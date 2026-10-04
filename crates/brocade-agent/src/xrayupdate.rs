@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use brocade_deployment::protocol::{XrayReleaseOffer, XrayReleaseOutcome, XrayReleaseReport};
@@ -23,6 +23,8 @@ use crate::{
 };
 
 const UPDATE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const STARTUP_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_HEALTH_INTERVAL: Duration = Duration::from_millis(50);
 const UPDATE_JITTER_MAX_SECS: u64 = 2 * 60;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(310);
 const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
@@ -579,12 +581,9 @@ fn start_and_restore_runtime(options: &Options, expected_sha256: &str) -> Result
         fs::read_to_string(&config).map_err(|error| format!("读取当前 Xray 配置失败：{error}"))?;
     let api_port = crate::xray_api_port(&content).unwrap_or(10085);
     crate::apply_xray(&config, api_port)?;
-    match crate::xray_runtime(&content) {
-        WorkloadRuntime::Healthy => {}
-        WorkloadRuntime::Broken(error) | WorkloadRuntime::Unknown(error) => {
-            return Err(format!("Xray 启动后健康检查失败：{error}"));
-        }
-    }
+    // The API listener can accept before the remaining inbound handlers finish starting. Keep
+    // the all-listeners gate, but do not roll back a valid binary on that transient snapshot.
+    wait_for_startup_health(STARTUP_HEALTH_TIMEOUT, || crate::xray_runtime(&content))?;
     if let Some(grants) = crate::desired_grants_on_disk(&options.state_dir)? {
         crate::sync_grants(&content, api_port, &grants)?;
     }
@@ -597,6 +596,24 @@ fn start_and_restore_runtime(options: &Options, expected_sha256: &str) -> Result
         ));
     }
     Ok(())
+}
+
+fn wait_for_startup_health(
+    timeout: Duration,
+    mut check: impl FnMut() -> WorkloadRuntime,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let error = match check() {
+            WorkloadRuntime::Healthy => return Ok(()),
+            WorkloadRuntime::Broken(error) | WorkloadRuntime::Unknown(error) => error,
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("Xray 启动后健康检查失败：{error}"));
+        }
+        thread::sleep(STARTUP_HEALTH_INTERVAL.min(remaining));
+    }
 }
 
 fn verify_installed_xray(expected_sha256: &str) -> Result<(), String> {
@@ -899,6 +916,44 @@ fn cleanup_file(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_health_waits_for_late_business_listeners() {
+        let mut attempts = 0;
+        wait_for_startup_health(Duration::from_secs(1), || {
+            attempts += 1;
+            if attempts < 3 {
+                WorkloadRuntime::Broken("anytls / hysteria2 尚未监听".to_owned())
+            } else {
+                WorkloadRuntime::Healthy
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn startup_health_does_not_delay_an_already_healthy_process() {
+        wait_for_startup_health(Duration::ZERO, || WorkloadRuntime::Healthy).unwrap();
+    }
+
+    #[test]
+    fn startup_health_timeout_keeps_broken_and_unknown_states_as_failures() {
+        for state in [
+            WorkloadRuntime::Broken("业务端口没有监听".to_owned()),
+            WorkloadRuntime::Unknown("无法检查业务端口".to_owned()),
+        ] {
+            let detail = match &state {
+                WorkloadRuntime::Broken(error) | WorkloadRuntime::Unknown(error) => error,
+                WorkloadRuntime::Healthy => unreachable!(),
+            };
+            let expected = format!("Xray 启动后健康检查失败：{detail}");
+            let mut state = Some(state);
+            let error =
+                wait_for_startup_health(Duration::ZERO, || state.take().unwrap()).unwrap_err();
+            assert_eq!(error, expected);
+        }
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let path =

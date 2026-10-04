@@ -121,13 +121,14 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
+#[path = "build/xray.rs"]
+mod xray_build;
+
 /// One architecture to distribute.
 struct Target {
     /// In `uname -m`'s terms, because `install.sh` ultimately selects embedded artifacts with
     /// `uname -m`.
     arch: &'static str,
-    /// Go's spelling of the same architecture, used for the embedded Xray build.
-    go_arch: &'static str,
     /// rust's triple.
     triple: &'static str,
     /// zig's spelling of the same target. **Not the same thing as the rust triple**: zig has no
@@ -144,14 +145,12 @@ struct Target {
 const TARGETS: &[Target] = &[
     Target {
         arch: "x86_64",
-        go_arch: "amd64",
         triple: "x86_64-unknown-linux-musl",
         zig_target: "x86_64-linux-musl",
         linker: None,
     },
     Target {
         arch: "aarch64",
-        go_arch: "arm64",
         triple: "aarch64-unknown-linux-musl",
         zig_target: "aarch64-linux-musl",
         linker: Some("-C linker=rust-lld"),
@@ -251,7 +250,6 @@ fn main() {
     // were knowable in the first second.
     let mut missing_targets = Vec::new();
     let mut needs_zig = false;
-    let mut needs_go = false;
     for target in TARGETS {
         println!("cargo:rerun-if-env-changed={}", override_var(target.arch));
         println!(
@@ -259,9 +257,6 @@ fn main() {
             xray_override_var(target.arch)
         );
         println!("cargo:rerun-if-env-changed={}", cc_var(target.triple));
-        if !env_set(&xray_override_var(target.arch)) {
-            needs_go = true;
-        }
         if env_set(&override_var(target.arch)) {
             continue;
         }
@@ -280,7 +275,8 @@ fn main() {
     // Found lazily: where everything takes an escape hatch, or both architectures bring their own
     // CC, a machine without zig builds all the same.
     let zig = if needs_zig { find_zig() } else { None };
-    let go = if needs_go { find_go() } else { None };
+    // Prebuilt Xray files must be checked against the current Go input graph too.
+    let go = find_go();
     // Same laziness for npm: pointed at a directory of already-built files, node is nobody's
     // business.
     println!("cargo:rerun-if-env-changed={CONSOLE_ASSETS_ENV}");
@@ -288,7 +284,7 @@ fn main() {
     let npm = if needs_npm { find_npm() } else { None };
     if !missing_targets.is_empty()
         || (needs_zig && zig.is_none())
-        || (needs_go && go.is_none())
+        || go.is_none()
         || (needs_npm && npm.is_none())
     {
         panic!(
@@ -296,11 +292,17 @@ fn main() {
             missing_prerequisites(
                 &missing_targets,
                 needs_zig && zig.is_none(),
-                needs_go && go.is_none(),
+                go.is_none(),
                 needs_npm && npm.is_none(),
             )
         );
     }
+
+    let go = go.as_deref().expect("前置检查保证 Go 存在");
+    println!("cargo:rerun-if-changed={}", go.display());
+    xray_build::Recipe::new(TARGETS[0].arch, XRAY_VERSION, &xray_build_id)
+        .and_then(|recipe| recipe.check_toolchain(go, &xray_source))
+        .unwrap_or_else(|error| panic!("Xray build preflight: {error}"));
 
     // Before the agents, and not because it matters more: it takes a couple of seconds where they
     // take minutes, so a front end that fails to typecheck says so almost immediately instead of
@@ -308,26 +310,34 @@ fn main() {
     embed_console(&out_dir, npm.as_deref());
 
     for target in TARGETS {
-        let built = match env::var(xray_override_var(target.arch)) {
+        let prebuilt = match env::var(xray_override_var(target.arch)) {
             Ok(path) if !path.trim().is_empty() => {
                 let path = PathBuf::from(path.trim());
                 println!("cargo:rerun-if-changed={}", path.display());
-                path
+                println!(
+                    "cargo:rerun-if-changed={}",
+                    xray_build::sidecar(&path).display()
+                );
+                Some(path)
             }
-            _ => build_xray(
-                &out_dir,
-                &xray_source,
-                target,
-                go.as_deref().expect("前置检查保证 Go 存在"),
-                &xray_build_id,
-            ),
+            _ => None,
         };
-        embed_binary(
-            &out_dir,
-            &built,
-            "xray",
-            target.arch,
-            "BROCADE_EMBEDDED_XRAY_SHA256",
+        let record = xray_build::Recipe::new(target.arch, XRAY_VERSION, &xray_build_id)
+            .and_then(|recipe| {
+                xray_build::prepare(
+                    go,
+                    &xray_source,
+                    &recipe,
+                    &out_dir,
+                    &workspace.join("target/brocade-xray-verified"),
+                    prebuilt.as_deref(),
+                )
+            })
+            .unwrap_or_else(|error| panic!("Xray {} build verification: {error}", target.arch));
+        println!(
+            "cargo:rustc-env=BROCADE_EMBEDDED_XRAY_SHA256_{}={}",
+            target.arch.to_ascii_uppercase(),
+            record.binary_sha256
         );
     }
 
@@ -414,9 +424,10 @@ fn missing_prerequisites(
     }
 
     if missing_go {
+        let version = xray_build::GO_VERSION.trim();
         text.push_str(&format!(
-            "\n[{}] Go 1.26（用仓库内的 {XRAY_SOURCE_DIR} 构建 Brocade Xray）\n\n\
-             装好 Go 1.26 后确保 `go version` 能运行，或者用 {GO_ENV_VAR} 指定完整路径。\n\
+            "\n[{}] Go {version}（构建或验证仓库内的 {XRAY_SOURCE_DIR}）\n\n\
+             装好 Go {version} 后确保 `go version` 能运行，或者用 {GO_ENV_VAR} 指定完整路径。\n\
              Xray 源码已经钉在仓库内，构建过程不会 clone 或切换上游仓库。\n",
             next(),
         ));
@@ -501,25 +512,16 @@ fn resolve_in_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Find a usable Go toolchain. Xray's go.mod pins the required language version; the build below
-/// sets GOTOOLCHAIN=local so an old binary fails rather than downloading a different compiler.
+/// Locate Go; the Xray recipe checks its exact version before any compilation starts.
 fn find_go() -> Option<PathBuf> {
     println!("cargo:rerun-if-env-changed={GO_ENV_VAR}");
 
-    let mut candidates = Vec::new();
     if let Ok(explicit) = env::var(GO_ENV_VAR) {
         if !explicit.trim().is_empty() {
-            candidates.push(PathBuf::from(explicit.trim()));
+            return Some(PathBuf::from(explicit.trim()));
         }
     }
-    candidates.extend(resolve_in_path("go"));
-
-    candidates.into_iter().find(|candidate| {
-        Command::new(candidate)
-            .arg("version")
-            .output()
-            .is_ok_and(|out| out.status.success())
-    })
+    resolve_in_path("go")
 }
 
 /// Find a usable zig.
@@ -662,53 +664,6 @@ fn target_installed(triple: &str) -> bool {
         .join(triple)
         .join("lib")
         .is_dir()
-}
-
-fn build_xray(
-    out_dir: &Path,
-    source: &Path,
-    target: &Target,
-    go: &Path,
-    build_id: &str,
-) -> PathBuf {
-    let output = out_dir.join(format!("xray-build-{}", target.arch));
-    let ldflags = format!("-X github.com/xtls/xray-core/core.build={build_id} -s -w -buildid=");
-    let status = Command::new(go)
-        .args([
-            "build",
-            "-mod=readonly",
-            "-trimpath",
-            "-buildvcs=false",
-            "-gcflags=all=-l=4",
-            "-ldflags",
-        ])
-        .arg(ldflags)
-        .arg("-o")
-        .arg(&output)
-        .arg("./main")
-        .current_dir(source)
-        .env("CGO_ENABLED", "0")
-        .env("GOOS", "linux")
-        .env("GOARCH", target.go_arch)
-        // Never make a Console build silently download and switch to another Go toolchain.
-        .env("GOTOOLCHAIN", "local")
-        .status()
-        .unwrap_or_else(|error| {
-            panic!(
-                "起不了 Go 去编 {} 的 Brocade Xray（源码 {}）：{error}",
-                target.arch,
-                source.display()
-            )
-        });
-    if !status.success() {
-        panic!(
-            "编不出 {} 的 Brocade Xray {XRAY_VERSION}（退出码 {:?}）。\n\
-             源码必须来自仓库内的 {XRAY_SOURCE_DIR}，不会回退到社区发行包。",
-            target.arch,
-            status.code()
-        );
-    }
-    output
 }
 
 fn build_agent(out_dir: &Path, target: &Target, zig: Option<&Path>) -> PathBuf {

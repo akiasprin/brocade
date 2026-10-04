@@ -2,6 +2,7 @@
 // API/自动化调用，以及创建首个管理员时的一次性初始化凭据。类型定义与服务端逐字段对应。
 
 import { draft, type ModelOp } from './draft';
+import { newRealityFallbackLimits } from './reality-fallback';
 
 export type AdminRole = 'user' | 'readonly' | 'editor' | 'publisher' | 'tenant-admin' | 'system-admin';
 
@@ -334,6 +335,8 @@ export const initAdmin = (
 ) => api<InitAdminResponse>('/auth/init', bootstrapToken, { method: 'POST', body: JSON.stringify(body) });
 export const loginAdmin = (body: { operator_id: string; password: string }) =>
   api<LoginAdminResponse>('/auth/login', '', { method: 'POST', body: JSON.stringify(body) });
+export const loginUserDirect = (body: { uuid: string; token: string }) =>
+  api<LoginAdminResponse>('/auth/direct-login', '', { method: 'POST', body: JSON.stringify(body) });
 export const logoutAdmin = () => api<{ revoked: boolean }>('/auth/logout', '', { method: 'POST' });
 
 /* ── 修订与编译 ── */
@@ -374,9 +377,9 @@ export interface CompileView {
 // 但按诊断码静音是在错误的层面处理该问题：编译器将一项无法判定的事项报为警告，
 // 界面只能逐条隐藏，而隐藏后「该跳是明文」这一事实也一并丢失。
 //
-// 编译器现已支持 `info` 级别（`Level::Info`，见 ir.md §10.3）：无法判定实际风险的诊断
-// 报为 info，不计入警告数、不触发顶栏角标，但正常显示为灰色。噪音问题由级别机制解决，
-// 静音列表不再需要，已删除。
+// 编译器现已支持 `info` 级别（`Level::Info`，见 ir.md §10.3）：需要操作者留意、但不表示
+// 配置存在问题的细节报为 info，不计入警告数、不触发顶栏角标，但正常显示为灰色。噪音
+// 问题由级别机制解决，静音列表不再需要，已删除。
 //
 // 删除它同时修复了一个关联问题：静音会使面板上的条数与 `summary` 不一致，而概览页
 // 当时用「总数 - errors」反推警告数，导致 2 条 info 被计为 2 条警告。
@@ -426,7 +429,7 @@ export const fetchCompileView = (revision: number): Promise<CompileView> =>
 /* ── 节点 ── */
 
 /* 与 brocade_deployment::protocol 中的同名结构逐字段对应 */
-export const AGENT_PROTOCOL_VERSION = 21;
+export const AGENT_PROTOCOL_VERSION = 24;
 export const MIN_AGENT_PROTOCOL_VERSION = 20;
 export const VPNGATE_MAX_CANDIDATES = 16;
 export const VPNGATE_CONNECT_THRESHOLD_MAX_MS = 35_000;
@@ -440,7 +443,7 @@ export interface NodeVersions {
   xray_installed_sha256?: string | null;
   xray_running_sha256?: string | null;
   phantun: string | null;
-  /** 可选能力；缺失或 null 表示该机器不纳入 VPN Gate 接入节点。 */
+  /** 可选能力；OpenVPN 或 /dev/net/tun 不可用时为 null，该机器不纳入 VPN Gate 接入节点。 */
   openvpn?: string | null;
   /** VPN Gate 目录拨测的有界并发能力；旧 Agent 缺失时按串行处理。 */
   vpngate_catalog_probe_workers?: number | null;
@@ -452,8 +455,12 @@ export interface NodeVersions {
 export interface SpoolBacklog {
   observation: number;
   usage: number;
-  /** 单调递增。非零表示存在永久丢失的用量记录。 */
+  /** 所有类型的累计总数，供旧 Console/Agent 滚动兼容。 */
   dropped: number;
+  /** 新 Agent 才有；非零表示用量时间分辨率曾永久丢失。 */
+  usage_dropped?: number | null;
+  /** 新 Agent 才有；非零表示发布收敛证据曾被永久丢弃。 */
+  observation_dropped?: number | null;
 }
 export interface LocalReconcileReport {
   at: number;
@@ -987,12 +994,76 @@ export interface UserListItem {
   status: string;
   account_type?: 'formal' | 'test';
   login_enabled?: boolean;
+  direct_login_enabled?: boolean;
   created_at: string;
   created_revision: number | null;
 }
 
 export const fetchUsers = (includeDisabled = true) =>
   api<{ users: UserListItem[] }>(`/users?include_disabled=${includeDisabled}`);
+
+export type OnlineSourceProtocol = 'vless' | 'anytls' | 'hysteria2' | 'unknown';
+
+export interface UserOnlineSourceAccess {
+  node_id: string;
+  ingress_id: string;
+  protocols: OnlineSourceProtocol[] | null;
+}
+
+export interface UserOnlineSource {
+  ip: string;
+  first_observed_at: string;
+  last_observed_at: string;
+  xray_last_seen_at: string;
+  node_ids: string[];
+  ingress_ids: string[];
+  /** Absent on older Consoles; never infer protocols from configured listeners. */
+  accesses?: UserOnlineSourceAccess[];
+}
+
+export interface UserPresence {
+  tenant_id: string;
+  user_id: string;
+  state: 'complete' | 'partial' | 'unavailable';
+  expected_nodes: number;
+  reporting_nodes: number;
+  sources: UserOnlineSource[];
+}
+
+export interface SourceCountry {
+  ip: string;
+  country: string;
+}
+
+export type NetworkOperator = 'chinanet' | 'cmcc' | 'unicom' | 'cernet' | 'cstnet';
+
+export interface SourceOperator {
+  ip: string;
+  operator: NetworkOperator;
+}
+
+export interface UserPresenceList {
+  freshness_secs: number;
+  users: UserPresence[];
+  /** Local GeoIP country/region codes. Older consoles omit this field. */
+  source_countries?: SourceCountry[];
+  /** Local BGP-derived network attribution, omitted for unknown or ambiguous matches. */
+  source_operators?: SourceOperator[];
+}
+
+export interface UserOnlineSourceHistory {
+  tenant_id: string;
+  user_id: string;
+  retention_days: number;
+  truncated: boolean;
+  sources: UserOnlineSource[];
+  source_countries?: SourceCountry[];
+  source_operators?: SourceOperator[];
+}
+
+export const fetchUserPresence = () => api<UserPresenceList>('/users/presence');
+export const fetchUserOnlineSourceHistory = (tenantId: string, userId: string) =>
+  api<UserOnlineSourceHistory>(`/users/${encodeURIComponent(tenantId)}/${encodeURIComponent(userId)}/presence-history`);
 
 export const createUser = (body: { tenant_id: string; id: string }) =>
   immediateModelWrite(() => post<ModelWriteResult>('/users', body));
@@ -1023,6 +1094,21 @@ export interface IssuedUserLogin {
 }
 
 export const issueUserLogin = (tenant: string, user: string) => post<IssuedUserLogin>(`/users/${tenant}/${user}/login`);
+
+export interface IssuedUserDirectLogin {
+  operator_id: string;
+  uuid: string;
+  token: string;
+  sessions_revoked: number;
+}
+
+export const issueUserDirectLogin = (tenant: string, user: string) =>
+  post<IssuedUserDirectLogin>(`/users/${tenant}/${user}/direct-login`);
+
+export const revokeUserDirectLogin = (tenant: string, user: string) =>
+  api<{ tenant_id: string; user_id: string; revoked: boolean }>(`/users/${tenant}/${user}/direct-login`, '', {
+    method: 'DELETE',
+  });
 
 export const setUserPassword = (tenant: string, user: string, newPassword: string) =>
   api<{ operator_id: string; sessions_revoked: number }>(`/users/${tenant}/${user}/login`, '', {
@@ -1679,7 +1765,8 @@ export type GrantWrite = {
   enabled: boolean;
 };
 
-export const upsertGrant = (grant: GrantWrite) => post<{ revision_id: number }>('/grants', grant);
+export const upsertGrant = (grant: GrantWrite) =>
+  immediateModelWrite(() => post<{ revision_id: number }>('/grants', grant));
 
 // A new chain's ingress does not exist until its structural draft commits, so the wizard stages
 // its initial grants in that same transaction.  Normal permission edits use `upsertGrant` above.
@@ -1958,6 +2045,12 @@ export const upsertExternalOutbound = async (outbound: ExternalOutboundWrite) =>
 export interface VpngateCatalogStatus {
   enabled: boolean;
   interval_secs: number;
+  /** Absent only when a development frontend is connected to an older Console. */
+  probe_success_cooldown_secs?: number;
+  /** Absent only when a development frontend is connected to an older Console. */
+  probe_performance_cooldown_secs?: number;
+  /** Absent only when a development frontend is connected to an older Console. */
+  probe_shard_rotation_secs?: number;
   source_url: string;
   next_sync_at_unix_secs: number;
   syncing: boolean;
@@ -2028,6 +2121,10 @@ export interface VpngateServerView {
   measured_nodes: number;
   successful_samples: number;
   latest_probe_status: string | null;
+  /** Fleet-wide consecutive catalogue failures; one or two are under priority review, three suspend qualification. */
+  consecutive_probe_failures?: number;
+  /** A failed candidate's twenty-minute review window ends at this Unix timestamp. */
+  probe_eligible_until_unix_secs?: number | null;
   latest_exit_ip: string | null;
   latest_exit_country_code: string | null;
   latest_connect_ms: number | null;
@@ -2041,7 +2138,8 @@ export interface VpngateServerView {
   intelligence_stale: boolean;
 }
 
-export type VpngateDirectoryFilter = 'all' | 'candidate' | 'successful' | 'failed' | 'pending' | 'current' | 'retained';
+export type VpngateDirectoryFilter =
+  'all' | 'candidate' | 'successful' | 'failed' | 'reviewing' | 'suspended' | 'pending' | 'current' | 'retained';
 export type VpngateDirectorySort = 'candidate' | 'download' | 'connect' | 'catalog' | 'samples' | 'recent' | 'hostname';
 
 export interface VpngateServerPageRequest {
@@ -2070,12 +2168,21 @@ const optionalNumberOrder = (left: number | null | undefined, right: number | nu
  * compatibility window; normal installations only receive VpngateServerPage. */
 function legacyVpngateServerPage(items: VpngateServerView[], request: VpngateServerPageRequest): VpngateServerPage {
   const term = request.search.trim().toLowerCase();
+  const nowUnixSecs = Math.floor(Date.now() / 1000);
   const filtered = items.filter(item => {
+    const failures = item.consecutive_probe_failures ?? 0;
+    const reviewExpired =
+      failures >= 1 &&
+      failures < 3 &&
+      item.probe_eligible_until_unix_secs != null &&
+      item.probe_eligible_until_unix_secs < nowUnixSecs;
     const matchesFilter =
       request.filter === 'all' ||
       (request.filter === 'candidate' && item.active) ||
       (request.filter === 'successful' && item.successful_samples > 0) ||
       (request.filter === 'failed' && item.latest_probe_status === 'failed') ||
+      (request.filter === 'reviewing' && failures >= 1 && failures < 3 && !reviewExpired) ||
+      (request.filter === 'suspended' && (failures >= 3 || reviewExpired)) ||
       (request.filter === 'pending' && item.latest_probe_status == null) ||
       (request.filter === 'current' && item.seen_in_latest_sync) ||
       (request.filter === 'retained' && !item.seen_in_latest_sync);
@@ -2196,6 +2303,16 @@ export const requestVpngatePoolSwitch = (nodeId: string, outboundId: string, exp
 
 export const updateVpngateCatalogSettings = (body: { enabled: boolean; interval_secs: number }) =>
   api<VpngateCatalogStatus>('/vpngate/settings', '', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+
+export const updateVpngateProbeSettings = (body: {
+  success_cooldown_secs: number;
+  performance_cooldown_secs: number;
+  shard_rotation_secs: number;
+}) =>
+  api<VpngateCatalogStatus>('/vpngate/probe-settings', '', {
     method: 'PUT',
     body: JSON.stringify(body),
   });
@@ -2521,7 +2638,7 @@ export function ingressUpsertBody(
   const transport: NonNullable<SnapshotIngress['wires']['vless']> = ingress.wires.vless ?? {
     kind: 'vless-reality',
   };
-  const realitySource = transport.kind.startsWith('vless-reality') ? transport : undefined;
+  const realitySource = ingress.wires.vless?.kind.startsWith('vless-reality') ? ingress.wires.vless : undefined;
   const wires = patch.wires ?? currentWires(ingress);
   return {
     id: ingress.id,
@@ -2536,7 +2653,9 @@ export function ingressUpsertBody(
       server_names: [...(realitySource?.server_names ?? [])],
       fingerprint: realitySource?.fingerprint ?? undefined,
       fallback_mode: realitySource?.fallback_mode ?? 'global-site',
-      fallback_limits: realitySource?.fallback_limits ?? { mode: 'off' },
+      // Missing policy on a legacy REALITY snapshot means off; a newly enabled REALITY wire
+      // gets the creation default without changing any explicitly saved policy.
+      fallback_limits: realitySource ? (realitySource.fallback_limits ?? { mode: 'off' }) : newRealityFallbackLimits(),
       // 需要显式回写，不能依赖「不携带即默认启用」：否则任何一次修改端口或迁移机器，
       // 都会将已关闭回落防护的接入面重新启用，且界面上没有任何提示。
       fallback_guard: realitySource?.fallback_guard ?? true,
@@ -2971,10 +3090,17 @@ export const fetchBranding = () => api<BrandingSettings>('/branding');
 export const saveBranding = (body: BrandingSettings) =>
   api<BrandingSettings>('/branding', '', { method: 'PUT', body: JSON.stringify(body) });
 
+export type PingProbeKind = 'tcp' | 'icmp';
+export type PingProbeFamily = 'ipv4' | 'ipv6';
+export const PING_PROBE_FAMILIES: readonly PingProbeFamily[] = ['ipv4', 'ipv6'];
+
 export interface PingProbeTarget {
   name: string;
-  /** 同时作为序列标识；URI 选择 TCP Connect 或 ICMP Echo。 */
-  address: string;
+  /** TCP Connect 或 ICMP Echo，两个地址族共用。 */
+  kind: PingProbeKind;
+  /** 本地址族的 IP 或域名（域名只取该族记录）；TCP 写 主机:端口。null 表示该地址族不探测，两族至少填一个。 */
+  ipv4: string | null;
+  ipv6: string | null;
 }
 
 export interface PingProbeSettings {
@@ -3280,7 +3406,6 @@ export interface XrayReleaseArtifact {
 
 export interface XrayReleaseTarget {
   node_id: string;
-  wave: number;
   status: XrayReleaseTargetStatus;
   attempt: number;
   before_sha256: string;
@@ -3300,7 +3425,6 @@ export interface XrayReleaseEvent {
   id: number;
   kind: string;
   node_id: string | null;
-  wave: number | null;
   actor: string | null;
   detail: unknown;
   created_at: string;
@@ -3313,8 +3437,6 @@ export interface XrayRelease {
   artifacts: XrayReleaseArtifact[];
   status: XrayReleaseStatus;
   active: boolean;
-  confirmed_wave: number;
-  batch_size: number;
   note: string | null;
   created_at: string;
   created_by: string;
@@ -3330,8 +3452,6 @@ export interface XrayReleaseSummary {
   version: string;
   status: XrayReleaseStatus;
   active: boolean;
-  confirmed_wave: number;
-  batch_size: number;
   note: string | null;
   created_at: string;
   created_by: string;
@@ -3348,8 +3468,6 @@ export interface XrayReleaseView {
   xray_version: string;
   console_version: string;
   build_commit: string;
-  history: XrayReleaseSummary[];
-  next_history_before_id: number | null;
   releases: XrayRelease[];
 }
 
@@ -3362,8 +3480,6 @@ export interface CreateXrayRelease {
   idempotency_key: string;
   release_id: string;
   nodes: string[];
-  canary_node: string;
-  batch_size: number;
   note: string | null;
 }
 
@@ -3373,8 +3489,6 @@ export const fetchXrayReleaseHistory = (beforeId: number) =>
 export const fetchXrayRelease = (releaseId: number) => api<XrayRelease>(`/xray-releases/${releaseId}`);
 export const createXrayRelease = (body: CreateXrayRelease) =>
   api<XrayReleaseView>('/xray-releases', '', { method: 'POST', body: JSON.stringify(body) });
-export const confirmXrayRelease = (releaseId: number) =>
-  api<XrayReleaseView>(`/xray-releases/${releaseId}/confirm`, '', { method: 'POST' });
 export const cancelXrayRelease = (releaseId: number) =>
   api<XrayReleaseView>(`/xray-releases/${releaseId}/cancel`, '', { method: 'POST' });
 export const retryXrayReleaseTarget = (releaseId: number, nodeId: string) =>
@@ -4260,16 +4374,31 @@ export const fetchNodeNicListWindows = (windows = 24, token = '') =>
 export const fetchNodeLoadWindows = (nodeId: string, windows = 24, token = '') =>
   api<NodeLoadView>(`/load/nodes/${encodeURIComponent(nodeId)}?windows=${windows}`, token);
 
+/** 未探测的原因：机器没有该地址族的路由、域名没有该族记录、解析失败、机器无法发起该探测。 */
+export type PingProbeSkipReason = 'no_route' | 'no_address' | 'resolve_failed' | 'unavailable';
+
 export interface PingProbePoint {
   probed_at_unix_secs: number;
   /** false 表示受能力或路由限制而未实际发包，不应计作丢包。 */
   attempted: boolean;
   /** 微秒；已尝试且为 null 表示在超时前没有响应。 */
   latency_us: number | null;
+  /** 仅双栈 Agent 的未探测样本带有。 */
+  skip_reason?: PingProbeSkipReason;
 }
 
-export interface PingProbeTargetSeries extends PingProbeTarget {
+export interface PingProbeFamilySeries {
+  /** 序列标识，如 icmp://1.1.1.1、tcp://[2001:db8::1]:443。 */
+  address: string;
   samples: PingProbePoint[];
+}
+
+/** 每个已填写的地址族一条序列；null 表示该地址族没有填写，不同于填写了但尚无样本。 */
+export interface PingProbeTargetSeries {
+  name: string;
+  kind: PingProbeKind;
+  ipv4: PingProbeFamilySeries | null;
+  ipv6: PingProbeFamilySeries | null;
 }
 
 export interface NodePingProbeView {
@@ -4277,10 +4406,19 @@ export interface NodePingProbeView {
   targets: PingProbeTargetSeries[];
 }
 
-interface PingProbeTargetColumnarSeries extends PingProbeTarget {
+interface PingProbeFamilyColumns {
+  address: string;
   probed_at_unix_secs: number[];
   attempted: boolean[];
   latency_us: Array<number | null>;
+  skip_reason: Array<PingProbeSkipReason | null>;
+}
+
+interface PingProbeTargetColumnarSeries {
+  name: string;
+  kind: PingProbeKind;
+  ipv4: PingProbeFamilyColumns | null;
+  ipv6: PingProbeFamilyColumns | null;
 }
 
 interface NodePingProbeColumnarView {
@@ -4288,34 +4426,56 @@ interface NodePingProbeColumnarView {
   targets: PingProbeTargetColumnarSeries[];
 }
 
+function expandPingProbeFamily(columns: PingProbeFamilyColumns | null): PingProbeFamilySeries | null {
+  if (!columns) return null;
+  const length = columns.probed_at_unix_secs.length;
+  if (
+    columns.attempted.length !== length ||
+    columns.latency_us.length !== length ||
+    columns.skip_reason.length !== length
+  ) {
+    throw new Error(`PING 图表列长度不一致：${columns.address}`);
+  }
+  return {
+    address: columns.address,
+    samples: columns.probed_at_unix_secs.map((probed_at_unix_secs, index) => {
+      const skipReason = columns.skip_reason[index];
+      return {
+        probed_at_unix_secs,
+        attempted: columns.attempted[index],
+        latency_us: columns.latency_us[index],
+        ...(skipReason ? { skip_reason: skipReason } : {}),
+      };
+    }),
+  };
+}
+
 function expandNodePingProbeSeries(view: NodePingProbeColumnarView): NodePingProbeView {
   return {
     node_id: view.node_id,
-    targets: view.targets.map(target => {
-      if (
-        target.attempted.length !== target.probed_at_unix_secs.length ||
-        target.latency_us.length !== target.probed_at_unix_secs.length
-      ) {
-        throw new Error(`PING 图表列长度不一致：${target.address}`);
-      }
-      return {
-        name: target.name,
-        address: target.address,
-        samples: target.probed_at_unix_secs.map((probed_at_unix_secs, index) => ({
-          probed_at_unix_secs,
-          attempted: target.attempted[index],
-          latency_us: target.latency_us[index],
-        })),
-      };
-    }),
+    targets: view.targets.map(target => ({
+      name: target.name,
+      kind: target.kind,
+      ipv4: expandPingProbeFamily(target.ipv4),
+      ipv6: expandPingProbeFamily(target.ipv6),
+    })),
   };
 }
 
 export const fetchNodePingProbeList = (windowSecs = 3600, token = '') =>
   api<{ nodes: NodePingProbeView[] }>(`/ping-probe/nodes?window_secs=${windowSecs}`, token);
 
-export interface PingProbeTargetLatest extends PingProbeTarget {
+export interface PingProbeFamilyLatest {
+  address: string;
+  /** null 表示该序列在这台机器上还没有保留的样本。 */
   latest: PingProbePoint | null;
+}
+
+export interface PingProbeTargetLatest {
+  name: string;
+  kind: PingProbeKind;
+  ipv4: PingProbeFamilyLatest | null;
+  ipv6: PingProbeFamilyLatest | null;
 }
 
 export interface NodePingProbeLatestView {

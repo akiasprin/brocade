@@ -14,9 +14,9 @@ use brocade_console::realtime::{RealtimeBroadcast, RealtimeService};
 use brocade_core::model::{ExternalOutboundProtocol, ExternalOutboundSecurity};
 use brocade_store::{
     AdminContext, AdminInitRequest, CreateChainRequest, CreateTenantRequest, IssuedAdminToken,
-    IssuedNodeToken, ModelOp, PgStore, PingProbeReportRequest, PingProbeSample, PingProbeSettings,
-    PingProbeTarget, RegisterWarpBindingRequest, UpdateVpngateIntelligenceNode,
-    UpsertExternalOutboundRequest, ENROLLMENT_TOKEN_PREFIX,
+    IssuedNodeToken, ModelOp, PgStore, PingProbeFamily, PingProbeKind, PingProbeReportRequest,
+    PingProbeSample, PingProbeSettings, PingProbeTarget, RegisterWarpBindingRequest,
+    UpdateVpngateIntelligenceNode, UpsertExternalOutboundRequest, ENROLLMENT_TOKEN_PREFIX,
 };
 use flate2::{write::GzEncoder, Compression};
 use futures_util::{SinkExt, StreamExt};
@@ -1274,6 +1274,57 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
     .unwrap();
     assert!(body.contains("type: vless"), "{body}");
     assert!(!body.contains("type: hysteria2"), "{body}");
+
+    // The same bearer and filters negotiate only the body representation, never a different
+    // serving snapshot or authorization scope. Unknown clients still receive the original YAML.
+    for (ua, native) in [
+        ("Shadowrocket/2247 CFNetwork/1494 Darwin/23.4.0", true),
+        ("Clash.Meta/1.19", false),
+    ] {
+        let response = agent
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/sub/v1/{uuid}/clash.yaml?family=v4&protocol=vless"
+                ))
+                .header("user-agent", ua)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["vary"], "User-Agent");
+        assert_eq!(
+            response.headers()["x-brocade-subscription-format"],
+            if native { "shadowrocket" } else { "clash" }
+        );
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let text = if native {
+            String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(bytes)
+                    .unwrap(),
+            )
+            .unwrap()
+        } else {
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+        if native {
+            assert!(text.starts_with("STATUS=↑:"));
+            assert!(text.contains(",↓:"));
+            assert!(text.contains(",TOT:∞\r\n"));
+            assert!(!text.contains("统计有缺口"));
+            assert!(text.contains(&format!("vless://{uuid}@n1.example.net:")));
+            assert!(!text.contains("2001:db8::10"));
+            assert!(!text.contains("proxies:"));
+        } else {
+            assert!(text.contains("# Brocade · SubBoost 标准版"));
+            assert!(!text.contains("STATUS="));
+        }
+    }
 
     // This fixture publishes VLESS only. A valid Hysteria-only view is therefore an empty
     // subscription rather than an accidental fallback to all protocols.
@@ -4270,6 +4321,90 @@ async fn http_user_login_keeps_general_views_masked_and_opens_only_self_service(
     login_cookie(&app, "platform.acme/alice", "user-chosen-password").await;
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_user_direct_page_exchanges_uuid_and_token_for_a_browser_session() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+
+    let (app, admin_token) = admin_app(&db).await;
+    let issued = post_json(
+        &app,
+        &admin_token,
+        "/users/platform.acme/alice/direct-login",
+        json!({}),
+    )
+    .await;
+    assert_eq!(issued.0, StatusCode::CREATED);
+    let uuid = issued.1["uuid"].as_str().unwrap();
+    let token = issued.1["token"].as_str().unwrap();
+
+    let wrong = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/direct-login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "uuid": uuid, "token": "broc_login_wrong" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/direct-login")
+                // An unrelated stale cookie must not override the explicit direct credential.
+                .header("cookie", "brocade_session=stale")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "uuid": uuid, "token": token }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let body = response_json(login).await;
+    assert_eq!(body["admin"]["role"], "user");
+    assert_eq!(body["admin"]["self_user"]["user_id"], "alice");
+
+    let whoami = get_json_with_cookie(&app, "/whoami", &cookie).await;
+    assert_eq!(whoami.0, StatusCode::OK);
+    assert_eq!(whoami.1["operator_id"], "platform.acme/alice");
+    assert_eq!(whoami.1["self_user"]["tenant_id"], "platform.acme");
+
+    let users = get_json(&app, &admin_token, "/users?include_disabled=true").await;
+    let alice = users.1["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["id"] == "alice")
+        .unwrap();
+    assert_eq!(alice["login_enabled"], false);
+    assert_eq!(alice["direct_login_enabled"], true);
+}
+
 /// A reviewing role reads the model to check it and must not walk away with the
 /// addresses. What is asserted here is the property the masking layer exists for —
 /// that no raw address reaches such a viewer through *any* read endpoint — rather
@@ -6716,6 +6851,96 @@ async fn http_operator_password_lifecycle() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn agent_ping_targets_follow_the_agent_protocol() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    db.store
+        .update_ping_probe_settings(
+            &AdminContext::system_admin("fixture"),
+            PingProbeSettings {
+                targets: vec![
+                    PingProbeTarget {
+                        name: "Cloudflare".to_owned(),
+                        kind: PingProbeKind::Icmp,
+                        ipv4: Some("1.1.1.1".to_owned()),
+                        ipv6: Some("2606:4700:4700::1111".to_owned()),
+                    },
+                    PingProbeTarget {
+                        name: "Google".to_owned(),
+                        kind: PingProbeKind::Tcp,
+                        ipv4: Some("www.google.com:443".to_owned()),
+                        ipv6: Some("www.google.com:443".to_owned()),
+                    },
+                ],
+                interval_secs: 60,
+                timeout_ms: 420,
+            },
+        )
+        .await
+        .unwrap();
+    let (admin, admin_token) = admin_app(&db).await;
+    let agent = agent_router(db.store.clone());
+    let response = admin
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/nodes/n1/agent-token")
+                .header("authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let issued: IssuedNodeToken = serde_json::from_slice(&bytes).unwrap();
+
+    let targets = |protocol: u32| {
+        let agent = agent.clone();
+        let token = issued.token.clone();
+        async move {
+            let response = agent
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/agent/v1/ping-probe-targets")
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("x-brocade-protocol-version", protocol.to_string())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        }
+    };
+
+    // An Agent that cannot tag samples with a family gets only the IP literals, one URI each.
+    let legacy = targets(brocade_deployment::protocol::DUAL_STACK_PING_PROTOCOL_VERSION - 1).await;
+    assert_eq!(
+        legacy["targets"],
+        json!([
+            { "name": "Cloudflare", "address": "icmp://1.1.1.1" },
+            { "name": "Cloudflare", "address": "icmp://[2606:4700:4700::1111]" },
+        ])
+    );
+    assert_eq!(legacy["interval_secs"], 60);
+
+    let current = targets(brocade_deployment::protocol::DUAL_STACK_PING_PROTOCOL_VERSION).await;
+    assert_eq!(current["targets"][0]["kind"], "icmp");
+    assert_eq!(current["targets"][0]["ipv6"], "2606:4700:4700::1111");
+    assert_eq!(current["targets"][1]["ipv4"], "www.google.com:443");
+    assert_eq!(current["targets"][1]["ipv6"], "www.google.com:443");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -6732,7 +6957,9 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
             PingProbeSettings {
                 targets: vec![PingProbeTarget {
                     name: "TCP".to_owned(),
-                    address: "tcp://192.0.2.1:443".to_owned(),
+                    kind: PingProbeKind::Tcp,
+                    ipv4: Some("192.0.2.1:443".to_owned()),
+                    ipv6: None,
                 }],
                 interval_secs: 60,
                 timeout_ms: 420,
@@ -6751,8 +6978,10 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
                 probed_at_unix_secs: now,
                 samples: vec![PingProbeSample {
                     target: "tcp://192.0.2.1:443".to_owned(),
+                    family: Some(PingProbeFamily::Ipv4),
                     attempted: true,
                     latency_us: Some(37_250),
+                    skip_reason: None,
                 }],
             },
         )
@@ -6854,10 +7083,11 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
     assert_eq!(list.0, StatusCode::OK);
     assert_eq!(list.1["nodes"][0]["node_id"], "n1");
     assert_eq!(
-        list.1["nodes"][0]["targets"][0]["samples"][0]["latency_us"],
+        list.1["nodes"][0]["targets"][0]["ipv4"]["samples"][0]["latency_us"],
         37_250
     );
-    let list_address = list.1["nodes"][0]["targets"][0]["address"]
+    assert!(list.1["nodes"][0]["targets"][0]["ipv6"].is_null());
+    let list_address = list.1["nodes"][0]["targets"][0]["ipv4"]["address"]
         .as_str()
         .unwrap();
     assert!(
@@ -6874,10 +7104,10 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
     assert_eq!(latest.1["interval_secs"], 60);
     assert_eq!(latest.1["nodes"][0]["node_id"], "n1");
     assert_eq!(
-        latest.1["nodes"][0]["targets"][0]["latest"]["latency_us"],
+        latest.1["nodes"][0]["targets"][0]["ipv4"]["latest"]["latency_us"],
         37_250
     );
-    let latest_address = latest.1["nodes"][0]["targets"][0]["address"]
+    let latest_address = latest.1["nodes"][0]["targets"][0]["ipv4"]["address"]
         .as_str()
         .unwrap();
     assert!(latest_address.starts_with("tcp://"));
@@ -6888,8 +7118,11 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
 
     let detail = get_json_with_cookie(&app, "/ping-probe/nodes/n1?window_secs=3600", &cookie).await;
     assert_eq!(detail.0, StatusCode::OK);
-    assert_eq!(detail.1["targets"][0]["samples"][0]["latency_us"], 37_250);
-    assert!(detail.1["targets"][0]["address"]
+    assert_eq!(
+        detail.1["targets"][0]["ipv4"]["samples"][0]["latency_us"],
+        37_250
+    );
+    assert!(detail.1["targets"][0]["ipv4"]["address"]
         .as_str()
         .unwrap()
         .starts_with("tcp://"));
@@ -6902,14 +7135,19 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
     .await;
     assert_eq!(compact_ping.0, StatusCode::OK);
     assert_eq!(
-        compact_ping.1["targets"][0]["probed_at_unix_secs"]
+        compact_ping.1["targets"][0]["ipv4"]["probed_at_unix_secs"]
             .as_array()
             .unwrap()
             .len(),
         1
     );
-    assert_eq!(compact_ping.1["targets"][0]["latency_us"][0], 37_250);
-    assert!(compact_ping.1["targets"][0].get("samples").is_none());
+    assert_eq!(
+        compact_ping.1["targets"][0]["ipv4"]["latency_us"][0],
+        37_250
+    );
+    assert!(compact_ping.1["targets"][0]["ipv4"]
+        .get("samples")
+        .is_none());
 
     let overview = get_json_with_cookie(&app, "/load/nodes/n1/overview?windows=24", &cookie).await;
     assert_eq!(overview.0, StatusCode::OK);
@@ -7266,10 +7504,9 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// Xray rollout has more state than Agent clearance, so exercise the whole HTTP circuit: the
-/// admin freezes a target, the authenticated node receives only its open wave, and the report
-/// settles the immutable record. This catches route/header/origin mistakes that store tests
-/// cannot see and that otherwise present as an Agent receiving 204 forever.
+/// Exercise the whole Xray approval circuit: the admin freezes a target, the authenticated node
+/// receives it, and the report settles the internal audit record. This catches route/header/origin
+/// mistakes that store tests cannot see and that otherwise present as an Agent receiving 204 forever.
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn http_xray_release_is_offered_and_reported_by_digest() {
@@ -7354,8 +7591,7 @@ async fn http_xray_release_is_offered_and_reported_by_digest() {
                         "idempotency_key": "http-xray-release-test-1",
                         "release_id": release_id,
                         "nodes": ["n1"],
-                        "canary_node": "n1",
-                        "note": "HTTP rollout test"
+                        "note": "HTTP approval test"
                     })
                     .to_string(),
                 ))
@@ -7368,9 +7604,11 @@ async fn http_xray_release_is_offered_and_reported_by_digest() {
         serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
             .unwrap();
     let database_id = created["releases"][0]["id"].as_i64().unwrap();
-    assert_eq!(created["releases"][0]["batch_size"], 10);
-    assert_eq!(created["history"][0]["id"], database_id);
-    assert!(created["next_history_before_id"].is_null());
+    assert!(created["releases"][0].get("batch_size").is_none());
+    assert!(created["releases"][0].get("confirmed_wave").is_none());
+    assert!(created["releases"][0]["targets"][0].get("wave").is_none());
+    assert!(created.get("history").is_none());
+    assert!(created.get("next_history_before_id").is_none());
 
     let response = admin
         .clone()

@@ -14,6 +14,56 @@ pub fn subscription(subscription: &Subscription) -> String {
     subscription_with_options(subscription, UriRenderOptions::default())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UriSubscriptionUnsupported {
+    FrontProxy,
+    SelfSignedCertificate,
+}
+
+impl UriSubscriptionUnsupported {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FrontProxy => "front_proxy",
+            Self::SelfSignedCertificate => "self_signed_certificate",
+        }
+    }
+}
+
+/// Unlike the manual URI export, an automatically negotiated subscription must not silently
+/// omit entries or their trust requirements. Callers must keep the complete YAML when this
+/// representation cannot preserve the route and certificate verification.
+pub fn complete_subscription(
+    subscription: &Subscription,
+) -> Result<String, UriSubscriptionUnsupported> {
+    if !subscription.front_groups.is_empty()
+        || !subscription.external_proxies.is_empty()
+        || subscription
+            .entries
+            .iter()
+            .any(|entry| entry.front_name.is_some())
+    {
+        return Err(UriSubscriptionUnsupported::FrontProxy);
+    }
+    if subscription.entries.iter().any(entry_is_self_signed) {
+        return Err(UriSubscriptionUnsupported::SelfSignedCertificate);
+    }
+    Ok(subscription
+        .entries
+        .iter()
+        .map(|entry| format!("{}\n", entry_uri(entry, UriRenderOptions::default())))
+        .collect())
+}
+
+fn entry_is_self_signed(entry: &SubscriptionEntry) -> bool {
+    match &entry.security {
+        SubscriptionSecurity::Tls(tls) => tls.self_signed,
+        SubscriptionSecurity::AnyTls(anytls) => anytls.self_signed,
+        SubscriptionSecurity::Hysteria2(hysteria) => hysteria.self_signed,
+        SubscriptionSecurity::Reality(_) | SubscriptionSecurity::VlessEncryption { .. } => false,
+    }
+}
+
 pub fn subscription_with_options(subscription: &Subscription, options: UriRenderOptions) -> String {
     let mut lines = Vec::new();
     let mut skipped = Vec::new();
@@ -25,15 +75,7 @@ pub fn subscription_with_options(subscription: &Subscription, options: UriRender
             skipped.push(entry.name.clone());
             continue;
         }
-        let self_signed = match &entry.security {
-            SubscriptionSecurity::Tls(tls) => tls.self_signed,
-            SubscriptionSecurity::AnyTls(anytls) => anytls.self_signed,
-            SubscriptionSecurity::Hysteria2(hysteria) => hysteria.self_signed,
-            SubscriptionSecurity::Reality(_) | SubscriptionSecurity::VlessEncryption { .. } => {
-                false
-            }
-        };
-        if self_signed {
+        if entry_is_self_signed(entry) {
             // VLESS has no interoperable URI field for a self-signed certificate pin, and current Xray
             // rejects allowInsecure. Never emit a link that imports successfully and cannot dial.
             if matches!(&entry.security, SubscriptionSecurity::Tls(_)) {

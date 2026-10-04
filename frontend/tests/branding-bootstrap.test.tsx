@@ -44,7 +44,7 @@ describe('站点标题初始化', () => {
 
     const view = mount();
     expect(view.container.querySelector('#stage')).toBeTruthy();
-    expect(view.container.querySelector('.login-fw')).toBeNull();
+    expect(view.container.querySelector('.login-page')).toBeNull();
     await waitFor(() => {
       const paths = fetchMock.mock.calls.map(([input]) => String(input));
       expect(paths).toContain('/bootstrap');
@@ -124,7 +124,9 @@ describe('站点标题初始化', () => {
       }),
     );
     const view = mount();
-    expect(await view.findByText('控制台 | 跨境网络小管家')).toBeTruthy();
+    // 登录页的字标显示站点名，副标题单独一行。
+    expect((await view.findByText('控制台')).classList.contains('login-word')).toBe(true);
+    expect(view.getByText('跨境网络小管家')).toBeTruthy();
     expect(view.queryByText(/Brocade/)).toBeNull();
     expect(document.title).toBe('跨境网络小管家');
   });

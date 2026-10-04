@@ -204,12 +204,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(rows) => eprintln!("notifications: 清掉 {rows} 条过期机器事件"),
                 Err(error) => eprintln!("notifications: 清理机器事件失败：{error}"),
             }
+            match pruner
+                .prune_user_online_sources(brocade_store::USER_ONLINE_SOURCE_RETENTION_DAYS)
+                .await
+            {
+                Ok(0) => {}
+                Ok(rows) => eprintln!("presence: 清掉 {rows} 条过期来源"),
+                Err(error) => eprintln!("presence: 清理来源失败：{error}"),
+            }
         }
     });
 
     // Permission automation.  The model write and its outbox row are one transaction in store;
-    // this loop only turns queued rows into non-disruptive grants deployments.  It folds all due
-    // rows into the newest revision, while an already-created deployment remains immutable.
+    // this loop only turns queued rows into non-disruptive grants deployments. Once any row is
+    // due it folds the whole queued batch into its newest revision, including backed-off rows;
+    // an already-created deployment remains immutable and must settle before the next order.
     let grants_wake = Arc::new(Notify::new());
     let grants_store = store.clone();
     let grants_signal = grants_wake.clone();

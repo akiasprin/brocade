@@ -98,13 +98,19 @@ func (s *statsServer) GetUsersStats(ctx context.Context, request *GetUsersStatsR
 		email, _, _ := strings.Cut(rest, ">>>")
 
 		user := &UserStat{Email: email}
-		om.ForEach(func(ip string, lastSeen int64) bool {
+		appendIP := func(ip string, lastSeen int64, protocols []string) bool {
 			user.Ips = append(user.Ips, &OnlineIPEntry{
-				Ip:       ip,
-				LastSeen: lastSeen,
+				Ip:        ip,
+				LastSeen:  lastSeen,
+				Protocols: protocols,
 			})
 			return true
-		})
+		}
+		if protocols, ok := om.(feature_stats.ProtocolOnlineMap); ok {
+			protocols.ForEachWithProtocols(appendIP)
+		} else {
+			om.ForEach(func(ip string, lastSeen int64) bool { return appendIP(ip, lastSeen, nil) })
+		}
 		if len(user.Ips) > 0 {
 			userMap[email] = user
 		}

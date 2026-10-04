@@ -301,6 +301,14 @@ fn difference(before: &Raw, now: &Raw) -> Sub {
             .is_some_and(|previous| cpu_times_regressed(*previous, *current))
     });
     let delayed = elapsed > SUB_INTERVAL_SECS + SUB_INTERVAL_SECS / 2;
+    let gap =
+        rebooted || clock_regressed || aggregate_cpu_regressed || core_cpu_regressed || delayed;
+    if gap {
+        crate::warn(format!(
+            "load: sample gap from={} to={} elapsed_secs={elapsed} delayed={delayed} rebooted={rebooted} clock_regressed={clock_regressed} aggregate_cpu_regressed={aggregate_cpu_regressed} core_cpu_regressed={core_cpu_regressed}",
+            before.at, now.at,
+        ));
+    }
     let invalid_interval = rebooted || clock_regressed;
     let cpu_total = now.cpu.total.saturating_sub(before.cpu.total);
     let share = |a: u64, b: u64| -> f32 {
@@ -537,11 +545,7 @@ fn difference(before: &Raw, now: &Raw) -> Sub {
         gup_pinned_bytes,
         disk,
         proc_cpu_pct,
-        gap: rebooted
-            || clock_regressed
-            || aggregate_cpu_regressed
-            || core_cpu_regressed
-            || delayed,
+        gap,
     }
 }
 

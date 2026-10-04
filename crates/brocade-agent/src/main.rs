@@ -34,7 +34,7 @@ use probe::{
     collect_e2e_probe_report, collect_link_probe_report, collect_ping_probe_report, e2e_once,
     fetch_e2e_probe_targets, fetch_ping_probe_settings, fetch_probe_targets, judge_hops,
     ping_probe_once, probe_once, read_hop_downlinks, send_e2e_probe_report, send_link_probe_report,
-    send_ping_probe_report, xray_listen_ports, XrayListenProtocol,
+    send_ping_probe_report, xray_listen_ports, PingProbePlan, XrayListenProtocol,
 };
 use spool::{
     collect_runtime_report, collect_spool_backlog, record_local_reconcile, runtime_cycle,
@@ -72,8 +72,8 @@ use brocade_deployment::{
         AgentObservationRequest, DesiredStateResponse, E2eProbeRequest, E2eProbeTargetList,
         GeodataFileState, GeodataObservation, LinkHealthRequest, LinkProbeRequest,
         LoadReportRequest, NodeDesiredDeployment, NodeRuntimeReport, PingProbeReportRequest,
-        PingProbeSettings, ProbeTargetList, ReportedNodeState, RouteIpReport, SpoolBacklog,
-        TargetApplyResult, UsageCounter, UsageReportRequest,
+        ProbeTargetList, ReportedNodeState, RouteIpReport, SpoolBacklog, TargetApplyResult,
+        UsageCounter, UsageReportRequest,
     },
 };
 
@@ -88,6 +88,8 @@ const USAGE_GENERATION_FILE: &str = "usage-generation";
 /// Presence means the running Xray was launched through the bounded sink. It deliberately sits
 /// outside xray.json: logging is agent runtime state, not part of the compiled Xray artifact.
 const XRAY_BOUNDED_LOG_MARKER: &str = "xray.bounded-log";
+const XRAY_SPLICE_MODE_MARKER: &str = "xray.splice-mode";
+const XRAY_SECURE_DOKODEMO_SPLICE_CAPABILITY: &str = "secure-dokodemo-splice";
 const AGENT_JOURNAL_MAX_MIB_HEADER: &str = "x-brocade-agent-journal-max-mib";
 const XRAY_LOG_MAX_MIB_HEADER: &str = "x-brocade-xray-log-max-mib";
 const PHANTUN_LOG_MAX_MIB_HEADER: &str = "x-brocade-phantun-log-max-mib";
@@ -116,12 +118,6 @@ fn install_termination_handlers() -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn finish_traffic_meter(state_dir: &Path) {
-    if let Err(error) = traffic::sample(state_dir) {
-        eprintln!("traffic final sample: {error}");
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -215,6 +211,20 @@ fn next_periodic_tick(previous_tick: Instant, interval: Duration, now: Instant) 
     }
 }
 
+/// Only slow rounds are logged; normal ten-second ticks remain quiet. Keep scheduler delay and
+/// collection duration separate so a gap can be traced without guessing from the chart.
+fn warn_slow_round(name: &str, scheduled: Instant, started: Instant, finished: Instant) {
+    let late = started.saturating_duration_since(scheduled);
+    let elapsed = finished.saturating_duration_since(started);
+    if late > Duration::from_secs(5) || elapsed > Duration::from_secs(5) {
+        warn(format!(
+            "{name}: slow round lateness_ms={} duration_ms={}",
+            late.as_millis(),
+            elapsed.as_millis(),
+        ));
+    }
+}
+
 struct SettingsCache<T> {
     current: Mutex<Option<T>>,
     changed: Condvar,
@@ -286,7 +296,7 @@ impl<T: Clone + PartialEq> SettingsCache<T> {
     }
 }
 
-type PingProbeSettingsCache = SettingsCache<PingProbeSettings>;
+type PingProbeSettingsCache = SettingsCache<PingProbePlan>;
 
 struct PendingLatestReport<T> {
     report: Option<T>,
@@ -358,6 +368,7 @@ impl<T> LatestReport<T> {
 struct RuntimeReports {
     reports: LatestReport<NodeRuntimeReport>,
     last_spool: Mutex<Option<SpoolBacklog>>,
+    traffic: Arc<traffic::TrafficSnapshot>,
 }
 
 impl Default for RuntimeReports {
@@ -365,6 +376,7 @@ impl Default for RuntimeReports {
         Self {
             reports: LatestReport::default(),
             last_spool: Mutex::new(None),
+            traffic: Arc::new(traffic::TrafficSnapshot::default()),
         }
     }
 }
@@ -375,7 +387,7 @@ impl RuntimeReports {
             .last_spool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let report = collect_runtime_report(state_dir)?;
+        let report = collect_runtime_report(state_dir, self.traffic.latest())?;
         *last_spool = Some(report.spool.clone());
         self.reports.publish(report);
         Ok(())
@@ -390,7 +402,7 @@ impl RuntimeReports {
         if last_spool.as_ref() == Some(&current) {
             return Ok(());
         }
-        let report = collect_runtime_report(state_dir)?;
+        let report = collect_runtime_report(state_dir, self.traffic.latest())?;
         *last_spool = Some(report.spool.clone());
         self.reports.publish(report);
         Ok(())
@@ -692,7 +704,11 @@ fn reconcile_local_inner(
     if xray_conf.exists() && !state_dir.join("xray.disabled").exists() {
         let content = fs::read_to_string(&xray_conf).map_err(|error| error.to_string())?;
         let api_port = xray_api_port(&content).unwrap_or(10085);
-        let restarted = if force || matches!(xray_runtime(&content), WorkloadRuntime::Broken(_)) {
+        let splice_mode_changed = xray_splice_mode_changed(state_dir, &content)?;
+        let restarted = if force
+            || splice_mode_changed
+            || matches!(xray_runtime(&content), WorkloadRuntime::Broken(_))
+        {
             // No sampling here: reaching this point means xray is already gone (or
             // repair forced a replay), the counters vanished with it, and sampling
             // would only read a freshly started, empty process.
@@ -1174,6 +1190,10 @@ fn run_forever(options: Options) -> Result<(), String> {
     let wants_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let runtime_reports = Arc::new(RuntimeReports::default());
+    let traffic_worker = traffic::TrafficWorker::spawn(
+        options.state_dir.clone(),
+        Arc::clone(&runtime_reports.traffic),
+    )?;
     let _ = RUNTIME_REPORTS.set(Arc::clone(&runtime_reports));
     let vpngate_realtime: realtime::VpngateCache = Default::default();
     {
@@ -1450,13 +1470,10 @@ fn run_forever(options: Options) -> Result<(), String> {
             .spawn(move || {
                 let mut next_tick = Instant::now();
                 loop {
+                    let started = Instant::now();
                     each_round("load", || {
-                        // This is also the durable traffic-meter clock. Persist independently of
-                        // HTTP delivery so a control-plane outage does not create an accounting
-                        // outage and a power loss leaves at most one ten-second interval unknown.
-                        if let Err(error) = traffic::sample(&options.state_dir) {
-                            eprintln!("traffic: {error}");
-                        }
+                        // Durable interface accounting has its own writer. In particular, an
+                        // fsync or the traffic meter's lock must never precede host sampling.
                         match build_load_report(&options) {
                             Ok(Some(report)) => reports_out.publish(report),
                             Ok(None) => {}
@@ -1465,6 +1482,7 @@ fn run_forever(options: Options) -> Result<(), String> {
                     });
 
                     let now = Instant::now();
+                    warn_slow_round("load", next_tick, started, now);
                     next_tick = next_periodic_tick(next_tick, LOAD_INTERVAL, now);
                     thread::sleep(next_tick.saturating_duration_since(now));
                 }
@@ -1663,7 +1681,7 @@ fn run_forever(options: Options) -> Result<(), String> {
     let mut apply_tick = Instant::now();
     loop {
         if TERMINATION_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
-            finish_traffic_meter(&options.state_dir);
+            traffic_worker.finish()?;
             println!("收到退出信号，最终流量样本已落盘");
             return Ok(());
         }
@@ -1683,12 +1701,12 @@ fn run_forever(options: Options) -> Result<(), String> {
         // interface and is unaffected; convergence is idempotent and re-runs every 15 seconds; and
         // anything owed to the control plane is already on disk in the spool.
         if TERMINATION_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
-            finish_traffic_meter(&options.state_dir);
+            traffic_worker.finish()?;
             println!("这一轮收敛做完了，最终流量样本已落盘，退出服务");
             return Ok(());
         }
         if wants_exit.load(std::sync::atomic::Ordering::SeqCst) {
-            finish_traffic_meter(&options.state_dir);
+            traffic_worker.finish()?;
             println!("selfupdate: 这一轮收敛做完了，退出让服务管理器用新二进制拉起来");
             return Ok(());
         }
@@ -2444,12 +2462,7 @@ fn converge_linux_xray(
             // what the running process was given, and the swap below is expressed as the
             // difference between the two.
             let previous = fs::read_to_string(&path).ok();
-            let desired_splice_disabled = xray_needs_splice_disabled(content)?;
-            let splice_mode_changed = previous
-                .as_deref()
-                .map(xray_needs_splice_disabled)
-                .transpose()?
-                != Some(desired_splice_disabled);
+            let splice_mode_changed = xray_splice_mode_changed(state_dir, content)?;
             write_private(&path, content)?;
             let _ = fs::remove_file(state_dir.join("xray.disabled"));
             let api_port = xray_api_port(content).unwrap_or(10085);
@@ -2482,6 +2495,7 @@ fn converge_linux_xray(
             terminate_xray()?;
             let _ = fs::remove_file(state_dir.join("xray.json"));
             let _ = fs::remove_file(state_dir.join(XRAY_BOUNDED_LOG_MARKER));
+            let _ = fs::remove_file(state_dir.join(XRAY_SPLICE_MODE_MARKER));
             fs::write(state_dir.join("xray.disabled"), reason)
                 .map_err(|error| error.to_string())?;
             Ok(())
@@ -2616,14 +2630,14 @@ fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
     let conf = shell_quote(&path.display().to_string());
     let content =
         fs::read_to_string(path).map_err(|error| format!("读取待启动的 xray 配置失败：{error}"))?;
-    let disable_splice = xray_needs_splice_disabled(&content)?;
+    let disable_splice =
+        xray_needs_splice_disabled(&content, xray_supports_secure_dokodemo_splice())?;
     let xray = xray_program();
     let executable = shell_quote(&xray);
-    let launch = if disable_splice {
-        format!("env 'xray.buf.splice=disable' {executable} run -config {conf}")
-    } else {
-        format!("{executable} run -config {conf}")
-    };
+    let splice_mode = if disable_splice { "disable" } else { "auto" };
+    // Set both modes explicitly so a service-manager environment cannot retain the legacy
+    // process-wide disable after the installed Xray gains the connection-scoped guard.
+    let launch = format!("env 'xray.buf.splice={splice_mode}' {executable} run -config {conf}");
     let state_dir = path.parent().ok_or("xray config has no state directory")?;
     let log_dir = state_dir.join("logs");
     create_private_dir(&log_dir)?;
@@ -2655,13 +2669,18 @@ fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
     ))?;
     fs::write(state_dir.join(XRAY_BOUNDED_LOG_MARKER), b"dynamic\n")
         .map_err(|error| format!("failed to record bounded xray logging: {error}"))?;
+    fs::write(
+        state_dir.join(XRAY_SPLICE_MODE_MARKER),
+        splice_mode.as_bytes(),
+    )
+    .map_err(|error| format!("failed to record xray splice mode: {error}"))?;
     Ok(())
 }
 
-fn xray_needs_splice_disabled(content: &str) -> Result<bool, String> {
+fn xray_needs_splice_disabled(content: &str, secure_dokodemo_splice: bool) -> Result<bool, String> {
     let value: serde_json::Value = serde_json::from_str(content)
         .map_err(|error| format!("解析待启动的 xray 配置失败：{error}"))?;
-    Ok(value["inbounds"]
+    let has_security_front = value["inbounds"]
         .as_array()
         .into_iter()
         .flatten()
@@ -2672,7 +2691,97 @@ fn xray_needs_splice_disabled(content: &str) -> Result<bool, String> {
                     inbound["streamSettings"]["security"].as_str(),
                     Some("reality" | "tls")
                 )
-        }))
+        });
+    Ok(has_security_front && !secure_dokodemo_splice)
+}
+
+fn xray_version_has_capability(output: &str, capability: &str) -> bool {
+    output.lines().any(|line| {
+        line.strip_prefix("Brocade-Capabilities:")
+            .is_some_and(|values| {
+                values
+                    .split_ascii_whitespace()
+                    .any(|value| value == capability)
+            })
+    })
+}
+
+fn xray_supports_secure_dokodemo_splice() -> bool {
+    let Ok(path) = which_xray() else {
+        return false;
+    };
+    let Ok(before) = XrayFileVersion::read(&path) else {
+        return false;
+    };
+    let cache = XRAY_SPLICE_CAPABILITY_CACHE.get_or_init(|| Mutex::new(Vec::with_capacity(4)));
+    if let Some(supported) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(version, _)| *version == before)
+        .map(|(_, supported)| *supported)
+    {
+        return supported;
+    }
+
+    let program = path.to_string_lossy().into_owned();
+    let Ok(output) = run_command(&program, &["version"]) else {
+        return false;
+    };
+    let Ok(after) = XrayFileVersion::read(&path) else {
+        return false;
+    };
+    if before != after {
+        return false;
+    }
+    let supported = xray_version_has_capability(&output, XRAY_SECURE_DOKODEMO_SPLICE_CAPABILITY);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.len() == 4 {
+        cache.remove(0);
+    }
+    cache.push((after, supported));
+    supported
+}
+
+fn xray_environ_disables_splice(environ: &[u8]) -> bool {
+    environ
+        .split(|byte| *byte == 0)
+        .any(|entry| entry == b"xray.buf.splice=disable")
+}
+
+fn parse_xray_splice_mode(value: &str) -> Option<bool> {
+    match value.trim() {
+        "disable" => Some(true),
+        "auto" => Some(false),
+        _ => None,
+    }
+}
+
+fn persisted_xray_splice_disabled(state_dir: &Path) -> Option<bool> {
+    fs::read_to_string(state_dir.join(XRAY_SPLICE_MODE_MARKER))
+        .ok()
+        .and_then(|value| parse_xray_splice_mode(&value))
+}
+
+fn xray_splice_mode_changed(state_dir: &Path, content: &str) -> Result<bool, String> {
+    let desired = xray_needs_splice_disabled(content, xray_supports_secure_dokodemo_splice())?;
+    let running = serving_xray_process()
+        .and_then(|process| running_xray_splice_disabled(process).ok())
+        .or_else(|| persisted_xray_splice_disabled(state_dir));
+    Ok(splice_mode_differs(running, desired))
+}
+
+fn splice_mode_differs(running: Option<bool>, desired: bool) -> bool {
+    running != Some(desired)
+}
+
+fn running_xray_splice_disabled(process: ProcessRef) -> Result<bool, String> {
+    let path = format!("/proc/{}/environ", process.pid);
+    let environ =
+        fs::read(&path).map_err(|error| format!("读取运行中 Xray 环境 {path} 失败：{error}"))?;
+    Ok(xray_environ_disables_splice(&environ))
 }
 
 fn converge_linux_grants(
@@ -3447,6 +3556,8 @@ impl XrayFileVersion {
 // inode + size + mtime + ctime invalidates atomic replacement and in-place edits without trusting
 // the path alone. The second metadata read prevents caching a hash of bytes that changed mid-read.
 static XRAY_DIGEST_CACHE: OnceLock<Mutex<Vec<(XrayFileVersion, String)>>> = OnceLock::new();
+static XRAY_SPLICE_CAPABILITY_CACHE: OnceLock<Mutex<Vec<(XrayFileVersion, bool)>>> =
+    OnceLock::new();
 
 fn cached_xray_sha256(path: &Path) -> Result<String, String> {
     const CACHE_ENTRIES: usize = 4;
@@ -3765,12 +3876,17 @@ mod tests {
         let reports = super::RuntimeReports::default();
         reports.publish_current(&dir).unwrap();
         assert_eq!(reports.reports.try_take().unwrap().0.spool.usage, 1);
+        assert!(
+            !dir.join("traffic-meter.json").exists(),
+            "runtime assembly must not create or advance the durable traffic meter"
+        );
 
         fs::write(dir.join(super::USAGE_SPOOL.file), b"").unwrap();
         reports.publish_if_spool_changed(&dir).unwrap();
         assert_eq!(reports.reports.try_take().unwrap().0.spool.usage, 0);
         reports.publish_if_spool_changed(&dir).unwrap();
         assert!(reports.reports.try_take().is_none());
+        assert!(!dir.join("traffic-meter.json").exists());
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -3778,8 +3894,8 @@ mod tests {
     #[test]
     fn a_ping_settings_refresh_replaces_the_cached_snapshot() {
         let cache = super::PingProbeSettingsCache::default();
-        let settings = |interval_secs| brocade_deployment::protocol::PingProbeSettings {
-            targets: Vec::new(),
+        let settings = |interval_secs| super::PingProbePlan {
+            probes: Vec::new(),
             interval_secs,
             timeout_ms: 420,
         };
@@ -3867,7 +3983,9 @@ mod tests {
     };
     use crate::options::{ApplyMode, Options};
     use crate::probe::{xray_listen_ports, XrayListenProtocol};
-    use crate::spool::{spool_push, spool_read, Spool, OBSERVATION_SPOOL, USAGE_SPOOL};
+    use crate::spool::{
+        spool_push, spool_read, DroppedKind, Spool, OBSERVATION_SPOOL, USAGE_SPOOL,
+    };
     use crate::wg::{judge_wg_peers, parse_wg_dump, parse_wireguard_conf_peers, PeerState};
     use crate::xray_grpc::XrayStat;
     use brocade_deployment::plan::{
@@ -4649,12 +4767,12 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
     }
 
     #[test]
-    fn splice_is_disabled_only_for_security_fronts() {
+    fn only_legacy_xray_disables_splice_for_security_fronts() {
         let ordinary = r#"{"inbounds":[
             {"protocol":"dokodemo-door","settings":{"address":"127.0.0.1"}},
             {"protocol":"vless","settings":{"clients":[]},"streamSettings":{"security":"reality"}}
         ]}"#;
-        assert!(!crate::xray_needs_splice_disabled(ordinary).unwrap());
+        assert!(!crate::xray_needs_splice_disabled(ordinary, false).unwrap());
 
         for security in ["reality", "tls"] {
             let split = format!(
@@ -4665,11 +4783,46 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
                 }}]}}"#
             );
             assert!(
-                crate::xray_needs_splice_disabled(&split).unwrap(),
+                crate::xray_needs_splice_disabled(&split, false).unwrap(),
+                "{security}"
+            );
+            assert!(
+                !crate::xray_needs_splice_disabled(&split, true).unwrap(),
                 "{security}"
             );
         }
-        assert!(crate::xray_needs_splice_disabled("not json").is_err());
+        assert!(crate::xray_needs_splice_disabled("not json", true).is_err());
+    }
+
+    #[test]
+    fn xray_capability_requires_the_machine_readable_capability_line() {
+        let supported = "Xray 26.4.25 (...)\n\
+            A unified platform.\n\
+            Brocade-Capabilities: anytls secure-dokodemo-splice\n";
+        assert!(crate::xray_version_has_capability(
+            supported,
+            crate::XRAY_SECURE_DOKODEMO_SPLICE_CAPABILITY
+        ));
+        assert!(!crate::xray_version_has_capability(
+            "Xray secure-dokodemo-splice\n",
+            crate::XRAY_SECURE_DOKODEMO_SPLICE_CAPABILITY
+        ));
+    }
+
+    #[test]
+    fn xray_environment_detects_only_the_exact_legacy_disable() {
+        assert!(crate::xray_environ_disables_splice(
+            b"PATH=/bin\0xray.buf.splice=disable\0"
+        ));
+        assert!(!crate::xray_environ_disables_splice(
+            b"xray.buf.splice=auto\0OTHER=xray.buf.splice=disable\0"
+        ));
+        assert_eq!(crate::parse_xray_splice_mode("disable\n"), Some(true));
+        assert_eq!(crate::parse_xray_splice_mode("auto"), Some(false));
+        assert_eq!(crate::parse_xray_splice_mode("enable"), None);
+        assert!(crate::splice_mode_differs(Some(true), false));
+        assert!(!crate::splice_mode_differs(Some(false), false));
+        assert!(crate::splice_mode_differs(None, false));
     }
 
     #[test]
@@ -5304,6 +5457,7 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
             max: 3,
             what: "tiny",
             unit: "条",
+            dropped_kind: DroppedKind::Observation,
             terminal_statuses: &[400],
         };
 

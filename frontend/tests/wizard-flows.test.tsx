@@ -437,6 +437,40 @@ describe('纳管机器向导', () => {
 });
 
 describe('新建链向导', () => {
+  it.each(['node-certificate', 'global-site', 'custom-site'])(
+    '新建 %s REALITY 接入默认使用严格 fallback 限速',
+    async target => {
+      draft.init(`wizard-strict-${target}`);
+      draft.clear();
+      const done = vi.fn();
+      const view = render(
+        <QueryClientProvider client={queryClient()}>
+          <SessionProvider value={{ who: operator, initial }}>
+            <ChainWizard fixedApp={{ id: 'global', label: '全球加速' }} onDone={done} />
+          </SessionProvider>
+        </QueryClientProvider>,
+      );
+      fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
+      fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: '严格限速测试' } });
+      fireEvent.click(
+        within(view.getByRole('checkbox', { name: 'VLESS · REALITY' }).closest('.wzp-card') as HTMLElement).getByRole(
+          'button',
+          { name: '参数' },
+        ),
+      );
+      fireEvent.change(view.getByRole('combobox', { name: 'REALITY 目标来源' }), { target: { value: target } });
+      if (target === 'custom-site') {
+        fireEvent.change(view.getByLabelText('自定义 REALITY 目标'), { target: { value: 'www.example.com:443' } });
+        fireEvent.change(view.getByLabelText('自定义 REALITY SNI'), { target: { value: 'www.example.com' } });
+      }
+      fireEvent.click(view.getByRole('button', { name: '加入草稿' }));
+      await waitFor(() => expect(done).toHaveBeenCalledOnce());
+      expect(draft.ops().find(op => op.op === 'create_ingress')).toMatchObject({
+        ingress: { reality: { fallback_mode: target, fallback_limits: { mode: 'strict' } } },
+      });
+    },
+  );
+
   it('没有机器时仍保留纸面与配置卡，并说明如何解除阻塞', () => {
     const client = queryClient();
     client.setQueryData(['nodes'], { nodes: [] });
@@ -739,6 +773,7 @@ describe('新建链向导', () => {
     const ingress = draft.ops().find(op => op.op === 'create_ingress');
     expect(ingress).toMatchObject({
       ingress: {
+        reality: { fallback_limits: { mode: 'strict' } },
         wires: {
           anytls: { padding_scheme: ['stop=4', '0=20-30'] },
           hysteria2: { bandwidth: { up: '200 mbps', down: '500 mbps' } },

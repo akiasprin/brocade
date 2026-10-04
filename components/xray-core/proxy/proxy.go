@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"runtime"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -111,6 +112,25 @@ type TrafficState struct {
 	RemainingServerHello   int32
 	Inbound                InboundState
 	Outbound               OutboundState
+
+	// TLS hello detection is fed by the independently running uplink and
+	// downlink copy loops. Keep the small, bounded reassembly state here so a
+	// record split across reads is classified exactly once without racing the
+	// opposite direction.
+	tlsFilterMu sync.Mutex
+	tlsFilter   [2]tlsHelloFilterState
+}
+
+type tlsHelloFilterState struct {
+	data []byte
+	done bool
+}
+
+type tlsFilterSnapshot struct {
+	filtering      bool
+	isTLS          bool
+	isTLS12orAbove bool
+	enableXtls     bool
 }
 
 type InboundState struct {
@@ -171,6 +191,23 @@ func NewTrafficState(userUUID []byte) *TrafficState {
 	}
 }
 
+func (s *TrafficState) tlsSnapshot() tlsFilterSnapshot {
+	s.tlsFilterMu.Lock()
+	defer s.tlsFilterMu.Unlock()
+	return tlsFilterSnapshot{
+		filtering:      s.NumberOfPacketToFilter > 0,
+		isTLS:          s.IsTLS,
+		isTLS12orAbove: s.IsTLS12orAbove,
+		enableXtls:     s.EnableXtls,
+	}
+}
+
+func (s *TrafficState) tlsFiltering() bool {
+	s.tlsFilterMu.Lock()
+	defer s.tlsFilterMu.Unlock()
+	return s.NumberOfPacketToFilter > 0
+}
+
 // VisionReader is used to read xtls vision protocol
 // Note Vision probably only make sense as the inner most layer of reader, since it need assess traffic state from origin proxy traffic
 type VisionReader struct {
@@ -185,6 +222,21 @@ type VisionReader struct {
 
 	// internal
 	directReadCounter stats.Counter
+}
+
+type visionBufferProvider interface {
+	VisionBuffers() (*bytes.Reader, *bytes.Buffer)
+}
+
+// VisionBuffers resolves transport read-ahead without coupling VLESS to the
+// private layout of crypto/tls, uTLS, REALITY, or VLESS encryption wrappers.
+func VisionBuffers(conn net.Conn) (*bytes.Reader, *bytes.Buffer, bool) {
+	provider, ok := conn.(visionBufferProvider)
+	if !ok {
+		return nil, nil, false
+	}
+	input, rawInput := provider.VisionBuffers()
+	return input, rawInput, input != nil && rawInput != nil
 }
 
 func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, input *bytes.Reader, rawInput *bytes.Buffer, ob *session.Outbound) *VisionReader {
@@ -232,7 +284,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		return buffer, err
 	}
 
-	if *withinPaddingBuffers || w.trafficState.NumberOfPacketToFilter > 0 {
+	if *withinPaddingBuffers || w.trafficState.tlsFiltering() {
 		mb2 := make(buf.MultiBuffer, 0, len(buffer))
 		for _, b := range buffer {
 			newbuffer := XtlsUnpadding(b, w.trafficState, w.isUplink, w.ctx)
@@ -252,8 +304,8 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			errors.LogDebug(w.ctx, "XtlsRead unknown command ", *currentCommand, buffer.Len())
 		}
 	}
-	if w.trafficState.NumberOfPacketToFilter > 0 {
-		XtlsFilterTls(buffer, w.trafficState, w.ctx)
+	if w.trafficState.tlsFiltering() {
+		XtlsFilterTls(buffer, w.trafficState, w.isUplink, w.ctx)
 	}
 
 	if *switchToDirectCopy {
@@ -270,11 +322,11 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		w.rawInput = nil
 
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
-			// if w.isUplink && inbound.CanSpliceCopy == 2 { // TODO: enable uplink splice
-			// 	inbound.CanSpliceCopy = 1
+			// if w.isUplink && inbound.CanSpliceCopy.Load() == session.SpliceCopyWaiting { // TODO: enable uplink splice
+			// 	inbound.CanSpliceCopy.CompareAndSwap(session.SpliceCopyWaiting, session.SpliceCopyDirect)
 			// }
-			if !w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // ob need to be passed in due to context can have more than one ob
-				w.ob.CanSpliceCopy = 1
+			if !w.isUplink && w.ob != nil { // ob need to be passed in due to context can have more than one ob
+				w.ob.CanSpliceCopy.CompareAndSwap(session.SpliceCopyWaiting, session.SpliceCopyDirect)
 			}
 		}
 		readerConn, readCounter, _ := UnwrapRawConn(w.conn)
@@ -297,6 +349,12 @@ type VisionWriter struct {
 	// internal
 	writeOnceUserUUID  []byte
 	directWriteCounter stats.Counter
+	directWrite        bool
+	tlsRecordMode      uint8
+	tlsRecordHeader    [6]byte
+	tlsRecordHeaderLen int
+	tlsRecordRemaining int
+	tlsRecordIsAppData bool
 
 	testseed []uint32
 }
@@ -322,7 +380,6 @@ func NewVisionWriter(writer buf.Writer, trafficState *TrafficState, isUplink boo
 func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	var isPadding *bool
 	var switchToDirectCopy *bool
-	var spliceReadyInbound *session.Inbound
 	if w.isUplink {
 		isPadding = &w.trafficState.Outbound.IsPadding
 		switchToDirectCopy = &w.trafficState.Outbound.UplinkWriterDirectCopy
@@ -331,44 +388,37 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		switchToDirectCopy = &w.trafficState.Inbound.DownlinkWriterDirectCopy
 	}
 
+	var spliceReadyInbound *session.Inbound
 	if *switchToDirectCopy {
-		if inbound := session.InboundFromContext(w.ctx); inbound != nil {
-			if !w.isUplink && inbound.CanSpliceCopy == 2 {
-				spliceReadyInbound = inbound
-			}
-			// if w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // TODO: enable uplink splice
-			// 	w.ob.CanSpliceCopy = 1
-			// }
-		}
-		rawConn, _, writerCounter := UnwrapRawConn(w.conn)
-		w.Writer = buf.NewWriter(rawConn)
-		w.directWriteCounter = writerCounter
-		*switchToDirectCopy = false
-	}
-	if !mb.IsEmpty() && w.directWriteCounter != nil {
-		w.directWriteCounter.Add(int64(mb.Len()))
+		spliceReadyInbound = w.activateDirectWrite(switchToDirectCopy)
 	}
 
-	if w.trafficState.NumberOfPacketToFilter > 0 {
-		XtlsFilterTls(mb, w.trafficState, w.ctx)
+	if w.trafficState.tlsFiltering() {
+		XtlsFilterTls(mb, w.trafficState, w.isUplink, w.ctx)
 	}
 
 	if *isPadding {
 		if len(mb) == 1 && mb[0] == nil {
 			mb[0] = XtlsPadding(nil, CommandPaddingContinue, &w.writeOnceUserUUID, true, w.ctx, w.testseed) // we do a long padding to hide vless header
 		} else {
+			handled, fallback, err := w.writeTLSRecords(mb, isPadding, switchToDirectCopy)
+			if handled {
+				return err
+			}
+			mb = fallback
+			snapshot := w.trafficState.tlsSnapshot()
 			isComplete := IsCompleteRecord(mb)
 			mb = ReshapeMultiBuffer(w.ctx, mb)
-			longPadding := w.trafficState.IsTLS
+			longPadding := snapshot.isTLS
 			for i, b := range mb {
-				if w.trafficState.IsTLS && b.Len() >= 6 && bytes.Equal(TlsApplicationDataStart, b.BytesTo(3)) && isComplete {
-					if w.trafficState.EnableXtls {
+				if snapshot.isTLS && b.Len() >= 6 && bytes.Equal(TlsApplicationDataStart, b.BytesTo(3)) && isComplete {
+					if snapshot.enableXtls {
 						*switchToDirectCopy = true
 					}
 					var command byte = CommandPaddingContinue
 					if i == len(mb)-1 {
 						command = CommandPaddingEnd
-						if w.trafficState.EnableXtls {
+						if snapshot.enableXtls {
 							command = CommandPaddingDirect
 						}
 					}
@@ -376,7 +426,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 					*isPadding = false // padding going to end
 					longPadding = false
 					continue
-				} else if !w.trafficState.IsTLS12orAbove && w.trafficState.NumberOfPacketToFilter <= 1 { // For compatibility with earlier vision receiver, we finish padding 1 packet early
+				} else if !snapshot.isTLS12orAbove && !snapshot.filtering { // For compatibility with earlier vision receiver, finish padding once classification is conclusive.
 					*isPadding = false
 					mb[i] = XtlsPadding(b, CommandPaddingEnd, &w.writeOnceUserUUID, longPadding, w.ctx, w.testseed)
 					break
@@ -384,7 +434,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				var command byte = CommandPaddingContinue
 				if i == len(mb)-1 && !*isPadding {
 					command = CommandPaddingEnd
-					if w.trafficState.EnableXtls {
+					if snapshot.enableXtls {
 						command = CommandPaddingDirect
 					}
 				}
@@ -392,69 +442,326 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			}
 		}
 	}
+	return w.writeOutput(mb, spliceReadyInbound)
+}
+
+const (
+	tlsRecordModeUnknown uint8 = iota
+	tlsRecordModeTLS
+	tlsRecordModePassthrough
+	maxTLSRecordPayload = (1 << 14) + 2048
+)
+
+func (w *VisionWriter) activateDirectWrite(switchToDirectCopy *bool) *session.Inbound {
+	var spliceReadyInbound *session.Inbound
+	if inbound := session.InboundFromContext(w.ctx); inbound != nil {
+		if !w.isUplink && inbound.CanSpliceCopy.Load() == session.SpliceCopyWaiting {
+			spliceReadyInbound = inbound
+		}
+		// Uplink splice is intentionally not enabled yet. The writer still has to
+		// unwrap the outer TLS connection when the peer sends CommandPaddingDirect.
+	}
+	rawConn, _, writerCounter := UnwrapRawConn(w.conn)
+	w.Writer = buf.NewWriter(rawConn)
+	w.directWriteCounter = writerCounter
+	w.directWrite = true
+	*switchToDirectCopy = false
+	return spliceReadyInbound
+}
+
+func (w *VisionWriter) writeOutput(mb buf.MultiBuffer, spliceReadyInbound *session.Inbound) error {
+	bytesWritten := int64(mb.Len())
+	if bytesWritten > 0 && w.directWriteCounter != nil {
+		w.directWriteCounter.Add(bytesWritten)
+	}
 	if err := w.Writer.WriteMultiBuffer(mb); err != nil {
 		return err
 	}
-	if spliceReadyInbound != nil && spliceReadyInbound.CanSpliceCopy == 2 {
-		// Enable splice only after this write has completed to avoid racing
-		// concurrent direct writes to the same TCP connection.
-		spliceReadyInbound.CanSpliceCopy = 1
+	if !w.isUplink && w.directWrite && bytesWritten > 0 {
+		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.SpliceMetrics != nil {
+			inbound.SpliceMetrics.AddDirectBytes(bytesWritten)
+		}
+	}
+	if spliceReadyInbound != nil && bytesWritten > 0 && spliceReadyInbound.CanSpliceCopy.CompareAndSwap(session.SpliceCopyWaiting, session.SpliceCopyDirect) {
+		// Enable splice only after this write has completed to avoid racing a
+		// concurrent raw write to the same TCP connection.
+		if spliceReadyInbound.SpliceMetrics != nil {
+			spliceReadyInbound.SpliceMetrics.MarkDirect()
+		}
 	}
 	return nil
 }
 
+// writeTLSRecords tracks TLS record boundaries without delaying short writes.
+// Header fragments are padded and sent immediately; only six bytes of parser
+// state and the current record's remaining length survive across calls. The
+// block carrying the final byte of the first application-data record ends
+// padding, so direct mode starts at an exact TLS record boundary regardless of
+// how Read split the stream.
+func (w *VisionWriter) writeTLSRecords(mb buf.MultiBuffer, isPadding, switchToDirectCopy *bool) (bool, buf.MultiBuffer, error) {
+	if w.tlsRecordMode == tlsRecordModePassthrough {
+		return false, mb, nil
+	}
+
+	snapshot := w.trafficState.tlsSnapshot()
+	var padded buf.MultiBuffer
+	content := buf.New()
+	flush := func(command byte) {
+		if content.IsEmpty() {
+			return
+		}
+		longPadding := snapshot.isTLS && !w.tlsRecordIsAppData
+		padded = append(padded, XtlsPadding(content, command, &w.writeOnceUserUUID, longPadding, w.ctx, w.testseed))
+		content = buf.New()
+	}
+	defer func() {
+		if content != nil {
+			content.Release()
+		}
+	}()
+
+	for bufferIndex, input := range mb {
+		if input == nil {
+			continue
+		}
+		data := input.Bytes()
+		consumed := 0
+		for consumed < len(data) {
+			if content.Len() >= buf.Size-21 {
+				flush(CommandPaddingContinue)
+			}
+
+			if w.tlsRecordMode == tlsRecordModeUnknown {
+				needed := len(w.tlsRecordHeader) - w.tlsRecordHeaderLen
+				take := minInt(needed, len(data)-consumed, int(buf.Size-21-content.Len()))
+				copy(w.tlsRecordHeader[w.tlsRecordHeaderLen:], data[consumed:consumed+take])
+				_, _ = content.Write(data[consumed : consumed+take])
+				w.tlsRecordHeaderLen += take
+				consumed += take
+				if w.tlsRecordHeaderLen < len(w.tlsRecordHeader) {
+					continue
+				}
+
+				recordSize, valid := tlsRecordSize(w.tlsRecordHeader[:])
+				expectedHello := TlsHandshakeTypeServerHello
+				if w.isUplink {
+					expectedHello = TlsHandshakeTypeClientHello
+				}
+				if !valid || w.tlsRecordHeader[0] != 0x16 || w.tlsRecordHeader[5] != expectedHello {
+					w.tlsRecordMode = tlsRecordModePassthrough
+					flush(CommandPaddingContinue)
+					if err := w.writeOutput(padded, nil); err != nil {
+						input.Advance(int32(consumed))
+						buf.ReleaseMulti(mb[bufferIndex:])
+						return true, nil, err
+					}
+					input.Advance(int32(consumed))
+					if input.IsEmpty() {
+						input.Release()
+						mb[bufferIndex] = nil
+						return false, mb[bufferIndex+1:], nil
+					}
+					return false, mb[bufferIndex:], nil
+				}
+
+				w.tlsRecordMode = tlsRecordModeTLS
+				w.tlsRecordRemaining = recordSize - len(w.tlsRecordHeader)
+				w.tlsRecordHeaderLen = 0
+				if w.tlsRecordRemaining == 0 {
+					w.tlsRecordIsAppData = false
+				}
+				continue
+			}
+
+			if w.tlsRecordRemaining == 0 {
+				needed := 5 - w.tlsRecordHeaderLen
+				take := minInt(needed, len(data)-consumed, int(buf.Size-21-content.Len()))
+				copy(w.tlsRecordHeader[w.tlsRecordHeaderLen:], data[consumed:consumed+take])
+				_, _ = content.Write(data[consumed : consumed+take])
+				w.tlsRecordHeaderLen += take
+				consumed += take
+				if w.tlsRecordHeaderLen < 5 {
+					continue
+				}
+
+				recordSize, valid := tlsRecordSize(w.tlsRecordHeader[:5])
+				if !valid {
+					w.tlsRecordMode = tlsRecordModePassthrough
+					flush(CommandPaddingContinue)
+					if err := w.writeOutput(padded, nil); err != nil {
+						input.Advance(int32(consumed))
+						buf.ReleaseMulti(mb[bufferIndex:])
+						return true, nil, err
+					}
+					input.Advance(int32(consumed))
+					if input.IsEmpty() {
+						input.Release()
+						mb[bufferIndex] = nil
+						return false, mb[bufferIndex+1:], nil
+					}
+					return false, mb[bufferIndex:], nil
+				}
+				w.tlsRecordRemaining = recordSize - 5
+				w.tlsRecordIsAppData = snapshot.isTLS && bytes.Equal(w.tlsRecordHeader[:3], TlsApplicationDataStart)
+				w.tlsRecordHeaderLen = 0
+			}
+
+			take := minInt(w.tlsRecordRemaining, len(data)-consumed, int(buf.Size-21-content.Len()))
+			_, _ = content.Write(data[consumed : consumed+take])
+			w.tlsRecordRemaining -= take
+			consumed += take
+			if w.tlsRecordRemaining != 0 || !w.tlsRecordIsAppData {
+				continue
+			}
+
+			command := CommandPaddingEnd
+			if snapshot.enableXtls {
+				command = CommandPaddingDirect
+				*switchToDirectCopy = true
+			}
+			flush(command)
+			*isPadding = false
+			if err := w.writeOutput(padded, nil); err != nil {
+				input.Advance(int32(consumed))
+				buf.ReleaseMulti(mb[bufferIndex:])
+				return true, nil, err
+			}
+			padded = nil
+
+			input.Advance(int32(consumed))
+			var remainder buf.MultiBuffer
+			if input.IsEmpty() {
+				input.Release()
+				mb[bufferIndex] = nil
+				remainder = mb[bufferIndex+1:]
+			} else {
+				remainder = mb[bufferIndex:]
+			}
+			if remainder.IsEmpty() {
+				return true, nil, nil
+			}
+			var spliceReadyInbound *session.Inbound
+			if snapshot.enableXtls {
+				spliceReadyInbound = w.activateDirectWrite(switchToDirectCopy)
+			}
+			return true, nil, w.writeOutput(remainder, spliceReadyInbound)
+		}
+		input.Release()
+		mb[bufferIndex] = nil
+	}
+
+	flush(CommandPaddingContinue)
+	return true, nil, w.writeOutput(padded, nil)
+}
+
+func tlsRecordSize(header []byte) (int, bool) {
+	if len(header) < 5 || header[0] < 0x14 || header[0] > 0x17 || header[1] != 0x03 {
+		return 0, false
+	}
+	payload := int(header[3])<<8 | int(header[4])
+	if payload <= 0 || payload > maxTLSRecordPayload {
+		return 0, false
+	}
+	return payload + 5, true
+}
+
+func minInt(values ...int) int {
+	minimum := values[0]
+	for _, value := range values[1:] {
+		if value < minimum {
+			minimum = value
+		}
+	}
+	return minimum
+}
+
 // IsCompleteRecord Is complete tls data record
 func IsCompleteRecord(buffer buf.MultiBuffer) bool {
-	b := make([]byte, buffer.Len())
-	if buffer.Copy(b) != int(buffer.Len()) {
-		panic("impossible bytes allocation")
-	}
-	var headerLen int = 5
-	var recordLen int
-
-	totalLen := len(b)
-	i := 0
-	for i < totalLen {
-		// record header: 0x17 0x3 0x3 + 2 bytes length
-		if headerLen > 0 {
-			data := b[i]
-			i++
-			switch headerLen {
-			case 5:
-				if data != 0x17 {
-					return false
-				}
-			case 4:
-				if data != 0x03 {
-					return false
-				}
-			case 3:
-				if data != 0x03 {
-					return false
-				}
-			case 2:
-				recordLen = int(data) << 8
-			case 1:
-				recordLen = recordLen | int(data)
-			}
-			headerLen--
-		} else if recordLen > 0 {
-			remaining := totalLen - i
-			if remaining < recordLen {
-				return false
-			} else {
-				i += recordLen
-				recordLen = 0
-				headerLen = 5
-			}
-		} else {
+	cursor := newMultiBufferCursor(buffer)
+	for cursor.remaining > 0 {
+		contentType, ok := cursor.readByte()
+		if !ok || contentType != 0x17 {
+			return false
+		}
+		major, ok := cursor.readByte()
+		if !ok || major != 0x03 {
+			return false
+		}
+		minor, ok := cursor.readByte()
+		if !ok || minor != 0x03 {
+			return false
+		}
+		high, ok := cursor.readByte()
+		if !ok {
+			return false
+		}
+		low, ok := cursor.readByte()
+		if !ok {
+			return false
+		}
+		recordLen := int(high)<<8 | int(low)
+		if recordLen == 0 || !cursor.skip(recordLen) {
 			return false
 		}
 	}
-	if headerLen == 5 && recordLen == 0 {
-		return true
+	return true
+}
+
+type multiBufferCursor struct {
+	buffers   buf.MultiBuffer
+	buffer    int
+	offset    int
+	remaining int
+}
+
+func newMultiBufferCursor(buffers buf.MultiBuffer) multiBufferCursor {
+	remaining := 0
+	for _, buffer := range buffers {
+		if buffer != nil {
+			remaining += int(buffer.Len())
+		}
 	}
-	return false
+	return multiBufferCursor{buffers: buffers, remaining: remaining}
+}
+
+func (c *multiBufferCursor) readByte() (byte, bool) {
+	for c.buffer < len(c.buffers) {
+		buffer := c.buffers[c.buffer]
+		if buffer == nil || c.offset >= int(buffer.Len()) {
+			c.buffer++
+			c.offset = 0
+			continue
+		}
+		value := buffer.Byte(int32(c.offset))
+		c.offset++
+		c.remaining--
+		return value, true
+	}
+	return 0, false
+}
+
+func (c *multiBufferCursor) skip(bytes int) bool {
+	if bytes > c.remaining {
+		return false
+	}
+	c.remaining -= bytes
+	for bytes > 0 {
+		buffer := c.buffers[c.buffer]
+		if buffer == nil || c.offset >= int(buffer.Len()) {
+			c.buffer++
+			c.offset = 0
+			continue
+		}
+		available := int(buffer.Len()) - c.offset
+		if available > bytes {
+			c.offset += bytes
+			return true
+		}
+		bytes -= available
+		c.buffer++
+		c.offset = 0
+	}
+	return true
 }
 
 // ReshapeMultiBuffer prepare multi buffer for padding structure (max 21 bytes)
@@ -615,58 +922,92 @@ func XtlsUnpadding(b *buf.Buffer, s *TrafficState, isUplink bool, ctx context.Co
 	return newbuffer
 }
 
-// XtlsFilterTls filter and recognize tls 1.3 and other info
-func XtlsFilterTls(buffer buf.MultiBuffer, trafficState *TrafficState, ctx context.Context) {
+// XtlsFilterTls recognizes the first TLS hello in one traffic direction. The
+// copy loops may split a record at any byte and run concurrently, so detection
+// is protected by TrafficState and reassembles at most one bounded TLS record.
+func XtlsFilterTls(buffer buf.MultiBuffer, trafficState *TrafficState, isUplink bool, ctx context.Context) {
+	trafficState.tlsFilterMu.Lock()
+	defer trafficState.tlsFilterMu.Unlock()
+	if trafficState.NumberOfPacketToFilter <= 0 {
+		return
+	}
+
+	direction := 0
+	expectedHello := TlsHandshakeTypeClientHello
+	if !isUplink {
+		direction = 1
+		expectedHello = TlsHandshakeTypeServerHello
+	}
+	filter := &trafficState.tlsFilter[direction]
+	if filter.done {
+		return
+	}
+
 	for _, b := range buffer {
-		if b == nil {
+		if b == nil || b.IsEmpty() || len(filter.data) >= maxTLSRecordPayload+5 {
 			continue
 		}
-		trafficState.NumberOfPacketToFilter--
-		if b.Len() >= 6 {
-			startsBytes := b.BytesTo(6)
-			if bytes.Equal(TlsServerHandShakeStart, startsBytes[:3]) && startsBytes[5] == TlsHandshakeTypeServerHello {
-				trafficState.RemainingServerHello = (int32(startsBytes[3])<<8 | int32(startsBytes[4])) + 5
-				trafficState.IsTLS12orAbove = true
-				trafficState.IsTLS = true
-				if b.Len() >= 79 && trafficState.RemainingServerHello >= 79 {
-					sessionIdLen := int32(b.Byte(43))
-					cipherSuite := b.BytesRange(43+sessionIdLen+1, 43+sessionIdLen+3)
-					trafficState.Cipher = uint16(cipherSuite[0])<<8 | uint16(cipherSuite[1])
-				} else {
-					errors.LogDebug(ctx, "XtlsFilterTls short server hello, tls 1.2 or older? ", b.Len(), " ", trafficState.RemainingServerHello)
-				}
-			} else if bytes.Equal(TlsClientHandShakeStart, startsBytes[:2]) && startsBytes[5] == TlsHandshakeTypeClientHello {
-				trafficState.IsTLS = true
-				errors.LogDebug(ctx, "XtlsFilterTls found tls client hello! ", buffer.Len())
-			}
+		remaining := maxTLSRecordPayload + 5 - len(filter.data)
+		data := b.Bytes()
+		if len(data) > remaining {
+			data = data[:remaining]
 		}
-		if trafficState.RemainingServerHello > 0 {
-			end := trafficState.RemainingServerHello
-			if end > b.Len() {
-				end = b.Len()
-			}
-			trafficState.RemainingServerHello -= b.Len()
-			if bytes.Contains(b.BytesTo(end), Tls13SupportedVersions) {
-				v, ok := Tls13CipherSuiteDic[trafficState.Cipher]
-				if !ok {
-					v = "Old cipher: " + strconv.FormatUint(uint64(trafficState.Cipher), 16)
-				} else if v != "TLS_AES_128_CCM_8_SHA256" {
-					trafficState.EnableXtls = true
-				}
-				errors.LogDebug(ctx, "XtlsFilterTls found tls 1.3! ", b.Len(), " ", v)
-				trafficState.NumberOfPacketToFilter = 0
-				return
-			} else if trafficState.RemainingServerHello <= 0 {
-				errors.LogDebug(ctx, "XtlsFilterTls found tls 1.2! ", b.Len())
-				trafficState.NumberOfPacketToFilter = 0
-				return
-			}
-			errors.LogDebug(ctx, "XtlsFilterTls inconclusive server hello ", b.Len(), " ", trafficState.RemainingServerHello)
+		filter.data = append(filter.data, data...)
+	}
+	if len(filter.data) < 6 {
+		return
+	}
+
+	recordSize, valid := tlsRecordSize(filter.data)
+	if !valid || filter.data[0] != 0x16 || filter.data[5] != expectedHello {
+		filter.data = nil
+		filter.done = true
+		// A connection starts in the uplink direction. If its first payload is
+		// not a ClientHello, continuing to scan arbitrary application chunks only
+		// makes padding duration depend on read fragmentation.
+		if isUplink || trafficState.IsTLS {
+			trafficState.NumberOfPacketToFilter = 0
 		}
-		if trafficState.NumberOfPacketToFilter <= 0 {
-			errors.LogDebug(ctx, "XtlsFilterTls stop filtering", buffer.Len())
+		return
+	}
+
+	trafficState.IsTLS = true
+	if isUplink {
+		filter.data = nil
+		filter.done = true
+		errors.LogDebug(ctx, "XtlsFilterTls found tls client hello! ", buffer.Len())
+		return
+	}
+
+	trafficState.IsTLS12orAbove = true
+	trafficState.RemainingServerHello = int32(recordSize)
+	if len(filter.data) < recordSize {
+		return
+	}
+	hello := filter.data[:recordSize]
+	if len(hello) > 45 {
+		sessionIDLength := int(hello[43])
+		cipherOffset := 44 + sessionIDLength
+		if cipherOffset+2 <= len(hello) {
+			trafficState.Cipher = uint16(hello[cipherOffset])<<8 | uint16(hello[cipherOffset+1])
 		}
 	}
+
+	if bytes.Contains(hello, Tls13SupportedVersions) {
+		cipherName, ok := Tls13CipherSuiteDic[trafficState.Cipher]
+		if !ok {
+			cipherName = "Old cipher: " + strconv.FormatUint(uint64(trafficState.Cipher), 16)
+		} else if cipherName != "TLS_AES_128_CCM_8_SHA256" {
+			trafficState.EnableXtls = true
+		}
+		errors.LogDebug(ctx, "XtlsFilterTls found tls 1.3! ", recordSize, " ", cipherName)
+	} else {
+		errors.LogDebug(ctx, "XtlsFilterTls found tls 1.2! ", recordSize)
+	}
+	trafficState.RemainingServerHello = 0
+	trafficState.NumberOfPacketToFilter = 0
+	filter.data = nil
+	filter.done = true
 }
 
 // UnwrapRawConn support unwrap encryption, stats, mask wrappers, tls, utls, reality, proxyproto, uds-wrapper conn and get raw tcp/uds conn from it
@@ -719,58 +1060,72 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	readerConn, readCounter, _ := UnwrapRawConn(readerConn)
 	writerConn, _, writeCounter := UnwrapRawConn(writerConn)
 	reader := buf.NewReader(readerConn)
+	inbound := session.InboundFromContext(ctx)
 	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
+		SetSpliceNotUsedReason(inbound, session.SpliceNotUsedUnsupportedTransport)
 		return readV(ctx, reader, writer, timer, readCounter)
 	}
 	tc, ok := writerConn.(*net.TCPConn)
 	if !ok || readerConn == nil || writerConn == nil {
+		SetSpliceNotUsedReason(inbound, session.SpliceNotUsedRawConnectionUnavailable)
 		return readV(ctx, reader, writer, timer, readCounter)
 	}
-	inbound := session.InboundFromContext(ctx)
-	if inbound == nil || inbound.CanSpliceCopy == 3 {
+	if inbound == nil || inbound.CanSpliceCopy.Load() == session.SpliceCopyDisabled {
+		SetSpliceNotUsedReason(inbound, session.SpliceNotUsedInboundIneligible)
 		return readV(ctx, reader, writer, timer, readCounter)
 	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
+		SetSpliceNotUsedReason(inbound, session.SpliceNotUsedMissingOutbound)
 		return readV(ctx, reader, writer, timer, readCounter)
 	}
 	for _, ob := range outbounds {
-		if ob.CanSpliceCopy == 3 {
+		if ob.CanSpliceCopy.Load() == session.SpliceCopyDisabled {
+			SetSpliceNotUsedReason(inbound, session.SpliceNotUsedOutboundIneligible)
 			return readV(ctx, reader, writer, timer, readCounter)
 		}
 	}
 
 	for {
-		inbound := session.InboundFromContext(ctx)
-		outbounds := session.OutboundsFromContext(ctx)
-		var splice = inbound.CanSpliceCopy == 1
+		var splice = inbound.CanSpliceCopy.Load() == session.SpliceCopyDirect
 		for _, ob := range outbounds {
-			if ob.CanSpliceCopy != 1 {
+			if ob.CanSpliceCopy.Load() != session.SpliceCopyDirect {
 				splice = false
 			}
 		}
-		if splice {
+		if splice && inbound.CanSpliceCopy.CompareAndSwap(session.SpliceCopyDirect, session.SpliceCopySplicing) {
 			errors.LogDebug(ctx, "CopyRawConn splice")
+			if inbound.SpliceMetrics != nil {
+				inbound.SpliceMetrics.MarkSplice()
+			}
 			statWriter, _ := writer.(*dispatcher.SizeStatWriter)
 			//runtime.Gosched() // necessary
 			timer.SetTimeout(24 * time.Hour) // prevent leak, just in case
 			if inTimer != nil {
 				inTimer.SetTimeout(24 * time.Hour)
 			}
-			w, err := tc.ReadFrom(readerConn)
-			if readCounter != nil {
-				readCounter.Add(w) // outbound stats
+			for {
+				limited := &io.LimitedReader{R: readerConn, N: spliceAccountingChunk}
+				written, err := tc.ReadFrom(limited)
+				if readCounter != nil {
+					readCounter.Add(written) // outbound stats
+				}
+				if writeCounter != nil {
+					writeCounter.Add(written) // inbound stats
+				}
+				if statWriter != nil {
+					statWriter.Counter.Add(written) // user stats
+				}
+				if inbound.SpliceMetrics != nil {
+					inbound.SpliceMetrics.AddSpliceBytes(written)
+				}
+				if err != nil && errors.Cause(err) != io.EOF {
+					return err
+				}
+				if err != nil || written < spliceAccountingChunk {
+					return nil
+				}
 			}
-			if writeCounter != nil {
-				writeCounter.Add(w) // inbound stats
-			}
-			if statWriter != nil {
-				statWriter.Counter.Add(w) // user stats
-			}
-			if err != nil && errors.Cause(err) != io.EOF {
-				return err
-			}
-			return nil
 		}
 		buffer, err := reader.ReadMultiBuffer()
 		if !buffer.IsEmpty() {
@@ -779,15 +1134,40 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			}
 			timer.Update()
 			if werr := writer.WriteMultiBuffer(buffer); werr != nil {
+				setSpliceEndedReason(inbound)
 				return werr
 			}
 		}
 		if err != nil {
+			setSpliceEndedReason(inbound)
 			if errors.Cause(err) == io.EOF {
 				return nil
 			}
 			return err
 		}
+	}
+}
+
+// spliceAccountingChunk keeps byte counters observable during long downloads
+// while amortizing the accounting work over large zero-copy transfers.
+const spliceAccountingChunk int64 = 64 << 20
+
+// SetSpliceNotUsedReason records why a protocol connection did not enter the
+// raw splice path. It is a no-op for protocols without splice metrics.
+func SetSpliceNotUsedReason(inbound *session.Inbound, reason session.SpliceNotUsedReason) {
+	if inbound != nil && inbound.SpliceMetrics != nil {
+		inbound.SpliceMetrics.SetNotSplicedReason(reason)
+	}
+}
+
+func setSpliceEndedReason(inbound *session.Inbound) {
+	if inbound == nil {
+		return
+	}
+	if inbound.CanSpliceCopy.Load() == session.SpliceCopyDirect {
+		SetSpliceNotUsedReason(inbound, session.SpliceNotUsedEndedBeforeSplice)
+	} else {
+		SetSpliceNotUsedReason(inbound, session.SpliceNotUsedEndedBeforeDirect)
 	}
 }
 

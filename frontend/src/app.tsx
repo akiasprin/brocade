@@ -11,7 +11,7 @@ import {
   type AuthState,
   type BrandingSettings,
 } from './api';
-import { Login } from './ui/login';
+import { DirectLogin, Login, parseDirectLoginHash } from './ui/login';
 import {
   autoPublicSuppressed,
   enterPublic,
@@ -95,11 +95,16 @@ export function App() {
   });
   // A failed request is not evidence that the operator chose the product defaults.
   const branding = brandingQuery.data ?? { site_name: '控制台', icon_data_url: null };
+  const [directCredentials, setDirectCredentials] = useState(() => parseDirectLoginHash(window.location.hash));
+  // A direct credential must take precedence over any cookie already in this browser. Remember the
+  // startup choice even if the user later falls back to the password form; do not restore the old
+  // identity after explicitly leaving a failed direct login.
+  const [restoreExistingSession] = useState(directCredentials === null);
   /* 浏览器会话依赖 HttpOnly cookie；内存中保存身份及首帧骨架所需的轻量统计。 */
   const [session, setSession] = useState<Session | null>(null);
   // 刷新后先用 cookie 恢复会话：恢复完成前只保留中性台面，避免短暂闪出登录表单。
   // 401 和网络错误同样进入登录页。
-  const [restoring, setRestoring] = useState(true);
+  const [restoring, setRestoring] = useState(restoreExistingSession);
   // Query keys describe resources rather than identities. Clear them whenever a new identity
   // enters, otherwise an administrator's cached user list can survive into a public session.
   const onLogin = useCallback(
@@ -114,6 +119,7 @@ export function App() {
   );
 
   useEffect(() => {
+    if (!restoreExistingSession) return;
     let active = true;
     // `/bootstrap`, the shell chunk and the current pane chunk are independent. Starting all three
     // here removes two avoidable network waterfalls without merging the split chunks.
@@ -153,7 +159,7 @@ export function App() {
     return () => {
       active = false;
     };
-  }, [queryClient]);
+  }, [queryClient, restoreExistingSession]);
 
   useEffect(() => {
     if (brandingQuery.data) {
@@ -162,7 +168,26 @@ export function App() {
     }
   }, [brandingQuery.data]);
 
-  if (restoring || brandingQuery.isPending) return <div id="stage" />;
+  if (brandingQuery.isPending) return <div id="stage" />;
+  if (directCredentials)
+    return (
+      <>
+        <div id="stage" />
+        <DirectLogin
+          branding={branding}
+          credentials={directCredentials}
+          onLogin={next => {
+            setDirectCredentials(null);
+            onLogin(next);
+          }}
+          onUsePassword={() => {
+            suppressAutoPublic();
+            void logoutAdmin().finally(() => setDirectCredentials(null));
+          }}
+        />
+      </>
+    );
+  if (restoring) return <div id="stage" />;
   if (!session)
     return (
       <>

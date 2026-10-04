@@ -14,12 +14,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"reflect"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	utls "github.com/refraction-networking/utls"
@@ -49,6 +47,16 @@ func (c *Conn) HandshakeAddress() net.Address {
 	return net.ParseAddress(state.ServerName)
 }
 
+// VisionBuffers exposes REALITY read-ahead through the transport wrapper.
+func (c *Conn) VisionBuffers() (*bytes.Reader, *bytes.Buffer) {
+	input, inputOK := utils.TryAccessField[bytes.Reader](c.Conn, "input")
+	rawInput, rawInputOK := utils.TryAccessField[bytes.Buffer](c.Conn, "rawInput")
+	if !inputOK || !rawInputOK {
+		return nil, nil
+	}
+	return input, rawInput
+}
+
 func Server(c net.Conn, config *reality.Config) (net.Conn, error) {
 	realityConn, err := reality.Server(context.Background(), c, config)
 	return &Conn{Conn: realityConn}, err
@@ -73,14 +81,33 @@ func (c *UConn) HandshakeAddress() net.Address {
 	return net.ParseAddress(state.ServerName)
 }
 
+// VisionBuffers exposes uTLS read-ahead through the REALITY wrapper.
+func (c *UConn) VisionBuffers() (*bytes.Reader, *bytes.Buffer) {
+	input, inputOK := utils.TryAccessField[bytes.Reader](c.Conn, "input")
+	rawInput, rawInputOK := utils.TryAccessField[bytes.Buffer](c.Conn, "rawInput")
+	if !inputOK || !rawInputOK {
+		return nil, nil
+	}
+	return input, rawInput
+}
+
 func (c *UConn) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 	if c.Config.Show {
 		localAddr := c.LocalAddr().String()
 		fmt.Printf("REALITY localAddr: %v\tis using X25519MLKEM768 for TLS' communication: %v\n", localAddr, c.HandshakeState.ServerHello.ServerShare.Group == utls.X25519MLKEM768)
 		fmt.Printf("REALITY localAddr: %v\tis using ML-DSA-65 for cert's extra verification: %v\n", localAddr, len(c.Config.Mldsa65Verify) > 0)
 	}
-	p, _ := reflect.TypeOf(c.Conn).Elem().FieldByName("peerCertificates")
-	certs := *(*([]*x509.Certificate))(unsafe.Pointer(uintptr(unsafe.Pointer(c.Conn)) + p.Offset))
+	if len(rawCerts) == 0 {
+		return errors.New("REALITY: peer sent no certificates")
+	}
+	certs := make([]*x509.Certificate, len(rawCerts))
+	for index, rawCert := range rawCerts {
+		cert, err := x509.ParseCertificate(rawCert)
+		if err != nil {
+			return errors.New("REALITY: failed to parse peer certificate").Base(err)
+		}
+		certs[index] = cert
+	}
 	if pub, ok := certs[0].PublicKey.(ed25519.PublicKey); ok {
 		h := hmac.New(sha512.New, c.AuthKey)
 		h.Write(pub)

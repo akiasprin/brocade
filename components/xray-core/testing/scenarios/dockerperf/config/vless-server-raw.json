@@ -1,0 +1,35 @@
+{
+  "log": { "loglevel": "warning" },
+  "stats": {},
+  "api": {
+    "tag": "api",
+    "listen": "0.0.0.0:10085",
+    "services": ["StatsService"]
+  },
+  "metrics": { "listen": "0.0.0.0:10086" },
+  "inbounds": [{
+    "tag": "vless-reality",
+    "listen": "0.0.0.0",
+    "port": 443,
+    "protocol": "vless",
+    "settings": {
+      "clients": [{ "id": "11111111-1111-4111-8111-111111111111" }],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "dest": "172.30.2.3:8443",
+        "serverNames": ["cover.test"],
+        "privateKey": "aGSYystUbf59_9_6LKRxD27rmSW_-2_nyd9YG_Gwbks",
+        "shortIds": ["0123456789abcdef"]
+      }
+    }
+  }],
+  "outbounds": [{
+    "tag": "direct",
+    "protocol": "freedom",
+    "settings": { "ipsBlocked": [] }
+  }]
+}

@@ -74,12 +74,14 @@ import { compatibleXhttpMode, transportKindFor, type IngressSecurity } from '../
 import {
   fallbackLimitDraft,
   fallbackLimitsFromDraft,
+  newRealityFallbackLimits,
   type FallbackLimitDraft,
   type FallbackRateDraft,
 } from '../reality-fallback';
 import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
-import { can, isPublic, useSession } from '../session';
+import { can, isVisitor, useSession } from '../session';
 import { Empty, EmptyState, ErrorBox, Loading, SegmentedControl, SegSwitch } from '../ui/bits';
+import { latencyMean } from '../ui/latency';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import {
   SUBSCRIPTION_COUNTRY_CODES,
@@ -404,14 +406,14 @@ function ChainLatency({ probe }: { probe: E2eProbeItem | undefined }) {
      抖动。窗口与下方曲线相同（samples 的近 6 小时），只计入成功的样本——失败样本的耗时
      是超时时间，与链路速度无关。当前不通时仍显示「不通」：此刻没有延迟可言，历史均值
      会把一个进行中的故障读成正常。 */
-  const valid = probe
-    ? probe.samples.ttfb_ms.filter(
-        (value, index): value is number => value != null && probe.samples.status[index] === 'ok',
-      )
-    : [];
-  const avg = valid.length > 0 ? Math.round(valid.reduce((sum, v) => sum + v, 0) / valid.length) : null;
-  const shown = avg ?? probe?.ttfb_ms ?? null;
+  const summary = latencyMean(
+    probe?.samples.ttfb_ms.map((value, index) =>
+      value != null && probe.samples.status[index] === 'ok' ? value : null,
+    ) ?? [],
+  );
+  const shown = summary.value ?? probe?.ttfb_ms ?? null;
   const ok = probe?.status === 'ok' && shown != null;
+  const excluded = summary.excludedSpikes > 0 ? `，已忽略 ${summary.excludedSpikes} 次离群高延迟` : '';
   return (
     <span
       className={`chain-card-latency${ok ? '' : ' word'}`}
@@ -419,7 +421,7 @@ function ChainLatency({ probe }: { probe: E2eProbeItem | undefined }) {
         !probe
           ? '还没探过这条链'
           : ok
-            ? `近 6 小时 ${valid.length} 次探测的平均落点首字节，最新一次 ${probe.ttfb_ms}ms`
+            ? `近 6 小时 ${summary.includedSamples} 次有效探测的平均落点首字节${excluded}，最新一次 ${probe.ttfb_ms}ms`
             : toneTitle(probe)
       }
     >
@@ -1007,10 +1009,10 @@ function IngressRealityRow({
   target?: 'vless' | 'anytls';
 }) {
   const qc = useQueryClient();
-  // The passwordless public visitor is intentionally outside `/settings`' allow-list. Existing
-  // ingress values already live in the masked snapshot, so its read-only view must not make a
-  // request that can only answer 403. Ordinary readonly operators may still inspect the masked
-  // global site through the settings endpoint.
+  // Visitor roles (passwordless public and ordinary user) are intentionally outside `/settings`'
+  // allow-list. Existing ingress values already live in the masked snapshot, so their read-only
+  // views must not make a request that can only answer 403. Readonly operators may still inspect
+  // the masked global site through the settings endpoint.
   const settings = useQuery({ queryKey: ['settings'], queryFn: fetchSettings, enabled: settingsReadable });
   const global = settings.data?.reality_site;
   type RealityCertificateForm = {
@@ -1049,7 +1051,7 @@ function IngressRealityRow({
     fingerprint: next.source === 'custom-site' ? next.fingerprint.trim() : '',
     flow: null,
     fallback_mode: next.source,
-    fallback_limits: ingressReality?.fallback_limits ?? { mode: 'balanced' as const },
+    fallback_limits: ingressReality?.fallback_limits ?? newRealityFallbackLimits(),
     fallback_guard: ingressReality?.fallback_guard ?? true,
   });
   const withAnyTlsReality = (body: UpsertIngressBody, next: RealityCertificateForm): UpsertIngressBody => {
@@ -1522,8 +1524,8 @@ function IngressRealityLimitsRow({
           disabled={!editable || save.isPending}
           onChange={event => setDraft({ ...form, mode: event.target.value as FallbackLimitDraft['mode'] })}
         >
-          <option value="balanced">均衡（默认，适合公网入口）</option>
-          <option value="strict">严格（更早、更低速）</option>
+          <option value="strict">严格（默认，更早、更低速）</option>
+          <option value="balanced">均衡</option>
           <option value="custom">自定义上传、下载参数</option>
           <option value="off">关闭限速</option>
         </select>
@@ -1631,6 +1633,10 @@ function projectionProtocolLabel(protocol: ProjectionProtocol): string {
     case 'hysteria2':
       return 'Hysteria 2';
   }
+}
+
+function formatProjectionAddress(host: string, port: number): string {
+  return `${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${port}`;
 }
 
 type XmuxDraft = {
@@ -2080,7 +2086,7 @@ export function IngressStreamRow({
   onAnyTlsEnabledChange?: (enabled: boolean | null) => void;
   onEncryptionEnabledChange?: (enabled: boolean | null) => void;
   onHy2EnabledChange?: (enabled: boolean | null) => void;
-  /** Public visitors cannot call `/settings`; editable and ordinary readonly views can. */
+  /** Visitor roles cannot call `/settings`; editable and readonly operator views can. */
   settingsReadable?: boolean;
   /** 本次渲染的是哪一段。
    *
@@ -2828,7 +2834,7 @@ export function IngressStreamRow({
                         fingerprint: '',
                         flow: null,
                         fallback_mode: 'global-site',
-                        fallback_limits: { mode: 'balanced' },
+                        fallback_limits: newRealityFallbackLimits(),
                         fallback_guard: true,
                       },
                     }
@@ -3109,7 +3115,7 @@ export function IngressStreamRow({
                 <input
                   className="f mono"
                   type="password"
-                  autoComplete="new-password"
+                  autoComplete="off"
                   style={{ width: 220, borderColor: hy2ObfsBad ? 'var(--err)' : undefined }}
                   placeholder="混淆密码"
                   value={hy2Value.obfs.password}
@@ -3732,7 +3738,12 @@ export function IngressProjectionRow({
   ingress: SnapshotIngress;
   protocol: ProjectionProtocol;
   family: 'v4' | 'v6';
-  node?: { public_ipv4: string | null; public_ipv6: string | null };
+  node?: {
+    public_ipv4: string | null;
+    public_ipv6: string | null;
+    public_ipv4_nat?: boolean;
+    public_ipv6_nat?: boolean;
+  };
   editable: boolean;
   onHandle?: (h: ProjectionHandle) => void;
   saving?: boolean;
@@ -3743,6 +3754,7 @@ export function IngressProjectionRow({
   const [disabledDraft, setDisabledDraft] = useState(false);
 
   const publicAddr = family === 'v4' ? node?.public_ipv4 : node?.public_ipv6;
+  const publicNat = family === 'v4' ? node?.public_ipv4_nat : node?.public_ipv6_nat;
   const label = family === 'v4' ? 'IPv4' : 'IPv6';
   const fieldLabel = `${projectionProtocolLabel(protocol)} ${label}`;
 
@@ -3799,9 +3811,16 @@ export function IngressProjectionRow({
   const dirty =
     disabledDraft ||
     (draft !== null && (!current || !valid || draft.host.trim() !== current.host || port !== current.port));
-  const currentAddress = current
-    ? `${current.host.includes(':') && !current.host.startsWith('[') ? `[${current.host}]` : current.host}:${current.port}`
-    : '';
+  const currentAddress = current ? formatProjectionAddress(current.host, current.port) : '';
+  const defaultAddress =
+    publicAddr && !publicNat ? formatProjectionAddress(publicAddr, projectionListenPort(ingress, protocol)) : '';
+  const resultAddress = on
+    ? draft && valid
+      ? formatProjectionAddress(draft.host.trim(), port)
+      : draft
+        ? ''
+        : currentAddress
+    : defaultAddress;
   const doSave = useCallback(() => {
     if (managed) {
       if (disabledDraft) mutateProjection(null);
@@ -3863,7 +3882,33 @@ export function IngressProjectionRow({
           />
           {dirty && <span className="client-projection-dirty" title="未保存" />}
         </div>
-        {draft ? (
+        <div className="client-projection-summary">
+          <span className="client-projection-result-label">当前结果</span>
+          {resultAddress ? (
+            <code title={resultAddress}>{resultAddress}</code>
+          ) : draft ? (
+            <span className="note">填写有效地址和端口后显示</span>
+          ) : (
+            <span className="note">
+              {publicAddr && publicNat
+                ? `机器公网 ${label} 不可直连，不生成此条订阅`
+                : `机器无公网 ${label}，不生成此条订阅`}
+            </span>
+          )}
+          {!draft && on && current && (
+            <button
+              className="btn"
+              disabled={!editable || pending}
+              onClick={() => {
+                setDisabledDraft(false);
+                setDraft({ host: current.host, port: String(current.port) });
+              }}
+            >
+              编辑
+            </button>
+          )}
+        </div>
+        {draft && (
           <div className="client-projection-editor">
             <label>
               <span>地址或域名</span>
@@ -3891,23 +3936,7 @@ export function IngressProjectionRow({
               />
             </label>
           </div>
-        ) : on && current ? (
-          <div className="client-projection-summary">
-            <code title={currentAddress}>{currentAddress}</code>
-            <button
-              className="btn"
-              disabled={!editable || pending}
-              onClick={() => {
-                setDisabledDraft(false);
-                setDraft({ host: current.host, port: String(current.port) });
-              }}
-            >
-              编辑
-            </button>
-          </div>
-        ) : !publicAddr ? (
-          <div className="note">机器无公网 {label}，不生成此条订阅</div>
-        ) : null}
+        )}
         {save.error && <ErrorBox error={save.error} />}
       </dd>
     </>
@@ -5037,7 +5066,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   const { who } = useSession();
   const qc = useQueryClient();
   const editable = can(who.role, 'edit');
-  const settingsReadable = !isPublic(who);
+  const settingsReadable = !isVisitor(who);
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
   // 协议默认值、端口占用和规则补全必须在首屏一起就绪，不能等子面板挂载后再取数。
@@ -5322,18 +5351,18 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                 )}
                 <span className="sp" />
                 <button
-                  className="btn primary"
-                  disabled={!editable || !projDirty || projBlocked || saveProjections.isPending}
-                  onClick={() => saveProjections.mutate()}
-                >
-                  {saveProjections.isPending ? '保存中…' : '保存'}
-                </button>
-                <button
                   className="btn"
                   disabled={(!projDirty && !projEditing) || saveProjections.isPending}
                   onClick={() => Object.values(projHandles).forEach(h => h.reset())}
                 >
                   还原
+                </button>
+                <button
+                  className="btn primary"
+                  disabled={!editable || !projDirty || projBlocked || saveProjections.isPending}
+                  onClick={() => saveProjections.mutate()}
+                >
+                  {saveProjections.isPending ? '保存中…' : '保存'}
                 </button>
               </div>
             </ConfigPanel>
@@ -5967,7 +5996,7 @@ export function ChainRulesPanel({
   // 此前整块被替换为「修改规则需要 editor 及以上」——该提示回答的是权限问题，
   // 而进入链详情页需要了解的是当前配置，两者不同。
   readOnly?: boolean;
-  /** False only for the passwordless public visitor, whose route allow-list excludes settings. */
+  /** False for visitor roles, whose route allow-list excludes settings. */
   settingsReadable?: boolean;
   /** Machine detail coordinates both rule cards under one empty boundary instead of showing a nested skeleton. */
   loadingFallback?: ReactNode;

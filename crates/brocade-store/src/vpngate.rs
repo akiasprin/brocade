@@ -17,8 +17,8 @@ use brocade_deployment::protocol::{
     VpngateAdmissionPolicy, VpngateCandidate, VpngateDesiredPool, VpngateDesiredState,
     VpngateIpIntelligenceReport, VpngateIpNetwork, VpngateIpProvider, VpngateIpScore,
     VpngateManualSwitchCommand, VpngateManualSwitchStatus, VpngatePoolReport,
-    VpngateProbeAssignment, VpngateProbeReport, VpngateProbeSample, VpngateProbeStatus,
-    VpngateReconcileReport, VpngateTransport, MIN_AGENT_PROTOCOL_VERSION,
+    VpngateProbeAssignment, VpngateProbeMode, VpngateProbeReport, VpngateProbeSample,
+    VpngateProbeStatus, VpngateReconcileReport, VpngateTransport, MIN_AGENT_PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -29,7 +29,10 @@ const SYNC_LEASE_SECS: i32 = 300;
 const MAX_ERROR_CODE_CHARS: usize = 64;
 const MAX_ERROR_DETAIL_CHARS: usize = 2_000;
 const MAX_CURRENT_CATALOG_DROP_FACTOR: u64 = 3;
-const MAX_ACTIVE_CANDIDATES_PER_COUNTRY: i64 = VPNGATE_MAX_CANDIDATES as i64;
+// Keep a wider country-level shortlist than any one runtime pool. Individual outbounds still
+// apply their own bounded `max_candidates`, while the directory can expose enough admitted
+// alternatives for different pools and manual selection.
+const MAX_ACTIVE_CANDIDATES_PER_COUNTRY: i64 = 32;
 const DEFAULT_CATALOG_PROBE_WORKERS: u8 = 16;
 const MAX_CATALOG_PROBE_WORKERS: usize = 128;
 const MAX_CATALOG_PROBE_REPORT_SAMPLES: i64 = 128;
@@ -38,10 +41,19 @@ const INTELLIGENCE_POLICY_MIN_HOURS: u32 = 1;
 const INTELLIGENCE_POLICY_MAX_HOURS: u32 = 10 * 365 * 24;
 const ACTIVE_MAX_CONNECT_MS: i32 = 15_000;
 const ACTIVE_MIN_DOWNLOAD_BPS: i64 = 1_000_000;
-// Automatic pools must not keep serving a relay on historical success alone. Catalogue work is
-// intentionally fair across the retained directory, so failed relays return in their normal
-// oldest-first turn; until then, evidence older than this window cannot admit a relay.
-const ACTIVE_PROBE_MAX_AGE_SECS: i32 = 5 * 60 * 60;
+// Successful performance evidence remains usable for at least five hours. The query extends this
+// floor to the configured performance interval plus one connectivity interval, preventing a
+// healthy candidate from falling out between its scheduled checks. A later failure still starts
+// the much shorter review window below.
+const ACTIVE_PROBE_MIN_MAX_AGE_SECS: i32 = 5 * 60 * 60;
+const PROBE_SUCCESS_COOLDOWN_MIN_SECS: u32 = 60;
+const PROBE_SUCCESS_COOLDOWN_MAX_SECS: u32 = 24 * 60 * 60;
+const PROBE_PERFORMANCE_COOLDOWN_MIN_SECS: u32 = 60 * 60;
+const PROBE_PERFORMANCE_COOLDOWN_MAX_SECS: u32 = 7 * 24 * 60 * 60;
+const PROBE_SHARD_ROTATION_MIN_SECS: u32 = 60 * 60;
+const PROBE_SHARD_ROTATION_MAX_SECS: u32 = 7 * 24 * 60 * 60;
+const FAILED_CANDIDATE_GRACE_SECS: i32 = 20 * 60;
+const MAX_CONSECUTIVE_PROBE_FAILURES: i32 = 3;
 const HISTORY_PRUNE_BATCH_ROWS: i64 = 50_000;
 const UNKNOWN_COUNTRY_CODE: &str = "ZZ";
 const MANUAL_SWITCH_COOLDOWN_SECS: u32 = 10 * 60;
@@ -163,6 +175,9 @@ enum VpngateSyncLeaseKind {
 pub struct VpngateCatalogStatus {
     pub enabled: bool,
     pub interval_secs: u32,
+    pub probe_success_cooldown_secs: u32,
+    pub probe_performance_cooldown_secs: u32,
+    pub probe_shard_rotation_secs: u32,
     pub source_url: String,
     pub next_sync_at_unix_secs: i64,
     pub syncing: bool,
@@ -231,6 +246,8 @@ pub struct VpngateServerView {
     pub measured_nodes: u64,
     pub successful_samples: u64,
     pub latest_probe_status: Option<String>,
+    pub consecutive_probe_failures: u32,
+    pub probe_eligible_until_unix_secs: Option<i64>,
     pub latest_exit_ip: Option<String>,
     pub latest_exit_country_code: Option<String>,
     pub latest_connect_ms: Option<u32>,
@@ -254,6 +271,8 @@ pub enum VpngateDirectoryFilter {
     Candidate,
     Successful,
     Failed,
+    Reviewing,
+    Suspended,
     Pending,
     Current,
     Retained,
@@ -266,6 +285,8 @@ impl VpngateDirectoryFilter {
             Self::Candidate => "candidate",
             Self::Successful => "successful",
             Self::Failed => "failed",
+            Self::Reviewing => "reviewing",
+            Self::Suspended => "suspended",
             Self::Pending => "pending",
             Self::Current => "current",
             Self::Retained => "retained",
@@ -450,6 +471,14 @@ pub struct UpdateVpngateCatalogSettings {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateVpngateProbeSettings {
+    pub success_cooldown_secs: u32,
+    pub performance_cooldown_secs: u32,
+    pub shard_rotation_secs: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpngateIntelligenceCredentials {
     pub proxycheck_api_key_configured: bool,
 }
@@ -545,9 +574,11 @@ pub struct VpngateProbeNodeAddress {
     pub public_ipv4: String,
 }
 
-/// The country observed for one currently usable catalogue-probe machine. This stays an input to
-/// assignment rather than durable model state: address geolocation is operational evidence and a
-/// GeoIP database refresh must not create a model revision.
+/// The country observed for one currently usable catalogue-probe machine. `ZZ` means that the
+/// Console's local GeoIP database could not resolve this address; retaining that machine in the
+/// input lets the complete fallback queue remain sharded during a GeoIP cold start. This stays an
+/// input to assignment rather than durable model state: address geolocation is operational
+/// evidence and a GeoIP database refresh must not create a model revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VpngateProbeNodeOrigin {
     pub node_id: String,
@@ -576,7 +607,10 @@ pub struct VpngateIpIntelligenceClaim {
 
 pub async fn catalog_status(pool: &PgPool) -> Result<VpngateCatalogStatus> {
     let row = sqlx::query(
-        "SELECT state.enabled, state.interval_secs, state.source_url,
+        "SELECT state.enabled, state.interval_secs,
+                state.probe_success_cooldown_secs, state.probe_performance_cooldown_secs,
+                state.probe_shard_rotation_secs,
+                state.source_url,
                 EXTRACT(EPOCH FROM COALESCE(
                     (SELECT MIN(catalogue_next_sync_at) FROM vpngate_intelligence_nodes),
                     state.next_sync_at
@@ -611,6 +645,18 @@ pub async fn catalog_status(pool: &PgPool) -> Result<VpngateCatalogStatus> {
     Ok(VpngateCatalogStatus {
         enabled: row.try_get("enabled")?,
         interval_secs: i32_to_u32("interval_secs", row.try_get("interval_secs")?)?,
+        probe_success_cooldown_secs: i32_to_u32(
+            "probe_success_cooldown_secs",
+            row.try_get("probe_success_cooldown_secs")?,
+        )?,
+        probe_performance_cooldown_secs: i32_to_u32(
+            "probe_performance_cooldown_secs",
+            row.try_get("probe_performance_cooldown_secs")?,
+        )?,
+        probe_shard_rotation_secs: i32_to_u32(
+            "probe_shard_rotation_secs",
+            row.try_get("probe_shard_rotation_secs")?,
+        )?,
         source_url: row.try_get("source_url")?,
         next_sync_at_unix_secs: row.try_get("next_sync_at_unix_secs")?,
         syncing: row.try_get("syncing")?,
@@ -1239,7 +1285,8 @@ async fn country_server_page_inner(
                         ORDER BY sample.last_success_probed_at DESC, sample.node_id)
                         FILTER (WHERE sample.last_success_probed_at IS NOT NULL))[1]
                         AS last_success_download_bps,
-                    MAX(sample.last_success_probed_at) AS last_success_probed_at
+                    MAX(sample.last_success_probed_at) AS last_success_probed_at,
+                    MAX(sample.last_success_received_at) AS last_success_received_at
                FROM country_servers server
                JOIN vpngate_candidate_probe_latest sample
                  ON sample.server_id = server.id
@@ -1260,6 +1307,11 @@ async fn country_server_page_inner(
                 COALESCE(measured.measured_nodes, 0) AS measured_nodes,
                 COALESCE(measured.successful_samples, 0) AS successful_samples,
                 measured.latest_probe_status,
+                COALESCE(probe_state.consecutive_failures, 0)
+                    AS consecutive_probe_failures,
+                EXTRACT(EPOCH FROM probe_state.failure_streak_started_at
+                    + make_interval(secs => $14))::BIGINT
+                    AS probe_eligible_until_unix_secs,
                 host(measured.last_success_exit_ip) AS latest_exit_ip,
                 reputation.country_code AS latest_exit_country_code,
                 NULLIF(measured.last_success_connect_ms, 0) AS latest_connect_ms,
@@ -1280,6 +1332,9 @@ async fn country_server_page_inner(
            LEFT JOIN measured
              ON measured.server_id = server.id
             AND measured.profile_sha256 = server.profile_sha256
+           LEFT JOIN vpngate_candidate_probe_state probe_state
+             ON probe_state.server_id = server.id
+            AND probe_state.profile_sha256 = server.profile_sha256
            LEFT JOIN vpngate_exit_reputations reputation
              ON reputation.exit_ip = measured.last_success_exit_ip
           WHERE server.country_code = $1
@@ -1290,6 +1345,15 @@ async fn country_server_page_inner(
                         WHEN 'candidate' THEN directory.active
                         WHEN 'successful' THEN directory.successful_samples > 0
                         WHEN 'failed' THEN directory.latest_probe_status = 'failed'
+                        WHEN 'reviewing' THEN
+                            directory.consecutive_probe_failures BETWEEN 1 AND 2
+                            AND directory.probe_eligible_until_unix_secs
+                                >= EXTRACT(EPOCH FROM now())::BIGINT
+                        WHEN 'suspended' THEN
+                            directory.consecutive_probe_failures >= 3
+                            OR (directory.consecutive_probe_failures BETWEEN 1 AND 2
+                                AND directory.probe_eligible_until_unix_secs
+                                    < EXTRACT(EPOCH FROM now())::BIGINT)
                         WHEN 'pending' THEN directory.latest_probe_status IS NULL
                         WHEN 'current' THEN directory.seen_in_latest_sync
                         WHEN 'retained' THEN NOT directory.seen_in_latest_sync
@@ -1338,6 +1402,7 @@ async fn country_server_page_inner(
         .bind(request.sort.as_str())
         .bind(page_size)
         .bind(offset)
+        .bind(FAILED_CANDIDATE_GRACE_SECS)
         .fetch_all(pool)
         .await?
     };
@@ -1387,6 +1452,12 @@ async fn country_server_page_inner(
                     row.try_get("successful_samples")?,
                 )?,
                 latest_probe_status: row.try_get("latest_probe_status")?,
+                consecutive_probe_failures: optional_i32_to_u32(
+                    "consecutive_probe_failures",
+                    row.try_get("consecutive_probe_failures")?,
+                )?
+                .unwrap_or(0),
+                probe_eligible_until_unix_secs: row.try_get("probe_eligible_until_unix_secs")?,
                 latest_exit_ip: row.try_get("latest_exit_ip")?,
                 latest_exit_country_code: row.try_get("latest_exit_country_code")?,
                 latest_connect_ms: optional_i32_to_u32(
@@ -1491,7 +1562,8 @@ async fn default_candidate_directory_page_rows(
                         ORDER BY sample.last_success_probed_at DESC, sample.node_id)
                         FILTER (WHERE sample.last_success_probed_at IS NOT NULL))[1]
                         AS last_success_download_bps,
-                    MAX(sample.last_success_probed_at) AS last_success_probed_at
+                    MAX(sample.last_success_probed_at) AS last_success_probed_at,
+                    MAX(sample.last_success_received_at) AS last_success_received_at
                FROM page_servers server
                JOIN vpngate_candidate_probe_latest sample
                  ON sample.server_id = server.id
@@ -1509,6 +1581,11 @@ async fn default_candidate_directory_page_rows(
                     COALESCE(measured.measured_nodes, 0) AS measured_nodes,
                     COALESCE(measured.successful_samples, 0) AS successful_samples,
                     measured.latest_probe_status,
+                    COALESCE(probe_state.consecutive_failures, 0)
+                        AS consecutive_probe_failures,
+                    EXTRACT(EPOCH FROM probe_state.failure_streak_started_at
+                        + make_interval(secs => $11))::BIGINT
+                        AS probe_eligible_until_unix_secs,
                     host(measured.last_success_exit_ip) AS latest_exit_ip,
                     reputation.country_code AS latest_exit_country_code,
                     NULLIF(measured.last_success_connect_ms, 0) AS latest_connect_ms,
@@ -1528,6 +1605,9 @@ async fn default_candidate_directory_page_rows(
                LEFT JOIN measured
                  ON measured.server_id = server.id
                 AND measured.profile_sha256 = server.profile_sha256
+               LEFT JOIN vpngate_candidate_probe_state probe_state
+                 ON probe_state.server_id = server.id
+                AND probe_state.profile_sha256 = server.profile_sha256
                LEFT JOIN vpngate_exit_reputations reputation
                  ON reputation.exit_ip = measured.last_success_exit_ip
          ), counted AS (
@@ -1550,6 +1630,7 @@ async fn default_candidate_directory_page_rows(
     .bind(stale_after_secs)
     .bind(page_size)
     .bind(offset)
+    .bind(FAILED_CANDIDATE_GRACE_SECS)
     .fetch_all(pool)
     .await?)
 }
@@ -1930,6 +2011,61 @@ pub async fn update_settings(
         .await?;
     }
     tx.commit().await?;
+    catalog_status(pool).await
+}
+
+pub async fn update_probe_settings(
+    pool: &PgPool,
+    actor: &AdminContext,
+    request: UpdateVpngateProbeSettings,
+) -> Result<VpngateCatalogStatus> {
+    require_system_admin(actor, "configure VPN Gate catalogue probing")?;
+    if !(PROBE_SUCCESS_COOLDOWN_MIN_SECS..=PROBE_SUCCESS_COOLDOWN_MAX_SECS)
+        .contains(&request.success_cooldown_secs)
+        || !request.success_cooldown_secs.is_multiple_of(60)
+    {
+        return Err(StoreError::InvalidData(format!(
+            "VPN Gate successful probe cooldown must be a whole number of minutes between {PROBE_SUCCESS_COOLDOWN_MIN_SECS} and {PROBE_SUCCESS_COOLDOWN_MAX_SECS} seconds"
+        )));
+    }
+    if !(PROBE_PERFORMANCE_COOLDOWN_MIN_SECS..=PROBE_PERFORMANCE_COOLDOWN_MAX_SECS)
+        .contains(&request.performance_cooldown_secs)
+        || !request.performance_cooldown_secs.is_multiple_of(60 * 60)
+    {
+        return Err(StoreError::InvalidData(format!(
+            "VPN Gate performance probe cooldown must be a whole number of hours between {PROBE_PERFORMANCE_COOLDOWN_MIN_SECS} and {PROBE_PERFORMANCE_COOLDOWN_MAX_SECS} seconds"
+        )));
+    }
+    if !(PROBE_SHARD_ROTATION_MIN_SECS..=PROBE_SHARD_ROTATION_MAX_SECS)
+        .contains(&request.shard_rotation_secs)
+        || !request.shard_rotation_secs.is_multiple_of(60 * 60)
+    {
+        return Err(StoreError::InvalidData(format!(
+            "VPN Gate probe shard rotation must be a whole number of hours between {PROBE_SHARD_ROTATION_MIN_SECS} and {PROBE_SHARD_ROTATION_MAX_SECS} seconds"
+        )));
+    }
+    sqlx::query(
+        "UPDATE vpngate_catalog_state
+            SET probe_success_cooldown_secs = $1,
+                probe_performance_cooldown_secs = $2,
+                probe_shard_rotation_secs = $3,
+                updated_at = now()
+          WHERE id = TRUE",
+    )
+    .bind(u32_to_i32(
+        "success_cooldown_secs",
+        request.success_cooldown_secs,
+    )?)
+    .bind(u32_to_i32(
+        "performance_cooldown_secs",
+        request.performance_cooldown_secs,
+    )?)
+    .bind(u32_to_i32(
+        "shard_rotation_secs",
+        request.shard_rotation_secs,
+    )?)
+    .execute(pool)
+    .await?;
     catalog_status(pool).await
 }
 
@@ -2971,7 +3107,9 @@ pub async fn agent_desired_with_probe_origins(
         })
         .collect::<Vec<_>>();
     let catalog_row = sqlx::query(
-        "SELECT last_success_run_id, admission_policy, intelligence_policy
+        "SELECT last_success_run_id, admission_policy, intelligence_policy,
+                probe_success_cooldown_secs, probe_performance_cooldown_secs,
+                probe_shard_rotation_secs
            FROM vpngate_catalog_state WHERE id = TRUE",
     )
     .fetch_one(pool)
@@ -2990,6 +3128,11 @@ pub async fn agent_desired_with_probe_origins(
     }
     let intelligence_policy =
         decode_intelligence_policy(catalog_row.try_get("intelligence_policy")?)?;
+    let probe_success_cooldown_secs: i32 = catalog_row.try_get("probe_success_cooldown_secs")?;
+    let probe_performance_cooldown_secs: i32 =
+        catalog_row.try_get("probe_performance_cooldown_secs")?;
+    let probe_shard_rotation_secs =
+        i64::from(catalog_row.try_get::<i32, _>("probe_shard_rotation_secs")?);
     let probe_workers = probe_node_workers(pool, node_id).await?;
     let mut active_by_country = BTreeMap::<String, Vec<VpngateCandidate>>::new();
     // Candidate selection is needed only by automatic pools on this node. `configured_countries`
@@ -3106,6 +3249,11 @@ pub async fn agent_desired_with_probe_origins(
                     &configured_countries,
                     workers,
                     probe_origins,
+                    VpngateProbeSchedule {
+                        connectivity_cooldown_secs: probe_success_cooldown_secs,
+                        performance_cooldown_secs: probe_performance_cooldown_secs,
+                        shard_rotation_secs: probe_shard_rotation_secs,
+                    },
                 )
                 .await?
             }
@@ -3357,22 +3505,31 @@ async fn qualified_candidates(
         VpngateStaleIntelligencePolicy::Retain | VpngateStaleIntelligencePolicy::Mark => None,
     };
     let rows = sqlx::query(
-        "WITH latest_per_node AS MATERIALIZED (
-            SELECT sample.node_id, sample.server_id, sample.profile_sha256, sample.status,
-                   sample.exit_ip, sample.connect_ms, sample.download_bps, sample.probed_at,
-                   sample.received_at
-              FROM vpngate_candidate_probe_latest sample
-             WHERE sample.received_at >= now() - make_interval(secs => $5)
-               AND ($1::TEXT IS NULL OR sample.country_code = $1)
-        ), eligible AS MATERIALIZED (
+        "WITH eligible AS MATERIALIZED (
             SELECT sample.node_id, sample.server_id, sample.profile_sha256,
-                   sample.exit_ip, sample.connect_ms, sample.download_bps, sample.probed_at,
-                   reputation.country_code AS verified_exit_country_code,
-                   reputation.ip_scores AS verified_ip_scores,
-                   reputation.ip_networks AS verified_ip_networks
-              FROM latest_per_node sample
-             JOIN vpngate_exit_reputations reputation ON reputation.exit_ip = sample.exit_ip
-             WHERE sample.status = 'succeeded'
+                   sample.last_success_exit_ip AS exit_ip,
+                   sample.last_success_connect_ms AS connect_ms,
+                   sample.last_success_download_bps AS download_bps,
+                   sample.last_success_probed_at AS probed_at
+              FROM vpngate_candidate_probe_latest sample
+             CROSS JOIN vpngate_catalog_state schedule
+              JOIN vpngate_exit_reputations reputation
+                ON reputation.exit_ip = sample.last_success_exit_ip
+              LEFT JOIN vpngate_candidate_probe_state probe_state
+                ON probe_state.server_id = sample.server_id
+               AND probe_state.profile_sha256 = sample.profile_sha256
+             WHERE sample.last_success_received_at >= now() - make_interval(
+                       secs => GREATEST(
+                           $5,
+                           schedule.probe_performance_cooldown_secs
+                               + schedule.probe_success_cooldown_secs
+                       )
+                   )
+               AND ($1::TEXT IS NULL OR sample.country_code = $1)
+               AND COALESCE(probe_state.consecutive_failures, 0) < $7
+               AND (COALESCE(probe_state.consecutive_failures, 0) = 0
+                    OR probe_state.failure_streak_started_at
+                        >= now() - make_interval(secs => $8))
                AND ($2::INTEGER IS NULL
                     OR reputation.verified_at >= now() - make_interval(secs => $2))
                AND jsonb_array_length(reputation.ip_scores) >= 1
@@ -3387,18 +3544,16 @@ async fn qualified_candidates(
              GROUP BY sample.server_id, sample.profile_sha256
         ), evidence AS MATERIALIZED (
             SELECT DISTINCT ON (sample.server_id, sample.profile_sha256)
-                   sample.server_id, sample.profile_sha256, sample.exit_ip,
-                   sample.verified_exit_country_code, sample.verified_ip_scores,
-                   sample.verified_ip_networks
+                   sample.server_id, sample.profile_sha256, sample.exit_ip
               FROM eligible sample
              ORDER BY sample.server_id, sample.profile_sha256,
                       sample.probed_at DESC, sample.node_id, sample.exit_ip
         )
         SELECT server.id, server.country_code, server.profile_sha256,
                host(evidence.exit_ip) AS verified_exit_ip,
-               evidence.verified_exit_country_code,
-               evidence.verified_ip_scores,
-               evidence.verified_ip_networks,
+               reputation.country_code AS verified_exit_country_code,
+               reputation.ip_scores AS verified_ip_scores,
+               reputation.ip_networks AS verified_ip_networks,
                ROUND(qualified.average_download)::BIGINT AS global_download_bps,
                ROUND(qualified.average_connect)::INTEGER AS global_connect_ms
           FROM qualified
@@ -3408,6 +3563,7 @@ async fn qualified_candidates(
           JOIN evidence
             ON evidence.server_id = qualified.server_id
            AND evidence.profile_sha256 = qualified.profile_sha256
+          JOIN vpngate_exit_reputations reputation ON reputation.exit_ip = evidence.exit_ip
          WHERE server.country_code <> $6
            AND ($1::TEXT IS NULL OR server.country_code = $1)
          ORDER BY server.country_code,
@@ -3419,8 +3575,10 @@ async fn qualified_candidates(
     .bind(maximum_age_secs)
     .bind(ACTIVE_MAX_CONNECT_MS)
     .bind(ACTIVE_MIN_DOWNLOAD_BPS)
-    .bind(ACTIVE_PROBE_MAX_AGE_SECS)
+    .bind(ACTIVE_PROBE_MIN_MAX_AGE_SECS)
     .bind(UNKNOWN_COUNTRY_CODE)
+    .bind(MAX_CONSECUTIVE_PROBE_FAILURES)
+    .bind(FAILED_CANDIDATE_GRACE_SECS)
     .fetch_all(pool)
     .await?;
     let candidates = rows
@@ -3522,6 +3680,8 @@ async fn hydrate_ranked_candidates(
                 transport: profile.transport,
                 profile_sha256: profile.profile_sha256,
                 openvpn_config: profile.openvpn_config,
+                probe_mode: VpngateProbeMode::Performance,
+                last_observed_exit_ip: evaluation.verified_exit_ip.clone(),
                 verified_exit_ip: evaluation.verified_exit_ip,
                 verified_exit_country_code: evaluation.verified_exit_country_code,
                 verified_ip_scores: evaluation.verified_ip_scores,
@@ -3668,16 +3828,59 @@ fn eligible_probe_countries(
         .collect()
 }
 
+/// Peers which share this machine's regional work are also its catalogue shard group. The query
+/// below gives every profile to exactly one peer for the configured rotation window, then advances
+/// ownership by one sorted peer so a machine does not permanently measure the same subset. Tied
+/// nearest regions deliberately keep separate shard groups because another region is useful
+/// independent evidence.
+fn probe_shard_peers(node_id: &str, origins: &[VpngateProbeNodeOrigin]) -> Vec<String> {
+    let regions = origins
+        .iter()
+        .filter_map(|origin| {
+            let country_code = origin.country_code.trim().to_ascii_uppercase();
+            vpngate_probe_region(&country_code).map(|region| (origin.node_id.as_str(), region))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut peers = match regions.get(node_id) {
+        Some(node_region) => regions
+            .iter()
+            .filter_map(|(peer_id, peer_region)| {
+                (peer_region == node_region).then_some((*peer_id).to_owned())
+            })
+            .collect::<Vec<_>>(),
+        None if regions.is_empty() => origins
+            .iter()
+            .map(|origin| origin.node_id.clone())
+            .collect::<Vec<_>>(),
+        None => Vec::new(),
+    };
+    peers.sort();
+    peers.dedup();
+    if peers.is_empty() {
+        peers.push(node_id.to_owned());
+    }
+    peers
+}
+
 /// Build one work-conserving regional batch across country boundaries, capped by this selected
-/// machine's configured worker count and its reported Agent capability. Every machine in the
-/// nearest region independently walks the complete regional directory; samples from distinct
-/// origins are useful evidence rather than duplicate execution, so no cross-machine lease exists.
+/// machine's configured worker count and its reported Agent capability. Machines in the same
+/// region partition one complete regional queue; tied nearest regions retain separate queues so
+/// genuinely distinct origins still produce independent evidence. No task lease is needed because
+/// rotating ownership is recomputed from the currently usable peer set on every desired read.
+#[derive(Clone, Copy)]
+struct VpngateProbeSchedule {
+    connectivity_cooldown_secs: i32,
+    performance_cooldown_secs: i32,
+    shard_rotation_secs: i64,
+}
+
 async fn next_retained_probe_assignments(
     pool: &PgPool,
     node_id: &str,
     configured_countries: &BTreeSet<String>,
     workers: usize,
     origins: &[VpngateProbeNodeOrigin],
+    schedule: VpngateProbeSchedule,
 ) -> Result<Vec<VpngateProbeAssignment>> {
     let configured_countries = configured_countries.iter().cloned().collect::<Vec<_>>();
     let country_codes = sqlx::query_scalar::<_, String>(
@@ -3693,16 +3896,31 @@ async fn next_retained_probe_assignments(
     if scoped_countries.is_empty() {
         return Ok(Vec::new());
     }
+    let shard_peers = probe_shard_peers(node_id, origins);
     let rows = sqlx::query(
         "SELECT server.id, server.hostname, server.country_code,
                 host(profile.remote_address) AS remote_address, profile.remote_port,
                 profile.transport, profile.sha256 AS profile_sha256,
                 profile.openvpn_config,
+                COALESCE(
+                    probe_state.consecutive_failures BETWEEN 1 AND 2
+                    AND probe_state.failure_streak_started_at
+                        >= now() - make_interval(secs => $6),
+                    FALSE
+                )
+                    AS review_priority,
                 server.current
                     AND server.country_code = ANY($2)
                     AND latest.received_at IS NULL AS serving_priority,
                 latest.received_at AS last_received_at,
                 server.current,
+                performance.last_observed_exit_ip,
+                (
+                    probe_state.last_outcome_status IS DISTINCT FROM 'succeeded'
+                    OR performance.last_performance_received_at IS NULL
+                    OR performance.last_performance_received_at
+                        <= now() - make_interval(secs => $9)
+                ) AS performance_due,
                 NULL::TEXT AS verified_exit_ip,
                 NULL::TEXT AS verified_exit_country_code,
                 '[]'::jsonb AS verified_ip_scores,
@@ -3713,9 +3931,51 @@ async fn next_retained_probe_assignments(
              ON latest.node_id = $1
             AND latest.server_id = server.id
             AND latest.profile_sha256 = profile.sha256
+           LEFT JOIN vpngate_candidate_probe_state probe_state
+             ON probe_state.server_id = server.id
+            AND probe_state.profile_sha256 = profile.sha256
+           LEFT JOIN LATERAL (
+                SELECT host(sample.last_success_exit_ip) AS last_observed_exit_ip,
+                       sample.last_success_received_at AS last_performance_received_at
+                  FROM vpngate_candidate_probe_latest sample
+                 WHERE sample.server_id = server.id
+                   AND sample.profile_sha256 = profile.sha256
+                   AND sample.last_success_received_at IS NOT NULL
+                 ORDER BY sample.last_success_received_at DESC, sample.node_id
+                 LIMIT 1
+           ) performance ON TRUE
           WHERE server.country_code = ANY($5)
             AND server.country_code <> $4
-          ORDER BY serving_priority DESC,
+            AND (
+                probe_state.last_outcome_status IS DISTINCT FROM 'succeeded'
+                OR probe_state.last_outcome_received_at
+                    <= now() - make_interval(secs => $8)
+            )
+            AND $1 = (
+                SELECT peer.node_id
+                  FROM (
+                       SELECT candidate.node_id,
+                              row_number() OVER (ORDER BY candidate.node_id) - 1 AS peer_index,
+                              count(*) OVER () AS peer_count
+                         FROM UNNEST($7::TEXT[]) AS candidate(node_id)
+                  ) peer
+                 WHERE peer.peer_index = mod(
+                           mod(
+                               (('x' || substr(
+                                   md5(server.id || ':' || profile.sha256),
+                                   1,
+                                   15
+                               ))::bit(60)::bigint),
+                               peer.peer_count
+                           ) + mod(
+                               floor(EXTRACT(EPOCH FROM now()) / $10)::bigint,
+                               peer.peer_count
+                           ),
+                           peer.peer_count
+                       )
+            )
+          ORDER BY review_priority DESC,
+                   serving_priority DESC,
                    last_received_at ASC NULLS FIRST,
                    server.current DESC,
                    server.country_code,
@@ -3729,11 +3989,22 @@ async fn next_retained_probe_assignments(
     })?)
     .bind(UNKNOWN_COUNTRY_CODE)
     .bind(scoped_countries)
+    .bind(FAILED_CANDIDATE_GRACE_SECS)
+    .bind(shard_peers)
+    .bind(schedule.connectivity_cooldown_secs)
+    .bind(schedule.performance_cooldown_secs)
+    .bind(schedule.shard_rotation_secs)
     .fetch_all(pool)
     .await?;
     let mut assignments = Vec::<VpngateProbeAssignment>::new();
     for row in &rows {
-        let candidate = candidate_from_row(row)?;
+        let mut candidate = candidate_from_row(row)?;
+        candidate.probe_mode = if row.try_get("performance_due")? {
+            VpngateProbeMode::Performance
+        } else {
+            VpngateProbeMode::Connectivity
+        };
+        candidate.last_observed_exit_ip = row.try_get("last_observed_exit_ip")?;
         if let Some(assignment) = assignments
             .iter_mut()
             .find(|assignment| assignment.country_code == candidate.country_code)
@@ -3770,6 +4041,8 @@ fn candidate_from_row(row: &sqlx::postgres::PgRow) -> Result<VpngateCandidate> {
         transport,
         profile_sha256: row.try_get("profile_sha256")?,
         openvpn_config: row.try_get("openvpn_config")?,
+        probe_mode: VpngateProbeMode::Performance,
+        last_observed_exit_ip: None,
         verified_exit_ip: row.try_get("verified_exit_ip")?,
         verified_exit_country_code: row.try_get("verified_exit_country_code")?,
         verified_ip_scores: decode_json("verified_ip_scores", row.try_get("verified_ip_scores")?)?,
@@ -3794,7 +4067,10 @@ pub async fn record_agent_report(
         report.catalog_generation,
     )
     .await?;
-    let accepted_samples = record_report_samples_tx(&mut tx, node_id, &report).await?;
+    let mut exit_reputations = Vec::new();
+    let accepted_samples =
+        record_report_samples_tx(&mut tx, node_id, &report, &mut exit_reputations).await?;
+    queue_exit_reputations(&mut tx, &exit_reputations).await?;
     let current_state_updated = expected
         .as_ref()
         .is_some_and(|ids| ids.contains(&report.outbound_id));
@@ -3829,10 +4105,13 @@ pub async fn record_reconcile_report(
     )
     .await?;
     let mut accepted_samples = 0_u32;
+    let mut exit_reputations = Vec::new();
     for pool_report in &report.pools {
-        accepted_samples = accepted_samples
-            .saturating_add(record_report_samples_tx(&mut tx, node_id, pool_report).await?);
+        accepted_samples = accepted_samples.saturating_add(
+            record_report_samples_tx(&mut tx, node_id, pool_report, &mut exit_reputations).await?,
+        );
     }
+    queue_exit_reputations(&mut tx, &exit_reputations).await?;
     let reported_ids = report
         .pools
         .iter()
@@ -3867,6 +4146,7 @@ async fn record_report_samples_tx(
     tx: &mut Transaction<'_, Postgres>,
     node_id: &str,
     report: &VpngatePoolReport,
+    exit_reputations: &mut Vec<(String, i64)>,
 ) -> Result<u32> {
     let mut accepted_samples = 0_u32;
     for sample in &report.samples {
@@ -3926,7 +4206,7 @@ async fn record_report_samples_tx(
                 .exit_ip
                 .as_deref()
                 .expect("validated successful VPN Gate samples have an exit IP");
-            queue_exit_reputation(tx, exit_ip, sample.probed_at_unix_secs).await?;
+            exit_reputations.push((exit_ip.to_owned(), sample.probed_at_unix_secs));
         }
         let (exit_country_code, ip_scores, ip_networks) = match sample.exit_ip.as_deref() {
             Some(exit_ip) => {
@@ -4213,6 +4493,7 @@ pub async fn record_probe_report(
     validate_probe_report(&report)?;
     let mut tx = pool.begin().await?;
     let mut accepted_samples = 0_u32;
+    let mut exit_reputations = Vec::new();
     for sample in &report.samples {
         // Catalogue collection runs independently from multi-minute OpenVPN probes. The retained
         // directory is authoritative for its current identity; immutable observations cover an
@@ -4250,7 +4531,7 @@ pub async fn record_probe_report(
                 .exit_ip
                 .as_deref()
                 .expect("validated successful VPN Gate samples have an exit IP");
-            queue_exit_reputation(&mut tx, exit_ip, sample.probed_at_unix_secs).await?;
+            exit_reputations.push((exit_ip.to_owned(), sample.probed_at_unix_secs));
         }
         let status = match sample.status {
             VpngateProbeStatus::Succeeded => "succeeded",
@@ -4298,9 +4579,11 @@ pub async fn record_probe_report(
                 sample,
             )
             .await?;
+            update_candidate_probe_state(&mut tx, node_id, sample).await?;
         }
         accepted_samples = accepted_samples.saturating_add(u32::try_from(affected).unwrap_or(1));
     }
+    queue_exit_reputations(&mut tx, &exit_reputations).await?;
     tx.commit().await?;
     Ok(VpngateReportReceipt {
         accepted_samples,
@@ -4395,13 +4678,15 @@ async fn upsert_candidate_latest(
             (node_id, catalog_generation, country_code, server_id, profile_sha256,
              status, exit_ip, connect_ms, download_bps, error_code, error_detail, probed_at,
              received_at, last_success_exit_ip, last_success_connect_ms,
-             last_success_download_bps, last_success_probed_at)
+             last_success_download_bps, last_success_probed_at, last_success_received_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7::inet, $8, $9, $10, $11,
                  to_timestamp($12::double precision), now(),
-                 CASE WHEN $6 = 'succeeded' THEN $7::inet END,
-                 CASE WHEN $6 = 'succeeded' THEN $8 END,
-                 CASE WHEN $6 = 'succeeded' THEN $9 END,
-                 CASE WHEN $6 = 'succeeded' THEN to_timestamp($12::double precision) END)
+                 CASE WHEN $6 = 'succeeded' AND $9 IS NOT NULL THEN $7::inet END,
+                 CASE WHEN $6 = 'succeeded' AND $9 IS NOT NULL THEN $8 END,
+                 CASE WHEN $6 = 'succeeded' AND $9 IS NOT NULL THEN $9 END,
+                 CASE WHEN $6 = 'succeeded' AND $9 IS NOT NULL
+                      THEN to_timestamp($12::double precision) END,
+                 CASE WHEN $6 = 'succeeded' AND $9 IS NOT NULL THEN now() END)
          ON CONFLICT (node_id, server_id, profile_sha256) DO UPDATE SET
             catalog_generation = CASE WHEN EXCLUDED.probed_at > vpngate_candidate_probe_latest.probed_at
                 THEN EXCLUDED.catalog_generation ELSE vpngate_candidate_probe_latest.catalog_generation END,
@@ -4443,7 +4728,13 @@ async fn upsert_candidate_latest(
             last_success_probed_at = GREATEST(
                 EXCLUDED.last_success_probed_at,
                 vpngate_candidate_probe_latest.last_success_probed_at
-            )",
+            ),
+            last_success_received_at = CASE
+                WHEN EXCLUDED.last_success_probed_at >
+                    vpngate_candidate_probe_latest.last_success_probed_at
+                    OR vpngate_candidate_probe_latest.last_success_probed_at IS NULL
+                THEN EXCLUDED.last_success_received_at
+                ELSE vpngate_candidate_probe_latest.last_success_received_at END",
     )
     .bind(node_id)
     .bind(u64_to_i64("catalog_generation", catalog_generation)?)
@@ -4472,26 +4763,103 @@ async fn upsert_candidate_latest(
     Ok(())
 }
 
-pub(crate) async fn queue_exit_reputation(
+async fn update_candidate_probe_state(
     tx: &mut Transaction<'_, Postgres>,
-    exit_ip: &str,
-    probed_at_unix_secs: i64,
+    node_id: &str,
+    sample: &VpngateProbeSample,
 ) -> Result<()> {
+    let status = match sample.status {
+        VpngateProbeStatus::Succeeded => "succeeded",
+        VpngateProbeStatus::Failed => "failed",
+    };
+    let initial_failures = i32::from(matches!(sample.status, VpngateProbeStatus::Failed));
+    sqlx::query(
+        "INSERT INTO vpngate_candidate_probe_state
+            (server_id, profile_sha256, last_outcome_status, last_outcome_node_id,
+             last_outcome_at, last_outcome_received_at, failure_streak_started_at,
+             consecutive_failures)
+         VALUES ($1, $2, $3, $4, to_timestamp($5::double precision), now(),
+                 CASE WHEN $3 = 'failed' THEN now() ELSE NULL END, $6)
+         ON CONFLICT (server_id, profile_sha256) DO UPDATE SET
+            last_outcome_status = EXCLUDED.last_outcome_status,
+            last_outcome_node_id = EXCLUDED.last_outcome_node_id,
+            last_outcome_at = EXCLUDED.last_outcome_at,
+            last_outcome_received_at = EXCLUDED.last_outcome_received_at,
+            failure_streak_started_at = CASE
+                WHEN EXCLUDED.last_outcome_status = 'succeeded' THEN NULL
+                WHEN vpngate_candidate_probe_state.last_outcome_status = 'succeeded'
+                    THEN EXCLUDED.failure_streak_started_at
+                ELSE vpngate_candidate_probe_state.failure_streak_started_at
+            END,
+            consecutive_failures = CASE
+                WHEN EXCLUDED.last_outcome_status = 'succeeded' THEN 0
+                WHEN vpngate_candidate_probe_state.last_outcome_status = 'succeeded' THEN 1
+                ELSE LEAST(
+                    vpngate_candidate_probe_state.consecutive_failures + 1,
+                    $7
+                )
+            END
+         WHERE EXCLUDED.last_outcome_at >= vpngate_candidate_probe_state.last_outcome_at",
+    )
+    .bind(&sample.server_id)
+    .bind(&sample.profile_sha256)
+    .bind(status)
+    .bind(node_id)
+    .bind(sample.probed_at_unix_secs)
+    .bind(initial_failures)
+    .bind(MAX_CONSECUTIVE_PROBE_FAILURES)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn queue_exit_reputations(
+    tx: &mut Transaction<'_, Postgres>,
+    observations: &[(String, i64)],
+) -> Result<()> {
+    if observations.is_empty() {
+        return Ok(());
+    }
+    let (exit_ips, probed_at_unix_secs): (Vec<_>, Vec<_>) =
+        deduplicate_exit_reputations(observations)?
+            .into_iter()
+            .unzip();
     sqlx::query(
         "INSERT INTO vpngate_exit_reputations (exit_ip, last_seen_at)
-         VALUES ($1::inet, LEAST(to_timestamp($2::double precision), now()))
+         SELECT input.exit_ip::inet,
+                LEAST(to_timestamp(input.probed_at::double precision), now())
+           FROM UNNEST($1::text[], $2::bigint[]) AS input(exit_ip, probed_at)
+          ORDER BY input.exit_ip::inet
          ON CONFLICT (exit_ip) DO UPDATE SET
             last_seen_at = GREATEST(
                 vpngate_exit_reputations.last_seen_at,
                 EXCLUDED.last_seen_at
             ),
-            updated_at = now()",
+            updated_at = now()
+         WHERE vpngate_exit_reputations.last_seen_at < EXCLUDED.last_seen_at",
     )
-    .bind(exit_ip)
-    .bind(probed_at_unix_secs)
+    .bind(&exit_ips)
+    .bind(&probed_at_unix_secs)
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+fn deduplicate_exit_reputations(observations: &[(String, i64)]) -> Result<Vec<(String, i64)>> {
+    let mut latest_by_exit_ip = BTreeMap::<std::net::IpAddr, i64>::new();
+    for (exit_ip, probed_at) in observations {
+        let exit_ip = exit_ip.parse::<std::net::IpAddr>().map_err(|_| {
+            StoreError::InvalidData("exit reputation observation has an invalid IP".to_owned())
+        })?;
+        latest_by_exit_ip
+            .entry(exit_ip)
+            .and_modify(|stored| *stored = (*stored).max(*probed_at))
+            .or_insert(*probed_at);
+    }
+    Ok(latest_by_exit_ip
+        .into_iter()
+        .map(|(exit_ip, probed_at)| (exit_ip.to_string(), probed_at))
+        .collect())
 }
 
 async fn verified_reputation(
@@ -4578,7 +4946,7 @@ fn validate_report(report: &VpngatePoolReport) -> Result<()> {
         }
     }
     for sample in &report.samples {
-        validate_sample(sample)?;
+        validate_sample(sample, false)?;
     }
     Ok(())
 }
@@ -4619,7 +4987,7 @@ fn validate_probe_report(report: &VpngateProbeReport) -> Result<()> {
     }
     let mut identities = BTreeSet::new();
     for sample in &report.samples {
-        validate_sample(sample)?;
+        validate_sample(sample, true)?;
         if !identities.insert((&sample.server_id, &sample.profile_sha256)) {
             return Err(StoreError::InvalidData(
                 "VPN Gate catalogue report contains duplicate candidates".to_owned(),
@@ -4629,7 +4997,7 @@ fn validate_probe_report(report: &VpngateProbeReport) -> Result<()> {
     Ok(())
 }
 
-fn validate_sample(sample: &VpngateProbeSample) -> Result<()> {
+fn validate_sample(sample: &VpngateProbeSample, allow_connectivity_only: bool) -> Result<()> {
     if !valid_sha256(&sample.profile_sha256)
         || sample.server_id.trim().is_empty()
         || sample.server_id.chars().count() > 128
@@ -4653,7 +5021,7 @@ fn validate_sample(sample: &VpngateProbeSample) -> Result<()> {
                 .as_deref()
                 .is_none_or(|value| value.parse::<std::net::IpAddr>().is_err())
                 || sample.connect_ms.is_none()
-                || sample.download_bps.is_none()
+                || (!allow_connectivity_only && sample.download_bps.is_none())
                 || sample.error_code.is_some()
             {
                 return Err(StoreError::InvalidData(
@@ -5108,6 +5476,14 @@ impl crate::PgStore {
         update_settings(self.pool(), actor, request).await
     }
 
+    pub async fn update_vpngate_probe_settings(
+        &self,
+        actor: &AdminContext,
+        request: UpdateVpngateProbeSettings,
+    ) -> Result<VpngateCatalogStatus> {
+        update_probe_settings(self.pool(), actor, request).await
+    }
+
     pub async fn update_vpngate_admission_policy(
         &self,
         actor: &AdminContext,
@@ -5409,15 +5785,45 @@ mod tests {
     #[test]
     fn catalogue_probe_regions_fall_back_to_the_complete_queue_without_geoip() {
         let countries = vec!["JP".to_owned(), "US".to_owned()];
-        let scopes = eligible_probe_countries(
-            "edge",
-            &countries,
-            &[VpngateProbeNodeOrigin {
-                node_id: "edge".to_owned(),
+        let origins = [
+            VpngateProbeNodeOrigin {
+                node_id: "edge-a".to_owned(),
                 country_code: "ZZ".to_owned(),
-            }],
-        );
+            },
+            VpngateProbeNodeOrigin {
+                node_id: "edge-b".to_owned(),
+                country_code: "ZZ".to_owned(),
+            },
+        ];
+        let scopes = eligible_probe_countries("edge-a", &countries, &origins);
         assert_eq!(scopes, vec!["JP".to_owned(), "US".to_owned()]);
+        assert_eq!(
+            probe_shard_peers("edge-a", &origins),
+            vec!["edge-a".to_owned(), "edge-b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn catalogue_probe_shards_only_within_the_same_origin_region() {
+        let origins = [
+            VpngateProbeNodeOrigin {
+                node_id: "jp-b".to_owned(),
+                country_code: "JP".to_owned(),
+            },
+            VpngateProbeNodeOrigin {
+                node_id: "us-a".to_owned(),
+                country_code: "US".to_owned(),
+            },
+            VpngateProbeNodeOrigin {
+                node_id: "jp-a".to_owned(),
+                country_code: "JP".to_owned(),
+            },
+        ];
+        assert_eq!(
+            probe_shard_peers("jp-a", &origins),
+            vec!["jp-a".to_owned(), "jp-b".to_owned()]
+        );
+        assert_eq!(probe_shard_peers("us-a", &origins), vec!["us-a".to_owned()]);
     }
 
     fn candidate_with_risk(
@@ -5433,6 +5839,8 @@ mod tests {
             transport: VpngateTransport::Udp,
             profile_sha256: "a".repeat(64),
             openvpn_config: "client".to_owned(),
+            probe_mode: VpngateProbeMode::Performance,
+            last_observed_exit_ip: Some("198.51.100.1".to_owned()),
             verified_exit_ip: Some("198.51.100.1".to_owned()),
             verified_exit_country_code: Some("JP".to_owned()),
             verified_ip_scores: scores
@@ -5598,10 +6006,10 @@ mod tests {
     }
 
     #[test]
-    fn risk_ranking_happens_before_the_sixteen_candidate_limit() {
+    fn risk_ranking_happens_before_the_country_candidate_limit() {
         use VpngateIpProvider::{Ffraud, Iplogs, Proxycheck};
 
-        let mut candidates = (0..16)
+        let mut candidates = (0..MAX_ACTIVE_CANDIDATES_PER_COUNTRY)
             .map(|index| {
                 candidate_with_risk(
                     &format!("faster-{index:02}"),
@@ -5616,11 +6024,14 @@ mod tests {
 
         let selected = ranked_ids(candidates)
             .into_iter()
-            .take(16)
+            .take(
+                usize::try_from(MAX_ACTIVE_CANDIDATES_PER_COUNTRY)
+                    .expect("country candidate limit fits usize"),
+            )
             .collect::<Vec<_>>();
-        assert_eq!(selected.len(), 16);
+        assert_eq!(selected.len(), 32);
         assert_eq!(selected[0], "safer-but-slower");
-        assert!(!selected.iter().any(|id| id == "faster-15"));
+        assert!(!selected.iter().any(|id| id == "faster-31"));
     }
 
     #[test]
@@ -5648,8 +6059,8 @@ mod tests {
     }
 
     #[test]
-    fn catalogue_probe_accepts_raw_route_facts_and_rejects_duplicate_candidates() {
-        let sample = VpngateProbeSample {
+    fn catalogue_probe_accepts_connectivity_only_facts_and_rejects_duplicate_candidates() {
+        let mut sample = VpngateProbeSample {
             server_id: "vpn1".to_owned(),
             profile_sha256: "a".repeat(64),
             status: VpngateProbeStatus::Succeeded,
@@ -5669,6 +6080,10 @@ mod tests {
             samples: vec![sample.clone()],
         };
         assert!(validate_probe_report(&report).is_ok());
+        sample.download_bps = None;
+        report.samples = vec![sample.clone()];
+        assert!(validate_probe_report(&report).is_ok());
+        assert!(validate_sample(&sample, false).is_err());
         report.samples.push(sample);
         assert!(validate_probe_report(&report).is_err());
     }
@@ -5697,5 +6112,25 @@ mod tests {
         assert!(validate_probe_report(&report).is_ok());
         report.samples.push(sample(128));
         assert!(validate_probe_report(&report).is_err());
+    }
+
+    #[test]
+    fn exit_reputation_batch_is_canonical_sorted_and_keeps_latest_observation() {
+        let observations = vec![
+            ("2001:0db8::1".to_owned(), 10),
+            ("8.8.8.8".to_owned(), 20),
+            ("2001:db8::1".to_owned(), 30),
+            ("1.1.1.1".to_owned(), 15),
+        ];
+
+        assert_eq!(
+            deduplicate_exit_reputations(&observations).unwrap(),
+            [
+                ("1.1.1.1".to_owned(), 15),
+                ("8.8.8.8".to_owned(), 20),
+                ("2001:db8::1".to_owned(), 30),
+            ]
+        );
+        assert!(deduplicate_exit_reputations(&[("not-an-ip".to_owned(), 1)]).is_err());
     }
 }

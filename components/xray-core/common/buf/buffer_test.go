@@ -26,6 +26,24 @@ func TestBufferClear(t *testing.T) {
 	}
 }
 
+func TestBufferExtendUninitialized(t *testing.T) {
+	buffer := NewWithSize(4)
+	defer buffer.Release()
+
+	first := buffer.ExtendUninitialized(4)
+	copy(first, []byte{1, 2, 3, 4})
+	buffer.Clear()
+
+	second := buffer.ExtendUninitialized(4)
+	if diff := cmp.Diff(second, []byte{1, 2, 3, 4}); diff != "" {
+		t.Fatalf("ExtendUninitialized unexpectedly cleared reused bytes (-got +want):\n%s", diff)
+	}
+	copy(second, []byte{5, 6, 7, 8})
+	if diff := cmp.Diff(buffer.Bytes(), []byte{5, 6, 7, 8}); diff != "" {
+		t.Fatalf("fully initialized buffer contents differ (-got +want):\n%s", diff)
+	}
+}
+
 func TestBufferIsEmpty(t *testing.T) {
 	buffer := New()
 	defer buffer.Release()

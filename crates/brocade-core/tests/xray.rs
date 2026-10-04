@@ -2302,6 +2302,8 @@ fn project_node_merges_xray_structure_from_all_app_views() {
     assert_eq!(forward["settings"]["vnext"][0]["users"][0]["id"], "uuid-sg");
 
     assert_eq!(value["dns"]["servers"], serde_json::json!(["localhost"]));
+    assert_eq!(value["dns"]["serveStale"], true);
+    assert_eq!(value["dns"]["serveExpiredTTL"], 36 * 60 * 60);
     assert_eq!(value["routing"]["domainStrategy"], "AsIs");
     assert_eq!(
         value["routing"]["rules"][0]["inboundTag"],

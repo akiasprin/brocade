@@ -12,7 +12,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     os::unix::ffi::OsStrExt,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -35,10 +35,10 @@ use brocade_deployment::protocol::{
     VpngateIpIntelligenceAssignment, VpngateIpIntelligenceFailure,
     VpngateIpIntelligenceObservation, VpngateIpIntelligenceReport, VpngateIpNetwork,
     VpngateIpProvider, VpngateIpScore, VpngateManualSwitchCommand, VpngateManualSwitchResult,
-    VpngateManualSwitchStatus, VpngateNetworkType, VpngatePoolReport, VpngateProbeReport,
-    VpngateProbeSample, VpngateProbeStatus, VpngateRealtimeBackend, VpngateRealtimePool,
-    VpngateRealtimeReport, VpngateReconcileReport, VpngateRuntimeEvent, VpngateRuntimeEventKind,
-    VpngateRuntimeState, VpngateTransport,
+    VpngateManualSwitchStatus, VpngateNetworkType, VpngatePoolReport, VpngateProbeMode,
+    VpngateProbeReport, VpngateProbeSample, VpngateProbeStatus, VpngateRealtimeBackend,
+    VpngateRealtimePool, VpngateRealtimeReport, VpngateReconcileReport, VpngateRuntimeEvent,
+    VpngateRuntimeEventKind, VpngateRuntimeState, VpngateTransport,
 };
 use flate2::{write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
@@ -3480,16 +3480,20 @@ fn probe_route(
     if host_ip == Some(first_ip) {
         return Err("VPN Gate exit is identical to the host exit".to_owned());
     }
-    let _speed_permit = speed_gate.map(ConcurrencyGate::enter);
-    let speed_text = curl_speed(&route)?;
-    let bytes_per_second = speed_text
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .ok_or_else(|| "speed endpoint returned an invalid rate".to_owned())?;
-    let download_bps = (bytes_per_second * 8.0).round().clamp(0.0, u64::MAX as f64) as u64;
     let exit_ip = first_ip.to_string();
+    let download_bps = if should_measure_performance(candidate, &exit_ip) {
+        let _speed_permit = speed_gate.map(ConcurrencyGate::enter);
+        let speed_text = curl_speed(&route)?;
+        let bytes_per_second = speed_text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .ok_or_else(|| "speed endpoint returned an invalid rate".to_owned())?;
+        Some((bytes_per_second * 8.0).round().clamp(0.0, u64::MAX as f64) as u64)
+    } else {
+        None
+    };
     let trusted = candidate.verified_exit_ip.as_deref() == Some(exit_ip.as_str());
     let (exit_country_code, ip_scores, ip_networks) = if trusted {
         (
@@ -3507,13 +3511,18 @@ fn probe_route(
         exit_ip: Some(exit_ip),
         exit_country_code,
         connect_ms: Some(connect_ms),
-        download_bps: Some(download_bps),
+        download_bps,
         ip_scores,
         ip_networks,
         error_code: None,
         error_detail: None,
         probed_at_unix_secs: unix_secs(),
     })
+}
+
+fn should_measure_performance(candidate: &VpngateCandidate, exit_ip: &str) -> bool {
+    candidate.probe_mode == VpngateProbeMode::Performance
+        || candidate.last_observed_exit_ip.as_deref() != Some(exit_ip)
 }
 
 fn failed_sample(candidate: &VpngateCandidate, code: &str, detail: &str) -> VpngateProbeSample {
@@ -4493,6 +4502,12 @@ fn require_linux_runtime() -> Result<(), String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("VPN Gate Linux apply mode requires root".to_owned());
     }
+    if !tun_device_available() {
+        return Err(
+            "VPN Gate runtime requires a usable /dev/net/tun; load and persist the tun kernel module"
+                .to_owned(),
+        );
+    }
     for command in ["ip", "iptables", "openvpn", "curl", "sysctl"] {
         if !command_exists(command) {
             return Err(format!("VPN Gate runtime dependency {command} is missing"));
@@ -4503,6 +4518,15 @@ fn require_linux_runtime() -> Result<(), String> {
         return Err("VPN Gate helper requires the Brocade Xray binary".to_owned());
     }
     Ok(())
+}
+
+pub(crate) fn tun_device_available() -> bool {
+    tun_device_available_at(Path::new("/dev/net/tun"))
+}
+
+fn tun_device_available_at(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_char_device())
+        && OpenOptions::new().read(true).write(true).open(path).is_ok()
 }
 
 fn command_exists(command: &str) -> bool {
@@ -4617,6 +4641,24 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn vpngate_capability_requires_an_openable_character_device() {
+        let root = std::env::temp_dir().join(format!(
+            "brocade-vpngate-tun-{}-{}",
+            std::process::id(),
+            unix_millis()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let regular = root.join("tun");
+        fs::write(&regular, b"not a device").unwrap();
+
+        assert!(!tun_device_available_at(&root.join("missing")));
+        assert!(!tun_device_available_at(&regular));
+        assert!(tun_device_available_at(Path::new("/dev/null")));
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn openvpn_dns_hook_writes_only_compatible_servers_to_the_namespace() {
@@ -5227,6 +5269,8 @@ mod tests {
             transport: VpngateTransport::Udp,
             profile_sha256: sha256_hex(profile.as_bytes()),
             openvpn_config: profile,
+            probe_mode: VpngateProbeMode::Performance,
+            last_observed_exit_ip: None,
             verified_exit_ip: None,
             verified_exit_country_code: None,
             verified_ip_scores: Vec::new(),
@@ -5249,6 +5293,19 @@ mod tests {
             candidates: Vec::new(),
             manual_switch: None,
         }
+    }
+
+    #[test]
+    fn connectivity_probe_promotes_an_exit_change_to_performance_measurement() {
+        let mut candidate = candidate(safe_profile());
+        candidate.probe_mode = VpngateProbeMode::Connectivity;
+        candidate.last_observed_exit_ip = Some("198.51.100.20".to_owned());
+
+        assert!(!should_measure_performance(&candidate, "198.51.100.20"));
+        assert!(should_measure_performance(&candidate, "198.51.100.21"));
+
+        candidate.probe_mode = VpngateProbeMode::Performance;
+        assert!(should_measure_performance(&candidate, "198.51.100.20"));
     }
 
     fn desired_pool_with_candidates(count: usize) -> VpngateDesiredPool {

@@ -659,15 +659,10 @@ func writePSHBatch(conn io.Writer, sid uint32, data buf.MultiBuffer) error {
 		return nil
 	}
 
-	// Sum of per-buffer ceilings is an upper bound on the number of frames
-	// SplitSize can produce. It lets small writes use a small bytespool bucket
-	// while the hard cap keeps large upstream batches bounded.
-	frameCapacity := int32(0)
-	for _, buffer := range data {
-		if buffer != nil && !buffer.IsEmpty() {
-			frameCapacity += (buffer.Len() + maxFramePayload - 1) / maxFramePayload
-		}
-	}
+	// Frame count depends on bytes, not on the upstream buffer boundaries. Keep
+	// those boundaries out of the wire format so the encoder neither allocates
+	// temporary MultiBuffers nor emits undersized frames under ReadV traffic.
+	frameCapacity := (totalLength + maxFramePayload - 1) / maxFramePayload
 	wireCapacity := totalLength + frameCapacity*frameHeaderSize
 	if wireCapacity > maxPSHBatchWireSize {
 		wireCapacity = maxPSHBatchWireSize
@@ -675,30 +670,29 @@ func writePSHBatch(conn io.Writer, sid uint32, data buf.MultiBuffer) error {
 	wire := buf.NewWithSize(wireCapacity)
 	defer wire.Release()
 
-	for !data.IsEmpty() {
-		var chunk buf.MultiBuffer
-		data, chunk = buf.SplitSize(data, maxFramePayload)
-		length := chunk.Len()
-		if length <= 0 || length > maxFramePayload {
-			buf.ReleaseMulti(chunk)
-			return fmt.Errorf("anytls: invalid PSH frame payload length: %d", length)
-		}
+	remaining := totalLength
+	for remaining > 0 {
+		length := min(remaining, int32(maxFramePayload))
 
 		frameLength := frameHeaderSize + length
 		if !wire.IsEmpty() && wire.Len()+frameLength > wireCapacity {
 			if err := writeFull(conn, wire.Bytes()); err != nil {
-				buf.ReleaseMulti(chunk)
 				return err
 			}
 			wire.Clear()
 		}
 
-		header := wire.Extend(frameHeaderSize)
+		header := wire.ExtendUninitialized(frameHeaderSize)
 		header[0] = cmdPSH
 		binary.BigEndian.PutUint32(header[1:5], sid)
 		binary.BigEndian.PutUint16(header[5:7], uint16(length))
-		chunk.Copy(wire.Extend(length))
-		buf.ReleaseMulti(chunk)
+		payload := wire.ExtendUninitialized(length)
+		var copied int
+		data, copied = buf.SplitBytes(data, payload)
+		if copied != int(length) {
+			return fmt.Errorf("anytls: copied PSH frame payload length %d, want %d", copied, length)
+		}
+		remaining -= length
 	}
 
 	if wire.IsEmpty() {

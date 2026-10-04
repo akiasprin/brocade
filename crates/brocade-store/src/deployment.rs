@@ -57,6 +57,8 @@ type WarpBindingTokenMap = BTreeMap<(String, String, String, String), String>;
 pub(crate) struct AutomaticGrantsDeploymentResult {
     pub deployment_id: Option<i64>,
     pub deferred: Vec<String>,
+    /// An unsettled grants deployment that has to land before this revision can be planned.
+    pub blocked_by: Option<i64>,
 }
 
 pub async fn plan_deployment(
@@ -1333,39 +1335,52 @@ async fn create_automatic_grants_deployment_locked(
     mark_isolated_targets(&mut plan, &isolated);
     plan.base_revision_id = last_succeeded_revision(&mut *tx, DeploymentKind::Grants).await?;
 
-    if plan.summary.changed_targets == 0 {
-        tx.commit().await?;
-        return Ok(AutomaticGrantsDeploymentResult {
-            deployment_id: None,
-            deferred: deferred.into_iter().collect(),
-        });
-    }
+    let idempotency_key = if plan.summary.changed_targets == 0 {
+        None
+    } else {
+        let fingerprint = automatic_grants_fingerprint(&plan)?;
+        let idempotency_key = format!("grants:auto:{revision_id}:{fingerprint}");
+        if let Some(existing) = sqlx::query("SELECT id FROM deployments WHERE idempotency_key = $1")
+            .bind(&idempotency_key)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            let deployment_id = existing.try_get("id")?;
+            tx.commit().await?;
+            return Ok(AutomaticGrantsDeploymentResult {
+                deployment_id: Some(deployment_id),
+                deferred: deferred.into_iter().collect(),
+                blocked_by: None,
+            });
+        }
+        Some(idempotency_key)
+    };
 
-    let fingerprint = automatic_grants_fingerprint(&plan)?;
-    let idempotency_key = format!("grants:auto:{revision_id}:{fingerprint}");
-    if let Some(existing) = sqlx::query("SELECT id FROM deployments WHERE idempotency_key = $1")
-        .bind(&idempotency_key)
-        .fetch_optional(&mut *tx)
-        .await?
-    {
-        let deployment_id = existing.try_get("id")?;
-        tx.commit().await?;
-        return Ok(AutomaticGrantsDeploymentResult {
-            deployment_id: Some(deployment_id),
-            deferred: deferred.into_iter().collect(),
-        });
-    }
-
+    // The comparison above is against what agents last reported. An unsettled grants order will
+    // still overwrite that, so neither "nothing to ship" nor a new order can be decided from it:
+    // the former would mark this revision serving and the older order would then land over it.
     if let Some(active) =
         sqlx::query("SELECT id FROM deployments WHERE active = TRUE AND kind = 'grants' LIMIT 1")
             .fetch_optional(&mut *tx)
             .await?
     {
-        return Err(StoreError::Unsupported(format!(
-            "another grants deployment is active: {}",
-            active.try_get::<i64, _>("id")?
-        )));
+        let blocked_by = active.try_get("id")?;
+        tx.rollback().await?;
+        return Ok(AutomaticGrantsDeploymentResult {
+            deployment_id: None,
+            deferred: deferred.into_iter().collect(),
+            blocked_by: Some(blocked_by),
+        });
     }
+
+    let Some(idempotency_key) = idempotency_key else {
+        tx.commit().await?;
+        return Ok(AutomaticGrantsDeploymentResult {
+            deployment_id: None,
+            deferred: deferred.into_iter().collect(),
+            blocked_by: None,
+        });
+    };
 
     let row = sqlx::query(
         "INSERT INTO deployments (
@@ -1398,6 +1413,7 @@ async fn create_automatic_grants_deployment_locked(
     Ok(AutomaticGrantsDeploymentResult {
         deployment_id: Some(deployment_id),
         deferred: deferred.into_iter().collect(),
+        blocked_by: None,
     })
 }
 
@@ -2200,7 +2216,10 @@ pub async fn load_desired_for_node(
     .fetch_one(pool)
     .await?
     {
-        return Ok(None);
+        return load_resigned_environment_desired(pool, node_id).await;
+    }
+    if let Some(desired) = load_resigned_environment_desired(pool, node_id).await? {
+        return Ok(Some(desired));
     }
     let Some(row) = sqlx::query(
         // Both lines can be active at once. A configuration target already handed to the agent
@@ -2384,8 +2403,9 @@ pub async fn claim_desired_for_node(
         .fetch_optional(&mut *tx)
         .await?;
         let Some(obligation) = obligation else {
+            let desired = load_resigned_environment_desired_connection(&mut tx, node_id).await?;
             tx.commit().await?;
-            return Ok(None);
+            return Ok(desired);
         };
         let deployment_id: i64 = obligation.try_get("deployment_id")?;
         let lifecycle_epoch: i64 = obligation.try_get("lifecycle_epoch")?;
@@ -2428,6 +2448,10 @@ pub async fn claim_desired_for_node(
         .bind(claim_generation)
         .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
+        return Ok(Some(desired));
+    }
+    if let Some(desired) = load_resigned_environment_desired_connection(&mut tx, node_id).await? {
         tx.commit().await?;
         return Ok(Some(desired));
     }
@@ -2533,6 +2557,7 @@ pub async fn claim_desired_for_node(
     .fetch_optional(&mut *tx)
     .await?
     else {
+        tx.commit().await?;
         return Ok(None);
     };
 
@@ -2767,7 +2792,118 @@ pub async fn report_target_result(
             deployment_status,
         });
     }
-    if !matches!(deployment_status.as_str(), "planned" | "running") {
+    if report.claim_generation != 0 {
+        if let Some(desired) =
+            load_resigned_environment_desired_connection(&mut tx, &report.node_id).await?
+        {
+            if desired.deployment_id != report.deployment_id
+                || desired.claim_generation != report.claim_generation
+            {
+                return Err(StoreError::Conflict(format!(
+                    "re-signed environment report for {}/{} has stale deployment or claim generation",
+                    report.deployment_id, report.node_id
+                )));
+            }
+            let mut desired_matched = true;
+            for (artifact, state) in desired.desired.artifacts() {
+                if !artifact_state_matches_metadata(
+                    report.observed_after.artifact(artifact),
+                    &artifact_metadata(state),
+                )? {
+                    desired_matched = false;
+                    break;
+                }
+            }
+            desired_matched &= grants_match(&desired.desired.grants, &report.observed_after.grants);
+            let final_status = match report.result {
+                TargetApplyResult::Applied if desired_matched => "succeeded",
+                TargetApplyResult::Applied => "failed-dirty",
+                TargetApplyResult::FailedRecovered => "failed-recovered",
+                TargetApplyResult::FailedDirty => "failed-dirty",
+            };
+            if final_status == "succeeded" {
+                upsert_node_applied_state(
+                    &mut tx,
+                    report.deployment_id,
+                    &report.node_id,
+                    &report.observed_after,
+                    DeploymentKind::Config,
+                )
+                .await?;
+                // Artifacts without a successful historical source are deliberately Unmanaged in
+                // this repair. `upsert_node_applied_state` preserves their previous value, so
+                // remove the job marker explicitly after every managed artifact has converged.
+                sqlx::query(
+                    "UPDATE node_applied_state
+                        SET phantun_observed = phantun_observed - 'reconcile',
+                            wireguard_observed = wireguard_observed - 'reconcile',
+                            xray_observed = xray_observed - 'reconcile',
+                            hy2_port_hop_observed = hy2_port_hop_observed - 'reconcile',
+                            grants_observed = grants_observed - 'reconcile'
+                      WHERE node_id = $1",
+                )
+                .bind(&report.node_id)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                // Keep the marker claimable. A clean reinstall cannot repair this from local
+                // files, so consuming it on the first failed attempt would return the machine to
+                // permanent 204 responses.
+                sqlx::query(
+                    "UPDATE node_applied_state
+                        SET phantun_state = 'unknown',
+                            phantun_sha256 = NULL,
+                            phantun_observed = phantun_observed || jsonb_build_object(
+                                'last_error', $2::text, 'last_result', $3::text
+                            ),
+                            wireguard_state = 'unknown',
+                            wireguard_sha256 = NULL,
+                            wireguard_observed = wireguard_observed || jsonb_build_object(
+                                'last_error', $2::text, 'last_result', $3::text
+                            ),
+                            xray_state = 'unknown',
+                            xray_sha256 = NULL,
+                            xray_observed = xray_observed || jsonb_build_object(
+                                'last_error', $2::text, 'last_result', $3::text
+                            ),
+                            hy2_port_hop_state = 'unknown',
+                            hy2_port_hop_sha256 = NULL,
+                            hy2_port_hop_observed = hy2_port_hop_observed || jsonb_build_object(
+                                'last_error', $2::text, 'last_result', $3::text
+                            ),
+                            grants_state = 'unknown',
+                            grants_observed = grants_observed || jsonb_build_object(
+                                'last_error', $2::text, 'last_result', $3::text
+                            ),
+                            observed_at = now()
+                      WHERE node_id = $1
+                        AND wireguard_observed->>'reconcile' = 'node-token-resigned'",
+                )
+                .bind(&report.node_id)
+                .bind(
+                    report
+                        .error
+                        .as_deref()
+                        .unwrap_or("environment convergence did not match desired state"),
+                )
+                .bind(final_status)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
+            return Ok(ReportTargetResult {
+                deployment_id: report.deployment_id,
+                node_id: report.node_id,
+                target_status: final_status.to_owned(),
+                deployment_status,
+            });
+        }
+    }
+    // Halting closes new claims, not reports that were already in flight. Rejecting those reports
+    // strands a successfully converged target in `dispatched`; the Agent correctly cannot replay
+    // a 409 forever because other conflicts are permanent. The target lock below still fences
+    // stale or terminal work.
+    if !matches!(deployment_status.as_str(), "planned" | "running" | "halted") {
         return Err(StoreError::Unsupported(format!(
             "deployment {} is not accepting reports in status {}",
             report.deployment_id, deployment_status
@@ -2954,8 +3090,13 @@ pub async fn report_target_result(
         .await?;
     }
 
-    let deployment_status =
-        refresh_deployment_status(&mut tx, report.deployment_id, final_status).await?;
+    let deployment_status = refresh_deployment_status_after_report(
+        &mut tx,
+        report.deployment_id,
+        final_status,
+        deployment_status == "halted",
+    )
+    .await?;
     tx.commit().await?;
 
     Ok(ReportTargetResult {
@@ -5681,6 +5822,195 @@ async fn desired_deployment_from_structure_connection(
     })
 }
 
+/// A re-signed token may be going to a clean operating-system install. The old applied row then
+/// describes the disk which was replaced, not the machine now polling. Reconstruct every managed
+/// artifact from its own last successful target: later narrow deployments may have moved only one
+/// artifact, so no single historical target is necessarily the complete running environment.
+/// Using the editable current model here would accidentally publish draft topology.
+async fn load_resigned_environment_desired(
+    pool: &PgPool,
+    node_id: &str,
+) -> Result<Option<NodeDesiredDeployment>> {
+    let mut connection = pool.acquire().await?;
+    load_resigned_environment_desired_connection(&mut connection, node_id).await
+}
+
+async fn load_resigned_environment_desired_connection(
+    connection: &mut PgConnection,
+    node_id: &str,
+) -> Result<Option<NodeDesiredDeployment>> {
+    let claim_generation = sqlx::query_scalar::<_, i64>(
+        "SELECT GREATEST(
+                    1,
+                    floor(extract(epoch FROM agent.token_created_at) * 1000000)::bigint
+                )
+           FROM node_agent_state agent
+           JOIN node_lifecycle_state lifecycle
+             ON lifecycle.node_id = agent.node_id
+            AND lifecycle.phase = 'active'
+           JOIN node_applied_state applied ON applied.node_id = agent.node_id
+          WHERE agent.node_id = $1
+            AND agent.token_created_at IS NOT NULL
+            AND applied.wireguard_observed->>'reconcile' = 'node-token-resigned'",
+    )
+    .bind(node_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some(claim_generation) = claim_generation else {
+        return Ok(None);
+    };
+
+    let unmanaged = || DesiredArtifact::Unmanaged {
+        reason: "该产物没有成功落地记录，重签对齐不猜测草稿状态".to_owned(),
+    };
+    let mut desired = NodeDesiredState {
+        phantun: unmanaged(),
+        wireguard: unmanaged(),
+        xray: unmanaged(),
+        hy2_port_hop: unmanaged(),
+        grants: DesiredGrants::Unmanaged {
+            reason: "没有成功落地的运行态权限记录".to_owned(),
+        },
+    };
+    let mut source_deployments = Vec::new();
+    let mut xray_source = None;
+    for artifact in ConfigArtifact::ALL {
+        let Some((deployment_id, artifact_desired)) =
+            load_last_successful_artifact(connection, node_id, artifact).await?
+        else {
+            continue;
+        };
+        source_deployments.push(deployment_id);
+        match artifact {
+            ConfigArtifact::Phantun => desired.phantun = artifact_desired,
+            ConfigArtifact::Hy2PortHop => desired.hy2_port_hop = artifact_desired,
+            ConfigArtifact::WireGuard => desired.wireguard = artifact_desired,
+            ConfigArtifact::Xray => {
+                desired.xray = artifact_desired;
+                xray_source = Some(deployment_id);
+            }
+        }
+    }
+    if let Some((deployment_id, grants)) = load_last_successful_grants(connection, node_id).await? {
+        source_deployments.push(deployment_id);
+        desired.grants = grants;
+    }
+    let Some(deployment_id) = xray_source.or_else(|| source_deployments.into_iter().max()) else {
+        return Ok(None);
+    };
+
+    let mut actions = Vec::new();
+    for (artifact, state) in desired.artifacts() {
+        let action = match (artifact, state) {
+            (ConfigArtifact::Phantun, DesiredArtifact::Present { .. }) => {
+                Some(PlannedAction::ApplyPhantun)
+            }
+            (ConfigArtifact::Phantun, DesiredArtifact::Disabled { .. }) => {
+                Some(PlannedAction::DisablePhantun)
+            }
+            (ConfigArtifact::Hy2PortHop, DesiredArtifact::Present { .. }) => {
+                Some(PlannedAction::ApplyHy2PortHop)
+            }
+            (ConfigArtifact::Hy2PortHop, DesiredArtifact::Disabled { .. }) => {
+                Some(PlannedAction::DisableHy2PortHop)
+            }
+            (ConfigArtifact::WireGuard, DesiredArtifact::Present { .. }) => {
+                Some(PlannedAction::ApplyWireGuard)
+            }
+            (ConfigArtifact::WireGuard, DesiredArtifact::Disabled { .. }) => {
+                Some(PlannedAction::DisableWireGuard)
+            }
+            (ConfigArtifact::Xray, DesiredArtifact::Present { .. }) => {
+                Some(PlannedAction::ApplyXray)
+            }
+            (ConfigArtifact::Xray, DesiredArtifact::Disabled { .. }) => {
+                Some(PlannedAction::DisableXray)
+            }
+            (_, DesiredArtifact::Unmanaged { .. }) => None,
+        };
+        actions.extend(action);
+    }
+    if matches!(desired.grants, DesiredGrants::Present { .. }) {
+        actions.push(PlannedAction::SyncGrants);
+    }
+    actions.sort();
+
+    Ok(Some(NodeDesiredDeployment {
+        deployment_id,
+        node_id: node_id.to_owned(),
+        claim_generation: i64_to_u64("re-signed environment claim generation", claim_generation)?,
+        wave: 0,
+        actions,
+        usage_generation_id: None,
+        phantun_binary: None,
+        desired,
+    }))
+}
+
+async fn load_last_successful_artifact(
+    connection: &mut PgConnection,
+    node_id: &str,
+    artifact: ConfigArtifact,
+) -> Result<Option<(i64, DesiredArtifact)>> {
+    let row = sqlx::query(
+        "SELECT d.id AS deployment_id,
+                dts.desired_structure -> CAST($2 AS text) AS metadata
+           FROM deployment_target_state dts
+           JOIN deployment_targets dt
+             ON dt.deployment_id = dts.deployment_id
+            AND dt.node_id = dts.node_id
+           JOIN deployments d
+             ON d.id = dts.deployment_id
+            AND d.kind = 'config'
+          WHERE dts.node_id = $1
+            AND dt.status = 'succeeded'
+            AND (dts.desired_structure -> CAST($2 AS text))->>'state'
+                IN ('present', 'disabled')
+          ORDER BY d.id DESC
+          LIMIT 1",
+    )
+    .bind(node_id)
+    .bind(artifact.field())
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let deployment_id: i64 = row.try_get("deployment_id")?;
+    let metadata: Value = row.try_get("metadata")?;
+    let desired = load_artifact_from_metadata(connection, &metadata).await?;
+    Ok(Some((deployment_id, desired)))
+}
+
+async fn load_last_successful_grants(
+    connection: &mut PgConnection,
+    node_id: &str,
+) -> Result<Option<(i64, DesiredGrants)>> {
+    let row = sqlx::query(
+        "SELECT d.id AS deployment_id, dts.desired_grants
+           FROM deployment_target_state dts
+           JOIN deployment_targets dt
+             ON dt.deployment_id = dts.deployment_id
+            AND dt.node_id = dts.node_id
+           JOIN deployments d ON d.id = dts.deployment_id
+          WHERE dts.node_id = $1
+            AND dt.status = 'succeeded'
+            AND dts.desired_grants->>'state' IN ('present', 'disabled')
+          ORDER BY d.id DESC
+          LIMIT 1",
+    )
+    .bind(node_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    row.map(|row| {
+        Ok((
+            row.try_get("deployment_id")?,
+            serde_json::from_value(row.try_get("desired_grants")?)?,
+        ))
+    })
+    .transpose()
+}
+
 /// The revision this kind of deployment last shipped successfully, which the console uses as the
 /// baseline for artifact diffs.
 ///
@@ -6302,6 +6632,32 @@ async fn refresh_deployment_status(
         .await?;
         Ok("running".to_owned())
     }
+}
+
+/// Settle one report without turning an operator- or failure-halted release back into `running`.
+/// If this was the last unresolved target and every target succeeded, normal completion is still
+/// correct: there is no remaining work for a later resume action to expose.
+async fn refresh_deployment_status_after_report(
+    tx: &mut Transaction<'_, Postgres>,
+    deployment_id: i64,
+    target_status: &str,
+    was_halted: bool,
+) -> Result<String> {
+    if was_halted && target_status == "succeeded" {
+        let unresolved = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*)
+               FROM deployment_targets
+              WHERE deployment_id = $1
+                AND status <> 'succeeded'",
+        )
+        .bind(deployment_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if unresolved != 0 {
+            return Ok("halted".to_owned());
+        }
+    }
+    refresh_deployment_status(tx, deployment_id, target_status).await
 }
 
 async fn refresh_deployment_settlement_tx(

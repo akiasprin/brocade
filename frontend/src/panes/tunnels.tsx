@@ -25,7 +25,7 @@ import { Icon, ListIcon, PanelTitle } from '../ui/icons';
 import { RegionFlag } from '../ui/region-flag';
 import { useCrumb } from '../wm/crumb';
 import { type CrumbSeg, type Win } from '../wm/store';
-import { navigate, returnTo } from '../forge/route';
+import { navigate, navigateInPlace, returnTo } from '../forge/route';
 import { DialogClose, DialogLayer } from '../ui/dialog';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import { WarpRegistrationAction, useWarpRegistrationAvailability } from '../warp-registration';
@@ -42,7 +42,11 @@ const ExternalOutboundEditor = lazy(() =>
 );
 const TunnelDeleteDialog = lazy(() => loadTunnelEditor().then(module => ({ default: module.TunnelDeleteDialog })));
 
-type Drill = { p: 'list' } | { p: 'vpngate'; id?: string } | { p: 'warp'; id: string } | { p: 'custom'; id: string };
+type Drill =
+  | { p: 'list' }
+  | { p: 'vpngate'; id?: string; country?: string }
+  | { p: 'warp'; id: string }
+  | { p: 'custom'; id: string };
 
 export type WarpIpStack = 'dual' | 'prefer_ipv4' | 'prefer_ipv6' | 'ipv4' | 'ipv6';
 
@@ -176,6 +180,8 @@ export function TunnelsPane({ win }: { win: Win }) {
   const drill = (win.data.drill as Drill | undefined) ?? { p: 'list' };
   const go = (next: Drill) => navigate('tunnels', next);
   const selectedId = 'id' in drill ? drill.id : undefined;
+  const selectedVpngateCountry = drill.p === 'vpngate' ? drill.country : undefined;
+  const selectVpngateCountry = (country: string) => navigateInPlace('tunnels', { p: 'vpngate', country });
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: fetchSnapshot, enabled: Boolean(selectedId) });
   const label = selectedId
     ? (snapshot.data?.snapshot.external_outbounds ?? []).find(candidate => candidate.id === selectedId)?.name
@@ -185,7 +191,7 @@ export function TunnelsPane({ win }: { win: Win }) {
   if (drill.p === 'vpngate' && !drill.id)
     return (
       <Suspense fallback={<Loading variant="vpngate" />}>
-        <VpngatePage />
+        <VpngatePage countryCode={selectedVpngateCountry} onCountryChange={selectVpngateCountry} />
       </Suspense>
     );
   if (selectedId) return <TunnelDetail tunnelId={selectedId} />;
@@ -1132,8 +1138,6 @@ function WarpTunnelDetail({
               <dl className="cg-kv">
                 <dt>协议</dt>
                 <dd>Cloudflare WARP</dd>
-                <dt>租户</dt>
-                <dd>{tunnel.tenant}</dd>
                 <dt>修订</dt>
                 <dd className={availability.committed ? '' : 'dim'}>
                   {availability.committed ? `r${availability.committedRevision ?? '—'}` : '仅在变更集'}
@@ -1256,7 +1260,10 @@ function TunnelDetail({ tunnelId }: { tunnelId: string }) {
   if (isVpngateOutbound(tunnel)) {
     return (
       <Suspense fallback={<Loading variant="vpngate" />}>
-        <VpngatePage initialPool={tunnel} />
+        <VpngatePage
+          initialPool={tunnel}
+          onCountryChange={country => navigateInPlace('tunnels', { p: 'vpngate', country })}
+        />
       </Suspense>
     );
   }

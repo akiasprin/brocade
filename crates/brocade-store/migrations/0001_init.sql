@@ -88,7 +88,11 @@ CREATE TABLE admin_operators (
         (role <> 'user' AND user_tenant_id IS NULL AND user_id IS NULL)
     ),
     CONSTRAINT admin_operators_passwordless_check CHECK (
-        password_hash IS NOT NULL OR (id = 'public' AND role = 'readonly')
+        password_hash IS NOT NULL
+        OR (id = 'public' AND role = 'readonly')
+        -- A direct-link-only user still needs an operator identity for browser sessions, but has
+        -- no password credential until an administrator explicitly enables password login.
+        OR role = 'user'
     ),
     CONSTRAINT admin_operators_pkey PRIMARY KEY (id),
     CONSTRAINT admin_operators_token_hash_key UNIQUE (token_hash),
@@ -418,6 +422,12 @@ CREATE TABLE vpngate_catalog_state (
     id BOOLEAN NOT NULL,
     enabled BOOLEAN DEFAULT true NOT NULL,
     interval_secs INTEGER DEFAULT 900 NOT NULL,
+    -- Successful connectivity checks stay out of the catalogue probe queue for this long. Full
+    -- single-stream performance measurements have their own slower schedule. Ownership of the
+    -- retained directory rotates independently so one machine does not keep the same shard.
+    probe_success_cooldown_secs INTEGER DEFAULT 1800 NOT NULL,
+    probe_performance_cooldown_secs INTEGER DEFAULT 21600 NOT NULL,
+    probe_shard_rotation_secs INTEGER DEFAULT 21600 NOT NULL,
     source_url TEXT DEFAULT 'https://www.vpngate.net/api/iphone/' NOT NULL,
     -- Risk scores are provider-local inputs. The policy first evaluates every source against its
     -- own threshold and only then combines pass/reject decisions; it never takes MAX across scores.
@@ -445,6 +455,18 @@ CREATE TABLE vpngate_catalog_state (
     CONSTRAINT vpngate_catalog_state_pkey PRIMARY KEY (id),
     CONSTRAINT vpngate_catalog_state_id_check CHECK (id),
     CONSTRAINT vpngate_catalog_state_interval_range CHECK (interval_secs BETWEEN 60 AND 86400),
+    CONSTRAINT vpngate_catalog_state_probe_success_cooldown_range CHECK (
+        probe_success_cooldown_secs BETWEEN 60 AND 86400
+        AND probe_success_cooldown_secs % 60 = 0
+    ),
+    CONSTRAINT vpngate_catalog_state_probe_performance_cooldown_range CHECK (
+        probe_performance_cooldown_secs BETWEEN 3600 AND 604800
+        AND probe_performance_cooldown_secs % 3600 = 0
+    ),
+    CONSTRAINT vpngate_catalog_state_probe_shard_rotation_range CHECK (
+        probe_shard_rotation_secs BETWEEN 3600 AND 604800
+        AND probe_shard_rotation_secs % 3600 = 0
+    ),
     CONSTRAINT vpngate_catalog_state_source_https CHECK (source_url ~ '^https://'),
     CONSTRAINT vpngate_catalog_state_admission_policy_object CHECK (jsonb_typeof(admission_policy) = 'object'),
     CONSTRAINT vpngate_catalog_state_intelligence_policy_object CHECK (jsonb_typeof(intelligence_policy) = 'object'),
@@ -1232,7 +1254,7 @@ CREATE TABLE vpngate_candidate_probe_samples (
     ),
     CONSTRAINT vpngate_candidate_probe_samples_success_coherent CHECK (
         (status = 'succeeded' AND exit_ip IS NOT NULL AND connect_ms IS NOT NULL
-            AND download_bps IS NOT NULL AND error_code IS NULL)
+            AND error_code IS NULL)
         OR (status = 'failed' AND error_code IS NOT NULL)
     )
 ) WITH (
@@ -1242,11 +1264,9 @@ CREATE TABLE vpngate_candidate_probe_samples (
 );
 
 -- Current candidate selection reads the bounded `vpngate_candidate_probe_latest` projection. The
--- append-only table is retained only for short incident reconstruction, so it needs one server
--- timeline path in addition to its idempotency key and the BRIN retention path.
-CREATE INDEX vpngate_candidate_probe_samples_server_recent
-    ON vpngate_candidate_probe_samples
-        (server_id, profile_sha256, probed_at DESC, node_id);
+-- append-only table is retained only for short incident reconstruction; its primary key supports
+-- idempotent writes and the BRIN path supports bounded retention without paying for another
+-- high-churn B-tree that no serving or diagnostic query reads.
 CREATE INDEX vpngate_candidate_probe_samples_received_brin
     ON vpngate_candidate_probe_samples USING brin (received_at) WITH (pages_per_range = 32);
 
@@ -1267,10 +1287,14 @@ CREATE TABLE vpngate_candidate_probe_latest (
     error_detail TEXT,
     probed_at TIMESTAMPTZ NOT NULL,
     received_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    -- These fields retain the most recent complete performance measurement. A newer successful
+    -- connectivity-only sample updates the current result above without making an old download
+    -- rate appear freshly measured.
     last_success_exit_ip INET,
     last_success_connect_ms INTEGER,
     last_success_download_bps BIGINT,
     last_success_probed_at TIMESTAMPTZ,
+    last_success_received_at TIMESTAMPTZ,
     CONSTRAINT vpngate_candidate_probe_latest_pkey
         PRIMARY KEY (node_id, server_id, profile_sha256),
     CONSTRAINT vpngate_candidate_probe_latest_node_fkey
@@ -1288,21 +1312,58 @@ CREATE TABLE vpngate_candidate_probe_latest (
     ),
     CONSTRAINT vpngate_candidate_probe_latest_success_coherent CHECK (
         (status = 'succeeded' AND exit_ip IS NOT NULL AND connect_ms IS NOT NULL
-            AND download_bps IS NOT NULL AND error_code IS NULL)
+            AND error_code IS NULL)
         OR (status = 'failed' AND error_code IS NOT NULL)
     ),
     CONSTRAINT vpngate_candidate_probe_latest_last_success_coherent CHECK (
         (last_success_exit_ip IS NULL AND last_success_connect_ms IS NULL
-            AND last_success_download_bps IS NULL AND last_success_probed_at IS NULL)
+            AND last_success_download_bps IS NULL AND last_success_probed_at IS NULL
+            AND last_success_received_at IS NULL)
         OR (last_success_exit_ip IS NOT NULL AND last_success_connect_ms IS NOT NULL
             AND last_success_connect_ms >= 0 AND last_success_download_bps IS NOT NULL
-            AND last_success_download_bps >= 0 AND last_success_probed_at IS NOT NULL)
+            AND last_success_download_bps >= 0 AND last_success_probed_at IS NOT NULL
+            AND last_success_received_at IS NOT NULL)
     )
 );
 CREATE INDEX vpngate_candidate_probe_latest_country_fresh
     ON vpngate_candidate_probe_latest (country_code, received_at DESC, server_id, profile_sha256);
 CREATE INDEX vpngate_candidate_probe_latest_server_recent
     ON vpngate_candidate_probe_latest (server_id, profile_sha256, probed_at DESC);
+
+-- Qualification keeps one fleet-wide failure streak per exact provider profile. Successful
+-- performance evidence remains fresh for at least five hours and extends through one configured
+-- performance interval plus one connectivity interval, so a healthy candidate does not disappear
+-- between scheduled checks. One or two later failures trigger immediate priority review and start
+-- a separate twenty-minute grace window; the third consecutive failure suspends the candidate
+-- immediately, while any later success resets the failure state.
+CREATE TABLE vpngate_candidate_probe_state (
+    server_id TEXT NOT NULL,
+    profile_sha256 TEXT NOT NULL,
+    last_outcome_status TEXT NOT NULL,
+    last_outcome_node_id TEXT NOT NULL,
+    last_outcome_at TIMESTAMPTZ NOT NULL,
+    last_outcome_received_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    failure_streak_started_at TIMESTAMPTZ,
+    consecutive_failures INTEGER NOT NULL,
+    CONSTRAINT vpngate_candidate_probe_state_pkey PRIMARY KEY (server_id, profile_sha256),
+    CONSTRAINT vpngate_candidate_probe_state_server_fkey
+        FOREIGN KEY (server_id) REFERENCES vpngate_servers(id),
+    CONSTRAINT vpngate_candidate_probe_state_profile_fkey
+        FOREIGN KEY (profile_sha256) REFERENCES vpngate_profiles(sha256),
+    CONSTRAINT vpngate_candidate_probe_state_status_known
+        CHECK (last_outcome_status IN ('succeeded', 'failed')),
+    CONSTRAINT vpngate_candidate_probe_state_node_shape
+        CHECK (length(btrim(last_outcome_node_id)) BETWEEN 1 AND 128),
+    CONSTRAINT vpngate_candidate_probe_state_failures_range
+        CHECK (consecutive_failures BETWEEN 0 AND 3),
+    CONSTRAINT vpngate_candidate_probe_state_outcome_coherent CHECK (
+        (last_outcome_status = 'succeeded' AND consecutive_failures = 0
+            AND failure_streak_started_at IS NULL)
+        OR (last_outcome_status = 'failed' AND consecutive_failures BETWEEN 1 AND 3
+            AND failure_streak_started_at IS NOT NULL
+            AND failure_streak_started_at <= last_outcome_received_at)
+    )
+);
 
 -- Last reported operational state for each node-local VPN Gate runtime. This is replaceable state,
 -- unlike the samples below; removing a node or logical pool removes only the pointer, not history.
@@ -1663,10 +1724,28 @@ CREATE TABLE users (
     created_revision BIGINT,
     status TEXT DEFAULT 'active' NOT NULL,
     account_type TEXT DEFAULT 'formal' NOT NULL,
+    -- One replaceable direct-login credential belongs to the user itself. The plaintext TOKEN is
+    -- never stored; timestamps keep issuance, successful use, and revocation auditable.
+    direct_login_token_hash TEXT,
+    direct_login_created_at TIMESTAMPTZ,
+    direct_login_last_used_at TIMESTAMPTZ,
+    direct_login_revoked_at TIMESTAMPTZ,
     CONSTRAINT users_status_check CHECK ((status IN ('active', 'disabled'))),
     CONSTRAINT users_account_type_check CHECK ((account_type IN ('formal', 'test'))),
+    CONSTRAINT users_direct_login_token_hash_length CHECK (
+        direct_login_token_hash IS NULL OR length(direct_login_token_hash) = 64
+    ),
+    CONSTRAINT users_direct_login_state_check CHECK (
+        (direct_login_token_hash IS NULL
+            AND direct_login_created_at IS NULL
+            AND direct_login_last_used_at IS NULL
+            AND direct_login_revoked_at IS NULL)
+        OR
+        (direct_login_token_hash IS NOT NULL AND direct_login_created_at IS NOT NULL)
+    ),
     CONSTRAINT users_pkey PRIMARY KEY (tenant_id, id),
     CONSTRAINT users_uuid_key UNIQUE (uuid),
+    CONSTRAINT users_direct_login_token_hash_key UNIQUE (direct_login_token_hash),
     CONSTRAINT users_created_revision_fkey FOREIGN KEY (created_revision) REFERENCES revisions(id),
     CONSTRAINT users_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT
 );
@@ -1785,7 +1864,7 @@ CREATE TABLE ingresses (
     reality_server_names JSONB NOT NULL,
     reality_flow TEXT,
     reality_fallback_mode TEXT DEFAULT 'global-site' NOT NULL,
-    reality_fallback_limits JSONB DEFAULT '{"mode":"balanced"}'::jsonb NOT NULL,
+    reality_fallback_limits JSONB DEFAULT '{"mode":"strict"}'::jsonb NOT NULL,
     -- Whether an unauthenticated fallback may reach names other than the borrowed one. Default on:
     -- a borrowed site is usually somebody's CDN, whose address answers for its neighbours too, and
     -- REALITY hands the connection over before it has read which name was asked for.
@@ -2316,10 +2395,11 @@ CREATE TABLE model_snapshots (
 -- being released), and without this column "the machine drifted and repaired itself" happens
 -- entirely without the control plane's knowledge.
 --
--- Backlog — while the agent cannot reach the control plane it accumulates reports in a spool,
--- dropping the oldest past the limit. What is dropped is accounting, and the symptom is "this machine
--- had no traffic this month", indistinguishable from genuinely having none. `dropped` only grows:
--- non-zero means accounting was permanently lost.
+-- Backlog — while the agent cannot reach the control plane it accumulates usage and convergence
+-- reports in separate spools, dropping the oldest past each limit. Their consequences differ:
+-- usage loss makes traffic accounting incomplete, while observation loss leaves a release without
+-- its execution evidence. New agents classify both cumulative counters inside this JSONB value;
+-- the legacy all-kinds total remains for rolling compatibility.
 --
 -- geodata_observed — the actual on-disk state of geoip.dat / geosite.dat on each machine. Those two
 -- .dat files are not sent by the control plane; xray downloads them on its own cron, and all the
@@ -2356,6 +2436,10 @@ CREATE TABLE node_agent_state (
     wireguard_health JSONB DEFAULT '{}'::jsonb NOT NULL,
     spool_backlog JSONB DEFAULT '{}'::jsonb NOT NULL,
     runtime_reported_at TIMESTAMPTZ,
+    -- Set only when the Agent successfully queried Xray's online map. It is deliberately
+    -- separate from runtime_reported_at: an old Agent, disabled stats policy or failed local API
+    -- must age presence into "unknown", never overwrite it with a fabricated zero.
+    online_sources_reported_at TIMESTAMPTZ,
     geodata_observed JSONB DEFAULT '{}'::jsonb NOT NULL,
     -- The slow-moving half of the load report: kernel, cores, RAM and disk capacity, congestion
     -- algorithm, qdisc, whether we own this machine's sysctl. Latest only.
@@ -2383,6 +2467,53 @@ CREATE TABLE node_agent_state (
     CONSTRAINT node_agent_state_token_hash_key UNIQUE (token_hash),
     CONSTRAINT node_agent_state_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE RESTRICT
 );
+
+-- Raw public client addresses observed in Xray's ref-counted online maps. One row follows one
+-- node / grant label / address across reconnects. `active` describes the latest accepted node
+-- snapshot; offline rows stay for bounded incident review and are pruned after 30 days.
+--
+-- PostgreSQL INET canonicalizes IPv4/IPv6 spellings and makes equality the deduplication rule.
+-- The control plane still validates globally routable input before it reaches this table.
+CREATE TABLE user_online_sources (
+    node_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    ingress_id TEXT NOT NULL,
+    source_ip INET NOT NULL,
+    active BOOLEAN DEFAULT TRUE NOT NULL,
+    first_observed_at TIMESTAMPTZ NOT NULL,
+    last_observed_at TIMESTAMPTZ NOT NULL,
+    xray_last_seen_at TIMESTAMPTZ NOT NULL,
+    offline_at TIMESTAMPTZ,
+    -- Last accepted per-node/ingress protocol set, not a cumulative connection history.
+    -- NULL preserves unknown legacy observations without guessing from configured listeners.
+    protocols JSONB,
+    CONSTRAINT user_online_sources_pkey
+        PRIMARY KEY (node_id, tenant_id, user_id, ingress_id, source_ip),
+    CONSTRAINT user_online_sources_node_fkey
+        FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    CONSTRAINT user_online_sources_user_fkey
+        FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE CASCADE,
+    CONSTRAINT user_online_sources_ingress_fkey
+        FOREIGN KEY (ingress_id) REFERENCES ingresses(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    CONSTRAINT user_online_sources_time_order CHECK (last_observed_at >= first_observed_at),
+    CONSTRAINT user_online_sources_active_shape CHECK (
+        (active AND offline_at IS NULL) OR (NOT active AND offline_at IS NOT NULL)
+    ),
+    CONSTRAINT user_online_sources_protocols_shape CHECK (
+        protocols IS NULL OR CASE WHEN jsonb_typeof(protocols) = 'array' THEN
+            jsonb_array_length(protocols) BETWEEN 1 AND 4
+            AND protocols <@ '["vless", "anytls", "hysteria2", "unknown"]'::jsonb
+        ELSE FALSE END
+    )
+);
+
+CREATE INDEX user_online_sources_current_user_idx
+    ON user_online_sources (tenant_id, user_id, source_ip)
+    WHERE active;
+CREATE INDEX user_online_sources_retention_idx
+    ON user_online_sources (last_observed_at)
+    WHERE NOT active;
 
 -- Public addresses are observations, not the configured addresses in nodes.public_ipv4/v6 and
 -- not the route source addresses above. Each family advances independently. The candidate fields
@@ -3214,18 +3345,24 @@ CREATE TABLE node_load_samples (
     CONSTRAINT node_load_samples_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
 
--- One TCP-connect or ICMP-echo result per machine, target and round. `attempted` is the only status
--- bit retained: it prevents missing IPv6 routes and unavailable ICMP sockets from becoming fake
--- packet loss. No resolved IP, DNS duration, TTL, kernel metric, retransmission or errno is stored.
+-- One TCP-connect or ICMP-echo result per machine, series and round. A series is one endpoint of a
+-- target in one address family: `target` is its `tcp://` / `icmp://` address, and a domain probed
+-- over both families is two series sharing that address. `attempted` keeps missing routes and
+-- unavailable ICMP sockets from becoming fake packet loss; `skip_reason` says which of those it
+-- was. No resolved IP, DNS duration, TTL, kernel metric, retransmission or errno is stored.
 CREATE TABLE node_ping_probe_samples (
     node_id TEXT NOT NULL,
     target TEXT NOT NULL,
+    family TEXT NOT NULL,
     probed_at TIMESTAMPTZ NOT NULL,
     attempted BOOLEAN NOT NULL,
     latency_us INTEGER,
+    skip_reason TEXT,
+    CONSTRAINT node_ping_probe_samples_family CHECK ((family = ANY (ARRAY['ipv4'::text, 'ipv6'::text]))),
     CONSTRAINT node_ping_probe_samples_latency_us CHECK (((latency_us IS NULL) OR (latency_us >= 0))),
     CONSTRAINT node_ping_probe_samples_attempted_latency CHECK (((latency_us IS NULL) OR attempted)),
-    CONSTRAINT node_ping_probe_samples_pkey PRIMARY KEY (node_id, target, probed_at),
+    CONSTRAINT node_ping_probe_samples_skip_reason CHECK (((skip_reason IS NULL) OR ((NOT attempted) AND (skip_reason = ANY (ARRAY['no_route'::text, 'no_address'::text, 'resolve_failed'::text, 'unavailable'::text]))))),
+    CONSTRAINT node_ping_probe_samples_pkey PRIMARY KEY (node_id, target, family, probed_at),
     CONSTRAINT node_ping_probe_samples_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
 ) WITH (
     autovacuum_vacuum_scale_factor = 0.02,

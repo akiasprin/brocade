@@ -16,20 +16,31 @@ const ADMIN_ORIGIN = process.env.BROCADE_ADMIN_ORIGIN ?? 'http://127.0.0.1:8080'
 const INSECURE_PREVIEW_COOKIE = process.env.BROCADE_INSECURE_PREVIEW_COOKIE === '1';
 const MOCK_PING = process.env.BROCADE_MOCK_PING === '1';
 
+type MockPingFamily = 'ipv4' | 'ipv6';
+
 type MockPingTarget = {
   name: string;
-  address: string;
+  kind: 'icmp' | 'tcp';
+  ipv4: string | null;
+  ipv6: string | null;
   baseMs: number;
   phase: number;
 };
 
 const MOCK_PING_TARGETS: MockPingTarget[] = [
-  { name: '深圳电信', address: 'icmp://202.96.134.33', baseMs: 28, phase: 0.2 },
-  { name: '深圳移动', address: 'icmp://120.196.165.24', baseMs: 44, phase: 1.4 },
-  { name: 'Cloudflare IPv6', address: 'icmp://[2606:4700:4700::1111]', baseMs: 62, phase: 2.5 },
-  { name: '深圳电信', address: 'tcp://202.96.134.33:443', baseMs: 37, phase: 0.7 },
-  { name: '深圳移动', address: 'tcp://120.196.165.24:443', baseMs: 58, phase: 1.9 },
-  { name: 'Cloudflare', address: 'tcp://1.1.1.1:443', baseMs: 104, phase: 3.1 },
+  { name: '深圳电信', kind: 'icmp', ipv4: '202.96.134.33', ipv6: null, baseMs: 28, phase: 0.2 },
+  { name: '深圳移动', kind: 'icmp', ipv4: '120.196.165.24', ipv6: null, baseMs: 44, phase: 1.4 },
+  { name: 'Cloudflare', kind: 'icmp', ipv4: '1.1.1.1', ipv6: '2606:4700:4700::1111', baseMs: 62, phase: 2.5 },
+  { name: '深圳电信', kind: 'tcp', ipv4: '202.96.134.33:443', ipv6: null, baseMs: 37, phase: 0.7 },
+  { name: '深圳移动', kind: 'tcp', ipv4: '120.196.165.24:443', ipv6: null, baseMs: 58, phase: 1.9 },
+  {
+    name: 'Cloudflare',
+    kind: 'tcp',
+    ipv4: '1.1.1.1:443',
+    ipv6: '[2606:4700:4700::1111]:443',
+    baseMs: 104,
+    phase: 3.1,
+  },
 ];
 
 function mockPingStep(windowSecs: number): number {
@@ -39,32 +50,58 @@ function mockPingStep(windowSecs: number): number {
   return 900;
 }
 
-function mockPingView(nodeId: string, requestedWindowSecs: number) {
+// 与 PingProbeEndpoint::series_address 一致：ICMP 的 IPv6 地址在序列标识里加方括号。
+function mockSeriesAddress(target: MockPingTarget, family: MockPingFamily): string {
+  const endpoint = target[family]!;
+  return target.kind === 'icmp' && family === 'ipv6' ? `icmp://[${endpoint}]` : `${target.kind}://${endpoint}`;
+}
+
+function mockPingColumns(
+  target: MockPingTarget,
+  family: MockPingFamily,
+  targetIndex: number,
+  end: number,
+  step: number,
+  count: number,
+) {
+  const columns = {
+    address: mockSeriesAddress(target, family),
+    probed_at_unix_secs: [] as number[],
+    attempted: [] as boolean[],
+    latency_us: [] as Array<number | null>,
+    skip_reason: [] as Array<string | null>,
+  };
+  // 每条线放一个超时。IPv6 另放一个未实际发包的缺口（无路由），以便确认两种状态没有混淆。
+  const lossIndex = Math.max(2, count - 7 - targetIndex * 3 - (family === 'ipv6' ? 2 : 0));
+  const gapIndex = family === 'ipv6' ? Math.max(1, Math.floor(count * 0.58)) : -1;
+  const baseMs = target.baseMs * (family === 'ipv6' ? 1.08 : 1);
+  for (let index = 0; index < count; index += 1) {
+    const attempted = index !== gapIndex;
+    const lost = index === lossIndex;
+    const wave = Math.sin(index / 3.8 + target.phase) * 0.11 + Math.sin(index / 10 + target.phase) * 0.05;
+    const spike = index === Math.floor(count * 0.72) ? baseMs * 0.45 : 0;
+    const latencyMs = Math.max(0.18, baseMs * (1 + wave) + spike);
+    columns.probed_at_unix_secs.push(end - (count - 1 - index) * step);
+    columns.attempted.push(attempted);
+    columns.latency_us.push(!attempted || lost ? null : Math.round(latencyMs * 1_000));
+    columns.skip_reason.push(attempted ? null : 'no_route');
+  }
+  return columns;
+}
+
+/** Same columnar shape as `/ping-probe/nodes/{id}/series`: one column set per configured family. */
+function mockPingView(nodeId: string, requestedWindowSecs: number, requestedEnd?: number) {
   const windowSecs = Math.min(7 * 86_400, Math.max(900, requestedWindowSecs || 1_800));
   const step = mockPingStep(windowSecs);
   const count = Math.min(600, Math.floor(windowSecs / step) + 1);
-  const end = Math.floor(Date.now() / 1_000 / step) * step;
+  const end = Math.floor((requestedEnd ?? Date.now() / 1_000) / step) * step;
   return {
     node_id: nodeId,
     targets: MOCK_PING_TARGETS.map((target, targetIndex) => ({
       name: target.name,
-      address: target.address,
-      samples: Array.from({ length: count }, (_, index) => {
-        const at = end - (count - 1 - index) * step;
-        // 每条线放一个超时。IPv6 目标另放一个未实际发包的缺口，以便确认两种状态没有混淆。
-        const lossIndex = Math.max(2, count - 7 - targetIndex * 3);
-        const gapIndex = target.address.includes('[') ? Math.max(1, Math.floor(count * 0.58)) : -1;
-        const attempted = index !== gapIndex;
-        const lost = index === lossIndex;
-        const wave = Math.sin(index / 3.8 + target.phase) * 0.11 + Math.sin(index / 10 + target.phase) * 0.05;
-        const spike = index === Math.floor(count * 0.72) ? target.baseMs * 0.45 : 0;
-        const latencyMs = Math.max(0.18, target.baseMs * (1 + wave) + spike);
-        return {
-          probed_at_unix_secs: at,
-          attempted,
-          latency_us: !attempted || lost ? null : Math.round(latencyMs * 1_000),
-        };
-      }),
+      kind: target.kind,
+      ipv4: target.ipv4 === null ? null : mockPingColumns(target, 'ipv4', targetIndex, end, step, count),
+      ipv6: target.ipv6 === null ? null : mockPingColumns(target, 'ipv6', targetIndex, end, step, count),
     })),
   };
 }
@@ -91,7 +128,7 @@ function pingMockPlugin(): Plugin {
         if (url.pathname === '/ping-probe/settings') {
           response.end(
             JSON.stringify({
-              targets: MOCK_PING_TARGETS.map(({ name, address }) => ({ name, address })),
+              targets: MOCK_PING_TARGETS.map(({ name, kind, ipv4, ipv6 }) => ({ name, kind, ipv4, ipv6 })),
               interval_secs: 60,
               timeout_ms: 420,
             }),
@@ -108,9 +145,12 @@ function pingMockPlugin(): Plugin {
         }
         const prefix = '/ping-probe/nodes/';
         if (url.pathname.startsWith(prefix)) {
-          const nodeId = decodeURIComponent(url.pathname.slice(prefix.length));
-          const windowSecs = Number(url.searchParams.get('window_secs'));
-          response.end(JSON.stringify(mockPingView(nodeId, windowSecs)));
+          const nodeId = decodeURIComponent(url.pathname.slice(prefix.length).replace(/\/series$/, ''));
+          const start = Number(url.searchParams.get('start_unix_secs'));
+          const end = Number(url.searchParams.get('end_unix_secs'));
+          const fixed = Number.isFinite(start) && Number.isFinite(end) && end > start;
+          const windowSecs = fixed ? end - start : Number(url.searchParams.get('window_secs'));
+          response.end(JSON.stringify(mockPingView(nodeId, windowSecs, fixed ? end : undefined)));
           return;
         }
         next();

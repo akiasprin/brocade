@@ -65,8 +65,22 @@ export function observeColors(themeName: string, resolve: (name: string) => stri
 }
 
 /** The paper an area fill lands on — `--card` in each theme. The overlay fill is expressed as a
- * tint of it, which is the whole mechanism behind the bound described on `observeAreaFill`. */
+ * tint of it, which is the whole mechanism behind the bound described on `observeAreaFill`.
+ *
+ * Callers pass the resolved `--card` as `paper`; these constants are only the fallback when it
+ * cannot be read. The dark palettes now sit on tinted-gray cards (L* 9.7, e.g. #1c1b1f), and tinting
+ * against the earlier #1f2023 left every unstacked fill lighter than its card — a gray haze under the
+ * trace. */
 const PAPER = { light: [255, 255, 255], dark: [31, 32, 35] } as const;
+
+/** `paper` is the resolved `--card` (#rrggbb); stacked bands ignore it because they are flat fills. */
+export type ObserveAreaOptions = { stacked?: boolean; count?: number; paper?: string };
+
+function paperChannels(paper: string | undefined, key: keyof typeof PAPER): readonly number[] {
+  if (paper === undefined || !/^#[0-9a-f]{6}$/i.test(paper)) return PAPER[key];
+  const value = Number.parseInt(paper.slice(1), 16);
+  return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+}
 
 /**
  * Share of the series hue kept in an overlay fill; the rest is paper. Alpha compositing converges
@@ -132,16 +146,12 @@ export type ObserveFill =
  * Unstacked fills also thin toward the zero line — see OVERLAY_BASE_FADE — so the pile-up at the
  * bottom carries less weight than the band right under each line.
  */
-export function observeAreaFill(
-  hex: string,
-  themeName: string,
-  options: { stacked?: boolean; count?: number } = {},
-): ObserveFill {
+export function observeAreaFill(hex: string, themeName: string, options: ObserveAreaOptions = {}): ObserveFill {
   const value = Number.parseInt(hex.slice(1), 16);
   const rgb = [(value >> 16) & 255, (value >> 8) & 255, value & 255];
   const key = themeName === 'light' ? 'light' : 'dark';
   if (options.stacked) return `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${BAND_INK[key]})`;
-  const paper = PAPER[key];
+  const paper = paperChannels(options.paper, key);
   const tinted = rgb.map((channel, index) => Math.round(channel * OVERLAY_TINT + paper[index] * (1 - OVERLAY_TINT)));
   // Fewer traces earn a more present fill; more traces reach the same floor more gently.
   const alpha = Math.max(0.1, OVERLAY_ALPHA[key] / Math.sqrt(Math.max(1, options.count ?? 1)));
@@ -168,13 +178,13 @@ export function observeAreaFill(
 export function observeAreaStyle(
   hex: string,
   themeName: string,
-  options: { stacked?: boolean; count?: number } = {},
+  options: ObserveAreaOptions = {},
 ): { color: ObserveFill; opacity: number } {
   return { color: observeAreaFill(hex, themeName, options), opacity: 1 };
 }
 
 /**
- * Full-size observation traces echo the 1.8px round KPI sparkline at an optically lighter 1.5px.
+ * Full-size observation traces use 1.5px round strokes; compact KPI sparklines stay finer at 1.2px.
  * Keeping this here makes throughput, ping, and expanded history use one stroke contract.
  */
 export function observeSeriesLine(color: string) {

@@ -19,7 +19,7 @@ import { Fragment, useState } from 'react';
 import { formatLocation, type DiagNames, type Diagnostic } from '../api';
 
 // 折叠状态按操作者存储。每次打开面板都需要重新点击展开会增加操作成本；
-// 而默认值为折叠——首次打开时不应直接显示大量无法判定的诊断信息。
+// 而默认值为折叠——首次打开时不应直接显示大量非阻断的配置提示。
 const KEY = 'brocade.diag.show-info';
 const readShowInfo = () => {
   try {
@@ -82,7 +82,7 @@ export function DiagTable({ diagnostics, names }: { diagnostics: Diagnostic[]; n
           <span className="big">
             {loud.length === 0 && infos === 0 ? '编译干净 · 可以发布' : '没有错误，也没有警告 · 可以发布'}
           </span>
-          {infos > 0 && <>另有 {infos} 条提示：编译器判断不了实际风险的那些事实</>}
+          {infos > 0 && <>另有 {infos} 条配置提示，建议核对</>}
         </div>
       ) : (
         <div className="dg-b">
@@ -106,7 +106,7 @@ export function DiagTable({ diagnostics, names }: { diagnostics: Diagnostic[]; n
                     {bandHere && (
                       <tr className="dg-band">
                         <td colSpan={4}>
-                          提示 · 编译器判断不了的事实，不挡发布<span className="sp">{infos}</span>
+                          提示 · 请留意以下配置细节<span className="sp">{infos} 条</span>
                         </td>
                       </tr>
                     )}
@@ -155,10 +155,10 @@ export function DiagTable({ diagnostics, names }: { diagnostics: Diagnostic[]; n
                             <b>级别</b>
                             <span>
                               {d.level === 'error'
-                                ? 'error · 挡住发布'
+                                ? '错误 · 阻止发布'
                                 : d.level === 'warn'
-                                  ? 'warn · 不挡发布'
-                                  : 'info · 不挡发布'}
+                                  ? '警告 · 不影响发布'
+                                  : '提示 · 建议核对'}
                             </span>
                           </div>
                         </td>

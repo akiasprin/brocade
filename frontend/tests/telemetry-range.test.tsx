@@ -87,6 +87,9 @@ describe('machine telemetry range', () => {
 
     fireEvent.click(trigger);
     expect(trigger.getAttribute('aria-expanded')).toBe('true');
+    const rangeMenu = view.getByRole('dialog', { name: '观测时间范围' });
+    expect(rangeMenu.parentElement).toBe(document.body);
+    expect(view.container.contains(rangeMenu)).toBe(false);
     expect(view.getAllByRole('option').map(option => option.textContent)).toEqual([
       '近 30 分钟✓',
       '近 1 小时✓',
@@ -168,7 +171,7 @@ describe('machine telemetry range', () => {
     );
   });
 
-  it('expands exact columnar PING points without downsampling or filling loss', async () => {
+  it('expands exact columnar PING points per family without downsampling or filling loss', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async () =>
@@ -177,11 +180,23 @@ describe('machine telemetry range', () => {
           targets: [
             {
               name: '广东电信',
-              address: 'icmp://example.test',
-              probed_at_unix_secs: [101, 111, 121],
-              attempted: [true, true, false],
-              latency_us: [12_300, null, null],
+              kind: 'icmp',
+              ipv4: {
+                address: 'icmp://example.test',
+                probed_at_unix_secs: [101, 111, 121],
+                attempted: [true, true, false],
+                latency_us: [12_300, null, null],
+                skip_reason: [null, null, 'unavailable'],
+              },
+              ipv6: {
+                address: 'icmp://example.test',
+                probed_at_unix_secs: [101],
+                attempted: [false],
+                latency_us: [null],
+                skip_reason: ['no_route'],
+              },
             },
+            { name: '只有 IPv4', kind: 'tcp', ipv4: null, ipv6: null },
           ],
         }),
       ),
@@ -189,11 +204,43 @@ describe('machine telemetry range', () => {
 
     const view = await fetchNodePingProbeRange('n1', 100, 130);
 
-    expect(view.targets[0].samples).toEqual([
+    expect(view.targets[0].ipv4?.samples).toEqual([
       { probed_at_unix_secs: 101, attempted: true, latency_us: 12_300 },
       { probed_at_unix_secs: 111, attempted: true, latency_us: null },
-      { probed_at_unix_secs: 121, attempted: false, latency_us: null },
+      { probed_at_unix_secs: 121, attempted: false, latency_us: null, skip_reason: 'unavailable' },
     ]);
+    expect(view.targets[0].ipv6?.samples).toEqual([
+      { probed_at_unix_secs: 101, attempted: false, latency_us: null, skip_reason: 'no_route' },
+    ]);
+    // An unconfigured family stays absent instead of becoming an empty series.
+    expect(view.targets[1]).toEqual({ name: '只有 IPv4', kind: 'tcp', ipv4: null, ipv6: null });
+  });
+
+  it('rejects PING columns of different lengths', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        Response.json({
+          node_id: 'n1',
+          targets: [
+            {
+              name: 'broken',
+              kind: 'icmp',
+              ipv4: {
+                address: 'icmp://192.0.2.1',
+                probed_at_unix_secs: [101, 111],
+                attempted: [true, true],
+                latency_us: [1_000, 2_000],
+                skip_reason: [null],
+              },
+              ipv6: null,
+            },
+          ],
+        }),
+      ),
+    );
+
+    await expect(fetchNodePingProbeRange('n1', 100, 130)).rejects.toThrow('PING 图表列长度不一致');
   });
 
   it('expands every overview point for ECharts without downsampling', async () => {
@@ -264,8 +311,12 @@ describe('machine telemetry range', () => {
           targets: [
             {
               name: 'TCP',
-              address: 'tcp://192.0.2.1:443',
-              latest: { probed_at_unix_secs: now, attempted: true, latency_us: 37_250 },
+              kind: 'tcp',
+              ipv4: {
+                address: 'tcp://192.0.2.1:443',
+                latest: { probed_at_unix_secs: now, attempted: true, latency_us: 37_250 },
+              },
+              ipv6: null,
             },
           ],
         }}
@@ -275,5 +326,58 @@ describe('machine telemetry range', () => {
     expect(view.container.textContent).toBe('37ms');
     expect(view.container.textContent).not.toContain('P95');
     expect(view.container.querySelector('.nc-tcp-latest')?.getAttribute('title')).toContain('最新样本');
+  });
+
+  it('reads IPv4 first, keeps IPv6 timeout detail in the title and does not render a badge', () => {
+    const now = Math.floor(Date.now() / 1000);
+    const point = (latency_us: number | null) => ({ probed_at_unix_secs: now, attempted: true, latency_us });
+    const view = render(
+      <TcpProbeLatest
+        intervalSecs={60}
+        view={{
+          node_id: 'n1',
+          targets: [
+            {
+              name: 'A',
+              kind: 'tcp',
+              ipv4: { address: 'tcp://192.0.2.1:443', latest: point(null) },
+              ipv6: { address: 'tcp://[2001:db8::1]:443', latest: point(20_000) },
+            },
+            {
+              name: 'B',
+              kind: 'tcp',
+              ipv4: { address: 'tcp://b.example:443', latest: point(30_000) },
+              ipv6: { address: 'tcp://b.example:443', latest: point(null) },
+            },
+            {
+              name: 'C',
+              kind: 'tcp',
+              ipv4: null,
+              ipv6: { address: 'tcp://[2001:db8::3]:443', latest: point(45_000) },
+            },
+            {
+              name: 'D',
+              kind: 'tcp',
+              ipv4: { address: 'tcp://d.example:443', latest: point(50_000) },
+              ipv6: {
+                address: 'tcp://d.example:443',
+                latest: { probed_at_unix_secs: now, attempted: false, latency_us: null, skip_reason: 'no_route' },
+              },
+            },
+          ],
+        }}
+      />,
+    );
+
+    const reading = view.container.querySelector('.nc-tcp-latest')!;
+    expect(reading.querySelector('.values')?.textContent).toBe('— / 30 / 45');
+    expect(reading.querySelectorAll('.values .lost')).toHaveLength(1);
+    expect(reading.querySelector('.v6')).toBeNull();
+    expect(reading.textContent).not.toContain('v6');
+    expect(reading.textContent).not.toContain('×');
+    const title = reading.getAttribute('title') ?? '';
+    expect(title).toContain('A：IPv4 无响应 · IPv6 20 ms');
+    expect(title).toContain('C：IPv6 45 ms');
+    expect(title).toContain('D：IPv4 50 ms · IPv6 未探测（机器没有 IPv6 路由）');
   });
 });

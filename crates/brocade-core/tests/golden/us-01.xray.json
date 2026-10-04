@@ -8,6 +8,8 @@
     "tag": "api"
   },
   "dns": {
+    "serveExpiredTTL": 129600,
+    "serveStale": true,
     "servers": [
       "1.1.1.1"
     ],

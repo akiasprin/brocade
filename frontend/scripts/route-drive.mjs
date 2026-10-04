@@ -99,7 +99,11 @@ class FakePopStateEvent {
 globalThis.HTMLElement = FakeHTMLElement;
 globalThis.PopStateEvent = FakePopStateEvent;
 
-const scroller = new FakeHTMLElement(['fg-desk']);
+const documentScroll = process.argv.includes('--document-scroll');
+const desk = new FakeHTMLElement(['fg-desk']);
+const rootScroller = new FakeHTMLElement();
+const scroller = documentScroll ? rootScroller : desk;
+globalThis.getComputedStyle = element => ({ overflowY: element === desk && documentScroll ? 'visible' : 'auto' });
 const surface = new FakeHTMLElement(['fg-view']);
 const card = new FakeHTMLElement();
 let surfaceMounted = true;
@@ -116,11 +120,13 @@ globalThis.MutationObserver = class {
   }
 };
 const rootStyle = { removeProperty() {}, setProperty() {} };
+rootScroller.style = rootStyle;
 globalThis.document = {
   activeElement: surface,
-  documentElement: { dataset: {}, style: rootStyle },
+  documentElement: rootScroller,
+  scrollingElement: rootScroller,
   querySelector: selector =>
-    selector === '.fg-desk' ? scroller : selector === '.fg-view, .fg-topo' && surfaceMounted ? surface : null,
+    selector === '.fg-desk' ? desk : selector === '.fg-view, .fg-topo' && surfaceMounted ? surface : null,
   addEventListener: (type, fn) => documentListeners[type]?.push(fn),
   removeEventListener: (type, fn) => {
     const list = documentListeners[type];
@@ -233,7 +239,7 @@ const forward = () => {
 };
 const rememberScroll = value => {
   scroller.scrollTop = value;
-  documentListeners.scroll.forEach(fn => fn({ target: scroller }));
+  documentListeners.scroll.forEach(fn => fn({ target: documentScroll ? document : scroller }));
   flushFrames();
 };
 
@@ -284,12 +290,19 @@ const goDrill = (nav, drill) => {
 };
 
 wm.init('op-1');
+setLocation('#/links');
 startRouting(nav => LABEL[nav] ?? nav);
 flushFrames();
 
-console.log('— 开局 —');
+console.log(`— ${documentScroll ? '触屏文档' : '桌面工作区'}滚动 · 开局 —`);
 check('地址被写上了', win.location.hash, '#/nodes');
 check('没白留一条历史', stack.length, 1);
+check('旧链路页面启动时回到机器列表', forge.snapshot().nav, 'nodes');
+check(
+  '不为旧链路页面创建窗口',
+  wm.snapshot().wins.some(win => win.key === 'tab:links'),
+  false,
+);
 
 console.log('\n— 状态动，地址跟着动 —');
 forge.setNav('chains');
@@ -427,11 +440,42 @@ returnTo('users');
 check('显式返回不新增历史', pushes - pushesBeforeReturn, 0);
 check('显式返回恢复用户页位置', scroller.scrollTop, 260);
 
-console.log('\n— 主从页原位切换 —');
-rememberScroll(318);
-navigateInPlace('users', { p: 'user', id: 'alice' });
+console.log('\n— 用户选择回到顶部，只有历史返回恢复原位置 —');
+navigate('users', { p: 'user', id: 'alice' });
 flushFrames();
-check('桌面切换用户不跳动名册', scroller.scrollTop, 318);
+rememberScroll(318);
+navigate('users', { p: 'user', id: 'bob' });
+scroller.scrollHeight = 620;
+const userSelectionPaints = [];
+flushFrames(() => userSelectionPaints.push(scroller.scrollTop));
+check('用户详情第一帧绘制前回到顶部', userSelectionPaints, [0]);
+check('新用户的历史位置为顶部', win.history.state.brocadeRoute.scrollTop, 0);
+scroller.scrollHeight = 4_000;
+[...mutations].forEach(callback => callback());
+advanceTime(4_000);
+check('详情随后变长不再恢复上一位用户的位置', scroller.scrollTop, 0);
+back();
+check('后退恢复原用户与滚动位置', [drillOf('users').id, scroller.scrollTop], ['alice', 318]);
+forward();
+check('前进到新用户仍停在顶部', [drillOf('users').id, scroller.scrollTop], ['bob', 0]);
+
+console.log('\n— VPN Gate 国家选择 —');
+navigate('tunnels', { p: 'vpngate' });
+flushFrames();
+rememberScroll(318);
+navigateInPlace('tunnels', { p: 'vpngate', country: 'JP' });
+flushFrames();
+check('VPN Gate 原位选择仍保留滚动位置', scroller.scrollTop, 318);
+check('国家进入地址', win.location.hash, '#/tunnels/vpngate?country=JP');
+navigateInPlace('tunnels', { p: 'vpngate', country: 'VN' });
+check('切换国家创建历史', win.location.hash, '#/tunnels/vpngate?country=VN');
+back();
+check('后退还原上一个国家', drillOf('tunnels'), { p: 'vpngate', country: 'JP' });
+forward();
+check('前进还原下一个国家', drillOf('tunnels'), { p: 'vpngate', country: 'VN' });
+setLocation('#/tunnels/vpngate?country=KR');
+fire('hashchange');
+check('刷新地址可恢复国家', drillOf('tunnels'), { p: 'vpngate', country: 'KR' });
 
 console.log('\n— 滚动不消耗浏览器导航配额 —');
 for (const engine of ['webkit', 'chromium']) {
@@ -595,6 +639,15 @@ document.activeElement = surface;
 startRouting(nav => LABEL[nav] ?? nav);
 flushFrames();
 check('重新启动从历史快照只恢复滚动', [scroller.scrollTop, document.activeElement === card], [517, false]);
+
+console.log('\n— 安全区弹性回弹与嵌套面板滚动 —');
+rememberScroll(-32);
+advanceTime(1_000);
+check('回弹不会保存负的历史位置', win.history.state.brocadeRoute.scrollTop, 0);
+rememberScroll(210);
+documentListeners.scroll.forEach(fn => fn({ target: card }));
+advanceTime(1_000);
+check('嵌套面板滚动不覆盖页面位置', win.history.state.brocadeRoute.scrollTop, 210);
 
 if (nativePerformanceNow) Object.defineProperty(performance, 'now', nativePerformanceNow);
 else delete performance.now;

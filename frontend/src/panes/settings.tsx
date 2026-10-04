@@ -56,6 +56,9 @@ import {
   type HopMux,
   type ModelSettings,
   type NodeAgentStateItem,
+  PING_PROBE_FAMILIES,
+  type PingProbeFamily,
+  type PingProbeKind,
   type PingProbeSettings,
   type VpngateAdmissionPolicy,
   type VpngateIntelligencePolicy,
@@ -69,6 +72,7 @@ import { BrandIcon } from '../ui/branding';
 import { PanelTitle, type IconName } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
 import { LOG_MAX_MIB, LOG_MIN_MIB, validLogMib } from '../ui/log-policy';
+import { PING_FAMILY_LABEL } from '../ui/ping-probe';
 import { SettingsParameterSummary } from '../ui/settings-parameter-summary';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import { REALITY_FINGERPRINT_OPTIONS } from '../reality';
@@ -110,6 +114,7 @@ type Form = {
   connDownlink: string;
   connBuffer: string;
   connHandshake: string;
+  statsOnline: string;
   muxConcurrency: string;
   muxPrewarmWorkers: string;
   muxReuseThreshold: string;
@@ -201,6 +206,7 @@ const EMPTY: Form = {
   connDownlink: '5',
   connBuffer: '',
   connHandshake: '60',
+  statsOnline: 'false',
   muxConcurrency: String(DEFAULT_HOP_MUX.concurrency),
   muxPrewarmWorkers: String(DEFAULT_HOP_MUX.prewarm_workers),
   muxReuseThreshold: String(DEFAULT_HOP_MUX.reuse_threshold),
@@ -246,6 +252,7 @@ function formOf(s: ModelSettings): Form {
     // null 需转换为空串而非 '0'：该字段的空值表示不写入该键，而 0 表示不缓冲。
     connBuffer: s.connection?.buffer_size_kb == null ? '' : String(s.connection.buffer_size_kb),
     connHandshake: String(s.connection?.handshake_secs ?? 60),
+    statsOnline: String(s.stats_user_online ?? false),
     muxConcurrency: String(s.relay_mux?.concurrency ?? 1),
     muxPrewarmWorkers: String(s.relay_mux?.prewarm_workers ?? 0),
     muxReuseThreshold: String(s.relay_mux?.reuse_threshold ?? 2),
@@ -272,6 +279,7 @@ const SECTION_FIELDS: Record<SectionKey, (keyof Form)[]> = {
     'connDownlink',
     'connBuffer',
     'connHandshake',
+    'statsOnline',
     'muxConcurrency',
     'muxPrewarmWorkers',
     'muxReuseThreshold',
@@ -1885,71 +1893,130 @@ function validIpv6Literal(host: string): boolean {
   }
 }
 
-export function pingProbeAddressError(address: string): string | null {
-  if (address.length > 512) return '探测地址不能超过 512 个字符';
-  const tcp = address.match(/^tcp:\/\/(.+)$/);
-  if (tcp) {
-    const authority = tcp[1];
-    if (/\s|[/?#]/.test(authority)) return 'TCP 地址格式应为 tcp://host:port';
-    const bracketedMatch = authority.match(/^\[([^\]]+)]:(\d+)$/);
-    const bracketed = bracketedMatch && validIpv6Literal(bracketedMatch[1]) ? bracketedMatch : null;
-    const plainMatch = authority.match(/^(.+):(\d+)$/);
-    const plain =
-      plainMatch && !plainMatch[1].includes(':') && !plainMatch[1].includes('[') && !plainMatch[1].includes(']')
-        ? plainMatch
-        : null;
-    const match = bracketed ?? plain;
-    if (!match) return 'TCP 地址格式应为 tcp://host:port；IPv6 地址需放在方括号内';
-    const port = Number(match[2]);
-    return Number.isInteger(port) && port >= 1 && port <= 65_535 ? null : 'TCP 端口必须为 1–65535';
-  }
-  const icmp = address.match(/^icmp:\/\/(.+)$/);
-  if (icmp) {
-    const authority = icmp[1];
-    if (/\s|[/?#]/.test(authority)) return 'ICMP 地址格式应为 icmp://host，不接受路径或端口';
-    const bracketed = authority.match(/^\[([^\]]+)]$/);
-    if (bracketed) return validIpv6Literal(bracketed[1]) ? null : 'ICMP 方括号内必须是 IPv6 地址';
-    if (!authority || authority.includes(':') || authority.includes('[') || authority.includes(']'))
-      return 'ICMP 不接受端口；IPv6 地址需放在方括号内';
-    return null;
-  }
-  return '探测地址必须使用 tcp://host:port 或 icmp://host';
+/** The family an IP literal fixes; null for a domain. Leading zeros make a domain, as on the server. */
+function literalFamily(host: string): PingProbeFamily | null {
+  const octets = host.split('.');
+  if (octets.length === 4 && octets.every(octet => /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255))
+    return 'ipv4';
+  if (host.includes(':') && validIpv6Literal(host)) return 'ipv6';
+  return null;
 }
 
-export function pingProbeFormError(form: PingProbeSettings): string | null {
-  if (!validPingProbeNumber(form.interval_secs, 5, 86_400)) return '探测间隔必须为 5–86400 秒的整数';
-  if (!validPingProbeNumber(form.timeout_ms, 1, 120_000)) return '探测超时必须为 1–120000 毫秒的整数';
-  if (form.targets.length > 32) return '最多配置 32 个目标';
-  const addresses = new Set<string>();
-  for (const target of form.targets) {
-    if (!target.name.trim()) return '每个目标都要填写名称';
-    if (Array.from(target.name.trim()).length > 64) return '目标名称不能超过 64 个字符';
-    const addressError = pingProbeAddressError(target.address.trim());
-    if (addressError) return addressError;
-    if (addresses.has(target.address.trim())) return `地址不能重复：${target.address.trim()}`;
-    addresses.add(target.address.trim());
+const PING_ENDPOINT_EXAMPLE: Record<PingProbeKind, Record<PingProbeFamily, string>> = {
+  icmp: { ipv4: '1.1.1.1', ipv6: '2606:4700:4700::1111' },
+  tcp: { ipv4: '1.1.1.1:443', ipv6: '[2606:4700:4700::1111]:443' },
+};
+
+/** Trimmed endpoint, or null when the field is empty. ICMP has no port, so an IPv6 address needs no
+ * brackets and is stored without them. */
+export function normalizePingEndpoint(kind: PingProbeKind, value: string | null): string | null {
+  const trimmed = (value ?? '').trim();
+  if (!trimmed) return null;
+  if (kind === 'icmp') {
+    const bracketed = trimmed.match(/^\[([^\]]+)]$/);
+    if (bracketed && validIpv6Literal(bracketed[1])) return bracketed[1];
+  }
+  return trimmed;
+}
+
+/** One address field: ICMP takes a host; TCP takes host:port, an IPv6 address in brackets. The host
+ * is an IP literal of the field's family or a domain. An empty field is valid. */
+export function pingProbeEndpointError(kind: PingProbeKind, family: PingProbeFamily, raw: string): string | null {
+  const label = PING_FAMILY_LABEL[family];
+  const value = raw.trim();
+  if (!value) return null;
+  if (Array.from(value).length > 512) return `${label} 地址不能超过 512 个字符`;
+  if (/[\s/?#@]/.test(value)) return `${label} 地址只写${kind === 'tcp' ? '主机和端口' : '主机'}，不带协议或路径`;
+  let host = value;
+  if (kind === 'tcp') {
+    const bracketed = value.match(/^\[([^\]]+)]:(\d+)$/);
+    const plain = value.match(/^([^:[\]]+):(\d+)$/);
+    const match = bracketed ?? plain;
+    if (!match)
+      return validIpv6Literal(value.replace(/^\[|]$/g, ''))
+        ? 'TCP 的 IPv6 地址写作 [地址]:端口'
+        : 'TCP 地址格式应为 主机:端口';
+    if (bracketed && !validIpv6Literal(bracketed[1])) return '方括号内必须是 IPv6 地址';
+    const port = Number(match[2]);
+    if (!Number.isInteger(port) || port < 1 || port > 65_535) return 'TCP 端口必须为 1–65535';
+    host = match[1];
+  } else {
+    const bracketed = value.match(/^\[([^\]]+)]$/);
+    if (bracketed) {
+      if (!validIpv6Literal(bracketed[1])) return '方括号内必须是 IPv6 地址';
+      host = bracketed[1];
+    } else if (/[[\]]/.test(value)) {
+      return '方括号内必须是 IPv6 地址';
+    } else if (value.includes(':') && !validIpv6Literal(value)) {
+      return 'ICMP 不接受端口';
+    }
+  }
+  const literal = literalFamily(host);
+  if (literal && literal !== family) return `${label} 栏不能填 ${PING_FAMILY_LABEL[literal]} 地址`;
+  return null;
+}
+
+export interface PingProbeFormError {
+  text: string;
+  /** The target row at fault; schedule and count errors have none. */
+  row?: number;
+  /** The address fields of that row to mark. */
+  families?: readonly PingProbeFamily[];
+}
+
+/** The first error of the form, in reading order. */
+export function pingProbeFormError(form: PingProbeSettings): PingProbeFormError | null {
+  if (!validPingProbeNumber(form.interval_secs, 5, 86_400)) return { text: '探测间隔必须为 5–86400 秒的整数' };
+  if (!validPingProbeNumber(form.timeout_ms, 1, 120_000)) return { text: '探测超时必须为 1–120000 毫秒的整数' };
+  if (form.targets.length > 32) return { text: '最多配置 32 个目标' };
+  const seen = new Set<string>();
+  for (const [row, target] of form.targets.entries()) {
+    const name = target.name.trim();
+    if (!name) return { text: '每个目标都要填写名称', row };
+    if (Array.from(name).length > 64) return { text: '目标名称不能超过 64 个字符', row };
+    const filled = PING_PROBE_FAMILIES.filter(family => normalizePingEndpoint(target.kind, target[family]) !== null);
+    if (filled.length === 0) return { text: `${name}：至少填写一个地址`, row, families: PING_PROBE_FAMILIES };
+    for (const family of filled) {
+      const error = pingProbeEndpointError(target.kind, family, target[family] ?? '');
+      if (error) return { text: `${name}：${error}`, row, families: [family] };
+    }
+    for (const family of filled) {
+      const value = normalizePingEndpoint(target.kind, target[family])!;
+      const key = `${target.kind}|${family}|${value.toLowerCase()}`;
+      if (seen.has(key))
+        return {
+          text: `${target.kind.toUpperCase()} 的 ${PING_FAMILY_LABEL[family]} 地址重复：${value}`,
+          row,
+          families: [family],
+        };
+      seen.add(key);
+    }
   }
   return null;
 }
+
+/** What the server stores: trimmed names, normalized endpoints, and null for an empty field. */
+const normalizePingProbeSettings = (settings: PingProbeSettings): PingProbeSettings => ({
+  ...settings,
+  targets: settings.targets.map(target => ({
+    name: target.name.trim(),
+    kind: target.kind,
+    ipv4: normalizePingEndpoint(target.kind, target.ipv4),
+    ipv6: normalizePingEndpoint(target.kind, target.ipv6),
+  })),
+});
 
 function PingProbeSettingsSection({ editable, data }: { editable: boolean; data: PingProbeSettings }) {
   const qc = useQueryClient();
   const { form, setForm, accept } = useServerForm(data);
   const [saved, setSaved] = useState(false);
-  const normalized = {
-    ...form,
-    targets: form.targets.map(target => ({ name: target.name.trim(), address: target.address.trim() })),
-  };
+  const normalized = normalizePingProbeSettings(form);
   const dirty = JSON.stringify(normalized) !== JSON.stringify(data);
   useUnsavedChanges(dirty, 'Ping 链路探测');
   const invalid = pingProbeFormError(normalized);
   const save = useMutation({
     onMutate: () => qc.cancelQueries({ queryKey: ['ping-probe-settings'] }),
-    mutationFn: (submitted: PingProbeSettings) =>
-      savePingProbeSettings({
-        ...submitted,
-        targets: submitted.targets.map(target => ({ name: target.name.trim(), address: target.address.trim() })),
-      }),
+    mutationFn: (submitted: PingProbeSettings) => savePingProbeSettings(normalizePingProbeSettings(submitted)),
     onSuccess: async (next, submitted) => {
       await qc.cancelQueries({ queryKey: ['ping-probe-settings'] });
       setSaved(true);
@@ -1959,7 +2026,7 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
     },
   });
 
-  const updateTarget = (index: number, field: 'name' | 'address', value: string) =>
+  const updateTarget = (index: number, field: 'name' | PingProbeFamily, value: string) =>
     setForm(current => ({
       ...current,
       targets: current.targets.map((target, targetIndex) =>
@@ -2016,20 +2083,20 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
               探测目标 <span>{form.targets.length}/32</span>
             </p>
             <div className="ping-probe-add">
-              {(['tcp', 'icmp'] as const).map(protocol => (
+              {(['tcp', 'icmp'] as const).map(kind => (
                 <button
                   className="btn sm"
                   type="button"
-                  key={protocol}
+                  key={kind}
                   disabled={!editable || form.targets.length >= 32}
                   onClick={() =>
                     setForm(current => ({
                       ...current,
-                      targets: [...current.targets, { name: '', address: `${protocol}://` }],
+                      targets: [...current.targets, { name: '', kind, ipv4: '', ipv6: '' }],
                     }))
                   }
                 >
-                  ＋ {protocol.toUpperCase()}
+                  ＋ {kind.toUpperCase()}
                 </button>
               ))}
             </div>
@@ -2038,16 +2105,15 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
             <div className="ping-probe-target-head" aria-hidden="true">
               <span>类型</span>
               <span>名称</span>
-              <span>地址</span>
+              <span>IPv4</span>
+              <span>IPv6</span>
               <span />
             </div>
           )}
           <div className="ping-probe-targets">
             {form.targets.map((target, index) => (
               <div className="ping-probe-target" key={index}>
-                <span className="ping-probe-kind">
-                  {target.address.startsWith('icmp://') ? 'ICMP' : target.address.startsWith('tcp://') ? 'TCP' : '—'}
-                </span>
+                <span className="ping-probe-kind">{target.kind.toUpperCase()}</span>
                 <input
                   className="f"
                   aria-label={`目标 ${index + 1} 名称`}
@@ -2055,13 +2121,38 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
                   value={target.name}
                   onChange={event => updateTarget(index, 'name', event.target.value)}
                 />
-                <input
-                  className="f mono"
-                  aria-label={`目标 ${index + 1} 地址`}
-                  placeholder="tcp://1.1.1.1:443 或 icmp://1.1.1.1"
-                  value={target.address}
-                  onChange={event => updateTarget(index, 'address', event.target.value)}
-                />
+                {PING_PROBE_FAMILIES.map(family => {
+                  const label = PING_FAMILY_LABEL[family];
+                  const other = family === 'ipv4' ? 'ipv6' : 'ipv4';
+                  const value = target[family] ?? '';
+                  const wrong =
+                    pingProbeEndpointError(target.kind, family, value) !== null ||
+                    (invalid?.row === index && invalid.families?.includes(family) === true);
+                  return (
+                    <label className="ping-probe-address" key={family}>
+                      {/* 宽屏由表头标明两列；窄屏表头隐藏，地址栏前显示地址族 */}
+                      <span className="ping-probe-family-tag" aria-hidden="true">
+                        {label}
+                      </span>
+                      <input
+                        className="f mono"
+                        aria-label={`目标 ${index + 1} ${label} 地址`}
+                        aria-invalid={wrong || undefined}
+                        placeholder={
+                          normalizePingEndpoint(target.kind, target[other]) !== null
+                            ? '不探测'
+                            : PING_ENDPOINT_EXAMPLE[target.kind][family]
+                        }
+                        value={value}
+                        onChange={event => updateTarget(index, family, event.target.value)}
+                        onBlur={event => {
+                          const next = normalizePingEndpoint(target.kind, event.target.value) ?? '';
+                          if (next !== event.target.value) updateTarget(index, family, next);
+                        }}
+                      />
+                    </label>
+                  );
+                })}
                 <button
                   className="btn sm ping-probe-remove"
                   type="button"
@@ -2084,7 +2175,7 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
               </div>
             )}
           </div>
-          {invalid && <span className="agent-log-invalid">{invalid}</span>}
+          {invalid && <span className="agent-log-invalid">{invalid.text}</span>}
         </section>
       </div>
       <SettingsSaveBar
@@ -2093,7 +2184,7 @@ function PingProbeSettingsSection({ editable, data }: { editable: boolean; data:
         savedText={saved ? '已保存，下一轮生效' : null}
         editable={editable}
         disabled={invalid !== null}
-        title={invalid ?? undefined}
+        title={invalid?.text}
         onSave={() => save.mutate(form)}
       />
     </section>
@@ -2711,9 +2802,7 @@ export function SettingsPane() {
           idle_ttl_ms: numOr(v('muxIdleTtl'), 24000),
           max_requests_per_worker: numOr(v('muxMaxRequests'), 128),
         },
-        // 该项没有对应的表单字段——统计得出的在线数尚无展示位置，提供一个无法看到效果的
-        // 开关不如不提供。此处原样传递，避免保存其他段时将其重置为 false。
-        stats_user_online: settings.data?.stats_user_online ?? false,
+        stats_user_online: v('statsOnline') === 'true',
       };
       const request: Promise<{ revision_id: number; settings?: ModelSettings }> =
         key === 'ports'
@@ -3010,6 +3099,21 @@ export function SettingsPane() {
                     <b>无明确理由不要修改</b>，也不支持按机器单独设置。60 是 XRAY 为对齐 nginx 的{' '}
                     <code>client_header_timeout</code> 选定的，目的是让这个值不暴露后端是什么。
                     改成其他值即产生一处可测量的差异；每台各设一个值，则形成一组可分别识别的机器
+                  </span>
+                </Fld>
+                <Fld label="在线来源">
+                  <SegmentedControl
+                    ariaLabel="在线来源统计"
+                    value={form.statsOnline}
+                    onChange={value => setForm({ ...form, statsOnline: value })}
+                    options={[
+                      { value: 'false', label: '关闭' },
+                      { value: 'true', label: '记录公网 IP' },
+                    ]}
+                  />
+                  <span className="hint">
+                    按用户统计当前连接的不同公网 IP；同一 IP 的多个连接只算一个。原始 IP
+                    保存在控制面，用于定位共享账号和连接问题。
                   </span>
                 </Fld>
                 <div className="guard">

@@ -193,6 +193,9 @@ const overview: VpngateOverview = {
   status: {
     enabled: true,
     interval_secs: 900,
+    probe_success_cooldown_secs: 1800,
+    probe_performance_cooldown_secs: 21600,
+    probe_shard_rotation_secs: 21600,
     source_url: 'https://www.vpngate.net/api/iphone/',
     next_sync_at_unix_secs: 1_800_000_000,
     syncing: false,
@@ -823,6 +826,66 @@ it('filters before pagination and follows the explicit backend candidate rank', 
   await waitFor(() => expect(visibleHostnames()).toEqual(['candidate-first', 'fast-second', 'failed-second']));
 });
 
+it('distinguishes priority review from suspended VPN Gate candidates', async () => {
+  const nowUnixSecs = Math.floor(Date.now() / 1000);
+  const reviewServers: VpngateServerView[] = [
+    {
+      ...servers[0],
+      id: 'reviewing-node',
+      hostname: 'reviewing-node',
+      active: true,
+      candidate_rank: 1,
+      consecutive_probe_failures: 2,
+      probe_eligible_until_unix_secs: nowUnixSecs + 1_200,
+      latest_probe_status: 'failed',
+      latest_error_code: 'catalogue-probe-failed',
+    },
+    {
+      ...servers[0],
+      id: 'expired-review-node',
+      hostname: 'expired-review-node',
+      active: false,
+      candidate_rank: null,
+      pareto_layer: null,
+      consecutive_probe_failures: 2,
+      probe_eligible_until_unix_secs: nowUnixSecs - 1,
+      latest_probe_status: 'failed',
+      latest_error_code: 'catalogue-probe-failed',
+    },
+    {
+      ...servers[0],
+      id: 'suspended-node',
+      hostname: 'suspended-node',
+      active: false,
+      candidate_rank: null,
+      pareto_layer: null,
+      consecutive_probe_failures: 3,
+      probe_eligible_until_unix_secs: nowUnixSecs + 1_200,
+      latest_probe_status: 'failed',
+      latest_error_code: 'catalogue-probe-failed',
+    },
+  ];
+  mockLegacyDirectory(reviewServers);
+  mount(overview, reviewServers);
+
+  expect(screen.getByText('候选 #1 · 复核')).toBeTruthy();
+  expect(screen.getByText('复核 2/3')).toBeTruthy();
+  expect(screen.getByText(/复核窗口至/)).toBeTruthy();
+  expect(screen.queryByText('暂停候选')).toBeNull();
+  expect(screen.getAllByText('已暂停')).toHaveLength(2);
+  expect(screen.getByText(/20 分钟复核窗口已结束/)).toBeTruthy();
+  expect(screen.getByText(/连续 3 次失败/)).toBeTruthy();
+
+  const visibleHostnames = () =>
+    Array.from(document.querySelectorAll('.vpngate-server-table tbody .vpngate-host > b')).map(
+      element => element.textContent,
+    );
+  fireEvent.change(screen.getByRole('combobox', { name: '目录节点筛选' }), { target: { value: 'reviewing' } });
+  await waitFor(() => expect(visibleHostnames()).toEqual(['reviewing-node']));
+  fireEvent.change(screen.getByRole('combobox', { name: '目录节点筛选' }), { target: { value: 'suspended' } });
+  await waitFor(() => expect(visibleHostnames()).toEqual(['expired-review-node', 'suspended-node']));
+});
+
 it('keeps the last successful exit intelligence visible after a newer dial failure', () => {
   const failedServer = {
     ...servers[0],
@@ -1023,6 +1086,57 @@ it('lets a system administrator change catalogue probe concurrency from the sele
   expect(screen.queryByText(/线程/)).toBeNull();
 });
 
+it('saves connectivity, performance, and shard schedules for the next batch', async () => {
+  const updatedStatus = {
+    ...overview.status,
+    probe_success_cooldown_secs: 3600,
+    probe_performance_cooldown_secs: 43200,
+    probe_shard_rotation_secs: 43200,
+  };
+  const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    const url = String(input);
+    if (url === '/vpngate/probe-settings') {
+      expect(init?.method).toBe('PUT');
+      expect(JSON.parse(String(init?.body))).toEqual({
+        success_cooldown_secs: 3600,
+        performance_cooldown_secs: 43200,
+        shard_rotation_secs: 43200,
+      });
+      return new Response(JSON.stringify(updatedStatus), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (url === '/vpngate') {
+      return new Response(JSON.stringify({ ...overview, status: updatedStatus }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    throw new Error(`unexpected request ${url}`);
+  });
+  mount();
+  fireEvent.click(screen.getByRole('tab', { name: '目录采集' }));
+
+  const connectivity = screen.getByRole('spinbutton', { name: '连通性复测间隔（分钟）' });
+  const performance = screen.getByRole('spinbutton', { name: '单流性能复测间隔（小时）' });
+  const rotation = screen.getByRole('spinbutton', { name: '拨测节点轮转周期（小时）' });
+  expect((connectivity as HTMLInputElement).value).toBe('30');
+  expect((performance as HTMLInputElement).value).toBe('6');
+  expect((rotation as HTMLInputElement).value).toBe('6');
+  expect(screen.getByText(/连通性与单流性能分开调度/)).toBeTruthy();
+
+  fireEvent.change(connectivity, { target: { value: '60' } });
+  fireEvent.change(performance, { target: { value: '12' } });
+  fireEvent.change(rotation, { target: { value: '12' } });
+  fireEvent.click(screen.getByRole('button', { name: '保存目录拨测设置' }));
+
+  await waitFor(() => expect(fetch).toHaveBeenCalledWith('/vpngate/probe-settings', expect.anything()));
+  await waitFor(() => expect((connectivity as HTMLInputElement).value).toBe('60'));
+  expect((performance as HTMLInputElement).value).toBe('12');
+  expect((rotation as HTMLInputElement).value).toBe('12');
+});
+
 it('lists selected catalogue probe machines first with a compact concurrency menu', () => {
   mount(overview, servers, runtimes, snapshot, [
     {
@@ -1161,10 +1275,18 @@ it('keeps the page mounted while a newly selected country loads its evidence', a
   vi.spyOn(globalThis, 'fetch').mockImplementation(() => new Promise<Response>(resolve => (finishRequest = resolve)));
   mount();
 
+  const page = document.querySelector('.vpngate-page');
+  const candidates = document.querySelector('.vpngate-candidates');
+  const table = document.querySelector('.vpngate-server-table');
   fireEvent.click(screen.getByRole('button', { name: /韩国，21 个目录节点/ }));
   expect(screen.getByRole('heading', { name: '韩国出口池' })).toBeTruthy();
-  expect(screen.getByRole('status', { name: '加载中…' })).toBeTruthy();
   expect(screen.getByRole('heading', { name: 'VPN Gate' })).toBeTruthy();
+  expect(document.querySelector('.vpngate-page')).toBe(page);
+  expect(document.querySelector('.vpngate-candidates')).toBe(candidates);
+  expect(document.querySelector('.vpngate-server-table')).toBe(table);
+  expect(screen.getByText('public-vpn-1')).toBeTruthy();
+  expect(candidates?.textContent).toContain('加载中…');
+  expect(candidates?.getAttribute('aria-busy')).toBe('true');
 
   finishRequest?.(new Response(JSON.stringify([]), { status: 200, headers: { 'content-type': 'application/json' } }));
   await waitFor(() => expect(screen.getByText('这个地区还没有目录节点')).toBeTruthy());

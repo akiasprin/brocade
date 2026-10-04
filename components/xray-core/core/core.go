@@ -29,6 +29,8 @@ var (
 	intro    = "A unified platform for anti-censorship."
 )
 
+const brocadeCapabilities = "secure-dokodemo-splice"
+
 func init() {
 	// Manually injected
 	if build != "Custom" {
@@ -73,5 +75,6 @@ func VersionStatement() []string {
 	return []string{
 		serial.Concat("Xray ", Version(), " (", codename, ") ", build, " (", runtime.Version(), " ", runtime.GOOS, "/", runtime.GOARCH, ")"),
 		intro,
+		"Brocade-Capabilities: " + brocadeCapabilities,
 	}
 }

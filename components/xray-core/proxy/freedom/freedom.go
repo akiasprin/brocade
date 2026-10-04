@@ -32,6 +32,25 @@ import (
 
 var useSplice bool
 
+func responseSpliceEnabled(inbound *session.Inbound) bool {
+	return responseSpliceAllowed(useSplice, inbound)
+}
+
+func responseSpliceAllowed(enabled bool, inbound *session.Inbound) bool {
+	if enabled {
+		return true
+	}
+	// Brocade's legacy Agent disabled Freedom splice process-wide to protect TLS/REALITY
+	// dokodemo fronts. A patched Xray can still honor that guard while allowing Vision,
+	// whose state changes from waiting to direct only after it has identified an inner encrypted
+	// stream that is safe to copy through the outer security layer.
+	if inbound == nil || inbound.Name != "vless" {
+		return false
+	}
+	state := inbound.CanSpliceCopy.Load()
+	return state == session.SpliceCopyDirect || state == session.SpliceCopyWaiting
+}
+
 var defaultPrivateBlockIP = []string{
 	"0.0.0.0/8",
 	"10.0.0.0/8",
@@ -145,7 +164,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return errors.New("target not specified.")
 	}
 	ob.Name = "freedom"
-	ob.CanSpliceCopy = 1
+	ob.CanSpliceCopy.Store(session.SpliceCopyDirect)
 	inbound := session.InboundFromContext(ctx)
 	blockedIPMatcher := h.getBlockedIPMatcher(ctx, inbound)
 
@@ -277,7 +296,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	responseDone := func() error {
 		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
-		if destination.Network == net.Network_TCP && useSplice && proxy.IsRAWTransportWithoutSecurity(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
+		if destination.Network != net.Network_TCP {
+			proxy.SetSpliceNotUsedReason(inbound, session.SpliceNotUsedUnsupportedCommand)
+		} else if !responseSpliceEnabled(inbound) {
+			proxy.SetSpliceNotUsedReason(inbound, session.SpliceNotUsedGloballyDisabled)
+		} else if !proxy.IsRAWTransportWithoutSecurity(conn) {
+			proxy.SetSpliceNotUsedReason(inbound, session.SpliceNotUsedOutboundNotRaw)
+		} else { // it would be tls conn in special use case of MITM, we need to let link handle traffic
 			var writeConn net.Conn
 			var inTimer *signal.ActivityTimer
 			if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {

@@ -1,51 +1,58 @@
 //! Active TCP-connect and ICMP-echo observation.
 //!
-//! One shared settings list may carry `tcp://` and `icmp://` targets at the same time. A round
-//! records only when it ran, which target it addressed, whether a wire measurement was possible,
-//! and an optional latency. DNS and local diagnostics never become historical metrics.
+//! One shared settings list may carry TCP and ICMP targets at the same time. Every target has an
+//! IPv4 and an IPv6 endpoint, either optional, and each configured endpoint is its own series. A
+//! round records only when it ran, which series it addressed, whether a wire measurement was
+//! possible, an optional latency, and a coarse reason when no measurement was possible. DNS and
+//! local diagnostics never become historical metrics.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use brocade_deployment::protocol::{
-    NodePingProbeLatestList, NodePingProbeLatestView, NodePingProbeList, NodePingProbeView,
-    PingProbePoint, PingProbeReportRequest, PingProbeReportResult, PingProbeSettings,
+    LegacyPingProbeTarget, NodePingProbeLatestList, NodePingProbeLatestView, NodePingProbeList,
+    NodePingProbeView, PingEndpointError, PingProbeEndpoint, PingProbeFamily,
+    PingProbeFamilyLatest, PingProbeFamilySeries, PingProbeKind, PingProbePoint,
+    PingProbeReportRequest, PingProbeReportResult, PingProbeSettings, PingProbeSkipReason,
     PingProbeTarget, PingProbeTargetLatest, PingProbeTargetSeries,
 };
 use sqlx::{PgPool, Row};
 
 use crate::{admin::tenant_filter, AdminContext, Result, StoreError};
 
-// The primary key is (node_id, target, probed_at). Ask for each requested pair explicitly so each
-// LATERAL arm is a bounded reverse index scan. DISTINCT ON would sort the entire retained table to
-// produce the same handful of rows.
-const LATEST_NODE_SAMPLES_SQL: &str = "SELECT requested_node.node_id, requested_target.target,
+// The primary key is (node_id, target, family, probed_at). Ask for each requested series
+// explicitly so each LATERAL arm is a bounded reverse index scan. DISTINCT ON would sort the
+// entire retained table to produce the same handful of rows.
+const LATEST_NODE_SAMPLES_SQL: &str =
+    "SELECT requested_node.node_id, requested.target, requested.family,
             extract(epoch FROM latest.probed_at)::bigint AS probed_at,
-            latest.attempted, latest.latency_us
+            latest.attempted, latest.latency_us, latest.skip_reason
        FROM unnest($1::text[]) AS requested_node(node_id)
-       CROSS JOIN unnest($2::text[]) AS requested_target(target)
+       CROSS JOIN unnest($2::text[], $3::text[]) AS requested(target, family)
        JOIN LATERAL (
-            SELECT sample.probed_at, sample.attempted, sample.latency_us
+            SELECT sample.probed_at, sample.attempted, sample.latency_us, sample.skip_reason
               FROM node_ping_probe_samples sample
              WHERE sample.node_id = requested_node.node_id
-               AND sample.target = requested_target.target
+               AND sample.target = requested.target
+               AND sample.family = requested.family
              ORDER BY sample.probed_at DESC
              LIMIT 1
        ) latest ON TRUE
-      ORDER BY requested_node.node_id, requested_target.target";
+      ORDER BY requested_node.node_id, requested.target, requested.family";
 
 const MAX_CLOCK_SKEW_SECS: i64 = 600;
 const MAX_TARGETS: usize = 32;
+/// One sample per configured family: at most two per target.
+const MAX_SAMPLES: usize = MAX_TARGETS * 2;
 const MIN_INTERVAL_SECS: u32 = 5;
 const MAX_INTERVAL_SECS: u32 = 86_400;
 const MIN_TIMEOUT_MS: u32 = 1;
 const MAX_TIMEOUT_MS: u32 = 120_000;
 const MAX_NAME_CHARS: usize = 64;
-const MAX_ADDRESS_CHARS: usize = 512;
 const MAX_READ_WINDOW_SECS: u32 = 7 * 86_400;
 
 /// The chart reads every retained PING point, but repeated object keys account for most of the
 /// row-oriented JSON. Parallel arrays preserve the exact samples while writing the target
-/// metadata and field names once.
+/// metadata and field names once per series.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct NodePingProbeColumnarView {
     pub node_id: String,
@@ -55,10 +62,35 @@ pub struct NodePingProbeColumnarView {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PingProbeTargetColumnarSeries {
     pub name: String,
+    pub kind: PingProbeKind,
+    pub ipv4: Option<PingProbeFamilyColumns>,
+    pub ipv6: Option<PingProbeFamilyColumns>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PingProbeFamilyColumns {
     pub address: String,
     pub probed_at_unix_secs: Vec<i64>,
     pub attempted: Vec<bool>,
     pub latency_us: Vec<Option<u32>>,
+    pub skip_reason: Vec<Option<PingProbeSkipReason>>,
+}
+
+fn family_columns(series: PingProbeFamilySeries) -> PingProbeFamilyColumns {
+    let mut columns = PingProbeFamilyColumns {
+        address: series.address,
+        probed_at_unix_secs: Vec::with_capacity(series.samples.len()),
+        attempted: Vec::with_capacity(series.samples.len()),
+        latency_us: Vec::with_capacity(series.samples.len()),
+        skip_reason: Vec::with_capacity(series.samples.len()),
+    };
+    for sample in series.samples {
+        columns.probed_at_unix_secs.push(sample.probed_at_unix_secs);
+        columns.attempted.push(sample.attempted);
+        columns.latency_us.push(sample.latency_us);
+        columns.skip_reason.push(sample.skip_reason);
+    }
+    columns
 }
 
 pub fn columnar_view(view: NodePingProbeView) -> NodePingProbeColumnarView {
@@ -67,22 +99,11 @@ pub fn columnar_view(view: NodePingProbeView) -> NodePingProbeColumnarView {
         targets: view
             .targets
             .into_iter()
-            .map(|target| {
-                let mut probed_at_unix_secs = Vec::with_capacity(target.samples.len());
-                let mut attempted = Vec::with_capacity(target.samples.len());
-                let mut latency_us = Vec::with_capacity(target.samples.len());
-                for sample in target.samples {
-                    probed_at_unix_secs.push(sample.probed_at_unix_secs);
-                    attempted.push(sample.attempted);
-                    latency_us.push(sample.latency_us);
-                }
-                PingProbeTargetColumnarSeries {
-                    name: target.name,
-                    address: target.address,
-                    probed_at_unix_secs,
-                    attempted,
-                    latency_us,
-                }
+            .map(|target| PingProbeTargetColumnarSeries {
+                name: target.name,
+                kind: target.kind,
+                ipv4: target.ipv4.map(family_columns),
+                ipv6: target.ipv6.map(family_columns),
             })
             .collect(),
     }
@@ -97,7 +118,7 @@ pub async fn load_settings(pool: &PgPool) -> Result<PingProbeSettings> {
     .await?;
     let targets: serde_json::Value = row.try_get("ping_probe_targets")?;
     let settings = PingProbeSettings {
-        targets: serde_json::from_value(targets)?,
+        targets: stored_targets(targets)?,
         interval_secs: u32::try_from(row.try_get::<i32, _>("ping_probe_interval_secs")?).map_err(
             |_| StoreError::InvalidData("negative PING probe interval in database".into()),
         )?,
@@ -107,6 +128,43 @@ pub async fn load_settings(pool: &PgPool) -> Result<PingProbeSettings> {
     };
     validate_settings(&settings)?;
     Ok(settings)
+}
+
+/// Read the stored target list. Lists saved before dual-stack probing hold one URI per target;
+/// they are converted on read (`PingProbeTarget::from_legacy`) and rewritten in the current shape
+/// on the next save. A domain URI becomes a target with both families. Should two legacy URIs
+/// canonicalize to the same series, the later copy of that family is dropped so the list stays
+/// valid; a target left with no family is dropped with it.
+fn stored_targets(value: serde_json::Value) -> Result<Vec<PingProbeTarget>> {
+    if let Ok(targets) = serde_json::from_value::<Vec<PingProbeTarget>>(value.clone()) {
+        return Ok(targets);
+    }
+    let legacy: Vec<LegacyPingProbeTarget> = serde_json::from_value(value)?;
+    let mut seen = BTreeSet::new();
+    let mut targets = Vec::with_capacity(legacy.len());
+    for entry in &legacy {
+        let mut target = PingProbeTarget::from_legacy(entry).ok_or_else(|| {
+            StoreError::InvalidData(format!(
+                "stored PING probe target is not a tcp:// or icmp:// address: {}",
+                entry.address
+            ))
+        })?;
+        for family in PingProbeFamily::ALL {
+            let Some(address) = target.series_address(family) else {
+                continue;
+            };
+            if !seen.insert((address, family)) {
+                match family {
+                    PingProbeFamily::Ipv4 => target.ipv4 = None,
+                    PingProbeFamily::Ipv6 => target.ipv6 = None,
+                }
+            }
+        }
+        if target.ipv4.is_some() || target.ipv6.is_some() {
+            targets.push(target);
+        }
+    }
+    Ok(targets)
 }
 
 pub async fn update_settings(
@@ -136,6 +194,19 @@ pub async fn update_settings(
     Ok(settings)
 }
 
+/// Every configured series of the current settings, keyed by (series address, family).
+fn configured_series(settings: &PingProbeSettings) -> BTreeSet<(String, PingProbeFamily)> {
+    settings
+        .targets
+        .iter()
+        .flat_map(|target| {
+            PingProbeFamily::ALL
+                .into_iter()
+                .filter_map(|family| Some((target.series_address(family)?, family)))
+        })
+        .collect()
+}
+
 pub async fn record_report(
     pool: &PgPool,
     node_id: &str,
@@ -146,9 +217,9 @@ pub async fn record_report(
             "PING probe timestamp must be positive unix seconds".to_owned(),
         ));
     }
-    if request.samples.len() > MAX_TARGETS {
+    if request.samples.len() > MAX_SAMPLES {
         return Err(StoreError::InvalidData(format!(
-            "PING probe carries {} targets, over the {MAX_TARGETS} limit",
+            "PING probe carries {} samples, over the {MAX_SAMPLES} limit",
             request.samples.len()
         )));
     }
@@ -165,11 +236,7 @@ pub async fn record_report(
     }
 
     let settings = load_settings(pool).await?;
-    let known = settings
-        .targets
-        .iter()
-        .map(|target| target.address.as_str())
-        .collect::<BTreeSet<_>>();
+    let known = configured_series(&settings);
     let mut seen = BTreeSet::new();
     let mut accepted_samples = 0;
     let mut skipped_samples = 0;
@@ -177,18 +244,33 @@ pub async fn record_report(
     let mut tx = pool.begin().await?;
 
     for sample in request.samples {
-        if !known.contains(sample.target.as_str()) {
+        // Agents older than the dual-stack protocol send no family. Their sample is attributable
+        // only when the address is an IP literal; a domain may have resolved to either family.
+        let Some(family) = sample
+            .family
+            .or_else(|| PingProbeFamily::of_series_address(&sample.target))
+        else {
+            unknown_targets += 1;
+            continue;
+        };
+        let series = (sample.target, family);
+        if !known.contains(&series) {
             unknown_targets += 1;
             continue;
         }
-        if !seen.insert(sample.target.clone()) {
+        if !seen.insert(series.clone()) {
             skipped_samples += 1;
             continue;
         }
+        let (target, family) = series;
         if !sample.attempted && sample.latency_us.is_some() {
             return Err(StoreError::InvalidData(format!(
-                "未执行的 PING 探测不能携带延迟：{}",
-                sample.target
+                "未执行的 PING 探测不能携带延迟：{target}"
+            )));
+        }
+        if sample.attempted && sample.skip_reason.is_some() {
+            return Err(StoreError::InvalidData(format!(
+                "已执行的 PING 探测不能携带未探测原因：{target}"
             )));
         }
         let attempted = sample.attempted;
@@ -201,15 +283,17 @@ pub async fn record_report(
             .transpose()?;
         let result = sqlx::query(
             "INSERT INTO node_ping_probe_samples
-                 (node_id, target, probed_at, attempted, latency_us)
-             VALUES ($1, $2, to_timestamp($3), $4, $5)
-             ON CONFLICT (node_id, target, probed_at) DO NOTHING",
+                 (node_id, target, family, probed_at, attempted, latency_us, skip_reason)
+             VALUES ($1, $2, $3, to_timestamp($4), $5, $6, $7)
+             ON CONFLICT (node_id, target, family, probed_at) DO NOTHING",
         )
         .bind(node_id)
-        .bind(&sample.target)
+        .bind(&target)
+        .bind(family.as_str())
         .bind(request.probed_at_unix_secs)
         .bind(attempted)
         .bind(latency_us)
+        .bind(sample.skip_reason.map(PingProbeSkipReason::as_str))
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 1 {
@@ -254,7 +338,11 @@ pub async fn node_view(
 ) -> Result<NodePingProbeView> {
     let settings = load_settings(pool).await?;
     if !node_in_scope(pool, actor, node_id).await? {
-        return Ok(empty_view(node_id, &settings.targets));
+        return Ok(series_view(
+            node_id,
+            &settings.targets,
+            &mut BTreeMap::new(),
+        ));
     }
     read_node(
         pool,
@@ -284,7 +372,11 @@ pub async fn node_view_range(
     }
     let settings = load_settings(pool).await?;
     if !node_in_scope(pool, actor, node_id).await? {
-        return Ok(empty_view(node_id, &settings.targets));
+        return Ok(series_view(
+            node_id,
+            &settings.targets,
+            &mut BTreeMap::new(),
+        ));
     }
     read_node(
         pool,
@@ -297,6 +389,39 @@ pub async fn node_view_range(
     .await
 }
 
+type SeriesPoints = BTreeMap<(String, PingProbeFamily), Vec<PingProbePoint>>;
+
+/// Lay the configured targets over the points that were read. A configured family always gets a
+/// series, empty when it has no retained points; an unconfigured family is `None`.
+fn series_view(
+    node_id: &str,
+    targets: &[PingProbeTarget],
+    points: &mut SeriesPoints,
+) -> NodePingProbeView {
+    let mut family_series = |target: &PingProbeTarget, family| {
+        target
+            .series_address(family)
+            .map(|address| PingProbeFamilySeries {
+                samples: points
+                    .remove(&(address.clone(), family))
+                    .unwrap_or_default(),
+                address,
+            })
+    };
+    NodePingProbeView {
+        node_id: node_id.to_owned(),
+        targets: targets
+            .iter()
+            .map(|target| PingProbeTargetSeries {
+                name: target.name.clone(),
+                kind: target.kind,
+                ipv4: family_series(target, PingProbeFamily::Ipv4),
+                ipv6: family_series(target, PingProbeFamily::Ipv6),
+            })
+            .collect(),
+    }
+}
+
 pub async fn list_nodes(
     pool: &PgPool,
     actor: &AdminContext,
@@ -304,16 +429,16 @@ pub async fn list_nodes(
 ) -> Result<NodePingProbeList> {
     let settings = load_settings(pool).await?;
     let ids = scoped_live_node_ids(pool, actor).await?;
-    let mut points = BTreeMap::<(String, String), Vec<PingProbePoint>>::new();
+    let mut points = BTreeMap::<String, SeriesPoints>::new();
     if !ids.is_empty() {
         let rows = sqlx::query(
-            "SELECT node_id, target,
+            "SELECT node_id, target, family,
                     extract(epoch FROM probed_at)::bigint AS probed_at,
-                    attempted, latency_us
+                    attempted, latency_us, skip_reason
                FROM node_ping_probe_samples
               WHERE node_id = ANY($1::text[])
                 AND probed_at >= now() - make_interval(secs => $2::double precision)
-              ORDER BY node_id, target, probed_at ASC",
+              ORDER BY node_id, target, family, probed_at ASC",
         )
         .bind(&ids)
         .bind(i32::try_from(bounded_window(window_secs)).expect("bounded window fits i32"))
@@ -321,77 +446,78 @@ pub async fn list_nodes(
         .await?;
         for row in rows {
             let node_id: String = row.try_get("node_id")?;
-            let target: String = row.try_get("target")?;
+            let series = series_key(&row)?;
             points
-                .entry((node_id, target))
+                .entry(node_id)
+                .or_default()
+                .entry(series)
                 .or_default()
                 .push(point_from_row(&row, settings.timeout_ms)?);
         }
     }
     let nodes = ids
         .into_iter()
-        .map(|node_id| NodePingProbeView {
-            targets: settings
-                .targets
-                .iter()
-                .map(|target| PingProbeTargetSeries {
-                    name: target.name.clone(),
-                    address: target.address.clone(),
-                    samples: points
-                        .remove(&(node_id.clone(), target.address.clone()))
-                        .unwrap_or_default(),
-                })
-                .collect(),
-            node_id,
+        .map(|node_id| {
+            let mut node_points = points.remove(&node_id).unwrap_or_default();
+            series_view(&node_id, &settings.targets, &mut node_points)
         })
         .collect();
     Ok(NodePingProbeList { nodes })
 }
 
-/// The machine list needs only the newest observation for each configured target. Fetching a
+/// The machine list needs only the newest observation for each configured series. Fetching a
 /// history window here used to perform one query per machine and ship every point to the browser,
-/// where the whole window was reduced to one card statistic. Keep the history
-/// endpoint for a machine detail chart; this path has a fixed query count and bounded response.
+/// where the whole window was reduced to one card statistic. Keep the history endpoint for a
+/// machine detail chart; this path has a fixed query count and bounded response.
 pub async fn list_latest_nodes(
     pool: &PgPool,
     actor: &AdminContext,
 ) -> Result<NodePingProbeLatestList> {
     let settings = load_settings(pool).await?;
     let ids = scoped_live_node_ids(pool, actor).await?;
-    let addresses = settings
-        .targets
-        .iter()
-        .map(|target| target.address.clone())
-        .collect::<Vec<_>>();
-    let mut latest = BTreeMap::<(String, String), PingProbePoint>::new();
+    let (addresses, families): (Vec<String>, Vec<&str>) = configured_series(&settings)
+        .into_iter()
+        .map(|(address, family)| (address, family.as_str()))
+        .unzip();
+    let mut latest = BTreeMap::<(String, String, PingProbeFamily), PingProbePoint>::new();
     if !ids.is_empty() && !addresses.is_empty() {
         let rows = sqlx::query(LATEST_NODE_SAMPLES_SQL)
             .bind(&ids)
             .bind(&addresses)
+            .bind(&families)
             .fetch_all(pool)
             .await?;
         for row in rows {
             let node_id: String = row.try_get("node_id")?;
-            let target: String = row.try_get("target")?;
+            let (target, family) = series_key(&row)?;
             latest.insert(
-                (node_id, target),
+                (node_id, target, family),
                 point_from_row(&row, settings.timeout_ms)?,
             );
         }
     }
     let nodes = ids
         .into_iter()
-        .map(|node_id| NodePingProbeLatestView {
-            targets: settings
+        .map(|node_id| {
+            let mut family_latest = |target: &PingProbeTarget, family| {
+                target
+                    .series_address(family)
+                    .map(|address| PingProbeFamilyLatest {
+                        latest: latest.remove(&(node_id.clone(), address.clone(), family)),
+                        address,
+                    })
+            };
+            let targets = settings
                 .targets
                 .iter()
                 .map(|target| PingProbeTargetLatest {
                     name: target.name.clone(),
-                    address: target.address.clone(),
-                    latest: latest.remove(&(node_id.clone(), target.address.clone())),
+                    kind: target.kind,
+                    ipv4: family_latest(target, PingProbeFamily::Ipv4),
+                    ipv6: family_latest(target, PingProbeFamily::Ipv6),
                 })
-                .collect(),
-            node_id,
+                .collect();
+            NodePingProbeLatestView { node_id, targets }
         })
         .collect();
     Ok(NodePingProbeLatestList {
@@ -409,7 +535,8 @@ async fn read_node(
     absolute: Option<(i64, i64)>,
 ) -> Result<NodePingProbeView> {
     let rows = sqlx::query(
-        "SELECT target, extract(epoch FROM probed_at)::bigint AS probed_at, attempted, latency_us
+        "SELECT target, family, extract(epoch FROM probed_at)::bigint AS probed_at,
+                attempted, latency_us, skip_reason
            FROM node_ping_probe_samples
           WHERE node_id = $1
             AND (
@@ -428,27 +555,25 @@ async fn read_node(
     .bind(absolute.map(|range| range.1))
     .fetch_all(pool)
     .await?;
-    let mut points = BTreeMap::<String, Vec<PingProbePoint>>::new();
+    let mut points = SeriesPoints::new();
     for row in rows {
-        let target: String = row.try_get("target")?;
         // Apply the current policy to historical rows too. Lowering the timeout must not leave
         // old, now-invalid latency points visible until retention expires.
         points
-            .entry(target)
+            .entry(series_key(&row)?)
             .or_default()
             .push(point_from_row(&row, timeout_ms)?);
     }
-    Ok(NodePingProbeView {
-        node_id: node_id.to_owned(),
-        targets: targets
-            .iter()
-            .map(|target| PingProbeTargetSeries {
-                name: target.name.clone(),
-                address: target.address.clone(),
-                samples: points.remove(&target.address).unwrap_or_default(),
-            })
-            .collect(),
-    })
+    Ok(series_view(node_id, targets, &mut points))
+}
+
+fn series_key(row: &sqlx::postgres::PgRow) -> Result<(String, PingProbeFamily)> {
+    let target: String = row.try_get("target")?;
+    let family: String = row.try_get("family")?;
+    let family = PingProbeFamily::parse(&family).ok_or_else(|| {
+        StoreError::InvalidData(format!("unknown PING family in database: {family}"))
+    })?;
+    Ok((target, family))
 }
 
 fn point_from_row(row: &sqlx::postgres::PgRow, timeout_ms: u32) -> Result<PingProbePoint> {
@@ -464,10 +589,19 @@ fn point_from_row(row: &sqlx::postgres::PgRow, timeout_ms: u32) -> Result<PingPr
         attempted,
         timeout_ms,
     );
+    let skip_reason = row
+        .try_get::<Option<String>, _>("skip_reason")?
+        .map(|reason| {
+            PingProbeSkipReason::parse(&reason).ok_or_else(|| {
+                StoreError::InvalidData(format!("unknown PING skip reason in database: {reason}"))
+            })
+        })
+        .transpose()?;
     Ok(PingProbePoint {
         probed_at_unix_secs: row.try_get("probed_at")?,
         attempted,
         latency_us,
+        skip_reason,
     })
 }
 
@@ -484,20 +618,6 @@ async fn scoped_live_node_ids(pool: &PgPool, actor: &AdminContext) -> Result<Vec
     .bind(pattern)
     .fetch_all(pool)
     .await?)
-}
-
-fn empty_view(node_id: &str, targets: &[PingProbeTarget]) -> NodePingProbeView {
-    NodePingProbeView {
-        node_id: node_id.to_owned(),
-        targets: targets
-            .iter()
-            .map(|target| PingProbeTargetSeries {
-                name: target.name.clone(),
-                address: target.address.clone(),
-                samples: Vec::new(),
-            })
-            .collect(),
-    }
 }
 
 async fn node_in_scope(pool: &PgPool, actor: &AdminContext, node_id: &str) -> Result<bool> {
@@ -535,18 +655,56 @@ fn successful_latency_us(latency_us: Option<u32>, attempted: bool, timeout_ms: u
         .filter(|value| *value <= timeout_us)
 }
 
+/// Trim names and endpoints, store an empty endpoint as an unconfigured family, and rewrite
+/// parseable endpoints in canonical form so equal endpoints share one series identity.
 fn normalize_settings(settings: PingProbeSettings) -> PingProbeSettings {
+    let endpoint = |kind: PingProbeKind, text: Option<String>| {
+        let text = text?.trim().to_owned();
+        if text.is_empty() {
+            return None;
+        }
+        Some(
+            PingProbeEndpoint::parse(kind, &text)
+                .map(|endpoint| endpoint.text())
+                .unwrap_or(text),
+        )
+    };
     PingProbeSettings {
         targets: settings
             .targets
             .into_iter()
             .map(|target| PingProbeTarget {
                 name: target.name.trim().to_owned(),
-                address: target.address.trim().to_owned(),
+                ipv4: endpoint(target.kind, target.ipv4),
+                ipv6: endpoint(target.kind, target.ipv6),
+                kind: target.kind,
             })
             .collect(),
         interval_secs: settings.interval_secs,
         timeout_ms: settings.timeout_ms,
+    }
+}
+
+fn family_label(family: PingProbeFamily) -> &'static str {
+    match family {
+        PingProbeFamily::Ipv4 => "IPv4",
+        PingProbeFamily::Ipv6 => "IPv6",
+    }
+}
+
+fn endpoint_error_text(kind: PingProbeKind, error: PingEndpointError) -> &'static str {
+    match (error, kind) {
+        (PingEndpointError::Empty, _) => "不能为空",
+        (PingEndpointError::TooLong, _) => "过长",
+        (PingEndpointError::Malformed, PingProbeKind::Tcp) => {
+            "只写主机和端口，不带协议、路径或空格"
+        }
+        (PingEndpointError::Malformed, PingProbeKind::Icmp) => "只写主机，不带协议、路径或空格",
+        (PingEndpointError::MissingPort, _) => "缺少端口，TCP 地址写作 主机:端口",
+        (PingEndpointError::InvalidPort, _) => "的端口必须为 1–65535",
+        (PingEndpointError::PortNotAllowed, _) => "不接受端口",
+        (PingEndpointError::BracketsNotIpv6, _) => "的方括号内必须是 IPv6 地址",
+        (PingEndpointError::Ipv6NeedsBrackets, _) => "的 IPv6 地址需写作 [地址]:端口",
     }
 }
 
@@ -566,7 +724,7 @@ fn validate_settings(settings: &PingProbeSettings) -> Result<()> {
             "PING 探测目标不能超过 {MAX_TARGETS} 个"
         )));
     }
-    let mut addresses = BTreeSet::new();
+    let mut series = BTreeSet::new();
     for target in &settings.targets {
         let name_len = target.name.chars().count();
         if name_len == 0 || name_len > MAX_NAME_CHARS || target.name.chars().any(char::is_control) {
@@ -574,98 +732,41 @@ fn validate_settings(settings: &PingProbeSettings) -> Result<()> {
                 "PING 探测目标名称必须为 1–{MAX_NAME_CHARS} 个可见字符"
             )));
         }
-        validate_probe_address(&target.address)?;
-        if !addresses.insert(target.address.as_str()) {
+        if target.ipv4.is_none() && target.ipv6.is_none() {
             return Err(StoreError::InvalidData(format!(
-                "PING 探测地址不能重复：{}",
-                target.address
+                "PING 探测目标「{}」至少要填写一个地址",
+                target.name
             )));
         }
-    }
-    Ok(())
-}
-
-fn validate_probe_address(address: &str) -> Result<()> {
-    if address.len() > MAX_ADDRESS_CHARS {
-        return Err(StoreError::InvalidData("PING 探测地址过长".to_owned()));
-    }
-    if let Some(authority) = address.strip_prefix("tcp://") {
-        return validate_tcp_authority(address, authority);
-    }
-    if let Some(authority) = address.strip_prefix("icmp://") {
-        return validate_icmp_authority(address, authority);
-    }
-    Err(StoreError::InvalidData(
-        "PING 探测地址必须使用 tcp://host:port 或 icmp://host".to_owned(),
-    ))
-}
-
-fn invalid_authority(authority: &str) -> bool {
-    authority.is_empty()
-        || authority.chars().any(char::is_whitespace)
-        || authority.contains('/')
-        || authority.contains('?')
-        || authority.contains('#')
-}
-
-fn validate_tcp_authority(address: &str, authority: &str) -> Result<()> {
-    if invalid_authority(authority) {
-        return Err(StoreError::InvalidData(format!(
-            "无效的 TCP 探测地址：{address}"
-        )));
-    };
-    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
-        let Some((host, port)) = bracketed.split_once("]:") else {
-            return Err(StoreError::InvalidData(format!(
-                "无效的 TCP 探测地址：{address}"
-            )));
-        };
-        if host.parse::<std::net::Ipv6Addr>().is_err() {
-            return Err(StoreError::InvalidData(format!(
-                "方括号内必须是 IPv6 地址：{address}"
-            )));
+        for family in PingProbeFamily::ALL {
+            let Some(text) = target.endpoint_text(family) else {
+                continue;
+            };
+            let label = family_label(family);
+            let endpoint = PingProbeEndpoint::parse(target.kind, text).map_err(|error| {
+                StoreError::InvalidData(format!(
+                    "PING 探测目标「{}」的 {label} 地址{}：{text}",
+                    target.name,
+                    endpoint_error_text(target.kind, error)
+                ))
+            })?;
+            if let Some(literal) = endpoint
+                .literal_family()
+                .filter(|literal| *literal != family)
+            {
+                return Err(StoreError::InvalidData(format!(
+                    "PING 探测目标「{}」的 {label} 地址填的是 {} 地址：{text}",
+                    target.name,
+                    family_label(literal)
+                )));
+            }
+            let address = endpoint.series_address(target.kind);
+            if !series.insert((address.clone(), family)) {
+                return Err(StoreError::InvalidData(format!(
+                    "PING 探测地址不能重复：{label} {address}"
+                )));
+            }
         }
-        (host, port)
-    } else {
-        let pair = authority
-            .rsplit_once(':')
-            .ok_or_else(|| StoreError::InvalidData(format!("TCP 探测地址缺少端口：{address}")))?;
-        if pair.0.chars().any(|ch| matches!(ch, ':' | '[' | ']')) {
-            return Err(StoreError::InvalidData(format!(
-                "IPv6 地址必须放在方括号内：{address}"
-            )));
-        }
-        pair
-    };
-    if host.is_empty() || port.parse::<u16>().ok().filter(|port| *port > 0).is_none() {
-        return Err(StoreError::InvalidData(format!(
-            "无效的 TCP 探测地址：{address}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_icmp_authority(address: &str, authority: &str) -> Result<()> {
-    if invalid_authority(authority) {
-        return Err(StoreError::InvalidData(format!(
-            "无效的 ICMP 探测地址：{address}"
-        )));
-    }
-    if let Some(host) = authority
-        .strip_prefix('[')
-        .and_then(|bracketed| bracketed.strip_suffix(']'))
-    {
-        if host.parse::<std::net::Ipv6Addr>().is_err() {
-            return Err(StoreError::InvalidData(format!(
-                "方括号内必须是 IPv6 地址：{address}"
-            )));
-        }
-        return Ok(());
-    }
-    if authority.chars().any(|ch| matches!(ch, ':' | '[' | ']')) {
-        return Err(StoreError::InvalidData(format!(
-            "ICMP 不接受端口，IPv6 地址必须放在方括号内：{address}"
-        )));
     }
     Ok(())
 }
@@ -674,17 +775,138 @@ fn validate_icmp_authority(address: &str, authority: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn target(kind: PingProbeKind, ipv4: Option<&str>, ipv6: Option<&str>) -> PingProbeTarget {
+        PingProbeTarget {
+            name: "target".to_owned(),
+            kind,
+            ipv4: ipv4.map(str::to_owned),
+            ipv6: ipv6.map(str::to_owned),
+        }
+    }
+
+    fn settings(targets: Vec<PingProbeTarget>) -> PingProbeSettings {
+        PingProbeSettings {
+            targets,
+            interval_secs: 60,
+            timeout_ms: 420,
+        }
+    }
+
     #[test]
-    fn accepts_tcp_and_icmp_targets_together() {
-        assert!(validate_probe_address("tcp://example.com:443").is_ok());
-        assert!(validate_probe_address("tcp://[2001:db8::1]:443").is_ok());
-        assert!(validate_probe_address("icmp://1.1.1.1").is_ok());
-        assert!(validate_probe_address("icmp://example.com").is_ok());
-        assert!(validate_probe_address("icmp://[2001:db8::1]").is_ok());
-        assert!(validate_probe_address("icmp://1.1.1.1:80").is_err());
-        assert!(validate_probe_address("icmp://2001:db8::1").is_err());
-        assert!(validate_probe_address("tcp://example.com").is_err());
-        assert!(validate_probe_address("tcp://example.com:0").is_err());
+    fn each_family_is_validated_against_its_own_column() {
+        let valid = |targets| validate_settings(&settings(targets)).is_ok();
+        assert!(valid(vec![target(
+            PingProbeKind::Icmp,
+            Some("1.1.1.1"),
+            Some("2606:4700:4700::1111")
+        )]));
+        assert!(valid(vec![target(
+            PingProbeKind::Tcp,
+            Some("www.google.com:443"),
+            Some("www.google.com:443")
+        )]));
+        // Either family may be left empty, but not both.
+        assert!(valid(vec![target(
+            PingProbeKind::Icmp,
+            Some("1.1.1.1"),
+            None
+        )]));
+        assert!(valid(vec![target(
+            PingProbeKind::Icmp,
+            None,
+            Some("ipv6.google.com")
+        )]));
+        assert!(!valid(vec![target(PingProbeKind::Icmp, None, None)]));
+        // An IP literal must sit in its own family's column.
+        assert!(!valid(vec![target(
+            PingProbeKind::Icmp,
+            Some("2001:db8::1"),
+            None
+        )]));
+        assert!(!valid(vec![target(
+            PingProbeKind::Tcp,
+            None,
+            Some("192.0.2.1:443")
+        )]));
+        assert!(!valid(vec![target(
+            PingProbeKind::Icmp,
+            Some("1.1.1.1:80"),
+            None
+        )]));
+        assert!(!valid(vec![target(
+            PingProbeKind::Tcp,
+            Some("example.com"),
+            None
+        )]));
+        // The same endpoint in the same family twice is one series.
+        assert!(!valid(vec![
+            target(PingProbeKind::Icmp, Some("1.1.1.1"), None),
+            target(PingProbeKind::Icmp, Some("1.1.1.1"), None),
+        ]));
+        // A domain in both columns is two series.
+        assert!(valid(vec![target(
+            PingProbeKind::Icmp,
+            Some("example.com"),
+            Some("example.com")
+        )]));
+    }
+
+    #[test]
+    fn saving_trims_and_canonicalizes_endpoints() {
+        let normalized = normalize_settings(settings(vec![PingProbeTarget {
+            name: "  Cloudflare ".to_owned(),
+            kind: PingProbeKind::Icmp,
+            ipv4: Some(" ".to_owned()),
+            ipv6: Some(" [2606:4700:4700:0:0:0:0:1111] ".to_owned()),
+        }]));
+        let target = &normalized.targets[0];
+        assert_eq!(target.name, "Cloudflare");
+        assert_eq!(target.ipv4, None);
+        assert_eq!(target.ipv6.as_deref(), Some("2606:4700:4700::1111"));
+    }
+
+    #[test]
+    fn legacy_stored_targets_are_read_as_dual_stack_targets() {
+        let targets = stored_targets(serde_json::json!([
+            { "name": "dns", "address": "icmp://dns.alidns.com" },
+            { "name": "v4", "address": "icmp://223.5.5.5" },
+            { "name": "v6", "address": "tcp://[2400:3200::1]:443" },
+            { "name": "dup", "address": "icmp://DNS.alidns.com" },
+        ]))
+        .unwrap();
+        assert_eq!(
+            targets.len(),
+            3,
+            "a duplicate series is dropped, not invented"
+        );
+        assert_eq!(targets[0].ipv4.as_deref(), Some("dns.alidns.com"));
+        assert_eq!(targets[0].ipv6.as_deref(), Some("dns.alidns.com"));
+        assert_eq!(targets[1].ipv6, None);
+        assert_eq!(targets[2].kind, PingProbeKind::Tcp);
+        assert_eq!(targets[2].ipv4, None);
+        assert!(validate_settings(&settings(targets)).is_ok());
+
+        let current = stored_targets(serde_json::json!([
+            { "name": "c", "kind": "icmp", "ipv4": "1.1.1.1", "ipv6": null }
+        ]))
+        .unwrap();
+        assert_eq!(current[0].ipv4.as_deref(), Some("1.1.1.1"));
+    }
+
+    #[test]
+    fn configured_series_are_keyed_by_address_and_family() {
+        let series = configured_series(&settings(vec![target(
+            PingProbeKind::Tcp,
+            Some("example.com:443"),
+            Some("example.com:443"),
+        )]));
+        assert_eq!(
+            series.into_iter().collect::<Vec<_>>(),
+            [
+                ("tcp://example.com:443".to_owned(), PingProbeFamily::Ipv4),
+                ("tcp://example.com:443".to_owned(), PingProbeFamily::Ipv6),
+            ]
+        );
     }
 
     #[test]
@@ -718,42 +940,52 @@ mod tests {
     fn latest_fleet_query_bounds_each_primary_key_probe() {
         assert!(LATEST_NODE_SAMPLES_SQL.contains("JOIN LATERAL"));
         assert!(LATEST_NODE_SAMPLES_SQL.contains("LIMIT 1"));
+        assert!(LATEST_NODE_SAMPLES_SQL.contains("sample.family = requested.family"));
         assert!(!LATEST_NODE_SAMPLES_SQL.contains("DISTINCT ON"));
     }
 
     #[test]
-    fn columnar_view_keeps_exact_ping_order_and_states() {
+    fn columnar_view_keeps_exact_ping_order_and_states_per_family() {
         let view = NodePingProbeView {
             node_id: "n1".to_owned(),
             targets: vec![PingProbeTargetSeries {
                 name: "target".to_owned(),
-                address: "icmp://example.test".to_owned(),
-                samples: vec![
-                    PingProbePoint {
-                        probed_at_unix_secs: 10,
-                        attempted: true,
-                        latency_us: Some(12_345),
-                    },
-                    PingProbePoint {
-                        probed_at_unix_secs: 20,
-                        attempted: true,
-                        latency_us: None,
-                    },
-                    PingProbePoint {
+                kind: PingProbeKind::Icmp,
+                ipv4: Some(PingProbeFamilySeries {
+                    address: "icmp://example.test".to_owned(),
+                    samples: vec![
+                        PingProbePoint {
+                            probed_at_unix_secs: 10,
+                            attempted: true,
+                            latency_us: Some(12_345),
+                            skip_reason: None,
+                        },
+                        PingProbePoint {
+                            probed_at_unix_secs: 20,
+                            attempted: true,
+                            latency_us: None,
+                            skip_reason: None,
+                        },
+                    ],
+                }),
+                ipv6: Some(PingProbeFamilySeries {
+                    address: "icmp://example.test".to_owned(),
+                    samples: vec![PingProbePoint {
                         probed_at_unix_secs: 30,
                         attempted: false,
                         latency_us: None,
-                    },
-                ],
+                        skip_reason: Some(PingProbeSkipReason::NoRoute),
+                    }],
+                }),
             }],
         };
 
         let compact = columnar_view(view);
-        assert_eq!(compact.targets[0].probed_at_unix_secs, vec![10, 20, 30]);
-        assert_eq!(compact.targets[0].attempted, vec![true, true, false]);
-        assert_eq!(
-            compact.targets[0].latency_us,
-            vec![Some(12_345), None, None]
-        );
+        let ipv4 = compact.targets[0].ipv4.as_ref().unwrap();
+        assert_eq!(ipv4.probed_at_unix_secs, vec![10, 20]);
+        assert_eq!(ipv4.attempted, vec![true, true]);
+        assert_eq!(ipv4.latency_us, vec![Some(12_345), None]);
+        let ipv6 = compact.targets[0].ipv6.as_ref().unwrap();
+        assert_eq!(ipv6.skip_reason, vec![Some(PingProbeSkipReason::NoRoute)]);
     }
 }

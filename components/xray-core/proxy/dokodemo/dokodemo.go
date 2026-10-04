@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -67,6 +68,16 @@ func (d *DokodemoDoor) policy() policy.Session {
 	config := d.config
 	p := d.policyManager.ForLevel(config.UserLevel)
 	return p
+}
+
+func spliceCopyState(conn stat.Connection) session.SpliceCopyState {
+	if proxy.IsRAWTransportWithoutSecurity(conn) {
+		return session.SpliceCopyDirect
+	}
+	// CopyRawConnIfExist unwraps TLS and REALITY before entering the kernel copy path.
+	// A security front must keep responses on its wrapped writer or plaintext would be
+	// written directly to the underlying socket.
+	return session.SpliceCopyDisabled
 }
 
 // Process implements proxy.Inbound.
@@ -137,7 +148,7 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 
 	inbound := session.InboundFromContext(ctx)
 	inbound.Name = "dokodemo-door"
-	inbound.CanSpliceCopy = 1
+	inbound.CanSpliceCopy.Store(spliceCopyState(conn))
 	inbound.User = &protocol.MemoryUser{
 		Level: d.config.UserLevel,
 	}

@@ -447,6 +447,23 @@ it('shows WARP status in the page body without a duplicate progress strip', () =
   expect(view.getAllByRole('button', { name: '前往线路' })).toHaveLength(2);
 });
 
+it('hides tenant metadata from WARP details while keeping operational summary fields', () => {
+  const warpSnapshot: ConsoleSnapshot = {
+    ...snapshot,
+    snapshot: { ...snapshot.snapshot, external_outbounds: [warpOutbound] },
+  };
+  const view = mount({ drill: { p: 'warp', id: warpOutbound.id } }, warpSnapshot);
+  const summary = view.getByRole('heading', { name: '隧道' }).closest('section') as HTMLElement;
+
+  expect(view.queryByText('租户')).toBeNull();
+  expect(view.queryByText(warpOutbound.tenant, { exact: true })).toBeNull();
+  for (const label of ['协议', '修订', '发布', '机器身份']) {
+    expect(within(summary).getByText(label, { exact: true })).toBeTruthy();
+  }
+  expect(within(summary).getByText('Cloudflare WARP')).toBeTruthy();
+  expect(within(summary).getByText('r1')).toBeTruthy();
+});
+
 it('shows a converged WARP release in the identity and summary without a progress strip', () => {
   const readyWarp: ExternalOutbound = {
     ...warpOutbound,

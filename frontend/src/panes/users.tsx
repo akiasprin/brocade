@@ -1,5 +1,5 @@
-import { useEffect, useState, type CSSProperties } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useEffect, useId, useState, type CSSProperties, type ReactNode } from 'react';
+import { useMutation, useMutationState, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ApiError,
   createUser,
@@ -11,10 +11,14 @@ import {
   fetchSnapshot,
   fetchTenants,
   fetchUsageMonthly,
+  fetchUserOnlineSourceHistory,
+  fetchUserPresence,
   fetchUsers,
   fetchUserGrantProbePlan,
   grantProbeEventsUrl,
+  issueUserDirectLogin,
   issueUserLogin,
+  revokeUserDirectLogin,
   rotateMyUuid,
   rotateUserUuid,
   setQuota,
@@ -27,25 +31,32 @@ import {
   type GrantProbeJob,
   type GrantProbeJobItem,
   type GrantProbePlanItem,
+  type GrantWrite,
+  type IssuedUserDirectLogin,
+  type NetworkOperator,
   type UsageMonthlyViewRow,
   type UserListItem,
+  type UserOnlineSource,
+  type UserPresence,
 } from '../api';
-import { can, useSession } from '../session';
-import { EmptyState, ErrorBox, Loading, SegSwitch } from '../ui/bits';
+import { can, isVisitor, useSession } from '../session';
+import { Ago, EmptyState, ErrorBox, Loading, SegmentedControl, SegSwitch } from '../ui/bits';
 import { Icon, ListIcon, PanelTitle } from '../ui/icons';
 import { bytes } from '../ui/format';
 import { useNodeNames } from '../ui/node-name';
 import { RegionFlag } from '../ui/region-flag';
+import { FieldLoading } from '../ui/loading';
 import { type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import { isValidSlug } from './ports';
 import { SubscriptionViewer, type SubscriptionKind } from './subscription';
-import { navigate, navigateInPlace } from '../forge/route';
+import { navigate } from '../forge/route';
 import { CopyButton } from '../ui/copy-button';
 import { DialogClose, DialogLayer } from '../ui/dialog';
 import { PASSWORD_MIN_LENGTH, passwordConfirmation } from '../ui/password-policy';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import { useNarrow } from '../ui/viewport';
+import { directLoginUrl } from '../ui/login';
 
 // 用户列表：一行一个用户，点击后就地展开。
 // 此处原为授权矩阵，行是用户、列是接入面。列数随数据增长：每个接入点一列，每个线路再加
@@ -68,7 +79,7 @@ type Drill = { p: 'list' } | { p: 'user'; id: string };
 // 与机器面「从未上报 ≠ 掉线」属同一类区分，因此沿用同一记号。
 type UserTone = 'ok' | 'bad' | 'idle';
 
-interface UserFacts {
+export interface UserFacts {
   status: string;
   grants: number;
   // 额度已用尽的线路。空数组不表示未设置额度：未设额度的线路和已设未超的线路
@@ -123,21 +134,29 @@ const userAvatarStyle = (id: string): UserAvatarStyle => {
   };
 };
 
+interface AvatarLamp {
+  tone: '' | 'bad' | 'idle';
+  title: string;
+}
+
+// 名册行（row）、详情身份栏（plate）、订阅与节点弹窗标题（mini）共用同一张身份牌。
+// 名册行只在需要处理时给灯，详情身份栏始终给灯；lamp 为空时不渲染状态灯。
 function GeneratedUserAvatar({
   id,
-  detail = false,
-  lampClass,
-  lampTitle,
+  variant = 'row',
+  lamp = null,
 }: {
   id: string;
-  detail?: boolean;
-  lampClass: string;
-  lampTitle: string;
+  variant?: 'row' | 'plate' | 'mini';
+  lamp?: AvatarLamp | null;
 }) {
+  const shape = variant === 'plate' ? 'plate' : variant === 'mini' ? 'user-avatar mini' : 'user-avatar';
   return (
-    <span className={`${detail ? 'plate' : 'user-avatar'} user-generated-avatar`} style={userAvatarStyle(id)}>
+    <span className={`${shape} user-generated-avatar`} style={userAvatarStyle(id)}>
       {initialsOf(id)}
-      <i className={`node-lamp${lampClass ? ` ${lampClass}` : ''}`} title={lampTitle} aria-label={lampTitle} />
+      {lamp && (
+        <i className={`node-lamp${lamp.tone ? ` ${lamp.tone}` : ''}`} title={lamp.title} aria-label={lamp.title} />
+      )}
     </span>
   );
 }
@@ -150,8 +169,340 @@ export const userMatchesSearch = (user: UserListItem, rawQuery: string) => {
     .some(value => value.toLocaleLowerCase().includes(query));
 };
 
-export const accountTypeBadge = (accountType: UserListItem['account_type']) =>
-  accountType === 'test' ? '测试' : '正式';
+// 名册只标出测试账号；正式账号是常态，不再逐行标注。
+export const accountTypeChip = (accountType: UserListItem['account_type']) => (accountType === 'test' ? '测试' : null);
+
+export type RosterFilter = 'all' | 'attention' | 'test' | 'disabled';
+
+const ROSTER_FILTERS: { value: RosterFilter; label: string }[] = [
+  { value: 'all', label: '全部' },
+  { value: 'attention', label: '需处理' },
+  { value: 'test', label: '测试' },
+  { value: 'disabled', label: '已停用' },
+];
+
+// 需处理：流量用尽或接入点被系统停用。已停用由操作者设置，单独成组；未授权不算异常。
+const needsAttention = (user: UserListItem, facts: UserFacts) =>
+  user.status !== 'disabled' && (facts.exhausted.length > 0 || facts.suspended > 0);
+
+export const rosterFilterMatches = (filter: RosterFilter, user: UserListItem, facts: UserFacts) =>
+  filter === 'all' ||
+  (filter === 'attention' && needsAttention(user, facts)) ||
+  (filter === 'test' && user.account_type === 'test') ||
+  (filter === 'disabled' && user.status === 'disabled');
+
+export const userPresenceText = (presence: UserPresence | undefined) => {
+  if (!presence || presence.state === 'unavailable') return '在线来源 —';
+  const count = presence.sources.length;
+  if (presence.state === 'partial') return count > 0 ? `至少 ${count} 个在线来源` : '在线来源 —';
+  return count > 0 ? `在线来源 ${count}` : '暂无在线连接';
+};
+
+const SOURCE_REGION_NAMES = new Intl.DisplayNames(['zh-Hans'], { type: 'region', style: 'short' });
+const SOURCE_OPERATOR_NAMES = new Map<NetworkOperator, string>([
+  ['chinanet', '电信'],
+  ['cmcc', '移动'],
+  ['unicom', '联通'],
+  ['cernet', '教育网'],
+  ['cstnet', '科技网'],
+]);
+
+const SOURCE_PROTOCOL_NAMES = new Map([
+  ['vless', 'VLESS'],
+  ['anytls', 'AnyTLS'],
+  ['hysteria2', 'Hysteria2'],
+  ['unknown', '协议未知'],
+]);
+
+function sourceProtocols(source: UserOnlineSource, nodeId: string): string {
+  const accesses = source.accesses?.filter(access => access.node_id === nodeId) ?? [];
+  const protocols = new Set(
+    accesses.flatMap(access =>
+      access.protocols?.length
+        ? access.protocols.map(protocol => (SOURCE_PROTOCOL_NAMES.has(protocol) ? protocol : 'unknown'))
+        : ['unknown'],
+    ),
+  );
+  if (!protocols.size) protocols.add('unknown');
+  return [...SOURCE_PROTOCOL_NAMES]
+    .filter(([protocol]) => protocols.has(protocol))
+    .map(([, name]) => name)
+    .join(' · ');
+}
+
+function PresenceNodeLink({ id, nameOf }: { id: string; nameOf: (id: string) => string }) {
+  return (
+    <button
+      type="button"
+      className="user-presence-node-link"
+      title={id}
+      onClick={() => navigate('nodes', { p: 'node', id })}
+    >
+      {nameOf(id)}
+    </button>
+  );
+}
+
+function PresenceSourceRow({
+  source,
+  country,
+  operator,
+  nameOf,
+  historical = false,
+}: {
+  source: UserOnlineSource;
+  country: string | undefined;
+  operator: NetworkOperator | undefined;
+  nameOf: (id: string) => string;
+  historical?: boolean;
+}) {
+  const [nodesExpanded, setNodesExpanded] = useState(false);
+  const detailsId = useId();
+  const code = country?.trim().toUpperCase();
+  const name = code && /^[A-Z]{2}$/.test(code) && code !== 'ZZ' ? SOURCE_REGION_NAMES.of(code) : undefined;
+  const region = name && name !== code ? name : undefined;
+  const operatorName = operator ? SOURCE_OPERATOR_NAMES.get(operator) : undefined;
+  const nodeCount = source.node_ids.length;
+  const nodeVerb = historical ? '曾接入' : '接入';
+  return (
+    <div className="user-presence-source">
+      <span className={`user-presence-dot${historical ? ' history' : ''}`} aria-hidden="true" />
+      <code>{source.ip}</code>
+      <CopyButton
+        className="user-fcopy"
+        text={source.ip}
+        label={`复制${historical ? '历史' : ''}来源 IP ${source.ip}`}
+        successLabel={`${historical ? '历史' : ''}来源 IP 已复制`}
+        failureLabel={`${historical ? '历史' : ''}来源 IP 复制失败`}
+        iconOnly
+      />
+      <span className="user-presence-location" title="本地 GeoIP · 国家／地区与网络归属参考，非精确位置或宽带品牌">
+        {region && <RegionFlag code={code} />}
+        <span>
+          {region ?? '位置未知'}
+          {operatorName && <> · {operatorName}</>}
+        </span>
+      </span>
+      <div className="user-presence-meta">
+        <span className="user-presence-source-nodes">
+          {nodeCount === 0 ? (
+            <span>接入节点未知</span>
+          ) : nodeCount === 1 ? (
+            <>
+              <span>{nodeVerb}</span>
+              <PresenceNodeLink id={source.node_ids[0]} nameOf={nameOf} />
+              <button
+                type="button"
+                className="user-presence-source-nodes-toggle"
+                aria-label={`${source.ip} 的${historical ? '最后观测' : '接入'}协议`}
+                aria-expanded={nodesExpanded}
+                aria-controls={detailsId}
+                onClick={() => setNodesExpanded(expanded => !expanded)}
+              >
+                协议
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              className="user-presence-source-nodes-toggle"
+              aria-expanded={nodesExpanded}
+              aria-controls={detailsId}
+              onClick={() => setNodesExpanded(expanded => !expanded)}
+            >
+              {nodeVerb} {nodeCount} 台节点
+            </button>
+          )}
+        </span>
+        <span className="user-presence-observed">
+          {historical ? '最后出现' : '最近观测'} <Ago at={source.last_observed_at} />
+        </span>
+        {nodesExpanded && nodeCount === 1 && (
+          <div id={detailsId} className="user-presence-protocol-detail">
+            <span>{historical ? '最后观测协议' : '接入协议'}</span>
+            <span className="user-presence-protocols">{sourceProtocols(source, source.node_ids[0])}</span>
+          </div>
+        )}
+        {nodesExpanded && nodeCount > 1 && (
+          <ul id={detailsId} className="user-presence-source-node-list" aria-label={`${source.ip} 的接入节点`}>
+            {source.node_ids.map(id => (
+              <li key={id}>
+                <PresenceNodeLink id={id} nameOf={nameOf} />
+                <span className="user-presence-protocols">
+                  {historical && <span>最后观测协议 · </span>}
+                  {sourceProtocols(source, id)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function UserPresenceCard({
+  user,
+  presence,
+  countries,
+  operators,
+  nameOf,
+  pending,
+  error,
+}: {
+  user: UserListItem;
+  presence: UserPresence | undefined;
+  countries: Record<string, string> | undefined;
+  operators: Record<string, NetworkOperator> | undefined;
+  nameOf: (id: string) => string;
+  pending: boolean;
+  error: unknown;
+}) {
+  const [historyExpanded, setHistoryExpanded] = useState(false);
+  const presenceText = userPresenceText(presence);
+  // A public source may use multiple ingress nodes. Count each node once in the coverage summary;
+  // expected/reporting_nodes are snapshot coverage, not the number of nodes with online sources.
+  const onlineNodeIds = new Set<string>();
+  for (const source of presence?.sources ?? []) {
+    for (const id of source.node_ids) {
+      onlineNodeIds.add(id);
+    }
+  }
+  const partial = presence?.state === 'partial';
+  const summary = presence?.sources.length
+    ? `${partial ? '至少 ' : ''}${presence.sources.length} 个公网来源 · ${partial ? '至少' : ''}覆盖 ${onlineNodeIds.size} 台节点`
+    : presenceText;
+  const history = useQuery({
+    queryKey: ['user-presence-history', user.tenant_id, user.id],
+    queryFn: () => fetchUserOnlineSourceHistory(user.tenant_id, user.id),
+    enabled: historyExpanded,
+    staleTime: 30_000,
+  });
+  const historyCountries = new Map(history.data?.source_countries?.map(({ ip, country }) => [ip, country]));
+  const historyOperators = new Map(history.data?.source_operators?.map(({ ip, operator }) => [ip, operator]));
+
+  return (
+    <section className="panel config-panel user-dcard user-presence-card">
+      <header>
+        <PanelTitle of="client">在线接入</PanelTitle>
+        <span className="rt">{error ? '在线状态暂不可用' : pending ? <FieldLoading /> : summary}</span>
+      </header>
+      <div className="user-dcard-body">
+        {!!error && <ErrorBox error={error} />}
+        {!!error && presence && <span className="dim">当前显示上次成功读取的快照。</span>}
+        {presence?.sources.length ? (
+          <div className="user-presence-list">
+            {presence.sources.map(source => (
+              <PresenceSourceRow
+                key={source.ip}
+                source={source}
+                country={countries?.[source.ip]}
+                operator={operators?.[source.ip]}
+                nameOf={nameOf}
+              />
+            ))}
+          </div>
+        ) : !pending && !error ? (
+          <span className="dim">{presenceText}</span>
+        ) : null}
+
+        <div className={`user-presence-history${historyExpanded ? ' open' : ''}`}>
+          <button
+            type="button"
+            className="user-presence-history-toggle"
+            aria-expanded={historyExpanded}
+            onClick={() => setHistoryExpanded(expanded => !expanded)}
+          >
+            <span aria-hidden="true">{historyExpanded ? '▾' : '▸'}</span>
+            {historyExpanded ? '收起历史来源 IP' : '历史来源 IP'}
+          </button>
+          {historyExpanded && (
+            <div className="user-presence-history-body" aria-live="polite">
+              {history.isPending ? (
+                <FieldLoading />
+              ) : history.error ? (
+                <ErrorBox error={history.error} />
+              ) : history.data && history.data.sources.length > 0 ? (
+                <>
+                  <div className="user-presence-history-summary">
+                    最近 {history.data.retention_days} 天 · {history.data.sources.length} 个已离线来源
+                  </div>
+                  <div className="user-presence-list history">
+                    {history.data.sources.map(source => (
+                      <PresenceSourceRow
+                        key={source.ip}
+                        source={source}
+                        country={historyCountries.get(source.ip)}
+                        operator={historyOperators.get(source.ip)}
+                        nameOf={nameOf}
+                        historical
+                      />
+                    ))}
+                  </div>
+                  {history.data.truncated && (
+                    <span className="user-presence-history-note">记录较多，仅显示最近 256 个来源 IP。</span>
+                  )}
+                </>
+              ) : (
+                <span className="dim">最近 {history.data?.retention_days ?? 30} 天没有历史来源 IP。</span>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="user-dcard-foot">
+        <span>按公网 IP 去重，不等于连接数；跨节点的同一 IP 在合计中只计一次。</span>
+        {presence?.state === 'partial' && (
+          <span>
+            当前仅收到 {presence.reporting_nodes} / {presence.expected_nodes} 台入口节点的最新快照。
+          </span>
+        )}
+        {!pending && !error && (!presence || presence.state === 'unavailable') && (
+          <span>Agent 尚未上报，或在线来源统计尚未启用。</span>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// 名册右列的本月用量只保留一位小数；精确值在详情的「用量与额度」里。
+const compactUsage = (total: number) => {
+  const [value, unit] = bytes(total).split(' ');
+  return { value: String(Number(Number(value).toFixed(1))), unit };
+};
+
+// 名册不暴露低用量的精确百分比；进入 95% 以上后才显示具体数值。
+export function quotaStage(pct: number): string {
+  if (pct < 95) return '余裕';
+  return `${pct.toFixed(0)}%`;
+}
+
+// 名册恢复线上原有的中性环形进度；右侧文字单独按阶段显示。
+function QuotaRing({ pct, over }: { pct: number; over: boolean }) {
+  const clamped = Math.min(100, Math.max(0, pct));
+  return (
+    <svg
+      className={`user-quota-ring${over ? ' over' : ''}`}
+      width="12"
+      height="12"
+      viewBox="0 0 12 12"
+      aria-hidden="true"
+    >
+      <circle className="track" cx="6" cy="6" r="4.5" />
+      {clamped > 0 && (
+        <circle
+          className="value"
+          cx="6"
+          cy="6"
+          r="4.5"
+          pathLength="100"
+          strokeDasharray={`${clamped} ${100 - clamped}`}
+          transform="rotate(-90 6 6)"
+        />
+      )}
+    </svg>
+  );
+}
 
 /* 将当前下钻层级转换为外壳顶部的面包屑。顶层那一段（「用户」）由外壳补全。 */
 const crumbOf = (d: Drill): CrumbSeg[] => (d.p === 'user' ? [{ label: d.id }] : []);
@@ -159,7 +510,8 @@ const crumbOf = (d: Drill): CrumbSeg[] => (d.p === 'user' ? [{ label: d.id }] : 
 export function UsersPane({ win, bare = false }: { win: Win; bare?: boolean }) {
   const drill = (win.data.drill as Drill | undefined) ?? { p: 'list' };
   const narrow = useNarrow();
-  const go = (d: Drill) => (narrow ? navigate('users', d) : navigateInPlace('users', d));
+  // 不同用户的详情高度不同；沿用旧偏移会在内容重排后再次跳动。只有历史返回恢复位置。
+  const go = (d: Drill) => navigate('users', d);
   useCrumb(win, crumbOf(drill));
 
   return <UserList drill={drill} go={go} sheeted={bare} narrow={narrow} />;
@@ -199,7 +551,7 @@ export function QuotaRow({
   const guardScope = `quota:${app.id}`;
   const dirty = editing && draftValue !== initialValue;
   useUnsavedChanges(dirty, `${app.label || app.id} 的月度额度`, guardScope);
-  const pct = limit && used !== null ? Math.min(100, (used / limit) * 100) : null;
+  const pct = limit && used !== null ? (used / limit) * 100 : null;
 
   if (editing) {
     const n = Number(draftValue.trim());
@@ -278,7 +630,7 @@ export function QuotaRow({
       </span>
       {limit !== null && pct !== null && used !== null && (
         <span className="qta-t" title={`${pct.toFixed(0)}%`}>
-          <i style={{ width: `${used > 0 ? Math.max(1, pct) : 0}%` }} />
+          <i style={{ width: `${used > 0 ? Math.min(100, Math.max(1, pct)) : 0}%` }} />
         </span>
       )}
       <span className={`qta-meta${over ? ' over' : ''}${limit === null ? ' unlimited' : ''}`}>
@@ -300,7 +652,7 @@ export function QuotaRow({
           </>
         ) : (
           <>
-            <span>{pct?.toFixed(0)}%</span>
+            <span>{pct === null ? '—' : `${pct.toFixed(0)}%`}</span>
             <span>剩余 {bytes(limit - used)}</span>
           </>
         )}
@@ -449,6 +801,56 @@ function UserLoginIssuedDialog({
   );
 }
 
+function UserDirectLoginIssuedDialog({
+  user,
+  issued,
+  onClose,
+}: {
+  user: UserListItem;
+  issued: IssuedUserDirectLogin;
+  onClose: () => void;
+}) {
+  const url = directLoginUrl(issued.uuid, issued.token);
+  const guardScope = `user-direct-login:${user.tenant_id}:${user.id}`;
+  const clearUnsavedChanges = useUnsavedChanges(true, `${user.id} 的直达登录页面`, guardScope);
+  return (
+    <DialogLayer
+      label={`${user.id} 的直达登录页面`}
+      onClose={onClose}
+      canClose={() => confirmDiscardChanges(guardScope)}
+    >
+      <section className="dialog-surface user-password-card user-login-issued-card">
+        <header>
+          <span>
+            <b>{user.direct_login_enabled ? '直达页面已重新生成' : '直达页面已生成'}</b>
+            <small>完整链接和 TOKEN 只显示这一次</small>
+          </span>
+          <DialogClose aria-label="关闭" title="关闭">
+            <Icon of="close" size={14} />
+          </DialogClose>
+        </header>
+        <div className="user-login-issued">
+          <span>
+            直达页面 <code>{url}</code>{' '}
+            <CopyButton className="user-fcopy" text={url} label="复制直达页面" successLabel="直达页面已复制" iconOnly />
+          </span>
+          <span>
+            UUID <code>{issued.uuid}</code> <CopyButton className="user-fcopy" text={issued.uuid} iconOnly />
+          </span>
+          <span>
+            TOKEN <code>{issued.token}</code> <CopyButton className="user-fcopy" text={issued.token} iconOnly />
+          </span>
+        </div>
+        <footer>
+          <DialogClose className="btn primary" onClick={clearUnsavedChanges}>
+            我已保存
+          </DialogClose>
+        </footer>
+      </section>
+    </DialogLayer>
+  );
+}
+
 type GrantProbeDisplayItem = GrantProbePlanItem & Partial<Pick<GrantProbeJobItem, 'status' | 'ttfb_ms' | 'detail'>>;
 
 const GRANT_PROBE_SLOTS = [
@@ -465,6 +867,102 @@ const GRANT_PROBE_SLOTS = [
 type GrantProbeMatrixStyle = CSSProperties & { '--grant-probe-slot-count': number };
 
 const GRANT_PROBE_POLL_MS = 1_000;
+const GRANT_REFRESH_MS = 3_000;
+const GRANT_REFRESH_WINDOW_MS = 60_000;
+const GRANT_MUTATION_KEY = ['grant'] as const;
+
+function grantWrite(value: unknown): GrantWrite | null {
+  if (!value || typeof value !== 'object') return null;
+  if (
+    !('app_id' in value) ||
+    typeof value.app_id !== 'string' ||
+    !('tenant_id' in value) ||
+    typeof value.tenant_id !== 'string' ||
+    !('user_id' in value) ||
+    typeof value.user_id !== 'string' ||
+    !('ingress_id' in value) ||
+    typeof value.ingress_id !== 'string' ||
+    !('enabled' in value) ||
+    typeof value.enabled !== 'boolean'
+  )
+    return null;
+  return {
+    app_id: value.app_id,
+    tenant_id: value.tenant_id,
+    user_id: value.user_id,
+    ingress_id: value.ingress_id,
+    enabled: value.enabled,
+  };
+}
+
+function grantRevision(value: unknown): number | null {
+  return value &&
+    typeof value === 'object' &&
+    'revision_id' in value &&
+    typeof value.revision_id === 'number' &&
+    Number.isSafeInteger(value.revision_id)
+    ? value.revision_id
+    : null;
+}
+
+const grantKey = (value: GrantWrite) => `${value.app_id}/${value.tenant_id}/${value.user_id}/${value.ingress_id}`;
+
+function useGrantEdits() {
+  return useMutationState({
+    filters: { mutationKey: GRANT_MUTATION_KEY, exact: true },
+    select: mutation => ({
+      write: grantWrite(mutation.state.variables),
+      revision: grantRevision(mutation.state.data),
+      status: mutation.state.status,
+      submittedAt: mutation.state.submittedAt,
+      error: mutation.state.error,
+    }),
+  });
+}
+
+// Each mounted card keeps its own mutation observer (including an unconfirmed write receipt).
+// A global single "busy" value lets clicking B unlock A; a refetch promise alone is also not an
+// acknowledgement, because cancellation or a failed refresh can resolve without newer data.
+function GrantToggle({
+  write,
+  confirmedRevision,
+  disabled,
+  className,
+  title,
+  refresh,
+  children,
+}: {
+  write: GrantWrite;
+  confirmedRevision: number;
+  disabled: boolean;
+  className: string;
+  title: string;
+  refresh: () => Promise<void>;
+  children: ReactNode;
+}) {
+  const qc = useQueryClient();
+  const mutation = useMutation({
+    mutationKey: GRANT_MUTATION_KEY,
+    mutationFn: upsertGrant,
+    onSettled: (_result, _error, value) => {
+      void qc.invalidateQueries({ queryKey: ['grant-probe-plan', value.tenant_id, value.user_id] });
+      return refresh();
+    },
+  });
+  const waiting = mutation.isPending || (mutation.data?.revision_id ?? 0) > confirmedRevision;
+  return (
+    <button
+      className={className}
+      title={title}
+      aria-pressed={!write.enabled}
+      aria-busy={waiting}
+      disabled={disabled || waiting}
+      onClick={() => mutation.mutate(write)}
+    >
+      {children}
+    </button>
+  );
+}
 
 const probeBaseName = (item: GrantProbeDisplayItem) => {
   const withoutFamily = item.family === 'ipv6' ? item.name.replace(/ \| v6$/, '') : item.name;
@@ -502,6 +1000,14 @@ const probeVisibleStatusText = (item: GrantProbeDisplayItem) => {
  */
 export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem; readOnly?: boolean }) {
   const qc = useQueryClient();
+  const edits = useGrantEdits();
+  const latestEdit = edits.reduce(
+    (latest, edit) =>
+      edit.write?.tenant_id === user.tenant_id && edit.write.user_id === user.id
+        ? Math.max(latest, edit.submittedAt)
+        : latest,
+    0,
+  );
   const capability = useQuery({
     queryKey: ['grant-probe-capability'],
     queryFn: fetchGrantProbeCapability,
@@ -510,12 +1016,26 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
   });
   const plan = useQuery({
     queryKey: ['grant-probe-plan', user.tenant_id, user.id],
-    queryFn: () => fetchUserGrantProbePlan(user.tenant_id, user.id),
+    queryFn: async () => {
+      try {
+        return await fetchUserGrantProbePlan(user.tenant_id, user.id);
+      } catch (error) {
+        // Revoking the last Serving grant returns 404. Cache an explicit empty plan so an older
+        // successful result (or completed probe job) cannot keep advertising a removed entry.
+        if (error instanceof ApiError && error.status === 404) return null;
+        throw error;
+      }
+    },
     // 只读访客只需要无连接材料的 Serving 计划，不读取本机 Xray 能力，更不会创建任务。
     enabled: readOnly || capability.data?.available === true,
     retry: false,
+    // Head changes precede Serving. Refresh only this user's recently edited plan, and stop
+    // after a bounded window even when a node is offline or an order is halted.
+    refetchInterval: () =>
+      latestEdit > 0 && Date.now() < latestEdit + GRANT_REFRESH_WINDOW_MS ? GRANT_REFRESH_MS : false,
   });
   const [job, setJob] = useState<GrantProbeJob | null>(null);
+  const [showEncryption, setShowEncryption] = useState(false);
   const activeJobId = job?.id;
   const activeJobStatus = job?.status;
 
@@ -591,21 +1111,33 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
   // project the current job state over it; otherwise every unrelated authorization disappears
   // while one row is being tested.
   const jobItems = new Map(job?.items.map(item => [item.id, item]) ?? []);
-  const source: GrantProbeDisplayItem[] = (plan.data?.items ?? job?.items ?? []).map(item => ({
-    ...item,
-    ...jobItems.get(item.id),
-  }));
+  const source: GrantProbeDisplayItem[] = (plan.data === null ? [] : (plan.data?.items ?? job?.items ?? [])).map(
+    item => ({
+      ...item,
+      ...jobItems.get(item.id),
+    }),
+  );
+  // 同一接入点同时提供 VLESS 与 VLESS Encryption 时，Encryption 项默认不显示，勾选后才进入
+  // 矩阵和「拨测全部」。只提供 Encryption 的接入点没有其他拨测项，隐藏后该接入点会从列表中
+  // 消失，因此始终显示。
+  const groupKey = (item: GrantProbePlanItem) => `${item.app_id}/${item.chain_id}/${item.ingress_id}`;
+  const plainGroups = new Set(source.filter(item => item.protocol !== 'vless-encryption').map(groupKey));
+  const optionalEncryption = (item: GrantProbePlanItem) =>
+    item.protocol === 'vless-encryption' && plainGroups.has(groupKey(item));
+  const optionalEncryptionCount = source.filter(optionalEncryption).length;
+  const isShown = (item: GrantProbePlanItem) => showEncryption || !optionalEncryption(item);
+  const shown = source.filter(isShown);
   // 只画本次 Serving 计划中确实存在的协议 / 地址族列。固定画满所有能力会让完全没有
   // 启用 Encryption 的授权列表仍出现两个空列，读起来像“尚未验证”，而不是“没有此入口”。
   const visibleSlots = GRANT_PROBE_SLOTS.filter(slot =>
-    source.some(item => item.protocol === slot.protocol && item.family === slot.family),
+    shown.some(item => item.protocol === slot.protocol && item.family === slot.family),
   );
   const matrixStyle: GrantProbeMatrixStyle = {
     '--grant-probe-slot-count': visibleSlots.length,
   };
   const groups = new Map<string, { name: string; items: GrantProbeDisplayItem[] }>();
-  for (const item of source) {
-    const key = `${item.app_id}/${item.chain_id}/${item.ingress_id}`;
+  for (const item of shown) {
+    const key = groupKey(item);
     const group = groups.get(key) ?? {
       name: probeBaseName(item),
       items: [],
@@ -619,13 +1151,17 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
   for (const group of groups.values()) group.items.sort((a, b) => order(a) - order(b));
 
   const busy = job?.status === 'running' || start.isPending || cancel.isPending;
-  const failedIds = job?.items.filter(item => item.status === 'failed').map(item => item.id) ?? [];
-  const complete = job?.items.filter(item => ['passed', 'failed', 'canceled'].includes(item.status)).length ?? 0;
-  const total = job?.items.length ?? plan.data?.items.length ?? 0;
-  const passed = job?.items.filter(item => item.status === 'passed').length ?? 0;
+  // 进度与「重试失败项」只统计当前显示的项，隐藏的 Encryption 项不计入。
+  const jobItemsShown = job?.items.filter(isShown) ?? [];
+  const failedIds = jobItemsShown.filter(item => item.status === 'failed').map(item => item.id);
+  const complete = jobItemsShown.filter(item => ['passed', 'failed', 'canceled'].includes(item.status)).length;
+  const total = jobItemsShown.length;
+  const passed = jobItemsShown.filter(item => item.status === 'passed').length;
   const failed = failedIds.length;
-  const waiting = job?.items.filter(item => item.status === 'waiting').length ?? 0;
-  const running = job?.items.filter(item => item.status === 'running').length ?? 0;
+  const waiting = jobItemsShown.filter(item => item.status === 'waiting').length;
+  const running = jobItemsShown.filter(item => item.status === 'running').length;
+  // 空列表表示服务端计划中的全部项；有项被隐藏时改为显式列出显示中的项。
+  const probeAllIds = shown.length < source.length ? shown.map(item => item.id) : [];
   const unavailable = !readOnly && capability.data && !capability.data.available ? capability.data.reason : null;
   const loadError = (readOnly ? null : capability.error) ?? plan.error ?? start.error ?? cancel.error;
 
@@ -639,6 +1175,20 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
       <header>
         <PanelTitle of="diag">网络拨测</PanelTitle>
         {plan.data && <span className="grant-probe-serving">Serving R{plan.data.serving_revision}</span>}
+        {optionalEncryptionCount > 0 && (
+          <label
+            className="grant-probe-toggle"
+            title={`同一接入点的 VLESS Encryption 拨测项，共 ${optionalEncryptionCount} 项`}
+          >
+            <input
+              type="checkbox"
+              checked={showEncryption}
+              disabled={busy}
+              onChange={event => setShowEncryption(event.target.checked)}
+            />
+            VLESS Encryption
+          </label>
+        )}
         <span className="grant-probe-actions">
           <button
             className="btn grant-probe-retry"
@@ -659,7 +1209,7 @@ export function GrantProbePanel({ user, readOnly = false }: { user: UserListItem
             }
             onClick={() => {
               if (job?.status === 'running') cancel.mutate(job.id);
-              else start.mutate([]);
+              else start.mutate(probeAllIds);
             }}
           >
             {job?.status === 'running' ? '取消拨测' : start.isPending ? '创建中…' : '拨测全部'}
@@ -778,19 +1328,44 @@ function UserList({
   const { who } = useSession();
   const qc = useQueryClient();
   const editable = can(who.role, 'edit');
+  const canViewPresence = !isVisitor(who);
+  const grantEdits = useGrantEdits();
   const users = useQuery({ queryKey: ['users'], queryFn: () => fetchUsers(true) });
+  const presence = useQuery({
+    queryKey: ['user-presence', who.role],
+    queryFn: fetchUserPresence,
+    enabled: canViewPresence,
+    refetchInterval: 30_000,
+  });
   const tenants = useQuery({ queryKey: ['tenants'], queryFn: () => fetchTenants(), enabled: editable });
   const me = useQuery({ queryKey: ['me-user'], queryFn: fetchMyUser, enabled: who.role === 'user' });
-  const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
+  const snapshot = useQuery({
+    queryKey: ['snapshot'],
+    queryFn: fetchSnapshot,
+    refetchInterval: query =>
+      grantEdits.some(
+        edit =>
+          edit.revision !== null &&
+          edit.revision > (query.state.data?.snapshot.revision ?? 0) &&
+          Date.now() < edit.submittedAt + GRANT_REFRESH_WINDOW_MS,
+      )
+        ? GRANT_REFRESH_MS
+        : false,
+  });
   /* 自然月汇总单独查询：该请求失败不影响授权操作，数字显示为 — 即可 */
   const monthly = useQuery({ queryKey: ['usage-monthly'], queryFn: () => fetchUsageMonthly() });
   // 额度是直写的运营参数，不进草稿也不随发布变化，因此与用量分开查询，
   // 也不随 refresh() 中的三个查询一起失效：修改额度只失效额度本身。
   const quotas = useQuery({ queryKey: ['quotas'], queryFn: () => fetchQuotas() });
   const monthlyState: MonthlyUsageState = monthly.data ? 'ready' : monthly.isPending ? 'pending' : 'failed';
+  const presenceByUser = new Map<string, UserPresence>(
+    (canViewPresence ? (presence.data?.users ?? []) : []).map(
+      item => [`${item.tenant_id}/${item.user_id}`, item] as const,
+    ),
+  );
 
-  const [busy, setBusy] = useState<string | null>(null);
   const [search, setSearch] = useState('');
+  const [rosterFilter, setRosterFilter] = useState<RosterFilter>('all');
   const [newUser, setNewUser] = useState<{ id: string; tenant: string } | null>(null);
   /* 当前查看的订阅（用户 + 格式）。null 表示未打开。同时只显示一份，与上面的展开策略一致。 */
   const [sub, setSub] = useState<{ user: UserListItem; kind: SubscriptionKind } | null>(null);
@@ -799,6 +1374,10 @@ function UserList({
   const [issuedLogin, setIssuedLogin] = useState<{
     user: UserListItem;
     value: { operator_id: string; password: string };
+  } | null>(null);
+  const [issuedDirectLogin, setIssuedDirectLogin] = useState<{
+    user: UserListItem;
+    value: IssuedUserDirectLogin;
   } | null>(null);
   const newUserGuardScope = 'new-user';
   useUnsavedChanges(Boolean(newUser?.id.trim()), '新用户资料', newUserGuardScope);
@@ -821,25 +1400,11 @@ function UserList({
 
   const refresh = () => {
     qc.invalidateQueries({ queryKey: ['users'] });
-    qc.invalidateQueries({ queryKey: ['snapshot'] });
     qc.invalidateQueries({ queryKey: ['revisions'] });
     qc.invalidateQueries({ queryKey: ['deployments'] });
     qc.invalidateQueries({ queryKey: ['grant-automation'] });
+    return qc.invalidateQueries({ queryKey: ['snapshot'] });
   };
-  const grant = useMutation({
-    mutationFn: (v: { app: string; user: UserListItem; ingress: string; enabled: boolean }) =>
-      upsertGrant({
-        app_id: v.app,
-        tenant_id: v.user.tenant_id,
-        user_id: v.user.id,
-        ingress_id: v.ingress,
-        enabled: v.enabled,
-      }),
-    onSettled: () => {
-      setBusy(null);
-      refresh();
-    },
-  });
   const profile = useMutation({
     mutationFn: (value: { user: UserListItem; accountType: 'formal' | 'test' }) =>
       updateUserProfile(value.user.tenant_id, value.user.id, { account_type: value.accountType }),
@@ -851,6 +1416,17 @@ function UserList({
       setIssuedLogin({ user, value });
       refresh();
     },
+  });
+  const directLogin = useMutation({
+    mutationFn: (user: UserListItem) => issueUserDirectLogin(user.tenant_id, user.id),
+    onSuccess: (value, user) => {
+      setIssuedDirectLogin({ user, value });
+      refresh();
+    },
+  });
+  const revokeDirectLogin = useMutation({
+    mutationFn: (user: UserListItem) => revokeUserDirectLogin(user.tenant_id, user.id),
+    onSuccess: refresh,
   });
   const status = useMutation({
     mutationFn: (v: { user: UserListItem; next: 'active' | 'disabled' }) =>
@@ -900,13 +1476,23 @@ function UserList({
     return <Loading variant="users" sheeted={sheeted} userDetail={drill.p === 'user'} />;
   }
   if (users.error) return <ErrorBox error={users.error} />;
-  if (snapshot.error) return <ErrorBox error={snapshot.error} />;
+  if (!snapshot.data) return <ErrorBox error={snapshot.error} />;
   if (tenants.error) return <ErrorBox error={tenants.error} />;
   // 额度缺失不能回退成“不限量”：那会把读取失败显示成一个有效、且风险相反的配置。
   if (quotas.error) return <ErrorBox error={quotas.error} />;
   if (me.error) return <ErrorBox error={me.error} />;
 
   const apps: SnapshotApp[] = snapshot.data.snapshot.apps ?? [];
+  const latestGrantEdits = new Map(
+    grantEdits.flatMap(edit => (edit.write ? [[grantKey(edit.write), edit] as const] : [])),
+  );
+  const unconfirmedGrantKeys = new Set(
+    [...latestGrantEdits]
+      .filter(([, edit]) => edit.status === 'pending' || (edit.revision ?? 0) > snapshot.data.snapshot.revision)
+      .map(([key]) => key),
+  );
+  const needsGrantRefresh = grantEdits.some(edit => (edit.revision ?? 0) > snapshot.data.snapshot.revision);
+  const grantError = [...latestGrantEdits.values()].find(edit => edit.status === 'error')?.error;
   const columns = apps.flatMap(a => a.ingresses.map(i => ({ app: a, ingress: i })));
   const granted = new Set(apps.flatMap(a => a.grants.map(g => `${g.tenant}/${g.user}/${g.ingress}`)));
   const selfKey = who.self_user ? `${who.self_user.tenant_id}/${who.self_user.user_id}` : null;
@@ -1001,7 +1587,15 @@ function UserList({
       tone: userTone(facts),
     };
   });
-  const rows = allRows.filter(row => userMatchesSearch(row.u, search));
+  const rows = allRows.filter(
+    row => userMatchesSearch(row.u, search) && rosterFilterMatches(rosterFilter, row.u, row.facts),
+  );
+  const filterCounts = Object.fromEntries(
+    ROSTER_FILTERS.map(option => [
+      option.value,
+      allRows.filter(row => rosterFilterMatches(option.value, row.u, row.facts)).length,
+    ]),
+  ) as Record<RosterFilter, number>;
   const newUserId = newUser?.id.trim() ?? '';
   const newUserBadSlug = newUserId && !isValidSlug(newUserId) ? 'ID 只能用 a-z 0-9 . _ -，最长 32' : null;
   const newUserDuplicate = list.some(user => user.tenant_id === newTenant && user.id === newUserId)
@@ -1076,11 +1670,16 @@ function UserList({
     const canOpenSubscription = canReadArtifacts || selfService;
     const headCls = disabled ? 'off' : tone === 'idle' ? 'idle' : '';
     const lampCls = tone === 'ok' ? '' : tone; // '' | 'bad' | 'idle'
+    const userPresence = presenceByUser.get(r.key);
+    const presenceText = userPresenceText(userPresence);
+    const presenceTitle = userPresence?.sources.length
+      ? userPresence.sources.map(source => source.ip).join(' · ')
+      : presenceText;
     return (
       <section key={r.key} className="panel user-split-detail">
         <div className={`user-dhead${headCls ? ` ${headCls}` : ''}`}>
           <div className="user-dhead-main">
-            <GeneratedUserAvatar id={u.id} detail lampClass={lampCls} lampTitle={userLampTitle(facts)} />
+            <GeneratedUserAvatar id={u.id} variant="plate" lamp={{ tone: lampCls, title: userLampTitle(facts) }} />
             <div className="dtitle">
               <div className="dname">
                 <b className="mono">{u.id}</b>
@@ -1090,26 +1689,35 @@ function UserList({
                     className="dstat"
                     title={
                       mine.length > 0
-                        ? `${mine.length} 个接入点`
+                        ? `已授权 ${mine.length} 个接入点`
                         : suspended.size > 0
                           ? `${suspended.size} 个接入点已停用`
                           : '尚未授权接入点'
                     }
                     aria-label={
                       mine.length > 0
-                        ? `${mine.length} 个接入点`
+                        ? `已授权 ${mine.length} 个接入点`
                         : suspended.size > 0
                           ? `${suspended.size} 个接入点已停用`
                           : '尚未授权接入点'
                     }
                   >
                     <Icon of="chains" size={12} className="dstat-ic" />
-                    <b>{mine.length || suspended.size}</b>
+                    <b>
+                      {mine.length > 0 ? '已授权' : suspended.size > 0 ? '已停用' : '已授权'}{' '}
+                      {mine.length || suspended.size}
+                    </b>
                   </span>
                   <span className="dstat" title={`本月合计 ${usageText}`} aria-label={`本月合计 ${usageText}`}>
                     <Icon of="usage" size={12} className="dstat-ic" />
                     <b className="user-usage-value">{usageText}</b>
                   </span>
+                  {canViewPresence && (
+                    <span className="dstat" title={presenceTitle} aria-label={presenceText}>
+                      <Icon of="client" size={12} className="dstat-ic" />
+                      <b>{userPresence?.sources.length ?? '—'}</b>
+                    </span>
+                  )}
                 </span>
               </div>
               {u.uuid && (
@@ -1146,16 +1754,19 @@ function UserList({
                 </span>
                 <button
                   className="btn user-dact"
-                  disabled={!selfService && (!canManageLogin || !u.login_enabled)}
+                  disabled={selfService ? !u.login_enabled : !canManageLogin || !u.login_enabled}
                   title={
                     selfService
-                      ? '修改自己的登录密码'
+                      ? u.login_enabled
+                        ? '修改自己的登录密码'
+                        : '当前只开通了直达登录，尚未设置密码'
                       : u.login_enabled
                         ? '为该用户设置新的登录密码'
                         : '请先在“更多”中开通登录'
                   }
                   onClick={() => {
                     if (selfService) {
+                      if (!u.login_enabled) return;
                       navigate('password');
                     } else {
                       setPasswordUser(u);
@@ -1221,6 +1832,47 @@ function UserList({
                             <small>
                               {u.login_enabled ? '生成一次性密码并注销现有会话' : '生成该用户的首次登录密码'}
                             </small>
+                          </span>
+                        </button>
+                      )}
+                      {canManageLogin && (
+                        <button
+                          role="menuitem"
+                          className={u.direct_login_enabled ? 'dg' : undefined}
+                          disabled={directLogin.isPending}
+                          onClick={() => {
+                            if (
+                              u.direct_login_enabled &&
+                              !window.confirm(`确定重新生成 ${u.id} 的直达登录页面？旧页面将立即失效。`)
+                            ) {
+                              return;
+                            }
+                            directLogin.mutate(u);
+                          }}
+                        >
+                          <Icon of="access" size={14} className="user-action-menu-icon" />
+                          <span>
+                            {u.direct_login_enabled ? '重新生成直达登录页' : '生成直达登录页'}
+                            <small>
+                              {u.direct_login_enabled ? '替换现有 UUID + TOKEN 登录链接' : '无需输入密码即可登录'}
+                            </small>
+                          </span>
+                        </button>
+                      )}
+                      {canManageLogin && u.direct_login_enabled && (
+                        <button
+                          role="menuitem"
+                          className="dg"
+                          disabled={revokeDirectLogin.isPending}
+                          onClick={() => {
+                            if (!window.confirm(`确定撤销 ${u.id} 的直达登录页面？`)) return;
+                            revokeDirectLogin.mutate(u);
+                          }}
+                        >
+                          <Icon of="dash" size={14} className="user-action-menu-icon" />
+                          <span>
+                            撤销直达登录页
+                            <small>已打开的会话不受影响，页面不能再用于登录</small>
                           </span>
                         </button>
                       )}
@@ -1294,6 +1946,23 @@ function UserList({
             </div>
           </section>
 
+          {canViewPresence && (
+            <UserPresenceCard
+              key={`presence:${r.key}`}
+              user={u}
+              presence={userPresence}
+              countries={Object.fromEntries(
+                presence.data?.source_countries?.map(({ ip, country }) => [ip, country]) ?? [],
+              )}
+              operators={Object.fromEntries(
+                presence.data?.source_operators?.map(({ ip, operator }) => [ip, operator]) ?? [],
+              )}
+              nameOf={nameOf}
+              pending={presence.isPending}
+              error={presence.error}
+            />
+          )}
+
           {/* 接入授权保留落地版：真实的授权卡（链名 + 节点:端口 + 线路水印 + ✓/⦸），
               只补一层与用量卡一致的标题条。 */}
           <section className="panel config-panel user-dcard">
@@ -1316,20 +1985,23 @@ function UserList({
                     const chainName = chain?.name || c.chain;
                     const appName = a.label || a.id;
                     return (
-                      <button
-                        key={`${a.id}/${c.id}`}
+                      <GrantToggle
+                        key={`${a.id}/${gk}`}
+                        write={{ app_id: a.id, tenant_id: u.tenant_id, user_id: u.id, ingress_id: c.id, enabled: !on }}
+                        confirmedRevision={snapshot.data.snapshot.revision}
+                        refresh={refresh}
                         className={`grant-card${held ? ' held' : ''}`}
-                        aria-pressed={on}
-                        disabled={!editable || busy === gk}
+                        disabled={
+                          !editable ||
+                          !!snapshot.error ||
+                          snapshot.fetchStatus === 'paused' ||
+                          unconfirmedGrantKeys.has(`${a.id}/${gk}`)
+                        }
                         title={
                           held
                             ? '流量已用尽，系统已停用。补足额度后自动恢复；此时手动授权在下一轮仍会被撤销。'
                             : `${chainName} · ${appName} · ${c.id} · ${on ? '点击取消授权' : '点击授权'}`
                         }
-                        onClick={() => {
-                          setBusy(gk);
-                          grant.mutate({ app: a.id, user: u, ingress: c.id, enabled: !on });
-                        }}
                       >
                         <span className="gc-head">
                           <span className="gc-app">
@@ -1345,7 +2017,7 @@ function UserList({
                         </span>
                         <span className="gc-at">{held ? '流量用尽已停用' : `${nameOf(c.node)}:${c.port}`}</span>
                         <span className="gc-wm">{appName}</span>
-                      </button>
+                      </GrantToggle>
                     );
                   })}
                 </div>
@@ -1358,14 +2030,121 @@ function UserList({
     );
   };
 
+  // 名册项：身份牌 │ 用户名 + 第二行 │ 右列（本月用量 / 额度）。
+  // 常态不画状态灯：流量用尽与系统停用为红点，未授权为空心灰点，已停用整行降一档、不再叠灯。
+  // 管理员第二行放在线来源，普通用户只看接入点数量；异常、未授权和停用状态优先于观测值，
+  // 避免把诊断信息盖住权限事实。
+  // 右列定宽，用量读数与额度百分比的右缘逐行对齐；额度取各线路中最接近额度的一条。
+  const rosterRow = (row: (typeof allRows)[number]) => {
+    const { u, key, mine, suspended, use, quotaRows, facts, tone } = row;
+    const disabled = u.status === 'disabled';
+    const picked = selected?.key === key;
+    const lamp: AvatarLamp | null = disabled || tone === 'ok' ? null : { tone, title: userLampTitle(facts) };
+    const state = disabled
+      ? { text: '已停用', bad: false }
+      : facts.exhausted.length > 0
+        ? { text: `流量已用尽 · ${facts.exhausted.join('、')}`, bad: true }
+        : suspended.size > 0
+          ? { text: `${suspended.size} 个接入点已被系统停用`, bad: true }
+          : mine.length === 0
+            ? { text: '未授权', bad: false }
+            : null;
+    const usage = monthlyState === 'ready' && use.rows.length > 0 ? compactUsage(use.total) : null;
+    const limited = quotaRows.filter(q => q.limit !== null && q.used !== null);
+    const maxPct = limited.length
+      ? Math.max(...limited.map(q => ((q.used as number) / (q.limit as number)) * 100))
+      : null;
+    const over = facts.exhausted.length > 0;
+    const userPresence = presenceByUser.get(key);
+    const presenceText = canViewPresence ? userPresenceText(userPresence) : `${mine.length} 个接入点`;
+    const presenceTitle = userPresence?.sources.length
+      ? `${presenceText} · ${userPresence.sources.map(source => source.ip).join(' · ')}`
+      : presenceText;
+    const testChip = accountTypeChip(u.account_type);
+    return (
+      <button
+        key={key}
+        type="button"
+        role="option"
+        aria-selected={picked}
+        data-route-focus={`user:${key}`}
+        className={`user-row${disabled ? ' off' : ''}${picked ? ' picked' : ''}`}
+        onClick={() => go({ p: 'user', id: u.id })}
+      >
+        <GeneratedUserAvatar id={u.id} lamp={lamp} />
+        <span className="user-row-name">
+          <b>{u.id}</b>
+          {key === selfKey && <span className="user-row-chip">我</span>}
+          {testChip && <span className="user-row-chip test">{testChip}</span>}
+        </span>
+        <span className={`user-row-usage${usage ? '' : ' none'}`}>
+          {usage ? (
+            <>
+              {usage.value}
+              <small>{usage.unit}</small>
+            </>
+          ) : (
+            monthlyUsageText(monthlyState, use.rows.length, use.total)
+          )}
+        </span>
+        <span className="user-row-meta">
+          {state ? (
+            <span className={`user-row-state${state.bad ? ' bad' : ''}`}>{state.text}</span>
+          ) : mine.length > 0 ? (
+            <span className={`user-row-presence${userPresence?.sources.length ? ' online' : ''}`} title={presenceTitle}>
+              {presenceText}
+            </span>
+          ) : (
+            <span className="user-row-state">{mine.length} 个接入点</span>
+          )}
+        </span>
+        <span className="user-row-quota" title={maxPct === null ? undefined : `额度 ${quotaStage(maxPct)}`}>
+          {maxPct !== null && (
+            <>
+              <QuotaRing pct={maxPct} over={over} />
+              <span className={over ? 'over' : undefined}>{quotaStage(maxPct)}</span>
+            </>
+          )}
+        </span>
+      </button>
+    );
+  };
+  const activeRows = rows.filter(row => row.u.status !== 'disabled');
+  const disabledRows = rows.filter(row => row.u.status === 'disabled');
+
   /* 名册与详情是两张同级面板：名册承担搜索和开户入口，详情只承担当前用户。
      避免一条跨栏标题把名册读成详情的附属筛选器。 */
   const body = (
     <>
-      {(grant.error || profile.error || login.error || status.error || rotate.error || quota.error || create.error) && (
+      {(snapshot.error || needsGrantRefresh) && (
+        <div className="toolbar" role="status">
+          <span>授权状态尚未确认，请重新读取后继续操作。</span>
+          <button className="btn" disabled={snapshot.isFetching} onClick={() => void snapshot.refetch()}>
+            重试读取授权
+          </button>
+          {snapshot.error && <ErrorBox error={snapshot.error} />}
+        </div>
+      )}
+      {(grantError ||
+        profile.error ||
+        login.error ||
+        directLogin.error ||
+        revokeDirectLogin.error ||
+        status.error ||
+        rotate.error ||
+        quota.error ||
+        create.error) && (
         <ErrorBox
           error={
-            grant.error ?? profile.error ?? login.error ?? status.error ?? rotate.error ?? quota.error ?? create.error
+            grantError ??
+            profile.error ??
+            login.error ??
+            directLogin.error ??
+            revokeDirectLogin.error ??
+            status.error ??
+            rotate.error ??
+            quota.error ??
+            create.error
           }
         />
       )}
@@ -1407,8 +2186,8 @@ function UserList({
           </div>
         </section>
       ) : (
-        // 双栏：左名册常驻可扫读，右详情随选中切换。名册项第一行放用户名与接入点数量，
-        // 第二行写明状态；身份徽标的悬停提示提供完整原因。
+        // 双栏：左名册常驻可扫读，右详情随选中切换。名册项的结构见 rosterRow；
+        // 已停用的用户在名册末尾单独成组。
         <div className={`user-split${drill.p === 'user' ? ' user-detail-route' : ''}`}>
           <section className="panel titled user-list-panel user-split-roster">
             <header>
@@ -1445,80 +2224,37 @@ function UserList({
                 </button>
               )}
             </span>
+            <SegmentedControl
+              className="user-roster-filter"
+              ariaLabel="筛选用户"
+              value={rosterFilter}
+              onChange={setRosterFilter}
+              options={ROSTER_FILTERS.map(option => ({
+                value: option.value,
+                label: (
+                  <>
+                    {option.label}{' '}
+                    <i className={option.value === 'attention' && filterCounts.attention > 0 ? 'attention' : undefined}>
+                      {filterCounts[option.value]}
+                    </i>
+                  </>
+                ),
+              }))}
+            />
             <div className="user-roster-options" role="listbox" aria-label="用户列表">
               {newUserEditor}
-              {rows.map(row => {
-                const { u, key, mine, suspended, use, quotaRows, facts, tone } = row;
-                const usageText = monthlyUsageText(monthlyState, use.rows.length, use.total);
-                const disabled = u.status === 'disabled';
-                const picked = selected?.key === key;
-                const lampCls = tone === 'ok' ? '' : tone; // '' | 'bad' | 'idle'
-                const accessCount = mine.length || suspended.size;
-                const accessTitle =
-                  mine.length > 0
-                    ? `${mine.length} 个接入点`
-                    : suspended.size > 0
-                      ? `${suspended.size} 个接入点已停用`
-                      : '尚未授权接入点';
-                const stateLine = disabled
-                  ? '已停用'
-                  : facts.exhausted.length > 0
-                    ? '流量已用尽'
-                    : suspended.size > 0
-                      ? '部分接入点已停用'
-                      : mine.length > 0
-                        ? '可用'
-                        : '未授权';
-                // 细条取各线路中最接近额度的一条；未设置额度时不显示。
-                const limited = quotaRows.filter(q => q.limit !== null && q.used !== null);
-                const maxPct = limited.length
-                  ? Math.min(100, Math.max(...limited.map(q => ((q.used as number) / (q.limit as number)) * 100)))
-                  : null;
-                return (
-                  <button
-                    key={key}
-                    type="button"
-                    role="option"
-                    aria-selected={picked}
-                    data-route-focus={`user:${key}`}
-                    className={`user-row${disabled ? ' off' : ''}${picked ? ' picked' : ''}`}
-                    onClick={() => go({ p: 'user', id: u.id })}
-                  >
-                    <GeneratedUserAvatar id={u.id} lampClass={lampCls} lampTitle={userLampTitle(facts)} />
-                    <span className="rbody">
-                      <span className="r1">
-                        <b>{u.id}</b>
-                        {key === selfKey && <span className="st st-ok">我</span>}
-                        <span className={`st ${u.account_type === 'test' ? 'st-warn' : 'st-succeeded'}`}>
-                          {accountTypeBadge(u.account_type)}
-                        </span>
-                      </span>
-                      <span className="r2">
-                        <span className={`rstate${lampCls ? ` ${lampCls}` : ''}`}>{stateLine}</span>
-                        <span aria-hidden="true">·</span>
-                        <span className="raccess" title={accessTitle} aria-label={accessTitle}>
-                          接入面 {accessCount}
-                        </span>
-                      </span>
-                    </span>
-                    <span className="rtail">
-                      <b
-                        className={`user-usage-value${monthlyState === 'ready' && use.rows.length > 0 ? '' : ' none'}`}
-                      >
-                        {usageText}
-                      </b>
-                      {maxPct !== null && (
-                        <span className="rmeter" title={`额度使用 ${maxPct.toFixed(0)}%`}>
-                          <i
-                            className={facts.exhausted.length > 0 ? 'over' : ''}
-                            style={{ width: `${Math.max(2, maxPct)}%` }}
-                          />
-                        </span>
-                      )}
-                    </span>
-                  </button>
-                );
-              })}
+              {activeRows.map(rosterRow)}
+              {disabledRows.length > 0 &&
+                (activeRows.length > 0 ? (
+                  <div className="user-roster-group" role="group" aria-label="已停用">
+                    <div className="user-roster-group-head" aria-hidden="true">
+                      已停用<span>{disabledRows.length}</span>
+                    </div>
+                    {disabledRows.map(rosterRow)}
+                  </div>
+                ) : (
+                  disabledRows.map(rosterRow)
+                ))}
               {rows.length === 0 && <div className="user-search-empty">没有匹配的用户</div>}
             </div>
           </section>
@@ -1530,7 +2266,7 @@ function UserList({
                 <div className="user-detail-empty">
                   {drill.p === 'user'
                     ? '链接指向的用户不存在，或当前账号无权查看'
-                    : search.trim()
+                    : search.trim() || rosterFilter !== 'all'
                       ? '没有匹配的用户'
                       : '从左侧选择一个用户查看详情'}
                 </div>
@@ -1556,6 +2292,7 @@ function UserList({
           user={sub.user.id}
           kind={sub.kind}
           selfService={who.role === 'user' && `${sub.user.tenant_id}/${sub.user.id}` === selfKey}
+          identity={<GeneratedUserAvatar id={sub.user.id} variant="mini" />}
           onClose={() => setSub(null)}
         />
       )}
@@ -1572,6 +2309,17 @@ function UserList({
           user={issuedLogin.user}
           issued={issuedLogin.value}
           onClose={() => setIssuedLogin(null)}
+        />
+      )}
+      {issuedDirectLogin && (
+        <UserDirectLoginIssuedDialog
+          key={`${issuedDirectLogin.user.tenant_id}/${issuedDirectLogin.user.id}`}
+          user={issuedDirectLogin.user}
+          issued={issuedDirectLogin.value}
+          onClose={() => {
+            setIssuedDirectLogin(null);
+            directLogin.reset();
+          }}
         />
       )}
     </>

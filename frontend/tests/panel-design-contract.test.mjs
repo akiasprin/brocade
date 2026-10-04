@@ -9,6 +9,13 @@ const paneNames = readdirSync(new URL('../src/panes/', import.meta.url))
 const panes = new Map(paneNames.map(name => [name, source(`../src/panes/${name}`)]));
 const styles = source('../src/styles.css');
 
+test('公共按钮在原生 button、summary、链接和标签上使用同一套居中基线', () => {
+  assert.match(
+    styles,
+    /\.btn\s*\{[^}]*display:\s*inline-flex;[^}]*align-items:\s*center;[^}]*justify-content:\s*center;[^}]*font-family:\s*inherit;[^}]*line-height:\s*1;[^}]*text-align:\s*center;[^}]*vertical-align:\s*middle;/s,
+  );
+});
+
 const tagEndAfter = (contents, start) => {
   let braces = 0;
   let quote = null;
@@ -97,6 +104,28 @@ test('主列表页标题不显示数量或状态汇总', () => {
   assert.doesNotMatch(users, /user-roster-availability/);
 });
 
+test('列表标题继承普通面板字体，所有标题图标共用 14px 尺寸', () => {
+  assert.match(
+    styles,
+    /\.panel\.config-panel > :is\(header, summary\) h4,\s*\.panel\.titled > :is\(header, summary\) h4\s*\{\s*font: 600 12px var\(--mono\);[\s\S]*?line-height: 14px;\s*letter-spacing: 0\.11em;/,
+  );
+  const clean = styles.replace(/\/\*[\s\S]*?\*\//g, '');
+  for (const [, selectors, declarations] of clean.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    if (!/(?:-list-panel|data-page-title)/.test(selectors) || !/\bh4\b/.test(selectors)) continue;
+    assert.doesNotMatch(
+      declarations,
+      /(?:^|;)\s*(?:font(?:-[\w-]+)?|letter-spacing|color)\s*:/,
+      '列表标题不得覆盖公共面板字体',
+    );
+  }
+
+  const icons = source('../src/ui/icons.tsx');
+  assert.match(icons, /const PANEL_TITLE_ICON_SIZE = 14;/);
+  for (const name of ['ListIcon', 'PanelTitle']) {
+    assert.match(icons, new RegExp(`function ${name}[\\s\\S]*?<Icon of=\\{of\\} size=\\{PANEL_TITLE_ICON_SIZE\\}`));
+  }
+});
+
 test('公网 IP 变更记录作为状态巡检后的 AGENT 指标展开详情', () => {
   const nodes = panes.get('nodes.tsx');
   const agent = nodes.slice(nodes.indexOf('function AgentCard('), nodes.indexOf('export function AppliedCard('));
@@ -174,7 +203,6 @@ const referenceFiles = [
   'users.tsx',
   'rules.tsx',
   'telemetry.tsx',
-  'fleet-net-panel.tsx',
   'node-observation-charts.tsx',
 ];
 const referenceClasses = new Set([
@@ -194,10 +222,8 @@ const referenceClasses = new Set([
   'load-metric',
   // 发布 mockup 的修饰类只编排既有 titled/config-panel 骨架，并继续使用全局设计 token。
   // 明确列出允许项，避免把所有发布页私有类都加入基准后掩盖新的面板皮肤。
-  'cgf',
   'cg-sec',
-  'cg-software',
-  // 隧道列表明确复用三个基准列表页标题，与它们在同一条 CSS 规则中。
+  // 隧道列表复用基准列表骨架，不提供自己的面板皮肤。
   'tunnel-list-panel',
 ]);
 for (const file of referenceFiles) {

@@ -767,6 +767,7 @@ pub async fn record_e2e_probe(
 
     let mut accepted = 0_u64;
     let mut unknown = 0_u64;
+    let mut exit_reputations = Vec::new();
     for chain in &request.chains {
         // A chain absent from the model is dropped: right after a chain is deleted or
         // reassigned, the agent's work list lags for a while. Not an error, simply a row with no
@@ -819,12 +820,7 @@ pub async fn record_e2e_probe(
         // lookup work.
         if chain.status == E2eProbeStatus::Ok {
             if let Some(exit_ip) = chain.exit_ip.as_deref().and_then(crate::public_route_ip) {
-                crate::vpngate::queue_exit_reputation(
-                    &mut tx,
-                    &exit_ip.to_string(),
-                    request.probed_at_unix_secs,
-                )
-                .await?;
+                exit_reputations.push((exit_ip.to_string(), request.probed_at_unix_secs));
             }
         }
 
@@ -859,6 +855,7 @@ pub async fn record_e2e_probe(
         accepted += 1;
     }
 
+    crate::vpngate::queue_exit_reputations(&mut tx, &exit_reputations).await?;
     tx.commit().await?;
 
     Ok(E2eProbeResult {

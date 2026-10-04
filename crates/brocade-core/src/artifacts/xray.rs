@@ -43,6 +43,7 @@ pub const NODE_CERTIFICATE_KEY_FILE: &str = NODE_PUBLIC_CA_CERTIFICATE_FILE;
 
 pub const API_TAG: &str = "api";
 pub const DNS_TAG: &str = "dns-out";
+const DNS_SERVE_EXPIRED_TTL_SECS: u32 = 36 * 60 * 60;
 pub const BLOCK_OUTBOUND_TAG: &str = "out:block";
 pub const REALITY_COVER_OUTBOUND_TAG: &str = "out:reality-cover";
 /// Where a fallback requesting a name this ingress does not impersonate is routed.
@@ -202,6 +203,8 @@ pub struct XrayPolicy {
 pub struct XrayDns {
     pub tag: Option<String>,
     pub servers: Vec<XrayDnsServer>,
+    pub serve_stale: bool,
+    pub serve_expired_ttl_secs: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1459,6 +1462,8 @@ fn dns_config(dns: &Dns, dns_route: Option<&str>, scoped: &[XrayEgressDnsPlan]) 
     XrayDns {
         tag: dns_route.map(|_| DNS_TAG.to_owned()),
         servers,
+        serve_stale: true,
+        serve_expired_ttl_secs: DNS_SERVE_EXPIRED_TTL_SECS,
     }
 }
 

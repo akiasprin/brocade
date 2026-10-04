@@ -91,7 +91,13 @@ function deferredResponse() {
   return { promise, resolve };
 }
 
-function setup({ publicVisitor = false, current = 7 }: { publicVisitor?: boolean; current?: number | null } = {}) {
+function setup({
+  viewer = 'operator',
+  current = 7,
+}: {
+  viewer?: 'operator' | 'public' | 'user';
+  current?: number | null;
+} = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity }, mutations: { retry: false } },
   });
@@ -109,11 +115,11 @@ function setup({ publicVisitor = false, current = 7 }: { publicVisitor?: boolean
   });
   vi.stubGlobal('fetch', fetcher);
   const who: Whoami = {
-    operator_id: publicVisitor ? 'public' : 'operator',
-    role: publicVisitor ? 'readonly' : 'system-admin',
-    tenant_scope: null,
+    operator_id: viewer,
+    role: viewer === 'operator' ? 'system-admin' : viewer === 'public' ? 'readonly' : 'user',
+    tenant_scope: viewer === 'user' ? 'platform' : null,
     token_prefix: null,
-    masked_assets: publicVisitor,
+    masked_assets: viewer !== 'operator',
   };
   const mount = () =>
     render(
@@ -292,8 +298,8 @@ describe('链详情统一等待首屏依赖', () => {
     expect(fetcher.mock.calls.some(([path]) => path.startsWith('/compile/'))).toBe(false);
   });
 
-  it('访客仍等待规则编译完成，但不会请求或等待无权读取的设置', async () => {
-    const { client, fetcher, mount, hold, finish } = setup({ publicVisitor: true });
+  it.each(['public', 'user'] as const)('%s 访客仍等待规则编译完成，但不会请求或等待无权读取的设置', async viewer => {
+    const { client, fetcher, mount, hold, finish } = setup({ viewer });
     await client
       .fetchQuery({
         queryKey: ['settings'],

@@ -1,7 +1,14 @@
 import { cleanup, fireEvent, render } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { InitializeAdmin, PasswordLogin, Login } from '../src/ui/login';
+import {
+  DirectLogin,
+  InitializeAdmin,
+  PasswordLogin,
+  Login,
+  directLoginUrl,
+  parseDirectLoginHash,
+} from '../src/ui/login';
 
 const wrapper = () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
@@ -31,9 +38,9 @@ describe('系统初始化默认身份', () => {
     const view = render(<Login branding={{ site_name: '我的站点', icon_data_url: null }} onLogin={vi.fn()} />, {
       wrapper: wrapper(),
     });
-    expect(view.container.querySelector('.fw-kind')?.textContent).toBe('加载中');
+    expect(view.container.querySelector('.login-title')?.textContent).toBe('加载中');
     complete(jsonResponse({ initialized: false, public_open: false }));
-    await vi.waitFor(() => expect(view.container.querySelector('.fw-kind')?.textContent).toBe('初始化'));
+    await vi.waitFor(() => expect(view.container.querySelector('.login-title')?.textContent).toBe('初始化'));
   });
 
   it('普通登录默认填写 root', () => {
@@ -109,5 +116,71 @@ describe('系统初始化默认身份', () => {
     fireEvent.click(view.getByRole('button', { name: '创建管理员' }));
 
     await vi.waitFor(() => expect(view.getByText('初始化凭据不正确')).toBeTruthy());
+  });
+});
+
+describe('用户直达登录', () => {
+  it('把 UUID 和 TOKEN 放在不会发给服务端的 fragment 中', () => {
+    const url = directLoginUrl(
+      '2d2304da-f114-4574-8d44-625afdb1db5c',
+      'broc_login_secret/value',
+      'https://tat.ac/console?from=admin#/users',
+    );
+    const parsed = new URL(url);
+
+    expect(`${parsed.origin}${parsed.pathname}${parsed.search}`).toBe('https://tat.ac/console?from=admin');
+    expect(parseDirectLoginHash(parsed.hash)).toEqual({
+      uuid: '2d2304da-f114-4574-8d44-625afdb1db5c',
+      token: 'broc_login_secret/value',
+    });
+    expect(parseDirectLoginHash('#/login/only-one-part')).toBeNull();
+    expect(parseDirectLoginHash('#/login/%E0%A4%A/token')).toBeNull();
+  });
+
+  it('用 UUID + TOKEN 换取 cookie 后读取同一份控制台 bootstrap', async () => {
+    const onLogin = vi.fn();
+    const requests: { path: string; body: unknown }[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        requests.push({ path, body: init?.body ? JSON.parse(String(init.body)) : null });
+        if (path === '/auth/direct-login') {
+          return jsonResponse({
+            admin: { operator_id: 'platform/alice', role: 'user', tenant_scope: 'platform' },
+            session_expires_at: '2030-01-01T00:00:00Z',
+          });
+        }
+        if (path === '/bootstrap') {
+          return jsonResponse({
+            who: {
+              operator_id: 'platform/alice',
+              role: 'user',
+              tenant_scope: 'platform',
+              token_prefix: null,
+              self_user: { tenant_id: 'platform', user_id: 'alice' },
+            },
+            initial: { node_count: 0, chain_group_count: [] },
+          });
+        }
+        throw new Error(`unexpected request ${path}`);
+      }),
+    );
+
+    render(
+      <DirectLogin
+        branding={{ site_name: '我的站点', icon_data_url: null }}
+        credentials={{ uuid: 'user-uuid', token: 'broc_login_token' }}
+        onLogin={onLogin}
+        onUsePassword={vi.fn()}
+      />,
+      { wrapper: wrapper() },
+    );
+
+    await vi.waitFor(() => expect(onLogin).toHaveBeenCalledOnce());
+    expect(requests).toEqual([
+      { path: '/auth/direct-login', body: { uuid: 'user-uuid', token: 'broc_login_token' } },
+      { path: '/bootstrap', body: null },
+    ]);
   });
 });

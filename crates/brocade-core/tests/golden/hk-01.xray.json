@@ -21,6 +21,8 @@
     ]
   },
   "dns": {
+    "serveExpiredTTL": 129600,
+    "serveStale": true,
     "servers": [
       "localhost"
     ]

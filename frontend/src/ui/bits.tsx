@@ -111,7 +111,6 @@ export type LoadingVariant =
   | 'users'
   | 'usage'
   | 'usage-metrics'
-  | 'links'
   | 'settings'
   | 'deploy'
   | 'detail'
@@ -695,6 +694,7 @@ function SkeletonUsers({ detailRoute = false }: { detailRoute?: boolean }) {
           <i />
           <span className="loading-bar" />
         </div>
+        <div className="loading-skeleton-user-filter" />
         {skeletonRange(6).map(row => (
           <div className="loading-skeleton-user-row" key={row}>
             <i className="loading-skeleton-avatar" />
@@ -761,37 +761,6 @@ function SkeletonUsageMetrics() {
           <i className="loading-bar value" />
         </div>
       ))}
-    </div>
-  );
-}
-
-function SkeletonLinks() {
-  return (
-    <div className="loading-skeleton-links">
-      <section className="loading-skeleton-panel loading-skeleton-link-summary">
-        <div className="loading-skeleton-panel-head page-title">
-          <i className="loading-skeleton-title-icon" />
-          <span className="loading-skeleton-title-copy">
-            <i className="loading-bar title" />
-            <i className="loading-bar hint" />
-          </span>
-          <i className="loading-skeleton-head-stat" />
-        </div>
-        <div className="loading-skeleton-overview">
-          {skeletonRange(4).map(metric => (
-            <div key={metric}>
-              <i className="loading-skeleton-title-icon" />
-              <span>
-                <i className="loading-bar" />
-                <i className="loading-bar value" />
-                <i className="loading-bar faint" />
-              </span>
-            </div>
-          ))}
-        </div>
-      </section>
-      <SkeletonFramedPanel kind="chart" />
-      <SkeletonFramedPanel kind="table" />
     </div>
   );
 }
@@ -1211,7 +1180,6 @@ export function Loading({
     'tunnels',
     'users',
     'usage',
-    'links',
     'settings',
     'deploy',
     'detail',
@@ -1295,9 +1263,6 @@ export function Loading({
       break;
     case 'usage-metrics':
       skeleton = <SkeletonUsageMetrics />;
-      break;
-    case 'links':
-      skeleton = <SkeletonLinks />;
       break;
     case 'settings':
       skeleton = <SkeletonSettings />;

@@ -14,7 +14,6 @@ const PANE_LOADERS = {
   usage: () => import('./usage'),
   settings: () => import('./settings'),
   password: () => import('./password'),
-  links: () => import('./links'),
   topo: () => import('../topo/canvas'),
 } as const;
 

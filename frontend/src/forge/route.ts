@@ -46,6 +46,8 @@ interface DrillSpec {
   /* 地址中的该段，同时也是 drill.p 的取值 */
   seg: string;
   fields?: Field[];
+  /* 页面内稳定选择可以放在 hash 的查询段中，不占用资源详情的路径段。 */
+  queryFields?: Field[];
   /* 恢复时补全的、不进入地址的字段（向导的起始步骤） */
   rest?: Drill;
 }
@@ -72,6 +74,7 @@ const DRILL: Partial<Record<NavKey, DrillSpec[]>> = {
     {
       seg: 'vpngate',
       fields: [{ name: 'id', optional: true, pattern: /^vpngate-[0-9a-f]{4}-[0-9a-f]{4}$/ }],
+      queryFields: [{ name: 'country', optional: true, pattern: /^[A-Z]{2}$/ }],
     },
   ],
   /* 单租户阶段用户 id 足以恢复详情，内部归属不进入可见地址。 */
@@ -90,6 +93,7 @@ const specFor = (nav: NavKey, p: unknown): DrillSpec | undefined =>
 export function serialize(loc: Loc): string {
   const parts: string[] = [loc.nav];
   const spec = specFor(loc.nav, loc.drill?.p);
+  const query = new URLSearchParams();
   if (spec && loc.drill) {
     parts.push(spec.seg);
     for (const f of spec.fields ?? []) {
@@ -104,12 +108,27 @@ export function serialize(loc: Loc): string {
       if (f.pattern && !f.pattern.test(raw)) return `#/${loc.nav}`;
       parts.push(encodeURIComponent(raw));
     }
+    for (const f of spec.queryFields ?? []) {
+      const value = loc.drill[f.name];
+      if (value == null) {
+        if (f.optional) continue;
+        return `#/${loc.nav}`;
+      }
+      const raw = String(value);
+      if (f.pattern && !f.pattern.test(raw)) return `#/${loc.nav}`;
+      query.set(f.name, raw);
+    }
   }
-  return `#/${parts.join('/')}`;
+  const suffix = query.size ? `?${query.toString()}` : '';
+  return `#/${parts.join('/')}${suffix}`;
 }
 
 export function parse(hash: string): Loc | null {
-  const parts = hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
+  const body = hash.replace(/^#\/?/, '');
+  const queryStart = body.indexOf('?');
+  const path = queryStart < 0 ? body : body.slice(0, queryStart);
+  const query = new URLSearchParams(queryStart < 0 ? '' : body.slice(queryStart + 1));
+  const parts = path.split('/').filter(Boolean).map(decodeURIComponent);
   const [nav, seg, ...rest] = parts;
   if (!nav || !isNavKey(nav)) return null;
 
@@ -138,6 +157,20 @@ export function parse(hash: string): Loc | null {
     const n = Number(raw);
     drill[f.name] = Number.isFinite(n) ? n : raw;
   });
+  for (const f of spec.queryFields ?? []) {
+    const raw = query.get(f.name);
+    if (raw == null) continue;
+    if (f.pattern && !f.pattern.test(raw)) {
+      valid = false;
+      continue;
+    }
+    if (!f.num) {
+      drill[f.name] = raw;
+      continue;
+    }
+    const n = Number(raw);
+    drill[f.name] = Number.isFinite(n) ? n : raw;
+  }
   if (!valid) return { nav };
   return { nav, drill };
 }
@@ -241,7 +274,13 @@ const cancelPositionSave = () => {
   positionSaveTimer = 0;
 };
 
-const workspaceScroller = (): HTMLElement | null => document.querySelector<HTMLElement>('.fg-desk');
+const workspaceScroller = (): Element | null => {
+  const desk = document.querySelector<HTMLElement>('.fg-desk');
+  if (!desk) return null;
+  // CSS owns the layout mode: touch pages scroll the document, while desktop and topology
+  // retain the workspace viewport. Read the actual layout rather than duplicating its breakpoint.
+  return getComputedStyle(desk).overflowY === 'visible' ? document.scrollingElement : desk;
+};
 
 const rememberCurrentPosition = () => {
   // Do not replace a pending restoration with the outgoing DOM or a partially loaded list.
@@ -249,7 +288,8 @@ const rememberCurrentPosition = () => {
   const previous = positionCache.get(historyIndex) ?? { scrollTop: 0 };
   const scroller = workspaceScroller();
   cachePosition(historyIndex, {
-    scrollTop: scroller?.scrollTop ?? previous.scrollTop,
+    // Safari's elastic overscroll can briefly report a negative document offset.
+    scrollTop: Math.max(0, scroller?.scrollTop ?? previous.scrollTop),
   });
   return true;
 };
@@ -337,7 +377,7 @@ const restoreWorkspacePosition = (state: Pick<RouteHistoryState, 'scrollTop'>) =
 };
 
 const currentWorkspacePosition = (): RoutePosition => ({
-  scrollTop: workspaceScroller()?.scrollTop ?? 0,
+  scrollTop: Math.max(0, workspaceScroller()?.scrollTop ?? 0),
 });
 
 const pushLocation = (hash: string, position: RoutePosition = { scrollTop: 0 }): boolean => {
@@ -364,8 +404,8 @@ function apply(loc: Loc) {
   applying = true;
   try {
     forge.setNav(loc.nav);
-    // 只有支持下钻的页面需要在此写入状态。其他页面（topo / links / 设置等）由外壳的 Work
-    // 自行打开窗口——topo 和 links 不使用 wm，在此为它们创建 `tab:` 窗口时，该窗口不会被
+    // 只有支持下钻的页面需要在此写入状态。其他页面（设置等）由外壳的 Work
+    // 自行打开窗口——topo 不使用 wm，在此为它创建 `tab:` 窗口时，该窗口不会被
     // 渲染（WinLayer 过滤掉 tab: 前缀），但会在布局中长期占用一条记录。
     if (!DRILL[loc.nav]) return;
     // 页面尚未打开时先打开：后退到 `#/nodes/node/hk-01` 时该窗口可能不存在
@@ -498,7 +538,10 @@ export function startRouting(label: (nav: NavKey) => string) {
   document.addEventListener(
     'scroll',
     event => {
-      if (!(event.target instanceof HTMLElement) || !event.target.classList.contains('fg-desk')) return;
+      const scroller = workspaceScroller();
+      if (!scroller) return;
+      const target = scroller === document.scrollingElement ? document : scroller;
+      if (event.target !== target) return;
       recordPosition();
     },
     true,

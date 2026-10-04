@@ -19,6 +19,35 @@ use brocade_core::{
 use ipnet::Ipv4Net;
 
 #[test]
+fn complete_uri_subscription_preserves_all_direct_protocols_and_empty_views() {
+    let mut artifact = subscription::build(&plan(|face| {
+        face.wires = IngressWires::VlessAnyTlsAndHysteria2 {
+            vless: face.wires.vless().unwrap().clone(),
+            anytls: AnyTls::default(),
+            hysteria2: Hysteria2::default(),
+        };
+    }));
+    let content = uri::complete_subscription(&artifact).unwrap();
+    assert_eq!(content, uri::subscription(&artifact));
+    assert_eq!(content.lines().count(), artifact.entries.len());
+    for scheme in ["vless://", "anytls://", "hysteria2://"] {
+        assert!(content.contains(scheme));
+    }
+    assert!(!content.contains("insecure=1"));
+    artifact.mark_self_signed(
+        &[("hk-cert.example.net".to_owned(), "ab".repeat(32))]
+            .into_iter()
+            .collect(),
+    );
+    assert_eq!(
+        uri::complete_subscription(&artifact),
+        Err(uri::UriSubscriptionUnsupported::SelfSignedCertificate)
+    );
+    artifact.entries.clear();
+    assert_eq!(uri::complete_subscription(&artifact).unwrap(), "");
+}
+
+#[test]
 fn uri_skips_front_entries_and_clash_renders_dialer_proxy_group() {
     let mut doc = doc(vec![
         node("hk", "hk.example.net", [10, 66, 0, 1]),
@@ -59,6 +88,10 @@ fn uri_skips_front_entries_and_clash_renders_dialer_proxy_group() {
     let plan = project_user(&[ir], "platform.acme", "alice");
     let artifact = subscription::build(&plan);
     let uri_text = uri::subscription(&artifact);
+    assert_eq!(
+        uri::complete_subscription(&artifact),
+        Err(uri::UriSubscriptionUnsupported::FrontProxy)
+    );
     let clash_text = yaml::clash_subscription(&artifact);
     let haitun_text = yaml::clash_haitun_subscription(&artifact);
 
@@ -1197,6 +1230,10 @@ fn self_signed_anytls_is_hidden_by_default_and_only_insecure_on_explicit_render(
     );
 
     let safe_uri = uri::subscription(&artifact);
+    assert_eq!(
+        uri::complete_subscription(&artifact),
+        Err(uri::UriSubscriptionUnsupported::SelfSignedCertificate)
+    );
     assert!(!safe_uri.contains("anytls://"), "{safe_uri}");
     assert!(safe_uri.contains("自签证书地址默认隐藏"), "{safe_uri}");
     assert!(!safe_uri.contains("insecure=1"), "{safe_uri}");
@@ -1235,6 +1272,10 @@ fn self_signed_vless_uri_is_never_rendered_without_a_portable_trust_field() {
         uri::UriRenderOptions {
             allow_insecure: true,
         },
+    );
+    assert_eq!(
+        uri::complete_subscription(&artifact),
+        Err(uri::UriSubscriptionUnsupported::SelfSignedCertificate)
     );
     assert!(!explicit_uri.contains("vless://"), "{explicit_uri}");
     assert!(explicit_uri.contains("请使用 Clash 订阅"), "{explicit_uri}");

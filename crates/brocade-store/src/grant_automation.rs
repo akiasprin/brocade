@@ -241,6 +241,11 @@ pub async fn process_jobs(pool: &PgPool) -> Result<GrantAutomationOutcome> {
 }
 
 async fn process_jobs_locked(pool: &PgPool) -> Result<GrantAutomationOutcome> {
+    // A deadline controls when to try the queue, not which historical intent may be applied.
+    // Include backed-off rows once any job is due: otherwise a newer edit can finish first and
+    // a delayed older revision can later restore permissions the operator already revoked.
+    // Select the whole batch in one statement snapshot; concurrent commits belong to the next
+    // batch, and the worker lock keeps another instance from consuming any of these rows.
     let rows = sqlx::query(
         "SELECT id,
                 (payload->>'revision_id')::bigint AS revision_id,
@@ -249,7 +254,12 @@ async fn process_jobs_locked(pool: &PgPool) -> Result<GrantAutomationOutcome> {
          FROM jobs
          WHERE kind = $1
            AND status = 'queued'
-           AND run_after <= now()
+           AND EXISTS (
+               SELECT 1 FROM jobs ready
+                WHERE ready.kind = $1
+                  AND ready.status = 'queued'
+                  AND ready.run_after <= now()
+           )
          ORDER BY id",
     )
     .bind(JOB_KIND)
@@ -317,6 +327,18 @@ async fn process_jobs_locked(pool: &PgPool) -> Result<GrantAutomationOutcome> {
         }
     };
 
+    if let Some(active) = prepared.blocked_by {
+        let message = format!("等待授权单 #{active} 落地后再规划");
+        requeue_behind(pool, &job_ids, &message).await?;
+        return Ok(GrantAutomationOutcome {
+            merged_jobs: job_ids.len(),
+            revision_id: Some(revision_id),
+            deployment_id: None,
+            deferred: prepared.deferred,
+            waiting: Some(message),
+        });
+    }
+
     if !prepared.deferred.is_empty() {
         let message = format!(
             "权限与执行中的配置冲突，等待配置：{}",
@@ -370,6 +392,25 @@ async fn reschedule(pool: &PgPool, job_ids: &[i64], error: &str) -> Result<()> {
     .bind(job_ids)
     .bind(RETRY_INTERVAL)
     .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Put jobs back behind an unsettled grants deployment. That is ordering, not a failed attempt:
+/// `attempts` stays unchanged, so the status reads "pending" rather than "retrying".
+async fn requeue_behind(pool: &PgPool, job_ids: &[i64], reason: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE jobs
+         SET status = 'queued',
+             run_after = now() + $2::interval,
+             last_error = $3,
+             updated_at = now()
+         WHERE id = ANY($1)",
+    )
+    .bind(job_ids)
+    .bind(RETRY_INTERVAL)
+    .bind(reason)
     .execute(pool)
     .await?;
     Ok(())

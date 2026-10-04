@@ -6,12 +6,10 @@ import (
 	gotls "crypto/tls"
 	"encoding/base64"
 	"io"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/app/reverse"
@@ -80,6 +78,7 @@ type Handler struct {
 	inboundHandlerManager  feature_inbound.Manager
 	policyManager          policy.Manager
 	stats                  stats.Manager
+	visionStats            *visionStats
 	validator              vless.Validator
 	decryption             *encryption.ServerInstance
 	outboundHandlerManager outbound.Manager
@@ -103,6 +102,7 @@ func New(ctx context.Context, config *Config, dc dns.Client, validator vless.Val
 		defaultDispatcher:      v.GetFeature(routing.DispatcherType()).(routing.Dispatcher),
 		ctx:                    ctx,
 	}
+	handler.visionStats = newVisionStats(handler.stats)
 
 	if config.Decryption != "" && config.Decryption != "none" {
 		s := strings.Split(config.Decryption, ".")
@@ -578,44 +578,51 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	switch requestAddons.Flow {
 	case vless.XRV:
 		if account.Flow == requestAddons.Flow {
-			inbound.CanSpliceCopy = 2
+			inbound.SpliceMetrics = h.visionStats.newTracker()
+			if inbound.SpliceMetrics != nil {
+				defer inbound.SpliceMetrics.Finish()
+			}
+			inbound.CanSpliceCopy.Store(session.SpliceCopyWaiting)
 			switch request.Command {
 			case protocol.RequestCommandUDP:
+				proxy.SetSpliceNotUsedReason(inbound, session.SpliceNotUsedUnsupportedCommand)
 				return errors.New(requestAddons.Flow + " doesn't support UDP").AtWarning()
 			case protocol.RequestCommandMux, protocol.RequestCommandRvs:
-				inbound.CanSpliceCopy = 3
+				inbound.CanSpliceCopy.Store(session.SpliceCopyDisabled)
+				proxy.SetSpliceNotUsedReason(inbound, session.SpliceNotUsedUnsupportedCommand)
 				fallthrough // we will break Mux connections that contain TCP requests
 			case protocol.RequestCommandTCP:
-				var t reflect.Type
-				var p uintptr
+				var visionConn net.Conn
 				if commonConn, ok := connection.(*encryption.CommonConn); ok {
 					if _, ok := commonConn.Conn.(*encryption.XorConn); ok || !proxy.IsRAWTransportWithoutSecurity(iConn) {
-						inbound.CanSpliceCopy = 3 // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
+						inbound.CanSpliceCopy.Store(session.SpliceCopyDisabled) // full-random xorConn / non-RAW transport / another securityConn should not be penetrated
+						proxy.SetSpliceNotUsedReason(inbound, session.SpliceNotUsedUnsupportedTransport)
 					}
-					t = reflect.TypeOf(commonConn).Elem()
-					p = uintptr(unsafe.Pointer(commonConn))
+					visionConn = commonConn
 				} else if tlsConn, ok := iConn.(*tls.Conn); ok {
 					if tlsConn.ConnectionState().Version != gotls.VersionTLS13 {
+						proxy.SetSpliceNotUsedReason(inbound, session.SpliceNotUsedOuterTLSNot13)
 						return errors.New(`failed to use `+requestAddons.Flow+`, found outer tls version `, tlsConn.ConnectionState().Version).AtWarning()
 					}
-					t = reflect.TypeOf(tlsConn.Conn).Elem()
-					p = uintptr(unsafe.Pointer(tlsConn.Conn))
+					visionConn = tlsConn
 				} else if realityConn, ok := iConn.(*reality.Conn); ok {
-					t = reflect.TypeOf(realityConn.Conn).Elem()
-					p = uintptr(unsafe.Pointer(realityConn.Conn))
+					visionConn = realityConn
 				} else {
+					proxy.SetSpliceNotUsedReason(inbound, session.SpliceNotUsedUnsupportedTransport)
 					return errors.New("XTLS only supports TLS and REALITY directly for now.").AtWarning()
 				}
-				i, _ := t.FieldByName("input")
-				r, _ := t.FieldByName("rawInput")
-				input = (*bytes.Reader)(unsafe.Pointer(p + i.Offset))
-				rawInput = (*bytes.Buffer)(unsafe.Pointer(p + r.Offset))
+				var ok bool
+				input, rawInput, ok = proxy.VisionBuffers(visionConn)
+				if !ok {
+					proxy.SetSpliceNotUsedReason(inbound, session.SpliceNotUsedUnsupportedTransport)
+					return errors.New("XTLS transport does not expose buffered input").AtWarning()
+				}
 			}
 		} else {
 			return errors.New("account " + account.ID.String() + " is not able to use the flow " + requestAddons.Flow).AtWarning()
 		}
 	case "":
-		inbound.CanSpliceCopy = 3
+		inbound.CanSpliceCopy.Store(session.SpliceCopyDisabled)
 		if account.Flow == vless.XRV && (request.Command == protocol.RequestCommandTCP || isMuxAndNotXUDP(request, first)) {
 			return errors.New("account " + account.ID.String() + " is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters.").AtWarning()
 		}

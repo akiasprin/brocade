@@ -9,7 +9,7 @@ const shell = readFileSync(new URL('../src/forge/shell.tsx', import.meta.url), '
 test('手机端菜单留在视口内并允许纵向滚动', () => {
   assert.match(
     styles,
-    /@media \(max-width: 820px\)[\s\S]*?\.fg-menu\s*\{[\s\S]*?max-width:\s*calc\(100vw - 16px\);[\s\S]*?max-height:\s*calc\(100dvh - 60px\);[\s\S]*?overflow-y:\s*auto;/,
+    /@media \(max-width: 820px\)[\s\S]*?\.fg-menu\s*\{[\s\S]*?max-width:\s*calc\(100vw - 16px\);[\s\S]*?max-height:\s*calc\(100dvh - 60px - var\(--safe-top\) - var\(--safe-bottom\)\);[\s\S]*?overflow-y:\s*auto;/,
   );
   assert.match(
     styles,
@@ -40,6 +40,14 @@ test('手机端不渲染桌面面包屑或额外返回条', () => {
   assert.match(shell, /\{!narrow && \(\s*<div className="fg-crumb">/);
   assert.doesNotMatch(shell, /ForgeMobileBack|fg-mobile-crumb/);
   assert.doesNotMatch(styles, /\.fg-mobile-crumb/);
+});
+
+test('手机端导航栏与内容面板保留呼吸距离', () => {
+  assert.match(styles, /@media \(max-width: 820px\)[\s\S]*?\.fg-sheet\s*\{[\s\S]*?margin:\s*12px 8px;/);
+  assert.match(
+    styles,
+    /\.nd-sheet,\s*\.cardpage,\s*\.loading-state\.loading-page\.sheeted:is\(\.loading-nodes, \.loading-detail\)\s*\{\s*margin:\s*12px 8px;/,
+  );
 });
 
 test('手机端机器详情页签沿用页头底色，不额外切出一层背景', () => {
@@ -91,7 +99,7 @@ test('用户 UUID 使用带状态反馈的紧凑复制按钮', () => {
 test('手机端图表和拓扑操作不会把关键控件推出屏幕', () => {
   assert.match(
     styles,
-    /\.usage-page,\s*\.link-page\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);[\s\S]*?min-width:\s*0;[\s\S]*?\.usage-page > \*,\s*\.link-page > \*\s*\{[\s\S]*?min-width:\s*0;/,
+    /\.usage-page\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);[\s\S]*?min-width:\s*0;[\s\S]*?\.usage-page > \*\s*\{[\s\S]*?min-width:\s*0;/,
   );
   assert.match(
     styles,
@@ -108,7 +116,7 @@ test('手机端图表和拓扑操作不会把关键控件推出屏幕', () => {
 });
 
 test('页面内容容器不会通过动画变换成为固定弹窗的包含块', () => {
-  const viewRule = styles.match(/\.fg-view\s*\{[^}]+\}/)?.[0] ?? '';
+  const viewRule = [...styles.matchAll(/\.fg-view\s*\{[^}]+\}/g)].map(([rule]) => rule).join('\n');
   assert.match(viewRule, /display:\s*flow-root/);
   assert.doesNotMatch(viewRule, /animation|transform/);
   assert.doesNotMatch(styles, /motion-page-in|\.fg-topo\s*\{[^}]*animation/s);

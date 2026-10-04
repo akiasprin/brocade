@@ -10,6 +10,13 @@ test('machine-card latency stays neutral when a probe sample is stale', () => {
   assert.doesNotMatch(styles, /\.nc-tcp-latest\.stale\s*\{[^}]*color:/s);
 });
 
+test('machine-card primary packet loss stays neutral without an IPv6 loss badge', () => {
+  assert.match(styles, /\.nc-tcp-latest \.lost\s*\{[^}]*color: var\(--ink-4\);/s);
+  assert.doesNotMatch(styles, /\.nc-tcp-latest \.lost\s*\{[^}]*color: var\(--err\);/s);
+  assert.doesNotMatch(styles, /\.nc-tcp-latest \.v6\s*\{/s);
+  assert.doesNotMatch(nodes, /className="v6"/);
+});
+
 test('machine-card status, region and name use one consistent gap', () => {
   assert.match(styles, /\.nc-status-slot\s*\{[^}]*margin-right: 9px;/s);
   assert.match(styles, /\.nc-region-flag\s*\{[^}]*margin-right: 9px;/s);

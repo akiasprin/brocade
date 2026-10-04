@@ -165,7 +165,6 @@ describe('发布计划审阅', () => {
 
     // 页头、底部状态结论与主操作分别保留一次，和评审稿的连续单据结构一致。
     expect(view.getAllByText('创建变更单')).toHaveLength(3);
-    expect(view.getByText('运行基线')).toBeTruthy();
     expect(view.getByText('变更机器')).toBeTruthy();
     expect(view.getByText('执行计划')).toBeTruthy();
     expect(view.getByText('更新机器配置')).toBeTruthy();
@@ -173,7 +172,7 @@ describe('发布计划审阅', () => {
     expect(view.getAllByText('全量发布')).toHaveLength(1);
     expect(view.getByText('步骤 1/2')).toBeTruthy();
     expect(view.getByText('步骤 2/2')).toBeTruthy();
-    expect(view.getByText('产物差异')).toBeTruthy();
+    expect(view.getByText('产物差异').closest('details')?.open).toBe(false);
     expect(view.getAllByText(/更新 Xray/)).toHaveLength(3);
     expect(view.queryByText('apply-xray')).toBeNull();
     expect(view.queryByText(/^波次 /)).toBeNull();
@@ -266,6 +265,7 @@ describe('发布计划审阅', () => {
     expect(view.getByText('步骤 1/2')).toBeTruthy();
     expect(view.getByText('步骤 2/2')).toBeTruthy();
     expect(view.getByRole('button', { name: '更新香港入口 B' })).toBeTruthy();
+    expect(view.getByText('R11 → R12 · 4 台机器')).toBeTruthy();
     expect(view.queryByText(/^波次 /)).toBeNull();
   });
 });

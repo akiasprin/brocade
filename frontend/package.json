@@ -12,7 +12,8 @@
     "test": "npm run test:unit && npm run test:ports && npm run test:routes && npm run test:react",
     "test:unit": "node --test tests/*.test.mjs",
     "test:ports": "node scripts/ports-check.mjs",
-    "test:routes": "node scripts/route-check.mjs && node scripts/route-drive.mjs",
+    "test:browser-appearance": "node --test scripts/browser-appearance-check.mjs",
+    "test:routes": "node scripts/route-check.mjs && node scripts/route-drive.mjs && node scripts/route-drive.mjs --document-scroll",
     "test:react": "tsc --noEmit -p tsconfig.test.json && vitest run --config vitest.config.ts",
     "format": "prettier --write src",
     "format:check": "prettier --check src"

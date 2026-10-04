@@ -37,16 +37,17 @@ test('窄屏不重复显示面包屑，进入新页面后焦点仍落在主内�
   assert.match(shell, /role="main" aria-label=\{`\$\{LABEL\[nav\]\}内容`\} tabIndex=\{-1\}/);
 });
 
-test('普通页面顶栏随唯一的工作区滚动容器滚动', () => {
+test('桌面普通页面顶栏随唯一的工作区滚动容器滚动', () => {
   assert.match(shell, /<div className=\{`fg-desk\$\{nav === 'topo' \? ' is-topo' : ''\}`\}>\s*<TopBar/);
   assert.equal((shell.match(/<TopBar/g) ?? []).length, 1);
   assert.match(styles, /\.fg-desk\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;[^}]*overflow:\s*auto;/s);
   assert.match(styles, /\.fg-desk\s*\{[^}]*background:\s*var\(--surface\);/s);
-  assert.doesNotMatch(styles, /\.fg-desk\s*\{[^}]*background-image:\s*var\(--grid-image\)/s);
+  assert.doesNotMatch(styles, /\.fg-desk\s*\{[^}]*background-image:/s);
   assert.match(styles, /\.fg-desk\.is-topo\s*\{[^}]*overflow:\s*hidden;/s);
+  assert.match(styles, /\.fg-desk > \.fg-view\s*\{[^}]*position:\s*relative;[^}]*flex:\s*1 0 auto;/s);
   assert.match(
     styles,
-    /\.fg-desk > \.fg-view\s*\{[^}]*flex:\s*1 0 auto;[^}]*background-color:\s*var\(--ground\);[^}]*background-image:\s*var\(--grid-image\)/s,
+    /#stage,\s*\.topo-deck,\s*\.loading-skeleton-canvas,\s*\.fg-desk > \.fg-view\s*\{[^}]*isolation:\s*isolate;[^}]*background-color:\s*var\(--ground\);/s,
   );
   assert.doesNotMatch(styles, /\.fg-top\s*\{[^}]*position:\s*(?:fixed|sticky)/s);
   assert.doesNotMatch(styles, /\.fg-top::before/);
@@ -80,8 +81,9 @@ test('纳管完成后去发布只执行一次跨页面导航', () => {
   assert.doesNotMatch(previewProvision, /navigate\('deploy',[\s\S]{0,160}go\(\{ p: 'list' \}\)/);
 });
 
-test('用户主从页桌面原位切换，窄屏进入独立详情', () => {
-  assert.match(users, /narrow \? navigate\('users', d\) : navigateInPlace\('users', d\)/);
+test('用户选择在桌面与窄屏都回到顶部，不继承上一用户的滚动位置', () => {
+  assert.match(users, /const go = \(d: Drill\) => navigate\('users', d\)/);
+  assert.doesNotMatch(users, /navigateInPlace/);
   assert.match(users, /user-detail-route/);
   assert.match(styles, /@media \(max-width: 820px\)[\s\S]*\.user-split\.user-detail-route > \.user-split-roster/);
 });

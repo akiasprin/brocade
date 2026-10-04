@@ -83,6 +83,11 @@ trip(
 );
 trip('VPN Gate 总页进入浏览器历史', { nav: 'tunnels', drill: { p: 'vpngate' } }, '#/tunnels/vpngate');
 trip(
+  'VPN Gate 国家选择进入浏览器历史',
+  { nav: 'tunnels', drill: { p: 'vpngate', country: 'VN' } },
+  '#/tunnels/vpngate?country=VN',
+);
+trip(
   'VPN Gate 资源进入浏览器历史',
   { nav: 'tunnels', drill: { p: 'vpngate', id: 'vpngate-8f3a-2d71' } },
   '#/tunnels/vpngate/vpngate-8f3a-2d71',
@@ -118,6 +123,7 @@ trip(
 );
 console.log('\n— 坏地址不许炸出坏状态 —');
 reads('不认识的面', '#/nonsense', null);
+reads('已移除的链路与 MTU 页面不可路由', '#/links', null);
 reads('空地址', '#/', null);
 reads('什么都没有', '', null);
 reads('不认识的下钻', '#/nodes/bogus', { nav: 'nodes' });

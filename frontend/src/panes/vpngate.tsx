@@ -20,6 +20,7 @@ import {
   startVpngateSync,
   updateVpngateCatalogSettings,
   updateVpngateProbeNode,
+  updateVpngateProbeSettings,
   type NodeAgentStateItem,
   type SnapshotApp,
   type VpngateCatalogStatus,
@@ -250,7 +251,15 @@ function catalogueState(status: VpngateCatalogStatus) {
   return { label: '目录正常', tone: '' };
 }
 
-export function VpngatePage({ initialPool }: { initialPool?: VpngateOutbound }) {
+export function VpngatePage({
+  initialPool,
+  countryCode: controlledCountryCode,
+  onCountryChange,
+}: {
+  initialPool?: VpngateOutbound;
+  countryCode?: string;
+  onCountryChange?: (countryCode: string) => void;
+}) {
   const { who } = useSession();
   const queryClient = useQueryClient();
   const systemAdmin = who.role === 'system-admin';
@@ -306,6 +315,7 @@ export function VpngatePage({ initialPool }: { initialPool?: VpngateOutbound }) 
     [countries],
   );
   const countryCode =
+    (controlledCountryCode && isSelectableVpngateRegion(controlledCountryCode) ? controlledCountryCode : '') ||
     countryChoice ||
     (initialPool && isSelectableVpngateRegion(initialPool.protocol.v.country_code)
       ? initialPool.protocol.v.country_code
@@ -320,6 +330,7 @@ export function VpngatePage({ initialPool }: { initialPool?: VpngateOutbound }) 
     retry: false,
     staleTime: 30_000,
     refetchInterval: 60_000,
+    placeholderData: previous => previous,
   });
   const sync = useMutation({
     mutationFn: startVpngateSync,
@@ -421,7 +432,7 @@ export function VpngatePage({ initialPool }: { initialPool?: VpngateOutbound }) 
                     search={countrySearch}
                     pending={overview.isPending}
                     onSearch={setCountrySearch}
-                    onCountry={setCountryChoice}
+                    onCountry={onCountryChange ?? setCountryChoice}
                   />
                   <CountrySummary country={country} countryCode={countryCode} pending={overview.isPending} />
                 </div>
@@ -432,7 +443,7 @@ export function VpngatePage({ initialPool }: { initialPool?: VpngateOutbound }) 
                   pools={referencedPools}
                   poolsPending={snapshot.isPending}
                   servers={runtimeServers.data?.items ?? []}
-                  serversPending={runtimeServers.isPending}
+                  serversPending={runtimeServers.isFetching}
                   runtimes={selectedRuntimes}
                   runtimesPending={runtimes.isPending}
                   runtimesError={runtimes.error}
@@ -736,7 +747,7 @@ function CountryWorkspace({
             </b>
           </span>
         </header>
-        <CandidateTable key={countryCode} countryCode={countryCode} searchEnabled={directorySearchEnabled} />
+        <CandidateTable countryCode={countryCode} searchEnabled={directorySearchEnabled} />
       </section>
     </div>
   );
@@ -956,12 +967,63 @@ function RuntimeCard({
   );
 }
 
+function candidateProbeState(server: VpngateServerView, nowUnixSecs = Math.floor(Date.now() / 1000)) {
+  const failures = server.consecutive_probe_failures ?? 0;
+  const eligibility = server.probe_eligible_until_unix_secs;
+  const reviewExpired = failures > 0 && failures < 3 && eligibility != null && eligibility < nowUnixSecs;
+  if (failures >= 3 || reviewExpired) {
+    return {
+      tone: 'bad',
+      badge: '暂停候选',
+      heading: '已暂停',
+      detail: reviewExpired
+        ? `${server.latest_error_code ?? '拨测失败'} · 20 分钟复核窗口已结束，等待一次成功恢复`
+        : `${server.latest_error_code ?? '拨测失败'} · 连续 3 次失败，等待一次成功恢复`,
+    };
+  }
+  if (failures > 0) {
+    return {
+      tone: 'warn',
+      badge: `复核 ${failures}/3`,
+      heading: `复核 ${failures}/3`,
+      detail:
+        eligibility == null
+          ? `${server.latest_error_code ?? '拨测失败'} · 尚无成功资格`
+          : `${server.latest_error_code ?? '拨测失败'} · 复核窗口至 ${dateTime(eligibility)}`,
+    };
+  }
+  return null;
+}
+
+function candidateBadge(server: VpngateServerView, probeState = candidateProbeState(server)) {
+  // Suspended candidates already explain their state and recovery condition in the evidence
+  // column. Repeating it as a host badge crowds the identity column without adding information.
+  if (probeState?.tone === 'bad') return null;
+  if (server.candidate_rank == null) return probeState;
+  const rank = `${server.active ? '候选' : '候补'} #${server.candidate_rank}`;
+  const layer = server.pareto_layer != null ? ` · L${server.pareto_layer}` : '';
+  return {
+    ...probeState,
+    tone: probeState?.tone ?? '',
+    badge: `${rank}${probeState ? ' · 复核' : layer}`,
+  };
+}
+
 function CandidateTable({ countryCode, searchEnabled }: { countryCode: string; searchEnabled: boolean }) {
+  const [stateCountryCode, setStateCountryCode] = useState(countryCode);
   const [search, setSearch] = useState('');
   const [querySearch, setQuerySearch] = useState('');
   const [filter, setFilter] = useState<VpngateDirectoryFilter>('all');
   const [sort, setSort] = useState<VpngateDirectorySort>('candidate');
   const [page, setPage] = useState(1);
+  if (stateCountryCode !== countryCode) {
+    setStateCountryCode(countryCode);
+    setSearch('');
+    setQuerySearch('');
+    setFilter('all');
+    setSort('candidate');
+    setPage(1);
+  }
   useEffect(() => {
     const timer = window.setTimeout(() => setQuerySearch(search.trim()), 250);
     return () => window.clearTimeout(timer);
@@ -1007,7 +1069,7 @@ function CandidateTable({ countryCode, searchEnabled }: { countryCode: string; s
     );
   }
   return (
-    <div className="vpngate-directory-table">
+    <div className="vpngate-directory-table" aria-busy={directory.isFetching || undefined}>
       <div className="vpngate-directory-tools">
         <input
           className="f"
@@ -1035,6 +1097,8 @@ function CandidateTable({ countryCode, searchEnabled }: { countryCode: string; s
           <option value="candidate">候选节点</option>
           <option value="successful">有成功样本</option>
           <option value="failed">最近失败</option>
+          <option value="reviewing">优先复核中</option>
+          <option value="suspended">已暂停候选</option>
           <option value="pending">等待拨测</option>
           <option value="current">当前目录</option>
           <option value="retained">历史保留</option>
@@ -1109,70 +1173,75 @@ function CandidateTable({ countryCode, searchEnabled }: { countryCode: string; s
               </tr>
             </thead>
             <tbody>
-              {servers.map((server, index) => (
-                // Readonly responses intentionally collapse provider hostnames to the same masked
-                // value. Keep the server-side order in the key so every evidence row still renders.
-                <tr key={`${server.id}/${pageStart + index}`} className={server.active ? 'active' : ''}>
-                  <td className="vpngate-host">
-                    <b>{server.hostname}</b>
-                    <small className="mono">{server.ip}</small>
-                    {server.candidate_rank != null && (
-                      <span className="st">
-                        {server.active ? '候选' : '候补'} #{server.candidate_rank}
-                        {server.pareto_layer != null ? ` · L${server.pareto_layer}` : ''}
-                      </span>
-                    )}
-                  </td>
-                  <td className="vpngate-metric-cell">
-                    <span>{rate(server.catalog_speed_bps)}</span>
-                    <small>{server.ping_ms == null ? '延迟 —' : `延迟 ${server.ping_ms} ms`}</small>
-                  </td>
-                  <td className="num">{server.vpn_sessions}</td>
-                  <td className="vpngate-metric-cell">
-                    <span>{rate(server.global_download_bps)}</span>
-                    <small>
-                      {server.global_connect_ms == null ? '全局建连 —' : `全局建连 ${server.global_connect_ms} ms`}
-                    </small>
-                  </td>
-                  <td className="vpngate-risk-cell">
-                    <IpScores scores={server.latest_ip_scores} />
-                    <IntelligenceAge
-                      verifiedAt={server.intelligence_verified_at_unix_secs}
-                      stale={server.intelligence_stale}
-                      historical={server.latest_probe_status === 'failed'}
-                    />
-                  </td>
-                  <td>
-                    <IpNetwork networks={server.latest_ip_networks} />
-                  </td>
-                  <td className="vpngate-exit-cell">
-                    <span className="mono">{server.latest_exit_ip ?? '—'}</span>
-                    <small>
-                      {server.latest_ip_scores.length
-                        ? [
-                            ...new Set(
-                              server.latest_ip_scores
-                                .map(score => score.country_code)
-                                .filter(countryCode => countryCode.length === 2),
-                            ),
-                          ]
-                            .map(vpngateRegionName)
-                            .join(' / ')
-                        : '未验证'}
-                    </small>
-                  </td>
-                  <td className="vpngate-evidence-cell">
-                    <b>{server.successful_samples}</b>
-                    <small>
-                      {server.latest_probe_status === 'failed'
-                        ? `${server.latest_error_code ?? '拨测失败'} · 上次成功 ${dateTime(
-                            server.latest_successful_probed_at_unix_secs,
-                          )}`
-                        : `${server.measured_nodes} 台机器 · ${dateTime(server.latest_probed_at_unix_secs)}`}
-                    </small>
-                  </td>
-                </tr>
-              ))}
+              {servers.map((server, index) => {
+                const probeState = candidateProbeState(server);
+                const badge = candidateBadge(server, probeState);
+                return (
+                  // Readonly responses intentionally collapse provider hostnames to the same masked
+                  // value. Keep the server-side order in the key so every evidence row still renders.
+                  <tr key={`${server.id}/${pageStart + index}`} className={server.active ? 'active' : ''}>
+                    <td className="vpngate-host">
+                      <b>{server.hostname}</b>
+                      <small className="mono">{server.ip}</small>
+                      {badge && (
+                        <span className={`st ${badge.tone}`} title={probeState?.detail}>
+                          {badge.badge}
+                        </span>
+                      )}
+                    </td>
+                    <td className="vpngate-metric-cell">
+                      <span>{rate(server.catalog_speed_bps)}</span>
+                      <small>{server.ping_ms == null ? '延迟 —' : `延迟 ${server.ping_ms} ms`}</small>
+                    </td>
+                    <td className="num">{server.vpn_sessions}</td>
+                    <td className="vpngate-metric-cell">
+                      <span>{rate(server.global_download_bps)}</span>
+                      <small>
+                        {server.global_connect_ms == null ? '全局建连 —' : `全局建连 ${server.global_connect_ms} ms`}
+                      </small>
+                    </td>
+                    <td className="vpngate-risk-cell">
+                      <IpScores scores={server.latest_ip_scores} />
+                      <IntelligenceAge
+                        verifiedAt={server.intelligence_verified_at_unix_secs}
+                        stale={server.intelligence_stale}
+                        historical={server.latest_probe_status === 'failed'}
+                      />
+                    </td>
+                    <td>
+                      <IpNetwork networks={server.latest_ip_networks} />
+                    </td>
+                    <td className="vpngate-exit-cell">
+                      <span className="mono">{server.latest_exit_ip ?? '—'}</span>
+                      <small>
+                        {server.latest_ip_scores.length
+                          ? [
+                              ...new Set(
+                                server.latest_ip_scores
+                                  .map(score => score.country_code)
+                                  .filter(countryCode => countryCode.length === 2),
+                              ),
+                            ]
+                              .map(vpngateRegionName)
+                              .join(' / ')
+                          : '未验证'}
+                      </small>
+                    </td>
+                    <td className="vpngate-evidence-cell">
+                      <b>{probeState?.heading ?? server.successful_samples}</b>
+                      <small>
+                        {probeState
+                          ? probeState.detail
+                          : server.latest_probe_status === 'failed'
+                            ? `${server.latest_error_code ?? '拨测失败'} · 上次成功 ${dateTime(
+                                server.latest_successful_probed_at_unix_secs,
+                              )}`
+                            : `${server.measured_nodes} 台机器 · ${dateTime(server.latest_probed_at_unix_secs)}`}
+                      </small>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -1220,11 +1289,13 @@ function CandidateTable({ countryCode, searchEnabled }: { countryCode: string; s
 }
 
 function VpngateCapabilityPanel({
+  status,
   nodes,
   pending,
   error,
   systemAdmin,
 }: {
+  status: VpngateCatalogStatus;
   nodes: NodeAgentStateItem[];
   pending: boolean;
   error: unknown;
@@ -1232,6 +1303,40 @@ function VpngateCapabilityPanel({
 }) {
   const queryClient = useQueryClient();
   const [showUnavailable, setShowUnavailable] = useState(false);
+  const connectivityCooldownSecs = status.probe_success_cooldown_secs ?? 30 * 60;
+  const performanceCooldownSecs = status.probe_performance_cooldown_secs ?? 6 * 60 * 60;
+  const shardRotationSecs = status.probe_shard_rotation_secs ?? 6 * 60 * 60;
+  const { form: scheduleForm, setForm: setScheduleForm } = useServerForm({
+    connectivityCooldownMinutes: String(connectivityCooldownSecs / 60),
+    performanceCooldownHours: String(performanceCooldownSecs / 3600),
+    shardRotationHours: String(shardRotationSecs / 3600),
+  });
+  const submittedConnectivityCooldownSecs = Number(scheduleForm.connectivityCooldownMinutes) * 60;
+  const submittedPerformanceCooldownSecs = Number(scheduleForm.performanceCooldownHours) * 3600;
+  const submittedShardRotationSecs = Number(scheduleForm.shardRotationHours) * 3600;
+  const scheduleValid =
+    Number.isInteger(Number(scheduleForm.connectivityCooldownMinutes)) &&
+    submittedConnectivityCooldownSecs >= 60 &&
+    submittedConnectivityCooldownSecs <= 86_400 &&
+    Number.isInteger(Number(scheduleForm.performanceCooldownHours)) &&
+    submittedPerformanceCooldownSecs >= 3_600 &&
+    submittedPerformanceCooldownSecs <= 604_800 &&
+    Number.isInteger(Number(scheduleForm.shardRotationHours)) &&
+    submittedShardRotationSecs >= 3_600 &&
+    submittedShardRotationSecs <= 604_800;
+  const scheduleDirty =
+    submittedConnectivityCooldownSecs !== connectivityCooldownSecs ||
+    submittedPerformanceCooldownSecs !== performanceCooldownSecs ||
+    submittedShardRotationSecs !== shardRotationSecs;
+  const schedule = useMutation({
+    mutationFn: () =>
+      updateVpngateProbeSettings({
+        success_cooldown_secs: submittedConnectivityCooldownSecs,
+        performance_cooldown_secs: submittedPerformanceCooldownSecs,
+        shard_rotation_secs: submittedShardRotationSecs,
+      }),
+    onSuccess: async () => queryClient.invalidateQueries({ queryKey: ['vpngate'] }),
+  });
   const selection = useMutation({
     mutationFn: ({ nodeId, enabled, workers }: { nodeId: string; enabled: boolean; workers: number }) =>
       updateVpngateProbeNode(nodeId, enabled, workers),
@@ -1314,6 +1419,87 @@ function VpngateCapabilityPanel({
         <p className="vpngate-collection-scope-note">
           这里只选择执行 VPN Gate OpenVPN 目录拨测的机器，与设置中的情报执行 Agent 独立。
         </p>
+        <section className="vpngate-probe-policy" aria-label="目录拨测策略">
+          <div className="vpngate-probe-policy-copy">
+            <b>拨测调度</b>
+            <span>连通性与单流性能分开调度；不打断当前批次，下一轮领取任务时生效</span>
+          </div>
+          <div className="vpngate-probe-policy-controls">
+            <label>
+              <span>连通性复测</span>
+              <span className="vpngate-probe-policy-field">
+                <input
+                  className="f"
+                  type="number"
+                  min="1"
+                  max="1440"
+                  step="1"
+                  inputMode="numeric"
+                  aria-label="连通性复测间隔（分钟）"
+                  value={scheduleForm.connectivityCooldownMinutes}
+                  disabled={!systemAdmin || schedule.isPending}
+                  onChange={event =>
+                    setScheduleForm(current => ({ ...current, connectivityCooldownMinutes: event.target.value }))
+                  }
+                />
+                分钟
+              </span>
+            </label>
+            <label>
+              <span>单流性能复测</span>
+              <span className="vpngate-probe-policy-field">
+                <input
+                  className="f"
+                  type="number"
+                  min="1"
+                  max="168"
+                  step="1"
+                  inputMode="numeric"
+                  aria-label="单流性能复测间隔（小时）"
+                  value={scheduleForm.performanceCooldownHours}
+                  disabled={!systemAdmin || schedule.isPending}
+                  onChange={event =>
+                    setScheduleForm(current => ({ ...current, performanceCooldownHours: event.target.value }))
+                  }
+                />
+                小时
+              </span>
+            </label>
+            <label>
+              <span>节点轮转</span>
+              <span className="vpngate-probe-policy-field">
+                <input
+                  className="f"
+                  type="number"
+                  min="1"
+                  max="168"
+                  step="1"
+                  inputMode="numeric"
+                  aria-label="拨测节点轮转周期（小时）"
+                  value={scheduleForm.shardRotationHours}
+                  disabled={!systemAdmin || schedule.isPending}
+                  onChange={event =>
+                    setScheduleForm(current => ({ ...current, shardRotationHours: event.target.value }))
+                  }
+                />
+                小时
+              </span>
+            </label>
+            <span className="vpngate-probe-policy-commit">
+              {schedule.isSuccess && !scheduleDirty && <span className="vpngate-collection-saved">已保存</span>}
+              <button
+                className="btn primary"
+                type="button"
+                aria-label="保存目录拨测设置"
+                disabled={!systemAdmin || !scheduleValid || !scheduleDirty || schedule.isPending}
+                onClick={() => schedule.mutate()}
+              >
+                {schedule.isPending ? '保存中…' : '保存'}
+              </button>
+            </span>
+          </div>
+          {schedule.error && <ErrorBox error={schedule.error} />}
+        </section>
         {pending ? (
           <p className="vpngate-empty">
             <FieldLoading />
@@ -1677,7 +1863,13 @@ function CollectionPanel({
           {save.error && <ErrorBox error={save.error} />}
         </section>
 
-        <VpngateCapabilityPanel nodes={nodes} pending={nodesPending} error={nodesError} systemAdmin={systemAdmin} />
+        <VpngateCapabilityPanel
+          status={status}
+          nodes={nodes}
+          pending={nodesPending}
+          error={nodesError}
+          systemAdmin={systemAdmin}
+        />
       </div>
     </section>
   );

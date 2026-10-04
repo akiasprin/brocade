@@ -1,5 +1,13 @@
-import { Fragment, useEffect, useState, useSyncExternalStore, type ReactNode } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+  Fragment,
+  useEffect,
+  useId,
+  useState,
+  useSyncExternalStore,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+} from 'react';
+import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query';
 import {
   discardPendingChanges,
   cancelDeployment,
@@ -19,18 +27,31 @@ import {
   type ArtifactIndexEntry,
   type DeploymentListItem,
   type DeploymentTargetDetail,
+  type NodeAgentStateItem,
   type PlannedAction,
   type PlannedTarget,
+  type RevisionList,
   type RevisionListItem,
 } from '../api';
 import { draft } from '../draft';
-import { AgentReleaseSection, useAgentSummary, type AgentSummary } from './agent-release';
-import { XrayReleaseSection, useXraySummary, type XraySummary } from './xray-release';
+import { AgentReleaseTab, agentBadge, useAgentRelease } from './agent-release';
+import { XrayReleaseTab, useXrayRelease, xrayBadge } from './xray-release';
+import { FlagRun, ReleaseLedger, stamp } from './deploy-cockpit';
 import { entryId, useRevisionDiff } from '../forge/artifacts';
 import { artifactFile, artifactFmt, countChanges, diffLines, highlight } from '../forge/diff';
 import { can, useSession } from '../session';
-import { Ago, Confirm, Empty, ErrorBox, Loading, STATUS_TEXT, Status, type LoadingVariant } from '../ui/bits';
-import { Icon, ListIcon, PanelTitle, type IconName } from '../ui/icons';
+import {
+  Ago,
+  Confirm,
+  Empty,
+  ErrorBox,
+  Loading,
+  STATUS_TEXT,
+  SegmentedControl,
+  Status,
+  type LoadingVariant,
+} from '../ui/bits';
+import { Icon, PanelTitle, type IconName } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
 import { randomKey } from '../ui/platform';
 import { wm, type CrumbSeg, type Win } from '../wm/store';
@@ -227,13 +248,8 @@ export function DeployPane({ win }: { win: Win }) {
   // 切换发布（如回滚跳转到新工单）时应重置，不能带入下一条。
   if (drill.p === 'detail') return <Detail key={drill.id} id={drill.id} go={go} />;
 
-  // 发布流水：整页一条时间轴，未发布的修订、进行中的变更单、已发布的单据与软件发布同流。
-  // 页标题由面板抬头承担（与机器、用量页一致），不再单列一个页头。
-  return (
-    <div className="cardpage cg-flow">
-      <ConfigSection go={go} editable={can(who.role, 'system')} />
-    </div>
-  );
+  // 发布页照机器详情页分页签（配置 / Agent / Xray），每个页签照用量页：左侧读数栏，右侧列表。
+  return <DeployOverview go={go} editable={can(who.role, 'system')} />;
 }
 
 function PlanRoute({ win, drill, go }: { win: Win; drill: Extract<Drill, { p: 'plan' }>; go: (d: Drill) => void }) {
@@ -251,7 +267,7 @@ function PlanRoute({ win, drill, go }: { win: Win; drill: Extract<Drill, { p: 'p
 // 协议中的取值是 config / grants，界面按发起方式表述：变更单由人工发起，需要关注分波和确认；
 // 自动化授权单由权限操作或配额执行自动发起，只增删运行时的名单。
 const KIND_LABEL = { all: '全部', config: '变更单', grants: '自动化授权单' } as const;
-const HISTORY_PREVIEW_COUNT = 12;
+const HISTORY_PREVIEW_COUNT = 6;
 
 // 发布列表通常由服务端按 id 倒序返回，但基线判定不能依赖调用方排序。回滚也会产生更大的
 // 修订号，因此比较的是 deployment id（实际发生顺序），返回该次发布引用的修订。
@@ -290,9 +306,7 @@ function RevisionTrail({ revisions, base }: { revisions: RevisionListItem[]; bas
 }
 
 /* ══ 发布流水 ═════════════════════════════════════════════════════════════════
-   整页一条时间轴：未发布的修订 → 进行中的变更单 → 已发布的单据。软件发布也是发布，
-   与变更单、自动化授权单排在同一条流里，不再各占一张卡；抬头之下一行是两样软件的读数
-   与操作，展开的机器选择在流水之上另起一块。
+   配置页签右侧的一条时间轴：未发布的修订 → 进行中的变更单 → 最近的已发布单据。
    稿件：mockups/deploy-redesign.html 的方案 B，稿件里的私有前缀在这里统一写作 cgf-。 */
 
 type FlowTone = 'ok' | 'warn' | 'err' | 'run' | 'idle';
@@ -397,157 +411,52 @@ function FlowGroup({
   );
 }
 
-// 软件读数行：一样软件一格，读数之后是把机器推到这个版本的操作。
-// 需要处理时（有机器待替换、有发布正在推）整格着金色。
-function SoftwareStrip({
-  agent,
-  xray,
-  editable,
-  onOpen,
-}: {
-  agent: AgentSummary;
-  xray: XraySummary;
-  editable: boolean;
-  onOpen: (which: 'agent' | 'xray') => void;
-}) {
-  const agentWaiting = agent.waiting.length;
-  return (
-    <div className="cgf-soft">
-      <div className={agentWaiting ? 'cgf-soft-item warn' : 'cgf-soft-item'}>
-        <span className="cgf-soft-ic">
-          <Icon of="agent" size={13} />
-        </span>
-        <b>Agent</b>
-        <code>{agent.version ? `v${agent.version}` : '—'}</code>
-        <small title={agentWaiting ? `待替换：${agent.waiting.join('、')}` : undefined}>
-          {agent.approved === 0
-            ? '未批准，机器不会自行更新'
-            : agentWaiting
-              ? `${agent.replaced}/${agent.approved} 台已替换`
-              : `${agent.scopeLabel} 已替换`}
-        </small>
-        <button className="btn" type="button" onClick={() => onOpen('agent')}>
-          {editable ? '批准' : '查看'}
-        </button>
-      </div>
-      <div className={xray.activeId ? 'cgf-soft-item warn' : 'cgf-soft-item'}>
-        <span className="cgf-soft-ic">
-          <Icon of="xray" size={13} />
-        </span>
-        <b>Xray</b>
-        <code>{xray.version ?? '—'}</code>
-        <small title={xray.others || undefined}>
-          {xray.activeId
-            ? `发布 #${xray.activeId} 进行中`
-            : xray.reported === 0
-              ? '尚未上报'
-              : `${xray.onVersion}/${xray.reported} 台在跑`}
-        </small>
-        <button className="btn" type="button" onClick={() => onOpen('xray')}>
-          {editable ? '选择机器' : '查看'}
-        </button>
-      </div>
-    </div>
-  );
-}
+/* ══ 发布页：页签 + 驾驶舱 ═════════════════════════════════════════════════════
+   外层照机器详情页：页头是身份（图标板 + 状态灯 + 「发布」+ 线上/当前修订）│ 页签 │ 当前页的主操作。
+   每个页签照用量页：左侧 300px 读数栏，右侧列表。配置页的列表是发布流水，Agent / Xray 是逐台机器表。
+   稿件：mockups/deploy-cockpit.html。 */
 
-// 已发布一段里的条目：配置与授权单来自 deployments，软件发布来自各自的接口，
-// 合流后按时间倒序，再按天分组。
-type FlowEntry =
-  | { at: string; sort: number; kind: 'deployment'; item: DeploymentListItem }
-  | { at: string; sort: number; kind: 'agent'; version: string | null; by: string | null; scope: string }
-  | {
-      at: string;
-      sort: number;
-      kind: 'xray';
-      id: number;
-      version: string;
-      tone: FlowTone;
-      statusText: string;
-      by: string;
-      done: number;
-      total: number;
-    };
+type DeployTab = 'config' | 'agent' | 'xray';
 
-const timeOf = (at: string) => Date.parse(at.endsWith('Z') || at.includes('+') ? at : `${at}Z`);
+const DEPLOY_TABS: { key: DeployTab; label: string; icon: IconName }[] = [
+  { key: 'config', label: '配置', icon: 'config' },
+  { key: 'agent', label: 'Agent', icon: 'agent' },
+  { key: 'xray', label: 'Xray', icon: 'xray' },
+];
 
-const XRAY_TONE: Record<string, FlowTone> = { succeeded: 'ok', halted: 'err', canceled: 'idle', running: 'run' };
+type TabBadge = { tone: 'run' | 'gold'; text: string } | null;
 
-function softwareEntries(agent: AgentSummary, xray: XraySummary): FlowEntry[] {
-  const entries: FlowEntry[] = [];
-  if (agent.event) {
-    entries.push({
-      at: agent.event.at,
-      sort: timeOf(agent.event.at),
-      kind: 'agent',
-      version: agent.event.version,
-      by: agent.event.by,
-      scope: agent.event.scope,
-    });
-  }
-  for (const release of xray.events) {
-    entries.push({
-      at: release.at,
-      sort: timeOf(release.at),
-      kind: 'xray',
-      id: release.id,
-      version: release.version,
-      tone: XRAY_TONE[release.status] ?? 'idle',
-      statusText: release.statusText,
-      by: release.by,
-      done: release.done,
-      total: release.total,
-    });
-  }
-  return entries;
-}
-
-function ConfigSection({ go, editable }: { go: (d: Drill) => void; editable: boolean }) {
-  const [kind, setKind] = useState<'all' | 'config' | 'grants'>('all');
-  const [historyExpanded, setHistoryExpanded] = useState(false);
-  // 软件的机器选择在流水之上展开；读数行就是它收起时的样子，因此这里控制展开状态。
-  const [software, setSoftware] = useState<'agent' | 'xray' | null>(null);
+function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: boolean }) {
+  // 页签是一次浏览中的位置，不进地址栏（与机器详情页相同）。
+  const [tab, setTab] = useState<DeployTab>('config');
+  const [editing, setEditing] = useState<'agent' | 'xray' | null>(null);
+  const tabIdBase = useId();
   useSyncExternalStore(draft.subscribe, draft.version);
 
-  // ForgeShell 全局轮询 ['deployments']（顶栏需要常驻显示发布状态），
-  // 因此不筛选时与其使用同一查询键共享缓存，筛选时使用独立的键。
-  const list = useQuery({
-    queryKey: kind === 'all' ? ['deployments'] : ['deployments', kind],
-    queryFn: () => fetchDeployments(kind === 'all' ? undefined : kind),
-  });
-  // 两类发布各自独立限流（deployments_single_flight 按 kind 分别持有），因此当前是否可发布
-  // 需要分别判断：变更单进行中时授权单仍可下发。该判断不受筛选条件影响。
-  const all = useQuery({
-    queryKey: ['deployments'],
-    queryFn: () => fetchDeployments(),
-  });
-
-  // 服务端拒绝不涉及任何机器的发布，因此此处同样应提前拦截。
-  // 查询键与 ForgeShell 的 verify 一致，共享缓存不产生额外请求。
+  // 顶栏的发布状态也读 ['deployments']，这里与它共用同一查询键。
+  const all = useQuery({ queryKey: ['deployments'], queryFn: () => fetchDeployments() });
   const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
   const current = revisions.data?.current_revision;
+  // 服务端拒绝不涉及任何机器的发布，因此此处同样应提前拦截。
+  // 查询键与 ForgeShell 的 verify 一致，共享缓存不产生额外请求。
   const verify = useQuery({
     queryKey: ['deployment-verify', current],
     queryFn: () => verifyDeployment({ revision_id: current! }),
     enabled: current != null,
   });
-  // 两个读数与展开后的机器表读同一组查询，不产生额外请求。
-  const agent = useAgentSummary();
-  const xray = useXraySummary();
+  const agent = useAgentRelease();
+  const xray = useXrayRelease();
 
-  // 历史、当前活动单和当前修订共同决定本段按钮是否可用。缺一项时继续渲染会把“未知”
-  // 误当成“没有活动发布”或“已收敛”。
-  if (list.isPending || all.isPending || revisions.isPending) return <Loading variant="panel" rows={7} />;
-  if (list.error || all.error || revisions.error) {
-    return <ErrorBox error={list.error ?? all.error ?? revisions.error} />;
-  }
+  // 页头的角标与状态灯读全部三页的数据：任一组还在加载就挂载，会先画出「没有待处理」再改口。
+  if (all.isPending || revisions.isPending || agent.rel.isPending || agent.nodes.isPending || xray.releases.isPending)
+    return <Loading variant="deploy" />;
+  // 历史与当前修订共同决定配置页的按钮是否可用。缺一项时继续渲染会把“未知”误当成
+  // “没有活动发布”或“已收敛”。
+  if (all.error || revisions.error) return <ErrorBox error={all.error ?? revisions.error} />;
 
-  const items = list.data.deployments;
-  const activeOf = (k: 'config' | 'grants') => (all.data?.deployments ?? []).find(d => d.active && d.kind === k);
-  const activeConfig = activeOf('config');
-  const changedTargets = verify.data?.summary.changed_targets;
-  const configHistory = (all.data?.deployments ?? []).filter(item => item.kind === 'config');
-  const publishedBase = latestSuccessfulRevision(configHistory);
+  const deployments = all.data.deployments;
+  const activeConfig = deployments.find(d => d.active && d.kind === 'config');
+  const publishedBase = latestSuccessfulRevision(deployments.filter(item => item.kind === 'config'));
   const coveredRevision = activeConfig?.revision_id ?? publishedBase;
   const pendingRevisions = revisions.data.revisions.filter(
     revision =>
@@ -557,123 +466,292 @@ function ConfigSection({ go, editable }: { go: (d: Drill) => void; editable: boo
       revision.id <= revisions.data.current_revision,
   );
   const draftDirty = !draft.isEmpty();
-  const historyCounts = (key: 'all' | 'config' | 'grants') =>
-    key === 'all'
-      ? (all.data?.deployments.length ?? 0)
-      : (all.data?.deployments ?? []).filter(item => item.kind === key).length;
+  const fleet = agent.nodes.data?.nodes ?? [];
 
-  // 进行中的单据单独成组，已发布一段里不再重复它。
-  const actives = (all.data?.deployments ?? []).filter(d => d.active);
-  const finished = items.filter(item => !item.active);
+  const liveDeployments = deployments.filter(d => d.active);
+  const failing = liveDeployments.some(d => d.failed_targets > 0 || d.status === 'halted');
+  const attention =
+    pendingRevisions.length > 0 ||
+    draftDirty ||
+    liveDeployments.some(d => d.awaiting_confirmation) ||
+    agent.counts.behind > 0 ||
+    xray.counts.behind > 0;
+  const running = liveDeployments.length > 0 || agent.counts.waiting > 0 || !!xray.active;
+  const lamp =
+    failing || xray.active?.status === 'halted'
+      ? { tone: 'err', why: '有发布失败或已暂停，需要处理' }
+      : attention
+        ? { tone: 'warn', why: '有待处理的发布' }
+        : running
+          ? { tone: 'run', why: '发布进行中' }
+          : { tone: 'ok', why: '配置与软件版本均已收敛' };
+  const badges: Record<DeployTab, TabBadge> = {
+    config: pendingRevisions.length ? { tone: 'gold', text: String(pendingRevisions.length) } : null,
+    agent: agentBadge(agent),
+    xray: xrayBadge(xray),
+  };
+
+  const stopEditing = () => {
+    agent.reset();
+    agent.save.reset();
+    xray.setSelected([]);
+    xray.create.reset();
+    setEditing(null);
+  };
+  const startEditing = (which: 'agent' | 'xray') => {
+    stopEditing();
+    setEditing(which);
+  };
+  const tabId = (key: DeployTab) => `${tabIdBase}-${key}-tab`;
+  const panelId = `${tabIdBase}-panel`;
+  const selectTab = (next: DeployTab) => {
+    if (next === tab) return;
+    stopEditing();
+    setTab(next);
+  };
+  const moveTab = (event: ReactKeyboardEvent<HTMLButtonElement>, from: DeployTab) => {
+    const index = DEPLOY_TABS.findIndex(item => item.key === from);
+    let next: number | null = null;
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % DEPLOY_TABS.length;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowUp')
+      next = (index - 1 + DEPLOY_TABS.length) % DEPLOY_TABS.length;
+    if (event.key === 'Home') next = 0;
+    if (event.key === 'End') next = DEPLOY_TABS.length - 1;
+    if (next === null) return;
+    event.preventDefault();
+    const key = DEPLOY_TABS[next].key;
+    selectTab(key);
+    window.requestAnimationFrame(() => document.getElementById(tabId(key))?.focus());
+  };
+
+  const noPermission = editable ? undefined : '需要系统管理员权限';
+  const action =
+    tab === 'config' ? (
+      <PlanButton
+        pending={current == null || verify.isPending || !!verify.error}
+        changed={verify.data?.summary.changed_targets}
+        onClick={() => go({ p: 'plan', key: randomKey() })}
+      />
+    ) : tab === 'agent' ? (
+      editing === 'agent' || !agent.ready ? null : (
+        <button
+          className={agent.counts.behind ? 'btn primary' : 'btn'}
+          type="button"
+          disabled={!editable}
+          title={noPermission}
+          onClick={() => startEditing('agent')}
+        >
+          升级 Agent
+        </button>
+      )
+    ) : xray.active ? (
+      <button
+        className="btn danger"
+        type="button"
+        disabled={!editable || xray.busy}
+        title={noPermission}
+        onClick={() => xray.setAskCancel(true)}
+      >
+        取消升级
+      </button>
+    ) : editing === 'xray' || !xray.ready ? null : (
+      <button
+        className={xray.counts.behind ? 'btn primary' : 'btn'}
+        type="button"
+        disabled={!editable}
+        title={noPermission}
+        onClick={() => startEditing('xray')}
+      >
+        升级 Xray
+      </button>
+    );
+  // 页签内的取消自己放弃改动；批准成功后表单已按服务端结果重新对齐，这里只退出编辑。
+  const setEditingFor = (which: 'agent' | 'xray') => (on: boolean) => setEditing(on ? which : null);
+
+  return (
+    <div className="nd-sheet nd-page cgc-page">
+      <div className="fg-sheet nd-paper">
+        <header className="nd-page-head">
+          <div className="nd-page-identity">
+            <span className="cg-plate">
+              <Icon of="deploy" size={18} />
+              <span className={`cg-lamp ${lamp.tone}`} role="img" aria-label={lamp.why} title={lamp.why} />
+            </span>
+            <div className="nd-ident-text">
+              <div className="nd-ident-row">
+                <h1 className="nd-id nd-name">发布</h1>
+              </div>
+              <span className="nd-ident-meta">
+                线上 {publishedBase == null ? '—' : `R${publishedBase}`} · 当前 {current == null ? '—' : `R${current}`}
+                {agent.nodes.data ? ` · ${fleet.length} 台机器` : ''}
+              </span>
+            </div>
+          </div>
+          <div className="nd-tabs" role="tablist" aria-label="发布页签">
+            <div className="nd-tabs-seg">
+              {DEPLOY_TABS.map(item => {
+                const badge = badges[item.key];
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    id={tabId(item.key)}
+                    role="tab"
+                    aria-selected={tab === item.key}
+                    aria-controls={panelId}
+                    tabIndex={tab === item.key ? 0 : -1}
+                    onKeyDown={event => moveTab(event, item.key)}
+                    onClick={() => selectTab(item.key)}
+                  >
+                    <Icon of={item.icon} size={14} className="nd-tab-ic" />
+                    {item.label}
+                    {/* 金色数字是待处理数，主题色是正在自行升级的进度。零时不画。 */}
+                    {badge && (
+                      <span className={`nd-tab-badge ${badge.tone === 'run' ? 'cgc-run' : 'gold'}`}>{badge.text}</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          {action && (
+            <div className="nd-tools">
+              <div className="nd-acts">{action}</div>
+            </div>
+          )}
+        </header>
+        <div className="nd-paper-body">
+          <div className="usage-cockpit cgc-cockpit" role="tabpanel" id={panelId} aria-labelledby={tabId(tab)}>
+            {tab === 'config' ? (
+              <ConfigTab
+                go={go}
+                deployments={deployments}
+                revisions={revisions.data}
+                verify={verify}
+                fleet={fleet}
+                pendingRevisions={pendingRevisions}
+                publishedBase={publishedBase}
+                draftDirty={draftDirty}
+              />
+            ) : tab === 'agent' ? (
+              <AgentReleaseTab
+                agent={agent}
+                editable={editable}
+                editing={editing === 'agent'}
+                onEditingChange={setEditingFor('agent')}
+              />
+            ) : (
+              <XrayReleaseTab
+                xray={xray}
+                editable={editable}
+                editing={editing === 'xray'}
+                onEditingChange={setEditingFor('xray')}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ConfigTab({
+  go,
+  deployments,
+  revisions,
+  verify,
+  fleet,
+  pendingRevisions,
+  publishedBase,
+  draftDirty,
+}: {
+  go: (d: Drill) => void;
+  deployments: DeploymentListItem[];
+  revisions: RevisionList;
+  verify: UseQueryResult<Awaited<ReturnType<typeof verifyDeployment>>>;
+  fleet: NodeAgentStateItem[];
+  pendingRevisions: RevisionListItem[];
+  publishedBase: number | null;
+  draftDirty: boolean;
+}) {
+  const [kind, setKind] = useState<'all' | 'config' | 'grants'>('all');
+  const [historyExpanded, setHistoryExpanded] = useState(false);
+  // 不筛选时与页头共用 ['deployments']。筛选时先用已有记录在本地筛出同类占位，
+  // 服务端结果返回后替换，切换类型时流水不会整块消失。
+  const list = useQuery({
+    queryKey: kind === 'all' ? ['deployments'] : ['deployments', kind],
+    queryFn: () => fetchDeployments(kind === 'all' ? undefined : kind),
+    placeholderData: kind === 'all' ? undefined : { deployments: deployments.filter(item => item.kind === kind) },
+  });
+
+  const current = revisions.current_revision;
+  const targets = verify.data?.targets;
+  const changed = targets?.filter(target => target.status !== 'skipped');
+  const disruptive = changed?.filter(target => target.disruptive);
+  const nodeById = new Map(fleet.map(node => [node.node_id, node]));
+  const latestRevision = revisions.revisions.find(revision => revision.id === current);
+  const lastConfig = deployments
+    .filter(item => item.kind === 'config' && !item.active)
+    .reduce<DeploymentListItem | null>((best, item) => (best === null || item.id > best.id ? item : best), null);
+
+  // 进行中的单据单独成组，历史里不再重复它。默认只给出最近几条，
+  // 完整账本在操作者主动展开后才出现。
+  const actives = deployments.filter(d => d.active);
+  const finished = (list.data?.deployments ?? []).filter(item => !item.active);
   const visibleItems = historyExpanded ? finished : finished.slice(0, HISTORY_PREVIEW_COUNT);
   const hiddenItems = finished.length - visibleItems.length;
 
-  // 软件发布只在不筛选时进入流水，并且不早于已展开的那段时间——否则一条半年前的批准
-  // 会吊在最近十几条单据的下面。
-  const floor = visibleItems.length
-    ? timeOf(visibleItems[visibleItems.length - 1].created_at)
-    : Number.NEGATIVE_INFINITY;
-  const stream: FlowEntry[] = [
-    ...visibleItems.map(item => ({
-      at: item.created_at,
-      sort: timeOf(item.created_at),
-      kind: 'deployment' as const,
-      item,
-    })),
-    ...(kind === 'all' ? softwareEntries(agent, xray).filter(entry => entry.sort >= floor) : []),
-  ].sort((left, right) => right.sort - left.sort);
-
   return (
     <>
-      {software === 'agent' && <AgentReleaseSection editable={editable} open onClose={() => setSoftware(null)} />}
-      {software === 'xray' && <XrayReleaseSection editable={editable} open onClose={() => setSoftware(null)} />}
-
-      <section className="panel titled cgf" data-page-title="true" id="cg-config">
-        <header>
-          <ListIcon of="deploy" />
-          <h4>发布</h4>
-          {/* 线上是最近一次成功发布的修订；进行中的变更单还没生效，不能算作线上。 */}
-          <span className="rd">
-            线上 <b>{publishedBase == null ? '—' : `R${publishedBase}`}</b> · 当前{' '}
-            <b className={pendingRevisions.length ? 'warn' : undefined}>{current == null ? '—' : `R${current}`}</b>
-          </span>
-          <span className="sp" />
-          <div className="segsw cgf-kind" role="group" aria-label="按类型筛选">
-            {(['all', 'config', 'grants'] as const).map(key => (
-              <button
-                key={key}
-                type="button"
-                aria-pressed={kind === key}
-                onClick={() => {
-                  setKind(key);
-                  setHistoryExpanded(false);
-                }}
-              >
-                {KIND_LABEL[key]}
-                <small>{historyCounts(key)}</small>
-              </button>
-            ))}
-          </div>
-        </header>
-
+      <ReleaseLedger
+        label="待发布修订"
+        value={pendingRevisions.length}
+        unit="个"
+        period={`线上 ${publishedBase == null ? '—' : `R${publishedBase}`} → 当前 R${current}${
+          draftDirty ? ' · 草稿未提交，不在预览中' : ''
+        }`}
+        parts={[
+          { tone: 'warn', label: '待变更', count: changed?.length ?? null },
+          { tone: 'ok', label: '与当前修订一致', count: targets && changed ? targets.length - changed.length : null },
+        ]}
+        facts={[
+          [
+            '会中断连接',
+            disruptive?.length ? (
+              <>
+                <FlagRun nodes={disruptive.map(target => nodeById.get(target.node_id))} />
+                <em className="cgc-em">{disruptive.length} 台</em>
+              </>
+            ) : (
+              '—'
+            ),
+          ],
+          [
+            '待变更机器',
+            changed?.length ? <FlagRun nodes={changed.map(target => nodeById.get(target.node_id))} /> : '—',
+          ],
+          ['最近修订', latestRevision ? `R${latestRevision.id} · ${stamp(latestRevision.created_at)}` : '—'],
+          ['上次发布', lastConfig ? `#${lastConfig.id} · ${stamp(lastConfig.created_at)}` : '—'],
+        ]}
+      />
+      <section className="cgc-main">
         {verify.error && <ErrorBox error={verify.error} />}
-
-        <SoftwareStrip agent={agent} xray={xray} editable={editable} onOpen={setSoftware} />
-
-        <div className="cgf-well">
+        <div className="cgf-well" aria-busy={list.isPlaceholderData || undefined}>
           <ol className="cgf-list">
-            <FlowGroup
-              label="未发布"
-              tone={pendingRevisions.length ? 'warn' : undefined}
-              meta={
-                pendingRevisions.length ? (
-                  <>
-                    {pendingRevisions.length} 个修订
-                    {coveredRevision != null && current != null && ` · R${coveredRevision} → R${current}`}
-                    {/* 修订数与按钮各自成立却读起来矛盾：提交过修订，但它们不改变任何机器的产物
-                        （只动了没有授权出去的用户、只改了未被引用的线路）。这里写明，否则
-                        「7 个修订」紧挨着「无待发布变更」会被当成故障。 */}
-                    {changedTargets === 0 && !draftDirty
-                      ? ' · 产物与线上一致，无需下发'
-                      : changedTargets
-                        ? ` · 影响 ${changedTargets} 台机器`
-                        : ''}
-                    {activeConfig ? ` · 变更单 #${activeConfig.id} 结束后可发布` : ''}
-                  </>
-                ) : draftDirty ? (
-                  '草稿还有未提交的修改，提交后才会出现在这里'
-                ) : (
-                  '所有已提交的修订都已发布'
-                )
-              }
-              action={
-                <PlanButton
-                  pending={current == null || verify.isPending || !!verify.error}
-                  changed={changedTargets}
-                  onClick={() => go({ p: 'plan', key: randomKey() })}
-                />
-              }
-            />
-            {pendingRevisions.map(revision => (
-              <FlowRow
-                key={`r${revision.id}`}
-                tone="idle"
-                muted
-                at={revision.created_at}
-                title={revision.note || '未填写修订说明'}
-                meta={
-                  <>
-                    R{revision.id} · {revision.author || '系统'}
-                  </>
-                }
-              />
-            ))}
-            {draftDirty && pendingRevisions.length > 0 && (
-              <li className="cgf-hint">
-                <span />
-                <span className="cg-lamp warn" />
-                <span>草稿还有未提交的修改，不会计入这次发布预览。</span>
-              </li>
+            {kind !== 'grants' && pendingRevisions.length > 0 && (
+              <>
+                <FlowGroup label="待发布" tone="warn" meta={`${pendingRevisions.length} 个修订`} />
+                {pendingRevisions.map(revision => (
+                  <FlowRow
+                    key={`revision-${revision.id}`}
+                    tone="idle"
+                    muted
+                    at={revision.created_at}
+                    title={revision.note || '未填写修订说明'}
+                    meta={`R${revision.id} · ${revision.author || '系统'}`}
+                  />
+                ))}
+              </>
             )}
 
             {actives.map(item => (
@@ -681,14 +759,26 @@ function ConfigSection({ go, editable }: { go: (d: Drill) => void; editable: boo
             ))}
 
             <FlowGroup
-              label="已发布"
-              meta={
-                finished.length === 0
-                  ? '还没有发布记录'
-                  : `最近 ${visibleItems.length} 条${kind === 'all' && stream.length > visibleItems.length ? ' · 含软件发布' : ''}`
+              label="发布记录"
+              meta={finished.length === 0 ? '还没有发布记录' : `最近 ${visibleItems.length} 条`}
+              action={
+                <SegmentedControl
+                  className="cgf-kind"
+                  ariaLabel="按类型筛选"
+                  value={kind}
+                  options={(['all', 'config', 'grants'] as const).map(key => ({ value: key, label: KIND_LABEL[key] }))}
+                  onChange={key => {
+                    setKind(key);
+                    setHistoryExpanded(false);
+                  }}
+                />
               }
             />
-            {finished.length === 0 ? (
+            {list.error ? (
+              <li className="cgf-empty">
+                <ErrorBox error={list.error} />
+              </li>
+            ) : finished.length === 0 ? (
               <li className="cgf-empty">
                 <Empty>
                   {kind === 'grants'
@@ -699,38 +789,17 @@ function ConfigSection({ go, editable }: { go: (d: Drill) => void; editable: boo
                 </Empty>
               </li>
             ) : (
-              stream.map((entry, index) => {
-                const day = dayKey(entry.at);
-                const newDay = index === 0 || day !== dayKey(stream[index - 1].at);
+              visibleItems.map((item, index) => {
+                const day = dayKey(item.created_at);
+                const newDay = index === 0 || day !== dayKey(visibleItems[index - 1].created_at);
                 return (
-                  <Fragment key={entry.kind === 'deployment' ? `d${entry.item.id}` : `${entry.kind}${entry.at}`}>
+                  <Fragment key={item.id}>
                     {newDay && (
                       <li className="cgf-day">
                         <span>{day}</span>
                       </li>
                     )}
-                    {entry.kind === 'deployment' ? (
-                      <RecordRow item={entry.item} items={finished} go={go} />
-                    ) : entry.kind === 'agent' ? (
-                      <FlowRow
-                        tone="ok"
-                        icon="agent"
-                        at={entry.at}
-                        title={`批准 Agent${entry.version ? ` v${entry.version}` : ''}`}
-                        tags={<em className="cgf-tag">软件</em>}
-                        meta={[entry.scope, entry.by].filter(Boolean).join(' · ')}
-                      />
-                    ) : (
-                      <FlowRow
-                        tone={entry.tone}
-                        icon="xray"
-                        at={entry.at}
-                        title={`Xray 发布 #${entry.id} → ${entry.version}`}
-                        tags={<em className="cgf-tag">软件</em>}
-                        state={entry.tone === 'ok' ? undefined : entry.statusText}
-                        meta={`${entry.done}/${entry.total} 台 · ${entry.by}`}
-                      />
-                    )}
+                    <RecordRow item={item} items={finished} go={go} />
                   </Fragment>
                 );
               })
@@ -1164,13 +1233,17 @@ function PlanPreview({
               <PlanTargets targets={data.targets} />
             </section>
 
-            <section className="panel config-panel cg-sec cg-artifact-review">
-              <header>
+            <details className="panel config-panel cg-sec cg-disclosure cg-artifact-review">
+              <summary>
                 <PanelTitle of="artifacts">{baseline === target ? '运行状态产物' : '产物差异'}</PanelTitle>
                 <span className="cg-meta">{baseline == null ? '全部新建' : `R${baseline} → R${target}`}</span>
-              </header>
+                <span className="cgf-disclosure-state" aria-hidden="true">
+                  <span>展开</span>
+                  <span>收起</span>
+                </span>
+              </summary>
               <ArtifactChanges revision={target} base={baseline} targets={actingTargets} loadingVariant="plan" />
-            </section>
+            </details>
 
             {(create.error || abort.error) && <ErrorBox error={create.error ?? abort.error} />}
           </main>
@@ -1181,10 +1254,6 @@ function PlanPreview({
                 <PanelTitle of="settings">摘要</PanelTitle>
               </header>
               <dl className="cg-kv">
-                <dt>运行基线</dt>
-                <dd>{baseline == null ? '空白环境' : `R${baseline}`}</dd>
-                <dt>发布目标</dt>
-                <dd className="act">R{target}</dd>
                 <dt>变更机器</dt>
                 <dd>{data.summary.changed_targets} 台</dd>
                 <dt>中断连接</dt>
@@ -1199,18 +1268,11 @@ function PlanPreview({
                     <dd>{data.summary.deferred_targets} 台</dd>
                   </>
                 )}
-                {data.summary.skipped_targets > 0 && (
-                  <>
-                    <dt>产物未变</dt>
-                    <dd className="dim">{data.summary.skipped_targets} 台</dd>
-                  </>
-                )}
               </dl>
-              <div className="cgo-label">
-                <b>包含的修订</b>
-                <span>{includedRevisions.length} 个</span>
-              </div>
-              <RevisionTrail revisions={includedRevisions} base={baseline} />
+              <details className="cg-summary-revisions">
+                <summary>查看包含的 {includedRevisions.length} 个修订</summary>
+                <RevisionTrail revisions={includedRevisions} base={baseline} />
+              </details>
             </section>
           </aside>
         </div>
@@ -2309,13 +2371,20 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
                 />
               </section>
 
-              <section className="panel config-panel cg-sec cg-artifact-review">
-                <header>
+              <details className="panel config-panel cg-sec cg-disclosure cg-artifact-review">
+                <summary>
                   <PanelTitle of="artifacts">产物记录</PanelTitle>
-                  <span className="cg-meta">执行前 → 本次目标 · {acting.length} 台机器</span>
-                </header>
+                  <span className="cg-meta">
+                    {d.base_revision_id == null ? '空白环境' : `R${d.base_revision_id}`} → R{d.revision_id} ·{' '}
+                    {acting.length} 台机器
+                  </span>
+                  <span className="cgf-disclosure-state" aria-hidden="true">
+                    <span>展开</span>
+                    <span>收起</span>
+                  </span>
+                </summary>
                 <RecordedArtifactChanges targets={acting} />
-              </section>
+              </details>
 
               {(confirm.error ||
                 halt.error ||

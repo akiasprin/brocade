@@ -5,13 +5,16 @@ import {
   Suspense,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   useSyncExternalStore,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
+  type RefObject,
 } from 'react';
+import { createPortal } from 'react-dom';
 import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import {
   abandonNode,
@@ -64,6 +67,11 @@ import {
   type NodeNicView,
   type NodePingProbeLatestView,
   type NodePingProbeView,
+  PING_PROBE_FAMILIES,
+  type PingProbeFamily,
+  type PingProbeKind,
+  type PingProbePoint,
+  type PingProbeTargetSeries,
   type NodePublicIpEvent,
   type NodeTrafficCycleKind,
   type NodeTrafficItem,
@@ -73,7 +81,7 @@ import {
 } from '../api';
 import { fetchPreviewStatus } from '../preview/api';
 import { PreviewProvision, type PreviewWizDrill } from '../preview/provision';
-import { can, isPublic, isVisitor, useSession } from '../session';
+import { can, isVisitor, useSession } from '../session';
 import { Ago, Confirm, Empty, EmptyState, ErrorBox, Loading, SegmentedControl, SegSwitch } from '../ui/bits';
 import { FieldLoading, PanelLoading } from '../ui/loading';
 import { Icon, ListIcon, PanelTitle, type IconName } from '../ui/icons';
@@ -84,7 +92,20 @@ import { WizardCard, WizardField, WizardFooter, WizardPaper, WizardPaperHeader }
 import { useNarrow } from '../ui/viewport';
 import { useNow } from '../ui/clock';
 import { useAgentLiveness } from '../ui/agent-alive';
-import { pingLatencyMs, pingSampleText } from '../ui/ping-probe';
+import {
+  PING_FAMILY_LABEL,
+  pingLatencyMs,
+  pingLossStats,
+  pingLossText,
+  pingLossTone,
+  pingSampleLost,
+  pingSampleText,
+  pingSkipReason,
+  pingSkipReasonShort,
+  pingSkipReasonText,
+  worstPingLossTone,
+  type PingLossTone,
+} from '../ui/ping-probe';
 import { type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import { RegionFlag } from '../ui/region-flag';
@@ -1165,7 +1186,7 @@ function NodeCard({
             </button>
           )}
         </span>
-        {!pingProbeReady || (pingProbe && pingProbe.targets.some(target => target.address.startsWith('tcp://'))) ? (
+        {!pingProbeReady || (pingProbe && pingProbe.targets.some(target => target.kind === 'tcp')) ? (
           <TcpProbeLatest view={pingProbe} intervalSecs={pingProbeIntervalSecs} pending={!pingProbeReady} />
         ) : (
           <NodeAddr node={node} />
@@ -1347,6 +1368,7 @@ export function ObserveRangeControl({
   const [to, setTo] = useState('');
   const rootRef = useRef<HTMLSpanElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   const localInput = (unixSecs: number) => {
@@ -1388,7 +1410,8 @@ export function ObserveRangeControl({
   useEffect(() => {
     if (!open) return;
     const outside = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+      const target = event.target as Node;
+      if (!rootRef.current?.contains(target) && !menuRef.current?.contains(target)) setOpen(false);
     };
     const escape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
@@ -1400,6 +1423,41 @@ export function ObserveRangeControl({
     return () => {
       document.removeEventListener('pointerdown', outside);
       document.removeEventListener('keydown', escape);
+    };
+  }, [open]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    const position = () => {
+      const menu = menuRef.current;
+      if (!menu) return;
+      if (window.innerWidth <= 520) {
+        menu.style.removeProperty('top');
+        menu.style.removeProperty('left');
+        return;
+      }
+      const trigger = triggerRef.current?.getBoundingClientRect();
+      if (!trigger) return;
+      const margin = 10;
+      const gap = 5;
+      const left = Math.min(
+        window.innerWidth - menu.offsetWidth - margin,
+        Math.max(margin, trigger.right - menu.offsetWidth),
+      );
+      const below = trigger.bottom + gap;
+      const top =
+        below + menu.offsetHeight <= window.innerHeight - margin
+          ? below
+          : Math.max(margin, trigger.top - menu.offsetHeight - gap);
+      menu.style.top = `${top}px`;
+      menu.style.left = `${left}px`;
+    };
+    position();
+    window.addEventListener('resize', position);
+    window.addEventListener('scroll', position, true);
+    return () => {
+      window.removeEventListener('resize', position);
+      window.removeEventListener('scroll', position, true);
     };
   }, [open]);
 
@@ -1440,96 +1498,100 @@ export function ObserveRangeControl({
         <Icon of="calendar" size={14} className="nd-tool-icon observe-range-clock" />
         <span>{value.menuLabel}</span>
       </button>
-      <div className="observe-range-menu" role="dialog" aria-label="观测时间范围" hidden={!open}>
-        <div
-          className="observe-range-presets"
-          role="listbox"
-          aria-label="快速范围"
-          onKeyDown={event => {
-            const current = optionRefs.current.indexOf(document.activeElement as HTMLButtonElement);
-            if (event.key === 'ArrowDown') {
-              event.preventDefault();
-              focusOption(current + 1);
-            } else if (event.key === 'ArrowUp') {
-              event.preventDefault();
-              focusOption(current - 1);
-            } else if (event.key === 'Home') {
-              event.preventDefault();
-              focusOption(0);
-            } else if (event.key === 'End') {
-              event.preventDefault();
-              focusOption(LOAD_RANGES.length - 1);
-            }
-          }}
-        >
-          <b>快速范围</b>
-          {LOAD_RANGES.map((option, index) => (
-            <button
-              key={option.seconds}
-              ref={element => {
-                optionRefs.current[index] = element;
-              }}
-              type="button"
-              role="option"
-              aria-selected={!fixedLoadRange(value) && value.seconds === option.seconds}
-              onClick={() => {
-                onChange(option);
-                setOpen(false);
-                triggerRef.current?.focus();
+      {open &&
+        createPortal(
+          <div ref={menuRef} className="observe-range-menu" role="dialog" aria-label="观测时间范围">
+            <div
+              className="observe-range-presets"
+              role="listbox"
+              aria-label="快速范围"
+              onKeyDown={event => {
+                const current = optionRefs.current.indexOf(document.activeElement as HTMLButtonElement);
+                if (event.key === 'ArrowDown') {
+                  event.preventDefault();
+                  focusOption(current + 1);
+                } else if (event.key === 'ArrowUp') {
+                  event.preventDefault();
+                  focusOption(current - 1);
+                } else if (event.key === 'Home') {
+                  event.preventDefault();
+                  focusOption(0);
+                } else if (event.key === 'End') {
+                  event.preventDefault();
+                  focusOption(LOAD_RANGES.length - 1);
+                }
               }}
             >
-              {option.menuLabel}
-              <span className="observe-range-check" aria-hidden="true">
-                ✓
+              <b>快速范围</b>
+              {LOAD_RANGES.map((option, index) => (
+                <button
+                  key={option.seconds}
+                  ref={element => {
+                    optionRefs.current[index] = element;
+                  }}
+                  type="button"
+                  role="option"
+                  aria-selected={!fixedLoadRange(value) && value.seconds === option.seconds}
+                  onClick={() => {
+                    onChange(option);
+                    setOpen(false);
+                    triggerRef.current?.focus();
+                  }}
+                >
+                  {option.menuLabel}
+                  <span className="observe-range-check" aria-hidden="true">
+                    ✓
+                  </span>
+                </button>
+              ))}
+            </div>
+            <div className="observe-range-absolute">
+              <b>自定义范围</b>
+              <label>
+                <span>从</span>
+                <input
+                  aria-label="观测开始时间"
+                  type="datetime-local"
+                  value={from}
+                  onChange={event => setFrom(event.target.value)}
+                />
+              </label>
+              <label>
+                <span>到</span>
+                <input
+                  aria-label="观测结束时间"
+                  type="datetime-local"
+                  value={to}
+                  onChange={event => setTo(event.target.value)}
+                />
+              </label>
+              <span className={`observe-range-error${absoluteError ? ' bad' : ''}`}>
+                {absoluteError ?? '固定区间，最长 24 小时'}
               </span>
-            </button>
-          ))}
-        </div>
-        <div className="observe-range-absolute">
-          <b>自定义范围</b>
-          <label>
-            <span>从</span>
-            <input
-              aria-label="观测开始时间"
-              type="datetime-local"
-              value={from}
-              onChange={event => setFrom(event.target.value)}
-            />
-          </label>
-          <label>
-            <span>到</span>
-            <input
-              aria-label="观测结束时间"
-              type="datetime-local"
-              value={to}
-              onChange={event => setTo(event.target.value)}
-            />
-          </label>
-          <span className={`observe-range-error${absoluteError ? ' bad' : ''}`}>
-            {absoluteError ?? '固定区间，最长 24 小时'}
-          </span>
-          <button
-            type="button"
-            className="observe-range-apply"
-            disabled={absoluteError !== null}
-            onClick={() => {
-              const menuLabel = `${shortDateTime(fromSecs)} → ${shortDateTime(toSecs)}`;
-              onChange({
-                seconds: span,
-                label: 'custom',
-                menuLabel,
-                heading: 'CUSTOM RANGE',
-                startUnixSecs: fromSecs,
-                endUnixSecs: toSecs,
-              });
-              setOpen(false);
-              triggerRef.current?.focus();
-            }}
-          >
-            应用时间范围
-          </button>
-        </div>
-      </div>
+              <button
+                type="button"
+                className="observe-range-apply"
+                disabled={absoluteError !== null}
+                onClick={() => {
+                  const menuLabel = `${shortDateTime(fromSecs)} → ${shortDateTime(toSecs)}`;
+                  onChange({
+                    seconds: span,
+                    label: 'custom',
+                    menuLabel,
+                    heading: 'CUSTOM RANGE',
+                    startUnixSecs: fromSecs,
+                    endUnixSecs: toSecs,
+                  });
+                  setOpen(false);
+                  triggerRef.current?.focus();
+                }}
+              >
+                应用时间范围
+              </button>
+            </div>
+          </div>,
+          document.body,
+        )}
     </span>
   );
 }
@@ -1601,6 +1663,8 @@ function nodeCardLatency(value: number | null): string {
   return value == null ? '—' : String(Math.round(value));
 }
 
+/** 机器卡右下角：每个 TCP 目标一个读数，取 IPv4，只填了 IPv6 的目标取 IPv6。最新一轮无响应的
+ * 主读数是灰白色「—」。另一族（IPv6）的结果不占卡片空间，两族读数都保留在 title 里。 */
 export function TcpProbeLatest({
   view,
   intervalSecs,
@@ -1613,36 +1677,51 @@ export function TcpProbeLatest({
   const now = useNow();
   if (pending && !view) return null;
   if (!view || view.targets.length === 0) return null;
-  const values = view.targets
-    .filter(target => target.address.startsWith('tcp://'))
-    .map(target => ({
-      name: target.name,
-      sample: target.latest,
-      value: target.latest ? pingLatencyMs(target.latest) : null,
-    }));
-  if (values.length === 0) return null;
+  const entries = view.targets
+    .filter(target => target.kind === 'tcp')
+    .map(target => ({ target, primary: (target.ipv4 ?? target.ipv6)?.latest ?? null }));
+  if (entries.length === 0) return null;
   const staleAfterSecs = Math.max(intervalSecs * 2, 30);
-  const stale = values.some(item => item.sample && now / 1000 - item.sample.probed_at_unix_secs > staleAfterSecs);
-  const compact = values
-    .slice(0, 3)
-    .map(item => {
-      if (!item.sample || !item.sample.attempted) return '—';
-      return item.value == null ? '×' : nodeCardLatency(item.value);
-    })
-    .join(' / ');
-  const title = values
-    .map(item => {
-      const sampledAt = item.sample
-        ? new Date(item.sample.probed_at_unix_secs * 1000).toLocaleString('zh-CN')
-        : '尚无样本';
-      const expired = item.sample && now / 1000 - item.sample.probed_at_unix_secs > staleAfterSecs ? ' · 已过期' : '';
-      return `${item.name}：${pingSampleText(item.sample ?? undefined)} · 最新样本 ${sampledAt}${expired}`;
+  const expired = (sample: PingProbePoint) => now / 1000 - sample.probed_at_unix_secs > staleAfterSecs;
+  const latestOf = (target: (typeof entries)[number]['target']) =>
+    PING_PROBE_FAMILIES.flatMap(family => {
+      const latest = target[family]?.latest;
+      return latest ? [latest] : [];
+    });
+  const stale = entries.some(({ target }) => latestOf(target).some(expired));
+  const primaryValue = (sample: PingProbePoint | null) => (sample && sample.attempted ? pingLatencyMs(sample) : null);
+  const title = entries
+    .map(({ target }) => {
+      const readings = PING_PROBE_FAMILIES.flatMap(family => {
+        const series = target[family];
+        if (!series) return [];
+        const label = PING_FAMILY_LABEL[family];
+        const reason = series.latest && !series.latest.attempted ? series.latest.skip_reason : undefined;
+        return [
+          reason
+            ? `${label} 未探测（${pingSkipReasonText(reason, family)}）`
+            : `${label} ${pingSampleText(series.latest ?? undefined)}`,
+        ];
+      });
+      const newest = latestOf(target).reduce<PingProbePoint | null>(
+        (found, sample) => (found && found.probed_at_unix_secs >= sample.probed_at_unix_secs ? found : sample),
+        null,
+      );
+      const sampledAt = newest ? new Date(newest.probed_at_unix_secs * 1000).toLocaleString('zh-CN') : '尚无样本';
+      return `${target.name}：${readings.join(' · ')} · 最新样本 ${sampledAt}${newest && expired(newest) ? ' · 已过期' : ''}`;
     })
     .join('\n');
   return (
     <span className={`nc-tcp-latest${stale ? ' stale' : ''}`} title={title}>
-      <span className="values">{compact}</span>
-      {values.some(item => item.value != null) && <em>ms</em>}
+      <span className="values">
+        {entries.slice(0, 3).map(({ target, primary }, index) => (
+          <Fragment key={`${target.name}-${index}`}>
+            {index > 0 && ' / '}
+            {pingSampleLost(primary ?? undefined) ? <i className="lost">—</i> : nodeCardLatency(primaryValue(primary))}
+          </Fragment>
+        ))}
+      </span>
+      {entries.some(({ primary }) => primaryValue(primary) != null) && <em>ms</em>}
     </span>
   );
 }
@@ -3724,6 +3803,16 @@ function xrayVer(raw: string | null | undefined): [number, number] | null {
 /** `geodata` 自动更新合入主线的版本。低于该版本的 xray 会忽略该段配置且不报错。 */
 const XRAY_GEODATA_MIN: [number, number] = [26, 4];
 
+function spoolDropCounts(spool: NonNullable<NodeAgentStateItem['spool_backlog']>) {
+  const usage = Math.max(0, spool.usage_dropped ?? 0);
+  const observation = Math.max(0, spool.observation_dropped ?? 0);
+  return {
+    usage,
+    observation,
+    unclassified: Math.max(0, spool.dropped - usage - observation),
+  };
+}
+
 export function runtimeFindings(
   node: NodeAgentStateItem,
   wireguardEnabled?: boolean,
@@ -3823,17 +3912,33 @@ export function runtimeFindings(
   }
 
   const spool = node.spool_backlog;
-  if (spool && spool.dropped > 0) {
-    out.push({
-      tone: 'bad',
-      chip: `丢了 ${spool.dropped.toLocaleString()} 条账`,
-      text: (
-        <>
-          发不出去被丢掉的上报<b>找不回来</b>。症状是这台机器某几段时间「没有流量」，
-          跟真的没流量分不开。先看它为什么连不上控制面。
-        </>
-      ),
-    });
+  if (spool) {
+    const dropped = spoolDropCounts(spool);
+    if (dropped.usage > 0) {
+      out.push({
+        tone: 'bad',
+        chip: `丢了 ${dropped.usage.toLocaleString()} 条用量`,
+        text: (
+          <>
+            用量上报已被永久丢弃，对应时段的流量明细<b>找不回来</b>。先检查控制面连通性和用量接口错误。
+          </>
+        ),
+      });
+    }
+    if (dropped.observation > 0) {
+      out.push({
+        tone: 'warn',
+        chip: `丢了 ${dropped.observation.toLocaleString()} 条收敛结果`,
+        text: <>Agent 已执行但结果被控制面永久拒绝；发布可能缺少执行证据，但这不代表流量丢失。</>,
+      });
+    }
+    if (dropped.unclassified > 0) {
+      out.push({
+        tone: 'warn',
+        chip: `丢了 ${dropped.unclassified.toLocaleString()} 条未分类上报`,
+        text: <>旧 Agent 只记录总数，无法还原是用量还是收敛结果；升级后新丢弃会分类记录。</>,
+      });
+    }
   }
 
   const usage = node.usage_last_result;
@@ -4069,51 +4174,230 @@ function LoadCardFor({
 }
 
 const PING_SERIES_CSS = OBSERVE_SERIES_COLOR_VARS;
-type PingProtocol = 'icmp' | 'tcp';
+const PING_LEGEND_LIMIT = 3;
+type PingProtocol = PingProbeKind;
 
-function PingProbeLegend({ view }: { view: NodePingProbeView }) {
-  const shown = view.targets.slice(0, 3);
+/** A target of one block (ICMP or TCP). Its color is its position in the block, so it keeps the
+ * same color whichever family the panel shows. */
+interface PingBlockTarget {
+  target: PingProbeTargetSeries;
+  color: number;
+}
+
+interface PingFamilyState {
+  /** At least one target has an endpoint of this family. */
+  configured: boolean;
+  /** Every sample of this family in the range was skipped, at least one for lack of a route. */
+  noRoute: boolean;
+  /** The worst loss of any target of this family in the range. */
+  tone: PingLossTone | null;
+}
+
+function pingFamilyStates(view: NodePingProbeView): Record<PingProbeFamily, PingFamilyState> {
+  const state = (family: PingProbeFamily): PingFamilyState => {
+    const series = view.targets.flatMap(target => target[family] ?? []);
+    const samples = series.flatMap(entry => entry.samples);
+    return {
+      configured: series.length > 0,
+      noRoute:
+        samples.length > 0 &&
+        samples.every(sample => !sample.attempted) &&
+        samples.some(sample => sample.skip_reason === 'no_route'),
+      tone: worstPingLossTone(series.map(entry => pingLossTone(pingLossStats(entry.samples)))),
+    };
+  };
+  return { ipv4: state('ipv4'), ipv6: state('ipv6') };
+}
+
+const pingFamilyUsable = (state: PingFamilyState) => state.configured && !state.noRoute;
+
+function PingLegendItem({
+  target,
+  color,
+  family,
+}: PingBlockTarget & {
+  family: PingProbeFamily;
+}) {
+  const series = target[family]!;
+  const loss = pingLossStats(series.samples);
+  const lossText = pingLossText(loss.percent);
+  const reason = loss.attempted === 0 ? pingSkipReason(series.samples) : null;
+  const tone = pingLossTone(loss);
+  const latest = series.samples.at(-1);
+  const sampledAt = latest ? new Date(latest.probed_at_unix_secs * 1000).toLocaleString('zh-CN') : '尚无样本';
+  const skipped = series.samples.length - loss.attempted;
+  const title =
+    `${PING_FAMILY_LABEL[family]} ${series.address}\n所选时段丢包率：${lossText}（丢包 ${loss.lost} / 已探测 ${loss.attempted}）` +
+    `\n未探测：${skipped}${reason ? `（${pingSkipReasonText(reason, family)}）` : ''}\n最新样本：${sampledAt}`;
+  return (
+    <span title={title}>
+      <i style={{ background: `var(${PING_SERIES_CSS[color % PING_SERIES_CSS.length]})` }} />
+      <span className="ping-probe-name">{target.name}</span>
+      <b
+        className={loss.attempted === 0 ? 'gap' : tone ? `loss ${tone}` : undefined}
+        aria-label={
+          reason ? `${target.name} 未探测：${pingSkipReasonText(reason, family)}` : `${target.name} 丢包率 ${lossText}`
+        }
+      >
+        {reason ? pingSkipReasonShort(reason, family) : lossText}
+      </b>
+    </span>
+  );
+}
+
+/** The shown family's legend: the first targets by block position, and「+N」for the rest. 「+N」
+ * takes the loss color of the targets it folds, which the legend would otherwise hide. */
+function PingProbeLegend({ targets, family }: { targets: PingBlockTarget[]; family: PingProbeFamily }) {
+  const entries = targets.filter(({ target }) => target[family]);
+  const shown = entries.slice(0, PING_LEGEND_LIMIT);
+  const hidden = entries.slice(PING_LEGEND_LIMIT).map(({ target }) => ({
+    name: target.name,
+    loss: pingLossStats(target[family]!.samples),
+  }));
+  const lossy = hidden.filter(entry => entry.loss.lost > 0);
+  const moreTone = worstPingLossTone(lossy.map(entry => pingLossTone(entry.loss)));
+  const moreTitle =
+    lossy.length > 0
+      ? `未列出的目标有丢包：\n${lossy.map(entry => `${entry.name} ${pingLossText(entry.loss.percent)}`).join('\n')}`
+      : `未列出：${hidden.map(entry => entry.name).join('、')}`;
   return (
     <footer className="load-network-legend ping-probe-legend" aria-label="Ping 图例">
-      {shown.map((target, index) => {
-        const latest = target.samples.at(-1);
-        const state = !latest?.attempted ? 'gap' : latest.latency_us == null ? 'loss' : undefined;
-        const sampledAt = latest ? new Date(latest.probed_at_unix_secs * 1000).toLocaleString('zh-CN') : '尚无样本';
-        const title = `${target.address}\n最新样本：${sampledAt}`;
-        return (
-          <span key={`${target.address}-${index}`} title={title}>
-            <i style={{ background: `var(${PING_SERIES_CSS[index % PING_SERIES_CSS.length]})` }} />
-            <span className="ping-probe-name">{target.name}</span>
-            <b className={state}>{pingSampleText(latest)}</b>
-          </span>
-        );
-      })}
-      {view.targets.length > shown.length && (
-        <span className="ping-probe-more">+{view.targets.length - shown.length}</span>
+      {shown.map(entry => (
+        <PingLegendItem key={entry.color} {...entry} family={family} />
+      ))}
+      {hidden.length > 0 && (
+        <span className={moreTone ? `ping-probe-more ${moreTone}` : 'ping-probe-more'} title={moreTitle}>
+          +{hidden.length}
+        </span>
       )}
     </footer>
   );
 }
 
+/** The panel's family switch, at its top-right corner in the first block's title bar: the whole
+ * panel shows one family. A family with no configured target, or that the machine has no route for,
+ * cannot be chosen. A dot on the other family says it lost packets in the range. */
+function PingFamilySwitch({
+  family,
+  states,
+  onChange,
+}: {
+  family: PingProbeFamily;
+  states: Record<PingProbeFamily, PingFamilyState>;
+  onChange: (family: PingProbeFamily) => void;
+}) {
+  const choose = (next: PingProbeFamily, focus?: HTMLElement | null) => {
+    if (next === family || !pingFamilyUsable(states[next])) return;
+    onChange(next);
+    focus?.querySelector<HTMLButtonElement>(`[data-family="${next}"]`)?.focus();
+  };
+  return (
+    <div
+      className="ping-family-switch"
+      role="radiogroup"
+      aria-label="Ping 地址族"
+      data-family={family}
+      onKeyDown={event => {
+        if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
+        event.preventDefault();
+        choose(family === 'ipv4' ? 'ipv6' : 'ipv4', event.currentTarget);
+      }}
+    >
+      <span className="ping-family-switch-thumb" aria-hidden="true" />
+      {PING_PROBE_FAMILIES.map(option => {
+        const state = states[option];
+        const label = PING_FAMILY_LABEL[option];
+        const blocked = state.noRoute
+          ? `机器没有 ${label} 路由，${label} 未探测`
+          : state.configured
+            ? null
+            : `没有填写 ${label} 地址的目标`;
+        const dot = blocked === null && option !== family ? state.tone : null;
+        const loss = dot === 'down' ? '（有目标完全无响应）' : dot === 'partial' ? '（有丢包）' : '';
+        return (
+          <button
+            key={option}
+            type="button"
+            role="radio"
+            data-family={option}
+            aria-checked={option === family}
+            tabIndex={option === family ? 0 : -1}
+            disabled={blocked !== null}
+            data-dot={dot ?? undefined}
+            title={blocked ?? `Ping 面板显示 ${label}${loss}`}
+            onClick={() => choose(option)}
+          >
+            {label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** The second block ends its title bar with an empty slot as wide as the switch above it, so both
+ * legends end at the same edge. */
+function usePingSwitchSpacer(panelRef: RefObject<HTMLElement | null>) {
+  useLayoutEffect(() => {
+    const switcher = panelRef.current?.querySelector<HTMLElement>('.ping-family-switch');
+    const spacer = panelRef.current?.querySelector<HTMLElement>('.ping-family-switch-spacer');
+    if (!switcher || !spacer) return;
+    const match = () => {
+      spacer.style.width = `${switcher.getBoundingClientRect().width}px`;
+    };
+    match();
+    // The button labels settle once the web font arrives.
+    const observer = new ResizeObserver(match);
+    observer.observe(switcher);
+    return () => observer.disconnect();
+  });
+}
+
+/** Fade the block body in after a family switch, as one panel-wide change rather than two charts
+ * redrawing on their own. */
+function useFamilySwitchFade(bodyRef: RefObject<HTMLElement | null>, family: PingProbeFamily) {
+  const shown = useRef(family);
+  useLayoutEffect(() => {
+    if (shown.current === family) return;
+    shown.current = family;
+    const body = bodyRef.current;
+    if (!body?.animate || window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return;
+    body.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 260, easing: 'ease' });
+  }, [bodyRef, family]);
+}
+
 function PingProbeBlock({
-  view,
+  targets,
   protocol,
-  range,
+  family,
+  corner,
+  bounds,
   group,
   loading,
   observationModules,
 }: {
-  view: NodePingProbeView;
+  targets: PingBlockTarget[];
   protocol: PingProtocol;
-  range: LoadRange;
+  family: PingProbeFamily;
+  /** The family switch in the first block, its width-matching slot in the second. */
+  corner: ReactNode;
+  bounds: { startUnixSecs: number; endUnixSecs: number };
   group?: string;
   loading: boolean;
   observationModules: NodeObservationModules;
 }) {
-  const targets = view.targets.filter(target => target.address.startsWith(`${protocol}://`));
-  const protocolView = { ...view, targets };
+  const lines = useMemo(
+    () =>
+      targets.flatMap(({ target, color }) => {
+        const series = target[family];
+        return series ? [{ name: target.name, color, samples: series.samples }] : [];
+      }),
+    [targets, family],
+  );
+  const bodyRef = useRef<HTMLDivElement>(null);
+  useFamilySwitchFade(bodyRef, family);
   const label = `${protocol.toUpperCase()} PING`;
-  const hasSamples = targets.some(target => target.samples.length > 0);
+  const hasSamples = lines.some(line => line.samples.length > 0);
   const PingLatencyChart = observationModules.PingLatencyChart;
   return (
     <div className="ping-probe-block" aria-label={label}>
@@ -4125,24 +4409,31 @@ function PingProbeBlock({
         {/* 量纲跟着图走：没画图时刻度也不存在，标题栏就不该挂一个单位。
             时延轴永远是毫秒（见 observeMsUnit），所以这里不必反算值轴。 */}
         {hasSamples && <span className="chart-unit">({OBSERVE_MS_UNIT})</span>}
-        {targets.length > 0 && <PingProbeLegend view={protocolView} />}
+        {targets.length > 0 && <PingProbeLegend targets={targets} family={family} />}
+        {corner}
       </div>
-      {loading ? (
-        <ObservationReading ChartLoading={observationModules.ObservationChartLoading} />
-      ) : targets.length === 0 ? (
-        <p className="note ping-probe-empty">尚未在设置中配置 {protocol.toUpperCase()} 探测目标。</p>
-      ) : hasSamples ? (
-        <Suspense fallback={<ObservationReading ChartLoading={observationModules.ObservationChartLoading} />}>
-          <PingLatencyChart view={protocolView} bounds={loadRangeBounds(range)} group={group} />
-        </Suspense>
-      ) : (
-        <p className="note ping-probe-empty">Ping 落点已配置，但 Agent 尚未上报样本。</p>
-      )}
+      <div className="ping-probe-body" ref={bodyRef}>
+        {loading ? (
+          <ObservationReading ChartLoading={observationModules.ObservationChartLoading} />
+        ) : targets.length === 0 ? (
+          <p className="note ping-probe-empty">尚未在设置中配置 {protocol.toUpperCase()} 探测目标。</p>
+        ) : lines.length === 0 ? (
+          <p className="note ping-probe-empty">
+            没有填写 {PING_FAMILY_LABEL[family]} 地址的 {protocol.toUpperCase()} 目标。
+          </p>
+        ) : hasSamples ? (
+          <Suspense fallback={<ObservationReading ChartLoading={observationModules.ObservationChartLoading} />}>
+            <PingLatencyChart lines={lines} family={family} bounds={bounds} group={group} />
+          </Suspense>
+        ) : (
+          <p className="note ping-probe-empty">Ping 落点已配置，但 Agent 尚未上报样本。</p>
+        )}
+      </div>
     </div>
   );
 }
 
-function PingProbePanel({
+export function PingProbePanel({
   nodeId,
   range,
   linked,
@@ -4156,28 +4447,51 @@ function PingProbePanel({
   const probe = useQuery({
     ...nodePingRangeQuery(nodeId, range),
   });
+  const [chosenFamily, setChosenFamily] = useState<PingProbeFamily>('ipv4');
+  const panelRef = useRef<HTMLElement>(null);
+  usePingSwitchSpacer(panelRef);
+  const bounds = useMemo(() => {
+    if (range.startUnixSecs != null && range.endUnixSecs != null) {
+      return { startUnixSecs: range.startUnixSecs, endUnixSecs: range.endUnixSecs };
+    }
+    // Advance the live axis with Ping refreshes, not unrelated parent renders.
+    const endUnixSecs = Math.floor(probe.dataUpdatedAt / 1000);
+    return { startUnixSecs: endUnixSecs - range.seconds, endUnixSecs };
+  }, [range.startUnixSecs, range.endUnixSecs, range.seconds, probe.dataUpdatedAt]);
+  const view = useMemo(() => probe.data ?? { node_id: nodeId, targets: [] }, [probe.data, nodeId]);
+  const states = useMemo(() => pingFamilyStates(view), [view]);
+  const blocks = useMemo(() => {
+    const of = (protocol: PingProtocol) =>
+      view.targets.filter(target => target.kind === protocol).map((target, color) => ({ target, color }));
+    return { icmp: of('icmp'), tcp: of('tcp') };
+  }, [view]);
   if (probe.error && !probe.data)
     return <PingProbePanelState state="error" ChartLoading={observationModules.ObservationChartLoading} />;
-  const view = probe.data ?? { node_id: nodeId, targets: [] };
+  const other = chosenFamily === 'ipv4' ? 'ipv6' : 'ipv4';
+  // The chosen family stays chosen while it has data to show; otherwise the panel shows the other.
+  const family = pingFamilyUsable(states[chosenFamily]) || !pingFamilyUsable(states[other]) ? chosenFamily : other;
+  const switcher =
+    probe.isPending || view.targets.length === 0 ? null : (
+      <PingFamilySwitch family={family} states={states} onChange={setChosenFamily} />
+    );
   const group = linked ? `nd-ping-${nodeId}` : undefined;
   return (
-    <section className="chart-card ping-probe-panel" aria-label="Ping">
-      <PingProbeBlock
-        view={view}
-        protocol="icmp"
-        range={range}
-        group={group}
-        loading={probe.isPending}
-        observationModules={observationModules}
-      />
-      <PingProbeBlock
-        view={view}
-        protocol="tcp"
-        range={range}
-        group={group}
-        loading={probe.isPending}
-        observationModules={observationModules}
-      />
+    <section className="chart-card ping-probe-panel" aria-label="Ping" ref={panelRef}>
+      {(['icmp', 'tcp'] as const).map((protocol, index) => (
+        <PingProbeBlock
+          key={protocol}
+          targets={blocks[protocol]}
+          protocol={protocol}
+          family={family}
+          corner={
+            switcher && (index === 0 ? switcher : <span className="ping-family-switch-spacer" aria-hidden="true" />)
+          }
+          bounds={bounds}
+          group={group}
+          loading={probe.isPending}
+          observationModules={observationModules}
+        />
+      ))}
     </section>
   );
 }
@@ -4724,7 +5038,7 @@ function NodeChainsSection({
     <Suspense fallback={<NodeRuleCardState kind="chains" />}>
       <header>
         <PanelTitle of="chains">链路规则</PanelTitle>
-        <span className="rule-sheet-meta">{inChains.length} 条相关链</span>
+        <span className="rule-sheet-meta">{inChains.length} 条</span>
         <span className="sp" />
         <button className="btn" disabled={!canCreate} title="以当前机器作为入口" onClick={() => go({ p: 'chain', id })}>
           添加新链
@@ -5710,7 +6024,7 @@ function NodeDetail({
               nodes={nodes.data?.nodes ?? []}
               canEdit={can(who.role, 'edit')}
               canCreate={can(who.role, 'edit')}
-              settingsReadable={!isPublic(who)}
+              settingsReadable={!isVisitor(who)}
               go={go}
               snapshotReady={!!snapshot.data}
               snapshotError={snapshot.error}

@@ -49,9 +49,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Read pinned Xray compiler
+        id: xray-go
+        run: echo "version=$(cat "$GITHUB_WORKSPACE/components/xray-core/.go-version")" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-go@v5
         with:
-          go-version-file: components/xray-core/go.mod
+          go-version: ${{ steps.xray-go.outputs.version }}
           cache-dependency-path: components/xray-core/go.sum
 
       - name: AnyTLS deterministic and fuzz-seed tests
@@ -71,6 +75,11 @@ jobs:
 
       - name: AnyTLS race tests
         run: go test -race ./proxy/anytls -count=3 -timeout=10m
+
+      - name: Online source protocol tracking
+        run: |
+          go test -race ./app/stats/... ./app/dispatcher ./features/stats -count=3 -timeout=3m
+          go vet ./app/stats/... ./app/dispatcher ./features/stats
 
       - name: Mux and reverse deterministic tests
         run: go test ./common/buf ./common/mux ./app/reverse ./app/proxyman/outbound ./app/stats/command ./infra/conf ./proxy/vless/... -count=1 -timeout=10m
@@ -155,9 +164,13 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: Read pinned Xray compiler
+        id: xray-go
+        run: echo "version=$(cat "$GITHUB_WORKSPACE/components/xray-core/.go-version")" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-go@v5
         with:
-          go-version-file: components/xray-core/go.mod
+          go-version: ${{ steps.xray-go.outputs.version }}
           cache-dependency-path: components/xray-core/go.sum
 
       # With no argument, this reads `rust-toolchain.toml` — the version, rustfmt, clippy and the
@@ -181,6 +194,15 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
 
+      # Persist only bounded verification evidence, never compiled binaries. A unique save key
+      # allows successful runs to extend the ledger; a cache miss triggers independent rebuilding.
+      - name: Restore Xray reproducibility evidence
+        uses: actions/cache@v4
+        with:
+          path: target/brocade-xray-verified/records.json
+          key: xray-evidence-v1-${{ runner.os }}-check-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: xray-evidence-v1-${{ runner.os }}-check-
+
       - run: cargo fmt --all -- --check
 
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -196,6 +218,11 @@ jobs:
           cargo test -p brocade-store --test pg_integration --locked -- --ignored
           cargo test -p brocade-store --test tunnel_probe_pg --locked -- --ignored
           cargo test -p brocade-console --test http_integration --locked -- --ignored
+
+      - name: Agent online protocols against a real Xray process
+        run: |
+          CGO_ENABLED=0 go -C components/xray-core build -buildvcs=false -trimpath -o "${RUNNER_TEMP}/presence-xray" ./main
+          BROCADE_XRAY_BIN="${RUNNER_TEMP}/presence-xray" cargo test -p brocade-agent --locked native_grpc_round_trips_against_xray -- --ignored
 
       - name: Front-end lint, tests and self-checks
         working-directory: frontend
@@ -245,9 +272,13 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+      - name: Read pinned Xray compiler
+        id: xray-go
+        run: echo "version=$(cat "$GITHUB_WORKSPACE/components/xray-core/.go-version")" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-go@v5
         with:
-          go-version-file: components/xray-core/go.mod
+          go-version: ${{ steps.xray-go.outputs.version }}
           cache-dependency-path: components/xray-core/go.sum
 
       - name: Install the toolchain rust-toolchain.toml declares
@@ -272,6 +303,13 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
 
+      - name: Restore Xray reproducibility evidence
+        uses: actions/cache@v4
+        with:
+          path: target/brocade-xray-verified/records.json
+          key: xray-evidence-v1-${{ runner.os }}-${{ matrix.triple }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: xray-evidence-v1-${{ runner.os }}-${{ matrix.triple }}-
+
       - name: cargo build --release
         env:
           # Set for both architectures, because it applies only to the aarch64 target and the
@@ -290,6 +328,13 @@ jobs:
           fi
           cargo build --release --locked --target ${{ matrix.triple }} \
             -p brocade-console -p brocade-launcher
+
+      - name: Preserve embedded Xray build records
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-build-records-${{ matrix.triple }}
+          path: target/${{ matrix.triple }}/release/build/brocade-console-*/out/xray-*.build.json
+          if-no-files-found: error
 
       # Say what was actually produced. This binary carries both agents and the whole front end, so
       # the checksum belongs here to be compared against on the machine before anything is replaced.

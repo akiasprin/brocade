@@ -11,7 +11,6 @@ const chains = readFileSync(new URL('../src/panes/chains.tsx', import.meta.url),
 const tunnels = readFileSync(new URL('../src/panes/tunnels.tsx', import.meta.url), 'utf8');
 const vpngateProvider = readFileSync(new URL('../src/panes/vpngate-provider.tsx', import.meta.url), 'utf8');
 const vpngate = readFileSync(new URL('../src/panes/vpngate.tsx', import.meta.url), 'utf8');
-const links = readFileSync(new URL('../src/panes/links.tsx', import.meta.url), 'utf8');
 const usage = readFileSync(new URL('../src/panes/usage.tsx', import.meta.url), 'utf8');
 const telemetry = readFileSync(new URL('../src/panes/telemetry.tsx', import.meta.url), 'utf8');
 const observationCharts = readFileSync(new URL('../src/panes/node-observation-charts.tsx', import.meta.url), 'utf8');
@@ -27,7 +26,7 @@ test('登录入口与页面功能保持异步边界', () => {
   assert.doesNotMatch(app, /SessionRestoring/);
   assert.match(app, /<Suspense fallback=\{<div id="stage" \/>\}>/);
 
-  for (const module of ['nodes', 'chains', 'tunnels', 'users', 'deploy', 'usage', 'settings', 'password', 'links']) {
+  for (const module of ['nodes', 'chains', 'tunnels', 'users', 'deploy', 'usage', 'settings', 'password']) {
     assert.match(preload, new RegExp(`${module}: \\(\\) => import\\('\\./${module}'\\)`));
   }
   assert.match(preload, /topo: \(\) => import\('\.\.\/topo\/canvas'\)/);
@@ -37,23 +36,22 @@ test('登录入口与页面功能保持异步边界', () => {
     assert.match(panes, new RegExp(`import\\('./${module}'\\)`));
   }
 
-  assert.doesNotMatch(shell, /from '\.\.\/panes\/links'/);
+  assert.doesNotMatch(shell, /panes\/links/);
+  assert.doesNotMatch(preload, /import\('\.\/links'\)/);
   assert.doesNotMatch(shell, /from '\.\.\/topo\/canvas'/);
-  assert.match(shell, /import\('\.\.\/panes\/links'\)/);
   assert.match(shell, /import\('\.\.\/topo\/canvas'\)/);
 
   assert.doesNotMatch(nodes, /from 'echarts\//);
   assert.match(nodes, /import\('\.\/node-observation-charts'\)/);
-  assert.doesNotMatch(links, /from '\.\/nodes'/);
 });
 
 test('代码分包与首次 API 请求共用一个持续加载边界', () => {
   assert.match(panes, /<LoadingBoundary fallback=\{fallback\}/);
   assert.doesNotMatch(panes, /<LoadingBoundary[^>]*\bkey=/);
   assert.match(panes, /routeKey=\{paneLoadingRouteKey\(win\.key, win\.data\)\}/);
-  assert.match(shell, /<LoadingBoundary fallback=\{<Loading variant="links" sheeted \/>\} variant="links">/);
   assert.match(shell, /<LoadingBoundary fallback=\{<Loading variant="canvas" \/>\} variant="canvas">/);
   assert.match(usage, /monthly\.isPending[\s\S]*?return <Loading variant="usage" \/>/);
+  assert.match(usage, /placeholderData: previous => previous/);
 });
 
 test('机器详情先显示真实框架，各观测面板在自己的位置渐进读取', () => {

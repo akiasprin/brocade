@@ -27,6 +27,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
+use base64::Engine as _;
 use brocade_core::{
     hash::{hex_lower, sha256_hex},
     model::{IpFamily, ModelSettings, PortSettings, ProbeSettings},
@@ -58,9 +59,10 @@ use brocade_store::{
     UpdateNodeStatusRequest, UpdateNodeTrafficRequest, UpdateTunnelProbePolicy,
     UpdateUserProfileRequest, UpdateUserStatusRequest, UpdateVpngateCatalogSettings,
     UpdateVpngateIntelligenceCredentials, UpdateVpngateIntelligenceNode, UpdateVpngateProbeNode,
-    UpdateWarpBindingRequest, VerifyDeploymentRequest, VpngateAdmissionPolicy,
-    VpngateIntelligencePolicy, VpngateProbeNodeOrigin, VpngateServerPageRequest, VpngateSyncClaim,
-    XrayBuildInfo, XrayReleaseArtifact, XrayReleaseSummary, PUBLIC_OPERATOR_ID,
+    UpdateVpngateProbeSettings, UpdateWarpBindingRequest, UserDirectLoginRequest,
+    VerifyDeploymentRequest, VpngateAdmissionPolicy, VpngateIntelligencePolicy,
+    VpngateProbeNodeOrigin, VpngateServerPageRequest, VpngateSyncClaim, XrayBuildInfo,
+    XrayReleaseArtifact, XrayReleaseSummary, PUBLIC_OPERATOR_ID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -977,7 +979,10 @@ fn skips_admin_auth(method: &axum::http::Method, path: &str) -> bool {
         || path == "/auth/state"
         || (method == axum::http::Method::GET && path == "/branding")
         || (method == axum::http::Method::POST
-            && matches!(path, "/auth/init" | "/auth/login" | "/auth/logout"))
+            && matches!(
+                path,
+                "/auth/init" | "/auth/login" | "/auth/direct-login" | "/auth/logout"
+            ))
 }
 
 async fn admin_auth_context(
@@ -1053,6 +1058,7 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/auth/state", get(auth_state))
         .route("/auth/init", post(auth_init))
         .route("/auth/login", post(auth_login))
+        .route("/auth/direct-login", post(auth_direct_login))
         .route("/auth/logout", post(auth_logout))
         .route("/visitor-access", put(set_visitor_access))
         .route("/bootstrap", get(bootstrap))
@@ -1117,10 +1123,6 @@ fn admin_router_with_state(state: AppState) -> Router {
         )
         .route("/xray-releases/history", get(list_xray_release_history))
         .route("/xray-releases/{release_id}", get(get_xray_release))
-        .route(
-            "/xray-releases/{release_id}/confirm",
-            post(confirm_xray_release),
-        )
         .route(
             "/xray-releases/{release_id}/cancel",
             post(cancel_xray_release),
@@ -1214,6 +1216,11 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/nodes/{node_id}/agent-token", post(issue_node_token))
         .route("/nodes/{node_id}/agent-token", delete(revoke_node_token))
         .route("/users", get(list_users).post(create_user))
+        .route("/users/presence", get(list_user_presence))
+        .route(
+            "/users/{tenant_id}/{user_id}/presence-history",
+            get(user_online_source_history),
+        )
         .route(
             "/users/{tenant_id}/{user_id}/rotate-uuid",
             post(rotate_user_uuid),
@@ -1225,6 +1232,10 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route(
             "/users/{tenant_id}/{user_id}/login",
             post(issue_user_login).put(set_user_password),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/direct-login",
+            post(issue_user_direct_login).delete(revoke_user_direct_login),
         )
         .route(
             "/users/{tenant_id}/{user_id}/clash-subscription",
@@ -1277,6 +1288,10 @@ fn admin_router_with_state(state: AppState) -> Router {
             post(switch_vpngate_runtime),
         )
         .route("/vpngate/settings", put(update_vpngate_settings))
+        .route(
+            "/vpngate/probe-settings",
+            put(update_vpngate_probe_settings),
+        )
         .route(
             "/vpngate/admission-policy",
             put(update_vpngate_admission_policy),
@@ -1566,11 +1581,19 @@ async fn public_clash_subscription(
         return public_subscription_not_found();
     };
 
-    let subscription = match state
-        .store
-        .clash_subscription_by_uuid_filtered(&uuid, SubscriptionFilter { family, protocol })
-        .await
-    {
+    let filter = SubscriptionFilter { family, protocol };
+    let result = if subscription_uses_shadowrocket(&headers) {
+        state
+            .store
+            .shadowrocket_subscription_by_uuid_filtered(&uuid, filter)
+            .await
+    } else {
+        state
+            .store
+            .clash_subscription_by_uuid_filtered(&uuid, filter)
+            .await
+    };
+    let subscription = match result {
         Ok(subscription) => subscription,
         Err(StoreError::NotFound(_)) => return public_subscription_not_found(),
         Err(StoreError::Unavailable(_)) => return public_subscription_unavailable(),
@@ -1647,28 +1670,61 @@ fn public_subscription_protocol(
 fn public_clash_subscription_response(
     subscription: brocade_store::DynamicClashSubscription,
 ) -> Response {
+    use brocade_store::DynamicSubscriptionFormat;
+
     let filename = safe_filename_slug(&subscription.user_id);
-    let mut response = subscription.content.into_response();
+    let native = subscription.format == DynamicSubscriptionFormat::Shadowrocket;
+    let content = if native {
+        // Shadowrocket STATUS is a line in a Base64 URI subscription, not a YAML field or a
+        // replacement for the numeric subscription-userinfo contract used by Clash clients.
+        base64::engine::general_purpose::STANDARD.encode(format!(
+            "STATUS={}\r\n{}",
+            shadowrocket_usage_status(&subscription.usage),
+            subscription.content
+        ))
+    } else {
+        subscription.content
+    };
+    let mut response = content.into_response();
     let response_headers = response.headers_mut();
     response_headers.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("text/yaml; charset=utf-8"),
+        HeaderValue::from_static(if native {
+            "text/plain; charset=utf-8"
+        } else {
+            "text/yaml; charset=utf-8"
+        }),
     );
+    response_headers.insert(header::VARY, HeaderValue::from_static("User-Agent"));
+    response_headers.insert(
+        "x-brocade-subscription-format",
+        HeaderValue::from_static(if native { "shadowrocket" } else { "clash" }),
+    );
+    if let DynamicSubscriptionFormat::ClashCompatibility(reason) = subscription.format {
+        response_headers.insert(
+            "x-brocade-subscription-fallback",
+            HeaderValue::from_static(reason.as_str()),
+        );
+    }
     // `safe_filename_slug` limits this to an ASCII token. Keep it unquoted because some
     // subscription clients incorrectly preserve RFC-valid filename quotes as literal characters.
     if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename={filename}")) {
         response_headers.insert(header::CONTENT_DISPOSITION, value);
     }
     response_headers.insert("profile-update-interval", HeaderValue::from_static("1"));
-    let mut userinfo = format!(
-        "upload={}; download={}",
-        subscription.usage.upload_bytes, subscription.usage.download_bytes
-    );
-    if let Some(total) = subscription.usage.total_bytes {
-        userinfo.push_str(&format!("; total={total}"));
-    }
-    if let Ok(value) = HeaderValue::from_str(&userinfo) {
-        response_headers.insert("subscription-userinfo", value);
+    // Native Shadowrocket has one display source: STATUS. Keep the standard numeric header
+    // unchanged for YAML, including the compatibility path, rather than mixing two messages.
+    if !native {
+        let mut userinfo = format!(
+            "upload={}; download={}",
+            subscription.usage.upload_bytes, subscription.usage.download_bytes
+        );
+        if let Some(total) = subscription.usage.total_bytes {
+            userinfo.push_str(&format!("; total={total}"));
+        }
+        if let Ok(value) = HeaderValue::from_str(&userinfo) {
+            response_headers.insert("subscription-userinfo", value);
+        }
     }
     if let Ok(value) = HeaderValue::from_str(&subscription.usage.reset_at) {
         response_headers.insert("x-brocade-quota-reset-at", value);
@@ -1677,6 +1733,51 @@ fn public_clash_subscription_response(
         response_headers.insert("x-brocade-usage-gap", HeaderValue::from_static("true"));
     }
     subscription_no_store(response)
+}
+
+fn subscription_uses_shadowrocket(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_ascii_whitespace().next())
+        .and_then(|product| product.split('/').next())
+        .is_some_and(|product| product.eq_ignore_ascii_case("Shadowrocket"))
+}
+
+fn shadowrocket_usage_status(usage: &brocade_store::ClashSubscriptionUsage) -> String {
+    let total = usage
+        .total_bytes
+        .map(readable_subscription_bytes)
+        .unwrap_or_else(|| "∞".to_owned());
+    format!(
+        "↑:{},↓:{},TOT:{total}",
+        readable_subscription_bytes(usage.upload_bytes),
+        readable_subscription_bytes(usage.download_bytes),
+    )
+}
+
+fn readable_subscription_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 7] = ["B", "K", "M", "G", "T", "P", "E"];
+    let bytes = u128::from(bytes);
+    let mut divisor = 1_u128;
+    for (index, unit) in UNITS.iter().enumerate() {
+        // Integer rounding avoids precision loss/overflow even for u64::MAX. Promote a unit
+        // when rounding would display 1024 of it; emit at most two fractional digits.
+        let hundredths = (bytes * 100 + divisor / 2) / divisor;
+        if hundredths < 102_400 || index == UNITS.len() - 1 {
+            let whole = hundredths / 100;
+            let fraction = hundredths % 100;
+            return if fraction == 0 {
+                format!("{whole}{unit}")
+            } else if fraction.is_multiple_of(10) {
+                format!("{whole}.{}{unit}", fraction / 10)
+            } else {
+                format!("{whole}.{fraction:02}{unit}")
+            };
+        }
+        divisor *= 1024;
+    }
+    unreachable!("the final exabyte unit covers every u64 byte count")
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1870,6 +1971,22 @@ async fn auth_login(
     Json(request): Json<AdminLoginRequest>,
 ) -> ApiResult<Response> {
     let result = state.store.login_admin(request).await?;
+    let cookie = session_cookie(&result.session.token);
+    Ok((
+        [(header::SET_COOKIE, cookie)],
+        Json(LoginAdminHttpResponse {
+            admin: result.admin,
+            session_expires_at: result.session.expires_at,
+        }),
+    )
+        .into_response())
+}
+
+async fn auth_direct_login(
+    State(state): State<AppState>,
+    Json(request): Json<UserDirectLoginRequest>,
+) -> ApiResult<Response> {
+    let result = state.store.login_user_direct(request).await?;
     let cookie = session_cookie(&result.session.token);
     Ok((
         [(header::SET_COOKIE, cookie)],
@@ -2725,11 +2842,8 @@ struct XrayReleaseHttpResponse {
     xray_version: &'static str,
     console_version: &'static str,
     build_commit: &'static str,
-    /// Compact history is cheap to poll while a release is active. `releases` deliberately carries
-    /// only the newest target ledger and omits append-only events; full audit detail has its own
-    /// read endpoint.
-    history: Vec<XrayReleaseSummary>,
-    next_history_before_id: Option<i64>,
+    /// Only the active or latest target ledger is needed for approval and recovery. The immutable
+    /// audit trail remains available from its dedicated endpoint and is not part of routine polls.
     releases: Vec<brocade_store::XrayRelease>,
 }
 
@@ -2755,9 +2869,8 @@ fn embedded_xray_artifacts() -> Vec<XrayReleaseArtifact> {
 }
 
 async fn xray_release_response(state: &AppState) -> Result<XrayReleaseHttpResponse, StoreError> {
-    let page = xray_release_history_page(state, None).await?;
-    let history = page.history;
-    let releases = match history.first() {
+    let latest = state.store.list_xray_release_summaries(1, None).await?;
+    let releases = match latest.first() {
         Some(latest) => vec![state.store.xray_release_overview(latest.id).await?],
         None => Vec::new(),
     };
@@ -2767,8 +2880,6 @@ async fn xray_release_response(state: &AppState) -> Result<XrayReleaseHttpRespon
         xray_version: BROCADE_XRAY_VERSION,
         console_version: env!("CARGO_PKG_VERSION"),
         build_commit: env!("BROCADE_AGENT_COMMIT"),
-        history,
-        next_history_before_id: page.next_history_before_id,
         releases,
     })
 }
@@ -3105,19 +3216,6 @@ async fn create_xray_release(
                 artifacts: &artifacts,
             },
         )
-        .await?;
-    Ok(Json(xray_release_response(&state).await?).into_response())
-}
-
-async fn confirm_xray_release(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(release_id): Path<i64>,
-) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
-    state
-        .store
-        .confirm_xray_release(&admin, release_id, embedded_xray_release_id())
         .await?;
     Ok(Json(xray_release_response(&state).await?).into_response())
 }
@@ -3644,9 +3742,9 @@ async fn update_node(
     Ok(Json(result).into_response())
 }
 
-/// Re-signing invalidates the token on the machine immediately, so the response carries a command
-/// that installs the new token, rather than returning a token string and leaving the transfer to
-/// a manual copy.
+/// Re-signing invalidates the token on the machine immediately and marks its last reported runtime
+/// environment for full convergence. The response therefore carries a command that installs the
+/// new token, rather than returning a token string and leaving the transfer to a manual copy.
 #[derive(Debug, Serialize)]
 struct IssuedNodeTokenHttpResponse {
     node_id: String,
@@ -3661,7 +3759,7 @@ async fn issue_node_token(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     require_admin(&state, &headers, AdminPermission::SystemAdmin).await?;
-    let result = state.store.issue_node_token(&node_id).await?;
+    let result = state.store.reissue_node_token(&node_id).await?;
     let dist = state.distribution().await?;
     let script_url = format!("{}/enroll/install.sh", dist.agent_public_url);
     let script_sha256 = install_script_sha256();
@@ -3761,6 +3859,100 @@ async fn list_users(
     Ok(Json(result).into_response())
 }
 
+async fn list_user_presence(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let result = state.store.list_user_presence(&admin).await?;
+    let addresses = result
+        .users
+        .iter()
+        .flat_map(|user| user.sources.iter().map(|source| source.ip.clone()))
+        .collect();
+    Ok(with_source_locations(&state, result, addresses)
+        .await?
+        .into_response())
+}
+
+/// Only decorate addresses already authorized by the Store. Locations come from the in-memory
+/// local country/operator indexes, never an IP lookup service, and are not persisted with history.
+#[derive(Serialize)]
+struct SourceLocationResponse<T> {
+    #[serde(flatten)]
+    data: T,
+    source_countries: Vec<SourceCountry>,
+    source_operators: Vec<SourceOperator>,
+}
+
+// Keep addresses in values, not JSON object keys: the response masking boundary must also
+// redact these addresses for read-only operators.
+#[derive(Serialize)]
+struct SourceCountry {
+    ip: String,
+    country: String,
+}
+
+#[derive(Serialize)]
+struct SourceOperator {
+    ip: String,
+    operator: crate::geoip::NetworkOperator,
+}
+
+async fn with_source_locations<T: Serialize>(
+    state: &AppState,
+    data: T,
+    addresses: Vec<String>,
+) -> ApiResult<Json<SourceLocationResponse<T>>> {
+    let source_countries = if addresses.is_empty() {
+        HashMap::new()
+    } else {
+        let settings = state.store.settings().await?;
+        state
+            .geoip
+            .countries(&settings.geodata.geoip_url, &addresses)
+            .await
+    };
+    let mut source_countries = source_countries
+        .into_iter()
+        .map(|(ip, country)| SourceCountry { ip, country })
+        .collect::<Vec<_>>();
+    source_countries.sort_by(|left, right| left.ip.cmp(&right.ip));
+    let mut source_operators = state
+        .geoip
+        .operators(&addresses)
+        .await
+        .into_iter()
+        .map(|(ip, operator)| SourceOperator { ip, operator })
+        .collect::<Vec<_>>();
+    source_operators.sort_by(|left, right| left.ip.cmp(&right.ip));
+    Ok(Json(SourceLocationResponse {
+        data,
+        source_countries,
+        source_operators,
+    }))
+}
+
+async fn user_online_source_history(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let result = state
+        .store
+        .user_online_source_history(&admin, &tenant_id, &user_id)
+        .await?;
+    let addresses = result
+        .sources
+        .iter()
+        .map(|source| source.ip.clone())
+        .collect();
+    Ok(with_source_locations(&state, result, addresses)
+        .await?
+        .into_response())
+}
+
 async fn rotate_user_uuid(
     State(state): State<AppState>,
     Path((tenant_id, user_id)): Path<(String, String)>,
@@ -3814,6 +4006,37 @@ async fn set_user_password(
         .set_user_password(&admin, &tenant_id, &user_id, request)
         .await?;
     Ok(Json(result).into_response())
+}
+
+async fn issue_user_direct_login(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::ManageOperators).await?;
+    let result = state
+        .store
+        .issue_user_direct_login(&admin, &tenant_id, &user_id)
+        .await?;
+    Ok((StatusCode::CREATED, Json(result)).into_response())
+}
+
+async fn revoke_user_direct_login(
+    State(state): State<AppState>,
+    Path((tenant_id, user_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::ManageOperators).await?;
+    let revoked = state
+        .store
+        .revoke_user_direct_login(&admin, &tenant_id, &user_id)
+        .await?;
+    Ok(Json(json!({
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "revoked": revoked,
+    }))
+    .into_response())
 }
 
 async fn self_user_context(
@@ -4610,6 +4833,21 @@ async fn update_vpngate_settings(
         state
             .store
             .update_vpngate_catalog_settings(&admin, request)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn update_vpngate_probe_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateVpngateProbeSettings>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    Ok(Json(
+        state
+            .store
+            .update_vpngate_probe_settings(&admin, request)
             .await?,
     )
     .into_response())
@@ -5440,13 +5678,15 @@ async fn agent_vpngate_desired(
         .await;
     let origins = probe_nodes
         .into_iter()
-        .filter_map(|probe_node| {
-            countries
+        .map(|probe_node| VpngateProbeNodeOrigin {
+            node_id: probe_node.node_id,
+            // Keep unresolved machines in the placement input. When the whole local GeoIP
+            // database is unavailable, Store can still shard the complete fallback queue across
+            // the selected fleet instead of making every machine repeat every profile.
+            country_code: countries
                 .get(&probe_node.public_ipv4)
-                .map(|country_code| VpngateProbeNodeOrigin {
-                    node_id: probe_node.node_id,
-                    country_code: country_code.clone(),
-                })
+                .cloned()
+                .unwrap_or_else(|| "ZZ".to_owned()),
         })
         .collect::<Vec<_>>();
     match state
@@ -5978,15 +6218,25 @@ async fn serve_agent_realtime(
     realtime.unregister_agent(&node_id, session_id).await;
 }
 
-/// Runtime TCP and ICMP targets. The same settings are returned to every active node; each URI is
-/// the series identifier and its scheme selects the probe operation.
+/// Runtime TCP and ICMP targets. The same settings are returned to every active node. A
+/// dual-stack Agent receives each target's IPv4 and IPv6 endpoints; an older Agent receives only
+/// the IP-literal endpoints as one URI each (`PingProbeSettings::legacy`), because it cannot report
+/// which family a domain resolved to.
 async fn agent_ping_probe_targets(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
     require_active_agent(&node)?;
-    Ok(Json(state.store.ping_probe_settings().await?).into_response())
+    let settings = state.store.ping_probe_settings().await?;
+    let dual_stack = agent_protocol_version(&headers).is_some_and(|version| {
+        version >= brocade_deployment::protocol::DUAL_STACK_PING_PROTOCOL_VERSION
+    });
+    if dual_stack {
+        Ok(Json(settings).into_response())
+    } else {
+        Ok(Json(settings.legacy()).into_response())
+    }
 }
 
 async fn agent_ping_probe(
@@ -7035,7 +7285,222 @@ mod tests {
         SUBSCRIPTION_CACHE_CONTROL,
     };
     use brocade_store::LoadSeriesQuery;
+
+    #[test]
+    fn source_location_responses_preserve_presence_and_history_contracts() {
+        let source = serde_json::json!({
+            "ip": "2001:db8::1", "node_ids": ["n1", "n2"], "ingress_ids": ["i1", "i2"],
+            "accesses": [
+                {"node_id": "n1", "ingress_id": "i1", "protocols": ["vless"]},
+                {"node_id": "n2", "ingress_id": "i2", "protocols": ["anytls", "hysteria2"]}
+            ]
+        });
+        for data in [
+            serde_json::json!({"freshness_secs": 120, "users": [{"sources": [source.clone()]}]}),
+            serde_json::json!({"retention_days": 30, "truncated": false, "sources": [source]}),
+        ] {
+            let response = super::SourceLocationResponse {
+                data: data.clone(),
+                source_countries: vec![super::SourceCountry {
+                    ip: "2001:db8::1".to_owned(),
+                    country: "JP".to_owned(),
+                }],
+                source_operators: vec![super::SourceOperator {
+                    ip: "2001:db8::1".to_owned(),
+                    operator: crate::geoip::NetworkOperator::Chinanet,
+                }],
+            };
+            let mut value = serde_json::to_value(response).unwrap();
+            for (key, original) in data.as_object().unwrap() {
+                assert_eq!(&value[key], original);
+            }
+            assert_eq!(
+                value["source_countries"],
+                serde_json::json!([{"ip": "2001:db8::1", "country": "JP"}])
+            );
+            assert!(value.get("data").is_none());
+            assert_eq!(
+                value["source_operators"],
+                serde_json::json!([{"ip": "2001:db8::1", "operator": "chinanet"}])
+            );
+            crate::mask::mask_json(&mut value);
+            assert_eq!(value["source_countries"][0]["ip"], "2001:db8:***");
+            assert_eq!(value["source_countries"][0]["country"], "JP");
+            assert_eq!(value["source_operators"][0]["ip"], "2001:db8:***");
+            assert_eq!(value["source_operators"][0]["operator"], "chinanet");
+            assert!(!value.to_string().contains("2001:db8::1"));
+        }
+    }
     use tokio_stream::StreamExt;
+
+    #[test]
+    fn subscription_client_detection_matches_the_ua_product_not_a_substring() {
+        let mut headers = HeaderMap::new();
+        assert!(!super::subscription_uses_shadowrocket(&headers));
+        for (ua, expected) in [
+            ("Shadowrocket/2247 CFNetwork/1494 Darwin/23.4.0", true),
+            ("Shadowrocket/2.2.50 (iPhone; iOS 18.0)", true),
+            ("shadowrocket", true),
+            (" SHADOWROCKET/2592 ", true),
+            ("Clash.Meta/1.19", false),
+            ("Mozilla/5.0 (Shadowrocket)", false),
+            ("NotShadowrocket/1.0", false),
+            ("ShadowrocketHelper/1.0", false),
+            ("", false),
+        ] {
+            headers.insert("user-agent", HeaderValue::from_str(ua).unwrap());
+            assert_eq!(
+                super::subscription_uses_shadowrocket(&headers),
+                expected,
+                "{ua}"
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_readable_units_round_without_losing_large_integer_counts() {
+        for (bytes, expected) in [
+            (0, "0B"),
+            (1023, "1023B"),
+            (1024, "1K"),
+            (1536, "1.5K"),
+            (1_290, "1.26K"),
+            (1024 * 1024 - 1, "1M"),
+            (1_342_177_280, "1.25G"),
+            (u64::MAX, "16E"),
+        ] {
+            assert_eq!(super::readable_subscription_bytes(bytes), expected);
+        }
+    }
+
+    fn subscription_fixture(
+        format: brocade_store::DynamicSubscriptionFormat,
+    ) -> brocade_store::DynamicClashSubscription {
+        brocade_store::DynamicClashSubscription {
+            tenant_id: "test".to_owned(),
+            user_id: "alice".to_owned(),
+            uuid: "test-only".to_owned(),
+            revision: 1,
+            content: "vless://test-only@node.example:443?security=reality#test\n".to_owned(),
+            format,
+            usage: brocade_store::ClashSubscriptionUsage {
+                upload_bytes: 1_342_177_280,
+                download_bytes: 536_870_912,
+                total_bytes: Some(107_374_182_400),
+                remaining_bytes: Some(105_495_134_208),
+                reset_at: "2026-10-01T00:00:00+08:00".to_owned(),
+                has_gap: false,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn shadowrocket_subscription_encodes_readable_status_without_usage_gap_label() {
+        use base64::Engine as _;
+        let mut subscription =
+            subscription_fixture(brocade_store::DynamicSubscriptionFormat::Shadowrocket);
+        subscription.usage.has_gap = true;
+        let expected = format!("STATUS=↑:1.25G,↓:512M,TOT:100G\r\n{}", subscription.content);
+        let response = super::public_clash_subscription_response(subscription);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(response.headers()["vary"], "User-Agent");
+        assert_eq!(
+            response.headers()["cache-control"],
+            SUBSCRIPTION_CACHE_CONTROL
+        );
+        assert_eq!(
+            response.headers()["x-brocade-subscription-format"],
+            "shadowrocket"
+        );
+        assert!(!response.headers().contains_key("subscription-userinfo"));
+        assert_eq!(response.headers()["x-brocade-usage-gap"], "true");
+        assert!(!response.headers().contains_key("etag"));
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(body)
+                .unwrap(),
+            expected.as_bytes()
+        );
+    }
+
+    #[test]
+    fn shadowrocket_subscription_distinguishes_unlimited_from_zero_quota() {
+        let mut usage =
+            subscription_fixture(brocade_store::DynamicSubscriptionFormat::Shadowrocket).usage;
+        usage.total_bytes = None;
+        assert!(super::shadowrocket_usage_status(&usage).ends_with("TOT:∞"));
+        usage.total_bytes = Some(0);
+        usage.has_gap = true;
+        assert_eq!(
+            super::shadowrocket_usage_status(&usage),
+            "↑:1.25G,↓:512M,TOT:0B"
+        );
+        assert!(
+            !super::shadowrocket_usage_status(&usage).contains("2026"),
+            "reset is not expiration"
+        );
+    }
+
+    #[test]
+    fn shadowrocket_subscription_formats_compact_traffic_and_quota_units() {
+        let mut usage =
+            subscription_fixture(brocade_store::DynamicSubscriptionFormat::Shadowrocket).usage;
+        usage.upload_bytes = 123 * 1024_u64.pow(3) / 100;
+        usage.download_bytes = 234 * 1024_u64.pow(3) / 100;
+        usage.total_bytes = Some(2121 * 1024_u64.pow(4) / 100);
+        assert_eq!(
+            super::shadowrocket_usage_status(&usage),
+            "↑:1.23G,↓:2.34G,TOT:21.21T"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_yaml_and_compatibility_keep_content_and_numeric_headers() {
+        use brocade_core::format::uri::UriSubscriptionUnsupported;
+        use brocade_store::DynamicSubscriptionFormat;
+        for format in [
+            DynamicSubscriptionFormat::Clash,
+            DynamicSubscriptionFormat::ClashCompatibility(UriSubscriptionUnsupported::FrontProxy),
+            DynamicSubscriptionFormat::ClashCompatibility(
+                UriSubscriptionUnsupported::SelfSignedCertificate,
+            ),
+        ] {
+            let mut subscription = subscription_fixture(format);
+            subscription.content = "proxies: []\n".to_owned();
+            let response = super::public_clash_subscription_response(subscription);
+            assert_eq!(
+                response.headers()["content-type"],
+                "text/yaml; charset=utf-8"
+            );
+            assert_eq!(
+                response.headers()["subscription-userinfo"],
+                "upload=1342177280; download=536870912; total=107374182400"
+            );
+            assert_eq!(response.headers()["x-brocade-subscription-format"], "clash");
+            if let DynamicSubscriptionFormat::ClashCompatibility(reason) = format {
+                assert_eq!(
+                    response.headers()["x-brocade-subscription-fallback"],
+                    reason.as_str()
+                );
+            } else {
+                assert!(!response
+                    .headers()
+                    .contains_key("x-brocade-subscription-fallback"));
+            }
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap(),
+                "proxies: []\n"
+            );
+        }
+    }
 
     #[test]
     fn fleet_realtime_projection_removes_diagnostics_from_every_snapshot_sample() {
@@ -7446,6 +7911,8 @@ mod tests {
             "/distribution",
             "/admin/operators",
             "/artifacts/index",
+            "/users/presence",
+            "/users/platform.acme/alice/presence-history",
             "/vpngate/settings",
             "/vpngate/countries/JP/servers/extra",
             "/nodes/hk-01/public-ip-history/extra",
@@ -7461,6 +7928,7 @@ mod tests {
         assert!(!public_may(&Method::PUT, "/node-traffic/nodes/hk-01"));
         assert!(!public_may(&Method::PUT, "/nodes/hk-01"));
         assert!(!public_may(&Method::PUT, "/vpngate/settings"));
+        assert!(!public_may(&Method::PUT, "/vpngate/probe-settings"));
         assert!(!public_may(&Method::PUT, "/vpngate/admission-policy"));
         assert!(!public_may(&Method::PUT, "/vpngate/intelligence-policy"));
         assert!(!public_may(&Method::POST, "/vpngate/intelligence-refresh"));
@@ -7513,6 +7981,12 @@ mod tests {
         assert!(user_may(&Method::GET, "/usage/samples"));
         assert!(user_may(&Method::GET, "/usage/monthly-summary"));
         assert!(user_may(&Method::GET, "/me/user"));
+        assert!(!user_may(&Method::GET, "/me/presence"));
+        assert!(!user_may(&Method::GET, "/users/presence"));
+        assert!(!user_may(
+            &Method::GET,
+            "/users/platform.acme/alice/presence-history"
+        ));
         assert!(!user_may(&Method::PUT, "/me/user"));
         assert!(user_may(&Method::POST, "/me/rotate-uuid"));
         assert!(user_may(&Method::GET, "/me/artifact"));
@@ -7615,6 +8089,10 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("--enable-openvpn)"));
         assert!(!INSTALL_SCRIPT.contains("--enable-vpngate"));
         assert!(INSTALL_SCRIPT.contains("if [ \"$ENABLE_VPNGATE\" = \"1\" ]; then"));
+        assert!(INSTALL_SCRIPT.contains("ensure_tun_runtime || exit 1"));
+        assert!(INSTALL_SCRIPT.contains("modprobe tun"));
+        assert!(INSTALL_SCRIPT.contains("/etc/modules-load.d/brocade-vpngate.conf"));
+        assert!(INSTALL_SCRIPT.contains("tun_device_usable"));
     }
 
     #[test]
@@ -7664,15 +8142,18 @@ mod tests {
             format!("XRAY_VERSION=${{BROCADE_XRAY_VERSION:-{BROCADE_XRAY_VERSION}}}");
         let upstream = include_str!("../../../components/xray-core/BROCADE_UPSTREAM.toml");
         let build_script = include_str!("../build.rs");
+        let xray_builder = include_str!("../build/xray.rs");
 
         assert!(INSTALL_SCRIPT.contains(&script_default));
         assert!(upstream.contains(&format!("tag = \"{BROCADE_XRAY_VERSION}\"")));
         assert!(upstream.contains("anytls = true"));
         assert!(upstream.contains("sniffing_failure_routing = true"));
         assert!(build_script.contains("const XRAY_UPSTREAM_BUILD: &str = \"b4f0898\""));
-        assert!(build_script.contains("core.build={build_id}"));
-        assert!(!build_script.contains("fn repository_build_id"));
-        assert!(!build_script.contains("core.build=brocade"));
+        assert!(xray_builder.contains("core.build={build_id}"));
+        for source in [build_script, xray_builder] {
+            assert!(!source.contains("fn repository_build_id"));
+            assert!(!source.contains("core.build=brocade"));
+        }
         assert!(!INSTALL_SCRIPT.contains("brocade-$XRAY_VERSION"));
         assert!(INSTALL_SCRIPT.contains("xray_bin_url_$XRAY_ARCH"));
         assert!(INSTALL_SCRIPT.contains("xray_bin_sha256_$XRAY_ARCH"));

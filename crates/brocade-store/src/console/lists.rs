@@ -245,7 +245,10 @@ pub async fn list_users(
                         WHERE o.role = 'user'
                           AND o.user_tenant_id = users.tenant_id
                           AND o.user_id = users.id
+                          AND o.password_hash IS NOT NULL
                     ) AS login_enabled,
+                    (direct_login_token_hash IS NOT NULL
+                     AND direct_login_revoked_at IS NULL) AS direct_login_enabled,
                     created_at::text AS created_at, created_revision
              FROM users
              WHERE ($1::text IS NULL OR tenant_id = $1)
@@ -265,7 +268,10 @@ pub async fn list_users(
                         WHERE o.role = 'user'
                           AND o.user_tenant_id = users.tenant_id
                           AND o.user_id = users.id
+                          AND o.password_hash IS NOT NULL
                     ) AS login_enabled,
+                    (direct_login_token_hash IS NOT NULL
+                     AND direct_login_revoked_at IS NULL) AS direct_login_enabled,
                     created_at::text AS created_at, created_revision
              FROM users
              WHERE tenant_id = $1
@@ -288,7 +294,10 @@ pub async fn list_users(
                         WHERE o.role = 'user'
                           AND o.user_tenant_id = users.tenant_id
                           AND o.user_id = users.id
+                          AND o.password_hash IS NOT NULL
                     ) AS login_enabled,
+                    (direct_login_token_hash IS NOT NULL
+                     AND direct_login_revoked_at IS NULL) AS direct_login_enabled,
                     created_at::text AS created_at, created_revision
              FROM users
              WHERE (tenant_id = $1 OR tenant_id LIKE $2 ESCAPE '\\')

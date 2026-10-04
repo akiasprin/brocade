@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
 
 /* 图标库以线稿为主，品牌标识保留原轮廓。16 网格、1.5px 描边、圆角线帽，
-   currentColor 由使用处的 CSS 定。两个出口：ListIcon 是列表页标题行的固定用法（16px、.list-ico 定色 --ink-2）；
+   currentColor 由使用处的 CSS 定。ListIcon 与 PanelTitle 共用 14px 标题图标；
    Icon 是通用件，尺寸和着色类由调用点给（顶栏导航 14px、产物/诊断 13px）。 */
 
 const PATHS = {
@@ -167,13 +167,6 @@ const PATHS = {
       <path d="M5.7 8 H10.3" />
     </>
   ),
-  /* 链路与 MTU：一把端点明确的短尺，强调测量而不是再次画一条链。 */
-  linkMeasure: (
-    <>
-      <path d="M2.4 5.5 V10.5 M13.6 5.5 V10.5 M2.6 8 H13.4" strokeWidth="1.25" />
-      <path d="M5.4 6.8 V9.2 M8 7.1 V8.9 M10.6 6.8 V9.2" strokeWidth="1.25" />
-    </>
-  ),
   /* 订阅源：圆点和两级扩散弧沿用 feed 的通用语义。 */
   subscription: (
     <>
@@ -309,6 +302,13 @@ const PATHS = {
       <path d="M4.4 7.3 L8 3.7 L11.6 7.3" />
     </>
   ),
+  /* 发布页的「可升级」：机器落后于可发版本，等待批准。与 tx 同形，按语义单列。 */
+  upgrade: (
+    <>
+      <path d="M8 12.8 V3.6" />
+      <path d="M4.6 7 L8 3.6 L11.4 7" />
+    </>
+  ),
   /* 产物状态：已应用 / 已关闭 / 已变化。
      关闭用一条横线而不是叉——叉读作失败，而 disabled 是一个正常取值，需要与 dirty 区分。
      变化用 ≠，即「机器上的与该修订不一致」。 */
@@ -320,6 +320,8 @@ const PATHS = {
     </>
   ),
   close: <path d="M3.5 3.5 L12.5 12.5 M12.5 3.5 L3.5 12.5" />,
+  /* 展开符：顶栏账户牌表示点击后展开菜单。 */
+  chevronDown: <path d="M4.6 6.4 L8 9.8 L11.4 6.4" />,
   dash: <path d="M3.8 8 H12.2" />,
   /* 在等：发布流水里表示等待确认或待补偿。与 check / close 同为结果图标，因此同样只有线稿。 */
   clock: (
@@ -384,9 +386,11 @@ export function Icon({ of, size = 16, className }: { of: IconName; size?: number
   );
 }
 
-/* 列表页标题行的固定用法：16px，颜色由 .list-ico 定为 --ink-2，比 15px/600 的标题浅一档。 */
+const PANEL_TITLE_ICON_SIZE = 14;
+
+/* 列表标题的独立图标，与 PanelTitle 使用同一尺寸。 */
 export function ListIcon({ of }: { of: IconName }) {
-  return <Icon of={of} size={16} className="list-ico" />;
+  return <Icon of={of} size={PANEL_TITLE_ICON_SIZE} className="list-ico" />;
 }
 
 /* 详情页卡片标题的统一骨架。图标放进 h4 内部，使标题与右侧状态、按钮仍是 header 的
@@ -394,7 +398,7 @@ export function ListIcon({ of }: { of: IconName }) {
 export function PanelTitle({ of, children }: { of: IconName; children: ReactNode }) {
   return (
     <h4 className="panel-title">
-      <Icon of={of} size={12} className="panel-title-icon" />
+      <Icon of={of} size={PANEL_TITLE_ICON_SIZE} className="panel-title-icon" />
       {children}
     </h4>
   );

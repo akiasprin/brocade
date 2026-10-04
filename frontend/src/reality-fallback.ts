@@ -1,5 +1,8 @@
 import type { RealityFallbackLimits, RealityFallbackRateLimit } from './api';
 
+/** New listeners default to strict; existing explicit policies must survive unrelated edits. */
+export const newRealityFallbackLimits = (): RealityFallbackLimits => ({ mode: 'strict' });
+
 export interface FallbackRateDraft {
   afterBytes: string;
   bytesPerSec: string;

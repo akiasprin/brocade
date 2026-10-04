@@ -27,6 +27,24 @@ pub struct AuthenticatedNode {
 }
 
 pub async fn issue_node_token(pool: &PgPool, node_id: &str) -> Result<IssuedNodeToken> {
+    issue_node_token_inner(pool, node_id, false).await
+}
+
+/// Rotate a node token for a machine which may have been reinstalled.
+///
+/// The control plane cannot distinguish a token rotation from a clean operating-system install.
+/// In the latter case the old applied-state row is only history: the new machine has no local
+/// files or runtime state to replay. Mark the whole managed environment unknown so the next
+/// desired-state poll can reconstruct every artifact from the last successful targets.
+pub async fn reissue_node_token(pool: &PgPool, node_id: &str) -> Result<IssuedNodeToken> {
+    issue_node_token_inner(pool, node_id, true).await
+}
+
+async fn issue_node_token_inner(
+    pool: &PgPool,
+    node_id: &str,
+    reconcile_environment: bool,
+) -> Result<IssuedNodeToken> {
     if node_id.trim().is_empty() {
         return Err(StoreError::InvalidData(
             "node_id must not be empty when issuing a node token".to_owned(),
@@ -62,7 +80,14 @@ pub async fn issue_node_token(pool: &PgPool, node_id: &str) -> Result<IssuedNode
          ON CONFLICT (node_id) DO UPDATE SET
             token_hash = EXCLUDED.token_hash,
             token_prefix = EXCLUDED.token_prefix,
-            token_created_at = EXCLUDED.token_created_at,
+            token_created_at = CASE
+                WHEN node_agent_state.token_created_at IS NULL
+                    THEN EXCLUDED.token_created_at
+                ELSE GREATEST(
+                    EXCLUDED.token_created_at,
+                    node_agent_state.token_created_at + interval '1 microsecond'
+                )
+            END,
             token_last_used_at = NULL,
             token_revoked_at = NULL
          RETURNING node_id, token_prefix",
@@ -72,6 +97,49 @@ pub async fn issue_node_token(pool: &PgPool, node_id: &str) -> Result<IssuedNode
     .bind(token_prefix)
     .fetch_one(&mut *tx)
     .await?;
+    if reconcile_environment {
+        sqlx::query(
+            "UPDATE node_applied_state
+                SET phantun_state = 'unknown',
+                    phantun_sha256 = NULL,
+                    phantun_observed = jsonb_build_object(
+                        'state', 'unknown',
+                        'reason', 'node token re-signed; environment must converge again',
+                        'reconcile', 'node-token-resigned'
+                    ),
+                    wireguard_state = 'unknown',
+                    wireguard_sha256 = NULL,
+                    wireguard_observed = jsonb_build_object(
+                        'state', 'unknown',
+                        'reason', 'node token re-signed; environment must converge again',
+                        'reconcile', 'node-token-resigned'
+                    ),
+                    xray_state = 'unknown',
+                    xray_sha256 = NULL,
+                    xray_observed = jsonb_build_object(
+                        'state', 'unknown',
+                        'reason', 'node token re-signed; environment must converge again',
+                        'reconcile', 'node-token-resigned'
+                    ),
+                    hy2_port_hop_state = 'unknown',
+                    hy2_port_hop_sha256 = NULL,
+                    hy2_port_hop_observed = jsonb_build_object(
+                        'state', 'unknown',
+                        'reason', 'node token re-signed; environment must converge again',
+                        'reconcile', 'node-token-resigned'
+                    ),
+                    grants_state = 'unknown',
+                    grants_observed = jsonb_build_object(
+                        'state', 'unknown',
+                        'reason', 'node token re-signed; environment must converge again',
+                        'reconcile', 'node-token-resigned'
+                    )
+              WHERE node_id = $1",
+        )
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     crate::notifications::initialize_waiting(&mut tx, node_id).await?;
     tx.commit().await?;
 
@@ -380,6 +448,8 @@ pub async fn record_node_runtime(
         .transpose()?
         .unwrap_or_else(|| serde_json::json!({}));
 
+    let mut tx = pool.begin().await?;
+
     let result = sqlx::query(
         "UPDATE node_agent_state
          SET runtime_versions = $2,
@@ -387,7 +457,11 @@ pub async fn record_node_runtime(
              last_local_reconcile = COALESCE($4, last_local_reconcile),
              wireguard_health = COALESCE($5, wireguard_health),
              geodata_observed = $6,
-             runtime_reported_at = to_timestamp($7)
+             runtime_reported_at = to_timestamp($7),
+             online_sources_reported_at = CASE
+                 WHEN $8 THEN to_timestamp($7)
+                 ELSE online_sources_reported_at
+             END
          WHERE node_id = $1
            AND token_hash IS NOT NULL
            AND token_revoked_at IS NULL
@@ -400,7 +474,8 @@ pub async fn record_node_runtime(
     .bind(wireguard_health)
     .bind(geodata)
     .bind(observed_at as f64)
-    .execute(pool)
+    .bind(report.online_sources.is_some())
+    .execute(&mut *tx)
     .await?;
 
     if result.rows_affected() == 0 {
@@ -413,17 +488,24 @@ pub async fn record_node_runtime(
              )",
         )
         .bind(node_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
         if active {
             // A newer runtime snapshot already won. The old report is accepted as a harmless
             // duplicate so its sender does not retry a state that can never become current.
+            tx.commit().await?;
             return Ok(());
         }
         return Err(StoreError::Unauthorized(format!(
             "node {node_id} does not have an active node token"
         )));
     }
+
+    if let Some(online_sources) = report.online_sources.as_deref() {
+        crate::user_presence::replace_node_snapshot(&mut tx, node_id, observed_at, online_sources)
+            .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 

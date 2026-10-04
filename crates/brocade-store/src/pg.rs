@@ -29,6 +29,7 @@ use crate::settings;
 use crate::traffic;
 use crate::tunnel_probe;
 use crate::usage;
+use crate::user_presence;
 use crate::xray_release;
 use crate::{
     agent, materialize, AdminAuthState, AdminContext, AdminInitRequest, AdminInitResult,
@@ -41,24 +42,25 @@ use crate::{
     DeleteFrontResult, DeleteStepResult, DeploymentCommandResult, DeploymentDetail, DeploymentList,
     DeploymentVerification, DeploymentWaveConfirmationResult, DynamicClashSubscription,
     E2eProbeItem, E2eProbeRequest, E2eProbeResult, E2eProbeTargetList, FrontClientConfigState,
-    FrontRouteAnalysisView, HopLinkList, IssuedAdminToken, IssuedNodeToken, IssuedUserLogin,
-    LinkHealthItem, LinkHealthRequest, LinkHealthResult, LinkMtuView, LinkProbeRequest,
-    LinkProbeResult, LoadReportRequest, LoadReportResult, LoadSeriesQuery, ModelWriteResult,
-    NodeAgentStateList, NodeDesiredDeployment, NodeLoadList, NodeLoadView, NodePingProbeLatestList,
-    NodePingProbeList, NodePingProbeView, PingProbeReportRequest, PingProbeReportResult,
-    PingProbeSettings, ProbeTargetList, ProvisionNodeRequest, ProvisionNodeResult,
-    PruneChainResult, QuotaEnforcementOutcome, QuotaEnforcementPlan, RegisterWarpBindingRequest,
-    RegisterWarpBindingResult, RemoveRetiredNodesRequest, RemoveRetiredNodesResult,
-    RemoveWarpBindingRequest, RemoveWarpBindingResult, ReportTargetResult,
-    ResetAdminPasswordResult, Result, RevisionList, RotateUserUuidResult, SetUserAppQuotaRequest,
-    SetUserAppQuotaResult, SetUserPasswordRequest, SetUserPasswordResult, StoreError,
-    SystemInitRequest, SystemInitResult, TargetConvergenceReport, TenantList, UpdateNodeRequest,
-    UpdateNodeResult, UpdateSettingsResult, UpdateUserProfileRequest, UpdateUserStatusRequest,
-    UpdateUserStatusResult, UpdateWarpBindingRequest, UpdateWarpBindingResult, UpsertAppResult,
-    UpsertChainResult, UpsertFrontResult, UpsertGrantResult, UpsertIngressResult,
-    UpsertTenantResult, UpsertUserResult, UsageMonthlySummary, UsageNodeSeriesList,
-    UsageReportRequest, UsageReportResult, UsageSampleList, UserAppQuotaList, UserGrantProbePlan,
-    UserList, VerifyDeploymentRequest, WarpBindingRemoval,
+    FrontRouteAnalysisView, HopLinkList, IssuedAdminToken, IssuedNodeToken, IssuedUserDirectLogin,
+    IssuedUserLogin, LinkHealthItem, LinkHealthRequest, LinkHealthResult, LinkMtuView,
+    LinkProbeRequest, LinkProbeResult, LoadReportRequest, LoadReportResult, LoadSeriesQuery,
+    ModelWriteResult, NodeAgentStateList, NodeDesiredDeployment, NodeLoadList, NodeLoadView,
+    NodePingProbeLatestList, NodePingProbeList, NodePingProbeView, PingProbeReportRequest,
+    PingProbeReportResult, PingProbeSettings, ProbeTargetList, ProvisionNodeRequest,
+    ProvisionNodeResult, PruneChainResult, QuotaEnforcementOutcome, QuotaEnforcementPlan,
+    RegisterWarpBindingRequest, RegisterWarpBindingResult, RemoveRetiredNodesRequest,
+    RemoveRetiredNodesResult, RemoveWarpBindingRequest, RemoveWarpBindingResult,
+    ReportTargetResult, ResetAdminPasswordResult, Result, RevisionList, RotateUserUuidResult,
+    SetUserAppQuotaRequest, SetUserAppQuotaResult, SetUserPasswordRequest, SetUserPasswordResult,
+    StoreError, SystemInitRequest, SystemInitResult, TargetConvergenceReport, TenantList,
+    UpdateNodeRequest, UpdateNodeResult, UpdateSettingsResult, UpdateUserProfileRequest,
+    UpdateUserStatusRequest, UpdateUserStatusResult, UpdateWarpBindingRequest,
+    UpdateWarpBindingResult, UpsertAppResult, UpsertChainResult, UpsertFrontResult,
+    UpsertGrantResult, UpsertIngressResult, UpsertTenantResult, UpsertUserResult,
+    UsageMonthlySummary, UsageNodeSeriesList, UsageReportRequest, UsageReportResult,
+    UsageSampleList, UserAppQuotaList, UserDirectLoginRequest, UserGrantProbePlan, UserList,
+    VerifyDeploymentRequest, WarpBindingRemoval,
 };
 use brocade_deployment::plan::DeploymentKind;
 
@@ -565,15 +567,6 @@ impl PgStore {
         xray_release::create_xray_release(&self.pool, actor, request, build).await
     }
 
-    pub async fn confirm_xray_release(
-        &self,
-        actor: &AdminContext,
-        release_id: i64,
-        available_build_id: &str,
-    ) -> Result<crate::XrayRelease> {
-        xray_release::confirm_xray_release(&self.pool, actor, release_id, available_build_id).await
-    }
-
     pub async fn cancel_xray_release(
         &self,
         actor: &AdminContext,
@@ -769,6 +762,14 @@ impl PgStore {
         filter: SubscriptionFilter,
     ) -> Result<DynamicClashSubscription> {
         console::clash_subscription_by_uuid_filtered(&self.pool, uuid, filter).await
+    }
+
+    pub async fn shadowrocket_subscription_by_uuid_filtered(
+        &self,
+        uuid: &str,
+        filter: SubscriptionFilter,
+    ) -> Result<DynamicClashSubscription> {
+        console::shadowrocket_subscription_by_uuid_filtered(&self.pool, uuid, filter).await
     }
 
     pub async fn clash_subscription_by_haitun_token_for_family(
@@ -1334,6 +1335,22 @@ impl PgStore {
         console::list_users(&self.pool, actor, tenant_id, include_disabled).await
     }
 
+    pub async fn list_user_presence(
+        &self,
+        actor: &AdminContext,
+    ) -> Result<crate::UserPresenceList> {
+        user_presence::list(&self.pool, actor).await
+    }
+
+    pub async fn user_online_source_history(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<crate::UserOnlineSourceHistory> {
+        user_presence::history(&self.pool, actor, tenant_id, user_id).await
+    }
+
     pub async fn rotate_user_uuid(
         &self,
         actor: &AdminContext,
@@ -1560,6 +1577,10 @@ impl PgStore {
         agent::issue_node_token(&self.pool, node_id).await
     }
 
+    pub async fn reissue_node_token(&self, node_id: &str) -> Result<IssuedNodeToken> {
+        agent::reissue_node_token(&self.pool, node_id).await
+    }
+
     pub async fn redeem_node_enrollment(&self, token: &str) -> Result<IssuedNodeToken> {
         provision::redeem_node_enrollment(&self.pool, token).await
     }
@@ -1645,6 +1666,31 @@ impl PgStore {
         user_id: &str,
     ) -> Result<IssuedUserLogin> {
         admin::issue_user_login(&self.pool, actor, tenant_id, user_id).await
+    }
+
+    pub async fn issue_user_direct_login(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<IssuedUserDirectLogin> {
+        admin::issue_user_direct_login(&self.pool, actor, tenant_id, user_id).await
+    }
+
+    pub async fn login_user_direct(
+        &self,
+        request: UserDirectLoginRequest,
+    ) -> Result<AdminLoginResult> {
+        admin::login_user_direct(&self.pool, request).await
+    }
+
+    pub async fn revoke_user_direct_login(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<bool> {
+        admin::revoke_user_direct_login(&self.pool, actor, tenant_id, user_id).await
     }
 
     pub async fn set_user_password(
@@ -1816,6 +1862,10 @@ impl PgStore {
 
     pub async fn prune_usage_samples(&self, retain_days: u32) -> Result<u64> {
         usage::prune_usage_samples(&self.pool, retain_days).await
+    }
+
+    pub async fn prune_user_online_sources(&self, retain_days: u32) -> Result<u64> {
+        user_presence::prune(&self.pool, retain_days).await
     }
 
     pub async fn list_usage_node_series(

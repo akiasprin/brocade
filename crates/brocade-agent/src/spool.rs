@@ -12,7 +12,7 @@ use std::{
 };
 
 use brocade_deployment::protocol::{
-    LocalReconcileReport, NodeRuntimeReport, NodeVersions, SpoolBacklog,
+    LocalReconcileReport, NodeRuntimeReport, NodeVersions, SpoolBacklog, UserOnlineSources,
 };
 
 use crate::{
@@ -35,6 +35,7 @@ pub(crate) struct Spool {
     /// Log prefix, and the unit noun in the over-limit message
     pub(crate) what: &'static str,
     pub(crate) unit: &'static str,
+    pub(crate) dropped_kind: DroppedKind,
     /// Statuses which prove this exact body can never become valid. Authentication failures,
     /// throttling, timeouts and conflicts are deliberately absent: all can recover unchanged.
     pub(crate) terminal_statuses: &'static [u16],
@@ -50,6 +51,7 @@ pub(crate) const USAGE_SPOOL: Spool = Spool {
     max: 720,
     what: "usage",
     unit: "读数",
+    dropped_kind: DroppedKind::Usage,
     terminal_statuses: &[400, 410, 422],
 };
 
@@ -65,13 +67,28 @@ pub(crate) const OBSERVATION_SPOOL: Spool = Spool {
     max: 64,
     what: "observation",
     unit: "条收敛结果",
+    dropped_kind: DroppedKind::Observation,
     terminal_statuses: &[400, 404, 409, 410, 422],
 };
 
-/// Cumulative count of dropped reports. Kept across restarts — it answers "has
-/// this machine ever lost accounting", and a restart is exactly the moment most
-/// likely to erase that fact.
-const DROPPED_FILE: &str = "spool-dropped";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DroppedKind {
+    Usage,
+    Observation,
+}
+
+impl DroppedKind {
+    const fn file(self) -> &'static str {
+        match self {
+            Self::Usage => "spool-dropped-usage",
+            Self::Observation => "spool-dropped-observation",
+        }
+    }
+}
+
+/// Pre-v23 cumulative count. It cannot be attributed after the fact, so new agents preserve it as
+/// the unclassified remainder of the all-kinds total instead of presenting it as lost usage.
+const LEGACY_DROPPED_FILE: &str = "spool-dropped";
 /// Last round's local reconcile result. In a file rather than memory for the same
 /// reason: `reconcile_local` may have been run on its own by the `repair`
 /// subcommand, which is a different process.
@@ -104,23 +121,31 @@ fn drain_lock(spool: Spool) -> &'static Mutex<()> {
     }
 }
 
-fn bump_dropped(state_dir: &Path, by: u64) {
+fn bump_dropped(kind: DroppedKind, state_dir: &Path, by: u64) {
     let _guard = DROPPED_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let now = read_dropped_unlocked(state_dir).saturating_add(by);
-    let _ = fs::write(state_dir.join(DROPPED_FILE), now.to_string());
+    let now = read_dropped_unlocked(kind, state_dir).saturating_add(by);
+    let _ = fs::write(state_dir.join(kind.file()), now.to_string());
 }
 
-fn read_dropped(state_dir: &Path) -> u64 {
+fn read_dropped(kind: DroppedKind, state_dir: &Path) -> u64 {
     let _guard = DROPPED_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    read_dropped_unlocked(state_dir)
+    read_dropped_unlocked(kind, state_dir)
 }
 
-fn read_dropped_unlocked(state_dir: &Path) -> u64 {
-    fs::read_to_string(state_dir.join(DROPPED_FILE))
+fn read_dropped_unlocked(kind: DroppedKind, state_dir: &Path) -> u64 {
+    read_counter_file(&state_dir.join(kind.file()))
+}
+
+fn read_legacy_dropped(state_dir: &Path) -> u64 {
+    read_counter_file(&state_dir.join(LEGACY_DROPPED_FILE))
+}
+
+fn read_counter_file(path: &Path) -> u64 {
+    fs::read_to_string(path)
         .ok()
         .and_then(|text| text.trim().parse().ok())
         .unwrap_or(0)
@@ -174,7 +199,13 @@ fn observe_versions(state_dir: &Path) -> NodeVersions {
         xray_installed_sha256: crate::installed_xray_sha256(),
         xray_running_sha256: crate::running_xray_sha256(),
         phantun: first_line(run_command("phantun-client", &["--version"]).ok()),
-        openvpn: first_line(run_command("openvpn", &["--version"]).ok()),
+        // OpenVPN alone is not a usable capability: without an openable TUN clone device every
+        // provider profile reaches the same local failure and can poison the fleet-wide candidate
+        // failure streak. Withhold the capability so Console never assigns VPN Gate work until the
+        // host prerequisite is actually usable.
+        openvpn: crate::vpngate::tun_device_available()
+            .then(|| first_line(run_command("openvpn", &["--version"]).ok()))
+            .flatten(),
         vpngate_catalog_probe_workers: Some(crate::vpngate::CATALOG_PROBE_WORKERS),
         wg_tools: first_line(run_command("wg", &["--version"]).ok()),
         // Whether the kernel module is present decides between the in-kernel
@@ -191,7 +222,34 @@ fn first_line(output: Option<String>) -> Option<String> {
     (!line.is_empty()).then(|| line.to_owned())
 }
 
-pub(crate) fn collect_runtime_report(state_dir: &Path) -> Result<NodeRuntimeReport, String> {
+/// Read a current online-source snapshot only when the applied Xray policy enabled the matching
+/// counters. A successful empty response is meaningful; a missing/disabled configuration stays
+/// `None` so the control plane never mistakes unsupported collection for zero online sources.
+fn observe_online_sources(state_dir: &Path) -> Result<Option<Vec<UserOnlineSources>>, String> {
+    let path = state_dir.join("xray.json");
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let config: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    let enabled = config
+        .pointer("/policy/levels/0/statsUserOnline")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(None);
+    }
+    let api_port = crate::xray_api_port(&content)
+        .ok_or_else(|| "xray.json does not contain an API port".to_owned())?;
+    crate::xray_grpc::online_sources(api_port).map(Some)
+}
+
+pub(crate) fn collect_runtime_report(
+    state_dir: &Path,
+    traffic: Option<brocade_deployment::protocol::NodeTrafficReading>,
+) -> Result<NodeRuntimeReport, String> {
     let versions = observe_versions(state_dir);
     let certificate = crate::certfile::observe(state_dir);
     let geodata = observe_geodata();
@@ -199,6 +257,16 @@ pub(crate) fn collect_runtime_report(state_dir: &Path) -> Result<NodeRuntimeRepo
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok());
     let spool = collect_spool_backlog(state_dir)?;
+    // Presence is ephemeral and must not prevent versions, backlog or geodata from reporting.
+    // On failure, `None` lets the preceding snapshot age out naturally instead of inventing a
+    // known-zero observation.
+    let online_sources = match observe_online_sources(state_dir) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("online sources: {error}");
+            None
+        }
+    };
     Ok(NodeRuntimeReport {
         observed_at_unix_secs: current_unix_secs()?,
         versions,
@@ -206,22 +274,23 @@ pub(crate) fn collect_runtime_report(state_dir: &Path) -> Result<NodeRuntimeRepo
         geodata,
         local_reconcile,
         wireguard_health: wireguard_health_snapshot(state_dir),
-        traffic: match crate::traffic::sample(state_dir) {
-            Ok(reading) => Some(reading),
-            Err(error) => {
-                eprintln!("traffic: {error}");
-                None
-            }
-        },
+        traffic,
+        online_sources,
         spool,
     })
 }
 
 pub(crate) fn collect_spool_backlog(state_dir: &Path) -> Result<SpoolBacklog, String> {
+    let usage_dropped = read_dropped(DroppedKind::Usage, state_dir);
+    let observation_dropped = read_dropped(DroppedKind::Observation, state_dir);
     Ok(SpoolBacklog {
         observation: spool_read(OBSERVATION_SPOOL, state_dir)?.len() as u32,
         usage: spool_read(USAGE_SPOOL, state_dir)?.len() as u32,
-        dropped: read_dropped(state_dir),
+        dropped: read_legacy_dropped(state_dir)
+            .saturating_add(usage_dropped)
+            .saturating_add(observation_dropped),
+        usage_dropped: Some(usage_dropped),
+        observation_dropped: Some(observation_dropped),
     })
 }
 
@@ -242,7 +311,16 @@ pub(crate) fn send_runtime_report(
 }
 
 pub(crate) fn runtime_cycle(options: &Options) -> Result<(), String> {
-    let report = collect_runtime_report(&options.state_dir)?;
+    // One-shot commands do not start the daemon's dedicated meter. Preserve their durable
+    // sample, but keep the report assembler itself read-only in every execution mode.
+    let traffic = match crate::traffic::sample(&options.state_dir) {
+        Ok(reading) => Some(reading),
+        Err(error) => {
+            eprintln!("traffic: {error}");
+            None
+        }
+    };
+    let report = collect_runtime_report(&options.state_dir, traffic)?;
     send_runtime_report(options, &report)
 }
 
@@ -267,12 +345,9 @@ pub(crate) fn spool_push<T: serde::Serialize>(
             spool.what, spool.max, spool.unit
         );
         lines.drain(..dropped);
-        // A drop must leave a trace. Logging alone confines it to that machine's
-        // stderr, and what was dropped is accounting — the symptom is "this
-        // machine had no traffic this month", indistinguishable in the UI from
-        // genuinely having none. The counter is on disk and only grows;
-        // non-zero means accounting was permanently lost.
-        bump_dropped(state_dir, dropped as u64);
+        // A drop must leave a durable, correctly classified trace. Lost usage makes accounting
+        // incomplete; a lost observation instead makes release evidence incomplete.
+        bump_dropped(spool.dropped_kind, state_dir, dropped as u64);
     }
     spool_write_unlocked(spool, state_dir, &lines)
 }
@@ -341,7 +416,7 @@ pub(crate) fn spool_drain(spool: Spool, options: &Options) -> Result<bool, Strin
             // and retrying blocks the head of the queue forever.
             Ok(response) if spool.terminal_statuses.contains(&response.status) => {
                 sent += 1;
-                bump_dropped(&options.state_dir, 1);
+                bump_dropped(spool.dropped_kind, &options.state_dir, 1);
                 eprintln!(
                     "{}: 控制面拒绝了一条，丢弃：HTTP {} {}",
                     spool.what, response.status, response.body
@@ -395,8 +470,8 @@ mod tests {
     use crate::options::{ApplyMode, Options};
 
     use super::{
-        first_line, observe_wg_backend, read_dropped, spool_drain, spool_push, spool_read, Spool,
-        OBSERVATION_SPOOL,
+        collect_spool_backlog, first_line, observe_wg_backend, read_dropped, spool_drain,
+        spool_push, spool_read, DroppedKind, Spool, OBSERVATION_SPOOL,
     };
 
     const TEST_SPOOL: Spool = Spool {
@@ -405,6 +480,7 @@ mod tests {
         max: 16,
         what: "test",
         unit: "条",
+        dropped_kind: DroppedKind::Observation,
         terminal_statuses: &[400, 404, 410, 422],
     };
 
@@ -517,7 +593,12 @@ mod tests {
             spool_read(TEST_SPOOL, &dir).unwrap().is_empty(),
             "三条都处理完了，队列该空"
         );
-        assert_eq!(read_dropped(&dir), 1, "服务端永久拒绝也必须进入丢失计数");
+        assert_eq!(
+            read_dropped(DroppedKind::Observation, &dir),
+            1,
+            "服务端永久拒绝也必须进入对应的丢失计数"
+        );
+        assert_eq!(read_dropped(DroppedKind::Usage, &dir), 0);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -533,7 +614,7 @@ mod tests {
         assert!(error.contains("409"));
         assert_eq!(handle.join().unwrap().len(), 1);
         assert_eq!(spool_read(TEST_SPOOL, &dir).unwrap().len(), 2);
-        assert_eq!(read_dropped(&dir), 0);
+        assert_eq!(read_dropped(DroppedKind::Observation, &dir), 0);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -646,36 +727,55 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The dropped counter must survive restarts. It answers "has this machine
-    /// ever lost accounting", and a restart is exactly the moment most likely to
-    /// erase that fact — the symptom is "this machine had no traffic this month",
-    /// indistinguishable in the UI from genuinely having none.
+    /// Each dropped counter must survive restarts without making a lost convergence result look
+    /// like lost accounting. The all-kinds total remains available to old consoles.
     #[test]
-    fn the_dropped_counter_survives_and_only_grows() {
+    fn dropped_counters_survive_and_keep_report_kinds_separate() {
         let dir = state_dir("dropped");
-        assert_eq!(read_dropped(&dir), 0, "没丢过就是 0，不是读不出来");
+        assert_eq!(read_dropped(DroppedKind::Usage, &dir), 0);
+        assert_eq!(read_dropped(DroppedKind::Observation, &dir), 0);
 
         let tiny = Spool {
             file: "tiny.spool.jsonl",
             max: 2,
+            dropped_kind: DroppedKind::Usage,
             ..TEST_SPOOL
         };
         for n in 0..5 {
             spool_push(tiny, &dir, &serde_json::json!({ "n": n })).unwrap();
         }
-        assert_eq!(read_dropped(&dir), 3);
+        assert_eq!(read_dropped(DroppedKind::Usage, &dir), 3);
+        assert_eq!(read_dropped(DroppedKind::Observation, &dir), 0);
 
-        // Keep dropping on a different spool: the counter is this machine's
-        // total, not per-spool.
         let other = Spool {
             file: "other.spool.jsonl",
             max: 1,
+            dropped_kind: DroppedKind::Observation,
             ..TEST_SPOOL
         };
         for n in 0..3 {
             spool_push(other, &dir, &serde_json::json!({ "n": n })).unwrap();
         }
-        assert_eq!(read_dropped(&dir), 5);
+        assert_eq!(read_dropped(DroppedKind::Usage, &dir), 3);
+        assert_eq!(read_dropped(DroppedKind::Observation, &dir), 2);
+
+        let backlog = collect_spool_backlog(&dir).unwrap();
+        assert_eq!(backlog.dropped, 5, "旧控制面仍能看到全部丢弃");
+        assert_eq!(backlog.usage_dropped, Some(3));
+        assert_eq!(backlog.observation_dropped, Some(2));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_dropped_count_stays_unclassified() {
+        let dir = state_dir("legacy-dropped");
+        fs::write(dir.join(super::LEGACY_DROPPED_FILE), "7").unwrap();
+
+        let backlog = collect_spool_backlog(&dir).unwrap();
+        assert_eq!(backlog.dropped, 7);
+        assert_eq!(backlog.usage_dropped, Some(0));
+        assert_eq!(backlog.observation_dropped, Some(0));
 
         let _ = fs::remove_dir_all(dir);
     }

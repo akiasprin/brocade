@@ -41,6 +41,7 @@ import { freePortAcross, freeSpanAcross, hopListener, isValidSlug, occupiedPorts
 import { appId as randomAppId, modelIdPair } from '../model-id';
 import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
 import { DEFAULT_VLESS_ENCRYPTION } from '../vless-encryption';
+import { newRealityFallbackLimits } from '../reality-fallback';
 import { WizardCard, WizardField, WizardFooter, WizardPaper, WizardPaperHeader } from '../ui/wizard-paper';
 import { Icon, type IconName } from '../ui/icons';
 import { SUBSCRIPTION_COUNTRY_CODES, subscriptionCountryLabel } from '../ui/subscription-country';
@@ -850,12 +851,12 @@ export function ChainWizard({
                 dest: customRealityDest.trim(),
                 server_names: customRealityServerNames,
                 fingerprint: customRealityFingerprint,
-                fallback_limits: { mode: 'off' },
+                fallback_limits: newRealityFallbackLimits(),
                 fallback_guard: true,
               }
             : {
                 fallback_mode: (realityTarget || 'global-site') as Exclude<RealityFallbackMode, 'custom-site'>,
-                fallback_limits: { mode: 'off' },
+                fallback_limits: newRealityFallbackLimits(),
                 fallback_guard: true,
               },
         wires,

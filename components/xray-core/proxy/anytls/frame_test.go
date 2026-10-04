@@ -226,15 +226,15 @@ func TestSendStreamDataFlushesControlFrameBeforeDirectWrite(t *testing.T) {
 }
 
 func BenchmarkSendStreamData64KiB(b *testing.B) {
+	payload := make([]byte, 8*buf.Size)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
 	newPayload := func() buf.MultiBuffer {
 		mb := make(buf.MultiBuffer, 0, 8)
-		for range 8 {
-			buffer := buf.New()
-			payload := buffer.Extend(buf.Size)
-			for i := range payload {
-				payload[i] = byte(i)
-			}
-			mb = append(mb, buffer)
+		for index := range 8 {
+			start := index * buf.Size
+			mb = append(mb, buf.FromBytes(payload[start:start+buf.Size]))
 		}
 		return mb
 	}

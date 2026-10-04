@@ -78,7 +78,7 @@ usage() {
     echo "  --service-mode systemd     强制写 systemd unit" >&2
     echo "  --service-mode openrc      强制写 OpenRC service" >&2
     echo "  --service-mode foreground  不写服务，直接 exec agent。preview 容器用" >&2
-    echo "  --enable-openvpn            安装 OpenVPN/iptables；默认不安装，普通 Agent 不受影响" >&2
+    echo "  --enable-openvpn            安装 OpenVPN/iptables，加载并持久化 TUN；默认不安装" >&2
     echo "  --vpngate-stats-window-secs 本机 VPN Gate 性能统计窗口；默认 900，范围 60–86400 秒" >&2
 }
 
@@ -105,6 +105,72 @@ install_pkg() {
     else
         return 1
     fi
+}
+
+tun_device_usable() {
+    [ -c /dev/net/tun ] || return 1
+    # Merely seeing a device node is insufficient in a restricted container: the devices cgroup
+    # may still reject opening it. Opening and immediately closing the clone device creates no
+    # interface, but proves that OpenVPN will at least reach TUNSETIFF instead of failing at open(2).
+    (: <> /dev/net/tun) 2>/dev/null
+}
+
+ensure_tun_runtime() {
+    if ! tun_device_usable; then
+        # A built-in TUN driver already exposes this sysfs entry. Otherwise load the module before
+        # creating the device node; doing it in the opposite order can leave a convincing but dead
+        # /dev/net/tun behind on kernels that do not provide the driver.
+        if [ ! -r /sys/class/misc/tun/dev ]; then
+            if ! have modprobe; then
+                echo "installing kmod for the VPN Gate TUN driver ..." >&2
+                install_pkg kmod || {
+                    echo "无法安装 modprobe；不能加载 VPN Gate 所需的 tun 内核模块" >&2
+                    return 1
+                }
+            fi
+            if ! modprobe tun; then
+                echo "当前内核无法加载 tun 模块；VPN Gate 的 OpenVPN 隧道无法创建" >&2
+                return 1
+            fi
+        fi
+
+        # devtmpfs normally creates this automatically. Minimal containers and a few VPS images
+        # expose the kernel misc device without populating /dev/net, so recover only from the
+        # kernel-advertised major/minor pair instead of hard-coding an unverified device node.
+        if [ ! -c /dev/net/tun ] && [ -r /sys/class/misc/tun/dev ]; then
+            tun_device_number=$(cat /sys/class/misc/tun/dev 2>/dev/null || true)
+            tun_major=${tun_device_number%%:*}
+            tun_minor=${tun_device_number#*:}
+            case "$tun_major:$tun_minor" in
+                *[!0-9:]*|:|*:)
+                    echo "内核返回了无效的 TUN 设备号：${tun_device_number:-空}" >&2
+                    return 1
+                    ;;
+            esac
+            if [ -e /dev/net/tun ]; then
+                echo "/dev/net/tun 已存在但不是字符设备；拒绝覆盖" >&2
+                return 1
+            fi
+            install -d -m 0755 /dev/net || return 1
+            mknod /dev/net/tun c "$tun_major" "$tun_minor" || return 1
+            chmod 0666 /dev/net/tun || return 1
+        fi
+    fi
+
+    if ! tun_device_usable; then
+        echo "/dev/net/tun 不可用；可能是容器未透传设备或宿主机禁止 TUN" >&2
+        return 1
+    fi
+
+    # Both systemd-modules-load and Alpine/OpenRC consume this directory. Keep it separate from
+    # brocade.conf: tune_conntrack owns that file and rewrites it on every installer run.
+    install -d -m 0755 /etc/modules-load.d || return 1
+    tun_module_stage=/etc/modules-load.d/.brocade-vpngate.$$
+    TMPFILES="$TMPFILES $tun_module_stage"
+    printf 'tun\n' > "$tun_module_stage" || return 1
+    chmod 0644 "$tun_module_stage" || return 1
+    mv -f "$tun_module_stage" /etc/modules-load.d/brocade-vpngate.conf || return 1
+    echo "VPN Gate TUN 已就绪，并会在开机时加载。" >&2
 }
 
 # Download, verify, install. **A failure at any step must not touch $dest.**
@@ -509,6 +575,14 @@ if [ "$SERVICE_MODE" = "openrc" ]; then
         echo "Alpine 上请先安装/恢复 openrc 包。" >&2
         exit 1
     fi
+fi
+
+# Fail before downloading binaries or consuming a one-time enrollment token. OpenVPN can be
+# perfectly installed while every probe fails later if the kernel TUN driver was never loaded — a
+# particularly common shape on Alpine's virt kernel. Explicit VPN Gate opt-in promises the complete
+# capability, so current and post-reboot TUN availability are both mandatory here.
+if [ "$APPLY_MODE" = "linux" ] && [ "$ENABLE_VPNGATE" = "1" ]; then
+    ensure_tun_runtime || exit 1
 fi
 
 install -d -m 0755 "$INSTALL_DIR" "$CONFIG_DIR" "$STATE_DIR"

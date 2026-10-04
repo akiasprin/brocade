@@ -145,6 +145,49 @@ describe('usage runtime findings', () => {
   });
 });
 
+describe('durable spool-loss findings', () => {
+  it('reserves the traffic-loss warning for classified usage reports', () => {
+    const value = node(false);
+    value.spool_backlog = {
+      observation: 0,
+      usage: 0,
+      dropped: 2,
+      usage_dropped: 2,
+      observation_dropped: 0,
+    };
+
+    const finding = runtimeFindings(value).find(item => item.chip === '丢了 2 条用量');
+    expect(finding?.tone).toBe('bad');
+    const { container } = render(<>{finding?.text}</>);
+    expect(container.textContent).toContain('流量明细');
+  });
+
+  it('reports rejected convergence evidence without claiming traffic was lost', () => {
+    const value = node(false);
+    value.spool_backlog = {
+      observation: 0,
+      usage: 0,
+      dropped: 1,
+      usage_dropped: 0,
+      observation_dropped: 1,
+    };
+
+    const finding = runtimeFindings(value).find(item => item.chip === '丢了 1 条收敛结果');
+    expect(finding?.tone).toBe('warn');
+    const { container } = render(<>{finding?.text}</>);
+    expect(container.textContent).toContain('不代表流量丢失');
+  });
+
+  it('keeps an old aggregate loss unclassified instead of inventing lost usage', () => {
+    const value = node(false);
+    value.spool_backlog = { observation: 0, usage: 0, dropped: 3 };
+
+    const findings = runtimeFindings(value);
+    expect(findings.find(item => item.chip === '丢了 3 条未分类上报')?.tone).toBe('warn');
+    expect(findings.some(item => item.chip.includes('条用量'))).toBe(false);
+  });
+});
+
 describe('OpenVPN runtime status', () => {
   it.each([
     ['OpenVPN 2.6.12 x86_64-pc-linux-gnu', 'OPENVPN 已应用'],

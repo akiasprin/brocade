@@ -53,7 +53,7 @@ import type {
 } from '../api';
 import { fetchNodeLoadMetrics } from '../api';
 
-// 与 nodes.tsx 的 FleetNetChart 共用同一套注册；echarts.use 对重复注册幂等，
+// 与 node-observation-charts.tsx 共用同一套注册；echarts.use 对重复注册幂等，
 // 但本模块独立使用 echarts，需要自己声明所依赖的组件。
 echarts.use([LineChart, GridComponent, MarkLineComponent, TooltipComponent, CanvasRenderer]);
 
@@ -676,7 +676,7 @@ export function ThroughputChart({
       smooth: false,
       connectNulls: false,
       lineStyle: observeSeriesLine(color),
-      areaStyle: observeAreaStyle(color, themeName, { count: 2 }),
+      areaStyle: observeAreaStyle(color, themeName, { count: 2, paper: cv('--card') }),
       itemStyle: { color, borderColor: glass, borderWidth: 1.5 },
       emphasis: { disabled: true },
       data: data.map((value, index) => [timesUnixSecs[index] * 1000, value] as [number, number | null]),
@@ -934,7 +934,7 @@ function HistoryChart({
     const areaFill = (lineSeries: HistoryLine, index: number) => {
       if (lineSeries.stack) return observeAreaStyle(colors[index], themeName, { stacked: true });
       if (hasStack) return undefined;
-      return observeAreaStyle(colors[index], themeName, { count: overlapCount });
+      return observeAreaStyle(colors[index], themeName, { count: overlapCount, paper: cv('--card', '') });
     };
     const lastMs = (times[times.length - 1] ?? 0) * 1000;
     const firstMs = (times[0] ?? 0) * 1000;

@@ -67,7 +67,7 @@ fn compile_output_blocks_publish_on_errors() {
 }
 
 #[test]
-fn compile_output_allows_publish_with_warnings() {
+fn compile_output_reports_unused_dns_as_info() {
     let mut snapshot = snapshot(vec![
         node(
             "hk",
@@ -77,7 +77,7 @@ fn compile_output_allows_publish_with_warnings() {
         node("sg", [10, 66, 0, 2], Dns::System),
     ]);
     // The chain must be alive: hk forwards to sg and sg exits. hk's own rule table has no
-    // Egress — its dns-unused warning is what this verifies. any_block cannot carry it: a
+    // Egress — its dns-unused info is what this verifies. any_block cannot carry it: a
     // chain that explicitly blocks everything has no exit path, which is a
     // chain.no-egress-path error and blocks the release.
     let mut a = app("a", "c-a", "i-a", 443, any_block());
@@ -115,10 +115,11 @@ fn compile_output_allows_publish_with_warnings() {
     let output = compile(&snapshot);
 
     assert_eq!(output.summary.errors, 0, "{:#?}", output.diagnostics);
-    assert_eq!(output.summary.warnings, 1, "{:#?}", output.diagnostics);
+    assert_eq!(output.summary.warnings, 0, "{:#?}", output.diagnostics);
+    assert_eq!(output.summary.infos, 1, "{:#?}", output.diagnostics);
     assert!(output.can_publish());
     assert!(output.diagnostics.iter().any(|diagnostic| {
-        diagnostic.level == Level::Warn && diagnostic.code == "node.dns-unused"
+        diagnostic.level == Level::Info && diagnostic.code == "node.dns-unused"
     }));
     assert!(output.project_node("hk").is_ok());
 }

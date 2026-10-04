@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { fallbackLimitDraft, fallbackLimitsFromDraft } from '../src/reality-fallback.ts';
+import { fallbackLimitDraft, fallbackLimitsFromDraft, newRealityFallbackLimits } from '../src/reality-fallback.ts';
+
+test('new REALITY listeners receive independent strict policies', () => {
+  const first = newRealityFallbackLimits();
+  assert.deepEqual(first, { mode: 'strict' });
+  first.mode = 'off';
+  assert.deepEqual(newRealityFallbackLimits(), { mode: 'strict' });
+});
 
 test('named presets seed their documented values without becoming custom', () => {
   const balanced = fallbackLimitDraft({ mode: 'balanced' });

@@ -4,18 +4,18 @@ use brocade_core::model::{
 use brocade_deployment::protocol::{
     VpngateAdmissionPolicy, VpngateCandidate, VpngateCountryPolicy, VpngateIpIntelligenceFailure,
     VpngateIpIntelligenceObservation, VpngateIpIntelligenceReport, VpngateIpNetwork,
-    VpngateIpProvider, VpngateIpScore, VpngateNetworkType, VpngateRiskDecisionPolicy,
-    VpngateTransport, AGENT_PROTOCOL_VERSION,
+    VpngateIpProvider, VpngateIpScore, VpngateNetworkType, VpngateProbeMode,
+    VpngateRiskDecisionPolicy, VpngateTransport, AGENT_PROTOCOL_VERSION,
 };
 use brocade_store::{
     AdminContext, CreateAppRequest, CreateChainRequest, CreateTenantRequest, ModelOp, PgStore,
     PutStepRequest, RequestVpngatePoolSwitch, UpdateVpngateIntelligenceCredentials,
-    UpdateVpngateIntelligenceNode, UpdateVpngateProbeNode, UpsertExternalOutboundRequest,
-    VpngateIntelligenceCredentialUpdateMode, VpngateIntelligencePolicy,
-    VpngateIntelligenceRefreshMode, VpngateManualSwitchResult, VpngateManualSwitchStatus,
-    VpngatePoolReport, VpngateProbeNodeOrigin, VpngateProbeReport, VpngateProbeSample,
-    VpngateProbeStatus, VpngateReconcileReport, VpngateRuntimeSelection, VpngateServerInput,
-    VpngateServerPageRequest, VpngateSyncBatch,
+    UpdateVpngateIntelligenceNode, UpdateVpngateProbeNode, UpdateVpngateProbeSettings,
+    UpsertExternalOutboundRequest, VpngateDirectoryFilter, VpngateIntelligenceCredentialUpdateMode,
+    VpngateIntelligencePolicy, VpngateIntelligenceRefreshMode, VpngateManualSwitchResult,
+    VpngateManualSwitchStatus, VpngatePoolReport, VpngateProbeNodeOrigin, VpngateProbeReport,
+    VpngateProbeSample, VpngateProbeStatus, VpngateReconcileReport, VpngateRuntimeSelection,
+    VpngateServerInput, VpngateServerPageRequest, VpngateSyncBatch,
 };
 use testcontainers::{runners::AsyncRunner, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -1426,7 +1426,7 @@ async fn probe_report_survives_a_concurrent_catalogue_identity_change() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn same_region_probe_nodes_keep_independent_complete_queues() {
+async fn same_region_probe_nodes_partition_one_resilient_queue() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -1550,9 +1550,11 @@ async fn same_region_probe_nodes_keep_independent_complete_queues() {
     let desired_b = desired_b.unwrap().unwrap();
     let candidate_a = desired_a.probe_assignments[0].candidates[0].clone();
     let candidate_b = desired_b.probe_assignments[0].candidates[0].clone();
-    assert_eq!(
+    assert_eq!(candidate_a.probe_mode, VpngateProbeMode::Performance);
+    assert_eq!(candidate_b.probe_mode, VpngateProbeMode::Performance);
+    assert_ne!(
         candidate_a.server_id, candidate_b.server_id,
-        "same-region nodes independently start at the oldest item instead of dividing fixed shards"
+        "same-region nodes divide profiles instead of repeating the complete queue"
     );
     let repeated_a = db
         .store
@@ -1569,6 +1571,178 @@ async fn same_region_probe_nodes_keep_independent_complete_queues() {
         .fetch_one(db.pool())
         .await
         .unwrap();
+    db.store
+        .record_vpngate_probe_report(
+            "jp-a",
+            VpngateProbeReport {
+                catalog_generation: desired_a.catalog_generation,
+                country_code: "JP".to_owned(),
+                samples: vec![VpngateProbeSample {
+                    server_id: candidate_a.server_id.clone(),
+                    profile_sha256: candidate_a.profile_sha256.clone(),
+                    status: VpngateProbeStatus::Succeeded,
+                    exit_ip: Some("198.51.100.100".to_owned()),
+                    exit_country_code: None,
+                    connect_ms: Some(500),
+                    download_bps: Some(20_000_000),
+                    ip_scores: Vec::new(),
+                    ip_networks: Vec::new(),
+                    error_code: None,
+                    error_detail: None,
+                    probed_at_unix_secs: probed_at,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let cooling = db
+        .store
+        .vpngate_agent_desired_with_probe_origins("jp-a", &origins)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        cooling
+            .probe_assignments
+            .iter()
+            .flat_map(|assignment| &assignment.candidates)
+            .all(|candidate| candidate.server_id != candidate_a.server_id),
+        "a successful profile is not assigned again during its thirty-minute cooldown"
+    );
+    let updated_schedule = db
+        .store
+        .update_vpngate_probe_settings(
+            &admin,
+            UpdateVpngateProbeSettings {
+                success_cooldown_secs: 60 * 60,
+                performance_cooldown_secs: 6 * 60 * 60,
+                shard_rotation_secs: 6 * 60 * 60,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated_schedule.probe_success_cooldown_secs, 60 * 60);
+    assert_eq!(
+        updated_schedule.probe_performance_cooldown_secs,
+        6 * 60 * 60
+    );
+    assert_eq!(updated_schedule.probe_shard_rotation_secs, 6 * 60 * 60);
+    sqlx::query(
+        "UPDATE vpngate_candidate_probe_state
+            SET last_outcome_received_at = now() - interval '31 minutes'
+          WHERE server_id = $1 AND profile_sha256 = $2",
+    )
+    .bind(&candidate_a.server_id)
+    .bind(&candidate_a.profile_sha256)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let still_cooling = db
+        .store
+        .vpngate_agent_desired_with_probe_origins("jp-a", &origins)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        still_cooling
+            .probe_assignments
+            .iter()
+            .flat_map(|assignment| &assignment.candidates)
+            .all(|candidate| candidate.server_id != candidate_a.server_id),
+        "the saved cooldown applies to the next desired batch"
+    );
+    sqlx::query(
+        "UPDATE vpngate_candidate_probe_state
+            SET last_outcome_received_at = now() - interval '61 minutes'
+          WHERE server_id = $1 AND profile_sha256 = $2",
+    )
+    .bind(&candidate_a.server_id)
+    .bind(&candidate_a.profile_sha256)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let cooled = db
+        .store
+        .vpngate_agent_desired_with_probe_origins("jp-a", &origins)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        cooled.probe_assignments[0].candidates[0].server_id, candidate_a.server_id,
+        "the profile becomes due after its successful cooldown"
+    );
+    assert_eq!(
+        cooled.probe_assignments[0].candidates[0].probe_mode,
+        VpngateProbeMode::Connectivity,
+        "a recent full measurement turns the next scheduled check into connectivity-only work"
+    );
+    db.store
+        .record_vpngate_probe_report(
+            "jp-a",
+            VpngateProbeReport {
+                catalog_generation: desired_a.catalog_generation,
+                country_code: "JP".to_owned(),
+                samples: vec![VpngateProbeSample {
+                    server_id: candidate_a.server_id.clone(),
+                    profile_sha256: candidate_a.profile_sha256.clone(),
+                    status: VpngateProbeStatus::Succeeded,
+                    exit_ip: Some("198.51.100.100".to_owned()),
+                    exit_country_code: None,
+                    connect_ms: Some(450),
+                    download_bps: None,
+                    ip_scores: Vec::new(),
+                    ip_networks: Vec::new(),
+                    error_code: None,
+                    error_detail: None,
+                    probed_at_unix_secs: probed_at + 1,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let retained_performance: Option<i64> = sqlx::query_scalar(
+        "SELECT last_success_download_bps
+           FROM vpngate_candidate_probe_latest
+          WHERE node_id = 'jp-a' AND server_id = $1 AND profile_sha256 = $2",
+    )
+    .bind(&candidate_a.server_id)
+    .bind(&candidate_a.profile_sha256)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(retained_performance, Some(20_000_000));
+
+    sqlx::query(
+        "UPDATE vpngate_candidate_probe_state
+            SET last_outcome_received_at = now() - interval '61 minutes'
+          WHERE server_id = $1 AND profile_sha256 = $2",
+    )
+    .bind(&candidate_a.server_id)
+    .bind(&candidate_a.profile_sha256)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE vpngate_candidate_probe_latest
+            SET last_success_received_at = now() - interval '7 hours'
+          WHERE server_id = $1 AND profile_sha256 = $2",
+    )
+    .bind(&candidate_a.server_id)
+    .bind(&candidate_a.profile_sha256)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let performance_due = db
+        .store
+        .vpngate_agent_desired_with_probe_origins("jp-a", &origins)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        performance_due.probe_assignments[0].candidates[0].probe_mode,
+        VpngateProbeMode::Performance,
+        "a profile receives a full measurement after the configured performance interval"
+    );
     let failed_sample = |candidate: &VpngateCandidate| VpngateProbeSample {
         server_id: candidate.server_id.clone(),
         profile_sha256: candidate.profile_sha256.clone(),
@@ -1581,7 +1755,7 @@ async fn same_region_probe_nodes_keep_independent_complete_queues() {
         ip_networks: Vec::new(),
         error_code: Some("catalogue-probe-failed".to_owned()),
         error_detail: Some("test failure".to_owned()),
-        probed_at_unix_secs: probed_at,
+        probed_at_unix_secs: probed_at + 2,
     };
     db.store
         .record_vpngate_probe_report(
@@ -1606,13 +1780,18 @@ async fn same_region_probe_nodes_keep_independent_complete_queues() {
         .await
         .unwrap()
         .unwrap();
-    assert_ne!(
+    assert_eq!(
         next_a.probe_assignments[0].candidates[0].server_id, candidate_a.server_id,
-        "a failure advances only the reporting machine's oldest-first queue"
+        "a failure immediately keeps the profile at the front for priority review"
+    );
+    assert_eq!(
+        next_a.probe_assignments[0].candidates[0].probe_mode,
+        VpngateProbeMode::Performance,
+        "the first successful recovery attempt must refresh single-stream performance"
     );
     assert_eq!(
         unchanged_b.probe_assignments[0].candidates[0].server_id, candidate_b.server_id,
-        "one machine's failure must not alter another machine's independent progress"
+        "another same-region machine keeps its disjoint shard"
     );
 
     db.store
@@ -1633,9 +1812,8 @@ async fn same_region_probe_nodes_keep_independent_complete_queues() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        next_b.probe_assignments[0].candidates[0].server_id,
-        next_a.probe_assignments[0].candidates[0].server_id,
-        "both same-region machines independently cover the complete regional directory"
+        next_b.probe_assignments[0].candidates[0].server_id, candidate_b.server_id,
+        "each shard performs priority review for its own failed profile"
     );
 
     sqlx::query(
@@ -1659,9 +1837,8 @@ async fn same_region_probe_nodes_keep_independent_complete_queues() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        unaffected.probe_assignments[0].candidates[0].server_id,
-        next_a.probe_assignments[0].candidates[0].server_id,
-        "an offline peer does not block or reset this machine's independent queue"
+        unaffected.probe_assignments[0].candidates[0].server_id, candidate_b.server_id,
+        "an offline peer's shard is immediately reassigned to a remaining machine"
     );
 }
 
@@ -2128,6 +2305,14 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
         .execute(db.pool())
         .await
         .unwrap();
+    sqlx::query(
+        "UPDATE vpngate_candidate_probe_state
+            SET last_outcome_received_at = now() - interval '31 minutes'
+          WHERE last_outcome_status = 'succeeded'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
     let ranked_desired = db
         .store
         .vpngate_agent_desired("edge")
@@ -2284,6 +2469,188 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
         .update_vpngate_admission_policy(&admin, VpngateAdmissionPolicy::default())
         .await
         .unwrap();
+
+    // A fresh success remains eligible for five hours. A later failure starts a separate
+    // twenty-minute review window: one or two failures keep it eligible, while the third failure
+    // suspends it immediately and any later success restores qualification.
+    for failure_count in 1..=3 {
+        db.store
+            .record_vpngate_probe_report(
+                "edge",
+                VpngateProbeReport {
+                    catalog_generation: ranked_desired.catalog_generation,
+                    country_code: "JP".to_owned(),
+                    samples: vec![VpngateProbeSample {
+                        server_id: risky_candidate.server_id.clone(),
+                        profile_sha256: risky_candidate.profile_sha256.clone(),
+                        status: VpngateProbeStatus::Failed,
+                        exit_ip: None,
+                        exit_country_code: None,
+                        connect_ms: None,
+                        download_bps: None,
+                        ip_scores: Vec::new(),
+                        ip_networks: Vec::new(),
+                        error_code: Some("catalogue-probe-failed".to_owned()),
+                        error_detail: Some("priority review failed".to_owned()),
+                        probed_at_unix_secs: 1_800_000_010 + i64::from(failure_count),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let view = db
+            .store
+            .vpngate_country_servers("JP")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|server| server.id == risky_candidate.server_id)
+            .unwrap();
+        assert_eq!(view.consecutive_probe_failures, failure_count);
+        assert_eq!(view.active, failure_count < 3);
+        assert!(view.probe_eligible_until_unix_secs.is_some());
+        let state_filter = if failure_count < 3 {
+            VpngateDirectoryFilter::Reviewing
+        } else {
+            VpngateDirectoryFilter::Suspended
+        };
+        let filtered = db
+            .store
+            .vpngate_country_server_page(
+                "JP",
+                VpngateServerPageRequest {
+                    filter: state_filter,
+                    ..VpngateServerPageRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(filtered
+            .items
+            .iter()
+            .any(|server| server.id == risky_candidate.server_id));
+        if failure_count < 3 {
+            let review = db
+                .store
+                .vpngate_agent_desired("edge")
+                .await
+                .unwrap()
+                .unwrap();
+            let first_jp = review
+                .probe_assignments
+                .iter()
+                .find(|assignment| assignment.country_code == "JP")
+                .and_then(|assignment| assignment.candidates.first())
+                .expect("a failed candidate is immediately assigned for priority review");
+            assert_eq!(first_jp.server_id, risky_candidate.server_id);
+        }
+        if failure_count == 2 {
+            sqlx::query(
+                "UPDATE vpngate_candidate_probe_state
+                    SET failure_streak_started_at = now() - interval '21 minutes'
+                  WHERE server_id = $1 AND profile_sha256 = $2",
+            )
+            .bind(&risky_candidate.server_id)
+            .bind(&risky_candidate.profile_sha256)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert!(
+                !db.store
+                    .vpngate_country_servers("JP")
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|server| server.id == risky_candidate.server_id)
+                    .unwrap()
+                    .active
+            );
+            let reviewing = db
+                .store
+                .vpngate_country_server_page(
+                    "JP",
+                    VpngateServerPageRequest {
+                        filter: VpngateDirectoryFilter::Reviewing,
+                        ..VpngateServerPageRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(!reviewing
+                .items
+                .iter()
+                .any(|server| server.id == risky_candidate.server_id));
+            let suspended = db
+                .store
+                .vpngate_country_server_page(
+                    "JP",
+                    VpngateServerPageRequest {
+                        filter: VpngateDirectoryFilter::Suspended,
+                        ..VpngateServerPageRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(suspended
+                .items
+                .iter()
+                .any(|server| server.id == risky_candidate.server_id));
+            sqlx::query(
+                "UPDATE vpngate_candidate_probe_state
+                    SET failure_streak_started_at = last_outcome_received_at
+                  WHERE server_id = $1 AND profile_sha256 = $2",
+            )
+            .bind(&risky_candidate.server_id)
+            .bind(&risky_candidate.profile_sha256)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+    }
+    db.store
+        .record_vpngate_probe_report(
+            "edge",
+            VpngateProbeReport {
+                catalog_generation: ranked_desired.catalog_generation,
+                country_code: "JP".to_owned(),
+                samples: vec![VpngateProbeSample {
+                    server_id: risky_candidate.server_id.clone(),
+                    profile_sha256: risky_candidate.profile_sha256.clone(),
+                    status: VpngateProbeStatus::Succeeded,
+                    exit_ip: Some("198.51.100.21".to_owned()),
+                    exit_country_code: None,
+                    connect_ms: Some(300),
+                    download_bps: Some(100_000_000),
+                    ip_scores: Vec::new(),
+                    ip_networks: Vec::new(),
+                    error_code: None,
+                    error_detail: None,
+                    probed_at_unix_secs: 1_800_000_020,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let recovered = db
+        .store
+        .vpngate_country_servers("JP")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|server| server.id == risky_candidate.server_id)
+        .unwrap();
+    assert_eq!(recovered.consecutive_probe_failures, 0);
+    assert!(recovered.active);
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT failure_streak_started_at IS NULL
+           FROM vpngate_candidate_probe_state
+          WHERE server_id = $1 AND profile_sha256 = $2",
+    )
+    .bind(&risky_candidate.server_id)
+    .bind(&risky_candidate.profile_sha256)
+    .fetch_one(db.pool())
+    .await
+    .unwrap());
 
     // Explicit pools neither inherit the country shortlist nor replace a missing/wrong-country
     // selected ID with a healthy unselected relay. The existing Agent candidate protocol suffices.
@@ -2643,19 +3010,58 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
     assert_eq!(measured_overview.countries[0].measured_successful, 2);
     assert_eq!(measured_overview.countries[0].candidate_servers, 2);
 
-    // A historical success remains useful evidence in the directory, but it cannot keep an
-    // automatic pool candidate alive after the five-hour operational freshness window.
+    // Twenty minutes is only the failure-review window; a healthy success remains eligible.
     sqlx::query(
-        "UPDATE vpngate_candidate_probe_samples
-            SET received_at = now() - interval '6 hours'
+        "UPDATE vpngate_candidate_probe_latest
+            SET last_success_received_at = now() - interval '21 minutes'
           WHERE server_id = 'vpn-jp-risky'",
     )
     .execute(db.pool())
     .await
     .unwrap();
+    let still_fresh_overview = db.store.vpngate_overview().await.unwrap();
+    assert_eq!(still_fresh_overview.countries[0].measured_successful, 2);
+    assert_eq!(still_fresh_overview.countries[0].candidate_servers, 2);
+    assert!(
+        db.store
+            .vpngate_country_servers("JP")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|server| server.id == "vpn-jp-risky")
+            .unwrap()
+            .active
+    );
+
+    // The five-hour floor must not create a serving gap before the configured six-hour
+    // performance interval and thirty-minute connectivity interval have both elapsed.
     sqlx::query(
         "UPDATE vpngate_candidate_probe_latest
-            SET received_at = now() - interval '6 hours'
+            SET last_success_received_at = now() - interval '5 hours 1 minute'
+          WHERE server_id = 'vpn-jp-risky'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let scheduled_fresh_overview = db.store.vpngate_overview().await.unwrap();
+    assert_eq!(scheduled_fresh_overview.countries[0].measured_successful, 2);
+    assert_eq!(scheduled_fresh_overview.countries[0].candidate_servers, 2);
+    assert!(
+        db.store
+            .vpngate_country_servers("JP")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|server| server.id == "vpn-jp-risky")
+            .unwrap()
+            .active
+    );
+
+    // A historical success remains visible evidence, but it cannot keep an automatic pool
+    // candidate alive after the complete configured scheduling window.
+    sqlx::query(
+        "UPDATE vpngate_candidate_probe_latest
+            SET last_success_received_at = now() - interval '6 hours 31 minutes'
           WHERE server_id = 'vpn-jp-risky'",
     )
     .execute(db.pool())
@@ -2675,16 +3081,8 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
             .active
     );
     sqlx::query(
-        "UPDATE vpngate_candidate_probe_samples
-            SET received_at = now()
-          WHERE server_id = 'vpn-jp-risky'",
-    )
-    .execute(db.pool())
-    .await
-    .unwrap();
-    sqlx::query(
         "UPDATE vpngate_candidate_probe_latest
-            SET received_at = now()
+            SET last_success_received_at = now()
           WHERE server_id = 'vpn-jp-risky'",
     )
     .execute(db.pool())
@@ -2849,6 +3247,14 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
     .fetch_one(db.pool())
     .await
     .unwrap());
+    sqlx::query(
+        "UPDATE vpngate_candidate_probe_state
+            SET last_outcome_received_at = now() - interval '31 minutes'
+          WHERE server_id = 'vpn-jp-risky'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
     let historical_desired = db
         .store
         .vpngate_agent_desired("edge")
@@ -2938,9 +3344,12 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
         .await
         .unwrap()
         .expect("a completed batch immediately advances the retained queue");
-    assert_eq!(continuing.probe_assignments.len(), 1);
-    assert_eq!(continuing.probe_assignments[0].country_code, "JP");
-    assert!(continuing.probe_assignments[0]
+    let continuing_jp = continuing
+        .probe_assignments
+        .iter()
+        .find(|assignment| assignment.country_code == "JP")
+        .expect("the retained JP profile returns after its successful cooldown");
+    assert!(continuing_jp
         .candidates
         .iter()
         .any(|candidate| candidate.server_id == "vpn-jp-risky"));
@@ -2963,6 +3372,14 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
             SET runtime_versions = runtime_versions ||
                 '{\"vpngate_catalog_probe_workers\":16}'::jsonb
           WHERE node_id = 'edge'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE vpngate_candidate_probe_state
+            SET last_outcome_received_at = now() - interval '31 minutes'
+          WHERE last_outcome_status = 'succeeded'",
     )
     .execute(db.pool())
     .await

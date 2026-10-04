@@ -1,6 +1,7 @@
 package tls
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -55,6 +56,17 @@ func (c *Conn) HandshakeContextServerName(ctx context.Context) string {
 func (c *Conn) NegotiatedProtocol() string {
 	state := c.ConnectionState()
 	return state.NegotiatedProtocol
+}
+
+// VisionBuffers exposes TLS read-ahead through the transport wrapper instead
+// of making protocol handlers depend on crypto/tls' private struct layout.
+func (c *Conn) VisionBuffers() (*bytes.Reader, *bytes.Buffer) {
+	input, inputOK := utils.TryAccessField[bytes.Reader](c.Conn, "input")
+	rawInput, rawInputOK := utils.TryAccessField[bytes.Buffer](c.Conn, "rawInput")
+	if !inputOK || !rawInputOK {
+		return nil, nil
+	}
+	return input, rawInput
 }
 
 // Client initiates a TLS client handshake on the given connection.
@@ -126,6 +138,16 @@ func (c *UConn) WebsocketHandshakeContext(ctx context.Context) error {
 func (c *UConn) NegotiatedProtocol() string {
 	state := c.ConnectionState()
 	return state.NegotiatedProtocol
+}
+
+// VisionBuffers exposes uTLS read-ahead through the transport wrapper.
+func (c *UConn) VisionBuffers() (*bytes.Reader, *bytes.Buffer) {
+	input, inputOK := utils.TryAccessField[bytes.Reader](c.Conn, "input")
+	rawInput, rawInputOK := utils.TryAccessField[bytes.Buffer](c.Conn, "rawInput")
+	if !inputOK || !rawInputOK {
+		return nil, nil
+	}
+	return input, rawInput
 }
 
 func UClient(c net.Conn, config *tls.Config, fingerprint *utls.ClientHelloID) net.Conn {

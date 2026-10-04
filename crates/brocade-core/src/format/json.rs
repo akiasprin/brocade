@@ -280,6 +280,11 @@ fn dns_config(config: &XrayConfig) -> Value {
     if let Some(tag) = &config.dns.tag {
         object.insert("tag".to_owned(), json!(tag));
     }
+    object.insert("serveStale".to_owned(), json!(config.dns.serve_stale));
+    object.insert(
+        "serveExpiredTTL".to_owned(),
+        json!(config.dns.serve_expired_ttl_secs),
+    );
     object.insert(
         "servers".to_owned(),
         Value::Array(

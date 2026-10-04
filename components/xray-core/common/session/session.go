@@ -4,6 +4,7 @@ package session // import "github.com/xtls/xray-core/common/session"
 import (
 	"context"
 	"math/rand"
+	"sync/atomic"
 
 	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
@@ -12,6 +13,68 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/signal"
 )
+
+// SpliceCopyState describes the connection's progression from protocol parsing
+// through direct copy and into an operating-system-assisted splice. The zero
+// value deliberately means that no protocol has opted the connection in.
+type SpliceCopyState int32
+
+const (
+	SpliceCopyUnknown SpliceCopyState = iota
+	SpliceCopyDirect
+	SpliceCopyWaiting
+	SpliceCopyDisabled
+	SpliceCopySplicing
+)
+
+// AtomicSpliceCopyState synchronizes the protocol and copy goroutines that
+// negotiate the transition to splice. Keep the underlying value private so new
+// call sites cannot accidentally reintroduce unsynchronized access.
+type AtomicSpliceCopyState struct {
+	value atomic.Int32
+}
+
+func (s *AtomicSpliceCopyState) Load() SpliceCopyState {
+	return SpliceCopyState(s.value.Load())
+}
+
+func (s *AtomicSpliceCopyState) Store(state SpliceCopyState) {
+	s.value.Store(int32(state))
+}
+
+func (s *AtomicSpliceCopyState) CompareAndSwap(old, new SpliceCopyState) bool {
+	return s.value.CompareAndSwap(int32(old), int32(new))
+}
+
+// SpliceNotUsedReason is the terminal reason a splice-eligible protocol
+// connection completed without entering splice.
+type SpliceNotUsedReason uint8
+
+const (
+	SpliceNotUsedUnknown SpliceNotUsedReason = iota
+	SpliceNotUsedUnsupportedCommand
+	SpliceNotUsedUnsupportedTransport
+	SpliceNotUsedOuterTLSNot13
+	SpliceNotUsedGloballyDisabled
+	SpliceNotUsedOutboundNotRaw
+	SpliceNotUsedInboundIneligible
+	SpliceNotUsedMissingOutbound
+	SpliceNotUsedOutboundIneligible
+	SpliceNotUsedRawConnectionUnavailable
+	SpliceNotUsedEndedBeforeDirect
+	SpliceNotUsedEndedBeforeSplice
+)
+
+// SpliceMetrics receives connection-level transitions. Implementations must be
+// safe for concurrent calls from protocol and copy goroutines.
+type SpliceMetrics interface {
+	MarkDirect()
+	AddDirectBytes(int64)
+	MarkSplice()
+	AddSpliceBytes(int64)
+	SetNotSplicedReason(SpliceNotUsedReason)
+	Finish()
+}
 
 // NewID generates a new ID. The generated ID is high likely to be unique, but not cryptographically secure.
 // The generated ID will never be 0.
@@ -53,9 +116,33 @@ type Inbound struct {
 	Conn net.Conn
 	// Used by splice copy. Timer of the inbound buf copier. May be nil.
 	Timer *signal.ActivityTimer
-	// CanSpliceCopy is a property for this connection
-	// 1 = can, 2 = after processing protocol info should be able to, 3 = cannot
-	CanSpliceCopy int
+	// CanSpliceCopy is the synchronized splice state for this connection.
+	CanSpliceCopy AtomicSpliceCopyState
+	// SpliceMetrics is set only by protocols that expose splice observability.
+	SpliceMetrics SpliceMetrics
+}
+
+// Clone returns a shallow metadata copy while loading the atomic splice state
+// safely. Mutable splice metrics intentionally stay attached to the logical
+// connection unless the caller explicitly clears them.
+func (i *Inbound) Clone() *Inbound {
+	if i == nil {
+		return nil
+	}
+	clone := &Inbound{
+		Source:        i.Source,
+		Local:         i.Local,
+		Gateway:       i.Gateway,
+		Tag:           i.Tag,
+		Name:          i.Name,
+		User:          i.User,
+		VlessRoute:    i.VlessRoute,
+		Conn:          i.Conn,
+		Timer:         i.Timer,
+		SpliceMetrics: i.SpliceMetrics,
+	}
+	clone.CanSpliceCopy.Store(i.CanSpliceCopy.Load())
+	return clone
 }
 
 // Outbound is the metadata of an outbound connection.
@@ -72,9 +159,8 @@ type Outbound struct {
 	Name string
 	// Unused. Conn is actually internet.Connection. May be nil. It is currently nil for outbound with proxySettings
 	Conn net.Conn
-	// CanSpliceCopy is a property for this connection
-	// 1 = can, 2 = after processing protocol info should be able to, 3 = cannot
-	CanSpliceCopy int
+	// CanSpliceCopy is the synchronized splice state for this connection.
+	CanSpliceCopy AtomicSpliceCopyState
 }
 
 // SniffingRequest controls the behavior of content sniffing. They are from inbound config. Read-only

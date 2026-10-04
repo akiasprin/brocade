@@ -300,6 +300,7 @@ pub struct UserListItem {
     pub status: String,
     pub account_type: UserAccountType,
     pub login_enabled: bool,
+    pub direct_login_enabled: bool,
     pub created_at: String,
     pub created_revision: Option<u64>,
 }
@@ -320,8 +321,9 @@ impl UserAccountType {
     }
 }
 
-/// A Clash subscription compiled from the current model for one active user. It is deliberately
-/// a response value rather than a stored entity: the public endpoint builds one on every GET.
+/// A subscription served by the Clash endpoint for one active user, optionally negotiated as
+/// native Shadowrocket URIs. This is a response value, not a stored entity; the public endpoint
+/// builds it from the stable serving projection on every GET.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DynamicClashSubscription {
     pub tenant_id: String,
@@ -329,7 +331,20 @@ pub struct DynamicClashSubscription {
     pub uuid: String,
     pub revision: u64,
     pub content: String,
+    #[serde(default)]
+    pub format: DynamicSubscriptionFormat,
     pub usage: ClashSubscriptionUsage,
+}
+
+/// The actual body encoding, including an explicit compatibility reason when URI output would
+/// lose an entry's route or certificate trust. Never infer the format from the URL suffix.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicSubscriptionFormat {
+    #[default]
+    Clash,
+    Shadowrocket,
+    ClashCompatibility(brocade_core::format::uri::UriSubscriptionUnsupported),
 }
 
 /// Revocable bearer for the deliberately small Clash document consumed by Haitun's test bot.

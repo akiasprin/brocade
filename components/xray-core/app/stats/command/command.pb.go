@@ -552,9 +552,12 @@ func (x *GetAllOnlineUsersResponse) GetUsers() []string {
 }
 
 type OnlineIPEntry struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ip            string                 `protobuf:"bytes,1,opt,name=ip,proto3" json:"ip,omitempty"`
-	LastSeen      int64                  `protobuf:"varint,2,opt,name=last_seen,json=lastSeen,proto3" json:"last_seen,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Ip       string                 `protobuf:"bytes,1,opt,name=ip,proto3" json:"ip,omitempty"`
+	LastSeen int64                  `protobuf:"varint,2,opt,name=last_seen,json=lastSeen,proto3" json:"last_seen,omitempty"`
+	// Current authenticated inbound protocols; empty/absent is unknown to older readers.
+	// IP cardinality and the existing user traffic counter names remain unchanged.
+	Protocols     []string `protobuf:"bytes,3,rep,name=protocols,proto3" json:"protocols,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -601,6 +604,13 @@ func (x *OnlineIPEntry) GetLastSeen() int64 {
 		return x.LastSeen
 	}
 	return 0
+}
+
+func (x *OnlineIPEntry) GetProtocols() []string {
+	if x != nil {
+		return x.Protocols
+	}
+	return nil
 }
 
 type TrafficUserStat struct {
@@ -1050,10 +1060,11 @@ const file_app_stats_command_command_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\x03R\x05value:\x028\x01\"\x1a\n" +
 	"\x18GetAllOnlineUsersRequest\"1\n" +
 	"\x19GetAllOnlineUsersResponse\x12\x14\n" +
-	"\x05users\x18\x01 \x03(\tR\x05users\"<\n" +
+	"\x05users\x18\x01 \x03(\tR\x05users\"Z\n" +
 	"\rOnlineIPEntry\x12\x0e\n" +
 	"\x02ip\x18\x01 \x01(\tR\x02ip\x12\x1b\n" +
-	"\tlast_seen\x18\x02 \x01(\x03R\blastSeen\"E\n" +
+	"\tlast_seen\x18\x02 \x01(\x03R\blastSeen\x12\x1c\n" +
+	"\tprotocols\x18\x03 \x03(\tR\tprotocols\"E\n" +
 	"\x0fTrafficUserStat\x12\x16\n" +
 	"\x06uplink\x18\x01 \x01(\x03R\x06uplink\x12\x1a\n" +
 	"\bdownlink\x18\x02 \x01(\x03R\bdownlink\"\x9c\x01\n" +

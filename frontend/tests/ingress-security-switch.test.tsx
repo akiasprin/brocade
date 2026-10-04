@@ -10,6 +10,7 @@ import type {
   SnapshotVless,
   TransportKind,
   UpsertIngressBody,
+  RealityFallbackLimits,
   XhttpTuning,
   XhttpXmux,
 } from '../src/api';
@@ -109,6 +110,37 @@ function Harness({
     </QueryClientProvider>
   );
 }
+
+describe('REALITY fallback creation defaults', () => {
+  it('uses strict when a TLS-only ingress gains REALITY settings', () => {
+    expect(ingressUpsertBody(ingress('vless-tls')).reality.fallback_limits).toEqual({ mode: 'strict' });
+  });
+
+  it('uses strict when an ingress without VLESS gains REALITY settings', () => {
+    const value = ingress('vless-reality');
+    value.wires.vless = null;
+    expect(ingressUpsertBody(value).reality.fallback_limits).toEqual({ mode: 'strict' });
+  });
+
+  it.each<RealityFallbackLimits>([
+    { mode: 'off' },
+    { mode: 'balanced' },
+    { mode: 'strict' },
+    {
+      mode: 'custom',
+      upload: { after_bytes: 10, bytes_per_sec: 20, burst_bytes_per_sec: 30 },
+      download: { after_bytes: 40, bytes_per_sec: 50, burst_bytes_per_sec: 60 },
+    },
+  ])('preserves an explicitly saved $mode policy on unrelated edits', policy => {
+    const value = ingress('vless-reality');
+    value.wires.vless = { kind: 'vless-reality', fallback_limits: policy };
+    expect(ingressUpsertBody(value, { port: 8443 }).reality.fallback_limits).toEqual(policy);
+  });
+
+  it('does not reinterpret legacy REALITY snapshots without a stored policy', () => {
+    expect(ingressUpsertBody(ingress('vless-reality')).reality.fallback_limits).toEqual({ mode: 'off' });
+  });
+});
 
 function anytlsIngress(): SnapshotIngress {
   const base = ingress('vless-reality');
@@ -803,6 +835,7 @@ describe('AnyTLS ingress draft', () => {
     expect(saved.wires?.anytls?.security).toBe('reality');
     expect(saved.wires?.anytls?.reality).toMatchObject({
       fallback_mode: 'global-site',
+      fallback_limits: { mode: 'strict' },
       dest: '',
       server_names: [],
     });
@@ -875,6 +908,14 @@ describe('AnyTLS ingress draft', () => {
 });
 
 describe('Hysteria 2 ingress form', () => {
+  it('does not offer the Salamander obfuscation secret to the browser password manager', () => {
+    const view = render(<Hy2Harness settings={{ obfs: { kind: 'salamander', password: 'obfuscation-secret' } }} />);
+    const secret = view.getByPlaceholderText('混淆密码') as HTMLInputElement;
+
+    expect(secret.type).toBe('password');
+    expect(secret.autocomplete).toBe('off');
+  });
+
   it('keeps the listener editable without a protocol suffix or reallocate action', () => {
     const view = render(<Hy2Harness />);
     const listener = view.getByDisplayValue('18443');

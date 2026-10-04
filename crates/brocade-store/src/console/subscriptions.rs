@@ -1,4 +1,4 @@
-//! Serving Clash subscriptions. Nothing in this module writes: every request renders fresh YAML
+//! Serving client subscriptions. Nothing in this module writes: every request renders fresh content
 //! from the last fully converged serving projection and accounts the current calendar month.
 //! Committed-but-unpublished revisions are intentionally invisible, while an open/uncertain
 //! release makes pulls temporarily unavailable instead of returning a configuration which may not
@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use brocade_core::{
     artifacts::subscription,
-    format::yaml,
+    format::{uri, yaml},
     model::IpFamily,
     physical::user::{project_user, SubscriptionFilter},
 };
@@ -25,6 +25,7 @@ const PUBLIC_NOT_FOUND: &str = "subscription not found";
 enum DynamicClashTemplate {
     Standard,
     Haitun,
+    Shadowrocket,
 }
 
 /// Resolve an active user by bearer UUID and compile their serving subscription. Inactive users
@@ -63,6 +64,23 @@ pub async fn clash_subscription_by_uuid_filtered(
     uuid: &str,
     filter: SubscriptionFilter,
 ) -> Result<DynamicClashSubscription> {
+    subscription_by_uuid(pool, uuid, filter, DynamicClashTemplate::Standard).await
+}
+
+pub async fn shadowrocket_subscription_by_uuid_filtered(
+    pool: &PgPool,
+    uuid: &str,
+    filter: SubscriptionFilter,
+) -> Result<DynamicClashSubscription> {
+    subscription_by_uuid(pool, uuid, filter, DynamicClashTemplate::Shadowrocket).await
+}
+
+async fn subscription_by_uuid(
+    pool: &PgPool,
+    uuid: &str,
+    filter: SubscriptionFilter,
+    template: DynamicClashTemplate,
+) -> Result<DynamicClashSubscription> {
     let serving = crate::serving::load_subscription_serving_projection(pool).await?;
     let user = serving
         .snapshot
@@ -79,7 +97,7 @@ pub async fn clash_subscription_by_uuid_filtered(
         &tenant_id,
         &user_id,
         filter,
-        DynamicClashTemplate::Standard,
+        template,
         true,
     )
     .await
@@ -357,10 +375,7 @@ async fn build_dynamic_clash(
     let uuid = plan.uuid.clone();
     let mut artifact = subscription::build(&plan);
     artifact.mark_self_signed(&crate::cert::self_signed_certificate_pins(pool).await?);
-    let content = match template {
-        DynamicClashTemplate::Standard => yaml::clash_subscription(&artifact),
-        DynamicClashTemplate::Haitun => yaml::clash_haitun_subscription(&artifact),
-    };
+    let (content, format) = render_subscription(&artifact, template);
     let usage = subscription_usage(pool, tenant_id, user_id, &app_ids).await?;
     Ok(DynamicClashSubscription {
         tenant_id: tenant_id.to_owned(),
@@ -368,8 +383,32 @@ async fn build_dynamic_clash(
         uuid,
         revision: snapshot.revision,
         content,
+        format,
         usage,
     })
+}
+
+fn render_subscription(
+    artifact: &subscription::Subscription,
+    template: DynamicClashTemplate,
+) -> (String, DynamicSubscriptionFormat) {
+    match template {
+        DynamicClashTemplate::Standard => (
+            yaml::clash_subscription(artifact),
+            DynamicSubscriptionFormat::Clash,
+        ),
+        DynamicClashTemplate::Haitun => (
+            yaml::clash_haitun_subscription(artifact),
+            DynamicSubscriptionFormat::Clash,
+        ),
+        DynamicClashTemplate::Shadowrocket => match uri::complete_subscription(artifact) {
+            Ok(content) => (content, DynamicSubscriptionFormat::Shadowrocket),
+            Err(reason) => (
+                yaml::clash_subscription(artifact),
+                DynamicSubscriptionFormat::ClashCompatibility(reason),
+            ),
+        },
+    }
 }
 
 async fn subscription_usage(
@@ -444,4 +483,85 @@ fn nonnegative_bytes(field: &str, value: i64) -> Result<u64> {
 
 fn public_not_found() -> StoreError {
     StoreError::NotFound(PUBLIC_NOT_FOUND.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brocade_core::artifacts::subscription::{
+        Subscription, SubscriptionEntry, SubscriptionSecurity, SubscriptionStream, SubscriptionTls,
+    };
+
+    fn artifact() -> Subscription {
+        Subscription {
+            tenant: "test".to_owned(),
+            user: "alice".to_owned(),
+            entries: vec![SubscriptionEntry {
+                name: "Test node".to_owned(),
+                server: "node.example".to_owned(),
+                port: 443,
+                uuid: "test-only".to_owned(),
+                front_name: None,
+                stream: SubscriptionStream::Tcp,
+                security: SubscriptionSecurity::Tls(SubscriptionTls {
+                    server_name: "node.example".to_owned(),
+                    flow: None,
+                    self_signed: false,
+                    certificate_fingerprint: None,
+                }),
+            }],
+            external_proxies: Vec::new(),
+            front_groups: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn subscription_templates_preserve_yaml_and_negotiate_only_complete_uris() {
+        let mut artifact = artifact();
+        for template in [DynamicClashTemplate::Standard, DynamicClashTemplate::Haitun] {
+            let (content, format) = render_subscription(&artifact, template);
+            assert_eq!(format, DynamicSubscriptionFormat::Clash);
+            let expected = match template {
+                DynamicClashTemplate::Haitun => yaml::clash_haitun_subscription(&artifact),
+                _ => yaml::clash_subscription(&artifact),
+            };
+            assert_eq!(content, expected);
+        }
+        let (content, format) = render_subscription(&artifact, DynamicClashTemplate::Shadowrocket);
+        assert_eq!(format, DynamicSubscriptionFormat::Shadowrocket);
+        assert_eq!(content, uri::complete_subscription(&artifact).unwrap());
+
+        if let SubscriptionSecurity::Tls(tls) = &mut artifact.entries[0].security {
+            tls.self_signed = true;
+            tls.certificate_fingerprint = Some("AB".repeat(32));
+        }
+        let (content, format) = render_subscription(&artifact, DynamicClashTemplate::Shadowrocket);
+        assert_eq!(
+            format,
+            DynamicSubscriptionFormat::ClashCompatibility(
+                uri::UriSubscriptionUnsupported::SelfSignedCertificate
+            )
+        );
+        assert_eq!(content, yaml::clash_subscription(&artifact));
+        assert!(content.contains(&format!("fingerprint: {}", "AB".repeat(32))));
+        assert!(!content.contains("skip-cert-verify"));
+
+        artifact.entries[0].front_name = Some("Front".to_owned());
+        artifact
+            .front_groups
+            .push(subscription::SubscriptionFrontGroup {
+                name: "Front".to_owned(),
+                strategy: brocade_core::model::FrontStrategy::Select,
+                members: vec!["DIRECT".to_owned()],
+            });
+        let (content, format) = render_subscription(&artifact, DynamicClashTemplate::Shadowrocket);
+        assert_eq!(
+            format,
+            DynamicSubscriptionFormat::ClashCompatibility(
+                uri::UriSubscriptionUnsupported::FrontProxy
+            )
+        );
+        assert_eq!(content, yaml::clash_subscription(&artifact));
+        assert!(content.contains("dialer-proxy: \"Front\""));
+    }
 }

@@ -1711,10 +1711,15 @@ fn validate_app_set_dns(apps: &[AppIr], diagnostics: &mut Vec<Diagnostic>) {
 
         let routes = egress_by_node.get(&node_id);
         match routes.map(BTreeSet::len).unwrap_or_default() {
-            0 => diagnostics.push(Diagnostic::warn(
+            // No route means this node's built-in DNS configuration is currently unused. That
+            // is worth surfacing because it is easy to overlook, but it is not a fault: a node
+            // may legitimately have no local egress while forwarding all traffic elsewhere.
+            0 => diagnostics.push(Diagnostic::info(
                 "node.dns-unused",
                 &node_id,
-                format!("{node_id} 配置了 Xray 内建 DNS 服务器，但没有可承载其查询流量的落地出站"),
+                format!(
+                    "{node_id} 配置了 Xray 内建 DNS 服务器，当前没有可承载其查询流量的落地出站"
+                ),
             )),
             1 => {}
             count => diagnostics.push(Diagnostic::error(

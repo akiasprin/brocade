@@ -93,9 +93,9 @@ test('detail ECharts sweep into view once while KPI sparklines stay independent'
   assert.match(echartsMotion, /animationDurationUpdate:\s*0/);
   assert.match(telemetry, /!chart \|\| !ready \|\| !enteredViewport/);
   assert.equal((telemetry.match(/useEchartsViewportEntry\(elRef\)/g) ?? []).length, 2);
-  assert.equal((nodeObservationCharts.match(/useEchartsViewportEntry\(elRef\)/g) ?? []).length, 2);
+  assert.equal((nodeObservationCharts.match(/useEchartsViewportEntry\(elRef\)/g) ?? []).length, 1);
   assert.equal((telemetry.match(/echartsEntranceAnimation\(!hasRenderedData\.current\)/g) ?? []).length, 2);
-  assert.equal((nodeObservationCharts.match(/echartsEntranceAnimation\(!hasRenderedData\.current\)/g) ?? []).length, 2);
+  assert.equal((nodeObservationCharts.match(/echartsEntranceAnimation\(!hasRenderedData\.current\)/g) ?? []).length, 1);
   assert.doesNotMatch(telemetry, /function Spark[\s\S]*?echartsEntranceAnimation/);
   assert.match(nodes, /尚无 Agent 上报样本。/);
   assert.match(nodes, /Ping 落点已配置，但 Agent 尚未上报样本。/);
@@ -127,12 +127,15 @@ test('content navigation updates directly without workspace snapshot transitions
 });
 
 test('user selection replaces detail directly without a snapshot cross-fade', () => {
-  assert.match(
-    users,
-    /const go = \(d: Drill\) => \(narrow \? navigate\('users', d\) : navigateInPlace\('users', d\)\)/,
-  );
+  assert.match(users, /const go = \(d: Drill\) => navigate\('users', d\)/);
   assert.doesNotMatch(users, /'selection'/);
   assert.doesNotMatch(styles, /data-motion-transition='selection'|motion-user-detail/);
+  assert.match(
+    styles,
+    /\.fg-view \.user-split-detail,\s*\.fg-view \.user-split-detail :is\(\.panel, \.chart-card\)\s*\{\s*animation:\s*none;\s*\}/,
+    'user detail and nested panels must not replay the shared mount animation on selection',
+  );
+  assert.match(users, /<section key=\{r\.key\} className="panel user-split-detail">/);
 });
 
 test('navigation updates directly while theme and palette retain progressive transitions', () => {

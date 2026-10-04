@@ -1,0 +1,33 @@
+#cloud-config
+hostname: brocade-xray-perf
+manage_etc_hosts: true
+disable_root: false
+ssh_pwauth: false
+users:
+  - name: root
+    lock_passwd: true
+    ssh_authorized_keys:
+      - SSH_PUBLIC_KEY
+write_files:
+  - path: /etc/sysctl.d/99-macau-xray-perf.conf
+    permissions: '0644'
+    content: |
+      net.core.default_qdisc = fq
+      net.core.rmem_max = 134217728
+      net.core.wmem_max = 134217728
+      net.ipv4.tcp_congestion_control = bbr
+      net.ipv4.tcp_mem = 32768 131072 196608
+      net.ipv4.tcp_moderate_rcvbuf = 1
+      net.ipv4.tcp_notsent_lowat = 65536
+      net.ipv4.tcp_rmem = 4096 8388608 134217728
+      net.ipv4.tcp_wmem = 4096 8388608 134217728
+packages:
+  - docker.io
+runcmd:
+  - [sysctl, --system]
+  - [fallocate, -l, 1G, /swap.img]
+  - [chmod, '0600', /swap.img]
+  - [mkswap, /swap.img]
+  - [swapon, /swap.img]
+  - [systemctl, enable, --now, docker]
+  - [touch, /var/lib/brocade-docker-ready]

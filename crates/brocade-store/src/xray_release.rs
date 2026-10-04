@@ -1,4 +1,4 @@
-//! Auditable, staged rollout of the Xray binary carried by the running Console.
+//! Auditable, single-stage approval of the Xray binary carried by the running Console.
 //!
 //! This is deliberately not a model deployment. Xray's configuration belongs to an immutable
 //! model revision; the executable that interprets it is operational software. Coupling the two
@@ -18,14 +18,8 @@ const MAX_ERROR_CHARS: usize = 4_000;
 const MAX_VERSION_CHARS: usize = 128;
 const MAX_TARGETS: usize = 10_000;
 const MAX_ARTIFACTS: usize = 16;
-pub const DEFAULT_XRAY_BATCH_SIZE: u32 = 10;
-const MAX_XRAY_BATCH_SIZE: u32 = 500;
 const DISPATCH_LEASE_MINUTES: i32 = 30;
 const XRAY_RELEASE_ADVISORY_LOCK: i64 = 0x5852_4159;
-
-const fn default_xray_batch_size() -> u32 {
-    DEFAULT_XRAY_BATCH_SIZE
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct XrayReleaseArtifact {
@@ -46,11 +40,6 @@ pub struct CreateXrayReleaseRequest {
     pub idempotency_key: String,
     pub release_id: String,
     pub nodes: Vec<String>,
-    pub canary_node: String,
-    /// Maximum number of non-canary machines opened by one confirmation. Defaulted so the
-    /// administrative v8 HTTP surface remains compatible with callers created before batching.
-    #[serde(default = "default_xray_batch_size")]
-    pub batch_size: u32,
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -112,7 +101,6 @@ impl XrayReleaseTargetStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct XrayReleaseTarget {
     pub node_id: String,
-    pub wave: u32,
     pub status: XrayReleaseTargetStatus,
     pub attempt: u32,
     pub before_sha256: String,
@@ -135,7 +123,6 @@ pub struct XrayReleaseEvent {
     pub id: i64,
     pub kind: String,
     pub node_id: Option<String>,
-    pub wave: Option<u32>,
     pub actor: Option<String>,
     pub detail: serde_json::Value,
     pub created_at: String,
@@ -149,8 +136,6 @@ pub struct XrayRelease {
     pub artifacts: Vec<XrayReleaseArtifact>,
     pub status: XrayReleaseStatus,
     pub active: bool,
-    pub confirmed_wave: u32,
-    pub batch_size: u32,
     pub note: Option<String>,
     pub created_at: String,
     pub created_by: String,
@@ -172,8 +157,6 @@ pub struct XrayReleaseSummary {
     pub version: String,
     pub status: XrayReleaseStatus,
     pub active: bool,
-    pub confirmed_wave: u32,
-    pub batch_size: u32,
     pub note: Option<String>,
     pub created_at: String,
     pub created_by: String,
@@ -234,8 +217,8 @@ pub async fn list_xray_release_summaries(
         ));
     }
     let rows = sqlx::query(
-        "SELECT r.id, r.build_id, r.version, r.status, r.active, r.confirmed_wave,
-                r.batch_size, r.note, r.created_at::text AS created_at, r.created_by,
+        "SELECT r.id, r.build_id, r.version, r.status, r.active,
+                r.note, r.created_at::text AS created_at, r.created_by,
                 r.halted_at::text AS halted_at, r.finished_at::text AS finished_at,
                 count(t.node_id) AS target_count,
                 count(t.node_id) FILTER (WHERE t.status = 'succeeded') AS succeeded_count,
@@ -263,10 +246,6 @@ pub async fn list_xray_release_summaries(
                 version: row.try_get("version")?,
                 status: XrayReleaseStatus::parse(row.try_get::<String, _>("status")?.as_str())?,
                 active: row.try_get("active")?,
-                confirmed_wave: u32::try_from(row.try_get::<i32, _>("confirmed_wave")?)
-                    .map_err(|_| invalid_number("confirmed_wave"))?,
-                batch_size: u32::try_from(row.try_get::<i32, _>("batch_size")?)
-                    .map_err(|_| invalid_number("batch_size"))?,
                 note: row.try_get("note")?,
                 created_at: row.try_get("created_at")?,
                 created_by: row.try_get("created_by")?,
@@ -308,17 +287,6 @@ pub async fn create_xray_release(
             "an Xray release cannot target more than {MAX_TARGETS} nodes"
         )));
     }
-    let canary_node = request.canary_node.trim().to_owned();
-    if !nodes.iter().any(|node| node == &canary_node) {
-        return Err(StoreError::InvalidData(
-            "the Xray canary must be one of the selected nodes".to_owned(),
-        ));
-    }
-    if !(1..=MAX_XRAY_BATCH_SIZE).contains(&request.batch_size) {
-        return Err(StoreError::InvalidData(format!(
-            "Xray release batch_size must be between 1 and {MAX_XRAY_BATCH_SIZE}"
-        )));
-    }
     let note = normalize_text(request.note, MAX_NOTE_CHARS, "Xray release note")?;
     let idempotency_key = request.idempotency_key.trim().to_owned();
     if idempotency_key.is_empty() || idempotency_key.chars().count() > 200 {
@@ -338,7 +306,7 @@ pub async fn create_xray_release(
         .execute(&mut *tx)
         .await?;
     if let Some(existing) = sqlx::query(
-        "SELECT id, build_id, version, note, batch_size
+        "SELECT id, build_id, version, note
            FROM xray_releases WHERE idempotency_key = $1",
     )
     .bind(&idempotency_key)
@@ -347,31 +315,20 @@ pub async fn create_xray_release(
     {
         let existing_id: i64 = existing.try_get("id")?;
         let target_rows =
-            sqlx::query("SELECT node_id, wave FROM xray_release_targets WHERE release_id = $1")
+            sqlx::query("SELECT node_id FROM xray_release_targets WHERE release_id = $1")
                 .bind(existing_id)
                 .fetch_all(&mut *tx)
                 .await?;
         let mut existing_nodes = Vec::with_capacity(target_rows.len());
-        let mut existing_canary = None;
         for row in target_rows {
             let node_id: String = row.try_get("node_id")?;
-            let wave: i32 = row.try_get("wave")?;
-            if wave == 1 && existing_canary.replace(node_id.clone()).is_some() {
-                return Err(StoreError::InvalidData(format!(
-                    "Xray release {existing_id} has more than one canary"
-                )));
-            }
             existing_nodes.push(node_id);
         }
         existing_nodes.sort();
         if existing.try_get::<String, _>("build_id")? != release_id
             || existing.try_get::<String, _>("version")? != build.version
             || existing.try_get::<Option<String>, _>("note")? != note
-            || u32::try_from(existing.try_get::<i32, _>("batch_size")?)
-                .map_err(|_| invalid_number("batch_size"))?
-                != request.batch_size
             || existing_nodes != nodes
-            || existing_canary.as_deref() != Some(canary_node.as_str())
         {
             return Err(StoreError::Conflict(
                 "Xray release idempotency_key already belongs to another request".to_owned(),
@@ -390,22 +347,22 @@ pub async fn create_xray_release(
         )));
     }
     let observations = release_observations(&mut tx, &nodes).await?;
-    let canary_observation = &observations[&canary_node];
-    if canary_observation.running_sha256.as_deref()
-        != Some(canary_observation.installed_sha256.as_str())
-    {
-        return Err(StoreError::InvalidData(format!(
-            "node {canary_node} is not currently running its managed Xray and cannot exercise the canary"
-        )));
-    }
-    if build
-        .artifacts
-        .iter()
-        .any(|artifact| artifact.sha256 == canary_observation.installed_sha256)
-    {
-        return Err(StoreError::InvalidData(format!(
-            "node {canary_node} already has bytes carried by this Console and cannot exercise the canary"
-        )));
+    for node_id in &nodes {
+        let observation = &observations[node_id];
+        if observation.running_sha256.as_deref() != Some(observation.installed_sha256.as_str()) {
+            return Err(StoreError::InvalidData(format!(
+                "node {node_id} is not currently running its managed Xray"
+            )));
+        }
+        if build
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.sha256 == observation.installed_sha256)
+        {
+            return Err(StoreError::InvalidData(format!(
+                "node {node_id} already has bytes carried by this Console"
+            )));
+        }
     }
 
     let id = sqlx::query_scalar::<_, i64>(
@@ -418,15 +375,14 @@ pub async fn create_xray_release(
     .bind(&release_id)
     .bind(build.version)
     .bind(artifacts)
-    .bind(i32::try_from(request.batch_size).map_err(|_| invalid_number("batch_size"))?)
+    // The column remains for schema compatibility. A single-stage approval has no batch size.
+    .bind(1_i32)
     .bind(&note)
     .bind(actor.operator_id())
     .fetch_one(&mut *tx)
     .await?;
 
-    let waves = release_waves(&nodes, &canary_node, request.batch_size);
     for node_id in &nodes {
-        let wave = waves[node_id];
         sqlx::query(
             "INSERT INTO xray_release_targets
                         (release_id, node_id, wave, before_sha256)
@@ -434,7 +390,7 @@ pub async fn create_xray_release(
         )
         .bind(id)
         .bind(node_id)
-        .bind(i32::try_from(wave).map_err(|_| invalid_number("wave"))?)
+        .bind(1_i32)
         .bind(&observations[node_id].installed_sha256)
         .execute(&mut *tx)
         .await?;
@@ -444,80 +400,12 @@ pub async fn create_xray_release(
         id,
         "created",
         None,
-        Some(1),
         Some(actor.operator_id()),
-        serde_json::json!({
-            "targets": nodes.len(),
-            "canary": canary_node,
-            "batch_size": request.batch_size,
-            "waves": waves.values().copied().max().unwrap_or(1),
-        }),
+        serde_json::json!({ "targets": nodes.len() }),
     )
     .await?;
     tx.commit().await?;
     load_xray_release(pool, id, true).await
-}
-
-pub async fn confirm_xray_release(
-    pool: &PgPool,
-    actor: &AdminContext,
-    release_id: i64,
-    available_build_id: &str,
-) -> Result<XrayRelease> {
-    require_system_admin(actor)?;
-    let mut tx = pool.begin().await?;
-    let row = lock_release(&mut tx, release_id).await?;
-    ensure_actionable_release(&row, release_id, available_build_id)?;
-    let status: String = row.try_get("status")?;
-    if status != "running" {
-        return Err(StoreError::Conflict(format!(
-            "Xray release {release_id} is {status}, not running"
-        )));
-    }
-    let confirmed: i32 = row.try_get("confirmed_wave")?;
-    let unfinished = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*)
-           FROM xray_release_targets
-          WHERE release_id = $1 AND wave <= $2 AND status <> 'succeeded'",
-    )
-    .bind(release_id)
-    .bind(confirmed)
-    .fetch_one(&mut *tx)
-    .await?;
-    if unfinished != 0 {
-        return Err(StoreError::Conflict(format!(
-            "Xray release {release_id} wave {confirmed} has unfinished targets"
-        )));
-    }
-    let Some(next_wave) = sqlx::query_scalar::<_, Option<i32>>(
-        "SELECT MIN(wave) FROM xray_release_targets WHERE release_id = $1 AND wave > $2",
-    )
-    .bind(release_id)
-    .bind(confirmed)
-    .fetch_one(&mut *tx)
-    .await?
-    else {
-        return Err(StoreError::Conflict(format!(
-            "Xray release {release_id} has no later wave"
-        )));
-    };
-    sqlx::query("UPDATE xray_releases SET confirmed_wave = $2 WHERE id = $1")
-        .bind(release_id)
-        .bind(next_wave)
-        .execute(&mut *tx)
-        .await?;
-    insert_event(
-        &mut tx,
-        release_id,
-        "wave-confirmed",
-        None,
-        Some(u32::try_from(next_wave).map_err(|_| invalid_number("wave"))?),
-        Some(actor.operator_id()),
-        serde_json::json!({}),
-    )
-    .await?;
-    tx.commit().await?;
-    load_xray_release(pool, release_id, true).await
 }
 
 pub async fn cancel_xray_release(
@@ -554,7 +442,6 @@ pub async fn cancel_xray_release(
         release_id,
         "canceled",
         None,
-        None,
         Some(actor.operator_id()),
         serde_json::json!({}),
     )
@@ -563,10 +450,9 @@ pub async fn cancel_xray_release(
     load_xray_release(pool, release_id, true).await
 }
 
-/// Serialize a lifecycle transition with release creation and close the entire rollout when the
-/// transitioning machine is one of its targets. A binary rollout is one immutable work order:
-/// silently dropping one target would change its requested scope and could let later waves proceed
-/// under evidence from a machine which is no longer eligible.
+/// Serialize a lifecycle transition with release creation and close the entire approval when the
+/// transitioning machine is one of its targets. A binary replacement is one immutable work order;
+/// silently dropping one target would change its requested scope.
 pub(crate) async fn cancel_for_node_lifecycle_tx(
     tx: &mut Transaction<'_, Postgres>,
     node_id: &str,
@@ -610,7 +496,6 @@ pub(crate) async fn cancel_for_node_lifecycle_tx(
         release_id,
         "canceled-for-node-lifecycle",
         Some(node_id),
-        None,
         Some(actor),
         serde_json::json!({
             "reason": "target left active lifecycle",
@@ -672,7 +557,6 @@ pub async fn retry_xray_release_target(
         release_id,
         "target-retried",
         Some(node_id),
-        None,
         Some(actor.operator_id()),
         serde_json::json!({}),
     )
@@ -699,12 +583,11 @@ pub async fn claim_xray_release(
     }
     let mut tx = pool.begin().await?;
     let Some(row) = sqlx::query(
-        "SELECT r.id, r.build_id, r.version, r.artifacts, r.confirmed_wave,
-                t.wave, t.status, t.attempt, t.before_sha256, t.desired_sha256, t.arch
+        "SELECT r.id, r.build_id, r.version, r.artifacts,
+                t.status, t.attempt, t.before_sha256, t.desired_sha256, t.arch
            FROM xray_releases r
            JOIN xray_release_targets t ON t.release_id = r.id
           WHERE r.active AND r.status = 'running' AND t.node_id = $1
-            AND t.wave <= r.confirmed_wave
             AND t.status IN ('pending', 'dispatched')
           ORDER BY r.id DESC
           LIMIT 1
@@ -774,7 +657,7 @@ pub async fn report_xray_release(
     let mut tx = pool.begin().await?;
     let Some(row) = sqlx::query(
         "SELECT r.active, r.status AS release_status,
-                t.wave, t.status, t.attempt, t.before_sha256, t.desired_sha256
+                t.status, t.attempt, t.before_sha256, t.desired_sha256
            FROM xray_releases r
            JOIN xray_release_targets t ON t.release_id = r.id
           WHERE r.id = $1 AND t.node_id = $2
@@ -799,7 +682,6 @@ pub async fn report_xray_release(
     let active: bool = row.try_get("active")?;
     let release_status: String = row.try_get("release_status")?;
     let existing: String = row.try_get("status")?;
-    let wave = u32::try_from(row.try_get::<i32, _>("wave")?).map_err(|_| invalid_number("wave"))?;
     let before: String = row.try_get("before_sha256")?;
     let desired: Option<String> = row.try_get("desired_sha256")?;
     // Cancellation closes the offer before marking its targets canceled. An Agent rechecks just
@@ -842,12 +724,10 @@ pub async fn report_xray_release(
         XrayReleaseOutcome::Unsupported => "unsupported",
     };
     let mut error = normalize_text(report.error.clone(), MAX_ERROR_CHARS, "Xray release error")?;
-    // Wave 1 is evidence, not merely distribution. A no-op or an inactive service proves only
-    // that bytes reached disk; it says nothing about whether the candidate can serve this node's
-    // real configuration. Accept the Agent's idempotent report, but halt the release until an
-    // operator chooses a canary which actually transitions a running process.
+    // Every approved target must exercise a real replacement. A no-op or an inactive service
+    // proves only that bytes reached disk; it says nothing about whether the candidate can serve
+    // this node's real configuration.
     if target_status == "succeeded"
-        && wave == 1
         && (!report.performed_update
             || before == desired.as_deref().unwrap_or_default()
             || !report.xray_enabled
@@ -855,13 +735,13 @@ pub async fn report_xray_release(
     {
         target_status = "unverified";
         error = Some(if !report.performed_update {
-            "灰度机器没有实际执行本次原子替换，不能把 no-op 当作灰度证据".to_owned()
+            "机器没有实际执行本次原子替换，不能把 no-op 当作替换证据".to_owned()
         } else if before == desired.as_deref().unwrap_or_default() {
-            "灰度机器在发布前已经是目标字节，没有实际执行升级".to_owned()
+            "机器在批准前已经是目标字节，没有实际执行替换".to_owned()
         } else if !report.xray_enabled {
-            "灰度机器只安装了目标字节，但 Xray 未启用，无法验证真实启动".to_owned()
+            "机器只安装了目标字节，但 Xray 未启用，无法验证真实启动".to_owned()
         } else {
-            "灰度机器没有报告目标字节正在运行".to_owned()
+            "机器没有报告目标字节正在运行".to_owned()
         });
     }
     sqlx::query(
@@ -891,7 +771,6 @@ pub async fn report_xray_release(
             "target-reported"
         },
         Some(node_id),
-        None,
         None,
         serde_json::json!({
             "report": report,
@@ -927,7 +806,6 @@ pub async fn report_xray_release(
                 &mut tx,
                 report.release_id,
                 "succeeded",
-                None,
                 None,
                 None,
                 serde_json::json!({}),
@@ -969,7 +847,7 @@ pub async fn report_xray_release(
 
 async fn load_xray_release(pool: &PgPool, id: i64, include_events: bool) -> Result<XrayRelease> {
     let row = sqlx::query(
-        "SELECT id, build_id, version, artifacts, status, active, confirmed_wave, batch_size, note,
+        "SELECT id, build_id, version, artifacts, status, active, note,
                 created_at::text AS created_at, created_by,
                 halted_at::text AS halted_at, finished_at::text AS finished_at
            FROM xray_releases WHERE id = $1",
@@ -979,7 +857,7 @@ async fn load_xray_release(pool: &PgPool, id: i64, include_events: bool) -> Resu
     .await?
     .ok_or_else(|| StoreError::NotFound(format!("Xray release {id}")))?;
     let target_rows = sqlx::query(
-        "SELECT node_id, wave, status, attempt, before_sha256, desired_sha256, arch, error,
+        "SELECT node_id, status, attempt, before_sha256, desired_sha256, arch, error,
                 reported_performed_update, reported_xray_enabled,
                 reported_installed_sha256, reported_running_sha256,
                 (
@@ -990,7 +868,7 @@ async fn load_xray_release(pool: &PgPool, id: i64, include_events: bool) -> Resu
                     )
                 ) AS retryable,
                 dispatched_at::text AS dispatched_at, finished_at::text AS finished_at
-           FROM xray_release_targets WHERE release_id = $1 ORDER BY wave, node_id",
+           FROM xray_release_targets WHERE release_id = $1 ORDER BY node_id",
     )
     .bind(id)
     .bind(DISPATCH_LEASE_MINUTES)
@@ -998,7 +876,7 @@ async fn load_xray_release(pool: &PgPool, id: i64, include_events: bool) -> Resu
     .await?;
     let event_rows = if include_events {
         sqlx::query(
-            "SELECT id, kind, node_id, wave, actor, detail, created_at::text AS created_at
+            "SELECT id, kind, node_id, actor, detail, created_at::text AS created_at
                FROM xray_release_events WHERE release_id = $1 ORDER BY id",
         )
         .bind(id)
@@ -1014,10 +892,6 @@ async fn load_xray_release(pool: &PgPool, id: i64, include_events: bool) -> Resu
         artifacts: parse_artifacts(row.try_get("artifacts")?)?,
         status: XrayReleaseStatus::parse(row.try_get::<String, _>("status")?.as_str())?,
         active: row.try_get("active")?,
-        confirmed_wave: u32::try_from(row.try_get::<i32, _>("confirmed_wave")?)
-            .map_err(|_| invalid_number("confirmed_wave"))?,
-        batch_size: u32::try_from(row.try_get::<i32, _>("batch_size")?)
-            .map_err(|_| invalid_number("batch_size"))?,
         note: row.try_get("note")?,
         created_at: row.try_get("created_at")?,
         created_by: row.try_get("created_by")?,
@@ -1028,8 +902,6 @@ async fn load_xray_release(pool: &PgPool, id: i64, include_events: bool) -> Resu
             .map(|row| {
                 Ok(XrayReleaseTarget {
                     node_id: row.try_get("node_id")?,
-                    wave: u32::try_from(row.try_get::<i32, _>("wave")?)
-                        .map_err(|_| invalid_number("wave"))?,
                     status: XrayReleaseTargetStatus::parse(
                         row.try_get::<String, _>("status")?.as_str(),
                     )?,
@@ -1056,10 +928,6 @@ async fn load_xray_release(pool: &PgPool, id: i64, include_events: bool) -> Resu
                     id: row.try_get("id")?,
                     kind: row.try_get("kind")?,
                     node_id: row.try_get("node_id")?,
-                    wave: row
-                        .try_get::<Option<i32>, _>("wave")?
-                        .map(|wave| u32::try_from(wave).map_err(|_| invalid_number("event wave")))
-                        .transpose()?,
                     actor: row.try_get("actor")?,
                     detail: row.try_get("detail")?,
                     created_at: row.try_get("created_at")?,
@@ -1153,7 +1021,7 @@ async fn lock_release(
     release_id: i64,
 ) -> Result<sqlx::postgres::PgRow> {
     sqlx::query(
-        "SELECT build_id, status, active, confirmed_wave
+        "SELECT build_id, status, active
            FROM xray_releases WHERE id = $1 FOR UPDATE",
     )
     .bind(release_id)
@@ -1208,7 +1076,6 @@ async fn mark_unsupported_arch(
         "target-unsupported",
         Some(node_id),
         None,
-        None,
         serde_json::json!({ "arch": arch, "error": error }),
     )
     .await
@@ -1219,21 +1086,16 @@ async fn insert_event(
     release_id: i64,
     kind: &str,
     node_id: Option<&str>,
-    wave: Option<u32>,
     actor: Option<&str>,
     detail: serde_json::Value,
 ) -> Result<()> {
-    let wave = wave
-        .map(|wave| i32::try_from(wave).map_err(|_| invalid_number("event wave")))
-        .transpose()?;
     sqlx::query(
-        "INSERT INTO xray_release_events (release_id, kind, node_id, wave, actor, detail)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO xray_release_events (release_id, kind, node_id, actor, detail)
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(release_id)
     .bind(kind)
     .bind(node_id)
-    .bind(wave)
     .bind(actor)
     .bind(detail)
     .execute(&mut **tx)
@@ -1343,23 +1205,6 @@ fn normalize_nodes(nodes: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn release_waves(nodes: &[String], canary_node: &str, batch_size: u32) -> BTreeMap<String, u32> {
-    let mut non_canary_index = 0_u32;
-    nodes
-        .iter()
-        .map(|node_id| {
-            let wave = if node_id == canary_node {
-                1
-            } else {
-                let wave = 2 + non_canary_index / batch_size;
-                non_canary_index += 1;
-                wave
-            };
-            (node_id.clone(), wave)
-        })
-        .collect()
-}
-
 fn normalize_text(value: Option<String>, max: usize, name: &str) -> Result<Option<String>> {
     let value = value
         .map(|value| value.trim().to_owned())
@@ -1417,20 +1262,6 @@ mod tests {
         let parsed = parse_artifacts(value).unwrap();
         assert_eq!(parsed[0].arch, "aarch64");
         assert_eq!(parsed[1].arch, "x86_64");
-    }
-
-    #[test]
-    fn non_canaries_are_split_into_deterministic_bounded_waves() {
-        let nodes = ["a", "b", "c", "d", "e"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let waves = release_waves(&nodes, "c", 2);
-        assert_eq!(waves["c"], 1);
-        assert_eq!(waves["a"], 2);
-        assert_eq!(waves["b"], 2);
-        assert_eq!(waves["d"], 3);
-        assert_eq!(waves["e"], 3);
     }
 
     #[test]

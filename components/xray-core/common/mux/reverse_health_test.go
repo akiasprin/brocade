@@ -293,7 +293,8 @@ func TestReverseTCPAndUDPFailClosedAndFreshGenerationWorks(t *testing.T) {
 }
 
 func TestReverseWorkerDoesNotMutateSharedInbound(t *testing.T) {
-	inbound := &session.Inbound{CanSpliceCopy: 1}
+	inbound := &session.Inbound{}
+	inbound.CanSpliceCopy.Store(session.SpliceCopyDirect)
 	ctx := session.ContextWithInbound(context.Background(), inbound)
 	reader, writer := pipe.New()
 	worker, err := NewReverseServerWorker(ctx, nil, &transport.Link{Reader: reader, Writer: buf.Discard}, DefaultReverseHealthConfig("metadata-test", "bridge"))
@@ -302,7 +303,7 @@ func TestReverseWorkerDoesNotMutateSharedInbound(t *testing.T) {
 	}
 	defer worker.Close()
 	defer writer.Close()
-	if inbound.CanSpliceCopy != 1 {
+	if inbound.CanSpliceCopy.Load() != session.SpliceCopyDirect {
 		t.Fatal("worker modified shared inbound metadata")
 	}
 }

@@ -1,5 +1,5 @@
 // Regression coverage converted from the frontend audit's delayed-response reproductions.
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -188,7 +188,13 @@ const ROUTES: Record<string, () => unknown> = {
 };
 
 const { SettingsPane } = await import('../src/panes/settings');
-const { AgentReleaseSection } = await import('../src/panes/agent-release');
+const { AgentReleaseTab, useAgentRelease } = await import('../src/panes/agent-release');
+/** 发布页把编辑状态放在页头；这里直接进入编辑，只测 Agent 页签的升级范围。 */
+function AgentHarness() {
+  const agent = useAgentRelease();
+  const [editing, setEditing] = useState(true);
+  return <AgentReleaseTab agent={agent} editable editing={editing} onEditingChange={setEditing} />;
+}
 it('branding save preserves further typing while the request is pending', async () => {
   draft.init('audit-branding');
   draft.clear();
@@ -257,12 +263,12 @@ it('agent selected-node set cannot expand to all nodes when only counts match', 
   );
   render(
     <QueryClientProvider client={qc}>
-      <AgentReleaseSection editable />
+      <AgentHarness />
     </QueryClientProvider>,
   );
-  const picks = screen.getAllByRole('checkbox') as HTMLInputElement[];
-  expect(picks[0].checked).toBe(false);
-  expect(picks[2].checked).toBe(false);
+  expect(screen.getByRole('button', { name: '选中的机器' }).getAttribute('aria-pressed')).toBe('true');
+  expect((screen.getByLabelText('升级 A') as HTMLInputElement).checked).toBe(true);
+  expect((screen.getByLabelText('升级 B') as HTMLInputElement).checked).toBe(false);
   fireEvent.click(screen.getByRole('button', { name: '批准' }));
   await waitFor(() => expect(sent).toBeDefined());
   expect(sent!.scope).toBe('nodes');
@@ -412,6 +418,52 @@ it.each(['distribution', 'ping', 'certificate'] as const)('%s saves preserve inp
   expect(document.querySelector(`#${id}`)?.textContent).toContain('有未保存');
 });
 
+it('ping targets take one optional address per family and save an empty family as null', async () => {
+  draft.init('ping-dual-stack');
+  draft.clear();
+  const qc = settingsClient();
+  qc.setQueryData(['ping-probe-settings'], {
+    targets: [{ name: 'CF', kind: 'icmp', ipv4: '1.1.1.1', ipv6: null }],
+    interval_secs: 60,
+    timeout_ms: 420,
+  });
+  let sent: unknown;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (_path: string, init: RequestInit) => {
+      sent = JSON.parse(String(init.body));
+      return json(sent);
+    }),
+  );
+  const view = mountSettings(qc);
+  const ipv4 = view.getByLabelText('目标 1 IPv4 地址') as HTMLInputElement;
+  const ipv6 = view.getByLabelText('目标 1 IPv6 地址') as HTMLInputElement;
+  expect(ipv6.placeholder).toBe('不探测');
+
+  fireEvent.change(ipv6, { target: { value: ' [2606:4700:4700::1111] ' } });
+  fireEvent.blur(ipv6);
+  expect(ipv6.value).toBe('2606:4700:4700::1111');
+  fireEvent.change(ipv4, { target: { value: '' } });
+  expect(ipv4.placeholder).toBe('不探测');
+
+  fireEvent.change(ipv6, { target: { value: '' } });
+  const section = document.querySelector('#set-ping-probe')!;
+  expect(section.textContent).toContain('CF：至少填写一个地址');
+  expect(ipv4.getAttribute('aria-invalid')).toBe('true');
+  expect(ipv6.getAttribute('aria-invalid')).toBe('true');
+
+  fireEvent.change(ipv6, { target: { value: '2606:4700:4700::1111' } });
+  expect(ipv4.getAttribute('aria-invalid')).toBeNull();
+  saveSection('set-ping-probe');
+  await waitFor(() =>
+    expect(sent).toEqual({
+      targets: [{ name: 'CF', kind: 'icmp', ipv4: null, ipv6: '2606:4700:4700::1111' }],
+      interval_secs: 60,
+      timeout_ms: 420,
+    }),
+  );
+});
+
 it('a rejected save retains subsequent input and presents the error', async () => {
   const qc = settingsClient();
   const response = deferred<Response>();
@@ -465,27 +517,28 @@ function mountAgent(scope: 'off' | 'nodes' | 'all', ids: string[], nodeIds = ['A
   vi.stubGlobal('fetch', fetch);
   const view = render(
     <QueryClientProvider client={qc}>
-      <AgentReleaseSection editable />
+      <AgentHarness />
     </QueryClientProvider>,
   );
   return { qc, fetch, view };
 }
 it('selecting every individual machine remains a fixed selection when a machine is added', async () => {
   const { qc, fetch } = mountAgent('off', []);
-  fireEvent.click(screen.getByLabelText('批准 A'));
-  fireEvent.click(screen.getByLabelText('批准 B'));
+  fireEvent.click(screen.getByRole('button', { name: '选中的机器' }));
+  fireEvent.click(screen.getByLabelText('升级 A'));
+  fireEvent.click(screen.getByLabelText('升级 B'));
   act(() => qc.setQueryData(['nodes'], { nodes: ['A', 'B', 'C'].map(node_id => ({ node_id, agent_version: null })) }));
-  await waitFor(() => expect(screen.getByLabelText('批准 C')).toBeTruthy());
-  expect((screen.getByLabelText('批准 C') as HTMLInputElement).checked).toBe(false);
+  await waitFor(() => expect(screen.getByLabelText('升级 C')).toBeTruthy());
+  expect((screen.getByLabelText('升级 C') as HTMLInputElement).checked).toBe(false);
   fireEvent.click(screen.getByRole('button', { name: '批准' }));
   await waitFor(() => expect(fetch).toHaveBeenCalled());
   expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toMatchObject({ scope: 'nodes', nodes: ['A', 'B'] });
 });
 it('an explicitly selected all-machines scope includes newly added machines', async () => {
   const { qc, fetch } = mountAgent('off', []);
-  fireEvent.click(screen.getByLabelText('批准全部机器（包含以后新增的机器）'));
+  fireEvent.click(screen.getByRole('button', { name: '全部机器' }));
   act(() => qc.setQueryData(['nodes'], { nodes: ['A', 'B', 'C'].map(node_id => ({ node_id, agent_version: null })) }));
-  await waitFor(() => expect((screen.getByLabelText('批准 C') as HTMLInputElement).checked).toBe(true));
+  await waitFor(() => expect((screen.getByLabelText('升级 C') as HTMLInputElement).checked).toBe(true));
   fireEvent.click(screen.getByRole('button', { name: '批准' }));
   await waitFor(() => expect(fetch).toHaveBeenCalled());
   expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toMatchObject({ scope: 'all', nodes: [] });
@@ -493,23 +546,34 @@ it('an explicitly selected all-machines scope includes newly added machines', as
 it('saved all scope does not become off when the fleet is empty', () => {
   mountAgent('all', [], []);
   expect((screen.getByRole('button', { name: '批准' }) as HTMLButtonElement).disabled).toBe(true);
-  expect((screen.getByLabelText('批准全部机器（包含以后新增的机器）') as HTMLInputElement).disabled).toBe(true);
+  expect(screen.getByRole('button', { name: '全部机器' }).getAttribute('aria-pressed')).toBe('true');
 });
 it('reordering the fleet does not make a fixed set dirty', () => {
   mountAgent('nodes', ['B', 'A']);
   expect((screen.getByRole('button', { name: '批准' }) as HTMLButtonElement).disabled).toBe(true);
 });
+it('a machine selection cannot be approved empty; stopping upgrades is the explicit off scope', async () => {
+  const { fetch } = mountAgent('all', []);
+  fireEvent.click(screen.getByRole('button', { name: '选中的机器' }));
+  expect((screen.getByRole('button', { name: '批准' }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(screen.getByRole('button', { name: '不升级' }));
+  expect(screen.getByText('所有机器保持当前版本，不会自行升级。')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: '批准' }));
+  await waitFor(() => expect(fetch).toHaveBeenCalled());
+  expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toMatchObject({ scope: 'off', nodes: [] });
+});
 it('available build refresh does not reset unsaved machine selection', async () => {
   const { qc } = mountAgent('off', []);
-  fireEvent.click(screen.getByLabelText('批准 A'));
+  fireEvent.click(screen.getByRole('button', { name: '选中的机器' }));
+  fireEvent.click(screen.getByLabelText('升级 A'));
   act(() =>
     qc.setQueryData(['agent-release'], {
       ...qc.getQueryData<object>(['agent-release']),
       available_release_id: 'b'.repeat(64),
     }),
   );
-  await waitFor(() => expect((screen.getByLabelText('批准 A') as HTMLInputElement).checked).toBe(true));
-  expect((screen.getByLabelText('批准 B') as HTMLInputElement).checked).toBe(false);
+  await waitFor(() => expect((screen.getByLabelText('升级 A') as HTMLInputElement).checked).toBe(true));
+  expect((screen.getByLabelText('升级 B') as HTMLInputElement).checked).toBe(false);
 });
 
 it('a refresh started during a save cannot overwrite its successful response', async () => {

@@ -11,7 +11,18 @@ use crate::plan::{
 pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 20;
 
 /// Wire contract spoken by this Agent build.
-pub const AGENT_PROTOCOL_VERSION: u32 = 21;
+pub const AGENT_PROTOCOL_VERSION: u32 = 24;
+
+/// First Agent protocol that probes each PING target per address family: it receives
+/// `PingProbeSettings` with separate IPv4/IPv6 endpoints and tags every sample with its family.
+/// Older Agents receive `LegacyPingProbeSettings` instead.
+pub const DUAL_STACK_PING_PROTOCOL_VERSION: u32 = 24;
+
+/// Hard bounds for one online-source snapshot. The runtime endpoint is authenticated but still
+/// crosses a machine trust boundary; a broken or compromised Agent must not turn one 30-second
+/// report into an unbounded allocation or database write.
+pub const MAX_ONLINE_SOURCE_USERS: usize = 2_048;
+pub const MAX_ONLINE_SOURCE_ENTRIES: usize = 4_096;
 
 /// Runtime log-retention bounds shared by the control-plane validator and the agent. MiB is
 /// intentional: the values shown to operators map exactly to disk allocation in binary units.
@@ -302,6 +313,17 @@ pub struct VpngateCandidate {
     pub transport: VpngateTransport,
     pub profile_sha256: String,
     pub openvpn_config: String,
+    /// Catalogue probes normally verify only connectivity. The Console requests a full
+    /// single-stream measurement when the performance interval expires, the profile changes, or
+    /// a failed profile is being recovered. Runtime pool candidates retain the compatibility
+    /// default and always use a full measurement.
+    #[serde(default)]
+    pub probe_mode: VpngateProbeMode,
+    /// Exit observed by the most recent full catalogue measurement. A connectivity-only probe
+    /// that exposes a different exit is promoted to a full measurement immediately, rather than
+    /// retaining performance evidence for another address until the scheduled interval expires.
+    #[serde(default)]
+    pub last_observed_exit_ip: Option<String>,
     /// Last exit IP whose country and intelligence were verified by a selected Agent. The Agent only
     /// reuses the accompanying facts when a fresh tunnel exposes this exact address; an exit change
     /// returns the candidate to the pending-intelligence state instead of inheriting stale trust.
@@ -313,6 +335,16 @@ pub struct VpngateCandidate {
     pub verified_ip_scores: Vec<VpngateIpScore>,
     #[serde(default)]
     pub verified_ip_networks: Vec<VpngateIpNetwork>,
+}
+
+/// Work requested for one catalogue candidate. `Performance` is the compatibility default so an
+/// old Console paired with a new Agent preserves the previous full-probe behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VpngateProbeMode {
+    Connectivity,
+    #[default]
+    Performance,
 }
 
 /// One bounded catalogue-measurement batch assigned to a selected VPN Gate probe node.
@@ -393,10 +425,12 @@ pub enum VpngateProbeStatus {
 
 /// A single real connection attempt made inside the Agent's isolated network namespace.
 ///
-/// A successful transport measurement always has an exit IP, setup time and download rate.
-/// Country, risk and access-network facts are optional because a newly discovered exit is queried
-/// asynchronously by a selected Agent. Runtime admission still fails closed until a later desired
-/// state carries enough provider-local evidence for that exact IP under the configured policy.
+/// A successful transport measurement always has an exit IP and setup time. Catalogue
+/// connectivity-only samples omit `download_bps`; runtime samples and scheduled performance
+/// samples include it. Country, risk and access-network facts are optional because a newly
+/// discovered exit is queried asynchronously by a selected Agent. Runtime admission still fails
+/// closed until a later desired state carries enough provider-local evidence for that exact IP
+/// under the configured policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpngateProbeSample {
     pub server_id: String,
@@ -683,8 +717,9 @@ pub struct CreateRollbackRequest {
 pub struct NodeDesiredDeployment {
     pub deployment_id: i64,
     pub node_id: String,
-    /// Positive for work claimed from an isolation obligation. The report must echo it so an
-    /// older in-flight result cannot settle a newer desired generation for the same node.
+    /// Positive for work claimed from an isolation obligation or a node re-sign repair. The
+    /// report must echo it so an older in-flight result cannot settle a newer desired generation
+    /// for the same node.
     pub claim_generation: u64,
     pub wave: u32,
     pub actions: Vec<PlannedAction>,
@@ -1806,8 +1841,54 @@ pub struct NodeRuntimeReport {
     /// never a measured zero.
     #[serde(default)]
     pub traffic: Option<NodeTrafficReading>,
+    /// Current public source addresses grouped by Xray account label.
+    ///
+    /// `None` means the running Xray configuration does not enable online tracking, the local
+    /// Xray API does not support the bulk snapshot call, or collection failed. `Some([])` is a
+    /// successful observation with no active source. Keeping those states apart prevents an old
+    /// Agent or a temporarily unreachable Xray API from making every user appear offline.
+    #[serde(default)]
+    pub online_sources: Option<Vec<UserOnlineSources>>,
     pub spool: SpoolBacklog,
 }
+
+/// Active public source addresses for one compiled grant label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserOnlineSources {
+    /// The exact `{user}@{tenant}#{ingress}` label written into Xray. The control plane parses it
+    /// through `brocade_core::model::parse_grant_label` and ignores probe or stale labels.
+    pub label: String,
+    pub sources: Vec<OnlineSource>,
+}
+
+/// One address currently held by Xray's ref-counted online map.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnlineSource {
+    /// Canonical textual IPv4 or IPv6 address. The Store accepts only public route addresses and
+    /// persists them as PostgreSQL `INET` values.
+    pub ip: String,
+    /// When Xray most recently saw a connection from this address. This is not packet activity:
+    /// a long-lived connection may legitimately carry an old value while remaining online.
+    pub last_seen_unix_secs: i64,
+    /// Authenticated inbound protocols currently holding this source online. Missing means an
+    /// older Agent/Xray; it must never be inferred from the configured or permitted protocols.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocols: Option<Vec<OnlineSourceProtocol>>,
+}
+
+/// Bounded protocol vocabulary for online presence, independent of grant/traffic identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnlineSourceProtocol {
+    Vless,
+    #[serde(rename = "anytls")]
+    AnyTls,
+    Hysteria2,
+    #[serde(other)]
+    Unknown,
+}
+
+pub const MAX_ONLINE_SOURCE_PROTOCOLS: usize = 8;
 
 /// One durable reading of the node's automatically selected default-route interface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1859,11 +1940,13 @@ pub struct NodeVersions {
     #[serde(default)]
     pub xray_running_sha256: Option<String>,
     pub phantun: Option<String>,
-    /// The first line of `openvpn --version`.
+    /// The first line of `openvpn --version`, reported only while `/dev/net/tun` is usable.
     ///
     /// VPN Gate is an optional node capability: `None` is a valid Agent installation, but that
-    /// machine must not receive or be offered VPN Gate egress work. OpenVPN is started on demand
-    /// inside a managed network namespace; this does not describe a system-wide daemon.
+    /// machine must not receive or be offered VPN Gate egress work. A present OpenVPN binary with
+    /// a missing or inaccessible TUN device is likewise reported as `None`, because it cannot run
+    /// a single provider profile. OpenVPN is started on demand inside a managed network namespace;
+    /// this does not describe a system-wide daemon.
     #[serde(default)]
     pub openvpn: Option<String>,
     /// Maximum number of catalogue profiles this Agent can probe concurrently.
@@ -1976,17 +2059,23 @@ pub enum WireGuardPeerStatus {
 
 /// How much undeliverable reporting has piled up locally.
 ///
-/// While the agent cannot reach the control plane it accumulates reports in a spool file and
-/// drops the oldest past the limit. What is dropped is accounting data, so the symptom is a
-/// machine reporting no traffic for the month, which the UI cannot distinguish from a machine
-/// that carried none.
+/// While the agent cannot reach the control plane it accumulates reports in spool files and drops
+/// the oldest past their limits. Usage and convergence observations have different consequences,
+/// so new agents classify their cumulative losses. `dropped` remains the all-kinds total for old
+/// consoles and may include losses recorded before classification existed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpoolBacklog {
     pub observation: u32,
     pub usage: u32,
-    /// The cumulative count dropped for exceeding the limit. It only increases, and a non-zero
-    /// value means accounting data was permanently lost.
+    /// Cumulative all-kinds total retained for wire compatibility. New readers subtract the two
+    /// classified counters below; any remainder is an older loss whose kind is unknowable.
     pub dropped: u64,
+    /// Present only on agents that distinguish lost accounting from lost convergence evidence.
+    #[serde(default)]
+    pub usage_dropped: Option<u64>,
+    /// Present only on agents that distinguish lost convergence evidence from lost accounting.
+    #[serde(default)]
+    pub observation_dropped: Option<u64>,
 }
 
 // ── Telemetry: host load and per-hop link estimates ────────────────────────────────────────
@@ -2484,17 +2573,317 @@ pub struct NodeLoadList {
 
 // ── Active PING probe (TCP connect + ICMP echo) ────────────────────────────────────────────
 //
-// A target's URI selects the operation: `tcp://host:port` measures a TCP handshake and
-// `icmp://host` measures one echo round trip. Both may be present in the same round. Name
-// resolution and local capability checks happen outside the timer. The durable contract keeps
-// only what the graph uses: whether a wire attempt actually happened and its optional latency.
-// Detailed DNS/socket/errno diagnostics remain in the node-local journal.
+// A target's kind selects the operation: TCP measures a handshake to `host:port` and ICMP
+// measures one echo round trip to `host`. Every target has an IPv4 and an IPv6 endpoint, each
+// optional; the two are probed independently and each produces its own series. Both kinds may
+// be present in the same round. Name resolution and local capability checks happen outside the
+// timer. The durable contract keeps what the graph uses: whether a wire attempt happened, its
+// optional latency, and a coarse reason when it did not. Detailed DNS/socket/errno diagnostics
+// remain in the node-local journal.
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PingProbeKind {
+    Tcp,
+    Icmp,
+}
+
+impl PingProbeKind {
+    pub fn scheme(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Icmp => "icmp",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PingProbeFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl PingProbeFamily {
+    pub const ALL: [Self; 2] = [Self::Ipv4, Self::Ipv6];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "ipv4" => Some(Self::Ipv4),
+            "ipv6" => Some(Self::Ipv6),
+            _ => None,
+        }
+    }
+
+    pub fn of(address: std::net::IpAddr) -> Self {
+        match address {
+            std::net::IpAddr::V4(_) => Self::Ipv4,
+            std::net::IpAddr::V6(_) => Self::Ipv6,
+        }
+    }
+
+    /// The family of an IP-literal series address (`icmp://192.0.2.1`, `tcp://[2001:db8::1]:443`).
+    /// `None` for a domain, whose family only the probing Agent knows.
+    pub fn of_series_address(address: &str) -> Option<Self> {
+        let (kind, authority) = split_series_address(address)?;
+        PingProbeEndpoint::parse(kind, authority)
+            .ok()?
+            .literal_family()
+    }
+}
+
+/// Why an Agent made no wire measurement for one endpoint. A skipped round is a capability or
+/// configuration gap and never counts as packet loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PingProbeSkipReason {
+    /// The machine has no route and source address for this family.
+    NoRoute,
+    /// The domain resolved, but to no address of this family.
+    NoAddress,
+    /// Name resolution failed or returned nothing.
+    ResolveFailed,
+    /// The probe could not run on this machine, for example no ICMP socket permission.
+    Unavailable,
+}
+
+impl PingProbeSkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRoute => "no_route",
+            Self::NoAddress => "no_address",
+            Self::ResolveFailed => "resolve_failed",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "no_route" => Some(Self::NoRoute),
+            "no_address" => Some(Self::NoAddress),
+            "resolve_failed" => Some(Self::ResolveFailed),
+            "unavailable" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+}
+
+/// Upper bound for one endpoint's text, shared by the settings validator and the Agent.
+pub const MAX_PING_ENDPOINT_CHARS: usize = 512;
+
+/// One validated PING endpoint: an ICMP `host`, or a TCP `host` and port. The host is an IP
+/// literal or a domain. Parsing canonicalizes it — IP literals are re-rendered by the standard
+/// formatter and domains are lowercased — so equal endpoints share one series identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PingProbeEndpoint {
+    host: String,
+    literal: Option<std::net::IpAddr>,
+    port: Option<u16>,
+}
+
+/// Why an endpoint is not accepted. The settings validator turns each into operator text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PingEndpointError {
+    Empty,
+    TooLong,
+    /// Whitespace, a scheme, a path, a query, a fragment or user info.
+    Malformed,
+    /// A TCP endpoint without `:port`.
+    MissingPort,
+    /// A port outside 1–65535.
+    InvalidPort,
+    /// An ICMP endpoint with a port.
+    PortNotAllowed,
+    /// Brackets around something that is not an IPv6 address.
+    BracketsNotIpv6,
+    /// A bare IPv6 address followed by a port, which cannot be told apart from the address.
+    Ipv6NeedsBrackets,
+}
+
+impl PingProbeEndpoint {
+    pub fn parse(kind: PingProbeKind, text: &str) -> Result<Self, PingEndpointError> {
+        if text.is_empty() {
+            return Err(PingEndpointError::Empty);
+        }
+        if text.chars().count() > MAX_PING_ENDPOINT_CHARS {
+            return Err(PingEndpointError::TooLong);
+        }
+        if text
+            .chars()
+            .any(|char| char.is_whitespace() || matches!(char, '/' | '?' | '#' | '@'))
+        {
+            return Err(PingEndpointError::Malformed);
+        }
+        let (host, port) = match kind {
+            PingProbeKind::Icmp => {
+                let host = match text.strip_prefix('[') {
+                    Some(rest) => {
+                        let inner = rest
+                            .strip_suffix(']')
+                            .ok_or(PingEndpointError::PortNotAllowed)?;
+                        if inner.parse::<std::net::Ipv6Addr>().is_err() {
+                            return Err(PingEndpointError::BracketsNotIpv6);
+                        }
+                        inner
+                    }
+                    // ICMP has no port, so a bare IPv6 address is unambiguous.
+                    None if text.contains(':') => {
+                        if text.parse::<std::net::Ipv6Addr>().is_err() {
+                            return Err(PingEndpointError::PortNotAllowed);
+                        }
+                        text
+                    }
+                    None => text,
+                };
+                (host, None)
+            }
+            PingProbeKind::Tcp => {
+                let (host, port) = match text.strip_prefix('[') {
+                    Some(rest) => {
+                        let (inner, port) = rest
+                            .split_once("]:")
+                            .ok_or(PingEndpointError::MissingPort)?;
+                        if inner.parse::<std::net::Ipv6Addr>().is_err() {
+                            return Err(PingEndpointError::BracketsNotIpv6);
+                        }
+                        (inner, port)
+                    }
+                    None => {
+                        let (host, port) = text
+                            .rsplit_once(':')
+                            .ok_or(PingEndpointError::MissingPort)?;
+                        if host.contains(':') {
+                            return Err(PingEndpointError::Ipv6NeedsBrackets);
+                        }
+                        (host, port)
+                    }
+                };
+                let port = port
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|port| *port > 0)
+                    .ok_or(PingEndpointError::InvalidPort)?;
+                (host, Some(port))
+            }
+        };
+        if host.is_empty() || host.contains(['[', ']']) {
+            return Err(PingEndpointError::Malformed);
+        }
+        let literal = host.parse::<std::net::IpAddr>().ok();
+        let host = match literal {
+            Some(address) => address.to_string(),
+            None => host.to_ascii_lowercase(),
+        };
+        Ok(Self {
+            host,
+            literal,
+            port,
+        })
+    }
+
+    /// Canonical domain or IP literal, without brackets.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    /// The family an IP literal fixes; `None` for a domain.
+    pub fn literal_family(&self) -> Option<PingProbeFamily> {
+        self.literal.map(PingProbeFamily::of)
+    }
+
+    /// `host`, `host:port` or `[v6]:port` — what operators type and settings store.
+    pub fn text(&self) -> String {
+        match self.port {
+            None => self.host.clone(),
+            Some(port) => format!("{}:{port}", self.bracketed_host()),
+        }
+    }
+
+    /// `kind://authority`: the stable identity of this endpoint's series.
+    pub fn series_address(&self, kind: PingProbeKind) -> String {
+        match self.port {
+            None => format!("{}://{}", kind.scheme(), self.bracketed_host()),
+            Some(port) => format!("{}://{}:{port}", kind.scheme(), self.bracketed_host()),
+        }
+    }
+
+    fn bracketed_host(&self) -> String {
+        match self.literal {
+            Some(std::net::IpAddr::V6(_)) => format!("[{}]", self.host),
+            _ => self.host.clone(),
+        }
+    }
+}
+
+fn split_series_address(address: &str) -> Option<(PingProbeKind, &str)> {
+    if let Some(authority) = address.strip_prefix("tcp://") {
+        return Some((PingProbeKind::Tcp, authority));
+    }
+    address
+        .strip_prefix("icmp://")
+        .map(|authority| (PingProbeKind::Icmp, authority))
+}
+
+/// One configured destination. `ipv4` and `ipv6` are independent endpoints of the same kind and
+/// each produces its own series; either may be absent, never both. An endpoint's host is an IP
+/// literal of that family or a domain whose records of that family are probed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PingProbeTarget {
     pub name: String,
-    /// Canonical `tcp://host:port` or `icmp://host` address. It is also the stable series id.
-    pub address: String,
+    pub kind: PingProbeKind,
+    #[serde(default)]
+    pub ipv4: Option<String>,
+    #[serde(default)]
+    pub ipv6: Option<String>,
+}
+
+impl PingProbeTarget {
+    pub fn endpoint_text(&self, family: PingProbeFamily) -> Option<&str> {
+        match family {
+            PingProbeFamily::Ipv4 => self.ipv4.as_deref(),
+            PingProbeFamily::Ipv6 => self.ipv6.as_deref(),
+        }
+    }
+
+    /// The parsed endpoint of one family; `None` when that family is not configured.
+    pub fn endpoint(
+        &self,
+        family: PingProbeFamily,
+    ) -> Option<Result<PingProbeEndpoint, PingEndpointError>> {
+        self.endpoint_text(family)
+            .map(|text| PingProbeEndpoint::parse(self.kind, text))
+    }
+
+    /// Series identity of one configured, valid family.
+    pub fn series_address(&self, family: PingProbeFamily) -> Option<String> {
+        Some(self.endpoint(family)?.ok()?.series_address(self.kind))
+    }
+
+    /// Read a pre-dual-stack target. An IP literal fills only its own family; a domain fills
+    /// both, because probing both families of a name is what a dual-stack target means.
+    pub fn from_legacy(legacy: &LegacyPingProbeTarget) -> Option<Self> {
+        let (kind, authority) = split_series_address(&legacy.address)?;
+        let endpoint = PingProbeEndpoint::parse(kind, authority).ok()?;
+        let text = endpoint.text();
+        let family = endpoint.literal_family();
+        Some(Self {
+            name: legacy.name.clone(),
+            kind,
+            ipv4: (family != Some(PingProbeFamily::Ipv6)).then(|| text.clone()),
+            ipv6: (family != Some(PingProbeFamily::Ipv4)).then_some(text),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2515,16 +2904,74 @@ impl Default for PingProbeSettings {
     }
 }
 
+impl PingProbeSettings {
+    /// What an Agent older than `DUAL_STACK_PING_PROTOCOL_VERSION` can execute: one URI per
+    /// IP-literal endpoint. Domains are left out because such an Agent probes whichever family
+    /// resolution returns first, and the Console could not attribute its sample to a series.
+    pub fn legacy(&self) -> LegacyPingProbeSettings {
+        let targets = self
+            .targets
+            .iter()
+            .flat_map(|target| {
+                PingProbeFamily::ALL.into_iter().filter_map(|family| {
+                    let endpoint = target.endpoint(family)?.ok()?;
+                    (endpoint.literal_family() == Some(family)).then(|| LegacyPingProbeTarget {
+                        name: target.name.clone(),
+                        address: endpoint.series_address(target.kind),
+                    })
+                })
+            })
+            .collect();
+        LegacyPingProbeSettings {
+            targets,
+            interval_secs: self.interval_secs,
+            timeout_ms: self.timeout_ms,
+        }
+    }
+}
+
+/// Pre-dual-stack target: one `tcp://host:port` or `icmp://host` URI, probed over whichever
+/// family name resolution returns first. Still stored by older Consoles and spoken to older Agents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyPingProbeTarget {
+    pub name: String,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyPingProbeSettings {
+    pub targets: Vec<LegacyPingProbeTarget>,
+    pub interval_secs: u32,
+    pub timeout_ms: u32,
+}
+
+/// What an Agent may receive from `/agent/v1/ping-probe-targets`. A Console older than the
+/// dual-stack protocol (for example after a Console rollback) still answers with the legacy shape.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum PingProbeTargetsResponse {
+    Current(PingProbeSettings),
+    Legacy(LegacyPingProbeSettings),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PingProbeSample {
-    /// Matches `PingProbeTarget.address` from the settings fetched for this round.
+    /// The series address of the probed endpoint (`PingProbeEndpoint::series_address`), or the
+    /// legacy target URI.
     pub target: String,
+    /// Absent only from Agents older than `DUAL_STACK_PING_PROTOCOL_VERSION`; the Console then
+    /// accepts the sample only when its address is an IP literal that fixes the family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<PingProbeFamily>,
     /// False means no wire measurement was possible (for example no IPv6 route or no ICMP socket).
     /// It must stay distinct from an attempted probe that received no response.
     pub attempted: bool,
     /// Whole microseconds preserve sub-millisecond ICMP readings without storing a floating point
     /// value. `None` with `attempted = true` means no response within the configured timeout.
     pub latency_us: Option<u32>,
+    /// Why no measurement was possible. Present only with `attempted = false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<PingProbeSkipReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2546,15 +2993,28 @@ pub struct PingProbePoint {
     pub probed_at_unix_secs: i64,
     pub attempted: bool,
     pub latency_us: Option<u32>,
+    /// Why the round made no measurement; only on unattempted points from dual-stack Agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<PingProbeSkipReason>,
 }
 
+/// One family of one target: its series address and retained points.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PingProbeTargetSeries {
-    pub name: String,
+pub struct PingProbeFamilySeries {
     pub address: String,
     /// Oldest first. Attempted null points are no-response intervals; unattempted null points are
     /// capability/route gaps and must not be counted as packet loss by clients.
     pub samples: Vec<PingProbePoint>,
+}
+
+/// A configured target with one series per configured family. `None` means the family is not
+/// configured for this target, which is different from configured but never measured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PingProbeTargetSeries {
+    pub name: String,
+    pub kind: PingProbeKind,
+    pub ipv4: Option<PingProbeFamilySeries>,
+    pub ipv6: Option<PingProbeFamilySeries>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2568,17 +3028,24 @@ pub struct NodePingProbeList {
     pub nodes: Vec<NodePingProbeView>,
 }
 
-/// Latest observation for one configured target on a machine-list card.
+/// Latest observation for one configured family of a target on a machine-list card.
 ///
 /// The list view answers a current-state question, so it must not carry a history window merely
-/// to derive one number in the browser. `None` means this target has never produced a retained
-/// sample for the machine. An attempted sample with no latency remains a timeout, while an
-/// unattempted sample remains a capability or route gap.
+/// to derive one number in the browser. `latest = None` means this series has never produced a
+/// retained sample for the machine. An attempted sample with no latency remains a timeout, while
+/// an unattempted sample remains a capability or route gap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PingProbeFamilyLatest {
+    pub address: String,
+    pub latest: Option<PingProbePoint>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PingProbeTargetLatest {
     pub name: String,
-    pub address: String,
-    pub latest: Option<PingProbePoint>,
+    pub kind: PingProbeKind,
+    pub ipv4: Option<PingProbeFamilyLatest>,
+    pub ipv6: Option<PingProbeFamilyLatest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2616,6 +3083,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn online_source_protocols_are_additive_and_use_stable_names() {
+        let legacy = serde_json::json!({"ip": "1.1.1.1", "last_seen_unix_secs": 1});
+        let mut source: OnlineSource = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(source.protocols, None);
+        assert_eq!(serde_json::to_value(&source).unwrap(), legacy);
+        source.protocols = Some(vec![
+            OnlineSourceProtocol::Vless,
+            OnlineSourceProtocol::AnyTls,
+            OnlineSourceProtocol::Hysteria2,
+        ]);
+        let mut value = serde_json::to_value(source).unwrap();
+        assert_eq!(
+            value["protocols"],
+            serde_json::json!(["vless", "anytls", "hysteria2"])
+        );
+        #[derive(Deserialize)]
+        struct LegacySource {
+            ip: String,
+            last_seen_unix_secs: i64,
+        }
+        let decoded: LegacySource = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(decoded.ip, "1.1.1.1");
+        assert_eq!(decoded.last_seen_unix_secs, 1);
+        value["protocols"] = serde_json::json!(["future-protocol"]);
+        assert_eq!(
+            serde_json::from_value::<OnlineSource>(value)
+                .unwrap()
+                .protocols,
+            Some(vec![OnlineSourceProtocol::Unknown])
+        );
+    }
+
+    #[test]
     fn public_ip_observation_has_stable_family_spelling() {
         let encoded = serde_json::to_value(NodePublicIpObservation {
             observed_at_unix_secs: 1,
@@ -2645,7 +3145,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_runtime_report_defaults_missing_traffic_meter() {
+    fn legacy_runtime_report_defaults_missing_additive_observations() {
         let report: NodeRuntimeReport = serde_json::from_value(serde_json::json!({
             "observed_at_unix_secs": 1,
             "versions": {
@@ -2663,6 +3163,9 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(report.traffic, None);
+        assert_eq!(report.online_sources, None);
+        assert_eq!(report.spool.usage_dropped, None);
+        assert_eq!(report.spool.observation_dropped, None);
     }
 
     #[test]
@@ -2687,6 +3190,8 @@ mod tests {
             "openvpn_config": "client"
         }))
         .unwrap();
+        assert_eq!(candidate.probe_mode, VpngateProbeMode::Performance);
+        assert_eq!(candidate.last_observed_exit_ip, None);
         assert_eq!(candidate.verified_exit_ip, None);
         assert_eq!(candidate.verified_exit_country_code, None);
         assert!(candidate.verified_ip_scores.is_empty());
@@ -2714,7 +3219,7 @@ mod tests {
             error: Option<String>,
         }
 
-        assert_eq!(AGENT_PROTOCOL_VERSION, 21);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 24);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
         let report: XrayReleaseReport = serde_json::from_value(serde_json::json!({
             "release_id": 7,
@@ -3156,6 +3661,151 @@ mod tests {
         let parsed: CpuDetailSample =
             serde_json::from_value(serde_json::to_value(&detail).unwrap()).unwrap();
         assert_eq!(parsed, detail);
+    }
+
+    #[test]
+    fn ping_endpoints_parse_into_one_canonical_series_identity() {
+        let icmp = |text| PingProbeEndpoint::parse(PingProbeKind::Icmp, text);
+        let tcp = |text| PingProbeEndpoint::parse(PingProbeKind::Tcp, text);
+
+        let v4 = icmp("1.1.1.1").unwrap();
+        assert_eq!(v4.literal_family(), Some(PingProbeFamily::Ipv4));
+        assert_eq!(v4.series_address(PingProbeKind::Icmp), "icmp://1.1.1.1");
+
+        // ICMP has no port, so a bare IPv6 address is accepted; brackets are accepted and dropped.
+        let bare = icmp("2606:4700:4700:0:0:0:0:1111").unwrap();
+        let bracketed = icmp("[2606:4700:4700::1111]").unwrap();
+        assert_eq!(bare, bracketed);
+        assert_eq!(bare.text(), "2606:4700:4700::1111");
+        assert_eq!(
+            bare.series_address(PingProbeKind::Icmp),
+            "icmp://[2606:4700:4700::1111]"
+        );
+
+        let domain = icmp("IPv6.Google.com").unwrap();
+        assert_eq!(domain.literal_family(), None);
+        assert_eq!(domain.text(), "ipv6.google.com");
+
+        let v6_tcp = tcp("[2400:3200::1]:443").unwrap();
+        assert_eq!(v6_tcp.text(), "[2400:3200::1]:443");
+        assert_eq!(
+            v6_tcp.series_address(PingProbeKind::Tcp),
+            "tcp://[2400:3200::1]:443"
+        );
+        assert_eq!(
+            tcp("www.google.com:443")
+                .unwrap()
+                .series_address(PingProbeKind::Tcp),
+            "tcp://www.google.com:443"
+        );
+
+        assert_eq!(icmp(""), Err(PingEndpointError::Empty));
+        assert_eq!(icmp("icmp://1.1.1.1"), Err(PingEndpointError::Malformed));
+        assert_eq!(icmp("1.1.1.1:80"), Err(PingEndpointError::PortNotAllowed));
+        assert_eq!(
+            icmp("[2001:db8::1]:80"),
+            Err(PingEndpointError::PortNotAllowed)
+        );
+        assert_eq!(
+            icmp("[example.com]"),
+            Err(PingEndpointError::BracketsNotIpv6)
+        );
+        assert_eq!(tcp("example.com"), Err(PingEndpointError::MissingPort));
+        assert_eq!(tcp("[2001:db8::1]"), Err(PingEndpointError::MissingPort));
+        assert_eq!(
+            tcp("2001:db8::1:443"),
+            Err(PingEndpointError::Ipv6NeedsBrackets)
+        );
+        assert_eq!(tcp("example.com:0"), Err(PingEndpointError::InvalidPort));
+        assert_eq!(tcp("a b:443"), Err(PingEndpointError::Malformed));
+    }
+
+    #[test]
+    fn legacy_ping_targets_convert_in_both_directions_without_guessing_families() {
+        let legacy = |address: &str| LegacyPingProbeTarget {
+            name: "t".to_owned(),
+            address: address.to_owned(),
+        };
+        let domain = PingProbeTarget::from_legacy(&legacy("tcp://example.com:443")).unwrap();
+        assert_eq!(domain.kind, PingProbeKind::Tcp);
+        assert_eq!(domain.ipv4.as_deref(), Some("example.com:443"));
+        assert_eq!(domain.ipv6.as_deref(), Some("example.com:443"));
+
+        let v6 = PingProbeTarget::from_legacy(&legacy("icmp://[2001:db8::1]")).unwrap();
+        assert_eq!(v6.ipv4, None);
+        assert_eq!(v6.ipv6.as_deref(), Some("2001:db8::1"));
+        assert!(PingProbeTarget::from_legacy(&legacy("udp://1.1.1.1")).is_none());
+
+        // Old Agents only receive IP literals: they cannot say which family a domain resolved to.
+        let settings = PingProbeSettings {
+            targets: vec![
+                PingProbeTarget {
+                    name: "Cloudflare".to_owned(),
+                    kind: PingProbeKind::Icmp,
+                    ipv4: Some("1.1.1.1".to_owned()),
+                    ipv6: Some("2606:4700:4700::1111".to_owned()),
+                },
+                domain,
+            ],
+            interval_secs: 60,
+            timeout_ms: 420,
+        };
+        let addresses = settings
+            .legacy()
+            .targets
+            .into_iter()
+            .map(|target| target.address)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            addresses,
+            ["icmp://1.1.1.1", "icmp://[2606:4700:4700::1111]"]
+        );
+        assert_eq!(
+            PingProbeFamily::of_series_address("icmp://[2606:4700:4700::1111]"),
+            Some(PingProbeFamily::Ipv6)
+        );
+        assert_eq!(
+            PingProbeFamily::of_series_address("tcp://example.com:443"),
+            None
+        );
+    }
+
+    #[test]
+    fn ping_wire_shapes_stay_readable_across_the_dual_stack_upgrade() {
+        // A dual-stack Agent still understands a Console that answers with the legacy shape.
+        let legacy: PingProbeTargetsResponse = serde_json::from_value(serde_json::json!({
+            "targets": [{ "name": "t", "address": "icmp://1.1.1.1" }],
+            "interval_secs": 60,
+            "timeout_ms": 420
+        }))
+        .unwrap();
+        assert!(matches!(legacy, PingProbeTargetsResponse::Legacy(_)));
+        let current: PingProbeTargetsResponse = serde_json::from_value(serde_json::json!({
+            "targets": [{ "name": "t", "kind": "icmp", "ipv4": "1.1.1.1", "ipv6": null }],
+            "interval_secs": 60,
+            "timeout_ms": 420
+        }))
+        .unwrap();
+        assert!(matches!(current, PingProbeTargetsResponse::Current(_)));
+
+        // A sample from an older Agent has neither family nor reason.
+        let old: PingProbeSample = serde_json::from_value(serde_json::json!({
+            "target": "icmp://1.1.1.1", "attempted": true, "latency_us": 1200
+        }))
+        .unwrap();
+        assert_eq!(old.family, None);
+        assert_eq!(old.skip_reason, None);
+        let new = PingProbeSample {
+            target: "icmp://[2001:db8::1]".to_owned(),
+            family: Some(PingProbeFamily::Ipv6),
+            attempted: false,
+            latency_us: None,
+            skip_reason: Some(PingProbeSkipReason::NoRoute),
+        };
+        let encoded = serde_json::to_value(&new).unwrap();
+        assert_eq!(encoded["family"], "ipv6");
+        assert_eq!(encoded["skip_reason"], "no_route");
+        assert_eq!(DUAL_STACK_PING_PROTOCOL_VERSION, AGENT_PROTOCOL_VERSION);
     }
 }
 

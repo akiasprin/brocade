@@ -132,6 +132,7 @@ const SECRET_KEYS: &[&str] = &[
     "acme_contact",
     "anytls_padding_scheme",
     "certificate_names",
+    "direct_login_enabled",
     "email",
     "login_enabled",
     "padding_scheme",
@@ -750,6 +751,7 @@ mod tests {
                 "email": "alice@example.com",
                 "telegram": "alice_net",
                 "login_enabled": true,
+                "direct_login_enabled": true,
                 "account_type": "test",
             }],
             "compiled": {
@@ -767,6 +769,7 @@ mod tests {
         assert!(!text.contains("alice@example.com"), "{text}");
         assert!(!text.contains("alice_net"), "{text}");
         assert!(!text.contains("login_enabled"), "{text}");
+        assert!(!text.contains("direct_login_enabled"), "{text}");
         assert_eq!(value["users"][0]["id"], "alice");
         assert_eq!(value["users"][0]["account_type"], "test");
         assert_eq!(value["compiled"]["observed"]["state"], "present");
@@ -960,6 +963,40 @@ mod tests {
         let encoded = value.to_string();
         assert!(!encoded.contains("192.0.2.1"), "IPv4 leaked in {encoded}");
         assert!(!encoded.contains("2001:db8::1"), "IPv6 leaked in {encoded}");
+    }
+
+    /// Dual-stack settings carry one bare endpoint per family, and history views nest each family's
+    /// series address under `ipv4` / `ipv6`. Both shapes must mask every endpoint.
+    #[test]
+    fn dual_stack_ping_endpoints_are_masked_in_settings_and_views() {
+        let mut value = json!({
+            "settings": {
+                "targets": [
+                    { "name": "TCP", "kind": "tcp", "ipv4": "192.0.2.1:443", "ipv6": "[2001:db8::1]:443" },
+                    { "name": "ICMP", "kind": "icmp", "ipv4": null, "ipv6": "2001:db8::2" },
+                ]
+            },
+            "view": {
+                "targets": [{
+                    "name": "TCP",
+                    "kind": "tcp",
+                    "ipv4": { "address": "tcp://192.0.2.1:443", "samples": [] },
+                    "ipv6": { "address": "tcp://[2001:db8::1]:443", "samples": [] },
+                }]
+            }
+        });
+
+        mask_json(&mut value);
+
+        let encoded = value.to_string();
+        for leaked in ["192.0.2.1", "2001:db8::1", "2001:db8::2"] {
+            assert!(!encoded.contains(leaked), "{leaked} leaked in {encoded}");
+        }
+        assert_eq!(value["settings"]["targets"][0]["kind"], "tcp");
+        assert!(value["view"]["targets"][0]["ipv6"]["address"]
+            .as_str()
+            .unwrap()
+            .starts_with("tcp://"));
     }
 
     /// The three ports that used to survive masking: the hop range's `start`/`end` under a

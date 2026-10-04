@@ -133,14 +133,14 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 
 	source := net.DestinationFromAddr(conn.RemoteAddr())
 	inbound := session.Inbound{
-		Name:          "tun",
-		Tag:           t.tag,
-		CanSpliceCopy: 3,
-		Source:        source,
+		Name:   "tun",
+		Tag:    t.tag,
+		Source: source,
 		User: &protocol.MemoryUser{
 			Level: t.config.UserLevel,
 		},
 	}
+	inbound.CanSpliceCopy.Store(session.SpliceCopyDisabled)
 
 	ctx = session.ContextWithInbound(ctx, &inbound)
 	ctx = session.ContextWithContent(ctx, &session.Content{

@@ -14,7 +14,7 @@ function LoadingIndicator({
 }) {
   return (
     <span
-      className={`loading-mark ${kind}`}
+      className={`loading-mark loading-mark-${kind}`}
       role={announce ? 'status' : undefined}
       aria-live={announce ? 'polite' : undefined}
       aria-label={announce ? label : undefined}
@@ -32,7 +32,7 @@ function LoadingIndicator({
   );
 }
 
-/** Progress for a whole panel or content region whose data has not arrived yet. */
+/** Progress for a panel or content region; its owner controls alignment and reserved space. */
 export function PanelLoading({ label, announce }: { label?: string; announce?: boolean }) {
   return <LoadingIndicator kind="panel" label={label} announce={announce} />;
 }

@@ -1,17 +1,20 @@
-// 用量按自然月展示。月份选择只切换整张视图，不把两个月叠在一起比较；汇总与每日柱形
-// 来自同一个月汇总端点。
+// 用量按自然月展示。月份选择只切换整张视图，不把两个月叠在一起比较；读数栏与每日柱形
+// 来自同一个月汇总端点。整页是一张卡：左侧读数栏回答“这个月用了多少”，右侧柱形图回答
+// “每天怎样组成”。
 
 import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { fetchUsageMonthly, type UsageDailyRow, type UsageMonthlySummary, type UsageMonthlyViewRow } from '../api';
+import { fetchUsageMonthly, type UsageDailyRow, type UsageMonthlySummary } from '../api';
 import { ErrorBox, Loading } from '../ui/bits';
 import { bytes } from '../ui/format';
-import { ListIcon, PanelTitle } from '../ui/icons';
+import { ListIcon } from '../ui/icons';
 
 const monthLabel = (s: string) => `${s.slice(0, 4)} 年 ${parseInt(s.slice(5, 7), 10)} 月`;
 const dayLabel = (s: string) =>
   `${s.slice(0, 4)} 年 ${parseInt(s.slice(5, 7), 10)} 月 ${parseInt(s.slice(8, 10), 10)} 日`;
-const rowBytes = (r: UsageMonthlyViewRow) => r.uplink_bytes + r.downlink_bytes;
+const shortDayLabel = (s: string) => `${parseInt(s.slice(5, 7), 10)} 月 ${parseInt(s.slice(8, 10), 10)} 日`;
+const dayBytes = (day: UsageDailyRow) => day.uplink_bytes + day.downlink_bytes;
+const share = (part: number, whole: number) => (whole > 0 ? `${((part / whole) * 100).toFixed(1)}%` : '—');
 
 interface CalendarUsageDay extends UsageDailyRow {
   dayNumber: number;
@@ -39,24 +42,41 @@ function calendarDays(summary: UsageMonthlySummary): CalendarUsageDay[] {
   });
 }
 
+/** Today's date on the control plane's calendar. The monthly summary query cuts days at +08
+ * (Asia/Hong_Kong), so the daily average uses the same zone to decide which days have ended. */
+function controlPlaneToday(now: Date): string {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Hong_Kong',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(now);
+  const part = (type: Intl.DateTimeFormatPartTypes) => parts.find(item => item.type === type)?.value ?? '';
+  return `${part('year')}-${part('month')}-${part('day')}`;
+}
+
 export function UsagePane() {
   const [monthOffset, setMonthOffset] = useState<0 | -1>(0);
   const monthly = useQuery({
     queryKey: monthOffset === 0 ? ['usage-monthly'] : ['usage-monthly', monthOffset],
     queryFn: () => fetchUsageMonthly(monthOffset),
+    // Month changes are refreshes inside an already-mounted surface. Keep the current reading in
+    // place until the next month is ready so the page title, switch and panel never remount.
+    placeholderData: previous => previous,
   });
 
   if (monthly.isPending) return <Loading variant="usage" />;
 
   return (
     <div className="cardpage usage-page">
-      <section className="panel titled usage-summary-panel" data-page-title="true">
+      <section
+        className="panel titled usage-summary-panel"
+        data-page-title="true"
+        aria-busy={monthly.isFetching || undefined}
+      >
         <header>
           <ListIcon of="usage" />
           <h4>用量</h4>
-          <span className="hint">
-            {monthly.data ? monthLabel(monthly.data.month_start) : monthOffset === 0 ? '本月' : '上月'}
-          </span>
           <span className="sp" />
           {monthly.isFetching && !monthly.isPending && <span className="usage-refreshing">读取中</span>}
           <div className="segsw usage-month-tabs" role="group" aria-label="用量月份">
@@ -69,65 +89,156 @@ export function UsagePane() {
           </div>
         </header>
 
-        {monthly.error ? <ErrorBox error={monthly.error} /> : <UsageMonth summary={monthly.data} />}
+        {/* A failed refresh keeps the month already on screen; the error explains why it may be stale. */}
+        {monthly.error && <ErrorBox error={monthly.error} />}
+        {monthly.data && <UsageMonth summary={monthly.data} />}
       </section>
-
-      {monthly.data && <DailyUsageChart summary={monthly.data} />}
     </div>
   );
 }
 
 function UsageMonth({ summary }: { summary: UsageMonthlySummary }) {
-  const views = summary.views;
-  const total = views.reduce((sum, row) => sum + rowBytes(row), 0);
-  const uplink = views.reduce((sum, row) => sum + row.uplink_bytes, 0);
-  const downlink = views.reduce((sum, row) => sum + row.downlink_bytes, 0);
-  const people = new Set(views.map(row => `${row.tenant_id}/${row.user_id}`)).size;
-  const apps = new Set(views.map(row => row.app_id)).size;
-  const gaps = views.filter(row => row.has_gap).length;
+  // The ledger's peak day and the chart's columns select the same day, so the selection lives here.
+  const [selectedDayKey, setSelectedDayKey] = useState<string | null>(null);
+  const days = calendarDays(summary);
   return (
-    <>
-      <section className="usage-overview" aria-label={`${monthLabel(summary.month_start)}用量概览`}>
-        <div className="usage-total">
-          <span>月累计流量</span>
-          <strong>{bytes(total)}</strong>
-          <small>自然月口径 · 每日上下行组成</small>
-        </div>
-        <UsageMetric label="上行" value={bytes(uplink)} tone="up" />
-        <UsageMetric label="下行" value={bytes(downlink)} tone="down" />
-        <UsageMetric label="活跃用户" value={String(people)} />
-        <UsageMetric label="线路" value={String(apps)} />
-      </section>
-
-      {gaps > 0 && (
-        <div className="callout warn usage-gap" role="status">
-          <span />
-          {gaps} 条流量明细包含采集缺口，页面按已收到的数据展示。
-        </div>
-      )}
-    </>
-  );
-}
-
-function UsageMetric({ label, value, tone }: { label: string; value: string; tone?: 'up' | 'down' }) {
-  return (
-    <div className={`usage-metric${tone ? ` ${tone}` : ''}`}>
-      <span>{label}</span>
-      <strong>{value}</strong>
+    <div className="usage-cockpit">
+      <UsageLedger summary={summary} days={days} onSelectDay={setSelectedDayKey} />
+      <DailyUsageChart summary={summary} days={days} selectedDayKey={selectedDayKey} onSelectDay={setSelectedDayKey} />
     </div>
   );
 }
 
-function DailyUsageChart({ summary }: { summary: UsageMonthlySummary }) {
-  const [selectedDayKey, setSelectedDayKey] = useState<string | null>(null);
+function UsageLedger({
+  summary,
+  days,
+  onSelectDay,
+}: {
+  summary: UsageMonthlySummary;
+  days: CalendarUsageDay[];
+  onSelectDay: (day: string) => void;
+}) {
+  const views = summary.views;
+  const uplink = views.reduce((sum, row) => sum + row.uplink_bytes, 0);
+  const downlink = views.reduce((sum, row) => sum + row.downlink_bytes, 0);
+  const total = uplink + downlink;
+  const people = new Set(views.map(row => `${row.tenant_id}/${row.user_id}`)).size;
+  const apps = new Set(views.map(row => row.app_id)).size;
+  // Today is still accumulating, so the average covers only days that have ended. An older control
+  // plane without daily rows cannot answer either daily reading.
+  const dailyAvailable = Array.isArray(summary.days);
+  const today = controlPlaneToday(new Date());
+  const closedDays = dailyAvailable ? days.filter(day => day.day < today) : [];
+  const average =
+    closedDays.length > 0 ? closedDays.reduce((sum, day) => sum + dayBytes(day), 0) / closedDays.length : null;
+  const peak = days.reduce<CalendarUsageDay | undefined>(
+    (best, day) => (dayBytes(day) > (best ? dayBytes(best) : 0) ? day : best),
+    undefined,
+  );
+  const upShare = total > 0 ? (uplink / total) * 100 : 0;
+  const [figure, unit] = bytes(total).split(' ');
+  const month = monthLabel(summary.month_start);
+  return (
+    <section className="usage-ledger" aria-label={`${month}用量概览`}>
+      <div className="usage-hero">
+        <span className="usage-hero-label">月累计流量</span>
+        <strong className="usage-hero-value">
+          {figure} <small>{unit}</small>
+        </strong>
+        <span className="usage-period">
+          {month} 1 日 – {days.length} 日
+        </span>
+      </div>
+      <div className="usage-compose">
+        {/* The rows below carry the same values as text; the bar only shows the proportion. */}
+        <div className="usage-split" aria-hidden="true">
+          {total > 0 && (
+            <>
+              <i className="up" style={{ flexGrow: upShare }} />
+              <i className="down" style={{ flexGrow: 100 - upShare }} />
+            </>
+          )}
+        </div>
+        <dl className="usage-io">
+          <div className="up">
+            <dt>
+              <i aria-hidden="true" />
+              上行
+            </dt>
+            <dd>{bytes(uplink)}</dd>
+            <dd className="usage-share">{share(uplink, total)}</dd>
+          </div>
+          <div className="down">
+            <dt>
+              <i aria-hidden="true" />
+              下行
+            </dt>
+            <dd>{bytes(downlink)}</dd>
+            <dd className="usage-share">{share(downlink, total)}</dd>
+          </div>
+        </dl>
+      </div>
+      <dl className="usage-facts">
+        <div>
+          <dt>日均</dt>
+          <dd title={closedDays.length > 0 ? `按 ${closedDays.length} 个完整日计算` : undefined}>
+            {average === null ? '—' : bytes(average)}
+          </dd>
+        </div>
+        <div>
+          <dt>峰值日</dt>
+          <dd>
+            {peak ? (
+              <>
+                <button
+                  type="button"
+                  className="usage-peak"
+                  aria-label={`在每日流量中查看 ${shortDayLabel(peak.day)}`}
+                  onClick={() => onSelectDay(peak.day)}
+                >
+                  {shortDayLabel(peak.day)}
+                </button>
+                <span className="usage-dot" aria-hidden="true">
+                  ·
+                </span>
+                {bytes(dayBytes(peak))}
+              </>
+            ) : (
+              '—'
+            )}
+          </dd>
+        </div>
+        <div>
+          <dt>活跃用户</dt>
+          <dd>{people}</dd>
+        </div>
+        <div>
+          <dt>线路</dt>
+          <dd>{apps}</dd>
+        </div>
+      </dl>
+    </section>
+  );
+}
+
+function DailyUsageChart({
+  summary,
+  days,
+  selectedDayKey,
+  onSelectDay,
+}: {
+  summary: UsageMonthlySummary;
+  days: CalendarUsageDay[];
+  selectedDayKey: string | null;
+  onSelectDay: (day: string) => void;
+}) {
   const selectedButtonRef = useRef<HTMLButtonElement>(null);
   const dailyAvailable = Array.isArray(summary.days);
-  const days = calendarDays(summary);
-  const totals = days.map(day => day.uplink_bytes + day.downlink_bytes);
+  const totals = days.map(dayBytes);
   const peak = Math.max(...totals, 1);
   const total = totals.reduce((sum, value) => sum + value, 0);
   const latestDayWithData = days.reduce<CalendarUsageDay | undefined>(
-    (latest, day) => (day.uplink_bytes + day.downlink_bytes > 0 || day.has_gap ? day : latest),
+    (latest, day) => (dayBytes(day) > 0 || day.has_gap ? day : latest),
     undefined,
   );
   // Keep a useful detail visible before interaction. When the month changes, an old key simply
@@ -143,10 +254,10 @@ function DailyUsageChart({ summary }: { summary: UsageMonthlySummary }) {
     scroller.scrollLeft = Math.max(0, button.offsetLeft - (scroller.clientWidth - button.offsetWidth) / 2);
   }, [selectedDayId]);
   return (
-    <section className="panel titled usage-daily">
-      <header>
-        <PanelTitle of="usage">每日流量</PanelTitle>
-        <span className="hint">{monthLabel(summary.month_start)} · 每根柱显示当天的上下行组成</span>
+    <section className="usage-chart">
+      <div className="usage-chart-head">
+        <h5>每日流量</h5>
+        <span className="usage-chart-hint">每根柱显示当天的上下行组成</span>
         <span className="sp" />
         <span className="usage-legend" aria-label="图例">
           <span>
@@ -158,7 +269,7 @@ function DailyUsageChart({ summary }: { summary: UsageMonthlySummary }) {
             下行
           </span>
         </span>
-      </header>
+      </div>
       {!dailyAvailable ? (
         <div className="usage-chart-empty">当前控制面尚未提供每日流量。</div>
       ) : total === 0 ? (
@@ -177,12 +288,10 @@ function DailyUsageChart({ summary }: { summary: UsageMonthlySummary }) {
               <span className="usage-grid-line bottom" />
               <div className="usage-day-columns" role="list" aria-label={`${monthLabel(summary.month_start)}每日流量`}>
                 {days.map(day => {
-                  const dayTotal = day.uplink_bytes + day.downlink_bytes;
+                  const dayTotal = dayBytes(day);
                   const height = dayTotal === 0 ? 0 : Math.max(2, (dayTotal / peak) * 100);
                   const upShare = dayTotal === 0 ? 0 : (day.uplink_bytes / dayTotal) * 100;
-                  const label = `${day.day}：上行 ${bytes(day.uplink_bytes)}，下行 ${bytes(day.downlink_bytes)}${
-                    day.has_gap ? '，包含采集缺口' : ''
-                  }`;
+                  const label = `${day.day}：上行 ${bytes(day.uplink_bytes)}，下行 ${bytes(day.downlink_bytes)}`;
                   const isMonthEnd = day.dayNumber === days.length;
                   const isInterval = day.dayNumber % 5 === 0 && days.length - day.dayNumber >= 3;
                   const major = day.dayNumber === 1 || isMonthEnd || isInterval;
@@ -195,15 +304,14 @@ function DailyUsageChart({ summary }: { summary: UsageMonthlySummary }) {
                         aria-label={`查看 ${label}`}
                         aria-pressed={selectedDayId === day.day}
                         title={label}
-                        onClick={() => setSelectedDayKey(day.day)}
-                        onFocus={() => setSelectedDayKey(day.day)}
+                        onClick={() => onSelectDay(day.day)}
+                        onFocus={() => onSelectDay(day.day)}
                       >
                         <span className="usage-day-track" aria-hidden="true">
                           <span className="usage-day-stack" style={{ height: `${height}%` }}>
                             <i className="up" style={{ height: `${upShare}%` }} />
                             <i className="down" style={{ height: `${100 - upShare}%` }} />
                           </span>
-                          {day.has_gap && <i className="gap" />}
                         </span>
                         <span className={`usage-day-label${major ? ' major' : ''}`} aria-hidden="true">
                           {major ? day.dayNumber : ''}
@@ -225,7 +333,7 @@ function DailyUsageChart({ summary }: { summary: UsageMonthlySummary }) {
             >
               <div className="usage-day-detail-date">
                 <time dateTime={selectedDay.day}>{dayLabel(selectedDay.day)}</time>
-                <small>{selectedDay.has_gap ? '包含采集缺口' : '点按柱形切换日期'}</small>
+                <small>点按柱形切换日期</small>
               </div>
               <dl>
                 <div className="up">

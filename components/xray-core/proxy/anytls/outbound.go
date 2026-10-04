@@ -154,7 +154,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		return errors.New("target not specified")
 	}
 	ob.Name = "anytls"
-	ob.CanSpliceCopy = 3 // Multiplexed AnyTLS frames must be encoded before delivery.
+	ob.CanSpliceCopy.Store(sessionctx.SpliceCopyDisabled) // Multiplexed AnyTLS frames must be encoded before delivery.
 	destination := ob.Target
 
 	var sess *session

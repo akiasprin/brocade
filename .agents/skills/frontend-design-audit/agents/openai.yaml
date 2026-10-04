@@ -1,0 +1,4 @@
+interface:
+  display_name: "Frontend Design Audit"
+  short_description: "Audit Brocade UI consistency and interaction"
+  default_prompt: "Audit the requested Brocade frontend surface against the repository design and interaction standards, then report or implement the scoped fixes."

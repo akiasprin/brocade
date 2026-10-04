@@ -1,7 +1,15 @@
+import { StrictMode } from 'react';
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { HostFacts, LoadSample, NodeLoadView } from '../src/api';
+import type {
+  HostFacts,
+  LoadSample,
+  NodeLoadView,
+  NodePingProbeView,
+  PingProbeFamilySeries,
+  PingProbePoint,
+} from '../src/api';
 import type { LoadRange } from '../src/panes/nodes';
 import {
   observeAreaFill,
@@ -32,15 +40,17 @@ vi.mock('echarts/core', () => ({
     group: '',
   })),
 }));
-vi.mock('echarts/charts', () => ({ LineChart: {} }));
+vi.mock('echarts/charts', () => ({ CustomChart: {}, LineChart: {} }));
 vi.mock('echarts/components', () => ({ GridComponent: {}, MarkLineComponent: {}, TooltipComponent: {} }));
 vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }));
 
 let LoadCard: typeof import('../src/panes/telemetry').LoadCard;
+let ThroughputChart: typeof import('../src/panes/telemetry').ThroughputChart;
 let downsampleKpiSeries: typeof import('../src/panes/telemetry').downsampleKpiSeries;
 let HostCard: typeof import('../src/panes/nodes').HostCard;
 let NicWave: typeof import('../src/panes/nodes').NicWave;
 let ThroughputPanel: typeof import('../src/panes/nodes').ThroughputPanel;
+let PingProbePanel: typeof import('../src/panes/nodes').PingProbePanel;
 let PingLatencyChart: typeof import('../src/panes/node-observation-charts').PingLatencyChart;
 let ObservationChartLoading: typeof import('../src/panes/node-observation-charts').ObservationChartLoading;
 
@@ -56,8 +66,8 @@ beforeAll(async () => {
       disconnect() {}
     },
   );
-  ({ LoadCard, downsampleKpiSeries } = await import('../src/panes/telemetry'));
-  ({ HostCard, NicWave, ThroughputPanel } = await import('../src/panes/nodes'));
+  ({ LoadCard, ThroughputChart, downsampleKpiSeries } = await import('../src/panes/telemetry'));
+  ({ HostCard, NicWave, ThroughputPanel, PingProbePanel } = await import('../src/panes/nodes'));
   ({ PingLatencyChart, ObservationChartLoading } = await import('../src/panes/node-observation-charts'));
 });
 
@@ -723,17 +733,12 @@ describe('deep host telemetry', () => {
   });
 
   it('sweeps Ping data in once and keeps later sample updates stable', () => {
-    const ping = {
-      node_id: 'n1',
-      targets: [
-        {
-          name: '测试落点',
-          address: 'icmp://192.0.2.1',
-          samples: [{ probed_at_unix_secs: 100, attempted: true, latency_us: 12_000 }],
-        },
-      ],
-    };
-    const view = render(<PingLatencyChart view={ping} bounds={{ startUnixSecs: 0, endUnixSecs: 130 }} />);
+    const lines = [
+      { name: '测试落点', color: 0, samples: [{ probed_at_unix_secs: 100, attempted: true, latency_us: 12_000 }] },
+    ];
+    const view = render(
+      <PingLatencyChart lines={lines} family="ipv4" bounds={{ startUnixSecs: 0, endUnixSecs: 130 }} />,
+    );
     const initial = chartMock.setOption.mock.calls.at(-1)?.[0];
 
     expect(initial.animation).toBe(true);
@@ -742,21 +747,371 @@ describe('deep host telemetry', () => {
 
     view.rerender(
       <PingLatencyChart
-        view={{
-          ...ping,
-          targets: [
-            {
-              ...ping.targets[0],
-              samples: [...ping.targets[0].samples, { probed_at_unix_secs: 110, attempted: true, latency_us: 13_000 }],
-            },
-          ],
-        }}
+        lines={[
+          {
+            ...lines[0],
+            samples: [...lines[0].samples, { probed_at_unix_secs: 110, attempted: true, latency_us: 13_000 }],
+          },
+        ]}
+        family="ipv4"
         bounds={{ startUnixSecs: 0, endUnixSecs: 130 }}
       />,
     );
     const updated = chartMock.setOption.mock.calls.at(-1)?.[0];
     expect(updated.animation).toBe(false);
     expect(updated.animationDuration).toBe(0);
+  });
+
+  it('does not interrupt the Ping entrance sweep when equivalent inputs get new references', () => {
+    const lines = [
+      {
+        name: '测试落点',
+        color: 0,
+        samples: [
+          { probed_at_unix_secs: 100, attempted: true, latency_us: 12_000 },
+          { probed_at_unix_secs: 110, attempted: true, latency_us: null },
+          { probed_at_unix_secs: 120, attempted: true, latency_us: 13_000 },
+        ],
+      },
+    ];
+    const bounds = { startUnixSecs: 0, endUnixSecs: 130 };
+    const view = render(<PingLatencyChart lines={lines} family="ipv4" bounds={bounds} />);
+
+    for (let i = 0; i < 3; i++) {
+      view.rerender(<PingLatencyChart lines={structuredClone(lines)} family="ipv4" bounds={{ ...bounds }} />);
+    }
+
+    expect(chartMock.setOption).toHaveBeenCalledTimes(1);
+    const initial = chartMock.setOption.mock.calls[0][0];
+    expect(initial.animation).toBe(true);
+    expect(initial.series[0].connectNulls).toBe(false);
+    expect(initial.series[0].data).toEqual([
+      [100_000, 12],
+      [110_000, null],
+      [120_000, 13],
+    ]);
+
+    view.rerender(<PingLatencyChart lines={lines} family="ipv4" bounds={{ startUnixSecs: 10, endUnixSecs: 140 }} />);
+    expect(chartMock.setOption).toHaveBeenCalledTimes(2);
+    expect(chartMock.setOption.mock.calls[1][0]).toMatchObject({ animation: false, xAxis: { max: 140_000 } });
+  });
+
+  it('paints every new Ping chart instance, including effect remounts and linking changes', () => {
+    const lines = [
+      { name: '测试落点', color: 0, samples: [{ probed_at_unix_secs: 100, attempted: true, latency_us: 12_000 }] },
+    ];
+    const bounds = { startUnixSecs: 0, endUnixSecs: 130 };
+    const view = render(
+      <StrictMode>
+        <PingLatencyChart lines={lines} family="ipv4" bounds={bounds} />
+      </StrictMode>,
+    );
+    expect(chartMock.setOption).toHaveBeenCalledTimes(2);
+
+    view.rerender(
+      <StrictMode>
+        <PingLatencyChart lines={lines} family="ipv4" bounds={bounds} group="nd-ping-n1" />
+      </StrictMode>,
+    );
+    expect(chartMock.setOption).toHaveBeenCalledTimes(3);
+    expect(chartMock.connect).toHaveBeenCalledWith('nd-ping-n1');
+  });
+
+  it('marks loss periods in a lane below the axis and keeps the lane out of the tooltip', () => {
+    const point = (at: number, latency_us: number | null, attempted = true): PingProbePoint => ({
+      probed_at_unix_secs: at,
+      attempted,
+      latency_us,
+    });
+    render(
+      <PingLatencyChart
+        lines={[
+          {
+            name: '甲',
+            color: 0,
+            samples: [
+              point(100, 10_000),
+              point(110, null),
+              point(120, null),
+              point(130, 12_000),
+              point(140, null, false),
+            ],
+          },
+          { name: '乙', color: 1, samples: [point(100, 20_000), point(110, 21_000), point(130, null)] },
+        ]}
+        family="ipv6"
+        bounds={{ startUnixSecs: 0, endUnixSecs: 150 }}
+      />,
+    );
+    const option = chartMock.setOption.mock.calls.at(-1)?.[0];
+    const lane = option.series.at(-1);
+    // Consecutive losses form one period; a skipped probe draws nothing. Each loss covers half the
+    // 10-second step on either side, so 甲 at 110–120 and 乙 at 130 touch and merge.
+    expect(lane).toMatchObject({ type: 'custom', silent: true, clip: false, tooltip: { show: false } });
+    expect(lane.data).toEqual([[105_000, 135_000]]);
+    expect(option.series.filter((series: { type: string }) => series.type === 'line')).toHaveLength(2);
+    const tooltip = option.tooltip.formatter([{ axisValue: 110_000 }]);
+    expect(tooltip).toContain('· IPv6');
+    expect(tooltip).toContain('无响应');
+    expect(tooltip).toContain('21 ms');
+  });
+
+  it('anchors the live Ping axis to query refreshes, not parent renders or the wall clock', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(130_000);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const ping: NodePingProbeView = {
+      node_id: 'n1',
+      targets: [
+        {
+          name: '测试落点',
+          kind: 'icmp',
+          ipv4: {
+            address: 'icmp://192.0.2.1',
+            samples: [{ probed_at_unix_secs: 100, attempted: true, latency_us: 12_000 }],
+          },
+          ipv6: null,
+        },
+      ],
+    };
+    const queryKey = ['node-ping-probe', 'n1', halfHour.seconds];
+    client.setQueryData(queryKey, ping);
+    const observationModules = { LoadCard, ThroughputChart, PingLatencyChart, ObservationChartLoading };
+    const panel = (range: LoadRange) => (
+      <QueryClientProvider client={client}>
+        <PingProbePanel nodeId="n1" range={range} linked={false} observationModules={observationModules} />
+      </QueryClientProvider>
+    );
+    const view = render(panel(halfHour));
+    expect(chartMock.setOption).toHaveBeenCalledTimes(1);
+    expect(chartMock.setOption.mock.calls[0][0].xAxis.max).toBe(130_000);
+
+    now.mockReturnValue(131_000);
+    view.rerender(panel({ ...halfHour }));
+    expect(chartMock.setOption).toHaveBeenCalledTimes(1);
+
+    // Even an unchanged successful response must advance the rolling window at refresh time.
+    now.mockReturnValue(140_000);
+    act(() => client.setQueryData(queryKey, structuredClone(ping)));
+    await waitFor(() => expect(chartMock.setOption).toHaveBeenCalledTimes(2));
+    expect(chartMock.setOption.mock.calls[1][0]).toMatchObject({ animation: false, xAxis: { max: 140_000 } });
+
+    client.setQueryData(['node-ping-probe', 'n1', '0-125'], ping);
+    view.rerender(panel({ ...halfHour, startUnixSecs: 0, endUnixSecs: 125 }));
+    expect(chartMock.setOption).toHaveBeenCalledTimes(3);
+    expect(chartMock.setOption.mock.calls[2][0].xAxis.max).toBe(125_000);
+    view.unmount();
+    client.clear();
+  });
+
+  const pingSeries = (address: string, samples: PingProbePoint[]): PingProbeFamilySeries => ({ address, samples });
+  const pingPanel = (ping: NodePingProbeView) => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(['node-ping-probe', 'n1', '0-130'], ping);
+    const observationModules = { LoadCard, ThroughputChart, PingLatencyChart, ObservationChartLoading };
+    const view = render(
+      <QueryClientProvider client={client}>
+        <PingProbePanel
+          nodeId="n1"
+          range={{ ...halfHour, startUnixSecs: 0, endUnixSecs: 130 }}
+          linked={false}
+          observationModules={observationModules}
+        />
+      </QueryClientProvider>,
+    );
+    return { view, client };
+  };
+  const lastChart = (name: string) =>
+    [...chartMock.setOption.mock.calls].reverse().find(([option]) => option.series?.[0]?.name === name)?.[0];
+
+  it('shows range loss rates in both Ping legends while preserving latency curves', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const points = [
+      { probed_at_unix_secs: 100, attempted: true, latency_us: 12_000 },
+      { probed_at_unix_secs: 110, attempted: true, latency_us: null },
+      { probed_at_unix_secs: 115, attempted: false, latency_us: null },
+      { probed_at_unix_secs: 120, attempted: true, latency_us: 24_000 },
+    ];
+    const ipv4 = (name: string, kind: 'icmp' | 'tcp', address: string, samples: PingProbePoint[]) => ({
+      name,
+      kind,
+      ipv4: pingSeries(address, samples),
+      ipv6: null,
+    });
+    const ping: NodePingProbeView = {
+      node_id: 'n1',
+      targets: [
+        ipv4('ICMP 混合', 'icmp', 'icmp://192.0.2.1', points),
+        ipv4('ICMP 正常', 'icmp', 'icmp://192.0.2.2', [{ ...points[0], latency_us: 0 }]),
+        ipv4('ICMP 空白', 'icmp', 'icmp://192.0.2.3', []),
+        ipv4('TCP 无响应', 'tcp', 'tcp://192.0.2.1:443', [points[1], points[2]]),
+        ipv4('TCP 未发包', 'tcp', 'tcp://192.0.2.2:443', [points[2]]),
+      ],
+    };
+    client.setQueryData(['node-ping-probe', 'n1', '0-130'], ping);
+    client.setQueryData(['node-ping-probe', 'n1', '116-130'], {
+      ...ping,
+      targets: ping.targets.map(target => ({
+        ...target,
+        ipv4: target.ipv4 && {
+          ...target.ipv4,
+          samples: target.ipv4.samples.filter(point => point.probed_at_unix_secs >= 116),
+        },
+      })),
+    });
+    const observationModules = { LoadCard, ThroughputChart, PingLatencyChart, ObservationChartLoading };
+    const panel = (startUnixSecs: number) => (
+      <QueryClientProvider client={client}>
+        <PingProbePanel
+          nodeId="n1"
+          range={{ ...halfHour, startUnixSecs, endUnixSecs: 130 }}
+          linked={false}
+          observationModules={observationModules}
+        />
+      </QueryClientProvider>
+    );
+    const view = render(panel(0));
+    expect(view.getByLabelText('ICMP 混合 丢包率 33.33%').textContent).toBe('33.33%');
+    expect(view.getByLabelText('ICMP 正常 丢包率 0%').textContent).toBe('0%');
+    expect(view.getByLabelText('ICMP 空白 丢包率 —').textContent).toBe('—');
+    expect(view.getByLabelText('TCP 无响应 丢包率 100%').textContent).toBe('100%');
+    expect(view.getByLabelText('TCP 未发包 丢包率 —').textContent).toBe('—');
+    expect(view.getByLabelText('ICMP 混合 丢包率 33.33%').parentElement?.title).toContain('丢包 1 / 已探测 3');
+    expect(view.getByLabelText('ICMP 混合 丢包率 33.33%').parentElement?.title).toContain('IPv4 icmp://192.0.2.1');
+    // Partial loss and a target that answered nothing it was asked are told apart.
+    expect(view.getByLabelText('ICMP 混合 丢包率 33.33%').className).toBe('loss partial');
+    expect(view.getByLabelText('TCP 无响应 丢包率 100%').className).toBe('loss down');
+    expect(view.getByLabelText('ICMP 正常 丢包率 0%').className).toBe('');
+    const chart = lastChart('ICMP 混合');
+    expect(chart.series[0].data).toEqual([
+      [100_000, 12],
+      [110_000, null],
+      [115_000, null],
+      [120_000, 24],
+    ]);
+    expect(chart.tooltip.formatter([{ axisValue: 120_000 }])).toContain('24 ms');
+    view.rerender(panel(116));
+    expect(view.getByLabelText('ICMP 混合 丢包率 0%').textContent).toBe('0%');
+    expect(view.getByLabelText('TCP 无响应 丢包率 —').textContent).toBe('—');
+    view.unmount();
+    client.clear();
+  });
+
+  it('switches the whole Ping panel between address families from its corner switch', () => {
+    const point = (at: number, latency_us: number | null): PingProbePoint => ({
+      probed_at_unix_secs: at,
+      attempted: true,
+      latency_us,
+    });
+    const { view, client } = pingPanel({
+      node_id: 'n1',
+      targets: [
+        {
+          name: 'CF',
+          kind: 'icmp',
+          ipv4: pingSeries('icmp://1.1.1.1', [point(100, 10_000)]),
+          ipv6: pingSeries('icmp://[2606:4700:4700::1111]', [point(100, 20_000), point(110, null)]),
+        },
+        { name: 'GitHub', kind: 'tcp', ipv4: pingSeries('tcp://github.com:443', [point(100, 30_000)]), ipv6: null },
+      ],
+    });
+
+    // One switch for the panel, last in the first block's title bar; the second block ends with a
+    // slot of the same width so both legends end at the same edge.
+    const [switcher] = view.getAllByRole('radiogroup', { name: 'Ping 地址族' });
+    const caps = view.container.querySelectorAll('.ping-probe-block > .load-network-cap');
+    expect(view.getAllByRole('radiogroup', { name: 'Ping 地址族' })).toHaveLength(1);
+    expect(caps[0].lastElementChild).toBe(switcher);
+    expect(caps[1].lastElementChild?.className).toBe('ping-family-switch-spacer');
+    const ipv6 = () => view.getByRole('radio', { name: 'IPv6' });
+    expect(ipv6().getAttribute('aria-checked')).toBe('false');
+    // The family not shown lost packets in the range: a dot, not a number.
+    expect(ipv6().dataset.dot).toBe('partial');
+    expect(lastChart('CF').series[0].data).toEqual([[100_000, 10]]);
+
+    fireEvent.click(ipv6());
+
+    expect(ipv6().getAttribute('aria-checked')).toBe('true');
+    expect(ipv6().dataset.dot).toBeUndefined();
+    expect(view.getByRole('radio', { name: 'IPv4' }).dataset.dot).toBeUndefined();
+    expect(lastChart('CF').series[0].data).toEqual([
+      [100_000, 20],
+      [110_000, null],
+    ]);
+    expect(lastChart('CF').tooltip.formatter([{ axisValue: 110_000 }])).toContain('· IPv6');
+    expect(view.getByLabelText('CF 丢包率 50%').className).toBe('loss partial');
+    expect(view.getByText('没有填写 IPv6 地址的 TCP 目标。')).toBeTruthy();
+
+    fireEvent.keyDown(switcher, { key: 'ArrowLeft' });
+    expect(view.getByRole('radio', { name: 'IPv4' }).getAttribute('aria-checked')).toBe('true');
+    view.unmount();
+    client.clear();
+  });
+
+  it('keeps the Ping panel on the family the machine can probe', () => {
+    const reply = { probed_at_unix_secs: 100, attempted: true, latency_us: 10_000 };
+    const noRoute = pingPanel({
+      node_id: 'n1',
+      targets: [
+        {
+          name: 'CF',
+          kind: 'icmp',
+          ipv4: pingSeries('icmp://1.1.1.1', [reply]),
+          ipv6: pingSeries('icmp://[2606:4700:4700::1111]', [
+            { probed_at_unix_secs: 100, attempted: false, latency_us: null, skip_reason: 'no_route' },
+          ]),
+        },
+      ],
+    });
+    const blocked = noRoute.view.getByRole('radio', { name: 'IPv6' }) as HTMLButtonElement;
+    expect(blocked.disabled).toBe(true);
+    expect(blocked.title).toBe('机器没有 IPv6 路由，IPv6 未探测');
+    noRoute.view.unmount();
+    noRoute.client.clear();
+
+    const onlyIpv6 = pingPanel({
+      node_id: 'n1',
+      targets: [{ name: 'v6', kind: 'icmp', ipv4: null, ipv6: pingSeries('icmp://[2001:db8::1]', [reply]) }],
+    });
+    expect(onlyIpv6.view.getByRole('radio', { name: 'IPv6' }).getAttribute('aria-checked')).toBe('true');
+    const ipv4 = onlyIpv6.view.getByRole('radio', { name: 'IPv4' }) as HTMLButtonElement;
+    expect(ipv4.disabled).toBe(true);
+    expect(ipv4.title).toBe('没有填写 IPv4 地址的目标');
+    expect(lastChart('v6').series[0].data).toEqual([[100_000, 10]]);
+    onlyIpv6.view.unmount();
+    onlyIpv6.client.clear();
+  });
+
+  it('names why a series was never probed and colors 「+N」 by the loss it folds', () => {
+    const reply = { probed_at_unix_secs: 100, attempted: true, latency_us: 10_000 };
+    const lost = { probed_at_unix_secs: 100, attempted: true, latency_us: null };
+    const { view, client } = pingPanel({
+      node_id: 'n1',
+      targets: [
+        {
+          name: '无 A 记录',
+          kind: 'icmp',
+          ipv4: pingSeries('icmp://v6only.example', [
+            { probed_at_unix_secs: 100, attempted: false, latency_us: null, skip_reason: 'no_address' },
+          ]),
+          ipv6: null,
+        },
+        ...['乙', '丙', '丁', '戊'].map(name => ({
+          name,
+          kind: 'icmp' as const,
+          ipv4: pingSeries(`icmp://${name}.example`, [name === '戊' ? lost : reply]),
+          ipv6: null,
+        })),
+      ],
+    });
+    const skipped = view.getByLabelText('无 A 记录 未探测：域名没有 A 记录');
+    expect(skipped.textContent).toBe('无 A');
+    expect(skipped.className).toBe('gap');
+    const more = view.container.querySelector('.ping-probe-more')!;
+    expect(more.textContent).toBe('+2');
+    expect(more.className).toBe('ping-probe-more down');
+    expect(more.getAttribute('title')).toBe('未列出的目标有丢包：\n戊 100%');
+    view.unmount();
+    client.clear();
   });
 
   it('does not render the host summary strip', () => {

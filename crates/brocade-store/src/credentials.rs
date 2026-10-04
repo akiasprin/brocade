@@ -12,6 +12,7 @@ pub const REALITY_SHORT_ID_HEX_LEN: usize = REALITY_SHORT_ID_BYTES * 2;
 pub const NODE_TOKEN_PREFIX: &str = "broc_node_";
 pub const ADMIN_TOKEN_PREFIX: &str = "broc_admin_";
 pub const ADMIN_SESSION_TOKEN_PREFIX: &str = "broc_session_";
+pub const USER_DIRECT_LOGIN_TOKEN_PREFIX: &str = "broc_login_";
 pub const ENROLLMENT_TOKEN_PREFIX: &str = "broc_enroll_";
 pub const NODE_TOKEN_BYTES: usize = 32;
 pub const NODE_TOKEN_HEX_LEN: usize = NODE_TOKEN_BYTES * 2;
@@ -20,6 +21,8 @@ pub const NODE_TOKEN_DISPLAY_PREFIX_LEN: usize = NODE_TOKEN_PREFIX.len() + 16;
 pub const ADMIN_TOKEN_LEN: usize = ADMIN_TOKEN_PREFIX.len() + NODE_TOKEN_HEX_LEN;
 pub const ADMIN_SESSION_TOKEN_LEN: usize = ADMIN_SESSION_TOKEN_PREFIX.len() + NODE_TOKEN_HEX_LEN;
 pub const ADMIN_TOKEN_DISPLAY_PREFIX_LEN: usize = ADMIN_TOKEN_PREFIX.len() + 16;
+pub const USER_DIRECT_LOGIN_TOKEN_LEN: usize =
+    USER_DIRECT_LOGIN_TOKEN_PREFIX.len() + NODE_TOKEN_HEX_LEN;
 pub const ADMIN_PASSWORD_BYTES: usize = 12;
 pub const ENROLLMENT_TOKEN_LEN: usize = ENROLLMENT_TOKEN_PREFIX.len() + NODE_TOKEN_HEX_LEN;
 pub const ENROLLMENT_TOKEN_DISPLAY_PREFIX_LEN: usize = ENROLLMENT_TOKEN_PREFIX.len() + 16;
@@ -111,6 +114,16 @@ pub fn generate_admin_session_token() -> Result<String> {
     ))
 }
 
+pub fn generate_user_direct_login_token() -> Result<String> {
+    let mut bytes = [0_u8; NODE_TOKEN_BYTES];
+    getrandom::fill(&mut bytes)?;
+    Ok(format!(
+        "{}{}",
+        USER_DIRECT_LOGIN_TOKEN_PREFIX,
+        hex_lower(&bytes)
+    ))
+}
+
 // The one-time password generated on a reset: returned once in the response, with only an
 // argon2 hash kept in the database as usual. URL-safe base64 so that it can be copied out of
 // a terminal without error.
@@ -174,6 +187,10 @@ pub fn admin_token_hash(token: &str) -> String {
 }
 
 pub fn admin_session_token_hash(token: &str) -> String {
+    sha256_hex(token.as_bytes())
+}
+
+pub fn user_direct_login_token_hash(token: &str) -> String {
     sha256_hex(token.as_bytes())
 }
 
@@ -295,6 +312,18 @@ mod tests {
         assert!(token[ADMIN_SESSION_TOKEN_PREFIX.len()..]
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn generated_user_direct_login_token_has_stable_prefix_and_entropy() {
+        let token = generate_user_direct_login_token().unwrap();
+
+        assert_eq!(token.len(), USER_DIRECT_LOGIN_TOKEN_LEN);
+        assert!(token.starts_with(USER_DIRECT_LOGIN_TOKEN_PREFIX));
+        assert!(token[USER_DIRECT_LOGIN_TOKEN_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+        assert_ne!(user_direct_login_token_hash(&token), token);
     }
 
     #[test]

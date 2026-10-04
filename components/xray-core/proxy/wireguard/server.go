@@ -132,18 +132,18 @@ func (s *Server) forwardConnection(dest net.Destination, conn net.Conn) {
 	ctx, cancel := context.WithCancel(core.ToBackgroundDetachedContext(s.info.ctx))
 	sid := session.NewID()
 	ctx = c.ContextWithID(ctx, sid)
-	inbound := session.Inbound{} // since promiscuousModeHandler mixed-up context, we shallow copy inbound (tag) and content (configs)
+	inbound := &session.Inbound{} // since promiscuousModeHandler mixed-up context, we shallow copy inbound (tag) and content (configs)
 	if s.info.inboundTag != nil {
-		inbound = *s.info.inboundTag
+		inbound = s.info.inboundTag.Clone()
 	}
 	inbound.Name = "wireguard"
-	inbound.CanSpliceCopy = 3
+	inbound.CanSpliceCopy.Store(session.SpliceCopyDisabled)
 
 	// overwrite the source to use the tun address for each sub context.
 	// Since gvisor.ForwarderRequest doesn't provide any info to associate the sub-context with the Parent context
 	// Currently we have no way to link to the original source address
 	inbound.Source = net.DestinationFromAddr(conn.RemoteAddr())
-	ctx = session.ContextWithInbound(ctx, &inbound)
+	ctx = session.ContextWithInbound(ctx, inbound)
 	content := new(session.Content)
 	if s.info.contentTag != nil {
 		content.SniffingRequest = s.info.contentTag.SniffingRequest

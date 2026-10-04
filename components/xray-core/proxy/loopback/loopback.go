@@ -35,7 +35,7 @@ func (l *Loopback) Process(ctx context.Context, link *transport.Link, _ internet
 	originInbound := session.InboundFromContext(ctx)
 	if originInbound != nil {
 		// get a shallow copy to avoid modifying the inbound tag in upstream context
-		*inbound = *originInbound
+		inbound = originInbound.Clone()
 	}
 	inbound.Tag = l.config.InboundTag
 	ctx = session.ContextWithInbound(ctx, inbound)

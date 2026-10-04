@@ -36,6 +36,17 @@ type OnlineMap interface {
 	ForEach(func(string, int64) bool)
 }
 
+// ProtocolOnlineMap augments the stable IP-only interface without changing its counting
+// semantics. The protocol is authenticated inbound metadata, never sniffed application traffic.
+type ProtocolOnlineMap interface {
+	OnlineMap
+	AddIPWithProtocol(ip, protocol string)
+	RemoveIPWithProtocol(ip, protocol string)
+	// ForEachWithProtocols visits each IP once; protocol names are sorted and unique.
+	// An empty protocol denotes a reference whose protocol was not observed.
+	ForEachWithProtocols(func(ip string, lastSeen int64, protocols []string) bool)
+}
+
 // Channel is the interface for stats channel.
 //
 // xray:api:stable
@@ -127,7 +138,14 @@ func GetOrRegisterOnlineMap(m Manager, name string) (OnlineMap, error) {
 		return onlineMap, nil
 	}
 
-	return m.RegisterOnlineMap(name)
+	onlineMap, err := m.RegisterOnlineMap(name)
+	if err != nil {
+		// A concurrent first connection may have registered this label after our read.
+		if existing := m.GetOnlineMap(name); existing != nil {
+			return existing, nil
+		}
+	}
+	return onlineMap, err
 }
 
 // GetOrRegisterChannel tries to get the StatChannel first. If not exist, it then tries to create a new channel.

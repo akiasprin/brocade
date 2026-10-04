@@ -158,6 +158,20 @@ func (b *Buffer) Extend(n int32) []byte {
 	return ext
 }
 
+// ExtendUninitialized increases the buffer size without clearing the returned
+// bytes. The caller must overwrite every byte before the buffer is exposed to
+// another component. Use Extend unless a measured hot path can prove that
+// immediate full initialization makes the clear redundant.
+func (b *Buffer) ExtendUninitialized(n int32) []byte {
+	end := b.end + n
+	if end > int32(len(b.v)) {
+		panic("extending out of bound")
+	}
+	ext := b.v[b.end:end]
+	b.end = end
+	return ext
+}
+
 // BytesRange returns a slice of this buffer with given from and to boundary.
 func (b *Buffer) BytesRange(from, to int32) []byte {
 	if from < 0 {

@@ -14,13 +14,19 @@
 
 use std::{
     io::{Read, Write},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpStream},
     time::Duration,
+};
+
+use brocade_deployment::protocol::{
+    OnlineSource, OnlineSourceProtocol, UserOnlineSources, MAX_ONLINE_SOURCE_ENTRIES,
+    MAX_ONLINE_SOURCE_PROTOCOLS, MAX_ONLINE_SOURCE_USERS,
 };
 
 const ALTER_INBOUND_PATH: &str = "/xray.app.proxyman.command.HandlerService/AlterInbound";
 const GET_INBOUND_USERS_PATH: &str = "/xray.app.proxyman.command.HandlerService/GetInboundUsers";
 const QUERY_STATS_PATH: &str = "/xray.app.stats.command.StatsService/QueryStats";
+const GET_USERS_STATS_PATH: &str = "/xray.app.stats.command.StatsService/GetUsersStats";
 const MUX_SNAPSHOT_PATH: &str = "/xray.app.stats.command.StatsService/GetMuxSnapshot";
 const ADD_USER_OPERATION: &str = "xray.app.proxyman.command.AddUserOperation";
 const REMOVE_USER_OPERATION: &str = "xray.app.proxyman.command.RemoveUserOperation";
@@ -136,6 +142,15 @@ pub(crate) fn query_stats(api_port: u16, pattern: &str) -> Result<Vec<XrayStat>,
     bytes_field(&mut request, 1, pattern.as_bytes());
     let response = grpc_unary(api_port, QUERY_STATS_PATH, &request)?;
     decode_stats(&response)
+}
+
+/// Every source address currently held by Xray's ref-counted online maps.
+///
+/// Both request booleans remain false by sending an empty protobuf: traffic already has its own
+/// durable accounting path, and resetting either structure would interfere with other readers.
+pub(crate) fn online_sources(api_port: u16) -> Result<Vec<UserOnlineSources>, String> {
+    let response = grpc_unary(api_port, GET_USERS_STATS_PATH, &[])?;
+    decode_online_sources(&response)
 }
 
 /// The users xray is serving on `tag` right now, account payloads decoded.
@@ -471,6 +486,100 @@ fn decode_stat(message: &[u8]) -> Result<XrayStat, String> {
     })
 }
 
+/// `GetUsersStatsResponse { repeated UserStat users = 1 }`.
+fn decode_online_sources(message: &[u8]) -> Result<Vec<UserOnlineSources>, String> {
+    let mut users = Vec::new();
+    let mut total_sources = 0_usize;
+    let mut cursor = 0;
+    while let Some((number, field)) = next_field(message, &mut cursor)? {
+        if let (1, Field::Bytes(bytes)) = (number, field) {
+            if users.len() >= MAX_ONLINE_SOURCE_USERS {
+                return Err(format!(
+                    "xray online snapshot exceeds {MAX_ONLINE_SOURCE_USERS} users"
+                ));
+            }
+            let mut user = decode_online_user(bytes)?;
+            total_sources = total_sources
+                .checked_add(user.sources.len())
+                .ok_or_else(|| "xray online source count overflow".to_owned())?;
+            if total_sources > MAX_ONLINE_SOURCE_ENTRIES {
+                return Err(format!(
+                    "xray online snapshot exceeds {MAX_ONLINE_SOURCE_ENTRIES} sources"
+                ));
+            }
+            user.sources.sort_by(|left, right| left.ip.cmp(&right.ip));
+            users.push(user);
+        }
+    }
+    users.sort_by(|left, right| left.label.cmp(&right.label));
+    Ok(users)
+}
+
+/// `UserStat { string email = 1; repeated OnlineIPEntry ips = 2; ... }`.
+fn decode_online_user(message: &[u8]) -> Result<UserOnlineSources, String> {
+    let mut label = None;
+    let mut sources = Vec::new();
+    let mut cursor = 0;
+    while let Some((number, field)) = next_field(message, &mut cursor)? {
+        match (number, field) {
+            (1, Field::Bytes(bytes)) => label = Some(utf8(bytes, "online user label")?),
+            (2, Field::Bytes(bytes)) => sources.push(decode_online_source(bytes)?),
+            _ => {}
+        }
+    }
+    let label = label.ok_or_else(|| "xray sent online sources without a user label".to_owned())?;
+    if label.is_empty() {
+        return Err("xray sent online sources with an empty user label".to_owned());
+    }
+    Ok(UserOnlineSources { label, sources })
+}
+
+/// `OnlineIPEntry { string ip = 1; int64 last_seen = 2; repeated string protocols = 3 }`.
+fn decode_online_source(message: &[u8]) -> Result<OnlineSource, String> {
+    let mut ip = None;
+    let mut last_seen_unix_secs = 0_i64;
+    let mut protocols = Vec::new();
+    let mut cursor = 0;
+    while let Some((number, field)) = next_field(message, &mut cursor)? {
+        match (number, field) {
+            (1, Field::Bytes(bytes)) => ip = Some(utf8(bytes, "online source IP")?),
+            (2, Field::Varint(raw)) => last_seen_unix_secs = raw as i64,
+            (3, Field::Bytes(bytes)) => {
+                if protocols.len() >= MAX_ONLINE_SOURCE_PROTOCOLS {
+                    return Err("xray online source protocol count exceeds limit".to_owned());
+                }
+                let protocol = match bytes {
+                    b"vless" => OnlineSourceProtocol::Vless,
+                    b"anytls" => OnlineSourceProtocol::AnyTls,
+                    b"hysteria" => OnlineSourceProtocol::Hysteria2,
+                    _ => OnlineSourceProtocol::Unknown,
+                };
+                protocols.push(protocol);
+            }
+            _ => {}
+        }
+    }
+    let raw_ip = ip.ok_or_else(|| "xray sent an online source without an IP".to_owned())?;
+    // Xray's Address.String() wraps IPv6 in brackets even in its online-IP field. Accept that
+    // representation as well as bare IPs, but not socket addresses, domains or broken wrappers.
+    let ip = match raw_ip.strip_prefix('[').and_then(|ip| ip.strip_suffix(']')) {
+        Some(ip) => ip.parse::<Ipv6Addr>().map(IpAddr::V6),
+        None => raw_ip.parse::<IpAddr>(),
+    }
+    .map_err(|_| "xray sent an invalid online source IP".to_owned())?
+    .to_string();
+    if last_seen_unix_secs <= 0 {
+        return Err("xray sent an online source with a non-positive last_seen".to_owned());
+    }
+    protocols.sort_unstable();
+    protocols.dedup();
+    Ok(OnlineSource {
+        ip,
+        last_seen_unix_secs,
+        protocols: (!protocols.is_empty()).then_some(protocols),
+    })
+}
+
 /// `GetInboundUserResponse { repeated xray.common.protocol.User users = 1 }`.
 fn decode_inbound_users(message: &[u8]) -> Result<Vec<XrayUser>, String> {
     let mut users = Vec::new();
@@ -622,6 +731,10 @@ mod tests {
         assert!(stats
             .windows(QUERY_STATS_PATH.len())
             .any(|window| window == QUERY_STATS_PATH.as_bytes()));
+        let online = request_headers(10085, GET_USERS_STATS_PATH);
+        assert!(online
+            .windows(GET_USERS_STATS_PATH.len())
+            .any(|window| window == GET_USERS_STATS_PATH.as_bytes()));
     }
 
     #[test]
@@ -677,6 +790,154 @@ mod tests {
 
         // No counter matched the pattern: an empty message, not a failure.
         assert!(decode_stats(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn decodes_and_sorts_an_online_source_snapshot() {
+        fn source(ip: &str, last_seen: i64) -> Vec<u8> {
+            let mut source = Vec::new();
+            bytes_field(&mut source, 1, ip.as_bytes());
+            varint_field(&mut source, 2, last_seen as u64);
+            source
+        }
+        fn user(label: &str, sources: &[(&str, i64)]) -> Vec<u8> {
+            let mut user = Vec::new();
+            bytes_field(&mut user, 1, label.as_bytes());
+            for (ip, last_seen) in sources {
+                message_field(&mut user, 2, &source(ip, *last_seen));
+            }
+            user
+        }
+
+        let mut response = Vec::new();
+        message_field(
+            &mut response,
+            1,
+            &user(
+                "bob@platform#i-main",
+                &[("[2606:4700:4700::1111]", 1_767_225_602)],
+            ),
+        );
+        message_field(
+            &mut response,
+            1,
+            &user(
+                "alice@platform#i-main",
+                &[("8.8.8.8", 1_767_225_601), ("1.1.1.1", 1_767_225_600)],
+            ),
+        );
+
+        assert_eq!(
+            decode_online_sources(&response).unwrap(),
+            vec![
+                UserOnlineSources {
+                    label: "alice@platform#i-main".to_owned(),
+                    sources: vec![
+                        OnlineSource {
+                            ip: "1.1.1.1".to_owned(),
+                            last_seen_unix_secs: 1_767_225_600,
+                            protocols: None,
+                        },
+                        OnlineSource {
+                            ip: "8.8.8.8".to_owned(),
+                            last_seen_unix_secs: 1_767_225_601,
+                            protocols: None,
+                        },
+                    ],
+                },
+                UserOnlineSources {
+                    label: "bob@platform#i-main".to_owned(),
+                    sources: vec![OnlineSource {
+                        ip: "2606:4700:4700::1111".to_owned(),
+                        last_seen_unix_secs: 1_767_225_602,
+                        protocols: None,
+                    }],
+                },
+            ]
+        );
+        assert!(decode_online_sources(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn decodes_bounded_protocol_sets_without_guessing_legacy_sources() {
+        let mut source = Vec::new();
+        bytes_field(&mut source, 1, b"1.1.1.1");
+        varint_field(&mut source, 2, 1_767_225_600);
+        assert_eq!(decode_online_source(&source).unwrap().protocols, None);
+        for name in [
+            "vless",
+            "anytls",
+            "hysteria",
+            "vless",
+            "future-protocol",
+            "",
+        ] {
+            bytes_field(&mut source, 3, name.as_bytes());
+        }
+        assert_eq!(
+            decode_online_source(&source).unwrap().protocols,
+            Some(vec![
+                OnlineSourceProtocol::Vless,
+                OnlineSourceProtocol::AnyTls,
+                OnlineSourceProtocol::Hysteria2,
+                OnlineSourceProtocol::Unknown,
+            ])
+        );
+        for _ in 0..3 {
+            bytes_field(&mut source, 3, b"vless");
+        }
+        assert!(decode_online_source(&source).is_err());
+    }
+
+    #[test]
+    fn normalizes_xray_online_source_ip_formats() {
+        for (raw, expected) in [
+            ("192.0.2.1", "192.0.2.1"),
+            ("2001:0DB8:0:0:0:0:0:1", "2001:db8::1"),
+            ("[2001:0DB8:0:0:0:0:0:1]", "2001:db8::1"),
+            ("[::ffff:192.0.2.1]", "::ffff:192.0.2.1"),
+        ] {
+            let mut source = Vec::new();
+            bytes_field(&mut source, 1, raw.as_bytes());
+            varint_field(&mut source, 2, 1_767_225_600);
+            let decoded = decode_online_source(&source).unwrap();
+            assert_eq!(decoded.ip, expected);
+            assert_eq!(decoded.last_seen_unix_secs, 1_767_225_600);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_online_source_address_wrappers() {
+        for raw in [
+            "[]",
+            "[2001:db8::1",
+            "2001:db8::1]",
+            "[[2001:db8::1]]",
+            "[2001:db8::1]:443",
+            "192.0.2.1:443",
+            "[192.0.2.1]",
+            "[example.com]",
+            "[fe80::1%eth0]",
+            " [2001:db8::1] ",
+        ] {
+            let mut source = Vec::new();
+            bytes_field(&mut source, 1, raw.as_bytes());
+            varint_field(&mut source, 2, 1_767_225_600);
+            assert!(decode_online_source(&source).is_err(), "accepted {raw}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_online_source_entries() {
+        let mut source = Vec::new();
+        bytes_field(&mut source, 1, b"not-an-ip");
+        varint_field(&mut source, 2, 1);
+        let mut user = Vec::new();
+        bytes_field(&mut user, 1, b"alice@platform#i-main");
+        message_field(&mut user, 2, &source);
+        let mut response = Vec::new();
+        message_field(&mut response, 1, &user);
+        assert!(decode_online_sources(&response).is_err());
     }
 
     /// The field this reads is the one this module writes. Encoding an account and decoding it
@@ -753,20 +1014,22 @@ mod tests {
         assert!(decode_stats(&[0xff; 12]).is_err());
     }
 
-    /// Release-time compatibility check against the Xray binary pinned in `.tools`.
+    /// Release-time compatibility check against the selected Xray, falling back to `.tools`.
     #[test]
     #[ignore = "requires the repository's pinned Xray binary"]
     fn native_grpc_round_trips_against_xray() {
         use std::{
             fs,
             net::TcpListener,
-            path::Path,
+            path::{Path, PathBuf},
             process::{Command, Stdio},
             thread,
             time::{SystemTime, UNIX_EPOCH},
         };
 
-        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tools/xray");
+        let binary = std::env::var_os("BROCADE_XRAY_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tools/xray"));
         assert!(binary.exists(), "{} is missing", binary.display());
         let api_port = free_port();
         let inbound_port = free_port();
@@ -810,7 +1073,8 @@ mod tests {
                 "stats": {},
                 "policy": { "levels": { "0": {
                     "statsUserUplink": true,
-                    "statsUserDownlink": true
+                    "statsUserDownlink": true,
+                    "statsUserOnline": true
                 } } },
                 "inbounds": [
                     {
@@ -825,7 +1089,10 @@ mod tests {
                         "listen": "127.0.0.1",
                         "port": inbound_port,
                         "protocol": "vless",
-                        "settings": { "clients": [], "decryption": "none" }
+                        "settings": { "clients": [], "decryption": "none" },
+                        // A local-only PROXY header supplies a non-loopback fixture source,
+                        // since Xray deliberately excludes localhost from presence statistics.
+                        "streamSettings": { "sockopt": { "acceptProxyProtocol": true } }
                     },
                     {
                         "tag": "test-hysteria2",
@@ -853,7 +1120,9 @@ mod tests {
                         }
                     }
                 ],
-                "outbounds": [{ "tag": "direct", "protocol": "freedom" }],
+                // The integration target is loopback; override the normal private-IP deny only
+                // inside this isolated fixture, never in generated production configuration.
+                "outbounds": [{ "tag": "direct", "protocol": "freedom", "settings": { "ipsBlocked": [] } }],
                 "routing": { "rules": [{
                     "type": "field",
                     "inboundTag": ["api"],
@@ -864,17 +1133,26 @@ mod tests {
         )
         .expect("write config");
 
-        let mut child = Command::new(&binary)
-            .args(["run", "-config", config.to_str().expect("utf-8 path")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start xray");
+        struct TestXray(std::process::Child);
+        impl Drop for TestXray {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = TestXray(
+            Command::new(&binary)
+                .args(["run", "-config", config.to_str().expect("utf-8 path")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start xray"),
+        );
         for _ in 0..50 {
             if TcpStream::connect((Ipv4Addr::LOCALHOST, api_port)).is_ok() {
                 break;
             }
-            if let Some(status) = child.try_wait().expect("poll xray") {
+            if let Some(status) = child.0.try_wait().expect("poll xray") {
                 panic!("xray exited before API became ready: {status}");
             }
             thread::sleep(Duration::from_millis(100));
@@ -949,6 +1227,84 @@ mod tests {
         assert!(query_stats(api_port, "user>>>")
             .expect("native query stats")
             .is_empty());
+        assert!(online_sources(api_port)
+            .expect("native online sources")
+            .is_empty());
+
+        // Exercise the real authenticated VLESS -> dispatcher -> protobuf -> Agent path,
+        // not just a hand-built protobuf message that could agree on the wrong field number.
+        let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, inbound_port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request =
+            format!("PROXY TCP4 203.0.113.10 127.0.0.1 23456 {inbound_port}\r\n").into_bytes();
+        request.push(0); // VLESS version
+        request.extend_from_slice(&[
+            0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3,
+            0x08, 0x11,
+        ]);
+        request.extend_from_slice(&[0, 1]); // no addons, TCP
+        request.extend_from_slice(&target_port.to_be_bytes());
+        request.extend_from_slice(&[1, 127, 0, 0, 1]); // IPv4 destination
+        request.extend_from_slice(b"ping");
+        client.write_all(&request).unwrap();
+        let mut accepted = None;
+        for _ in 0..100 {
+            match target.accept() {
+                Ok((stream, _)) => {
+                    accepted = Some(stream);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20))
+                }
+                Err(error) => panic!("accept VLESS target: {error}"),
+            }
+        }
+        let mut accepted = accepted.expect("VLESS reaches the local target");
+        accepted
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        accepted
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut payload = [0; 4];
+        accepted.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload, b"ping");
+        accepted.write_all(b"pong").unwrap();
+        let mut response = [0; 6];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"\0\0pong");
+        let sources = online_sources(api_port).expect("read real VLESS presence");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].label, "alice@example.test");
+        assert_eq!(sources[0].sources.len(), 1);
+        assert_eq!(sources[0].sources[0].ip, "203.0.113.10");
+        assert_eq!(
+            sources[0].sources[0].protocols,
+            Some(vec![OnlineSourceProtocol::Vless])
+        );
+        drop(accepted);
+        drop(client);
+        let mut cleared = false;
+        for _ in 0..100 {
+            if online_sources(api_port).unwrap().is_empty() {
+                cleared = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            cleared,
+            "closed VLESS connection must retire its protocol reference"
+        );
 
         remove_user(api_port, "test-vless", "alice@example.test").expect("native remove user");
         assert!(inbound_users(api_port, "test-vless")
@@ -965,8 +1321,7 @@ mod tests {
             "listing an inbound that does not exist is an error, not an empty list"
         );
 
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(child);
         let _ = fs::remove_dir_all(directory);
 
         fn free_port() -> u16 {

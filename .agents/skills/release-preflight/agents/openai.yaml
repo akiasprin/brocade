@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release Preflight"
+  short_description: "Verify Brocade release and rollback readiness"
+  default_prompt: "Run a read-only Brocade release preflight for the requested release domain and report the actual evidence, risks, and blockers."

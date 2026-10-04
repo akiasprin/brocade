@@ -1,8 +1,10 @@
-//! Country lookup for the machine list, backed by the fleet's configured `geoip.dat`.
+//! Country lookup for machines and user source IPs, backed by the configured `geoip.dat`.
 //!
 //! The agents already download this file for Xray rules, but it lives on remote machines. The
 //! control plane keeps its own copy: in memory for lookups, and on disk so a restart does not
 //! need the network. One download per day.
+//! Network-operator attribution lives alongside it in `operators`: same cache directory,
+//! refresh cadence and local-only request path, but an independent source and index.
 //!
 //! # Why there is a file on disk
 //!
@@ -37,8 +39,8 @@
 //! are missing" can be told apart from "the console never got a database" by reading the journal.
 
 use std::{
-    collections::HashMap,
-    net::Ipv4Addr,
+    collections::{HashMap, HashSet},
+    net::IpAddr,
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -48,6 +50,9 @@ use brocade_store::PgStore;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+
+mod operators;
+pub use operators::NetworkOperator;
 
 const FRESH_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 /// How often the worker re-reads the configured URL. One row of `control_state`; it exists so a
@@ -69,6 +74,7 @@ const MAX_DATABASE_BYTES: usize = 64 * 1024 * 1024;
 pub struct GeoIpLookup {
     http: reqwest::Client,
     cache: Arc<Mutex<Cache>>,
+    operators: operators::OperatorLookup,
 }
 
 /// What the worker published, and which configured URL it came from. Freshness and retry timing
@@ -89,6 +95,7 @@ impl Default for GeoIpLookup {
                 .build()
                 .expect("the static GeoIP HTTP client configuration is valid"),
             cache: Arc::new(Mutex::new(Cache::default())),
+            operators: operators::OperatorLookup::default(),
         }
     }
 }
@@ -106,6 +113,7 @@ impl Default for GeoIpLookup {
 /// load, whether or not the CDN answers.
 pub fn spawn(store: PgStore) -> GeoIpLookup {
     let lookup = GeoIpLookup::default();
+    lookup.operators.spawn(lookup.http.clone());
     let worker = lookup.clone();
     tokio::spawn(async move {
         let mut backoff = RETRY_MIN;
@@ -240,6 +248,11 @@ async fn write_cached(source: &str, bytes: &[u8]) {
 }
 
 impl GeoIpLookup {
+    /// Local network attribution, independent of the country database and Xray routing data.
+    pub async fn operators(&self, addresses: &[String]) -> HashMap<String, NetworkOperator> {
+        self.operators.lookup(addresses).await
+    }
+
     /// Publishes the copy on disk, if there is one for this URL and it still decodes.
     ///
     /// Returns when it was fetched — the file's mtime — so the caller can tell a copy that is
@@ -284,7 +297,7 @@ impl GeoIpLookup {
         cache.database = None;
     }
 
-    /// Returns country codes for literal public IPv4 addresses. Hostnames and masked addresses
+    /// Returns country codes for literal IPv4/IPv6 addresses. Hostnames and masked addresses
     /// are intentionally absent: DNS resolution here would make opening the list trigger an
     /// operator-controlled collection of outbound lookups.
     ///
@@ -292,7 +305,9 @@ impl GeoIpLookup {
     pub async fn countries(&self, source: &str, addresses: &[String]) -> HashMap<String, String> {
         let parsed = addresses
             .iter()
-            .filter_map(|address| address.parse::<Ipv4Addr>().ok().map(|ip| (address, ip)))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter_map(|address| address.parse::<IpAddr>().ok().map(|ip| (address, ip)))
             .collect::<Vec<_>>();
         if parsed.is_empty() || source.trim().is_empty() {
             return HashMap::new();
@@ -352,16 +367,18 @@ impl GeoIpLookup {
     }
 }
 
-/// One hash table for each prefix length. Lookup is at most 33 integer probes instead of walking
+/// One hash table for each prefix length. Lookup is at most 33/129 probes instead of walking
 /// every CIDR in the 10+ MiB database for every machine on every list refresh.
 struct GeoDatabase {
     v4: Vec<HashMap<u32, String>>,
+    v6: Vec<HashMap<u128, String>>,
 }
 
 impl GeoDatabase {
     fn decode(bytes: &[u8]) -> Result<Self, String> {
         let list = GeoIpList::decode(bytes).map_err(|error| format!("解析 geoip.dat：{error}"))?;
         let mut v4 = (0..=32).map(|_| HashMap::new()).collect::<Vec<_>>();
+        let mut v6 = (0..=128).map(|_| HashMap::new()).collect::<Vec<_>>();
         for entry in list.entry {
             let code = entry.country_code.trim().to_ascii_uppercase();
             // The database also contains tags such as PRIVATE. A flag requires an ISO alpha-2
@@ -373,30 +390,58 @@ impl GeoDatabase {
                 continue;
             }
             for cidr in entry.cidr {
-                if cidr.ip.len() != 4 || cidr.prefix > 32 {
-                    continue;
+                match cidr.ip.as_slice() {
+                    [a, b, c, d] if cidr.prefix <= 32 => {
+                        let raw = u32::from_be_bytes([*a, *b, *c, *d]);
+                        v4[cidr.prefix as usize]
+                            .entry(raw & prefix_mask(cidr.prefix))
+                            .or_insert_with(|| code.clone());
+                    }
+                    bytes if bytes.len() == 16 && cidr.prefix <= 128 => {
+                        let raw = u128::from_be_bytes(
+                            bytes
+                                .try_into()
+                                .expect("the IPv6 address has exactly 16 bytes"),
+                        );
+                        v6[cidr.prefix as usize]
+                            .entry(raw & prefix_mask_v6(cidr.prefix))
+                            .or_insert_with(|| code.clone());
+                    }
+                    _ => {}
                 }
-                let raw = u32::from_be_bytes([cidr.ip[0], cidr.ip[1], cidr.ip[2], cidr.ip[3]]);
-                let mask = prefix_mask(cidr.prefix);
-                v4[cidr.prefix as usize]
-                    .entry(raw & mask)
-                    .or_insert_with(|| code.clone());
             }
         }
-        Ok(Self { v4 })
+        Ok(Self { v4, v6 })
     }
 
     /// Networks held, across every prefix length. Only for the line the worker logs on success.
     fn len(&self) -> usize {
-        self.v4.iter().map(HashMap::len).sum()
+        self.v4.iter().map(HashMap::len).sum::<usize>()
+            + self.v6.iter().map(HashMap::len).sum::<usize>()
     }
 
-    fn country(&self, ip: Ipv4Addr) -> Option<&str> {
-        let raw = u32::from(ip);
-        for prefix in (0..=32).rev() {
-            let network = raw & prefix_mask(prefix);
-            if let Some(country) = self.v4[prefix as usize].get(&network) {
-                return Some(country);
+    fn country(&self, ip: IpAddr) -> Option<&str> {
+        match ip {
+            IpAddr::V4(ip) => {
+                let raw = u32::from(ip);
+                for prefix in (0..=32).rev() {
+                    let network = raw & prefix_mask(prefix);
+                    if let Some(country) = self.v4[prefix as usize].get(&network) {
+                        return Some(country);
+                    }
+                }
+            }
+            IpAddr::V6(ip) => {
+                if let Some(ip) = ip.to_ipv4_mapped() {
+                    return self.country(IpAddr::V4(ip));
+                }
+                let raw = u128::from(ip);
+                for prefix in (0..=128).rev() {
+                    let network = raw & prefix_mask_v6(prefix);
+                    if let Some(country) = self.v6[prefix as usize].get(&network) {
+                        return Some(country);
+                    }
+                }
             }
         }
         None
@@ -408,6 +453,14 @@ fn prefix_mask(prefix: u32) -> u32 {
         0
     } else {
         u32::MAX << (32 - prefix)
+    }
+}
+
+fn prefix_mask_v6(prefix: u32) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
     }
 }
 
@@ -488,11 +541,90 @@ mod tests {
             ],
         };
         let database = GeoDatabase::decode(&list.encode_to_vec()).unwrap();
-        assert_eq!(database.country(Ipv4Addr::new(203, 0, 113, 7)), Some("US"));
+        assert_eq!(database.country("203.0.113.7".parse().unwrap()), Some("US"));
         assert_eq!(
-            database.country(Ipv4Addr::new(203, 0, 113, 200)),
+            database.country("203.0.113.200".parse().unwrap()),
             Some("JP")
         );
-        assert_eq!(database.country(Ipv4Addr::new(10, 0, 0, 1)), None);
+        assert_eq!(database.country("10.0.0.1".parse().unwrap()), None);
+    }
+
+    #[tokio::test]
+    async fn source_countries_use_only_the_matching_local_database_for_both_families() {
+        let lookup = GeoIpLookup::default();
+        let addresses = vec![
+            "203.0.113.7".to_owned(),
+            "2001:db8::1".to_owned(),
+            "2001:db8::2".to_owned(),
+            "::ffff:203.0.113.7".to_owned(),
+            "203.0.113.7".to_owned(),
+            "example.invalid".to_owned(),
+            "203.0.***.***".to_owned(),
+            "fd00::1".to_owned(),
+        ];
+        let source = "https://example.invalid/geoip.dat";
+        // An unfed lookup must return immediately; it never resolves or contacts this URL.
+        assert!(lookup.countries(source, &addresses).await.is_empty());
+        let v6 = |ip: &str, prefix| Cidr {
+            ip: ip.parse::<std::net::Ipv6Addr>().unwrap().octets().to_vec(),
+            prefix,
+        };
+        let entry = |country: &str, cidr| GeoIp {
+            country_code: country.to_owned(),
+            cidr,
+            reverse_match: false,
+        };
+        let list = GeoIpList {
+            entry: vec![
+                entry(
+                    "US",
+                    vec![Cidr {
+                        ip: vec![203, 0, 113, 0],
+                        prefix: 24,
+                    }],
+                ),
+                entry("JP", vec![v6("2001:db8::", 32)]),
+                entry("TW", vec![v6("2001:db8::1", 128)]),
+                entry("PRIVATE", vec![v6("fd00::", 8)]),
+                entry("XX", vec![v6("2001:db8::2", 129)]),
+                GeoIp {
+                    reverse_match: true,
+                    ..entry("DE", vec![v6("2001:db8::2", 128)])
+                },
+            ],
+        };
+        let database = GeoDatabase::decode(&list.encode_to_vec()).unwrap();
+        assert_eq!(database.len(), 3);
+        lookup.publish(source.to_owned(), database).await;
+        let countries = lookup.countries(source, &addresses).await;
+        assert_eq!(countries.len(), 4);
+        assert_eq!(countries["203.0.113.7"], "US");
+        assert_eq!(countries["2001:db8::1"], "TW");
+        assert_eq!(countries["2001:db8::2"], "JP");
+        assert_eq!(countries["::ffff:203.0.113.7"], "US");
+        assert!(lookup
+            .countries("https://other.invalid/geoip.dat", &addresses)
+            .await
+            .is_empty());
+        assert!(lookup.countries("", &addresses).await.is_empty());
+        lookup.clear().await;
+        assert!(lookup.countries(source, &addresses).await.is_empty());
+    }
+
+    #[test]
+    fn ipv6_zero_prefix_matches_without_overflow() {
+        let list = GeoIpList {
+            entry: vec![GeoIp {
+                country_code: "JP".to_owned(),
+                cidr: vec![Cidr {
+                    ip: vec![0; 16],
+                    prefix: 0,
+                }],
+                reverse_match: false,
+            }],
+        };
+        let database = GeoDatabase::decode(&list.encode_to_vec()).unwrap();
+        assert_eq!(database.country("2001:db8::1".parse().unwrap()), Some("JP"));
+        assert_eq!(database.country("203.0.113.1".parse().unwrap()), None);
     }
 }

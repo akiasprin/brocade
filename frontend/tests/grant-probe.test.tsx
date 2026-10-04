@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { GrantProbeJob, GrantProbePlan, UserListItem } from '../src/api';
 import { GrantProbePanel } from '../src/panes/users';
@@ -71,10 +71,132 @@ const wrapper = () => {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
 describe('user grant probe', () => {
+  it('clears a removed Serving plan instead of retaining old entries or completed job results', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let revoked = false;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input) === '/grant-probes/capability') return Response.json({ available: true });
+        if (init?.method === 'POST') return Response.json({ job: finishedJob, reused: false });
+        return revoked
+          ? Response.json({ error: 'has no effective serving grants' }, { status: 404 })
+          : Response.json(plan);
+      }),
+    );
+    const view = render(
+      <QueryClientProvider client={client}>
+        <GrantProbePanel user={user} />
+      </QueryClientProvider>,
+    );
+    try {
+      expect(await view.findByText('伦敦入口')).toBeTruthy();
+      fireEvent.click(view.getByRole('button', { name: '拨测全部' }));
+      await view.findAllByText('42ms');
+      revoked = true;
+      await act(async () => {
+        await client.invalidateQueries({ queryKey: ['grant-probe-plan'] });
+      });
+      await waitFor(() => expect(view.queryByText('伦敦入口')).toBeNull());
+      expect(view.getByText('没有可拨测的生效授权')).toBeTruthy();
+      expect((view.getByRole('button', { name: '拨测全部' }) as HTMLButtonElement).disabled).toBe(true);
+      expect(view.queryByText('42ms')).toBeNull();
+    } finally {
+      view.unmount();
+      client.clear();
+    }
+  });
+
+  it('refreshes only the edited user until the bounded Serving propagation window ends', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-28T00:00:00Z'));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+    client.setQueryData(['grant-probe-plan', user.tenant_id, user.id], plan);
+    let servingCaughtUp = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe('/users/platform.acme/alice/grant-probes');
+      return Response.json(
+        servingCaughtUp
+          ? {
+              ...plan,
+              serving_generation: 20,
+              items: [{ ...plan.items[0], id: 'new-ingress', name: '新授权入口' }],
+            }
+          : plan,
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const view = render(
+      <QueryClientProvider client={client}>
+        <GrantProbePanel user={user} readOnly />
+      </QueryClientProvider>,
+    );
+    const edit = async (userId: string) => {
+      const mutation = client.getMutationCache().build(client, {
+        mutationKey: ['grant'],
+        mutationFn: async () => ({ revision_id: 583 }),
+      });
+      await act(async () => {
+        await mutation.execute({
+          app_id: 'app-global',
+          tenant_id: user.tenant_id,
+          user_id: userId,
+          ingress_id: 'in-green',
+          enabled: true,
+        });
+        await vi.advanceTimersByTimeAsync(1);
+      });
+    };
+    try {
+      await edit('bob');
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6_000);
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+      await edit('alice');
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3_010);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(view.getByText('伦敦入口')).toBeTruthy();
+      servingCaughtUp = true;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3_010);
+      });
+      expect(view.getByText('新授权入口')).toBeTruthy();
+      expect(view.queryByText('伦敦入口')).toBeNull();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      const count = fetchMock.mock.calls.length;
+      expect(count).toBeGreaterThan(1);
+      expect(count).toBeLessThanOrEqual(21);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(90_000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(count);
+      await edit('alice');
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3_010);
+      });
+      expect(fetchMock.mock.calls.length).toBeGreaterThan(count);
+      view.unmount();
+      const afterUnmount = fetchMock.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(afterUnmount);
+    } finally {
+      view.unmount();
+      client.clear();
+    }
+  });
+
   it('submits only frozen item ids and renders the real-traffic contract', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input);
@@ -208,6 +330,62 @@ describe('user grant probe', () => {
     });
   });
 
+  it('hides the VLESS Encryption variant of an ingress that also serves VLESS until it is requested', async () => {
+    const mixedPlan: GrantProbePlan = {
+      ...plan,
+      items: [
+        ...plan.items,
+        {
+          ...plan.items[0],
+          id: 'g-friendly:ipv4:vless-encryption',
+          name: '伦敦入口 | VLESS Encryption',
+          protocol: 'vless-encryption',
+        },
+      ],
+    };
+    const posts: { item_ids: string[] }[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path === '/grant-probes/capability') {
+        return jsonResponse({ available: true, version: '26.4.25', reason: null, concurrency: 30 });
+      }
+      if (path === '/users/platform.acme/alice/grant-probes' && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body)) as { item_ids: string[] };
+        posts.push(body);
+        const selected = mixedPlan.items.filter(item => body.item_ids.length === 0 || body.item_ids.includes(item.id));
+        const job: GrantProbeJob = {
+          ...finishedJob,
+          items: selected.map(item => ({ ...item, status: 'passed', ttfb_ms: 42, detail: null })),
+        };
+        return jsonResponse({ job, reused: false });
+      }
+      if (path === '/users/platform.acme/alice/grant-probes') return jsonResponse(mixedPlan);
+      throw new Error(`unexpected request ${path}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const view = render(<GrantProbePanel user={user} />, { wrapper: wrapper() });
+    const headText = () => view.container.querySelector('.grant-probe-table-head')?.textContent ?? '';
+
+    expect(await view.findByText('伦敦入口')).toBeTruthy();
+    expect(headText()).not.toContain('VLESS · Encryption');
+    expect(view.container.querySelectorAll('.grant-probe-result')).toHaveLength(2);
+    const toggle = view.getByRole('checkbox', { name: 'VLESS Encryption' }) as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+
+    // 隐藏的项不参与拨测：请求显式列出显示中的项。
+    fireEvent.click(view.getByRole('button', { name: '拨测全部' }));
+    await view.findAllByText('42ms');
+    expect(posts).toEqual([{ item_ids: ['g-friendly:ipv4:vless', 'g-friendly:ipv6:hysteria2'] }]);
+
+    fireEvent.click(toggle);
+    expect(headText()).toContain('VLESS · Encryption');
+    expect(view.container.querySelectorAll('.grant-probe-result')).toHaveLength(3);
+    expect(view.getByLabelText('VLESS · Encryption · V4：尚未验证')).toBeTruthy();
+    fireEvent.click(view.getByRole('button', { name: '拨测全部' }));
+    await waitFor(() => expect(posts).toHaveLength(2));
+    expect(posts[1]).toEqual({ item_ids: [] });
+  });
+
   it('polls a running job to completion when the SSE stream delivers no snapshots', async () => {
     class SilentEventSource {
       onerror: (() => void) | null = null;
@@ -273,4 +451,6 @@ it('单独的 VLESS Encryption 入站也显示在拨测矩阵中', async () => {
   expect(view.container.querySelector('.grant-probe-table-head')?.textContent).toContain('VLESS · Encryption');
   expect(view.container.querySelector('.grant-probe-matrix')?.children).toHaveLength(1);
   expect(view.getByLabelText('VLESS · Encryption · V4：尚未验证')).toBeTruthy();
+  // 只提供 Encryption 的接入点没有其他拨测项，不受开关控制，也不显示开关。
+  expect(view.queryByRole('checkbox', { name: 'VLESS Encryption' })).toBeNull();
 });

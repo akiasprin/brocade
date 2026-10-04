@@ -13,3 +13,6 @@ license = "MPL-2.0"
 # recover a domain, allowing an explicit safe route instead of falling through to the default.
 anytls = true
 sniffing_failure_routing = true
+secure_dokodemo_splice = true
+legacy_agent_vision_splice = true
+online_source_protocols = true

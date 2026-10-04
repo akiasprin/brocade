@@ -50,13 +50,12 @@ import { usePresence } from '../ui/presence';
 import { confirmDiscardChanges } from '../ui/navigation-guard';
 import { FleetTrafficMeter } from '../ui/fleet-traffic';
 
-const LinksPane = lazy(() => import('../panes/links').then(module => ({ default: module.LinksPane })));
 const TopoCanvas = lazy(() => import('../topo/canvas').then(module => ({ default: module.TopoCanvas })));
 
 interface Face {
   key: NavKey;
   label: string;
-  /* 顶栏和「⋯」菜单共用：菜单里的图标用于快速区分导航与账号操作。 */
+  /* 顶栏和账户牌菜单共用：菜单里的图标用于快速区分导航与账号操作。 */
   icon?: IconName;
   /* 默认对所有角色可见。按角色隐藏入口属于体验优化，不构成安全边界。 */
   roles?: AdminRole[];
@@ -73,16 +72,15 @@ const NAV: Face[] = [
 ];
 
 /* 手机端只把三项高频配置入口留在顶栏，腾出的宽度用于恢复按钮文字。隧道、发布和用量仍
-   使用同一份 Face 定义，只是移动到更多菜单，避免两套角色权限和名称逐渐分叉。 */
+   使用同一份 Face 定义，只是移动到账户牌菜单，避免两套角色权限和名称逐渐分叉。 */
 const MOBILE_NAV = NAV.filter(f => f.key === 'nodes' || f.key === 'chains' || f.key === 'users');
 const MOBILE_MORE = NAV.filter(f => f.key === 'tunnels' || f.key === 'deploy' || f.key === 'usage');
 
-// 收入「⋯」的项：都是低频访问的页面，占用顶栏位置的收益较低。
-// 窄屏同理：该行只放 NAV 的主工作流，这些低频页面仍从「⋯」进入。
+// 收入账户牌菜单的项：都是低频访问的页面，占用顶栏位置的收益较低。
+// 窄屏同理：该行只放 NAV 的主工作流，这些低频页面仍从账户牌菜单进入。
 const MORE: Face[] = [
   { key: 'settings', label: '设置', icon: 'settings', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
   { key: 'topo', label: '拓扑', icon: 'topology' },
-  { key: 'links', label: '链路与 MTU', icon: 'linkMeasure' },
 ];
 
 /* 不进入页面列表，但需要标题：面包屑和窗口名都读取 LABEL。 */
@@ -100,6 +98,13 @@ const ROLE_LABEL: Record<AdminRole, string> = {
   'tenant-admin': '租户管理员',
   'system-admin': '系统管理员',
 };
+
+/** 顶栏账户牌与菜单头显示的身份。公开访客没有账户名；单租户阶段不显示租户范围。 */
+function accountOf(who: Whoami) {
+  if (isPublic(who)) return { name: '访客', role: '未登录', initial: '访', guest: true };
+  const name = who.self_user?.user_id ?? who.operator_id;
+  return { name, role: ROLE_LABEL[who.role], initial: Array.from(name)[0]?.toUpperCase() ?? '?', guest: false };
+}
 
 const visible = (faces: Face[], who: Whoami) => faces.filter(f => !f.roles || f.roles.includes(who.role));
 
@@ -335,7 +340,7 @@ export function ForgeShell({
 //
 // 只放 NAV 的主工作流，与宽屏顶栏一致。按钮直接复用宽屏的 fg-nv，不在这里维护
 // 第二套尺寸、图标和选中态；窄屏的差异只有容器允许横向滚动。
-// 曾尝试将 MORE 的四项也加入（带横向滚动），结果是右侧部分始终不可见——与收入「⋯」
+// 曾尝试将 MORE 的四项也加入（带横向滚动），结果是右侧部分始终不可见——与收进菜单
 // 的效果相同，且会产生该处有更多内容的错误预期。
 function MainNav({
   className,
@@ -460,6 +465,7 @@ function TopBar({
   const toggleTheme = () => runVisualTransition(() => theme.toggle(), nextThemeTransition);
   /* 评审角色无法获取产物（服务端返回 403），开关一并隐藏 */
   const artifacts = can(who.role, 'artifacts');
+  const account = accountOf(who);
 
   /* 点击其他位置时关闭菜单和气泡。两者绑定在同一个 document 监听上，避免重复实现。 */
   useEffect(() => {
@@ -485,7 +491,7 @@ function TopBar({
   // `warnings = diagnostics.length - errors`，在只有两个级别时等价，引入 info 后会将提示
   // 全部计为警告——表现为服务端返回 `warnings: 0` 而角标显示「2 警」。相同的计算在
   // 概览页也有一份，两处需要同步修改（`panes/index.tsx`）。顶栏角标只统计错误和警告，
-  // 提示不计入：它表示无法判定的事实，在全局位置显示会与分级的目的相悖。
+  // 提示不计入：它只列出可能被忽略的配置细节，在全局位置显示会与分级的目的相悖。
   const errors = summary?.errors ?? 0;
   const warnings = summary?.warnings ?? 0;
   const rest = visible(narrow ? [...MOBILE_MORE, ...MORE] : MORE, who);
@@ -530,6 +536,33 @@ function TopBar({
     items[next]?.focus();
   };
 
+  /* 账户牌替代「⋯」打开同一个菜单：顶栏常驻显示当前账户。窄屏只留首字母牌，名称与角色
+     在菜单头和读屏名称里。 */
+  const accountButton = (
+    <button
+      ref={moreButtonRef}
+      type="button"
+      className={`fg-who${narrow ? ' compact' : ''}${account.guest ? ' guest' : ''}`}
+      title={`${account.name} · ${account.role}`}
+      aria-label={`${account.name}，${account.role}：账户与更多功能`}
+      aria-haspopup="menu"
+      aria-controls="forge-more-menu"
+      aria-expanded={more}
+      onKeyDown={openMoreFromKeyboard}
+      onClick={e => {
+        e.stopPropagation();
+        setMore(v => !v);
+        forge.setDiag(false);
+      }}
+    >
+      <span className="fg-who-plate" aria-hidden="true">
+        {account.initial}
+      </span>
+      {!narrow && <span className="fg-who-name">{account.name}</span>}
+      {!narrow && <Icon of="chevronDown" size={12} className="fg-who-caret" />}
+    </button>
+  );
+
   const diagPop = diagPresence.present && (
     <div
       className="fg-pop"
@@ -554,13 +587,22 @@ function TopBar({
       ref={moreMenuRef}
       className="fg-menu nav-menu"
       role="menu"
-      aria-label="更多功能"
+      aria-label="账户与更多功能"
       data-motion-state={menuPresence.phase}
       aria-hidden={!more || undefined}
       inert={!more}
       onClick={() => setMore(false)}
       onKeyDown={moveWithinMore}
     >
+      {/* 菜单头重复账户牌的读屏名称，只作视觉呈现；读屏从账户牌读到账户名与角色。 */}
+      <div className={`fg-menu-id${account.guest ? ' guest' : ''}`} aria-hidden="true">
+        <span className="fg-who-plate">{account.initial}</span>
+        <span className="fg-menu-id-text">
+          <span className="fg-menu-id-name">{account.name}</span>
+          <span className="fg-menu-id-role">{account.role}</span>
+        </span>
+      </div>
+      <hr />
       {rest.map(f => (
         <button
           key={f.key}
@@ -588,12 +630,11 @@ function TopBar({
         </button>
       )}
       {/* 页面入口与即时外观控制分组。明暗模式使用明确的二选一，色调单独一行并显示当前名称；
-          两组操作都保持菜单打开，便于直接比较。 */}
+          两行与菜单项同一层级，不再套一层框。选择任一外观后立即关闭菜单。 */}
       {(rest.length > 0 || (narrow && artifacts)) && <hr />}
       <div className="fg-appearance" role="group" aria-label="外观" onClick={e => e.stopPropagation()}>
-        <div className="fg-appearance-title">外观</div>
         <div className="fg-appearance-row">
-          <span className="fg-appearance-label">模式</span>
+          <span className="fg-appearance-label">主题</span>
           <div className="fg-theme-switch" role="group" aria-label="明暗模式">
             <button
               type="button"
@@ -602,6 +643,7 @@ function TopBar({
               aria-label="使用亮色模式"
               aria-checked={themeKey === 'light'}
               onClick={() => {
+                setMore(false);
                 if (themeKey === 'light') return;
                 toggleTheme();
               }}
@@ -616,6 +658,7 @@ function TopBar({
               aria-label="使用暗色模式"
               aria-checked={themeKey === 'dark'}
               onClick={() => {
+                setMore(false);
                 if (themeKey === 'dark') return;
                 toggleTheme();
               }}
@@ -639,17 +682,17 @@ function TopBar({
                 title={`${option.name}：${option.description}`}
                 aria-label={`使用${option.name}色调：${option.description}`}
                 aria-checked={paletteKey === option.key}
-                onClick={event =>
+                onClick={event => {
+                  setMore(false);
+                  if (paletteKey === option.key) return;
                   runVisualTransition(
                     () => palette.set(option.key),
                     'appearance',
                     motionOriginFor(event.currentTarget, event.clientX, event.clientY),
-                  )
-                }
+                  );
+                }}
               >
-                <span className="fg-accdot-swatch" style={{ backgroundColor: option.action }}>
-                  {paletteKey === option.key && <Icon of="check" size={9} className="fg-accdot-check" />}
-                </span>
+                <span className="fg-accdot-swatch" style={{ backgroundColor: option.action }} />
               </button>
             ))}
           </div>
@@ -671,26 +714,17 @@ function TopBar({
           {nav === 'password' && <Icon of="check" size={13} className="fg-menu-check" />}
         </button>
       )}
-      {/* 公开访客从这里进入登录；已有身份从这里退出。完整身份留在辅助标签中，菜单只展示
-          单行操作和角色，避免长 ID 把一个简单动作撑成两三行。 */}
-      <button
-        type="button"
-        role="menuitem"
-        className="fg-menu-item fg-account-action"
-        aria-label={isPublic(who) ? '登录' : `退出登录，当前角色${ROLE_LABEL[who.role]}`}
-        title={isPublic(who) ? '登录' : `${who.self_user?.user_id ?? who.operator_id} · ${ROLE_LABEL[who.role]}`}
-        onClick={onLogout}
-      >
+      {/* 公开访客从这里进入登录；已有身份从这里退出。账户名与角色已在菜单头，这一行只写动作。 */}
+      <button type="button" role="menuitem" className="fg-menu-item fg-account-action" onClick={onLogout}>
         <Icon of={isPublic(who) ? 'access' : 'outbound'} size={14} className="fg-menu-icon" />
         <span className="fg-menu-copy">{isPublic(who) ? '登录' : '退出登录'}</span>
-        {!isPublic(who) && <span className="fg-account-role">{ROLE_LABEL[who.role]}</span>}
       </button>
     </div>
   );
 
   if (narrow) {
-    /* 窄屏只有这一行：品牌 + 三个高频页面 + 诊断 + ⋯。隧道、发布和用量收入更多菜单，
-       发布状态作为菜单项说明显示。下钻不再增加第二行，理由见上方 `.fg-backrow` 的说明。 */
+    /* 窄屏只有这一行：品牌 + 三个高频页面 + 诊断 + 账户牌。隧道、发布和用量收入账户牌的
+       菜单，发布状态作为菜单项说明显示。下钻不再增加第二行，理由见上方 `.fg-backrow` 的说明。 */
     return (
       <div className="fg-top fg-navrow">
         <BrandHome branding={branding} />
@@ -727,24 +761,7 @@ function TopBar({
         )}
 
         <div className="fg-menuwrap">
-          <button
-            ref={moreButtonRef}
-            type="button"
-            className="fg-ico fg-more-trigger"
-            title="更多"
-            aria-label="更多"
-            aria-haspopup="menu"
-            aria-controls="forge-more-menu"
-            aria-expanded={more}
-            onKeyDown={openMoreFromKeyboard}
-            onClick={e => {
-              e.stopPropagation();
-              setMore(v => !v);
-              forge.setDiag(false);
-            }}
-          >
-            <Icon of="menu" size={16} className="fg-more-icon" />
-          </button>
+          {accountButton}
           {menu}
         </div>
       </div>
@@ -768,7 +785,8 @@ function TopBar({
 
       <span className="sp" />
 
-      {/* 产物按钮只控制展开和收起。是否有待发布内容由「发布」导航表示；否则历史 diff
+      {/* 产物与诊断只显示图标，名称放在悬停提示和读屏文字里。
+          产物按钮只控制展开和收起。是否有待发布内容由「发布」导航表示；否则历史 diff
           的标记会被理解为发布未完成。
           读不了产物的角色看到的是禁用而不是消失：按角色隐藏时，顶栏在不同身份下少一个
           控件，而少掉的那个是这套外壳里唯一的产物入口。 */}
@@ -780,8 +798,8 @@ function TopBar({
         title={artifacts ? '显示 / 隐藏产物栏' : '当前身份无权查看产物'}
         onClick={() => artifactPanel.toggle()}
       >
-        <Icon of="artifactFolder" size={13} className="fg-tgl-ic" />
-        产物
+        <Icon of="artifactFolder" size={15} className="fg-tgl-ic" />
+        <span className="fg-tgl-label">产物</span>
       </button>
 
       {/* 诊断不对公开访客显示：它表示该版本的编译结果和可发布性，属于编辑到发布流程的
@@ -799,8 +817,8 @@ function TopBar({
               setMore(false);
             }}
           >
-            <Icon of="diag" size={13} className="fg-tgl-ic" />
-            诊断
+            <Icon of="diag" size={15} className="fg-tgl-ic" />
+            <span className="fg-tgl-label">诊断</span>
             {(diagnosticsError || errors > 0 || warnings > 0) && (
               <span className={`fg-badge${diagnosticsError || errors ? ' err' : ''}`}>
                 {diagnosticsError ? '!' : errors || warnings}
@@ -811,25 +829,9 @@ function TopBar({
         </div>
       )}
 
+      <span className="fg-vr" />
       <div className="fg-menuwrap">
-        <button
-          ref={moreButtonRef}
-          type="button"
-          className="btn fg-more fg-more-trigger"
-          title="更多"
-          aria-label="更多"
-          aria-haspopup="menu"
-          aria-controls="forge-more-menu"
-          aria-expanded={more}
-          onKeyDown={openMoreFromKeyboard}
-          onClick={e => {
-            e.stopPropagation();
-            setMore(v => !v);
-            forge.setDiag(false);
-          }}
-        >
-          <Icon of="menu" size={16} className="fg-more-icon" />
-        </button>
+        {accountButton}
         {menu}
       </div>
     </div>
@@ -838,8 +840,6 @@ function TopBar({
 
 /* ══ 工作区 ══ */
 
-// 导航键到已有功能页面的对应关系。两侧使用同一套 key，因此不需要映射表：
-// `links` 是后增加的页面，没有对应的旧功能窗，直接渲染。
 // 顶部面包屑。第一段是当前所在的页面（机器、线路等），其后是面板内的下钻层级。
 // *
 // * 下钻状态保存在 `win.data.drill` 中，其结构由面板自行定义，因此此处不解析它，
@@ -885,16 +885,10 @@ function Work({ nav }: { nav: NavKey }) {
   // 已打开时不执行任何操作——窗内导航状态（向导的当前步骤、下钻到的机器）保持不变。
   const hasWin = !!win;
   useEffect(() => {
-    if (nav === 'links' || nav === 'topo' || hasWin) return;
+    if (nav === 'topo' || hasWin) return;
     wm.open(`tab:${nav}`, LABEL[nav]);
   }, [nav, hasWin]);
 
-  if (nav === 'links')
-    return (
-      <LoadingBoundary fallback={<Loading variant="links" sheeted />} variant="links">
-        <LinksPane />
-      </LoadingBoundary>
-    );
   if (!win) {
     return null;
   }

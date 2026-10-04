@@ -77,13 +77,38 @@ function ProjectionHarness({
 afterEach(cleanup);
 
 describe('projection handle registration', () => {
-  it('keeps the default public endpoint implicit', async () => {
+  it('shows the effective public endpoint below the default/conversion switch', async () => {
     const reports = vi.fn<(handle: ProjectionHandle) => void>();
     const view = render(<ProjectionHarness onReport={reports} />);
 
     await waitFor(() => expect(reports).toHaveBeenCalledTimes(1));
     expect(view.queryByText(/使用机器公网地址/)).toBeNull();
-    expect(view.queryByText(/192\.0\.2\.1/)).toBeNull();
+    expect(view.getByText('当前结果')).toBeTruthy();
+    expect(view.getByText('192.0.2.1:443')).toBeTruthy();
+  });
+
+  it('does not present a NAT address as a generated client endpoint', () => {
+    const reports = vi.fn<(handle: ProjectionHandle) => void>();
+    const [client] = [new QueryClient({ defaultOptions: { queries: { retry: false } } })];
+    const onHandle = (handle: ProjectionHandle) => reports(handle);
+    const view = render(
+      <QueryClientProvider client={client}>
+        <dl>
+          <IngressProjectionRow
+            appId="app-1"
+            ingress={ingress}
+            protocol="vless"
+            family="v4"
+            node={{ public_ipv4: '192.0.2.1', public_ipv6: null, public_ipv4_nat: true }}
+            editable
+            onHandle={onHandle}
+          />
+        </dl>
+      </QueryClientProvider>,
+    );
+
+    expect(view.queryByText('192.0.2.1:443')).toBeNull();
+    expect(view.getByText('机器公网 IPv4 不可直连，不生成此条订阅')).toBeTruthy();
   });
 
   it('reports once per semantic form change instead of looping after the parent rerenders', async () => {
@@ -96,10 +121,12 @@ describe('projection handle registration', () => {
     fireEvent.click(view.getByRole('button', { name: '转换' }));
     await waitFor(() => expect(reports).toHaveBeenCalledTimes(2));
     expect(reports.mock.calls[1]?.[0]).toMatchObject({ dirty: true, blocked: true });
+    expect(view.getByText('填写有效地址和端口后显示')).toBeTruthy();
 
     fireEvent.change(view.getByPlaceholderText('地址或域名'), { target: { value: 'edge.example.com' } });
     await waitFor(() => expect(reports).toHaveBeenCalledTimes(3));
     expect(reports.mock.calls[2]?.[0]).toMatchObject({ dirty: true, blocked: false });
+    expect(view.getByText('edge.example.com:443')).toBeTruthy();
   });
 
   it('expands a legacy shared address into an independent protocol mapping', () => {

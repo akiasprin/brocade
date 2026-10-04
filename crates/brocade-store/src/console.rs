@@ -377,11 +377,17 @@ pub(crate) async fn rotate_user_uuid_tx(
     let uuid = generate_uuid_v4()?;
     ensure_user_exists_tx(tx, &tenant_id, &user_id).await?;
     // Rotation means replacing it with a new one, the uuid is generated afresh each time, and
-    // there is no such thing as no change.
+    // there is no such thing as no change. UUID is also half of the direct-login credential, so
+    // revoke that credential in the same update and keep the user list's state truthful.
     sqlx::query(
         "UPDATE users
          SET uuid = $3::uuid,
-             created_revision = COALESCE(created_revision, $4)
+             created_revision = COALESCE(created_revision, $4),
+             direct_login_revoked_at = CASE
+                 WHEN direct_login_token_hash IS NOT NULL
+                     THEN COALESCE(direct_login_revoked_at, now())
+                 ELSE direct_login_revoked_at
+             END
          WHERE tenant_id = $1 AND id = $2",
     )
     .bind(&tenant_id)
@@ -3602,6 +3608,7 @@ fn user_item_from_row(row: &sqlx::postgres::PgRow) -> Result<UserListItem> {
         status: row.try_get("status")?,
         account_type: parse_user_account_type(row.try_get("account_type")?)?,
         login_enabled: row.try_get("login_enabled")?,
+        direct_login_enabled: row.try_get("direct_login_enabled")?,
         created_at: row.try_get("created_at")?,
         created_revision: row
             .try_get::<Option<i64>, _>("created_revision")?
@@ -3618,7 +3625,10 @@ async fn load_user_item(pool: &PgPool, tenant_id: &str, user_id: &str) -> Result
                     WHERE o.role = 'user'
                       AND o.user_tenant_id = users.tenant_id
                       AND o.user_id = users.id
+                      AND o.password_hash IS NOT NULL
                 ) AS login_enabled,
+                (direct_login_token_hash IS NOT NULL
+                 AND direct_login_revoked_at IS NULL) AS direct_login_enabled,
                 created_at::text AS created_at, created_revision
          FROM users
          WHERE tenant_id = $1 AND id = $2",

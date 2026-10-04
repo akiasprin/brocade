@@ -3,7 +3,11 @@ import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ApiError } from './api';
 import { App } from './app';
+import { observeBrowserAppearance } from './forge/browser-appearance';
 import './styles.css';
+
+const stopBrowserAppearance = observeBrowserAppearance();
+if (import.meta.hot) import.meta.hot.dispose(stopBrowserAppearance);
 
 /* 配置与观测使用不同的刷新语义。
  *

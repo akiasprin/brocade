@@ -1,16 +1,15 @@
 import { useEffect, useRef, useSyncExternalStore } from 'react';
 import * as echarts from 'echarts/core';
-import { LineChart } from 'echarts/charts';
+import { CustomChart, LineChart } from 'echarts/charts';
 import { GridComponent, MarkLineComponent, TooltipComponent } from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
-import type { NodePingProbeView } from '../api';
+import type { PingProbeFamily, PingProbePoint } from '../api';
 import { theme } from '../forge/theme';
 import { palette } from '../forge/palette';
 import {
   observeAreaStyle,
   observeAxisLine,
   observeAxisTick,
-  observeBpsUnit,
   observeColors,
   observeLoadingOptions,
   observeMinorTick,
@@ -19,10 +18,10 @@ import {
   observeTimeInterval,
   observeValueAxis,
 } from '../ui/observe-chart';
-import { pingLatencyMs, pingSampleText } from '../ui/ping-probe';
+import { PING_FAMILY_LABEL, pingLatencyMs, pingSampleLost, pingSampleText } from '../ui/ping-probe';
 import { echartsEntranceAnimation, useEchartsViewportEntry } from '../ui/echarts-motion';
 
-echarts.use([LineChart, GridComponent, TooltipComponent, MarkLineComponent, CanvasRenderer]);
+echarts.use([LineChart, CustomChart, GridComponent, TooltipComponent, MarkLineComponent, CanvasRenderer]);
 
 const NET_MONO = 'ui-monospace, SFMono-Regular, Menlo, monospace';
 
@@ -61,136 +60,6 @@ export function ObservationChartLoading({ className = 'node-observation-loading-
   return <div ref={elRef} className={className} aria-label="加载中" />;
 }
 
-export interface FleetNetPoint {
-  nicRx: number;
-  nicTx: number;
-  xrayRx: number;
-  xrayTx: number;
-}
-
-/* 镜像面积图。接收为正（朝上）、发送取负（朝下），零线居中；每方向 NIC 外层（淡填充 +
-   描边）套 XRAY 内层（实心），两线之间的缝即封装 / 系统开销。方向由镜像位置表达，用色
-   同一数据色的两档（接收=data、发送=data-secondary），来源用填充手法区分。颜色与坐标
-   全部读自 CSS 令牌，随明暗主题与调色盘选择重绘。 */
-export function FleetNetChart({ times, pts, peak }: { times: number[]; pts: FleetNetPoint[]; peak: number }) {
-  const elRef = useRef<HTMLDivElement>(null);
-  const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
-  const themeName = useSyncExternalStore(theme.subscribe, theme.snapshot);
-  const paletteKey = useSyncExternalStore(palette.subscribe, palette.snapshot);
-  const enteredViewport = useEchartsViewportEntry(elRef);
-  const hasRenderedData = useRef(false);
-
-  useEffect(() => {
-    const el = elRef.current;
-    if (!el) return;
-    const chart = echarts.init(el, null, { renderer: 'canvas' });
-    chartRef.current = chart;
-    const ro = new ResizeObserver(() => chart.resize());
-    ro.observe(el);
-    return () => {
-      ro.disconnect();
-      chart.dispose();
-      chartRef.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    const chart = chartRef.current;
-    if (!chart || !enteredViewport) return;
-    const css = getComputedStyle(document.documentElement);
-    const cv = (name: string) => css.getPropertyValue(name).trim();
-    const data = cv('--data');
-    const dataSecondary = cv('--data-secondary');
-    const ink = cv('--ink');
-    const ink3 = cv('--ink-3');
-    const ink4 = cv('--ink-4');
-    const line = cv('--line');
-    const lineSoft = cv('--line-soft');
-    const glass = cv('--glass-strong');
-    const valueAxis = observeValueAxis(peak);
-    const unit = observeBpsUnit(valueAxis);
-
-    const area = (name: string, key: keyof FleetNetPoint, color: string, sign: 1 | -1, inner: boolean) => ({
-      name,
-      type: 'line' as const,
-      showSymbol: false,
-      smooth: true,
-      sampling: 'lttb' as const,
-      lineStyle: { color, width: inner ? 1 : 1.3, opacity: inner ? 1 : 0.9 },
-      areaStyle: { color, opacity: inner ? 0.42 : 0.12 },
-      emphasis: { disabled: true },
-      z: inner ? 3 : 2,
-      data: times.map((time, index) => [time * 1000, sign * pts[index][key]] as [number, number]),
-    });
-
-    const series = [
-      area('接收 · 网卡', 'nicRx', data, 1, false),
-      area('接收 · 承载', 'xrayRx', data, 1, true),
-      area('发送 · 网卡', 'nicTx', dataSecondary, -1, false),
-      area('发送 · 承载', 'xrayTx', dataSecondary, -1, true),
-    ];
-    (series[0] as Record<string, unknown>).markLine = {
-      silent: true,
-      symbol: 'none',
-      data: [{ yAxis: 0 }],
-      lineStyle: { color: ink4, width: 0.8, opacity: 0.55 },
-      label: { show: false },
-    };
-
-    chart.setOption(
-      {
-        ...echartsEntranceAnimation(!hasRenderedData.current),
-        grid: { left: 48, right: 12, top: 10, bottom: 20 },
-        textStyle: { fontFamily: NET_MONO },
-        tooltip: {
-          trigger: 'axis',
-          backgroundColor: glass,
-          borderColor: line,
-          borderWidth: 1,
-          padding: [7, 9],
-          textStyle: { color: ink3, fontSize: 11, fontFamily: NET_MONO },
-          formatter: (params: unknown) => {
-            const entries = params as { seriesName: string; color: string; value: [number, number] }[];
-            const when = new Date(entries[0].value[0]).toLocaleTimeString('zh-CN', {
-              hour: '2-digit',
-              minute: '2-digit',
-            });
-            const row = (entry: { seriesName: string; color: string; value: [number, number] }) =>
-              `<div style="display:flex;gap:8px;align-items:center;line-height:1.75">` +
-              `<span style="width:8px;height:8px;border-radius:2px;background:${entry.color}"></span>` +
-              `<span>${entry.seriesName}</span>` +
-              `<b style="margin-left:auto;color:${ink}">${unit.read(Math.abs(entry.value[1]))}</b></div>`;
-            return `<div style="color:${ink4};font-size:9px;margin-bottom:3px">${when}</div>${entries.map(row).join('')}`;
-          },
-        },
-        xAxis: {
-          type: 'time',
-          axisLabel: { color: ink4, fontSize: 9, hideOverlap: true },
-          axisLine: { ...observeAxisLine(ink3), onZero: false },
-          axisTick: observeAxisTick(ink3),
-          minorTick: observeMinorTick(lineSoft),
-          splitLine: { show: false },
-        },
-        yAxis: {
-          type: 'value',
-          min: -valueAxis.max,
-          max: valueAxis.max,
-          interval: valueAxis.interval,
-          axisLabel: { color: ink4, fontSize: 9, formatter: (value: number) => unit.text(Math.abs(value)) },
-          axisLine: observeAxisLine(ink3),
-          axisTick: observeAxisTick(ink3),
-          splitLine: { lineStyle: { color: lineSoft } },
-        },
-        series,
-      },
-      true,
-    );
-    hasRenderedData.current = true;
-  }, [enteredViewport, times, pts, peak, themeName, paletteKey]);
-
-  return <div ref={elRef} className="ndnet-echart" />;
-}
-
 function html(value: string): string {
   return value.replace(
     /[&<>"']/g,
@@ -198,12 +67,92 @@ function html(value: string): string {
   );
 }
 
+/** One curve of a Ping chart: one target's series for the family the panel shows. */
+export interface PingChartLine {
+  name: string;
+  /** Position of the target in its block; the legend uses the same color. */
+  color: number;
+  samples: PingProbePoint[];
+}
+
+/** Sample spacing of the chart: the median gap between consecutive timestamps, so a missing report
+ * or a changed interval does not widen every loss mark. */
+function pingSampleStepMs(times: readonly number[]): number {
+  const gaps = times.slice(1).map((time, index) => time - times[index]);
+  if (gaps.length === 0) return 60_000;
+  gaps.sort((left, right) => left - right);
+  return gaps[Math.floor(gaps.length / 2)] * 1000;
+}
+
+/** Periods in which any curve lost packets, as [start, end] milliseconds. A run of consecutive
+ * losses is one period, each loss covers half a sample step on either side, and overlapping periods
+ * of different curves are merged: the mark says when, the legend and tooltip say which target. */
+export function pingLossPeriods(lines: readonly PingChartLine[], stepMs: number): Array<[number, number]> {
+  const half = stepMs / 2;
+  const periods: Array<[number, number]> = [];
+  for (const line of lines) {
+    const { samples } = line;
+    for (let index = 0; index < samples.length; index += 1) {
+      if (!pingSampleLost(samples[index])) continue;
+      const start = index;
+      while (index + 1 < samples.length && pingSampleLost(samples[index + 1])) index += 1;
+      periods.push([
+        samples[start].probed_at_unix_secs * 1000 - half,
+        samples[index].probed_at_unix_secs * 1000 + half,
+      ]);
+    }
+  }
+  periods.sort((left, right) => left[0] - right[0]);
+  const merged: Array<[number, number]> = [];
+  for (const period of periods) {
+    const last = merged.at(-1);
+    if (last && period[0] <= last[1]) last[1] = Math.max(last[1], period[1]);
+    else merged.push([...period]);
+  }
+  return merged;
+}
+
+/** Loss periods as a 3px lane just below the x axis. Curves only break where a reply is missing,
+ * which a capability gap does too; the lane is what tells packet loss apart. It stays out of the
+ * axis tooltip, which would otherwise snap to the period edges instead of to samples. */
+function pingLossLane(periods: Array<[number, number]>, color: string): Record<string, unknown> {
+  type Coord = { x: number; y: number; width: number; height: number };
+  return {
+    type: 'custom',
+    silent: true,
+    animation: false,
+    clip: false,
+    z: 6,
+    tooltip: { show: false },
+    data: periods,
+    encode: { x: [0, 1] },
+    renderItem: (
+      params: { coordSys: unknown },
+      api: { value: (dimension: number) => number; coord: (value: number[]) => number[] },
+    ) => {
+      const area = params.coordSys as Coord;
+      const left = Math.max(area.x, api.coord([api.value(0), 0])[0]);
+      const right = Math.min(area.x + area.width, api.coord([api.value(1), 0])[0]);
+      // A single loss in a week-long range is still a visible mark.
+      const width = Math.max(2, right - left);
+      const x = right - left < 2 ? (left + right) / 2 - 1 : left;
+      return {
+        type: 'rect',
+        shape: { x, y: area.y + area.height + 2, width, height: 3, r: 1 },
+        style: { fill: color, opacity: 0.8 },
+      };
+    },
+  };
+}
+
 export function PingLatencyChart({
-  view,
+  lines,
+  family,
   bounds,
   group,
 }: {
-  view: NodePingProbeView;
+  lines: PingChartLine[];
+  family: PingProbeFamily;
   bounds: { startUnixSecs: number; endUnixSecs: number };
   group?: string;
 }) {
@@ -213,6 +162,7 @@ export function PingLatencyChart({
   const paletteKey = useSyncExternalStore(palette.subscribe, palette.snapshot);
   const enteredViewport = useEchartsViewportEntry(elRef);
   const hasRenderedData = useRef(false);
+  const lastSig = useRef<string | null>(null);
 
   useEffect(() => {
     const el = elRef.current;
@@ -220,6 +170,7 @@ export function PingLatencyChart({
     const chart = echarts.init(el, null, { renderer: 'canvas' });
     if (group) chart.group = group;
     chartRef.current = chart;
+    lastSig.current = null;
     const ro = new ResizeObserver(() => chart.resize());
     ro.observe(el);
     return () => {
@@ -232,24 +183,27 @@ export function PingLatencyChart({
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart || !enteredViewport) return;
+    // An identical notMerge write would cancel the in-flight entrance sweep.
+    const sig = JSON.stringify([lines, family, bounds.startUnixSecs, bounds.endUnixSecs, group, themeName, paletteKey]);
+    if (sig === lastSig.current) return;
     const css = getComputedStyle(document.documentElement);
     const cv = (name: string) => css.getPropertyValue(name).trim();
     const colors = observeColors(themeName, cv);
+    const colorOf = (entry: PingChartLine) => colors[entry.color % colors.length];
     const ink = cv('--ink');
     const ink3 = cv('--ink-3');
     const ink4 = cv('--ink-4');
+    const err = cv('--err');
     const line = cv('--line');
     const lineSoft = cv('--line-soft');
     const glass = cv('--glass-strong');
-    const byTarget = view.targets.map(
-      target => new Map(target.samples.map(sample => [sample.probed_at_unix_secs, sample])),
+    const byLine = lines.map(entry => new Map(entry.samples.map(sample => [sample.probed_at_unix_secs, sample])));
+    const times = [...new Set(lines.flatMap(entry => entry.samples.map(sample => sample.probed_at_unix_secs)))].sort(
+      (left, right) => left - right,
     );
-    const times = [
-      ...new Set(view.targets.flatMap(target => target.samples.map(sample => sample.probed_at_unix_secs))),
-    ].sort((left, right) => left - right);
-    const valuesAt = new Map(times.map(time => [time, byTarget.map(samples => samples.get(time))] as const));
-    const successful = view.targets.flatMap(target =>
-      target.samples.flatMap(sample => {
+    const valuesAt = new Map(times.map(time => [time, byLine.map(samples => samples.get(time))] as const));
+    const successful = lines.flatMap(entry =>
+      entry.samples.flatMap(sample => {
         const latency = pingLatencyMs(sample);
         return latency == null ? [] : [latency];
       }),
@@ -266,10 +220,10 @@ export function PingLatencyChart({
         minute: '2-digit',
         hour12: false,
       });
-    const series: Array<Record<string, unknown>> = view.targets.map((target, index) => {
-      const color = colors[index % colors.length];
+    const series: Array<Record<string, unknown>> = lines.map((entry, index) => {
+      const color = colorOf(entry);
       return {
-        name: target.name,
+        name: entry.name,
         type: 'line' as const,
         symbol: 'circle',
         symbolSize: 5,
@@ -277,15 +231,17 @@ export function PingLatencyChart({
         smooth: false,
         connectNulls: false,
         lineStyle: observeSeriesLine(color),
-        areaStyle: observeAreaStyle(color, themeName, { count: view.targets.length }),
+        areaStyle: observeAreaStyle(color, themeName, { count: lines.length, paper: cv('--card') }),
         itemStyle: { color, borderColor: glass, borderWidth: 1.5 },
         emphasis: { disabled: true },
         data: times.map(time => {
-          const sample = byTarget[index].get(time);
+          const sample = byLine[index].get(time);
           return [time * 1000, sample ? pingLatencyMs(sample) : null] as [number, number | null];
         }),
       };
     });
+    const lossPeriods = pingLossPeriods(lines, pingSampleStepMs(times));
+    if (lossPeriods.length > 0) series.push(pingLossLane(lossPeriods, err));
     chart.setOption(
       {
         ...echartsEntranceAnimation(!hasRenderedData.current),
@@ -306,7 +262,7 @@ export function PingLatencyChart({
             const entries = params as { axisValue: number }[];
             const atMs = Number(entries[0]?.axisValue ?? 0);
             const at = Math.round(atMs / 1000);
-            const values = valuesAt.get(at) ?? view.targets.map(() => undefined);
+            const values = valuesAt.get(at) ?? lines.map(() => undefined);
             const when = new Date(atMs).toLocaleString('zh-CN', {
               month: '2-digit',
               day: '2-digit',
@@ -315,25 +271,26 @@ export function PingLatencyChart({
               second: '2-digit',
               hour12: false,
             });
-            const rows = view.targets
-              .map((target, index) => ({
-                target,
-                index,
+            const rows = lines
+              .map((entry, index) => ({
+                entry,
                 sample: values[index],
                 value: values[index] ? pingLatencyMs(values[index]!) : null,
               }))
               .sort(
                 (left, right) => (right.value ?? Number.NEGATIVE_INFINITY) - (left.value ?? Number.NEGATIVE_INFINITY),
               )
-              .map(
-                ({ target, index, sample }) =>
+              .map(({ entry, sample }) => {
+                const tone = pingSampleLost(sample) ? err : sample && !sample.attempted ? ink4 : ink;
+                return (
                   `<div style="display:flex;align-items:center;gap:7px;line-height:1.75">` +
-                  `<span style="width:8px;height:8px;border-radius:2px;background:${colors[index % colors.length]};flex:none"></span>` +
-                  `<span style="color:${ink3}">${html(target.name)}</span>` +
-                  `<b style="margin-left:auto;color:${ink};font-weight:500">${pingSampleText(sample)}</b></div>`,
-              )
+                  `<span style="width:8px;height:8px;border-radius:2px;background:${colorOf(entry)};flex:none"></span>` +
+                  `<span style="color:${ink3}">${html(entry.name)}</span>` +
+                  `<b style="margin-left:auto;color:${tone};font-weight:500">${pingSampleText(sample)}</b></div>`
+                );
+              })
               .join('');
-            return `<div style="color:${ink4};font-size:9px;margin-bottom:4px;letter-spacing:.04em">${when}</div>${rows}`;
+            return `<div style="color:${ink4};font-size:9px;margin-bottom:4px;letter-spacing:.04em">${when} · ${PING_FAMILY_LABEL[family]}</div>${rows}`;
           },
         },
         xAxis: {
@@ -368,8 +325,9 @@ export function PingLatencyChart({
       true,
     );
     hasRenderedData.current = true;
+    lastSig.current = sig;
     if (group) echarts.connect(group);
-  }, [view, bounds, group, themeName, paletteKey, enteredViewport]);
+  }, [lines, family, bounds, group, themeName, paletteKey, enteredViewport]);
 
   return <div ref={elRef} className="ping-probe-chart" />;
 }

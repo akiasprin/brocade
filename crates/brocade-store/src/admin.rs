@@ -12,6 +12,8 @@ use crate::{
     credentials::{
         admin_session_token_hash, admin_token_display_prefix, admin_token_hash,
         generate_admin_password, generate_admin_session_token, generate_admin_token,
+        generate_user_direct_login_token, user_direct_login_token_hash,
+        USER_DIRECT_LOGIN_TOKEN_LEN, USER_DIRECT_LOGIN_TOKEN_PREFIX,
     },
     Result, StoreError,
 };
@@ -192,6 +194,20 @@ pub struct AuthenticatedUser {
 pub struct IssuedUserLogin {
     pub operator_id: String,
     pub password: String,
+    pub sessions_revoked: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserDirectLoginRequest {
+    pub uuid: String,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuedUserDirectLogin {
+    pub operator_id: String,
+    pub uuid: String,
+    pub token: String,
     pub sessions_revoked: u64,
 }
 
@@ -681,81 +697,9 @@ pub async fn issue_user_login(
 
     let password = generate_admin_password()?;
     let password_hash = hash_admin_password(&password)?;
-    let desired_operator_id = format!("{tenant_id}/{user_id}");
     let mut tx = pool.begin().await?;
-    let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM users WHERE tenant_id = $1 AND id = $2)",
-    )
-    .bind(&tenant_id)
-    .bind(&user_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    if !exists {
-        return Err(StoreError::NotFound(format!("user {tenant_id}/{user_id}")));
-    }
-
-    let existing_id: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM admin_operators
-         WHERE role = 'user' AND user_tenant_id = $1 AND user_id = $2",
-    )
-    .bind(&tenant_id)
-    .bind(&user_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let mut sessions_revoked = 0;
-    let operator_id = if existing_id.as_deref() == Some(desired_operator_id.as_str()) {
-        sqlx::query(
-            "UPDATE admin_operators
-             SET password_hash = $2,
-                 token_hash = NULL,
-                 token_prefix = NULL,
-                 token_created_at = NULL,
-                 token_last_used_at = NULL,
-                 token_revoked_at = NULL
-             WHERE id = $1",
-        )
-        .bind(&desired_operator_id)
-        .bind(&password_hash)
-        .execute(&mut *tx)
-        .await?;
-        desired_operator_id
-    } else {
-        let collision: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM admin_operators WHERE id = $1)")
-                .bind(&desired_operator_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if collision {
-            return Err(StoreError::InvalidData(format!(
-                "login name {desired_operator_id} is already in use"
-            )));
-        }
-        // This also upgrades an identity created by the short-lived bare-user naming scheme.
-        // Its sessions are invalid after a reset anyway, so remove the old identity only after
-        // proving the requested bare login name is available.
-        if let Some(existing_id) = existing_id {
-            sessions_revoked += revoke_operator_sessions(&mut tx, &existing_id, None).await?;
-            sqlx::query("DELETE FROM admin_operators WHERE id = $1")
-                .bind(existing_id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        sqlx::query(
-            "INSERT INTO admin_operators (
-                id, display_name, role, tenant_scope, password_hash,
-                user_tenant_id, user_id
-             ) VALUES ($1, $2, 'user', $3, $4, $3, $2)",
-        )
-        .bind(&desired_operator_id)
-        .bind(&user_id)
-        .bind(&tenant_id)
-        .bind(&password_hash)
-        .execute(&mut *tx)
-        .await?;
-        desired_operator_id
-    };
-
+    let (operator_id, mut sessions_revoked) =
+        ensure_user_login_identity(&mut tx, &tenant_id, &user_id, Some(&password_hash)).await?;
     sessions_revoked += revoke_operator_sessions(&mut tx, &operator_id, None).await?;
     tx.commit().await?;
     Ok(IssuedUserLogin {
@@ -763,6 +707,239 @@ pub async fn issue_user_login(
         password,
         sessions_revoked,
     })
+}
+
+/// Create or replace the bearer used by a user's direct-login page. The raw token is returned in
+/// this response alone; only its SHA-256 digest is durable. Existing browser sessions and an
+/// independently configured password remain valid.
+pub async fn issue_user_direct_login(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<IssuedUserDirectLogin> {
+    let tenant_id = required_text(tenant_id, "tenant_id")?;
+    let user_id = required_text(user_id, "user id")?;
+    actor.require_tenant_access(&tenant_id, "user direct login")?;
+
+    let token = generate_user_direct_login_token()?;
+    let token_hash = user_direct_login_token_hash(&token);
+    let mut tx = pool.begin().await?;
+    let uuid: String = sqlx::query_scalar(
+        "SELECT uuid::text FROM users WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
+    )
+    .bind(&tenant_id)
+    .bind(&user_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(format!("user {tenant_id}/{user_id}")))?;
+    let (operator_id, sessions_revoked) =
+        ensure_user_login_identity(&mut tx, &tenant_id, &user_id, None).await?;
+
+    sqlx::query(
+        "UPDATE users
+         SET direct_login_token_hash = $3,
+             direct_login_created_at = now(),
+             direct_login_last_used_at = NULL,
+             direct_login_revoked_at = NULL
+         WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(&tenant_id)
+    .bind(&user_id)
+    .bind(token_hash)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(IssuedUserDirectLogin {
+        operator_id,
+        uuid,
+        token,
+        sessions_revoked,
+    })
+}
+
+/// Exchange the UUID + direct token pair for the same short-lived HttpOnly browser session used by
+/// password login. Locking the user row until the session insert commits gives regeneration
+/// a crisp boundary: either this exchange wins first, or the replaced token is rejected.
+pub async fn login_user_direct(
+    pool: &PgPool,
+    request: UserDirectLoginRequest,
+) -> Result<AdminLoginResult> {
+    let uuid = required_text(&request.uuid, "user uuid")?;
+    let token = required_text(&request.token, "user direct login token")?;
+    if token.len() != USER_DIRECT_LOGIN_TOKEN_LEN
+        || !token.starts_with(USER_DIRECT_LOGIN_TOKEN_PREFIX)
+    {
+        return Err(StoreError::Unauthorized(
+            "invalid direct login credentials".to_owned(),
+        ));
+    }
+    let token_hash = user_direct_login_token_hash(&token);
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query(
+        "SELECT o.id, o.role, o.tenant_scope, o.user_tenant_id, o.user_id
+         FROM users u
+         JOIN admin_operators o
+           ON o.role = 'user'
+          AND o.user_tenant_id = u.tenant_id
+          AND o.user_id = u.id
+         WHERE u.uuid::text = lower($1)
+           AND u.direct_login_token_hash = $2
+           AND u.direct_login_revoked_at IS NULL
+         FOR UPDATE OF u",
+    )
+    .bind(uuid)
+    .bind(&token_hash)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| StoreError::Unauthorized("invalid direct login credentials".to_owned()))?;
+
+    sqlx::query(
+        "UPDATE users
+         SET direct_login_last_used_at = now()
+         WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(row.try_get::<String, _>("user_tenant_id")?)
+    .bind(row.try_get::<String, _>("user_id")?)
+    .execute(&mut *tx)
+    .await?;
+
+    let operator_id: String = row.try_get("id")?;
+    let session = issue_admin_session_tx(&mut tx, &operator_id).await?;
+    let admin = AuthenticatedAdmin {
+        operator_id,
+        role: parse_admin_role(row.try_get("role")?)?,
+        tenant_scope: row.try_get("tenant_scope")?,
+        token_prefix: None,
+        self_user: authenticated_user_from_row(&row)?,
+    };
+    tx.commit().await?;
+    Ok(AdminLoginResult { admin, session })
+}
+
+pub async fn revoke_user_direct_login(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<bool> {
+    let tenant_id = required_text(tenant_id, "tenant_id")?;
+    let user_id = required_text(user_id, "user id")?;
+    actor.require_tenant_access(&tenant_id, "user direct login")?;
+    let user_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE tenant_id = $1 AND id = $2)")
+            .bind(&tenant_id)
+            .bind(&user_id)
+            .fetch_one(pool)
+            .await?;
+    if !user_exists {
+        return Err(StoreError::NotFound(format!("user {tenant_id}/{user_id}")));
+    }
+    let result = sqlx::query(
+        "UPDATE users
+         SET direct_login_revoked_at = COALESCE(direct_login_revoked_at, now())
+         WHERE tenant_id = $1
+           AND id = $2
+           AND direct_login_token_hash IS NOT NULL
+           AND direct_login_revoked_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Ensure that a network user has exactly one session identity. `password_hash = None` creates a
+/// direct-link-only identity without altering an existing password credential.
+async fn ensure_user_login_identity(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: &str,
+    user_id: &str,
+    password_hash: Option<&str>,
+) -> Result<(String, u64)> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE tenant_id = $1 AND id = $2)",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !exists {
+        return Err(StoreError::NotFound(format!("user {tenant_id}/{user_id}")));
+    }
+
+    let existing = sqlx::query(
+        "SELECT id, password_hash FROM admin_operators
+         WHERE role = 'user' AND user_tenant_id = $1 AND user_id = $2
+         FOR UPDATE",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let desired_operator_id = format!("{tenant_id}/{user_id}");
+    let existing_id = existing
+        .as_ref()
+        .map(|row| row.try_get::<String, _>("id"))
+        .transpose()?;
+    if existing_id.as_deref() == Some(desired_operator_id.as_str()) {
+        if let Some(password_hash) = password_hash {
+            sqlx::query(
+                "UPDATE admin_operators
+                 SET password_hash = $2,
+                     token_hash = NULL,
+                     token_prefix = NULL,
+                     token_created_at = NULL,
+                     token_last_used_at = NULL,
+                     token_revoked_at = NULL
+                 WHERE id = $1",
+            )
+            .bind(&desired_operator_id)
+            .bind(password_hash)
+            .execute(&mut **tx)
+            .await?;
+        }
+        return Ok((desired_operator_id, 0));
+    }
+
+    let collision: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM admin_operators WHERE id = $1)")
+            .bind(&desired_operator_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if collision {
+        return Err(StoreError::InvalidData(format!(
+            "login name {desired_operator_id} is already in use"
+        )));
+    }
+
+    let mut sessions_revoked = 0;
+    let preserved_password_hash = existing
+        .as_ref()
+        .map(|row| row.try_get::<Option<String>, _>("password_hash"))
+        .transpose()?
+        .flatten();
+    if let Some(existing_id) = existing_id {
+        sessions_revoked += revoke_operator_sessions(tx, &existing_id, None).await?;
+        sqlx::query("DELETE FROM admin_operators WHERE id = $1")
+            .bind(existing_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    sqlx::query(
+        "INSERT INTO admin_operators (
+            id, display_name, role, tenant_scope, password_hash, user_tenant_id, user_id
+         ) VALUES ($1, $2, 'user', $3, $4, $3, $2)",
+    )
+    .bind(&desired_operator_id)
+    .bind(user_id)
+    .bind(tenant_id)
+    .bind(password_hash.or(preserved_password_hash.as_deref()))
+    .execute(&mut **tx)
+    .await?;
+    Ok((desired_operator_id, sessions_revoked))
 }
 
 /// Set a chosen password for an existing user login. This is deliberately separate from
@@ -1207,6 +1384,26 @@ async fn issue_admin_session(pool: &PgPool, operator_id: &str) -> Result<IssuedA
     .bind(operator_id)
     .bind(ADMIN_SESSION_TTL_SECONDS)
     .fetch_one(pool)
+    .await?
+    .try_get("expires_at")?;
+    Ok(IssuedAdminSession { token, expires_at })
+}
+
+async fn issue_admin_session_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    operator_id: &str,
+) -> Result<IssuedAdminSession> {
+    let token = generate_admin_session_token()?;
+    let token_hash = admin_session_token_hash(&token);
+    let expires_at = sqlx::query(
+        "INSERT INTO admin_sessions (token_hash, operator_id, expires_at)
+         VALUES ($1, $2, now() + ($3::int * interval '1 second'))
+         RETURNING expires_at::text AS expires_at",
+    )
+    .bind(token_hash)
+    .bind(operator_id)
+    .bind(ADMIN_SESSION_TTL_SECONDS)
+    .fetch_one(&mut **tx)
     .await?
     .try_get("expires_at")?;
     Ok(IssuedAdminSession { token, expires_at })

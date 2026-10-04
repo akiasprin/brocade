@@ -24,8 +24,9 @@ use brocade_deployment::protocol::{
     DiskDetailSample, E2eExitVerdict, E2eProbe, E2eProbeAnyTls, E2eProbeRequest, E2eProbeSecurity,
     E2eProbeStatus, E2eProbeTarget, GeodataFileState, GeodataObservation, HostFacts,
     LoadReportRequest, LoadSample, LocalReconcileReport, NetworkDetailSample,
-    NodePublicIpObservation, NodeRuntimeReport, NodeTrafficReading, NodeVersions, PublicIpFamily,
-    SpoolBacklog, WireGuardHealth, WireGuardPeerHealth, WireGuardPeerStatus,
+    NodePublicIpObservation, NodeRuntimeReport, NodeTrafficReading, NodeVersions, OnlineSource,
+    PublicIpFamily, SpoolBacklog, UserOnlineSources, WireGuardHealth, WireGuardPeerHealth,
+    WireGuardPeerStatus,
 };
 use brocade_store::{
     generate_reality_short_id, is_reality_short_id, node_token_display_prefix, node_token_hash,
@@ -36,17 +37,18 @@ use brocade_store::{
     CreateUserRequest, CreateXrayReleaseRequest, DeleteFrontRequest, HopInRequest, HopWireRequest,
     IsolateDeploymentTargetRequest, IsolateNodeRequest, IssuedCertificate, LinkProbe,
     LinkProbeRequest, LinkProbeStatus, LoadSeriesQuery, ModelOp, NodeDesiredDeployment,
-    NodeTrafficCycleKind, PgStore, PingProbeReportRequest, PingProbeSample, PingProbeSettings,
-    PingProbeTarget, ProbeTransport, ProvisionNodeRequest, PublicIpObservationOutcome,
-    PutStepRequest, RegisterWarpBindingRequest, RemoveRetiredNodesRequest,
-    RemoveWarpBindingRequest, ReportedNodeState, SetUserAppQuotaRequest, SetUserPasswordRequest,
-    StepAcceptRequest, StoreError, TargetApplyResult, TargetConvergenceReport, TransportRequest,
-    UpdateAgentLogDefaultRequest, UpdateNodeLogPolicyRequest, UpdateNodeRequest,
-    UpdateNodeTrafficRequest, UpdateRealtimeTelemetryPolicyRequest, UpdateUserProfileRequest,
-    UpdateUserStatusRequest, UpdateWarpBindingRequest, UpsertExternalOutboundRequest, UsageCounter,
-    UsageReportRequest, UserAccountType, VerifyDeploymentRequest, WiresRequest, XrayBuildInfo,
-    XrayReleaseArtifact, XrayReleaseOutcome, XrayReleaseReport, XrayReleaseStatus,
-    XrayReleaseTargetStatus, ENROLLMENT_TOKEN_PREFIX, NODE_TOKEN_PREFIX,
+    NodeTrafficCycleKind, PgStore, PingProbeFamily, PingProbeKind, PingProbeReportRequest,
+    PingProbeSample, PingProbeSettings, PingProbeSkipReason, PingProbeTarget, ProbeTransport,
+    ProvisionNodeRequest, PublicIpObservationOutcome, PutStepRequest, RegisterWarpBindingRequest,
+    RemoveRetiredNodesRequest, RemoveWarpBindingRequest, ReportedNodeState, SetUserAppQuotaRequest,
+    SetUserPasswordRequest, StepAcceptRequest, StoreError, TargetApplyResult,
+    TargetConvergenceReport, TransportRequest, UpdateAgentLogDefaultRequest,
+    UpdateNodeLogPolicyRequest, UpdateNodeRequest, UpdateNodeTrafficRequest,
+    UpdateRealtimeTelemetryPolicyRequest, UpdateUserProfileRequest, UpdateUserStatusRequest,
+    UpdateWarpBindingRequest, UpsertExternalOutboundRequest, UsageCounter, UsageReportRequest,
+    UserAccountType, UserDirectLoginRequest, UserPresenceState, VerifyDeploymentRequest,
+    WiresRequest, XrayBuildInfo, XrayReleaseArtifact, XrayReleaseOutcome, XrayReleaseReport,
+    XrayReleaseStatus, XrayReleaseTargetStatus, ENROLLMENT_TOKEN_PREFIX, NODE_TOKEN_PREFIX,
 };
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
@@ -2474,6 +2476,8 @@ async fn deployment_schema_matches_convergence_design() {
     assert_table_exists(db.pool(), "node_ping_probe_samples").await;
     assert_column_exists(db.pool(), "node_ping_probe_samples", "node_id").await;
     assert_column_exists(db.pool(), "node_ping_probe_samples", "target").await;
+    assert_column_exists(db.pool(), "node_ping_probe_samples", "family").await;
+    assert_column_exists(db.pool(), "node_ping_probe_samples", "skip_reason").await;
     assert_column_exists(db.pool(), "node_ping_probe_samples", "probed_at").await;
     assert_column_exists(db.pool(), "node_ping_probe_samples", "attempted").await;
     assert_column_exists(db.pool(), "node_ping_probe_samples", "latency_us").await;
@@ -2649,11 +2653,15 @@ async fn tcp_and_icmp_probe_samples_share_one_round_without_fabricating_loss() {
                 targets: vec![
                     PingProbeTarget {
                         name: "TCP".to_owned(),
-                        address: "tcp://192.0.2.1:443".to_owned(),
+                        kind: PingProbeKind::Tcp,
+                        ipv4: Some("192.0.2.1:443".to_owned()),
+                        ipv6: None,
                     },
                     PingProbeTarget {
                         name: "ICMP".to_owned(),
-                        address: "icmp://[2001:db8::1]".to_owned(),
+                        kind: PingProbeKind::Icmp,
+                        ipv4: None,
+                        ipv6: Some("2001:db8::1".to_owned()),
                     },
                 ],
                 interval_secs: 5,
@@ -2675,14 +2683,18 @@ async fn tcp_and_icmp_probe_samples_share_one_round_without_fabricating_loss() {
                 samples: vec![
                     PingProbeSample {
                         target: "tcp://192.0.2.1:443".to_owned(),
+                        family: Some(PingProbeFamily::Ipv4),
                         attempted: true,
                         latency_us: Some(37_250),
+                        skip_reason: None,
                     },
-                    // No usable IPv6 route/socket is an observation gap, not an attempted timeout.
+                    // No usable IPv6 route is an observation gap, not an attempted timeout.
                     PingProbeSample {
                         target: "icmp://[2001:db8::1]".to_owned(),
+                        family: Some(PingProbeFamily::Ipv6),
                         attempted: false,
                         latency_us: None,
+                        skip_reason: Some(PingProbeSkipReason::NoRoute),
                     },
                 ],
             },
@@ -2697,10 +2709,20 @@ async fn tcp_and_icmp_probe_samples_share_one_round_without_fabricating_loss() {
         .await
         .unwrap();
     assert_eq!(view.targets.len(), 2);
-    assert_eq!(view.targets[0].samples[0].latency_us, Some(37_250));
-    assert!(view.targets[0].samples[0].attempted);
-    assert_eq!(view.targets[1].samples[0].latency_us, None);
-    assert!(!view.targets[1].samples[0].attempted);
+    let tcp = view.targets[0].ipv4.as_ref().unwrap();
+    assert_eq!(tcp.samples[0].latency_us, Some(37_250));
+    assert!(tcp.samples[0].attempted);
+    assert!(
+        view.targets[0].ipv6.is_none(),
+        "an unconfigured family has no series"
+    );
+    let icmp = view.targets[1].ipv6.as_ref().unwrap();
+    assert_eq!(icmp.samples[0].latency_us, None);
+    assert!(!icmp.samples[0].attempted);
+    assert_eq!(
+        icmp.samples[0].skip_reason,
+        Some(PingProbeSkipReason::NoRoute)
+    );
 
     let exact = db
         .store
@@ -2708,8 +2730,9 @@ async fn tcp_and_icmp_probe_samples_share_one_round_without_fabricating_loss() {
         .await
         .unwrap();
     assert_eq!(exact.targets.len(), 2);
-    assert_eq!(exact.targets[0].samples.len(), 1);
-    assert_eq!(exact.targets[0].samples[0].latency_us, Some(37_250));
+    let exact_tcp = exact.targets[0].ipv4.as_ref().unwrap();
+    assert_eq!(exact_tcp.samples.len(), 1);
+    assert_eq!(exact_tcp.samples[0].latency_us, Some(37_250));
 
     let latest = db
         .store
@@ -2723,11 +2746,26 @@ async fn tcp_and_icmp_probe_samples_share_one_round_without_fabricating_loss() {
         .find(|node| node.node_id == "n1")
         .unwrap();
     assert_eq!(node.targets.len(), 2);
-    assert_eq!(
-        node.targets[0].latest.as_ref().unwrap().latency_us,
-        Some(37_250)
-    );
-    assert!(!node.targets[1].latest.as_ref().unwrap().attempted);
+    let tcp_latest = |node: &brocade_deployment::protocol::NodePingProbeLatestView| {
+        node.targets[0]
+            .ipv4
+            .as_ref()
+            .unwrap()
+            .latest
+            .clone()
+            .unwrap()
+    };
+    let icmp_latest = |node: &brocade_deployment::protocol::NodePingProbeLatestView| {
+        node.targets[1]
+            .ipv6
+            .as_ref()
+            .unwrap()
+            .latest
+            .clone()
+            .unwrap()
+    };
+    assert_eq!(tcp_latest(node).latency_us, Some(37_250));
+    assert!(!icmp_latest(node).attempted);
 
     db.store
         .record_ping_probe(
@@ -2736,8 +2774,10 @@ async fn tcp_and_icmp_probe_samples_share_one_round_without_fabricating_loss() {
                 probed_at_unix_secs: now + 1,
                 samples: vec![PingProbeSample {
                     target: "tcp://192.0.2.1:443".to_owned(),
+                    family: Some(PingProbeFamily::Ipv4),
                     attempted: true,
                     latency_us: Some(12_500),
+                    skip_reason: None,
                 }],
             },
         )
@@ -2754,12 +2794,12 @@ async fn tcp_and_icmp_probe_samples_share_one_round_without_fabricating_loss() {
         .find(|node| node.node_id == "n1")
         .unwrap();
     assert_eq!(
-        node.targets[0].latest.as_ref().unwrap().latency_us,
+        tcp_latest(node).latency_us,
         Some(12_500),
-        "each target must independently select its newest sample"
+        "each series must independently select its newest sample"
     );
     assert_eq!(
-        node.targets[1].latest.as_ref().unwrap().probed_at_unix_secs,
+        icmp_latest(node).probed_at_unix_secs,
         now,
         "a newer TCP sample must not hide the latest ICMP sample"
     );
@@ -2770,10 +2810,12 @@ async fn tcp_and_icmp_probe_samples_share_one_round_without_fabricating_loss() {
         .await
         .unwrap();
     assert!(
-        before_sample
-            .targets
-            .iter()
-            .all(|target| target.samples.is_empty()),
+        before_sample.targets.iter().all(|target| {
+            [&target.ipv4, &target.ipv6]
+                .into_iter()
+                .flatten()
+                .all(|series| series.samples.is_empty())
+        }),
         "an absolute history request must not fall back to a recent window"
     );
 
@@ -2785,8 +2827,10 @@ async fn tcp_and_icmp_probe_samples_share_one_round_without_fabricating_loss() {
                 probed_at_unix_secs: now + 2,
                 samples: vec![PingProbeSample {
                     target: "icmp://[2001:db8::1]".to_owned(),
+                    family: Some(PingProbeFamily::Ipv6),
                     attempted: false,
                     latency_us: Some(1),
+                    skip_reason: None,
                 }],
             },
         )
@@ -2795,11 +2839,31 @@ async fn tcp_and_icmp_probe_samples_share_one_round_without_fabricating_loss() {
         matches!(invalid, Err(StoreError::InvalidData(_))),
         "an unattempted sample must not smuggle in a latency"
     );
+    let invalid = db
+        .store
+        .record_ping_probe(
+            "n1",
+            PingProbeReportRequest {
+                probed_at_unix_secs: now + 3,
+                samples: vec![PingProbeSample {
+                    target: "tcp://192.0.2.1:443".to_owned(),
+                    family: Some(PingProbeFamily::Ipv4),
+                    attempted: true,
+                    latency_us: Some(1),
+                    skip_reason: Some(PingProbeSkipReason::NoRoute),
+                }],
+            },
+        )
+        .await;
+    assert!(
+        matches!(invalid, Err(StoreError::InvalidData(_))),
+        "an attempted sample cannot also say why it was not attempted"
+    );
 
     sqlx::query(
         "INSERT INTO node_ping_probe_samples
-            (node_id, target, probed_at, attempted, latency_us)
-         VALUES ('n1', 'tcp://1.1.1.1:443', now() - interval '8 days', TRUE, 1000)",
+            (node_id, target, family, probed_at, attempted, latency_us)
+         VALUES ('n1', 'tcp://1.1.1.1:443', 'ipv4', now() - interval '8 days', TRUE, 1000)",
     )
     .execute(db.pool())
     .await
@@ -2813,6 +2877,100 @@ async fn tcp_and_icmp_probe_samples_share_one_round_without_fabricating_loss() {
     .await
     .unwrap();
     assert!(retained > 0, "retention must keep the current probe round");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn dual_stack_series_stay_apart_and_legacy_samples_need_a_literal_family() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    // Settings saved before dual-stack probing are read as dual-stack targets.
+    sqlx::query(
+        "UPDATE control_state
+            SET ping_probe_targets = '[{\"name\": \"Google\", \"address\": \"tcp://www.google.com:443\"},
+                                       {\"name\": \"CF\", \"address\": \"icmp://1.1.1.1\"}]'::jsonb
+          WHERE id = TRUE",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let settings = db.store.ping_probe_settings().await.unwrap();
+    assert_eq!(settings.targets[0].kind, PingProbeKind::Tcp);
+    assert_eq!(
+        settings.targets[0].ipv4.as_deref(),
+        Some("www.google.com:443")
+    );
+    assert_eq!(
+        settings.targets[0].ipv6.as_deref(),
+        Some("www.google.com:443")
+    );
+    assert_eq!(settings.targets[1].ipv4.as_deref(), Some("1.1.1.1"));
+    assert_eq!(settings.targets[1].ipv6, None);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let sample = |target: &str, family, latency_us| PingProbeSample {
+        target: target.to_owned(),
+        family,
+        attempted: true,
+        latency_us: Some(latency_us),
+        skip_reason: None,
+    };
+    let report = db
+        .store
+        .record_ping_probe(
+            "n1",
+            PingProbeReportRequest {
+                probed_at_unix_secs: now,
+                samples: vec![
+                    sample(
+                        "tcp://www.google.com:443",
+                        Some(PingProbeFamily::Ipv4),
+                        2_700,
+                    ),
+                    sample(
+                        "tcp://www.google.com:443",
+                        Some(PingProbeFamily::Ipv6),
+                        3_100,
+                    ),
+                    // An older Agent: the IP literal fixes the family.
+                    sample("icmp://1.1.1.1", None, 1_800),
+                    // An older Agent probing a domain: either family may have answered.
+                    sample("tcp://www.google.com:443", None, 2_900),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.accepted_samples, 3);
+    assert_eq!(report.unknown_targets, 1);
+
+    let view = db
+        .store
+        .node_ping_probe_view(&system_admin(), "n1", 3_600)
+        .await
+        .unwrap();
+    let google = &view.targets[0];
+    assert_eq!(
+        google.ipv4.as_ref().unwrap().samples[0].latency_us,
+        Some(2_700)
+    );
+    assert_eq!(
+        google.ipv6.as_ref().unwrap().samples[0].latency_us,
+        Some(3_100)
+    );
+    let cloudflare = &view.targets[1];
+    assert_eq!(
+        cloudflare.ipv4.as_ref().unwrap().samples[0].latency_us,
+        Some(1_800)
+    );
+    assert!(cloudflare.ipv6.is_none());
 }
 
 #[tokio::test]
@@ -3769,6 +3927,22 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
     assert!(first.usage.reset_at.ends_with("+08:00"));
     assert!(first.content.contains("name: \"Main Chain\""));
     assert!(first.content.contains("# Brocade · SubBoost 标准版"));
+    let native = db
+        .store
+        .shadowrocket_subscription_by_uuid_filtered(
+            uuid,
+            brocade_core::physical::user::SubscriptionFilter::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        native.format,
+        brocade_store::DynamicSubscriptionFormat::Shadowrocket
+    );
+    assert_eq!(native.usage, first.usage);
+    assert_eq!(native.revision, first.revision);
+    assert_eq!(native.uuid, first.uuid);
+    assert!(native.content.contains("vless://"));
 
     let before_client: (i64, i64) = sqlx::query_as(
         "SELECT client_snapshot_id, generation
@@ -3885,6 +4059,15 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
     .unwrap();
     assert!(matches!(
         db.store.clash_subscription_by_uuid(uuid).await,
+        Err(StoreError::Unavailable(_))
+    ));
+    assert!(matches!(
+        db.store
+            .shadowrocket_subscription_by_uuid_filtered(
+                uuid,
+                brocade_core::physical::user::SubscriptionFilter::default(),
+            )
+            .await,
         Err(StoreError::Unavailable(_))
     ));
     sqlx::query("DELETE FROM node_applied_state WHERE node_id = 'n1'")
@@ -4140,10 +4323,13 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
                 local_reconcile: Some(reconcile.clone()),
                 wireguard_health: Some(wireguard_health.clone()),
                 traffic: None,
+                online_sources: None,
                 spool: SpoolBacklog {
                     observation: 3,
                     usage: 41,
                     dropped: 1_480,
+                    usage_dropped: Some(1_400),
+                    observation_dropped: Some(80),
                 },
             },
         )
@@ -4177,10 +4363,9 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
     assert_eq!(stored, versions);
     let spool: SpoolBacklog =
         serde_json::from_value(row.try_get("spool_backlog").unwrap()).unwrap();
-    assert_eq!(
-        spool.dropped, 1_480,
-        "累计丢弃是唯一一个「非零即有账永久丢了」的量"
-    );
+    assert_eq!(spool.dropped, 1_480);
+    assert_eq!(spool.usage_dropped, Some(1_400));
+    assert_eq!(spool.observation_dropped, Some(80));
     let kept: LocalReconcileReport =
         serde_json::from_value(row.try_get("last_local_reconcile").unwrap()).unwrap();
     assert_eq!(kept, reconcile);
@@ -4216,10 +4401,13 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
                 local_reconcile: None,
                 wireguard_health: None,
                 traffic: None,
+                online_sources: None,
                 spool: SpoolBacklog {
                     observation: 0,
                     usage: 0,
                     dropped: 1_480,
+                    usage_dropped: Some(1_400),
+                    observation_dropped: Some(80),
                 },
             },
         )
@@ -4266,7 +4454,7 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn xray_release_canaries_halts_retries_and_fences_old_reports() {
+async fn xray_release_approves_all_targets_halts_retries_and_fences_old_reports() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -4327,9 +4515,7 @@ async fn xray_release_canaries_halts_retries_and_fences_old_reports() {
         idempotency_key: "xray-release-test-1".to_owned(),
         release_id: build_id.clone(),
         nodes: vec!["n1".to_owned(), "n2".to_owned()],
-        canary_node: "n2".to_owned(),
-        batch_size: 10,
-        note: Some("canary the embedded Xray".to_owned()),
+        note: Some("replace the embedded Xray".to_owned()),
     };
     let build = XrayBuildInfo {
         release_id: &build_id,
@@ -4373,14 +4559,14 @@ async fn xray_release_canaries_halts_retries_and_fences_old_reports() {
     .execute(db.pool())
     .await
     .unwrap();
-    let mut stopped_canary_request = request.clone();
-    stopped_canary_request.idempotency_key = "xray-release-stopped-canary".to_owned();
-    let stopped_canary = db
+    let mut stopped_target_request = request.clone();
+    stopped_target_request.idempotency_key = "xray-release-stopped-target".to_owned();
+    let stopped_target = db
         .store
-        .create_xray_release(&system_admin(), stopped_canary_request, build)
+        .create_xray_release(&system_admin(), stopped_target_request, build)
         .await
         .unwrap_err();
-    assert!(matches!(stopped_canary, StoreError::InvalidData(_)));
+    assert!(matches!(stopped_target, StoreError::InvalidData(_)));
     sqlx::query(
         "UPDATE node_agent_state
             SET runtime_versions = jsonb_set(
@@ -4399,10 +4585,8 @@ async fn xray_release_canaries_halts_retries_and_fences_old_reports() {
         .create_xray_release(&system_admin(), request.clone(), build)
         .await
         .unwrap();
-    assert_eq!(created.targets[0].node_id, "n2");
-    assert_eq!(created.targets[0].wave, 1);
-    assert_eq!(created.targets[1].node_id, "n1");
-    assert_eq!(created.targets[1].wave, 2);
+    assert_eq!(created.targets[0].node_id, "n1");
+    assert_eq!(created.targets[1].node_id, "n2");
 
     let reused = db
         .store
@@ -4429,21 +4613,23 @@ async fn xray_release_canaries_halts_retries_and_fences_old_reports() {
         .await
         .unwrap_err();
     assert!(matches!(conflict, StoreError::Conflict(_)));
-    assert!(db
+    let first = db
         .store
         .claim_xray_release("n1", "x86_64", &build_id)
         .await
         .unwrap()
-        .is_none());
+        .unwrap();
+    assert_eq!(first.previous_sha256, old_n1);
+    assert_eq!(first.sha256, desired);
 
-    let canary = db
+    let second = db
         .store
         .claim_xray_release("n2", "x86_64", &build_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(canary.previous_sha256, old_n2);
-    assert_eq!(canary.sha256, desired);
+    assert_eq!(second.previous_sha256, old_n2);
+    assert_eq!(second.sha256, desired);
     assert!(db
         .store
         .report_xray_release(
@@ -4462,19 +4648,6 @@ async fn xray_release_canaries_halts_retries_and_fences_old_reports() {
         .await
         .unwrap());
 
-    let expanded = db
-        .store
-        .confirm_xray_release(&system_admin(), created.id, &build_id)
-        .await
-        .unwrap();
-    assert_eq!(expanded.confirmed_wave, 2);
-    let second = db
-        .store
-        .claim_xray_release("n1", "x86_64", &build_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(second.previous_sha256, old_n1);
     let false_recovery = db
         .store
         .report_xray_release(
@@ -4540,7 +4713,7 @@ async fn xray_release_canaries_halts_retries_and_fences_old_reports() {
         .remove(0);
     assert_eq!(halted.status, XrayReleaseStatus::Halted);
     assert_eq!(
-        halted.targets[1].status,
+        halted.targets[0].status,
         XrayReleaseTargetStatus::FailedRecovered
     );
     assert!(db
@@ -4556,7 +4729,7 @@ async fn xray_release_canaries_halts_retries_and_fences_old_reports() {
         .await
         .unwrap();
     assert_eq!(retried.status, XrayReleaseStatus::Running);
-    assert_eq!(retried.targets[1].attempt, 2);
+    assert_eq!(retried.targets[0].attempt, 2);
     let retry_offer = db
         .store
         .claim_xray_release("n1", "x86_64", &build_id)
@@ -4615,10 +4788,6 @@ async fn xray_release_canaries_halts_retries_and_fences_old_reports() {
     assert!(finished
         .events
         .iter()
-        .any(|event| event.kind == "wave-confirmed"));
-    assert!(finished
-        .events
-        .iter()
         .any(|event| event.kind == "target-retried"));
     assert!(finished
         .events
@@ -4644,11 +4813,9 @@ async fn xray_release_canaries_halts_retries_and_fences_old_reports() {
         .create_xray_release(
             &system_admin(),
             CreateXrayReleaseRequest {
-                idempotency_key: "xray-release-test-noop-canary".to_owned(),
+                idempotency_key: "xray-release-test-noop-current".to_owned(),
                 release_id: build_id.clone(),
                 nodes: vec!["n2".to_owned()],
-                canary_node: "n2".to_owned(),
-                batch_size: 10,
                 note: None,
             },
             build,
@@ -4665,8 +4832,6 @@ async fn xray_release_canaries_halts_retries_and_fences_old_reports() {
                 idempotency_key: "xray-release-test-cancel-race".to_owned(),
                 release_id: build_id.clone(),
                 nodes: vec!["n1".to_owned()],
-                canary_node: "n1".to_owned(),
-                batch_size: 10,
                 note: None,
             },
             build,
@@ -4721,11 +4886,9 @@ async fn xray_release_canaries_halts_retries_and_fences_old_reports() {
         .create_xray_release(
             &system_admin(),
             CreateXrayReleaseRequest {
-                idempotency_key: "xray-release-test-real-canary".to_owned(),
+                idempotency_key: "xray-release-test-real-replacement".to_owned(),
                 release_id: build_id.clone(),
                 nodes: vec!["n1".to_owned()],
-                canary_node: "n1".to_owned(),
-                batch_size: 10,
                 note: None,
             },
             build,
@@ -4837,8 +5000,6 @@ async fn xray_release_canaries_halts_retries_and_fences_old_reports() {
                 idempotency_key: "xray-release-test-corrected-arch".to_owned(),
                 release_id: build_id.clone(),
                 nodes: vec!["n1".to_owned()],
-                canary_node: "n1".to_owned(),
-                batch_size: 10,
                 note: None,
             },
             build,
@@ -4909,10 +5070,13 @@ async fn delayed_runtime_report_cannot_overwrite_a_newer_snapshot() {
         local_reconcile: None,
         wireguard_health: None,
         traffic: None,
+        online_sources: None,
         spool: SpoolBacklog {
             observation: 0,
             usage: 0,
             dropped: 0,
+            usage_dropped: Some(0),
+            observation_dropped: Some(0),
         },
     };
 
@@ -4931,6 +5095,477 @@ async fn delayed_runtime_report_cannot_overwrite_a_newer_snapshot() {
             .await
             .unwrap();
     assert_eq!(stored["agent"], "new");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    db.store.issue_node_token("n1").await.unwrap();
+
+    fn report(
+        observed_at_unix_secs: i64,
+        online_sources: Option<Vec<UserOnlineSources>>,
+    ) -> NodeRuntimeReport {
+        NodeRuntimeReport {
+            observed_at_unix_secs,
+            certificate: Default::default(),
+            versions: NodeVersions {
+                agent: "online-source-test".to_owned(),
+                xray: None,
+                xray_installed_sha256: None,
+                xray_running_sha256: None,
+                phantun: None,
+                openvpn: None,
+                vpngate_catalog_probe_workers: None,
+                wg_tools: None,
+                wg_backend: None,
+            },
+            geodata: None,
+            local_reconcile: None,
+            wireguard_health: None,
+            traffic: None,
+            online_sources,
+            spool: SpoolBacklog {
+                observation: 0,
+                usage: 0,
+                dropped: 0,
+                usage_dropped: Some(0),
+                observation_dropped: Some(0),
+            },
+        }
+    }
+
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let initial = vec![UserOnlineSources {
+        label: "alice@platform.acme#ing-a1b2".to_owned(),
+        sources: vec![
+            OnlineSource {
+                ip: "1.1.1.1".to_owned(),
+                last_seen_unix_secs: now,
+                protocols: Some(vec![
+                    brocade_deployment::protocol::OnlineSourceProtocol::Vless,
+                ]),
+            },
+            OnlineSource {
+                ip: "1.1.1.1".to_owned(),
+                last_seen_unix_secs: now,
+                protocols: Some(vec![
+                    brocade_deployment::protocol::OnlineSourceProtocol::AnyTls,
+                ]),
+            },
+            OnlineSource {
+                ip: "2606:4700:4700::1111".to_owned(),
+                last_seen_unix_secs: now,
+                protocols: None,
+            },
+            OnlineSource {
+                ip: "192.168.1.20".to_owned(),
+                last_seen_unix_secs: now,
+                protocols: None,
+            },
+        ],
+    }];
+    db.store
+        .record_node_runtime("n1", &report(now, Some(initial)))
+        .await
+        .unwrap();
+
+    let raw_ips: Vec<String> = sqlx::query_scalar(
+        "SELECT host(source_ip)
+           FROM user_online_sources
+          WHERE active
+          ORDER BY host(source_ip)",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        raw_ips,
+        ["1.1.1.1".to_owned(), "2606:4700:4700::1111".to_owned()],
+        "public source addresses must be stored verbatim and deduplicated"
+    );
+
+    let presence = db.store.list_user_presence(&system_admin()).await.unwrap();
+    let alice = presence
+        .users
+        .iter()
+        .find(|user| user.tenant_id == "platform.acme" && user.user_id == "alice")
+        .unwrap();
+    assert_eq!(alice.state, UserPresenceState::Complete);
+    assert_eq!(alice.expected_nodes, 1);
+    assert_eq!(alice.reporting_nodes, 1);
+    assert_eq!(alice.sources.len(), 2);
+    let v4 = alice
+        .sources
+        .iter()
+        .find(|source| source.ip == "1.1.1.1")
+        .unwrap();
+    assert_eq!(
+        v4.accesses,
+        vec![brocade_store::UserOnlineSourceAccess {
+            node_id: "n1".to_owned(),
+            ingress_id: "ing-a1b2".to_owned(),
+            protocols: Some(vec![
+                brocade_deployment::protocol::OnlineSourceProtocol::Vless,
+                brocade_deployment::protocol::OnlineSourceProtocol::AnyTls,
+            ]),
+        }]
+    );
+    let v4_accesses = v4.accesses.clone();
+    assert_eq!(
+        alice
+            .sources
+            .iter()
+            .find(|source| source.ip.contains(':'))
+            .unwrap()
+            .accesses[0]
+            .protocols,
+        None
+    );
+    let current_only = db
+        .store
+        .user_online_source_history(&system_admin(), "platform.acme", "alice")
+        .await
+        .unwrap();
+    assert!(
+        current_only.sources.is_empty(),
+        "currently online addresses must not be duplicated in history"
+    );
+    let outside_scope = db
+        .store
+        .user_online_source_history(&tenant_admin("other"), "platform.acme", "alice")
+        .await
+        .unwrap_err();
+    assert!(matches!(outside_scope, StoreError::Forbidden(_)));
+
+    let reported_at: String = sqlx::query_scalar(
+        "SELECT online_sources_reported_at::text FROM node_agent_state WHERE node_id = 'n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    db.store
+        .record_node_runtime("n1", &report(now + 1, None))
+        .await
+        .unwrap();
+    let unchanged_reported_at: String = sqlx::query_scalar(
+        "SELECT online_sources_reported_at::text FROM node_agent_state WHERE node_id = 'n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(unchanged_reported_at, reported_at);
+    let active_after_unavailable: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM user_online_sources WHERE active")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        active_after_unavailable, 2,
+        "None must not fabricate an offline event"
+    );
+
+    db.store
+        .record_node_runtime("n1", &report(now + 2, Some(Vec::new())))
+        .await
+        .unwrap();
+    let presence = db.store.list_user_presence(&system_admin()).await.unwrap();
+    let alice = presence
+        .users
+        .iter()
+        .find(|user| user.tenant_id == "platform.acme" && user.user_id == "alice")
+        .unwrap();
+    assert_eq!(alice.state, UserPresenceState::Complete);
+    assert!(
+        alice.sources.is_empty(),
+        "an empty successful snapshot means zero online sources"
+    );
+    let history = db
+        .store
+        .user_online_source_history(&system_admin(), "platform.acme", "alice")
+        .await
+        .unwrap();
+    assert_eq!(history.retention_days, 30);
+    assert_eq!(
+        history
+            .sources
+            .iter()
+            .find(|source| source.ip == "1.1.1.1")
+            .unwrap()
+            .accesses,
+        v4_accesses
+    );
+    assert!(!history.truncated);
+    assert_eq!(
+        history
+            .sources
+            .iter()
+            .map(|source| source.ip.as_str())
+            .collect::<Vec<_>>(),
+        ["1.1.1.1", "2606:4700:4700::1111"]
+    );
+    sqlx::query(
+        "UPDATE user_online_sources
+            SET active = TRUE,
+                first_observed_at = now() - interval '31 days',
+                last_observed_at = now() - interval '31 days',
+                xray_last_seen_at = now() - interval '31 days',
+                offline_at = NULL
+          WHERE source_ip = '1.1.1.1'::inet",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(db.store.prune_user_online_sources(30).await.unwrap(), 1);
+    let expired_ip_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM user_online_sources WHERE source_ip = '1.1.1.1'::inet
+         )",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        !expired_ip_exists,
+        "a stale active row must not outlive the history retention window"
+    );
+
+    let stale = vec![UserOnlineSources {
+        label: "alice@platform.acme#ing-a1b2".to_owned(),
+        sources: vec![OnlineSource {
+            ip: "8.8.8.8".to_owned(),
+            last_seen_unix_secs: now + 1,
+            protocols: None,
+        }],
+    }];
+    db.store
+        .record_node_runtime("n1", &report(now + 1, Some(stale)))
+        .await
+        .unwrap();
+    let active_after_stale: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM user_online_sources WHERE active")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        active_after_stale, 0,
+        "an older report must not reactivate a source"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn online_sources_protocols_replace_per_node_and_ingress_without_inflating_counts() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO nodes (id, tenant_id, name, public_ipv4, overlay_addr,
+                            wg_private_key, wg_public_key, wg_listen_port, api_port,
+                            overlay, egress_allowed, dns_kind, dns_servers)
+         SELECT 'n2', tenant_id, 'Node 2', 'n2.example.net', '10.66.0.2',
+                'wg-private-2', 'wg-public-2', wg_listen_port, api_port,
+                overlay, egress_allowed, dns_kind, dns_servers FROM nodes WHERE id = 'n1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    for (id, node, port) in [("ing-c3d4", "n1", 8443), ("ing-e5f6", "n2", 443)] {
+        sqlx::query(
+            "INSERT INTO ingresses (id, app_id, chain_id, node_id, bind, port, transport_kind,
+                                    reality_private_key, reality_public_key, reality_short_ids,
+                                    reality_dest, reality_server_names, reality_flow, reality_fallback_mode)
+             SELECT $1, app_id, chain_id, $2, bind, $3, transport_kind,
+                    reality_private_key, reality_public_key, reality_short_ids,
+                    reality_dest, reality_server_names, reality_flow, reality_fallback_mode
+               FROM ingresses WHERE id = 'ing-a1b2'",
+        ).bind(id).bind(node).bind(port).execute(db.pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO grants (app_id, tenant_id, user_id, ingress_id)
+                     VALUES ('app-main', 'platform.acme', 'alice', $1)",
+        )
+        .bind(id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    for node in ["n1", "n2"] {
+        db.store.issue_node_token(node).await.unwrap();
+    }
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let snapshot = |at, entries: &[(&str, serde_json::Value)]| -> NodeRuntimeReport {
+        serde_json::from_value(json!({
+            "observed_at_unix_secs": at,
+            "certificate": {"t": "unmanaged"},
+            "versions": {"agent": "protocol-test", "xray": null, "phantun": null, "wg_tools": null, "wg_backend": null},
+            "spool": {"observation": 0, "usage": 0, "dropped": 0},
+            "online_sources": entries.iter().map(|(ingress, protocols)| json!({
+                "label": format!("alice@platform.acme#{ingress}"),
+                "sources": [{"ip": "1.1.1.1", "last_seen_unix_secs": at, "protocols": protocols}],
+            })).collect::<Vec<_>>()
+        })).unwrap()
+    };
+    db.store
+        .record_node_runtime(
+            "n1",
+            &snapshot(
+                now,
+                &[
+                    ("ing-a1b2", json!(["vless", "anytls"])),
+                    ("ing-c3d4", json!(["hysteria2"])),
+                    // An Agent must not attach its own protocol observations to another node's ingress.
+                    ("ing-e5f6", json!(["vless"])),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+    db.store
+        .record_node_runtime("n2", &snapshot(now, &[("ing-e5f6", json!(["anytls"]))]))
+        .await
+        .unwrap();
+    let current = db.store.list_user_presence(&system_admin()).await.unwrap();
+    let alice = current
+        .users
+        .iter()
+        .find(|user| user.user_id == "alice")
+        .unwrap();
+    assert_eq!(alice.sources.len(), 1);
+    assert_eq!(alice.sources[0].node_ids, ["n1", "n2"]);
+    assert_eq!(
+        serde_json::to_value(&alice.sources[0].accesses).unwrap(),
+        json!([
+            {"node_id": "n1", "ingress_id": "ing-a1b2", "protocols": ["vless", "anytls"]},
+            {"node_id": "n1", "ingress_id": "ing-c3d4", "protocols": ["hysteria2"]},
+            {"node_id": "n2", "ingress_id": "ing-e5f6", "protocols": ["anytls"]},
+        ])
+    );
+    // A newer snapshot replaces the protocol set, retires missing ingresses, and represents
+    // an older Agent/Xray explicitly as unknown rather than keeping stale protocol labels.
+    db.store
+        .record_node_runtime("n1", &snapshot(now + 1, &[("ing-a1b2", json!(["vless"]))]))
+        .await
+        .unwrap();
+    db.store
+        .record_node_runtime(
+            "n2",
+            &snapshot(now + 1, &[("ing-e5f6", serde_json::Value::Null)]),
+        )
+        .await
+        .unwrap();
+    let current = db.store.list_user_presence(&system_admin()).await.unwrap();
+    let alice = current
+        .users
+        .iter()
+        .find(|user| user.user_id == "alice")
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&alice.sources[0].accesses).unwrap(),
+        json!([
+            {"node_id": "n1", "ingress_id": "ing-a1b2", "protocols": ["vless"]},
+            {"node_id": "n2", "ingress_id": "ing-e5f6", "protocols": null},
+        ])
+    );
+    // A failed malformed snapshot rolls the whole transaction back, preserving current data.
+    assert!(db
+        .store
+        .record_node_runtime(
+            "n1",
+            &snapshot(now + 2, &[("ing-a1b2", json!(vec!["vless"; 9]))])
+        )
+        .await
+        .is_err());
+    let after = db.store.list_user_presence(&system_admin()).await.unwrap();
+    assert_eq!(after, current);
+    for invalid in [
+        json!([]),
+        json!({}),
+        json!(["tls"]),
+        json!(["vless", "vless", "vless", "vless", "vless"]),
+    ] {
+        assert!(
+            sqlx::query("UPDATE user_online_sources SET protocols = $1 WHERE active")
+                .bind(invalid)
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn online_sources_documented_compatibility_preserves_legacy_rows_and_is_repeatable() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let definition_sql = "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+                          WHERE conrelid = 'user_online_sources'::regclass
+                            AND conname = 'user_online_sources_protocols_shape'";
+    let expected: String = sqlx::query_scalar(definition_sql)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO user_online_sources
+                 (node_id, tenant_id, user_id, ingress_id, source_ip, first_observed_at,
+                  last_observed_at, xray_last_seen_at)
+                 VALUES ('n1', 'platform.acme', 'alice', 'ing-a1b2', '1.1.1.1', now(), now(), now())")
+        .execute(db.pool()).await.unwrap();
+    // Simulate the pre-feature schema only in this disposable PostgreSQL container.
+    sqlx::query("ALTER TABLE user_online_sources DROP COLUMN protocols")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let runbook = include_str!("../../../.agents/runbooks/console-deployment.md");
+    let section = runbook.split_once("### 在线来源协议字段兼容").unwrap().1;
+    let sql = section
+        .split_once("```sql\n")
+        .unwrap()
+        .1
+        .split_once("```")
+        .unwrap()
+        .0;
+    for _ in 0..2 {
+        sqlx::raw_sql(sql).execute(db.pool()).await.unwrap();
+    }
+    sqlx::query(
+        "ALTER TABLE user_online_sources VALIDATE CONSTRAINT user_online_sources_protocols_shape",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let actual: String = sqlx::query_scalar(definition_sql)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        actual, expected,
+        "manual compatibility must match the fresh-install constraint"
+    );
+    let unknown_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM user_online_sources WHERE protocols IS NULL")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        unknown_rows, 1,
+        "legacy sources must survive without invented protocol data"
+    );
 }
 
 /// A machine with no valid token may not write runtime state. The same gate as
@@ -4963,10 +5598,13 @@ async fn node_runtime_report_is_rejected_without_an_active_token() {
         local_reconcile: None,
         wireguard_health: None,
         traffic: None,
+        online_sources: None,
         spool: SpoolBacklog {
             observation: 0,
             usage: 0,
             dropped: 0,
+            usage_dropped: Some(0),
+            observation_dropped: Some(0),
         },
     };
 
@@ -5119,6 +5757,184 @@ async fn node_token_rotation_invalidates_previous_token() {
     .try_get("token_hash")
     .unwrap();
     assert_eq!(stored_hash, node_token_hash(&second.token));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn node_token_resign_replays_the_complete_successful_environment_until_it_converges() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    let old_token = db.store.issue_node_token("n1").await.unwrap();
+    let deployment = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "resign-environment-baseline"),
+        )
+        .await
+        .unwrap();
+    let initial = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut expected_environment = initial.desired.clone();
+    db.store
+        .report_target_result(applied_report(&initial))
+        .await
+        .unwrap();
+
+    // Land a later WireGuard-only release. Re-sign reconstruction must take WireGuard from this
+    // target while retaining Phantun, Xray, port hopping and grants from their own latest
+    // successful targets; taking one whole target would silently drop the other four dimensions.
+    let mut settings = db.store.settings().await.unwrap();
+    settings.overlay.mtu = settings.overlay.mtu.saturating_sub(1);
+    let changed = db
+        .store
+        .update_settings(&system_admin(), settings)
+        .await
+        .unwrap();
+    let wireguard_deployment = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(changed.revision_id, "resign-environment-narrow"),
+        )
+        .await
+        .unwrap();
+    let wireguard_only = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(wireguard_only.actions, vec![PlannedAction::ApplyWireGuard]);
+    expected_environment.wireguard = wireguard_only.desired.wireguard.clone();
+    db.store
+        .report_target_result(applied_report(&wireguard_only))
+        .await
+        .unwrap();
+    assert_eq!(
+        deployment_status(db.pool(), wireguard_deployment.deployment_id).await,
+        "succeeded"
+    );
+    assert!(db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .is_none());
+
+    let new_token = db.store.reissue_node_token("n1").await.unwrap();
+    assert!(db
+        .store
+        .authenticate_node_token(&old_token.token)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .store
+        .authenticate_node_token(&new_token.token)
+        .await
+        .unwrap()
+        .is_some());
+
+    let repair = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("a re-signed machine must receive its last applied environment");
+    assert_eq!(repair.deployment_id, deployment.deployment_id);
+    assert!(repair.claim_generation > 0);
+    assert_eq!(repair.desired, expected_environment);
+    assert!(repair.actions.iter().any(|action| matches!(
+        action,
+        PlannedAction::ApplyPhantun | PlannedAction::DisablePhantun
+    )));
+    assert!(repair.actions.iter().any(|action| matches!(
+        action,
+        PlannedAction::ApplyWireGuard | PlannedAction::DisableWireGuard
+    )));
+    assert!(repair.actions.iter().any(|action| matches!(
+        action,
+        PlannedAction::ApplyXray | PlannedAction::DisableXray
+    )));
+    assert!(repair.actions.iter().any(|action| matches!(
+        action,
+        PlannedAction::ApplyHy2PortHop | PlannedAction::DisableHy2PortHop
+    )));
+    if matches!(repair.desired.grants, DesiredGrants::Present { .. }) {
+        assert!(repair.actions.contains(&PlannedAction::SyncGrants));
+    }
+
+    let failed = db
+        .store
+        .report_target_result(failed_recovered_report(&repair))
+        .await
+        .unwrap();
+    assert_eq!(failed.target_status, "failed-recovered");
+    let retry = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("a failed re-sign repair must remain claimable");
+    assert_eq!(retry.claim_generation, repair.claim_generation);
+    assert_eq!(retry.desired, expected_environment);
+
+    db.store.reissue_node_token("n1").await.unwrap();
+    let replacement = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("a later re-sign must replace the earlier repair claim");
+    assert_ne!(replacement.claim_generation, retry.claim_generation);
+    assert!(matches!(
+        db.store.report_target_result(applied_report(&retry)).await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let applied = db
+        .store
+        .report_target_result(applied_report(&replacement))
+        .await
+        .unwrap();
+    assert_eq!(applied.target_status, "succeeded");
+    assert!(db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .is_none());
+    let aligned = sqlx::query(
+        "SELECT phantun_state, wireguard_state, xray_state, hy2_port_hop_state, grants_state,
+                wireguard_observed->>'reconcile' AS reconcile
+           FROM node_applied_state
+          WHERE node_id = 'n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    for field in [
+        "phantun_state",
+        "wireguard_state",
+        "xray_state",
+        "hy2_port_hop_state",
+        "grants_state",
+    ] {
+        assert_ne!(aligned.try_get::<String, _>(field).unwrap(), "unknown");
+    }
+    assert_eq!(
+        aligned.try_get::<Option<String>, _>("reconcile").unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -6943,6 +7759,184 @@ async fn user_login_is_bound_to_one_user_and_resets_in_place() {
     assert!(matches!(short, Err(StoreError::InvalidData(_))));
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn user_direct_login_requires_uuid_and_rotating_token_invalidates_the_old_page() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('customer.alpha', 'Customer Alpha')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let uuid = "2d2304da-f114-4574-8d44-625afdb1db5c";
+    sqlx::query(
+        "INSERT INTO users (tenant_id, id, uuid) VALUES ('customer.alpha', 'alice', $1::uuid)",
+    )
+    .bind(uuid)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let issued = db
+        .store
+        .issue_user_direct_login(&system_admin(), "customer.alpha", "alice")
+        .await
+        .unwrap();
+    assert_eq!(issued.uuid, uuid);
+    assert_eq!(issued.operator_id, "customer.alpha/alice");
+    assert!(issued.token.starts_with("broc_login_"));
+
+    let stored: (String, Option<String>) = sqlx::query_as(
+        "SELECT users.direct_login_token_hash, operator.password_hash
+         FROM users
+         JOIN admin_operators operator
+           ON operator.user_tenant_id = users.tenant_id AND operator.user_id = users.id
+         WHERE users.tenant_id = 'customer.alpha' AND users.id = 'alice'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_ne!(
+        stored.0, issued.token,
+        "the direct token must not be stored in plaintext"
+    );
+    assert_eq!(stored.0.len(), 64);
+    assert!(
+        stored.1.is_none(),
+        "issuing a direct page must not invent a password"
+    );
+
+    let listed = db
+        .store
+        .list_users(&system_admin(), Some("customer.alpha"), true)
+        .await
+        .unwrap();
+    assert!(!listed.users[0].login_enabled);
+    assert!(listed.users[0].direct_login_enabled);
+
+    let password_attempt = db
+        .store
+        .login_admin(AdminLoginRequest {
+            operator_id: issued.operator_id.clone(),
+            password: String::new(),
+        })
+        .await;
+    assert!(matches!(password_attempt, Err(StoreError::Unauthorized(_))));
+    assert!(db
+        .store
+        .authenticate_admin_token(&issued.token)
+        .await
+        .unwrap()
+        .is_none());
+
+    for request in [
+        UserDirectLoginRequest {
+            uuid: "00000000-0000-4000-8000-000000000000".to_owned(),
+            token: issued.token.clone(),
+        },
+        UserDirectLoginRequest {
+            uuid: issued.uuid.clone(),
+            token: "broc_login_wrong".to_owned(),
+        },
+    ] {
+        assert!(matches!(
+            db.store.login_user_direct(request).await,
+            Err(StoreError::Unauthorized(_))
+        ));
+    }
+
+    let session = db
+        .store
+        .login_user_direct(UserDirectLoginRequest {
+            uuid: issued.uuid.clone(),
+            token: issued.token.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(session.admin.role, AdminRole::User);
+    assert_eq!(
+        session.admin.self_user.as_ref().unwrap(),
+        &brocade_store::AuthenticatedUser {
+            tenant_id: "customer.alpha".to_owned(),
+            user_id: "alice".to_owned(),
+        }
+    );
+    assert!(db
+        .store
+        .authenticate_admin_session(&session.session.token)
+        .await
+        .unwrap()
+        .is_some());
+
+    let replacement = db
+        .store
+        .issue_user_direct_login(&system_admin(), "customer.alpha", "alice")
+        .await
+        .unwrap();
+    assert_ne!(replacement.token, issued.token);
+    assert!(matches!(
+        db.store
+            .login_user_direct(UserDirectLoginRequest {
+                uuid: issued.uuid,
+                token: issued.token,
+            })
+            .await,
+        Err(StoreError::Unauthorized(_))
+    ));
+    db.store
+        .login_user_direct(UserDirectLoginRequest {
+            uuid: replacement.uuid.clone(),
+            token: replacement.token.clone(),
+        })
+        .await
+        .unwrap();
+
+    let rotated = db
+        .store
+        .rotate_user_uuid(&system_admin(), "customer.alpha", "alice")
+        .await
+        .unwrap();
+    assert_ne!(rotated.user.uuid, replacement.uuid);
+    assert!(matches!(
+        db.store
+            .login_user_direct(UserDirectLoginRequest {
+                uuid: replacement.uuid,
+                token: replacement.token,
+            })
+            .await,
+        Err(StoreError::Unauthorized(_))
+    ));
+    assert!(
+        !db.store
+            .list_users(&system_admin(), Some("customer.alpha"), true)
+            .await
+            .unwrap()
+            .users[0]
+            .direct_login_enabled
+    );
+
+    db.store
+        .issue_user_direct_login(&system_admin(), "customer.alpha", "alice")
+        .await
+        .unwrap();
+
+    assert!(db
+        .store
+        .revoke_user_direct_login(&system_admin(), "customer.alpha", "alice")
+        .await
+        .unwrap());
+    assert!(
+        !db.store
+            .list_users(&system_admin(), Some("customer.alpha"), true)
+            .await
+            .unwrap()
+            .users[0]
+            .direct_login_enabled
+    );
+}
+
 /// Passwordless login is a named public surface, never a property that can be attached to an
 /// arbitrary operator or privileged role.
 #[tokio::test]
@@ -7859,16 +8853,37 @@ async fn tenant_scoped_plan_filters_outside_warnings() {
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
     insert_other_tenant_fixture(db.pool()).await;
-    sqlx::query("UPDATE steps SET rules = $1")
-        .bind(json!([
-            {
-                "m": { "t": "any" },
-                "a": { "t": "block" }
-            }
-        ]))
+    sqlx::query(
+        "INSERT INTO external_outbounds (
+            id, tenant_id, name, address, port, protocol, credential_sealed,
+            protocol_options, security
+         ) VALUES
+            ('vpngate-1111-1111', 'platform.acme', 'Acme VPN Gate',
+             'managed.vpngate.invalid', 1, 'vpngate', '',
+             '{\"country_code\":\"JP\",\"server_ids\":[],\"max_connect_ms\":15000,\"min_download_bps\":1000000,\"max_candidates\":16}'::jsonb,
+             '{\"t\":\"none\"}'::jsonb),
+            ('vpngate-2222-2222', 'platform.other', 'Other VPN Gate',
+             'managed.vpngate.invalid', 1, 'vpngate', '',
+             '{\"country_code\":\"US\",\"server_ids\":[],\"max_connect_ms\":15000,\"min_download_bps\":1000000,\"max_candidates\":16}'::jsonb,
+             '{\"t\":\"none\"}'::jsonb)",
+    )
         .execute(db.pool())
         .await
         .unwrap();
+    for (chain_id, outbound_id) in [
+        ("chn-a1b2-c3d4", "vpngate-1111-1111"),
+        ("c-other", "vpngate-2222-2222"),
+    ] {
+        sqlx::query("UPDATE steps SET rules = $1 WHERE chain_id = $2")
+            .bind(json!([{
+                "m": { "t": "any" },
+                "a": { "t": "proxy", "outbound": outbound_id }
+            }]))
+            .bind(chain_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
 
     let system_plan = db.store.plan_deployment(&system_admin(), 1).await.unwrap();
     assert!(system_plan
@@ -8183,8 +9198,6 @@ async fn retired_node_removal_is_atomic_and_cleans_chains_and_operational_state(
                 idempotency_key: "xray-lifecycle-removal".to_owned(),
                 release_id: xray_build_id.clone(),
                 nodes: vec!["n1".to_owned()],
-                canary_node: "n1".to_owned(),
-                batch_size: 10,
                 note: None,
             },
             XrayBuildInfo {
@@ -8835,7 +9848,7 @@ async fn deployment_base_revision_is_the_last_succeeded_of_the_same_kind() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn create_deployment_writes_compile_warnings() {
+async fn create_deployment_does_not_persist_compile_infos_as_warnings() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -8868,11 +9881,47 @@ async fn create_deployment_writes_compile_warnings() {
         .unwrap()
         .try_get("warnings")
         .unwrap();
-    assert!(warnings
+    assert!(!warnings
         .as_array()
         .unwrap()
         .iter()
         .any(|warning| warning["code"] == "node.dns-unused"));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn create_deployment_writes_compile_warnings() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query("UPDATE nodes SET domain_strategy = 'as_is' WHERE id = 'n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let result = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "deploy-warning"),
+        )
+        .await
+        .unwrap();
+
+    let warnings: serde_json::Value = sqlx::query("SELECT warnings FROM deployments WHERE id = $1")
+        .bind(result.deployment_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+        .try_get("warnings")
+        .unwrap();
+    assert!(warnings
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning["code"] == "node.dns-bypassed"));
 }
 
 #[tokio::test]
@@ -14159,6 +15208,65 @@ async fn halt_deployment_hides_desired_without_canceling_targets() {
     .try_get("status")
     .unwrap();
     assert_eq!(target_status, "pending");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn halted_deployment_accepts_an_in_flight_report_without_resuming_pending_work() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    insert_second_node(db.pool()).await;
+
+    let created = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "halt-in-flight-report"),
+        )
+        .await
+        .unwrap();
+    let in_flight = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("n1 should claim before the deployment is halted");
+    db.store
+        .halt_deployment(&system_admin(), created.deployment_id)
+        .await
+        .unwrap();
+
+    let result = db
+        .store
+        .report_target_result(applied_report(&in_flight))
+        .await
+        .expect("already-dispatched evidence must survive a temporary halt");
+    assert_eq!(result.target_status, "succeeded");
+    assert_eq!(result.deployment_status, "halted");
+    assert_eq!(
+        target_status(db.pool(), created.deployment_id, "n1").await,
+        "succeeded"
+    );
+    assert_eq!(
+        target_status(db.pool(), created.deployment_id, "n2").await,
+        "pending"
+    );
+    assert!(db
+        .store
+        .load_desired_for_node("n2")
+        .await
+        .unwrap()
+        .is_none());
+
+    let status: String = sqlx::query_scalar("SELECT status FROM deployments WHERE id = $1")
+        .bind(created.deployment_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(status, "halted", "在途成功不能擅自恢复后续下发");
 }
 
 #[tokio::test]
@@ -20855,4 +21963,451 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
     assert_eq!(after.total_bytes, "1073741944");
     assert!(after.has_gap, "a reboot after calibration remains visible");
     assert_eq!(after.last_gap_reason.as_deref(), Some("machine-reboot"));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn delayed_regrant_cannot_overtake_a_newer_revoke() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+    db.store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "review-delayed-regrant-base"),
+        )
+        .await
+        .unwrap();
+    let base = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    db.store
+        .report_target_result(applied_report(&base))
+        .await
+        .unwrap();
+
+    let grant = |enabled| CreateGrantRequest {
+        app_id: "app-main".to_owned(),
+        tenant_id: "platform.acme".to_owned(),
+        user_id: "alice".to_owned(),
+        ingress_id: "ing-a1b2".to_owned(),
+        enabled,
+        note: None,
+    };
+    db.store
+        .upsert_grant(&system_admin(), grant(false))
+        .await
+        .unwrap();
+    let revoke_order = db.store.process_grant_automation().await.unwrap();
+    assert!(revoke_order.deployment_id.is_some());
+
+    let regrant_revision = db
+        .store
+        .upsert_grant(&system_admin(), grant(true))
+        .await
+        .unwrap();
+    let blocked = db.store.process_grant_automation().await.unwrap();
+    assert!(blocked.waiting.is_some());
+    // Freeze the retry deadline so this ordering does not depend on CI machine speed.
+    sqlx::query("UPDATE jobs SET run_after = now() + interval '1 hour' WHERE status = 'queued' AND kind = 'grants-deployment'")
+        .execute(db.pool()).await.unwrap();
+
+    let revoke = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    db.store
+        .report_target_result(applied_report(&revoke))
+        .await
+        .unwrap();
+
+    // A third click revokes again while the older re-grant is still backing off.
+    let latest = db
+        .store
+        .upsert_grant(&system_admin(), grant(false))
+        .await
+        .unwrap();
+    let newest = db.store.process_grant_automation().await.unwrap();
+    assert_eq!(newest.revision_id, Some(latest.revision_id));
+    assert_eq!(
+        newest.deployment_id, None,
+        "the node already applied the first revoke"
+    );
+    assert_eq!(
+        serving_permissions_revision(db.pool()).await,
+        latest.revision_id
+    );
+
+    // The older deadline now expires, just as the 5-second production retry would.
+    sqlx::query(
+        "UPDATE jobs SET run_after = now() WHERE status = 'queued' AND kind = 'grants-deployment'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let late = db.store.process_grant_automation().await.unwrap();
+    if late.deployment_id.is_some() {
+        let unwanted = db
+            .store
+            .claim_desired_for_node("n1")
+            .await
+            .unwrap()
+            .unwrap();
+        let reenabled_alice = match &unwanted.desired.grants {
+            DesiredGrants::Present { inbounds } => inbounds
+                .iter()
+                .flat_map(|inbound| &inbound.clients)
+                .any(|client| client.email == "alice@platform.acme#ing-a1b2"),
+            _ => false,
+        };
+        db.store
+            .report_target_result(applied_report(&unwanted))
+            .await
+            .unwrap();
+        assert!(
+            !reenabled_alice,
+            "stale re-grant revision {} re-enabled Alice after newer revoke {}; serving is now {}",
+            regrant_revision.revision_id,
+            latest.revision_id,
+            serving_permissions_revision(db.pool()).await
+        );
+    }
+    assert_eq!(
+        serving_permissions_revision(db.pool()).await,
+        latest.revision_id
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn permission_retry_deadlines_do_not_partition_the_revision_queue() {
+    for delay_newest in [false, true] {
+        let Some(db) = TestPg::start_if_enabled().await else {
+            return;
+        };
+        db.store.migrate().await.unwrap();
+        insert_minimal_fixture(db.pool()).await;
+        store_current_model_snapshot(db.pool(), &db.store).await;
+        db.store
+            .create_deployment(
+                &system_admin(),
+                create_deployment_request(1, "retry-queue-base"),
+            )
+            .await
+            .unwrap();
+        let base = db
+            .store
+            .claim_desired_for_node("n1")
+            .await
+            .unwrap()
+            .unwrap();
+        db.store
+            .report_target_result(applied_report(&base))
+            .await
+            .unwrap();
+        let grant = |enabled| CreateGrantRequest {
+            app_id: "app-main".to_owned(),
+            tenant_id: "platform.acme".to_owned(),
+            user_id: "alice".to_owned(),
+            ingress_id: "ing-a1b2".to_owned(),
+            enabled,
+            note: None,
+        };
+        let older = db
+            .store
+            .upsert_grant(&system_admin(), grant(false))
+            .await
+            .unwrap();
+        let newest = db
+            .store
+            .upsert_grant(&system_admin(), grant(true))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET run_after = now() + interval '1 hour' WHERE kind = 'grants-deployment'")
+            .execute(db.pool()).await.unwrap();
+        assert_eq!(
+            db.store
+                .process_grant_automation()
+                .await
+                .unwrap()
+                .merged_jobs,
+            0,
+            "an entirely backed-off queue must not run on every wake"
+        );
+        let due = if delay_newest {
+            older.revision_id
+        } else {
+            newest.revision_id
+        };
+        sqlx::query("UPDATE jobs SET run_after = now() WHERE kind = 'grants-deployment' AND (payload->>'revision_id')::bigint = $1")
+            .bind(i64::try_from(due).unwrap()).execute(db.pool()).await.unwrap();
+        let batch = db.store.process_grant_automation().await.unwrap();
+        assert_eq!(batch.merged_jobs, 2);
+        assert_eq!(batch.revision_id, Some(newest.revision_id));
+        assert_eq!(
+            batch.deployment_id, None,
+            "the latest intent still matches the baseline"
+        );
+        assert_eq!(
+            serving_permissions_revision(db.pool()).await,
+            newest.revision_id
+        );
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM jobs WHERE kind = 'grants-deployment' AND status = 'queued'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            queued, 0,
+            "no historical retry may survive the newer intent"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn grants_order_recovery_is_idempotent_and_halted_orders_keep_jobs_pending() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+    db.store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "retry-recovery-base"),
+        )
+        .await
+        .unwrap();
+    let base = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    db.store
+        .report_target_result(applied_report(&base))
+        .await
+        .unwrap();
+    let grant = |enabled| CreateGrantRequest {
+        app_id: "app-main".to_owned(),
+        tenant_id: "platform.acme".to_owned(),
+        user_id: "alice".to_owned(),
+        ingress_id: "ing-a1b2".to_owned(),
+        enabled,
+        note: None,
+    };
+    db.store
+        .upsert_grant(&system_admin(), grant(false))
+        .await
+        .unwrap();
+    let first = db
+        .store
+        .process_grant_automation()
+        .await
+        .unwrap()
+        .deployment_id
+        .unwrap();
+    // Model a crash after committing the immutable order but before finishing its durable job.
+    sqlx::query("UPDATE jobs SET status = 'queued', run_after = now(), payload = payload - 'deployment_id' WHERE kind = 'grants-deployment'")
+        .execute(db.pool()).await.unwrap();
+    let restarted = PgStore::connect(&db.url).await.unwrap();
+    let recovered = restarted.process_grant_automation().await.unwrap();
+    assert_eq!(recovered.deployment_id, Some(first));
+    assert!(recovered.waiting.is_none());
+    let orders: i64 = sqlx::query_scalar("SELECT count(*) FROM deployments WHERE kind = 'grants'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(orders, 1);
+    db.store
+        .halt_deployment(&system_admin(), first)
+        .await
+        .unwrap();
+    let newest = db
+        .store
+        .upsert_grant(&system_admin(), grant(true))
+        .await
+        .unwrap();
+    let pending = restarted.process_grant_automation().await.unwrap();
+    assert_eq!(pending.revision_id, Some(newest.revision_id));
+    assert!(pending.waiting.is_some());
+    let status = db.store.grant_automation_status().await.unwrap();
+    assert_eq!(status.pending_jobs, 1);
+    assert_eq!(status.retrying_jobs, 0);
+    assert_eq!(serving_permissions_revision(db.pool()).await, 1);
+}
+
+async fn serving_permissions_revision(pool: &PgPool) -> u64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT permissions_revision_id FROM subscription_serving_state WHERE id = TRUE",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .try_into()
+    .unwrap()
+}
+
+// A re-grant planned while the revoke order was still unclaimed used to compare against n1's
+// pre-revoke report, find nothing to ship, and mark its revision serving; the revoke order then
+// landed over it and nothing queued the re-grant again.
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn regrant_waits_for_an_unsettled_revoke_order() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    store_current_model_snapshot(db.pool(), &db.store).await;
+
+    db.store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(1, "regrant-race-base"),
+        )
+        .await
+        .unwrap();
+    let base = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    db.store
+        .report_target_result(applied_report(&base))
+        .await
+        .unwrap();
+    let serving_before = serving_permissions_revision(db.pool()).await;
+    let probe_items_before = db
+        .store
+        .user_grant_probe_plan(&system_admin(), "platform.acme", "alice")
+        .await
+        .unwrap()
+        .items
+        .len();
+
+    let alice = |enabled: bool| CreateGrantRequest {
+        app_id: "app-main".to_owned(),
+        tenant_id: "platform.acme".to_owned(),
+        user_id: "alice".to_owned(),
+        ingress_id: "ing-a1b2".to_owned(),
+        enabled,
+        note: None,
+    };
+
+    let revoked = db
+        .store
+        .upsert_grant(&system_admin(), alice(false))
+        .await
+        .unwrap();
+    let revoke_order = db
+        .store
+        .process_grant_automation()
+        .await
+        .unwrap()
+        .deployment_id
+        .expect("the revoke becomes a grants order");
+
+    let regranted = db
+        .store
+        .upsert_grant(&system_admin(), alice(true))
+        .await
+        .unwrap();
+    let blocked = db.store.process_grant_automation().await.unwrap();
+    assert_eq!(blocked.deployment_id, None);
+    assert!(
+        blocked
+            .waiting
+            .as_deref()
+            .unwrap()
+            .contains(&format!("#{revoke_order}")),
+        "the job names the order it waits for: {blocked:?}"
+    );
+    assert_eq!(
+        serving_permissions_revision(db.pool()).await,
+        serving_before,
+        "a job waiting behind an order must not advance serving"
+    );
+    let (queued, attempts): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), COALESCE(max(attempts), 0)::bigint
+         FROM jobs WHERE kind = 'grants-deployment' AND status = 'queued'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(queued, 1);
+    assert_eq!(
+        attempts, 0,
+        "waiting behind an order is not a failed attempt"
+    );
+
+    let revoke = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("the revoke order is claimable");
+    assert_eq!(revoke.deployment_id, revoke_order);
+    db.store
+        .report_target_result(applied_report(&revoke))
+        .await
+        .unwrap();
+    assert_eq!(
+        serving_permissions_revision(db.pool()).await,
+        revoked.revision_id
+    );
+
+    sqlx::query(
+        "UPDATE jobs SET run_after = now()
+         WHERE kind = 'grants-deployment' AND status = 'queued'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let released = db.store.process_grant_automation().await.unwrap();
+    assert_eq!(released.revision_id, Some(regranted.revision_id));
+    assert!(released.waiting.is_none());
+    let regrant = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .expect("the re-grant ships once the revoke has landed");
+    assert_eq!(Some(regrant.deployment_id), released.deployment_id);
+    let DesiredGrants::Present { ref inbounds } = regrant.desired.grants else {
+        panic!("grants should be present");
+    };
+    assert!(inbounds
+        .iter()
+        .flat_map(|inbound| &inbound.clients)
+        .any(|client| client.email == "alice@platform.acme#ing-a1b2"));
+    db.store
+        .report_target_result(applied_report(&regrant))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        serving_permissions_revision(db.pool()).await,
+        regranted.revision_id
+    );
+    let probe_items_after = db
+        .store
+        .user_grant_probe_plan(&system_admin(), "platform.acme", "alice")
+        .await
+        .unwrap()
+        .items
+        .len();
+    assert_eq!(probe_items_after, probe_items_before);
 }

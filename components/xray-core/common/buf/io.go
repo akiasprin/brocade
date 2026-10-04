@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,50 +32,63 @@ type TimeoutReader interface {
 type TimeoutWrapperReader struct {
 	Reader
 	stats.Counter
+	readMu  sync.Mutex
+	pending *timeoutPendingRead
+}
+
+type timeoutPendingRead struct {
 	mb   MultiBuffer
 	err  error
 	done chan struct{}
 }
 
 func (r *TimeoutWrapperReader) ReadMultiBuffer() (MultiBuffer, error) {
-	if r.done != nil {
-		<-r.done
-		r.done = nil
-		if r.Counter != nil {
-			r.Counter.Add(int64(r.mb.Len()))
-		}
-		return r.mb, r.err
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+
+	if r.pending != nil {
+		pending := r.pending
+		<-pending.done
+		return r.takePendingRead(pending)
 	}
-	r.mb, r.err = r.Reader.ReadMultiBuffer()
+	mb, err := r.Reader.ReadMultiBuffer()
 	if r.Counter != nil {
-		r.Counter.Add(int64(r.mb.Len()))
+		r.Counter.Add(int64(mb.Len()))
 	}
-	return r.mb, r.err
+	return mb, err
 }
 
 func (r *TimeoutWrapperReader) ReadMultiBufferTimeout(duration time.Duration) (MultiBuffer, error) {
-	if r.done == nil {
-		r.done = make(chan struct{})
+	r.readMu.Lock()
+	defer r.readMu.Unlock()
+
+	pending := r.pending
+	if pending == nil {
+		pending = &timeoutPendingRead{done: make(chan struct{})}
+		r.pending = pending
 		go func() {
-			r.mb, r.err = r.Reader.ReadMultiBuffer()
-			close(r.done)
+			pending.mb, pending.err = r.Reader.ReadMultiBuffer()
+			close(pending.done)
 		}()
 	}
-	timeout := make(chan struct{})
-	go func() {
-		time.Sleep(duration)
-		close(timeout)
-	}()
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
 	select {
-	case <-r.done:
-		r.done = nil
-		if r.Counter != nil {
-			r.Counter.Add(int64(r.mb.Len()))
-		}
-		return r.mb, r.err
-	case <-timeout:
-		return nil, nil
+	case <-pending.done:
+		return r.takePendingRead(pending)
+	case <-timer.C:
+		return nil, ErrReadTimeout
 	}
+}
+
+// takePendingRead consumes a completed asynchronous read. The caller must hold
+// readMu and must have observed done being closed.
+func (r *TimeoutWrapperReader) takePendingRead(pending *timeoutPendingRead) (MultiBuffer, error) {
+	r.pending = nil
+	if r.Counter != nil {
+		r.Counter.Add(int64(pending.mb.Len()))
+	}
+	return pending.mb, pending.err
 }
 
 // Writer extends io.Writer with MultiBuffer.
