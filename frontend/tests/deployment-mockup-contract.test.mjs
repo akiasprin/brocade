@@ -6,6 +6,8 @@ const source = path => readFileSync(new URL(path, import.meta.url), 'utf8');
 const deploy = source('../src/panes/deploy.tsx');
 const agentRelease = source('../src/panes/agent-release.tsx');
 const xrayRelease = source('../src/panes/xray-release.tsx');
+const binaryRelease = source('../src/panes/binary-release.tsx');
+const binaryStatus = source('../src/ui/binary-release-status.ts');
 const cockpit = source('../src/panes/deploy-cockpit.tsx');
 const styles = source('../src/styles.css');
 
@@ -43,11 +45,11 @@ test('发布页面使用 mockup 的页签 + 驾驶舱结构，不保留旧 dp �
     ['agent-release.tsx', agentRelease],
     ['xray-release.tsx', xrayRelease],
   ]) {
-    assert.doesNotMatch(contents, /替换|持续批准范围|Xray 二进制|独立于配置修订/, `${name} 仍有旧文案`);
-    assert.match(contents, /<ScopeToolbar/, `${name} 没有升级范围工具条`);
-    assert.match(contents, /'可升级'/, `${name} 没有「可升级」`);
-    assert.match(contents, /'待升级'/, `${name} 没有「待升级」`);
-    assert.match(contents, /'不可升级'/, `${name} 没有「不可升级」`);
+    assert.match(contents, /<BinaryReleaseTab/, `${name} 未复用二进制发布视图`);
+    assert.match(binaryRelease, /<ScopeToolbar/);
+    assert.match(binaryRelease, /'可升级'/);
+    assert.match(binaryStatus, /'待升级'/);
+    assert.match(binaryRelease, /'不可升级'/);
   }
 });
 

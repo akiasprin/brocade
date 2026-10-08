@@ -79,6 +79,12 @@ CREATE TABLE admin_operators (
     -- one network user. Ordinary administrative operators leave both columns NULL.
     user_tenant_id TEXT,
     user_id TEXT,
+    -- Per-operator durable read cursor for the global machine notification center. The cursor is
+    -- deliberately not a foreign key: machine events expire after 90 days, while advancing the
+    -- cursor must remain monotonic across retention cleanup.
+    notification_last_seen_event_id BIGINT DEFAULT 0 NOT NULL,
+    -- Dismissing the inbox never deletes shared machine or public-IP history.
+    notification_cleared_through_event_id BIGINT DEFAULT 0 NOT NULL,
     CONSTRAINT admin_operators_check CHECK ((((role = 'system-admin') AND (tenant_scope IS NULL)) OR ((role <> 'system-admin') AND (tenant_scope IS NOT NULL)))),
     CONSTRAINT admin_operators_role_check CHECK ((role IN ('user', 'readonly', 'editor', 'publisher', 'tenant-admin', 'system-admin'))),
     CONSTRAINT admin_operators_user_binding_check CHECK (
@@ -97,6 +103,11 @@ CREATE TABLE admin_operators (
     CONSTRAINT admin_operators_pkey PRIMARY KEY (id),
     CONSTRAINT admin_operators_token_hash_key UNIQUE (token_hash),
     CONSTRAINT admin_operators_user_binding_key UNIQUE (user_tenant_id, user_id),
+    CONSTRAINT admin_operators_notification_cursor_nonnegative
+        CHECK (notification_last_seen_event_id >= 0),
+    CONSTRAINT admin_operators_notification_clear_cursor_valid
+        CHECK (notification_cleared_through_event_id >= 0
+            AND notification_cleared_through_event_id <= notification_last_seen_event_id),
     CONSTRAINT admin_operators_tenant_scope_fkey FOREIGN KEY (tenant_scope) REFERENCES tenants(id) ON DELETE RESTRICT
 );
 
@@ -802,41 +813,11 @@ CREATE TABLE control_state (
     -- Count concurrent source addresses per account. Global, because "does this fleet watch
     -- for shared accounts" has one answer, unlike the per-machine capacity settings above.
     stats_user_online BOOLEAN DEFAULT FALSE NOT NULL,
-    -- Which agent build the fleet has been cleared to install, and how far that clearance reaches.
-    -- Same character as the two columns above — compiles into nothing, stamps no revision.
-    --
-    -- `agent_release_id` identifies a *build*, not a version: it is the sha256 of the two embedded
-    -- per-architecture agent sha256s joined in order (`brocade-console`'s `embedded_release_id`).
-    -- Storing that rather than a boolean is what keeps deploying the control plane from being a
-    -- fleet-wide agent release. The control plane only ever holds the agents it was compiled with,
-    -- so after a redeploy the id recorded here no longer names anything it can serve, every node
-    -- gets 204, and the fleet stays where it is until somebody releases again on purpose. A
-    -- boolean would instead have every control-plane deploy silently replace the agent on every
-    -- machine — that is not a release, that is an accident with a changelog.
-    --
-    -- Why an id over the two raw sha256s: the pair is one artifact, and comparing them separately
-    -- invites the state where one architecture is cleared and the other is not, which nobody means
-    -- and which shows up as "half the fleet upgraded".
+    -- Read-only baseline from the former mutable Agent approval. New approvals live in
+    -- binary_releases; these fields never dispatch updates or invent per-node history.
     agent_release_id TEXT,
-    -- off: nobody upgrades. nodes: only those listed. all: the whole fleet.
-    -- Three states rather than a percentage — the point of staging here is that a person looks at
-    -- the first machine before the rest go, and a percentage invites automating away the looking.
     agent_release_scope TEXT DEFAULT 'off' NOT NULL,
     agent_release_nodes JSONB DEFAULT '[]'::jsonb NOT NULL,
-    -- What a person can read about the build that was cleared, snapshotted at the moment of
-    -- clearing. A build id answers "is this machine on it"; none of it answers "what did I release
-    -- and when", and that question gets asked first every time something looks wrong.
-    --
-    -- Snapshotted rather than read live from the running process: after the control plane is
-    -- redeployed, the process describes the build it now carries, while these describe the build
-    -- that was actually cleared. Reading them live would have the page rewrite its own history.
-    --
-    -- The version is whatever `crates/brocade-agent/Cargo.toml` said when the control plane was
-    -- built — that manifest is the one place a version number is maintained, deliberately not a
-    -- second file invented for this. The commit describes the control plane's source, not the
-    -- agent's bytes: the agent is identified by its sha256 and nothing else, because baking a
-    -- commit into it would make every documentation commit produce a new agent
-    -- (`brocade-console/build.rs`, `describe_build`).
     agent_release_version TEXT,
     agent_release_commit TEXT,
     agent_release_note TEXT,
@@ -1226,11 +1207,16 @@ CREATE TABLE vpngate_exit_reputations (
         (lease_owner IS NULL AND lease_until IS NULL)
         OR (lease_owner IS NOT NULL AND lease_until IS NOT NULL)
     )
+) WITH (
+    fillfactor = 85,
+    autovacuum_vacuum_scale_factor = 0.02,
+    autovacuum_analyze_scale_factor = 0.02
 );
 
+-- The claim also reclaims expired leases, so a lease_until IS NULL partial index cannot serve
+-- it. last_seen_at changes on every sighting: keeping it out permits HOT updates of sightings.
 CREATE INDEX vpngate_exit_reputations_due
-    ON vpngate_exit_reputations (next_check_at, last_seen_at DESC, exit_ip)
-    WHERE lease_until IS NULL;
+    ON vpngate_exit_reputations (next_check_at, exit_ip);
 
 -- Distributed catalogue measurements are not tied to a tenant outbound. They answer how one
 -- selected Agent reaches one provider profile and are retained independently from runtime state.
@@ -1331,6 +1317,9 @@ CREATE TABLE vpngate_candidate_probe_latest (
             AND last_success_download_bps >= 0 AND last_success_probed_at IS NOT NULL
             AND last_success_received_at IS NOT NULL)
     )
+) WITH (
+    autovacuum_vacuum_scale_factor = 0.02,
+    autovacuum_analyze_scale_factor = 0.02
 );
 CREATE INDEX vpngate_candidate_probe_latest_country_fresh
     ON vpngate_candidate_probe_latest (country_code, received_at DESC, server_id, profile_sha256);
@@ -2609,12 +2598,46 @@ CREATE TABLE machine_events (
     family SMALLINT,
     previous_value TEXT,
     current_value TEXT,
+    -- Only node_offline carries the last successful desired-state poll. `occurred_at` is when the
+    -- control plane confirmed the outage after its debounce window; keeping both prevents the UI
+    -- from presenting detection latency as a shorter outage.
+    last_contact_at TIMESTAMPTZ,
+    -- Metric incidents retain enough structured context to remain useful after their raw
+    -- seven-day telemetry has expired. These columns stay NULL for presence and address events.
+    incident_started_at TIMESTAMPTZ,
+    metric_value REAL,
+    metric_peak_value REAL,
+    metric_threshold REAL,
     occurred_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     CONSTRAINT machine_events_pkey PRIMARY KEY (id),
     CONSTRAINT machine_events_node_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
-    CONSTRAINT machine_events_kind_known CHECK (event_kind IN ('node_online', 'node_offline', 'public_ip_changed')),
+    CONSTRAINT machine_events_kind_known CHECK (event_kind IN (
+        'node_online', 'node_offline', 'public_ip_changed',
+        'cpu_steal_started', 'cpu_steal_recovered'
+    )),
     CONSTRAINT machine_events_family_known CHECK (family IS NULL OR family IN (4, 6)),
+    CONSTRAINT machine_events_last_contact_shape CHECK (
+        (event_kind = 'node_offline' AND last_contact_at IS NOT NULL AND last_contact_at <= occurred_at)
+        OR (event_kind <> 'node_offline' AND last_contact_at IS NULL)
+    ),
+    CONSTRAINT machine_events_metric_shape CHECK (
+        (event_kind NOT IN ('cpu_steal_started', 'cpu_steal_recovered')
+            AND incident_started_at IS NULL
+            AND metric_value IS NULL
+            AND metric_peak_value IS NULL
+            AND metric_threshold IS NULL)
+        OR (event_kind IN ('cpu_steal_started', 'cpu_steal_recovered')
+            AND incident_started_at IS NOT NULL
+            AND incident_started_at <= occurred_at
+            AND metric_value IS NOT NULL
+            AND metric_peak_value IS NOT NULL
+            AND metric_threshold IS NOT NULL
+            AND metric_value BETWEEN 0 AND 100
+            AND metric_peak_value BETWEEN 0 AND 100
+            AND metric_peak_value >= metric_value
+            AND metric_threshold BETWEEN 0 AND 100)
+    ),
     CONSTRAINT machine_events_shape CHECK (
         (event_kind = 'node_online'
             AND family IS NULL
@@ -2629,15 +2652,80 @@ CREATE TABLE machine_events (
             AND previous_value IS NOT NULL
             AND current_value IS NOT NULL
             AND previous_value <> current_value)
+        OR (event_kind = 'cpu_steal_started'
+            AND family IS NULL
+            AND previous_value = 'normal'
+            AND current_value = 'active')
+        OR (event_kind = 'cpu_steal_recovered'
+            AND family IS NULL
+            AND previous_value = 'active'
+            AND current_value = 'normal')
     )
 );
 
 CREATE INDEX machine_events_node_time_idx ON machine_events (node_id, occurred_at DESC, id DESC);
 CREATE INDEX machine_events_retention_idx ON machine_events (created_at);
 
--- One generic Webhook delivery per event. Rows exist even when this Console process has no
--- webhook configured, so enabling the worker later makes the outstanding state explicit rather
--- than silently losing it. The event retention job bounds the backlog through ON DELETE CASCADE.
+-- Current projection for the sustained CPU-steal incident state machine, advanced from raw reports
+-- before historical aggregation. This bounded row prevents duplicate open/recovery events across
+-- retries, duplicate windows and Console restarts. Missing telemetry never advances recovery.
+CREATE TABLE node_cpu_steal_state (
+    node_id TEXT NOT NULL,
+    status TEXT DEFAULT 'normal' NOT NULL,
+    transition_started_at TIMESTAMPTZ,
+    transition_observations INTEGER DEFAULT 0 NOT NULL,
+    active_started_at TIMESTAMPTZ,
+    last_window_end TIMESTAMPTZ NOT NULL,
+    current_pct REAL NOT NULL,
+    peak_pct REAL NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT node_cpu_steal_state_pkey PRIMARY KEY (node_id),
+    CONSTRAINT node_cpu_steal_state_node_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    CONSTRAINT node_cpu_steal_state_status_known CHECK (status IN ('normal', 'candidate', 'active', 'recovering')),
+    CONSTRAINT node_cpu_steal_state_observations_nonnegative CHECK (transition_observations >= 0),
+    CONSTRAINT node_cpu_steal_state_values CHECK (
+        current_pct BETWEEN 0 AND 100
+        AND peak_pct BETWEEN 0 AND 100
+        AND peak_pct >= current_pct
+    ),
+    CONSTRAINT node_cpu_steal_state_shape CHECK (
+        (status = 'normal'
+            AND transition_started_at IS NULL
+            AND transition_observations = 0
+            AND active_started_at IS NULL)
+        OR (status = 'candidate'
+            AND transition_started_at IS NOT NULL
+            AND transition_observations > 0
+            AND active_started_at IS NULL)
+        OR (status = 'active'
+            AND transition_started_at IS NULL
+            AND transition_observations = 0
+            AND active_started_at IS NOT NULL)
+        OR (status = 'recovering'
+            AND transition_started_at IS NOT NULL
+            AND transition_observations > 0
+            AND active_started_at IS NOT NULL)
+    ),
+    CONSTRAINT node_cpu_steal_state_time_order CHECK (
+        (transition_started_at IS NULL OR transition_started_at <= last_window_end)
+        AND (active_started_at IS NULL OR active_started_at <= last_window_end)
+    )
+);
+
+-- Runtime channel state separates durable machine events from optional external delivery. A
+-- disabled channel does not accumulate work which would unexpectedly flood a newly configured
+-- endpoint with historical events.
+CREATE TABLE notification_channels (
+    channel TEXT NOT NULL,
+    enabled BOOLEAN DEFAULT FALSE NOT NULL,
+    changed_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    CONSTRAINT notification_channels_pkey PRIMARY KEY (channel),
+    CONSTRAINT notification_channels_channel_known CHECK (channel = 'webhook')
+);
+
+-- One generic Webhook delivery per event while the channel is enabled. Legacy databases may
+-- contain rows created without a configured Webhook; channel reconciliation marks those rows
+-- suppressed instead of unexpectedly delivering historical events after configuration.
 CREATE TABLE notification_deliveries (
     id BIGINT GENERATED BY DEFAULT AS IDENTITY,
     event_id BIGINT NOT NULL,
@@ -2654,7 +2742,7 @@ CREATE TABLE notification_deliveries (
     CONSTRAINT notification_deliveries_event_fkey FOREIGN KEY (event_id) REFERENCES machine_events(id) ON DELETE CASCADE,
     CONSTRAINT notification_deliveries_event_channel_key UNIQUE (event_id, channel),
     CONSTRAINT notification_deliveries_channel_known CHECK (channel = 'webhook'),
-    CONSTRAINT notification_deliveries_status_known CHECK (status IN ('pending', 'delivering', 'delivered')),
+    CONSTRAINT notification_deliveries_status_known CHECK (status IN ('pending', 'delivering', 'delivered', 'suppressed')),
     CONSTRAINT notification_deliveries_attempts_nonnegative CHECK (attempts >= 0),
     CONSTRAINT notification_deliveries_lease_shape CHECK (
         (status = 'delivering' AND lease_owner IS NOT NULL AND lease_until IS NOT NULL)
@@ -2766,89 +2854,106 @@ CREATE TABLE node_traffic_calibrations (
 CREATE INDEX node_traffic_calibrations_node_time_idx
     ON node_traffic_calibrations (node_id, calibrated_at DESC, id DESC);
 
--- Xray binaries are operational software, not model artifacts. A release therefore has no model
--- revision, but it still needs immutable identity, an auditable operator trail, and per-machine
--- progress because replacing a serving Xray interrupts connections. `artifacts` freezes the
--- architecture-to-sha mapping carried by the Console that created this release; a later Console
--- can never silently substitute the bytes under an existing release id.
-CREATE TABLE xray_releases (
+-- Binary release metadata is shared by Agent and Xray; executable bytes are never archived here.
+-- BEGIN BINARY RELEASE SCHEMA
+CREATE TABLE binary_releases (
     id BIGINT GENERATED BY DEFAULT AS IDENTITY,
+    component TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     build_id TEXT NOT NULL,
     version TEXT NOT NULL,
     artifacts JSONB NOT NULL,
     status TEXT DEFAULT 'running' NOT NULL,
-    active BOOLEAN DEFAULT true NOT NULL,
-    confirmed_wave INTEGER DEFAULT 1 NOT NULL,
-    batch_size INTEGER DEFAULT 10 NOT NULL,
+    active BOOLEAN GENERATED ALWAYS AS (status IN ('running', 'halted')) STORED,
     note TEXT,
     created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     created_by TEXT NOT NULL,
     halted_at TIMESTAMPTZ,
     finished_at TIMESTAMPTZ,
-    CONSTRAINT xray_releases_pkey PRIMARY KEY (id),
-    CONSTRAINT xray_releases_idempotency_key_key UNIQUE (idempotency_key),
-    CONSTRAINT xray_releases_idempotency_key_length CHECK ((length(idempotency_key) BETWEEN 1 AND 200)),
-    CONSTRAINT xray_releases_build_id_shape CHECK ((build_id ~ '^[0-9a-f]{64}$')),
-    CONSTRAINT xray_releases_version_shape CHECK (((length(version) BETWEEN 1 AND 128))),
-    CONSTRAINT xray_releases_artifacts_shape CHECK (((jsonb_typeof(artifacts) = 'object') AND (artifacts <> '{}'::jsonb))),
-    CONSTRAINT xray_releases_note_length CHECK (((note IS NULL) OR (length(note) <= 2000))),
-    CONSTRAINT xray_releases_status_known CHECK ((status IN ('running', 'halted', 'succeeded', 'canceled'))),
-    CONSTRAINT xray_releases_active_status_consistent CHECK (((active AND (status IN ('running', 'halted'))) OR ((NOT active) AND (status IN ('succeeded', 'canceled'))))),
-    CONSTRAINT xray_releases_confirmed_wave_check CHECK ((confirmed_wave >= 1)),
-    CONSTRAINT xray_releases_batch_size_check CHECK ((batch_size BETWEEN 1 AND 500)),
-    CONSTRAINT xray_releases_created_by_fkey FOREIGN KEY (created_by) REFERENCES admin_operators(id) ON DELETE RESTRICT
+    CONSTRAINT binary_releases_pkey PRIMARY KEY (id),
+    CONSTRAINT binary_releases_idempotency_key_key UNIQUE (component, idempotency_key),
+    CONSTRAINT binary_releases_idempotency_key_length CHECK ((length(idempotency_key) BETWEEN 1 AND 200)),
+    CONSTRAINT binary_releases_build_id_shape CHECK ((build_id ~ '^[0-9a-f]{64}$')),
+    CONSTRAINT binary_releases_version_shape CHECK (((length(version) BETWEEN 1 AND 128))),
+    CONSTRAINT binary_releases_artifacts_shape CHECK (((jsonb_typeof(artifacts) = 'object') AND (artifacts <> '{}'::jsonb))),
+    CONSTRAINT binary_releases_note_length CHECK (((note IS NULL) OR (length(note) <= 2000))),
+    CONSTRAINT binary_releases_status_known CHECK ((status IN ('running', 'halted', 'succeeded', 'canceled'))),
+    CONSTRAINT binary_releases_component_known CHECK (component IN ('agent', 'xray')),
+    CONSTRAINT binary_releases_created_by_fkey FOREIGN KEY (created_by) REFERENCES admin_operators(id) ON DELETE RESTRICT
 );
 
-CREATE TABLE xray_release_targets (
+CREATE TABLE binary_release_targets (
     release_id BIGINT NOT NULL,
     node_id TEXT NOT NULL,
-    wave INTEGER NOT NULL,
     status TEXT DEFAULT 'pending' NOT NULL,
     attempt INTEGER DEFAULT 1 NOT NULL,
     before_sha256 TEXT NOT NULL,
     desired_sha256 TEXT,
     arch TEXT,
     error TEXT,
+    verification TEXT,
     reported_performed_update BOOLEAN,
-    reported_xray_enabled BOOLEAN,
+    reported_service_enabled BOOLEAN,
     reported_installed_sha256 TEXT,
     reported_running_sha256 TEXT,
     dispatched_at TIMESTAMPTZ,
     finished_at TIMESTAMPTZ,
-    CONSTRAINT xray_release_targets_pkey PRIMARY KEY (release_id, node_id),
-    CONSTRAINT xray_release_targets_release_fkey FOREIGN KEY (release_id) REFERENCES xray_releases(id) ON DELETE CASCADE,
+    CONSTRAINT binary_release_targets_pkey PRIMARY KEY (release_id, node_id),
+    CONSTRAINT binary_release_targets_release_fkey FOREIGN KEY (release_id) REFERENCES binary_releases(id) ON DELETE CASCADE,
     -- Keep the textual machine identity after a terminal node is permanently removed. Binary
     -- releases are an immutable audit ledger, so deleting their targets would falsify history.
-    CONSTRAINT xray_release_targets_wave_check CHECK ((wave >= 1)),
-    CONSTRAINT xray_release_targets_attempt_check CHECK ((attempt >= 1)),
-    CONSTRAINT xray_release_targets_before_sha_shape CHECK ((before_sha256 ~ '^[0-9a-f]{64}$')),
-    CONSTRAINT xray_release_targets_desired_sha_shape CHECK (((desired_sha256 IS NULL) OR (desired_sha256 ~ '^[0-9a-f]{64}$'))),
-    CONSTRAINT xray_release_targets_arch_shape CHECK (((arch IS NULL) OR ((length(arch) BETWEEN 1 AND 32) AND (arch ~ '^[A-Za-z0-9_-]+$')))),
-    CONSTRAINT xray_release_targets_error_length CHECK (((error IS NULL) OR (length(error) <= 4000))),
-    CONSTRAINT xray_release_targets_reported_installed_shape CHECK (((reported_installed_sha256 IS NULL) OR (reported_installed_sha256 ~ '^[0-9a-f]{64}$'))),
-    CONSTRAINT xray_release_targets_reported_running_shape CHECK (((reported_running_sha256 IS NULL) OR (reported_running_sha256 ~ '^[0-9a-f]{64}$'))),
-    CONSTRAINT xray_release_targets_status_known CHECK ((status IN ('pending', 'dispatched', 'succeeded', 'unverified', 'failed-recovered', 'failed-dirty', 'unsupported', 'canceled')))
+    CONSTRAINT binary_release_targets_attempt_check CHECK ((attempt BETWEEN 1 AND 32)),
+    CONSTRAINT binary_release_targets_before_sha_shape CHECK ((before_sha256 ~ '^[0-9a-f]{64}$')),
+    CONSTRAINT binary_release_targets_desired_sha_shape CHECK (((desired_sha256 IS NULL) OR (desired_sha256 ~ '^[0-9a-f]{64}$'))),
+    CONSTRAINT binary_release_targets_arch_shape CHECK (((arch IS NULL) OR ((length(arch) BETWEEN 1 AND 32) AND (arch ~ '^[A-Za-z0-9_-]+$')))),
+    CONSTRAINT binary_release_targets_verification CHECK (verification IS NULL OR verification IN ('receipt', 'observed', 'legacy')),
+    CONSTRAINT binary_release_targets_error_length CHECK (((error IS NULL) OR (length(error) <= 4000))),
+    CONSTRAINT binary_release_targets_reported_installed_shape CHECK (((reported_installed_sha256 IS NULL) OR (reported_installed_sha256 ~ '^[0-9a-f]{64}$'))),
+    CONSTRAINT binary_release_targets_reported_running_shape CHECK (((reported_running_sha256 IS NULL) OR (reported_running_sha256 ~ '^[0-9a-f]{64}$'))),
+    CONSTRAINT binary_release_targets_status_known CHECK ((status IN ('pending', 'dispatched', 'succeeded', 'unverified', 'failed-recovered', 'failed-dirty', 'unsupported', 'canceled')))
 );
 
 -- Status columns answer the current operational question; events retain who moved the rollout and
 -- what each Agent reported, so confirmations, retries, cancellation and failures remain auditable.
-CREATE TABLE xray_release_events (
+CREATE TABLE binary_release_events (
     id BIGINT GENERATED BY DEFAULT AS IDENTITY,
     release_id BIGINT NOT NULL,
     kind TEXT NOT NULL,
     node_id TEXT,
-    wave INTEGER,
     actor TEXT,
     detail JSONB DEFAULT '{}'::jsonb NOT NULL,
     created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
-    CONSTRAINT xray_release_events_pkey PRIMARY KEY (id),
-    CONSTRAINT xray_release_events_release_fkey FOREIGN KEY (release_id) REFERENCES xray_releases(id) ON DELETE CASCADE,
+    CONSTRAINT binary_release_events_pkey PRIMARY KEY (id),
+    CONSTRAINT binary_release_events_release_fkey FOREIGN KEY (release_id) REFERENCES binary_releases(id) ON DELETE CASCADE,
     -- `node_id` is an audit snapshot, not a live ownership edge; see the target table above.
-    CONSTRAINT xray_release_events_actor_fkey FOREIGN KEY (actor) REFERENCES admin_operators(id) ON DELETE RESTRICT,
-    CONSTRAINT xray_release_events_wave_check CHECK (((wave IS NULL) OR (wave >= 1))),
-    CONSTRAINT xray_release_events_detail_shape CHECK ((jsonb_typeof(detail) = 'object'))
+    CONSTRAINT binary_release_events_actor_fkey FOREIGN KEY (actor) REFERENCES admin_operators(id) ON DELETE RESTRICT,
+    CONSTRAINT binary_release_events_detail_shape CHECK ((jsonb_typeof(detail) = 'object'))
 );
+CREATE TABLE binary_release_attempts (
+    release_id BIGINT NOT NULL,
+    node_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    status TEXT DEFAULT 'pending' NOT NULL,
+    receipt_capable BOOLEAN,
+    verification TEXT,
+    error TEXT,
+    evidence JSONB DEFAULT '{}'::jsonb NOT NULL,
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    CONSTRAINT binary_release_attempts_pkey PRIMARY KEY (release_id, node_id, attempt),
+    CONSTRAINT binary_release_attempts_target_fkey FOREIGN KEY (release_id, node_id)
+        REFERENCES binary_release_targets(release_id, node_id) ON DELETE CASCADE,
+    CONSTRAINT binary_release_attempts_number CHECK (attempt BETWEEN 1 AND 32),
+    CONSTRAINT binary_release_attempts_status CHECK (status IN ('pending', 'dispatched', 'succeeded', 'unverified', 'failed-recovered', 'failed-dirty', 'unsupported', 'canceled')),
+    CONSTRAINT binary_release_attempts_verification CHECK (verification IS NULL OR verification IN ('receipt', 'observed', 'legacy')),
+    CONSTRAINT binary_release_attempts_error_length CHECK (error IS NULL OR length(error) <= 4000),
+    CONSTRAINT binary_release_attempts_evidence CHECK (jsonb_typeof(evidence) = 'object')
+);
+
+CREATE UNIQUE INDEX binary_releases_single_flight ON binary_releases (component) WHERE active;
+CREATE INDEX binary_releases_history ON binary_releases (component, id DESC);
+CREATE INDEX binary_release_events_by_release ON binary_release_events (release_id, id);
+-- END BINARY RELEASE SCHEMA
 
 -- A usage generation is the immutable interpretation of every Xray counter label for one machine.
 -- It is deliberately frozen beside a deployment rather than reconstructed from today's grants:
@@ -3339,6 +3444,7 @@ CREATE TABLE node_load_samples (
     -- "unavailable kernel view", never an all-zero network.
     network_detail JSONB,
     uptime_secs BIGINT NOT NULL,
+    is_rollup BOOLEAN NOT NULL DEFAULT FALSE,
     CONSTRAINT node_load_samples_window CHECK ((window_end > window_start)),
     -- CPU shares are normalised across all cores, so each part is within a window and the three
     -- together cannot exceed it. load1 deliberately has no upper bound — it is a queue length, not
@@ -3352,31 +3458,51 @@ CREATE TABLE node_load_samples (
     CONSTRAINT node_load_samples_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
 
+-- BEGIN LOAD ROLLUP SCHEMA
+-- Recent raw windows and minute history share the existing read path. The fence prevents a
+-- delayed retry from recreating source rows that have already been folded into a minute.
+CREATE INDEX node_load_samples_raw_end_idx ON node_load_samples (node_id, window_end, window_start)
+    WHERE NOT is_rollup;
+CREATE TABLE node_load_compaction_state (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    sealed_through TIMESTAMPTZ NOT NULL DEFAULT to_timestamp(0)
+);
+-- END LOAD ROLLUP SCHEMA
+
 -- One TCP-connect or ICMP-echo result per machine, series and round. A series is one endpoint of a
 -- target in one address family: `target` is its `tcp://` / `icmp://` address, and a domain probed
 -- over both families is two series sharing that address. `attempted` keeps missing routes and
 -- unavailable ICMP sockets from becoming fake packet loss; `skip_reason` says which of those it
 -- was. No resolved IP, DNS duration, TTL, kernel metric, retransmission or errno is stored.
-CREATE TABLE node_ping_probe_samples (
+-- BEGIN PING SERIES SCHEMA
+-- Intern repeated labels once. Samples retain every original timestamp and measurement.
+CREATE TABLE node_ping_probe_series (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     node_id TEXT NOT NULL,
     target TEXT NOT NULL,
     family TEXT NOT NULL,
+    CONSTRAINT node_ping_probe_series_family CHECK (family IN ('ipv4', 'ipv6')),
+    CONSTRAINT node_ping_probe_series_identity UNIQUE (node_id, target, family),
+    CONSTRAINT node_ping_probe_series_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+);
+CREATE TABLE node_ping_probe_samples (
+    series_id BIGINT NOT NULL,
     probed_at TIMESTAMPTZ NOT NULL,
     attempted BOOLEAN NOT NULL,
     latency_us INTEGER,
     skip_reason TEXT,
-    CONSTRAINT node_ping_probe_samples_family CHECK ((family = ANY (ARRAY['ipv4'::text, 'ipv6'::text]))),
     CONSTRAINT node_ping_probe_samples_latency_us CHECK (((latency_us IS NULL) OR (latency_us >= 0))),
     CONSTRAINT node_ping_probe_samples_attempted_latency CHECK (((latency_us IS NULL) OR attempted)),
     CONSTRAINT node_ping_probe_samples_skip_reason CHECK (((skip_reason IS NULL) OR ((NOT attempted) AND (skip_reason = ANY (ARRAY['no_route'::text, 'no_address'::text, 'resolve_failed'::text, 'unavailable'::text]))))),
-    CONSTRAINT node_ping_probe_samples_pkey PRIMARY KEY (node_id, target, family, probed_at),
-    CONSTRAINT node_ping_probe_samples_node_id_fkey FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+    CONSTRAINT node_ping_probe_samples_pkey PRIMARY KEY (series_id, probed_at),
+    CONSTRAINT node_ping_probe_samples_series_id_fkey FOREIGN KEY (series_id) REFERENCES node_ping_probe_series(id) ON DELETE CASCADE
 ) WITH (
     autovacuum_vacuum_scale_factor = 0.02,
     autovacuum_analyze_scale_factor = 0.02
 );
 CREATE INDEX node_ping_probe_samples_probed_at_idx
     ON node_ping_probe_samples (probed_at);
+-- END PING SERIES SCHEMA
 
 -- The processes we put on the machine. Latest only — one row per (node, process).
 --
@@ -3524,7 +3650,7 @@ CREATE TABLE usage_chain_samples (
     CONSTRAINT usage_chain_samples_revision_id_fkey FOREIGN KEY (revision_id) REFERENCES revisions(id),
     CONSTRAINT usage_chain_samples_generation_id_fkey FOREIGN KEY (generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT,
     CONSTRAINT usage_chain_samples_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT
-);
+) WITH (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02);
 
 CREATE TABLE usage_readings (
     id BIGINT GENERATED BY DEFAULT AS IDENTITY,
@@ -3602,6 +3728,26 @@ CREATE INDEX usage_node_rollups_by_period
         has_gap
     );
 
+-- BEGIN USAGE NODE WINDOWS SCHEMA
+-- The chart needs a machine/tenant total at each actual report boundary, not a row per user.
+-- Explicit zero windows preserve the difference between idle traffic and missing collection.
+CREATE TABLE usage_node_windows (
+    node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    window_end TIMESTAMPTZ NOT NULL,
+    user_uplink_bytes BIGINT NOT NULL,
+    user_downlink_bytes BIGINT NOT NULL,
+    relay_uplink_bytes BIGINT NOT NULL,
+    relay_downlink_bytes BIGINT NOT NULL,
+    CONSTRAINT usage_node_windows_pkey PRIMARY KEY (node_id, window_end, tenant_id),
+    CONSTRAINT usage_node_windows_bytes_nonnegative CHECK (
+        user_uplink_bytes >= 0 AND user_downlink_bytes >= 0
+        AND relay_uplink_bytes >= 0 AND relay_downlink_bytes >= 0
+    )
+) WITH (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02);
+CREATE INDEX usage_node_windows_by_window_end ON usage_node_windows (window_end);
+-- END USAGE NODE WINDOWS SCHEMA
+
 -- Raw samples of user traffic.
 --
 -- A usage row is a historical fact rather than a live model row, so the columns referencing the model
@@ -3645,7 +3791,7 @@ CREATE TABLE usage_samples (
     CONSTRAINT usage_samples_revision_id_fkey FOREIGN KEY (revision_id) REFERENCES revisions(id),
     CONSTRAINT usage_samples_generation_id_fkey FOREIGN KEY (generation_id) REFERENCES usage_generations(id) ON DELETE RESTRICT,
     CONSTRAINT usage_samples_tenant_id_user_id_fkey FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE RESTRICT
-);
+) WITH (autovacuum_vacuum_scale_factor = 0.02, autovacuum_analyze_scale_factor = 0.02);
 
 
 CREATE TABLE user_app_quotas (
@@ -3660,36 +3806,11 @@ CREATE TABLE user_app_quotas (
     CONSTRAINT user_app_quotas_tenant_id_user_id_fkey FOREIGN KEY (tenant_id, user_id) REFERENCES users(tenant_id, id) ON DELETE CASCADE
 );
 
-CREATE VIEW node_usage_windows AS
- SELECT usage_samples.node_id,
-    usage_samples.window_start,
-    usage_samples.window_end,
-    usage_samples.tenant_id,
-    'user' AS kind,
-    usage_samples.uplink_bytes,
-    usage_samples.downlink_bytes,
-    usage_samples.has_gap
-   FROM usage_samples
-UNION ALL
- SELECT usage_chain_samples.node_id,
-    usage_chain_samples.window_start,
-    usage_chain_samples.window_end,
-    usage_chain_samples.tenant_id,
-    'relay' AS kind,
-    usage_chain_samples.uplink_bytes,
-    usage_chain_samples.downlink_bytes,
-    usage_chain_samples.has_gap
-   FROM usage_chain_samples;
-
 CREATE INDEX admin_sessions_by_operator ON admin_sessions USING btree (operator_id, expires_at DESC);
 
 CREATE INDEX admin_sessions_live ON admin_sessions USING btree (expires_at) WHERE (revoked_at IS NULL);
 
 CREATE UNIQUE INDEX deployments_single_flight ON deployments USING btree (kind) WHERE active;
-
-CREATE UNIQUE INDEX xray_releases_single_flight ON xray_releases USING btree (active) WHERE active;
-
-CREATE INDEX xray_release_events_by_release ON xray_release_events USING btree (release_id, id);
 
 CREATE INDEX e2e_probe_samples_recent ON e2e_probe_samples USING btree (chain_id, probed_at DESC);
 
@@ -3737,14 +3858,9 @@ CREATE INDEX quota_suspensions_by_view ON quota_suspensions USING btree (tenant_
 
 CREATE INDEX steps_by_node ON steps USING btree (node_id, chain_id);
 
-CREATE INDEX usage_chain_samples_by_chain_window ON usage_chain_samples USING btree (tenant_id, chain_id, window_start, window_end);
-
--- Machine detail reads both the recent chart and month-to-date total by node. The dedup key has
--- hop_label between node_id and time, so it cannot provide an ordered/range path for that query.
--- Include the aggregate inputs to keep the hot page on an index-only scan.
+-- Detail endpoints read a bounded newest-first list; charts and month totals use projections.
 CREATE INDEX usage_chain_samples_by_node_window
-    ON usage_chain_samples USING btree (node_id, window_start, window_end)
-    INCLUDE (tenant_id, uplink_bytes, downlink_bytes, has_gap);
+    ON usage_chain_samples USING btree (node_id, window_end DESC, id DESC);
 
 CREATE INDEX usage_chain_samples_by_window_end ON usage_chain_samples USING btree (window_end);
 
@@ -3756,13 +3872,10 @@ CREATE INDEX usage_generation_activations_by_time
 CREATE INDEX usage_report_receipts_by_received_at
     ON usage_report_receipts USING btree (received_at);
 
-CREATE INDEX usage_samples_by_user_app_window ON usage_samples USING btree (tenant_id, user_id, app_id, window_start);
-
-CREATE INDEX usage_samples_by_user_window ON usage_samples USING btree (tenant_id, user_id, window_start, window_end);
+CREATE INDEX usage_samples_by_user_window ON usage_samples USING btree (tenant_id, user_id, window_end DESC, id DESC);
 
 CREATE INDEX usage_samples_by_node_window
-    ON usage_samples USING btree (node_id, window_start, window_end)
-    INCLUDE (tenant_id, uplink_bytes, downlink_bytes, has_gap);
+    ON usage_samples USING btree (node_id, window_end DESC, id DESC);
 
 CREATE INDEX usage_samples_by_window_end ON usage_samples USING btree (window_end);
 

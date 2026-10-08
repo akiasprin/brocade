@@ -28,9 +28,7 @@ describe('permission automation status', () => {
   });
 
   it('shows the revision only with an active deployment state', () => {
-    const view = render(
-      <RuntimeCrumbStatus state={{ text: '发布 #42 · 进行中', tone: 'hot' }} revision={582} />,
-    );
+    const view = render(<RuntimeCrumbStatus state={{ text: '发布 #42 · 进行中', tone: 'hot' }} revision={582} />);
     expect(view.container.textContent).toBe('发布 #42 · 进行中R582');
   });
 

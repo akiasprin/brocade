@@ -18,6 +18,9 @@ export const bytes = (n: number) =>
           ? `${(n / KiB).toFixed(0)} KiB`
           : `${n.toFixed(0)} B`;
 
+/** 部分占整体的百分比，保留一位小数；整体为 0 时返回「—」。用量页与用户详情的读数栏共用。 */
+export const shareOf = (part: number, whole: number) => (whole > 0 ? `${((part / whole) * 100).toFixed(1)}%` : '—');
+
 /** File and payload sizes keep one decimal below MiB, while sharing the same IEC unit names. */
 export const fileBytes = (n: number | null): string => {
   if (n === null) return '—';

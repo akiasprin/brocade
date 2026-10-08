@@ -227,14 +227,8 @@ export function observeAxisTick(strong: string, interval?: (index: number) => bo
   return interval ? { ...tick, alignWithLabel: true, interval } : tick;
 }
 
-/**
- * Faint minor ticks between the majors — the fine graduations of the instrument. Only time and
- * value axes accept them (a category axis rejects minor ticks), so this stays on the time-axis
- * charts' horizontal frame.
- */
-export function observeMinorTick(soft: string, splitNumber = 4) {
-  return { show: true, splitNumber, length: 2, lineStyle: { color: soft } };
-}
+/** Minor graduations per major division on the time axis. */
+const MINOR_TICKS_PER_STEP = 4;
 
 /** Round wall-clock steps a time axis is allowed to snap its major ticks to (milliseconds). */
 const TIME_STEPS_MS = [
@@ -251,6 +245,79 @@ const TIME_STEPS_MS = [
 export function observeTimeInterval(spanMs: number, targetDivisions = 6): number {
   const target = spanMs / Math.max(2, targetDivisions);
   return TIME_STEPS_MS.find(step => step >= target) ?? TIME_STEPS_MS[TIME_STEPS_MS.length - 1];
+}
+
+/**
+ * Every whole multiple of `stepMs` on the local wall clock inside [minMs, maxMs]: whole minutes,
+ * whole ten minutes, whole hours. The time zone offset is applied before rounding, so a 6-hour step
+ * lands on 00:00 / 06:00 / 12:00 / 18:00 locally rather than on UTC boundaries.
+ */
+export function observeWallClockTicks(minMs: number, maxMs: number, stepMs: number): number[] {
+  const zoneMs = new Date(minMs).getTimezoneOffset() * 60_000;
+  const ticks: number[] = [];
+  for (let value = Math.ceil((minMs - zoneMs) / stepMs) * stepMs + zoneMs; value <= maxMs; value += stepMs) {
+    ticks.push(value);
+  }
+  return ticks;
+}
+
+const two = (value: number) => String(value).padStart(2, '0');
+
+/** Axis label for a time tick: HH:MM, or HH:MM:SS once the step is shorter than a minute. */
+function timeTickText(valueMs: number, withSeconds: boolean): string {
+  const date = new Date(valueMs);
+  const minutes = `${two(date.getHours())}:${two(date.getMinutes())}`;
+  return withSeconds ? `${minutes}:${two(date.getSeconds())}` : minutes;
+}
+
+/**
+ * The time axis shared by every machine-observation chart, as two x axes over the same span.
+ *
+ * Major ticks, their labels and the vertical grid sit on whole local wall-clock multiples of the
+ * step (`customValues`; ECharts draws split lines at the axis-tick positions). With a plain
+ * `interval` ECharts counts ticks from the axis minimum, so a range dragged out to 13:41:20 labelled
+ * the tick at 13:43:20 as "13:43" — every label was off by the start's seconds.
+ *
+ * Minor ticks cannot follow `customValues`: ECharts derives them from the interval ticks. They are
+ * drawn by the second axis instead, which carries only its own short ticks — no line, labels, grid
+ * or tooltip — so the frame keeps its fine graduations on the same wall-clock grid.
+ */
+export function observeTimeAxes(minMs: number, maxMs: number, strong: string, soft: string) {
+  const step = observeTimeInterval(Math.max(30_000, maxMs - minMs));
+  const majors = observeWallClockTicks(minMs, maxMs, step);
+  const major = new Set(majors);
+  const minors = observeWallClockTicks(minMs, maxMs, step / MINOR_TICKS_PER_STEP).filter(value => !major.has(value));
+  const withSeconds = step < 60_000;
+  return [
+    {
+      type: 'value' as const,
+      min: minMs,
+      max: maxMs,
+      axisLine: observeAxisLine(strong),
+      axisTick: { ...observeAxisTick(strong), customValues: majors },
+      splitLine: { show: true, lineStyle: { color: soft, width: 1 } },
+      axisLabel: {
+        color: strong,
+        fontSize: 9.5,
+        margin: 8,
+        hideOverlap: true,
+        customValues: majors,
+        formatter: (value: number) => timeTickText(value, withSeconds),
+      },
+    },
+    {
+      type: 'value' as const,
+      min: minMs,
+      max: maxMs,
+      position: 'bottom' as const,
+      silent: true,
+      axisLine: { show: false },
+      axisLabel: { show: false },
+      splitLine: { show: false },
+      axisTick: { show: true, length: 2, lineStyle: { color: soft }, customValues: minors },
+      axisPointer: { show: false, triggerTooltip: false },
+    },
+  ];
 }
 
 export type ObserveValueAxis = { max: number; interval: number };

@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { DeploymentListItem, XrayRelease } from '../src/api';
+import type { DeploymentListItem, BinaryRelease } from '../src/api';
 import type { Win } from '../src/wm/store';
 
 window.matchMedia = ((media: string) => ({
@@ -66,9 +66,10 @@ function deployment(id: number): DeploymentListItem {
   };
 }
 
-const activeRelease: XrayRelease = {
+const activeRelease: BinaryRelease = {
   id: 7,
-  release_id: 'xray-release',
+  component: 'xray',
+  build_id: 'xray-release',
   version: '26.4.25',
   artifacts: [{ arch: 'x86_64', sha256: 'c'.repeat(64) }],
   status: 'running',
@@ -79,6 +80,7 @@ const activeRelease: XrayRelease = {
   halted_at: null,
   finished_at: null,
   events: [],
+  next_event_before_id: null,
   targets: [
     {
       node_id: 'edge',
@@ -89,9 +91,10 @@ const activeRelease: XrayRelease = {
       arch: 'x86_64',
       error: null,
       reported_performed_update: null,
-      reported_xray_enabled: null,
+      reported_service_enabled: null,
       reported_installed_sha256: null,
       reported_running_sha256: null,
+      verification: null,
       retryable: false,
       dispatched_at: '2026-09-16T00:00:30Z',
       finished_at: null,
@@ -99,7 +102,7 @@ const activeRelease: XrayRelease = {
   ],
 };
 
-function mount({ releases = [] as XrayRelease[] } = {}) {
+function mount({ releases = [] as BinaryRelease[] } = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY }, mutations: { retry: false } },
   });
@@ -139,30 +142,27 @@ function mount({ releases = [] as XrayRelease[] } = {}) {
       },
     ],
   });
-  client.setQueryData(['agent-release'], {
-    agent_version: '0.2.0',
-    console_version: '0.2.0',
-    build_commit: 'test',
-    available_release_id: 'a'.repeat(64),
-    available_agents: [{ arch: 'x86_64', sha256: 'a'.repeat(64) }],
-    released: {
-      release_id: 'a'.repeat(64),
-      scope: 'all',
-      nodes: [],
-      note: null,
+  client.setQueryData(['binary-releases', 'agent'], {
+    available: {
+      component: 'agent',
       version: '0.2.0',
-      commit: 'test',
-      released_at: '2026-09-16T00:00:00Z',
-      released_by: 'root',
+      build_id: 'a'.repeat(64),
+      artifacts: [{ arch: 'x86_64', sha256: 'a'.repeat(64) }],
+      source: 'embedded',
     },
+    current: null,
+    legacy_approval: null,
   });
-  client.setQueryData(['xray-releases'], {
-    available_release_id: 'xray-release',
-    available_xrays: [{ arch: 'x86_64', sha256: 'c'.repeat(64) }],
-    xray_version: '26.4.25',
-    console_version: '0.2.0',
-    build_commit: 'test',
-    releases,
+  client.setQueryData(['binary-releases', 'xray'], {
+    available: {
+      component: 'xray',
+      build_id: 'xray-release',
+      version: '26.4.25',
+      artifacts: [{ arch: 'x86_64', sha256: 'c'.repeat(64) }],
+      source: 'embedded',
+    },
+    current: releases[0] ?? null,
+    legacy_approval: null,
   });
 
   return render(
@@ -216,35 +216,35 @@ describe('发布页', () => {
     expect(view.container.querySelector('.cgf-software-launcher, .cgf-software-drawer')).toBeNull();
   });
 
-  it('Agent 与 Xray 两页用同一套文案：已是新版、升级范围、批准', () => {
+  it('Agent 与 Xray 共用已一致状态和冻结的逐台选择范围', () => {
     draft.init('deployment-overview');
     draft.clear();
     mount();
 
     fireEvent.click(screen.getByRole('tab', { name: 'Agent' }));
     expect(screen.getByRole('tab', { name: 'Agent' }).getAttribute('aria-selected')).toBe('true');
-    const agentLedger = screen.getByRole('region', { name: '已是新版' });
-    expect(within(agentLedger).getByText('可发 v0.2.0 · 升级范围：全部机器')).toBeTruthy();
+    const agentLedger = screen.getByRole('region', { name: '已一致' });
+    expect(within(agentLedger).getByText('可发 v0.2.0 · 升级范围：逐台选择')).toBeTruthy();
     expect(screen.getByRole('table', { name: '逐台 Agent 升级状态' })).toBeTruthy();
     expect(screen.queryByRole('group', { name: '升级范围' })).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: '升级 Agent' }));
     const agentScope = screen.getByRole('group', { name: '升级范围' });
-    expect(within(agentScope).getByRole('button', { name: '全部机器' }).getAttribute('aria-pressed')).toBe('true');
-    expect(within(agentScope).getByText(/^批准后 10 分钟内，所有机器自行下载校验、升级 Agent 并重启/)).toBeTruthy();
+    expect(within(agentScope).getByText('勾选下方可升级的机器')).toBeTruthy();
+    expect(within(agentScope).queryByRole('button', { name: '全部机器' })).toBeNull();
     expect((within(agentScope).getByRole('button', { name: '批准' }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(within(agentScope).getByRole('button', { name: '取消' }));
     expect(screen.queryByRole('group', { name: '升级范围' })).toBeNull();
 
     fireEvent.click(screen.getByRole('tab', { name: 'Xray1' }));
-    const xrayLedger = screen.getByRole('region', { name: '已是新版' });
+    const xrayLedger = screen.getByRole('region', { name: '已一致' });
     expect(within(xrayLedger).getByText('可发 v26.4.25 · 升级范围：逐台选择')).toBeTruthy();
     expect(screen.getByText('可升级', { selector: '.cgc-st' })).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: '升级 Xray' }));
     const xrayScope = screen.getByRole('group', { name: '升级范围' });
     expect(within(xrayScope).getByText('勾选下方可升级的机器')).toBeTruthy();
-    expect(within(xrayScope).getByText(/^批准后，勾选的机器自行下载校验、升级 Xray 并重启/)).toBeTruthy();
+    expect(within(xrayScope).getByText(/^批准时冻结本次机器名单。Xray 替换后验证监听与运行摘要/)).toBeTruthy();
     fireEvent.click(screen.getByLabelText('升级 东京入口'));
     expect(within(xrayScope).getByText('已选 1 台')).toBeTruthy();
     expect((within(xrayScope).getByRole('button', { name: '批准' }) as HTMLButtonElement).disabled).toBe(false);
@@ -262,14 +262,18 @@ describe('发布页', () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input) === '/nodes/agent-state') return json({ nodes: [] });
         requested = String(input);
         return json({
-          available_release_id: 'xray-release',
-          available_xrays: [{ arch: 'x86_64', sha256: 'c'.repeat(64) }],
-          xray_version: '26.4.25',
-          console_version: '0.2.0',
-          build_commit: 'test',
-          releases: [{ ...activeRelease, status: 'canceled', active: false }],
+          available: {
+            component: 'xray',
+            build_id: 'xray-release',
+            version: '26.4.25',
+            artifacts: [{ arch: 'x86_64', sha256: 'c'.repeat(64) }],
+            source: 'embedded',
+          },
+          current: { ...activeRelease, status: 'canceled', active: false },
+          legacy_approval: null,
         });
       }),
     );
@@ -283,9 +287,9 @@ describe('发布页', () => {
     expect(screen.getByText('升级中', { selector: '.cgc-st' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: '升级 Xray' })).toBeNull();
 
-    fireEvent.click(screen.getByRole('button', { name: '取消升级' }));
-    const dialog = screen.getByRole('dialog', { name: '取消 Xray 升级？' });
-    fireEvent.click(within(dialog).getByRole('button', { name: '取消升级' }));
-    await waitFor(() => expect(requested).toBe('/xray-releases/7/cancel'));
+    fireEvent.click(screen.getByRole('button', { name: '停止发布' }));
+    const dialog = screen.getByRole('dialog', { name: '停止 Xray 发布？' });
+    fireEvent.click(within(dialog).getByRole('button', { name: '停止发布' }));
+    await waitFor(() => expect(requested).toBe('/binary-releases/xray/7/cancel'));
   });
 });

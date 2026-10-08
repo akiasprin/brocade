@@ -115,7 +115,7 @@ export function Login({ branding, onLogin }: { branding: BrandingSettings; onLog
   );
 }
 
-/* 登录页版式：左侧品牌区（图标、字标、线路示意），右侧标题与表单，表单直接落在台面上。
+/* 登录页版式：左侧品牌区（图标、字标、线路示意），右侧标题与表单落在一张卡片里。
    登录、初始化与直达登录共用。窄屏改为上下排列，品牌区只留图标与字标（见 styles.css）。 */
 function LoginLayout({
   branding,

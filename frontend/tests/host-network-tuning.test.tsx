@@ -34,7 +34,9 @@ describe('host network tuning settings', () => {
 
     expect((view.getByLabelText('GRO 刷新等待') as HTMLInputElement).value).toBe('20000');
     expect((view.getByLabelText('NAPI 延迟硬中断轮数') as HTMLInputElement).value).toBe('2');
-    expect(view.getByLabelText('GRO 刷新等待').closest('.host-network-tuning-grid.settings-field-grid-two')).toBeTruthy();
+    expect(
+      view.getByLabelText('GRO 刷新等待').closest('.host-network-tuning-grid.settings-field-grid-two'),
+    ).toBeTruthy();
     const note = view.container.querySelector('.settings-block-note');
     expect(note?.textContent).toContain('gro_flush_timeout');
     expect(note?.textContent).toContain('napi_defer_hard_irqs');

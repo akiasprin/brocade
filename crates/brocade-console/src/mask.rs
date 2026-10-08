@@ -478,6 +478,29 @@ mod tests {
     }
 
     #[test]
+    fn machine_notification_ip_changes_are_masked_by_value() {
+        let mut value = json!({
+            "latest_event_id": 7,
+            "events": [{
+                "id": 7,
+                "node_id": "hk-1",
+                "node_name": "香港机器",
+                "event_kind": "public_ip_changed",
+                "family": 4,
+                "previous_value": "198.51.100.20",
+                "current_value": "203.0.113.42",
+                "occurred_at": "2026-10-06T16:00:00+08:00"
+            }]
+        });
+
+        mask_json(&mut value);
+
+        assert_eq!(value["events"][0]["previous_value"], "198.51.***.***");
+        assert_eq!(value["events"][0]["current_value"], "203.0.***.***");
+        assert_eq!(value["events"][0]["node_name"], "香港机器");
+    }
+
+    #[test]
     fn vpngate_catalogue_keeps_evidence_but_masks_dialable_server_identity() {
         let mut value = json!({
             "status": {

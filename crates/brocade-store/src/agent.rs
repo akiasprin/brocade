@@ -312,6 +312,8 @@ pub async fn record_node_poll(
                 Some(previous),
                 Some("online"),
                 server_now,
+                None,
+                None,
             )
             .await?;
         }

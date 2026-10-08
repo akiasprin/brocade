@@ -9,6 +9,7 @@ pub mod http;
 pub mod lifecycle;
 pub mod mask;
 pub mod notifications;
+pub mod performance;
 pub mod realtime;
 pub mod tunnel_probe;
 pub mod vpngate;

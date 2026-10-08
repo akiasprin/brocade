@@ -3,6 +3,7 @@ crates/*/target/
 /node_modules/
 frontend/dist/
 frontend/node_modules/
+*.tsbuildinfo
 __pycache__/
 .env
 *.local
@@ -11,4 +12,5 @@ __pycache__/
 /.claude/worktrees/
 /mockups/
 /handbook/
+/incident-reports/
 .gstack/

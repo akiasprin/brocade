@@ -12,19 +12,23 @@
 //!
 //! 1. Ask. 204 means nothing to do, which is the answer nearly every round.
 //! 2. Compare against the sha256 of the running binary (`identity.rs`). Equal means this machine
-//!    already took the release — the common case after a successful upgrade, and the reason this
-//!    can run on a timer without needing to remember anything across restarts.
+//!    already runs these bytes. A tracked release still needs a durable result; digest equality
+//!    alone must not be mistaken for evidence that this process performed the update.
 //! 3. Download to the state directory, which is 0700.
 //! 4. Verify the sha256 before anything is executed or installed.
 //! 5. **Run the candidate once** before it replaces anything. This is what stops a binary that
 //!    cannot execute on this machine — wrong architecture, truncated download, a libc assumption
 //!    that does not hold here — from becoming the installed one. `install.sh` gates on the same
 //!    signal for the same reason.
-//! 6. Stage next to the real binary and `rename` over it. Not `install`(1) and not writing in
+//! 6. Recheck the assignment and persist its pending receipt, then stage next to the real binary
+//!    and `rename` over it. Not `install`(1) and not writing in
 //!    place: opening a running executable for writing returns `ETXTBSY`. `rename` is atomic, and
 //!    the running process keeps its own inode until it exits.
 //! 7. Ask the main loop to exit. The installed service supervisor starts the new one five seconds
 //!    later (`Restart=always` on systemd, `supervise-daemon` on OpenRC).
+//! 8. The new process reports installed/running digests from the pending receipt. Console also
+//!    requires fresh polling and runtime reports from these bytes. Retry the durable receipt
+//!    until acknowledged; a legacy updater without receipts is explicitly observation-confirmed.
 //!
 //! # This depends on something restarting the process
 //!
@@ -73,7 +77,10 @@ use std::{
     time::Duration,
 };
 
-use brocade_deployment::protocol::BinarySource;
+use brocade_deployment::protocol::{
+    AgentReleaseOffer, AgentReleaseOutcome, AgentReleaseReport, BinarySource,
+};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     command::{capture_command_with_timeout, run_shell_with_timeout},
@@ -98,63 +105,273 @@ const STAGING_FILE: &str = ".brocade-agent.new";
 ///
 /// Returning rather than exiting here: the process must not disappear in the middle of a
 /// convergence, so the decision to leave belongs to the main loop.
+const PENDING_FILE: &str = "agent-release-pending.json";
+const MAX_PENDING_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingUpdate {
+    offer: AgentReleaseOffer,
+    /// Frozen path verified before replacement; /proc/self/exe may later name a deleted inode.
+    target: PathBuf,
+    /// None means replacement was prepared but no new process has confirmed it yet.
+    report: Option<AgentReleaseReport>,
+}
+
 pub(crate) fn selfupdate_cycle(options: &Options) -> Result<bool, String> {
     let Some(running) = identity::self_sha256() else {
-        // `identity` already said why, once, at startup. Self-update cannot proceed without
-        // knowing what is running: every round would download and install the same binary again.
         return Ok(false);
     };
+    if let Some(mut pending) = read_pending(&options.state_dir.join(PENDING_FILE))? {
+        if pending.report.is_none() {
+            let installed = file_sha256_hex(&pending.target).ok();
+            // A crash between rename and requesting exit is recoverable without executing the
+            // replacement twice. Only the new process is allowed to claim running success.
+            if installed.as_deref() == Some(&pending.offer.sha256)
+                && running != pending.offer.sha256
+            {
+                return Ok(true);
+            }
+            pending.report = Some(result_report(
+                &pending.offer,
+                running,
+                installed,
+                true,
+                None,
+            )?);
+            write_pending(options, &pending)?;
+        }
+        send_pending(options, &pending)?;
+        return Ok(false);
+    }
+    let Some(offer) = fetch_offer(options)? else {
+        return Ok(false);
+    };
+    validate_offer(&offer)?;
+    let target = self_path()?;
+    let tracked = offer.release_id.is_some();
+    if offer.sha256 == running {
+        // Bootstrap from a pre-ledger Agent has no durable update receipt. The Console labels
+        // this as observed confirmation and requires fresh post-dispatch runtime evidence.
+        if tracked {
+            let pending = PendingUpdate {
+                report: Some(result_report(
+                    &offer,
+                    running,
+                    file_sha256_hex(&target).ok(),
+                    false,
+                    None,
+                )?),
+                offer,
+                target,
+            };
+            write_pending(options, &pending)?;
+            send_pending(options, &pending)?;
+        }
+        return Ok(false);
+    }
+    let download = options.state_dir.join(DOWNLOAD_FILE);
+    let source = BinarySource {
+        url: offer.url.clone(),
+        sha256: offer.sha256.clone(),
+    };
+    let guard = || {
+        if let Some(previous) = &offer.previous_sha256 {
+            if previous != running || file_sha256_hex(&target)? != *previous {
+                return Err("Agent 本地摘要已偏离批准时状态，未替换".to_owned());
+            }
+        }
+        if tracked {
+            let current = fetch_offer(options)?;
+            if current.as_ref() != Some(&offer) {
+                return Err("Agent 发布已停止或尝试编号已变化，未替换".to_owned());
+            }
+            write_pending(
+                options,
+                &PendingUpdate {
+                    offer: offer.clone(),
+                    target: target.clone(),
+                    report: None,
+                },
+            )?;
+        }
+        Ok(())
+    };
+    let outcome = install_release(&source, &offer.sha256, &download, &target, guard);
+    let _ = fs::remove_file(&download);
+    if let Err(error) = outcome {
+        if tracked && file_sha256_hex(&target).ok().as_deref() == Some(&offer.sha256) {
+            // Rename committed but directory fsync failed. Keep the prepared receipt and let
+            // the new process prove the actual state, rather than overwrite it with a failure.
+            warn(format!("selfupdate: 替换已完成，持久化确认有异常：{error}"));
+            return Ok(true);
+        }
+        if tracked {
+            let pending = PendingUpdate {
+                report: Some(result_report(
+                    &offer,
+                    running,
+                    file_sha256_hex(&target).ok(),
+                    false,
+                    Some(error.clone()),
+                )?),
+                offer,
+                target,
+            };
+            write_pending(options, &pending)?;
+            send_pending(options, &pending)?;
+        }
+        return Err(error);
+    }
+    println!(
+        "selfupdate: 已安装 {}，等待安全退出及新进程确认",
+        short(&offer.sha256)
+    );
+    Ok(true)
+}
 
-    let client = HttpClient::new(&options.server)?;
-    let response = client.request_with_headers(
+fn fetch_offer(options: &Options) -> Result<Option<AgentReleaseOffer>, String> {
+    let response = HttpClient::new(&options.server)?.request_with_headers(
         "GET",
         "/agent/v1/agent-release",
         &options.token,
         None,
-        &[(ARCH_HEADER, identity::self_arch().to_owned())],
+        &[
+            (ARCH_HEADER, identity::self_arch().to_owned()),
+            ("x-brocade-agent-release-receipt", "1".to_owned()),
+        ],
     )?;
     if response.status == 204 {
-        return Ok(false);
+        return Ok(None);
     }
     if !(200..300).contains(&response.status) {
-        return Err(format!(
-            "问不到该装哪个 agent: HTTP {} {}",
-            response.status, response.body
-        ));
+        return Err(format!("Agent 发布查询失败：HTTP {}", response.status));
     }
-    let release: BinarySource =
-        serde_json::from_str(&response.body).map_err(|error| format!("发布响应读不懂: {error}"))?;
+    serde_json::from_str(&response.body)
+        .map(Some)
+        .map_err(|e| format!("Agent 发布响应无效：{e}"))
+}
 
-    let wanted = release.sha256.trim().to_ascii_lowercase();
-    if wanted == running {
-        // Already the released build. The control plane keeps saying so every round, and that is
-        // fine — it is one small response, and it is what makes this loop stateless.
-        return Ok(false);
+fn valid_digest(sha: &str) -> bool {
+    sha.len() == 64
+        && sha
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+fn validate_offer(offer: &AgentReleaseOffer) -> Result<(), String> {
+    if !valid_digest(&offer.sha256) {
+        return Err("Agent 目标摘要无效".to_owned());
     }
-    if wanted.len() != 64 || !wanted.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!("发布的 sha256 不成形: {wanted}"));
+    match (
+        offer.release_id,
+        offer.attempt,
+        offer.previous_sha256.as_deref(),
+    ) {
+        (None, None, None) => Ok(()), // old Console
+        (Some(id), Some(attempt), Some(before))
+            if id > 0 && (1..=32).contains(&attempt) && valid_digest(before) =>
+        {
+            Ok(())
+        }
+        _ => Err("Agent 发布单身份不完整".to_owned()),
     }
+}
 
-    let target = self_path()?;
-    let download = options.state_dir.join(DOWNLOAD_FILE);
-    println!(
-        "selfupdate: 控制面要求换成 {}（当前 {}），开始下载",
-        short(&wanted),
-        short(running)
-    );
+fn read_pending(path: &Path) -> Result<Option<PendingUpdate>, String> {
+    use std::io::Read;
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("读取 Agent 发布回执失败：{e}")),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_PENDING_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_PENDING_BYTES {
+        return Err("Agent 发布回执超出大小限制".to_owned());
+    }
+    let pending: PendingUpdate =
+        serde_json::from_slice(&bytes).map_err(|e| format!("Agent 发布回执无效：{e}"))?;
+    validate_offer(&pending.offer)?;
+    if pending.offer.release_id.is_none() || !pending.target.is_absolute() {
+        return Err("Agent 发布回执缺少发布身份或安装路径".to_owned());
+    }
+    if pending.report.as_ref().is_some_and(|report| {
+        Some(report.release_id) != pending.offer.release_id
+            || Some(report.attempt) != pending.offer.attempt
+    }) {
+        return Err("Agent 发布回执与批准身份不一致".to_owned());
+    }
+    Ok(Some(pending))
+}
 
-    // Failures leave nothing behind. A stale candidate is not dangerous — every round verifies
-    // before it installs — but it is confusing to find, and it is a whole agent's worth of disk on
-    // a machine that may not have much.
-    let outcome = install_release(&release, &wanted, &download, &target);
-    let _ = fs::remove_file(&download);
-    outcome?;
+fn write_pending(options: &Options, pending: &PendingUpdate) -> Result<(), String> {
+    let encoded = serde_json::to_vec(pending).map_err(|e| e.to_string())?;
+    crate::fsutil::atomic_write_private(&options.state_dir.join(PENDING_FILE), &encoded)
+}
 
-    println!(
-        "selfupdate: 已换上 {}，等这一轮收敛做完就退出，交给服务管理器拉起",
-        short(&wanted)
-    );
-    Ok(true)
+fn result_report(
+    offer: &AgentReleaseOffer,
+    running: &str,
+    installed: Option<String>,
+    performed_update: bool,
+    error: Option<String>,
+) -> Result<AgentReleaseReport, String> {
+    let healthy =
+        error.is_none() && running == offer.sha256 && installed.as_deref() == Some(running);
+    Ok(AgentReleaseReport {
+        release_id: offer.release_id.ok_or("missing Agent release id")?,
+        attempt: offer.attempt.ok_or("missing Agent release attempt")?,
+        outcome: if healthy {
+            AgentReleaseOutcome::Running
+        } else {
+            AgentReleaseOutcome::Failed
+        },
+        performed_update,
+        installed_sha256: installed,
+        running_sha256: Some(running.to_owned()),
+        error: if healthy {
+            None
+        } else {
+            Some(
+                error
+                    .unwrap_or_else(|| "重启后未运行目标 Agent".to_owned())
+                    .chars()
+                    .take(4_000)
+                    .collect(),
+            )
+        },
+    })
+}
+
+fn send_pending(options: &Options, pending: &PendingUpdate) -> Result<(), String> {
+    let report = pending
+        .report
+        .as_ref()
+        .ok_or("Agent replacement has not been confirmed")?;
+    let body = serde_json::to_string(report).map_err(|e| e.to_string())?;
+    let response = HttpClient::new(&options.server)?.request(
+        "POST",
+        "/agent/v1/agent-release/report",
+        &options.token,
+        Some(&body),
+    )?;
+    if !(200..300).contains(&response.status) {
+        return Err(format!("Agent 发布回执待确认：HTTP {}", response.status));
+    }
+    #[derive(Deserialize)]
+    struct Ack {
+        accepted: bool,
+    }
+    let ack: Ack =
+        serde_json::from_str(&response.body).map_err(|e| format!("Agent 回执响应无效：{e}"))?;
+    if !ack.accepted {
+        println!("selfupdate: 本次回执已过期，停止补报");
+    }
+    fs::remove_file(options.state_dir.join(PENDING_FILE))
+        .map_err(|e| format!("清理 Agent 回执失败：{e}"))?;
+    Ok(())
 }
 
 fn install_release(
@@ -162,6 +379,7 @@ fn install_release(
     wanted: &str,
     download: &Path,
     target: &Path,
+    before_replace: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     fetch(&release.url, download)?;
 
@@ -198,10 +416,22 @@ fn install_release(
     }
     // The only irreversible step, and it is atomic: readers of this path either see the whole old
     // file or the whole new one. The running process keeps the old inode regardless.
+    fs::File::open(&staging)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("同步 Agent 暂存文件失败：{e}"))?;
+    if let Err(error) = before_replace() {
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
     fs::rename(&staging, target).map_err(|error| {
         let _ = fs::remove_file(&staging);
         format!("换 {} 失败: {error}", target.display())
     })?;
+    if let Some(parent) = target.parent() {
+        fs::File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| format!("同步 Agent 安装目录失败：{e}"))?;
+    }
     Ok(())
 }
 
@@ -213,7 +443,7 @@ fn install_release(
 fn fetch(url: &str, into: &Path) -> Result<(), String> {
     run_shell_with_timeout(
         &format!(
-            "curl -fsSL --connect-timeout 15 --max-time 300 {} -o {}",
+            "curl -fsSL --connect-timeout 15 --max-time 300 --max-filesize 134217728 {} -o {}",
             shell_quote(url),
             shell_quote(&into.to_string_lossy())
         ),
@@ -312,7 +542,15 @@ pub(crate) fn spawn_selfupdate(options: &Options, wants_exit: &Arc<AtomicBool>) 
                 Ok(false) => {}
                 Err(error) => warn(format!("selfupdate: {error}")),
             });
-            std::thread::sleep(SELFUPDATE_INTERVAL);
+            if wants_exit.load(Ordering::SeqCst) {
+                break;
+            }
+            let interval = if options.state_dir.join(PENDING_FILE).exists() {
+                Duration::from_secs(15)
+            } else {
+                SELFUPDATE_INTERVAL
+            };
+            std::thread::sleep(interval);
         });
     if let Err(error) = spawned {
         // Not fatal. A machine that cannot self-update still converges, still reports, and still
@@ -328,6 +566,85 @@ pub(crate) const SELFUPDATE_INTERVAL: std::time::Duration = std::time::Duration:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tracked_offer() -> AgentReleaseOffer {
+        AgentReleaseOffer {
+            url: "https://console.example/agent".to_owned(),
+            sha256: "a".repeat(64),
+            release_id: Some(7),
+            attempt: Some(2),
+            previous_sha256: Some("b".repeat(64)),
+        }
+    }
+
+    #[test]
+    fn replacement_is_not_success_until_the_new_process_is_running() {
+        let offer = tracked_offer();
+        let before = result_report(
+            &offer,
+            &"b".repeat(64),
+            Some(offer.sha256.clone()),
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(before.outcome, AgentReleaseOutcome::Failed);
+        let after = result_report(
+            &offer,
+            &offer.sha256,
+            Some(offer.sha256.clone()),
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(after.outcome, AgentReleaseOutcome::Running);
+        assert_eq!((after.release_id, after.attempt), (7, 2));
+        let observed = result_report(
+            &offer,
+            &offer.sha256,
+            Some(offer.sha256.clone()),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !observed.performed_update,
+            "legacy bootstrap must not invent a receipt"
+        );
+    }
+
+    #[test]
+    fn old_console_offer_is_supported_but_partial_tracking_is_rejected() {
+        let mut offer = tracked_offer();
+        assert!(validate_offer(&offer).is_ok());
+        offer.attempt = None;
+        assert!(validate_offer(&offer).is_err());
+        offer.release_id = None;
+        offer.previous_sha256 = None;
+        assert!(validate_offer(&offer).is_ok());
+        offer.sha256 = "A".repeat(64);
+        assert!(validate_offer(&offer).is_err());
+    }
+
+    #[test]
+    fn prepared_update_survives_a_restart_without_fabricating_a_report() {
+        let dir =
+            std::env::temp_dir().join(format!("brocade-agent-receipt-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PENDING_FILE);
+        let pending = PendingUpdate {
+            offer: tracked_offer(),
+            target: PathBuf::from("/usr/local/bin/brocade-agent"),
+            report: None,
+        };
+        crate::fsutil::atomic_write_private(&path, &serde_json::to_vec(&pending).unwrap()).unwrap();
+        let restored = read_pending(&path).unwrap().unwrap();
+        assert_eq!(restored.offer, pending.offer);
+        assert!(restored.report.is_none());
+        fs::write(&path, vec![0; MAX_PENDING_BYTES as usize + 1]).unwrap();
+        assert!(read_pending(&path).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn short_is_twelve_hex_and_survives_a_short_input() {
@@ -376,7 +693,7 @@ mod tests {
             url: format!("file://{}", source.display()),
             sha256: "f".repeat(64),
         };
-        let error = install_release(&release, &"f".repeat(64), &download, &target)
+        let error = install_release(&release, &"f".repeat(64), &download, &target, || Ok(()))
             .expect_err("sha 对不上就不该装");
         assert!(error.contains("对不上"), "{error}");
 
@@ -388,5 +705,33 @@ mod tests {
         // And nothing was staged next to it either.
         assert!(!dir.join(STAGING_FILE).exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn canceled_assignment_cannot_replace_binary_and_cleans_staging() {
+        let dir = std::env::temp_dir().join(format!("brocade-agent-fence-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("candidate");
+        fs::write(&source, b"#!/bin/sh\nprintf 'expected run\\n'\n").unwrap();
+        let target = dir.join("brocade-agent");
+        fs::write(&target, b"old binary").unwrap();
+        let wanted = file_sha256_hex(&source).unwrap();
+        let release = BinarySource {
+            url: format!("file://{}", source.display()),
+            sha256: wanted.clone(),
+        };
+        let error = install_release(&release, &wanted, &dir.join(DOWNLOAD_FILE), &target, || {
+            Err("assignment canceled".to_owned())
+        })
+        .unwrap_err();
+        assert_eq!(error, "assignment canceled");
+        assert_eq!(fs::read(&target).unwrap(), b"old binary");
+        assert!(!dir.join(STAGING_FILE).exists());
+        install_release(&release, &wanted, &dir.join(DOWNLOAD_FILE), &target, || {
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(file_sha256_hex(&target).unwrap(), wanted);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

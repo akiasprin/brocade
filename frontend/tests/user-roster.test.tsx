@@ -73,9 +73,40 @@ beforeEach(() => {
       if (String(input) === '/grant-probes/capability') {
         return Response.json({ available: false, reason: '测试中不发起拨测' });
       }
+      // 详情打开即读取离线来源；默认没有离线记录
+      const history = String(input).match(/^\/users\/([^/]+)\/([^/]+)\/presence-history$/);
+      if (history) {
+        return Response.json({
+          tenant_id: history[1],
+          user_id: history[2],
+          retention_days: 30,
+          truncated: false,
+          sources: [],
+        });
+      }
       throw new Error(`unexpected ${String(input)}`);
     }),
   );
+});
+
+// 详情打开后的后台读取只有拨测能力和当前用户的离线来源，其余请求都来自显式操作。
+const backgroundReadsOnly = () =>
+  vi
+    .mocked(fetch)
+    .mock.calls.every(
+      ([input]) => String(input) === '/grant-probes/capability' || String(input).endsWith('/presence-history'),
+    );
+const readingOf = (card: HTMLElement) => card.querySelector('header .rt')?.textContent;
+const two = (value: number) => String(value).padStart(2, '0');
+const HOUR = 3_600_000;
+const offlineSource = (ip: string, lastSeen: number, protocols: string[]) => ({
+  ip,
+  first_observed_at: new Date(lastSeen - HOUR).toISOString(),
+  last_observed_at: new Date(lastSeen).toISOString(),
+  xray_last_seen_at: new Date(lastSeen - 60_000).toISOString(),
+  node_ids: ['n1'],
+  ingress_ids: ['tyo-iij'],
+  accesses: [{ node_id: 'n1', ingress_id: 'tyo-iij', protocols }],
 });
 afterEach(() => {
   cleanup();
@@ -212,25 +243,62 @@ describe('user roster rows', () => {
 
   it('switches details immediately while preserving the roster and isolating per-user editors', () => {
     const { view, selectUser } = mount();
+    const quotaInput = () => view.queryByRole('textbox', { name: '东京 的月度额度（GiB）' }) as HTMLInputElement | null;
     const roster = view.getByRole('listbox', { name: '用户列表' });
     const aliceDetail = view.container.querySelector('.user-split-detail');
     fireEvent.click(view.getByRole('button', { name: '改额度' }));
-    expect(view.getByPlaceholderText('留空 = 不限').getAttribute('value')).toBe('100');
+    expect(quotaInput()?.value).toBe('100');
 
     selectUser('dave');
     const daveDetail = view.container.querySelector('.user-split-detail');
     expect(view.getByRole('listbox', { name: '用户列表' })).toBe(roster);
     expect(daveDetail).not.toBe(aliceDetail);
     expect(daveDetail?.querySelector('.dname > b')?.textContent).toBe('dave');
-    expect(view.queryByPlaceholderText('留空 = 不限')).toBeNull();
+    expect(quotaInput()).toBeNull();
     expect(view.queryByText('加载中…')).toBeNull();
     fireEvent.click(view.getByRole('button', { name: '改额度' }));
-    expect(view.getByPlaceholderText('留空 = 不限').getAttribute('value')).toBe('50');
+    expect(quotaInput()?.value).toBe('50');
 
     selectUser('alice');
     expect(view.getByRole('listbox', { name: '用户列表' })).toBe(roster);
     expect(view.container.querySelector('.user-split-detail .dname > b')?.textContent).toBe('alice');
-    expect(view.queryByPlaceholderText('留空 = 不限')).toBeNull();
+    expect(quotaInput()).toBeNull();
+  });
+
+  it('reads the month and every route of the selected user in one usage card', () => {
+    const { view, selectUser } = mount();
+    const card = () => view.container.querySelector<HTMLElement>('.user-usage-card')!;
+    expect(card().querySelector('header .rt')?.textContent).toBe('1 条线路');
+    expect(card().querySelector('.user-usage-hero-value')?.textContent).toBe('54.10 GiB');
+    expect([...card().querySelectorAll('.usage-io dd:not(.usage-share)')].map(cell => cell.textContent)).toEqual([
+      '0 B',
+      '54.10 GiB',
+    ]);
+    const tokyo = card().querySelector<HTMLElement>('.qta-r')!;
+    expect(tokyo.classList.contains('ok')).toBe(true);
+    expect(tokyo.querySelector('.qta-app')?.textContent).toBe('东京');
+    expect(tokyo.querySelectorAll('.qta-app .geo-flag')).toHaveLength(1);
+    // 线路名在前，地区旗跟在名字后面。
+    expect([...tokyo.querySelector('.qta-app')!.children].map(child => child.tagName.toLowerCase())).toEqual([
+      'b',
+      'span',
+    ]);
+    expect(tokyo.querySelector('.qta-app > :last-child')?.classList.contains('qta-flags')).toBe(true);
+    expect(tokyo.querySelector('.qta-sub')?.textContent).toBe('东京 IIJ');
+    expect(tokyo.querySelector('.qta-figs')?.textContent).toBe('54.10GiB/ 100 GiB');
+    expect(tokyo.querySelector('.qta-left')?.textContent).toBe('剩余45.90 GiB');
+    expect(card().querySelector('.user-dcard-foot')).toBeNull();
+
+    // dave 用尽额度：执行器撤销的接入点不在 grants 里，只能从额度记录读出。
+    selectUser('dave');
+    const daveRoute = card().querySelector<HTMLElement>('.qta-r')!;
+    expect(daveRoute.classList.contains('over')).toBe(true);
+    expect(daveRoute.querySelector('.qta-sub.stop')?.textContent).toBe('系统已停用 1 个接入点');
+    expect(daveRoute.querySelector('.qta-sub.stop')?.getAttribute('title')).toBe(
+      '东京 IIJ 已被系统停用；补足额度或月初重置后自动恢复',
+    );
+    expect(daveRoute.querySelector('.qta-left')?.textContent).toBe('超出419.8 MiB');
+    expect(daveRoute.querySelector('.qta-pct')?.textContent).toBe('101%');
   });
 
   it('shows online sources and quota for a normal user without a status lamp', () => {
@@ -244,14 +312,16 @@ describe('user roster rows', () => {
     expect(alice.querySelector('.user-row-quota')?.getAttribute('title')).toBe('额度 余裕');
     expect(alice.querySelectorAll('.user-quota-ring circle')).toHaveLength(2);
     expect(alice.querySelector('.user-quota-ring.over')).toBeNull();
-    expect(view.container.querySelector('.user-dcard .qta-meta > span')?.textContent).toBe('54%');
+    expect(view.container.querySelector('.user-dcard .qta-pct')?.textContent).toBe('54%');
     expect(alice.querySelector('.user-row-chip')).toBeNull();
     expect(view.getByText('1.1.1.1')).toBeTruthy();
     expect(view.getByRole('button', { name: '复制来源 IP 1.1.1.1' })).toBeTruthy();
   });
 
-  it('loads historical source IPs only after an administrator expands them', async () => {
+  it('reads offline sources with the detail and groups them by the day they were last seen', async () => {
     const historyPath = `/users/${tenant}/alice/presence-history`;
+    // 以本地当天零点为基准，分组不随测试运行的时刻变化
+    const today = new Date().setHours(0, 0, 0, 0);
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
       if (path === '/grant-probes/capability') {
@@ -266,15 +336,10 @@ describe('user roster rows', () => {
           source_countries: [{ ip: '8.8.8.8', country: 'JP' }],
           source_operators: [{ ip: '8.8.8.8', operator: 'cernet' }],
           sources: [
-            {
-              ip: '8.8.8.8',
-              first_observed_at: '2026-09-28T00:00:00Z',
-              last_observed_at: '2026-09-29T00:00:00Z',
-              xray_last_seen_at: '2026-09-28T23:59:58Z',
-              node_ids: ['n1'],
-              ingress_ids: ['tyo-iij'],
-              accesses: [{ node_id: 'n1', ingress_id: 'tyo-iij', protocols: ['hysteria2'] }],
-            },
+            offlineSource('8.8.8.8', today + 60_000, ['hysteria2']),
+            offlineSource('9.9.9.9', today - 12 * HOUR, ['vless']),
+            offlineSource('2001:db8::5', today - 60 * HOUR, ['anytls']),
+            offlineSource('4.4.4.4', today - 20 * 24 * HOUR, ['vless']),
           ],
         });
       }
@@ -282,29 +347,104 @@ describe('user roster rows', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
     const { view } = mount();
-    const toggle = view.getByRole('button', { name: '历史来源 IP' });
+    const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
 
-    expect(toggle.getAttribute('aria-expanded')).toBe('false');
-    expect(view.queryByText('8.8.8.8')).toBeNull();
-    expect(fetchMock.mock.calls.some(([input]) => String(input) === historyPath)).toBe(false);
-
-    fireEvent.click(toggle);
-    expect(toggle.getAttribute('aria-expanded')).toBe('true');
-    expect(await view.findByText('8.8.8.8')).toBeTruthy();
-    expect(view.getByText('最近 30 天 · 1 个已离线来源')).toBeTruthy();
-    const historyRow = view.getByText('8.8.8.8').closest('.user-presence-source')!;
-    expect(within(historyRow as HTMLElement).getByText('日本 · 教育网')).toBeTruthy();
-    expect(within(historyRow as HTMLElement).getByText('曾接入')).toBeTruthy();
-    expect(within(historyRow as HTMLElement).getByRole('button', { name: '东京测试节点' })).toBeTruthy();
-    expect(within(historyRow as HTMLElement).queryByText('Hysteria2')).toBeNull();
-    fireEvent.click(within(historyRow as HTMLElement).getByRole('button', { name: '8.8.8.8 的最后观测协议' }));
-    expect(within(historyRow as HTMLElement).getByText('最后观测协议')).toBeTruthy();
-    expect(within(historyRow as HTMLElement).getByText('Hysteria2')).toBeTruthy();
+    expect(await within(card).findByText('8.8.8.8')).toBeTruthy();
     expect(fetchMock.mock.calls.filter(([input]) => String(input) === historyPath)).toHaveLength(1);
+    expect(readingOf(card)).toBe('在线 1 · 30 天 5 个地址');
+    expect([...card.querySelectorAll('.user-presence-day')].map(day => day.textContent)).toEqual([
+      '在线',
+      '今天',
+      '昨天',
+    ]);
+    const recent = view.getByText('8.8.8.8').closest<HTMLElement>('.user-presence-row')!;
+    expect(recent.classList.contains('off')).toBe(true);
+    expect(recent.querySelector('.user-presence-time')?.textContent).toBe('00:01');
+    expect(within(recent).getByText('日本 · 教育网')).toBeTruthy();
+    expect(within(recent).getByRole('button', { name: '东京测试节点' })).toBeTruthy();
+    expect(within(recent).getByText('Hysteria2')).toBeTruthy();
+    expect(within(recent).getByRole('button', { name: '复制历史来源 IP 8.8.8.8' })).toBeTruthy();
+    expect(within(card).getByText('9.9.9.9')).toBeTruthy();
+    expect(within(card).queryByText('2001:db8::5')).toBeNull();
+    expect(within(card).queryByText('4.4.4.4')).toBeNull();
 
-    fireEvent.click(toggle);
-    expect(toggle.getAttribute('aria-expanded')).toBe('false');
-    expect(view.queryByText('8.8.8.8')).toBeNull();
+    const older = within(card).getByRole('button', { name: '显示更早的 2 个来源' });
+    expect(older.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(older);
+    expect([...card.querySelectorAll('.user-presence-day')].map(day => day.textContent)).toEqual([
+      '在线',
+      '今天',
+      '昨天',
+      '7 天内',
+      '30 天内',
+    ]);
+    expect(within(card).getByText('2001:db8::5')).toBeTruthy();
+    const oldest = within(card).getByText('4.4.4.4').closest<HTMLElement>('.user-presence-row')!;
+    const oldestDay = new Date(today - 20 * 24 * HOUR);
+    expect(oldest.querySelector('.user-presence-time')?.textContent).toBe(
+      `${two(oldestDay.getMonth() + 1)}-${two(oldestDay.getDate())}`,
+    );
+    fireEvent.click(within(card).getByRole('button', { name: '收起更早的来源' }));
+    expect(within(card).queryByText('4.4.4.4')).toBeNull();
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === historyPath)).toHaveLength(1);
+  });
+
+  it('lists a returning address only once and summarizes an offline user by the last appearance', async () => {
+    const historyPath = `/users/${tenant}/alice/presence-history`;
+    const today = new Date().setHours(0, 0, 0, 0);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === '/grant-probes/capability') {
+        return Response.json({ available: false, reason: '测试中不发起拨测' });
+      }
+      if (path === historyPath) {
+        return Response.json({
+          tenant_id: tenant,
+          user_id: 'alice',
+          retention_days: 30,
+          truncated: false,
+          sources: [
+            offlineSource('1.1.1.1', today + 60_000, ['vless']),
+            offlineSource('8.8.8.8', today - 12 * HOUR, ['vless']),
+          ],
+        });
+      }
+      throw new Error(`unexpected ${path}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const { view, client } = mount();
+    const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
+
+    expect(await within(card).findByText('8.8.8.8')).toBeTruthy();
+    expect(within(card).getAllByText('1.1.1.1')).toHaveLength(1);
+    expect(within(card).getByText('1.1.1.1').closest('.user-presence-row')?.classList.contains('off')).toBe(false);
+    expect(readingOf(card)).toBe('在线 1 · 30 天 2 个地址');
+
+    const key = ['user-presence', 'system-admin'];
+    const data = client.getQueryData<UserPresenceList>(key)!;
+    act(() => client.setQueryData(key, { ...data, users: [{ ...data.users[0], sources: [] }] }));
+    await vi.waitFor(() => expect(readingOf(card)).toMatch(/^离线 · 最后出现 /));
+    expect(within(card).getByText('暂无在线连接')).toBeTruthy();
+    expect(within(card).getByText('1.1.1.1').closest('.user-presence-row')?.classList.contains('off')).toBe(true);
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === historyPath)).toHaveLength(2);
+  });
+
+  it('keeps a full IPv6 address copyable while dimming its interface identifier', async () => {
+    const { view, client } = mount();
+    const key = ['user-presence', 'system-admin'];
+    const data = client.getQueryData<UserPresenceList>(key)!;
+    const ip = '2408:8207:2464:1a50:4c3b:9f2e:11d0:7a21';
+    act(() =>
+      client.setQueryData(key, {
+        ...data,
+        users: [{ ...data.users[0], sources: [{ ...data.users[0].sources[0], ip }] }],
+      }),
+    );
+    const copy = await view.findByRole('button', { name: `复制来源 IP ${ip}` });
+    const row = copy.closest<HTMLElement>('.user-presence-row')!;
+    expect(row.querySelector('.user-presence-ip > code')?.textContent).toBe(ip);
+    expect(row.querySelector('.user-presence-iid')?.textContent).toBe(':4c3b:9f2e:11d0:7a21');
+    expect(row.querySelectorAll('.user-presence-iid wbr')).toHaveLength(4);
   });
 
   it('shows only access point counts to a signed-in user and never requests presence', () => {
@@ -316,25 +456,25 @@ describe('user roster rows', () => {
     expect(view.queryByText('在线接入')).toBeNull();
     expect(view.queryByText('台湾')).toBeNull();
     expect(view.queryByText('1.1.1.1')).toBeNull();
-    expect(view.queryByRole('button', { name: '历史来源 IP' })).toBeNull();
+    expect(view.container.querySelector('.user-presence-card')).toBeNull();
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/presence'))).toBe(false);
   });
 
-  it('shows local source location and node names with working node navigation', () => {
+  it('shows local source location and node names with working node navigation', async () => {
     const navigate = vi.spyOn(route, 'navigate').mockReturnValue(true);
     const { view } = mount();
     const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
     expect(within(card).getByText('在线接入')).toBeTruthy();
-    expect(within(card).getByText('1 个公网来源 · 覆盖 1 台节点')).toBeTruthy();
+    await vi.waitFor(() => expect(readingOf(card)).toBe('在线 1 · 30 天 1 个地址'));
     expect(within(card).getByText('台湾')).toBeTruthy();
     expect(within(card).getByRole('img', { name: 'TW 地区旗' })).toBeTruthy();
     fireEvent.click(within(card).getByRole('button', { name: '东京测试节点' }));
     expect(navigate).toHaveBeenCalledExactlyOnceWith('nodes', { p: 'node', id: 'n1' });
     expect(view.getByLabelText('已授权 1 个接入点')).toBeTruthy();
-    expect(vi.mocked(fetch).mock.calls.every(([input]) => String(input) === '/grant-probes/capability')).toBe(true);
+    expect(backgroundReadsOnly()).toBe(true);
   });
 
-  it('counts shared source IPs once globally and once per node, including IPv6', async () => {
+  it('lists every node of a shared source IP inline and counts the address once, including IPv6', async () => {
     const { view, client } = mount();
     const key = ['user-presence', 'system-admin'];
     const data = client.getQueryData<UserPresenceList>(key)!;
@@ -357,31 +497,22 @@ describe('user roster rows', () => {
       }),
     );
     const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
-    expect(await within(card).findByText('2 个公网来源 · 覆盖 2 台节点')).toBeTruthy();
-    const shared = view.getByText('1.1.1.1').closest<HTMLElement>('.user-presence-source')!;
-    const sharedToggle = within(shared).getByRole('button', { name: '接入 2 台节点' });
-    expect(sharedToggle.getAttribute('aria-expanded')).toBe('false');
-    fireEvent.click(sharedToggle);
-    expect(sharedToggle.getAttribute('aria-expanded')).toBe('true');
-    expect(within(shared).getByRole('list', { name: '1.1.1.1 的接入节点' })).toBeTruthy();
+    await vi.waitFor(() => expect(readingOf(card)).toBe('在线 2 · 30 天 2 个地址'));
+    const shared = view.getByText('1.1.1.1').closest<HTMLElement>('.user-presence-row')!;
     expect(within(shared).getByRole('button', { name: '东京测试节点' })).toBeTruthy();
     expect(within(shared).getByRole('button', { name: '澳门测试节点' })).toBeTruthy();
+    expect(within(shared).getAllByText('协议未知')).toHaveLength(2);
     expect(within(shared).getByText('位置未知')).toBeTruthy();
-    const v6 = view.getByText('2001:db8::1').closest<HTMLElement>('.user-presence-source')!;
+    const v6 = view.getByText('2001:db8::1').closest<HTMLElement>('.user-presence-row')!;
     expect(within(v6).getByText('澳门')).toBeTruthy();
   });
 
-  it('reveals actual protocols only on click and keeps unknown legacy observations explicit', async () => {
+  it('shows observed protocols inline and keeps unknown legacy observations explicit', async () => {
     const { view, client } = mount();
     const key = ['user-presence', 'system-admin'];
     const data = client.getQueryData<UserPresenceList>(key)!;
-    const row = view.getByText('1.1.1.1').closest<HTMLElement>('.user-presence-source')!;
-    const toggle = within(row).getByRole('button', { name: '1.1.1.1 的接入协议' });
-    expect(toggle.getAttribute('aria-expanded')).toBe('false');
-    expect(within(row).queryByText('协议未知')).toBeNull();
-    fireEvent.click(toggle);
+    const row = view.getByText('1.1.1.1').closest<HTMLElement>('.user-presence-row')!;
     expect(within(row).getByText('协议未知')).toBeTruthy();
-    expect(document.getElementById(toggle.getAttribute('aria-controls')!)).toBeTruthy();
     act(() =>
       client.setQueryData(key, {
         ...data,
@@ -403,13 +534,10 @@ describe('user roster rows', () => {
       }),
     );
     expect(await within(row).findByText('VLESS · AnyTLS · 协议未知')).toBeTruthy();
-    fireEvent.click(toggle);
-    expect(toggle.getAttribute('aria-expanded')).toBe('false');
-    expect(within(row).queryByText('VLESS · AnyTLS · 协议未知')).toBeNull();
-    expect(vi.mocked(fetch).mock.calls.every(([input]) => String(input) === '/grant-probes/capability')).toBe(true);
+    expect(backgroundReadsOnly()).toBe(true);
   });
 
-  it('keeps protocols associated with their own node inside the existing multi-node disclosure', async () => {
+  it('keeps protocols associated with their own node', async () => {
     const { view, client } = mount();
     const key = ['user-presence', 'system-admin'];
     const data = client.getQueryData<UserPresenceList>(key)!;
@@ -433,17 +561,17 @@ describe('user roster rows', () => {
         ],
       }),
     );
-    const toggle = await view.findByRole('button', { name: '接入 2 台节点' });
-    const row = view.getByText('1.1.1.1').closest<HTMLElement>('.user-presence-source')!;
-    expect(within(row).queryByText('VLESS')).toBeNull();
-    fireEvent.click(toggle);
-    const tokyo = within(row).getByRole('button', { name: '东京测试节点' }).closest('li')!;
-    const macau = within(row).getByRole('button', { name: '澳门测试节点' }).closest('li')!;
+    const row = view.getByText('1.1.1.1').closest<HTMLElement>('.user-presence-row')!;
+    const tokyo = (await within(row).findByRole('button', { name: '东京测试节点' })).closest<HTMLElement>(
+      '.user-presence-access-item',
+    )!;
+    const macau = within(row)
+      .getByRole('button', { name: '澳门测试节点' })
+      .closest<HTMLElement>('.user-presence-access-item')!;
     expect(within(tokyo).getByText('VLESS')).toBeTruthy();
     expect(within(tokyo).queryByText(/AnyTLS/)).toBeNull();
     expect(within(macau).getByText('AnyTLS · Hysteria2')).toBeTruthy();
     expect(within(macau).queryByText('VLESS')).toBeNull();
-    expect(view.getByText('1 个公网来源 · 覆盖 2 台节点')).toBeTruthy();
   });
 
   it.each([
@@ -452,7 +580,7 @@ describe('user roster rows', () => {
     ['unicom', '联通'],
     ['cernet', '教育网'],
     ['cstnet', '科技网'],
-  ])('shows local %s attribution beside the country without an extra request', async (operator, label) => {
+  ])('names the domestic %s network without an extra request', async (operator, label) => {
     const { view, client } = mount();
     const key = ['user-presence', 'system-admin'];
     const data = client.getQueryData<UserPresenceList>(key)!;
@@ -464,10 +592,10 @@ describe('user roster rows', () => {
         users: [{ ...data.users[0], sources: [{ ...data.users[0].sources[0], ip: '2001:db8::1' }] }],
       }),
     );
-    expect(await view.findByText(`中国 · ${label}`)).toBeTruthy();
+    expect(await view.findByText(`中国${label}`)).toBeTruthy();
     const location = view.container.querySelector('.user-presence-location')!;
     expect(within(location as HTMLElement).getByRole('img', { name: 'CN 地区旗' })).toBeTruthy();
-    expect(vi.mocked(fetch).mock.calls.every(([input]) => String(input) === '/grant-probes/capability')).toBe(true);
+    expect(backgroundReadsOnly()).toBe(true);
   });
 
   it.each([
@@ -520,6 +648,7 @@ describe('user roster rows', () => {
       const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
       if (state === 'complete') {
         expect((await within(card).findAllByText('暂无在线连接')).length).toBeGreaterThan(0);
+        expect(await within(card).findByText('最近 30 天没有来源记录')).toBeTruthy();
       } else {
         expect(within(card).queryByText('暂无在线连接')).toBeNull();
         expect((await within(card).findAllByText('在线来源 —')).length).toBeGreaterThan(0);
@@ -546,7 +675,8 @@ describe('user roster rows', () => {
       }),
     );
     const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
-    expect(await within(card).findByText('至少 1 个公网来源 · 至少覆盖 1 台节点')).toBeTruthy();
+    await vi.waitFor(() => expect(readingOf(card)).toBe('在线至少 1 · 30 天 1 个地址'));
+    expect(within(card).getByText('当前仅收到 1 / 2 台入口节点的最新快照，在线来源可能不完整')).toBeTruthy();
     expect(within(card).getByRole('button', { name: 'retired-node' })).toBeTruthy();
     expect(within(card).getByText('位置未知')).toBeTruthy();
   });

@@ -1,6 +1,7 @@
 mod admin;
 mod agent;
 mod agent_release;
+mod binary_release;
 mod branding;
 mod cert;
 mod compile_cache;
@@ -16,6 +17,7 @@ mod host_tuning;
 mod input;
 mod lifecycle;
 mod load;
+mod load_rollup;
 mod log_policy;
 mod materialize;
 mod notifications;
@@ -47,7 +49,13 @@ pub use admin::{
 };
 pub use agent::public_route_ip;
 pub use agent::{AuthenticatedNode, IssuedNodeToken};
-pub use agent_release::{AgentBuildInfo, AgentRelease, AgentReleaseScope};
+pub use agent_release::{AgentRelease, AgentReleaseScope};
+pub use binary_release::{
+    BinaryBuildInfo, BinaryComponent, BinaryRelease, BinaryReleaseArtifact,
+    BinaryReleaseAssignment, BinaryReleaseAttempt, BinaryReleaseEvent, BinaryReleaseStatus,
+    BinaryReleaseSummary, BinaryReleaseTarget, BinaryReleaseTargetStatus,
+    CreateBinaryReleaseRequest,
+};
 pub use branding::{BrandingSettings, DEFAULT_SITE_NAME};
 pub use brocade_deployment::protocol::{
     BinarySource, CreateDeploymentRequest, CreateDeploymentResult, CreateRollbackRequest,
@@ -144,7 +152,8 @@ pub use log_policy::{
     MIN_AGENT_LOG_MAX_MIB,
 };
 pub use notifications::{
-    ClaimedNotificationDelivery, MachineEventList, MachineEventView, MACHINE_EVENT_RETENTION_DAYS,
+    ActiveMachineIncidentView, ClaimedNotificationDelivery, MachineEventList, MachineEventView,
+    MACHINE_EVENT_RETENTION_DAYS,
 };
 pub use pg::PgStore;
 pub use ping_probe::{

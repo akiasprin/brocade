@@ -4060,13 +4060,8 @@ pub async fn record_agent_report(
 ) -> Result<VpngateReportReceipt> {
     validate_report(&report)?;
     let mut tx = pool.begin().await?;
-    let expected = current_reconcile_pool_ids_tx(
-        &mut tx,
-        node_id,
-        report.topology_revision,
-        report.catalog_generation,
-    )
-    .await?;
+    let expected =
+        current_reconcile_pool_ids_tx(&mut tx, node_id, report.topology_revision).await?;
     let mut exit_reputations = Vec::new();
     let accepted_samples =
         record_report_samples_tx(&mut tx, node_id, &report, &mut exit_reputations).await?;
@@ -4088,8 +4083,8 @@ pub async fn record_agent_report(
 
 /// Store one complete post-reconcile pool set and remove every replaceable state row omitted by
 /// the Agent. Samples remain immutable history even when their generation is stale; state
-/// replacement and deletion happen only when both echoed generations and the complete expected
-/// pool identity set match the current desired state.
+/// replacement and deletion happen only when the echoed topology and the complete expected pool
+/// identity set match the current desired state.
 pub async fn record_reconcile_report(
     pool: &PgPool,
     node_id: &str,
@@ -4097,13 +4092,8 @@ pub async fn record_reconcile_report(
 ) -> Result<VpngateReportReceipt> {
     validate_reconcile_report(&report)?;
     let mut tx = pool.begin().await?;
-    let expected = current_reconcile_pool_ids_tx(
-        &mut tx,
-        node_id,
-        report.topology_revision,
-        report.catalog_generation,
-    )
-    .await?;
+    let expected =
+        current_reconcile_pool_ids_tx(&mut tx, node_id, report.topology_revision).await?;
     let mut accepted_samples = 0_u32;
     let mut exit_reputations = Vec::new();
     for pool_report in &report.pools {
@@ -4269,15 +4259,18 @@ async fn current_reconcile_pool_ids_tx(
     tx: &mut Transaction<'_, Postgres>,
     node_id: &str,
     topology_revision: u64,
-    catalog_generation: u64,
 ) -> Result<Option<BTreeSet<String>>> {
-    // Keep the generation check and omission deletion in one publication epoch. Callers acquire
-    // these publication locks before writing exit-IP reputation rows, preserving the catalog ->
-    // reputation lock order used by policy updates. Otherwise an old report could pass the check,
-    // race a new publication, and delete rows already written for that newer desired state.
+    // Keep the topology check and omission deletion in one publication epoch. Callers also acquire
+    // the catalogue lock before writing exit-IP reputation rows, preserving the catalogue ->
+    // reputation lock order used by policy updates.
+    //
+    // Catalogue generations change the candidate payload, not the set of pools referenced by a
+    // node. A fleet-wide catalogue sync can finish between an Agent fetching desired state and
+    // reporting the runtime it actually applied. Rejecting that truthful report leaves a new pool
+    // permanently absent while frequent syncs keep advancing the global generation. Topology is
+    // the authority for pool identity; the echoed catalogue generation remains stored as evidence.
     let current = sqlx::query(
         "SELECT serving.topology_revision_id,
-                COALESCE(catalog.last_success_run_id, 0) AS catalog_generation,
                 serving.isolated_node_ids,
                 NULLIF(BTRIM(agent.runtime_versions->>'openvpn'), '') IS NOT NULL
                     AS openvpn_available
@@ -4295,8 +4288,6 @@ async fn current_reconcile_pool_ids_tx(
     };
     if current.try_get::<i64, _>("topology_revision_id")?
         != u64_to_i64("topology_revision", topology_revision)?
-        || current.try_get::<i64, _>("catalog_generation")?
-            != u64_to_i64("catalog_generation", catalog_generation)?
     {
         return Ok(None);
     }
@@ -4326,11 +4317,17 @@ async fn validate_selected_profile_tx(
     else {
         return Ok(());
     };
+    // A catalogue refresh may replace the current profile while the Agent is still applying the
+    // previous generation. Observation history preserves the authenticated server/profile pair.
     let selected_matches = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (
-            SELECT 1 FROM vpngate_servers server
-            JOIN vpngate_profiles profile ON profile.sha256 = server.profile_sha256
-            WHERE server.id = $1 AND profile.sha256 = $2
+            SELECT 1
+              FROM vpngate_servers server
+             WHERE server.id = $1 AND server.profile_sha256 = $2
+            UNION ALL
+            SELECT 1
+              FROM vpngate_server_observations observation
+             WHERE observation.server_id = $1 AND observation.profile_sha256 = $2
         )",
     )
     .bind(server_id)
@@ -4415,7 +4412,11 @@ async fn record_manual_switch_result_tx(
     }
 
     // The Agent includes its last terminal result in every complete runtime report. Accept the
-    // exact stored result again, but reject an unrelated or contradictory request identity.
+    // exact stored result again, but reject an unrelated or contradictory request identity while
+    // that request still exists. Removing and later recreating a pool cascades its old request
+    // row, while an Agent that stayed online can legitimately retain the terminal acknowledgement
+    // in its durable runtime metadata. With no row left there is nothing to acknowledge or
+    // contradict, so the stale audit attachment must not block the pool's current runtime state.
     let stored = sqlx::query(
         "SELECT node_id, outbound_id, previous_server_id, status, selected_server_id,
                 EXTRACT(EPOCH FROM cooldown_until)::BIGINT AS cooldown_until_unix_secs,
@@ -4427,9 +4428,7 @@ async fn record_manual_switch_result_tx(
     .fetch_optional(&mut **tx)
     .await?;
     let Some(stored) = stored else {
-        return Err(StoreError::InvalidData(
-            "VPN Gate switch result references an unknown request".to_owned(),
-        ));
+        return Ok(());
     };
     let stored_matches = stored.try_get::<String, _>("node_id")? == node_id
         && stored.try_get::<String, _>("outbound_id")? == report.outbound_id

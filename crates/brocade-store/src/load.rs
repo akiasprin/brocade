@@ -2,9 +2,10 @@
 //!
 //! Reads and writes two time series plus two latest-only tables. The shape of what arrives, and
 //! why it arrives already differenced, is argued at length on `LoadReportRequest` in protocol.rs;
-//! what matters here is the consequence: **the control plane stores what it is told**. It cannot
-//! re-derive a rate from counters the way usage does, so the only defences available are the ones
-//! below — a clock check, a window-overlap check, and an ownership check on each hop.
+//! what matters here is the consequence: rates cannot be re-derived from counters as usage can.
+//! Recent reports stay raw; `load_rollup` combines older diagnostic windows while preserving
+//! event totals and measured boundaries. A clock check, a compaction retry fence and an ownership
+//! check on each hop protect ingestion.
 //!
 //! That is a weaker guarantee than usage gets, and deliberately so. Usage is money; this is
 //! diagnostics. A node that lies about its CPU wastes an operator's afternoon, while a node that
@@ -19,7 +20,12 @@ use brocade_deployment::protocol::{
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
-use crate::{admin::tenant_filter, AdminContext, Result, StoreError};
+use crate::{
+    admin::tenant_filter,
+    load_rollup::{self, TimedSample},
+    notifications::{insert_machine_event, MachineMetricEvent},
+    AdminContext, Result, StoreError,
+};
 
 /// The machine overview draws only its short NIC sparkline. Keeping that response separate from
 /// [`NodeLoadView`] avoids serialising every CPU, memory, disk and socket detail for every card.
@@ -43,7 +49,7 @@ pub struct NodeNicList {
     pub nodes: Vec<NodeNicView>,
 }
 
-/// Exact, column-oriented samples for a bounded set of detail-chart metrics.
+/// Column-oriented samples at the selected history resolution for bounded detail-chart metrics.
 ///
 /// The ordinary overview deliberately omits the four deep JSON objects. A detail expansion asks
 /// for the fields used by at most two charts, and this shape writes the shared time axis once
@@ -58,8 +64,8 @@ pub struct NodeLoadMetricView {
     pub metrics: BTreeMap<String, Vec<Option<f64>>>,
 }
 
-/// Transport form of the initial machine observation. Every ECharts sample is retained; only the
-/// JSON layout changes from repeated row objects to parallel columns. Deep objects stay solely in
+/// Transport form of the initial machine observation. The selected history samples are encoded
+/// as parallel columns rather than repeated row objects. Deep objects stay solely in
 /// `latest_sample` as capability/current-state facts and are fetched historically in chart pairs.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct NodeLoadOverviewView {
@@ -162,6 +168,78 @@ const MAX_SAMPLES_PER_REPORT: usize = 60;
 /// Guard against a single report claiming the whole fleet's hops.
 const MAX_HOPS_PER_REPORT: usize = 512;
 
+const CPU_STEAL_OPEN_PCT: f32 = 10.0;
+const CPU_STEAL_RECOVERY_PCT: f32 = 5.0;
+const CPU_STEAL_OPEN_SECS: i64 = 60;
+const CPU_STEAL_RECOVERY_SECS: i64 = 90;
+const CPU_STEAL_OPEN_OBSERVATIONS: i32 = 2;
+const CPU_STEAL_RECOVERY_OBSERVATIONS: i32 = 3;
+const CPU_STEAL_CONTIGUITY_TOLERANCE_SECS: i64 = 15;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpuStealStatus {
+    Normal,
+    Candidate,
+    Active,
+    Recovering,
+}
+
+impl CpuStealStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Candidate => "candidate",
+            Self::Active => "active",
+            Self::Recovering => "recovering",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "normal" => Ok(Self::Normal),
+            "candidate" => Ok(Self::Candidate),
+            "active" => Ok(Self::Active),
+            "recovering" => Ok(Self::Recovering),
+            other => Err(StoreError::InvalidData(format!(
+                "unknown CPU steal state {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CpuStealState {
+    status: CpuStealStatus,
+    transition_started_at: Option<i64>,
+    transition_observations: i32,
+    active_started_at: Option<i64>,
+    last_window_end: i64,
+    current_pct: f32,
+    peak_pct: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CpuStealObservation {
+    window_start: i64,
+    window_end: i64,
+    value: f32,
+    has_gap: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CpuStealTransition {
+    Started {
+        started_at: i64,
+        value: f32,
+        peak_value: f32,
+    },
+    Recovered {
+        started_at: i64,
+        value: f32,
+        peak_value: f32,
+    },
+}
+
 /// Which part of a node's load history a reader requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadSeriesQuery {
@@ -175,6 +253,31 @@ pub enum LoadSeriesQuery {
 }
 
 impl LoadSeriesQuery {
+    fn read_bounds(self) -> Option<(i64, i64)> {
+        match self {
+            Self::Absolute {
+                start_unix_secs,
+                end_unix_secs,
+            } => {
+                // Read whole edge minutes before aggregation, then filter by real overlap. Without
+                // this margin a raw query could average half a minute while its compacted form
+                // would return the full minute for the exact same requested interval.
+                let margin = if end_unix_secs.saturating_sub(start_unix_secs)
+                    > load_rollup::RAW_RETAIN_SECS
+                {
+                    60
+                } else {
+                    0
+                };
+                Some((
+                    start_unix_secs.saturating_sub(margin),
+                    end_unix_secs.saturating_add(margin),
+                ))
+            }
+            Self::LatestWindows { .. } => None,
+        }
+    }
+
     fn response_range(self, series: &[LoadSample]) -> (i64, i64) {
         match self {
             Self::Absolute {
@@ -228,18 +331,24 @@ pub async fn record_load_report(
     }
 
     let mut tx = pool.begin().await?;
+    let sealed_through = load_rollup::lock_node(&mut tx, node_id).await?;
     let mut accepted_samples = 0_u64;
     let mut skipped_samples = 0_u64;
     let mut accepted_hops = 0_u64;
     let mut rejected_hops = 0_u64;
 
-    for sample in &request.samples {
-        if sample.window_end_unix_secs <= sample.window_start_unix_secs {
+    let mut samples = request.samples.iter().collect::<Vec<_>>();
+    samples.sort_by_key(|sample| (sample.window_end_unix_secs, sample.window_start_unix_secs));
+    for sample in samples {
+        if sample.window_end_unix_secs <= sample.window_start_unix_secs
+            || sample.window_end_unix_secs <= sealed_through
+        {
             skipped_samples += 1;
             continue;
         }
-        if insert_load_sample(&mut tx, node_id, request.btime_unix_secs, sample).await? {
+        if insert_load_sample(&mut tx, node_id, request.btime_unix_secs, sample, false).await? {
             accepted_samples += 1;
+            advance_cpu_steal_state(&mut tx, node_id, sample).await?;
         } else {
             // ON CONFLICT DO NOTHING rather than an upsert: a window already stored is a window
             // already stored, and a retry re-sending it must not overwrite. Not an error either —
@@ -296,6 +405,353 @@ pub async fn record_load_report(
     })
 }
 
+async fn advance_cpu_steal_state(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+    sample: &LoadSample,
+) -> Result<()> {
+    let observation = CpuStealObservation {
+        window_start: sample.window_start_unix_secs,
+        window_end: sample.window_end_unix_secs,
+        value: pct("cpu_steal_pct", sample.cpu_steal_pct)?,
+        has_gap: sample.has_gap,
+    };
+    let initial = advance_cpu_steal(None, observation).0;
+    sqlx::query(
+        "INSERT INTO node_cpu_steal_state (
+             node_id, status, transition_started_at, transition_observations,
+             active_started_at, last_window_end, current_pct, peak_pct
+         ) VALUES (
+             $1, $2, to_timestamp($3), $4,
+             to_timestamp($5), to_timestamp($6), $7, $8
+         )
+         ON CONFLICT (node_id) DO NOTHING",
+    )
+    .bind(node_id)
+    .bind(initial.status.as_str())
+    .bind(initial.transition_started_at.map(|value| value as f64))
+    .bind(initial.transition_observations)
+    .bind(initial.active_started_at.map(|value| value as f64))
+    .bind(initial.last_window_end as f64)
+    .bind(initial.current_pct)
+    .bind(initial.peak_pct)
+    .execute(&mut **tx)
+    .await?;
+
+    let row = sqlx::query(
+        "SELECT status,
+                extract(epoch FROM transition_started_at)::bigint AS transition_started_at,
+                transition_observations,
+                extract(epoch FROM active_started_at)::bigint AS active_started_at,
+                extract(epoch FROM last_window_end)::bigint AS last_window_end,
+                current_pct, peak_pct
+           FROM node_cpu_steal_state
+          WHERE node_id = $1
+          FOR UPDATE",
+    )
+    .bind(node_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let current = cpu_steal_state_from_row(&row)?;
+    if current.last_window_end >= observation.window_end {
+        // This transaction inserted the initial row, or an older unique telemetry window arrived
+        // after a newer one. Neither may advance a sustained-state counter twice.
+        return Ok(());
+    }
+
+    let (next, transition) = advance_cpu_steal(Some(current), observation);
+    sqlx::query(
+        "UPDATE node_cpu_steal_state
+            SET status = $2,
+                transition_started_at = to_timestamp($3),
+                transition_observations = $4,
+                active_started_at = to_timestamp($5),
+                last_window_end = to_timestamp($6),
+                current_pct = $7,
+                peak_pct = $8,
+                updated_at = now()
+          WHERE node_id = $1",
+    )
+    .bind(node_id)
+    .bind(next.status.as_str())
+    .bind(next.transition_started_at.map(|value| value as f64))
+    .bind(next.transition_observations)
+    .bind(next.active_started_at.map(|value| value as f64))
+    .bind(next.last_window_end as f64)
+    .bind(next.current_pct)
+    .bind(next.peak_pct)
+    .execute(&mut **tx)
+    .await?;
+
+    let Some(transition) = transition else {
+        return Ok(());
+    };
+    let server_now: i64 =
+        sqlx::query_scalar("SELECT extract(epoch FROM clock_timestamp())::bigint")
+            .fetch_one(&mut **tx)
+            .await?;
+    // An accepted node clock may still lead the Console by up to MAX_CLOCK_SKEW_SECS. Keep the
+    // metric's own incident ordering valid while avoiding future timestamps in the ordinary case.
+    let detected_at = server_now.max(observation.window_end);
+    let (event_kind, previous, current_value, started_at, value, peak_value, threshold) =
+        match transition {
+            CpuStealTransition::Started {
+                started_at,
+                value,
+                peak_value,
+            } => (
+                "cpu_steal_started",
+                "normal",
+                "active",
+                started_at,
+                value,
+                peak_value,
+                CPU_STEAL_OPEN_PCT,
+            ),
+            CpuStealTransition::Recovered {
+                started_at,
+                value,
+                peak_value,
+            } => (
+                "cpu_steal_recovered",
+                "active",
+                "normal",
+                started_at,
+                value,
+                peak_value,
+                CPU_STEAL_RECOVERY_PCT,
+            ),
+        };
+    insert_machine_event(
+        tx,
+        node_id,
+        event_kind,
+        None,
+        Some(previous),
+        Some(current_value),
+        detected_at,
+        None,
+        Some(MachineMetricEvent {
+            incident_started_at_unix_secs: started_at,
+            value,
+            peak_value,
+            threshold,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+fn cpu_steal_state_from_row(row: &sqlx::postgres::PgRow) -> Result<CpuStealState> {
+    Ok(CpuStealState {
+        status: CpuStealStatus::parse(row.try_get("status")?)?,
+        transition_started_at: row.try_get("transition_started_at")?,
+        transition_observations: row.try_get("transition_observations")?,
+        active_started_at: row.try_get("active_started_at")?,
+        last_window_end: row.try_get("last_window_end")?,
+        current_pct: row.try_get("current_pct")?,
+        peak_pct: row.try_get("peak_pct")?,
+    })
+}
+
+fn advance_cpu_steal(
+    current: Option<CpuStealState>,
+    observation: CpuStealObservation,
+) -> (CpuStealState, Option<CpuStealTransition>) {
+    let candidate = || CpuStealState {
+        status: CpuStealStatus::Candidate,
+        transition_started_at: Some(observation.window_start),
+        transition_observations: 1,
+        active_started_at: None,
+        last_window_end: observation.window_end,
+        current_pct: observation.value,
+        peak_pct: observation.value,
+    };
+    let normal = || CpuStealState {
+        status: CpuStealStatus::Normal,
+        transition_started_at: None,
+        transition_observations: 0,
+        active_started_at: None,
+        last_window_end: observation.window_end,
+        current_pct: observation.value,
+        peak_pct: observation.value,
+    };
+    let Some(current) = current else {
+        return if observation.value >= CPU_STEAL_OPEN_PCT {
+            (candidate(), None)
+        } else {
+            (normal(), None)
+        };
+    };
+    if observation.window_end <= current.last_window_end {
+        return (current, None);
+    }
+    let contiguous = observation.window_start.abs_diff(current.last_window_end)
+        <= CPU_STEAL_CONTIGUITY_TOLERANCE_SECS as u64;
+    let high = observation.value >= CPU_STEAL_OPEN_PCT;
+    // A high value remains useful evidence even when collection was delayed. A low value from a
+    // gap window cannot prove recovery: reboot, clock regression and scheduling delay share the
+    // same `has_gap` bit today.
+    let recovery_low = observation.value <= CPU_STEAL_RECOVERY_PCT && !observation.has_gap;
+
+    match current.status {
+        CpuStealStatus::Normal => {
+            if high {
+                (candidate(), None)
+            } else {
+                (normal(), None)
+            }
+        }
+        CpuStealStatus::Candidate if high => {
+            let started_at = if contiguous {
+                current
+                    .transition_started_at
+                    .unwrap_or(observation.window_start)
+            } else {
+                observation.window_start
+            };
+            let observations = if contiguous {
+                current.transition_observations.saturating_add(1)
+            } else {
+                1
+            };
+            let peak = if contiguous {
+                current.peak_pct.max(observation.value)
+            } else {
+                observation.value
+            };
+            if observations >= CPU_STEAL_OPEN_OBSERVATIONS
+                && observation.window_end.saturating_sub(started_at) >= CPU_STEAL_OPEN_SECS
+            {
+                let next = CpuStealState {
+                    status: CpuStealStatus::Active,
+                    transition_started_at: None,
+                    transition_observations: 0,
+                    active_started_at: Some(started_at),
+                    last_window_end: observation.window_end,
+                    current_pct: observation.value,
+                    peak_pct: peak,
+                };
+                (
+                    next,
+                    Some(CpuStealTransition::Started {
+                        started_at,
+                        value: observation.value,
+                        peak_value: peak,
+                    }),
+                )
+            } else {
+                (
+                    CpuStealState {
+                        status: CpuStealStatus::Candidate,
+                        transition_started_at: Some(started_at),
+                        transition_observations: observations,
+                        active_started_at: None,
+                        last_window_end: observation.window_end,
+                        current_pct: observation.value,
+                        peak_pct: peak,
+                    },
+                    None,
+                )
+            }
+        }
+        CpuStealStatus::Candidate => (normal(), None),
+        CpuStealStatus::Active => {
+            let peak = current.peak_pct.max(observation.value);
+            let active_started_at = current
+                .active_started_at
+                .unwrap_or(observation.window_start);
+            if recovery_low {
+                (
+                    CpuStealState {
+                        status: CpuStealStatus::Recovering,
+                        transition_started_at: Some(observation.window_start),
+                        transition_observations: 1,
+                        active_started_at: Some(active_started_at),
+                        last_window_end: observation.window_end,
+                        current_pct: observation.value,
+                        peak_pct: peak,
+                    },
+                    None,
+                )
+            } else {
+                (
+                    CpuStealState {
+                        status: CpuStealStatus::Active,
+                        transition_started_at: None,
+                        transition_observations: 0,
+                        active_started_at: Some(active_started_at),
+                        last_window_end: observation.window_end,
+                        current_pct: observation.value,
+                        peak_pct: peak,
+                    },
+                    None,
+                )
+            }
+        }
+        CpuStealStatus::Recovering if recovery_low => {
+            let active_started_at = current
+                .active_started_at
+                .unwrap_or(observation.window_start);
+            let started_at = if contiguous {
+                current
+                    .transition_started_at
+                    .unwrap_or(observation.window_start)
+            } else {
+                observation.window_start
+            };
+            let observations = if contiguous {
+                current.transition_observations.saturating_add(1)
+            } else {
+                1
+            };
+            let peak = current.peak_pct.max(observation.value);
+            if observations >= CPU_STEAL_RECOVERY_OBSERVATIONS
+                && observation.window_end.saturating_sub(started_at) >= CPU_STEAL_RECOVERY_SECS
+            {
+                (
+                    normal(),
+                    Some(CpuStealTransition::Recovered {
+                        started_at: active_started_at,
+                        value: observation.value,
+                        peak_value: peak,
+                    }),
+                )
+            } else {
+                (
+                    CpuStealState {
+                        status: CpuStealStatus::Recovering,
+                        transition_started_at: Some(started_at),
+                        transition_observations: observations,
+                        active_started_at: Some(active_started_at),
+                        last_window_end: observation.window_end,
+                        current_pct: observation.value,
+                        peak_pct: peak,
+                    },
+                    None,
+                )
+            }
+        }
+        CpuStealStatus::Recovering => {
+            let active_started_at = current
+                .active_started_at
+                .unwrap_or(observation.window_start);
+            (
+                CpuStealState {
+                    status: CpuStealStatus::Active,
+                    transition_started_at: None,
+                    transition_observations: 0,
+                    active_started_at: Some(active_started_at),
+                    last_window_end: observation.window_end,
+                    current_pct: observation.value,
+                    peak_pct: current.peak_pct.max(observation.value),
+                },
+                None,
+            )
+        }
+    }
+}
+
 /// Whether this machine has any step on the named chain.
 ///
 /// A looser test than usage's `counter_by_label`, on purpose. Usage has to pin a counter to one
@@ -319,11 +775,12 @@ async fn node_carries_chain(
     Ok(found)
 }
 
-async fn insert_load_sample(
+pub(crate) async fn insert_load_sample(
     tx: &mut Transaction<'_, Postgres>,
     node_id: &str,
     btime: i64,
     s: &LoadSample,
+    is_rollup: bool,
 ) -> Result<bool> {
     let cpu = cpu_split(s)?;
     // Deep diagnostics are deliberately fail-soft. They are optional enrichment, so a malformed
@@ -340,14 +797,14 @@ async fn insert_load_sample(
              mem_available_bytes, swap_used_bytes, memory_detail, oom_kills,
              disk_free_bytes, disk_inode_free_pct, disk_detail,
              nic_rx_bps, nic_tx_bps, nic_rx_drop, nic_tx_drop, nic_err,
-             conntrack_count, network_detail, uptime_secs
+             conntrack_count, network_detail, uptime_secs, is_rollup
          ) VALUES (
              $1, to_timestamp($2), to_timestamp($3), $4, $5,
              $6, $7, $8, $9, $10, $11, $12,
              $13, $14, $15, $16,
              $17, $18, $19,
              $20, $21, $22, $23, $24,
-             $25, $26, $27
+             $25, $26, $27, $28
          )
          ON CONFLICT (node_id, window_start) DO NOTHING",
     )
@@ -384,6 +841,7 @@ async fn insert_load_sample(
     )
     .bind(network_detail)
     .bind(u64_to_i64("uptime_secs", s.uptime_secs)?)
+    .bind(is_rollup)
     .execute(&mut **tx)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -1145,7 +1603,7 @@ async fn node_load_view_inner(
     let samples_select = format!(
         "SELECT extract(epoch FROM window_start)::bigint AS window_start_secs,
                 extract(epoch FROM window_end)::bigint AS window_end_secs,
-                has_gap, cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct, cpu_steal_pct, load1,
+                btime, has_gap, cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct, cpu_steal_pct, load1,
                 mem_available_bytes, swap_used_bytes, oom_kills,
                 disk_free_bytes, disk_inode_free_pct,
                 nic_rx_bps, nic_tx_bps, nic_rx_drop, nic_tx_drop, nic_err,
@@ -1155,19 +1613,13 @@ async fn node_load_view_inner(
     );
     let mut samples_query = sqlx::QueryBuilder::<Postgres>::new(&samples_select);
     samples_query.push_bind(node_id);
-    match selection {
-        LoadSeriesQuery::Absolute {
-            start_unix_secs,
-            end_unix_secs,
-        } => {
-            samples_query
-                .push(" AND window_end > to_timestamp(")
-                .push_bind(start_unix_secs)
-                .push(") AND window_start < to_timestamp(")
-                .push_bind(end_unix_secs)
-                .push(')');
-        }
-        LoadSeriesQuery::LatestWindows { .. } => {}
+    if let Some((start_unix_secs, end_unix_secs)) = selection.read_bounds() {
+        samples_query
+            .push(" AND window_end > to_timestamp(")
+            .push_bind(start_unix_secs)
+            .push(") AND window_start < to_timestamp(")
+            .push_bind(end_unix_secs)
+            .push(')');
     }
     let limit = match selection {
         LoadSeriesQuery::Absolute { .. } => max_samples,
@@ -1177,14 +1629,14 @@ async fn node_load_view_inner(
         .push(" ORDER BY window_start DESC LIMIT ")
         .push_bind(i64::from(limit));
     let rows = samples_query.build().fetch_all(pool).await?;
-    let mut series = rows
+    let mut timed = rows
         .iter()
-        .map(load_sample_from_row)
+        .map(load_rollup::sample_from_row)
         .collect::<Result<Vec<_>>>()?;
-    series.reverse();
+    timed.reverse();
 
     let latest_sample = match selection {
-        LoadSeriesQuery::LatestWindows { .. } => series.last().cloned(),
+        LoadSeriesQuery::LatestWindows { .. } => timed.last().map(|s| s.sample.clone()),
         LoadSeriesQuery::Absolute { .. } => {
             let row = sqlx::query(
                 "SELECT extract(epoch FROM window_start)::bigint AS window_start_secs,
@@ -1206,6 +1658,7 @@ async fn node_load_view_inner(
         }
     };
 
+    let series = history_series(selection, timed)?;
     let (range_start_unix_secs, range_end_unix_secs) = selection.response_range(&series);
 
     let processes = sqlx::query(
@@ -1232,6 +1685,47 @@ async fn node_load_view_inner(
         series,
         processes,
     })
+}
+
+/// Keep overview, deep metrics and fleet readers on the same minute boundaries.
+fn history_series(
+    selection: LoadSeriesQuery,
+    samples: Vec<TimedSample>,
+) -> Result<Vec<LoadSample>> {
+    let span = match selection {
+        LoadSeriesQuery::Absolute {
+            start_unix_secs,
+            end_unix_secs,
+        } => end_unix_secs.saturating_sub(start_unix_secs),
+        LoadSeriesQuery::LatestWindows { .. } => samples
+            .first()
+            .zip(samples.last())
+            .map(|(first, last)| {
+                last.sample
+                    .window_end_unix_secs
+                    .saturating_sub(first.sample.window_start_unix_secs)
+            })
+            .unwrap_or(0),
+    };
+    let samples = if span > load_rollup::RAW_RETAIN_SECS {
+        load_rollup::aggregate(samples)?
+    } else {
+        samples
+    };
+    Ok(samples
+        .into_iter()
+        .map(|s| s.sample)
+        .filter(|sample| match selection {
+            LoadSeriesQuery::Absolute {
+                start_unix_secs,
+                end_unix_secs,
+            } => {
+                sample.window_end_unix_secs > start_unix_secs
+                    && sample.window_start_unix_secs < end_unix_secs
+            }
+            LoadSeriesQuery::LatestWindows { .. } => true,
+        })
+        .collect())
 }
 
 /// Every live machine's selected load windows, for list and fleet views.
@@ -1293,7 +1787,7 @@ pub async fn list_node_load(
         "SELECT requested.node_id,
                 extract(epoch FROM sample.window_start)::bigint AS window_start_secs,
                 extract(epoch FROM sample.window_end)::bigint AS window_end_secs,
-                sample.has_gap, sample.cpu_user_pct, sample.cpu_sys_pct,
+                sample.btime, sample.has_gap, sample.cpu_user_pct, sample.cpu_sys_pct,
                 sample.cpu_softirq_pct, sample.cpu_peak_pct, sample.cpu_steal_pct,
                 sample.load1, sample.cpu_detail,
                 sample.mem_available_bytes, sample.swap_used_bytes, sample.memory_detail,
@@ -1306,7 +1800,7 @@ pub async fn list_node_load(
     samples_query.push_bind(ids.clone()).push(
         "::text[]) AS requested(node_id)
            JOIN LATERAL (
-                SELECT window_start, window_end,
+                SELECT btime, window_start, window_end,
                        has_gap, cpu_user_pct, cpu_sys_pct, cpu_softirq_pct, cpu_peak_pct,
                        cpu_steal_pct, load1, cpu_detail,
                        mem_available_bytes, swap_used_bytes, memory_detail, oom_kills,
@@ -1316,11 +1810,7 @@ pub async fn list_node_load(
                   FROM node_load_samples
                  WHERE node_id = requested.node_id",
     );
-    if let LoadSeriesQuery::Absolute {
-        start_unix_secs,
-        end_unix_secs,
-    } = selection
-    {
+    if let Some((start_unix_secs, end_unix_secs)) = selection.read_bounds() {
         samples_query
             .push(" AND window_end > to_timestamp(")
             .push_bind(start_unix_secs)
@@ -1332,19 +1822,23 @@ pub async fn list_node_load(
         .push(" ORDER BY window_start DESC LIMIT ")
         .push_bind(i64::from(limit))
         .push(") sample ON TRUE ORDER BY requested.node_id, sample.window_start");
+    let mut timed_by_node = BTreeMap::<String, Vec<TimedSample>>::new();
     for row in samples_query.build().fetch_all(pool).await? {
         let node_id: String = row.try_get("node_id")?;
-        if let Some(view) = nodes.get_mut(&node_id) {
-            view.series.push(load_sample_from_row(&row)?);
-        }
+        timed_by_node
+            .entry(node_id)
+            .or_default()
+            .push(load_rollup::sample_from_row(&row)?);
     }
 
     for view in nodes.values_mut() {
+        let timed = timed_by_node.remove(&view.node_id).unwrap_or_default();
+        if matches!(selection, LoadSeriesQuery::LatestWindows { .. }) {
+            view.latest_sample = timed.last().map(|s| s.sample.clone());
+        }
+        view.series = history_series(selection, timed)?;
         (view.range_start_unix_secs, view.range_end_unix_secs) =
             selection.response_range(&view.series);
-        if matches!(selection, LoadSeriesQuery::LatestWindows { .. }) {
-            view.latest_sample = view.series.last().cloned();
-        }
     }
 
     if matches!(selection, LoadSeriesQuery::Absolute { .. }) {
@@ -1570,11 +2064,17 @@ pub async fn hop_link_list(
 /// are the finished article, and once old, worthless.
 pub async fn prune_load_samples(pool: &PgPool, retain_days: u32) -> Result<u64> {
     let cutoff = format!("{retain_days} days");
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(load_rollup::RETENTION_LOCK)
+        .execute(&mut *tx)
+        .await?;
     let load = sqlx::query("DELETE FROM node_load_samples WHERE window_end < now() - $1::interval")
         .bind(&cutoff)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+    tx.commit().await?;
     let hops =
         sqlx::query("DELETE FROM node_hop_link_samples WHERE window_end < now() - $1::interval")
             .bind(&cutoff)
@@ -1584,7 +2084,7 @@ pub async fn prune_load_samples(pool: &PgPool, retain_days: u32) -> Result<u64> 
     Ok(load + hops)
 }
 
-fn load_sample_from_row(row: &sqlx::postgres::PgRow) -> Result<LoadSample> {
+pub(crate) fn load_sample_from_row(row: &sqlx::postgres::PgRow) -> Result<LoadSample> {
     Ok(LoadSample {
         window_start_unix_secs: row.try_get("window_start_secs")?,
         window_end_unix_secs: row.try_get("window_end_secs")?,
@@ -1936,6 +2436,80 @@ mod tests {
             network_detail: None,
             uptime_secs: 10,
         }
+    }
+
+    fn steal_observation(start: i64, value: f32) -> CpuStealObservation {
+        CpuStealObservation {
+            window_start: start,
+            window_end: start + 30,
+            value,
+            has_gap: false,
+        }
+    }
+
+    #[test]
+    fn cpu_steal_opens_once_after_two_contiguous_high_windows() {
+        let (candidate, first) = advance_cpu_steal(None, steal_observation(0, 40.0));
+        assert_eq!(candidate.status, CpuStealStatus::Candidate);
+        assert!(first.is_none());
+
+        let (duplicate, event) = advance_cpu_steal(Some(candidate), steal_observation(0, 40.0));
+        assert_eq!(duplicate, candidate);
+        assert!(event.is_none());
+
+        let (active, event) = advance_cpu_steal(Some(candidate), steal_observation(30, 55.0));
+        assert_eq!(active.status, CpuStealStatus::Active);
+        assert_eq!(active.active_started_at, Some(0));
+        assert_eq!(active.peak_pct, 55.0);
+        assert_eq!(
+            event,
+            Some(CpuStealTransition::Started {
+                started_at: 0,
+                value: 55.0,
+                peak_value: 55.0,
+            })
+        );
+
+        let (still_active, repeated) = advance_cpu_steal(Some(active), steal_observation(60, 20.0));
+        assert_eq!(still_active.status, CpuStealStatus::Active);
+        assert!(repeated.is_none());
+    }
+
+    #[test]
+    fn cpu_steal_requires_three_valid_low_windows_to_recover() {
+        let (candidate, _) = advance_cpu_steal(None, steal_observation(0, 40.0));
+        let (active, _) = advance_cpu_steal(Some(candidate), steal_observation(30, 50.0));
+
+        let mut gap_low = steal_observation(60, 0.0);
+        gap_low.has_gap = true;
+        let (active, event) = advance_cpu_steal(Some(active), gap_low);
+        assert_eq!(active.status, CpuStealStatus::Active);
+        assert!(event.is_none());
+
+        let (recovering, _) = advance_cpu_steal(Some(active), steal_observation(90, 4.0));
+        assert_eq!(recovering.status, CpuStealStatus::Recovering);
+        let (recovering, _) = advance_cpu_steal(Some(recovering), steal_observation(120, 3.0));
+        assert_eq!(recovering.status, CpuStealStatus::Recovering);
+        let (normal, event) = advance_cpu_steal(Some(recovering), steal_observation(150, 2.0));
+        assert_eq!(normal.status, CpuStealStatus::Normal);
+        assert_eq!(
+            event,
+            Some(CpuStealTransition::Recovered {
+                started_at: 0,
+                value: 2.0,
+                peak_value: 50.0,
+            })
+        );
+    }
+
+    #[test]
+    fn cpu_steal_streaks_restart_after_missing_windows() {
+        let (candidate, _) = advance_cpu_steal(None, steal_observation(0, 20.0));
+        let (candidate, event) = advance_cpu_steal(Some(candidate), steal_observation(90, 30.0));
+        assert_eq!(candidate.status, CpuStealStatus::Candidate);
+        assert_eq!(candidate.transition_started_at, Some(90));
+        assert_eq!(candidate.transition_observations, 1);
+        assert!(event.is_none());
     }
 
     #[test]

@@ -248,7 +248,14 @@ const rememberScroll = value => {
 const bundle = await build({
   stdin: {
     contents: `
-      export { navigate, navigateInPlace, returnTo, startRouting } from './src/forge/route';
+      export {
+        navigate,
+        navigateInPlace,
+        previousRouteHash,
+        returnTo,
+        startRouting,
+        subscribeRouteHistory,
+      } from './src/forge/route';
       export { forge } from './src/forge/state';
       export { wm } from './src/wm/store';
     `,
@@ -268,7 +275,8 @@ const bundle = await build({
 const dir = await mkdtemp(join(tmpdir(), 'brocade-drive-'));
 const file = join(dir, 'drive.mjs');
 await writeFile(file, bundle.outputFiles[0].text);
-const { navigate, navigateInPlace, returnTo, startRouting, forge, wm } = await import(pathToFileURL(file).href);
+const { navigate, navigateInPlace, previousRouteHash, returnTo, startRouting, subscribeRouteHistory, forge, wm } =
+  await import(pathToFileURL(file).href);
 
 /* ══ 断言 ══ */
 
@@ -476,6 +484,50 @@ check('前进还原下一个国家', drillOf('tunnels'), { p: 'vpngate', country
 setLocation('#/tunnels/vpngate?country=KR');
 fire('hashchange');
 check('刷新地址可恢复国家', drillOf('tunnels'), { p: 'vpngate', country: 'KR' });
+
+console.log('\n— 机器详情观测时间范围 —');
+let historyNotices = 0;
+const stopHistoryNotices = subscribeRouteHistory(() => historyNotices++);
+navigate('nodes', { p: 'node', id: 'hk-01' });
+flushFrames();
+rememberScroll(412);
+const zoomed = { p: 'node', id: 'hk-01', from: 1_700_000_000, to: 1_700_000_600 };
+const pushesBeforeRange = pushes;
+navigateInPlace('nodes', zoomed);
+flushFrames();
+check('拖选的固定区间进入地址', win.location.hash, '#/nodes/node/hk-01?from=1700000000&to=1700000600');
+check('切换范围是一条新历史', pushes - pushesBeforeRange, 1);
+check('切换范围保留滚动位置', scroller.scrollTop, 412);
+check('新历史记下来源地址', previousRouteHash(), '#/nodes/node/hk-01');
+navigateInPlace('nodes', { p: 'node', id: 'hk-01', range: '24h' });
+check('快速范围进入地址', win.location.hash, '#/nodes/node/hk-01?range=24h');
+back();
+check('后退还原上一个范围', drillOf('nodes'), zoomed);
+check('后退后的来源仍是默认范围', previousRouteHash(), '#/nodes/node/hk-01');
+back();
+check('再后退回到默认范围', drillOf('nodes'), { p: 'node', id: 'hk-01' });
+forward();
+check('前进还原固定区间', drillOf('nodes'), zoomed);
+const pushesBeforeReturnRange = pushes;
+returnTo('nodes', { p: 'node', id: 'hk-01' });
+flushFrames();
+check(
+  '页头返回按钮等同浏览器后退',
+  [drillOf('nodes'), pushes - pushesBeforeReturnRange],
+  [{ p: 'node', id: 'hk-01' }, 0],
+);
+check('前进后退与写入历史都会通知订阅方', historyNotices >= 6, true);
+setLocation('#/nodes/node/hk-01?range=1h');
+fire('hashchange');
+check('默认范围不写进地址', [win.location.hash, drillOf('nodes')], ['#/nodes/node/hk-01', { p: 'node', id: 'hk-01' }]);
+setLocation('#/nodes/node/hk-01?from=1700000000&to=1700000010');
+fire('hashchange');
+check(
+  '跨度不足 1 分钟的区间回到默认范围，不离开详情',
+  [win.location.hash, drillOf('nodes')],
+  ['#/nodes/node/hk-01', { p: 'node', id: 'hk-01' }],
+);
+stopHistoryNotices();
 
 console.log('\n— 滚动不消耗浏览器导航配额 —');
 for (const engine of ['webkit', 'chromium']) {

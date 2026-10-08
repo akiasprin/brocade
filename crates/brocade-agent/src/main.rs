@@ -1,6 +1,7 @@
 mod certfile;
 mod command;
 mod conntrack;
+mod conntrack_tuning;
 use brocade_probe as e2e;
 mod fsutil;
 mod host_tuning;
@@ -96,6 +97,8 @@ const XRAY_LOG_MAX_MIB_HEADER: &str = "x-brocade-xray-log-max-mib";
 const PHANTUN_LOG_MAX_MIB_HEADER: &str = "x-brocade-phantun-log-max-mib";
 const NIC_GRO_FLUSH_TIMEOUT_NS_HEADER: &str = "x-brocade-nic-gro-flush-timeout-ns";
 const NIC_NAPI_DEFER_HARD_IRQS_HEADER: &str = "x-brocade-nic-napi-defer-hard-irqs";
+const KERNEL_TLS_MODULE_PATH: &str = "/sys/module/tls";
+const KERNEL_TLS_BOOT_CONFIG: &str = "/etc/modules-load.d/brocade-xray-ktls.conf";
 static TERMINATION_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1182,6 +1185,20 @@ fn run_forever(options: Options) -> Result<(), String> {
     }
     if !ensure_kernel_tls_module() {
         warn("Linux tls 内核模块未能加载；AnyTLS kTLS 灰度前置条件未满足");
+    } else {
+        match ensure_kernel_tls_boot_config(Path::new(KERNEL_TLS_BOOT_CONFIG)) {
+            Ok(true) => println!("Linux tls 内核模块已加入开机加载配置"),
+            Ok(false) => {}
+            Err(error) => warn(format!("Linux tls 内核模块开机加载配置未能落地：{error}")),
+        }
+    }
+    match conntrack_tuning::reconcile() {
+        Ok(result) if result.changed => println!(
+            "连接跟踪参数已收敛（nf_conntrack_max={}，UDP 超时 30/60 秒）",
+            result.target_max
+        ),
+        Ok(_) => {}
+        Err(error) => warn(format!("连接跟踪参数未能完整收敛：{error}")),
     }
     match logcap::ensure_agent_journal_namespace(&options.state_dir) {
         Ok(true) => {
@@ -2679,12 +2696,13 @@ fn xray_launch_command(splice_mode: &str, executable: &str, conf: &str) -> Strin
 
 /// Make the kTLS ULP available before Xray accepts AnyTLS sessions.
 ///
-/// The install script persists the same module for new machines, but an Agent self-update does not
-/// rerun that script. Loading it here closes that upgrade gap. Failure remains observable through
-/// `NodeVersions::kernel_tls_module`; the caller decides whether a rollout may continue while
-/// Xray's `auto` mode keeps existing traffic compatible on unsupported kernels.
+/// The install script persists the same module for new machines, while Agent startup separately
+/// reconciles persistence for machines upgraded in place. Loading it here also closes the runtime
+/// gap without waiting for a reboot. Failure remains observable through
+/// `NodeVersions::kernel_tls_module`; Xray's `auto` mode keeps existing traffic compatible on
+/// unsupported kernels.
 fn ensure_kernel_tls_module() -> bool {
-    ensure_kernel_tls_module_with(Path::new("/sys/module/tls"), || {
+    ensure_kernel_tls_module_with(Path::new(KERNEL_TLS_MODULE_PATH), || {
         run_command("modprobe", &["tls"]).map(|_| ())
     })
 }
@@ -2703,8 +2721,46 @@ fn ensure_kernel_tls_module_with(
     module_path.is_dir()
 }
 
+/// Persist the module independently of the installer. Older nodes can receive
+/// a new Agent through self-update without ever rerunning install.sh, so loading
+/// the module for this process is not enough to survive their next reboot.
+fn ensure_kernel_tls_boot_config(path: &Path) -> Result<bool, String> {
+    const CONTENTS: &[u8] = b"tls\n";
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!("拒绝覆盖符号链接 {}", path.display()));
+            }
+            if !metadata.is_file() {
+                return Err(format!("{} 不是普通文件", path.display()));
+            }
+            if fs::read(path).map_err(|error| format!("读取 {} 失败：{error}", path.display()))?
+                == CONTENTS
+                && metadata.permissions().mode() & 0o777 == 0o644
+            {
+                return Ok(false);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("检查 {} 失败：{error}", path.display())),
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} 没有父目录", path.display()))?;
+    if !parent.is_dir() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("创建 {} 失败：{error}", parent.display()))?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("设置 {} 权限失败：{error}", parent.display()))?;
+    }
+    fsutil::atomic_write_with_mode(path, CONTENTS, 0o644)?;
+    Ok(true)
+}
+
 fn kernel_tls_module_loaded() -> bool {
-    Path::new("/sys/module/tls").is_dir()
+    Path::new(KERNEL_TLS_MODULE_PATH).is_dir()
 }
 
 fn apply_xray(path: &Path, api_port: u16) -> Result<(), String> {
@@ -3855,6 +3911,8 @@ fn unknown_state() -> ReportedNodeState {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
     #[test]
     fn log_policy_requires_all_specific_headers() {
         let specific = crate::http::parse_http_response(
@@ -4958,6 +5016,37 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
         assert!(!super::ensure_kernel_tls_module_with(&module, || {
             Err("unsupported".to_owned())
         }));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn kernel_tls_module_is_persisted_idempotently_for_reboot() {
+        let dir = test_state_dir("ktls-module-persistence");
+        let path = dir.join("etc/modules-load.d/brocade-xray-ktls.conf");
+
+        assert!(super::ensure_kernel_tls_boot_config(&path).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"tls\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(!super::ensure_kernel_tls_boot_config(&path).unwrap());
+
+        fs::write(&path, b"wrong\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(super::ensure_kernel_tls_boot_config(&path).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"tls\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+
+        fs::remove_file(&path).unwrap();
+        let target = dir.join("unexpected-target");
+        fs::write(&target, b"keep\n").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(super::ensure_kernel_tls_boot_config(&path).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"keep\n");
         let _ = fs::remove_dir_all(dir);
     }
 

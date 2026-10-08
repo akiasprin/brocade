@@ -20,14 +20,8 @@ test('tunnel probe panels collapse instead of overflowing narrow screens', () =>
 
 test('runtime settings stay inside the settings two-column flow', () => {
   assert.match(settings, /<div className="duo settings-layout">/);
-  assert.match(
-    settings,
-    /<div className="col">[\s\S]*?<VpngateIntelligenceSection[\s\S]*?<\/fieldset>[\s\S]*?<\/div>/,
-  );
-  assert.match(
-    settings,
-    /<div className="col">[\s\S]*?<\/fieldset>[\s\S]*?<TunnelProbeSettingsSection[\s\S]*?<\/div>/,
-  );
+  assert.match(settings, /<div className="col">[\s\S]*?<VpngateIntelligenceSection[\s\S]*?<\/fieldset>[\s\S]*?<\/div>/);
+  assert.match(settings, /<div className="col">[\s\S]*?<\/fieldset>[\s\S]*?<TunnelProbeSettingsSection[\s\S]*?<\/div>/);
   assert.match(styles, /\.tunnel-probe-settings\s*\{[\s\S]*?container-type:\s*inline-size;/);
   assert.match(styles, /\.vpngate-intelligence-settings\s*\{[\s\S]*?container-type:\s*inline-size;/);
   assert.match(

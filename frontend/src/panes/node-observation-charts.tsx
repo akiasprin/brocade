@@ -12,14 +12,15 @@ import {
   observeAxisTick,
   observeColors,
   observeLoadingOptions,
-  observeMinorTick,
   observeMsUnit,
   observeSeriesLine,
-  observeTimeInterval,
+  observeTimeAxes,
   observeValueAxis,
 } from '../ui/observe-chart';
 import { PING_FAMILY_LABEL, pingLatencyMs, pingSampleLost, pingSampleText } from '../ui/ping-probe';
+import { observeSampleStepSecs, observeSeriesData } from '../ui/observe-series';
 import { echartsEntranceAnimation, useEchartsViewportEntry } from '../ui/echarts-motion';
+import { OBSERVE_TOOLTIP_CLASS, ObserveBrushPlot, type ObserveBrushExtent } from '../ui/observe-brush';
 
 echarts.use([LineChart, CustomChart, GridComponent, TooltipComponent, MarkLineComponent, CanvasRenderer]);
 
@@ -78,10 +79,7 @@ export interface PingChartLine {
 /** Sample spacing of the chart: the median gap between consecutive timestamps, so a missing report
  * or a changed interval does not widen every loss mark. */
 function pingSampleStepMs(times: readonly number[]): number {
-  const gaps = times.slice(1).map((time, index) => time - times[index]);
-  if (gaps.length === 0) return 60_000;
-  gaps.sort((left, right) => left - right);
-  return gaps[Math.floor(gaps.length / 2)] * 1000;
+  return (observeSampleStepSecs(times) ?? 60) * 1000;
 }
 
 /** Periods in which any curve lost packets, as [start, end] milliseconds. A run of consecutive
@@ -95,7 +93,12 @@ export function pingLossPeriods(lines: readonly PingChartLine[], stepMs: number)
     for (let index = 0; index < samples.length; index += 1) {
       if (!pingSampleLost(samples[index])) continue;
       const start = index;
-      while (index + 1 < samples.length && pingSampleLost(samples[index + 1])) index += 1;
+      while (
+        index + 1 < samples.length &&
+        pingSampleLost(samples[index + 1]) &&
+        (samples[index + 1].probed_at_unix_secs - samples[index].probed_at_unix_secs) * 1000 <= stepMs * 1.5
+      )
+        index += 1;
       periods.push([
         samples[start].probed_at_unix_secs * 1000 - half,
         samples[index].probed_at_unix_secs * 1000 + half,
@@ -163,6 +166,8 @@ export function PingLatencyChart({
   const enteredViewport = useEchartsViewportEntry(elRef);
   const hasRenderedData = useRef(false);
   const lastSig = useRef<string | null>(null);
+  // 拖选按最近一次写入的坐标范围换算像素。
+  const extentRef = useRef<ObserveBrushExtent | null>(null);
 
   useEffect(() => {
     const el = elRef.current;
@@ -212,14 +217,7 @@ export function PingLatencyChart({
     const start = bounds.startUnixSecs * 1000;
     const now = bounds.endUnixSecs * 1000;
     const firstMs = times.length > 0 ? times[0] * 1000 : start;
-    const xStep = observeTimeInterval(now - firstMs);
     const xMin = Math.min(firstMs, now - 30_000);
-    const hm = (milliseconds: number) =>
-      new Date(milliseconds).toLocaleTimeString('zh-CN', {
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false,
-      });
     const series: Array<Record<string, unknown>> = lines.map((entry, index) => {
       const color = colorOf(entry);
       return {
@@ -234,10 +232,13 @@ export function PingLatencyChart({
         areaStyle: observeAreaStyle(color, themeName, { count: lines.length, paper: cv('--card') }),
         itemStyle: { color, borderColor: glass, borderWidth: 1.5 },
         emphasis: { disabled: true },
-        data: times.map(time => {
-          const sample = byLine[index].get(time);
-          return [time * 1000, sample ? pingLatencyMs(sample) : null] as [number, number | null];
-        }),
+        data: observeSeriesData(
+          times,
+          times.map(time => {
+            const sample = byLine[index].get(time);
+            return sample ? pingLatencyMs(sample) : null;
+          }),
+        ),
       };
     });
     const lossPeriods = pingLossPeriods(lines, pingSampleStepMs(times));
@@ -251,6 +252,7 @@ export function PingLatencyChart({
         tooltip: {
           trigger: 'axis',
           confine: true,
+          className: OBSERVE_TOOLTIP_CLASS,
           backgroundColor: glass,
           borderColor: line,
           borderWidth: 1,
@@ -293,23 +295,7 @@ export function PingLatencyChart({
             return `<div style="color:${ink4};font-size:9px;margin-bottom:4px;letter-spacing:.04em">${when} · ${PING_FAMILY_LABEL[family]}</div>${rows}`;
           },
         },
-        xAxis: {
-          type: 'value',
-          min: xMin,
-          max: now,
-          interval: xStep,
-          axisLabel: {
-            color: ink3,
-            fontSize: 9.5,
-            margin: 8,
-            hideOverlap: true,
-            formatter: (value: number) => hm(value),
-          },
-          axisLine: observeAxisLine(ink3),
-          axisTick: observeAxisTick(ink3),
-          minorTick: observeMinorTick(lineSoft),
-          splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
-        },
+        xAxis: observeTimeAxes(xMin, now, ink3, lineSoft),
         yAxis: {
           type: 'value',
           min: 0,
@@ -324,10 +310,11 @@ export function PingLatencyChart({
       },
       true,
     );
+    extentRef.current = { minMs: xMin, maxMs: now, yMax: valueAxis.max };
     hasRenderedData.current = true;
     lastSig.current = sig;
     if (group) echarts.connect(group);
   }, [lines, family, bounds, group, themeName, paletteKey, enteredViewport]);
 
-  return <div ref={elRef} className="ping-probe-chart" />;
+  return <ObserveBrushPlot className="ping-probe-chart" hostRef={elRef} chartRef={chartRef} extentRef={extentRef} />;
 }

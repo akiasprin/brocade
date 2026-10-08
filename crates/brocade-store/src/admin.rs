@@ -273,6 +273,11 @@ impl AdminContext {
         self.role == AdminRole::SystemAdmin
     }
 
+    /// Sharing a speed-test link exposes the user's deployed node credentials to its holder.
+    pub fn can_manage_speedtest_subscriptions(&self) -> bool {
+        matches!(self.role, AdminRole::SystemAdmin | AdminRole::TenantAdmin)
+    }
+
     /// Whether the visibility is global — no tenant_scope means not narrowed to one branch.
     ///
     /// It gates the read-only views organized as one global network that cannot be split along

@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { groupNodeLinks, parseNodeListing, SubscriptionViewer } from '../src/panes/subscription';
 
 const standardUrl = 'https://sub.example/sub/v1/2d2304da-f114-4574-8d44-625afdb1db5c/clash.yaml';
@@ -72,18 +72,32 @@ const artifact = (content: string) =>
     redacted: false,
   });
 
-const renderViewer = (kind: 'uri' | 'clash') => {
+const renderViewer = (kind: 'uri' | 'clash', selfService = false) => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  return render(
+  const view = render(
     <QueryClientProvider client={client}>
-      <SubscriptionViewer tenant="platform.acme" user="alice" kind={kind} onClose={() => undefined} />
+      <SubscriptionViewer
+        tenant="platform.acme"
+        user="alice"
+        kind={kind}
+        selfService={selfService}
+        onClose={() => undefined}
+      />
     </QueryClientProvider>,
   );
+  return { ...view, client };
 };
+
+// 弹窗按 useNarrow 选择筛选控件：默认桌面宽度（两组分段控件），窄屏用例单独改写。
+const stubViewport = (narrow: boolean) =>
+  vi.stubGlobal('matchMedia', () => ({ matches: narrow, addEventListener() {}, removeEventListener() {} }));
+
+beforeEach(() => stubViewport(false));
 
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe('node link listing', () => {
@@ -119,24 +133,17 @@ describe('node link listing', () => {
 });
 
 describe('subscription and node dialog', () => {
-  it('generates and revokes an independent koipy URL beside the standard subscription', async () => {
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+  it('generates and regenerates an independent koipy URL with an explicit credential warning', async () => {
+    const replacementUrl = haitunUrl.replace('f98b74ba', 'a98b74ba');
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       if (init?.method === 'POST') {
         return jsonResponse({
           template: 'koipy 测速',
           status: 'active',
-          urls: urls(haitunUrl),
+          urls: urls(String(input).endsWith('/regenerate') ? replacementUrl : haitunUrl),
           created_at: '2026-08-28 12:00:00+00',
           revoked_at: null,
-        });
-      }
-      if (init?.method === 'DELETE') {
-        return jsonResponse({
-          template: 'koipy 测速',
-          status: 'revoked',
-          urls: null,
-          created_at: '2026-08-28 12:00:00+00',
-          revoked_at: '2026-08-28 12:05:00+00',
         });
       }
       return jsonResponse(subscriptionInfo());
@@ -145,9 +152,11 @@ describe('subscription and node dialog', () => {
     const view = renderViewer('clash');
 
     expect(await view.findByText('尚未生成')).toBeTruthy();
+    expect(view.getByText(/风险提示：测速订阅包含用户 UUID/)).toBeTruthy();
+    expect(view.getByText(/更换用户 UUID 并发布授权/)).toBeTruthy();
     expect(view.getByText('模板 SubBoost 标准版 · 适用 Mihomo / Clash Meta')).toBeTruthy();
     fireEvent.click(view.getByRole('button', { name: '生成 koipy 测速地址' }));
-    await view.findByRole('button', { name: '撤销 koipy 测速地址' });
+    await view.findByRole('button', { name: '重新生成 koipy 测速地址' });
     expect(view.getByText('可用')).toBeTruthy();
     expect(view.queryByText(haitunUrl)).toBeNull();
     fireEvent.click(view.getByRole('button', { name: '显示 koipy 测速地址' }));
@@ -157,16 +166,109 @@ describe('subscription and node dialog', () => {
       expect.objectContaining({ method: 'POST' }),
     );
 
-    fireEvent.click(view.getByRole('button', { name: '撤销 koipy 测速地址' }));
-    await view.findByRole('button', { name: '重新生成 koipy 测速地址' });
-    expect(view.getByText('已撤销')).toBeTruthy();
-    expect(view.queryByText(haitunUrl)).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: '重新生成 koipy 测速地址' }));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('已下载的 UUID 和节点配置仍然有效'));
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/regenerate'))).toBe(false);
+    expect(view.getByText(haitunUrl)).toBeTruthy();
+    confirm.mockReturnValue(true);
+    fireEvent.click(view.getByRole('button', { name: '重新生成 koipy 测速地址' }));
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
-        '/users/platform.acme/alice/clash-subscription/haitun',
-        expect.objectContaining({ method: 'DELETE' }),
+        '/users/platform.acme/alice/clash-subscription/haitun/regenerate',
+        expect.objectContaining({ method: 'POST' }),
       ),
     );
+    await waitFor(() => expect(view.queryByText(haitunUrl)).toBeNull());
+    expect(view.queryByText(replacementUrl)).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: '显示 koipy 测速地址' }));
+    expect(view.getByText(replacementUrl)).toBeTruthy();
+    fireEvent.click(view.getByRole('button', { name: '显示 Clash 订阅地址' }));
+    expect(view.getByText(standardUrl)).toBeTruthy();
+    expect(view.queryByRole('button', { name: /撤销/ })).toBeNull();
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false);
+  });
+
+  it.each([false, true])('hides koipy when the server denies access (self-service: %s)', async selfService => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ ...subscriptionInfo(), haitun: null })),
+    );
+    const view = renderViewer('clash', selfService);
+    await view.findByText('Clash 订阅');
+    expect(view.queryByText('koipy 测速订阅')).toBeNull();
+    expect(view.queryByRole('button', { name: /koipy/ })).toBeNull();
+  });
+
+  it('does not expose cached administrator koipy data in the self-service dialog', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse(subscriptionInfo())),
+    );
+    const view = renderViewer('clash', true);
+    await view.findByText('Clash 订阅');
+    expect(view.queryByText('koipy 测速订阅')).toBeNull();
+  });
+
+  it('keeps the previous address and permits retry if regeneration fails', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === 'POST')
+          return { ok: false, status: 500, json: async () => ({ error: 'regeneration failed' }) } as Response;
+        return jsonResponse({
+          ...subscriptionInfo(),
+          haitun: { ...subscriptionInfo().haitun, status: 'active', urls: urls(haitunUrl) },
+        });
+      }),
+    );
+    const view = renderViewer('clash');
+    fireEvent.click(await view.findByRole('button', { name: '显示 koipy 测速地址' }));
+    fireEvent.click(view.getByRole('button', { name: '重新生成 koipy 测速地址' }));
+    await view.findByText(/regeneration failed/);
+    expect(view.getByText(haitunUrl)).toBeTruthy();
+    expect((view.getByRole('button', { name: '重新生成 koipy 测速地址' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('blocks duplicate regeneration and prevents an older in-flight read from restoring the old URL', async () => {
+    const replacementUrl = haitunUrl.replace('f98b74ba', 'a98b74ba');
+    const info = {
+      ...subscriptionInfo(),
+      haitun: { ...subscriptionInfo().haitun, status: 'active', urls: urls(haitunUrl) },
+    };
+    let completeRead!: (response: Response) => void;
+    let completeRotation!: (response: Response) => void;
+    const oldRead = new Promise<Response>(resolve => {
+      completeRead = resolve;
+    });
+    const rotation = new Promise<Response>(resolve => {
+      completeRotation = resolve;
+    });
+    let reads = 0;
+    let readSignal: AbortSignal | null | undefined;
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST') return rotation;
+      if (++reads === 1) return jsonResponse(info);
+      readSignal = init?.signal;
+      return oldRead;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const view = renderViewer('clash');
+    const regenerate = await view.findByRole('button', { name: '重新生成 koipy 测速地址' });
+    const refreshing = view.client.refetchQueries({ queryKey: ['clash-subscription'] });
+    await waitFor(() => expect(reads).toBe(2));
+    fireEvent.click(regenerate);
+    await waitFor(() => expect((regenerate as HTMLButtonElement).disabled).toBe(true));
+    fireEvent.click(regenerate);
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+    completeRotation(jsonResponse({ ...info.haitun, urls: urls(replacementUrl) }));
+    await waitFor(() => expect(readSignal?.aborted).toBe(true));
+    completeRead(jsonResponse(info));
+    await refreshing;
+    fireEvent.click(await view.findByRole('button', { name: '显示 koipy 测速地址' }));
+    expect(view.getByText(replacementUrl)).toBeTruthy();
+    expect(view.queryByText(haitunUrl)).toBeNull();
   });
 
   it('combines protocol and address-family choices in the public URL', async () => {
@@ -178,9 +280,58 @@ describe('subscription and node dialog', () => {
 
     fireEvent.click(await view.findByRole('button', { name: 'Hysteria 2' }));
     fireEvent.click(view.getByRole('button', { name: 'IPv4' }));
+    // 遮罩只遮 Token，主机、路径与筛选参数保持可读。
+    expect(view.baseElement.querySelector('.sub-url-mask')?.textContent).toBe('••••••••-••••-••••-••••-••••••••');
+    expect(view.baseElement.querySelector('.sub-url code')?.textContent).toBe(
+      'https://sub.example/sub/v1/••••••••-••••-••••-••••-••••••••db5c/clash.yaml?family=v4&protocol=hysteria2',
+    );
     fireEvent.click(view.getByRole('button', { name: '显示 Clash 订阅地址' }));
 
     expect(view.getByText(`${standardUrl}?family=v4&protocol=hysteria2`)).toBeTruthy();
+    expect(view.getByTitle('按 UTC+8 计').textContent).toBe('9/1 00:00');
+  });
+
+  it('switches the filters to two dropdowns on narrow screens', async () => {
+    stubViewport(true);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse(subscriptionInfo())),
+    );
+    const view = renderViewer('clash');
+
+    await view.findByText('Clash 订阅');
+    expect(view.queryByRole('button', { name: 'Hysteria 2' })).toBeNull();
+    fireEvent.change(view.getByRole('combobox', { name: '协议' }), { target: { value: 'hysteria2' } });
+    fireEvent.change(view.getByRole('combobox', { name: '地址族' }), { target: { value: 'v4' } });
+    fireEvent.click(view.getByRole('button', { name: '显示 Clash 订阅地址' }));
+
+    expect(view.getByText(`${standardUrl}?family=v4&protocol=hysteria2`)).toBeTruthy();
+    expect(view.baseElement.querySelector('.sub-pick-value')?.textContent).toBe('Hysteria 2');
+  });
+
+  it('moves between the two tabs with the arrow keys like the node detail tabs', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === '/revisions?limit=50') return jsonResponse({ current_revision: 9, revisions: [] });
+        if (path.endsWith('/clash-subscription')) return jsonResponse(subscriptionInfo());
+        return artifact(uriText);
+      }),
+    );
+    const view = renderViewer('clash');
+
+    const subscriptionTab = await view.findByRole('tab', { name: '订阅' });
+    expect(subscriptionTab.getAttribute('aria-selected')).toBe('true');
+    expect(view.getByRole('tabpanel').getAttribute('aria-labelledby')).toBe(subscriptionTab.id);
+    fireEvent.keyDown(subscriptionTab, { key: 'ArrowRight' });
+
+    const nodeTab = view.getByRole('tab', { name: '节点' });
+    expect(nodeTab.getAttribute('aria-selected')).toBe('true');
+    expect(nodeTab.tabIndex).toBe(0);
+    expect(subscriptionTab.tabIndex).toBe(-1);
+    await view.findByRole('region', { name: '东京 IIJ' });
+    expect(view.getByRole('tabpanel').getAttribute('aria-labelledby')).toBe(nodeTab.id);
   });
 
   it('shares the filters with the node tab, which requests a server-filtered URI artifact', async () => {
@@ -195,13 +346,13 @@ describe('subscription and node dialog', () => {
 
     fireEvent.click(await view.findByRole('button', { name: 'Hysteria 2' }));
     fireEvent.click(view.getByRole('button', { name: 'IPv4' }));
-    fireEvent.click(view.getByRole('button', { name: '节点' }));
+    fireEvent.click(view.getByRole('tab', { name: '节点' }));
 
     await waitFor(() =>
       expect(
         fetchMock.mock.calls.some(([input]) =>
           String(input).endsWith(
-            '/artifacts/content/user/platform.acme%3Aalice/uri?family=v4&protocol=hysteria2&serving=true',
+            '/artifacts/content/user/platform.acme%3Aalice/uri?family=v4&protocol=hysteria2&serving=true&insecure=true',
           ),
         ),
       ).toBe(true),
@@ -242,7 +393,7 @@ describe('subscription and node dialog', () => {
     expect(await view.findByText('Clash 订阅')).toBeTruthy();
   });
 
-  it('requests self-signed URI entries only after an explicit one-time insecure choice', async () => {
+  it('lists self-signed URI entries by default and lets the operator stop listing them', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input);
       if (path === '/revisions?limit=50') return jsonResponse({ current_revision: 9, revisions: [] });
@@ -251,21 +402,40 @@ describe('subscription and node dialog', () => {
     vi.stubGlobal('fetch', fetchMock);
     const view = renderViewer('uri');
 
-    await view.findByRole('region', { name: '东京 IIJ' });
-    expect(view.queryByText('insecure')).toBeNull();
-    fireEvent.click(view.getByRole('button', { name: '允许 insecure' }));
-
     await view.findByRole('region', { name: '东京 NTT' });
     expect(view.getByText('insecure')).toBeTruthy();
-    expect(view.getByText('已列出 1 个自签证书节点，客户端不验证证书')).toBeTruthy();
+    expect(view.getByText('已列出 1 个自签证书节点（标 insecure），客户端不验证证书')).toBeTruthy();
     expect(
       fetchMock.mock.calls.some(([input]) =>
         String(input).endsWith('/artifacts/content/user/platform.acme%3Aalice/uri?serving=true&insecure=true'),
       ),
     ).toBe(true);
 
-    // VLESS 没有可互通的自签证书链接：切到 VLESS 时收回 insecure，开关也不再出现。
+    fireEvent.click(view.getByRole('button', { name: '不再列出' }));
+    await view.findByRole('region', { name: '东京 IIJ' });
+    expect(view.queryByText('insecure')).toBeNull();
+    // 服务端原句写「默认隐藏」，与弹窗的默认相反；改写为当前状态。
+    expect(view.getByText('未列出 1 个自签证书节点：东京 NTT | QUIC')).toBeTruthy();
+    expect(view.queryByText(/默认隐藏/)).toBeNull();
+    expect(
+      fetchMock.mock.calls.some(([input]) =>
+        String(input).endsWith('/artifacts/content/user/platform.acme%3Aalice/uri?serving=true'),
+      ),
+    ).toBe(true);
+
+    fireEvent.click(view.getByRole('button', { name: '允许 insecure' }));
+    await view.findByRole('region', { name: '东京 NTT' });
+
+    // 切到 VLESS 不收回：VLESS 自签入口在服务端一律跳过，请求仍带 insecure。
     fireEvent.click(view.getByRole('button', { name: 'VLESS' }));
-    await waitFor(() => expect(view.queryByRole('button', { name: '允许 insecure' })).toBeNull());
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([input]) =>
+          String(input).endsWith(
+            '/artifacts/content/user/platform.acme%3Aalice/uri?protocol=vless&serving=true&insecure=true',
+          ),
+        ),
+      ).toBe(true),
+    );
   });
 });

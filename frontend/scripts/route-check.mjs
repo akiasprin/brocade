@@ -93,6 +93,28 @@ trip(
   '#/tunnels/vpngate/vpngate-8f3a-2d71',
 );
 trip('用户详情由用户名定位', { nav: 'users', drill: { p: 'user', id: 'alice' } }, '#/users/user/alice');
+trip(
+  '机器详情的快速范围进入浏览器历史',
+  { nav: 'nodes', drill: { p: 'node', id: 'hk-01', range: '6h' } },
+  '#/nodes/node/hk-01?range=6h',
+);
+trip(
+  '机器详情的固定区间进入浏览器历史，起止读回来是数字',
+  { nav: 'nodes', drill: { p: 'node', id: 'hk-01', from: 1_700_000_000, to: 1_700_003_600 } },
+  '#/nodes/node/hk-01?from=1700000000&to=1700003600',
+);
+trip(
+  '默认范围（近 1 小时）不写进地址',
+  { nav: 'nodes', drill: { p: 'node', id: 'hk-01', range: '1h' } },
+  '#/nodes/node/hk-01',
+  { nav: 'nodes', drill: { p: 'node', id: 'hk-01' } },
+);
+trip(
+  '固定区间与快速范围同时出现时以固定区间为准',
+  { nav: 'nodes', drill: { p: 'node', id: 'hk-01', range: '24h', from: 1_700_000_000, to: 1_700_000_060 } },
+  '#/nodes/node/hk-01?from=1700000000&to=1700000060',
+  { nav: 'nodes', drill: { p: 'node', id: 'hk-01', from: 1_700_000_000, to: 1_700_000_060 } },
+);
 
 console.log('\n— 类型要还原 —');
 trip('发布详情的 id 是数字', { nav: 'deploy', drill: { p: 'detail', id: 12 } }, '#/deploy/detail/12');
@@ -138,6 +160,15 @@ reads('链式代理地址暂不开放', '#/tunnels/front/app-main/front-asia', {
 reads('用户详情少了用户名', '#/users/user', { nav: 'users' });
 reads('用户详情多出路径段', '#/users/user/acme/alice', { nav: 'users' });
 reads('机器详情多出路径段', '#/nodes/node/hk-01/extra', { nav: 'nodes' });
+console.log('\n— 时间范围参数不合法时回到默认范围，不离开机器详情 —');
+const bareNode = { nav: 'nodes', drill: { p: 'node', id: 'hk-01' } };
+reads('未知的快速范围', '#/nodes/node/hk-01?range=7h', bareNode);
+reads('只有起点', '#/nodes/node/hk-01?from=1700000000', bareNode);
+reads('跨度不足 1 分钟', '#/nodes/node/hk-01?from=1700000000&to=1700000059', bareNode);
+reads('跨度超过 24 小时', '#/nodes/node/hk-01?from=1700000000&to=1700086401', bareNode);
+reads('终点早于起点', '#/nodes/node/hk-01?from=1700003600&to=1700000000', bareNode);
+reads('不是整数', '#/nodes/node/hk-01?from=abc&to=1700003600', bareNode);
+reads('负数', '#/nodes/node/hk-01?from=-600&to=0', bareNode);
 
 console.log('\n— 缺字段的 loc 退回面的根 —');
 trip('detail 没带 id', { nav: 'deploy', drill: { p: 'detail' } }, '#/deploy', { nav: 'deploy' });

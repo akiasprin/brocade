@@ -19,7 +19,7 @@ use sqlx::{PgPool, Row};
 
 use crate::{admin::tenant_filter, AdminContext, Result, StoreError};
 
-// The primary key is (node_id, target, family, probed_at). Ask for each requested series
+// The primary key is (series_id, probed_at). Ask for each requested series
 // explicitly so each LATERAL arm is a bounded reverse index scan. DISTINCT ON would sort the
 // entire retained table to produce the same handful of rows.
 const LATEST_NODE_SAMPLES_SQL: &str =
@@ -28,12 +28,13 @@ const LATEST_NODE_SAMPLES_SQL: &str =
             latest.attempted, latest.latency_us, latest.skip_reason
        FROM unnest($1::text[]) AS requested_node(node_id)
        CROSS JOIN unnest($2::text[], $3::text[]) AS requested(target, family)
+       JOIN node_ping_probe_series series
+         ON series.node_id = requested_node.node_id
+        AND series.target = requested.target AND series.family = requested.family
        JOIN LATERAL (
             SELECT sample.probed_at, sample.attempted, sample.latency_us, sample.skip_reason
               FROM node_ping_probe_samples sample
-             WHERE sample.node_id = requested_node.node_id
-               AND sample.target = requested.target
-               AND sample.family = requested.family
+             WHERE sample.series_id = series.id
              ORDER BY sample.probed_at DESC
              LIMIT 1
        ) latest ON TRUE
@@ -238,10 +239,9 @@ pub async fn record_report(
     let settings = load_settings(pool).await?;
     let known = configured_series(&settings);
     let mut seen = BTreeSet::new();
-    let mut accepted_samples = 0;
     let mut skipped_samples = 0;
     let mut unknown_targets = 0;
-    let mut tx = pool.begin().await?;
+    let mut validated = Vec::with_capacity(request.samples.len());
 
     for sample in request.samples {
         // Agents older than the dual-stack protocol send no family. Their sample is attributable
@@ -281,28 +281,47 @@ pub async fn record_report(
                 })
             })
             .transpose()?;
-        let result = sqlx::query(
-            "INSERT INTO node_ping_probe_samples
-                 (node_id, target, family, probed_at, attempted, latency_us, skip_reason)
-             VALUES ($1, $2, $3, to_timestamp($4), $5, $6, $7)
-             ON CONFLICT (node_id, target, family, probed_at) DO NOTHING",
-        )
-        .bind(node_id)
-        .bind(&target)
-        .bind(family.as_str())
-        .bind(request.probed_at_unix_secs)
-        .bind(attempted)
-        .bind(latency_us)
-        .bind(sample.skip_reason.map(PingProbeSkipReason::as_str))
-        .execute(&mut *tx)
-        .await?;
-        if result.rows_affected() == 1 {
-            accepted_samples += 1;
-        } else {
-            skipped_samples += 1;
-        }
+        validated.push((
+            target,
+            family.as_str(),
+            attempted,
+            latency_us,
+            sample.skip_reason.map(PingProbeSkipReason::as_str),
+        ));
     }
 
+    // Canonical lock order avoids concurrent reports inserting the same new series in opposite
+    // orders. Two statements deliberately avoid the ON CONFLICT/CTE snapshot-visibility trap.
+    validated.sort_unstable_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+    let targets: Vec<_> = validated.iter().map(|sample| sample.0.as_str()).collect();
+    let families: Vec<_> = validated.iter().map(|sample| sample.1).collect();
+    let attempted: Vec<_> = validated.iter().map(|sample| sample.2).collect();
+    let latencies: Vec<_> = validated.iter().map(|sample| sample.3).collect();
+    let reasons: Vec<_> = validated.iter().map(|sample| sample.4).collect();
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO node_ping_probe_series (node_id, target, family)
+         SELECT $1, target, family FROM unnest($2::text[], $3::text[]) AS input(target, family)
+         ORDER BY target, family
+         ON CONFLICT (node_id, target, family) DO NOTHING",
+    )
+    .bind(node_id)
+    .bind(&targets)
+    .bind(&families)
+    .execute(&mut *tx)
+    .await?;
+    let accepted_samples = sqlx::query(
+        "INSERT INTO node_ping_probe_samples (series_id, probed_at, attempted, latency_us, skip_reason)
+         SELECT series.id, to_timestamp($2), input.attempted, input.latency_us, input.skip_reason
+           FROM unnest($3::text[], $4::text[], $5::bool[], $6::int[], $7::text[])
+                AS input(target, family, attempted, latency_us, skip_reason)
+           JOIN node_ping_probe_series series
+             ON series.node_id = $1 AND series.target = input.target AND series.family = input.family
+          ORDER BY series.id
+         ON CONFLICT (series_id, probed_at) DO NOTHING",
+    ).bind(node_id).bind(request.probed_at_unix_secs).bind(&targets).bind(&families)
+        .bind(&attempted).bind(&latencies).bind(&reasons).execute(&mut *tx).await?.rows_affected();
+    skipped_samples += validated.len() as u64 - accepted_samples;
     tx.commit().await?;
 
     Ok(PingProbeReportResult {
@@ -320,14 +339,34 @@ pub async fn record_report(
 /// same retention boundary while removing that work from the ingestion transaction.
 pub async fn prune_samples(pool: &PgPool, retain_days: u32) -> Result<u64> {
     let retain_days = i32::try_from(retain_days.clamp(1, 365)).expect("retention fits i32");
-    Ok(sqlx::query(
-        "DELETE FROM node_ping_probe_samples
-          WHERE probed_at < now() - make_interval(days => $1)",
-    )
-    .bind(retain_days)
-    .execute(pool)
-    .await?
-    .rows_affected())
+    let started = std::time::Instant::now();
+    let mut deleted = 0;
+    // Independent small transactions release row locks and pool capacity between batches. The
+    // hourly pass can remove 200k points (above current ingestion); a backlog drains across passes.
+    for _ in 0..20 {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET LOCAL statement_timeout = '5s'")
+            .execute(&mut *tx)
+            .await?;
+        let count = sqlx::query(
+            "WITH expired AS (
+                SELECT ctid FROM node_ping_probe_samples
+                 WHERE probed_at < now() - make_interval(days => $1)
+                 ORDER BY probed_at LIMIT 10000 FOR UPDATE SKIP LOCKED
+             ) DELETE FROM node_ping_probe_samples sample USING expired
+                WHERE sample.ctid = expired.ctid",
+        )
+        .bind(retain_days)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        deleted += count;
+        if count < 10_000 || started.elapsed() >= std::time::Duration::from_secs(10) {
+            break;
+        }
+    }
+    Ok(deleted)
 }
 
 pub async fn node_view(
@@ -432,11 +471,12 @@ pub async fn list_nodes(
     let mut points = BTreeMap::<String, SeriesPoints>::new();
     if !ids.is_empty() {
         let rows = sqlx::query(
-            "SELECT node_id, target, family,
+            "SELECT series.node_id, series.target, series.family,
                     extract(epoch FROM probed_at)::bigint AS probed_at,
                     attempted, latency_us, skip_reason
-               FROM node_ping_probe_samples
-              WHERE node_id = ANY($1::text[])
+               FROM node_ping_probe_series series
+               JOIN node_ping_probe_samples sample ON sample.series_id = series.id
+              WHERE series.node_id = ANY($1::text[])
                 AND probed_at >= now() - make_interval(secs => $2::double precision)
               ORDER BY node_id, target, family, probed_at ASC",
         )
@@ -537,16 +577,12 @@ async fn read_node(
     let rows = sqlx::query(
         "SELECT target, family, extract(epoch FROM probed_at)::bigint AS probed_at,
                 attempted, latency_us, skip_reason
-           FROM node_ping_probe_samples
-          WHERE node_id = $1
-            AND (
-                ($3::bigint IS NULL
-                 AND probed_at >= now() - make_interval(secs => $2::double precision))
-                OR
-                ($3::bigint IS NOT NULL
-                 AND probed_at >= to_timestamp($3)
-                 AND probed_at <= to_timestamp($4))
-            )
+           FROM node_ping_probe_series series
+           JOIN node_ping_probe_samples sample ON sample.series_id = series.id
+          WHERE series.node_id = $1
+            AND probed_at >= COALESCE(to_timestamp($3::bigint),
+                now() - make_interval(secs => $2::double precision))
+            AND probed_at <= COALESCE(to_timestamp($4::bigint), 'infinity'::timestamptz)
           ORDER BY probed_at ASC",
     )
     .bind(node_id)
@@ -940,7 +976,8 @@ mod tests {
     fn latest_fleet_query_bounds_each_primary_key_probe() {
         assert!(LATEST_NODE_SAMPLES_SQL.contains("JOIN LATERAL"));
         assert!(LATEST_NODE_SAMPLES_SQL.contains("LIMIT 1"));
-        assert!(LATEST_NODE_SAMPLES_SQL.contains("sample.family = requested.family"));
+        assert!(LATEST_NODE_SAMPLES_SQL.contains("series.family = requested.family"));
+        assert!(LATEST_NODE_SAMPLES_SQL.contains("sample.series_id = series.id"));
         assert!(!LATEST_NODE_SAMPLES_SQL.contains("DISTINCT ON"));
     }
 

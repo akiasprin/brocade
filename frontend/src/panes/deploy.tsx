@@ -448,7 +448,13 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
   const xray = useXrayRelease();
 
   // 页头的角标与状态灯读全部三页的数据：任一组还在加载就挂载，会先画出「没有待处理」再改口。
-  if (all.isPending || revisions.isPending || agent.rel.isPending || agent.nodes.isPending || xray.releases.isPending)
+  if (
+    all.isPending ||
+    revisions.isPending ||
+    agent.releases.isPending ||
+    agent.nodes.isPending ||
+    xray.releases.isPending
+  )
     return <Loading variant="deploy" />;
   // 历史与当前修订共同决定配置页的按钮是否可用。缺一项时继续渲染会把“未知”误当成
   // “没有活动发布”或“已收敛”。
@@ -476,9 +482,9 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
     liveDeployments.some(d => d.awaiting_confirmation) ||
     agent.counts.behind > 0 ||
     xray.counts.behind > 0;
-  const running = liveDeployments.length > 0 || agent.counts.waiting > 0 || !!xray.active;
+  const running = liveDeployments.length > 0 || !!agent.active || !!xray.active;
   const lamp =
-    failing || xray.active?.status === 'halted'
+    failing || agent.active?.status === 'halted' || xray.active?.status === 'halted'
       ? { tone: 'err', why: '有发布失败或已暂停，需要处理' }
       : attention
         ? { tone: 'warn', why: '有待处理的发布' }
@@ -492,8 +498,8 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
   };
 
   const stopEditing = () => {
-    agent.reset();
-    agent.save.reset();
+    agent.setSelected([]);
+    agent.create.reset();
     xray.setSelected([]);
     xray.create.reset();
     setEditing(null);
@@ -532,6 +538,16 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
         changed={verify.data?.summary.changed_targets}
         onClick={() => go({ p: 'plan', key: randomKey() })}
       />
+    ) : tab === 'agent' && agent.active ? (
+      <button
+        className="btn danger"
+        type="button"
+        disabled={!editable || agent.busy}
+        title={noPermission}
+        onClick={() => agent.setAskCancel(true)}
+      >
+        停止发布
+      </button>
     ) : tab === 'agent' ? (
       editing === 'agent' || !agent.ready ? null : (
         <button
@@ -552,7 +568,7 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
         title={noPermission}
         onClick={() => xray.setAskCancel(true)}
       >
-        取消升级
+        停止发布
       </button>
     ) : editing === 'xray' || !xray.ready ? null : (
       <button

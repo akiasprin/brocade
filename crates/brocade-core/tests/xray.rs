@@ -1462,6 +1462,69 @@ fn an_ingress_guard_also_covers_its_hysteria2_inbound() {
     assert!(blocks_hy2, "guard 未覆盖 hy2 入站: {rules:#?}");
 }
 
+#[test]
+fn udp_amplification_guard_allows_dns_for_vless_and_anytls() {
+    let mut hk = node("hk", [10, 66, 0, 1], true, Dns::System);
+    hk.certificate_name = Some("hk.example.net".to_owned());
+    let doc = doc(vec![hk]);
+
+    let mut face = ingress("i", "c", "hk");
+    face.guard = brocade_core::model::IngressGuard {
+        no_udp_amplification: true,
+        ..brocade_core::model::IngressGuard::OPEN
+    };
+    face.wires = IngressWires::VlessAndAnyTls {
+        vless: face.wires.vless().unwrap().clone(),
+        anytls: AnyTls {
+            port: 19443,
+            ..AnyTls::default()
+        },
+    };
+
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![face],
+        fronts: Vec::new(),
+        steps: vec![step("c", "hk", vec![any_egress()], None)],
+        grants: Vec::new(),
+    };
+
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    let value = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "hk")));
+    let rules = value["routing"]["rules"].as_array().unwrap();
+    let rule = rules
+        .iter()
+        .find(|rule| {
+            rule["outboundTag"] == "out:block"
+                && rule["network"] == "udp"
+                && rule["port"]
+                    .as_str()
+                    .is_some_and(|ports| ports.contains("123"))
+        })
+        .unwrap_or_else(|| panic!("没有生成 UDP 放大防护规则: {rules:#?}"));
+
+    assert_eq!(rule["port"], "19,123,161,389,1900,11211");
+    assert!(!rule["port"]
+        .as_str()
+        .unwrap()
+        .split(',')
+        .any(|port| port == "53"));
+    assert_eq!(
+        rule["inboundTag"],
+        serde_json::json!(["in:app/i", "in:app/i:anytls"])
+    );
+}
+
 /// The point of the whole shape: one ingress, two listeners, one credential.
 ///
 /// They share a port number and nothing else. TCP and UDP have independent port spaces, so this

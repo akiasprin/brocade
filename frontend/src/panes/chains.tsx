@@ -1318,7 +1318,7 @@ export function IngressGuardBlock({
       key: 'no_udp_amplification',
       name: '禁止 UDP 放大端口',
       why: '防止反射放大攻击。',
-      expr: 'udp:19,53,123,161,389,1900,11211',
+      expr: 'udp:19,123,161,389,1900,11211',
     },
     {
       key: 'tcp_and_quic_only',

@@ -787,8 +787,6 @@ fn self_route_may_hold_secrets(method: &axum::http::Method, path: &str) -> bool 
             | (&axum::http::Method::POST, "/me/rotate-uuid")
             | (&axum::http::Method::GET, "/me/artifact")
             | (&axum::http::Method::GET, "/me/clash-subscription")
-            | (&axum::http::Method::POST, "/me/clash-subscription/haitun")
-            | (&axum::http::Method::DELETE, "/me/clash-subscription/haitun")
     )
 }
 
@@ -802,8 +800,9 @@ fn self_route_may_hold_secrets(method: &axum::http::Method, path: &str) -> bool 
 ///
 /// The list covers what the visitor-facing pages read: the model, the machines' agent state
 /// and load, the per-machine traffic series, hop quality, the current revision's compile
-/// output, the read side of users, tenants, quotas and usage, and the VPN Gate catalogue and
-/// runtime evidence. Sensitive fields are removed centrally by the response masking layer.
+/// output, notifications, the read side of users, tenants, quotas and usage, and the VPN Gate
+/// catalogue and runtime evidence. Sensitive fields are removed centrally by the response
+/// masking layer.
 /// Write methods never match: the method check above closes every non-GET to the public
 /// account, and the deployments, settings, operator and artifact routes are excluded
 /// entirely.
@@ -887,6 +886,8 @@ fn user_may(method: &axum::http::Method, path: &str) -> bool {
     public_may(method, path)
         || self_route_may_hold_secrets(method, path)
         || (method == axum::http::Method::POST && path == "/admin/password")
+        || (method == axum::http::Method::POST
+            && matches!(path, "/notifications/read" | "/notifications/clear"))
         || (method == axum::http::Method::GET && path == "/grant-probes/capability")
         || (method == axum::http::Method::POST
             && (is_user_grant_probe_plan_path(path) || is_user_front_probe_path(path)))
@@ -1057,6 +1058,7 @@ fn masking_failed(detail: &str) -> Response {
 fn admin_router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/diagnostics/performance", get(performance_diagnostics))
         .route("/auth/state", get(auth_state))
         .route("/auth/init", post(auth_init))
         .route("/auth/login", post(auth_login))
@@ -1121,9 +1123,34 @@ fn admin_router_with_state(state: AppState) -> Router {
         // from it because the two are read on different schedules by different callers.
         // distribution is read when an operator installs a machine; this one is read on every
         // agent's own cycle.
+        .route("/agent-release", get(get_agent_release))
         .route(
-            "/agent-release",
-            get(get_agent_release).put(update_agent_release),
+            "/binary-releases/{component}",
+            get(binary_release_overview).post(create_binary_release),
+        )
+        .route(
+            "/binary-releases/{component}/history",
+            get(binary_release_history),
+        )
+        .route(
+            "/binary-releases/{component}/{release_id}",
+            get(binary_release_detail),
+        )
+        .route(
+            "/binary-releases/{component}/{release_id}/events",
+            get(binary_release_events),
+        )
+        .route(
+            "/binary-releases/{component}/{release_id}/targets/{node_id}/attempts",
+            get(binary_release_attempts),
+        )
+        .route(
+            "/binary-releases/{component}/{release_id}/cancel",
+            post(cancel_binary_release),
+        )
+        .route(
+            "/binary-releases/{component}/{release_id}/targets/{node_id}/retry",
+            post(retry_binary_release),
         )
         .route(
             "/xray-releases",
@@ -1171,6 +1198,8 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/compile/{revision_id}", get(compile_revision))
         .route("/nodes/agent-state", get(node_agent_state))
         .route("/notifications", get(machine_notifications))
+        .route("/notifications/read", post(mark_machine_notifications_read))
+        .route("/notifications/clear", post(clear_machine_notifications))
         .route(
             "/nodes/{node_id}/public-ip-history",
             get(node_public_ip_history),
@@ -1251,7 +1280,11 @@ fn admin_router_with_state(state: AppState) -> Router {
         )
         .route(
             "/users/{tenant_id}/{user_id}/clash-subscription/haitun",
-            post(issue_clash_haitun_subscription).delete(revoke_clash_haitun_subscription),
+            post(issue_clash_haitun_subscription),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/clash-subscription/haitun/regenerate",
+            post(regenerate_clash_haitun_subscription),
         )
         .route(
             "/users/{tenant_id}/{user_id}/status",
@@ -1377,11 +1410,6 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/me/rotate-uuid", post(rotate_self_user_uuid))
         .route("/me/artifact", get(self_user_artifact))
         .route("/me/clash-subscription", get(self_clash_subscription_info))
-        .route(
-            "/me/clash-subscription/haitun",
-            post(issue_self_clash_haitun_subscription)
-                .delete(revoke_self_clash_haitun_subscription),
-        )
         .route("/usage/samples", get(list_usage_samples))
         .route("/usage/node-series", get(list_usage_node_series))
         .route("/usage/monthly-summary", get(usage_monthly_summary))
@@ -1421,6 +1449,7 @@ fn admin_router_with_state(state: AppState) -> Router {
             state.clone(),
             admin_auth_context,
         ))
+        .layer(axum::middleware::from_fn(crate::performance::middleware))
         .with_state(state)
 }
 
@@ -1535,6 +1564,7 @@ fn agent_routes() -> Router<AppState> {
         .route("/agent/v1/observation", post(agent_observation))
         .route("/agent/v1/runtime", post(agent_runtime))
         .route("/agent/v1/agent-release", get(agent_release))
+        .route("/agent/v1/agent-release/report", post(agent_release_report))
         .route("/agent/v1/xray-release", get(agent_xray_release))
         .route(
             "/agent/v1/xray-release/report",
@@ -1553,6 +1583,33 @@ fn agent_routes() -> Router<AppState> {
         .route("/agent/v1/link-health", post(agent_link_health))
         .route("/agent/v1/e2e-targets", get(agent_e2e_targets))
         .route("/agent/v1/e2e-probe", post(agent_e2e_probe))
+        .layer(axum::middleware::from_fn(crate::performance::middleware))
+}
+
+async fn performance_diagnostics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let snapshot = crate::performance::Performance::global()
+        .snapshot()
+        .map_err(|message| StoreError::Unavailable(message.to_owned()))?;
+    let database = state.store.performance_database_state().await?;
+    let pool = state.store.pool();
+    let mut response = Json(json!({
+        "performance": snapshot,
+        "database": database,
+        "pool": {
+            "size": pool.size(),
+            "idle": pool.num_idle(),
+            "max_connections": pool.options().get_max_connections(),
+        },
+    }))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 async fn healthz() -> Json<serde_json::Value> {
@@ -2241,11 +2298,50 @@ async fn machine_notifications(
     Query(query): Query<NotificationListQuery>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
-    let events = state
+    let mut events = state
         .store
         .machine_events(&admin, query.limit.unwrap_or(50))
         .await?;
+    // The public identity has no writable notification cursor: every public POST stays closed by
+    // `public_may`. Present its current snapshot as already seen so the visitor does not get a
+    // permanent "unread" badge it can never clear. This changes only the response; the shared
+    // public operator row remains untouched. IP values are masked by the outer response layer.
+    if admin.operator_id() == PUBLIC_OPERATOR_ID {
+        events.last_seen_event_id = events.latest_event_id;
+        events.unread_count = 0;
+    }
     Ok(Json(events).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct MarkNotificationsReadRequest {
+    through_event_id: i64,
+}
+
+async fn mark_machine_notifications_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<MarkNotificationsReadRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let last_seen_event_id = state
+        .store
+        .mark_machine_events_read(&admin, request.through_event_id)
+        .await?;
+    Ok(Json(json!({ "last_seen_event_id": last_seen_event_id })).into_response())
+}
+
+async fn clear_machine_notifications(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<MarkNotificationsReadRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let cleared_through_event_id = state
+        .store
+        .clear_machine_events(&admin, request.through_event_id)
+        .await?;
+    Ok(Json(json!({ "cleared_through_event_id": cleared_through_event_id })).into_response())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2844,15 +2940,7 @@ struct AgentBuildHttpResponse {
 /// `CARGO_PKG_VERSION` is the console's version and also the agent's: every crate inherits
 /// `[workspace.package].version`, so the workspace has one number rather than six manifests with
 /// no mechanism keeping them equal.
-fn embedded_build_info() -> brocade_store::AgentBuildInfo<'static> {
-    brocade_store::AgentBuildInfo {
-        version: env!("CARGO_PKG_VERSION"),
-        commit: env!("BROCADE_AGENT_COMMIT"),
-    }
-}
-
 async fn agent_release_response(state: &AppState) -> Result<AgentReleaseHttpResponse, StoreError> {
-    let build = embedded_build_info();
     Ok(AgentReleaseHttpResponse {
         released: state.store.agent_release().await?,
         available_release_id: embedded_release_id(),
@@ -2860,9 +2948,9 @@ async fn agent_release_response(state: &AppState) -> Result<AgentReleaseHttpResp
             .iter()
             .map(|(arch, _, sha256)| AgentBuildHttpResponse { arch, sha256 })
             .collect(),
-        console_version: build.version,
-        agent_version: build.version,
-        build_commit: build.commit,
+        console_version: env!("CARGO_PKG_VERSION"),
+        agent_version: env!("CARGO_PKG_VERSION"),
+        build_commit: env!("BROCADE_AGENT_COMMIT"),
     })
 }
 
@@ -3214,19 +3302,220 @@ async fn scan_certs(State(state): State<AppState>, headers: HeaderMap) -> ApiRes
     Ok(Json(response).into_response())
 }
 
-async fn update_agent_release(
+/// One current distributable build, not an artifact archive. Future uploads replace this
+/// provider's current selection; immutable work orders only retain the manifest.
+#[derive(Serialize)]
+struct BinaryCatalog {
+    component: brocade_store::BinaryComponent,
+    build_id: &'static str,
+    version: &'static str,
+    artifacts: Vec<brocade_store::BinaryReleaseArtifact>,
+    source: &'static str,
+}
+
+fn binary_catalog(component: brocade_store::BinaryComponent) -> BinaryCatalog {
+    use brocade_store::BinaryComponent;
+    let (build_id, version, artifacts) = match component {
+        BinaryComponent::Agent => (
+            embedded_release_id(),
+            env!("CARGO_PKG_VERSION"),
+            EMBEDDED_AGENTS
+                .iter()
+                .map(|(arch, _, sha)| brocade_store::BinaryReleaseArtifact {
+                    arch: (*arch).to_owned(),
+                    sha256: (*sha).to_owned(),
+                })
+                .collect(),
+        ),
+        BinaryComponent::Xray => (
+            embedded_xray_release_id(),
+            BROCADE_XRAY_VERSION,
+            embedded_xray_artifacts(),
+        ),
+    };
+    BinaryCatalog {
+        component,
+        build_id,
+        version,
+        artifacts,
+        source: "embedded",
+    }
+}
+
+#[derive(Serialize)]
+struct BinaryReleaseView {
+    available: BinaryCatalog,
+    current: Option<brocade_store::BinaryRelease>,
+    /// Pre-ledger approval is a baseline, never an invented completed release or live policy.
+    legacy_approval: Option<AgentRelease>,
+}
+
+async fn binary_release_view(
+    state: &AppState,
+    component: brocade_store::BinaryComponent,
+) -> Result<BinaryReleaseView, StoreError> {
+    let summaries = state
+        .store
+        .binary_release_history(component, 1, None)
+        .await?;
+    let current = match summaries.first() {
+        Some(summary) => Some(
+            state
+                .store
+                .binary_release(component, summary.id, false)
+                .await?,
+        ),
+        None => None,
+    };
+    let legacy_approval = if component == brocade_store::BinaryComponent::Agent {
+        Some(state.store.agent_release().await?)
+    } else {
+        None
+    };
+    Ok(BinaryReleaseView {
+        available: binary_catalog(component),
+        current,
+        legacy_approval,
+    })
+}
+
+async fn binary_release_overview(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(release): Json<AgentRelease>,
+    Path(component): Path<brocade_store::BinaryComponent>,
 ) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    require_admin(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(binary_release_view(&state, component).await?).into_response())
+}
+
+async fn create_binary_release(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(component): Path<brocade_store::BinaryComponent>,
+    Json(request): Json<brocade_store::CreateBinaryReleaseRequest>,
+) -> ApiResult<Response> {
+    let actor = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let catalog = binary_catalog(component);
     state
         .store
-        .update_agent_release(&admin, release, embedded_build_info())
+        .create_binary_release(
+            &actor,
+            request,
+            brocade_store::BinaryBuildInfo {
+                component,
+                build_id: catalog.build_id,
+                version: catalog.version,
+                artifacts: &catalog.artifacts,
+            },
+        )
         .await?;
-    // Read back rather than echo: the store trims and de-duplicates the node list, and the page
-    // must show what took effect.
-    Ok(Json(agent_release_response(&state).await?).into_response())
+    Ok(Json(binary_release_view(&state, component).await?).into_response())
+}
+
+#[derive(Default, Deserialize)]
+struct BinaryHistoryQuery {
+    before_id: Option<i64>,
+}
+
+async fn binary_release_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(component): Path<brocade_store::BinaryComponent>,
+    Query(query): Query<BinaryHistoryQuery>,
+) -> ApiResult<Response> {
+    require_admin(&state, &headers, AdminPermission::Read).await?;
+    let mut items = state
+        .store
+        .binary_release_history(component, 21, query.before_id)
+        .await?;
+    let more = items.len() > 20;
+    items.truncate(20);
+    let next_before_id = if more {
+        items.last().map(|s| s.id)
+    } else {
+        None
+    };
+    Ok(Json(json!({ "items": items, "next_before_id": next_before_id })).into_response())
+}
+
+async fn binary_release_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((component, id)): Path<(brocade_store::BinaryComponent, i64)>,
+) -> ApiResult<Response> {
+    require_admin(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.store.binary_release(component, id, true).await?).into_response())
+}
+
+async fn cancel_binary_release(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((component, id)): Path<(brocade_store::BinaryComponent, i64)>,
+) -> ApiResult<Response> {
+    let actor = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    state
+        .store
+        .cancel_binary_release(component, &actor, id)
+        .await?;
+    Ok(Json(binary_release_view(&state, component).await?).into_response())
+}
+
+async fn binary_release_attempts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((component, id, node)): Path<(brocade_store::BinaryComponent, i64, String)>,
+) -> ApiResult<Response> {
+    require_admin(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(
+        state
+            .store
+            .binary_release_attempts(component, id, &node)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn binary_release_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((component, id)): Path<(brocade_store::BinaryComponent, i64)>,
+    Query(query): Query<BinaryHistoryQuery>,
+) -> ApiResult<Response> {
+    require_admin(&state, &headers, AdminPermission::Read).await?;
+    let before = query
+        .before_id
+        .ok_or_else(|| StoreError::InvalidData("missing event cursor".to_owned()))?;
+    let mut items = state
+        .store
+        .binary_release_events(component, id, before)
+        .await?;
+    let more = items.len() > 200;
+    items.truncate(200);
+    let next_before_id = if more {
+        items.last().map(|s| s.id)
+    } else {
+        None
+    };
+    Ok(Json(json!({ "items": items, "next_before_id": next_before_id })).into_response())
+}
+
+async fn retry_binary_release(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((component, id, node)): Path<(brocade_store::BinaryComponent, i64, String)>,
+) -> ApiResult<Response> {
+    let actor = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    state
+        .store
+        .retry_binary_release_target(
+            component,
+            &actor,
+            id,
+            &node,
+            binary_catalog(component).build_id,
+        )
+        .await?;
+    Ok(Json(binary_release_view(&state, component).await?).into_response())
 }
 
 async fn create_xray_release(
@@ -3400,8 +3689,16 @@ fn require_complete_settings(value: &serde_json::Value) -> ApiResult<()> {
 /// unrecognized architecture answers 404 with an explanatory message rather than a binary for
 /// another architecture: such a file downloads, passes the sha check, installs, and does not run,
 /// and `Exec format error` is several layers removed from the cause.
-async fn agent_binary(Path(arch): Path<String>) -> Response {
-    let Some((bytes, _)) = embedded_agent(&arch) else {
+#[derive(Default, Deserialize)]
+struct BinaryDownloadQuery {
+    sha256: Option<String>,
+}
+
+async fn agent_binary(
+    Path(arch): Path<String>,
+    Query(query): Query<BinaryDownloadQuery>,
+) -> Response {
+    let Some((bytes, sha)) = embedded_agent(&arch) else {
         return (
             StatusCode::NOT_FOUND,
             format!(
@@ -3417,6 +3714,13 @@ async fn agent_binary(Path(arch): Path<String>) -> Response {
         )
             .into_response();
     };
+    if query.sha256.as_deref().is_some_and(|wanted| wanted != sha) {
+        return (
+            StatusCode::CONFLICT,
+            "approved Agent artifact is no longer available",
+        )
+            .into_response();
+    }
     (
         [
             (header::CONTENT_TYPE, "application/octet-stream"),
@@ -3432,8 +3736,11 @@ async fn agent_binary(Path(arch): Path<String>) -> Response {
 
 /// The Brocade Xray build matching the node architecture. Unknown architectures fail rather than
 /// receiving a community build or a binary for another machine type.
-async fn xray_binary(Path(arch): Path<String>) -> Response {
-    let Some((bytes, _)) = embedded_xray(&arch) else {
+async fn xray_binary(
+    Path(arch): Path<String>,
+    Query(query): Query<BinaryDownloadQuery>,
+) -> Response {
+    let Some((bytes, sha)) = embedded_xray(&arch) else {
         return (
             StatusCode::NOT_FOUND,
             format!(
@@ -3448,6 +3755,13 @@ async fn xray_binary(Path(arch): Path<String>) -> Response {
         )
             .into_response();
     };
+    if query.sha256.as_deref().is_some_and(|wanted| wanted != sha) {
+        return (
+            StatusCode::CONFLICT,
+            "approved Xray artifact is no longer available",
+        )
+            .into_response();
+    }
     (
         [
             (header::CONTENT_TYPE, "application/octet-stream"),
@@ -4142,7 +4456,7 @@ struct ClashSubscriptionInfoResponse {
     url: String,
     urls: ClashSubscriptionUrlsResponse,
     template: &'static str,
-    haitun: ClashHaitunSubscriptionInfoResponse,
+    haitun: Option<ClashHaitunSubscriptionInfoResponse>,
     remaining_bytes: Option<u64>,
     reset_at: String,
     usage_has_gap: bool,
@@ -4192,29 +4506,26 @@ async fn clash_subscription_info_response(
         .store
         .clash_subscription_for_user(admin, tenant_id, user_id)
         .await?;
-    let haitun = state
-        .store
-        .clash_haitun_link_for_user(admin, tenant_id, user_id)
-        .await?;
+    let haitun = if admin.can_manage_speedtest_subscriptions() {
+        let link = state
+            .store
+            .clash_haitun_link_for_user(admin, tenant_id, user_id)
+            .await?;
+        Some(clash_haitun_subscription_info(&origin, link.as_ref()))
+    } else {
+        None
+    };
     let url = format!("{origin}/sub/v1/{}/clash.yaml", subscription.uuid);
     Ok(Json(ClashSubscriptionInfoResponse {
         url: url.clone(),
         urls: clash_subscription_urls(url),
         template: "SubBoost 标准版",
-        haitun: clash_haitun_subscription_info(&origin, haitun.as_ref()),
+        haitun,
         remaining_bytes: subscription.usage.remaining_bytes,
         reset_at: subscription.usage.reset_at,
         usage_has_gap: subscription.usage.has_gap,
     })
     .into_response())
-}
-
-async fn issue_self_clash_haitun_subscription(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> ApiResult<Response> {
-    let (admin, tenant_id, user_id) = self_user_context(&state, &headers).await?;
-    issue_clash_haitun_subscription_response(&state, &admin, &tenant_id, &user_id).await
 }
 
 async fn issue_clash_haitun_subscription(
@@ -4223,15 +4534,19 @@ async fn issue_clash_haitun_subscription(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
-    issue_clash_haitun_subscription_response(&state, &admin, &tenant_id, &user_id).await
+    write_clash_haitun_subscription_response(&state, &admin, &tenant_id, &user_id, false).await
 }
 
-async fn issue_clash_haitun_subscription_response(
+async fn write_clash_haitun_subscription_response(
     state: &AppState,
     admin: &AdminContext,
     tenant_id: &str,
     user_id: &str,
+    regenerate: bool,
 ) -> ApiResult<Response> {
+    if !admin.can_manage_speedtest_subscriptions() {
+        return Err(ApiError::Forbidden);
+    }
     let origin = state.subscription_origin().await?;
     // Do not mint a bearer that can only return 404. This performs the same serving-model and
     // effective-entry checks as opening the normal Clash subscription.
@@ -4239,50 +4554,27 @@ async fn issue_clash_haitun_subscription_response(
         .store
         .clash_subscription_for_user(admin, tenant_id, user_id)
         .await?;
-    let link = state
-        .store
-        .issue_clash_haitun_link(admin, tenant_id, user_id)
-        .await?;
+    let link = if regenerate {
+        state
+            .store
+            .regenerate_clash_haitun_link(admin, tenant_id, user_id)
+            .await?
+    } else {
+        state
+            .store
+            .issue_clash_haitun_link(admin, tenant_id, user_id)
+            .await?
+    };
     Ok(Json(clash_haitun_subscription_info(&origin, Some(&link))).into_response())
 }
 
-async fn revoke_self_clash_haitun_subscription(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> ApiResult<Response> {
-    let (admin, tenant_id, user_id) = self_user_context(&state, &headers).await?;
-    revoke_clash_haitun_subscription_response(&state, &admin, &tenant_id, &user_id).await
-}
-
-async fn revoke_clash_haitun_subscription(
+async fn regenerate_clash_haitun_subscription(
     State(state): State<AppState>,
     Path((tenant_id, user_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
-    revoke_clash_haitun_subscription_response(&state, &admin, &tenant_id, &user_id).await
-}
-
-async fn revoke_clash_haitun_subscription_response(
-    state: &AppState,
-    admin: &AdminContext,
-    tenant_id: &str,
-    user_id: &str,
-) -> ApiResult<Response> {
-    let link = state
-        .store
-        .revoke_clash_haitun_link(admin, tenant_id, user_id)
-        .await?;
-    // A revoked response has no URL, so this operation remains available even when the public
-    // subscription origin was removed from a broken deployment.
-    Ok(Json(ClashHaitunSubscriptionInfoResponse {
-        template: "koipy 测速",
-        status: "revoked",
-        urls: None,
-        created_at: Some(link.created_at),
-        revoked_at: link.revoked_at,
-    })
-    .into_response())
+    write_clash_haitun_subscription_response(&state, &admin, &tenant_id, &user_id, true).await
 }
 
 fn clash_subscription_urls(url: String) -> ClashSubscriptionUrlsResponse {
@@ -5612,31 +5904,61 @@ fn with_host_network_tuning(mut response: Response, settings: HostNetworkTuning)
 /// architectures therefore upgrade the way they were installed, through `install.sh`.
 async fn agent_release(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
-    let release = state.store.agent_release().await?;
     if node.lifecycle_phase != NodeLifecyclePhase::Active {
-        return Ok(StatusCode::NO_CONTENT.into_response());
-    }
-    if !release.offers(&node.node_id, embedded_release_id()) {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
     let Some(arch) = headers
         .get(AGENT_ARCH_HEADER)
-        .and_then(|value| value.to_str().ok())
+        .and_then(|h| h.to_str().ok())
         .map(str::trim)
-        .filter(|arch| !arch.is_empty())
+        .filter(|s| !s.is_empty())
     else {
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
-    let Some((_, sha256)) = embedded_agent(arch) else {
+    let receipt_capable = headers
+        .get("x-brocade-agent-release-receipt")
+        .and_then(|h| h.to_str().ok())
+        == Some("1");
+    let Some(assignment) = state
+        .store
+        .claim_agent_release(&node.node_id, arch, embedded_release_id(), receipt_capable)
+        .await?
+    else {
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
-
     let dist = state.distribution().await?;
-    Ok(Json(BinarySource {
-        url: format!("{}/brocade-agent/{arch}", dist.agent_public_url),
-        sha256: sha256.to_owned(),
+    Ok(Json(brocade_deployment::protocol::AgentReleaseOffer {
+        url: format!(
+            "{}/brocade-agent/{arch}?sha256={}",
+            dist.agent_public_url, assignment.sha256
+        ),
+        sha256: assignment.sha256,
+        release_id: Some(assignment.release_id),
+        attempt: Some(assignment.attempt),
+        previous_sha256: Some(assignment.previous_sha256),
     })
     .into_response())
+}
+
+async fn agent_release_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<brocade_deployment::protocol::AgentReleaseReport>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    let claimed = report.running_sha256.as_deref();
+    let authenticated = user_agent(&headers).and_then(|s| s.strip_prefix("brocade-agent/"));
+    if claimed.is_some() && claimed != authenticated {
+        return Err(StoreError::InvalidData(
+            "Agent report does not match the authenticated process identity".to_owned(),
+        )
+        .into());
+    }
+    let accepted = state
+        .store
+        .report_agent_release(&node.node_id, &report)
+        .await?;
+    Ok(Json(json!({ "accepted": accepted })).into_response())
 }
 
 /// Offer only the current Console's immutable Xray release and only to an open target wave. The
@@ -5670,7 +5992,10 @@ async fn agent_xray_release(
         release_id: assignment.release_id,
         attempt: assignment.attempt,
         version: assignment.version,
-        url: format!("{}/brocade-xray/{arch}", dist.agent_public_url),
+        url: format!(
+            "{}/brocade-xray/{arch}?sha256={}",
+            dist.agent_public_url, assignment.sha256
+        ),
         sha256: assignment.sha256,
         previous_sha256: assignment.previous_sha256,
     })
@@ -7326,7 +7651,7 @@ const INSTALL_SCRIPT: &str = include_str!("../templates/install.sh");
 
 #[cfg(test)]
 mod tests {
-    use axum::extract::Path;
+    use axum::extract::{Path, Query};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
     use brocade_store::{
@@ -8001,6 +8326,8 @@ mod tests {
         assert!(public_may(&Method::POST, "/auth/logout"));
         // Every other write, including on a path whose GET is allowed.
         assert!(!public_may(&Method::POST, "/model/apply"));
+        assert!(!public_may(&Method::POST, "/notifications/read"));
+        assert!(!public_may(&Method::POST, "/notifications/clear"));
         assert!(!public_may(&Method::PUT, "/branding"));
         assert!(!public_may(&Method::PUT, "/agent-log-policy"));
         assert!(!public_may(&Method::PUT, "/node-traffic/nodes/hk-01"));
@@ -8069,7 +8396,15 @@ mod tests {
         assert!(user_may(&Method::POST, "/me/rotate-uuid"));
         assert!(user_may(&Method::GET, "/me/artifact"));
         assert!(user_may(&Method::GET, "/me/clash-subscription"));
+        assert!(!user_may(&Method::POST, "/me/clash-subscription/haitun"));
+        assert!(!user_may(&Method::DELETE, "/me/clash-subscription/haitun"));
+        assert!(!user_may(
+            &Method::POST,
+            "/users/platform.acme/alice/clash-subscription/haitun/regenerate"
+        ));
         assert!(user_may(&Method::POST, "/admin/password"));
+        assert!(user_may(&Method::POST, "/notifications/read"));
+        assert!(user_may(&Method::POST, "/notifications/clear"));
         assert!(user_may(&Method::GET, "/grant-probes/capability"));
         assert!(user_may(
             &Method::GET,
@@ -8174,6 +8509,10 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("modprobe tls"));
         assert!(INSTALL_SCRIPT.contains("/etc/modules-load.d/brocade-xray-ktls.conf"));
         assert!(INSTALL_SCRIPT.contains("enable_xray_ktls || true"));
+        assert!(INSTALL_SCRIPT.contains("# Brocade: conntrack for Hysteria 2 port hopping."));
+        assert!(INSTALL_SCRIPT.contains("# Brocade: TCP transport defaults."));
+        assert!(!INSTALL_SCRIPT.contains("# 由 brocade 安装脚本写入。控制台靠这个文件在不在"));
+        assert!(!INSTALL_SCRIPT.contains("# 连接跟踪。hy2 端口跳转每换一个目的端口"));
     }
 
     #[test]
@@ -8357,7 +8696,11 @@ mod tests {
     #[tokio::test]
     async fn xray_download_serves_the_requested_architecture_and_rejects_unknown_ones() {
         for (arch, bytes, _) in EMBEDDED_XRAYS {
-            let response = super::xray_binary(Path((*arch).to_owned())).await;
+            let response = super::xray_binary(
+                Path((*arch).to_owned()),
+                Query(super::BinaryDownloadQuery::default()),
+            )
+            .await;
             assert_eq!(response.status(), StatusCode::OK, "{arch}");
             let served = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -8365,7 +8708,11 @@ mod tests {
             assert_eq!(served.as_ref(), *bytes, "{arch}");
         }
 
-        let response = super::xray_binary(Path("riscv64".to_owned())).await;
+        let response = super::xray_binary(
+            Path("riscv64".to_owned()),
+            Query(super::BinaryDownloadQuery::default()),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await

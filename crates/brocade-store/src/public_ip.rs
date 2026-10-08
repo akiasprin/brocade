@@ -230,6 +230,8 @@ pub async fn record(
             Some(&current_ip),
             Some(&ip),
             observed_at,
+            None,
+            None,
         )
         .await?;
         tx.commit().await?;

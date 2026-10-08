@@ -2025,8 +2025,9 @@ fn guard_matches(guard: &IngressGuard, overlay: ipnet::Ipv4Net) -> Vec<DestMatch
         ));
     }
     if guard.no_udp_amplification {
-        // UDP only: 53 over TCP is ordinary DNS that a client may legitimately use, and 389 over
-        // TCP is LDAP. Only the UDP side is usable for reflection.
+        // UDP only: TCP on these ports is used by legitimate services such as LDAP. DNS is not
+        // in this list: proxied system resolvers normally need UDP/53, and silently blackholing it
+        // turns an otherwise healthy VLESS or AnyTLS connection into repeated lookup timeouts.
         matches.push(DestMatch::All(vec![
             DestMatch::Network(Network::Udp),
             DestMatch::Port(

@@ -13,6 +13,7 @@ brocade-core = { path = "../brocade-core" }
 brocade-deployment = { path = "../brocade-deployment" }
 getrandom = "0.3"
 ipnet = "2.11.0"
+log = "0.4"
 # AES-256-GCM for the two secrets that must come back out in the clear (see src/secrets.rs).
 # ring rather than a RustCrypto AEAD for the reason argued at the top of brocade-console/build.rs:
 # it is already what this workspace links through rustls, so it adds no second crypto stack.

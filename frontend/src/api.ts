@@ -618,15 +618,38 @@ export interface MachineEvent {
   id: number;
   node_id: string;
   node_name: string;
-  event_kind: 'node_online' | 'node_offline' | 'public_ip_changed';
+  event_kind: 'node_online' | 'node_offline' | 'public_ip_changed' | 'cpu_steal_started' | 'cpu_steal_recovered';
   family: 4 | 6 | null;
   previous_value: string | null;
   current_value: string | null;
+  last_contact_at: string | null;
+  incident_started_at?: string | null;
+  metric_value?: number | null;
+  metric_peak_value?: number | null;
+  metric_threshold?: number | null;
   occurred_at: string;
+}
+
+export interface ActiveMachineIncident {
+  event_id: number;
+  node_id: string;
+  node_name: string;
+  incident_kind: 'control_plane_offline' | 'cpu_steal';
+  started_at: string;
+  detected_at: string;
+  last_observed_at: string | null;
+  current_value: number | null;
+  peak_value: number | null;
 }
 
 export interface MachineEventList {
   retention_days: number;
+  latest_event_id: number;
+  last_seen_event_id: number;
+  /** Effective personal/global incident cursor; public-IP changes remain visible until retention expiry. */
+  cleared_through_event_id: number;
+  unread_count: number;
+  active: ActiveMachineIncident[];
   events: MachineEvent[];
 }
 
@@ -680,8 +703,14 @@ export const fetchNodePublicIpHistory = (nodeId: string, days = 14) =>
     `/nodes/${encodeURIComponent(nodeId)}/public-ip-history?days=${encodeURIComponent(String(days))}`,
   );
 
-export const fetchMachineEvents = (limit = 50) =>
-  api<MachineEventList>(`/notifications?limit=${encodeURIComponent(String(limit))}`);
+export const fetchMachineEvents = (limit = 50, signal?: AbortSignal) =>
+  api<MachineEventList>(`/notifications?limit=${encodeURIComponent(String(limit))}`, '', { signal });
+
+export const markMachineEventsRead = (throughEventId: number) =>
+  post<{ last_seen_event_id: number }>('/notifications/read', { through_event_id: throughEventId });
+
+export const clearMachineEvents = (throughEventId: number) =>
+  post<{ cleared_through_event_id: number }>('/notifications/clear', { through_event_id: throughEventId });
 
 /* Dns 是带标签的枚举：{"t":"system"} 或 {"t":"servers","v":["1.1.1.1"]} */
 export type Dns = { t: 'system' } | { t: 'servers'; v: string[] };
@@ -1312,7 +1341,7 @@ export interface ClashSubscriptionInfo {
     v6: string;
   };
   template: string;
-  haitun: ClashHaitunSubscriptionInfo;
+  haitun: ClashHaitunSubscriptionInfo | null;
   remaining_bytes: number | null;
   reset_at: string;
   usage_has_gap: boolean;
@@ -1328,26 +1357,21 @@ export interface ClashHaitunSubscriptionInfo {
 
 // The URL is a bearer credential, so it is fetched only when the operator opens the Clash
 // dialog. It must not ride along in the ordinary user-list response or initial page DOM.
-export const fetchClashSubscription = (tenant: string, user: string) =>
-  api<ClashSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription`);
+export const fetchClashSubscription = (tenant: string, user: string, signal?: AbortSignal) =>
+  api<ClashSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription`, '', { signal });
 
-export const fetchMyClashSubscription = () => api<ClashSubscriptionInfo>('/me/clash-subscription');
+export const fetchMyClashSubscription = (signal?: AbortSignal) =>
+  api<ClashSubscriptionInfo>('/me/clash-subscription', '', { signal });
 
 export const issueClashHaitunSubscription = (tenant: string, user: string) =>
   api<ClashHaitunSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription/haitun`, '', {
     method: 'POST',
   });
 
-export const issueMyClashHaitunSubscription = () =>
-  api<ClashHaitunSubscriptionInfo>('/me/clash-subscription/haitun', '', { method: 'POST' });
-
-export const revokeClashHaitunSubscription = (tenant: string, user: string) =>
-  api<ClashHaitunSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription/haitun`, '', {
-    method: 'DELETE',
+export const regenerateClashHaitunSubscription = (tenant: string, user: string) =>
+  api<ClashHaitunSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription/haitun/regenerate`, '', {
+    method: 'POST',
   });
-
-export const revokeMyClashHaitunSubscription = () =>
-  api<ClashHaitunSubscriptionInfo>('/me/clash-subscription/haitun', '', { method: 'DELETE' });
 
 // ── 流量额度（用户 × 项目）──
 // 额度不修改任何产物——xray.json 中不写入用户——因此它是直接写入的运营参数；
@@ -2930,6 +2954,7 @@ export const revokeOperatorToken = (id: string) =>
   });
 
 /* ── 用量 ── */
+// 用户明细仅包含非零流量或缺口事件，不是完整采样时间线；机器曲线使用 node-series 投影。
 
 export interface UsageSample {
   id: number;
@@ -3341,68 +3366,10 @@ export const saveNodeTraffic = (nodeId: string, body: UpdateNodeTrafficRequest) 
     body: JSON.stringify(body),
   });
 
-/* ── agent 发布 ──
- *
- * 与分发一样不产生修订、不需要发布，但作用对象不同：机队上运行的 agent 二进制本身。
- *
- * `release_id` 标识的是一次**构建**而非版本号——控制面在编译期将两个架构的 agent 嵌入自身，
- * 该 id 即这两个 sha256 的哈希。控制面只能识别自身携带的那一批，因此重新部署控制面后，
- * 原先批准的 id 不再对应任何可下发的内容，机队保持当前状态等待再次批准。
- * 若改为自动升级开关，每次部署控制面都会同时替换每台机器上的 agent。
- *
- * 因此此处无法表达「回滚整个机队」，这与实际能力一致：控制面只持有自身编译的那批字节。
- * 需要回退到上一版本时重新部署上一版控制面，其中包含上一版 agent。 */
-export type AgentReleaseScope = 'off' | 'nodes' | 'all';
-
-export interface AgentRelease {
-  release_id: string | null;
-  scope: AgentReleaseScope;
-  /** 只在 scope 为 `nodes` 时有效。切换后返回时不丢失，因此另外两档下保持原值。 */
-  nodes: string[];
-  /** 本次发布的说明。下面四项中唯一由人填写的——构建号标识的是字节内容，不说明原因。 */
-  note: string | null;
-  /* 下列四项由服务端在批准时记录，客户端传入的值无效：若 `released_by` 可由请求设置，
-     即相当于可以用他人身份记录一次全机队二进制替换。
-     记录的是**批准时**的构建信息而非当前进程的信息——控制面重新部署后，进程描述的是它当前
-     携带的那一批，而这几个字段表示的是批准时的那一批。 */
-  version: string | null;
-  commit: string | null;
-  released_at: string | null;
-  released_by: string | null;
-}
-
-export interface AgentBuild {
-  arch: string;
-  sha256: string;
-}
-
-export interface AgentReleaseView {
-  released: AgentRelease;
-  /** 该控制面**当前可下发**的那一批。与 released.release_id 不一致时不会执行升级。 */
-  available_release_id: string;
-  available_agents: AgentBuild[];
-  /** 控制面和 agent 分别上报，尽管当前两者使用同一个 workspace 版本号：它们表示两个对象——
-      当前通信的进程，以及它将安装到机器上的二进制。阅读者不应需要先了解两者由同一次构建
-      产生才能理解本页内容。 */
-  console_version: string;
-  agent_version: string;
-  /** 控制面构建对应的 commit。不在 git 仓库中时为 `unknown`，工作区有未提交改动时附加
-      `-改动未提交`。它描述的不是 agent 的字节内容——将 commit 编入 agent 会使每次文档提交
-      都产生一个新的 agent 构建。 */
-  build_commit: string;
-}
-
-export const fetchAgentRelease = () => api<AgentReleaseView>('/agent-release');
-export const saveAgentRelease = (body: AgentRelease) =>
-  api<AgentReleaseView>('/agent-release', '', { method: 'PUT', body: JSON.stringify(body) });
-
-/* ── Xray 二进制发布 ──
- *
- * 配置仍由不可变模型修订发布；这里发布的是解释配置的可执行文件。一次记录冻结 Console
- * 当前携带的架构摘要、每台机器更新前的摘要和操作事件，因此失败恢复与历史审计不依赖
- * 后续部署的 Console 仍保留相同字节。 */
-export type XrayReleaseStatus = 'running' | 'halted' | 'succeeded' | 'canceled';
-export type XrayReleaseTargetStatus =
+/* Binary release orders retain audit metadata, never historical executable bytes. */
+export type BinaryComponent = 'agent' | 'xray';
+export type BinaryReleaseStatus = 'running' | 'halted' | 'succeeded' | 'canceled';
+export type BinaryReleaseTargetStatus =
   | 'pending'
   | 'dispatched'
   | 'succeeded'
@@ -3411,30 +3378,30 @@ export type XrayReleaseTargetStatus =
   | 'failed-dirty'
   | 'unsupported'
   | 'canceled';
+export type BinaryVerification = 'receipt' | 'observed' | 'legacy';
 
-export interface XrayReleaseArtifact {
+export interface BinaryReleaseArtifact {
   arch: string;
   sha256: string;
 }
-
-export interface XrayReleaseTarget {
+export interface BinaryReleaseTarget {
   node_id: string;
-  status: XrayReleaseTargetStatus;
+  status: BinaryReleaseTargetStatus;
   attempt: number;
   before_sha256: string;
   desired_sha256: string | null;
   arch: string | null;
   error: string | null;
   reported_performed_update: boolean | null;
-  reported_xray_enabled: boolean | null;
+  reported_service_enabled: boolean | null;
   reported_installed_sha256: string | null;
   reported_running_sha256: string | null;
+  verification: BinaryVerification | null;
   retryable: boolean;
   dispatched_at: string | null;
   finished_at: string | null;
 }
-
-export interface XrayReleaseEvent {
+export interface BinaryReleaseEvent {
   id: number;
   kind: string;
   node_id: string | null;
@@ -3442,28 +3409,39 @@ export interface XrayReleaseEvent {
   detail: unknown;
   created_at: string;
 }
-
-export interface XrayRelease {
+export interface BinaryReleaseAttempt {
+  node_id: string;
+  attempt: number;
+  status: BinaryReleaseTargetStatus;
+  verification: BinaryVerification | null;
+  error: string | null;
+  evidence: unknown;
+  started_at: string | null;
+  finished_at: string | null;
+}
+export interface BinaryRelease {
   id: number;
-  release_id: string;
+  component: BinaryComponent;
+  build_id: string;
   version: string;
-  artifacts: XrayReleaseArtifact[];
-  status: XrayReleaseStatus;
+  artifacts: BinaryReleaseArtifact[];
+  status: BinaryReleaseStatus;
   active: boolean;
   note: string | null;
   created_at: string;
   created_by: string;
   halted_at: string | null;
   finished_at: string | null;
-  targets: XrayReleaseTarget[];
-  events: XrayReleaseEvent[];
+  targets: BinaryReleaseTarget[];
+  events: BinaryReleaseEvent[];
+  next_event_before_id: number | null;
 }
-
-export interface XrayReleaseSummary {
+export interface BinaryReleaseSummary {
   id: number;
-  release_id: string;
+  component: BinaryComponent;
+  build_id: string;
   version: string;
-  status: XrayReleaseStatus;
+  status: BinaryReleaseStatus;
   active: boolean;
   note: string | null;
   created_at: string;
@@ -3474,38 +3452,56 @@ export interface XrayReleaseSummary {
   succeeded_count: number;
   problem_count: number;
 }
-
-export interface XrayReleaseView {
-  available_release_id: string;
-  available_xrays: XrayReleaseArtifact[];
-  xray_version: string;
-  console_version: string;
-  build_commit: string;
-  releases: XrayRelease[];
+export interface BinaryReleaseView {
+  available: {
+    component: BinaryComponent;
+    build_id: string;
+    version: string;
+    artifacts: BinaryReleaseArtifact[];
+    source: 'embedded';
+  };
+  current: BinaryRelease | null;
+  legacy_approval: {
+    release_id: string | null;
+    scope: 'off' | 'nodes' | 'all';
+    nodes: string[];
+    note: string | null;
+    version: string | null;
+    commit: string | null;
+    released_at: string | null;
+    released_by: string | null;
+  } | null;
 }
-
-export interface XrayReleaseHistoryPage {
-  history: XrayReleaseSummary[];
-  next_history_before_id: number | null;
+export interface BinaryReleaseHistoryPage {
+  items: BinaryReleaseSummary[];
+  next_before_id: number | null;
 }
-
-export interface CreateXrayRelease {
+export interface CreateBinaryRelease {
   idempotency_key: string;
-  release_id: string;
+  build_id: string;
   nodes: string[];
   note: string | null;
 }
-
-export const fetchXrayReleases = () => api<XrayReleaseView>('/xray-releases');
-export const fetchXrayReleaseHistory = (beforeId: number) =>
-  api<XrayReleaseHistoryPage>(`/xray-releases/history?before_id=${beforeId}`);
-export const fetchXrayRelease = (releaseId: number) => api<XrayRelease>(`/xray-releases/${releaseId}`);
-export const createXrayRelease = (body: CreateXrayRelease) =>
-  api<XrayReleaseView>('/xray-releases', '', { method: 'POST', body: JSON.stringify(body) });
-export const cancelXrayRelease = (releaseId: number) =>
-  api<XrayReleaseView>(`/xray-releases/${releaseId}/cancel`, '', { method: 'POST' });
-export const retryXrayReleaseTarget = (releaseId: number, nodeId: string) =>
-  api<XrayReleaseView>(`/xray-releases/${releaseId}/targets/${encodeURIComponent(nodeId)}/retry`, '', {
+const binaryReleasePath = (component: BinaryComponent) => `/binary-releases/${component}`;
+export const fetchBinaryReleases = (component: BinaryComponent) => api<BinaryReleaseView>(binaryReleasePath(component));
+export const fetchBinaryReleaseHistory = (component: BinaryComponent, beforeId?: number) =>
+  api<BinaryReleaseHistoryPage>(
+    `${binaryReleasePath(component)}/history${beforeId == null ? '' : `?before_id=${beforeId}`}`,
+  );
+export const fetchBinaryRelease = (component: BinaryComponent, id: number) =>
+  api<BinaryRelease>(`${binaryReleasePath(component)}/${id}`);
+export const fetchBinaryReleaseAttempts = (component: BinaryComponent, id: number, node: string) =>
+  api<BinaryReleaseAttempt[]>(`${binaryReleasePath(component)}/${id}/targets/${encodeURIComponent(node)}/attempts`);
+export const fetchBinaryReleaseEvents = (component: BinaryComponent, id: number, beforeId: number) =>
+  api<{ items: BinaryReleaseEvent[]; next_before_id: number | null }>(
+    `${binaryReleasePath(component)}/${id}/events?before_id=${beforeId}`,
+  );
+export const createBinaryRelease = (component: BinaryComponent, body: CreateBinaryRelease) =>
+  api<BinaryReleaseView>(binaryReleasePath(component), '', { method: 'POST', body: JSON.stringify(body) });
+export const cancelBinaryRelease = (component: BinaryComponent, id: number) =>
+  api<BinaryReleaseView>(`${binaryReleasePath(component)}/${id}/cancel`, '', { method: 'POST' });
+export const retryBinaryReleaseTarget = (component: BinaryComponent, id: number, nodeId: string) =>
+  api<BinaryReleaseView>(`${binaryReleasePath(component)}/${id}/targets/${encodeURIComponent(nodeId)}/retry`, '', {
     method: 'POST',
   });
 

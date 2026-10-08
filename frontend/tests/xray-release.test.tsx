@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { XrayRelease, XrayReleaseView } from '../src/api';
+import type { BinaryRelease, BinaryReleaseView } from '../src/api';
 import { XrayReleaseTab, useXrayRelease } from '../src/panes/xray-release';
 
 const OLD_A = 'a'.repeat(64);
@@ -10,13 +10,16 @@ const OLD_B = 'b'.repeat(64);
 const NEXT = 'c'.repeat(64);
 const RELEASE_ID = 'd'.repeat(64);
 
-const emptyView = (): XrayReleaseView => ({
-  available_release_id: RELEASE_ID,
-  available_xrays: [{ arch: 'x86_64', sha256: NEXT }],
-  xray_version: '26.9.1',
-  console_version: '0.2.0',
-  build_commit: 'test',
-  releases: [],
+const emptyView = (): BinaryReleaseView => ({
+  available: {
+    component: 'xray',
+    build_id: RELEASE_ID,
+    artifacts: [{ arch: 'x86_64', sha256: NEXT }],
+    version: '26.9.1',
+    source: 'embedded',
+  },
+  current: null,
+  legacy_approval: null,
 });
 
 const nodes = {
@@ -92,7 +95,7 @@ function XrayHarness() {
 }
 
 const clients: QueryClient[] = [];
-function mount(view: XrayReleaseView) {
+function mount(view: BinaryReleaseView) {
   const client = new QueryClient({
     defaultOptions: {
       queries: { retry: false, staleTime: Number.POSITIVE_INFINITY },
@@ -100,7 +103,7 @@ function mount(view: XrayReleaseView) {
     },
   });
   clients.push(client);
-  client.setQueryData(['xray-releases'], view);
+  client.setQueryData(['binary-releases', 'xray'], view);
   client.setQueryData(['nodes'], nodes);
   return render(
     <QueryClientProvider client={client}>
@@ -126,7 +129,8 @@ describe('Xray 升级', () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        expect(String(input)).toBe('/xray-releases');
+        if (String(input) === '/nodes/agent-state') return json(nodes);
+        expect(String(input)).toBe('/binary-releases/xray');
         expect(init?.method).toBe('POST');
         sent = JSON.parse(String(init?.body));
         return json(view);
@@ -149,18 +153,20 @@ describe('Xray 升级', () => {
     await waitFor(() =>
       expect(sent).toEqual({
         idempotency_key: expect.any(String),
-        release_id: RELEASE_ID,
+        build_id: RELEASE_ID,
         nodes: ['edge-a', 'edge-b'],
         note: null,
       }),
     );
-    expect(screen.queryByText(/灰度|分批|波次|发布记录/)).toBeNull();
+    expect(screen.queryByText(/分批|波次/)).toBeNull();
+    expect(screen.getByRole('button', { name: '发布历史' })).toBeTruthy();
   });
 
-  it('进行中只显示每台机器的升级状态，不提供扩波和历史', async () => {
-    const release: XrayRelease = {
+  it('进行中保持逐台状态，历史通过独立入口按需读取', async () => {
+    const release: BinaryRelease = {
       id: 7,
-      release_id: RELEASE_ID,
+      component: 'xray',
+      build_id: RELEASE_ID,
       version: '26.9.1',
       artifacts: [{ arch: 'x86_64', sha256: NEXT }],
       status: 'halted',
@@ -171,6 +177,7 @@ describe('Xray 升级', () => {
       halted_at: '2026-09-12T00:02:00Z',
       finished_at: null,
       events: [],
+      next_event_before_id: null,
       targets: [
         {
           node_id: 'edge-a',
@@ -181,9 +188,10 @@ describe('Xray 升级', () => {
           arch: 'x86_64',
           error: null,
           reported_performed_update: true,
-          reported_xray_enabled: true,
+          reported_service_enabled: true,
           reported_installed_sha256: NEXT,
           reported_running_sha256: NEXT,
+          verification: 'receipt',
           retryable: false,
           dispatched_at: '2026-09-12T00:01:00Z',
           finished_at: '2026-09-12T00:02:00Z',
@@ -197,20 +205,22 @@ describe('Xray 升级', () => {
           arch: 'x86_64',
           error: '启动检查失败',
           reported_performed_update: true,
-          reported_xray_enabled: true,
+          reported_service_enabled: true,
           reported_installed_sha256: OLD_B,
           reported_running_sha256: OLD_B,
+          verification: 'receipt',
           retryable: true,
           dispatched_at: '2026-09-12T00:01:00Z',
           finished_at: '2026-09-12T00:02:00Z',
         },
       ],
     };
-    const view = { ...emptyView(), releases: [release] };
+    const view = { ...emptyView(), current: release };
     let requested = '';
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input) === '/nodes/agent-state') return json(nodes);
         requested = String(input);
         return json(view);
       }),
@@ -218,7 +228,7 @@ describe('Xray 升级', () => {
     mount(view);
 
     expect(screen.getByText('本次已升级', { selector: '.cgc-st' })).toBeTruthy();
-    expect(screen.getByText('失败 · 已恢复', { selector: '.cgc-st' })).toBeTruthy();
+    expect(screen.getByText('失败 · 原版本运行', { selector: '.cgc-st' })).toBeTruthy();
     // 失败原因写在机器名下；进行中不能再勾选新的机器。
     expect(screen.getByText('启动检查失败')).toBeTruthy();
     expect(screen.queryByRole('group', { name: '升级范围' })).toBeNull();
@@ -227,6 +237,6 @@ describe('Xray 升级', () => {
     expect(screen.queryByRole('button', { name: '查看审计' })).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: '重试' }));
-    await waitFor(() => expect(requested).toBe('/xray-releases/7/targets/edge-b/retry'));
+    await waitFor(() => expect(requested).toBe('/binary-releases/xray/7/targets/edge-b/retry'));
   });
 });

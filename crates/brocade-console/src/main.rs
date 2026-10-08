@@ -12,14 +12,14 @@ use brocade_console::lifecycle::{
 use brocade_store::PgStore;
 use tokio::sync::Notify;
 
-/// How long raw readings are retained. The difference needs only the most recent one, and a week
-/// is so that accounts can be reconciled after an incident.
-const USAGE_READING_RETAIN_DAYS: u32 = 7;
+/// Raw cumulative history is short-lived diagnostic evidence; billing uses durable counter heads.
+const USAGE_READING_RETAIN_DAYS: u32 = 1;
+/// Retry responses have an independent lifetime, not the raw diagnostic history's cutoff.
+const USAGE_RECEIPT_RETAIN_DAYS: u32 = 7;
 const USAGE_SAMPLE_RETAIN_DAYS: u32 = 7;
 
-/// How long telemetry is retained. A week for the same reason as above — long enough to look back
-/// at an incident after the weekend — but the resemblance stops there: usage_readings are kept so
-/// that money can be re-derived, while these are the finished article and worth nothing once old.
+/// How long telemetry is retained: a week lets operators look back at an incident after a weekend.
+/// These finished observations are independent of the shorter raw accounting diagnostic history.
 ///
 /// This is the first knob to turn if the tables get heavy. Shortening it costs history; shortening
 /// the sampling interval instead would cost the resolution that makes a CPU spike visible at all,
@@ -42,6 +42,7 @@ const GRANTS_TICK: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    brocade_console::performance::Performance::initialize()?;
     let database_url =
         env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set for brocade-console")?;
     let admin_bind: SocketAddr = env::var("BROCADE_ADMIN_BIND")
@@ -140,12 +141,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Machine online/offline/IP-change events are always persisted. A generic webhook worker is
     // added when BROCADE_NOTIFICATION_WEBHOOK_URL is configured; its delivery state is durable.
-    brocade_console::notifications::spawn(store.clone());
+    brocade_console::notifications::spawn(store.clone()).await;
 
-    // Retention cleanup. The control plane had no background loop before this one —
-    // usage_readings appends a row per label every 30 seconds and never reclaims, so without
-    // someone clearing it, it does not last long.
-    //
+    // Preserve recent raw telemetry; seal older history incrementally, never one large rewrite.
+    // Skip missed ticks and bound the whole pass so catch-up cannot monopolise the database.
+    let compactor = store.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                compactor.compact_load_history(),
+            )
+            .await
+            {
+                Ok(Ok(0)) => {}
+                Ok(Ok(rows)) => eprintln!("load: 将 {rows} 条历史窗口封存为分钟数据"),
+                Ok(Err(error)) => eprintln!("load: 历史聚合失败：{error}"),
+                Err(_) => eprintln!("load: 历史聚合达到本轮时间预算，下轮继续"),
+            }
+        }
+    });
+
+    // Catch up a shortened raw-history policy gradually: each minute deletes at most one bounded
+    // batch. Keep it separate from receipt expiry and the other hourly retention jobs.
+    let readings_pruner = store.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            match readings_pruner
+                .prune_usage_readings(USAGE_READING_RETAIN_DAYS)
+                .await
+            {
+                Ok(0) => {}
+                Ok(rows) => eprintln!("usage: 清掉 {rows} 条过期读数"),
+                Err(error) => eprintln!("usage: 清理读数失败：{error}"),
+            }
+        }
+    });
+
+    // Other retention cleanup keeps its existing hourly cadence and independent lifetimes.
     // Once an hour suffices (retention is measured in days), DELETE is idempotent, and several
     // instances running at once do not fight. Failure logs without exiting: an uncleanable table
     // is a disk problem and should not take the whole control plane down.
@@ -154,10 +193,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             tick.tick().await;
-            match pruner.prune_usage_readings(USAGE_READING_RETAIN_DAYS).await {
+            match pruner
+                .prune_usage_report_receipts(USAGE_RECEIPT_RETAIN_DAYS)
+                .await
+            {
                 Ok(0) => {}
-                Ok(rows) => eprintln!("usage: 清掉 {rows} 条过期读数"),
-                Err(error) => eprintln!("usage: 清理读数失败：{error}"),
+                Ok(rows) => eprintln!("usage: 清掉 {rows} 条过期回执"),
+                Err(error) => eprintln!("usage: 清理回执失败：{error}"),
             }
             match pruner.prune_usage_samples(USAGE_SAMPLE_RETAIN_DAYS).await {
                 Ok(0) => {}

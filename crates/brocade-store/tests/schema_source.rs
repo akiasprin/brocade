@@ -91,3 +91,12 @@ fn vpngate_probe_history_stays_a_small_diagnostic_store() {
         "raw candidate history should appear only in its insert and bounded retention delete",
     );
 }
+
+#[test]
+fn intelligence_due_index_covers_expired_leases_without_indexing_every_sighting() {
+    assert!(INITIAL_SCHEMA.contains(
+        "CREATE INDEX vpngate_exit_reputations_due\n    ON vpngate_exit_reputations (next_check_at, exit_ip);"
+    ));
+    assert!(VPNGATE_STORE.contains("AND (lease_until IS NULL OR lease_until <= now())"));
+    assert!(VPNGATE_STORE.contains("ORDER BY next_check_at, exit_ip"));
+}

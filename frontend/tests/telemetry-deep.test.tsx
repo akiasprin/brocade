@@ -466,9 +466,17 @@ describe('deep host telemetry', () => {
     const chart = chartMock.setOption.mock.calls.find(([option]) =>
       option.series?.some((line: { name: string }) => line.name === '用户态'),
     )?.[0];
-    expect(chart.xAxis.min).toBe(firstEnd * 1000);
-    expect(chart.xAxis.min % 60_000).not.toBe(0);
-    expect(chart.xAxis.max).toBe((firstEnd + 90) * 1000);
+    expect(chart.xAxis[0].min).toBe(firstEnd * 1000);
+    expect(chart.xAxis[0].min % 60_000).not.toBe(0);
+    expect(chart.xAxis[0].max).toBe((firstEnd + 90) * 1000);
+    // The axis still starts at the first sample, but its ticks sit on whole wall-clock steps (30 s
+    // here) instead of being counted from 01:00:32; a sub-minute step labels the seconds.
+    expect(chart.xAxis[0].axisTick.customValues).toEqual([3_660_000, 3_690_000, 3_720_000]);
+    expect(chart.xAxis[0].axisLabel.customValues).toEqual([3_660_000, 3_690_000, 3_720_000]);
+    expect(chart.xAxis[0].axisLabel.formatter(3_690_000)).toMatch(/^\d{2}:\d{2}:30$/);
+    expect(chart.xAxis[0].minorTick).toBeUndefined();
+    expect(chart.xAxis[1]).toMatchObject({ min: firstEnd * 1000, max: (firstEnd + 90) * 1000, silent: true });
+    expect(chart.xAxis[1].axisPointer).toEqual({ show: false, triggerTooltip: false });
   });
 
   it('keeps stacked bands flat and at full hue, since they never overlap', () => {
@@ -710,7 +718,7 @@ describe('deep host telemetry', () => {
     )?.[0];
     expect(chart.color).toEqual(['#3e8fb0', '#e99cd3']);
     expect(chart.grid).toMatchObject({ left: 10, containLabel: true });
-    expect(chart.xAxis.splitLine.show).toBe(true);
+    expect(chart.xAxis[0].splitLine.show).toBe(true);
     expect(chart.yAxis.splitLine.show).toBe(true);
     for (const line of chart.series) {
       expect(line.smooth).toBe(false);
@@ -730,6 +738,107 @@ describe('deep host telemetry', () => {
     const view = render(<LoadCard report={report()} linked />);
     fireEvent.click(view.getByRole('button', { name: /CPU/ }));
     expect(chartMock.connect).toHaveBeenCalledWith('nd-cpu-history-n1');
+  });
+
+  it('breaks NIC lines and fills across absent windows without dropping the recovery sample', async () => {
+    const value = report();
+    const before = sample();
+    const after = { ...sample(), window_start_unix_secs: 1_000, window_end_unix_secs: 1_030, nic_rx_bps: 300 };
+    value.series = [before, after];
+    value.range_end_unix_secs = 1_030;
+    value.latest_sample = after;
+    renderThroughput(value);
+
+    await waitFor(() => expect(chartMock.setOption).toHaveBeenCalled());
+    const chart = chartMock.setOption.mock.calls.find(([option]) => option.series?.[0]?.name === '接收')?.[0];
+    expect(chart.series[0].connectNulls).toBe(false);
+    expect(chart.series[0].data).toEqual([
+      [130_000, 100],
+      [565_000, null],
+      [1_030_000, 300],
+    ]);
+    expect(chart.series[1].data).toEqual([
+      [130_000, 200],
+      [565_000, null],
+      [1_030_000, 200],
+    ]);
+  });
+
+  it('uses the same explicit gap for every stacked deep-metric series', () => {
+    const value = report();
+    value.series = [sample(), { ...sample(), window_start_unix_secs: 1_000, window_end_unix_secs: 1_030 }];
+    value.latest_sample = value.series[1];
+    value.range_end_unix_secs = 1_030;
+    const view = render(<LoadCard report={value} />);
+    fireEvent.click(view.getByRole('button', { name: /CPU/ }));
+
+    const chart = chartMock.setOption.mock.calls.find(([option]) => option.series?.[0]?.name === '用户态')?.[0];
+    expect(chart).toBeTruthy();
+    for (const series of chart.series) {
+      expect(series.connectNulls).toBe(false);
+      expect(series.data).toHaveLength(3);
+      expect(series.data[1]).toEqual([565_000, null]);
+      expect(series.data[2][0]).toBe(1_030_000);
+      expect(series.data[2][1]).not.toBeNull();
+    }
+  });
+
+  it('breaks Ping when all targets have no reports without labelling that interval packet loss', () => {
+    render(
+      <PingLatencyChart
+        lines={[
+          {
+            name: '测试落点',
+            color: 0,
+            samples: [100, 110, 1_000, 1_010].map(probed_at_unix_secs => ({
+              probed_at_unix_secs,
+              attempted: true,
+              latency_us: 12_000,
+            })),
+          },
+        ]}
+        family="ipv4"
+        bounds={{ startUnixSecs: 0, endUnixSecs: 1_030 }}
+      />,
+    );
+    const chart = chartMock.setOption.mock.calls.at(-1)?.[0];
+    expect(chart.series).toHaveLength(1);
+    expect(chart.series[0].connectNulls).toBe(false);
+    expect(chart.series[0].data).toEqual([
+      [100_000, 12],
+      [110_000, 12],
+      [555_000, null],
+      [1_000_000, 12],
+      [1_010_000, 12],
+    ]);
+    const missing = chart.tooltip.formatter([{ axisValue: 555_000 }]);
+    expect(missing).toContain('—');
+    expect(missing).not.toContain('无响应');
+  });
+
+  it('does not stretch a Ping loss lane across an unobserved interval', () => {
+    render(
+      <PingLatencyChart
+        lines={[
+          {
+            name: '测试落点',
+            color: 0,
+            samples: [100, 110, 1_000, 1_010].map(probed_at_unix_secs => ({
+              probed_at_unix_secs,
+              attempted: true,
+              latency_us: probed_at_unix_secs === 110 || probed_at_unix_secs === 1_000 ? null : 12_000,
+            })),
+          },
+        ]}
+        family="ipv4"
+        bounds={{ startUnixSecs: 0, endUnixSecs: 1_030 }}
+      />,
+    );
+    const chart = chartMock.setOption.mock.calls.at(-1)?.[0];
+    expect(chart.series.at(-1).data).toEqual([
+      [105_000, 115_000],
+      [995_000, 1_005_000],
+    ]);
   });
 
   it('sweeps Ping data in once and keeps later sample updates stable', () => {
@@ -793,7 +902,10 @@ describe('deep host telemetry', () => {
 
     view.rerender(<PingLatencyChart lines={lines} family="ipv4" bounds={{ startUnixSecs: 10, endUnixSecs: 140 }} />);
     expect(chartMock.setOption).toHaveBeenCalledTimes(2);
-    expect(chartMock.setOption.mock.calls[1][0]).toMatchObject({ animation: false, xAxis: { max: 140_000 } });
+    expect(chartMock.setOption.mock.calls[1][0]).toMatchObject({
+      animation: false,
+      xAxis: [{ max: 140_000 }, { max: 140_000 }],
+    });
   });
 
   it('paints every new Ping chart instance, including effect remounts and linking changes', () => {
@@ -883,7 +995,7 @@ describe('deep host telemetry', () => {
     );
     const view = render(panel(halfHour));
     expect(chartMock.setOption).toHaveBeenCalledTimes(1);
-    expect(chartMock.setOption.mock.calls[0][0].xAxis.max).toBe(130_000);
+    expect(chartMock.setOption.mock.calls[0][0].xAxis[0].max).toBe(130_000);
 
     now.mockReturnValue(131_000);
     view.rerender(panel({ ...halfHour }));
@@ -893,12 +1005,15 @@ describe('deep host telemetry', () => {
     now.mockReturnValue(140_000);
     act(() => client.setQueryData(queryKey, structuredClone(ping)));
     await waitFor(() => expect(chartMock.setOption).toHaveBeenCalledTimes(2));
-    expect(chartMock.setOption.mock.calls[1][0]).toMatchObject({ animation: false, xAxis: { max: 140_000 } });
+    expect(chartMock.setOption.mock.calls[1][0]).toMatchObject({
+      animation: false,
+      xAxis: [{ max: 140_000 }, { max: 140_000 }],
+    });
 
     client.setQueryData(['node-ping-probe', 'n1', '0-125'], ping);
     view.rerender(panel({ ...halfHour, startUnixSecs: 0, endUnixSecs: 125 }));
     expect(chartMock.setOption).toHaveBeenCalledTimes(3);
-    expect(chartMock.setOption.mock.calls[2][0].xAxis.max).toBe(125_000);
+    expect(chartMock.setOption.mock.calls[2][0].xAxis[0].max).toBe(125_000);
     view.unmount();
     client.clear();
   });
@@ -1171,10 +1286,10 @@ describe('deep host telemetry', () => {
     expect(chart.animationEasing).toBe('cubicInOut');
     expect(chart.animationDurationUpdate).toBe(0);
     expect(chart.color.slice(0, 6)).toEqual(['#3e8fb0', '#e99cd3', '#8bbe95', '#7da1e3', '#ea9a97', '#9ccfd8']);
-    expect(chart.xAxis.splitLine.show).toBe(true);
+    expect(chart.xAxis[0].splitLine.show).toBe(true);
     expect(chart.yAxis.splitLine.show).toBe(true);
     expect(chart.grid).toMatchObject({ left: 10, containLabel: true });
-    expect(chart.xAxis.axisLabel.fontSize).toBe(9.5);
+    expect(chart.xAxis[0].axisLabel.fontSize).toBe(9.5);
     expect(chart.yAxis.axisLabel.fontSize).toBe(9.5);
     expect(chart.tooltip.extraCssText).toContain('box-shadow');
 
@@ -1237,7 +1352,7 @@ describe('deep host telemetry', () => {
       option.series?.some((line: { name: string }) => line.name === 'CPU PSI some'),
     )?.[0];
     expect(pressure).toBeTruthy();
-    expect(pressure.xAxis.type).toBe('value');
+    expect(pressure.xAxis[0].type).toBe('value');
     const cpuPsi = pressure.series.find((line: { name: string }) => line.name === 'CPU PSI some');
     expect(cpuPsi.data).toHaveLength(60);
     expect(cpuPsi.data[8]).toEqual([(130 + 8 * 30) * 1000, 11.084]);
@@ -1285,9 +1400,9 @@ describe('deep host telemetry', () => {
       option.series?.some((line: { name: string }) => line.name === '接收'),
     )?.[0];
     expect(network).toBeTruthy();
-    expect(network.xAxis.type).toBe('value');
-    expect(network.xAxis.min).toBe(1_000_000);
-    expect(network.xAxis.max).toBe(87_400_000);
+    expect(network.xAxis[0].type).toBe('value');
+    expect(network.xAxis[0].min).toBe(1_000_000);
+    expect(network.xAxis[0].max).toBe(87_400_000);
     expect(network.series[0].data).toEqual([[10_030_000, 100]]);
     expect(network.series[1].data).toEqual([[10_030_000, 200]]);
   });

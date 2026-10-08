@@ -33,5 +33,12 @@ test('VLESS Encryption validates complete keys, modes, padding and rejects incom
     for (const rtt of ['0rtt', '1rtt']) assert.equal(valid(`mlkem768x25519plus.${mode}.${rtt}.${key}`), true);
   }
   assert.equal(valid(`mlkem768x25519plus.native.0rtt.100-111-1111.75-0-111.${key}`), true);
-  for (const value of ['', 'garbage', 'mlkem768x25519plus.native.1rtt.', `mlkem768x25519plus.native.600s.${key}`, `mlkem768x25519plus.native.1rtt.${key}.100-1-1`]) assert.equal(valid(value), false);
+  for (const value of [
+    '',
+    'garbage',
+    'mlkem768x25519plus.native.1rtt.',
+    `mlkem768x25519plus.native.600s.${key}`,
+    `mlkem768x25519plus.native.1rtt.${key}.100-1-1`,
+  ])
+    assert.equal(valid(value), false);
 });

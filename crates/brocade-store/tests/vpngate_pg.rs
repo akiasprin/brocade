@@ -142,6 +142,129 @@ fn vpngate_outbound(id: &str, country_code: &str) -> UpsertExternalOutboundReque
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn intelligence_due_index_serves_new_and_expired_leases() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    let admin = AdminContext::system_admin("intelligence-index-test");
+    db.store
+        .create_tenant(
+            &admin,
+            CreateTenantRequest {
+                id: "platform.intelligence".to_owned(),
+                name: "Intelligence".to_owned(),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO nodes
+        (id, tenant_id, name, overlay_addr, wg_private_key, wg_public_key,
+         wg_listen_port, egress_allowed, dns_kind)
+        VALUES ('intel-index', 'platform.intelligence', 'Intel', '10.88.0.22',
+                'private-index', 'public-index', 51820, TRUE, 'system')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO node_agent_state (node_id, agent_protocol_version, runtime_reported_at, runtime_versions)
+                 VALUES ('intel-index', $1, now(), '{}'::jsonb)",
+    )
+    .bind(i32::try_from(AGENT_PROTOCOL_VERSION).unwrap())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    db.store
+        .update_vpngate_intelligence_node(
+            &admin,
+            "intel-index",
+            UpdateVpngateIntelligenceNode { enabled: true },
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO vpngate_exit_reputations (exit_ip, next_check_at)
+        SELECT '198.18.0.0'::inet + n, now() + interval '1 day'
+          FROM generate_series(1, 5000) n",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE vpngate_exit_reputations SET next_check_at=now()-interval '1 minute'
+                 WHERE exit_ip='198.18.0.1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("ANALYZE vpngate_exit_reputations")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let plan: serde_json::Value = sqlx::query_scalar(
+        "EXPLAIN (FORMAT JSON)
+        SELECT host(exit_ip), lease_generation FROM vpngate_exit_reputations
+        WHERE next_check_at <= now() AND (lease_until IS NULL OR lease_until <= now())
+          AND last_seen_at >= now()-interval '48 hours'
+        ORDER BY next_check_at, exit_ip FOR UPDATE SKIP LOCKED LIMIT 1",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        plan.to_string().contains("vpngate_exit_reputations_due"),
+        "{plan}"
+    );
+    let first = db
+        .store
+        .claim_vpngate_exit_intelligence("intel-index")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.exit_ip, "198.18.0.1");
+    assert!(db
+        .store
+        .claim_vpngate_exit_intelligence("intel-index")
+        .await
+        .unwrap()
+        .is_none());
+    sqlx::query(
+        "UPDATE vpngate_exit_reputations SET lease_until=now()-interval '1 second'
+                 WHERE exit_ip='198.18.0.1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let reclaimed = db
+        .store
+        .claim_vpngate_exit_intelligence("intel-index")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reclaimed.exit_ip, first.exit_ip);
+    assert!(reclaimed.lease_generation > first.lease_generation);
+    assert!(db
+        .store
+        .record_vpngate_ip_intelligence_report(
+            "intel-index",
+            &intelligence_report(&first.exit_ip, first.lease_generation, 9)
+        )
+        .await
+        .is_err());
+    db.store
+        .record_vpngate_ip_intelligence_report(
+            "intel-index",
+            &intelligence_report(&reclaimed.exit_ip, reclaimed.lease_generation, 9),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn selected_probe_node_becomes_stale_only_after_the_startup_grace_period() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -2983,7 +3106,7 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
     after_automatic_failover.selected_server_id = Some(safe_candidate.server_id.clone());
     after_automatic_failover.applied_profile_sha256 = Some(safe_candidate.profile_sha256.clone());
     db.store
-        .record_vpngate_agent_report("edge", after_automatic_failover)
+        .record_vpngate_agent_report("edge", after_automatic_failover.clone())
         .await
         .unwrap();
     let switched = db.store.vpngate_runtime_views(&admin).await.unwrap();
@@ -3005,6 +3128,32 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
         .pools[0]
         .manual_switch
         .is_none());
+
+    // Deleting and recreating a logical pool cascades its switch audit row, but an Agent that
+    // stayed online still repeats its last durable terminal acknowledgement. That orphaned audit
+    // attachment has no database row left to mutate and must not suppress otherwise valid current
+    // runtime state.
+    sqlx::query("DELETE FROM vpngate_pool_switch_requests WHERE id = $1")
+        .bind(i64::try_from(switch_request.request_id).unwrap())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let orphaned_switch_receipt = db
+        .store
+        .record_vpngate_agent_report("edge", after_automatic_failover)
+        .await
+        .unwrap();
+    assert!(orphaned_switch_receipt.current_state_updated);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT runtime_status FROM vpngate_node_pool_state
+              WHERE node_id = 'edge' AND outbound_id = 'vpngate-1111-1111'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        "degraded"
+    );
 
     let measured_overview = db.store.vpngate_overview().await.unwrap();
     assert_eq!(measured_overview.countries[0].measured_successful, 2);
@@ -3144,6 +3293,39 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
             .map(|point| point.current_servers)
             .collect::<Vec<_>>(),
         vec![3, 1]
+    );
+
+    // A successful fleet-wide catalogue sync can finish after this Agent fetched its desired
+    // state but before its reconcile report arrives. The older candidate generation still
+    // describes the runtime the Agent actually applied, and pool identity is governed by the
+    // unchanged topology. Persist it instead of leaving the carrier invisible indefinitely.
+    let stale_catalog_receipt = db
+        .store
+        .record_vpngate_agent_report(
+            "edge",
+            VpngatePoolReport {
+                topology_revision: ranked_desired.topology_revision,
+                catalog_generation: ranked_desired.catalog_generation,
+                outbound_id: "vpngate-1111-1111".to_owned(),
+                runtime_status: "degraded".to_owned(),
+                selected_server_id: Some(selected_candidate.server_id.clone()),
+                applied_profile_sha256: Some(selected_candidate.profile_sha256.clone()),
+                manual_switch_result: None,
+                samples: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(stale_catalog_receipt.current_state_updated);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT runtime_status FROM vpngate_node_pool_state
+              WHERE node_id = 'edge' AND outbound_id = 'vpngate-1111-1111'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        "degraded"
     );
     assert_eq!(
         second_view

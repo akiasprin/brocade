@@ -1,4 +1,4 @@
-import { useState, type CSSProperties, type ReactNode } from 'react';
+import { useId, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   fetchArtifactContent,
@@ -7,19 +7,18 @@ import {
   fetchMyClashSubscription,
   fetchRevisions,
   issueClashHaitunSubscription,
-  issueMyClashHaitunSubscription,
-  revokeClashHaitunSubscription,
-  revokeMyClashHaitunSubscription,
+  regenerateClashHaitunSubscription,
   type ArtifactFamily,
   type ArtifactProtocol,
   type ClashSubscriptionInfo,
 } from '../api';
 import { ErrorBox, Loading, SegmentedControl } from '../ui/bits';
-import { CopyButton } from '../ui/copy-button';
+import { CopyButton, copyStateIcon } from '../ui/copy-button';
 import { DialogClose, DialogLayer } from '../ui/dialog';
 import { bytes } from '../ui/format';
-import { Icon } from '../ui/icons';
+import { Icon, type IconName } from '../ui/icons';
 import { RegionFlag } from '../ui/region-flag';
+import { useNarrow } from '../ui/viewport';
 
 export type SubscriptionKind = 'uri' | 'clash';
 
@@ -39,9 +38,22 @@ const PROTOCOL_PICKS: { value: ProtocolPick; label: string }[] = [
   { value: 'hysteria2', label: 'Hysteria 2' },
 ];
 
+const TABS: { value: SubscriptionKind; label: string; icon: IconName }[] = [
+  { value: 'clash', label: '订阅', icon: 'subscription' },
+  { value: 'uri', label: '节点', icon: 'client' },
+];
+
+/* 两个页签各自渲染正文；正文元素是当前页签对应的 tabpanel。 */
+interface TabPanelProps {
+  role: 'tabpanel';
+  id: string;
+  'aria-labelledby': string;
+}
+
 /* 订阅与节点共用一个弹窗：标题栏切换「订阅 / 节点」，协议与地址族筛选两个页签共用。
  * 两边的内容都由服务端按筛选条件生成：订阅是带 family / protocol 参数的地址，节点是同一条件下的
- * uri.txt。浏览器只把 uri.txt 解析成列表用于展示，不自行过滤条目。 */
+ * uri.txt。浏览器只把 uri.txt 解析成列表用于展示，不自行过滤条目。
+ * 窄屏（与 useNarrow 同一断点）弹窗贴底成为面板，筛选换成一行两个下拉。 */
 export function SubscriptionViewer({
   tenant,
   user,
@@ -60,7 +72,28 @@ export function SubscriptionViewer({
   const [tab, setTab] = useState<SubscriptionKind>(kind);
   const [protocol, setProtocol] = useState<ProtocolPick>('both');
   const [family, setFamily] = useState<FamilyPick>('both');
-  const [allowInsecure, setAllowInsecure] = useState(false);
+  // 默认列出自签证书节点（带 insecure 标记），节点页签的说明行里可以改为不列出。切到 VLESS 不收回：
+  // VLESS 自签入口没有可互通的链接写法，服务端无论是否允许 insecure 都会跳过并给出说明。
+  const [allowInsecure, setAllowInsecure] = useState(true);
+  const narrow = useNarrow();
+  const ids = useId();
+  const tabId = (value: SubscriptionKind) => `${ids}-tab-${value}`;
+  const panel: TabPanelProps = { role: 'tabpanel', id: `${ids}-panel`, 'aria-labelledby': tabId(tab) };
+
+  // 与机器详情页签相同：左右方向键、Home / End 在两个页签之间移动并切换。
+  const moveTab = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    const index = TABS.findIndex(item => item.value === tab);
+    let next: number | null = null;
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % TABS.length;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (index - 1 + TABS.length) % TABS.length;
+    if (event.key === 'Home') next = 0;
+    if (event.key === 'End') next = TABS.length - 1;
+    if (next === null) return;
+    event.preventDefault();
+    const value = TABS[next].value;
+    setTab(value);
+    window.requestAnimationFrame(() => document.getElementById(tabId(value))?.focus());
+  };
 
   return (
     <DialogLayer label={`${user} 的订阅与节点`} onClose={onClose}>
@@ -68,54 +101,65 @@ export function SubscriptionViewer({
         <header className="sub-dialog-head">
           {identity}
           <b className="sub-dialog-user">{user}</b>
-          <SegmentedControl
-            className="sub-dialog-tabs"
-            ariaLabel="订阅与节点"
-            value={tab}
-            onChange={setTab}
-            options={[
-              {
-                value: 'clash',
-                label: (
-                  <>
-                    <Icon of="subscription" size={12} className="sub-dialog-tab-icon" />
-                    订阅
-                  </>
-                ),
-              },
-              {
-                value: 'uri',
-                label: (
-                  <>
-                    <Icon of="client" size={12} className="sub-dialog-tab-icon" />
-                    节点
-                  </>
-                ),
-              },
-            ]}
-          />
+          <div className="nd-tabs sub-dialog-tabs" role="tablist" aria-label="订阅与节点">
+            <div className="nd-tabs-seg">
+              {TABS.map(item => (
+                <button
+                  key={item.value}
+                  type="button"
+                  id={tabId(item.value)}
+                  role="tab"
+                  aria-selected={tab === item.value}
+                  aria-controls={panel.id}
+                  tabIndex={tab === item.value ? 0 : -1}
+                  onKeyDown={moveTab}
+                  onClick={() => setTab(item.value)}
+                >
+                  <Icon of={item.icon} size={14} className="nd-tab-ic" />
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          </div>
           <DialogClose className="sub-dialog-close" title="关闭" aria-label="关闭">
             <Icon of="close" size={14} />
           </DialogClose>
         </header>
         <div className="sub-dialog-filter">
-          <span className="sub-dialog-field">
-            <span>协议</span>
-            <SegmentedControl
-              ariaLabel="订阅协议"
-              value={protocol}
-              options={PROTOCOL_PICKS}
-              onChange={next => {
-                setProtocol(next);
-                // VLESS 没有可互通的自签证书链接表达，切到 VLESS 时收回 insecure。
-                if (next === 'vless') setAllowInsecure(false);
-              }}
-            />
-          </span>
-          <span className="sub-dialog-field">
-            <span>地址族</span>
-            <SegmentedControl ariaLabel="地址族" value={family} options={FAMILY_PICKS} onChange={setFamily} />
-          </span>
+          {narrow ? (
+            <>
+              <FilterPick
+                icon="protocol"
+                label="协议"
+                value={protocol}
+                options={PROTOCOL_PICKS}
+                onChange={setProtocol}
+              />
+              <FilterPick icon="family" label="地址族" value={family} options={FAMILY_PICKS} onChange={setFamily} />
+            </>
+          ) : (
+            <>
+              <span className="sub-dialog-field">
+                <span className="sub-dialog-label">
+                  <Icon of="protocol" size={13} />
+                  协议
+                </span>
+                <SegmentedControl
+                  ariaLabel="订阅协议"
+                  value={protocol}
+                  options={PROTOCOL_PICKS}
+                  onChange={setProtocol}
+                />
+              </span>
+              <span className="sub-dialog-field">
+                <span className="sub-dialog-label">
+                  <Icon of="family" size={13} />
+                  地址族
+                </span>
+                <SegmentedControl ariaLabel="地址族" value={family} options={FAMILY_PICKS} onChange={setFamily} />
+              </span>
+            </>
+          )}
         </div>
         {tab === 'clash' ? (
           <ClashSubscription
@@ -124,6 +168,7 @@ export function SubscriptionViewer({
             selfService={selfService}
             protocol={protocol}
             family={family}
+            panel={panel}
           />
         ) : (
           <NodeLinks
@@ -135,6 +180,7 @@ export function SubscriptionViewer({
             allowInsecure={allowInsecure}
             onAllowInsecure={setAllowInsecure}
             onUseSubscription={() => setTab('clash')}
+            panel={panel}
           />
         )}
       </section>
@@ -142,7 +188,49 @@ export function SubscriptionViewer({
   );
 }
 
-/* ── 订阅 ── */
+/* 窄屏筛选：显示层是图标、名称、当前值与箭头，透明的原生 select 覆盖在上面，点开即系统选择器。
+ * select 自身用 16px：iOS 聚焦字号小于 16px 的表单控件会放大页面。 */
+function FilterPick<T extends string>({
+  icon,
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  icon: IconName;
+  label: string;
+  value: T;
+  options: readonly { value: T; label: string }[];
+  onChange: (value: T) => void;
+}) {
+  return (
+    <label className="sub-pick">
+      <span className="sub-pick-label">
+        <Icon of={icon} size={14} />
+        {label}
+      </span>
+      <b className="sub-pick-value">{options.find(option => option.value === value)?.label}</b>
+      <Icon of="chevronDown" size={14} className="sub-pick-chevron" />
+      <select
+        aria-label={label}
+        value={value}
+        onChange={event => {
+          const next = options.find(option => option.value === event.target.value);
+          if (next) onChange(next.value);
+        }}
+      >
+        {options.map(option => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+/* ── 订阅 ──
+ * 一个订阅一块：左侧图标列，标题与说明在上，读数在右；地址框与说明对齐到标题文字。 */
 
 function ClashSubscription({
   tenant,
@@ -150,36 +238,41 @@ function ClashSubscription({
   selfService,
   protocol,
   family,
+  panel,
 }: {
   tenant: string;
   user: string;
   selfService: boolean;
   protocol: ProtocolPick;
   family: FamilyPick;
+  panel: TabPanelProps;
 }) {
   const qc = useQueryClient();
-  const queryKey = ['clash-subscription', tenant, user] as const;
+  const queryKey = ['clash-subscription', tenant, user, selfService ? 'self' : 'admin'] as const;
   // 地址本身是访问凭据：只在打开「订阅」页签时读取，不随用户列表下发。
   const subscription = useQuery({
     queryKey,
-    queryFn: () => (selfService ? fetchMyClashSubscription() : fetchClashSubscription(tenant, user)),
+    queryFn: ({ signal }) =>
+      selfService ? fetchMyClashSubscription(signal) : fetchClashSubscription(tenant, user, signal),
     staleTime: 0,
   });
-  const updateHaitun = (haitun: ClashSubscriptionInfo['haitun']) => {
+  const updateHaitun = async (haitun: ClashSubscriptionInfo['haitun']) => {
+    // A read started before rotation must not replace the new URL with the invalid old token.
+    await qc.cancelQueries({ queryKey });
     qc.setQueryData<ClashSubscriptionInfo>(queryKey, current => (current ? { ...current, haitun } : current));
   };
   const issueHaitun = useMutation({
-    mutationFn: () => (selfService ? issueMyClashHaitunSubscription() : issueClashHaitunSubscription(tenant, user)),
+    mutationFn: () => issueClashHaitunSubscription(tenant, user),
     onSuccess: updateHaitun,
   });
-  const revokeHaitun = useMutation({
-    mutationFn: () => (selfService ? revokeMyClashHaitunSubscription() : revokeClashHaitunSubscription(tenant, user)),
+  const regenerateHaitun = useMutation({
+    mutationFn: () => regenerateClashHaitunSubscription(tenant, user),
     onSuccess: updateHaitun,
   });
 
   if (subscription.isPending || subscription.error) {
     return (
-      <div className="sub-dialog-body">
+      <div className="sub-dialog-body" {...panel}>
         {subscription.error ? <ErrorBox error={subscription.error} /> : <Loading variant="code" />}
       </div>
     );
@@ -187,86 +280,125 @@ function ClashSubscription({
 
   const value = subscription.data;
   const standardUrl = withSubscriptionProtocol(value.urls[family], protocol);
-  const haitun = value.haitun;
-  const haitunUrls = haitun.status === 'active' ? haitun.urls : null;
+  const haitun = selfService ? null : value.haitun;
+  const haitunUrls = haitun?.status === 'active' ? haitun.urls : null;
   const haitunUrl = haitunUrls ? withSubscriptionProtocol(haitunUrls[family], protocol) : '';
-  const actionError = issueHaitun.error ?? revokeHaitun.error;
+  const actionError = issueHaitun.error ?? regenerateHaitun.error;
+  const haitunPending = issueHaitun.isPending || regenerateHaitun.isPending;
 
   return (
     <>
-      <div className="sub-dialog-body">
-        <section className="sub-section">
-          <div className="sub-section-head">
-            <b>Clash 订阅</b>
-            <span className="sub-section-meta">模板 {value.template} · 适用 Mihomo / Clash Meta</span>
-          </div>
-          {/* key 随地址变化：切换协议或地址族后重新遮罩。 */}
-          <SubscriptionUrl key={standardUrl} url={standardUrl} name="Clash 订阅地址" />
-          <dl className="sub-readings">
-            <div>
-              <dt>剩余流量</dt>
-              <dd className={value.remaining_bytes === 0 ? 'bad' : undefined}>
-                {value.remaining_bytes === null ? '不限量' : bytes(value.remaining_bytes)}
-              </dd>
+      <div className="sub-dialog-body" {...panel}>
+        <section className="sub-item" aria-label="Clash 订阅">
+          <Icon of="subscription" size={16} className="sub-item-icon" />
+          <div className="sub-item-head">
+            <div className="sub-item-title">
+              <div className="sub-item-name">
+                <b>Clash 订阅</b>
+              </div>
+              <span className="sub-item-sub">模板 {value.template} · 适用 Mihomo / Clash Meta</span>
             </div>
-            <div>
-              <dt>重置时间</dt>
-              <dd>{formatResetAt(value.reset_at)}</dd>
-            </div>
-          </dl>
-        </section>
-        <section className="sub-section">
-          <div className="sub-section-head">
-            <b>koipy 测速订阅</b>
-            <span className={`sub-live${haitunUrls ? ' ok' : haitun.status === 'revoked' ? ' warn' : ''}`}>
-              {haitunUrls ? '可用' : haitun.status === 'revoked' ? '已撤销' : '尚未生成'}
-            </span>
-            {haitunUrls ? (
-              <button
-                type="button"
-                className="sub-text-action danger"
-                aria-label="撤销 koipy 测速地址"
-                disabled={revokeHaitun.isPending}
-                onClick={() => revokeHaitun.mutate()}
-              >
-                {revokeHaitun.isPending ? '撤销中…' : '撤销'}
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="btn sub-section-action"
-                aria-label={haitun.status === 'revoked' ? '重新生成 koipy 测速地址' : '生成 koipy 测速地址'}
-                disabled={issueHaitun.isPending}
-                onClick={() => issueHaitun.mutate()}
-              >
-                {issueHaitun.isPending ? '生成中…' : haitun.status === 'revoked' ? '重新生成' : '生成'}
-              </button>
-            )}
+            <dl className="sub-readings">
+              <div>
+                <dt>剩余流量</dt>
+                <dd className={value.remaining_bytes === 0 ? 'bad' : undefined}>
+                  {value.remaining_bytes === null ? '不限量' : bytes(value.remaining_bytes)}
+                </dd>
+              </div>
+              <div>
+                <dt>重置时间</dt>
+                <dd title="按 UTC+8 计">{formatResetAt(value.reset_at)}</dd>
+              </div>
+            </dl>
           </div>
-          {haitunUrls && <SubscriptionUrl key={haitunUrl} url={haitunUrl} name="koipy 测速地址" />}
-          <p className="sub-section-note">
-            {haitunUrls
-              ? '独立 Token，只含测速需要的节点与链路。撤销后测速端无法再拉取；已下载的节点凭据需更换 UUID 才失效。'
-              : haitun.status === 'revoked'
-                ? '旧测速地址已失效。重新生成会签发新的 Token。'
-                : '生成独立 Token 的测速订阅，不影响上方的 Clash 订阅。'}
-          </p>
-          {actionError && <ErrorBox error={actionError} />}
+          <div className="sub-item-body">
+            {/* key 随地址变化：切换协议或地址族后重新遮罩。 */}
+            <SubscriptionUrl key={standardUrl} url={standardUrl} name="Clash 订阅地址" />
+          </div>
         </section>
+        {haitun && (
+          <section className="sub-item" aria-label="koipy 测速订阅">
+            <Icon of="observe" size={16} className="sub-item-icon" />
+            <div className="sub-item-head">
+              <div className="sub-item-title">
+                <div className="sub-item-name">
+                  <b>koipy 测速订阅</b>
+                  <span className={`sub-live${haitunUrls ? ' ok' : haitun.status === 'revoked' ? ' warn' : ''}`}>
+                    {haitunUrls ? '可用' : haitun.status === 'revoked' ? '旧地址已停用' : '尚未生成'}
+                  </span>
+                </div>
+                <span className="sub-item-sub">仅管理员</span>
+              </div>
+              {haitunUrls ? (
+                <button
+                  type="button"
+                  className="btn sub-item-action"
+                  aria-label="重新生成 koipy 测速地址"
+                  disabled={haitunPending}
+                  onClick={() => {
+                    if (
+                      !window.confirm(
+                        '重新生成后，旧测速地址将无法继续拉取，但已下载的 UUID 和节点配置仍然有效。此操作不更换 UUID，也不发布授权。确定重新生成？',
+                      )
+                    )
+                      return;
+                    issueHaitun.reset();
+                    regenerateHaitun.mutate();
+                  }}
+                >
+                  {regenerateHaitun.isPending ? '生成中…' : '重新生成'}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn sub-item-action"
+                  aria-label={haitun.status === 'revoked' ? '重新生成 koipy 测速地址' : '生成 koipy 测速地址'}
+                  disabled={haitunPending}
+                  onClick={() => issueHaitun.mutate()}
+                >
+                  {issueHaitun.isPending ? '生成中…' : haitun.status === 'revoked' ? '重新生成' : '生成'}
+                </button>
+              )}
+            </div>
+            <div className="sub-item-body">
+              {haitunUrls && <SubscriptionUrl key={haitunUrl} url={haitunUrl} name="koipy 测速地址" />}
+              <p className="sub-item-note">
+                风险提示：测速订阅包含用户 UUID
+                等真实节点凭据，持有地址的人无需登录即可获取并使用节点，请仅交给可信测速服务。
+                重新生成仅更换测速地址，不影响普通订阅，也不会使已下载的节点配置失效。
+                若凭据泄露，需同时重新生成测速地址、更换用户 UUID 并发布授权，待节点生效后旧凭据才失效。
+              </p>
+              {actionError && <ErrorBox error={actionError} />}
+            </div>
+          </section>
+        )}
       </div>
       <footer className="sub-dialog-foot">
         <span>每次拉取按当前授权实时生成，不缓存</span>
-        <span>更换 UUID 后旧地址立即失效</span>
+        <span>节点凭据变更需发布授权并等待节点生效</span>
       </footer>
     </>
   );
 }
 
+/* 地址框：遮住的 Token 降一档墨色，主机与路径保持可读；「显示」与「复制」收在框内右侧。
+ * 窄屏时地址整段换行显示，两个按钮落到框底各占一半。 */
 function SubscriptionUrl({ url, name }: { url: string; name: string }) {
   const [revealed, setRevealed] = useState(false);
+  const masked = revealed ? null : maskSubscriptionUrl(url);
   return (
     <div className="sub-url">
-      <code title={revealed ? url : undefined}>{revealed ? url : maskSubscriptionUrl(url)}</code>
+      <code title={revealed ? url : undefined}>
+        {masked ? (
+          <>
+            {masked.head}
+            <span className="sub-url-mask">{TOKEN_MASK}</span>
+            {masked.tail}
+          </>
+        ) : (
+          url
+        )}
+      </code>
       <button
         type="button"
         className="sub-url-reveal"
@@ -275,7 +407,14 @@ function SubscriptionUrl({ url, name }: { url: string; name: string }) {
       >
         {revealed ? '隐藏' : '显示'}
       </button>
-      <CopyButton className="sub-url-copy" text={url} />
+      <CopyButton className="sub-url-copy" text={url}>
+        {(state, label) => (
+          <>
+            <Icon of={copyStateIcon(state)} size={13} />
+            {label}
+          </>
+        )}
+      </CopyButton>
     </div>
   );
 }
@@ -290,7 +429,7 @@ const NODE_PROTOCOL_LABEL: Record<NodeProtocol, string> = {
   other: '其他',
 };
 
-type NodeSlotsStyle = CSSProperties & { '--node-slots': number };
+const NODE_FAMILY_LABEL: Record<NodeFamily, string> = { ipv4: 'IPv4', ipv6: 'IPv6' };
 
 function NodeLinks({
   tenant,
@@ -301,6 +440,7 @@ function NodeLinks({
   allowInsecure,
   onAllowInsecure,
   onUseSubscription,
+  panel,
 }: {
   tenant: string;
   user: string;
@@ -310,6 +450,7 @@ function NodeLinks({
   allowInsecure: boolean;
   onAllowInsecure: (allow: boolean) => void;
   onUseSubscription: () => void;
+  panel: TabPanelProps;
 }) {
   const [view, setView] = useState<'list' | 'raw'>('list');
   const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions(), refetchInterval: 10_000 });
@@ -338,7 +479,7 @@ function NodeLinks({
 
   if (!revision || content.isPending || content.error) {
     return (
-      <div className="sub-dialog-body">
+      <div className="sub-dialog-body" {...panel}>
         {content.error ? <ErrorBox error={content.error} /> : <Loading variant="code" />}
       </div>
     );
@@ -348,30 +489,17 @@ function NodeLinks({
   const listing = parseNodeListing(text);
   const groups = groupNodeLinks(listing.links);
   const slots: NodeFamily[] = family === 'both' ? ['ipv4', 'ipv6'] : [family === 'v4' ? 'ipv4' : 'ipv6'];
-  const slotsStyle: NodeSlotsStyle = { '--node-slots': slots.length };
-  const insecureCount = listing.links.filter(link => link.insecure).length;
+  const insecureCount = allowInsecure ? listing.links.filter(link => link.insecure).length : 0;
   const lines = text ? text.replace(/\n$/, '').split('\n') : [];
 
   return (
     <>
-      <div className="sub-dialog-body">
+      <div className="sub-dialog-body" {...panel}>
         <div className="node-toolbar">
           <span className="node-count">
             <b>{listing.links.length}</b> 个节点
           </span>
           <span className="sp" />
-          {protocol !== 'vless' && (
-            <button
-              type="button"
-              className="node-insecure"
-              aria-pressed={allowInsecure}
-              title="列出自签证书节点；客户端不验证证书"
-              onClick={() => onAllowInsecure(!allowInsecure)}
-            >
-              <span className="node-insecure-switch" aria-hidden="true" />
-              允许 insecure
-            </button>
-          )}
           <SegmentedControl
             className="node-view"
             ariaLabel="显示方式"
@@ -386,29 +514,21 @@ function NodeLinks({
             className="btn node-copy-all"
             text={listing.links.map(link => link.uri).join('\n')}
             label="复制全部"
-          />
-        </div>
-        {(listing.notes.length > 0 || (allowInsecure && insecureCount > 0)) && (
-          <div className="node-notes">
-            {allowInsecure && insecureCount > 0 && (
-              <p className="warn">
-                <Icon of="warn" size={13} className="node-note-icon" />
-                <span className="node-note-text">已列出 {insecureCount} 个自签证书节点，客户端不验证证书</span>
-              </p>
+          >
+            {(state, label) => (
+              <>
+                <Icon of={copyStateIcon(state)} size={13} />
+                {label}
+              </>
             )}
-            {listing.notes.map(note => (
-              <p key={note}>
-                <Icon of="info" size={13} className="node-note-icon" />
-                <span className="node-note-text">{note}</span>
-                {note.includes('Clash') && (
-                  <button type="button" className="sub-text-action" onClick={onUseSubscription}>
-                    改用订阅
-                  </button>
-                )}
-              </p>
-            ))}
-          </div>
-        )}
+          </CopyButton>
+        </div>
+        <NodeNotes
+          notes={listing.notes}
+          insecureCount={insecureCount}
+          onAllowInsecure={onAllowInsecure}
+          onUseSubscription={onUseSubscription}
+        />
         {view === 'raw' ? (
           <div className="cfg-code node-raw">
             <div className="lnum">{lines.map((_, index) => index + 1).join('\n')}</div>
@@ -417,44 +537,7 @@ function NodeLinks({
         ) : groups.length === 0 ? (
           <div className="node-empty">没有符合当前协议与地址族的节点</div>
         ) : (
-          <div className="node-groups" style={slotsStyle}>
-            {groups.map(group => (
-              <section className="node-group" key={group.key} aria-label={group.name}>
-                <div className="node-group-head">
-                  <RegionFlag code={group.region} />
-                  <b>{group.name}</b>
-                </div>
-                {group.rows.map(row => (
-                  <div className="node-row" key={row.key}>
-                    <span className="node-protocol">{NODE_PROTOCOL_LABEL[row.protocol]}</span>
-                    <span className="node-stack">
-                      {row.stack}
-                      {row.insecure && <em>insecure</em>}
-                    </span>
-                    <code className="node-endpoint">{row.endpoint}</code>
-                    <span className="node-copies">
-                      {slots.map(slot => {
-                        const link = row.links[slot];
-                        const familyLabel = slot === 'ipv6' ? 'IPv6' : 'IPv4';
-                        return link ? (
-                          <CopyButton
-                            key={slot}
-                            className="node-copy"
-                            text={link.uri}
-                            label={familyLabel}
-                            aria-label={`复制 ${link.name}（${familyLabel}）`}
-                            title={`${link.name} · ${link.endpoint}`}
-                          />
-                        ) : (
-                          <span key={slot} className="node-copy-gap" aria-hidden="true" />
-                        );
-                      })}
-                    </span>
-                  </div>
-                ))}
-              </section>
-            ))}
-          </div>
+          <NodeMatrix groups={groups} slots={slots} />
         )}
       </div>
       <footer className="sub-dialog-foot">
@@ -462,6 +545,127 @@ function NodeLinks({
         <span>更换 UUID 后全部节点链接失效</span>
       </footer>
     </>
+  );
+}
+
+// 服务端的说明写作「以下自签证书地址默认隐藏；……：名称、名称」，那是 uri.txt 自身的默认。
+// 这个弹窗默认列出自签节点，用户改为不列出后，原句的「默认隐藏」与弹窗的默认相反，改写为当前状态。
+const HIDDEN_SELF_SIGNED = /^以下自签证书地址默认隐藏[^：]*：(.+)$/;
+
+/* 列表之前的说明：已列出的自签节点、未列出的条目及原因，各带一个就地操作。 */
+function NodeNotes({
+  notes,
+  insecureCount,
+  onAllowInsecure,
+  onUseSubscription,
+}: {
+  notes: string[];
+  insecureCount: number;
+  onAllowInsecure: (allow: boolean) => void;
+  onUseSubscription: () => void;
+}) {
+  if (notes.length === 0 && insecureCount === 0) return null;
+  return (
+    <div className="node-notes">
+      {insecureCount > 0 && (
+        <p>
+          <Icon of="info" size={13} className="node-note-icon" />
+          <span className="node-note-text">已列出 {insecureCount} 个自签证书节点（标 insecure），客户端不验证证书</span>
+          <button type="button" className="sub-text-action" onClick={() => onAllowInsecure(false)}>
+            不再列出
+          </button>
+        </p>
+      )}
+      {notes.map(note => {
+        const hidden = HIDDEN_SELF_SIGNED.exec(note);
+        return (
+          <p key={note}>
+            <Icon of="info" size={13} className="node-note-icon" />
+            <span className="node-note-text">
+              {hidden ? `未列出 ${hidden[1].split('、').length} 个自签证书节点：${hidden[1]}` : note}
+            </span>
+            {hidden ? (
+              <button type="button" className="sub-text-action" onClick={() => onAllowInsecure(true)}>
+                允许 insecure
+              </button>
+            ) : (
+              note.includes('Clash') && (
+                <button type="button" className="sub-text-action" onClick={onUseSubscription}>
+                  改用订阅
+                </button>
+              )
+            )}
+          </p>
+        );
+      })}
+    </div>
+  );
+}
+
+/* 一条链一组；一种协议一行，IPv4 / IPv6 各一列，地址本身就是复制按钮，缺少的地址族画「—」。
+ * 只选一个地址族时只剩一列。 */
+function NodeMatrix({ groups, slots }: { groups: NodeGroup[]; slots: NodeFamily[] }) {
+  return (
+    <div className={`node-matrix${slots.length === 1 ? ' single' : ''}`}>
+      <div className="node-matrix-head" aria-hidden="true">
+        <span />
+        {slots.map(slot => (
+          <span key={slot}>{NODE_FAMILY_LABEL[slot]}</span>
+        ))}
+      </div>
+      {groups.map(group => (
+        <section className="node-group" key={group.key} aria-label={group.name}>
+          <div className="node-group-head">
+            <RegionFlag code={group.region} />
+            <b>{group.name}</b>
+          </div>
+          {group.rows.map(row => (
+            <div className="node-row" key={row.key}>
+              <span className="node-protocol">
+                <b>{NODE_PROTOCOL_LABEL[row.protocol]}</b>
+                <span>{row.stack}</span>
+                {row.insecure && <em>insecure</em>}
+              </span>
+              {slots.map(slot => (
+                <NodeAddress key={slot} link={row.links[slot]} family={slot} />
+              ))}
+            </div>
+          ))}
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function NodeAddress({ link, family }: { link: NodeLink | undefined; family: NodeFamily }) {
+  if (!link) {
+    return (
+      <span className="node-copy-gap" aria-hidden="true">
+        —
+      </span>
+    );
+  }
+  const familyLabel = NODE_FAMILY_LABEL[family];
+  // 主机与端口分开排：长 IPv6 只截主机部分，端口始终可见。
+  const [, host, port = ''] = /^(.*?)(:\d+)?$/.exec(link.endpoint) ?? [link.endpoint, link.endpoint];
+  return (
+    <CopyButton
+      className="node-copy"
+      text={link.uri}
+      aria-label={`复制 ${link.name}（${familyLabel}）`}
+      title={`${link.endpoint} · 复制分享链接`}
+    >
+      {state => (
+        <>
+          <i className="node-copy-family">{familyLabel}</i>
+          <span className="node-copy-endpoint">
+            <span className="node-copy-host">{host}</span>
+            <span className="node-copy-port">{port}</span>
+          </span>
+          <Icon of={copyStateIcon(state)} size={13} className="node-copy-icon" />
+        </>
+      )}
+    </CopyButton>
   );
 }
 
@@ -638,14 +842,15 @@ export function groupNodeLinks(links: NodeLink[]): NodeGroup[] {
   return groups;
 }
 
-function maskSubscriptionUrl(url: string): string {
-  return url.replace(
-    /(\/sub\/v1\/(?:haitun\/)?)([^/]+)(\/clash\.yaml)/,
-    (_match, prefix: string, token: string, suffix: string) => {
-      const tail = token.slice(-4);
-      return `${prefix}••••••••-••••-••••-••••-••••••••${tail}${suffix}`;
-    },
-  );
+const TOKEN_MASK = '••••••••-••••-••••-••••-••••••••';
+
+/* 订阅地址里的 Token 换成与 UUID 同形的圆点，只留末四位。地址不是预期形状时原样返回 null。 */
+function maskSubscriptionUrl(url: string): { head: string; tail: string } | null {
+  const match = /(\/sub\/v1\/(?:haitun\/)?)([^/]+)(\/clash\.yaml)/.exec(url);
+  if (!match) return null;
+  const start = match.index + match[1].length;
+  const end = start + match[2].length;
+  return { head: url.slice(0, start), tail: `${match[2].slice(-4)}${url.slice(end)}` };
 }
 
 function withSubscriptionProtocol(url: string, protocol: ProtocolPick): string {
@@ -655,6 +860,7 @@ function withSubscriptionProtocol(url: string, protocol: ProtocolPick): string {
   return selected.toString();
 }
 
+/* 重置时间按 UTC+8 显示，时区写在读数的 title 里。 */
 function formatResetAt(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
@@ -665,5 +871,5 @@ function formatResetAt(value: string): string {
     hour: '2-digit',
     minute: '2-digit',
     hour12: false,
-  }).format(date)} +08`;
+  }).format(date)}`;
 }

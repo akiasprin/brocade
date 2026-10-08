@@ -86,6 +86,32 @@ it('图标复制按钮用可访问名称反馈 UUID 复制结果', async () => {
   expect(button.getAttribute('aria-label')).toBe('UUID 已复制');
 });
 
+it('复制按钮的自定义内容随复制状态更新，可访问名称保持调用方给定的值', async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+  const view = render(
+    <CopyButton text="vless://link" aria-label="复制 东京 IIJ（IPv4）">
+      {(state, label) => (
+        <>
+          <span className="endpoint">203.0.113.21:443</span>
+          <span className="state">{`${state}:${label}`}</span>
+        </>
+      )}
+    </CopyButton>,
+  );
+  const button = view.getByRole('button', { name: '复制 东京 IIJ（IPv4）' });
+  expect(button.querySelector('.state')?.textContent).toBe('idle:复制');
+
+  await act(async () => fireEvent.click(button));
+  expect(writeText).toHaveBeenCalledWith('vless://link');
+  expect(button.querySelector('.endpoint')?.textContent).toBe('203.0.113.21:443');
+  expect(button.querySelector('.state')?.textContent).toBe('done:已复制');
+  expect(button.getAttribute('aria-label')).toBe('复制 东京 IIJ（IPv4）');
+
+  act(() => vi.advanceTimersByTime(1_600));
+  expect(button.querySelector('.state')?.textContent).toBe('idle:复制');
+});
+
 function DialogHarness() {
   const [open, setOpen] = useState(false);
   return (

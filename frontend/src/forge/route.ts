@@ -22,6 +22,7 @@
 import { wm } from '../wm/store';
 import { cancelVisualTransition } from '../ui/motion';
 import { confirmDiscardChanges } from '../ui/navigation-guard';
+import { canonicalLoadRangeQuery } from '../ui/observe-range';
 import { DEFAULT_NAV, forge, isNavKey, type NavKey } from './state';
 
 // 下钻状态在各页面中是私有的 `type Drill`，此处只将其视为一组字段。
@@ -48,6 +49,9 @@ interface DrillSpec {
   fields?: Field[];
   /* 页面内稳定选择可以放在 hash 的查询段中，不占用资源详情的路径段。 */
   queryFields?: Field[];
+  /* 查询段字段之间有组合约束时（固定区间的起止必须成对且跨度合法），在解析和写出两个方向
+     规范化：非法组合去掉而不是让整个地址失效，手改出的地址随后被改写为规范形式。 */
+  canonical?: (drill: Drill) => Drill;
   /* 恢复时补全的、不进入地址的字段（向导的起始步骤） */
   rest?: Drill;
 }
@@ -56,7 +60,18 @@ interface DrillSpec {
 // 一个 nav 即可表示；未列出的 `p`（provision 的步骤）保留在 wm.data 中不进入地址。
 const DRILL: Partial<Record<NavKey, DrillSpec[]>> = {
   nodes: [
-    { seg: 'node', fields: [{ name: 'id' }] },
+    // 观测时间范围进入地址：每次切换是一条浏览器历史，前进后退、刷新、分享链接都保留所选时段。
+    // 取值与组合规则见 ui/observe-range.ts；页签不进入地址（见 nodes.tsx 的 NodeDetail）。
+    {
+      seg: 'node',
+      fields: [{ name: 'id' }],
+      queryFields: [
+        { name: 'range', optional: true },
+        { name: 'from', optional: true, num: true },
+        { name: 'to', optional: true, num: true },
+      ],
+      canonical: canonicalLoadRangeQuery,
+    },
     { seg: 'chain', fields: [{ name: 'id' }] },
     { seg: 'provision', rest: { step: 1 } },
     // 机器在提交表单时即已入库，因此安装页的标识是 node_id，切换、刷新、后退都可恢复。
@@ -93,11 +108,12 @@ const specFor = (nav: NavKey, p: unknown): DrillSpec | undefined =>
 export function serialize(loc: Loc): string {
   const parts: string[] = [loc.nav];
   const spec = specFor(loc.nav, loc.drill?.p);
+  const drill = spec?.canonical && loc.drill ? spec.canonical(loc.drill) : loc.drill;
   const query = new URLSearchParams();
-  if (spec && loc.drill) {
+  if (spec && drill) {
     parts.push(spec.seg);
     for (const f of spec.fields ?? []) {
-      const v = loc.drill[f.name];
+      const v = drill[f.name];
       // 字段缺失时回退到该页面的根路径：少一层优于生成 `#/deploy/detail/undefined`
       // ——该地址解析后会得到一个 id 为空的详情页。
       if (v == null) {
@@ -109,7 +125,7 @@ export function serialize(loc: Loc): string {
       parts.push(encodeURIComponent(raw));
     }
     for (const f of spec.queryFields ?? []) {
-      const value = loc.drill[f.name];
+      const value = drill[f.name];
       if (value == null) {
         if (f.optional) continue;
         return `#/${loc.nav}`;
@@ -172,7 +188,7 @@ export function parse(hash: string): Loc | null {
     drill[f.name] = Number.isFinite(n) ? n : raw;
   }
   if (!valid) return { nav };
-  return { nav, drill };
+  return { nav, drill: spec.canonical ? spec.canonical(drill) : drill };
 }
 
 /* ══ 位置与应用状态的相互转换 ══ */
@@ -230,6 +246,25 @@ const routeHistoryState = (value: unknown = window.history.state): RouteHistoryS
     fromHash: typeof state.fromHash === 'string' ? state.fromHash : undefined,
   };
 };
+
+/* 当前历史项变化的订阅。页面据此读出「这一条是从哪个地址进入的」（previousRouteHash）：
+   push、前进后退、启动对齐之后通知；只改滚动位置的 replaceState 不改变来源，不通知。 */
+const historyListeners = new Set<() => void>();
+const notifyHistory = () => {
+  for (const listener of historyListeners) listener();
+};
+
+export function subscribeRouteHistory(listener: () => void): () => void {
+  historyListeners.add(listener);
+  return () => {
+    historyListeners.delete(listener);
+  };
+}
+
+/** 当前历史项的来源地址：push 时记录，手改地址栏时由 restore 补记；没有记录时为 null。 */
+export function previousRouteHash(): string | null {
+  return routeHistoryState()?.fromHash ?? null;
+}
 
 const withRouteHistoryState = (state: RouteHistoryState, source: unknown = window.history.state) => ({
   ...stateRecord(source),
@@ -393,6 +428,7 @@ const pushLocation = (hash: string, position: RoutePosition = { scrollTop: 0 }):
   historyIndex = nextIndex;
   historyHash = hash;
   cachePosition(historyIndex, position);
+  notifyHistory();
   return true;
 };
 
@@ -513,6 +549,7 @@ export function startRouting(label: (nav: NavKey) => string) {
   const initialState = restoredState ?? { index: historyIndex, scrollTop: 0 };
   cachePosition(historyIndex, initialState);
   writeRouteHistory('replaceState', initialState, initialHash);
+  notifyHistory();
   if ('scrollRestoration' in window.history) window.history.scrollRestoration = 'manual';
   restoreWorkspacePosition(restoredState ?? { scrollTop: 0 });
 
@@ -606,6 +643,7 @@ export function startRouting(label: (nav: NavKey) => string) {
       writeRouteHistory('replaceState', { ...state, ...position }, canonicalHash);
     }
     apply(next);
+    notifyHistory();
     restoreWorkspacePosition(position);
   };
   window.addEventListener('popstate', restore);

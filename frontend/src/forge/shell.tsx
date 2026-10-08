@@ -50,6 +50,7 @@ import { motionOriginFor, runVisualTransition } from '../ui/motion';
 import { usePresence } from '../ui/presence';
 import { confirmDiscardChanges } from '../ui/navigation-guard';
 import { FleetTrafficMeter } from '../ui/fleet-traffic';
+import { MachineNotifications } from '../ui/machine-notifications';
 
 const TopoCanvas = lazy(() => import('../topo/canvas').then(module => ({ default: module.TopoCanvas })));
 
@@ -72,10 +73,12 @@ const NAV: Face[] = [
   { key: 'usage', label: '用量', icon: 'usage' },
 ];
 
-/* 手机端只把三项高频配置入口留在顶栏，腾出的宽度用于恢复按钮文字。隧道、发布和用量仍
+/* 手机端只把两项最高频、且构成主要操作路径的入口留在顶栏。用户、隧道、发布和用量仍
    使用同一份 Face 定义，只是移动到账户牌菜单，避免两套角色权限和名称逐渐分叉。 */
-const MOBILE_NAV = NAV.filter(f => f.key === 'nodes' || f.key === 'chains' || f.key === 'users');
-const MOBILE_MORE = NAV.filter(f => f.key === 'tunnels' || f.key === 'deploy' || f.key === 'usage');
+const MOBILE_NAV = NAV.filter(f => f.key === 'nodes' || f.key === 'chains');
+const MOBILE_MORE = NAV.filter(
+  f => f.key === 'tunnels' || f.key === 'users' || f.key === 'deploy' || f.key === 'usage',
+);
 
 // 收入账户牌菜单的项：都是低频访问的页面，占用顶栏位置的收益较低。
 // 窄屏同理：该行只放 NAV 的主工作流，这些低频页面仍从账户牌菜单进入。
@@ -455,7 +458,9 @@ function TopBar({
 }) {
   const st = useForge();
   const [more, setMore] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   const moreButtonRef = useRef<HTMLButtonElement>(null);
+  const notificationsButtonRef = useRef<HTMLButtonElement>(null);
   const moreMenuRef = useRef<HTMLDivElement>(null);
   const pendingAppearanceTransition = useRef<(() => void) | null>(null);
   const menuPresence = usePresence(more, 180);
@@ -485,15 +490,20 @@ function TopBar({
 
   /* 点击其他位置时关闭菜单和气泡。两者绑定在同一个 document 监听上，避免重复实现。 */
   useEffect(() => {
-    if (!more && !st.diag) return;
+    if (!more && !st.diag && !notificationsOpen) return;
     const close = () => {
       setMore(false);
+      setNotificationsOpen(false);
       forge.setDiag(false);
     };
     const esc = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
+      const restoreNotifications = notificationsOpen;
+      const restoreDiagnostics = st.diag;
       close();
       if (more) moreButtonRef.current?.focus();
+      else if (restoreNotifications) notificationsButtonRef.current?.focus();
+      else if (restoreDiagnostics) moreButtonRef.current?.focus();
     };
     document.addEventListener('click', close);
     document.addEventListener('keydown', esc);
@@ -501,7 +511,7 @@ function TopBar({
       document.removeEventListener('click', close);
       document.removeEventListener('keydown', esc);
     };
-  }, [more, st.diag]);
+  }, [more, notificationsOpen, st.diag]);
 
   // 三个级别分别统计，数值取自服务端的 summary 而非从列表反推：此前使用
   // `warnings = diagnostics.length - errors`，在只有两个级别时等价，引入 info 后会将提示
@@ -518,6 +528,13 @@ function TopBar({
       : (pendingTargets ?? 0) > 0
         ? `${pendingTargets} 台待发布`
         : undefined;
+  const diagnosticsMenuHint = diagnosticsError
+    ? '读取失败'
+    : diagnosticsPending
+      ? '正在检查'
+      : errors || warnings
+        ? `${errors} 错 · ${warnings} 警`
+        : '没有阻断项';
 
   const focusMenuEdge = (edge: 'first' | 'last') => {
     requestAnimationFrame(() => {
@@ -531,6 +548,7 @@ function TopBar({
     if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
     event.preventDefault();
     setMore(true);
+    setNotificationsOpen(false);
     forge.setDiag(false);
     focusMenuEdge(event.key === 'ArrowDown' ? 'first' : 'last');
   };
@@ -568,6 +586,7 @@ function TopBar({
       onClick={e => {
         e.stopPropagation();
         setMore(v => !v);
+        setNotificationsOpen(false);
         forge.setDiag(false);
       }}
     >
@@ -636,18 +655,45 @@ function TopBar({
           {nav === f.key && <Icon of="check" size={13} className="fg-menu-check" />}
         </button>
       ))}
-      {/* 产物在窄屏下是全屏覆盖层，不是随手查看的内容，因此从导航行收入菜单。 */}
-      {narrow && artifacts && (
-        <button type="button" role="menuitem" className="fg-menu-item" onClick={() => artifactPanel.toggle()}>
-          <Icon of="artifactFolder" size={14} className="fg-menu-icon" />
+      {rest.length > 0 && <hr />}
+      {/* 产物和诊断都是低频辅助面板。收入同一个更多菜单后，桌面与手机的顶栏都不再为
+          一次性查看动作各占一个常驻按钮；状态仍直接写在菜单项中。 */}
+      <button
+        type="button"
+        role="menuitem"
+        className="fg-menu-item"
+        disabled={!artifacts}
+        onClick={() => artifactPanel.toggle()}
+      >
+        <Icon of="artifactFolder" size={14} className="fg-menu-icon" />
+        <span className="fg-menu-copy">
+          产物
+          <small>{!artifacts ? '当前身份无权查看' : railOpen ? '产物栏已展开' : '这一版编译出了什么'}</small>
+        </span>
+        {railOpen && artifacts && <Icon of="check" size={13} className="fg-menu-check" />}
+      </button>
+      {!isVisitor(who) && (
+        <button
+          type="button"
+          role="menuitem"
+          className="fg-menu-item"
+          onClick={event => {
+            event.stopPropagation();
+            setMore(false);
+            setNotificationsOpen(false);
+            forge.setDiag(true);
+            requestAnimationFrame(() => moreButtonRef.current?.focus());
+          }}
+        >
+          <Icon of="diag" size={14} className="fg-menu-icon" />
           <span className="fg-menu-copy">
-            产物<small>这一版编译出了什么</small>
+            诊断<small>{diagnosticsMenuHint}</small>
           </span>
         </button>
       )}
       {/* 页面入口与即时外观控制分组。明暗模式使用明确的二选一，色调单独一行并显示当前名称；
           两行与菜单项同一层级，不再套一层框。选择任一外观后立即关闭菜单。 */}
-      {(rest.length > 0 || (narrow && artifacts)) && <hr />}
+      <hr />
       <div className="fg-appearance" role="group" aria-label="外观" onClick={e => e.stopPropagation()}>
         <div className="fg-appearance-row">
           <span className="fg-appearance-label">主题</span>
@@ -735,8 +781,8 @@ function TopBar({
   );
 
   if (narrow) {
-    /* 窄屏只有这一行：品牌 + 三个高频页面 + 诊断 + 账户牌。隧道、发布和用量收入账户牌的
-       菜单，发布状态作为菜单项说明显示。下钻不再增加第二行，理由见上方 `.fg-backrow` 的说明。 */
+    /* 窄屏只有这一行：品牌 + 机器 / 线路 + 通知 + 账户牌。其他页面、产物和诊断收入账户
+       菜单，状态作为菜单项说明显示。下钻不再增加第二行，理由见上方 `.fg-backrow` 的说明。 */
     return (
       <div className="fg-top fg-navrow">
         <BrandHome branding={branding} />
@@ -749,32 +795,26 @@ function TopBar({
           activeDeploy={activeDeploy}
           awaitingDeploy={awaitingDeploy}
         />
-        {/* 与宽屏的处理一致：诊断属于发布流程的读数，公开访客不显示。 */}
-        {!isVisitor(who) && (
-          <div className="fg-menuwrap">
-            <button
-              className="fg-ico"
-              aria-expanded={st.diag}
-              aria-label="诊断"
-              title="诊断"
-              onClick={e => {
-                e.stopPropagation();
-                forge.toggleDiag();
-                setMore(false);
-              }}
-            >
-              <Icon of="diag" size={13} className="fg-tgl-ic" />
-              {(diagnosticsError || errors > 0 || warnings > 0) && (
-                <i className={`fg-dot${diagnosticsError || errors ? ' err' : ''}`} />
-              )}
-            </button>
-            {diagPop}
-          </div>
-        )}
-
+        <MachineNotifications
+          narrow
+          open={notificationsOpen}
+          publicView={isPublic(who)}
+          globalClear={who.role === 'system-admin'}
+          buttonRef={notificationsButtonRef}
+          onToggle={() => {
+            setNotificationsOpen(value => !value);
+            setMore(false);
+            forge.setDiag(false);
+          }}
+          onNode={nodeId => {
+            setNotificationsOpen(false);
+            navigate('nodes', { p: 'node', id: nodeId });
+          }}
+        />
         <div className="fg-menuwrap">
           {accountButton}
           {menu}
+          {diagPop}
         </div>
       </div>
     );
@@ -797,54 +837,28 @@ function TopBar({
 
       <span className="sp" />
 
-      {/* 产物与诊断只显示图标，名称放在悬停提示和读屏文字里。
-          产物按钮只控制展开和收起。是否有待发布内容由「发布」导航表示；否则历史 diff
-          的标记会被理解为发布未完成。
-          读不了产物的角色看到的是禁用而不是消失：按角色隐藏时，顶栏在不同身份下少一个
-          控件，而少掉的那个是这套外壳里唯一的产物入口。 */}
-      <button
-        type="button"
-        className="fg-tgl"
-        aria-pressed={railOpen}
-        disabled={!artifacts}
-        title={artifacts ? '显示 / 隐藏产物栏' : '当前身份无权查看产物'}
-        onClick={() => artifactPanel.toggle()}
-      >
-        <Icon of="artifactFolder" size={15} className="fg-tgl-ic" />
-        <span className="fg-tgl-label">产物</span>
-      </button>
-
-      {/* 诊断不对公开访客显示：它表示该版本的编译结果和可发布性，属于编辑到发布流程的
-          读数。修订号不在顶栏重复——面包屑行（fg-crumb-right）已承担这项读数。 */}
-      {!isVisitor(who) && (
-        <div className="fg-menuwrap">
-          <button
-            type="button"
-            className="fg-tgl"
-            aria-expanded={st.diag}
-            title="诊断"
-            onClick={e => {
-              e.stopPropagation();
-              forge.toggleDiag();
-              setMore(false);
-            }}
-          >
-            <Icon of="diag" size={15} className="fg-tgl-ic" />
-            <span className="fg-tgl-label">诊断</span>
-            {(diagnosticsError || errors > 0 || warnings > 0) && (
-              <span className={`fg-badge${diagnosticsError || errors ? ' err' : ''}`}>
-                {diagnosticsError ? '!' : errors || warnings}
-              </span>
-            )}
-          </button>
-          {diagPop}
-        </div>
-      )}
+      <MachineNotifications
+        narrow={false}
+        open={notificationsOpen}
+        publicView={isPublic(who)}
+        globalClear={who.role === 'system-admin'}
+        buttonRef={notificationsButtonRef}
+        onToggle={() => {
+          setNotificationsOpen(value => !value);
+          setMore(false);
+          forge.setDiag(false);
+        }}
+        onNode={nodeId => {
+          setNotificationsOpen(false);
+          navigate('nodes', { p: 'node', id: nodeId });
+        }}
+      />
 
       <span className="fg-vr" />
       <div className="fg-menuwrap">
         {accountButton}
         {menu}
+        {diagPop}
       </div>
     </div>
   );

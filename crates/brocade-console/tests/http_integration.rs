@@ -31,6 +31,78 @@ use tower::ServiceExt;
 const ADMIN_PASSWORD: &str = "correct horse battery staple";
 const BOOTSTRAP_TOKEN: &str = "bootstrap-test-token-with-at-least-32-bytes";
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn performance_diagnostics_are_system_admin_only_and_never_cached() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    let (app, token) = admin_app(&db).await;
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/diagnostics/performance")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!unauthorized.status().is_success());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/diagnostics/performance")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(!response.headers().contains_key("server-timing"));
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["performance"]["window_minutes"], 15);
+    assert_eq!(body["pool"]["max_connections"], 5);
+    assert_eq!(body["database"]["pg_stat_statements_installed"], false);
+    assert!(body["database"]["server_version_num"].as_u64().unwrap() >= 160000);
+    let created = post_json(
+        &app,
+        &token,
+        "/admin/operators",
+        json!({
+            "id": "perf-reviewer", "display_name": "Reviewer", "role": "readonly",
+            "password": "reviewer-secret", "tenant_scope": "platform.acme"
+        }),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    let issued = post_json(
+        &app,
+        &token,
+        "/admin/operators/perf-reviewer/token",
+        json!({}),
+    )
+    .await;
+    assert_eq!(issued.0, StatusCode::CREATED);
+    let denied = get_json_with_token(
+        &app,
+        "/diagnostics/performance",
+        issued.1["token"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(denied.0, StatusCode::FORBIDDEN);
+}
+
 struct TestPg {
     _container: testcontainers::ContainerAsync<Postgres>,
     store: PgStore,
@@ -147,6 +219,162 @@ async fn admin_token(db: &TestPg) -> String {
 
 async fn admin_app(db: &TestPg) -> (Router, String) {
     (admin_router(db.store.clone()), admin_token(db).await)
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn machine_notifications_http_tracks_active_incidents_and_read_cursor() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    let (app, token) = admin_app(&db).await;
+
+    sqlx::query(
+        "INSERT INTO machine_events (
+             node_id, event_kind, previous_value, current_value, last_contact_at, occurred_at
+         ) VALUES (
+             'n1', 'node_offline', 'online', 'offline',
+             now() - interval '100 seconds', now() - interval '10 seconds'
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO node_presence_state (node_id, status, since_at)
+         VALUES ('n1', 'offline', now() - interval '10 seconds')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let unread = get_json(&app, &token, "/notifications?limit=10").await;
+    assert_eq!(unread.0, StatusCode::OK);
+    assert_eq!(unread.1["latest_event_id"], 1);
+    assert_eq!(unread.1["last_seen_event_id"], 0);
+    assert_eq!(unread.1["unread_count"], 1);
+    assert_eq!(unread.1["active"][0]["node_id"], "n1");
+    assert_eq!(
+        unread.1["active"][0]["incident_kind"],
+        "control_plane_offline"
+    );
+    assert!(unread.1["active"][0]["started_at"].is_string());
+    assert!(unread.1["events"][0]["last_contact_at"].is_string());
+
+    let read = post_json(
+        &app,
+        &token,
+        "/notifications/read",
+        json!({ "through_event_id": 1 }),
+    )
+    .await;
+    assert_eq!(read, (StatusCode::OK, json!({ "last_seen_event_id": 1 })));
+
+    let acknowledged = get_json(&app, &token, "/notifications?limit=10").await;
+    assert_eq!(acknowledged.0, StatusCode::OK);
+    assert_eq!(acknowledged.1["unread_count"], 0);
+    assert_eq!(acknowledged.1["active"].as_array().unwrap().len(), 1);
+    let rejected = post_json(
+        &app,
+        &token,
+        "/notifications/clear",
+        json!({ "through_event_id": -1 }),
+    )
+    .await;
+    assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+    let cleared = post_json(
+        &app,
+        &token,
+        "/notifications/clear",
+        json!({ "through_event_id": 1 }),
+    )
+    .await;
+    assert_eq!(
+        cleared,
+        (StatusCode::OK, json!({ "cleared_through_event_id": 1 }))
+    );
+    let inbox = get_json(&app, &token, "/notifications?limit=10").await;
+    assert_eq!(inbox.1["cleared_through_event_id"], 1);
+    assert_eq!(inbox.1["unread_count"], 0);
+    assert_eq!(inbox.1["events"], json!([]));
+    assert_eq!(inbox.1["active"], json!([]));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM machine_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn clearing_machine_incidents_preserves_public_ip_notifications() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    let (app, token) = admin_app(&db).await;
+
+    sqlx::query(
+        "INSERT INTO machine_events (
+             node_id, event_kind, family, previous_value, current_value, occurred_at
+         ) VALUES ('n1', 'public_ip_changed', 4, '198.51.100.20', '203.0.113.42', now() - interval '20 seconds')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO machine_events (
+             node_id, event_kind, previous_value, current_value, last_contact_at, occurred_at
+         ) VALUES (
+             'n1', 'node_offline', 'online', 'offline',
+             now() - interval '100 seconds', now() - interval '10 seconds'
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO node_presence_state (node_id, status, since_at)
+         VALUES ('n1', 'offline', now() - interval '10 seconds')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let cleared = post_json(
+        &app,
+        &token,
+        "/notifications/clear",
+        json!({ "through_event_id": 2 }),
+    )
+    .await;
+    assert_eq!(
+        cleared,
+        (StatusCode::OK, json!({ "cleared_through_event_id": 2 }))
+    );
+
+    let inbox = get_json(&app, &token, "/notifications?limit=10").await;
+    assert_eq!(inbox.0, StatusCode::OK);
+    assert_eq!(inbox.1["cleared_through_event_id"], 2);
+    assert_eq!(inbox.1["unread_count"], 0);
+    assert_eq!(inbox.1["active"], json!([]));
+    assert_eq!(inbox.1["events"].as_array().unwrap().len(), 1);
+    assert_eq!(inbox.1["events"][0]["event_kind"], "public_ip_changed");
+    assert_eq!(inbox.1["events"][0]["previous_value"], "198.51.100.20");
+    assert_eq!(inbox.1["events"][0]["current_value"], "203.0.113.42");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM machine_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        2,
+        "clearing advances cursors without deleting shared history"
+    );
 }
 
 #[tokio::test]
@@ -1646,7 +1874,7 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
     let issued_again = response_json(issued_again).await;
     assert_eq!(issued_again["urls"]["both"], issued["urls"]["both"]);
 
-    let revoked = admin
+    let removed_revoke = admin
         .clone()
         .oneshot(
             Request::delete("/users/platform.acme/alice/clash-subscription/haitun")
@@ -1656,20 +1884,11 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
         )
         .await
         .unwrap();
-    assert_eq!(revoked.status(), StatusCode::OK);
-    let revoked = response_json(revoked).await;
-    assert_eq!(revoked["status"], "revoked");
-    assert!(revoked["urls"].is_null());
-    let old = agent
-        .clone()
-        .oneshot(Request::get(&haitun_path).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(old.status(), StatusCode::NOT_FOUND);
+    assert_eq!(removed_revoke.status(), StatusCode::METHOD_NOT_ALLOWED);
 
     let reissued = admin
         .oneshot(
-            Request::post("/users/platform.acme/alice/clash-subscription/haitun")
+            Request::post("/users/platform.acme/alice/clash-subscription/haitun/regenerate")
                 .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -1697,6 +1916,128 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
         .await
         .unwrap();
     assert_eq!(old.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn koipy_subscriptions_are_admin_only_and_self_service_never_leaks_links() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('platform.other', 'Other tenant')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    seed_subscription_serving(&db).await;
+    let (app, token) = admin_app(&db).await;
+    let path = "/users/platform.acme/alice/clash-subscription";
+    let issued = post_json(&app, &token, &format!("{path}/haitun"), json!({})).await;
+    assert_eq!(issued.0, StatusCode::OK);
+    let original_url = issued.1["urls"]["both"].as_str().unwrap();
+
+    for (role, scope, allowed) in [
+        ("readonly", "platform.acme", false),
+        ("editor", "platform.acme", false),
+        ("publisher", "platform.acme", false),
+        ("tenant-admin", "platform.acme", true),
+        ("tenant-admin", "platform.other", false),
+    ] {
+        let id = format!("speedtest-{role}-{scope}");
+        let created = post_json(
+            &app,
+            &token,
+            "/admin/operators",
+            json!({
+                "id": id,
+                "display_name": "Speed-test permission fixture",
+                "role": role,
+                "tenant_scope": scope,
+                "password": "speedtest-test-password"
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.0,
+            StatusCode::CREATED,
+            "{role}/{scope}: {}",
+            created.1
+        );
+        let credential = post_json(
+            &app,
+            &token,
+            &format!("/admin/operators/{id}/token"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(credential.0, StatusCode::CREATED);
+        let credential = credential.1["token"].as_str().unwrap();
+        let info = get_json(&app, credential, path).await;
+        if role == "readonly" || scope == "platform.other" {
+            assert_eq!(info.0, StatusCode::FORBIDDEN);
+        } else {
+            assert_eq!(info.0, StatusCode::OK);
+            assert_eq!(!info.1["haitun"].is_null(), allowed);
+            if !allowed {
+                assert!(!info.1.to_string().contains(original_url));
+            }
+        }
+        for action in ["haitun", "haitun/regenerate"] {
+            let response =
+                post_json(&app, credential, &format!("{path}/{action}"), json!({})).await;
+            assert_eq!(
+                response.0,
+                if allowed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                }
+            );
+        }
+    }
+
+    let current = get_json(&app, &token, path).await;
+    assert_eq!(current.0, StatusCode::OK);
+    let current_url = current.1["haitun"]["urls"]["both"].as_str().unwrap();
+    let login = post_json(&app, &token, "/users/platform.acme/alice/login", json!({})).await;
+    assert_eq!(login.0, StatusCode::CREATED);
+    let cookie = login_cookie(
+        &app,
+        login.1["operator_id"].as_str().unwrap(),
+        login.1["password"].as_str().unwrap(),
+    )
+    .await;
+    let me = get_json_with_cookie(&app, "/me/clash-subscription", &cookie).await;
+    assert_eq!(me.0, StatusCode::OK);
+    assert!(me.1["url"].as_str().unwrap().contains("/sub/v1/"));
+    assert!(me.1["haitun"].is_null());
+    assert!(!me.1.to_string().contains(current_url));
+    for (method, route) in [
+        ("POST", "/me/clash-subscription/haitun".to_owned()),
+        ("DELETE", "/me/clash-subscription/haitun".to_owned()),
+        ("POST", format!("{path}/haitun")),
+        ("POST", format!("{path}/haitun/regenerate")),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(route)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "self-service must not manage speed-test links"
+        );
+    }
+    let unchanged = get_json(&app, &token, path).await;
+    assert_eq!(unchanged.1["haitun"]["urls"]["both"], current_url);
 }
 
 #[tokio::test]
@@ -2243,7 +2584,7 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
                 .uri("/agent/v1/desired")
                 .header("x-brocade-protocol-version", "1")
                 .header("authorization", format!("Bearer {}", issued.token))
-                .header("user-agent", "brocade-agent-test")
+                .header("user-agent", format!("brocade-agent/{}", "a".repeat(64)))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2338,18 +2679,25 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
         .unwrap();
     assert_eq!(update_before_approval.status(), StatusCode::NO_CONTENT);
 
+    sqlx::query(
+        "UPDATE node_agent_state SET agent_version = $1, last_poll_at = now() WHERE node_id = 'n1'",
+    )
+    .bind(format!("brocade-agent/{}", "a".repeat(64)))
+    .execute(db.pool())
+    .await
+    .unwrap();
     let approve = admin
         .clone()
         .oneshot(
             Request::builder()
-                .method("PUT")
-                .uri("/agent-release")
+                .method("POST")
+                .uri("/binary-releases/agent")
                 .header("authorization", format!("Bearer {admin_token}"))
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "release_id": brocade_console::http::embedded_release_id(),
-                        "scope": "nodes",
+                        "build_id": brocade_console::http::embedded_release_id(),
+                        "idempotency_key": "rescue-isolated-node",
                         "nodes": ["n1"]
                     })
                     .to_string(),
@@ -2600,7 +2948,7 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
     assert!(row.try_get::<bool, _>("polled").unwrap());
     assert_eq!(
         row.try_get::<Option<String>, _>("agent_version").unwrap(),
-        Some("brocade-agent-test".to_owned())
+        Some(format!("brocade-agent/{}", "a".repeat(64)))
     );
 }
 
@@ -6975,6 +7323,14 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
     };
     db.store.migrate().await.unwrap();
     insert_usage_model(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO machine_events (
+             node_id, event_kind, family, previous_value, current_value, occurred_at
+         ) VALUES ('n1', 'public_ip_changed', 4, '198.51.100.20', '203.0.113.42', now())",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO apps (id, label, position) VALUES ('app-empty', 'Empty App', 1)")
         .execute(db.pool())
         .await
@@ -7043,6 +7399,36 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         json!([["app-a1b2", 1]])
     );
 
+    let notifications = get_json_with_cookie(&app, "/notifications?limit=10", &cookie).await;
+    assert_eq!(notifications.0, StatusCode::OK);
+    let denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/notifications/clear")
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"through_event_id":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        notifications.1["events"][0]["previous_value"],
+        "198.51.***.***"
+    );
+    assert_eq!(
+        notifications.1["events"][0]["current_value"],
+        "203.0.***.***"
+    );
+    assert_eq!(notifications.1["unread_count"], 0);
+    assert_eq!(
+        notifications.1["last_seen_event_id"], notifications.1["latest_event_id"],
+        "public notifications must not expose a permanent unread state"
+    );
+
     // Public access includes the system's masked user and usage views. The same response layer
     // that masks machine addresses must keep UUID credentials and login state out of both the
     // dedicated list and the model snapshot.
@@ -7053,6 +7439,7 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         "/usage/monthly-summary",
         "/agent-log-policy",
         "/certs",
+        "/notifications",
         "/vpngate",
         "/vpngate/runtimes",
         "/vpngate/countries/JP/servers",
@@ -7317,39 +7704,21 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
     };
     db.store.migrate().await.unwrap();
     insert_node(db.pool()).await;
-
     let (admin, admin_token) = admin_app(&db).await;
     let agent = agent_router_with_origin(db.store.clone(), "http://10.0.0.7:9091".to_owned());
-
-    let response = admin
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/nodes/n1/agent-token")
-                .header("authorization", format!("Bearer {admin_token}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let issued: IssuedNodeToken =
-        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
-            .unwrap();
-
-    // The node's own question, asked the way the agent asks it.
-    let ask = |token: String, arch: Option<&'static str>| {
+    let issued = post_json(&admin, &admin_token, "/nodes/n1/agent-token", json!({})).await;
+    assert_eq!(issued.0, StatusCode::CREATED);
+    let token = issued.1["token"].as_str().unwrap().to_owned();
+    let previous = "1".repeat(64);
+    sqlx::query("UPDATE node_agent_state SET agent_version = $1, last_poll_at = now(),
+        runtime_reported_at = now(), agent_protocol_version = 24, runtime_versions = $2 WHERE node_id = 'n1'")
+        .bind(format!("brocade-agent/{previous}")).bind(json!({"agent": previous})).execute(db.pool()).await.unwrap();
+    let ask = |arch: Option<&'static str>| {
         let agent = agent.clone();
+        let token = token.clone();
         async move {
-            let mut request = Request::builder()
-                .method("GET")
-                .uri("/agent/v1/agent-release")
-                .header("authorization", format!("Bearer {token}"))
-                .header(
-                    "x-brocade-protocol-version",
-                    brocade_deployment::protocol::AGENT_PROTOCOL_VERSION.to_string(),
-                );
+            let mut request = Request::get("/agent/v1/agent-release")
+                .header("authorization", format!("Bearer {token}"));
             if let Some(arch) = arch {
                 request = request.header("x-brocade-arch", arch);
             }
@@ -7359,170 +7728,104 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
                 .unwrap()
         }
     };
-
-    // Nothing released yet. This is the answer for the entire life of a fleet nobody has released
-    // to, so it must not be an error.
-    let response = ask(issued.token.clone(), Some("x86_64")).await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    // What this control plane can actually serve. The admin side has to publish it, because
-    // nothing else knows it — it comes from the binaries compiled in.
-    let response = admin
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/agent-release")
-                .header("authorization", format!("Bearer {admin_token}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let view: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
-            .unwrap();
-    let available = view["available_release_id"].as_str().unwrap().to_owned();
-    assert_eq!(available.len(), 64, "构建号是 sha256");
-    assert_eq!(view["released"]["scope"], "off");
-
-    let release = |body: Value| {
-        let admin = admin.clone();
-        let admin_token = admin_token.clone();
-        async move {
-            admin
-                .oneshot(
-                    Request::builder()
-                        .method("PUT")
-                        .uri("/agent-release")
-                        .header("authorization", format!("Bearer {admin_token}"))
-                        .header("content-type", "application/json")
-                        .body(Body::from(body.to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-        }
-    };
-
-    // Staged to a node that is not this one.
-    let response = release(json!({
-        "release_id": available, "scope": "nodes", "nodes": ["n2"]
-    }))
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let response = ask(issued.token.clone(), Some("x86_64")).await;
-    assert_eq!(
-        response.status(),
-        StatusCode::NO_CONTENT,
-        "不在范围里的节点不该拿到"
-    );
-
-    // Staged to this one.
-    let response = release(json!({
-        "release_id": available, "scope": "nodes", "nodes": ["n1"]
-    }))
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let response = ask(issued.token.clone(), Some("x86_64")).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let offer: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
-            .unwrap();
-    // The value, not merely the key: the URL is what a root process will fetch and run, and an
-    // origin dropped on the floor points every node at a port nothing listens on.
-    assert_eq!(
-        offer["url"], "http://10.0.0.7:9091/brocade-agent/x86_64",
-        "下载地址要是节点那侧够得着的"
-    );
-    let sha = offer["sha256"].as_str().unwrap();
-    assert_eq!(sha.len(), 64);
-    // The sha must belong to the architecture that was asked for, not to whichever agent happens
-    // to be listed first. Getting this wrong installs a binary that verifies and cannot run.
-    let x86 = view["available_agents"]
+    assert_eq!(ask(Some("x86_64")).await.status(), StatusCode::NO_CONTENT);
+    let view = get_json(&admin, &admin_token, "/binary-releases/agent").await;
+    assert_eq!(view.0, StatusCode::OK);
+    assert!(view.1["current"].is_null());
+    let available = view.1["available"]["build_id"].as_str().unwrap();
+    let wanted = view.1["available"]["artifacts"]
         .as_array()
         .unwrap()
         .iter()
         .find(|a| a["arch"] == "x86_64")
         .unwrap()["sha256"]
         .as_str()
-        .unwrap()
-        .to_owned();
-    assert_eq!(sha, x86);
-
-    // A different architecture gets that architecture's bytes.
-    let response = ask(issued.token.clone(), Some("aarch64")).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let arm: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
-            .unwrap();
-    assert_ne!(arm["sha256"], offer["sha256"], "两个架构不可能同一个 sha");
-
-    // An architecture this control plane does not carry, and a request that names none. Both are
-    // 204 rather than an error: nothing is wrong with such a machine, there is simply nothing here
-    // for it, and an error would show up on the console as a node failing.
-    for arch in [Some("riscv64"), None] {
-        let response = ask(issued.token.clone(), arch).await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT, "{arch:?}");
-    }
-
-    // Widening to the whole fleet.
-    let response = release(json!({ "release_id": available, "scope": "all", "nodes": [] })).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let response = ask(issued.token.clone(), Some("x86_64")).await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    // Desired-state protocol isolation must not cut off the separately approved self-update
-    // channel. A node unable to consume the current desired contract can still install the
-    // released Agent build and rejoin on the current protocol without an SSH session.
-    let response = agent
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/agent/v1/agent-release")
-                .header("authorization", format!("Bearer {}", issued.token))
-                .header("x-brocade-arch", "x86_64")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    // A clearance naming a build this control plane does not have — which is exactly what a
-    // redeployed control plane looks like. It must serve nothing, or deploying the control plane
-    // would double as releasing whatever agent it happens to embed.
-    let response = release(json!({
-        "release_id": "0".repeat(64), "scope": "all", "nodes": []
-    }))
+    let unknown = post_json(
+        &admin,
+        &admin_token,
+        "/binary-releases/agent",
+        json!({
+            "idempotency_key": "unknown", "build_id": available, "nodes": ["missing"]
+        }),
+    )
     .await;
+    assert_eq!(unknown.0, StatusCode::NOT_FOUND);
+    let created = post_json(&admin, &admin_token, "/binary-releases/agent", json!({
+        "idempotency_key": "agent-http-1", "build_id": available, "nodes": ["n1"], "note": "test"
+    })).await;
+    assert_eq!(created.0, StatusCode::OK);
+    let id = created.1["current"]["id"].as_i64().unwrap();
+    assert_eq!(created.1["current"]["events"], json!([]));
+    // No protocol header: even an isolated legacy Agent retains the narrow repair channel.
+    let response = ask(Some("x86_64")).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let response = ask(issued.token.clone(), Some("x86_64")).await;
-    assert_eq!(
-        response.status(),
-        StatusCode::NO_CONTENT,
-        "批准的不是这台控制面带的那一批，就该谁也不给"
-    );
-
-    // Pausing keeps the build id, so resuming does not mean choosing it again.
-    let response = release(json!({ "release_id": available, "scope": "off", "nodes": [] })).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let paused: Value =
+    let offer: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
             .unwrap();
-    assert_eq!(paused["released"]["release_id"], available);
-    let response = ask(issued.token.clone(), Some("x86_64")).await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    // No token, no answer. This endpoint says which bytes a machine should run as root.
+    assert_eq!(offer["release_id"], id);
+    assert_eq!(offer["attempt"], 1);
+    assert_eq!(offer["sha256"], wanted);
+    assert_eq!(
+        offer["url"],
+        format!("http://10.0.0.7:9091/brocade-agent/x86_64?sha256={wanted}")
+    );
+    let legacy: brocade_deployment::protocol::BinarySource = serde_json::from_value(offer).unwrap();
+    assert_eq!(legacy.sha256, wanted);
+    assert_eq!(ask(None).await.status(), StatusCode::NO_CONTENT);
+    let report = json!({"release_id": id, "attempt": 1, "outcome": "running", "performed_update": false,
+        "installed_sha256": wanted, "running_sha256": wanted, "error": null});
+    let send = |hash: String| {
+        let agent = agent.clone();
+        let token = token.clone();
+        let body = report.to_string();
+        async move {
+            agent
+                .oneshot(
+                    Request::post("/agent/v1/agent-release/report")
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("user-agent", format!("brocade-agent/{hash}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        send(previous.clone()).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(send(wanted.to_owned()).await.status(), StatusCode::CONFLICT);
+    sqlx::query(
+        "UPDATE node_agent_state SET agent_version = $1, runtime_versions = $2,
+        last_poll_at = now(), runtime_reported_at = now() WHERE node_id = 'n1'",
+    )
+    .bind(format!("brocade-agent/{wanted}"))
+    .bind(json!({"agent": wanted}))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(send(wanted.to_owned()).await.status(), StatusCode::OK);
+    let finished = get_json(&admin, &admin_token, "/binary-releases/agent").await;
+    assert_eq!(finished.1["current"]["status"], "succeeded");
+    assert_eq!(
+        finished.1["current"]["targets"][0]["verification"],
+        "observed"
+    );
+    let history = get_json(&admin, &admin_token, "/binary-releases/agent/history").await;
+    assert_eq!(history.1["items"][0]["id"], id);
+    assert_eq!(
+        get_json(&admin, &admin_token, &format!("/binary-releases/xray/{id}"))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(ask(Some("x86_64")).await.status(), StatusCode::NO_CONTENT);
     let response = agent
-        .clone()
         .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/agent/v1/agent-release")
+            Request::get("/agent/v1/agent-release")
                 .header("x-brocade-arch", "x86_64")
                 .body(Body::empty())
                 .unwrap(),
@@ -7692,7 +7995,10 @@ async fn http_xray_release_is_offered_and_reported_by_digest() {
     assert_eq!(offer["attempt"], 1);
     assert_eq!(offer["sha256"], desired);
     assert_eq!(offer["previous_sha256"], previous);
-    assert_eq!(offer["url"], "http://10.0.0.7:9091/brocade-xray/x86_64");
+    assert_eq!(
+        offer["url"],
+        format!("http://10.0.0.7:9091/brocade-xray/x86_64?sha256={desired}")
+    );
 
     let response = agent
         .clone()

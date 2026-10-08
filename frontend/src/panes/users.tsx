@@ -1,5 +1,5 @@
-import { useEffect, useId, useState, type CSSProperties, type ReactNode } from 'react';
-import { useMutation, useMutationState, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Fragment, memo, useEffect, useState, type CSSProperties, type ReactNode } from 'react';
+import { keepPreviousData, useMutation, useMutationState, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ApiError,
   createUser,
@@ -42,10 +42,11 @@ import {
 import { can, isVisitor, useSession } from '../session';
 import { Ago, EmptyState, ErrorBox, Loading, SegmentedControl, SegSwitch } from '../ui/bits';
 import { Icon, ListIcon, PanelTitle } from '../ui/icons';
-import { bytes } from '../ui/format';
+import { bytes, shareOf } from '../ui/format';
 import { useNodeNames } from '../ui/node-name';
 import { RegionFlag } from '../ui/region-flag';
 import { FieldLoading } from '../ui/loading';
+import { useNow } from '../ui/clock';
 import { type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import { isValidSlug } from './ports';
@@ -243,103 +244,175 @@ function PresenceNodeLink({ id, nameOf }: { id: string; nameOf: (id: string) => 
   );
 }
 
-function PresenceSourceRow({
-  source,
-  country,
-  operator,
-  nameOf,
-  historical = false,
-}: {
-  source: UserOnlineSource;
-  country: string | undefined;
-  operator: NetworkOperator | undefined;
-  nameOf: (id: string) => string;
-  historical?: boolean;
-}) {
-  const [nodesExpanded, setNodesExpanded] = useState(false);
-  const detailsId = useId();
+const SOURCE_LOCATION_TITLE = '本地 GeoIP · 国家／地区与网络归属参考，非精确位置或宽带品牌';
+
+// 来源的网络归属：本地 GeoIP 国家／地区 + BGP 运营商。国内运营商合写为网络名（「中国电信」
+// 「中国教育网」）；境外地区有运营商归属时写「香港 · 移动」。国家库未命中时保留运营商，
+// 不从运营商反推国家。
+function sourceNetwork(
+  country: string | undefined,
+  operator: NetworkOperator | undefined,
+): { code: string | undefined; label: string } {
   const code = country?.trim().toUpperCase();
   const name = code && /^[A-Z]{2}$/.test(code) && code !== 'ZZ' ? SOURCE_REGION_NAMES.of(code) : undefined;
   const region = name && name !== code ? name : undefined;
   const operatorName = operator ? SOURCE_OPERATOR_NAMES.get(operator) : undefined;
-  const nodeCount = source.node_ids.length;
-  const nodeVerb = historical ? '曾接入' : '接入';
+  if (!region) return { code: undefined, label: operatorName ? `位置未知 · ${operatorName}` : '位置未知' };
+  if (!operatorName) return { code, label: region };
+  return { code, label: code === 'CN' ? `中国${operatorName}` : `${region} · ${operatorName}` };
+}
+
+// PostgreSQL 的 timestamptz::text 形如「2026-10-05 06:21:22.409123+00」：日期与时刻以空格分隔，
+// 时区偏移只写小时，秒的小数为 6 位，均不是 ECMAScript 规定的日期格式。先改写为该格式再解析，
+// 不依赖各浏览器 Date.parse 对其他写法的宽松解析。
+function observedAt(at: string): number {
+  const iso = at
+    .replace(/^(\d{4}-\d{2}-\d{2}) /, '$1T')
+    .replace(/(\.\d{3})\d+/, '$1')
+    .replace(/(T[\d:.]+[+-]\d{2})$/, '$1:00');
+  return Date.parse(/(?:Z|[+-]\d{2}:\d{2})$/.test(iso) ? iso : `${iso}Z`);
+}
+
+const two = (value: number) => String(value).padStart(2, '0');
+const clockOf = (t: number) => {
+  const d = new Date(t);
+  return `${two(d.getHours())}:${two(d.getMinutes())}`;
+};
+const monthDayOf = (t: number) => {
+  const d = new Date(t);
+  return `${two(d.getMonth() + 1)}-${two(d.getDate())}`;
+};
+// 本地日历的天数差：0 为今天，1 为昨天，与发布流水按天分组的口径一致。today 是本地当天零点；
+// 跨夏令时切换的那一天不是整 24 小时，取最接近的整数。
+const calendarDaysAgo = (t: number, today: number) =>
+  Math.round((today - new Date(t).setHours(0, 0, 0, 0)) / 86_400_000);
+
+// 首次出现：今天只写时刻，昨天加「昨天」，更早写月-日与时刻
+function firstSeenLabel(t: number, today: number): string {
+  if (Number.isNaN(t)) return '—';
+  const days = calendarDaysAgo(t, today);
+  if (days <= 0) return clockOf(t);
+  if (days === 1) return `昨天 ${clockOf(t)}`;
+  return `${monthDayOf(t)} ${clockOf(t)}`;
+}
+
+const localTime = (at: string) => {
+  const t = observedAt(at);
+  return Number.isNaN(t) ? at : new Date(t).toLocaleString();
+};
+
+const observedTitle = (source: UserOnlineSource, online: boolean) =>
+  [
+    `首次出现 ${localTime(source.first_observed_at)}`,
+    `${online ? '最近观测' : '最后出现'} ${localTime(source.last_observed_at)}`,
+    `最近新建连接 ${localTime(source.xray_last_seen_at)}`,
+  ].join('\n');
+
+// 时间线分组：在线来源在最前，离线来源按最后出现分到今天、昨天、7 天内与保留期内。
+// 7 天内与保留期内默认折叠。
+type PresenceBucket = 'online' | 'today' | 'yesterday' | 'week' | 'retention';
+const PRESENCE_BUCKETS: PresenceBucket[] = ['online', 'today', 'yesterday', 'week', 'retention'];
+const OLDER_PRESENCE_BUCKETS = new Set<PresenceBucket>(['week', 'retention']);
+
+function offlineBucket(lastSeen: number, today: number): PresenceBucket {
+  if (Number.isNaN(lastSeen)) return 'retention';
+  const days = calendarDaysAgo(lastSeen, today);
+  if (days <= 0) return 'today';
+  if (days === 1) return 'yesterday';
+  return days < 7 ? 'week' : 'retention';
+}
+
+// IPv6 的前 64 位用正文墨色，接口标识降一档：同一 /64 下轮换的隐私地址可以直接对上。
+// 接口标识的冒号后允许断行，窄卡里不会把一组十六进制拆到两行。
+function SourceAddress({ ip }: { ip: string }) {
+  const groups = ip.split(':');
+  if (groups.length <= 4 || !groups.slice(0, 4).every(Boolean)) return <code>{ip}</code>;
   return (
-    <div className="user-presence-source">
-      <span className={`user-presence-dot${historical ? ' history' : ''}`} aria-hidden="true" />
-      <code>{source.ip}</code>
-      <CopyButton
-        className="user-fcopy"
-        text={source.ip}
-        label={`复制${historical ? '历史' : ''}来源 IP ${source.ip}`}
-        successLabel={`${historical ? '历史' : ''}来源 IP 已复制`}
-        failureLabel={`${historical ? '历史' : ''}来源 IP 复制失败`}
-        iconOnly
-      />
-      <span className="user-presence-location" title="本地 GeoIP · 国家／地区与网络归属参考，非精确位置或宽带品牌">
-        {region && <RegionFlag code={code} />}
-        <span>
-          {region ?? '位置未知'}
-          {operatorName && <> · {operatorName}</>}
-        </span>
+    <code>
+      {groups.slice(0, 4).join(':')}
+      <span className="user-presence-iid">
+        {groups.slice(4).map((group, index) => (
+          <Fragment key={index}>
+            :<wbr />
+            {group}
+          </Fragment>
+        ))}
       </span>
-      <div className="user-presence-meta">
-        <span className="user-presence-source-nodes">
-          {nodeCount === 0 ? (
-            <span>接入节点未知</span>
-          ) : nodeCount === 1 ? (
-            <>
-              <span>{nodeVerb}</span>
-              <PresenceNodeLink id={source.node_ids[0]} nameOf={nameOf} />
-              <button
-                type="button"
-                className="user-presence-source-nodes-toggle"
-                aria-label={`${source.ip} 的${historical ? '最后观测' : '接入'}协议`}
-                aria-expanded={nodesExpanded}
-                aria-controls={detailsId}
-                onClick={() => setNodesExpanded(expanded => !expanded)}
-              >
-                协议
-              </button>
-            </>
-          ) : (
-            <button
-              type="button"
-              className="user-presence-source-nodes-toggle"
-              aria-expanded={nodesExpanded}
-              aria-controls={detailsId}
-              onClick={() => setNodesExpanded(expanded => !expanded)}
-            >
-              {nodeVerb} {nodeCount} 台节点
-            </button>
-          )}
-        </span>
-        <span className="user-presence-observed">
-          {historical ? '最后出现' : '最近观测'} <Ago at={source.last_observed_at} />
-        </span>
-        {nodesExpanded && nodeCount === 1 && (
-          <div id={detailsId} className="user-presence-protocol-detail">
-            <span>{historical ? '最后观测协议' : '接入协议'}</span>
-            <span className="user-presence-protocols">{sourceProtocols(source, source.node_ids[0])}</span>
-          </div>
-        )}
-        {nodesExpanded && nodeCount > 1 && (
-          <ul id={detailsId} className="user-presence-source-node-list" aria-label={`${source.ip} 的接入节点`}>
-            {source.node_ids.map(id => (
-              <li key={id}>
-                <PresenceNodeLink id={id} nameOf={nameOf} />
-                <span className="user-presence-protocols">
-                  {historical && <span>最后观测协议 · </span>}
-                  {sourceProtocols(source, id)}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-    </div>
+    </code>
   );
 }
+
+// 时间线的一行：最后出现时刻 │ 节点 │ 来源 IP │ 网络 │ 接入（机器 + 协议）│ 首次出现。
+// 在线来源不写时刻，所在分组「在线」已经表达它此刻仍在线。卡片每秒随时钟重渲染，
+// 行只在数据或日期变化时重渲染。
+const PresenceRow = memo(function PresenceRow({
+  source,
+  online,
+  older,
+  country,
+  operator,
+  nameOf,
+  today,
+}: {
+  source: UserOnlineSource;
+  online: boolean;
+  older: boolean;
+  country: string | undefined;
+  operator: NetworkOperator | undefined;
+  nameOf: (id: string) => string;
+  today: number;
+}) {
+  const lastSeen = observedAt(source.last_observed_at);
+  const network = sourceNetwork(country, operator);
+  const title = observedTitle(source, online);
+  const time = online ? '' : Number.isNaN(lastSeen) ? '—' : older ? monthDayOf(lastSeen) : clockOf(lastSeen);
+  const past = online ? '' : '历史';
+  return (
+    <li className={`user-presence-row${online ? '' : ' off'}`}>
+      <span className="user-presence-time" title={title}>
+        {time}
+      </span>
+      <span className="user-presence-mark" aria-hidden="true" />
+      <span className="user-presence-ip">
+        <SourceAddress ip={source.ip} />
+        <CopyButton
+          className="user-fcopy"
+          text={source.ip}
+          label={`复制${past}来源 IP ${source.ip}`}
+          successLabel={`${past}来源 IP 已复制`}
+          failureLabel={`${past}来源 IP 复制失败`}
+          iconOnly
+        />
+      </span>
+      <span className="user-presence-sub">
+        <span className="user-presence-location" title={SOURCE_LOCATION_TITLE}>
+          {network.code && <RegionFlag code={network.code} />}
+          <span>{network.label}</span>
+        </span>
+        <span className="user-presence-access">
+          {source.node_ids.length === 0 ? (
+            <span className="user-presence-unknown">接入节点未知</span>
+          ) : (
+            source.node_ids.map(id => (
+              <span key={id} className="user-presence-access-item">
+                <PresenceNodeLink id={id} nameOf={nameOf} />
+                <span className="user-presence-protocols">{sourceProtocols(source, id)}</span>
+              </span>
+            ))
+          )}
+        </span>
+      </span>
+      <span className="user-presence-first" title={title}>
+        首次 {firstSeenLabel(observedAt(source.first_observed_at), today)}
+      </span>
+    </li>
+  );
+});
+
+const firstSeenOrder = (source: UserOnlineSource) => {
+  const t = observedAt(source.first_observed_at);
+  return Number.isNaN(t) ? 0 : t;
+};
 
 function UserPresenceCard({
   user,
@@ -358,107 +431,156 @@ function UserPresenceCard({
   pending: boolean;
   error: unknown;
 }) {
-  const [historyExpanded, setHistoryExpanded] = useState(false);
-  const presenceText = userPresenceText(presence);
-  // A public source may use multiple ingress nodes. Count each node once in the coverage summary;
-  // expected/reporting_nodes are snapshot coverage, not the number of nodes with online sources.
-  const onlineNodeIds = new Set<string>();
-  for (const source of presence?.sources ?? []) {
-    for (const id of source.node_ids) {
-      onlineNodeIds.add(id);
-    }
-  }
-  const partial = presence?.state === 'partial';
-  const summary = presence?.sources.length
-    ? `${partial ? '至少 ' : ''}${presence.sources.length} 个公网来源 · ${partial ? '至少' : ''}覆盖 ${onlineNodeIds.size} 台节点`
-    : presenceText;
+  const [olderExpanded, setOlderExpanded] = useState(false);
+  const today = new Date(useNow()).setHours(0, 0, 0, 0);
+  const online = presence?.sources ?? [];
+  // 在线与离线来源排在同一条时间线上，打开详情即读取离线来源。名册只轮询在线来源，历史只为
+  // 当前打开的这一位用户读取（见 store 的 history 说明）。刚离线的地址要立即出现在历史里：
+  // 在线地址集合进入查询键，集合变化即重新读取，读取期间沿用上一份结果，时间线不闪烁。
+  const onlineKey = online
+    .map(source => source.ip)
+    .sort()
+    .join(' ');
   const history = useQuery({
-    queryKey: ['user-presence-history', user.tenant_id, user.id],
+    queryKey: ['user-presence-history', user.tenant_id, user.id, onlineKey],
     queryFn: () => fetchUserOnlineSourceHistory(user.tenant_id, user.id),
-    enabled: historyExpanded,
+    enabled: !pending,
     staleTime: 30_000,
+    placeholderData: keepPreviousData,
   });
+  // 重新读取完成前，上一份历史里可能还有刚恢复在线的地址；同一地址只在「在线」出现一次。
+  const onlineIps = new Set(online.map(source => source.ip));
+  const offline = (history.data?.sources ?? []).filter(source => !onlineIps.has(source.ip));
+  const retentionDays = history.data?.retention_days ?? 30;
   const historyCountries = new Map(history.data?.source_countries?.map(({ ip, country }) => [ip, country]));
   const historyOperators = new Map(history.data?.source_operators?.map(({ ip, operator }) => [ip, operator]));
+
+  const groups = new Map<PresenceBucket, UserOnlineSource[]>();
+  // 在线来源按首次出现由近到远：新出现的地址排在最上面
+  if (online.length) {
+    groups.set(
+      'online',
+      [...online].sort((a, b) => firstSeenOrder(b) - firstSeenOrder(a) || a.ip.localeCompare(b.ip)),
+    );
+  }
+  for (const source of offline) {
+    const bucket = offlineBucket(observedAt(source.last_observed_at), today);
+    groups.set(bucket, [...(groups.get(bucket) ?? []), source]);
+  }
+  const bucketLabel: Record<PresenceBucket, string> = {
+    online: '在线',
+    today: '今天',
+    yesterday: '昨天',
+    week: '7 天内',
+    retention: `${retentionDays} 天内`,
+  };
+  const olderCount = [...OLDER_PRESENCE_BUCKETS].reduce((sum, bucket) => sum + (groups.get(bucket)?.length ?? 0), 0);
+  // 只有更早的来源时直接展开，否则整张卡只剩一个按钮
+  const olderOnly = PRESENCE_BUCKETS.every(bucket => OLDER_PRESENCE_BUCKETS.has(bucket) || !groups.has(bucket));
+  const showOlder = olderExpanded || olderOnly;
+  const visibleBuckets = PRESENCE_BUCKETS.filter(
+    bucket => groups.has(bucket) && (showOlder || !OLDER_PRESENCE_BUCKETS.has(bucket)),
+  );
+
+  const partial = presence?.state === 'partial';
+  const reading = error ? (
+    '在线状态暂不可用'
+  ) : pending ? (
+    <FieldLoading />
+  ) : !presence || presence.state === 'unavailable' ? (
+    '在线来源 —'
+  ) : online.length > 0 ? (
+    <>
+      {partial ? '在线至少 ' : '在线 '}
+      <b>{online.length}</b>
+      {history.data && (
+        <>
+          {' '}
+          · {retentionDays} 天 <b>{online.length + offline.length}</b> 个地址
+        </>
+      )}
+    </>
+  ) : partial ? (
+    '在线来源 —'
+  ) : offline.length > 0 ? (
+    <>
+      离线 · 最后出现 <Ago at={offline[0].last_observed_at} />
+    </>
+  ) : (
+    '暂无在线连接'
+  );
+  // 状态行：快照不完整或不可用时为金色点；确认无在线来源时为空心点。错误由 ErrorBox 单独说明。
+  const notice: { tone: 'warn' | 'idle'; text: string } | null =
+    error || pending
+      ? null
+      : presence?.state === 'partial'
+        ? {
+            tone: 'warn',
+            text: `当前仅收到 ${presence.reporting_nodes} / ${presence.expected_nodes} 台入口节点的最新快照，在线来源可能不完整`,
+          }
+        : !presence || presence.state === 'unavailable'
+          ? { tone: 'warn', text: '在线来源暂不可用：Agent 尚未上报，或在线来源统计尚未启用' }
+          : online.length > 0
+            ? null
+            : offline.length > 0
+              ? { tone: 'idle', text: '暂无在线连接' }
+              : history.data
+                ? { tone: 'idle', text: `最近 ${retentionDays} 天没有来源记录` }
+                : null;
 
   return (
     <section className="panel config-panel user-dcard user-presence-card">
       <header>
         <PanelTitle of="client">在线接入</PanelTitle>
-        <span className="rt">{error ? '在线状态暂不可用' : pending ? <FieldLoading /> : summary}</span>
+        <span className="rt" title="按公网 IP 去重，不等于连接数；跨节点的同一 IP 只计一次">
+          {reading}
+        </span>
       </header>
       <div className="user-dcard-body">
         {!!error && <ErrorBox error={error} />}
         {!!error && presence && <span className="dim">当前显示上次成功读取的快照。</span>}
-        {presence?.sources.length ? (
-          <div className="user-presence-list">
-            {presence.sources.map(source => (
-              <PresenceSourceRow
-                key={source.ip}
-                source={source}
-                country={countries?.[source.ip]}
-                operator={operators?.[source.ip]}
-                nameOf={nameOf}
-              />
+        {notice && <div className={`user-presence-note ${notice.tone}`}>{notice.text}</div>}
+        {visibleBuckets.length > 0 && (
+          <ol className="user-presence-timeline" aria-label={`在线与最近 ${retentionDays} 天的来源`}>
+            {visibleBuckets.map(bucket => (
+              <Fragment key={bucket}>
+                <li className="user-presence-day">
+                  <span>{bucketLabel[bucket]}</span>
+                </li>
+                {groups.get(bucket)!.map(source => (
+                  <PresenceRow
+                    key={source.ip}
+                    source={source}
+                    online={bucket === 'online'}
+                    older={OLDER_PRESENCE_BUCKETS.has(bucket)}
+                    country={bucket === 'online' ? countries?.[source.ip] : historyCountries.get(source.ip)}
+                    operator={bucket === 'online' ? operators?.[source.ip] : historyOperators.get(source.ip)}
+                    nameOf={nameOf}
+                    today={today}
+                  />
+                ))}
+              </Fragment>
             ))}
+          </ol>
+        )}
+        {!pending && history.isPending && (
+          <div className="user-presence-pending">
+            <FieldLoading label="读取离线来源" />
           </div>
-        ) : !pending && !error ? (
-          <span className="dim">{presenceText}</span>
-        ) : null}
-
-        <div className={`user-presence-history${historyExpanded ? ' open' : ''}`}>
+        )}
+        {!!history.error && <ErrorBox error={history.error} />}
+        {history.data?.truncated && showOlder && (
+          <span className="user-presence-history-note">记录较多，仅显示最近 256 个来源 IP。</span>
+        )}
+        {olderCount > 0 && !olderOnly && (
           <button
             type="button"
-            className="user-presence-history-toggle"
-            aria-expanded={historyExpanded}
-            onClick={() => setHistoryExpanded(expanded => !expanded)}
+            className="user-presence-more"
+            aria-expanded={olderExpanded}
+            onClick={() => setOlderExpanded(expanded => !expanded)}
           >
-            <span aria-hidden="true">{historyExpanded ? '▾' : '▸'}</span>
-            {historyExpanded ? '收起历史来源 IP' : '历史来源 IP'}
+            {olderExpanded ? '收起更早的来源' : `显示更早的 ${olderCount} 个来源`}
           </button>
-          {historyExpanded && (
-            <div className="user-presence-history-body" aria-live="polite">
-              {history.isPending ? (
-                <FieldLoading />
-              ) : history.error ? (
-                <ErrorBox error={history.error} />
-              ) : history.data && history.data.sources.length > 0 ? (
-                <>
-                  <div className="user-presence-history-summary">
-                    最近 {history.data.retention_days} 天 · {history.data.sources.length} 个已离线来源
-                  </div>
-                  <div className="user-presence-list history">
-                    {history.data.sources.map(source => (
-                      <PresenceSourceRow
-                        key={source.ip}
-                        source={source}
-                        country={historyCountries.get(source.ip)}
-                        operator={historyOperators.get(source.ip)}
-                        nameOf={nameOf}
-                        historical
-                      />
-                    ))}
-                  </div>
-                  {history.data.truncated && (
-                    <span className="user-presence-history-note">记录较多，仅显示最近 256 个来源 IP。</span>
-                  )}
-                </>
-              ) : (
-                <span className="dim">最近 {history.data?.retention_days ?? 30} 天没有历史来源 IP。</span>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-      <div className="user-dcard-foot">
-        <span>按公网 IP 去重，不等于连接数；跨节点的同一 IP 在合计中只计一次。</span>
-        {presence?.state === 'partial' && (
-          <span>
-            当前仅收到 {presence.reporting_nodes} / {presence.expected_nodes} 台入口节点的最新快照。
-          </span>
-        )}
-        {!pending && !error && (!presence || presence.state === 'unavailable') && (
-          <span>Agent 尚未上报，或在线来源统计尚未启用。</span>
         )}
       </div>
     </section>
@@ -471,9 +593,12 @@ const compactUsage = (total: number) => {
   return { value: String(Number(Number(value).toFixed(1))), unit };
 };
 
-// 名册不暴露低用量的精确百分比；进入 95% 以上后才显示具体数值。
+// 额度用到这一比例即进入注意档：名册从这里开始显示具体百分比，详情的额度条改用注意色。
+const QUOTA_ATTENTION_PCT = 95;
+
+// 名册不暴露低用量的精确百分比；进入注意档后才显示具体数值。
 export function quotaStage(pct: number): string {
-  if (pct < 95) return '余裕';
+  if (pct < QUOTA_ATTENTION_PCT) return '余裕';
   return `${pct.toFixed(0)}%`;
 }
 
@@ -522,16 +647,28 @@ export function UsersPane({ win, bare = false }: { win: Win; bare?: boolean }) {
 // 这类额度不应在此输入框中修改。
 const GiB = 1024 ** 3;
 const toGiB = (n: number) => Number((n / GiB).toFixed(3));
+// 额度通常按整 GiB 设置，整数时不显示小数位（「100 GiB」）；非整值沿用 bytes() 的精度。
+const quotaBytes = (n: number) => (n % GiB === 0 ? `${n / GiB} GiB` : bytes(n));
 
-// 一个线路一个指标列，显示已用量、额度和剩余量。
-// 进度条仅在设置了额度时显示：未设额度时不存在用尽的概念，显示一条空槽会被误读为
-// 用量为零，而实际含义是不限量。
+/** 线路在当前用户下的接入情况：地区旗、已授权接入点所在的链、被配额执行器停用的接入点（按链名）。 */
+export interface QuotaRouteAccess {
+  countries: string[];
+  chains: string[];
+  suspended: string[];
+}
+
+const NO_ROUTE_ACCESS: QuotaRouteAccess = { countries: [], chains: [], suspended: [] };
+
+// 一条线路一行，分两层：名称（线路名 + 地区旗 / 接入链）│ 已用 / 额度 … 剩余；第二层是额度条与百分比。
+// 额度条只在设置了额度且用量已知时绘制：未设额度时不存在用尽的概念，空槽会被理解为用量为零，
+// 而实际含义是不限量。
 export function QuotaRow({
   app,
   used,
   limit,
   over,
   usageState = 'ready',
+  access = NO_ROUTE_ACCESS,
   editable,
   busy,
   onSave,
@@ -541,25 +678,56 @@ export function QuotaRow({
   limit: number | null;
   over: boolean;
   usageState?: MonthlyUsageState;
+  access?: QuotaRouteAccess;
   editable: boolean;
   busy: boolean;
   onSave: (limit: number | null) => Promise<unknown>;
 }) {
   const [draftValue, setDraftValue] = useState<string | null>(null);
   const editing = draftValue !== null;
+  const label = app.label || app.id;
   const initialValue = limit === null ? '' : String(toGiB(limit));
   const guardScope = `quota:${app.id}`;
   const dirty = editing && draftValue !== initialValue;
-  useUnsavedChanges(dirty, `${app.label || app.id} 的月度额度`, guardScope);
-  const pct = limit && used !== null ? (used / limit) * 100 : null;
+  useUnsavedChanges(dirty, `${label} 的月度额度`, guardScope);
+  const pct = limit !== null && used !== null ? (used / limit) * 100 : null;
+
+  const name = (
+    <span className="qta-name">
+      <span className="qta-app">
+        <b>{label}</b>
+        {access.countries.length > 0 && (
+          <span className="qta-flags">
+            {access.countries.slice(0, 3).map(code => (
+              <RegionFlag key={code} code={code} />
+            ))}
+          </span>
+        )}
+      </span>
+      {access.suspended.length > 0 ? (
+        // 行内只写数量；被停用的链与恢复条件放进悬停提示，避免名称列换行。
+        <span
+          className="qta-sub stop"
+          title={`${[...new Set(access.suspended)].join('、')} 已被系统停用；补足额度或月初重置后自动恢复`}
+        >
+          系统已停用 {access.suspended.length} 个接入点
+        </span>
+      ) : (
+        <span className="qta-sub" title={access.chains.length > 0 ? access.chains.join('、') : undefined}>
+          {access.chains.length > 0 ? access.chains.join('、') : '未授权接入点'}
+        </span>
+      )}
+    </span>
+  );
 
   if (editing) {
-    const n = Number(draftValue.trim());
-    const bad = draftValue.trim() !== '' && (!Number.isFinite(n) || n <= 0);
+    const value = draftValue.trim();
+    const n = Number(value);
+    const bad = value !== '' && (!Number.isFinite(n) || n <= 0);
     const submit = async () => {
       if (bad || busy) return;
       try {
-        await onSave(draftValue.trim() === '' ? null : Math.round(n * GiB));
+        await onSave(value === '' ? null : Math.round(n * GiB));
         // 只有服务端确认保存后才退出编辑。失败时保留输入，方便修正或重试。
         setDraftValue(null);
       } catch {
@@ -567,30 +735,31 @@ export function QuotaRow({
       }
     };
     return (
-      <div className="qta-r">
-        <span className="qta-head">
-          <span className="qta-app">
-            {app.label || app.id}
-            <i>{app.id}</i>
-          </span>
-        </span>
-        <input
-          className="f qta-in"
-          autoFocus
-          disabled={busy}
-          value={draftValue}
-          placeholder="留空 = 不限"
-          onChange={e => setDraftValue(e.target.value)}
-          onKeyDown={e => {
-            if (e.key === 'Escape' && !busy && confirmDiscardChanges(guardScope)) setDraftValue(null);
-            if (e.key === 'Enter' && !bad && !busy) {
-              e.preventDefault();
-              void submit();
-            }
-          }}
-        />
-        <span className="qta-acts">
-          <span className="qta-u">GiB</span>
+      <div className="qta-r editing" role="listitem">
+        {name}
+        <div className="qta-editor">
+          <label className="qta-input">
+            <input
+              className="f qta-in"
+              autoFocus
+              disabled={busy}
+              value={draftValue}
+              placeholder="不限"
+              inputMode="decimal"
+              aria-label={`${label} 的月度额度（GiB）`}
+              aria-invalid={bad || undefined}
+              onChange={e => setDraftValue(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Escape' && !busy && confirmDiscardChanges(guardScope)) setDraftValue(null);
+                if (e.key === 'Enter' && !bad && !busy) {
+                  e.preventDefault();
+                  void submit();
+                }
+              }}
+            />
+            <span className="qta-u">GiB</span>
+          </label>
+          <span className={`qta-hint${bad ? ' bad' : ''}`}>{bad ? '请输入大于 0 的数字' : '留空表示不限'}</span>
           <span className="sp" />
           <button
             className="btn"
@@ -602,63 +771,65 @@ export function QuotaRow({
           <button className="btn primary" disabled={bad || busy} onClick={() => void submit()}>
             {busy ? '保存中…' : '保存'}
           </button>
-        </span>
+        </div>
       </div>
     );
   }
 
+  // 用到注意档（≥95%）改用注意色，用尽改用告警色：后者即名册红点的成因，两处同色。
+  const tone =
+    used === null
+      ? 'unknown'
+      : limit === null
+        ? 'unlimited'
+        : over
+          ? 'over'
+          : pct !== null && pct >= QUOTA_ATTENTION_PCT
+            ? 'warn'
+            : 'ok';
+  const [figure, unit] = used === null ? ['', ''] : bytes(used).split(' ');
+  const left =
+    usageState === 'pending' ? null : usageState === 'failed' ? (
+      '用量暂不可用'
+    ) : used === null ? (
+      '用量未知'
+    ) : limit === null ? (
+      '不限额度'
+    ) : over ? (
+      <>
+        超出<b>{bytes(used - limit)}</b>
+      </>
+    ) : (
+      <>
+        剩余<b>{bytes(limit - used)}</b>
+      </>
+    );
   return (
-    <div className={`qta-r${over ? ' over' : ''}`}>
-      <span className="qta-head">
-        <span className="qta-app">
-          {app.label || app.id}
-          <i>{app.id}</i>
-        </span>
-      </span>
-      <span className="qta-measures">
-        <small>本月已用</small>
-        <strong>
-          {usageState === 'pending'
-            ? '读取中…'
-            : usageState === 'failed'
-              ? '暂不可用'
-              : used === null
-                ? '—'
-                : bytes(used)}
-        </strong>
-        <span className="qta-cap">{limit === null ? '不限额度' : `/ ${bytes(limit)}`}</span>
-      </span>
-      {limit !== null && pct !== null && used !== null && (
-        <span className="qta-t" title={`${pct.toFixed(0)}%`}>
-          <i style={{ width: `${used > 0 ? Math.min(100, Math.max(1, pct)) : 0}%` }} />
-        </span>
-      )}
-      <span className={`qta-meta${over ? ' over' : ''}${limit === null ? ' unlimited' : ''}`}>
+    <div className={`qta-r ${tone}`} role="listitem">
+      {name}
+      <span className="qta-figs">
         {usageState === 'pending' ? (
-          '正在读取本月用量'
-        ) : usageState === 'failed' ? (
-          '本月用量暂不可用'
-        ) : limit === null ? (
-          '未设置月度额度'
+          '读取中…'
         ) : used === null ? (
-          <>
-            <span>本月用量未知</span>
-            <span>额度 {bytes(limit)}</span>
-          </>
-        ) : over ? (
-          <>
-            <span>额度已用尽</span>
-            <span>超出 {bytes(Math.max(0, used - limit))}</span>
-          </>
+          '—'
         ) : (
           <>
-            <span>{pct === null ? '—' : `${pct.toFixed(0)}%`}</span>
-            <span>剩余 {bytes(limit - used)}</span>
+            {figure}
+            <small>{unit}</small>
           </>
         )}
+        {limit !== null && <span className="qta-cap">/ {quotaBytes(limit)}</span>}
       </span>
+      {left !== null && <span className="qta-left">{left}</span>}
+      {pct !== null && used !== null && (
+        <span className="qta-meter">
+          <span className="qta-t" aria-hidden="true">
+            <i style={{ width: `${used > 0 ? Math.min(100, Math.max(1, pct)) : 0}%` }} />
+          </span>
+          <span className="qta-pct">{pct.toFixed(0)}%</span>
+        </span>
+      )}
       <span className="qta-acts">
-        <span className="sp" />
         <button
           className="btn qta-pencil"
           disabled={!editable}
@@ -673,6 +844,90 @@ export function QuotaRow({
         </button>
       </span>
     </div>
+  );
+}
+
+// 详情卡的本月读数栏：与用量页读数栏同一写法（合计 + 上下行组成条与数值），尺寸按子卡缩小一档。
+function UserUsageLedger({
+  state,
+  rows,
+  monthEnd,
+}: {
+  state: MonthlyUsageState;
+  rows: UsageMonthlyViewRow[];
+  monthEnd: string | null;
+}) {
+  const uplink = rows.reduce((sum, row) => sum + row.uplink_bytes, 0);
+  const downlink = rows.reduce((sum, row) => sum + row.downlink_bytes, 0);
+  const total = uplink + downlink;
+  const known = state === 'ready' && rows.length > 0;
+  const [figure, unit] = bytes(total).split(' ');
+  const upShare = total > 0 ? (uplink / total) * 100 : 0;
+  return (
+    <section className="user-usage-ledger" aria-label="本月用量">
+      <div className="user-usage-hero">
+        <span className="user-usage-hero-label">本月合计</span>
+        {known ? (
+          <strong className="user-usage-hero-value">
+            {figure} <small>{unit}</small>
+          </strong>
+        ) : (
+          <strong className="user-usage-hero-value none">{monthlyUsageText(state, rows.length, total)}</strong>
+        )}
+        {monthEnd && <QuotaReset monthEnd={monthEnd} />}
+      </div>
+      <div className="user-usage-compose">
+        {/* 下方两行写出同样的数值；组成条只表示比例。 */}
+        <div className="usage-split" aria-hidden="true">
+          {known && total > 0 && (
+            <>
+              <i className="up" style={{ flexGrow: upShare }} />
+              <i className="down" style={{ flexGrow: 100 - upShare }} />
+            </>
+          )}
+        </div>
+        <dl className="usage-io">
+          <div className="up">
+            <dt>
+              <i aria-hidden="true" />
+              上行
+            </dt>
+            <dd>{known ? bytes(uplink) : '—'}</dd>
+            <dd className="usage-share">{known ? shareOf(uplink, total) : ''}</dd>
+          </div>
+          <div className="down">
+            <dt>
+              <i aria-hidden="true" />
+              下行
+            </dt>
+            <dd>{known ? bytes(downlink) : '—'}</dd>
+            <dd className="usage-share">{known ? shareOf(downlink, total) : ''}</dd>
+          </div>
+        </dl>
+      </div>
+    </section>
+  );
+}
+
+// 额度按 +08 自然月统计，到月界重新计算，被系统停用的接入点也在此时恢复。月界取服务端返回的
+// month_end（+08 墙钟时刻），浏览器不另算一份；剩余天数随共享时钟更新。
+function QuotaReset({ monthEnd }: { monthEnd: string }) {
+  const now = useNow();
+  const resetAt = Date.parse(`${monthEnd.replace(' ', 'T')}+08:00`);
+  if (!Number.isFinite(resetAt) || resetAt <= now) return null;
+  const month = Number(monthEnd.slice(5, 7));
+  const days = Math.ceil((resetAt - now) / 86_400_000);
+  return (
+    <span
+      className="user-usage-reset"
+      title={`额度按 UTC+8 自然月统计，${month} 月 1 日 00:00 重新计算；被系统停用的接入点同时恢复`}
+    >
+      {month} 月 1 日重置
+      <span className="usage-dot" aria-hidden="true">
+        ·
+      </span>
+      {days} 天后
+    </span>
   );
 }
 
@@ -1675,6 +1930,22 @@ function UserList({
     const presenceTitle = userPresence?.sources.length
       ? userPresence.sources.map(source => source.ip).join(' · ')
       : presenceText;
+    // 用量行名称下方的接入情况。被配额执行器停用的接入点与已授权的分开：撤销后 grants 里
+    // 已没有这些记录，与授权卡的 held 判定相同。地区旗依次取已授权、被停用、线路全部的链。
+    const routeAccessOf = (app: SnapshotApp): QuotaRouteAccess => {
+      const chainOf = (id: string) => (app.chains ?? []).find(chain => chain.id === id);
+      const granted = mine.filter(column => column.app.id === app.id).map(column => column.ingress);
+      const grantedIds = new Set(granted.map(ingress => ingress.id));
+      const held = app.ingresses.filter(ingress => !grantedIds.has(ingress.id) && suspended.has(ingress.id));
+      const shown = granted.length > 0 ? granted : held.length > 0 ? held : app.ingresses;
+      const distinct = (values: (string | null | undefined)[]) =>
+        [...new Set(values)].filter((value): value is string => !!value);
+      return {
+        countries: distinct(shown.map(ingress => chainOf(ingress.chain)?.subscription_country)),
+        chains: distinct(granted.map(ingress => chainOf(ingress.chain)?.name || ingress.chain)),
+        suspended: held.map(ingress => chainOf(ingress.chain)?.name || ingress.chain),
+      };
+    };
     return (
       <section key={r.key} className="panel user-split-detail">
         <div className={`user-dhead${headCls ? ` ${headCls}` : ''}`}>
@@ -1913,18 +2184,21 @@ function UserList({
           </div>
         </div>
         <div className="user-dbody">
-          <section className="panel config-panel user-dcard">
+          {/* 用量与额度：左侧读数栏沿用用量页写法（本月合计、重置日、上下行），右侧每条线路一行。
+              合计已在读数栏，标题读数只写线路数。 */}
+          <section className="panel config-panel user-dcard user-usage-card">
             <header>
               <PanelTitle of="usage">用量与额度</PanelTitle>
               <span className="rt">
-                本月合计 <b className="user-usage-value">{usageText}</b> · {quotaRows.length} 条线路
+                <b>{quotaRows.length}</b> 条线路
               </span>
             </header>
-            <div className="user-dcard-body">
+            <div className="user-dcard-body user-usage">
+              <UserUsageLedger state={monthlyState} rows={use.rows} monthEnd={monthly.data?.month_end ?? null} />
               {quotaRows.length === 0 ? (
-                <span className="dim">尚未授权任何线路</span>
+                <span className="dim qta-empty">尚未授权任何线路</span>
               ) : (
-                <div className="qta">
+                <div className="qta" role="list" aria-label="各线路的用量与额度">
                   {quotaRows.map(q => (
                     <QuotaRow
                       key={q.app.id}
@@ -1933,6 +2207,7 @@ function UserList({
                       limit={q.limit}
                       over={q.over}
                       usageState={monthlyState}
+                      access={routeAccessOf(q.app)}
                       editable={editable}
                       busy={quota.isPending}
                       onSave={limit => quota.mutateAsync({ user: u, app: q.app.id, limit })}
@@ -1940,9 +2215,6 @@ function UserList({
                   ))}
                 </div>
               )}
-            </div>
-            <div className="user-dcard-foot">
-              <span>留空表示不限。</span>
             </div>
           </section>
 

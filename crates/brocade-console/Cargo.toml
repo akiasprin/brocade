@@ -19,6 +19,7 @@ sha2 = "0.10"
 subtle = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
 tower-http = { version = "0.6", features = ["fs"] }
 # ── 证书签发 ─────────────────────────────────────────────────────────────────────
 # 控制面第一次需要主动往外发请求（ACME 和 DNS 提供商），所以第一次有 HTTP 客户端。

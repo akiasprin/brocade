@@ -35,7 +35,8 @@ export function preloadPaneForHash(hash: string): Promise<unknown> {
  * authentication entry point. Invalid percent escapes and partial routes follow the router's
  * normal fallback and therefore do not start a speculative detail fetch. */
 export function initialNodeDetailFromHash(hash: string): string | null {
-  const parts = hash.replace(/^#\/?/, '').split('/').filter(Boolean);
+  // 查询段是观测时间范围（?range= / ?from=&to=），不属于机器标识。
+  const parts = hash.replace(/^#\/?/, '').split('?', 1)[0].split('/').filter(Boolean);
   if (parts.length !== 3 || parts[0] !== 'nodes' || parts[1] !== 'node') return null;
   try {
     const nodeId = decodeURIComponent(parts[2]).trim();

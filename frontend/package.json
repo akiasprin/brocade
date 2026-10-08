@@ -15,6 +15,7 @@
     "test:browser-appearance": "node --test scripts/browser-appearance-check.mjs",
     "test:routes": "node scripts/route-check.mjs && node scripts/route-drive.mjs && node scripts/route-drive.mjs --document-scroll",
     "test:react": "tsc --noEmit -p tsconfig.test.json && vitest run --config vitest.config.ts",
+    "perf:pages": "node scripts/page-performance.mjs",
     "format": "prettier --write src",
     "format:check": "prettier --check src"
   },

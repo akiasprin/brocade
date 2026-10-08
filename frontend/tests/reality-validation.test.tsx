@@ -1,9 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  realityFingerprintIsValid,
-  realityPublicKeyIsValid,
-  realityShortIdIsValid,
-} from '../src/reality';
+import { realityFingerprintIsValid, realityPublicKeyIsValid, realityShortIdIsValid } from '../src/reality';
 
 describe('REALITY field validation', () => {
   it('accepts exactly a canonical 32-byte base64url public key', () => {

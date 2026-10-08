@@ -453,6 +453,7 @@ dependencies = [
  "tokio-tungstenite",
  "tower",
  "tower-http",
+ "tracing",
  "x509-parser 0.17.0",
 ]
 
@@ -530,6 +531,7 @@ dependencies = [
  "brocade-deployment",
  "getrandom 0.3.4",
  "ipnet",
+ "log",
  "ring",
  "serde",
  "serde_json",

@@ -20,12 +20,33 @@ test('用户名册选中行使用中性卡面和弱边线且不再绘制高亮�
   assert.doesNotMatch(rosterStyles, /\.user-row\.picked::before/);
 });
 
-test('在线来源支持长 IPv6 和节点名称换行，地区在窄屏独占一行', () => {
-  assert.match(styles, /\.user-presence-source > code\s*\{[^}]*overflow-wrap:\s*anywhere;/);
-  assert.match(styles, /\.user-presence-source-nodes\s*\{[^}]*flex-wrap:\s*wrap;/);
+test('用量与额度：读数栏沿用用量页写法，线路行不铺底色，窄卡把读数栏移到上方', () => {
+  const users = readFileSync(new URL('../src/panes/users.tsx', import.meta.url), 'utf8');
+  const ledger = users.slice(users.indexOf('function UserUsageLedger('), users.indexOf('function QuotaReset('));
+  assert.match(ledger, /className="usage-split"/);
+  assert.match(ledger, /className="usage-io"/);
+  assert.doesNotMatch(users, /留空表示不限。/);
+
+  assert.match(styles, /\.qta-t > i\s*\{[^}]*background:\s*var\(--data\);/);
+  assert.match(styles, /\.qta-r\.warn \.qta-t > i\s*\{[^}]*background:\s*var\(--gold\);/);
+  assert.match(styles, /\.qta-r\.over \.qta-t > i\s*\{[^}]*background:\s*var\(--err\);/);
+  assert.doesNotMatch(styles, /\.qta-r(?:\.over|\.warn)?\s*\{[^}]*background:/);
+  assert.match(styles, /\.panel\.config-panel\.user-usage-card\s*\{[^}]*container:\s*user-usage \/ inline-size;/);
+  assert.match(
+    styles,
+    /@container user-usage \(max-width: 620px\)\s*\{[\s\S]*?\.user-usage\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);[\s\S]*?\.qta-r\s*\{[^}]*grid-template-areas:/,
+  );
+});
+
+test('在线接入时间线：IPv6 不截断，接入可换行，窄卡改为两行', () => {
+  assert.doesNotMatch(styles, /\.user-presence-ip > code\s*\{[^}]*(text-overflow:\s*ellipsis|white-space:\s*nowrap)/);
+  assert.match(styles, /\.user-presence-access\s*\{[^}]*flex-wrap:\s*wrap;/);
   assert.match(styles, /\.user-presence-node-link:focus-visible\s*\{[^}]*outline:/);
-  assert.match(styles, /\.user-presence-source-node-list\s*\{[^}]*flex-wrap:\s*wrap;/);
-  assert.match(styles, /\.user-presence-source-nodes-toggle:focus-visible\s*\{[^}]*outline:/);
-  assert.match(styles, /\.user-presence-location\s*\{[^}]*grid-column:\s*2 \/ -1;/);
-  assert.doesNotMatch(styles, /\.user-presence-meta\s*\{[^}]*(text-overflow:\s*ellipsis|white-space:\s*nowrap)/);
+  assert.match(styles, /\.user-presence-more:focus-visible\s*\{[^}]*outline:/);
+  assert.match(styles, /\.user-presence-sub\s*\{\s*display:\s*contents;/);
+  assert.match(
+    styles,
+    /@container user-presence \(max-width: 620px\)\s*\{[\s\S]*?\.user-presence-row\s*\{[^}]*grid-template-areas:/,
+  );
+  assert.match(styles, /\.user-presence-mark\s*\{[^}]*background:\s*var\(--ok\);/);
 });

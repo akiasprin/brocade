@@ -8,8 +8,10 @@
 import { useNow } from './clock';
 import type { NodeAgentStateItem } from '../api';
 
-// 超过该时间没有心跳即判定为掉线。agent 的 APPLY 周期为 15 秒，此处留四倍余量。
-const STALE_MS = 60_000;
+// 与服务端机器事件的确认窗口一致：agent 的 APPLY 周期为 15 秒，连续六轮没有领取期望
+// 状态后才确认控制面失联。此前界面用 60 秒、事件用 90 秒，同一台机器会先红约半分钟却
+// 没有对应事件，恢复后也无法解释这段差异。
+const STALE_MS = 90_000;
 
 export type AgentLiveness =
   { state: 'waiting' } | { state: 'polling'; onceOnline: boolean } | { state: 'online'; agoSec: number };

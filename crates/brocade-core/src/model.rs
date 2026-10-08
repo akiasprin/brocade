@@ -1226,8 +1226,8 @@ pub struct IngressGuard {
     /// Outbound SMTP. Abuse of this port is the most common cause of the machine's address being
     /// blacklisted, and ordinary clients do not send mail through a proxy.
     pub no_mail: bool,
-    /// The UDP services used for reflection attacks: chargen, DNS, NTP, SNMP, CLDAP, SSDP,
-    /// memcached. A subscriber reaches these deliberately only when running their own.
+    /// The UDP services used for reflection attacks: chargen, NTP, SNMP, CLDAP, SSDP and
+    /// memcached. DNS stays available because proxied system resolvers ordinarily use UDP/53.
     pub no_udp_amplification: bool,
     /// Everything UDP except 443. Off by default, because it also blocks games, voice, and every
     /// self-hosted UDP service. QUIC continues to work, since it runs on 443.
@@ -1239,7 +1239,7 @@ pub struct IngressGuard {
 pub(crate) const INGRESS_GUARD_MAIL_PORTS: [u16; 3] = [25, 465, 587];
 
 /// Fixed UDP amplification destinations emitted by [`IngressGuard::no_udp_amplification`].
-pub(crate) const INGRESS_GUARD_AMPLIFICATION_PORTS: [u16; 7] = [19, 53, 123, 161, 389, 1900, 11211];
+pub(crate) const INGRESS_GUARD_AMPLIFICATION_PORTS: [u16; 6] = [19, 123, 161, 389, 1900, 11211];
 
 impl Default for IngressGuard {
     fn default() -> Self {

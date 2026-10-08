@@ -14,7 +14,23 @@ struct WebhookEnvelope<'a> {
     event: &'a brocade_store::MachineEventView,
 }
 
-pub fn spawn(store: PgStore) {
+pub async fn spawn(store: PgStore) {
+    let webhook = webhook_from_env();
+    let channel_ready = match store
+        .configure_webhook_notification_channel(webhook.is_some())
+        .await
+    {
+        Ok(0) => true,
+        Ok(suppressed) => {
+            eprintln!("notifications: Webhook 未配置，已抑制 {suppressed} 条历史待投递事件");
+            true
+        }
+        Err(error) => {
+            eprintln!("notifications: 更新 Webhook 通道状态失败：{error}");
+            false
+        }
+    };
+
     let presence_store = store.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(PRESENCE_TICK);
@@ -28,9 +44,12 @@ pub fn spawn(store: PgStore) {
         }
     });
 
-    let Some(webhook) = webhook_from_env() else {
+    let Some(webhook) = webhook else {
         return;
     };
+    if !channel_ready {
+        return;
+    }
     let client = match Client::builder()
         .timeout(WEBHOOK_TIMEOUT)
         // A redirect to a different host would copy the event payload to an origin the operator
@@ -91,7 +110,9 @@ async fn deliver(
     let outcome = client
         .post(webhook.clone())
         .json(&WebhookEnvelope {
-            schema_version: 1,
+            // v2 adds structured sustained-metric incident fields and event kinds. A strict v1
+            // consumer must not mistake a cpu_steal transition for a presence transition.
+            schema_version: 2,
             event: &delivery.event,
         })
         .send()

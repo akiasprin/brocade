@@ -109,10 +109,34 @@ import {
 import { type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import { RegionFlag } from '../ui/region-flag';
-import { navigate, returnTo } from '../forge/route';
+import {
+  navigate,
+  navigateInPlace,
+  parse as parseRoute,
+  previousRouteHash,
+  returnTo,
+  subscribeRouteHistory,
+} from '../forge/route';
 import { cancelVisualTransition } from '../ui/motion';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import { OBSERVE_MS_UNIT, OBSERVE_SERIES_COLOR_VARS } from '../ui/observe-chart';
+import {
+  customLoadRange,
+  DEFAULT_LOAD_RANGE,
+  fixedLoadRange,
+  LOAD_RANGES,
+  loadRangeFromQuery,
+  loadRangeKey,
+  loadRangeQuery,
+  loadRangeTriggerText,
+  localDayStart,
+  MAX_LOAD_RANGE_SECS,
+  MIN_LOAD_RANGE_SECS,
+  observeZoomOut,
+  type LoadRange,
+  type LoadRangeQuery,
+} from '../ui/observe-range';
+import { ObserveBrushProvider } from '../ui/observe-brush';
 import { dur, iso, throughputAxis } from './telemetry-format';
 import { LOG_MAX_MIB, LOG_MIN_MIB, validLogMib } from '../ui/log-policy';
 import { isForwardTargetInChain } from './rule-graph';
@@ -193,7 +217,8 @@ function useNodeObservationModules(): NodeObservationModuleState {
 // `result` 只是创建流程返回的一次性响应，重新进入后不再存在（见 ProvisionInstall）。
 export type Drill =
   | { p: 'list' }
-  | { p: 'node'; id: string; tab?: 'config' }
+  // range / from / to 是地址栏里的观测时间范围（ui/observe-range.ts 的 LoadRangeQuery）。
+  | ({ p: 'node'; id: string; tab?: 'config' } & LoadRangeQuery)
   | { p: 'provision'; step: number }
   | { p: 'install'; node: string; step: number; result?: ProvisionNodeResult }
   | { p: 'chain'; id: string };
@@ -250,7 +275,13 @@ export function NodesPane({ win, bare = false }: { win: Win; bare?: boolean }) {
     ) : drill.p === 'chain' ? (
       <ChainStep id={drill.id} />
     ) : (
-      <NodeDetail id={drill.id} initialTab={drill.tab} go={go} sheeted={bare} />
+      <NodeDetail
+        id={drill.id}
+        initialTab={drill.tab}
+        rangeQuery={{ range: drill.range, from: drill.from, to: drill.to }}
+        go={go}
+        sheeted={bare}
+      />
     );
 
   // Provision and chain wizards own their full-width paper through WizardPaper. Wrapping them in
@@ -1196,43 +1227,15 @@ function NodeCard({
   );
 }
 
-export const LOAD_RANGES = [
-  { seconds: 30 * 60, label: '30m', menuLabel: '近 30 分钟', heading: '30 MINUTES' },
-  { seconds: 60 * 60, label: '1h', menuLabel: '近 1 小时', heading: '1 HOUR' },
-  { seconds: 6 * 60 * 60, label: '6h', menuLabel: '近 6 小时', heading: '6 HOURS' },
-  { seconds: 12 * 60 * 60, label: '12h', menuLabel: '近 12 小时', heading: '12 HOURS' },
-  { seconds: 24 * 60 * 60, label: '24h', menuLabel: '近 24 小时', heading: '24 HOURS' },
-] as const;
-export const DEFAULT_LOAD_RANGE: LoadRange = LOAD_RANGES[1];
+// 时间范围的定义（快速范围、固定区间、地址查询段）在 ui/observe-range.ts，路由与本页共用。
+export { DEFAULT_LOAD_RANGE, LOAD_RANGES, type LoadRange };
 const GRID_SECS = 30;
-export interface LoadRange {
-  seconds: number;
-  label: string;
-  menuLabel: string;
-  heading: string;
-  /** 存在时是固定历史区间；没有时是随当前时间移动的最近 N 秒。 */
-  startUnixSecs?: number;
-  endUnixSecs?: number;
-}
-
-const MAX_DETAIL_RANGE_SECS = 24 * 60 * 60;
-const MIN_DETAIL_RANGE_SECS = 60;
 
 export function loadRangeBounds(range: LoadRange): { startUnixSecs: number; endUnixSecs: number } {
   if (range.startUnixSecs != null && range.endUnixSecs != null) {
     return { startUnixSecs: range.startUnixSecs, endUnixSecs: range.endUnixSecs };
   }
   return absoluteLoadRange(range.seconds);
-}
-
-function loadRangeKey(range: LoadRange): string | number {
-  return range.startUnixSecs != null && range.endUnixSecs != null
-    ? `${range.startUnixSecs}-${range.endUnixSecs}`
-    : range.seconds;
-}
-
-function fixedLoadRange(range: LoadRange): boolean {
-  return range.startUnixSecs != null && range.endUnixSecs != null;
 }
 
 function absoluteLoadRange(seconds: number): { startUnixSecs: number; endUnixSecs: number } {
@@ -1358,12 +1361,20 @@ export function ObserveRangeControl({
   value,
   onChange,
   pending = false,
+  previous = null,
+  onReturn,
 }: {
   value: LoadRange;
   onChange: (value: LoadRange) => void;
   pending?: boolean;
+  /** 上一条浏览器历史是本机器的另一个时间范围时传入。返回按钮与浏览器后退是同一个动作。 */
+  previous?: LoadRange | null;
+  onReturn?: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  // 固定区间起止都在今天时按钮读数省略日期；跨过零点后随时钟重算。
+  const now = useNow();
+  const triggerText = loadRangeTriggerText(value, localDayStart(Math.floor(now / 1000)));
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const rootRef = useRef<HTMLSpanElement>(null);
@@ -1392,20 +1403,11 @@ export function ObserveRangeControl({
   const absoluteError =
     !Number.isFinite(fromSecs) || !Number.isFinite(toSecs)
       ? '请选择完整的起止时间'
-      : span < MIN_DETAIL_RANGE_SECS
+      : span < MIN_LOAD_RANGE_SECS
         ? '时间范围至少 1 分钟'
-        : span > MAX_DETAIL_RANGE_SECS
+        : span > MAX_LOAD_RANGE_SECS
           ? '时间范围最多 24 小时'
           : null;
-
-  const shortDateTime = (unixSecs: number) =>
-    new Date(unixSecs * 1000).toLocaleString('zh-CN', {
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    });
 
   useEffect(() => {
     if (!open) return;
@@ -1472,6 +1474,17 @@ export function ObserveRangeControl({
 
   return (
     <span ref={rootRef} className={`observe-range${open ? ' open' : ''}`}>
+      {previous && onReturn && (
+        <button
+          type="button"
+          className="btn observe-range-return"
+          aria-label={`返回上一个时间范围：${previous.menuLabel}`}
+          title={`返回上一个时间范围：${previous.menuLabel}（与浏览器后退相同）`}
+          onClick={onReturn}
+        >
+          <Icon of="back" size={14} className="nd-tool-icon" />
+        </button>
+      )}
       <button
         ref={triggerRef}
         type="button"
@@ -1496,7 +1509,7 @@ export function ObserveRangeControl({
         }}
       >
         <Icon of="calendar" size={14} className="nd-tool-icon observe-range-clock" />
-        <span>{value.menuLabel}</span>
+        <span>{triggerText}</span>
       </button>
       {open &&
         createPortal(
@@ -1573,15 +1586,7 @@ export function ObserveRangeControl({
                 className="observe-range-apply"
                 disabled={absoluteError !== null}
                 onClick={() => {
-                  const menuLabel = `${shortDateTime(fromSecs)} → ${shortDateTime(toSecs)}`;
-                  onChange({
-                    seconds: span,
-                    label: 'custom',
-                    menuLabel,
-                    heading: 'CUSTOM RANGE',
-                    startUnixSecs: fromSecs,
-                    endUnixSecs: toSecs,
-                  });
+                  onChange(customLoadRange(fromSecs, toSecs));
                   setOpen(false);
                   triggerRef.current?.focus();
                 }}
@@ -2073,6 +2078,7 @@ export function ThroughputPanel({
   const latestNic = latest.has_gap ? null : latest;
   const host = report.host;
   const nicTimes = series.map(sample => sample.window_end_unix_secs);
+  const nicWindowStarts = series.map(sample => sample.window_start_unix_secs);
   const nicRx = series.map(sample => (sample.has_gap ? null : sample.nic_rx_bps));
   const nicTx = series.map(sample => (sample.has_gap ? null : sample.nic_tx_bps));
   const drops = latestNic ? latestNic.nic_rx_drop + latestNic.nic_tx_drop + latestNic.nic_err : 0;
@@ -2125,6 +2131,7 @@ export function ThroughputPanel({
         <Suspense fallback={<ObservationReading ChartLoading={observationModules?.ObservationChartLoading} />}>
           <ThroughputChart
             timesUnixSecs={nicTimes}
+            windowStartsUnixSecs={nicWindowStarts}
             rangeStartUnixSecs={rangeStart}
             rangeEndUnixSecs={rangeEnd}
             rx={nicRx}
@@ -5204,11 +5211,14 @@ function NodeDetail({
   go,
   sheeted = false,
   initialTab = 'observed',
+  rangeQuery,
 }: {
   id: string;
   go: (d: Drill) => void;
   sheeted?: boolean;
   initialTab?: NodeTab;
+  /** 地址栏里的观测时间范围。 */
+  rangeQuery: LoadRangeQuery;
 }) {
   const { who } = useSession();
   const qc = useQueryClient();
@@ -5382,10 +5392,13 @@ function NodeDetail({
     if (!setTab(next)) return;
     window.requestAnimationFrame(() => document.getElementById(tabId(next))?.focus());
   };
-  const [loadRangeState, setLoadRangeState] = useState<{ id: string; range: LoadRange }>({
-    id,
-    range: DEFAULT_LOAD_RANGE,
-  });
+  /* 观测时间范围来自地址栏（route.ts 的 queryFields）。切换范围写一条浏览器历史，前进后退、
+     刷新、分享链接都保留所选时段。 */
+  const loadRange = useMemo(
+    () => loadRangeFromQuery({ range: rangeQuery.range, from: rangeQuery.from, to: rangeQuery.to }),
+    [rangeQuery.range, rangeQuery.from, rangeQuery.to],
+  );
+  const displayedRangeKey = loadRangeKey(loadRange);
   const [loadRangeTransition, setLoadRangeTransition] = useState<
     | { id: string; status: 'pending'; range: LoadRange }
     | { id: string; status: 'error'; range: LoadRange; error: unknown }
@@ -5400,6 +5413,24 @@ function NodeDetail({
     },
     [id],
   );
+  // 读取完成时据此确认范围在读取期间没有被前进后退改掉；改掉了就不再写入新的历史。
+  const displayedRange = useRef(displayedRangeKey);
+  useEffect(() => {
+    displayedRange.current = displayedRangeKey;
+  }, [displayedRangeKey]);
+  /* 页签不进地址栏。前进、后退到只差时间范围的历史项时切回观测页，否则按下后退界面没有变化；
+     其他页签未保存的内容已由路由在恢复前交给 confirmDiscardChanges 处理。范围由地址改变后，
+     进行中的读取不再适用。 */
+  const [shownRange, setShownRange] = useState({ id, key: displayedRangeKey });
+  if (shownRange.id !== id || shownRange.key !== displayedRangeKey) {
+    setShownRange({ id, key: displayedRangeKey });
+    if (shownRange.id === id) {
+      setLoadRangeTransition(null);
+      if (activeTab !== 'observed') setTabState({ id, tab: 'observed' });
+    }
+  }
+  // 当前历史项的来源。来源是本机器的另一个时间范围时，时间按钮旁显示返回按钮。
+  const fromHash = useSyncExternalStore(subscribeRouteHistory, previousRouteHash, () => null);
 
   /* 页头的稀有/危险操作（重签 token、退役下线）收进 ⋯ 菜单：它们的视觉权重原与
      使用频率成反比——最稀有的危险操作画着最抢眼的红框。菜单项可以带一行说明，
@@ -5490,19 +5521,21 @@ function NodeDetail({
   // 规则页同时承载机器 DNS 策略和链路规则，所以没有加入链路的机器也保留这一页；两块
   // 各自显示空状态，不能再把“无链路”等同于“没有规则页面”。
   const tab = activeTab;
-  const loadRange = loadRangeState.id === id ? loadRangeState.range : DEFAULT_LOAD_RANGE;
   const activeLoadRangeTransition = loadRangeTransition?.id === id ? loadRangeTransition : null;
-  const changeLoadRange = (range: LoadRange) => {
+  /** 返回 false 表示没有发起切换（与当前显示的范围相同）。 */
+  const changeLoadRange = (range: LoadRange): boolean => {
     const nextKey = loadRangeKey(range);
     if (activeLoadRangeTransition?.status === 'pending' && loadRangeKey(activeLoadRangeTransition.range) === nextKey)
-      return;
-    if (loadRangeKey(loadRange) === nextKey) {
+      return true;
+    if (displayedRangeKey === nextKey) {
       loadRangeTransitionVersion.current += 1;
       setLoadRangeTransition(null);
-      return;
+      return false;
     }
 
     const version = ++loadRangeTransitionVersion.current;
+    const fromKey = displayedRangeKey;
+    const current = () => loadRangeTransitionVersion.current === version && displayedRange.current === fromKey;
     setLoadRangeTransition({ id, status: 'pending', range });
     void Promise.all([
       qc.fetchQuery(nodeLoadRangeQuery(id, range)),
@@ -5510,18 +5543,36 @@ function NodeDetail({
       qc.fetchQuery(nodePingRangeQuery(id, range)),
     ]).then(
       () => {
-        if (loadRangeTransitionVersion.current !== version) return;
-        // All three keys now have data. The existing panels stay mounted until this single state
-        // update, then read the prepared cache together instead of exposing request completion order.
-        setLoadRangeState({ id, range });
+        if (!current()) return;
+        // All three keys now have data. Writing the address (one browser history entry) hands the
+        // new range back through the route; the mounted panels then read the prepared cache together
+        // instead of exposing request completion order.
+        navigateInPlace('nodes', { p: 'node', id, ...loadRangeQuery(range) });
         setLoadRangeTransition(null);
       },
       error => {
-        if (loadRangeTransitionVersion.current !== version) return;
+        if (!current()) return;
         setLoadRangeTransition({ id, status: 'error', range, error });
       },
     );
+    return true;
   };
+  /* 双击图表：跨度翻倍、两侧各加一半，结束不晚于当前时间。 */
+  const zoomOutLoadRange = () => {
+    const bounds = loadRangeBounds(loadRange);
+    const next = observeZoomOut(bounds.startUnixSecs, bounds.endUnixSecs, Math.floor(Date.now() / 1000));
+    if (next) changeLoadRange(customLoadRange(next.startUnixSecs, next.endUnixSecs));
+  };
+  const fromRoute = fromHash ? parseRoute(fromHash) : null;
+  const fromRange =
+    fromRoute?.nav === 'nodes' && fromRoute.drill?.p === 'node' && fromRoute.drill.id === id
+      ? loadRangeFromQuery(fromRoute.drill)
+      : null;
+  const previousRange = fromRange && loadRangeKey(fromRange) !== displayedRangeKey ? fromRange : null;
+  // 来源历史项恰好是这个地址，returnTo 走 history.back()，与浏览器后退相同。
+  const returnToPreviousRange = previousRange
+    ? () => returnTo('nodes', { p: 'node', id, ...loadRangeQuery(previousRange) })
+    : undefined;
   /* 同一观测页里的图表始终共享时间位置与 Tooltip，不再把页面级一致行为做成用户开关。 */
   const chartsLinked = true;
 
@@ -5591,6 +5642,8 @@ function NodeDetail({
               value={loadRange}
               pending={activeLoadRangeTransition?.status === 'pending'}
               onChange={changeLoadRange}
+              previous={previousRange}
+              onReturn={returnToPreviousRange}
             />
           )}
           {!pub && (
@@ -5816,40 +5869,48 @@ function NodeDetail({
               </button>
             </div>
           )}
-          {observationModules.status === 'ready' ? (
-            <LoadCardFor
-              nodeId={id}
-              range={loadRange}
-              linked={chartsLinked}
-              observationModules={observationModules.modules}
-            />
-          ) : (
-            <ObservationKpisState state={observationModules.status === 'error' ? 'error' : 'pending'} />
-          )}
-          {/* 吞吐（网卡 + XRAY）与 Ping（ICMP + TCP）分别同卡堆叠，两栏并排。 */}
-          <div className="nd-observe-throughput">
+          {/* 图上拖选放大、双击缩小，结果与时间按钮走同一个切换。 */}
+          <ObserveBrushProvider
+            rangeKey={displayedRangeKey}
+            pending={activeLoadRangeTransition?.status === 'pending'}
+            onSelect={(start, end) => changeLoadRange(customLoadRange(start, end))}
+            onZoomOut={zoomOutLoadRange}
+          >
             {observationModules.status === 'ready' ? (
-              <>
-                <ThroughputPanel
-                  nodeId={id}
-                  range={loadRange}
-                  linked={chartsLinked}
-                  observationModules={observationModules.modules}
-                />
-                <PingProbePanel
-                  nodeId={id}
-                  range={loadRange}
-                  linked={chartsLinked}
-                  observationModules={observationModules.modules}
-                />
-              </>
+              <LoadCardFor
+                nodeId={id}
+                range={loadRange}
+                linked={chartsLinked}
+                observationModules={observationModules.modules}
+              />
             ) : (
-              <>
-                <ThroughputPanelState state={observationModules.status === 'error' ? 'error' : 'pending'} />
-                <PingProbePanelState state={observationModules.status === 'error' ? 'error' : 'pending'} />
-              </>
+              <ObservationKpisState state={observationModules.status === 'error' ? 'error' : 'pending'} />
             )}
-          </div>
+            {/* 吞吐（网卡 + XRAY）与 Ping（ICMP + TCP）分别同卡堆叠，两栏并排。 */}
+            <div className="nd-observe-throughput">
+              {observationModules.status === 'ready' ? (
+                <>
+                  <ThroughputPanel
+                    nodeId={id}
+                    range={loadRange}
+                    linked={chartsLinked}
+                    observationModules={observationModules.modules}
+                  />
+                  <PingProbePanel
+                    nodeId={id}
+                    range={loadRange}
+                    linked={chartsLinked}
+                    observationModules={observationModules.modules}
+                  />
+                </>
+              ) : (
+                <>
+                  <ThroughputPanelState state={observationModules.status === 'error' ? 'error' : 'pending'} />
+                  <PingProbePanelState state={observationModules.status === 'error' ? 'error' : 'pending'} />
+                </>
+              )}
+            </div>
+          </ObserveBrushProvider>
           {/* Mux 与反向隧道来自同一条节点实时流，只建立一个 EventSource。两张卡都只在对应
               快照存在时渲染；计数基线留在浏览器内，不进入遥测历史或数据库。 */}
           <NodeRealtimeProvider nodeId={id}>

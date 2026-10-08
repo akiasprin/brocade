@@ -2686,7 +2686,8 @@
   --glass: rgba(255, 255, 255, 0.88);
   --glass-strong: rgba(255, 255, 255, 0.96);
   --float: color-mix(in srgb, var(--surface) 64%, transparent);
-  --float-sheet: color-mix(in srgb, var(--sheet) 64%, transparent);
+  /* 对话框底色亮色取 96%：背后是压暗的页面，64% 会把白底染成中灰，输入框与按钮反而比弹窗亮。 */
+  --float-sheet: color-mix(in srgb, var(--sheet) 96%, transparent);
   --float-filter: blur(20px) saturate(1.8);
   --float-edge: inset 0 1px 0 rgba(255, 255, 255, 0.1);
   --scrim: rgba(30, 30, 45, 0.4);
@@ -3481,8 +3482,8 @@ select {
 }
 
 /* ═══ 登录页 ═══
-   左侧品牌区（图标、字标、线路示意），右侧标题与表单直接落在台面上。登录、初始化与直达登录
-   共用这一版式（ui/login.tsx 的 LoginLayout）。
+   左侧品牌区（图标、字标、线路示意），右侧标题与表单落在台面上的一张卡片里。登录、初始化与
+   直达登录共用这一版式（ui/login.tsx 的 LoginLayout）。
    整页用 absolute 铺满而不是 fixed：与 #stage、.forge 一致，不把全屏容器注册为浏览器贴顶的
    fixed 取色来源。根文档不滚动，版式内部滚动，窄屏的初始化表单也能完整显示。 */
 .login-page {
@@ -3580,12 +3581,22 @@ select {
   place-items: center;
   padding: calc(32px + var(--safe-top)) calc(24px + var(--safe-right)) calc(32px + var(--safe-bottom)) 24px;
 }
+/* 卡片：卡面（亮色纯白，暗色为块档）加 1px 边框与纸投影，与台面拉开一档；输入框取 --sunk，
+   比卡面沉一档。内距写成变量，底部的备用路径据此铺到卡片边缘。 */
 .login-panel {
+  --login-pad-x: 28px;
+  --login-pad-bottom: 24px;
   display: flex;
-  width: min(340px, 100%);
+  width: min(396px, 100%);
+  box-sizing: border-box;
   flex-direction: column;
   gap: 18px;
   margin-top: -3vh;
+  padding: 28px var(--login-pad-x) var(--login-pad-bottom);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--card);
+  box-shadow: var(--sheet-shadow);
 }
 .login-title {
   margin: 0;
@@ -3657,15 +3668,22 @@ select {
   justify-content: center;
   font-size: 13.5px;
 }
+/* 备用路径收在卡片底部一条，以细线与主操作分开，左右与底边铺到卡片边缘 */
 .login-alt {
-  width: 100%;
-  height: 34px;
+  width: calc(100% + 2 * var(--login-pad-x));
+  height: 44px;
+  margin: 2px calc(-1 * var(--login-pad-x)) calc(-1 * var(--login-pad-bottom));
   border: 0;
-  border-radius: var(--r-ctl);
+  border-top: 1px solid var(--line);
+  border-radius: 0 0 calc(var(--r-card) - 1px) calc(var(--r-card) - 1px);
   background: transparent;
   color: var(--ink-3);
   font: 12.5px var(--sans);
   cursor: pointer;
+}
+.login-alt:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -2px;
 }
 @media (hover: hover) {
   .login-alt:hover:not(:disabled) {
@@ -3711,7 +3729,10 @@ select {
     padding: 28px calc(16px + var(--safe-right)) calc(28px + var(--safe-bottom)) calc(16px + var(--safe-left));
   }
   .login-panel {
+    --login-pad-x: 20px;
+    --login-pad-bottom: 20px;
     margin-top: 0;
+    padding-top: 24px;
   }
 }
 /* ═══ z2 窗口层 ═══ */
@@ -13086,27 +13107,25 @@ select.f.words {
   color: var(--ink-2);
   font-weight: 600;
 }
-/* 订阅与节点：同一个弹窗，标题栏切换页签，协议与地址族筛选两个页签共用。
-   正文不再套边框盒：订阅页签是「标题行 + 地址栏 + 读数」两段，节点页签是按链分组的行列表。
-   高度随内容，超过视口时只有正文滚动，标题栏、筛选与底栏保持可见（mask 是 fixed 居中，
-   卡片本身超出视口的部分无法滚动到）。 */
+/* 订阅与节点：同一个弹窗，标题栏切换页签（沿用机器详情页签 .nd-tabs），协议与地址族筛选两个页签共用。
+   标题行与筛选同在弹窗底色上，筛选行上下各一条分隔线；正文不套边框盒：订阅页签一个订阅一块
+   （图标列 │ 标题与说明 │ 读数），节点页签是「协议 │ IPv4 │ IPv6」的行列表，地址本身是复制按钮。
+   高度随内容，超过视口时只有正文滚动，标题栏、筛选与底栏保持可见。窄屏见本节末尾：贴底成为面板。 */
 .sub-dialog {
   display: flex;
-  width: min(720px, calc(100vw - 32px));
-  max-height: min(660px, calc(100dvh - 48px));
+  width: min(800px, calc(100vw - 32px));
+  max-height: min(680px, calc(100dvh - 48px));
   flex-direction: column;
   overflow: hidden;
 }
 .sub-dialog-head {
   display: flex;
-  min-height: 50px;
+  min-height: 54px;
   box-sizing: border-box;
   flex: none;
   align-items: center;
   gap: 10px;
   padding: 0 10px 0 16px;
-  border-bottom: 1px solid var(--line-soft);
-  background: var(--band);
 }
 .sub-dialog-user {
   min-width: 0;
@@ -13116,19 +13135,13 @@ select.f.words {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.sub-dialog-tabs {
+.sub-dialog-tabs::before {
+  content: '';
+  width: 1px;
+  height: 18px;
+  margin: auto 8px auto 0;
   flex: none;
-  margin-left: 6px;
-}
-.sub-dialog-tabs button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 12px;
-}
-.sub-dialog-tab-icon,
-.sub-dialog-tab-icon svg {
-  display: block;
+  background: var(--line);
 }
 .sub-dialog-close {
   display: grid;
@@ -13139,7 +13152,7 @@ select.f.words {
   margin-left: auto;
   padding: 0;
   border: 0;
-  border-radius: 6px;
+  border-radius: 7px;
   color: var(--ink-3);
   background: none;
   cursor: pointer;
@@ -13155,94 +13168,15 @@ select.f.words {
   align-items: center;
   gap: 8px 22px;
   padding: 10px 16px;
-  border-bottom: 1px solid var(--line-soft);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
 }
 .sub-dialog-field {
   display: inline-flex;
   align-items: center;
-  gap: 9px;
+  gap: 8px;
 }
-.sub-dialog-field > span:first-child {
-  color: var(--ink-4);
-  font-size: 11.5px;
-}
-.sub-dialog-filter .segsw button {
-  padding: 0 11px;
-  font-size: 12px;
-}
-.sub-dialog-body {
-  flex: 1;
-  min-height: 0;
-  padding: 18px 16px;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-}
-.sub-dialog-foot {
-  display: flex;
-  min-height: 38px;
-  box-sizing: border-box;
-  flex: none;
-  flex-wrap: wrap;
-  align-items: center;
-  padding: 6px 16px;
-  border-top: 1px solid var(--line-soft);
-  color: var(--ink-4);
-  font-size: 11px;
-}
-.sub-dialog-foot > span + span::before {
-  content: '·';
-  margin: 0 7px;
-  color: var(--line);
-}
-
-/* 订阅页签：两段之间只用一条发丝线分隔。 */
-.sub-section {
-  display: grid;
-  gap: 10px;
-}
-.sub-section + .sub-section {
-  margin-top: 20px;
-  padding-top: 16px;
-  border-top: 1px solid var(--line-soft);
-}
-.sub-section-head {
-  display: flex;
-  min-width: 0;
-  min-height: 26px;
-  align-items: center;
-  gap: 9px;
-}
-.sub-section-head > b {
-  flex: none;
-  color: var(--ink);
-  font: 600 13px var(--sans);
-}
-.sub-section-meta {
-  min-width: 0;
-  margin-left: auto;
-  overflow: hidden;
-  color: var(--ink-4);
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.sub-section-head > .sub-text-action,
-.sub-section-head > .sub-section-action {
-  margin-left: auto;
-}
-.sub-section-action {
-  min-height: 26px;
-  height: 26px;
-  padding: 0 10px;
-  font-size: 12px;
-}
-.sub-section-note {
-  margin: 0;
-  color: var(--ink-4);
-  font-size: 11.5px;
-  line-height: 1.55;
-}
-.sub-live {
+.sub-dialog-label {
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -13250,28 +13184,230 @@ select.f.words {
   font-size: 11.5px;
   white-space: nowrap;
 }
+/* Icon 的外层 span 与 svg 都按块排，避免行盒基线把图标顶偏。 */
+.sub-dialog-label > span,
+.sub-pick-label > span,
+.sub-url-copy > span,
+.node-copy-all > span,
+.sub-item-icon,
+.node-copy-icon,
+.sub-pick-chevron,
+.sub-dialog-label svg,
+.sub-pick-label svg,
+.sub-url-copy svg,
+.node-copy-all svg,
+.sub-item-icon svg,
+.node-copy-icon svg,
+.sub-pick-chevron svg {
+  display: block;
+}
+.sub-dialog-label > span,
+.sub-pick-label > span {
+  color: var(--ink-3);
+}
+.sub-dialog-filter .segsw {
+  min-height: 26px;
+}
+.sub-dialog-filter .segsw button {
+  padding: 0 10px;
+  font-size: 12px;
+}
+.sub-dialog-body {
+  flex: 1;
+  min-height: 0;
+  padding: 16px 16px 18px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.sub-dialog-foot {
+  display: flex;
+  min-height: 36px;
+  box-sizing: border-box;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 7px 16px;
+  border-top: 1px solid var(--line);
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.sub-dialog-foot > span + span::before {
+  content: '·';
+  margin: 0 7px;
+  opacity: 0.6;
+}
+
+/* 窄屏筛选的下拉：显示层 + 透明原生 select（16px，避免 iOS 聚焦放大）。 */
+.sub-pick {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  height: 44px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--btn);
+}
+.sub-pick-label {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink-4);
+  font-size: 13px;
+}
+.sub-pick-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font: 500 14px var(--sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sub-pick-chevron {
+  flex: none;
+  color: var(--ink-3);
+}
+.sub-pick > select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  font-size: 16px;
+  cursor: pointer;
+}
+.sub-pick:focus-within {
+  outline: 2px solid var(--action);
+  outline-offset: 1px;
+}
+
+/* 订阅：一个订阅一块。图标列让标题之下的内容整体缩进，两块之间一条整宽分隔线。 */
+.sub-item {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  column-gap: 12px;
+}
+.sub-item + .sub-item {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
+.sub-item-icon {
+  padding-top: 1px;
+  color: var(--ink-3);
+}
+.sub-item-head {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 16px;
+}
+.sub-item-title {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+  gap: 4px;
+}
+.sub-item-name {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+.sub-item-name > b {
+  color: var(--ink);
+  font: 600 14px/18px var(--sans);
+}
+.sub-item-sub {
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.sub-item-action {
+  flex: none;
+  min-height: 26px;
+  height: 26px;
+  margin-top: -3px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+.sub-item-body {
+  grid-column: 2;
+  min-width: 0;
+  margin-top: 12px;
+}
+.sub-item-body > .callout {
+  margin-top: 8px;
+}
+.sub-item-note {
+  margin: 8px 0 0;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+/* 读数：标签在上、数值在下，右对齐 */
+.sub-readings {
+  display: flex;
+  flex: none;
+  gap: 24px;
+  margin: 0;
+}
+.sub-readings > div {
+  display: grid;
+  justify-items: end;
+  gap: 3px;
+}
+.sub-readings dt {
+  color: var(--ink-4);
+  font-size: 11px;
+  line-height: 14px;
+}
+.sub-readings dd {
+  margin: 0;
+  color: var(--ink);
+  font: 500 13px/18px var(--sans);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.sub-readings dd.bad {
+  color: var(--err);
+}
+/* 状态：字中性，颜色只在圆点上；尚未生成为空心点 */
+.sub-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
 .sub-live::before {
   content: '';
   width: 6px;
   height: 6px;
+  flex: none;
   border-radius: 50%;
-  background: var(--ink-4);
-}
-.sub-live.ok {
-  color: var(--ok);
+  box-shadow: inset 0 0 0 1.5px var(--ink-4);
 }
 .sub-live.ok::before {
   background: var(--ok);
+  box-shadow: none;
 }
 .sub-live.warn {
   color: var(--gold);
 }
 .sub-live.warn::before {
   background: var(--gold);
+  box-shadow: none;
 }
 .sub-text-action {
   flex: none;
-  padding: 3px 6px;
+  padding: 3px 7px;
   border: 0;
   border-radius: 5px;
   color: var(--action);
@@ -13283,48 +13419,55 @@ select.f.words {
 .sub-text-action:hover:not(:disabled) {
   background: var(--action-wash);
 }
-.sub-text-action.danger {
-  color: var(--err);
-}
-.sub-text-action.danger:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--err) 9%, transparent);
-}
 .sub-text-action:disabled {
   cursor: wait;
   opacity: 0.6;
 }
+/* 地址框：遮住的 Token 降一档墨色；「显示」是幽灵按钮，「复制」带边框 */
 .sub-url {
-  display: grid;
+  display: flex;
   height: 38px;
   box-sizing: border-box;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  overflow: hidden;
+  align-items: center;
+  gap: 2px;
+  padding: 0 4px 0 12px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--sunk);
 }
 .sub-url code {
-  align-self: center;
+  flex: 1;
   min-width: 0;
-  padding: 0 12px;
   overflow: hidden;
   color: var(--ink-2);
   font: 11.5px var(--mono);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.sub-url-mask {
+  color: var(--ink-4);
+  letter-spacing: -0.06em;
+}
 .sub-url > button {
-  min-width: 58px;
-  padding: 0 12px;
-  border: 0;
-  border-left: 1px solid var(--line);
+  display: inline-flex;
+  height: 28px;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
   color: var(--ink-3);
-  background: var(--btn);
-  font-size: 12px;
+  font: 12px var(--sans);
+  white-space: nowrap;
   cursor: pointer;
 }
 .sub-url > .sub-url-copy {
-  min-width: 72px;
+  margin-left: 2px;
+  padding: 0 10px 0 9px;
+  border-color: var(--line);
+  background: var(--btn);
   color: var(--ink-2);
 }
 .sub-url > .sub-url-copy.done {
@@ -13336,42 +13479,20 @@ select.f.words {
 @media (hover: hover) {
   .sub-url > button:hover:not(:disabled) {
     color: var(--ink);
+    background: var(--hover-2);
+  }
+  .sub-url > .sub-url-copy:hover:not(:disabled) {
     background: var(--btn-h);
   }
 }
-.sub-readings {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 24px;
-  margin: 0;
-}
-.sub-readings > div {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-}
-.sub-readings dt {
-  color: var(--ink-4);
-  font-size: 11.5px;
-}
-.sub-readings dd {
-  margin: 0;
-  color: var(--ink-2);
-  font: 500 12px var(--sans);
-  font-variant-numeric: tabular-nums;
-}
-.sub-readings dd.bad {
-  color: var(--err);
-}
 
-/* 节点页签：一条链一组；一种协议一行，IPv4 / IPv6 是这一行的两个复制按钮。
-   未列出的条目（前置代理、自签证书）写在列表之前。 */
+/* 节点：工具行 → 说明 → 「协议 │ IPv4 │ IPv6」行列表。未列出的条目与自签节点写在列表之前。 */
 .node-toolbar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  margin: -4px 0 14px;
+  margin: 0 0 10px;
 }
 .node-toolbar > .sp {
   flex: 1;
@@ -13385,58 +13506,6 @@ select.f.words {
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
-.node-insecure {
-  display: inline-flex;
-  height: 26px;
-  box-sizing: border-box;
-  align-items: center;
-  gap: 7px;
-  padding: 0 9px 0 7px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-ctl);
-  color: var(--ink-3);
-  background: var(--btn);
-  font-size: 12px;
-  white-space: nowrap;
-  cursor: pointer;
-}
-.node-insecure-switch {
-  position: relative;
-  width: 24px;
-  height: 14px;
-  box-sizing: border-box;
-  flex: none;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--sunk);
-}
-.node-insecure-switch::after {
-  content: '';
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--ink-4);
-}
-.node-insecure[aria-pressed='true'] {
-  border-color: color-mix(in srgb, var(--gold) 45%, var(--line));
-  color: var(--gold);
-  background: color-mix(in srgb, var(--gold) 8%, var(--btn));
-}
-.node-insecure[aria-pressed='true'] .node-insecure-switch {
-  border-color: color-mix(in srgb, var(--gold) 55%, var(--line));
-  background: color-mix(in srgb, var(--gold) 14%, var(--sunk));
-}
-.node-insecure[aria-pressed='true'] .node-insecure-switch::after {
-  background: var(--gold);
-  transform: translateX(10px);
-}
-.node-insecure:focus-visible {
-  outline: 2px solid var(--action);
-  outline-offset: 2px;
-}
 .node-view {
   min-height: 26px;
 }
@@ -13447,33 +13516,28 @@ select.f.words {
 .node-copy-all {
   min-height: 26px;
   height: 26px;
+  gap: 6px;
   padding: 0 10px;
   font-size: 12px;
 }
 .node-notes {
   display: grid;
-  gap: 4px;
-  margin: -4px 0 14px;
-  padding: 7px 10px;
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--ink) 4%, transparent);
+  gap: 6px;
+  margin: 0 0 12px;
 }
 .node-notes > p {
   display: flex;
   min-width: 0;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   margin: 0;
   color: var(--ink-3);
   font-size: 11.5px;
-  line-height: 1.45;
+  line-height: 1.5;
 }
 .node-note-text {
   flex: 1;
   min-width: 0;
-}
-.node-notes > p.warn {
-  color: var(--gold);
 }
 .node-note-icon,
 .node-note-icon svg {
@@ -13481,19 +13545,43 @@ select.f.words {
   flex: none;
   color: var(--ink-4);
 }
-.node-notes > p.warn .node-note-icon {
-  color: var(--gold);
+.node-note-icon {
+  margin-top: 2px;
 }
-.node-groups {
+.node-notes > p > .sub-text-action {
+  margin: -3px -7px -3px 0;
+}
+.node-matrix {
+  --node-cols: 172px 176px minmax(0, 1fr);
+}
+.node-matrix.single {
+  --node-cols: 172px minmax(0, 1fr);
+}
+.node-matrix-head,
+.node-row {
   display: grid;
-  gap: 14px;
+  grid-template-columns: var(--node-cols);
+  align-items: center;
+  gap: 6px;
+  padding-left: 23px;
+}
+.node-matrix-head {
+  height: 20px;
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+}
+.node-matrix-head > span + span {
+  padding-left: 9px;
+}
+.node-group + .node-group {
+  margin-top: 6px;
 }
 .node-group-head {
   display: flex;
   min-width: 0;
+  height: 30px;
   align-items: center;
   gap: 8px;
-  margin-bottom: 3px;
 }
 .node-group-head .geo-flag {
   border-radius: 2px;
@@ -13510,12 +13598,7 @@ select.f.words {
 /* 行首缩进 23px（15px 地区旗 + 8px 间距），与组名文字左缘对齐；行间分隔线从同一位置起画。 */
 .node-row {
   position: relative;
-  display: grid;
-  grid-template-columns: 76px minmax(0, 1fr) minmax(0, 1.2fr) auto;
-  align-items: center;
-  gap: 10px;
   min-height: 36px;
-  padding-left: 23px;
 }
 .node-row + .node-row::before {
   content: '';
@@ -13523,24 +13606,30 @@ select.f.words {
   top: 0;
   right: 0;
   left: 23px;
-  border-top: 1px solid var(--line-soft);
+  border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
 }
 .node-protocol {
-  color: var(--ink-2);
-  font: 500 12px var(--sans);
-  white-space: nowrap;
-}
-.node-stack {
   display: flex;
   min-width: 0;
-  align-items: center;
+  align-items: baseline;
   gap: 8px;
   overflow: hidden;
-  color: var(--ink-3);
-  font-size: 11.5px;
   white-space: nowrap;
 }
-.node-stack em {
+.node-protocol > b {
+  flex: none;
+  color: var(--ink-2);
+  font: 500 12px var(--sans);
+}
+.node-protocol > span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 11px;
+  text-overflow: ellipsis;
+}
+.node-protocol > em {
+  align-self: center;
   padding: 0 5px;
   border-radius: 4px;
   color: var(--gold);
@@ -13548,41 +13637,73 @@ select.f.words {
   font: 10px/16px var(--mono);
   font-style: normal;
 }
-.node-endpoint {
+.node-copy {
+  display: flex;
+  min-width: 0;
+  height: 28px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 0 9px;
+  border: 1px solid transparent;
+  border-radius: var(--r-ctl);
+  background: none;
+  color: var(--ink-2);
+  font: 11.5px var(--mono);
+  text-align: left;
+  cursor: pointer;
+}
+.node-copy-family {
+  display: none;
+  flex: none;
+  color: var(--ink-4);
+  font: 10px var(--mono);
+  font-style: normal;
+}
+.node-copy-endpoint {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+}
+.node-copy-host {
   min-width: 0;
   overflow: hidden;
-  color: var(--ink-4);
-  font: 11px var(--mono);
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
-.node-copies {
-  display: grid;
-  grid-template-columns: repeat(var(--node-slots, 2), 70px);
-  gap: 6px;
+.node-copy-port {
+  flex: none;
 }
-.node-copy {
-  height: 26px;
-  box-sizing: border-box;
-  padding: 0 8px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-ctl);
-  color: var(--ink-2);
-  background: var(--btn);
-  font-size: 11.5px;
-  white-space: nowrap;
-  cursor: pointer;
+.node-copy-icon {
+  flex: none;
+  color: var(--ink-4);
 }
 @media (hover: hover) {
   .node-copy:hover:not(:disabled) {
-    border-color: color-mix(in srgb, var(--action) 45%, var(--line));
+    border-color: var(--line);
+    background: var(--btn);
+    color: var(--ink);
+  }
+  .node-copy:hover:not(:disabled) .node-copy-icon {
     color: var(--action);
-    background: var(--action-wash);
   }
 }
-.node-copy.done {
-  border-color: color-mix(in srgb, var(--ok) 45%, var(--line));
+.node-copy:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -1px;
+}
+.node-copy.done,
+.node-copy.done .node-copy-icon {
   color: var(--ok);
+}
+.node-copy.failed,
+.node-copy.failed .node-copy-icon {
+  color: var(--err);
+}
+.node-copy-gap {
+  padding-left: 9px;
+  color: var(--ink-4);
+  font: 11.5px var(--mono);
 }
 .node-empty {
   padding: 36px 0;
@@ -13596,57 +13717,197 @@ select.f.words {
   border-radius: 8px;
   font-size: 11.5px;
 }
-@media (max-width: 720px) {
-  /* 窄屏铺满；筛选的两组分段控件各占一行、按格等分。 */
-  .sub-dialog {
-    width: calc(100vw - 16px);
-    max-height: calc(100dvh - 24px);
+/* 窄屏（≤820px，与 ui/viewport.ts 的 NARROW_MAX 一致）：弹窗贴底成为面板，宽度铺满、上方两角圆角，
+   高度随内容、最高留出顶部安全区；筛选由组件换成一行两个下拉；地址框整段换行显示，「显示」「复制」
+   落到框底各占一半；按钮与复制目标放大到触屏尺寸。 */
+@media (max-width: 820px) {
+  .dialog-layer.modal:has(> .sub-dialog) {
+    place-items: end stretch;
+    padding: max(24px, var(--safe-top)) 0 0;
+  }
+  .dialog-layer.modal > .dialog-surface.sub-dialog {
+    width: 100%;
+    max-width: none;
+    max-height: calc(100dvh - max(24px, var(--safe-top)));
+    box-sizing: border-box;
+    border-width: 1px 0 0;
+    border-radius: 16px 16px 0 0;
+  }
+  .dialog-layer.modal[data-motion-state='entering'] > .dialog-surface.sub-dialog {
+    animation-name: sub-sheet-in;
+  }
+  .dialog-layer.modal[data-motion-state='exiting'] > .dialog-surface.sub-dialog {
+    animation-name: sub-sheet-out;
   }
   .sub-dialog-head {
-    padding-left: 12px;
+    min-height: 58px;
+    padding: 0 8px 0 14px;
+  }
+  .sub-dialog-tabs button {
+    height: 40px;
+    padding: 0 12px;
+    font-size: 14px;
+  }
+  .sub-dialog-close {
+    width: 40px;
+    height: 40px;
   }
   .sub-dialog-filter {
     display: grid;
-    gap: 8px;
-    padding: 10px 12px;
-  }
-  .sub-dialog-field {
-    display: grid;
-    grid-template-columns: 44px minmax(0, 1fr);
-  }
-  .sub-dialog-field .segsw {
-    display: grid;
-    grid-auto-columns: minmax(0, 1fr);
-    grid-auto-flow: column;
-  }
-  .sub-dialog-field .segsw button {
-    padding: 0 4px;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 10px;
+    padding: 10px 14px;
   }
   .sub-dialog-body {
-    padding: 16px 12px;
+    padding: 16px 14px 20px;
   }
-  .sub-section-meta,
-  .node-endpoint {
+  .sub-dialog-foot {
+    display: grid;
+    gap: 2px;
+    padding: 10px 14px calc(10px + var(--safe-bottom));
+    font-size: 12px;
+  }
+  .sub-dialog-foot > span + span::before {
+    content: none;
+  }
+  .sub-item-head {
+    flex-wrap: wrap;
+  }
+  .sub-item-name > b {
+    font-size: 15px;
+    line-height: 20px;
+  }
+  .sub-item-sub {
+    font-size: 13px;
+  }
+  .sub-readings {
+    order: 3;
+    width: 100%;
+  }
+  .sub-readings > div {
+    justify-items: start;
+  }
+  .sub-readings dt {
+    font-size: 12px;
+  }
+  .sub-readings dd {
+    font-size: 14px;
+  }
+  .sub-item-note {
+    font-size: 12.5px;
+  }
+  .sub-item-action {
+    min-height: 44px;
+    height: 44px;
+    margin-top: -10px;
+    padding: 0 14px;
+    font-size: 14px;
+  }
+  .sub-url {
+    display: grid;
+    height: auto;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+      'code code'
+      'reveal copy';
+    gap: 0;
+    padding: 0;
+    overflow: hidden;
+    border-radius: 10px;
+  }
+  .sub-url code {
+    grid-area: code;
+    padding: 11px 12px;
+    overflow: visible;
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: normal;
+    word-break: break-all;
+  }
+  .sub-url > button,
+  .sub-url > .sub-url-copy {
+    height: 44px;
+    justify-content: center;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-top: 1px solid var(--line);
+    border-radius: 0;
+    background: var(--btn);
+    font-size: 14px;
+  }
+  .sub-url > .sub-url-reveal {
+    grid-area: reveal;
+  }
+  .sub-url > .sub-url-copy {
+    grid-area: copy;
+    border-left: 1px solid var(--line);
+    color: var(--ink);
+    font-weight: 500;
+  }
+  .node-count {
+    font-size: 13px;
+  }
+  .node-view button {
+    padding: 0 14px;
+    font-size: 13.5px;
+  }
+  .node-copy-all {
+    min-height: 44px;
+    height: 44px;
+    padding: 0 14px;
+    font-size: 14px;
+  }
+  .node-notes > p {
+    font-size: 12.5px;
+  }
+  .node-notes > p > .sub-text-action {
+    margin: -9px -10px -9px 0;
+    padding: 9px 10px;
+    font-size: 13px;
+  }
+  .node-matrix-head,
+  .node-copy-gap {
     display: none;
   }
+  .node-group-head {
+    height: 36px;
+  }
+  .node-group-head > b {
+    font-size: 14px;
+  }
   .node-row {
-    grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-areas:
-      'protocol copies'
-      'stack copies';
-    gap: 1px 10px;
-    padding: 6px 0 6px 23px;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+    padding: 8px 0 8px 23px;
   }
-  .node-protocol {
-    grid-area: protocol;
+  .node-protocol > b {
+    font-size: 13px;
   }
-  .node-stack {
-    grid-area: stack;
+  .node-protocol > span {
+    font-size: 12px;
+  }
+  .node-copy {
+    height: 40px;
+    margin-left: -9px;
+    font-size: 12.5px;
+  }
+  .node-copy-family {
+    display: inline;
+    width: 36px;
     font-size: 11px;
   }
-  .node-copies {
-    grid-area: copies;
-    grid-template-columns: repeat(var(--node-slots, 2), 64px);
+}
+@keyframes sub-sheet-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 32px, 0);
+  }
+}
+@keyframes sub-sheet-out {
+  to {
+    opacity: 0;
+    transform: translate3d(0, 32px, 0);
   }
 }
 /* 产物侧栏展开时，台面和画布让出右侧宽度。
@@ -14077,7 +14338,7 @@ body.has-artpanel .topo-deck {
   overflow: hidden;
 }
 
-/* ── 顶栏：导航 + 两个面板开关 + 修订号。其余收入「⋯」 ── */
+/* ── 顶栏：主导航 + 通知 + 账户。低频面板和设置收入账户菜单 ── */
 .fg-top {
   position: relative;
   flex: 0 0 auto;
@@ -14187,8 +14448,7 @@ body.has-artpanel .topo-deck {
   background: var(--primary-on);
 }
 
-/* 面板开关：产物为展开/收起，诊断为气泡。两者只显示图标，名称放在悬停提示和读屏文字里；
-   诊断计数压在图标右上角——面板收起后，是否有待查看的内容仍需可见。
+/* 顶栏通知开关只显示图标，名称放在悬停提示和读屏文字里；计数压在图标右上角。
    样式与主导航同一套无框写法：悬停出底色，展开或按下取操作色洗色。 */
 .fg-tgl {
   position: relative;
@@ -14680,6 +14940,179 @@ body.has-artpanel .topo-deck {
   backdrop-filter: var(--float-filter);
   box-shadow: var(--float-edge), var(--shadow);
   overflow: hidden;
+}
+
+/* 全局机器通知中心。它复用顶栏气泡的表面、动画和按钮语义，但内容是持久事故记录而非
+   瞬时 toast：操作者离开机器页或故障已经恢复后，事件仍能从任意页面找回。 */
+.machine-notification-pop {
+  width: min(540px, 88vw);
+  min-width: min(420px, 88vw);
+}
+.machine-notification-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 8px 13px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.machine-notification-head > span:first-child {
+  display: grid;
+  gap: 2px;
+}
+.machine-notification-head b {
+  font-size: 12.5px;
+  color: var(--ink);
+}
+.machine-notification-head small {
+  font-size: 10.5px;
+  color: var(--ink-4);
+}
+.machine-notification-body {
+  max-height: min(660px, 72vh);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.machine-notification-group {
+  padding: 11px 13px 12px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.machine-notification-group.active {
+  background: color-mix(in srgb, var(--err) 6%, transparent);
+}
+.machine-notification-group > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.machine-notification-group > header > span:nth-child(2) {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.machine-notification-group b,
+.machine-notification-ip b {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+}
+.machine-notification-group small,
+.machine-notification-ip small {
+  color: var(--ink-4);
+  font-size: 10.5px;
+}
+.machine-notification-state {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 12%, transparent);
+}
+.machine-notification-group.active .machine-notification-state {
+  background: var(--err);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--err) 13%, transparent);
+}
+.machine-notification-new {
+  padding: 2px 6px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--gold) 14%, transparent);
+  color: var(--gold);
+  font: 9.5px/1.2 var(--mono);
+}
+.machine-notification-window {
+  margin: 7px 0 7px 15px;
+  color: var(--ink-3);
+  font: 10.5px/1.45 var(--mono);
+}
+.machine-notification-nodes {
+  display: grid;
+  gap: 2px;
+  margin-left: 15px;
+}
+.machine-notification-nodes button,
+.machine-notification-ip {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  border-radius: var(--r-ctl);
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  text-align: left;
+}
+.machine-notification-nodes button {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 7px;
+}
+.machine-notification-nodes button > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+.machine-notification-nodes button small {
+  white-space: nowrap;
+}
+.machine-notification-history > h3 {
+  margin: 0;
+  padding: 10px 13px 6px;
+  color: var(--ink-4);
+  font: 10px/1.4 var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.machine-notification-ip {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 13px;
+}
+.machine-notification-ip > span:nth-child(2) {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.machine-notification-ip time {
+  color: var(--ink-4);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.machine-notification-empty {
+  padding: 28px 18px;
+  color: var(--ink-4);
+  font-size: 12px;
+  text-align: center;
+}
+.machine-notification-more {
+  display: flex;
+  justify-content: center;
+  padding: 9px 13px 11px;
+  border-top: 1px solid var(--line-soft);
+}
+.machine-notification-more button {
+  min-height: 30px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  background: transparent;
+  color: var(--action);
+  cursor: pointer;
+  font-size: 11.5px;
+}
+@media (hover: hover) {
+  .machine-notification-nodes button:hover,
+  .machine-notification-ip:hover,
+  .machine-notification-more button:hover {
+    background: var(--hover);
+    color: var(--ink);
+  }
 }
 
 /* ══ 诊断面板（ui/diag-table.tsx）══
@@ -15439,15 +15872,15 @@ body.fg-dragging * {
    本段实现的是 forge 的对应形态：改变布局形态，而非压缩桌面布局。
    ═══════════════════════════════════════════════════════════════════ */
 @media (max-width: 820px) {
-  /* ─── 导航行：品牌 + 三个高频页面 + 诊断 + ⋯（44px）───
+  /* ─── 导航行：品牌 + 两个高频页面 + 通知 + 账户（44px）───
      此处原为「品牌 / 产物 / 诊断 / ⋯」，导航位于屏幕底部的 tab bar。
      该布局共三层：顶栏 53 + 面包屑 35 + tab bar 52 = 140px，占 844 屏高的 16.6%。
      随后导航上移为独立一行（45 + 41 = 86px），再并入导航行剩一行；面包屑那一行
      （`.fg-backrow`：‹ 返回 + 当前层级名称）现已一并去掉，窄屏头部固定 44px，
      不随下钻变高。理由见 shell.tsx 中对应位置的说明。
 
-     该行移除的内容：「产物」（窄屏下它是全屏覆盖层，不是随手查看的内容，收入「⋯」），
-     以及修订读数 `r77 · 3 台待发`——同一信息由「发布」按钮上的角标承担。 */
+     该行移除的内容：「产物」「诊断」（都是按需查看的辅助面板，收入账户菜单），以及修订
+     读数 `r77 · 3 台待发`——同一信息由菜单中的「发布」状态承担。 */
   .fg-top {
     height: 44px;
     flex-wrap: nowrap;
@@ -15470,7 +15903,7 @@ body.fg-dragging * {
     font-size: 15px;
     letter-spacing: 0.015em;
   }
-  /* 窄屏的诊断图标与宽屏产物、诊断同一套无框写法。 */
+  /* 窄屏的通知图标与宽屏通知使用同一套无框写法。 */
   .fg-ico {
     flex: none;
     position: relative;
@@ -15521,8 +15954,8 @@ body.fg-dragging * {
   /* ─── 页面导航：并入导航行，位于品牌右侧 ───
      flex:1 吃掉品牌与图标之间的全部空间，min-width:0 + overflow-x 用于兜底——
      按钮本身直接复用桌面端 .fg-nv：同样的图标、28px 高度、内距和实心选中态；
-     移动端只负责横向滚动，不再维护第二套按钮视觉。发布和用量收入更多菜单后，
-     三个高频入口可以保留图标和文字。 */
+     移动端只负责横向滚动，不再维护第二套按钮视觉。用户、隧道、发布和用量收入账户菜单后，
+     两个高频入口可以保留图标和文字。 */
   .fg-facebar {
     flex: 1;
     min-width: 0;
@@ -18549,121 +18982,371 @@ h4.sec > .btn {
 .lst-acts .sp {
   flex: 1;
 }
-/* ── 额度：一个项目一行，显示已用量和额度 ──
-   进度条只在设置了额度时绘制。未设额度时绘制空槽会被理解为用量为零，
-   而实际含义是不限量，两者不应使用同一标识。 */
-/* 用量卡：一个项目一张，与授权卡结构相同（相同的网格、圆角和内距）——
-   展开块内只有用量和授权两部分，外观一致才能表明它们是并列的两组，
-   而非一个表格加一组卡片。
-
-   已用量和额度是同一比值的分子与分母，因此放在同一张卡内：分置两处时，
-   项目增多后需要自行配对，容易对应错误。数字表示精确值，进度条表示接近额度的程度。 */
-.qta {
+/* ── 用户详情 · 用量与额度 ──
+   一张子卡分两栏：左侧读数栏沿用用量页的 .usage-split / .usage-io（本月合计、重置日、上下行组成），
+   右侧每条线路一行。两栏铺满卡片内距以外的区域，竖线从标题色带下沿画到卡片底边。
+   容器查询挂在卡片上：@container 只能改写后代，正文网格要随卡宽切换。 */
+.panel.config-panel.user-usage-card {
+  container: user-usage / inline-size;
+}
+.user-usage {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(196px, 1fr));
-  gap: 8px;
-  margin-top: 4px;
+  grid-template-columns: 236px minmax(0, 1fr);
+  margin: -11px -13px;
 }
-.qta-r {
+.user-usage-ledger {
   display: flex;
-  flex-direction: column;
-  gap: 3px;
   min-width: 0;
-  padding: 9px 11px 10px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-card);
-  background: var(--sunk);
+  box-sizing: border-box;
+  flex-direction: column;
+  gap: 16px;
+  padding: 16px 18px 15px 16px;
+  border-right: 1px solid var(--line-soft);
 }
-.qta-head {
+.user-usage-hero {
+  display: grid;
+}
+.user-usage-hero-label {
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 16px;
+}
+/* 合计用无衬线比例数字，与用量页读数栏一致；等宽数字在大字号下字距松散。 */
+.user-usage-hero-value {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: 6px;
+  margin-top: 8px;
+  color: var(--ink);
+  font: 600 34px/1 var(--sans);
+  letter-spacing: -0.035em;
+  white-space: nowrap;
+}
+.user-usage-hero-value small {
+  color: var(--ink-3);
+  font: 500 14px/1 var(--sans);
+  letter-spacing: 0;
+}
+/* 读取中、不可用、无样本时只是一行状态文字，不放大。 */
+.user-usage-hero-value.none {
+  margin-top: 10px;
+  color: var(--ink-3);
+  font: 500 20px/1 var(--sans);
+  letter-spacing: 0;
+}
+.user-usage-reset {
+  margin-top: 9px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  line-height: 16px;
+  cursor: default;
+}
+.user-usage-reset .usage-dot {
+  margin: 0 5px;
+}
+.user-usage-ledger .usage-io {
+  gap: 6px;
+  margin-top: 12px;
+}
+.user-usage-ledger .usage-io > div {
+  grid-template-columns: minmax(0, 1fr) auto 42px;
+  gap: 10px;
+}
+.user-usage-ledger .usage-io dt {
+  gap: 7px;
+  font-size: 12px;
+}
+.user-usage-ledger .usage-io dd {
+  font-size: 12.5px;
+}
+.user-usage-ledger .usage-io .usage-share {
+  font-size: 11.5px;
+}
+.qta {
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  padding: 3px 14px 3px 20px;
+}
+.user-usage > .dim.qta-empty {
+  display: block;
+  padding: 16px 20px;
+}
+/* 一行两层：名称（线路名 + 地区旗 / 接入链）│ 已用 / 额度 …… 剩余 │ 铅笔；第二层是额度条与百分比，
+   左缘与数值对齐。已用量和额度是同一比值的分子与分母，放在同一行，线路增多后不需要自行配对。
+   未设额度不画额度条：空槽会被理解为用量为零，而实际含义是不限量。 */
+.qta-r {
+  display: grid;
+  grid-template-columns: minmax(118px, 0.85fr) minmax(0, 2fr) minmax(96px, auto) 25px;
+  grid-template-areas:
+    'name figs left acts'
+    'name meter meter acts';
+  align-items: center;
+  column-gap: 18px;
+  row-gap: 8px;
+  padding: 12px 0;
+}
+.qta-r + .qta-r {
+  border-top: 1px solid var(--line-soft);
+}
+.qta-name {
+  display: grid;
+  grid-area: name;
+  gap: 3px;
   min-width: 0;
 }
 .qta-app {
-  flex: 1;
+  display: flex;
   min-width: 0;
+  align-items: center;
+  gap: 7px;
+  color: var(--ink);
+  font: 600 13px/18px var(--sans);
+}
+.qta-app > b {
   overflow: hidden;
+  font-weight: inherit;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font: 600 12.5px var(--sans);
-  color: var(--ink-2);
 }
-.qta-app i {
-  display: block;
-  font: 11px var(--mono);
-  font-style: normal;
-  color: var(--ink-4);
-  font-weight: 400;
+.qta-flags {
+  display: inline-flex;
+  flex: none;
+  gap: 3px;
 }
-/* 数值是这张卡的主要内容：大一档、等宽、tabular，多张卡之间纵向对齐 */
-.qta-n {
-  font: 600 16px var(--mono);
-  color: var(--ink);
-  font-variant-numeric: tabular-nums;
-  letter-spacing: -0.02em;
-  line-height: 1.3;
-  margin-top: 3px;
-}
-.qta-n em {
-  font: 400 11.5px var(--mono);
-  font-style: normal;
-  color: var(--ink-4);
-  letter-spacing: 0;
-}
-.qta-t {
-  height: 4px;
-  background: color-mix(in srgb, var(--ink) 10%, transparent);
+.qta-sub {
   overflow: hidden;
-  display: flex;
-  margin-top: 5px;
+  min-width: 0;
+  color: var(--ink-4);
+  font-size: 11px;
+  line-height: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.qta-t i {
-  display: block;
-  height: 100%;
-  background: var(--action);
-}
-/* 额度用尽：数值和进度条同时变为告警色——该卡即状态点变红的成因，
-   两处需使用同一颜色，否则需要在两种红色之间判断对应关系。 */
-.qta-r.over {
-  border-color: color-mix(in srgb, var(--err) 45%, var(--line));
-  background: color-mix(in srgb, var(--err) 7%, transparent);
-}
-.qta-r.over .qta-n {
+.qta-sub.stop {
   color: var(--err);
 }
-.qta-r.over .qta-t i {
-  background: var(--err);
+.qta-figs {
+  display: flex;
+  grid-area: figs;
+  min-width: 0;
+  align-items: baseline;
+  gap: 4px;
+  color: var(--ink);
+  font: 600 15px/18px var(--sans);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
-.qta-in {
-  width: 100%;
-  box-sizing: border-box;
-  text-align: right;
-  margin-top: 4px;
+.qta-figs small {
+  color: var(--ink-3);
+  font: 500 11.5px var(--sans);
 }
-.qta-u {
-  font: 10.5px var(--mono);
+.qta-cap {
+  margin-left: 5px;
   color: var(--ink-4);
-  letter-spacing: 0.06em;
+  font: 500 12px var(--sans);
+}
+.qta-left {
+  grid-area: left;
+  justify-self: end;
+  color: var(--ink-4);
+  font-size: 12px;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.qta-left b {
+  margin-left: 4px;
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.qta-meter {
+  display: flex;
+  grid-area: meter;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+}
+/* 额度条取数据色：它表示用量，与用量页的上下行同属数据角色。 */
+.qta-t {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+}
+.qta-t > i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: var(--data);
+}
+.qta-pct {
+  flex: none;
+  width: 34px;
+  color: var(--ink-3);
+  font: 500 11.5px var(--sans);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 .qta-acts {
+  grid-area: acts;
+  justify-self: end;
+}
+/* 注意档（≥95%）只给额度条与百分比上色；用尽时额度条、百分比与超出量同用告警色——
+   该行即名册红点的成因，两处需使用同一颜色。不铺底色。 */
+.qta-r.warn .qta-t > i {
+  background: var(--gold);
+}
+.qta-r.warn .qta-pct {
+  color: var(--gold);
+}
+.qta-r.over .qta-t > i {
+  background: var(--err);
+}
+.qta-r.over :is(.qta-pct, .qta-left, .qta-left b) {
+  color: var(--err);
+}
+.qta-r.unknown .qta-figs {
+  color: var(--ink-3);
+  font-weight: 500;
+}
+/* 编辑中：左缘 2px 主题色竖线加 5% 底色（紧凑列表的选中写法），编辑器占满名称右侧两层。 */
+.qta-r.editing {
+  margin: 0 -14px 0 -20px;
+  padding: 12px 14px 12px 18px;
+  border-left: 2px solid var(--action);
+  background: color-mix(in srgb, var(--action) 5%, transparent);
+}
+.qta-r.editing + .qta-r,
+.qta-r + .qta-r.editing {
+  border-top-color: transparent;
+}
+.qta-editor {
   display: flex;
+  grid-column: 2 / -1;
+  grid-row: 1 / span 2;
+  min-width: 0;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
-  margin-top: 6px;
+  gap: 8px;
 }
-.qta-acts .sp {
-  flex: 1;
-}
-.qta-r .btn {
-  height: 22px;
-  padding: 0 8px;
-  font-size: 11.5px;
+.qta-input {
   display: inline-flex;
   align-items: center;
+  gap: 6px;
 }
-.qta-edit {
-  flex: none;
+/* 带上元素名才能压过 input.f 的宽度（否则按 size 默认 20 个字符撑宽）。 */
+input.f.qta-in {
+  width: 96px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.qta-in[aria-invalid='true'] {
+  border-color: var(--err);
+}
+.qta-u {
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.qta-hint {
+  color: var(--ink-4);
+  font-size: 11px;
+  line-height: 15px;
+}
+.qta-hint.bad {
+  color: var(--err);
+}
+.qta-editor .sp {
+  flex: 1;
+}
+/* 非编辑态的操作是铅笔图标，悬停整行或键盘聚焦时显出；触屏没有悬停，常显。 */
+.qta-pencil.btn {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  min-height: 25px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  place-items: center;
+  opacity: 0.48;
+}
+.qta-r:hover .qta-pencil,
+.qta-pencil:focus-visible {
+  opacity: 1;
+}
+.qta-pencil.btn:hover:not(:disabled) {
+  border-color: var(--line);
+  background: var(--hover-2);
+}
+.qta-pencil svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+}
+@media (hover: none) {
+  .qta-pencil.btn {
+    opacity: 0.8;
+  }
+}
+/* 卡宽 ≤620px：读数栏移到列表上方（合计与上下行并排），线路行改为三层。 */
+@container user-usage (max-width: 620px) {
+  .user-usage {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .user-usage-ledger {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+    column-gap: 20px;
+    row-gap: 14px;
+    padding: 14px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .user-usage-hero-value {
+    font-size: 30px;
+  }
+  .user-usage-compose {
+    align-self: end;
+  }
+  .qta {
+    padding: 0 14px;
+  }
+  .user-usage > .dim.qta-empty {
+    padding: 14px;
+  }
+  .qta-r {
+    grid-template-columns: minmax(0, 1fr) auto 25px;
+    grid-template-areas:
+      'name name acts'
+      'figs left left'
+      'meter meter meter';
+    column-gap: 10px;
+    row-gap: 7px;
+  }
+  .qta-r.editing {
+    margin-inline: -14px;
+    padding: 12px 14px 12px 12px;
+  }
+  .qta-editor {
+    grid-column: 1 / -1;
+    grid-row: 2 / span 2;
+  }
+  /* 窄卡放不下一行：输入框与按钮留在第一行，说明换到下一行。 */
+  .qta-hint {
+    order: 1;
+    flex-basis: 100%;
+  }
+}
+@container user-usage (max-width: 400px) {
+  .user-usage-ledger {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 /* 授权卡：一个接入点一张。标签形式只能容纳一行 id，而判断是否授权依据的是
@@ -18726,8 +19409,7 @@ h4.sec > .btn {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 链 id 位于链名下方，与用量卡的「项目名 + 项目 id」写法一致（.qta-app i）。
-   链名不唯一而 id 唯一——该行是区分同名链的依据。 */
+/* 链 id 位于链名下方。链名不唯一而 id 唯一——该行是区分同名链的依据。 */
 .gc-app i {
   display: block;
   font: 11px var(--mono);
@@ -19782,9 +20464,8 @@ h4.sec > .btn {
 .user-login-issued-card > footer {
   padding: 0 13px 13px;
 }
-/* .qta / .grant-cards 自带 margin-top:4px（原先跟在 .fgrid 标签后）；落在卡壳里由内距
+/* .grant-cards 自带 margin-top:4px（原先跟在 .fgrid 标签后）；落在卡壳里由内距
    接管顶距，去掉这 4px 免得叠出多余空白。 */
-.user-dcard-body > .qta,
 .user-dcard-body > .grant-cards {
   margin-top: 0;
 }
@@ -19792,14 +20473,178 @@ h4.sec > .btn {
   display: inline-block;
   padding: 6px 2px;
 }
+/* 在线接入：一条时间线。在线来源在最前，离线来源按最后出现分到今天、昨天、7 天内与保留期内。
+   列：最后出现时刻 │ 节点（竖线穿过）│ 来源 IP │ 网络 │ 接入（机器 + 协议）│ 首次出现。
+   竖线与节点沿用发布流水（.cgf-list）的画法，节点用卡面色描边切断竖线。IP 列按完整 IPv6
+   的宽度固定，各行的网络与接入列对齐。窄卡改为两行，见文件后部的容器查询。 */
+.user-presence-card .user-dcard-body {
+  container: user-presence / inline-size;
+}
+.user-presence-note {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.user-presence-note::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  flex: none;
+  margin: 0 2px;
+  border-radius: 50%;
+}
+.user-presence-note.warn::before {
+  background: var(--gold);
+}
+.user-presence-note.idle::before {
+  box-shadow: inset 0 0 0 1.5px var(--ink-4);
+}
+.user-presence-note + .user-presence-timeline {
+  margin-top: 2px;
+  border-top: 1px solid var(--line-soft);
+}
+.user-presence-timeline {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.user-presence-timeline > li {
+  position: relative;
+}
+/* 竖线穿过节点列中心：40 时刻列 + 12 间距 + 6 半个节点列 */
+.user-presence-timeline > li::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 57.5px;
+  width: 1px;
+  background: var(--line);
+}
+.user-presence-timeline > li:first-child::before {
+  top: 60%;
+}
+.user-presence-timeline > li:last-child::before {
+  bottom: 50%;
+}
+/* 分组标题落在时刻列，与发布流水的日期标题同一写法 */
+.user-presence-day {
+  display: grid;
+  min-height: 30px;
+  grid-template-columns: 40px;
+  align-items: end;
+  padding-bottom: 3px;
+}
+.user-presence-day:first-child {
+  min-height: 24px;
+}
+.user-presence-day > span {
+  color: var(--ink-3);
+  font: 600 11px/1.4 var(--sans);
+  text-align: right;
+  white-space: nowrap;
+}
+.user-presence-row {
+  display: grid;
+  min-height: 34px;
+  grid-template-columns: 40px 12px minmax(0, 312px) 104px minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 12px;
+}
+.user-presence-time {
+  color: var(--ink-4);
+  font: 11px var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.user-presence-mark {
+  position: relative;
+  z-index: 1;
+  justify-self: center;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 3px var(--card);
+}
+.user-presence-row.off .user-presence-mark {
+  background: var(--card);
+  box-shadow:
+    inset 0 0 0 1.5px var(--ink-4),
+    0 0 0 3px var(--card);
+}
+.user-presence-ip {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+.user-presence-ip > code {
+  min-width: 0;
+  color: var(--ink);
+  font: 12px/1.45 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.user-presence-row.off .user-presence-ip > code {
+  color: var(--ink-2);
+}
+.user-presence-iid {
+  color: var(--ink-3);
+}
+/* 复制按钮在悬停或键盘聚焦时出现；触屏没有悬停，始终显示 */
+@media (hover: hover) {
+  .user-presence-row .user-fcopy {
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .user-presence-row:hover .user-fcopy,
+  .user-presence-row .user-fcopy:focus-visible,
+  .user-presence-row .user-fcopy:is(.done, .failed) {
+    opacity: 1;
+  }
+}
+/* 宽卡里网络与接入各占一列；窄卡里两者合成第二行 */
+.user-presence-sub {
+  display: contents;
+}
+.user-presence-location {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.user-presence-row.off .user-presence-location {
+  color: var(--ink-3);
+}
+.user-presence-access {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 16px;
+}
+.user-presence-access-item {
+  display: inline-flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+}
 .user-presence-node-link {
   min-width: 0;
   min-height: 24px;
-  padding: 2px 0;
+  padding: 0;
   border: 0;
-  border-radius: var(--r-ctl);
-  color: var(--action);
-  font: inherit;
+  border-radius: 3px;
+  color: var(--ink-2);
+  font: 12px/1.45 var(--sans);
   text-align: left;
   overflow-wrap: anywhere;
   background: transparent;
@@ -19808,204 +20653,89 @@ h4.sec > .btn {
 .user-presence-node-link:hover {
   color: var(--action-hover);
   text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .user-presence-node-link:focus-visible {
   outline: 2px solid var(--action);
   outline-offset: 2px;
 }
-.user-presence-list {
-  display: grid;
-  gap: 1px;
-  overflow: hidden;
-  border: 1px solid var(--line-soft);
-  border-radius: var(--r-ctl);
-  background: var(--line-soft);
-}
-.user-presence-source {
-  display: grid;
-  grid-template-columns: 7px minmax(0, max-content) 22px minmax(0, 1fr);
-  align-items: center;
-  gap: 2px 8px;
-  min-width: 0;
-  padding: 8px 10px;
-  background: var(--sheet);
-}
-.user-presence-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--ok);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 9%, transparent);
-}
-.user-presence-source > code {
-  min-width: 0;
-  color: var(--ink-2);
-  font: 11.5px/1.5 var(--mono);
-  overflow-wrap: anywhere;
-}
-.user-presence-source > .user-fcopy {
-  opacity: 0.62;
-}
-.user-presence-source:hover > .user-fcopy,
-.user-presence-source > .user-fcopy:focus-visible {
-  opacity: 1;
-}
-.user-presence-location {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
+.user-presence-row.off .user-presence-node-link {
   color: var(--ink-3);
-  font-size: 11.5px;
-}
-.user-presence-meta {
-  display: flex;
-  grid-column: 2 / -1;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 2px 12px;
-  min-width: 0;
-  color: var(--ink-4);
-  font-size: 11px;
-  line-height: 1.5;
-}
-.user-presence-source-nodes {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 2px 8px;
-  min-width: 0;
-}
-.user-presence-source-nodes-toggle {
-  min-height: 24px;
-  margin: -2px 0;
-  padding: 2px 15px 2px 0;
-  border: 0;
-  border-radius: var(--r-ctl);
-  color: var(--action);
-  font: inherit;
-  text-align: left;
-  background: transparent;
-  cursor: pointer;
-}
-.user-presence-source-nodes-toggle::after {
-  content: '›';
-  display: inline-block;
-  margin-left: 6px;
-  color: var(--ink-4);
-  font: 12px var(--mono);
-  transform: rotate(90deg);
-  transition: transform 120ms ease;
-}
-.user-presence-source-nodes-toggle[aria-expanded='true']::after {
-  transform: rotate(-90deg);
-}
-.user-presence-source-nodes-toggle:hover {
-  color: var(--action-hover);
-}
-.user-presence-source-nodes-toggle:focus-visible {
-  outline: 2px solid var(--action);
-  outline-offset: 2px;
-}
-.user-presence-observed {
-  margin-left: auto;
-}
-.user-presence-source-node-list {
-  display: flex;
-  grid-column: 1 / -1;
-  flex-basis: 100%;
-  flex-wrap: wrap;
-  gap: 4px 6px;
-  margin: 4px 0 1px;
-  padding: 0;
-  list-style: none;
-}
-.user-presence-source-node-list .user-presence-node-link {
-  min-height: 26px;
-  padding: 2px 8px;
-  border: 1px solid var(--line-soft);
-  color: var(--ink-2);
-  background: var(--ground);
-}
-.user-presence-source-node-list .user-presence-node-link:hover {
-  border-color: color-mix(in srgb, var(--action) 35%, var(--line));
-  color: var(--action-hover);
-  text-decoration: none;
-  background: var(--action-wash);
-}
-.user-presence-source-node-list > li {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 8px;
-  min-width: 0;
-  flex-basis: 100%;
-}
-.user-presence-protocol-detail {
-  display: flex;
-  flex-wrap: wrap;
-  flex-basis: 100%;
-  gap: 4px 8px;
-  margin: 4px 0 1px;
 }
 .user-presence-protocols {
-  color: var(--ink-2);
-  overflow-wrap: anywhere;
-}
-.user-presence-history {
-  display: grid;
-  gap: 0;
-  margin-top: 10px;
-  padding-top: 7px;
-  border-top: 1px solid var(--line-soft);
-}
-.user-presence-history-toggle {
-  display: inline-flex;
-  justify-self: start;
-  align-items: center;
-  gap: 6px;
-  min-height: 30px;
-  margin-left: -6px;
-  padding: 4px 6px;
-  border: 0;
-  border-radius: var(--r-ctl);
-  color: var(--action);
-  font: 11.5px/1.35 var(--sans);
-  background: transparent;
-  cursor: pointer;
-}
-.user-presence-history-toggle:hover {
-  color: var(--action-hover);
-  background: var(--action-wash);
-}
-.user-presence-history-toggle:focus-visible {
-  outline: 2px solid var(--action);
-  outline-offset: 1px;
-}
-.user-presence-history-toggle > span {
-  width: 9px;
   color: var(--ink-4);
-  font: 10px var(--mono);
-  text-align: center;
+  font: 10.5px/1.45 var(--mono);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
 }
-.user-presence-history-body {
-  display: grid;
-  gap: 7px;
-  padding-top: 6px;
+.user-presence-unknown {
+  color: var(--ink-4);
+  font-size: 11.5px;
 }
-.user-presence-history-summary,
+.user-presence-first {
+  color: var(--ink-4);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.user-presence-pending,
 .user-presence-history-note {
+  display: block;
+  padding: 6px 0 2px 64px;
   color: var(--ink-4);
   font-size: 10.5px;
   line-height: 1.45;
 }
-.user-presence-list.history .user-presence-source {
-  background: var(--ground);
+.user-presence-more {
+  min-height: 30px;
+  margin: 2px 0 0 58px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  color: var(--action);
+  font: 11.5px var(--sans);
+  background: transparent;
+  cursor: pointer;
 }
-.user-presence-dot.history {
-  background: var(--ink-4);
-  box-shadow: none;
+.user-presence-more:hover {
+  color: var(--action-hover);
+  background: var(--action-wash);
+}
+.user-presence-more:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -2px;
+}
+@container user-presence (max-width: 620px) {
+  .user-presence-row {
+    grid-template-columns: 40px 12px minmax(0, 1fr) auto;
+    grid-template-areas:
+      'time mark ip ip'
+      '. . sub first';
+    row-gap: 3px;
+    padding: 6px 0;
+  }
+  .user-presence-time {
+    grid-area: time;
+  }
+  .user-presence-mark {
+    grid-area: mark;
+  }
+  .user-presence-ip {
+    grid-area: ip;
+  }
+  .user-presence-sub {
+    display: flex;
+    min-width: 0;
+    grid-area: sub;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 3px 14px;
+  }
+  .user-presence-first {
+    grid-area: first;
+    align-self: start;
+  }
 }
 .user-dcard-foot {
   display: flex;
@@ -20461,182 +21191,6 @@ h4.sec > .btn {
   }
 }
 
-/* 用量额度沿用接入授权卡的底色、边框和圆角；大数字与额度写成一个完整读数，
-   避免同一面板里再出现一套独立的仪表盘视觉。 */
-.user-dcard .qta {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 8px;
-  margin: 0;
-  padding: 0;
-  overflow: visible;
-  border-radius: 0;
-  background: transparent;
-}
-.user-dcard .qta-r {
-  position: relative;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-content: start;
-  align-items: start;
-  column-gap: 8px;
-  row-gap: 0;
-  min-height: 112px;
-  padding: 10px 11px 9px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-card);
-  background: var(--sunk);
-  box-shadow: none;
-  transition:
-    border-color 120ms ease,
-    background 120ms ease,
-    box-shadow 120ms ease;
-}
-.user-dcard .qta-r:hover {
-  border-color: color-mix(in srgb, var(--action) 40%, var(--line));
-  background: color-mix(in srgb, var(--action) 3%, var(--sunk));
-  box-shadow: none;
-}
-.user-dcard .qta-r.over {
-  border: 1px solid color-mix(in srgb, var(--err) 40%, var(--line));
-  background: color-mix(in srgb, var(--err) 6%, var(--sunk));
-}
-.user-dcard .qta-r.over:hover {
-  border-color: color-mix(in srgb, var(--err) 54%, var(--line));
-  background: color-mix(in srgb, var(--err) 8%, var(--sunk));
-}
-.user-dcard .qta-head {
-  min-height: 24px;
-  grid-column: 1;
-  grid-row: 1;
-  align-items: center;
-}
-.user-dcard .qta-app {
-  color: var(--ink-2);
-  font-size: 12.5px;
-  font-weight: 600;
-}
-.user-dcard .qta-app i {
-  display: none;
-}
-.user-dcard .qta-measures {
-  grid-column: 1 / -1;
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: baseline;
-  column-gap: 7px;
-  row-gap: 1px;
-  min-width: 0;
-  margin-top: 6px;
-}
-.user-dcard .qta-measures > small {
-  grid-column: 1 / -1;
-  color: var(--ink-4);
-  font: 9px var(--sans);
-  font-weight: 500;
-  letter-spacing: 0.04em;
-}
-.user-dcard .qta-measures > strong {
-  overflow: hidden;
-  max-width: 100%;
-  color: var(--ink);
-  font: 620 15.5px var(--mono);
-  font-variant-numeric: tabular-nums;
-  letter-spacing: -0.025em;
-  line-height: 1.25;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.user-dcard .qta-cap {
-  overflow: hidden;
-  min-width: 0;
-  color: var(--ink-3);
-  font: 10.5px var(--mono);
-  font-variant-numeric: tabular-nums;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.user-dcard .qta-t {
-  grid-column: 1 / -1;
-  width: 100%;
-  height: 4px;
-  margin: 9px 0 0;
-  overflow: hidden;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--ink) 9%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--line-soft) 65%, transparent);
-}
-.user-dcard .qta-t > i {
-  border-radius: inherit;
-}
-.user-dcard .qta-meta {
-  grid-column: 1 / -1;
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  margin-top: 5px;
-  color: var(--ink-4);
-  font: 10px var(--sans);
-  font-variant-numeric: tabular-nums;
-  line-height: 1.3;
-}
-.user-dcard .qta-meta.unlimited {
-  justify-content: flex-start;
-  margin-top: 13px;
-  color: var(--ink-4);
-}
-.user-dcard .qta-meta.over {
-  color: var(--err);
-}
-.user-dcard .qta-in {
-  grid-column: 1 / -1;
-  height: 28px;
-  margin: 3px 0 0;
-}
-.user-dcard .qta-acts {
-  grid-column: 2;
-  grid-row: 1;
-  align-self: start;
-  margin: 0;
-}
-.user-dcard .qta-r:has(.qta-in) .qta-acts {
-  grid-column: 1 / -1;
-  grid-row: 3;
-  align-self: center;
-  margin-top: 3px;
-}
-.user-dcard .qta-r:has(.qta-in) {
-  border-color: color-mix(in srgb, var(--action) 34%, var(--line));
-  background: color-mix(in srgb, var(--action) 5%, var(--sunk));
-}
-/* 非编辑态的操作改用铅笔图标（对齐 mockup）；编辑态的取消/保存仍是文字按钮。 */
-.qta-pencil.btn {
-  display: grid;
-  width: 25px;
-  height: 25px;
-  min-height: 25px;
-  padding: 0;
-  border-color: transparent;
-  background: transparent;
-  place-items: center;
-  opacity: 0.48;
-}
-.user-dcard .qta-r:hover .qta-pencil,
-.qta-pencil:focus-visible {
-  opacity: 1;
-}
-.qta-pencil.btn:hover:not(:disabled) {
-  border-color: var(--line);
-  background: var(--hover-2);
-}
-.qta-pencil svg {
-  width: 13px;
-  height: 13px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.6;
-}
-
 /* 无选中态：仅在空列表下出现（正常情况下默认选中首行）。 */
 .user-detail-empty {
   display: grid;
@@ -20764,26 +21318,8 @@ h4.sec > .btn {
     flex: 0 1 auto;
     white-space: normal;
   }
-  .user-dcard .qta,
   .user-dcard .grant-cards {
     grid-template-columns: minmax(0, 1fr);
-  }
-  .user-presence-source {
-    grid-template-columns: 7px minmax(0, 1fr) 22px;
-  }
-  .user-presence-location {
-    grid-column: 2 / -1;
-    justify-content: flex-start;
-  }
-  .user-presence-meta {
-    justify-content: flex-start;
-  }
-  .user-presence-observed {
-    width: 100%;
-    margin-left: 0;
-  }
-  .user-presence-node-link {
-    min-height: 32px;
   }
   .grant-probe-result {
     justify-content: center;
@@ -21872,8 +22408,9 @@ h4.sec > .btn {
    所有点的绝对时间和值交给 tooltip，避免只看最后一个瞬时窗口。 */
 .observe-range {
   position: relative;
-  display: inline-block;
+  display: inline-flex;
   flex: 0 0 auto;
+  align-items: center;
 }
 .observe-link-switch {
   gap: 6px;
@@ -21921,6 +22458,7 @@ h4.sec > .btn {
   background: var(--surface);
 }
 .observe-range-trigger:focus-visible,
+.observe-range-return:focus-visible,
 .observe-range-menu button:focus-visible,
 .observe-range-menu input:focus-visible {
   outline: 2px solid color-mix(in srgb, var(--action) 45%, transparent);
@@ -22068,6 +22606,112 @@ h4.sec > .btn {
 .nd-range-error > span {
   min-width: 0;
   flex: 1;
+}
+/* 时间按钮左侧的返回：只在上一条浏览器历史是本机器的另一个时间范围时出现，点击等同浏览器后退。
+   与时间按钮拼成一组，共用中间那条边框。 */
+.observe-range-return {
+  position: relative;
+  width: 30px;
+  padding: 0;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  color: var(--ink-3);
+}
+.observe-range-return + .observe-range-trigger {
+  margin-left: -1px;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+.observe-range-return:focus-visible {
+  z-index: 1;
+}
+@media (hover: hover) {
+  .observe-range-return:hover:not(:disabled) {
+    color: var(--ink);
+  }
+}
+
+/* ── 图上拖选 ──
+   .observe-plot 是图表容器，尺寸来自 .ndtp-ec / .history-chart / .ping-probe-chart。ECharts 挂在
+   内层铺满的 .observe-plot-canvas 上；选区层是它的兄弟节点，不进 ECharts 容器（见 ui/observe-brush.tsx）。 */
+.observe-plot {
+  position: relative;
+}
+.observe-plot-canvas {
+  position: absolute;
+  inset: 0;
+}
+/* 十字光标只在绘图区内出现。zrender 在画布根节点上写行内 cursor，需要 !important 覆盖。 */
+.observe-plot[data-brush-hot],
+.observe-plot[data-brush-hot] * {
+  cursor: crosshair !important;
+}
+body.observe-brushing,
+body.observe-brushing * {
+  cursor: crosshair !important;
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* 拖动时隐藏悬停提示：读数提示与选区标签同时出现会互相遮挡。十字线已在拖动开始时收起。 */
+body.observe-brushing .observe-chart-tip {
+  visibility: hidden !important;
+}
+.observe-brush-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow: hidden;
+  pointer-events: none;
+}
+/* 选区是交互选择状态，取操作色。拖动所在的图实色，同页其余图浅色。 */
+.observe-brush-band {
+  position: absolute;
+  box-sizing: border-box;
+  border-inline: 1px solid color-mix(in srgb, var(--action) 75%, transparent);
+  background: color-mix(in srgb, var(--action) 14%, transparent);
+}
+.observe-brush-band[data-linked] {
+  border-color: color-mix(in srgb, var(--action) 40%, transparent);
+  background: color-mix(in srgb, var(--action) 7%, transparent);
+}
+/* 松开后到三类数据读取完成之间，选区保持显示并缓慢明暗变化，表示正在读取。 */
+.observe-brush-band[data-pending] {
+  animation: observe-brush-pending 0.9s var(--motion-ease-standard) infinite alternate;
+}
+@keyframes observe-brush-pending {
+  to {
+    opacity: 0.45;
+  }
+}
+/* 起止时刻标签：压在拖动所在那张图的 x 轴刻度行上、居中于选区，不遮挡曲线。 */
+.observe-brush-tag {
+  position: absolute;
+  display: inline-flex;
+  height: 19px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 7px;
+  padding: 0 7px;
+  border: 1px solid color-mix(in srgb, var(--action) 50%, var(--line));
+  border-radius: 5px;
+  background: var(--glass-strong);
+  box-shadow: var(--sheet-shadow);
+  color: var(--ink);
+  font: 10px var(--mono);
+  font-feature-settings: 'tnum';
+  white-space: nowrap;
+}
+.observe-brush-band[hidden],
+.observe-brush-tag[hidden] {
+  display: none;
+}
+.observe-brush-tag-detail {
+  color: var(--ink-3);
+}
+/* KPI 迷你趋势线上的同一时段：浅色、无边线。 */
+.observe-brush-spark {
+  fill: var(--action);
+  opacity: 0.18;
 }
 @media (max-width: 520px) {
   .observe-range-menu {
@@ -29144,15 +29788,13 @@ select.f,
     border-color var(--motion-fast) var(--motion-ease-standard),
     box-shadow var(--motion-fast) var(--motion-ease-standard);
 }
-.switch-ui,
-.node-insecure-switch {
+.switch-ui {
   transition:
     background-color var(--motion-medium) var(--motion-ease-standard),
     border-color var(--motion-medium) var(--motion-ease-standard),
     box-shadow var(--motion-medium) var(--motion-ease-standard);
 }
-.switch-ui span,
-.node-insecure-switch::after {
+.switch-ui span {
   transition:
     transform var(--motion-medium) var(--motion-ease-emphasized),
     background-color var(--motion-fast) var(--motion-ease-standard);
@@ -30025,6 +30667,52 @@ body.fg-dragging .fg-rail {
 /* 页签数据读取失败时，错误横跨读数栏与列表两列。 */
 .cgc-span {
   grid-column: 1 / -1;
+}
+.binary-history {
+  border-top: 1px solid var(--line);
+}
+.binary-history-list {
+  padding: 0;
+  margin: 12px 0;
+  list-style: none;
+}
+.binary-history-list > li + li {
+  border-top: 1px solid var(--line);
+}
+.binary-history-row {
+  display: flex;
+  width: 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 18px;
+  padding: 12px 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.binary-history-row:hover {
+  color: var(--action);
+}
+.binary-history-row small,
+.binary-attempts small {
+  color: var(--ink-3);
+}
+.binary-history-detail {
+  padding: 8px 12px 16px;
+  border-left: 2px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.binary-attempts {
+  display: grid;
+  gap: 10px;
+  padding: 8px 0 8px 18px;
+}
+.binary-attempts li > span,
+.binary-attempts li > small {
+  display: block;
 }
 /* 页签角标：主题色是机器正在自行升级的进度，金色仍是待处理数。 */
 .nd-tab-badge.cgc-run {

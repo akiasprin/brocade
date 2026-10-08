@@ -241,41 +241,14 @@ it('branding save preserves further typing while the request is pending', async 
   );
   expect(field.value).toBe('later unsaved title');
 });
-it('agent selected-node set cannot expand to all nodes when only counts match', async () => {
-  const qc = client();
-  qc.setQueryData(['nodes'], {
-    nodes: [
-      { node_id: 'A', agent_version: null },
-      { node_id: 'B', agent_version: null },
-    ],
-  });
-  qc.setQueryData(['agent-release'], {
-    agent_version: '1',
-    available_release_id: 'a'.repeat(64),
-    available_agents: [],
-    released: { scope: 'nodes', nodes: ['A', 'removed-C'], release_id: 'a'.repeat(64) },
-  });
-  let sent: { scope: string; nodes: string[] } | undefined;
-  vi.stubGlobal(
-    'fetch',
-    vi.fn(async (_path, init) => {
-      sent = JSON.parse(init.body);
-      return json({ ...qc.getQueryData<object>(['agent-release']), released: sent });
-    }),
-  );
-  render(
-    <QueryClientProvider client={qc}>
-      <AgentHarness />
-    </QueryClientProvider>,
-  );
-  expect(screen.getByRole('button', { name: '选中的机器' }).getAttribute('aria-pressed')).toBe('true');
-  expect((screen.getByLabelText('升级 A') as HTMLInputElement).checked).toBe(true);
+it('legacy approval does not seed a new release selection', async () => {
+  const { fetch } = mountAgent('nodes', ['A', 'removed-C']);
+  expect((screen.getByLabelText('升级 A') as HTMLInputElement).checked).toBe(false);
   expect((screen.getByLabelText('升级 B') as HTMLInputElement).checked).toBe(false);
+  fireEvent.click(screen.getByLabelText('升级 A'));
   fireEvent.click(screen.getByRole('button', { name: '批准' }));
-  await waitFor(() => expect(sent).toBeDefined());
-  expect(sent!.scope).toBe('nodes');
-  expect(sent!.nodes).toEqual(['A']);
-  expect(sent!.nodes).not.toContain('B');
+  await waitFor(() => expect(fetch).toHaveBeenCalled());
+  expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toMatchObject({ nodes: ['A'] });
 });
 
 it('committing settings draft keeps the new baseline and refreshes settings', async () => {
@@ -505,18 +478,34 @@ it.each([false, true])('discard while preview is pending ignores the old respons
   expect(await read).toEqual({ tag: 'committed latest' });
 });
 
+function agentNodes(nodeIds: string[]) {
+  return {
+    nodes: nodeIds.map(node_id => ({
+      node_id,
+      name: node_id,
+      agent_version: 'b'.repeat(64),
+      lifecycle_phase: 'active',
+      desired_poll_fresh: true,
+    })),
+  };
+}
 function mountAgent(scope: 'off' | 'nodes' | 'all', ids: string[], nodeIds = ['A', 'B']) {
   const qc = client();
-  qc.setQueryData(['nodes'], { nodes: nodeIds.map(node_id => ({ node_id, agent_version: null })) });
+  qc.setQueryData(['nodes'], agentNodes(nodeIds));
   const release = {
-    agent_version: '1',
-    available_release_id: 'a'.repeat(64),
-    available_agents: [],
-    released: { scope, nodes: ids, release_id: 'a'.repeat(64) },
+    available: {
+      component: 'agent',
+      version: '0.2.0',
+      build_id: 'a'.repeat(64),
+      artifacts: [{ arch: 'x86_64', sha256: 'a'.repeat(64) }],
+      source: 'embedded',
+    },
+    current: null,
+    legacy_approval: { scope, nodes: ids, release_id: 'a'.repeat(64) },
   };
-  qc.setQueryData(['agent-release'], release);
-  const fetch = vi.fn(async (_path: string, init?: RequestInit) =>
-    json({ ...release, released: JSON.parse(String(init?.body)) }),
+  qc.setQueryData(['binary-releases', 'agent'], release);
+  const fetch = vi.fn(async (path: string, _init?: RequestInit) =>
+    json(path === '/nodes/agent-state' ? qc.getQueryData(['nodes']) : release),
   );
   vi.stubGlobal('fetch', fetch);
   const view = render(
@@ -528,53 +517,54 @@ function mountAgent(scope: 'off' | 'nodes' | 'all', ids: string[], nodeIds = ['A
 }
 it('selecting every individual machine remains a fixed selection when a machine is added', async () => {
   const { qc, fetch } = mountAgent('off', []);
-  fireEvent.click(screen.getByRole('button', { name: '选中的机器' }));
   fireEvent.click(screen.getByLabelText('升级 A'));
   fireEvent.click(screen.getByLabelText('升级 B'));
-  act(() => qc.setQueryData(['nodes'], { nodes: ['A', 'B', 'C'].map(node_id => ({ node_id, agent_version: null })) }));
+  act(() => qc.setQueryData(['nodes'], agentNodes(['A', 'B', 'C'])));
   await waitFor(() => expect(screen.getByLabelText('升级 C')).toBeTruthy());
   expect((screen.getByLabelText('升级 C') as HTMLInputElement).checked).toBe(false);
   fireEvent.click(screen.getByRole('button', { name: '批准' }));
   await waitFor(() => expect(fetch).toHaveBeenCalled());
-  expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toMatchObject({ scope: 'nodes', nodes: ['A', 'B'] });
+  expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toMatchObject({ nodes: ['A', 'B'] });
 });
-it('an explicitly selected all-machines scope includes newly added machines', async () => {
+it('select-all also freezes the checked machines instead of creating an ongoing policy', async () => {
   const { qc, fetch } = mountAgent('off', []);
-  fireEvent.click(screen.getByRole('button', { name: '全部机器' }));
-  act(() => qc.setQueryData(['nodes'], { nodes: ['A', 'B', 'C'].map(node_id => ({ node_id, agent_version: null })) }));
-  await waitFor(() => expect((screen.getByLabelText('升级 C') as HTMLInputElement).checked).toBe(true));
+  fireEvent.click(screen.getByLabelText('选择全部可升级的机器'));
+  act(() => qc.setQueryData(['nodes'], agentNodes(['A', 'B', 'C'])));
+  await waitFor(() => expect(screen.getByLabelText('升级 C')).toBeTruthy());
+  expect((screen.getByLabelText('升级 C') as HTMLInputElement).checked).toBe(false);
   fireEvent.click(screen.getByRole('button', { name: '批准' }));
   await waitFor(() => expect(fetch).toHaveBeenCalled());
-  expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toMatchObject({ scope: 'all', nodes: [] });
+  const sent = JSON.parse(String(fetch.mock.calls[0][1]?.body));
+  expect(sent.nodes).toEqual(['A', 'B']);
+  expect(sent).not.toHaveProperty('scope');
 });
-it('saved all scope does not become off when the fleet is empty', () => {
+it('legacy all scope cannot create an empty release', () => {
   mountAgent('all', [], []);
   expect((screen.getByRole('button', { name: '批准' }) as HTMLButtonElement).disabled).toBe(true);
-  expect(screen.getByRole('button', { name: '全部机器' }).getAttribute('aria-pressed')).toBe('true');
+  expect(screen.queryByRole('button', { name: '全部机器' })).toBeNull();
 });
-it('reordering the fleet does not make a fixed set dirty', () => {
-  mountAgent('nodes', ['B', 'A']);
-  expect((screen.getByRole('button', { name: '批准' }) as HTMLButtonElement).disabled).toBe(true);
+it('reordering the fleet preserves the same unsaved machine set', async () => {
+  const { qc } = mountAgent('nodes', ['B', 'A']);
+  fireEvent.click(screen.getByLabelText('升级 A'));
+  act(() => qc.setQueryData(['nodes'], agentNodes(['B', 'A'])));
+  await waitFor(() => expect((screen.getByLabelText('升级 A') as HTMLInputElement).checked).toBe(true));
+  expect((screen.getByLabelText('升级 B') as HTMLInputElement).checked).toBe(false);
 });
-it('a machine selection cannot be approved empty; stopping upgrades is the explicit off scope', async () => {
+it('canceling the selection does not write an off policy or a release', () => {
   const { fetch } = mountAgent('all', []);
-  fireEvent.click(screen.getByRole('button', { name: '选中的机器' }));
   expect((screen.getByRole('button', { name: '批准' }) as HTMLButtonElement).disabled).toBe(true);
-  fireEvent.click(screen.getByRole('button', { name: '不升级' }));
-  expect(screen.getByText('所有机器保持当前版本，不会自行升级。')).toBeTruthy();
-  fireEvent.click(screen.getByRole('button', { name: '批准' }));
-  await waitFor(() => expect(fetch).toHaveBeenCalled());
-  expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toMatchObject({ scope: 'off', nodes: [] });
+  fireEvent.click(screen.getByRole('button', { name: '取消' }));
+  expect(screen.queryByRole('group', { name: '升级范围' })).toBeNull();
+  expect(fetch).not.toHaveBeenCalled();
 });
 it('available build refresh does not reset unsaved machine selection', async () => {
   const { qc } = mountAgent('off', []);
-  fireEvent.click(screen.getByRole('button', { name: '选中的机器' }));
   fireEvent.click(screen.getByLabelText('升级 A'));
   act(() =>
-    qc.setQueryData(['agent-release'], {
-      ...qc.getQueryData<object>(['agent-release']),
-      available_release_id: 'b'.repeat(64),
-    }),
+    qc.setQueryData(['binary-releases', 'agent'], (previous: { available: object }) => ({
+      ...previous,
+      available: { ...previous.available, build_id: 'c'.repeat(64) },
+    })),
   );
   await waitFor(() => expect((screen.getByLabelText('升级 A') as HTMLInputElement).checked).toBe(true));
   expect((screen.getByLabelText('升级 B') as HTMLInputElement).checked).toBe(false);

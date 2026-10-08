@@ -95,6 +95,9 @@ impl PgStore {
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(5)
+            // Numeric acquire events are consumed by Console's privacy-filtered observer, not
+            // a text logger. With no observer installed tracing discards them.
+            .acquire_time_level(log::LevelFilter::Debug)
             // Brocade's workload is short, frequently repeated OLTP queries. PostgreSQL can
             // otherwise spend seconds compiling JIT code when stale statistics make a small join
             // look expensive, even though executing it only takes a few milliseconds.
@@ -200,6 +203,29 @@ impl PgStore {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Numeric, read-only operational context. Never expose SQL text, client identities or values.
+    /// PostgreSQL counters are cumulative since stats_reset, not the Console's 15-minute window.
+    pub async fn performance_database_state(&self) -> Result<serde_json::Value> {
+        Ok(sqlx::query_scalar(
+            "SELECT jsonb_build_object(
+                'server_version_num', current_setting('server_version_num')::int,
+                'track_io_timing', current_setting('track_io_timing'),
+                'pg_stat_statements_installed', EXISTS (
+                    SELECT 1 FROM pg_extension WHERE extname='pg_stat_statements'),
+                'stats_reset', stats_reset::text,
+                'backends', numbackends, 'commits', xact_commit, 'rollbacks', xact_rollback,
+                'blocks_read', blks_read, 'blocks_hit', blks_hit,
+                'temp_files', temp_files, 'temp_bytes', temp_bytes, 'deadlocks', deadlocks,
+                'active', (SELECT count(*) FROM pg_stat_activity
+                    WHERE datname=current_database() AND pid<>pg_backend_pid() AND state='active'),
+                'lock_waiters', (SELECT count(*) FROM pg_stat_activity
+                    WHERE datname=current_database() AND wait_event_type='Lock')
+             ) FROM pg_stat_database WHERE datname=current_database()",
+        )
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -533,28 +559,112 @@ impl PgStore {
         cert::cert_delta_for_node(&self.pool, node_id).await
     }
 
-    /// Read fresh for the same reason as `distribution`, and one more: this one is read on the
-    /// agent's own schedule rather than a person's. A cached clearance would keep being handed out
-    /// after somebody paused the rollout, which is the one moment it must stop.
+    /// Read-only legacy approval, never used for Agent dispatch.
     pub async fn agent_release(&self) -> Result<crate::AgentRelease> {
         agent_release::load_agent_release(&self.pool).await
     }
 
-    /// `build` describes the agents the *calling process* carries. It comes from the console's
-    /// compile-time constants rather than being read here — store has no business knowing that
-    /// crate exists — and it is recorded rather than trusted from the request, so that a release
-    /// cannot be filed under a version its bytes have nothing to do with.
-    pub async fn update_agent_release(
-        &self,
-        actor: &AdminContext,
-        release: crate::AgentRelease,
-        build: crate::AgentBuildInfo<'_>,
-    ) -> Result<crate::AgentRelease> {
-        agent_release::update_agent_release(&self.pool, actor, release, build).await
-    }
-
     pub async fn list_xray_releases(&self, limit: u32) -> Result<crate::XrayReleaseList> {
         xray_release::list_xray_releases(&self.pool, limit).await
+    }
+
+    pub async fn binary_release(
+        &self,
+        component: crate::BinaryComponent,
+        id: i64,
+        detail: bool,
+    ) -> Result<crate::BinaryRelease> {
+        if detail {
+            crate::binary_release::get_binary_release(&self.pool, component, id).await
+        } else {
+            crate::binary_release::get_binary_release_overview(&self.pool, component, id).await
+        }
+    }
+
+    pub async fn binary_release_history(
+        &self,
+        component: crate::BinaryComponent,
+        limit: u32,
+        before: Option<i64>,
+    ) -> Result<Vec<crate::BinaryReleaseSummary>> {
+        crate::binary_release::list_binary_release_summaries(&self.pool, component, limit, before)
+            .await
+    }
+
+    pub async fn binary_release_attempts(
+        &self,
+        component: crate::BinaryComponent,
+        id: i64,
+        node: &str,
+    ) -> Result<Vec<crate::BinaryReleaseAttempt>> {
+        crate::binary_release::release_attempts(&self.pool, component, id, node).await
+    }
+
+    pub async fn binary_release_events(
+        &self,
+        component: crate::BinaryComponent,
+        id: i64,
+        before: i64,
+    ) -> Result<Vec<crate::BinaryReleaseEvent>> {
+        crate::binary_release::release_events(&self.pool, component, id, before).await
+    }
+
+    pub async fn create_binary_release(
+        &self,
+        actor: &AdminContext,
+        request: crate::CreateBinaryReleaseRequest,
+        build: crate::BinaryBuildInfo<'_>,
+    ) -> Result<crate::BinaryRelease> {
+        crate::binary_release::create_binary_release(&self.pool, actor, request, build).await
+    }
+
+    pub async fn cancel_binary_release(
+        &self,
+        component: crate::BinaryComponent,
+        actor: &AdminContext,
+        id: i64,
+    ) -> Result<crate::BinaryRelease> {
+        crate::binary_release::cancel_binary_release(&self.pool, component, actor, id).await
+    }
+
+    pub async fn retry_binary_release_target(
+        &self,
+        component: crate::BinaryComponent,
+        actor: &AdminContext,
+        id: i64,
+        node: &str,
+        build: &str,
+    ) -> Result<crate::BinaryRelease> {
+        crate::binary_release::retry_binary_release_target(
+            &self.pool, component, actor, id, node, build,
+        )
+        .await
+    }
+
+    pub async fn claim_agent_release(
+        &self,
+        node: &str,
+        arch: &str,
+        build: &str,
+        receipt_capable: bool,
+    ) -> Result<Option<crate::BinaryReleaseAssignment>> {
+        crate::binary_release::claim_binary_release(
+            &self.pool,
+            crate::BinaryComponent::Agent,
+            node,
+            arch,
+            build,
+            receipt_capable,
+        )
+        .await
+    }
+
+    pub async fn report_agent_release(
+        &self,
+        node: &str,
+        report: &brocade_deployment::protocol::AgentReleaseReport,
+    ) -> Result<bool> {
+        crate::binary_release::report_agent_release(&self.pool, node, report).await
     }
 
     pub async fn xray_release(&self, release_id: i64) -> Result<crate::XrayRelease> {
@@ -1001,13 +1111,13 @@ impl PgStore {
         console::issue_clash_haitun_link(&self.pool, actor, tenant_id, user_id).await
     }
 
-    pub async fn revoke_clash_haitun_link(
+    pub async fn regenerate_clash_haitun_link(
         &self,
         actor: &AdminContext,
         tenant_id: &str,
         user_id: &str,
     ) -> Result<ClashHaitunLink> {
-        console::revoke_clash_haitun_link(&self.pool, actor, tenant_id, user_id).await
+        console::regenerate_clash_haitun_link(&self.pool, actor, tenant_id, user_id).await
     }
 
     pub async fn verify_deployment(
@@ -1165,6 +1275,10 @@ impl PgStore {
         notifications::claim_delivery(&self.pool, owner).await
     }
 
+    pub async fn configure_webhook_notification_channel(&self, enabled: bool) -> Result<u64> {
+        notifications::configure_webhook_channel(&self.pool, enabled).await
+    }
+
     pub async fn complete_notification_delivery(
         &self,
         delivery_id: i64,
@@ -1192,8 +1306,24 @@ impl PgStore {
         notifications::list(&self.pool, actor, limit).await
     }
 
+    pub async fn mark_machine_events_read(
+        &self,
+        actor: &AdminContext,
+        through_event_id: i64,
+    ) -> Result<i64> {
+        notifications::mark_read(&self.pool, actor, through_event_id).await
+    }
+
     pub async fn prune_machine_events(&self, retain_days: u32) -> Result<u64> {
         notifications::prune(&self.pool, retain_days).await
+    }
+
+    pub async fn clear_machine_events(
+        &self,
+        actor: &AdminContext,
+        through_event_id: i64,
+    ) -> Result<i64> {
+        notifications::clear(&self.pool, actor, through_event_id).await
     }
 
     pub async fn halt_deployment(
@@ -1875,6 +2005,10 @@ impl PgStore {
         usage::prune_usage_readings(&self.pool, retain_days).await
     }
 
+    pub async fn prune_usage_report_receipts(&self, retain_days: u32) -> Result<u64> {
+        usage::prune_usage_report_receipts(&self.pool, retain_days).await
+    }
+
     pub async fn prune_usage_samples(&self, retain_days: u32) -> Result<u64> {
         usage::prune_usage_samples(&self.pool, retain_days).await
     }
@@ -2081,6 +2215,11 @@ impl PgStore {
 
     pub async fn prune_load_samples(&self, retain_days: u32) -> Result<u64> {
         load::prune_load_samples(&self.pool, retain_days).await
+    }
+
+    /// Seal at most 16 × 240 old raw Load samples into minute history per maintenance pass.
+    pub async fn compact_load_history(&self) -> Result<u64> {
+        crate::load_rollup::compact(&self.pool).await
     }
 }
 

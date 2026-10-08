@@ -28,6 +28,9 @@ const MAX_CLOCK_SKEW_SECS: i64 = 600;
 /// WAL burst, and autovacuum debt when it first receives the retention policy.
 const USAGE_SAMPLE_PRUNE_BATCH_ROWS: i64 = 50_000;
 
+/// Bound each minute of raw-history catch-up when reducing the diagnostic retention window.
+const USAGE_READING_PRUNE_BATCH_ROWS: i64 = 50_000;
+
 /// Process-local observations for counters which are absent from the reporting generation.
 ///
 /// Xray keeps removed user counters in process memory, so merely seeing an unknown label is not
@@ -694,6 +697,7 @@ pub async fn record_usage_report(
     let mut rejected_counters = 0_u64;
     let mut gap_samples = 0_u64;
     let mut unknown_counters = Vec::new();
+    let mut node_windows = BTreeMap::<(String, String), UsageWindowTotals>::new();
     let route = request.route.clone();
     request.counters.sort_by(|a, b| a.label.cmp(&b.label));
     let mut labels = BTreeSet::new();
@@ -827,6 +831,13 @@ pub async fn record_usage_report(
                         CounterOwner::ChainHop(_) => insert_chain_sample(&mut tx, insert).await?,
                     };
                     if sample_inserted {
+                        add_node_window(
+                            &mut node_windows,
+                            node_id,
+                            &owner,
+                            uplink_delta,
+                            downlink_delta,
+                        )?;
                         inserted_samples += 1;
                         if has_gap {
                             gap_samples += 1;
@@ -867,6 +878,13 @@ pub async fn record_usage_report(
                     CounterOwner::ChainHop(_) => insert_chain_sample(&mut tx, insert).await?,
                 };
                 if sample_inserted {
+                    add_node_window(
+                        &mut node_windows,
+                        node_id,
+                        &owner,
+                        uplink_bytes,
+                        downlink_bytes,
+                    )?;
                     inserted_samples += 1;
                     if has_gap {
                         gap_samples += 1;
@@ -893,6 +911,7 @@ pub async fn record_usage_report(
         }
     }
 
+    persist_node_windows(&mut tx, request.read_at_unix_secs, node_windows).await?;
     let result = UsageReportResult {
         node_id: node_id.to_owned(),
         agent_instance_id: request.agent_instance_id.clone(),
@@ -973,11 +992,8 @@ pub async fn record_usage_report(
 /// grant), so sixteen machines over ten minutes is `16 × 20 × users × ingresses` rows against a
 /// limit capped at 500. Aggregating here yields everything the page needs in one query.
 ///
-/// It goes through the `node_usage_windows` view (the machine-dimension union of both sample
-/// families) rather than touching the two underlying tables: "how much did this machine carry"
-/// has to count both an ingress's user traffic and a relay's link hops — ingress and relay are
-/// merely one machine's roles on different chains. The first version queried only
-/// `usage_samples`, and every relay machine's bar chart was empty.
+/// The bounded machine-window projection includes both user and relay traffic. It keeps real
+/// zero windows without requiring a zero-valued detail row for every inactive user.
 ///
 /// `window_secs` sets how long the series is (not the bucket width — the buckets are the agent's
 /// reporting windows themselves).
@@ -1080,25 +1096,16 @@ async fn list_usage_node_series_selected(
         }
     };
 
-    // The window series. The two tables are UNIONed and aggregated by (node_id, window_end) —
-    // window_end is the right edge of the agent's reporting window, both sides write the same
-    // boundary for one report, and no further bucketing is needed. User traffic and relay
-    // traffic are given in separate columns (FILTER): an ingress machine's bytes belong to a
-    // user, a relay machine's belong to a link hop with no user dimension, and querying only
-    // usage_samples leaves a relay machine's bar chart forever empty — while it is plainly
-    // forwarding.
+    // Tenant rows are summed only after applying the actor's scope; time boundaries are the
+    // actual Agent windows, with no resampling or inferred zero points.
     let bucket_rows = sqlx::query(
         "SELECT node_id,
                 window_end::text AS window_end,
-                coalesce(sum(uplink_bytes) FILTER (WHERE kind = 'user'), 0)::bigint
-                    AS user_uplink_bytes,
-                coalesce(sum(downlink_bytes) FILTER (WHERE kind = 'user'), 0)::bigint
-                    AS user_downlink_bytes,
-                coalesce(sum(uplink_bytes) FILTER (WHERE kind = 'relay'), 0)::bigint
-                    AS relay_uplink_bytes,
-                coalesce(sum(downlink_bytes) FILTER (WHERE kind = 'relay'), 0)::bigint
-                    AS relay_downlink_bytes
-         FROM node_usage_windows
+                sum(user_uplink_bytes)::bigint AS user_uplink_bytes,
+                sum(user_downlink_bytes)::bigint AS user_downlink_bytes,
+                sum(relay_uplink_bytes)::bigint AS relay_uplink_bytes,
+                sum(relay_downlink_bytes)::bigint AS relay_downlink_bytes
+         FROM usage_node_windows
          WHERE window_end >= $1::timestamptz
            AND window_end <= $2::timestamptz
            AND ($3::text IS NULL OR tenant_id = $3 OR tenant_id LIKE $4 ESCAPE '\\')
@@ -1201,45 +1208,58 @@ async fn list_usage_node_series_selected(
     })
 }
 
-/// Delete raw readings past their retention.
+/// Delete one bounded batch of raw readings past their retention (each day is exactly 24 hours).
 ///
 /// `usage_readings` is audit history only; the non-expiring baseline lives in
 /// `usage_counter_heads`. This split is what makes retention safe even when a label is quiet for
-/// longer than the retention window. Idempotency receipts use the same retention: the on-disk
-/// spool holds six hours, while the minimum here is one day; the permanent cursor still refuses
-/// an older sequence after its detailed response has expired.
-///
-/// Seven days rather than only the most recent row: the difference needs one, and the extra week
-/// is so that accounts can be reconciled after an incident (when a window's figure does not add
-/// up, the raw cumulative values are the only thing that can reconstruct the truth).
-///
-/// Repetition is safe and several control-plane instances running at once is fine — DELETE is
-/// idempotent.
+/// longer than the retention window. Receipts expire independently, so removing diagnostic rows
+/// must not change a retry's response. Concurrent cleaners skip locked rows; the batch and SQL
+/// time limits prevent first-run catch-up from deleting days of history in one transaction.
 pub async fn prune_usage_readings(pool: &PgPool, retain_days: u32) -> Result<u64> {
-    let retain_days = i64::from(retain_days.clamp(1, 365));
+    let retain_secs = f64::from(retain_days.clamp(1, 365)) * 86_400.0;
     let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '1s'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '10s'")
+        .execute(&mut *tx)
+        .await?;
     let result = sqlx::query(
-        "DELETE FROM usage_readings
-         WHERE read_at < now() - make_interval(days => $1::int)",
+        "WITH expired AS MATERIALIZED (
+             SELECT id FROM usage_readings
+              WHERE read_at < now() - make_interval(secs => $1)
+              ORDER BY read_at
+              LIMIT $2
+              FOR UPDATE SKIP LOCKED
+         )
+         DELETE FROM usage_readings history USING expired WHERE history.id = expired.id",
     )
-    .bind(retain_days as i32)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "DELETE FROM usage_report_receipts
-         WHERE received_at < now() - make_interval(days => $1::int)",
-    )
-    .bind(retain_days as i32)
+    .bind(retain_secs)
+    .bind(USAGE_READING_PRUNE_BATCH_ROWS)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
     Ok(result.rows_affected())
 }
 
+/// Expire replay responses separately from raw readings. The permanent cursor still rejects an
+/// older sequence after its response expires; the durable counter baseline is never pruned here.
+pub async fn prune_usage_report_receipts(pool: &PgPool, retain_days: u32) -> Result<u64> {
+    let retain_days = i32::try_from(retain_days.clamp(1, 365)).expect("retention fits i32");
+    let result = sqlx::query(
+        "DELETE FROM usage_report_receipts
+         WHERE received_at < now() - make_interval(days => $1::int)",
+    )
+    .bind(retain_days)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Delete accounting detail only after its daily machine and user projections are durable.
 ///
 /// The UI asks detail tables for at most one 24-hour interval. Seven days leaves enough evidence
-/// for incident reconstruction while keeping both append-only tables bounded. One chunk per table
+/// for incident reconstruction while keeping details and exact machine windows bounded. One chunk per table
 /// and hour lets an installation catch up without a long transaction or a sudden WAL spike.
 pub async fn prune_usage_samples(pool: &PgPool, retain_days: u32) -> Result<u64> {
     let retain_days = i32::try_from(retain_days.clamp(1, 365)).expect("retention fits i32");
@@ -1282,9 +1302,24 @@ pub async fn prune_usage_samples(pool: &PgPool, retain_days: u32) -> Result<u64>
     .bind(USAGE_SAMPLE_PRUNE_BATCH_ROWS)
     .fetch_one(&mut *tx)
     .await?;
+    let window_rows = sqlx::query_scalar::<_, i64>(
+        "WITH expired AS MATERIALIZED (
+             SELECT ctid FROM usage_node_windows
+              WHERE window_end < now() - make_interval(days => $1)
+              ORDER BY window_end LIMIT $2
+         ), deleted AS (
+             DELETE FROM usage_node_windows history USING expired
+              WHERE history.ctid = expired.ctid RETURNING 1
+         ) SELECT count(*) FROM deleted",
+    )
+    .bind(retain_days)
+    .bind(USAGE_SAMPLE_PRUNE_BATCH_ROWS)
+    .fetch_one(&mut *tx)
+    .await?;
     tx.commit().await?;
     let removed = user_rows
         .checked_add(chain_rows)
+        .and_then(|rows| rows.checked_add(window_rows))
         .ok_or_else(|| StoreError::InvalidData("usage sample prune count overflow".to_owned()))?;
     u64::try_from(removed)
         .map_err(|_| StoreError::InvalidData("negative usage sample prune count".to_owned()))
@@ -1788,6 +1823,68 @@ struct UsageSampleInsert<'a> {
     generation_id: i64,
 }
 
+#[derive(Default)]
+struct UsageWindowTotals {
+    user_up: i64,
+    user_down: i64,
+    relay_up: i64,
+    relay_down: i64,
+}
+
+fn add_node_window(
+    windows: &mut BTreeMap<(String, String), UsageWindowTotals>,
+    reporter: &str,
+    owner: &CounterOwner,
+    up: i64,
+    down: i64,
+) -> Result<()> {
+    let (node, tenant, relay) = match owner {
+        CounterOwner::User(grant) => (reporter, grant.tenant_id.as_str(), false),
+        CounterOwner::ChainHop(hop) => (hop.node_id.as_str(), hop.tenant_id.as_str(), true),
+    };
+    let totals = windows
+        .entry((node.to_owned(), tenant.to_owned()))
+        .or_default();
+    let (total_up, total_down) = if relay {
+        (&mut totals.relay_up, &mut totals.relay_down)
+    } else {
+        (&mut totals.user_up, &mut totals.user_down)
+    };
+    *total_up = total_up
+        .checked_add(up)
+        .ok_or_else(|| StoreError::InvalidData("usage window uplink overflow".to_owned()))?;
+    *total_down = total_down
+        .checked_add(down)
+        .ok_or_else(|| StoreError::InvalidData("usage window downlink overflow".to_owned()))?;
+    Ok(())
+}
+
+async fn persist_node_windows(
+    tx: &mut Transaction<'_, Postgres>,
+    window_end: i64,
+    windows: BTreeMap<(String, String), UsageWindowTotals>,
+) -> Result<()> {
+    // Sorted ownership keys give competing reports one lock order, including reverse-hop
+    // attribution to a machine other than the reporter. Receipt and heads guard exact replay.
+    for ((node, tenant), totals) in windows {
+        sqlx::query(
+            "INSERT INTO usage_node_windows
+                (node_id, tenant_id, window_end, user_uplink_bytes, user_downlink_bytes,
+                 relay_uplink_bytes, relay_downlink_bytes)
+             VALUES ($1, $2, to_timestamp($3::double precision), $4, $5, $6, $7)
+             ON CONFLICT (node_id, window_end, tenant_id) DO UPDATE SET
+                user_uplink_bytes = usage_node_windows.user_uplink_bytes + EXCLUDED.user_uplink_bytes,
+                user_downlink_bytes = usage_node_windows.user_downlink_bytes + EXCLUDED.user_downlink_bytes,
+                relay_uplink_bytes = usage_node_windows.relay_uplink_bytes + EXCLUDED.relay_uplink_bytes,
+                relay_downlink_bytes = usage_node_windows.relay_downlink_bytes + EXCLUDED.relay_downlink_bytes",
+        )
+        .bind(node).bind(tenant).bind(window_end as f64)
+        .bind(totals.user_up).bind(totals.user_down).bind(totals.relay_up).bind(totals.relay_down)
+        .execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 async fn insert_usage_sample(
     tx: &mut Transaction<'_, Postgres>,
     sample: UsageSampleInsert<'_>,
@@ -1795,6 +1892,29 @@ async fn insert_usage_sample(
     let CounterOwner::User(grant) = sample.owner else {
         return Ok(false);
     };
+    if sample.uplink_bytes == 0 && sample.downlink_bytes == 0 && !sample.has_gap {
+        // Zero is a valid collected window, not an audit event. The machine projection preserves
+        // that point, while the durable head/receipt already provide ordering and retry safety.
+        // Keep day-level presence identical without rewriting the same zero totals every 30s.
+        sqlx::query(
+            "WITH period AS (
+                SELECT date_trunc('day', to_timestamp($4::double precision) AT TIME ZONE 'Asia/Hong_Kong')
+                           AT TIME ZONE 'Asia/Hong_Kong' AS start
+             ), user_day AS (
+                INSERT INTO usage_rollups
+                    (tenant_id, user_id, app_id, period_start, period_end, uplink_bytes, downlink_bytes, has_gap)
+                SELECT $1, $2, $3, start, start + interval '24 hours', 0, 0, FALSE FROM period
+                ON CONFLICT DO NOTHING
+             )
+             INSERT INTO usage_node_rollups (tenant_id, node_id, period_start, period_end)
+             SELECT $1, $5, start, start + interval '24 hours' FROM period
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&grant.tenant_id).bind(&grant.user_id).bind(&grant.app_id)
+        .bind(sample.window_start_unix_secs as f64).bind(sample.node_id)
+        .execute(&mut **tx).await?;
+        return Ok(true);
+    }
     // app_id is looked up from ingresses once at insert and frozen, no longer following the
     // model: when an ingress is moved to another view, this row still says which view it counted
     // against at the time. Derived on demand, a quota's numerator would jump wholesale to the new

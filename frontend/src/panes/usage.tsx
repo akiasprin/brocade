@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { fetchUsageMonthly, type UsageDailyRow, type UsageMonthlySummary } from '../api';
 import { ErrorBox, Loading } from '../ui/bits';
-import { bytes } from '../ui/format';
+import { bytes, shareOf } from '../ui/format';
 import { ListIcon } from '../ui/icons';
 
 const monthLabel = (s: string) => `${s.slice(0, 4)} 年 ${parseInt(s.slice(5, 7), 10)} 月`;
@@ -14,7 +14,6 @@ const dayLabel = (s: string) =>
   `${s.slice(0, 4)} 年 ${parseInt(s.slice(5, 7), 10)} 月 ${parseInt(s.slice(8, 10), 10)} 日`;
 const shortDayLabel = (s: string) => `${parseInt(s.slice(5, 7), 10)} 月 ${parseInt(s.slice(8, 10), 10)} 日`;
 const dayBytes = (day: UsageDailyRow) => day.uplink_bytes + day.downlink_bytes;
-const share = (part: number, whole: number) => (whole > 0 ? `${((part / whole) * 100).toFixed(1)}%` : '—');
 
 interface CalendarUsageDay extends UsageDailyRow {
   dayNumber: number;
@@ -166,7 +165,7 @@ function UsageLedger({
               上行
             </dt>
             <dd>{bytes(uplink)}</dd>
-            <dd className="usage-share">{share(uplink, total)}</dd>
+            <dd className="usage-share">{shareOf(uplink, total)}</dd>
           </div>
           <div className="down">
             <dt>
@@ -174,7 +173,7 @@ function UsageLedger({
               下行
             </dt>
             <dd>{bytes(downlink)}</dd>
-            <dd className="usage-share">{share(downlink, total)}</dd>
+            <dd className="usage-share">{shareOf(downlink, total)}</dd>
           </div>
         </dl>
       </div>

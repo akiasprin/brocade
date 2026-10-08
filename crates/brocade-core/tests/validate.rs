@@ -3326,7 +3326,7 @@ fn front_analysis_applies_member_ingress_guards_before_chain_rules() {
     let mut amplification = base_app.clone();
     amplification.ingresses[0].guard.no_udp_amplification = true;
     amplification.ingresses[1].wires = IngressWires::Hysteria2(Hysteria2 {
-        port: 53,
+        port: 123,
         ..Hysteria2::default()
     });
     let amplification = analyze(amplification);

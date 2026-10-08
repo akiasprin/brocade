@@ -119,7 +119,10 @@ test('机器详情首屏剥离深度对象，深度图立即挂载并按十项�
   assert.match(telemetry, /const metricStates = plan\.groupBatchIndices\.map/);
   assert.doesNotMatch(telemetry, /loadedBatches/);
   assert.match(telemetry, /const sampledSeries = downsampleKpiSeries\(series, valueOf\)/);
-  assert.match(telemetry, /data: lineSeries\.values\.map\(/);
+  assert.match(
+    telemetry,
+    /data: observeSeriesData\(times, lineSeries\.values, \{ windowStartsUnixSecs: windowStarts \}\)/,
+  );
   assert.doesNotMatch(telemetry, /data: downsample|data: sampledSeries|sampling:/);
 });
 

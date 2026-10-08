@@ -26,15 +26,21 @@ import {
   observeColors,
   observeCountUnit,
   observeMsUnit,
-  observeMinorTick,
   observeNumberUnit,
   observeLoadingOptions,
   observeSeriesLine,
-  observeTimeInterval,
+  observeTimeAxes,
   observeValueAxis,
 } from '../ui/observe-chart';
 import type { ObserveAxisUnit, ObserveValueAxis } from '../ui/observe-chart';
+import { observeSeriesData } from '../ui/observe-series';
 import { echartsEntranceAnimation, useEchartsViewportEntry } from '../ui/echarts-motion';
+import {
+  OBSERVE_TOOLTIP_CLASS,
+  ObserveBrushPlot,
+  useObserveBrushSpark,
+  type ObserveBrushExtent,
+} from '../ui/observe-brush';
 import { dur, iso, throughputAxis } from './telemetry-format';
 
 export { dur, iso, throughputAxis } from './telemetry-format';
@@ -577,6 +583,7 @@ function congestionFindings(r: NodeLoadView): Finding[] {
 
 export function ThroughputChart({
   timesUnixSecs,
+  windowStartsUnixSecs,
   rangeStartUnixSecs,
   rangeEndUnixSecs,
   rx,
@@ -587,6 +594,8 @@ export function ThroughputChart({
 }: {
   /** 每个速率点对应的真实窗口结束时间。 */
   timesUnixSecs: number[];
+  /** Measured windows distinguish missing reports from a legitimate change of sample duration. */
+  windowStartsUnixSecs?: number[];
   /** 前端请求并由服务端回显的绝对区间。 */
   rangeStartUnixSecs: number;
   rangeEndUnixSecs: number;
@@ -603,6 +612,8 @@ export function ThroughputChart({
   const paletteKey = useSyncExternalStore(palette.subscribe, palette.snapshot);
   const enteredViewport = useEchartsViewportEntry(elRef);
   const hasRenderedData = useRef(false);
+  // 拖选按最近一次写入的坐标范围换算像素。
+  const extentRef = useRef<ObserveBrushExtent | null>(null);
   // 最近一次真正写入实例的输入签名。父组件可能因无关状态每秒重渲染（LoadCard 的相对
   // 时间标签由 useNow 驱动），传入身份新但值相同的数组；若仅凭数组身份就重设 option，
   // notMerge 会销毁悬停中的 tooltip DOM——值未变时必须跳过。
@@ -630,6 +641,7 @@ export function ThroughputChart({
     if (!chart || !enteredViewport) return;
     const sig = JSON.stringify([
       timesUnixSecs,
+      windowStartsUnixSecs,
       rangeStartUnixSecs,
       rangeEndUnixSecs,
       rx,
@@ -655,9 +667,7 @@ export function ThroughputChart({
     const { axis: valueAxis, unit } = throughputAxis(rx, tx);
     const xMin = rangeStartUnixSecs * 1000;
     const xMax = rangeEndUnixSecs * 1000;
-    // x 轴显示墙钟时刻（hh:mm，与全机队镜像图及此前的 mockup 一致），tooltip 到秒。
-    const hm = (ms: number) =>
-      new Date(ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    // x 轴刻度落在墙钟整点上（observeTimeAxes），tooltip 到秒。
     const hms = (ms: number) =>
       new Date(ms).toLocaleTimeString('zh-CN', {
         hour: '2-digit',
@@ -665,7 +675,6 @@ export function ThroughputChart({
         second: '2-digit',
         hour12: false,
       });
-    const xStep = observeTimeInterval(Math.max(30_000, xMax - xMin));
 
     const mk = (name: string, data: (number | null)[], color: string) => ({
       name,
@@ -679,7 +688,7 @@ export function ThroughputChart({
       areaStyle: observeAreaStyle(color, themeName, { count: 2, paper: cv('--card') }),
       itemStyle: { color, borderColor: glass, borderWidth: 1.5 },
       emphasis: { disabled: true },
-      data: data.map((value, index) => [timesUnixSecs[index] * 1000, value] as [number, number | null]),
+      data: observeSeriesData(timesUnixSecs, data, { windowStartsUnixSecs }),
     });
 
     chart.setOption(
@@ -691,6 +700,7 @@ export function ThroughputChart({
         tooltip: {
           trigger: 'axis',
           confine: true,
+          className: OBSERVE_TOOLTIP_CLASS,
           backgroundColor: glass,
           borderColor: line,
           borderWidth: 1,
@@ -713,25 +723,9 @@ export function ThroughputChart({
             return `<div style="color:${ink4};font-size:9px;margin-bottom:4px;letter-spacing:.04em">${head}</div>${rows.map(row).join('')}`;
           },
         },
-        xAxis: {
-          // 数值轴而非 time 轴：x 是毫秒时间戳，等比排布即时间轴，但 echarts 6 的 time 轴
-          // 无视 interval/minInterval（实测固定 2 分钟一格 → 15 条网格），数值轴才认 interval。
-          type: 'value',
-          min: xMin,
-          max: xMax,
-          interval: xStep,
-          axisLine: observeAxisLine(ink3),
-          axisTick: observeAxisTick(ink3),
-          minorTick: observeMinorTick(lineSoft),
-          splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
-          axisLabel: {
-            color: ink3,
-            fontSize: 9.5,
-            margin: 8,
-            hideOverlap: true,
-            formatter: (value: number) => hm(value),
-          },
-        },
+        // 数值轴而非 time 轴：x 是毫秒时间戳，等比排布即时间轴，但 echarts 6 的 time 轴
+        // 无视 interval/minInterval（实测固定 2 分钟一格 → 15 条网格）。刻度位置见 observeTimeAxes。
+        xAxis: observeTimeAxes(xMin, xMax, ink3, lineSoft),
         yAxis: {
           type: 'value',
           min: 0,
@@ -749,6 +743,7 @@ export function ThroughputChart({
       },
       true,
     );
+    extentRef.current = { minMs: xMin, maxMs: xMax, yMax: valueAxis.max };
     hasRenderedData.current = true;
     // connect 按组联动所有已建实例；任一图重设 option 后重连一次，保证最新成员都在组内。
     if (group) echarts.connect(group);
@@ -762,11 +757,12 @@ export function ThroughputChart({
     rxName,
     themeName,
     timesUnixSecs,
+    windowStartsUnixSecs,
     tx,
     txName,
   ]);
 
-  return <div ref={elRef} className="ndtp-ec" />;
+  return <ObserveBrushPlot className="ndtp-ec" hostRef={elRef} chartRef={chartRef} extentRef={extentRef} />;
 }
 
 type HistoryLine = {
@@ -869,6 +865,8 @@ function HistoryChart({
   const lastSig = useRef<string | null>(null);
   const hasRenderedData = useRef(false);
   const enteredViewport = useEchartsViewportEntry(elRef);
+  // 拖选按最近一次写入的坐标范围换算像素。
+  const extentRef = useRef<ObserveBrushExtent | null>(null);
   const observedPeak = historyObservedPeak(lines, threshold);
   const valueAxis = max === undefined ? observeValueAxis(observedPeak) : null;
   // 显式 max 的容量/连接图仍需要一个完整轴描述来选整卡单位；这只决定显示档位，实际轴上界
@@ -910,7 +908,19 @@ function HistoryChart({
     const chart = chartRef.current;
     if (!chart || !ready || !enteredViewport) return;
     const times = samples.map(sample => sample.window_end_unix_secs);
-    const sig = JSON.stringify([times, lines, title, max, threshold, group, unit?.name, themeName, paletteKey]);
+    const windowStarts = samples.map(sample => sample.window_start_unix_secs);
+    const sig = JSON.stringify([
+      times,
+      windowStarts,
+      lines,
+      title,
+      max,
+      threshold,
+      group,
+      unit?.name,
+      themeName,
+      paletteKey,
+    ]);
     if (sig === lastSig.current) return;
     lastSig.current = sig;
     const css = getComputedStyle(elRef.current ?? document.documentElement);
@@ -938,12 +948,10 @@ function HistoryChart({
     };
     const lastMs = (times[times.length - 1] ?? 0) * 1000;
     const firstMs = (times[0] ?? 0) * 1000;
-    // x 轴显示墙钟时刻（hh:mm），tooltip 到秒；轴起点即首个样本时刻，曲线紧贴 y 轴。
-    // 见 ThroughputChart 同处说明：不再向下取整到整分，以免首点秒数变成左端留白。
-    const xStep = observeTimeInterval(lastMs - firstMs);
+    // 轴起点即首个样本时刻，曲线紧贴 y 轴；不向下取整到整分，以免首点秒数变成左端留白。
+    // 刻度落在墙钟整点上（observeTimeAxes），tooltip 到秒。
     const xMin = Math.min(firstMs, lastMs - 30_000);
-    const hm = (ms: number) =>
-      new Date(ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    const yMax = max ?? valueAxis?.max;
     const clockAt = (ms: number) =>
       new Date(ms).toLocaleTimeString('zh-CN', {
         hour: '2-digit',
@@ -969,6 +977,7 @@ function HistoryChart({
         tooltip: {
           trigger: 'axis',
           confine: true,
+          className: OBSERVE_TOOLTIP_CLASS,
           backgroundColor: glass,
           borderColor: line,
           borderWidth: 1,
@@ -996,29 +1005,12 @@ function HistoryChart({
             return `<div style="color:${ink4};font-size:9px;margin-bottom:4px;letter-spacing:.04em">${clockAt(rows[0]?.value?.[0] ?? lastMs)}</div>${body}`;
           },
         },
-        xAxis: {
-          // 数值轴承载毫秒时间戳（见 ThroughputChart 同处说明）：echarts 6 的 time 轴不认
-          // interval，数值轴才能把主网格钉在稀疏的整分位置，同时保留次刻度。
-          type: 'value',
-          min: xMin,
-          max: lastMs,
-          interval: xStep,
-          axisLine: observeAxisLine(ink3),
-          axisTick: observeAxisTick(ink3),
-          minorTick: observeMinorTick(lineSoft),
-          splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
-          axisLabel: {
-            color: ink3,
-            fontSize: 9.5,
-            margin: 8,
-            hideOverlap: true,
-            formatter: (value: number) => hm(value),
-          },
-        },
+        // 数值轴承载毫秒时间戳（见 ThroughputChart 同处说明）。
+        xAxis: observeTimeAxes(xMin, lastMs, ink3, lineSoft),
         yAxis: {
           type: 'value',
           min: 0,
-          max: max ?? valueAxis?.max,
+          max: yMax,
           interval: max === undefined ? valueAxis?.interval : undefined,
           scale: true,
           axisLine: observeAxisLine(ink3),
@@ -1044,9 +1036,7 @@ function HistoryChart({
           },
           itemStyle: { color: colors[index], borderColor: glass, borderWidth: 1.5 },
           emphasis: { disabled: true },
-          data: lineSeries.values.map(
-            (value, valueIndex) => [(times[valueIndex] ?? 0) * 1000, value] as [number, number | null],
-          ),
+          data: observeSeriesData(times, lineSeries.values, { windowStartsUnixSecs: windowStarts }),
           markLine:
             index === 0 && threshold
               ? {
@@ -1068,6 +1058,7 @@ function HistoryChart({
       },
       true,
     );
+    extentRef.current = yMax === undefined ? null : { minMs: xMin, maxMs: lastMs, yMax };
     hasRenderedData.current = true;
     if (group) echarts.connect(group);
   }, [
@@ -1110,7 +1101,7 @@ function HistoryChart({
         {renderedMeta && <small>{renderedMeta}</small>}
         {renderedCurrent && <strong>{renderedCurrent}</strong>}
       </header>
-      <div ref={elRef} className="history-chart" />
+      <ObserveBrushPlot className="history-chart" hostRef={elRef} chartRef={chartRef} extentRef={extentRef} />
       <footer className="history-chart-legend" aria-label={`${title} 图例`}>
         {lines.map((line, index) => {
           const value = ready ? latest(line.values) : null;
@@ -2418,8 +2409,12 @@ function Spark({
     rangeStartUnixSecs,
     rangeEndUnixSecs,
   );
+  // 图上拖选时，趋势线画出同一时段。
+  const brushRef = useRef<SVGRectElement>(null);
+  useObserveBrushSpark(brushRef, rangeStartUnixSecs, rangeEndUnixSecs, PLOT_W);
   return (
     <svg className="kpi-spark" viewBox={`0 0 ${PLOT_W} ${PLOT_H}`} preserveAspectRatio="none" aria-hidden="true">
+      <rect ref={brushRef} className="observe-brush-spark" y={0} height={PLOT_H} visibility="hidden" />
       {paths.areas.map((path, index) => (
         <path key={`a-${index}`} className="kpi-spark-area" d={path} />
       ))}

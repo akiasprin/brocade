@@ -20,9 +20,11 @@ const baseDark = tokens(":root,\n[data-theme='dark']");
 const baseLight = tokens(":root[data-theme='light'],\n[data-theme='light']");
 
 test('floating layers share one translucent material', () => {
+  // 亮色对话框底色 96%：背后是压暗的页面，64% 会把白底染成中灰。
+  assert.equal(baseDark.get('--float-sheet'), 'color-mix(in srgb, var(--sheet) 64%, transparent)');
+  assert.equal(baseLight.get('--float-sheet'), 'color-mix(in srgb, var(--sheet) 96%, transparent)');
   for (const t of [baseDark, baseLight]) {
     assert.equal(t.get('--float'), 'color-mix(in srgb, var(--surface) 64%, transparent)');
-    assert.equal(t.get('--float-sheet'), 'color-mix(in srgb, var(--sheet) 64%, transparent)');
     assert.equal(t.get('--float-filter'), 'blur(20px) saturate(1.8)');
     assert.equal(t.get('--float-edge'), 'inset 0 1px 0 rgba(255, 255, 255, 0.1)');
     // 对话框本身半透明，遮罩只压暗 40%，否则背后的页面只剩一块暗色。

@@ -203,27 +203,13 @@ pub async fn remove_retired_nodes(
                        FROM jsonb_array_elements(overlay_disabled_links) link
                       WHERE NOT ((link ->> 'a') = ANY($1) OR (link ->> 'b') = ANY($1))),
                     '[]'::jsonb
-                ),
-                agent_release_nodes = COALESCE(
-                    (SELECT jsonb_agg(node)
-                       FROM jsonb_array_elements(agent_release_nodes) node
-                      WHERE NOT ((node #>> '{}') = ANY($1))),
-                    '[]'::jsonb
                 )
           WHERE id = TRUE",
     )
     .bind(&node_ids)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        "UPDATE control_state
-            SET agent_release_scope = 'off'
-          WHERE id = TRUE
-            AND agent_release_scope = 'nodes'
-            AND jsonb_array_length(agent_release_nodes) = 0",
-    )
-    .execute(&mut *tx)
-    .await?;
+    // Legacy Agent approval is an audit baseline, not a live machine reference.
     for node_id in &node_ids {
         sqlx::query(
             "UPDATE subscription_serving_state

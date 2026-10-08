@@ -44,3 +44,13 @@ test('登录页铺满视口但不注册 fixed 贴顶容器，窄屏上下排列'
   assert.match(styles, /\.login-panel\s*\{\s*animation:\s*motion-login-in 360ms/);
   assert.doesNotMatch(styles, /\.login-fw/);
 });
+
+test('表单落在卡片上：边框、卡面与纸投影，备用路径铺在卡片底部', () => {
+  const panel = rule('.login-panel');
+  assert.match(panel, /border:\s*1px solid var\(--line\);/);
+  assert.match(panel, /background:\s*var\(--card\);/);
+  assert.match(panel, /box-shadow:\s*var\(--sheet-shadow\);/);
+  const alt = rule('.login-alt');
+  assert.match(alt, /border-top:\s*1px solid var\(--line\);/);
+  assert.match(alt, /margin:\s*2px calc\(-1 \* var\(--login-pad-x\)\) calc\(-1 \* var\(--login-pad-bottom\)\);/);
+});

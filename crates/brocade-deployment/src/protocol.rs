@@ -955,6 +955,64 @@ pub struct BinarySource {
     pub sha256: String,
 }
 
+/// An additive self-update offer. Older Agents read its url/sha256 as BinarySource.
+/// Missing work-order fields mean an older Console, not a fabricated release attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReleaseOffer {
+    pub url: String,
+    pub sha256: String,
+    #[serde(default)]
+    pub release_id: Option<i64>,
+    #[serde(default)]
+    pub attempt: Option<u32>,
+    #[serde(default)]
+    pub previous_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentReleaseOutcome {
+    Running,
+    Failed,
+}
+
+/// Persisted before replacement and acknowledged only after a new process reconnects.
+/// Console also checks its fresh authenticated poll and runtime observations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReleaseReport {
+    pub release_id: i64,
+    pub attempt: u32,
+    pub outcome: AgentReleaseOutcome,
+    pub performed_update: bool,
+    pub installed_sha256: Option<String>,
+    pub running_sha256: Option<String>,
+    pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod agent_release_compat_tests {
+    use super::*;
+    #[test]
+    fn self_update_uses_additive_fields_without_raising_protocol_minimum() {
+        let offer = AgentReleaseOffer {
+            url: "https://console.example/brocade-agent/x86_64".to_owned(),
+            sha256: "a".repeat(64),
+            release_id: Some(1),
+            attempt: Some(1),
+            previous_sha256: Some("b".repeat(64)),
+        };
+        let old: BinarySource =
+            serde_json::from_value(serde_json::to_value(&offer).unwrap()).unwrap();
+        assert_eq!(old.sha256, offer.sha256);
+        let new: AgentReleaseOffer =
+            serde_json::from_value(serde_json::to_value(&old).unwrap()).unwrap();
+        assert_eq!(new.release_id, None);
+        assert_eq!(new.attempt, None);
+        assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 24);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetConvergenceReport {
     pub deployment_id: i64,
@@ -1393,6 +1451,8 @@ pub struct UsageReportResult {
     /// True when the control plane returned the durable result of an already committed report.
     pub duplicate: bool,
     pub accepted_readings: u64,
+    /// Accepted accounting windows, including collected zero-traffic windows stored only in
+    /// the machine projection. This is not a count of physical audit-detail rows.
     pub inserted_samples: u64,
     /// The label has no corresponding owner in the report's frozen usage generation.
     pub skipped_counters: u64,
@@ -1404,6 +1464,8 @@ pub struct UsageReportResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageSampleList {
+    /// Sparse audit events: user windows with traffic or an attribution gap. Collected idle
+    /// windows live in the machine series; this list is not a complete sampling timeline.
     pub samples: Vec<UsageSample>,
     /// Link-hop usage. Kept separate from `samples` rather than as two row kinds in one table:
     /// combined into one list, summing by tenant would add link overhead to user bills, and
@@ -2350,7 +2412,8 @@ pub struct DiskDetailSample {
 /// Optional deep network diagnostics from agents that support them.
 ///
 /// The socket inventory fields are end-of-window levels. The remaining fields are differences of
-/// kernel counters over this exact 30-second window. Keeping those two kinds explicit prevents a
+/// kernel counters over this exact window (normally 30 seconds at ingestion; older Console history
+/// may combine windows into minutes). Keeping those two kinds explicit prevents a
 /// UI from accidentally presenting a lifetime `TcpRetransSegs` counter as a current rate, or from
 /// averaging a current socket count that only has meaning at one instant.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

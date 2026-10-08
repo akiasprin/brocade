@@ -1,8 +1,12 @@
-import { useEffect, useRef, useState, type ButtonHTMLAttributes } from 'react';
-import { Icon } from './icons';
+import { useEffect, useRef, useState, type ButtonHTMLAttributes, type ReactNode } from 'react';
+import { Icon, type IconName } from './icons';
 import { copyText } from './platform';
 
-type CopyState = 'idle' | 'done' | 'failed';
+export type CopyState = 'idle' | 'done' | 'failed';
+
+/** 复制按钮在各状态下的图标：空闲为复制、成功为对勾、失败为警示。 */
+export const copyStateIcon = (state: CopyState): IconName =>
+  state === 'done' ? 'check' : state === 'failed' ? 'warn' : 'copy';
 
 export function CopyButton({
   text,
@@ -12,6 +16,7 @@ export function CopyButton({
   iconOnly = false,
   className,
   disabled,
+  children,
   ...buttonProps
 }: Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'children' | 'onClick'> & {
   text: string;
@@ -19,6 +24,8 @@ export function CopyButton({
   successLabel?: string;
   failureLabel?: string;
   iconOnly?: boolean;
+  /** 自定义按钮内容（例如「地址 + 复制图标」）。复制、反馈与复位仍由本组件负责。 */
+  children?: (state: CopyState, stateLabel: string) => ReactNode;
 }) {
   const [state, setState] = useState<CopyState>('idle');
   const timer = useRef<number | undefined>(undefined);
@@ -50,11 +57,7 @@ export function CopyButton({
         timer.current = window.setTimeout(() => setState('idle'), 1_600);
       }}
     >
-      {iconOnly ? (
-        <Icon of={state === 'done' ? 'check' : state === 'failed' ? 'warn' : 'copy'} size={16} />
-      ) : (
-        stateLabel
-      )}
+      {children ? children(state, stateLabel) : iconOnly ? <Icon of={copyStateIcon(state)} size={16} /> : stateLabel}
     </button>
   );
 }

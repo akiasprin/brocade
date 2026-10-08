@@ -1,8 +1,8 @@
-//! Serving client subscriptions. Nothing in this module writes: every request renders fresh content
+//! Serving client subscriptions. Every pull renders fresh content
 //! from the last fully converged serving projection and accounts the current calendar month.
 //! Committed-but-unpublished revisions are intentionally invisible, while an open/uncertain
 //! release makes pulls temporarily unavailable instead of returning a configuration which may not
-//! match the fleet.
+//! match the fleet. Administrator-only sharing links are separate operational state.
 
 use std::collections::BTreeSet;
 
@@ -207,7 +207,7 @@ pub async fn clash_haitun_link_for_user(
 ) -> Result<Option<ClashHaitunLink>> {
     let tenant_id = required_text(tenant_id, "tenant_id")?;
     let user_id = required_text(user_id, "user id")?;
-    actor.require_tenant_access(&tenant_id, "Clash subscription")?;
+    require_speedtest_subscription_admin(actor, &tenant_id)?;
     let row = sqlx::query(
         "SELECT tenant_id, user_id, token::text AS token,
                 created_at::text AS created_at, revoked_at::text AS revoked_at
@@ -230,9 +230,30 @@ pub async fn issue_clash_haitun_link(
     tenant_id: &str,
     user_id: &str,
 ) -> Result<ClashHaitunLink> {
+    write_clash_haitun_link(pool, actor, tenant_id, user_id, false).await
+}
+
+/// Atomically replace the URL token, including an active one. Already downloaded node
+/// credentials are unchanged: invalidating them requires UUID rotation and grant publication.
+pub async fn regenerate_clash_haitun_link(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<ClashHaitunLink> {
+    write_clash_haitun_link(pool, actor, tenant_id, user_id, true).await
+}
+
+async fn write_clash_haitun_link(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+    regenerate: bool,
+) -> Result<ClashHaitunLink> {
     let tenant_id = required_text(tenant_id, "tenant_id")?;
     let user_id = required_text(user_id, "user id")?;
-    actor.require_tenant_access(&tenant_id, "Clash subscription")?;
+    require_speedtest_subscription_admin(actor, &tenant_id)?;
     let exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (
              SELECT 1 FROM users
@@ -255,11 +276,11 @@ pub async fn issue_clash_haitun_link(
          VALUES ($1, $2, $3::uuid)
          ON CONFLICT (tenant_id, user_id) DO UPDATE SET
              token = CASE
-                 WHEN clash_haitun_links.revoked_at IS NULL THEN clash_haitun_links.token
+                 WHEN NOT $4 AND clash_haitun_links.revoked_at IS NULL THEN clash_haitun_links.token
                  ELSE EXCLUDED.token
              END,
              created_at = CASE
-                 WHEN clash_haitun_links.revoked_at IS NULL THEN clash_haitun_links.created_at
+                 WHEN NOT $4 AND clash_haitun_links.revoked_at IS NULL THEN clash_haitun_links.created_at
                  ELSE EXCLUDED.created_at
              END,
              revoked_at = NULL
@@ -269,35 +290,19 @@ pub async fn issue_clash_haitun_link(
     .bind(&tenant_id)
     .bind(&user_id)
     .bind(token)
+    .bind(regenerate)
     .fetch_one(pool)
     .await?;
     clash_haitun_link_from_row(row)
 }
 
-/// Repeated revocation is harmless and preserves the first revocation timestamp. A link that was
-/// never issued is a missing resource rather than an invented revoked state.
-pub async fn revoke_clash_haitun_link(
-    pool: &PgPool,
-    actor: &AdminContext,
-    tenant_id: &str,
-    user_id: &str,
-) -> Result<ClashHaitunLink> {
-    let tenant_id = required_text(tenant_id, "tenant_id")?;
-    let user_id = required_text(user_id, "user id")?;
-    actor.require_tenant_access(&tenant_id, "Clash subscription")?;
-    let row = sqlx::query(
-        "UPDATE clash_haitun_links
-         SET revoked_at = COALESCE(revoked_at, now())
-         WHERE tenant_id = $1 AND user_id = $2
-         RETURNING tenant_id, user_id, token::text AS token,
-                   created_at::text AS created_at, revoked_at::text AS revoked_at",
-    )
-    .bind(&tenant_id)
-    .bind(&user_id)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| StoreError::NotFound(format!("Haitun link {tenant_id}/{user_id}")))?;
-    clash_haitun_link_from_row(row)
+fn require_speedtest_subscription_admin(actor: &AdminContext, tenant_id: &str) -> Result<()> {
+    if !actor.can_manage_speedtest_subscriptions() {
+        return Err(StoreError::Forbidden(
+            "speed-test subscriptions require an administrator".to_owned(),
+        ));
+    }
+    actor.require_tenant_access(tenant_id, "speed-test subscription")
 }
 
 fn clash_haitun_link_from_row(row: sqlx::postgres::PgRow) -> Result<ClashHaitunLink> {

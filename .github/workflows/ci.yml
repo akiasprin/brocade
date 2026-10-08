@@ -58,6 +58,9 @@ jobs:
           go-version: ${{ steps.xray-go.outputs.version }}
           cache-dependency-path: components/xray-core/go.sum
 
+      - name: Prepare pinned Xray assets
+        run: sh "$GITHUB_WORKSPACE/scripts/prepare-xray-assets.sh"
+
       - name: AnyTLS deterministic and fuzz-seed tests
         run: go test ./proxy/anytls -count=10 -timeout=5m
 
@@ -218,6 +221,10 @@ jobs:
           cargo test -p brocade-store --test pg_integration --locked -- --ignored
           cargo test -p brocade-store --test tunnel_probe_pg --locked -- --ignored
           cargo test -p brocade-console --test http_integration --locked -- --ignored
+          cargo test -p brocade-console --lib --locked sqlx_events_really_include_query_and_pool_timings -- --ignored
+
+      - name: Read-only performance baseline contract
+        run: node --test scripts/performance-baseline.test.mjs
 
       - name: Agent online protocols against a real Xray process
         run: |

@@ -65,6 +65,8 @@ describe('machine-detail preparation', () => {
   it('only recognizes exact detail routes and safely decodes the node id', () => {
     expect(initialNodeDetailFromHash('#/nodes/node/edge-jp-01')).toBe('edge-jp-01');
     expect(initialNodeDetailFromHash('#/nodes/node/hk%2Fedge')).toBe('hk/edge');
+    expect(initialNodeDetailFromHash('#/nodes/node/edge-jp-01?range=6h')).toBe('edge-jp-01');
+    expect(initialNodeDetailFromHash('#/nodes/node/edge-jp-01?from=1700000000&to=1700000600')).toBe('edge-jp-01');
     expect(initialNodeDetailFromHash('#/nodes')).toBeNull();
     expect(initialNodeDetailFromHash('#/nodes/node')).toBeNull();
     expect(initialNodeDetailFromHash('#/nodes/node/n1/extra')).toBeNull();

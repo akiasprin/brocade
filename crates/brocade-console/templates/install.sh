@@ -865,8 +865,7 @@ tune_congestion() {
     # 写文件而不是只 sysctl -w：只 -w 的话重启就没了，而「装的时候设过、现在不是了」
     # 正是控制台要报的那种漂移——设了但不持久，等于给自己埋一个假信号。
     if ! cat > /etc/sysctl.d/99-brocade.conf <<'SYSCTL'
-# 由 brocade 安装脚本写入。控制台靠这个文件在不在，区分「本来就是 bbr」和
-# 「我们设成了 bbr，后来被人改回去了」——两句话对应的处理完全不同。
+# Brocade: TCP transport defaults.
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 SYSCTL
@@ -909,7 +908,7 @@ tune_congestion || true
 tune_tcp_fast_open() {
     conf=/etc/sysctl.d/99-brocade.conf
     if [ ! -e "$conf" ]; then
-        if ! printf '%s\n' '# 由 brocade 安装脚本写入。' > "$conf"; then
+        if ! printf '%s\n' '# Brocade: TCP transport defaults.' > "$conf"; then
             echo "写不了 $conf，跳过 TCP Fast Open。不影响安装。" >&2
             return 0
         fi
@@ -1029,14 +1028,20 @@ tune_conntrack() {
     # 时的常态——照着返回值判成失败就会跳过清理，然后追加，每重装一次多一份。所以这里只看
     # 临时文件在不在：空文件也是正确结果。
     if [ -f "$conf" ]; then
-        grep -v '^net\.netfilter\.nf_conntrack_' "$conf" > "$conf.tmp" 2>/dev/null || true
+        grep -v \
+            -e '^[[:space:]]*net\.netfilter\.nf_conntrack_max[[:space:]]*=' \
+            -e '^[[:space:]]*net\.netfilter\.nf_conntrack_udp_timeout[[:space:]]*=' \
+            -e '^[[:space:]]*net\.netfilter\.nf_conntrack_udp_timeout_stream[[:space:]]*=' \
+            -e '^# Brocade: conntrack for Hysteria 2 port hopping\.$' \
+            -e '^# 连接跟踪。hy2 端口跳转' \
+            -e '^# 机器上是三四千条。' \
+            "$conf" > "$conf.tmp" 2>/dev/null || true
         if [ -f "$conf.tmp" ]; then
             mv "$conf.tmp" "$conf" 2>/dev/null || rm -f "$conf.tmp"
         fi
     fi
     if ! cat >> "$conf" <<SYSCTL
-# 连接跟踪。hy2 端口跳转每换一个目的端口就是一条新表项，而内核按内存推出来的默认值在小内存
-# 机器上是三四千条。表满之后丢的是新流，已建立的照常走——症状是「跳转突然不通、重启就好」。
+# Brocade: conntrack for Hysteria 2 port hopping.
 net.netfilter.nf_conntrack_max = $want
 net.netfilter.nf_conntrack_udp_timeout = 30
 net.netfilter.nf_conntrack_udp_timeout_stream = 60

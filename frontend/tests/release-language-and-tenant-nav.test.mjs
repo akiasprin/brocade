@@ -54,6 +54,15 @@ test('隧道页位于线路前并接入主导航、路由和页面容器', () =>
   assert.match(panes, /TunnelsPane|case 'tab:tunnels'/);
 });
 
+test('手机顶栏只保留机器和线路，其他页面收入账户菜单', () => {
+  const mobileNav = shell.match(/const MOBILE_NAV = ([^;]+);/)?.[1] ?? '';
+  const mobileMore = shell.match(/const MOBILE_MORE = ([\s\S]*?);\n/)?.[1] ?? '';
+  assert.match(mobileNav, /f\.key === 'nodes'/);
+  assert.match(mobileNav, /f\.key === 'chains'/);
+  assert.doesNotMatch(mobileNav, /users|tunnels|deploy|usage/);
+  for (const key of ['users', 'tunnels', 'deploy', 'usage']) assert.match(mobileMore, new RegExp(`f\\.key === '${key}'`));
+});
+
 test('账户牌打开更多菜单，菜单项使用一致图标并标出展开与当前页状态', () => {
   assert.match(shell, /className="fg-menu nav-menu"/);
   assert.match(shell, /className="fg-menu-icon"/);
@@ -141,7 +150,7 @@ test('账户入口使用单行文案和产品角色名称', () => {
   assert.doesNotMatch(shell, /\{who\.role\}/);
 });
 
-test('产物与诊断只显示图标，与账户牌同为无框按钮', () => {
+test('产物与诊断收入账户菜单，顶栏只保留无框通知和账户按钮', () => {
   const toggle = styles.match(/\.fg-tgl\s*\{([\s\S]*?)\n\}/)?.[1] ?? '';
   const who = styles.match(/\.fg-who\s*\{([\s\S]*?)\n\}/)?.[1] ?? '';
   const mobile = styles.match(/\s\.fg-ico\s*\{([\s\S]*?)\n\s+\}/)?.[1] ?? '';
@@ -155,11 +164,16 @@ test('产物与诊断只显示图标，与账户牌同为无框按钮', () => {
     assert.match(rule, /background:\s*transparent/, `${name} has no surface`);
   }
   assert.match(toggle, /width:\s*30px/);
-  // 名称只在视觉上隐藏，读屏仍读到「产物」「诊断」。
-  assert.match(shell, /<span className="fg-tgl-label">产物<\/span>/);
-  assert.match(shell, /<span className="fg-tgl-label">诊断<\/span>/);
+  assert.doesNotMatch(shell, /<span className="fg-tgl-label">(?:产物|诊断)<\/span>/);
+  assert.equal((shell.match(/<MachineNotifications/g) ?? []).length, 2);
+  // 只有免密公开账户使用脱敏读取；已登录的普通用户保留自己的已读和清空游标。
+  assert.equal((shell.match(/publicView=\{isPublic\(who\)\}/g) ?? []).length, 2);
+  assert.match(shell, /<Icon of="artifactFolder" size=\{14\} className="fg-menu-icon" \/>/);
+  assert.match(shell, /<Icon of="diag" size=\{14\} className="fg-menu-icon" \/>/);
+  assert.match(shell, /诊断<small>\{diagnosticsMenuHint\}<\/small>/);
+  assert.match(shell, /disabled=\{!artifacts\}/);
   assert.match(styles, /\.fg-tgl-label\s*\{[^}]*clip-path:\s*inset\(50%\)/);
-  // 诊断计数压在图标右上角。
+  // 通知计数仍压在图标右上角。
   assert.match(styles, /\.fg-tgl \.fg-badge\s*\{[^}]*position:\s*absolute;[^}]*top:\s*-3px;[^}]*right:\s*-4px;/);
   assert.match(styles, /\.fg-tgl:disabled\s*\{[^}]*color:\s*var\(--ink-4\)/);
   assert.match(
@@ -168,10 +182,9 @@ test('产物与诊断只显示图标，与账户牌同为无框按钮', () => {
   );
   assert.match(styles, /\.fg-tgl-ic svg\s*\{[\s\S]*?stroke-width:\s*1\.25px/);
   assert.doesNotMatch(styles, /\.fg-top \.fg-more|\.fg-more-icon/);
-  assert.match(shell, /title=\{artifacts \? '显示 \/ 隐藏产物栏' : '当前身份无权查看产物'\}/);
   assert.equal(
     (shell.match(/<Icon of="artifactFolder" size=\{1[45]\} className="fg-(?:tgl-ic|menu-icon)" \/>/g) ?? []).length,
-    2,
+    1,
   );
 });
 
