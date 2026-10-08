@@ -42,6 +42,27 @@ func TestTryEnableKernelTLSModes(t *testing.T) {
 	})
 }
 
+func TestTryEnableKernelTLSReportsNonFatalFallbackReason(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	t.Run("disabled", func(t *testing.T) {
+		t.Setenv(platform.UseAnyTLSKernelTLS, "off")
+		enabled, reason, err := TryEnableKernelTLSWithReason(t.Context(), server)
+		if err != nil || enabled || reason != KernelTLSFallbackDisabled {
+			t.Fatalf("TryEnableKernelTLSWithReason() = (%v, %q, %v), want (false, %q, nil)", enabled, reason, err, KernelTLSFallbackDisabled)
+		}
+	})
+	t.Run("unsupported connection", func(t *testing.T) {
+		t.Setenv(platform.UseAnyTLSKernelTLS, "auto")
+		enabled, reason, err := TryEnableKernelTLSWithReason(t.Context(), server)
+		if err != nil || enabled || reason != KernelTLSFallbackUnsupportedConnection {
+			t.Fatalf("TryEnableKernelTLSWithReason() = (%v, %q, %v), want (false, %q, nil)", enabled, reason, err, KernelTLSFallbackUnsupportedConnection)
+		}
+	})
+}
+
 func TestDeriveKernelTLSKeyMaterialSupportsAESGCM(t *testing.T) {
 	tests := []struct {
 		name        string

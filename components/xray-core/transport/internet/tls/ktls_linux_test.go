@@ -3,10 +3,12 @@
 package tls
 
 import (
+	"bytes"
 	"context"
 	gotls "crypto/tls"
 	"crypto/x509"
 	stderrors "errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -66,6 +68,143 @@ func TestKernelTLSLoopbackAESGCM(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			testKernelTLSLoopback(t, test.cipherSuite)
 		})
+	}
+}
+
+func TestKernelTLSSessionResumption(t *testing.T) {
+	testKernelTLSSessionResumption(t, 0)
+}
+
+func TestKernelTLSSessionResumptionLargeTicket(t *testing.T) {
+	testKernelTLSSessionResumption(t, 20<<10)
+}
+
+func testKernelTLSSessionResumption(t *testing.T, ticketPadding int) {
+	t.Setenv(platform.UseAnyTLSKernelTLS, "auto")
+	certificate, _ := cert.MustGenerate(nil,
+		cert.CommonName("localhost"),
+		cert.DNSNames("localhost"),
+		cert.KeyUsage(x509.KeyUsageDigitalSignature),
+	)
+	certificatePEM, keyPEM := certificate.ToPEM()
+	keyPair, err := gotls.X509KeyPair(certificatePEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverConfig := &gotls.Config{
+		Certificates:           []gotls.Certificate{keyPair},
+		MinVersion:             gotls.VersionTLS13,
+		MaxVersion:             gotls.VersionTLS13,
+		SessionTicketsDisabled: false,
+	}
+	if ticketPadding > 0 {
+		serverConfig.WrapSession = func(state gotls.ConnectionState, session *gotls.SessionState) ([]byte, error) {
+			ticket, err := serverConfig.EncryptTicket(state, session)
+			if err != nil {
+				return nil, err
+			}
+			return append(ticket, make([]byte, ticketPadding)...), nil
+		}
+		serverConfig.UnwrapSession = func(identity []byte, state gotls.ConnectionState) (*gotls.SessionState, error) {
+			if len(identity) < ticketPadding {
+				return nil, nil
+			}
+			return serverConfig.DecryptTicket(identity[:len(identity)-ticketPadding], state)
+		}
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	type serverResult struct {
+		enabled   bool
+		didResume bool
+		err       error
+	}
+	results := make(chan serverResult, 2)
+	go func() {
+		for connectionIndex := range 2 {
+			rawConn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				results <- serverResult{err: acceptErr}
+				return
+			}
+			serverConn := Server(rawConn, serverConfig).(*Conn)
+			enabled, enableErr := TryEnableKernelTLS(context.Background(), serverConn)
+			if enableErr != nil {
+				_ = serverConn.Close()
+				results <- serverResult{err: enableErr}
+				continue
+			}
+			want := bytes.Repeat([]byte{byte(connectionIndex + 1)}, 32<<10)
+			payload := make([]byte, len(want))
+			if _, readErr := io.ReadFull(serverConn, payload); readErr != nil {
+				_ = serverConn.Close()
+				results <- serverResult{enabled: enabled, err: readErr}
+				continue
+			}
+			if !bytes.Equal(payload, want) {
+				_ = serverConn.Close()
+				results <- serverResult{enabled: enabled, err: fmt.Errorf("server received %d bytes, want %d", len(payload), len(want))}
+				continue
+			}
+			_, writeErr := serverConn.Write([]byte(fmt.Sprintf("server payload %d", connectionIndex)))
+			state := serverConn.ConnectionState()
+			if closeErr := serverConn.Close(); writeErr == nil {
+				writeErr = closeErr
+			}
+			results <- serverResult{enabled: enabled, didResume: state.DidResume, err: writeErr}
+		}
+	}()
+
+	clientConfig := &gotls.Config{
+		InsecureSkipVerify:          true,
+		ServerName:                  "localhost",
+		MinVersion:                  gotls.VersionTLS13,
+		MaxVersion:                  gotls.VersionTLS13,
+		ClientSessionCache:          gotls.NewLRUClientSessionCache(2),
+		DynamicRecordSizingDisabled: true,
+	}
+	for connectionIndex := range 2 {
+		rawClient, dialErr := net.DialTimeout("tcp4", listener.Addr().String(), 5*time.Second)
+		if dialErr != nil {
+			t.Fatal(dialErr)
+		}
+		client := gotls.Client(rawClient, clientConfig)
+		if err := client.Handshake(); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := client.ConnectionState().DidResume, connectionIndex == 1; got != want {
+			t.Fatalf("client connection %d DidResume = %v, want %v", connectionIndex, got, want)
+		}
+		request := bytes.Repeat([]byte{byte(connectionIndex + 1)}, 32<<10)
+		if _, err := client.Write(request); err != nil {
+			t.Fatal(err)
+		}
+		response := make([]byte, len(fmt.Sprintf("server payload %d", connectionIndex)))
+		if _, err := io.ReadFull(client, response); err != nil {
+			server := <-results
+			t.Fatalf("read response: %v (server: %v)", err, server.err)
+		}
+		server := <-results
+		if server.err != nil {
+			t.Fatal(server.err)
+		}
+		if !server.enabled {
+			_ = client.Close()
+			t.Skip("kTLS is unavailable on this kernel")
+		}
+		if server.didResume != (connectionIndex == 1) {
+			t.Fatalf("server connection %d DidResume = %v", connectionIndex, server.didResume)
+		}
+		if got, want := string(response), fmt.Sprintf("server payload %d", connectionIndex); got != want {
+			t.Fatalf("response = %q, want %q", got, want)
+		}
+		if err := client.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

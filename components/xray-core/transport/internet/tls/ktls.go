@@ -28,12 +28,35 @@ var (
 )
 
 type kernelTLSKeyMaterial struct {
-	cipherSuite uint16
-	txKey       []byte
-	txIV        []byte
-	rxKey       []byte
-	rxIV        []byte
+	cipherSuite      uint16
+	txKey            []byte
+	txIV             []byte
+	txRecordSequence uint64
+	rxKey            []byte
+	rxIV             []byte
+	rxRecordSequence uint64
 }
+
+// KernelTLSFallbackReason identifies the compatibility condition that kept one
+// connection on Go TLS while xray.anytls.ktls=auto was enabled. It deliberately
+// describes transport negotiation, not AnyTLS authentication: public TLS
+// scanners reach this decision before the protocol can authenticate them.
+type KernelTLSFallbackReason string
+
+const (
+	KernelTLSFallbackNone                  KernelTLSFallbackReason = ""
+	KernelTLSFallbackDisabled              KernelTLSFallbackReason = "disabled"
+	KernelTLSFallbackUnsupportedConnection KernelTLSFallbackReason = "unsupported_connection"
+	KernelTLSFallbackNotServer             KernelTLSFallbackReason = "not_server"
+	KernelTLSFallbackApplicationIO         KernelTLSFallbackReason = "application_io_started"
+	KernelTLSFallbackPreflight             KernelTLSFallbackReason = "preflight"
+	KernelTLSFallbackSessionTickets        KernelTLSFallbackReason = "session_tickets"
+	KernelTLSFallbackTLSVersion            KernelTLSFallbackReason = "tls_version"
+	KernelTLSFallbackTrafficSecrets        KernelTLSFallbackReason = "traffic_secrets"
+	KernelTLSFallbackCipherSuite           KernelTLSFallbackReason = "cipher_suite"
+	KernelTLSFallbackSocket                KernelTLSFallbackReason = "socket"
+	KernelTLSFallbackOther                 KernelTLSFallbackReason = "other"
+)
 
 func (m *kernelTLSKeyMaterial) clear() {
 	clear(m.txKey)
@@ -47,6 +70,15 @@ func (m *kernelTLSKeyMaterial) clear() {
 // using Go TLS. Handshake failures and failures after the kernel socket has
 // been modified remain fatal.
 func TryEnableKernelTLS(ctx context.Context, conn net.Conn) (bool, error) {
+	enabled, _, err := TryEnableKernelTLSWithReason(ctx, conn)
+	return enabled, err
+}
+
+// TryEnableKernelTLSWithReason is TryEnableKernelTLS plus a stable reason for
+// non-fatal auto-mode fallback. A successful promotion has reason
+// KernelTLSFallbackNone. The reason remains available to callers after the
+// compatibility error itself has intentionally been suppressed.
+func TryEnableKernelTLSWithReason(ctx context.Context, conn net.Conn) (bool, KernelTLSFallbackReason, error) {
 	mode := strings.ToLower(strings.TrimSpace(platform.NewEnvFlag(platform.UseAnyTLSKernelTLS).GetValue(func() string {
 		return "auto"
 	})))
@@ -54,11 +86,11 @@ func TryEnableKernelTLS(ctx context.Context, conn net.Conn) (bool, error) {
 		mode = "auto"
 	}
 	if mode == "off" || mode == "false" || mode == "0" || mode == "disabled" {
-		return false, nil
+		return false, KernelTLSFallbackDisabled, nil
 	}
 	required := mode == "required"
 	if mode != "auto" && !required && mode != "on" && mode != "true" && mode != "1" {
-		return false, fmt.Errorf("invalid %s mode %q", platform.UseAnyTLSKernelTLS, mode)
+		return false, KernelTLSFallbackNone, fmt.Errorf("invalid %s mode %q", platform.UseAnyTLSKernelTLS, mode)
 	}
 
 	inner := conn
@@ -68,20 +100,23 @@ func TryEnableKernelTLS(ctx context.Context, conn net.Conn) (bool, error) {
 	tlsConn, ok := inner.(*Conn)
 	if !ok {
 		if required {
-			return false, fmt.Errorf("%w: AnyTLS connection is not direct Go TLS", errKernelTLSUnavailable)
+			return false, KernelTLSFallbackUnsupportedConnection, fmt.Errorf("%w: AnyTLS connection is not direct Go TLS", errKernelTLSUnavailable)
 		}
-		return false, nil
+		return false, KernelTLSFallbackUnsupportedConnection, nil
 	}
 
-	enabled, err := tlsConn.enableKernelTLS(ctx)
+	enabled, reason, err := tlsConn.enableKernelTLS(ctx)
 	if err == nil {
-		return enabled, nil
+		return enabled, reason, nil
 	}
 	if stderrors.Is(err, errKernelTLSUnavailable) && !required {
 		errors.LogDebug(ctx, "AnyTLS kTLS fallback: ", err)
-		return false, nil
+		if reason == KernelTLSFallbackNone {
+			reason = KernelTLSFallbackOther
+		}
+		return false, reason, nil
 	}
-	return false, err
+	return false, reason, err
 }
 
 // KernelTLSRawConn returns the plaintext kernel-TLS socket after promotion.
@@ -98,33 +133,70 @@ func KernelTLSRawConn(conn net.Conn) (net.Conn, bool) {
 	return tlsConn.rawConn, true
 }
 
-func (c *Conn) enableKernelTLS(ctx context.Context) (bool, error) {
-	c.promoteMu.Lock()
-	defer c.promoteMu.Unlock()
-
-	if c.kernelTLSConn() != nil {
-		return true, nil
-	}
-	if c.serverConfig == nil || c.rawConn == nil {
-		return false, fmt.Errorf("%w: not a server-side TLS connection", errKernelTLSUnavailable)
-	}
-	if c.ioStarted.Load() {
-		return false, fmt.Errorf("%w: TLS application I/O has already started", errKernelTLSUnavailable)
-	}
-	if err := preflightKernelTLS(); err != nil {
-		return false, fmt.Errorf("%w: %v", errKernelTLSUnavailable, err)
+func prepareKernelTLSServerConfig(base *gotls.Config, secrets io.Writer) (*gotls.Config, *uint64, error) {
+	if !base.SessionTicketsDisabled && (base.WrapSession == nil || base.UnwrapSession == nil) {
+		// Clone only shares the source Config's ticket keys once they have been
+		// initialized. Decrypting an empty identity initializes or rotates the
+		// default key set without producing a throwaway ticket.
+		if _, err := base.DecryptTicket(nil, gotls.ConnectionState{}); err != nil {
+			return nil, nil, err
+		}
 	}
 
-	secrets := newTrafficSecretCapture()
-	config := c.serverConfig.Clone()
-	// A NewSessionTicket consumes an application-data record sequence number.
-	// Disabling tickets keeps both directions at sequence zero when kTLS takes
-	// ownership after the handshake. AnyTLS does not rely on TLS resumption.
-	config.SessionTicketsDisabled = true
+	config := base.Clone()
+	ticketRecords := new(uint64)
+	if !config.SessionTicketsDisabled {
+		wrapSession := config.WrapSession
+		if wrapSession == nil {
+			wrapSession = config.EncryptTicket
+		}
+		config.WrapSession = func(state gotls.ConnectionState, session *gotls.SessionState) ([]byte, error) {
+			ticket, err := wrapSession(state, session)
+			if err == nil {
+				// NewSessionTicket uses the server application traffic secret.
+				// Count every record, including custom tickets large enough to
+				// span more than one 16 KiB TLS plaintext fragment, so kTLS
+				// resumes at the exact following sequence number.
+				const (
+					maxTLSPlaintextRecordSize = 16 * 1024
+					newSessionTicketOverhead  = 17
+				)
+				messageSize := newSessionTicketOverhead + len(ticket)
+				*ticketRecords += uint64((messageSize + maxTLSPlaintextRecordSize - 1) / maxTLSPlaintextRecordSize)
+			}
+			return ticket, err
+		}
+	}
 	if config.KeyLogWriter == nil {
 		config.KeyLogWriter = secrets
 	} else {
 		config.KeyLogWriter = io.MultiWriter(config.KeyLogWriter, secrets)
+	}
+	return config, ticketRecords, nil
+}
+
+func (c *Conn) enableKernelTLS(ctx context.Context) (bool, KernelTLSFallbackReason, error) {
+	c.promoteMu.Lock()
+	defer c.promoteMu.Unlock()
+
+	if c.kernelTLSConn() != nil {
+		return true, KernelTLSFallbackNone, nil
+	}
+	if c.serverConfig == nil || c.rawConn == nil {
+		return false, KernelTLSFallbackNotServer, fmt.Errorf("%w: not a server-side TLS connection", errKernelTLSUnavailable)
+	}
+	if c.ioStarted.Load() {
+		return false, KernelTLSFallbackApplicationIO, fmt.Errorf("%w: TLS application I/O has already started", errKernelTLSUnavailable)
+	}
+	if err := preflightKernelTLS(); err != nil {
+		return false, KernelTLSFallbackPreflight, fmt.Errorf("%w: %v", errKernelTLSUnavailable, err)
+	}
+
+	secrets := newTrafficSecretCapture()
+	config, ticketRecords, err := prepareKernelTLSServerConfig(c.serverConfig, secrets)
+	if err != nil {
+		secrets.clear()
+		return false, KernelTLSFallbackSessionTickets, fmt.Errorf("%w: prepare TLS session tickets: %v", errKernelTLSUnavailable, err)
 	}
 
 	boundaryConn := newTLSRecordBoundaryConn(c.rawConn)
@@ -135,43 +207,44 @@ func (c *Conn) enableKernelTLS(ctx context.Context) (bool, error) {
 
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		secrets.clear()
-		return false, err
+		return false, KernelTLSFallbackNone, err
 	}
 	c.ioStarted.Store(true)
 
 	state := tlsConn.ConnectionState()
 	if state.Version != gotls.VersionTLS13 {
 		secrets.clear()
-		return false, fmt.Errorf("%w: negotiated TLS version 0x%x", errKernelTLSUnavailable, state.Version)
+		return false, KernelTLSFallbackTLSVersion, fmt.Errorf("%w: negotiated TLS version 0x%x", errKernelTLSUnavailable, state.Version)
 	}
 	clientSecret, serverSecret, ok := secrets.takeTrafficSecrets()
 	secrets.clear()
 	if !ok {
 		clear(clientSecret)
 		clear(serverSecret)
-		return false, fmt.Errorf("%w: TLS 1.3 traffic secrets were not captured", errKernelTLSUnavailable)
+		return false, KernelTLSFallbackTrafficSecrets, fmt.Errorf("%w: TLS 1.3 traffic secrets were not captured", errKernelTLSUnavailable)
 	}
 	defer clear(clientSecret)
 	defer clear(serverSecret)
 
 	material, err := deriveKernelTLSKeyMaterial(state.CipherSuite, serverSecret, clientSecret)
 	if err != nil {
-		return false, fmt.Errorf("%w: %v", errKernelTLSUnavailable, err)
+		return false, KernelTLSFallbackCipherSuite, fmt.Errorf("%w: %v", errKernelTLSUnavailable, err)
 	}
+	material.txRecordSequence = *ticketRecords
 	defer material.clear()
 	modified, err := installKernelTLS(c.rawConn, material)
 	if err != nil {
 		if modified {
 			_ = c.rawConn.Close()
-			return false, fmt.Errorf("install kTLS after enabling TCP ULP: %w", err)
+			return false, KernelTLSFallbackNone, fmt.Errorf("install kTLS after enabling TCP ULP: %w", err)
 		}
-		return false, fmt.Errorf("%w: %v", errKernelTLSUnavailable, err)
+		return false, KernelTLSFallbackSocket, fmt.Errorf("%w: %v", errKernelTLSUnavailable, err)
 	}
 
 	c.stateMu.Lock()
 	c.kernelConn = newKernelTLSConn(c.rawConn)
 	c.stateMu.Unlock()
-	return true, nil
+	return true, KernelTLSFallbackNone, nil
 }
 
 func deriveKernelTLSKeyMaterial(cipherSuite uint16, txSecret, rxSecret []byte) (*kernelTLSKeyMaterial, error) {

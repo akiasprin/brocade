@@ -41,6 +41,7 @@ const (
 	localPerfClientCPUsEnv  = "XRAY_LOCAL_PERF_CLIENT_CPUS"
 	localPerfLoadCPUsEnv    = "XRAY_LOCAL_PERF_LOAD_CPUS"
 	localPerfVLESSFlowEnv   = "XRAY_LOCAL_PERF_VLESS_FLOW"
+	localPerfDirectionEnv   = "XRAY_LOCAL_PERF_DIRECTION"
 )
 
 type localPerfOptions struct {
@@ -51,11 +52,12 @@ type localPerfOptions struct {
 	serverCPUs     string
 	clientCPUs     string
 	loadCPUs       string
+	direction      string
 }
 
 func localPerfOptionsFromEnv(t *testing.T, defaultConcurrency, defaultBodyBytes int) localPerfOptions {
 	t.Helper()
-	return localPerfOptions{
+	options := localPerfOptions{
 		concurrency:    positiveEnvInt(t, localPerfConcurrencyEnv, defaultConcurrency),
 		bodyBytes:      positiveEnvInt(t, localPerfBodyBytesEnv, defaultBodyBytes),
 		profileDir:     os.Getenv(localPerfProfileDirEnv),
@@ -63,7 +65,15 @@ func localPerfOptionsFromEnv(t *testing.T, defaultConcurrency, defaultBodyBytes 
 		serverCPUs:     os.Getenv(localPerfServerCPUsEnv),
 		clientCPUs:     os.Getenv(localPerfClientCPUsEnv),
 		loadCPUs:       os.Getenv(localPerfLoadCPUsEnv),
+		direction:      os.Getenv(localPerfDirectionEnv),
 	}
+	if options.direction == "" {
+		options.direction = "download"
+	}
+	if options.direction != "download" && options.direction != "upload" {
+		t.Fatalf("%s must be download or upload, got %q", localPerfDirectionEnv, options.direction)
+	}
+	return options
 }
 
 func positiveEnvInt(t *testing.T, name string, fallback int) int {
@@ -317,6 +327,46 @@ func startLocalCPUProfiles(t *testing.T, ctx context.Context, directory, prefix 
 	}
 }
 
+func captureLocalHeapProfiles(t *testing.T, ctx context.Context, directory, prefix string, ports map[string]xnet.Port) {
+	t.Helper()
+	if directory == "" {
+		return
+	}
+	for name, port := range ports {
+		request, err := http.NewRequestWithContext(
+			ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/debug/pprof/heap", port), nil,
+		)
+		if err != nil {
+			t.Errorf("build %s heap profile request: %v", name, err)
+			continue
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Errorf("capture %s heap profile: %v", name, err)
+			continue
+		}
+		if response.StatusCode != http.StatusOK {
+			_ = response.Body.Close()
+			t.Errorf("capture %s heap profile: HTTP status %s", name, response.Status)
+			continue
+		}
+		path := filepath.Join(directory, prefix+"-"+name+".heap.pprof")
+		file, createErr := os.Create(path)
+		if createErr == nil {
+			_, createErr = io.Copy(file, response.Body)
+			if closeErr := file.Close(); createErr == nil {
+				createErr = closeErr
+			}
+		}
+		if closeErr := response.Body.Close(); createErr == nil {
+			createErr = closeErr
+		}
+		if createErr != nil {
+			t.Errorf("write %s heap profile: %v", name, createErr)
+		}
+	}
+}
+
 // TestLocalAnyTLSHighConcurrency is an explicit local capacity/profile gate.
 // It stays out of regular CI because its result depends on host CPU topology.
 func TestLocalAnyTLSHighConcurrency(t *testing.T) {
@@ -411,6 +461,9 @@ func TestLocalAnyTLSHighConcurrency(t *testing.T) {
 	for index := range options.concurrency {
 		index := index
 		group.Go(func() error {
+			if options.direction == "upload" {
+				return uploadFragmentedHTTPS(ctx, clientPort, index+1, options.bodyBytes)
+			}
 			return fetchFragmentedHTTPS(ctx, clientPort, index+1, expectedBodyHash, options.bodyBytes)
 		})
 	}
@@ -420,9 +473,10 @@ func TestLocalAnyTLSHighConcurrency(t *testing.T) {
 	elapsed := time.Since(started)
 	logProcessUsage()
 	waitProfiles()
+	captureLocalHeapProfiles(t, ctx, options.profileDir, "anytls", profilePorts)
 	transferred := int64(options.concurrency) * int64(options.bodyBytes)
 	t.Logf(
-		"protocol=anytls connections=%d transferred=%d elapsed=%s throughput=%.2f GiB/s",
-		options.concurrency, transferred, elapsed, float64(transferred)/elapsed.Seconds()/(1<<30),
+		"protocol=anytls direction=%s connections=%d transferred=%d elapsed=%s throughput=%.2f GiB/s",
+		options.direction, options.concurrency, transferred, elapsed, float64(transferred)/elapsed.Seconds()/(1<<30),
 	)
 }

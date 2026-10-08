@@ -329,6 +329,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 				w.ob.CanSpliceCopy.CompareAndSwap(session.SpliceCopyWaiting, session.SpliceCopyDirect)
 			}
 		}
+		SuppressOuterCloseNotify(w.conn)
 		readerConn, readCounter, _ := UnwrapRawConn(w.conn)
 		w.directReadCounter = readCounter
 		w.Reader = buf.NewReader(readerConn)
@@ -461,6 +462,7 @@ func (w *VisionWriter) activateDirectWrite(switchToDirectCopy *bool) *session.In
 		// Uplink splice is intentionally not enabled yet. The writer still has to
 		// unwrap the outer TLS connection when the peer sends CommandPaddingDirect.
 	}
+	SuppressOuterCloseNotify(w.conn)
 	rawConn, _, writerCounter := UnwrapRawConn(w.conn)
 	w.Writer = buf.NewWriter(rawConn)
 	w.directWriteCounter = writerCounter
@@ -1008,6 +1010,19 @@ func XtlsFilterTls(buffer buf.MultiBuffer, trafficState *TrafficState, isUplink 
 	trafficState.NumberOfPacketToFilter = 0
 	filter.data = nil
 	filter.done = true
+}
+
+type closeNotifySuppressor interface {
+	SuppressCloseNotify()
+}
+
+// SuppressOuterCloseNotify transfers connection shutdown to the raw transport
+// after Vision has bypassed the outer TLS record layer. Closing that abandoned
+// TLS state would otherwise inject an outer close_notify into the inner stream.
+func SuppressOuterCloseNotify(conn net.Conn) {
+	if suppressor, ok := stat.TryUnwrapStatsConn(conn).(closeNotifySuppressor); ok {
+		suppressor.SuppressCloseNotify()
+	}
 }
 
 // UnwrapRawConn support unwrap encryption, stats, mask wrappers, tls, utls, reality, proxyproto, uds-wrapper conn and get raw tcp/uds conn from it

@@ -95,11 +95,11 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	sessPol := s.policyManager.ForLevel(0)
 	handshakeDeadline := time.Now().Add(sessPol.Timeouts.Handshake)
 	_ = conn.SetReadDeadline(handshakeDeadline)
-	kernelTLSEnabled, err := v2tls.TryEnableKernelTLS(ctx, conn)
+	kernelTLSEnabled, kernelTLSFallbackReason, err := v2tls.TryEnableKernelTLSWithReason(ctx, conn)
 	if err != nil {
 		return errors.New("anytls: enable kTLS").Base(err)
 	}
-	s.performance.recordKernelTLS(kernelTLSEnabled)
+	s.performance.recordKernelTLS(kernelTLSEnabled, kernelTLSFallbackReason)
 
 	sess := s.newSession(conn, dispatcher)
 	sess.fw = newFrameWriter(sess.bw)
@@ -147,6 +147,7 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 		cancel()
 		return failAuthentication(errors.New("anytls: invalid user"))
 	}
+	s.performance.recordAuthenticatedKernelTLS(kernelTLSEnabled, kernelTLSFallbackReason)
 	defer s.unregisterSession(user, sess)
 	defer sess.close(nil)
 	_ = conn.SetReadDeadline(time.Time{})

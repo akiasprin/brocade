@@ -9,12 +9,15 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"io"
+	"net"
+	"syscall"
 	"testing"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
 	v2tls "github.com/xtls/xray-core/transport/internet/tls"
+	"golang.org/x/sys/unix"
 )
 
 func TestWritePSHBatchVectoredUsesOneNormalBatch(t *testing.T) {
@@ -89,6 +92,22 @@ func TestAdvanceWritevVectorsPreservesPartialVector(t *testing.T) {
 	vectors = advanceWritevVectors(vectors, len("header")+3)
 	if len(vectors) != 2 || string(vectors[0]) != "load" || string(vectors[1]) != "tail" {
 		t.Fatalf("advanced vectors = %q", vectors)
+	}
+}
+
+func TestKernelTLSWritevScratchDropsOversizedVectors(t *testing.T) {
+	scratch := newKernelTLSWritevScratch().(*kernelTLSWritevScratch)
+	scratch.vectors = make([][]byte, 1, maxPooledKernelTLSWritevVectors+1)
+	scratch.iovecs = make([]unix.Iovec, 1, maxPooledKernelTLSWritevVectors+1)
+	scratch.vectors[0] = []byte("retained")
+	scratch.iovecs[0].Base = &scratch.vectors[0][0]
+
+	scratch.reset()
+	if got := cap(scratch.vectors); got != initialKernelTLSWritevVectorCapacity {
+		t.Fatalf("vector capacity after reset = %d, want %d", got, initialKernelTLSWritevVectorCapacity)
+	}
+	if got := cap(scratch.iovecs); got != initialKernelTLSWritevVectorCapacity {
+		t.Fatalf("iovec capacity after reset = %d, want %d", got, initialKernelTLSWritevVectorCapacity)
 	}
 }
 
@@ -187,5 +206,51 @@ func TestKernelTLSVectoredWritePreservesAnyTLSFrames(t *testing.T) {
 	}
 	if !bytes.Equal(reconstructed.Bytes(), payload) {
 		t.Fatal("kTLS writev payload differs from source")
+	}
+}
+
+func BenchmarkWritePSHBatchVectored(b *testing.B) {
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan *net.TCPConn, 1)
+	go func() {
+		conn, acceptErr := listener.AcceptTCP()
+		if acceptErr != nil {
+			accepted <- nil
+			return
+		}
+		accepted <- conn
+	}()
+	writer, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		b.Fatal(err)
+	}
+	reader := <-accepted
+	if reader == nil {
+		b.Fatal("accept benchmark connection")
+	}
+	defer writer.Close()
+	defer reader.Close()
+	go func() {
+		_, _ = io.Copy(io.Discard, reader)
+	}()
+	raw, err := syscall.Conn(writer).SyscallConn()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	payload := buf.FromBytes(make([]byte, maxPSHBatchPayloadSize))
+	defer payload.Release()
+	data := buf.MultiBuffer{payload}
+	b.SetBytes(int64(maxPSHBatchPayloadSize))
+	b.ReportAllocs()
+	for b.Loop() {
+		result := writePSHBatchVectored(raw, 1, data)
+		if result.err != nil {
+			b.Fatal(result.err)
+		}
 	}
 }

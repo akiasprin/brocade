@@ -335,6 +335,17 @@ func startFragmentedHTTPSOrigin(t *testing.T, bodySize int) (*httptest.Server, [
 	copy(expected[:], hash.Sum(nil))
 
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/upload" {
+			hash := sha256.New()
+			written, err := io.Copy(hash, io.LimitReader(request.Body, int64(bodySize)+1))
+			if err != nil || written != int64(bodySize) || !bytes.Equal(hash.Sum(nil), expected[:]) {
+				http.Error(writer, "invalid upload", http.StatusBadRequest)
+				return
+			}
+			writer.Header().Set("Connection", "close")
+			writer.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if request.URL.Path != "/large" {
 			http.NotFound(writer, request)
 			return
@@ -360,6 +371,87 @@ func startFragmentedHTTPSOrigin(t *testing.T, bodySize int) (*httptest.Server, [
 	server.Listener = &fragmentingListener{Listener: server.Listener}
 	server.StartTLS()
 	return server, expected
+}
+
+type repeatedPatternReader struct {
+	pattern   []byte
+	remaining int
+	offset    int
+}
+
+func (r *repeatedPatternReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	p = p[:min(len(p), r.remaining)]
+	written := 0
+	for written < len(p) {
+		length := min(len(r.pattern)-r.offset, len(p)-written)
+		copy(p[written:], r.pattern[r.offset:r.offset+length])
+		written += length
+		r.offset = (r.offset + length) % len(r.pattern)
+	}
+	r.remaining -= written
+	return written, nil
+}
+
+func uploadFragmentedHTTPS(ctx context.Context, port net.Port, seed int, bodySize int) error {
+	dialer := stdnet.Dialer{Timeout: 5 * time.Second}
+	raw, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	if tcpConn, ok := raw.(*stdnet.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+	}
+	fragmented := &fragmentingConn{
+		Conn:      raw,
+		rng:       mathrand.New(mathrand.NewSource(int64(seed))),
+		remaining: 32 << 10,
+	}
+	tlsConn := gotls.Client(fragmented, &gotls.Config{
+		InsecureSkipVerify: true, // The origin certificate exists only for this local scenario.
+		MinVersion:         gotls.VersionTLS13,
+		MaxVersion:         gotls.VersionTLS13,
+		ServerName:         "inner-origin.test",
+		NextProtos:         []string{"http/1.1"},
+	})
+	deadline, ok := ctx.Deadline()
+	if ok {
+		_ = tlsConn.SetDeadline(deadline)
+	}
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return fmt.Errorf("TLS handshake: %w", err)
+	}
+	body := &repeatedPatternReader{
+		pattern:   []byte("brocade-vision-real-https-"),
+		remaining: bodySize,
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://inner-origin.test/upload", body)
+	if err != nil {
+		return err
+	}
+	request.ContentLength = int64(bodySize)
+	request.Close = true
+	if err := request.Write(tlsConn); err != nil {
+		return fmt.Errorf("write HTTP upload: %w", err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(tlsConn), request)
+	if err != nil {
+		return fmt.Errorf("read HTTP upload response: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("HTTP upload status = %s, want 204 No Content", response.Status)
+	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		return fmt.Errorf("read HTTP upload response body: %w", err)
+	}
+	if body.remaining != 0 {
+		return fmt.Errorf("HTTP upload left %d bytes unsent", body.remaining)
+	}
+	return nil
 }
 
 func fetchFragmentedHTTPS(ctx context.Context, port net.Port, seed int, expectedHash [sha256.Size]byte, expectedSize int) error {

@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
@@ -34,6 +35,18 @@ import (
 
 type Conn struct {
 	*reality.Conn
+	suppressCloseNotify atomic.Bool
+}
+
+func (c *Conn) SuppressCloseNotify() {
+	c.suppressCloseNotify.Store(true)
+}
+
+func (c *Conn) Close() error {
+	if c.suppressCloseNotify.Load() {
+		return c.Conn.NetConn().Close()
+	}
+	return c.Conn.Close()
 }
 
 func (c *Conn) HandshakeAddress() net.Address {
@@ -64,10 +77,22 @@ func Server(c net.Conn, config *reality.Config) (net.Conn, error) {
 
 type UConn struct {
 	*utls.UConn
-	Config     *Config
-	ServerName string
-	AuthKey    []byte
-	Verified   bool
+	Config              *Config
+	ServerName          string
+	AuthKey             []byte
+	Verified            bool
+	suppressCloseNotify atomic.Bool
+}
+
+func (c *UConn) SuppressCloseNotify() {
+	c.suppressCloseNotify.Store(true)
+}
+
+func (c *UConn) Close() error {
+	if c.suppressCloseNotify.Load() {
+		return c.NetConn().Close()
+	}
+	return c.UConn.Close()
 }
 
 func (c *UConn) HandshakeAddress() net.Address {

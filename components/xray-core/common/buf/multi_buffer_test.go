@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -126,16 +127,23 @@ func TestMultiBufferReadAllToByte(t *testing.T) {
 		}
 	}
 	{
-		const dat = "data/test_MultiBufferReadAllToByte.dat"
+		dat := filepath.Join(t.TempDir(), "read-all.dat")
+		cnt := bytes.Repeat([]byte("brocade xray buffer fixture\n"), 512)
+		if err := os.WriteFile(dat, cnt, 0o600); err != nil {
+			t.Fatal(err)
+		}
 		f, err := os.Open(dat)
-		common.Must(err)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		buf2, err := ReadAllToBytes(f)
-		common.Must(err)
-		f.Close()
-
-		cnt, err := os.ReadFile(dat)
-		common.Must(err)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
 
 		if d := cmp.Diff(buf2, cnt); d != "" {
 			t.Error("fail to read from file: ", d)

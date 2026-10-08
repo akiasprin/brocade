@@ -4,6 +4,7 @@ package tls
 
 import (
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -239,10 +240,10 @@ func configureKernelTLSSocket(conn net.Conn, material *kernelTLSKeyMaterial) (bo
 			return
 		}
 		modified = true
-		if socketErr = setKernelTLSCrypto(int(fd), kernelTLSSetTX, material.cipherSuite, material.txKey, material.txIV); socketErr != nil {
+		if socketErr = setKernelTLSCrypto(int(fd), kernelTLSSetTX, material.cipherSuite, material.txKey, material.txIV, material.txRecordSequence); socketErr != nil {
 			return
 		}
-		socketErr = setKernelTLSCrypto(int(fd), kernelTLSSetRX, material.cipherSuite, material.rxKey, material.rxIV)
+		socketErr = setKernelTLSCrypto(int(fd), kernelTLSSetRX, material.cipherSuite, material.rxKey, material.rxIV, material.rxRecordSequence)
 	})
 	if err != nil {
 		return modified, err
@@ -250,7 +251,7 @@ func configureKernelTLSSocket(conn net.Conn, material *kernelTLSKeyMaterial) (bo
 	return modified, socketErr
 }
 
-func setKernelTLSCrypto(fd, direction int, cipherSuite uint16, key, iv []byte) error {
+func setKernelTLSCrypto(fd, direction int, cipherSuite uint16, key, iv []byte, recordSequence uint64) error {
 	if len(iv) != 12 {
 		return fmt.Errorf("invalid TLS 1.3 IV length %d", len(iv))
 	}
@@ -270,6 +271,7 @@ func setKernelTLSCrypto(fd, direction int, cipherSuite uint16, key, iv []byte) e
 		copy(info.Salt[:], iv[:4])
 		copy(info.IV[:], iv[4:])
 		copy(info.Key[:], key)
+		binary.BigEndian.PutUint64(info.RecordSeq[:], recordSequence)
 		pointer = unsafe.Pointer(&info)
 		size = unsafe.Sizeof(info)
 		defer runtime.KeepAlive(info)
@@ -284,6 +286,7 @@ func setKernelTLSCrypto(fd, direction int, cipherSuite uint16, key, iv []byte) e
 		copy(info.Salt[:], iv[:4])
 		copy(info.IV[:], iv[4:])
 		copy(info.Key[:], key)
+		binary.BigEndian.PutUint64(info.RecordSeq[:], recordSequence)
 		pointer = unsafe.Pointer(&info)
 		size = unsafe.Sizeof(info)
 		defer runtime.KeepAlive(info)
