@@ -435,6 +435,7 @@ const pushLocation = (hash: string, position: RoutePosition = { scrollTop: 0 }):
 // 页面名称由外壳管理（NAV / MORE 两张表），在 startRouting 时传入；
 // 在此处 import 会形成循环依赖。只在打开窗口时使用一次，默认值为 nav 本身。
 let labelOf: (nav: NavKey) => string = nav => nav;
+let normalizeLocation: (location: Loc) => Loc = location => location;
 
 function apply(loc: Loc) {
   applying = true;
@@ -476,7 +477,7 @@ const moveTo = (
   restorePrevious: boolean,
   preservePosition = false,
 ): boolean => {
-  const loc: Loc = { nav, drill };
+  const loc = normalizeLocation({ nav, drill });
   const next = serialize(loc);
   if (!confirmDiscardChanges()) return false;
   cancelVisualTransition();
@@ -532,15 +533,16 @@ let started = false;
     外壳重新挂载，而地址栏还停在上一个人走到的地方；不重新对齐一次的话，界面显示
     的是 forge 记着的那一面，地址栏写的是另一处，直到下一次点击才被纠正。
     订阅和监听只挂一次。 */
-export function startRouting(label: (nav: NavKey) => string) {
+export function startRouting(label: (nav: NavKey) => string, normalize: (location: Loc) => Loc = location => location) {
   labelOf = label;
+  normalizeLocation = normalize;
   cancelPositionSave();
   positionRestoreCleanup?.();
   positionCache.clear();
   // 地址中有位置时以地址为准；站点根地址始终打开默认列表，不恢复上次页面或下钻。
   // 使用 replace，避免为首次进入额外增加一条历史记录。
   const initial = parse(window.location.hash);
-  const initialLocation = initial ?? { nav: DEFAULT_NAV };
+  const initialLocation = normalizeLocation(initial ?? { nav: DEFAULT_NAV });
   apply(initialLocation);
   const initialHash = serialize(initialLocation);
   const restoredState = routeHistoryState();
@@ -591,7 +593,7 @@ export function startRouting(label: (nav: NavKey) => string) {
   // popstate 处理前进后退；hashchange 处理手动修改地址栏。hash 导航在部分浏览器会连续触发
   // 两者，第二次必须按序列化位置去重，否则同一个返回动作会应用两次。
   const restore = (event: PopStateEvent | HashChangeEvent) => {
-    const next = parse(window.location.hash) ?? { nav: DEFAULT_NAV };
+    const next = normalizeLocation(parse(window.location.hash) ?? { nav: DEFAULT_NAV });
     const canonicalHash = serialize(next);
     const previous = current();
     const poppedState = event instanceof PopStateEvent ? routeHistoryState(event.state) : routeHistoryState();

@@ -51,6 +51,7 @@ import { usePresence } from '../ui/presence';
 import { confirmDiscardChanges } from '../ui/navigation-guard';
 import { FleetTrafficMeter } from '../ui/fleet-traffic';
 import { MachineNotifications } from '../ui/machine-notifications';
+import { routeForViewer } from './access';
 
 const TopoCanvas = lazy(() => import('../topo/canvas').then(module => ({ default: module.TopoCanvas })));
 
@@ -73,12 +74,10 @@ const NAV: Face[] = [
   { key: 'usage', label: '用量', icon: 'usage' },
 ];
 
-/* 手机端只把两项最高频、且构成主要操作路径的入口留在顶栏。用户、隧道、发布和用量仍
-   使用同一份 Face 定义，只是移动到账户牌菜单，避免两套角色权限和名称逐渐分叉。 */
-const MOBILE_NAV = NAV.filter(f => f.key === 'nodes' || f.key === 'chains');
-const MOBILE_MORE = NAV.filter(
-  f => f.key === 'tunnels' || f.key === 'users' || f.key === 'deploy' || f.key === 'usage',
-);
+/* 手机端把日常查看的机器、线路和用量留在顶栏。用户、隧道与发布仍使用同一份 Face
+   定义，只是移动到账户牌菜单，避免两套角色权限和名称逐渐分叉。 */
+const MOBILE_NAV = NAV.filter(f => f.key === 'nodes' || f.key === 'chains' || f.key === 'usage');
+const MOBILE_MORE = NAV.filter(f => f.key === 'tunnels' || f.key === 'users' || f.key === 'deploy');
 
 // 收入账户牌菜单的项：都是低频访问的页面，占用顶栏位置的收益较低。
 // 窄屏同理：该行只放 NAV 的主工作流，这些低频页面仍从账户牌菜单进入。
@@ -88,7 +87,7 @@ const MORE: Face[] = [
 ];
 
 /* 不进入页面列表，但需要标题：面包屑和窗口名都读取 LABEL。 */
-const OFF_NAV: Face[] = [{ key: 'password', label: '改密码' }];
+const OFF_NAV: Face[] = [{ key: 'password', label: '修改密码' }];
 
 const LABEL: Record<NavKey, string> = Object.fromEntries(
   [...NAV, ...MORE, ...OFF_NAV].map(f => [f.key, f.label]),
@@ -164,7 +163,10 @@ export function ForgeShell({
     draft.init(session.who.operator_id);
     // 路由恢复需要排在 init 之后：init 会清空 wins，先恢复地址会导致恢复出的窗口被清除。
     // 两者都对重复调用免疫，在 StrictMode 下重复执行安全。
-    startRouting(nav => LABEL[nav]);
+    startRouting(
+      nav => LABEL[nav],
+      location => routeForViewer(location, session.who),
+    );
     return true;
   });
   const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions(), enabled: !pub });
@@ -570,15 +572,15 @@ function TopBar({
     items[next]?.focus();
   };
 
-  /* 账户牌替代「⋯」打开同一个菜单：顶栏常驻显示当前账户。窄屏只留首字母牌，名称与角色
-     在菜单头和读屏名称里。 */
+  /* 账户牌替代「⋯」打开同一个菜单：顶栏常驻显示当前账户。窄屏已登录时只留首字母牌；
+     访客没有身份可缩写，直接在同一位置写「登录」，避免把入口藏到菜单底部。 */
   const accountButton = (
     <button
       ref={moreButtonRef}
       type="button"
-      className={`fg-who${narrow ? ' compact' : ''}${account.guest ? ' guest' : ''}`}
-      title={`${account.name} · ${account.role}`}
-      aria-label={`${account.name}，${account.role}：账户与更多功能`}
+      className={`fg-who${narrow && !account.guest ? ' compact' : ''}${account.guest ? ' guest guest-login' : ''}`}
+      title={account.guest ? '登录与更多功能' : `${account.name} · ${account.role}`}
+      aria-label={account.guest ? '登录与更多功能' : `${account.name}，${account.role}：账户与更多功能`}
       aria-haspopup="menu"
       aria-controls="forge-more-menu"
       aria-expanded={more}
@@ -591,9 +593,9 @@ function TopBar({
       }}
     >
       <span className="fg-who-plate" aria-hidden="true">
-        {account.initial}
+        {account.guest ? <Icon of="access" size={13} /> : account.initial}
       </span>
-      {!narrow && <span className="fg-who-name">{account.name}</span>}
+      {(!narrow || account.guest) && <span className="fg-who-name">{account.guest ? '登录' : account.name}</span>}
       {!narrow && <Icon of="chevronDown" size={12} className="fg-who-caret" />}
     </button>
   );
@@ -629,14 +631,28 @@ function TopBar({
       onClick={() => setMore(false)}
       onKeyDown={moveWithinMore}
     >
-      {/* 菜单头重复账户牌的读屏名称，只作视觉呈现；读屏从账户牌读到账户名与角色。 */}
-      <div className={`fg-menu-id${account.guest ? ' guest' : ''}`} aria-hidden="true">
-        <span className="fg-who-plate">{account.initial}</span>
-        <span className="fg-menu-id-text">
-          <span className="fg-menu-id-name">{account.name}</span>
-          <span className="fg-menu-id-role">{account.role}</span>
-        </span>
-      </div>
+      {account.guest ? (
+        /* 访客的登录动作占用已登录身份头的同一位置；页面导航仍可留在菜单中，不让“登录”
+           与当前并不存在的身份混在底部操作区。 */
+        <button type="button" role="menuitem" className="fg-menu-id fg-menu-login guest" onClick={onLogout}>
+          <span className="fg-who-plate" aria-hidden="true">
+            <Icon of="access" size={14} />
+          </span>
+          <span className="fg-menu-id-text">
+            <span className="fg-menu-id-name">登录</span>
+            <span className="fg-menu-id-role">使用账户进入控制台</span>
+          </span>
+        </button>
+      ) : (
+        /* 菜单头重复账户牌的读屏名称，只作视觉呈现；读屏从账户牌读到账户名与角色。 */
+        <div className="fg-menu-id" aria-hidden="true">
+          <span className="fg-who-plate">{account.initial}</span>
+          <span className="fg-menu-id-text">
+            <span className="fg-menu-id-name">{account.name}</span>
+            <span className="fg-menu-id-role">{account.role}</span>
+          </span>
+        </div>
+      )}
       <hr />
       {rest.map(f => (
         <button
@@ -768,20 +784,22 @@ function TopBar({
           onClick={() => navigate('password')}
         >
           <Icon of="security" size={14} className="fg-menu-icon" />
-          <span className="fg-menu-copy">改密码</span>
+          <span className="fg-menu-copy">修改密码</span>
           {nav === 'password' && <Icon of="check" size={13} className="fg-menu-check" />}
         </button>
       )}
-      {/* 公开访客从这里进入登录；已有身份从这里退出。账户名与角色已在菜单头，这一行只写动作。 */}
-      <button type="button" role="menuitem" className="fg-menu-item fg-account-action" onClick={onLogout}>
-        <Icon of={isPublic(who) ? 'access' : 'outbound'} size={14} className="fg-menu-icon" />
-        <span className="fg-menu-copy">{isPublic(who) ? '登录' : '退出登录'}</span>
-      </button>
+      {/* 已登录身份从这里退出；访客的登录动作已与菜单头的身份位置合并。 */}
+      {!isPublic(who) && (
+        <button type="button" role="menuitem" className="fg-menu-item fg-account-action" onClick={onLogout}>
+          <Icon of="outbound" size={14} className="fg-menu-icon" />
+          <span className="fg-menu-copy">退出登录</span>
+        </button>
+      )}
     </div>
   );
 
   if (narrow) {
-    /* 窄屏只有这一行：品牌 + 机器 / 线路 + 通知 + 账户牌。其他页面、产物和诊断收入账户
+    /* 窄屏只有这一行：品牌 + 机器 / 线路 / 用量 + 通知 + 账户牌。其他页面、产物和诊断收入账户
        菜单，状态作为菜单项说明显示。下钻不再增加第二行，理由见上方 `.fg-backrow` 的说明。 */
     return (
       <div className="fg-top fg-navrow">

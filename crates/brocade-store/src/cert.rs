@@ -31,7 +31,7 @@ use brocade_deployment::protocol::{
     NodeCertificateSlotMaterial,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{postgres::PgRow, PgPool, Postgres, Row, Transaction};
 
 use crate::secrets::{self, CTX_ACME_ACCOUNT, CTX_CERT_KEY, CTX_DNS_CREDENTIAL};
 use crate::{AdminContext, AdminRole, Result, StoreError};
@@ -48,7 +48,10 @@ pub const SELF_SIGNED_DIRECTORY: &str = "self-signed";
 /// a fleet, short enough to read out over a call.
 const LABEL_BYTES: usize = 4;
 const CERTIFICATE_SCAN_ADVISORY_KEY: i64 = 0x4252_4f43_4345_5254;
+pub const CERTIFICATE_SCAN_LEASE_SECS: i32 = 30;
+pub const CERTIFICATE_SCAN_RETENTION_DAYS: i32 = 30;
 pub const DEFAULT_SELF_SIGNED_GROUP_NAME: &str = "默认自签证书组";
+const DEFAULT_SELF_SIGNED_GROUP_CREATED_AT: &str = "2000-01-01 00:00:00+00";
 pub const SELF_SIGNED_INITIAL_POOL_SIZE: usize = 2;
 
 /// A transaction whose only job is to hold the fleet-wide issuance lock. Dropping it rolls the
@@ -66,6 +69,379 @@ pub async fn try_certificate_scan_lock(pool: &PgPool) -> Result<Option<Certifica
     Ok(acquired.then_some(CertificateScanLock {
         _transaction: transaction,
     }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CertificateScanTrigger {
+    Startup,
+    Scheduled,
+    Settings,
+    Manual,
+}
+
+impl CertificateScanTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Scheduled => "scheduled",
+            Self::Settings => "settings",
+            Self::Manual => "manual",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "startup" => Ok(Self::Startup),
+            "scheduled" => Ok(Self::Scheduled),
+            "settings" => Ok(Self::Settings),
+            "manual" => Ok(Self::Manual),
+            _ => Err(StoreError::InvalidData(format!(
+                "unknown certificate scan trigger: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CertificateScanStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl CertificateScanStatus {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            _ => Err(StoreError::InvalidData(format!(
+                "unknown certificate scan status: {value}"
+            ))),
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CertificateScanPhase {
+    Queued,
+    Preparing,
+    Dns,
+    Validating,
+    Finalizing,
+    Storing,
+    Finished,
+}
+
+impl CertificateScanPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Preparing => "preparing",
+            Self::Dns => "dns",
+            Self::Validating => "validating",
+            Self::Finalizing => "finalizing",
+            Self::Storing => "storing",
+            Self::Finished => "finished",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "preparing" => Ok(Self::Preparing),
+            "dns" => Ok(Self::Dns),
+            "validating" => Ok(Self::Validating),
+            "finalizing" => Ok(Self::Finalizing),
+            "storing" => Ok(Self::Storing),
+            "finished" => Ok(Self::Finished),
+            _ => Err(StoreError::InvalidData(format!(
+                "unknown certificate scan phase: {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertificateScanRun {
+    pub id: i64,
+    pub trigger: CertificateScanTrigger,
+    pub status: CertificateScanStatus,
+    pub phase: CertificateScanPhase,
+    pub total_items: u32,
+    pub processed_items: u32,
+    pub issued_items: u32,
+    pub failed_items: u32,
+    pub current_certificate_id: Option<String>,
+    pub current_subject: Option<String>,
+    pub error_detail: Option<String>,
+    pub queued_at_unix_secs: i64,
+    pub started_at_unix_secs: Option<i64>,
+    pub heartbeat_at_unix_secs: Option<i64>,
+    pub finished_at_unix_secs: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaimedCertificateScan {
+    pub run: CertificateScanRun,
+    pub lease_owner: String,
+    pub lease_generation: u64,
+}
+
+fn nonnegative_u32(field: &str, value: i32) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| StoreError::InvalidData(format!("{field} is negative: {value}")))
+}
+
+fn certificate_scan_run(row: &PgRow) -> Result<CertificateScanRun> {
+    Ok(CertificateScanRun {
+        id: row.try_get("id")?,
+        trigger: CertificateScanTrigger::parse(&row.try_get::<String, _>("trigger")?)?,
+        status: CertificateScanStatus::parse(&row.try_get::<String, _>("status")?)?,
+        phase: CertificateScanPhase::parse(&row.try_get::<String, _>("phase")?)?,
+        total_items: nonnegative_u32("total_items", row.try_get("total_items")?)?,
+        processed_items: nonnegative_u32("processed_items", row.try_get("processed_items")?)?,
+        issued_items: nonnegative_u32("issued_items", row.try_get("issued_items")?)?,
+        failed_items: nonnegative_u32("failed_items", row.try_get("failed_items")?)?,
+        current_certificate_id: row.try_get("current_certificate_id")?,
+        current_subject: row.try_get("current_subject")?,
+        error_detail: row.try_get("error_detail")?,
+        queued_at_unix_secs: row.try_get("queued_at_unix_secs")?,
+        started_at_unix_secs: row.try_get("started_at_unix_secs")?,
+        heartbeat_at_unix_secs: row.try_get("heartbeat_at_unix_secs")?,
+        finished_at_unix_secs: row.try_get("finished_at_unix_secs")?,
+    })
+}
+
+const CERTIFICATE_SCAN_RETURNING: &str =
+    "id, trigger, status, phase, total_items, processed_items, issued_items, failed_items,
+     current_certificate_id, current_subject, error_detail,
+     extract(epoch FROM queued_at)::bigint AS queued_at_unix_secs,
+     extract(epoch FROM started_at)::bigint AS started_at_unix_secs,
+     extract(epoch FROM heartbeat_at)::bigint AS heartbeat_at_unix_secs,
+     extract(epoch FROM finished_at)::bigint AS finished_at_unix_secs";
+
+pub async fn enqueue_certificate_scan(
+    pool: &PgPool,
+    trigger: CertificateScanTrigger,
+) -> Result<CertificateScanRun> {
+    let query = format!(
+        "INSERT INTO certificate_scan_runs (trigger) VALUES ($1)
+         ON CONFLICT DO NOTHING RETURNING {CERTIFICATE_SCAN_RETURNING}"
+    );
+    if let Some(row) = sqlx::query(&query)
+        .bind(trigger.as_str())
+        .fetch_optional(pool)
+        .await?
+    {
+        return certificate_scan_run(&row);
+    }
+    let query = format!(
+        "SELECT {CERTIFICATE_SCAN_RETURNING} FROM certificate_scan_runs
+          WHERE status = 'queued' ORDER BY id DESC LIMIT 1"
+    );
+    sqlx::query(&query)
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(certificate_scan_run)
+        .transpose()?
+        .or(active_certificate_scan(pool).await?)
+        .ok_or_else(|| StoreError::Unavailable("证书任务入队时发生并发冲突，请重试".to_owned()))
+}
+
+pub async fn active_certificate_scan(pool: &PgPool) -> Result<Option<CertificateScanRun>> {
+    let query = format!(
+        "SELECT {CERTIFICATE_SCAN_RETURNING} FROM certificate_scan_runs
+          WHERE status IN ('queued', 'running')
+          ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, id DESC LIMIT 1"
+    );
+    sqlx::query(&query)
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(certificate_scan_run)
+        .transpose()
+}
+
+pub async fn latest_certificate_scan(pool: &PgPool) -> Result<Option<CertificateScanRun>> {
+    let query = format!(
+        "SELECT {CERTIFICATE_SCAN_RETURNING} FROM certificate_scan_runs
+          ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, id DESC
+          LIMIT 1"
+    );
+    sqlx::query(&query)
+        .fetch_optional(pool)
+        .await?
+        .as_ref()
+        .map(certificate_scan_run)
+        .transpose()
+}
+
+pub async fn claim_certificate_scan(
+    pool: &PgPool,
+    owner: &str,
+) -> Result<Option<ClaimedCertificateScan>> {
+    let mut tx = pool.begin().await?;
+    let candidate: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM certificate_scan_runs
+          WHERE (status = 'running' AND lease_until < now())
+             OR (status = 'queued' AND NOT EXISTS (
+                    SELECT 1 FROM certificate_scan_runs active WHERE active.status = 'running'
+                ))
+          ORDER BY queued_at, id LIMIT 1 FOR UPDATE SKIP LOCKED",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(id) = candidate else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let query = format!(
+        "UPDATE certificate_scan_runs
+            SET status = 'running', phase = 'preparing', started_at = COALESCE(started_at, now()),
+                heartbeat_at = now(), lease_owner = $2,
+                lease_until = now() + make_interval(secs => $3),
+                lease_generation = lease_generation + 1,
+                total_items = 0, processed_items = 0, issued_items = 0, failed_items = 0,
+                current_certificate_id = NULL, current_subject = NULL, error_detail = NULL
+          WHERE id = $1 RETURNING {CERTIFICATE_SCAN_RETURNING}, lease_generation"
+    );
+    let row = sqlx::query(&query)
+        .bind(id)
+        .bind(owner)
+        .bind(CERTIFICATE_SCAN_LEASE_SECS)
+        .fetch_one(&mut *tx)
+        .await?;
+    let generation: i64 = row.try_get("lease_generation")?;
+    let lease_generation = u64::try_from(generation).map_err(|_| {
+        StoreError::InvalidData(format!(
+            "certificate lease generation is negative: {generation}"
+        ))
+    })?;
+    let run = certificate_scan_run(&row)?;
+    tx.commit().await?;
+    Ok(Some(ClaimedCertificateScan {
+        run,
+        lease_owner: owner.to_owned(),
+        lease_generation,
+    }))
+}
+
+pub async fn renew_certificate_scan_lease(
+    pool: &PgPool,
+    claim: &ClaimedCertificateScan,
+) -> Result<bool> {
+    let affected = sqlx::query(
+        "UPDATE certificate_scan_runs
+            SET heartbeat_at = now(), lease_until = now() + make_interval(secs => $4)
+          WHERE id = $1 AND status = 'running' AND lease_owner = $2 AND lease_generation = $3",
+    )
+    .bind(claim.run.id)
+    .bind(&claim.lease_owner)
+    .bind(i64::try_from(claim.lease_generation).unwrap_or(i64::MAX))
+    .bind(CERTIFICATE_SCAN_LEASE_SECS)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CertificateScanCounts {
+    pub total: usize,
+    pub processed: usize,
+    pub issued: usize,
+    pub failed: usize,
+}
+
+pub async fn update_certificate_scan_progress(
+    pool: &PgPool,
+    claim: &ClaimedCertificateScan,
+    phase: CertificateScanPhase,
+    counts: CertificateScanCounts,
+    current_certificate_id: Option<&str>,
+    current_subject: Option<&str>,
+) -> Result<bool> {
+    if counts.processed > counts.total || counts.issued + counts.failed > counts.processed {
+        return Err(StoreError::InvalidData(
+            "certificate scan progress counts are incoherent".to_owned(),
+        ));
+    }
+    let to_i32 = |field: &str, value: usize| {
+        i32::try_from(value).map_err(|_| {
+            StoreError::InvalidData(format!("certificate scan {field} exceeds i32: {value}"))
+        })
+    };
+    let affected = sqlx::query(
+        "UPDATE certificate_scan_runs
+            SET phase = $4, total_items = $5, processed_items = $6,
+                issued_items = $7, failed_items = $8,
+                current_certificate_id = $9, current_subject = $10, heartbeat_at = now()
+          WHERE id = $1 AND status = 'running' AND lease_owner = $2 AND lease_generation = $3",
+    )
+    .bind(claim.run.id)
+    .bind(&claim.lease_owner)
+    .bind(i64::try_from(claim.lease_generation).unwrap_or(i64::MAX))
+    .bind(phase.as_str())
+    .bind(to_i32("total", counts.total)?)
+    .bind(to_i32("processed", counts.processed)?)
+    .bind(to_i32("issued", counts.issued)?)
+    .bind(to_i32("failed", counts.failed)?)
+    .bind(current_certificate_id)
+    .bind(current_subject)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
+pub async fn complete_certificate_scan(
+    pool: &PgPool,
+    claim: &ClaimedCertificateScan,
+    error: Option<&str>,
+) -> Result<bool> {
+    let error: Option<String> = error.map(|value| value.chars().take(500).collect());
+    let affected = sqlx::query(
+        "UPDATE certificate_scan_runs
+            SET status = CASE WHEN $4::text IS NULL THEN 'succeeded' ELSE 'failed' END,
+                phase = 'finished', error_detail = $4, finished_at = now(), heartbeat_at = now(),
+                current_certificate_id = NULL, current_subject = NULL,
+                lease_owner = NULL, lease_until = NULL
+          WHERE id = $1 AND status = 'running' AND lease_owner = $2 AND lease_generation = $3",
+    )
+    .bind(claim.run.id)
+    .bind(&claim.lease_owner)
+    .bind(i64::try_from(claim.lease_generation).unwrap_or(i64::MAX))
+    .bind(error)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
+pub async fn prune_certificate_scans(pool: &PgPool) -> Result<u64> {
+    Ok(sqlx::query(
+        "DELETE FROM certificate_scan_runs WHERE id IN (
+             SELECT id FROM certificate_scan_runs
+              WHERE status IN ('succeeded', 'failed')
+                AND finished_at < now() - make_interval(days => $1)
+              ORDER BY id LIMIT 1000
+         )",
+    )
+    .bind(CERTIFICATE_SCAN_RETENTION_DAYS)
+    .execute(pool)
+    .await?
+    .rows_affected())
 }
 
 /// A domain the fleet issues node certificates under.
@@ -372,9 +748,11 @@ fn normalize_certificate_name(raw: &str) -> Result<String> {
     Ok(name)
 }
 
-/// Ensures every installation has its private default primary/standby pair. Existing groups are
-/// left byte-for-byte alone; an installation created before the default group existed receives a
-/// new independent group rather than having one of its live identities renamed underneath clients.
+/// Ensures every installation has its private default primary/standby pair. Existing custom groups
+/// are left byte-for-byte alone; the built-in group keeps a fixed name and sentinel creation time
+/// so it sorts before operator-created groups on every installation. An installation created before
+/// the default group existed receives a new independent group rather than having one of its live
+/// identities renamed underneath clients.
 pub async fn ensure_default_self_signed_pool(pool: &PgPool) -> Result<usize> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -386,10 +764,16 @@ pub async fn ensure_default_self_signed_pool(pool: &PgPool) -> Result<usize> {
             .fetch_one(&mut *tx)
             .await?;
     if default_exists {
-        sqlx::query("UPDATE cert_labels SET name = $1 WHERE is_default AND name <> $1")
-            .bind(DEFAULT_SELF_SIGNED_GROUP_NAME)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE cert_labels
+                SET name = $1, created_at = $2::timestamptz
+              WHERE is_default
+                AND (name <> $1 OR created_at <> $2::timestamptz)",
+        )
+        .bind(DEFAULT_SELF_SIGNED_GROUP_NAME)
+        .bind(DEFAULT_SELF_SIGNED_GROUP_CREATED_AT)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         return Ok(0);
     }
@@ -400,20 +784,22 @@ pub async fn ensure_default_self_signed_pool(pool: &PgPool) -> Result<usize> {
     sqlx::query(
         "INSERT INTO cert_domains
              (id, domain, dns_provider, acme_directory, renew_before_days)
-         VALUES ($1, $1, 'cloudflare', 'self-signed', 30)",
+         VALUES ($1, $1, 'cloudflare', 'self-signed', 60)",
     )
     .bind(&certificate_name)
     .execute(&mut *tx)
     .await?;
     sqlx::query(
         "INSERT INTO cert_labels
-             (id, domain_id, label, name, note, certificate_name, is_default)
-         VALUES ($1, $2, $3, $4, '新安装自动创建的自签证书池', $2, TRUE)",
+             (id, domain_id, label, name, note, certificate_name, is_default, created_at)
+         VALUES ($1, $2, $3, $4, '新安装自动创建的自签证书池', $2, TRUE,
+                 $5::timestamptz)",
     )
     .bind(&group_id)
     .bind(&certificate_name)
     .bind(&label)
     .bind(DEFAULT_SELF_SIGNED_GROUP_NAME)
+    .bind(DEFAULT_SELF_SIGNED_GROUP_CREATED_AT)
     .execute(&mut *tx)
     .await?;
     for (index, runtime_slot) in ["a", "b"].into_iter().enumerate() {
@@ -514,7 +900,7 @@ pub async fn upsert_cert_domain(
             "the ACME directory must be an https URL".to_owned(),
         ));
     }
-    let renew_before = input.renew_before_days.unwrap_or(30);
+    let renew_before = input.renew_before_days.unwrap_or(60);
     if !(1..=89).contains(&renew_before) {
         return Err(StoreError::InvalidData(
             "renew_before_days must be between 1 and 89".to_owned(),
@@ -588,6 +974,17 @@ pub async fn upsert_cert_domain(
     .await?;
 
     let domain_id: String = row.try_get("id")?;
+    // Saving is the operator's signal that an invalid credential, directory or renewal policy may
+    // have been corrected. Let the queued settings-triggered scan try existing unfinished rows
+    // immediately; ordinary hourly/manual scans still honor the retry floor.
+    sqlx::query(
+        "UPDATE certificates c SET last_attempt_at = NULL
+          FROM cert_labels l
+         WHERE c.label_id = l.id AND l.domain_id = $1 AND c.status IN ('pending', 'failed')",
+    )
+    .bind(&domain_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
 
     let directory: String = row.try_get("acme_directory")?;
@@ -1017,7 +1414,7 @@ pub async fn list_cert_groups(pool: &PgPool, actor: &AdminContext) -> Result<Vec
                 d.acme_directory AS configured_directory
            FROM cert_labels l
            JOIN cert_domains d ON d.id = l.domain_id
-          ORDER BY l.name",
+          ORDER BY l.created_at, l.id",
     )
     .fetch_all(pool)
     .await?;
@@ -1657,10 +2054,9 @@ pub async fn certificates_due(
         "SELECT l.id
            FROM cert_labels l
            JOIN cert_domains d ON d.id = l.domain_id
-           JOIN certificates serving
+          JOIN certificates serving
              ON serving.label_id = l.id AND serving.status = 'serving'
           WHERE l.status = 'active'
-            AND ($1 = 0 OR d.acme_directory = 'self-signed' OR d.dns_credential_sealed IS NOT NULL)
             AND (serving.expires_at < now() + make_interval(days => d.renew_before_days)
                  OR serving.acme_directory IS DISTINCT FROM d.acme_directory)
             -- One self-signed standby is the whole compatibility budget. A third identity cannot
@@ -1677,7 +2073,6 @@ pub async fn certificates_due(
                    AND pending.status IN ('pending', 'ready', 'failed')
             )",
     )
-    .bind(retry_after_minutes)
     .fetch_all(pool)
     .await?
     .iter()
@@ -1731,15 +2126,20 @@ pub async fn certificates_due(
            FROM certificates c
            JOIN cert_labels l ON l.id = c.label_id
            JOIN cert_domains d ON d.id = l.domain_id
-          -- Public issuance needs a DNS credential to prove the name. Direct self-signing does not.
-          WHERE ($1 = 0 OR d.acme_directory = 'self-signed' OR d.dns_credential_sealed IS NOT NULL)
-            AND l.status = 'active'
+           LEFT JOIN certificates serving
+             ON serving.label_id = c.label_id AND serving.status = 'serving'
+          -- A missing public-CA credential still participates once: the worker records an
+          -- actionable failure on the certificate row, then the ordinary retry floor applies.
+          -- Silently omitting it would leave a permanently pending row with no explanation.
+          WHERE l.status = 'active'
             -- Fresh, manually requested and renewal rows all use one issuance path. A serving row
             -- is never selected here: the block above creates a separate renewal row for it.
             AND c.status IN ('pending', 'failed')
             AND (c.last_attempt_at IS NULL
                  OR c.last_attempt_at < now() - make_interval(mins => $1))
-          ORDER BY c.expires_at NULLS FIRST",
+          -- Pending renewal rows have no expiry of their own. Order them by the certificate they
+          -- protect, so a large fleet spends its serial CA budget on the nearest deadline first.
+          ORDER BY COALESCE(serving.expires_at, c.expires_at) NULLS FIRST, c.created_at, c.id",
     )
     .bind(retry_after_minutes)
     .fetch_all(pool)

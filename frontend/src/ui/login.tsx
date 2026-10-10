@@ -12,6 +12,7 @@ import {
 import type { Session } from '../app';
 import { enterPublic } from '../session';
 import { BrandIcon } from './branding';
+import { ConfigSecretInput } from './config-secret-input';
 import { PASSWORD_MIN_LENGTH } from './password-policy';
 
 export interface DirectLoginCredentials {
@@ -227,11 +228,23 @@ export function PasswordLogin({ onLogin, publicOpen }: { onLogin: (session: Sess
     >
       <label className="login-field">
         <span>用户名</span>
-        <input className="f" autoFocus value={operatorId} onChange={e => setOperatorId(e.target.value)} />
+        <input
+          className="f"
+          autoComplete="username"
+          autoFocus
+          value={operatorId}
+          onChange={e => setOperatorId(e.target.value)}
+        />
       </label>
       <label className="login-field">
         <span>密码</span>
-        <input className="f" type="password" value={password} onChange={e => setPassword(e.target.value)} />
+        <input
+          className="f"
+          type="password"
+          autoComplete="current-password"
+          value={password}
+          onChange={e => setPassword(e.target.value)}
+        />
       </label>
       {login.error && <div className="callout err">{loginError(login.error)}</div>}
       {guest.error && <div className="callout err">{loginError(guest.error)}</div>}
@@ -283,10 +296,8 @@ export function InitializeAdmin({ onInitialized }: { onInitialized: (session: Se
       <p className="login-lead">面板支持多用户统计；初始化时会预置使用者 zero，默认不开放登录。</p>
       <label className="login-field">
         <span>初始化凭据</span>
-        <input
+        <ConfigSecretInput
           className="f"
-          type="password"
-          autoComplete="one-time-code"
           autoFocus
           value={bootstrapToken}
           onChange={e => setBootstrapToken(e.target.value)}
@@ -295,7 +306,7 @@ export function InitializeAdmin({ onInitialized }: { onInitialized: (session: Se
       <p className="login-note">使用启动器提示的私有文件内容，或 BROCADE_BOOTSTRAP_TOKEN；成功后即失效。</p>
       <label className="login-field">
         <span>用户名</span>
-        <input className="f" value={operatorId} onChange={e => setOperatorId(e.target.value)} />
+        <input className="f" autoComplete="username" value={operatorId} onChange={e => setOperatorId(e.target.value)} />
       </label>
       <label className="login-field">
         <span>密码</span>
@@ -303,6 +314,7 @@ export function InitializeAdmin({ onInitialized }: { onInitialized: (session: Se
           <input
             className="f"
             type={reveal ? 'text' : 'password'}
+            autoComplete="new-password"
             value={password}
             onChange={e => setPassword(e.target.value)}
           />

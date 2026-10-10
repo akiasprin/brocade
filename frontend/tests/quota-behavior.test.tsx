@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SnapshotApp } from '../src/api';
-import { monthlyUsageText, QuotaRow } from '../src/panes/users';
+import { combinedQuotaPercent, monthlyUsageText, QuotaRow } from '../src/panes/users';
 
 const GiB = 1024 ** 3;
 const app: SnapshotApp = {
@@ -17,6 +17,16 @@ const app: SnapshotApp = {
 afterEach(cleanup);
 
 describe('用户额度交互', () => {
+  it('名册环形按总已用除以总额度，不取单条线路的最大比例', () => {
+    expect(
+      combinedQuotaPercent([
+        { used: 9 * GiB, limit: 10 * GiB },
+        { used: 10 * GiB, limit: 90 * GiB },
+      ]),
+    ).toBeCloseTo(19);
+    expect(combinedQuotaPercent([{ used: 4 * GiB, limit: null }])).toBeNull();
+  });
+
   it('区分读取中、失败、无样本和实际用量', () => {
     expect(monthlyUsageText('pending', 0, 0)).toBe('读取中…');
     expect(monthlyUsageText('failed', 0, 0)).toBe('暂不可用');

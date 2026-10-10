@@ -148,7 +148,7 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
             reality_fingerprint, \
             reality_flow, \
             anytls_padding_scheme, \
-            port_ingress_base, port_anytls_base, port_vless_encryption_base, port_hop_base, port_hy2_base, \
+            port_ingress_base, port_anytls_base, port_vless_encryption_base, port_hop_base, port_hy2_base, port_mtproto_base, \
             probe_endpoint_url, probe_timeout_secs, probe_interval_secs, \
             geodata_cron, geodata_geoip_url, geodata_geosite_url, \
             conn_idle_secs, conn_uplink_only_secs, conn_downlink_only_secs, \
@@ -216,6 +216,10 @@ pub async fn load_current_snapshot(pool: &PgPool) -> Result<ModelSnapshot> {
             hy2_base: u16_column(
                 "control_state.port_hy2_base",
                 state.try_get("port_hy2_base")?,
+            )?,
+            mtproto_base: u16_column(
+                "control_state.port_mtproto_base",
+                state.try_get("port_mtproto_base")?,
             )?,
         },
         probe: ProbeSettings {
@@ -457,7 +461,7 @@ pub(crate) async fn load_current_snapshot_tx(
             reality_fingerprint, \
             reality_flow, \
             anytls_padding_scheme, \
-            port_ingress_base, port_anytls_base, port_vless_encryption_base, port_hop_base, port_hy2_base, \
+            port_ingress_base, port_anytls_base, port_vless_encryption_base, port_hop_base, port_hy2_base, port_mtproto_base, \
             probe_endpoint_url, probe_timeout_secs, probe_interval_secs, \
             geodata_cron, geodata_geoip_url, geodata_geosite_url, \
             conn_idle_secs, conn_uplink_only_secs, conn_downlink_only_secs, \
@@ -525,6 +529,10 @@ pub(crate) async fn load_current_snapshot_tx(
             hy2_base: u16_column(
                 "control_state.port_hy2_base",
                 state.try_get("port_hy2_base")?,
+            )?,
+            mtproto_base: u16_column(
+                "control_state.port_mtproto_base",
+                state.try_get("port_mtproto_base")?,
             )?,
         },
         probe: ProbeSettings {
@@ -1454,7 +1462,7 @@ async fn load_ingresses(pool: &PgPool, app_id: &str, site: &RealitySite) -> Resu
             guard_no_udp_amplification, guard_tcp_and_quic_only, \
             projection_v4_host, projection_v4_port, \
             projection_v6_host, projection_v6_port, \
-            protocol_projection, \
+            protocol_projection, mtproto_port, \
             client.xhttp_download_v4, client.xhttp_download_v6 \
          FROM ingresses \
          LEFT JOIN ingress_client_settings client ON client.ingress_id = ingresses.id \
@@ -1502,7 +1510,7 @@ async fn load_ingresses_tx(
             guard_no_udp_amplification, guard_tcp_and_quic_only, \
             projection_v4_host, projection_v4_port, \
             projection_v6_host, projection_v6_port, \
-            protocol_projection, \
+            protocol_projection, mtproto_port, \
             client.xhttp_download_v4, client.xhttp_download_v6 \
          FROM ingresses \
          LEFT JOIN ingress_client_settings client ON client.ingress_id = ingresses.id \
@@ -1781,6 +1789,15 @@ fn ingress_from_row_with_site(row: &sqlx::postgres::PgRow, site: &RealitySite) -
         vless,
         anytls,
         hysteria2,
+        mtproto: row
+            .try_get::<Option<i32>, _>("mtproto_port")?
+            .map(|port| -> Result<_> {
+                Ok(brocade_core::model::MtProto {
+                    port: u16::try_from(port)
+                        .map_err(|_| StoreError::InvalidData("invalid MTProxy port".to_owned()))?,
+                })
+            })
+            .transpose()?,
     })
     .map_err(|error| StoreError::InvalidData(format!("ingresses 行没有任何一条线：{error}")))?;
 

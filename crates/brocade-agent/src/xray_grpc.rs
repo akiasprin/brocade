@@ -33,6 +33,7 @@ const REMOVE_USER_OPERATION: &str = "xray.app.proxyman.command.RemoveUserOperati
 const VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
 const HYSTERIA2_ACCOUNT: &str = "xray.proxy.hysteria.account.Account";
 const ANYTLS_ACCOUNT: &str = "xray.proxy.anytls.Account";
+const MTPROTO_ACCOUNT: &str = "xray.proxy.mtproto.Account";
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const END_STREAM: u8 = 0x1;
 const ACK: u8 = 0x1;
@@ -69,6 +70,7 @@ pub(crate) enum XrayAccount<'a> {
     Vless { id: &'a str, flow: Option<&'a str> },
     Hysteria2 { auth: &'a str },
     AnyTls { password: &'a str },
+    MtProto { secret: &'a str },
 }
 
 pub(crate) fn add_user(
@@ -96,6 +98,11 @@ pub(crate) fn add_user(
             let mut value = Vec::new();
             bytes_field(&mut value, 1, password.as_bytes());
             typed_message(ANYTLS_ACCOUNT, &value)
+        }
+        XrayAccount::MtProto { secret } => {
+            let mut value = Vec::new();
+            bytes_field(&mut value, 1, secret.as_bytes());
+            typed_message(MTPROTO_ACCOUNT, &value)
         }
     };
 
@@ -552,6 +559,7 @@ fn decode_online_source(message: &[u8]) -> Result<OnlineSource, String> {
                     b"vless" => OnlineSourceProtocol::Vless,
                     b"anytls" => OnlineSourceProtocol::AnyTls,
                     b"hysteria" => OnlineSourceProtocol::Hysteria2,
+                    b"mtproto" => OnlineSourceProtocol::MtProto,
                     _ => OnlineSourceProtocol::Unknown,
                 };
                 protocols.push(protocol);
@@ -648,6 +656,7 @@ fn decode_account(message: &[u8]) -> Result<Option<(String, Option<String>)>, St
             }
             // xray.proxy.anytls.Account { string password = 1 }
             (ANYTLS_ACCOUNT, 1, Field::Bytes(bytes)) => id = Some(utf8(bytes, "AnyTLS password")?),
+            (MTPROTO_ACCOUNT, 1, Field::Bytes(bytes)) => id = Some(utf8(bytes, "MTProxy secret")?),
             _ => {}
         }
     }
@@ -868,6 +877,7 @@ mod tests {
             "vless",
             "anytls",
             "hysteria",
+            "mtproto",
             "vless",
             "future-protocol",
             "",
@@ -880,6 +890,7 @@ mod tests {
                 OnlineSourceProtocol::Vless,
                 OnlineSourceProtocol::AnyTls,
                 OnlineSourceProtocol::Hysteria2,
+                OnlineSourceProtocol::MtProto,
                 OnlineSourceProtocol::Unknown,
             ])
         );
@@ -965,6 +976,14 @@ mod tests {
             Some(("hy-secret".to_owned(), None))
         );
 
+        let mut mtproto = Vec::new();
+        bytes_field(&mut mtproto, 1, b"11111111-2222-3333-4444-555555555555");
+        let mtproto = typed_message(MTPROTO_ACCOUNT, &mtproto);
+        assert_eq!(
+            decode_account(&mtproto).unwrap(),
+            Some(("11111111-2222-3333-4444-555555555555".to_owned(), None,))
+        );
+
         // An empty flow is xray saying "none"; it must not read back as a flow named "".
         let mut flowless = Vec::new();
         bytes_field(&mut flowless, 1, b"an-id");
@@ -1034,6 +1053,7 @@ mod tests {
         let api_port = free_port();
         let inbound_port = free_port();
         let hysteria_port = free_port();
+        let mtproto_port = free_port();
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -1118,6 +1138,15 @@ mod tests {
                                 "quicParams": { "congestion": "bbr" }
                             }
                         }
+                    },
+                    {
+                        "tag": "test-mtproto",
+                        "listen": "127.0.0.1",
+                        "port": mtproto_port,
+                        "protocol": "mtproto",
+                        "settings": { "users": [] },
+                        "streamSettings": { "network": "tcp", "security": "none" },
+                        "sniffing": { "enabled": false }
                     }
                 ],
                 // The integration target is loopback; override the normal private-IP deny only
@@ -1213,6 +1242,25 @@ mod tests {
         let listed_hysteria = String::from_utf8_lossy(&listed_hysteria.stdout);
         assert!(listed_hysteria.contains("bob@example.test"));
         assert!(listed_hysteria.contains("hysteria-secret"));
+
+        add_user(
+            api_port,
+            "test-mtproto",
+            "carol@example.test",
+            0,
+            XrayAccount::MtProto {
+                secret: "00112233-4455-6677-8899-aabbccddeeff",
+            },
+        )
+        .expect("native add MTProxy user");
+        assert_eq!(
+            inbound_users(api_port, "test-mtproto").expect("native list MTProxy users"),
+            vec![XrayUser {
+                email: "carol@example.test".to_owned(),
+                credential: "00112233-4455-6677-8899-aabbccddeeff".to_owned(),
+                flow: None,
+            }]
+        );
 
         // No traffic has flowed, so no user counter exists yet. What this proves is the call
         // itself: path, framing, flow-control windows, and an empty response decoding to an
@@ -1312,6 +1360,8 @@ mod tests {
             .is_empty());
         remove_user(api_port, "test-hysteria2", "bob@example.test")
             .expect("native remove Hysteria 2 user");
+        remove_user(api_port, "test-mtproto", "carol@example.test")
+            .expect("native remove MTProxy user");
         assert!(
             remove_user(api_port, "missing-inbound", "nobody@example.test").is_err(),
             "a trailers-only gRPC error must not be mistaken for success"

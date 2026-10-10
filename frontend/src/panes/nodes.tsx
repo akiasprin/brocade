@@ -1939,7 +1939,7 @@ function PollAgo({ at }: { at: string | null }) {
 // 「已应用」表示配置是否已下发到该机器，此处表示链路是否连通。配置全部正常而用户无法连接，
 // 正是因为此前只有前者。
 // 链路统计单独提取：观测页顶部的状态条使用这份数据（RELAY STATUS 表已移除）。
-function useHopStats(nodeId: string) {
+export function useHopStats(nodeId: string, artifactReadable = true) {
   const health = useQuery({
     queryKey: ['link-health'],
     queryFn: () => fetchLinkHealth(),
@@ -1948,6 +1948,7 @@ function useHopStats(nodeId: string) {
   const artifact = useQuery({
     queryKey: ['artifact', 'view', 'burst-observatory', nodeId, 'xray'],
     queryFn: () => fetchArtifactContentView('node', nodeId, 'xray'),
+    enabled: artifactReadable,
     retry: false,
   });
   const observatory = parseBurstObservatory(artifact.data?.content);
@@ -1981,7 +1982,7 @@ function useHopStats(nodeId: string) {
   // 状态条的「N/M 通」使用同一口径：表中不显示的跳不应计入，
   // 否则顶部显示 3/5 而下方只能列出 3 行。
   const shown = mine.filter(h => inArtifact(hopSubject(h)));
-  const loading = health.isLoading && artifact.isLoading;
+  const loading = health.isLoading && (!artifactReadable || artifact.isLoading);
   const dead = shown.filter(h => !h.alive);
   const expected = list.length;
   const reported = shown.length;
@@ -5356,7 +5357,7 @@ function NodeDetail({
     ...nodePingRangeQuery(id, initialRange),
   });
   const observationModules = useNodeObservationModules();
-  const { dead } = useHopStats(id);
+  const { dead } = useHopStats(id, can(who.role, 'artifacts'));
 
   /* 页签是一次浏览中的位置，不进地址栏。安装页可定向打开配置，但不改变既有详情 URL。
      换机器时使用新入口指定的位置，不继承上一台的阅读位置。 */

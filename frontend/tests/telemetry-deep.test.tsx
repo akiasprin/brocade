@@ -47,6 +47,7 @@ vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }));
 let LoadCard: typeof import('../src/panes/telemetry').LoadCard;
 let ThroughputChart: typeof import('../src/panes/telemetry').ThroughputChart;
 let downsampleKpiSeries: typeof import('../src/panes/telemetry').downsampleKpiSeries;
+let loadFindings: typeof import('../src/panes/telemetry').loadFindings;
 let HostCard: typeof import('../src/panes/nodes').HostCard;
 let NicWave: typeof import('../src/panes/nodes').NicWave;
 let ThroughputPanel: typeof import('../src/panes/nodes').ThroughputPanel;
@@ -66,7 +67,7 @@ beforeAll(async () => {
       disconnect() {}
     },
   );
-  ({ LoadCard, ThroughputChart, downsampleKpiSeries } = await import('../src/panes/telemetry'));
+  ({ LoadCard, ThroughputChart, downsampleKpiSeries, loadFindings } = await import('../src/panes/telemetry'));
   ({ HostCard, NicWave, ThroughputPanel, PingProbePanel } = await import('../src/panes/nodes'));
   ({ PingLatencyChart, ObservationChartLoading } = await import('../src/panes/node-observation-charts'));
 });
@@ -306,6 +307,18 @@ function renderThroughput(value: NodeLoadView, linked = false, range: LoadRange 
 }
 
 describe('deep host telemetry', () => {
+  it('only calls out CPU steal at eighty percent or above', () => {
+    const below = reportWith(value => {
+      value.cpu_steal_pct = 79.9;
+    });
+    const atThreshold = reportWith(value => {
+      value.cpu_steal_pct = 80;
+    });
+
+    expect(loadFindings(below).some(finding => finding.chip.startsWith('宿主争抢'))).toBe(false);
+    expect(loadFindings(atThreshold).map(finding => finding.chip)).toContain('宿主争抢 80.0%');
+  });
+
   it('downsamples only KPI spark data while retaining endpoints, extrema and a gap marker', () => {
     const series = Array.from({ length: 1_000 }, (_, index) => {
       const point = sample(false);

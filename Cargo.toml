@@ -12,10 +12,10 @@ members = [
 resolver = "2"
 
 [workspace.package]
-# The one place a version number is maintained. Every crate inherits it with
-# `version.workspace = true`, so bumping it here bumps the whole set — the console reports it as
-# its own version and stamps it onto the agent release it distributes
-# (`brocade-console/build.rs`, `describe_build`).
+# The one place the package version is maintained. Every crate inherits it with
+# `version.workspace = true`; the Console reports it as its own version. Agent and Xray releases
+# use the last Git commit touching their source closure as their human-facing version, while their
+# executable digests remain the machine identity (`brocade-console/build.rs`, `describe_build`).
 #
 # Six copies of the same string lived in the six manifests before this. Nothing forced them to
 # agree, and the failure mode is quiet: the console would report one number while the agent it

@@ -9,3 +9,10 @@ export function useNodeNames(): (id: string) => string {
   const map = q.data ? new Map(q.data.nodes.map(n => [n.node_id, n.name])) : null;
   return id => map?.get(id) || id;
 }
+
+/** 机器公网 IPv4 的归属地区，给名称前的地区旗用；与 useNodeNames 共用 ['nodes'] 查询。 */
+export function useNodeCountries(): (id: string) => string | null {
+  const q = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes() });
+  const map = q.data ? new Map(q.data.nodes.map(n => [n.node_id, n.public_ipv4_country ?? null])) : null;
+  return id => map?.get(id) ?? null;
+}

@@ -9,7 +9,11 @@ const shell = readFileSync(new URL('../src/forge/shell.tsx', import.meta.url), '
 test('手机端菜单留在视口内并允许纵向滚动', () => {
   assert.match(
     styles,
-    /@media \(max-width: 820px\)[\s\S]*?\.fg-menu\s*\{[\s\S]*?max-width:\s*calc\(100vw - 16px\);[\s\S]*?max-height:\s*calc\(100dvh - 60px - var\(--safe-top\) - var\(--safe-bottom\)\);[\s\S]*?overflow-y:\s*auto;/,
+    /@media \(max-width: 820px\)[\s\S]*?\.fg-menu\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?top:\s*calc\(46px \+ var\(--safe-top\)\);[\s\S]*?right:\s*calc\(10px \+ var\(--safe-right\)\);[\s\S]*?max-width:\s*calc\(100vw - 20px - var\(--safe-left\) - var\(--safe-right\)\);[\s\S]*?overflow-y:\s*auto;/,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 820px\)[\s\S]*?\.fg-menu\.nav-menu\s*\{[\s\S]*?width:\s*min\(232px,[\s\S]*?padding:\s*4px;/,
   );
   assert.match(
     styles,
@@ -43,6 +47,14 @@ test('手机端不渲染桌面面包屑或额外返回条', () => {
 });
 
 test('手机端导航栏与内容面板保留呼吸距离', () => {
+  assert.match(
+    styles,
+    /@media \(max-width: 375px\)[\s\S]*?\.forge\.narrow \.fg-brand\s*\{[\s\S]*?display:\s*none;/,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 820px\)[\s\S]*?\.fg-facebar \.fg-nv\s*\{[\s\S]*?gap:\s*4px;[\s\S]*?padding:\s*0 6px;/,
+  );
   assert.match(styles, /@media \(max-width: 820px\)[\s\S]*?\.fg-sheet\s*\{[\s\S]*?margin:\s*12px 8px;/);
   assert.match(
     styles,

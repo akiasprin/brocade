@@ -15,7 +15,7 @@ use brocade_core::{
         ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload,
         ExternalWarpBinding, Grant, HopDial, HopEncryption, HopIn, HopMux, HopPool, HopWire,
         Hysteria2, HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs,
-        Ingress, IngressWires, IpFamily, ModelSettings, ModelSnapshot, Network, Node,
+        Ingress, IngressWires, IpFamily, ModelSettings, ModelSnapshot, MtProto, Network, Node,
         NodeEgressDnsPolicy, OverlaySettings, Reality, RealityClientPolicy, RealityFallbackLimits,
         RealityFallbackMode, RealitySite, RealityXhttp, Rule, Step, Tls, Transport, User,
         WireGuardKeys, Xhttp, XhttpMode, XhttpTuning, XhttpXmuxRange,
@@ -1460,6 +1460,60 @@ fn an_ingress_guard_also_covers_its_hysteria2_inbound() {
                 .is_some_and(|tags| tags.iter().any(|tag| tag == "in:app/i:hy2"))
     });
     assert!(blocks_hy2, "guard 未覆盖 hy2 入站: {rules:#?}");
+}
+
+#[test]
+fn mtproxy_never_enters_content_or_chain_routing_rules() {
+    let doc = doc(vec![node("hk", [10, 66, 0, 1], true, Dns::System)]);
+    let mut face = ingress("i", "c", "hk");
+    face.wires = IngressWires::WithMtProto {
+        other: Some(Box::new(face.wires.clone())),
+        mtproto: MtProto { port: 15_443 },
+    };
+    face.guard = brocade_core::model::IngressGuard {
+        no_private: true,
+        ..brocade_core::model::IngressGuard::OPEN
+    };
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![face],
+        fronts: Vec::new(),
+        steps: vec![step("c", "hk", vec![any_egress()], None)],
+        grants: Vec::new(),
+    };
+
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    let value = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "hk")));
+    let rules = value["routing"]["rules"].as_array().unwrap();
+    let selected_tags = rules
+        .iter()
+        .filter_map(|rule| rule["inboundTag"].as_array())
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+
+    assert!(
+        selected_tags.contains(&"in:app/i"),
+        "VLESS listener lost its chain rules: {rules:#?}"
+    );
+    assert!(
+        !selected_tags.contains(&"in:app/i:mtproto"),
+        "MTProxy must bypass SNI, guard and chain routing: {rules:#?}"
+    );
+    assert_eq!(
+        inbound(&value, "in:app/i:mtproto")["sniffing"],
+        serde_json::json!({ "enabled": false })
+    );
 }
 
 #[test]
@@ -3856,6 +3910,7 @@ fn assert_encryption_ingress(options: brocade_core::model::VlessEncryptionOption
         vless: face.wires.vless().cloned(),
         anytls: None,
         hysteria2: None,
+        mtproto: None,
     })
     .unwrap();
     let app = AppView {

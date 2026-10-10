@@ -16,6 +16,7 @@ import { Confirm, ErrorBox } from '../ui/bits';
 import { randomKey } from '../ui/platform';
 import { BinaryReleaseHistory } from './binary-release-history';
 import { BINARY_TARGET_STATUS } from '../ui/binary-release-status';
+import { binaryReleaseVersion } from '../ui/binary-release-version';
 import {
   MachineTable,
   ReleaseLedger,
@@ -33,11 +34,6 @@ import {
 const agentHash = (node: NodeAgentStateItem) => node.agent_version?.replace(/^brocade-agent\//, '') ?? null;
 const runningHash = (node: NodeAgentStateItem, component: BinaryComponent) =>
   component === 'agent' ? agentHash(node) : node.runtime_versions?.xray_running_sha256;
-function compactRuntimeVersion(value: string) {
-  const version = value.match(/(?:^|\b)(?:Xray\s+)?v?(\d+(?:\.\d+){1,3})(?:\b|$)/i)?.[1];
-  return version ? `v${version}` : value;
-}
-
 function eligible(node: NodeAgentStateItem, component: BinaryComponent) {
   if (component === 'agent')
     return node.lifecycle_phase === 'active' && node.desired_poll_fresh && /^[0-9a-f]{64}$/.test(agentHash(node) ?? '');
@@ -209,14 +205,14 @@ export function BinaryReleaseTab({
   if (!release.ready) return release.error ? <TabError error={release.error} /> : null;
   const view = release.view!;
   const { active, selected, setSelected, busy } = release;
-  const target = compactRuntimeVersion(active?.version ?? view.available.version);
+  const target = binaryReleaseVersion(release.component, active?.version ?? view.available.version);
   const label = release.component === 'agent' ? 'Agent' : 'Xray';
   const unavailableBuild = !!active && active.build_id !== view.available.build_id;
   const versionOf = (node: NodeAgentStateItem) =>
     release.component === 'agent'
       ? (agentHash(node)?.slice(0, 8) ?? null)
       : node.runtime_versions?.xray
-        ? compactRuntimeVersion(node.runtime_versions.xray)
+        ? binaryReleaseVersion('xray', node.runtime_versions.xray)
         : null;
   const picking = editing && !active;
   const actionable = release.states

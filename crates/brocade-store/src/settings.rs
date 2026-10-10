@@ -72,6 +72,7 @@ const SETTINGS_SQL: &str = "SELECT current_revision,
             port_vless_encryption_base,
             port_hop_base,
             port_hy2_base,
+            port_mtproto_base,
             probe_endpoint_url,
             probe_timeout_secs,
             probe_interval_secs,
@@ -224,6 +225,7 @@ fn settings_from_row(row: &sqlx::postgres::PgRow) -> Result<ModelSettings> {
             )?,
             hop_base: u16_column("port_hop_base", row.try_get("port_hop_base")?)?,
             hy2_base: u16_column("port_hy2_base", row.try_get("port_hy2_base")?)?,
+            mtproto_base: u16_column("port_mtproto_base", row.try_get("port_mtproto_base")?)?,
         },
         probe: ProbeSettings {
             endpoint_url: row.try_get("probe_endpoint_url")?,
@@ -387,7 +389,8 @@ pub(crate) async fn update_settings_tx(
              relay_mux_probe_timeout_ms = $33,
              relay_mux_idle_ttl_ms = $34,
              relay_mux_max_requests_per_worker = $35,
-             port_vless_encryption_base = $36, reverse_health = $37, reverse_health_overrides = $38
+             port_vless_encryption_base = $36, reverse_health = $37, reverse_health_overrides = $38,
+             port_mtproto_base = $39
          WHERE id = TRUE",
     )
     .bind(settings.reality_client.min_client_ver.as_deref())
@@ -439,6 +442,7 @@ pub(crate) async fn update_settings_tx(
     .bind(i32::from(settings.ports.vless_encryption_base))
     .bind(serde_json::to_value(settings.reverse_health)?)
     .bind(serde_json::to_value(&settings.reverse_health_overrides)?)
+    .bind(i32::from(settings.ports.mtproto_base))
     .execute(&mut **tx)
     .await?;
 

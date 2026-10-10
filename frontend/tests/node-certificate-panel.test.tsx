@@ -75,6 +75,7 @@ const certs: CertsView = {
       observed_at: '2026-09-03T00:00:00Z',
     },
   ],
+  scan: null,
   letsencrypt: 'https://acme',
   letsencrypt_staging: 'https://acme-staging',
 };

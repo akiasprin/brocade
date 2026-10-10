@@ -34,6 +34,11 @@ pub struct ConsoleAsset {
 
 include!(concat!(env!("OUT_DIR"), "/console_assets.rs"));
 
+/// Content identity shared by the embedded index and the no-store version endpoint.
+pub(crate) fn version() -> &'static str {
+    CONSOLE_ASSET_VERSION
+}
+
 /// The asset answering a request path, if any.
 ///
 /// A linear scan: this table holds a handful of entries (vite emits one JS, one CSS and the HTML),
@@ -217,6 +222,16 @@ mod tests {
             "没有 JS 的话是编出了一个空壳（表里有 {} 个文件）",
             CONSOLE_ASSETS.len()
         );
+        let html = String::from_utf8_lossy(index.bytes);
+        assert!(
+            html.contains(&format!(
+                "<meta name=\"brocade-ui-version\" content=\"{}\" />",
+                version()
+            )),
+            "index.html 与版本接口必须携带同一个前端指纹"
+        );
+        assert_eq!(version().len(), 64);
+        assert!(version().bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 
     /// The hashed filenames are the whole reason `immutable` is safe. Handing `index.html` the

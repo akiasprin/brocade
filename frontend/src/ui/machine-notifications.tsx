@@ -11,6 +11,7 @@ import {
 import { Ago, ErrorBox, Loading } from './bits';
 import { Icon } from './icons';
 import { usePresence } from './presence';
+import { CPU_STEAL_ALERT_PCT } from './telemetry-thresholds';
 
 const INCIDENT_GROUP_WINDOW_MS = 60_000;
 const DEFAULT_VISIBLE_NOTIFICATIONS = 10;
@@ -69,7 +70,7 @@ function activeIncident(active: ActiveMachineIncident): MachineIncident {
     recoveredAt: null,
     currentValue: active.current_value,
     peakValue: active.peak_value,
-    threshold: active.incident_kind === 'cpu_steal' ? 10 : null,
+    threshold: active.incident_kind === 'cpu_steal' ? CPU_STEAL_ALERT_PCT : null,
   };
 }
 

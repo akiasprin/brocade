@@ -1,6 +1,6 @@
 import { cleanup, render } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
-import { confirmDiscardChanges, useUnsavedChanges } from '../src/ui/navigation-guard';
+import { confirmDiscardChanges, prepareForDocumentReload, useUnsavedChanges } from '../src/ui/navigation-guard';
 
 function DirtySurface({
   active = true,
@@ -98,4 +98,21 @@ it('still allows navigation when preserving an edit fails', () => {
 
   expect(confirmDiscardChanges()).toBe(true);
   expect(confirm).not.toHaveBeenCalled();
+});
+
+it('only permits a document reload after volatile edits have been saved', () => {
+  let clear: () => void = () => {};
+  render(<DirtySurface label="新密码" exposeClear={next => (clear = next)} />);
+
+  expect(prepareForDocumentReload()).toBe(false);
+  clear();
+  expect(prepareForDocumentReload()).toBe(true);
+});
+
+it('persists eligible edits before permitting a document reload', () => {
+  const preserve = vi.fn();
+  render(<DirtySurface label="规则表" preserveOnLeave={preserve} />);
+
+  expect(prepareForDocumentReload()).toBe(true);
+  expect(preserve).toHaveBeenCalledOnce();
 });

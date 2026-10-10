@@ -45,7 +45,12 @@ describe('系统初始化默认身份', () => {
 
   it('普通登录默认填写 root', () => {
     const view = render(<PasswordLogin onLogin={vi.fn()} publicOpen={false} />, { wrapper: wrapper() });
-    expect((view.getByLabelText('用户名') as HTMLInputElement).value).toBe('root');
+    const username = view.getByLabelText('用户名') as HTMLInputElement;
+    const password = view.getByLabelText('密码') as HTMLInputElement;
+    expect(username.value).toBe('root');
+    expect(username.autocomplete).toBe('username');
+    expect(password.type).toBe('password');
+    expect(password.autocomplete).toBe('current-password');
   });
 
   it('以 root 初始化后直接进入控制台，zero 不设置登录密码', async () => {
@@ -77,6 +82,13 @@ describe('系统初始化默认身份', () => {
 
     const view = render(<InitializeAdmin onInitialized={onInitialized} />, { wrapper: wrapper() });
     expect((view.getByLabelText('用户名') as HTMLInputElement).value).toBe('root');
+    const bootstrapToken = view.getByLabelText('初始化凭据') as HTMLInputElement;
+    const password = view.getByLabelText('密码') as HTMLInputElement;
+    expect(bootstrapToken.type).toBe('text');
+    expect(bootstrapToken.autocomplete).toBe('off');
+    expect(bootstrapToken.classList.contains('config-secret-input')).toBe(true);
+    expect(password.type).toBe('password');
+    expect(password.autocomplete).toBe('new-password');
     expect(view.getByText('面板支持多用户统计；初始化时会预置使用者 zero，默认不开放登录。')).toBeTruthy();
     const submit = view.getByRole('button', { name: '创建管理员' }) as HTMLButtonElement;
     fireEvent.change(view.getByLabelText('密码'), { target: { value: 'root-password' } });

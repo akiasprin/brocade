@@ -318,6 +318,9 @@ pub struct PortSettings {
     /// AnyTLS ingresses search upward from this port, on TCP.
     ///
     pub anytls_base: u16,
+    /// Telegram MTProxy ingresses search upward from this port, on TCP.
+    #[serde(default = "default_mtproto_port_base")]
+    pub mtproto_base: u16,
     pub vless_encryption_base: u16,
     /// Relay ports search upward from this port. A high range keeps them clear of
     /// ingresses and system services.
@@ -333,12 +336,18 @@ pub struct PortSettings {
 }
 
 pub const VLESS_ENCRYPTION_PORT_BASE: u16 = 13800;
+pub const MTPROTO_PORT_BASE: u16 = 28_800;
+
+const fn default_mtproto_port_base() -> u16 {
+    MTPROTO_PORT_BASE
+}
 
 impl Default for PortSettings {
     fn default() -> Self {
         Self {
             ingress_base: VLESS_PORT_BASE,
             anytls_base: ANYTLS_PORT_BASE,
+            mtproto_base: MTPROTO_PORT_BASE,
             vless_encryption_base: VLESS_ENCRYPTION_PORT_BASE,
             hop_base: 20000,
             hy2_base: HYSTERIA2_PORT_BASE,
@@ -348,7 +357,10 @@ impl Default for PortSettings {
 
 #[cfg(test)]
 mod port_settings_tests {
-    use super::{PortSettings, ANYTLS_PORT_BASE, VLESS_ENCRYPTION_PORT_BASE, VLESS_PORT_BASE};
+    use super::{
+        PortSettings, ANYTLS_PORT_BASE, MTPROTO_PORT_BASE, VLESS_ENCRYPTION_PORT_BASE,
+        VLESS_PORT_BASE,
+    };
 
     #[test]
     fn factory_bases_keep_vless_and_anytls_in_separate_ranges() {
@@ -357,8 +369,24 @@ mod port_settings_tests {
         assert_eq!(ports.ingress_base, 13_443);
         assert_eq!(ports.anytls_base, ANYTLS_PORT_BASE);
         assert_eq!(ports.anytls_base, 14_443);
+        assert_eq!(ports.mtproto_base, MTPROTO_PORT_BASE);
+        assert_eq!(ports.mtproto_base, 28_800);
         assert_eq!(ports.vless_encryption_base, VLESS_ENCRYPTION_PORT_BASE);
         assert_eq!(ports.vless_encryption_base, 13_800);
+    }
+
+    #[test]
+    fn legacy_port_settings_default_the_mtproto_base() {
+        let ports: PortSettings = serde_json::from_value(serde_json::json!({
+            "ingress_base": 13443,
+            "anytls_base": 14443,
+            "vless_encryption_base": 13800,
+            "hop_base": 20000,
+            "hy2_base": 30000
+        }))
+        .expect("legacy port settings remain readable");
+
+        assert_eq!(ports.mtproto_base, MTPROTO_PORT_BASE);
     }
 }
 
@@ -1319,6 +1347,9 @@ pub struct Projection {
     /// `None` is the legacy shared-address representation; `Some(empty)` explicitly means direct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hysteria2: Option<ProtocolProjection>,
+    /// `None` is the legacy shared-address representation; `Some(empty)` explicitly means direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtproto: Option<ProtocolProjection>,
 }
 
 /// One protocol's independently mapped public endpoints.
@@ -1633,6 +1664,22 @@ pub const VLESS_PORT_BASE: u16 = 13_443;
 /// Base used when the console creates an AnyTLS listener without an explicit port.
 pub const ANYTLS_PORT_BASE: u16 = 14_443;
 
+/// Telegram's native MTProxy listener. User secrets are derived from the existing UUID grants,
+/// so this object owns only its independently allocated TCP port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MtProto {
+    pub port: u16,
+}
+
+impl Default for MtProto {
+    fn default() -> Self {
+        Self {
+            port: MTPROTO_PORT_BASE,
+        }
+    }
+}
+
 /// The response body and headers used by Xray's built-in `type: 404` masquerade are owned by
 /// Xray. Brocade stores only optional header overrides for that form; the status and body stay
 /// the stable upstream defaults.
@@ -1877,6 +1924,10 @@ pub enum IngressWires {
         other: Option<Box<IngressWires>>,
         encryption: VlessEncryption,
     },
+    WithMtProto {
+        other: Option<Box<IngressWires>>,
+        mtproto: MtProto,
+    },
     Vless(Transport),
     AnyTls(AnyTls),
     Hysteria2(Hysteria2),
@@ -1913,6 +1964,8 @@ pub struct IngressWiresWire {
     pub anytls: Option<AnyTls>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hysteria2: Option<Hysteria2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtproto: Option<MtProto>,
 }
 
 impl TryFrom<IngressWiresWire> for IngressWires {
@@ -1920,13 +1973,25 @@ impl TryFrom<IngressWiresWire> for IngressWires {
 
     fn try_from(mut wire: IngressWiresWire) -> Result<Self, Self::Error> {
         if let Some(encryption) = wire.vless_encryption.take() {
-            let other = if wire.vless.is_none() && wire.anytls.is_none() && wire.hysteria2.is_none()
+            let other = if wire.vless.is_none()
+                && wire.anytls.is_none()
+                && wire.hysteria2.is_none()
+                && wire.mtproto.is_none()
             {
                 None
             } else {
                 Some(Box::new(Self::try_from(wire)?))
             };
             return Ok(Self::WithVlessEncryption { other, encryption });
+        }
+        if let Some(mtproto) = wire.mtproto.take() {
+            let other = if wire.vless.is_none() && wire.anytls.is_none() && wire.hysteria2.is_none()
+            {
+                None
+            } else {
+                Some(Box::new(Self::try_from(wire)?))
+            };
+            return Ok(Self::WithMtProto { other, mtproto });
         }
         match (wire.vless, wire.anytls, wire.hysteria2) {
             (Some(vless), Some(anytls), Some(hysteria2)) => Ok(Self::VlessAnyTlsAndHysteria2 {
@@ -1943,7 +2008,7 @@ impl TryFrom<IngressWiresWire> for IngressWires {
             (None, Some(anytls), None) => Ok(Self::AnyTls(anytls)),
             (None, None, Some(hysteria2)) => Ok(Self::Hysteria2(hysteria2)),
             (None, None, None) => {
-                Err("接入面至少要有一条线：vless、anytls 和 hysteria2 不能都空着")
+                Err("接入面至少要有一条线：vless、anytls、hysteria2 和 mtproto 不能都空着")
             }
         }
     }
@@ -1958,8 +2023,20 @@ impl From<IngressWires> for IngressWiresWire {
                     vless: None,
                     anytls: None,
                     hysteria2: None,
+                    mtproto: None,
                 });
                 wire.vless_encryption = Some(encryption);
+                wire
+            }
+            IngressWires::WithMtProto { other, mtproto } => {
+                let mut wire = other.map(|other| Self::from(*other)).unwrap_or(Self {
+                    vless_encryption: None,
+                    vless: None,
+                    anytls: None,
+                    hysteria2: None,
+                    mtproto: None,
+                });
+                wire.mtproto = Some(mtproto);
                 wire
             }
             IngressWires::Vless(vless) => Self {
@@ -1967,36 +2044,42 @@ impl From<IngressWires> for IngressWiresWire {
                 vless: Some(vless),
                 anytls: None,
                 hysteria2: None,
+                mtproto: None,
             },
             IngressWires::AnyTls(anytls) => Self {
                 vless_encryption: None,
                 vless: None,
                 anytls: Some(anytls),
                 hysteria2: None,
+                mtproto: None,
             },
             IngressWires::Hysteria2(hysteria2) => Self {
                 vless_encryption: None,
                 vless: None,
                 anytls: None,
                 hysteria2: Some(hysteria2),
+                mtproto: None,
             },
             IngressWires::VlessAndAnyTls { vless, anytls } => Self {
                 vless_encryption: None,
                 vless: Some(vless),
                 anytls: Some(anytls),
                 hysteria2: None,
+                mtproto: None,
             },
             IngressWires::Both { vless, hysteria2 } => Self {
                 vless_encryption: None,
                 vless: Some(vless),
                 anytls: None,
                 hysteria2: Some(hysteria2),
+                mtproto: None,
             },
             IngressWires::AnyTlsAndHysteria2 { anytls, hysteria2 } => Self {
                 vless_encryption: None,
                 vless: None,
                 anytls: Some(anytls),
                 hysteria2: Some(hysteria2),
+                mtproto: None,
             },
             IngressWires::VlessAnyTlsAndHysteria2 {
                 vless,
@@ -2007,6 +2090,7 @@ impl From<IngressWires> for IngressWiresWire {
                 vless: Some(vless),
                 anytls: Some(anytls),
                 hysteria2: Some(hysteria2),
+                mtproto: None,
             },
         }
     }
@@ -2177,6 +2261,19 @@ impl IngressWires {
     pub fn vless_encryption(&self) -> Option<&VlessEncryption> {
         match self {
             Self::WithVlessEncryption { encryption, .. } => Some(encryption),
+            Self::WithMtProto { other, .. } => {
+                other.as_ref().and_then(|other| other.vless_encryption())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn mtproto(&self) -> Option<&MtProto> {
+        match self {
+            Self::WithMtProto { mtproto, .. } => Some(mtproto),
+            Self::WithVlessEncryption { other, .. } => {
+                other.as_ref().and_then(|other| other.mtproto())
+            }
             _ => None,
         }
     }
@@ -2187,6 +2284,7 @@ impl IngressWires {
             Self::WithVlessEncryption { other, .. } => {
                 other.as_ref().and_then(|other| other.vless())
             }
+            Self::WithMtProto { other, .. } => other.as_ref().and_then(|other| other.vless()),
             Self::Vless(vless) | Self::Both { vless, .. } => Some(vless),
             Self::VlessAndAnyTls { vless, .. } | Self::VlessAnyTlsAndHysteria2 { vless, .. } => {
                 Some(vless)
@@ -2200,6 +2298,7 @@ impl IngressWires {
             Self::WithVlessEncryption { other, .. } => {
                 other.as_mut().and_then(|other| other.vless_mut())
             }
+            Self::WithMtProto { other, .. } => other.as_mut().and_then(|other| other.vless_mut()),
             Self::Vless(vless) | Self::Both { vless, .. } => Some(vless),
             Self::VlessAndAnyTls { vless, .. } | Self::VlessAnyTlsAndHysteria2 { vless, .. } => {
                 Some(vless)
@@ -2214,6 +2313,7 @@ impl IngressWires {
             Self::WithVlessEncryption { other, .. } => {
                 other.as_ref().and_then(|other| other.anytls())
             }
+            Self::WithMtProto { other, .. } => other.as_ref().and_then(|other| other.anytls()),
             Self::AnyTls(anytls)
             | Self::VlessAndAnyTls { anytls, .. }
             | Self::AnyTlsAndHysteria2 { anytls, .. }
@@ -2227,6 +2327,7 @@ impl IngressWires {
             Self::WithVlessEncryption { other, .. } => {
                 other.as_mut().and_then(|other| other.anytls_mut())
             }
+            Self::WithMtProto { other, .. } => other.as_mut().and_then(|other| other.anytls_mut()),
             Self::AnyTls(anytls)
             | Self::VlessAndAnyTls { anytls, .. }
             | Self::AnyTlsAndHysteria2 { anytls, .. }
@@ -2241,6 +2342,7 @@ impl IngressWires {
             Self::WithVlessEncryption { other, .. } => {
                 other.as_ref().and_then(|other| other.hysteria2())
             }
+            Self::WithMtProto { other, .. } => other.as_ref().and_then(|other| other.hysteria2()),
             Self::Hysteria2(hysteria2)
             | Self::Both { hysteria2, .. }
             | Self::AnyTlsAndHysteria2 { hysteria2, .. }
@@ -2254,6 +2356,9 @@ impl IngressWires {
             Self::WithVlessEncryption { other, .. } => {
                 other.as_mut().and_then(|other| other.hysteria2_mut())
             }
+            Self::WithMtProto { other, .. } => {
+                other.as_mut().and_then(|other| other.hysteria2_mut())
+            }
             Self::Hysteria2(hysteria2)
             | Self::Both { hysteria2, .. }
             | Self::AnyTlsAndHysteria2 { hysteria2, .. }
@@ -2265,7 +2370,10 @@ impl IngressWires {
     /// Whether a TCP listener exists. `false` for the QUIC-only shape, which is why the
     /// port-occupancy checks call this rather than assuming (`ir/validate.rs`).
     pub fn has_tcp(&self) -> bool {
-        self.vless().is_some() || self.anytls().is_some() || self.vless_encryption().is_some()
+        self.vless().is_some()
+            || self.anytls().is_some()
+            || self.vless_encryption().is_some()
+            || self.mtproto().is_some()
     }
 
     /// Whether a UDP listener exists.

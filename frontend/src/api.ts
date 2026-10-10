@@ -1031,7 +1031,7 @@ export interface UserListItem {
 export const fetchUsers = (includeDisabled = true) =>
   api<{ users: UserListItem[] }>(`/users?include_disabled=${includeDisabled}`);
 
-export type OnlineSourceProtocol = 'vless' | 'anytls' | 'hysteria2' | 'unknown';
+export type OnlineSourceProtocol = 'vless' | 'anytls' | 'hysteria2' | 'mtproto' | 'unknown';
 
 export interface UserOnlineSourceAccess {
   node_id: string;
@@ -1368,9 +1368,9 @@ export const issueClashHaitunSubscription = (tenant: string, user: string) =>
     method: 'POST',
   });
 
-export const regenerateClashHaitunSubscription = (tenant: string, user: string) =>
-  api<ClashHaitunSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription/haitun/regenerate`, '', {
-    method: 'POST',
+export const revokeClashHaitunSubscription = (tenant: string, user: string) =>
+  api<ClashHaitunSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription/haitun`, '', {
+    method: 'DELETE',
   });
 
 // ── 流量额度（用户 × 项目）──
@@ -1680,15 +1680,20 @@ export interface VlessEncryptionSettings {
   options?: VlessEncryptionOptions;
 }
 
+export interface MtProtoSettings {
+  port: number;
+}
+
 export interface Wires {
   vless_encryption?: VlessEncryptionSettings | null;
   vless?: Transport | null;
   anytls?: AnyTlsSettings | null;
   hysteria2?: Hysteria2Settings | null;
+  mtproto?: MtProtoSettings | null;
 }
 
 export const wiresAreValid = (wires: Wires) =>
-  !!wires.vless || !!wires.anytls || !!wires.hysteria2 || !!wires.vless_encryption;
+  !!wires.vless || !!wires.anytls || !!wires.hysteria2 || !!wires.vless_encryption || !!wires.mtproto;
 
 /* 该档位是否需要机器自有证书。REALITY 借用其他站点，机器上没有证书；TLS 使用自有证书，
  * 未签发时该接入面不可用（编译器会拦截，`ingress.tls-no-certificate`）。 */
@@ -1746,9 +1751,10 @@ export interface IngressProjection extends ProtocolProjection {
   vless_encryption?: ProtocolProjection | null;
   anytls?: ProtocolProjection | null;
   hysteria2?: ProtocolProjection | null;
+  mtproto?: ProtocolProjection | null;
 }
 
-export type ProjectionProtocol = 'vless' | 'vless_encryption' | 'anytls' | 'hysteria2';
+export type ProjectionProtocol = 'vless' | 'vless_encryption' | 'anytls' | 'hysteria2' | 'mtproto';
 
 export interface ProjectionEndpoint {
   host: string;
@@ -2606,6 +2612,7 @@ export interface SnapshotIngress {
     vless_encryption?: (VlessEncryptionSettings & { public_key?: string }) | null;
     anytls?: AnyTlsSettings | null;
     hysteria2?: Hysteria2Settings | null;
+    mtproto?: MtProtoSettings | null;
   };
 }
 
@@ -2639,13 +2646,14 @@ export function currentWires(ingress: SnapshotIngress): Wires {
       : {}),
     anytls: ingress.wires.anytls ?? null,
     hysteria2: ingress.wires.hysteria2 ?? null,
+    mtproto: ingress.wires.mtproto ?? null,
   };
 }
 
 function projectionForWireChange(ingress: SnapshotIngress, wires: Wires): IngressProjection {
   const previous = currentWires(ingress);
   let projection = ingress.projection;
-  for (const protocol of ['vless_encryption', 'anytls', 'hysteria2'] as const) {
+  for (const protocol of ['vless_encryption', 'anytls', 'hysteria2', 'mtproto'] as const) {
     if (wires[protocol] && !previous[protocol] && projection[protocol] == null) {
       projection = { ...projection, [protocol]: {} };
     }
@@ -3178,6 +3186,7 @@ export interface ModelSettings {
     vless_encryption_base?: number;
     hop_base: number;
     hy2_base: number;
+    mtproto_base: number;
   };
   // geoip.dat / geosite.dat 的自动更新。不提供开关——规则表中的 `geosite:` /
   // `geoip:` 匹配依赖这两个文件，文件过期不会报错，而是导致规则匹配失败且无提示。
@@ -3621,6 +3630,31 @@ export interface NodeCertificateState {
   observed_at: string | null;
 }
 
+export type CertificateScanTrigger = 'startup' | 'scheduled' | 'settings' | 'manual';
+export type CertificateScanStatus = 'queued' | 'running' | 'succeeded' | 'failed';
+export type CertificateScanPhase =
+  'queued' | 'preparing' | 'dns' | 'validating' | 'finalizing' | 'storing' | 'finished';
+
+/** One durable fleet-wide certificate pass. Certificate rows carry individual failures; this row
+    carries scheduling, ownership recovery and cross-tab progress. */
+export interface CertificateScanRun {
+  id: number;
+  trigger: CertificateScanTrigger;
+  status: CertificateScanStatus;
+  phase: CertificateScanPhase;
+  total_items: number;
+  processed_items: number;
+  issued_items: number;
+  failed_items: number;
+  current_certificate_id: string | null;
+  current_subject: string | null;
+  error_detail: string | null;
+  queued_at_unix_secs: number;
+  started_at_unix_secs: number | null;
+  heartbeat_at_unix_secs: number | null;
+  finished_at_unix_secs: number | null;
+}
+
 export interface CertsView {
   /** 该控制面是否具备加密存储能力（是否配置了 `BROCADE_SECRET_KEY`）。页面需要在**输入之前**
       即提示该控制面无法存储凭据，而不是在保存失败后提示。它是进程配置而非数据，没有其他接口
@@ -3629,6 +3663,7 @@ export interface CertsView {
   domain: CertDomain | null;
   groups: CertGroup[];
   nodes: NodeCertificateState[];
+  scan: CertificateScanRun | null;
   letsencrypt: string;
   letsencrypt_staging: string;
 }
@@ -3636,13 +3671,8 @@ export interface CertsView {
 export const fetchCerts = () => api<CertsView>('/certs');
 export const saveCertDomain = (body: CertDomainInput) =>
   api<CertsView>('/certs/domain', '', { method: 'PUT', body: JSON.stringify(body) });
-export interface CertificateIssuanceResult {
-  issued: number;
-  failed: number;
-}
-/** 立即处理待签发、失败及需要续期的证书，等待完成后返回结果。 */
-export const scanCerts = () =>
-  api<CertsView & { processing: CertificateIssuanceResult }>('/certs/scan', '', { method: 'POST' });
+/** Queue a durable scan. Closing the request does not cancel issuance. */
+export const scanCerts = () => api<CertificateScanRun>('/certs/scan', '', { method: 'POST' });
 
 export const createCertGroup = (body: {
   name: string;
@@ -3650,7 +3680,7 @@ export const createCertGroup = (body: {
   note?: string | null;
   certificate_name?: string | null;
 }) =>
-  api<{ id: string; processing: CertificateIssuanceResult }>('/certs/groups', '', {
+  api<{ id: string; scan: CertificateScanRun }>('/certs/groups', '', {
     method: 'POST',
     body: JSON.stringify(body),
   });
@@ -3663,7 +3693,7 @@ export const deleteCertGroup = (id: string) =>
   api<void>(`/certs/groups/${encodeURIComponent(id)}`, '', { method: 'DELETE' });
 /** 给这个组多签一张备用。它停在 `ready`，由人决定何时启用——自动续期那张不经过这里。 */
 export const requestSpareCertificate = (id: string) =>
-  api<{ id: string; processing: CertificateIssuanceResult }>(`/certs/groups/${encodeURIComponent(id)}/spare`, '', {
+  api<{ id: string; scan: CertificateScanRun }>(`/certs/groups/${encodeURIComponent(id)}/spare`, '', {
     method: 'POST',
   });
 /** 把一张待命的证书变成该组机器出示的那张。SNI 不变，只换字节，因此不需要发布。 */
@@ -3960,7 +3990,7 @@ export const fetchArtifactContentView = (
 // proxy-groups 按代理名引用成员，在浏览器端按行删除会产生引用不存在代理的组，mihomo 会
 // 拒绝导入。
 export type ArtifactFamily = 'v4' | 'v6';
-export type ArtifactProtocol = 'vless' | 'anytls' | 'hysteria2';
+export type ArtifactProtocol = 'vless' | 'anytls' | 'hysteria2' | 'mtproto';
 
 export const fetchArtifactContent = (
   targetKind: string,

@@ -7,7 +7,7 @@ import {
   fetchMyClashSubscription,
   fetchRevisions,
   issueClashHaitunSubscription,
-  regenerateClashHaitunSubscription,
+  revokeClashHaitunSubscription,
   type ArtifactFamily,
   type ArtifactProtocol,
   type ClashSubscriptionInfo,
@@ -36,6 +36,7 @@ const PROTOCOL_PICKS: { value: ProtocolPick; label: string }[] = [
   { value: 'vless', label: 'VLESS' },
   { value: 'anytls', label: 'AnyTLS' },
   { value: 'hysteria2', label: 'Hysteria 2' },
+  { value: 'mtproto', label: 'MTProxy' },
 ];
 
 const TABS: { value: SubscriptionKind; label: string; icon: IconName }[] = [
@@ -257,7 +258,7 @@ function ClashSubscription({
     staleTime: 0,
   });
   const updateHaitun = async (haitun: ClashSubscriptionInfo['haitun']) => {
-    // A read started before rotation must not replace the new URL with the invalid old token.
+    // A read started before revocation must not restore the invalid old URL.
     await qc.cancelQueries({ queryKey });
     qc.setQueryData<ClashSubscriptionInfo>(queryKey, current => (current ? { ...current, haitun } : current));
   };
@@ -265,8 +266,8 @@ function ClashSubscription({
     mutationFn: () => issueClashHaitunSubscription(tenant, user),
     onSuccess: updateHaitun,
   });
-  const regenerateHaitun = useMutation({
-    mutationFn: () => regenerateClashHaitunSubscription(tenant, user),
+  const revokeHaitun = useMutation({
+    mutationFn: () => revokeClashHaitunSubscription(tenant, user),
     onSuccess: updateHaitun,
   });
 
@@ -283,8 +284,8 @@ function ClashSubscription({
   const haitun = selfService ? null : value.haitun;
   const haitunUrls = haitun?.status === 'active' ? haitun.urls : null;
   const haitunUrl = haitunUrls ? withSubscriptionProtocol(haitunUrls[family], protocol) : '';
-  const actionError = issueHaitun.error ?? regenerateHaitun.error;
-  const haitunPending = issueHaitun.isPending || regenerateHaitun.isPending;
+  const actionError = issueHaitun.error ?? revokeHaitun.error;
+  const haitunPending = issueHaitun.isPending || revokeHaitun.isPending;
 
   return (
     <>
@@ -324,7 +325,7 @@ function ClashSubscription({
                 <div className="sub-item-name">
                   <b>koipy 测速订阅</b>
                   <span className={`sub-live${haitunUrls ? ' ok' : haitun.status === 'revoked' ? ' warn' : ''}`}>
-                    {haitunUrls ? '可用' : haitun.status === 'revoked' ? '旧地址已停用' : '尚未生成'}
+                    {haitunUrls ? '可用' : haitun.status === 'revoked' ? '已撤销' : '尚未生成'}
                   </span>
                 </div>
                 <span className="sub-item-sub">仅管理员</span>
@@ -333,20 +334,20 @@ function ClashSubscription({
                 <button
                   type="button"
                   className="btn sub-item-action"
-                  aria-label="重新生成 koipy 测速地址"
+                  aria-label="撤销 koipy 测速地址"
                   disabled={haitunPending}
                   onClick={() => {
                     if (
                       !window.confirm(
-                        '重新生成后，旧测速地址将无法继续拉取，但已下载的 UUID 和节点配置仍然有效。此操作不更换 UUID，也不发布授权。确定重新生成？',
+                        '撤销后，旧测速地址将无法继续拉取，不会自动生成新地址。但已下载的 UUID 和节点配置仍然有效；此操作不更换 UUID，也不发布授权。确定撤销？',
                       )
                     )
                       return;
                     issueHaitun.reset();
-                    regenerateHaitun.mutate();
+                    revokeHaitun.mutate();
                   }}
                 >
-                  {regenerateHaitun.isPending ? '生成中…' : '重新生成'}
+                  {revokeHaitun.isPending ? '撤销中…' : '撤销'}
                 </button>
               ) : (
                 <button
@@ -354,7 +355,10 @@ function ClashSubscription({
                   className="btn sub-item-action"
                   aria-label={haitun.status === 'revoked' ? '重新生成 koipy 测速地址' : '生成 koipy 测速地址'}
                   disabled={haitunPending}
-                  onClick={() => issueHaitun.mutate()}
+                  onClick={() => {
+                    revokeHaitun.reset();
+                    issueHaitun.mutate();
+                  }}
                 >
                   {issueHaitun.isPending ? '生成中…' : haitun.status === 'revoked' ? '重新生成' : '生成'}
                 </button>
@@ -365,8 +369,8 @@ function ClashSubscription({
               <p className="sub-item-note">
                 风险提示：测速订阅包含用户 UUID
                 等真实节点凭据，持有地址的人无需登录即可获取并使用节点，请仅交给可信测速服务。
-                重新生成仅更换测速地址，不影响普通订阅，也不会使已下载的节点配置失效。
-                若凭据泄露，需同时重新生成测速地址、更换用户 UUID 并发布授权，待节点生效后旧凭据才失效。
+                撤销仅停止测速地址的后续拉取，不会自动生成新地址，不影响普通订阅，也不会使已下载的节点配置失效。
+                若凭据泄露，需撤销测速地址、更换用户 UUID 并发布授权，待节点生效后旧凭据才失效。
               </p>
               {actionError && <ErrorBox error={actionError} />}
             </div>
@@ -426,6 +430,7 @@ const NODE_PROTOCOL_LABEL: Record<NodeProtocol, string> = {
   'vless-encryption': 'VLESS',
   anytls: 'AnyTLS',
   hysteria2: 'Hysteria 2',
+  mtproto: 'MTProxy',
   other: '其他',
 };
 
@@ -647,7 +652,7 @@ function NodeAddress({ link, family }: { link: NodeLink | undefined; family: Nod
   }
   const familyLabel = NODE_FAMILY_LABEL[family];
   // 主机与端口分开排：长 IPv6 只截主机部分，端口始终可见。
-  const [, host, port = ''] = /^(.*?)(:\d+)?$/.exec(link.endpoint) ?? [link.endpoint, link.endpoint];
+  const [, host, port = ''] = /^(.*?)(:\d+(?:-\d+)?)?$/.exec(link.endpoint) ?? [link.endpoint, link.endpoint];
   return (
     <CopyButton
       className="node-copy"
@@ -674,7 +679,7 @@ function NodeAddress({ link, family }: { link: NodeLink | undefined; family: Nod
  * 名称的写法与 core/physical/user.rs 一致：可选的地区旗（两个区域指示符）+ 链名 + 协议后缀
  * （「 | VLESS Encryption」「 | QUIC」「 | AnyTLS」）+ 地址族后缀（「 | v6」）。 */
 
-export type NodeProtocol = 'vless' | 'vless-encryption' | 'anytls' | 'hysteria2' | 'other';
+export type NodeProtocol = 'vless' | 'vless-encryption' | 'anytls' | 'hysteria2' | 'mtproto' | 'other';
 export type NodeFamily = 'ipv4' | 'ipv6';
 
 export interface NodeLink {
@@ -709,7 +714,7 @@ export interface NodeGroup {
 
 const REGIONAL_INDICATOR_A = 0x1f1e6;
 const FAMILY_SUFFIX = ' | v6';
-const WIRE_SUFFIXES = [' | VLESS Encryption', ' | QUIC', ' | AnyTLS'];
+const WIRE_SUFFIXES = [' | VLESS Encryption', ' | QUIC', ' | AnyTLS', ' | MTProxy'];
 
 // 浏览器不一定装有彩色 emoji 字体，地区旗拆成代码后交给 RegionFlag 的雪碧图显示。
 function splitRegion(name: string): { region: string | null; label: string } {
@@ -730,7 +735,36 @@ function baseName(label: string) {
   return base;
 }
 
-function parseNodeLink(line: string): NodeLink {
+function parseNodeUriParts(line: string): { endpoint: string; params: URLSearchParams } {
+  const schemeAt = line.indexOf('://');
+  if (schemeAt < 0) return { endpoint: '—', params: new URLSearchParams() };
+
+  const authorityStart = schemeAt + 3;
+  const hashAt = line.indexOf('#', authorityStart);
+  const queryAt = line.indexOf('?', authorityStart);
+  const pathAt = line.indexOf('/', authorityStart);
+  const authorityEnd = [pathAt, queryAt, hashAt]
+    .filter(index => index >= 0)
+    .reduce((earliest, index) => Math.min(earliest, index), line.length);
+  const authority = line.slice(authorityStart, authorityEnd);
+  const userInfoAt = authority.lastIndexOf('@');
+  const endpoint = authority.slice(userInfoAt + 1) || '—';
+  const hasQuery = queryAt >= 0 && (hashAt < 0 || queryAt < hashAt);
+  const params = hasQuery
+    ? new URLSearchParams(line.slice(queryAt + 1, hashAt >= 0 ? hashAt : line.length))
+    : new URLSearchParams();
+
+  if (line.slice(0, schemeAt).toLowerCase() === 'tg' && authority === 'proxy') {
+    const server = params.get('server') ?? '—';
+    const port = params.get('port');
+    const host = server.includes(':') && !server.startsWith('[') ? `[${server}]` : server;
+    return { endpoint: port ? `${host}:${port}` : host, params };
+  }
+
+  return { endpoint, params };
+}
+
+function parseNodeLink(line: string, metadataName?: string): NodeLink {
   const hashAt = line.indexOf('#');
   let fragment = hashAt >= 0 ? line.slice(hashAt + 1) : '';
   try {
@@ -738,17 +772,12 @@ function parseNodeLink(line: string): NodeLink {
   } catch {
     // 名称不是合法的百分号编码时按原文显示。
   }
+  if (!fragment && metadataName) fragment = metadataName;
   const { region, label } = splitRegion(fragment);
   const scheme = line.slice(0, Math.max(0, line.indexOf('://'))).toLowerCase();
-  let endpoint = '—';
-  let params = new URLSearchParams();
-  try {
-    const url = new URL(line);
-    endpoint = url.host || endpoint;
-    params = url.searchParams;
-  } catch {
-    // 没有可用地址的条目（服务端写作「?」）仍然列出，便于对照原文。
-  }
+  // Hy2 把端口跳跃范围写在 authority 中（如 `host:50000-50009`），这是它的
+  // 合法 URI 形式，但 WHATWG URL 会将它拒绝为非法端口。按订阅 URI 的分隔符取地址和查询参数。
+  const { endpoint, params } = parseNodeUriParts(line);
   let protocol: NodeProtocol = 'other';
   let stack = '';
   if (scheme === 'vless') {
@@ -768,6 +797,9 @@ function parseNodeLink(line: string): NodeLink {
   } else if (scheme === 'hysteria2' || scheme === 'hy2') {
     protocol = 'hysteria2';
     stack = 'QUIC';
+  } else if (scheme === 'tg' && line.startsWith('tg://proxy?')) {
+    protocol = 'mtproto';
+    stack = params.get('secret')?.startsWith('dd') ? 'Padded intermediate' : 'MTProto';
   }
   return {
     uri: line,
@@ -786,6 +818,7 @@ export function parseNodeListing(text: string): { links: NodeLink[]; notes: stri
   const links: NodeLink[] = [];
   const notes: string[] = [];
   let block: string[] = [];
+  let metadataName: string | undefined;
   const flush = () => {
     // 段内各行接成一句：上一行以冒号或句读结尾时直接相接，否则补一个空格。
     const note = block
@@ -800,10 +833,20 @@ export function parseNodeListing(text: string): { links: NodeLink[]; notes: stri
     if (!line) {
       flush();
     } else if (line.startsWith('#')) {
-      block.push(stripRegions(line.replace(/^#\s?/, '')).trim());
+      const metadata = /^#\s*@brocade-name=(.*)$/.exec(line);
+      if (metadata) {
+        try {
+          metadataName = decodeURIComponent(metadata[1]);
+        } catch {
+          metadataName = metadata[1];
+        }
+      } else {
+        block.push(stripRegions(line.replace(/^#\s?/, '')).trim());
+      }
     } else {
       flush();
-      links.push(parseNodeLink(line));
+      links.push(parseNodeLink(line, metadataName));
+      metadataName = undefined;
     }
   }
   flush();

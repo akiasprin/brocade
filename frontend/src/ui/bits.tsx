@@ -9,7 +9,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import type { ConsoleInitialData } from '../api';
+import { ApiError, type ConsoleInitialData } from '../api';
 import { useNow } from './clock';
 import { DialogClose, DialogLayer } from './dialog';
 import { Icon, type IconName } from './icons';
@@ -1313,7 +1313,12 @@ export function Loading({
 }
 
 export function ErrorBox({ error }: { error: unknown }) {
-  const message = error instanceof Error ? error.message : String(error);
+  const message =
+    error instanceof ApiError && error.status === 403
+      ? '当前账号不能查看这项内容'
+      : error instanceof Error
+        ? error.message
+        : String(error);
   return <div className="callout err">{message}</div>;
 }
 

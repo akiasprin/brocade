@@ -25,6 +25,7 @@ type Interface interface {
 }
 
 var _ buf.Writer = (*Conn)(nil)
+var _ buf.Reader = (*Conn)(nil)
 var _ Interface = (*Conn)(nil)
 
 type Conn struct {
@@ -33,10 +34,10 @@ type Conn struct {
 	rawConn      net.Conn
 	serverConfig *tls.Config
 
-	stateMu    sync.RWMutex
-	kernelConn net.Conn
-	ioStarted  atomic.Bool
-	promoteMu  sync.Mutex
+	stateMu         sync.RWMutex
+	kernelWriteConn net.Conn
+	ioStarted       atomic.Bool
+	promoteMu       sync.Mutex
 
 	suppressCloseNotify atomic.Bool
 }
@@ -51,7 +52,7 @@ func (c *Conn) Close() error {
 	if c.suppressCloseNotify.Load() {
 		return c.rawConn.Close()
 	}
-	if c.kernelTLSConn() != nil {
+	if c.kernelTLSWriteConn() != nil {
 		return closeKernelTLS(c.rawConn)
 	}
 	timer := time.AfterFunc(tlsCloseTimeout, func() {
@@ -62,15 +63,28 @@ func (c *Conn) Close() error {
 }
 
 func (c *Conn) Read(p []byte) (int, error) {
-	if conn := c.kernelTLSConn(); conn != nil {
-		return conn.Read(p)
-	}
 	c.ioStarted.Store(true)
 	return c.tlsConn().Read(p)
 }
 
+func (c *Conn) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	c.ioStarted.Store(true)
+	// crypto/tls returns at most one plaintext record per Read. Matching the
+	// record limit avoids splitting one record across two 8 KiB AnyTLS reads.
+	const maxTLSPlaintextRecordSize = 16 * 1024
+	b := buf.NewWithSize(maxTLSPlaintextRecordSize)
+	payload := b.ExtendUninitialized(maxTLSPlaintextRecordSize)
+	n, err := c.tlsConn().Read(payload)
+	b.Resize(0, int32(n))
+	if n == 0 {
+		b.Release()
+		return nil, err
+	}
+	return buf.MultiBuffer{b}, err
+}
+
 func (c *Conn) Write(p []byte) (int, error) {
-	if conn := c.kernelTLSConn(); conn != nil {
+	if conn := c.kernelTLSWriteConn(); conn != nil {
 		return conn.Write(p)
 	}
 	c.ioStarted.Store(true)
@@ -78,21 +92,18 @@ func (c *Conn) Write(p []byte) (int, error) {
 }
 
 func (c *Conn) SetDeadline(t time.Time) error {
-	if conn := c.kernelTLSConn(); conn != nil {
+	if conn := c.kernelTLSWriteConn(); conn != nil {
 		return conn.SetDeadline(t)
 	}
 	return c.tlsConn().SetDeadline(t)
 }
 
 func (c *Conn) SetReadDeadline(t time.Time) error {
-	if conn := c.kernelTLSConn(); conn != nil {
-		return conn.SetReadDeadline(t)
-	}
 	return c.tlsConn().SetReadDeadline(t)
 }
 
 func (c *Conn) SetWriteDeadline(t time.Time) error {
-	if conn := c.kernelTLSConn(); conn != nil {
+	if conn := c.kernelTLSWriteConn(); conn != nil {
 		return conn.SetWriteDeadline(t)
 	}
 	return c.tlsConn().SetWriteDeadline(t)
@@ -111,7 +122,7 @@ func (c *Conn) NetConn() net.Conn {
 }
 
 func (c *Conn) HandshakeContext(ctx context.Context) error {
-	if c.kernelTLSConn() != nil {
+	if c.kernelTLSWriteConn() != nil {
 		return nil
 	}
 	c.ioStarted.Store(true)
@@ -133,9 +144,9 @@ func (c *Conn) tlsConn() *tls.Conn {
 	return conn
 }
 
-func (c *Conn) kernelTLSConn() net.Conn {
+func (c *Conn) kernelTLSWriteConn() net.Conn {
 	c.stateMu.RLock()
-	conn := c.kernelConn
+	conn := c.kernelWriteConn
 	c.stateMu.RUnlock()
 	return conn
 }

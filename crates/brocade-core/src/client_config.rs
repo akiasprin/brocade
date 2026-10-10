@@ -91,6 +91,8 @@ pub struct ClientProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hysteria2: Option<ClientProtocolProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtproto: Option<ClientProtocolProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xhttp_host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xhttp_xmux: Option<XhttpXmux>,
@@ -152,6 +154,7 @@ struct SubscriptionTopologyContract<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     vless_encryption: Option<(u16, String)>,
     hysteria2: Option<Hysteria2TopologyContract<'a>>,
+    mtproto_port: Option<u16>,
     split_download_ports: [Option<u16>; 2],
     split_download_certificate_name: Option<&'a str>,
 }
@@ -602,6 +605,11 @@ impl From<&Ingress> for ClientProjection {
                 .hysteria2
                 .as_ref()
                 .map(ClientProtocolProjection::from),
+            mtproto: value
+                .projection
+                .mtproto
+                .as_ref()
+                .map(ClientProtocolProjection::from),
             xhttp_host: xhttp.and_then(|xhttp| xhttp.host.clone()),
             xhttp_xmux: xhttp.and_then(|xhttp| xhttp.xmux.clone()),
             xhttp_download_v4: xhttp
@@ -679,6 +687,11 @@ impl ClientProjection {
                 .transpose()?,
             hysteria2: self
                 .hysteria2
+                .as_ref()
+                .map(ClientProtocolProjection::to_model)
+                .transpose()?,
+            mtproto: self
+                .mtproto
                 .as_ref()
                 .map(ClientProtocolProjection::to_model)
                 .transpose()?,
@@ -837,6 +850,7 @@ pub fn topology_contract_hash(nodes: &[Node], app_id: &str, ingress: &Ingress) -
             .vless_encryption()
             .map(|wire| (wire.port, wire.options.encryption(&wire.public_key))),
         hysteria2,
+        mtproto_port: ingress.wires.mtproto().map(|wire| wire.port),
         split_download_ports,
         split_download_certificate_name,
     };

@@ -46,6 +46,7 @@ import {
   serveCertificate,
   updateCertGroup,
   type CertsView,
+  type CertificateScanRun,
   type CertificateTrack,
   type BrandingSettings,
   type DistributionView,
@@ -71,6 +72,7 @@ import {
 import { draft } from '../draft';
 import { can, useSession } from '../session';
 import { ErrorBox, Loading, SegmentedControl } from '../ui/bits';
+import { ConfigSecretInput } from '../ui/config-secret-input';
 import { BrandIcon } from '../ui/branding';
 import { PanelTitle, type IconName } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
@@ -106,6 +108,7 @@ type Form = {
   vlessEncryptionBase: string;
   hopBase: string;
   hy2Base: string;
+  mtprotoBase: string;
   probeUrl: string;
   probeTimeout: string;
   probeInterval: string;
@@ -196,6 +199,7 @@ const EMPTY: Form = {
   vlessEncryptionBase: '13800',
   hopBase: '20000',
   hy2Base: '30000',
+  mtprotoBase: '28800',
   probeUrl: PROBE_URL_DEFAULT,
   probeTimeout: '10',
   probeInterval: '60',
@@ -243,6 +247,7 @@ function formOf(s: ModelSettings): Form {
     vlessEncryptionBase: String(s.ports?.vless_encryption_base ?? 13800),
     hopBase: String(s.ports?.hop_base ?? 20000),
     hy2Base: String(s.ports?.hy2_base ?? 30000),
+    mtprotoBase: String(s.ports?.mtproto_base ?? 28800),
     probeUrl: s.probe?.endpoint_url ?? PROBE_URL_DEFAULT,
     probeTimeout: String(s.probe?.timeout_secs ?? 10),
     probeInterval: String(s.probe?.interval_secs ?? 60),
@@ -293,7 +298,7 @@ const SECTION_FIELDS: Record<SectionKey, (keyof Form)[]> = {
     'muxMaxRequests',
   ],
   wireguard: ['keepalive', 'mtu'],
-  ports: ['ingressBase', 'anytlsBase', 'vlessEncryptionBase', 'hopBase', 'hy2Base'],
+  ports: ['ingressBase', 'anytlsBase', 'vlessEncryptionBase', 'hopBase', 'hy2Base', 'mtprotoBase'],
   probe: ['probeUrl', 'probeTimeout', 'probeInterval'],
   geodata: ['geodataCron', 'geodataGeoip', 'geodataGeosite'],
 };
@@ -623,11 +628,81 @@ function retainedCertificate(cert: GroupCertificate): boolean {
   return cert.sha256 !== null && ['ready', 'serving', 'compatible'].includes(cert.status);
 }
 
+/** `*.example.com` 与 `example.com` 是同一张证书的通配名/裸名，界面合成一项以降低噪音。 */
+function compactCertificateNames(names: string[]): string {
+  if (names.length === 2) {
+    const bare = names.find(name => !name.startsWith('*.'));
+    const wildcard = names.find(name => name.startsWith('*.'));
+    if (bare && wildcard === `*.${bare}`) return `[*.]${bare}`;
+  }
+  return names.join(' · ');
+}
+
 const certificateTime = (value: string | null) => (value ? value.slice(0, 19).replace('T', ' ') : '—');
 
-function issuanceResultText(result: { issued: number; failed: number }): string {
-  if (result.issued === 0 && result.failed === 0) return '处理完成，暂无需要签发或续期的证书。';
-  return `处理完成：成功 ${result.issued} 张，失败 ${result.failed} 张。${result.failed ? '请查看下方失败原因，修正后可立即重试。' : ''}`;
+const certificateScanPhase: Record<CertificateScanRun['phase'], string> = {
+  queued: '等待后台处理',
+  preparing: '计算待处理证书',
+  dns: '写入 DNS 验证',
+  validating: '等待 CA 验证',
+  finalizing: '完成证书签发',
+  storing: '保存并切换证书',
+  finished: '已完成',
+};
+
+const certificateScanTrigger: Record<CertificateScanRun['trigger'], string> = {
+  startup: '启动检查',
+  scheduled: '定时检查',
+  settings: '配置变更',
+  manual: '手动触发',
+};
+
+function certificateScanResult(run: CertificateScanRun): string {
+  if (run.status === 'failed') return run.error_detail ?? '后台任务未完成，可重新触发。';
+  if (run.issued_items === 0 && run.failed_items === 0) return '最近一轮已完成，暂无需要签发或续期的证书。';
+  return `最近一轮已完成：签发 ${run.issued_items} 张，失败 ${run.failed_items} 张。`;
+}
+
+function CertificateScanProgress({ run }: { run: CertificateScanRun }) {
+  const active = run.status === 'queued' || run.status === 'running';
+  const failed = run.status === 'failed' || run.failed_items > 0;
+  return (
+    <div className={`cert-scan-progress${failed ? ' failed' : ''}`} role="status" aria-live="polite">
+      <div className="cert-scan-progress-head">
+        <div>
+          <b>{active ? '后台签发任务' : '最近签发任务'}</b>
+          <span className="hint">
+            #{run.id} · {certificateScanTrigger[run.trigger]}
+          </span>
+        </div>
+        <span className={failed ? 'bad' : active ? 'cstate warn' : 'cstate ok'}>
+          {active ? certificateScanPhase[run.phase] : run.status === 'failed' ? '执行失败' : '执行完成'}
+        </span>
+      </div>
+
+      {active ? (
+        <>
+          {run.current_subject && <code className="cert-scan-subject">{run.current_subject}</code>}
+          {run.total_items > 0 && (
+            <progress
+              className="cert-scan-meter"
+              aria-label="证书签发进度"
+              max={run.total_items}
+              value={run.processed_items}
+            />
+          )}
+          <div className="cert-scan-counts">
+            <span>{run.total_items > 0 ? `已处理 ${run.processed_items} / ${run.total_items}` : '正在准备任务'}</span>
+            <span>
+              已签发 {run.issued_items} · 失败 {run.failed_items}
+            </span>
+          </div>
+        </>
+      ) : (
+        <p className={failed ? 'note bad' : 'hint'}>{certificateScanResult(run)}</p>
+      )}
+    </div>
+  );
 }
 
 function CertSection({ editable, view }: { editable: boolean; view: CertsView }) {
@@ -637,7 +712,7 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
     credential: '',
     directory: source.domain?.acme_directory ?? source.letsencrypt,
     contact: source.domain?.acme_contact ?? '',
-    renew: String(source.domain?.renew_before_days ?? 30),
+    renew: String(source.domain?.renew_before_days ?? 60),
   });
   const { form: f, setForm, accept } = useServerForm(certForm(view));
   const [saved, setSaved] = useState(false);
@@ -650,7 +725,7 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
         dns_credential: submitted.credential.trim() || null,
         acme_directory: submitted.directory,
         acme_contact: submitted.contact.trim() || null,
-        renew_before_days: Number(submitted.renew) || 30,
+        renew_before_days: Number(submitted.renew) || 60,
       }),
     onSuccess: async (next, submitted) => {
       await qc.cancelQueries({ queryKey: ['certs'] });
@@ -662,7 +737,10 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
 
   const scan = useMutation({
     mutationFn: () => scanCerts(),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['certs'] }),
+    onSuccess: run => {
+      qc.setQueryData<CertsView>(['certs'], current => (current ? { ...current, scan: run } : current));
+      void qc.invalidateQueries({ queryKey: ['certs'] });
+    },
   });
 
   const d = view.domain;
@@ -672,10 +750,11 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
     f.credential.trim() !== '' ||
     f.directory !== storedDirectory ||
     f.contact.trim() !== (d?.acme_contact ?? '') ||
-    Number(f.renew) !== (d?.renew_before_days ?? 30);
+    Number(f.renew) !== (d?.renew_before_days ?? 60);
   useUnsavedChanges(dirty, '证书签发配置');
 
   const publicCaConfigured = d?.signing_method === 'public-ca';
+  const scanActive = view.scan?.status === 'queued' || view.scan?.status === 'running';
   return (
     <section className="panel config-panel" id="set-cert">
       <header>
@@ -758,10 +837,9 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
           <div className="setfld">
             <label>Cloudflare Token</label>
             <div className="v">
-              <input
+              <ConfigSecretInput
                 className={f.credential ? 'f chg' : 'f'}
                 style={{ width: 430 }}
-                type="password"
                 placeholder={d?.has_credential ? '已配置（重填才会覆盖）' : 'Zone:Read + DNS:Edit'}
                 value={f.credential}
                 onChange={e => setForm({ ...f, credential: e.target.value })}
@@ -803,7 +881,7 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
             <label>提前续期</label>
             <div className="v">
               <input
-                className={dirty && Number(f.renew) !== (d?.renew_before_days ?? 30) ? 'f chg' : 'f'}
+                className={dirty && Number(f.renew) !== (d?.renew_before_days ?? 60) ? 'f chg' : 'f'}
                 style={{ width: 70 }}
                 value={f.renew}
                 onChange={e => setForm({ ...f, renew: e.target.value })}
@@ -830,19 +908,15 @@ function CertSection({ editable, view }: { editable: boolean; view: CertsView })
         <div className="setfld">
           <label />
           <div className="v">
-            <button className="btn" disabled={!editable || scan.isPending} onClick={() => scan.mutate()}>
-              {scan.isPending ? '正在签发与续期…' : '立即签发与续期'}
+            <button className="btn" disabled={!editable || scan.isPending || scanActive} onClick={() => scan.mutate()}>
+              {scan.isPending ? '正在提交…' : scanActive ? '后台处理中…' : '立即签发与续期'}
             </button>
             <span className="hint">只处理待签发、失败和即将到期的证书</span>
           </div>
         </div>
 
-        {scan.data?.processing && !scan.isPending && (
-          <p role="status" className={scan.data.processing.failed ? 'note bad' : 'hint'}>
-            {issuanceResultText(scan.data.processing)}
-          </p>
-        )}
-        <CertGroups view={view} editable={editable && !scan.isPending} />
+        {view.scan && <CertificateScanProgress run={view.scan} />}
+        <CertGroups view={view} editable={editable && !scan.isPending && !scanActive} />
       </div>
     </section>
   );
@@ -918,11 +992,11 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
     Promise.resolve()
       .then(what)
       .then(result => {
-        if (result && typeof result === 'object' && 'processing' in result) {
-          const processing = result.processing as { issued: number; failed: number };
-          setResultText(issuanceResultText(processing));
-          if ('id' in result && typeof result.id === 'string') {
-            openGroup(key.startsWith('spare:') ? key.slice('spare:'.length) : result.id);
+        if (result && typeof result === 'object' && 'scan' in result) {
+          const queued = result as { id?: unknown; scan: CertificateScanRun };
+          setResultText(`已加入后台签发任务 #${queued.scan.id}。`);
+          if (typeof queued.id === 'string') {
+            openGroup(key.startsWith('spare:') ? key.slice('spare:'.length) : queued.id);
           }
         }
         onSuccess?.();
@@ -1165,7 +1239,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                 </div>
                 <div className="wide">
                   <dt>证书名称</dt>
-                  <dd className="mono">{group.names.length > 0 ? group.names.join(' · ') : '—'}</dd>
+                  <dd className="mono">{group.names.length > 0 ? compactCertificateNames(group.names) : '—'}</dd>
                 </div>
                 <div className="wide">
                   <dt>证书组 ID</dt>
@@ -1286,7 +1360,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
                               <dt>SNI / 证书名称</dt>
                               <dd className="mono">
                                 {cert.certificate_name ??
-                                  (group.names.length > 0 ? group.names.join(' · ') : '等待签发')}
+                                  (group.names.length > 0 ? compactCertificateNames(group.names) : '等待签发')}
                               </dd>
                             </div>
                             {cert.signing_method === 'self-signed' && (
@@ -2517,10 +2591,8 @@ function VpngateIntelligenceSection({
             <div className="vpngate-api-key-list" role="group" aria-label="ProxyCheck API 密钥">
               {proxycheckApiKeyInputs.map((key, index) => (
                 <div className="vpngate-api-key-row" key={index}>
-                  <input
+                  <ConfigSecretInput
                     className="f vpngate-api-key"
-                    type="password"
-                    autoComplete="new-password"
                     aria-label={`ProxyCheck API 密钥 ${index + 1}`}
                     placeholder={
                       index === 0 && proxycheckApiKeyConfigured ? '输入要追加的新密钥' : 'xxxxxx-xxxxxx-xxxxxx-xxxxxx'
@@ -2785,10 +2857,13 @@ export function SettingsPane() {
     queryKey: ['certs'],
     queryFn: () => fetchCerts(),
     // 有证书正在签发时页面需要自动更新：一轮约半分钟，要求手动刷新才能看到进展不可接受。
-    refetchInterval: query =>
-      (query.state.data?.groups ?? []).some(group => group.certificates.some(cert => cert.status === 'pending'))
+    refetchInterval: query => {
+      const current = query.state.data;
+      if (current?.scan?.status === 'queued' || current?.scan?.status === 'running') return 2_000;
+      return (current?.groups ?? []).some(group => group.certificates.some(cert => cert.status === 'pending'))
         ? 10_000
-        : false,
+        : false;
+    },
   });
   const dist = useQuery({ queryKey: ['distribution'], queryFn: () => fetchDistribution() });
   const logPolicy = useQuery({ queryKey: ['agent-log-policy'], queryFn: fetchAgentLogPolicy });
@@ -2888,6 +2963,7 @@ export function SettingsPane() {
           vless_encryption_base: Number(v('vlessEncryptionBase')),
           hop_base: Number(v('hopBase')) || 20000,
           hy2_base: Number(v('hy2Base')) || 30000,
+          mtproto_base: Number(v('mtprotoBase')) || 28800,
         },
         probe: {
           endpoint_url: v('probeUrl').trim() || PROBE_URL_DEFAULT,
@@ -3469,6 +3545,16 @@ export function SettingsPane() {
                       max={65535}
                       value={form.hy2Base}
                       onChange={e => setForm({ ...form, hy2Base: e.target.value })}
+                    />
+                  </Fld>
+                  <Fld label="MTProxy · TCP">
+                    <input
+                      className={chg('mtprotoBase')}
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={form.mtprotoBase}
+                      onChange={e => setForm({ ...form, mtprotoBase: e.target.value })}
                     />
                   </Fld>
                   <Fld label="中转端口">

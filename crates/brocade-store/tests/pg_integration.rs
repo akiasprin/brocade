@@ -31,15 +31,17 @@ use brocade_deployment::protocol::{
 use brocade_store::{
     generate_reality_short_id, is_reality_short_id, node_token_display_prefix, node_token_hash,
     AdminContext, AdminInitRequest, AdminLoginRequest, AdminRole, AgentLogLimits, ApplyDraftResult,
-    CertDomainInput, ChangeAdminPasswordRequest, CreateAdminOperatorRequest, CreateAppRequest,
-    CreateChainRequest, CreateDeploymentRequest, CreateFrontRequest, CreateGrantRequest,
-    CreateIngressRequest, CreateRealityIngressRequest, CreateRollbackRequest, CreateTenantRequest,
-    CreateUserRequest, CreateXrayReleaseRequest, DeleteFrontRequest, HopInRequest, HopWireRequest,
-    HostNetworkTuning, IsolateDeploymentTargetRequest, IsolateNodeRequest, IssuedCertificate,
-    LinkProbe, LinkProbeRequest, LinkProbeStatus, LoadSeriesQuery, ModelOp, NodeDesiredDeployment,
-    NodeTrafficCycleKind, PgStore, PingProbeFamily, PingProbeKind, PingProbeReportRequest,
-    PingProbeSample, PingProbeSettings, PingProbeSkipReason, PingProbeTarget, ProbeTransport,
-    ProvisionNodeRequest, PublicIpObservationOutcome, PutStepRequest, RegisterWarpBindingRequest,
+    CertDomainInput, CertificateScanCounts, CertificateScanPhase, CertificateScanStatus,
+    CertificateScanTrigger, ChangeAdminPasswordRequest, CreateAdminOperatorRequest,
+    CreateAppRequest, CreateChainRequest, CreateDeploymentRequest, CreateFrontRequest,
+    CreateGrantRequest, CreateIngressRequest, CreateRealityIngressRequest, CreateRollbackRequest,
+    CreateTenantRequest, CreateUserRequest, CreateXrayReleaseRequest, DeleteFrontRequest,
+    HopInRequest, HopWireRequest, HostNetworkTuning, IsolateDeploymentTargetRequest,
+    IsolateNodeRequest, IssuedCertificate, LinkProbe, LinkProbeRequest, LinkProbeStatus,
+    LoadSeriesQuery, ModelOp, NodeDesiredDeployment, NodeTrafficCycleKind, PgStore,
+    PingProbeFamily, PingProbeKind, PingProbeReportRequest, PingProbeSample, PingProbeSettings,
+    PingProbeSkipReason, PingProbeTarget, ProbeTransport, ProvisionNodeRequest,
+    PublicIpObservationOutcome, PutStepRequest, RegisterWarpBindingRequest,
     RemoveRetiredNodesRequest, RemoveWarpBindingRequest, ReportedNodeState, SetUserAppQuotaRequest,
     SetUserPasswordRequest, StepAcceptRequest, StoreError, TargetApplyResult,
     TargetConvergenceReport, TransportRequest, UpdateAgentLogDefaultRequest,
@@ -4345,7 +4347,7 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
         .unwrap();
     assert!(haitun.content.contains("# Brocade · koipy 测速"));
     assert!(!haitun.content.contains("rule-providers:"));
-    let before_regeneration = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    let before_revocation = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
     let publication_counts_before: (i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM revisions),
                 (SELECT count(*) FROM deployments), (SELECT count(*) FROM jobs)",
@@ -4353,23 +4355,32 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
     .fetch_one(db.pool())
     .await
     .unwrap();
-    let replacement = db
+    let revoked = db
         .store
-        .regenerate_clash_haitun_link(&system_admin(), "platform.acme", "alice")
+        .revoke_clash_haitun_link(&system_admin(), "platform.acme", "alice")
         .await
         .unwrap();
-    assert!(replacement.revoked_at.is_none());
-    assert_ne!(replacement.token, link.token);
+    assert!(revoked.revoked_at.is_some());
+    assert_eq!(
+        revoked.token, link.token,
+        "revocation must not mint a replacement"
+    );
+    let revoked_again = db
+        .store
+        .revoke_clash_haitun_link(&system_admin(), "platform.acme", "alice")
+        .await
+        .unwrap();
+    assert_eq!(revoked_again, revoked);
     assert!(matches!(
         db.store
             .clash_subscription_by_haitun_token_for_family(&link.token, None)
             .await,
         Err(StoreError::NotFound(_))
     ));
-    let after_regeneration = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
-    assert_eq!(before_regeneration.uuid, after_regeneration.uuid);
-    assert_eq!(before_regeneration.revision, after_regeneration.revision);
-    assert_eq!(before_regeneration.content, after_regeneration.content);
+    let after_revocation = db.store.clash_subscription_by_uuid(uuid).await.unwrap();
+    assert_eq!(before_revocation.uuid, after_revocation.uuid);
+    assert_eq!(before_revocation.revision, after_revocation.revision);
+    assert_eq!(before_revocation.content, after_revocation.content);
     let publication_counts_after: (i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM revisions),
                 (SELECT count(*) FROM deployments), (SELECT count(*) FROM jobs)",
@@ -4378,14 +4389,6 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
     .await
     .unwrap();
     assert_eq!(publication_counts_before, publication_counts_after);
-    assert_eq!(
-        db.store
-            .clash_subscription_by_haitun_token_for_family(&replacement.token, None)
-            .await
-            .unwrap()
-            .uuid,
-        uuid
-    );
 
     for role in [
         AdminRole::User,
@@ -4408,7 +4411,7 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
         ));
         assert!(matches!(
             db.store
-                .regenerate_clash_haitun_link(&actor, "platform.acme", "alice")
+                .revoke_clash_haitun_link(&actor, "platform.acme", "alice")
                 .await,
             Err(StoreError::Forbidden(_))
         ));
@@ -4421,22 +4424,36 @@ async fn clash_subscription_uses_only_the_stable_serving_projection() {
             .unwrap()
             .unwrap()
             .token,
-        replacement.token
+        link.token
     );
     assert!(matches!(
         db.store
-            .regenerate_clash_haitun_link(&tenant_admin("platform.other"), "platform.acme", "alice")
+            .revoke_clash_haitun_link(&tenant_admin("platform.other"), "platform.acme", "alice")
             .await,
         Err(StoreError::Forbidden(_))
     ));
-    // Preserve compatibility with an old stopped link without offering revocation as an action.
-    sqlx::query("UPDATE clash_haitun_links SET revoked_at = now() WHERE tenant_id = 'platform.acme' AND user_id = 'alice'").execute(db.pool()).await.unwrap();
+    // Only a separate generation request makes a new URL available.
     let restored = db
         .store
         .issue_clash_haitun_link(&scoped_admin, "platform.acme", "alice")
         .await
         .unwrap();
-    assert_ne!(restored.token, replacement.token);
+    assert_ne!(restored.token, link.token);
+    assert!(restored.revoked_at.is_none());
+    assert_eq!(
+        db.store
+            .clash_subscription_by_haitun_token_for_family(&restored.token, None)
+            .await
+            .unwrap()
+            .uuid,
+        uuid
+    );
+    assert!(matches!(
+        db.store
+            .clash_subscription_by_haitun_token_for_family(&link.token, None)
+            .await,
+        Err(StoreError::NotFound(_))
+    ));
 
     // Credential rotation follows the independently converged permission line. Before it switches,
     // the old bearer remains the truthful deployed credential and the committed new one is absent.
@@ -6125,7 +6142,7 @@ async fn online_sources_protocols_replace_per_node_and_ingress_without_inflating
         json!([]),
         json!({}),
         json!(["tls"]),
-        json!(["vless", "vless", "vless", "vless", "vless"]),
+        json!(["vless", "vless", "vless", "vless", "vless", "vless"]),
     ] {
         assert!(
             sqlx::query("UPDATE user_online_sources SET protocols = $1 WHERE active")
@@ -6258,6 +6275,106 @@ async fn node_runtime_report_is_rejected_without_an_active_token() {
         .await
         .unwrap_err();
     assert!(matches!(error, StoreError::Unauthorized(_)), "{error:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn mtproxy_compatibility_matches_fresh_schema_and_preserves_existing_rows() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+
+    let schema_signature = "SELECT jsonb_build_object(
+        'columns', (SELECT jsonb_agg(jsonb_build_object(
+            'table', table_name, 'name', column_name, 'type', data_type,
+            'nullable', is_nullable, 'default', column_default
+        ) ORDER BY table_name, column_name)
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND (table_name, column_name) IN (
+            ('control_state', 'port_mtproto_base'), ('ingresses', 'mtproto_port')
+        )),
+        'constraints', (SELECT jsonb_agg(jsonb_build_object(
+            'table', relname, 'name', conname, 'validated', convalidated,
+            'definition', pg_get_constraintdef(pg_constraint.oid)
+        ) ORDER BY relname, conname)
+        FROM pg_constraint JOIN pg_class ON pg_class.oid = conrelid
+        WHERE conname IN (
+            'control_state_port_mtproto_base_range',
+            'ingresses_mtproto_port_range',
+            'ingresses_mtproto_vless_port_distinct',
+            'ingresses_mtproto_anytls_port_distinct',
+            'ingresses_mtproto_vless_encryption_port_distinct',
+            'ingresses_has_a_wire',
+            'user_online_sources_protocols_shape'
+        ))
+    )";
+    let expected: serde_json::Value = sqlx::query_scalar(schema_signature)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+
+    sqlx::raw_sql(
+        "ALTER TABLE user_online_sources DROP CONSTRAINT user_online_sources_protocols_shape;
+         ALTER TABLE user_online_sources ADD CONSTRAINT user_online_sources_protocols_shape CHECK (
+             protocols IS NULL OR CASE WHEN jsonb_typeof(protocols) = 'array' THEN
+                 jsonb_array_length(protocols) BETWEEN 1 AND 4
+                 AND protocols <@ '[\"vless\", \"anytls\", \"hysteria2\", \"unknown\"]'::jsonb
+             ELSE FALSE END
+         );
+         ALTER TABLE ingresses
+             DROP CONSTRAINT ingresses_mtproto_port_range,
+             DROP CONSTRAINT ingresses_mtproto_vless_port_distinct,
+             DROP CONSTRAINT ingresses_mtproto_anytls_port_distinct,
+             DROP CONSTRAINT ingresses_mtproto_vless_encryption_port_distinct,
+             DROP CONSTRAINT ingresses_has_a_wire;
+         ALTER TABLE ingresses DROP COLUMN mtproto_port;
+         ALTER TABLE ingresses ADD CONSTRAINT ingresses_has_a_wire CHECK (
+             transport_kind IS NOT NULL OR anytls_enabled OR hy2_enabled
+             OR vless_encryption_port IS NOT NULL
+         );
+         ALTER TABLE control_state DROP CONSTRAINT control_state_port_mtproto_base_range;
+         ALTER TABLE control_state DROP COLUMN port_mtproto_base;",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let compatibility = include_str!("../../../scripts/compat-mtproxy.sql")
+        .replace("\\set ON_ERROR_STOP on", "")
+        .replace("SET LOCAL ROLE :\"app_role\";", "SET LOCAL ROLE postgres;");
+    sqlx::raw_sql(&compatibility)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let actual: serde_json::Value = sqlx::query_scalar(schema_signature)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(actual, expected);
+    let port_base: i32 = sqlx::query_scalar("SELECT port_mtproto_base FROM control_state")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(port_base, 28_800);
+    let populated_ingresses: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ingresses WHERE mtproto_port IS NOT NULL")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(populated_ingresses, 0);
+
+    let mut connection = db.pool().acquire().await.unwrap();
+    assert!(sqlx::raw_sql(&compatibility)
+        .execute(&mut *connection)
+        .await
+        .is_err());
+    sqlx::query("ROLLBACK")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -11316,6 +11433,7 @@ async fn pending_config_gets_latest_grants_while_permission_is_released_immediat
                         port: 50000,
                         ..Default::default()
                     }),
+                    mtproto: None,
                 },
                 projection: Projection::default(),
                 note: Some("replace VLESS with Hysteria before permission".to_owned()),
@@ -17572,7 +17690,7 @@ async fn sustained_cpu_steal_opens_deduplicates_and_recovers_one_machine_inciden
         hops: vec![],
     };
 
-    let high = vec![sample(now - 60, 40.0, false), sample(now - 30, 59.4, false)];
+    let high = vec![sample(now - 60, 82.0, false), sample(now - 30, 89.4, false)];
     let accepted = db
         .store
         .record_load_report("steal-observe", report(now, high.clone()))
@@ -17582,11 +17700,11 @@ async fn sustained_cpu_steal_opens_deduplicates_and_recovers_one_machine_inciden
     let active = db.store.machine_events(&system_admin(), 10).await.unwrap();
     assert_eq!(active.active.len(), 1);
     assert_eq!(active.active[0].incident_kind, "cpu_steal");
-    assert_eq!(active.active[0].current_value, Some(59.4));
-    assert_eq!(active.active[0].peak_value, Some(59.4));
+    assert_eq!(active.active[0].current_value, Some(89.4));
+    assert_eq!(active.active[0].peak_value, Some(89.4));
     assert_eq!(active.events.len(), 1);
     assert_eq!(active.events[0].event_kind, "cpu_steal_started");
-    assert_eq!(active.events[0].metric_threshold, Some(10.0));
+    assert_eq!(active.events[0].metric_threshold, Some(80.0));
 
     let duplicate = db
         .store
@@ -17629,9 +17747,9 @@ async fn sustained_cpu_steal_opens_deduplicates_and_recovers_one_machine_inciden
             report(
                 now + 120,
                 vec![
-                    sample(now + 30, 4.0, false),
-                    sample(now + 60, 3.0, false),
-                    sample(now + 90, 2.0, false),
+                    sample(now + 30, 79.0, false),
+                    sample(now + 60, 78.0, false),
+                    sample(now + 90, 77.0, false),
                 ],
             ),
         )
@@ -17641,9 +17759,9 @@ async fn sustained_cpu_steal_opens_deduplicates_and_recovers_one_machine_inciden
     assert!(recovered.active.is_empty());
     assert_eq!(recovered.events.len(), 2);
     assert_eq!(recovered.events[0].event_kind, "cpu_steal_recovered");
-    assert_eq!(recovered.events[0].metric_value, Some(2.0));
-    assert_eq!(recovered.events[0].metric_peak_value, Some(59.4));
-    assert_eq!(recovered.events[0].metric_threshold, Some(5.0));
+    assert_eq!(recovered.events[0].metric_value, Some(77.0));
+    assert_eq!(recovered.events[0].metric_peak_value, Some(89.4));
+    assert_eq!(recovered.events[0].metric_threshold, Some(80.0));
     let pending: i64 =
         sqlx::query_scalar("SELECT count(*) FROM notification_deliveries WHERE status = 'pending'")
             .fetch_one(db.pool())
@@ -17700,6 +17818,241 @@ async fn insert_extra_user_grant(pool: &PgPool) {
     .execute(pool)
     .await
     .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn certificate_scan_compatibility_matches_fresh_schema_and_preserves_existing_defaults() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+
+    let schema_signature = "SELECT jsonb_build_object(
+        'columns', (SELECT jsonb_agg(jsonb_build_object(
+            'name', column_name, 'type', data_type, 'udt', udt_name,
+            'nullable', is_nullable, 'default', column_default,
+            'identity', is_identity, 'identity_generation', identity_generation
+        ) ORDER BY ordinal_position)
+        FROM information_schema.columns WHERE table_schema = 'public'
+          AND table_name = 'certificate_scan_runs'),
+        'constraints', (SELECT jsonb_agg(jsonb_build_object(
+            'name', conname, 'definition', pg_get_constraintdef(oid)
+        ) ORDER BY conname) FROM pg_constraint
+          WHERE conrelid = 'certificate_scan_runs'::regclass),
+        'indexes', (SELECT jsonb_agg(jsonb_build_object(
+            'name', indexname, 'definition', indexdef
+        ) ORDER BY indexname) FROM pg_indexes
+          WHERE schemaname = 'public' AND tablename = 'certificate_scan_runs'),
+        'renew_default', (SELECT column_default FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'cert_domains'
+            AND column_name = 'renew_before_days')
+    )";
+    let expected: serde_json::Value = sqlx::query_scalar(schema_signature)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+
+    sqlx::raw_sql(
+        "DROP TABLE certificate_scan_runs;
+         ALTER TABLE cert_domains ALTER COLUMN renew_before_days SET DEFAULT 30;
+         INSERT INTO cert_domains (id, domain, acme_directory)
+         VALUES ('legacy-domain', 'legacy.example.test', 'self-signed');",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let schema = include_str!("../migrations/0001_init.sql")
+        .split("-- BEGIN CERTIFICATE SCAN SCHEMA")
+        .nth(1)
+        .unwrap()
+        .split("-- END CERTIFICATE SCAN SCHEMA")
+        .next()
+        .unwrap();
+    let compatibility = include_str!("../../../scripts/compat-certificate-scan.sql")
+        .replace("\\set ON_ERROR_STOP on", "")
+        .replace("SET LOCAL ROLE :\"app_role\";", "SET LOCAL ROLE postgres;")
+        .replace("\\i :certificate_scan_schema_file", schema);
+    sqlx::raw_sql(&compatibility)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let actual: serde_json::Value = sqlx::query_scalar(schema_signature)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(actual, expected);
+    let legacy_renew_before_days: i32 =
+        sqlx::query_scalar("SELECT renew_before_days FROM cert_domains WHERE id = 'legacy-domain'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(legacy_renew_before_days, 30);
+
+    let mut connection = db.pool().acquire().await.unwrap();
+    assert!(sqlx::raw_sql(&compatibility)
+        .execute(&mut *connection)
+        .await
+        .is_err());
+    sqlx::query("ROLLBACK")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn certificate_scan_queue_recovers_expired_leases_and_fences_the_old_worker() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+
+    let queued = db
+        .store
+        .enqueue_certificate_scan(CertificateScanTrigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(queued.status, CertificateScanStatus::Queued);
+    let deduplicated = db
+        .store
+        .enqueue_certificate_scan(CertificateScanTrigger::Scheduled)
+        .await
+        .unwrap();
+    assert_eq!(deduplicated.id, queued.id, "only one queued pass may exist");
+
+    let first = db
+        .store
+        .claim_certificate_scan("console-a")
+        .await
+        .unwrap()
+        .expect("queued scan is claimable");
+    assert_eq!(first.run.id, queued.id);
+    assert_eq!(first.run.status, CertificateScanStatus::Running);
+
+    let follow_up = db
+        .store
+        .enqueue_certificate_scan(CertificateScanTrigger::Settings)
+        .await
+        .unwrap();
+    assert_ne!(follow_up.id, first.run.id);
+    assert_eq!(follow_up.status, CertificateScanStatus::Queued);
+    assert_eq!(
+        db.store
+            .latest_certificate_scan()
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        first.run.id,
+        "the UI should prefer the pass doing work over its queued follow-up"
+    );
+
+    assert!(db
+        .store
+        .update_certificate_scan_progress(
+            &first,
+            CertificateScanPhase::Validating,
+            CertificateScanCounts {
+                total: 2,
+                processed: 1,
+                issued: 1,
+                failed: 0,
+            },
+            Some("cert-a"),
+            Some("edge.example.test"),
+        )
+        .await
+        .unwrap());
+    sqlx::query(
+        "UPDATE certificate_scan_runs SET lease_until = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(first.run.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let recovered = db
+        .store
+        .claim_certificate_scan("console-b")
+        .await
+        .unwrap()
+        .expect("expired running scan is reclaimable");
+    assert_eq!(recovered.run.id, first.run.id);
+    assert!(recovered.lease_generation > first.lease_generation);
+    assert!(!db.store.renew_certificate_scan_lease(&first).await.unwrap());
+    assert!(!db
+        .store
+        .complete_certificate_scan(&first, None)
+        .await
+        .unwrap());
+    assert!(db
+        .store
+        .complete_certificate_scan(&recovered, None)
+        .await
+        .unwrap());
+
+    let second = db
+        .store
+        .claim_certificate_scan("console-c")
+        .await
+        .unwrap()
+        .expect("settings change queued during the first pass runs next");
+    assert_eq!(second.run.id, follow_up.id);
+    assert!(db
+        .store
+        .complete_certificate_scan(&second, Some("test failure"))
+        .await
+        .unwrap());
+    let latest = db.store.latest_certificate_scan().await.unwrap().unwrap();
+    assert_eq!(latest.id, follow_up.id);
+    assert_eq!(latest.status, CertificateScanStatus::Failed);
+    assert_eq!(latest.error_detail.as_deref(), Some("test failure"));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn certificate_domains_default_to_renewing_sixty_days_before_expiry() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let domain = db
+        .store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: "renewal-default.example".to_owned(),
+                signing_method: Default::default(),
+                dns_credential: Some("token".to_owned()),
+                acme_directory: Some(brocade_store::ACME_LETSENCRYPT.to_owned()),
+                acme_contact: None,
+                renew_before_days: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(domain.renew_before_days, 60);
+
+    let serving = issue_certificate_for(&db, "n1", "Test CA").await;
+    sqlx::query("UPDATE certificates SET expires_at = now() + interval '45 days' WHERE id = $1")
+        .bind(&serving)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let due = db.store.certificates_due(30).await.unwrap();
+    assert_eq!(
+        due.len(),
+        1,
+        "45 days remaining is inside the 60-day renewal window"
+    );
+    assert!(due[0].renewal);
 }
 
 /// Moving a domain to a different CA makes every certificate under it due again.
@@ -17997,6 +18350,67 @@ async fn a_self_signed_domain_needs_no_dns_credential() {
     .await
     .unwrap();
     assert_eq!(stale_root_columns, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn certificate_groups_are_listed_in_creation_order() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+
+    let domain = db
+        .store
+        .upsert_cert_domain(
+            &system_admin(),
+            CertDomainInput {
+                domain: "group-order.test".to_owned(),
+                signing_method: brocade_store::CertificateSigningMethod::SelfSigned,
+                dns_credential: None,
+                acme_directory: None,
+                acme_contact: None,
+                renew_before_days: Some(30),
+            },
+        )
+        .await
+        .unwrap();
+    let first = db
+        .store
+        .create_cert_label(&system_admin(), &domain.id, "Zulu first", None)
+        .await
+        .unwrap();
+    let second = db
+        .store
+        .create_cert_label(&system_admin(), &domain.id, "Alpha second", None)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE cert_labels
+            SET created_at = CASE id
+                WHEN $1 THEN TIMESTAMPTZ '2024-01-01 00:00:00+00'
+                WHEN $2 THEN TIMESTAMPTZ '2024-01-02 00:00:00+00'
+            END
+          WHERE id IN ($1, $2)",
+    )
+    .bind(&first)
+    .bind(&second)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let groups = db.store.cert_groups(&system_admin()).await.unwrap();
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Zulu first", "Alpha second"]
+    );
 }
 
 #[tokio::test]
@@ -19158,6 +19572,7 @@ async fn an_ingress_keeps_its_stream_across_writes() {
         }),
         anytls: None,
         hysteria2: None,
+        mtproto: None,
     };
     let written = db
         .store
@@ -19239,6 +19654,7 @@ async fn an_ingress_keeps_its_stream_across_writes() {
         }),
         anytls: None,
         hysteria2: None,
+        mtproto: None,
     };
     let written = db
         .store
@@ -19327,6 +19743,7 @@ async fn anytls_session_settings_use_client_storage_and_advance_its_checkpoint()
                 ..AnyTls::default()
             }),
             hysteria2: None,
+            mtproto: None,
         },
         projection: Projection::default(),
         guard: brocade_core::model::IngressGuard::OPEN,
@@ -19563,6 +19980,7 @@ async fn hysteria2_ingress_round_trips_preserves_redacted_obfs_and_uses_udp_port
                     vless: None,
                     anytls: None,
                     hysteria2: Some(hysteria("salamander-secret")),
+                    mtproto: None,
                 },
             ),
         )
@@ -19600,6 +20018,7 @@ async fn hysteria2_ingress_round_trips_preserves_redacted_obfs_and_uses_udp_port
                     vless: None,
                     anytls: None,
                     hysteria2: Some(hysteria("<redacted>")),
+                    mtproto: None,
                 },
             ),
         )
@@ -19656,6 +20075,7 @@ async fn ingress_projection_round_trips_and_refuses_a_blank_host() {
                     download,
                 },
             }),
+            mtproto: None,
         },
         id: "ing-a1b2".to_owned(),
         chain_id: "chn-a1b2-c3d4".to_owned(),
@@ -20794,11 +21214,29 @@ async fn a_fresh_install_bootstraps_a_self_signed_primary_and_standby() {
     db.store.migrate().await.unwrap();
 
     assert_eq!(db.store.ensure_default_self_signed_pool().await.unwrap(), 2);
-    sqlx::query("UPDATE cert_labels SET name = '默认组' WHERE is_default")
+    let has_sentinel_creation_time: bool = sqlx::query_scalar(
+        "SELECT created_at = TIMESTAMPTZ '2000-01-01 00:00:00+00'
+           FROM cert_labels
+          WHERE is_default",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(has_sentinel_creation_time);
+    sqlx::query("UPDATE cert_labels SET name = '默认组', created_at = now() WHERE is_default")
         .execute(db.pool())
         .await
         .unwrap();
     assert_eq!(db.store.ensure_default_self_signed_pool().await.unwrap(), 0);
+    let has_repaired_creation_time: bool = sqlx::query_scalar(
+        "SELECT created_at = TIMESTAMPTZ '2000-01-01 00:00:00+00'
+           FROM cert_labels
+          WHERE is_default",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(has_repaired_creation_time);
     let groups = db.store.cert_groups(&system_admin()).await.unwrap();
     assert_eq!(groups.len(), 1);
     let group = &groups[0];
@@ -23148,6 +23586,7 @@ async fn hysteria2_quic_tuning_round_trips_field_by_field() {
                 obfs: None,
                 masquerade: HysteriaMasquerade::NotFound,
             }),
+            mtproto: None,
         },
         id: "ing-a1b2".to_owned(),
         chain_id: "chn-a1b2-c3d4".to_owned(),

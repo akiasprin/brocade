@@ -498,6 +498,62 @@ impl PgStore {
         cert::try_certificate_scan_lock(&self.pool).await
     }
 
+    pub async fn enqueue_certificate_scan(
+        &self,
+        trigger: crate::CertificateScanTrigger,
+    ) -> Result<crate::CertificateScanRun> {
+        cert::enqueue_certificate_scan(&self.pool, trigger).await
+    }
+
+    pub async fn latest_certificate_scan(&self) -> Result<Option<crate::CertificateScanRun>> {
+        cert::latest_certificate_scan(&self.pool).await
+    }
+
+    pub async fn claim_certificate_scan(
+        &self,
+        owner: &str,
+    ) -> Result<Option<crate::ClaimedCertificateScan>> {
+        cert::claim_certificate_scan(&self.pool, owner).await
+    }
+
+    pub async fn renew_certificate_scan_lease(
+        &self,
+        claim: &crate::ClaimedCertificateScan,
+    ) -> Result<bool> {
+        cert::renew_certificate_scan_lease(&self.pool, claim).await
+    }
+
+    pub async fn update_certificate_scan_progress(
+        &self,
+        claim: &crate::ClaimedCertificateScan,
+        phase: crate::CertificateScanPhase,
+        counts: crate::CertificateScanCounts,
+        current_certificate_id: Option<&str>,
+        current_subject: Option<&str>,
+    ) -> Result<bool> {
+        cert::update_certificate_scan_progress(
+            &self.pool,
+            claim,
+            phase,
+            counts,
+            current_certificate_id,
+            current_subject,
+        )
+        .await
+    }
+
+    pub async fn complete_certificate_scan(
+        &self,
+        claim: &crate::ClaimedCertificateScan,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        cert::complete_certificate_scan(&self.pool, claim, error).await
+    }
+
+    pub async fn prune_certificate_scans(&self) -> Result<u64> {
+        cert::prune_certificate_scans(&self.pool).await
+    }
+
     pub async fn record_certificate_attempt(&self, certificate_id: &str) -> Result<()> {
         cert::record_certificate_attempt(&self.pool, certificate_id).await
     }
@@ -1111,13 +1167,13 @@ impl PgStore {
         console::issue_clash_haitun_link(&self.pool, actor, tenant_id, user_id).await
     }
 
-    pub async fn regenerate_clash_haitun_link(
+    pub async fn revoke_clash_haitun_link(
         &self,
         actor: &AdminContext,
         tenant_id: &str,
         user_id: &str,
     ) -> Result<ClashHaitunLink> {
-        console::regenerate_clash_haitun_link(&self.pool, actor, tenant_id, user_id).await
+        console::revoke_clash_haitun_link(&self.pool, actor, tenant_id, user_id).await
     }
 
     pub async fn verify_deployment(

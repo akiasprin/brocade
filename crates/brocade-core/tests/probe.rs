@@ -337,5 +337,13 @@ fn user_params(
             String::new(),
             None,
         ),
+        UserSecurityPlan::MtProto { .. } => (
+            "mtproto",
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            None,
+        ),
     }
 }

@@ -56,6 +56,41 @@ for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
     }
   });
 
+  test(`${engine}: shared icons stay centered in square controls without text-baseline drift`, async () => {
+    const browser = await launcher.launch();
+    try {
+      const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+      const icon = size =>
+        `<span class="ui-icon"><svg width="${size}" height="${size}" viewBox="0 0 16 16"><path d="M2 8h12" /></svg></span>`;
+      await page.setContent(`<!doctype html><html><head><style>${styles}</style></head><body>
+        <span class="fg-who-plate">${icon(13)}</span>
+        <button class="sub-dialog-close" type="button">${icon(14)}</button>
+        <button class="user-fcopy" type="button">${icon(11)}</button>
+        <button class="fg-ico" type="button">${icon(13)}</button>
+      </body></html>`);
+
+      const offsets = await page
+        .locator('.fg-who-plate, .sub-dialog-close, .user-fcopy, .fg-ico')
+        .evaluateAll(controls =>
+          controls.map(control => {
+            const box = control.getBoundingClientRect();
+            const svg = control.querySelector('svg').getBoundingClientRect();
+            return {
+              name: control.className,
+              x: svg.x + svg.width / 2 - box.x - box.width / 2,
+              y: svg.y + svg.height / 2 - box.y - box.height / 2,
+            };
+          }),
+        );
+      for (const offset of offsets) {
+        assert.ok(Math.abs(offset.x) <= 0.5, `${offset.name}: horizontal offset ${offset.x}px`);
+        assert.ok(Math.abs(offset.y) <= 0.5, `${offset.name}: vertical offset ${offset.y}px`);
+      }
+    } finally {
+      await browser.close();
+    }
+  });
+
   test(`${engine}: title icons and Chinese, Latin or mixed text share a vertical center`, async () => {
     const browser = await launcher.launch();
     try {

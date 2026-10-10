@@ -60,7 +60,9 @@ fn entry_is_self_signed(entry: &SubscriptionEntry) -> bool {
         SubscriptionSecurity::Tls(tls) => tls.self_signed,
         SubscriptionSecurity::AnyTls(anytls) => anytls.self_signed,
         SubscriptionSecurity::Hysteria2(hysteria) => hysteria.self_signed,
-        SubscriptionSecurity::Reality(_) | SubscriptionSecurity::VlessEncryption { .. } => false,
+        SubscriptionSecurity::Reality(_)
+        | SubscriptionSecurity::VlessEncryption { .. }
+        | SubscriptionSecurity::MtProto => false,
     }
 }
 
@@ -125,6 +127,9 @@ fn entry_uri(entry: &SubscriptionEntry, options: UriRenderOptions) -> String {
     if let SubscriptionSecurity::Hysteria2(hysteria) = &entry.security {
         return hysteria2_uri(entry, hysteria, options);
     }
+    if matches!(&entry.security, SubscriptionSecurity::MtProto) {
+        return mtproto_uri(entry);
+    }
     // `type` names the network layer, and it is the field a client uses to decide how to dial.
     // XHTTP additionally needs the path: the server matches it and refuses anything else, so a
     // URI missing it imports cleanly and never connects.
@@ -174,7 +179,9 @@ fn entry_uri(entry: &SubscriptionEntry, options: UriRenderOptions) -> String {
             query.push(("sni", tls.server_name.clone()));
             tls.flow.clone()
         }
-        SubscriptionSecurity::AnyTls(_) | SubscriptionSecurity::Hysteria2(_) => {
+        SubscriptionSecurity::AnyTls(_)
+        | SubscriptionSecurity::Hysteria2(_)
+        | SubscriptionSecurity::MtProto => {
             unreachable!("AnyTLS / Hysteria 已在上方单独渲染")
         }
     };
@@ -367,6 +374,23 @@ fn hysteria2_uri(
     )
 }
 
+fn mtproto_uri(entry: &SubscriptionEntry) -> String {
+    // Telegram's `dd` prefix selects padded-intermediate transport. The remaining 16 bytes are
+    // the same per-user UUID the Agent reconciles into Xray, without UUID punctuation.
+    let secret = entry
+        .uuid
+        .chars()
+        .filter(|character| *character != '-')
+        .collect::<String>();
+    format!(
+        "# @brocade-name={}\ntg://proxy?server={}&port={}&secret=dd{}",
+        pct_encode(&entry.name),
+        pct_encode(&entry.server),
+        entry.port,
+        pct_encode(&secret)
+    )
+}
+
 fn uri_host(host: &str) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
@@ -385,4 +409,28 @@ fn pct_encode(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mtproxy_link_uses_the_official_padded_secret_shape() {
+        let entry = SubscriptionEntry {
+            name: "台湾 Hinet | MTProxy".to_owned(),
+            server: "2001:db8::7".to_owned(),
+            port: 15_443,
+            uuid: "00112233-4455-6677-8899-aabbccddeeff".to_owned(),
+            security: SubscriptionSecurity::MtProto,
+            stream: SubscriptionStream::Tcp,
+            front_name: None,
+        };
+
+        assert_eq!(
+            entry_uri(&entry, UriRenderOptions::default()),
+            "# @brocade-name=%E5%8F%B0%E6%B9%BE%20Hinet%20%7C%20MTProxy\n\
+             tg://proxy?server=2001%3Adb8%3A%3A7&port=15443&secret=dd00112233445566778899aabbccddeeff"
+        );
+    }
 }

@@ -493,6 +493,19 @@ fn inbound(inbound: &XrayInbound) -> Value {
                 "sniffing": sniffing,
             })
         }
+        XrayInbound::MtProto { tag, listen, port } => json!({
+            "tag": tag,
+            "listen": listen,
+            "port": port,
+            "protocol": "mtproto",
+            "settings": { "users": [] },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "none",
+                "sockopt": { "tcpFastOpen": TCP_FAST_OPEN_BACKLOG },
+            },
+            "sniffing": { "enabled": false },
+        }),
         XrayInbound::Dokodemo {
             tag,
             listen,
@@ -1449,6 +1462,21 @@ fn attach_reverse_health(reverse: Option<&mut Value>, config: &XrayConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtproxy_inbound_never_enables_content_or_sni_sniffing() {
+        let value = inbound(&XrayInbound::MtProto {
+            tag: "in:telegram:mtproto".to_owned(),
+            listen: "0.0.0.0".to_owned(),
+            port: 15_443,
+        });
+
+        assert_eq!(value["protocol"], json!("mtproto"));
+        assert_eq!(value["streamSettings"]["network"], json!("tcp"));
+        assert_eq!(value["streamSettings"]["security"], json!("none"));
+        assert_eq!(value["sniffing"], json!({ "enabled": false }));
+        assert!(value.get("tlsSettings").is_none());
+    }
 
     #[test]
     fn business_egress_can_honor_an_ingress_that_allows_private_targets() {

@@ -4861,7 +4861,7 @@ async fn restore_app_tx(
                 anytls_security, anytls_reality,
                 anytls_reality_private_key, anytls_reality_public_key,
                 anytls_reality_short_ids, vless_encryption_port, vless_encryption_private_key, vless_encryption_public_key, vless_encryption_options,
-                protocol_projection
+                protocol_projection, mtproto_port
              )
              VALUES (
                 $1, $2, $3, $4, $5::inet, $6, $7,
@@ -4880,7 +4880,7 @@ async fn restore_app_tx(
                 $45, $46, $47, $48,
                 $49, $50, $51,
                 $52, $53, $54, $55, $56, $57, $58, $59, $60,
-                $61, $62, $63, $64, $65, $66, $67, $68
+                $61, $62, $63, $64, $65, $66, $67, $68, $69
              )",
         )
         .bind(&ingress.id)
@@ -4982,6 +4982,7 @@ async fn restore_app_tx(
         .bind(ingress.wires.vless_encryption().map(|wire| &wire.public_key))
         .bind(serde_json::to_value(ingress.wires.vless_encryption().map(|wire| wire.options.clone()).unwrap_or_default())?)
         .bind(serde_json::to_value(projection)?)
+        .bind(ingress.wires.mtproto().map(|wire| i32::from(wire.port)))
         .execute(&mut **tx)
         .await?;
 

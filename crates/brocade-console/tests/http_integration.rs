@@ -23,6 +23,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use std::io::Write as _;
+use std::time::Duration;
 use testcontainers::{runners::AsyncRunner, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
@@ -219,6 +220,30 @@ async fn admin_token(db: &TestPg) -> String {
 
 async fn admin_app(db: &TestPg) -> (Router, String) {
     (admin_router(db.store.clone()), admin_token(db).await)
+}
+
+async fn wait_certificate_scan(pool: &PgPool, id: i64) -> (String, i32, i32) {
+    for _ in 0..200 {
+        if let Some(row) = sqlx::query(
+            "SELECT status, issued_items, failed_items FROM certificate_scan_runs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            let status: String = row.try_get("status").unwrap();
+            if status == "succeeded" || status == "failed" {
+                return (
+                    status,
+                    row.try_get("issued_items").unwrap(),
+                    row.try_get("failed_items").unwrap(),
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("certificate scan {id} did not finish");
 }
 
 #[tokio::test]
@@ -1874,7 +1899,15 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
     let issued_again = response_json(issued_again).await;
     assert_eq!(issued_again["urls"]["both"], issued["urls"]["both"]);
 
-    let removed_revoke = admin
+    let removed_regenerate = post_json(
+        &admin,
+        &token,
+        "/users/platform.acme/alice/clash-subscription/haitun/regenerate",
+        json!({}),
+    )
+    .await;
+    assert!(removed_regenerate.0.is_client_error());
+    let revoked = admin
         .clone()
         .oneshot(
             Request::delete("/users/platform.acme/alice/clash-subscription/haitun")
@@ -1884,11 +1917,28 @@ async fn clash_subscription_route_serves_only_stable_releases_without_http_cachi
         )
         .await
         .unwrap();
-    assert_eq!(removed_revoke.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let revoked = response_json(revoked).await;
+    assert_eq!(revoked["status"], "revoked");
+    assert!(revoked["urls"].is_null());
+    assert!(revoked["revoked_at"].is_string());
+    let stopped = get_json(
+        &admin,
+        &token,
+        "/users/platform.acme/alice/clash-subscription",
+    )
+    .await;
+    assert_eq!(stopped.1["haitun"], revoked);
+    let old = agent
+        .clone()
+        .oneshot(Request::get(&haitun_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(old.status(), StatusCode::NOT_FOUND);
 
     let reissued = admin
         .oneshot(
-            Request::post("/users/platform.acme/alice/clash-subscription/haitun/regenerate")
+            Request::post("/users/platform.acme/alice/clash-subscription/haitun")
                 .header("authorization", format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -1983,11 +2033,21 @@ async fn koipy_subscriptions_are_admin_only_and_self_service_never_leaks_links()
                 assert!(!info.1.to_string().contains(original_url));
             }
         }
-        for action in ["haitun", "haitun/regenerate"] {
-            let response =
-                post_json(&app, credential, &format!("{path}/{action}"), json!({})).await;
+        for method in ["DELETE", "POST"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("{path}/haitun"))
+                        .header("authorization", format!("Bearer {credential}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(
-                response.0,
+                response.status(),
                 if allowed {
                     StatusCode::OK
                 } else {
@@ -2017,7 +2077,7 @@ async fn koipy_subscriptions_are_admin_only_and_self_service_never_leaks_links()
         ("POST", "/me/clash-subscription/haitun".to_owned()),
         ("DELETE", "/me/clash-subscription/haitun".to_owned()),
         ("POST", format!("{path}/haitun")),
-        ("POST", format!("{path}/haitun/regenerate")),
+        ("DELETE", format!("{path}/haitun")),
     ] {
         let response = app
             .clone()
@@ -4134,6 +4194,7 @@ async fn http_settings_exposes_and_updates_global_reality_client_policy() {
     assert_eq!(body["ports"]["ingress_base"], 13_443);
     assert_eq!(body["ports"]["anytls_base"], 14_443);
     assert_eq!(body["ports"]["hy2_base"], 30_000);
+    assert_eq!(body["ports"]["mtproto_base"], 28_800);
 
     let update_body = json!({
         "reality_client": {
@@ -4345,7 +4406,8 @@ async fn http_control_plane_only_edits_commit_immediately_without_a_deployment()
         "anytls_base": 14453,
         "vless_encryption_base": 13810,
         "hop_base": 21000,
-        "hy2_base": 31000
+        "hy2_base": 31000,
+        "mtproto_base": 28810
     });
     let ports = put_json(&app, &admin_token, "/settings/ports", port_settings.clone()).await;
     assert_eq!(ports.0, StatusCode::OK, "{:?}", ports.1);
@@ -6629,7 +6691,17 @@ async fn first_start_issues_the_default_self_signed_primary_and_standby_pair() {
     };
     db.store.migrate().await.unwrap();
     assert_eq!(db.store.ensure_default_self_signed_pool().await.unwrap(), 2);
-    assert_eq!(brocade_console::certs::scan_once(&db.store).await, (2, 0));
+    let queued = db
+        .store
+        .enqueue_certificate_scan(brocade_store::CertificateScanTrigger::Startup)
+        .await
+        .unwrap();
+    let wake = brocade_console::certs::spawn(db.store.clone());
+    wake.notify_one();
+    assert_eq!(
+        wait_certificate_scan(db.pool(), queued.id).await,
+        ("succeeded".to_owned(), 2, 0)
+    );
 
     let groups = db
         .store
@@ -6679,6 +6751,7 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
     };
     db.store.migrate().await.unwrap();
     insert_node(db.pool()).await;
+    let _worker = brocade_console::certs::spawn(db.store.clone());
     let (app, token) = admin_app(&db).await;
 
     let response = app
@@ -6734,7 +6807,7 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
         .await
         .unwrap();
     let lock = db.store.try_certificate_scan_lock().await.unwrap().unwrap();
-    let busy = app
+    let queued = app
         .clone()
         .oneshot(
             Request::post("/certs/scan")
@@ -6744,23 +6817,14 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
         )
         .await
         .unwrap();
-    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(queued.status(), StatusCode::ACCEPTED);
+    let queued = response_json(queued).await;
+    assert_eq!(queued["status"], "queued");
     drop(lock);
-    let processed = app
-        .clone()
-        .oneshot(
-            Request::post("/certs/scan")
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(processed.status(), StatusCode::OK);
-    let result = response_json(processed).await;
-    assert_eq!(result["processing"]["issued"], 1);
-    assert_eq!(result["processing"]["failed"], 0);
-    assert_eq!(result["groups"][0]["certificates"][0]["status"], "serving");
+    assert_eq!(
+        wait_certificate_scan(db.pool(), queued["id"].as_i64().unwrap()).await,
+        ("succeeded".to_owned(), 1, 0)
+    );
 
     let groups = db
         .store
@@ -6802,10 +6866,13 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
         json!({"name": "Immediate issuance", "signing_method": "self-signed"}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(created["processing"]["issued"], 2);
-    assert_eq!(created["processing"]["failed"], 0);
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(created["scan"]["status"], "queued");
     let id = created["id"].as_str().unwrap();
+    assert_eq!(
+        wait_certificate_scan(db.pool(), created["scan"]["id"].as_i64().unwrap()).await,
+        ("succeeded".to_owned(), 2, 0)
+    );
     let states: Vec<String> =
         sqlx::query_scalar("SELECT status FROM certificates WHERE label_id = $1 ORDER BY status")
             .bind(id)
@@ -6835,10 +6902,11 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
         json!({"name": "Missing credential", "signing_method": "public-ca"}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(
-        blocked["processing"]["failed"], 1,
-        "missing credentials must surface as a failed attempt, not a queue"
+        wait_certificate_scan(db.pool(), blocked["scan"]["id"].as_i64().unwrap()).await,
+        ("succeeded".to_owned(), 0, 1),
+        "missing credentials must surface as a failed item in the durable task"
     );
     let public_group_id = blocked["id"].as_str().unwrap();
     let (first_status, first_extra) = post_json(
@@ -6855,9 +6923,10 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
         json!({}),
     )
     .await;
-    assert_eq!(first_status, StatusCode::OK);
-    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(first_status, StatusCode::ACCEPTED);
+    assert_eq!(second_status, StatusCode::ACCEPTED);
     assert_ne!(first_extra["id"], second_extra["id"]);
+    wait_certificate_scan(db.pool(), second_extra["scan"]["id"].as_i64().unwrap()).await;
     let retained: i64 = sqlx::query_scalar("SELECT count(*) FROM certificates WHERE label_id = $1")
         .bind(public_group_id)
         .fetch_one(db.pool())
@@ -6874,7 +6943,12 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
         )
         .await
         .unwrap();
-    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(retry.status(), StatusCode::ACCEPTED);
+    let retry = response_json(retry).await;
+    assert_eq!(
+        wait_certificate_scan(db.pool(), retry["id"].as_i64().unwrap()).await,
+        ("succeeded".to_owned(), 0, 0)
+    );
     let counts: (i64, i64) = sqlx::query_as(
         "SELECT count(*), sum(attempts)::bigint FROM certificates WHERE label_id = $1",
     )
@@ -6884,8 +6958,8 @@ async fn certificate_settings_issue_a_direct_self_signed_certificate() {
     .unwrap();
     assert_eq!(
         counts,
-        (3, 9),
-        "manual retry must reuse every retained failed request immediately"
+        (3, 3),
+        "manual scans must honor the retry floor instead of spending CA quota again immediately"
     );
 }
 

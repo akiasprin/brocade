@@ -11,8 +11,8 @@ import (
 // separate header writes and depends heavily on kernel pipe/kTLS behaviour.
 // It can win peak throughput on a suitable kernel, but has a less predictable
 // syscall, latency, and memory profile than the writev path. Keep kTLS itself
-// independent: xray.anytls.ktls=auto can still move AES-GCM into the kernel
-// without enabling this framing experiment.
+// independent: xray.anytls.ktls=auto can still move transmit AES-GCM into the
+// kernel without enabling this framing experiment.
 func framedDownlinkSpliceEnabled() bool {
 	value := platform.NewEnvFlag(platform.UseAnyTLSSplice).GetValue(func() string {
 		return "off"

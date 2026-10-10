@@ -102,8 +102,8 @@ const activeStealEvent: MachineEventList = {
       started_at: '2026-10-06T17:15:00+08:00',
       detected_at: '2026-10-06T17:16:02+08:00',
       last_observed_at: '2026-10-06T17:20:00+08:00',
-      current_value: 59.4,
-      peak_value: 63.1,
+      current_value: 89.4,
+      peak_value: 93.1,
     },
   ],
   events: [
@@ -117,9 +117,9 @@ const activeStealEvent: MachineEventList = {
       current_value: 'active',
       last_contact_at: null,
       incident_started_at: '2026-10-06T17:15:00+08:00',
-      metric_value: 59.4,
-      metric_peak_value: 63.1,
-      metric_threshold: 10,
+      metric_value: 89.4,
+      metric_peak_value: 93.1,
+      metric_threshold: 80,
       occurred_at: '2026-10-06T17:16:02+08:00',
     },
   ],
@@ -210,7 +210,7 @@ it('把持续 CPU steal 保持为一条进行中事故并显示当前值与峰�
   expect(groups).toHaveLength(1);
   expect(groups[0]?.kind).toBe('cpu_steal');
   expect(groups[0]?.status).toBe('active');
-  expect(groups[0]?.incidents[0]).toMatchObject({ currentValue: 59.4, peakValue: 63.1 });
+  expect(groups[0]?.incidents[0]).toMatchObject({ currentValue: 89.4, peakValue: 93.1 });
 
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
   client.setQueryData(['machine-notifications', 'operator'], activeStealEvent);
@@ -223,7 +223,7 @@ it('把持续 CPU steal 保持为一条进行中事故并显示当前值与峰�
 
   fireEvent.click(screen.getByRole('button', { name: '1 条进行中机器事故' }));
   expect(screen.getByText('宿主机 CPU 抢占')).toBeTruthy();
-  expect(screen.getByText('当前 59.4% · 峰值 63.1%')).toBeTruthy();
+  expect(screen.getByText('当前 89.4% · 峰值 93.1%')).toBeTruthy();
 });
 
 it('按异常开始时间合并一分钟内采样窗口错开的多机 CPU steal 事故', () => {
@@ -241,8 +241,8 @@ it('按异常开始时间合并一分钟内采样窗口错开的多机 CPU steal
         started_at: '2026-10-06T17:15:59+08:00',
         detected_at: '2026-10-06T17:17:03+08:00',
         last_observed_at: '2026-10-06T17:20:21+08:00',
-        current_value: 24.4,
-        peak_value: 24.4,
+        current_value: 84.4,
+        peak_value: 84.4,
       },
     ],
     events: [],

@@ -15,8 +15,8 @@ use brocade_core::{
         ExternalVlessTransport, ExternalVlessXhttp, ExternalVlessXhttpDownload,
         ExternalWarpBinding, Front, FrontStrategy, Grant, HopDial, HopIn, HopMux, HopPool, HopWire,
         Hysteria2, HysteriaBandwidth, HysteriaMasquerade, HysteriaObfs, HysteriaPortHop, Ingress,
-        IngressWires, IpFamily, ListenerDial, ListenerRef, ModelSettings, ModelSnapshot, Node,
-        NodeEgressDnsPolicy, OverlaySettings, Projection, ProjectionDownloadEndpoint,
+        IngressWires, IpFamily, ListenerDial, ListenerRef, ModelSettings, ModelSnapshot, MtProto,
+        Node, NodeEgressDnsPolicy, OverlaySettings, Projection, ProjectionDownloadEndpoint,
         ProjectionEndpoint, Reality, RealityClientPolicy, RealityFallbackMode, RealitySite,
         RealityXhttp, Rule, Step, Tls, Transport, User, WireGuardKeys, Xhttp, XhttpDownload,
         XhttpMode, XhttpXmux,
@@ -34,6 +34,61 @@ fn egress_rejects_unknown_fields() {
         "resolution": { "address": "192.0.2.53", "port": 53 }
     }));
     assert!(result.is_err());
+}
+
+#[test]
+fn mtproxy_requires_a_direct_public_ipv4_node() {
+    let diagnostics_for = |mut machine: Node| {
+        let mut face = ingress("i", "c", &machine.id, None);
+        face.wires = IngressWires::WithMtProto {
+            other: None,
+            mtproto: MtProto { port: 15_443 },
+        };
+        let app = AppView {
+            id: "app".to_owned(),
+            label: "应用".to_owned(),
+            chains: vec![chain("c")],
+            ingresses: vec![face],
+            fronts: Vec::new(),
+            steps: vec![step("c", &machine.id, vec![any_egress()], None)],
+            grants: Vec::new(),
+        };
+        machine.certificate_name = None;
+        let snapshot = doc(vec![machine]);
+        let mut diagnostics = Vec::new();
+        let sys = compile_system(&snapshot, &mut diagnostics);
+        let app = compile_app(&snapshot, &app, &mut diagnostics);
+        validate_app(&sys, &app, &mut diagnostics);
+        diagnostics
+    };
+
+    let without_ipv4 = diagnostics_for(node("edge", "platform.acme", None, [10, 66, 0, 1], true));
+    assert_has(&without_ipv4, Level::Error, "ingress.mtproto-direct-ipv4");
+
+    let mut behind_nat = node(
+        "edge",
+        "platform.acme",
+        Some("198.51.100.10"),
+        [10, 66, 0, 1],
+        true,
+    );
+    behind_nat.public_ipv4_nat = true;
+    let behind_nat = diagnostics_for(behind_nat);
+    assert_has(&behind_nat, Level::Error, "ingress.mtproto-direct-ipv4");
+
+    let direct = diagnostics_for(node(
+        "edge",
+        "platform.acme",
+        Some("198.51.100.10"),
+        [10, 66, 0, 1],
+        true,
+    ));
+    assert!(
+        direct
+            .iter()
+            .all(|diagnostic| diagnostic.code != "ingress.mtproto-direct-ipv4"),
+        "direct public IPv4 was rejected: {direct:#?}"
+    );
 }
 
 #[test]

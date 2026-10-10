@@ -163,6 +163,7 @@ const certsWithGroup = (): CertsView => ({
     },
   ],
   nodes: [],
+  scan: null,
   letsencrypt: 'https://acme',
   letsencrypt_staging: 'https://acme-staging',
 });
@@ -337,14 +338,16 @@ describe('设置页分段保存的基准', () => {
     );
   });
 
-  it('以多条密码输入追加 ProxyCheck Key 池，不从 API 读回密钥', async () => {
+  it('以不触发密码保存的密钥输入追加 ProxyCheck Key 池，不从 API 读回密钥', async () => {
     render(<Harness />);
     await screen.findByText('情报任务');
     const scope = section('set-vpngate-intelligence');
     const first = scope.getByLabelText('ProxyCheck API 密钥 1') as HTMLInputElement;
     const row = first.closest('.setfld');
     expect(row).not.toBeNull();
-    expect(first.type).toBe('password');
+    expect(first.type).toBe('text');
+    expect(first.autocomplete).toBe('off');
+    expect(first.classList.contains('config-secret-input')).toBe(true);
     expect(first.placeholder).toContain('追加');
     expect(
       within(row as HTMLElement).getByText('已配置；旧 Key 不回显，追加不会覆盖 · 最多 32 个，随机起点轮换'),
@@ -354,7 +357,7 @@ describe('设置页分段保存的基准', () => {
     fireEvent.change(first, { target: { value: replacements[0] } });
     fireEvent.click(within(row as HTMLElement).getByRole('button', { name: '＋ 添加密钥' }));
     const second = scope.getByLabelText('ProxyCheck API 密钥 2') as HTMLInputElement;
-    expect(second.type).toBe('password');
+    expect(second.type).toBe('text');
     fireEvent.change(second, { target: { value: replacements[1] } });
     fireEvent.click(within(row as HTMLElement).getByRole('button', { name: '追加到 Key 池' }));
 
@@ -618,14 +621,30 @@ describe('设置页分段保存的基准', () => {
     expect(fieldInput(connection, '复用流数量').matches(':disabled')).toBe(true);
   });
 
-  it('立即签发等待完成并显示结果，签发配置与证书记录分开', async () => {
-    const full = certsWithGroup();
-    let complete!: (response: Response) => void;
-    const response = new Promise<Response>(resolve => {
-      complete = resolve;
-    });
+  it('立即签发只入队后台任务并显示持久化进度，签发配置与证书记录分开', async () => {
+    let full = certsWithGroup();
+    const queued = {
+      id: 41,
+      trigger: 'manual' as const,
+      status: 'queued' as const,
+      phase: 'queued' as const,
+      total_items: 0,
+      processed_items: 0,
+      issued_items: 0,
+      failed_items: 0,
+      current_certificate_id: null,
+      current_subject: null,
+      error_detail: null,
+      queued_at_unix_secs: 1,
+      started_at_unix_secs: null,
+      heartbeat_at_unix_secs: null,
+      finished_at_unix_secs: null,
+    };
     const fetchMock = vi.fn(async (path: string, init?: RequestInit) => {
-      if (path === '/certs/scan' && init?.method === 'POST') return response;
+      if (path === '/certs/scan' && init?.method === 'POST') {
+        full = { ...full, scan: queued };
+        return Response.json(queued, { status: 202 });
+      }
       const body = path === '/certs' ? () => full : ROUTES[path];
       if (!body) throw new Error(`未预期的请求：${path}`);
       return Response.json(body());
@@ -642,13 +661,11 @@ describe('设置页分段保存的基准', () => {
     expect(screen.queryByText(/不代表当前选中了哪一种/)).toBeNull();
     expect(screen.queryByText('现在检查一轮')).toBeNull();
     fireEvent.click(process);
-    await waitFor(() =>
-      expect((screen.getByRole('button', { name: '正在签发与续期…' }) as HTMLButtonElement).disabled).toBe(true),
-    );
-    expect(screen.queryByText(/处理完成/)).toBeNull();
-    complete(Response.json({ ...full, processing: { issued: 2, failed: 1 } }));
-    expect(await screen.findByText(/处理完成：成功 2 张，失败 1 张/)).toBeTruthy();
-    expect((screen.getByRole('button', { name: '立即签发与续期' }) as HTMLButtonElement).disabled).toBe(false);
+    expect(await screen.findByText('后台签发任务')).toBeTruthy();
+    expect(screen.getByText('#41 · 手动触发')).toBeTruthy();
+    expect(screen.getByText('等待后台处理')).toBeTruthy();
+    expect((screen.getByRole('button', { name: '后台处理中…' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith('/certs/scan', expect.objectContaining({ method: 'POST' }));
   });
 
   it('两项签发配置同时展示，只在新建证书组时选择类型', async () => {
@@ -664,6 +681,10 @@ describe('设置页分段保存的基准', () => {
     fireEvent.click(publicCa.querySelector('summary')!);
     expect(publicCa.open).toBe(true);
     expect(within(publicCa).getByPlaceholderText('example.net')).toBeTruthy();
+    const token = within(publicCa).getByPlaceholderText('已配置（重填才会覆盖）') as HTMLInputElement;
+    expect(token.type).toBe('text');
+    expect(token.autocomplete).toBe('off');
+    expect(token.classList.contains('config-secret-input')).toBe(true);
     expect(screen.queryByRole('group', { name: '证书组类型' })).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: '新建证书组' }));
@@ -679,6 +700,17 @@ describe('设置页分段保存的基准', () => {
     fireEvent.click(selfSigned);
     expect(screen.getByPlaceholderText('example.net')).toBeTruthy();
     expect(screen.getByText(/创建后立即生成并签发固定主备两份/)).toBeTruthy();
+  });
+
+  it('把同一证书的通配名与裸名合并成紧凑名称', async () => {
+    const full = certsWithGroup();
+    ROUTES['/certs'] = () => full;
+    render(<Harness />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /CA-1/ }));
+
+    expect(screen.getByText('[*.]a1b2c3d4.private.example')).toBeTruthy();
+    expect(screen.queryByText('*.a1b2c3d4.private.example · a1b2c3d4.private.example')).toBeNull();
   });
 
   it('证书组默认收起，自签模式不提供手动添加备用动作', async () => {

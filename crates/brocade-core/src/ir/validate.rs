@@ -1816,6 +1816,38 @@ fn validate_chain_ingresses(app: &AppIr, diagnostics: &mut Vec<Diagnostic>) {
         if let Some(settings) = ingress.wires.anytls() {
             validate_anytls(diagnostics, ingress, settings);
         }
+        if let Some(settings) = ingress.wires.mtproto() {
+            if settings.port == 0 {
+                diagnostics.push(Diagnostic::error(
+                    "ingress.mtproto-port",
+                    &ingress.id,
+                    format!("接入面 {} 的 MTProxy 监听端口不能是 0", ingress.id),
+                ));
+            }
+            if let Some(node) = app.nodes.iter().find(|node| node.id == ingress.node) {
+                let reason = if node
+                    .public_ipv4
+                    .as_deref()
+                    .is_none_or(|address| address.trim().is_empty())
+                {
+                    Some("没有配置公网 IPv4")
+                } else if node.public_ipv4_nat {
+                    Some("公网 IPv4 标记为 NAT")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    diagnostics.push(Diagnostic::error(
+                        "ingress.mtproto-direct-ipv4",
+                        &ingress.id,
+                        format!(
+                            "接入面 {} 不能在机器 {} 上启用 MTProxy：{reason}；MTProxy 要求公网 IPv4 直接配置在机器网卡上",
+                            ingress.id, node.id
+                        ),
+                    ));
+                }
+            }
+        }
         validate_ingress_certificate(diagnostics, ingress);
         validate_ingress_guard(diagnostics, ingress);
         if !app.chains.iter().any(|chain| chain.id == ingress.chain) {
@@ -1871,6 +1903,7 @@ fn validate_projection(ingress: &Ingress, diagnostics: &mut Vec<Diagnostic>) {
         ),
         ("AnyTLS", ingress.projection.anytls.as_ref()),
         ("Hysteria 2", ingress.projection.hysteria2.as_ref()),
+        ("MTProxy", ingress.projection.mtproto.as_ref()),
     ] {
         let Some(projection) = projection else {
             continue;
@@ -2036,6 +2069,13 @@ fn occupied_ingress_ports(ingress: &Ingress) -> Vec<OccupiedIngressPort> {
             proto: Proto::Tcp,
             port: anytls.port,
             suffix: " 的 AnyTLS",
+        });
+    }
+    if let Some(mtproto) = ingress.wires.mtproto() {
+        occupied.push(OccupiedIngressPort {
+            proto: Proto::Tcp,
+            port: mtproto.port,
+            suffix: " 的 MTProxy",
         });
     }
 

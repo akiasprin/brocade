@@ -235,6 +235,10 @@ describe('发布计划审阅', () => {
         { node_id: 'edge-rollout-2', name: '东京 IIJ-01' },
       ],
     });
+    // 「等待确认」取运行中列表里服务端算出的 awaiting_confirmation
+    client.setQueryData(['deployments', 'runtime'], {
+      deployments: [{ id: 5, active: true, awaiting_confirmation: true }],
+    });
 
     const detailWindow: Win = {
       ...windowState,
@@ -262,8 +266,9 @@ describe('发布计划审阅', () => {
     expect(view.getByText('变更单 #5')).toBeTruthy();
     expect(view.getByText('发布验证')).toBeTruthy();
     expect(view.getByText('全量发布')).toBeTruthy();
-    expect(view.getByText('步骤 1/2')).toBeTruthy();
-    expect(view.getByText('步骤 2/2')).toBeTruthy();
+    expect(view.getByText('第 1 步')).toBeTruthy();
+    expect(view.getByText('第 2 步')).toBeTruthy();
+    expect(view.getByText('等待确认')).toBeTruthy();
     expect(view.getByRole('button', { name: '更新香港入口 B' })).toBeTruthy();
     expect(view.getByText('R11 → R12 · 4 台机器')).toBeTruthy();
     expect(view.queryByText(/^波次 /)).toBeNull();

@@ -279,6 +279,8 @@ const EXPERIMENTAL_CN_RULE: StandardRule = StandardRule {
 };
 
 pub fn clash_subscription(subscription: &Subscription) -> String {
+    let subscription = clash_compatible_subscription(subscription);
+    let subscription = &subscription;
     let mut lines = Vec::new();
     push_standard_base(&mut lines, subscription);
     lines.push(String::new());
@@ -314,6 +316,8 @@ pub fn clash_subscription(subscription: &Subscription) -> String {
 /// one handed to the user. The final group contains only user-facing entries, never helper
 /// external proxies.
 pub fn clash_haitun_subscription(subscription: &Subscription) -> String {
+    let subscription = clash_compatible_subscription(subscription);
+    let subscription = &subscription;
     let mut lines = vec![
         "# Brocade · koipy 测速（请求时动态生成）".to_owned(),
         "mixed-port: 7897".to_owned(),
@@ -453,6 +457,7 @@ fn subscription_server_names(subscription: &Subscription) -> BTreeSet<&str> {
             SubscriptionSecurity::Tls(tls) => tls.server_name.as_str(),
             SubscriptionSecurity::AnyTls(anytls) => anytls.server_name.as_str(),
             SubscriptionSecurity::Hysteria2(hysteria) => hysteria.server_name.as_str(),
+            SubscriptionSecurity::MtProto => "",
         })
         .chain(
             subscription
@@ -638,6 +643,9 @@ fn deduplicate(values: &mut Vec<String>) {
 }
 
 fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
+    if matches!(&entry.security, SubscriptionSecurity::MtProto) {
+        return;
+    }
     if let SubscriptionSecurity::AnyTls(anytls) = &entry.security {
         push_anytls_proxy(lines, entry, anytls);
         return;
@@ -691,7 +699,8 @@ fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
         SubscriptionSecurity::Tls(tls) => (&tls.server_name, &tls.flow, None),
         SubscriptionSecurity::AnyTls(_)
         | SubscriptionSecurity::Hysteria2(_)
-        | SubscriptionSecurity::VlessEncryption { .. } => {
+        | SubscriptionSecurity::VlessEncryption { .. }
+        | SubscriptionSecurity::MtProto => {
             unreachable!("AnyTLS / Hysteria 已在上方单独渲染")
         }
     };
@@ -777,6 +786,26 @@ fn push_proxy(lines: &mut Vec<String>, entry: &SubscriptionEntry) {
     if let Some(front_name) = &entry.front_name {
         lines.push(format!("    dialer-proxy: {}", yaml_quote(front_name)));
     }
+}
+
+fn clash_compatible_subscription(subscription: &Subscription) -> Subscription {
+    let mut compatible = subscription.clone();
+    let omitted = compatible
+        .entries
+        .iter()
+        .filter(|entry| matches!(&entry.security, SubscriptionSecurity::MtProto))
+        .map(|entry| entry.name.clone())
+        .collect::<BTreeSet<_>>();
+    compatible
+        .entries
+        .retain(|entry| !omitted.contains(&entry.name));
+    for group in &mut compatible.front_groups {
+        group.members.retain(|member| !omitted.contains(member));
+    }
+    compatible
+        .front_groups
+        .retain(|group| !group.members.is_empty());
+    compatible
 }
 
 fn push_anytls_proxy(

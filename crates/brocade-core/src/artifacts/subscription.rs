@@ -84,6 +84,7 @@ pub enum SubscriptionSecurity {
     Tls(SubscriptionTls),
     AnyTls(SubscriptionAnyTls),
     Hysteria2(SubscriptionHysteria2),
+    MtProto,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,7 +208,8 @@ impl Subscription {
                 }
                 SubscriptionSecurity::Reality(_)
                 | SubscriptionSecurity::AnyTls(_)
-                | SubscriptionSecurity::VlessEncryption { .. } => {}
+                | SubscriptionSecurity::VlessEncryption { .. }
+                | SubscriptionSecurity::MtProto => {}
             }
         }
     }
@@ -247,6 +249,7 @@ fn security(security: &UserSecurityPlan) -> SubscriptionSecurity {
             self_signed: false,
             certificate_fingerprint: None,
         }),
+        UserSecurityPlan::MtProto { .. } => SubscriptionSecurity::MtProto,
     }
 }
 

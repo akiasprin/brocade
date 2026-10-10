@@ -54,20 +54,22 @@ test('隧道页位于线路前并接入主导航、路由和页面容器', () =>
   assert.match(panes, /TunnelsPane|case 'tab:tunnels'/);
 });
 
-test('手机顶栏只保留机器和线路，其他页面收入账户菜单', () => {
+test('手机顶栏保留机器、线路和用量，其他页面收入账户菜单', () => {
   const mobileNav = shell.match(/const MOBILE_NAV = ([^;]+);/)?.[1] ?? '';
   const mobileMore = shell.match(/const MOBILE_MORE = ([\s\S]*?);\n/)?.[1] ?? '';
   assert.match(mobileNav, /f\.key === 'nodes'/);
   assert.match(mobileNav, /f\.key === 'chains'/);
-  assert.doesNotMatch(mobileNav, /users|tunnels|deploy|usage/);
-  for (const key of ['users', 'tunnels', 'deploy', 'usage']) assert.match(mobileMore, new RegExp(`f\\.key === '${key}'`));
+  assert.match(mobileNav, /f\.key === 'usage'/);
+  assert.doesNotMatch(mobileNav, /users|tunnels|deploy/);
+  for (const key of ['users', 'tunnels', 'deploy']) assert.match(mobileMore, new RegExp(`f\\.key === '${key}'`));
+  assert.doesNotMatch(mobileMore, /usage/);
 });
 
 test('账户牌打开更多菜单，菜单项使用一致图标并标出展开与当前页状态', () => {
   assert.match(shell, /className="fg-menu nav-menu"/);
   assert.match(shell, /className="fg-menu-icon"/);
-  // 宽窄屏共用一枚账户牌作为菜单入口，窄屏只留首字母牌。
-  assert.match(shell, /className=\{`fg-who\$\{narrow \? ' compact' : ''\}/);
+  // 宽窄屏共用一枚账户牌作为菜单入口；窄屏已登录时只留首字母，访客直接写登录。
+  assert.match(shell, /className=\{`fg-who\$\{narrow && !account\.guest \? ' compact' : ''\}/);
   assert.equal((shell.match(/\{accountButton\}/g) ?? []).length, 2);
   assert.match(shell, /aria-haspopup="menu"/);
   assert.match(shell, /aria-controls="forge-more-menu"/);
@@ -131,7 +133,7 @@ test('外观控制分开呈现明暗模式与当前色调', () => {
   assert.doesNotMatch(shell, /<span[^>]*>\s*配色\s*<\/span>/);
 });
 
-test('账户入口使用单行文案和产品角色名称', () => {
+test('访客登录与身份头对齐，登录后支持修改密码和退出登录', () => {
   const accountClass = shell.indexOf('className="fg-menu-item fg-account-action"');
   const accountAction = shell.slice(
     shell.lastIndexOf('<button', accountClass),
@@ -139,10 +141,14 @@ test('账户入口使用单行文案和产品角色名称', () => {
   );
   assert.match(shell, /const ROLE_LABEL: Record<AdminRole, string>/);
   assert.match(shell, /'system-admin': '系统管理员'/);
-  assert.match(accountAction, /\{isPublic\(who\) \? '登录' : '退出登录'\}/);
+  assert.match(accountAction, />退出登录</);
   assert.doesNotMatch(accountAction, /<small>/);
-  assert.doesNotMatch(accountAction, /现在是公开访客/);
-  // 账户名与角色放在菜单头，角色取产品名称；动作行只写动作。
+  // 访客的登录动作占用身份头；登录后账户名与角色留在同一位置，账号操作位于菜单尾部。
+  assert.match(shell, /className="fg-menu-id fg-menu-login guest" onClick=\{onLogout\}/);
+  assert.match(shell, /<span className="fg-menu-id-name">登录<\/span>/);
+  assert.match(shell, /<span className="fg-menu-copy">修改密码<\/span>/);
+  assert.match(shell, /<span className="fg-menu-copy">退出登录<\/span>/);
+  assert.match(shell, /account\.guest \? '登录与更多功能'/);
   assert.match(shell, /role: ROLE_LABEL\[who\.role\]/);
   assert.match(shell, /<span className="fg-menu-id-name">\{account\.name\}<\/span>/);
   assert.match(shell, /<span className="fg-menu-id-role">\{account\.role\}<\/span>/);

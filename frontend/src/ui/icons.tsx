@@ -115,6 +115,13 @@ const PATHS = {
       <polygon fill="#ffbc00" points="149.41 121.47 3.52 121.47 0 161.66 221.09 161.66 235.23 0 149.41 121.47" />
     </g>
   ),
+  /* Telegram Web 的纸飞机轮廓，简化到 16 网格；不带品牌底圆，避免在紧凑协议行里形成色块。 */
+  telegram: (
+    <>
+      <path d="M1.7 7.6 L14 2.1 L10.5 13.9 L7.4 9.9 L4.8 12 L5.3 8.9 Z" />
+      <path d="M5.3 8.9 L11 5.2 L7.4 9.9" />
+    </>
+  ),
   /* AnyTLS 使用闪电。 */
   bolt: <path d="M9.2 1.8 L3.2 8.8 H7 L6.8 14.2 L12.8 7.2 H9 Z" />,
   /* 箭头进入监听边界。 */
@@ -345,6 +352,13 @@ const PATHS = {
   close: <path d="M3.5 3.5 L12.5 12.5 M12.5 3.5 L3.5 12.5" />,
   /* 展开符：顶栏账户牌表示点击后展开菜单。 */
   chevronDown: <path d="M4.6 6.4 L8 9.8 L11.4 6.4" />,
+  /* 展开折叠段：差异里被收起的未改动行，点按向上下两侧展开。 */
+  unfold: (
+    <>
+      <path d="M5.2 6.2 L8 3.4 L10.8 6.2" />
+      <path d="M5.2 9.8 L8 12.6 L10.8 9.8" />
+    </>
+  ),
   dash: <path d="M3.8 8 H12.2" />,
   /* 在等：发布流水里表示等待确认或待补偿。与 check / close 同为结果图标，因此同样只有线稿。 */
   clock: (
@@ -392,7 +406,7 @@ export type IconName = keyof typeof PATHS;
 
 export function Icon({ of, size = 16, className }: { of: IconName; size?: number; className?: string }) {
   return (
-    <span className={className} aria-hidden="true">
+    <span className={`ui-icon${className ? ` ${className}` : ''}`} aria-hidden="true">
       <svg
         width={size}
         height={size}

@@ -38,9 +38,11 @@ test('用量与额度：读数栏沿用用量页写法，线路行不铺底色�
   );
 });
 
-test('在线接入时间线：IPv6 不截断，接入可换行，窄卡改为两行', () => {
+test('在线接入时间线：IPv6 不截断，入口默认收成摘要，窄卡重排', () => {
   assert.doesNotMatch(styles, /\.user-presence-ip > code\s*\{[^}]*(text-overflow:\s*ellipsis|white-space:\s*nowrap)/);
   assert.match(styles, /\.user-presence-access\s*\{[^}]*flex-wrap:\s*wrap;/);
+  assert.match(styles, /\.user-presence-access-toggle:focus-visible\s*\{[^}]*outline:/);
+  assert.match(styles, /\.user-presence-access\s*\{[^}]*grid-column:\s*3 \/ -1;/);
   assert.match(styles, /\.user-presence-node-link:focus-visible\s*\{[^}]*outline:/);
   assert.match(styles, /\.user-presence-more:focus-visible\s*\{[^}]*outline:/);
   assert.match(styles, /\.user-presence-sub\s*\{\s*display:\s*contents;/);

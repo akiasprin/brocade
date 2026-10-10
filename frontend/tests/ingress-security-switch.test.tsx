@@ -341,6 +341,124 @@ function NewVlessHarness() {
   );
 }
 
+function MtProtoAvailabilityHarness({
+  publicIpv4,
+  nat,
+  enabled = false,
+}: {
+  publicIpv4: string | null;
+  nat: boolean;
+  enabled?: boolean;
+}) {
+  const [client] = useState(() => {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, staleTime: Infinity },
+        mutations: { retry: false },
+      },
+    });
+    queryClient.setQueryData(['snapshot'], { snapshot: { apps: [], nodes: [] } });
+    queryClient.setQueryData(['nodes'], {
+      nodes: [
+        {
+          node_id: 'node-1',
+          public_ipv4: publicIpv4,
+          public_ipv4_nat: nat,
+        },
+      ],
+    });
+    queryClient.setQueryData(['revisions'], { current_revision: null });
+    queryClient.setQueryData(['settings'], {
+      ports: { anytls_base: 16000, hy2_base: 18000, mtproto_base: 28800 },
+      reality_site: {
+        dest: 'www.example.com:443',
+        server_names: ['www.example.com'],
+        fingerprint: 'chrome',
+      },
+    });
+    return queryClient;
+  });
+  const base = ingress('vless-reality');
+  const value: SnapshotIngress = {
+    ...base,
+    wires: {
+      ...base.wires,
+      mtproto: enabled ? { port: 28800 } : null,
+    },
+  };
+
+  return (
+    <QueryClientProvider client={client}>
+      <IngressPanel appId="app-1" ingress={value} title="协议" editable>
+        <IngressStreamRow appId="app-1" ingress={value} editable section="protocols" />
+      </IngressPanel>
+    </QueryClientProvider>
+  );
+}
+
+describe('MTProxy machine eligibility', () => {
+  it.each([
+    [null, false, '当前机器没有配置公网 IPv4，不能启用 MTProxy'],
+    ['198.51.100.10', true, '当前机器的公网 IPv4 未直接配置在网卡上，不能启用 MTProxy'],
+  ] as const)('blocks creation without a network-card public IPv4', (publicIpv4, nat, message) => {
+    const view = render(<MtProtoAvailabilityHarness publicIpv4={publicIpv4} nat={nat} />);
+    const toggle = view.getByRole('checkbox', { name: 'MTProxy（Telegram）' }) as HTMLInputElement;
+
+    expect(toggle.disabled).toBe(true);
+    expect(view.getByText(message)).toBeTruthy();
+  });
+
+  it('uses the Telegram mark and documents the outbound handshake requirement', () => {
+    const view = render(<MtProtoAvailabilityHarness publicIpv4="198.51.100.10" nat={false} />);
+    const toggle = view.getByRole('checkbox', { name: 'MTProxy（Telegram）' });
+    const card = toggle.closest('.protocol-choice');
+
+    expect(card?.querySelectorAll('.protocol-choice-icon path')).toHaveLength(2);
+    expect(card?.querySelector('.protocol-choice-icon circle')).toBeNull();
+    expect(view.getByText('Telegram MTProto 代理；出口地址参与中继握手，要求网卡直配公网 IPv4。')).toBeTruthy();
+  });
+
+  it('allows creation on a network-card public IPv4 and still lets an invalid legacy instance be disabled', () => {
+    const direct = render(<MtProtoAvailabilityHarness publicIpv4="198.51.100.10" nat={false} />);
+    expect((direct.getByRole('checkbox', { name: 'MTProxy（Telegram）' }) as HTMLInputElement).disabled).toBe(false);
+    direct.unmount();
+
+    const legacy = render(<MtProtoAvailabilityHarness publicIpv4="198.51.100.10" nat enabled />);
+    const toggle = legacy.getByRole('checkbox', { name: 'MTProxy（Telegram）' }) as HTMLInputElement;
+    expect(toggle.checked).toBe(true);
+    expect(toggle.disabled).toBe(false);
+  });
+
+  it('shows the redacted listener port in a read-only MTProxy panel', () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+    client.setQueryData(['snapshot'], { snapshot: { apps: [], nodes: [] } });
+    client.setQueryData(['nodes'], { nodes: [] });
+    client.setQueryData(['revisions'], { current_revision: null });
+    client.setQueryData(['settings'], {
+      ports: { anytls_base: 16000, hy2_base: 18000, mtproto_base: 28800 },
+      reality_site: {
+        dest: 'www.example.com:443',
+        server_names: ['www.example.com'],
+        fingerprint: 'chrome',
+      },
+    });
+    const base = ingress('vless-reality');
+    const value: SnapshotIngress = {
+      ...base,
+      wires: { ...base.wires, mtproto: { port: '***' as unknown as number } },
+    };
+    const view = render(
+      <QueryClientProvider client={client}>
+        <IngressPanel appId="app-1" ingress={value} title="MTProxy" editable={false}>
+          <IngressStreamRow appId="app-1" ingress={value} editable={false} section="mtproto" />
+        </IngressPanel>
+      </QueryClientProvider>,
+    );
+
+    expect((view.getByRole('textbox', { name: 'MTProxy 监听端口' }) as HTMLInputElement).value).toBe('***');
+  });
+});
+
 describe('接入协议面板折叠', () => {
   it('已有协议默认折叠，刚添加的协议默认展开', async () => {
     const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
@@ -908,12 +1026,23 @@ describe('AnyTLS ingress draft', () => {
 });
 
 describe('Hysteria 2 ingress form', () => {
-  it('does not offer the Salamander obfuscation secret to the browser password manager', () => {
-    const view = render(<Hy2Harness settings={{ obfs: { kind: 'salamander', password: 'obfuscation-secret' } }} />);
-    const secret = view.getByPlaceholderText('混淆密码') as HTMLInputElement;
+  it('keeps the Salamander key out of password-manager heuristics beside bandwidth fields', () => {
+    const view = render(
+      <Hy2Harness
+        settings={{
+          bandwidth: { up: '750 mbps', down: '750 mbps' },
+          obfs: { kind: 'salamander', password: 'obfuscation-secret' },
+        }}
+      />,
+    );
+    const secret = view.getByRole('textbox', { name: 'Hysteria 2 混淆密钥' }) as HTMLInputElement;
 
-    expect(secret.type).toBe('password');
+    expect(view.getAllByDisplayValue('750 mbps')).toHaveLength(2);
+    expect(secret.type).toBe('text');
     expect(secret.autocomplete).toBe('off');
+    expect(secret.getAttribute('spellcheck')).toBe('false');
+    expect(secret.classList.contains('hy2-obfs-secret')).toBe(true);
+    expect(view.container.querySelector('input[type="password"]')).toBeNull();
   });
 
   it('keeps the listener editable without a protocol suffix or reallocate action', () => {

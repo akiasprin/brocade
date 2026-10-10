@@ -121,6 +121,8 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
+#[path = "build/source_revision.rs"]
+mod source_revision;
 #[path = "build/xray.rs"]
 mod xray_build;
 
@@ -210,27 +212,26 @@ const FRONTEND_WATCHED: &[&str] = &[
 ];
 
 fn main() {
+    let workspace = workspace_root();
     // Changed agent source has to rebuild, and what must be watched is the whole dependency chain
     // `agent -> deployment -> core`, not merely its own directory. The symptom of missing one has
     // been observed: change only core with not one word of agent source altered, build.rs does not
     // re-run, the embedded bytes are still the previous agent, compilation and deployment are all
     // green, and the sha `/enroll/dist` reports disagrees with the current source. Adding a
     // dependency means adding a line here.
-    for watched in [
-        "../brocade-agent/src",
-        "../brocade-agent/Cargo.toml",
-        "../brocade-probe/src",
-        "../brocade-probe/Cargo.toml",
-        "../brocade-deployment/src",
-        "../brocade-deployment/Cargo.toml",
-        "../brocade-core/src",
-        "../brocade-core/Cargo.toml",
-        "../../Cargo.lock",
-    ] {
-        println!("cargo:rerun-if-changed={watched}");
+    for watched in source_revision::AGENT_SOURCE_PATHS {
+        println!(
+            "cargo:rerun-if-changed={}",
+            workspace.join(watched).display()
+        );
     }
+    // Resolution can change the bytes even though it does not choose the human-facing source
+    // revision. The resulting artifact digest remains authoritative in that case.
+    println!(
+        "cargo:rerun-if-changed={}",
+        workspace.join("Cargo.lock").display()
+    );
 
-    let workspace = workspace_root();
     let xray_source = workspace.join(XRAY_SOURCE_DIR);
     // Keep repository metadata out of Xray's bytes. The executable sha256 is its release identity;
     // putting the workspace HEAD in the banner would make a README or front-end commit produce a
@@ -239,7 +240,7 @@ fn main() {
     let xray_build_id = XRAY_UPSTREAM_BUILD.to_owned();
     watch_tree(&xray_source);
 
-    describe_build();
+    describe_build(&workspace);
     println!("cargo:rustc-env=BROCADE_EMBEDDED_XRAY_VERSION={XRAY_VERSION}");
     println!("cargo:rustc-env=BROCADE_EMBEDDED_XRAY_BUILD_ID={xray_build_id}");
 
@@ -755,32 +756,29 @@ fn sha256(data: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// What a person can read about the agents this build carries: the version somebody maintains, and
-/// the commit it came from.
+/// Human-readable provenance for the Console and the embedded source trees it carries.
 ///
-/// # Why this is not compiled into the agent
+/// # Why these revisions are not compiled into the payloads
 ///
-/// It would be the obvious place, and it is the wrong one. Baking a commit id into the agent makes
-/// the commit part of the bytes, so every commit — including one that only touches documentation —
-/// produces a different agent sha, a different release id, and a fleet-wide upgrade that changes
-/// no behaviour. It would also cost the reproducibility this file goes out of its way to preserve
-/// elsewhere (see the `current_dir` passage): an operator building the same source could no longer
-/// arrive at the same sha unless they were on the same commit with the same dirty state.
+/// Baking a commit id into Agent or Xray makes metadata part of the bytes. Every commit could then
+/// produce a different artifact sha and release id even when the component's behaviour did not
+/// change. It would also cost the reproducibility this file goes out of its way to preserve
+/// elsewhere: an operator building the same component source could no longer arrive at the same
+/// sha unless they were on the same repository commit with the same dirty state.
 ///
 /// So the identity of the *bytes* stays the sha256 of the bytes, and this rides alongside as
-/// metadata about the control plane that serves them. The console records it when somebody
-/// releases, which is the moment the pairing matters.
-fn describe_build() {
-    // Every crate inherits `[workspace.package].version`, so the console's own version is also the
-    // agent's — one number, maintained in one manifest. An earlier revision of this function
-    // parsed the agent's `Cargo.toml` to read it separately, which was machinery for keeping two
-    // numbers in sync that are now the same number.
+/// metadata beside the artifacts. The Console records it when somebody releases, which is the
+/// moment the pairing matters.
+fn describe_build(workspace: &Path) {
+    // The package version remains useful for the Console itself. Agent releases use their own
+    // source revision below, so a Console/frontend/docs commit cannot masquerade as a new Agent.
     println!("cargo:rerun-if-changed=../../Cargo.toml");
 
     // Absent git, or built from a tarball, this is simply unknown — not a build failure. The sha256
     // is what identifies the artifact; this is here to be read.
     let commit = Command::new("git")
         .args(["rev-parse", "--short=7", "HEAD"])
+        .current_dir(workspace)
         .output()
         .ok()
         .filter(|out| out.status.success())
@@ -788,6 +786,7 @@ fn describe_build() {
         .filter(|id| !id.is_empty());
     let dirty = Command::new("git")
         .args(["status", "--porcelain"])
+        .current_dir(workspace)
         .output()
         .ok()
         .filter(|out| out.status.success())
@@ -800,7 +799,15 @@ fn describe_build() {
         (Some(id), false) => id,
         (None, _) => "unknown".to_owned(),
     };
-    println!("cargo:rustc-env=BROCADE_AGENT_COMMIT={described}");
+    println!("cargo:rustc-env=BROCADE_CONSOLE_COMMIT={described}");
+    println!(
+        "cargo:rustc-env=BROCADE_AGENT_SOURCE_REVISION={}",
+        source_revision::agent_source_revision(workspace)
+    );
+    println!(
+        "cargo:rustc-env=BROCADE_XRAY_SOURCE_REVISION={}",
+        source_revision::xray_source_revision(workspace)
+    );
 
     // Without this the commit is frozen at whatever it was the first time this ran. `.git/HEAD`
     // covers checkouts and commits on a branch; the ref file covers committing without moving HEAD.
@@ -972,13 +979,54 @@ fn embed_console(out_dir: &Path, npm: Option<&Path>) {
         );
     }
 
-    let mut code = String::from(
-        "// 由 brocade-console/build.rs 生成，别手改（改了下次构建也会被覆盖）。\n\
-         pub static CONSOLE_ASSETS: &[ConsoleAsset] = &[\n",
-    );
+    // The browser needs an identity for the complete UI it is currently running. Hash every
+    // route and its bytes, rather than a package version or git revision: public assets can change
+    // without changing index.html, and two builds of identical inputs should still agree. Length
+    // prefixes make the stream unambiguous (`ab` + `c` cannot collide structurally with `a` +
+    // `bc`). `files` is sorted above, so filesystem enumeration order cannot change the result.
+    let mut version_hasher = Sha256::new();
     for (route, path) in &files {
         let bytes = fs::read(path)
             .unwrap_or_else(|error| panic!("读不了前端产物 {}: {error}", path.display()));
+        version_hasher.update((route.len() as u64).to_be_bytes());
+        version_hasher.update(route.as_bytes());
+        version_hasher.update((bytes.len() as u64).to_be_bytes());
+        version_hasher.update(&bytes);
+    }
+    let asset_version = format!("{:x}", version_hasher.finalize());
+
+    // Do not edit an operator-supplied BROCADE_CONSOLE_ASSETS_DIR in place. The injected copy is
+    // private to this Cargo build and is the exact HTML embedded below. A Vite development server
+    // therefore has no marker and deliberately disables production update polling; otherwise a
+    // local UI proxied to production would forever believe it was stale.
+    let index_source = files
+        .iter()
+        .find_map(|(route, path)| (route == "/index.html").then_some(path))
+        .expect("前面已经验证 index.html 存在");
+    let index_html = fs::read_to_string(index_source)
+        .unwrap_or_else(|error| panic!("index.html 不是 UTF-8 或读不了：{error}"));
+    let marker = format!("<meta name=\"brocade-ui-version\" content=\"{asset_version}\" />");
+    let versioned_index = index_html.replacen("<head>", &format!("<head>{marker}"), 1);
+    if versioned_index == index_html {
+        panic!("index.html 没有 <head>，无法注入前端版本标记");
+    }
+    let versioned_index_path = out_dir.join("console-index.html");
+    fs::write(&versioned_index_path, versioned_index).expect("写不进带版本标记的 index.html");
+
+    let mut code = format!(
+        "// 由 brocade-console/build.rs 生成，别手改（改了下次构建也会被覆盖）。\n\
+         pub const CONSOLE_ASSET_VERSION: &str = {:?};\n\
+         pub static CONSOLE_ASSETS: &[ConsoleAsset] = &[\n",
+        asset_version,
+    );
+    for (route, path) in &files {
+        let embedded_path = if route == "/index.html" {
+            &versioned_index_path
+        } else {
+            path
+        };
+        let bytes = fs::read(embedded_path)
+            .unwrap_or_else(|error| panic!("读不了前端产物 {}: {error}", embedded_path.display()));
         // Compressed at build time rather than per request: these bytes never change for the life
         // of the binary, so compressing them once at the highest level is strictly better than
         // compressing them again for every visitor at a level chosen to be cheap.
@@ -1006,7 +1054,7 @@ fn embed_console(out_dir: &Path, npm: Option<&Path>) {
              }},\n",
             route,
             content_type(route),
-            path_str(path),
+            path_str(embedded_path),
         ));
     }
     code.push_str("];\n");

@@ -12,6 +12,7 @@ import {
 import { Empty, ErrorBox } from '../ui/bits';
 import { PanelLoading } from '../ui/loading';
 import { BINARY_RELEASE_STATUS, BINARY_TARGET_STATUS, BINARY_VERIFICATION } from '../ui/binary-release-status';
+import { binaryReleaseVersion } from '../ui/binary-release-version';
 import { useNodeNames } from '../ui/node-name';
 import { stamp } from './deploy-cockpit';
 
@@ -71,7 +72,8 @@ export function BinaryReleaseHistory({ component, latestId }: { component: Binar
                       onClick={() => setSelected(current => (current === item.id ? null : item.id))}
                     >
                       <span>
-                        <b>#{item.id}</b> · {item.version} <span className="mono">{item.build_id.slice(0, 8)}</span>
+                        <b>#{item.id}</b> · {binaryReleaseVersion(component, item.version)}{' '}
+                        <span className="mono">{item.build_id.slice(0, 8)}</span>
                       </span>
                       <span>
                         {BINARY_RELEASE_STATUS[item.status]} · {item.succeeded_count} / {item.target_count} 台

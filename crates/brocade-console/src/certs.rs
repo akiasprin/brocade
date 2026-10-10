@@ -16,11 +16,14 @@
 //! while the console shows nothing wrong, so every outcome lands in `node_certificates` — status,
 //! attempt count and the CA's own words — and the console reads it from there.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use brocade_store::{
-    CertificateOrder, CertificateSigningMethod, IssuedCertificate, PgStore, SELF_SIGNED_DIRECTORY,
+    CertificateOrder, CertificateScanCounts, CertificateScanPhase, CertificateScanTrigger,
+    CertificateSigningMethod, ClaimedCertificateScan, IssuedCertificate, PgStore,
+    SELF_SIGNED_DIRECTORY,
 };
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose,
@@ -31,10 +34,12 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 use crate::acme::{self, AccountKey};
 use crate::dns::Cloudflare;
 
-/// How often the fleet is scanned. Renewal happens 30 days before expiry, so the scan being
+/// How often the fleet is scanned. Renewal normally happens 60 days before expiry, so the scan being
 /// hourly rather than by the minute costs nothing; what it buys is that a control plane restarting
 /// in a loop cannot become a source of ACME traffic.
 const SCAN_INTERVAL: Duration = Duration::from_secs(3600);
+const SCHEDULER_TICK: Duration = Duration::from_secs(1);
+const LEASE_REFRESH: Duration = Duration::from_secs(5);
 
 /// How long a failed node waits before being tried again.
 ///
@@ -116,9 +121,21 @@ fn generate_self_signed(names: Vec<String>) -> Result<SelfSignedCertificate, Str
 async fn issue_self_signed(
     store: &PgStore,
     order: &CertificateOrder,
+    claim: &ClaimedCertificateScan,
+    counts: CertificateScanCounts,
+    subject: &str,
 ) -> Result<IssueOutcome, String> {
     let started = std::time::Instant::now();
     let certificate = generate_self_signed(order.names())?;
+    report_progress(
+        store,
+        claim,
+        CertificateScanPhase::Storing,
+        counts,
+        Some(&order.certificate_id),
+        Some(subject),
+    )
+    .await;
     let stored = store
         .record_certificate(IssuedCertificate {
             certificate_id: &order.certificate_id,
@@ -138,73 +155,115 @@ async fn issue_self_signed(
     }
 }
 
-/// Runs one pass over everything that is due. Returns how many succeeded and how many failed.
-#[derive(Debug, serde::Serialize)]
-pub struct IssuanceResult {
-    pub issued: usize,
-    pub failed: usize,
+#[derive(Debug)]
+struct IssuanceResult {
+    issued: usize,
+    failed: usize,
 }
 
-pub async fn scan_once(store: &PgStore) -> (usize, usize) {
-    let Ok(Some(_lock)) = store.try_certificate_scan_lock().await else {
-        return (0, 0);
-    };
-    match process_pending(store, None, RETRY_AFTER_MINUTES).await {
-        Ok(result) => (result.issued, result.failed),
-        Err(error) => {
-            eprintln!("证书：{error}");
-            (0, 0)
-        }
+async fn report_progress(
+    store: &PgStore,
+    claim: &ClaimedCertificateScan,
+    phase: CertificateScanPhase,
+    counts: CertificateScanCounts,
+    certificate_id: Option<&str>,
+    subject: Option<&str>,
+) {
+    match store
+        .update_certificate_scan_progress(claim, phase, counts, certificate_id, subject)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => eprintln!("证书任务 {}：进度写入被 fencing 拒绝", claim.run.id),
+        Err(error) => eprintln!("证书任务 {}：进度写不下来：{error}", claim.run.id),
     }
 }
 
-/// Caller holds the cross-replica issuance lock. Manual requests use zero retry delay and
-/// keep the response open until issuance finishes, so the UI reports an actual outcome.
-pub async fn process_pending(
+/// Runs one durable pass over everything due. The retry floor applies to automatic and manual
+/// runs alike; saving corrected settings explicitly clears unfinished rows' backoff.
+async fn process_pending(
     store: &PgStore,
-    group_id: Option<&str>,
-    retry_after_minutes: i32,
+    claim: &ClaimedCertificateScan,
 ) -> Result<IssuanceResult, String> {
-    // A domain with no credential cannot issue, and rows created against it would show up in the
-    // console as pending forever with no explanation. Skipped entirely instead — unless it signs
-    // its own, which needs no credential and would otherwise be the one setting that silently
-    // never produces a certificate.
+    // Domains are loaded before the due list so cleanup also runs when nothing needs issuance.
+    // A missing public-CA credential remains in the due list once: `issue` records an actionable
+    // failure on its certificate row and the retry floor prevents a tight loop.
     let domains = store
         .cert_domains()
         .await
         .map_err(|error| error.to_string())?;
-    // Before the "nothing to issue" exit below, deliberately. A fleet whose certificates are all
-    // current is exactly when nothing is due — and also exactly when a machine may have changed
-    // address with nobody watching. Reconciling after that early return would mean DNS is only
-    // ever fixed in the same pass as an issuance, which is once every sixty days.
-    if group_id.is_none() {
-        reconcile_dns(store, &domains).await;
-    }
+    // Before the "nothing to issue" exit below, deliberately. Challenge records can survive a
+    // process interruption, and older consoles also kept unnecessary A records for certificate
+    // SNI names. A full scan removes only records carrying Brocade's exact ownership comments.
+    cleanup_dns(store, &domains).await;
 
     let due = store
-        .certificates_due(retry_after_minutes)
+        .certificates_due(RETRY_AFTER_MINUTES)
         .await
         .map_err(|error| error.to_string())?;
+    let total = due.len();
     let mut issued = 0;
     let mut failed = 0;
+    let mut processed = 0;
+    report_progress(
+        store,
+        claim,
+        CertificateScanPhase::Preparing,
+        CertificateScanCounts {
+            total,
+            processed,
+            issued,
+            failed,
+        },
+        None,
+        None,
+    )
+    .await;
     for order in due {
-        if group_id.is_some_and(|id| id != order.label_id) {
-            continue;
-        }
         // Named by the group, not by a machine: one order covers every machine drawing from it,
         // and saying "hk-01 已签发" when five machines share the certificate would be wrong four
         // times over.
         let what = format!("{}.{}", order.label, order.domain);
         let cert_id = order.certificate_id.clone();
+        let counts = CertificateScanCounts {
+            total,
+            processed,
+            issued,
+            failed,
+        };
+        report_progress(
+            store,
+            claim,
+            CertificateScanPhase::Preparing,
+            counts,
+            Some(&cert_id),
+            Some(&what),
+        )
+        .await;
         // Stamped before the CA is asked anything, so that a process which dies partway through
         // one — or is restarted during one — still looks like it tried. Written afterwards only,
         // the backoff never applied to the case that needs it most.
         if let Err(error) = store.record_certificate_attempt(&cert_id).await {
             eprintln!("证书：{what} 记不下这次尝试，跳过这一轮：{error}");
             failed += 1;
+            processed += 1;
+            report_progress(
+                store,
+                claim,
+                CertificateScanPhase::Preparing,
+                CertificateScanCounts {
+                    total,
+                    processed,
+                    issued,
+                    failed,
+                },
+                None,
+                None,
+            )
+            .await;
             continue;
         }
-        match issue(store, &order).await {
+        match issue(store, &order, claim, counts, &what).await {
             Ok(IssueOutcome::Stored(seconds)) => {
                 issued += 1;
                 eprintln!("证书：{what} 已签发，用时 {seconds:.0}s");
@@ -223,29 +282,29 @@ pub async fn process_pending(
                 eprintln!("证书：{what} 签发失败：{error}");
             }
         }
+        processed += 1;
+        report_progress(
+            store,
+            claim,
+            CertificateScanPhase::Preparing,
+            CertificateScanCounts {
+                total,
+                processed,
+                issued,
+                failed,
+            },
+            None,
+            None,
+        )
+        .await;
     }
     Ok(IssuanceResult { issued, failed })
 }
 
-/// Points every issued name at the machine it belongs to.
-///
-/// Separate from issuance and run every scan, because the two go out of date for different
-/// reasons: a certificate expires on a schedule, while a name stops resolving the moment a machine
-/// changes address — and nothing announces that. Reconciling here means a rebuilt node fixes its
-/// own DNS on the next pass, which is the same bargain the rest of the system makes.
-///
-/// Without the record the certificate is valid and unreachable: a client dialing a TLS ingress
-/// resolves this name, and there is nothing else to resolve it to.
-async fn reconcile_dns(store: &PgStore, domains: &[brocade_store::CertDomain]) {
-    let targets = match store.certificate_dns_targets().await {
-        Ok(targets) if !targets.is_empty() => targets,
-        Ok(_) => return,
-        Err(error) => {
-            eprintln!("证书：读不出要对账的 DNS 记录：{error}");
-            return;
-        }
-    };
-
+/// Removes DNS state owned by Brocade but no longer needed. ACME TXT records are temporary proof;
+/// certificate names are carried as SNI while clients dial the configured IP directly, so the A
+/// records maintained by older consoles have no consumer either.
+async fn cleanup_dns(store: &PgStore, domains: &[brocade_store::CertDomain]) {
     for domain in domains.iter().filter(|domain| {
         domain.signing_method == CertificateSigningMethod::PublicCa && domain.has_credential
     }) {
@@ -264,25 +323,34 @@ async fn reconcile_dns(store: &PgStore, domains: &[brocade_store::CertDomain]) {
                 continue;
             }
         };
-        for target in targets
-            .iter()
-            .filter(|target| target.name.ends_with(&format!(".{}", domain.domain)))
-        {
-            match dns.ensure_a(&target.name, &target.ipv4).await {
-                // Silence is the point: this runs hourly and says something only when it acted.
-                Ok(None) => {}
-                Ok(Some(what)) => eprintln!("证书：DNS {what}"),
-                Err(error) => eprintln!("证书：{} 的 A 记录写不了：{error}", target.name),
+        match dns.cleanup_managed_records().await {
+            Ok(cleanup) => {
+                if cleanup.legacy_address_records > 0 || cleanup.challenge_records > 0 {
+                    eprintln!(
+                        "证书：{} 清掉长期 A 记录 {} 条、遗留挑战 TXT {} 条",
+                        domain.domain, cleanup.legacy_address_records, cleanup.challenge_records
+                    );
+                }
+                for failure in cleanup.failures {
+                    eprintln!("证书：DNS 遗留记录清理失败：{failure}");
+                }
             }
+            Err(error) => eprintln!("证书：{} 的 DNS 遗留记录查不了：{error}", domain.domain),
         }
     }
 }
 
 /// One order, start to finish. The error is a sentence meant for the console, not a type — every
 /// caller does the same thing with it, which is show it to a person.
-async fn issue(store: &PgStore, order: &CertificateOrder) -> Result<IssueOutcome, String> {
+async fn issue(
+    store: &PgStore,
+    order: &CertificateOrder,
+    claim: &ClaimedCertificateScan,
+    counts: CertificateScanCounts,
+    subject: &str,
+) -> Result<IssueOutcome, String> {
     if order.acme_directory == SELF_SIGNED_DIRECTORY {
-        return issue_self_signed(store, order).await;
+        return issue_self_signed(store, order, claim, counts, subject).await;
     }
     let started = std::time::Instant::now();
 
@@ -333,6 +401,15 @@ async fn issue(store: &PgStore, order: &CertificateOrder) -> Result<IssueOutcome
     // finalize; publishing records nobody will look at can only fail.
     let mut published = Vec::new();
     if !challenges.is_empty() {
+        report_progress(
+            store,
+            claim,
+            CertificateScanPhase::Dns,
+            counts,
+            Some(&order.certificate_id),
+            Some(subject),
+        )
+        .await;
         let name = challenges[0].name.clone();
         let mut values = Vec::new();
         for challenge in &challenges {
@@ -358,6 +435,15 @@ async fn issue(store: &PgStore, order: &CertificateOrder) -> Result<IssueOutcome
             ),
         }
 
+        report_progress(
+            store,
+            claim,
+            CertificateScanPhase::Validating,
+            counts,
+            Some(&order.certificate_id),
+            Some(subject),
+        )
+        .await;
         for challenge in &challenges {
             if let Err(error) = session.validate(challenge).await {
                 retract(&dns, &published).await;
@@ -366,12 +452,30 @@ async fn issue(store: &PgStore, order: &CertificateOrder) -> Result<IssueOutcome
         }
     }
 
+    report_progress(
+        store,
+        claim,
+        CertificateScanPhase::Finalizing,
+        counts,
+        Some(&order.certificate_id),
+        Some(subject),
+    )
+    .await;
     let result = session.finalize(&acme_order, &names).await;
     // Before the result is inspected: the records have done their job either way, and leaving them
     // behind on the failure path is exactly how the leftovers this code sweeps came to exist.
     retract(&dns, &published).await;
     let issued = result.map_err(|error| error.to_string())?;
 
+    report_progress(
+        store,
+        claim,
+        CertificateScanPhase::Storing,
+        counts,
+        Some(&order.certificate_id),
+        Some(subject),
+    )
+    .await;
     let stored = store
         .record_certificate(IssuedCertificate {
             certificate_id: &order.certificate_id,
@@ -396,44 +500,127 @@ async fn issue(store: &PgStore, order: &CertificateOrder) -> Result<IssueOutcome
 /// what the caller is reporting, and "the certificate was issued but a TXT record could not be
 /// deleted" must not read as a failed issuance.
 async fn retract(dns: &Cloudflare, records: &[crate::dns::PublishedRecord]) {
-    for record in records {
+    let mut deleted = HashSet::new();
+    for record in records
+        .iter()
+        .filter(|record| record.delete_after_use && deleted.insert(record.id.as_str()))
+    {
         if let Err(error) = dns.delete(&record.id).await {
             eprintln!(
-                "证书：{} 的挑战记录没删掉（{error}）——下次签发前会被扫掉",
+                "证书：{} 的挑战记录没删掉（{error}）——后台扫描会按 Brocade 标记重试清理",
                 record.name
             );
         }
     }
 }
 
-/// Starts the scan loop. Returns a handle the HTTP layer can use to ask for a scan now, which is
-/// what the console's "retry" button is: the same pass, not a second code path.
+async fn execute_claim(store: &PgStore, claim: &ClaimedCertificateScan) {
+    let work = process_pending(store, claim);
+    tokio::pin!(work);
+    let mut refresh =
+        tokio::time::interval_at(tokio::time::Instant::now() + LEASE_REFRESH, LEASE_REFRESH);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let outcome = loop {
+        tokio::select! {
+            result = &mut work => break result,
+            _ = refresh.tick() => {
+                match store.renew_certificate_scan_lease(claim).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        eprintln!("证书任务 {}：lease 已被其他执行器接管，停止本轮", claim.run.id);
+                        return;
+                    }
+                    Err(error) => {
+                        // Continuing after an uncertain heartbeat can overlap the executor that
+                        // reclaims this row. Dropping the issuing future is the safe side; the row
+                        // remains recoverable after its existing lease expires.
+                        eprintln!("证书任务 {}：lease 续租失败，停止并等待恢复：{error}", claim.run.id);
+                        return;
+                    }
+                }
+            }
+        }
+    };
+
+    let error = outcome.as_ref().err().map(String::as_str);
+    match store.complete_certificate_scan(claim, error).await {
+        Ok(true) => {}
+        Ok(false) => eprintln!("证书任务 {}：完成写入被 fencing 拒绝", claim.run.id),
+        Err(write) => eprintln!("证书任务 {}：完成状态写不下来：{write}", claim.run.id),
+    }
+    match outcome {
+        Ok(result) if result.issued > 0 || result.failed > 0 => eprintln!(
+            "证书：任务 {} 完成，签发 {} 张，失败 {} 张",
+            claim.run.id, result.issued, result.failed
+        ),
+        Ok(_) => {}
+        Err(error) => eprintln!("证书：任务 {} 失败：{error}", claim.run.id),
+    }
+}
+
+async fn run_next(store: &PgStore, owner: &str) {
+    // Keep the existing transaction-scoped fleet lock around the whole external workflow. The
+    // durable row makes work recoverable and visible; this lock still excludes mutations that
+    // require a stable certificate set while the worker is talking to the CA.
+    let lock = match store.try_certificate_scan_lock().await {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("证书任务：全局锁取不到：{error}");
+            return;
+        }
+    };
+    let claim = match store.claim_certificate_scan(owner).await {
+        Ok(Some(claim)) => claim,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("证书任务：领取失败：{error}");
+            return;
+        }
+    };
+    execute_claim(store, &claim).await;
+    drop(lock);
+}
+
+/// Starts the durable scan scheduler. HTTP handlers only enqueue and wake it; no request owns an
+/// ACME operation, so closing a tab or a proxy timeout cannot cancel issuance.
 pub fn spawn(store: PgStore) -> Arc<tokio::sync::Notify> {
     let wake = Arc::new(tokio::sync::Notify::new());
     let signal = wake.clone();
     tokio::spawn(async move {
+        if let Err(error) = store
+            .enqueue_certificate_scan(CertificateScanTrigger::Startup)
+            .await
+        {
+            eprintln!("证书任务：启动扫描入队失败：{error}");
+        }
+        let owner = format!("console-{}", std::process::id());
+        let mut poll = tokio::time::interval(SCHEDULER_TICK);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut hourly =
+            tokio::time::interval_at(tokio::time::Instant::now() + SCAN_INTERVAL, SCAN_INTERVAL);
+        hourly.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut prune_ticks = 0_u32;
         loop {
-            // Scanning first and sleeping after, rather than the other way round. A restart is
-            // not a quiet moment for this: it is what follows enrolling a machine, changing the
-            // CA, or fixing a credential — exactly the states with work waiting. Sleeping first
-            // made all of those read as "I changed the setting and nothing happened" for an hour,
-            // and the only thing that ever broke the silence was somebody pressing retry.
-            //
-            // Safe to run on every start because being due is a property of the row: a
-            // certificate that was just issued is not due again, and one that just failed is held
-            // off by `RETRY_AFTER_MINUTES`. A restart loop therefore cannot spend the CA's rate
-            // limit — provided the attempt is stamped before the CA is asked, which is why
-            // `scan_once` does that first.
-            let (issued, failed) = scan_once(&store).await;
-            if issued > 0 || failed > 0 {
-                eprintln!("证书：这一轮签发 {issued} 张，失败 {failed} 张");
-            }
-            // Both triggers, and the timer is the one that matters: the button only ever makes
-            // something happen sooner.
             tokio::select! {
-                _ = tokio::time::sleep(SCAN_INTERVAL) => {}
+                _ = poll.tick() => {}
                 _ = signal.notified() => {}
+                _ = hourly.tick() => {
+                    if let Err(error) = store
+                        .enqueue_certificate_scan(CertificateScanTrigger::Scheduled)
+                        .await
+                    {
+                        eprintln!("证书任务：定时扫描入队失败：{error}");
+                    }
+                    prune_ticks = prune_ticks.wrapping_add(1);
+                    if prune_ticks.is_multiple_of(24) {
+                        if let Err(error) = store.prune_certificate_scans().await {
+                            eprintln!("证书任务：历史清理失败：{error}");
+                        }
+                    }
+                }
             }
+            run_next(&store, &owner).await;
         }
     });
     wake

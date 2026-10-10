@@ -312,6 +312,11 @@ pub enum XrayInbound {
         sniff: bool,
         settings: AnyTls,
     },
+    MtProto {
+        tag: String,
+        listen: String,
+        port: u16,
+    },
     /// A security-only public front. dokodemo-door preserves the decrypted byte stream and sends
     /// it to the loopback XHTTP inbound where VLESS identity, routing and accounting live.
     Dokodemo {
@@ -1236,6 +1241,11 @@ fn ingress_inbound(
             security: ingress_security(ingress, policy, certificate_track),
             sniff: ingress.sniff,
             settings: settings.clone(),
+        },
+        IngressProtocol::MtProto => XrayInbound::MtProto {
+            tag: ingress.tag.clone(),
+            listen: ingress.listen.to_string(),
+            port: ingress.port,
         },
     }
 }

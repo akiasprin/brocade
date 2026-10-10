@@ -62,6 +62,9 @@ export function occupiedPorts(
       if (ingress.wires.anytls) {
         put(ingress.node, ingress.wires.anytls.port, `线路 ${app.id} 的接入面 ${ingress.id} AnyTLS`);
       }
+      if (ingress.wires.mtproto) {
+        put(ingress.node, ingress.wires.mtproto.port, `线路 ${app.id} 的接入面 ${ingress.id} MTProxy`);
+      }
     }
     if (protocol === 'tcp') {
       for (const step of app.steps ?? []) {

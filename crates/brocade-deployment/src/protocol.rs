@@ -1969,6 +1969,8 @@ pub enum OnlineSourceProtocol {
     #[serde(rename = "anytls")]
     AnyTls,
     Hysteria2,
+    #[serde(rename = "mtproto", alias = "mt_proto")]
+    MtProto,
     #[serde(other)]
     Unknown,
 }
@@ -3185,11 +3187,12 @@ mod tests {
             OnlineSourceProtocol::Vless,
             OnlineSourceProtocol::AnyTls,
             OnlineSourceProtocol::Hysteria2,
+            OnlineSourceProtocol::MtProto,
         ]);
         let mut value = serde_json::to_value(source).unwrap();
         assert_eq!(
             value["protocols"],
-            serde_json::json!(["vless", "anytls", "hysteria2"])
+            serde_json::json!(["vless", "anytls", "hysteria2", "mtproto"])
         );
         #[derive(Deserialize)]
         struct LegacySource {
@@ -3199,6 +3202,13 @@ mod tests {
         let decoded: LegacySource = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(decoded.ip, "1.1.1.1");
         assert_eq!(decoded.last_seen_unix_secs, 1);
+        value["protocols"] = serde_json::json!(["mt_proto"]);
+        assert_eq!(
+            serde_json::from_value::<OnlineSource>(value.clone())
+                .unwrap()
+                .protocols,
+            Some(vec![OnlineSourceProtocol::MtProto])
+        );
         value["protocols"] = serde_json::json!(["future-protocol"]);
         assert_eq!(
             serde_json::from_value::<OnlineSource>(value)

@@ -51,6 +51,43 @@ sha256sum /opt/brocade/brocade-console
 
 ## 数据库兼容
 
+### 持久证书签发任务
+
+证书扫描从进程内任务改为数据库持久队列和带代次的租约；新安装的默认续签提前量由
+30 天改为 60 天，已有证书域显式保存的值不变。旧库缺少 `certificate_scan_runs` 时，
+新 Console 无法安全启动证书扫描，因此 Console 发布前必须先完成兼容。
+
+1. 停止所有 Console 写入者，完成数据库备份和隔离恢复演练。
+2. 从目标 `0001_init.sql` 提取 `BEGIN/END CERTIFICATE SCAN SCHEMA` 区块到已核验文件。
+3. 以应用角色运行：
+
+   ```sh
+   psql -X -v ON_ERROR_STOP=1 -d brocade \
+     -v app_role=brocade \
+     -v certificate_scan_schema_file=/verified/certificate-scan-schema.sql \
+     -f scripts/compat-certificate-scan.sql
+   ```
+
+脚本在单事务内把 `cert_domains.renew_before_days` 的列默认值改为 60，并创建持久任务表、
+约束和索引；不会改写已有域的续签提前量，也故意拒绝重复或部分执行。执行后逐项核对
+列、identity 序列、约束、索引、默认值和所有权与目标 `0001` 一致。确认本次 `0001` 的
+所有其它差异也已兼容后，才更新 `_sqlx_migrations` version 1 的 SHA-384；不要仅为消除
+checksum 报错而直接更新。完成转换后，旧 Console 不再是安全回滚目标，除非先恢复旧库。
+
+### Telegram MTProxy 入站
+
+MTProxy 在 `control_state` 增加默认 `28800` 的 TCP 起始端口，在 `ingresses` 增加可空
+`mtproto_port`，并把 `mtproto` 加入在线来源协议约束。已有行的接入协议、端口和来源历史
+保持不变；现有控制行取得 `28800`。部署前停止所有 Console 写入者并完成数据库备份，
+随后以应用角色运行 `scripts/compat-mtproxy.sql`。脚本故意不允许重复执行，也不修改
+`_sqlx_migrations` checksum。
+
+执行后核对新增列类型、默认值、非空属性和七个受影响约束与目标 `0001` 一致，确认
+`control_state.port_mtproto_base = 28800`、已有 `ingresses.mtproto_port` 全为 NULL，并确认
+没有活动配置或二进制发布，才按目标文件更新 version 1 的 SQLx SHA-384。旧 Console
+会忽略新增列；回滚旧二进制前必须把 checksum 恢复为旧值。Console 部署不会自动发布
+Agent/Xray；启用 MTProxy 配置前需另走二进制发布流程，使目标机器具备对应能力。
+
 ### 通知中心一键清空
 
 仅修改 `0001_init.sql`：在 `admin_operators` 增加默认 0 的
@@ -221,8 +258,8 @@ DO $$ BEGIN
         ALTER TABLE user_online_sources ADD CONSTRAINT user_online_sources_protocols_shape
         CHECK (
             protocols IS NULL OR CASE WHEN jsonb_typeof(protocols) = 'array' THEN
-                jsonb_array_length(protocols) BETWEEN 1 AND 4
-                AND protocols <@ '["vless", "anytls", "hysteria2", "unknown"]'::jsonb
+                jsonb_array_length(protocols) BETWEEN 1 AND 5
+                AND protocols <@ '["vless", "anytls", "hysteria2", "mtproto", "unknown"]'::jsonb
             ELSE FALSE END
         ) NOT VALID;
     END IF;
@@ -419,8 +456,8 @@ ALTER TABLE machine_events VALIDATE CONSTRAINT machine_events_shape;
 `_sqlx_migrations` 中 `0001` 的 checksum 更新为目标二进制所内嵌迁移的 SHA-384。
 Console 启动时根据 `BROCADE_NOTIFICATION_WEBHOOK_URL` 收敛通道状态：未配置时把遗留的
 `pending`/`delivering` 行标记为 `suppressed`，后续机器事件不再积压外部投递；已配置时只
-投递启用后的新事件，不复活已抑制历史。持续 CPU steal 使用 `>=10%` 六十秒开启、
-`<=5%` 九十秒恢复；Webhook envelope 升为 schema v2，并为事件增加结构化指标字段。
+投递启用后的新事件，不复活已抑制历史。持续 CPU steal 使用 `>=80%` 六十秒开启、
+`<80%` 九十秒恢复；Webhook envelope 升为 schema v2，并为事件增加结构化指标字段。
 回滚旧 Console 时保留兼容列、状态表和事件，并先恢复旧 checksum；旧版本会忽略
 `suppressed` 行以及新的 steal 事件。
 

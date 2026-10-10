@@ -1191,7 +1191,7 @@ export function ChainWizard({
               <div className="wzp" aria-label="接入协议">
                 <WizardProtocolTile
                   name="VLESS · REALITY"
-                  note="REALITY 侧重抗识别与抗封锁。"
+                  note="TCP / XHTTP 入站；使用 REALITY 保护传输。"
                   icon="xray"
                   enabled={vlessEnabled}
                   onToggle={setVlessEnabled}
@@ -1267,7 +1267,7 @@ export function ChainWizard({
                 />
                 <WizardProtocolTile
                   name="VLESS · Encryption"
-                  note="仅加密数据流，不提供 HTTPS 伪装，适合无封锁网络。"
+                  note="TCP 入站；使用 VLESS 原生加密，不叠加 TLS 或 REALITY。"
                   icon="xray"
                   enabled={encryptionEnabled}
                   onToggle={setEncryptionEnabled}
@@ -1305,7 +1305,7 @@ export function ChainWizard({
                 />
                 <WizardProtocolTile
                   name="AnyTLS"
-                  note="基于 TLS 加密，通过 Padding 填充缓解流量特征识别，通过连接复用减少 TLS 握手开销。"
+                  note="TCP 入站；支持 TLS / REALITY、Padding 与连接复用。"
                   icon="bolt"
                   enabled={anyTlsEnabled}
                   onToggle={setAnyTlsEnabled}
@@ -1353,7 +1353,7 @@ export function ChainWizard({
                 <WizardProtocolTile
                   name="Hysteria 2"
                   portRange
-                  note="适合高延迟、丢包网络，依赖 UDP 可用；UDP 被封锁时无法连接。"
+                  note="QUIC / UDP 入站；面向高延迟、丢包链路，要求 UDP 可达。"
                   icon="hysteria"
                   enabled={hy2Enabled}
                   onToggle={setHy2Enabled}

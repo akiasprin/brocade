@@ -50,6 +50,17 @@ const uriText = [
 ].join('\n');
 
 const selfSignedLink = `hysteria2://u@tyo-n.example:443?sni=tyo-n.example&insecure=1#${named(`${JP}东京 NTT | QUIC`)}`;
+const MO = '\u{1F1F2}\u{1F1F4}';
+const hoppingHy2Text = [
+  `hysteria2://u@192.0.2.44:50000-50009/?sni=hy2.example#${named(`${MO}澳门示例节点 | QUIC`)}`,
+  `hysteria2://u@[2001:db8:44::1]:50000-50009/?sni=hy2.example#${named(`${MO}澳门示例节点 | QUIC | v6`)}`,
+  '',
+].join('\n');
+const mtproxyText = [
+  `# @brocade-name=${named(`${JP}东京 IIJ | MTProxy`)}`,
+  'tg://proxy?server=tyo.example&port=15443&secret=dd00112233445566778899aabbccddeeff',
+  '',
+].join('\n');
 
 const jsonResponse = (body: unknown) =>
   ({
@@ -130,21 +141,53 @@ describe('node link listing', () => {
   it('treats the empty-listing placeholder as an empty list rather than a note', () => {
     expect(parseNodeListing('# （这个用户没有能用纯 URI 表达的接入面）\n')).toEqual({ links: [], notes: [] });
   });
+
+  it('parses Hysteria 2 port-hopping endpoints without WHATWG URL rejecting the port range', () => {
+    const listing = parseNodeListing(hoppingHy2Text);
+    expect(listing.links.map(link => [link.family, link.endpoint, link.stack])).toEqual([
+      ['ipv4', '192.0.2.44:50000-50009', 'QUIC'],
+      ['ipv6', '[2001:db8:44::1]:50000-50009', 'QUIC'],
+    ]);
+
+    const [group] = groupNodeLinks(listing.links);
+    expect(group).toMatchObject({ name: '澳门示例节点', region: 'MO' });
+    expect(group.rows).toHaveLength(1);
+    expect(group.rows[0].links).toMatchObject({ ipv4: listing.links[0], ipv6: listing.links[1] });
+  });
+
+  it('parses Telegram deep links and keeps the out-of-band Brocade display name', () => {
+    const listing = parseNodeListing(mtproxyText);
+    expect(listing.notes).toEqual([]);
+    expect(listing.links).toHaveLength(1);
+    expect(listing.links[0]).toMatchObject({
+      protocol: 'mtproto',
+      family: 'ipv4',
+      endpoint: 'tyo.example:15443',
+      stack: 'Padded intermediate',
+      region: 'JP',
+      name: '东京 IIJ | MTProxy',
+      base: '东京 IIJ',
+    });
+  });
 });
 
 describe('subscription and node dialog', () => {
-  it('generates and regenerates an independent koipy URL with an explicit credential warning', async () => {
+  it('revokes without replacing the URL, and generates a new one only on a separate action', async () => {
     const replacementUrl = haitunUrl.replace('f98b74ba', 'a98b74ba');
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    let generations = 0;
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       if (init?.method === 'POST') {
         return jsonResponse({
           template: 'koipy 测速',
           status: 'active',
-          urls: urls(String(input).endsWith('/regenerate') ? replacementUrl : haitunUrl),
+          urls: urls(++generations === 1 ? haitunUrl : replacementUrl),
           created_at: '2026-08-28 12:00:00+00',
           revoked_at: null,
         });
+      }
+      if (init?.method === 'DELETE') {
+        return jsonResponse({ ...subscriptionInfo().haitun, status: 'revoked', revoked_at: '2026-10-09T00:00:00Z' });
       }
       return jsonResponse(subscriptionInfo());
     });
@@ -156,7 +199,7 @@ describe('subscription and node dialog', () => {
     expect(view.getByText(/更换用户 UUID 并发布授权/)).toBeTruthy();
     expect(view.getByText('模板 SubBoost 标准版 · 适用 Mihomo / Clash Meta')).toBeTruthy();
     fireEvent.click(view.getByRole('button', { name: '生成 koipy 测速地址' }));
-    await view.findByRole('button', { name: '重新生成 koipy 测速地址' });
+    await view.findByRole('button', { name: '撤销 koipy 测速地址' });
     expect(view.getByText('可用')).toBeTruthy();
     expect(view.queryByText(haitunUrl)).toBeNull();
     fireEvent.click(view.getByRole('button', { name: '显示 koipy 测速地址' }));
@@ -166,26 +209,32 @@ describe('subscription and node dialog', () => {
       expect.objectContaining({ method: 'POST' }),
     );
 
-    fireEvent.click(view.getByRole('button', { name: '重新生成 koipy 测速地址' }));
+    expect(view.queryByRole('button', { name: '重新生成 koipy 测速地址' })).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: '撤销 koipy 测速地址' }));
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining('已下载的 UUID 和节点配置仍然有效'));
-    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/regenerate'))).toBe(false);
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false);
     expect(view.getByText(haitunUrl)).toBeTruthy();
     confirm.mockReturnValue(true);
-    fireEvent.click(view.getByRole('button', { name: '重新生成 koipy 测速地址' }));
+    fireEvent.click(view.getByRole('button', { name: '撤销 koipy 测速地址' }));
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
-        '/users/platform.acme/alice/clash-subscription/haitun/regenerate',
-        expect.objectContaining({ method: 'POST' }),
+        '/users/platform.acme/alice/clash-subscription/haitun',
+        expect.objectContaining({ method: 'DELETE' }),
       ),
     );
     await waitFor(() => expect(view.queryByText(haitunUrl)).toBeNull());
+    await view.findByText('已撤销');
+    expect(view.queryByRole('button', { name: '显示 koipy 测速地址' })).toBeNull();
+    expect(generations).toBe(1);
+    fireEvent.click(view.getByRole('button', { name: '重新生成 koipy 测速地址' }));
+    await view.findByRole('button', { name: '撤销 koipy 测速地址' });
     expect(view.queryByText(replacementUrl)).toBeNull();
     fireEvent.click(view.getByRole('button', { name: '显示 koipy 测速地址' }));
     expect(view.getByText(replacementUrl)).toBeTruthy();
     fireEvent.click(view.getByRole('button', { name: '显示 Clash 订阅地址' }));
     expect(view.getByText(standardUrl)).toBeTruthy();
-    expect(view.queryByRole('button', { name: /撤销/ })).toBeNull();
-    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false);
+    expect(generations).toBe(2);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/regenerate'))).toBe(false);
   });
 
   it.each([false, true])('hides koipy when the server denies access (self-service: %s)', async selfService => {
@@ -209,13 +258,13 @@ describe('subscription and node dialog', () => {
     expect(view.queryByText('koipy 测速订阅')).toBeNull();
   });
 
-  it('keeps the previous address and permits retry if regeneration fails', async () => {
+  it('keeps the previous address and permits retry if revocation fails', async () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     vi.stubGlobal(
       'fetch',
       vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-        if (init?.method === 'POST')
-          return { ok: false, status: 500, json: async () => ({ error: 'regeneration failed' }) } as Response;
+        if (init?.method === 'DELETE')
+          return { ok: false, status: 500, json: async () => ({ error: 'revocation failed' }) } as Response;
         return jsonResponse({
           ...subscriptionInfo(),
           haitun: { ...subscriptionInfo().haitun, status: 'active', urls: urls(haitunUrl) },
@@ -224,30 +273,29 @@ describe('subscription and node dialog', () => {
     );
     const view = renderViewer('clash');
     fireEvent.click(await view.findByRole('button', { name: '显示 koipy 测速地址' }));
-    fireEvent.click(view.getByRole('button', { name: '重新生成 koipy 测速地址' }));
-    await view.findByText(/regeneration failed/);
+    fireEvent.click(view.getByRole('button', { name: '撤销 koipy 测速地址' }));
+    await view.findByText(/revocation failed/);
     expect(view.getByText(haitunUrl)).toBeTruthy();
-    expect((view.getByRole('button', { name: '重新生成 koipy 测速地址' }) as HTMLButtonElement).disabled).toBe(false);
+    expect((view.getByRole('button', { name: '撤销 koipy 测速地址' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it('blocks duplicate regeneration and prevents an older in-flight read from restoring the old URL', async () => {
-    const replacementUrl = haitunUrl.replace('f98b74ba', 'a98b74ba');
+  it('blocks duplicate revocation and prevents an older in-flight read from restoring the old URL', async () => {
     const info = {
       ...subscriptionInfo(),
       haitun: { ...subscriptionInfo().haitun, status: 'active', urls: urls(haitunUrl) },
     };
     let completeRead!: (response: Response) => void;
-    let completeRotation!: (response: Response) => void;
+    let completeRevocation!: (response: Response) => void;
     const oldRead = new Promise<Response>(resolve => {
       completeRead = resolve;
     });
-    const rotation = new Promise<Response>(resolve => {
-      completeRotation = resolve;
+    const revocation = new Promise<Response>(resolve => {
+      completeRevocation = resolve;
     });
     let reads = 0;
     let readSignal: AbortSignal | null | undefined;
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      if (init?.method === 'POST') return rotation;
+      if (init?.method === 'DELETE') return revocation;
       if (++reads === 1) return jsonResponse(info);
       readSignal = init?.signal;
       return oldRead;
@@ -255,19 +303,21 @@ describe('subscription and node dialog', () => {
     vi.stubGlobal('fetch', fetchMock);
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     const view = renderViewer('clash');
-    const regenerate = await view.findByRole('button', { name: '重新生成 koipy 测速地址' });
+    const revoke = await view.findByRole('button', { name: '撤销 koipy 测速地址' });
     const refreshing = view.client.refetchQueries({ queryKey: ['clash-subscription'] });
     await waitFor(() => expect(reads).toBe(2));
-    fireEvent.click(regenerate);
-    await waitFor(() => expect((regenerate as HTMLButtonElement).disabled).toBe(true));
-    fireEvent.click(regenerate);
-    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
-    completeRotation(jsonResponse({ ...info.haitun, urls: urls(replacementUrl) }));
+    fireEvent.click(revoke);
+    await waitFor(() => expect((revoke as HTMLButtonElement).disabled).toBe(true));
+    fireEvent.click(revoke);
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'DELETE')).toHaveLength(1);
+    completeRevocation(
+      jsonResponse({ ...info.haitun, status: 'revoked', urls: null, revoked_at: '2026-10-09T00:00:00Z' }),
+    );
     await waitFor(() => expect(readSignal?.aborted).toBe(true));
     completeRead(jsonResponse(info));
     await refreshing;
-    fireEvent.click(await view.findByRole('button', { name: '显示 koipy 测速地址' }));
-    expect(view.getByText(replacementUrl)).toBeTruthy();
+    await view.findByText('已撤销');
+    expect(view.queryByRole('button', { name: '显示 koipy 测速地址' })).toBeNull();
     expect(view.queryByText(haitunUrl)).toBeNull();
   });
 
@@ -391,6 +441,30 @@ describe('subscription and node dialog', () => {
 
     fireEvent.click(view.getByRole('button', { name: '改用订阅' }));
     expect(await view.findByText('Clash 订阅')).toBeTruthy();
+  });
+
+  it('shows Hysteria 2 port-hopping endpoints in both address-family columns', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input) === '/revisions?limit=50') return jsonResponse({ current_revision: 9, revisions: [] });
+        return artifact(hoppingHy2Text);
+      }),
+    );
+    const view = renderViewer('uri');
+
+    const group = await view.findByRole('region', { name: '澳门示例节点' });
+    expect(group.querySelectorAll('.node-row')).toHaveLength(1);
+    expect(view.getByRole('button', { name: '复制 澳门示例节点 | QUIC（IPv4）' }).getAttribute('title')).toBe(
+      '192.0.2.44:50000-50009 · 复制分享链接',
+    );
+    expect(view.getByRole('button', { name: '复制 澳门示例节点 | QUIC | v6（IPv6）' }).getAttribute('title')).toBe(
+      '[2001:db8:44::1]:50000-50009 · 复制分享链接',
+    );
+    expect([...group.querySelectorAll('.node-copy-port')].map(node => node.textContent)).toEqual([
+      ':50000-50009',
+      ':50000-50009',
+    ]);
   });
 
   it('lists self-signed URI entries by default and lets the operator stop listing them', async () => {

@@ -48,6 +48,7 @@ import {
   type XhttpMode,
 } from '../api';
 import { ErrorBox, Loading, SegmentedControl } from '../ui/bits';
+import { ConfigSecretInput } from '../ui/config-secret-input';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import { DialogClose, DialogLayer } from '../ui/dialog';
 import { Icon, PanelTitle } from '../ui/icons';
@@ -5033,10 +5034,8 @@ export function ExternalOutboundEditor({
                             : '密码（可选）'}
                   </span>
                   <span className="v">
-                    <input
+                    <ConfigSecretInput
                       className="f mono"
-                      type="password"
-                      autoComplete="new-password"
                       value={credential}
                       onChange={event => setCredential(event.target.value)}
                     />

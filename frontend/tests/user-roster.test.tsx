@@ -309,7 +309,7 @@ describe('user roster rows', () => {
     expect(alice.querySelector('.geo-flag')).toBeNull();
     expect(alice.querySelector('.user-row-usage')?.textContent).toBe('54.1GiB');
     expect(alice.querySelector('.user-row-quota')?.textContent).toBe('余裕');
-    expect(alice.querySelector('.user-row-quota')?.getAttribute('title')).toBe('额度 余裕');
+    expect(alice.querySelector('.user-row-quota')?.getAttribute('title')).toBe('总额度 余裕');
     expect(alice.querySelectorAll('.user-quota-ring circle')).toHaveLength(2);
     expect(alice.querySelector('.user-quota-ring.over')).toBeNull();
     expect(view.container.querySelector('.user-dcard .qta-pct')?.textContent).toBe('54%');
@@ -361,6 +361,11 @@ describe('user roster rows', () => {
     expect(recent.classList.contains('off')).toBe(true);
     expect(recent.querySelector('.user-presence-time')?.textContent).toBe('00:01');
     expect(within(recent).getByText('日本 · 教育网')).toBeTruthy();
+    const accessToggle = within(recent).getByRole('button', { name: '展开 1 个入口详情' });
+    expect(accessToggle.getAttribute('aria-expanded')).toBe('false');
+    expect(within(recent).queryByRole('button', { name: '东京测试节点' })).toBeNull();
+    fireEvent.click(accessToggle);
+    expect(accessToggle.getAttribute('aria-expanded')).toBe('true');
     expect(within(recent).getByRole('button', { name: '东京测试节点' })).toBeTruthy();
     expect(within(recent).getByText('Hysteria2')).toBeTruthy();
     expect(within(recent).getByRole('button', { name: '复制历史来源 IP 8.8.8.8' })).toBeTruthy();
@@ -468,13 +473,15 @@ describe('user roster rows', () => {
     await vi.waitFor(() => expect(readingOf(card)).toBe('在线 1 · 30 天 1 个地址'));
     expect(within(card).getByText('台湾')).toBeTruthy();
     expect(within(card).getByRole('img', { name: 'TW 地区旗' })).toBeTruthy();
+    expect(within(card).getByText('1 个入口 · 协议未知')).toBeTruthy();
+    fireEvent.click(within(card).getByRole('button', { name: '展开 1 个入口详情' }));
     fireEvent.click(within(card).getByRole('button', { name: '东京测试节点' }));
     expect(navigate).toHaveBeenCalledExactlyOnceWith('nodes', { p: 'node', id: 'n1' });
     expect(view.getByLabelText('已授权 1 个接入点')).toBeTruthy();
     expect(backgroundReadsOnly()).toBe(true);
   });
 
-  it('lists every node of a shared source IP inline and counts the address once, including IPv6', async () => {
+  it('summarizes shared source entry points and expands every node without recounting the address', async () => {
     const { view, client } = mount();
     const key = ['user-presence', 'system-admin'];
     const data = client.getQueryData<UserPresenceList>(key)!;
@@ -499,19 +506,29 @@ describe('user roster rows', () => {
     const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
     await vi.waitFor(() => expect(readingOf(card)).toBe('在线 2 · 30 天 2 个地址'));
     const shared = view.getByText('1.1.1.1').closest<HTMLElement>('.user-presence-row')!;
+    expect(within(shared).getByText('2 个入口 · 协议未知')).toBeTruthy();
+    expect(within(shared).queryByRole('button', { name: '东京测试节点' })).toBeNull();
+    const accessToggle = within(shared).getByRole('button', { name: '展开 2 个入口详情' });
+    fireEvent.click(accessToggle);
+    expect(accessToggle.getAttribute('aria-expanded')).toBe('true');
     expect(within(shared).getByRole('button', { name: '东京测试节点' })).toBeTruthy();
     expect(within(shared).getByRole('button', { name: '澳门测试节点' })).toBeTruthy();
     expect(within(shared).getAllByText('协议未知')).toHaveLength(2);
     expect(within(shared).getByText('位置未知')).toBeTruthy();
+    fireEvent.click(within(shared).getByRole('button', { name: '收起 2 个入口详情' }));
+    expect(accessToggle.getAttribute('aria-expanded')).toBe('false');
+    expect(within(shared).queryByRole('button', { name: '东京测试节点' })).toBeNull();
     const v6 = view.getByText('2001:db8::1').closest<HTMLElement>('.user-presence-row')!;
     expect(within(v6).getByText('澳门')).toBeTruthy();
   });
 
-  it('shows observed protocols inline and keeps unknown legacy observations explicit', async () => {
+  it('shows observed protocols in expanded details and keeps unknown legacy observations explicit', async () => {
     const { view, client } = mount();
     const key = ['user-presence', 'system-admin'];
     const data = client.getQueryData<UserPresenceList>(key)!;
     const row = view.getByText('1.1.1.1').closest<HTMLElement>('.user-presence-row')!;
+    expect(within(row).getByText('1 个入口 · 协议未知')).toBeTruthy();
+    fireEvent.click(within(row).getByRole('button', { name: '展开 1 个入口详情' }));
     expect(within(row).getByText('协议未知')).toBeTruthy();
     act(() =>
       client.setQueryData(key, {
@@ -562,6 +579,7 @@ describe('user roster rows', () => {
       }),
     );
     const row = view.getByText('1.1.1.1').closest<HTMLElement>('.user-presence-row')!;
+    fireEvent.click(await within(row).findByRole('button', { name: '展开 2 个入口详情' }));
     const tokyo = (await within(row).findByRole('button', { name: '东京测试节点' })).closest<HTMLElement>(
       '.user-presence-access-item',
     )!;
@@ -677,6 +695,7 @@ describe('user roster rows', () => {
     const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
     await vi.waitFor(() => expect(readingOf(card)).toBe('在线至少 1 · 30 天 1 个地址'));
     expect(within(card).getByText('当前仅收到 1 / 2 台入口节点的最新快照，在线来源可能不完整')).toBeTruthy();
+    fireEvent.click(within(card).getByRole('button', { name: '展开 1 个入口详情' }));
     expect(within(card).getByRole('button', { name: 'retired-node' })).toBeTruthy();
     expect(within(card).getByText('位置未知')).toBeTruthy();
   });

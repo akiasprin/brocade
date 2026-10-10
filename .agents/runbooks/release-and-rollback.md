@@ -64,6 +64,12 @@
 
 ### Agent 执行与验证
 
+Agent 发布页和新发布记录中的版本是最后一次修改 Agent 本地源码依赖闭包
+（`brocade-agent`、`brocade-probe`、`brocade-deployment`、`brocade-core`）的完整 Git
+提交号；只有这些路径未提交时才追加 `-dirty`。Console、前端和文档提交不会推进这个
+版本。它只供人追溯来源，不能替代 `build_id` 或每架构 SHA-256：依赖解析、工具链或
+构建配方仍可能在源码提交不变时改变字节，机器是否需要升级始终按实际摘要判断。
+
 1. 先验证 Console/Agent 协议兼容和目标 Agent 的自更新能力。
 2. 使用灰度和有界批次，观察版本、摘要、轮询、运行上报和收敛债务。
 3. 节点失联、摘要不符或协议能力不足时停止推进，不把未知状态视为成功。
@@ -80,6 +86,9 @@
 
 ### 构建身份与可复现门槛
 
+- Xray 发布页和新发布记录中的版本是最后一次修改 `components/xray-core` 的完整 Git
+  提交号；只有该目录未提交时才追加 `-dirty`。上游 banner/安装兼容版本仍单独保留，
+  Git revision 只负责追溯 Brocade fork 来源，不替代构建标识或每架构摘要。
 - 编译器精确版本只有一个来源：`components/xray-core/.go-version`。CI 和 Console 构建共用；本地版本不符直接报错，可通过 `BROCADE_GO` 指向匹配的编译器。
 - 编译配方由 `crates/brocade-console/build/xray.rs` 固定，隔离宿主机的 Go 默认参数、workspace、实验开关和 CPU 级别，关闭 VCS 和自动 PGO。Console 的 Git 提交号、前端变化不会注入 Xray 字节。
 - 依据 Go 实际选择的生产源文件、汇编、嵌入资源、依赖及标准库计算输入指纹；包含未提交/未跟踪的生产文件，不把无关文档和测试当成数据面变更。源码在构建途中变化会报错重试。

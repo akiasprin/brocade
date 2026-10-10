@@ -236,6 +236,10 @@ pub async fn user_grant_probe_plan(
                     }),
                 }),
             ),
+            // MTProxy tunnels Telegram's own DC transport rather than an arbitrary probe URL.
+            // A TCP connect would only prove that a socket is open, not that the per-user secret
+            // and MTProto handshake work, so keep it out of the end-to-end proxy probe set.
+            UserSecurityPlan::MtProto { .. } => continue,
         };
         let item_id = format!("{}:{family}:{protocol}", entry.grant_id);
         items.push(UserGrantProbeTarget {

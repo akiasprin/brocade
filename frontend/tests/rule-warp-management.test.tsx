@@ -354,6 +354,11 @@ describe('external outbound editor controls', () => {
     fireEvent.click(view.getByRole('button', { name: 'WireGuard' }));
     expect(view.getByRole('spinbutton', { name: 'WireGuard MTU' })).toBeTruthy();
     expect(view.getByRole('spinbutton', { name: 'WireGuard Keepalive' })).toBeTruthy();
+    const credential = view.getByText('本地私钥').closest('label')?.querySelector('input') ?? null;
+    expect(credential).toBeInstanceOf(HTMLInputElement);
+    expect((credential as HTMLInputElement).type).toBe('text');
+    expect((credential as HTMLInputElement).autocomplete).toBe('off');
+    expect(view.container.querySelector('input[type="password"]')).toBeNull();
   });
 
   it('does not create a draft operation when an existing outbound has no changes', () => {

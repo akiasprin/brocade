@@ -81,6 +81,7 @@ import {
 import { REALITY_FINGERPRINT_OPTIONS, realityFingerprintIsValid, realityServerNameIsValid } from '../reality';
 import { can, isVisitor, useSession } from '../session';
 import { Empty, EmptyState, ErrorBox, Loading, SegmentedControl, SegSwitch } from '../ui/bits';
+import { ConfigSecretInput } from '../ui/config-secret-input';
 import { latencyMean } from '../ui/latency';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import {
@@ -121,6 +122,7 @@ import { freePortAcross, freeSpanAcross, occupiedPorts, portClash, spanClash } f
  * 界面仍会填入旧值。 */
 const HY2_PORT_BASE = 30000;
 const ANYTLS_PORT_BASE = 14443;
+const MTPROTO_PORT_BASE = 28800;
 const DEFAULT_HOP_SPAN = 100;
 const U32_MAX = 4_294_967_295;
 
@@ -362,10 +364,11 @@ function chainAccessLabel(ingress: SnapshotIngress | null): string {
     labels.push(ingress.wires.anytls.security === 'reality' ? 'AnyTLS · REALITY' : 'AnyTLS');
   }
   if (ingress.wires.hysteria2) labels.push('HY2');
+  if (ingress.wires.mtproto) labels.push('MTProxy');
   return labels.join(' + ') || '—';
 }
 
-type IngressProtocolPanelKind = 'vless' | 'encryption' | 'anytls' | 'hy2';
+type IngressProtocolPanelKind = 'vless' | 'encryption' | 'anytls' | 'hy2' | 'mtproto';
 
 /** 折叠标题只保留辨认协议实例所需的信息；详细参数留在展开后的表单。 */
 function ingressProtocolPanelSummary(ingress: SnapshotIngress, kind: IngressProtocolPanelKind): string {
@@ -382,6 +385,10 @@ function ingressProtocolPanelSummary(ingress: SnapshotIngress, kind: IngressProt
   if (kind === 'anytls') {
     const anytls = ingress.wires.anytls;
     return anytls ? `TCP ${anytls.port} · ${anytls.security === 'reality' ? 'REALITY' : 'TLS'}` : '新协议 · 请完成配置';
+  }
+  if (kind === 'mtproto') {
+    const mtproto = ingress.wires.mtproto;
+    return mtproto ? `TCP ${mtproto.port} · Telegram` : '新协议 · 请完成配置';
   }
   const hy2 = ingress.wires.hysteria2;
   if (!hy2) return '新协议 · 请完成配置';
@@ -1568,7 +1575,7 @@ function IngressRealityLimitsRow({
  * xray 自身不拦截该组合——其配置检查会通过，但运行时所有连接都会被拒绝。 */
 type ProjectionFamily = 'v4' | 'v6';
 const PROJECTION_FAMILIES = ['v4', 'v6'] as const;
-const PROJECTION_PROTOCOLS = ['vless', 'vless_encryption', 'anytls', 'hysteria2'] as const;
+const PROJECTION_PROTOCOLS = ['vless', 'vless_encryption', 'anytls', 'hysteria2', 'mtproto'] as const;
 
 function projectionListenPort(ingress: SnapshotIngress, protocol: ProjectionProtocol): number {
   switch (protocol) {
@@ -1580,6 +1587,8 @@ function projectionListenPort(ingress: SnapshotIngress, protocol: ProjectionProt
       return ingress.wires.anytls?.port ?? ingress.port;
     case 'hysteria2':
       return ingress.wires.hysteria2?.port ?? ingress.port;
+    case 'mtproto':
+      return ingress.wires.mtproto?.port ?? ingress.port;
   }
 }
 
@@ -1632,6 +1641,8 @@ function projectionProtocolLabel(protocol: ProjectionProtocol): string {
       return 'AnyTLS';
     case 'hysteria2':
       return 'Hysteria 2';
+    case 'mtproto':
+      return 'MTProxy';
   }
 }
 
@@ -2067,10 +2078,12 @@ export function IngressStreamRow({
   vlessEnabled,
   anytlsEnabled,
   hy2Enabled,
+  mtprotoEnabled,
   onVlessEnabledChange,
   onAnyTlsEnabledChange,
   onEncryptionEnabledChange,
   onHy2EnabledChange,
+  onMtProtoEnabledChange,
   settingsReadable = true,
 }: {
   appId: string;
@@ -2082,10 +2095,12 @@ export function IngressStreamRow({
   vlessEnabled?: boolean;
   anytlsEnabled?: boolean;
   hy2Enabled?: boolean;
+  mtprotoEnabled?: boolean;
   onVlessEnabledChange?: (enabled: boolean | null) => void;
   onAnyTlsEnabledChange?: (enabled: boolean | null) => void;
   onEncryptionEnabledChange?: (enabled: boolean | null) => void;
   onHy2EnabledChange?: (enabled: boolean | null) => void;
+  onMtProtoEnabledChange?: (enabled: boolean | null) => void;
   /** Visitor roles cannot call `/settings`; editable and readonly operator views can. */
   settingsReadable?: boolean;
   /** 本次渲染的是哪一段。
@@ -2093,12 +2108,13 @@ export function IngressStreamRow({
    *  三段位于三块面板中，但状态、草稿和保存逻辑只有一份——修改一条线时需要将另一条原样带上
    *  （请求是全量覆盖），拆分为三个组件需要复制该逻辑三次。因此同一组件渲染三次，
    *  每次只渲染对应的一段。 */
-  section: 'protocols' | 'vless' | 'anytls' | 'hy2';
+  section: 'protocols' | 'vless' | 'anytls' | 'hy2' | 'mtproto';
 }) {
   const qc = useQueryClient();
   const portSettings = useQuery({ queryKey: ['settings'], queryFn: fetchSettings, enabled: settingsReadable });
   const hy2Base = portSettings.data?.ports?.hy2_base || HY2_PORT_BASE;
   const anytlsBase = portSettings.data?.ports?.anytls_base || ANYTLS_PORT_BASE;
+  const mtprotoBase = portSettings.data?.ports?.mtproto_base || MTPROTO_PORT_BASE;
   const [pendingEncryption, setPendingEncryption] = useState<boolean | null>(null);
   const encryptionOn = pendingEncryption ?? !!ingress.wires.vless_encryption;
   const certificateLabel = nodeCertificateLabel(certificateTrack);
@@ -2110,6 +2126,14 @@ export function IngressStreamRow({
     queryFn: () => fetchCompileView(streamRevisions.data!.current_revision!),
     enabled: !!streamRevisions.data?.current_revision,
   });
+  const mtprotoNode = streamNodes.data?.nodes.find(node => node.node_id === ingress.node);
+  const mtprotoUnavailable = streamNodes.isPending
+    ? '正在读取机器公网地址'
+    : !mtprotoNode?.public_ipv4
+      ? '当前机器没有配置公网 IPv4，不能启用 MTProxy'
+      : mtprotoNode.public_ipv4_nat
+        ? '当前机器的公网 IPv4 未直接配置在网卡上，不能启用 MTProxy'
+        : null;
   const tcpTaken = useMemo(
     () =>
       occupiedPorts(
@@ -2156,6 +2180,32 @@ export function IngressStreamRow({
   const anytlsOn = anytlsEnabled ?? stagedAnyTlsOn ?? !!ingress.wires.anytls;
   const [draftAnyTls, setDraftAnyTls] = useState<AnyTlsSettings | null>(null);
   const anytlsValue = draftAnyTls ?? storedAnyTls;
+  const storedMtProto = useMemo(() => {
+    if (ingress.wires.mtproto) return ingress.wires.mtproto;
+    let port = freePortAcross(tcpTaken, [ingress.node], mtprotoBase);
+    while (
+      port < 65536 &&
+      (port === ingress.port ||
+        port === ingress.wires.vless_encryption?.port ||
+        port === ingress.wires.anytls?.port ||
+        tcpTaken.get(ingress.node)?.has(port))
+    )
+      port += 1;
+    return { port };
+  }, [
+    ingress.node,
+    ingress.port,
+    ingress.wires.anytls,
+    ingress.wires.mtproto,
+    ingress.wires.vless_encryption,
+    mtprotoBase,
+    tcpTaken,
+  ]);
+  const [pendingMtProtoOn, setPendingMtProtoOn] = useState<boolean | null>(null);
+  const stagedMtProtoOn = pendingMtProtoOn === !!ingress.wires.mtproto ? null : pendingMtProtoOn;
+  const mtprotoOn = mtprotoEnabled ?? stagedMtProtoOn ?? !!ingress.wires.mtproto;
+  const [draftMtProtoPort, setDraftMtProtoPort] = useState<number | null>(null);
+  const mtprotoPort = draftMtProtoPort ?? storedMtProto.port;
   const [draftAnyTlsPadding, setDraftAnyTlsPadding] = useState<string | null>(null);
   const [forceAnyTlsPaddingCustom, setForceAnyTlsPaddingCustom] = useState(false);
   const [draftAnyTlsHeaders, setDraftAnyTlsHeaders] = useState<string | null>(null);
@@ -2270,6 +2320,7 @@ export function IngressStreamRow({
         vless,
         anytls: next.anytls ?? null,
         hysteria2: next.hysteria2 ?? null,
+        mtproto: next.mtproto === undefined ? (currentWires(ingress).mtproto ?? null) : next.mtproto,
       };
       const base = ingressUpsertBody(ingress, { wires });
       return upsertIngress(appId, base, base);
@@ -2289,15 +2340,18 @@ export function IngressStreamRow({
       setDraftAnyTlsIdleCheck(null);
       setDraftAnyTlsIdleTimeout(null);
       setDraftAnyTlsMinIdle(null);
+      setDraftMtProtoPort(null);
       await qc.invalidateQueries({ queryKey: ['snapshot'] });
       onVlessEnabledChange?.(null);
       onAnyTlsEnabledChange?.(null);
       onEncryptionEnabledChange?.(null);
       setPendingEncryption(null);
       onHy2EnabledChange?.(null);
+      onMtProtoEnabledChange?.(null);
       setDraftMode(null);
       setPendingTransport(null);
       setPendingAnyTlsOn(null);
+      setPendingMtProtoOn(null);
       qc.invalidateQueries({ queryKey: ['revisions'] });
       qc.invalidateQueries({ queryKey: ['compile'] });
     },
@@ -2312,6 +2366,7 @@ export function IngressStreamRow({
       onEncryptionEnabledChange?.(null);
       setPendingEncryption(null);
       onHy2EnabledChange?.(null);
+      onMtProtoEnabledChange?.(null);
     },
   });
 
@@ -2355,12 +2410,14 @@ export function IngressStreamRow({
 
   /* 启用或关闭一条线路。两条都关闭表示该接入面不接收任何连接，服务端的类型定义和库中的
      CHECK 约束都不允许该状态，因此在点击前拦截，而不是点击后返回错误。 */
-  const toggleWire = (wire: 'vless' | 'anytls' | 'hy2' | 'encryption', enabled: boolean) => {
-    const otherWireOn =
-      wire === 'encryption'
-        ? vlessOn || anytlsOn || hy2
-        : encryptionOn ||
-          (wire === 'vless' ? anytlsOn || hy2 : wire === 'anytls' ? vlessOn || hy2 : vlessOn || anytlsOn);
+  const toggleWire = (wire: 'vless' | 'anytls' | 'hy2' | 'encryption' | 'mtproto', enabled: boolean) => {
+    const otherWireOn = [
+      ['vless', vlessOn],
+      ['anytls', anytlsOn],
+      ['hy2', hy2],
+      ['encryption', encryptionOn],
+      ['mtproto', mtprotoOn],
+    ].some(([name, on]) => name !== wire && on);
     if (!enabled && !otherWireOn) {
       window.alert('至少要保留一种入站协议：全部关闭后，这个接入面不再接收任何流量。');
       return;
@@ -2414,6 +2471,18 @@ export function IngressStreamRow({
         anytls: enabled ? anytlsValue : null,
         hysteria2: hy2 ? hy2Value : null,
       });
+      return;
+    }
+    if (wire === 'mtproto') {
+      if (
+        !enabled &&
+        !window.confirm('关闭 MTProxy 会移除对应的 inbound，Telegram 中已保存的代理地址将失效。确定继续吗？')
+      ) {
+        return;
+      }
+      setPendingMtProtoOn(enabled);
+      onMtProtoEnabledChange?.(enabled);
+      save.mutate({ ...currentWires(ingress), mtproto: enabled ? { port: mtprotoPort } : null });
       return;
     }
     if (
@@ -2678,6 +2747,26 @@ export function IngressStreamRow({
       anytlsMinIdleText,
     ]),
   );
+  const mtprotoPortBad =
+    editable &&
+    (!Number.isInteger(mtprotoPort) ||
+      mtprotoPort < 1 ||
+      mtprotoPort > 65535 ||
+      !!portClash(tcpTaken, [ingress.node], mtprotoPort) ||
+      (vlessOn && mtprotoPort === ingress.port) ||
+      (anytlsOn && mtprotoPort === anytlsValue.port) ||
+      mtprotoPort === ingress.wires.vless_encryption?.port);
+  const mtprotoDirty = draftMtProtoPort !== null && mtprotoPort !== storedMtProto.port;
+  usePanelEntry(
+    'mtproto',
+    mtprotoDirty,
+    {
+      blocked: mtprotoPortBad,
+      apply: body => ({ ...body, wires: { ...body.wires!, mtproto: { port: mtprotoPort } } }),
+      reset: () => setDraftMtProtoPort(null),
+    },
+    mtprotoPort,
+  );
   const updateAnyTls = (patch: Partial<AnyTlsSettings>) => setDraftAnyTls({ ...anytlsValue, ...patch });
   const updateAnyTlsMasquerade = (masquerade: AnyTlsMasquerade) => updateAnyTls({ masquerade });
   const selectAnyTlsMasqueradePreset = (preset: AnyTlsMasqueradePreset) => {
@@ -2724,7 +2813,7 @@ export function IngressStreamRow({
                 <Icon of="xray" size={14} className="protocol-choice-icon" />
                 VLESS · TLS / REALITY
               </b>
-              <span className="note">REALITY 侧重抗识别与抗封锁；TLS 使用证书加密连接。</span>
+              <span className="note">TCP / XHTTP 入站；使用 TLS 或 REALITY 保护传输。</span>
             </span>
             <span className="protocol-choice-status" aria-hidden="true">
               已启用
@@ -2743,7 +2832,7 @@ export function IngressStreamRow({
                 <Icon of="xray" size={14} className="protocol-choice-icon" />
                 VLESS · Encryption
               </b>
-              <span className="note">仅加密数据流，不提供 HTTPS 伪装，适合无封锁网络。</span>
+              <span className="note">TCP 入站；使用 VLESS 原生加密，不叠加 TLS 或 REALITY。</span>
             </span>
             <span className="protocol-choice-status" aria-hidden="true">
               已启用
@@ -2762,9 +2851,7 @@ export function IngressStreamRow({
                 <Icon of="bolt" size={14} className="protocol-choice-icon" />
                 AnyTLS
               </b>
-              <span className="note">
-                基于 TLS 加密，通过 Padding 填充缓解流量特征识别，通过连接复用减少 TLS 握手开销。
-              </span>
+              <span className="note">TCP 入站；支持 TLS / REALITY、Padding 与连接复用。</span>
             </span>
             <span className="protocol-choice-status" aria-hidden="true">
               已启用
@@ -2783,7 +2870,30 @@ export function IngressStreamRow({
                 <Icon of="hysteria" size={14} className="protocol-choice-icon" />
                 Hysteria 2
               </b>
-              <span className="note">适合高延迟、丢包网络，依赖 UDP 可用；UDP 被封锁时无法连接。</span>
+              <span className="note">QUIC / UDP 入站；面向高延迟、丢包链路，要求 UDP 可达。</span>
+            </span>
+            <span className="protocol-choice-status" aria-hidden="true">
+              已启用
+            </span>
+          </label>
+          <label className={mtprotoOn ? 'protocol-choice on' : 'protocol-choice'}>
+            <input
+              type="checkbox"
+              aria-label="MTProxy（Telegram）"
+              checked={mtprotoOn}
+              disabled={
+                !editable || save.isPending || stagedMtProtoOn !== null || (!mtprotoOn && mtprotoUnavailable !== null)
+              }
+              onChange={event => toggleWire('mtproto', event.target.checked)}
+            />
+            <span className="protocol-choice-copy">
+              <b>
+                <Icon of="telegram" size={14} className="protocol-choice-icon" />
+                MTProxy
+              </b>
+              <span className={mtprotoUnavailable ? 'note bad' : 'note'}>
+                {mtprotoUnavailable ?? 'Telegram MTProto 代理；出口地址参与中继握手，要求网卡直配公网 IPv4。'}
+              </span>
             </span>
             <span className="protocol-choice-status" aria-hidden="true">
               已启用
@@ -3112,12 +3222,11 @@ export function IngressStreamRow({
                 <option value="salamander">Salamander</option>
               </select>
               {hy2Value.obfs?.kind === 'salamander' && (
-                <input
-                  className="f mono"
-                  type="password"
-                  autoComplete="off"
+                <ConfigSecretInput
+                  className="f mono hy2-obfs-secret"
+                  aria-label="Hysteria 2 混淆密钥"
                   style={{ width: 220, borderColor: hy2ObfsBad ? 'var(--err)' : undefined }}
-                  placeholder="混淆密码"
+                  placeholder="混淆密钥"
                   value={hy2Value.obfs.password}
                   disabled={!editable}
                   onChange={event => updateHy2({ obfs: { kind: 'salamander', password: event.target.value } })}
@@ -3237,6 +3346,27 @@ export function IngressStreamRow({
         {/* 段级保存：这一段的所有取值共用一份草稿，也共用一次提交，因此只需要一个按钮。
             排在段末右下角——改完往下走就是它，不必回到改动所在的那一行去找。
             没有改动时不渲染：一个常驻的灰按钮会让「能不能存」变成需要辨认的状态。 */}
+      </>
+    );
+  }
+
+  if (section === 'mtproto') {
+    if (!mtprotoOn) return null;
+    return (
+      <>
+        <dt>监听端口</dt>
+        <dd>
+          <input
+            className="f mono"
+            style={{ width: 86, borderColor: mtprotoPortBad ? 'var(--err)' : undefined }}
+            inputMode="numeric"
+            value={mtprotoPort}
+            disabled={!editable}
+            aria-label="MTProxy 监听端口"
+            onChange={event => setDraftMtProtoPort(Number(event.target.value.replace(/\D/g, '')) || 0)}
+          />
+          {mtprotoPortBad && <div className="note bad">端口必须是 1–65535，且不能与同机其他 TCP 监听冲突。</div>}
+        </dd>
       </>
     );
   }
@@ -5098,6 +5228,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   const encryptionPanel = useImmediatePanelVisibility(!!ingress?.wires.vless_encryption);
   const anyTlsPanel = useImmediatePanelVisibility(!!ingress?.wires.anytls);
   const hy2Panel = useImmediatePanelVisibility(!!ingress?.wires.hysteria2);
+  const mtprotoPanel = useImmediatePanelVisibility(!!ingress?.wires.mtproto);
   const { projHandles, projDirty, projEditing, projBlocked, registrars: projectionRegistrars } = useProjectionHandles();
   const bindDirty = pendingBind !== null && pendingBind !== ingress?.bind;
   useUnsavedChanges(bindDirty, `${c?.name || chain} 的绑定地址`);
@@ -5249,11 +5380,15 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                     >
                       {(nodes.data?.nodes ?? [])
                         .filter(n => !n.retired_at)
-                        .map(n => (
-                          <option key={n.node_id} value={n.node_id}>
-                            {nameOf(n.node_id)}
-                          </option>
-                        ))}
+                        .map(n => {
+                          const mtproxyBlocked = !!ingress.wires.mtproto && (!n.public_ipv4 || n.public_ipv4_nat);
+                          return (
+                            <option key={n.node_id} value={n.node_id} disabled={mtproxyBlocked}>
+                              {nameOf(n.node_id)}
+                              {mtproxyBlocked ? '（MTProxy 要求网卡直配公网 IPv4）' : ''}
+                            </option>
+                          );
+                        })}
                     </select>
                   ) : (
                     <span>{nameOf(ingress.node)}</span>
@@ -5398,6 +5533,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                   onAnyTlsEnabledChange={anyTlsPanel.preview}
                   onEncryptionEnabledChange={encryptionPanel.preview}
                   onHy2EnabledChange={hy2Panel.preview}
+                  onMtProtoEnabledChange={mtprotoPanel.preview}
                 />
               </ConfigPanel>
               {vlessPanel.visible && (
@@ -5484,6 +5620,28 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                     settingsReadable={settingsReadable}
                     section="hy2"
                     hy2Enabled
+                  />
+                </IngressPanel>
+              )}
+              {mtprotoPanel.visible && (
+                <IngressPanel
+                  key="mtproto"
+                  appId={app}
+                  ingress={ingress}
+                  title="MTProxy"
+                  editable={editable}
+                  panelRef={mtprotoPanel.panelRef}
+                  collapsible
+                  initiallyExpanded={mtprotoPanel.newlyAdded}
+                  summary={ingressProtocolPanelSummary(ingress, 'mtproto')}
+                >
+                  <IngressStreamRow
+                    appId={app}
+                    ingress={ingress}
+                    editable={editable}
+                    settingsReadable={settingsReadable}
+                    section="mtproto"
+                    mtprotoEnabled
                   />
                 </IngressPanel>
               )}

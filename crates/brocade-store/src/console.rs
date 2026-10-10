@@ -2341,6 +2341,7 @@ pub(crate) async fn upsert_ingress_tx(
             request.projection.hysteria2,
             "Hysteria 2 projection",
         )?,
+        mtproto: normalized_protocol_projection(request.projection.mtproto, "MTProxy projection")?,
     };
     // The site default must be read inside the transaction: during a batch commit an earlier
     // operation may have just changed the global REALITY site, reading from the pool would take
@@ -2370,7 +2371,11 @@ pub(crate) async fn upsert_ingress_tx(
     actor.require_tenant_access(&chain_tenant, "ingress")?;
     validate_model_id("ingress", &id)?;
     validate_model_id_pair(&id, &chain_id)?;
-    ensure_node_exists_tx(tx, &node_id).await?;
+    if request.wires.mtproto.is_some() {
+        ensure_mtproxy_node_eligible_tx(tx, &node_id).await?;
+    } else {
+        ensure_node_exists_tx(tx, &node_id).await?;
+    }
     // Front target ownership is client configuration and can only be changed by the atomic Front
     // API. A machine ingress edit must retain the value which is current when this transaction
     // holds the model lock; otherwise an older browser draft can rewind an immediately saved
@@ -2484,6 +2489,9 @@ pub(crate) async fn upsert_ingress_tx(
             .validate()
             .map_err(|message| StoreError::InvalidData(message.to_owned()))?;
     }
+    if let Some(mtproto) = request.wires.mtproto {
+        ensure_nonzero_port(mtproto.port, "MTProxy port")?;
+    }
     let encryption_keypair = encryption.map(|_| generate_reality_keypair()).transpose()?;
     let anytls_short_ids = anytls
         .map(|_| generate_reality_short_id().map(|short_id| json!([short_id])))
@@ -2539,7 +2547,7 @@ pub(crate) async fn upsert_ingress_tx(
             anytls_reality_private_key, anytls_reality_public_key,
             anytls_reality_short_ids,
             vless_encryption_port, vless_encryption_private_key, vless_encryption_public_key, vless_encryption_options,
-            protocol_projection
+            protocol_projection, mtproto_port
          ) VALUES (
             $1, $2, $3, $4, $5::inet, $6, $7,
             $8, $9, $10,
@@ -2557,7 +2565,7 @@ pub(crate) async fn upsert_ingress_tx(
             $45, $46, $47, $48,
             $49, $50, $51,
             $52, $53, $54, $55, $56, $57, $58, $59, $60,
-            $61, $62, $63, $64, $65, $66, $67, $68
+            $61, $62, $63, $64, $65, $66, $67, $68, $69
          )
          ON CONFLICT (id) DO UPDATE SET
             chain_id = EXCLUDED.chain_id,
@@ -2588,6 +2596,7 @@ pub(crate) async fn upsert_ingress_tx(
             projection_v6_host = EXCLUDED.projection_v6_host,
             projection_v6_port = EXCLUDED.projection_v6_port,
             protocol_projection = EXCLUDED.protocol_projection,
+            mtproto_port = EXCLUDED.mtproto_port,
             guard_no_private = EXCLUDED.guard_no_private,
             guard_no_bittorrent = EXCLUDED.guard_no_bittorrent,
             guard_no_mail = EXCLUDED.guard_no_mail,
@@ -2689,6 +2698,7 @@ pub(crate) async fn upsert_ingress_tx(
             OR ingresses.vless_encryption_port IS DISTINCT FROM EXCLUDED.vless_encryption_port
             OR ingresses.vless_encryption_options IS DISTINCT FROM EXCLUDED.vless_encryption_options
             OR ingresses.protocol_projection IS DISTINCT FROM EXCLUDED.protocol_projection
+            OR ingresses.mtproto_port IS DISTINCT FROM EXCLUDED.mtproto_port
             OR (EXCLUDED.vless_encryption_port IS NOT NULL AND ingresses.vless_encryption_private_key IS NULL)
             OR (EXCLUDED.anytls_enabled AND ingresses.anytls_reality_private_key IS NULL)
          RETURNING reality_private_key,
@@ -2782,6 +2792,7 @@ pub(crate) async fn upsert_ingress_tx(
     .bind(encryption_keypair.as_ref().map(|keypair| &keypair.public_key))
     .bind(serde_json::to_value(encryption.map(|settings| settings.options.clone()).unwrap_or_default())?)
     .bind(serde_json::to_value(&projection)?)
+    .bind(request.wires.mtproto.map(|settings| i32::from(settings.port)))
     .fetch_optional(&mut **tx)
     .await?;
     let client_changed = sqlx::query(
@@ -2963,6 +2974,7 @@ pub(crate) async fn upsert_ingress_tx(
             }),
             anytls: response_anytls,
             hysteria2: request.wires.hysteria2.clone(),
+            mtproto: request.wires.mtproto,
         })
         .map_err(|error| StoreError::InvalidData(error.to_owned()))?,
     };
@@ -3881,6 +3893,41 @@ pub(crate) async fn ensure_node_exists_tx(
         .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))
 }
 
+async fn ensure_mtproxy_node_eligible_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT public_ipv4, public_ipv4_nat
+         FROM nodes
+         WHERE id = $1",
+    )
+    .bind(node_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+    let public_ipv4: Option<String> = row.try_get("public_ipv4")?;
+    let public_ipv4_nat: bool = row.try_get("public_ipv4_nat")?;
+    validate_mtproxy_node_eligibility(public_ipv4.as_deref(), public_ipv4_nat)
+}
+
+fn validate_mtproxy_node_eligibility(
+    public_ipv4: Option<&str>,
+    public_ipv4_nat: bool,
+) -> Result<()> {
+    if public_ipv4.is_none_or(|address| address.trim().is_empty()) {
+        return Err(StoreError::InvalidData(
+            "MTProxy 只允许创建在公网 IPv4 直接配置于网卡的机器上".to_owned(),
+        ));
+    }
+    if public_ipv4_nat {
+        return Err(StoreError::InvalidData(
+            "MTProxy 不允许创建在公网 IPv4 标记为 NAT 的机器上".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 async fn ensure_user_exists_tx(
     tx: &mut Transaction<'_, Postgres>,
     tenant_id: &str,
@@ -4622,5 +4669,13 @@ mod model_id_tests {
         assert!(validate_external_outbound_id("vpngate-jp", "vpngate").is_err());
         assert!(validate_external_outbound_id("warp-platform", "warp").is_err());
         assert!(validate_external_outbound_id("vpngate-8f3a-2d71", "wireguard").is_err());
+    }
+
+    #[test]
+    fn mtproxy_accepts_only_a_direct_public_ipv4_node() {
+        assert!(validate_mtproxy_node_eligibility(Some("198.51.100.10"), false).is_ok());
+        assert!(validate_mtproxy_node_eligibility(None, false).is_err());
+        assert!(validate_mtproxy_node_eligibility(Some("  "), false).is_err());
+        assert!(validate_mtproxy_node_eligibility(Some("198.51.100.10"), true).is_err());
     }
 }

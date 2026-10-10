@@ -168,8 +168,7 @@ const MAX_SAMPLES_PER_REPORT: usize = 60;
 /// Guard against a single report claiming the whole fleet's hops.
 const MAX_HOPS_PER_REPORT: usize = 512;
 
-const CPU_STEAL_OPEN_PCT: f32 = 10.0;
-const CPU_STEAL_RECOVERY_PCT: f32 = 5.0;
+const CPU_STEAL_ALERT_PCT: f32 = 80.0;
 const CPU_STEAL_OPEN_SECS: i64 = 60;
 const CPU_STEAL_RECOVERY_SECS: i64 = 90;
 const CPU_STEAL_OPEN_OBSERVATIONS: i32 = 2;
@@ -506,7 +505,7 @@ async fn advance_cpu_steal_state(
                 started_at,
                 value,
                 peak_value,
-                CPU_STEAL_OPEN_PCT,
+                CPU_STEAL_ALERT_PCT,
             ),
             CpuStealTransition::Recovered {
                 started_at,
@@ -519,7 +518,7 @@ async fn advance_cpu_steal_state(
                 started_at,
                 value,
                 peak_value,
-                CPU_STEAL_RECOVERY_PCT,
+                CPU_STEAL_ALERT_PCT,
             ),
         };
     insert_machine_event(
@@ -577,7 +576,7 @@ fn advance_cpu_steal(
         peak_pct: observation.value,
     };
     let Some(current) = current else {
-        return if observation.value >= CPU_STEAL_OPEN_PCT {
+        return if observation.value >= CPU_STEAL_ALERT_PCT {
             (candidate(), None)
         } else {
             (normal(), None)
@@ -588,11 +587,11 @@ fn advance_cpu_steal(
     }
     let contiguous = observation.window_start.abs_diff(current.last_window_end)
         <= CPU_STEAL_CONTIGUITY_TOLERANCE_SECS as u64;
-    let high = observation.value >= CPU_STEAL_OPEN_PCT;
+    let high = observation.value >= CPU_STEAL_ALERT_PCT;
     // A high value remains useful evidence even when collection was delayed. A low value from a
     // gap window cannot prove recovery: reboot, clock regression and scheduling delay share the
     // same `has_gap` bit today.
-    let recovery_low = observation.value <= CPU_STEAL_RECOVERY_PCT && !observation.has_gap;
+    let recovery_low = observation.value < CPU_STEAL_ALERT_PCT && !observation.has_gap;
 
     match current.status {
         CpuStealStatus::Normal => {
@@ -2448,64 +2447,71 @@ mod tests {
     }
 
     #[test]
+    fn cpu_steal_below_eighty_percent_stays_normal() {
+        let (normal, event) = advance_cpu_steal(None, steal_observation(0, 79.9));
+        assert_eq!(normal.status, CpuStealStatus::Normal);
+        assert!(event.is_none());
+    }
+
+    #[test]
     fn cpu_steal_opens_once_after_two_contiguous_high_windows() {
-        let (candidate, first) = advance_cpu_steal(None, steal_observation(0, 40.0));
+        let (candidate, first) = advance_cpu_steal(None, steal_observation(0, 82.0));
         assert_eq!(candidate.status, CpuStealStatus::Candidate);
         assert!(first.is_none());
 
-        let (duplicate, event) = advance_cpu_steal(Some(candidate), steal_observation(0, 40.0));
+        let (duplicate, event) = advance_cpu_steal(Some(candidate), steal_observation(0, 82.0));
         assert_eq!(duplicate, candidate);
         assert!(event.is_none());
 
-        let (active, event) = advance_cpu_steal(Some(candidate), steal_observation(30, 55.0));
+        let (active, event) = advance_cpu_steal(Some(candidate), steal_observation(30, 85.0));
         assert_eq!(active.status, CpuStealStatus::Active);
         assert_eq!(active.active_started_at, Some(0));
-        assert_eq!(active.peak_pct, 55.0);
+        assert_eq!(active.peak_pct, 85.0);
         assert_eq!(
             event,
             Some(CpuStealTransition::Started {
                 started_at: 0,
-                value: 55.0,
-                peak_value: 55.0,
+                value: 85.0,
+                peak_value: 85.0,
             })
         );
 
-        let (still_active, repeated) = advance_cpu_steal(Some(active), steal_observation(60, 20.0));
+        let (still_active, repeated) = advance_cpu_steal(Some(active), steal_observation(60, 80.0));
         assert_eq!(still_active.status, CpuStealStatus::Active);
         assert!(repeated.is_none());
     }
 
     #[test]
     fn cpu_steal_requires_three_valid_low_windows_to_recover() {
-        let (candidate, _) = advance_cpu_steal(None, steal_observation(0, 40.0));
-        let (active, _) = advance_cpu_steal(Some(candidate), steal_observation(30, 50.0));
+        let (candidate, _) = advance_cpu_steal(None, steal_observation(0, 82.0));
+        let (active, _) = advance_cpu_steal(Some(candidate), steal_observation(30, 85.0));
 
-        let mut gap_low = steal_observation(60, 0.0);
+        let mut gap_low = steal_observation(60, 79.0);
         gap_low.has_gap = true;
         let (active, event) = advance_cpu_steal(Some(active), gap_low);
         assert_eq!(active.status, CpuStealStatus::Active);
         assert!(event.is_none());
 
-        let (recovering, _) = advance_cpu_steal(Some(active), steal_observation(90, 4.0));
+        let (recovering, _) = advance_cpu_steal(Some(active), steal_observation(90, 79.0));
         assert_eq!(recovering.status, CpuStealStatus::Recovering);
-        let (recovering, _) = advance_cpu_steal(Some(recovering), steal_observation(120, 3.0));
+        let (recovering, _) = advance_cpu_steal(Some(recovering), steal_observation(120, 78.0));
         assert_eq!(recovering.status, CpuStealStatus::Recovering);
-        let (normal, event) = advance_cpu_steal(Some(recovering), steal_observation(150, 2.0));
+        let (normal, event) = advance_cpu_steal(Some(recovering), steal_observation(150, 77.0));
         assert_eq!(normal.status, CpuStealStatus::Normal);
         assert_eq!(
             event,
             Some(CpuStealTransition::Recovered {
                 started_at: 0,
-                value: 2.0,
-                peak_value: 50.0,
+                value: 77.0,
+                peak_value: 85.0,
             })
         );
     }
 
     #[test]
     fn cpu_steal_streaks_restart_after_missing_windows() {
-        let (candidate, _) = advance_cpu_steal(None, steal_observation(0, 20.0));
-        let (candidate, event) = advance_cpu_steal(Some(candidate), steal_observation(90, 30.0));
+        let (candidate, _) = advance_cpu_steal(None, steal_observation(0, 82.0));
+        let (candidate, event) = advance_cpu_steal(Some(candidate), steal_observation(90, 83.0));
         assert_eq!(candidate.status, CpuStealStatus::Candidate);
         assert_eq!(candidate.transition_started_at, Some(90));
         assert_eq!(candidate.transition_observations, 1);

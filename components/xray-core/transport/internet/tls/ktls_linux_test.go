@@ -16,9 +16,9 @@ import (
 	"unsafe"
 
 	utls "github.com/refraction-networking/utls"
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
-	"golang.org/x/sys/unix"
 )
 
 func TestKernelTLSCryptoInfoABI(t *testing.T) {
@@ -40,23 +40,7 @@ func TestKernelTLSCryptoInfoABI(t *testing.T) {
 	}
 }
 
-func TestKernelTLSRecordTypeControlMessage(t *testing.T) {
-	oob := make([]byte, unix.CmsgSpace(1))
-	header := (*unix.Cmsghdr)(unsafe.Pointer(&oob[0]))
-	header.Level = unix.SOL_TLS
-	header.Type = kernelTLSGetRecordType
-	header.SetLen(unix.CmsgLen(1))
-	oob[unix.CmsgLen(0)] = tlsRecordTypeAlert
-	recordType, err := kernelTLSRecordType(oob)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if recordType != tlsRecordTypeAlert {
-		t.Fatalf("record type = %d, want %d", recordType, tlsRecordTypeAlert)
-	}
-}
-
-func TestKernelTLSLoopbackAESGCM(t *testing.T) {
+func TestKernelTLSTXLoopbackAESGCM(t *testing.T) {
 	tests := []struct {
 		name        string
 		cipherSuite uint16
@@ -66,7 +50,7 @@ func TestKernelTLSLoopbackAESGCM(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			testKernelTLSLoopback(t, test.cipherSuite)
+			testKernelTLSTXLoopback(t, test.cipherSuite)
 		})
 	}
 }
@@ -208,7 +192,7 @@ func testKernelTLSSessionResumption(t *testing.T, ticketPadding int) {
 	}
 }
 
-func testKernelTLSLoopback(t *testing.T, cipherSuite uint16) {
+func testKernelTLSTXLoopback(t *testing.T, cipherSuite uint16) {
 	t.Setenv(platform.UseAnyTLSKernelTLS, "auto")
 	certificate, _ := cert.MustGenerate(nil,
 		cert.CommonName("localhost"),
@@ -226,6 +210,7 @@ func testKernelTLSLoopback(t *testing.T, cipherSuite uint16) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
+	requestPayload := bytes.Repeat([]byte("client payload"), 5<<10)
 
 	type result struct {
 		enabled bool
@@ -249,13 +234,41 @@ func testKernelTLSLoopback(t *testing.T, cipherSuite uint16) {
 			serverResult <- result{err: enableErr}
 			return
 		}
-		request := make([]byte, len("client payload"))
-		if _, readErr := io.ReadFull(serverConn, request); readErr != nil {
+		if enabled {
+			readConn, ok := serverConn.tlsConn().NetConn().(*kernelTLSTXReadConn)
+			if !ok || readConn.Conn != rawConn || !readConn.txEnabled.Load() {
+				_ = serverConn.Close()
+				serverResult <- result{enabled: true, err: stderrors.New("kTLS TX did not preserve the direct Go TLS read connection")}
+				return
+			}
+			if _, writeErr := readConn.Write([]byte("unexpected crypto/tls write")); !stderrors.Is(writeErr, errKernelTLSTXOwnsWrites) {
+				_ = serverConn.Close()
+				serverResult <- result{enabled: true, err: fmt.Errorf("post-promotion crypto/tls write error = %v", writeErr)}
+				return
+			}
+		}
+		request := make([]byte, len(requestPayload))
+		offset := 0
+		largestRead := int32(0)
+		for offset < len(request) {
+			multiBuffer, readErr := serverConn.ReadMultiBuffer()
+			if length := multiBuffer.Len(); length > largestRead {
+				largestRead = length
+			}
+			offset += multiBuffer.Copy(request[offset:])
+			buf.ReleaseMulti(multiBuffer)
+			if readErr != nil && offset < len(request) {
+				_ = serverConn.Close()
+				serverResult <- result{enabled: enabled, err: readErr}
+				return
+			}
+		}
+		if largestRead <= buf.Size {
 			_ = serverConn.Close()
-			serverResult <- result{enabled: enabled, err: readErr}
+			serverResult <- result{enabled: enabled, err: fmt.Errorf("largest TLS read = %d, want more than %d", largestRead, buf.Size)}
 			return
 		}
-		if string(request) != "client payload" {
+		if !bytes.Equal(request, requestPayload) {
 			_ = serverConn.Close()
 			serverResult <- result{enabled: enabled, err: stderrors.New("server received an unexpected payload")}
 			return
@@ -273,8 +286,9 @@ func testKernelTLSLoopback(t *testing.T, cipherSuite uint16) {
 		t.Fatal(err)
 	}
 	client := utls.UClient(rawClient, &utls.Config{
-		ServerName:         "localhost",
-		InsecureSkipVerify: true,
+		ServerName:                  "localhost",
+		InsecureSkipVerify:          true,
+		DynamicRecordSizingDisabled: true,
 	}, utls.HelloCustom)
 	if err := client.ApplyPreset(kernelTLSTestClientHello(cipherSuite)); err != nil {
 		t.Fatal(err)
@@ -286,7 +300,7 @@ func testKernelTLSLoopback(t *testing.T, cipherSuite uint16) {
 	if got := client.ConnectionState().CipherSuite; got != cipherSuite {
 		t.Fatalf("negotiated cipher suite = 0x%x, want 0x%x", got, cipherSuite)
 	}
-	if _, err := client.Write([]byte("client payload")); err != nil {
+	if _, err := client.Write(requestPayload); err != nil {
 		t.Fatal(err)
 	}
 	response := make([]byte, len("server payload"))

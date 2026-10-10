@@ -936,12 +936,13 @@ tune_tcp_fast_open() {
 }
 tune_tcp_fast_open || true
 
-# AnyTLS can move TLS 1.3 AES-GCM record processing into the kernel. Xray keeps kTLS in `auto`, so
-# an old or restricted kernel still works through ordinary Go TLS; the installer only makes a
-# usable module available now and after reboot. The kTLS writev path is selected by Xray without
-# host setup; the separate pipe-splice experiment stays independently switchable because its result
-# varies with the kernel and workload. Keep the module file separate from brocade.conf because
-# tune_conntrack rewrites that file on every installation.
+# AnyTLS can move TLS 1.3 AES-GCM transmit record processing into the kernel while keeping receive
+# processing on full-record Go TLS reads. Xray keeps kTLS TX in `auto`, so an old or restricted
+# kernel still works through ordinary Go TLS; the installer only makes a usable module available
+# now and after reboot. The kTLS writev path is selected by Xray without host setup; the separate
+# pipe-splice experiment stays independently switchable because its result varies with the kernel
+# and workload. Keep the module file separate from brocade.conf because tune_conntrack rewrites
+# that file on every installation.
 enable_xray_ktls() {
     if [ ! -d /sys/module/tls ]; then
         if ! have modprobe; then

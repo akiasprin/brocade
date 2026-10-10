@@ -600,7 +600,7 @@ CREATE TABLE cert_domains (
     acme_account_url TEXT,
     -- Public certificates normally last 90 days; self-signed certificates last a year. The advance window
     -- is retry time before either kind breaks, not merely a countdown for display.
-    renew_before_days INTEGER DEFAULT 30 NOT NULL,
+    renew_before_days INTEGER DEFAULT 60 NOT NULL,
     created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     CONSTRAINT cert_domains_pkey PRIMARY KEY (id),
     CONSTRAINT cert_domains_domain_key UNIQUE (domain),
@@ -728,6 +728,7 @@ CREATE TABLE control_state (
     overlay_disabled_links JSONB DEFAULT '[]'::jsonb NOT NULL,
     port_ingress_base INTEGER DEFAULT 13443 NOT NULL,
     port_anytls_base INTEGER DEFAULT 14443 NOT NULL,
+    port_mtproto_base INTEGER DEFAULT 28800 NOT NULL,
     port_vless_encryption_base INTEGER DEFAULT 13800 NOT NULL,
     port_hop_base INTEGER DEFAULT 20000 NOT NULL,
     -- First UDP port considered when allocating a Hysteria 2 ingress.
@@ -846,6 +847,7 @@ CREATE TABLE control_state (
     CONSTRAINT control_state_port_hop_base_range CHECK (((port_hop_base >= 1) AND (port_hop_base <= 65535))),
     CONSTRAINT control_state_port_hy2_base_range CHECK (((port_hy2_base >= 1) AND (port_hy2_base <= 65535))),
     CONSTRAINT control_state_port_ingress_base_range CHECK (((port_ingress_base >= 1) AND (port_ingress_base <= 65535))),
+    CONSTRAINT control_state_port_mtproto_base_range CHECK (((port_mtproto_base >= 1) AND (port_mtproto_base <= 65535))),
     CONSTRAINT control_state_port_vless_encryption_base_range CHECK (((port_vless_encryption_base >= 1) AND (port_vless_encryption_base <= 65535))),
     CONSTRAINT control_state_probe_endpoint_url_shape CHECK ((probe_endpoint_url ~ '^https?://')),
     CONSTRAINT control_state_probe_interval_range CHECK (((probe_interval_secs >= 15) AND (probe_interval_secs <= 86400))),
@@ -1848,6 +1850,10 @@ CREATE TABLE ingresses (
     anytls_reality_public_key TEXT,
     anytls_reality_short_ids JSONB,
     anytls_port INTEGER,
+    -- Telegram MTProxy is a fourth independently selectable wire. It is plain TCP at the socket
+    -- layer; each user secret is delivered through the same runtime grant channel as the other
+    -- protocols and is never stored on this row.
+    mtproto_port INTEGER,
     anytls_padding_scheme JSONB DEFAULT '[]'::jsonb NOT NULL,
     anytls_masquerade_kind TEXT DEFAULT '404' NOT NULL,
     anytls_masquerade_content TEXT DEFAULT '' NOT NULL,
@@ -2062,6 +2068,16 @@ CREATE TABLE ingresses (
     CONSTRAINT ingresses_anytls_port_distinct CHECK (
         anytls_port IS NULL OR transport_kind IS NULL OR anytls_port <> port
     ),
+    CONSTRAINT ingresses_mtproto_port_range CHECK (mtproto_port IS NULL OR mtproto_port BETWEEN 1 AND 65535),
+    CONSTRAINT ingresses_mtproto_vless_port_distinct CHECK (
+        mtproto_port IS NULL OR transport_kind IS NULL OR mtproto_port <> port
+    ),
+    CONSTRAINT ingresses_mtproto_anytls_port_distinct CHECK (
+        mtproto_port IS NULL OR anytls_port IS NULL OR mtproto_port <> anytls_port
+    ),
+    CONSTRAINT ingresses_mtproto_vless_encryption_port_distinct CHECK (
+        mtproto_port IS NULL OR vless_encryption_port IS NULL OR mtproto_port <> vless_encryption_port
+    ),
     CONSTRAINT ingresses_anytls_padding_scheme_check CHECK (jsonb_typeof(anytls_padding_scheme) = 'array'),
     CONSTRAINT ingresses_anytls_masquerade_kind_check CHECK (anytls_masquerade_kind IN ('404', 'string')),
     CONSTRAINT ingresses_anytls_masquerade_headers_check CHECK (jsonb_typeof(anytls_masquerade_headers) = 'object'),
@@ -2072,7 +2088,7 @@ CREATE TABLE ingresses (
     -- An ingress with neither wire listens on nothing and would compile to an inbound-less
     -- machine. The model makes it unrepresentable (`IngressWires` is an enum, not two Options);
     -- this is the same invariant at the layer that outlives the process.
-    CONSTRAINT ingresses_has_a_wire CHECK ((transport_kind IS NOT NULL OR anytls_enabled OR hy2_enabled OR vless_encryption_port IS NOT NULL)),
+    CONSTRAINT ingresses_has_a_wire CHECK ((transport_kind IS NOT NULL OR anytls_enabled OR hy2_enabled OR vless_encryption_port IS NOT NULL OR mtproto_port IS NOT NULL)),
     CONSTRAINT ingresses_app_id_id_key UNIQUE (app_id, id),
 
     CONSTRAINT ingresses_pkey PRIMARY KEY (id),
@@ -2498,8 +2514,8 @@ CREATE TABLE user_online_sources (
     ),
     CONSTRAINT user_online_sources_protocols_shape CHECK (
         protocols IS NULL OR CASE WHEN jsonb_typeof(protocols) = 'array' THEN
-            jsonb_array_length(protocols) BETWEEN 1 AND 4
-            AND protocols <@ '["vless", "anytls", "hysteria2", "unknown"]'::jsonb
+            jsonb_array_length(protocols) BETWEEN 1 AND 5
+            AND protocols <@ '["vless", "anytls", "hysteria2", "mtproto", "unknown"]'::jsonb
         ELSE FALSE END
     )
 );
@@ -3233,6 +3249,64 @@ CREATE UNIQUE INDEX certificates_one_runtime_slot_per_label
 
 -- Renewal scans ask "what expires soonest", never "what belongs to this group".
 CREATE INDEX certificates_expires_at_idx ON certificates (expires_at);
+
+-- BEGIN CERTIFICATE SCAN SCHEMA
+-- One durable execution record for each certificate scan. The certificate rows remain the
+-- authority for individual outcomes; this table answers the operational questions around them:
+-- whether a scan is queued/running, which stage it reached, whether its worker still owns a live
+-- lease, and how far the fleet-wide pass got before a restart.
+CREATE TABLE certificate_scan_runs (
+    id BIGINT GENERATED BY DEFAULT AS IDENTITY,
+    trigger TEXT NOT NULL,
+    status TEXT DEFAULT 'queued' NOT NULL,
+    phase TEXT DEFAULT 'queued' NOT NULL,
+    total_items INTEGER DEFAULT 0 NOT NULL,
+    processed_items INTEGER DEFAULT 0 NOT NULL,
+    issued_items INTEGER DEFAULT 0 NOT NULL,
+    failed_items INTEGER DEFAULT 0 NOT NULL,
+    current_certificate_id TEXT,
+    current_subject TEXT,
+    error_detail TEXT,
+    queued_at TIMESTAMPTZ DEFAULT now() NOT NULL,
+    started_at TIMESTAMPTZ,
+    heartbeat_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    lease_owner TEXT,
+    lease_until TIMESTAMPTZ,
+    lease_generation BIGINT DEFAULT 0 NOT NULL,
+    CONSTRAINT certificate_scan_runs_pkey PRIMARY KEY (id),
+    CONSTRAINT certificate_scan_runs_trigger_known
+        CHECK (trigger IN ('startup', 'scheduled', 'settings', 'manual')),
+    CONSTRAINT certificate_scan_runs_status_known
+        CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+    CONSTRAINT certificate_scan_runs_phase_known
+        CHECK (phase IN ('queued', 'preparing', 'dns', 'validating', 'finalizing', 'storing', 'finished')),
+    CONSTRAINT certificate_scan_runs_counts_nonnegative CHECK (
+        total_items >= 0 AND processed_items >= 0 AND issued_items >= 0 AND failed_items >= 0
+        AND processed_items <= total_items
+        AND issued_items + failed_items <= processed_items
+    ),
+    CONSTRAINT certificate_scan_runs_lease_shape CHECK (
+        (status = 'running' AND lease_owner IS NOT NULL AND lease_until IS NOT NULL
+            AND heartbeat_at IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NULL)
+        OR (status <> 'running' AND lease_owner IS NULL AND lease_until IS NULL)
+    ),
+    CONSTRAINT certificate_scan_runs_terminal_shape CHECK (
+        (status IN ('succeeded', 'failed') AND phase = 'finished' AND finished_at IS NOT NULL)
+        OR (status IN ('queued', 'running') AND phase <> 'finished' AND finished_at IS NULL)
+    )
+);
+
+-- Keep at most one executor and one follow-up. A settings save or new group created while a scan
+-- is already running must not be lost merely because that run took its due-list snapshot earlier;
+-- it occupies the queued slot. Repeated clicks then observe the same queued follow-up.
+CREATE UNIQUE INDEX certificate_scan_runs_one_queued
+    ON certificate_scan_runs ((TRUE)) WHERE status = 'queued';
+CREATE UNIQUE INDEX certificate_scan_runs_one_running
+    ON certificate_scan_runs ((TRUE)) WHERE status = 'running';
+CREATE INDEX certificate_scan_runs_claim
+    ON certificate_scan_runs (status, lease_until, queued_at, id);
+-- END CERTIFICATE SCAN SCHEMA
 
 -- Which group a machine draws its certificate from. Many machines to one group, hence no unique
 -- constraint on label_id — that absence is the feature.

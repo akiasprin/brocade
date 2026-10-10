@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 	"runtime"
 	"sync"
@@ -23,102 +22,13 @@ const (
 	kernelTLSCipherAESGCM256 = 52
 
 	kernelTLSSetTX = 1
-	kernelTLSSetRX = 2
 
 	kernelTLSSetRecordType = 1
-	kernelTLSGetRecordType = 2
 
-	tlsRecordTypeAlert           = 21
-	tlsRecordTypeHandshake       = 22
-	tlsRecordTypeApplicationData = 23
-	tlsAlertLevelWarning         = 1
-	tlsAlertCloseNotify          = 0
+	tlsRecordTypeAlert   = 21
+	tlsAlertLevelWarning = 1
+	tlsAlertCloseNotify  = 0
 )
-
-type kernelTLSConn struct {
-	net.Conn
-	raw syscall.RawConn
-}
-
-func newKernelTLSConn(conn net.Conn) net.Conn {
-	syscallConn, ok := conn.(syscall.Conn)
-	if !ok {
-		return conn
-	}
-	raw, err := syscallConn.SyscallConn()
-	if err != nil {
-		return conn
-	}
-	return &kernelTLSConn{Conn: conn, raw: raw}
-}
-
-func (c *kernelTLSConn) Read(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	var (
-		readBytes int
-		readErr   error
-	)
-	rawErr := c.raw.Read(func(fd uintptr) bool {
-		var oob [64]byte
-		n, oobn, flags, _, err := unix.Recvmsg(int(fd), p, oob[:], 0)
-		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-			return false
-		}
-		if err != nil {
-			readErr = err
-			return true
-		}
-		if flags&unix.MSG_CTRUNC != 0 {
-			readErr = fmt.Errorf("kTLS record type control message was truncated")
-			return true
-		}
-		recordType, err := kernelTLSRecordType(oob[:oobn])
-		if err != nil {
-			readErr = err
-			return true
-		}
-		switch recordType {
-		case 0, tlsRecordTypeApplicationData:
-			readBytes = n
-			if n == 0 {
-				readErr = io.EOF
-			}
-		case tlsRecordTypeAlert:
-			if n >= 2 && p[1] == tlsAlertCloseNotify {
-				readErr = io.EOF
-			} else {
-				readErr = fmt.Errorf("kTLS received TLS alert %x", p[:n])
-			}
-		case tlsRecordTypeHandshake:
-			readErr = fmt.Errorf("kTLS received unsupported post-handshake message")
-		default:
-			readErr = fmt.Errorf("kTLS received unexpected record type %d", recordType)
-		}
-		return true
-	})
-	if rawErr != nil {
-		return 0, rawErr
-	}
-	return readBytes, readErr
-}
-
-func kernelTLSRecordType(oob []byte) (byte, error) {
-	if len(oob) == 0 {
-		return 0, nil
-	}
-	messages, err := unix.ParseSocketControlMessage(oob)
-	if err != nil {
-		return 0, err
-	}
-	for _, message := range messages {
-		if message.Header.Level == unix.SOL_TLS && message.Header.Type == kernelTLSGetRecordType && len(message.Data) > 0 {
-			return message.Data[0], nil
-		}
-	}
-	return 0, nil
-}
 
 type kernelTLSCryptoInfoAESGCM128 struct {
 	Version    uint16
@@ -163,7 +73,7 @@ func preflightKernelTLS() error {
 	return fmt.Errorf("no supported AES-GCM kTLS cipher: %v", failures)
 }
 
-func installKernelTLS(conn net.Conn, material *kernelTLSKeyMaterial) (bool, error) {
+func installKernelTLSTX(conn net.Conn, material *kernelTLSTXKeyMaterial) (bool, error) {
 	probe := kernelTLSProbes[material.cipherSuite]
 	if probe == nil {
 		return false, fmt.Errorf("unsupported cipher suite 0x%x", material.cipherSuite)
@@ -174,7 +84,7 @@ func installKernelTLS(conn net.Conn, material *kernelTLSKeyMaterial) (bool, erro
 	if probe.err != nil {
 		return false, probe.err
 	}
-	return configureKernelTLSSocket(conn, material)
+	return configureKernelTLSTXSocket(conn, material)
 }
 
 func probeKernelTLSCipher(cipherSuite uint16) error {
@@ -208,22 +118,20 @@ func probeKernelTLSCipher(cipherSuite uint16) error {
 	if cipherSuite == tls.TLS_AES_256_GCM_SHA384 {
 		keyLen = 32
 	}
-	material := &kernelTLSKeyMaterial{
+	material := &kernelTLSTXKeyMaterial{
 		cipherSuite: cipherSuite,
-		txKey:       make([]byte, keyLen),
-		txIV:        make([]byte, 12),
-		rxKey:       make([]byte, keyLen),
-		rxIV:        make([]byte, 12),
+		key:         make([]byte, keyLen),
+		iv:          make([]byte, 12),
 	}
 	defer material.clear()
-	_, err = configureKernelTLSSocket(client, material)
+	_, err = configureKernelTLSTXSocket(client, material)
 	if err != nil {
 		return fmt.Errorf("kernel rejected cipher suite 0x%x: %w", cipherSuite, err)
 	}
 	return nil
 }
 
-func configureKernelTLSSocket(conn net.Conn, material *kernelTLSKeyMaterial) (bool, error) {
+func configureKernelTLSTXSocket(conn net.Conn, material *kernelTLSTXKeyMaterial) (bool, error) {
 	syscallConn, ok := conn.(syscall.Conn)
 	if !ok {
 		return false, errKernelTLSUnsupportedConn
@@ -240,10 +148,7 @@ func configureKernelTLSSocket(conn net.Conn, material *kernelTLSKeyMaterial) (bo
 			return
 		}
 		modified = true
-		if socketErr = setKernelTLSCrypto(int(fd), kernelTLSSetTX, material.cipherSuite, material.txKey, material.txIV, material.txRecordSequence); socketErr != nil {
-			return
-		}
-		socketErr = setKernelTLSCrypto(int(fd), kernelTLSSetRX, material.cipherSuite, material.rxKey, material.rxIV, material.rxRecordSequence)
+		socketErr = setKernelTLSTXCrypto(int(fd), material.cipherSuite, material.key, material.iv, material.recordSequence)
 	})
 	if err != nil {
 		return modified, err
@@ -251,7 +156,7 @@ func configureKernelTLSSocket(conn net.Conn, material *kernelTLSKeyMaterial) (bo
 	return modified, socketErr
 }
 
-func setKernelTLSCrypto(fd, direction int, cipherSuite uint16, key, iv []byte, recordSequence uint64) error {
+func setKernelTLSTXCrypto(fd int, cipherSuite uint16, key, iv []byte, recordSequence uint64) error {
 	if len(iv) != 12 {
 		return fmt.Errorf("invalid TLS 1.3 IV length %d", len(iv))
 	}
@@ -298,7 +203,7 @@ func setKernelTLSCrypto(fd, direction int, cipherSuite uint16, key, iv []byte, r
 		unix.SYS_SETSOCKOPT,
 		uintptr(fd),
 		uintptr(unix.SOL_TLS),
-		uintptr(direction),
+		uintptr(kernelTLSSetTX),
 		uintptr(pointer),
 		size,
 		0,

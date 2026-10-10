@@ -8,10 +8,10 @@ use brocade_core::{
         AnyTls, AnyTlsMasquerade, AppView, Chain, Dns, DomainStrategy, ExternalOutbound,
         ExternalOutboundProtocol, ExternalOutboundSecurity, Front, FrontStrategy, Grant, Hysteria2,
         HysteriaBandwidth, HysteriaCongestion, HysteriaMasquerade, HysteriaObfs, Ingress,
-        IngressWires, IpFamily, ModelSnapshot, Node, Projection, ProjectionDownloadEndpoint,
-        ProjectionEndpoint, ProtocolProjection, RealityFallbackMode, RealityXhttp, Tls, TlsXhttp,
-        Transport, User, WireGuardKeys, Xhttp, XhttpDownload, XhttpMode, XhttpTuning, XhttpXmux,
-        XhttpXmuxRange,
+        IngressWires, IpFamily, ModelSnapshot, MtProto, Node, Projection,
+        ProjectionDownloadEndpoint, ProjectionEndpoint, ProtocolProjection, RealityFallbackMode,
+        RealityXhttp, Tls, TlsXhttp, Transport, User, WireGuardKeys, Xhttp, XhttpDownload,
+        XhttpMode, XhttpTuning, XhttpXmux, XhttpXmuxRange,
     },
     physical::user::{project_user, SubscriptionProtocol, UserPlan},
     Level,
@@ -1390,6 +1390,41 @@ fn anytls_protocol_filter_removes_vless_entries() {
     assert!(uri_text.contains("anytls://"), "{uri_text}");
     assert!(!clash_text.contains("type: vless"), "{clash_text}");
     assert!(clash_text.contains("type: anytls"), "{clash_text}");
+}
+
+#[test]
+fn mtproxy_filter_emits_telegram_padded_link_and_not_a_fake_clash_proxy() {
+    let mut plan = plan(|face| {
+        face.wires = IngressWires::WithMtProto {
+            other: Some(Box::new(face.wires.clone())),
+            mtproto: MtProto { port: 15_443 },
+        };
+    });
+    plan.uuid = "00112233-4455-6677-8899-aabbccddeeff".to_owned();
+    for entry in &mut plan.entries {
+        entry.uuid = plan.uuid.clone();
+    }
+    plan.retain_protocol(SubscriptionProtocol::MtProto);
+    let artifact = subscription::build(&plan);
+    let uri_text = uri::subscription(&artifact);
+    let clash_text = yaml::clash_subscription(&artifact);
+
+    assert!(
+        uri_text.contains(
+            "tg://proxy?server=203.0.113.7&port=15443&secret=dd00112233445566778899aabbccddeeff"
+        ),
+        "{uri_text}"
+    );
+    assert!(uri_text.contains("# @brocade-name="), "{uri_text}");
+    assert!(!uri_text.contains("vless://"), "{uri_text}");
+    assert!(
+        !clash_text.contains("00112233445566778899aabbccddeeff"),
+        "{clash_text}"
+    );
+    assert!(
+        !clash_text.contains("name: \"香港 | MTProxy\""),
+        "{clash_text}"
+    );
 }
 
 #[test]

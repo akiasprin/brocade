@@ -8,8 +8,9 @@ use serde_json::Value;
 
 use brocade_core::model::{
     AnyTls, Chain, DestMatch, Dns, DomainStrategy, EgressDnsResolution, ExternalOutboundProtocol,
-    ExternalOutboundSecurity, Front, FrontStrategy, Grant, Hysteria2, IngressGuard, NodeConnection,
-    Projection, RealityFallbackLimits, RealityFallbackMode, Rule, User, WgTransport, Xhttp,
+    ExternalOutboundSecurity, Front, FrontStrategy, Grant, Hysteria2, IngressGuard, MtProto,
+    NodeConnection, Projection, RealityFallbackLimits, RealityFallbackMode, Rule, User,
+    WgTransport, Xhttp,
 };
 use brocade_deployment::plan::{PlanSummary, PlannedTarget};
 
@@ -764,6 +765,8 @@ pub struct WiresRequest {
     pub anytls: Option<AnyTls>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hysteria2: Option<Hysteria2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtproto: Option<MtProto>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -782,6 +785,7 @@ impl Default for WiresRequest {
             vless: Some(TransportRequest::default()),
             anytls: None,
             hysteria2: None,
+            mtproto: None,
         }
     }
 }
@@ -802,15 +806,18 @@ impl<'de> Deserialize<'de> for WiresRequest {
             anytls: Option<AnyTls>,
             #[serde(default)]
             hysteria2: Option<Hysteria2>,
+            #[serde(default)]
+            mtproto: Option<MtProto>,
         }
         let wire = Wire::deserialize(deserializer)?;
         if wire.vless.is_none()
             && wire.anytls.is_none()
             && wire.hysteria2.is_none()
             && wire.vless_encryption.is_none()
+            && wire.mtproto.is_none()
         {
             return Err(serde::de::Error::custom(
-                "接入面至少要有一条线：wires.vless、wires.vless_encryption、wires.anytls 和 wires.hysteria2 不能都空着",
+                "接入面至少要有一条线：wires.vless、wires.vless_encryption、wires.anytls、wires.hysteria2 和 wires.mtproto 不能都空着",
             ));
         }
         Ok(Self {
@@ -818,6 +825,7 @@ impl<'de> Deserialize<'de> for WiresRequest {
             vless: wire.vless,
             anytls: wire.anytls,
             hysteria2: wire.hysteria2,
+            mtproto: wire.mtproto,
         })
     }
 }

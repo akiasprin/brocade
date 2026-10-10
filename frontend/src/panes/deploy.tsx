@@ -15,6 +15,7 @@ import {
   confirmWave,
   createDeployment,
   createRollback,
+  fetchActiveDeployments,
   fetchArtifactContent,
   fetchDeployment,
   fetchDeployments,
@@ -24,6 +25,7 @@ import {
   planDeployment,
   retryTarget,
   verifyDeployment,
+  type ArtifactContent,
   type ArtifactIndexEntry,
   type DeploymentListItem,
   type DeploymentTargetDetail,
@@ -38,7 +40,16 @@ import { AgentReleaseTab, agentBadge, useAgentRelease } from './agent-release';
 import { XrayReleaseTab, useXrayRelease, xrayBadge } from './xray-release';
 import { FlagRun, ReleaseLedger, stamp } from './deploy-cockpit';
 import { entryId, useRevisionDiff } from '../forge/artifacts';
-import { artifactFile, artifactFmt, countChanges, diffLines, highlight } from '../forge/diff';
+import {
+  artifactFile,
+  artifactFmt,
+  artifactLines,
+  highlight,
+  markRange,
+  reviewDiff,
+  type ReviewDiff,
+  type ReviewRow,
+} from '../forge/diff';
 import { can, useSession } from '../session';
 import {
   Ago,
@@ -52,8 +63,10 @@ import {
   type LoadingVariant,
 } from '../ui/bits';
 import { Icon, PanelTitle, type IconName } from '../ui/icons';
-import { useNodeNames } from '../ui/node-name';
+import { useNodeCountries, useNodeNames } from '../ui/node-name';
+import { observeClockText, observeDurationText } from '../ui/observe-range';
 import { randomKey } from '../ui/platform';
+import { RegionFlag } from '../ui/region-flag';
 import { wm, type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import { navigate, returnTo } from '../forge/route';
@@ -1081,6 +1094,9 @@ function PlanPreview({
   /* picked 只在重新预览当前修订时设置：用户操作优先于从路由传入的 revision 参数 */
   const [picked, setPicked] = useState<number | undefined>(undefined);
   const [note, setNote] = useState('');
+  // 产物差异第一次展开时才挂载清单：每份变更文件要拉两个修订的内容，收起的面板不该替读者先拉完。
+  // 展开过之后保持挂载，收起再展开时选中的文件与展开的折叠段都还在。
+  const [artifactsShown, setArtifactsShown] = useState(false);
   const target = picked ?? revision ?? revisions.data?.current_revision;
   const stale = revisions.data && target !== revisions.data.current_revision;
 
@@ -1249,7 +1265,12 @@ function PlanPreview({
               <PlanTargets targets={data.targets} />
             </section>
 
-            <details className="panel config-panel cg-sec cg-disclosure cg-artifact-review">
+            <details
+              className="panel config-panel cg-sec cg-disclosure cg-artifact-review"
+              onToggle={event => {
+                if (event.currentTarget.open) setArtifactsShown(true);
+              }}
+            >
               <summary>
                 <PanelTitle of="artifacts">{baseline === target ? '运行状态产物' : '产物差异'}</PanelTitle>
                 <span className="cg-meta">{baseline == null ? '全部新建' : `R${baseline} → R${target}`}</span>
@@ -1258,7 +1279,9 @@ function PlanPreview({
                   <span>收起</span>
                 </span>
               </summary>
-              <ArtifactChanges revision={target} base={baseline} targets={actingTargets} loadingVariant="plan" />
+              {artifactsShown && (
+                <ArtifactChanges revision={target} base={baseline} targets={actingTargets} loadingVariant="plan" />
+              )}
             </details>
 
             {(create.error || abort.error) && <ErrorBox error={create.error ?? abort.error} />}
@@ -1501,6 +1524,7 @@ function PlanTargets({ targets }: { targets: PlannedTarget[] }) {
 // 产物是模型快照的纯函数，分别编译两个 revision 即可逐行比较，服务端无需额外计算。
 // 基线是 base_revision_id——同类上一次成功推送的版本，而非上一个修订：
 // 期间提交但未发布的修订不属于本次发布。
+// 与变更单详情的「产物记录」是同一种清单；每份文件的内容按需拉取，页签上的增删读数随内容到达补上。
 export function ArtifactChanges({
   revision,
   base,
@@ -1515,6 +1539,7 @@ export function ArtifactChanges({
   loadingVariant?: LoadingVariant;
 }) {
   const nameOf = useNodeNames();
+  const [foldRuleTags, setFoldRuleTags] = useState(true);
   const { list, changed, known, pending, error } = useRevisionDiff(revision, base);
 
   if (error) return <ErrorBox error={error} />;
@@ -1531,18 +1556,19 @@ export function ArtifactChanges({
   const subscriptionChanges = list.filter(a => a.target_kind === 'user' && (base == null || changed.has(entryId(a))));
   const usersWithSubscriptionChanges = [...new Set(subscriptionChanges.map(a => a.target_id))];
   const nodesWithChanges = [...new Set(nodeChanges.map(a => a.target_id))];
-  const groups: ArtifactBrowserGroup[] = [
+  const tabs = (entries: ArtifactIndexEntry[]) => entries.map(entry => ({ key: entryId(entry), item: entry }));
+  const rows: ArtifactListRow<ArtifactIndexEntry>[] = [
     ...nodesWithChanges.map(node => ({
       key: `node:${node}`,
       name: nameOf(node),
-      entries: nodeChanges.filter(entry => entry.target_id === node),
-      changeLabel: base == null ? '新建' : '变更',
+      id: node,
+      items: tabs(nodeChanges.filter(entry => entry.target_id === node)),
     })),
     ...usersWithSubscriptionChanges.map(userKey => ({
       key: `user:${userKey}`,
       name: `用户 ${userKey.split(':').at(-1)}`,
-      entries: subscriptionChanges.filter(entry => entry.target_id === userKey),
-      changeLabel: base == null ? '新建' : '变更',
+      id: userKey,
+      items: tabs(subscriptionChanges.filter(entry => entry.target_id === userKey)),
     })),
   ];
 
@@ -1569,62 +1595,162 @@ export function ArtifactChanges({
           </span>
         </div>
       )}
-      {groups.length > 0 && <RevisionArtifactBrowser groups={groups} revision={revision} base={base} />}
+      {rows.length > 0 && (
+        <ArtifactList
+          rows={rows}
+          openFirst
+          tab={entry => <RevisionFileTab entry={entry} revision={revision} base={base} foldRuleTags={foldRuleTags} />}
+          note={entry => (
+            <RevisionRuleTagNote
+              entry={entry}
+              revision={revision}
+              base={base}
+              folded={foldRuleTags}
+              onToggle={() => setFoldRuleTags(value => !value)}
+            />
+          )}
+          detail={entry => (
+            <RevisionFileDetail
+              key={`${entryId(entry)}:${foldRuleTags}`}
+              entry={entry}
+              revision={revision}
+              base={base}
+              foldRuleTags={foldRuleTags}
+            />
+          )}
+        />
+      )}
+    </>
+  );
+}
+
+/** 一份产物在本次修订与基线下的内容。查询键与产物工作区相同，切换文件、收起再展开都命中缓存。 */
+function useRevisionContents(entry: ArtifactIndexEntry, revision: number, base: number | null) {
+  const key = [entry.target_kind, entry.target_id, entry.artifact_kind] as const;
+  const here = useQuery({
+    queryKey: ['artifact', revision, ...key],
+    queryFn: () => fetchArtifactContent(...key, revision),
+  });
+  const there = useQuery({
+    queryKey: ['artifact', base, ...key],
+    queryFn: () => fetchArtifactContent(...key, base ?? undefined),
+    enabled: base != null,
+  });
+  // 首次发布没有基线，只看本次内容
+  const ready = here.data && (base == null || there.data) ? { here: here.data, there: there.data } : null;
+  return { ready, error: here.error ?? (base == null ? null : there.error) };
+}
+
+// 同一份文件的页签、行尾说明与差异区各自读一次内容；按本次内容对象缓存差异，只算一遍。
+const revisionCache = new WeakMap<
+  ArtifactContent,
+  { there: ArtifactContent | undefined; diffs: Map<boolean, ReviewDiff> }
+>();
+
+function revisionDiff(kind: string, here: ArtifactContent, there: ArtifactContent | undefined, foldRuleTags: boolean) {
+  let cached = revisionCache.get(here);
+  if (!cached || cached.there !== there) {
+    cached = { there, diffs: new Map() };
+    revisionCache.set(here, cached);
+  }
+  let diff = cached.diffs.get(foldRuleTags);
+  if (!diff) {
+    diff = reviewDiff(there?.content ?? null, here.content, kind, foldRuleTags);
+    cached.diffs.set(foldRuleTags, diff);
+  }
+  return diff;
+}
+
+/** 基线没有这份文件为新增，本次没有为停用，两边都有为修改。 */
+const revisionFileState = (here: ArtifactContent, there: ArtifactContent | undefined): RecordedFileState =>
+  (there?.content ?? null) === null ? 'new' : here.content === null ? 'off' : 'mod';
+
+function RevisionFileTab({
+  entry,
+  revision,
+  base,
+  foldRuleTags,
+}: {
+  entry: ArtifactIndexEntry;
+  revision: number;
+  base: number | null;
+  foldRuleTags: boolean;
+}) {
+  const { ready, error } = useRevisionContents(entry, revision, base);
+  const state = ready ? revisionFileState(ready.here, ready.there) : null;
+  return (
+    <>
+      <span className="nm">{artifactFile(entry.artifact_kind)}</span>
+      {error ? (
+        <span className="cga-st err">读取失败</span>
+      ) : (
+        state && state !== 'mod' && <span className={`cga-st ${state}`}>{FILE_STATE_TEXT[state]}</span>
+      )}
+      {ready && !error && (
+        <ChangeDelta {...revisionDiff(entry.artifact_kind, ready.here, ready.there, foldRuleTags).counts} />
+      )}
+    </>
+  );
+}
+
+function RevisionRuleTagNote({
+  entry,
+  revision,
+  base,
+  folded,
+  onToggle,
+}: {
+  entry: ArtifactIndexEntry;
+  revision: number;
+  base: number | null;
+  folded: boolean;
+  onToggle: () => void;
+}) {
+  const { ready } = useRevisionContents(entry, revision, base);
+  if (!ready || entry.artifact_kind !== 'xray' || revisionFileState(ready.here, ready.there) !== 'mod') return null;
+  return <RuleTagNote diff={revisionDiff('xray', ready.here, ready.there, true)} folded={folded} onToggle={onToggle} />;
+}
+
+function RevisionFileDetail({
+  entry,
+  revision,
+  base,
+  foldRuleTags,
+}: {
+  entry: ArtifactIndexEntry;
+  revision: number;
+  base: number | null;
+  foldRuleTags: boolean;
+}) {
+  const { ready, error } = useRevisionContents(entry, revision, base);
+  const [expanded, setExpanded] = useState<ReadonlySet<number>>(() => new Set());
+  if (error) return <ErrorBox error={error} />;
+  if (!ready) return <Loading variant="code" />;
+  return (
+    <>
+      <div className="fg-code cga-code">
+        <table>
+          <tbody>
+            <ReviewRows
+              diff={revisionDiff(entry.artifact_kind, ready.here, ready.there, foldRuleTags)}
+              fmt={artifactFmt(entry.artifact_kind)}
+              expanded={expanded}
+              onExpand={start => setExpanded(current => new Set(current).add(start))}
+            />
+          </tbody>
+        </table>
+      </div>
+      {(ready.here.redacted || ready.there?.redacted) && (
+        <div className="fg-afoot">
+          <span className="st st-warn">已打码</span>
+          <span className="note">私钥原文仅 system-admin 可见。</span>
+        </div>
+      )}
     </>
   );
 }
 
 type RecordedArtifact = { state?: string; sha256?: string; content?: string };
-type ArtifactBrowserGroup = {
-  key: string;
-  name: string;
-  entries: ArtifactIndexEntry[];
-  changeLabel: string;
-};
-
-function RevisionArtifactBrowser({
-  groups,
-  revision,
-  base,
-}: {
-  groups: ArtifactBrowserGroup[];
-  revision: number;
-  base: number | null;
-}) {
-  const entries = groups.flatMap(group => group.entries.map(entry => ({ group, entry })));
-  const [picked, setPicked] = useState(() => (entries[0] ? entryId(entries[0].entry) : ''));
-  const selected = entries.find(item => entryId(item.entry) === picked) ?? entries[0];
-  if (!selected) return null;
-  return (
-    <div className="cg-files">
-      <div className="cg-tree" aria-label="产物文件">
-        {groups.map(group => (
-          <div key={group.key}>
-            <div className="cg-tree-group">
-              <b>{group.name}</b>
-              <span>
-                {group.entries.length} 份{group.changeLabel}
-              </span>
-            </div>
-            {group.entries.map(entry => (
-              <button
-                className="cg-tree-file"
-                type="button"
-                key={entryId(entry)}
-                aria-current={entryId(selected.entry) === entryId(entry)}
-                onClick={() => setPicked(entryId(entry))}
-              >
-                <span className="nm">{artifactFile(entry.artifact_kind)}</span>
-                <span className="cg-fstate">{base == null ? '新增' : '修改'}</span>
-              </button>
-            ))}
-          </div>
-        ))}
-      </div>
-      <FileDiff entry={selected.entry} groupName={selected.group.name} revision={revision} base={base} />
-    </div>
-  );
-}
 
 function artifactRecord(value: unknown, key: string): RecordedArtifact | undefined {
   if (!value || typeof value !== 'object') return undefined;
@@ -1642,6 +1768,9 @@ interface RecordedGrantChange extends RecordedGrantClient {
   key: string;
   tag: string;
   change: 'added' | 'removed' | 'updated';
+  /** 更新的是凭据还是 flow。只记 UUID 是否变化，不保留旧值。 */
+  uuidChanged: boolean;
+  flowBefore: string | null;
 }
 
 /** Read only the fields needed for a safe historical comparison. UUID participates in equality
@@ -1690,52 +1819,41 @@ function recordedGrantChanges(target: DeploymentTargetDetail): RecordedGrantChan
     .flatMap<RecordedGrantChange>(key => {
       const previous = before.get(key);
       const current = after.get(key);
-      if (!previous && current) return [{ ...current, key, change: 'added' as const }];
-      if (previous && !current) return [{ ...previous, key, change: 'removed' as const }];
+      if (!previous && current)
+        return [{ ...current, key, change: 'added' as const, uuidChanged: false, flowBefore: null }];
+      if (previous && !current)
+        return [{ ...previous, key, change: 'removed' as const, uuidChanged: false, flowBefore: null }];
       if (previous && current && (previous.uuid !== current.uuid || previous.flow !== current.flow)) {
-        return [{ ...current, key, change: 'updated' as const }];
+        return [
+          {
+            ...current,
+            key,
+            change: 'updated' as const,
+            uuidChanged: previous.uuid !== current.uuid,
+            flowBefore: previous.flow,
+          },
+        ];
       }
       return [];
     });
 }
 
-function RecordedGrantChanges({ groups }: { groups: { key: string; name: string; changes: RecordedGrantChange[] }[] }) {
-  return (
-    <div className="cgr-waves cg-grant-changes" aria-label="运行时授权变更">
-      {groups.map(group => (
-        <section className="cgr-group" key={group.key}>
-          <div className="cgr-head">
-            <b>{group.name}</b>
-            <span className="cgr-facts">{group.changes.length} 项授权变更</span>
-          </div>
-          {group.changes.map(change => {
-            const label = change.change === 'added' ? '新增' : change.change === 'removed' ? '移除' : '更新';
-            const tone = change.change === 'added' ? 'ok' : change.change === 'removed' ? 'err' : 'warn';
-            return (
-              <div className="cgr-row" key={change.key}>
-                <span className={`cg-lamp ${tone}`} />
-                <span className="cgo-main">
-                  <b>{change.email}</b>
-                  <small>{change.tag}</small>
-                </span>
-                <span className={`cgr-effect ${tone}`}>{label}</span>
-              </div>
-            );
-          })}
-        </section>
-      ))}
-    </div>
-  );
+type RecordedFile = { key: string; kind: string; before: RecordedArtifact | undefined; after: RecordedArtifact };
+interface RecordedMachine {
+  id: string;
+  files: RecordedFile[];
+  /** null：这台没有同步授权；空数组：同步了，但机器没有提供可比较的执行前后记录 */
+  grants: RecordedGrantChange[] | null;
 }
+type RecordedItem = { key: string; file: RecordedFile } | { key: string; grants: RecordedGrantChange[] };
 
-/** 同修订也可能因证书等运行状态产生不同产物，历史详情必须使用发布时保存的内容。 */
-export function RecordedArtifactChanges({ targets }: { targets: DeploymentTargetDetail[] }) {
-  const nameOf = useNodeNames();
-  const groups = targets.map(target => ({
-    key: target.node_id,
-    name: nameOf(target.node_id),
-    grantChanges: recordedGrantChanges(target),
-    files: ['phantun', 'wireguard', 'xray', 'hy2_port_hop'].flatMap(kind => {
+const RECORDED_KINDS = ['phantun', 'wireguard', 'xray', 'hy2_port_hop'];
+
+function recordedMachines(targets: DeploymentTargetDetail[]): RecordedMachine[] {
+  return targets.map(target => ({
+    id: target.node_id,
+    grants: recordedGrantChanges(target),
+    files: RECORDED_KINDS.flatMap(kind => {
       const after = artifactRecord(target.desired_structure, kind);
       const before = artifactRecord(target.observed_before, kind);
       if (!after || after.state === 'unmanaged') return [];
@@ -1745,271 +1863,461 @@ export function RecordedArtifactChanges({ targets }: { targets: DeploymentTarget
       return [{ key: `${target.node_id}:${kind}`, kind, before, after }];
     }),
   }));
-  const files = groups.flatMap(group => group.files.map(file => ({ group, file })));
-  const grantGroups = groups.flatMap(group =>
-    group.grantChanges && group.grantChanges.length > 0
-      ? [{ key: group.key, name: group.name, changes: group.grantChanges }]
-      : [],
-  );
-  const hasGrantSync = groups.some(group => group.grantChanges !== null);
-  const [picked, setPicked] = useState(() => files[0]?.file.key ?? '');
-  const selected = files.find(item => item.file.key === picked) ?? files[0];
+}
+
+const recordedItems = (machine: RecordedMachine): RecordedItem[] => [
+  ...machine.files.map(file => ({ key: file.key, file })),
+  ...(machine.grants?.length ? [{ key: `${machine.id}:grants`, grants: machine.grants }] : []),
+];
+
+/** 比较用的原文。null：执行前不存在（新建）或本次停用；undefined：记录里没有原文（未记录或无权查看）。 */
+const recordedTexts = (file: RecordedFile) => ({
+  before: file.before?.state === 'absent' ? null : file.before?.content,
+  after: file.after.state === 'disabled' ? null : file.after.content,
+});
+
+type RecordedFileState = 'new' | 'off' | 'mod' | 'na';
+const FILE_STATE_TEXT: Record<RecordedFileState, string> = { new: '新增', off: '停用', mod: '修改', na: '不可比较' };
+
+function recordedFileState(file: RecordedFile): RecordedFileState {
+  const { before, after } = recordedTexts(file);
+  if (before === undefined || after === undefined) return 'na';
+  return before === null ? 'new' : after === null ? 'off' : 'mod';
+}
+
+// 执行中每 3 秒重新拉一次详情；React Query 的结构共享让没变的记录保持同一个对象，按对象缓存差异，
+// 轮询时不重复计算整份 LCS。键是查询缓存里的记录，随缓存一起被回收。
+const reviewCache = new WeakMap<
+  RecordedArtifact,
+  { before: RecordedArtifact | undefined; diffs: Map<boolean, ReviewDiff> }
+>();
+
+function recordedDiff(file: RecordedFile, foldRuleTags: boolean): ReviewDiff | null {
+  const { before, after } = recordedTexts(file);
+  if (before === undefined || after === undefined) return null;
+  let cached = reviewCache.get(file.after);
+  if (!cached || cached.before !== file.before) {
+    cached = { before: file.before, diffs: new Map() };
+    reviewCache.set(file.after, cached);
+  }
+  let diff = cached.diffs.get(foldRuleTags);
+  if (!diff) {
+    diff = reviewDiff(before, after, file.kind, foldRuleTags);
+    cached.diffs.set(foldRuleTags, diff);
+  }
+  return diff;
+}
+
+/**
+ * 产物记录。同修订也可能因证书等运行状态产生不同产物，所以比较的是发布时保存的执行前后内容，不重新编译修订。
+ * 一台机器一行，文件是行内页签，差异在该行下方展开。面板默认展开、机器行默认收起：
+ * 先看到每台的文件与增删读数，再点开要看的差异。
+ */
+export function RecordedArtifacts({ targets, range }: { targets: DeploymentTargetDetail[]; range: string }) {
+  const nameOf = useNodeNames();
+  const [expanded, setExpanded] = useState(true);
+  const [foldRuleTags, setFoldRuleTags] = useState(true);
+  const machines = recordedMachines(targets);
+  const rows = machines.flatMap(machine => {
+    const items = recordedItems(machine);
+    return items.length > 0
+      ? [
+          {
+            key: machine.id,
+            name: nameOf(machine.id),
+            id: machine.id,
+            items: items.map(item => ({ key: item.key, item })),
+          },
+        ]
+      : [];
+  });
+
+  const files = machines.flatMap(machine => machine.files);
+  const diffs = files.flatMap(file => recordedDiff(file, foldRuleTags) ?? []);
+  const added = diffs.reduce((sum, diff) => sum + diff.counts.add, 0);
+  const deleted = diffs.reduce((sum, diff) => sum + diff.counts.del, 0);
+  const grants = machines.reduce((sum, machine) => sum + (machine.grants?.length ?? 0), 0);
+  const meta = [
+    range,
+    `${targets.length} 台机器`,
+    files.length > 0 ? `${files.length} 份文件${diffs.length > 0 ? ` +${added} −${deleted}` : ''}` : '',
+    grants > 0 ? `授权 ${grants} 项` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ');
 
   return (
-    <>
-      {selected && (
-        <div className="cg-files is-compact">
-          <div className="cg-tree" aria-label="发布时保存的产物文件">
-            {groups.map(group => (
-              <div key={group.key}>
-                <div className="cg-tree-group">
-                  <b>{group.name}</b>
-                  <span>{group.files.length} 份变更</span>
-                </div>
-                {group.files.map(file => (
-                  <button
-                    className="cg-tree-file"
-                    type="button"
-                    key={file.key}
-                    aria-current={selected.file.key === file.key}
-                    onClick={() => setPicked(file.key)}
-                  >
-                    <span className="nm">{artifactFile(file.kind)}</span>
-                    <span
-                      className={`cg-fstate ${file.before?.state === 'absent' ? 'new' : file.after.state === 'disabled' ? 'warn' : ''}`}
-                    >
-                      {file.before?.state === 'absent' ? '新增' : file.after.state === 'disabled' ? '停用' : '修改'}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            ))}
-          </div>
-          <RecordedFileDiff
-            groupName={selected.group.name}
-            kind={selected.file.kind}
-            before={selected.file.before}
-            after={selected.file.after}
-          />
-        </div>
-      )}
-      {grantGroups.length > 0 && <RecordedGrantChanges groups={grantGroups} />}
-      {!selected && grantGroups.length === 0 && (
+    <details
+      className="panel config-panel cg-sec cg-disclosure cg-artifact-review"
+      open={expanded}
+      onToggle={event => setExpanded(event.currentTarget.open)}
+    >
+      <summary>
+        <PanelTitle of="artifacts">产物记录</PanelTitle>
+        <span className="cg-meta">{meta}</span>
+        <span className="cgf-disclosure-state" aria-hidden="true">
+          <span>展开</span>
+          <span>收起</span>
+        </span>
+      </summary>
+      {rows.length > 0 ? (
+        <ArtifactList
+          rows={rows}
+          tab={item =>
+            'file' in item ? (
+              <RecordedFileChip file={item.file} foldRuleTags={foldRuleTags} />
+            ) : (
+              <>
+                <span className="nm cga-sans">授权名单</span>
+                <ChangeDelta
+                  add={item.grants.filter(change => change.change === 'added').length}
+                  del={item.grants.filter(change => change.change === 'removed').length}
+                  upd={item.grants.filter(change => change.change === 'updated').length}
+                />
+              </>
+            )
+          }
+          note={item => {
+            if (!('file' in item) || item.file.kind !== 'xray' || recordedFileState(item.file) !== 'mod') return null;
+            const folded = recordedDiff(item.file, true);
+            return (
+              folded && (
+                <RuleTagNote diff={folded} folded={foldRuleTags} onToggle={() => setFoldRuleTags(value => !value)} />
+              )
+            );
+          }}
+          detail={item =>
+            'file' in item ? (
+              <RecordedFileDetail key={`${item.key}:${foldRuleTags}`} file={item.file} foldRuleTags={foldRuleTags} />
+            ) : (
+              <RecordedGrantDetail changes={item.grants} />
+            )
+          }
+        />
+      ) : (
         <div className="cgr-notice">
           <span className="cg-lamp idle" />
           <span>
-            {hasGrantSync
+            {machines.some(machine => machine.grants !== null)
               ? '授权名单已同步，但机器没有提供可比较的执行前后记录。'
               : '没有文件内容变化；本次执行的重应用操作见上方动作记录。'}
           </span>
         </div>
       )}
+    </details>
+  );
+}
+
+interface ArtifactListRow<Item> {
+  key: string;
+  name: string;
+  id: string;
+  items: { key: string; item: Item }[];
+}
+
+/**
+ * 产物清单：一行一个归属（机器或用户订阅），展开符 + 名称与 ID │ 文件页签 │ 行尾说明，差异贴边展开在行下。
+ * 行默认收起，openFirst 时展开第一行；点所选的页签收起。变更单详情（发布时保存的内容）与创建变更单（两个修订的
+ * 编译结果）共用这一套行与差异视图，页签内容、行尾说明与差异区由调用方按各自的数据来源渲染。
+ */
+function ArtifactList<Item>({
+  rows,
+  openFirst = false,
+  tab,
+  note,
+  detail,
+}: {
+  rows: ArtifactListRow<Item>[];
+  openFirst?: boolean;
+  tab: (item: Item) => ReactNode;
+  note: (item: Item) => ReactNode;
+  detail: (item: Item) => ReactNode;
+}) {
+  // null：读者还没操作过，按 openFirst 决定是否展开第一行
+  const [explicit, setExplicit] = useState<ReadonlySet<string> | null>(null);
+  const [picked, setPicked] = useState<ReadonlyMap<string, string>>(() => new Map());
+  const open = explicit ?? new Set(openFirst ? rows.slice(0, 1).map(row => row.key) : []);
+  const toggle = (key: string) => {
+    const next = new Set(open);
+    if (!next.delete(key)) next.add(key);
+    setExplicit(next);
+  };
+  const pick = (key: string, item: string) => {
+    setExplicit(new Set(open).add(key));
+    setPicked(new Map(picked).set(key, item));
+  };
+  return (
+    <div className="cga-list">
+      {rows.map(row => {
+        const isOpen = open.has(row.key);
+        const current = row.items.find(entry => entry.key === picked.get(row.key)) ?? row.items[0];
+        return (
+          <div key={row.key} className={`cga-node${isOpen ? ' is-open' : ''}`}>
+            <div className="cga-row">
+              <button type="button" className="cga-head" aria-expanded={isOpen} onClick={() => toggle(row.key)}>
+                <Icon of="chevronDown" size={14} className="cga-caret" />
+                <span className="cgo-main">
+                  <b>{row.name}</b>
+                  <small>{row.id}</small>
+                </span>
+              </button>
+              <span className="cga-files">
+                {row.items.map(entry => {
+                  const pressed = isOpen && entry.key === current.key;
+                  return (
+                    <button
+                      key={entry.key}
+                      type="button"
+                      className="cga-file"
+                      aria-pressed={pressed}
+                      onClick={() => (pressed ? toggle(row.key) : pick(row.key, entry.key))}
+                    >
+                      {tab(entry.item)}
+                    </button>
+                  );
+                })}
+              </span>
+              {isOpen && note(current.item)}
+            </div>
+            {isOpen && <div className="cga-detail">{detail(current.item)}</div>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function RecordedFileChip({ file, foldRuleTags }: { file: RecordedFile; foldRuleTags: boolean }) {
+  const state = recordedFileState(file);
+  const diff = recordedDiff(file, foldRuleTags);
+  return (
+    <>
+      <span className="nm">{artifactFile(file.kind)}</span>
+      {state !== 'mod' && <span className={`cga-st ${state}`}>{FILE_STATE_TEXT[state]}</span>}
+      {diff && <ChangeDelta add={diff.counts.add} del={diff.counts.del} />}
     </>
   );
 }
 
-function RecordedFileDiff({
-  groupName,
-  kind,
-  before,
-  after,
-}: {
-  groupName: string;
-  kind: string;
-  before: RecordedArtifact | undefined;
-  after: RecordedArtifact;
-}) {
-  const beforeText = before?.state === 'absent' ? '' : before?.content;
-  const afterText = after.state === 'disabled' ? '' : after.content;
-  if (beforeText === undefined || afterText === undefined) {
+/** +N −M ~K 读数。没有任何改动时写 +0：ruleTag 折叠后可能一行实际改动都不剩。 */
+function ChangeDelta({ add, del, upd = 0 }: { add: number; del: number; upd?: number }) {
+  return (
+    <span className="fg-delta cga-delta">
+      {(add > 0 || (del === 0 && upd === 0)) && <span className="add">+{add}</span>}
+      {del > 0 && <span className="del">−{del}</span>}
+      {upd > 0 && <span className="upd">~{upd}</span>}
+    </span>
+  );
+}
+
+/** ruleTag 重新编号的说明与开关，放在展开行的行尾，开关对整张清单的差异生效。`diff` 是折叠后的那份差异。 */
+function RuleTagNote({ diff, folded, onToggle }: { diff: ReviewDiff; folded: boolean; onToggle: () => void }) {
+  if (!diff.retagged) return null;
+  const [from, to] = diff.generations;
+  return (
+    <span
+      className="cga-fold"
+      title={`规则表任何改动都会换掉整表的生成号（r:${from} → r:${to}），每条规则的 ruleTag 随之重新编号`}
+    >
+      ruleTag 重新编号 {diff.retagged} 处{folded ? '，已折叠' : ''}
+      <button type="button" className="cga-link" onClick={onToggle}>
+        {folded ? '显示' : '折叠'}
+      </button>
+    </span>
+  );
+}
+
+function RecordedFileDetail({ file, foldRuleTags }: { file: RecordedFile; foldRuleTags: boolean }) {
+  const [expanded, setExpanded] = useState<ReadonlySet<number>>(() => new Set());
+  const [showWritten, setShowWritten] = useState(false);
+  const diff = recordedDiff(file, foldRuleTags);
+  const fmt = artifactFmt(file.kind);
+
+  if (!diff) {
+    const written = file.after.content;
+    const lines = written === undefined ? [] : artifactLines(written);
     return (
-      <div className="cg-viewer">
-        <ArtifactViewerHead groupName={groupName} kind={kind} state="不可比较" />
-        <div className="note cg-artifact-unavailable">
-          {before === undefined
-            ? '执行前状态尚未记录，暂不能比较。'
-            : '记录中的原文不可用或当前账号无权查看，暂不能显示逐行差异。'}
-          <div>
-            执行前：<code>{before?.sha256 ?? before?.state ?? '未知'}</code>
-          </div>
-          <div>
-            本次目标：<code>{after.sha256 ?? after.state}</code>
-          </div>
+      <>
+        <div className="cga-na">
+          <p>
+            {file.before === undefined
+              ? '执行前状态没有记录，不能逐行比较。'
+              : '记录里没有原文，或当前账号无权查看原文，不能逐行比较。'}
+          </p>
+          <dl>
+            <dt>执行前</dt>
+            <dd>{file.before?.sha256 ?? file.before?.state ?? '未记录'}</dd>
+            <dt>本次写入</dt>
+            <dd>{file.after.sha256 ?? file.after.state}</dd>
+          </dl>
+          {written !== undefined && (
+            <button
+              type="button"
+              className="cga-link"
+              aria-expanded={showWritten}
+              onClick={() => setShowWritten(value => !value)}
+            >
+              {showWritten ? '收起本次写入的内容' : `查看本次写入的内容 · ${lines.length} 行`}
+            </button>
+          )}
         </div>
-      </div>
+        {showWritten && (
+          <div className="fg-code cga-code">
+            <table>
+              <tbody>
+                {lines.map((line, index) => (
+                  <tr key={index}>
+                    <td className="ln" />
+                    <td className="ln">{index + 1}</td>
+                    <td className="mk" />
+                    <td className="src" dangerouslySetInnerHTML={{ __html: highlight(line, fmt) || '&nbsp;' }} />
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </>
     );
   }
-  const ops =
-    before?.state === 'absent'
-      ? afterText.split('\n').map((s, i) => ({ t: '+' as const, n: i + 1, s }))
-      : after.state === 'disabled'
-        ? beforeText.split('\n').map(s => ({ t: '-' as const, n: null, s }))
-        : diffLines(beforeText, afterText);
-  const counts = countChanges(ops);
+
   return (
-    <div className="cg-viewer">
-      <ArtifactViewerHead
-        groupName={groupName}
-        kind={kind}
-        state={before?.state === 'absent' ? '新增' : after.state === 'disabled' ? '停用' : '修改'}
-        counts={counts}
-      />
-      <div className="fg-code cg-diff">
-        <table>
-          <tbody>
-            {collapseContext(ops, 3).map((row, i) =>
-              row === null ? (
-                <tr key={i} className="gap">
-                  <td className="ln">⋯</td>
-                  <td className="src" />
-                </tr>
-              ) : (
-                <tr key={i} className={row.t === '+' ? 'add' : row.t === '-' ? 'del' : undefined}>
-                  <td className="ln">{row.n ?? ''}</td>
-                  <td
-                    className="src"
-                    dangerouslySetInnerHTML={{ __html: highlight(row.s, artifactFmt(kind)) || '&nbsp;' }}
-                  />
-                </tr>
-              ),
-            )}
-          </tbody>
-        </table>
-      </div>
+    <div className="fg-code cga-code">
+      <table>
+        <tbody>
+          <ReviewRows
+            diff={diff}
+            fmt={fmt}
+            expanded={expanded}
+            onExpand={start => setExpanded(current => new Set(current).add(start))}
+          />
+        </tbody>
+      </table>
     </div>
   );
 }
 
-function ArtifactViewerHead({
-  groupName,
-  kind,
-  state,
-  counts,
+/** 改动行前后各留的未改动行数；更远的未改动行收成一条折叠行。 */
+const CONTEXT_LINES = 3;
+
+function ReviewRows({
+  diff,
+  fmt,
+  expanded,
+  onExpand,
 }: {
-  groupName: string;
-  kind: string;
-  state: string;
-  counts?: { add: number; del: number };
+  diff: ReviewDiff;
+  fmt: string;
+  expanded: ReadonlySet<number>;
+  onExpand: (start: number) => void;
 }) {
-  return (
-    <div className="cg-viewer-head">
-      <span className="path">
-        {groupName} / <b>{artifactFile(kind)}</b>
-      </span>
-      <span className="sp" />
-      {counts && (
-        <span className="fg-delta">
-          <span className="add">+{counts.add}</span> <span className="del">−{counts.del}</span>
-        </span>
-      )}
-      <span className="cg-fstate">{state}</span>
-    </div>
-  );
-}
-
-function FileDiff({
-  entry,
-  groupName,
-  revision,
-  base,
-}: {
-  entry: ArtifactIndexEntry;
-  groupName: string;
-  revision: number;
-  base: number | null;
-}) {
-  const key = [entry.target_kind, entry.target_id, entry.artifact_kind] as const;
-  const here = useQuery({
-    queryKey: ['artifact', revision, ...key],
-    queryFn: () => fetchArtifactContent(...key, revision),
-  });
-  const there = useQuery({
-    queryKey: ['artifact', base, ...key],
-    queryFn: () => fetchArtifactContent(...key, base ?? undefined),
-    enabled: base != null,
-  });
-
-  const fmt = artifactFmt(entry.artifact_kind);
-  if (here.isPending || (base != null && there.isPending))
-    return (
-      <div className="cg-viewer">
-        <ArtifactViewerHead groupName={groupName} kind={entry.artifact_kind} state={base == null ? '新增' : '修改'} />
-        <Loading variant="code" />
-      </div>
-    );
-  if (here.error || (base != null && there.error))
-    return (
-      <div className="cg-viewer">
-        <ArtifactViewerHead groupName={groupName} kind={entry.artifact_kind} state={base == null ? '新增' : '修改'} />
-        <ErrorBox error={here.error ?? there.error} />
-      </div>
-    );
-
-  const text = here.data.content ?? '';
-  const before = there.data?.content ?? '';
-  // `diffLines('', text)` 会把空串当成一行删除；首次发布应只有真正的新建行。
-  const ops =
-    base == null ? text.split('\n').map((s, i) => ({ t: '+' as const, n: i + 1, s })) : diffLines(before, text);
-  const counts = countChanges(ops);
-  /* 产物有数百行，全部展开会使改动内容难以定位。 */
-  const shown = base == null ? ops : collapseContext(ops, 3);
-
-  return (
-    <div className="cg-viewer">
-      <ArtifactViewerHead
-        groupName={groupName}
-        kind={entry.artifact_kind}
-        state={base == null ? '新增' : '修改'}
-        counts={counts}
-      />
-      <div className="fg-code cg-diff">
-        <table>
-          <tbody>
-            {shown.map((row, i) =>
-              row === null ? (
-                <tr key={`gap-${i}`} className="gap">
-                  <td className="ln">⋯</td>
-                  <td className="src" />
-                </tr>
-              ) : (
-                <tr key={i} className={row.t === '+' ? 'add' : row.t === '-' ? 'del' : undefined}>
-                  <td className="ln">{row.n ?? ''}</td>
-                  <td className="src" dangerouslySetInnerHTML={{ __html: highlight(row.s, fmt) || '&nbsp;' }} />
-                </tr>
-              ),
-            )}
-          </tbody>
-        </table>
-      </div>
-      {here.data.redacted && (
-        <div className="fg-afoot">
-          <span className="st st-warn">已打码</span>
-          <span className="note">私钥原文仅 system-admin 可见。</span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** 将未改动的长段落折叠为一个省略行，改动行前后各保留 `pad` 行。`null` 表示被折叠的段落。 */
-function collapseContext<T extends { t: ' ' | '-' | '+' }>(ops: T[], pad: number): (T | null)[] {
+  const { rows, paths } = diff;
   const keep = new Set<number>();
-  ops.forEach((op, i) => {
-    if (op.t === ' ') return;
-    for (let j = Math.max(0, i - pad); j <= Math.min(ops.length - 1, i + pad); j++) keep.add(j);
+  rows.forEach((row, index) => {
+    if (row.t === ' ') return;
+    const last = Math.min(rows.length - 1, index + CONTEXT_LINES);
+    for (let near = Math.max(0, index - CONTEXT_LINES); near <= last; near++) keep.add(near);
   });
-  const out: (T | null)[] = [];
-  let gap = false;
-  ops.forEach((op, i) => {
-    if (keep.has(i)) {
-      out.push(op);
-      gap = false;
-    } else if (!gap) {
-      out.push(null);
-      gap = true;
+  const out: ReactNode[] = [];
+  for (let start = 0; start < rows.length;) {
+    if (keep.has(start)) {
+      out.push(<ReviewLine key={start} row={rows[start]} fmt={fmt} />);
+      start++;
+      continue;
     }
-  });
-  return out;
+    let end = start;
+    while (end < rows.length && !keep.has(end)) end++;
+    // 只省一两行时直接显示：折叠行本身也要占一行
+    if (end - start <= 2 || expanded.has(start)) {
+      for (let line = start; line < end; line++) out.push(<ReviewLine key={line} row={rows[line]} fmt={fmt} />);
+    } else {
+      const next = rows[end];
+      const where = !next
+        ? '文件末尾'
+        : next.n !== null
+          ? paths.new[next.n - 1]
+          : next.o !== null
+            ? paths.old[next.o - 1]
+            : '';
+      const gap = start;
+      out.push(
+        <tr key={`gap-${gap}`} className="cga-gap" onClick={() => onExpand(gap)}>
+          <td className="ln" colSpan={3}>
+            <Icon of="unfold" size={13} />
+          </td>
+          <td className="src">
+            <button type="button" className="cga-gap-btn">
+              <span className="cnt">未改动 {end - start} 行</span>
+              {where && <span className="where">{where}</span>}
+            </button>
+          </td>
+        </tr>,
+      );
+    }
+    start = end;
+  }
+  return <>{out}</>;
+}
+
+function ReviewLine({ row, fmt }: { row: ReviewRow; fmt: string }) {
+  const html = highlight(row.s, fmt);
+  return (
+    <tr className={row.t === '+' ? 'add' : row.t === '-' ? 'del' : row.retagged ? 'tag' : undefined}>
+      <td className="ln">{row.o ?? ''}</td>
+      <td className="ln">{row.n ?? ''}</td>
+      <td className="mk">{row.t === '+' ? '+' : row.t === '-' ? '−' : ''}</td>
+      <td
+        className="src"
+        dangerouslySetInnerHTML={{ __html: (row.mark ? markRange(html, row.mark[0], row.mark[1]) : html) || '&nbsp;' }}
+      />
+    </tr>
+  );
+}
+
+const grantChangeText = (change: RecordedGrantChange) =>
+  change.change === 'added'
+    ? '新增'
+    : change.change === 'removed'
+      ? '移除'
+      : change.uuidChanged
+        ? '凭据已更换'
+        : `flow ${change.flowBefore ?? '无'} → ${change.flow ?? '无'}`;
+
+/** 授权名单：与文件差异同一种行，按入站分组。UUID 是凭据，只写「凭据已更换」，不显示值。 */
+function RecordedGrantDetail({ changes }: { changes: RecordedGrantChange[] }) {
+  const byTag = new Map<string, RecordedGrantChange[]>();
+  for (const change of changes) byTag.set(change.tag, [...(byTag.get(change.tag) ?? []), change]);
+  return (
+    <div className="fg-code cga-code cga-grants">
+      <table>
+        <tbody>
+          {[...byTag].map(([tag, list]) => (
+            <Fragment key={tag}>
+              <tr className="cga-ghead">
+                <td className="mk" />
+                <td className="src">
+                  <span className="where">{tag}</span>
+                  <span className="cnt">{list.length} 项</span>
+                </td>
+              </tr>
+              {list.map(change => (
+                <tr
+                  key={change.key}
+                  className={change.change === 'added' ? 'add' : change.change === 'removed' ? 'del' : 'upd'}
+                >
+                  <td className="mk">{change.change === 'added' ? '+' : change.change === 'removed' ? '−' : '~'}</td>
+                  <td className="src">
+                    <span className="em">{change.email}</span>
+                    <span className="what">{grantChangeText(change)}</span>
+                  </td>
+                </tr>
+              ))}
+            </Fragment>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 const OPEN_STATES = new Set(['planned', 'running', 'dispatched', 'converging']);
@@ -2035,10 +2343,83 @@ type Ask =
 
 const ISOLATABLE_TARGET = new Set(['pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty']);
 
+/* 阶段的固定说明，放在阶段名的 title 里：正文只写这一步做什么、结果如何。 */
+const STAGE_NOTE: Record<DeploymentStage, string> = {
+  config: '自动下发，不中断现有连接',
+  verify: '先验证一台机器，再继续扩大范围',
+  stop: '停止服务前需要明确确认',
+  rollout: '按监听依赖顺序更新其余机器',
+};
+
+type StepTone = 'ok' | 'err' | 'warn' | 'run' | 'idle';
+
+const STEP_ICON: Partial<Record<StepTone, IconName>> = { ok: 'check', err: 'close', warn: 'clock' };
+
+const actionLabels = (target: DeploymentTargetDetail) =>
+  actionsOf(target).map(action => (ACTION_LABEL as Record<string, string>)[action] ?? action);
+
+/** 要整行展开的机器：失败的，以及带着报错的——报错不能藏进格子。 */
+const needsAttention = (target: DeploymentTargetDetail) => target.status.startsWith('failed') || !!target.error;
+
+/**
+ * 一步的状态。颜色只给失败、进行中和等待确认；全部成功只画图标、不写字。
+ * `awaiting` 是服务端的判断（这一步需要确认且还没有确认记录），只对当前打开的那一步成立。
+ */
+function stepState(
+  step: DeploymentStep<DeploymentTargetDetail>,
+  openWave: number | null,
+  halted: boolean,
+  awaiting: boolean,
+): { tone: StepTone; label: string } {
+  const statuses = step.targets.map(target => target.status);
+  if (statuses.some(status => status.startsWith('failed'))) return { tone: 'err', label: '执行失败' };
+  if (statuses.every(status => status === 'succeeded')) return { tone: 'ok', label: '' };
+  if (statuses.some(status => LIVE_TARGET.has(status))) {
+    if (halted) return { tone: 'idle', label: '已停止' };
+    if (step.wave !== openWave) return { tone: 'idle', label: '等待上一步' };
+    return awaiting ? { tone: 'warn', label: '等待确认' } : { tone: 'run', label: '进行中' };
+  }
+  // 没有在途的机器、也不是全部成功：这一步以取消、隔离或被替代收尾
+  const ended = statuses.find(status => status !== 'succeeded') ?? '';
+  return { tone: 'idle', label: STATUS_TEXT[ended] ?? ended };
+}
+
+/** 服务端时刻文本 → 毫秒；不带时区的按 UTC，与 Ago / When 的解析一致。 */
+const instantOf = (at: string) => Date.parse(at.endsWith('Z') || at.includes('+') ? at : `${at}Z`);
+
+/** 一步的开始时刻：这一步最早下发的那台。完整日期时间在 title 里。 */
+function StepTime({ targets }: { targets: DeploymentTargetDetail[] }) {
+  const times = targets
+    .map(target => (target.dispatched_at ? instantOf(target.dispatched_at) : NaN))
+    .filter(time => !Number.isNaN(time));
+  if (times.length === 0) return <span className="cgp-time" />;
+  const first = new Date(Math.min(...times));
+  return (
+    <time className="cgp-time" dateTime={first.toISOString()} title={first.toLocaleString()}>
+      {observeClockText(first.getTime() / 1000, true)}
+    </time>
+  );
+}
+
+/** 用时读数；不到一分钟写秒数。 */
+function elapsedText(from: string, to: string): string | null {
+  const ms = instantOf(to) - instantOf(from);
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  const seconds = Math.round(ms / 1000);
+  return seconds < 60 ? `${seconds} 秒` : observeDurationText(seconds);
+}
+
+/*
+ * 执行进度：每一步是时间线上的一个节点——开始时刻 │ 结果图标 │ 阶段名与动作 │ 异常状态 │ 台数。
+ * 多步的全量发布先写一行分组，相同的动作只写一次。正常的机器收成机器格（地区旗 + 名称 + ID），
+ * 不逐台重复「成功」与时间；失败或带报错的机器展开成整行，写报错、处理方式与重试 / 隔离。
+ * 稿件：mockups/artifact-review.html（执行进度：时间线）。
+ */
 function DeploymentStages({
   steps,
   openWave,
   halted,
+  awaiting,
   publisher,
   system,
   retryPending,
@@ -2049,6 +2430,7 @@ function DeploymentStages({
   steps: DeploymentStep<DeploymentTargetDetail>[];
   openWave: number | null;
   halted: boolean;
+  awaiting: boolean;
   publisher: boolean;
   system: boolean;
   retryPending: boolean;
@@ -2056,6 +2438,8 @@ function DeploymentStages({
   onRetry: (nodeId: string) => void;
   onIsolate: (target: DeploymentTargetDetail) => void;
 }) {
+  const nameOf = useNodeNames();
+  const countryOf = useNodeCountries();
   const groups = steps.reduce<
     { stage: DeploymentStage; title: string; steps: DeploymentStep<DeploymentTargetDetail>[] }[]
   >((result, step) => {
@@ -2065,96 +2449,108 @@ function DeploymentStages({
     return result;
   }, []);
 
-  const stateOf = (step: DeploymentStep<DeploymentTargetDetail>) => {
-    const isOpen = openWave === step.wave;
-    const canConfirm = isOpen && !halted && step.needsConfirmation;
-    const queued = openWave !== null && step.wave > openWave;
-    const succeeded = step.targets.every(target => target.status === 'succeeded');
-    const failed = step.targets.some(target => target.status.startsWith('failed'));
-    return {
-      isOpen,
-      tone: failed ? 'err' : canConfirm ? 'warn' : succeeded ? 'ok' : '',
-      label: succeeded
-        ? '已完成'
-        : failed
-          ? '执行失败'
-          : canConfirm
-            ? '等待确认'
-            : isOpen && !halted
-              ? '进行中 · 等待 Agent'
-              : queued
-                ? '等待前一步完成'
-                : halted
-                  ? '已停止'
-                  : '等待执行',
-    };
-  };
-  const targetRows = (step: DeploymentStep<DeploymentTargetDetail>) => (
+  const stateOf = (step: DeploymentStep<DeploymentTargetDetail>) =>
+    stepState(step, openWave, halted, awaiting && step.wave === openWave);
+  const mixedOf = (step: DeploymentStep<DeploymentTargetDetail>) =>
+    new Set(step.targets.map(target => actionLabels(target).join(' · '))).size > 1;
+  /* 这一步做什么：各台动作相同时只写一次，不同时并列。 */
+  const actionsText = (step: DeploymentStep<DeploymentTargetDetail>) =>
+    [...new Set(step.targets.flatMap(actionLabels))].join(mixedOf(step) ? '、' : ' · ');
+  /* 「会中断连接」只在等待确认时标金色：那是读者要据此做决定的时候。 */
+  const facts = (step: DeploymentStep<DeploymentTargetDetail>, tone: StepTone | null) => (
     <>
-      {step.targets.map(target => (
-        <TargetRow
-          key={target.node_id}
-          t={target}
-          publisher={publisher}
-          system={system}
-          retryPending={retryPending}
-          retrying={retryPending && retryingNode === target.node_id}
-          onRetry={() => onRetry(target.node_id)}
-          onIsolate={() => onIsolate(target)}
-        />
-      ))}
+      {actionsText(step)}
+      {step.disruptive && (
+        <>
+          {' · '}
+          <em className={tone === 'warn' ? 'warn' : undefined}>会中断连接</em>
+        </>
+      )}
     </>
   );
-  const stageDescription = (stage: DeploymentStage) =>
-    stage === 'config'
-      ? '自动下发，不中断现有连接'
-      : stage === 'verify'
-        ? '先验证一台机器，再继续扩大范围'
-        : stage === 'stop'
-          ? '停止服务前需要明确确认'
-          : '按监听依赖顺序更新其余机器';
+
+  const renderStep = (step: DeploymentStep<DeploymentTargetDetail>, grouped: boolean, sharedFacts: boolean) => {
+    const state = stateOf(step);
+    const open = step.wave === openWave;
+    const mixed = mixedOf(step);
+    const attention = step.targets.filter(needsAttention);
+    const rest = step.targets.filter(target => !needsAttention(target));
+    // 分组行已经写了同样的动作；只有等待确认、需要标金色时再写一遍
+    const showFacts = !sharedFacts || (state.tone === 'warn' && step.disruptive);
+    const icon = STEP_ICON[state.tone];
+    return (
+      <li key={step.wave} className={`cgp-step ${state.tone}${grouped ? ' sub' : ''}`}>
+        <div className="cgp-head">
+          <StepTime targets={step.targets} />
+          <span className="cgp-node">{state.tone === 'run' ? <i /> : icon && <Icon of={icon} size={11} />}</span>
+          <span className="cgp-title">
+            <b title={STAGE_NOTE[step.stage]}>{grouped ? `第 ${step.step} 步` : step.title}</b>
+            {showFacts && <span className="cgp-facts">{facts(step, state.tone)}</span>}
+          </span>
+          <span className={`cgp-state ${state.tone}`}>{state.label}</span>
+          <span className="cgp-count">{step.targets.length} 台</span>
+        </div>
+        {attention.map(target => (
+          <TargetFailure
+            key={target.node_id}
+            target={target}
+            name={nameOf(target.node_id)}
+            country={countryOf(target.node_id)}
+            publisher={publisher}
+            system={system}
+            retryPending={retryPending}
+            retrying={retryPending && retryingNode === target.node_id}
+            onRetry={() => onRetry(target.node_id)}
+            onIsolate={() => onIsolate(target)}
+          />
+        ))}
+        {rest.length > 0 && (
+          <ul className="cgp-grid">
+            {rest.map(target => (
+              <TargetCell
+                key={target.node_id}
+                target={target}
+                name={nameOf(target.node_id)}
+                country={countryOf(target.node_id)}
+                actions={mixed ? actionLabels(target) : null}
+                open={open}
+                running={state.tone === 'run'}
+                system={system}
+                onIsolate={() => onIsolate(target)}
+              />
+            ))}
+          </ul>
+        )}
+      </li>
+    );
+  };
 
   return (
-    <div className="cgr-waves">
-      {groups.map(group => {
-        const single = group.steps.length === 1 ? stateOf(group.steps[0]) : null;
-        const singleClass =
-          single?.tone === 'err' ? 'is-fail' : single?.tone === 'warn' ? 'is-open' : single?.isOpen ? 'is-run' : '';
-        return (
-          <section className={`cgr-group cgr-stage ${singleClass}`} key={`${group.stage}:${group.steps[0].wave}`}>
-            <div className="cgr-head">
-              <b>{group.title}</b>
-              <span className="lbl">{stageDescription(group.stage)}</span>
-              <span className={`cgr-state ${single?.tone ?? ''}`}>
-                {single?.label ?? `${group.steps.length} 个步骤`}
-              </span>
-            </div>
-            {group.steps.length === 1 ? (
-              targetRows(group.steps[0])
-            ) : (
-              <div className="cgr-stage-steps">
-                {group.steps.map(step => {
-                  const state = stateOf(step);
-                  const stateClass =
-                    state.tone === 'err' ? 'is-fail' : state.tone === 'warn' ? 'is-open' : state.isOpen ? 'is-run' : '';
-                  return (
-                    <section className={`cgr-stage-step ${stateClass}`} key={step.wave}>
-                      <div className="cgr-step-head">
-                        <b>
-                          步骤 {step.step}/{step.steps}
-                        </b>
-                        <span className={`cgr-state ${state.tone}`}>{state.label}</span>
-                      </div>
-                      {targetRows(step)}
-                    </section>
-                  );
-                })}
-              </div>
-            )}
-          </section>
+    <ol className="cgp-line">
+      {groups.flatMap(group => {
+        if (group.steps.length === 1) return [renderStep(group.steps[0], false, false)];
+        const first = group.steps[0];
+        const shared = group.steps.every(
+          step => actionsText(step) === actionsText(first) && step.disruptive === first.disruptive,
         );
+        const total = group.steps.reduce((sum, step) => sum + step.targets.length, 0);
+        return [
+          <li key={`group:${first.wave}`} className="cgp-group">
+            <span className="cgp-time" />
+            <span />
+            <span className="cgp-title">
+              <b title={STAGE_NOTE[group.stage]}>{group.title}</b>
+              <span className="cgp-facts">
+                {group.steps.length} 步{shared && <> · {facts(first, null)}</>}
+              </span>
+            </span>
+            <span />
+            <span className="cgp-count">{total} 台</span>
+          </li>,
+          ...group.steps.map(step => renderStep(step, true, shared)),
+        ];
       })}
-    </div>
+    </ol>
   );
 }
 
@@ -2177,6 +2573,10 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
         ? 3_000
         : false,
   });
+  // 「这一步还在等确认」以服务端为准：详情接口不带确认记录，运行中列表的 awaiting_confirmation
+  // 按 deployment_wave_confirmations 计算。与外壳顶栏同一个查询键，直接用它的缓存与轮询。
+  // 需要确认的步骤在确认前一台都不会下发，单看「这一步需要确认」会把已确认、正在执行的步骤也算进去。
+  const runtime = useQuery({ queryKey: ['deployments', 'runtime'], queryFn: () => fetchActiveDeployments() });
 
   const refresh = () => {
     qc.invalidateQueries({ queryKey: ['deployment', id] });
@@ -2231,6 +2631,8 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
 
   if (detail.isPending) return <Loading variant="deployment" />;
   if (detail.error) return <ErrorBox error={detail.error} />;
+  // 在途的单据等运行中列表到位再画：确认按钮与「等待确认」都取它，不先画一版再改口
+  if (OPEN_STATES.has(detail.data.status) && runtime.isPending) return <Loading variant="deployment" />;
 
   const d = detail.data;
   // 只列出实际有操作的机器。十余行 skipped 会使实际执行的行难以定位，
@@ -2250,12 +2652,22 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
   const disruptiveTargets = acting.filter(target => target.disruptive).length;
   const executionDone = d.status === 'succeeded';
   const effective = d.activation_status === 'activated';
+  const halted = d.status === 'halted';
+  const awaiting =
+    !halted &&
+    openStep !== undefined &&
+    (runtime.data?.deployments.some(item => item.id === d.id && item.awaiting_confirmation) ?? false);
+  // 确认请求成功到列表刷新之间，本地记下的确认先生效，按钮与状态不回跳
+  const awaitingNow = awaiting && confirmedWave !== openWave;
+  const elapsed = d.started_at && d.finished_at ? elapsedText(d.started_at, d.finished_at) : null;
+  const range = `${d.base_revision_id == null ? '空白环境' : `R${d.base_revision_id}`} → R${d.revision_id}`;
+  const note = d.note || '未填写备注';
   const detailTone =
-    d.status === 'halted' || failed.length > 0
+    halted || failed.length > 0
       ? 'err'
       : effective
         ? 'ok'
-        : openStep?.needsConfirmation
+        : awaitingNow
           ? 'warn'
           : OPEN_STATES.has(d.status)
             ? 'run'
@@ -2276,9 +2688,13 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
                   <h1 className="nd-id nd-name">变更单 #{d.id}</h1>
                   <Status value={d.status} />
                 </div>
+                {/* 备注常是服务端拼的修订说明，可能很长：单独一段、单行省略、title 带全文；
+                    修订范围另起一段，始终完整。 */}
                 <span className="nd-ident-meta">
-                  {d.note || '未填写备注'} · {d.base_revision_id == null ? '空白环境' : `R${d.base_revision_id}`} → R
-                  {d.revision_id}
+                  <span className="cg-head-note" title={note}>
+                    {note}
+                  </span>
+                  <span className="cg-head-range">· {range}</span>
                 </span>
               </div>
             </div>
@@ -2302,7 +2718,7 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
               </li>
             </ol>
             <div className="nd-acts">
-              {openStep?.needsConfirmation && openWave === openStep.wave && d.status !== 'halted' && (
+              {openStep && awaiting && (
                 <button
                   className="btn primary"
                   disabled={!publisher || confirm.isPending || confirmedWave === openStep.wave}
@@ -2371,13 +2787,14 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
                 <header>
                   <PanelTitle of="deploy">执行进度</PanelTitle>
                   <span className="cg-meta">
-                    {finishedTargets} / {acting.length} 台完成
+                    {finishedTargets} / {acting.length} 台完成{elapsed ? ` · 用时 ${elapsed}` : ''}
                   </span>
                 </header>
                 <DeploymentStages
                   steps={steps}
                   openWave={openWave}
-                  halted={d.status === 'halted'}
+                  halted={halted}
+                  awaiting={awaitingNow}
                   publisher={publisher}
                   system={can(who.role, 'system') && !isolate.isPending}
                   retryPending={retry.isPending}
@@ -2387,22 +2804,10 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
                 />
               </section>
 
-              <details className="panel config-panel cg-sec cg-disclosure cg-artifact-review">
-                <summary>
-                  <PanelTitle of="artifacts">产物记录</PanelTitle>
-                  <span className="cg-meta">
-                    {d.base_revision_id == null ? '空白环境' : `R${d.base_revision_id}`} → R{d.revision_id} ·{' '}
-                    {acting.length} 台机器
-                  </span>
-                  <span className="cgf-disclosure-state" aria-hidden="true">
-                    <span>展开</span>
-                    <span>收起</span>
-                  </span>
-                </summary>
-                <RecordedArtifactChanges targets={acting} />
-              </details>
+              <RecordedArtifacts targets={acting} range={range} />
 
-              {(confirm.error ||
+              {(runtime.error ||
+                confirm.error ||
                 halt.error ||
                 cancel.error ||
                 cancelRollback.error ||
@@ -2417,7 +2822,8 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
                     cancelRollback.error ??
                     rollback.error ??
                     retry.error ??
-                    isolate.error
+                    isolate.error ??
+                    runtime.error
                   }
                 />
               )}
@@ -2598,8 +3004,72 @@ function WaveSummary({ targets, nameOf }: { targets: DeploymentTargetDetail[]; n
   );
 }
 
-function TargetRow({
-  t,
+/** 机器格：地区旗 + 名称与 ID。在途的写状态；动作只在同一步各台不一样时写。 */
+function TargetCell({
+  target,
+  name,
+  country,
+  actions,
+  open,
+  running,
+  system,
+  onIsolate,
+}: {
+  target: DeploymentTargetDetail;
+  name: string;
+  country: string | null;
+  actions: string[] | null;
+  open: boolean;
+  running: boolean;
+  system: boolean;
+  onIsolate: () => void;
+}) {
+  const status = target.status;
+  const state =
+    status === 'dispatched' || status === 'converging' ? (
+      <span className="cgp-ms run">
+        <span className="cg-lamp run" />
+        {STATUS_TEXT[status]}
+      </span>
+    ) : status === 'pending' && open && running ? (
+      <span className="cgp-ms">
+        <span className="cg-lamp idle" />
+        {STATUS_TEXT.pending}
+      </span>
+    ) : status === 'succeeded' || status === 'pending' ? null : (
+      <span className="cgp-ms">{STATUS_TEXT[status] ?? status}</span>
+    );
+  return (
+    <li className={`cgp-m${status === 'pending' && !open ? ' queued' : ''}`}>
+      <span className="cgp-flag">
+        <RegionFlag code={country} />
+      </span>
+      <span className="cgp-mt">
+        <b title={target.node_id}>{name}</b>
+        <small>{[target.node_id, ...(actions ?? [])].join(' · ')}</small>
+      </span>
+      {state}
+      {ISOLATABLE_TARGET.has(status) && (
+        <button
+          type="button"
+          className="cgp-iso"
+          disabled={!system}
+          aria-label={`隔离 ${name}`}
+          title={`把 ${name} 移出这次发布`}
+          onClick={onIsolate}
+        >
+          隔离
+        </button>
+      )}
+    </li>
+  );
+}
+
+/** 失败或带报错的机器：整行，写报错、处理方式与重试 / 隔离。 */
+function TargetFailure({
+  target,
+  name,
+  country,
   publisher,
   system,
   retryPending,
@@ -2607,7 +3077,9 @@ function TargetRow({
   onRetry,
   onIsolate,
 }: {
-  t: DeploymentTargetDetail;
+  target: DeploymentTargetDetail;
+  name: string;
+  country: string | null;
   publisher: boolean;
   system: boolean;
   retryPending: boolean;
@@ -2615,53 +3087,41 @@ function TargetRow({
   onRetry: () => void;
   onIsolate: () => void;
 }) {
-  const nameOf = useNodeNames();
-  const guide = t.error ? guideFor(t.error) : undefined;
-  const tone = t.status.startsWith('failed')
-    ? 'err'
-    : t.status === 'succeeded'
-      ? 'ok'
-      : LIVE_TARGET.has(t.status)
-        ? 'run'
-        : 'idle';
-  const canRetry = t.status.startsWith('failed');
-  const canIsolate = ISOLATABLE_TARGET.has(t.status);
+  const failed = target.status.startsWith('failed');
+  const canIsolate = ISOLATABLE_TARGET.has(target.status);
+  const guide = target.error ? guideFor(target.error) : undefined;
   return (
-    <div className="cgr-row is-run">
-      <span className={`cg-lamp ${tone}`} />
-      <span className="cgo-main">
-        <b title={t.node_id}>{nameOf(t.node_id)}</b>
-        <small>
-          {[t.node_id, ...actionsOf(t).map(action => (ACTION_LABEL as Record<string, string>)[action] ?? action)].join(
-            ' · ',
+    <div className="cgp-fail">
+      <div className="cgp-fhead">
+        <span className="cgp-flag">
+          <RegionFlag code={country} />
+        </span>
+        <b title={target.node_id}>{name}</b>
+        <small>{[target.node_id, ...actionLabels(target)].join(' · ')}</small>
+        <span className={`cgp-fstate${failed ? ' err' : ''}`}>
+          {failed && <span className="cg-lamp err" />}
+          {STATUS_TEXT[target.status] ?? target.status}
+        </span>
+      </div>
+      {target.error && <code>{target.error}</code>}
+      {guide && (
+        <p>
+          <span>处理方式</span>
+          {guide}
+          {target.status === 'failed-dirty' ? ' 这台机器当前状态未知，请先登录确认。' : ''}
+        </p>
+      )}
+      {(failed || canIsolate) && (
+        <div className="ops">
+          {failed && (
+            <button className="btn" disabled={!publisher || retryPending} onClick={onRetry}>
+              {retrying ? '重试中…' : '重试'}
+            </button>
           )}
-        </small>
-      </span>
-      <span className={`cgo-state ${tone}`}>{STATUS_TEXT[t.status] ?? t.status}</span>
-      <span className="cgo-when">{t.dispatched_at ? <Ago at={t.dispatched_at} /> : '—'}</span>
-      {(t.error || canRetry || canIsolate) && (
-        <div className="cgr-fail">
-          {t.error && <code>{t.error}</code>}
-          {t.error && guide && (
-            <p>
-              <span>处理方式</span>
-              {guide}
-              {t.status === 'failed-dirty' ? ' 这台机器当前状态未知，请先登录确认。' : ''}
-            </p>
-          )}
-          {(canRetry || canIsolate) && (
-            <div className="ops">
-              {canRetry && (
-                <button className="btn" disabled={!publisher || retryPending} onClick={onRetry}>
-                  {retrying ? '重试中…' : '重试'}
-                </button>
-              )}
-              {canIsolate && (
-                <button className="btn danger" disabled={!system} onClick={onIsolate}>
-                  隔离
-                </button>
-              )}
-            </div>
+          {canIsolate && (
+            <button className="btn danger" disabled={!system} onClick={onIsolate}>
+              隔离
+            </button>
           )}
         </div>
       )}

@@ -1,4 +1,4 @@
-import { Fragment, memo, useEffect, useState, type CSSProperties, type ReactNode } from 'react';
+import { Fragment, memo, useEffect, useId, useState, type CSSProperties, type ReactNode } from 'react';
 import { keepPreviousData, useMutation, useMutationState, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ApiError,
@@ -212,6 +212,7 @@ const SOURCE_PROTOCOL_NAMES = new Map([
   ['vless', 'VLESS'],
   ['anytls', 'AnyTLS'],
   ['hysteria2', 'Hysteria2'],
+  ['mtproto', 'MTProxy'],
   ['unknown', '协议未知'],
 ]);
 
@@ -229,6 +230,19 @@ function sourceProtocols(source: UserOnlineSource, nodeId: string): string {
     .filter(([protocol]) => protocols.has(protocol))
     .map(([, name]) => name)
     .join(' · ');
+}
+
+function sourceProtocolSummary(source: UserOnlineSource): string {
+  const protocols = new Set(
+    (source.accesses ?? []).flatMap(access =>
+      access.protocols?.length
+        ? access.protocols.map(protocol => (SOURCE_PROTOCOL_NAMES.has(protocol) ? protocol : 'unknown'))
+        : ['unknown'],
+    ),
+  );
+  if (!protocols.size) protocols.add('unknown');
+  const labels = [...SOURCE_PROTOCOL_NAMES].filter(([protocol]) => protocols.has(protocol)).map(([, name]) => name);
+  return labels.length <= 2 ? labels.join(' / ') : `${labels.length} 种协议`;
 }
 
 function PresenceNodeLink({ id, nameOf }: { id: string; nameOf: (id: string) => string }) {
@@ -362,13 +376,17 @@ const PresenceRow = memo(function PresenceRow({
   nameOf: (id: string) => string;
   today: number;
 }) {
+  const [accessExpanded, setAccessExpanded] = useState(false);
+  const accessId = useId();
   const lastSeen = observedAt(source.last_observed_at);
   const network = sourceNetwork(country, operator);
   const title = observedTitle(source, online);
   const time = online ? '' : Number.isNaN(lastSeen) ? '—' : older ? monthDayOf(lastSeen) : clockOf(lastSeen);
   const past = online ? '' : '历史';
+  const accessCount = source.node_ids.length;
+  const accessSummary = accessCount === 0 ? '接入节点未知' : `${accessCount} 个入口 · ${sourceProtocolSummary(source)}`;
   return (
-    <li className={`user-presence-row${online ? '' : ' off'}`}>
+    <li className={`user-presence-row${online ? '' : ' off'}${accessExpanded ? ' expanded' : ''}`}>
       <span className="user-presence-time" title={title}>
         {time}
       </span>
@@ -389,22 +407,36 @@ const PresenceRow = memo(function PresenceRow({
           {network.code && <RegionFlag code={network.code} />}
           <span>{network.label}</span>
         </span>
-        <span className="user-presence-access">
-          {source.node_ids.length === 0 ? (
-            <span className="user-presence-unknown">接入节点未知</span>
-          ) : (
-            source.node_ids.map(id => (
-              <span key={id} className="user-presence-access-item">
-                <PresenceNodeLink id={id} nameOf={nameOf} />
-                <span className="user-presence-protocols">{sourceProtocols(source, id)}</span>
-              </span>
-            ))
+        <button
+          type="button"
+          className="user-presence-access-toggle"
+          aria-expanded={accessExpanded}
+          aria-controls={accessId}
+          aria-label={`${accessExpanded ? '收起' : '展开'} ${accessCount} 个入口详情`}
+          disabled={accessCount === 0}
+          onClick={() => setAccessExpanded(expanded => !expanded)}
+        >
+          <span>{accessSummary}</span>
+          {accessCount > 0 && (
+            <span className="user-presence-access-caret" aria-hidden="true">
+              ›
+            </span>
           )}
-        </span>
+        </button>
       </span>
       <span className="user-presence-first" title={title}>
         首次 {firstSeenLabel(observedAt(source.first_observed_at), today)}
       </span>
+      {accessExpanded && accessCount > 0 && (
+        <div id={accessId} className="user-presence-access">
+          {source.node_ids.map(id => (
+            <span key={id} className="user-presence-access-item">
+              <PresenceNodeLink id={id} nameOf={nameOf} />
+              <span className="user-presence-protocols">{sourceProtocols(source, id)}</span>
+            </span>
+          ))}
+        </div>
+      )}
     </li>
   );
 });
@@ -600,6 +632,17 @@ const QUOTA_ATTENTION_PCT = 95;
 export function quotaStage(pct: number): string {
   if (pct < QUOTA_ATTENTION_PCT) return '余裕';
   return `${pct.toFixed(0)}%`;
+}
+
+/** 名册环形表示用户所有有限额度线路的合计，不让某一条小额度线路支配总览。 */
+export function combinedQuotaPercent(rows: { used: number | null; limit: number | null }[]): number | null {
+  const limited = rows.filter(
+    (row): row is { used: number; limit: number } => row.used !== null && row.limit !== null && row.limit > 0,
+  );
+  if (limited.length === 0) return null;
+  const used = limited.reduce((total, row) => total + row.used, 0);
+  const limit = limited.reduce((total, row) => total + row.limit, 0);
+  return (used / limit) * 100;
 }
 
 // 名册恢复线上原有的中性环形进度；右侧文字单独按阶段显示。
@@ -2306,7 +2349,7 @@ function UserList({
   // 常态不画状态灯：流量用尽与系统停用为红点，未授权为空心灰点，已停用整行降一档、不再叠灯。
   // 管理员第二行放在线来源，普通用户只看接入点数量；异常、未授权和停用状态优先于观测值，
   // 避免把诊断信息盖住权限事实。
-  // 右列定宽，用量读数与额度百分比的右缘逐行对齐；额度取各线路中最接近额度的一条。
+  // 右列定宽，用量读数与额度百分比的右缘逐行对齐；环形按有限额度线路的合计用量 / 合计额度。
   const rosterRow = (row: (typeof allRows)[number]) => {
     const { u, key, mine, suspended, use, quotaRows, facts, tone } = row;
     const disabled = u.status === 'disabled';
@@ -2322,11 +2365,8 @@ function UserList({
             ? { text: '未授权', bad: false }
             : null;
     const usage = monthlyState === 'ready' && use.rows.length > 0 ? compactUsage(use.total) : null;
-    const limited = quotaRows.filter(q => q.limit !== null && q.used !== null);
-    const maxPct = limited.length
-      ? Math.max(...limited.map(q => ((q.used as number) / (q.limit as number)) * 100))
-      : null;
-    const over = facts.exhausted.length > 0;
+    const quotaPct = combinedQuotaPercent(quotaRows);
+    const quotaOver = quotaPct !== null && quotaPct >= 100;
     const userPresence = presenceByUser.get(key);
     const presenceText = canViewPresence ? userPresenceText(userPresence) : `${mine.length} 个接入点`;
     const presenceTitle = userPresence?.sources.length
@@ -2370,11 +2410,11 @@ function UserList({
             <span className="user-row-state">{mine.length} 个接入点</span>
           )}
         </span>
-        <span className="user-row-quota" title={maxPct === null ? undefined : `额度 ${quotaStage(maxPct)}`}>
-          {maxPct !== null && (
+        <span className="user-row-quota" title={quotaPct === null ? undefined : `总额度 ${quotaStage(quotaPct)}`}>
+          {quotaPct !== null && (
             <>
-              <QuotaRing pct={maxPct} over={over} />
-              <span className={over ? 'over' : undefined}>{quotaStage(maxPct)}</span>
+              <QuotaRing pct={quotaPct} over={quotaOver} />
+              <span className={quotaOver ? 'over' : undefined}>{quotaStage(quotaPct)}</span>
             </>
           )}
         </span>

@@ -15,6 +15,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
@@ -25,16 +26,31 @@ import (
 var (
 	errKernelTLSUnavailable     = stderrors.New("kernel TLS is unavailable")
 	errKernelTLSUnsupportedConn = stderrors.New("connection does not expose a raw socket")
+	errKernelTLSTXOwnsWrites    = stderrors.New("kernel TLS owns the transmit record layer")
 )
 
-type kernelTLSKeyMaterial struct {
-	cipherSuite      uint16
-	txKey            []byte
-	txIV             []byte
-	txRecordSequence uint64
-	rxKey            []byte
-	rxIV             []byte
-	rxRecordSequence uint64
+type kernelTLSTXKeyMaterial struct {
+	cipherSuite    uint16
+	key            []byte
+	iv             []byte
+	recordSequence uint64
+}
+
+// kernelTLSTXReadConn leaves Go TLS on the ordinary socket read path after
+// promotion, but rejects record-layer writes originating inside crypto/tls.
+// Application writes bypass crypto/tls and go to the raw kTLS TX socket. This
+// prevents alerts or KeyUpdate responses from being encrypted once by Go and
+// then a second time by the kernel.
+type kernelTLSTXReadConn struct {
+	net.Conn
+	txEnabled atomic.Bool
+}
+
+func (c *kernelTLSTXReadConn) Write(p []byte) (int, error) {
+	if c.txEnabled.Load() {
+		return 0, errKernelTLSTXOwnsWrites
+	}
+	return c.Conn.Write(p)
 }
 
 // KernelTLSFallbackReason identifies the compatibility condition that kept one
@@ -58,17 +74,16 @@ const (
 	KernelTLSFallbackOther                 KernelTLSFallbackReason = "other"
 )
 
-func (m *kernelTLSKeyMaterial) clear() {
-	clear(m.txKey)
-	clear(m.txIV)
-	clear(m.rxKey)
-	clear(m.rxIV)
+func (m *kernelTLSTXKeyMaterial) clear() {
+	clear(m.key)
+	clear(m.iv)
 }
 
-// TryEnableKernelTLS promotes a server-side TLS connection before its first
-// application read. In auto mode unsupported platforms and cipher suites keep
-// using Go TLS. Handshake failures and failures after the kernel socket has
-// been modified remain fatal.
+// TryEnableKernelTLS promotes server-side TLS writes before the first
+// application read. Reads remain on Go TLS, which outperforms software kTLS RX
+// on machines without receive offload. In auto mode unsupported platforms and
+// cipher suites keep using Go TLS. Handshake failures and failures after the
+// kernel socket has been modified remain fatal.
 func TryEnableKernelTLS(ctx context.Context, conn net.Conn) (bool, error) {
 	enabled, _, err := TryEnableKernelTLSWithReason(ctx, conn)
 	return enabled, err
@@ -119,15 +134,16 @@ func TryEnableKernelTLSWithReason(ctx context.Context, conn net.Conn) (bool, Ker
 	return false, reason, err
 }
 
-// KernelTLSRawConn returns the plaintext kernel-TLS socket after promotion.
-// Callers must preserve protocol framing and serialize it with ordinary writes.
+// KernelTLSRawConn returns the plaintext kernel-TLS transmit socket after
+// promotion. Callers must preserve protocol framing and serialize it with
+// ordinary writes. Reads must continue through Conn so Go TLS owns RX.
 func KernelTLSRawConn(conn net.Conn) (net.Conn, bool) {
 	inner := conn
 	if counterConn, ok := inner.(*stat.CounterConnection); ok {
 		inner = counterConn.Connection
 	}
 	tlsConn, ok := inner.(*Conn)
-	if !ok || tlsConn.kernelTLSConn() == nil {
+	if !ok || tlsConn.kernelTLSWriteConn() == nil {
 		return nil, false
 	}
 	return tlsConn.rawConn, true
@@ -179,7 +195,7 @@ func (c *Conn) enableKernelTLS(ctx context.Context) (bool, KernelTLSFallbackReas
 	c.promoteMu.Lock()
 	defer c.promoteMu.Unlock()
 
-	if c.kernelTLSConn() != nil {
+	if c.kernelTLSWriteConn() != nil {
 		return true, KernelTLSFallbackNone, nil
 	}
 	if c.serverConfig == nil || c.rawConn == nil {
@@ -192,15 +208,18 @@ func (c *Conn) enableKernelTLS(ctx context.Context) (bool, KernelTLSFallbackReas
 		return false, KernelTLSFallbackPreflight, fmt.Errorf("%w: %v", errKernelTLSUnavailable, err)
 	}
 
-	secrets := newTrafficSecretCapture()
+	secrets := newServerTrafficSecretCapture()
 	config, ticketRecords, err := prepareKernelTLSServerConfig(c.serverConfig, secrets)
 	if err != nil {
 		secrets.clear()
 		return false, KernelTLSFallbackSessionTickets, fmt.Errorf("%w: prepare TLS session tickets: %v", errKernelTLSUnavailable, err)
 	}
 
-	boundaryConn := newTLSRecordBoundaryConn(c.rawConn)
-	tlsConn := gotls.Server(boundaryConn, config)
+	// The wrapper delegates reads directly and blocks crypto/tls from writing
+	// records after the kernel takes ownership of TX. Application reads stay on
+	// Go TLS and use the full-record ReadMultiBuffer path.
+	tlsReadConn := &kernelTLSTXReadConn{Conn: c.rawConn}
+	tlsConn := gotls.Server(tlsReadConn, config)
 	c.stateMu.Lock()
 	c.Conn = tlsConn
 	c.stateMu.Unlock()
@@ -216,23 +235,21 @@ func (c *Conn) enableKernelTLS(ctx context.Context) (bool, KernelTLSFallbackReas
 		secrets.clear()
 		return false, KernelTLSFallbackTLSVersion, fmt.Errorf("%w: negotiated TLS version 0x%x", errKernelTLSUnavailable, state.Version)
 	}
-	clientSecret, serverSecret, ok := secrets.takeTrafficSecrets()
+	serverSecret, ok := secrets.takeServerTrafficSecret()
 	secrets.clear()
 	if !ok {
-		clear(clientSecret)
 		clear(serverSecret)
-		return false, KernelTLSFallbackTrafficSecrets, fmt.Errorf("%w: TLS 1.3 traffic secrets were not captured", errKernelTLSUnavailable)
+		return false, KernelTLSFallbackTrafficSecrets, fmt.Errorf("%w: TLS 1.3 server traffic secret was not captured", errKernelTLSUnavailable)
 	}
-	defer clear(clientSecret)
 	defer clear(serverSecret)
 
-	material, err := deriveKernelTLSKeyMaterial(state.CipherSuite, serverSecret, clientSecret)
+	material, err := deriveKernelTLSTXKeyMaterial(state.CipherSuite, serverSecret)
 	if err != nil {
 		return false, KernelTLSFallbackCipherSuite, fmt.Errorf("%w: %v", errKernelTLSUnavailable, err)
 	}
-	material.txRecordSequence = *ticketRecords
+	material.recordSequence = *ticketRecords
 	defer material.clear()
-	modified, err := installKernelTLS(c.rawConn, material)
+	modified, err := installKernelTLSTX(c.rawConn, material)
 	if err != nil {
 		if modified {
 			_ = c.rawConn.Close()
@@ -240,14 +257,14 @@ func (c *Conn) enableKernelTLS(ctx context.Context) (bool, KernelTLSFallbackReas
 		}
 		return false, KernelTLSFallbackSocket, fmt.Errorf("%w: %v", errKernelTLSUnavailable, err)
 	}
-
 	c.stateMu.Lock()
-	c.kernelConn = newKernelTLSConn(c.rawConn)
+	tlsReadConn.txEnabled.Store(true)
+	c.kernelWriteConn = c.rawConn
 	c.stateMu.Unlock()
 	return true, KernelTLSFallbackNone, nil
 }
 
-func deriveKernelTLSKeyMaterial(cipherSuite uint16, txSecret, rxSecret []byte) (*kernelTLSKeyMaterial, error) {
+func deriveKernelTLSTXKeyMaterial(cipherSuite uint16, txSecret []byte) (*kernelTLSTXKeyMaterial, error) {
 	var (
 		hashFunc func() hash.Hash
 		keyLen   int
@@ -262,7 +279,7 @@ func deriveKernelTLSKeyMaterial(cipherSuite uint16, txSecret, rxSecret []byte) (
 	default:
 		return nil, fmt.Errorf("unsupported TLS 1.3 cipher suite 0x%x", cipherSuite)
 	}
-	if len(txSecret) != hashFunc().Size() || len(rxSecret) != hashFunc().Size() {
+	if len(txSecret) != hashFunc().Size() {
 		return nil, fmt.Errorf("invalid traffic secret size for cipher suite 0x%x", cipherSuite)
 	}
 
@@ -275,26 +292,10 @@ func deriveKernelTLSKeyMaterial(cipherSuite uint16, txSecret, rxSecret []byte) (
 		clear(txKey)
 		return nil, err
 	}
-	rxKey, err := expandTLS13Label(hashFunc, rxSecret, "key", keyLen)
-	if err != nil {
-		clear(txKey)
-		clear(txIV)
-		return nil, err
-	}
-	rxIV, err := expandTLS13Label(hashFunc, rxSecret, "iv", 12)
-	if err != nil {
-		clear(txKey)
-		clear(txIV)
-		clear(rxKey)
-		return nil, err
-	}
-
-	return &kernelTLSKeyMaterial{
+	return &kernelTLSTXKeyMaterial{
 		cipherSuite: cipherSuite,
-		txKey:       txKey,
-		txIV:        txIV,
-		rxKey:       rxKey,
-		rxIV:        rxIV,
+		key:         txKey,
+		iv:          txIV,
 	}, nil
 }
 
@@ -308,18 +309,17 @@ func expandTLS13Label(hashFunc func() hash.Hash, secret []byte, label string, le
 	return hkdf.Expand(hashFunc, secret, string(info), length)
 }
 
-type trafficSecretCapture struct {
+type serverTrafficSecretCapture struct {
 	mu     sync.Mutex
 	buffer []byte
-	client []byte
 	server []byte
 }
 
-func newTrafficSecretCapture() *trafficSecretCapture {
-	return &trafficSecretCapture{}
+func newServerTrafficSecretCapture() *serverTrafficSecretCapture {
+	return &serverTrafficSecretCapture{}
 }
 
-func (c *trafficSecretCapture) Write(p []byte) (int, error) {
+func (c *serverTrafficSecretCapture) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -337,18 +337,9 @@ func (c *trafficSecretCapture) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (c *trafficSecretCapture) consumeLine(line []byte) {
+func (c *serverTrafficSecretCapture) consumeLine(line []byte) {
 	fields := bytes.Fields(line)
-	if len(fields) != 3 {
-		return
-	}
-	var target *[]byte
-	switch {
-	case bytes.Equal(fields[0], []byte("CLIENT_TRAFFIC_SECRET_0")):
-		target = &c.client
-	case bytes.Equal(fields[0], []byte("SERVER_TRAFFIC_SECRET_0")):
-		target = &c.server
-	default:
+	if len(fields) != 3 || !bytes.Equal(fields[0], []byte("SERVER_TRAFFIC_SECRET_0")) {
 		return
 	}
 	secret := make([]byte, hex.DecodedLen(len(fields[2])))
@@ -358,29 +349,25 @@ func (c *trafficSecretCapture) consumeLine(line []byte) {
 		return
 	}
 	secret = secret[:n]
-	clear(*target)
-	*target = secret
+	clear(c.server)
+	c.server = secret
 }
 
-func (c *trafficSecretCapture) takeTrafficSecrets() (client, server []byte, ok bool) {
+func (c *serverTrafficSecretCapture) takeServerTrafficSecret() (server []byte, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	client = c.client
 	server = c.server
-	c.client = nil
 	c.server = nil
-	return client, server, len(client) > 0 && len(server) > 0
+	return server, len(server) > 0
 }
 
-func (c *trafficSecretCapture) clear() {
+func (c *serverTrafficSecretCapture) clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	clear(c.buffer)
-	clear(c.client)
 	clear(c.server)
 	c.buffer = nil
-	c.client = nil
 	c.server = nil
 }

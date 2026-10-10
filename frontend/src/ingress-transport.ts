@@ -20,7 +20,7 @@ export function projectionForTransport(projection: IngressProjection, _kind: Tra
         )
       : pair;
   const next: IngressProjection = { ...copyPair(projection) };
-  const protocols = ['vless_encryption', 'anytls', 'hysteria2'] as const;
+  const protocols = ['vless_encryption', 'anytls', 'hysteria2', 'mtproto'] as const;
   protocols.forEach(protocol => {
     if (projection[protocol] !== undefined) next[protocol] = copyPair(projection[protocol]);
   });

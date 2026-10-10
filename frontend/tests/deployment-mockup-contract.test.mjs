@@ -38,7 +38,7 @@ test('发布页面使用 mockup 的页签 + 驾驶舱结构，不保留旧 dp �
   assert.match(deploy, /className="nd-sheet nd-page cg-page cg-detail"/);
   assert.match(deploy, /className="nd-paper-body cg-body"/);
   assert.match(deploy, /className="cgr-waves"/);
-  assert.match(deploy, /className="cg-files/);
+  assert.match(deploy, /className="cga-list"/);
   assert.match(deploy, /className=\{`cg-foot/);
   // Agent 与 Xray 用同一套词：升级范围、待升级 / 可升级 / 不可升级、批准。
   for (const [name, contents] of [
@@ -73,7 +73,7 @@ test('发布页是一条流水，变更单复用全站单栏宽度', () => {
     styles,
     /@container \(max-width: 1080px\)\s*\{[\s\S]*?\.cg-detail \.cg-body\.nd-paper-body\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/,
   );
-  assert.match(styles, /\.cg-files\s*\{[^}]*grid-template-columns:\s*216px minmax\(0, 1fr\)/s);
+  assert.match(styles, /\.cga-row\s*\{[^}]*grid-template-columns:\s*minmax\(220px, 300px\) minmax\(0, 1fr\) auto/s);
   assert.match(styles, /\.cg-disclosure > summary::after\s*\{[^}]*display:\s*none;/s);
   // 驾驶舱铺满纸面内距；机器表各行定宽对齐，窄宽度改为一台两行。
   assert.match(styles, /\.usage-cockpit\.cgc-cockpit\s*\{[^}]*margin:\s*-18px -20px -22px/s);
@@ -88,4 +88,49 @@ test('发布页是一条流水，变更单复用全站单栏宽度', () => {
   assert.doesNotMatch(deploy, /执行前 → 本次目标/);
   assert.match(deploy, /<summary className="btn" aria-label="更多操作">\s*<Icon of="more" size=\{16\} \/>/s);
   assert.doesNotMatch(deploy, />\s*•••\s*</);
+});
+
+test('变更单：执行进度是时间线，产物是一行一个归属的清单，页头备注单行截取', () => {
+  // 时间线：16 内距 + 54 时刻列 + 12 间距 + 10 半个图标，竖线穿过结果图标中心；机器格与阶段名同一左缘。
+  assert.match(
+    styles,
+    /\.cgp-head,\s*\.cgp-group\s*\{[^}]*grid-template-columns:\s*54px 20px minmax\(0, 1fr\) auto 40px/s,
+  );
+  assert.match(styles, /\.cgp-line > li::before\s*\{[^}]*left:\s*91\.5px/s);
+  assert.match(styles, /\.cgp-grid\s*\{[^}]*padding:\s*0 16px 6px 114px/s);
+  assert.match(styles, /\.cgp-fail\s*\{[^}]*margin:\s*0 16px 6px 114px/s);
+  assert.match(styles, /@container \(max-width: 700px\)\s*\{[\s\S]*?\.cgp-line > li::before\s*\{[^}]*left:\s*25\.5px/);
+  assert.match(
+    styles,
+    /@media \(prefers-reduced-motion: reduce\)\s*\{\s*\.cg-lamp\.run,\s*\.cgp-step\.run \.cgp-node > i\s*\{/,
+  );
+  // 产物清单：变更单详情与创建变更单共用一套行与差异视图，差异区定高滚动；旧的文件树双栏已删除。
+  assert.match(styles, /\.cga-code\.fg-code\s*\{[^}]*max-height:\s*520px/s);
+  assert.equal(deploy.match(/<ArtifactList\b/g)?.length, 2, '产物记录与产物差异都应使用 ArtifactList');
+  assert.doesNotMatch(deploy, /cg-files|cg-tree|cg-viewer|cgr-fail|collapseContext/);
+  assert.doesNotMatch(
+    styles,
+    /\.cg-files\b|\.cg-tree\b|\.cg-viewer\b|\.cg-diff\b|\.cgr-fail\b|\.cg-artifact-unavailable/,
+  );
+  // 创建变更单的产物差异在第一次展开时才挂载：每份变更文件要拉两个修订的内容。
+  assert.match(deploy, /\{artifactsShown && \(\s*<ArtifactChanges/);
+  // 页头：身份区不再 flex: none 撑满，备注最宽 30em 后省略，修订范围单独一段不截。
+  assert.match(styles, /\.cg-detail \.cg-head \.nd-page-identity\s*\{\s*flex:\s*0 1 auto;/);
+  assert.match(styles, /\.cg-head-note\s*\{[^}]*max-width:\s*30em;[^}]*text-overflow:\s*ellipsis/s);
+  assert.match(styles, /\.cg-head-range\s*\{\s*flex:\s*none;/);
+  assert.match(deploy, /<span className="cg-head-note" title=\{note\}>/);
+});
+
+test('产物记录折叠后保留完整标题条', () => {
+  // 公共折叠规则用 -11px 下外边距抵消卡片 11px 下内距；分区内距为 0，必须在其后归零，
+  // 否则折叠卡只占 22px，标题条下半截被裁掉。两条规则优先级相同，由先后顺序决定。
+  assert.match(
+    deploy,
+    /<details\s+className="panel config-panel cg-sec cg-disclosure cg-artifact-review"\s+open=\{expanded\}\s+onToggle=/,
+  );
+  assert.match(styles, /\.cg-sec\.panel\s*\{[^}]*padding:\s*0;/s);
+  const shared = styles.search(/\.panel\.config-panel:not\(\[open\]\) > summary[^{]*\{[^}]*margin-bottom:\s*-11px;/s);
+  const section = styles.search(/\.cg-sec\.panel:not\(\[open\]\) > summary\s*\{[^}]*margin-bottom:\s*0;/s);
+  assert.notEqual(shared, -1, '公共折叠规则已改动，需重新核对分区标题条');
+  assert.ok(section > shared, '分区折叠标题条的归零规则必须位于公共折叠规则之后');
 });

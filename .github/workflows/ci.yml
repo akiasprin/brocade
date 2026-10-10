@@ -41,7 +41,7 @@ permissions:
 
 jobs:
   xray-data-plane:
-    name: xray AnyTLS + Mux/reverse test, vet and race
+    name: xray data-plane test, vet and race
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -61,8 +61,11 @@ jobs:
       - name: Prepare pinned Xray assets
         run: sh "$GITHUB_WORKSPACE/scripts/prepare-xray-assets.sh"
 
-      - name: AnyTLS deterministic and fuzz-seed tests
-        run: go test ./proxy/anytls -count=10 -timeout=5m
+      - name: Data-plane deterministic, kTLS and fuzz-seed tests
+        run: |
+          go test ./proxy/anytls -count=10 -timeout=5m
+          go test ./transport/internet/tls -count=1 -timeout=5m
+          go test ./proxy/mtproto -count=10 -timeout=5m
 
       - name: AnyTLS settings fuzz
         run: go test ./proxy/anytls -run '^$' -fuzz '^FuzzAnyTLSSettings$' -fuzztime=10s -timeout=2m
@@ -76,8 +79,11 @@ jobs:
       - name: AnyTLS UoT-record fuzz
         run: go test ./proxy/anytls -run '^$' -fuzz '^FuzzAnyTLSUoTRecords$' -fuzztime=10s -timeout=2m
 
-      - name: AnyTLS race tests
-        run: go test -race ./proxy/anytls -count=3 -timeout=10m
+      - name: Data-plane race tests
+        run: go test -race ./transport/internet/tls ./proxy/anytls ./proxy/mtproto -count=3 -timeout=10m
+
+      - name: Data-plane vet
+        run: go vet ./transport/internet/tls ./proxy/anytls ./proxy/mtproto
 
       - name: Online source protocol tracking
         run: |

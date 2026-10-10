@@ -67,9 +67,13 @@ describe('首次发布产物', () => {
     );
 
     expect(await view.findByText('台北一号')).toBeTruthy();
-    expect(view.getByText('1 份新建')).toBeTruthy();
     expect(await view.findByText(/warning/)).toBeTruthy();
     expect(view.container.querySelectorAll('tr.add')).toHaveLength(3);
+    // 页签：文件名、新增与增删读数；新建内容整份展开，不收起任何一行
+    const tab = view.getByRole('button', { name: /xray\.json/ });
+    expect(tab.getAttribute('aria-pressed')).toBe('true');
+    expect(tab.textContent).toBe('xray.json新增+3');
+    expect(view.container.querySelector('.cga-gap')).toBeNull();
     expect(fetchMock.mock.calls.filter(([path]) => String(path).startsWith('/artifacts/index'))).toHaveLength(1);
   });
 });

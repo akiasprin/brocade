@@ -7,9 +7,14 @@
 //!
 //! - Cleanup deletes by record id. Deleting by name removes the sibling too, and the order that is
 //!   still using it fails with an error that points at DNS instead of at us.
-//! - An order that dies between publishing and cleanup can leave records behind. They are safer
-//!   left stale than swept by name: the same challenge name can be in use by another ACME client,
-//!   and deleting records we did not create can break somebody else's live renewal.
+//! - An order that dies between publishing and cleanup can leave records behind. Records created
+//!   here carry an exact Brocade comment, so the next scan can remove only those records by id
+//!   without touching another ACME client's TXT value at the same name.
+//!
+//! Publishing is also idempotent. Let's Encrypt may reuse a still-pending authorization after a
+//! retry, which gives the retry the same TXT name and value. Cloudflare answers a second POST with
+//! code 81058 (`An identical record already exists`); finding and reusing the exact value avoids
+//! turning a harmless retry into a failed certificate order.
 //!
 //! # Why the wait can give up without failing
 //!
@@ -40,9 +45,16 @@ const DOH: &str = "https://cloudflare-dns.com/dns-query";
 
 const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(60);
 const PROPAGATION_INTERVAL: Duration = Duration::from_secs(3);
+const RECORDS_PER_PAGE: u64 = 5_000;
+const MAX_RECORD_PAGES: u64 = 1_000;
 /// The TXT record's TTL. Short because it lives for seconds; not shorter because Cloudflare's
 /// floor for a non-automatic TTL is 60.
 const CHALLENGE_TTL: u32 = 60;
+const ACME_RECORD_COMMENT: &str = "brocade ACME dns-01";
+/// Older consoles kept an orange-clouded A record for every certificate SNI. Subscriptions dial
+/// the machine IP directly and carry the name only as TLS SNI, so those records have no runtime
+/// consumer. The marker remains here solely so a newer console can remove what an older one made.
+const LEGACY_NODE_RECORD_COMMENT: &str = "brocade node";
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -73,10 +85,28 @@ pub struct Cloudflare {
     zone_id: String,
 }
 
-/// A record this process created, and therefore is responsible for removing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DnsRecord {
+    id: String,
+    name: String,
+    content: String,
+    comment: Option<String>,
+}
+
+/// A challenge record used by this order. `delete_after_use` is false when an exact value exists
+/// without Brocade's ownership marker: it is valid proof and can be reused, but is not ours to
+/// remove.
 pub struct PublishedRecord {
     pub id: String,
     pub name: String,
+    pub delete_after_use: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ManagedCleanup {
+    pub legacy_address_records: usize,
+    pub challenge_records: usize,
+    pub failures: Vec<String>,
 }
 
 fn transport(error: reqwest::Error) -> Error {
@@ -109,6 +139,47 @@ fn unwrap_envelope(body: Value) -> Result<Value> {
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "没有给出原因".to_owned());
     Err(Error::Api(detail))
+}
+
+fn parse_records(result: &Value) -> Result<Vec<DnsRecord>> {
+    let records = result
+        .as_array()
+        .ok_or_else(|| Error::Api("DNS 记录列表不是数组".to_owned()))?;
+    records
+        .iter()
+        .map(|record| {
+            let field = |name: &str| {
+                record
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| Error::Api(format!("DNS 记录缺少 {name}")))
+            };
+            Ok(DnsRecord {
+                id: field("id")?,
+                name: field("name")?,
+                content: field("content")?,
+                comment: record
+                    .get("comment")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+fn reusable_challenge(records: &[DnsRecord], value: &str) -> Option<PublishedRecord> {
+    records
+        .iter()
+        .find(|record| record.content == value)
+        .map(|record| PublishedRecord {
+            id: record.id.clone(),
+            name: record.name.clone(),
+            delete_after_use: record
+                .comment
+                .as_deref()
+                .is_some_and(|comment| comment.eq_ignore_ascii_case(ACME_RECORD_COMMENT)),
+        })
 }
 
 impl Cloudflare {
@@ -157,168 +228,90 @@ impl Cloudflare {
         })
     }
 
-    /// Every TXT record currently at `name`.
-    /// Points `name` at `ipv4` behind the proxy, creating or correcting the record, and removes
-    /// any extras.
-    ///
-    /// Returns what it did, so the caller can say so once rather than every scan: this runs on a
-    /// timer and a line per node per hour would bury the one time it mattered.
-    ///
-    /// Extras are deleted rather than left alone. Two A records at one name means half the clients
-    /// resolve to a machine that is not there, which presents as "it works for some people" — the
-    /// worst shape a fault can take.
-    ///
-    /// The proxy flag is reconciled alongside the address, and for the same reason the address is:
-    /// a record written before this fleet proxied them is still exposing the machine's own
-    /// address, and nothing else would ever come back to fix it. Which means the correcting branch
-    /// now has two causes and has to say which one it acted on — a line reading "changed to the
-    /// address it already had" is the sort of log that gets a working system taken apart.
-    pub async fn ensure_a(&self, name: &str, ipv4: &str) -> Result<Option<String>> {
-        let body: Value = self
-            .http
-            .get(format!("{API}/zones/{}/dns_records", self.zone_id))
-            .query(&[("type", "A"), ("name", name)])
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(transport)?
-            .json()
-            .await
-            .map_err(transport)?;
-        let existing: Vec<(String, String, bool)> = unwrap_envelope(body)?
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|record| {
-                        Some((
-                            record.get("id")?.as_str()?.to_owned(),
-                            record.get("content")?.as_str()?.to_owned(),
-                            // A record whose flag the API did not state is read as grey and
-                            // corrected. Dropping it instead would leave it in `existing` as
-                            // surplus and get it deleted, which is a worse answer to a field we
-                            // merely failed to parse.
-                            record
-                                .get("proxied")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+    async fn records(&self, record_type: &str, name: Option<&str>) -> Result<Vec<DnsRecord>> {
+        let mut all = Vec::new();
+        let mut page = 1_u64;
+        loop {
+            let mut query = vec![
+                ("type", record_type.to_owned()),
+                ("page", page.to_string()),
+                ("per_page", RECORDS_PER_PAGE.to_string()),
+            ];
+            if let Some(name) = name {
+                query.push(("name", name.to_owned()));
+            }
+            let body: Value = self
+                .http
+                .get(format!("{API}/zones/{}/dns_records", self.zone_id))
+                .query(&query)
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .map_err(transport)?
+                .json()
+                .await
+                .map_err(transport)?;
+            let total_pages = body
+                .pointer("/result_info/total_pages")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            if total_pages > MAX_RECORD_PAGES {
+                return Err(Error::Api(format!(
+                    "DNS 记录列表有 {total_pages} 页，超过安全上限 {MAX_RECORD_PAGES}"
+                )));
+            }
+            all.extend(parse_records(&unwrap_envelope(body)?)?);
+            if page >= total_pages {
+                return Ok(all);
+            }
+            page += 1;
+        }
+    }
 
-        let mut note = None;
-        // The single record this name is allowed to end up with: the address, behind the proxy.
-        // Everything else here goes, a duplicate carrying the right address included — that one
-        // used to be merely redundant, and is now the machine's own address answering alongside
-        // the edge, which is the precise thing the proxy was turned on to stop.
-        let mut keep = existing
-            .iter()
-            .find(|(_, content, proxied)| content == ipv4 && *proxied)
-            .map(|(id, _, _)| id.clone());
-        if keep.is_none() {
-            match existing.first() {
-                // Corrected in place rather than deleted and recreated: a gap between the two,
-                // however short, is a name that resolves to nothing.
-                Some((id, was, was_proxied)) => {
-                    self.update_a(id, name, ipv4).await?;
-                    keep = Some(id.clone());
-                    note = Some(if was == ipv4 && !was_proxied {
-                        format!("{name} 由直连改走橙云")
-                    } else {
-                        format!("{name} 从 {was} 改指 {ipv4}")
-                    });
-                }
-                None => {
-                    self.create_a(name, ipv4).await?;
-                    note = Some(format!("{name} → {ipv4}"));
-                }
+    /// Removes only records carrying the exact comments used by Brocade. A records are leftovers
+    /// from the retired SNI-address reconciliation; TXT records are abandoned ACME challenges.
+    /// Records owned by a person or another ACME client are never selected.
+    pub async fn cleanup_managed_records(&self) -> Result<ManagedCleanup> {
+        let mut managed = Vec::new();
+        managed.extend(
+            self.records("A", None)
+                .await?
+                .into_iter()
+                .filter(|record| {
+                    record.comment.as_deref().is_some_and(|comment| {
+                        comment.eq_ignore_ascii_case(LEGACY_NODE_RECORD_COMMENT)
+                    })
+                })
+                .map(|record| (record, false)),
+        );
+        managed.extend(
+            self.records("TXT", None)
+                .await?
+                .into_iter()
+                .filter(|record| {
+                    record
+                        .comment
+                        .as_deref()
+                        .is_some_and(|comment| comment.eq_ignore_ascii_case(ACME_RECORD_COMMENT))
+                })
+                .map(|record| (record, true)),
+        );
+
+        let mut cleanup = ManagedCleanup::default();
+        for (record, challenge) in managed {
+            match self.delete(&record.id).await {
+                Ok(()) if challenge => cleanup.challenge_records += 1,
+                Ok(()) => cleanup.legacy_address_records += 1,
+                Err(error) => cleanup.failures.push(format!("{}：{error}", record.name)),
             }
         }
-        for (id, content, proxied) in existing
-            .iter()
-            .filter(|(id, _, _)| Some(id) != keep.as_ref())
-        {
-            self.delete(id).await?;
-            // Said apart, because the two read as different faults to whoever finds the line: a
-            // stray address is somebody else's record at our name, a stray direct one is our own
-            // address that the proxy was supposed to have taken out of the answer.
-            let what = match (content == ipv4, *proxied) {
-                (true, false) => format!("多余的直连记录 {content}"),
-                _ => format!("多余的 {content}"),
-            };
-            note = Some(match note {
-                Some(said) => format!("{said}，并清掉{what}"),
-                None => format!("{name} 清掉{what}"),
-            });
-        }
-        Ok(note)
-    }
-
-    async fn create_a(&self, name: &str, ipv4: &str) -> Result<()> {
-        let body: Value = self
-            .http
-            .post(format!("{API}/zones/{}/dns_records", self.zone_id))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({
-                "type": "A",
-                "name": name,
-                "content": ipv4,
-                // Proxied, so the name answers with Cloudflare's edge rather than the machine.
-                // Every issued certificate is published to Certificate Transparency, so
-                // `<label>.<domain>` is public the moment it exists and anyone may ask what it
-                // points at; grey-clouded, that question hands out the node's address. Orange
-                // costs the data plane nothing — subscriptions carry the address itself, and this
-                // name only ever travels as SNI, which no client resolves.
-                //
-                // What it does cost is the name in an address position: a projection host, a CDN
-                // origin, or somebody's `curl` pointed at this name now reaches the edge, and the
-                // edge speaks HTTP only. Neither is something this fleet sets up on its own.
-                //
-                // TTL is automatic because Cloudflare requires that of a proxied record. Nothing
-                // is lost: the edge answers for the name, so the number would decide nothing.
-                "ttl": 1,
-                "proxied": true,
-                "comment": "brocade node",
-            }))
-            .send()
-            .await
-            .map_err(transport)?
-            .json()
-            .await
-            .map_err(transport)?;
-        unwrap_envelope(body).map(|_| ())
-    }
-
-    async fn update_a(&self, record_id: &str, name: &str, ipv4: &str) -> Result<()> {
-        let body: Value = self
-            .http
-            .patch(format!(
-                "{API}/zones/{}/dns_records/{record_id}",
-                self.zone_id
-            ))
-            .bearer_auth(&self.token)
-            .json(&serde_json::json!({
-                "type": "A",
-                "name": name,
-                "content": ipv4,
-                // Both fields restated rather than left to PATCH's merge: this is also the path
-                // that turns an existing grey record orange, and a patch that names neither
-                // leaves it exactly as it was. See `create_a` for why orange.
-                "ttl": 1,
-                "proxied": true,
-            }))
-            .send()
-            .await
-            .map_err(transport)?
-            .json()
-            .await
-            .map_err(transport)?;
-        unwrap_envelope(body).map(|_| ())
+        Ok(cleanup)
     }
 
     pub async fn publish(&self, name: &str, value: &str) -> Result<PublishedRecord> {
+        if let Some(existing) = reusable_challenge(&self.records("TXT", Some(name)).await?, value) {
+            return Ok(existing);
+        }
         let body: Value = self
             .http
             .post(format!("{API}/zones/{}/dns_records", self.zone_id))
@@ -328,7 +321,7 @@ impl Cloudflare {
                 "name": name,
                 "content": value,
                 "ttl": CHALLENGE_TTL,
-                "comment": "brocade ACME dns-01",
+                "comment": ACME_RECORD_COMMENT,
             }))
             .send()
             .await
@@ -337,7 +330,20 @@ impl Cloudflare {
             .await
             .map_err(transport)?;
 
-        let id = unwrap_envelope(body)?
+        let created = match unwrap_envelope(body) {
+            Ok(created) => created,
+            Err(error) => {
+                // Close the race between the preflight GET and POST. It also makes a retry safe
+                // against providers which create a record but lose the create response.
+                if let Some(existing) =
+                    reusable_challenge(&self.records("TXT", Some(name)).await?, value)
+                {
+                    return Ok(existing);
+                }
+                return Err(error);
+            }
+        };
+        let id = created
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Api("建好了 TXT 但没给记录 id".to_owned()))?
@@ -345,6 +351,7 @@ impl Cloudflare {
         Ok(PublishedRecord {
             id,
             name: name.to_owned(),
+            delete_after_use: true,
         })
     }
 
@@ -428,6 +435,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn record(id: &str, name: &str, content: &str, comment: Option<&str>) -> DnsRecord {
+        DnsRecord {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            content: content.to_owned(),
+            comment: comment.map(str::to_owned),
+        }
+    }
+
     #[test]
     fn a_failed_envelope_carries_what_cloudflare_said() {
         let body = json!({
@@ -454,5 +470,63 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("没有给出原因"), "{error}");
+    }
+
+    #[test]
+    fn an_identical_brocade_challenge_is_reused_and_removed_afterwards() {
+        let existing = vec![record(
+            "txt-1",
+            "_acme-challenge.edge.example.com",
+            "proof",
+            Some(ACME_RECORD_COMMENT),
+        )];
+        let published = reusable_challenge(&existing, "proof").expect("same proof is reusable");
+        assert_eq!(published.id, "txt-1");
+        assert!(published.delete_after_use);
+    }
+
+    #[test]
+    fn an_identical_unowned_challenge_is_reused_but_not_deleted() {
+        let existing = vec![record(
+            "txt-external",
+            "_acme-challenge.edge.example.com",
+            "proof",
+            Some("managed elsewhere"),
+        )];
+        let published = reusable_challenge(&existing, "proof").expect("same proof is reusable");
+        assert_eq!(published.id, "txt-external");
+        assert!(!published.delete_after_use);
+    }
+
+    #[test]
+    fn a_different_challenge_value_does_not_hide_a_new_record() {
+        let existing = vec![record(
+            "txt-old",
+            "_acme-challenge.edge.example.com",
+            "old-proof",
+            Some(ACME_RECORD_COMMENT),
+        )];
+        assert!(reusable_challenge(&existing, "new-proof").is_none());
+    }
+
+    #[test]
+    fn record_lists_require_identity_name_and_content() {
+        let parsed = parse_records(&json!([{
+            "id": "record-1",
+            "name": "edge.example.com",
+            "content": "192.0.2.1",
+            "comment": LEGACY_NODE_RECORD_COMMENT
+        }]))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![record(
+                "record-1",
+                "edge.example.com",
+                "192.0.2.1",
+                Some(LEGACY_NODE_RECORD_COMMENT)
+            )]
+        );
+        assert!(parse_records(&json!([{"name": "missing-id.example.com"}])).is_err());
     }
 }

@@ -19,7 +19,7 @@ import {
 } from '../api';
 import { draft } from '../draft';
 import { warpTunnelId as randomWarpTunnelId } from '../model-id';
-import { can, useSession } from '../session';
+import { can, isVisitor, useSession } from '../session';
 import { Empty, EmptyState, ErrorBox, Loading } from '../ui/bits';
 import { Icon, ListIcon, PanelTitle } from '../ui/icons';
 import { RegionFlag } from '../ui/region-flag';
@@ -708,7 +708,7 @@ type TunnelReference = {
   chainId: string;
 };
 
-type WarpPhase = 'draft' | 'missing' | 'unused' | 'ready' | 'rolling' | 'live';
+type WarpPhase = 'draft' | 'missing' | 'unused' | 'configured' | 'ready' | 'rolling' | 'live';
 
 const hasWarpBindingOverrides = (binding: ExternalWarpBinding) =>
   binding.endpoint_address != null ||
@@ -726,6 +726,7 @@ function WarpTunnelDetail({
   apps,
   references,
   editable,
+  deploymentsReadable,
   editing,
   deleting,
   onEdit,
@@ -738,6 +739,7 @@ function WarpTunnelDetail({
   apps: SnapshotApp[];
   references: TunnelReference[];
   editable: boolean;
+  deploymentsReadable: boolean;
   editing: boolean;
   deleting: boolean;
   onEdit: () => void;
@@ -749,6 +751,7 @@ function WarpTunnelDetail({
   const deployments = useQuery({
     queryKey: ['deployments', 'config'],
     queryFn: () => fetchDeployments('config'),
+    enabled: deploymentsReadable,
   });
   const [registrationNode, setRegistrationNode] = useState<string | null>(null);
   const [registrationChoice, setRegistrationChoice] = useState('');
@@ -794,11 +797,13 @@ function WarpTunnelDetail({
       ? 'missing'
       : references.length === 0
         ? 'unused'
-        : converged
-          ? 'live'
-          : releaseInProgress
-            ? 'rolling'
-            : 'ready';
+        : !deploymentsReadable
+          ? 'configured'
+          : converged
+            ? 'live'
+            : releaseInProgress
+              ? 'rolling'
+              : 'ready';
   const overriddenUsing = using.filter(hasWarpBindingOverrides).length;
   const following = tunnel.bindings.filter(binding => !hasWarpBindingOverrides(binding)).length;
 
@@ -806,6 +811,7 @@ function WarpTunnelDetail({
     draft: { className: 'st-pending', text: availability.checking ? '确认中' : '未提交' },
     missing: { className: 'st-gold', text: `${missing.length} 台待注册` },
     unused: { className: 'st-pending', text: '未引用' },
+    configured: { className: 'st-pending', text: '已配置' },
     ready: { className: 'st-gold', text: '待发布' },
     rolling: { className: 'st-running', text: '发布中' },
     live: { className: 'st-succeeded', text: '已发布' },
@@ -814,6 +820,7 @@ function WarpTunnelDetail({
     draft: { className: 'dim', text: '—' },
     missing: { className: 'warn', text: '当前修订不可发布' },
     unused: { className: 'dim', text: '—' },
+    configured: { className: 'dim', text: '—' },
     ready: { className: 'warn', text: '待发布' },
     rolling: { className: 'act', text: release ? `#${release.id} 发布中` : '发布中' },
     live: { className: 'ok', text: release ? `#${release.id} 已收敛` : '已收敛' },
@@ -832,6 +839,7 @@ function WarpTunnelDetail({
     if (phase === 'missing')
       return { label: `为 ${nodeNameOf(missing[0])} 申请身份`, onClick: () => openRegistration(missing[0]) };
     if (phase === 'unused') return { label: '前往线路', onClick: () => navigate('chains') };
+    if (phase === 'configured') return null;
     if (phase === 'ready') return { label: '前往发布', onClick: () => navigate('deploy', { p: 'plan' }) };
     if (phase === 'rolling' && release)
       return { label: '查看变更单', onClick: () => navigate('deploy', { p: 'detail', id: release.id }) };
@@ -1278,6 +1286,7 @@ function TunnelDetail({ tunnelId }: { tunnelId: string }) {
         apps={apps}
         references={references}
         editable={editable}
+        deploymentsReadable={!isVisitor(who)}
         editing={editing}
         deleting={deleting}
         onEdit={() => setEditing(true)}

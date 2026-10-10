@@ -69,6 +69,7 @@ async fn fallback_guard_round_trips() {
             vless: Some(TransportRequest::VlessReality),
             anytls: None,
             hysteria2: None,
+            mtproto: None,
         },
         id: "ing-a1b2".to_owned(),
         chain_id: "chn-a1b2-c3d4".to_owned(),

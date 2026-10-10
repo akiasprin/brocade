@@ -89,13 +89,16 @@ function mount(
   snapshotValue: ConsoleSnapshot | null = snapshot,
   configDeployments: DeploymentListItem[] = [],
   committedSnapshot: ConsoleSnapshot | null = snapshotValue,
+  options: { publicView?: boolean; seedDeployments?: boolean } = {},
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY } },
   });
   if (snapshotValue) client.setQueryData(['snapshot'], snapshotValue);
   if (committedSnapshot) client.setQueryData(['snapshot', 'committed'], committedSnapshot);
-  client.setQueryData(['deployments', 'config'], { deployments: configDeployments });
+  if (options.seedDeployments !== false) {
+    client.setQueryData(['deployments', 'config'], { deployments: configDeployments });
+  }
   client.setQueryData(['nodes'], { nodes: [] });
   client.setQueryData(['users'], { users: [] });
   client.setQueryData(['tunnel-probe-capability'], {
@@ -138,11 +141,11 @@ function mount(
         value={{
           initial,
           who: {
-            operator_id: 'editor',
-            role: 'editor',
+            operator_id: options.publicView ? 'public' : 'editor',
+            role: options.publicView ? 'readonly' : 'editor',
             tenant_scope: 'platform',
             token_prefix: null,
-            masked_assets: false,
+            masked_assets: options.publicView ?? false,
           },
         }}
       >
@@ -445,6 +448,27 @@ it('shows WARP status in the page body without a duplicate progress strip', () =
   expect(view.getByRole('heading', { name: '规则引用' })).toBeTruthy();
   expect(view.queryByRole('heading', { name: '线路拨测' })).toBeNull();
   expect(view.getAllByRole('button', { name: '前往线路' })).toHaveLength(2);
+});
+
+it('does not request deployment history from a public WARP detail', async () => {
+  const request = vi.fn(async (input: RequestInfo | URL) => {
+    throw new Error(`访客不应请求 ${String(input)}`);
+  });
+  vi.stubGlobal('fetch', request);
+  const warpSnapshot: ConsoleSnapshot = {
+    ...snapshot,
+    snapshot: { ...snapshot.snapshot, external_outbounds: [warpOutbound] },
+  };
+
+  const view = mount({ drill: { p: 'warp', id: warpOutbound.id } }, warpSnapshot, [], warpSnapshot, {
+    publicView: true,
+    seedDeployments: false,
+  });
+
+  await waitFor(() => expect(view.getByRole('heading', { name: warpOutbound.name })).toBeTruthy());
+  expect(request).not.toHaveBeenCalled();
+  expect(view.client.getQueryState(['deployments', 'config'])?.fetchStatus).toBe('idle');
+  expect(view.client.getQueryData(['deployments', 'config'])).toBeUndefined();
 });
 
 it('hides tenant metadata from WARP details while keeping operational summary fields', () => {

@@ -47,6 +47,7 @@ export { dur, iso, throughputAxis } from './telemetry-format';
 import { theme } from '../forge/theme';
 import { palette } from '../forge/palette';
 import { usePresence } from '../ui/presence';
+import { CPU_STEAL_ALERT_PCT } from '../ui/telemetry-thresholds';
 import type {
   CpuDetailSample,
   DiskDetailSample,
@@ -234,7 +235,6 @@ const CPU_PEAK_WARN = 85;
     继续上升会出现丢包，而丢包在业务上表现为间歇性无法连接。 */
 const SOFTIRQ_WARN = 30;
 const CPU_PSI_WARN = 1;
-const CPU_STEAL_WARN = 5;
 const IO_PSI_WARN = 1;
 /** 可用内存低于该比例。使用 available 而非 free——free 在有 page cache 的机器上
     始终很小，按其判定会将所有正常机器报为内存不足。 */
@@ -361,7 +361,7 @@ export function loadFindings(r: NodeLoadView): Finding[] {
     );
   }
   const steal = sampleMaximum(r.series, sample => sample.cpu_steal_pct);
-  if (steal && steal.value >= CPU_STEAL_WARN) {
+  if (steal && steal.value >= CPU_STEAL_ALERT_PCT) {
     out.push(
       rollingFinding(
         {

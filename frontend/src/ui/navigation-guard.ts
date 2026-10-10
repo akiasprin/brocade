@@ -29,6 +29,17 @@ const preserveEntries = (scope?: string) => {
 };
 
 /**
+ * Give every editor its normal synchronous persistence chance, then report whether a document
+ * reload is lossless. Unlike in-app navigation, a reload destroys component memory, so entries
+ * without a persistence callback must keep the old document alive until the user saves or closes
+ * them.
+ */
+export function prepareForDocumentReload(): boolean {
+  preserveEntries();
+  return entries.size === 0;
+}
+
+/**
  * Register local form state that would be discarded when its owning surface unmounts.
  * The returned callback synchronously marks this entry saved, so a successful mutation may
  * navigate in the same tick without being mistaken for an attempted discard.

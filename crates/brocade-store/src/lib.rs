@@ -91,9 +91,12 @@ pub use brocade_deployment::protocol::{
 };
 pub use cert::{
     CertDomain, CertDomainInput, CertGroup, CertificateDnsTarget, CertificateOrder,
-    CertificateScanLock, CertificateSigningMethod, GroupCertificate, IssuedCertificate,
-    NodeCertificateState, ACME_LETSENCRYPT, ACME_LETSENCRYPT_STAGING,
-    DEFAULT_SELF_SIGNED_GROUP_NAME, SELF_SIGNED_DIRECTORY, SELF_SIGNED_INITIAL_POOL_SIZE,
+    CertificateScanCounts, CertificateScanLock, CertificateScanPhase, CertificateScanRun,
+    CertificateScanStatus, CertificateScanTrigger, CertificateSigningMethod,
+    ClaimedCertificateScan, GroupCertificate, IssuedCertificate, NodeCertificateState,
+    ACME_LETSENCRYPT, ACME_LETSENCRYPT_STAGING, CERTIFICATE_SCAN_LEASE_SECS,
+    CERTIFICATE_SCAN_RETENTION_DAYS, DEFAULT_SELF_SIGNED_GROUP_NAME, SELF_SIGNED_DIRECTORY,
+    SELF_SIGNED_INITIAL_POOL_SIZE,
 };
 pub use console::{
     ArtifactContent, ArtifactIndex, ArtifactIndexEntry, ClashHaitunLink, ClashSubscriptionUsage,

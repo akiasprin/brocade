@@ -2688,7 +2688,9 @@ fn xray_launch_command(splice_mode: &str, executable: &str, conf: &str) -> Strin
     // Set both modes explicitly so a service-manager environment cannot retain either the legacy
     // process-wide splice disable or a temporary kTLS disable after the installed Xray gains the
     // corresponding connection-scoped safeguards. kTLS auto still falls back to Go TLS when the
-    // kernel, cipher suite, or socket is unsupported; writev auto only applies after kTLS succeeds.
+    // kernel, cipher suite, or socket is unsupported; it only promotes TX because software kTLS RX
+    // regresses AnyTLS uplink capacity. RX remains on Go TLS with full-record reads, and writev auto
+    // only applies after kTLS TX succeeds.
     format!(
         "env 'xray.buf.splice={splice_mode}' 'xray.anytls.ktls=auto' 'xray.anytls.writev=auto' 'xray.anytls.splice=off' {executable} run -config {conf}"
     )
@@ -3144,6 +3146,7 @@ enum GrantAccount {
     Vless { id: String, flow: Option<String> },
     Hysteria2 { auth: String },
     AnyTls { password: String },
+    MtProto { secret: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3172,7 +3175,9 @@ fn sync_running_grants(
             .map(|client| {
                 let flow = match protocol {
                     GrantProtocol::Vless => client.flow.clone(),
-                    GrantProtocol::Hysteria2 | GrantProtocol::AnyTls => None,
+                    GrantProtocol::Hysteria2 | GrantProtocol::AnyTls | GrantProtocol::MtProto => {
+                        None
+                    }
                 };
                 (
                     client.email.clone(),
@@ -3203,7 +3208,9 @@ fn sync_running_grants(
             .filter(|client| {
                 let flow = match protocol {
                     GrantProtocol::Vless => client.flow.clone(),
-                    GrantProtocol::Hysteria2 | GrantProtocol::AnyTls => None,
+                    GrantProtocol::Hysteria2 | GrantProtocol::AnyTls | GrantProtocol::MtProto => {
+                        None
+                    }
                 };
                 actual_by_email.get(&client.email) != Some(&(client.uuid.clone(), flow))
             })
@@ -3231,6 +3238,7 @@ fn add_grant_users(api_port: u16, additions: &[GrantAddition]) -> Result<(), Str
             },
             GrantAccount::Hysteria2 { auth } => xray_grpc::XrayAccount::Hysteria2 { auth },
             GrantAccount::AnyTls { password } => xray_grpc::XrayAccount::AnyTls { password },
+            GrantAccount::MtProto { secret } => xray_grpc::XrayAccount::MtProto { secret },
         };
         xray_grpc::add_user(
             api_port,
@@ -3255,6 +3263,9 @@ fn grant_addition(protocol: GrantProtocol, tag: &str, client: &GrantClient) -> G
         GrantProtocol::AnyTls => GrantAccount::AnyTls {
             password: client.uuid.clone(),
         },
+        GrantProtocol::MtProto => GrantAccount::MtProto {
+            secret: client.uuid.clone(),
+        },
     };
     GrantAddition {
         tag: tag.to_owned(),
@@ -3269,6 +3280,7 @@ enum GrantProtocol {
     Vless,
     Hysteria2,
     AnyTls,
+    MtProto,
 }
 
 fn grant_protocol(inbound: &serde_json::Value, tag: &str) -> Result<GrantProtocol, String> {
@@ -3276,6 +3288,7 @@ fn grant_protocol(inbound: &serde_json::Value, tag: &str) -> Result<GrantProtoco
         Some("vless") => Ok(GrantProtocol::Vless),
         Some("hysteria") => Ok(GrantProtocol::Hysteria2),
         Some("anytls") => Ok(GrantProtocol::AnyTls),
+        Some("mtproto") => Ok(GrantProtocol::MtProto),
         Some(protocol) => Err(format!(
             "xray inbound {tag} protocol {protocol} does not support dynamic grants"
         )),

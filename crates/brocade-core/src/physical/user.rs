@@ -19,6 +19,7 @@ pub enum SubscriptionProtocol {
     Vless,
     AnyTls,
     Hysteria2,
+    MtProto,
 }
 
 /// Optional dimensions applied to a generated subscription. Keeping these together makes every
@@ -88,6 +89,10 @@ impl UserPlan {
                     | (
                         SubscriptionProtocol::Hysteria2,
                         UserSecurityPlan::Hysteria2(_)
+                    )
+                    | (
+                        SubscriptionProtocol::MtProto,
+                        UserSecurityPlan::MtProto { .. }
                     )
             )
         });
@@ -178,6 +183,9 @@ pub enum UserSecurityPlan {
     Tls(UserTlsPlan),
     AnyTls(UserAnyTlsPlan),
     Hysteria2(UserHysteria2Plan),
+    MtProto {
+        port: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +322,15 @@ fn securities(ingress: &Ingress) -> Vec<(UserSecurityPlan, &'static str)> {
                 reality,
             }),
             " | AnyTLS",
+        ));
+    }
+
+    if let Some(settings) = ingress.wires.mtproto() {
+        wires.push((
+            UserSecurityPlan::MtProto {
+                port: settings.port,
+            },
+            " | MTProxy",
         ));
     }
 
@@ -588,6 +605,7 @@ fn subscription_protocol_rank(security: &UserSecurityPlan) -> u8 {
         | UserSecurityPlan::VlessEncryption { .. } => 0,
         UserSecurityPlan::AnyTls(_) => 1,
         UserSecurityPlan::Hysteria2(_) => 2,
+        UserSecurityPlan::MtProto { .. } => 3,
     }
 }
 
@@ -710,6 +728,7 @@ fn projected_endpoint(
         UserSecurityPlan::VlessEncryption { .. } => ingress.projection.vless_encryption.as_ref(),
         UserSecurityPlan::AnyTls(_) => ingress.projection.anytls.as_ref(),
         UserSecurityPlan::Hysteria2(_) => ingress.projection.hysteria2.as_ref(),
+        UserSecurityPlan::MtProto { .. } => ingress.projection.mtproto.as_ref(),
     };
     if let Some(specific) = specific {
         return match family {
@@ -729,6 +748,7 @@ fn security_port(ingress: &Ingress, security: &UserSecurityPlan) -> u16 {
         UserSecurityPlan::VlessEncryption { port, .. } => *port,
         UserSecurityPlan::AnyTls(plan) => plan.settings.port,
         UserSecurityPlan::Hysteria2(plan) => plan.settings.port,
+        UserSecurityPlan::MtProto { port } => *port,
     }
 }
 

@@ -230,27 +230,6 @@ pub async fn issue_clash_haitun_link(
     tenant_id: &str,
     user_id: &str,
 ) -> Result<ClashHaitunLink> {
-    write_clash_haitun_link(pool, actor, tenant_id, user_id, false).await
-}
-
-/// Atomically replace the URL token, including an active one. Already downloaded node
-/// credentials are unchanged: invalidating them requires UUID rotation and grant publication.
-pub async fn regenerate_clash_haitun_link(
-    pool: &PgPool,
-    actor: &AdminContext,
-    tenant_id: &str,
-    user_id: &str,
-) -> Result<ClashHaitunLink> {
-    write_clash_haitun_link(pool, actor, tenant_id, user_id, true).await
-}
-
-async fn write_clash_haitun_link(
-    pool: &PgPool,
-    actor: &AdminContext,
-    tenant_id: &str,
-    user_id: &str,
-    regenerate: bool,
-) -> Result<ClashHaitunLink> {
     let tenant_id = required_text(tenant_id, "tenant_id")?;
     let user_id = required_text(user_id, "user id")?;
     require_speedtest_subscription_admin(actor, &tenant_id)?;
@@ -276,11 +255,11 @@ async fn write_clash_haitun_link(
          VALUES ($1, $2, $3::uuid)
          ON CONFLICT (tenant_id, user_id) DO UPDATE SET
              token = CASE
-                 WHEN NOT $4 AND clash_haitun_links.revoked_at IS NULL THEN clash_haitun_links.token
+                 WHEN clash_haitun_links.revoked_at IS NULL THEN clash_haitun_links.token
                  ELSE EXCLUDED.token
              END,
              created_at = CASE
-                 WHEN NOT $4 AND clash_haitun_links.revoked_at IS NULL THEN clash_haitun_links.created_at
+                 WHEN clash_haitun_links.revoked_at IS NULL THEN clash_haitun_links.created_at
                  ELSE EXCLUDED.created_at
              END,
              revoked_at = NULL
@@ -290,9 +269,34 @@ async fn write_clash_haitun_link(
     .bind(&tenant_id)
     .bind(&user_id)
     .bind(token)
-    .bind(regenerate)
     .fetch_one(pool)
     .await?;
+    clash_haitun_link_from_row(row)
+}
+
+/// Stop future pulls without minting a replacement or changing deployed node credentials.
+/// Repeated revocation preserves the original timestamp; UUID rotation still needs publication.
+pub async fn revoke_clash_haitun_link(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<ClashHaitunLink> {
+    let tenant_id = required_text(tenant_id, "tenant_id")?;
+    let user_id = required_text(user_id, "user id")?;
+    require_speedtest_subscription_admin(actor, &tenant_id)?;
+    let row = sqlx::query(
+        "UPDATE clash_haitun_links
+         SET revoked_at = COALESCE(revoked_at, now())
+         WHERE tenant_id = $1 AND user_id = $2
+         RETURNING tenant_id, user_id, token::text AS token,
+                   created_at::text AS created_at, revoked_at::text AS revoked_at",
+    )
+    .bind(&tenant_id)
+    .bind(&user_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| StoreError::NotFound(format!("Haitun link {tenant_id}/{user_id}")))?;
     clash_haitun_link_from_row(row)
 }
 

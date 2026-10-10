@@ -3254,6 +3254,52 @@ body {
   -moz-osx-font-smoothing: grayscale;
   font-variant-numeric: tabular-nums;
 }
+
+/* 已打开页面发现新部署后的唯一全局状态。平时完全不占界面；只有刷新被本地编辑阻塞，
+   或已经开始短暂的换版过程时才出现。位置避开 10px 顶栏，移动端也受安全区约束。 */
+.console-update-status {
+  position: fixed;
+  top: calc(58px + var(--safe-top));
+  right: calc(12px + var(--safe-right));
+  z-index: 1000;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(360px, calc(100vw - 24px - var(--safe-left) - var(--safe-right)));
+  box-sizing: border-box;
+  padding: 8px 11px;
+  border: 1px solid color-mix(in srgb, var(--gold) 36%, var(--line));
+  border-radius: var(--r-ctl);
+  background: var(--float);
+  color: var(--ink-2);
+  box-shadow: var(--float-edge), var(--shadow);
+  -webkit-backdrop-filter: var(--float-filter);
+  backdrop-filter: var(--float-filter);
+  font: 11.5px var(--sans);
+  pointer-events: none;
+}
+.console-update-status > span {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--gold);
+}
+.console-update-status.reloading > span {
+  animation: console-update-pulse 720ms ease-in-out infinite alternate;
+}
+@keyframes console-update-pulse {
+  to {
+    opacity: 0.38;
+    transform: scale(0.72);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .console-update-status.reloading > span {
+    animation: none;
+  }
+}
+
 button,
 input,
 select {
@@ -9143,6 +9189,20 @@ textarea.f::placeholder {
   letter-spacing: 0.11em;
   color: var(--ink-3);
 }
+/* Icon 的 span 若保留普通行内盒，SVG 会按文字基线预留 descender：即便外层方钮使用
+   place-items:center，图形仍会向上偏 1.5–2px。共享原语在这里消除行盒，并让所有调用方
+   （包括未另设 class 的关闭、复制与身份图标）使用同一几何中心。 */
+.ui-icon {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+  vertical-align: middle;
+}
+.ui-icon > svg {
+  display: block;
+}
 /* 列表标题图标与普通面板同为 14px、--ink-3；只保留独立排列所需的布局。 */
 .list-ico {
   display: inline-flex;
@@ -14605,6 +14665,12 @@ body.has-artpanel .topo-deck {
   justify-content: center;
   padding: 0;
 }
+.fg-who.guest-login {
+  gap: 5px;
+  max-width: none;
+  padding-right: 7px;
+  font-family: var(--sans);
+}
 .fg-who-name {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -14745,6 +14811,20 @@ body.has-artpanel .topo-deck {
   margin-top: 2px;
   color: var(--ink-3);
   font-size: 11px;
+}
+/* 访客尚无身份，登录动作直接占据身份头的位置。用 button 保留键盘和焦点语义，但布局、
+   字体与登录后的身份头完全相同。 */
+.fg-menu button.fg-menu-login {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 6px 7px 8px;
+}
+.fg-menu button.fg-menu-login:hover {
+  background: var(--hover);
+  color: var(--ink);
 }
 .fg-menu-check,
 .fg-menu-check svg {
@@ -15859,6 +15939,14 @@ body.fg-dragging * {
   }
 }
 
+/* 375px 及以下若同时保留完整字标、三项导航、通知和登录，只能让第三项初始落在滚动区外。
+   图标仍保留品牌入口；让出字标宽度后，三项导航无需先横滑才能看见。 */
+@media (max-width: 375px) {
+  .forge.narrow .fg-brand {
+    display: none;
+  }
+}
+
 /* ═══════════════════════════════════════════════════════════════════
    编译台的窄屏形态。断点值必须跟 ui/viewport.ts 的 NARROW_MAX 一致，
    那边是唯一定义处（跟本文件上方 workbench 那套同源）。
@@ -15872,7 +15960,7 @@ body.fg-dragging * {
    本段实现的是 forge 的对应形态：改变布局形态，而非压缩桌面布局。
    ═══════════════════════════════════════════════════════════════════ */
 @media (max-width: 820px) {
-  /* ─── 导航行：品牌 + 两个高频页面 + 通知 + 账户（44px）───
+  /* ─── 导航行：品牌 + 三个高频页面 + 通知 + 账户（44px）───
      此处原为「品牌 / 产物 / 诊断 / ⋯」，导航位于屏幕底部的 tab bar。
      该布局共三层：顶栏 53 + 面包屑 35 + tab bar 52 = 140px，占 844 屏高的 16.6%。
      随后导航上移为独立一行（45 + 41 = 86px），再并入导航行剩一行；面包屑那一行
@@ -15954,8 +16042,8 @@ body.fg-dragging * {
   /* ─── 页面导航：并入导航行，位于品牌右侧 ───
      flex:1 吃掉品牌与图标之间的全部空间，min-width:0 + overflow-x 用于兜底——
      按钮本身直接复用桌面端 .fg-nv：同样的图标、28px 高度、内距和实心选中态；
-     移动端只负责横向滚动，不再维护第二套按钮视觉。用户、隧道、发布和用量收入账户菜单后，
-     两个高频入口可以保留图标和文字。 */
+     移动端只负责横向滚动，不再维护第二套按钮视觉。用户、隧道和发布收入账户菜单后，
+     三个日常查看入口可以保留图标和文字。 */
   .fg-facebar {
     flex: 1;
     min-width: 0;
@@ -15963,6 +16051,10 @@ body.fg-dragging * {
     gap: 2px;
     overflow-x: auto;
     scrollbar-width: none;
+  }
+  .fg-facebar .fg-nv {
+    gap: 4px;
+    padding: 0 6px;
   }
   .fg-facebar::-webkit-scrollbar {
     display: none;
@@ -16032,16 +16124,43 @@ body.fg-dragging * {
     padding-left: 30px !important;
   }
   .fg-menu {
-    top: 44px;
-    min-width: 210px;
-    max-width: calc(100vw - 16px);
-    max-height: calc(100dvh - 60px - var(--safe-top) - var(--safe-bottom));
+    position: fixed;
+    top: calc(46px + var(--safe-top));
+    right: calc(10px + var(--safe-right));
+    min-width: 200px;
+    max-width: calc(100vw - 20px - var(--safe-left) - var(--safe-right));
+    max-height: calc(100dvh - 56px - var(--safe-top) - var(--safe-bottom));
     overflow-y: auto;
     overscroll-behavior-y: contain;
   }
+  .fg-menu.nav-menu {
+    width: min(232px, calc(100vw - 20px - var(--safe-left) - var(--safe-right)));
+    padding: 4px;
+  }
   .fg-menu button {
-    padding: 11px 12px;
-    font-size: 13.5px;
+    min-height: 34px;
+    padding: 6px 8px;
+    font-size: 12.5px;
+  }
+  .fg-menu button.fg-menu-login {
+    min-height: 40px;
+    padding: 4px 6px 6px;
+  }
+  .fg-menu-id {
+    gap: 8px;
+    padding: 4px 6px 6px;
+  }
+  .fg-menu-id .fg-who-plate {
+    width: 28px;
+    height: 28px;
+    border-radius: 7px;
+  }
+  .fg-menu hr {
+    margin: 4px 3px;
+  }
+  .fg-appearance-row {
+    min-height: 30px;
+    padding: 1px 2px 1px 7px;
   }
 
   /* ─── 面包屑：单行，宽度不足时横向滚动 ─── */
@@ -20474,9 +20593,9 @@ input.f.qta-in {
   padding: 6px 2px;
 }
 /* 在线接入：一条时间线。在线来源在最前，离线来源按最后出现分到今天、昨天、7 天内与保留期内。
-   列：最后出现时刻 │ 节点（竖线穿过）│ 来源 IP │ 网络 │ 接入（机器 + 协议）│ 首次出现。
-   竖线与节点沿用发布流水（.cgf-list）的画法，节点用卡面色描边切断竖线。IP 列按完整 IPv6
-   的宽度固定，各行的网络与接入列对齐。窄卡改为两行，见文件后部的容器查询。 */
+   列：最后出现时刻 │ 节点（竖线穿过）│ 来源 IP │ 网络 │ 接入摘要 │ 首次出现。
+   机器与协议默认收入摘要按钮，展开后独占下一行，避免一个共享来源把整张用户卡撑高。竖线与节点
+   沿用发布流水（.cgf-list）的画法；IP 列按完整 IPv6 的宽度固定。窄卡改为两行摘要。 */
 .user-presence-card .user-dcard-body {
   container: user-presence / inline-size;
 }
@@ -20624,12 +20743,60 @@ input.f.qta-in {
 .user-presence-row.off .user-presence-location {
   color: var(--ink-3);
 }
+.user-presence-access-toggle {
+  display: inline-flex;
+  min-width: 0;
+  min-height: 26px;
+  margin-left: -5px;
+  padding: 0 5px;
+  align-items: center;
+  justify-self: start;
+  gap: 6px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  color: var(--ink-3);
+  font: 11.5px/1.4 var(--sans);
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
+}
+.user-presence-access-toggle > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-presence-access-toggle:hover {
+  color: var(--action-hover);
+  background: var(--action-wash);
+}
+.user-presence-access-toggle:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -2px;
+}
+.user-presence-access-toggle:disabled {
+  color: var(--ink-4);
+  cursor: default;
+}
+.user-presence-access-toggle:disabled:hover {
+  background: transparent;
+}
+.user-presence-access-caret {
+  flex: none;
+  color: var(--ink-4);
+  font: 13px/1 var(--sans);
+}
+.user-presence-access-toggle[aria-expanded='true'] .user-presence-access-caret {
+  transform: rotate(90deg);
+}
 .user-presence-access {
   display: flex;
   min-width: 0;
+  grid-column: 3 / -1;
+  grid-row: 2;
   flex-wrap: wrap;
   align-items: baseline;
   gap: 0 16px;
+  padding: 1px 0 6px;
 }
 .user-presence-access-item {
   display: inline-flex;
@@ -20710,8 +20877,9 @@ input.f.qta-in {
   .user-presence-row {
     grid-template-columns: 40px 12px minmax(0, 1fr) auto;
     grid-template-areas:
-      'time mark ip ip'
-      '. . sub first';
+      'time mark ip first'
+      '. . sub sub'
+      '. . access access';
     row-gap: 3px;
     padding: 6px 0;
   }
@@ -20735,6 +20903,9 @@ input.f.qta-in {
   .user-presence-first {
     grid-area: first;
     align-self: start;
+  }
+  .user-presence-access {
+    grid-area: access;
   }
 }
 .user-dcard-foot {
@@ -24649,6 +24820,13 @@ body.observe-brushing .observe-chart-tip {
 .xhttp-xmux-range > small {
   color: var(--ink-4);
   white-space: nowrap;
+}
+
+/* 协议密钥和 API Token 不是站点登录凭据。不能使用 type=password：浏览器会忽略
+   autocomplete=off，并把相邻的配置值误判为账号后弹出“保存密码”。ConfigSecretInput
+   保持普通文本语义；这里仅负责视觉遮罩，使它不进入浏览器的登录凭据识别流程。 */
+.config-secret-input {
+  -webkit-text-security: disc;
 }
 
 /* Hysteria 2 的 QUIC 调优。八项默认收在折叠区里：留空即用 xray 自己那一版的默认值，
@@ -29701,6 +29879,78 @@ input[type='number']::-webkit-outer-spin-button {
   margin-bottom: 14px;
 }
 
+.cert-scan-progress {
+  margin: 2px 0 12px;
+  padding: 9px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--sunk) 58%, transparent);
+}
+.cert-scan-progress.failed {
+  border-color: color-mix(in srgb, var(--err) 38%, var(--line-soft));
+}
+.cert-scan-progress-head,
+.cert-scan-progress-head > div,
+.cert-scan-counts {
+  display: flex;
+  align-items: center;
+}
+.cert-scan-progress-head {
+  justify-content: space-between;
+  gap: 10px;
+}
+.cert-scan-progress-head > div {
+  min-width: 0;
+  gap: 8px;
+}
+.cert-scan-progress-head b {
+  color: var(--ink-2);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.cert-scan-subject {
+  display: block;
+  margin-top: 7px;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cert-scan-meter {
+  display: block;
+  width: 100%;
+  height: 4px;
+  margin: 8px 0 5px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 99px;
+  color: var(--accent);
+  background: var(--line-soft);
+}
+.cert-scan-meter::-webkit-progress-bar {
+  background: var(--line-soft);
+}
+.cert-scan-meter::-webkit-progress-value {
+  border-radius: 99px;
+  background: var(--accent);
+}
+.cert-scan-meter::-moz-progress-bar {
+  border-radius: 99px;
+  background: var(--accent);
+}
+.cert-scan-counts {
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--ink-4);
+  font: 9.5px/1.4 var(--mono);
+}
+.cert-scan-progress > .note,
+.cert-scan-progress > .hint {
+  display: block;
+  margin: 7px 0 0;
+}
+
 @container (max-width: 520px) {
   #set-cert .certgrp-hd {
     grid-template-columns: minmax(0, 1fr);
@@ -29716,6 +29966,12 @@ input[type='number']::-webkit-outer-spin-button {
   #set-cert .certgrp.expanded .certgrp-facts,
   #set-cert .cert-record-facts {
     grid-template-columns: minmax(0, 1fr);
+  }
+  .cert-scan-progress-head,
+  .cert-scan-counts {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
   }
 }
 
@@ -30469,7 +30725,8 @@ body.fg-dragging .fg-rail {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .cg-lamp.run {
+  .cg-lamp.run,
+  .cgp-step.run .cgp-node > i {
     animation: none;
   }
 }
@@ -31508,6 +31765,26 @@ body.fg-dragging .fg-rail {
 .cg-head .nd-ident-row .st {
   margin: 0;
 }
+/* 变更单详情的备注常是服务端拼的修订说明，可能很长。身份区允许收窄；备注单行、最宽 30em 后省略
+   （完整内容在 title），修订范围单独一段、始终完整。两段按基线对齐。 */
+.cg-detail .cg-head .nd-page-identity {
+  flex: 0 1 auto;
+}
+.cg-detail .cg-head .nd-ident-meta {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 0.55em;
+}
+.cg-head-note {
+  min-width: 0;
+  max-width: 30em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cg-head-range {
+  flex: none;
+}
 .cg-plate {
   position: relative;
   display: grid;
@@ -31675,6 +31952,12 @@ body.fg-dragging .fg-rail {
   list-style: none;
   cursor: pointer;
 }
+/* 公共折叠规则（`.panel.config-panel:not([open]) > summary`）给标题条 -11px 下外边距，
+   用来抵消卡片 11px 下内距。分区内距为 0，沿用它会让折叠卡只占 22px，标题条下半截被
+   overflow 裁掉。两条规则优先级相同，本条依靠位于其后生效。 */
+.cg-sec.panel:not([open]) > summary {
+  margin-bottom: 0;
+}
 .cg-sec.panel > summary::-webkit-details-marker {
   display: none;
 }
@@ -31744,14 +32027,6 @@ body.fg-dragging .fg-rail {
   background: color-mix(in srgb, var(--gold) 4%, transparent);
   box-shadow: inset 2px 0 0 var(--gold);
 }
-.cgr-group.is-fail {
-  background: color-mix(in srgb, var(--err) 4%, transparent);
-  box-shadow: inset 2px 0 0 var(--err);
-}
-.cgr-group.is-run {
-  background: color-mix(in srgb, var(--action) 4%, transparent);
-  box-shadow: inset 2px 0 0 var(--action);
-}
 .cgr-stage > .cgr-head {
   padding-bottom: 10px;
 }
@@ -31763,18 +32038,6 @@ body.fg-dragging .fg-rail {
 }
 .cgr-stage-step + .cgr-stage-step {
   border-top: 1px solid var(--line-soft);
-}
-.cgr-stage-step.is-open {
-  background: color-mix(in srgb, var(--gold) 4%, transparent);
-  box-shadow: inset 2px 0 0 var(--gold);
-}
-.cgr-stage-step.is-fail {
-  background: color-mix(in srgb, var(--err) 4%, transparent);
-  box-shadow: inset 2px 0 0 var(--err);
-}
-.cgr-stage-step.is-run {
-  background: color-mix(in srgb, var(--action) 4%, transparent);
-  box-shadow: inset 2px 0 0 var(--action);
 }
 .cgr-step-head {
   display: flex;
@@ -31881,215 +32144,685 @@ body.fg-dragging .fg-rail {
   color: var(--ink-3);
   font-size: 12px;
 }
-/* 失败详情接在该机器行内，与文字左缘对齐 */
-.cgr-fail {
-  display: grid;
-  grid-column: 2 / -1;
-  gap: 5px;
-  margin: 6px 0 4px;
+/* ── 执行进度：时间线 + 机器格 ──
+   每一步是时间线上的一个节点：开始时刻 │ 结果图标 │ 阶段名与动作 │ 异常状态 │ 台数。竖线穿过图标中心
+   （16 内距 + 54 时刻列 + 12 间距 + 10 半个图标）。机器格与阶段名同一左缘；失败的机器展开成整行。 */
+.cgp-line {
+  margin: 0;
+  padding: 6px 0;
+  list-style: none;
 }
-.cgr-fail code {
+.cgp-line > li {
+  position: relative;
+}
+.cgp-line > li::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 91.5px;
+  width: 1px;
+  background: var(--line);
+}
+.cgp-line > li:first-child::before {
+  top: 20px;
+}
+.cgp-line > li:last-child::before {
+  bottom: auto;
+  height: 20px;
+}
+.cgp-line > li:only-child::before {
+  display: none;
+}
+.cgp-head,
+.cgp-group {
+  display: grid;
+  grid-template-columns: 54px 20px minmax(0, 1fr) auto 40px;
+  align-items: center;
+  column-gap: 12px;
+  min-height: 40px;
+  padding: 0 16px;
+}
+.cgp-time {
+  color: var(--ink-4);
+  font: 11px var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.cgp-node {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--ink-4);
+  background: var(--block);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.cgp-step.ok .cgp-node {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 16%, var(--block));
+  box-shadow: none;
+}
+.cgp-step.err .cgp-node {
+  color: var(--err);
+  background: color-mix(in srgb, var(--err) 18%, var(--block));
+  box-shadow: none;
+}
+.cgp-step.warn .cgp-node {
+  color: var(--gold);
+  background: color-mix(in srgb, var(--gold) 20%, var(--block));
+  box-shadow: none;
+}
+.cgp-step.run .cgp-node {
+  color: var(--action);
+  background: color-mix(in srgb, var(--action) 14%, var(--block));
+  box-shadow: none;
+}
+.cgp-step.run .cgp-node > i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: cg-pulse 1.4s ease-in-out infinite;
+}
+.cgp-title {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 10px;
+}
+.cgp-title b {
+  flex: none;
+  color: var(--ink);
+  font: 600 13px var(--sans);
+}
+.cgp-step.sub .cgp-title b {
+  color: var(--ink-2);
+  font-size: 12.5px;
+}
+.cgp-facts {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cgp-facts em {
+  font-style: normal;
+}
+.cgp-facts em.warn {
+  color: var(--gold);
+}
+.cgp-state {
+  font-size: 12px;
+  white-space: nowrap;
+}
+.cgp-state.warn {
+  color: var(--gold);
+}
+.cgp-state.err {
+  color: var(--err);
+}
+.cgp-state.run {
+  color: var(--action);
+}
+.cgp-state.idle {
+  color: var(--ink-4);
+}
+.cgp-count {
+  color: var(--ink-4);
+  font: 11px var(--mono);
+  text-align: right;
+  white-space: nowrap;
+}
+/* 机器格：与阶段名同一左缘（16 + 54 + 12 + 20 + 12 = 114） */
+.cgp-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 0 24px;
+  margin: 0;
+  padding: 0 16px 6px 114px;
+  list-style: none;
+}
+.cgp-m {
+  display: flex;
+  min-width: 0;
+  min-height: 40px;
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+/* 地区旗是机器名的前缀，照发布页机器表 .cgc-flag：定宽留位、与名称隔 10px、1px 墨色细边 */
+.cgp-flag {
+  display: inline-flex;
+  width: 15px;
+  flex: none;
+  margin-right: 2px;
+}
+.cgp-flag .geo-flag {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ink) 14%, transparent);
+}
+.cgp-mt {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+}
+.cgp-mt b {
+  overflow: hidden;
+  color: var(--ink);
+  font: 500 12.5px/1.35 var(--sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cgp-mt small {
+  overflow: hidden;
+  color: var(--ink-4);
+  font: 11px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 还没轮到的机器降一档 */
+.cgp-m.queued .cgp-mt b {
+  color: var(--ink-3);
+  font-weight: 400;
+}
+.cgp-ms {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.cgp-ms.run {
+  color: var(--action);
+}
+.cgp-ms .cg-lamp {
+  width: 6px;
+  height: 6px;
+}
+/* 格内的隔离是安静的文字按钮，悬停才出错误色；失败整行里的隔离仍是 .btn.danger */
+.cgp-iso {
+  flex: none;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  color: var(--ink-4);
+  background: none;
+  font: 11.5px var(--sans);
+  cursor: pointer;
+}
+.cgp-iso:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+@media (hover: hover) {
+  .cgp-iso:not(:disabled):hover {
+    color: var(--err);
+    background: color-mix(in srgb, var(--err) 8%, transparent);
+  }
+}
+.cgp-iso:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+.cgp-fail {
+  display: grid;
+  gap: 6px;
+  margin: 0 16px 6px 114px;
+  padding: 10px 0 12px;
+  border-top: 1px solid var(--line-soft);
+}
+.cgp-fhead {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+}
+.cgp-fhead > .cgp-flag,
+.cgp-fstate > .cg-lamp {
+  align-self: center;
+}
+.cgp-fhead b {
+  color: var(--ink);
+  font: 500 12.5px var(--sans);
+}
+.cgp-fhead small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-4);
+  font: 11px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cgp-fstate {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-left: auto;
+  color: var(--ink-4);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.cgp-fstate.err {
+  color: var(--err);
+}
+.cgp-fstate > .cg-lamp {
+  width: 6px;
+  height: 6px;
+}
+.cgp-fail code {
   color: var(--err);
   font: 11.5px/1.55 var(--mono);
   white-space: pre-wrap;
   word-break: break-word;
 }
-.cgr-fail p {
+.cgp-fail p {
   margin: 0;
   color: var(--ink-2);
   font-size: 12px;
   line-height: 1.6;
 }
-.cgr-fail p > span {
+.cgp-fail p > span {
   margin-right: 8px;
   color: var(--ink-4);
 }
-.cgr-fail .ops {
+.cgp-fail .ops {
   display: flex;
   gap: 6px;
-  margin-top: 3px;
+  margin-top: 2px;
 }
-.cgr-fail .btn {
+.cgp-fail .btn {
   min-height: 26px;
   padding: 0 10px;
   font-size: 12px;
 }
+@container (max-width: 700px) {
+  .cgp-head,
+  .cgp-group {
+    grid-template-columns: 20px minmax(0, 1fr) auto 34px;
+  }
+  .cgp-time {
+    display: none;
+  }
+  .cgp-line > li::before {
+    left: 25.5px;
+  }
+  .cgp-grid {
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    padding-left: 48px;
+  }
+  .cgp-fail {
+    margin-left: 48px;
+  }
+  .cgp-title {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+}
 
-/* ── 产物差异：左侧文件树，右侧单文件 diff ── */
-.cg-files {
-  display: grid;
-  grid-template-columns: 216px minmax(0, 1fr);
-  border-top: 0;
+/* ── 产物清单：变更单详情的「产物记录」与创建变更单的「产物差异」共用 ──
+   一行一个归属（机器或用户订阅），文件是行内页签，差异贴边展开在行下。行与执行进度的机器同一种写法：
+   15px 首列（展开符）+ 名称与等宽 ID，分隔线从文字左缘画起。文件页签未选中无底，选中为操作色浅底；
+   差异区最高 520px，超出在区内滚动。 */
+.cga-list {
+  padding-bottom: 2px;
 }
-@media (min-width: 901px) {
-  .cg-files {
-    height: 560px;
-  }
-  .cg-files > .cg-tree,
-  .cg-files > .cg-viewer {
-    min-height: 0;
-  }
-  .cg-files .cg-diff.fg-code {
-    max-height: none;
-    min-height: 0;
-  }
-  .cg-files.is-compact {
-    height: auto;
-  }
-}
-.cg-tree {
-  padding: 2px 0 10px;
-  overflow: auto;
-  border-right: 1px solid var(--line-soft);
-}
-.cg-tree-group {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 12px 12px 2px 14px;
-  color: var(--ink-4);
-  font: 10.5px var(--mono);
-  letter-spacing: 0.04em;
-}
-.cg-tree-group b {
-  color: var(--ink-3);
-  font-weight: 600;
-}
-.cg-tree-group span {
-  letter-spacing: 0;
-}
-.cg-tree-node {
-  display: flex;
-  min-width: 0;
-  align-items: baseline;
-  gap: 6px;
-  padding: 8px 12px 2px 14px;
-  color: var(--ink-2);
-  font-size: 12px;
-  font-weight: 600;
-}
-.cg-tree-node small {
-  color: var(--ink-4);
-  font: 400 10.5px var(--mono);
-}
-.cg-tree-node em {
-  margin-left: auto;
-  color: var(--gold);
-  font-size: 10.5px;
-  font-style: normal;
-  font-weight: 400;
-}
-.cg-tree-file {
+.cga-node {
   position: relative;
-  display: flex;
-  width: 100%;
-  height: 27px;
-  box-sizing: border-box;
+}
+.cga-node + .cga-node::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 16px;
+  left: 41px;
+  height: 1px;
+  background: var(--line-soft);
+}
+.cga-node.is-open + .cga-node::before {
+  display: none;
+}
+.cga-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr) auto;
   align-items: center;
-  gap: 8px;
-  padding: 0 12px 0 24px;
+  column-gap: 12px;
+  min-height: 44px;
+  padding-right: 16px;
+}
+.cga-head {
+  display: grid;
+  grid-template-columns: 15px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 10px;
+  min-width: 0;
+  min-height: 44px;
+  box-sizing: border-box;
+  padding: 6px 0 6px 16px;
   border: 0;
+  color: inherit;
   background: none;
-  color: var(--ink-3);
-  font: 11.5px var(--mono);
+  font: inherit;
   text-align: left;
   cursor: pointer;
 }
-.cg-tree-file .nm {
-  min-width: 0;
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.cga-head:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+  border-radius: var(--r-ctl);
+}
+.cga-caret {
+  justify-self: center;
+  color: var(--ink-4);
+  transform: rotate(-90deg);
+  transition: transform var(--motion-fast) var(--motion-ease-standard);
+}
+.cga-node.is-open .cga-caret {
+  color: var(--ink-2);
+  transform: none;
 }
 @media (hover: hover) {
-  .cg-tree-file:hover {
+  .cga-head:hover .cga-caret,
+  .cga-head:hover b {
+    color: var(--ink);
+  }
+}
+.cga-files {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 0;
+}
+.cga-file {
+  display: inline-flex;
+  height: 26px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 8px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  color: var(--ink-2);
+  background: none;
+  font: 11.5px var(--mono);
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--motion-ease-standard),
+    color var(--motion-fast) var(--motion-ease-standard);
+}
+@media (hover: hover) {
+  .cga-file:hover {
     color: var(--ink);
     background: var(--hover);
   }
 }
-.cg-tree-file[aria-current='true'] {
-  color: var(--ink);
-  background: color-mix(in srgb, var(--action) 10%, transparent);
+.cga-file[aria-pressed='true'] {
+  color: var(--action);
+  background: var(--action-wash);
 }
-.cg-tree-file[aria-current='true']::before {
-  content: '';
-  position: absolute;
-  top: 5px;
-  bottom: 5px;
-  left: 0;
-  width: 2px;
-  border-radius: 0 2px 2px 0;
-  background: var(--action);
+.cga-file:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
 }
-.cg-viewer {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-}
-.cg-viewer-head {
-  display: flex;
-  min-height: 38px;
-  box-sizing: border-box;
-  align-items: center;
-  gap: 8px;
-  padding: 0 12px;
+.cga-detail {
+  border-top: 1px solid var(--line-soft);
   border-bottom: 1px solid var(--line-soft);
+  background: var(--code-bg);
 }
-.cg-viewer-head .path {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--ink-4);
-  font: 11.5px var(--mono);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.cga-node:last-child .cga-detail {
+  border-bottom: 0;
 }
-.cg-viewer-head .path b {
-  color: var(--ink);
-  font-weight: 600;
-}
-.cg-viewer-head .sp {
-  flex: 1;
-}
-.cg-viewer-head .range {
-  color: var(--ink-4);
+/* 文件名后的读数：+N −M，授权名单的 ~N */
+.cga-delta {
+  display: inline-flex;
+  gap: 5px;
   font: 10.5px var(--mono);
-  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
-.cg-fstate {
-  color: var(--ink-4);
-  font-size: 11px;
-  white-space: nowrap;
-}
-.cg-fstate.new {
-  color: var(--ok);
-}
-.cg-fstate.warn {
+.cga-delta .upd {
   color: var(--gold);
 }
-.cg-diff.fg-code {
-  max-height: 560px;
-  flex: 1;
-  font-size: 11.5px;
-  line-height: 1.72;
-}
-.cg-diff.fg-code td.ln {
-  position: static;
-  padding: 0 8px 0 12px;
-}
-.cg-diff.fg-code td.ln + td.ln {
-  padding-left: 4px;
-  border-right: 1px solid var(--line-soft);
-}
-.cg-diff.fg-code tr.gap td {
-  height: 26px;
-  vertical-align: middle;
+.cga-st {
   color: var(--ink-4);
-  background: color-mix(in srgb, var(--surface) 55%, transparent);
+  font: 11px var(--sans);
 }
-.cg-diff.fg-code tr.gap td.src {
+.cga-st.new {
+  color: var(--ok);
+}
+.cga-st.off {
+  color: var(--gold);
+}
+.cga-st.err {
+  color: var(--err);
+}
+.cga-sans {
+  font-family: var(--sans);
+}
+/* ruleTag 重新编号的说明，在展开行的行尾 */
+.cga-fold {
+  color: var(--ink-4);
+  font: 11.5px var(--sans);
+  white-space: nowrap;
+}
+.cga-link {
+  margin-left: 10px;
+  padding: 0;
+  border: 0;
+  color: var(--action);
+  background: none;
+  font: 11.5px var(--sans);
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .cga-link:hover {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+}
+.cga-link:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* 差异：旧行号 │ 新行号 │ +/− │ 内容。删除行也有行号；增删行保留语法色，只靠底色与标记区分。
+   长行折行，不出现横向滚动。 */
+.cga-code.fg-code {
+  flex: none;
+  max-height: 520px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--code-bg);
+  font: 11.5px/1.72 var(--mono);
+}
+.cga-code td.ln {
+  position: static;
+  width: 1%;
+  min-width: 24px;
+  padding: 0 6px 0 2px;
+  color: var(--code-ln);
+  background: none;
+  font-size: 10.5px;
+  text-align: right;
+  vertical-align: top;
+}
+.cga-code td.ln:first-child {
+  padding-left: 14px;
+}
+.cga-code td.mk {
+  width: 10px;
+  padding: 0 6px;
+  border-left: 1px solid var(--line-soft);
+  color: var(--ink-4);
+  text-align: center;
+  user-select: none;
+}
+.cga-code td.src {
+  padding: 0 16px 0 2px;
+  color: var(--code-ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.cga-code tr.add td {
+  background: var(--add);
+}
+.cga-code tr.del td {
+  background: var(--del);
+}
+.cga-code tr.del td.src {
+  color: var(--code-ink);
+}
+.cga-code tr.add td.mk {
+  color: var(--add-ink);
+}
+.cga-code tr.del td.mk {
+  color: var(--del-ink);
+}
+/* 成对修改行里真正变化的那一段 */
+.cga-code mark {
+  border-radius: 2px;
+  color: inherit;
+}
+.cga-code tr.add mark {
+  background: color-mix(in srgb, var(--add-ink) 26%, transparent);
+}
+.cga-code tr.del mark {
+  background: color-mix(in srgb, var(--del-ink) 24%, transparent);
+}
+/* 只有 ruleTag 编号变化的行：按未改动显示，降一档墨色 */
+.cga-code tr.tag td.src,
+.cga-code tr.tag td.src i {
+  color: var(--ink-4);
+}
+/* 折叠行与授权分组行：同一条浅底横条，写明行数与所在位置 */
+.cga-code tr:is(.cga-gap, .cga-ghead) td {
+  height: 28px;
+  padding-top: 0;
+  padding-bottom: 0;
+  background: color-mix(in srgb, var(--ink) 3.5%, var(--code-bg));
+  vertical-align: middle;
+}
+.cga-code tr.cga-gap {
+  cursor: pointer;
+}
+.cga-code tr.cga-gap td.ln {
+  padding: 0;
+  color: var(--ink-4);
+  text-align: center;
+}
+.cga-code tr:is(.cga-gap, .cga-ghead) td.src {
+  color: var(--ink-4);
   font-size: 11px;
+  white-space: nowrap;
+}
+.cga-gap-btn {
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: none;
+  font: inherit;
+  cursor: pointer;
+}
+.cga-gap-btn:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+.cga-code .where {
+  color: var(--ink-3);
+}
+.cga-code .cnt + .where {
+  margin-left: 14px;
+}
+.cga-code .where + .cnt {
+  margin-left: 10px;
+}
+@media (hover: hover) {
+  .cga-code tr.cga-gap:hover td,
+  .cga-code tr.cga-gap:hover .where {
+    color: var(--action);
+  }
+  .cga-code tr.cga-gap:hover td {
+    background: color-mix(in srgb, var(--action) 7%, var(--code-bg));
+  }
+}
+/* 授权名单：只有标记列和内容列，标记落在展开符那一列，邮箱与机器名左缘对齐 */
+.cga-grants td.mk {
+  width: 15px;
+  padding: 0 10px 0 16px;
+  border-left: 0;
+}
+.cga-grants .em {
+  display: inline-block;
+  min-width: min(340px, 60%);
+  margin-right: 16px;
+}
+.cga-grants .what {
+  color: var(--ink-3);
+  font: 11.5px var(--sans);
+}
+.cga-grants tr.upd td {
+  background: color-mix(in srgb, var(--gold) 9%, transparent);
+}
+.cga-grants tr.upd td.mk {
+  color: var(--gold);
+}
+/* 执行前没有记录：说明 + 两个哈希 + 可选的本次内容 */
+.cga-na {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+  padding: 12px 16px 12px 41px;
+  background: var(--code-bg);
+}
+.cga-na p {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.cga-na dl {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 14px;
+  margin: 0;
+  font: 11px var(--mono);
+}
+.cga-na dt {
+  color: var(--ink-4);
+  font-family: var(--sans);
+}
+.cga-na dd {
+  margin: 0;
+  color: var(--ink-3);
+  overflow-wrap: anywhere;
+}
+.cga-na .cga-link {
+  margin: 2px 0 0;
+}
+.cga-na + .cga-code {
+  border-top: 1px solid var(--line-soft);
+}
+@container (max-width: 760px) {
+  .cga-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .cga-files {
+    padding: 0 0 8px 35px;
+  }
+  .cga-row > .cga-fold {
+    padding: 0 0 8px 41px;
+  }
 }
 
 /* ── 侧栏：一张面板，读数行 + 包含的修订 ── */
@@ -32337,17 +33070,6 @@ body.fg-dragging .fg-rail {
   }
 }
 @media (max-width: 900px) {
-  .cg-files {
-    grid-template-columns: minmax(0, 1fr);
-  }
-  .cg-tree {
-    max-height: 200px;
-    border-right: 0;
-    border-bottom: 1px solid var(--line-soft);
-  }
-  .cg-viewer-head .range {
-    display: none;
-  }
   .cgr-row {
     grid-template-columns: 15px minmax(0, 1fr);
     row-gap: 3px;
@@ -32375,10 +33097,6 @@ body.fg-dragging .fg-rail {
   .cgr-row.is-run > .cgo-when {
     grid-column: 3;
     grid-row: 2;
-  }
-  .cgr-row.is-run > .cgr-fail {
-    grid-column: 2 / -1;
-    grid-row: 3;
   }
   .cgr-row .cgo-main small {
     white-space: normal;
@@ -32432,19 +33150,8 @@ body.fg-dragging .fg-rail {
   }
 }
 
-/* 窄容器按自身宽度收缩文件树、执行行和页头，不依赖视口宽度。 */
+/* 窄容器按自身宽度收缩执行行和页头，不依赖视口宽度。 */
 @container (max-width: 700px) {
-  .cg-files {
-    grid-template-columns: minmax(0, 1fr);
-  }
-  .cg-tree {
-    max-height: 200px;
-    border-right: 0;
-    border-bottom: 1px solid var(--line-soft);
-  }
-  .cg-viewer-head .range {
-    display: none;
-  }
   .cgr-row {
     grid-template-columns: 15px minmax(0, 1fr);
     row-gap: 3px;
@@ -32472,10 +33179,6 @@ body.fg-dragging .fg-rail {
   .cgr-row.is-run > .cgo-when {
     grid-column: 3;
     grid-row: 2;
-  }
-  .cgr-row.is-run > .cgr-fail {
-    grid-column: 2 / -1;
-    grid-row: 3;
   }
   .cgr-row .cgo-main small {
     white-space: normal;
@@ -32548,9 +33251,6 @@ body.fg-dragging .fg-rail {
   color: var(--ink-3);
   font-size: 12px;
   line-height: 1.55;
-}
-.cg-artifact-unavailable {
-  margin: 12px;
 }
 .cg-detail-statuses {
   padding: 4px 14px 12px;

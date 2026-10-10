@@ -102,15 +102,16 @@ VPN Gate 观测页的「规则与承载机器」也使用同一实时通道显�
 
 ## 客户端订阅
 
-koipy 测速订阅仅允许管理员（`system-admin` 或作用域内的 `tenant-admin`）查看、生成和重新生成。
+koipy 测速订阅仅允许管理员（`system-admin` 或作用域内的 `tenant-admin`）查看、生成和撤销。
 普通用户自助订阅及编辑/发布角色的订阅响应不下发测速地址，普通 Clash 订阅不受影响。
 首次生成使用 `POST /users/{tenant}/{user}/clash-subscription/haitun`，重复请求返回现有有效地址；
-`POST /users/{tenant}/{user}/clash-subscription/haitun/regenerate` 原子替换 Token，旧地址随后无法再拉取。
-不再提供 DELETE 撤销或 `/me/clash-subscription/haitun` 自助操作；兼容已有的停用记录，无需数据库迁移。
+`DELETE /users/{tenant}/{user}/clash-subscription/haitun` 停止旧地址后续拉取，不自动生成新地址。
+撤销后可由管理员再次 POST 生成新 Token；重复 DELETE 保持首次撤销时间。移除直接重新生成接口，
+不提供 `/me/clash-subscription/haitun` 自助操作，无需数据库迁移。
 
 **风险：测速地址是可转交的访问凭据，不要求测速客户端登录管理员账号。** 其内容包含用户 UUID
-等真实节点凭据，持有者可以使用节点，应只交给可信服务。重新生成仅替换测速地址，不修改 UUID、
-普通订阅或节点授权，也不会触发发布；已下载的节点配置仍可使用。若凭据已泄露，需要同时重新生成
+等真实节点凭据，持有者可以使用节点，应只交给可信服务。撤销仅停止后续拉取，不修改 UUID、
+普通订阅或节点授权，也不会触发发布；已下载的节点配置仍可使用。若凭据已泄露，需要同时撤销
 测速地址、更换用户 UUID 并发布授权，待节点生效后旧凭据才失效。收紧管理权限不会自动替换已签发
 的地址；管理员应对曾交给不可信服务的地址执行上述处置。
 

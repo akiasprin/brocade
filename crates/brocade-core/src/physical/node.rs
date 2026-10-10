@@ -308,6 +308,7 @@ pub enum IngressProtocol {
     Vless,
     AnyTls(AnyTls),
     Hysteria2(crate::model::Hysteria2),
+    MtProto,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1021,11 +1022,27 @@ fn xray_ingresses(apps: &[AppIr], node_id: &str, api_port: Option<u16>) -> Vec<X
                     cover_port: None,
                     guard_port: None,
                 });
+            let mtproto = ingress.wires.mtproto().map(|settings| XrayIngressPlan {
+                id: ingress.id.clone(),
+                tag: format!("{base_tag}:mtproto"),
+                listen: ingress.bind,
+                port: settings.port,
+                sniff: false,
+                protocol: IngressProtocol::MtProto,
+                security: IngressSecurity::None,
+                certificate_name: None,
+                certificate_names: vec![],
+                xhttp: None,
+                split: None,
+                cover_port: None,
+                guard_port: None,
+            });
             vless
                 .into_iter()
                 .chain(anytls)
                 .chain(quic)
                 .chain(encryption)
+                .chain(mtproto)
         })
         .collect::<Vec<_>>();
     inbounds.sort_by(|a, b| a.tag.cmp(&b.tag));
@@ -1052,6 +1069,12 @@ fn xray_ingresses(apps: &[AppIr], node_id: &str, api_port: Option<u16>) -> Vec<X
                 .flat_map(|app| app.ingresses.iter())
                 .filter(|ingress| ingress.node == node_id)
                 .filter_map(|ingress| ingress.wires.anytls().map(|anytls| anytls.port)),
+        );
+        used.extend(
+            apps.iter()
+                .flat_map(|app| app.ingresses.iter())
+                .filter(|ingress| ingress.node == node_id)
+                .filter_map(|ingress| ingress.wires.mtproto().map(|mtproto| mtproto.port)),
         );
         used.extend(
             app.steps
@@ -1923,6 +1946,19 @@ fn grant_sync_plan(apps: &[AppIr], node_id: &str) -> GrantSyncPlan {
                         .collect(),
                 });
             }
+            if ingress.wires.mtproto().is_some() {
+                updates.push(GrantInboundUpdatePlan {
+                    inbound_tag: format!("{tag}:mtproto"),
+                    clients: clients
+                        .iter()
+                        .cloned()
+                        .map(|client| GrantClientPlan {
+                            flow: None,
+                            ..client
+                        })
+                        .collect(),
+                });
+            }
         }
     }
 
@@ -2054,15 +2090,17 @@ fn ingress_tag(app: &AppIr, ingress: &str) -> String {
     }
 }
 
-/// The xray inbound tags an ingress actually registers.
+/// The xray inbound tags that can actually enter Xray's routing dispatcher.
 ///
-/// An ingress is up to two inbounds: the base tag for its TCP/VLESS listener and a
-/// `:hy2`-suffixed tag for its UDP/Hysteria 2 listener, exactly as `xray_ingresses` builds them.
-/// Routing and guard rules select on these, so they have to be enumerated the same way here —
-/// writing `ingress_tag` alone selects only the TCP half, and traffic arriving on the `:hy2`
-/// inbound matches no rule, falls through the whole chain table, and lands on the default
-/// outbound: every Hysteria 2 ingress reaching one fixed link regardless of its port range or its
-/// chain. Mirrors the per-listener split the grant sync already makes (`grant_sync_plan`).
+/// Routing and guard rules select on these, so every ordinary proxy listener has to be enumerated
+/// exactly as `xray_ingresses` builds it. Writing `ingress_tag` alone selects only the TCP/VLESS
+/// half, while Hysteria 2 and the other TCP protocols each have their own suffixed tags.
+///
+/// MTProxy is intentionally absent. Its handler terminates Telegram's transport and forms the
+/// official middle-proxy TCP connection itself because Telegram derives that connection's key
+/// from the real socket endpoints. It never calls Xray's dispatcher, so emitting chain or guard
+/// rules for `:mtproto` would claim behavior that cannot execute. MTProxy also has no arbitrary
+/// destination or SNI for those rules to inspect.
 fn ingress_inbound_tags(app: &AppIr, ingress: &Ingress) -> Vec<String> {
     let base = ingress_tag(app, &ingress.id);
     let mut tags = Vec::new();

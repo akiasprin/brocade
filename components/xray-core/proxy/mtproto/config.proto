@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package xray.proxy.mtproto;
+option csharp_namespace = "Xray.Proxy.Mtproto";
+option go_package = "github.com/xtls/xray-core/proxy/mtproto";
+option java_package = "com.xray.proxy.mtproto";
+option java_multiple_files = true;
+
+import "common/protocol/user.proto";
+
+message Account {
+  // Brocade uses the user's UUID as the 16-byte MTProxy secret. Keeping the
+  // canonical UUID string on the control channel makes grant reconciliation
+  // identical to VLESS, AnyTLS and Hysteria 2; the server decodes it only at
+  // the protocol boundary.
+  string secret = 1;
+}
+
+message ServerConfig {
+  repeated xray.common.protocol.User users = 1;
+}

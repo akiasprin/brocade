@@ -24,6 +24,7 @@ var (
 		"dokodemo-door": func() interface{} { return new(DokodemoConfig) },
 		"http":          func() interface{} { return new(HTTPServerConfig) },
 		"anytls":        func() interface{} { return new(AnyTLSServerConfig) },
+		"mtproto":       func() interface{} { return new(MTProtoServerConfig) },
 		"shadowsocks":   func() interface{} { return new(ShadowsocksServerConfig) },
 		"mixed":         func() interface{} { return new(SocksServerConfig) },
 		"socks":         func() interface{} { return new(SocksServerConfig) },

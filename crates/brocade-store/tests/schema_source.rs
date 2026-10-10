@@ -35,6 +35,29 @@ fn fresh_install_host_network_tuning_matches_the_runtime_defaults() {
 }
 
 #[test]
+fn fresh_install_mtproxy_port_base_matches_the_runtime_default() {
+    assert!(INITIAL_SCHEMA.contains("port_mtproto_base INTEGER DEFAULT 28800 NOT NULL"));
+}
+
+#[test]
+fn certificate_scan_compatibility_block_is_extractable() {
+    assert!(INITIAL_SCHEMA.contains("renew_before_days INTEGER DEFAULT 60 NOT NULL"));
+    assert_eq!(
+        INITIAL_SCHEMA
+            .matches("-- BEGIN CERTIFICATE SCAN SCHEMA")
+            .count(),
+        1
+    );
+    assert_eq!(
+        INITIAL_SCHEMA
+            .matches("-- END CERTIFICATE SCAN SCHEMA")
+            .count(),
+        1
+    );
+    assert!(INITIAL_SCHEMA.contains("CREATE TABLE certificate_scan_runs"));
+}
+
+#[test]
 fn schema_source_is_a_single_fresh_install_definition() {
     let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     let mut files = fs::read_dir(migrations)

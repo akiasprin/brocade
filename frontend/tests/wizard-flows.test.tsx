@@ -524,6 +524,12 @@ describe('新建链向导', () => {
     expect(cards.every(card => card.querySelector('.protocol-choice-copy .protocol-choice-icon'))).toBe(true);
     expect(cards[0].querySelector('.protocol-choice-icon polygon')).toBeTruthy();
     expect(cards[3].querySelector('.protocol-choice-icon polygon[fill="#ffbc00"]')).toBeTruthy();
+    expect(cards.map(card => card.querySelector('.note')?.textContent)).toEqual([
+      'TCP / XHTTP 入站；使用 REALITY 保护传输。',
+      'TCP 入站；使用 VLESS 原生加密，不叠加 TLS 或 REALITY。',
+      'TCP 入站；支持 TLS / REALITY、Padding 与连接复用。',
+      'QUIC / UDP 入站；面向高延迟、丢包链路，要求 UDP 可达。',
+    ]);
 
     const anyTls = view.getByRole('checkbox', { name: 'AnyTLS' }) as HTMLInputElement;
     fireEvent.click(anyTls.closest('.wzp-card')!.querySelector('.protocol-choice-copy')!);

@@ -979,6 +979,7 @@ async fn public_scope(request: Request, next: Next) -> Response {
 /// themselves; all other admin routes use the one lookup below.
 fn skips_admin_auth(method: &axum::http::Method, path: &str) -> bool {
     path == "/healthz"
+        || path == "/console/version"
         || path == "/auth/state"
         || (method == axum::http::Method::GET && path == "/branding")
         || (method == axum::http::Method::POST
@@ -1058,6 +1059,7 @@ fn masking_failed(detail: &str) -> Response {
 fn admin_router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/console/version", get(console_version))
         .route("/diagnostics/performance", get(performance_diagnostics))
         .route("/auth/state", get(auth_state))
         .route("/auth/init", post(auth_init))
@@ -1280,11 +1282,7 @@ fn admin_router_with_state(state: AppState) -> Router {
         )
         .route(
             "/users/{tenant_id}/{user_id}/clash-subscription/haitun",
-            post(issue_clash_haitun_subscription),
-        )
-        .route(
-            "/users/{tenant_id}/{user_id}/clash-subscription/haitun/regenerate",
-            post(regenerate_clash_haitun_subscription),
+            post(issue_clash_haitun_subscription).delete(revoke_clash_haitun_subscription),
         )
         .route(
             "/users/{tenant_id}/{user_id}/status",
@@ -1616,6 +1614,21 @@ async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
 }
 
+/// Tiny public probe used by an already-open SPA to notice that its immutable chunks were
+/// replaced by a newer deployment. It is intentionally independent of sessions: the login page
+/// needs the same behavior, and an expired cookie must not turn version discovery into a 401.
+async fn console_version() -> Response {
+    let mut response = Json(json!({ "ui_version": crate::assets::version() })).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, max-age=0, must-revalidate"),
+    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+}
+
 async fn public_clash_subscription(
     State(state): State<AppState>,
     Path(uuid): Path<String>,
@@ -1728,6 +1741,7 @@ fn public_subscription_protocol(
         Some("vless") => Some(Some(SubscriptionProtocol::Vless)),
         Some("anytls") => Some(Some(SubscriptionProtocol::AnyTls)),
         Some("hysteria2") => Some(Some(SubscriptionProtocol::Hysteria2)),
+        Some("mtproto") => Some(Some(SubscriptionProtocol::MtProto)),
         Some(_) => None,
     }
 }
@@ -2916,10 +2930,8 @@ struct AgentReleaseHttpResponse {
     /// Readable identification of this process and what it carries. The build id above only
     /// answers whether a machine is on this build.
     ///
-    /// Console and agent versions are reported separately even though one workspace version
-    /// currently supplies both, because they identify two different artifacts: the process
-    /// serving the request, and the binary it would install on the fleet. A reader should not
-    /// need to know they are compiled together.
+    /// The Console keeps its package version. The Agent version is the newest Git commit touching
+    /// its source closure, so unrelated control-plane changes do not advance it.
     console_version: &'static str,
     agent_version: &'static str,
     /// The commit the *control plane* was built from, `unknown` outside a git checkout, with
@@ -2937,9 +2949,8 @@ struct AgentBuildHttpResponse {
 
 /// The agents this process carries, recorded when a release is made.
 ///
-/// `CARGO_PKG_VERSION` is the console's version and also the agent's: every crate inherits
-/// `[workspace.package].version`, so the workspace has one number rather than six manifests with
-/// no mechanism keeping them equal.
+/// The Agent's human-facing version is its source revision. The build id and per-architecture
+/// digests still decide whether a machine is current; a Git commit never substitutes for bytes.
 async fn agent_release_response(state: &AppState) -> Result<AgentReleaseHttpResponse, StoreError> {
     Ok(AgentReleaseHttpResponse {
         released: state.store.agent_release().await?,
@@ -2949,8 +2960,8 @@ async fn agent_release_response(state: &AppState) -> Result<AgentReleaseHttpResp
             .map(|(arch, _, sha256)| AgentBuildHttpResponse { arch, sha256 })
             .collect(),
         console_version: env!("CARGO_PKG_VERSION"),
-        agent_version: env!("CARGO_PKG_VERSION"),
-        build_commit: env!("BROCADE_AGENT_COMMIT"),
+        agent_version: env!("BROCADE_AGENT_SOURCE_REVISION"),
+        build_commit: env!("BROCADE_CONSOLE_COMMIT"),
     })
 }
 
@@ -2958,7 +2969,9 @@ async fn agent_release_response(state: &AppState) -> Result<AgentReleaseHttpResp
 struct XrayReleaseHttpResponse {
     available_release_id: &'static str,
     available_xrays: Vec<XrayReleaseArtifact>,
+    /// Runtime banner/install compatibility version, kept separate from source provenance.
     xray_version: &'static str,
+    source_revision: &'static str,
     console_version: &'static str,
     build_commit: &'static str,
     /// Only the active or latest target ledger is needed for approval and recovery. The immutable
@@ -2997,8 +3010,9 @@ async fn xray_release_response(state: &AppState) -> Result<XrayReleaseHttpRespon
         available_release_id: embedded_xray_release_id(),
         available_xrays: embedded_xray_artifacts(),
         xray_version: BROCADE_XRAY_VERSION,
+        source_revision: env!("BROCADE_XRAY_SOURCE_REVISION"),
         console_version: env!("CARGO_PKG_VERSION"),
-        build_commit: env!("BROCADE_AGENT_COMMIT"),
+        build_commit: env!("BROCADE_CONSOLE_COMMIT"),
         releases,
     })
 }
@@ -3072,6 +3086,9 @@ struct CertsResponse {
     /// a certificate is per group — during a roll the two disagree, and that disagreement is the
     /// thing worth showing.
     nodes: Vec<brocade_store::NodeCertificateState>,
+    /// Latest active or completed durable scan. It is intentionally part of the read surface so a
+    /// page opened after another tab queued work sees the same progress.
+    scan: Option<brocade_store::CertificateScanRun>,
     /// The two well-known ACME directories, so the form can offer both without either side
     /// hard-coding a value the other does not know.
     letsencrypt: &'static str,
@@ -3095,11 +3112,13 @@ async fn certs_response(
     // domain instead of editing the private pool's synthetic domain in place.
     let groups = state.store.cert_groups(admin).await?;
     let nodes = state.store.node_certificate_state(admin).await?;
+    let scan = state.store.latest_certificate_scan().await?;
     Ok(CertsResponse {
         sealing_available: brocade_store::secrets::sealing_available(),
         domain,
         groups,
         nodes,
+        scan,
         letsencrypt: brocade_store::ACME_LETSENCRYPT,
         letsencrypt_staging: brocade_store::ACME_LETSENCRYPT_STAGING,
     })
@@ -3124,25 +3143,12 @@ struct CertGroupInput {
     signing_method: brocade_store::CertificateSigningMethod,
 }
 
-async fn manual_certificate_lock(
-    state: &AppState,
-) -> Result<brocade_store::CertificateScanLock, StoreError> {
-    state
-        .store
-        .try_certificate_scan_lock()
-        .await?
-        .ok_or_else(|| {
-            StoreError::Unavailable("正在处理其他证书申领，请稍后重试；本次未加入队列".to_owned())
-        })
-}
-
 async fn create_cert_group(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<CertGroupInput>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
-    let _lock = manual_certificate_lock(&state).await?;
     // The trust track is a property of the group, chosen when it is created. It cannot be inferred
     // from whichever domain happens to sort first because normal installations keep both the
     // synthetic self-signed pool and an optional public-CA domain.
@@ -3172,10 +3178,16 @@ async fn create_cert_group(
             input.certificate_name.as_deref(),
         )
         .await?;
-    let processing = crate::certs::process_pending(&state.store, Some(&id), 0)
-        .await
-        .map_err(StoreError::Unavailable)?;
-    Ok(Json(serde_json::json!({ "id": id, "processing": processing })).into_response())
+    let scan = state
+        .store
+        .enqueue_certificate_scan(brocade_store::CertificateScanTrigger::Manual)
+        .await?;
+    state.cert_wake.notify_one();
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "id": id, "scan": scan })),
+    )
+        .into_response())
 }
 
 async fn update_cert_group(
@@ -3214,15 +3226,20 @@ async fn request_spare(
     Path(label_id): Path<String>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
-    let _lock = manual_certificate_lock(&state).await?;
     let id = state
         .store
         .request_spare_certificate(&admin, &label_id)
         .await?;
-    let processing = crate::certs::process_pending(&state.store, Some(&label_id), 0)
-        .await
-        .map_err(StoreError::Unavailable)?;
-    Ok(Json(serde_json::json!({ "id": id, "processing": processing })).into_response())
+    let scan = state
+        .store
+        .enqueue_certificate_scan(brocade_store::CertificateScanTrigger::Manual)
+        .await?;
+    state.cert_wake.notify_one();
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "id": id, "scan": scan })),
+    )
+        .into_response())
 }
 
 /// Makes a spare the one the group's machines present. The SNI does not change; the bytes do.
@@ -3283,23 +3300,24 @@ async fn update_cert_domain(
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
     state.store.upsert_cert_domain(&admin, input).await?;
-    // Saving a domain is also when a wrong token gets corrected, so the worker is asked to retry
-    // immediately rather than after the retry floor.
+    // Saving a domain is also when a wrong token gets corrected. The store clears unfinished
+    // rows' retry timestamps and this durable follow-up survives browser/proxy disconnects.
+    state
+        .store
+        .enqueue_certificate_scan(brocade_store::CertificateScanTrigger::Settings)
+        .await?;
     state.cert_wake.notify_one();
     Ok(Json(certs_response(&state, &admin).await?).into_response())
 }
 
 async fn scan_certs(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
-    let _lock = manual_certificate_lock(&state).await?;
-    let processing = crate::certs::process_pending(&state.store, None, 0)
-        .await
-        .map_err(StoreError::Unavailable)?;
-    let mut response = serde_json::to_value(certs_response(&state, &admin).await?)
-        .map_err(|error| StoreError::Unavailable(error.to_string()))?;
-    response["processing"] = serde_json::to_value(processing)
-        .map_err(|error| StoreError::Unavailable(error.to_string()))?;
-    Ok(Json(response).into_response())
+    require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let scan = state
+        .store
+        .enqueue_certificate_scan(brocade_store::CertificateScanTrigger::Manual)
+        .await?;
+    state.cert_wake.notify_one();
+    Ok((StatusCode::ACCEPTED, Json(scan)).into_response())
 }
 
 /// One current distributable build, not an artifact archive. Future uploads replace this
@@ -3318,7 +3336,7 @@ fn binary_catalog(component: brocade_store::BinaryComponent) -> BinaryCatalog {
     let (build_id, version, artifacts) = match component {
         BinaryComponent::Agent => (
             embedded_release_id(),
-            env!("CARGO_PKG_VERSION"),
+            env!("BROCADE_AGENT_SOURCE_REVISION"),
             EMBEDDED_AGENTS
                 .iter()
                 .map(|(arch, _, sha)| brocade_store::BinaryReleaseArtifact {
@@ -3329,7 +3347,7 @@ fn binary_catalog(component: brocade_store::BinaryComponent) -> BinaryCatalog {
         ),
         BinaryComponent::Xray => (
             embedded_xray_release_id(),
-            BROCADE_XRAY_VERSION,
+            env!("BROCADE_XRAY_SOURCE_REVISION"),
             embedded_xray_artifacts(),
         ),
     };
@@ -3532,7 +3550,7 @@ async fn create_xray_release(
             request,
             XrayBuildInfo {
                 release_id: embedded_xray_release_id(),
-                version: BROCADE_XRAY_VERSION,
+                version: env!("BROCADE_XRAY_SOURCE_REVISION"),
                 artifacts: &artifacts,
             },
         )
@@ -4534,16 +4552,6 @@ async fn issue_clash_haitun_subscription(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
-    write_clash_haitun_subscription_response(&state, &admin, &tenant_id, &user_id, false).await
-}
-
-async fn write_clash_haitun_subscription_response(
-    state: &AppState,
-    admin: &AdminContext,
-    tenant_id: &str,
-    user_id: &str,
-    regenerate: bool,
-) -> ApiResult<Response> {
     if !admin.can_manage_speedtest_subscriptions() {
         return Err(ApiError::Forbidden);
     }
@@ -4552,29 +4560,34 @@ async fn write_clash_haitun_subscription_response(
     // effective-entry checks as opening the normal Clash subscription.
     state
         .store
-        .clash_subscription_for_user(admin, tenant_id, user_id)
+        .clash_subscription_for_user(&admin, &tenant_id, &user_id)
         .await?;
-    let link = if regenerate {
-        state
-            .store
-            .regenerate_clash_haitun_link(admin, tenant_id, user_id)
-            .await?
-    } else {
-        state
-            .store
-            .issue_clash_haitun_link(admin, tenant_id, user_id)
-            .await?
-    };
+    let link = state
+        .store
+        .issue_clash_haitun_link(&admin, &tenant_id, &user_id)
+        .await?;
     Ok(Json(clash_haitun_subscription_info(&origin, Some(&link))).into_response())
 }
 
-async fn regenerate_clash_haitun_subscription(
+async fn revoke_clash_haitun_subscription(
     State(state): State<AppState>,
     Path((tenant_id, user_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
-    write_clash_haitun_subscription_response(&state, &admin, &tenant_id, &user_id, true).await
+    let link = state
+        .store
+        .revoke_clash_haitun_link(&admin, &tenant_id, &user_id)
+        .await?;
+    // Revocation must remain available even if the subscription origin or serving model is broken.
+    Ok(Json(ClashHaitunSubscriptionInfoResponse {
+        template: "koipy 测速",
+        status: "revoked",
+        urls: None,
+        created_at: Some(link.created_at),
+        revoked_at: link.revoked_at,
+    })
+    .into_response())
 }
 
 fn clash_subscription_urls(url: String) -> ClashSubscriptionUrlsResponse {
@@ -5988,18 +6001,28 @@ async fn agent_xray_release(
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
     let dist = state.distribution().await?;
-    Ok(Json(XrayReleaseOffer {
+    Ok(Json(xray_release_offer(assignment, &dist.agent_public_url, arch)).into_response())
+}
+
+fn xray_release_offer(
+    assignment: brocade_store::BinaryReleaseAssignment,
+    agent_public_url: &str,
+    arch: &str,
+) -> XrayReleaseOffer {
+    XrayReleaseOffer {
         release_id: assignment.release_id,
         attempt: assignment.attempt,
-        version: assignment.version,
+        // The ledger version is the Brocade fork source revision shown to operators. Xray's
+        // executable banner intentionally retains the upstream compatibility version, which is
+        // what the Agent preflight must verify before replacing a running binary.
+        version: BROCADE_XRAY_VERSION.to_owned(),
         url: format!(
             "{}/brocade-xray/{arch}?sha256={}",
-            dist.agent_public_url, assignment.sha256
+            agent_public_url, assignment.sha256
         ),
         sha256: assignment.sha256,
         previous_sha256: assignment.previous_sha256,
-    })
-    .into_response())
+    }
 }
 
 async fn agent_xray_release_report(
@@ -7659,16 +7682,61 @@ mod tests {
     };
 
     use super::{
-        bearer_token, dist_json, expired_session_cookie, install_command, load_selection,
-        looks_like_uuid, public_may, require_grant_probe_user_access, resolve_agent_public_url,
-        resolve_subscription_origin, route_from_headers, safe_filename_slug, session_cookie,
-        user_may, AgentDistribution, ApiError, ArtifactContentQuery, BootstrapCredential,
-        InstallCredential, IpFamily, LoadQuery, SubscriptionProtocol, BOOTSTRAP_TOKEN_MAX_BYTES,
-        BOOTSTRAP_TOKEN_MIN_BYTES, BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS,
-        DETAIL_LOAD_MAX_WINDOWS, EMBEDDED_AGENTS, EMBEDDED_XRAYS, INSTALL_SCRIPT,
-        SUBSCRIPTION_CACHE_CONTROL,
+        bearer_token, binary_catalog, dist_json, embedded_release_id, embedded_xray_release_id,
+        expired_session_cookie, install_command, load_selection, looks_like_uuid, public_may,
+        require_grant_probe_user_access, resolve_agent_public_url, resolve_subscription_origin,
+        route_from_headers, safe_filename_slug, session_cookie, user_may, AgentDistribution,
+        ApiError, ArtifactContentQuery, BootstrapCredential, InstallCredential, IpFamily,
+        LoadQuery, SubscriptionProtocol, BOOTSTRAP_TOKEN_MAX_BYTES, BOOTSTRAP_TOKEN_MIN_BYTES,
+        BROCADE_XRAY_VERSION, DETAIL_LOAD_MAX_RANGE_SECS, DETAIL_LOAD_MAX_WINDOWS, EMBEDDED_AGENTS,
+        EMBEDDED_XRAYS, INSTALL_SCRIPT, SUBSCRIPTION_CACHE_CONTROL,
     };
     use brocade_store::LoadSeriesQuery;
+
+    #[test]
+    fn binary_catalogs_keep_source_revisions_separate_from_artifact_identity() {
+        for (component, revision, build_id) in [
+            (
+                brocade_store::BinaryComponent::Agent,
+                env!("BROCADE_AGENT_SOURCE_REVISION"),
+                embedded_release_id(),
+            ),
+            (
+                brocade_store::BinaryComponent::Xray,
+                env!("BROCADE_XRAY_SOURCE_REVISION"),
+                embedded_xray_release_id(),
+            ),
+        ] {
+            let catalog = binary_catalog(component);
+            assert_eq!(catalog.version, revision);
+            assert_eq!(catalog.build_id, build_id);
+            assert_ne!(catalog.version, catalog.build_id);
+        }
+    }
+
+    #[test]
+    fn xray_offer_preflights_the_executable_version_not_the_source_revision() {
+        let offer = super::xray_release_offer(
+            brocade_store::BinaryReleaseAssignment {
+                release_id: 7,
+                attempt: 2,
+                version: "fork-source-revision-dirty".to_owned(),
+                sha256: "a".repeat(64),
+                previous_sha256: "b".repeat(64),
+            },
+            "https://console.example",
+            "aarch64",
+        );
+
+        assert_eq!(offer.version, BROCADE_XRAY_VERSION);
+        assert_eq!(
+            offer.url,
+            format!(
+                "https://console.example/brocade-xray/aarch64?sha256={}",
+                "a".repeat(64)
+            )
+        );
+    }
 
     #[test]
     fn source_location_responses_preserve_presence_and_history_contracts() {
@@ -9084,6 +9152,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
+
+        let version = router
+            .clone()
+            .oneshot(
+                Request::get("/console/version")
+                    // A stale browser session must not prevent the login page from discovering a
+                    // new UI version.
+                    .header(header::COOKIE, "brocade_session=stale")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(version.status(), StatusCode::OK);
+        assert_eq!(
+            version.headers()[header::CACHE_CONTROL],
+            "no-store, no-cache, max-age=0, must-revalidate"
+        );
+        assert_eq!(version.headers()[header::PRAGMA], "no-cache");
+        let version_body = axum::body::to_bytes(version.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&version_body).unwrap(),
+            serde_json::json!({ "ui_version": crate::assets::version() })
+        );
 
         let missing = router
             .oneshot(

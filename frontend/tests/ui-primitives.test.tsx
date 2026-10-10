@@ -5,6 +5,7 @@ import { SegmentedControl } from '../src/ui/bits';
 import { CopyButton } from '../src/ui/copy-button';
 import { DialogClose, DialogLayer } from '../src/ui/dialog';
 import { bytes, fileBytes } from '../src/ui/format';
+import { Icon } from '../src/ui/icons';
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
 
@@ -84,6 +85,16 @@ it('图标复制按钮用可访问名称反馈 UUID 复制结果', async () => {
   expect(writeText).toHaveBeenCalledWith('user-uuid');
   expect(button.dataset.copyState).toBe('done');
   expect(button.getAttribute('aria-label')).toBe('UUID 已复制');
+});
+
+it('共享图标保留调用方类名并统一使用无基线偏移的容器', () => {
+  const view = render(<Icon of="copy" size={13} className="caller-icon" />);
+  const wrapper = view.container.firstElementChild;
+
+  expect(wrapper?.classList.contains('ui-icon')).toBe(true);
+  expect(wrapper?.classList.contains('caller-icon')).toBe(true);
+  expect(wrapper?.getAttribute('aria-hidden')).toBe('true');
+  expect(wrapper?.querySelector('svg')?.getAttribute('width')).toBe('13');
 });
 
 it('复制按钮的自定义内容随复制状态更新，可访问名称保持调用方给定的值', async () => {

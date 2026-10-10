@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xtls/xray-core/app/log"
 	"github.com/xtls/xray-core/app/metrics"
 	"github.com/xtls/xray-core/app/proxyman"
 	xnet "github.com/xtls/xray-core/common/net"
@@ -239,20 +240,21 @@ func startLocalProcessUsage(t *testing.T, enabled bool, servers []*exec.Cmd) fun
 		t.Fatalf("local process usage requires two Xray processes, got %d", len(servers))
 	}
 
-	names := []string{"server", "client"}
-	before := make([]localProcessUsage, len(servers))
-	for index, server := range servers {
-		usage, err := readLocalProcessUsage(server.Process.Pid)
+	names := []string{"server", "client", "load"}
+	pids := []int{servers[0].Process.Pid, servers[1].Process.Pid, os.Getpid()}
+	before := make([]localProcessUsage, len(pids))
+	for index, pid := range pids {
+		usage, err := readLocalProcessUsage(pid)
 		if err != nil {
-			t.Fatalf("read initial %s Xray usage: %v", names[index], err)
+			t.Fatalf("read initial %s process usage: %v", names[index], err)
 		}
 		before[index] = usage
 	}
 	return func() {
-		for index, server := range servers {
-			after, err := readLocalProcessUsage(server.Process.Pid)
+		for index, pid := range pids {
+			after, err := readLocalProcessUsage(pid)
 			if err != nil {
-				t.Errorf("read final %s Xray usage: %v", names[index], err)
+				t.Errorf("read final %s process usage: %v", names[index], err)
 				continue
 			}
 			initial := before[index]
@@ -382,6 +384,10 @@ func TestLocalAnyTLSHighConcurrency(t *testing.T) {
 	password := "local-anytls-performance-password"
 	serverPort := tcp.PickPort()
 	serverConfig := &core.Config{
+		App: []*serial.TypedMessage{serial.ToTypedMessage(&log.Config{
+			ErrorLogType:  log.LogType_None,
+			AccessLogType: log.LogType_None,
+		})},
 		Inbound: []*core.InboundHandlerConfig{{
 			ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
 				PortList: &xnet.PortList{Range: []*xnet.PortRange{xnet.SinglePortRange(serverPort)}},
@@ -408,6 +414,10 @@ func TestLocalAnyTLSHighConcurrency(t *testing.T) {
 
 	clientPort := tcp.PickPort()
 	clientConfig := &core.Config{
+		App: []*serial.TypedMessage{serial.ToTypedMessage(&log.Config{
+			ErrorLogType:  log.LogType_None,
+			AccessLogType: log.LogType_None,
+		})},
 		Inbound: []*core.InboundHandlerConfig{{
 			ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
 				PortList: &xnet.PortList{Range: []*xnet.PortRange{xnet.SinglePortRange(clientPort)}},
