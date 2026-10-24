@@ -223,6 +223,8 @@ jobs:
   check:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
+    env:
+      BROCADE_RUN_PG_TESTS: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -337,15 +339,20 @@ jobs:
       # BROCADE_RUN_PG_TESTS is not optional here. Without it the integration tests skip silently
       # and CI is green all the same — and what green means quietly becomes "nobody has exercised
       # the database layer". The runner ships docker, so testcontainers starts.
-      - name: cargo test (with the PostgreSQL integration tests)
-        env:
-          BROCADE_RUN_PG_TESTS: "1"
-        run: |
-          cargo test --workspace --locked
-          cargo test -p brocade-store --test pg_integration --locked -- --ignored
-          cargo test -p brocade-store --test tunnel_probe_pg --locked -- --ignored
-          cargo test -p brocade-console --test http_integration --locked -- --ignored
-          cargo test -p brocade-console --lib --locked sqlx_events_really_include_query_and_pool_timings -- --ignored
+      - name: Rust workspace tests
+        run: cargo test --workspace --locked
+
+      - name: PostgreSQL store integration tests
+        run: cargo test -p brocade-store --test pg_integration --locked -- --ignored
+
+      - name: PostgreSQL tunnel probe integration tests
+        run: cargo test -p brocade-store --test tunnel_probe_pg --locked -- --ignored
+
+      - name: Console HTTP integration tests
+        run: cargo test -p brocade-console --test http_integration --locked -- --ignored
+
+      - name: PostgreSQL performance event integration test
+        run: cargo test -p brocade-console --lib --locked sqlx_events_really_include_query_and_pool_timings -- --ignored
 
       - name: Read-only performance baseline contract
         run: node --test scripts/performance-baseline.test.mjs
