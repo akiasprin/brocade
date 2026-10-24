@@ -2555,13 +2555,16 @@ fn a_hysteria2_ingress_loads_in_the_real_binary() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A throwaway certificate for the check above. Self-signed and expired-proof only in the sense
-/// that xray never validates an inbound's own certificate — it only has to parse and pair.
+/// A local certificate shared by config checks and HTTPS clients that explicitly trust it.
 fn self_signed() -> (String, String) {
     let key = rcgen::KeyPair::generate().unwrap();
     let mut params =
         rcgen::CertificateParams::new(vec!["a1b2c3d4.example.net".to_owned()]).unwrap();
     params.distinguished_name = rcgen::DistinguishedName::new();
+    // A self-signed certificate uses this as both subject and issuer; the issuer must be named.
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "a1b2c3d4.example.net");
     let certificate = params.self_signed(&key).unwrap();
     (certificate.pem(), key.serialize_pem())
 }
