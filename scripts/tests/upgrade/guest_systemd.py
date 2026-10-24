@@ -358,7 +358,11 @@ def main():
         PASSWORD = saved['password']
         EXPECTED_DATA = saved['expected_data']
         assert saved['boot_id'] != Path('/proc/sys/kernel/random/boot_id').read_text().strip()
-        assert active() and wait_ready()['initialized']
+        # External PostgreSQL can become ready after the Console's first systemd start.
+        # Observe the existing bounded HTTP readiness gate before checking service state.
+        assert wait_ready()['initialized']
+        assert active()
+        assert cmd('systemctl', 'is-enabled', '--quiet', 'brocade.service', check=False).returncode == 0
         assert receipts(saved['mode']) == '1,2'
         assert sql(saved['mode'], 'SELECT site_name FROM control_state') == saved['name']
         verify(saved['mode'], saved['name'], saved['preserved'])
