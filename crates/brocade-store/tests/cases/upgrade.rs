@@ -105,3 +105,96 @@ async fn upgrade_rejects_unknown_and_newer_histories_without_rewriting_receipts(
     assert!(!check.compatible);
     assert_eq!(check.installed_versions, [1, 9999]);
 }
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn rejected_upgrade_releases_its_session_lock_before_a_repaired_retry() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    install_v031_schema(&db).await;
+    let original: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version=1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    sqlx::query(
+        "UPDATE _sqlx_migrations SET checksum=decode(repeat('00',48),'hex') WHERE version=1",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(db.store.migrate_database_schema().await.is_err());
+
+    // Inspect from another session so reacquiring the migrator's pooled connection cannot hide
+    // its session-level advisory lock through PostgreSQL's reentrant locking semantics.
+    let mut observer = <sqlx::PgConnection as sqlx::Connection>::connect(&db.url)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE _sqlx_migrations SET checksum=$1 WHERE version=1")
+        .bind(original)
+        .execute(&mut observer)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        db.store.migrate_database_schema(),
+    )
+    .await
+    .expect("repaired migration must not wait for a pooled connection to expire")
+    .unwrap();
+    let held: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND granted
+          AND database=(SELECT oid FROM pg_database WHERE datname=current_database())",
+    )
+    .fetch_one(&mut observer)
+    .await
+    .unwrap();
+    assert_eq!(
+        held, 0,
+        "a rejected migration retained its database session lock"
+    );
+    assert_eq!(
+        db.store
+            .check_database_upgrade()
+            .await
+            .unwrap()
+            .installed_versions,
+        [1, 2]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cancelled_upgrade_does_not_leave_a_session_lock_for_the_next_attempt() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    install_v031_schema(&db).await;
+    let mut blocker = <sqlx::PgConnection as sqlx::Connection>::connect(&db.url)
+        .await
+        .unwrap();
+    sqlx::migrate::Migrate::lock(&mut blocker).await.unwrap();
+    let store = db.store.clone();
+    let attempt = tokio::spawn(async move { store.migrate_database_schema().await });
+    wait_for_advisory_waiters(db.pool(), 1).await;
+    attempt.abort();
+    assert!(attempt.await.unwrap_err().is_cancelled());
+    sqlx::migrate::Migrate::unlock(&mut blocker).await.unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        db.store.migrate_database_schema(),
+    )
+    .await
+    .expect("a cancelled migrator must not retain the lock after its blocker exits")
+    .unwrap();
+    let held: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND granted
+          AND database=(SELECT oid FROM pg_database WHERE datname=current_database())",
+    )
+    .fetch_one(&mut blocker)
+    .await
+    .unwrap();
+    assert_eq!(held, 0, "a cancelled migration retained a session lock");
+}

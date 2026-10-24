@@ -36,7 +36,14 @@ impl PgStore {
     /// Schema-only migration for the offline upgrader. Normal startup performs its initializers
     /// separately, so a failed initializer cannot be mistaken for a rolled-back schema change.
     pub async fn migrate_database_schema(&self) -> Result<()> {
-        MIGRATOR.run(self.pool()).await?;
+        let mut connection = self.pool().acquire().await?;
+        // SQLx unlocks its session advisory lock only after a successful migration. Never return
+        // this session to the pool after failure or cancellation, where it could block a retry.
+        connection.close_on_drop();
+        let migrated = MIGRATOR.run_direct(&mut *connection).await;
+        let closed = connection.close().await;
+        migrated?;
+        closed?;
         Ok(())
     }
 }
