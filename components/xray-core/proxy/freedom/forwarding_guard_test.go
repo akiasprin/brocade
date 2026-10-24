@@ -88,11 +88,15 @@ func TestForwardingGuardBlocksBeforeTCPConnectIncludingDNSFallback(t *testing.T)
 			internet.InitSystemDialer(&forwardingDNS{fail: test.failDNS}, nil)
 			defer internet.InitSystemDialer(nil, nil)
 			handler := new(Handler)
-			if err := handler.Init(&Config{DomainStrategy: test.strategy, IpsBlocked: &IPRules{Rules: rules}}, policy.DefaultManager{}); err != nil {
+			if err := handler.Init(&Config{DomainStrategy: test.strategy}, policy.DefaultManager{}); err != nil {
+				t.Fatal(err)
+			}
+			matcher, err := geodata.IPReg.BuildIPMatcher(rules)
+			if err != nil {
 				t.Fatal(err)
 			}
 			dest := xnet.TCPDestination(xnet.ParseAddress(test.address), xnet.Port(listener.Addr().(*net.TCPAddr).Port))
-			ctx := session.ContextWithInbound(context.Background(), &session.Inbound{Name: "dokodemo-door", Tag: "fwd:42"})
+			ctx := session.ContextWithInbound(context.Background(), &session.Inbound{Name: "dokodemo-door", Tag: "fwd:42", ForwardingTargetIPMatcher: matcher})
 			ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: dest}})
 			if err := handler.Process(ctx, &transport.Link{}, &forwardingSystemDialer{}); err == nil {
 				t.Fatal("private target accepted")

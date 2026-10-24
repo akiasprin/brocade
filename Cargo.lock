@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-agent"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "brocade-core",
  "brocade-deployment",
@@ -408,16 +408,18 @@ dependencies = [
  "flate2",
  "getrandom 0.3.4",
  "libc",
+ "reqwest 0.12.28",
  "rustls",
  "serde",
  "serde_json",
+ "tokio",
  "tungstenite",
  "webpki-roots 1.0.10",
 ]
 
 [[package]]
 name = "brocade-console"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "async-stream",
  "axum",
@@ -456,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.22.1",
  "ipnet",
@@ -468,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-deployment"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "brocade-core",
  "serde",
@@ -477,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-launcher"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -485,9 +487,11 @@ dependencies = [
  "getrandom 0.3.4",
  "libc",
  "liblzma",
+ "percent-encoding",
  "postgresql_embedded",
  "reqwest 0.12.28",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "sqlx",
  "tar",
@@ -498,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-preview"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "axum",
  "reqwest 0.12.28",
@@ -511,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-probe"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "brocade-core",
  "brocade-deployment",
@@ -522,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-sqlx"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "sqlx-core 0.8.6",
  "sqlx-postgres 0.8.6",
@@ -530,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-store"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -801,9 +805,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
 dependencies = [
  "cmov",
 ]
@@ -984,7 +988,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2370,7 +2374,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2575,7 +2579,9 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "h2",
  "http",
  "http-body",
@@ -2757,7 +2763,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2815,7 +2821,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3440,7 +3446,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3560,9 +3566,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -4108,7 +4114,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

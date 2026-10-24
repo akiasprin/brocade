@@ -866,11 +866,15 @@ fn push_external_proxy(lines: &mut Vec<String>, proxy: &SubscriptionExternalProx
             if let ExternalOutboundSecurity::Tls {
                 server_name,
                 fingerprint,
+                allow_insecure,
                 ..
             } = &proxy.security
             {
                 lines.push(format!("    sni: {}", scalar(server_name)));
                 lines.push(format!("    client-fingerprint: {}", scalar(fingerprint)));
+                if *allow_insecure {
+                    lines.push("    skip-cert-verify: true".to_owned());
+                }
             }
         }
         ExternalOutboundProtocol::Vless {
@@ -1111,6 +1115,7 @@ fn push_external_security(
         ExternalOutboundSecurity::Tls {
             server_name,
             fingerprint,
+            allow_insecure,
             alpn,
             ech_config_list,
             pinned_peer_cert_sha256,
@@ -1120,6 +1125,9 @@ fn push_external_security(
             lines.push(format!("{pad}tls: true"));
             lines.push(format!("{pad}servername: {}", scalar(server_name)));
             lines.push(format!("{pad}client-fingerprint: {}", scalar(fingerprint)));
+            if *allow_insecure {
+                lines.push(format!("{pad}skip-cert-verify: true"));
+            }
             if !alpn.is_empty() {
                 lines.push(format!(
                     "{pad}alpn: [{}]",

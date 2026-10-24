@@ -28,8 +28,7 @@ use crate::{
     options::Options,
 };
 
-const IO_POLL: Duration = Duration::from_millis(20);
-const IDLE_POLL: Duration = Duration::from_millis(250);
+mod diagnostics;
 const INITIAL_RECONNECT: Duration = Duration::from_secs(1);
 const MAX_RECONNECT: Duration = Duration::from_secs(300);
 /// NIC rates stay at the requested live cadence, while the much larger worker snapshots refresh
@@ -441,35 +440,19 @@ fn normalize_idle_mux_fields(report: &mut brocade_deployment::protocol::MuxRepor
 }
 
 pub(crate) fn run(options: &Options, vpngate: VpngateCache) {
-    let health: HealthCache = Default::default();
-    let mux: MuxCache = Default::default();
-    let health_cache = health.clone();
-    let mux_cache = mux.clone();
-    let state_dir = options.state_dir.clone();
-    // Polling fallback is independent of management connectivity and NIC sampling.
-    thread::spawn(move || loop {
-        let started = Instant::now();
-        let api_address = fs::read_to_string(state_dir.join("xray.json"))
-            .ok()
-            .and_then(|content| crate::xray_api_address(&content));
-        let health_report =
-            api_address.and_then(|address| crate::xray_grpc::reverse_health(address).ok());
-        let mux_report =
-            api_address.and_then(|address| crate::xray_grpc::mux_snapshot(address).ok());
-        if let Ok(mut value) = health_cache.lock() {
-            *value = health_report;
+    let diagnostics = match diagnostics::Worker::start(options.state_dir.clone()) {
+        Ok(worker) => worker,
+        Err(error) => {
+            eprintln!("realtime: {error}");
+            return;
         }
-        if let Ok(mut value) = mux_cache.lock() {
-            *value = mux_report;
-        }
-        thread::sleep(Duration::from_secs(1).saturating_sub(started.elapsed()));
-    });
+    };
     let mut backoff = INITIAL_RECONNECT;
     loop {
         match connect(options) {
             Ok(socket) => {
                 backoff = INITIAL_RECONNECT;
-                if let Err(error) = serve(socket, &options.state_dir, &health, &mux, &vpngate) {
+                if let Err(error) = serve(socket, &options.state_dir, &diagnostics, &vpngate) {
                     eprintln!("realtime: connection ended: {error}");
                 }
             }
@@ -481,11 +464,12 @@ pub(crate) fn run(options: &Options, vpngate: VpngateCache) {
 }
 
 fn connect(options: &Options) -> Result<WebSocket<Stream>, String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
     let url = websocket_url(&options.server)?;
     let mut request = url
         .as_str()
         .into_client_request()
-        .map_err(|error| format!("invalid control-plane URL: {error}"))?;
+        .map_err(|_| "invalid control-plane WebSocket URL".to_owned())?;
     let headers = request.headers_mut();
     headers.insert(
         "authorization",
@@ -506,15 +490,10 @@ fn connect(options: &Options) -> Result<WebSocket<Stream>, String> {
             .parse()
             .expect("protocol version is a valid HTTP header"),
     );
-    // Reuse the Agent's existing transport, root store and TLS configuration. Giving tungstenite
-    // its own TLS feature would compile a second root database into every static Agent binary.
+    // TCP, system DNS, TLS and Upgrade share one deadline. The stream enforces it beneath
+    // rustls so TLS control messages cannot extend a blocked HTTP Upgrade indefinitely.
     let client = HttpClient::new(&options.server)?;
-    let tcp = client.connect()?;
-    tcp.set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|error| error.to_string())?;
-    tcp.set_write_timeout(Some(Duration::from_secs(10)))
-        .map_err(|error| error.to_string())?;
-    let stream = client.wrap_tls(tcp)?;
+    let stream = client.connect_stream(deadline)?;
     let config = WebSocketConfig::default()
         // Commands and samples are tiny JSON values. Bounding both directions prevents a broken
         // or hostile peer from turning this optional channel into unbounded Agent memory.
@@ -523,16 +502,16 @@ fn connect(options: &Options) -> Result<WebSocket<Stream>, String> {
         .max_write_buffer_size(MAX_WRITE_BUFFER_BYTES)
         .max_message_size(Some(MAX_FRAME_BYTES))
         .max_frame_size(Some(MAX_FRAME_BYTES));
-    let (socket, _) = tungstenite::client::client_with_config(request, stream, Some(config))
-        .map_err(|error| format!("WebSocket handshake failed: {error}"))?;
+    let (mut socket, _) = tungstenite::client::client_with_config(request, stream, Some(config))
+        .map_err(|_| "WebSocket handshake failed or timed out".to_owned())?;
     // Tungstenite documents every I/O error except WouldBlock as fatal. A read timeout therefore
     // cannot be used as a periodic wake-up: treating TimedOut as recoverable corrupts its state,
-    // while treating it as fatal reconnects every idle interval. Nonblocking I/O plus a short
-    // sleep gives sampling a precise clock and leaves the only recoverable result as WouldBlock.
+    // while treating it as fatal reconnects every idle interval. Nonblocking I/O plus a socket
+    // readiness wait gives sampling a precise clock and leaves WouldBlock recoverable.
     socket
-        .get_ref()
-        .set_nonblocking(true)
-        .map_err(|error| error.to_string())?;
+        .get_mut()
+        .finish_handshake()
+        .map_err(|error| format!("WebSocket handshake completion failed: {:?}", error.kind()))?;
     Ok(socket)
 }
 
@@ -550,10 +529,10 @@ fn websocket_url(server: &str) -> Result<String, String> {
 fn serve(
     mut socket: WebSocket<Stream>,
     state_dir: &Path,
-    health: &HealthCache,
-    mux: &MuxCache,
+    diagnostics_worker: &diagnostics::Worker,
     vpngate: &VpngateCache,
 ) -> Result<(), String> {
+    let subscription = diagnostics_worker.subscribe();
     let mut active: Option<(Duration, bool, Option<RealtimeUserTrafficSelector>)> = None;
     let mut next_sample = Instant::now();
     let mut next_diagnostics = Instant::now();
@@ -567,6 +546,7 @@ fn serve(
         if write_pending {
             write_pending = flush_pending(&mut socket)?;
         }
+        let mut would_block = false;
         match socket.read() {
             Ok(Message::Text(text)) => {
                 let command = serde_json::from_str::<AgentRealtimeCommand>(text.as_str())
@@ -602,6 +582,7 @@ fn serve(
                         } else if !diagnostics {
                             mux_baseline = None;
                         }
+                        subscription.set_enabled(diagnostics);
                         active = Some((interval, diagnostics, user_traffic));
                     }
                     AgentRealtimeCommand::Start { .. } => {
@@ -610,6 +591,7 @@ fn serve(
                         );
                     }
                     AgentRealtimeCommand::Stop => {
+                        subscription.set_enabled(false);
                         active = None;
                         mux_baseline = None;
                         sampler.reset();
@@ -619,7 +601,9 @@ fn serve(
             }
             Ok(Message::Close(_)) => return Ok(()),
             Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_)) => {}
-            Err(WebSocketError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(WebSocketError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                would_block = true;
+            }
             Err(error) => return Err(error.to_string()),
         }
 
@@ -644,8 +628,8 @@ fn serve(
                                     &mut sample,
                                     diagnostics,
                                     now >= next_diagnostics,
-                                    health,
-                                    mux,
+                                    &diagnostics_worker.health,
+                                    &diagnostics_worker.mux,
                                     vpngate,
                                     &mut mux_baseline,
                                 ) {
@@ -664,14 +648,17 @@ fn serve(
                 }
             }
         }
-        let sleep = match active {
-            Some(_) => next_sample
-                .saturating_duration_since(Instant::now())
-                .min(IO_POLL),
-            None => IDLE_POLL,
-        };
-        if !sleep.is_zero() {
-            thread::sleep(sleep);
+        if would_block {
+            // Drain all tungstenite/rustls buffered frames before waiting on the kernel socket.
+            // Flush also covers automatic Pong/Close replies; POLLOUT wakes a blocked writer.
+            write_pending = flush_pending(&mut socket)?;
+            let timeout = active
+                .as_ref()
+                .map(|_| next_sample.saturating_duration_since(Instant::now()));
+            socket
+                .get_ref()
+                .wait_for_io(write_pending, timeout)
+                .map_err(|error| error.to_string())?;
         }
     }
 }
@@ -1163,11 +1150,64 @@ mod tests {
         serve(
             socket,
             &options.state_dir,
-            &Default::default(),
-            &Default::default(),
+            &diagnostics::Worker::start(options.state_dir.clone()).unwrap(),
             &Default::default(),
         )
         .unwrap();
         server.join().unwrap();
+    }
+    #[test]
+    fn buffered_commands_and_ping_are_drained_before_readiness_wait() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            for command in [
+                AgentRealtimeCommand::Start {
+                    interval_millis: 1_000,
+                    diagnostics: false,
+                    user_traffic: None,
+                },
+                AgentRealtimeCommand::Stop,
+                AgentRealtimeCommand::Start {
+                    interval_millis: 1_000,
+                    diagnostics: false,
+                    user_traffic: None,
+                },
+                AgentRealtimeCommand::Stop,
+            ] {
+                socket
+                    .write(Message::Text(
+                        serde_json::to_string(&command).unwrap().into(),
+                    ))
+                    .unwrap();
+            }
+            socket.write(Message::Ping(vec![7, 8, 9].into())).unwrap();
+            socket.flush().unwrap();
+            assert_eq!(socket.read().unwrap(), Message::Pong(vec![7, 8, 9].into()));
+            socket.close(None).unwrap();
+        });
+        let options = Options {
+            command: "run".into(),
+            server: format!("http://{address}"),
+            token: "test-node".into(),
+            state_dir: std::env::temp_dir(),
+            apply_mode: ApplyMode::StateDir,
+            vpngate_stats_window: Duration::from_secs(900),
+        };
+        let worker = diagnostics::Worker::start(options.state_dir.clone()).unwrap();
+        serve(
+            connect(&options).unwrap(),
+            &options.state_dir,
+            &worker,
+            &Default::default(),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert!(worker.health.lock().unwrap().is_none());
     }
 }

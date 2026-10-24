@@ -4,6 +4,8 @@ mod command;
 mod conntrack;
 mod conntrack_tuning;
 #[cfg(test)]
+mod desired_delivery_tests;
+#[cfg(test)]
 mod endpoint_hot_swap_tests;
 use brocade_probe as e2e;
 mod forwarding;
@@ -25,11 +27,16 @@ mod public_ip;
 mod realtime;
 mod selfupdate;
 mod site_usage;
+mod source_access;
 mod spool;
 mod traffic;
+mod traffic_limit;
+mod traffic_limit_budget;
+mod user_traffic;
 mod vpngate;
 mod wg;
 mod xray_grpc;
+mod xray_process;
 mod xrayupdate;
 pub(crate) use command::{command_success, run_command, run_shell, run_shell_with_timeout};
 use http::{HttpClient, HttpResponse};
@@ -63,7 +70,10 @@ use std::{
     fs::{self, OpenOptions},
     io::Read,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, OnceLock},
     thread,
@@ -156,14 +166,18 @@ struct UsageCursor {
 }
 
 /// The report context which must outlive the Agent process while an Xray configuration handoff
-/// is in flight. The desired state is retained because the control plane correctly withholds the
-/// already-dispatched target until its lease expires; recovery cannot fetch it again immediately.
+/// is in flight. The control plane may replay the same target; local recovery must retain the
+/// original desired state, observation and accounting boundary rather than starting a new operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingConfigConvergence {
     desired: NodeDesiredDeployment,
     observed_before: ReportedNodeState,
     usage_activated_at_unix_secs: Option<i64>,
     certificate_received: bool,
+    /// Persist completion before the reporter can send/acknowledge the separate spool. A crash
+    /// between those file updates must resume delivery, never execute the data-plane change again.
+    #[serde(default)]
+    completed_observation: Option<AgentObservationRequest>,
     /// The exact observation is already durable in `observation.spool.jsonl`. Keep this journal
     /// only while the old Xray generation still drains, so an Agent restart neither replays the
     /// convergence nor mistakes the live two-generation state for an unreported work order.
@@ -858,18 +872,34 @@ fn wait_for_xray_runtime_health(state_dir: &Path, content: &str) -> Result<(), S
     wait_for_xray_runtime_health_with(
         XRAY_STARTUP_HEALTH_TIMEOUT,
         XRAY_STARTUP_HEALTH_INTERVAL,
-        || xray_runtime(state_dir, content),
+        || {
+            if let Some(runtime) = xrayupdate::read_upgrade_runtime(state_dir)? {
+                if let Some(candidate) = &runtime.candidate {
+                    let replacement_started =
+                        serving_xray_processes_in(state_dir).iter().any(|process| {
+                            process.pid != runtime.old.pid && process.pid != candidate.pid
+                        });
+                    if candidate.accepting == Some(true) && !candidate.alive && !replacement_started
+                    {
+                        return Err(
+                            "已接流 Xray 候选退出，结束启动等待并交由守护线程恢复".to_owned()
+                        );
+                    }
+                }
+            }
+            Ok(xray_runtime(state_dir, content))
+        },
     )
 }
 
 fn wait_for_xray_runtime_health_with(
     timeout: Duration,
     interval: Duration,
-    mut observe: impl FnMut() -> WorkloadRuntime,
+    mut observe: impl FnMut() -> Result<WorkloadRuntime, String>,
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
-        let error = match observe() {
+        let error = match observe()? {
             WorkloadRuntime::Healthy => return Ok(()),
             WorkloadRuntime::Broken(error) | WorkloadRuntime::Unknown(error) => error,
         };
@@ -1199,15 +1229,36 @@ fn guard_xray_once(state_dir: &Path, restore_existing: bool) -> Result<(), Strin
         // state. Ordinary guard recovery must not collapse them into a destructive restart.
         return Ok(());
     }
+    let running = serving_xray_process_in(state_dir).is_some();
+    if running && !restore_existing && !state_dir.join(XRAY_RECOVERY_MARKER).exists() {
+        return Ok(());
+    }
     let content = fs::read_to_string(&config)
         .map_err(|error| format!("读取 {} 失败：{error}", config.display()))?;
     let api_address = xray_api_address(&content).unwrap_or(crate::DEFAULT_XRAY_API_ADDRESS);
-    if serving_xray_process_in(state_dir).is_none() {
-        let recovery = apply_xray(&config, api_address)?;
+    let pending_grants = read_pending_config_convergence(state_dir)?.and_then(|pending| {
+        match pending.desired.desired.xray {
+            DesiredArtifact::Present {
+                content: desired, ..
+            } if desired == content => match pending.desired.desired.grants {
+                DesiredGrants::Present { inbounds } => Some(inbounds),
+                DesiredGrants::Disabled { .. } => Some(Vec::new()),
+                DesiredGrants::Unmanaged { .. } => None,
+            },
+            _ => None,
+        }
+    });
+    if !running {
+        let recovery = apply_xray_with_grants(&config, api_address, pending_grants.as_deref())?;
         return recovery.error().map_or(Ok(()), Err);
     }
     if restore_existing || state_dir.join(XRAY_RECOVERY_MARKER).exists() {
-        let recovery = restore_xray_runtime(state_dir, &content, api_address);
+        let recovery = restore_xray_runtime_with_grants(
+            state_dir,
+            &content,
+            api_address,
+            pending_grants.as_deref(),
+        );
         return recovery.error().map_or(Ok(()), Err);
     }
     Ok(())
@@ -1540,6 +1591,7 @@ fn health(state_dir: &Path) -> Result<(), String> {
 // alternating between two tasks.
 const APPLY_INTERVAL: Duration = Duration::from_secs(15);
 const XRAY_GUARD_INTERVAL: Duration = Duration::from_secs(1);
+const XRAY_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
 const USAGE_INTERVAL: Duration = Duration::from_secs(30);
 /// A round sends about a dozen pings per peer, while path MTU is a property of the
 /// upstream link and typically holds for hours. A shorter interval only adds traffic on
@@ -1652,6 +1704,16 @@ fn run_forever(options: Options) -> Result<(), String> {
         // Keep serving and leave a searchable warning for the operator.
         Err(error) => warn(format!("agent 日志上限未能落地：{error}")),
     }
+    source_access::spawn(options.clone())?;
+    user_traffic::spawn(options.clone())?;
+    if let Err(error) = traffic_limit_budget::initialize(&options.state_dir) {
+        warn(format!("应用层限速预算初始化失败，将独立重试：{error}"));
+    }
+    if options.apply_mode == ApplyMode::Linux {
+        if let Err(error) = traffic_limit::restore_saved_network(&options.state_dir) {
+            warn(format!("恢复机器限速失败：{error}"));
+        }
+    }
     let meter = Arc::new(Mutex::new(()));
     {
         // Restore from local durable state before any network-paced worker starts. This closes the
@@ -1676,6 +1738,7 @@ fn run_forever(options: Options) -> Result<(), String> {
         options.state_dir.clone(),
         Arc::clone(&runtime_reports.traffic),
     )?;
+    traffic_limit::spawn(options.clone(), Arc::clone(&runtime_reports.traffic))?;
     let _ = RUNTIME_REPORTS.set(Arc::clone(&runtime_reports));
     let vpngate_realtime: realtime::VpngateCache = Default::default();
     {
@@ -1698,6 +1761,7 @@ fn run_forever(options: Options) -> Result<(), String> {
             .name("xray-guard".to_owned())
             .spawn(move || {
                 let mut observed = serving_xray_process_in(&state_dir);
+                let mut next_prune = Instant::now();
                 loop {
                     each_round("xray-guard", || {
                         let _guard = xray_meter
@@ -1712,6 +1776,12 @@ fn run_forever(options: Options) -> Result<(), String> {
                             eprintln!("xray-guard: {error}");
                         }
                         observed = serving_xray_process_in(&state_dir);
+                        if Instant::now() >= next_prune {
+                            if let Err(error) = xrayupdate::prune_retired_generations(&state_dir) {
+                                eprintln!("xray-handoff: {error}");
+                            }
+                            next_prune = Instant::now() + XRAY_PRUNE_INTERVAL;
+                        }
                     });
                     thread::sleep(XRAY_GUARD_INTERVAL);
                 }
@@ -1719,9 +1789,9 @@ fn run_forever(options: Options) -> Result<(), String> {
             .map_err(|error| format!("cannot spawn xray-guard thread: {error}"))?;
     }
 
-    // Convergence results are durable and ordered, but their network delivery is not part of the
-    // convergence transaction. The control plane already withholds new work while an observation
-    // is outstanding, so a dedicated drainer preserves ordering without delaying heartbeats.
+    // Convergence results are durable and ordered, but network delivery is independent. The
+    // local executor withholds new claims until this spool is acknowledged; a dedicated drainer
+    // preserves ordering without delaying the independent runtime/usage reporters.
     spawn_spool_reporter(
         "observation-report",
         OBSERVATION_SPOOL,
@@ -1849,6 +1919,13 @@ fn run_forever(options: Options) -> Result<(), String> {
                         let _guard = meter
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let _deadline = xray_grpc::deadline_after(
+                            options
+                                .state_dir
+                                .join(xrayupdate::UPGRADE_RUNTIME_FILE)
+                                .exists()
+                                .then_some(Duration::from_secs(1)),
+                        );
                         if let Err(error) = collect_usage_report(&options) {
                             eprintln!("usage: {error}");
                         }
@@ -2325,16 +2402,33 @@ fn pending_config_convergence_path(state_dir: &Path) -> PathBuf {
     state_dir.join(CONFIG_CONVERGENCE_FILE)
 }
 
-fn write_pending_config_convergence(
-    state_dir: &Path,
-    pending: &PendingConfigConvergence,
-) -> Result<(), String> {
+fn validate_pending_config_convergence(pending: &PendingConfigConvergence) -> Result<(), String> {
     if pending.desired.deployment_id <= 0
         || pending.desired.node_id.is_empty()
         || !pending.desired.actions.contains(&PlannedAction::ApplyXray)
     {
-        return Err("拒绝写入身份不完整的 Xray 配置收敛日志".to_owned());
+        return Err("Xray 配置收敛日志的发布身份或动作无效".to_owned());
     }
+    if pending
+        .completed_observation
+        .as_ref()
+        .is_some_and(|report| {
+            report.deployment_id != pending.desired.deployment_id
+                || report.claim_generation != pending.desired.claim_generation
+                || report.observed_before != pending.observed_before
+                || report.usage_activated_at_unix_secs != pending.usage_activated_at_unix_secs
+        })
+    {
+        return Err("Xray 配置收敛日志的完成回执与原工单不一致".to_owned());
+    }
+    Ok(())
+}
+
+fn write_pending_config_convergence(
+    state_dir: &Path,
+    pending: &PendingConfigConvergence,
+) -> Result<(), String> {
+    validate_pending_config_convergence(pending)?;
     let encoded = serde_json::to_vec(pending)
         .map_err(|error| format!("编码 Xray 配置收敛日志失败：{error}"))?;
     if encoded.is_empty() || encoded.len() as u64 > MAX_CONFIG_CONVERGENCE_BYTES {
@@ -2388,15 +2482,8 @@ fn read_pending_config_convergence(
     }
     let pending: PendingConfigConvergence = serde_json::from_slice(&encoded)
         .map_err(|error| format!("解析 Xray 配置收敛日志 {} 失败：{error}", path.display()))?;
-    if pending.desired.deployment_id <= 0
-        || pending.desired.node_id.is_empty()
-        || !pending.desired.actions.contains(&PlannedAction::ApplyXray)
-    {
-        return Err(format!(
-            "Xray 配置收敛日志 {} 的发布身份或动作无效",
-            path.display()
-        ));
-    }
+    validate_pending_config_convergence(&pending)
+        .map_err(|error| format!("Xray 配置收敛日志 {} 无效：{error}", path.display()))?;
     Ok(Some(pending))
 }
 
@@ -2450,11 +2537,64 @@ fn config_convergence_can_resume_during_handoff(
             == Some(true))
 }
 
+/// Replay is safe only with one executor per state directory, including manual apply-once.
+/// Keep the inode after release: unlinking would let another process lock a different inode.
+struct ConvergenceLock(fs::File);
+
+impl Drop for ConvergenceLock {
+    fn drop(&mut self) {
+        // CLOEXEC closes the descriptor at exec, but a concurrent fork can briefly retain
+        // the open file description after this owner closes it. Explicit unlock releases
+        // our completed round even if that child has not reached exec yet.
+        if unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            eprintln!("释放收敛锁失败：{}", std::io::Error::last_os_error());
+        }
+    }
+}
+
+fn lock_convergence(state_dir: &Path) -> Result<ConvergenceLock, String> {
+    create_private_dir(state_dir)?;
+    let path = state_dir.join("convergence.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|error| format!("打开收敛锁 {} 失败：{error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("检查收敛锁 {} 失败：{error}", path.display()))?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(format!(
+            "收敛锁 {} 的类型、属主、链接数或权限无效",
+            path.display()
+        ));
+    }
+    // SAFETY: file owns an open descriptor for the whole convergence round. flock does not
+    // access Rust memory; closing the descriptor releases the process lock, including on exit.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "无法独占收敛目录 {}：{}",
+            state_dir.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(ConvergenceLock(file))
+}
+
 fn apply_once_inner(
     options: Options,
     meter: Option<&Arc<Mutex<()>>>,
     report_inline: bool,
 ) -> Result<(), String> {
+    let _convergence_lock = lock_convergence(&options.state_dir)?;
     let runtime = xrayupdate::read_upgrade_runtime(&options.state_dir)?;
     if let Some(runtime) = runtime.as_ref() {
         // An active or gracefully blocked handoff owns the Xray process/configuration boundary.
@@ -2463,6 +2603,9 @@ fn apply_once_inner(
         // may finish the same work order at that point; all other work remains fenced.
         if matches!(&runtime.source, XrayUpgradeSource::ConfigDeployment { .. }) {
             if let Some(pending) = read_pending_config_convergence(&options.state_dir)? {
+                if pending.completed_observation.is_some() && !pending.observation_queued {
+                    return record_convergence_observation(&options, report_inline, pending, true);
+                }
                 if pending.observation_queued {
                     if report_inline {
                         spool_drain(OBSERVATION_SPOOL, &options)?;
@@ -2481,6 +2624,9 @@ fn apply_once_inner(
         return Ok(());
     }
     if let Some(pending) = read_pending_config_convergence(&options.state_dir)? {
+        if pending.completed_observation.is_some() && !pending.observation_queued {
+            return record_convergence_observation(&options, report_inline, pending, true);
+        }
         if pending.observation_queued {
             // Retirement has reached a terminal boundary and the separately durable observation
             // is now the only owner. Remove the no-longer-needed convergence context before
@@ -2494,17 +2640,16 @@ fn apply_once_inner(
         }
     }
     let client = HttpClient::new(&options.server)?;
-    // Flush the convergence results still owed from earlier rounds before asking for
-    // new work. It runs before fetching desired state, because while an observation is
-    // outstanding the control plane answers 204 — the row is still at `dispatched`, its
-    // lease has not expired, and the claim query cannot select it — so a flush placed
-    // after that early 204 return would never run.
-    // Failure does not stop this round: a failed flush usually means the control plane
-    // is not reachable, which is the situation the local reconcile below covers.
+    // A new Console replays an in-flight claim immediately after a lost response. Once we have
+    // executed it, the durable observation owns completion: never claim again until its ACK,
+    // even when delivery runs on the separate reporter thread or this Agent has restarted.
     if report_inline {
         if let Err(error) = spool_drain(OBSERVATION_SPOOL, &options) {
             warn(format!("补发上一轮的收敛结果没成功：{error}"));
         }
+    }
+    if !spool::spool_read(OBSERVATION_SPOOL, &options.state_dir)?.is_empty() {
+        return Ok(());
     }
     let response = match desired_request(&client, &options) {
         Ok(response) => response,
@@ -2631,6 +2776,7 @@ fn apply_once_inner(
         observed_before: before,
         usage_activated_at_unix_secs: None,
         certificate_received,
+        completed_observation: None,
         observation_queued: false,
     };
     if durable {
@@ -2684,11 +2830,20 @@ fn converge_and_record(
             Ok(())
         };
         match options.apply_mode {
-            ApplyMode::StateDir => converge_to_state_dir(&options.state_dir, &desired),
-            ApplyMode::Linux => converge_linux(&options.state_dir, &desired, &mut collect)
-                .map(|_| observe_linux_state(&options.state_dir, &desired)),
+            ApplyMode::StateDir => converge_to_state_dir(&options.state_dir, &desired).map(Some),
+            ApplyMode::Linux => {
+                converge_linux(&options.state_dir, &desired, &mut collect).map(|()| None)
+            }
         }
     };
+    // Keep observation within a shared short budget. The lock must still cover committing
+    // the usage generation: sampling new counters through the previous ownership map is unsafe.
+    let applied = applied.map(|after| {
+        after.unwrap_or_else(|| {
+            let _deadline = xray_grpc::deadline_after(Some(Duration::from_secs(2)));
+            observe_linux_state(&options.state_dir, &desired)
+        })
+    });
     let (result, after, error) = match applied {
         Ok(after) => {
             let outcome = successful_apply_outcome(&options.state_dir, after);
@@ -2699,6 +2854,7 @@ fn converge_and_record(
             )
         }
         Err(error) => {
+            let _deadline = xray_grpc::deadline_after(Some(Duration::from_secs(2)));
             let after = observe_state(&options.state_dir, &desired, options.apply_mode)
                 .unwrap_or_else(|_| unknown_state());
             let result = if after == before {
@@ -2710,24 +2866,40 @@ fn converge_and_record(
         }
     };
 
-    let report = AgentObservationRequest {
+    // Runtime mutation, bounded observation and accounting ownership are now one committed
+    // boundary. Receipt persistence/delivery must not hold the local recovery mutex.
+    drop(held.take());
+    pending.completed_observation = Some(AgentObservationRequest {
         deployment_id: desired.deployment_id,
         claim_generation: desired.claim_generation,
         result,
         observed_before: before,
         observed_after: after,
-        error: error.clone(),
+        error,
         route: route_ip_report(),
         usage_activated_at_unix_secs: pending.usage_activated_at_unix_secs,
-    };
-    // Write to disk before sending. Convergence has already happened on this machine and
-    // this result is its only record. If it is not delivered, the control plane stays at
-    // `dispatched` and waits out a full 15-minute distribution lease before sending
-    // again, while the work of this round is already complete. This previously returned
-    // on a failed send, discarding the record of a completed convergence. The usage spool
-    // has always worked this way, and both share the same persistence and retry
-    // machinery (`Spool`).
-    spool_push_unique(OBSERVATION_SPOOL, &options.state_dir, &report)?;
+    });
+    record_convergence_observation(options, report_inline, pending, durable)
+}
+
+fn record_convergence_observation(
+    options: &Options,
+    report_inline: bool,
+    mut pending: PendingConfigConvergence,
+    durable: bool,
+) -> Result<(), String> {
+    let report = pending
+        .completed_observation
+        .as_ref()
+        .ok_or("收敛完成记录缺少回执")?;
+    let error = report.error.clone();
+    if durable {
+        write_pending_config_convergence(&options.state_dir, &pending)?;
+    }
+    // Persist before sending: this result owns completion even if the Console accepts it and
+    // its ACK is lost. The next executor must retry this receipt before claiming/replaying work;
+    // legacy Consoles additionally withhold the dispatched target for a 15-minute lease.
+    spool_push_unique(OBSERVATION_SPOOL, &options.state_dir, report)?;
     if durable {
         match xrayupdate::read_upgrade_runtime(&options.state_dir)? {
             Some(runtime) => {
@@ -3271,14 +3443,26 @@ fn converge_linux(
             .unwrap_or(brocade_deployment::protocol::XrayConfigUpdatePolicy::Handoff),
         match &desired.desired.grants {
             DesiredGrants::Present { inbounds } => Some(inbounds),
-            _ => None,
+            DesiredGrants::Disabled { .. } => Some(&[]),
+            DesiredGrants::Unmanaged { .. } => None,
         },
     )?;
     // After xray, because the ports come out of its config: applying first would exempt the
     // previous release's ports and leave the new ones tracked until the next convergence.
     conntrack::apply(&desired.desired.xray)?;
     converge_linux_hy2_port_hop(state_dir, &desired.desired.hy2_port_hop)?;
-    converge_linux_grants(state_dir, &desired.desired.xray, &desired.desired.grants)?;
+    let grants_restored = match &desired.desired.grants {
+        DesiredGrants::Present { inbounds } => xrayupdate::config_handoff_has_grants(
+            state_dir,
+            desired.deployment_id,
+            desired.claim_generation,
+            inbounds,
+        )?,
+        _ => false,
+    };
+    if !grants_restored {
+        converge_linux_grants(state_dir, &desired.desired.xray, &desired.desired.grants)?;
+    }
 
     Ok(())
 }
@@ -3360,7 +3544,7 @@ fn converge_linux_xray(
     policy: brocade_deployment::protocol::XrayConfigUpdatePolicy,
     desired_grants: Option<&[GrantInbound]>,
 ) -> Result<(), String> {
-    let forbid_restart = policy == brocade_deployment::protocol::XrayConfigUpdatePolicy::Handoff;
+    let prefer_handoff = policy == brocade_deployment::protocol::XrayConfigUpdatePolicy::Handoff;
     match desired {
         DesiredArtifact::Present { content, .. } => {
             let path = state_dir.join("xray.json");
@@ -3380,8 +3564,7 @@ fn converge_linux_xray(
             // A successful swap commits the live checkpoint. Otherwise stage the candidate,
             // validate it, and preserve the serving process's old file through final accounting.
             // The shared classifier never mutates inbounds: a failed hot update must leave
-            // the old listeners and grants available for handoff. Forbidding a stop/start
-            // fallback does not forbid this safe, in-process configuration path.
+            // the old listeners and grants available for handoff or a validated restart.
             if !force_restart && serving_before && !splice_mode_changed && bounded_log {
                 if let Some(swap) = previous
                     .as_deref()
@@ -3397,7 +3580,7 @@ fn converge_linux_xray(
                             // Not fatal, and deliberately not silent: a swap that keeps
                             // failing is a machine restarting on every deployment while
                             // appearing to have gained the ability not to.
-                            if forbid_restart {
+                            if prefer_handoff {
                                 eprintln!("热切换失败，继续尝试 Xray 代际交接：{error}");
                             } else {
                                 eprintln!("热更新失败，按发布策略重启 Xray：{error}");
@@ -3412,26 +3595,30 @@ fn converge_linux_xray(
             let candidate = state_dir.join("xray.next.json");
             write_private(&candidate, content)?;
             let serving = serving_xray_process_in(state_dir).is_some();
-            let handoff_ready = forbid_restart && xrayupdate::config_handoff_ready(state_dir);
-            let handoff_eligible = previous
-                .as_deref()
-                .is_some_and(|previous| previous != content);
-            if forbid_restart && serving {
-                let blocker = config_handoff_blocker(
-                    force_restart,
-                    handoff_ready,
-                    previous.as_deref(),
-                    content,
-                    deployment,
-                );
-                if let Some(blocker) = blocker {
-                    let _ = fs::remove_file(&candidate);
-                    return Err(format!(
-                        "Xray 配置要求平滑交接，但当前条件不满足；旧进程继续服务，未执行断流重启：{blocker}"
-                    ));
+            let fallback_reason = if prefer_handoff && serving {
+                if previous.is_none() || deployment.is_none_or(|(id, _)| id <= 0) {
+                    return Err(
+                        "Xray 配置交接缺少运行配置检查点或可审计发布身份，旧进程继续服务"
+                            .to_owned(),
+                    );
                 }
+                if xrayupdate::read_upgrade_runtime(state_dir)?.is_some() {
+                    return Err("已有 Xray 双进程交接，不能再启动配置重启或第三代进程".to_owned());
+                }
+                if force_restart {
+                    Some("本次收敛要求强制重启".to_owned())
+                } else {
+                    xrayupdate::config_handoff_unavailable_reason(state_dir, content)
+                }
+            } else {
+                None
+            };
+            if let Some(reason) = &fallback_reason {
+                eprintln!(
+                    "Xray 平滑条件不足，将按发布策略降级为直接重启，现有连接将中断：{reason}"
+                );
             }
-            if forbid_restart && !force_restart && serving && handoff_ready && handoff_eligible {
+            if prefer_handoff && serving && fallback_reason.is_none() {
                 let (deployment_id, claim_generation) = deployment.ok_or_else(|| {
                     "配置满足 Xray 交接条件，但当前收敛没有可审计的发布身份".to_owned()
                 })?;
@@ -3460,18 +3647,15 @@ fn converge_linux_xray(
                         // Once handoff was selected, never silently turn its failure into a
                         // destructive restart. The handoff routine either restored the old
                         // accepting generation or durably recorded the two-process dirty state.
-                        return Err(format!("Xray 配置代际交接失败，未执行断流重启：{error}"));
+                        return Err(format!(
+                            "Xray 配置代际交接失败；Agent 将根据持久交接状态恢复服务：{error}"
+                        ));
                     }
                 }
             }
-            if forbid_restart && serving {
-                let _ = fs::remove_file(&candidate);
-                return Err(
-                    "Xray 配置要求平滑交接，但未能选择交接路径；旧进程继续服务，未执行断流重启"
-                        .to_owned(),
-                );
-            }
-            let recovery = match apply_xray(&candidate, api_address) {
+            // Candidate validation and final accounting still precede stopping the old
+            // process. A capability fallback never excuses unsafe config or lost counters.
+            let recovery = match apply_xray_with_grants(&candidate, api_address, desired_grants) {
                 Ok(recovery) => recovery,
                 Err(update_error) => {
                     let old_still_serving = previous.as_ref().is_some_and(|previous| {
@@ -3513,6 +3697,18 @@ fn converge_linux_xray(
                 }
             };
             let _ = fs::remove_file(state_dir.join("xray.disabled"));
+            if let Some(reason) = fallback_reason {
+                let identity = deployment.map_or_else(String::new, |(id, attempt)| {
+                    format!("配置发布 {id}/{attempt}：")
+                });
+                record_local_reconcile(
+                    state_dir,
+                    &[format!(
+                        "{identity}Xray 平滑条件不足，已降级为直接重启：{reason}"
+                    )],
+                    recovery.error().as_deref(),
+                )?;
+            }
             if let Some(error) = recovery.error() {
                 Err(format!(
                     "Xray 新配置已运行并保留已恢复业务，但动态状态尚未完整：{error}"
@@ -3534,50 +3730,42 @@ fn converge_linux_xray(
     }
 }
 
-fn config_handoff_blocker(
-    force_restart: bool,
-    handoff_ready: bool,
-    previous: Option<&str>,
-    desired: &str,
-    deployment: Option<(i64, u64)>,
-) -> Option<&'static str> {
-    if force_restart {
-        return Some("本次收敛要求强制重启");
-    }
-    if !handoff_ready {
-        return Some("运行中的 Xray 未报告可交接状态");
-    }
-    let Some(previous) = previous else {
-        return Some("缺少运行中 Xray 的配置检查点");
-    };
-    if previous == desired {
-        return Some("目标配置与运行检查点相同");
-    }
-    if deployment.is_none_or(|(deployment_id, _claim_generation)| deployment_id <= 0) {
-        return Some("缺少可审计的发布身份");
-    }
-    None
-}
-
-/// Installs a `HotSwap`, in the one order that leaves no gap.
-///
-/// Appending the new table while the old one is still installed keeps the old rules in
-/// effect until they are removed, because they remain ahead of the new ones and routing
-/// takes the first match. There is no instant at which the table is empty or partially
-/// built.
-///
-/// The simpler alternative is incorrect: `adrules` without `-append` replaces the table, and
-/// a replacement removes the balancers with it. The liveness balancer cannot be rebuilt
-/// afterwards, so hop health would stop with nothing reporting that it had.
+/// Uses upstream AddRule replacement semantics with complete routing configurations.
+/// Check the running executable before any mutation: an installed update can coexist
+/// with an older, unsafe router until Xray itself has been upgraded.
 fn apply_hot_swap(state_dir: &Path, api_address: SocketAddr, swap: &HotSwap) -> Result<(), String> {
+    let running = if swap.reload_routing.is_some() {
+        let process = serving_xray_process_in(state_dir)
+            .ok_or_else(|| "路由热更新缺少运行中的 Xray 身份".to_owned())?;
+        let version = command::run_command_with_timeout(
+            &format!("/proc/{}/exe", process.pid),
+            &["version"],
+            Duration::from_secs(5),
+        )?;
+        if !xray_version_has_capability(&version, "atomic-routing-reload-v1") {
+            return Err("运行中的 Xray 不支持原子路由重载，按发布策略交接或重启".to_owned());
+        }
+        if !process_is_live(process)
+            || !process_owns_listener(process.pid, api_address.port(), XrayListenProtocol::Tcp)?
+        {
+            return Err("路由热更新检查期间 Xray 运行身份或 API 监听已改变".to_owned());
+        }
+        Some(process)
+    } else {
+        None
+    };
+    let program = running.map_or_else(xray_program, |process| format!("/proc/{}/exe", process.pid));
     let server = format!("--server={api_address}");
     // `--server` goes directly after the verb. Go's flag parsing stops at the first
     // non-flag argument, so placed after a file name it is read as another file, and the
     // call dials the default port with no error.
     let call = |verb: &str, rest: &[&str]| -> Result<String, String> {
+        if running.is_some_and(|process| !process_is_live(process)) {
+            return Err("路由热更新期间 Xray 运行身份已改变".to_owned());
+        }
         let mut args = vec!["api", verb, server.as_str()];
         args.extend_from_slice(rest);
-        run_command(&xray_program(), &args)
+        run_command(&program, &args)
     };
     let stage = |name: &str, value: Value| -> Result<PathBuf, String> {
         let path = state_dir.join(name);
@@ -3605,24 +3793,14 @@ fn apply_hot_swap_operation(
             let path = stage("hotswap.outbounds.json", json!({ "outbounds": outbounds }))?;
             call("ado", &[&path.display().to_string()])?;
         }
-        HotSwapOperation::AddRules(rules) => {
-            let path = stage(
-                "hotswap.rules.json",
-                json!({ "routing": { "rules": rules } }),
-            )?;
-            // Append preserves balancers and keeps the preceding table live until removal.
-            call("adrules", &["-append", &path.display().to_string()])?;
+        HotSwapOperation::ReloadRouting(routing) => {
+            let path = stage("hotswap.routing.json", json!({ "routing": routing }))?;
+            // AddRule defaults to shouldAppend=false, matching upstream replacement semantics.
+            call("adrules", &["-timeout=20", &path.display().to_string()])?;
         }
-        HotSwapOperation::RemoveOutbounds(tags) | HotSwapOperation::RemoveRules(tags)
-            if tags.is_empty() => {}
+        HotSwapOperation::RemoveOutbounds(tags) if tags.is_empty() => {}
         HotSwapOperation::RemoveOutbounds(tags) => {
             call("rmo", &tags.iter().map(String::as_str).collect::<Vec<_>>())?;
-        }
-        HotSwapOperation::RemoveRules(tags) => {
-            call(
-                "rmrules",
-                &tags.iter().map(String::as_str).collect::<Vec<_>>(),
-            )?;
         }
     }
     Ok(())
@@ -3735,12 +3913,23 @@ fn apply_xray_with_grants(
     let disable_splice =
         xray_needs_splice_disabled(&content, xray_supports_secure_dokodemo_splice())?;
     let xray = xray_program();
+    user_traffic::verify_executable(
+        path.parent().ok_or("xray config has no state directory")?,
+        Path::new(&xray),
+    )?;
+    source_access::verify_executable(
+        path.parent().ok_or("xray config has no state directory")?,
+        Path::new(&xray),
+    )?;
     let executable = shell_quote(&xray);
     let splice_mode = if disable_splice { "disable" } else { "auto" };
     if !ensure_kernel_tls_module() {
         warn("启动 Xray 前仍未观察到 Linux tls 内核模块；AnyTLS 将按 auto 回退");
     }
     let state_dir = path.parent().ok_or("xray config has no state directory")?;
+    if let Err(error) = traffic_limit_budget::initialize(state_dir) {
+        warn(format!("应用层限速预算初始化失败，将独立重试：{error}"));
+    }
     let bootstrap = xrayupdate::installed_xray_supports_handoff()
         .then(|| xrayupdate::prepare_bootstrap_handoff(state_dir, &content))
         .transpose()?;
@@ -3759,6 +3948,23 @@ fn apply_xray_with_grants(
     ));
     let mut launch_environment = vec![
         journal,
+        shell_quote(&format!(
+            "{}={}",
+            source_access::ENV,
+            source_access::policy_path(&accounting_dir).display()
+        )),
+        shell_quote(&format!(
+            "XRAY_BROCADE_USER_LIMIT_FILE={}",
+            user_traffic::control_path(&accounting_dir).display()
+        )),
+        shell_quote(&format!(
+            "XRAY_BROCADE_MACHINE_LIMIT_FILE={}",
+            traffic_limit_budget::control_path(&accounting_dir).display()
+        )),
+        shell_quote(&format!(
+            "XRAY_BROCADE_MACHINE_LIMIT_REQUIRED={}",
+            u8::from(traffic_limit_budget::required_at_start(&accounting_dir))
+        )),
         shell_quote(&format!(
             "XRAY_BROCADE_SNIFFING_FAILED_CONTROL_FILE={}",
             other_domain::failed_control_path(&accounting_dir).display()
@@ -3985,7 +4191,7 @@ fn xray_supports_secure_dokodemo_splice() -> bool {
     let Ok(path) = which_xray() else {
         return false;
     };
-    let Ok(before) = XrayFileVersion::read(&path) else {
+    let Ok(before) = FileVersion::read(&path) else {
         return false;
     };
     let cache = XRAY_SPLICE_CAPABILITY_CACHE.get_or_init(|| Mutex::new(Vec::with_capacity(4)));
@@ -4003,7 +4209,7 @@ fn xray_supports_secure_dokodemo_splice() -> bool {
     let Ok(output) = run_command(&program, &["version"]) else {
         return false;
     };
-    let Ok(after) = XrayFileVersion::read(&path) else {
+    let Ok(after) = FileVersion::read(&path) else {
         return false;
     };
     if before != after {
@@ -4972,7 +5178,7 @@ fn xray_config_argument(cmdline: &[u8]) -> Option<&str> {
 /// A temporary probe can be older than the replacement server. Its PID must never become a
 /// billing epoch or a released-binary identity; resolve the managed config, not process age alone.
 fn serving_xray_process_for(state_dir: Option<&Path>) -> Option<ProcessRef> {
-    serving_xray_processes_for(state_dir).into_iter().next()
+    xray_process::serving(state_dir)
 }
 
 fn serving_xray_processes_for(state_dir: Option<&Path>) -> Vec<ProcessRef> {
@@ -4984,38 +5190,40 @@ fn serving_xray_processes_for(state_dir: Option<&Path>) -> Vec<ProcessRef> {
     }
     let mut processes = live_processes_named("xray")
         .into_iter()
-        .filter(|process| {
-            let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", process.pid)) else {
-                return false;
-            };
-            let Some(config) = xray_config_argument(&cmdline) else {
-                return false;
-            };
-            let path = Path::new(config);
-            if path.file_name() != Some(std::ffi::OsStr::new("xray.json")) {
-                return false;
-            }
-            let Some(expected) = &expected else {
-                return true;
-            };
-            let actual = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                let Ok(cwd) = fs::read_link(format!("/proc/{}/cwd", process.pid)) else {
-                    return false;
-                };
-                cwd.join(path)
-            };
-            actual
-                .parent()
-                .and_then(|parent| fs::canonicalize(parent).ok())
-                .map(|dir| dir.join("xray.json"))
-                .as_ref()
-                == Some(expected)
-        })
+        .filter(|process| xray_process_uses_config(*process, expected.as_deref()))
         .collect::<Vec<_>>();
     processes.sort_by_key(|process| process.start_ticks);
     processes
+}
+
+fn xray_process_uses_config(process: ProcessRef, expected: Option<&Path>) -> bool {
+    let Ok(cmdline) = fs::read(format!("/proc/{}/cmdline", process.pid)) else {
+        return false;
+    };
+    let Some(config) = xray_config_argument(&cmdline) else {
+        return false;
+    };
+    let path = Path::new(config);
+    if path.file_name() != Some(std::ffi::OsStr::new("xray.json")) {
+        return false;
+    }
+    let Some(expected) = expected else {
+        return true;
+    };
+    let actual = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let Ok(cwd) = fs::read_link(format!("/proc/{}/cwd", process.pid)) else {
+            return false;
+        };
+        cwd.join(path)
+    };
+    actual
+        .parent()
+        .and_then(|parent| fs::canonicalize(parent).ok())
+        .map(|directory| directory.join("xray.json"))
+        .as_deref()
+        == Some(expected)
 }
 
 pub(crate) fn installed_xray_sha256() -> Option<String> {
@@ -5034,7 +5242,7 @@ pub(crate) fn serving_xray_executable_path() -> Option<PathBuf> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct XrayFileVersion {
+struct FileVersion {
     device: u64,
     inode: u64,
     bytes: u64,
@@ -5044,12 +5252,12 @@ struct XrayFileVersion {
     changed_nanos: i64,
 }
 
-impl XrayFileVersion {
+impl FileVersion {
     fn read(path: &Path) -> Result<Self, String> {
         let metadata = fs::metadata(path)
-            .map_err(|error| format!("读取 Xray 文件身份 {} 失败：{error}", path.display()))?;
+            .map_err(|error| format!("读取文件身份 {} 失败：{error}", path.display()))?;
         if !metadata.is_file() {
-            return Err(format!("Xray 路径不是普通文件：{}", path.display()));
+            return Err(format!("路径不是普通文件：{}", path.display()));
         }
         Ok(Self {
             device: metadata.dev(),
@@ -5068,45 +5276,43 @@ impl XrayFileVersion {
 // Four identities cover the installed binary, its serving inode, and both sides of one update.
 // inode + size + mtime + ctime invalidates atomic replacement and in-place edits without trusting
 // the path alone. The second metadata read prevents caching a hash of bytes that changed mid-read.
-static XRAY_DIGEST_CACHE: OnceLock<Mutex<Vec<(XrayFileVersion, String)>>> = OnceLock::new();
-static XRAY_SPLICE_CAPABILITY_CACHE: OnceLock<Mutex<Vec<(XrayFileVersion, bool)>>> =
-    OnceLock::new();
+type FileDigestCache = OnceLock<Mutex<Vec<(FileVersion, String)>>>;
+static XRAY_DIGEST_CACHE: FileDigestCache = OnceLock::new();
+static GEODATA_DIGEST_CACHE: FileDigestCache = OnceLock::new();
+static XRAY_SPLICE_CAPABILITY_CACHE: OnceLock<Mutex<Vec<(FileVersion, bool)>>> = OnceLock::new();
 
 fn cached_xray_sha256(path: &Path) -> Result<String, String> {
+    cached_file_sha256(path, &XRAY_DIGEST_CACHE).map(|(_, digest)| digest)
+}
+
+fn cached_file_sha256(
+    path: &Path,
+    cache: &FileDigestCache,
+) -> Result<(FileVersion, String), String> {
     const CACHE_ENTRIES: usize = 4;
-    let before = XrayFileVersion::read(path)?;
-    let cache = XRAY_DIGEST_CACHE.get_or_init(|| Mutex::new(Vec::with_capacity(CACHE_ENTRIES)));
-    let known = cache
+    let before = FileVersion::read(path)?;
+    let cache = cache.get_or_init(|| Mutex::new(Vec::with_capacity(CACHE_ENTRIES)));
+    // Serialize cache misses as well: concurrent runtime reporters must not all hash the same
+    // unchanged GeoIP/Geosite inode while the first observer is still filling the cache.
+    let mut cache = cache
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .find(|(version, _)| *version == before)
-        .map(|(_, digest)| digest.clone());
-    if let Some(digest) = known {
-        if XrayFileVersion::read(path)? == before {
-            return Ok(digest);
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, digest)) = cache.iter().find(|(version, _)| *version == before) {
+        if FileVersion::read(path)? == before {
+            return Ok((before, digest.clone()));
         }
     }
 
     let digest = file_sha256_hex(path)?;
-    let after = XrayFileVersion::read(path)?;
+    let after = FileVersion::read(path)?;
     if before != after {
-        return Err(format!(
-            "Xray 文件在计算摘要期间发生变化：{}",
-            path.display()
-        ));
-    }
-    let mut cache = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((_, known)) = cache.iter().find(|(version, _)| *version == after) {
-        return Ok(known.clone());
+        return Err(format!("文件在计算摘要期间发生变化：{}", path.display()));
     }
     if cache.len() == CACHE_ENTRIES {
         cache.remove(0);
     }
     cache.push((after, digest.clone()));
-    Ok(digest)
+    Ok((after, digest))
 }
 
 /// Rule-database reconcile: size, mtime, and sha256 of the two .dat files.
@@ -5126,22 +5332,13 @@ fn observe_geodata() -> Option<GeodataObservation> {
 }
 
 fn geodata_file_state(path: &Path) -> Option<GeodataFileState> {
-    let meta = fs::metadata(path).ok()?;
-    // sha256 reads the whole file, and geosite.dat is around ten megabytes with geoip.dat
-    // around twenty. This runs only on the observation round, since the 15-second default
-    // belongs to APPLY, so the cost is acceptable. Reporting only mtime would make it
-    // impossible to determine whether two machines hold the same copy.
-    let sha256 = file_sha256_hex(path).ok()?;
-    let modified_at = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    // A queue change can trigger several runtime snapshots within one reporting window. Reuse
+    // the digest while the full file identity is unchanged, keeping its metadata and hash paired.
+    let (version, sha256) = cached_file_sha256(path, &GEODATA_DIGEST_CACHE).ok()?;
     Some(GeodataFileState {
         sha256,
-        bytes: meta.len(),
-        modified_at,
+        bytes: version.bytes,
+        modified_at: version.modified_secs.max(0),
     })
 }
 
@@ -5318,9 +5515,20 @@ fn unknown_state() -> ReportedNodeState {
 mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
 
+    pub(crate) fn thread_io_counter(name: &str) -> u64 {
+        fs::read_to_string("/proc/thread-self/io")
+            .unwrap()
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                (key == name).then(|| value.trim().parse().unwrap())
+            })
+            .unwrap()
+    }
+
     #[test]
     fn log_policy_requires_all_specific_headers() {
-        let specific = crate::http::parse_http_response(
+        let specific = crate::http::tests::response_from_wire(
             b"HTTP/1.1 204 No Content\r\nX-Brocade-Agent-Journal-Max-MiB: 96\r\nX-Brocade-Xray-Log-Max-MiB: 80\r\nX-Brocade-Phantun-Log-Max-MiB: 72\r\nContent-Length: 0\r\n\r\n",
         )
         .unwrap();
@@ -5333,7 +5541,7 @@ mod tests {
             })
         );
 
-        let incomplete = crate::http::parse_http_response(
+        let incomplete = crate::http::tests::response_from_wire(
             b"HTTP/1.1 204 No Content\r\nX-Brocade-Agent-Journal-Max-MiB: 96\r\nX-Brocade-Xray-Log-Max-MiB: 80\r\nContent-Length: 0\r\n\r\n",
         )
         .unwrap();
@@ -5342,7 +5550,7 @@ mod tests {
 
     #[test]
     fn host_network_tuning_requires_the_pair_and_accepts_zero() {
-        let response = crate::http::parse_http_response(
+        let response = crate::http::tests::response_from_wire(
             b"HTTP/1.1 204 No Content\r\nX-Brocade-Nic-Gro-Flush-Timeout-Ns: 0\r\nX-Brocade-Nic-Napi-Defer-Hard-Irqs: 0\r\nContent-Length: 0\r\n\r\n",
         )
         .unwrap();
@@ -5354,7 +5562,7 @@ mod tests {
             })
         );
 
-        let incomplete = crate::http::parse_http_response(
+        let incomplete = crate::http::tests::response_from_wire(
             b"HTTP/1.1 204 No Content\r\nX-Brocade-Nic-Gro-Flush-Timeout-Ns: 20000\r\nContent-Length: 0\r\n\r\n",
         )
         .unwrap();
@@ -5598,15 +5806,30 @@ mod tests {
             || {
                 observations += 1;
                 if observations < 3 {
-                    super::WorkloadRuntime::Broken("UDP listener is still opening".to_owned())
+                    Ok(super::WorkloadRuntime::Broken(
+                        "UDP listener is still opening".to_owned(),
+                    ))
                 } else {
-                    super::WorkloadRuntime::Healthy
+                    Ok(super::WorkloadRuntime::Healthy)
                 }
             },
         )
         .expect("a listener that appears before the deadline must be accepted");
 
         assert_eq!(observations, 3);
+    }
+
+    #[test]
+    fn xray_runtime_health_does_not_wait_thirty_seconds_for_a_dead_candidate() {
+        let started = std::time::Instant::now();
+        let error = super::wait_for_xray_runtime_health_with(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis(50),
+            || Err("已接流候选退出".to_owned()),
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert_eq!(error, "已接流候选退出");
     }
 
     #[test]
@@ -5820,40 +6043,6 @@ mod tests {
     }
 
     #[test]
-    fn handoff_only_config_rejects_every_restart_fallback() {
-        let previous = r#"{"api":{"tag":"api"},"metrics":{"tag":"metrics"},"inbounds":[],"outbounds":[{"tag":"old"}]}"#;
-        let compatible = r#"{"api":{"tag":"api"},"metrics":{"tag":"metrics"},"inbounds":[],"outbounds":[{"tag":"new"}]}"#;
-        assert_eq!(
-            super::config_handoff_blocker(false, true, Some(previous), compatible, Some((603, 0)),),
-            None
-        );
-
-        let changed_listeners = r#"{"api":{"tag":"new-api","listen":"127.0.0.1:20085"},"metrics":{"listen":"127.0.0.1:20086"},"inbounds":[{"tag":"new"}],"outbounds":[{"tag":"new"}]}"#;
-        assert_eq!(
-            super::config_handoff_blocker(
-                false,
-                true,
-                Some(previous),
-                changed_listeners,
-                Some((603, 0)),
-            ),
-            None
-        );
-        assert_eq!(
-            super::config_handoff_blocker(false, false, Some(previous), compatible, Some((603, 0)),),
-            Some("运行中的 Xray 未报告可交接状态")
-        );
-        assert_eq!(
-            super::config_handoff_blocker(false, true, Some(previous), compatible, None,),
-            Some("缺少可审计的发布身份")
-        );
-        assert_eq!(
-            super::config_handoff_blocker(false, true, Some(previous), compatible, Some((0, 0)),),
-            Some("缺少可审计的发布身份")
-        );
-    }
-
-    #[test]
     fn recovery_grants_omit_only_inbounds_removed_from_config() {
         let grants = vec![
             GrantInbound {
@@ -5972,9 +6161,7 @@ mod tests {
         converge_artifact, grants_drifted_in, observed_inbounds, route_headers, sha256_hex,
         usage_counters_from_stats,
     };
-    use crate::http::{
-        decode_chunked_body, parse_http_response, HttpClient, MAX_HTTP_RESPONSE_BYTES,
-    };
+    use crate::http::{tests::response_from_wire, HttpClient, MAX_HTTP_RESPONSE_BYTES};
     use crate::options::{ApplyMode, Options};
     use crate::probe::{xray_listen_ports, XrayListenProtocol};
     use crate::spool::{
@@ -6949,7 +7136,7 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
     #[test]
     fn parses_basic_http_response() {
         let response =
-            parse_http_response(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
+            response_from_wire(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
         assert_eq!(response.status, 204);
         assert_eq!(response.body, "");
     }
@@ -6969,7 +7156,7 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
 
     #[test]
     fn parses_chunked_http_response() {
-        let response = parse_http_response(
+        let response = response_from_wire(
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
         )
         .unwrap();
@@ -7142,7 +7329,9 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
             }
         }
 
-        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tools/xray");
+        let binary = PathBuf::from(
+            std::env::var_os("BROCADE_TEST_XRAY").expect("explicit test Xray is required"),
+        );
         assert!(binary.exists(), "{} is missing", binary.display());
         let api_port = TcpListener::bind(("127.0.0.1", 0))
             .expect("reserve API port")
@@ -7258,8 +7447,12 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
 
     #[test]
     fn rejects_oversized_chunked_http_response() {
-        let body = format!("{:x}\r\n", MAX_HTTP_RESPONSE_BYTES + 1);
-        let error = decode_chunked_body(body.as_bytes()).unwrap_err();
+        let body = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            MAX_HTTP_RESPONSE_BYTES + 1,
+            "x".repeat(MAX_HTTP_RESPONSE_BYTES + 1)
+        );
+        let error = response_from_wire(body.as_bytes()).unwrap_err();
         assert!(error.contains("exceeds"));
     }
 
@@ -7545,6 +7738,7 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
             observed_before: before.clone(),
             usage_activated_at_unix_secs: None,
             certificate_received: false,
+            completed_observation: None,
             observation_queued: false,
         };
         let process =
@@ -7648,7 +7842,11 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
                 let headers = String::from_utf8_lossy(&request[..header_end]);
                 let content_length = headers
                     .lines()
-                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_owned)
+                    })
                     .expect("request includes Content-Length")
                     .parse::<usize>()
                     .unwrap();
@@ -7906,5 +8104,102 @@ JP=\t(none)\t203.0.113.7:51820\t10.66.0.3/32\t1754200000\t1\t1\toff
         assert_eq!(state.sha256, sha256_hex(b"not really geoip"));
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn geodata_observation_does_not_reread_unchanged_files() {
+        let dir = test_state_dir("geodata-repeated-observation");
+        let path = dir.join("geoip.dat");
+        let bytes = vec![b'a'; 1024 * 1024];
+        fs::write(&path, &bytes).unwrap();
+        // Isolate the cache from other tests observing their own geodata concurrently.
+        let cache = super::FileDigestCache::new();
+        let first = super::cached_file_sha256(&path, &cache).unwrap();
+        let before = thread_io_counter("rchar");
+
+        assert_eq!(super::cached_file_sha256(&path, &cache).unwrap(), first);
+
+        let read_bytes = thread_io_counter("rchar") - before;
+        assert!(
+            read_bytes < bytes.len() as u64,
+            "unchanged geodata was read again: {read_bytes} bytes"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn geodata_observation_detects_replacement_and_preserved_mtime_edits() {
+        let dir = test_state_dir("geodata-invalidation");
+        let path = dir.join("geoip.dat");
+        fs::write(&path, b"old-bytes").unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let first = super::geodata_file_state(&path).unwrap();
+
+        let replacement = dir.join("replacement");
+        fs::write(&replacement, b"new-bytes").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let replaced = super::geodata_file_state(&path).unwrap();
+        assert_eq!(replaced.sha256, sha256_hex(b"new-bytes"));
+        assert_eq!(replaced.bytes, first.bytes);
+        assert_eq!(replaced.modified_at, first.modified_at);
+
+        let before_edit = super::FileVersion::read(&path).unwrap();
+        // Leave a timestamp tick between the observations even on filesystems with coarse ctime.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&path, b"edit-data").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let after_edit = super::FileVersion::read(&path).unwrap();
+        assert_eq!(before_edit.inode, after_edit.inode);
+        assert_eq!(before_edit.bytes, after_edit.bytes);
+        assert_eq!(before_edit.modified_secs, after_edit.modified_secs);
+        assert_eq!(before_edit.modified_nanos, after_edit.modified_nanos);
+        assert_ne!(
+            (before_edit.changed_secs, before_edit.changed_nanos),
+            (after_edit.changed_secs, after_edit.changed_nanos)
+        );
+        let edited = super::geodata_file_state(&path).unwrap();
+        assert_eq!(edited.sha256, sha256_hex(b"edit-data"));
+        assert_eq!(edited.modified_at, first.modified_at);
+
+        fs::remove_file(&path).unwrap();
+        assert!(super::geodata_file_state(&path).is_none());
+        fs::create_dir(&path).unwrap();
+        assert!(super::geodata_file_state(&path).is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn file_digest_cache_stays_bounded_and_rechecks_evicted_files() {
+        let dir = test_state_dir("bounded-file-digest-cache");
+        let cache = super::FileDigestCache::new();
+        for index in 0..6 {
+            let path = dir.join(format!("geodata-{index}.dat"));
+            let bytes = [index; 16];
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(
+                super::cached_file_sha256(&path, &cache).unwrap().1,
+                sha256_hex(&bytes)
+            );
+            assert!(cache.get().unwrap().lock().unwrap().len() <= 4);
+        }
+        let first = dir.join("geodata-0.dat");
+        fs::write(&first, b"updated after eviction").unwrap();
+        assert_eq!(
+            super::cached_file_sha256(&first, &cache).unwrap().1,
+            sha256_hex(b"updated after eviction")
+        );
+        assert_eq!(cache.get().unwrap().lock().unwrap().len(), 4);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

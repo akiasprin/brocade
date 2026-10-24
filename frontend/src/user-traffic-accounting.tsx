@@ -42,7 +42,7 @@ export function UserTrafficAccountingSetting({
       <div id={descriptionId} className="dim user-usage-accounting-note" hidden={!showDescription}>
         <p>单向计量：按代理层有效流量计量，同一业务数据仅计一次。</p>
         <p>双向计量：合计服务器入站与出站流量，同一业务数据在接收和转发阶段各计一次。</p>
-        <p>切换后将按新口径重算本月用量，可能立即暂停或恢复受额度控制的接入线路或转发入口。</p>
+        <p>切换后将按新口径重算本期用量，可能立即暂停或恢复受额度控制的接入线路或转发入口。</p>
       </div>
     </>
   );

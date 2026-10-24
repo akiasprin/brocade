@@ -466,10 +466,12 @@ export const fetchCompileView = (revision: number): Promise<CompileView> =>
 /* ── 节点 ── */
 
 /* 与 brocade_deployment::protocol 中的同名结构逐字段对应 */
-export const AGENT_PROTOCOL_VERSION = 38;
+export const AGENT_PROTOCOL_VERSION = 45;
+export const FORWARDING_TARGET_POLICY_PROTOCOL_VERSION = 43;
 export const MIN_AGENT_PROTOCOL_VERSION = 20;
 export const REALTIME_USER_TRAFFIC_PROTOCOL_VERSION = 27;
 export const XRAY_HANDOFF_PROTOCOL_VERSION = 30;
+export const XRAY_HANDOFF_RESTART_FALLBACK_PROTOCOL_VERSION = 40;
 export const CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION = 33;
 export const VPNGATE_MAX_CANDIDATES = 16;
 export const VPNGATE_CONNECT_THRESHOLD_MAX_MS = 35_000;
@@ -712,6 +714,7 @@ export interface MachineEventList {
   last_seen_event_id: number;
   /** Effective personal/global incident cursor; public-IP changes remain visible until retention expiry. */
   cleared_through_event_id: number;
+  /** Unread incident transitions; IP history and initial online observations do not highlight the bell. */
   unread_count: number;
   active: ActiveMachineIncident[];
   events: MachineEvent[];
@@ -1119,11 +1122,58 @@ export interface UserListItem {
   account_type?: 'formal' | 'test';
   /** Missing only while a newer UI is rolling over an older local Console. */
   traffic_accounting_mode?: UserTrafficAccountingMode;
+  traffic_reset_day?: number;
+  service_starts_at?: string | null;
+  service_expires_at?: string | null;
+  service_state?: UserServiceState;
   login_enabled?: boolean;
   direct_login_enabled?: boolean;
   created_at: string;
   created_revision: number | null;
 }
+
+export type UserServiceState = 'active' | 'pending' | 'expired';
+export interface UserServicePolicyWrite {
+  traffic_reset_day: number;
+  service_starts_at: string | null;
+  service_expires_at: string | null;
+}
+export interface UserCyclePeriod {
+  tenant_id: string;
+  user_id: string;
+  starts_at: string;
+  ends_at: string;
+}
+export interface UserCycleUsage {
+  traffic_policies?: {
+    tenant_id: string;
+    user_id: string;
+    kind: UserTrafficKind;
+    app_id: string | null;
+    quota_bytes: string | null;
+    used_bytes: string;
+    exhausted: boolean;
+    suspended: boolean;
+    rate_bps: number | null;
+  }[];
+  periods: UserCyclePeriod[];
+  views: UsageMonthlyViewRow[];
+  forwarding: UsageForwardingMonthlyRow[];
+}
+export interface UserServicePolicyPreview {
+  starts_at: string;
+  ends_at: string;
+  access_used_bytes: number;
+  forwarding_used_bytes: number;
+  service_state: UserServiceState;
+}
+export const fetchUserCycleUsage = () => api<UserCycleUsage>('/usage/user-cycles');
+const userServicePolicyPath = (tenant: string, user: string) =>
+  `/users/${encodeURIComponent(tenant)}/${encodeURIComponent(user)}/service-policy`;
+export const previewUserServicePolicy = (tenant: string, user: string, body: UserServicePolicyWrite) =>
+  post<UserServicePolicyPreview>(`${userServicePolicyPath(tenant, user)}/preview`, body);
+export const updateUserServicePolicy = (tenant: string, user: string, body: UserServicePolicyWrite) =>
+  api<UserListItem>(userServicePolicyPath(tenant, user), '', { method: 'PUT', body: JSON.stringify(body) });
 
 export type UserTrafficAccountingMode = 'single' | 'double';
 
@@ -1244,8 +1294,9 @@ export interface ForwardingEntitlement {
   applied_generation: number | null;
   reconcile_status: 'pending' | 'converged' | 'error';
   last_error: string | null;
-  monthly_limit_bytes?: number | null;
-  monthly_used_bytes?: number;
+  reported_at?: string | null;
+  cycle_limit_bytes?: number | null;
+  cycle_used_bytes?: number;
   quota_suspended?: boolean;
   quota_job_id?: number | null;
   quota_job_status?: 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled' | null;
@@ -1291,7 +1342,8 @@ export interface ForwardingRule {
   target_host: string;
   target_port: ForwardingPort;
   enabled: boolean;
-  runtime_status: 'active' | 'pending' | 'error' | 'disabled' | 'quota-paused';
+  runtime_status: 'active' | 'pending' | 'error' | 'disabled' | 'quota-paused' | 'service-paused' | 'unknown';
+  runtime_error?: string | null;
   uplink_bytes: number;
   downlink_bytes: number;
   created_at: string;
@@ -1655,6 +1707,7 @@ export interface ClashSubscriptionInfo {
   haitun: ClashHaitunSubscriptionInfo | null;
   remaining_bytes: number | null;
   reset_at: string;
+  expires_at: string | null;
   usage_has_gap: boolean;
 }
 
@@ -2356,6 +2409,7 @@ export type ExternalOutboundSecurity =
       v: {
         server_name: string;
         fingerprint: string;
+        allow_insecure?: boolean;
         alpn?: string[];
         ech_config_list?: string | null;
         pinned_peer_cert_sha256?: string | null;
@@ -2383,6 +2437,8 @@ export interface ExternalOutbound {
   port: number;
   protocol: ExternalOutboundProtocol;
   security: ExternalOutboundSecurity;
+  /** Absent / AsIs preserves the target domain for remote resolution. */
+  target_strategy?: DomainStrategy | null;
   bindings: ExternalWarpBinding[];
 }
 
@@ -3659,7 +3715,7 @@ export interface UserOtherDomains {
 export const fetchOtherDomainPolicy = () => api<OtherDomainPolicy>('/other-domain/settings');
 export const saveOtherDomainPolicy = (policy: OtherDomainPolicy) =>
   api<OtherDomainPolicy>('/other-domain/settings', '', { method: 'PUT', body: JSON.stringify(policy) });
-/** 明细只保留近 24 小时：当周、当月的 range_start 晚于周期起点。 */
+/** 明细遵循数据保留设置：range_start 取自然周期与保留窗口起点的较晚者。 */
 export const fetchUserOtherDomains = (tenant: string, user: string, period: SiteUsagePeriod) =>
   api<UserOtherDomains>(`${userPath(tenant, user)}/other-domains?period=${period}`);
 
@@ -3909,6 +3965,18 @@ export const saveNodeLogPolicy = (nodeId: string, overrides: AgentLogLimitOverri
 /* ── PostgreSQL 历史/临时数据保留：即时运行策略，不进入模型修订 ── */
 export type DataRetentionCategory = 'history' | 'temporary';
 
+export interface RetentionCleanup {
+  ttl_hours: number;
+  finished_at_unix_secs: number;
+  last_success_unix_secs: number | null;
+  /** 上次成功清理的行数；后续失败不会覆盖。 */
+  deleted_rows: number;
+  error_code: string | null;
+  /** 有界检查超时或本轮失败时为 null，不能当作没有积压。 */
+  has_backlog: boolean | null;
+  next_run_unix_secs: number;
+}
+
 export interface DataRetentionPolicy {
   table_name: string;
   title: string;
@@ -3922,6 +3990,9 @@ export interface DataRetentionPolicy {
   /** PostgreSQL 统计估值，不是会锁表的精确 COUNT。 */
   estimated_rows: number;
   total_bytes: number;
+  estimated_dead_rows: number;
+  last_vacuum_unix_secs: number | null;
+  cleanup: RetentionCleanup | null;
 }
 
 export interface DataRetentionView {
@@ -3952,6 +4023,43 @@ export const saveHostNetworkTuning = (body: HostNetworkTuning) =>
 export type NodeTrafficCycleKind = 'monthly' | 'yearly';
 export type NodeTrafficAccountingMode = 'bidirectional_sum' | 'bidirectional_max' | 'outbound_only' | 'inbound_only';
 
+export type TrafficLimitLayer = 'system' | 'application' | 'both';
+export type TrafficLimitThreshold =
+  { kind: 'quota_percent'; basis_points: number } | { kind: 'absolute'; bytes: string };
+export interface TrafficLimitRule {
+  threshold: TrafficLimitThreshold;
+  rate_bps: number;
+}
+export interface TrafficLimitPolicy {
+  enabled: boolean;
+  layer: TrafficLimitLayer;
+  rules: TrafficLimitRule[];
+}
+export type TrafficLimitPhase = 'disabled' | 'waiting' | 'ready' | 'limited' | 'error';
+export interface TrafficLayerObservation {
+  phase: TrafficLimitPhase;
+  rate_bps: number | null;
+  error: string | null;
+}
+export interface TrafficLimitObservation {
+  revision: number;
+  phase: TrafficLimitPhase;
+  interface: string | null;
+  rate_bps: number | null;
+  used_bytes: string | null;
+  period_start_unix_secs: number | null;
+  error: string | null;
+  system: TrafficLayerObservation | null;
+  application: TrafficLayerObservation | null;
+}
+export interface NodeTrafficLimitView {
+  revision: number;
+  policy: TrafficLimitPolicy;
+  supported: boolean;
+  observation: TrafficLimitObservation | null;
+  reported_at_unix_secs: number | null;
+}
+
 export interface NodeTrafficItem {
   node_id: string;
   tenant_id: string;
@@ -3974,6 +4082,7 @@ export interface NodeTrafficItem {
   last_gap_at_unix_secs: number | null;
   last_gap_reason: string | null;
   has_gap: boolean;
+  limit?: NodeTrafficLimitView;
 }
 
 export interface NodeTrafficView {
@@ -3994,6 +4103,12 @@ export const saveNodeTraffic = (nodeId: string, body: UpdateNodeTrafficRequest) 
   api<NodeTrafficView>(`/node-traffic/nodes/${encodeURIComponent(nodeId)}`, '', {
     method: 'PUT',
     body: JSON.stringify(body),
+  });
+
+export const saveNodeTrafficLimit = (nodeId: string, policy: TrafficLimitPolicy) =>
+  api<NodeTrafficView>(`/node-traffic/nodes/${encodeURIComponent(nodeId)}/limit`, '', {
+    method: 'PUT',
+    body: JSON.stringify(policy),
   });
 
 export type MachineTrafficConfidence = 'low' | 'medium' | 'high';
@@ -5413,3 +5528,76 @@ export function reverseHealthError(p: ReverseHealthPolicy): string | null {
     return '参数超出范围，或超时、健康租约、备用连接数量不一致';
   return null;
 }
+
+export type UserTrafficKind = 'access' | 'forwarding';
+export interface UserTrafficPolicy {
+  quota_bytes: string | null;
+  exhausted_action: { kind: 'suspend' } | { kind: 'throttle'; rate_bps: number };
+}
+export interface UserTrafficPolicyView {
+  kind: UserTrafficKind;
+  app_id: string | null;
+  policy: UserTrafficPolicy | null;
+  used_bytes: string;
+  exhausted: boolean;
+  service_available: boolean;
+  unsupported_nodes: string[];
+  pending_nodes?: string[];
+}
+const userTrafficPolicyPath = (tenant: string, user: string) =>
+  `/users/${encodeURIComponent(tenant)}/${encodeURIComponent(user)}/traffic-policy`;
+export const fetchUserTrafficPolicies = async (tenant: string, user: string): Promise<UserTrafficPolicyView[]> => {
+  const value = await api<unknown>(userTrafficPolicyPath(tenant, user));
+  if (
+    !Array.isArray(value) ||
+    !value.every(
+      row =>
+        row &&
+        ((row.kind === 'access' && typeof row.app_id === 'string' && row.app_id.length > 0) ||
+          (row.kind === 'forwarding' && row.app_id === null)) &&
+        Array.isArray(row.unsupported_nodes),
+    )
+  ) {
+    throw new Error('用户额度响应无效');
+  }
+  // Older Consoles may still include the retired forwarding policy during a rolling upgrade.
+  return value.filter(row => row.kind === 'access');
+};
+export const saveUserTrafficPolicy = (
+  tenant: string,
+  user: string,
+  view: Pick<UserTrafficPolicyView, 'kind' | 'app_id'>,
+  policy: UserTrafficPolicy,
+) => {
+  if (view.kind !== 'access' || !view.app_id) throw new Error('接入额度必须指定 app');
+  const path = `${userTrafficPolicyPath(tenant, user)}/access/${encodeURIComponent(view.app_id)}`;
+  return api<UserTrafficPolicyView[]>(path, '', { method: 'PUT', body: JSON.stringify(policy) });
+};
+
+export interface SourceAccessNode {
+  node_id: string;
+  phase: 'pending' | 'applied' | 'unsupported' | 'error';
+  error?: string | null;
+}
+export interface SourceAccessView {
+  revision: number;
+  ips: string[];
+  nodes: SourceAccessNode[];
+  /** Local GeoIP for the listed addresses, as on presence. Older Consoles omit both. */
+  source_countries?: SourceCountry[];
+  source_operators?: SourceOperator[];
+}
+export type SourceAccessScope = { nodeId: string } | { tenantId: string; userId: string };
+export const sourceAccessPath = (scope: SourceAccessScope) =>
+  'nodeId' in scope
+    ? `/nodes/${encodeURIComponent(scope.nodeId)}/source-access`
+    : `/users/${encodeURIComponent(scope.tenantId)}/${encodeURIComponent(scope.userId)}/source-access`;
+export const fetchSourceAccess = async (scope: SourceAccessScope) => {
+  const view = await api<SourceAccessView>(sourceAccessPath(scope));
+  if (!view || !Number.isSafeInteger(view.revision) || !Array.isArray(view.ips) || !Array.isArray(view.nodes)) {
+    throw new Error('来源封禁响应无效，请确认 Console 已升级');
+  }
+  return view;
+};
+export const saveSourceAccess = (scope: SourceAccessScope, revision: number, ips: string[]) =>
+  api<SourceAccessView>(sourceAccessPath(scope), '', { method: 'PUT', body: JSON.stringify({ revision, ips }) });

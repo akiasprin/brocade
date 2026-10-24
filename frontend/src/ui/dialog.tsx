@@ -7,12 +7,41 @@ import {
   useRef,
   useState,
   type ButtonHTMLAttributes,
+  type CSSProperties,
   type ReactNode,
+  type RefObject,
 } from 'react';
 import { createPortal } from 'react-dom';
 import { usePresence } from './presence';
 
-type DialogMode = 'modal' | 'drawer';
+type DialogMode = 'modal' | 'drawer' | 'popover';
+
+const POPOVER_MARGIN = 8;
+const POPOVER_GAP = 8;
+
+type PopoverAlign = 'start' | 'end';
+
+/**
+ * `start`: right of the anchor, top-aligned; below it when the right side is too narrow, above when below is too short.
+ * `end`: for a trigger at the right end of a row, below it (or above) with the right edges aligned, so the panel
+ * stays over the card instead of hanging past its edge.
+ */
+function popoverPlace(
+  anchor: DOMRect,
+  width: number,
+  height: number,
+  align: PopoverAlign,
+): { top: number; left: number } {
+  const right = window.innerWidth - POPOVER_MARGIN;
+  const bottom = window.innerHeight - POPOVER_MARGIN;
+  const fitTop = (top: number) => Math.max(POPOVER_MARGIN, Math.min(top, bottom - height));
+  if (align === 'start' && anchor.right + POPOVER_GAP + width <= right)
+    return { top: fitTop(anchor.top), left: anchor.right + POPOVER_GAP };
+  const left = Math.max(POPOVER_MARGIN, Math.min(align === 'end' ? anchor.right - width : anchor.left, right - width));
+  if (anchor.bottom + POPOVER_GAP + height <= bottom) return { top: anchor.bottom + POPOVER_GAP, left };
+  if (anchor.top - POPOVER_GAP - height >= POPOVER_MARGIN) return { top: anchor.top - POPOVER_GAP - height, left };
+  return { top: fitTop(anchor.bottom + POPOVER_GAP), left };
+}
 
 const DialogCloseContext = createContext<(() => void) | null>(null);
 interface DialogEntry {
@@ -45,25 +74,30 @@ function focusableElements(root: HTMLElement): HTMLElement[] {
 }
 
 /**
- * Shared modal/drawer boundary. It owns the scrim, Escape handling, focus containment and focus
+ * Shared modal/drawer/popover boundary. It owns the scrim, Escape handling, focus containment and focus
  * restoration so feature dialogs cannot silently drift apart on those interaction contracts.
+ * A popover keeps the same contracts behind a transparent scrim and places its `.dialog-surface` next to `anchor`.
  */
 export function DialogLayer({
   label,
   mode = 'modal',
+  anchor,
+  align = 'start',
   className,
   onClose,
   canClose,
   children,
 }: {
   label: string;
-  mode?: DialogMode;
   className?: string;
   onClose: () => void;
   /** Checked before the exit animation starts. Return false to keep the dialog fully interactive. */
   canClose?: () => boolean;
   children: ReactNode;
-}) {
+} & (
+  | { mode?: Exclude<DialogMode, 'popover'>; anchor?: never; align?: never }
+  | { mode: 'popover'; anchor: RefObject<HTMLElement | null>; align?: PopoverAlign }
+)) {
   const rootRef = useRef<HTMLDivElement>(null);
   const identity = useRef(Symbol(label));
   const closeRef = useRef(onClose);
@@ -80,7 +114,8 @@ export function DialogLayer({
     activeOnOpen ? [activeOnOpen, ...inheritedTargets.filter(target => target !== activeOnOpen)] : inheritedTargets,
   );
   const [closing, setClosing] = useState(false);
-  const duration = mode === 'drawer' ? 300 : 260;
+  const [place, setPlace] = useState<{ top: number; left: number } | null>(null);
+  const duration = mode === 'drawer' ? 300 : mode === 'popover' ? 180 : 260;
   const presence = usePresence(!closing, duration);
 
   useLayoutEffect(() => {
@@ -140,6 +175,27 @@ export function DialogLayer({
     };
   }, []);
 
+  // The scrim swallows wheel and touch scrolling, so only a resize or the surface's own content can move the panel.
+  useLayoutEffect(() => {
+    if (mode !== 'popover') return;
+    const measure = () => {
+      const target = anchor?.current;
+      const surface = rootRef.current?.querySelector<HTMLElement>(':scope > .dialog-surface');
+      if (!target || !surface) return;
+      const next = popoverPlace(target.getBoundingClientRect(), surface.offsetWidth, surface.offsetHeight, align);
+      setPlace(current => (current?.top === next.top && current.left === next.left ? current : next));
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    const surface = rootRef.current?.querySelector(':scope > .dialog-surface');
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    if (surface) observer?.observe(surface);
+    return () => {
+      window.removeEventListener('resize', measure);
+      observer?.disconnect();
+    };
+  }, [align, anchor, mode]);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (dialogStack.at(-1)?.identity !== identity.current) return;
@@ -186,6 +242,11 @@ export function DialogLayer({
         aria-hidden={closing || undefined}
         inert={closing}
         tabIndex={-1}
+        style={
+          place
+            ? ({ '--popover-top': `${place.top}px`, '--popover-left': `${place.left}px` } as CSSProperties)
+            : undefined
+        }
       >
         <button className="dialog-scrim" type="button" tabIndex={-1} aria-label="关闭" onClick={requestClose} />
         {children}

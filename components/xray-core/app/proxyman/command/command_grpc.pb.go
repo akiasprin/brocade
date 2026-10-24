@@ -19,22 +19,25 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	HandlerService_AddInbound_FullMethodName           = "/xray.app.proxyman.command.HandlerService/AddInbound"
-	HandlerService_RemoveInbound_FullMethodName        = "/xray.app.proxyman.command.HandlerService/RemoveInbound"
-	HandlerService_AlterInbound_FullMethodName         = "/xray.app.proxyman.command.HandlerService/AlterInbound"
-	HandlerService_ListInbounds_FullMethodName         = "/xray.app.proxyman.command.HandlerService/ListInbounds"
-	HandlerService_GetInboundUsers_FullMethodName      = "/xray.app.proxyman.command.HandlerService/GetInboundUsers"
-	HandlerService_GetInboundUsersCount_FullMethodName = "/xray.app.proxyman.command.HandlerService/GetInboundUsersCount"
-	HandlerService_AddOutbound_FullMethodName          = "/xray.app.proxyman.command.HandlerService/AddOutbound"
-	HandlerService_RemoveOutbound_FullMethodName       = "/xray.app.proxyman.command.HandlerService/RemoveOutbound"
-	HandlerService_AlterOutbound_FullMethodName        = "/xray.app.proxyman.command.HandlerService/AlterOutbound"
-	HandlerService_ListOutbounds_FullMethodName        = "/xray.app.proxyman.command.HandlerService/ListOutbounds"
+	HandlerService_GetForwardingTargetPolicy_FullMethodName = "/xray.app.proxyman.command.HandlerService/GetForwardingTargetPolicy"
+	HandlerService_AddInbound_FullMethodName                = "/xray.app.proxyman.command.HandlerService/AddInbound"
+	HandlerService_RemoveInbound_FullMethodName             = "/xray.app.proxyman.command.HandlerService/RemoveInbound"
+	HandlerService_AlterInbound_FullMethodName              = "/xray.app.proxyman.command.HandlerService/AlterInbound"
+	HandlerService_ListInbounds_FullMethodName              = "/xray.app.proxyman.command.HandlerService/ListInbounds"
+	HandlerService_GetInboundUsers_FullMethodName           = "/xray.app.proxyman.command.HandlerService/GetInboundUsers"
+	HandlerService_GetInboundUsersCount_FullMethodName      = "/xray.app.proxyman.command.HandlerService/GetInboundUsersCount"
+	HandlerService_AddOutbound_FullMethodName               = "/xray.app.proxyman.command.HandlerService/AddOutbound"
+	HandlerService_RemoveOutbound_FullMethodName            = "/xray.app.proxyman.command.HandlerService/RemoveOutbound"
+	HandlerService_AlterOutbound_FullMethodName             = "/xray.app.proxyman.command.HandlerService/AlterOutbound"
+	HandlerService_ListOutbounds_FullMethodName             = "/xray.app.proxyman.command.HandlerService/ListOutbounds"
 )
 
 // HandlerServiceClient is the client API for HandlerService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type HandlerServiceClient interface {
+	// Query the serving process, never the installed executable during a handoff.
+	GetForwardingTargetPolicy(ctx context.Context, in *ForwardingTargetPolicyRequest, opts ...grpc.CallOption) (*ForwardingTargetPolicyResponse, error)
 	AddInbound(ctx context.Context, in *AddInboundRequest, opts ...grpc.CallOption) (*AddInboundResponse, error)
 	RemoveInbound(ctx context.Context, in *RemoveInboundRequest, opts ...grpc.CallOption) (*RemoveInboundResponse, error)
 	AlterInbound(ctx context.Context, in *AlterInboundRequest, opts ...grpc.CallOption) (*AlterInboundResponse, error)
@@ -53,6 +56,16 @@ type handlerServiceClient struct {
 
 func NewHandlerServiceClient(cc grpc.ClientConnInterface) HandlerServiceClient {
 	return &handlerServiceClient{cc}
+}
+
+func (c *handlerServiceClient) GetForwardingTargetPolicy(ctx context.Context, in *ForwardingTargetPolicyRequest, opts ...grpc.CallOption) (*ForwardingTargetPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForwardingTargetPolicyResponse)
+	err := c.cc.Invoke(ctx, HandlerService_GetForwardingTargetPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *handlerServiceClient) AddInbound(ctx context.Context, in *AddInboundRequest, opts ...grpc.CallOption) (*AddInboundResponse, error) {
@@ -156,9 +169,11 @@ func (c *handlerServiceClient) ListOutbounds(ctx context.Context, in *ListOutbou
 }
 
 // HandlerServiceServer is the server API for HandlerService service.
-// All implementations must embed UnimplementedHandlerServiceServer
+// All implementations should embed UnimplementedHandlerServiceServer
 // for forward compatibility.
 type HandlerServiceServer interface {
+	// Query the serving process, never the installed executable during a handoff.
+	GetForwardingTargetPolicy(context.Context, *ForwardingTargetPolicyRequest) (*ForwardingTargetPolicyResponse, error)
 	AddInbound(context.Context, *AddInboundRequest) (*AddInboundResponse, error)
 	RemoveInbound(context.Context, *RemoveInboundRequest) (*RemoveInboundResponse, error)
 	AlterInbound(context.Context, *AlterInboundRequest) (*AlterInboundResponse, error)
@@ -169,16 +184,18 @@ type HandlerServiceServer interface {
 	RemoveOutbound(context.Context, *RemoveOutboundRequest) (*RemoveOutboundResponse, error)
 	AlterOutbound(context.Context, *AlterOutboundRequest) (*AlterOutboundResponse, error)
 	ListOutbounds(context.Context, *ListOutboundsRequest) (*ListOutboundsResponse, error)
-	mustEmbedUnimplementedHandlerServiceServer()
 }
 
-// UnimplementedHandlerServiceServer must be embedded to have
+// UnimplementedHandlerServiceServer should be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
 // pointer dereference when methods are called.
 type UnimplementedHandlerServiceServer struct{}
 
+func (UnimplementedHandlerServiceServer) GetForwardingTargetPolicy(context.Context, *ForwardingTargetPolicyRequest) (*ForwardingTargetPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetForwardingTargetPolicy not implemented")
+}
 func (UnimplementedHandlerServiceServer) AddInbound(context.Context, *AddInboundRequest) (*AddInboundResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AddInbound not implemented")
 }
@@ -209,8 +226,7 @@ func (UnimplementedHandlerServiceServer) AlterOutbound(context.Context, *AlterOu
 func (UnimplementedHandlerServiceServer) ListOutbounds(context.Context, *ListOutboundsRequest) (*ListOutboundsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListOutbounds not implemented")
 }
-func (UnimplementedHandlerServiceServer) mustEmbedUnimplementedHandlerServiceServer() {}
-func (UnimplementedHandlerServiceServer) testEmbeddedByValue()                        {}
+func (UnimplementedHandlerServiceServer) testEmbeddedByValue() {}
 
 // UnsafeHandlerServiceServer may be embedded to opt out of forward compatibility for this service.
 // Use of this interface is not recommended, as added methods to HandlerServiceServer will
@@ -228,6 +244,24 @@ func RegisterHandlerServiceServer(s grpc.ServiceRegistrar, srv HandlerServiceSer
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&HandlerService_ServiceDesc, srv)
+}
+
+func _HandlerService_GetForwardingTargetPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForwardingTargetPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HandlerServiceServer).GetForwardingTargetPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HandlerService_GetForwardingTargetPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HandlerServiceServer).GetForwardingTargetPolicy(ctx, req.(*ForwardingTargetPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _HandlerService_AddInbound_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -417,6 +451,10 @@ var HandlerService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "xray.app.proxyman.command.HandlerService",
 	HandlerType: (*HandlerServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetForwardingTargetPolicy",
+			Handler:    _HandlerService_GetForwardingTargetPolicy_Handler,
+		},
 		{
 			MethodName: "AddInbound",
 			Handler:    _HandlerService_AddInbound_Handler,

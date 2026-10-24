@@ -1117,7 +1117,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			// Even unmetered streams need per-pump progress: an upload EOF may
 			// shorten the idle timeout while this download is still active.
 			// Preserve that policy instead of replacing it when splice starts.
-			handled, err := copyAccountedSplice(readerConn, tc, func(written int64) {
+			handled, err := copyAccountedSplice(ctx, readerConn, tc, func(written int64) {
 				if readCounter != nil {
 					readCounter.Add(written)
 				}

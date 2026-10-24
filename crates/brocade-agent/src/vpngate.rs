@@ -1207,6 +1207,21 @@ fn normalize_network_type(value: Option<&str>) -> VpngateNetworkType {
 }
 
 fn validate_desired(desired: &VpngateDesiredState) -> Result<(), String> {
+    if let Some(url) = &desired.health_probe_url {
+        let valid = url.len() <= 4096
+            && !url
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+            && reqwest::Url::parse(url).is_ok_and(|parsed| {
+                matches!(parsed.scheme(), "http" | "https")
+                    && parsed.host_str().is_some()
+                    && parsed.username().is_empty()
+                    && parsed.password().is_none()
+            });
+        if !valid {
+            return Err("desired VPN Gate health probe URL is invalid".to_owned());
+        }
+    }
     if !validate_vpngate_admission_policy(&desired.admission_policy) {
         return Err("desired VPN Gate admission policy is invalid".to_owned());
     }
@@ -2255,8 +2270,12 @@ fn reconcile_pool(
             ) {
                 return (backend.slot, Some(reason));
             }
-            let reason = (!egress_reachable(&backend.peer_address, pool.socks_port))
-                .then_some(brocade_deployment::protocol::VpngateFailureReason::EgressUnreachable);
+            let reason = (!egress_reachable(
+                &backend.peer_address,
+                pool.socks_port,
+                desired.health_probe_url.as_deref(),
+            ))
+            .then_some(brocade_deployment::protocol::VpngateFailureReason::EgressUnreachable);
             (backend.slot, reason)
         },
     );
@@ -2399,7 +2418,7 @@ fn reconcile_pool(
         let Some(backend) = start_verified_backend(
             &pool_dir,
             pool,
-            &desired.admission_policy,
+            desired,
             slot,
             &mut excluded,
             &mut metadata.candidate_samples,
@@ -2572,7 +2591,7 @@ fn reconcile_pool(
 fn start_verified_backend(
     pool_dir: &Path,
     pool: &VpngateDesiredPool,
-    admission_policy: &brocade_deployment::protocol::VpngateAdmissionPolicy,
+    desired: &VpngateDesiredState,
     slot: u8,
     excluded: &mut BTreeSet<String>,
     candidate_samples: &mut Vec<RuntimeCandidateSample>,
@@ -2598,7 +2617,21 @@ fn start_verified_backend(
             candidate,
             None,
         ) {
-            Ok(sample) if sample_meets_policy(pool, admission_policy, &sample) => {
+            Ok(mut sample) if sample_meets_policy(pool, &desired.admission_policy, &sample) => {
+                if !egress_reachable(
+                    &peer_address,
+                    pool.socks_port,
+                    desired.health_probe_url.as_deref(),
+                ) {
+                    sample.status = VpngateProbeStatus::Failed;
+                    sample.error_code = Some("runtime-egress-unreachable".to_owned());
+                    sample.error_detail =
+                        Some("configured health probe endpoint is unreachable".to_owned());
+                    samples.push(sample);
+                    excluded.insert(candidate.server_id.clone());
+                    let _ = cleanup_backend_runtime(pool_dir, pool, slot);
+                    continue;
+                }
                 let backend = RuntimeBackendMetadata {
                     slot,
                     server_id: candidate.server_id.clone(),
@@ -2711,7 +2744,7 @@ fn apply_manual_switch(
         replacement = start_verified_backend(
             pool_dir,
             pool,
-            &desired.admission_policy,
+            desired,
             slot,
             &mut excluded,
             &mut metadata.candidate_samples,
@@ -4327,12 +4360,20 @@ fn backend_runtime_failure(
     None
 }
 
-fn egress_reachable(address: &str, port: u16) -> bool {
+fn egress_reachable(address: &str, port: u16, health_probe_url: Option<&str>) -> bool {
+    check_egress(health_probe_url, |url| curl_health(address, port, url))
+}
+
+fn check_egress(health_probe_url: Option<&str>, probe: impl Fn(&str) -> bool + Sync) -> bool {
+    // Reachability of an unrelated HTTPS service cannot prove that the actual probe target
+    // works. In particular, VPN providers can reset HTTP connections while allowing HTTPS.
+    if let Some(url) = health_probe_url {
+        return probe(url);
+    }
+    // Compatibility with Consoles predating the configured runtime health endpoint.
     thread::scope(|scope| {
-        let first =
-            scope.spawn(|| curl_health(address, port, "https://cp.cloudflare.com/generate_204"));
-        let second =
-            scope.spawn(|| curl_health(address, port, "https://www.gstatic.com/generate_204"));
+        let first = scope.spawn(|| probe("https://cp.cloudflare.com/generate_204"));
+        let second = scope.spawn(|| probe("https://www.gstatic.com/generate_204"));
         first.join().unwrap_or(false) || second.join().unwrap_or(false)
     })
 }
@@ -4348,6 +4389,10 @@ fn curl_health(address: &str, port: u16, url: &str) -> bool {
             "--silent",
             "--show-error",
             "--location",
+            "--proto",
+            "=http,https",
+            "--proto-redir",
+            "=http,https",
             "--ipv4",
             "--connect-timeout",
             "3",
@@ -4355,6 +4400,7 @@ fn curl_health(address: &str, port: u16, url: &str) -> bool {
             &timeout,
             "--output",
             "/dev/null",
+            "--",
             url,
         ])
         .stdin(Stdio::null())
@@ -4744,8 +4790,8 @@ mod tests {
                 request.starts_with("GET /agent/v1/vpngate/intelligence-assignment "),
                 "{request}"
             );
-            assert!(request.contains(&format!(
-                "X-Brocade-Protocol-Version: {}\r\n",
+            assert!(request.to_ascii_lowercase().contains(&format!(
+                "x-brocade-protocol-version: {}\r\n",
                 brocade_deployment::protocol::AGENT_PROTOCOL_VERSION
             )));
             let body = r#"{"exit_ip":"198.51.100.7","lease_generation":9}"#;
@@ -4902,7 +4948,11 @@ mod tests {
                 let headers = String::from_utf8_lossy(&request[..header_end]);
                 let content_length = headers
                     .lines()
-                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_owned)
+                    })
                     .expect("request includes Content-Length")
                     .parse::<usize>()
                     .unwrap();
@@ -4976,7 +5026,11 @@ mod tests {
                 let headers = String::from_utf8_lossy(&request[..header_end]);
                 let content_length = headers
                     .lines()
-                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_owned)
+                    })
                     .expect("request includes Content-Length")
                     .parse::<usize>()
                     .unwrap();
@@ -5053,7 +5107,11 @@ mod tests {
                 let headers = String::from_utf8_lossy(&request[..headers_end]);
                 let content_length = headers
                     .lines()
-                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_owned)
+                    })
                     .expect("request includes Content-Length")
                     .parse::<usize>()
                     .unwrap();
@@ -5128,7 +5186,11 @@ mod tests {
                 let headers = String::from_utf8_lossy(&request[..headers_end]);
                 let content_length = headers
                     .lines()
-                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_owned)
+                    })
                     .expect("request includes Content-Length")
                     .parse::<usize>()
                     .unwrap();
@@ -5566,6 +5628,94 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires curl; exercises the real SOCKS5 health request"]
+    fn runtime_health_observes_http_failure_through_a_working_socks_tunnel() {
+        use std::net::TcpListener;
+
+        for (response, expected) in [
+            ("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n", true),
+            ("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", false),
+            ("", false),
+            ("HTTP/1.1 302 Found\r\nLocation: file:///etc/passwd\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut greeting = [0; 2];
+                socket.read_exact(&mut greeting).unwrap();
+                assert_eq!(greeting[0], 5);
+                let mut methods = vec![0; usize::from(greeting[1])];
+                socket.read_exact(&mut methods).unwrap();
+                socket.write_all(&[5, 0]).unwrap();
+                let mut request = [0; 5];
+                socket.read_exact(&mut request).unwrap();
+                assert_eq!(&request[..4], &[5, 1, 0, 3]);
+                let mut target = vec![0; usize::from(request[4]) + 2];
+                socket.read_exact(&mut target).unwrap();
+                assert_eq!(&target[..target.len() - 2], b"probe.example.test");
+                socket.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80]).unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                    assert!(headers.len() < 8192);
+                }
+                assert!(headers.starts_with(b"GET /trace HTTP/1.1\r\n"));
+                socket.write_all(response.as_bytes()).unwrap();
+            });
+            assert_eq!(egress_reachable("127.0.0.1", port, Some("http://probe.example.test/trace")), expected);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn runtime_health_requires_the_configured_endpoint_even_when_https_works() {
+        let endpoint = "http://probe.example.test/cdn-cgi/trace";
+        let calls = Mutex::new(Vec::new());
+        assert!(!check_egress(Some(endpoint), |url| {
+            calls.lock().unwrap().push(url.to_owned());
+            url.starts_with("https://")
+        }));
+        assert_eq!(*calls.lock().unwrap(), [endpoint]);
+        assert!(check_egress(Some(endpoint), |url| url == endpoint));
+        // Old Consoles retain redundant checks rather than interpreting a missing URL as down.
+        assert!(check_egress(None, |url| url.contains("gstatic.com")));
+        assert!(!check_egress(None, |_| false));
+    }
+
+    #[test]
+    fn runtime_health_rejects_unsafe_urls_without_echoing_them() {
+        let mut desired: VpngateDesiredState = serde_json::from_value(serde_json::json!({
+            "topology_revision": 1, "catalog_generation": 1, "pools": []
+        }))
+        .unwrap();
+        for url in [
+            "http://probe.example.test/trace",
+            "https://probe.example.test/trace",
+        ] {
+            desired.health_probe_url = Some(url.to_owned());
+            assert!(validate_desired(&desired).is_ok());
+        }
+        for url in [
+            "file:///etc/passwd",
+            "ftp://probe.example.test/",
+            "--config",
+            "http://user:secret@example.test/",
+            "http://example.test/\n--next",
+            "",
+        ] {
+            desired.health_probe_url = Some(url.to_owned());
+            assert_eq!(
+                validate_desired(&desired).unwrap_err(),
+                "desired VPN Gate health probe URL is invalid"
+            );
+        }
+    }
+
+    #[test]
     fn runtime_health_budget_leaves_room_for_switching_within_thirty_seconds() {
         let worst_detection = RUNTIME_INTERVAL
             + Duration::from_secs(
@@ -5593,6 +5743,7 @@ mod tests {
             VpngateDesiredState {
                 topology_revision: 1,
                 catalog_generation: 1,
+                health_probe_url: None,
                 admission_policy: Default::default(),
                 pools: vec![pool],
                 probe_assignments: Vec::new(),
@@ -5614,6 +5765,7 @@ mod tests {
             VpngateDesiredState {
                 topology_revision: 1,
                 catalog_generation: 1,
+                health_probe_url: None,
                 admission_policy: Default::default(),
                 pools: vec![pool],
                 probe_assignments: Vec::new(),
@@ -5629,6 +5781,7 @@ mod tests {
         let make_desired = |count: usize| VpngateDesiredState {
             topology_revision: 1,
             catalog_generation: 1,
+            health_probe_url: None,
             admission_policy: Default::default(),
             pools: Vec::new(),
             probe_assignments: vec![brocade_deployment::protocol::VpngateProbeAssignment {

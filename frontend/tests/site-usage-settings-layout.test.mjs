@@ -19,7 +19,7 @@ before(async () => {
     configFile: false,
     root: fileURLToPath(new URL('..', import.meta.url)),
     plugins: [react()],
-    cacheDir: cacheDirectory,
+    cacheDir: join(cacheDirectory, 'node_modules/.vite'),
     server: { host: '127.0.0.1', port: 0 },
   });
   await server.listen();
@@ -37,9 +37,15 @@ async function preview(t, width, query = {}) {
   const page = await browser.newPage({ viewport: { width, height: 1100 }, reducedMotion: 'reduce' });
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
+  page.on('requestfailed', request => {
+    if (['document', 'script', 'stylesheet'].includes(request.resourceType())) {
+      errors.push(`${request.failure()?.errorText}: ${request.url()}`);
+    }
+  });
   t.after(async () => {
+    const failures = [...errors];
     await page.close();
-    assert.deepEqual(errors, [], 'no browser or React exceptions');
+    assert.deepEqual(failures, [], 'no browser or React exceptions');
   });
   await page.goto(`${base}?${new URLSearchParams(query)}`);
   await page.getByLabel('每用户目标容量', { exact: true }).waitFor();

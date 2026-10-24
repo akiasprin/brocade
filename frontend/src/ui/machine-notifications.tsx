@@ -282,6 +282,16 @@ function PublicIpEvent({ event, onNode }: { event: MachineEvent; onNode: (nodeId
   );
 }
 
+function advanceReadCursor(current: MachineEventList | undefined, cursor: number): MachineEventList | undefined {
+  if (!current) return current;
+  const lastSeen = Math.max(current.last_seen_event_id, cursor);
+  return {
+    ...current,
+    last_seen_event_id: lastSeen,
+    unread_count: current.latest_event_id <= lastSeen ? 0 : current.unread_count,
+  };
+}
+
 export function MachineNotifications({
   narrow,
   open,
@@ -315,16 +325,14 @@ export function MachineNotifications({
   });
   const read = useMutation({
     mutationFn: markMachineEventsRead,
-    onMutate: throughEventId => {
-      queryClient.setQueryData<MachineEventList>(queryKey, current =>
-        current
-          ? {
-              ...current,
-              last_seen_event_id: Math.max(current.last_seen_event_id, throughEventId),
-              unread_count: 0,
-            }
-          : current,
-      );
+    onMutate: async throughEventId => {
+      await queryClient.cancelQueries({ queryKey });
+      queryClient.setQueryData<MachineEventList>(queryKey, current => advanceReadCursor(current, throughEventId));
+    },
+    onSuccess: async ({ last_seen_event_id: cursor }) => {
+      // Also cancel reads started during the POST: an older snapshot must not restore the badge.
+      await queryClient.cancelQueries({ queryKey });
+      queryClient.setQueryData<MachineEventList>(queryKey, current => advanceReadCursor(current, cursor));
     },
     onError: () => queryClient.invalidateQueries({ queryKey }),
   });

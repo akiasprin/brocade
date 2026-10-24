@@ -52,15 +52,15 @@ test('在线接入时间线：IPv6 不截断，入口默认收成摘要，窄卡
   assert.match(styles, /\.user-presence-row > \.user-presence-session\s*\{[^}]*justify-self:\s*end;/);
   assert.match(
     styles,
-    /@container user-presence \(max-width: 620px\)\s*\{[\s\S]*?\.user-presence-row\s*\{[^}]*grid-template-areas:/,
+    /@container user-presence \(max-width: 760px\)\s*\{[\s\S]*?\.user-presence-row\s*\{[^}]*grid-template-areas:/,
   );
   assert.match(
     styles,
-    /@container user-presence \(max-width: 620px\)\s*\{[\s\S]*?\.user-presence-row > \.user-presence-session\s*\{[^}]*grid-area:\s*session;/,
+    /@container user-presence \(max-width: 760px\)\s*\{[\s\S]*?\.user-presence-row > \.user-presence-session\s*\{[^}]*grid-area:\s*session;/,
   );
   assert.match(
     styles,
-    /@container user-presence \(max-width: 620px\)\s*\{[\s\S]*?\.user-presence-access-item\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);/,
+    /@container user-presence \(max-width: 760px\)\s*\{[\s\S]*?\.user-presence-access-item\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);/,
   );
   assert.match(styles, /\.user-presence-mark\s*\{[^}]*background:\s*var\(--ok\);/);
 });

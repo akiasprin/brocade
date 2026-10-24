@@ -78,8 +78,8 @@ pub fn subscription_with_options(subscription: &Subscription, options: UriRender
             continue;
         }
         if entry_is_self_signed(entry) {
-            // VLESS has no interoperable URI field for a self-signed certificate pin, and current Xray
-            // rejects allowInsecure. Never emit a link that imports successfully and cannot dial.
+            // VLESS has no interoperable URI field for a self-signed certificate pin, and upstream Xray
+            // clients reject allowInsecure. Never emit a link that imports successfully and cannot dial.
             if matches!(&entry.security, SubscriptionSecurity::Tls(_)) {
                 unsupported_self_signed.push(entry.name.clone());
                 continue;

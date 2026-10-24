@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.test.json",
+  "include": [
+    "src",
+    "tests/coverage/**/*.ts",
+    "tests/fixtures/rule-coverage-preview.tsx",
+    "tests/fixtures/layer-coverage-preview.tsx",
+    "tests/fixtures/capacity-coverage-preview.tsx",
+    "tests/fixtures/draft-coverage-preview.tsx",
+    "playwright.coverage.config.ts"
+  ]
+}

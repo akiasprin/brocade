@@ -174,6 +174,8 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		Writer: downlinkWriter,
 	}
 
+	inboundLink.Writer = machineWriter(ctx, inboundLink.Writer)
+	outboundLink.Writer = machineWriter(ctx, outboundLink.Writer)
 	sessionInbound := session.InboundFromContext(ctx)
 	var user *protocol.MemoryUser
 	if sessionInbound != nil {
@@ -235,6 +237,11 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 	}
 
 	reader := link.Reader
+	if c := machineController(ctx); c != nil {
+		limitedCtx, cancel := context.WithCancel(ctx)
+		reader = &limitedReader{ctx: limitedCtx, cancel: cancel, controller: c, reader: reader}
+		link.Writer = machineWriter(ctx, link.Writer)
+	}
 	link.Reader = &buf.TimeoutWrapperReader{Reader: reader}
 
 	if user != nil && len(user.Email) > 0 {

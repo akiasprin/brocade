@@ -249,6 +249,10 @@ pub async fn list_users(
         sqlx::query(
             "SELECT tenant_id, id, uuid::text AS uuid, status, account_type,
                     traffic_accounting_mode,
+                traffic_reset_day,
+                (to_jsonb(service_starts_at AT TIME ZONE 'UTC') #>> '{}') || 'Z' AS service_starts_at,
+                (to_jsonb(service_expires_at AT TIME ZONE 'UTC') #>> '{}') || 'Z' AS service_expires_at,
+                user_service_state(service_starts_at,service_expires_at,now()) AS service_state,
                     EXISTS (
                         SELECT 1 FROM admin_operators o
                         WHERE o.role = 'user'
@@ -273,6 +277,10 @@ pub async fn list_users(
         sqlx::query(
             "SELECT tenant_id, id, uuid::text AS uuid, status, account_type,
                     traffic_accounting_mode,
+                traffic_reset_day,
+                (to_jsonb(service_starts_at AT TIME ZONE 'UTC') #>> '{}') || 'Z' AS service_starts_at,
+                (to_jsonb(service_expires_at AT TIME ZONE 'UTC') #>> '{}') || 'Z' AS service_expires_at,
+                user_service_state(service_starts_at,service_expires_at,now()) AS service_state,
                     EXISTS (
                         SELECT 1 FROM admin_operators o
                         WHERE o.role = 'user'
@@ -300,6 +308,10 @@ pub async fn list_users(
         sqlx::query(
             "SELECT tenant_id, id, uuid::text AS uuid, status, account_type,
                     traffic_accounting_mode,
+                traffic_reset_day,
+                (to_jsonb(service_starts_at AT TIME ZONE 'UTC') #>> '{}') || 'Z' AS service_starts_at,
+                (to_jsonb(service_expires_at AT TIME ZONE 'UTC') #>> '{}') || 'Z' AS service_expires_at,
+                user_service_state(service_starts_at,service_expires_at,now()) AS service_state,
                     EXISTS (
                         SELECT 1 FROM admin_operators o
                         WHERE o.role = 'user'
@@ -391,9 +403,8 @@ pub async fn set_user_app_quota(
     actor.require_tenant_access(&tenant_id, "quota")?;
 
     let mut tx = pool.begin().await?;
-    ensure_user_exists_tx(&mut tx, &tenant_id, &user_id).await?;
+    crate::user_traffic::lock_user_tx(&mut tx, &tenant_id, &user_id).await?;
     ensure_app_exists_tx(&mut tx, &app_id).await?;
-
     let Some(limit_bytes) = request.limit_bytes else {
         sqlx::query(
             "DELETE FROM user_app_quotas WHERE tenant_id = $1 AND user_id = $2 AND app_id = $3",
@@ -419,6 +430,7 @@ pub async fn set_user_app_quota(
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (tenant_id, user_id, app_id) DO UPDATE SET
             limit_bytes = EXCLUDED.limit_bytes,
+            revision = user_app_quotas.revision + 1,
             updated_at = now()
          RETURNING tenant_id, user_id, app_id, limit_bytes, updated_at::text AS updated_at",
     )

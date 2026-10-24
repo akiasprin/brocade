@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/machinelimit"
 	"github.com/xtls/xray-core/common/mux"
+	"github.com/xtls/xray-core/common/userlimit"
 	"github.com/xtls/xray-core/core"
 	feature_stats "github.com/xtls/xray-core/features/stats"
 	grpc "google.golang.org/grpc"
@@ -17,8 +19,10 @@ import (
 
 // statsServer is an implementation of StatsService.
 type statsServer struct {
-	stats     feature_stats.Manager
-	startTime time.Time
+	machineLimit *machinelimit.Controller
+	userLimit    *userlimit.Client
+	stats        feature_stats.Manager
+	startTime    time.Time
 }
 
 func NewStatsServer(manager feature_stats.Manager) StatsServiceServer {
@@ -198,6 +202,26 @@ func (s *statsServer) GetUsersStats(ctx context.Context, request *GetUsersStatsR
 }
 
 func (s *statsServer) QueryStats(ctx context.Context, request *QueryStatsRequest) (*QueryStatsResponse, error) {
+	if request.Pattern == userlimit.StatsName {
+		if request.Reset_ {
+			return nil, status.Error(codes.InvalidArgument, "user limit capability is read-only")
+		}
+		var ready int64
+		if s.userLimit.Ready() {
+			ready = 1
+		}
+		return &QueryStatsResponse{Stat: []*Stat{{Name: userlimit.StatsName, Value: ready}}}, nil
+	}
+	if request.Pattern == machinelimit.StatsName {
+		if request.Reset_ {
+			return nil, status.Error(codes.InvalidArgument, "machine limit is read-only")
+		}
+		rate, err := s.machineLimit.Snapshot(ctx)
+		if err != nil {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
+		return &QueryStatsResponse{Stat: []*Stat{{Name: machinelimit.StatsName, Value: int64(rate)}}}, nil
+	}
 	if strings.HasPrefix(request.Pattern, feature_stats.OtherDomainPattern+"ack>>>") || strings.HasPrefix(request.Pattern, feature_stats.SniffingFailedPattern+"ack>>>") {
 		return s.acknowledgeDetail(request)
 	}
@@ -311,11 +335,15 @@ func (s *statsServer) GetSysStats(ctx context.Context, request *SysStatsRequest)
 func (s *statsServer) mustEmbedUnimplementedStatsServiceServer() {}
 
 type service struct {
+	machineLimit *machinelimit.Controller
+	userLimit    *userlimit.Client
 	statsManager feature_stats.Manager
 }
 
 func (s *service) Register(server *grpc.Server) {
 	ss := NewStatsServer(s.statsManager)
+	ss.(*statsServer).machineLimit = s.machineLimit
+	ss.(*statsServer).userLimit = s.userLimit
 	RegisterStatsServiceServer(server, ss)
 
 	// For compatibility purposes
@@ -327,6 +355,8 @@ func (s *service) Register(server *grpc.Server) {
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, cfg interface{}) (interface{}, error) {
 		s := new(service)
+		s.machineLimit = machinelimit.FromContext(ctx)
+		s.userLimit = userlimit.FromContext(ctx)
 
 		core.RequireFeatures(ctx, func(sm feature_stats.Manager) {
 			s.statsManager = sm

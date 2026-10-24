@@ -12,6 +12,7 @@ import (
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/machinelimit"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	v2tls "github.com/xtls/xray-core/transport/internet/tls"
 	"golang.org/x/sys/unix"
@@ -79,7 +80,11 @@ func (s *framedDownlinkSplicer) SpliceDownlink(ctx context.Context, source net.C
 	performance.recordSpliceConnection()
 
 	for {
-		length, readErr := spliceSocketToPipe(sourceRaw, pipeFDs[1], maxFramePayload)
+		chunk, limitErr := machinelimit.FromContext(ctx).ChunkSize()
+		if limitErr != nil {
+			return true, limitErr
+		}
+		length, readErr := spliceSocketToPipe(sourceRaw, pipeFDs[1], min(chunk, maxFramePayload))
 		if length == 0 {
 			if readErr == nil || errors.Cause(readErr) == io.EOF {
 				return true, nil
@@ -88,6 +93,9 @@ func (s *framedDownlinkSplicer) SpliceDownlink(ctx context.Context, source net.C
 			return true, readErr
 		}
 
+		if err := machinelimit.FromContext(ctx).Wait(ctx, length); err != nil {
+			return true, err
+		}
 		if err := s.writeSplicedFrame(ctx, destinationRaw, pipeFDs[0], length); err != nil {
 			performance.recordSpliceError()
 			s.session.close(err)
@@ -130,6 +138,10 @@ func (s *framedDownlinkSplicer) writevDownlink(ctx context.Context, source net.C
 		payload.Resize(0, int32(length))
 
 		if length > 0 {
+			if err := machinelimit.FromContext(ctx).Wait(ctx, length); err != nil {
+				payload.Release()
+				return true, err
+			}
 			s.session.writeMu.Lock()
 			if s.session.isClosed() {
 				s.session.writeMu.Unlock()

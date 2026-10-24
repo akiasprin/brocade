@@ -58,7 +58,7 @@ const REPORT_FILE: &str = "xray-release-report.json";
 // Keep file mutation brief; a Console request must never hold up local crash recovery.
 static REPORT_STATE_LOCK: Mutex<()> = Mutex::new(());
 static REPORT_RETRY_LOCK: Mutex<()> = Mutex::new(());
-const UPGRADE_RUNTIME_FILE: &str = "xray-upgrade.json";
+pub(crate) const UPGRADE_RUNTIME_FILE: &str = "xray-upgrade.json";
 // This capability keeps TCP generations drainable while treating UDP as reconnect-only: the
 // candidate binds the public SO_REUSEPORT socket, then the old generation drops its UDP socket.
 // Requiring the explicit marker prevents an older v2 process from receiving `drop_udp`.
@@ -98,7 +98,7 @@ pub(crate) fn read_upgrade_runtime(state_dir: &Path) -> Result<Option<XrayUpgrad
     // leave a rename/symlink race exactly where release-time process identities are trusted.
     let file = match OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&path)
     {
         Ok(file) => file,
@@ -201,11 +201,36 @@ pub(crate) fn installed_xray_supports_handoff() -> bool {
         .is_ok_and(|output| crate::xray_version_has_capability(&output, XRAY_HANDOFF_CAPABILITY))
 }
 
-pub(crate) fn config_handoff_ready(state_dir: &Path) -> bool {
-    installed_xray_supports_handoff()
-        && observe_serving_handoff_generation(state_dir).is_ok_and(|(_, _, status)| {
-            status.ready && status.accepting && status.retirement_supported
-        })
+pub(crate) fn config_handoff_unavailable_reason(state_dir: &Path, desired: &str) -> Option<String> {
+    let result = (|| -> Result<(), String> {
+        let (process, _, status) = observe_serving_handoff_generation(state_dir)?;
+        if !status.ready || !status.accepting || !status.retirement_supported {
+            return Err(handoff_blocked_reason(&status));
+        }
+        let version = run_command_with_timeout(
+            &format!("/proc/{}/exe", process.pid),
+            &["version"],
+            Duration::from_secs(5),
+        )?;
+        for capability in [XRAY_HANDOFF_CAPABILITY, "config-listener-handoff-v1"] {
+            if !crate::xray_version_has_capability(&version, capability) {
+                return Err(format!("运行中的 Xray 缺少 {capability} 能力"));
+            }
+        }
+        let config: serde_json::Value =
+            serde_json::from_str(desired).map_err(|error| error.to_string())?;
+        if ["/api/listen", "/metrics/listen"].iter().any(|pointer| {
+            config
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|listen| !listen.is_empty())
+        }) && !crate::xray_version_has_capability(&version, "control-listener-handoff-v1")
+        {
+            return Err("运行中的 Xray 缺少 control-listener-handoff-v1 能力".to_owned());
+        }
+        Ok(())
+    })();
+    result.err()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -728,7 +753,16 @@ fn read_handoff_manifest_identity(path: &Path) -> Result<HandoffManifestIdentity
     {
         return Err("代际 manifest 权限或文件身份不安全".to_owned());
     }
-    serde_json::from_reader(file).map_err(|error| format!("解析代际 manifest 失败：{error}"))
+    // from_reader(File) reads JSON byte by byte. The one-second guard checks several manifests,
+    // so collect the already size-checked file in bounded batches before parsing it.
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_HANDOFF_MESSAGE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("读取代际 manifest 失败：{error}"))?;
+    if bytes.len() as u64 != metadata.len() {
+        return Err("代际 manifest 在读取期间发生变化".to_owned());
+    }
+    serde_json::from_slice(&bytes).map_err(|error| format!("解析代际 manifest 失败：{error}"))
 }
 
 fn handoff_status_rpc(
@@ -828,36 +862,8 @@ fn handoff_rpc_inner(
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let address_len =
         (std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1) as libc::socklen_t;
-    if unsafe {
-        libc::connect(
-            fd.as_raw_fd(),
-            &address as *const _ as *const libc::sockaddr,
-            address_len,
-        )
-    } != 0
-    {
-        return Err(format!(
-            "连接代际控制端失败：{}",
-            io::Error::last_os_error()
-        ));
-    }
-    let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut peer_len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut peer as *mut _ as *mut libc::c_void,
-            &mut peer_len,
-        )
-    } != 0
-        || peer_len as usize != std::mem::size_of::<libc::ucred>()
-        || peer.uid != unsafe { libc::geteuid() }
-        || expected_pid.is_some_and(|expected| peer.pid != expected)
-    {
-        return Err("代际控制端 PID/UID 身份不一致".to_owned());
-    }
+    // SO_SNDTIMEO also bounds a blocking Unix connect when a frozen control server's
+    // accept backlog is full. Installing it after connect leaves every recovery worker stuck.
     let timeout = libc::timeval {
         tv_sec: 2,
         tv_usec: 0,
@@ -878,6 +884,37 @@ fn handoff_rpc_inner(
                 io::Error::last_os_error()
             ));
         }
+    }
+    if unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            &address as *const _ as *const libc::sockaddr,
+            address_len,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "代际控制 {operation} 连接失败（PID {:?}，超时上限 2 秒）：{}",
+            expected_pid,
+            io::Error::last_os_error()
+        ));
+    }
+    let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut peer_len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut peer as *mut _ as *mut libc::c_void,
+            &mut peer_len,
+        )
+    } != 0
+        || peer_len as usize != std::mem::size_of::<libc::ucred>()
+        || peer.uid != unsafe { libc::geteuid() }
+        || expected_pid.is_some_and(|expected| peer.pid != expected)
+    {
+        return Err("代际控制端 PID/UID 身份不一致".to_owned());
     }
     let request = serde_json::json!({
         "operation": operation,
@@ -937,8 +974,24 @@ fn handoff_rpc_inner(
             },
         )
     };
-    if received <= 0 || received as usize > MAX_HANDOFF_MESSAGE_BYTES {
-        return Err(format!("读取代际状态失败：{}", io::Error::last_os_error()));
+    if received < 0 {
+        return Err(format!(
+            "代际控制 {operation} 等待响应失败（PID {}，超时上限 2 秒）：{}",
+            peer.pid,
+            io::Error::last_os_error()
+        ));
+    }
+    if received == 0 {
+        return Err(format!(
+            "代际控制 {operation} 响应提前关闭（PID {}）",
+            peer.pid
+        ));
+    }
+    if received as usize > MAX_HANDOFF_MESSAGE_BYTES {
+        return Err(format!(
+            "代际控制 {operation} 响应超出大小上限（PID {}）",
+            peer.pid
+        ));
     }
     if message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
         return Err("代际控制响应或监听 FD 被截断".to_owned());
@@ -1326,6 +1379,8 @@ fn launch_handoff_candidate(
         })
         .map(AsRawFd::as_raw_fd)
         .collect::<Vec<_>>();
+    crate::user_traffic::verify_executable(accounting_dir, &candidate.executable)?;
+    crate::source_access::verify_executable(accounting_dir, &candidate.executable)?;
     let mut command = Command::new(&candidate.executable);
     command
         .args(["run", "-config"])
@@ -1333,6 +1388,25 @@ fn launch_handoff_candidate(
         .envs(crate::xray_launch_environment(splice_mode))
         .env("XRAY_BROCADE_ACCOUNTING_FILE", &accounting)
         .env("XRAY_BROCADE_ACCOUNTING_SHARED", "join")
+        .env(
+            "XRAY_BROCADE_USER_LIMIT_FILE",
+            crate::user_traffic::control_path(accounting_dir),
+        )
+        .env(
+            crate::source_access::ENV,
+            crate::source_access::policy_path(accounting_dir),
+        )
+        .env(
+            "XRAY_BROCADE_MACHINE_LIMIT_FILE",
+            crate::traffic_limit_budget::control_path(accounting_dir),
+        )
+        .env(
+            "XRAY_BROCADE_MACHINE_LIMIT_REQUIRED",
+            u8::from(crate::traffic_limit_budget::required_at_start(
+                accounting_dir,
+            ))
+            .to_string(),
+        )
         .env(
             "XRAY_BROCADE_SNIFFING_FAILED_CONTROL_FILE",
             crate::other_domain::failed_control_path(accounting_dir),
@@ -1756,6 +1830,98 @@ fn status_for_upgrade_process(
     Ok(Some((process_ref, manifest, status)))
 }
 
+type ObservedGeneration = (
+    crate::ProcessRef,
+    HandoffManifestIdentity,
+    HandoffRuntimeStatus,
+);
+
+fn observe_upgrade_generations(
+    runtime: &XrayUpgradeRuntime,
+) -> Result<(Option<ObservedGeneration>, Option<ObservedGeneration>), String> {
+    let old = status_for_upgrade_process(&runtime.old)
+        .map_err(|error| format!("旧代 PID {} 控制失联：{error}", runtime.old.pid))?;
+    let candidate = runtime
+        .candidate
+        .as_ref()
+        .map(|candidate| {
+            status_for_upgrade_process(candidate)
+                .map_err(|error| format!("候选代 PID {} 控制失联：{error}", candidate.pid))
+        })
+        .transpose()?
+        .flatten();
+    Ok((old, candidate))
+}
+
+fn recover_unresponsive_handoff(
+    state_dir: &Path,
+    runtime: &XrayUpgradeRuntime,
+    cause: &str,
+) -> Result<bool, String> {
+    // A lost old control channel must not restart a healthy admitted candidate. Persist the
+    // retirement decision first so interruption after SIGKILL can complete through the normal
+    // single-candidate path. The accounting journal remains shared until promotion.
+    if runtime.old.accepting == Some(false) {
+        if let Some((candidate, manifest, status)) = runtime
+            .candidate
+            .as_ref()
+            .map(status_for_upgrade_process)
+            .transpose()
+            .ok()
+            .flatten()
+            .flatten()
+        {
+            if status.ready && status.accepting && status.retirement_supported {
+                candidate_grants_for_recovery(state_dir, runtime)?;
+                crate::accounting::handoff_journal_epochs(state_dir)?;
+                let options = Options {
+                    command: "repair".to_owned(),
+                    server: String::new(),
+                    token: String::new(),
+                    state_dir: state_dir.to_owned(),
+                    apply_mode: ApplyMode::Linux,
+                    vpngate_stats_window: Duration::from_secs(900),
+                };
+                crate::collect_usage_report(&options)?;
+                let mut retiring = runtime.clone();
+                retiring.phase = XrayUpgradePhase::Forcing;
+                retiring.blocked_reason = Some(format!(
+                    "旧代控制失联，强制退役旧代并保留已接流候选：{cause}"
+                ));
+                write_upgrade_runtime(state_dir, &retiring)?;
+                if let Some(old) = exact_upgrade_process(&runtime.old) {
+                    crate::terminate_processes(
+                        &[old],
+                        crate::XRAY_TERM_GRACE,
+                        crate::XRAY_KILL_GRACE,
+                    )?;
+                }
+                let old = crate::ProcessRef {
+                    pid: runtime.old.pid,
+                    start_ticks: runtime.old.pid_start_ticks,
+                };
+                finalize_recovered_candidate(
+                    &options,
+                    &retiring,
+                    old,
+                    candidate,
+                    &manifest,
+                    runtime.strategy == XrayReleaseStrategy::HandoffForce,
+                )?;
+                crate::record_local_reconcile(
+                    state_dir,
+                    &[format!(
+                        "Xray 旧代控制失联，已退役旧代，候选继续服务：{cause}"
+                    )],
+                    None,
+                )?;
+                return Ok(true);
+            }
+        }
+    }
+    crash_recovery::begin_unresponsive(state_dir, runtime, cause)
+}
+
 /// Restore one accepting generation before ordinary guard logic is allowed to consider a
 /// restart. A lost candidate after UDP teardown enters durable crash recovery; healthy handoffs
 /// continue to pause only the old generation and preserve its draining TCP sessions.
@@ -1766,13 +1932,12 @@ pub(crate) fn guard_interrupted_handoff(state_dir: &Path) -> Result<bool, String
     let Some(runtime) = interrupted_handoff_runtime(state_dir)? else {
         return Ok(false);
     };
-    let old = status_for_upgrade_process(&runtime.old)?;
-    let candidate = runtime
-        .candidate
-        .as_ref()
-        .map(status_for_upgrade_process)
-        .transpose()?
-        .flatten();
+    let (old, candidate) = match observe_upgrade_generations(&runtime) {
+        Ok(generations) => generations,
+        Err(error) => {
+            return recover_unresponsive_handoff(state_dir, &runtime, &error);
+        }
+    };
 
     if let Some((_, candidate_manifest, candidate_status)) = &candidate {
         if candidate_status.ready
@@ -1906,6 +2071,119 @@ fn restore_old_handoff_state(state_dir: &Path, runtime: &XrayUpgradeRuntime) -> 
     }
 }
 
+/// Retain the live generation and two recent retired generations for diagnosis. Finished
+/// handoffs otherwise leave a complete executable per release and eventually exhaust small nodes.
+/// The runtime mutex is held by the caller; an in-flight handoff/recovery never permits pruning.
+pub(crate) fn prune_retired_generations(state_dir: &Path) -> Result<(), String> {
+    if read_upgrade_runtime(state_dir)?.is_some()
+        || state_dir
+            .join(crash_recovery::RECOVERY_FILE)
+            .try_exists()
+            .map_err(|error| error.to_string())?
+        || crate::pending_config_convergence_path(state_dir)
+            .try_exists()
+            .map_err(|error| error.to_string())?
+    {
+        return Ok(());
+    }
+    let root = state_dir.join(HANDOFF_DIR);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("读取旧代目录失败：{error}")),
+    };
+    let mut live = BTreeSet::new();
+    for process in crate::serving_xray_processes_in(state_dir) {
+        let environment = match fs::read(format!("/proc/{}/environ", process.pid)) {
+            Ok(environment) => environment,
+            Err(_) if !crate::process_is_live(process) => continue,
+            Err(error) => return Err(format!("确认存活 Xray 代际失败，暂缓回收：{error}")),
+        };
+        if let Some(path) = environment
+            .split(|byte| *byte == 0)
+            .find_map(|entry| entry.strip_prefix(XRAY_HANDOFF_MANIFEST_ENV))
+        {
+            let path = std::str::from_utf8(path).map_err(|_| "存活代际路径无效，暂缓回收")?;
+            let manifest = read_handoff_manifest_identity(Path::new(path))?;
+            live.insert(manifest.generation_id);
+        } else {
+            // Legacy launches have no generation directory, but may still execute a copied
+            // binary. Never remove its directory based only on an absent environment variable.
+            let executable = fs::read_link(format!("/proc/{}/exe", process.pid))
+                .map_err(|error| format!("确认存活 Xray 路径失败，暂缓回收：{error}"))?;
+            if let Some(name) = executable
+                .parent()
+                .filter(|parent| parent.parent() == Some(root.as_path()))
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+            {
+                live.insert(name.to_owned());
+            }
+        }
+    }
+    let mut retired = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("读取旧代条目失败：{error}"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(token) = name.strip_prefix("brocade-") else {
+            continue;
+        };
+        if token.len() != 32
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || live.contains(&name)
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err("旧代目录类型、属主或权限无效，暂缓回收".to_owned());
+        }
+        let manifest_path = entry.path().join("manifest.json");
+        match fs::symlink_metadata(&manifest_path) {
+            Ok(_) => {
+                let manifest = read_handoff_manifest_identity(&manifest_path)?;
+                if manifest.generation_id != name
+                    || manifest.control_path.parent() != Some(entry.path().as_path())
+                {
+                    return Err("旧代 manifest 与目录身份不一致，暂缓回收".to_owned());
+                }
+            }
+            // Preparation writes the executable before the manifest. Failed preparation can
+            // leave this incomplete private directory, but cannot have launched a child from it.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("读取旧代 manifest 元数据失败：{error}")),
+        }
+        retired.push((
+            metadata.modified().map_err(|error| error.to_string())?,
+            name,
+            entry.path(),
+        ));
+    }
+    retired.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    for (_, name, directory) in retired.into_iter().skip(2).take(4) {
+        // New candidates are the newest entries and are retained even across a manual executor's
+        // pre-registration window. Recheck the durable fence before deleting any older entry.
+        if read_upgrade_runtime(state_dir)?.is_some() {
+            return Ok(());
+        }
+        fs::remove_dir_all(&directory).map_err(|error| format!("回收旧代 {name} 失败：{error}"))?;
+        let log = state_dir.join("logs").join(format!("xray-{name}.log"));
+        for path in [&log, &crate::logcap::archive_path(&log)] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("回收旧代日志 {name} 失败：{error}")),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cleanup_handoff_backup(state_dir: &Path, runtime: &XrayUpgradeRuntime) {
     let name = match &runtime.source {
         XrayUpgradeSource::BinaryRelease => PREVIOUS_FILE,
@@ -1962,6 +2240,27 @@ fn candidate_grants_for_recovery(
             .map(Some)
             .ok_or_else(|| "配置候选缺少完整目标授权检查点，拒绝恢复接入".to_owned()),
     }
+}
+
+pub(crate) fn config_handoff_has_grants(
+    state_dir: &Path,
+    deployment_id: i64,
+    claim_generation: u64,
+    wanted: &[GrantInbound],
+) -> Result<bool, String> {
+    let Some(runtime) = read_upgrade_runtime(state_dir)? else {
+        return Ok(false);
+    };
+    Ok(
+        config_handoff_source(&runtime) == Some((deployment_id, claim_generation))
+            && runtime.phase == XrayUpgradePhase::Draining
+            && runtime
+                .candidate
+                .as_ref()
+                .and_then(|candidate| candidate.accepting)
+                == Some(true)
+            && read_config_handoff_grants(state_dir)?.as_deref() == Some(wanted),
+    )
 }
 
 fn freeze_config_handoff_grants(
@@ -2149,13 +2448,23 @@ pub(crate) fn recover_interrupted_handoff(
     let _switch_guard = meter
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let old = status_for_upgrade_process(&runtime.old)?;
-    let candidate = runtime
-        .candidate
-        .as_ref()
-        .map(status_for_upgrade_process)
-        .transpose()?
-        .flatten();
+    let Some(current) = interrupted_handoff_runtime(&options.state_dir)? else {
+        // The one-second guard can finish recovery while the optional Console query runs.
+        return Ok(true);
+    };
+    if current.source != runtime.source
+        || current.release_id != runtime.release_id
+        || current.attempt != runtime.attempt
+    {
+        return Ok(true);
+    }
+    runtime = current;
+    let (old, candidate) = match observe_upgrade_generations(&runtime) {
+        Ok(generations) => generations,
+        Err(error) => {
+            return recover_unresponsive_handoff(&options.state_dir, &runtime, &error);
+        }
+    };
 
     match (old, candidate) {
         (None, None) => {
@@ -2843,11 +3152,6 @@ fn preflight(candidate: &Path, offer: &XrayReleaseOffer, options: &Options) -> R
             version.lines().next().unwrap_or_default()
         ));
     }
-    if offer.strategy != XrayReleaseStrategy::Restart
-        && !crate::xray_version_has_capability(&version, XRAY_HANDOFF_CAPABILITY)
-    {
-        return Err(format!("候选 Xray 没有 {XRAY_HANDOFF_CAPABILITY} 能力"));
-    }
     let config = options.state_dir.join("xray.json");
     if xray_enabled(&options.state_dir) {
         let config = config.to_string_lossy().into_owned();
@@ -3198,12 +3502,15 @@ pub(crate) fn begin_config_handoff(
             &error,
         );
     }
-    let recovery = crate::restore_xray_runtime_with_grants(
-        state_dir,
-        &desired,
-        api_address,
-        Some(&candidate_grants),
-    );
+    let recovery = {
+        let _deadline = crate::xray_grpc::deadline_after(Some(Duration::from_secs(5)));
+        crate::restore_xray_runtime_with_grants(
+            state_dir,
+            &desired,
+            api_address,
+            Some(&candidate_grants),
+        )
+    };
     if let Some(error) = recovery.error() {
         return rollback_config_handoff_before_switch(
             state_dir,
@@ -3436,12 +3743,16 @@ fn rollback_config_handoff_before_switch(
         Ok(_) => failures.push("旧代回滚后没有恢复 accepting".to_owned()),
         Err(error) => failures.push(format!("恢复旧代 admission 失败：{error}")),
     }
-    if let Ok(previous) = fs::read_to_string(&previous_path) {
-        let api_address =
-            crate::xray_api_address(&previous).unwrap_or(crate::DEFAULT_XRAY_API_ADDRESS);
-        if let Some(error) = crate::restore_xray_runtime(state_dir, &previous, api_address).error()
-        {
-            failures.push(format!("旧代动态状态恢复失败：{error}"));
+    if failures.is_empty() {
+        if let Ok(previous) = fs::read_to_string(&previous_path) {
+            let _deadline = crate::xray_grpc::deadline_after(Some(Duration::from_secs(5)));
+            let api_address =
+                crate::xray_api_address(&previous).unwrap_or(crate::DEFAULT_XRAY_API_ADDRESS);
+            if let Some(error) =
+                crate::restore_xray_runtime(state_dir, &previous, api_address).error()
+            {
+                failures.push(format!("旧代动态状态恢复失败：{error}"));
+            }
         }
     }
     if failures.is_empty() {
@@ -3465,28 +3776,47 @@ fn perform_handoff_update_at_target(
     candidate: &Path,
     target: &Path,
 ) -> Option<XrayReleaseReport> {
-    if !xray_enabled(&options.state_dir) {
-        return Some(failure_report(
-            options,
-            offer,
-            XrayReleaseOutcome::Unsupported,
-            "停用的 Xray 没有可交接的运行代；请使用 restart 策略安装".to_owned(),
-        ));
-    }
-    if !installed_xray_supports_handoff() {
-        return Some(failure_report(
-            options,
-            offer,
-            XrayReleaseOutcome::Unsupported,
-            format!("当前 Xray 没有 {XRAY_HANDOFF_CAPABILITY} 能力"),
-        ));
-    }
     if let Err(error) = preflight(candidate, offer, options) {
         return Some(failure_report(
             options,
             offer,
             pre_update_failure_outcome(options, offer),
             format!("候选 Xray 在交接前复检失败：{error}"),
+        ));
+    }
+    if !xray_enabled(&options.state_dir) || !installed_xray_supports_handoff() {
+        return Some(restart_handoff_fallback(
+            options,
+            meter,
+            offer,
+            candidate,
+            target,
+            "当前 Xray 未运行或缺少 tcp-handoff-udp-reset-v1 能力",
+        ));
+    }
+    let candidate_version = match run_command_with_timeout(
+        &candidate.to_string_lossy(),
+        &["version"],
+        Duration::from_secs(5),
+    ) {
+        Ok(version) => version,
+        Err(error) => {
+            return Some(failure_report(
+                options,
+                offer,
+                pre_update_failure_outcome(options, offer),
+                error,
+            ))
+        }
+    };
+    if !crate::xray_version_has_capability(&candidate_version, XRAY_HANDOFF_CAPABILITY) {
+        return Some(restart_handoff_fallback(
+            options,
+            meter,
+            offer,
+            candidate,
+            target,
+            "候选 Xray 缺少 tcp-handoff-udp-reset-v1 能力",
         ));
     }
     let (old_process, old_manifest, old_status) =
@@ -3499,19 +3829,23 @@ fn perform_handoff_update_at_target(
                 generation
             }
             Ok((_, _, status)) => {
-                return Some(failure_report(
+                return Some(restart_handoff_fallback(
                     options,
+                    meter,
                     offer,
-                    XrayReleaseOutcome::Unsupported,
-                    handoff_blocked_reason(&status),
+                    candidate,
+                    target,
+                    &handoff_blocked_reason(&status),
                 ))
             }
             Err(error) => {
-                return Some(failure_report(
+                return Some(restart_handoff_fallback(
                     options,
+                    meter,
                     offer,
-                    XrayReleaseOutcome::Unsupported,
-                    format!("当前 Xray 不具备真实 handoff 运行态：{error}"),
+                    candidate,
+                    target,
+                    &format!("当前 Xray 不具备真实 handoff 运行态：{error}"),
                 ))
             }
         };
@@ -3764,7 +4098,10 @@ fn perform_handoff_update_at_target(
         }
     };
     let api_address = crate::xray_api_address(&config).unwrap_or(crate::DEFAULT_XRAY_API_ADDRESS);
-    let recovery = crate::restore_xray_runtime(&options.state_dir, &config, api_address);
+    let recovery = {
+        let _deadline = crate::xray_grpc::deadline_after(Some(Duration::from_secs(5)));
+        crate::restore_xray_runtime(&options.state_dir, &config, api_address)
+    };
     if let Some(error) = recovery.error() {
         let error = startup::root_failure(&candidate_handoff.manifest, Some(candidate_process))
             .unwrap_or_else(|| format!("候选动态业务状态没有完整恢复：{error}"));
@@ -4113,8 +4450,8 @@ fn rollback_handoff_before_switch(
         Ok(_) => failures.push("旧代回滚后没有恢复 accepting".to_owned()),
         Err(error) => failures.push(format!("恢复旧代 admission 失败：{error}")),
     }
-    cleanup_file(&options.state_dir.join(UPGRADE_RUNTIME_FILE));
     if failures.is_empty() {
+        cleanup_file(&options.state_dir.join(UPGRADE_RUNTIME_FILE));
         failure_report(
             options,
             offer,
@@ -4122,11 +4459,27 @@ fn rollback_handoff_before_switch(
             format!("平滑交接未切流，旧代已恢复：{cause}"),
         )
     } else {
+        // A live but unreachable candidate must remain fenced after a failed rollback. The
+        // guard owns recovery from this durable identity; deleting it strands the paused old
+        // generation and loses the only safe way to clean up the candidate.
+        if let Ok(Some(mut runtime)) = read_upgrade_runtime(&options.state_dir) {
+            runtime.phase = XrayUpgradePhase::Blocked;
+            runtime.blocked_reason = Some(format!(
+                "平滑交接回滚尚未完成：{cause}；{}",
+                failures.join("；")
+            ));
+            if let Err(error) = write_upgrade_runtime(&options.state_dir, &runtime) {
+                failures.push(format!("保存待恢复交接失败：{error}"));
+            }
+        }
         failure_report(
             options,
             offer,
             XrayReleaseOutcome::FailedDirty,
-            format!("平滑交接失败：{cause}；{}", failures.join("；")),
+            format!(
+                "平滑交接失败，保留检查点等待自动恢复：{cause}；{}",
+                failures.join("；")
+            ),
         )
     }
 }
@@ -4149,6 +4502,46 @@ fn handoff_dirty_failure(
             None => error,
         },
     )
+}
+
+fn restart_handoff_fallback(
+    options: &Options,
+    meter: &Arc<Mutex<()>>,
+    offer: &XrayReleaseOffer,
+    candidate: &Path,
+    target: &Path,
+    reason: &str,
+) -> XrayReleaseReport {
+    match read_upgrade_runtime(&options.state_dir) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return failure_report(
+                options,
+                offer,
+                XrayReleaseOutcome::FailedDirty,
+                "已有双进程交接，拒绝重启降级或创建第三代进程".to_owned(),
+            )
+        }
+        Err(error) => {
+            return failure_report(options, offer, XrayReleaseOutcome::FailedDirty, error)
+        }
+    }
+    eprintln!("xray-update: 平滑条件不足，将降级为直接重启，现有连接将中断：{reason}");
+    let mut report = perform_update_at_target(options, meter, offer, candidate, target);
+    let outcome = if report.outcome == XrayReleaseOutcome::Succeeded {
+        "已完成"
+    } else {
+        "未完成"
+    };
+    report.error = Some(format!(
+        "平滑条件不足，降级直接重启{outcome}：{reason}{}",
+        report
+            .error
+            .as_ref()
+            .map(|error| format!("；{error}"))
+            .unwrap_or_default()
+    ));
+    report
 }
 
 fn perform_update_at_target(
@@ -4896,6 +5289,57 @@ mod tests {
     }
 
     #[test]
+    fn retired_generation_cleanup_is_bounded_and_preserves_unknown_entries() {
+        let dir = temp_dir("retired-generation-cleanup");
+        let root = dir.join(HANDOFF_DIR);
+        crate::create_private_dir(&root).unwrap();
+        crate::create_private_dir(&dir.join("logs")).unwrap();
+        for index in 0..6 {
+            let name = format!("brocade-{index:032x}");
+            let generation = root.join(&name);
+            crate::create_private_dir(&generation).unwrap();
+            let manifest = HandoffManifestIdentity {
+                version: 2,
+                scope: "whole-generation".to_owned(),
+                generation_id: name.clone(),
+                control_path: generation.join("control.sock"),
+                listeners: vec![],
+            };
+            crate::fsutil::atomic_write_private(
+                &generation.join("manifest.json"),
+                &serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            crate::write_private(&generation.join("xray"), "synthetic retired bytes").unwrap();
+            crate::write_private(
+                &dir.join("logs").join(format!("xray-{name}.log")),
+                "synthetic log",
+            )
+            .unwrap();
+            let log = dir.join("logs").join(format!("xray-{name}.log"));
+            crate::write_private(&crate::logcap::archive_path(&log), "synthetic archive").unwrap();
+        }
+        fs::create_dir(root.join("unrelated")).unwrap();
+        let mut active = config_grants_test_runtime();
+        active.release_id = -604;
+        super::write_upgrade_runtime(&dir, &active).unwrap();
+        prune_retired_generations(&dir).unwrap();
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            7,
+            "active handoff must fence cleanup"
+        );
+        fs::remove_file(dir.join(UPGRADE_RUNTIME_FILE)).unwrap();
+        prune_retired_generations(&dir).unwrap();
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+        assert!(root.join("unrelated").is_dir());
+        assert_eq!(fs::read_dir(dir.join("logs")).unwrap().count(), 4);
+        prune_retired_generations(&dir).unwrap();
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn configuration_handoffs_force_only_after_the_drain_deadline() {
         let runtime = retirement_test_runtime(
             XrayUpgradeSource::ConfigDeployment {
@@ -5103,6 +5547,111 @@ mod tests {
     }
 
     #[test]
+    fn handoff_control_connect_timeout_includes_a_full_accept_backlog() {
+        let dir = temp_dir("handoff-connect-timeout");
+        let control_path = dir.join("control.sock");
+        let _listener = bind_test_seqpacket(&control_path);
+        let mut connections = Vec::new();
+        // Linux accepts backlog + 1 queued Unix connections. Never accept any of them.
+        for _ in 0..2 {
+            let path = control_path.as_os_str().as_encoded_bytes();
+            let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            for (slot, byte) in address.sun_path.iter_mut().zip(path) {
+                *slot = *byte as libc::c_char;
+            }
+            let fd = unsafe {
+                libc::socket(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                    0,
+                )
+            };
+            assert!(fd >= 0);
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            assert_eq!(
+                unsafe {
+                    libc::connect(
+                        fd.as_raw_fd(),
+                        &address as *const _ as *const libc::sockaddr,
+                        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1)
+                            as libc::socklen_t,
+                    )
+                },
+                0
+            );
+            connections.push(fd);
+        }
+        let manifest = HandoffManifestIdentity {
+            version: 2,
+            scope: "whole-generation".to_owned(),
+            generation_id: "generation-backlog-0001".to_owned(),
+            control_path,
+            listeners: Vec::new(),
+        };
+        // Release the backlog as a test fail-safe: the pre-fix implementation would otherwise
+        // block this test forever. It must finish on its own well before that release.
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(4));
+            drop(connections);
+        });
+        let started = Instant::now();
+        let error = handoff_status_any(&manifest).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "connect was not bounded: {error}"
+        );
+        assert!(
+            error.contains("status 连接失败") && error.contains("2 秒"),
+            "{error}"
+        );
+        release.join().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn handoff_control_eof_does_not_report_a_stale_os_error() {
+        let dir = temp_dir("handoff-eof");
+        let control_path = dir.join("control.sock");
+        let listener = bind_test_seqpacket(&control_path);
+        let server = thread::spawn(move || {
+            let client = unsafe {
+                libc::accept4(
+                    listener.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_CLOEXEC,
+                )
+            };
+            assert!(client >= 0);
+            let client = unsafe { OwnedFd::from_raw_fd(client) };
+            let mut request = [0_u8; 4096];
+            assert!(
+                unsafe {
+                    libc::recv(
+                        client.as_raw_fd(),
+                        request.as_mut_ptr().cast(),
+                        request.len(),
+                        0,
+                    )
+                } > 0
+            );
+        });
+        let manifest = HandoffManifestIdentity {
+            version: 2,
+            scope: "whole-generation".to_owned(),
+            generation_id: "generation-eof-0001".to_owned(),
+            control_path,
+            listeners: Vec::new(),
+        };
+        let error = handoff_status_any(&manifest).unwrap_err();
+        assert!(error.contains("status 响应提前关闭"), "{error}");
+        assert!(!error.contains("os error"), "{error}");
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn startup_health_waits_for_late_business_listeners() {
         let mut attempts = 0;
         wait_for_startup_health(Duration::from_secs(1), || {
@@ -5134,6 +5683,7 @@ mod tests {
                 listen_port: 40_000,
                 target_host: "127.0.0.1".to_owned(),
                 target_port: 443,
+                allow_private_targets: Some(false),
             }],
         };
         crate::fsutil::atomic_write_private(
@@ -5215,6 +5765,7 @@ mod tests {
                     listen_port: 8448,
                     target_host: "127.0.0.1".to_owned(),
                     target_port: 443,
+                    allow_private_targets: Some(false),
                 }],
             })
             .unwrap(),
@@ -5471,6 +6022,58 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
         assert!(validate_handoff_manifest_path(&path).is_err());
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn handoff_identity_reads_large_manifests_in_batches() {
+        let dir = temp_dir("manifest-batch-read");
+        let path = dir.join("manifest.json");
+        let manifest = serde_json::json!({
+            "version": 2,
+            "scope": "whole-generation",
+            "generation_id": "generation-batch-read-0001",
+            "control_path": "/private/control.sock",
+            "listeners": [],
+            "future_field": "a".repeat(128 * 1024),
+        });
+        crate::fsutil::atomic_write_private(&path, &serde_json::to_vec(&manifest).unwrap())
+            .unwrap();
+        let before = crate::tests::thread_io_counter("syscr");
+
+        let observed = read_handoff_manifest_identity(&path).unwrap();
+
+        let reads = crate::tests::thread_io_counter("syscr") - before;
+        assert_eq!(observed.generation_id, "generation-batch-read-0001");
+        assert!(reads < 16, "manifest used {reads} read calls");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn handoff_identity_batch_read_preserves_size_and_json_validation() {
+        let dir = temp_dir("manifest-batch-validation");
+        let path = dir.join("manifest.json");
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "generation_id": "generation-batch-validation-0001",
+            "control_path": "/private/control.sock",
+        }))
+        .unwrap();
+        bytes.resize(MAX_HANDOFF_MESSAGE_BYTES, b' ');
+        crate::fsutil::atomic_write_private(&path, &bytes).unwrap();
+        read_handoff_manifest_identity(&path).unwrap();
+
+        bytes.push(b' ');
+        crate::fsutil::atomic_write_private(&path, &bytes).unwrap();
+        assert!(read_handoff_manifest_identity(&path).is_err());
+        crate::fsutil::atomic_write_private(&path, b"{}").unwrap();
+        assert!(read_handoff_manifest_identity(&path).is_err());
+        crate::fsutil::atomic_write_private(&path, b"").unwrap();
+        assert!(read_handoff_manifest_identity(&path).is_err());
+
+        let alias = dir.join("symlink.json");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(read_handoff_manifest_identity(&alias).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -6055,6 +6658,122 @@ mod tests {
     #[ignore = "requires BROCADE_TEST_XRAY and local TCP/Unix sockets"]
     fn native_agent_graceful_timeout_yields_until_the_old_flow_drains() {
         native_agent_handoff_case(NativeInterruption::GracefulTimeout);
+    }
+
+    #[test]
+    #[ignore = "requires BROCADE_TEST_XRAY and isolated local TCP/Unix sockets; run serially"]
+    fn native_unresponsive_old_without_a_registered_candidate_recovers_previous_state() {
+        use std::{ffi::OsString, net::TcpListener};
+        struct Fixture {
+            root: PathBuf,
+            previous: Vec<(&'static str, Option<OsString>)>,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = crate::terminate_processes(
+                    &crate::serving_xray_processes_in(&self.root),
+                    crate::XRAY_TERM_GRACE,
+                    crate::XRAY_KILL_GRACE,
+                );
+                for (name, value) in &self.previous {
+                    if let Some(value) = value {
+                        std::env::set_var(name, value);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+        let source =
+            PathBuf::from(std::env::var_os("BROCADE_TEST_XRAY").expect("explicit Xray required"));
+        for config_source in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "br-{}-{}",
+                std::process::id(),
+                u8::from(config_source)
+            ));
+            assert!(!root.exists());
+            crate::create_private_dir(&root).unwrap();
+            let _fixture = Fixture {
+                root: root.clone(),
+                previous: ["BROCADE_XRAY_BIN", "BROCADE_TEST_LOG_SINK"]
+                    .into_iter()
+                    .map(|name| (name, std::env::var_os(name)))
+                    .collect(),
+            };
+            let binary = root.join("xray");
+            copy_atomic(&source, &binary, 0o755).unwrap();
+            std::env::set_var("BROCADE_XRAY_BIN", &binary);
+            std::env::set_var("BROCADE_TEST_LOG_SINK", "cat >/dev/null");
+            let api = TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap();
+            let content = serde_json::json!({
+                "log": {"loglevel": "error"}, "stats": {},
+                "api": {"tag": "api", "listen": api.to_string(), "services": ["HandlerService", "StatsService"]},
+                "inbounds": [], "outbounds": [{"tag": "out:forward", "protocol": "freedom"}]
+            }).to_string();
+            crate::write_private(&root.join("xray.json"), &content).unwrap();
+            crate::write_private(&root.join(CONFIG_PREVIOUS_FILE), &content).unwrap();
+            crate::write_private(&root.join(CONFIG_GRANTS_FILE), "[]").unwrap();
+            crate::write_private(&root.join("grants.desired.json"), "[]").unwrap();
+            crate::write_private(&root.join("usage-generation"), "1").unwrap();
+            crate::apply_xray(&root.join("xray.json"), api).unwrap();
+            let (old, manifest, status) = observe_serving_handoff_generation(&root).unwrap();
+            let paused = handoff_rpc(
+                &manifest,
+                old.pid,
+                "pause",
+                status.epoch + 1,
+                "test-pre-candidate-pause",
+            )
+            .unwrap();
+            let runtime = XrayUpgradeRuntime {
+                source: if config_source {
+                    XrayUpgradeSource::ConfigDeployment {
+                        deployment_id: 77,
+                        claim_generation: 1,
+                    }
+                } else {
+                    XrayUpgradeSource::BinaryRelease
+                },
+                release_id: if config_source { -77 } else { 91 },
+                attempt: if config_source { 0 } else { 1 },
+                strategy: XrayReleaseStrategy::HandoffForce,
+                phase: XrayUpgradePhase::Switching,
+                old: upgrade_process(&paused, file_sha256_hex(&binary).unwrap()).unwrap(),
+                candidate: None,
+                drain_deadline_unix_secs: None,
+                blocked_reason: None,
+            };
+            super::write_upgrade_runtime(&root, &runtime).unwrap();
+            crate::signal_processes(&[old], libc::SIGSTOP).unwrap();
+            let started = Instant::now();
+            assert!(guard_interrupted_handoff(&root).unwrap());
+            assert!(started.elapsed() < Duration::from_secs(12));
+            let replacement = crate::serving_xray_process_in(&root).unwrap();
+            assert_ne!(replacement, old);
+            assert_eq!(crate::serving_xray_processes_in(&root), vec![replacement]);
+            assert_eq!(fs::read_to_string(root.join("xray.json")).unwrap(), content);
+            assert!(crate::xray_grpc::query_stats(api, "").is_ok());
+            assert!(read_upgrade_runtime(&root).unwrap().is_none());
+            if config_source {
+                assert!(
+                    !root.join(crash_recovery::RECOVERED_REPORT_FILE).exists(),
+                    "config manufactured binary receipt"
+                );
+            } else {
+                let stored: StoredReport = serde_json::from_slice(
+                    &fs::read(root.join(crash_recovery::RECOVERED_REPORT_FILE)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(stored.report.outcome, XrayReleaseOutcome::FailedRecovered);
+                assert!(!stored.report.performed_update);
+                assert_eq!(stored.report.running_sha256, Some(runtime.old.sha256));
+            }
+        }
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]

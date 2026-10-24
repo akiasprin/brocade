@@ -4,6 +4,7 @@ mod download;
 mod entry;
 mod paths;
 mod platform;
+mod upgrade;
 
 use access::AccessArgs;
 use anyhow::{bail, Context, Result};
@@ -46,6 +47,8 @@ enum LauncherCommand {
     Url(entry::UrlArgs),
     /// 显示 HTTP IP 入口，供安装器确认地址；不启动服务
     Address(AccessArgs),
+    /// 检查、备份并前向迁移既有数据库；供安装器 --upgrade 调用
+    UpgradeDatabase(upgrade::UpgradeDatabaseArgs),
 }
 
 #[derive(Debug, Args)]
@@ -105,6 +108,7 @@ async fn run(cli: Cli) -> Result<()> {
             println!("{}", args.resolve()?.public_url);
             Ok(())
         }
+        LauncherCommand::UpgradeDatabase(args) => upgrade::run(args).await,
     }
 }
 

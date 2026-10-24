@@ -91,19 +91,27 @@ const DUPLICATE_DATABASE: &str = "42P04";
 /// `template1` cannot be dropped at all, so the pair covers servers that have been tidied up.
 const MAINTENANCE_DATABASES: &[&str] = &["postgres", "template1"];
 
-// This repository deliberately has one squashed fresh-install schema (enforced by
-// schema_source_is_a_single_fresh_install_definition). Build the same embedded migration without
-// SQLx's proc-macro feature: that feature also compiles unused MySQL/RSA tooling into the host-side
-// build dependency graph.
-static MIGRATOR: LazyLock<sqlx::migrate::Migrator> = LazyLock::new(|| {
+// Embed every forward migration at build time: deployed Console binaries do not need a schema
+// directory. Avoid SQLx's proc-macro feature and its unused database-driver dependencies.
+const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] =
+    include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
+
+pub(crate) static MIGRATOR: LazyLock<sqlx::migrate::Migrator> = LazyLock::new(|| {
     let mut migrator = sqlx::migrate::Migrator::DEFAULT;
-    migrator.migrations = Cow::Owned(vec![sqlx::migrate::Migration::new(
-        1,
-        Cow::Borrowed("init"),
-        sqlx::migrate::MigrationType::Simple,
-        Cow::Borrowed(include_str!("../migrations/0001_init.sql")),
-        false,
-    )]);
+    migrator.migrations = Cow::Owned(
+        EMBEDDED_MIGRATIONS
+            .iter()
+            .map(|&(version, description, sql)| {
+                sqlx::migrate::Migration::new(
+                    version,
+                    Cow::Borrowed(description),
+                    sqlx::migrate::MigrationType::Simple,
+                    Cow::Borrowed(sql),
+                    sql.starts_with("-- no-transaction"),
+                )
+            })
+            .collect(),
+    );
     migrator
 });
 
@@ -253,7 +261,7 @@ impl PgStore {
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        MIGRATOR.run(&self.pool).await?;
+        self.migrate_database_schema().await?;
         admin::remove_public_sessions(&self.pool).await?;
         // Establish immutable model and subscription checkpoints before later initializers can
         // commit another model revision.
@@ -370,6 +378,30 @@ impl PgStore {
         request: crate::UpdateNodeTrafficRequest,
     ) -> Result<()> {
         traffic::update_node_traffic(&self.pool, actor, node_id, request).await
+    }
+
+    pub async fn update_node_traffic_limit(
+        &self,
+        actor: &AdminContext,
+        node: &str,
+        policy: brocade_deployment::traffic_limit::TrafficLimitPolicy,
+    ) -> Result<()> {
+        crate::traffic_limit::update_policy(&self.pool, actor, node, policy).await
+    }
+
+    pub async fn node_traffic_limit_desired(
+        &self,
+        node: &str,
+    ) -> Result<brocade_deployment::traffic_limit::TrafficLimitDesired> {
+        crate::traffic_limit::desired(&self.pool, node).await
+    }
+
+    pub async fn report_node_traffic_limit(
+        &self,
+        node: &str,
+        report: brocade_deployment::traffic_limit::TrafficLimitObservation,
+    ) -> Result<()> {
+        crate::traffic_limit::report(&self.pool, node, report).await
     }
 
     /// Operational live-traffic policy. It is durable, but neither reading nor writing it creates
@@ -1841,6 +1873,79 @@ impl PgStore {
         console::update_user_status(&self.pool, actor, tenant_id, user_id, request).await
     }
 
+    pub async fn acknowledge_user_traffic(&self, node: &str, hash: &str) -> Result<()> {
+        crate::user_traffic::acknowledge(&self.pool, node, hash).await
+    }
+    pub async fn user_traffic_assignments(
+        &self,
+        node: &str,
+    ) -> Result<brocade_deployment::user_traffic::UserTrafficSnapshot> {
+        crate::user_traffic::assignments(&self.pool, node).await
+    }
+    pub async fn user_traffic_policies(
+        &self,
+        actor: &AdminContext,
+        tenant: &str,
+        user: &str,
+    ) -> Result<Vec<brocade_deployment::user_traffic::UserTrafficPolicyView>> {
+        crate::user_traffic::views(&self.pool, actor, tenant, user).await
+    }
+    pub async fn update_user_traffic_policy(
+        &self,
+        actor: &AdminContext,
+        tenant: &str,
+        user: &str,
+        kind: brocade_deployment::user_traffic::UserTrafficKind,
+        app: Option<&str>,
+        policy: brocade_deployment::user_traffic::UserTrafficPolicy,
+    ) -> Result<Vec<brocade_deployment::user_traffic::UserTrafficPolicyView>> {
+        crate::user_traffic::update(&self.pool, actor, tenant, user, kind, app, policy).await
+    }
+    pub async fn enforce_user_traffic_policies(&self) -> Result<usize> {
+        crate::user_traffic::enforce(&self.pool).await
+    }
+    pub async fn report_user_traffic_support(&self, node: &str, supported: bool) -> Result<bool> {
+        crate::user_traffic::support(&self.pool, node, supported).await
+    }
+    pub async fn user_traffic_budget(
+        &self,
+        node: &str,
+        request: brocade_deployment::user_traffic::UserBudgetRequest,
+    ) -> Result<brocade_deployment::user_traffic::UserBudgetGrant> {
+        crate::user_traffic::budget(&self.pool, node, request).await
+    }
+
+    pub async fn update_user_service_policy(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+        policy: crate::UserServicePolicyWrite,
+    ) -> Result<crate::UserListItem> {
+        crate::user_service::update(&self.pool, actor, tenant_id, user_id, policy).await
+    }
+
+    pub async fn preview_user_service_policy(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+        policy: &crate::UserServicePolicyWrite,
+    ) -> Result<crate::UserServicePolicyPreview> {
+        crate::user_service::preview(&self.pool, actor, tenant_id, user_id, policy).await
+    }
+
+    pub async fn enforce_user_service_periods(&self) -> Result<usize> {
+        crate::user_service::enforce(&self.pool).await
+    }
+
+    pub async fn list_user_cycle_usage(
+        &self,
+        actor: &AdminContext,
+    ) -> Result<crate::UserCycleUsage> {
+        crate::user_service::cycle_usage(&self.pool, actor).await
+    }
+
     pub async fn upsert_grant(
         &self,
         actor: &AdminContext,
@@ -2796,6 +2901,7 @@ impl PgStore {
 #[cfg(test)]
 mod tests {
     use sha2::{Digest, Sha384};
+    use sqlx::migrate::MigrationSource;
 
     use super::MIGRATOR;
 
@@ -2808,5 +2914,24 @@ mod tests {
         let source_checksum = Sha384::digest(include_bytes!("../migrations/0001_init.sql"));
 
         assert_eq!(migration.checksum.as_ref(), source_checksum.as_slice());
+    }
+
+    #[tokio::test]
+    async fn embedded_migrations_match_every_source_file() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let expected = directory.resolve().await.unwrap();
+        let embedded = MIGRATOR.iter().collect::<Vec<_>>();
+        assert!(!expected.is_empty());
+        assert_eq!(embedded.len(), expected.len());
+        for (actual, expected) in embedded.iter().zip(expected) {
+            assert_eq!(actual.version, expected.version);
+            assert_eq!(actual.description, expected.description);
+            assert_eq!(actual.migration_type, expected.migration_type);
+            assert_eq!(actual.sql, expected.sql);
+            assert_eq!(actual.checksum, expected.checksum);
+            assert_eq!(actual.no_tx, expected.no_tx);
+        }
+        assert!(MIGRATOR.locking);
+        assert!(!MIGRATOR.ignore_missing);
     }
 }

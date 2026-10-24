@@ -54,7 +54,7 @@ export function createMockProbeTransport(initial: ForwardingOverview, initialOut
       entry?.listen_port_end,
       entry?.max_rules,
       entry?.allow_private_targets,
-      entry?.monthly_limit_bytes,
+      entry?.cycle_limit_bytes,
       entry?.quota_suspended,
     ]);
     return { rule, entry, signature };

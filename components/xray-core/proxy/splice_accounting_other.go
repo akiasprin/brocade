@@ -2,6 +2,11 @@
 
 package proxy
 
-import "net"
+import (
+	"context"
+	"net"
+)
 
-func copyAccountedSplice(net.Conn, *net.TCPConn, func(int64)) (bool, error) { return false, nil }
+func copyAccountedSplice(context.Context, net.Conn, *net.TCPConn, func(int64)) (bool, error) {
+	return false, nil
+}

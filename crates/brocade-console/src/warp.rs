@@ -951,6 +951,7 @@ mod tests {
                 egress_outbounds: Vec::new(),
                 egress_dns: Vec::new(),
                 external_outbounds: vec![XrayExternalOutboundPlan {
+                    target_strategy: None,
                     tag: "out:external/warp-live-e2e".to_owned(),
                     address,
                     port,

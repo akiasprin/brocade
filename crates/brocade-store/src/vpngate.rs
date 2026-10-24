@@ -54,7 +54,6 @@ const PROBE_SHARD_ROTATION_MIN_SECS: u32 = 60 * 60;
 const PROBE_SHARD_ROTATION_MAX_SECS: u32 = 7 * 24 * 60 * 60;
 const FAILED_CANDIDATE_GRACE_SECS: i32 = 20 * 60;
 const MAX_CONSECUTIVE_PROBE_FAILURES: i32 = 3;
-const HISTORY_PRUNE_BATCH_ROWS: i64 = 50_000;
 const UNKNOWN_COUNTRY_CODE: &str = "ZZ";
 const MANUAL_SWITCH_COOLDOWN_SECS: u32 = 10 * 60;
 
@@ -1741,34 +1740,37 @@ pub async fn runtime_views(
                        sample.ip_networks,
                        sample.error_code, sample.error_detail,
                        sample.probed_at
-                  FROM vpngate_probe_samples sample
+                  FROM vpngate_runtime_evidence sample
                  WHERE sample.node_id = state.node_id
                    AND sample.outbound_id = state.outbound_id
                    AND sample.server_id = state.active_server_id
-                 ORDER BY sample.probed_at DESC, sample.id DESC
+                   AND sample.evidence_kind = 'latest'
+                 ORDER BY sample.probed_at DESC, sample.sample_id DESC
                  LIMIT 1
            ) latest ON TRUE
            LEFT JOIN LATERAL (
                 SELECT sample.exit_ip, sample.exit_country_code,
                        sample.connect_ms, sample.download_bps,
                        sample.ip_scores, sample.ip_networks, sample.probed_at
-                  FROM vpngate_probe_samples sample
+                  FROM vpngate_runtime_evidence sample
                  WHERE sample.node_id = state.node_id
                    AND sample.outbound_id = state.outbound_id
                    AND sample.server_id = state.active_server_id
+                   AND sample.evidence_kind = 'success'
                    AND sample.status = 'succeeded'
-                 ORDER BY sample.probed_at DESC, sample.id DESC
+                 ORDER BY sample.probed_at DESC, sample.sample_id DESC
                  LIMIT 1
            ) last_success ON TRUE
            LEFT JOIN LATERAL (
                 SELECT sample.connect_ms
-                  FROM vpngate_probe_samples sample
+                  FROM vpngate_runtime_evidence sample
                  WHERE sample.node_id = state.node_id
                    AND sample.outbound_id = state.outbound_id
                    AND sample.server_id = state.active_server_id
+                   AND sample.evidence_kind = 'connect'
                    AND sample.status = 'succeeded'
                    AND sample.connect_ms > 0
-                 ORDER BY sample.probed_at DESC, sample.id DESC
+                 ORDER BY sample.probed_at DESC, sample.sample_id DESC
                  LIMIT 1
            ) last_connect ON TRUE
            LEFT JOIN vpngate_exit_reputations reputation
@@ -3395,6 +3397,11 @@ pub async fn agent_desired_with_probe_origins(
     Ok(Some(VpngateDesiredState {
         topology_revision,
         catalog_generation,
+        health_probe_url: Some(
+            sqlx::query_scalar("SELECT probe_endpoint_url FROM control_state WHERE id = TRUE")
+                .fetch_one(pool)
+                .await?,
+        ),
         admission_policy,
         pools: desired_pools,
         probe_assignments,
@@ -3893,8 +3900,8 @@ async fn candidate_by_id(
                           AND sample.last_success_probed_at IS NOT NULL
                        UNION ALL
                        SELECT sample.node_id, sample.exit_ip, sample.probed_at
-                         FROM vpngate_probe_samples sample
-                        WHERE sample.server_id = server.id
+                         FROM vpngate_runtime_evidence sample
+                        WHERE sample.evidence_kind = 'success' AND sample.server_id = server.id
                           AND sample.profile_sha256 = profile.sha256
                           AND sample.status = 'succeeded'
                   ) evidence
@@ -4307,11 +4314,11 @@ async fn record_report_samples_tx(
             // omit only this sample; replaceable runtime state is still accepted below.
             sqlx::query_scalar::<_, i32>(
                 "SELECT connect_ms
-                   FROM vpngate_probe_samples
-                  WHERE node_id = $1 AND outbound_id = $2
+                   FROM vpngate_runtime_evidence
+                  WHERE evidence_kind = 'connect' AND node_id = $1 AND outbound_id = $2
                     AND server_id = $3 AND profile_sha256 = $4
                     AND status = 'succeeded' AND connect_ms > 0
-                  ORDER BY probed_at DESC, id DESC
+                  ORDER BY probed_at DESC, sample_id DESC
                   LIMIT 1",
             )
             .bind(node_id)
@@ -4347,14 +4354,39 @@ async fn record_report_samples_tx(
             }
             None => (None, Vec::new(), Vec::new()),
         };
-        let affected = sqlx::query(
-            "INSERT INTO vpngate_probe_samples
+        let affected = sqlx::query_scalar::<_, i64>(
+            "WITH inserted AS (INSERT INTO vpngate_probe_samples
                 (node_id, outbound_id, topology_revision, catalog_generation, server_id,
                  profile_sha256, status, exit_ip, exit_country_code, connect_ms, download_bps,
                  ip_scores, ip_networks, error_code, error_detail, probed_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8::inet, $9, $10, $11, $12, $13,
                      $14, $15, to_timestamp($16::double precision))
-             ON CONFLICT (node_id, outbound_id, server_id, profile_sha256, probed_at) DO NOTHING",
+             ON CONFLICT (node_id, outbound_id, server_id, profile_sha256, probed_at) DO NOTHING
+             RETURNING *), projected AS (
+                 INSERT INTO vpngate_runtime_evidence (sample_id, node_id, outbound_id, topology_revision, catalog_generation, server_id, profile_sha256, status, exit_ip, exit_country_code, connect_ms, download_bps, ip_scores, ip_networks, error_code, error_detail, probed_at, received_at, evidence_kind)
+                 SELECT sample.id, sample.node_id, sample.outbound_id, sample.topology_revision, sample.catalog_generation, sample.server_id, sample.profile_sha256, sample.status, sample.exit_ip, sample.exit_country_code, sample.connect_ms, sample.download_bps, sample.ip_scores, sample.ip_networks, sample.error_code, sample.error_detail, sample.probed_at, sample.received_at, kind.name FROM inserted sample
+                 CROSS JOIN (VALUES ('latest'), ('success'), ('connect')) kind(name)
+                 WHERE kind.name = 'latest'
+                    OR (sample.status = 'succeeded' AND (kind.name = 'success' OR sample.connect_ms > 0))
+                 ON CONFLICT (node_id, outbound_id, server_id, profile_sha256, evidence_kind) DO UPDATE SET
+                    sample_id = EXCLUDED.sample_id,
+                    topology_revision = EXCLUDED.topology_revision,
+                    catalog_generation = EXCLUDED.catalog_generation,
+                    status = EXCLUDED.status,
+                    exit_ip = EXCLUDED.exit_ip,
+                    exit_country_code = EXCLUDED.exit_country_code,
+                    connect_ms = EXCLUDED.connect_ms,
+                    download_bps = EXCLUDED.download_bps,
+                    ip_scores = EXCLUDED.ip_scores,
+                    ip_networks = EXCLUDED.ip_networks,
+                    error_code = EXCLUDED.error_code,
+                    error_detail = EXCLUDED.error_detail,
+                    probed_at = EXCLUDED.probed_at,
+                    received_at = EXCLUDED.received_at
+                 WHERE (EXCLUDED.probed_at, EXCLUDED.sample_id) >
+                       (vpngate_runtime_evidence.probed_at, vpngate_runtime_evidence.sample_id)
+                 RETURNING 1
+             ) SELECT count(*) FROM inserted",
         )
         .bind(node_id)
         .bind(&report.outbound_id)
@@ -4388,10 +4420,10 @@ async fn record_report_samples_tx(
                 .map(|value| bounded(value, MAX_ERROR_DETAIL_CHARS)),
         )
         .bind(sample.probed_at_unix_secs)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected();
-        accepted_samples = accepted_samples.saturating_add(u32::try_from(affected).unwrap_or(1));
+        .fetch_one(&mut **tx)
+        .await?;
+        accepted_samples +=
+            u32::try_from(affected).expect("one inserted sample is zero or one row");
     }
     Ok(accepted_samples)
 }
@@ -4754,65 +4786,19 @@ pub(crate) async fn prune_history_hours(
     candidate_retain_hours: u32,
     observation_retain_hours: u32,
 ) -> Result<u64> {
-    let candidate_retain_secs =
-        i64::from(candidate_retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
-    let observation_retain_secs =
-        i64::from(observation_retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
-    let mut tx = pool.begin().await?;
-    let candidate_rows = sqlx::query_scalar::<_, i64>(
-        "WITH expired AS MATERIALIZED (
-             SELECT ctid
-               FROM vpngate_candidate_probe_samples
-              WHERE received_at < now() - make_interval(secs => $1::double precision)
-              LIMIT $2
-         ), deleted AS (
-             DELETE FROM vpngate_candidate_probe_samples history
-              USING expired
-              WHERE history.ctid = expired.ctid
-              RETURNING 1
-         )
-         SELECT count(*) FROM deleted",
+    let candidate = crate::retention::cleanup::prune_batch(
+        pool,
+        "vpngate_candidate_probe_samples",
+        candidate_retain_hours,
     )
-    .bind(candidate_retain_secs)
-    .bind(HISTORY_PRUNE_BATCH_ROWS)
-    .fetch_one(&mut *tx)
     .await?;
-    let (observation_rows, retained_observation_rows) = sqlx::query_as::<_, (i64, i64)>(
-        "WITH expired AS MATERIALIZED (
-             SELECT ctid
-               FROM vpngate_server_observations
-              WHERE observed_at < now() - make_interval(secs => $1::double precision)
-              LIMIT $2
-         ), deleted AS (
-             DELETE FROM vpngate_server_observations history
-              USING expired
-              WHERE history.ctid = expired.ctid
-              RETURNING history.country_code
-         )
-         SELECT count(*), count(*) FILTER (WHERE country_code <> $3) FROM deleted",
+    let observation = crate::retention::cleanup::prune_batch(
+        pool,
+        "vpngate_server_observations",
+        observation_retain_hours,
     )
-    .bind(observation_retain_secs)
-    .bind(HISTORY_PRUNE_BATCH_ROWS)
-    .bind(UNKNOWN_COUNTRY_CODE)
-    .fetch_one(&mut *tx)
     .await?;
-    sqlx::query(
-        "UPDATE vpngate_catalog_state
-            SET retained_observation_count = GREATEST(
-                    retained_observation_count - $1,
-                    0
-                )
-          WHERE id = TRUE",
-    )
-    .bind(retained_observation_rows)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    let removed = candidate_rows
-        .checked_add(observation_rows)
-        .ok_or_else(|| StoreError::InvalidData("VPN Gate prune count overflow".to_owned()))?;
-    u64::try_from(removed)
-        .map_err(|_| StoreError::InvalidData("negative VPN Gate prune count".to_owned()))
+    Ok(candidate + observation)
 }
 
 async fn upsert_candidate_latest(

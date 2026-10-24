@@ -88,17 +88,42 @@ mod node_initialization_tests;
 #[path = "cases/online_source_defaults.rs"]
 mod online_source_defaults_tests;
 
+#[path = "cases/ping_probe_recovery.rs"]
+mod ping_probe_recovery_tests;
+
 #[path = "cases/unattended_deployment.rs"]
 mod unattended_deployment_tests;
+
+#[path = "cases/desired_delivery.rs"]
+mod desired_delivery_tests;
 
 #[path = "cases/xray_handoff_beta.rs"]
 mod xray_handoff_beta_tests;
 
+#[path = "cases/forwarding_authorization.rs"]
+mod forwarding_authorization_tests;
+#[path = "cases/forwarding_lock_order.rs"]
+mod forwarding_lock_order_tests;
 #[path = "cases/forwarding_quota.rs"]
 mod forwarding_quota_tests;
+#[path = "cases/forwarding_rule_results.rs"]
+mod forwarding_rule_results_tests;
+#[path = "cases/forwarding_target_policy.rs"]
+mod forwarding_target_policy_tests;
+#[path = "cases/forwarding_total_removal.rs"]
+mod forwarding_total_removal_tests;
 
 #[path = "cases/validation_limits.rs"]
 mod validation_limits_tests;
+
+#[path = "cases/retention.rs"]
+mod retention_tests;
+
+#[path = "cases/migrations.rs"]
+mod migration_tests;
+
+#[path = "cases/upgrade.rs"]
+mod upgrade_tests;
 
 #[path = "cases/node_outflow.rs"]
 mod node_outflow_tests;
@@ -112,8 +137,17 @@ mod node_inflow_source_tests;
 #[path = "cases/node_traffic_history.rs"]
 mod node_traffic_history_tests;
 
+#[path = "cases/usage_retired_counters.rs"]
+mod usage_retired_counter_tests;
+
 #[path = "cases/deployment_artifact_preview.rs"]
 mod deployment_artifact_preview_tests;
+
+#[path = "cases/machine_traffic_limit.rs"]
+mod machine_traffic_limit_tests;
+
+#[path = "cases/user_service.rs"]
+mod user_service_tests;
 
 impl TestPg {
     async fn start_if_enabled() -> Option<Self> {
@@ -1359,6 +1393,7 @@ async fn tenant_creation_adds_exactly_one_default_warp_in_the_same_revision() {
             &system_admin(),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
+                    target_strategy: None,
                     id: "warp".to_owned(),
                     tenant_id: "platform.acme".to_owned(),
                     name: "Legacy WARP".to_owned(),
@@ -1398,6 +1433,7 @@ async fn external_outbound_round_trips_sealed_and_redacted() {
     insert_minimal_fixture(db.pool()).await;
 
     let request = UpsertExternalOutboundRequest {
+        target_strategy: None,
         id: "custom-1111-1111".to_owned(),
         tenant_id: "platform.acme".to_owned(),
         name: "Vendor edge".to_owned(),
@@ -1575,6 +1611,101 @@ async fn external_outbound_round_trips_sealed_and_redacted() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn external_outbound_target_strategy_preserves_drafts_history_and_remote_default() {
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let request: UpsertExternalOutboundRequest = serde_json::from_value(serde_json::json!({
+        "id": "custom-abcd-1234", "tenant_id": "platform.acme", "name": "AnyTLS test",
+        "address": "edge.example.com", "port": 443,
+        "protocol": { "t": "anytls", "v": { "credential": "test-only-password" } },
+        "security": { "t": "tls", "v": { "server_name": "edge.example.com", "fingerprint": "chrome" } }
+    })).unwrap();
+    assert!(request.target_strategy.is_none());
+    let committed = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::UpsertExternalOutbound {
+                outbound: request.clone(),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    let mut change = request;
+    change.target_strategy = Some(brocade_core::model::DomainStrategy::UseIpv4v6);
+    change.protocol.set_credential("<redacted>".to_owned());
+    let preview = db
+        .store
+        .preview_draft(
+            &system_admin(),
+            vec![ModelOp::UpsertExternalOutbound {
+                outbound: change.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        preview.snapshot.snapshot["external_outbounds"][0]["target_strategy"],
+        "use_ipv4v6"
+    );
+    assert!(db
+        .store
+        .materialize_snapshot(None)
+        .await
+        .unwrap()
+        .external_outbounds[0]
+        .target_strategy
+        .is_none());
+    for strategy in [
+        Some(brocade_core::model::DomainStrategy::UseIpv4v6),
+        Some(brocade_core::model::DomainStrategy::UseIpv6v4),
+        None,
+    ] {
+        change.target_strategy = strategy;
+        let result = db
+            .store
+            .apply_draft(
+                &system_admin(),
+                vec![ModelOp::UpsertExternalOutbound {
+                    outbound: change.clone(),
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        for revision in [None, Some(result.revision_id)] {
+            let snapshot = db.store.materialize_snapshot(revision).await.unwrap();
+            assert_eq!(snapshot.external_outbounds[0].target_strategy, strategy);
+            assert_eq!(
+                snapshot.external_outbounds[0].protocol.credential(),
+                "test-only-password"
+            );
+        }
+        let legacy = db
+            .store
+            .materialize_snapshot(Some(committed.revision_id))
+            .await
+            .unwrap();
+        assert!(legacy.external_outbounds[0].target_strategy.is_none());
+    }
+    let invalid = sqlx::query("UPDATE external_outbounds SET target_strategy = 'unsupported' WHERE id = 'custom-abcd-1234'")
+        .execute(db.pool()).await;
+    assert!(
+        invalid.is_err(),
+        "the database must reject unknown strategy values"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn managed_warp_binding_round_trips_sealed_and_redacted() {
     std::env::set_var(
         brocade_store::secrets::SECRET_KEY_ENV,
@@ -1591,6 +1722,7 @@ async fn managed_warp_binding_round_trips_sealed_and_redacted() {
             &system_admin(),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
+                    target_strategy: None,
                     id: "warp-8f3a-2d71".to_owned(),
                     tenant_id: "platform.acme".to_owned(),
                     name: "Cloudflare WARP".to_owned(),
@@ -1797,6 +1929,7 @@ async fn managed_warp_removal_waits_until_current_and_published_routes_are_clear
             &system_admin(),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
+                    target_strategy: None,
                     id: "warp-8f3a-2d71".to_owned(),
                     tenant_id: "platform.acme".to_owned(),
                     name: "Cloudflare WARP".to_owned(),
@@ -1995,6 +2128,7 @@ async fn external_vless_xhttp_round_trips() {
     insert_minimal_fixture(db.pool()).await;
 
     let request = UpsertExternalOutboundRequest {
+        target_strategy: None,
         id: "custom-2222-2222".to_owned(),
         tenant_id: "platform.acme".to_owned(),
         name: "XHTTP edge".to_owned(),
@@ -2018,6 +2152,7 @@ async fn external_vless_xhttp_round_trips() {
                     address: "download.vendor.example".to_owned(),
                     port: 8443,
                     security: ExternalOutboundSecurity::Tls {
+                        allow_insecure: false,
                         alpn: vec!["h2".to_owned()],
                         ech_config_list: Some("download-ech".to_owned()),
                         pinned_peer_cert_sha256: Some("11".repeat(32)),
@@ -3961,6 +4096,7 @@ async fn front_save_updates_subscriptions_without_creating_a_deployment() {
             &system_admin(),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
+                    target_strategy: None,
                     id: "custom-3333-3333".to_owned(),
                     tenant_id: "platform.acme".to_owned(),
                     name: "测试供应商".to_owned(),
@@ -3974,6 +4110,7 @@ async fn front_save_updates_subscriptions_without_creating_a_deployment() {
                         transport: ExternalVlessTransport::Raw,
                     },
                     security: ExternalOutboundSecurity::Tls {
+                        allow_insecure: false,
                         alpn: Vec::new(),
                         ech_config_list: None,
                         pinned_peer_cert_sha256: None,
@@ -6122,6 +6259,61 @@ async fn xray_handoff_release_requires_live_readiness_and_freezes_its_strategy()
     assert_eq!(forced.status, XrayReleaseStatus::Succeeded);
     assert_eq!(forced.targets[0].reported_forced_retirement, Some(true));
     assert!(!forced.targets[0].recovered_after_dirty);
+    // v40 Agents can safely choose an explicit restart fallback at execution time. Older
+    // Agents still need a ready handoff runtime; the approved strategy remains immutable.
+    sqlx::query("UPDATE node_agent_state SET agent_protocol_version = 40,
+        runtime_versions = jsonb_set(runtime_versions, '{xray_handoff}', '{\"state\":\"blocked\"}'::jsonb)
+        WHERE node_id = 'n1'")
+        .execute(db.pool()).await.unwrap();
+    let fallback_release = db
+        .store
+        .create_xray_release(
+            &system_admin(),
+            CreateXrayReleaseRequest {
+                idempotency_key: "handoff-v40-restart-fallback".to_owned(),
+                release_id: build_id.clone(),
+                nodes: vec!["n1".to_owned()],
+                note: None,
+                xray_strategy: XrayReleaseStrategy::HandoffForce,
+                xray_drain_timeout_secs: Some(30),
+            },
+            build,
+        )
+        .await
+        .unwrap();
+    let fallback_offer = db
+        .store
+        .claim_xray_release("n1", "x86_64", &build_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let wanted = "2".repeat(64);
+    let fallback_reason = "平滑条件不足，降级直接重启已完成：服务进程没有代际 manifest";
+    db.store
+        .report_xray_release(
+            "n1",
+            &XrayReleaseReport {
+                release_id: fallback_release.id,
+                attempt: fallback_offer.attempt,
+                outcome: XrayReleaseOutcome::Succeeded,
+                performed_update: true,
+                strategy: XrayReleaseStrategy::HandoffForce,
+                forced_retirement: false,
+                xray_enabled: true,
+                installed_sha256: Some(wanted.clone()),
+                running_sha256: Some(wanted),
+                error: Some(fallback_reason.to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    let fallback = db.store.xray_release(fallback_release.id).await.unwrap();
+    assert_eq!(fallback.status, XrayReleaseStatus::Succeeded);
+    assert_eq!(fallback.targets[0].error.as_deref(), Some(fallback_reason));
+    assert_eq!(
+        fallback.xray_strategy,
+        Some(XrayReleaseStrategy::HandoffForce)
+    );
 }
 
 #[tokio::test]
@@ -13717,9 +13909,17 @@ async fn claim_desired_uses_dispatch_lease_before_reclaiming_stale_target() {
         .await
         .unwrap();
 
-    let first = db.store.claim_desired_for_node("n1").await.unwrap();
+    let first = db
+        .store
+        .claim_desired_for_node_with_protocol("n1", 38)
+        .await
+        .unwrap();
     assert!(first.is_some(), "first claim should dispatch the target");
-    let duplicate = db.store.claim_desired_for_node("n1").await.unwrap();
+    let duplicate = db
+        .store
+        .claim_desired_for_node_with_protocol("n1", 38)
+        .await
+        .unwrap();
     assert!(
         duplicate.is_none(),
         "an unexpired dispatch lease must not be handed out twice"
@@ -13735,7 +13935,11 @@ async fn claim_desired_uses_dispatch_lease_before_reclaiming_stale_target() {
     .await
     .unwrap();
 
-    let reclaimed = db.store.claim_desired_for_node("n1").await.unwrap();
+    let reclaimed = db
+        .store
+        .claim_desired_for_node_with_protocol("n1", 38)
+        .await
+        .unwrap();
     assert!(
         reclaimed.is_some(),
         "an expired dispatch lease should be claimable again"
@@ -23974,13 +24178,16 @@ async fn isolated_grants_wait_for_an_in_flight_config_obligation() {
         .deployment_id
         .expect("the newer grants generation must be durable");
 
-    assert!(
-        db.store
-            .claim_desired_for_node("n1")
-            .await
-            .unwrap()
-            .is_none(),
-        "grants must not be handed out while the config claim is in flight"
+    let replay = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(replay).unwrap(),
+        serde_json::to_value(&config_claim).unwrap(),
+        "only the frozen config may replay while its grants obligation waits"
     );
     db.store
         .report_target_result(applied_report(&config_claim))
@@ -24885,7 +25092,10 @@ async fn machine_presence_transitions_are_deduplicated_and_deliverable() {
     assert_eq!(events.events[1].event_kind, "node_offline");
     assert!(events.events[1].last_contact_at.is_some());
     assert_eq!(events.events[2].previous_value.as_deref(), Some("waiting"));
-    assert_eq!(events.unread_count, 3);
+    assert_eq!(
+        events.unread_count, 2,
+        "initial online observations stay quiet"
+    );
     assert_eq!(
         db.store
             .mark_machine_events_read(&system_admin(), events.latest_event_id)
@@ -24980,6 +25190,146 @@ async fn machine_presence_transitions_are_deduplicated_and_deliverable() {
         after_retiring_poll, 3,
         "teardown polling is not a recovery notification"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn machine_notification_badges_ignore_ip_history_and_initial_online_observations() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('outside', 'Outside')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let system = system_admin();
+    sqlx::query(
+        "INSERT INTO admin_operators (id, display_name, role, tenant_scope, password_hash) VALUES
+         ($1, 'System', 'system-admin', NULL, 'fixture'),
+         ('bell-viewer', 'Viewer', 'readonly', 'platform.acme', 'fixture'),
+         ('bell-outside', 'Outside', 'readonly', 'outside', 'fixture')",
+    )
+    .bind(system.operator_id())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let viewer = AdminContext::new(
+        "bell-viewer",
+        AdminRole::Readonly,
+        Some("platform.acme".to_owned()),
+    );
+    let outside = AdminContext::new(
+        "bell-outside",
+        AdminRole::Readonly,
+        Some("outside".to_owned()),
+    );
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "INSERT INTO machine_events (node_id, event_kind, previous_value, current_value,
+             family, last_contact_at, incident_started_at, metric_value, metric_peak_value,
+             metric_threshold, occurred_at)
+         SELECT 'n1', kind, previous, current,
+             CASE WHEN kind = 'public_ip_changed' THEN 4 END,
+             CASE WHEN kind = 'node_offline' THEN now() - interval '100 seconds' END,
+             CASE WHEN kind IN ('cpu_steal_started','cpu_steal_recovered') THEN now() - interval '60 seconds' END,
+             CASE WHEN kind = 'cpu_steal_started' THEN 15 WHEN kind = 'cpu_steal_recovered' THEN 3 END,
+             CASE WHEN kind IN ('cpu_steal_started','cpu_steal_recovered') THEN 20 END,
+             CASE WHEN kind IN ('cpu_steal_started','cpu_steal_recovered') THEN 10 END,
+             now()
+         FROM (VALUES
+             ('public_ip_changed', '198.51.100.1', '203.0.113.1'),
+             ('node_online', 'waiting', 'online'),
+             ('node_offline', 'online', 'offline'),
+             ('node_online', 'offline', 'online'),
+             ('cpu_steal_started', 'normal', 'active'),
+             ('cpu_steal_recovered', 'active', 'normal'),
+             ('public_ip_changed', '203.0.113.1', '198.51.100.2')
+         ) fixture(kind, previous, current) RETURNING id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(ids.len(), 7);
+    for actor in [&system, &viewer] {
+        let page = db.store.machine_events(actor, 1).await.unwrap();
+        assert_eq!(page.latest_event_id, ids[6]);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event_kind, "public_ip_changed");
+        assert_eq!(
+            page.unread_count, 4,
+            "badge counts cannot depend on the bounded event page"
+        );
+        db.store
+            .mark_machine_events_read(actor, ids[5])
+            .await
+            .unwrap();
+        let read = db.store.machine_events(actor, 1).await.unwrap();
+        assert_eq!(
+            read.unread_count, 0,
+            "a newer IP change must not relight the bell"
+        );
+        assert_eq!(read.latest_event_id, ids[6]);
+    }
+    assert_eq!(
+        db.store
+            .machine_events(&outside, 1)
+            .await
+            .unwrap()
+            .unread_count,
+        0
+    );
+
+    let quiet_ids: Vec<i64> = sqlx::query_scalar(
+        "INSERT INTO machine_events (node_id, event_kind, family, previous_value, current_value, occurred_at) VALUES
+         ('n1', 'public_ip_changed', 4, '198.51.100.2', '203.0.113.2', now()),
+         ('n1', 'node_online', NULL, 'waiting', 'online', now()) RETURNING id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(quiet_ids.len(), 2);
+    for actor in [&system, &viewer] {
+        let quiet = db.store.machine_events(actor, 1).await.unwrap();
+        assert_eq!(quiet.latest_event_id, quiet_ids[1]);
+        assert_eq!(quiet.unread_count, 0);
+    }
+    let offline_id: i64 = sqlx::query_scalar(
+        "INSERT INTO machine_events (node_id, event_kind, previous_value, current_value, last_contact_at, occurred_at)
+         VALUES ('n1', 'node_offline', 'online', 'offline', now() - interval '100 seconds', now()) RETURNING id",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    for actor in [&system, &viewer] {
+        assert_eq!(
+            db.store
+                .machine_events(actor, 1)
+                .await
+                .unwrap()
+                .unread_count,
+            1
+        );
+    }
+    db.store
+        .clear_machine_events(&system, offline_id)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO machine_events (node_id, event_kind, previous_value, current_value, occurred_at)
+         VALUES ('n1', 'node_online', 'offline', 'online', now())",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    for actor in [&system, &viewer] {
+        let recovered = db.store.machine_events(actor, 1).await.unwrap();
+        assert_eq!(
+            recovered.unread_count, 1,
+            "real recovery after a clear still needs attention"
+        );
+        assert_eq!(recovered.events[0].event_kind, "node_online");
+    }
 }
 
 #[tokio::test]
@@ -25451,6 +25801,7 @@ async fn forwarding_authorization_reconcile_and_usage_are_durable() {
             .record_forwarding_reconcile(
                 "n1",
                 ForwardingReconcileReport {
+                    rule_results: None,
                     generation: desired.generation,
                     applied_rule_ids: vec![],
                     error: None,
@@ -25463,6 +25814,7 @@ async fn forwarding_authorization_reconcile_and_usage_are_durable() {
         .record_forwarding_reconcile(
             "n1",
             ForwardingReconcileReport {
+                rule_results: None,
                 generation: desired.generation,
                 applied_rule_ids: vec![rule_id, udp_rule_id],
                 error: None,
@@ -25569,6 +25921,7 @@ async fn forwarding_authorization_reconcile_and_usage_are_durable() {
         .is_empty());
     let revoked = db.store.forwarding_desired_for_node("n1").await.unwrap();
     let residual = ForwardingReconcileReport {
+        rule_results: None,
         generation: revoked.generation,
         applied_rule_ids: vec![rule_id, udp_rule_id],
         error: Some("rule removal failed; retrying next round".to_owned()),
@@ -25601,6 +25954,7 @@ async fn forwarding_authorization_reconcile_and_usage_are_durable() {
         .record_forwarding_reconcile(
             "n1",
             ForwardingReconcileReport {
+                rule_results: None,
                 generation: revoked.generation,
                 applied_rule_ids: vec![],
                 error: None,
@@ -25999,6 +26353,8 @@ async fn forwarding_traffic_integrates_users_machines_and_survives_lifecycle() {
         rx_bytes,
         tx_bytes,
         discontinuities: 0,
+        sampled_at_unix_secs: None,
+        day_boundaries: Vec::new(),
     };
     db.store
         .record_node_traffic("n1", now - 5, &reading(1, 0, 0))
@@ -27504,6 +27860,7 @@ async fn proxy_outbound_anytls_and_deletion_are_sealed_scoped_and_reference_safe
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
     let request = UpsertExternalOutboundRequest {
+        target_strategy: None,
         id: "custom-4444-4444".to_owned(),
         tenant_id: "platform.acme".to_owned(),
         name: "AnyTLS Proxy".to_owned(),
@@ -27513,6 +27870,7 @@ async fn proxy_outbound_anytls_and_deletion_are_sealed_scoped_and_reference_safe
             credential: "anytls-secret".to_owned(),
         },
         security: ExternalOutboundSecurity::Tls {
+            allow_insecure: true,
             alpn: Vec::new(),
             ech_config_list: None,
             pinned_peer_cert_sha256: None,
@@ -27539,6 +27897,7 @@ async fn proxy_outbound_anytls_and_deletion_are_sealed_scoped_and_reference_safe
         .find(|o| o.id == request.id)
         .unwrap();
     assert_eq!(proxy.protocol, request.protocol);
+    assert_eq!(proxy.security, request.security);
     let sealed: String =
         sqlx::query_scalar("SELECT credential_sealed FROM external_outbounds WHERE id = $1")
             .bind(&request.id)
@@ -27559,6 +27918,7 @@ async fn proxy_outbound_anytls_and_deletion_are_sealed_scoped_and_reference_safe
         .find(|o| o["id"] == request.id)
         .unwrap();
     assert_eq!(value["protocol"]["v"]["credential"], "<redacted>");
+    assert_eq!(value["security"]["v"]["allow_insecure"], true);
     let mut update = request.clone();
     update.protocol.set_credential("<redacted>".to_owned());
     update.name = "Updated".to_owned();
@@ -27970,6 +28330,8 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
         rx_bytes,
         tx_bytes,
         discontinuities,
+        sampled_at_unix_secs: None,
+        day_boundaries: Vec::new(),
     };
 
     // First absolute reading is a baseline. Only later monotonic differences enter the ledger.
@@ -29608,3 +29970,9 @@ async fn node_site_usage_reads_one_machine_across_users_in_scope() {
         ));
     }
 }
+
+#[path = "cases/user_traffic.rs"]
+mod user_traffic_tests;
+
+#[path = "cases/source_access.rs"]
+mod source_access_tests;

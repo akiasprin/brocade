@@ -20,4 +20,15 @@ message Config {
 
   bool follow_redirect = 5;
   uint32 user_level = 6;
+  ForwardingTargetPolicy forwarding_target_policy = 8;
 }
+
+// Only user-managed forwarding listeners use this policy. Ordinary dokodemo
+// inbounds (including the local management API) keep their existing behavior.
+message ForwardingTargetPolicy {
+  repeated string blocked_cidrs = 1;
+}
+
+// A distinct type makes old Xray processes reject protected listeners instead
+// of silently discarding the added policy field during a mixed-version handoff.
+message ForwardingConfig { Config config = 1; }

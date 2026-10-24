@@ -123,6 +123,7 @@ fn networks() -> Vec<VpngateIpNetwork> {
 
 fn vpngate_outbound(id: &str, country_code: &str) -> UpsertExternalOutboundRequest {
     UpsertExternalOutboundRequest {
+        target_strategy: None,
         id: id.to_owned(),
         tenant_id: "platform.acme".to_owned(),
         name: format!("VPN Gate {country_code}"),
@@ -517,6 +518,7 @@ async fn draft_prunes_vpngate_pools_after_their_last_reference_is_removed() {
                 },
                 ModelOp::UpsertExternalOutbound {
                     outbound: UpsertExternalOutboundRequest {
+                        target_strategy: None,
                         id: "custom-1111-1111".to_owned(),
                         tenant_id: "platform.acme".to_owned(),
                         name: "Reusable SOCKS".to_owned(),
@@ -2271,6 +2273,7 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
                 vec![
                     ModelOp::UpsertExternalOutbound {
                         outbound: UpsertExternalOutboundRequest {
+                            target_strategy: None,
                             id: "vpngate-1111-1111".to_owned(),
                             tenant_id: "platform.acme".to_owned(),
                             name: "VPN Gate Japan".to_owned(),
@@ -2459,6 +2462,26 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
         .await
         .unwrap()
         .expect("a serving snapshot produces a complete empty desired state");
+    assert_eq!(
+        unavailable.health_probe_url.as_deref(),
+        Some("http://cp.cloudflare.com/cdn-cgi/trace")
+    );
+    sqlx::query("UPDATE control_state SET probe_endpoint_url = $1 WHERE id = TRUE")
+        .bind("http://probe.example.test/changed")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let refreshed = db
+        .store
+        .vpngate_agent_desired("edge")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        refreshed.health_probe_url.as_deref(),
+        Some("http://probe.example.test/changed")
+    );
+    assert_eq!(refreshed.topology_revision, unavailable.topology_revision);
     assert!(
         unavailable.pools.is_empty(),
         "a node without a reported OpenVPN binary must not receive VPN Gate profiles"
@@ -3269,6 +3292,26 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
     assert_eq!(runtimes[0].latest_ip_scores, scores(8));
     assert_eq!(runtimes[0].latest_ip_networks, networks());
 
+    // Runtime history may expire without losing the successful route or dial evidence.
+    sqlx::query("UPDATE vpngate_probe_samples SET received_at = now() - interval '8 days'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let cleanup = db.store.run_data_retention().await.unwrap();
+    assert!(
+        cleanup.iter().all(|run| run.error_code.is_none()),
+        "{cleanup:?}"
+    );
+    assert!(cleanup
+        .iter()
+        .any(|run| run.table_name == "vpngate_probe_samples" && run.deleted_rows > 0));
+    let retained_runtime = db.store.vpngate_runtime_views(&admin).await.unwrap();
+    assert_eq!(retained_runtime[0].latest_connect_ms, Some(900));
+    assert_eq!(
+        retained_runtime[0].latest_exit_ip.as_deref(),
+        Some("198.51.100.20")
+    );
+
     // Older Agents used zero as a sentinel when periodically rechecking an already established
     // backend. Keep the successful route observation, but persist the backend's last real dial
     // measurement so the API never reports an impossible 0 ms connection.
@@ -3316,6 +3359,44 @@ async fn vpngate_sync_keeps_history_while_replacing_only_the_current_projection(
     let refreshed_runtime = db.store.vpngate_runtime_views(&admin).await.unwrap();
     assert_eq!(refreshed_runtime[0].latest_connect_ms, Some(900));
     assert_eq!(refreshed_runtime[0].latest_download_bps, Some(45_000_000));
+
+    // A delayed report and its retry cannot move any current evidence backwards.
+    let delayed_report = VpngatePoolReport {
+        topology_revision: ranked_desired.topology_revision,
+        catalog_generation: ranked_desired.catalog_generation,
+        outbound_id: "vpngate-1111-1111".to_owned(),
+        runtime_status: "running".to_owned(),
+        selected_server_id: Some(safe_candidate.server_id.clone()),
+        applied_profile_sha256: Some(safe_candidate.profile_sha256.clone()),
+        manual_switch_result: None,
+        samples: vec![VpngateProbeSample {
+            server_id: safe_candidate.server_id.clone(),
+            profile_sha256: safe_candidate.profile_sha256.clone(),
+            status: VpngateProbeStatus::Succeeded,
+            exit_ip: Some("198.51.100.20".to_owned()),
+            exit_country_code: Some("JP".to_owned()),
+            connect_ms: Some(777),
+            download_bps: Some(1_000_000),
+            ip_scores: scores(99),
+            ip_networks: networks(),
+            error_code: None,
+            error_detail: None,
+            probed_at_unix_secs: 1_800_000_099,
+        }],
+    };
+    db.store
+        .record_vpngate_agent_report("edge", delayed_report.clone())
+        .await
+        .unwrap();
+    db.store
+        .record_vpngate_agent_report("edge", delayed_report)
+        .await
+        .unwrap();
+    let after_replay = db.store.vpngate_runtime_views(&admin).await.unwrap();
+    assert_eq!(after_replay[0].latest_connect_ms, Some(900));
+    assert_eq!(after_replay[0].latest_download_bps, Some(45_000_000));
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM vpngate_runtime_evidence WHERE node_id='edge' AND outbound_id='vpngate-1111-1111' AND server_id='vpn-jp'")
+        .fetch_one(db.pool()).await.unwrap(), 3);
 
     // Automatic failover is visible on the live path before its durable summary. Read evidence
     // for the observed backend on this machine, never the old pointer or a catalogue sample.

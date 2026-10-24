@@ -103,6 +103,7 @@ const PROSE_KEYS: &[&str] = &[
     "details",
     "error",
     "last_error",
+    "runtime_error",
     "last_error_detail",
     "latest_error_detail",
     "switch_error_detail",
@@ -1049,7 +1050,7 @@ mod tests {
             "rules": [
                 {"id": 42, "name": "Web at target.example.net:18443", "protocol": "tcp",
                  "listen_port": 30442, "target_host": "target.example.net", "target_port": 18443,
-                 "runtime_status": "active", "uplink_bytes": 12345},
+                 "runtime_status": "active", "runtime_error": "listen target.example.net:30442 failed", "uplink_bytes": 12345},
                 {"id": 43, "name": "[2001:db8::31]:18444", "protocol": "tcp_udp",
                  "listen_port": 30443, "target_host": "[2001:db8::31]", "target_port": 18444}
             ],
@@ -1069,6 +1070,7 @@ mod tests {
         assert_eq!(value["rules"][0]["id"], 42);
         assert_eq!(value["rules"][0]["protocol"], "tcp");
         assert_eq!(value["rules"][0]["runtime_status"], "active");
+        assert_eq!(value["rules"][0]["runtime_error"], "");
         assert_eq!(value["rules"][0]["uplink_bytes"], 12345);
         assert_eq!(value["entitlements"][0]["rule_count"], 2);
         assert_eq!(value["entitlements"][0]["node_name"], "Tokyo");

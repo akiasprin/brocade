@@ -600,7 +600,6 @@ pub fn spawn(store: PgStore) -> Arc<tokio::sync::Notify> {
         let mut hourly =
             tokio::time::interval_at(tokio::time::Instant::now() + SCAN_INTERVAL, SCAN_INTERVAL);
         hourly.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut prune_ticks = 0_u32;
         loop {
             tokio::select! {
                 _ = poll.tick() => {}
@@ -611,17 +610,6 @@ pub fn spawn(store: PgStore) -> Arc<tokio::sync::Notify> {
                         .await
                     {
                         eprintln!("证书任务：定时扫描入队失败：{error}");
-                    }
-                    prune_ticks = prune_ticks.wrapping_add(1);
-                    if prune_ticks.is_multiple_of(24) {
-                        let result = async {
-                            let schedule = store.retention_schedule().await?;
-                            store.prune_configured_certificate_scans(&schedule).await
-                        }
-                        .await;
-                        if let Err(error) = result {
-                            eprintln!("证书任务：历史清理失败：{error}");
-                        }
                     }
                 }
             }

@@ -16,64 +16,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::{AdminContext, Result, StoreError};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeTrafficCycleKind {
-    Monthly,
-    Yearly,
-}
-
-impl NodeTrafficCycleKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Monthly => "monthly",
-            Self::Yearly => "yearly",
-        }
-    }
-}
-
-/// How a provider turns the two default-route directions into one allowance counter.
-/// Raw RX/TX stay immutable; this is only a derived accounting view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeTrafficAccountingMode {
-    BidirectionalSum,
-    BidirectionalMax,
-    OutboundOnly,
-    InboundOnly,
-}
-
-impl NodeTrafficAccountingMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::BidirectionalSum => "bidirectional_sum",
-            Self::BidirectionalMax => "bidirectional_max",
-            Self::OutboundOnly => "outbound_only",
-            Self::InboundOnly => "inbound_only",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "bidirectional_sum" => Ok(Self::BidirectionalSum),
-            "bidirectional_max" => Ok(Self::BidirectionalMax),
-            "outbound_only" => Ok(Self::OutboundOnly),
-            "inbound_only" => Ok(Self::InboundOnly),
-            other => Err(StoreError::InvalidData(format!(
-                "invalid node traffic accounting mode {other}"
-            ))),
-        }
-    }
-
-    fn apply(self, rx_bytes: u64, tx_bytes: u64) -> u64 {
-        match self {
-            Self::BidirectionalSum => rx_bytes.saturating_add(tx_bytes),
-            Self::BidirectionalMax => rx_bytes.max(tx_bytes),
-            Self::OutboundOnly => tx_bytes,
-            Self::InboundOnly => rx_bytes,
-        }
-    }
-}
+pub use brocade_deployment::traffic_limit::{NodeTrafficAccountingMode, NodeTrafficCycleKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeTrafficItem {
@@ -99,6 +42,7 @@ pub struct NodeTrafficItem {
     pub last_gap_at_unix_secs: Option<i64>,
     pub last_gap_reason: Option<String>,
     pub has_gap: bool,
+    pub limit: crate::traffic_limit::NodeTrafficLimitView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,6 +256,13 @@ fn valid_interface(value: &str) -> bool {
 }
 
 fn validate_reading(reading: &NodeTrafficReading) -> Result<()> {
+    brocade_deployment::traffic_limit::validate_day_boundaries(
+        &reading.day_boundaries,
+        reading.sampled_at_unix_secs,
+        reading.rx_bytes,
+        reading.tx_bytes,
+    )
+    .map_err(StoreError::InvalidData)?;
     if !valid_meter_id(&reading.meter_id) {
         return Err(StoreError::InvalidData(
             "traffic meter id has an invalid shape".to_owned(),
@@ -398,6 +349,15 @@ pub async fn record_node_traffic(
     reading: &NodeTrafficReading,
 ) -> Result<()> {
     validate_reading(reading)?;
+    let sampled_at = reading
+        .sampled_at_unix_secs
+        .unwrap_or(observed_at_unix_secs);
+    if sampled_at <= 0 || sampled_at > observed_at_unix_secs.saturating_add(300) {
+        return Err(StoreError::InvalidData(
+            "invalid traffic sample timestamp".into(),
+        ));
+    }
+    let observed_at_unix_secs = sampled_at;
     if observed_at_unix_secs <= 0 {
         return Err(StoreError::InvalidData(
             "traffic observed_at must be positive unix seconds".to_owned(),
@@ -474,7 +434,15 @@ pub async fn record_node_traffic(
     // across a UTC midnight, however, the delta cannot be split around a reset that may live on
     // that date. Keep the bytes (discarding known traffic would be worse) and make the ambiguity
     // explicit so a calibration can establish the authoritative current-period total.
+    let (daily_deltas, boundaries_complete) = split_daily_deltas(
+        previous.as_ref(),
+        reading,
+        observed_at_unix_secs,
+        rx_delta,
+        tx_delta,
+    );
     if gap_reason.is_none()
+        && !boundaries_complete
         && previous.as_ref().is_some_and(|old| {
             crosses_unobserved_utc_day(old.last_reported_at_unix_secs, observed_at_unix_secs)
         })
@@ -535,7 +503,10 @@ pub async fn record_node_traffic(
         .await?;
     }
 
-    if rx_delta > 0 || tx_delta > 0 {
+    for (day, rx_delta, tx_delta) in daily_deltas {
+        if rx_delta == 0 && tx_delta == 0 {
+            continue;
+        }
         sqlx::query(
             "INSERT INTO node_traffic_daily (node_id, day, rx_bytes, tx_bytes)
              VALUES ($1, (to_timestamp($2) AT TIME ZONE 'UTC')::date, $3::numeric, $4::numeric)
@@ -544,7 +515,7 @@ pub async fn record_node_traffic(
                 tx_bytes = node_traffic_daily.tx_bytes + EXCLUDED.tx_bytes",
         )
         .bind(node_id)
-        .bind(observed_at_unix_secs as f64)
+        .bind(day as f64)
         .bind(rx_delta.to_string())
         .bind(tx_delta.to_string())
         .execute(&mut *tx)
@@ -555,6 +526,51 @@ pub async fn record_node_traffic(
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Split only newly accepted bytes at durable Agent boundaries; retransmission stays a no-op.
+fn split_daily_deltas(
+    previous: Option<&PreviousReading>,
+    reading: &NodeTrafficReading,
+    at: i64,
+    rx_delta: u64,
+    tx_delta: u64,
+) -> (Vec<(i64, u64, u64)>, bool) {
+    let day = at.div_euclid(86_400) * 86_400;
+    let Some(old) = previous.filter(|old| old.meter_id == reading.meter_id) else {
+        return (vec![(day, rx_delta, tx_delta)], false);
+    };
+    let old_day = old.last_reported_at_unix_secs.div_euclid(86_400) * 86_400;
+    let boundaries: Vec<_> = reading
+        .day_boundaries
+        .iter()
+        .filter(|b| {
+            b.day_start_unix_secs > old_day
+                && b.day_start_unix_secs <= day
+                && b.rx_bytes >= old.rx_bytes
+                && b.tx_bytes >= old.tx_bytes
+        })
+        .collect();
+    let complete = i64::try_from(boundaries.len()).ok() == Some((day - old_day) / 86_400);
+    if !complete {
+        return (vec![(day, rx_delta, tx_delta)], false);
+    }
+    let (mut rx, mut tx, mut cursor) = (old.rx_bytes, old.tx_bytes, old_day);
+    let mut result = Vec::new();
+    for boundary in boundaries {
+        result.push((cursor, boundary.rx_bytes - rx, boundary.tx_bytes - tx));
+        (rx, tx, cursor) = (
+            boundary.rx_bytes,
+            boundary.tx_bytes,
+            boundary.day_start_unix_secs,
+        );
+    }
+    result.push((
+        day,
+        reading.rx_bytes.saturating_sub(rx),
+        reading.tx_bytes.saturating_sub(tx),
+    ));
+    (result, true)
 }
 
 async fn insert_gap(
@@ -598,13 +614,18 @@ pub async fn update_node_traffic(
         .map(|value| parse_decimal_u64(value, "机器流量配额"))
         .transpose()?;
     let mut tx = pool.begin().await?;
-    let exists = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM nodes WHERE id = $1)")
+    if sqlx::query_scalar::<_, String>("SELECT id FROM nodes WHERE id = $1 FOR UPDATE")
         .bind(node_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    if !exists {
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    {
         return Err(StoreError::NotFound(format!("node {node_id}")));
     }
+    let limit_policy = crate::traffic_limit::policy_in_transaction(&mut tx, node_id).await?;
+    limit_policy
+        .validate(quota)
+        .map_err(StoreError::InvalidData)?;
     let accounting_mode = match request.accounting_mode {
         Some(mode) => mode,
         None => sqlx::query_scalar::<_, String>(
@@ -614,7 +635,7 @@ pub async fn update_node_traffic(
         .fetch_optional(&mut *tx)
         .await?
         .as_deref()
-        .map(NodeTrafficAccountingMode::parse)
+        .map(|mode| NodeTrafficAccountingMode::parse(mode).map_err(StoreError::InvalidData))
         .transpose()?
         .unwrap_or(NodeTrafficAccountingMode::BidirectionalSum),
     };
@@ -642,6 +663,10 @@ pub async fn update_node_traffic(
     .execute(&mut *tx)
     .await?;
 
+    sqlx::query("UPDATE node_traffic_limit SET revision = revision + 1 WHERE node_id = $1")
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await?;
     if let Some(target) = calibration {
         sqlx::query(
             "INSERT INTO node_traffic_calibrations (
@@ -671,6 +696,7 @@ pub async fn load_node_traffic(pool: &PgPool, actor: &AdminContext) -> Result<No
     let rows = sqlx::query(NODE_TRAFFIC_VIEW_SQL)
         .bind(actor.tenant_scope())
         .bind(actor.tenant_scope_like_pattern())
+        .bind(None::<&str>)
         .fetch_all(pool)
         .await?;
     let nodes = rows
@@ -686,7 +712,8 @@ pub async fn load_node_traffic(pool: &PgPool, actor: &AdminContext) -> Result<No
                 }
             };
             let accounting_mode =
-                NodeTrafficAccountingMode::parse(&row.try_get::<String, _>("accounting_mode")?)?;
+                NodeTrafficAccountingMode::parse(&row.try_get::<String, _>("accounting_mode")?)
+                    .map_err(StoreError::InvalidData)?;
             Ok(NodeTrafficItem {
                 node_id: row.try_get("node_id")?,
                 tenant_id: row.try_get("tenant_id")?,
@@ -717,6 +744,7 @@ pub async fn load_node_traffic(pool: &PgPool, actor: &AdminContext) -> Result<No
                 last_gap_at_unix_secs: row.try_get("last_gap_at_unix_secs")?,
                 last_gap_reason: row.try_get("last_gap_reason")?,
                 has_gap: row.try_get("has_gap")?,
+                limit: crate::traffic_limit::view_from_row(&row)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1879,18 +1907,10 @@ pub(crate) async fn prune_machine_traffic_forecasts_hours(
     pool: &PgPool,
     retain_hours: u32,
 ) -> Result<u64> {
-    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
-    let deleted = sqlx::query(
-        "DELETE FROM node_traffic_forecasts
-          WHERE day < ((now() - make_interval(secs => $1::double precision)) AT TIME ZONE 'UTC')::date",
-    )
-    .bind(retain_secs)
-    .execute(pool)
-    .await?;
-    Ok(deleted.rows_affected())
+    crate::retention::cleanup::prune_batch(pool, "node_traffic_forecasts", retain_hours).await
 }
 
-const NODE_TRAFFIC_VIEW_SQL: &str = r#"
+pub(crate) const NODE_TRAFFIC_VIEW_SQL: &str = r#"
 WITH policies AS (
     SELECT n.id AS node_id, n.tenant_id, n.name,
            COALESCE(p.cycle_kind, 'monthly') AS cycle_kind,
@@ -1902,6 +1922,7 @@ WITH policies AS (
       FROM nodes AS n
       LEFT JOIN node_traffic_policy AS p ON p.node_id = n.id
      WHERE ($1::text IS NULL OR n.tenant_id = $1 OR n.tenant_id LIKE $2 ESCAPE '\')
+       AND ($3::text IS NULL OR n.id = $3)
 ), anchors AS (
     SELECT policies.*,
            CASE WHEN cycle_kind = 'monthly' THEN
@@ -2003,6 +2024,21 @@ SELECT b.node_id, b.tenant_id, b.name, b.cycle_kind, b.accounting_mode,
                       WHEN 'inbound_only' THEN daily.rx_bytes
                   END
         END)::text AS total_bytes,
+       state.meter_id, state.sequence::text AS meter_sequence,
+       state.agent_rx_bytes::text AS meter_rx_bytes, state.agent_tx_bytes::text AS meter_tx_bytes,
+       COALESCE(calibration.target_total_bytes, 0)::text AS limit_calibrated_total,
+       (calibration.target_total_bytes IS NOT NULL AND calibration.accounted_rx_bytes IS NULL) AS limit_legacy_calibration,
+       (CASE WHEN calibration.target_total_bytes IS NOT NULL THEN
+           GREATEST(COALESCE(state.accounted_rx_bytes, 0) - COALESCE(calibration.accounted_rx_bytes, 0), 0)
+           ELSE daily.rx_bytes END)::text AS limit_rx_bytes,
+       (CASE WHEN calibration.target_total_bytes IS NOT NULL THEN
+           GREATEST(COALESCE(state.accounted_tx_bytes, 0) - COALESCE(calibration.accounted_tx_bytes, 0), 0)
+           ELSE daily.tx_bytes END)::text AS limit_tx_bytes,
+       COALESCE(limiter.policy, '{"enabled":false,"rules":[]}'::jsonb) AS limit_policy,
+       COALESCE(limiter.revision, 0) AS limit_revision,
+       limiter.observation AS limit_observation,
+       extract(epoch FROM limiter.reported_at)::bigint AS limit_reported_at,
+       COALESCE(agent.agent_protocol_version >= 42, false) AS limit_supported,
        state.interface,
        extract(epoch FROM state.tracking_started_at)::bigint AS tracking_started_at_unix_secs,
        extract(epoch FROM state.last_reported_at)::bigint AS last_reported_at_unix_secs,
@@ -2018,6 +2054,8 @@ SELECT b.node_id, b.tenant_id, b.name, b.cycle_kind, b.accounting_mode,
        END AS has_gap
   FROM bounds AS b
   LEFT JOIN node_traffic_state AS state ON state.node_id = b.node_id
+  LEFT JOIN node_traffic_limit AS limiter ON limiter.node_id = b.node_id
+  LEFT JOIN node_agent_state AS agent ON agent.node_id = b.node_id
   LEFT JOIN LATERAL (
       SELECT COALESCE(sum(day.rx_bytes), 0) AS rx_bytes,
              COALESCE(sum(day.tx_bytes), 0) AS tx_bytes

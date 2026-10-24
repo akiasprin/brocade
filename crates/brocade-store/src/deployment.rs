@@ -27,7 +27,8 @@ use brocade_deployment::protocol::{
     NodeDesiredDeployment, NodeIsolationCommandResult, ReportTargetResult, ReportedNodeState,
     TargetApplyResult, TargetConvergenceReport, XrayConfigUpdatePolicy, XrayReleaseStrategy,
     XrayUpgradePhase, XrayUpgradeRuntime, XrayUpgradeSource,
-    CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION, MIN_AGENT_PROTOCOL_VERSION,
+    CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION, DESIRED_REPLAY_PROTOCOL_VERSION,
+    MIN_AGENT_PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use sqlx::{Executor, PgConnection, PgPool, Postgres, Row, Transaction};
@@ -2405,6 +2406,7 @@ pub async fn claim_desired_for_node_with_protocol(
     node_id: &str,
     protocol: u32,
 ) -> Result<Option<NodeDesiredDeployment>> {
+    let replay_supported = protocol >= DESIRED_REPLAY_PROTOCOL_VERSION;
     let mut tx = pool.begin().await?;
     // `load_current_snapshot_tx` is several SELECTs. Repeatable Read makes them one model view;
     // using one connection prevents the old pool-deadlock where every claimant held a
@@ -2426,6 +2428,7 @@ pub async fn claim_desired_for_node_with_protocol(
     if isolated {
         let obligation = sqlx::query(
             "SELECT obligation.kind,
+                    obligation.status,
                     obligation.lifecycle_epoch,
                     obligation.generation,
                     obligation.source_deployment_id AS deployment_id,
@@ -2442,6 +2445,7 @@ pub async fn claim_desired_for_node_with_protocol(
                 AND obligation.status IN ('pending', 'dispatched', 'converging')
                 AND (
                     obligation.status = 'pending'
+                    OR $3
                     OR COALESCE(obligation.claimed_at, '-infinity'::timestamptz)
                          < now() - $2::interval
                 )
@@ -2467,6 +2471,7 @@ pub async fn claim_desired_for_node_with_protocol(
         )
         .bind(node_id)
         .bind(DISPATCH_LEASE_INTERVAL)
+        .bind(replay_supported)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(obligation) = obligation else {
@@ -2478,14 +2483,17 @@ pub async fn claim_desired_for_node_with_protocol(
         let lifecycle_epoch: i64 = obligation.try_get("lifecycle_epoch")?;
         let generation: i64 = obligation.try_get("generation")?;
         let kind: String = obligation.try_get("kind")?;
-        let claim_generation = obligation
-            .try_get::<i64, _>("claim_generation")?
-            .checked_add(1)
-            .ok_or_else(|| {
+        let replaying = replay_supported && obligation.try_get::<String, _>("status")? != "pending";
+        let previous_claim: i64 = obligation.try_get("claim_generation")?;
+        let claim_generation = if replaying {
+            previous_claim
+        } else {
+            previous_claim.checked_add(1).ok_or_else(|| {
                 StoreError::InvalidData(format!(
                     "obligation claim generation overflow for {node_id}/{kind}"
                 ))
-            })?;
+            })?
+        };
         let mut desired = desired_deployment_from_structure_tx(
             &mut tx,
             deployment_id,
@@ -2500,6 +2508,12 @@ pub async fn claim_desired_for_node_with_protocol(
         if !supports_config_policy(&desired, protocol) {
             tx.commit().await?;
             return Ok(None);
+        }
+        if replaying {
+            // Re-deliver the same frozen obligation, not a new attempt that would fence the
+            // original response/report if it was merely delayed in transit.
+            tx.commit().await?;
+            return Ok(Some(desired));
         }
         sqlx::query(
             "UPDATE node_convergence_obligations
@@ -2527,7 +2541,7 @@ pub async fn claim_desired_for_node_with_protocol(
         return Ok(supports_config_policy(&desired, protocol).then_some(desired));
     }
     let Some(row) = sqlx::query(
-        // Same ordering as the read-only path above. A dispatched config keeps its lease; a
+        // Same ordering as the read-only path above. In-flight config precedes new grants;
         // pending config has already been rebased and yields to the permission hot update.
         "WITH active_deployment AS (
             SELECT d.id
@@ -2591,9 +2605,11 @@ pub async fn claim_desired_for_node_with_protocol(
          )
          SELECT ad.id AS deployment_id,
                 dt.node_id,
+                dt.status AS target_status,
                 dts.wave,
                 dts.desired_structure,
-                dts.desired_grants
+                dts.desired_grants,
+                dts.dispatched_grants
          FROM active_deployment ad
          JOIN deployments d
            ON d.id = ad.id
@@ -2617,6 +2633,7 @@ pub async fn claim_desired_for_node_with_protocol(
                 OR (SELECT deployment_unattended FROM control_state WHERE id = TRUE))
            AND (
                 dt.status = 'pending'
+                OR $3
                 OR COALESCE(dts.dispatched_at, '-infinity'::timestamptz)
                      < now() - $2::interval
            )
@@ -2626,6 +2643,7 @@ pub async fn claim_desired_for_node_with_protocol(
     )
     .bind(node_id)
     .bind(DISPATCH_LEASE_INTERVAL)
+    .bind(replay_supported)
     .fetch_optional(&mut *tx)
     .await?
     else {
@@ -2637,7 +2655,17 @@ pub async fn claim_desired_for_node_with_protocol(
     let node_id: String = row.try_get("node_id")?;
     let wave = row.try_get("wave")?;
     let desired_structure = row.try_get("desired_structure")?;
-    let grants: DesiredGrants = serde_json::from_value(row.try_get::<Value, _>("desired_grants")?)?;
+    let replaying = replay_supported && row.try_get::<String, _>("target_status")? != "pending";
+    // The dispatched list is authoritative even if newer permissions have been queued. Null
+    // remains compatible with historical claims predating the frozen-grants column.
+    let frozen_grants = if replaying {
+        row.try_get::<Option<Value>, _>("dispatched_grants")?
+    } else {
+        None
+    };
+    let grants: DesiredGrants = serde_json::from_value(
+        frozen_grants.unwrap_or(row.try_get::<Value, _>("desired_grants")?),
+    )?;
     let desired = desired_deployment_from_structure_tx(
         &mut tx,
         deployment_id,
@@ -2651,6 +2679,13 @@ pub async fn claim_desired_for_node_with_protocol(
     if !supports_config_policy(&desired, protocol) {
         tx.commit().await?;
         return Ok(None);
+    }
+
+    if replaying {
+        // Preserve the original dispatch timestamp and frozen grants. A failed response is a
+        // delivery retry, not a new claim or a new accounting boundary.
+        tx.commit().await?;
+        return Ok(Some(desired));
     }
 
     // A node claim is not the wave start. This is only a compatibility guard for an active order
@@ -4375,12 +4410,34 @@ async fn restore_model_snapshot_tx(
     // Provider control tokens are operational state and intentionally absent from model
     // snapshots. Preserve one when the target restores the exact same Cloudflare device.
     let warp_binding_tokens = load_warp_binding_tokens_tx(tx).await?;
+    // Effective snapshots intentionally omit suspended users. Keep their configured grants
+    // across topology restoration, so renewal can restore access where the ingress survives.
+    let suspended_grants = sqlx::query(
+        "SELECT g.app_id,g.tenant_id,g.user_id,g.ingress_id FROM grants g
+         JOIN users u ON u.tenant_id=g.tenant_id AND u.id=g.user_id WHERE u.service_suspended",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
     restore_settings_tx(tx, snapshot).await?;
     restore_tenants_tx(tx, revision_id, snapshot).await?;
     restore_users_tx(tx, revision_id, snapshot).await?;
     restore_nodes_tx(tx, revision_id, snapshot).await?;
     clear_app_model_tx(tx).await?;
     restore_apps_tx(tx, revision_id, snapshot, &warp_binding_tokens).await?;
+    for grant in suspended_grants {
+        sqlx::query(
+            "INSERT INTO grants(app_id,tenant_id,user_id,ingress_id,created_revision)
+            SELECT $1,$2,$3,$4,$5 FROM ingresses WHERE app_id=$1 AND id=$4
+            ON CONFLICT DO NOTHING",
+        )
+        .bind(grant.try_get::<String, _>("app_id")?)
+        .bind(grant.try_get::<String, _>("tenant_id")?)
+        .bind(grant.try_get::<String, _>("user_id")?)
+        .bind(grant.try_get::<String, _>("ingress_id")?)
+        .bind(revision_to_i64(revision_id)?)
+        .execute(&mut **tx)
+        .await?;
+    }
     restore_node_egress_dns_tx(tx, revision_id, snapshot).await?;
     Ok(())
 }
@@ -4397,6 +4454,16 @@ fn preserve_immediate_fields(
     target.settings.ports = current.settings.ports;
     target.settings.probe = current.settings.probe.clone();
     target.users = current.users.clone();
+    let effective_users = target
+        .users
+        .iter()
+        .map(|user| (user.tenant.as_str(), user.id.as_str()))
+        .collect::<BTreeSet<_>>();
+    for app in &mut target.apps {
+        app.grants.retain(|grant| {
+            effective_users.contains(&(grant.tenant.as_str(), grant.user.as_str()))
+        });
+    }
     client.apply_fronts(&mut target);
 
     let app_rank = client
@@ -4612,9 +4679,13 @@ async fn restore_users_tx(
     revision_id: u64,
     snapshot: &ModelSnapshot,
 ) -> Result<()> {
-    sqlx::query("UPDATE users SET status = 'disabled' WHERE status <> 'disabled'")
-        .execute(&mut **tx)
-        .await?;
+    // Service suspension removes a user from the effective snapshot, not from the operator's
+    // configured account set. Rollback must not turn that temporary absence into manual disable.
+    sqlx::query(
+        "UPDATE users SET status = 'disabled' WHERE status <> 'disabled' AND NOT service_suspended",
+    )
+    .execute(&mut **tx)
+    .await?;
 
     let revision_id = revision_to_i64(revision_id)?;
     for user in &snapshot.users {
@@ -4908,6 +4979,7 @@ async fn restore_apps_tx(
                 port: outbound.port,
                 protocol: outbound.protocol.clone(),
                 security: outbound.security.clone(),
+                target_strategy: outbound.target_strategy,
                 note: None,
             },
         )
@@ -7629,6 +7701,7 @@ mod tests {
         });
         let mut snapshot = snapshot(revision, ModelSettings::default(), vec![app], Vec::new());
         snapshot.external_outbounds.push(ExternalOutbound {
+            target_strategy: None,
             id: "vpngate-1111-1111".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "VPN Gate Japan".to_owned(),

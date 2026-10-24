@@ -1287,4 +1287,72 @@ mod tests {
             Some("Xray 1.8.4 (Xray, Penetrates)".to_owned())
         );
     }
+    // An HTTP timeout is an unknown delivery outcome. The queue must retain the exact body
+    // until the complete ACK is read, so a retry keeps the Console deduplication identity.
+    fn unconfirmed_ack_keeps_the_exact_durable_body(stall: bool) {
+        let dir = state_dir(if stall {
+            "review-timeout-ack"
+        } else {
+            "review-lost-ack"
+        });
+        let payload = serde_json::json!({"agent_instance_id":"review-fixture","sequence":1,"n":7});
+        spool_push(super::USAGE_SPOOL, &dir, &payload).unwrap();
+        let original = spool_read(super::USAGE_SPOOL, &dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = format!("http://{}", listener.local_addr().unwrap());
+        let worker = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let body1 = read_request_body(&mut first);
+            // Model server commit followed by a lost or incomplete ACK.
+            if stall {
+                first
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{")
+                    .unwrap();
+                first
+                    .set_read_timeout(Some(Duration::from_secs(33)))
+                    .unwrap();
+                let mut byte = [0];
+                assert_eq!(
+                    first.read(&mut byte).unwrap(),
+                    0,
+                    "timeout must close connection"
+                );
+            }
+            drop(first);
+            let (mut second, _) = listener.accept().unwrap();
+            let body2 = read_request_body(&mut second);
+            second
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .unwrap();
+            assert_eq!(
+                body1, body2,
+                "the retry must preserve deduplication identity and payload"
+            );
+            body2
+        });
+        let opts = options(&server, &dir);
+        let started = Instant::now();
+        assert!(spool_drain(super::USAGE_SPOOL, &opts).is_err());
+        if stall {
+            assert!(started.elapsed() >= Duration::from_secs(29));
+            assert!(started.elapsed() < Duration::from_secs(32));
+        }
+        assert_eq!(
+            spool_read(super::USAGE_SPOOL, &dir).unwrap(),
+            original,
+            "unconfirmed ACK must not delete accounting"
+        );
+        assert!(spool_drain(super::USAGE_SPOOL, &opts).unwrap());
+        assert_eq!(worker.join().unwrap(), original[0]);
+        assert!(spool_read(super::USAGE_SPOOL, &dir).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn committed_usage_with_dropped_ack_is_retained_and_retried_exactly() {
+        unconfirmed_ack_keeps_the_exact_durable_body(false);
+    }
+    #[test]
+    fn committed_usage_with_timed_out_body_is_retained_and_retried_exactly() {
+        unconfirmed_ack_keeps_the_exact_durable_body(true);
+    }
 }

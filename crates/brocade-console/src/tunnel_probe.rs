@@ -21,8 +21,6 @@ const SCHEDULER_TICK: Duration = Duration::from_secs(1);
 const LEASE_REFRESH: Duration = Duration::from_secs(5);
 const MAINTENANCE_TICK: Duration = Duration::from_secs(5);
 const LOCAL_CONCURRENCY: usize = 4;
-const PRUNE_EVERY_SCHEDULER_TICKS: u64 = 60;
-const PRUNE_EVERY_MAINTENANCE_TICKS: u64 = 12;
 
 /// Start the scheduler on this Console process.
 ///
@@ -50,11 +48,9 @@ pub fn spawn(store: PgStore) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SCHEDULER_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut tick_count = 0_u64;
         let mut enqueue_failures = 0_u32;
         loop {
             tick.tick().await;
-            tick_count = tick_count.wrapping_add(1);
             if let Err(error) = store.enqueue_due_tunnel_probes().await {
                 if enqueue_failures == 0 || enqueue_failures.is_power_of_two() {
                     eprintln!("tunnel probe: enqueue failed: {error}");
@@ -73,9 +69,6 @@ pub fn spawn(store: PgStore) {
                 enqueue_failures = 0;
             }
             dispatch_available(&store, &owner, &local, &xray_binary, &runtime_dir).await;
-            if tick_count.is_multiple_of(PRUNE_EVERY_SCHEDULER_TICKS) {
-                prune_history(&store).await;
-            }
         }
     });
 }
@@ -84,11 +77,9 @@ fn spawn_maintenance(store: PgStore) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(MAINTENANCE_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut tick_count = 0_u64;
         let mut reap_failed = false;
         loop {
             tick.tick().await;
-            tick_count = tick_count.wrapping_add(1);
             match store.reap_expired_tunnel_probes().await {
                 Ok(rows) => {
                     if reap_failed {
@@ -106,24 +97,8 @@ fn spawn_maintenance(store: PgStore) {
                     reap_failed = true;
                 }
             }
-            if tick_count.is_multiple_of(PRUNE_EVERY_MAINTENANCE_TICKS) {
-                prune_history(&store).await;
-            }
         }
     });
-}
-
-async fn prune_history(store: &PgStore) {
-    let result = async {
-        let schedule = store.retention_schedule().await?;
-        store.prune_configured_tunnel_probes(&schedule).await
-    }
-    .await;
-    match result {
-        Ok(0) => {}
-        Ok(rows) => eprintln!("tunnel probe: pruned {rows} expired runs"),
-        Err(error) => eprintln!("tunnel probe: prune failed: {error}"),
-    }
 }
 
 async fn dispatch_available(

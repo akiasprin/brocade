@@ -111,6 +111,7 @@ it('groups three independent policies in one settings panel', async () => {
   expect(panel.getByRole('heading', { name: '出流量统计' })).toBeTruthy();
   expect(view.container.querySelectorAll('.panel.config-panel')).toHaveLength(1);
   expect(panel.getByText(/容量满时优先淘汰已可靠保存的冷条目/)).toBeTruthy();
+  expect(panel.getByText(/默认保留 24 小时，可在“数据保留”中分别调整/)).toBeTruthy();
   for (const name of ['站点分类', '未分类域名', '嗅探失败目标']) {
     const section = within(screen.getByRole('region', { name }));
     expect(section.getByRole('heading', { name })).toBeTruthy();

@@ -884,7 +884,7 @@ select.f.fwr-sort {
     gap: 8px;
     padding-block: 14px;
   }
-  .fwr-item .fwd-month {
+  .fwr-item .fwd-cycle {
     display: block;
   }
   .fwr-item .fwd-bar {

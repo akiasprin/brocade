@@ -1,0 +1,805 @@
+/* 用户「来源 IP 封禁」改版 mockup。页面主体是生产的用户页，这里只补审阅外壳（mk-）和改版部件（sam-）。 */
+
+/* ── 审阅外壳：不属于设计 ── */
+html,
+body {
+  height: auto;
+  min-height: 100%;
+  overflow: auto !important;
+}
+body {
+  margin: 0;
+  background: var(--ground);
+}
+.mk-bar {
+  position: sticky;
+  z-index: 30;
+  top: 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--sheet);
+}
+.mk-bar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  padding: 10px 20px 6px;
+}
+.mk-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--ink);
+  font: 600 14px var(--sans);
+  white-space: nowrap;
+}
+.mk-title small {
+  color: var(--ink-4);
+  font: 400 10px var(--mono);
+  letter-spacing: 0.06em;
+}
+.mk-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-left: auto;
+}
+.mk-ctl {
+  --ctl-h: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.mk-ctl-label {
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.mk-ctl select {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  color: var(--ink);
+  font: 12px var(--sans);
+}
+.mk-ctl .segsw button {
+  padding: 0 9px;
+  font-size: 12px;
+}
+.mk-scene-note {
+  margin: 0;
+  padding: 0 20px 9px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.mk-scene-note b {
+  margin-right: 10px;
+  color: var(--action);
+  font-weight: 600;
+}
+.mk-stage {
+  padding: 20px;
+}
+@media (max-width: 620px) {
+  .mk-stage {
+    padding: 12px;
+  }
+}
+.mk-hide-legacy .source-access-panel,
+.mk-hide-legacy .user-presence-card:not(.sam-own) {
+  display: none;
+}
+.mk-slot {
+  display: contents;
+}
+
+/* ══ 共用：禁行标记、行内禁行钮、标签、解除 ══ */
+.sam-glyph {
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+/* 禁行钮与复制钮同一尺寸、同一出现方式（悬停或聚焦时出现，触屏常显）；指向它时转为告警色。 */
+@media (hover: hover) {
+  .user-fcopy.sam-ban:hover {
+    color: var(--err);
+    border-color: color-mix(in srgb, var(--err) 45%, var(--line));
+  }
+}
+.user-presence-row .user-fcopy.sam-ban[aria-expanded='true'] {
+  opacity: 1;
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 45%, var(--line));
+}
+/* 时间线节点换成禁行标记：空心圆 + 斜杠。已断开为告警色；名单已保存、来源仍在线为注意色。 */
+.user-presence-mark.sam-mark-ban,
+.user-presence-row.off .user-presence-mark.sam-mark-ban {
+  width: 9px;
+  height: 9px;
+  background: var(--card);
+  box-shadow:
+    inset 0 0 0 1.5px var(--err),
+    0 0 0 3px var(--card);
+}
+.user-presence-mark.sam-mark-ban::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 1.5px;
+  height: 8px;
+  margin: -4px 0 0 -0.75px;
+  border-radius: 1px;
+  background: var(--err);
+  transform: rotate(-45deg);
+}
+.sam-banned-row.live .user-presence-mark.sam-mark-ban,
+.user-presence-row.sam-row-banned:not(.off) .user-presence-mark.sam-mark-ban {
+  box-shadow:
+    inset 0 0 0 1.5px var(--gold),
+    0 0 0 3px var(--card);
+}
+.sam-banned-row.live .user-presence-mark.sam-mark-ban::after,
+.user-presence-row.sam-row-banned:not(.off) .user-presence-mark.sam-mark-ban::after {
+  background: var(--gold);
+}
+.sam-tag {
+  display: inline-flex;
+  height: 18px;
+  flex: none;
+  align-items: center;
+  padding: 0 6px;
+  border-radius: 5px;
+  font: 500 10.5px/1 var(--sans);
+  white-space: nowrap;
+}
+.sam-tag.err {
+  color: var(--err);
+  background: color-mix(in srgb, var(--err) 12%, transparent);
+}
+.sam-tag.gold {
+  color: var(--gold);
+  background: var(--gold-wash);
+}
+.user-presence-row.sam-row-banned.off .user-presence-ip > code {
+  color: var(--ink-3);
+}
+.sam-link {
+  min-height: 26px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  color: var(--action);
+  background: transparent;
+  font: 12px var(--sans);
+  white-space: nowrap;
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .sam-link:hover:not(:disabled) {
+    color: var(--action-hover);
+    background: var(--action-wash);
+  }
+}
+.sam-link:disabled {
+  color: var(--ink-4);
+  cursor: default;
+}
+.sam-link:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -2px;
+}
+
+/* ══ 执行情况：状态点 + 文字；可点开逐台机器 ══ */
+.sam-state {
+  display: inline-flex;
+  min-height: 22px;
+  box-sizing: border-box;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  margin: -3px -7px -3px 0;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--ink-3);
+  background: transparent;
+  font: 11px/1 var(--sans);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.sam-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+}
+.sam-state.ok .sam-dot,
+.sam-dot.ok {
+  background: var(--ok);
+}
+.sam-state.gold,
+.sam-dot.gold {
+  color: var(--gold);
+}
+.sam-dot.gold {
+  background: var(--gold);
+}
+.sam-state.err {
+  color: var(--err);
+}
+.sam-dot.err {
+  background: var(--err);
+}
+.sam-state.idle {
+  color: var(--ink-4);
+  cursor: default;
+}
+.sam-state.static {
+  margin: 0;
+  padding: 0;
+  cursor: default;
+}
+@media (hover: hover) {
+  button.sam-state:hover {
+    background: var(--hover);
+  }
+}
+button.sam-state[aria-expanded='true'] {
+  background: var(--action-wash);
+}
+button.sam-state:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -2px;
+}
+.sam-nodes-pop {
+  width: min(300px, calc(100vw - 16px));
+  padding: 4px 0;
+}
+.sam-nodes {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sam-nodes li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 3px 12px;
+  padding: 7px 14px;
+}
+.sam-nodes li + li {
+  border-top: 1px solid var(--line-soft);
+}
+.sam-node-name {
+  color: var(--ink);
+  font-size: 12.5px;
+}
+.sam-node-phase {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.sam-node-phase.ok {
+  color: var(--ok);
+}
+.sam-node-phase.gold {
+  color: var(--gold);
+}
+.sam-node-phase.err {
+  color: var(--err);
+}
+.sam-nodes small {
+  grid-column: 1 / -1;
+  color: var(--ink-3);
+  font: 11px/1.45 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+/* 卡头右端打开的面板：右缘对齐锚点（useEndAlign 写入 --sam-anchor-right）。 */
+.dialog-layer.popover > .dialog-surface.end {
+  left: max(8px, calc(var(--sam-anchor-right) - var(--sam-pop-w)));
+}
+.sam-nodes-pop {
+  --sam-pop-w: min(300px, calc(100vw - 16px));
+}
+.sam-pop {
+  --sam-pop-w: min(400px, calc(100vw - 16px));
+}
+
+/* ══ 行内封禁的确认：贴着禁行钮弹出 ══ */
+.sam-confirm {
+  width: min(300px, calc(100vw - 16px));
+  padding: 12px 14px;
+}
+.sam-confirm-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0;
+  color: var(--ink);
+  font: 600 13px var(--sans);
+}
+.sam-confirm-title code {
+  min-width: 0;
+  font: 600 12.5px var(--mono);
+  overflow-wrap: anywhere;
+}
+.sam-confirm-body {
+  margin: 6px 0 12px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.sam-confirm footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* ══ 手动添加：输入框 + 封禁；下方一行写这个地址是谁 ══ */
+.sam-add form {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+.sam-add input.f {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.sam-add input.f[aria-invalid='true'] {
+  border-color: var(--err);
+}
+.sam-add .btn {
+  flex: none;
+}
+.sam-add.inline {
+  padding: 6px 0 2px 76px;
+}
+.sam-add.inline form {
+  max-width: 480px;
+}
+.sam-add.foot {
+  padding: 10px var(--panel-content-x) 12px;
+  border-top: 1px solid var(--line-soft);
+}
+.sam-add.foot form {
+  max-width: 480px;
+}
+.sam-add.pop {
+  flex: none;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.sam-add-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0 0;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.sam-add-note.gold {
+  color: var(--gold);
+}
+.sam-add-note.err {
+  color: var(--err);
+}
+.sam-add > .error {
+  margin-top: 8px;
+}
+
+/* ══ 方案 A：在线设备卡底的「已封禁」组 ══ */
+.sam-banned {
+  margin-top: 6px;
+  padding-top: 2px;
+  border-top: 1px solid var(--line-soft);
+}
+.user-presence-day.sam-banned-day {
+  grid-template-columns: 40px minmax(0, 1fr);
+  column-gap: 12px;
+}
+.sam-banned-day > .sam-state {
+  justify-self: end;
+  margin: 0 -1px -2px 0;
+}
+.sam-banned-seen {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sam-banned-seen.gold {
+  color: var(--gold);
+}
+.sam-row-end {
+  display: inline-flex;
+  justify-self: end;
+}
+.sam-add-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+@container user-presence (max-width: 620px) {
+  .user-presence-row.sam-banned-row {
+    grid-template-areas:
+      'time mark ip end'
+      '. . sub sub';
+  }
+  .sam-banned-row .sam-row-end {
+    grid-area: end;
+  }
+  .sam-add.inline {
+    padding-left: 64px;
+  }
+}
+
+/* ══ 方案 B / D：独立卡片 ══ */
+/* 空名单只剩标题条：与折叠卡同一写法，色带延伸到卡片下缘。 */
+.sam-list-card.empty > header {
+  margin-bottom: calc(0px - var(--panel-pad-bottom));
+  border-bottom-color: transparent;
+}
+.sam-head-btn {
+  display: inline-flex;
+  min-height: 24px;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  margin: -4px -6px -4px 0;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  color: var(--action);
+  background: transparent;
+  font: 12px var(--sans);
+  white-space: nowrap;
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .sam-head-btn:hover {
+    color: var(--action-hover);
+    background: var(--action-wash);
+  }
+}
+.sam-head-btn:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -2px;
+}
+.sam-list {
+  container: sam-list / inline-size;
+}
+.sam-list-rows {
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+}
+.sam-list-row {
+  display: grid;
+  min-height: 36px;
+  grid-template-columns: minmax(0, 312px) 120px minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 12px;
+  padding: 0 var(--panel-content-x);
+}
+.sam-list-row + .sam-list-row {
+  border-top: 1px solid var(--line-soft);
+}
+.sam-list-ip {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+.sam-list-ip > code {
+  min-width: 0;
+  color: var(--ink);
+  font: 12px/1.45 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+@media (hover: hover) {
+  .sam-list-row .user-fcopy {
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .sam-list-row:hover .user-fcopy,
+  .sam-list-row .user-fcopy:focus-visible,
+  .sam-list-row .user-fcopy:is(.done, .failed) {
+    opacity: 1;
+  }
+}
+.sam-list-geo {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.sam-list-seen {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sam-list-seen.gold {
+  color: var(--gold);
+}
+.sam-list-seen.dim {
+  color: var(--ink-4);
+}
+.sam-list-more {
+  min-height: 30px;
+  margin: 0 0 4px calc(var(--panel-content-x) - 6px);
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  color: var(--action);
+  background: transparent;
+  font: 11.5px var(--sans);
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .sam-list-more:hover {
+    color: var(--action-hover);
+    background: var(--action-wash);
+  }
+}
+.sam-list > .error {
+  margin: 8px var(--panel-content-x);
+}
+@container sam-list (max-width: 620px) {
+  .sam-list-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'ip end'
+      'geo seen';
+    row-gap: 2px;
+    padding-block: 7px;
+  }
+  .sam-list-ip {
+    grid-area: ip;
+  }
+  .sam-list-row .sam-row-end {
+    grid-area: end;
+  }
+  .sam-list-geo {
+    grid-area: geo;
+  }
+  .sam-list-seen {
+    grid-area: seen;
+    justify-self: end;
+  }
+}
+
+/* ══ 方案 C：卡头入口 + 弹出面板 ══ */
+.sam-entry {
+  display: inline-flex;
+  height: 22px;
+  box-sizing: border-box;
+  flex: none;
+  align-items: center;
+  align-self: center;
+  gap: 5px;
+  margin: -3px -6px -3px 0;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--ink-3);
+  background: transparent;
+  font: 11px/1 var(--sans);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.sam-entry b {
+  color: var(--ink-2);
+  font: 600 10.5px var(--mono);
+}
+@media (hover: hover) {
+  .sam-entry:hover {
+    color: var(--ink-2);
+    background: var(--hover);
+  }
+}
+.sam-entry[aria-expanded='true'] {
+  color: var(--action);
+  background: var(--action-wash);
+}
+.sam-entry:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -2px;
+}
+.sam-pop {
+  display: flex;
+  width: min(400px, calc(100vw - 16px));
+  max-height: min(560px, calc(100dvh - 16px));
+  flex-direction: column;
+}
+.sam-pop > header {
+  display: flex;
+  min-height: 44px;
+  box-sizing: border-box;
+  flex: none;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.sam-pop h3 {
+  margin: 0 auto 0 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+.sam-pop > .sam-nodes {
+  flex: none;
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--ink) 2.5%, transparent);
+}
+.sam-pop > .sam-nodes li {
+  padding-block: 6px;
+}
+.sam-pop > .sam-nodes .sam-node-name {
+  font-size: 12px;
+}
+.sam-pop-rows {
+  min-height: 0;
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 4px 0;
+  overflow-y: auto;
+  list-style: none;
+}
+.sam-pop-rows li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    'ip end'
+    'geo end';
+  align-items: center;
+  column-gap: 10px;
+  row-gap: 1px;
+  padding: 6px 8px 6px 14px;
+}
+.sam-pop-rows li + li {
+  border-top: 1px solid var(--line-soft);
+}
+.sam-pop-ip {
+  grid-area: ip;
+  min-width: 0;
+}
+.sam-pop-ip code {
+  color: var(--ink);
+  font: 12px/1.45 var(--mono);
+  overflow-wrap: anywhere;
+}
+.sam-pop-geo {
+  display: flex;
+  min-width: 0;
+  grid-area: geo;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.sam-pop-seen::before {
+  content: '·';
+  margin-right: 6px;
+  color: var(--ink-4);
+}
+.sam-pop-seen.gold {
+  color: var(--gold);
+}
+.sam-pop-rows li > .sam-link {
+  grid-area: end;
+}
+.sam-pop-empty {
+  margin: 0;
+  padding: 14px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.sam-pop > .error {
+  margin: 8px 14px 0;
+}
+
+/* ══ 方案 D：地址块与批量编辑 ══ */
+.sam-chips-body {
+  padding-top: 2px;
+}
+.sam-chips,
+.sam-diff {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sam-chip {
+  display: inline-flex;
+  height: 24px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink-2);
+  background: var(--sunk);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.sam-chip code {
+  color: inherit;
+  font: 11.5px var(--mono);
+}
+.sam-chip.live {
+  border-color: color-mix(in srgb, var(--gold) 45%, var(--line));
+  color: var(--gold);
+}
+.sam-chip.add {
+  border-color: color-mix(in srgb, var(--action) 40%, var(--line));
+  color: var(--action);
+  background: var(--action-wash);
+}
+.sam-chip.del {
+  color: var(--ink-4);
+}
+.sam-chip.del code {
+  text-decoration: line-through;
+}
+.sam-chip.bad {
+  border-color: color-mix(in srgb, var(--err) 50%, var(--line));
+  color: var(--err);
+}
+.sam-chip em {
+  color: var(--gold);
+  font-size: 10.5px;
+  font-style: normal;
+}
+.sam-batch {
+  display: grid;
+  gap: 10px;
+}
+.sam-batch textarea.f {
+  min-height: 96px;
+  font: 12px/1.6 var(--mono);
+  text-decoration: none;
+}
+.sam-batch > footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
+}
+.sam-batch > footer .sp {
+  flex: 1;
+}
+.sam-batch-count {
+  color: var(--ink-4);
+  font: 11px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.sam-batch-count.err {
+  color: var(--err);
+}

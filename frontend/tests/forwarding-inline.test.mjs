@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, before, test } from 'node:test';
 import { chromium, expect } from '@playwright/test';
@@ -9,12 +11,15 @@ import { createServer } from 'vite';
 let server;
 let browser;
 let base;
+let cacheDirectory;
 const output = '/tmp/brocade-forwarding-a-acceptance';
 before(async () => {
+  cacheDirectory = await mkdtemp(join(tmpdir(), 'brocade-forwarding-inline-'));
   server = await createServer({
     configFile: false,
     root: fileURLToPath(new URL('..', import.meta.url)),
     plugins: [react()],
+    cacheDir: join(cacheDirectory, 'node_modules/.vite'),
     server: { host: '127.0.0.1', port: 0 },
   });
   await server.listen();
@@ -25,6 +30,7 @@ before(async () => {
 after(async () => {
   await browser?.close();
   await server?.close();
+  if (cacheDirectory) await rm(cacheDirectory, { recursive: true, force: true });
 });
 
 async function preview(t, query = {}, width = 1180) {
@@ -35,12 +41,18 @@ async function preview(t, query = {}, width = 1180) {
   });
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
+  page.on('requestfailed', request => {
+    if (['document', 'script', 'stylesheet'].includes(request.resourceType())) {
+      errors.push(`${request.failure()?.errorText}: ${request.url()}`);
+    }
+  });
   page.on('console', message => {
     if (message.type() === 'error') errors.push(message.text());
   });
   t.after(async () => {
+    const failures = [...errors];
     await page.close();
-    assert.deepEqual(errors, [], 'no browser errors');
+    assert.deepEqual(failures, [], 'no browser errors');
   });
   await page.goto(`${base}?${new URLSearchParams(query)}`);
   await page.locator('.fwr-item').first().waitFor();
@@ -67,7 +79,7 @@ for (const width of [1180, 900, 620, 390]) {
       await expect(form.getByRole('article', { name: '配额工单 #91' })).toBeVisible();
       await page.screenshot({ path: `${output}/${width}-${theme}-authorization.png`, fullPage: true });
       await form.getByLabel('规则上限', { exact: true }).fill('101');
-      await form.getByLabel('月度转发额度（GiB）', { exact: true }).fill('1100');
+      await form.getByLabel('本期转发额度（GiB）', { exact: true }).fill('1100');
       await form.getByRole('button', { name: '保存', exact: true }).click();
       await expect(form).toHaveCount(0);
       await expect(opener(page)).toBeFocused();
@@ -79,7 +91,7 @@ for (const width of [1180, 900, 620, 390]) {
       await expect(opener(page, '洛杉矶入口')).toBeFocused();
       await page.getByRole('button', { name: '编辑 东京入口 :30000', exact: true }).click();
       form = page.getByRole('form', { name: '编辑入口 30000 的规则', exact: true });
-      await expect(group(page).locator('.fwd-month').first()).toContainText('96.00 GiB');
+      await expect(group(page).locator('.fwd-cycle').first()).toContainText('96.00 GiB');
       await form.getByLabel('名称', { exact: true }).fill('回归测试');
       await form.getByRole('button', { name: '保存', exact: true }).click();
       await expect(form).toHaveCount(0);
@@ -118,10 +130,10 @@ test('production A: mobile partial save retries the quota without rewriting the 
   await opener(page).click();
   const form = page.getByRole('form', { name: '编辑 东京入口 的转发授权', exact: true });
   await form.getByLabel('规则上限', { exact: true }).fill('101');
-  await form.getByLabel('月度转发额度（GiB）', { exact: true }).fill('1100');
+  await form.getByLabel('本期转发额度（GiB）', { exact: true }).fill('1100');
   await form.getByRole('button', { name: '保存', exact: true }).click();
   await expect(form).toContainText('授权已保存，配额保存失败');
-  await expect(form.getByLabel('月度转发额度（GiB）', { exact: true })).toHaveValue('1100');
+  await expect(form.getByLabel('本期转发额度（GiB）', { exact: true })).toHaveValue('1100');
   await page.screenshot({ path: `${output}/390-partial-save.png`, fullPage: true });
   await form.getByRole('button', { name: '保存', exact: true }).click();
   await expect(form).toHaveCount(0);

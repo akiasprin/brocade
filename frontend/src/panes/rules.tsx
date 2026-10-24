@@ -29,6 +29,7 @@ import {
   upsertExternalOutbound,
   deleteExternalOutbound,
   type DestMatch,
+  type DomainStrategy,
   type EgressDnsResolution,
   type ExternalOutbound,
   type ExternalOutboundProtocol,
@@ -3943,7 +3944,8 @@ export function externalProtocolBadge(protocol: ExternalOutboundProtocol['t']): 
 
 function externalSecurityLabel(security: ExternalOutboundSecurity): string {
   if (security.t === 'none') return 'RAW';
-  return `${security.t.toUpperCase()} · ${security.v.fingerprint}`;
+  const insecure = security.t === 'tls' && security.v.allow_insecure;
+  return `${security.t.toUpperCase()} · ${security.v.fingerprint}${insecure ? ' · insecure' : ''}`;
 }
 
 function externalVlessTransportLabel(transport: ExternalVlessTransport['t']): string {
@@ -4139,6 +4141,23 @@ function externalOptionalParam(url: URL, name: string): string | null {
   return url.searchParams.has(name) ? (url.searchParams.get(name) ?? '') : null;
 }
 
+function externalAliasedParam(url: URL, names: string[]): string | null {
+  const values = names.flatMap(name => url.searchParams.getAll(name));
+  if (new Set(values).size > 1) throw new Error(`${names.join(' / ')} 参数互相冲突`);
+  return values[0] ?? null;
+}
+
+function externalBooleanParam(url: URL, names: string[]): boolean {
+  const values = names.flatMap(name => url.searchParams.getAll(name));
+  const parsed = values.map(value => {
+    if (['1', 'true'].includes(value.toLowerCase())) return true;
+    if (['0', 'false'].includes(value.toLowerCase())) return false;
+    throw new Error(`${names.join(' / ')} 必须为 1、0、true 或 false`);
+  });
+  if (new Set(parsed).size > 1) throw new Error(`${names.join(' / ')} 参数互相冲突`);
+  return parsed[0] ?? false;
+}
+
 function externalXhttpHost(value: unknown): string | null {
   if (Array.isArray(value)) return externalString(value[0]);
   return externalString(value);
@@ -4156,6 +4175,9 @@ function parseExternalDownloadSecurity(
   const serverName = externalString(settings.serverName) ?? fallbackAddress;
   const fingerprint = externalString(settings.fingerprint) ?? DEFAULT_TLS_FINGERPRINT;
   if (kind === 'tls') {
+    if (settings.allowInsecure !== undefined && typeof settings.allowInsecure !== 'boolean') {
+      throw new Error('XHTTP 下载 allowInsecure 必须为布尔值');
+    }
     const alpn = Array.isArray(settings.alpn)
       ? settings.alpn.filter((value): value is string => typeof value === 'string')
       : [];
@@ -4164,6 +4186,7 @@ function parseExternalDownloadSecurity(
       v: {
         server_name: serverName,
         fingerprint,
+        ...(settings.allowInsecure ? { allow_insecure: true } : {}),
         alpn,
         ech_config_list: externalString(settings.echConfigList),
         pinned_peer_cert_sha256: externalString(settings.pinnedPeerCertSha256),
@@ -4412,8 +4435,10 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
   if (url.protocol === 'anytls:') {
     if (url.password) throw new Error('AnyTLS 密码中的特殊字符必须使用百分号编码');
     if (!url.username) throw new Error('AnyTLS 链接缺少密码');
-    const insecure = url.searchParams.get('insecure');
-    if (insecure && insecure !== '0') throw new Error('暂不支持跳过 AnyTLS 证书验证，请使用有效证书');
+    const allowInsecure = externalBooleanParam(url, ['insecure', 'allowInsecure']);
+    if (url.searchParams.has('udp') && !externalBooleanParam(url, ['udp'])) {
+      throw new Error('当前 AnyTLS 出站不能单独关闭 UDP，udp 参数必须为 1 或 true');
+    }
     const requestedSecurity = url.searchParams.get('security');
     if (requestedSecurity && requestedSecurity !== 'tls') throw new Error('AnyTLS 代理出站必须使用 TLS');
     const address = url.hostname.replace(/^\[|\]$/g, '');
@@ -4425,8 +4450,9 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
       security: {
         t: 'tls',
         v: {
-          server_name: url.searchParams.get('sni') || address,
-          fingerprint: url.searchParams.get('fp') || DEFAULT_TLS_FINGERPRINT,
+          server_name: externalAliasedParam(url, ['sni', 'peer']) || address,
+          fingerprint: externalAliasedParam(url, ['fp', 'fingerprint']) || DEFAULT_TLS_FINGERPRINT,
+          ...(allowInsecure ? { allow_insecure: true } : {}),
         },
       },
     };
@@ -4449,9 +4475,9 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
       throw new Error('VLESS security 与旧版 tls 参数互相冲突');
     }
     const security = explicitSecurity || legacySecurity;
-    const insecure = url.searchParams.get('allowInsecure') ?? url.searchParams.get('insecure');
-    if (insecure && !['0', 'false'].includes(insecure.toLowerCase())) {
-      throw new Error('当前 Xray 已移除 allowInsecure；请让提供方改用 pcs 证书钉扎');
+    const allowInsecure = externalBooleanParam(url, ['insecure', 'allowInsecure']);
+    if (allowInsecure && security !== 'tls') {
+      throw new Error('insecure 仅适用于 TLS 传输安全');
     }
     const queryEncryption = url.searchParams.get('encryption');
     if (queryEncryption && normalizedVless.encryption && queryEncryption !== normalizedVless.encryption) {
@@ -4504,6 +4530,7 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
                 v: {
                   server_name: serverName,
                   fingerprint,
+                  ...(allowInsecure ? { allow_insecure: true } : {}),
                   alpn,
                   ech_config_list: externalOptionalParam(url, 'ech'),
                   pinned_peer_cert_sha256: externalOptionalParam(url, 'pcs'),
@@ -4554,7 +4581,14 @@ function parseExternalShareLink(raw: string): ParsedExternalShare {
       },
       security:
         url.protocol === 'https:'
-          ? { t: 'tls', v: { server_name: url.hostname, fingerprint: DEFAULT_TLS_FINGERPRINT } }
+          ? {
+              t: 'tls',
+              v: {
+                server_name: url.hostname,
+                fingerprint: DEFAULT_TLS_FINGERPRINT,
+                ...(externalBooleanParam(url, ['insecure', 'allowInsecure']) ? { allow_insecure: true } : {}),
+              },
+            }
           : { t: 'none' },
     };
   }
@@ -4626,6 +4660,7 @@ type ExternalXhttpDraft = {
   downloadSecurityKind: 'tls' | 'reality';
   downloadServerName: string;
   downloadFingerprint: string;
+  downloadAllowInsecure: boolean;
   downloadAlpn: string;
   downloadEchConfigList: string;
   downloadPinnedPeerCertSha256: string;
@@ -4701,6 +4736,7 @@ function externalXhttpDraft(protocol: ExternalOutboundProtocol | null | undefine
     downloadServerName: downloadSecurity && downloadSecurity.t !== 'none' ? downloadSecurity.v.server_name : '',
     downloadFingerprint:
       downloadSecurity && downloadSecurity.t !== 'none' ? downloadSecurity.v.fingerprint : DEFAULT_TLS_FINGERPRINT,
+    downloadAllowInsecure: downloadSecurity?.t === 'tls' && (downloadSecurity.v.allow_insecure ?? false),
     downloadAlpn: downloadSecurity?.t === 'tls' ? (downloadSecurity.v.alpn ?? []).join(',') : '',
     downloadEchConfigList: downloadSecurity?.t === 'tls' ? (downloadSecurity.v.ech_config_list ?? '') : '',
     downloadPinnedPeerCertSha256:
@@ -4902,6 +4938,7 @@ export function ExternalOutboundEditor({
   const [name, setName] = useState(existing?.name ?? '新代理出站');
   const [address, setAddress] = useState(existing?.address ?? '');
   const [port, setPort] = useState(String(existing?.port ?? 443));
+  const [targetStrategy, setTargetStrategy] = useState<DomainStrategy>(existing?.target_strategy ?? 'as_is');
   const [protocolKind, setProtocolKind] = useState<EditableExternalProtocol>(initialProtocol);
   const [credential, setCredential] = useState(
     existing?.protocol.t && existing.protocol.t !== 'warp' && existing.protocol.t !== 'vpngate'
@@ -4972,6 +5009,9 @@ export function ExternalOutboundEditor({
   const [publicKey, setPublicKey] = useState(existing?.security.t === 'reality' ? existing.security.v.public_key : '');
   const [shortId, setShortId] = useState(existing?.security.t === 'reality' ? existing.security.v.short_id : '');
   const [alpn, setAlpn] = useState(existing?.security.t === 'tls' ? (existing.security.v.alpn ?? []).join(',') : '');
+  const [allowInsecure, setAllowInsecure] = useState(
+    existing?.security.t === 'tls' && (existing.security.v.allow_insecure ?? false),
+  );
   const [echConfigList, setEchConfigList] = useState(
     existing?.security.t === 'tls' ? (existing.security.v.ech_config_list ?? '') : '',
   );
@@ -5019,6 +5059,7 @@ export function ExternalOutboundEditor({
       setFingerprint(parsed.security.v.fingerprint);
     }
     if (parsed.security.t === 'tls') {
+      setAllowInsecure(parsed.security.v.allow_insecure ?? false);
       setAlpn((parsed.security.v.alpn ?? []).join(','));
       setEchConfigList(parsed.security.v.ech_config_list ?? '');
       setPinnedPeerCertSha256(parsed.security.v.pinned_peer_cert_sha256 ?? '');
@@ -5206,6 +5247,7 @@ export function ExternalOutboundEditor({
           v: {
             server_name: xhttp.downloadServerName.trim(),
             fingerprint: xhttp.downloadFingerprint.trim() || DEFAULT_TLS_FINGERPRINT,
+            ...(xhttp.downloadAllowInsecure ? { allow_insecure: true } : {}),
             ...(xhttp.downloadAlpn.trim() ? { alpn: xhttp.downloadAlpn.split(',') } : {}),
             ...(xhttp.downloadEchConfigList ? { ech_config_list: xhttp.downloadEchConfigList } : {}),
             ...(xhttp.downloadPinnedPeerCertSha256
@@ -5317,6 +5359,7 @@ export function ExternalOutboundEditor({
             v: {
               server_name: serverName.trim(),
               fingerprint: fingerprint.trim() || DEFAULT_TLS_FINGERPRINT,
+              ...(allowInsecure ? { allow_insecure: true } : {}),
               ...(alpn.trim() ? { alpn: alpn.split(',') } : {}),
               ...(echConfigList ? { ech_config_list: echConfigList } : {}),
               ...(pinnedPeerCertSha256 ? { pinned_peer_cert_sha256: pinnedPeerCertSha256 } : {}),
@@ -5342,6 +5385,7 @@ export function ExternalOutboundEditor({
     port: Number(port),
     protocol,
     security,
+    ...(targetStrategy !== 'as_is' ? { target_strategy: targetStrategy } : {}),
     bindings: existing?.bindings ?? [],
   };
   const dirty =
@@ -5355,18 +5399,26 @@ export function ExternalOutboundEditor({
         port: existing.port,
         protocol: existing.protocol,
         security: existing.security,
+        ...(existing.target_strategy && existing.target_strategy !== 'as_is'
+          ? { target_strategy: existing.target_strategy }
+          : {}),
         bindings: existing.bindings,
       });
-  const initialOutbound: ExternalOutbound = existing ?? {
-    id,
-    tenant: tenantId,
-    name: '新代理出站',
-    address: '',
-    port: 443,
-    protocol: { t: 'vless', v: { credential: '', encryption: 'none', flow: null, transport: { t: 'raw' } } },
-    security: { t: 'tls', v: { server_name: '', fingerprint: DEFAULT_TLS_FINGERPRINT } },
-    bindings: [],
-  };
+  const initialOutbound: ExternalOutbound = existing
+    ? {
+        ...existing,
+        target_strategy: existing.target_strategy === 'as_is' ? undefined : (existing.target_strategy ?? undefined),
+      }
+    : {
+        id,
+        tenant: tenantId,
+        name: '新代理出站',
+        address: '',
+        port: 443,
+        protocol: { t: 'vless', v: { credential: '', encryption: 'none', flow: null, transport: { t: 'raw' } } },
+        security: { t: 'tls', v: { server_name: '', fingerprint: DEFAULT_TLS_FINGERPRINT } },
+        bindings: [],
+      };
   const localDirty = shareLink.trim() !== '' || stableJson(outbound) !== stableJson(initialOutbound);
   const guardScope = `external-outbound:${tenantId}:${id}`;
   const clearUnsavedChanges = useUnsavedChanges(
@@ -5389,6 +5441,7 @@ export function ExternalOutboundEditor({
           port: outbound.port,
           protocol,
           security,
+          target_strategy: targetStrategy === 'as_is' ? undefined : targetStrategy,
         });
         await qc.invalidateQueries({ queryKey: ['snapshot'] });
       }
@@ -5400,6 +5453,40 @@ export function ExternalOutboundEditor({
       setSaving(false);
     }
   };
+
+  const targetStrategyControl = (
+    <label className="row">
+      <span className="k">目标域名解析</span>
+      <span className="v">
+        <select
+          className="f"
+          aria-label="目标域名解析"
+          value={targetStrategy}
+          onChange={event => setTargetStrategy(event.target.value as DomainStrategy)}
+        >
+          <option value="as_is">
+            {protocolKind === 'wireguard' ? '按 WireGuard 策略（AsIs）' : '远端解析（AsIs）'}
+          </option>
+          <option value="use_ipv4v6">本地 IPv4 优先（UseIPv4v6）</option>
+          <option value="use_ipv6v4">本地 IPv6 优先（UseIPv6v4）</option>
+          <option value="use_ip">本地双栈（UseIP）</option>
+          <option value="use_ipv4">本地 IPv4（UseIPv4）</option>
+          <option value="use_ipv6">本地 IPv6（UseIPv6）</option>
+        </select>
+        <span className="sub">
+          {targetStrategy === 'as_is'
+            ? protocolKind === 'wireguard'
+              ? '目标域名由 WireGuard 自身的域名策略处理。'
+              : '目标域名交给远端解析。'
+            : targetStrategy === 'use_ipv4v6'
+              ? '先在本机解析 IPv4，无结果时查询 IPv6；IPv4 连接失败不会回退 IPv6。'
+              : targetStrategy === 'use_ipv6v4'
+                ? '先在本机解析 IPv6，无结果时查询 IPv4；IPv6 连接失败不会回退 IPv4。'
+                : '在本机解析目标域名后，将 IP 交给隧道；解析失败时回退系统解析。'}
+        </span>
+      </span>
+    </label>
+  );
 
   return (
     <DialogLayer
@@ -5495,6 +5582,9 @@ export function ExternalOutboundEditor({
                               ? externalVlessTransportLabel(parsedShare.value.protocol.v.transport.t)
                               : 'RAW'}
                             {!parsedShareUsesVlessEncryption && ` / ${parsedShare.value.security.t.toUpperCase()}`}
+                            {parsedShare.value.security.t === 'tls' &&
+                              parsedShare.value.security.v.allow_insecure &&
+                              ' · insecure'}
                           </b>
                         </span>
                         <span>
@@ -5514,12 +5604,7 @@ export function ExternalOutboundEditor({
               ) : (
                 shareLink.trim() && <div className="external-parse-error">{parsedShare.error}</div>
               )}
-              <div className="external-form-grid compact">
-                <span className="external-form-label">解析策略</span>
-                <span className="external-form-value">
-                  <span className="external-readonly-field">保持域名（AsIs）</span>
-                </span>
-              </div>
+              <div className="fgrid one external-manual-fields">{targetStrategyControl}</div>
               <p className="external-secret-note">
                 🔒 UUID、密码、私钥等敏感字段保存为 secret；后续编辑只显示“已设置”，不会重新下发明文。
               </p>
@@ -5594,6 +5679,7 @@ export function ExternalOutboundEditor({
                     />
                   </span>
                 </div>
+                {targetStrategyControl}
                 {authenticatedProxy && (
                   <label className="row">
                     <span className="k">用户名（可选）</span>
@@ -6204,6 +6290,20 @@ export function ExternalOutboundEditor({
                             {xhttp.downloadSecurityKind === 'tls' && (
                               <>
                                 <label className="row">
+                                  <span className="k">下载证书验证</span>
+                                  <span className="v">
+                                    <span className="checkline">
+                                      <input
+                                        type="checkbox"
+                                        aria-label="下载跳过证书验证（insecure）"
+                                        checked={xhttp.downloadAllowInsecure}
+                                        onChange={event => patchXhttp({ downloadAllowInsecure: event.target.checked })}
+                                      />
+                                      下载跳过证书验证（insecure）
+                                    </span>
+                                  </span>
+                                </label>
+                                <label className="row">
                                   <span className="k">下载 ALPN（可选）</span>
                                   <span className="v">
                                     <input
@@ -6549,6 +6649,21 @@ export function ExternalOutboundEditor({
                       </span>
                       <i>TLS</i>
                     </header>
+                    <label className="row">
+                      <span className="k">证书验证</span>
+                      <span className="v">
+                        <span className="checkline">
+                          <input
+                            type="checkbox"
+                            aria-label="跳过证书验证（insecure）"
+                            checked={allowInsecure}
+                            onChange={event => setAllowInsecure(event.target.checked)}
+                          />
+                          跳过证书验证（insecure）
+                        </span>
+                        <span className="sub">开启后不验证服务端证书。</span>
+                      </span>
+                    </label>
                     <label className="row">
                       <span className="k">ALPN（可选）</span>
                       <span className="v">

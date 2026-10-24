@@ -202,6 +202,7 @@ async fn ensure_default_warp_for_tenant_tx(
         actor,
         revision_id,
         UpsertExternalOutboundRequest {
+            target_strategy: None,
             id,
             tenant_id: tenant_id.to_owned(),
             name: "Cloudflare WARP".to_owned(),
@@ -1128,11 +1129,22 @@ pub(crate) async fn upsert_external_outbound_tx(
         }
     }
     let security = serde_json::to_value(request.security)?;
+    let target_strategy = request
+        .target_strategy
+        .map(|strategy| {
+            serde_json::to_value(strategy).map(|value| {
+                value
+                    .as_str()
+                    .expect("DomainStrategy serializes to a string")
+                    .to_owned()
+            })
+        })
+        .transpose()?;
     let changed = sqlx::query(
         "INSERT INTO external_outbounds
             (id, tenant_id, name, address, port, protocol, credential_sealed,
-             protocol_options, security, created_revision)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             protocol_options, security, created_revision, target_strategy)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          ON CONFLICT (id) DO UPDATE SET
             tenant_id = EXCLUDED.tenant_id,
             name = EXCLUDED.name,
@@ -1142,15 +1154,16 @@ pub(crate) async fn upsert_external_outbound_tx(
             credential_sealed = EXCLUDED.credential_sealed,
             protocol_options = EXCLUDED.protocol_options,
             security = EXCLUDED.security,
+            target_strategy = EXCLUDED.target_strategy,
             created_revision = COALESCE(external_outbounds.created_revision, EXCLUDED.created_revision)
          WHERE (external_outbounds.tenant_id, external_outbounds.name, external_outbounds.address,
                 external_outbounds.port, external_outbounds.protocol,
                 external_outbounds.credential_sealed, external_outbounds.protocol_options,
-                external_outbounds.security)
+                external_outbounds.security, external_outbounds.target_strategy)
                IS DISTINCT FROM
                (EXCLUDED.tenant_id, EXCLUDED.name, EXCLUDED.address, EXCLUDED.port,
                 EXCLUDED.protocol, EXCLUDED.credential_sealed, EXCLUDED.protocol_options,
-                EXCLUDED.security)",
+                EXCLUDED.security, EXCLUDED.target_strategy)",
     )
     .bind(&id)
     .bind(&tenant_id)
@@ -1162,6 +1175,7 @@ pub(crate) async fn upsert_external_outbound_tx(
     .bind(protocol_options)
     .bind(security)
     .bind(u64_to_i64(revision_id, "revision_id")?)
+    .bind(target_strategy)
     .execute(&mut **tx)
     .await?
     .rows_affected()
@@ -3636,6 +3650,11 @@ fn user_item_from_row(row: &sqlx::postgres::PgRow) -> Result<UserListItem> {
         traffic_accounting_mode: parse_user_traffic_accounting_mode(
             row.try_get("traffic_accounting_mode")?,
         )?,
+        traffic_reset_day: u8::try_from(row.try_get::<i32, _>("traffic_reset_day")?)
+            .map_err(|_| StoreError::InvalidData("invalid user traffic reset day".into()))?,
+        service_starts_at: row.try_get("service_starts_at")?,
+        service_expires_at: row.try_get("service_expires_at")?,
+        service_state: serde_json::from_value(row.try_get::<String, _>("service_state")?.into())?,
         login_enabled: row.try_get("login_enabled")?,
         direct_login_enabled: row.try_get("direct_login_enabled")?,
         created_at: row.try_get("created_at")?,
@@ -3650,6 +3669,10 @@ async fn load_user_item(pool: &PgPool, tenant_id: &str, user_id: &str) -> Result
     let row = sqlx::query(
         "SELECT tenant_id, id, uuid::text AS uuid, status, account_type,
                 traffic_accounting_mode,
+                traffic_reset_day,
+                (to_jsonb(service_starts_at AT TIME ZONE 'UTC') #>> '{}') || 'Z' AS service_starts_at,
+                (to_jsonb(service_expires_at AT TIME ZONE 'UTC') #>> '{}') || 'Z' AS service_expires_at,
+                user_service_state(service_starts_at,service_expires_at,now()) AS service_state,
                 EXISTS (
                     SELECT 1 FROM admin_operators o
                     WHERE o.role = 'user'

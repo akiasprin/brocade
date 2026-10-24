@@ -348,15 +348,7 @@ pub async fn prune(pool: &PgPool, retain_days: u32) -> Result<u64> {
 }
 
 pub(crate) async fn prune_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
-    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
-    let result = sqlx::query(
-        "DELETE FROM node_public_ip_events
-          WHERE recorded_at < now() - make_interval(secs => $1::double precision)",
-    )
-    .bind(retain_secs)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    crate::retention::cleanup::prune_batch(pool, "node_public_ip_events", retain_hours).await
 }
 
 pub async fn history(

@@ -44,6 +44,7 @@ pub struct MachineEventList {
     pub last_seen_event_id: i64,
     /// Dismisses incident notifications only; public-IP changes ignore this cursor.
     pub cleared_through_event_id: i64,
+    /// Unread incident transitions; IP history and initial online observations stay quiet.
     pub unread_count: u64,
     pub active: Vec<ActiveMachineIncidentView>,
     pub events: Vec<MachineEventView>,
@@ -481,9 +482,14 @@ pub async fn list(pool: &PgPool, actor: &AdminContext, limit: u32) -> Result<Mac
         .bind(cleared_through_event_id)
         .fetch_all(pool)
         .await?;
+        // Only incident transitions need attention. Keep the cursor over all events so quiet
+        // history can still be retained and acknowledged without lighting the notification bell.
         let summary_row = sqlx::query(
             "SELECT COALESCE(max(id), 0) AS latest_event_id,
-                    count(*) FILTER (WHERE id > $1)::bigint AS unread_count
+                    count(*) FILTER (WHERE id > $1 AND (
+                        event_kind IN ('node_offline', 'cpu_steal_started', 'cpu_steal_recovered')
+                        OR (event_kind = 'node_online' AND previous_value = 'offline')
+                    ))::bigint AS unread_count
                FROM machine_events",
         )
         .bind(last_seen_event_id)
@@ -557,7 +563,10 @@ pub async fn list(pool: &PgPool, actor: &AdminContext, limit: u32) -> Result<Mac
         .await?;
         let summary_row = sqlx::query(
             "SELECT COALESCE(max(event.id), 0) AS latest_event_id,
-                    count(*) FILTER (WHERE event.id > $3)::bigint AS unread_count
+                    count(*) FILTER (WHERE event.id > $3 AND (
+                        event.event_kind IN ('node_offline', 'cpu_steal_started', 'cpu_steal_recovered')
+                        OR (event.event_kind = 'node_online' AND event.previous_value = 'offline')
+                    ))::bigint AS unread_count
                FROM machine_events event
                JOIN nodes node ON node.id = event.node_id
               WHERE node.tenant_id = $1 OR node.tenant_id LIKE $2 ESCAPE '\\'",
@@ -728,15 +737,7 @@ pub async fn prune(pool: &PgPool, retain_days: u32) -> Result<u64> {
 }
 
 pub(crate) async fn prune_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
-    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
-    let result = sqlx::query(
-        "DELETE FROM machine_events
-          WHERE created_at < now() - make_interval(secs => $1::double precision)",
-    )
-    .bind(retain_secs)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    crate::retention::cleanup::prune_batch(pool, "machine_events", retain_hours).await
 }
 
 fn machine_delivery_from_row(row: sqlx::postgres::PgRow) -> Result<ClaimedNotificationDelivery> {

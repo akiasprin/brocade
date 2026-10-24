@@ -9,9 +9,10 @@ use std::{
 };
 
 use brocade_core::artifacts::xray::FORWARD_OUTBOUND_TAG;
+use brocade_core::forwarding::{target_host_is_public_ip, target_ip_is_blocked_by_policy};
 use brocade_deployment::protocol::{
     ForwardingDesiredState, ForwardingReconcileReport, ForwardingRuleDesired,
-    ForwardingUsageCounter, ForwardingUsageReportRequest,
+    ForwardingRuleReconcileResult, ForwardingUsageCounter, ForwardingUsageReportRequest,
 };
 
 use crate::{
@@ -59,6 +60,13 @@ fn run_round(options: &Options, meter: &Mutex<()>) -> Result<bool, String> {
         let _guard = meter
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _deadline = crate::xray_grpc::deadline_after(
+            options
+                .state_dir
+                .join(crate::xrayupdate::UPGRADE_RUNTIME_FILE)
+                .exists()
+                .then_some(Duration::from_secs(1)),
+        );
         let report = reconcile(&options.state_dir, &desired);
         let usage = collect_usage(&options.state_dir);
         (report, usage)
@@ -90,15 +98,18 @@ pub(crate) fn restore_after_xray_restart(
         state_dir,
         &desired,
         forwarding_outbound_is_ready(xray_content),
-        &mut XrayForwardingApi(api_address),
+        &mut XrayForwardingApi(api_address, target_policy_supported(api_address)),
     )?;
     Ok(Some(report))
 }
 
 pub(crate) fn recovery_complete(state_dir: &Path, api_address: SocketAddr) -> Result<bool, String> {
-    let Some(desired) = desired_state_on_disk(state_dir)? else {
+    let Some(mut desired) = desired_state_on_disk(state_dir)? else {
         return Ok(true);
     };
+    for rule in &mut desired.rules {
+        rule.allow_private_targets = Some(rule.allow_private_targets.unwrap_or(false));
+    }
     let wanted = desired
         .rules
         .iter()
@@ -165,6 +176,7 @@ fn reconcile(state_dir: &Path, desired: &ForwardingDesiredState) -> ForwardingRe
         Err(error) => {
             let applied_rule_ids = current_forwarding_rule_ids(state_dir).unwrap_or_default();
             ForwardingReconcileReport {
+                rule_results: None,
                 generation: desired.generation,
                 applied_rule_ids,
                 error: Some(error.chars().take(900).collect()),
@@ -183,6 +195,7 @@ fn reconcile_inner(
         Ok(_) | Err(_) if desired.rules.is_empty() => {
             write_state(state_dir, desired)?;
             return Ok(ForwardingReconcileReport {
+                rule_results: None,
                 generation: desired.generation,
                 applied_rule_ids: Vec::new(),
                 error: None,
@@ -196,11 +209,17 @@ fn reconcile_inner(
         state_dir,
         desired,
         forwarding_outbound_is_ready(&content),
-        &mut XrayForwardingApi(api_address),
+        &mut XrayForwardingApi(api_address, target_policy_supported(api_address)),
     )
 }
 
 trait ForwardingRuntime {
+    fn target_policy_supported(&self) -> bool {
+        true
+    }
+    fn public_target(&self, _tag: &str) -> bool {
+        false
+    }
     fn inbound_tags(&mut self) -> Result<Vec<String>, String>;
     fn remove(&mut self, tag: &str) -> Result<(), String>;
     fn add(&mut self, rule: &ForwardingRuleDesired) -> Result<(), String>;
@@ -213,9 +232,20 @@ trait ForwardingRuntime {
     }
 }
 
-struct XrayForwardingApi(SocketAddr);
+struct XrayForwardingApi(SocketAddr, bool);
+
+fn target_policy_supported(api_address: SocketAddr) -> bool {
+    let _deadline = xray_grpc::deadline_after(Some(Duration::from_secs(2)));
+    xray_grpc::forwarding_target_policy_supported(api_address)
+}
 
 impl ForwardingRuntime for XrayForwardingApi {
+    fn target_policy_supported(&self) -> bool {
+        self.1
+    }
+    fn public_target(&self, tag: &str) -> bool {
+        xray_grpc::forwarding_target_is_public(self.0, tag)
+    }
     fn inbound_tags(&mut self) -> Result<Vec<String>, String> {
         xray_grpc::inbound_tags(self.0)
     }
@@ -232,7 +262,14 @@ impl ForwardingRuntime for XrayForwardingApi {
             rule.listen_port,
             &rule.target_host,
             rule.target_port,
+            rule.allow_private_targets.unwrap_or(false),
         )
+        .map_err(|error| {
+            format!(
+                "listen port {} could not be installed: {error}",
+                rule.listen_port
+            )
+        })
     }
 
     fn preflight_replacement(
@@ -298,15 +335,45 @@ fn reconcile_listeners(
     outbound_ready: bool,
     runtime: &mut impl ForwardingRuntime,
 ) -> Result<ForwardingReconcileReport, String> {
-    let mut known = read_state(state_dir)
-        .ok()
+    let mut desired = desired.clone();
+    for rule in &mut desired.rules {
+        rule.allow_private_targets = Some(rule.allow_private_targets.unwrap_or(false));
+    }
+    let checkpoint = read_checkpoint(state_dir);
+    let checkpoint_error = checkpoint.as_ref().err().cloned();
+    // Missing evidence cannot authorize replacing wanted listeners, but must not prevent
+    // revocations. Preserve those listeners and explicitly report a damaged checkpoint.
+    let checkpoint = checkpoint.unwrap_or_else(|_| ForwardingCheckpoint {
+        applied: ForwardingDesiredState {
+            generation: 0,
+            rules: Vec::new(),
+        },
+        installing_rule_ids: BTreeSet::new(),
+    });
+    let mut installing = checkpoint.installing_rule_ids;
+    let mut known = checkpoint
+        .applied
+        .rules
         .into_iter()
-        .flat_map(|state| state.rules)
         .map(|rule| (rule.id, rule))
         .collect::<BTreeMap<_, _>>();
+    let policy_supported = runtime.target_policy_supported();
     let wanted = desired
         .rules
         .iter()
+        .filter(|rule| {
+            let literal_blocked =
+                rule.target_host
+                    .trim_matches(['[', ']'])
+                    .parse()
+                    .is_ok_and(|address| {
+                        target_ip_is_blocked_by_policy(
+                            address,
+                            rule.allow_private_targets.unwrap_or(false),
+                        )
+                    });
+            !literal_blocked && (policy_supported || target_host_is_public_ip(&rule.target_host))
+        })
         .map(|rule| (rule.id, rule))
         .collect::<BTreeMap<_, _>>();
     let actual = runtime
@@ -319,8 +386,23 @@ fn reconcile_listeners(
     // definition until its listener has actually been removed: it is also the rollback payload
     // if the replacement cannot be installed.
     known.retain(|id, _| actual.contains_key(id));
-    write_checkpoint(state_dir, desired.generation, &known)?;
+    installing.retain(|id| actual.contains_key(id) && !known.contains_key(id));
+    write_checkpoint(state_dir, desired.generation, &known, &installing)?;
     let mut errors = ReconcileErrors::default();
+    for rule in &desired.rules {
+        if !wanted.contains_key(&rule.id) {
+            errors.push_rule(
+                rule.id,
+                format!(
+                    "rule {} target is blocked or running Xray needs forwarding-target-policy-v1",
+                    rule.id
+                ),
+            );
+        }
+    }
+    if let Some(error) = checkpoint_error {
+        errors.push(error);
+    }
     if !outbound_ready && !desired.rules.is_empty() {
         errors.push(format!(
             "Xray forwarding requires {FORWARD_OUTBOUND_TAG} as the first freedom outbound; publish a compatible Xray configuration first"
@@ -331,22 +413,43 @@ fn reconcile_listeners(
     // revocations still proceed, but authorized listeners are frozen instead of being torn down.
     // A failed operation must not block unrelated rules.
     for (id, tag) in actual {
+        let unknown = !known.contains_key(&id) && !installing.contains(&id);
+        let proven_public = unknown
+            && wanted
+                .get(&id)
+                .is_some_and(|rule| target_host_is_public_ip(&rule.target_host))
+            && runtime.public_target(&tag);
+        // A fixed public IP has the same allowed destination under either private-network
+        // policy. Preserve its socket, including legacy checkpoints, when only that flag changes.
+        if let (Some(previous), Some(replacement)) = (known.get_mut(&id), wanted.get(&id)) {
+            if target_host_is_public_ip(&replacement.target_host) {
+                previous.allow_private_targets = replacement.allow_private_targets;
+            }
+        }
         let unchanged = known
             .get(&id)
             .zip(wanted.get(&id))
             .is_some_and(|(previous, desired)| previous == *desired);
         let revoked = !wanted.contains_key(&id);
-        if revoked || (outbound_ready && !unchanged) {
+        let security_revocation = (unknown && !proven_public)
+            || wanted.get(&id).is_some_and(|replacement| {
+                !target_host_is_public_ip(&replacement.target_host)
+                    && previous_policy_requires_replacement(known.get(&id), replacement)
+            });
+        if revoked || (outbound_ready && !unchanged) || security_revocation {
             let previous = known.get(&id).cloned();
-            if !revoked && previous.is_none() {
-                errors.push(format!(
-                    "rule {id} has no applied checkpoint; preserving its existing listener"
-                ));
+            if !revoked && previous.is_none() && !installing.contains(&id) && proven_public {
+                errors.push_rule(
+                    id,
+                    format!(
+                        "rule {id} has no applied checkpoint; preserving its existing listener"
+                    ),
+                );
                 continue;
             }
             if let (Some(previous), Some(replacement)) = (previous.as_ref(), wanted.get(&id)) {
                 if let Err(error) = runtime.preflight_replacement(previous, replacement) {
-                    errors.push(format!("rule {id} preflight failed: {error}"));
+                    errors.push_rule(id, format!("rule {id} preflight failed: {error}"));
                     continue;
                 }
             }
@@ -354,38 +457,49 @@ fn reconcile_listeners(
                 Ok(()) => {
                     remaining.remove(&id);
                     known.remove(&id);
-                    write_checkpoint(state_dir, desired.generation, &known)?;
+                    installing.remove(&id);
+                    write_checkpoint(state_dir, desired.generation, &known, &installing)?;
 
                     if let Some(replacement) = wanted.get(&id).filter(|_| outbound_ready) {
-                        match runtime.add(replacement) {
+                        match install_listener(
+                            state_dir,
+                            desired.generation,
+                            runtime,
+                            replacement,
+                            &mut known,
+                            &mut installing,
+                        ) {
                             Ok(()) => {
-                                known.insert(id, (*replacement).clone());
                                 remaining.insert(id);
-                                write_checkpoint(state_dir, desired.generation, &known)?;
                             }
                             Err(error) => {
-                                errors.push(format!("rule {id} add failed: {error}"));
-                                if let Some(previous) = previous {
-                                    match restore_listener(runtime, &previous) {
+                                errors.push_rule(id, format!("rule {id} add failed: {error}"));
+                                if let Some(previous) = previous.filter(|previous| {
+                                    replacement.allow_private_targets.unwrap_or(false)
+                                        || !previous.allow_private_targets.unwrap_or(false)
+                                }) {
+                                    match restore_listener(
+                                        state_dir,
+                                        desired.generation,
+                                        runtime,
+                                        &previous,
+                                        &mut known,
+                                        &mut installing,
+                                    ) {
                                         Ok(()) => {
-                                            known.insert(id, previous);
                                             remaining.insert(id);
-                                            write_checkpoint(
-                                                state_dir,
-                                                desired.generation,
-                                                &known,
-                                            )?;
                                         }
-                                        Err(rollback_error) => errors.push(format!(
-                                            "rule {id} restore failed: {rollback_error}"
-                                        )),
+                                        Err(rollback_error) => errors.push_rule(
+                                            id,
+                                            format!("rule {id} restore failed: {rollback_error}"),
+                                        ),
                                     }
                                 }
                             }
                         }
                     }
                 }
-                Err(error) => errors.push(format!("rule {id} remove failed: {error}")),
+                Err(error) => errors.push_rule(id, format!("rule {id} remove failed: {error}")),
             }
         }
     }
@@ -395,12 +509,15 @@ fn reconcile_listeners(
                 continue;
             }
             known.remove(&rule.id);
-            match runtime.add(rule) {
-                Ok(()) => {
-                    known.insert(rule.id, (*rule).clone());
-                    write_checkpoint(state_dir, desired.generation, &known)?;
-                }
-                Err(error) => errors.push(format!("rule {} add failed: {error}", rule.id)),
+            if let Err(error) = install_listener(
+                state_dir,
+                desired.generation,
+                runtime,
+                rule,
+                &mut known,
+                &mut installing,
+            ) {
+                errors.push_rule(rule.id, format!("rule {} add failed: {error}", rule.id));
             }
         }
     }
@@ -417,21 +534,52 @@ fn reconcile_listeners(
             "Xray forwarding listeners have not fully converged; retrying next round".to_owned(),
         );
     }
-    write_checkpoint(state_dir, desired.generation, &known)?;
+    write_checkpoint(state_dir, desired.generation, &known, &installing)?;
     Ok(ForwardingReconcileReport {
+        rule_results: Some(
+            desired.rules
+                .iter()
+                .map(|rule| ForwardingRuleReconcileResult {
+                    rule: rule.clone(),
+                    applied: wanted.contains_key(&rule.id) && known.get(&rule.id) == Some(rule),
+                    error: errors
+                        .rules
+                        .get(&rule.id)
+                        .filter(|_| !wanted.contains_key(&rule.id) || known.get(&rule.id) != Some(rule))
+                        .cloned()
+                        .or_else(|| (!outbound_ready && known.get(&rule.id) != Some(rule)).then(||
+                            "Forwarding outbound is unavailable; publish a compatible Xray configuration first".to_owned())),
+                })
+                .collect(),
+        ),
         generation: desired.generation,
         applied_rule_ids: actual.into_iter().collect(),
         error: errors.finish(),
     })
 }
 
+fn previous_policy_requires_replacement(
+    previous: Option<&ForwardingRuleDesired>,
+    replacement: &ForwardingRuleDesired,
+) -> bool {
+    previous.is_none_or(|rule| {
+        rule.allow_private_targets.is_none()
+            || (!replacement.allow_private_targets.unwrap_or(false)
+                && rule.allow_private_targets.unwrap_or(false))
+    })
+}
+
 fn restore_listener(
+    state_dir: &Path,
+    generation: i64,
     runtime: &mut impl ForwardingRuntime,
     previous: &ForwardingRuleDesired,
+    known: &mut BTreeMap<i64, ForwardingRuleDesired>,
+    installing: &mut BTreeSet<i64>,
 ) -> Result<(), String> {
     let mut last_error = None;
     for attempt in 0..20 {
-        match runtime.add(previous) {
+        match install_listener(state_dir, generation, runtime, previous, known, installing) {
             Ok(()) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
@@ -446,23 +594,88 @@ fn write_checkpoint(
     state_dir: &Path,
     generation: i64,
     known: &BTreeMap<i64, ForwardingRuleDesired>,
+    installing: &BTreeSet<i64>,
 ) -> Result<(), String> {
-    write_state(
-        state_dir,
-        &ForwardingDesiredState {
+    let checkpoint = ForwardingCheckpoint {
+        applied: ForwardingDesiredState {
             generation,
             rules: known.values().cloned().collect(),
         },
-    )
+        installing_rule_ids: installing.clone(),
+    };
+    let content = serde_json::to_vec_pretty(&checkpoint).map_err(|error| error.to_string())?;
+    atomic_write_private(&state_dir.join(FORWARDING_STATE_FILE), &content)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ForwardingCheckpoint {
+    #[serde(flatten)]
+    applied: ForwardingDesiredState,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    installing_rule_ids: BTreeSet<i64>,
+}
+
+fn read_checkpoint(state_dir: &Path) -> Result<ForwardingCheckpoint, String> {
+    match fs::read(state_dir.join(FORWARDING_STATE_FILE)) {
+        Ok(content) => serde_json::from_slice(&content)
+            .map_err(|error| format!("decode forwarding checkpoint: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ForwardingCheckpoint {
+            applied: ForwardingDesiredState {
+                generation: 0,
+                rules: Vec::new(),
+            },
+            installing_rule_ids: BTreeSet::new(),
+        }),
+        Err(error) => Err(format!("read forwarding checkpoint: {error}")),
+    }
+}
+
+fn install_listener(
+    state_dir: &Path,
+    generation: i64,
+    runtime: &mut impl ForwardingRuntime,
+    rule: &ForwardingRuleDesired,
+    known: &mut BTreeMap<i64, ForwardingRuleDesired>,
+    installing: &mut BTreeSet<i64>,
+) -> Result<(), String> {
+    // Ownership must survive a lost AddInbound response or process exit. Never tear down an
+    // uncheckpointed listener unless this Agent durably recorded its installation attempt.
+    installing.insert(rule.id);
+    write_checkpoint(state_dir, generation, known, installing)?;
+    if let Err(error) = runtime.add(rule) {
+        let cleanup = (|| {
+            if runtime.inbound_tags()?.contains(&forwarding_tag(rule.id)) {
+                runtime.remove(&forwarding_tag(rule.id))?;
+            }
+            installing.remove(&rule.id);
+            write_checkpoint(state_dir, generation, known, installing)
+        })();
+        return Err(match cleanup {
+            Ok(()) => error,
+            Err(cleanup) => format!("{error}; cleanup pending: {cleanup}"),
+        });
+    }
+    known.insert(rule.id, rule.clone());
+    installing.remove(&rule.id);
+    write_checkpoint(state_dir, generation, known, installing)
 }
 
 #[derive(Default)]
 struct ReconcileErrors {
     messages: Vec<String>,
     omitted: bool,
+    rules: BTreeMap<i64, String>,
 }
 
 impl ReconcileErrors {
+    fn push_rule(&mut self, id: i64, error: String) {
+        if self.rules.len() < 1_024 {
+            self.rules
+                .entry(id)
+                .or_insert_with(|| error.chars().take(96).collect());
+        }
+        self.push(error);
+    }
     fn push(&mut self, error: String) {
         // Eight messages of at most 384 UTF-8 bytes fit the protocol's 4096-byte bound.
         if self.messages.len() < 8 {
@@ -637,8 +850,10 @@ mod tests {
 
     #[derive(Default)]
     struct FakeRuntime {
+        unsupported_target_policy: bool,
         rules: BTreeMap<i64, ForwardingRuleDesired>,
         fail_add: BTreeSet<i64>,
+        partial_add: BTreeSet<i64>,
         fail_target_ports: BTreeSet<u16>,
         fail_target_attempts: BTreeMap<u16, usize>,
         fail_remove: BTreeSet<i64>,
@@ -647,6 +862,14 @@ mod tests {
         operations: Vec<String>,
     }
     impl ForwardingRuntime for FakeRuntime {
+        fn target_policy_supported(&self) -> bool {
+            !self.unsupported_target_policy
+        }
+        fn public_target(&self, tag: &str) -> bool {
+            forwarding_id(tag)
+                .and_then(|id| self.rules.get(&id))
+                .is_some_and(|rule| target_host_is_public_ip(&rule.target_host))
+        }
         fn inbound_tags(&mut self) -> Result<Vec<String>, String> {
             self.snapshot_calls += 1;
             if self.fail_snapshot == Some(self.snapshot_calls) {
@@ -676,6 +899,9 @@ mod tests {
             if self.fail_add.contains(&rule.id)
                 || self.fail_target_ports.contains(&rule.target_port)
             {
+                if self.partial_add.contains(&rule.id) {
+                    self.rules.insert(rule.id, rule.clone());
+                }
                 return Err("injected add failure".to_owned());
             }
             self.rules.insert(rule.id, rule.clone());
@@ -689,7 +915,112 @@ mod tests {
             listen_port: 40_000 + id as u16,
             target_host: "unresolvable.invalid".to_owned(),
             target_port: 443,
+            allow_private_targets: Some(false),
         }
+    }
+
+    #[test]
+    fn forwarding_policy_changes_preserve_public_ip_connections() {
+        let dir = TestDir::new();
+        let mut previous = rule(1);
+        previous.target_host = "1.1.1.1".to_owned();
+        previous.allow_private_targets = None;
+        write_state(&dir.0, &desired(vec![previous.clone()])).unwrap();
+        let mut runtime = FakeRuntime {
+            unsupported_target_policy: true,
+            ..Default::default()
+        };
+        runtime.rules.insert(1, previous.clone());
+        let mut wanted = previous;
+        wanted.allow_private_targets = Some(false);
+        let report =
+            reconcile_listeners(&dir.0, &desired(vec![wanted]), true, &mut runtime).unwrap();
+        assert!(report.error.is_none());
+        assert!(
+            runtime.operations.is_empty(),
+            "public listener must remain open"
+        );
+    }
+
+    #[test]
+    fn forwarding_replaces_legacy_domain_listeners_with_a_policy() {
+        let dir = TestDir::new();
+        let mut previous = rule(1);
+        previous.allow_private_targets = None;
+        write_state(&dir.0, &desired(vec![previous.clone()])).unwrap();
+        let mut runtime = FakeRuntime::default();
+        runtime.rules.insert(1, previous);
+        let report =
+            reconcile_listeners(&dir.0, &desired(vec![rule(1)]), true, &mut runtime).unwrap();
+        assert!(report.error.is_none());
+        assert_eq!(runtime.operations, ["remove:1", "add:1"]);
+    }
+
+    #[test]
+    fn forwarding_missing_checkpoint_never_trusts_a_public_target_from_desired_state() {
+        let dir = TestDir::new();
+        let mut actual = rule(1);
+        actual.target_host = "127.0.0.1".to_owned();
+        let mut wanted = rule(1);
+        wanted.target_host = "1.1.1.1".to_owned();
+        let mut runtime = FakeRuntime::default();
+        runtime.rules.insert(1, actual);
+        let report =
+            reconcile_listeners(&dir.0, &desired(vec![wanted]), false, &mut runtime).unwrap();
+        assert!(report.error.is_some());
+        assert_eq!(runtime.operations, ["remove:1"]);
+        assert!(!runtime.rules.contains_key(&1));
+    }
+
+    #[test]
+    fn forwarding_policy_tightening_never_restores_the_permissive_listener() {
+        let dir = TestDir::new();
+        let mut previous = rule(1);
+        previous.allow_private_targets = Some(true);
+        write_state(&dir.0, &desired(vec![previous.clone()])).unwrap();
+        let mut runtime = FakeRuntime::default();
+        runtime.rules.insert(1, previous);
+        runtime.fail_add.insert(1);
+        let report =
+            reconcile_listeners(&dir.0, &desired(vec![rule(1)]), true, &mut runtime).unwrap();
+        assert!(report.error.is_some());
+        assert_eq!(runtime.operations, ["remove:1", "add:1", "add:1"]);
+        assert!(!runtime.rules.contains_key(&1));
+    }
+
+    #[test]
+    fn forwarding_tightening_revokes_even_when_the_outbound_is_unavailable() {
+        let dir = TestDir::new();
+        let mut previous = rule(1);
+        previous.allow_private_targets = Some(true);
+        write_state(&dir.0, &desired(vec![previous.clone()])).unwrap();
+        let mut runtime = FakeRuntime::default();
+        runtime.rules.insert(1, previous);
+        let report =
+            reconcile_listeners(&dir.0, &desired(vec![rule(1)]), false, &mut runtime).unwrap();
+        assert!(report.error.is_some());
+        assert_eq!(runtime.operations, ["remove:1"]);
+        assert!(!runtime.rules.contains_key(&1));
+    }
+
+    #[test]
+    fn forwarding_old_xray_revokes_domains_but_preserves_existing_public_ips() {
+        let dir = TestDir::new();
+        let mut public = rule(2);
+        public.target_host = "1.1.1.1".to_owned();
+        write_state(&dir.0, &desired(vec![rule(1), public.clone()])).unwrap();
+        let mut runtime = FakeRuntime {
+            unsupported_target_policy: true,
+            ..Default::default()
+        };
+        runtime.rules.extend([(1, rule(1)), (2, public.clone())]);
+        let report =
+            reconcile_listeners(&dir.0, &desired(vec![rule(1), public]), true, &mut runtime)
+                .unwrap();
+        assert!(report.error.is_some());
+        assert_eq!(runtime.operations, ["remove:1"]);
+        assert_eq!(report.applied_rule_ids, [2]);
+        assert!(!report.rule_results.unwrap()[0].applied);
     }
     fn desired(rules: Vec<ForwardingRuleDesired>) -> ForwardingDesiredState {
         ForwardingDesiredState {
@@ -707,6 +1038,95 @@ mod tests {
         assert_eq!(forwarding_id("fwd:7"), Some(7));
         assert_eq!(forwarding_id("in:app/ingress"), None);
         assert_eq!(parse_stat_name("user>>>fwd:42>>>traffic>>>uplink"), None);
+    }
+
+    #[test]
+    fn forwarding_failed_add_cleans_partial_listener_and_retries_independently() {
+        let dir = TestDir::new();
+        write_state(&dir.0, &desired(vec![rule(1)])).unwrap();
+        let mut runtime = FakeRuntime::default();
+        runtime.rules.insert(1, rule(1));
+        runtime.fail_add.insert(2);
+        runtime.partial_add.insert(2);
+        let wanted = desired(vec![rule(1), rule(2), rule(3)]);
+        let report = reconcile_listeners(&dir.0, &wanted, true, &mut runtime).unwrap();
+        assert_eq!(runtime.operations, ["add:2", "remove:2", "add:3"]);
+        assert_eq!(report.applied_rule_ids, [1, 3]);
+        let results = report.rule_results.unwrap();
+        assert!(results[0].applied && results[0].error.is_none());
+        assert!(!results[1].applied && results[1].error.is_some());
+        assert!(results[2].applied && results[2].error.is_none());
+        runtime.fail_add.clear();
+        runtime.operations.clear();
+        let report = reconcile_listeners(&dir.0, &wanted, true, &mut runtime).unwrap();
+        assert!(report.error.is_none());
+        assert_eq!(runtime.operations, ["add:2"]);
+    }
+
+    #[test]
+    fn forwarding_failed_cleanup_survives_restart_without_touching_other_rules() {
+        let dir = TestDir::new();
+        write_state(&dir.0, &desired(vec![rule(1)])).unwrap();
+        let mut runtime = FakeRuntime::default();
+        runtime.rules.insert(1, rule(1));
+        runtime.fail_add.insert(2);
+        runtime.partial_add.insert(2);
+        runtime.fail_remove.insert(2);
+        let wanted = desired(vec![rule(1), rule(2), rule(3)]);
+        let report = reconcile_listeners(&dir.0, &wanted, true, &mut runtime).unwrap();
+        assert!(report.error.is_some());
+        assert_eq!(
+            read_checkpoint(&dir.0).unwrap().installing_rule_ids,
+            BTreeSet::from([2])
+        );
+        runtime.fail_add.clear();
+        runtime.fail_remove.clear();
+        runtime.operations.clear();
+        let report = reconcile_listeners(&dir.0, &wanted, true, &mut runtime).unwrap();
+        assert!(report.error.is_none());
+        assert_eq!(runtime.operations, ["remove:2", "add:2"]);
+        assert!(read_checkpoint(&dir.0)
+            .unwrap()
+            .installing_rule_ids
+            .is_empty());
+    }
+
+    #[test]
+    fn forwarding_interrupted_installation_retries_only_the_owned_listener() {
+        let dir = TestDir::new();
+        write_checkpoint(
+            &dir.0,
+            7,
+            &BTreeMap::from([(1, rule(1))]),
+            &BTreeSet::from([2]),
+        )
+        .unwrap();
+        let mut runtime = FakeRuntime::default();
+        runtime.rules.extend([(1, rule(1)), (2, rule(2))]);
+        let report =
+            reconcile_listeners(&dir.0, &desired(vec![rule(1), rule(2)]), true, &mut runtime)
+                .unwrap();
+        assert!(report.error.is_none());
+        assert_eq!(runtime.operations, ["remove:2", "add:2"]);
+    }
+
+    #[test]
+    fn forwarding_damaged_checkpoint_still_revokes_without_replacing_unknown_listeners() {
+        let dir = TestDir::new();
+        fs::write(dir.0.join(FORWARDING_STATE_FILE), "{damaged").unwrap();
+        let mut runtime = FakeRuntime::default();
+        let mut public = rule(1);
+        public.target_host = "1.1.1.1".to_owned();
+        runtime.rules.extend([(1, public.clone()), (2, rule(2))]);
+        let report =
+            reconcile_listeners(&dir.0, &desired(vec![public]), true, &mut runtime).unwrap();
+        assert!(report
+            .error
+            .unwrap()
+            .contains("decode forwarding checkpoint"));
+        assert_eq!(report.applied_rule_ids, [1]);
+        assert_eq!(runtime.operations, ["remove:2"]);
+        assert!(!report.rule_results.unwrap()[0].applied);
     }
 
     #[test]
@@ -807,25 +1227,35 @@ mod tests {
     fn forwarding_without_the_dedicated_outbound_freezes_existing_but_still_revokes() {
         let dir = TestDir::new();
         let mut runtime = FakeRuntime::default();
-        runtime.rules.insert(1, rule(1));
-        runtime.rules.insert(2, rule(2));
-        let mut changed = rule(2);
+        let mut first = rule(1);
+        first.target_host = "1.1.1.1".to_owned();
+        let mut second = rule(2);
+        second.target_host = "8.8.8.8".to_owned();
+        runtime.rules.insert(1, first.clone());
+        runtime.rules.insert(2, second.clone());
+        let mut changed = second;
         changed.target_port = 8443;
         let report = reconcile_listeners(
             &dir.0,
-            &desired(vec![rule(1), changed, rule(3)]),
+            &desired(vec![first.clone(), changed, rule(3)]),
             false,
             &mut runtime,
         )
         .unwrap();
         assert!(report.error.is_some());
         assert_eq!(report.applied_rule_ids, [1, 2]);
+        assert!(report
+            .rule_results
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|result| !result.applied && result.error.is_some()));
         assert!(runtime.operations.is_empty());
 
         runtime.rules.insert(4, rule(4));
         runtime.operations.clear();
         let report =
-            reconcile_listeners(&dir.0, &desired(vec![rule(1)]), false, &mut runtime).unwrap();
+            reconcile_listeners(&dir.0, &desired(vec![first]), false, &mut runtime).unwrap();
         assert!(report.error.is_some());
         assert_eq!(report.applied_rule_ids, [1]);
         assert_eq!(runtime.operations, ["remove:2", "remove:4"]);
@@ -881,7 +1311,8 @@ mod tests {
     #[test]
     fn forwarding_preserves_a_wanted_listener_when_its_checkpoint_is_missing() {
         let dir = TestDir::new();
-        let existing = rule(1);
+        let mut existing = rule(1);
+        existing.target_host = "1.1.1.1".to_owned();
         let mut runtime = FakeRuntime::default();
         runtime.rules.insert(1, existing.clone());
 
@@ -995,16 +1426,31 @@ mod tests {
         }
         assert!(ready, "isolated Xray API did not become ready");
 
+        // A host-wide proxy may select a reserved benchmarking address for default routes.
+        // Pick a permitted address actually assigned to this host so the fixture stays local.
+        let local_addresses = crate::run_command("ip", &["-o", "-4", "addr", "show"])
+            .expect("native forwarding fixture needs iproute2");
+        let target_host = local_addresses
+            .split_whitespace()
+            .filter_map(|field| {
+                field
+                    .split_once('/')
+                    .and_then(|(address, _)| address.parse::<std::net::IpAddr>().ok())
+            })
+            .find(|address| !target_ip_is_blocked_by_policy(*address, true))
+            .expect("native forwarding fixture needs a permitted local IPv4 address")
+            .to_string();
         let original = ForwardingRuleDesired {
             id: 42,
             protocol: ForwardingProtocol::Tcp,
             listen_port: original_port,
-            target_host: "127.0.0.1".to_owned(),
+            target_host,
             target_port: 9,
+            allow_private_targets: Some(true),
         };
         let wanted = desired(vec![original.clone()]);
         write_desired_state(&dir.0, &wanted).unwrap();
-        let mut runtime = XrayForwardingApi(api_address);
+        let mut runtime = XrayForwardingApi(api_address, true);
         let report = reconcile_listeners(&dir.0, &wanted, true, &mut runtime).unwrap();
         assert_eq!(report.error, None);
         TcpStream::connect((Ipv4Addr::LOCALHOST, original_port))

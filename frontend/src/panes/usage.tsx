@@ -148,7 +148,7 @@ export function UsagePane() {
           {tab === 'monthly' ? (
             <>
               {monthly.isPending && (
-                <div className="usage-month-loading">
+                <div className="usage-tab-loading">
                   <PanelLoading label="读取月度用量" announce={false} />
                 </div>
               )}
@@ -278,18 +278,22 @@ function UsageLedger({
           <dd>
             {peak ? (
               <>
-                <button
-                  type="button"
-                  className="usage-peak"
-                  aria-label={`在每日流量中查看 ${shortDayLabel(peak.day)}`}
-                  onClick={() => onSelectDay(peak.day)}
-                >
-                  {shortDayLabel(peak.day)}
-                </button>
-                <span className="usage-dot" aria-hidden="true">
-                  ·
+                {/* 窄屏放不下一行时在间隔号之后换行，日期和读数各自保持完整。 */}
+                <span className="usage-nobreak">
+                  <button
+                    type="button"
+                    className="usage-peak"
+                    aria-label={`在每日流量中查看 ${shortDayLabel(peak.day)}`}
+                    onClick={() => onSelectDay(peak.day)}
+                  >
+                    {shortDayLabel(peak.day)}
+                  </button>
+                  <span className="usage-dot" aria-hidden="true">
+                    ·
+                  </span>
                 </span>
-                {bytes(dayBytes(peak))}
+                <wbr />
+                <span className="usage-nobreak">{bytes(dayBytes(peak))}</span>
               </>
             ) : (
               '—'

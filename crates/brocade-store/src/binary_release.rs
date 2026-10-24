@@ -573,7 +573,9 @@ pub async fn create_binary_release(
             && xray_strategy != Some(XrayReleaseStrategy::Restart)
             && (observation.agent_protocol_version.unwrap_or_default()
                 < XRAY_HANDOFF_PROTOCOL_VERSION
-                || !observation.xray_handoff_ready)
+                || (!observation.xray_handoff_ready
+                    && observation.agent_protocol_version.unwrap_or_default()
+                        < brocade_deployment::protocol::XRAY_HANDOFF_RESTART_FALLBACK_PROTOCOL_VERSION))
         {
             return Err(StoreError::InvalidData(format!(
                 "node {node_id} has not reported a ready managed Xray handoff runtime"

@@ -25,7 +25,7 @@ import { prefersReducedMotion } from './ui/motion';
 
 /* 用户详情「站点流量」：固定站点分类、其他站点的域名明细、嗅探失败的目标明细合在一张卡里。
    上半部左侧是按小时（当天、当周）或按天（当月）的堆叠柱，右侧是排行；下半部是两类明细。
-   范围是 UTC+8 的自然日、周一起的自然周、自然月，与额度的自然月相同；明细只保留近 24 小时，
+   范围是 UTC+8 的自然日、周一起的自然周、自然月，与额度的自然月相同；明细遵循数据保留设置，
    当周、当月的明细由说明行写明范围。 */
 
 const LazySiteUsageChart = lazy(() => import('./site-usage-chart'));
@@ -49,7 +49,7 @@ const TOP_SITES = 5;
 const DETAIL_ROWS = 6;
 
 const SCOPE =
-  '认证代理入口按固定站点域名集合归类，每条连接只计入一类，不保存 URL。嗅探失败：启用嗅探但未取得域名；未识别：未启用嗅探且无域名。其他站点按主机名、嗅探失败按原始目标 IP 与端口另记明细，只保留近 24 小时。端口转发作为独立类型计入，沿用账本窗口起点归属；当天、当周按保留明细显示小时分布，当月按日汇总，不提供站点分类。站点采集状态只描述认证代理入口。按 UTC+8 自然日、自然周（周一起）、自然月统计。';
+  '认证代理入口按固定站点域名集合归类，每条连接只计入一类，不保存 URL。嗅探失败：启用嗅探但未取得域名；未识别：未启用嗅探且无域名。其他站点按主机名、嗅探失败按原始目标 IP 与端口另记明细，保存时长遵循数据保留设置。端口转发作为独立类型计入，沿用账本窗口起点归属；当天、当周按保留明细显示小时分布，当月按日汇总，不提供站点分类。站点采集状态只描述认证代理入口。按 UTC+8 自然日、自然周（周一起）、自然月统计。';
 const NODE_SCOPE =
   '本机认证代理入口按目的站点分类，端口转发作为独立类型计入。端口转发沿用账本窗口起点归属，当天、当周按保留明细显示小时分布，当月按日汇总；不提供站点分类。站点采集状态只描述认证代理入口。按 UTC+8 自然日、自然周（周一起）、自然月统计。';
 const FORWARDING_COLOR: SiteUsageColor = { token: '--observe-2' };
@@ -294,7 +294,8 @@ function coverageText(
 ): string {
   const parts: string[] = [];
   if (!detail.collection_enabled) parts.push('明细采集已关闭，显示已保留的数据');
-  if (!site || detail.range_start_unix_secs > site.range_start_unix_secs) parts.push('明细只保留近 24 小时');
+  if (!site || detail.range_start_unix_secs > site.range_start_unix_secs)
+    parts.push(`明细自${moment(detail.range_start_unix_secs, detail.range_end_unix_secs)} 起保留`);
   if (detail.observed_since_unix_secs !== null && detail.observed_since_unix_secs > detail.range_start_unix_secs)
     parts.push(`自${moment(detail.observed_since_unix_secs, detail.range_end_unix_secs)} 起采集`);
   const covered = detail.rows.reduce((sum, row) => sum + row.uplink_bytes + row.downlink_bytes, 0);
@@ -754,13 +755,6 @@ function SiteUsageCard({
         className="site-usage-body panel-full-bleed-body"
         aria-busy={site.isFetching || domains.isFetching || targets.isFetching}
       >
-        {range && data && (
-          <p className="site-usage-note">
-            目标按小时汇总，实际覆盖 {moment(data.range_start_unix_secs, data.range_end_unix_secs)} —{' '}
-            {moment(data.range_end_unix_secs, data.range_end_unix_secs)}
-            （UTC+8）；不按分钟均摊站点流量，转发仅含尚存的窗口明细。
-          </p>
-        )}
         {site.isError && !data && (
           <p role="alert" className="site-usage-state">
             站点统计读取失败，请稍后重试。
@@ -899,6 +893,13 @@ function SiteUsageCard({
               onToggle={() => setOpen(current => ({ ...current, [kind]: !current[kind] }))}
             />
           ))}
+        {range && data && (
+          <p className="site-usage-note">
+            目标按小时汇总，实际覆盖 {moment(data.range_start_unix_secs, data.range_end_unix_secs)} —{' '}
+            {moment(data.range_end_unix_secs, data.range_end_unix_secs)}
+            （UTC+8）；不按分钟均摊站点流量，转发仅含尚存的窗口明细。
+          </p>
+        )}
       </div>
     </section>
   );

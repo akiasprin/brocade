@@ -1,3 +1,4 @@
+import { InlineField } from '../ui/inline-field';
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
@@ -8,7 +9,7 @@ import {
   fetchForwardingOverview,
   fetchForwardingProbes,
   fetchNodes,
-  fetchUsageMonthly,
+  fetchUserCycleUsage,
   setForwardingEntitlement,
   setForwardingQuota,
   updateForwardingRule,
@@ -26,7 +27,7 @@ import {
 import { Confirm, EmptyState, ErrorBox, SegmentedControl } from '../ui/bits';
 import { CopyButton, copyStateIcon } from '../ui/copy-button';
 import { bytes, shareOf } from '../ui/format';
-import { endpointText, parseTarget, submittedHost, type ParsedTarget } from '../ui/forwarding-target';
+import { blockedAddress, endpointText, parseTarget, submittedHost, type ParsedTarget } from '../ui/forwarding-target';
 import { Icon, PanelTitle, type IconName } from '../ui/icons';
 import { FieldLoading } from '../ui/loading';
 import { observeBpsReading } from '../ui/observe-chart';
@@ -43,7 +44,7 @@ import {
 import { ForwardingRuleProbe, forwardingProbeKey, forwardingProbePending } from './forwarding-probe';
 
 /* 用户详情「转发」页签：共用服务端查询，规则面板独立筛选机器。
- * 月度转发独立于接入账本，已删除规则仍计入合计和所属机器；规则额度是数量上限。
+ * 本期转发独立于接入账本，已删除规则仍计入合计和所属机器；规则额度是数量上限。
  * 授权与规则都在原行下展开；停止/移除授权原位确认，删除规则使用公共确认框。 */
 
 export interface ForwardingNodeOption {
@@ -54,7 +55,7 @@ export interface ForwardingNodeOption {
   api_port?: number | null;
 }
 
-type RuleSort = 'port' | 'month' | 'created';
+type RuleSort = 'port' | 'cycle' | 'created';
 type RuleFilter = 'all' | 'active' | 'attention' | 'disabled';
 type Traffic = { down: number; up: number };
 
@@ -93,7 +94,7 @@ type PolicyDialog = {
 const PROTOCOL_LABEL: Record<ForwardingProtocol, string> = { tcp: 'TCP', udp: 'UDP', tcp_udp: 'TCP + UDP' };
 
 // 新授权的默认策略：同时开放 TCP 与 UDP，使用完整的转发端口段，并允许内部目标。
-const GRANT_DEFAULTS = { start: 30_000, end: 59_999, max: 100, allowPrivate: true } as const;
+const GRANT_DEFAULTS = { start: 30_000, end: 59_999, max: 100, allowPrivate: false } as const;
 
 const writablePort = (port: ForwardingPort): number => {
   if (typeof port !== 'number') throw new Error('脱敏的转发信息不能用于修改规则或授权');
@@ -124,7 +125,7 @@ const policyLimit = (dialog: PolicyDialog) =>
 const policyChanged = (dialog: PolicyDialog, entry: ForwardingEntitlement | undefined) =>
   !entry ||
   JSON.stringify(policyWrite(dialog.draft, entry.enabled)) !== JSON.stringify(entitlementWrite(entry)) ||
-  policyLimit(dialog) !== (entry.monthly_limit_bytes ?? null);
+  policyLimit(dialog) !== (entry.cycle_limit_bytes ?? null);
 const effectiveStatus = (rule: ForwardingRule, entry: ForwardingEntitlement | undefined) =>
   !rule.enabled || !entry?.enabled ? 'disabled' : entry.quota_suspended ? 'quota-paused' : rule.runtime_status;
 const ruleCategory = (rule: ForwardingRule, entry: ForwardingEntitlement | undefined): Exclude<RuleFilter, 'all'> => {
@@ -174,16 +175,38 @@ const nextFreePort = (
   return null;
 };
 
-const entryState = (entry: ForwardingEntitlement) =>
-  !entry.enabled
-    ? { tone: 'off', text: '已停止' }
-    : entry.reconcile_status === 'error'
-      ? { tone: 'bad', text: '收敛失败' }
-      : entry.applied_generation !== entry.desired_generation
-        ? { tone: 'warn', text: '同步中' }
-        : entry.quota_suspended
-          ? { tone: 'warn', text: '配额暂停' }
-          : { tone: 'ok', text: '已就绪' };
+const entryState = (entry: ForwardingEntitlement, rules: ForwardingRule[]) => {
+  if (!entry.enabled) return { tone: 'off', text: '已停止' };
+  if (entry.quota_suspended) return { tone: 'warn', text: '配额暂停' };
+  const own = rules.filter(rule => rule.node_id === entry.node_id);
+  const count = (status: ForwardingRule['runtime_status']) =>
+    own.filter(rule => effectiveStatus(rule, entry) === status).length;
+  const active = count('active');
+  const pending = count('pending');
+  const failed = count('error');
+  const unknown = count('unknown');
+  const servicePaused = count('service-paused');
+  const disabled = count('disabled');
+  if (own.length) {
+    return {
+      tone: failed ? 'bad' : pending || unknown || servicePaused ? 'warn' : active ? 'ok' : 'off',
+      text: [
+        active && `${active} 条正常`,
+        pending && `${pending} 条同步中`,
+        failed && `${failed} 条失败`,
+        unknown && `${unknown} 条待确认`,
+        servicePaused && `${servicePaused} 条有效期暂停`,
+        disabled && `${disabled} 条已停用`,
+      ]
+        .filter(Boolean)
+        .join(' · '),
+    };
+  }
+  if (entry.reconcile_status === 'error') return { tone: 'warn', text: '入口状态待确认' };
+  return entry.applied_generation !== entry.desired_generation
+    ? { tone: 'warn', text: '同步中' }
+    : { tone: 'ok', text: '已就绪' };
+};
 
 const RULE_STATUS: Record<ForwardingRule['runtime_status'], { tone: string; text: string } | null> = {
   active: null,
@@ -191,6 +214,8 @@ const RULE_STATUS: Record<ForwardingRule['runtime_status'], { tone: string; text
   error: { tone: 'bad', text: '收敛失败' },
   disabled: { tone: 'off', text: '已停用' },
   'quota-paused': { tone: 'warn', text: '配额暂停' },
+  'service-paused': { tone: 'warn', text: '有效期暂停' },
+  unknown: { tone: 'warn', text: '状态待确认' },
 };
 
 /** 规则名默认就是目标地址；只有自定义过的名称才单独显示。 */
@@ -250,8 +275,12 @@ function checkRule(
       problems.push(parsed.error);
       targetBad = true;
     }
-  } else if (parsed.blocked && !entry.allow_private_targets) {
-    problems.push(`${entry.node_name} 未允许转发到私网、环回或保留地址`);
+  } else if (blockedAddress(parsed.host, entry.allow_private_targets)) {
+    problems.push(
+      entry.allow_private_targets
+        ? '回环、链路本地、元数据及保留地址始终拒绝'
+        : `${entry.node_name} 未允许转发到私网、环回或保留地址`,
+    );
     targetBad = true;
   }
   const port = Number(draft.port);
@@ -339,6 +368,7 @@ export function UserForwardingCard({
   canViewRealtime = false,
   accountingDisabled,
   onAccountingModeChange,
+  servicePolicy,
 }: {
   user: UserListItem;
   nodes: ForwardingNodeOption[];
@@ -348,6 +378,8 @@ export function UserForwardingCard({
   canViewRealtime?: boolean;
   accountingDisabled: boolean;
   onAccountingModeChange: (mode: UserTrafficAccountingMode) => void;
+  /** 账期与有效期由用户页提供（与「接入」读数栏同一份），排在计量口径之后。 */
+  servicePolicy?: ReactNode;
 }) {
   const qc = useQueryClient();
   const key = ['forwarding', user.tenant_id, user.id] as const;
@@ -355,23 +387,23 @@ export function UserForwardingCard({
     queryKey: key,
     queryFn: () => fetchForwardingOverview(user.tenant_id, user.id),
     refetchInterval: query =>
-      query.state.data?.rules.some(rule => rule.runtime_status === 'pending') ||
+      query.state.data?.rules.some(rule => ['pending', 'error', 'unknown'].includes(rule.runtime_status)) ||
       query.state.data?.entitlements.some(
         entry =>
           entry.enabled &&
           (entry.desired_generation !== entry.applied_generation ||
             entry.quota_job_status === 'queued' ||
             entry.quota_job_status === 'running' ||
-            (entry.monthly_limit_bytes != null &&
-              entry.monthly_used_bytes !== undefined &&
-              entry.monthly_used_bytes >= entry.monthly_limit_bytes) !== !!entry.quota_suspended),
+            (entry.cycle_limit_bytes != null &&
+              entry.cycle_used_bytes !== undefined &&
+              entry.cycle_used_bytes >= entry.cycle_limit_bytes) !== !!entry.quota_suspended),
       )
         ? 5_000
-        : query.state.data?.entitlements.some(entry => entry.monthly_limit_bytes != null)
+        : query.state.data?.entitlements.some(entry => entry.enabled)
           ? 30_000
           : false,
   });
-  // 本月用量与用户页「用量与额度」共用同一份月度汇总
+  // 本期用量与用户页「用量与额度」共用同一份账期汇总
   const probes = useQuery({
     queryKey: forwardingProbeKey(user.tenant_id, user.id),
     queryFn: () => fetchForwardingProbes(user.tenant_id, user.id),
@@ -379,7 +411,7 @@ export function UserForwardingCard({
     refetchInterval: query => (query.state.data?.some(forwardingProbePending) ? 2_000 : false),
     retry: false,
   });
-  const monthly = useQuery({ queryKey: ['usage-monthly'], queryFn: () => fetchUsageMonthly() });
+  const cycle = useQuery({ queryKey: ['user-cycles'], queryFn: () => fetchUserCycleUsage() });
   // 地区旗取机器列表；取不到时不画旗，不影响其余内容
   const fleet = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), retry: false });
   const realtime = useUserTrafficSource(user.tenant_id, user.id, canViewRealtime);
@@ -432,7 +464,7 @@ export function UserForwardingCard({
         setPolicy(active => (active?.session === dialog.session ? { ...active, mode: 'edit' } : active));
       }
       if (!current) throw new Error('保存响应缺少转发授权，请刷新后检查');
-      if (limit !== (current.monthly_limit_bytes ?? null)) {
+      if (limit !== (current.cycle_limit_bytes ?? null)) {
         try {
           value = await setForwardingQuota(user.tenant_id, user.id, nodeId, limit);
           storeResult(value);
@@ -520,10 +552,10 @@ export function UserForwardingCard({
   }, [fleet.data]);
   const loadFailed = !!overview.error && !overview.data;
 
-  // 本月：月度汇总里这位用户的转发行；已删除的规则只计入合计
-  const month = useMemo(() => {
-    if (!monthly.data) return null;
-    const rows = (monthly.data.forwarding ?? []).filter(
+  // 本期：账期汇总里这位用户的转发行；已删除的规则只计入合计
+  const cycleTraffic = useMemo(() => {
+    if (!cycle.data) return null;
+    const rows = (cycle.data.forwarding ?? []).filter(
       row => row.tenant_id === user.tenant_id && row.user_id === user.id,
     );
     const byRule = new Map<number, Traffic>();
@@ -542,10 +574,11 @@ export function UserForwardingCard({
     const deleted =
       rows.filter(row => !live.has(row.rule_id)).reduce((sum, row) => sum + row.downlink_bytes + row.uplink_bytes, 0) *
       accountingMultiplier;
-    return { byRule, byNode, down, up, deleted, start: monthly.data.month_start, end: monthly.data.month_end };
-  }, [accountingMultiplier, monthly.data, rules, user.tenant_id, user.id]);
-  const monthOf = (rule: ForwardingRule): Traffic | null =>
-    month ? (month.byRule.get(rule.id) ?? { down: 0, up: 0 }) : null;
+    const period = cycle.data.periods?.find(p => p.tenant_id === user.tenant_id && p.user_id === user.id);
+    return { byRule, byNode, down, up, deleted, start: period?.starts_at, end: period?.ends_at };
+  }, [accountingMultiplier, cycle.data, rules, user.tenant_id, user.id]);
+  const cycleOf = (rule: ForwardingRule): Traffic | null =>
+    cycleTraffic ? (cycleTraffic.byRule.get(rule.id) ?? { down: 0, up: 0 }) : null;
 
   // 当前：只认新鲜、就绪的报告；覆盖不到的机器上的规则读作「—」，不是 0
   const live = useMemo(
@@ -567,9 +600,9 @@ export function UserForwardingCard({
     return { total, active };
   }, [live]);
 
-  const maxMonth = Math.max(
+  const maxCycle = Math.max(
     1,
-    ...rules.map(rule => (month?.byRule.get(rule.id)?.down ?? 0) + (month?.byRule.get(rule.id)?.up ?? 0)),
+    ...rules.map(rule => (cycleTraffic?.byRule.get(rule.id)?.down ?? 0) + (cycleTraffic?.byRule.get(rule.id)?.up ?? 0)),
   );
   const scopedRules = rules.filter(rule => !filterNode || rule.node_id === filterNode);
   const statusCounts = {
@@ -592,17 +625,17 @@ export function UserForwardingCard({
       );
     });
     const totalOf = (rule: ForwardingRule) => {
-      const value = month?.byRule.get(rule.id);
+      const value = cycleTraffic?.byRule.get(rule.id);
       return value ? value.down + value.up : 0;
     };
     const by: Record<RuleSort, (a: ForwardingRule, b: ForwardingRule) => number> = {
       port: (a, b) =>
         typeof a.listen_port === 'number' && typeof b.listen_port === 'number' ? a.listen_port - b.listen_port : 0,
-      month: (a, b) => totalOf(b) - totalOf(a),
+      cycle: (a, b) => totalOf(b) - totalOf(a),
       created: (a, b) => parseTimestamp(b.created_at) - parseTimestamp(a.created_at),
     };
     return [...filtered].sort((a, b) => by[sort](a, b) || a.id - b.id);
-  }, [rules, entries, filterNode, statusFilter, search, sort, month]);
+  }, [rules, entries, filterNode, statusFilter, search, sort, cycleTraffic]);
   const creatableEntries = activeEntries.filter(
     entry =>
       (!filterNode || entry.node_id === filterNode) &&
@@ -694,13 +727,13 @@ export function UserForwardingCard({
       closeEditors();
       return;
     }
-    const quota = forwardingQuotaText(entry.monthly_limit_bytes);
+    const quota = forwardingQuotaText(entry.cycle_limit_bytes);
     setEditor(null);
     setMenu(null);
     setPolicy({
       mode: 'edit',
       session: newSession(trigger),
-      initialQuota: { text: quota, bytes: entry.monthly_limit_bytes ?? null },
+      initialQuota: { text: quota, bytes: entry.cycle_limit_bytes ?? null },
       draft: {
         nodeId: entry.node_id,
         tcp: entry.tcp_allowed,
@@ -800,21 +833,24 @@ export function UserForwardingCard({
   const sortedEntries = [...entries].sort(
     (a, b) => Number(b.enabled) - Number(a.enabled) || a.node_name.localeCompare(b.node_name, 'zh-CN'),
   );
-  const [figure, unit] = month ? bytes(month.down + month.up).split(' ') : ['', ''];
+  const [figure, unit] = cycleTraffic ? bytes(cycleTraffic.down + cycleTraffic.up).split(' ') : ['', ''];
   const deletionSummary = (rule: ForwardingRule) => {
     const entry = entryOf(rule.node_id);
-    const usage = monthOf(rule);
+    const usage = cycleOf(rule);
     const address = entry
       ? (entryAddress(entry, rule.listen_port, 'v4') ?? entryAddress(entry, rule.listen_port, 'v6'))
       : null;
     return {
       entry: address ?? `:${rule.listen_port}`,
       node: entry?.node_name ?? '转发入口',
-      month: usage ? usage.down + usage.up : null,
+      cycleTraffic: usage ? usage.down + usage.up : null,
     };
   };
   const deletingView = deleting ? deletionSummary(deleting) : null;
-  const monthNumber = (text: string) => Number(text.slice(5, 7));
+  const cycleDate = (text: string) => {
+    const date = new Date(Date.parse(text) + 8 * 3_600_000);
+    return `${date.getUTCMonth() + 1} 月 ${date.getUTCDate()} 日`;
+  };
 
   return (
     <>
@@ -832,51 +868,52 @@ export function UserForwardingCard({
             <ErrorBox error={overview.error} />
           ) : (
             <div className="user-usage panel-full-bleed-body">
-              <aside className="fwd-ledger user-usage-ledger" aria-label="本月转发">
+              <aside className="fwd-ledger user-usage-ledger" aria-label="本期转发">
                 <div className="user-usage-hero">
-                  <span className="user-usage-hero-label">本月转发</span>
-                  {month ? (
+                  <span className="user-usage-hero-label">本期转发</span>
+                  {cycleTraffic ? (
                     <strong className="user-usage-hero-value">
                       {figure} <small>{unit}</small>
                     </strong>
                   ) : (
-                    <strong className="user-usage-hero-value none">{monthly.isPending ? '读取中' : '—'}</strong>
+                    <strong className="user-usage-hero-value none">{cycle.isPending ? '读取中' : '—'}</strong>
                   )}
-                  {month?.start && month.end && (
+                  {cycleTraffic?.start && cycleTraffic.end && (
                     <span className="user-usage-reset">
-                      {monthNumber(month.start)} 月 1 日起
-                      <span className="usage-dot">·</span>
-                      {monthNumber(month.end)} 月 1 日重置
+                      {cycleDate(cycleTraffic.start)}起<span className="usage-dot">·</span>
+                      {cycleDate(cycleTraffic.end)}重置
                     </span>
                   )}
-                  {month && month.down + month.up > 0 && (
+                  {cycleTraffic && cycleTraffic.down + cycleTraffic.up > 0 && (
                     <div className="usage-split" aria-hidden="true">
-                      <i className="down" style={{ flexGrow: month.down }} />
-                      <i className="up" style={{ flexGrow: month.up }} />
+                      <i className="down" style={{ flexGrow: cycleTraffic.down }} />
+                      <i className="up" style={{ flexGrow: cycleTraffic.up }} />
                     </div>
                   )}
-                  {month && (
+                  {cycleTraffic && (
                     <dl className="usage-io">
                       <div className="down">
                         <dt>
                           <i aria-hidden="true" />
                           下行
                         </dt>
-                        <dd>{bytes(month.down)}</dd>
-                        <dd className="usage-share">{shareOf(month.down, month.down + month.up)}</dd>
+                        <dd>{bytes(cycleTraffic.down)}</dd>
+                        <dd className="usage-share">
+                          {shareOf(cycleTraffic.down, cycleTraffic.down + cycleTraffic.up)}
+                        </dd>
                       </div>
                       <div className="up">
                         <dt>
                           <i aria-hidden="true" />
                           上行
                         </dt>
-                        <dd>{bytes(month.up)}</dd>
-                        <dd className="usage-share">{shareOf(month.up, month.down + month.up)}</dd>
+                        <dd>{bytes(cycleTraffic.up)}</dd>
+                        <dd className="usage-share">{shareOf(cycleTraffic.up, cycleTraffic.down + cycleTraffic.up)}</dd>
                       </div>
                     </dl>
                   )}
-                  {month && month.deleted > 0 && (
-                    <span className="fwd-deleted">其中 {bytes(month.deleted)} 来自已删除的规则</span>
+                  {cycleTraffic && cycleTraffic.deleted > 0 && (
+                    <span className="fwd-deleted">其中 {bytes(cycleTraffic.deleted)} 来自已删除的规则</span>
                   )}
                 </div>
                 <UserTrafficAccountingSetting
@@ -884,6 +921,7 @@ export function UserForwardingCard({
                   disabled={accountingDisabled}
                   onChange={onAccountingModeChange}
                 />
+                {servicePolicy}
                 {canViewRealtime && (
                   <div className="fwd-live">
                     <span>当前</span>
@@ -916,9 +954,9 @@ export function UserForwardingCard({
               ) : (
                 <div className="qta fwd-quotas fwe-aligned" role="list" aria-label="各转发入口的用量与规则额度">
                   {sortedEntries.map(entry => {
-                    const state = entryState(entry);
+                    const state = entryState(entry, rules);
                     const count = rules.filter(rule => rule.node_id === entry.node_id).length;
-                    const traffic = month?.byNode.get(entry.node_id);
+                    const traffic = cycleTraffic?.byNode.get(entry.node_id);
                     const percent = entry.max_rules > 0 ? (count / entry.max_rules) * 100 : 0;
                     const editing = canAuthorize && policy?.mode === 'edit' && policy.draft.nodeId === entry.node_id;
                     const resuming =
@@ -945,13 +983,13 @@ export function UserForwardingCard({
                           </span>
                         </span>
                         <span className="qta-figs">
-                          {entry.monthly_used_bytes !== undefined
-                            ? bytes(entry.monthly_used_bytes)
-                            : month
+                          {entry.cycle_used_bytes !== undefined
+                            ? bytes(entry.cycle_used_bytes)
+                            : cycleTraffic
                               ? bytes(traffic ? traffic.down + traffic.up : 0)
                               : '—'}
-                          {entry.monthly_limit_bytes != null && (
-                            <small className="dim"> / {bytes(entry.monthly_limit_bytes)}</small>
+                          {entry.cycle_limit_bytes != null && (
+                            <small className="dim"> / {bytes(entry.cycle_limit_bytes)}</small>
                           )}
                         </span>
                         <span className="qta-left">
@@ -994,12 +1032,6 @@ export function UserForwardingCard({
                           )}
                         </span>
                         {editing && <div className="fwe-sheet">{policyForm()}</div>}
-                        {state.tone === 'bad' && entry.last_error && (
-                          <p className="fwd-merr">
-                            <Icon of="warn" size={12} />
-                            {entry.last_error}
-                          </p>
-                        )}
                         {lifecycle.error &&
                           lifecycle.variables?.nodeId === entry.node_id &&
                           lifecycle.variables.session === undefined && <ErrorBox error={lifecycle.error} />}
@@ -1056,13 +1088,14 @@ export function UserForwardingCard({
             </button>
           )}
         </header>
-        <div className="user-dcard-body panel-full-bleed-body fwd-body">
+        {/* 完整列表自行铺满卡片；加载与错误状态保留普通正文留白。 */}
+        <div className="user-dcard-body fwd-body">
           {overview.isPending ? (
             <FieldLoading label="读取转发规则" />
           ) : loadFailed ? (
             <ErrorBox error={overview.error} />
           ) : (
-            <div className="fwd-main fwr-main">
+            <div className="fwd-main fwr-main panel-full-bleed-body">
               <div className="fwr-tools">
                 <label className="fwr-machine">
                   <span>机器</span>
@@ -1109,7 +1142,7 @@ export function UserForwardingCard({
                   }}
                 >
                   <option value="port">端口升序</option>
-                  <option value="month">本月流量 ↓</option>
+                  <option value="cycle">本期流量 ↓</option>
                   <option value="created">最近创建</option>
                 </select>
               </div>
@@ -1157,7 +1190,7 @@ export function UserForwardingCard({
                 {sortedEntries.map(entry => {
                   const groupRules = visible.filter(rule => rule.node_id === entry.node_id);
                   if (!groupRules.length) return null;
-                  const state = entryState(entry);
+                  const state = entryState(entry, rules);
                   return (
                     <section className="fwr-group" key={entry.node_id} aria-label={`${entry.node_name}的规则`}>
                       <header className="fwr-group-head">
@@ -1173,7 +1206,7 @@ export function UserForwardingCard({
                         <span>入口端口</span>
                         <span>转发目标</span>
                         <span>协议</span>
-                        <span>本月流量</span>
+                        <span>本期流量</span>
                         <span>{canViewRealtime ? '当前' : '状态'}</span>
                         <span />
                       </div>
@@ -1187,10 +1220,10 @@ export function UserForwardingCard({
                               entry={entry}
                               probe={probes.data?.find(probe => probe.rule_id === rule.id)}
                               probeError={probes.error}
-                              month={monthOf(rule)}
+                              cycleTraffic={cycleOf(rule)}
                               live={liveOf(rule)}
                               showLive={canViewRealtime}
-                              maxMonth={maxMonth}
+                              maxCycle={maxCycle}
                               open={expanded.has(rule.id)}
                               editing={editing}
                               sheet={editing ? ruleForm(editor) : null}
@@ -1269,7 +1302,7 @@ export function UserForwardingCard({
                 {deleting.enabled
                   ? `${deletingView.node} 立即停止监听 ${deleting.listen_port}，正在经过它的连接会断开。`
                   : `规则已停用，删除后入口端口 ${deleting.listen_port} 不再保留给它。`}
-                {deletingView.month !== null && `本月已转发 ${bytes(deletingView.month)}，仍计入用量。`}
+                {deletingView.cycleTraffic !== null && `本期已转发 ${bytes(deletingView.cycleTraffic)}，仍计入用量。`}
               </p>
               {removeRule.error && <ErrorBox error={removeRule.error} />}
             </>
@@ -1291,10 +1324,10 @@ function RuleItem({
   entry,
   probe,
   probeError,
-  month,
+  cycleTraffic,
   live,
   showLive,
-  maxMonth,
+  maxCycle,
   open,
   editing,
   sheet,
@@ -1312,10 +1345,10 @@ function RuleItem({
   entry: ForwardingEntitlement | undefined;
   probe: ForwardingProbe | undefined;
   probeError: Error | null;
-  month: Traffic | null;
+  cycleTraffic: Traffic | null;
   live: Traffic | null;
   showLive: boolean;
-  maxMonth: number;
+  maxCycle: number;
   open: boolean;
   editing: boolean;
   sheet: ReactNode;
@@ -1338,11 +1371,11 @@ function RuleItem({
   const status = RULE_STATUS[state];
   const detailId = useId();
   const expandedNow = editing || open;
-  const monthTotal = month ? month.down + month.up : null;
+  const cycleTotal = cycleTraffic ? cycleTraffic.down + cycleTraffic.up : null;
   const nowCell = status ? (
     <span className={`fwd-st ${status.tone}`}>{status.text}</span>
   ) : !showLive ? (
-    <span className="fwd-st ok">已生效</span>
+    <span className="fwd-st ok">已监听</span>
   ) : live === null ? (
     <span className="fwd-idle">—</span>
   ) : live.down + live.up > 0 ? (
@@ -1380,14 +1413,18 @@ function RuleItem({
           </span>
           <span className="fwd-proto">{PROTOCOL_LABEL[rule.protocol]}</span>
           <span
-            className="fwd-month"
-            title={month ? `本月 下行 ${bytes(month.down)} · 上行 ${bytes(month.up)}` : '本月用量暂不可用'}
+            className="fwd-cycle"
+            title={
+              cycleTraffic
+                ? `本期 下行 ${bytes(cycleTraffic.down)} · 上行 ${bytes(cycleTraffic.up)}`
+                : '本期用量暂不可用'
+            }
           >
-            <b>{monthTotal === null ? '—' : bytes(monthTotal)}</b>
+            <b>{cycleTotal === null ? '—' : bytes(cycleTotal)}</b>
             <span className="fwd-bar" aria-hidden="true">
               <i
                 style={{
-                  width: `${monthTotal ? Math.max(2, (monthTotal / maxMonth) * 100) : 0}%`,
+                  width: `${cycleTotal ? Math.max(2, (cycleTotal / maxCycle) * 100) : 0}%`,
                 }}
               />
             </span>
@@ -1497,8 +1534,8 @@ function RuleItem({
                 </dd>
               </div>
               <div>
-                <dt>本月</dt>
-                <dd>{month ? <TrafficPair value={month} format={bytes} /> : '—'}</dd>
+                <dt>本期</dt>
+                <dd>{cycleTraffic ? <TrafficPair value={cycleTraffic} format={bytes} /> : '—'}</dd>
               </div>
               <div>
                 <dt>累计</dt>
@@ -1556,11 +1593,20 @@ function RuleStateLine({ rule, entry }: { rule: ForwardingRule; entry: Forwardin
     case 'error':
       return (
         <>
-          <span className="fwd-st bad">收敛失败</span> · {entry?.last_error ?? '机器未能应用转发配置'}
+          <span className="fwd-st bad">收敛失败</span> · {rule.runtime_error ?? '机器未能应用这条转发规则'}
+        </>
+      );
+    case 'unknown':
+      return (
+        <>
+          <span className="fwd-st warn">状态待确认</span> · 等待 {node} 确认运行状态。
+          {entry?.reported_at && `上次回报 ${clockText(entry.reported_at)}。`}
         </>
       );
     case 'disabled':
       return <>{entry?.enabled === false ? '入口转发已停止' : '已停用'} · 入口端口不监听，规则保留</>;
+    case 'service-paused':
+      return <>有效期暂停 · 服务生效或续期后恢复仍启用的规则</>;
     case 'quota-paused':
       return <>配额暂停 · 补足额度后恢复仍启用的规则</>;
   }
@@ -1586,21 +1632,6 @@ function AddressCopy({ text, label }: { text: string; label: string }) {
 }
 
 /* ── 授权和规则共用的行内表单布局 ── */
-
-function InlineField({ label, htmlFor, children }: { label: string; htmlFor?: string; children: ReactNode }) {
-  return (
-    <div className="fwe-field">
-      {htmlFor ? (
-        <label className="fwe-k" htmlFor={htmlFor}>
-          {label}
-        </label>
-      ) : (
-        <span className="fwe-k">{label}</span>
-      )}
-      <div className="fwe-v">{children}</div>
-    </div>
-  );
-}
 
 function RuleForm({
   editor,
@@ -1629,6 +1660,13 @@ function RuleForm({
   const id = useId();
   const check = checkRule(draft, entry, rules, editingId);
   const dirty = JSON.stringify(draft) !== JSON.stringify(editor.initial);
+  const installed = rules.find(rule => rule.id === editingId);
+  const changesListener =
+    installed?.enabled &&
+    (draft.nodeId !== editor.initial.nodeId ||
+      draft.target !== editor.initial.target ||
+      draft.port !== editor.initial.port ||
+      draft.protocol !== editor.initial.protocol);
   const choosable = creating
     ? entries.filter(
         item =>
@@ -1750,6 +1788,12 @@ function RuleForm({
           {check.problems[0]}
         </p>
       )}
+      {changesListener && (
+        <p className="fwe-problem">
+          <Icon of="warn" size={12} />
+          保存后会重新监听本条规则，经过它的已有连接会断开；其他规则继续运行。
+        </p>
+      )}
       {error ? <ErrorBox error={error} /> : null}
       <footer className="fwe-foot">
         <span className="fwe-preview">
@@ -1856,7 +1900,7 @@ function PolicyEditorView({
             <input
               id={`${id}-quota`}
               className="f mono fwe-num quota"
-              aria-label="月度转发额度（GiB）"
+              aria-label="本期转发额度（GiB）"
               inputMode="decimal"
               autoComplete="off"
               autoFocus={!grant}
@@ -1926,7 +1970,7 @@ function PolicyEditorView({
         <InlineField label="私网目标">
           <SegmentedControl
             value={draft.allowPrivate}
-            ariaLabel="允许转发到私网与本机地址"
+            ariaLabel="允许转发到私网地址"
             disabled={pending}
             options={[
               { value: false, label: '拒绝' },
@@ -1934,6 +1978,7 @@ function PolicyEditorView({
             ]}
             onChange={allowPrivate => set({ allowPrivate })}
           />
+          <small>回环、链路本地和元数据地址始终拒绝。</small>
         </InlineField>
       </div>
       {check.problem && (
@@ -1948,7 +1993,7 @@ function PolicyEditorView({
           <p>
             {confirming === 'stop'
               ? `${entry?.node_name} 的 ${own.filter(rule => rule.enabled).length} 条规则停止监听，经过的连接会断开；规则与用量保留，其他用户不受影响。`
-              : `连同 ${own.length} 条规则一起移除，入口端口释放，本月用量保留。`}
+              : `连同 ${own.length} 条规则一起移除，入口端口释放，本期用量保留。`}
           </p>
           <button type="button" className="btn" disabled={pending} onClick={() => setConfirming(null)}>
             返回

@@ -128,6 +128,79 @@ fn managed_xhttp_listener_tuning_reaches_the_server_artifact() {
 }
 
 #[test]
+fn split_xhttp_fronts_preserve_source_with_loopback_only_proxy_protocol() {
+    let mut machine = node("hk", [10, 66, 0, 1], true, Dns::System);
+    machine.certificate_name = Some("hk.example.net".to_owned());
+    let doc = doc(vec![machine]);
+    let mut face = ingress("i", "c", "hk");
+    face.wires = IngressWires::Vless(Transport::VlessRealityXhttp(RealityXhttp {
+        reality: face.wires.reality().unwrap().clone(),
+        xhttp: Xhttp {
+            path: "/split".to_owned(),
+            host: None,
+            xmux: None,
+            tuning: None,
+            mode: XhttpMode::Auto,
+            download: Some(brocade_core::model::XhttpDownload {
+                v4: Some(brocade_core::model::ProjectionDownloadEndpoint {
+                    host: "cdn.example.net".to_owned(),
+                    port: 443,
+                    origin_port: Some(8443),
+                    http_host: None,
+                    mux: None,
+                }),
+                v6: None,
+            }),
+        },
+    }));
+    let app = AppView {
+        id: "app".to_owned(),
+        label: "应用".to_owned(),
+        chains: vec![chain("c")],
+        ingresses: vec![face],
+        fronts: Vec::new(),
+        steps: vec![step("c", "hk", vec![any_egress()], None)],
+        grants: Vec::new(),
+    };
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(
+        diagnostics.iter().all(|d| d.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+    let value = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "hk")));
+    let core = inbound(&value, "in:app/i");
+    assert_eq!(core["listen"], "127.0.0.1");
+    assert_eq!(
+        core["streamSettings"]["sockopt"]["acceptProxyProtocol"],
+        true
+    );
+    assert_eq!(
+        outbound(&value, xray::SPLIT_FRONT_OUTBOUND_TAG)["settings"]["proxyProtocol"],
+        2
+    );
+    let rule = rule_to(&value, xray::SPLIT_FRONT_OUTBOUND_TAG);
+    assert!(rule["inboundTag"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tag| tag == "in:app/i:upload"));
+    assert!(rule["inboundTag"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tag| tag == "in:app/i:download:8443"));
+    assert!(outbound(&value, "out:internal")["settings"]
+        .get("proxyProtocol")
+        .is_none());
+}
+
+#[test]
 fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_node() {
     let mut doc = doc(vec![
         node("hk", [10, 66, 0, 1], true, Dns::System),
@@ -135,6 +208,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
     ]);
     doc.external_outbounds = vec![
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-1111-1111".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "供应商边缘".to_owned(),
@@ -158,6 +232,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-2222-2222".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "XHTTP 边缘".to_owned(),
@@ -178,6 +253,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
                         address: "download.vendor.example".to_owned(),
                         port: 8443,
                         security: ExternalOutboundSecurity::Tls {
+                            allow_insecure: false,
                             alpn: Vec::new(),
                             ech_config_list: None,
                             pinned_peer_cert_sha256: None,
@@ -203,6 +279,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-3333-3333".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "SOCKS5 边缘".to_owned(),
@@ -216,6 +293,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-7777-7777".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "WebSocket 边缘".to_owned(),
@@ -232,6 +310,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
                 }),
             },
             security: ExternalOutboundSecurity::Tls {
+                allow_insecure: false,
                 alpn: vec!["h2".to_owned(), "http/1.1".to_owned()],
                 ech_config_list: Some("ech-config-list".to_owned()),
                 pinned_peer_cert_sha256: Some("00".repeat(32)),
@@ -242,6 +321,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-8888-8888".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "mKCP 边缘".to_owned(),
@@ -258,6 +338,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
                 }),
             },
             security: ExternalOutboundSecurity::Tls {
+                allow_insecure: false,
                 alpn: Vec::new(),
                 ech_config_list: None,
                 pinned_peer_cert_sha256: None,
@@ -268,6 +349,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-9999-9999".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "HTTP/2 边缘".to_owned(),
@@ -284,6 +366,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
                 }),
             },
             security: ExternalOutboundSecurity::Tls {
+                allow_insecure: false,
                 alpn: Vec::new(),
                 ech_config_list: None,
                 pinned_peer_cert_sha256: None,
@@ -294,6 +377,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-aaaa-aaaa".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "gRPC 边缘".to_owned(),
@@ -311,6 +395,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
                 }),
             },
             security: ExternalOutboundSecurity::Tls {
+                allow_insecure: false,
                 alpn: Vec::new(),
                 ech_config_list: None,
                 pinned_peer_cert_sha256: None,
@@ -321,6 +406,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-bbbb-bbbb".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "HTTPUpgrade 边缘".to_owned(),
@@ -337,6 +423,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
                 }),
             },
             security: ExternalOutboundSecurity::Tls {
+                allow_insecure: false,
                 alpn: Vec::new(),
                 ech_config_list: None,
                 pinned_peer_cert_sha256: None,
@@ -347,6 +434,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-4444-4444".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "HTTP CONNECT 边缘".to_owned(),
@@ -357,6 +445,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
                 credential: String::new(),
             },
             security: ExternalOutboundSecurity::Tls {
+                allow_insecure: false,
                 alpn: Vec::new(),
                 ech_config_list: None,
                 pinned_peer_cert_sha256: None,
@@ -367,6 +456,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-5555-5555".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "SS 边缘".to_owned(),
@@ -380,6 +470,7 @@ fn external_proxy_action_renders_protocol_security_and_only_on_the_referencing_n
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-6666-6666".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "WireGuard 边缘".to_owned(),
@@ -653,6 +744,7 @@ fn managed_vpngate_pools_lower_to_deterministic_local_socks_endpoints() {
         node("sg", [10, 66, 0, 2], true, Dns::System),
     ]);
     let pool = |id: &str, country_code: &str| ExternalOutbound {
+        target_strategy: None,
         id: id.to_owned(),
         tenant: "platform.acme".to_owned(),
         name: format!("VPN Gate {country_code}"),
@@ -781,6 +873,7 @@ fn managed_warp_renders_masque_with_a_distinct_identity_on_each_machine() {
         ],
     };
     doc.external_outbounds = vec![ExternalOutbound {
+        target_strategy: None,
         id: "warp-8f3a-2d71".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "Cloudflare WARP".to_owned(),
@@ -4022,6 +4115,7 @@ fn proxy_outbounds_support_anytls_and_native_vless_encryption() {
                 credential: "anytls-password".to_owned(),
             },
             ExternalOutboundSecurity::Tls {
+                allow_insecure: true,
                 alpn: Vec::new(),
                 ech_config_list: None,
                 pinned_peer_cert_sha256: None,
@@ -4045,6 +4139,7 @@ fn proxy_outbounds_support_anytls_and_native_vless_encryption() {
     ] {
         let mut doc = doc(vec![node("hk", [10, 66, 0, 1], true, Dns::System)]);
         doc.external_outbounds = vec![ExternalOutbound {
+            target_strategy: Some(DomainStrategy::UseIpv4v6),
             id: "custom-7777-7777".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "Proxy".to_owned(),
@@ -4086,10 +4181,17 @@ fn proxy_outbounds_support_anytls_and_native_vless_encryption() {
         let config = parse_xray(&xray::build(&project_node(&sys, &[ir], "hk")));
         let proxy = outbound(&config, "out:external/custom-7777-7777");
         assert_eq!(proxy["protocol"], name);
+        assert_eq!(proxy["targetStrategy"], "UseIPv4v6");
+        assert!(proxy["settings"].get("targetStrategy").is_none());
+        assert!(proxy["streamSettings"].get("sockopt").is_none());
         assert_eq!(proxy["settings"]["address"], "edge.example.com");
         if name == "anytls" {
             assert_eq!(proxy["settings"]["password"], "anytls-password");
             assert_eq!(proxy["streamSettings"]["security"], "tls");
+            assert_eq!(
+                proxy["streamSettings"]["tlsSettings"]["allowInsecure"],
+                true
+            );
             assert_eq!(
                 proxy["streamSettings"]["tlsSettings"]["serverName"],
                 "edge.example.com"
@@ -4118,6 +4220,7 @@ fn proxy_outbounds_support_anytls_and_native_vless_encryption() {
             assert!(yaml.contains(&encryption), "{yaml}");
         } else {
             assert!(yaml.contains("sni: edge.example.com"), "{yaml}");
+            assert!(yaml.contains("skip-cert-verify: true"), "{yaml}");
         }
 
         // Check the generated outbound against the bundled executable when it is installed.

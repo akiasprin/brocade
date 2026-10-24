@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import type { FleetTrafficSnapshot } from '../src/fleet-traffic-source';
@@ -73,12 +73,13 @@ function snapshot(enabled = true): FleetTrafficSnapshot {
   };
 }
 
-function serve(payload: FleetTrafficSnapshot) {
+function serve(payload: FleetTrafficSnapshot, deferred?: { path: string; until: Promise<void> }) {
   vi.stubGlobal('EventSource', undefined);
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL) => {
       const path = new URL(String(input), 'http://console.test').pathname;
+      if (path === deferred?.path) await deferred.until;
       const body =
         path === '/nodes/agent-state'
           ? {
@@ -179,6 +180,15 @@ describe('fleet realtime traffic panel', () => {
     expect(readingOf(ledger, '网卡收 / 发')).toBe('100 Mbit/s / 104 Mbit/s');
     expect(readingOf(ledger, '有读数')).toBe('2 / 3 台');
     expect(view.getByRole('status').textContent).toBe('实时 · 每秒更新');
+    // Narrow ledgers wrap these values; each reading stays whole so a unit never starts a line.
+    const unbroken = (label: string) =>
+      Array.from(
+        within(ledger).getByText(label, { selector: 'dt' }).parentElement!.querySelectorAll('dd .usage-nobreak'),
+        segment => segment.textContent,
+      );
+    expect(unbroken('最高用户')).toEqual(['25.0 Mbit/s']);
+    expect(unbroken('最忙机器')).toEqual(['25.0 Mbit/s']);
+    expect(unbroken('网卡收 / 发')).toEqual(['100 Mbit/s', '104 Mbit/s']);
   });
 
   it('lays the fleet out as a user × machine table whose cells say what was measured', async () => {
@@ -269,6 +279,55 @@ describe('fleet realtime traffic panel', () => {
     });
     expect(within(list).queryByText('连接中：')).toBeNull();
     expect(within(list).getByText('空闲 1 位')).toBeTruthy();
+  });
+
+  it.each(['/nodes/agent-state', '/users'])(
+    'shows the first reading while other machines are warming and %s is still loading',
+    async path => {
+      let finish!: () => void;
+      const until = new Promise<void>(resolve => {
+        finish = resolve;
+      });
+      const payload = snapshot();
+      payload.nodes[1].samples[0].sample.user_traffic!.state = 'warming';
+      payload.nodes[2].connected = true;
+      payload.nodes[2].active = true;
+      payload.nodes[2].samples = [];
+      serve(payload, { path, until });
+      const view = mount();
+
+      const ledger = await view.findByLabelText('机队当前速率');
+      expect(ledger.querySelector('.user-usage-hero-value')?.textContent).toBe('25.0 Mbit/s');
+      expect(readingOf(ledger, '有读数')).toBe('1 / 3 台');
+      expect(view.getByRole('status').textContent).toBe('实时 · 每秒更新');
+      expect(view.queryByRole('status', { name: '读取实时用量' })).toBeNull();
+      const table = view.getByRole('table');
+      const bob = within(table).getByRole('rowheader', { name: /bob/ }).closest('tr')!;
+      expect(bob.querySelector('td[data-node="jp"] .flt-sr')?.textContent).toBe('正在建立速率基线');
+      expect(bob.querySelector('td[data-node="jp"] .flt-cell')?.classList.contains('unknown')).toBe(true);
+      await act(async () => finish());
+      await view.findByRole('button', { name: '香港 HKIX，查看机器用量' });
+      expect(view.getByRole('table')).toBe(table);
+      expect(view.getByLabelText('机队当前速率')).toBe(ledger);
+    },
+  );
+
+  it('keeps realtime readings visible when the machine roster fails', async () => {
+    serve(snapshot());
+    const fetchSnapshot = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      if (String(input) === '/nodes/agent-state') {
+        return Promise.resolve(Response.json({ error: '机器名册读取失败' }, { status: 503 }));
+      }
+      return fetchSnapshot(input, init);
+    });
+    const view = mount();
+
+    const ledger = await view.findByLabelText('机队当前速率');
+    await view.findByText(/机器名册读取失败/);
+    expect(ledger.querySelector('.user-usage-hero-value')?.textContent).toBe('25.0 Mbit/s');
+    expect(view.getByRole('table')).toBeTruthy();
+    expect(view.queryByRole('status', { name: '读取实时用量' })).toBeNull();
   });
 
   it('keeps a large connecting fleet concise instead of repeating one message for every machine', async () => {

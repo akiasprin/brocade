@@ -42,10 +42,19 @@ mod site_usage;
 mod source_traffic;
 mod subscription_client;
 mod traffic;
+mod traffic_limit;
+mod upgrade;
+mod user_traffic;
+pub use traffic_limit::NodeTrafficLimitView;
 mod tunnel_probe;
 mod usage;
 mod user_machine_usage;
 mod user_presence;
+mod user_service;
+pub use user_service::{
+    UserCyclePeriod, UserCycleUsage, UserServicePolicyPreview, UserServicePolicyWrite,
+    UserServiceState,
+};
 mod vpngate;
 mod xray_release;
 
@@ -201,8 +210,8 @@ pub use public_ip::{
 };
 pub use quota::{QuotaEnforcementOutcome, QuotaEnforcementPlan, QuotaGrantChange, QUOTA_ACTOR};
 pub use retention::{
-    DataRetentionCategory, DataRetentionPolicyView, DataRetentionView, RetentionSchedule,
-    UpdateDataRetentionPolicy, MAX_RETENTION_HOURS,
+    DataRetentionCategory, DataRetentionPolicyView, DataRetentionView, RetentionCleanupResult,
+    RetentionCleanupView, RetentionSchedule, UpdateDataRetentionPolicy, MAX_RETENTION_HOURS,
 };
 pub use settings::{
     DeploymentSettings, SettingsSnapshot, UpdateDeploymentSettings, UpdateSettingsResult,
@@ -223,6 +232,7 @@ pub use tunnel_probe::{
     TunnelProbeSummary, TunnelProbeTrigger, TunnelProbeView, UpdateTunnelProbePolicy,
     TUNNEL_PROBE_RETENTION_DAYS,
 };
+pub use upgrade::DatabaseUpgradeCheck;
 pub use usage::{
     FleetRealtimeTarget, FleetRealtimeUser, UserRealtimeTarget, UserTrafficHistoryScope,
 };
@@ -323,3 +333,5 @@ impl From<brocade_core::compile::PublishBlocked> for StoreError {
         StoreError::PublishBlocked(error)
     }
 }
+
+mod source_access;

@@ -46,6 +46,7 @@ pub const DNS_TAG: &str = "dns-out";
 const DNS_SERVE_EXPIRED_TTL_SECS: u32 = 36 * 60 * 60;
 pub const BLOCK_OUTBOUND_TAG: &str = "out:block";
 pub const REALITY_COVER_OUTBOUND_TAG: &str = "out:reality-cover";
+pub const SPLIT_FRONT_OUTBOUND_TAG: &str = "out:split-front";
 /// Where a fallback requesting a name this ingress does not impersonate is routed.
 ///
 /// Its own blackhole rather than `BLOCK_OUTBOUND_TAG`, which is emitted only where a rule blocks
@@ -266,6 +267,8 @@ pub enum XrayIngressSecurity {
 pub enum XrayStream {
     Tcp,
     Xhttp {
+        /// Only the loopback core behind managed split fronts accepts authenticated transport metadata.
+        accept_proxy_protocol: bool,
         path: String,
         /// No `xmux` here, deliberately. XMUX is a dialer's connection pool and only a dialer
         /// reads it: `XmuxManager` is built in `getHTTPClient` on the client path
@@ -525,10 +528,12 @@ pub enum XrayOutbound {
         port: u16,
         protocol: ExternalOutboundProtocol,
         security: ExternalOutboundSecurity,
+        target_strategy: Option<DomainStrategy>,
 
         warp_masque: Option<crate::physical::node::XrayWarpMasquePlan>,
     },
     Freedom {
+        proxy_protocol: bool,
         tag: String,
         send_through: Option<IpAddr>,
         /// xray's own form of `model::DomainStrategy`, already converted. The same split
@@ -603,8 +608,7 @@ pub struct XrayBalancer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XrayRoutingRule {
-    /// What names this rule inside the running xray, so it can be removed by name
-    /// (`xray api rmrules`) without restarting the process.
+    /// Identifies the compiled generation and position in `xray api lsrules` output.
     ///
     /// Assigned by `stamp_rule_tags`, never written by the code that builds a rule —
     /// the value depends on the whole table, which no single construction site knows.
@@ -623,34 +627,17 @@ pub struct XrayRoutingRule {
 ///
 /// # Why the generation, and why it covers the whole table
 ///
-/// The names exist so a rule table can be swapped inside a running xray. The only swap
-/// that leaves no gap is to append the entire new table, which the old rules still
-/// precede so they continue to match, and then remove the entire old table by name, at
-/// which point the new rules take effect. Measured against xray 26.4.25, that sequence
-/// drops no connections, while `adrules` without `-append` replaces the table and
-/// removes the balancers with it permanently, since a balancer cannot be recreated or
-/// reused once its tag is gone.
-///
-/// Appending the new table on top of the old means both are present at once, and xray
-/// rejects a duplicate `ruleTag` (`app/router: duplicate ruleTag`), so the two
-/// generations must not share a name. A per-rule identity cannot guarantee that: a rule
-/// that survives a compilation unchanged would keep its name and collide with itself.
-/// Hashing the whole table does guarantee it, because a changed table changes every
-/// name.
-///
-/// The same reasoning forbids the opposite convention. A name carrying a revision
-/// counter would differ on every compilation whether or not anything changed, and the
-/// artifact's sha256 is what decides that a machine needs a deployment at all: every
-/// compilation would ship. Derived from the table's own content, an unchanged table
-/// yields identical names, identical bytes, and no deployment.
+/// The generation identifies the whole compiled table when inspecting a running Xray.
+/// Atomic rule replacement permits reusing tags, but retaining these content-derived
+/// names keeps existing artifacts stable and makes the installed generation observable.
+/// A revision counter would change artifact bytes on every compilation and trigger
+/// unnecessary deployments; an unchanged table must produce identical names and bytes.
 ///
 /// # Why the index is in the name
 ///
-/// It is not needed for uniqueness, because the generation already separates tables and
-/// the digest covers the whole table. It exists so a table read back from a machine with
-/// `xray api lsrules` can be aligned with the compiled one: that command returns names
-/// and outbound tags but no match conditions, so without the position the listing cannot
-/// be compared.
+/// The generation is shared by every rule, so the index makes names unique within the
+/// table. It also aligns `xray api lsrules` output with the compiled rules: that command
+/// returns names and outbound tags but no match conditions.
 fn stamp_rule_tags(rules: &mut [XrayRoutingRule]) {
     // Lengths are hashed ahead of the elements they precede. Without them `["a", "bc"]`
     // and `["ab", "c"]` feed the hasher the same bytes, so two different tables would
@@ -772,12 +759,13 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
     );
 
     let mut outbounds = vec![XrayOutbound::Freedom {
+        proxy_protocol: false,
         tag: FORWARD_OUTBOUND_TAG.to_owned(),
         send_through: None,
         domain_strategy: domain_strategy_name(xray.domain_strategy).to_owned(),
-        // Dynamic forwarding listeners share this default outbound, so the data plane cannot
-        // express a different address policy per entitlement. The Store is the policy owner: it
-        // admits private literals only when that user/node entitlement explicitly allows them.
+        // Each dynamic forwarding inbound carries its entitlement's target policy. Keep the
+        // shared outbound neutral: its matcher is combined with that per-listener policy,
+        // and a global private-address deny would also block explicitly authorized LAN targets.
         address_policy: XrayFreedomAddressPolicy::Default,
     }];
     // The mirror of the above for the bridge end: which dialling outbound carries the
@@ -841,6 +829,7 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
     // machine, whose `egress_outbounds` is empty, has no outbound for geodata to use,
     // and relay machines are where `geosite:` rules are most numerous.
     outbounds.push(XrayOutbound::Freedom {
+        proxy_protocol: false,
         tag: INTERNAL_OUTBOUND_TAG.to_owned(),
         send_through: None,
         // Takes the machine's strategy like every other freedom outbound here. This one
@@ -851,6 +840,15 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
         address_policy: XrayFreedomAddressPolicy::Default,
     });
 
+    if xray.inbounds.iter().any(|ingress| ingress.split.is_some()) {
+        outbounds.push(XrayOutbound::Freedom {
+            proxy_protocol: true,
+            tag: SPLIT_FRONT_OUTBOUND_TAG.to_owned(),
+            send_through: None,
+            domain_strategy: domain_strategy_name(xray.domain_strategy).to_owned(),
+            address_policy: XrayFreedomAddressPolicy::Default,
+        });
+    }
     let mut rules = Vec::new();
     if xray.api_port.is_some() {
         rules.push(XrayRoutingRule {
@@ -944,7 +942,7 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
             inbound_tags: split_fronts,
             users: Vec::new(),
             condition: XrayMatchCondition::default(),
-            outbound_tag: INTERNAL_OUTBOUND_TAG.to_owned(),
+            outbound_tag: SPLIT_FRONT_OUTBOUND_TAG.to_owned(),
             balancer_tag: None,
         });
     }
@@ -1177,6 +1175,7 @@ fn ingress_inbounds(
                         security: XrayIngressSecurity::None,
                         sniff: ingress.sniff,
                         stream: XrayStream::Xhttp {
+                            accept_proxy_protocol: true,
                             path: xhttp.path,
                             mode: xhttp.mode.as_str(),
                             tuning: xhttp.tuning,
@@ -1252,6 +1251,7 @@ fn ingress_inbound(
             stream: match &ingress.xhttp {
                 None => XrayStream::Tcp,
                 Some(xhttp) => XrayStream::Xhttp {
+                    accept_proxy_protocol: false,
                     path: xhttp.path.clone(),
                     mode: xhttp.mode.as_str(),
                     tuning: xhttp.tuning.clone(),
@@ -1443,6 +1443,7 @@ fn mux_of(pool: HopPool, relay_mux: crate::model::HopMux) -> Option<XrayMux> {
 
 fn egress_outbound(outbound: &XrayEgressOutboundPlan, strategy: DomainStrategy) -> XrayOutbound {
     XrayOutbound::Freedom {
+        proxy_protocol: false,
         tag: outbound.tag.clone(),
         send_through: outbound.send_through,
         domain_strategy: domain_strategy_name(outbound.domain_strategy.unwrap_or(strategy))
@@ -1461,6 +1462,7 @@ fn external_outbound(outbound: &XrayExternalOutboundPlan) -> XrayOutbound {
         port: outbound.port,
         protocol: outbound.protocol.clone(),
         security: outbound.security.clone(),
+        target_strategy: outbound.target_strategy,
 
         warp_masque: outbound.warp_masque.clone(),
     }
@@ -1471,7 +1473,7 @@ fn external_outbound(outbound: &XrayExternalOutboundPlan) -> XrayOutbound {
 /// `infra/conf/freedom.go` lowercases before matching, so the casing has no effect; it is
 /// written the way xray's own documentation writes it, so that anyone holding the two side
 /// by side reads the same token. Verified against v26.4.25.
-fn domain_strategy_name(strategy: DomainStrategy) -> &'static str {
+pub(crate) fn domain_strategy_name(strategy: DomainStrategy) -> &'static str {
     match strategy {
         DomainStrategy::UseIp => "UseIP",
         DomainStrategy::UseIpv4 => "UseIPv4",
@@ -1808,20 +1810,16 @@ mod tests {
         // is that two runs agree.
     }
 
-    /// The property the swap depends on. Appending the new table while the old one is
-    /// still installed puts both in the running xray at once, and xray rejects a
-    /// duplicate `ruleTag`, so one name shared between the generations fails the whole
-    /// append, which is atomic, and the machine keeps the old routing with no error.
+    /// Inspection must identify a changed generation even when some rules are unchanged.
     #[test]
-    fn a_changed_table_shares_no_name_with_the_old_one() {
+    fn a_changed_table_updates_the_generation_in_every_name() {
         let before = tags(vec![rule("api", "api"), rule("in:a", "out:egress")]);
         // Only the second rule moved, and only in its outbound.
         let after = tags(vec![rule("api", "api"), rule("in:a", "out:block")]);
         for name in &after {
             assert!(
                 !before.contains(name),
-                "{name} appears in both generations; appending the new table would be \
-                 rejected as a duplicate ruleTag and the swap would leave the old rules in place",
+                "{name} still identifies the old generation after the table changed",
             );
         }
     }

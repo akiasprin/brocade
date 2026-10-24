@@ -58,6 +58,80 @@ function json(body: unknown) {
   return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
 }
 
+describe('usage realtime loading', () => {
+  it.each(['/realtime/fleet-traffic/snapshot', '/nodes/agent-state', '/users?include_disabled=false'])(
+    'only waits for the realtime snapshot while %s is pending',
+    async pendingPath => {
+      let finish!: (response: Response) => void;
+      const pending = new Promise<Response>(resolve => {
+        finish = resolve;
+      });
+      const responses: Record<string, unknown> = {
+        '/realtime/fleet-traffic/snapshot': { policy: { enabled: true }, nodes: [], expected: [] },
+        '/nodes/agent-state': { nodes: [] },
+        '/users?include_disabled=false': { users: [] },
+      };
+      vi.stubGlobal('EventSource', undefined);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+          const path = String(input);
+          if (path === pendingPath) return pending;
+          if (path in responses) return json(responses[path]);
+          throw new Error(`unexpected request: ${path}`);
+        }),
+      );
+      const view = render(
+        <QueryClientProvider client={client()}>
+          <UsagePane />
+        </QueryClientProvider>,
+      );
+      const paper = view.container.querySelector('.nd-paper');
+      const panel = view.getByRole('tabpanel', { name: '实时' });
+      if (pendingPath === '/realtime/fleet-traffic/snapshot') {
+        expect(within(panel).getByRole('status', { name: '读取实时用量' })).toBeTruthy();
+        expect(view.queryByLabelText('机队当前速率')).toBeNull();
+        expect(view.container.querySelector('.usage-tab-loading')?.getAttribute('aria-busy')).toBe('true');
+      } else {
+        await view.findByLabelText('机队当前速率');
+        expect(within(panel).queryByRole('status', { name: '读取实时用量' })).toBeNull();
+      }
+      const surface = view.container.querySelector('.flt-panel');
+
+      await act(async () => finish(json(responses[pendingPath])));
+
+      await view.findByLabelText('机队当前速率');
+      expect(view.queryByRole('status', { name: '读取实时用量' })).toBeNull();
+      expect(view.container.querySelector('.nd-paper')).toBe(paper);
+      expect(view.getByRole('tabpanel', { name: '实时' })).toBe(panel);
+      if (surface) expect(view.container.querySelector('.flt-panel')).toBe(surface);
+    },
+  );
+
+  it('replaces realtime progress with an error when the first reading fails', async () => {
+    vi.stubGlobal('EventSource', undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === '/nodes/agent-state') return json({ nodes: [] });
+        if (path === '/users?include_disabled=false') return json({ users: [] });
+        if (path === '/realtime/fleet-traffic/snapshot') return new Response('{}', { status: 503 });
+        throw new Error(`unexpected request: ${path}`);
+      }),
+    );
+    const view = render(
+      <QueryClientProvider client={client()}>
+        <UsagePane />
+      </QueryClientProvider>,
+    );
+
+    await view.findByText('无法读取机队实时流量，正在等待服务恢复');
+    expect(view.queryByRole('status', { name: '读取实时用量' })).toBeNull();
+    expect(view.getByRole('heading', { name: '用量' })).toBeTruthy();
+  });
+});
+
 describe('usage month view', () => {
   it('keeps the usage paper mounted while the first monthly reading loads', async () => {
     let finishMonthly: ((response: Response) => void) | undefined;

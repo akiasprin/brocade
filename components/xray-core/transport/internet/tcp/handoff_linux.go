@@ -116,6 +116,7 @@ type tcpHandoffBinding struct {
 	inAccept           bool
 	closed             bool
 	retired            bool
+	runtimeRemoved     bool
 	accepted           uint64
 	active             uint64
 	keepAlive          *net.KeepAliveConfig
@@ -130,6 +131,7 @@ type packetHandoffBinding struct {
 	endpoint           handoffEndpoint
 	inAccept           bool
 	closed             bool
+	runtimeRemoved     bool
 	accepted           uint64
 	active             uint64
 	acceptCancel       context.CancelFunc
@@ -501,6 +503,14 @@ func (c *tcpHandoff) open(address string, unsupported bool, config *internet.Soc
 	defer c.mu.Unlock()
 	key := handoffEndpointKey("tcp", address)
 	endpoint, found := c.expected[key]
+	runtimeAddition := !found && !unsupported && c.runtimeMutationAllowedLocked()
+	if runtimeAddition {
+		if len(c.expected) >= 512 {
+			return nil, nil, fmt.Errorf("runtime handoff listener limit reached")
+		}
+		endpoint = handoffEndpoint{Address: address, BindAddress: address, Network: "tcp", Role: "public"}
+		found = true
+	}
 	if !found {
 		if c.manifest.Version >= 2 {
 			c.unsupported["unregistered_tcp_listener"] = true
@@ -508,7 +518,7 @@ func (c *tcpHandoff) open(address string, unsupported bool, config *internet.Soc
 		l, err := bind()
 		return l, nil, err
 	}
-	if c.closed || c.ready || c.bindings[key] != nil || unsupported {
+	if c.closed || (c.ready && !runtimeAddition) || c.bindings[key] != nil || unsupported {
 		return nil, nil, fmt.Errorf("TCP handoff listener is closed, duplicate or uses unsupported wrapping")
 	}
 	// MPTCP is a preference, not a requirement: Go can fall back to TCP when
@@ -577,6 +587,9 @@ func (c *tcpHandoff) open(address string, unsupported bool, config *internet.Soc
 		b.keepAlive = &keepAlive
 	}
 	c.bindings[key] = b
+	if runtimeAddition {
+		c.expected[key] = endpoint
+	}
 	return listener, b, nil
 }
 
@@ -589,6 +602,14 @@ func (c *tcpHandoff) openPacket(logicalAddress string, config *internet.SocketCo
 	defer c.mu.Unlock()
 	key := handoffEndpointKey("udp", logicalAddress)
 	endpoint, found := c.expected[key]
+	runtimeAddition := !found && c.runtimeMutationAllowedLocked()
+	if runtimeAddition {
+		if len(c.expected) >= 512 {
+			return nil, nil, fmt.Errorf("runtime handoff listener limit reached")
+		}
+		endpoint = handoffEndpoint{Address: logicalAddress, BindAddress: logicalAddress, Network: "udp", Role: "public", Protocol: unix.IPPROTO_UDP}
+		found = true
+	}
 	if !found {
 		if c.manifest.Version >= 2 {
 			c.unsupported["unregistered_udp_listener"] = true
@@ -596,7 +617,7 @@ func (c *tcpHandoff) openPacket(logicalAddress string, config *internet.SocketCo
 		conn, err := bind(logicalAddress)
 		return conn, nil, err
 	}
-	if c.closed || c.ready || c.packets[key] != nil {
+	if c.closed || (c.ready && !runtimeAddition) || c.packets[key] != nil {
 		return nil, nil, fmt.Errorf("UDP handoff listener is closed or duplicate")
 	}
 	digest, err := handoffSocketConfigDigest(config)
@@ -623,7 +644,38 @@ func (c *tcpHandoff) openPacket(logicalAddress string, config *internet.SocketCo
 	identity.Address = endpoint.Address
 	b := &packetHandoffBinding{owner: c, conn: udpConn, identity: identity, endpoint: endpoint, socketConfigSHA256: digest}
 	c.packets[key] = b
+	if runtimeAddition {
+		c.expected[key] = endpoint
+	}
 	return conn, b, nil
+}
+
+// The Agent serializes live forwarding changes with generation handoff. Once a whole
+// generation is serving, its public listeners may be revoked and recreated through gRPC.
+// Preparation and pause/drain keep the frozen listener contract and fail closed.
+func (c *tcpHandoff) runtimeMutationAllowedLocked() bool {
+	return c.manifest.Version >= 2 && c.manifest.Scope == "whole-generation" && c.ready &&
+		!c.closed && !c.paused && !c.coverPaused && !c.drainRequested
+}
+
+// A removed listener remains in the drain proof until both Accept and every admitted
+// connection finish. Keeping it in the bounded listener map also prevents premature reuse.
+func (b *tcpHandoffBinding) pruneRuntimeRemovedLocked() {
+	c := b.owner
+	key := handoffEndpointKey("tcp", b.endpoint.Address)
+	if b.runtimeRemoved && !b.inAccept && b.active == 0 && c.bindings[key] == b {
+		delete(c.bindings, key)
+		delete(c.expected, key)
+	}
+}
+
+func (b *packetHandoffBinding) pruneRuntimeRemovedLocked() {
+	c := b.owner
+	key := handoffEndpointKey("udp", b.endpoint.Address)
+	if b.runtimeRemoved && !b.inAccept && b.active == 0 && c.packets[key] == b {
+		delete(c.packets, key)
+		delete(c.expected, key)
+	}
 }
 
 func (c *tcpHandoff) markReady() error {
@@ -780,6 +832,7 @@ func (b *tcpHandoffBinding) afterAccept(accepted bool) {
 		b.accepted++
 		b.active++
 	}
+	b.pruneRuntimeRemovedLocked()
 	c.cond.Broadcast()
 	c.mu.Unlock()
 }
@@ -799,6 +852,7 @@ func (b *tcpHandoffBinding) finishConnection() {
 	if b.active > 0 {
 		b.active--
 	}
+	b.pruneRuntimeRemovedLocked()
 	c.cond.Broadcast()
 	c.mu.Unlock()
 }
@@ -860,6 +914,13 @@ func (b *tcpHandoffBinding) close() {
 	c := b.owner
 	c.mu.Lock()
 	b.closed = true
+	if b.runtimeRemoved || (!b.retired && b.endpoint.Role == "public" && c.runtimeMutationAllowedLocked()) {
+		b.runtimeRemoved = true
+		b.pruneRuntimeRemovedLocked()
+		c.cond.Broadcast()
+		c.mu.Unlock()
+		return
+	}
 	// HTTP/gRPC servers close their listener again when Accept exits. An explicitly retired
 	// admission socket is not an unexpected missing listener and must retain its drain proof.
 	if !b.retired {
@@ -898,6 +959,7 @@ func (b *packetHandoffBinding) AfterAccept(accepted bool) {
 		b.accepted++
 		b.active++
 	}
+	b.pruneRuntimeRemovedLocked()
 	c.cond.Broadcast()
 	c.mu.Unlock()
 }
@@ -908,6 +970,7 @@ func (b *packetHandoffBinding) FinishConnection() {
 	if b.active > 0 {
 		b.active--
 	}
+	b.pruneRuntimeRemovedLocked()
 	c.cond.Broadcast()
 	c.mu.Unlock()
 }
@@ -935,6 +998,13 @@ func (b *packetHandoffBinding) Close() {
 	if b.acceptCancel != nil {
 		b.acceptCancel()
 		b.acceptCancel = nil
+	}
+	if b.runtimeRemoved || (b.endpoint.Role == "public" && c.runtimeMutationAllowedLocked()) {
+		b.runtimeRemoved = true
+		b.pruneRuntimeRemovedLocked()
+		c.cond.Broadcast()
+		c.mu.Unlock()
+		return
 	}
 	c.ready = false
 	c.paused = true

@@ -364,6 +364,7 @@ fn warp_topology() -> ModelSnapshot {
         outbound: "warp-8f3a-2d71".to_owned(),
     };
     topology.external_outbounds.push(ExternalOutbound {
+        target_strategy: None,
         id: "warp-8f3a-2d71".to_owned(),
         tenant,
         name: "WARP checkpoint fixture".to_owned(),

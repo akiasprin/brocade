@@ -47,17 +47,17 @@ export function ForwardingRuleProbe({
         value,
       ]),
   });
+  const disabled =
+    !rule.enabled ||
+    !entry?.enabled ||
+    entry.quota_suspended ||
+    ['service-paused', 'disabled'].includes(rule.runtime_status);
   const current =
-    result?.rule_updated_at === rule.updated_at &&
-    result.generation === entry?.desired_generation &&
-    rule.enabled &&
-    entry?.enabled &&
-    !entry.quota_suspended
+    result?.rule_updated_at === rule.updated_at && result.generation === entry?.desired_generation && !disabled
       ? result
       : undefined;
   const pending = !!current && forwardingProbePending(current);
   const reading = current?.state === 'complete' ? current.result : null;
-  const disabled = !rule.enabled || !entry?.enabled || entry.quota_suspended;
   const status = !current
     ? '未测试'
     : {

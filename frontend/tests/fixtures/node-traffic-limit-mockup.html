@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>机器配置 · 流量统计 · 自动限速 mockup</title>
+    <script>
+      document.documentElement.dataset.theme =
+        new URLSearchParams(location.search).get('theme') === 'light' ? 'light' : 'dark';
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import RefreshRuntime from '/@react-refresh';
+      RefreshRuntime.injectIntoGlobalHook(window);
+      window.$RefreshReg$ = () => {};
+      window.$RefreshSig$ = () => type => type;
+      window.__vite_plugin_react_preamble_installed__ = true;
+    </script>
+    <script type="module" src="./node-traffic-limit-mockup.tsx"></script>
+  </body>
+</html>

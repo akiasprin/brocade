@@ -90,7 +90,7 @@ async fn forwarding_quota_jobs_pause_only_the_user_machine_and_preserve_manual_f
         .iter()
         .find(|e| e.node_id == "n1")
         .unwrap();
-    assert_eq!(entry.monthly_used_bytes, 100);
+    assert_eq!(entry.cycle_used_bytes, 100);
     assert!(entry.quota_suspended);
     assert_eq!(entry.quota_job_status.as_deref(), Some("queued"));
     assert_eq!(
@@ -122,6 +122,7 @@ async fn forwarding_quota_jobs_pause_only_the_user_machine_and_preserve_manual_f
         .record_forwarding_reconcile(
             "n1",
             ForwardingReconcileReport {
+                rule_results: None,
                 generation: original.generation,
                 applied_rule_ids: vec![active, bob],
                 error: None,
@@ -139,6 +140,7 @@ async fn forwarding_quota_jobs_pause_only_the_user_machine_and_preserve_manual_f
         .record_forwarding_reconcile(
             "n1",
             ForwardingReconcileReport {
+                rule_results: None,
                 generation: paused.generation,
                 applied_rule_ids: vec![active, bob],
                 error: Some("remove failed; retrying".into()),
@@ -151,6 +153,7 @@ async fn forwarding_quota_jobs_pause_only_the_user_machine_and_preserve_manual_f
         .record_forwarding_reconcile(
             "n1",
             ForwardingReconcileReport {
+                rule_results: None,
                 generation: paused.generation,
                 applied_rule_ids: vec![],
                 error: None
@@ -171,6 +174,7 @@ async fn forwarding_quota_jobs_pause_only_the_user_machine_and_preserve_manual_f
         .record_forwarding_reconcile(
             "n1",
             ForwardingReconcileReport {
+                rule_results: None,
                 generation: paused.generation,
                 applied_rule_ids: vec![bob],
                 error: None,
@@ -253,7 +257,7 @@ async fn forwarding_quota_uses_the_users_single_or_double_accounting_mode() {
         .iter()
         .find(|entry| entry.node_id == "n1")
         .unwrap();
-    assert_eq!(entry.monthly_used_bytes, 200);
+    assert_eq!(entry.cycle_used_bytes, 200);
 }
 
 #[tokio::test]
@@ -288,6 +292,7 @@ async fn forwarding_quota_month_reset_deleted_history_and_superseded_jobs() {
         .record_forwarding_reconcile(
             "n1",
             ForwardingReconcileReport {
+                rule_results: None,
                 generation: paused.generation,
                 applied_rule_ids: vec![],
                 error: None,
@@ -554,8 +559,8 @@ async fn forwarding_quota_compatibility_preserves_existing_rules_and_usage() {
         .iter()
         .find(|e| e.node_id == "n1")
         .unwrap();
-    assert_eq!(entry.monthly_used_bytes, 100);
-    assert!(entry.monthly_limit_bytes.is_none());
+    assert_eq!(entry.cycle_used_bytes, 100);
+    assert!(entry.cycle_limit_bytes.is_none());
     assert!(!entry.quota_suspended);
     assert_eq!(
         db.store.enforce_forwarding_quotas().await.unwrap(),

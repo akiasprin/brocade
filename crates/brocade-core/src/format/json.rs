@@ -828,10 +828,26 @@ fn anytls_masquerade(masquerade: &AnyTlsMasquerade) -> Value {
 ///
 /// The TCP branch emits the canonical direct transport shape; XHTTP adds only its own settings.
 fn stream_settings(stream: &XrayStream, security: &XrayIngressSecurity) -> Value {
+    let mut value = stream_settings_inner(stream, security);
+    if matches!(
+        stream,
+        XrayStream::Xhttp {
+            accept_proxy_protocol: true,
+            ..
+        }
+    ) {
+        value["sockopt"] = json!({ "acceptProxyProtocol": true });
+    }
+    value
+}
+
+fn stream_settings_inner(stream: &XrayStream, security: &XrayIngressSecurity) -> Value {
     if matches!(security, XrayIngressSecurity::None) {
         return match stream {
             XrayStream::Tcp => json!({ "network": "tcp", "security": "none" }),
-            XrayStream::Xhttp { path, mode, tuning } => json!({
+            XrayStream::Xhttp {
+                path, mode, tuning, ..
+            } => json!({
                 "network": "xhttp",
                 "security": "none",
                 "xhttpSettings": xhttp_settings(path, *mode, tuning.as_ref()),
@@ -845,7 +861,9 @@ fn stream_settings(stream: &XrayStream, security: &XrayIngressSecurity) -> Value
             "security": security_name,
             settings_key: settings,
         }),
-        XrayStream::Xhttp { path, mode, tuning } => json!({
+        XrayStream::Xhttp {
+            path, mode, tuning, ..
+        } => json!({
             "network": "xhttp",
             "security": security_name,
             settings_key: settings,
@@ -1083,10 +1101,11 @@ fn outbound(outbound: &XrayOutbound) -> Value {
             port,
             protocol,
             security,
+            target_strategy,
             warp_masque,
         } => {
             if let Some(warp) = warp_masque {
-                return json!({
+                let mut value = json!({
                     "tag": tag, "protocol": "masque",
                     "settings": { "address": address, "port": port, "remoteDNS": warp.options.remote_dns },
                     "streamSettings": {
@@ -1097,6 +1116,11 @@ fn outbound(outbound: &XrayOutbound) -> Value {
                         } }
                     }
                 });
+                if let Some(strategy) = target_strategy {
+                    value["targetStrategy"] =
+                        json!(crate::artifacts::xray::domain_strategy_name(*strategy));
+                }
+                return value;
             }
             let supports_stream_settings = !matches!(
                 protocol,
@@ -1209,6 +1233,10 @@ fn outbound(outbound: &XrayOutbound) -> Value {
                 "protocol": protocol_name,
                 "settings": settings,
             });
+            if let Some(strategy) = target_strategy {
+                value["targetStrategy"] =
+                    json!(crate::artifacts::xray::domain_strategy_name(*strategy));
+            }
             if supports_stream_settings {
                 value
                     .as_object_mut()
@@ -1222,6 +1250,7 @@ fn outbound(outbound: &XrayOutbound) -> Value {
             send_through,
             domain_strategy,
             address_policy,
+            proxy_protocol,
         } => {
             let mut object = Map::new();
             object.insert("tag".to_owned(), json!(tag));
@@ -1234,6 +1263,9 @@ fn outbound(outbound: &XrayOutbound) -> Value {
             // (`infra/conf/freedom.go`), so the older key works on both sides of that
             // rename while the newer one would not.
             let mut settings = json!({ "domainStrategy": domain_strategy });
+            if *proxy_protocol {
+                settings["proxyProtocol"] = json!(2);
+            }
             match address_policy {
                 XrayFreedomAddressPolicy::Default => {}
                 XrayFreedomAddressPolicy::BlockPrivate => {
@@ -1268,7 +1300,11 @@ fn enable_tcp_fast_open(stream_settings: &mut Value, value: Value) {
     stream_settings
         .as_object_mut()
         .expect("hop streamSettings must be an object")
-        .insert("sockopt".to_owned(), json!({ "tcpFastOpen": value }));
+        .entry("sockopt")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .expect("hop sockopt must be an object")
+        .insert("tcpFastOpen".to_owned(), value);
 }
 
 fn external_vless_stream_settings(
@@ -1374,6 +1410,7 @@ fn external_stream_settings(network: &str, security: &ExternalOutboundSecurity) 
         ExternalOutboundSecurity::Tls {
             server_name,
             fingerprint,
+            allow_insecure,
             alpn,
             ech_config_list,
             pinned_peer_cert_sha256,
@@ -1383,6 +1420,9 @@ fn external_stream_settings(network: &str, security: &ExternalOutboundSecurity) 
             let mut settings = Map::new();
             settings.insert("serverName".to_owned(), json!(server_name));
             settings.insert("fingerprint".to_owned(), json!(fingerprint));
+            if *allow_insecure {
+                settings.insert("allowInsecure".to_owned(), json!(true));
+            }
             if !alpn.is_empty() {
                 settings.insert("alpn".to_owned(), json!(alpn));
             }
@@ -1591,9 +1631,7 @@ fn policy_config(policy: &XrayPolicy) -> Value {
 fn routing_rule(rule: &XrayRoutingRule) -> Value {
     let mut object = Map::new();
     object.insert("type".to_owned(), json!("field"));
-    // What lets this rule be removed from a running xray by name. Unconditional: a rule
-    // without one is invisible to `xray api lsrules` (it reports `{}`) and unreachable by
-    // `rmrules`, so one unnamed rule in the table is enough to make the table unswappable.
+    // Keep the compiled generation and position visible in `xray api lsrules` output.
     object.insert("ruleTag".to_owned(), json!(rule.rule_tag));
     if !rule.inbound_tags.is_empty() {
         object.insert("inboundTag".to_owned(), json!(rule.inbound_tags));
@@ -1672,6 +1710,7 @@ mod tests {
                 security: XrayIngressSecurity::None,
                 sniff: true,
                 stream: XrayStream::Xhttp {
+                    accept_proxy_protocol: false,
                     path: "/test".to_owned(),
                     mode: None,
                     tuning: None,
@@ -1828,6 +1867,7 @@ mod tests {
             (XrayFreedomAddressPolicy::Default, None),
         ] {
             let value = outbound(&XrayOutbound::Freedom {
+                proxy_protocol: false,
                 tag: "direct".to_owned(),
                 send_through: None,
                 domain_strategy: "UseIP".to_owned(),

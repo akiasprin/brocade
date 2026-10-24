@@ -125,3 +125,9 @@ it('network failure stays local and allows retry rather than automatic target pr
   expect(fetch).toHaveBeenCalledTimes(1);
   expect((view.getByRole('button', { name: '测试延迟' }) as HTMLButtonElement).disabled).toBe(false);
 });
+
+it('有效期暂停后隐藏旧读数并禁止发送新的拨测', () => {
+  const view = show(result, true, { ...rule, runtime_status: 'service-paused' });
+  expect(view.queryByText(/TCP 连通/)).toBeNull();
+  expect((view.getByRole('button', { name: '测试延迟' }) as HTMLButtonElement).disabled).toBe(true);
+});

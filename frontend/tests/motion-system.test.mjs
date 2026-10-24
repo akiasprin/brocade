@@ -139,7 +139,11 @@ test('user selection replaces detail directly without a snapshot cross-fade', ()
     /\.fg-view \.user-split-detail,\s*\.fg-view \.user-split-detail :is\(\.panel, \.chart-card\)\s*\{\s*animation:\s*none;\s*\}/,
     'user detail and nested panels must not replay the shared mount animation on selection',
   );
-  assert.match(users, /<section key=\{r\.key\} className="panel user-split-detail">/);
+  assert.match(
+    users,
+    /<section\s+key="user-detail"\s+className="panel user-split-detail"/,
+    'the detail panel keeps its identity while the selected user changes',
+  );
 });
 
 test('navigation updates directly while theme and palette retain progressive transitions', () => {

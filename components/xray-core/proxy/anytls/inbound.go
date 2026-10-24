@@ -3,6 +3,7 @@ package anytls
 import (
 	"context"
 	"encoding/binary"
+	"github.com/xtls/xray-core/common/sourceaccess"
 	"io"
 	"sync"
 	"time"
@@ -156,6 +157,11 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	inb := sessionctx.InboundFromContext(ctx)
 	inb.Name = protocolName
 	inb.User = user
+	releaseAccess, err := sourceaccess.Register(ctx, user.Email, conn.RemoteAddr(), func() { _ = conn.SetDeadline(time.Now()); sess.close(errors.New("source IP access denied")) })
+	if err != nil {
+		return err
+	}
+	defer releaseAccess()
 	inb.CanSpliceCopy.Store(sessionctx.SpliceCopyDisabled) // Multiplexed AnyTLS frames must be decoded before delivery.
 
 	return sess.readLoop(sessionCtx)

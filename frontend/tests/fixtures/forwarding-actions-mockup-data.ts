@@ -251,8 +251,8 @@ export function overviewOf(scene: Scene): ForwardingOverview {
       applied_generation: item.sync === 'pending' ? 2 : 3,
       reconcile_status: item.sync === 'error' ? 'error' : item.sync === 'pending' ? 'pending' : 'converged',
       last_error: item.lastError ?? null,
-      monthly_limit_bytes: item.limit,
-      monthly_used_bytes: item.used,
+      cycle_limit_bytes: item.limit,
+      cycle_used_bytes: item.used,
       quota_suspended: item.limit != null && item.used >= item.limit,
       quota_job_id: latest?.id ?? null,
       quota_job_status: latest?.status ?? null,
@@ -279,10 +279,12 @@ export function overviewOf(scene: Scene): ForwardingOverview {
   return { tenant_id: 'ops', user_id: 'alice', entitlements, rules };
 }
 
-export function monthlyOf(scene: Scene) {
+export function cycleUsageOf(scene: Scene) {
   return {
-    month_start: '2026-10-01',
-    month_end: '2026-11-01',
+    periods: [
+      { tenant_id: 'ops', user_id: 'alice', starts_at: '2026-09-30T16:00:00Z', ends_at: '2026-10-31T16:00:00Z' },
+    ],
+    views: [],
     forwarding: scene.rules.map(item => ({
       tenant_id: 'ops',
       user_id: 'alice',

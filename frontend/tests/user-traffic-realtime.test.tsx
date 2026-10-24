@@ -435,10 +435,80 @@ describe('machine user traffic card', () => {
     const rates = Array.from({ length: 26 }, (_, i) => rate(`u${String(i).padStart(2, '0')}`, `c${i % 7}`, i + 1, 100));
     act(() => Events.sources[0].send('sample', event('n1', [...rates, rate('u01', 'extra', 5, 10)])));
     const chains = screen.getByRole('region', { name: '当前经过的接入链' });
-    expect(within(chains).getAllByRole('listitem')).toHaveLength(6);
-    expect(chains.textContent).toContain('其余 2 条');
+    expect(within(chains).getAllByRole('listitem')).toHaveLength(7);
+    expect([...chains.querySelectorAll('.rut-source-name')].map(entry => entry.textContent)).toEqual([
+      'ingress:c0',
+      'ingress:c1',
+      'ingress:c2',
+      'ingress:c3',
+      'ingress:c4',
+      'ingress:c5',
+      'ingress:c6',
+    ]);
+    expect(chains.textContent).not.toContain('其余');
     expect(screen.queryByRole('table')).toBeNull();
     expect(screen.queryByRole('button', { name: '当前' })).toBeNull();
+  });
+
+  it('keeps chain names in alphabetical order and retains zero-rate entries between complete reports', async () => {
+    const labels: Record<string, string> = { 'ingress:a': 'Alpha', 'ingress:b': 'beta', 'ingress:z': 'Zulu' };
+    renderCard(
+      <NodeRealtimeProvider nodeId="n1">
+        <NodeUserTrafficCard nodeId="n1" sourceOf={key => ({ key, name: labels[key] ?? key, country: null })} />
+      </NodeRealtimeProvider>,
+    );
+    await settle();
+    const chains = screen.getByRole('region', { name: '当前经过的接入链' });
+    const chainNames = () => [...chains.querySelectorAll('.rut-source-name')].map(entry => entry.textContent);
+    const report = async (rates: ReturnType<typeof rate>[]) => {
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+      act(() => Events.sources[0].send('sample', event('n1', rates)));
+      await act(() => vi.advanceTimersByTimeAsync(1_000));
+    };
+
+    await report([rate('alice', 'z', 0, 900), rate('alice', 'b', 0, 100), rate('alice', 'a', 0, 10)]);
+    expect(chainNames()).toEqual(['Alpha', 'beta', 'Zulu']);
+    const originalRows = within(chains).getAllByRole('listitem');
+
+    // The same user's next report drops two sources; keep their identities at zero.
+    await report([rate('alice', 'a', 0, 2000)]);
+    expect(chainNames()).toEqual(['Alpha', 'beta', 'Zulu']);
+    expect(within(chains).getAllByRole('listitem')).toEqual(originalRows);
+    expect(originalRows[1].querySelector('b')?.textContent).toBe('0');
+    expect(originalRows[2].querySelector('b')?.textContent).toBe('0');
+
+    // A complete empty report confirms all users are idle, rather than deleting their chains.
+    await report([]);
+    expect(chainNames()).toEqual(['Alpha', 'beta', 'Zulu']);
+    expect(
+      within(chains)
+        .getAllByRole('listitem')
+        .map(entry => entry.querySelector('b')?.textContent),
+    ).toEqual(['0', '0', '0']);
+
+    await report([rate('bob', 'z', 0, 3000)]);
+    expect(chainNames()).toEqual(['Alpha', 'beta', 'Zulu']);
+    expect(originalRows[0].querySelector('b')?.textContent).toBe('0');
+    expect(originalRows[2].querySelector('b')?.textContent).not.toBe('0');
+  });
+
+  it('keeps chain identities visible without showing unknown reports as measured zeroes', async () => {
+    renderCard(
+      <NodeRealtimeProvider nodeId="n1">
+        <NodeUserTrafficCard nodeId="n1" />
+      </NodeRealtimeProvider>,
+    );
+    await settle();
+    act(() => Events.sources[0].send('sample', event('n1', [rate('alice', 'first')])));
+    const chains = screen.getByRole('region', { name: '当前经过的接入链' });
+    await act(() => vi.advanceTimersByTimeAsync(1_000));
+    act(() => Events.sources[0].send('sample', event('n1', [rate('bob', 'second')], true, { truncated: true })));
+    await act(() => vi.advanceTimersByTimeAsync(1_000));
+
+    const first = within(chains).getByText('接入点 first').closest('li')!;
+    expect(first.querySelector('b')?.textContent).toBe('—');
+    expect(within(chains).getByText('接入点 second')).toBeTruthy();
+    expect(screen.getByText('部分速率合计')).toBeTruthy();
   });
 
   it('marks forwarding sources with the shared icon alongside chain region flags', async () => {

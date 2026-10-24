@@ -1,8 +1,12 @@
+import { useSourceAccess } from './source-access';
+import { SourceAccessRollout, SourceBanAdd, SourceBanButton } from './user-source-access';
 import {
   Fragment,
   memo,
+  useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -15,7 +19,7 @@ import {
   fetchQuotas,
   fetchSnapshot,
   fetchTenants,
-  fetchUsageMonthly,
+  fetchUserCycleUsage,
   fetchUserOnlineSourceHistory,
   fetchUserPresence,
   fetchUsers,
@@ -24,18 +28,19 @@ import {
   revokeUserDirectLogin,
   rotateMyUuid,
   rotateUserUuid,
-  setQuota,
   setUserPassword,
   setUserStatus,
   updateUserProfile,
   upsertGrant,
   type SnapshotApp,
+  type SourceAccessNode,
   type GrantWrite,
   type IssuedUserDirectLogin,
   type NetworkOperator,
   type UsageMonthlyViewRow,
   type UserListItem,
   type UserTrafficAccountingMode,
+  type UserTrafficPolicyView,
   type UserOnlineSourceAccess,
   type UserOnlineSource,
   type UserPresence,
@@ -47,7 +52,7 @@ import { bytes, shareOf } from '../ui/format';
 import { useNodeNames } from '../ui/node-name';
 import { RegionFlag } from '../ui/region-flag';
 import { GeneratedUserAvatar, type AvatarLamp } from '../ui/user-avatar';
-import { FieldLoading } from '../ui/loading';
+import { FieldLoading, PanelLoading } from '../ui/loading';
 import { useNow } from '../ui/clock';
 import { type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
@@ -67,6 +72,13 @@ import { UserSiteUsageCard } from '../user-site-usage';
 import { UserMachineUsageCard } from '../user-machine-usage';
 import { UserTrafficAccountingSetting } from '../user-traffic-accounting';
 import { UserForwardingCard } from './user-forwarding';
+import { UserServiceTerms } from './user-service-policy';
+import {
+  UserAppTrafficPolicyEditor,
+  useUserTrafficPolicies,
+  prefetchUserTrafficPolicies,
+  UserTrafficQuotaMeter,
+} from './user-traffic-policy';
 
 // 用户列表：一行一个用户，点击后就地展开。
 // 此处原为授权矩阵，行是用户、列是接入面。列数随数据增长：每个接入点一列，每个线路再加
@@ -92,6 +104,7 @@ type UserTone = 'ok' | 'bad' | 'idle';
 
 export interface UserFacts {
   status: string;
+  serviceState?: UserListItem['service_state'];
   grants: number;
   // 额度已用尽的线路。空数组不表示未设置额度：未设额度的线路和已设未超的线路
   // 都不会进入此数组。
@@ -99,11 +112,12 @@ export interface UserFacts {
   // 被配额执行器撤销的接入点数量。撤销后 `grants` 归零，仅依据 `grants` 会判定为
   // 未授权并显示空心状态，而该用户实际是被中断的。
   suspended: number;
+  throttledApps?: string[];
 }
 
-export type MonthlyUsageState = 'pending' | 'failed' | 'ready';
+export type CycleUsageState = 'pending' | 'failed' | 'ready';
 
-export const monthlyUsageText = (state: MonthlyUsageState, rowCount: number, total: number) => {
+export const cycleUsageText = (state: CycleUsageState, rowCount: number, total: number) => {
   if (state === 'pending') return '读取中…';
   if (state === 'failed') return '暂不可用';
   return rowCount > 0 ? bytes(total) : '—';
@@ -112,14 +126,24 @@ export const monthlyUsageText = (state: MonthlyUsageState, rowCount: number, tot
 const trafficMultiplier = (mode: UserTrafficAccountingMode | undefined) => (mode === 'double' ? 2 : 1);
 
 const userTone = (f: UserFacts): UserTone =>
-  f.status === 'disabled' || f.exhausted.length > 0 || f.suspended > 0 ? 'bad' : f.grants === 0 ? 'idle' : 'ok';
+  f.status === 'disabled' ||
+  (f.serviceState !== undefined && f.serviceState !== 'active') ||
+  f.exhausted.length > 0 ||
+  f.suspended > 0
+    ? 'bad'
+    : f.grants === 0
+      ? 'idle'
+      : 'ok';
 
 const userLampTitle = (f: UserFacts) => {
   const causes: string[] = [];
   if (f.status === 'disabled') causes.push('已停用：旧凭据立即失效');
+  if (f.serviceState === 'pending') causes.push('服务尚未生效');
+  if (f.serviceState === 'expired') causes.push('服务已到期');
   if (f.exhausted.length > 0) causes.push(`流量已用尽：${f.exhausted.join('、')}`);
   if (f.suspended > 0) causes.push(`${f.suspended} 个接入点已被系统停用`);
   if (causes.length > 0) return `无法连接 · ${causes.join('；')}`;
+  if (f.throttledApps?.length) return `额度已用满 · ${f.throttledApps.join('、')} 已限速`;
   return f.grants === 0 ? '未授权任何接入点，无法连接' : `可用 · ${f.grants} 个接入点`;
 };
 
@@ -145,7 +169,11 @@ const ROSTER_FILTERS: { value: RosterFilter; label: string }[] = [
 
 // 需处理：流量用尽或接入点被系统停用。已停用由操作者设置，单独成组；未授权不算异常。
 const needsAttention = (user: UserListItem, facts: UserFacts) =>
-  user.status !== 'disabled' && (facts.exhausted.length > 0 || facts.suspended > 0);
+  user.status !== 'disabled' &&
+  (facts.serviceState === 'pending' ||
+    facts.serviceState === 'expired' ||
+    facts.exhausted.length > 0 ||
+    facts.suspended > 0);
 
 export const rosterFilterMatches = (filter: RosterFilter, user: UserListItem, facts: UserFacts) =>
   filter === 'all' ||
@@ -248,6 +276,14 @@ function chainsOf(source: UserOnlineSource, apps: SnapshotApp[]): PresenceChain[
   }
   return [...grouped.values()].sort((a, b) => a.name.localeCompare(b.name, 'zh-CN') || a.key.localeCompare(b.key));
 }
+
+const accessSummaryOf = (chains: PresenceChain[]) => {
+  const accesses = chains.flatMap(chain => chain.accesses);
+  if (chains.length === 0) return '接入链未知';
+  return chains.length === 1
+    ? `${chains[0].name} · ${protocolSummary(accesses)}`
+    : `${chains.length} 条接入链 · ${protocolSummary(accesses)}`;
+};
 
 function PresenceChainLink({ chain }: { chain: PresenceChain }) {
   if (!chain.appId || !chain.chainId) return <span className="user-presence-chain-unknown">{chain.name}</span>;
@@ -436,6 +472,7 @@ const PresenceRow = memo(function PresenceRow({
   operator,
   apps,
   now,
+  onBan,
 }: {
   source: UserOnlineSource;
   online: boolean;
@@ -444,6 +481,8 @@ const PresenceRow = memo(function PresenceRow({
   operator: NetworkOperator | undefined;
   apps: SnapshotApp[];
   now: number;
+  /** 有修改名单的权限且名单已读到时给出：复制钮旁多一枚禁行钮。 */
+  onBan?: (ip: string) => Promise<unknown>;
 }) {
   const [accessExpanded, setAccessExpanded] = useState(false);
   const accessId = useId();
@@ -454,13 +493,7 @@ const PresenceRow = memo(function PresenceRow({
   const past = online ? '' : '历史';
   const chains = chainsOf(source, apps);
   const accessCount = chains.length;
-  const allAccesses = chains.flatMap(chain => chain.accesses);
-  const accessSummary =
-    accessCount === 0
-      ? '接入链未知'
-      : accessCount === 1
-        ? `${chains[0].name} · ${protocolSummary(allAccesses)}`
-        : `${accessCount} 条接入链 · ${protocolSummary(allAccesses)}`;
+  const accessSummary = accessSummaryOf(chains);
   const until = online ? now : lastSeen;
   return (
     <li className={`user-presence-row${online ? '' : ' off'}${accessExpanded ? ' expanded' : ''}`}>
@@ -478,6 +511,7 @@ const PresenceRow = memo(function PresenceRow({
           failureLabel={`${past}来源 IP 复制失败`}
           iconOnly
         />
+        {onBan && <SourceBanButton ip={source.ip} online={online} onBan={onBan} />}
       </span>
       <span className="user-presence-sub">
         <span className="user-presence-location" title={SOURCE_LOCATION_TITLE}>
@@ -540,6 +574,131 @@ const lastSeenOrder = (source: UserOnlineSource) => {
   return Number.isNaN(t) ? 0 : t;
 };
 
+// 来源封禁在在线设备卡底自成「已封禁」一组，与时间线同一套列：时刻列写最后出现，节点换成禁行标记，
+// 网络列之后写接入链或出现情况，行尾解除。
+type BannedSourceState = 'live' | 'seen' | 'unseen' | 'unknown';
+
+interface BannedSource {
+  key: string;
+  ip: string;
+  /** live：仍有经过它的机器未确认当前名单，会话可能还在；seen：有出现记录；unseen：30 天内确实没出现过。 */
+  state: BannedSourceState;
+  source: UserOnlineSource | null;
+  country: string | undefined;
+  operator: NetworkOperator | undefined;
+}
+
+// 同一天写时刻，更早写月-日：这一组不按天分组，单写时刻读不出是哪天。
+const bannedSeenStamp = (t: number, today: number) =>
+  Number.isNaN(t) ? '' : calendarDaysAgo(t, today) <= 0 ? clockOf(t) : monthDayOf(t);
+
+function BannedSources({
+  rows,
+  nodes,
+  apps,
+  today,
+  onUnban,
+}: {
+  rows: BannedSource[];
+  nodes: SourceAccessNode[];
+  apps: SnapshotApp[];
+  today: number;
+  /** 有修改名单的权限时给出。 */
+  onUnban?: (ip: string) => Promise<unknown>;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [removing, setRemoving] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
+  const visible = expanded ? rows : rows.slice(0, PRESENCE_HISTORY_PREVIEW_LIMIT);
+  const unban = async (ip: string) => {
+    if (!onUnban) return;
+    setRemoving(ip);
+    setError(null);
+    try {
+      await onUnban(ip);
+    } catch (failure) {
+      setError(failure);
+    } finally {
+      setRemoving(null);
+    }
+  };
+  return (
+    <div className="source-ban-group">
+      <ol className="user-presence-timeline" aria-label="已封禁的来源">
+        <li className="user-presence-day source-ban-day">
+          <span>已封禁</span>
+          <SourceAccessRollout nodes={nodes} />
+        </li>
+        {visible.map(row => {
+          const network = sourceNetwork(row.country, row.operator);
+          const chains = row.source ? chainsOf(row.source, apps) : [];
+          const seen =
+            row.state === 'live'
+              ? `仍在线 · ${accessSummaryOf(chains)}`
+              : row.state === 'seen'
+                ? accessSummaryOf(chains)
+                : row.state === 'unseen'
+                  ? '30 天内未出现'
+                  : '';
+          return (
+            <li key={row.key} className={`user-presence-row source-ban-row${row.state === 'live' ? ' live' : ' off'}`}>
+              <span
+                className="user-presence-time"
+                title={row.source ? observedTitle(row.source, row.state === 'live') : undefined}
+              >
+                {row.state === 'seen' && row.source
+                  ? bannedSeenStamp(observedAt(row.source.last_observed_at), today)
+                  : ''}
+              </span>
+              <span className="user-presence-mark banned" aria-hidden="true" />
+              <span className="user-presence-ip">
+                <SourceAddress ip={row.ip} />
+                <CopyButton
+                  className="user-fcopy"
+                  text={row.ip}
+                  label={`复制已封禁来源 IP ${row.ip}`}
+                  successLabel="已封禁来源 IP 已复制"
+                  failureLabel="已封禁来源 IP 复制失败"
+                  iconOnly
+                />
+              </span>
+              <span className="user-presence-sub">
+                <span className="user-presence-location" title={SOURCE_LOCATION_TITLE}>
+                  {network.code && <RegionFlag code={network.code} />}
+                  <span>{network.label}</span>
+                </span>
+                <span className={`source-ban-seen${row.state === 'live' ? ' gold' : ''}`}>{seen}</span>
+              </span>
+              {onUnban && (
+                <button
+                  type="button"
+                  className="source-ban-unban"
+                  disabled={removing !== null}
+                  aria-label={`解除封禁 ${row.ip}`}
+                  onClick={() => void unban(row.ip)}
+                >
+                  {removing === row.ip ? '解除中…' : '解除'}
+                </button>
+              )}
+            </li>
+          );
+        })}
+      </ol>
+      {rows.length > PRESENCE_HISTORY_PREVIEW_LIMIT && (
+        <button
+          type="button"
+          className="user-presence-more"
+          aria-expanded={expanded}
+          onClick={() => setExpanded(value => !value)}
+        >
+          {expanded ? '收起已封禁来源' : `显示其余 ${rows.length - PRESENCE_HISTORY_PREVIEW_LIMIT} 个已封禁来源`}
+        </button>
+      )}
+      {!!error && <ErrorBox error={error} />}
+    </div>
+  );
+}
+
 function UserPresenceCard({
   user,
   presence,
@@ -548,6 +707,8 @@ function UserPresenceCard({
   apps,
   pending,
   error,
+  canBan,
+  masked,
 }: {
   user: UserListItem;
   presence: UserPresence | undefined;
@@ -556,11 +717,22 @@ function UserPresenceCard({
   apps: SnapshotApp[];
   pending: boolean;
   error: unknown;
+  /** 可以修改来源封禁名单（编辑及以上）。 */
+  canBan: boolean;
+  /** 只读视角：服务端把地址脱敏成网段前缀，不同来源可能同形，不能按地址对照名单与在线来源。 */
+  masked: boolean;
 }) {
   const nameOf = useNodeNames();
   const [historyExpanded, setHistoryExpanded] = useState(false);
+  const [addingBan, setAddingBan] = useState(false);
   const now = useNow();
   const today = new Date(now).setHours(0, 0, 0, 0);
+  const sourceAccess = useSourceAccess({ tenantId: user.tenant_id, userId: user.id });
+  const bans = sourceAccess.query.data;
+  const changeBans = sourceAccess.save.mutateAsync;
+  // 行是 memo 的：回调要稳定，否则每秒的时钟重渲染会带着所有行一起重渲染。
+  const banSource = useCallback((ip: string) => changeBans(ips => [...ips, ip]), [changeBans]);
+  const unbanSource = useCallback((ip: string) => changeBans(ips => ips.filter(value => value !== ip)), [changeBans]);
   const online = presence?.sources ?? [];
   // 在线与离线来源排在同一条时间线上，打开详情即读取离线来源。名册只轮询在线来源，历史只为
   // 当前打开的这一位用户读取（见 store 的 history 说明）。刚离线的地址要立即出现在历史里：
@@ -581,17 +753,22 @@ function UserPresenceCard({
   const offline = (history.data?.sources ?? [])
     .filter(source => !onlineIps.has(source.ip))
     .sort((a, b) => lastSeenOrder(b) - lastSeenOrder(a) || a.ip.localeCompare(b.ip));
-  const visibleOffline = historyExpanded ? offline : offline.slice(0, PRESENCE_HISTORY_PREVIEW_LIMIT);
   const retentionDays = history.data?.retention_days ?? 30;
   const historyCountries = new Map(history.data?.source_countries?.map(({ ip, country }) => [ip, country]));
   const historyOperators = new Map(history.data?.source_operators?.map(({ ip, operator }) => [ip, operator]));
 
+  // 已封禁的地址移出时间线，在卡底自成一组；读数与说明仍按全部来源计算。
+  const bannedIps = new Set(masked ? [] : (bans?.ips ?? []));
+  const timelineOnline = online.filter(source => !bannedIps.has(source.ip));
+  const timelineOffline = offline.filter(source => !bannedIps.has(source.ip));
+  const visibleOffline = historyExpanded ? timelineOffline : timelineOffline.slice(0, PRESENCE_HISTORY_PREVIEW_LIMIT);
+
   const groups = new Map<PresenceBucket, UserOnlineSource[]>();
   // 在线来源按首次出现由近到远：新出现的地址排在最上面
-  if (online.length) {
+  if (timelineOnline.length) {
     groups.set(
       'online',
-      [...online].sort((a, b) => firstSeenOrder(b) - firstSeenOrder(a) || a.ip.localeCompare(b.ip)),
+      [...timelineOnline].sort((a, b) => firstSeenOrder(b) - firstSeenOrder(a) || a.ip.localeCompare(b.ip)),
     );
   }
   for (const source of visibleOffline) {
@@ -605,10 +782,69 @@ function UserPresenceCard({
     week: '7 天内',
     retention: `${retentionDays} 天内`,
   };
-  const hiddenHistoryCount = Math.max(0, offline.length - PRESENCE_HISTORY_PREVIEW_LIMIT);
+  const hiddenHistoryCount = Math.max(0, timelineOffline.length - PRESENCE_HISTORY_PREVIEW_LIMIT);
   const visibleBuckets = PRESENCE_BUCKETS.filter(bucket => groups.has(bucket));
 
+  // 名单与在线来源按地址对照。名单自带全部地址的地区；脱敏后同形的地址对不上号，只在名单里唯一时才写地区。
+  const sourceByIp = new Map([...offline, ...online].map(source => [source.ip, source]));
+  const banCountries = new Map(bans?.source_countries?.map(({ ip, country }) => [ip, country]));
+  const banOperators = new Map(bans?.source_operators?.map(({ ip, operator }) => [ip, operator]));
+  const confirmedNodes = new Set(bans?.nodes.filter(node => node.phase === 'applied').map(node => node.node_id));
+  // 「30 天内未出现」要有完整的在线统计和未截断的历史作依据，否则只能不写。
+  const absenceKnown = !masked && presence?.state === 'complete' && !!history.data && !history.data.truncated;
+  const banList = bans?.ips ?? [];
+  const bannedRows: BannedSource[] = banList
+    .map((ip, index): BannedSource => {
+      const unique = banList.indexOf(ip) === banList.lastIndexOf(ip);
+      const source = masked ? null : (sourceByIp.get(ip) ?? null);
+      const nodesOf = (seen: UserOnlineSource) =>
+        seen.accesses?.length ? seen.accesses.map(access => access.node_id) : seen.node_ids;
+      // 经过它的机器都已确认当前名单时，会话已经关闭，在线快照只是还没刷新，不再写「仍在线」。
+      const live =
+        !!source &&
+        onlineIps.has(ip) &&
+        (nodesOf(source).length === 0 || nodesOf(source).some(node => !confirmedNodes.has(node)));
+      return {
+        key: masked ? `${index}:${ip}` : ip,
+        ip,
+        state: live ? 'live' : source ? 'seen' : absenceKnown ? 'unseen' : 'unknown',
+        source,
+        country: unique
+          ? (banCountries.get(ip) ?? (masked ? undefined : (countries?.[ip] ?? historyCountries.get(ip))))
+          : undefined,
+        operator: unique
+          ? (banOperators.get(ip) ?? (masked ? undefined : (operators?.[ip] ?? historyOperators.get(ip))))
+          : undefined,
+      };
+    })
+    // 仍在线的在最前，其余按最后出现由近到远；没有出现记录的保持名单顺序排在最后。
+    .sort(
+      (a, b) =>
+        Number(b.state === 'live') - Number(a.state === 'live') ||
+        (b.source ? lastSeenOrder(b.source) : 0) - (a.source ? lastSeenOrder(a.source) : 0),
+    );
+  const describeSource = (ip: string) => {
+    const source = sourceByIp.get(ip);
+    if (!source) return null;
+    const live = onlineIps.has(ip);
+    const network = sourceNetwork(
+      countries?.[ip] ?? historyCountries.get(ip),
+      operators?.[ip] ?? historyOperators.get(ip),
+    );
+    return {
+      online: live,
+      content: (
+        <>
+          {network.code && <RegionFlag code={network.code} />}
+          {network.label} ·{' '}
+          {live ? '在线，封禁后断开' : `最后出现 ${bannedSeenStamp(observedAt(source.last_observed_at), today)}`}
+        </>
+      ),
+    };
+  };
+
   const partial = presence?.state === 'partial';
+  const banCount = banList.length;
   const reading = error ? (
     '在线状态暂不可用'
   ) : pending ? (
@@ -690,12 +926,22 @@ function UserPresenceCard({
         <PanelTitle of="client">在线设备</PanelTitle>
         <span className="rt" title="按公网 IP 去重，不等于连接数；同一 IP 可同时使用多条接入链">
           {reading}
+          {!pending && banCount > 0 && (
+            <>
+              {' '}
+              · 封禁 <b>{banCount}</b>
+            </>
+          )}
         </span>
       </header>
       <div className="user-dcard-body">
         {!!error && <ErrorBox error={error} />}
         {!!error && presence && <span className="dim">当前显示上次成功读取的快照。</span>}
-        {notice && <div className={`user-presence-note ${notice.tone}`}>{notice.text}</div>}
+        {notice && (
+          <div className={`user-presence-note ${notice.tone}`}>
+            <span>{notice.text}</span>
+          </div>
+        )}
         {visibleBuckets.length > 0 && (
           <ol className="user-presence-timeline" aria-label={`在线与最近 ${retentionDays} 天的来源`}>
             {visibleBuckets.map(bucket => (
@@ -713,6 +959,7 @@ function UserPresenceCard({
                     operator={bucket === 'online' ? operators?.[source.ip] : historyOperators.get(source.ip)}
                     apps={apps}
                     now={now}
+                    onBan={canBan && bans ? banSource : undefined}
                   />
                 ))}
               </Fragment>
@@ -725,10 +972,10 @@ function UserPresenceCard({
           </div>
         )}
         {!!history.error && <ErrorBox error={history.error} />}
-        {history.data?.truncated && (historyExpanded || offline.length <= PRESENCE_HISTORY_PREVIEW_LIMIT) && (
+        {history.data?.truncated && (historyExpanded || timelineOffline.length <= PRESENCE_HISTORY_PREVIEW_LIMIT) && (
           <span className="user-presence-history-note">记录较多，仅显示最近 256 个来源 IP。</span>
         )}
-        {offline.length > PRESENCE_HISTORY_PREVIEW_LIMIT && (
+        {timelineOffline.length > PRESENCE_HISTORY_PREVIEW_LIMIT && (
           <button
             type="button"
             className="user-presence-more"
@@ -738,19 +985,44 @@ function UserPresenceCard({
             {historyExpanded ? '收起历史来源' : `显示其余 ${hiddenHistoryCount} 个历史来源`}
           </button>
         )}
+        {bans && bannedRows.length > 0 && (
+          <BannedSources
+            rows={bannedRows}
+            nodes={bans.nodes}
+            apps={apps}
+            today={today}
+            onUnban={canBan ? unbanSource : undefined}
+          />
+        )}
+        {canBan &&
+          bans &&
+          (addingBan ? (
+            <SourceBanAdd
+              bans={bans.ips}
+              describe={describeSource}
+              onSave={banSource}
+              onDone={() => setAddingBan(false)}
+            />
+          ) : (
+            <button type="button" className="user-presence-more source-ban-add-link" onClick={() => setAddingBan(true)}>
+              <Icon of="plus" size={11} />
+              {bannedRows.length > 0 || visibleBuckets.length > 0 ? '封禁其他 IP' : '封禁 IP'}
+            </button>
+          ))}
+        {!!sourceAccess.query.error && <ErrorBox error={sourceAccess.query.error} />}
       </div>
     </section>
   );
 }
 
-// 名册右列的本月用量只保留一位小数；精确值在详情的「用量与额度」里。
+// 名册右列的本期用量只保留一位小数；精确值在详情的「用量与额度」里。
 const compactUsage = (total: number) => {
   const [value, unit] = bytes(total).split(' ');
   return { value: String(Number(Number(value).toFixed(1))), unit };
 };
 
 // 额度用到这一比例即进入注意档：名册从这里开始显示具体百分比，详情的额度条改用注意色。
-const QUOTA_ATTENTION_PCT = 95;
+const QUOTA_ATTENTION_PCT = 80;
 
 // 名册不暴露低用量的精确百分比；进入注意档后才显示具体数值。
 export function quotaStage(pct: number): string {
@@ -813,7 +1085,6 @@ export function UsersPane({ win, bare = false }: { win: Win; bare?: boolean }) {
 // 整数 GiB 的往返转换是精确的；通过其他 API 设置的非整值在此会被截断到 KB 级，
 // 这类额度不应在此输入框中修改。
 const GiB = 1024 ** 3;
-const toGiB = (n: number) => Number((n / GiB).toFixed(3));
 // 额度通常按整 GiB 设置，整数时不显示小数位（「100 GiB」）；非整值沿用 bytes() 的精度。
 const quotaBytes = (n: number) => (n % GiB === 0 ? `${n / GiB} GiB` : bytes(n));
 
@@ -836,27 +1107,28 @@ export function QuotaRow({
   over,
   usageState = 'ready',
   access = NO_ROUTE_ACCESS,
-  editable,
-  busy,
-  onSave,
+  policy,
+  user,
+  editable = false,
 }: {
   app: SnapshotApp;
   used: number | null;
   limit: number | null;
   over: boolean;
-  usageState?: MonthlyUsageState;
+  usageState?: CycleUsageState;
   access?: QuotaRouteAccess;
-  editable: boolean;
-  busy: boolean;
-  onSave: (limit: number | null) => Promise<unknown>;
+  policy?: UserTrafficPolicyView;
+  user?: UserListItem;
+  editable?: boolean;
 }) {
-  const [draftValue, setDraftValue] = useState<string | null>(null);
-  const editing = draftValue !== null;
+  const [editing, setEditing] = useState(false);
+  const editorId = useId();
+  const editButton = useRef<HTMLButtonElement>(null);
+  const closeEditor = () => {
+    setEditing(false);
+    queueMicrotask(() => editButton.current?.focus());
+  };
   const label = app.label || app.id;
-  const initialValue = limit === null ? '' : String(toGiB(limit));
-  const guardScope = `quota:${app.id}`;
-  const dirty = editing && draftValue !== initialValue;
-  useUnsavedChanges(dirty, `${label} 的月度额度`, guardScope);
   const pct = limit !== null && used !== null ? (used / limit) * 100 : null;
 
   const name = (
@@ -875,7 +1147,7 @@ export function QuotaRow({
         // 行内只写数量；被停用的链与恢复条件放进悬停提示，避免名称列换行。
         <span
           className="qta-sub stop"
-          title={`${[...new Set(access.suspended)].join('、')} 已被系统停用；补足额度或月初重置后自动恢复`}
+          title={`${[...new Set(access.suspended)].join('、')} 已被系统停用；补足额度或账期重置后自动恢复`}
         >
           系统已停用 {access.suspended.length} 个接入点
         </span>
@@ -887,70 +1159,18 @@ export function QuotaRow({
     </span>
   );
 
-  if (editing) {
-    const value = draftValue.trim();
-    const n = Number(value);
-    const bad = value !== '' && (!Number.isFinite(n) || n <= 0);
-    const submit = async () => {
-      if (bad || busy) return;
-      try {
-        await onSave(value === '' ? null : Math.round(n * GiB));
-        // 只有服务端确认保存后才退出编辑。失败时保留输入，方便修正或重试。
-        setDraftValue(null);
-      } catch {
-        // mutation.error 由父组件显示；这里仅阻止 rejected promise 变成未处理异常。
-      }
-    };
-    return (
-      <div className="qta-r editing" role="listitem">
-        {name}
-        <div className="qta-editor">
-          <label className="qta-input">
-            <input
-              className="f qta-in"
-              autoFocus
-              disabled={busy}
-              value={draftValue}
-              placeholder="不限"
-              inputMode="decimal"
-              aria-label={`${label} 的月度额度（GiB）`}
-              aria-invalid={bad || undefined}
-              onChange={e => setDraftValue(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === 'Escape' && !busy && confirmDiscardChanges(guardScope)) setDraftValue(null);
-                if (e.key === 'Enter' && !bad && !busy) {
-                  e.preventDefault();
-                  void submit();
-                }
-              }}
-            />
-            <span className="qta-u">GiB</span>
-          </label>
-          <span className={`qta-hint${bad ? ' bad' : ''}`}>{bad ? '请输入大于 0 的数字' : '留空表示不限'}</span>
-          <span className="sp" />
-          <button
-            className="btn"
-            disabled={busy}
-            onClick={() => confirmDiscardChanges(guardScope) && setDraftValue(null)}
-          >
-            取消
-          </button>
-          <button className="btn primary" disabled={bad || busy} onClick={() => void submit()}>
-            {busy ? '保存中…' : '保存'}
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  // 用到注意档（≥95%）改用注意色，用尽改用告警色：后者即名册红点的成因，两处同色。
+  // 限速仍可用，与名册一致使用注意色；服务暂停时额度轨道退为灰色。
+  const paused = policy?.service_available === false;
+  const throttled = !paused && policy?.exhausted && policy.policy?.exhausted_action.kind === 'throttle';
   const tone =
     used === null
       ? 'unknown'
       : limit === null
         ? 'unlimited'
         : over
-          ? 'over'
+          ? throttled
+            ? 'warn'
+            : 'over'
           : pct !== null && pct >= QUOTA_ATTENTION_PCT
             ? 'warn'
             : 'ok';
@@ -972,7 +1192,10 @@ export function QuotaRow({
       </>
     );
   return (
-    <div className={`qta-r ${tone}`} role="listitem">
+    <div
+      className={`qta-r ${tone}${paused ? ' paused' : throttled ? ' throttled' : ''}${editing ? ' fwe-open' : ''}`}
+      role="listitem"
+    >
       {name}
       <span className="qta-figs">
         {usageState === 'pending' ? (
@@ -987,48 +1210,130 @@ export function QuotaRow({
         )}
         {limit !== null && <span className="qta-cap">/ {quotaBytes(limit)}</span>}
       </span>
-      {left !== null && <span className="qta-left">{left}</span>}
-      {pct !== null && used !== null && (
-        <span className="qta-meter">
-          <span className="qta-t" aria-hidden="true">
-            <i style={{ width: `${used > 0 ? Math.min(100, Math.max(1, pct)) : 0}%` }} />
-          </span>
-          <span className="qta-pct">{pct.toFixed(0)}%</span>
+      {left !== null && (
+        <span className="qta-left">
+          <span className="qta-left-value">{left}</span>
         </span>
       )}
-      <span className="qta-acts">
-        <button
-          className="btn qta-pencil"
-          disabled={!editable}
-          aria-label={limit === null ? '设额度' : '改额度'}
-          title={limit === null ? '设额度' : '改额度'}
-          onClick={() => setDraftValue(limit === null ? '' : String(toGiB(limit)))}
-        >
-          <svg viewBox="0 0 16 16" aria-hidden="true">
-            <path d="m3 11.8.6-2.7L10.8 2l2.2 2.2-7.1 7.1-2.9.5Z" />
-            <path d="m9.7 3.1 2.2 2.2" />
-          </svg>
-        </button>
-      </span>
+      <UserTrafficQuotaMeter used={used} limit={limit} view={policy} />
+      {editable && user && (
+        <span className="qta-acts">
+          <button
+            ref={editButton}
+            type="button"
+            className="btn qta-pencil"
+            disabled={!policy || editing}
+            aria-label={`${label} · 额度与超额处理`}
+            title="编辑额度"
+            aria-expanded={editing}
+            aria-controls={editing ? editorId : undefined}
+            onClick={() => setEditing(true)}
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d="m3 11.8.6-2.7L10.8 2l2.2 2.2-7.1 7.1-2.9.5Z" />
+              <path d="m9.7 3.1 2.2 2.2" />
+            </svg>
+          </button>
+        </span>
+      )}
+      {editing && user && policy && (
+        <div className="fwe-sheet" id={editorId}>
+          <UserAppTrafficPolicyEditor
+            key={`${user.tenant_id}/${user.id}/${app.id}`}
+            user={user}
+            view={policy}
+            label={`${label} · 额度与超额处理`}
+            onClose={closeEditor}
+          />
+        </div>
+      )}
     </div>
   );
 }
 
-// 详情卡的本月读数栏：与用量页读数栏同一写法（合计 + 上下行组成条与数值），尺寸按子卡缩小一档。
+/** Keep the card in place while the selected user's readings and policy arrive together. */
+function UserUsageBody({ pending, children }: { pending: boolean; children: ReactNode }) {
+  const body = useRef<HTMLDivElement>(null);
+  const [height, setHeight] = useState(0);
+  useLayoutEffect(() => {
+    const element = body.current;
+    if (pending || !element) return;
+    const measure = () => setHeight(element.getBoundingClientRect().height);
+    measure();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    observer?.observe(element);
+    return () => observer?.disconnect();
+  }, [pending]);
+  return (
+    <div
+      ref={body}
+      className="user-dcard-body panel-full-bleed-body user-usage"
+      aria-busy={pending || undefined}
+      style={pending && height > 0 ? { minHeight: height } : undefined}
+    >
+      {pending ? (
+        <div className="user-usage-loading">
+          <PanelLoading label="读取用量与额度…" />
+        </div>
+      ) : (
+        children
+      )}
+    </div>
+  );
+}
+
+function UserAccessQuotaRows({
+  user,
+  rows,
+  usageState,
+  editable,
+  routeAccessOf,
+  policies,
+}: {
+  user: UserListItem;
+  rows: Array<Pick<Parameters<typeof QuotaRow>[0], 'app' | 'used' | 'limit' | 'over'>>;
+  usageState: CycleUsageState;
+  editable: boolean;
+  routeAccessOf: (app: SnapshotApp) => QuotaRouteAccess;
+  policies: ReturnType<typeof useUserTrafficPolicies>;
+}) {
+  return (
+    <div className="user-access-quotas">
+      {policies.error && <ErrorBox error={policies.error} />}
+      <div className="qta" role="list" aria-label="各线路的用量与额度">
+        {rows.map(q => (
+          <QuotaRow
+            key={q.app.id}
+            {...q}
+            user={user}
+            editable={editable}
+            usageState={usageState}
+            access={routeAccessOf(q.app)}
+            policy={policies.data?.find(row => row.kind === 'access' && row.app_id === q.app.id)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+// 详情卡的本期读数栏：与用量页读数栏同一写法（合计 + 上下行组成条与数值），尺寸按子卡缩小一档。
 function UserUsageLedger({
   state,
   rows,
-  monthEnd,
+  periodEnd,
   accountingMode,
   accountingDisabled,
   onAccountingModeChange,
+  servicePolicy,
 }: {
-  state: MonthlyUsageState;
+  state: CycleUsageState;
   rows: UsageMonthlyViewRow[];
-  monthEnd: string | null;
+  periodEnd: string | null;
   accountingMode: UserTrafficAccountingMode;
   accountingDisabled: boolean;
   onAccountingModeChange: (mode: UserTrafficAccountingMode) => void;
+  /** 账期与有效期（user-service-policy.tsx），排在计量口径之后。 */
+  servicePolicy: ReactNode;
 }) {
   const uplink = rows.reduce((sum, row) => sum + row.uplink_bytes, 0);
   const downlink = rows.reduce((sum, row) => sum + row.downlink_bytes, 0);
@@ -1038,17 +1343,17 @@ function UserUsageLedger({
   const [figure, unit] = bytes(total).split(' ');
   const upShare = rawTotal > 0 ? (uplink / rawTotal) * 100 : 0;
   return (
-    <section className="user-usage-ledger" aria-label="本月接入">
+    <section className="user-usage-ledger" aria-label="本期接入">
       <div className="user-usage-hero">
-        <span className="user-usage-hero-label">本月接入</span>
+        <span className="user-usage-hero-label">本期接入</span>
         {known ? (
           <strong className="user-usage-hero-value">
             {figure} <small>{unit}</small>
           </strong>
         ) : (
-          <strong className="user-usage-hero-value none">{monthlyUsageText(state, rows.length, total)}</strong>
+          <strong className="user-usage-hero-value none">{cycleUsageText(state, rows.length, total)}</strong>
         )}
-        {monthEnd && <QuotaReset monthEnd={monthEnd} />}
+        {periodEnd && <QuotaReset periodEnd={periodEnd} />}
       </div>
       <div className="user-usage-compose">
         {/* 下方两行写出同样的数值；组成条只表示比例。 */}
@@ -1084,24 +1389,26 @@ function UserUsageLedger({
         disabled={accountingDisabled}
         onChange={onAccountingModeChange}
       />
+      {servicePolicy}
     </section>
   );
 }
 
-// 额度按 +08 自然月统计，到月界重新计算，被系统停用的接入点也在此时恢复。月界取服务端返回的
-// month_end（+08 墙钟时刻），浏览器不另算一份；剩余天数随共享时钟更新。
-function QuotaReset({ monthEnd }: { monthEnd: string }) {
+// 重置边界由服务端按该用户的策略返回，浏览器只显示倒计时。
+
+function QuotaReset({ periodEnd }: { periodEnd: string }) {
   const now = useNow();
-  const resetAt = Date.parse(`${monthEnd.replace(' ', 'T')}+08:00`);
+  const resetAt = Date.parse(periodEnd);
   if (!Number.isFinite(resetAt) || resetAt <= now) return null;
-  const month = Number(monthEnd.slice(5, 7));
+  const date = new Date(resetAt + 8 * 3_600_000);
+  const resetDate = `${date.getUTCMonth() + 1} 月 ${date.getUTCDate()} 日`;
   const days = Math.ceil((resetAt - now) / 86_400_000);
   return (
     <span
       className="user-usage-reset"
-      title={`额度按 UTC+8 自然月统计，${month} 月 1 日 00:00 重新计算；被系统停用的接入点同时恢复`}
+      title={`额度按 UTC+8 账期统计，${resetDate} 00:00 重新计算；仅恢复仍符合有效期和手动开关的接入点`}
     >
-      {month} 月 1 日重置
+      {resetDate}重置
       <span className="usage-dot" aria-hidden="true">
         ·
       </span>
@@ -1515,6 +1822,22 @@ const USER_DETAIL_TABS = [
   { key: 'stats', label: '统计', icon: 'observe' },
 ] as const;
 
+/** Visit each tab on demand, retaining its forms only for the same user. */
+function UserDetailTabContent({
+  active,
+  userKey,
+  children,
+}: {
+  active: boolean;
+  userKey: string;
+  children: ReactNode;
+}) {
+  const [visit, setVisit] = useState({ userKey, opened: active });
+  const opened = active || (visit.userKey === userKey && visit.opened);
+  if (visit.userKey !== userKey || visit.opened !== opened) setVisit({ userKey, opened });
+  return opened ? children : null;
+}
+
 function UserList({
   drill,
   go,
@@ -1529,12 +1852,24 @@ function UserList({
   const nameOf = useNodeNames();
   const { who } = useSession();
   const qc = useQueryClient();
+  const prepareTimer = useRef(0);
+  const cancelPrepare = useCallback(() => {
+    window.clearTimeout(prepareTimer.current);
+    prepareTimer.current = 0;
+  }, []);
+  useEffect(() => cancelPrepare, [cancelPrepare]);
+  const prepareUser = (user: UserListItem) => {
+    cancelPrepare();
+    void prefetchUserTrafficPolicies(qc, who, user);
+  };
+  const schedulePrepare = (user: UserListItem) => {
+    cancelPrepare();
+    prepareTimer.current = window.setTimeout(() => prepareUser(user), 120);
+  };
   const editable = can(who.role, 'edit');
   const canViewPresence = !isVisitor(who);
   const [detailTab, setDetailTab] = useState<UserDetailTab>('access');
   const detailTabId = useId();
-  const detailTabs = USER_DETAIL_TABS.filter(tab => tab.key !== 'stats' || canViewUserRealtimeTraffic(who));
-  const activeDetailTab = detailTabs.some(tab => tab.key === detailTab) ? detailTab : 'access';
   const tabId = (tab: UserDetailTab) => `${detailTabId}-${tab}-tab`;
   const panelId = (tab: UserDetailTab) => `${detailTabId}-${tab}-panel`;
   const moveDetailTab = (event: ReactKeyboardEvent<HTMLButtonElement>, current: UserDetailTab) => {
@@ -1551,7 +1886,7 @@ function UserList({
     document.getElementById(tabId(detailTabs[next].key))?.focus();
   };
   const grantEdits = useGrantEdits();
-  const users = useQuery({ queryKey: ['users'], queryFn: () => fetchUsers(true) });
+  const users = useQuery({ queryKey: ['users'], queryFn: () => fetchUsers(true), refetchInterval: 30_000 });
   const presence = useQuery({
     queryKey: ['user-presence', who.role],
     queryFn: fetchUserPresence,
@@ -1571,14 +1906,16 @@ function UserList({
           Date.now() < edit.submittedAt + GRANT_REFRESH_WINDOW_MS,
       )
         ? GRANT_REFRESH_MS
-        : false,
+        : 30_000,
   });
-  /* 自然月汇总单独查询：该请求失败不影响授权操作，数字显示为 — 即可 */
-  const monthly = useQuery({ queryKey: ['usage-monthly'], queryFn: () => fetchUsageMonthly() });
+  /* 用量与策略在详情内容中一起等待；读取失败后仍允许授权操作，用量明确显示不可用。 */
+  const cycle = useQuery({ queryKey: ['user-cycles'], queryFn: () => fetchUserCycleUsage(), refetchInterval: 30_000 });
   // 额度是直写的运营参数，不进草稿也不随发布变化，因此与用量分开查询，
   // 也不随 refresh() 中的三个查询一起失效：修改额度只失效额度本身。
-  const quotas = useQuery({ queryKey: ['quotas'], queryFn: () => fetchQuotas() });
-  const monthlyState: MonthlyUsageState = monthly.data ? 'ready' : monthly.isPending ? 'pending' : 'failed';
+  const quotas = useQuery({ queryKey: ['quotas'], queryFn: () => fetchQuotas(), refetchInterval: 30_000 });
+  const cycleState: CycleUsageState = cycle.data ? 'ready' : cycle.isPending ? 'pending' : 'failed';
+  const cyclePeriodOf = (user: UserListItem) =>
+    cycle.data?.periods?.find(p => p.tenant_id === user.tenant_id && p.user_id === user.id);
   const presenceByUser = new Map<string, UserPresence>(
     (canViewPresence ? (presence.data?.users ?? []) : []).map(
       item => [`${item.tenant_id}/${item.user_id}`, item] as const,
@@ -1701,19 +2038,6 @@ function UserList({
       void qc.invalidateQueries({ queryKey: ['me-user'] });
     },
   });
-  // 额度直写，不进草稿：保存后立即生效，无需再到发布页操作。
-  // 因此只失效 quotas 查询，不涉及 revisions。
-  const quota = useMutation({
-    mutationFn: (v: { user: UserListItem; app: string; limit: number | null }) =>
-      setQuota({
-        tenant_id: v.user.tenant_id,
-        user_id: v.user.id,
-        app_id: v.app,
-        limit_bytes: v.limit,
-      }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['quotas'] }),
-  });
-
   const tenantOptions = [...(tenants.data?.tenants ?? [])].sort((a, b) => a.id.localeCompare(b.id));
   // 单租户阶段只接受“恰好一条”这个事实，不识别 platform 或操作者 scope 等特殊名字。
   const defaultTenant = tenantOptions.length === 1 ? tenantOptions[0].id : '';
@@ -1726,37 +2050,21 @@ function UserList({
     },
   });
 
-  if (
-    users.isPending ||
-    snapshot.isPending ||
-    quotas.isPending ||
-    (editable && tenants.isPending) ||
-    (who.role === 'user' && me.isPending)
-  ) {
-    return <Loading variant="users" sheeted={sheeted} userDetail={drill.p === 'user'} />;
-  }
-  if (users.error) return <ErrorBox error={users.error} />;
-  if (!snapshot.data) return <ErrorBox error={snapshot.error} />;
-  if (tenants.error) return <ErrorBox error={tenants.error} />;
-  // 额度缺失不能回退成“不限量”：那会把读取失败显示成一个有效、且风险相反的配置。
-  if (quotas.error) return <ErrorBox error={quotas.error} />;
-  if (me.error) return <ErrorBox error={me.error} />;
-
-  const apps: SnapshotApp[] = snapshot.data.snapshot.apps ?? [];
+  const apps: SnapshotApp[] = snapshot.data?.snapshot.apps ?? [];
   const latestGrantEdits = new Map(
     grantEdits.flatMap(edit => (edit.write ? [[grantKey(edit.write), edit] as const] : [])),
   );
   const unconfirmedGrantKeys = new Set(
     [...latestGrantEdits]
-      .filter(([, edit]) => edit.status === 'pending' || (edit.revision ?? 0) > snapshot.data.snapshot.revision)
+      .filter(([, edit]) => edit.status === 'pending' || (edit.revision ?? 0) > (snapshot.data?.snapshot.revision ?? 0))
       .map(([key]) => key),
   );
-  const needsGrantRefresh = grantEdits.some(edit => (edit.revision ?? 0) > snapshot.data.snapshot.revision);
+  const needsGrantRefresh = grantEdits.some(edit => (edit.revision ?? 0) > (snapshot.data?.snapshot.revision ?? 0));
   const grantError = [...latestGrantEdits.values()].find(edit => edit.status === 'error')?.error;
   const columns = apps.flatMap(a => a.ingresses.map(i => ({ app: a, ingress: i })));
   const granted = new Set(apps.flatMap(a => a.grants.map(g => `${g.tenant}/${g.user}/${g.ingress}`)));
   const selfKey = who.self_user ? `${who.self_user.tenant_id}/${who.self_user.user_id}` : null;
-  const listedUsers = users.data.users;
+  const listedUsers = users.data?.users ?? [];
   const serverUsers = me.data
     ? listedUsers.some(user => `${user.tenant_id}/${user.id}` === selfKey)
       ? listedUsers.map(user => (`${user.tenant_id}/${user.id}` === selfKey ? me.data : user))
@@ -1767,14 +2075,14 @@ function UserList({
   /* 订阅是完整可用的配置，readonly 角色在 API 侧返回 403（见 session.tsx 的 can）。
      入口同步隐藏，避免点击后只得到一个错误。 */
   const canReadArtifacts = can(who.role, 'artifacts');
-  /* 按（用户 × 线路）索引：每个线路组右侧的「本月」列读取这一行 */
+  /* 按（用户 × 线路）索引：各线路读取同一账期的用量。 */
   const usageByView = new Map(
-    (monthly.data?.views ?? []).map((r: UsageMonthlyViewRow) => [`${r.tenant_id}/${r.user_id}/${r.app_id}`, r]),
+    (cycle.data?.views ?? []).map((r: UsageMonthlyViewRow) => [`${r.tenant_id}/${r.user_id}/${r.app_id}`, r]),
   );
 
   // 用户总量包含接入与转发；按线路的额度仍只读取 usageByView。
   const usageOf = (u: UserListItem) => {
-    const rows = [...(monthly.data?.views ?? []), ...(monthly.data?.forwarding ?? [])].filter(
+    const rows = [...(cycle.data?.views ?? []), ...(cycle.data?.forwarding ?? [])].filter(
       row => row.tenant_id === u.tenant_id && row.user_id === u.id,
     );
     return {
@@ -1809,9 +2117,9 @@ function UserList({
       .map(a => {
         const key = `${u.tenant_id}/${u.id}/${a.id}`;
         const row = usageByView.get(key);
-        // 月用量是可选观测；读取失败时显示未知，绝不能把未知当成 0 后再算出“额度充足”。
+        // 账期用量是可选观测；读取失败时显示未知，绝不能把未知当成 0 后再算出“额度充足”。
         const used =
-          monthlyState === 'ready'
+          cycleState === 'ready'
             ? (row ? row.uplink_bytes + row.downlink_bytes : 0) * trafficMultiplier(u.traffic_accounting_mode)
             : null;
         const limit = quotaByView.get(key) ?? null;
@@ -1834,11 +2142,20 @@ function UserList({
     const mine = columns.filter(c => granted.has(`${u.tenant_id}/${u.id}/${c.ingress.id}`));
     const quotaRows = quotaRowsOf(u, mine);
     const suspended = suspendedByUser.get(`${u.tenant_id}/${u.id}`) ?? new Set<string>();
+    const appTraffic = new Map(
+      (cycle.data?.traffic_policies ?? [])
+        .filter(item => item.tenant_id === u.tenant_id && item.user_id === u.id && item.kind === 'access')
+        .map(item => [item.app_id, item]),
+    );
     const facts: UserFacts = {
       status: u.status,
+      serviceState: u.service_state,
       grants: mine.length,
-      exhausted: quotaRows.filter(q => q.over).map(q => q.app.label || q.app.id),
+      exhausted: quotaRows.filter(q => q.over && !appTraffic.get(q.app.id)?.rate_bps).map(q => q.app.label || q.app.id),
       suspended: suspended.size,
+      throttledApps: quotaRows
+        .filter(q => q.over && appTraffic.get(q.app.id)?.rate_bps)
+        .map(q => q.app.label || q.app.id),
     };
     return {
       u,
@@ -1921,21 +2238,64 @@ function UserList({
   // URL 是显式选择的唯一来源，使刷新、分享链接和浏览器前进/后退落到同一用户。根地址仍
   // 默认预览当前筛选的首行；深链接失效时不回落到别人，避免地址写 alice 却展示 bob。
   const selected = drill.p === 'user' ? allRows.find(r => r.u.id === drill.id) : rows[0];
+  const requestedPolicies = useUserTrafficPolicies(selected?.u);
+  const selectionPending = cycle.isPending || (requestedPolicies.readable && requestedPolicies.isPending);
+  const [readyDetailKey, setReadyDetailKey] = useState<string | null>(null);
+  const selectedKey = selected?.key ?? null;
+  if (!selectionPending && readyDetailKey !== selectedKey) setReadyDetailKey(selectedKey);
+  // Keep a complete identity and its readings together until the next user's data settles.
+  const detail = selectionPending ? (allRows.find(row => row.key === readyDetailKey) ?? selected) : selected;
+  const canViewForwarding =
+    who.role !== 'user' ||
+    (who.self_user?.tenant_id === detail?.u.tenant_id && who.self_user?.user_id === detail?.u.id);
+  const detailTabs = USER_DETAIL_TABS.filter(
+    tab => (tab.key !== 'stats' || canViewUserRealtimeTraffic(who)) && (tab.key !== 'forwarding' || canViewForwarding),
+  );
+  const activeDetailTab = detailTabs.some(tab => tab.key === detailTab) ? detailTab : 'access';
+  const trafficPolicies = useUserTrafficPolicies(detail?.u);
+  const usagePending = cycle.isPending || (trafficPolicies.readable && trafficPolicies.isPending);
+
+  if (
+    users.isPending ||
+    snapshot.isPending ||
+    quotas.isPending ||
+    (editable && tenants.isPending) ||
+    (who.role === 'user' && me.isPending)
+  ) {
+    return <Loading variant="users" sheeted={sheeted} userDetail={drill.p === 'user'} />;
+  }
+  if (!users.data) return <ErrorBox error={users.error} />;
+  if (!snapshot.data) return <ErrorBox error={snapshot.error} />;
+  if (tenants.error) return <ErrorBox error={tenants.error} />;
+  // 额度缺失不能回退成“不限量”：那会把读取失败显示成一个有效、且风险相反的配置。
+  if (quotas.error && !quotas.data) return <ErrorBox error={quotas.error} />;
+  if (me.error) return <ErrorBox error={me.error} />;
 
   // 右栏详情。内容与此前就地展开时完全一致（身份与操作 + 用量额度 + 接入授权，
   // 沿用列表页原有的 .lst-acts / .fgrid / .qta / .grant-cards），只是从行内移到常驻的右栏，
   // 并在顶部补一条身份标题条。
   const detailOf = (r: (typeof rows)[number]) => {
     const { u, mine, suspended, use, quotaRows, facts, tone } = r;
-    const usageText = monthlyUsageText(monthlyState, use.rows.length, use.total);
     const disabled = u.status === 'disabled';
     const isMe = r.key === selfKey;
     const selfService = who.role === 'user' && isMe;
     const canOpenSubscription = canReadArtifacts || selfService;
     const headCls = disabled ? 'off' : tone === 'idle' ? 'idle' : '';
-    const lampCls = tone === 'ok' ? '' : tone; // '' | 'bad' | 'idle'
     const userPresence = presenceByUser.get(r.key);
     const statusText = userLampTitle(facts);
+    const statusLabel = disabled
+      ? '已停用'
+      : facts.serviceState === 'pending'
+        ? '未生效'
+        : facts.serviceState === 'expired'
+          ? '已到期'
+          : tone === 'idle'
+            ? '未授权'
+            : tone === 'bad'
+              ? '接入受限'
+              : '可用';
+    const uuid = u.uuid?.trim() ?? '';
+    const shortUuid = uuid.length > 16 ? `${uuid.slice(0, 8)}…${uuid.slice(-4)}` : uuid;
     const testChip = accountTypeChip(u.account_type);
     // UUID 也收在「更多」里：只读身份能看到 UUID 时，菜单为复制它而可用，其余项各自禁用。
     const menuAvailable = editable || selfService || !!u.uuid;
@@ -1961,26 +2321,56 @@ function UserList({
       };
     };
     return (
-      <section key={r.key} className="panel user-split-detail">
+      <section
+        key="user-detail"
+        className="panel user-split-detail"
+        aria-busy={detail?.key !== selected?.key || undefined}
+        inert={detail?.key !== selected?.key}
+      >
         <div className={`user-dhead${headCls ? ` ${headCls}` : ''}`}>
-          {/* 与机器详情同构：身份、页签和操作共用一条横梁；窄容器才把页签落到第二行。
-              UUID、账号类型、密码与登录、停用和换 UUID 仍收进「更多」，不让低频或危险操作常驻。 */}
+          {/* 身份列不随 UUID 长度伸缩，让页签位置稳定；窄容器把导航独立到下一行。 */}
           <div className="user-dhead-main">
             <div className="user-dhead-identity">
-              <GeneratedUserAvatar id={u.id} variant="plate" lamp={{ tone: lampCls, title: statusText }} />
+              <GeneratedUserAvatar id={u.id} variant="plate" />
               <div className="dtitle">
                 <div className="dname">
-                  <b className="mono">{u.id}</b>
-                  <span className="user-monthly-badge" title={`本月流量 ${usageText}`}>
-                    <Icon of="usage" size={12} />
-                    <span className="mono">{usageText}</span>
+                  <b title={u.id}>{u.id}</b>
+                  <span
+                    className="user-account-state"
+                    data-tone={tone}
+                    role="status"
+                    title={statusText}
+                    aria-label={statusText}
+                  >
+                    {statusLabel}
                   </span>
                   {isMe && <span className="user-row-chip">我</span>}
                   {testChip && <span className="user-row-chip test">{testChip}</span>}
                 </div>
-                {/* 状态由头像灯表达，流量收进名称旁角标；第二行只留完整 UUID。 */}
                 <p className="dsub">
-                  <span className="mono user-summary-uuid">{u.uuid?.trim() || 'UUID —'}</span>
+                  {uuid ? (
+                    <CopyButton
+                      key={uuid}
+                      className="user-uuid-copy"
+                      text={uuid}
+                      label="复制完整 UUID"
+                      successLabel="UUID 已复制"
+                      failureLabel="UUID 复制失败"
+                      iconOnly
+                    >
+                      {state => (
+                        <>
+                          <span className="user-uuid-label">UUID</span>
+                          <span className="mono" title={uuid}>
+                            {shortUuid}
+                          </span>
+                          <Icon of={copyStateIcon(state)} size={12} />
+                        </>
+                      )}
+                    </CopyButton>
+                  ) : (
+                    <span className="user-uuid-empty">UUID —</span>
+                  )}
                 </p>
               </div>
             </div>
@@ -2222,7 +2612,7 @@ function UserList({
             </div>
           </div>
         </div>
-        {/* 页签只切可见性；表单与图表留在原位，切用户由详情 key 重置。 */}
+        {/* 未打开的页签不取数据；已打开的页签保留同一用户的表单。 */}
         <div
           className="user-dbody"
           role="tabpanel"
@@ -2231,8 +2621,8 @@ function UserList({
           aria-label={detailTabs.length === 1 ? '接入' : undefined}
           hidden={activeDetailTab !== 'access'}
         >
-          {/* 用量与额度：左侧读数栏沿用用量页写法（本月接入、重置日、上下行），右侧每条线路一行。
-              合计已在读数栏，标题读数只写线路数。 */}
+          {/* 用量与额度：左侧读数栏沿用用量页写法（本期接入、重置日、上下行），底部是计量口径与账期、有效期，
+              右侧每条线路一行。合计已在读数栏，标题读数只写线路数。 */}
           <section className="panel config-panel user-dcard user-usage-card">
             <header>
               <PanelTitle of="usage">用量与额度</PanelTitle>
@@ -2240,38 +2630,38 @@ function UserList({
                 <b>{quotaRows.length}</b> 条线路
               </span>
             </header>
-            <div className="user-dcard-body panel-full-bleed-body user-usage">
+            <UserUsageBody pending={usagePending}>
               <UserUsageLedger
-                state={monthlyState}
+                key={`ledger:${r.key}`}
+                state={cycleState}
                 rows={use.rows.filter((row): row is UsageMonthlyViewRow => 'app_id' in row)}
-                monthEnd={monthly.data?.month_end ?? null}
+                periodEnd={cyclePeriodOf(u)?.ends_at ?? null}
                 accountingMode={u.traffic_accounting_mode ?? 'single'}
                 accountingDisabled={!editable || profile.isPending}
                 onAccountingModeChange={changeAccountingMode}
+                servicePolicy={
+                  <>
+                    <UserServiceTerms user={u} editable={editable} onSaved={refresh} />
+                  </>
+                }
               />
               {quotaRows.length === 0 ? (
                 <span className="dim qta-empty">尚未授权任何线路</span>
               ) : (
-                <div className="qta" role="list" aria-label="各线路的用量与额度">
-                  {quotaRows.map(q => (
-                    <QuotaRow
-                      key={q.app.id}
-                      app={q.app}
-                      used={q.used}
-                      limit={q.limit}
-                      over={q.over}
-                      usageState={monthlyState}
-                      access={routeAccessOf(q.app)}
-                      editable={editable}
-                      busy={quota.isPending}
-                      onSave={limit => quota.mutateAsync({ user: u, app: q.app.id, limit })}
-                    />
-                  ))}
-                </div>
+                <UserAccessQuotaRows
+                  key={`quotas:${r.key}`}
+                  user={u}
+                  rows={quotaRows}
+                  usageState={cycleState}
+                  editable={editable}
+                  routeAccessOf={routeAccessOf}
+                  policies={trafficPolicies}
+                />
               )}
-            </div>
+            </UserUsageBody>
           </section>
 
+          {/* 来源封禁并入在线设备：在行上直接封禁，卡底列出已封禁的来源。访客与普通用户看不到这张卡。 */}
           {canViewPresence && (
             <UserPresenceCard
               key={`presence:${r.key}`}
@@ -2286,6 +2676,8 @@ function UserList({
               apps={apps}
               pending={presence.isPending}
               error={presence.error}
+              canBan={editable}
+              masked={who.masked_assets}
             />
           )}
 
@@ -2303,24 +2695,33 @@ function UserList({
             refresh={refresh}
           />
         </div>
-        <div
-          className="user-dbody"
-          role="tabpanel"
-          id={panelId('forwarding')}
-          aria-labelledby={tabId('forwarding')}
-          hidden={activeDetailTab !== 'forwarding'}
-        >
-          <UserForwardingCard
-            key={`forwarding:${r.key}`}
-            user={u}
-            nodes={snapshot.data.snapshot.nodes ?? []}
-            canAuthorize={can(who.role, 'manage-operators')}
-            canManageRules={editable || selfService}
-            canViewRealtime={canViewUserRealtimeTraffic(who)}
-            accountingDisabled={!editable || profile.isPending}
-            onAccountingModeChange={changeAccountingMode}
-          />
-        </div>
+        {canViewForwarding && (
+          <div
+            className="user-dbody"
+            role="tabpanel"
+            id={panelId('forwarding')}
+            aria-labelledby={tabId('forwarding')}
+            hidden={activeDetailTab !== 'forwarding'}
+          >
+            <UserDetailTabContent active={activeDetailTab === 'forwarding'} userKey={r.key}>
+              <UserForwardingCard
+                key={`forwarding:${r.key}`}
+                user={u}
+                nodes={snapshot.data.snapshot.nodes ?? []}
+                canAuthorize={can(who.role, 'manage-operators')}
+                canManageRules={editable || selfService}
+                canViewRealtime={canViewUserRealtimeTraffic(who)}
+                accountingDisabled={!editable || profile.isPending}
+                onAccountingModeChange={changeAccountingMode}
+                servicePolicy={
+                  <>
+                    <UserServiceTerms user={u} editable={editable} onSaved={refresh} />
+                  </>
+                }
+              />
+            </UserDetailTabContent>
+          </div>
+        )}
         {canViewUserRealtimeTraffic(who) && (
           <div
             className="user-dbody"
@@ -2329,17 +2730,19 @@ function UserList({
             aria-labelledby={tabId('stats')}
             hidden={activeDetailTab !== 'stats'}
           >
-            <UserRealtimeTrafficCard key={`traffic:${r.key}`} tenantId={u.tenant_id} userId={u.id} nameOf={nameOf} />
-            <UserMachineUsageCard key={`machines:${r.key}`} tenantId={u.tenant_id} userId={u.id} nameOf={nameOf} />
-            {/* 站点分类、其他站点域名、嗅探失败目标合在同一张卡里（user-site-usage.tsx）。 */}
-            <UserSiteUsageCard key={`sites:${r.key}`} tenantId={u.tenant_id} userId={u.id} />
+            <UserDetailTabContent active={activeDetailTab === 'stats'} userKey={r.key}>
+              <UserRealtimeTrafficCard key={`traffic:${r.key}`} tenantId={u.tenant_id} userId={u.id} nameOf={nameOf} />
+              <UserMachineUsageCard key={`machines:${r.key}`} tenantId={u.tenant_id} userId={u.id} nameOf={nameOf} />
+              {/* 站点分类、其他站点域名、嗅探失败目标合在同一张卡里（user-site-usage.tsx）。 */}
+              <UserSiteUsageCard key={`sites:${r.key}`} tenantId={u.tenant_id} userId={u.id} />
+            </UserDetailTabContent>
           </div>
         )}
       </section>
     );
   };
 
-  // 名册项：身份牌 │ 用户名 + 第二行 │ 右列（本月用量 / 额度）。
+  // 名册项：身份牌 │ 用户名 + 第二行 │ 右列（本期用量 / 额度）。
   // 常态不画状态灯：流量用尽与系统停用为红点，未授权为空心灰点，已停用整行降一档、不再叠灯。
   // 管理员第二行放在线来源，普通用户只看接入点数量；异常、未授权和停用状态优先于观测值，
   // 避免把诊断信息盖住权限事实。
@@ -2351,14 +2754,18 @@ function UserList({
     const lamp: AvatarLamp | null = disabled || tone === 'ok' ? null : { tone, title: userLampTitle(facts) };
     const state = disabled
       ? { text: '已停用', bad: false }
-      : facts.exhausted.length > 0
-        ? { text: `流量已用尽 · ${facts.exhausted.join('、')}`, bad: true }
-        : suspended.size > 0
-          ? { text: `${suspended.size} 个接入点已被系统停用`, bad: true }
-          : mine.length === 0
-            ? { text: '未授权', bad: false }
-            : null;
-    const usage = monthlyState === 'ready' && use.rows.length > 0 ? compactUsage(use.total) : null;
+      : facts.serviceState === 'pending' || facts.serviceState === 'expired'
+        ? { text: facts.serviceState === 'pending' ? '未生效' : '已到期', bad: true }
+        : facts.exhausted.length > 0
+          ? { text: `流量已用尽 · ${facts.exhausted.join('、')}`, bad: true }
+          : facts.throttledApps?.length
+            ? { text: `额度已用满 · ${facts.throttledApps.join('、')} 已限速`, bad: false }
+            : suspended.size > 0
+              ? { text: `${suspended.size} 个接入点已被系统停用`, bad: true }
+              : mine.length === 0
+                ? { text: '未授权', bad: false }
+                : null;
+    const usage = cycleState === 'ready' && use.rows.length > 0 ? compactUsage(use.total) : null;
     const quotaPct = combinedQuotaPercent(quotaRows);
     const quotaOver = quotaPct !== null && quotaPct >= 100;
     const userPresence = presenceByUser.get(key);
@@ -2375,6 +2782,12 @@ function UserList({
         aria-selected={picked}
         data-route-focus={`user:${key}`}
         className={`user-row${disabled ? ' off' : ''}${picked ? ' picked' : ''}`}
+        onMouseEnter={() => !picked && schedulePrepare(u)}
+        onMouseLeave={cancelPrepare}
+        onFocus={() => !picked && prepareUser(u)}
+        onPointerDown={event => {
+          if (event.pointerType !== 'mouse' && !picked) prepareUser(u);
+        }}
         onClick={() => go({ p: 'user', id: u.id })}
       >
         <GeneratedUserAvatar id={u.id} lamp={lamp} />
@@ -2390,7 +2803,7 @@ function UserList({
               <small>{usage.unit}</small>
             </>
           ) : (
-            monthlyUsageText(monthlyState, use.rows.length, use.total)
+            cycleUsageText(cycleState, use.rows.length, use.total)
           )}
         </span>
         <span className="user-row-meta">
@@ -2422,6 +2835,18 @@ function UserList({
      内部使用机器详情的紧凑横向页头和独立内容卡。 */
   const body = (
     <>
+      {(users.error || quotas.error || cycle.error) && (
+        <div className="toolbar" role="status">
+          <ErrorBox error={users.error ?? quotas.error ?? cycle.error} />
+          <button
+            className="btn"
+            disabled={users.isFetching || quotas.isFetching || cycle.isFetching}
+            onClick={() => void Promise.all([users.refetch(), quotas.refetch(), cycle.refetch()])}
+          >
+            重新读取用户状态
+          </button>
+        </div>
+      )}
       {(snapshot.error || needsGrantRefresh) && (
         <div className="toolbar" role="status">
           <span>授权状态尚未确认，请重新读取后继续操作。</span>
@@ -2438,7 +2863,6 @@ function UserList({
         revokeDirectLogin.error ||
         status.error ||
         rotate.error ||
-        quota.error ||
         create.error) && (
         <ErrorBox
           error={
@@ -2449,7 +2873,6 @@ function UserList({
             revokeDirectLogin.error ??
             status.error ??
             rotate.error ??
-            quota.error ??
             create.error
           }
         />
@@ -2565,8 +2988,8 @@ function UserList({
             </div>
           </section>
           {(!narrow || drill.p === 'user') &&
-            (selected ? (
-              detailOf(selected)
+            (detail ? (
+              detailOf(detail)
             ) : (
               <section key="user-detail-empty" className="panel user-split-detail">
                 <div className="user-detail-empty">
@@ -2596,7 +3019,7 @@ function UserList({
           title={`切换为${accountingChange.mode === 'double' ? '双向' : '单向'}计量`}
           body={
             <>
-              <p>用户「{accountingChange.user.id}」本月的接入与转发用量将按新口径重新核算。</p>
+              <p>用户「{accountingChange.user.id}」本期的接入与转发用量将按新口径重新核算。</p>
               <p>
                 {accountingChange.mode === 'double'
                   ? '同一业务数据在服务器接收和转发时各计一次。重算后若额度耗尽，相关线路或转发入口将自动暂停。'

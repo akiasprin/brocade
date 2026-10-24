@@ -21,6 +21,9 @@ const GRANTS_TICK: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if database_command().await? {
+        return Ok(());
+    }
     brocade_console::performance::Performance::initialize()?;
     let database_url =
         env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set for brocade-console")?;
@@ -173,97 +176,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Catch up a shortened raw-history policy gradually: each minute deletes at most one bounded
-    // batch. Keep it separate from receipt expiry and the other hourly retention jobs.
-    let readings_pruner = store.clone();
+    // Each table owns its due time and bounded transaction. Backlogs retry every minute;
+    // normally settled history runs hourly. One failure never skips another table.
+    let pruner = store.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            let schedule = match readings_pruner.retention_schedule().await {
-                Ok(schedule) => schedule,
-                Err(error) => {
-                    eprintln!("retention: 读取保留策略失败：{error}");
-                    continue;
+            match pruner.run_data_retention().await {
+                Ok(results) => {
+                    for result in results {
+                        if let Some(code) = result.error_code {
+                            eprintln!(
+                                "retention: {} 清理失败（{}），下轮重试",
+                                result.table_name, code
+                            );
+                        } else if result.deleted_rows > 0 {
+                            eprintln!(
+                                "retention: {} 清理 {} 条过期记录",
+                                result.table_name, result.deleted_rows
+                            );
+                        }
+                    }
                 }
-            };
-            match readings_pruner
-                .prune_configured_usage_readings(&schedule)
-                .await
-            {
-                Ok(0) => {}
-                Ok(rows) => eprintln!("usage: 清掉 {rows} 条过期读数"),
-                Err(error) => eprintln!("usage: 清理读数失败：{error}"),
-            }
-        }
-    });
-
-    // Other retention cleanup keeps its existing hourly cadence and independent lifetimes.
-    // Once an hour suffices (retention is measured in days), DELETE is idempotent, and several
-    // instances running at once do not fight. Failure logs without exiting: an uncleanable table
-    // is a disk problem and should not take the whole control plane down.
-    let pruner = store.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
-        loop {
-            tick.tick().await;
-            let schedule = match pruner.retention_schedule().await {
-                Ok(schedule) => schedule,
-                Err(error) => {
-                    eprintln!("retention: 读取保留策略失败：{error}");
-                    continue;
-                }
-            };
-            match pruner.prune_configured_usage_receipts(&schedule).await {
-                Ok(0) => {}
-                Ok(rows) => eprintln!("usage: 清掉 {rows} 条过期回执"),
-                Err(error) => eprintln!("usage: 清理回执失败：{error}"),
-            }
-            match pruner.prune_configured_usage_history(&schedule).await {
-                Ok(0) => {}
-                Ok(rows) => eprintln!("usage: 清掉 {rows} 条已汇总明细"),
-                Err(error) => eprintln!("usage: 清理明细失败：{error}"),
-            }
-            match pruner.prune_configured_load_history(&schedule).await {
-                Ok(0) => {}
-                Ok(rows) => eprintln!("load: 清掉 {rows} 条过期遥测"),
-                Err(error) => eprintln!("load: 清理遥测失败：{error}"),
-            }
-            match pruner.prune_configured_ping_history(&schedule).await {
-                Ok(0) => {}
-                Ok(rows) => eprintln!("ping: 清掉 {rows} 条过期探测"),
-                Err(error) => eprintln!("ping: 清理探测失败：{error}"),
-            }
-            match pruner.prune_configured_e2e_history(&schedule).await {
-                Ok(0) => {}
-                Ok(rows) => eprintln!("probe: 清掉 {rows} 条过期端到端探测"),
-                Err(error) => eprintln!("probe: 清理端到端探测失败：{error}"),
-            }
-            match pruner.prune_configured_vpngate_history(&schedule).await {
-                Ok(0) => {}
-                Ok(rows) => eprintln!("vpngate: 清掉 {rows} 条过期观测"),
-                Err(error) => eprintln!("vpngate: 清理观测失败：{error}"),
-            }
-            match pruner.prune_configured_public_ip_history(&schedule).await {
-                Ok(0) => {}
-                Ok(rows) => eprintln!("public-ip: 清掉 {rows} 条过期变更事件"),
-                Err(error) => eprintln!("public-ip: 清理变更事件失败：{error}"),
-            }
-            match pruner.prune_configured_machine_events(&schedule).await {
-                Ok(0) => {}
-                Ok(rows) => eprintln!("notifications: 清掉 {rows} 条过期机器事件"),
-                Err(error) => eprintln!("notifications: 清理机器事件失败：{error}"),
-            }
-            match pruner.prune_configured_online_sources(&schedule).await {
-                Ok(0) => {}
-                Ok(rows) => eprintln!("presence: 清掉 {rows} 条过期来源"),
-                Err(error) => eprintln!("presence: 清理来源失败：{error}"),
-            }
-            match pruner.prune_configured_traffic_forecasts(&schedule).await {
-                Ok(0) => {}
-                Ok(rows) => eprintln!("traffic: 清掉 {rows} 条过期流量预测"),
-                Err(error) => eprintln!("traffic: 清理流量预测失败：{error}"),
+                Err(error) => eprintln!("retention: 读取清理策略失败：{error}"),
             }
         }
     });
@@ -328,6 +265,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // collision with somebody else's release is simply retried next round under the same
     // idempotency key.
     let quota_wake = Arc::new(Notify::new());
+    let user_traffic_store = store.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            if let Err(error) = user_traffic_store.enforce_user_traffic_policies().await {
+                eprintln!("user traffic: {error}");
+            }
+        }
+    });
+
     let quota_store = store.clone();
     let quota_signal = quota_wake.clone();
     tokio::spawn(async move {
@@ -338,6 +286,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::select! {
                 _ = tokio::time::sleep(QUOTA_TICK) => {}
                 _ = quota_signal.notified() => {}
+            }
+            match quota_store.enforce_user_service_periods().await {
+                Ok(changed) if changed > 0 => {
+                    eprintln!("user service: 已更新 {changed} 个用户的服务状态")
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("user service: 有效期评估失败：{error}"),
             }
             match quota_store.enforce_quotas().await {
                 Ok(outcome) => {
@@ -463,6 +418,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     Ok(())
+}
+
+/// Offline maintenance commands never create a missing database or start HTTP/background jobs.
+async fn database_command() -> Result<bool, Box<dyn std::error::Error>> {
+    let args: Vec<_> = env::args().skip(1).collect();
+    if args.is_empty() {
+        return Ok(false);
+    }
+    let migrate = match args.as_slice() {
+        [command] if command == "database-check" => false,
+        [command] if command == "database-migrate" => true,
+        _ => return Err("usage: brocade-console [database-check|database-migrate]".into()),
+    };
+    let url = env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set")?;
+    let store = PgStore::connect(&url)
+        .await
+        .map_err(|_| "数据库连接失败；请检查原有数据库配置，不会创建新库")?;
+    let check = store
+        .check_database_upgrade()
+        .await
+        .map_err(|_| "无法读取数据库迁移历史")?;
+    println!("{}", serde_json::to_string(&check)?);
+    if !check.compatible {
+        return Err("数据库不在支持的升级路径中，未执行迁移".into());
+    }
+    if migrate {
+        store
+            .migrate_database_schema()
+            .await
+            .map_err(|_| "数据库迁移失败；保留备份和迁移历史，请检查后重试")?;
+    }
+    Ok(true)
 }
 
 /// Both SIGTERM (what systemd stops a service with) and Ctrl-C count.

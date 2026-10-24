@@ -819,6 +819,11 @@ pub struct ExternalOutbound {
     pub port: u16,
     pub protocol: ExternalOutboundProtocol,
     pub security: ExternalOutboundSecurity,
+    /// Resolve the proxied target locally before passing it to this tunnel. Absent means
+    /// `AsIs`: preserve the target domain for the remote server. This does not control how
+    /// the tunnel server's own address is resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_strategy: Option<DomainStrategy>,
     /// Machine-specific identities owned by a managed provider. Ordinary imported tunnels leave
     /// this empty; WARP deliberately gets one private key and one Cloudflare device per machine
     /// instead of copying a single provider identity across the fleet.
@@ -1208,6 +1213,9 @@ pub enum ExternalOutboundSecurity {
         server_name: String,
         #[serde(default = "default_tls_fingerprint")]
         fingerprint: String,
+        /// Skip certificate verification only when explicitly requested for this tunnel.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_insecure: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         alpn: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2517,9 +2525,9 @@ impl IngressWires {
 /// presents that certificate. The remaining ingress-local setting is whether to run flow control;
 /// the client uses its native TLS stack and the model carries no ClientHello preset.
 ///
-/// Skipping certificate verification is deliberately absent from the model: Xray removed
-/// `allowInsecure`, probes pin self-signed certificates, and the one lossy URI escape hatch is a transient
-/// render choice rather than durable ingress configuration.
+/// Skipping certificate verification is deliberately absent from managed ingress configuration:
+/// probes pin self-signed certificates, and the lossy URI escape hatch is a transient render
+/// choice. External tunnels own their independent, explicit `allow_insecure` setting.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tls {
     /// Same three-state rule as [`Reality::flow`]: unset follows the fleet, empty is off.

@@ -1,42 +1,30 @@
-//! HTTP client, hand-written rather than pulling in reqwest: the agent links
-//! statically against musl and ships to other people's machines, and it needs
-//! only GET/POST, one timeout, and one body limit.
+//! Bounded HTTP requests over reqwest/rustls, plus the shared WebSocket TLS transport.
 //!
-//! TLS is the one layer we do not write ourselves. This subset of HTTP/1.1 fits
-//! on a screen; TLS does not. Hand-rolling it fails differently, too: not by
-//! missing features, but by completing a handshake that never established who
-//! the peer is. So this reaches for rustls (with the ring provider — the
-//! reasoning and the measurements are at the top of `brocade-console/build.rs`,
-//! in the section on zig).
-//!
-//! Trust anchors come from `webpki-roots`, compiled into the binary, rather than
-//! from the target machine's `/etc/ssl/certs`. The agent runs on other people's
-//! machines, and how old their root store is — or whether they have one at all,
-//! which trimmed Alpine images often do not — must not decide whether the agent
-//! can reach the control plane.
-//!
-//! One consequence worth stating: a node whose clock is badly wrong cannot reach
-//! the control plane, because certificate validity is checked against system
-//! time. That is deliberate and not worked around — working around it would mean
-//! not checking validity at all.
+//! Each request has one deadline through DNS, TCP, TLS, upload and complete response body.
+//! Retries belong to durable/latest-value reporters, never to the transport. Console traffic
+//! and optional public services have separate clients and bounded resolver budgets.
+//! Trust anchors are compiled into the Agent; host certificate stores and environment proxies
+//! cannot change control-plane connectivity or expose the node credential.
+use rustls::{pki_types::ServerName, ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use std::{
     collections::BTreeMap,
-    io::{Read, Write},
-    net::{SocketAddr, TcpStream, ToSocketAddrs},
+    io::{self, Read, Write},
+    net::{SocketAddr, TcpStream},
+    os::fd::AsRawFd,
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use rustls::{pki_types::ServerName, ClientConfig, ClientConnection, RootCertStore, StreamOwned};
-
-mod response;
+mod client;
+mod diagnostic;
+mod resolver;
 #[cfg(test)]
-pub(crate) use response::{decode_chunked_body, parse_http_response};
+pub(crate) mod tests;
 
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const MAX_HTTP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const HTTP_DEFAULT_PORT: u16 = 80;
 const HTTPS_DEFAULT_PORT: u16 = 443;
 
@@ -45,7 +33,6 @@ pub(crate) enum AddressFamily {
     V4,
     V6,
 }
-
 impl AddressFamily {
     fn accepts(self, address: &SocketAddr) -> bool {
         match self {
@@ -53,7 +40,6 @@ impl AddressFamily {
             Self::V6 => address.is_ipv6(),
         }
     }
-
     fn label(self) -> &'static str {
         match self {
             Self::V4 => "IPv4",
@@ -61,39 +47,31 @@ impl AddressFamily {
         }
     }
 }
-
 struct RequestBody<'a> {
     bytes: &'a [u8],
     content_type: &'a str,
 }
-
 #[derive(Clone, Copy)]
 struct RequestTransport {
     family: Option<AddressFamily>,
-    io_timeout: Duration,
+    timeout: Duration,
 }
-
 impl Default for RequestTransport {
     fn default() -> Self {
         Self {
             family: None,
-            io_timeout: HTTP_IO_TIMEOUT,
+            timeout: HTTP_REQUEST_TIMEOUT,
         }
     }
 }
-
 #[derive(Debug)]
 pub(crate) struct HttpClient {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) host_header: String,
     pub(crate) prefix: String,
-    /// Whether this connection runs over TLS. Decided by the URL scheme and by
-    /// nothing else: there must be no state where the configuration claims
-    /// encryption and the wire does not have it.
     pub(crate) tls: bool,
 }
-
 impl HttpClient {
     pub(crate) fn new(base_url: &str) -> Result<Self, String> {
         // Both prefixes are required; a missing scheme is not defaulted to http.
@@ -105,17 +83,24 @@ impl HttpClient {
         } else if let Some(rest) = base_url.strip_prefix("http://") {
             (false, rest)
         } else {
-            return Err(format!(
-                "server URL must start with http:// or https://: {base_url}"
-            ));
+            return Err("server URL must start with http:// or https://".to_owned());
         };
+        if rest.chars().any(|c| c.is_control() || c.is_whitespace()) || rest.contains('#') {
+            return Err(
+                "invalid server URL: credentials, fragments and whitespace are forbidden"
+                    .to_owned(),
+            );
+        }
         let default_port = if tls {
             HTTPS_DEFAULT_PORT
         } else {
             HTTP_DEFAULT_PORT
         };
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-        let (host, port, host_header) = parse_http_authority(base_url, authority, default_port)?;
+        if authority.contains('@') {
+            return Err("server URL credentials are forbidden".to_owned());
+        }
+        let (host, port, host_header) = parse_http_authority(authority, default_port)?;
         let prefix = if path.is_empty() {
             String::new()
         } else {
@@ -182,7 +167,7 @@ impl HttpClient {
             &[],
             RequestTransport {
                 family: Some(family),
-                io_timeout: timeout,
+                timeout,
             },
         )
     }
@@ -231,6 +216,30 @@ impl HttpClient {
         )
     }
 
+    pub(crate) fn request_timeout(
+        &self,
+        method: &str,
+        path: &str,
+        token: &str,
+        body: Option<&str>,
+        timeout: Duration,
+    ) -> Result<HttpResponse, String> {
+        self.request_inner(
+            method,
+            path,
+            Some(token),
+            RequestBody {
+                bytes: body.unwrap_or("").as_bytes(),
+                content_type: "application/json",
+            },
+            &[],
+            RequestTransport {
+                family: None,
+                timeout,
+            },
+        )
+    }
+
     fn request_inner(
         &self,
         method: &str,
@@ -240,163 +249,264 @@ impl HttpClient {
         extra_headers: &[(&str, String)],
         transport: RequestTransport,
     ) -> Result<HttpResponse, String> {
-        let full_path = format!("{}{}", self.prefix, path);
-        let mut extra = String::new();
-        for (name, value) in extra_headers {
-            extra.push_str(name);
-            extra.push_str(": ");
-            extra.push_str(value);
-            extra.push_str("\r\n");
-        }
-        let tcp = self.connect_with_family(
-            transport.family,
-            transport.io_timeout.min(HTTP_CONNECT_TIMEOUT),
-        )?;
-        // Timeouts go on the TcpStream, and they go on before TLS wraps it: the
-        // handshake is itself a round of reads and writes, so without them a peer
-        // that never answers blocks forever. A stalled convergence loop is
-        // invisible from the console — that node merely stops reporting.
-        tcp.set_read_timeout(Some(transport.io_timeout))
-            .map_err(|error| error.to_string())?;
-        tcp.set_write_timeout(Some(transport.io_timeout))
-            .map_err(|error| error.to_string())?;
-        let mut stream = self.wrap_tls(tcp)?;
-        let internal_headers = token
-            .map(|token| {
-                format!(
-                    "Authorization: Bearer {token}\r\nX-Brocade-Protocol-Version: {protocol}\r\n",
-                    protocol = brocade_deployment::protocol::AGENT_PROTOCOL_VERSION,
-                )
-            })
-            .unwrap_or_default();
-        let request = format!(
-            "{method} {full_path} HTTP/1.1\r\n\
-             Host: {host}\r\n\
-             User-Agent: brocade-agent/{identity}\r\n\
-             {internal_headers}\
-             Accept: application/json\r\n\
-             Content-Type: {content_type}\r\n\
-             {extra}\
-             Content-Length: {len}\r\n\
-             Connection: close\r\n\
-             \r\n",
-            host = self.host_header,
-            // The sha256 of this very binary, not a version number somebody has to remember to
-            // bump — the reasoning is at the top of `identity.rs`. It lands in
-            // `node_agent_state.agent_version`, whose sole writer is the poll path.
-            identity = crate::identity::self_identity(),
-            content_type = body.content_type,
-            len = body.bytes.len(),
-        );
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|error| error.to_string())?;
-        stream
-            .write_all(body.bytes)
-            .map_err(|error| error.to_string())?;
-
-        response::read_response(&mut stream, method)
-    }
-
-    pub(crate) fn connect(&self) -> Result<TcpStream, String> {
-        self.connect_with_family(None, HTTP_CONNECT_TIMEOUT)
-    }
-
-    fn connect_with_family(
-        &self,
-        family: Option<AddressFamily>,
-        connect_timeout: Duration,
-    ) -> Result<TcpStream, String> {
-        let addresses = (self.host.as_str(), self.port)
-            .to_socket_addrs()
-            .map_err(|error| format!("resolve {}:{} failed: {error}", self.host, self.port))?;
-        let mut last_error = None;
-        let mut matched = false;
-        for address in
-            addresses.filter(|address| family.is_none_or(|family| family.accepts(address)))
-        {
-            matched = true;
-            match TcpStream::connect_timeout(&address, connect_timeout) {
-                Ok(stream) => return Ok(stream),
-                Err(error) => last_error = Some(error),
+        let started = Instant::now();
+        let mut progress = diagnostic::Progress::new(started);
+        let deadline = started
+            .checked_add(transport.timeout)
+            .ok_or("invalid HTTP request timeout")?;
+        if let (Some(family), Ok(ip)) = (transport.family, self.host.parse::<std::net::IpAddr>()) {
+            if !family.accepts(&SocketAddr::new(ip, self.port)) {
+                return Err(format!("resolve returned no {} addresses", family.label()));
             }
         }
-        Err(match last_error {
-            Some(error) => format!("connect {}:{} failed: {error}", self.host, self.port),
-            None if matched => format!("connect {}:{} failed", self.host, self.port),
-            None => match family {
-                Some(family) => format!(
-                    "resolve {}:{} returned no {} addresses",
-                    self.host,
-                    self.port,
-                    family.label()
-                ),
-                None => format!("resolve {}:{} returned no addresses", self.host, self.port),
-            },
+        let class = if token.is_some() {
+            client::TrafficClass::Control
+        } else {
+            client::TrafficClass::Public
+        };
+        let client = client::shared(class, transport.family, deadline)
+            .map_err(|error| progress.message("client", &error))?;
+        let url = format!(
+            "{}://{}{}{}",
+            if self.tls { "https" } else { "http" },
+            self.host_header,
+            self.prefix,
+            path
+        );
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| progress.message("request", "invalid_method"))?;
+        let mut request = client
+            .request(method, url)
+            .header("Accept", "application/json")
+            .header("Content-Type", body.content_type)
+            .header("Content-Length", body.bytes.len())
+            .body(body.bytes.to_vec());
+        if let Some(token) = token {
+            request = request.bearer_auth(token).header(
+                "X-Brocade-Protocol-Version",
+                brocade_deployment::protocol::AGENT_PROTOCOL_VERSION,
+            );
+        }
+        for (name, value) in extra_headers {
+            request = request.header(*name, value);
+        }
+        // Client creation and copying the bounded application payload spend the same budget.
+        // Setting only ClientBuilder::timeout does not carry a total timer through blocking reads.
+        let request_budget =
+            remaining(deadline).map_err(|_| progress.message("request", "timeout"))?;
+        let mut response = request
+            .timeout(request_budget)
+            .send()
+            .map_err(|error| progress.error("send", &error))?;
+        progress.status = Some(response.status().as_u16());
+        progress.content_length = response.content_length();
+        if response.status() == reqwest::StatusCode::SWITCHING_PROTOCOLS {
+            return Err(progress.message("headers", "unsupported_upgrade"));
+        }
+        if progress
+            .content_length
+            .is_some_and(|size| size > MAX_HTTP_RESPONSE_BYTES as u64)
+        {
+            return Err(progress.message("headers", "body_exceeds_limit"));
+        }
+        let mut headers = BTreeMap::new();
+        let mut header_bytes = 0usize;
+        for (name, value) in response.headers() {
+            header_bytes = header_bytes
+                .saturating_add(name.as_str().len())
+                .saturating_add(value.len())
+                .saturating_add(4);
+            if header_bytes > MAX_HTTP_HEADER_BYTES {
+                return Err(progress.message("headers", "headers_exceed_limit"));
+            }
+            let value = std::str::from_utf8(value.as_bytes())
+                .map_err(|_| progress.message("headers", "invalid_header_encoding"))?;
+            headers.insert(name.as_str().to_owned(), value.to_owned());
+        }
+        // Hyper owns framing. The application only supports the identity/chunked transfer coding;
+        // do not accidentally accept a gzip transfer-coding as an uncompressed JSON response.
+        if headers
+            .get("transfer-encoding")
+            .is_some_and(|value| !value.trim().eq_ignore_ascii_case("chunked"))
+        {
+            return Err(progress.message("headers", "unsupported_transfer_encoding"));
+        }
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 8192];
+        loop {
+            remaining(deadline).map_err(|_| progress.message("body", "timeout"))?;
+            let available = (MAX_HTTP_RESPONSE_BYTES + 1 - bytes.len()).min(buffer.len());
+            let length = response
+                .read(&mut buffer[..available])
+                .map_err(|error| progress.error("body", &error))?;
+            progress.received_bytes += length;
+            if length == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..length]);
+            if bytes.len() > MAX_HTTP_RESPONSE_BYTES {
+                return Err(progress.message("body", "body_exceeds_limit"));
+            }
+        }
+        let body =
+            String::from_utf8(bytes).map_err(|_| progress.message("body", "invalid_utf8"))?;
+        Ok(HttpResponse {
+            status: response.status().as_u16(),
+            body,
+            headers,
         })
     }
 
-    /// Plaintext passes through untouched; https gets a rustls layer on top.
-    pub(crate) fn wrap_tls(&self, tcp: TcpStream) -> Result<Stream, String> {
+    pub(crate) fn connect_stream(&self, deadline: Instant) -> Result<Stream, String> {
+        let addresses = resolver::control()
+            .resolve_blocking(&self.host, self.port, deadline)
+            .map_err(|error| format!("WebSocket DNS failed: {}", diagnostic::category(&error)))?;
+        let count = u32::try_from(addresses.len()).map_err(|_| "too many resolved addresses")?;
+        let mut last_error = None;
+        for (index, address) in addresses.into_iter().enumerate() {
+            let budget = remaining(deadline).map_err(|_| "WebSocket connect timeout")?;
+            let left = count - u32::try_from(index).map_err(|_| "too many resolved addresses")?;
+            match TcpStream::connect_timeout(&address, (budget / left).min(HTTP_CONNECT_TIMEOUT)) {
+                Ok(tcp) => {
+                    return self.wrap_tls(DeadlineTcpStream {
+                        tcp,
+                        deadline: Some(deadline),
+                    })
+                }
+                Err(error) => last_error = Some(diagnostic::category(&error)),
+            }
+        }
+        Err(format!(
+            "WebSocket connect failed: {}",
+            last_error.unwrap_or_else(|| "no_addresses".to_owned())
+        ))
+    }
+
+    fn wrap_tls(&self, tcp: DeadlineTcpStream) -> Result<Stream, String> {
         if !self.tls {
             return Ok(Stream::Plain(tcp));
         }
-        let config = tls_config()?;
-        // The name being verified comes from the URL, not from the address we
-        // connected to. Verifying against the resolved IP when the URL names a
-        // host would void the name field of the certificate entirely.
-        let server_name = ServerName::try_from(self.host.clone())
-            .map_err(|_| format!("{} is not a valid TLS server name", self.host))?;
-        let connection = ClientConnection::new(config, server_name)
-            .map_err(|error| format!("TLS setup for {} failed: {error}", self.host))?;
+        let server_name =
+            ServerName::try_from(self.host.clone()).map_err(|_| "invalid TLS server name")?;
+        let connection = ClientConnection::new(tls_config()?, server_name)
+            .map_err(|_| "TLS client setup failed")?;
         Ok(Stream::Tls(Box::new(StreamOwned::new(connection, tcp))))
     }
 }
 
-/// The two paths a request can take: plaintext or TLS.
-///
-/// An enum rather than `Box<dyn ...>`, because there are exactly two of them and
-/// a trait object would first need a hand-written trait that is both `Read` and
-/// `Write`, in exchange for one more indirection on every read and write.
-///
-/// The TLS variant is boxed because `ClientConnection` carries its record
-/// buffers and is large. Unboxed, the whole enum would be sized for it, and every
-/// plaintext request would pay for that much stack it never uses.
+fn remaining(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|value| !value.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request deadline exceeded"))
+}
+
+/// Rustls may consume many TLS records inside one Read. Enforce the absolute handshake deadline
+/// at the underlying socket on every operation so control messages cannot renew its budget.
+pub(crate) struct DeadlineTcpStream {
+    tcp: TcpStream,
+    deadline: Option<Instant>,
+}
+impl DeadlineTcpStream {
+    fn prepare_read(&self) -> io::Result<()> {
+        if let Some(deadline) = self.deadline {
+            self.tcp.set_read_timeout(Some(remaining(deadline)?))?;
+        }
+        Ok(())
+    }
+    fn prepare_write(&self) -> io::Result<()> {
+        if let Some(deadline) = self.deadline {
+            self.tcp.set_write_timeout(Some(remaining(deadline)?))?;
+        }
+        Ok(())
+    }
+}
+impl Read for DeadlineTcpStream {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.prepare_read()?;
+        self.tcp.read(bytes)
+    }
+}
+impl Write for DeadlineTcpStream {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.prepare_write()?;
+        self.tcp.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.prepare_write()?;
+        self.tcp.flush()
+    }
+}
 pub(crate) enum Stream {
-    Plain(TcpStream),
-    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+    Plain(DeadlineTcpStream),
+    Tls(Box<StreamOwned<ClientConnection, DeadlineTcpStream>>),
 }
-
 impl Stream {
-    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
-        match self {
-            Self::Plain(stream) => stream.set_nonblocking(nonblocking),
-            Self::Tls(stream) => stream.sock.set_nonblocking(nonblocking),
+    /// Wait on the socket without changing the nonblocking transport or poisoning tungstenite
+    /// with a timeout error. Callers drain buffered frames before waiting for kernel readiness.
+    pub(crate) fn wait_for_io(&self, writable: bool, timeout: Option<Duration>) -> io::Result<()> {
+        let tcp = match self {
+            Self::Plain(stream) => &stream.tcp,
+            Self::Tls(stream) => &stream.sock.tcp,
+        };
+        let mut descriptor = libc::pollfd {
+            fd: tcp.as_raw_fd(),
+            events: libc::POLLIN | if writable { libc::POLLOUT } else { 0 },
+            revents: 0,
+        };
+        let millis = timeout.map_or(-1, |duration| {
+            let rounded =
+                duration.as_millis() + u128::from(duration.subsec_nanos() % 1_000_000 != 0);
+            rounded.min(i32::MAX as u128) as i32
+        });
+        // SAFETY: descriptor references one live socket owned by self for the whole call.
+        let result = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
         }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_handshake(&mut self) -> io::Result<()> {
+        let stream = match self {
+            Self::Plain(stream) => stream,
+            Self::Tls(stream) => &mut stream.sock,
+        };
+        if let Some(deadline) = stream.deadline {
+            remaining(deadline)?;
+        }
+        stream.tcp.set_read_timeout(None)?;
+        stream.tcp.set_write_timeout(None)?;
+        stream.tcp.set_nonblocking(true)?;
+        stream.deadline = None;
+        Ok(())
     }
 }
-
 impl Read for Stream {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         match self {
-            Stream::Plain(stream) => stream.read(buffer),
-            Stream::Tls(stream) => stream.read(buffer),
+            Self::Plain(stream) => stream.read(bytes),
+            Self::Tls(stream) => stream.read(bytes),
         }
     }
 }
-
 impl Write for Stream {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         match self {
-            Stream::Plain(stream) => stream.write(buffer),
-            Stream::Tls(stream) => stream.write(buffer),
+            Self::Plain(stream) => stream.write(bytes),
+            Self::Tls(stream) => stream.write(bytes),
         }
     }
-
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         match self {
-            Stream::Plain(stream) => stream.flush(),
-            Stream::Tls(stream) => stream.flush(),
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
         }
     }
 }
@@ -409,12 +519,18 @@ impl Write for Stream {
 /// The failure is cached along with the success: everything that could make this
 /// fail is fixed at compile time — both the provider and the trust anchors live
 /// in the binary — so a second attempt returns the same error as the first.
-fn tls_config() -> Result<Arc<ClientConfig>, String> {
+pub(super) fn tls_config() -> Result<Arc<ClientConfig>, String> {
     static CONFIG: OnceLock<Result<Arc<ClientConfig>, String>> = OnceLock::new();
     CONFIG
         .get_or_init(|| {
             let mut roots = RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            #[cfg(test)]
+            roots
+                .add(rustls::pki_types::CertificateDer::from(
+                    include_bytes!("http/testdata/ca.der").to_vec(),
+                ))
+                .expect("the checked-in loopback test CA is valid");
             // The provider is named explicitly instead of going through
             // `ClientConfig::builder()`, which reads the process-wide default.
             // rustls is built with default-features off (see Cargo.toml), so
@@ -432,60 +548,41 @@ fn tls_config() -> Result<Arc<ClientConfig>, String> {
 }
 
 fn parse_http_authority(
-    base_url: &str,
     authority: &str,
     default_port: u16,
 ) -> Result<(String, u16, String), String> {
-    if authority.is_empty() {
-        return Err(format!("invalid server URL {base_url}"));
+    if authority.ends_with(':') {
+        return Err("invalid port".to_owned());
     }
-    if authority.starts_with('[') {
-        let end = authority
-            .find(']')
-            .ok_or_else(|| format!("invalid bracketed IPv6 address in {base_url}"))?;
-        let host = &authority[1..end];
-        if host.is_empty() {
-            return Err(format!("invalid server URL {base_url}"));
-        }
-        let rest = &authority[end + 1..];
-        let port = if rest.is_empty() {
-            default_port
-        } else {
-            parse_http_port(
-                base_url,
-                rest.strip_prefix(':')
-                    .ok_or_else(|| format!("invalid server URL {base_url}"))?,
-            )?
-        };
-        let bracketed_host = format!("[{host}]");
-        let host_header = host_header(&bracketed_host, port, default_port);
-        return Ok((host.to_owned(), port, host_header));
+    if authority.starts_with('[') && !authority.contains(']') {
+        return Err("invalid bracketed IPv6 address".to_owned());
     }
-    if authority.contains(']') {
-        return Err(format!("invalid server URL {base_url}"));
+    if !authority.starts_with('[') && authority.matches(':').count() > 1 {
+        return Err("IPv6 server URLs must use brackets, for example http://[::1]:8081".to_owned());
     }
-
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') => (host, parse_http_port(base_url, port)?),
-        Some(_) => {
-            return Err(
-                "IPv6 server URLs must use brackets, for example http://[::1]:8081".to_owned(),
-            )
-        }
-        None => (authority, default_port),
+    let scheme = if default_port == HTTPS_DEFAULT_PORT {
+        "https"
+    } else {
+        "http"
     };
-    if host.is_empty() {
-        return Err(format!("invalid server URL {base_url}"));
-    }
-    Ok((host.to_owned(), port, host_header(host, port, default_port)))
-}
-
-fn parse_http_port(base_url: &str, port: &str) -> Result<u16, String> {
-    if port.is_empty() {
-        return Err(format!("invalid port in {base_url}"));
-    }
-    port.parse::<u16>()
-        .map_err(|_| format!("invalid port in {base_url}"))
+    let url = reqwest::Url::parse(&format!("{scheme}://{authority}"))
+        .map_err(|_| "invalid server URL or invalid port".to_owned())?;
+    let host = url
+        .host_str()
+        .ok_or("invalid server URL: missing host")?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let port = url.port().unwrap_or(default_port);
+    let authority_host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    Ok((
+        host.to_owned(),
+        port,
+        host_header(&authority_host, port, default_port),
+    ))
 }
 
 /// The Host header carries no port when the port is the default for the scheme.
@@ -514,318 +611,5 @@ impl HttpResponse {
         self.headers
             .get(&name.to_ascii_lowercase())
             .map(String::as_str)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{io::Read as _, io::Write as _, net::TcpListener, sync::mpsc, thread};
-
-    use super::{decode_chunked_body, parse_http_response, AddressFamily, HttpClient};
-
-    #[test]
-    fn address_family_filter_keeps_v4_and_v6_separate() {
-        let v4 = "127.0.0.1:80".parse().unwrap();
-        let v6 = "[::1]:80".parse().unwrap();
-
-        assert!(AddressFamily::V4.accepts(&v4));
-        assert!(!AddressFamily::V4.accepts(&v6));
-        assert!(AddressFamily::V6.accepts(&v6));
-        assert!(!AddressFamily::V6.accepts(&v4));
-    }
-
-    #[test]
-    fn family_request_rejects_an_origin_without_that_address_family() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let client = HttpClient::new(&format!("http://{address}")).unwrap();
-
-        let error = client
-            .request_public_on_family(
-                AddressFamily::V6,
-                "GET",
-                "/ip",
-                std::time::Duration::from_secs(1),
-            )
-            .unwrap_err();
-
-        assert!(error.contains("no IPv6 addresses"), "{error}");
-    }
-
-    #[test]
-    fn public_requests_never_send_console_credentials_or_protocol_headers() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (sent, received) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let length = stream.read(&mut request).unwrap();
-            sent.send(String::from_utf8_lossy(&request[..length]).into_owned())
-                .unwrap();
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-                .unwrap();
-        });
-        let client = HttpClient::new(&format!("http://{address}")).unwrap();
-        assert_eq!(
-            client.request_public("GET", "/intel", None).unwrap().status,
-            200
-        );
-        let request = received.recv().unwrap();
-        server.join().unwrap();
-        assert!(!request.contains("Authorization:"), "{request}");
-        assert!(
-            !request.contains("X-Brocade-Protocol-Version:"),
-            "{request}"
-        );
-    }
-
-    #[test]
-    fn authenticated_binary_requests_preserve_the_compressed_body() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let (header_end, content_length) = loop {
-                let mut chunk = [0_u8; 4096];
-                let length = stream.read(&mut chunk).unwrap();
-                assert!(length > 0, "request ended before its body arrived");
-                request.extend_from_slice(&chunk[..length]);
-                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
-                else {
-                    continue;
-                };
-                let headers = String::from_utf8_lossy(&request[..header_end]);
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| line.strip_prefix("Content-Length: "))
-                    .unwrap()
-                    .parse::<usize>()
-                    .unwrap();
-                if request.len() >= header_end + 4 + content_length {
-                    break (header_end, content_length);
-                }
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            assert!(headers.contains("Content-Type: application/gzip\r\n"));
-            assert_eq!(
-                &request[header_end + 4..header_end + 4 + content_length],
-                &[0, 0x9f, 0xff, 7]
-            );
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-                .unwrap();
-        });
-        let client = HttpClient::new(&format!("http://{address}")).unwrap();
-
-        let response = client
-            .request_bytes_with_headers(
-                "POST",
-                "/catalogue",
-                "node-token",
-                &[0, 0x9f, 0xff, 7],
-                "application/gzip",
-                &[],
-            )
-            .unwrap();
-
-        server.join().unwrap();
-        assert_eq!(response.status, 200);
-    }
-
-    #[test]
-    fn response_headers_are_case_insensitive() {
-        let response = parse_http_response(
-            b"HTTP/1.1 204 No Content\r\nX-Brocade-Xray-Log-Max-MiB: 256\r\nContent-Length: 0\r\n\r\n",
-        )
-        .unwrap();
-        assert_eq!(response.header("x-brocade-xray-log-max-mib"), Some("256"));
-        assert_eq!(response.header("X-BROCADE-XRAY-LOG-MAX-MIB"), Some("256"));
-    }
-
-    /// Without an explicit port the Host header must not carry one either. With
-    /// it, a name-based reverse proxy on the far side finds no matching site and
-    /// the agent connects fine but gets a 404.
-    #[test]
-    fn the_default_port_is_left_out_of_the_host_header() {
-        let client = HttpClient::new("http://example.test").unwrap();
-        assert_eq!(client.port, 80);
-        assert_eq!(client.host_header, "example.test");
-        assert_eq!(client.prefix, "", "没有路径就没有前缀");
-
-        let client = HttpClient::new("http://[::1]").unwrap();
-        assert_eq!(client.host, "::1");
-        assert_eq!(client.port, 80);
-        assert_eq!(client.host_header, "[::1]");
-    }
-
-    /// A trailing slash on the path prefix must go. Kept, the joined path reads
-    /// `/base//agent/v1/desired`, which some reverse proxies route elsewhere.
-    #[test]
-    fn a_trailing_slash_in_the_prefix_is_trimmed() {
-        assert_eq!(HttpClient::new("http://h/base/").unwrap().prefix, "/base");
-        assert_eq!(HttpClient::new("http://h/base").unwrap().prefix, "/base");
-        assert_eq!(HttpClient::new("http://h/").unwrap().prefix, "");
-    }
-
-    /// A broken port must be reported on the spot. Falling back to 80 sends the
-    /// agent at a port nobody listens on, and the error reads "cannot connect" —
-    /// which sends the operator to the network, not to their own URL.
-    #[test]
-    fn a_broken_port_is_reported_instead_of_falling_back_to_80() {
-        for url in [
-            "http://example.test:",
-            "http://example.test:http",
-            "http://example.test:70000",
-            "http://[::1]:70000",
-        ] {
-            let error = HttpClient::new(url).unwrap_err();
-            assert!(
-                error.contains("invalid port"),
-                "{url} 该报端口无效，实际 {error}"
-            );
-        }
-    }
-
-    /// https means TLS, port 443, and no 443 in the Host header. A name-based
-    /// reverse proxy matches on that header; carrying the port finds no site,
-    /// and the symptom is a connection that works and 404s on everything.
-    #[test]
-    fn https_urls_get_tls_and_port_443() {
-        let client = HttpClient::new("https://example.test").unwrap();
-        assert!(client.tls);
-        assert_eq!(client.port, 443);
-        assert_eq!(client.host_header, "example.test");
-
-        let client = HttpClient::new("https://example.test:8443").unwrap();
-        assert!(client.tls);
-        assert_eq!(client.port, 8443);
-        assert_eq!(client.host_header, "example.test:8443", "非默认端口要带上");
-
-        let client = HttpClient::new("http://example.test").unwrap();
-        assert!(!client.tls, "http 不该被悄悄升级成 TLS");
-        assert_eq!(client.port, 80);
-
-        // 443 is not the default under http, and 80 is not the default under
-        // https, so both must keep their port in the header.
-        assert_eq!(
-            HttpClient::new("http://example.test:443")
-                .unwrap()
-                .host_header,
-            "example.test:443"
-        );
-        assert_eq!(
-            HttpClient::new("https://example.test:80")
-                .unwrap()
-                .host_header,
-            "example.test:80"
-        );
-    }
-
-    /// A URL with no scheme is an error, not something to default to http.
-    /// Defaulted, a slip like `relay.example:8081` parses as host `relay.example` on port
-    /// 8081 over plaintext: the token goes out in the clear and everything about
-    /// it looks normal.
-    #[test]
-    fn a_url_without_a_scheme_is_rejected() {
-        for url in [
-            "relay.example:8081",
-            "example.test",
-            "ftp://example.test",
-            "",
-        ] {
-            let error = HttpClient::new(url).unwrap_err();
-            assert!(
-                error.contains("must start with http:// or https://"),
-                "{url} 实际 {error}"
-            );
-        }
-    }
-
-    /// The TLS configuration builds, and twice asking yields the same one.
-    /// Rebuilt per request, all ~150 trust anchors would be re-parsed every 15
-    /// seconds for nothing.
-    #[test]
-    fn the_tls_config_is_built_once_and_reused() {
-        let first = super::tls_config().expect("信任锚和 provider 都在二进制里，不该建不起来");
-        let second = super::tls_config().unwrap();
-        assert!(std::sync::Arc::ptr_eq(&first, &second), "该是同一份");
-    }
-
-    /// A URL with no host must not pass. An empty host survives all the way to
-    /// connect, where the error talks about resolution failure — several layers
-    /// away from "your URL is missing a host".
-    #[test]
-    fn an_empty_host_is_rejected_early() {
-        for url in ["http://", "http://:8080", "http://[]:8080", "http://]bad"] {
-            assert!(HttpClient::new(url).is_err(), "{url} 不该被接受");
-        }
-    }
-
-    /// An unclosed bracket is an error too. Taking everything before `]` as the
-    /// host would connect somewhere whose name does not match.
-    #[test]
-    fn an_unclosed_bracket_is_rejected() {
-        let error = HttpClient::new("http://[::1:8080").unwrap_err();
-        assert!(error.contains("bracketed IPv6"), "实际 {error}");
-    }
-
-    /// A chunked response cut short is an error; the part already received must
-    /// not pass as a complete body. Truncated JSON may well parse into a valid
-    /// object with less in it, which is far worse than a parse failure.
-    #[test]
-    fn a_truncated_chunked_body_is_an_error_not_a_short_read() {
-        let error = decode_chunked_body(b"5\r\nhel").unwrap_err();
-        assert!(error.contains("ended inside a chunk"), "实际 {error}");
-
-        let error = decode_chunked_body(b"5\r\nhelloXX").unwrap_err();
-        assert!(error.contains("missing trailing CRLF"), "实际 {error}");
-
-        let error = decode_chunked_body(b"5").unwrap_err();
-        assert!(error.contains("missing chunk size"), "实际 {error}");
-
-        let error = decode_chunked_body(b"zz\r\n").unwrap_err();
-        assert!(error.contains("invalid chunk size"), "实际 {error}");
-    }
-
-    /// A chunk-size line with an extension (`5;foo=bar`) is legal; everything
-    /// after the semicolon is ignored.
-    #[test]
-    fn a_chunk_extension_is_ignored() {
-        let decoded = decode_chunked_body(b"5;name=value\r\nhello\r\n0\r\n\r\n").unwrap();
-        assert_eq!(decoded, b"hello");
-    }
-
-    /// A response missing the `\r\n\r\n` terminator, or with a non-numeric status
-    /// line, is an error. Guessing 200 would hand the layer above a piece of
-    /// garbage to parse as the control plane's reply.
-    #[test]
-    fn a_malformed_status_line_is_rejected() {
-        let error = parse_http_response(b"HTTP/1.1 200 OK\r\nno terminator").unwrap_err();
-        assert!(error.contains("missing header terminator"), "实际 {error}");
-
-        let error = parse_http_response(b"HTTP/1.1 zzz OK\r\n\r\n").unwrap_err();
-        assert!(error.contains("invalid status"), "实际 {error}");
-
-        let error = parse_http_response(b"HTTP/1.1\r\n\r\n").unwrap_err();
-        assert!(error.contains("missing status"), "实际 {error}");
-    }
-
-    /// Case and spacing in Transfer-Encoding are the far side's choice, so one
-    /// spelling is not enough. Missing it hands up the raw bytes, chunk-length
-    /// prefixes and all, as the body.
-    #[test]
-    fn chunked_is_recognized_regardless_of_spelling() {
-        for head in [
-            "Transfer-Encoding: chunked",
-            "transfer-encoding: Chunked",
-            "Transfer-Encoding:  chunked ",
-        ] {
-            let raw = format!("HTTP/1.1 200 OK\r\n{head}\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
-            let response = parse_http_response(raw.as_bytes()).unwrap();
-            assert_eq!(response.body, "hello", "{head} 该被认成分块");
-        }
     }
 }

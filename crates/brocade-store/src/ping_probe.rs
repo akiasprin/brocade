@@ -40,7 +40,7 @@ const LATEST_NODE_SAMPLES_SQL: &str =
        ) latest ON TRUE
       ORDER BY requested_node.node_id, requested.target, requested.family";
 
-const MAX_CLOCK_SKEW_SECS: i64 = 600;
+const MAX_FUTURE_CLOCK_SKEW_SECS: i64 = 600;
 const MAX_TARGETS: usize = 6;
 // Previously saved lists and in-flight Agent reports may still contain up to 32 targets. Keep
 // them readable so operators can reduce the list; every new settings write is limited to six.
@@ -232,10 +232,11 @@ pub async fn record_report(
             .bind(request.probed_at_unix_secs)
             .fetch_one(pool)
             .await?;
-    if skew_secs.abs() > MAX_CLOCK_SKEW_SECS {
+    // Collection time can legitimately precede delivery by an arbitrarily long outage. Only
+    // future timestamps diagnose clock skew; history is bounded by its configured retention.
+    if skew_secs > MAX_FUTURE_CLOCK_SKEW_SECS {
         return Err(StoreError::InvalidData(format!(
-            "PING probe clock skew {}s exceeds {MAX_CLOCK_SKEW_SECS}s; check the node's clock",
-            skew_secs.abs()
+            "PING probe timestamp is {skew_secs}s in the future, exceeding {MAX_FUTURE_CLOCK_SKEW_SECS}s; check the node's clock"
         )));
     }
 
@@ -293,6 +294,19 @@ pub async fn record_report(
         ));
     }
 
+    let retention_secs =
+        i64::from(crate::retention::ttl_hours(pool, "node_ping_probe_samples").await?) * 3_600;
+    if skew_secs < -retention_secs {
+        // Expired history is a completed delivery, not a retryable failure. A successful receipt
+        // lets existing Agents advance their FIFO without changing the collection timestamp.
+        return Ok(PingProbeReportResult {
+            node_id: node_id.to_owned(),
+            accepted_samples: 0,
+            skipped_samples: skipped_samples + validated.len() as u64,
+            unknown_targets,
+        });
+    }
+
     // Canonical lock order avoids concurrent reports inserting the same new series in opposite
     // orders. Two statements deliberately avoid the ON CONFLICT/CTE snapshot-visibility trap.
     validated.sort_unstable_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
@@ -345,29 +359,12 @@ pub async fn prune_samples(pool: &PgPool, retain_days: u32) -> Result<u64> {
 }
 
 pub(crate) async fn prune_samples_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
-    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
     let started = std::time::Instant::now();
     let mut deleted = 0;
-    // Independent small transactions release row locks and pool capacity between batches. The
-    // hourly pass can remove 200k points (above current ingestion); a backlog drains across passes.
     for _ in 0..20 {
-        let mut tx = pool.begin().await?;
-        sqlx::query("SET LOCAL statement_timeout = '5s'")
-            .execute(&mut *tx)
-            .await?;
-        let count = sqlx::query(
-            "WITH expired AS (
-                SELECT ctid FROM node_ping_probe_samples
-                 WHERE probed_at < now() - make_interval(secs => $1::double precision)
-                 ORDER BY probed_at LIMIT 10000 FOR UPDATE SKIP LOCKED
-             ) DELETE FROM node_ping_probe_samples sample USING expired
-                WHERE sample.ctid = expired.ctid",
-        )
-        .bind(retain_secs)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        tx.commit().await?;
+        let count =
+            crate::retention::cleanup::prune_batch(pool, "node_ping_probe_samples", retain_hours)
+                .await?;
         deleted += count;
         if count < 10_000 || started.elapsed() >= std::time::Duration::from_secs(10) {
             break;

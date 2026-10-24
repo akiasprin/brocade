@@ -15,8 +15,7 @@ const ThroughputChart = lazy(() =>
 );
 
 const SPARK_HEIGHT = 26;
-/** 读数栏只列当前最忙的几条链，其余合为一行，读数栏不被链的数量撑长。 */
-const CHAIN_FOLD = 5;
+const chainNameOrder = new Intl.Collator('zh-CN', { numeric: true });
 const FOLD = 12;
 const SEARCH_ROWS = 12;
 type Sort = 'name' | 'now' | 'hour';
@@ -77,6 +76,7 @@ export function LiveCard({ built, views, run }: { built: Built; views: ChainView
   const [order, setOrder] = useState<string[]>([]);
   const [query, setQuery] = useState('');
   const [expanded, setExpanded] = useState(false);
+  const [seenChains, setSeenChains] = useState<ReadonlySet<string>>(() => new Set());
   const listRef = useRef<HTMLOListElement>(null);
   const now = NOW + second;
   const viewOf = (col: string) => views.find(view => view.id === col);
@@ -84,18 +84,20 @@ export function LiveCard({ built, views, run }: { built: Built; views: ChainView
   const up = rates.reduce((sum, rate) => sum + rate.up, 0);
   const total = down + up;
   const active = rates.filter(rate => rate.down + rate.up > 0);
-  const byChain = views
-    .map(view => ({
-      view,
-      value: rates.reduce(
-        (sum, rate) =>
-          sum +
-          rate.chains.filter(chain => chain.col === view.id).reduce((acc, chain) => acc + chain.down + chain.up, 0),
-        0,
-      ),
-    }))
-    .filter(item => item.value > 0)
-    .sort((a, b) => b.value - a.value);
+  const chainRates = views.map(view => ({
+    view,
+    value: rates.reduce(
+      (sum, rate) =>
+        sum + rate.chains.filter(chain => chain.col === view.id).reduce((acc, chain) => acc + chain.down + chain.up, 0),
+      0,
+    ),
+  }));
+  const nextSeenChains = new Set(seenChains);
+  chainRates.filter(item => item.value > 0).forEach(item => nextSeenChains.add(item.view.id));
+  if (nextSeenChains.size !== seenChains.size) setSeenChains(nextSeenChains);
+  const byChain = chainRates
+    .filter(item => nextSeenChains.has(item.view.id))
+    .sort((a, b) => chainNameOrder.compare(a.view.name, b.view.name) || a.view.id.localeCompare(b.view.id));
   const chart = useMemo(() => {
     const rx = history.totalDown.map(value => (value * 8) / SLOT_SECS);
     const tx = history.totalUp.map(value => (value * 8) / SLOT_SECS);
@@ -192,7 +194,7 @@ export function LiveCard({ built, views, run }: { built: Built; views: ChainView
                 <span className="ntl-none">没有正在传输的连接</span>
               ) : (
                 <ol>
-                  {byChain.slice(0, CHAIN_FOLD).map(({ view, value }) => (
+                  {byChain.map(({ view, value }) => (
                     <li key={view.id} title={`${view.name} · ${view.via} · 占当前 ${shareOf(value, total)}`}>
                       <ChainName view={view} />
                       <b>
@@ -200,20 +202,6 @@ export function LiveCard({ built, views, run }: { built: Built; views: ChainView
                       </b>
                     </li>
                   ))}
-                  {byChain.length > CHAIN_FOLD && (
-                    <li
-                      className="ntl-rest"
-                      title={byChain
-                        .slice(CHAIN_FOLD)
-                        .map(({ view }) => view.name)
-                        .join('、')}
-                    >
-                      <span>其余 {byChain.length - CHAIN_FOLD} 条</span>
-                      <b>
-                        <Rate value={byChain.slice(CHAIN_FOLD).reduce((sum, item) => sum + item.value, 0)} />
-                      </b>
-                    </li>
-                  )}
                 </ol>
               )}
             </div>

@@ -4,6 +4,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/xtls/xray-core/common/net"
 	featurestats "github.com/xtls/xray-core/features/stats"
 )
 
@@ -14,6 +15,60 @@ func sourceValue(m *Manager, name string) int64 {
 		}
 	}
 	return -1
+}
+
+func TestSourceTrafficCanonicalizesDispatcherAddresses(t *testing.T) {
+	for _, test := range []struct {
+		name, source, canonical string
+	}{
+		{"IPv4", net.ParseAddress("192.0.2.1").String(), "192.0.2.1"},
+		{"dispatcher IPv6", net.ParseAddress("2001:db8::1").String(), "2001:db8::1"},
+		{"bare IPv6", "2001:db8::1", "2001:db8::1"},
+		{"expanded IPv6", "[2001:0db8:0:0:0:0:0:1]", "2001:db8::1"},
+		{"mapped IPv4", "[::ffff:192.0.2.1]", "192.0.2.1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := &Manager{}
+			m.sourceTraffic.bucketSeconds = 30
+			m.sourceTraffic.update(otherDomainPolicy{Enabled: true, MaxDomainsPerUser: 1, NodeCapacity: 1}, 1800000001)
+			up, down := featurestats.WithSourceTraffic(m, "alice@t#i", test.source, nil, nil)
+			if up == nil || down == nil {
+				t.Fatal("dispatcher source address lost its traffic counters")
+			}
+			up.Add(11)
+			down.Add(22)
+			// Both source representations must share one entry, even at capacity.
+			canonicalUp, canonicalDown := m.SourceTrafficCounters("alice@t#i", test.canonical)
+			if canonicalUp == nil || canonicalDown == nil {
+				t.Fatal("canonical source created a second entry")
+			}
+			canonicalUp.Add(3)
+			canonicalDown.Add(4)
+			prefix := "sourcetraffic>>>1800000000>>>alice@t#i>>>" + test.canonical + ">>>"
+			if got := sourceValue(m, prefix+"uplink"); got != 14 {
+				t.Fatalf("source uplink = %d, want 14", got)
+			}
+			if got := sourceValue(m, prefix+"downlink"); got != 26 {
+				t.Fatalf("source downlink = %d, want 26", got)
+			}
+		})
+	}
+}
+
+func TestSourceTrafficRejectsInvalidSources(t *testing.T) {
+	for _, source := range []string{
+		"", "example.test", "[2001:db8::1]:443", "[2001:db8::1", "2001:db8::1]", "[[2001:db8::1]]",
+		"0.0.0.0", "224.0.0.1", "::", "[::]", "ff02::1", "[ff02::1]", "fe80::1%eth0", "[fe80::1%eth0]",
+	} {
+		t.Run(source, func(t *testing.T) {
+			m := &Manager{}
+			m.sourceTraffic.bucketSeconds = 30
+			m.sourceTraffic.update(otherDomainPolicy{Enabled: true, MaxDomainsPerUser: 1, NodeCapacity: 1}, 1800000001)
+			if up, down := m.SourceTrafficCounters("alice@t#i", source); up != nil || down != nil {
+				t.Fatal("invalid source received traffic counters")
+			}
+		})
+	}
 }
 
 func TestSourceTrafficRetainsShortConnectionsAndRotatesLongHandles(t *testing.T) {

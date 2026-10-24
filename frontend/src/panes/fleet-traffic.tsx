@@ -13,8 +13,9 @@ import type { NodeRealtimeEvent } from '../node-realtime';
 import { NodeTrafficDialog } from '../node-traffic';
 import { useFleetTrafficSource, type FleetTrafficNode, type FleetTrafficSnapshot } from '../fleet-traffic-source';
 import { PARTIAL_TEXT, PHASE_TEXT, RATE_SUM_NOTE, type TrafficPhase } from '../user-traffic-phase';
-import { ErrorBox, Loading } from '../ui/bits';
+import { ErrorBox } from '../ui/bits';
 import { shareOf } from '../ui/format';
+import { PanelLoading } from '../ui/loading';
 import { observeBpsReadingParts } from '../ui/observe-chart';
 import { RegionFlag } from '../ui/region-flag';
 import { GeneratedUserAvatar } from '../ui/user-avatar';
@@ -473,7 +474,7 @@ function FleetLedger({ matrix, status }: { matrix: FleetTrafficMatrix; status: R
         </span>
         {status}
       </div>
-      <div>
+      <div className="usage-compose">
         <div className="usage-split" aria-hidden="true">
           {down > 0 && <i className="down" style={{ flexGrow: down }} />}
           {up > 0 && <i className="up" style={{ flexGrow: up }} />}
@@ -500,12 +501,26 @@ function FleetLedger({ matrix, status }: { matrix: FleetTrafficMatrix; status: R
       <dl className="usage-facts">
         <div>
           <dt>最高用户</dt>
-          <dd title={topUser?.userId}>{topUser ? `${topUser.userId} · ${totalOf(topUser)}` : '—'}</dd>
+          <dd title={topUser?.userId}>
+            {topUser ? (
+              <>
+                {topUser.userId} · <span className="usage-nobreak">{totalOf(topUser)}</span>
+              </>
+            ) : (
+              '—'
+            )}
+          </dd>
         </div>
         <div>
           <dt>最忙机器</dt>
           <dd title={topNode ? `${topNode.name}（按用户速率）` : undefined}>
-            {topNode ? `${topNode.name} · ${totalOf(matrix.nodeTotals.get(topNode.id)!)}` : '—'}
+            {topNode ? (
+              <>
+                {topNode.name} · <span className="usage-nobreak">{totalOf(matrix.nodeTotals.get(topNode.id)!)}</span>
+              </>
+            ) : (
+              '—'
+            )}
           </dd>
         </div>
         <div>
@@ -513,7 +528,14 @@ function FleetLedger({ matrix, status }: { matrix: FleetTrafficMatrix; status: R
           <dd
             title={`${matrix.nicNodes} 台机器的网卡接收 / 发送合计，含中转与系统流量；与用户速率不是同一口径，不能直接相减。`}
           >
-            {matrix.nicNodes > 0 ? `${rateText(matrix.nicRx, nicPair)} / ${rateText(matrix.nicTx, nicPair)}` : '—'}
+            {matrix.nicNodes > 0 ? (
+              <>
+                <span className="usage-nobreak">{rateText(matrix.nicRx, nicPair)}</span> /{' '}
+                <span className="usage-nobreak">{rateText(matrix.nicTx, nicPair)}</span>
+              </>
+            ) : (
+              '—'
+            )}
           </dd>
         </div>
         <div>
@@ -1031,17 +1053,19 @@ export function FleetTrafficTab({ allowMachineDetails = true }: { allowMachineDe
     queryKey: ['users', false],
     queryFn: () => fetchUsers(false),
   });
+  // The snapshot already carries machine IDs and projected users. Names enrich that surface later;
+  // neither roster requests nor machines still establishing a rate baseline should delay it.
   const matrix = useMemo(
     () =>
-      source.payload && nodes.data && users.data
-        ? buildFleetTrafficMatrix(source.payload, nodes.data.nodes, users.data.users, source.now)
+      source.payload
+        ? buildFleetTrafficMatrix(source.payload, nodes.data?.nodes ?? [], users.data?.users ?? [], source.now)
         : null,
     [source.payload, source.now, nodes.data, users.data],
   );
 
   const error = nodes.error ?? users.error;
   const unavailableError = (!nodes.data && nodes.error) || (!users.data && users.error);
-  if (unavailableError) {
+  if (!source.payload && unavailableError) {
     return (
       <TrafficSurface>
         <ErrorBox error={unavailableError} />
@@ -1055,7 +1079,13 @@ export function FleetTrafficTab({ allowMachineDetails = true }: { allowMachineDe
       </TrafficSurface>
     );
   }
-  if (!source.payload || nodes.isPending || users.isPending) return <Loading variant="table" />;
+  if (!source.payload) {
+    return (
+      <div className="usage-tab-loading" aria-busy="true">
+        <PanelLoading label="读取实时用量" />
+      </div>
+    );
+  }
   if (!matrix) return <ErrorBox error={new Error('机队实时流量没有返回可用数据')} />;
 
   const enabled = source.payload.policy.enabled;

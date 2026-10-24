@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, before, test } from 'node:test';
 import { chromium, expect } from '@playwright/test';
@@ -9,13 +11,16 @@ import { createServer } from 'vite';
 let server;
 let browser;
 let base;
+let cacheDirectory;
 const screenshots = '/tmp/brocade-forwarding-actions-mockup';
 
 before(async () => {
+  cacheDirectory = await mkdtemp(join(tmpdir(), 'brocade-forwarding-actions-'));
   server = await createServer({
     configFile: false,
     root: fileURLToPath(new URL('..', import.meta.url)),
     plugins: [react()],
+    cacheDir: join(cacheDirectory, 'node_modules/.vite'),
     server: { host: '127.0.0.1', port: 0 },
   });
   await server.listen();
@@ -27,18 +32,25 @@ before(async () => {
 after(async () => {
   await browser?.close();
   await server?.close();
+  if (cacheDirectory) await rm(cacheDirectory, { recursive: true, force: true });
 });
 
 async function preview(t, query = {}, width = 1280) {
   const page = await browser.newPage({ viewport: { width, height: 1000 }, reducedMotion: 'reduce' });
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
+  page.on('requestfailed', request => {
+    if (['document', 'script', 'stylesheet'].includes(request.resourceType())) {
+      errors.push(`${request.failure()?.errorText}: ${request.url()}`);
+    }
+  });
   page.on('console', message => {
     if (message.type() === 'error') errors.push(message.text());
   });
   t.after(async () => {
+    const failures = [...errors];
     await page.close();
-    assert.deepEqual(errors, [], 'no browser or React errors');
+    assert.deepEqual(failures, [], 'no browser or React errors');
   });
   await page.goto(`${base}?${new URLSearchParams({ scene: 'fleet', nav: '0', ...query })}`);
   await page.locator(query.v === 'current' ? '.user-forwarding-card' : '.fwr-panel').waitFor();
@@ -292,7 +304,7 @@ for (const variant of ['inline', 'popover', 'drawer']) {
     await opener.click();
     const form = page.getByRole('form', { name: '编辑入口 30000 的规则', exact: true });
     await expect(form).toBeVisible();
-    await expect(group(page, '东京入口').locator('.fwd-month').first()).toContainText('96.00 GiB');
+    await expect(group(page, '东京入口').locator('.fwd-cycle').first()).toContainText('96.00 GiB');
     await form.getByLabel('名称', { exact: true }).fill('新目标名称');
     await form.getByRole('button', { name: '保存', exact: true }).click();
     await expect(form).toHaveCount(0);

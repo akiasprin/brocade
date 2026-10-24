@@ -19,3 +19,10 @@ test('前端转发目标网段与 brocade-core BLOCKED_TARGET_CIDRS 逐项一致
   assert.ok(server.length > 10);
   assert.deepEqual(browser, server);
 });
+
+test('允许私网时可放行的范围与服务端一致', () => {
+  const server = cidrs(rust, /pub const PRIVATE_TARGET_CIDRS: &\[&str\] = &\[([\s\S]*?)\];/);
+  const browser = cidrs(ts, /export const PRIVATE_TARGET_CIDRS = \[([\s\S]*?)\] as const;/);
+  assert.ok(server.length > 0);
+  assert.deepEqual(browser, server);
+});

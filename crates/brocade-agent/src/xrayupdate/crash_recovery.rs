@@ -3,7 +3,7 @@
 
 use super::*;
 
-const RECOVERY_FILE: &str = "xray-crash-recovery.json";
+pub(super) const RECOVERY_FILE: &str = "xray-crash-recovery.json";
 pub(super) const FAILURE_FILE: &str = "xray-crash-report.json";
 pub(super) const RECOVERED_REPORT_FILE: &str = "xray-crash-recovered-report.json";
 
@@ -15,6 +15,14 @@ struct Recovery {
     journal_epochs: [Option<String>; 2],
     failures: u32,
     retry_after_unix_secs: i64,
+    /// Explicitly authorizes retirement of the frozen identities after control RPC failure.
+    /// Older crash checkpoints only permit restarting a dead candidate.
+    #[serde(default)]
+    restart_unresponsive: bool,
+    /// No candidate was registered before the old generation lost control. Restore the
+    /// frozen previous config/executable, never manufacture a successful target upgrade.
+    #[serde(default)]
+    restart_previous: bool,
 }
 
 fn read(state_dir: &Path) -> Result<Option<Recovery>, String> {
@@ -45,7 +53,7 @@ fn read(state_dir: &Path) -> Result<Option<Recovery>, String> {
         serde_json::from_slice(&bytes).map_err(|_| "Xray 崩溃恢复检查点无效".to_owned())?;
     if bytes.len() as u64 != metadata.len()
         || !valid_upgrade_runtime(&recovery.runtime)
-        || recovery.runtime.candidate.is_none()
+        || (recovery.runtime.candidate.is_none() && !recovery.restart_previous)
         || !valid_sha256(&recovery.config_sha256)
         || recovery
             .grants_sha256
@@ -71,37 +79,82 @@ fn write(state_dir: &Path, recovery: &Recovery) -> Result<(), String> {
 }
 
 pub(super) fn begin(state_dir: &Path, runtime: &XrayUpgradeRuntime) -> Result<bool, String> {
-    let candidate = runtime
-        .candidate
-        .as_ref()
-        .ok_or("崩溃恢复缺少已批准的候选身份")?;
-    if exact_upgrade_process(candidate).is_some() {
+    begin_recovery(state_dir, runtime, None)
+}
+
+pub(super) fn begin_unresponsive(
+    state_dir: &Path,
+    runtime: &XrayUpgradeRuntime,
+    cause: &str,
+) -> Result<bool, String> {
+    begin_recovery(state_dir, runtime, Some(cause))
+}
+
+fn begin_recovery(
+    state_dir: &Path,
+    runtime: &XrayUpgradeRuntime,
+    unresponsive: Option<&str>,
+) -> Result<bool, String> {
+    let restart_previous = runtime.candidate.is_none() && unresponsive.is_some();
+    let candidate = runtime.candidate.as_ref().unwrap_or(&runtime.old);
+    if runtime.candidate.is_none() && !restart_previous {
+        return Err("崩溃恢复缺少已批准的候选身份".to_owned());
+    }
+    if unresponsive.is_none() && exact_upgrade_process(candidate).is_some() {
         return Err("候选代仍存活，拒绝进入崩溃重启".to_owned());
     }
     // Check all reusable state before retiring the residual TCP sessions. A configuration
     // handoff must never reopen admission from the obsolete formal authorization checkpoint.
-    candidate_grants_for_recovery(state_dir, runtime)?;
+    if !restart_previous {
+        candidate_grants_for_recovery(state_dir, runtime)?;
+    }
+    let config_path = if restart_previous && config_handoff_source(runtime).is_some() {
+        state_dir.join(CONFIG_PREVIOUS_FILE)
+    } else {
+        state_dir.join("xray.json")
+    };
+    let grants_path = if restart_previous {
+        "grants.desired.json"
+    } else {
+        CONFIG_GRANTS_FILE
+    };
+    let grants_sha256 = if restart_previous {
+        crate::desired_grants_on_disk(state_dir)?;
+        state_dir
+            .join(grants_path)
+            .exists()
+            .then(|| file_sha256_hex(&state_dir.join(grants_path)))
+            .transpose()?
+    } else {
+        config_handoff_source(runtime)
+            .map(|_| file_sha256_hex(&state_dir.join(grants_path)))
+            .transpose()?
+    };
     let recovery = Recovery {
         runtime: runtime.clone(),
-        config_sha256: file_sha256_hex(&state_dir.join("xray.json"))?,
-        grants_sha256: config_handoff_source(runtime)
-            .map(|_| file_sha256_hex(&state_dir.join(CONFIG_GRANTS_FILE)))
-            .transpose()?,
+        config_sha256: file_sha256_hex(&config_path)?,
+        grants_sha256,
         journal_epochs: crate::accounting::handoff_journal_epochs(state_dir)?,
         failures: 0,
         retry_after_unix_secs: 0,
+        restart_unresponsive: unresponsive.is_some(),
+        restart_previous,
     };
-    if matches!(runtime.source, XrayUpgradeSource::BinaryRelease) {
+    if matches!(runtime.source, XrayUpgradeSource::BinaryRelease) && !restart_previous {
         let mut report = recovered_success_report(state_dir, runtime, false);
         report.outcome = XrayReleaseOutcome::FailedDirty;
-        report.error = Some(
-            "交接候选崩溃，原代无法恢复完整接入；Agent 执行自动重启恢复，残留连接可能中断"
+        report.error = Some(match unresponsive {
+            Some(cause) => format!("交接控制失联，降级为直接重启恢复，现有连接将中断：{cause}"),
+            None => "交接候选崩溃，原代无法恢复完整接入；Agent 执行自动重启恢复，残留连接可能中断"
                 .to_owned(),
-        );
+        });
         // A separate bounded slot preserves the crash even if success is recorded offline.
         write_stored_report(state_dir, FAILURE_FILE, report)?;
     }
     write(state_dir, &recovery)?;
+    if let Some(cause) = unresponsive {
+        eprintln!("xray-update: 交接控制失联，降级为直接重启恢复，现有连接将中断：{cause}");
+    }
     resume(state_dir)
 }
 
@@ -160,32 +213,80 @@ fn retry_delay(failures: u32) -> i64 {
 
 fn restore(state_dir: &Path, recovery: &Recovery) -> Result<(), String> {
     let runtime = &recovery.runtime;
-    let lost = runtime.candidate.as_ref().ok_or("崩溃恢复缺少候选身份")?;
+    let lost = runtime.candidate.as_ref().unwrap_or(&runtime.old);
+    if runtime.candidate.is_none() && !recovery.restart_previous {
+        return Err("崩溃恢复缺少候选身份".to_owned());
+    }
     let target = managed_target()?;
     validate_managed_target(&target)?;
-    verify_xray_path(&target, &lost.sha256)?;
+    if recovery.restart_previous {
+        restore_old_handoff_state(state_dir, runtime)?;
+    }
+    let replacement_executable = if recovery.restart_unresponsive
+        && !recovery.restart_previous
+        && matches!(runtime.source, XrayUpgradeSource::BinaryRelease)
+        && file_sha256_hex(&target).ok().as_deref() != Some(lost.sha256.as_str())
+    {
+        let process = exact_upgrade_process(lost).ok_or("控制失联恢复缺少候选二进制")?;
+        Some(PathBuf::from(format!("/proc/{}/exe", process.pid)))
+    } else {
+        None
+    };
+    let executable = replacement_executable.as_deref().unwrap_or(&target);
+    verify_xray_path(executable, &lost.sha256)?;
     let config = state_dir.join("xray.json");
     if file_sha256_hex(&config)? != recovery.config_sha256 {
         return Err("崩溃恢复期间目标配置发生变化".to_owned());
     }
     let content = fs::read_to_string(&config).map_err(|error| error.to_string())?;
-    let desired_grants = candidate_grants_for_recovery(state_dir, runtime)?;
-    let grants_sha256 = config_handoff_source(runtime)
-        .map(|_| file_sha256_hex(&state_dir.join(CONFIG_GRANTS_FILE)))
-        .transpose()?;
+    let desired_grants = if recovery.restart_previous {
+        crate::desired_grants_on_disk(state_dir)?
+    } else {
+        candidate_grants_for_recovery(state_dir, runtime)?
+    };
+    let grants_sha256 = if recovery.restart_previous {
+        state_dir
+            .join("grants.desired.json")
+            .exists()
+            .then(|| file_sha256_hex(&state_dir.join("grants.desired.json")))
+            .transpose()?
+    } else {
+        config_handoff_source(runtime)
+            .map(|_| file_sha256_hex(&state_dir.join(CONFIG_GRANTS_FILE)))
+            .transpose()?
+    };
     if grants_sha256 != recovery.grants_sha256 {
         return Err("崩溃恢复期间目标授权检查点发生变化".to_owned());
     }
     let api = crate::xray_api_address(&content).unwrap_or(crate::DEFAULT_XRAY_API_ADDRESS);
     // Preflight before killing the residual generation, including on retries after Agent exit.
     run_command_with_timeout(
-        &target.to_string_lossy(),
+        &executable.to_string_lossy(),
         &["-test", "-config", &config.to_string_lossy()],
         Duration::from_secs(30),
     )?;
+    if let Some(executable) = replacement_executable {
+        replace_executable(&executable, &target)?;
+        verify_xray_path(&target, &lost.sha256)?;
+    }
     let old = exact_upgrade_process(&runtime.old);
-    if exact_upgrade_process(lost).is_some() {
+    let lost_process = exact_upgrade_process(lost);
+    if lost_process.is_some() && !recovery.restart_unresponsive {
         return Err("原候选代重新出现，拒绝执行崩溃重启".to_owned());
+    }
+    if recovery.restart_unresponsive {
+        let processes = crate::serving_xray_processes_in(state_dir);
+        if processes
+            .iter()
+            .any(|process| Some(*process) != old && Some(*process) != lost_process)
+        {
+            return Err("控制失联恢复发现未登记的 Xray 进程，拒绝终止或覆盖".to_owned());
+        }
+        // The checkpoint, config, grants and accounting namespace are frozen before any signal.
+        // SIGKILL still works for a stopped process; termination itself is bounded to 500 ms.
+        if let Some(process) = lost_process {
+            crate::terminate_processes(&[process], crate::XRAY_TERM_GRACE, crate::XRAY_KILL_GRACE)?;
+        }
     }
     let processes = crate::serving_xray_processes_in(state_dir);
     let replacements = processes
@@ -248,15 +349,27 @@ fn restore(state_dir: &Path, recovery: &Recovery) -> Result<(), String> {
     }
     crate::wait_for_xray_runtime_health(state_dir, &content)?;
     if matches!(runtime.source, XrayUpgradeSource::BinaryRelease) {
-        // Crash restart is recorded by the preceding FailedDirty receipt. It is distinct from
-        // a drain-deadline force operation and does not change the approved release strategy.
-        write_stored_report(
-            state_dir,
-            RECOVERED_REPORT_FILE,
-            recovered_success_report(state_dir, runtime, false),
-        )?;
+        let report = if recovery.restart_previous {
+            XrayReleaseReport {
+                release_id: runtime.release_id,
+                attempt: runtime.attempt,
+                outcome: XrayReleaseOutcome::FailedRecovered,
+                performed_update: false,
+                strategy: runtime.strategy,
+                forced_retirement: false,
+                xray_enabled: true,
+                installed_sha256: Some(runtime.old.sha256.clone()),
+                running_sha256: Some(runtime.old.sha256.clone()),
+                error: Some("切流前旧代控制失联，已重启恢复发布前版本；现有连接中断".to_owned()),
+            }
+        } else {
+            recovered_success_report(state_dir, runtime, false)
+        };
+        write_stored_report(state_dir, RECOVERED_REPORT_FILE, report)?;
     }
-    commit_config_handoff_state(state_dir, runtime)?;
+    if !recovery.restart_previous {
+        commit_config_handoff_state(state_dir, runtime)?;
+    }
     cleanup_file(&state_dir.join(UPGRADE_RUNTIME_FILE));
     cleanup_file(&state_dir.join(RECOVERY_FILE));
     cleanup_handoff_backup(state_dir, runtime);

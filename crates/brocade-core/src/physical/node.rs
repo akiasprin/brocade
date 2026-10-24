@@ -414,6 +414,7 @@ pub struct XrayExternalOutboundPlan {
     pub port: u16,
     pub protocol: ExternalOutboundProtocol,
     pub security: ExternalOutboundSecurity,
+    pub target_strategy: Option<DomainStrategy>,
     pub warp_masque: Option<XrayWarpMasquePlan>,
 }
 
@@ -1719,6 +1720,7 @@ fn xray_external_outbounds(apps: &[AppIr], node_id: &str) -> Vec<XrayExternalOut
                         port,
                         protocol,
                         security: target.security.clone(),
+                        target_strategy: target.target_strategy,
                         warp_masque,
                     });
             }

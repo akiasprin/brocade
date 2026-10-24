@@ -10,7 +10,7 @@
 
 - 明确目标环境、主机、CPU 架构、域名和维护窗口。
 - 具备受控的 SSH、systemd、Nginx 和 PostgreSQL 管理权限。
-- 按 `docs/build.md` 的构建前置条件安装 Node.js、Go、Zig、Rust 工具链和目标架构。
+- 按[构建文档](../../docs/build.md)的前置条件安装 Node.js、Go、Zig、Rust 工具链和目标架构。
 - 准备与 `console.env.example` 同步的环境文件；真实秘密只存在于目标机器的受限文件或秘密管理系统。
 - 确认数据库备份位置有足够空间，并验证恢复责任人和停机边界。
 
@@ -23,6 +23,11 @@
 3. 构建目标架构的 release 产物，并记录产物 SHA-256、提交和构建环境。
 4. 审查是否涉及环境变量、数据库、HTTP API、Console/Agent 协议、内嵌 Agent 或 Xray。
 5. 确认旧二进制和数据库备份的保存位置，写下回滚判据。
+
+复制源码制作发布快照时，应给快照独立的 Git 元数据。不要将指向实际仓库的
+`GIT_DIR`、`GIT_WORK_TREE` 或 `GIT_INDEX_FILE` 传给测试进程：Git 语义测试会在临时目录
+执行 `init` 和 `commit`，继承这些变量会把操作重定向到实际仓库。构建来源追溯与测试都应
+使用快照自己的 `.git`，同时保留实际仓库的工作文件、索引和提交状态。
 
 示例构建和摘要：
 
@@ -37,7 +42,7 @@ sha256sum target/<target-triple>/release/brocade-console
 
 ```sh
 sudo install -d -o postgres -g postgres -m 0700 /var/backups/brocade
-sudo -u postgres pg_dump --format=custom \
+sudo -u postgres pg_dump --format=custom --compress=6 \
   --file=/var/backups/brocade/before-<release-id>.dump brocade
 
 sudo install -d -o root -g root -m 0755 /opt/brocade/releases
@@ -50,6 +55,99 @@ sha256sum /opt/brocade/brocade-console
 确认备份命令成功、文件非空，并把旧二进制摘要写入发布记录。涉及不可逆数据库变化时，仅有备份文件不算完成预检；必须在隔离环境验证恢复。
 
 ## 数据库兼容
+
+### 迁移链与历史基线
+
+Console 在构建时嵌入 `crates/brocade-store/migrations/` 中的全部前向迁移，并按数字版本
+执行；不限制迁移数量，也不要求逐个运行中间版本的 Console。新增数据库变更追加迁移，
+命名和不可变性要求见 `../standards/backend.md`。SQLx 继续校验已应用迁移的 checksum，
+不会自动修正不匹配的历史记录。当前未发布功能按用户 2026-10-24 的明确要求统一整合在
+`0002`，正式迁移目录仅保留 `0001`、`0002`；已执行旧 `0002` / `0003` 的环境须走下述
+一次性转换，不能直接替换二进制。
+
+下文兼容步骤描述过去持续修改 `0001_init.sql` 的历史结构转换，不是后续新增功能的默认
+发布流程。旧库只有接入经过验证的迁移基线后才能使用追加迁移；放开数量限制本身不提供
+任意历史版本自动升级、备份或失败回退。不得仅为通过启动检查而改写 checksum。
+
+### 转发逐条回执（0002）
+
+`0002_forwarding_rule_results.sql` 为 `forwarding_node_state` 增加可空 `rule_results JSONB`
+及对象形状约束，不回填或重写已有规则、节点回执和用量。`0001_init.sql` 保持原有字节。
+对于 `0001` 校验值匹配的已有库，先备份并验证恢复，再更新 Console；启动时 SQLx 在同一
+事务中应用新增字段与约束、记录版本 2，后续启动直接跳过。不需要手工兼容 SQL，也不改写
+版本 1 的 checksum。之后独立更新 Agent v41，此项不需要更新 Xray。
+
+迁移失败时本条 DDL 和版本 2 记录一起回滚；锁或语句超时须排除原因后再启动重试。迁移
+完成后，只认识版本 1 的旧 Console 会拒绝版本 2 的历史，回退构建须携带相同迁移链且兼容
+新增列。不得通过删除迁移记录、删除字段或覆盖升级后新用量来回退。
+
+### 隧道目标域名解析（整合于 0002）
+
+`0002_forwarding_rule_results.sql` 包含 `external_outbounds.target_strategy` 可空字段和取值约束。
+存量行保持 NULL，旧快照缺失字段时保持原有解析行为；不重写隧道凭据、模型修订、授权或节点配置。
+页面选项仍需保存到草稿并发布配置才影响节点。回退代码必须保留已保存字段的数据与编译语义。
+
+### 已部署旧 0002 / 0003 的合并转换
+
+按用户明确要求，原目标地址族策略 `0003` 和移除转发总额度的 `0004` 已整合进未发布 `0002`。
+`0001` 字节不变；原 SQL 仅在测试夹具和既有发布证据中留存，不再进入正式迁移链。
+150 已执行旧 `[1,2,3]`，它的历史不会因源码合并自动改变；直接启动新二进制仍会被 SQLx 拒绝。
+
+`scripts/prepare-consolidated-0002-compat.py` 只接受精确核验的历史：`0001` 为
+`794044a4…0947`、旧 `0002` 为 `375a1d3c…ab71a`，以及可选旧 `0003` 为
+`1ef92edf…4c13`。目标 `0002` 为 `54300599…552f1`。不接受任意旧库或其它 checksum。
+
+先保存数据库、原迁移回执和二进制，在隔离恢复库演练。生成 SQL 后，以实际应用 owner 执行：
+
+```sh
+python3 scripts/prepare-consolidated-0002-compat.py \
+  --migration crates/brocade-store/migrations/0002_forwarding_rule_results.sql \
+  --output <release-dir>/consolidate-0002.sql
+psql -X -v ON_ERROR_STOP=1 -v app_role=<应用角色> -d <恢复库> \
+  -f <release-dir>/consolidate-0002.sql > <release-dir>/consolidate-0002.log
+```
+
+仅安装上述旧 `[1,2]` 的库，生成时加 `--without-target-strategy`；默认接受 `[1,2,3]`。
+SQL 从完整目标 `0002` 提取尚未执行的 DDL，验证接入配额和预算原样保留、转发总额度退役完成，
+再在同一事务内将版本 2 checksum 对齐到目标并移除版本 3 回执；原始完整回执输出到转换日志。
+版本 1 与版本 2 的其它元数据保持不变。5 秒锁等待和 120 秒语句超时，任何失败整笔回滚。
+不允许单独删除版本 3 回执或只修改 checksum。
+
+上线时先停止 Console 写入，执行与演练完全相同的文件并保存输出，再以候选运行
+`database-check`，确认已安装 `[1,2]`、无待执行迁移，随后切换已验证二进制。此次源码合并本身
+不执行生产转换。旧总额度对象已退役，原二进制不能直接作为回退包；须准备保留当前结构和行为的
+兼容回退构建。不得恢复整库覆盖新写入的计费数据。
+
+### 未发布版本 0002 的用户账期兼容
+
+本次用户明确要求未发布版本仍合并在 `0002`，并手工兼容已经运行过旧版 `0002` 的环境。
+这是针对已核验字节的一次性转换；后续迁移继续遵守已发布文件不可变规则。
+`scripts/prepare-user-service-compat.py` 只接受旧版 SHA-384 `201b4ff0…acd0643` 的完整
+前缀和目标 `54300599…552f1`，从目标文件提取早期前缀之后的全部 DDL（包含账期、接入超额处理、
+来源准入、目标地址族及转发总额度退役），避免另存一份结构定义。此路径只适用于该早期前缀，
+不是上述 `375a1d3c…ab71a` 已部署库的转换方式。
+
+1. 保存原迁移记录、二进制、配置与数据库备份，在隔离恢复库验证恢复。
+2. 生成 SQL，先对恢复库以实际应用 owner 执行，核对与全新完整 `0002` 的结构一致、用户原字段、
+   账本、计数头及迁移记录元数据不变，再用候选二进制运行 `database-check`。
+3. 准备兼容完整目标 `0002` 结构和当前额度行为的回退包，验证它能通过恢复库检查及接口验证。
+   依赖已退役转发总额度对象的旧代码不能直接使用；回退代码也须保留已启用的服务有效期与目标策略约束。
+4. 核验生成 SQL 与演练摘要一致后，在目标库执行同一文件。事务以有界锁等待锁定 `users`，
+   拒绝未知历史、部分执行和重复执行；验证新增结构、owner、默认值及旧用户原字段后，才在同一
+   事务内对齐版本 2 的 checksum。版本 1、版本 2 的其它元数据与原始备份均保留。
+5. 用候选再次执行 `database-check`，切换 Console 并验证接口、用户页和正常记账。失败时保留
+   现场，未知执行结果先检查事务是否提交，不得盲目重放或只改 checksum。
+
+```sh
+python3 scripts/prepare-user-service-compat.py \
+  --migration crates/brocade-store/migrations/0002_forwarding_rule_results.sql \
+  --output <release-dir>/user-service-compat.sql
+psql -X -v ON_ERROR_STOP=1 -v app_role=<应用角色> -d <恢复库或目标库> \
+  -f <release-dir>/user-service-compat.sql
+```
+
+该路径不创建 `0003`，不放宽 Console 的迁移校验，不删除历史用量。旧的原字节二进制在
+checksum 对齐后不能直接启动，应使用已验证的回退包；不得整库恢复覆盖兼容之后的新计费数据。
 
 ### 校验范围精简
 
@@ -390,7 +488,7 @@ CPU steal 告警仍消费原始上报，历史聚合不触发或重放告警。P
 
 ### Ping 序列字典（无损时序存储）
 
-只修改 `0001_init.sql`，不增加 `0002`。新结构为
+此项历史变更写入当时的 `0001_init.sql`。结构为
 `node_ping_probe_series(id,node_id,target,family)` 与以 `(series_id,probed_at)` 为主键的
 `node_ping_probe_samples`；所有时间点、微秒延迟、NULL、丢包/未执行原因、双栈分离和
 7 天保留期不变，HTTP/Agent 协议不变。Load、用量结构和保留策略不随本项改变。
@@ -436,7 +534,7 @@ Load 的 20,000 行无损 TOAST 目标实验（2,040 / 1,024 / 512 字节）没�
 
 ### Agent / Xray 统一发布账本兼容
 
-本次仍只维护 `0001_init.sql`。停止旧 Console 后才可转换旧 Xray 三表为
+此项历史变更写入当时的 `0001_init.sql`。停止旧 Console 后才可转换旧 Xray 三表为
 `binary_releases`、`binary_release_targets`、`binary_release_attempts` 和
 `binary_release_events`。转换前必须没有活动 Xray 单；保留完整备份，并在隔离库
 恢复实际生产备份演练，不只在空库建表。
@@ -499,8 +597,8 @@ SHA-384；回滚旧 Console 时仍须恢复旧 checksum。
 
 ### 在线来源协议字段兼容
 
-协议感知版本在 `user_online_sources` 增加可空 `protocols JSONB`；只维护
-`0001_init.sql`，不新建 `0002`。已有环境部署前先完成备份、记录原迁移 checksum，
+协议感知版本在 `user_online_sources` 增加可空 `protocols JSONB`，写入当时的
+`0001_init.sql`。已有环境部署前先完成备份、记录原迁移 checksum，
 在隔离库验证以下兼容 SQL，然后在受控窗口应用（新安装不需要）：
 
 ```sql
@@ -800,6 +898,20 @@ psql -X -v ON_ERROR_STOP=1 -d brocade -v app_role=brocade \
 本次 `0001` 的其它差异后，才更新 version 1 的 SQLx SHA-384。旧 Console 不读取这张表，
 回滚时可以保留手动选择记录，但必须恢复与旧二进制匹配的 migration checksum。
 
+### 移除用户转发总额度（整合于 0002）
+
+该版本取消转发总额度控件与写入接口，只保留用户 × 机器的独立额度。完整 `0002` 的退役段将旧总额度
+配置改名归档为 `retired_forwarding_traffic_policies`，保留政策事件与全部转发用量；归档不再
+参与执行。统一额度视图仅保留原接入分支，接入额度及其预算不调整。转发总额度预算和旧来源
+分配解除；旧 Agent 从完整快照和兼容预算响应收敛，不需要清空节点状态。
+
+迁移在一个事务内恢复受影响机器额度状态、推进期望代次，并为退役动作生成新的审计工单、
+取代旧待执行意图。升级后核对机器额度、手动规则开关、用量与工单回执；线上未配置过
+转发总额度时，不会生成这些补偿工单。迁移有 5 秒锁等待和 120 秒语句上限，失败回滚事务。
+
+先完成备份和隔离升级验证，再统一替换 Console。旧总额度执行表和函数已退役，不能仅替换
+为依赖它们的旧 Console 回滚；优先前向修复，需要恢复数据库时另行明确授权及数据损失边界。
+
 ## 上传与原子替换
 
 生产 Console 应由 `brocade-console.socket` 持有监听端口，service 的 `[Unit]` 同时包含
@@ -808,11 +920,18 @@ psql -X -v ON_ERROR_STOP=1 -d brocade -v app_role=brocade \
 Agent 入口时应再传一个与 `BROCADE_AGENT_BIND` 一致的 fd。二进制会拒绝数量、地址、类型
 或监听状态不匹配的描述符，不会静默回退到另一个端口。
 
-发布期间只重启 `brocade-console.service`，不要停止、重启或 disable socket。这样旧进程
+纯二进制替换期间只重启 `brocade-console.service`，不要停止、重启或 disable socket。这样旧进程
 退出后到新进程完成数据库初始化期间，新 TCP 连接留在内核 backlog；它不能延长已经建立
 连接的应用层超时，因此仍须保留 Agent 的有界 Load 补报作为较长维护窗口的第二层保护。
 首次从旧的直接绑定 service 迁移到 socket activation 时，必须先停旧服务释放端口，再
 启动 socket 和 service；记录这一次不可避免的短维护窗口并验证后续 restart 不再关闭端口。
+
+数据库停写、耗时备份等长维护须单独验证入口和自动激活的处理。不要用让 service 反复跳过
+启动的 `ConditionPathExists` 围栏来阻止 socket 自动激活：待处理连接可使 socket 触发
+`trigger-limit-hit`，关闭监听并导致公网 502。若发生此情况，先按迁移历史确定应运行的
+Console 字节，再清理本次临时围栏、重置相关 unit 的失败状态，启动 socket 和 service，
+核对进程摘要及公网健康。记录监听曾关闭和实际错误采样，不能把恢复后的 active 状态当作
+整个维护窗口内监听连续的证据。
 
 先上传到临时路径并核对摘要，之后才在目标机安装。上传过程不应覆盖正在运行的二进制。
 

@@ -24,6 +24,9 @@ message AddInboundRequest {
 
 message AddInboundResponse {}
 
+message ForwardingTargetPolicyRequest {}
+message ForwardingTargetPolicyResponse { uint32 version = 1; }
+
 message RemoveInboundRequest {
   string tag = 1;
 }
@@ -84,6 +87,8 @@ message ListOutboundsResponse {
 }
 
 service HandlerService {
+  // Query the serving process, never the installed executable during a handoff.
+  rpc GetForwardingTargetPolicy(ForwardingTargetPolicyRequest) returns (ForwardingTargetPolicyResponse) {}
   rpc AddInbound(AddInboundRequest) returns (AddInboundResponse) {}
 
   rpc RemoveInbound(RemoveInboundRequest) returns (RemoveInboundResponse) {}

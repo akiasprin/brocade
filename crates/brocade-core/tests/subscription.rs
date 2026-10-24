@@ -239,6 +239,7 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
     ]);
     doc.users.push(user("platform.acme", "alice", "uuid-alice"));
     let socks = |id: &str, name: &str, address: &str, credential: &str| ExternalOutbound {
+        target_strategy: None,
         id: id.to_owned(),
         tenant: "platform.acme".to_owned(),
         name: name.to_owned(),
@@ -265,6 +266,7 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
             "unused-secret",
         ),
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-3333-3333".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "Shadowsocks 前置".to_owned(),
@@ -278,6 +280,7 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-4444-4444".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "WebSocket 前置".to_owned(),
@@ -294,6 +297,7 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
                 }),
             },
             security: ExternalOutboundSecurity::Tls {
+                allow_insecure: false,
                 alpn: vec!["h2".to_owned(), "http/1.1".to_owned()],
                 ech_config_list: Some("ech-config-list".to_owned()),
                 pinned_peer_cert_sha256: Some("11".repeat(32)),
@@ -304,6 +308,7 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "warp-8f3a-2d71".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "Cloudflare WARP".to_owned(),
@@ -393,6 +398,19 @@ fn clash_publishes_only_explicit_manual_front_tunnels_and_keeps_warp_out() {
     assert!(!clash.contains("unused-secret"), "{clash}");
     assert!(!clash.contains("engage.cloudflareclient.com"), "{clash}");
     assert!(!clash.contains("Cloudflare WARP"), "{clash}");
+    assert!(!clash.contains("skip-cert-verify"), "{clash}");
+    let mut insecure_artifact = artifact;
+    let tls_proxy = insecure_artifact
+        .external_proxies
+        .iter_mut()
+        .find(|proxy| proxy.server == "ws.proxy.example")
+        .unwrap();
+    let ExternalOutboundSecurity::Tls { allow_insecure, .. } = &mut tls_proxy.security else {
+        panic!("the explicit front tunnel must retain its TLS settings");
+    };
+    *allow_insecure = true;
+    let insecure_clash = yaml::clash_subscription(&insecure_artifact);
+    assert_eq!(insecure_clash.matches("skip-cert-verify: true").count(), 1);
 }
 
 #[test]
@@ -988,10 +1006,8 @@ fn a_tls_ingress_names_its_certificate_in_both_subscription_formats() {
     assert!(!clash_text.contains("public-key"), "{clash_text}");
 }
 
-/// A TLS entry must never tell a client to skip verification. xray removed `allowInsecure` in
-/// v26.2.6 and rejects the whole config from v26.6.1 on, so the parameter does not loosen
-/// verification any more — it produces a client that refuses to start. The setting now belongs to
-/// the Hysteria 2 wire alone, where clients whose core is not xray still honour it.
+/// Default ingress subscriptions keep certificate verification enabled. An explicit external
+/// tunnel opt-in is separate from the fleet's managed ingress trust policy.
 #[test]
 fn a_tls_entry_never_tells_the_client_to_skip_verification() {
     let (uri_text, clash_text) = render(|face| {
@@ -1833,13 +1849,9 @@ fn a_dual_wire_subscription_can_be_narrowed_to_either_protocol() {
     );
 }
 
-/// No subscription this fleet hands out may tell a client to skip certificate verification, on
-/// either wire. xray removed `allowInsecure` in v26.2.6 and rejects the whole config from v26.6.1
-/// on, so the fleet's own core cannot load a configuration carrying the equivalent field; a
-/// subscription offering it would describe a client this deployment cannot run. A certificate
-/// that does not verify is a fault to fix on the machine, and the setting no longer exists.
+/// Default ingress subscriptions never opt out of certificate verification on either wire.
 #[test]
-fn no_subscription_ever_tells_a_client_to_skip_verification() {
+fn default_ingress_subscriptions_keep_certificate_verification() {
     let (uri_text, clash_text) = render(|face| {
         let vless = face.wires.vless().unwrap().clone();
         face.wires = IngressWires::Both {

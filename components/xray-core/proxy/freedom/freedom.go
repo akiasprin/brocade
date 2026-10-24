@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -106,7 +107,12 @@ func isValidAddress(addr *net.IPOrDomain) bool {
 	return a != net.AnyIP && a != net.AnyIPv6
 }
 
-func isBlockedAddress(matcher geodata.IPMatcher, addr net.Address) bool {
+type ipMatcher interface{ Match(net.IP) bool }
+type ipMatchFunc func(net.IP) bool
+
+func (f ipMatchFunc) Match(ip net.IP) bool { return f(ip) }
+
+func isBlockedAddress(matcher ipMatcher, addr net.Address) bool {
 	return matcher != nil && addr != nil && addr.Family().IsIP() && matcher.Match(addr.IP())
 }
 
@@ -120,7 +126,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	ob.Name = "freedom"
 	ob.CanSpliceCopy.Store(session.SpliceCopyDirect)
 	inbound := session.InboundFromContext(ctx)
-	blockedIPMatcher := h.blockedIPMatcher
+	var blockedIPMatcher ipMatcher
+	if h.blockedIPMatcher != nil {
+		blockedIPMatcher = h.blockedIPMatcher
+	}
+	if inbound != nil && strings.HasPrefix(inbound.Tag, "fwd:") {
+		if inbound.ForwardingTargetIPMatcher == nil {
+			return errors.New("user forwarding has no target address policy")
+		}
+		forwardingMatcher := inbound.ForwardingTargetIPMatcher
+		outboundMatcher := h.blockedIPMatcher
+		blockedIPMatcher = ipMatchFunc(func(ip net.IP) bool {
+			return forwardingMatcher.Match(ip) || (outboundMatcher != nil && outboundMatcher.Match(ip))
+		})
+	}
 	if blockedIPMatcher != nil {
 		ctx = internet.ContextWithIPBlocker(ctx, blockedIPMatcher.Match)
 	}
@@ -317,7 +336,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	return nil
 }
 
-func NewPacketReader(conn net.Conn, UDPOverride net.Destination, DialDest net.Destination, blockedIPMatcher geodata.IPMatcher) buf.Reader {
+func NewPacketReader(conn net.Conn, UDPOverride net.Destination, DialDest net.Destination, blockedIPMatcher ipMatcher) buf.Reader {
 	iConn := conn
 	statConn, ok := iConn.(*stat.CounterConnection)
 	if ok {
@@ -348,7 +367,7 @@ func NewPacketReader(conn net.Conn, UDPOverride net.Destination, DialDest net.De
 type PacketReader struct {
 	*internet.PacketConnWrapper
 	stats.Counter
-	BlockedIPMatcher  geodata.IPMatcher
+	BlockedIPMatcher  ipMatcher
 	IsOverridden      bool
 	InitUnchangedAddr net.Address
 	InitChangedAddr   net.Address
@@ -390,7 +409,7 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 }
 
 // DialDest means the dial target used in the dialer when creating conn
-func NewPacketWriter(conn net.Conn, h *Handler, UDPOverride net.Destination, DialDest net.Destination, blockedIPMatcher geodata.IPMatcher) buf.Writer {
+func NewPacketWriter(conn net.Conn, h *Handler, UDPOverride net.Destination, DialDest net.Destination, blockedIPMatcher ipMatcher) buf.Writer {
 	iConn := conn
 	statConn, ok := iConn.(*stat.CounterConnection)
 	if ok {
@@ -425,7 +444,7 @@ type PacketWriter struct {
 	*internet.PacketConnWrapper
 	stats.Counter
 	*Handler
-	BlockedIPMatcher geodata.IPMatcher
+	BlockedIPMatcher ipMatcher
 	UDPOverride      net.Destination
 
 	// Dest of udp packets might be a domain, we will resolve them to IP

@@ -6,8 +6,8 @@
 //! and the drift is not symmetric: a control plane promising "nothing will drop" while the
 //! agent restarts is a promise broken on live traffic.
 //!
-//! Every rule here was measured against xray 26.4.25 rather than read off documentation —
-//! several of them contradict what the command help implies.
+//! Routing changes use upstream AddRule with shouldAppend=false and the complete routing
+//! configuration. The Agent checks the running kernel's atomic reload capability first.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,8 +20,7 @@ const ENDPOINT_RULE_PREFIX: &str = "brocade:endpoint-swap:";
 pub enum HotSwapOperation {
     AddOutbounds(Vec<Value>),
     RemoveOutbounds(Vec<String>),
-    AddRules(Vec<Value>),
-    RemoveRules(Vec<String>),
+    ReloadRouting(Value),
 }
 
 pub struct EndpointSwap {
@@ -43,10 +42,8 @@ pub struct HotSwap {
     /// Tags of outbounds that no longer appear. They come out last, once nothing refers
     /// to them any more.
     pub remove_outbounds: Vec<String>,
-    /// The complete new table, in order.
-    pub add_rules: Vec<Value>,
-    /// The complete old table, by name.
-    pub remove_rule_tags: Vec<String>,
+    /// Complete routing configuration, including balancers; None leaves it unchanged.
+    pub reload_routing: Option<Value>,
     /// Temporary routing protects the same-tag replacement's remove/add interval.
     pub endpoint_swap: Option<EndpointSwap>,
 }
@@ -61,22 +58,23 @@ impl HotSwap {
             operations.push(AddOutbounds(self.add_outbounds.clone()));
         }
         if let Some(swap) = &self.endpoint_swap {
+            let routing = self
+                .reload_routing
+                .as_ref()
+                .expect("endpoint swaps always carry the complete routing configuration");
+            let mut bridge = routing.clone();
+            bridge["rules"] = Value::Array(swap.bridge_rules.clone());
             operations.extend([
                 AddOutbounds(swap.bridge_outbounds.clone()),
-                AddRules(swap.bridge_rules.clone()),
-                RemoveRules(self.remove_rule_tags.clone()),
+                ReloadRouting(bridge),
                 RemoveOutbounds(tags_of(&swap.outbounds, "tag")),
                 AddOutbounds(swap.outbounds.clone()),
-                AddRules(self.add_rules.clone()),
-                RemoveRules(tags_of(&swap.bridge_rules, "ruleTag")),
+                ReloadRouting(routing.clone()),
                 RemoveOutbounds(tags_of(&swap.bridge_outbounds, "tag")),
             ]);
         } else {
-            if !self.add_rules.is_empty() {
-                operations.push(AddRules(self.add_rules.clone()));
-            }
-            if !self.remove_rule_tags.is_empty() {
-                operations.push(RemoveRules(self.remove_rule_tags.clone()));
+            if let Some(routing) = &self.reload_routing {
+                operations.push(ReloadRouting(routing.clone()));
             }
         }
         if !self.remove_outbounds.is_empty() {
@@ -92,7 +90,7 @@ fn tags_of(entries: &[Value], key: &str) -> Vec<String> {
         .map(|entry| {
             entry[key]
                 .as_str()
-                .expect("hot_swap validates every outbound and rule tag")
+                .expect("hot_swap validates every outbound tag")
                 .to_owned()
         })
         .collect()
@@ -109,9 +107,9 @@ fn tags_of(entries: &[Value], key: &str) -> Vec<String> {
 ///   a second one under the same tag), which closes the listener and drops the users that
 ///   were added to it over gRPC. That is a real interruption and belongs to its own change,
 ///   not smuggled in behind a routing edit.
-/// - **Any balancer difference.** A balancer cannot be modified, cannot be removed, and is
-///   never reclaimed once created; only entirely new tags can be added. Selector changes
-///   therefore have no runtime expression at all.
+/// - **Any balancer difference.** Rule edits reload the complete routing configuration
+///   against the existing observatory. Balancer changes remain excluded so selectors and
+///   the startup probe configuration cannot diverge.
 /// - **Same-tag changes other than ordinary VLESS endpoints.** Endpoint replacements use
 ///   a temporary outbound and routing table. Default, reverse and indirectly referenced
 ///   outbounds cannot be protected by that routing-table switch and remain excluded.
@@ -210,26 +208,15 @@ pub fn hot_swap(previous: &str, desired: &str) -> Option<HotSwap> {
         Some(value.get("routing")?.get("rules")?.as_array()?.clone())
     };
     let (before_rules, after_rules) = (rules(before)?, rules(after)?);
-    let tags = |rules: &[Value]| -> Option<Vec<String>> {
-        rules
-            .iter()
-            .map(|rule| {
-                Some(
-                    rule.get("ruleTag")?
-                        .as_str()
-                        .filter(|tag| !tag.is_empty())?
-                        .to_owned(),
-                )
-            })
-            .collect()
+    let valid_tags = |rules: &[Value]| {
+        let mut tags = BTreeSet::new();
+        rules.iter().all(|rule| match rule.get("ruleTag") {
+            Some(Value::String(tag)) if !tag.is_empty() => tags.insert(tag),
+            None | Some(Value::Null) | Some(Value::String(_)) => true,
+            _ => false,
+        })
     };
-    // A table with an unnamed rule in it cannot be swapped: `rmrules` works by name, so the
-    // unnamed one would survive the removal and sit in front of the new table forever.
-    let remove_rule_tags = tags(&before_rules)?;
-    let new_tags = tags(&after_rules)?;
-    if remove_rule_tags.iter().collect::<BTreeSet<_>>().len() != remove_rule_tags.len()
-        || new_tags.iter().collect::<BTreeSet<_>>().len() != new_tags.len()
-    {
+    if !valid_tags(&after_rules) {
         return None;
     }
 
@@ -245,25 +232,10 @@ pub fn hot_swap(previous: &str, desired: &str) -> Option<HotSwap> {
         )?)
     };
 
-    // A table that did not change is not reinstalled. Beyond saving two calls this is what
-    // keeps the check below meaningful: an unchanged table necessarily reuses every name,
-    // which is indistinguishable from a genuine collision by name alone.
-    let (add_rules, remove_rule_tags) = if endpoint_swap.is_some() {
-        // The bridge table has disjoint names and removes the old table before the final
-        // one returns, so unchanged rule tags are safe in this path.
-        (after_rules, remove_rule_tags)
-    } else if before_rules == after_rules {
-        (Vec::new(), Vec::new())
+    let reload_routing = if before_rules == after_rules && endpoint_swap.is_none() {
+        None
     } else {
-        // Both tables are installed at once during the swap, and xray rejects a duplicate
-        // name for the whole batch — atomically, so the machine would stay on its old
-        // routing while the call reported failure. The compiler makes the generations
-        // disjoint on purpose (`brocade_core::artifacts::xray`'s rule naming); this is the
-        // agent declining to find out the hard way if that ever stops being true.
-        if new_tags.iter().any(|tag| remove_rule_tags.contains(tag)) {
-            return None;
-        }
-        (after_rules, remove_rule_tags)
+        Some(after.get("routing")?.clone())
     };
 
     Some(HotSwap {
@@ -277,8 +249,7 @@ pub fn hot_swap(previous: &str, desired: &str) -> Option<HotSwap> {
             .filter(|tag| !after_outbounds.contains_key(*tag))
             .cloned()
             .collect(),
-        add_rules,
-        remove_rule_tags,
+        reload_routing,
         endpoint_swap,
     })
 }
@@ -316,8 +287,8 @@ fn endpoint_swap_plan(
     before_rules: &[Value],
     after_rules: &[Value],
 ) -> Option<EndpointSwap> {
-    // No empty table: Xray's adrules CLI needs a nonempty payload and both generations
-    // must provide a route while the other table is removed.
+    // The bridge protects explicit routes. Implicit default-outbound selection cannot
+    // be redirected through a temporary endpoint alias.
     if before_rules.is_empty() || after_rules.is_empty() {
         return None;
     }
@@ -504,14 +475,13 @@ mod tests {
                 RemoveOutbounds(tags) => {
                     outbounds.retain(|out| !tags.iter().any(|tag| out["tag"] == *tag))
                 }
-                AddRules(added) => {
-                    for added in &added {
-                        assert!(rules.iter().all(|old| old["ruleTag"] != added["ruleTag"]));
-                    }
-                    rules.extend(added);
-                }
-                RemoveRules(tags) => {
-                    rules.retain(|rule| !tags.iter().any(|tag| rule["ruleTag"] == *tag))
+                ReloadRouting(replacement) => {
+                    assert_eq!(replacement["balancers"], after["routing"]["balancers"]);
+                    assert_eq!(
+                        replacement["domainStrategy"],
+                        after["routing"]["domainStrategy"]
+                    );
+                    rules = replacement["rules"].as_array().unwrap().clone();
                 }
             }
             assert!(!rules.is_empty());
@@ -542,10 +512,7 @@ mod tests {
         let (before, mut after) = endpoint_configs();
         after["routing"]["rules"][1]["domain"] = json!(["full:example.test"]);
         let swap = hot_swap(&before.to_string(), &after.to_string()).unwrap();
-        assert_eq!(
-            &swap.add_rules,
-            after["routing"]["rules"].as_array().unwrap()
-        );
+        assert_eq!(swap.reload_routing.as_ref().unwrap(), &after["routing"]);
         assert_eq!(
             swap.endpoint_swap.unwrap().bridge_rules[1]["domain"],
             json!(["full:example.test"])
@@ -562,7 +529,7 @@ mod tests {
         after["routing"]["rules"][1]["ruleTag"] = after["routing"]["rules"][0]["ruleTag"].clone();
         assert!(hot_swap(&before.to_string(), &after.to_string()).is_none());
         after["routing"]["rules"][1]["ruleTag"] = json!("");
-        assert!(hot_swap(&before.to_string(), &after.to_string()).is_none());
+        assert!(hot_swap(&before.to_string(), &after.to_string()).is_some());
     }
 
     #[test]
@@ -571,7 +538,7 @@ mod tests {
         after["routing"]["rules"] = json!([]);
         let swap = hot_swap(&base(), &after.to_string()).unwrap();
         assert!(
-            matches!(swap.operations().as_slice(), [super::HotSwapOperation::RemoveRules(tags)] if tags.len() == 2)
+            matches!(swap.operations().as_slice(), [super::HotSwapOperation::ReloadRouting(routing)] if routing["rules"].as_array().unwrap().is_empty())
         );
     }
 
@@ -645,7 +612,7 @@ mod tests {
     #[test]
     fn an_identical_config_asks_for_nothing() {
         let swap = hot_swap(&base(), &base()).expect("同一份配置当然可以热切");
-        assert!(swap.add_rules.is_empty() && swap.remove_rule_tags.is_empty());
+        assert!(swap.reload_routing.is_none());
         assert!(swap.add_outbounds.is_empty() && swap.remove_outbounds.is_empty());
     }
 
@@ -658,12 +625,56 @@ mod tests {
             &["out:a"],
         );
         let swap = hot_swap(&base(), &after).expect("只动规则表，应当能热切");
-        assert_eq!(swap.remove_rule_tags, vec!["r:g1:000", "r:g1:001"]);
-        assert_eq!(swap.add_rules.len(), 2);
-        // The old table goes out by name and the new one goes in whole — a rule that
-        // happens to be unchanged is still reinstalled, because its position in the new
-        // table is what decides routing and position cannot be patched.
+        assert_eq!(
+            swap.reload_routing.as_ref().unwrap()["rules"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(matches!(
+            swap.operations().as_slice(),
+            [super::HotSwapOperation::ReloadRouting(_)]
+        ));
         assert!(swap.add_outbounds.is_empty() && swap.remove_outbounds.is_empty());
+    }
+
+    #[test]
+    fn rule_updates_preserve_denials_at_every_api_boundary() {
+        let mut before: Value = serde_json::from_str(&base()).unwrap();
+        before["routing"]["rules"] = json!([
+            {"type":"field","ruleTag":"deny-old","inboundTag":["denied"],"outboundTag":"out:a"},
+            {"type":"field","ruleTag":"fallback-old","outboundTag":"out:egress"}
+        ]);
+        let mut after = before.clone();
+        after["routing"]["rules"][0]["ruleTag"] = "deny-new".into();
+        after["routing"]["rules"][1]["ruleTag"] = "fallback-new".into();
+        let swap = hot_swap(&before.to_string(), &after.to_string()).unwrap();
+        let mut rules = before["routing"]["rules"].as_array().unwrap().clone();
+        for operation in swap.operations() {
+            match operation {
+                super::HotSwapOperation::ReloadRouting(replacement) => {
+                    rules = replacement["rules"].as_array().unwrap().clone()
+                }
+                _ => panic!("rule-only change unexpectedly changes handlers"),
+            }
+            let decision = rules
+                .iter()
+                .find(|rule| {
+                    rule.get("inboundTag").is_none()
+                        || rule["inboundTag"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|tag| tag == "denied")
+                })
+                .unwrap();
+            assert_eq!(
+                decision["outboundTag"], "out:a",
+                "deny fell through to fallback"
+            );
+        }
+        assert_eq!(&rules, after["routing"]["rules"].as_array().unwrap());
     }
 
     #[test]
@@ -756,7 +767,7 @@ mod tests {
         let swap = hot_swap(&base(), &after).expect("规则没动，只多了一条出站");
         assert_eq!(swap.add_outbounds.len(), 1);
         assert_eq!(swap.add_outbounds[0]["tag"], "out:block");
-        assert!(swap.add_rules.is_empty() && swap.remove_rule_tags.is_empty());
+        assert!(swap.reload_routing.is_none());
     }
 
     /// Unmatched traffic goes to whichever outbound is first, and that role is fixed when
@@ -869,17 +880,15 @@ mod tests {
         assert!(hot_swap(&after, &base()).is_none(), "消失的块被漏掉了");
     }
 
-    /// `rmrules` works by name. One unnamed rule would survive the removal and sit ahead
-    /// of the whole new table, deciding routing forever.
     #[test]
-    fn an_unnamed_rule_anywhere_forces_a_restart() {
+    fn unnamed_rules_are_replaced_with_the_complete_table() {
         let mut before: Value = serde_json::from_str(&base()).unwrap();
         before["routing"]["rules"][1]
             .as_object_mut()
             .unwrap()
             .remove("ruleTag");
         let before = serde_json::to_string(&before).unwrap();
-        assert!(hot_swap(&before, &base()).is_none(), "旧表里有无名规则");
+        assert!(hot_swap(&before, &base()).is_some());
 
         let mut after: Value = serde_json::from_str(&base()).unwrap();
         after["routing"]["rules"][0]
@@ -887,14 +896,13 @@ mod tests {
             .unwrap()
             .remove("ruleTag");
         let after = serde_json::to_string(&after).unwrap();
-        assert!(hot_swap(&base(), &after).is_none(), "新表里有无名规则");
+        let swap = hot_swap(&base(), &after).unwrap();
+        let expected: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(swap.reload_routing.as_ref().unwrap(), &expected["routing"]);
     }
 
-    /// Both tables are installed at once during the swap and xray rejects a duplicate
-    /// name for the entire batch, leaving the machine on its old routing. The compiler
-    /// keeps the generations disjoint; this is the agent not betting on it.
     #[test]
-    fn a_name_shared_between_the_two_tables_forces_a_restart() {
+    fn rule_names_can_be_reused_across_atomic_replacements() {
         let after = config(
             443,
             &["out:egress", "out:a"],
@@ -902,7 +910,7 @@ mod tests {
             &[("r:g1:000", "out:a"), ("r:g1:001", "out:egress")],
             &["out:a"],
         );
-        assert!(hot_swap(&base(), &after).is_none());
+        assert!(hot_swap(&base(), &after).is_some());
     }
 
     #[test]

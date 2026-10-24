@@ -220,6 +220,7 @@ fn chained_probe_crosses_two_real_xray_servers_and_obeys_member_routing() {
     );
 
     let external_member = ExternalOutbound {
+        target_strategy: None,
         id: "custom-1111-1111".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "External member".to_owned(),

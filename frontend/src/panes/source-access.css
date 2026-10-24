@@ -1,0 +1,58 @@
+.source-access-body {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.source-access-panel > summary .sp {
+  flex: 1;
+}
+.source-access-body p {
+  margin: 0;
+}
+.source-access-body .note {
+  line-height: 1.55;
+}
+.source-access-status {
+  font-size: 12px;
+}
+.source-access-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  border-block: 1px solid var(--line-soft);
+}
+.source-access-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+}
+.source-access-list li + li {
+  border-top: 1px solid var(--line-soft);
+}
+.source-access-list code,
+.source-access-dialog code {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.source-access-add {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+.source-access-add label {
+  display: grid;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+.source-access-add input {
+  width: 100%;
+  min-width: 0;
+}
+.source-access-add > button {
+  flex-shrink: 0;
+}

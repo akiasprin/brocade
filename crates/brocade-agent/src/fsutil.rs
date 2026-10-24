@@ -1,13 +1,41 @@
 //! Small durable-file primitives shared by artifacts and retry spools.
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Read a bounded regular checkpoint without blocking on a FIFO or following a leaf symlink.
+pub(crate) fn read_bounded(path: &Path, maximum: usize) -> Result<Option<Vec<u8>>, String> {
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular checkpoint", path.display()));
+    }
+    if metadata.len() > maximum as u64 {
+        return Err(format!("{} exceeds {maximum} bytes", path.display()));
+    }
+    let mut bytes = Vec::new();
+    file.take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if bytes.len() > maximum {
+        return Err(format!("{} exceeds {maximum} bytes", path.display()));
+    }
+    Ok(Some(bytes))
+}
 
 /// Replace a private file without ever exposing a truncated or partially-written
 /// destination.  The temporary file lives beside the destination, making rename
@@ -92,7 +120,63 @@ pub(crate) fn atomic_write_with_mode(
 mod tests {
     use std::{env, fs, os::unix::fs::PermissionsExt};
 
-    use super::{atomic_write_private, atomic_write_with_mode};
+    use super::{atomic_write_private, atomic_write_with_mode, read_bounded};
+
+    #[test]
+    fn bounded_checkpoint_read_rejects_nonregular_files_and_symlinks() {
+        let dir = env::temp_dir().join(format!("brocade-bounded-files-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        assert!(read_bounded(&path, 4).unwrap().is_none());
+        atomic_write_private(&path, b"test").unwrap();
+        assert_eq!(read_bounded(&path, 4).unwrap().unwrap(), b"test");
+        assert!(read_bounded(&path, 3).unwrap_err().contains("exceeds"));
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_bounded(&link, 4).is_err());
+        let fifo = dir.join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: name is a NUL-terminated temporary pathname and the mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_bounded(&fifo, 4)
+            .unwrap_err()
+            .contains("not a regular"));
+        assert_eq!(fs::read(&path).unwrap(), b"test");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bounded_checkpoint_read_rejects_sparse_files_under_memory_limit() {
+        if env::var_os("BROCADE_BOUNDED_READ_CHILD").is_none() {
+            let result = std::process::Command::new(env::current_exe().unwrap())
+                .args(["--exact", "fsutil::tests::bounded_checkpoint_read_rejects_sparse_files_under_memory_limit", "--test-threads=1"])
+                .env("BROCADE_BOUNDED_READ_CHILD", "1")
+                .output().unwrap();
+            assert!(
+                result.status.success(),
+                "bounded-read child failed: {}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+            return;
+        }
+        let limits = libc::rlimit {
+            rlim_cur: 512 * 1024 * 1024,
+            rlim_max: 512 * 1024 * 1024,
+        };
+        // SAFETY: only this isolated test subprocess receives the address-space limit.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &limits) }, 0);
+        let dir = env::temp_dir().join(format!("brocade-bounded-sparse-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(2 * 1024 * 1024 * 1024)
+            .unwrap();
+        assert!(read_bounded(&path, 128 * 1024)
+            .unwrap_err()
+            .contains("exceeds 131072"));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn replacement_is_private_and_leaves_no_temporary_file() {

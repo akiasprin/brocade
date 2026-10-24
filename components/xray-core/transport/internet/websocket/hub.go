@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"github.com/xtls/xray-core/common/sourceaccess"
 	"io"
 	"net/http"
 	"strings"
@@ -77,7 +78,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		forwardedAddrs = http_proto.ParseXForwardedFor(request.Header)
 	}
 	remoteAddr := conn.RemoteAddr()
-	if len(forwardedAddrs) > 0 && forwardedAddrs[0].Family().IsIP() {
+	if !sourceaccess.Configured() && len(forwardedAddrs) > 0 && forwardedAddrs[0].Family().IsIP() {
 		remoteAddr = &net.TCPAddr{
 			IP:   forwardedAddrs[0].IP(),
 			Port: int(0),

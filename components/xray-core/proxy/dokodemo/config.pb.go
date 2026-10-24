@@ -28,11 +28,12 @@ type Config struct {
 	Port    uint32                 `protobuf:"varint,2,opt,name=port,proto3" json:"port,omitempty"`
 	PortMap map[string]string      `protobuf:"bytes,3,rep,name=port_map,json=portMap,proto3" json:"port_map,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// List of networks that the Dokodemo accepts.
-	Networks       []net.Network `protobuf:"varint,7,rep,packed,name=networks,proto3,enum=xray.common.net.Network" json:"networks,omitempty"`
-	FollowRedirect bool          `protobuf:"varint,5,opt,name=follow_redirect,json=followRedirect,proto3" json:"follow_redirect,omitempty"`
-	UserLevel      uint32        `protobuf:"varint,6,opt,name=user_level,json=userLevel,proto3" json:"user_level,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	Networks               []net.Network           `protobuf:"varint,7,rep,packed,name=networks,proto3,enum=xray.common.net.Network" json:"networks,omitempty"`
+	FollowRedirect         bool                    `protobuf:"varint,5,opt,name=follow_redirect,json=followRedirect,proto3" json:"follow_redirect,omitempty"`
+	UserLevel              uint32                  `protobuf:"varint,6,opt,name=user_level,json=userLevel,proto3" json:"user_level,omitempty"`
+	ForwardingTargetPolicy *ForwardingTargetPolicy `protobuf:"bytes,8,opt,name=forwarding_target_policy,json=forwardingTargetPolicy,proto3" json:"forwarding_target_policy,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *Config) Reset() {
@@ -107,11 +108,110 @@ func (x *Config) GetUserLevel() uint32 {
 	return 0
 }
 
+func (x *Config) GetForwardingTargetPolicy() *ForwardingTargetPolicy {
+	if x != nil {
+		return x.ForwardingTargetPolicy
+	}
+	return nil
+}
+
+// Only user-managed forwarding listeners use this policy. Ordinary dokodemo
+// inbounds (including the local management API) keep their existing behavior.
+type ForwardingTargetPolicy struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	BlockedCidrs  []string               `protobuf:"bytes,1,rep,name=blocked_cidrs,json=blockedCidrs,proto3" json:"blocked_cidrs,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ForwardingTargetPolicy) Reset() {
+	*x = ForwardingTargetPolicy{}
+	mi := &file_proxy_dokodemo_config_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ForwardingTargetPolicy) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ForwardingTargetPolicy) ProtoMessage() {}
+
+func (x *ForwardingTargetPolicy) ProtoReflect() protoreflect.Message {
+	mi := &file_proxy_dokodemo_config_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ForwardingTargetPolicy.ProtoReflect.Descriptor instead.
+func (*ForwardingTargetPolicy) Descriptor() ([]byte, []int) {
+	return file_proxy_dokodemo_config_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *ForwardingTargetPolicy) GetBlockedCidrs() []string {
+	if x != nil {
+		return x.BlockedCidrs
+	}
+	return nil
+}
+
+// A distinct type makes old Xray processes reject protected listeners instead
+// of silently discarding the added policy field during a mixed-version handoff.
+type ForwardingConfig struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Config        *Config                `protobuf:"bytes,1,opt,name=config,proto3" json:"config,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ForwardingConfig) Reset() {
+	*x = ForwardingConfig{}
+	mi := &file_proxy_dokodemo_config_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ForwardingConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ForwardingConfig) ProtoMessage() {}
+
+func (x *ForwardingConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_proxy_dokodemo_config_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ForwardingConfig.ProtoReflect.Descriptor instead.
+func (*ForwardingConfig) Descriptor() ([]byte, []int) {
+	return file_proxy_dokodemo_config_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *ForwardingConfig) GetConfig() *Config {
+	if x != nil {
+		return x.Config
+	}
+	return nil
+}
+
 var File_proxy_dokodemo_config_proto protoreflect.FileDescriptor
 
 const file_proxy_dokodemo_config_proto_rawDesc = "" +
 	"\n" +
-	"\x1bproxy/dokodemo/config.proto\x12\x13xray.proxy.dokodemo\x1a\x18common/net/address.proto\x1a\x18common/net/network.proto\"\xd2\x02\n" +
+	"\x1bproxy/dokodemo/config.proto\x12\x13xray.proxy.dokodemo\x1a\x18common/net/address.proto\x1a\x18common/net/network.proto\"\xb9\x03\n" +
 	"\x06Config\x125\n" +
 	"\aaddress\x18\x01 \x01(\v2\x1b.xray.common.net.IPOrDomainR\aaddress\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12C\n" +
@@ -119,10 +219,15 @@ const file_proxy_dokodemo_config_proto_rawDesc = "" +
 	"\bnetworks\x18\a \x03(\x0e2\x18.xray.common.net.NetworkR\bnetworks\x12'\n" +
 	"\x0ffollow_redirect\x18\x05 \x01(\bR\x0efollowRedirect\x12\x1d\n" +
 	"\n" +
-	"user_level\x18\x06 \x01(\rR\tuserLevel\x1a:\n" +
+	"user_level\x18\x06 \x01(\rR\tuserLevel\x12e\n" +
+	"\x18forwarding_target_policy\x18\b \x01(\v2+.xray.proxy.dokodemo.ForwardingTargetPolicyR\x16forwardingTargetPolicy\x1a:\n" +
 	"\fPortMapEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B[\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"=\n" +
+	"\x16ForwardingTargetPolicy\x12#\n" +
+	"\rblocked_cidrs\x18\x01 \x03(\tR\fblockedCidrs\"G\n" +
+	"\x10ForwardingConfig\x123\n" +
+	"\x06config\x18\x01 \x01(\v2\x1b.xray.proxy.dokodemo.ConfigR\x06configB[\n" +
 	"\x17com.xray.proxy.dokodemoP\x01Z(github.com/xtls/xray-core/proxy/dokodemo\xaa\x02\x13Xray.Proxy.Dokodemob\x06proto3"
 
 var (
@@ -137,22 +242,26 @@ func file_proxy_dokodemo_config_proto_rawDescGZIP() []byte {
 	return file_proxy_dokodemo_config_proto_rawDescData
 }
 
-var file_proxy_dokodemo_config_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_proxy_dokodemo_config_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_proxy_dokodemo_config_proto_goTypes = []any{
-	(*Config)(nil),         // 0: xray.proxy.dokodemo.Config
-	nil,                    // 1: xray.proxy.dokodemo.Config.PortMapEntry
-	(*net.IPOrDomain)(nil), // 2: xray.common.net.IPOrDomain
-	(net.Network)(0),       // 3: xray.common.net.Network
+	(*Config)(nil),                 // 0: xray.proxy.dokodemo.Config
+	(*ForwardingTargetPolicy)(nil), // 1: xray.proxy.dokodemo.ForwardingTargetPolicy
+	(*ForwardingConfig)(nil),       // 2: xray.proxy.dokodemo.ForwardingConfig
+	nil,                            // 3: xray.proxy.dokodemo.Config.PortMapEntry
+	(*net.IPOrDomain)(nil),         // 4: xray.common.net.IPOrDomain
+	(net.Network)(0),               // 5: xray.common.net.Network
 }
 var file_proxy_dokodemo_config_proto_depIdxs = []int32{
-	2, // 0: xray.proxy.dokodemo.Config.address:type_name -> xray.common.net.IPOrDomain
-	1, // 1: xray.proxy.dokodemo.Config.port_map:type_name -> xray.proxy.dokodemo.Config.PortMapEntry
-	3, // 2: xray.proxy.dokodemo.Config.networks:type_name -> xray.common.net.Network
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	4, // 0: xray.proxy.dokodemo.Config.address:type_name -> xray.common.net.IPOrDomain
+	3, // 1: xray.proxy.dokodemo.Config.port_map:type_name -> xray.proxy.dokodemo.Config.PortMapEntry
+	5, // 2: xray.proxy.dokodemo.Config.networks:type_name -> xray.common.net.Network
+	1, // 3: xray.proxy.dokodemo.Config.forwarding_target_policy:type_name -> xray.proxy.dokodemo.ForwardingTargetPolicy
+	0, // 4: xray.proxy.dokodemo.ForwardingConfig.config:type_name -> xray.proxy.dokodemo.Config
+	5, // [5:5] is the sub-list for method output_type
+	5, // [5:5] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for extension type_name
+	5, // [5:5] is the sub-list for extension extendee
+	0, // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_proxy_dokodemo_config_proto_init() }
@@ -166,7 +275,7 @@ func file_proxy_dokodemo_config_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proxy_dokodemo_config_proto_rawDesc), len(file_proxy_dokodemo_config_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

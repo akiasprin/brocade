@@ -1,0 +1,338 @@
+/* 用户「用量与额度」线路状态改版 mockup。页面主体是生产的用户页，这里只补审阅外壳（mk-）和方案部件（qs-）。 */
+
+/* ── 审阅外壳：不属于设计 ── */
+html,
+body {
+  height: auto;
+  min-height: 100%;
+  overflow: auto !important;
+}
+body {
+  margin: 0;
+  background: var(--ground);
+}
+.mk-bar {
+  position: sticky;
+  z-index: 30;
+  top: 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--sheet);
+}
+.mk-bar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  padding: 10px 20px 6px;
+}
+.mk-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--ink);
+  font: 600 14px var(--sans);
+  white-space: nowrap;
+}
+.mk-title small {
+  color: var(--ink-4);
+  font: 400 10px var(--mono);
+  letter-spacing: 0.06em;
+}
+.mk-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-left: auto;
+}
+.mk-ctl {
+  --ctl-h: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.mk-ctl-label {
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.mk-ctl select {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  color: var(--ink);
+  font: 12px var(--sans);
+}
+.mk-ctl .segsw button {
+  padding: 0 9px;
+  font-size: 12px;
+}
+.mk-scene-note {
+  margin: 0;
+  padding: 0 20px 9px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.mk-scene-note b {
+  margin-right: 10px;
+  color: var(--action);
+  font-weight: 600;
+}
+.mk-common {
+  display: block;
+  color: var(--ink-4);
+}
+.mk-stage {
+  padding: 20px;
+}
+@media (max-width: 620px) {
+  .mk-stage {
+    padding: 12px;
+  }
+}
+.mk-hide-legacy .user-access-quotas:not(.qs-own) {
+  display: none;
+}
+.mk-slot {
+  display: contents;
+}
+
+/* ══ 共用：状态点、同步环、限速与服务暂停的行色 ══ */
+.qs-dot {
+  flex: none;
+  align-self: center;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.qs-dot.hollow {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px currentColor;
+}
+.qs-spin {
+  flex: none;
+  align-self: center;
+  width: 11px;
+  height: 11px;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  animation: qs-spin 0.8s steps(8, end) infinite;
+}
+@keyframes qs-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .qs-spin {
+    animation: none;
+  }
+}
+/* 限速中仍可用：超出量与上方额度条、百分比同用注意色（生产的 .warn 已给条和百分比上色）。 */
+.qs-row.qs-throttled :is(.qta-left, .qta-left b) {
+  color: var(--gold);
+}
+/* 服务暂停时没有流量经过：额度条退成灰色，用量数字照常。 */
+.qta-r.qs-row.qs-paused .qta-t > i {
+  background: var(--ink-4);
+}
+.qs-row.qs-paused .qta-pct {
+  color: var(--ink-3);
+}
+.qta-left.qs-left-status {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px 10px;
+}
+
+/* ══ A 状态字 ══ */
+/* 跟在「/ 额度」之后，字号降到与额度相同；位于伸缩的数值列内，放不下时截断而不挤压线路名。 */
+.qs-a-policy,
+.qs-a-state {
+  display: inline-flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+  margin-left: 14px;
+  overflow: hidden;
+  font: 500 12px/18px var(--sans);
+  white-space: nowrap;
+}
+.qs-a-policy {
+  color: var(--ink-4);
+}
+.qs-a-state.warn {
+  color: var(--gold);
+}
+.qs-a-state.err {
+  color: var(--err);
+}
+.qs-a-state.idle {
+  color: var(--ink-3);
+}
+.qs-a-sync {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  margin-left: 4px;
+  color: var(--ink-3);
+}
+.qs-a-line {
+  display: none;
+  grid-area: state;
+  min-width: 0;
+}
+@container user-usage (max-width: 620px) {
+  .qta-r.qs-a {
+    grid-template-areas:
+      'name name acts'
+      'figs left left'
+      'state state state'
+      'meter meter meter';
+  }
+  .qs-a .qta-figs > :is(.qs-a-policy, .qs-a-state) {
+    display: none;
+  }
+  .qs-a-line {
+    display: flex;
+  }
+  .qs-a-line > :is(.qs-a-policy, .qs-a-state) {
+    margin-left: 0;
+  }
+}
+
+/* ══ C 状态符号 ══ */
+.qs-c-badge {
+  position: relative;
+  display: inline-grid;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--ink-3);
+  place-items: center;
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .qs-c-badge:hover {
+    background: var(--hover-2);
+  }
+}
+.qs-c-badge[aria-expanded='true'] {
+  background: var(--hover-2);
+}
+.qs-c-badge:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 1px;
+}
+.qs-c-badge.warn {
+  color: var(--gold);
+}
+.qs-c-badge.err {
+  color: var(--err);
+}
+.qs-c-badge.idle {
+  color: var(--ink-4);
+}
+/* 实心圆底、符号镂空，与系统的 .fill 符号同一画法。 */
+.qs-c-disc {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: currentColor;
+  place-items: center;
+}
+.qs-c-disc svg {
+  width: 13px;
+  height: 13px;
+  fill: var(--card);
+}
+.qs-c-disc .qs-c-stroke {
+  fill: none;
+  stroke: var(--card);
+  stroke-width: 1.9;
+  stroke-linecap: round;
+}
+.qs-c-disc .qs-c-stroke circle {
+  fill: var(--card);
+  stroke: none;
+}
+.qs-c-badge.sync .qs-spin {
+  width: 14px;
+  height: 14px;
+}
+.qs-c-corner {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--action);
+  box-shadow: 0 0 0 1.5px var(--card);
+}
+.qs-c-pop {
+  width: min(232px, calc(100vw - 16px));
+  padding: 11px 13px 12px;
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 18px;
+}
+.qs-c-pop > b {
+  display: block;
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.qs-c-pop > b.warn {
+  color: var(--gold);
+}
+.qs-c-pop > b.err {
+  color: var(--err);
+}
+.qs-c-pop dl {
+  display: grid;
+  gap: 3px;
+  margin: 7px 0 0;
+}
+.qs-c-pop dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+}
+.qs-c-pop dt {
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+.qs-c-pop dd {
+  margin: 0;
+  color: var(--ink-2);
+  text-align: right;
+}
+
+/* ══ D 名称行状态 ══ */
+.qta-sub.qs-d {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.qta-sub.qs-d.warn {
+  color: var(--gold);
+}
+.qta-sub.qs-d.err {
+  color: var(--err);
+}
+.qta-sub.qs-d.idle,
+.qta-sub.qs-d.sync {
+  color: var(--ink-3);
+}

@@ -43,7 +43,7 @@ use std::{
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 
-use brocade_core::model::{ExternalOutbound, ExternalOutboundProtocol};
+use brocade_core::model::{DomainStrategy, ExternalOutbound, ExternalOutboundProtocol};
 
 use brocade_deployment::protocol::{
     E2eExitVerdict, E2eProbe, E2eProbeSecurity, E2eProbeStatus, E2eProbeTarget, E2eProbeTargetList,
@@ -175,8 +175,9 @@ pub struct TunnelProbeResult {
 /// The endpoint is resolved and checked here, then the approved IP is encoded directly into the
 /// SOCKS request while the original hostname remains in the HTTP Host header. Xray therefore
 /// cannot resolve the probe target to a loopback, private, link-local or metadata address after
-/// validation. This intentionally measures the tunnel rather than its DNS policy; Agent E2E
-/// probes retain their existing remote-DNS behavior.
+/// validation. The tunnel's target strategy selects the family from these approved addresses;
+/// a literal IP keeps its original family, just as it does in Xray. Agent E2E probes retain their
+/// existing remote-DNS behavior.
 pub fn probe_external_outbound_with_options<F>(
     outbound: &ExternalOutbound,
     endpoint_url: &str,
@@ -216,7 +217,7 @@ where
             )
         }
     };
-    let connect_host = match endpoint.resolve_public_host() {
+    let connect_host = match endpoint.resolve_public_host(outbound.target_strategy) {
         Ok(host) => host,
         Err(detail) => return failed(TunnelProbeStatus::Unsupported, 0, detail),
     };
@@ -951,12 +952,9 @@ fn stream_settings(target: &E2eProbeTarget) -> serde_json::Value {
         // A certificate of the machine's own: nothing to configure but the name, which the
         // client checks the certificate against — so a wrong one fails here rather than at the
         // far end.
-        // No `allowInsecure` here, and none on the Hysteria 2 side either: xray removed the
-        // field in v26.2.6 and rejects the whole config from v26.6.1 on, so writing it does not
-        // weaken the probe, it stops the probe process from starting at all. A machine whose
-        // certificate does not verify therefore fails here — correctly, because a subscriber's
-        // client fails in the same place. Pinning the certificate (`pinnedPeerCertSha256`) is the
-        // replacement. Self-signed certificates carry that digest in the frozen probe target.
+        // Managed ingress probes keep certificate verification enabled. Self-signed certificates
+        // carry their pinned digest in the frozen target; external tunnel opt-ins do not apply
+        // to this independently generated client config.
         E2eProbeSecurity::Tls(tls) => {
             let mut tls_settings = serde_json::json!({
                 "serverName": tls.server_name,
@@ -1155,8 +1153,8 @@ where
     // Both streams go to the same file. A rejected config is reported on **stdout**,
     // and stderr stays empty: at that point xray's logging system is not initialized
     // and the `log.error` path has not taken effect. Discarding stdout is why every
-    // VLESS+TLS chain reported "探测进程没起来：（没有输出）" after xray 26.4.25 removed
-    // `allowInsecure` — the reason existed and was written to a discarded stream.
+    // VLESS+TLS chain reported "探测进程没起来：（没有输出）" after the upstream Xray
+    // `allowInsecure` cutoff — the reason existed and was written to a discarded stream.
     //
     // A file rather than a pipe: a full pipe blocks the process in write, which is
     // indistinguishable from a dead chain. Both handles are opened `append`, so the
@@ -1330,25 +1328,51 @@ impl HttpTarget {
         }
     }
 
-    fn resolve_public_host(&self) -> Result<String, String> {
-        let mut addresses = (self.host.as_str(), self.port)
+    fn resolve_public_host(&self, strategy: Option<DomainStrategy>) -> Result<String, String> {
+        let addresses = (self.host.as_str(), self.port)
             .to_socket_addrs()
             .map_err(|error| format!("公共落点解析失败：{error}"))?
             .map(|address| address.ip())
             .collect::<Vec<_>>();
-        addresses.sort();
-        addresses.dedup();
-        if addresses.is_empty() {
-            return Err("公共落点没有可连接的地址".to_owned());
-        }
-        if let Some(blocked) = addresses
-            .iter()
-            .find(|address| !is_public_probe_ip(**address))
-        {
-            return Err(format!("公共落点解析到非公网地址 {blocked}，已拒绝拨测"));
-        }
-        Ok(addresses[0].to_string())
+        select_public_probe_ip(&self.host, addresses, strategy).map(|address| address.to_string())
     }
+}
+
+fn select_public_probe_ip(
+    host: &str,
+    mut addresses: Vec<IpAddr>,
+    strategy: Option<DomainStrategy>,
+) -> Result<IpAddr, String> {
+    addresses.sort();
+    addresses.dedup();
+    let Some(first) = addresses.first().copied() else {
+        return Err("公共落点没有可连接的地址".to_owned());
+    };
+    // Validate the entire answer before selecting a family. An IPv4 preference must not hide a
+    // private AAAA result, and the selected address stays pinned throughout retries.
+    if let Some(blocked) = addresses
+        .iter()
+        .find(|address| !is_public_probe_ip(**address))
+    {
+        return Err(format!("公共落点解析到非公网地址 {blocked}，已拒绝拨测"));
+    }
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(first);
+    }
+    let preferred = match strategy {
+        Some(DomainStrategy::UseIpv4 | DomainStrategy::UseIpv4v6) => {
+            addresses.iter().find(|address| address.is_ipv4())
+        }
+        Some(DomainStrategy::UseIpv6 | DomainStrategy::UseIpv6v4) => {
+            addresses.iter().find(|address| address.is_ipv6())
+        }
+        // AsIs still requires local validation for Console-originated probes. Preserve the
+        // existing deterministic choice when no family preference was requested.
+        None | Some(DomainStrategy::AsIs | DomainStrategy::UseIp) => None,
+    };
+    // These are Xray's Use strategies, not Force strategies: an unavailable preferred family
+    // may fall back to an available public address. A connect failure does not change families.
+    Ok(preferred.copied().unwrap_or(first))
 }
 
 fn is_public_probe_ip(address: IpAddr) -> bool {
@@ -1982,9 +2006,8 @@ mod tests {
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         assert!(stream["tlsSettings"].get("fingerprint").is_none());
-        // xray rejects a config carrying `allowInsecure` outright (removed in v26.2.6, fatal
-        // from v26.6.1). Writing it does not loosen verification, it prevents the probe process
-        // from starting — which reported as "探测进程没起来：（没有输出）" on every VLESS+TLS chain.
+        // A managed ingress probe verifies its frozen certificate pin and never opts into
+        // the external-tunnel certificate bypass.
         assert!(stream["tlsSettings"].get("allowInsecure").is_none());
         assert!(stream.get("realitySettings").is_none());
         assert!(out["outbounds"][0]["settings"]["vnext"][0]["users"][0]
@@ -2259,6 +2282,7 @@ mod tests {
     #[test]
     fn external_member_config_uses_the_same_transport_layer_boundary() {
         let member = ExternalOutbound {
+            target_strategy: None,
             id: "custom-1111-1111".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "港区供应商".to_owned(),
@@ -2464,6 +2488,73 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_probe_selects_the_requested_family_from_validated_dns_answers() {
+        let ipv4: IpAddr = "1.1.1.1".parse().unwrap();
+        let ipv6: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+        for (strategy, expected) in [
+            (None, ipv4),
+            (Some(DomainStrategy::AsIs), ipv4),
+            (Some(DomainStrategy::UseIp), ipv4),
+            (Some(DomainStrategy::UseIpv4), ipv4),
+            (Some(DomainStrategy::UseIpv4v6), ipv4),
+            (Some(DomainStrategy::UseIpv6), ipv6),
+            (Some(DomainStrategy::UseIpv6v4), ipv6),
+        ] {
+            assert_eq!(
+                select_public_probe_ip("probe.example", vec![ipv6, ipv4, ipv6], strategy).unwrap(),
+                expected,
+                "{strategy:?}"
+            );
+        }
+        assert_eq!(
+            select_public_probe_ip("probe.example", vec![ipv6], Some(DomainStrategy::UseIpv4v6))
+                .unwrap(),
+            ipv6
+        );
+        assert_eq!(
+            select_public_probe_ip("probe.example", vec![ipv4], Some(DomainStrategy::UseIpv6v4))
+                .unwrap(),
+            ipv4
+        );
+        assert_eq!(
+            select_public_probe_ip("1.1.1.1", vec![ipv4], Some(DomainStrategy::UseIpv6)).unwrap(),
+            ipv4
+        );
+        assert_eq!(
+            select_public_probe_ip(
+                "2606:4700:4700::1111",
+                vec![ipv6],
+                Some(DomainStrategy::UseIpv4)
+            )
+            .unwrap(),
+            ipv6
+        );
+    }
+
+    #[test]
+    fn tunnel_probe_validates_nonpreferred_answers_before_selecting_a_family() {
+        for (strategy, addresses) in [
+            (DomainStrategy::UseIpv4v6, vec!["1.1.1.1", "fc00::1"]),
+            (
+                DomainStrategy::UseIpv6v4,
+                vec!["2606:4700:4700::1111", "127.0.0.1"],
+            ),
+        ] {
+            let addresses = addresses
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect();
+            let error =
+                select_public_probe_ip("probe.example", addresses, Some(strategy)).unwrap_err();
+            assert!(error.contains("非公网地址"), "{error}");
+        }
+        assert!(
+            select_public_probe_ip("probe.example", vec![], Some(DomainStrategy::UseIpv4v6))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn trace_body_fields() {
         let body = "HTTP/1.1 200 OK\r\n\r\nfl=abc\nip=198.51.100.7\nloc=TW\ntls=off\n";
         assert_eq!(trace_field(body, "ip").as_deref(), Some("198.51.100.7"));
@@ -2499,51 +2590,93 @@ mod tests {
 
     #[test]
     fn tunnel_http_request_pins_the_approved_ip_and_preserves_the_host_header() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let socks_port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut greeting = [0_u8; 3];
-            stream.read_exact(&mut greeting).unwrap();
-            assert_eq!(greeting, [0x05, 0x01, 0x00]);
-            stream.write_all(&[0x05, 0x00]).unwrap();
+        for (strategy, expected) in [
+            (
+                DomainStrategy::UseIpv4v6,
+                "1.1.1.1".parse::<IpAddr>().unwrap(),
+            ),
+            (
+                DomainStrategy::UseIpv6v4,
+                "2606:4700:4700::1111".parse::<IpAddr>().unwrap(),
+            ),
+        ] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let socks_port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut greeting = [0_u8; 3];
+                stream.read_exact(&mut greeting).unwrap();
+                assert_eq!(greeting, [0x05, 0x01, 0x00]);
+                stream.write_all(&[0x05, 0x00]).unwrap();
 
-            let mut connect = [0_u8; 10];
-            stream.read_exact(&mut connect).unwrap();
-            assert_eq!(&connect[..4], &[0x05, 0x01, 0x00, 0x01]);
-            assert_eq!(&connect[4..8], &[1, 1, 1, 1]);
-            assert_eq!(u16::from_be_bytes([connect[8], connect[9]]), 8080);
-            stream
-                .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                let mut prefix = [0_u8; 4];
+                stream.read_exact(&mut prefix).unwrap();
+                assert_eq!(&prefix[..3], &[0x05, 0x01, 0x00]);
+                let (kind, address) = match expected {
+                    IpAddr::V4(address) => (0x01, address.octets().to_vec()),
+                    IpAddr::V6(address) => (0x04, address.octets().to_vec()),
+                };
+                assert_eq!(
+                    prefix[3], kind,
+                    "SOCKS must receive an IP, never an unvalidated domain"
+                );
+                let mut connect = vec![0; address.len() + 2];
+                stream.read_exact(&mut connect).unwrap();
+                assert_eq!(&connect[..address.len()], address);
+                assert_eq!(
+                    u16::from_be_bytes(connect[address.len()..].try_into().unwrap()),
+                    8080
+                );
+                stream
+                    .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                    .unwrap();
+
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 256];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with("GET /trace?source=test HTTP/1.1\r\n"));
+                assert!(request.contains("\r\nHost: probe.example:8080\r\n"));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nip={expected}\nloc=US\n"
+                )
                 .unwrap();
+            });
 
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 256];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let read = stream.read(&mut chunk).unwrap();
-                assert!(read > 0);
-                request.extend_from_slice(&chunk[..read]);
-            }
-            let request = String::from_utf8(request).unwrap();
-            assert!(request.starts_with("GET /trace?source=test HTTP/1.1\r\n"));
-            assert!(request.contains("\r\nHost: probe.example:8080\r\n"));
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nip=1.1.1.1\nloc=US\n")
-                .unwrap();
-        });
-
-        let endpoint = HttpTarget::parse("http://probe.example:8080/trace?source=test").unwrap();
-        let result = run_http_request(
-            socks_port,
-            &endpoint,
-            "1.1.1.1",
-            Duration::from_secs(2),
-            &ProbeCancellation::default(),
-        )
-        .unwrap();
-        assert_eq!(result.http_status, 200);
-        assert_eq!(result.exit_ip.as_deref(), Some("1.1.1.1"));
-        assert_eq!(result.exit_loc.as_deref(), Some("US"));
-        server.join().unwrap();
+            let endpoint =
+                HttpTarget::parse("http://probe.example:8080/trace?source=test").unwrap();
+            let selected = select_public_probe_ip(
+                &endpoint.host,
+                vec![
+                    "2606:4700:4700::1111".parse().unwrap(),
+                    "1.1.1.1".parse().unwrap(),
+                ],
+                Some(strategy),
+            )
+            .unwrap();
+            let result = run_http_request(
+                socks_port,
+                &endpoint,
+                &selected.to_string(),
+                Duration::from_secs(2),
+                &ProbeCancellation::default(),
+            )
+            .unwrap();
+            assert_eq!(result.http_status, 200);
+            assert_eq!(result.exit_ip, Some(expected.to_string()));
+            assert_eq!(result.exit_loc.as_deref(), Some("US"));
+            server.join().unwrap();
+        }
     }
 }

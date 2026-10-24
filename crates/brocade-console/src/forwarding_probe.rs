@@ -79,6 +79,7 @@ fn current<'a>(overview: &'a ForwardingOverview, job: &Job) -> Option<&'a Forwar
         && rule.enabled
         && entry.enabled
         && !entry.quota_suspended
+        && !matches!(rule.runtime_status.as_str(), "service-paused" | "disabled")
         && entry.desired_generation == job.view.generation
         && entry.allow_private_targets == job.entry.allow_private_targets)
         .then_some(rule)
@@ -107,8 +108,14 @@ impl Service {
             .iter()
             .find(|entry| entry.node_id == rule.node_id)
             .ok_or_else(|| conflict("转发入口授权不存在"))?;
-        if !rule.enabled || !entry.enabled || entry.quota_suspended {
-            return Err(conflict("转发已停用或额度暂停，不能执行 TCP Ping"));
+        if !rule.enabled
+            || !entry.enabled
+            || entry.quota_suspended
+            || matches!(rule.runtime_status.as_str(), "service-paused" | "disabled")
+        {
+            return Err(conflict(
+                "转发已停用、额度暂停或不在有效期内，不能执行 TCP Ping",
+            ));
         }
         let mut jobs = self.lock();
         jobs.retain(|_, job| job.started.elapsed() < TTL);
@@ -342,7 +349,7 @@ mod tests {
             "entitlements":[{"node_id":"n1","node_name":"入口","public_ipv4":null,"public_ipv6":null,
                 "enabled":true,"tcp_allowed":true,"udp_allowed":true,"listen_port_start":30000,"listen_port_end":59999,
                 "max_rules":100,"allow_private_targets":false,"rule_count":1,"desired_generation":3,"applied_generation":3,
-                "reconcile_status":"converged","last_error":null,"monthly_limit_bytes":null,"monthly_used_bytes":0,
+                "reconcile_status":"converged","last_error":null,"cycle_limit_bytes":null,"cycle_used_bytes":0,
                 "quota_suspended":false,"quota_job_id":null,"quota_job_status":null,"quota_job_error":null}],
             "rules":[{"id":id,"tenant_id":"t","user_id":user,"node_id":"n1","name":"rule","protocol":"tcp",
                 "listen_port":30001,"target_host":"1.1.1.1","target_port":443,"enabled":true,"runtime_status":"active",
@@ -386,7 +393,7 @@ mod tests {
 
     #[test]
     fn editing_revocation_and_quota_invalidate_only_the_affected_users_result() {
-        for change in 0..4 {
+        for change in 0..5 {
             let service = Service::default();
             let mut alice = overview("alice", 1);
             let bob = overview("bob", 2);
@@ -408,6 +415,7 @@ mod tests {
                 0 => alice.rules[0].updated_at = "two".to_owned(),
                 1 => alice.entitlements[0].enabled = false,
                 2 => alice.entitlements[0].quota_suspended = true,
+                3 => alice.rules[0].runtime_status = "service-paused".to_owned(),
                 _ => alice.rules.clear(),
             }
             let alice_result = service.list(&alice);
@@ -419,6 +427,18 @@ mod tests {
             assert_eq!(bob.rules[0].uplink_bytes, 5);
             assert_eq!(bob.rules[0].downlink_bytes, 10);
         }
+    }
+
+    #[test]
+    fn service_paused_rules_cannot_enqueue_diagnostic_traffic() {
+        let mut overview = overview("alice", 1);
+        overview.rules[0].runtime_status = "service-paused".to_owned();
+        let service = Service::default();
+        assert!(matches!(
+            service.enqueue(&overview, 1, Some(36)),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(service.lock().is_empty());
     }
 
     #[test]

@@ -391,12 +391,6 @@ pub(crate) async fn details(
     })
 }
 
-pub(crate) async fn prune(pool: &PgPool, windows_hours: u32, daily_hours: u32) -> Result<u64> {
-    let a=sqlx::query("DELETE FROM source_traffic_windows WHERE ctid IN (SELECT ctid FROM source_traffic_windows WHERE bucket < extract(epoch FROM now())::bigint-$1 ORDER BY bucket LIMIT 10000)").bind(i64::from(windows_hours)*3600).execute(pool).await?.rows_affected();
-    let b=sqlx::query("DELETE FROM source_traffic_daily WHERE ctid IN (SELECT ctid FROM source_traffic_daily WHERE bucket < extract(epoch FROM now())::bigint-$1 ORDER BY bucket LIMIT 10000)").bind(i64::from(daily_hours)*3600).execute(pool).await?.rows_affected();
-    Ok(a + b)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5,13 +5,16 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"github.com/xtls/xray-core/common/sourceaccess"
 	"io"
+	stdnet "net"
 	"net/http"
 	"runtime"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/pires/go-proxyproto"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
@@ -82,45 +85,64 @@ func Test_ListenXHAndDial(t *testing.T) {
 }
 
 func TestDialWithRemoteAddr(t *testing.T) {
-	listenPort := tcp.PickPort()
-	listen, err := ListenXH(context.Background(), net.LocalHostIP, listenPort, &internet.MemoryStreamConfig{
-		ProtocolName: "splithttp",
-		ProtocolSettings: &Config{
-			Path: "sh",
-		},
-	}, func(conn stat.Connection) {
-		go func(c stat.Connection) {
-			defer c.Close()
-
-			var b [1024]byte
-			_, err := c.Read(b[:])
-			// common.Must(err)
-			if err != nil {
-				return
+	for _, managed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("managed=%t", managed), func(t *testing.T) {
+			if managed {
+				t.Setenv(sourceaccess.Env, "managed-test")
+			} else {
+				t.Setenv(sourceaccess.Env, "")
 			}
 
-			_, err = c.Write([]byte(c.RemoteAddr().String()))
+			listenPort := tcp.PickPort()
+			listen, err := ListenXH(context.Background(), net.LocalHostIP, listenPort, &internet.MemoryStreamConfig{
+				ProtocolName: "splithttp",
+				ProtocolSettings: &Config{
+					Path: "sh",
+				},
+			}, func(conn stat.Connection) {
+				go func(c stat.Connection) {
+					defer c.Close()
+
+					var b [1024]byte
+					_, err := c.Read(b[:])
+					// common.Must(err)
+					if err != nil {
+						return
+					}
+
+					_, err = c.Write([]byte(c.RemoteAddr().String()))
+					common.Must(err)
+				}(conn)
+			})
 			common.Must(err)
-		}(conn)
-	})
-	common.Must(err)
 
-	conn, err := Dial(context.Background(), net.TCPDestination(net.DomainAddress("localhost"), listenPort), &internet.MemoryStreamConfig{
-		ProtocolName:     "splithttp",
-		ProtocolSettings: &Config{Path: "sh", Headers: map[string]string{"X-Forwarded-For": "1.1.1.1"}},
-	})
+			conn, err := Dial(context.Background(), net.TCPDestination(net.DomainAddress("localhost"), listenPort), &internet.MemoryStreamConfig{
+				ProtocolName:     "splithttp",
+				ProtocolSettings: &Config{Path: "sh", Headers: map[string]string{"X-Forwarded-For": "1.1.1.1"}},
+			})
 
-	common.Must(err)
-	_, err = conn.Write([]byte("Test connection 1"))
-	common.Must(err)
+			common.Must(err)
+			_, err = conn.Write([]byte("Test connection 1"))
+			common.Must(err)
 
-	var b [1024]byte
-	n, _ := io.ReadFull(conn, b[:])
-	if string(b[:n]) != "1.1.1.1:0" {
-		t.Error("response: ", string(b[:n]))
+			var b [1024]byte
+			n, _ := io.ReadFull(conn, b[:])
+			host, port, err := stdnet.SplitHostPort(string(b[:n]))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if managed {
+				if host != "127.0.0.1" || port == "0" {
+					t.Fatalf("client-controlled forwarded header replaced actual peer: %s", b[:n])
+				}
+			} else if string(b[:n]) != "1.1.1.1:0" {
+				t.Fatalf("unmanaged compatibility changed: %s", b[:n])
+			}
+
+			common.Must(listen.Close())
+
+		})
 	}
-
-	common.Must(listen.Close())
 }
 
 func Test_ListenXHAndDial_TLS(t *testing.T) {
@@ -462,4 +484,72 @@ func Test_maxUpload(t *testing.T) {
 	}
 
 	common.Must(listen.Close())
+}
+
+func TestManagedSplitFrontAcceptsProxyV2AndIgnoresSpoofedForwardedHeader(t *testing.T) {
+	t.Setenv(sourceaccess.Env, "managed-test")
+	port := tcp.PickPort()
+	backend, err := ListenXH(context.Background(), net.LocalHostIP, port, &internet.MemoryStreamConfig{
+		ProtocolName: "splithttp", ProtocolSettings: &Config{Path: "/source"},
+		SocketSettings: &internet.SocketConfig{AcceptProxyProtocol: true},
+	}, func(conn stat.Connection) {
+		go func() {
+			defer conn.Close()
+			var b [1]byte
+			if _, err := io.ReadFull(conn, b[:]); err == nil {
+				_, _ = conn.Write([]byte(conn.RemoteAddr().String()))
+			}
+		}()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	front, err := stdnet.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer front.Close()
+	go func() {
+		for {
+			incoming, err := front.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer incoming.Close()
+				target, err := stdnet.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+				if err != nil {
+					return
+				}
+				defer target.Close()
+				// This trusted loopback front supplies socket metadata, independently of HTTP headers.
+				header := proxyproto.HeaderProxyFromAddrs(2, &stdnet.TCPAddr{IP: stdnet.ParseIP("127.0.0.2"), Port: 4321}, target.RemoteAddr())
+				if _, err := header.WriteTo(target); err != nil {
+					return
+				}
+				copied := make(chan struct{})
+				go func() { _, _ = io.Copy(target, incoming); _ = target.Close(); close(copied) }()
+				_, _ = io.Copy(incoming, target)
+				_ = incoming.Close()
+				<-copied
+			}()
+		}
+	}()
+	endpoint := front.Addr().(*stdnet.TCPAddr)
+	conn, err := Dial(context.Background(), net.TCPDestination(net.LocalHostIP, net.Port(endpoint.Port)), &internet.MemoryStreamConfig{ProtocolName: "splithttp", ProtocolSettings: &Config{Path: "/source", Headers: map[string]string{"X-Forwarded-For": "192.0.2.99"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(io.LimitReader(conn, 128))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "127.0.0.2:4321" {
+		t.Fatalf("source identity was lost or spoofed: %q", data)
+	}
 }

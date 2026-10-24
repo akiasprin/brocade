@@ -1,7 +1,8 @@
 // Local visual acceptance fixture; production components and tokens, synthetic traffic only.
 // Serve frontend/ with Vite and open tests/fixtures/fleet-traffic-preview.html?scene=prod.
-// Query: scene=prod|few|solo|crowd|quiet|degraded|disabled|public|empty, theme=dark|light,
-// w=<frame width>, run=0 freezes the rates (timestamps keep advancing), nav=0 hides the scene bar.
+// Query: scene=prod|few|solo|crowd|heavy|quiet|degraded|disabled|public|empty, theme=dark|light,
+// w=<frame width>, run=0 freezes the rates (timestamps keep advancing), nav=0 hides the scene bar,
+// delay=<milliseconds> delays content reads for entrance-motion acceptance.
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ConsoleInitialData, UsageMonthlySummary, Whoami } from '../../src/api';
@@ -19,6 +20,7 @@ const scene = params.get('scene') ?? 'prod';
 const width = Number(params.get('w')) || 1280;
 const frozen = params.get('run') === '0';
 const showNav = params.get('nav') !== '0';
+const readDelay = Math.max(0, Math.min(2000, Number(params.get('delay')) || 0));
 
 /** 1 Mb/s in the bytes-per-second unit the realtime protocol carries. */
 const MB = 1_000_000 / 8;
@@ -179,8 +181,46 @@ function crowdWorld(): World {
   return { machines, users, flows };
 }
 
+const HEAVY_CARRIERS = ['CN2 GIA 4837 高防', 'BGP 三网优化', 'CMIN2 精品', 'IIJ 原生 IP', 'Tier 1 大带宽'];
+
+/** Large readings and long names at once: Gbit/s rates, TiB months, carrier-length machine names,
+ * an email-length top user, and more machines than the matrix shows without scrolling. */
+function heavyWorld(): World {
+  const machines: Machine[] = Array.from({ length: 48 }, (_, index) => {
+    const [city, country] = CITIES[index % CITIES.length];
+    const carrier = HEAVY_CARRIERS[Math.floor(index / CITIES.length) % HEAVY_CARRIERS.length];
+    return {
+      id: `h${String(index).padStart(2, '0')}`,
+      name: `${city} ${carrier} ${String(index + 1).padStart(2, '0')}`,
+      country,
+      relay: 2_000 * MB,
+      condition: index === 7 ? 'offline' : index === 23 ? 'partial' : undefined,
+    };
+  });
+  const users: Person[] = Array.from({ length: 160 }, (_, index) => ({
+    id: index === 0 ? 'enterprise-customer-0001@example.com' : `user-${String(index + 1).padStart(4, '0')}`,
+    tenant: 'platform',
+    grants: machines
+      .filter((_, machine) => machine === 0 || (machine * 7 + index * 13) % 11 < 2 + (index % 4))
+      .map(machine => machine.id),
+  }));
+  const flows: Flow[] = users
+    .filter((_, index) => index % 4 === 0)
+    .flatMap((user, index) =>
+      user.grants.slice(0, 3).map((node, step) => ({
+        user: user.id,
+        node,
+        down: (index === 0 && step === 0 ? 20_000 : 600 + ((index * 37 + step * 11) % 40) * 100) * MB,
+        up: (150 + ((index * 11 + step) % 9) * 60) * MB,
+        phase: index + step,
+      })),
+    );
+  return { machines, users, flows };
+}
+
 function worldOf(name: string): World {
   if (name === 'crowd') return crowdWorld();
+  if (name === 'heavy') return heavyWorld();
   if (name === 'few')
     return {
       machines: PROD_MACHINES.filter(machine => ['hk-hkix', 'jp-iij', 'us-gia'].includes(machine.id)),
@@ -295,6 +335,7 @@ class FixtureEventSource {
   private timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(readonly url: string) {
+    const initialDelay = Math.max(30, readDelay);
     setTimeout(() => {
       if (streamDown) {
         this.onerror?.();
@@ -308,7 +349,7 @@ class FixtureEventSource {
           if (machine.condition !== 'offline') this.emit('sample', nodeEvent(machine, now));
         }
       }, 1_000);
-    }, 30);
+    }, initialDelay);
   }
 
   addEventListener(type: string, listener: (event: MessageEvent) => void) {
@@ -339,9 +380,10 @@ function monthly(offset: string | null): UsageMonthlySummary {
   const previous = offset === '-1';
   const month = previous ? '2026-09' : '2026-10';
   const daysInMonth = previous ? 30 : 19;
-  const GiB = 1024 ** 3;
+  // The heavy scene carries hundreds of TiB a month, so every ledger reading is at its widest.
+  const unit = scene === 'heavy' ? 400 * 1024 ** 3 : 1024 ** 3;
   const days = Array.from({ length: daysInMonth }, (_, index) => {
-    const downlink = Math.round((18 + 9 * Math.sin(index / 2.3) + (index % 7 === 5 ? 14 : 0)) * GiB);
+    const downlink = Math.round((18 + 9 * Math.sin(index / 2.3) + (index % 7 === 5 ? 14 : 0)) * unit);
     return {
       day: `${month}-${String(index + 1).padStart(2, '0')}`,
       uplink_bytes: Math.round(downlink * 0.06),
@@ -368,6 +410,9 @@ function monthly(offset: string | null): UsageMonthlySummary {
 globalThis.fetch = async (input: RequestInfo | URL) => {
   const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
   const path = url.pathname;
+  if (readDelay > 0 && (path === '/usage/monthly-summary' || path === '/realtime/fleet-traffic/snapshot')) {
+    await new Promise(resolve => setTimeout(resolve, readDelay));
+  }
   if (path === '/whoami') return Response.json(who);
   if (path === '/nodes/agent-state')
     return Response.json({
@@ -404,6 +449,7 @@ const SCENES: Record<string, string> = {
   few: '三台 · 两位',
   solo: '一台 · 一位',
   crowd: '40 台 · 120 位',
+  heavy: '大流量 · 长名称',
   quiet: '全部空闲',
   degraded: '实时连接中断',
   disabled: '已关闭',
@@ -432,7 +478,7 @@ createRoot(document.getElementById('root')!).render(
           </a>
         </nav>
       )}
-      <div style={{ width: `min(100%, ${width}px)`, margin: '0 auto' }}>
+      <div className="fg-view" style={{ width: `min(100%, ${width}px)`, margin: '0 auto' }}>
         <UsagePane />
       </div>
     </SessionProvider>

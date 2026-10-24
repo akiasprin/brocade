@@ -117,6 +117,9 @@ type Inbound struct {
 	Tag string
 	// Name of the inbound proxy that handles the connection.
 	Name string
+	// ForwardingTargetIPMatcher is owned by a user-forwarding inbound and applies
+	// to its actual direct TCP/UDP destination, including system DNS answers.
+	ForwardingTargetIPMatcher geodata.IPMatcher
 	// User is the user that authenticates for the inbound. May be nil if the protocol allows anonymous traffic.
 	User *protocol.MemoryUser
 	// VlessRoute is the user-sent VLESS UUID's 7th<<8 | 8th bytes.
@@ -142,17 +145,18 @@ func (i *Inbound) Clone() *Inbound {
 		return nil
 	}
 	clone := &Inbound{
-		Source:                i.Source,
-		Local:                 i.Local,
-		Gateway:               i.Gateway,
-		Tag:                   i.Tag,
-		Name:                  i.Name,
-		User:                  i.User,
-		VlessRoute:            i.VlessRoute,
-		Conn:                  i.Conn,
-		Timer:                 i.Timer,
-		SpliceMetrics:         i.SpliceMetrics,
-		FramedDownlinkSplicer: i.FramedDownlinkSplicer,
+		Source:                    i.Source,
+		Local:                     i.Local,
+		Gateway:                   i.Gateway,
+		Tag:                       i.Tag,
+		Name:                      i.Name,
+		ForwardingTargetIPMatcher: i.ForwardingTargetIPMatcher,
+		User:                      i.User,
+		VlessRoute:                i.VlessRoute,
+		Conn:                      i.Conn,
+		Timer:                     i.Timer,
+		SpliceMetrics:             i.SpliceMetrics,
+		FramedDownlinkSplicer:     i.FramedDownlinkSplicer,
 	}
 	clone.CanSpliceCopy.Store(i.CanSpliceCopy.Load())
 	return clone

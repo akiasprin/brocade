@@ -7,7 +7,7 @@ import type {
   ForwardingOverview,
   ForwardingRule,
   UsageForwardingMonthlyRow,
-  UsageMonthlySummary,
+  UserCycleUsage,
   UserListItem,
 } from '../src/api';
 import { UserForwardingCard } from '../src/panes/user-forwarding';
@@ -77,9 +77,10 @@ const usage = (ruleId: number, down: number, up: number, over: Partial<UsageForw
   ...over,
 });
 
-const monthly = (rows: UsageForwardingMonthlyRow[]): UsageMonthlySummary => ({
-  month_start: '2026-10-01 00:00:00',
-  month_end: '2026-11-01 00:00:00',
+const cycleUsage = (rows: UsageForwardingMonthlyRow[]): UserCycleUsage => ({
+  periods: [
+    { tenant_id: user.tenant_id, user_id: user.id, starts_at: '2026-09-30T16:00:00Z', ends_at: '2026-10-31T16:00:00Z' },
+  ],
   views: [],
   forwarding: rows,
 });
@@ -89,7 +90,7 @@ type Route = (init?: RequestInit) => unknown;
 /** 按「方法 路径」应答；未登记的请求返回 404，让查询进入错误态而不是挂起。 */
 function serve(routes: Record<string, Route>) {
   const table: Record<string, Route> = {
-    'GET /usage/monthly-summary': () => monthly([]),
+    'GET /usage/user-cycles': () => cycleUsage([]),
     [`GET ${BASE}/forwarding/tcp-pings`]: () => [],
     'GET /nodes/agent-state': () => ({
       nodes: [
@@ -146,6 +147,71 @@ afterEach(() => {
 });
 
 describe('A inline forwarding regression', () => {
+  it('does not report an empty entry as ready after an unsuccessful removal', async () => {
+    serve({ [`GET ${BASE}/forwarding`]: () => overview([entry({ reconcile_status: 'error' })], []) });
+    const view = show();
+    expect(await view.findByText('入口状态待确认')).toBeTruthy();
+    expect(view.queryByText('已就绪')).toBeNull();
+  });
+
+  it('keeps old rules active while another rule syncs or fails and shows scoped errors', async () => {
+    let current = overview(
+      [entry({ desired_generation: 3, applied_generation: 2, reconcile_status: 'pending' })],
+      [rule(), rule({ id: 43, name: '新增规则', listen_port: 20043, runtime_status: 'pending' })],
+    );
+    serve({ [`GET ${BASE}/forwarding`]: () => current });
+    const view = show();
+    await view.findByText('新增规则');
+    const old = view.container.querySelector('.fwd-item.st-active')!;
+    expect(old.textContent).toContain('已监听');
+    expect(old.textContent).not.toContain('同步中');
+    expect(view.container.textContent).toContain('1 条正常 · 1 条同步中');
+    current = overview(
+      [entry({ reconcile_status: 'error', last_error: '另一用户的私密错误' })],
+      [
+        rule(),
+        rule({
+          id: 43,
+          name: '新增规则',
+          listen_port: 20043,
+          runtime_status: 'error',
+          runtime_error: 'TCP 20043 端口被占用',
+        }),
+      ],
+    );
+    await act(() => view.client.invalidateQueries({ queryKey: ['forwarding', user.tenant_id, user.id] }));
+    await waitFor(() => expect(view.container.textContent).toContain('1 条正常 · 1 条失败'));
+    fireEvent.click(view.getByRole('button', { name: /新增规则，入口 20043/ }));
+    expect(view.container.textContent).toContain('TCP 20043 端口被占用');
+    expect(view.container.textContent).not.toContain('另一用户的私密错误');
+    expect(view.container.querySelector('.fwd-item.st-active')?.textContent).not.toContain('收敛失败');
+  });
+
+  it('shows stale rules as unconfirmed with the last report time', async () => {
+    serve({
+      [`GET ${BASE}/forwarding`]: () =>
+        overview([entry({ reported_at: '2026-10-21 01:02:03+00' })], [rule({ runtime_status: 'unknown' })]),
+    });
+    const view = show();
+    await view.findByText('现有规则');
+    expect(view.container.querySelector('.fwd-item')?.textContent).toContain('状态待确认');
+    fireEvent.click(view.getByRole('button', { name: /现有规则，入口 20042/ }));
+    expect(view.container.textContent).toContain('上次回报');
+    expect(view.container.textContent).not.toContain('已应用这条规则');
+  });
+
+  it('warns only when editing an enabled listener rather than its name', async () => {
+    serve({ [`GET ${BASE}/forwarding`]: () => overview([entry()], [rule()]) });
+    const view = show();
+    await view.findByText('现有规则');
+    fireEvent.click(view.getByRole('button', { name: '编辑 东京入口 :20042' }));
+    const form = view.getByRole('form', { name: '编辑入口 20042 的规则' });
+    fireEvent.change(within(form).getByLabelText('名称'), { target: { value: '改名' } });
+    expect(form.textContent).not.toContain('已有连接会断开');
+    fireEvent.change(within(form).getByLabelText('目标地址'), { target: { value: 'example.net:8443' } });
+    expect(form.textContent).toContain('已有连接会断开；其他规则继续运行');
+  });
+
   it('uses the shared forwarding icon in the panel title and both empty states', async () => {
     serve({ [`GET ${BASE}/forwarding`]: () => overview([], []) });
     const view = show();
@@ -168,12 +234,12 @@ describe('A inline forwarding regression', () => {
     serve({ [`GET ${BASE}/forwarding`]: () => current });
     const view = show({ canAuthorize: true });
     const form = await editAuthorization(view);
-    fireEvent.change(within(form).getByLabelText('月度转发额度（GiB）'), { target: { value: '150' } });
-    current = overview([entry({ monthly_used_bytes: 8 * 1024 ** 3 })], [rule()]);
+    fireEvent.change(within(form).getByLabelText('本期转发额度（GiB）'), { target: { value: '150' } });
+    current = overview([entry({ cycle_used_bytes: 8 * 1024 ** 3 })], [rule()]);
     await act(() => view.client.invalidateQueries({ queryKey: ['forwarding', user.tenant_id, user.id] }));
     await waitFor(() => expect(view.container.querySelector('.qta-figs')?.textContent).toContain('8.00 GiB'));
     expect(view.getByRole('form')).toBe(form);
-    expect((within(form).getByLabelText('月度转发额度（GiB）') as HTMLInputElement).value).toBe('150');
+    expect((within(form).getByLabelText('本期转发额度（GiB）') as HTMLInputElement).value).toBe('150');
     fireEvent.click(view.getByRole('button', { name: '编辑 东京入口 :20042' }));
     const ruleForm = view.getByRole('form', { name: '编辑入口 20042 的规则' });
     fireEvent.change(within(ruleForm).getByLabelText('名称'), { target: { value: '保留名称' } });
@@ -202,7 +268,7 @@ describe('A inline forwarding regression', () => {
   });
 
   it('retains a successful policy, preserves the quota draft, and retries only the failed quota', async () => {
-    let current = overview([entry({ monthly_limit_bytes: 100 * 1024 ** 3 })], [rule()]);
+    let current = overview([entry({ cycle_limit_bytes: 100 * 1024 ** 3 })], [rule()]);
     let attempts = 0;
     const request = serve({
       [`GET ${BASE}/forwarding`]: () => current,
@@ -213,7 +279,7 @@ describe('A inline forwarding regression', () => {
       [`PUT ${BASE}/forwarding-nodes/n1/quota`]: init => {
         if (++attempts === 1) return Response.json({ error: '请重试' }, { status: 503 });
         current = overview(
-          [{ ...current.entitlements[0], monthly_limit_bytes: JSON.parse(String(init?.body)).limit_bytes }],
+          [{ ...current.entitlements[0], cycle_limit_bytes: JSON.parse(String(init?.body)).limit_bytes }],
           current.rules,
         );
         return current;
@@ -222,11 +288,11 @@ describe('A inline forwarding regression', () => {
     const view = show({ canAuthorize: true });
     const form = await editAuthorization(view);
     fireEvent.change(within(form).getByLabelText('规则上限'), { target: { value: '8' } });
-    fireEvent.change(within(form).getByLabelText('月度转发额度（GiB）'), { target: { value: '200' } });
+    fireEvent.change(within(form).getByLabelText('本期转发额度（GiB）'), { target: { value: '200' } });
     fireEvent.click(within(form).getByRole('button', { name: '保存' }));
     await within(form).findByText(/授权已保存，配额保存失败/);
     expect(view.container.querySelector('.qta-left')?.textContent).toContain('1 / 8');
-    expect((within(form).getByLabelText('月度转发额度（GiB）') as HTMLInputElement).value).toBe('200');
+    expect((within(form).getByLabelText('本期转发额度（GiB）') as HTMLInputElement).value).toBe('200');
     expect(writes(request).map(write => write.path)).toEqual([
       `${BASE}/forwarding-nodes/n1`,
       `${BASE}/forwarding-nodes/n1/quota`,
@@ -249,7 +315,7 @@ describe('A inline forwarding regression', () => {
     const view = show({ canAuthorize: true });
     const form = await editAuthorization(view);
     fireEvent.change(within(form).getByLabelText('规则上限'), { target: { value: '8' } });
-    fireEvent.change(within(form).getByLabelText('月度转发额度（GiB）'), { target: { value: '200' } });
+    fireEvent.change(within(form).getByLabelText('本期转发额度（GiB）'), { target: { value: '200' } });
     fireEvent.click(within(form).getByRole('button', { name: '保存' }));
     await within(form).findByText('授权保存失败');
     expect(writes(request)).toHaveLength(1);
@@ -269,7 +335,7 @@ describe('A inline forwarding regression', () => {
               node_id: 'n2',
               node_name: '洛杉矶入口',
               ...JSON.parse(String(init?.body)),
-              monthly_limit_bytes: null,
+              cycle_limit_bytes: null,
             }),
           ],
           [],
@@ -278,7 +344,7 @@ describe('A inline forwarding regression', () => {
       },
       [`PUT ${BASE}/forwarding-nodes/n2/quota`]: () => {
         if (++attempts === 1) return Response.json({ error: '配额暂不可用' }, { status: 503 });
-        current = overview([{ ...current.entitlements[0], monthly_limit_bytes: 50 * 1024 ** 3 }], []);
+        current = overview([{ ...current.entitlements[0], cycle_limit_bytes: 50 * 1024 ** 3 }], []);
         return current;
       },
     });
@@ -286,11 +352,11 @@ describe('A inline forwarding regression', () => {
     fireEvent.click(await view.findByRole('button', { name: '授权机器' }));
     const grant = view.getByRole('form', { name: '授权转发入口' });
     fireEvent.click(within(grant).getByRole('radio', { name: /洛杉矶入口/ }));
-    fireEvent.change(within(grant).getByLabelText('月度转发额度（GiB）'), { target: { value: '50' } });
+    fireEvent.change(within(grant).getByLabelText('本期转发额度（GiB）'), { target: { value: '50' } });
     fireEvent.click(within(grant).getByRole('button', { name: '授权' }));
     const form = await view.findByRole('form', { name: '编辑 洛杉矶入口 的转发授权' });
     await within(form).findByText(/授权已保存，配额保存失败/);
-    expect((within(form).getByLabelText('月度转发额度（GiB）') as HTMLInputElement).value).toBe('50');
+    expect((within(form).getByLabelText('本期转发额度（GiB）') as HTMLInputElement).value).toBe('50');
     fireEvent.click(within(form).getByRole('button', { name: '保存' }));
     await waitFor(() => expect(view.queryByRole('form')).toBeNull());
     expect(writes(request).map(write => write.path)).toEqual([
@@ -331,7 +397,7 @@ describe('A inline forwarding regression', () => {
           [entry(), entry({ node_id: 'n2', node_name: '洛杉矶入口' })],
           [rule(), rule({ id: 43, node_id: 'n2', name: '另一台规则' })],
         ),
-      'GET /usage/monthly-summary': () => monthly([usage(42, 4 * MiB, 0), usage(43, 9 * MiB, 0, { node_id: 'n2' })]),
+      'GET /usage/user-cycles': () => cycleUsage([usage(42, 4 * MiB, 0), usage(43, 9 * MiB, 0, { node_id: 'n2' })]),
     });
     const view = show({ canAuthorize: true });
     await view.findByText('另一台规则');
@@ -433,14 +499,14 @@ describe('forwarding quota input', () => {
     expect(forwardingQuotaValue(forwardingQuotaText(exactBytes), forwardingQuotaText(exactBytes), exactBytes)).toBe(
       exactBytes,
     );
-    const quotaEntry = entry({ monthly_limit_bytes: exactBytes, monthly_used_bytes: 0 });
+    const quotaEntry = entry({ cycle_limit_bytes: exactBytes, cycle_used_bytes: 0 });
     const request = serve({
       [`GET ${BASE}/forwarding`]: () => overview([quotaEntry], [rule()]),
       [`PUT ${BASE}/forwarding-nodes/n1`]: () => overview([{ ...quotaEntry, max_rules: 8 }], [rule()]),
     });
     const view = show({ canAuthorize: true });
     fireEvent.click(await view.findByRole('button', { name: '编辑 东京入口 的转发授权' }));
-    expect((view.getByLabelText('月度转发额度（GiB）') as HTMLInputElement).value).toBe('1.15');
+    expect((view.getByLabelText('本期转发额度（GiB）') as HTMLInputElement).value).toBe('1.15');
     fireEvent.change(view.getByLabelText('规则上限'), { target: { value: '8' } });
     fireEvent.click(within(view.getByRole('form')).getByRole('button', { name: '保存' }));
     await waitFor(() => expect(view.queryByRole('form')).toBeNull());
@@ -451,7 +517,7 @@ describe('forwarding quota input', () => {
 
 describe('用户转发入口', () => {
   it('switches between inline editors without disabling unrelated actions and retains the readings', async () => {
-    serve({ [`GET ${BASE}/forwarding`]: () => overview([entry({ monthly_used_bytes: 5 * 1024 ** 3 })], [rule()]) });
+    serve({ [`GET ${BASE}/forwarding`]: () => overview([entry({ cycle_used_bytes: 5 * 1024 ** 3 })], [rule()]) });
     const view = show({ canAuthorize: true });
     await view.findByText('现有规则');
     fireEvent.click(view.getByRole('button', { name: '编辑 东京入口 :20042' }));
@@ -477,14 +543,14 @@ describe('用户转发入口', () => {
 
   it('quota edits remain inline on failure and Escape cancels without another write', async () => {
     const request = serve({
-      [`GET ${BASE}/forwarding`]: () => overview([entry({ monthly_limit_bytes: 100 * 1024 ** 3 })], [rule()]),
+      [`GET ${BASE}/forwarding`]: () => overview([entry({ cycle_limit_bytes: 100 * 1024 ** 3 })], [rule()]),
       [`GET ${BASE}/forwarding-nodes/n1/quota/jobs`]: () => ({ jobs: [], next_before_id: null }),
       [`PUT ${BASE}/forwarding-nodes/n1/quota`]: () => new Response('暂时无法保存', { status: 503 }),
     });
     const view = show({ canAuthorize: true });
     fireEvent.click(await view.findByRole('button', { name: '编辑 东京入口 的转发授权' }));
     const form = view.getByRole('form', { name: '编辑 东京入口 的转发授权' });
-    const input = within(form).getByLabelText('月度转发额度（GiB）') as HTMLInputElement;
+    const input = within(form).getByLabelText('本期转发额度（GiB）') as HTMLInputElement;
     expect(document.activeElement).toBe(input);
     fireEvent.change(input, { target: { value: '0' } });
     expect((within(form).getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(true);
@@ -497,7 +563,7 @@ describe('用户转发入口', () => {
     expect(view.queryByRole('form', { name: '编辑 东京入口 的转发授权' })).toBeNull();
     expect(writes(request)).toHaveLength(1);
     fireEvent.click(view.getByRole('button', { name: '编辑 东京入口 的转发授权' }));
-    expect((view.getByLabelText('月度转发额度（GiB）') as HTMLInputElement).value).toBe('100.00');
+    expect((view.getByLabelText('本期转发额度（GiB）') as HTMLInputElement).value).toBe('100.00');
   });
 
   it('canceling inline stop confirmation leaves both machines and all rules unchanged', async () => {
@@ -525,7 +591,7 @@ describe('用户转发入口', () => {
 
   it('lets administrators set a monthly quota per machine and inspect durable jobs', async () => {
     const request = serve({
-      [`GET ${BASE}/forwarding`]: () => overview([entry({ monthly_used_bytes: 5 * 1024 ** 3 })], [rule()]),
+      [`GET ${BASE}/forwarding`]: () => overview([entry({ cycle_used_bytes: 5 * 1024 ** 3 })], [rule()]),
       [`GET ${BASE}/forwarding-nodes/n1/quota/jobs`]: () => ({
         jobs: [
           {
@@ -542,7 +608,7 @@ describe('用户转发入口', () => {
         next_before_id: null,
       }),
       [`PUT ${BASE}/forwarding-nodes/n1/quota`]: () =>
-        overview([entry({ monthly_limit_bytes: 100 * 1024 ** 3, monthly_used_bytes: 5 * 1024 ** 3 })], [rule()]),
+        overview([entry({ cycle_limit_bytes: 100 * 1024 ** 3, cycle_used_bytes: 5 * 1024 ** 3 })], [rule()]),
     });
     const view = show({ canAuthorize: true });
     fireEvent.click(await view.findByRole('button', { name: '编辑 东京入口 的转发授权' }));
@@ -557,7 +623,7 @@ describe('用户转发入口', () => {
     expect(within(jobCard).getByText('暂停转发')).toBeTruthy();
     expect(within(jobCard).getByText('等待节点确认')).toBeTruthy();
     expect(within(jobCard).getByText('等待节点恢复')).toBeTruthy();
-    fireEvent.change(within(dialog).getByLabelText('月度转发额度（GiB）'), { target: { value: '100' } });
+    fireEvent.change(within(dialog).getByLabelText('本期转发额度（GiB）'), { target: { value: '100' } });
     fireEvent.click(within(dialog).getByRole('button', { name: '保存' }));
     await waitFor(() =>
       expect(writes(request)).toContainEqual({
@@ -569,7 +635,7 @@ describe('用户转发入口', () => {
     await waitFor(() => expect(view.queryByRole('form', { name: '编辑 东京入口 的转发授权' })).toBeNull());
     fireEvent.click(view.getByRole('button', { name: '编辑 东京入口 的转发授权' }));
     const reopened = view.getByRole('form', { name: '编辑 东京入口 的转发授权' });
-    fireEvent.change(within(reopened).getByLabelText('月度转发额度（GiB）'), { target: { value: '' } });
+    fireEvent.change(within(reopened).getByLabelText('本期转发额度（GiB）'), { target: { value: '' } });
     fireEvent.click(within(reopened).getByRole('button', { name: '保存' }));
     await waitFor(() =>
       expect(writes(request)).toContainEqual({
@@ -584,7 +650,7 @@ describe('用户转发入口', () => {
     serve({
       [`GET ${BASE}/forwarding`]: () =>
         overview(
-          [entry({ quota_suspended: true, monthly_limit_bytes: 1024 ** 3, monthly_used_bytes: 1024 ** 3 })],
+          [entry({ quota_suspended: true, cycle_limit_bytes: 1024 ** 3, cycle_used_bytes: 1024 ** 3 })],
           [rule({ runtime_status: 'quota-paused' })],
         ),
     });
@@ -601,6 +667,14 @@ describe('用户转发入口', () => {
     expect(await view.findAllByText('404 Not Found')).toHaveLength(2);
     expect(view.queryByText('尚未授权转发入口')).toBeNull();
     expect(view.queryByRole('button', { name: /新建规则/ })).toBeNull();
+  });
+
+  it('有效期暂停在机器摘要和规则上均有明确状态', async () => {
+    serve({ [`GET ${BASE}/forwarding`]: () => overview([entry()], [rule({ runtime_status: 'service-paused' })]) });
+    const view = show();
+    expect((await view.findAllByText('1 条有效期暂停')).length).toBeGreaterThan(0);
+    expect(view.getAllByText('有效期暂停').length).toBeGreaterThan(0);
+    expect(view.queryByText('1 条正常')).toBeNull();
   });
 
   it('管理员在原位表单选机器授权，使用完整的默认转发策略', async () => {
@@ -631,25 +705,29 @@ describe('用户转发入口', () => {
         listen_port_start: 30_000,
         listen_port_end: 59_999,
         max_rules: 100,
-        allow_private_targets: true,
+        allow_private_targets: false,
       },
     });
     expect(await view.findByRole('button', { name: '编辑 洛杉矶入口 的转发授权' })).toBeTruthy();
     expect(view.queryByRole('dialog')).toBeNull();
   });
 
-  it('读数栏给出本月转发与已删除规则；IPv6 入口与目标不重复方括号', async () => {
+  it('读数栏给出本期转发与已删除规则；IPv6 入口与目标不重复方括号', async () => {
     serve({
       [`GET ${BASE}/forwarding`]: () => overview([entry()], [rule()]),
-      'GET /usage/monthly-summary': () =>
-        monthly([usage(42, 3 * MiB, 1 * MiB), usage(7, 1 * MiB, 0), usage(42, 9 * MiB, 9 * MiB, { user_id: 'bob' })]),
+      'GET /usage/user-cycles': () =>
+        cycleUsage([
+          usage(42, 3 * MiB, 1 * MiB),
+          usage(7, 1 * MiB, 0),
+          usage(42, 9 * MiB, 9 * MiB, { user_id: 'bob' }),
+        ]),
     });
     const view = show();
 
     await view.findByText('现有规则');
     await waitFor(() => expect(view.container.querySelector('.user-usage-hero-value')?.textContent).toBe('5.0 MiB'));
     expect(view.getByText('其中 1.0 MiB 来自已删除的规则')).toBeTruthy();
-    expect(view.container.querySelector('.fwd-month b')?.textContent).toBe('4.0 MiB');
+    expect(view.container.querySelector('.fwd-cycle b')?.textContent).toBe('4.0 MiB');
 
     fireEvent.click(view.getByRole('button', { name: /现有规则，入口 20042/ }));
     expect(view.getByText('198.51.100.10:20042')).toBeTruthy();
@@ -665,8 +743,8 @@ describe('用户转发入口', () => {
           [entry(), entry({ node_id: 'n2', node_name: '洛杉矶入口', max_rules: 2 })],
           [rule(), rule({ id: 43, node_id: 'n2', enabled: false })],
         ),
-      'GET /usage/monthly-summary': () =>
-        monthly([
+      'GET /usage/user-cycles': () =>
+        cycleUsage([
           usage(42, 3 * MiB, MiB),
           usage(7, MiB, 0),
           usage(43, 2 * MiB, 0, { node_id: 'n2' }),
@@ -691,7 +769,7 @@ describe('用户转发入口', () => {
   it('月流量加载失败时保留未知读数，不伪装成零用量', async () => {
     serve({
       [`GET ${BASE}/forwarding`]: () => overview([entry()], [rule()]),
-      'GET /usage/monthly-summary': () => new Response('Unavailable', { status: 503 }),
+      'GET /usage/user-cycles': () => new Response('Unavailable', { status: 503 }),
     });
     const view = show();
     const quotas = await view.findByRole('list', { name: '各转发入口的用量与规则额度' });
@@ -755,6 +833,31 @@ describe('用户转发入口', () => {
       target_host: '[2001:4860::1]',
       target_port: 443,
     });
+  });
+
+  it('允许私网时仍在提交前拒绝回环和元数据目标', async () => {
+    const request = serve({
+      [`GET ${BASE}/forwarding`]: () => overview([entry({ allow_private_targets: true })], [rule()]),
+    });
+    const view = show();
+    await view.findByText('现有规则');
+    fireEvent.click(view.getByRole('button', { name: /新建规则/ }));
+    const submit = view.getByRole('button', { name: '创建规则' }) as HTMLButtonElement;
+    for (const target of [
+      '127.0.0.1:10085',
+      '[::ffff:127.0.0.1]:10085',
+      '169.254.169.254:80',
+      '100.100.100.200:80',
+      '[fd00:ec2::254]:80',
+    ]) {
+      fireEvent.change(view.getByLabelText('目标地址'), { target: { value: target } });
+      expect(view.getByRole('alert').textContent).toContain('始终拒绝');
+      expect(submit.disabled).toBe(true);
+    }
+    fireEvent.change(view.getByLabelText('目标地址'), { target: { value: '192.168.1.10:22' } });
+    expect(view.queryByRole('alert')).toBeNull();
+    expect(submit.disabled).toBe(false);
+    expect(writes(request)).toHaveLength(0);
   });
 
   it('就地修改已有规则的协议和端口', async () => {
@@ -937,7 +1040,7 @@ describe('用户转发入口', () => {
     expect(writes(request)).toEqual([]);
   });
 
-  it('按机器筛选、搜索，并可按本月流量排序', async () => {
+  it('按机器筛选、搜索，并可按本期流量排序', async () => {
     serve({
       [`GET ${BASE}/forwarding`]: () =>
         overview(
@@ -961,8 +1064,8 @@ describe('用户转发入口', () => {
             }),
           ],
         ),
-      'GET /usage/monthly-summary': () =>
-        monthly([usage(42, 4 * MiB, 0), usage(43, 9 * MiB, 0, { node_id: 'n2' }), usage(44, 1 * MiB, 0)]),
+      'GET /usage/user-cycles': () =>
+        cycleUsage([usage(42, 4 * MiB, 0), usage(43, 9 * MiB, 0, { node_id: 'n2' }), usage(44, 1 * MiB, 0)]),
     });
     const view = show();
     const ports = () =>
@@ -972,7 +1075,7 @@ describe('用户转发入口', () => {
     expect(ports()).toEqual(['20002', '20042', '20001']);
     await waitFor(() => expect(view.container.querySelector('.user-usage-hero-value')?.textContent).toBe('14.0 MiB'));
 
-    fireEvent.change(view.getByRole('combobox', { name: '规则排序' }), { target: { value: 'month' } });
+    fireEvent.change(view.getByRole('combobox', { name: '规则排序' }), { target: { value: 'cycle' } });
     expect(ports()).toEqual(['20042', '20002', '20001']);
 
     fireEvent.change(view.getByRole('combobox', { name: '筛选转发机器' }), { target: { value: 'n2' } });

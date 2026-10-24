@@ -8,12 +8,13 @@ import (
 )
 
 type DokodemoConfig struct {
-	Address        *Address          `json:"address"`
-	Port           uint16            `json:"port"`
-	PortMap        map[string]string `json:"portMap"`
-	Network        *NetworkList      `json:"network"`
-	FollowRedirect bool              `json:"followRedirect"`
-	UserLevel      uint32            `json:"userLevel"`
+	Address                *Address                         `json:"address"`
+	Port                   uint16                           `json:"port"`
+	PortMap                map[string]string                `json:"portMap"`
+	Network                *NetworkList                     `json:"network"`
+	FollowRedirect         bool                             `json:"followRedirect"`
+	UserLevel              uint32                           `json:"userLevel"`
+	ForwardingTargetPolicy *dokodemo.ForwardingTargetPolicy `json:"forwardingTargetPolicy"`
 }
 
 func (v *DokodemoConfig) Build() (proto.Message, error) {
@@ -31,5 +32,6 @@ func (v *DokodemoConfig) Build() (proto.Message, error) {
 	config.Networks = v.Network.Build()
 	config.FollowRedirect = v.FollowRedirect
 	config.UserLevel = v.UserLevel
+	config.ForwardingTargetPolicy = v.ForwardingTargetPolicy
 	return config, nil
 }

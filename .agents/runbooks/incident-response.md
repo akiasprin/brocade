@@ -42,6 +42,34 @@ Content-Length、不支持的传输编码会显式失败。头部、临时响应
 共用原有 16MiB 总报文预算。仍兼容 TLS 对端省略 close_notify，但不能因此接受截断的定长或
 chunked 正文。该修复不延长网络超时、不自动重放 HTTP 请求；仅需更新 Agent，无协议变更。
 
+协议 v39 起还记录 `phase`、已知 HTTP `status`、`received_bytes`、`content_length` 和
+`response_elapsed_ms`，不包含响应头值、正文或凭据。先据此区分未收到状态行、头部不完整、
+正文停顿或关闭分隔响应等待 EOF，再结合代理访问日志判断链路位置；不能只凭超时认定
+Console 执行慢。派发响应丢失后的重领与新旧版本兼容行为见 `../../docs/concepts.md` 的节点收敛说明。
+
+### 停机后 Ping 持续没有新数据
+
+先分别检查 `node_ping_probe_samples` 的最新采样时间、Agent 独立 journal 中的探测结果和
+`/agent/v1/ping-probe` 上报响应。本机探测正常但上报反复返回 `PING probe clock skew`，
+且请求年龄接近 900 秒、机器实际时钟正常时，应排查旧 Console 把补报年龄误当作
+超过 10 分钟时钟偏差，造成队首反复重试。修复后的 Console 按 Ping 的数据保留策略接收
+历史补报，超期有效样本成功确认并计入 `skipped_samples`；异常未来时间仍拒绝。
+只更新 Console 即可让已有 Agent 继续排空队列，不依赖某个固定的离线时长。
+验证时同时确认历史补报正在推进、最新采样时间追上当前时间，不能只看上报返回 200。
+现有 Agent 缓存有限，长停机期间已过期或进程重启丢失的样本仍应显示真实缺口。
+
+### Xray 平滑交接控制失联
+
+核对 `xray-upgrade.json` 中的旧代/候选 PID、start ticks、摘要、phase 与实际进程，保留
+`xray-crash-recovery.json`、配置候选授权快照和共享计量文件。v40 的控制错误包含 operation、
+连接/响应阶段与 2 秒上限；`Resource temporarily unavailable` 代表有界等待超时，不能
+仅据此判定配置错误。候选被 kill 时不应等满 30 秒启动窗口；被冻结或控制 socket 丢失时，
+守护线程应在本地恢复，期间用实际业务请求校验可用性，不把 15 秒发布收尾轮询当作断流时长。
+健康候选可继续服务时只清理失联旧代；重启降级会中断连接，需核对降级原因、完整授权/转发
+恢复及计量 epoch 延续。不要删除交接/恢复文件来绕过围栏，也不要同时启动第三个 Xray。
+
+可重复 Docker 注入入口及覆盖边界见[交接故障验证](../../scripts/tests/xray-faults/README.md)。
+
 ### 机器尖峰流量归属
 
 从「用量 → 实时 → 机器弹层」定位所选区间内的尖峰，拖选图表或在「统计 → 自定义」输入 UTC+8

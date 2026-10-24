@@ -45,6 +45,76 @@ fn installer_section(start: &str, end: &str) -> &'static str {
 }
 
 #[test]
+fn upgrade_failure_restores_old_files_only_before_the_migration_boundary() {
+    let cleanup = installer_section("cleanup_staging() {", "\ntrap cleanup_staging 0");
+    for (published, migration_started) in [(false, false), (true, false), (true, true)] {
+        let root = tempfile::tempdir().unwrap();
+        let backup = root.path().join("backup");
+        fs::create_dir_all(backup.join("database")).unwrap();
+        if migration_started {
+            fs::write(backup.join("database/migration-started"), "started").unwrap();
+        }
+        let script = root.path().join("cleanup.sh");
+        fs::write(&script, format!(
+            "#!/bin/sh\nset -eu\nupgrade_service_stopped=true\nupgrade_success=false\nupgrade_published={published}\nupgrade_backup=$1\n\
+             launcher_stage=$1/launcher\nconsole_stage=$1/console\ncommand_stage=$1/command\nlisten_address_stage=$1/listen\n\
+             public_url_stage=$1/public\ndatabase_type_stage=$1/type\ndatabase_url_stage=$1/url\nservice_stage=$1/service\nready_error=$1/ready\n\
+             systemctl() {{ printf 'systemctl %s\\n' \"$*\"; }}\n\
+             tar() {{ printf 'restore installation\\n'; }}\n\
+             say() {{ printf '%s\\n' \"$*\"; }}\n{cleanup}\ncleanup_staging\n"
+        )).unwrap();
+        let output = Command::new("sh")
+            .arg(script)
+            .arg(&backup)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            output.contains("restore installation"),
+            published && !migration_started
+        );
+        assert_eq!(
+            output.contains("systemctl start brocade.service"),
+            !migration_started
+        );
+        assert_eq!(
+            output.contains("systemctl reset-failed brocade.service"),
+            !migration_started
+        );
+        if !migration_started {
+            let reset = output
+                .find("systemctl reset-failed brocade.service")
+                .unwrap();
+            let start = output.find("systemctl start brocade.service").unwrap();
+            assert!(
+                reset < start,
+                "recovery must clear the failed candidate's start limit"
+            );
+        }
+        if migration_started {
+            assert!(output.contains("systemctl stop brocade.service"));
+        }
+    }
+}
+
+#[test]
+fn upgrade_retains_saved_entry_instead_of_running_new_install_detection() {
+    let selection = installer_section(
+        "if [ \"$upgrade\" = true ]; then\n    public_url=$saved_public_url",
+        "\nrun_upgrade_database() {",
+    );
+    let output = Command::new("sh").args(["-c", &format!(
+        "set -eu\nupgrade=true\nsaved_public_url=http://192.0.2.20:9001\nsaved_listen_address=0.0.0.0:9001\n{selection}\nprintf '%s\\n' \"$public_url\" \"$listen_address\""
+    )]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "http://192.0.2.20:9001\n0.0.0.0:9001\n"
+    );
+}
+
+#[test]
 fn installer_accepts_static_musl_on_gnu_without_accepting_other_architectures() {
     let check = installer_section("case $(uname -m) in\n", "\nhas_ca_bundle() {");
     let root = tempfile::tempdir().unwrap();

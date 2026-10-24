@@ -36,7 +36,7 @@ const nodes = {
         xray: 'Xray 26.8.1',
         xray_installed_sha256: OLD_A,
         xray_running_sha256: OLD_A,
-        xray_handoff: { state: 'ready' as const },
+        xray_handoff: { state: 'ready' as 'ready' | 'blocked' },
       },
     },
     {
@@ -50,7 +50,7 @@ const nodes = {
         xray: 'Xray 26.8.1',
         xray_installed_sha256: OLD_B,
         xray_running_sha256: OLD_B,
-        xray_handoff: { state: 'ready' as const },
+        xray_handoff: { state: 'ready' as 'ready' | 'blocked' },
       },
     },
     {
@@ -145,6 +145,24 @@ describe('Xray 升级', () => {
     clients.at(-1)!.setQueryData(['deployment-settings'], { unattended: true, xray_handoff_beta: true });
     await waitFor(() => expect(screen.getByRole('radio', { name: '双跑交接 Beta' })).toBeTruthy());
     expect((screen.getByRole('radio', { name: '直接重启' }) as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('v40 允许交接条件不足时降级，旧 Agent 仍需 ready', () => {
+    const candidates = structuredClone(nodes);
+    for (const node of candidates.nodes.slice(0, 2)) {
+      node.runtime_versions!.xray_handoff!.state = 'blocked';
+    }
+    candidates.nodes[0].agent_protocol_version = 40;
+    candidates.nodes[1].agent_protocol_version = 39;
+    mount(emptyView(), candidates, true);
+    fireEvent.click(screen.getByRole('radio', { name: '双跑交接 Beta' }));
+    expect((screen.getByLabelText('升级 台北入口') as HTMLInputElement).disabled).toBe(false);
+    expect((screen.getByLabelText('升级 东京中继') as HTMLInputElement).disabled).toBe(true);
+    fireEvent.click(screen.getByLabelText('升级 台北入口'));
+    fireEvent.click(screen.getByRole('button', { name: '批准' }));
+    expect(
+      within(screen.getByRole('dialog', { name: '确认双跑升级？' })).getByText(/交接条件不足时会降级直接重启/),
+    ).toBeTruthy();
   });
 
   it('显示源码 commit，按实际运行摘要识别当前构建，不显示上游版本号', () => {

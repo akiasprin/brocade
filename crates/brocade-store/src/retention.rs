@@ -5,6 +5,8 @@
 //! records and billing rollups are historical too, but are durable audit state. Keeping a small
 //! allow-list makes the Settings page incapable of turning a core model table into TTL data.
 
+pub(crate) mod cleanup;
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -35,6 +37,29 @@ pub struct DataRetentionPolicyView {
     /// PostgreSQL's statistics estimate; deliberately not presented as an exact count.
     pub estimated_rows: u64,
     pub total_bytes: u64,
+    pub estimated_dead_rows: u64,
+    pub last_vacuum_unix_secs: Option<i64>,
+    pub cleanup: Option<RetentionCleanupView>,
+}
+
+/// Most recent cleanup observation. Backlog is unknown when its bounded probe could not finish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionCleanupView {
+    pub ttl_hours: u32,
+    pub finished_at_unix_secs: i64,
+    pub last_success_unix_secs: Option<i64>,
+    /// Rows removed by the last successful run, preserved if a later run fails.
+    pub deleted_rows: u64,
+    pub error_code: Option<String>,
+    pub has_backlog: Option<bool>,
+    pub next_run_unix_secs: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionCleanupResult {
+    pub table_name: String,
+    pub deleted_rows: u64,
+    pub error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +240,12 @@ const DEFINITIONS: &[Definition] = &[
         24,
     ),
     history(
+        "vpngate_probe_samples",
+        "VPN Gate 运行探测样本",
+        "实际出口池的逐次拨测历史；最新结果和最后成功证据独立保存。",
+        7 * 24,
+    ),
+    history(
         "vpngate_server_observations",
         "VPN Gate 目录观测",
         "目录同步时看到的服务器历史，用于短期追溯候选变化。",
@@ -341,9 +372,17 @@ impl PgStore {
             "WITH names(table_name) AS (SELECT unnest($1::text[]))
              SELECT names.table_name,
                     COALESCE(stats.n_live_tup, 0)::bigint AS estimated_rows,
-                    COALESCE(pg_total_relation_size(to_regclass(names.table_name)), 0)::bigint AS total_bytes
+                    COALESCE(pg_total_relation_size(to_regclass(names.table_name)), 0)::bigint AS total_bytes,
+                    COALESCE(stats.n_dead_tup, 0)::bigint AS estimated_dead_rows,
+                    extract(epoch FROM greatest(stats.last_vacuum, stats.last_autovacuum))::bigint AS last_vacuum,
+                    cleanup.ttl_hours AS cleanup_hours,
+                    extract(epoch FROM cleanup.finished_at)::bigint AS cleanup_finished,
+                    extract(epoch FROM cleanup.last_success_at)::bigint AS cleanup_success,
+                    cleanup.deleted_rows, cleanup.error_code, cleanup.has_backlog,
+                    extract(epoch FROM cleanup.next_run_at)::bigint AS cleanup_next
                FROM names
-               LEFT JOIN pg_stat_user_tables stats ON stats.relname = names.table_name",
+               LEFT JOIN pg_stat_user_tables stats ON stats.relid = to_regclass(names.table_name)
+               LEFT JOIN data_retention_cleanup cleanup ON cleanup.table_name = names.table_name",
         )
         .bind(&table_names)
         .fetch_all(self.pool())
@@ -353,7 +392,23 @@ impl PgStore {
             let name: String = row.try_get("table_name")?;
             let rows: i64 = row.try_get("estimated_rows")?;
             let bytes: i64 = row.try_get("total_bytes")?;
-            Ok((name, (rows.max(0) as u64, bytes.max(0) as u64)))
+            let dead: i64 = row.try_get("estimated_dead_rows")?;
+            let vacuum: Option<i64> = row.try_get("last_vacuum")?;
+            let finished: Option<i64> = row.try_get("cleanup_finished")?;
+            let cleanup = if let Some(finished_at_unix_secs) = finished {
+                Some(RetentionCleanupView {
+                    ttl_hours: u32::try_from(row.try_get::<i32, _>("cleanup_hours")?)
+                        .map_err(|_| StoreError::InvalidData("negative cleanup TTL".to_owned()))?,
+                    finished_at_unix_secs,
+                    last_success_unix_secs: row.try_get("cleanup_success")?,
+                    deleted_rows: u64::try_from(row.try_get::<i64, _>("deleted_rows")?)
+                        .map_err(|_| StoreError::InvalidData("negative cleanup count".to_owned()))?,
+                    error_code: row.try_get("error_code")?,
+                    has_backlog: row.try_get("has_backlog")?,
+                    next_run_unix_secs: row.try_get("cleanup_next")?,
+                })
+            } else { None };
+            Ok((name, (rows.max(0) as u64, bytes.max(0) as u64, dead.max(0) as u64, vacuum, cleanup)))
         })
         .collect::<Result<HashMap<_, _>>>()?;
 
@@ -362,8 +417,13 @@ impl PgStore {
                 .iter()
                 .map(|item| {
                     let override_hours = overrides.get(item.table_name).copied();
-                    let (estimated_rows, total_bytes) =
-                        stats.get(item.table_name).copied().unwrap_or_default();
+                    let (
+                        estimated_rows,
+                        total_bytes,
+                        estimated_dead_rows,
+                        last_vacuum_unix_secs,
+                        cleanup,
+                    ) = stats.get(item.table_name).cloned().unwrap_or_default();
                     DataRetentionPolicyView {
                         table_name: item.table_name.to_owned(),
                         title: item.title.to_owned(),
@@ -378,6 +438,9 @@ impl PgStore {
                         customized: override_hours.is_some(),
                         estimated_rows,
                         total_bytes,
+                        estimated_dead_rows,
+                        last_vacuum_unix_secs,
+                        cleanup,
                     }
                 })
                 .collect(),
@@ -420,162 +483,24 @@ impl PgStore {
         self.data_retention().await
     }
 
-    pub async fn prune_configured_usage_readings(
-        &self,
-        schedule: &RetentionSchedule,
-    ) -> Result<u64> {
-        crate::usage::prune_usage_readings_hours(self.pool(), schedule.ttl_hours("usage_readings"))
-            .await
-    }
-
-    pub async fn prune_configured_usage_receipts(
-        &self,
-        schedule: &RetentionSchedule,
-    ) -> Result<u64> {
-        let ordinary = crate::usage::prune_usage_report_receipts_hours(
-            self.pool(),
-            schedule.ttl_hours("usage_report_receipts"),
-        )
-        .await?;
-        let forwarding = crate::forwarding::prune_usage_report_receipts_hours(
-            self.pool(),
-            schedule.ttl_hours("forwarding_usage_report_receipts"),
-        )
-        .await?;
-        ordinary
-            .checked_add(forwarding)
-            .ok_or_else(|| StoreError::InvalidData("usage receipt prune count overflow".to_owned()))
-    }
-
-    pub async fn prune_configured_usage_history(
-        &self,
-        schedule: &RetentionSchedule,
-    ) -> Result<u64> {
-        crate::source_traffic::prune(
-            self.pool(),
-            schedule.ttl_hours("source_traffic_windows"),
-            schedule.ttl_hours("source_traffic_daily"),
-        )
-        .await?;
-        crate::other_domain::prune_hours(
-            self.pool(),
-            schedule.ttl_hours("user_other_domain_hourly"),
-            schedule.ttl_hours("user_sniffing_failed_hourly"),
-            schedule.ttl_hours("other_domain_counter_heads"),
-            schedule.ttl_hours("sniffing_failed_counter_heads"),
-        )
-        .await?;
-        let site = crate::site_usage::prune_hours(
-            self.pool(),
-            schedule.ttl_hours("user_site_usage_hourly"),
-        )
-        .await?;
-        let ordinary = crate::usage::prune_usage_samples_hours(
-            self.pool(),
-            schedule.ttl_hours("usage_samples"),
-            schedule.ttl_hours("usage_chain_samples"),
-            schedule.ttl_hours("usage_node_windows"),
-        )
-        .await?;
-        let forwarding = crate::forwarding::prune_usage_samples_hours(
-            self.pool(),
-            schedule.ttl_hours("forwarding_usage_samples"),
-            schedule.ttl_hours("forwarding_usage_windows"),
-        )
-        .await?;
-        site.checked_add(ordinary)
-            .and_then(|rows| rows.checked_add(forwarding))
-            .ok_or_else(|| StoreError::InvalidData("usage prune count overflow".to_owned()))
-    }
-
-    pub async fn prune_configured_load_history(&self, schedule: &RetentionSchedule) -> Result<u64> {
-        crate::load::prune_load_samples_hours(
-            self.pool(),
-            schedule.ttl_hours("node_load_samples"),
-            schedule.ttl_hours("node_hop_link_samples"),
-        )
-        .await
-    }
-
-    pub async fn prune_configured_ping_history(&self, schedule: &RetentionSchedule) -> Result<u64> {
-        crate::ping_probe::prune_samples_hours(
-            self.pool(),
-            schedule.ttl_hours("node_ping_probe_samples"),
-        )
-        .await
-    }
-
-    pub async fn prune_configured_e2e_history(&self, schedule: &RetentionSchedule) -> Result<u64> {
-        crate::probe::prune_e2e_samples_hours(self.pool(), schedule.ttl_hours("e2e_probe_samples"))
-            .await
-    }
-
-    pub async fn prune_configured_vpngate_history(
-        &self,
-        schedule: &RetentionSchedule,
-    ) -> Result<u64> {
-        crate::vpngate::prune_history_hours(
-            self.pool(),
-            schedule.ttl_hours("vpngate_candidate_probe_samples"),
-            schedule.ttl_hours("vpngate_server_observations"),
-        )
-        .await
-    }
-
-    pub async fn prune_configured_public_ip_history(
-        &self,
-        schedule: &RetentionSchedule,
-    ) -> Result<u64> {
-        crate::public_ip::prune_hours(self.pool(), schedule.ttl_hours("node_public_ip_events"))
-            .await
-    }
-
-    pub async fn prune_configured_machine_events(
-        &self,
-        schedule: &RetentionSchedule,
-    ) -> Result<u64> {
-        crate::notifications::prune_hours(self.pool(), schedule.ttl_hours("machine_events")).await
-    }
-
-    pub async fn prune_configured_online_sources(
-        &self,
-        schedule: &RetentionSchedule,
-    ) -> Result<u64> {
-        crate::user_presence::prune_hours(self.pool(), schedule.ttl_hours("user_online_sources"))
-            .await
-    }
-
-    pub async fn prune_configured_traffic_forecasts(
-        &self,
-        schedule: &RetentionSchedule,
-    ) -> Result<u64> {
-        crate::traffic::prune_machine_traffic_forecasts_hours(
-            self.pool(),
-            schedule.ttl_hours("node_traffic_forecasts"),
-        )
-        .await
-    }
-
-    pub async fn prune_configured_certificate_scans(
-        &self,
-        schedule: &RetentionSchedule,
-    ) -> Result<u64> {
-        crate::cert::prune_certificate_scans_hours(
-            self.pool(),
-            schedule.ttl_hours("certificate_scan_runs"),
-        )
-        .await
-    }
-
-    pub async fn prune_configured_tunnel_probes(
-        &self,
-        schedule: &RetentionSchedule,
-    ) -> Result<u64> {
-        crate::tunnel_probe::prune_hours(
-            self.pool(),
-            schedule.ttl_hours("external_outbound_probe_runs"),
-        )
-        .await
+    /// Run due tables independently. A per-table failure is reported without skipping others.
+    pub async fn run_data_retention(&self) -> Result<Vec<RetentionCleanupResult>> {
+        let schedule = self.retention_schedule().await?;
+        let mut results = Vec::new();
+        for item in DEFINITIONS {
+            match cleanup::run_one(self.pool(), item, &schedule).await {
+                Ok(Some(result)) => results.push(result),
+                Ok(None) => {}
+                Err(_) => results.push(RetentionCleanupResult {
+                    table_name: item.table_name.to_owned(),
+                    deleted_rows: 0,
+                    // Database/connection failures can prevent recording status itself. Never
+                    // expose a raw database message, which can contain values or credentials.
+                    error_code: Some("status_unavailable".to_owned()),
+                }),
+            }
+        }
+        Ok(results)
     }
 }
 

@@ -2414,7 +2414,9 @@
   .dialog-layer.modal {
     padding: 10px;
   }
-  .tunnel-row {
+  /* 自定义行隐藏引用信息后也按四列重排，避免桌面专用列继续挤占名称。 */
+  .tunnel-row,
+  .tunnel-row.manual-row {
     grid-template-columns: 36px minmax(0, 1fr) 66px 10px;
     min-height: 64px;
     padding: 9px 10px;
@@ -10106,6 +10108,11 @@ details.more b {
   isolation: isolate;
 }
 .dialog-layer.drawer {
+  /* 抽屉占用扣除安全区后的空间，内容不能把隐式网格撑出视口。 */
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  height: 100dvh;
+  box-sizing: border-box;
   place-items: stretch end;
   padding: 0;
 }
@@ -10135,6 +10142,23 @@ details.more b {
   border-right: 0;
   border-bottom: 0;
   border-radius: 0;
+}
+/* 贴着锚点的弹出面板：遮罩透明，只负责点外部关闭和挡住背景滚动；位置由 DialogLayer 量出后写入变量。 */
+.dialog-layer.popover {
+  display: block;
+  padding: 0;
+}
+.dialog-layer.popover > .dialog-scrim {
+  background: transparent;
+  backdrop-filter: none;
+}
+.dialog-layer.popover > .dialog-surface {
+  position: fixed;
+  top: var(--popover-top);
+  left: var(--popover-left);
+  box-sizing: border-box;
+  max-height: calc(100dvh - 16px);
+  overflow-y: auto;
 }
 /* 卡片限制高度、正文内部滚动、按钮固定在底部。
    不限制高度时，body 内容变长会使卡片超出视口，而 mask 是 fixed 且居中，
@@ -19184,6 +19208,12 @@ h4.sec > .btn {
   min-width: 0;
   padding: 3px var(--panel-content-x);
 }
+.user-access-quotas {
+  min-width: 0;
+}
+.user-access-quotas > .callout {
+  margin: 12px var(--panel-content-x) 0;
+}
 .user-usage > .dim.qta-empty {
   display: block;
   padding: 16px var(--panel-content-x);
@@ -19276,6 +19306,9 @@ h4.sec > .btn {
   color: var(--ink-2);
   font-weight: 500;
 }
+.qta-left-value {
+  white-space: nowrap;
+}
 .qta-meter {
   display: flex;
   grid-area: meter;
@@ -19311,8 +19344,7 @@ h4.sec > .btn {
   grid-area: acts;
   justify-self: end;
 }
-/* 注意档（≥95%）只给额度条与百分比上色；用尽时额度条、百分比与超出量同用告警色——
-   该行即名册红点的成因，两处需使用同一颜色。不铺底色。 */
+/* 注意档（≥80%）给额度条与百分比上色；停用时用告警色，超额限速仍用注意色。 */
 .qta-r.warn .qta-t > i {
   background: var(--gold);
 }
@@ -19328,55 +19360,6 @@ h4.sec > .btn {
 .qta-r.unknown .qta-figs {
   color: var(--ink-3);
   font-weight: 500;
-}
-/* 编辑中：左缘 2px 主题色竖线加 5% 底色（紧凑列表的选中写法），编辑器占满名称右侧两层。 */
-.qta-r.editing {
-  margin: 0 -14px 0 -20px;
-  padding: 12px 14px 12px 18px;
-  border-left: 2px solid var(--action);
-  background: color-mix(in srgb, var(--action) 5%, transparent);
-}
-.qta-r.editing + .qta-r,
-.qta-r + .qta-r.editing {
-  border-top-color: transparent;
-}
-.qta-editor {
-  display: flex;
-  grid-column: 2 / -1;
-  grid-row: 1 / span 2;
-  min-width: 0;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-}
-.qta-input {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-/* 带上元素名才能压过 input.f 的宽度（否则按 size 默认 20 个字符撑宽）。 */
-input.f.qta-in {
-  width: 96px;
-  font-variant-numeric: tabular-nums;
-  text-align: right;
-}
-.qta-in[aria-invalid='true'] {
-  border-color: var(--err);
-}
-.qta-u {
-  color: var(--ink-4);
-  font-size: 11.5px;
-}
-.qta-hint {
-  color: var(--ink-4);
-  font-size: 11px;
-  line-height: 15px;
-}
-.qta-hint.bad {
-  color: var(--err);
-}
-.qta-editor .sp {
-  flex: 1;
 }
 /* 非编辑态的操作是铅笔图标，悬停整行或键盘聚焦时显出；触屏没有悬停，常显。 */
 .qta-pencil.btn {
@@ -19451,19 +19434,6 @@ input.f.qta-in {
       'meter meter meter';
     column-gap: 10px;
     row-gap: 7px;
-  }
-  .qta-r.editing {
-    margin-inline: calc(0px - var(--panel-content-x-compact));
-    padding: 12px var(--panel-content-x-compact);
-  }
-  .qta-editor {
-    grid-column: 1 / -1;
-    grid-row: 2 / span 2;
-  }
-  /* 窄卡放不下一行：输入框与按钮留在第一行，说明换到下一行。 */
-  .qta-hint {
-    order: 1;
-    flex-basis: 100%;
   }
 }
 @container user-usage (max-width: 400px) {
@@ -20160,51 +20130,53 @@ input.f.qta-in {
   border-bottom: 1px solid var(--line-soft);
   background: var(--band);
 }
-/* 沿用机器详情的横向结构：身份、页签、操作共用一条横梁。64px 的横梁保留两行
-   身份信息所需的纵向呼吸，避免页头退化成工具栏；表面使用实色色带。 */
+/* 固定身份列的上限，让导航不随名称或 UUID 长度横向移动。 */
 .user-dhead-main {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 252px) max-content minmax(0, 1fr);
+  grid-template-rows: minmax(66px, auto);
   min-width: 0;
-  min-height: 64px;
+  min-height: 66px;
   box-sizing: border-box;
   align-items: center;
-  gap: 16px;
+  gap: 20px;
   padding: 0 18px;
 }
 .user-dhead-identity {
   display: flex;
-  max-width: 430px;
+  grid-column: 1;
+  grid-row: 1;
   min-width: 0;
-  flex: 0 1 auto;
+  overflow: hidden;
   align-items: center;
-  gap: 10px;
-  padding-right: 14px;
-  border-right: 1px solid var(--line-soft);
+  gap: 11px;
 }
 .user-dhead .user-detail-tabs {
-  flex: 0 1 auto;
+  grid-column: 2;
+  grid-row: 1;
   min-width: 0;
+  align-self: center;
   margin: 0;
 }
 .user-dhead .user-detail-tabs::before {
   content: none;
 }
 .user-dhead .user-detail-tabs .nd-tabs-seg {
-  gap: 2px;
+  gap: 4px;
 }
 .user-dhead-tools {
   display: flex;
-  flex: none;
+  grid-column: 3;
+  grid-row: 1;
   align-items: center;
-  gap: 8px;
-  margin-left: auto;
-  padding-left: 0;
+  justify-self: end;
+  gap: 9px;
 }
 .user-dhead .plate {
   position: relative;
   display: grid;
-  width: 44px;
-  height: 44px;
+  width: 38px;
+  height: 38px;
   box-sizing: border-box;
   flex: none;
   place-items: center;
@@ -20214,15 +20186,6 @@ input.f.qta-in {
   background: color-mix(in srgb, var(--action) 7%, var(--sheet));
   font: 700 25px/1 var(--sans);
   letter-spacing: -0.06em;
-}
-/* 与机器详情身份徽标相同：状态灯叠在方牌右下角，正常态不再另画「可用」文字胶囊。 */
-.user-dhead .plate > .node-lamp {
-  position: absolute;
-  right: -3px;
-  bottom: -3px;
-  width: 9px;
-  height: 9px;
-  box-shadow: 0 0 0 2px var(--sheet);
 }
 .user-dhead.off .plate,
 .user-dhead.idle .plate {
@@ -20255,56 +20218,98 @@ input.f.qta-in {
   box-shadow: none;
 }
 .user-dhead .dtitle {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
   min-width: 0;
+  gap: 3px;
 }
 .user-dhead .dname {
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
 }
 .user-dhead .dname b {
   min-width: 0;
   overflow: hidden;
   color: var(--ink);
-  font: 650 15px/20px var(--sans);
+  font: 650 16px/21px var(--sans);
   letter-spacing: -0.01em;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.user-monthly-badge {
+.user-account-state {
   display: inline-flex;
   flex: none;
   align-items: center;
   gap: 5px;
   color: var(--ink-3);
   background: transparent;
-  font: 500 11px/18px var(--sans);
-  font-variant-numeric: tabular-nums;
+  font: 400 10.5px/18px var(--sans);
   white-space: nowrap;
 }
-.user-monthly-badge > .ui-icon {
-  color: var(--ink-3);
+.user-account-state::before {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--ok);
+  content: '';
 }
-/* 完整 UUID 是标题下唯一的次级信息；状态由头像灯表达。 */
+.user-account-state[data-tone='bad'] {
+  color: var(--err);
+}
+.user-account-state[data-tone='bad']::before {
+  background: var(--err);
+}
+.user-account-state[data-tone='idle']::before {
+  background: var(--ink-4);
+}
+/* 短标识只用于识别，复制与更多菜单始终使用完整 UUID。 */
 .user-dhead .dsub {
+  display: flex;
+  min-width: 0;
+  margin: 0;
+  line-height: 16px;
+}
+.user-uuid-copy {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  color: var(--ink-4);
+  background: none;
+  font: 400 10.5px/16px var(--sans);
+  cursor: pointer;
+}
+.user-uuid-copy > .mono {
+  min-width: 0;
   overflow: hidden;
-  margin: 1px 0 0;
-  color: var(--ink-3);
-  font-size: 11.5px;
-  line-height: 17px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.user-dhead .dsub > .user-summary-uuid {
-  color: var(--ink-4);
-  font-size: inherit;
-  font-weight: 400;
-  letter-spacing: 0;
-  line-height: inherit;
+.user-uuid-copy > .ui-icon {
+  flex: none;
 }
-.user-dhead .dsub > .bad {
-  color: var(--err);
+.user-uuid-label {
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+}
+.user-uuid-copy:hover:not(.done, .failed) {
+  color: var(--ink-2);
+}
+.user-uuid-copy:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 3px;
+}
+.user-uuid-empty {
+  color: var(--ink-4);
+  font: 400 10.5px/16px var(--mono);
 }
 .user-dbody {
   flex: 0 0 auto;
@@ -20365,6 +20370,8 @@ input.f.qta-in {
 }
 /* 页签与轻操作共享无边框语言；只有当前页签保留浅操作色底，避免丢失选择状态。 */
 .user-dhead .user-detail-tabs button {
+  height: 32px;
+  padding-inline: 12px;
   border: 0;
   background: transparent;
   box-shadow: none;
@@ -21247,7 +21254,8 @@ input.f.qta-in {
    默认只展示最近五个历史来源，其余由用户展开，避免高频换 IP 的账号撑满整个详情页。
    列：最后出现时刻 │ 节点（竖线穿过）│ 来源 IP │ 网络 │ 接入摘要 │ 首次出现。
    机器与协议默认收入摘要按钮，展开后独占下一行，避免一个共享来源把整张用户卡撑高。竖线与节点
-   沿用发布流水（.cgf-list）的画法；IP 列按完整 IPv6 的宽度固定。窄卡改为两行摘要。 */
+   沿用发布流水（.cgf-list）的画法；IP 列按完整 IPv6 加复制、禁行两枚按钮的宽度固定（282 + 2 × 26）。
+   卡宽放不下这一列加网络、接入、流量（约 740px）时改为两行摘要，否则接入摘要会被挤到流量上。 */
 .user-presence-card .user-dcard-body {
   container: user-presence / inline-size;
 }
@@ -21259,6 +21267,13 @@ input.f.qta-in {
   color: var(--ink-3);
   font-size: 11.5px;
   line-height: 1.45;
+}
+.user-presence-note > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.user-presence-note .ago {
+  white-space: nowrap;
 }
 .user-presence-note::before {
   content: '';
@@ -21323,7 +21338,7 @@ input.f.qta-in {
 .user-presence-row {
   display: grid;
   min-height: 34px;
-  grid-template-columns: 40px 12px minmax(0, 312px) 104px minmax(0, 1fr) auto;
+  grid-template-columns: 40px 12px minmax(0, 336px) 104px minmax(0, 1fr) auto;
   align-items: center;
   column-gap: 12px;
 }
@@ -21557,7 +21572,7 @@ input.f.qta-in {
   outline: 2px solid var(--action);
   outline-offset: -2px;
 }
-@container user-presence (max-width: 620px) {
+@container user-presence (max-width: 760px) {
   .user-presence-row {
     grid-template-columns: 40px 12px minmax(0, 1fr) auto;
     grid-template-areas:
@@ -21620,11 +21635,8 @@ input.f.qta-in {
 .user-forwarding-card {
   container: user-forwarding / inline-size;
 }
-.fwd-body > :is(.empty-state, .error, .field-loading) {
+.fwd-body > :is(.empty-state, .error, .loading-mark-field) {
   margin-block: 8px;
-}
-.panel-full-bleed-body.fwd-body > :is(.empty-state, .error, .field-loading) {
-  margin-inline: var(--panel-content-x);
 }
 .fwd-empty-action {
   display: inline-flex;
@@ -21668,20 +21680,6 @@ input.f.qta-in {
   margin-left: auto;
   color: var(--ink-4);
   font-size: 11px;
-}
-/* 规则数到上限才着色：再新建需要先调上限或删规则 */
-.fwd-merr {
-  display: flex;
-  grid-column: 1 / -1;
-  align-items: flex-start;
-  gap: 6px;
-  margin: 0 0 4px;
-  color: var(--err);
-  font-size: 11px;
-  line-height: 15px;
-}
-.fwd-merr .ui-icon {
-  margin-top: 1px;
 }
 .fwd-add {
   display: flex;
@@ -21730,9 +21728,6 @@ input.f.qta-in {
       'figs left left'
       'meter meter meter';
   }
-}
-.fwd-quota-row .fwd-merr {
-  grid-column: 1 / -1;
 }
 .fwd-quotas > .fwd-add {
   justify-self: start;
@@ -21838,13 +21833,13 @@ input.f.qta-in {
   white-space: nowrap;
 }
 /* 本月：数值 + 细条（相对清单里最大的一条），细条取数据色，与额度条同一角色 */
-.fwd-month {
+.fwd-cycle {
   display: grid;
   min-width: 0;
   grid-area: month;
   gap: 5px;
 }
-.fwd-month b {
+.fwd-cycle b {
   color: var(--ink-2);
   font: 500 12px/14px var(--sans);
   font-variant-numeric: tabular-nums;
@@ -21904,7 +21899,7 @@ input.f.qta-in {
   color: var(--ink-4);
 }
 /* 停用：整行降一档，不改结构 */
-.fwd-item.st-disabled :is(.fwd-port, .fwd-target b, .fwd-target code, .fwd-month b) {
+.fwd-item.st-disabled :is(.fwd-port, .fwd-target b, .fwd-target code, .fwd-cycle b) {
   color: var(--ink-4);
 }
 .fwd-item.st-disabled .fwd-bar > i {
@@ -22692,7 +22687,7 @@ select.f.fwr-sort {
     gap: 8px;
     padding-block: 14px;
   }
-  .fwr-item .fwd-month {
+  .fwr-item .fwd-cycle {
     display: block;
   }
   .fwr-item .fwd-bar {
@@ -22791,147 +22786,77 @@ select.f.fwr-sort {
   text-align: center;
 }
 
-/* 平板和手机上的身份牌与机器详情的 28px 标识保持同一量级。单独放在布局断点之外：
-   700–820px 的平板详情仍放得下一行标题，但不该继续使用 44px 的桌面头像。 */
-@container user-header (max-width: 820px) {
-  .user-dhead .plate {
-    width: 32px;
-    height: 32px;
-    font-size: 18px;
-  }
-  .user-dhead .plate > .node-lamp {
-    right: -2px;
-    bottom: -2px;
-    width: 8px;
-    height: 8px;
-  }
-}
-
-/* 窄详情不做普通折行：上层仍是身份与操作，下层变成独立导航带，保持信息层级。 */
-@container user-header (max-width: 700px) {
+/* 窄详情保留身份与操作，导航独立一行；UUID 留在身份内部，不增加第三层。 */
+@container user-header (max-width: 760px) {
   .user-dhead-main {
-    display: grid;
     grid-template-columns: minmax(0, 1fr) max-content;
-    grid-template-rows: 54px;
-    min-height: 54px;
+    grid-template-rows: 64px;
+    min-height: 64px;
     gap: 0;
-    padding: 0;
+    padding: 0 12px;
   }
   .user-dhead-main:has(> .user-detail-tabs) {
-    grid-template-rows: 54px 40px;
-    min-height: 94px;
-  }
-  .user-dhead-identity {
-    max-width: none;
-    grid-column: 1;
-    grid-row: 1;
-    overflow: hidden;
-    padding: 0 10px 0 12px;
-    border-right: 0;
+    grid-template-rows: 64px 42px;
+    min-height: 106px;
   }
   .user-dhead .user-detail-tabs {
-    width: 100%;
-    height: 40px;
+    width: auto;
+    height: 42px;
     box-sizing: border-box;
     grid-column: 1 / -1;
     grid-row: 2;
-    padding: 0 5px;
+    align-self: stretch;
+    margin: 0 -12px;
+    padding: 0 6px;
     border-top: 1px solid var(--line-soft);
     background: var(--block);
-  }
-  .user-dhead .user-detail-tabs::before {
-    display: none;
   }
   .user-dhead .user-detail-tabs .nd-tabs-seg {
     width: 100%;
     min-width: 0;
-    gap: 3px;
   }
   .user-dhead .user-detail-tabs button {
     min-width: 0;
     flex: 1 1 0;
     justify-content: center;
-    overflow: hidden;
-    padding-inline: 7px;
   }
   .user-dhead-tools {
     grid-column: 2;
-    grid-row: 1;
-    margin-left: 0;
-    padding: 0 10px 0 8px;
-  }
-  .user-dhead .dname {
-    overflow: hidden;
-  }
-  .user-dhead .dname b {
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .user-dhead .user-dacts .btn {
-    min-height: 40px;
-  }
-  .user-dhead .btn.user-dact-more {
-    width: 40px;
-    min-height: 40px;
+    gap: 3px;
   }
 }
 
 @container user-header (max-width: 440px) {
   .user-dhead-main {
-    grid-template-columns: 54px minmax(0, 1fr) max-content;
-    grid-template-rows: 50px 24px;
-    min-height: 74px;
-    gap: 0;
-  }
-  .user-dhead-main:has(> .user-detail-tabs) {
-    grid-template-rows: 50px 24px 40px;
-    min-height: 114px;
+    column-gap: 8px;
   }
   .user-dhead-identity {
-    display: contents;
+    gap: 9px;
   }
   .user-dhead .plate {
-    grid-column: 1;
-    grid-row: 1;
-    align-self: center;
-    margin-left: 12px;
-  }
-  .user-dhead .dtitle {
-    display: contents;
+    width: 32px;
+    height: 32px;
+    font-size: 18px;
   }
   .user-dhead .dname {
-    grid-column: 2;
-    grid-row: 1;
-    align-self: center;
-    padding-left: 0;
+    gap: 7px;
   }
-  .user-dhead .dsub {
-    width: 100%;
-    box-sizing: border-box;
-    grid-column: 1 / -1;
-    grid-row: 2;
-    align-self: start;
-    padding: 0 12px;
+  .user-dhead .dname b {
+    font-size: 15px;
   }
-  .user-dhead .user-detail-tabs {
-    grid-row: 3;
-  }
-  .user-dhead-tools {
-    grid-column: 3;
-    grid-row: 1;
-    gap: 6px;
-    padding: 0 10px 0 6px;
-  }
-  .user-dacts {
-    gap: 6px;
-  }
-  .user-dhead .user-dacts .btn {
-    width: 40px;
+  .user-dhead .user-dacts .btn,
+  .user-dhead .btn.user-dact-more {
+    width: 34px;
+    min-height: 40px;
     justify-content: center;
     padding: 0;
   }
-  .user-dact-label {
+  .user-dhead .user-dact-label {
     display: none;
+  }
+  .user-dhead-tools,
+  .user-dhead-tools .user-dacts {
+    gap: 2px;
   }
 }
 
@@ -23870,7 +23795,8 @@ select.f.fwr-sort {
 }
 .load-network-cap > span {
   color: var(--ink-4);
-  font: 9px var(--mono);
+  /* 固定行盒，避免中文回退字体让「滞后」比 MTU 等元信息更高。 */
+  font: 9px/14px var(--mono);
   white-space: nowrap;
 }
 /* 量纲。刻度上只剩数字，单位在标题后写一次（`网卡流量 (Mbit/s)`）——它不是元信息，不能拿
@@ -23897,9 +23823,6 @@ select.f.fwr-sort {
   color: var(--ink-4);
   font: 400 10.5px var(--mono);
   letter-spacing: 0.11em;
-}
-.load-network-cap > span.stale {
-  color: var(--gold);
 }
 .load-network-cap > span.hot {
   color: var(--gold);
@@ -25783,7 +25706,7 @@ body.observe-brushing .observe-chart-tip {
   font: 300 19px/1 var(--mono);
   letter-spacing: -0.02em;
 }
-/* 流量统计：一行本期读数、一根额度条、接收与发送，下面是计量设置。卡片常驻在身份下方，
+/* 流量统计：一行本期读数、一根额度条、接收与发送，下面是计量设置与自动限速。卡片常驻在身份下方，
    不使用 details 折叠。额度条沿用流量预测页的跑道（cap-bar / cap-q），竖线是本期时间进度。 */
 .node-traffic-source {
   display: inline-flex;
@@ -25841,6 +25764,10 @@ body.observe-brushing .observe-chart-tip {
   display: block;
   margin: 2px 0;
 }
+.node-traffic-bar {
+  position: relative;
+  display: block;
+}
 .node-traffic-pace {
   position: absolute;
   top: -4px;
@@ -25849,6 +25776,82 @@ body.observe-brushing .observe-chart-tip {
   margin-left: -1px;
   border-radius: 1px;
   background: var(--ink-2);
+}
+/* 自动限速画在额度条上：每档阈值在条上切一道 3px 的口（底色与卡面相同），旗杆从切口垂下，旗面两行写
+   阈值与速度，靠近右端时整面翻到旗杆左侧；越过第一道有效阈值后的已用部分叠斜纹，数据色不变。
+   此前已有更低限速、永远不会生效的规则只切一道细缝，旗面变淡。正在起作用的一档在机器确认后转金色，
+   与标题栏的状态片同色。 */
+.node-traffic-cut {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  width: 3px;
+  margin-left: -1.5px;
+  background: var(--block);
+}
+.node-traffic-cut.idle {
+  width: 1px;
+  margin-left: -0.5px;
+}
+.cap-bar > .node-traffic-hatch {
+  background: repeating-linear-gradient(
+    -45deg,
+    transparent 0 3px,
+    color-mix(in srgb, var(--block) 55%, transparent) 3px 5px
+  );
+}
+.node-traffic-flags {
+  position: relative;
+  display: block;
+  height: 31px;
+}
+.node-traffic-flag {
+  position: absolute;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 5px 0 0 6px;
+  color: var(--ink-2);
+  font: 10.5px/13px var(--mono);
+  white-space: nowrap;
+}
+.node-traffic-flag::before {
+  position: absolute;
+  top: 0;
+  bottom: 2px;
+  left: 0;
+  width: 1px;
+  background: color-mix(in srgb, var(--ink-3) 55%, transparent);
+  content: '';
+}
+.node-traffic-flag b {
+  color: var(--ink-4);
+  font: 400 10px/12px var(--mono);
+}
+.node-traffic-flag.flip {
+  align-items: flex-end;
+  padding: 5px 6px 0 0;
+  transform: translateX(-100%);
+}
+.node-traffic-flag.flip::before {
+  right: 0;
+  left: auto;
+}
+.node-traffic-flag.bare {
+  height: 6px;
+  padding: 0;
+}
+.node-traffic-flag.on {
+  color: var(--gold);
+}
+.node-traffic-flag.on::before {
+  background: var(--gold);
+}
+.node-traffic-flag.on b {
+  color: color-mix(in srgb, var(--gold) 65%, var(--ink-4));
+}
+.node-traffic-flag.idle {
+  opacity: 0.55;
 }
 /* 接收、发送与观测页签的网卡曲线同色；不计入当前口径的一方退成灰色。 */
 .node-traffic-directions {
@@ -25899,6 +25902,189 @@ body.observe-brushing .observe-chart-tip {
   margin-top: 12px;
   padding-top: 2px;
   border-top: 1px solid var(--line-soft);
+}
+/* 标题栏的限速状态片只在值得一眼看到时出现：金色 = 正在限速，错误色 = 有一层没生效，等待类为中性；
+   圆点只给前两种。 */
+.node-traffic-limit-chip {
+  display: inline-flex;
+  height: 20px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--ink-3);
+  font: 10.5px/1 var(--mono);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.node-traffic-limit-chip i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.node-traffic-limit-chip.gold {
+  border-color: color-mix(in srgb, var(--gold) 45%, var(--line));
+  background: var(--gold-wash);
+  color: var(--gold);
+}
+.node-traffic-limit-chip.err {
+  border-color: color-mix(in srgb, var(--err) 45%, var(--line));
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+  color: var(--err);
+}
+/* 开关旁的执行状态与执行层下的各层回执只用中性色，出错才用错误色；金色留给额度条与标题栏。 */
+.node-traffic-limit-state {
+  display: inline-flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 7px;
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.node-traffic-limit-state.mute {
+  color: var(--ink-3);
+}
+.node-traffic-limit-state small {
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.fgrid .v .sub.node-traffic-limit-layers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 14px;
+}
+.node-traffic-limit-state.err,
+.node-traffic-limit-state em,
+.node-traffic-limit-layers .err,
+.node-traffic-limit-layers em {
+  color: var(--err);
+  font-style: normal;
+}
+/* 限速规则一行一条：「达到 [80 %] 限至 [100 Mbps]」，数值与单位拼成一格。值列窄于 350px 时拆成两行
+   （「达到 … ×」「限至 …」），不在字段中间折行。行首一格圆点：机器确认限速时，正在起作用的一条为金色实心；
+   永远不会生效的一条为空心并整行变淡。 */
+.node-traffic-rules {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  container: node-traffic-rules / inline-size;
+}
+.node-traffic-rule {
+  display: grid;
+  grid-template-areas: 'dot k1 amount k2 rate remove';
+  grid-template-columns: 6px repeat(5, auto);
+  justify-content: start;
+  align-items: center;
+  gap: 6px 8px;
+  min-height: var(--ctl-h);
+}
+.node-traffic-rule::before {
+  grid-area: dot;
+  width: 6px;
+  height: 6px;
+  box-sizing: border-box;
+  border-radius: 50%;
+  content: '';
+}
+.node-traffic-rule.on::before {
+  background: var(--gold);
+}
+.node-traffic-rule.idle::before {
+  border: 1px solid var(--ink-4);
+}
+.node-traffic-rule.idle > :not(.node-traffic-rule-remove) {
+  opacity: 0.55;
+}
+.node-traffic-rule > :nth-child(1) {
+  grid-area: k1;
+}
+.node-traffic-rule > :nth-child(2) {
+  grid-area: amount;
+}
+.node-traffic-rule > :nth-child(3) {
+  grid-area: k2;
+}
+.node-traffic-rule > :nth-child(4) {
+  grid-area: rate;
+}
+.node-traffic-rule > .node-traffic-rule-remove {
+  grid-area: remove;
+}
+@container node-traffic-rules (max-width: 350px) {
+  .node-traffic-rule {
+    grid-template-areas:
+      'dot k1 amount remove'
+      '. k2 rate .';
+    grid-template-columns: 6px repeat(3, auto);
+  }
+}
+.node-traffic-rule-k {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.node-traffic-num {
+  display: inline-flex;
+  min-width: 0;
+  justify-self: start;
+}
+.node-traffic-num > input.f {
+  width: 58px;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  text-align: right;
+}
+.node-traffic-num > select.f {
+  width: auto;
+  margin-left: -1px;
+  padding-right: 22px;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  background-color: var(--band);
+  background-position: right 8px center;
+  color: var(--ink-2);
+}
+.node-traffic-num > :focus,
+.node-traffic-num > [aria-invalid='true'] {
+  position: relative;
+  z-index: 1;
+}
+.node-traffic-num > [aria-invalid='true'] {
+  border-color: var(--err);
+}
+.node-traffic-rule-remove {
+  display: inline-grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border: 0;
+  border-radius: var(--r-ctl);
+  background: none;
+  color: var(--ink-4);
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .node-traffic-rule-remove:hover:not(:disabled) {
+    background: var(--btn-h);
+    color: var(--ink);
+  }
+}
+.node-traffic-rule-remove:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 1px;
+}
+.node-traffic-rule-remove:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.btn.sm.node-traffic-rule-add {
+  gap: 5px;
+  min-height: 26px;
+  margin-left: 14px;
+  color: var(--ink-2);
 }
 .nc-foot .lst-sum small {
   display: inline;
@@ -26923,6 +27109,23 @@ body.observe-brushing .observe-chart-tip {
   color: var(--ink-4);
   font: 9.5px/1.4 var(--mono);
   font-variant-numeric: tabular-nums;
+}
+.retention-cleanup {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
+.retention-cleanup-status {
+  color: var(--ink-3);
+  font-size: 10.5px;
+}
+.retention-cleanup[data-state='pending'] .retention-cleanup-status {
+  color: var(--gold);
+}
+.retention-cleanup[data-state='error'] .retention-cleanup-status {
+  color: var(--err);
 }
 .retention-policy-control {
   display: grid;
@@ -28555,7 +28758,13 @@ body.observe-brushing .observe-chart-tip {
 .usage-tab-body {
   padding: 0;
 }
-.usage-month-loading {
+/* 页签纸面持续挂载；让真实内容就绪后沿用面板入场，首次读取与双向切换都有过渡，
+ * 后续速率、月份和日期更新保留同一内容根，不重播动画。 */
+.usage-tab-body > .usage-cockpit,
+.usage-tab-body > .flt-panel > :is(.flt-cockpit, .flt-permission, .callout) {
+  animation: motion-surface-mount 240ms var(--motion-ease-out) backwards;
+}
+.usage-tab-loading {
   display: grid;
   min-height: 300px;
   place-items: center;
@@ -29278,6 +29487,24 @@ body.observe-brushing .observe-chart-tip {
   padding: 22px 24px 20px;
   border-right: 1px solid var(--line-soft);
 }
+/* 双列读数栏中，总量与上下行组成沿左列连续排列，摘要占右列；窄屏单列按 DOM 顺序排列。 */
+.usage-page .usage-ledger {
+  grid-template-areas:
+    'hero facts'
+    'compose facts';
+}
+.usage-page .usage-ledger > :is(.usage-hero, .user-usage-hero) {
+  grid-area: hero;
+  align-content: start;
+}
+.usage-page .usage-compose {
+  min-width: 0;
+  grid-area: compose;
+}
+.usage-page .usage-ledger > .usage-facts {
+  grid-area: facts;
+  align-content: start;
+}
 .usage-hero {
   display: flex;
   min-width: 0;
@@ -29404,6 +29631,11 @@ body.observe-brushing .observe-chart-tip {
 .usage-dot {
   margin: 0 6px;
   color: var(--ink-4);
+}
+/* 键值里不可拆开的一段：一个读数（数值连同单位），或日期连同其后的间隔号。窄屏键值换行时
+   只在段与段之间断开。 */
+.usage-nobreak {
+  white-space: nowrap;
 }
 /* 峰值日期在柱形图里选中那一天。 */
 .usage-peak {
@@ -29668,7 +29900,7 @@ body.observe-brushing .observe-chart-tip {
   font-size: 14px;
 }
 
-/* 柱形图需要整行宽度：读数栏移到图的上方，总览数字占左列，组成与键值行占右列。 */
+/* 柱形图需要整行宽度：读数栏移到图的上方，总览数字与组成占左列，键值行占右列。 */
 @container (max-width: 900px) {
   .usage-cockpit {
     grid-template-columns: minmax(0, 1fr);
@@ -29680,7 +29912,7 @@ body.observe-brushing .observe-chart-tip {
     border-right: 0;
     border-bottom: 1px solid var(--line-soft);
   }
-  .usage-hero {
+  .cgc-ledger > .usage-hero {
     grid-row: span 2;
   }
   .usage-facts {
@@ -29711,17 +29943,24 @@ body.observe-brushing .observe-chart-tip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 14px 20px;
   }
+  /* 同一行另一项折成多行时，名称与数值仍贴在顶部，不被两端对齐拉开。 */
   .usage-facts > div {
     flex-direction: column;
     align-items: flex-start;
+    justify-content: flex-start;
     gap: 4px;
     padding: 0;
   }
   .usage-facts > div + div {
     border-top: 0;
   }
+  /* 半栏放不下机器名、用户名或成对读数时数值折行，不能保持单行撑出栏外和页面：左对齐的纵向
+     排列按内容定宽，单行的数值有多宽就占多宽，省略号不会生效。 */
   .usage-facts dd {
+    max-width: 100%;
     text-align: left;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
   .usage-chart-head {
     padding: 16px 12px 0;
@@ -30418,9 +30657,13 @@ body.observe-brushing .observe-chart-tip {
    transport credentials are reusable project state rather than fields of one match clause. */
 .external-outbound-drawer {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   width: min(610px, 100vw);
+  min-width: 0;
   height: 100%;
+  min-height: 0;
+  box-sizing: border-box;
 }
 .mux-config-drawer {
   grid-template-rows: auto minmax(0, 1fr) auto;
@@ -32773,6 +33016,13 @@ html[data-motion-transition='appearance']::view-transition-new(root) {
 .dialog-layer.drawer[data-motion-state='exiting'] > .dialog-surface {
   pointer-events: none;
   animation: motion-drawer-out var(--motion-slow) var(--motion-ease-standard) both;
+}
+.dialog-layer.popover[data-motion-state='entering'] > .dialog-surface {
+  animation: motion-popover-in 180ms var(--motion-ease-out) both;
+}
+.dialog-layer.popover[data-motion-state='exiting'] > .dialog-surface {
+  pointer-events: none;
+  animation: motion-popover-out 180ms var(--motion-ease-standard) both;
 }
 .topo-callout,
 #winlayer .fw {
@@ -36406,6 +36656,10 @@ details.cg-menu-wrap > summary::-webkit-details-marker {
   color: var(--ink-4);
   font-size: 11px;
 }
+.site-usage-body > .site-usage-note {
+  margin: 0;
+  padding: 8px var(--panel-content-x) 12px;
+}
 .site-usage-side {
   min-width: 0;
   padding: 8px var(--panel-content-x) 6px;
@@ -36728,7 +36982,8 @@ button.site-usage-row:focus-visible {
 @container user-site-usage (max-width: 620px) {
   .site-usage-plot,
   .site-usage-side,
-  .site-usage-detail {
+  .site-usage-detail,
+  .site-usage-body > .site-usage-note {
     padding-inline: var(--panel-content-x-compact);
   }
   /* 窄卡：筛选移到最上方，三档等宽 */
@@ -36808,10 +37063,6 @@ button.site-usage-row:focus-visible {
   grid-template-columns: 300px minmax(0, 1fr);
   margin: 0;
 }
-/* 读数栏移到上方时总览数字占两行高，内容仍从顶部排起。 */
-.flt-ledger > .user-usage-hero {
-  align-content: start;
-}
 .flt-empty {
   display: grid;
   place-items: center;
@@ -36840,7 +37091,10 @@ button.site-usage-row:focus-visible {
   gap: 12px;
   padding: 14px 20px 16px 18px;
 }
+/* 单元格里的读屏文字（.flt-sr）是绝对定位的。滚动容器自身不定位时，它们的包含块落在纸面上，
+ * 不受横向滚动裁切：机器多到矩阵需要横向滚动时，最右几列的读屏文字会把整页撑宽。 */
 .flt-scroll {
+  position: relative;
   max-width: 100%;
   overflow-x: auto;
   overscroll-behavior-inline: contain;
@@ -37248,6 +37502,7 @@ button.site-usage-row:focus-visible {
 }
 .flt-flow {
   display: grid;
+  box-sizing: border-box;
   width: 100%;
   min-height: 56px;
   grid-template-areas:
@@ -37320,6 +37575,7 @@ button.site-usage-row:focus-visible {
   color: var(--ink-3);
   font-size: 12px;
   line-height: 1.6;
+  overflow-wrap: anywhere;
 }
 .flt-list-rest b {
   margin-right: 8px;
@@ -37354,9 +37610,6 @@ button.site-usage-row:focus-visible {
   .flt-cockpit.packed > .usage-ledger > .usage-facts {
     margin-top: 0;
   }
-  .flt-cockpit.packed > .usage-ledger > .user-usage-hero {
-    grid-row: span 2;
-  }
 }
 @container (min-width: 621px) and (max-width: 1080px) {
   .flt-cockpit.dense > .usage-ledger {
@@ -37369,16 +37622,10 @@ button.site-usage-row:focus-visible {
   .flt-cockpit.dense > .usage-ledger > .usage-facts {
     margin-top: 0;
   }
-  .flt-cockpit.dense > .usage-ledger > .user-usage-hero {
-    grid-row: span 2;
-  }
 }
 @container (max-width: 900px) {
   .flt-cockpit {
     grid-template-columns: minmax(0, 1fr);
-  }
-  .flt-cockpit > .usage-ledger > .user-usage-hero {
-    grid-row: span 2;
   }
 }
 /* 较窄的板面（以 .flt-board 为容器）：收窄用户列与合计列、组间缝。 */
@@ -37395,11 +37642,6 @@ button.site-usage-row:focus-visible {
   }
   .flt-list {
     display: block;
-  }
-}
-@container (max-width: 620px) {
-  .flt-cockpit > .usage-ledger > .user-usage-hero {
-    grid-row: auto;
   }
 }
 

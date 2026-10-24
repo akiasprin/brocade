@@ -26,6 +26,229 @@ async fn record_checkpoint(db: &TestPg, failed: bool, report: OtherDomainReport)
     }
 }
 
+async fn query_history(
+    db: &TestPg,
+    failed: bool,
+    node: bool,
+    period: SiteUsagePeriod,
+) -> brocade_deployment::other_domain::UserDetailUsage<u64> {
+    match (failed, node) {
+        (false, false) => db
+            .store
+            .user_other_domains(&system_admin(), "platform.acme", "alice", period)
+            .await
+            .unwrap()
+            .map_rows(|r| r.uplink_bytes + r.downlink_bytes),
+        (false, true) => db
+            .store
+            .node_other_domains(&system_admin(), "n1", period)
+            .await
+            .unwrap()
+            .map_rows(|r| r.uplink_bytes + r.downlink_bytes),
+        (true, false) => db
+            .store
+            .user_sniffing_failed_targets(&system_admin(), "platform.acme", "alice", period)
+            .await
+            .unwrap()
+            .map_rows(|r| r.uplink_bytes + r.downlink_bytes),
+        (true, true) => db
+            .store
+            .node_sniffing_failed_targets(&system_admin(), "n1", period)
+            .await
+            .unwrap()
+            .map_rows(|r| r.uplink_bytes + r.downlink_bytes),
+    }
+}
+
+async fn configured_history_retention_case(failed: bool) {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query("INSERT INTO admin_operators (id,display_name,role,password_hash) VALUES ('detail-admin','Detail admin','system-admin','test-only')")
+        .execute(db.pool()).await.unwrap();
+    let admin = AdminContext::system_admin("detail-admin");
+    let (table, key, other_table) = if failed {
+        (
+            "user_sniffing_failed_hourly",
+            "target",
+            "user_other_domain_hourly",
+        )
+    } else {
+        (
+            "user_other_domain_hourly",
+            "domain",
+            "user_sniffing_failed_hourly",
+        )
+    };
+    let name = if failed {
+        "tcp://192.0.2.1:443"
+    } else {
+        "history.example"
+    };
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let hour = now / 3600 * 3600;
+    let generation =
+        install_usage_generation(db.pool(), "n1", alice_usage_bindings(), now - 10 * 86_400).await;
+    let mut report = OtherDomainReport {
+        version: 2,
+        epoch: "a".repeat(32),
+        activation_unix_secs: now - 10 * 86_400,
+        read_at_unix_secs: now,
+        usage_generation_id: generation,
+        limited: false,
+        counters: vec![OtherDomainCounter {
+            counter_id: 1,
+            bucket: hour,
+            label: "alice@platform.acme#ing-a1b2".into(),
+            domain: if failed {
+                "udp://192.0.2.2:53"
+            } else {
+                "current.example"
+            }
+            .into(),
+            uplink_bytes: 10,
+            downlink_bytes: 0,
+        }],
+    };
+    record_checkpoint(&db, failed, report.clone()).await;
+    // Seed real hourly history independently of the short checkpoint replay window.
+    let insert = format!("INSERT INTO {table} (bucket,node_id,tenant_id,user_id,{key},uplink_bytes,downlink_bytes) SELECT $1 - age * 3600,'n1','platform.acme','alice',$2,1,2 FROM generate_series(0,191) age");
+    sqlx::query(&insert)
+        .bind(hour)
+        .bind(name)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let seed_buckets: Vec<_> = (0..192).map(|age| hour - age * 3600).collect();
+    let policy = db
+        .store
+        .data_retention()
+        .await
+        .unwrap()
+        .policies
+        .into_iter()
+        .find(|p| p.table_name == table)
+        .unwrap();
+    assert_eq!(policy.ttl_hours, 24);
+    assert_eq!(policy.default_ttl_hours, 24);
+
+    for hours in [24_u32, 7 * 24, 3 * 24, 6] {
+        if hours != 24 {
+            db.store
+                .update_data_retention(
+                    &admin,
+                    table,
+                    UpdateDataRetentionPolicy { ttl_hours: hours },
+                )
+                .await
+                .unwrap();
+            // A new upload must preserve all history inside the configured lifetime.
+            report.counters[0].uplink_bytes += 5;
+            record_checkpoint(&db, failed, report.clone()).await;
+            let retained: i64 =
+                sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE {key}=$1"))
+                    .bind(name)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(retained, i64::from(hours));
+            assert_eq!(
+                db.store
+                    .retention_schedule()
+                    .await
+                    .unwrap()
+                    .ttl_hours(other_table),
+                24
+            );
+        }
+        for period in [
+            SiteUsagePeriod::Day,
+            SiteUsagePeriod::Week,
+            SiteUsagePeriod::Month,
+        ] {
+            let sites = db
+                .store
+                .user_site_usage(&system_admin(), "platform.acme", "alice", period)
+                .await
+                .unwrap();
+            for node in [false, true] {
+                let detail = query_history(&db, failed, node, period).await;
+                let cutoff =
+                    (detail.range_end_unix_secs - i64::from(hours) * 3600 + 3599) / 3600 * 3600;
+                assert_eq!(
+                    detail.range_start_unix_secs,
+                    sites.range_start_unix_secs.max(cutoff)
+                );
+                let expected = seed_buckets
+                    .iter()
+                    .filter(|&&bucket| bucket >= detail.range_start_unix_secs)
+                    .count() as u64
+                    * 3
+                    + report.counters[0].uplink_bytes;
+                assert_eq!(
+                    detail.rows.iter().sum::<u64>(),
+                    expected,
+                    "{table}, {hours} hours, {period:?}, node={node}"
+                );
+            }
+        }
+        if hours == 7 * 24 {
+            let mut expired = report.clone();
+            expired.read_at_unix_secs -= 48 * 3600;
+            expired.counters[0].bucket -= 48 * 3600;
+            expired.counters[0].counter_id = 99;
+            expired.counters[0].uplink_bytes = 1_000_000;
+            record_checkpoint(&db, failed, expired).await;
+            let total: i64 =
+                sqlx::query_scalar(&format!("SELECT sum(uplink_bytes)::bigint FROM {table}"))
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                total,
+                i64::from(hours) + report.counters[0].uplink_bytes as i64,
+                "longer history must not extend checkpoint replay acceptance"
+            );
+            sqlx::query(&format!("INSERT INTO {table} (bucket,node_id,tenant_id,user_id,{key},uplink_bytes,downlink_bytes) VALUES ($1,'n1','platform.acme','alice',$2,1,2)"))
+                .bind(hour - 8 * 24 * 3600).bind(name).execute(db.pool()).await.unwrap();
+            let cleanup = db.store.run_data_retention().await.unwrap();
+            let result = cleanup.iter().find(|r| r.table_name == table).unwrap();
+            assert_eq!(result.error_code, None);
+            assert_eq!(result.deleted_rows, 1);
+            // The older usage cleanup entry point must honor the same live history policy.
+            db.store.prune_usage_samples(7).await.unwrap();
+            let retained: i64 =
+                sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE {key}=$1"))
+                    .bind(name)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                retained,
+                7 * 24,
+                "scheduled cleanup must keep seven days too"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn detail_history_domain_retention_is_configurable_for_uploads_queries_and_cleanup() {
+    configured_history_retention_case(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn detail_history_failed_retention_is_configurable_for_uploads_queries_and_cleanup() {
+    configured_history_retention_case(true).await;
+}
+
 async fn checkpoint_replay_case(failed: bool) {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -122,10 +345,7 @@ async fn checkpoint_replay_case(failed: bool) {
         24,
         "old retention overrides must respect replay safety"
     );
-    db.store
-        .prune_configured_usage_history(&schedule)
-        .await
-        .unwrap();
+    db.store.run_data_retention().await.unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM {heads}"))
             .fetch_one(db.pool())

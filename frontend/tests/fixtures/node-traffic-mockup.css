@@ -249,9 +249,6 @@ body {
   font-size: 10.5px;
   font-weight: 400;
 }
-.ntl-bychain li.ntl-rest {
-  color: var(--ink-4);
-}
 .ntl-share {
   color: var(--ink-4);
   font-size: 11px;

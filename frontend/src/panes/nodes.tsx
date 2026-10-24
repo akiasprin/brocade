@@ -1,3 +1,17 @@
+import { SourceAccessPanel } from './source-access';
+import {
+  TrafficLimitChip,
+  TrafficLimitFlags,
+  TrafficLimitRows,
+  trafficLimitForm,
+  trafficLimitNeedsQuota,
+  trafficLimitPolicy,
+  trafficLimitProblem,
+  trafficLimitStatus,
+  trafficLimitSteps,
+  type LimitStep,
+  type TrafficLimitForm,
+} from './nodes-traffic-limit';
 import { useMetricQuery } from '../ui/metric-cadence';
 import { draft } from '../draft';
 import { NODE_DRAFT_PANELS, nodeDraftPanelKey, useNodeDraftFocus } from '../forge/draft-node-location';
@@ -49,6 +63,7 @@ import {
   saveNodeLogPolicy,
   saveNodeRegion,
   saveNodeTraffic,
+  saveNodeTrafficLimit,
   setNodeCertGroup,
   setNodeStatus,
   setWireGuardLinkDisabled,
@@ -129,6 +144,7 @@ import {
 import { cancelVisualTransition } from '../ui/motion';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import { OBSERVE_MS_UNIT, OBSERVE_SERIES_COLOR_VARS } from '../ui/observe-chart';
+import { observeSeriesData } from '../ui/observe-series';
 import {
   customLoadRange,
   DEFAULT_LOAD_RANGE,
@@ -1240,7 +1256,7 @@ function NodeCard({
 
 // 时间范围的定义（快速范围、固定区间、地址查询段）在 ui/observe-range.ts，路由与本页共用。
 export { DEFAULT_LOAD_RANGE, LOAD_RANGES, type LoadRange };
-const GRID_SECS = 30;
+const USAGE_WINDOW_SECS = 30;
 
 export function loadRangeBounds(range: LoadRange): { startUnixSecs: number; endUnixSecs: number } {
   if (range.startUnixSecs != null && range.endUnixSecs != null) {
@@ -1864,7 +1880,7 @@ export function exactBytes(value: string): string {
   return `${whole}.${fraction} ${unit.name}`;
 }
 
-function NicMonthTotal({
+export function NicMonthTotal({
   traffic,
   pending,
   retired,
@@ -1887,14 +1903,15 @@ function NicMonthTotal({
   )
     .toISOString()
     .slice(0, 10)}（UTC）`;
+  const mode = TRAFFIC_ACCOUNTING_MODES.find(mode => mode.value === traffic.accounting_mode);
   return (
     <span
       className="lst-sum"
-      title={`${period}${
+      title={`${mode?.label}\n${period}${
         traffic.has_gap ? `\n${trafficGapReason(traffic.last_gap_reason)}造成采集缺口，请校准确认总量` : ''
       }`}
     >
-      {exactBytes(traffic.total_bytes)}
+      {`${traffic.accounting_mode === 'bidirectional_sum' ? '' : '单·'}${exactBytes(traffic.total_bytes)}`}
       <small>本月</small>
     </span>
   );
@@ -1986,38 +2003,57 @@ export function useHopStats(nodeId: string, artifactReadable = true) {
   return { list, loading, dead, expected, reported, alive, observatory, windowSecs };
 }
 
-/** 把 usage 桶落到请求区间内的绝对 30 秒网格。无桶表示该窗口没有转发字节，按 0 处理。 */
+/** 保留实际上报的窗口结束时间；缺少上报时断线，不能把待更新的尾部或历史缺口补成 0。 */
 export function usageRoleTimeline(
   series: UsageNodeSeries | undefined,
   rangeStartUnixSecs: number,
   rangeEndUnixSecs: number,
 ): {
   timesUnixSecs: number[];
-  user: number[];
-  relay: number[];
+  user: (number | null)[];
+  relay: (number | null)[];
   forwarding: (number | null)[];
   forwardingTimes: number[];
   forwardingStarts: number[];
 } {
-  const slots = Math.max(1, Math.ceil((rangeEndUnixSecs - rangeStartUnixSecs) / GRID_SECS));
-  const endKey = Math.floor(rangeEndUnixSecs / GRID_SECS) * GRID_SECS;
-  const startKey = endKey - (slots - 1) * GRID_SECS;
-  const timesUnixSecs = Array.from({ length: slots }, (_, index) => startKey + index * GRID_SECS);
-  const user = new Array<number>(slots).fill(0);
-  const relay = new Array<number>(slots).fill(0);
+  const rolesByEnd = new Map<number, { user: number; relay: number }>();
   for (const bucket of series?.buckets ?? []) {
-    const key = Math.floor(Date.parse(bucket.window_end) / 1000 / GRID_SECS) * GRID_SECS;
-    if (!Number.isFinite(key)) continue;
-    const index = Math.round((key - startKey) / GRID_SECS);
-    if (index < 0 || index >= slots) continue;
-    user[index] += ((bucket.user_uplink_bytes + bucket.user_downlink_bytes) * 8) / GRID_SECS;
-    relay[index] += ((bucket.relay_uplink_bytes + bucket.relay_downlink_bytes) * 8) / GRID_SECS;
+    const end = Date.parse(bucket.window_end) / 1000;
+    if (!Number.isFinite(end) || end < rangeStartUnixSecs || end > rangeEndUnixSecs) continue;
+    const roles = rolesByEnd.get(end) ?? { user: 0, relay: 0 };
+    roles.user += ((bucket.user_uplink_bytes + bucket.user_downlink_bytes) * 8) / USAGE_WINDOW_SECS;
+    roles.relay += ((bucket.relay_uplink_bytes + bucket.relay_downlink_bytes) * 8) / USAGE_WINDOW_SECS;
+    rolesByEnd.set(end, roles);
   }
+  const roleEntries = [...rolesByEnd.entries()].sort(([a], [b]) => a - b);
+  const times = roleEntries.map(([end]) => end);
+  // 接入/中继接口只有结束时间，以既有 30 秒采样周期识别断档；只加 null 分隔，不生成读数。
+  const userData = observeSeriesData(
+    times,
+    roleEntries.map(([, roles]) => roles.user),
+    {
+      sampleStepSecs: USAGE_WINDOW_SECS,
+    },
+  );
+  const relayData = observeSeriesData(
+    times,
+    roleEntries.map(([, roles]) => roles.relay),
+    {
+      sampleStepSecs: USAGE_WINDOW_SECS,
+    },
+  );
   const forwardingByEnd = new Map<number, { start: number; rate: number | null }>();
   for (const window of series?.forwarding ?? []) {
     const start = Date.parse(window.window_start) / 1000;
     const end = Date.parse(window.window_end) / 1000;
-    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
+    if (
+      !Number.isFinite(start) ||
+      !Number.isFinite(end) ||
+      end <= start ||
+      end < rangeStartUnixSecs ||
+      end > rangeEndUnixSecs
+    )
+      continue;
     const previous = forwardingByEnd.get(end);
     forwardingByEnd.set(end, {
       start: Math.max(start, previous?.start ?? start),
@@ -2029,9 +2065,9 @@ export function usageRoleTimeline(
   }
   const forwardingEntries = [...forwardingByEnd.entries()].sort(([a], [b]) => a - b);
   return {
-    timesUnixSecs,
-    user,
-    relay,
+    timesUnixSecs: userData.map(([time]) => time / 1000),
+    user: userData.map(([, value]) => value),
+    relay: relayData.map(([, value]) => value),
     forwarding: forwardingEntries.map(([, v]) => v.rate),
     forwardingTimes: forwardingEntries.map(([end]) => end),
     forwardingStarts: forwardingEntries.map(([, v]) => v.start),
@@ -2053,6 +2089,8 @@ export function ThroughputPanel({
   linked: boolean;
   observationModules?: NodeObservationModules;
 }) {
+  const displayIdentity = `${nodeId}:${loadRangeKey(range)}`;
+  const [displayedRange, setDisplayedRange] = useState({ identity: displayIdentity, end: 0 });
   const load = useMetricQuery({
     ...nodeLoadRangeQuery(nodeId, range),
     refetchInterval: fixedLoadRange(range) ? false : range.seconds <= 60 * 60 ? 10_000 : 30_000,
@@ -2070,9 +2108,7 @@ export function ThroughputPanel({
       />
     );
 
-  const series = report.series;
-  const latest = report.latest_sample ?? series[series.length - 1];
-  if (series.length === 0 || !latest) {
+  if (report.series.length === 0) {
     const emptyBlock = (title: string, icon: IconName) => (
       <div className="nd-throughput-block" key={title}>
         <div className="load-network-cap">
@@ -2094,9 +2130,42 @@ export function ThroughputPanel({
 
   const group = linked ? `nd-tp-${nodeId}` : undefined;
   const rangeStart = report.range_start_unix_secs;
-  const rangeEnd = report.range_end_unix_secs;
+  const requestedEnd = report.range_end_unix_secs;
+  const mine = usage.data?.nodes.find(n => n.node_id === nodeId);
+  const receivedUsage = usageRoleTimeline(mine, rangeStart, requestedEnd);
+  const sourceTimes = [
+    report.series.map(sample => sample.window_end_unix_secs),
+    receivedUsage.timesUnixSecs.filter((_, index) => receivedUsage.user[index] !== null),
+    receivedUsage.forwardingTimes,
+  ];
+  const sourceEnds = sourceTimes.map(times => times.at(-1));
+  const newestEnd = Math.max(rangeStart, ...sourceEnds.filter((end): end is number => end !== undefined));
+  const fixed = fixedLoadRange(range);
+  // 不要求时间戳相同：小于一轮刷新偏差时，按共同截止时间显示。落后超过一轮的来源不再阻塞其他数据。
+  const delayed = sourceEnds.map(end => !fixed && end !== undefined && newestEnd - end > USAGE_WINDOW_SECS);
+  const readySources = sourceTimes.filter((times, index) => times.length > 0 && !delayed[index]);
+  const commonEnd = Math.min(...readySources.map(times => times[times.length - 1]));
+  // 选离共同时间最近的完整窗口，允许半个采样周期偏差；否则错开 5 秒也会被误配成相隔 25 秒。
+  const matchedEnds = readySources.map(times =>
+    times.reduce<number | undefined>((nearest, time) => {
+      const distance = Math.abs(time - commonEnd);
+      if (distance > USAGE_WINDOW_SECS / 2) return nearest;
+      return nearest === undefined || distance <= Math.abs(nearest - commonEnd) ? time : nearest;
+    }, undefined),
+  );
+  // 首批数据尚无可配对窗口时先显示已有数据；延迟来源恢复后也不撤回已经展示的样本。
+  const alignedEnd = matchedEnds.every((end): end is number => end !== undefined)
+    ? Math.max(...matchedEnds)
+    : newestEnd;
+  const previousEnd = displayedRange.identity === displayIdentity ? displayedRange.end : 0;
+  const rangeEnd = fixed ? requestedEnd : Math.min(requestedEnd, Math.max(previousEnd, alignedEnd));
+  if (displayedRange.identity !== displayIdentity || displayedRange.end !== rangeEnd) {
+    setDisplayedRange({ identity: displayIdentity, end: rangeEnd });
+  }
+  const series = report.series.filter(sample => sample.window_end_unix_secs <= rangeEnd);
+  const latest = series[series.length - 1];
 
-  // 网卡：每个点使用上报的真实结束时间。轴保持完整请求区间，因此尾部没有样本时会留白。
+  // 图例与曲线取同一批已显示样本，保留真实时间和值；固定历史区间始终保留完整请求范围。
   const latestNic = latest.has_gap ? null : latest;
   const host = report.host;
   const nicTimes = series.map(sample => sample.window_end_unix_secs);
@@ -2113,7 +2182,6 @@ export function ThroughputPanel({
   ].filter((value): value is string => value !== null);
 
   // XRAY：按角色只统计 xray 转发的字节。
-  const mine = usage.data?.nodes.find(n => n.node_id === nodeId);
   const {
     timesUnixSecs: xrayTimes,
     user,
@@ -2143,10 +2211,12 @@ export function ThroughputPanel({
           </b>
           <span className="chart-unit">({nicUnit.name})</span>
           {nicMeta.length > 0 && <span className={drops > 0 ? 'hot' : undefined}>{nicMeta.join(' · ')}</span>}
-          <span>
-            最后样本 <Ago at={iso(latest.window_end_unix_secs)} />
-          </span>
-          <footer className="load-network-legend" aria-label="网卡流量图例">
+          {delayed[0] && <span title="网卡样本落后超过 30 秒，其他数据继续更新">滞后</span>}
+          <footer
+            className="load-network-legend"
+            aria-label="网卡流量图例"
+            title={`最后采样 ${iso(latest.window_end_unix_secs)}`}
+          >
             <span className="rx">
               <i />
               接收 <b>{latestNic ? nicUnit.read(latestNic.nic_rx_bps) : '—'}</b>
@@ -2180,16 +2250,38 @@ export function ThroughputPanel({
             </b>
             <span className="chart-unit">({xrayUnit.name})</span>
             <span>本月 {bytes(monthTotal)}</span>
-            <footer className="load-network-legend" aria-label="XRAY 流量图例">
+            {(delayed[1] || delayed[2]) && (
+              <span
+                title={`${[delayed[1] ? '接入与中继' : null, delayed[2] ? '转发' : null].filter(Boolean).join('、')}样本落后超过 30 秒，其他数据继续更新`}
+              >
+                滞后
+              </span>
+            )}
+            <footer
+              className="load-network-legend"
+              aria-label="XRAY 流量图例"
+              title={
+                xrayTimes.length > 0
+                  ? `接入与中继最后采样 ${iso(xrayTimes[xrayTimes.length - 1])}`
+                  : '尚无接入与中继样本'
+              }
+            >
               <span className="rx">
                 <i />
-                接入 <b>{xrayUnit.read(user[user.length - 1])}</b>
+                接入 <b>{user[user.length - 1] == null ? '—' : xrayUnit.read(user[user.length - 1]!)}</b>
               </span>
               <span className="tx">
                 <i />
-                中继 <b>{xrayUnit.read(relay[relay.length - 1])}</b>
+                中继 <b>{relay[relay.length - 1] == null ? '—' : xrayUnit.read(relay[relay.length - 1]!)}</b>
               </span>
-              <span className="forwarding">
+              <span
+                className="forwarding"
+                title={
+                  forwardingTimes.length > 0
+                    ? `最后样本 ${iso(forwardingTimes[forwardingTimes.length - 1])}`
+                    : '尚无转发样本'
+                }
+              >
                 <i />
                 转发{' '}
                 <b>
@@ -3324,10 +3416,40 @@ const TRAFFIC_ACCOUNTING_MODES: ReadonlyArray<{ value: NodeTrafficAccountingMode
 ];
 const TRAFFIC_DAY_SECS = 86_400;
 
-/** Physical default-route traffic. Policy/calibration are immediate and do not create a revision. */
+/** Physical default-route traffic and the machine's automatic rate limit. Both are immediate runtime settings that do
+ *  not create a revision; they share one form and one save. */
 export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateItem; canEdit: boolean }) {
   const qc = useQueryClient();
-  const traffic = useMetricQuery({ queryKey: ['node-traffic'], queryFn: fetchNodeTraffic, retry: false });
+  const traffic = useMetricQuery({
+    queryKey: ['node-traffic'],
+    queryFn: fetchNodeTraffic,
+    retry: false,
+    /* 计量设置、限速策略与限速回执是状态不是计数：保存后或回执一变就立即显示，表单不会先退回旧值再跳到新值。
+       累计字节仍随共享节拍更新。 */
+    metricFacts: view => {
+      const item = view.nodes.find(entry => entry.node_id === node.node_id);
+      const observation = item?.limit?.observation;
+      return item
+        ? [
+            item.cycle_kind,
+            item.accounting_mode,
+            item.reset_month,
+            item.reset_day,
+            item.quota_bytes,
+            item.calibrated_at_unix_secs,
+            item.limit?.revision,
+            item.limit?.policy,
+            item.limit?.supported,
+            observation?.revision,
+            observation?.phase,
+            observation?.rate_bps,
+            observation?.error,
+            observation?.system,
+            observation?.application,
+          ]
+        : null;
+    },
+  });
   const mine = traffic.data?.nodes.find(item => item.node_id === node.node_id) ?? null;
   const base: TrafficForm = {
     cycle_kind: mine?.cycle_kind ?? 'monthly',
@@ -3376,26 +3498,67 @@ export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateI
     shown.reset_day !== base.reset_day ||
     (shown.cycle_kind === 'yearly' && shown.reset_month !== base.reset_month);
   const dirty = policyDirty || shown.quota !== base.quota || shown.calibration.trim() !== '';
-  useUnsavedChanges(dirty, `${node.name || node.node_id} 的流量统计`, `node-tab:${node.node_id}:config`);
+
+  /* 自动限速的草稿单独跟踪来源（修订与策略），计量设置先保存成功时不会把它冲掉。 */
+  const limit = mine?.limit;
+  const savedQuota = mine?.quota_bytes ?? null;
+  const limitBase = trafficLimitForm(limit?.policy, savedQuota);
+  const limitSource = JSON.stringify([node.node_id, limit?.revision, limit?.policy]);
+  const [limitSyncedFrom, setLimitSyncedFrom] = useState(limitSource);
+  const [limitForm, setLimitForm] = useState<TrafficLimitForm | null>(null);
+  if (limitSource !== limitSyncedFrom) {
+    setLimitSyncedFrom(limitSource);
+    setLimitForm(null);
+  }
+  const limitShown = limitForm ?? limitBase;
+  const limitDirty = limitForm !== null && JSON.stringify(limitShown) !== JSON.stringify(limitBase);
+  /* 额度条与百分比规则按表单里的额度预览；额度输入无效时仍按已保存的额度画。 */
+  const quotaShown = quota === undefined ? savedQuota : quota;
+  const limitPolicy = trafficLimitPolicy(limitShown, quotaShown);
+  const limitProblem = limit ? trafficLimitProblem(limitShown, quotaShown) : null;
+  const used =
+    mine && (mine.tracking_started_at_unix_secs !== null || mine.calibrated_at_unix_secs !== null)
+      ? Number(mine.total_bytes)
+      : null;
+  const steps = limitShown.enabled
+    ? trafficLimitSteps(limitShown, quotaShown === null ? null : Number(quotaShown), used)
+    : [];
+
+  useUnsavedChanges(dirty || limitDirty, `${node.name || node.node_id} 的流量统计`, `node-tab:${node.node_id}:config`);
   const set = (patch: Partial<TrafficForm>) => setForm({ ...shown, ...patch });
   const revert = () => {
     setForm(null);
     setCalibrating(false);
+    setLimitForm(null);
   };
   const save = useMutation({
-    mutationFn: () =>
-      saveNodeTraffic(node.node_id, {
-        cycle_kind: shown.cycle_kind,
-        accounting_mode: shown.accounting_mode,
-        reset_month: shown.cycle_kind === 'yearly' ? resetMonth : null,
-        reset_day: resetDay,
-        quota_bytes: quota ?? null,
-        calibrated_total_bytes: calibration,
-      }),
-    onSuccess: async view => {
-      revert();
-      qc.setQueryData<NodeTrafficView>(['node-traffic'], view);
-      await qc.invalidateQueries({ queryKey: ['usage-machine-model'] });
+    /* 计量设置与限速策略是两个接口，按顺序各存一次。服务端用额度校验已保存的百分比限速，所以通常先存计量；
+       清空额度、同时撤下百分比限速时反过来先存限速，否则第一步就会被拒绝。每一步成功后立即收起它的草稿，
+       后一步失败时只留下没存上的部分。 */
+    mutationFn: async () => {
+      const saveAccounting = async () => {
+        if (!dirty) return;
+        const view = await saveNodeTraffic(node.node_id, {
+          cycle_kind: shown.cycle_kind,
+          accounting_mode: shown.accounting_mode,
+          reset_month: shown.cycle_kind === 'yearly' ? resetMonth : null,
+          reset_day: resetDay,
+          quota_bytes: quota ?? null,
+          calibrated_total_bytes: calibration,
+        });
+        setForm(null);
+        setCalibrating(false);
+        qc.setQueryData<NodeTrafficView>(['node-traffic'], view);
+        await qc.invalidateQueries({ queryKey: ['usage-machine-model'] });
+      };
+      const saveLimit = async () => {
+        if (!limitDirty || !limitPolicy) return;
+        const view = await saveNodeTrafficLimit(node.node_id, limitPolicy);
+        setLimitForm(null);
+        qc.setQueryData<NodeTrafficView>(['node-traffic'], view);
+      };
+      const limitFirst = limitDirty && quota === null && trafficLimitNeedsQuota(limit?.policy);
+      for (const step of limitFirst ? [saveLimit, saveAccounting] : [saveAccounting, saveLimit]) await step();
     },
   });
 
@@ -3407,11 +3570,12 @@ export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateI
       <header>
         <PanelTitle of="usage">流量统计</PanelTitle>
         <span className="sp" />
+        <TrafficLimitChip limit={limit} />
         <span className="node-traffic-source" title={reported === null ? undefined : `上报于 ${iso(reported)}`}>
           <span className="mono">{mine.interface ?? '待上报'}</span>
         </span>
       </header>
-      <TrafficPeriodSummary traffic={mine} />
+      <TrafficPeriodSummary traffic={mine} quota={quotaShown} steps={steps} />
       <div className="fgrid one node-traffic-settings">
         <Row k="计量口径">
           <select
@@ -3543,19 +3707,31 @@ export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateI
             </span>
           )}
         </Row>
+        <TrafficLimitRows
+          limit={limit}
+          form={limitShown}
+          steps={steps}
+          quota={quotaShown}
+          canEdit={canEdit}
+          saving={save.isPending}
+          onChange={setLimitForm}
+        />
       </div>
-      {invalid && (
+      {(invalid || limitProblem) && (
         <div className="callout err">
-          日期需为 1–31；流量额度需为大于 0 的数字、最多两位小数，留空表示不限；校准值需为非负数字、最多保留 6 位小数。
+          {invalid &&
+            '日期需为 1–31；流量额度需为大于 0 的数字、最多两位小数，留空表示不限；校准值需为非负数字、最多保留 6 位小数。'}
+          {invalid && limitProblem && ' '}
+          {limitProblem}
         </div>
       )}
       {save.error && <ErrorBox error={save.error} />}
-      {dirty && (
+      {(dirty || limitDirty) && (
         <div className="toolbar config-panel-savebar">
           <span className="sp" />
           <button
             className="btn primary"
-            disabled={!canEdit || invalid || save.isPending}
+            disabled={!canEdit || invalid || limitProblem !== null || save.isPending}
             onClick={() => save.mutate()}
           >
             {save.isPending ? '保存中…' : '保存'}
@@ -3569,23 +3745,33 @@ export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateI
   );
 }
 
-/** 本期一行读数、额度条与接收/发送。倒计时与时间进度用共享的一秒节拍，只让这一块随之重绘。 */
-function TrafficPeriodSummary({ traffic }: { traffic: NodeTrafficItem }) {
+/** 本期一行读数、额度条与接收/发送。倒计时、时间进度与限速回执是否过期用共享的一秒节拍，只让这一块随之重绘。
+ *  额度与限速台阶取表单里的值，编辑时即可看到阈值落在条上哪里。 */
+function TrafficPeriodSummary({
+  traffic,
+  quota: quotaBytes,
+  steps,
+}: {
+  traffic: NodeTrafficItem;
+  quota: string | null;
+  steps: LimitStep[];
+}) {
   const now = useNow() / 1000;
   const tracked = traffic.tracking_started_at_unix_secs !== null || traffic.calibrated_at_unix_secs !== null;
   const start = traffic.period_start_unix_secs;
   const end = traffic.period_end_unix_secs;
   const left = Math.max(end - now, 0);
   const used = Number(traffic.total_bytes);
-  const quota = traffic.quota_bytes === null ? null : Number(traffic.quota_bytes);
+  const quota = quotaBytes === null ? null : Number(quotaBytes);
   const counted = countedTrafficDirections(traffic);
+  const limited = trafficLimitStatus(traffic.limit, now).rate !== null;
   return (
     <div className="node-traffic-summary">
       <div className="node-traffic-line">
         <span className="node-traffic-used">
           本期
           <b>{tracked ? exactBytes(traffic.total_bytes) : '—'}</b>
-          {traffic.quota_bytes !== null && <span>/ {machineQuotaTiB(traffic.quota_bytes)} TiB</span>}
+          {quotaBytes !== null && <span>/ {machineQuotaTiB(quotaBytes)} TiB</span>}
           {quota !== null && tracked && (
             <span className={used > quota ? 'over' : undefined}>{Math.round((used / quota) * 100)}%</span>
           )}
@@ -3597,8 +3783,14 @@ function TrafficPeriodSummary({ traffic }: { traffic: NodeTrafficItem }) {
           后重置 · {new Date(end * 1000).toISOString().slice(5, 10)} UTC
         </span>
       </div>
-      {quota !== null && tracked && (
-        <TrafficQuotaMeter used={used} quota={quota} elapsed={(now - start) / (end - start)} />
+      {tracked && (quota !== null || steps.length > 0) && (
+        <TrafficQuotaMeter
+          used={used}
+          quota={quota}
+          elapsed={(now - start) / (end - start)}
+          steps={steps}
+          limited={limited}
+        />
       )}
       {tracked && (
         <dl className="node-traffic-directions" aria-label="接收与发送流量">
@@ -3638,28 +3830,59 @@ function countedTrafficDirections(traffic: NodeTrafficItem): { rx: boolean; tx: 
   }
 }
 
-/** 额度条沿用流量预测页的跑道：满格为额度与已用中较大者，超出额度的部分用错误色。
- *  未超额时竖线是本期时间进度，与已用长度对照即看出快慢；超额后竖线改标额度位置。 */
-function TrafficQuotaMeter({ used, quota, elapsed }: { used: number; quota: number; elapsed: number }) {
-  const full = Math.max(quota, used);
+/** 额度条沿用流量预测页的跑道：满格为额度、已用与最高限速阈值中较大者，超出额度的部分用错误色。
+ *  未超额时竖线是本期时间进度，与已用长度对照即看出快慢；超额后竖线改标额度位置。
+ *  自动限速的每档阈值在条上切一道口，旗标写在条下；越过第一道有效阈值后的已用部分叠斜纹。
+ *  没有额度、只有绝对用量阈值时，满格按最高阈值再留出一段，只为看清离各档还有多远。 */
+function TrafficQuotaMeter({
+  used,
+  quota,
+  elapsed,
+  steps,
+  limited,
+}: {
+  used: number;
+  quota: number | null;
+  elapsed: number;
+  steps: LimitStep[];
+  limited: boolean;
+}) {
+  const highest = steps.reduce((max, step) => Math.max(max, step.at), 0);
+  const full = quota !== null ? Math.max(quota, used, highest) : Math.max(used, highest) * 1.14;
   const at = (value: number) => (full > 0 ? (Math.min(Math.max(value, 0), full) / full) * 100 : 0);
   const progress = Math.min(Math.max(elapsed, 0), 1);
-  const over = used > quota;
+  const over = quota !== null && used > quota;
+  const throttledFrom = steps.find(step => step.effective && step.reached);
   return (
-    <span
-      className="node-traffic-meter"
-      aria-hidden="true"
-      title={over ? undefined : `本期时间已过 ${Math.round(progress * 100)}%`}
-    >
-      <span className="cap-bar">
-        <i className="u" style={{ left: 0, width: `${at(Math.min(used, quota))}%` }} />
-        {over && <i className="u x" style={{ left: `${at(quota)}%`, width: `${at(used) - at(quota)}%` }} />}
+    <span className="node-traffic-meter" aria-hidden="true">
+      <span
+        className="node-traffic-bar"
+        title={over || quota === null ? undefined : `本期时间已过 ${Math.round(progress * 100)}%`}
+      >
+        <span className="cap-bar">
+          <i className="u" style={{ left: 0, width: `${at(over ? quota : used)}%` }} />
+          {over && <i className="u x" style={{ left: `${at(quota)}%`, width: `${at(used) - at(quota)}%` }} />}
+          {throttledFrom && (
+            <i
+              className="node-traffic-hatch"
+              style={{ left: `${at(throttledFrom.at)}%`, width: `${at(used) - at(throttledFrom.at)}%` }}
+            />
+          )}
+        </span>
+        {steps.map(step => (
+          <i
+            key={step.index}
+            className={step.effective ? 'node-traffic-cut' : 'node-traffic-cut idle'}
+            style={{ left: `${at(step.at)}%` }}
+          />
+        ))}
+        {over ? (
+          <i className="cap-q" style={{ left: `${at(quota)}%` }} />
+        ) : (
+          quota !== null && <i className="node-traffic-pace" style={{ left: `${at(quota * progress)}%` }} />
+        )}
       </span>
-      {over ? (
-        <i className="cap-q" style={{ left: `${at(quota)}%` }} />
-      ) : (
-        <i className="node-traffic-pace" style={{ left: `${progress * 100}%` }} />
-      )}
+      {steps.length > 0 && <TrafficLimitFlags steps={steps} position={at} used={used} limited={limited} />}
     </span>
   );
 }
@@ -6347,6 +6570,7 @@ function NodeDetail({
             </div>
 
             <TrafficAccountingCard node={n} canEdit={system} />
+            {system && <SourceAccessPanel key={`source-access:${id}`} nodeId={id} editable={system} />}
             <WgCard
               node={n}
               listenPort={wgListenPort}

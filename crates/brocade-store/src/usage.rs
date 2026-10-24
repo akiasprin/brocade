@@ -654,13 +654,6 @@ pub(crate) async fn traffic_history_range(
 /// bytes land in, and month boundaries are where bills divide.
 const MAX_CLOCK_SKEW_SECS: i64 = 600;
 
-/// Bound each hourly detail cleanup so an older installation does not create one large DELETE,
-/// WAL burst, and autovacuum debt when it first receives the retention policy.
-const USAGE_SAMPLE_PRUNE_BATCH_ROWS: i64 = 50_000;
-
-/// Bound each minute of raw-history catch-up when reducing the diagnostic retention window.
-const USAGE_READING_PRUNE_BATCH_ROWS: i64 = 50_000;
-
 /// Process-local observations for counters which are absent from the reporting generation.
 ///
 /// Xray keeps removed user counters in process memory, so merely seeing an unknown label is not
@@ -1512,8 +1505,22 @@ pub async fn record_usage_report(
             continue;
         };
         let first_reading_policy = binding.first_reading_policy();
+        let previous = usage_head_for_update(&mut tx, node_id, &label).await?;
         let Some(owner) = binding.to_counter_owner(&label) else {
-            rejected_counters += 1;
+            // Persistent Xray counters survive a topology change that removes their owner from
+            // this machine. An unchanged value in the same namespace is already accounted for;
+            // it neither advances the head nor indicates foreign traffic. Require the exact
+            // durable baseline: new bytes, regressions and unproven namespaces still reject.
+            if previous.as_ref().is_some_and(|head| {
+                request.read_at_unix_secs >= head.read_at_unix_secs
+                    && xray_epoch == head.xray_epoch
+                    && uplink_bytes == head.uplink_bytes
+                    && downlink_bytes == head.downlink_bytes
+            }) {
+                skipped_counters += 1;
+            } else {
+                rejected_counters += 1;
+            }
             continue;
         };
         let canonical_label = match &owner {
@@ -1521,7 +1528,6 @@ pub async fn record_usage_report(
             CounterOwner::ChainHop(hop) => &hop.label,
         };
 
-        let previous = usage_head_for_update(&mut tx, node_id, canonical_label).await?;
         let inserted = insert_usage_reading(
             &mut tx,
             UsageReadingInsert {
@@ -2051,30 +2057,7 @@ pub async fn prune_usage_readings(pool: &PgPool, retain_days: u32) -> Result<u64
 }
 
 pub(crate) async fn prune_usage_readings_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
-    let retain_secs = f64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600.0;
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET LOCAL lock_timeout = '1s'")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("SET LOCAL statement_timeout = '10s'")
-        .execute(&mut *tx)
-        .await?;
-    let result = sqlx::query(
-        "WITH expired AS MATERIALIZED (
-             SELECT id FROM usage_readings
-              WHERE read_at < now() - make_interval(secs => $1)
-              ORDER BY read_at
-              LIMIT $2
-              FOR UPDATE SKIP LOCKED
-         )
-         DELETE FROM usage_readings history USING expired WHERE history.id = expired.id",
-    )
-    .bind(retain_secs)
-    .bind(USAGE_READING_PRUNE_BATCH_ROWS)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(result.rows_affected())
+    crate::retention::cleanup::prune_batch(pool, "usage_readings", retain_hours).await
 }
 
 /// Expire replay responses separately from raw readings. The permanent cursor still rejects an
@@ -2087,15 +2070,7 @@ pub(crate) async fn prune_usage_report_receipts_hours(
     pool: &PgPool,
     retain_hours: u32,
 ) -> Result<u64> {
-    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
-    let result = sqlx::query(
-        "DELETE FROM usage_report_receipts
-         WHERE received_at < now() - make_interval(secs => $1::double precision)",
-    )
-    .bind(retain_secs)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
+    crate::retention::cleanup::prune_batch(pool, "usage_report_receipts", retain_hours).await
 }
 
 /// Delete accounting detail only after its daily machine and user projections are durable.
@@ -2114,72 +2089,15 @@ pub(crate) async fn prune_usage_samples_hours(
     chain_retain_hours: u32,
     node_window_retain_hours: u32,
 ) -> Result<u64> {
-    let user_retain_secs =
-        i64::from(user_retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
-    let chain_retain_secs =
-        i64::from(chain_retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
-    let node_window_retain_secs =
-        i64::from(node_window_retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
-    let mut tx = pool.begin().await?;
-    let user_rows = sqlx::query_scalar::<_, i64>(
-        "WITH expired AS MATERIALIZED (
-             SELECT ctid
-               FROM usage_samples
-              WHERE window_end < now() - make_interval(secs => $1::double precision)
-              ORDER BY window_end
-              LIMIT $2
-         ), deleted AS (
-             DELETE FROM usage_samples history
-              USING expired
-              WHERE history.ctid = expired.ctid
-              RETURNING 1
-         )
-         SELECT count(*) FROM deleted",
-    )
-    .bind(user_retain_secs)
-    .bind(USAGE_SAMPLE_PRUNE_BATCH_ROWS)
-    .fetch_one(&mut *tx)
-    .await?;
-    let chain_rows = sqlx::query_scalar::<_, i64>(
-        "WITH expired AS MATERIALIZED (
-             SELECT ctid
-               FROM usage_chain_samples
-              WHERE window_end < now() - make_interval(secs => $1::double precision)
-              ORDER BY window_end
-              LIMIT $2
-         ), deleted AS (
-             DELETE FROM usage_chain_samples history
-              USING expired
-              WHERE history.ctid = expired.ctid
-              RETURNING 1
-         )
-         SELECT count(*) FROM deleted",
-    )
-    .bind(chain_retain_secs)
-    .bind(USAGE_SAMPLE_PRUNE_BATCH_ROWS)
-    .fetch_one(&mut *tx)
-    .await?;
-    let window_rows = sqlx::query_scalar::<_, i64>(
-        "WITH expired AS MATERIALIZED (
-             SELECT ctid FROM usage_node_windows
-              WHERE window_end < now() - make_interval(secs => $1::double precision)
-              ORDER BY window_end LIMIT $2
-         ), deleted AS (
-             DELETE FROM usage_node_windows history USING expired
-              WHERE history.ctid = expired.ctid RETURNING 1
-         ) SELECT count(*) FROM deleted",
-    )
-    .bind(node_window_retain_secs)
-    .bind(USAGE_SAMPLE_PRUNE_BATCH_ROWS)
-    .fetch_one(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    let removed = user_rows
-        .checked_add(chain_rows)
-        .and_then(|rows| rows.checked_add(window_rows))
-        .ok_or_else(|| StoreError::InvalidData("usage sample prune count overflow".to_owned()))?;
-    u64::try_from(removed)
-        .map_err(|_| StoreError::InvalidData("negative usage sample prune count".to_owned()))
+    let mut total = 0;
+    for (table, hours) in [
+        ("usage_samples", user_retain_hours),
+        ("usage_chain_samples", chain_retain_hours),
+        ("usage_node_windows", node_window_retain_hours),
+    ] {
+        total += crate::retention::cleanup::prune_batch(pool, table, hours).await?;
+    }
+    Ok(total)
 }
 
 pub async fn list_usage_samples(

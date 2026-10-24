@@ -18,13 +18,11 @@ flate2 = "1.1"
 # implementation is installed (BusyBox's does not understand -M) and can only treat an
 # exit code as a measurement. See the argument at the top of src/icmp.rs.
 libc = "0.2"
-# For the https leg to the control plane. We write the HTTP ourselves (see the top of
-# src/http.rs), but TLS is not something to write oneself.
-# default-features is fully off: the default set drags in aws-lc-rs (needing cmake and
-# bindgen, and cross-compiling that to musl is a separate battle) and logging (needing the
-# log crate, and the agent has no logging facade).
-# The provider is ring rather than either pure-Rust one; the reasoning and the measurements
-# are at the top of brocade-console/build.rs.
+# HTTP framing and deadlines use the same reqwest/rustls stack as the Console.
+# Keep native TLS, OpenSSL and AWS-LC out of static musl builds.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots"] }
+# Only the one-shot notification primitive is needed by our bounded system resolver.
+tokio = { version = "1", features = ["sync"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 # Trust anchors are compiled into the binary rather than read from the target machine's
 # /etc/ssl/certs. The agent installs on other people's machines, and how old that root store

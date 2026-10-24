@@ -63,6 +63,67 @@ it('orders secure tunnel protocols before generic proxies', () => {
       .filter((name): name is string => name !== null && protocolNames.has(name)),
   ).toEqual(['VLESS Encryption', 'VLESS', 'AnyTLS', 'Shadowsocks', 'WireGuard', 'SOCKS5', 'HTTP CONNECT']);
 });
+it('keeps existing tunnels on remote resolution without creating a dirty draft', () => {
+  const view = wrap(
+    <ExternalOutboundEditor tenantId="platform" existing={outbound} onClose={() => undefined} onSaved={vi.fn()} />,
+  );
+  expect((view.getByRole('combobox', { name: '目标域名解析' }) as HTMLSelectElement).value).toBe('as_is');
+  expect(view.getByRole('button', { name: '保存并选中' }).hasAttribute('disabled')).toBe(true);
+  expect(draft.snapshot()).toEqual([]);
+});
+it.each(['use_ipv4v6', 'use_ipv6v4', 'use_ip', 'use_ipv4', 'use_ipv6'])(
+  'saves %s at the tunnel level and retains the redacted credential',
+  async strategy => {
+    const saved = vi.fn();
+    const view = wrap(
+      <ExternalOutboundEditor tenantId="platform" existing={outbound} onClose={() => undefined} onSaved={saved} />,
+    );
+    fireEvent.change(view.getByRole('combobox', { name: '目标域名解析' }), { target: { value: strategy } });
+    fireEvent.click(view.getByRole('button', { name: '保存并选中' }));
+    await waitFor(() => expect(saved).toHaveBeenCalled());
+    expect(saved.mock.calls[0][0]).toMatchObject({
+      target_strategy: strategy,
+      protocol: { t: 'anytls', v: { credential: '<redacted>' } },
+    });
+    expect(draft.snapshot()[0].op).toMatchObject({
+      op: 'upsert_external_outbound',
+      outbound: { target_strategy: strategy },
+    });
+  },
+);
+it('loads the saved strategy and can return to remote resolution', async () => {
+  const saved = vi.fn();
+  const view = wrap(
+    <ExternalOutboundEditor
+      tenantId="platform"
+      existing={{ ...outbound, target_strategy: 'use_ipv4v6' }}
+      onClose={() => undefined}
+      onSaved={saved}
+    />,
+  );
+  expect((view.getByRole('combobox', { name: '目标域名解析' }) as HTMLSelectElement).value).toBe('use_ipv4v6');
+  expect(view.getByRole('button', { name: '保存并选中' }).hasAttribute('disabled')).toBe(true);
+  fireEvent.change(view.getByRole('combobox', { name: '目标域名解析' }), { target: { value: 'as_is' } });
+  fireEvent.click(view.getByRole('button', { name: '保存并选中' }));
+  await waitFor(() => expect(saved).toHaveBeenCalled());
+  expect(saved.mock.calls[0][0].target_strategy).toBeUndefined();
+  expect(
+    (draft.snapshot()[0].op as { outbound: { target_strategy?: string } }).outbound.target_strategy,
+  ).toBeUndefined();
+});
+it('preserves the selected strategy when switching between import and manual entry', async () => {
+  const view = editor();
+  fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
+    target: { value: 'anytls://secret@example.com' },
+  });
+  fireEvent.change(view.getByRole('combobox', { name: '目标域名解析' }), { target: { value: 'use_ipv4v6' } });
+  fireEvent.click(view.getByRole('button', { name: '手动填写' }));
+  expect((view.getByRole('combobox', { name: '目标域名解析' }) as HTMLSelectElement).value).toBe('use_ipv4v6');
+  fireEvent.click(view.getByRole('button', { name: '粘贴分享链接' }));
+  fireEvent.click(view.getByRole('button', { name: '创建并选中' }));
+  await waitFor(() => expect(view.saved).toHaveBeenCalled());
+  expect(view.saved.mock.calls[0][0].target_strategy).toBe('use_ipv4v6');
+});
 it('imports AnyTLS with encoded password, IPv6, SNI and default port into the draft', async () => {
   const view = editor();
   fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
@@ -79,13 +140,80 @@ it('imports AnyTLS with encoded password, IPv6, SNI and default port into the dr
   });
   expect(draft.snapshot()[0].op.op).toBe('upsert_external_outbound');
 });
-it('rejects unsupported AnyTLS certificate bypass instead of silently losing it', () => {
+it.each(['import', 'manual'])('imports AnyTLS peer, fingerprint, insecure and UDP aliases via %s mode', async mode => {
   const view = editor();
   fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
-    target: { value: 'anytls://secret@example.com?insecure=1' },
+    target: {
+      value:
+        'anytls://test-password@192.0.2.25:771' +
+        '?peer=tls.vendor.example&insecure=1&udp=1&fingerprint=chrome#PH-test',
+    },
   });
+  expect(view.getByText(/TLS · insecure/)).toBeTruthy();
+  if (mode === 'manual') {
+    fireEvent.click(view.getByRole('button', { name: '手动填写' }));
+    expect((view.getByRole('checkbox', { name: '跳过证书验证（insecure）' }) as HTMLInputElement).checked).toBe(true);
+  }
+  fireEvent.click(view.getByRole('button', { name: '创建并选中' }));
+  await waitFor(() => expect(view.saved).toHaveBeenCalled());
+  expect(view.saved.mock.calls[0][0]).toMatchObject({
+    name: 'PH-test',
+    address: '192.0.2.25',
+    port: 771,
+    protocol: { t: 'anytls', v: { credential: 'test-password' } },
+    security: {
+      t: 'tls',
+      v: { server_name: 'tls.vendor.example', fingerprint: 'chrome', allow_insecure: true },
+    },
+  });
+});
+it.each(['', '?insecure=0', '?insecure=false', '?allowInsecure=false'])(
+  'keeps verification on for AnyTLS %s',
+  query => {
+    const view = editor();
+    fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
+      target: { value: `anytls://test-password@example.com${query}` },
+    });
+    fireEvent.click(view.getByRole('button', { name: '手动填写' }));
+    expect((view.getByRole('checkbox', { name: '跳过证书验证（insecure）' }) as HTMLInputElement).checked).toBe(false);
+  },
+);
+it.each([
+  ['insecure=yes', 'insecure / allowInsecure 必须为 1、0、true 或 false'],
+  ['insecure=0&allowInsecure=1', 'insecure / allowInsecure 参数互相冲突'],
+  ['sni=one.example&peer=two.example', 'sni / peer 参数互相冲突'],
+  ['fp=chrome&fingerprint=firefox', 'fp / fingerprint 参数互相冲突'],
+  ['udp=0', '当前 AnyTLS 出站不能单独关闭 UDP，udp 参数必须为 1 或 true'],
+])('rejects invalid or conflicting AnyTLS parameters: %s', (query, error) => {
+  const view = editor();
+  fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
+    target: { value: `anytls://test-password@example.com?${query}` },
+  });
+  expect(view.getByText(error)).toBeTruthy();
   expect(view.getByRole('button', { name: '创建并选中' }).hasAttribute('disabled')).toBe(true);
-  expect(view.getByText('暂不支持跳过 AnyTLS 证书验证，请使用有效证书')).toBeTruthy();
+});
+it('preserves explicit insecure on edit and lets the operator re-enable verification', async () => {
+  const saved = vi.fn();
+  const view = wrap(
+    <ExternalOutboundEditor
+      tenantId="platform"
+      existing={{
+        ...outbound,
+        security: {
+          t: 'tls',
+          v: { server_name: 'example.com', fingerprint: 'chrome', allow_insecure: true },
+        },
+      }}
+      onClose={() => undefined}
+      onSaved={saved}
+    />,
+  );
+  const checkbox = view.getByRole('checkbox', { name: '跳过证书验证（insecure）' }) as HTMLInputElement;
+  expect(checkbox.checked).toBe(true);
+  fireEvent.click(checkbox);
+  fireEvent.click(view.getByRole('button', { name: '保存并选中' }));
+  await waitFor(() => expect(saved).toHaveBeenCalled());
+  expect(saved.mock.calls[0][0].security.v.allow_insecure ?? false).toBe(false);
 });
 it('imports VLESS Encryption without requiring TLS', async () => {
   const view = editor();
@@ -147,6 +275,7 @@ it('preserves the complete XHTTP, Finalmask and TLS share-link payload', async (
       tlsSettings: {
         serverName: 'download-sni.example.com',
         fingerprint: 'firefox',
+        allowInsecure: true,
         alpn: ['h2'],
         echConfigList: 'download-ech',
         pinnedPeerCertSha256: pins,
@@ -207,6 +336,7 @@ it('preserves the complete XHTTP, Finalmask and TLS share-link payload', async (
                 v: {
                   server_name: 'download-sni.example.com',
                   fingerprint: 'firefox',
+                  allow_insecure: true,
                   alpn: ['h2'],
                   ech_config_list: 'download-ech',
                   pinned_peer_cert_sha256: pins,
@@ -229,6 +359,29 @@ it('preserves the complete XHTTP, Finalmask and TLS share-link payload', async (
         verify_peer_cert_by_name: 'upload-cert.example.com',
       },
     },
+  });
+});
+it.each(['insecure=1', 'allowInsecure=true'])('preserves VLESS TLS certificate bypass: %s', async query => {
+  const view = editor();
+  fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
+    target: {
+      value: `vless://11111111-2222-4333-8444-555555555555@edge.example.com:443?security=tls&${query}`,
+    },
+  });
+  fireEvent.click(view.getByRole('button', { name: '创建并选中' }));
+  await waitFor(() => expect(view.saved).toHaveBeenCalled());
+  expect(view.saved.mock.calls[0][0].security.v.allow_insecure).toBe(true);
+});
+it('imports an explicit HTTPS certificate bypass', async () => {
+  const view = editor();
+  fireEvent.change(view.getByPlaceholderText('anytls://… / vless://… / ss://… / socks5://… / https://…'), {
+    target: { value: 'https://proxy.example.com:8443?insecure=1' },
+  });
+  fireEvent.click(view.getByRole('button', { name: '创建并选中' }));
+  await waitFor(() => expect(view.saved).toHaveBeenCalled());
+  expect(view.saved.mock.calls[0][0]).toMatchObject({
+    protocol: { t: 'http_connect' },
+    security: { t: 'tls', v: { allow_insecure: true } },
   });
 });
 it('makes raw XHTTP xmux and downloadSettings visibly authoritative', () => {

@@ -372,7 +372,7 @@ fn open_append(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn archive_path(path: &Path) -> PathBuf {
+pub(crate) fn archive_path(path: &Path) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(".1");
     PathBuf::from(value)

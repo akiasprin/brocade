@@ -107,6 +107,17 @@ install_pkg() {
     fi
 }
 
+# Optional system-layer protection. Application-layer limits do not require these tools.
+if ! have tc; then
+    if have apk; then
+        install_pkg iproute2-tc || echo "tc 未安装；系统层限速待补齐依赖，应用层不受影响。" >&2
+    elif have dnf || have yum; then
+        install_pkg iproute-tc || echo "tc 未安装；系统层限速待补齐依赖，应用层不受影响。" >&2
+    else
+        install_pkg iproute2 || echo "tc 未安装；系统层限速待补齐依赖，应用层不受影响。" >&2
+    fi
+fi
+
 tun_device_usable() {
     [ -c /dev/net/tun ] || return 1
     # Merely seeing a device node is insufficient in a restricted container: the devices cgroup
@@ -849,7 +860,12 @@ SYSCTL
         # 关键的一步，也是最容易漏的：改 default_qdisc 只对**之后新建**的队列生效，
         # 已经 up 的网卡纹丝不动。只回读 default_qdisc 的话它显示 fq、而 eth0 上还是
         # fq_codel——「设了但没生效」会被判成成功。所以这里直接换现网卡上的那个。
-        tc qdisc replace dev "$nic" root fq >/dev/null 2>&1 || true
+        root_queue=$(tc qdisc show dev "$nic" 2>/dev/null | awk '/ root / { print $2 " " $3; exit }')
+        case "$root_queue" in
+            "fq 80"*|"fq 0:"|"fq_codel 80"*|"fq_codel 0:"|"pfifo_fast 0:"|"mq 0:"|"noqueue 0:")
+                tc qdisc replace dev "$nic" root fq >/dev/null 2>&1 || true ;;
+            *) echo "保留网卡现有 QoS/限速队列：$nic" >&2 ;;
+        esac
     fi
 
     echo "已开启 BBR（拥塞控制 bbr + qdisc fq）。" >&2

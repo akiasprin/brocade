@@ -295,3 +295,30 @@ fn ping_frames_cannot_refresh_the_overall_deadline() {
     assert!(started.elapsed() < Duration::from_millis(350));
     assert_eq!(server.count(), 1);
 }
+
+#[test]
+fn scoped_runtime_deadline_covers_multiple_rpcs_and_is_restored_after_unwind() {
+    let server = Server::start(|_, _stream| thread::sleep(Duration::from_millis(150)));
+    let started = Instant::now();
+    {
+        let _deadline = deadline_after(Some(Duration::from_millis(80)));
+        let error = unary(server.address, LIST_INBOUNDS_PATH, &[], None).unwrap_err();
+        assert!(error.contains("XRAY_API_READ_TIMEOUT"), "{error}");
+        let calls = server.count();
+        let _nested = deadline_after(Some(Duration::from_secs(20)));
+        let error = unary(server.address, LIST_INBOUNDS_PATH, &[], None).unwrap_err();
+        assert!(error.contains("deadline exceeded"), "{error}");
+        assert_eq!(
+            server.count(),
+            calls,
+            "a second RPC escaped the shared budget"
+        );
+    }
+    assert!(started.elapsed() < Duration::from_millis(400));
+    let _ = std::panic::catch_unwind(|| {
+        let _deadline = deadline_after(Some(Duration::ZERO));
+        panic!("test unwind");
+    });
+    let healthy = Server::start(|_, stream| reply(stream));
+    assert!(unary(healthy.address, LIST_INBOUNDS_PATH, &[], None).is_ok());
+}

@@ -163,16 +163,18 @@ function Harness({
   onNode,
   publicView = false,
   globalClear = false,
+  narrow = false,
 }: {
   onNode: (nodeId: string) => void;
   publicView?: boolean;
   globalClear?: boolean;
+  narrow?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
   return (
     <MachineNotifications
-      narrow={false}
+      narrow={narrow}
       open={open}
       publicView={publicView}
       globalClear={globalClear}
@@ -342,6 +344,102 @@ it('公网地址变化默认只显示三条，独立展开和收起其余内容'
   expect(screen.getAllByRole('button', { name: /机器 \d/ })).toHaveLength(3);
 });
 
+it.each([false, true])('公网 IP 历史和首次上线不点亮铃铛，窄屏=%s', narrow => {
+  const quiet: MachineEventList = {
+    ...recoveredFleetEvent,
+    latest_event_id: 8,
+    last_seen_event_id: 0,
+    unread_count: 0,
+    events: [
+      {
+        ...recoveredFleetEvent.events[0]!,
+        id: 8,
+        event_kind: 'public_ip_changed',
+        family: 4,
+        previous_value: '198.51.100.20',
+        current_value: '203.0.113.42',
+      },
+      { ...recoveredFleetEvent.events[0]!, id: 7, previous_value: 'waiting' },
+    ],
+  };
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+  client.setQueryData(['machine-notifications', 'operator'], quiet);
+  const view = render(
+    <QueryClientProvider client={client}>
+      <Harness onNode={vi.fn()} narrow={narrow} />
+    </QueryClientProvider>,
+  );
+  expect(screen.getByRole('button', { name: '机器通知' })).toBeTruthy();
+  expect(view.container.querySelector('.fg-badge, .fg-dot')).toBeNull();
+});
+
+it('已读成功后，旧查询迟到不能重新点亮铃铛', async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+  client.setQueryData(['machine-notifications', 'operator'], recoveredFleetEvent);
+  let finishOld: (response: Response) => void = () => {};
+  const response = (value: unknown) =>
+    new Response(JSON.stringify(value), { headers: { 'content-type': 'application/json' } });
+  const fetcher = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.method === 'POST') return Promise.resolve(response({ last_seen_event_id: 6 }));
+    return new Promise<Response>(resolve => {
+      finishOld = resolve;
+    });
+  });
+  vi.stubGlobal('fetch', fetcher);
+  const view = render(
+    <QueryClientProvider client={client}>
+      <Harness onNode={vi.fn()} />
+    </QueryClientProvider>,
+  );
+  act(() => {
+    void client.invalidateQueries({ queryKey: ['machine-notifications', 'operator'] });
+  });
+  await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+  fireEvent.click(screen.getByRole('button', { name: '6 条未读机器通知' }));
+  await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+  await act(async () => {
+    finishOld(response(recoveredFleetEvent));
+  });
+  expect(screen.getByRole('button', { name: '机器通知' })).toBeTruthy();
+  expect(view.container.querySelector('.fg-badge')).toBeNull();
+  expect(client.getQueryData<MachineEventList>(['machine-notifications', 'operator'])?.last_seen_event_id).toBe(6);
+});
+
+it('已读请求期间到达的新事故不会被旧游标吞掉', async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+  client.setQueryData(['machine-notifications', 'operator'], recoveredFleetEvent);
+  let finishRead: (response: Response) => void = () => {};
+  const fetcher = vi.fn(
+    () =>
+      new Promise<Response>(resolve => {
+        finishRead = resolve;
+      }),
+  );
+  vi.stubGlobal('fetch', fetcher);
+  render(
+    <QueryClientProvider client={client}>
+      <Harness onNode={vi.fn()} />
+    </QueryClientProvider>,
+  );
+  fireEvent.click(screen.getByRole('button', { name: '6 条未读机器通知' }));
+  await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+  act(() => {
+    client.setQueryData(['machine-notifications', 'operator'], {
+      ...recoveredFleetEvent,
+      latest_event_id: 8,
+      last_seen_event_id: 6,
+      unread_count: 1,
+    });
+  });
+  expect(client.getQueryData<MachineEventList>(['machine-notifications', 'operator'])?.latest_event_id).toBe(8);
+  await act(async () => {
+    finishRead(new Response(JSON.stringify({ last_seen_event_id: 6 })));
+  });
+  expect(client.getQueryData<MachineEventList>(['machine-notifications', 'operator'])?.latest_event_id).toBe(8);
+  expect(await screen.findByRole('button', { name: '1 条未读机器通知' })).toBeTruthy();
+  expect(client.getQueryData<MachineEventList>(['machine-notifications', 'operator'])?.unread_count).toBe(1);
+});
+
 it('访客读取独立的脱敏缓存且不会提交已读游标', async () => {
   const publicEvents: MachineEventList = {
     ...recoveredFleetEvent,
@@ -482,7 +580,7 @@ it('一键清空后刷新仍为空，不删除新到达的通知，也不受旧�
   server = {
     ...cleared,
     latest_event_id: 7,
-    unread_count: 1,
+    unread_count: 0,
     events: [
       {
         id: 7,
@@ -502,6 +600,8 @@ it('一键清空后刷新仍为空，不删除新到达的通知，也不受旧�
   });
   expect(await screen.findByText('新机器 公网 IPv4 已变化')).toBeTruthy();
   expect(screen.queryByText('Console-Agent 链路已恢复')).toBeNull();
+  expect(screen.getByRole('button', { name: '机器通知' })).toBeTruthy();
+  expect(document.querySelector('.fg-badge, .fg-dot')).toBeNull();
 });
 
 it('清空失败保留通知，禁止重复提交并显示可重试错误', async () => {

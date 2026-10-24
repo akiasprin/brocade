@@ -1,3 +1,5 @@
+mod source_access;
+use source_access::*;
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
@@ -863,6 +865,7 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         "/quotas",
         "/usage/samples",
         "/usage/monthly-summary",
+        "/usage/user-cycles",
         "/realtime/nodes/events",
         "/realtime/fleet-traffic/events",
         "/realtime/fleet-traffic/snapshot",
@@ -923,12 +926,26 @@ fn user_may(method: &axum::http::Method, path: &str) -> bool {
         || (method == axum::http::Method::POST
             && matches!(path, "/notifications/read" | "/notifications/clear"))
         || (method == axum::http::Method::GET && path == "/grant-probes/capability")
+        || (method == axum::http::Method::GET && is_user_traffic_policy_path(path))
         || (method == axum::http::Method::POST
             && (is_user_grant_probe_plan_path(path) || is_user_front_probe_path(path)))
         || ((method == axum::http::Method::GET || method == axum::http::Method::DELETE)
             && is_grant_probe_job_path(path))
         || (method == axum::http::Method::GET && is_grant_probe_events_path(path))
         || is_user_forwarding_path(method, path)
+}
+
+// The handler/store checks the authenticated self_user before returning any policy.
+fn is_user_traffic_policy_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/users/") else {
+        return false;
+    };
+    let mut parts = rest.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(tenant), Some(user), Some("traffic-policy"), None)
+            if !tenant.is_empty() && !user.is_empty()
+    )
 }
 
 fn is_user_forwarding_path(method: &axum::http::Method, path: &str) -> bool {
@@ -1226,6 +1243,10 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/node-traffic", get(get_node_traffic))
         .route("/usage/machine-model", get(get_machine_traffic_model))
         .route("/node-traffic/nodes/{node_id}", put(update_node_traffic))
+        .route(
+            "/node-traffic/nodes/{node_id}/limit",
+            put(update_node_traffic_limit),
+        )
         // Alongside /distribution and for the same reason: no revision and no release. Separate
         // from it because the two are read on different schedules by different callers.
         // distribution is read when an operator installs a machine; this one is read on every
@@ -1421,6 +1442,30 @@ fn admin_router_with_state(state: AppState) -> Router {
             post(rotate_user_uuid),
         )
         .route(
+            "/users/{tenant_id}/{user_id}/source-access",
+            get(get_user_source_access).put(put_user_source_access),
+        )
+        .route(
+            "/nodes/{node_id}/source-access",
+            get(get_node_source_access).put(put_node_source_access),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/traffic-policy",
+            get(get_user_traffic_policies),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/traffic-policy/access/{app_id}",
+            put(update_user_access_traffic_policy),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/service-policy",
+            put(update_user_service_policy),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/service-policy/preview",
+            post(preview_user_service_policy),
+        )
+        .route(
             "/users/{tenant_id}/{user_id}/profile",
             put(update_user_profile),
         )
@@ -1599,6 +1644,7 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/usage/samples", get(list_usage_samples))
         .route("/usage/node-series", get(list_usage_node_series))
         .route("/usage/monthly-summary", get(usage_monthly_summary))
+        .route("/usage/user-cycles", get(user_cycle_usage))
         .route("/load/nodes", get(load_nodes))
         .route("/load/nodes/nic", get(load_node_nic))
         .route("/load/nodes/{node_id}/overview", get(load_node_overview))
@@ -1711,6 +1757,32 @@ fn agent_routes() -> Router<AppState> {
         )
         .route("/agent/v1/enroll", post(agent_enroll))
         .route("/agent/v1/desired", get(agent_desired))
+        .route(
+            "/agent/v1/user-traffic/policies",
+            get(agent_user_traffic_assignments),
+        )
+        .route(
+            "/agent/v1/user-traffic/policies/ack",
+            post(agent_user_traffic_ack),
+        )
+        .route(
+            "/agent/v1/source-access",
+            get(agent_source_access)
+                .post(agent_source_access_report)
+                .layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/agent/v1/user-traffic/budget",
+            post(agent_user_traffic_budget).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/agent/v1/user-traffic/support",
+            post(agent_user_traffic_support),
+        )
+        .route(
+            "/agent/v1/traffic-limit",
+            get(agent_traffic_limit).post(agent_traffic_limit_report),
+        )
         .route(
             "/agent/v1/public-ip-observation",
             post(agent_public_ip_observation),
@@ -2024,6 +2096,11 @@ fn public_clash_subscription_response(
         );
         if let Some(total) = subscription.usage.total_bytes {
             userinfo.push_str(&format!("; total={total}"));
+        }
+        if let Some(expiry) = subscription.usage.expires_at.as_deref() {
+            if let Ok(at) = OffsetDateTime::parse(expiry, &Rfc3339) {
+                userinfo.push_str(&format!("; expire={}", at.unix_timestamp()));
+            }
         }
         if let Ok(value) = HeaderValue::from_str(&userinfo) {
             response_headers.insert("subscription-userinfo", value);
@@ -4020,6 +4097,68 @@ async fn update_node_traffic(
     Ok(Json(state.store.node_traffic(&admin).await?).into_response())
 }
 
+async fn update_node_traffic_limit(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(policy): Json<brocade_deployment::traffic_limit::TrafficLimitPolicy>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    state
+        .store
+        .update_node_traffic_limit(&admin, &node_id, policy)
+        .await?;
+    Ok(Json(state.store.node_traffic(&admin).await?).into_response())
+}
+
+async fn agent_traffic_limit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_traffic_limit_protocol(&headers)?;
+    state
+        .store
+        .record_node_poll_with_protocol(
+            &node.node_id,
+            user_agent(&headers),
+            agent_protocol_version(&headers).and_then(|p| i32::try_from(p).ok()),
+        )
+        .await?;
+    Ok(Json(
+        state
+            .store
+            .node_traffic_limit_desired(&node.node_id)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn agent_traffic_limit_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(report): Json<brocade_deployment::traffic_limit::TrafficLimitObservation>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_traffic_limit_protocol(&headers)?;
+    state
+        .store
+        .report_node_traffic_limit(&node.node_id, report)
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+fn require_traffic_limit_protocol(headers: &HeaderMap) -> ApiResult<()> {
+    if agent_protocol_version(headers)
+        .is_none_or(|p| p < brocade_deployment::traffic_limit::TRAFFIC_LIMIT_PROTOCOL_VERSION)
+    {
+        return Err(ApiError::Store(StoreError::Unsupported(
+            "Agent v42 is required for machine traffic limits".into(),
+        )));
+    }
+    Ok(())
+}
+
 /// The recorded clearance, plus what this control plane is actually able to serve.
 ///
 /// `available_release_id` is required. A clearance naming any other build serves nothing, which
@@ -5662,6 +5801,144 @@ async fn update_user_profile(
     Ok(Json(result).into_response())
 }
 
+async fn get_user_traffic_policies(
+    State(state): State<AppState>,
+    Path((tenant, user)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(
+        state
+            .store
+            .user_traffic_policies(&admin, &tenant, &user)
+            .await?,
+    )
+    .into_response())
+}
+async fn update_user_access_traffic_policy(
+    State(state): State<AppState>,
+    Path((tenant, user, app)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(policy): Json<brocade_deployment::user_traffic::UserTrafficPolicy>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    let result = state
+        .store
+        .update_user_traffic_policy(
+            &admin,
+            &tenant,
+            &user,
+            brocade_deployment::user_traffic::UserTrafficKind::Access,
+            Some(&app),
+            policy,
+        )
+        .await?;
+    state.quota_wake.notify_one();
+    state.grants_wake.notify_one();
+    Ok(Json(result).into_response())
+}
+async fn agent_user_traffic_ack(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(hash): Json<String>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_user_traffic_protocol(&headers)?;
+    state
+        .store
+        .acknowledge_user_traffic(&node.node_id, &hash)
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+async fn agent_user_traffic_assignments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_user_traffic_protocol(&headers)?;
+    Ok(Json(state.store.user_traffic_assignments(&node.node_id).await?).into_response())
+}
+async fn agent_user_traffic_budget(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<brocade_deployment::user_traffic::UserBudgetRequest>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_user_traffic_protocol(&headers)?;
+    Ok(Json(
+        state
+            .store
+            .user_traffic_budget(&node.node_id, request)
+            .await?,
+    )
+    .into_response())
+}
+async fn agent_user_traffic_support(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(supported): Json<bool>,
+) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    require_user_traffic_protocol(&headers)?;
+    Ok(Json(
+        state
+            .store
+            .report_user_traffic_support(&node.node_id, supported)
+            .await?,
+    )
+    .into_response())
+}
+fn require_user_traffic_protocol(headers: &HeaderMap) -> ApiResult<()> {
+    if agent_protocol_version(headers)
+        .is_none_or(|v| v < brocade_deployment::user_traffic::USER_TRAFFIC_PROTOCOL_VERSION)
+    {
+        return Err(ApiError::Store(StoreError::Unsupported(
+            "Agent v44 is required for user traffic limits".into(),
+        )));
+    }
+    Ok(())
+}
+
+async fn update_user_service_policy(
+    State(state): State<AppState>,
+    Path((tenant, user)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<brocade_store::UserServicePolicyWrite>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    let result = state
+        .store
+        .update_user_service_policy(&admin, &tenant, &user, request)
+        .await?;
+    state.quota_wake.notify_one();
+    state.grants_wake.notify_one();
+    Ok(Json(result).into_response())
+}
+
+async fn preview_user_service_policy(
+    State(state): State<AppState>,
+    Path((tenant, user)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<brocade_store::UserServicePolicyWrite>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    Ok(Json(
+        state
+            .store
+            .preview_user_service_policy(&admin, &tenant, &user, &request)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn user_cycle_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(Json(state.store.list_user_cycle_usage(&admin).await?).into_response())
+}
+
 async fn issue_user_login(
     State(state): State<AppState>,
     Path((tenant_id, user_id)): Path<(String, String)>,
@@ -5795,6 +6072,7 @@ struct ClashSubscriptionInfoResponse {
     haitun: Option<ClashHaitunSubscriptionInfoResponse>,
     remaining_bytes: Option<u64>,
     reset_at: String,
+    expires_at: Option<String>,
     usage_has_gap: bool,
 }
 
@@ -5859,6 +6137,7 @@ async fn clash_subscription_info_response(
         haitun,
         remaining_bytes: subscription.usage.remaining_bytes,
         reset_at: subscription.usage.reset_at,
+        expires_at: subscription.usage.expires_at,
         usage_has_gap: subscription.usage.has_gap,
     })
     .into_response())
@@ -7939,21 +8218,64 @@ async fn agent_forwarding_desired(
         .store
         .forwarding_desired_for_node(&node.node_id)
         .await?;
-    Ok(Json(desired).into_response())
+    Ok(Json(forwarding_for_agent(
+        desired,
+        agent_protocol_version(&headers),
+    ))
+    .into_response())
+}
+
+fn forwarding_for_agent(
+    mut desired: brocade_deployment::protocol::ForwardingDesiredState,
+    protocol: Option<u32>,
+) -> brocade_deployment::protocol::ForwardingDesiredState {
+    if protocol.is_none_or(|version| {
+        version < brocade_deployment::protocol::FORWARDING_TARGET_POLICY_PROTOCOL_VERSION
+    }) {
+        desired
+            .rules
+            .retain(|rule| brocade_core::forwarding::target_host_is_public_ip(&rule.target_host));
+    }
+    desired
 }
 
 async fn agent_forwarding_reconcile(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(report): Json<ForwardingReconcileReport>,
+    Json(mut report): Json<ForwardingReconcileReport>,
 ) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
     require_active_agent(&node)?;
+    let protocol = agent_protocol_version(&headers);
+    if protocol.is_none_or(|version| {
+        version < brocade_deployment::protocol::FORWARDING_TARGET_POLICY_PROTOCOL_VERSION
+    }) {
+        let desired = state
+            .store
+            .forwarding_desired_for_node(&node.node_id)
+            .await?;
+        if desired.generation == report.generation
+            && desired
+                .rules
+                .iter()
+                .any(|rule| !brocade_core::forwarding::target_host_is_public_ip(&rule.target_host))
+        {
+            // Legacy listeners can prove public literals, but cannot prove domain/private
+            // target enforcement. Keep their actual IDs as telemetry and report the missing
+            // upgrade instead of synthesizing a successful security acknowledgement.
+            let previous = report.error.take().unwrap_or_default();
+            report.error = Some(format!(
+                "forwarding target policy requires Agent protocol v43; {}",
+                previous.chars().take(900).collect::<String>()
+            ));
+            report.rule_results = None;
+        }
+    }
     let desired = state
         .store
         .record_forwarding_reconcile(&node.node_id, report)
         .await?;
-    Ok(Json(desired).into_response())
+    Ok(Json(forwarding_for_agent(desired, protocol)).into_response())
 }
 
 async fn agent_forwarding_usage(
@@ -9182,6 +9504,25 @@ const INSTALL_SCRIPT: &str = include_str!("../templates/install.sh");
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_forwarding_agents_receive_only_public_literal_targets() {
+        let desired: brocade_deployment::protocol::ForwardingDesiredState = serde_json::from_value(serde_json::json!({
+            "generation":7,"rules":[
+                {"id":1,"protocol":"tcp","listen_port":40001,"target_host":"1.1.1.1","target_port":443},
+                {"id":2,"protocol":"tcp","listen_port":40002,"target_host":"localhost","target_port":10085},
+                {"id":3,"protocol":"tcp","listen_port":40003,"target_host":"10.0.0.1","target_port":443,"allow_private_targets":true}
+            ]
+        })).unwrap();
+        let legacy = super::forwarding_for_agent(desired.clone(), Some(42));
+        assert_eq!(
+            legacy.rules.iter().map(|rule| rule.id).collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(
+            super::forwarding_for_agent(desired.clone(), Some(43)),
+            desired
+        );
+    }
     use axum::extract::{Path, Query};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
@@ -9249,7 +9590,7 @@ mod tests {
     }
 
     #[test]
-    fn source_location_responses_preserve_presence_and_history_contracts() {
+    fn source_location_responses_preserve_presence_history_and_source_access_contracts() {
         let source = serde_json::json!({
             "ip": "2001:db8::1", "node_ids": ["n1", "n2"], "ingress_ids": ["i1", "i2"],
             "accesses": [
@@ -9260,6 +9601,11 @@ mod tests {
         for data in [
             serde_json::json!({"freshness_secs": 120, "users": [{"sources": [source.clone()]}]}),
             serde_json::json!({"retention_days": 30, "truncated": false, "sources": [source]}),
+            serde_json::json!({
+                "revision": 7,
+                "ips": ["2001:db8::1"],
+                "nodes": [{"node_id": "n1", "phase": "applied", "error": null}]
+            }),
         ] {
             let response = super::SourceLocationResponse {
                 data: data.clone(),
@@ -9351,9 +9697,31 @@ mod tests {
                 total_bytes: Some(107_374_182_400),
                 remaining_bytes: Some(105_495_134_208),
                 reset_at: "2026-10-01T00:00:00+08:00".to_owned(),
+                expires_at: None,
                 has_gap: false,
             },
         }
+    }
+
+    #[test]
+    fn subscription_expire_uses_service_expiry_instead_of_quota_reset() {
+        let mut subscription =
+            subscription_fixture(brocade_store::DynamicSubscriptionFormat::Clash);
+        let expiry = "2099-01-01T00:00:00Z";
+        let timestamp =
+            time::OffsetDateTime::parse(expiry, &time::format_description::well_known::Rfc3339)
+                .unwrap()
+                .unix_timestamp();
+        subscription.usage.expires_at = Some(expiry.to_owned());
+        let response = super::public_clash_subscription_response(subscription);
+        assert!(response.headers()["subscription-userinfo"]
+            .to_str()
+            .unwrap()
+            .ends_with(&format!("; expire={timestamp}")));
+        assert_eq!(
+            response.headers()["x-brocade-quota-reset-at"],
+            "2026-10-01T00:00:00+08:00"
+        );
     }
 
     #[tokio::test]
@@ -10197,6 +10565,7 @@ mod tests {
             "/quotas",
             "/usage/samples",
             "/usage/monthly-summary",
+            "/usage/user-cycles",
             "/users/platform.acme/alice/grant-probes",
             "/users/platform.acme/alice/forwarding",
             "/realtime/nodes/events",
@@ -10335,6 +10704,40 @@ mod tests {
     }
 
     #[test]
+    fn user_cycle_usage_is_readable_without_opening_writes_or_subpaths() {
+        use axum::http::Method;
+
+        for may in [public_may, user_may] {
+            assert!(may(&Method::GET, "/usage/user-cycles"));
+            assert!(!may(&Method::GET, "/usage/user-cycles/extra"));
+            for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+                assert!(!may(&method, "/usage/user-cycles"));
+            }
+        }
+    }
+
+    #[test]
+    fn user_traffic_policy_reads_reach_self_scope_checks_without_opening_writes() {
+        use axum::http::Method;
+
+        let path = "/users/platform.acme/alice/traffic-policy";
+        assert!(user_may(&Method::GET, path));
+        assert!(!public_may(&Method::GET, path));
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(!user_may(&method, path));
+            assert!(!user_may(&method, &format!("{path}/access/app-a1b2")));
+            assert!(!user_may(&method, &format!("{path}/forwarding")));
+        }
+        for path in [
+            "/users//alice/traffic-policy",
+            "/users/platform.acme//traffic-policy",
+            "/users/platform.acme/alice/traffic-policy/extra",
+        ] {
+            assert!(!user_may(&Method::GET, path));
+        }
+    }
+
+    #[test]
     fn a_user_gets_the_public_console_plus_self_service_and_network_probe_routes() {
         use axum::http::Method;
 
@@ -10343,6 +10746,7 @@ mod tests {
         assert!(user_may(&Method::GET, "/quotas"));
         assert!(user_may(&Method::GET, "/usage/samples"));
         assert!(user_may(&Method::GET, "/usage/monthly-summary"));
+        assert!(user_may(&Method::GET, "/usage/user-cycles"));
         assert!(user_may(&Method::GET, "/me/user"));
         assert!(!user_may(&Method::GET, "/me/presence"));
         assert!(!user_may(&Method::GET, "/users/presence"));

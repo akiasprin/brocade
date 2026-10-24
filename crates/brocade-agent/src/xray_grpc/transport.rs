@@ -7,6 +7,32 @@ use std::{io, thread, time::Instant};
 #[cfg(test)]
 mod tests;
 
+thread_local! {
+    static SCOPED_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Bound all RPCs in a runtime observation, including retries and multiple inbounds, so a
+/// failed candidate cannot hold the accounting mutex away from the one-second guard.
+pub(crate) struct DeadlineGuard(Option<Instant>);
+
+impl Drop for DeadlineGuard {
+    fn drop(&mut self) {
+        SCOPED_DEADLINE.with(|deadline| deadline.set(self.0));
+    }
+}
+
+pub(crate) fn deadline_after(timeout: Option<Duration>) -> DeadlineGuard {
+    let previous = SCOPED_DEADLINE.with(|deadline| {
+        let previous = deadline.get();
+        if let Some(timeout) = timeout {
+            let next = Instant::now() + timeout;
+            deadline.set(Some(previous.map_or(next, |previous| previous.min(next))));
+        }
+        previous
+    });
+    DeadlineGuard(previous)
+}
+
 #[derive(Clone, Copy)]
 struct Policy {
     io_timeout: Duration,
@@ -90,6 +116,7 @@ fn read_only(path: &str, request: &[u8]) -> bool {
     matches!(
         path,
         LIST_INBOUNDS_PATH
+            | FORWARDING_POLICY_PATH
             | GET_INBOUND_USERS_PATH
             | MUX_SNAPSHOT_PATH
             | REVERSE_HEALTH_SNAPSHOT_PATH
@@ -102,6 +129,13 @@ pub(super) fn unary(
     request: &[u8],
     outer_deadline: Option<Instant>,
 ) -> Result<Vec<u8>, String> {
+    let outer_deadline = match (
+        outer_deadline,
+        SCOPED_DEADLINE.with(|deadline| deadline.get()),
+    ) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    };
     unary_with_policy(
         api_address,
         path,

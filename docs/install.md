@@ -9,7 +9,7 @@
 `v0.3.0` 的 GNU 包要求 glibc 2.39，且该版本 musl 安装器不支持跨 libc 安装。兼容 Ubuntu 22.04、Debian 12 等较旧 GNU 系统时，请下载 `v0.3.1` 或更新版本：
 
 ```sh
-v=0.3.1 p=linux-x86_64-gnu
+v=0.3.3 p=linux-x86_64-gnu
 url=https://github.com/akiasprin/brocade/releases/download/v$v/brocade-dist-$v-$p.tar.gz
 curl -fLO "$url" && curl -fLO "$url.sha256"
 sha256sum -c brocade-dist-$v-$p.tar.gz.sha256
@@ -64,9 +64,51 @@ sudo brocade up
 
 ## 升级
 
-下载并校验新版本发行包后，再次运行其中的 `install.sh`。安装器先校验发行包，再原子替换二进制并重启 `brocade.service`；交互安装会重新确认数据库与访问地址，请选择与首次安装相同的选项。托管 PostgreSQL 的数据保留在 `/var/lib/brocade`，重装不会重建数据库。
+安装器管理的 systemd 部署，从 **v0.3.1 及以后版本**升级时，下载、校验并解压新发行包，在新包目录执行：
+
+```sh
+sudo sh install.sh --upgrade
+```
+
+升级复用 `/etc/brocade` 中原来的数据库、访问 IP 和端口，不重新选择，也不生成替代密钥。
+不要同时传入 `--managed-db`、`--database-url`、`--public-ip`、`--port` 或 `--no-start`。
+原服务须正常运行；外部数据库模式还要求本机已有兼容服务端版本的 `pg_dump`、`pg_restore`。
+
+安装器先校验发行包和旧版本、只读检查数据库迁移历史，再停止服务，在
+`/var/backups/brocade-upgrades/<时间>-<进程号>/` 保存压缩备份：`installation.tar.gz` 包含旧安装
+和配置，`data.tar.gz` 包含密钥及持久数据。受管模式使用停服后的完整数据冷备份；外部数据库
+另存内部启用 gzip 6 级压缩的定制格式 `database/database.dump`，可由 `pg_restore` 直接读取。
+随后执行缺少的前向迁移，最后原子替换
+Console/launcher 并检查入口就绪。升级存在停服窗口；数据较大时，备份时间也会增加。
+
+迁移开始前失败会恢复旧服务；尚未修改 schema 的安装若在切换后失败，也会恢复旧安装。
+一旦写入 `database/migration-started`，失败后会停止服务并保留现场，不自动运行可能不兼容的
+旧程序，也不自动恢复数据库覆盖新写入。保留新发行包与备份目录，核对迁移历史后重试或按
+[部署恢复流程](../.agents/runbooks/console-deployment.md#console-二进制回滚)处理。
+备份目录包含秘密，应按数据库凭据保管；tar/逻辑备份的目录校验不等于已在目标环境完成恢复演练。
 
 升级 Console 不会自动升级任何机器上的 Agent 或 Xray；它们通过「发布」页的发布单更新，见[模型、修订与发布](concepts.md#agent-与-xray-发布单)。
+
+v0.3.3 的强制升级验收基线为官方 v0.3.1，覆盖外置 PostgreSQL 和受管 PostgreSQL、旧账户登录、
+配置/密钥/额度/用量保留、压缩备份恢复、重复升级及真实 systemd 重启。安装器不会自动发布节点
+Agent/Xray。真实验收与证据要求见[升级验收](../scripts/tests/upgrade/README.md)。
+
+Console 内嵌全部数据库迁移，兼容库无需逐个启动中间版本。官方 v0.3.1 使用
+`0001` 基线；预检逐条核对既有迁移的版本、成功状态和 SHA-384，拒绝未知校验值、失败历史、
+空库误升级和数据库版本高于程序的降级。不支持 v0.3.1 之前的历史转换、自行改库或
+PostgreSQL 大版本转换，不会改写 SQLx 校验值。
+
+手动部署可使用新 Console 的维护命令进行只读预检；它们沿用 `DATABASE_URL`，不创建库，
+不启动 HTTP 或节点发布：
+
+```sh
+brocade-console database-check
+# 停止 Console 写入、备份并核验后，才执行：
+brocade-console database-migrate
+```
+
+只读预检核对迁移回执，不承诺探测所有人工修改的结构；不兼容 DDL 仍会使正常迁移失败。
+手动部署的进程管理、数据库与密钥备份由操作者按[手动部署](manual-deployment.md)完成。
 
 ## 备份
 
@@ -78,4 +120,4 @@ sudo tar -C /var/lib -czf brocade-backup.tar.gz brocade
 sudo systemctl start brocade
 ```
 
-备份包含密钥，应按凭据保管。使用已有 PostgreSQL 时，用 `pg_dump` 备份数据库；若为 Console 配置了 `BROCADE_SECRET_KEY`，与数据库备份一同保管。丢失密钥后，已密封的 DNS 凭据和证书私钥无法恢复。
+备份包含密钥，应按凭据保管。使用已有 PostgreSQL 时，用 `pg_dump --format=custom --compress=6` 保存压缩数据库备份；若为 Console 配置了 `BROCADE_SECRET_KEY`，与数据库备份一同保管。丢失密钥后，已密封的 DNS 凭据和证书私钥无法恢复。

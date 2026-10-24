@@ -9,6 +9,7 @@ export const BLOCKED_TARGET_CIDRS = [
   '0.0.0.0/8',
   '10.0.0.0/8',
   '100.64.0.0/10',
+  '100.100.100.200/32',
   '127.0.0.0/8',
   '169.254.0.0/16',
   '172.16.0.0/12',
@@ -23,9 +24,19 @@ export const BLOCKED_TARGET_CIDRS = [
   '::/127',
   '2001:db8::/32',
   'fc00::/7',
+  'fd00:ec2::254/128',
   'fe80::/10',
   'ff00::/8',
 ] as const;
+
+export const PRIVATE_TARGET_CIDRS = [
+  '10.0.0.0/8',
+  '100.64.0.0/10',
+  '172.16.0.0/12',
+  '192.168.0.0/16',
+  'fc00::/7',
+] as const;
+const PRIVATE_NETWORKS = new Set<string>(PRIVATE_TARGET_CIDRS);
 
 export type TargetKind = 'IPv4' | 'IPv6' | '域名';
 
@@ -99,11 +110,15 @@ const prefixMatches = (address: number[], network: number[], length: number) => 
 
 const NETWORKS = BLOCKED_TARGET_CIDRS.map(cidr => {
   const [network, length] = cidr.split('/');
-  return { bytes: ipv4Bytes(network) ?? ipv6Bytes(network) ?? [], length: Number(length) };
+  return {
+    bytes: ipv4Bytes(network) ?? ipv6Bytes(network) ?? [],
+    length: Number(length),
+    private: PRIVATE_NETWORKS.has(cidr),
+  };
 });
 
 /** 与 Rust `target_ip_is_blocked` 相同：IPv4 映射的 IPv6 先还原成 IPv4 再比对。 */
-export function blockedAddress(host: string): boolean {
+export function blockedAddress(host: string, allowPrivateTargets = false): boolean {
   const bare = bareHost(host);
   let bytes = ipv4Bytes(bare) ?? ipv6Bytes(bare);
   if (!bytes) return false;
@@ -112,7 +127,10 @@ export function blockedAddress(host: string): boolean {
   }
   const address = bytes;
   return NETWORKS.some(
-    network => network.bytes.length === address.length && prefixMatches(address, network.bytes, network.length),
+    network =>
+      !(allowPrivateTargets && network.private) &&
+      network.bytes.length === address.length &&
+      prefixMatches(address, network.bytes, network.length),
   );
 }
 

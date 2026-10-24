@@ -234,8 +234,38 @@ it('states how much of a category its detail covers', async () => {
   const other = await screen.findByRole('region', { name: '其他站点明细' });
   const note = await within(other).findByText(/覆盖/);
   expect(note.textContent).toBe(
-    '明细只保留近 24 小时 · 自今天 04:57 起采集 · 覆盖 8 KiB，占其他站点 78.5% · 只保留前 10 个主机 · 10 / 12 台入口已上报 · 计数受限，部分流量未计入',
+    '明细自今天 01:00 起保留 · 自今天 04:57 起采集 · 覆盖 8 KiB，占其他站点 78.5% · 只保留前 10 个主机 · 10 / 12 台入口已上报 · 计数受限，部分流量未计入',
   );
+});
+
+it('shows the returned retention boundary and keeps a full calendar week when details cover it', async () => {
+  const weekStart = DAY_START - 5 * 86_400;
+  const retainedSince = DAY_START - 7 * 86_400 + 6 * 3600;
+  fetchSites.mockResolvedValue(sites({ period: 'month', range_start_unix_secs: DAY_START - 16 * 86_400 }));
+  fetchDomains.mockResolvedValue(
+    domains({ range_start_unix_secs: retainedSince, observed_since_unix_secs: retainedSince - 86_400 }),
+  );
+  fetchTargets.mockResolvedValue(
+    detail('target', ['tcp://192.0.2.1:443'], {
+      range_start_unix_secs: DAY_START - 3 * 86_400,
+      observed_since_unix_secs: retainedSince,
+    }),
+  );
+  card();
+  const other = await screen.findByRole('region', { name: '其他站点明细' });
+  expect((await within(other).findByText(/覆盖/)).textContent).toMatch(/^明细自10-10 06:00 起保留/);
+  const failed = screen.getByRole('region', { name: '嗅探失败明细' });
+  expect((await within(failed).findByText(/覆盖/)).textContent).toMatch(/^明细自10-14 00:00 起保留/);
+  expect(screen.queryByText(/明细只保留近 24 小时/)).toBeNull();
+
+  fetchSites.mockResolvedValue(sites({ period: 'week', range_start_unix_secs: weekStart }));
+  fetchDomains.mockResolvedValue(
+    domains({ range_start_unix_secs: weekStart, observed_since_unix_secs: retainedSince }),
+  );
+  fireEvent.click(screen.getByRole('button', { name: '当周' }));
+  await waitFor(() => expect(fetchDomains).toHaveBeenLastCalledWith('root', 'alice', 'week'));
+  await waitFor(() => expect(within(other).getByText(/覆盖/).textContent).not.toContain('起保留'));
+  expect(within(other).getByText(/覆盖/).textContent).not.toContain('起采集');
 });
 
 it('marks a high sniffing-failure share, a late observation start and missing reporters', async () => {

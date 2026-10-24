@@ -99,8 +99,10 @@ func (s *routingServer) TestRoute(ctx context.Context, request *TestRouteRequest
 		return nil, err
 	}
 	if request.PublishResult && s.routingStats != nil {
-		ctx, _ := context.WithTimeout(context.Background(), 4*time.Second)
-		s.routingStats.Publish(ctx, route)
+		// Publish delivers asynchronously; returning from this RPC must not cancel it.
+		publishCtx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(4*time.Second, cancel)
+		s.routingStats.Publish(publishCtx, route)
 	}
 	return AsProtobufMessage(request.FieldSelectors)(route), nil
 }

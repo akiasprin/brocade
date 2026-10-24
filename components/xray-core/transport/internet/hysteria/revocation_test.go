@@ -19,13 +19,15 @@ import (
 	"github.com/apernet/quic-go"
 	"github.com/apernet/quic-go/http3"
 	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/sourceaccess"
+	"github.com/xtls/xray-core/common/sourceaccess/testutil"
 	"github.com/xtls/xray-core/proxy/hysteria/account"
 	hyCtx "github.com/xtls/xray-core/proxy/hysteria/ctx"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
-func quotaQUICListener(t *testing.T, validator *account.Validator, staticAuth string) string {
+func quotaQUICListener(t *testing.T, validator *account.Validator, staticAuth string, contexts ...context.Context) string {
 	t.Helper()
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -40,7 +42,11 @@ func quotaQUICListener(t *testing.T, validator *account.Validator, staticAuth st
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	base := context.Background()
+	if len(contexts) > 0 {
+		base = contexts[0]
+	}
+	ctx, cancel := context.WithCancel(base)
 	var workers sync.WaitGroup
 	workers.Add(1)
 	l := &Listener{ctx: hyCtx.ContextWithRequireDatagram(ctx, true), validator: validator, config: &Config{Auth: staticAuth, UdpIdleTimeout: 5}, quicParams: &internet.QuicParams{Congestion: "reno"}, masqHandler: http.NotFoundHandler(), addConn: func(conn stat.Connection) {
@@ -272,5 +278,51 @@ func TestQuotaRemovalOfLastManagedUserDoesNotReopenStaticAuth(t *testing.T) {
 				t.Fatalf("managed=%v status=%d", managed, status)
 			}
 		})
+	}
+}
+
+func TestSourceBanClosesWholeQUICWhileAnotherUserKeepsTCPAndUDP(t *testing.T) {
+	ctx, update := testutil.Open(t)
+	validator := account.NewValidator()
+	for _, name := range []string{"alice", "bob"} {
+		if err := validator.Add(&protocol.MemoryUser{Email: name + "@tenant#i1", Account: &account.MemoryAccount{Auth: name + "-auth"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	address := quotaQUICListener(t, validator, "", ctx)
+	alice, status := quotaQUICAuthenticate(t, address, "alice-auth")
+	if status != StatusAuthOK {
+		t.Fatal(status)
+	}
+	bob, status := quotaQUICAuthenticate(t, address, "bob-auth")
+	if status != StatusAuthOK {
+		t.Fatal(status)
+	}
+	a, b := quotaQUICStream(t, alice), quotaQUICStream(t, bob)
+	if err := quotaQUICExchange(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := quotaQUICExchange(b); err != nil {
+		t.Fatal(err)
+	}
+	update(sourceaccess.Policy{Revision: 2, Users: []sourceaccess.UserBlock{{Tenant: "tenant", User: "alice", IPs: []string{"127.0.0.1"}}}})
+	select {
+	case <-alice.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("banned QUIC carrier survived")
+	}
+	if err := quotaQUICExchange(b); err != nil {
+		t.Fatalf("other user's original TCP stream failed: %v", err)
+	}
+	if err := quotaQUICDatagram(bob); err != nil {
+		t.Fatalf("other user's UDP failed: %v", err)
+	}
+	update(sourceaccess.Policy{Revision: 3})
+	restored, status := quotaQUICAuthenticate(t, address, "alice-auth")
+	if status != StatusAuthOK {
+		t.Fatal(status)
+	}
+	if err := quotaQUICExchange(quotaQUICStream(t, restored)); err != nil {
+		t.Fatal(err)
 	}
 }

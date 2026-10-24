@@ -12,12 +12,20 @@ license = "MPL-2.0"
 # target. `sniffing_failure_routing` marks IP destinations whose bounded sniffing attempt did not
 # recover a domain, allowing an explicit safe route instead of falling through to the default.
 anytls = true
+external_tls_allow_insecure = true
 sniffing_failure_routing = true
 secure_dokodemo_splice = true
 legacy_agent_vision_splice = true
 online_source_protocols = true
+machine_traffic_limit = true
+user_traffic_limit = true
 
 # Selected upstream backports; the full-tree baseline above remains unchanged.
+[[backports]]
+commit = "598bde74122f5f0207c7c6a56ccb74fbbbe33fca"
+pull_request = "https://github.com/XTLS/Xray-core/pull/6678"
+description = "Adapt atomic routing snapshots with upstream AddRule full-routing replacement semantics"
+
 [[backports]]
 commit = "1d62941bd2a0f1ca410c7b81c1aeb198dd105825"
 pull_request = "https://github.com/XTLS/Xray-core/pull/6041"

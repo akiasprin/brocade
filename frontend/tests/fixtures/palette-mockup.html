@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark" data-palette="dailan">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" />
+    <title>配色 mockup</title>
+    <script>
+      /* 首帧之前写好方案与主题，生产颜色过渡不会从旧配色渐变过来。 */
+      (() => {
+        const params = new URLSearchParams(location.search);
+        const theme = params.get('theme') === 'light' ? 'light' : 'dark';
+        try {
+          localStorage.setItem('brocade-console:theme', theme);
+          localStorage.setItem('brocade-console:palette', 'dailan');
+        } catch {}
+        const base = params.get('base') ?? 'ios';
+        const accent = params.get('accent') ?? 'blue';
+        const root = document.documentElement;
+        root.dataset.theme = theme;
+        if (['ios', 'mac'].includes(base)) {
+          root.dataset.base = base;
+          root.dataset.accent = ['blue', 'purple', 'pink', 'teal', 'graphite'].includes(accent) ? accent : 'blue';
+        }
+        document.querySelector('meta[name="color-scheme"]').content = theme;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="mk-dock"></div>
+    <script type="module">
+      import RefreshRuntime from '/@react-refresh';
+      RefreshRuntime.injectIntoGlobalHook(window);
+      window.$RefreshReg$ = () => {};
+      window.$RefreshSig$ = () => type => type;
+      window.__vite_plugin_react_preamble_installed__ = true;
+    </script>
+    <script type="module" src="./palette-mockup.tsx"></script>
+  </body>
+</html>

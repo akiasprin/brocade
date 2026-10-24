@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/binary"
+	"github.com/xtls/xray-core/common/sourceaccess"
 	"io"
 	"sort"
 	"sync"
@@ -129,6 +130,12 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	inbound := session.InboundFromContext(ctx)
 	inbound.Name = protocolName
 	inbound.User = user
+	accessConn := conn
+	releaseAccess, err := sourceaccess.Register(ctx, user.Email, accessConn.RemoteAddr(), func() { _ = conn.SetDeadline(time.Now()); _ = conn.Close() })
+	if err != nil {
+		return err
+	}
+	defer releaseAccess()
 	inbound.CanSpliceCopy.Store(session.SpliceCopyDisabled)
 	userPolicy := s.policyManager.ForLevel(user.Level)
 	conn, stopAccounting, err := accountConnection(

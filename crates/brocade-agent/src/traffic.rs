@@ -152,6 +152,10 @@ struct TrafficMeterState {
     total_rx_bytes: u64,
     total_tx_bytes: u64,
     discontinuities: u64,
+    #[serde(default)]
+    sampled_at_unix_secs: Option<i64>,
+    #[serde(default)]
+    day_boundaries: Vec<brocade_deployment::traffic_limit::TrafficDayBoundary>,
 }
 
 impl TrafficMeterState {
@@ -164,6 +168,8 @@ impl TrafficMeterState {
             rx_bytes: self.total_rx_bytes,
             tx_bytes: self.total_tx_bytes,
             discontinuities: self.discontinuities,
+            sampled_at_unix_secs: self.sampled_at_unix_secs,
+            day_boundaries: self.day_boundaries.clone(),
         }
     }
 }
@@ -178,7 +184,28 @@ pub(crate) fn sample(state_dir: &Path) -> Result<NodeTrafficReading, String> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let raw = read_raw()?;
-    sample_locked(state_dir, raw)
+    let mut reading = sample_locked(state_dir, raw)?;
+    trim_acknowledged_boundaries(state_dir, &mut reading);
+    Ok(reading)
+}
+
+fn trim_acknowledged_boundaries(state_dir: &Path, reading: &mut NodeTrafficReading) {
+    // The full history remains durable. Only boundaries not yet acknowledged need travelling
+    // with every runtime report; this bounds normal wire overhead to the current day.
+    if let Ok(Some(bytes)) =
+        crate::fsutil::read_bounded(&state_dir.join("traffic-limit-desired.json"), 128 * 1024)
+    {
+        if let Ok(desired) =
+            serde_json::from_slice::<brocade_deployment::traffic_limit::TrafficLimitDesired>(&bytes)
+        {
+            if let Some(anchor) = desired.anchor.filter(|a| a.meter_id == reading.meter_id) {
+                let day = anchor.sampled_at_unix_secs.div_euclid(86_400) * 86_400;
+                reading
+                    .day_boundaries
+                    .retain(|b| b.day_start_unix_secs >= day);
+            }
+        }
+    }
 }
 
 fn sample_locked(state_dir: &Path, raw: RawTraffic) -> Result<NodeTrafficReading, String> {
@@ -191,17 +218,20 @@ fn sample_with_writer(
     write: impl FnOnce(&Path, &[u8]) -> Result<(), String>,
 ) -> Result<NodeTrafficReading, String> {
     let path = state_dir.join(STATE_FILE);
-    let previous = match fs::read_to_string(&path) {
-        Ok(text) => {
-            let state: TrafficMeterState = serde_json::from_str(&text)
+    let previous = match crate::fsutil::read_bounded(&path, 128 * 1024)? {
+        Some(bytes) => {
+            let state: TrafficMeterState = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("decode {}: {error}", path.display()))?;
             validate_state(&state)?;
             Some(state)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("read {}: {error}", path.display())),
+        None => None,
     };
-    let state = match previous {
+    let now = crate::current_unix_secs()?;
+    let boundary_counters = previous
+        .as_ref()
+        .map(|p| (p.total_rx_bytes, p.total_tx_bytes));
+    let mut state = match previous {
         Some(previous) => advance(previous, raw)?,
         None => TrafficMeterState {
             version: STATE_VERSION,
@@ -216,11 +246,38 @@ fn sample_with_writer(
             total_rx_bytes: 0,
             total_tx_bytes: 0,
             discontinuities: 0,
+            sampled_at_unix_secs: None,
+            day_boundaries: Vec::new(),
         },
     };
+    record_day_boundary(&mut state, now, boundary_counters);
+    validate_state(&state)?;
     let encoded = serde_json::to_vec(&state).map_err(|error| error.to_string())?;
     write(&path, &encoded)?;
     Ok(state.reading())
+}
+
+fn record_day_boundary(state: &mut TrafficMeterState, now: i64, previous: Option<(u64, u64)>) {
+    use brocade_deployment::traffic_limit::{TrafficDayBoundary, MAX_TRAFFIC_DAY_BOUNDARIES};
+    let day = now.div_euclid(86_400) * 86_400;
+    if state
+        .day_boundaries
+        .last()
+        .is_none_or(|b| day > b.day_start_unix_secs)
+    {
+        let (rx_bytes, tx_bytes) = previous.unwrap_or((state.total_rx_bytes, state.total_tx_bytes));
+        state.day_boundaries.push(TrafficDayBoundary {
+            day_start_unix_secs: day,
+            rx_bytes,
+            tx_bytes,
+        });
+        let excess = state
+            .day_boundaries
+            .len()
+            .saturating_sub(MAX_TRAFFIC_DAY_BOUNDARIES);
+        state.day_boundaries.drain(..excess);
+    }
+    state.sampled_at_unix_secs = Some(now);
 }
 
 fn advance(mut state: TrafficMeterState, raw: RawTraffic) -> Result<TrafficMeterState, String> {
@@ -320,6 +377,12 @@ fn new_meter_id() -> Result<String, String> {
 }
 
 fn validate_state(state: &TrafficMeterState) -> Result<(), String> {
+    brocade_deployment::traffic_limit::validate_day_boundaries(
+        &state.day_boundaries,
+        state.sampled_at_unix_secs,
+        state.total_rx_bytes,
+        state.total_tx_bytes,
+    )?;
     if state.version != STATE_VERSION {
         return Err(format!(
             "unsupported traffic meter state version {}",
@@ -389,6 +452,8 @@ mod tests {
             total_rx_bytes: 100,
             total_tx_bytes: 200,
             discontinuities: 0,
+            sampled_at_unix_secs: None,
+            day_boundaries: Vec::new(),
         }
     }
 
@@ -430,6 +495,52 @@ mod tests {
             2_000,
         ))
         .reading()
+    }
+
+    #[test]
+    fn traffic_special_checkpoints_do_not_block_meter_or_optional_ack_reads() {
+        let dir = env::temp_dir().join(format!("brocade-traffic-special-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for name in [STATE_FILE, "traffic-limit-desired.json"] {
+            let path =
+                std::ffi::CString::new(dir.join(name).as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: path is a NUL-terminated temporary pathname and the mode is valid.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
+        assert!(sample_locked(
+            &dir,
+            raw("eth0", "11111111-2222-3333-4444-555555555555", 1, 2)
+        )
+        .unwrap_err()
+        .contains("not a regular"));
+        let mut actual = reading();
+        let expected = actual.clone();
+        trim_acknowledged_boundaries(&dir, &mut actual);
+        assert_eq!(actual, expected);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn traffic_oversized_checkpoints_are_rejected_before_decoding() {
+        let dir = env::temp_dir().join(format!("brocade-traffic-oversized-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for name in [STATE_FILE, "traffic-limit-desired.json"] {
+            fs::File::create(dir.join(name))
+                .unwrap()
+                .set_len(128 * 1024 + 1)
+                .unwrap();
+        }
+        assert!(sample_locked(
+            &dir,
+            raw("eth0", "11111111-2222-3333-4444-555555555555", 1, 2)
+        )
+        .unwrap_err()
+        .contains("exceeds 131072"));
+        let mut actual = reading();
+        let expected = actual.clone();
+        trim_acknowledged_boundaries(&dir, &mut actual);
+        assert_eq!(actual, expected);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

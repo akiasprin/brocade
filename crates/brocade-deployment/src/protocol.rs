@@ -16,7 +16,16 @@ use crate::plan::{
 pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 20;
 
 /// Wire contract spoken by this Agent build.
-pub const AGENT_PROTOCOL_VERSION: u32 = 38;
+pub const AGENT_PROTOCOL_VERSION: u32 = 45;
+
+/// First Agent that can restart when handoff prerequisites are unavailable, and recover
+/// unresponsive generations through a durable checkpoint without waiting for the Console.
+pub const XRAY_HANDOFF_RESTART_FALLBACK_PROTOCOL_VERSION: u32 = 40;
+
+/// First Agent that serializes local convergence and withholds new claims until its durable
+/// observation spool is acknowledged. The Console may replay its frozen in-flight claim on
+/// every poll: a lost HTTP response must not impose the legacy 15-minute dispatch lease.
+pub const DESIRED_REPLAY_PROTOCOL_VERSION: u32 = 39;
 
 /// First Agent that obeys a frozen configuration restart/handoff policy. Older Agents would
 /// ignore the added field and silently use handoff even when Beta is disabled.
@@ -25,9 +34,8 @@ pub const CONFIG_XRAY_UPDATE_POLICY_PROTOCOL_VERSION: u32 = 37;
 /// Single on-demand TCP pings are independent of listener convergence and accounting.
 pub const FORWARDING_PROBE_PROTOCOL_VERSION: u32 = 36;
 
-/// First Agent protocol whose configuration-deployment path fails closed when a live Xray cannot
-/// be hot-swapped or handed off. Console must not dispatch desired state to an older Agent because
-/// the old implementation could restart Xray after a handoff precondition failed.
+/// Historical gate for the v32-v39 handoff-only configuration contract. v40 explicitly permits
+/// validated restart fallback; retain this threshold when interpreting legacy work orders.
 pub const CONFIG_XRAY_HANDOFF_ONLY_PROTOCOL_VERSION: u32 = 32;
 /// First Agent wire contract that can consume an operator authorization to end the old Xray
 /// generation of an exact configuration handoff. Older Agents keep draining naturally and must
@@ -54,6 +62,8 @@ pub const XRAY_HANDOFF_EXECUTION_TIMEOUT_SECS: u32 = 60 * 60;
 /// per-rule counters. Forwarding has its own desired-state endpoint, so older Agents continue
 /// serving their existing workload while the Console exposes the entitlement as pending.
 pub const FORWARDING_PROTOCOL_VERSION: u32 = 26;
+/// First Agent that carries and enforces per-listener forwarding target policies.
+pub const FORWARDING_TARGET_POLICY_PROTOCOL_VERSION: u32 = 43;
 
 /// First Agent protocol that can stream per-user Xray rates on demand. The fields are optional in
 /// both directions, so old Agents keep providing NIC telemetry during a staggered rollout and a
@@ -488,6 +498,10 @@ pub struct VpngateDesiredPool {
 pub struct VpngateDesiredState {
     pub topology_revision: u64,
     pub catalog_generation: u64,
+    /// The configured end-to-end probe endpoint must work through every runtime backend.
+    /// Older Consoles omit it; newer Agents then retain the legacy redundant HTTPS checks.
+    #[serde(default)]
+    pub health_probe_url: Option<String>,
     #[serde(default)]
     pub admission_policy: VpngateAdmissionPolicy,
     pub pools: Vec<VpngateDesiredPool>,
@@ -924,7 +938,8 @@ pub struct NodeDesiredDeployment {
     pub wave: u32,
     pub actions: Vec<PlannedAction>,
     /// Frozen at approval, not read from live settings at execution time. Absent only for
-    /// pre-policy work orders, which retain their approved handoff-only behavior.
+    /// pre-policy work orders, which retain handoff preference. v40 can use a validated restart
+    /// when that handoff is unavailable, including for an older work order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xray_config_update_policy: Option<XrayConfigUpdatePolicy>,
     /// Immutable ownership map for the Xray counters created by this work order.  It advances
@@ -951,7 +966,8 @@ pub struct NodeDesiredDeployment {
 pub enum XrayConfigUpdatePolicy {
     /// Try safe in-process updates first; otherwise stop/start. Never initiate handoff.
     Restart,
-    /// Try safe in-process updates first; otherwise handoff. Never fall back to stop/start.
+    /// Try safe in-process updates first; otherwise handoff. From v40, unavailable handoff
+    /// prerequisites permit a validated, reported restart fallback.
     Handoff,
 }
 
@@ -1236,7 +1252,7 @@ mod agent_release_compat_tests {
         assert_eq!(new.release_id, None);
         assert_eq!(new.attempt, None);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
-        assert_eq!(AGENT_PROTOCOL_VERSION, 38);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 45);
         assert_eq!(CONFIG_XRAY_UPDATE_POLICY_PROTOCOL_VERSION, 37);
         assert_eq!(CONFIG_XRAY_HANDOFF_ONLY_PROTOCOL_VERSION, 32);
         assert_eq!(CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION, 33);
@@ -1756,6 +1772,10 @@ pub struct ForwardingRuleDesired {
     pub listen_port: u16,
     pub target_host: String,
     pub target_port: u16,
+    /// Missing on legacy Consoles/checkpoints: public targets only, without proof that the
+    /// existing listener has received a target policy. The Agent must upgrade that listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_private_targets: Option<bool>,
 }
 
 /// Complete forwarding state for one node. The Agent replaces only the dynamic `fwd:` listener
@@ -1770,6 +1790,16 @@ pub struct ForwardingDesiredState {
 pub struct ForwardingReconcileReport {
     pub generation: i64,
     pub applied_rule_ids: Vec<i64>,
+    pub error: Option<String>,
+    /// Exact per-rule results. Absent on legacy Agents or when the runtime cannot be inspected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_results: Option<Vec<ForwardingRuleReconcileResult>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardingRuleReconcileResult {
+    pub rule: ForwardingRuleDesired,
+    pub applied: bool,
     pub error: Option<String>,
 }
 
@@ -2544,6 +2574,12 @@ pub struct NodeTrafficReading {
     /// Monotonic count of boundaries at which an exact delta was unknowable (reboot, interface
     /// replacement or a counter regression). The logical counters never guess across one.
     pub discontinuities: u64,
+    /// Sampling time, independent of delayed delivery. Older meters omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_at_unix_secs: Option<i64>,
+    /// Unacknowledged UTC day boundaries, for exact offline replay between samples.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub day_boundaries: Vec<crate::traffic_limit::TrafficDayBoundary>,
 }
 
 /// The versions of the components running on this machine.
@@ -3654,6 +3690,7 @@ pub struct PingProbeReportRequest {
 pub struct PingProbeReportResult {
     pub node_id: String,
     pub accepted_samples: u64,
+    /// Duplicate or expired observations acknowledged without another historical write.
     pub skipped_samples: u64,
     pub unknown_targets: u64,
 }
@@ -3753,6 +3790,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn forwarding_per_rule_results_preserve_legacy_receipts() {
+        let legacy = serde_json::json!({"generation":7,"applied_rule_ids":[42],"error":null});
+        let mut report: ForwardingReconcileReport = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(report.rule_results.is_none());
+        assert_eq!(serde_json::to_value(&report).unwrap(), legacy);
+        report.rule_results = Some(vec![ForwardingRuleReconcileResult {
+            rule: ForwardingRuleDesired {
+                id: 42,
+                protocol: ForwardingProtocol::Tcp,
+                listen_port: 20042,
+                target_host: "example.net".into(),
+                target_port: 443,
+                allow_private_targets: Some(false),
+            },
+            applied: true,
+            error: None,
+        }]);
+        #[derive(Deserialize)]
+        struct LegacyReceipt {
+            generation: i64,
+            applied_rule_ids: Vec<i64>,
+            error: Option<String>,
+        }
+        let old: LegacyReceipt =
+            serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
+        assert_eq!(old.generation, 7);
+        assert_eq!(old.applied_rule_ids, [42]);
+        assert!(old.error.is_none());
+    }
+
+    #[test]
     fn forwarding_wire_shape_keeps_protocol_and_counter_identity() {
         let desired = ForwardingDesiredState {
             generation: 7,
@@ -3762,10 +3830,23 @@ mod tests {
                 listen_port: 20_042,
                 target_host: "example.com".to_owned(),
                 target_port: 443,
+                allow_private_targets: Some(false),
             }],
         };
         let wire = serde_json::to_value(&desired).unwrap();
         assert_eq!(wire["rules"][0]["protocol"], "tcp_udp");
+        let mut legacy = wire.clone();
+        legacy["rules"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("allow_private_targets");
+        assert_eq!(
+            serde_json::from_value::<ForwardingDesiredState>(legacy)
+                .unwrap()
+                .rules[0]
+                .allow_private_targets,
+            None
+        );
         assert_eq!(
             serde_json::from_value::<ForwardingDesiredState>(wire).unwrap(),
             desired
@@ -3909,6 +3990,7 @@ mod tests {
         }))
         .unwrap();
         assert!(desired.probe_assignments.is_empty());
+        assert!(desired.health_probe_url.is_none());
         assert_eq!(desired.admission_policy, VpngateAdmissionPolicy::default());
 
         let candidate: VpngateCandidate = serde_json::from_value(serde_json::json!({
@@ -3951,7 +4033,7 @@ mod tests {
             error: Option<String>,
         }
 
-        assert_eq!(AGENT_PROTOCOL_VERSION, 38);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 45);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
         let report: XrayReleaseReport = serde_json::from_value(serde_json::json!({
             "release_id": 7,

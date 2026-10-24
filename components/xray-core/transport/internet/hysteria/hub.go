@@ -4,6 +4,7 @@ import (
 	"context"
 	gotls "crypto/tls"
 	"encoding/binary"
+	"github.com/xtls/xray-core/common/sourceaccess"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -196,7 +197,13 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					h.masqHandler.ServeHTTP(w, r)
 					return
 				}
-				h.releaseUser = release
+				releaseAccess, err := sourceaccess.RegisterPeer(h.ctx, user.Email, h.conn.RemoteAddr, func() { _ = h.conn.CloseWithError(closeErrCodeOK, "source IP access denied") })
+				if err != nil {
+					release()
+					_ = h.conn.CloseWithError(closeErrCodeOK, "source IP access denied")
+					return
+				}
+				h.releaseUser = func() { releaseAccess(); release() }
 			}
 			h.auth = true
 			h.user = user

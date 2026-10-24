@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render } from '@testing-library/react';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { SegmentedControl } from '../src/ui/bits';
 import { CopyButton } from '../src/ui/copy-button';
@@ -240,6 +240,83 @@ it('弹层在退出动画前检查未保存保护，拒绝时保持可交互', a
   act(() => vi.advanceTimersByTime(260));
   await act(async () => Promise.resolve());
   expect(document.body.querySelector('.dialog-layer')).toBeNull();
+});
+
+function PopoverHarness({ align }: { align?: 'start' | 'end' }) {
+  const anchor = useRef<HTMLButtonElement>(null);
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button ref={anchor} type="button" onClick={() => setOpen(true)}>
+        账期
+      </button>
+      {open && (
+        <DialogLayer mode="popover" anchor={anchor} align={align} label="贴边弹层" onClose={() => setOpen(false)}>
+          <section className="dialog-surface">
+            <input aria-label="重置日" />
+            <DialogClose>取消</DialogClose>
+          </section>
+        </DialogLayer>
+      )}
+    </>
+  );
+}
+
+it('贴边弹层优先放在锚点右侧，放不下时换到下方或上方，并沿用弹层的焦点与关闭', async () => {
+  // jsdom 没有布局：给面板一个尺寸、给锚点一个位置。
+  vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(380);
+  vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(300);
+  vi.stubGlobal('innerWidth', 1200);
+  vi.stubGlobal('innerHeight', 800);
+  const view = render(<PopoverHarness />);
+  const opener = view.getByRole('button', { name: '账期' });
+  let box = new DOMRect(200, 600, 236, 46);
+  opener.getBoundingClientRect = () => box;
+  opener.focus();
+  fireEvent.click(opener);
+
+  const layer = document.body.querySelector<HTMLElement>('.dialog-layer.popover')!;
+  const place = () => [layer.style.getPropertyValue('--popover-left'), layer.style.getPropertyValue('--popover-top')];
+  // 右侧放得下：贴右边，顶边上移到面板底不出视口。
+  expect(place()).toEqual(['444px', '492px']);
+  expect(document.body.style.overflow).toBe('hidden');
+  expect(document.activeElement).toBe(view.getByRole('textbox', { name: '重置日' }));
+
+  // 窄视口：右侧放不下，下方也放不下，放在上方并与锚点左对齐。
+  vi.stubGlobal('innerWidth', 600);
+  act(() => void window.dispatchEvent(new Event('resize')));
+  expect(place()).toEqual(['200px', '292px']);
+  // 锚点靠上时放在下方；左边不越过视口右侧留白。
+  box = new DOMRect(300, 80, 236, 46);
+  act(() => void window.dispatchEvent(new Event('resize')));
+  expect(place()).toEqual(['212px', '134px']);
+
+  fireEvent.keyDown(document, { key: 'Escape' });
+  await act(async () => Promise.resolve());
+  act(() => vi.advanceTimersByTime(180));
+  await act(async () => Promise.resolve());
+  expect(document.body.querySelector('.dialog-layer')).toBeNull();
+  expect(document.activeElement).toBe(opener);
+});
+
+it('行尾的弹层放在锚点下方并与它右缘对齐，下方放不下时换到上方', () => {
+  vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(300);
+  vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(200);
+  vi.stubGlobal('innerWidth', 1200);
+  vi.stubGlobal('innerHeight', 800);
+  const view = render(<PopoverHarness align="end" />);
+  const opener = view.getByRole('button', { name: '账期' });
+  // 右侧本来放得下，也不放到右侧：面板右缘对齐锚点右缘（1100 - 300）。
+  let box = new DOMRect(1000, 100, 100, 24);
+  opener.getBoundingClientRect = () => box;
+  fireEvent.click(opener);
+  const layer = document.body.querySelector<HTMLElement>('.dialog-layer.popover')!;
+  const place = () => [layer.style.getPropertyValue('--popover-left'), layer.style.getPropertyValue('--popover-top')];
+  expect(place()).toEqual(['800px', '132px']);
+  // 锚点靠下：换到上方；锚点靠左时左缘不越过视口留白。
+  box = new DOMRect(40, 700, 100, 24);
+  act(() => void window.dispatchEvent(new Event('resize')));
+  expect(place()).toEqual(['8px', '492px']);
 });
 
 it('流量和文件大小共用 IEC 单位名称', () => {

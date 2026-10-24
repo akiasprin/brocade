@@ -87,6 +87,31 @@ pub(crate) struct ManagedPostgres {
 }
 
 impl ManagedPostgres {
+    /// Upgrade must never turn a missing/partial old installation into a fresh database.
+    pub(crate) fn existing_database_url(data_root: &Path) -> Result<String> {
+        let data_root = fs::canonicalize(data_root).context("受管数据库目录不存在")?;
+        let state = crate::paths::read_private_text(&data_root.join("cluster-state"))?;
+        validate_state(Some(&state))?;
+        if !state.starts_with("ready ") {
+            bail!("升级要求既有受管数据库已完成初始化");
+        }
+        if fs::read_to_string(data_root.join("data/PG_VERSION"))?.trim() != POSTGRES_MAJOR
+            || !data_root.join("data/postgresql.conf").is_file()
+        {
+            bail!("升级要求既有、完整且 PostgreSQL 大版本匹配的数据目录");
+        }
+        let password = crate::paths::read_private_text(&data_root.join("password"))?;
+        if password.len() != 64 || !password.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("既有受管数据库密码文件无效");
+        }
+        let mut url = reqwest::Url::parse("postgresql://postgres@localhost:5432/brocade")?;
+        url.set_password(Some(&password))
+            .map_err(|_| anyhow::anyhow!("无法设置数据库凭据"))?;
+        url.query_pairs_mut()
+            .append_pair("host", &postgres_socket_dir(&data_root).to_string_lossy());
+        Ok(url.to_string())
+    }
+
     pub(crate) async fn start(
         data_root: &Path,
         cache_root: &Path,
@@ -608,6 +633,35 @@ fn load_or_create_password(path: &Path, initialized: bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upgrade_connection_reads_existing_state_without_initializing_or_changing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        assert!(ManagedPostgres::existing_database_url(root.path()).is_err());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+        atomic_write_private(&root.path().join("cluster-state"), b"ready 123\n", 0o600).unwrap();
+        atomic_write_private(
+            &root.path().join("password"),
+            "a".repeat(64).as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        let data = root.path().join("data");
+        fs::create_dir(&data).unwrap();
+        fs::write(data.join("PG_VERSION"), "17\n").unwrap();
+        fs::write(data.join("postgresql.conf"), "").unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o750)).unwrap();
+        let url = ManagedPostgres::existing_database_url(root.path()).unwrap();
+        assert!(url.contains("brocade"));
+        assert_eq!(
+            fs::metadata(&data).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        fs::remove_file(root.path().join("password")).unwrap();
+        assert!(ManagedPostgres::existing_database_url(root.path()).is_err());
+        assert!(!root.path().join("password").exists());
+    }
     use crate::platform::Libc;
     use std::io::Write;
 

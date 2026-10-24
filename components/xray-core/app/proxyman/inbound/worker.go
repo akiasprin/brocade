@@ -2,6 +2,7 @@ package inbound
 
 import (
 	"context"
+	"github.com/xtls/xray-core/common/sourceaccess"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -132,6 +133,18 @@ func (w *tcpWorker) callback(conn stat.Connection) {
 	content.SniffingRequest = w.sniffingRequest
 	ctx = session.ContextWithContent(ctx, content)
 
+	// Apply node admission to authenticated proxy listeners and dynamic forwarding.
+	// Internal REALITY cover/guard helpers must remain reachable for other peers.
+	_, authenticatedProxy := w.proxy.(proxy.UserManager)
+	if authenticatedProxy || strings.HasPrefix(w.tag, "fwd:") {
+		release, err := sourceaccess.Register(ctx, "", conn.RemoteAddr(), func() { cancel(); _ = conn.SetDeadline(time.Now()); _ = conn.Close() })
+		if err != nil {
+			cancel()
+			_ = conn.Close()
+			return
+		}
+		defer release()
+	}
 	if err := w.proxy.Process(ctx, net.Network_TCP, conn, w.dispatcher); err != nil {
 		errors.LogInfoInner(ctx, err, "connection ends")
 	}
@@ -391,8 +404,14 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			content := new(session.Content)
 			content.SniffingRequest = w.sniffingRequest
 			ctx = session.ContextWithContent(ctx, content)
-			if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
-				errors.LogInfoInner(ctx, err, "connection ends")
+			releaseAccess, accessErr := sourceaccess.Register(ctx, "", conn.RemoteAddr(), func() { _ = conn.Close() })
+			if accessErr == nil {
+				defer releaseAccess()
+			}
+			if accessErr == nil {
+				if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
+					errors.LogInfoInner(ctx, err, "connection ends")
+				}
 			}
 			conn.Close()
 			// conn not removed by checker TODO may be lock worker here is better

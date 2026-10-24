@@ -851,21 +851,6 @@ pub async fn record_e2e_probe(
     })
 }
 
-pub(crate) async fn prune_e2e_samples_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
-    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
-    Ok(sqlx::query(
-        "DELETE FROM e2e_probe_samples WHERE ctid IN (
-             SELECT ctid FROM e2e_probe_samples
-              WHERE probed_at < now() - make_interval(secs => $1::double precision)
-              ORDER BY probed_at LIMIT 10000
-         )",
-    )
-    .bind(retain_secs)
-    .execute(pool)
-    .await?
-    .rows_affected())
-}
-
 // This family is partitioned by tenant, unlike MTU and link liveness: those two are properties
 // of the backbone (one global network), whereas a chain belongs to a tenant. A tenant
 // administrator sees whether their own chains work and not anyone else's.

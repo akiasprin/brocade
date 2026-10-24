@@ -18,8 +18,10 @@ getrandom = "0.3"
 libc = "0.2"
 liblzma = { version = "0.4.8", default-features = false }
 postgresql_embedded = { version = "=0.21.0", default-features = false, features = ["tokio", "tls-rustls-ring"] }
+percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio"] }
 tempfile = "3"

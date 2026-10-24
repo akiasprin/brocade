@@ -35,6 +35,121 @@ const BOOTSTRAP_TOKEN: &str = "bootstrap-test-token-with-at-least-32-bytes";
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn user_service_policy_http_previews_saves_and_protects_readonly_access() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    let (app, token) = admin_app(&db).await;
+    let path = "/users/platform.acme/alice/service-policy";
+    let policy = json!({"traffic_reset_day":15,"service_starts_at":null,"service_expires_at":"2099-01-01T00:00:00Z"});
+    let (status, preview) =
+        post_json(&app, &token, &format!("{path}/preview"), policy.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert!(preview["starts_at"].as_str().unwrap().ends_with('Z'));
+    let (status, saved) = put_json(&app, &token, path, policy.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["traffic_reset_day"], 15);
+    assert_eq!(saved["service_expires_at"], "2099-01-01T00:00:00Z");
+    assert_eq!(saved["service_state"], "active");
+    let (status, cycles) = get_json(&app, &token, "/usage/user-cycles").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cycles["periods"][0]["user_id"], "alice");
+    let bad = put_json(&app, &token, path, json!({"traffic_reset_day":32})).await;
+    assert_eq!(bad.0, StatusCode::BAD_REQUEST);
+    let created=post_json(&app,&token,"/admin/operators",json!({"id":"service-reader","display_name":"Reader","role":"readonly","tenant_scope":"platform.acme","password":"service-test-password-only"})).await;
+    assert_eq!(created.0, StatusCode::CREATED);
+    let issued = post_json(
+        &app,
+        &token,
+        "/admin/operators/service-reader/token",
+        json!({}),
+    )
+    .await;
+    let reader = issued.1["token"].as_str().unwrap();
+    assert_eq!(
+        put_json(&app, reader, path, policy.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_json(&app, reader, &format!("{path}/preview"), policy)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get_json(&app, reader, "/usage/user-cycles").await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_desired_delivery_recovers_a_lost_response_only_for_replay_capable_agents() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    let token = db.store.issue_node_token("n1").await.unwrap();
+    let deployment_id: i64 = sqlx::query_scalar(
+        "INSERT INTO deployments (revision_id, status, active, kind)
+         SELECT current_revision, 'planned', TRUE, 'config' FROM control_state
+         RETURNING id",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO deployment_targets (deployment_id,node_id,status) VALUES ($1,'n1','pending')",
+    )
+    .bind(deployment_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let unmanaged = json!({"state":"unmanaged","reason":"not part of this order"});
+    sqlx::query(
+        "INSERT INTO deployment_target_state (deployment_id,node_id,wave,disruptive,desired_structure,desired_grants,lifecycle_epoch)
+         SELECT $1,'n1',0,FALSE,$2,$3,lifecycle_epoch FROM node_lifecycle_state WHERE node_id='n1'",
+    ).bind(deployment_id)
+        .bind(json!({"actions":["disable-wire-guard"],"phantun":unmanaged,"wireguard":{"state":"disabled","reason":"test"},"xray":unmanaged,"hy2_port_hop":unmanaged}))
+        .bind(&unmanaged).execute(db.pool()).await.unwrap();
+    let agent = agent_router(db.store.clone());
+    let request = |protocol: u32| {
+        Request::get("/agent/v1/desired")
+            .header("authorization", format!("Bearer {}", token.token))
+            .header("x-brocade-protocol-version", protocol.to_string())
+            .body(Body::empty())
+            .unwrap()
+    };
+    // Drop the first response instead of delivering it to the Agent.
+    let lost = agent.clone().oneshot(request(38)).await.unwrap();
+    assert_eq!(lost.status(), StatusCode::OK);
+    drop(lost);
+    let legacy = agent.clone().oneshot(request(38)).await.unwrap();
+    assert_eq!(legacy.status(), StatusCode::NO_CONTENT);
+    for _ in 0..2 {
+        let replay = agent
+            .clone()
+            .oneshot(request(
+                brocade_deployment::protocol::DESIRED_REPLAY_PROTOCOL_VERSION,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let body = response_json(replay).await;
+        assert_eq!(body["v"]["deployment"]["deployment_id"], deployment_id);
+        assert_eq!(body["v"]["deployment"]["claim_generation"], 0);
+        assert_eq!(
+            body["v"]["deployment"]["actions"],
+            json!(["disable-wire-guard"])
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn distribution_exposes_xray_source_revision_separately_from_install_version() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -193,6 +308,27 @@ async fn data_retention_api_lists_only_bounded_tables_and_updates_without_a_revi
     let (status, initial) = get_json(&app, &token, "/data-retention").await;
     assert_eq!(status, StatusCode::OK);
     let policies = initial["policies"].as_array().unwrap();
+    assert_eq!(policies.len(), 28);
+    assert!(policies
+        .iter()
+        .any(|policy| policy["table_name"] == "vpngate_probe_samples"));
+    assert!(policies.iter().all(|policy| policy["cleanup"].is_null()));
+    let cleaned = db.store.run_data_retention().await.unwrap();
+    assert!(
+        cleaned.iter().all(|run| run.error_code.is_none()),
+        "{cleaned:?}"
+    );
+    let (status, observed) = get_json(&app, &token, "/data-retention").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(observed["policies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|policy| {
+            policy["estimated_dead_rows"].is_u64()
+                && policy["cleanup"]["last_success_unix_secs"].is_i64()
+                && policy["cleanup"]["has_backlog"] == false
+        }));
     assert!(policies
         .iter()
         .any(|policy| policy["table_name"] == "node_ping_probe_samples"));
@@ -685,6 +821,9 @@ async fn performance_diagnostics_are_system_admin_only_and_never_cached() {
     assert_eq!(denied.0, StatusCode::FORBIDDEN);
 }
 
+#[path = "cases/forwarding_total_removal.rs"]
+mod forwarding_total_removal_tests;
+
 struct TestPg {
     _container: testcontainers::ContainerAsync<Postgres>,
     store: PgStore,
@@ -933,6 +1072,11 @@ async fn clearing_machine_incidents_preserves_public_ip_notifications() {
     .execute(db.pool())
     .await
     .unwrap();
+    let quiet = get_json(&app, &token, "/notifications?limit=10").await;
+    assert_eq!(quiet.0, StatusCode::OK);
+    assert_eq!(quiet.1["unread_count"], 0);
+    assert_eq!(quiet.1["latest_event_id"], 1);
+    assert_eq!(quiet.1["events"].as_array().unwrap().len(), 1);
     sqlx::query(
         "INSERT INTO machine_events (
              node_id, event_kind, previous_value, current_value, last_contact_at, occurred_at
@@ -1263,6 +1407,7 @@ async fn tunnel_probe_http_routes_expose_history_and_protect_writes() {
             &AdminContext::system_admin("fixture"),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
+                    target_strategy: None,
                     id: "custom-1111-1111".to_owned(),
                     tenant_id: "platform.acme".to_owned(),
                     name: "Vendor edge".to_owned(),
@@ -1485,6 +1630,7 @@ async fn http_warp_binding_route_updates_endpoint_and_ignores_additional_options
             &AdminContext::system_admin("fixture"),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
+                    target_strategy: None,
                     id: "warp-8f3a-2d71".to_owned(),
                     tenant_id: "platform.acme".to_owned(),
                     name: "Cloudflare WARP".to_owned(),
@@ -5930,6 +6076,41 @@ async fn http_user_login_keeps_general_views_masked_and_opens_only_self_service(
     assert_eq!(whoami.1["self_user"]["tenant_id"], "platform.acme");
     assert_eq!(whoami.1["self_user"]["user_id"], "alice");
 
+    let policy_path = "/users/platform.acme/alice/traffic-policy";
+    let own_policy = get_json_with_cookie(&app, policy_path, &cookie).await;
+    assert_eq!(own_policy.0, StatusCode::OK, "{}", own_policy.1);
+    assert!(own_policy
+        .1
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["kind"] == "access" && row["app_id"] == "app-a1b2"));
+    for path in [
+        "/users/platform.acme/bob/traffic-policy",
+        "/users/platform.other/alice/traffic-policy",
+    ] {
+        assert_eq!(
+            get_json_with_cookie(&app, path, &cookie).await.0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    let write = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("{policy_path}/access/app-a1b2"))
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"quota_bytes":"1024","exhausted_action":{"kind":"suspend"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.status(), StatusCode::FORBIDDEN);
+
     assert_eq!(
         get_json_with_cookie(&app, "/users/platform.acme/alice/machine-usage", &cookie)
             .await
@@ -6154,6 +6335,7 @@ async fn http_forwarding_tcp_ping_is_manual_scoped_fenced_and_shared_across_list
         .record_forwarding_reconcile(
             "n1",
             brocade_deployment::protocol::ForwardingReconcileReport {
+                rule_results: None,
                 generation: desired.generation,
                 applied_rule_ids: ids.clone(),
                 error: None,
@@ -6563,6 +6745,77 @@ async fn http_forwarding_grants_nodes_to_admins_and_rules_to_the_exact_user() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_forwarding_entitlement_rejects_nodes_outside_the_administrators_scope() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ('platform.other', 'Other')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE nodes SET tenant_id = 'platform.other' WHERE id = 'n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let (app, admin_token) = admin_app(&db).await;
+    let created = post_json(
+        &app,
+        &admin_token,
+        "/admin/operators",
+        json!({
+            "id": "forwarding-tenant-admin",
+            "display_name": "Forwarding tenant administrator",
+            "role": "tenant-admin",
+            "tenant_scope": "platform.acme",
+            "password": "forwarding-admin-password"
+        }),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    let issued = post_json(
+        &app,
+        &admin_token,
+        "/admin/operators/forwarding-tenant-admin/token",
+        json!({}),
+    )
+    .await;
+    assert_eq!(issued.0, StatusCode::CREATED, "{}", issued.1);
+    let tenant_token = issued.1["token"].as_str().unwrap();
+    let path = "/users/platform.acme/alice/forwarding-nodes/n1";
+    let denied = put_json(&app, tenant_token, path, json!({ "enabled": true })).await;
+    assert_eq!(denied.0, StatusCode::FORBIDDEN, "{}", denied.1);
+    let empty = get_json(&app, &admin_token, "/users/platform.acme/alice/forwarding").await;
+    assert_eq!(empty.0, StatusCode::OK);
+    assert!(empty.1["entitlements"].as_array().unwrap().is_empty());
+
+    let shared = put_json(&app, &admin_token, path, json!({ "enabled": true })).await;
+    assert_eq!(shared.0, StatusCode::OK, "{}", shared.1);
+    let denied_update = put_json(&app, tenant_token, path, json!({ "enabled": false })).await;
+    assert_eq!(
+        denied_update.0,
+        StatusCode::FORBIDDEN,
+        "{}",
+        denied_update.1
+    );
+    let after = get_json(&app, &admin_token, "/users/platform.acme/alice/forwarding").await;
+    assert_eq!(after.0, StatusCode::OK);
+    assert_eq!(
+        after.1, shared.1,
+        "denied writes must leave the grant unchanged"
+    );
+
+    sqlx::query("UPDATE nodes SET tenant_id = 'platform.acme' WHERE id = 'n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let allowed = put_json(&app, tenant_token, path, json!({ "enabled": false })).await;
+    assert_eq!(allowed.0, StatusCode::OK, "{}", allowed.1);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn http_forwarding_quota_routes_authorize_admins_and_expose_durable_jobs() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -6663,7 +6916,7 @@ async fn http_forwarding_quota_routes_authorize_admins_and_expose_durable_jobs()
         .unwrap();
     assert_eq!(unknown_field.status(), StatusCode::OK);
     let unchanged = response_json(unknown_field).await;
-    assert_eq!(unchanged["entitlements"][0]["monthly_limit_bytes"], 100);
+    assert_eq!(unchanged["entitlements"][0]["cycle_limit_bytes"], 100);
     assert_eq!(unchanged["entitlements"][0]["quota_suspended"], false);
     let absent = app
         .clone()
@@ -6701,7 +6954,7 @@ async fn http_forwarding_quota_routes_authorize_admins_and_expose_durable_jobs()
     );
     let overview =
         get_json_with_cookie(&app, "/users/platform.acme/alice/forwarding", &cookie).await;
-    assert_eq!(overview.1["entitlements"][0]["monthly_used_bytes"], 100);
+    assert_eq!(overview.1["entitlements"][0]["cycle_used_bytes"], 100);
     assert_eq!(overview.1["rules"][0]["runtime_status"], "quota-paused");
     let jobs = get_json(&app, &token, &history).await;
     assert_eq!(jobs.0, StatusCode::OK, "{}", jobs.1);
@@ -6804,6 +7057,27 @@ async fn http_user_direct_page_exchanges_uuid_and_token_for_a_browser_session() 
     assert_eq!(whoami.0, StatusCode::OK);
     assert_eq!(whoami.1["operator_id"], "platform.acme/alice");
     assert_eq!(whoami.1["self_user"]["tenant_id"], "platform.acme");
+
+    // A valid direct login must also load the queries used by the destination user page.
+    for path in [
+        "/users?include_disabled=true",
+        "/model/snapshot",
+        "/quotas",
+        "/me/user",
+        "/usage/user-cycles",
+    ] {
+        let (status, body) = get_json_with_cookie(&app, path, &cookie).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "user page read failed: {path}: {body}"
+        );
+        if path == "/usage/user-cycles" {
+            assert_eq!(body["periods"][0]["user_id"], "alice");
+            assert!(body["views"].is_array());
+            assert!(body["forwarding"].is_array());
+        }
+    }
 
     let users = get_json(&app, &admin_token, "/users?include_disabled=true").await;
     let alice = users.1["users"]
@@ -9623,6 +9897,7 @@ async fn public_guest_can_read_masked_ping_probe_history_but_not_settings() {
         "/quotas",
         "/usage/samples",
         "/usage/monthly-summary",
+        "/usage/user-cycles",
         "/agent-log-policy",
         "/certs",
         "/notifications",
@@ -10483,3 +10758,177 @@ async fn insert_front_target(pool: &PgPool) {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn machine_traffic_limit_http_checks_roles_protocol_and_per_node_receipts() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    let (app, admin) = admin_app(&db).await;
+    let node = db.store.issue_node_token("n1").await.unwrap();
+    let policy = json!({"enabled":true,"layer":"application","rules":[{"threshold":{"kind":"absolute","bytes":"858993459200"},"rate_bps":100000000}]});
+    let write = |token: &str| {
+        Request::put("/node-traffic/nodes/n1/limit")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(policy.to_string()))
+            .unwrap()
+    };
+    assert!(!app
+        .clone()
+        .oneshot(write(&node.token))
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    assert_eq!(
+        app.clone().oneshot(write(&admin)).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let agent = agent_router(db.store.clone());
+    let get = |protocol: &str, token: &str| {
+        Request::get("/agent/v1/traffic-limit")
+            .header("authorization", format!("Bearer {token}"))
+            .header("x-brocade-protocol-version", protocol)
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert!(!agent
+        .clone()
+        .oneshot(get("41", &node.token))
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    assert_eq!(
+        agent
+            .clone()
+            .oneshot(get("42", &admin))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let response = agent.clone().oneshot(get("42", &node.token)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let desired: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(desired["policy"], policy);
+    assert_eq!(desired["revision"], 1);
+    let report = json!({"revision":1,"phase":"waiting","interface":null,"rate_bps":null,"used_bytes":null,
+        "period_start_unix_secs":null,"error":"等待计量","system":null,"application":null});
+    let response = agent
+        .oneshot(
+            Request::post("/agent/v1/traffic-limit")
+                .header("authorization", format!("Bearer {}", node.token))
+                .header("x-brocade-protocol-version", "42")
+                .header("content-type", "application/json")
+                .body(Body::from(report.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let view = db
+        .store
+        .node_traffic(&AdminContext::system_admin("test"))
+        .await
+        .unwrap();
+    let limit = &view.nodes.iter().find(|n| n.node_id == "n1").unwrap().limit;
+    assert_eq!(limit.observation.as_ref().unwrap().revision, 1);
+    assert!(limit.supported);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_forwarding_target_policy_keeps_legacy_public_rules_and_reports_upgrade_debt() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    let (app, token) = admin_app(&db).await;
+    assert_eq!(
+        put_json(
+            &app,
+            &token,
+            "/users/platform.acme/alice/forwarding-nodes/n1",
+            json!({"enabled":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for (port, host) in [(40001, "1.1.1.1"), (40002, "example.com")] {
+        let result=post_json(&app,&token,"/users/platform.acme/alice/forwarding",json!({
+            "node_id":"n1","name":host,"protocol":"tcp","listen_port":port,"target_host":host,"target_port":443,"enabled":true
+        })).await;
+        assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
+    }
+    let node_token = db.store.issue_node_token("n1").await.unwrap();
+    let agent = agent_router(db.store.clone());
+    let request = |method: &str, protocol: u32, body: Option<Value>| {
+        Request::builder()
+            .method(method)
+            .uri(if method == "GET" {
+                "/agent/v1/forwarding/desired"
+            } else {
+                "/agent/v1/forwarding/reconcile"
+            })
+            .header("authorization", format!("Bearer {}", node_token.token))
+            .header("x-brocade-protocol-version", protocol.to_string())
+            .header("content-type", "application/json")
+            .body(
+                body.map(|body| Body::from(body.to_string()))
+                    .unwrap_or_else(Body::empty),
+            )
+            .unwrap()
+    };
+    let modern = agent
+        .clone()
+        .oneshot(request("GET", 43, None))
+        .await
+        .unwrap();
+    assert_eq!(modern.status(), StatusCode::OK);
+    let modern = response_json(modern).await;
+    assert_eq!(modern["rules"].as_array().unwrap().len(), 2);
+    assert_eq!(modern["rules"][0]["allow_private_targets"], false);
+    let legacy = agent
+        .clone()
+        .oneshot(request("GET", 42, None))
+        .await
+        .unwrap();
+    assert_eq!(legacy.status(), StatusCode::OK);
+    let legacy = response_json(legacy).await;
+    assert_eq!(legacy["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(legacy["rules"][0]["target_host"], "1.1.1.1");
+    let report = json!({"generation":legacy["generation"],"applied_rule_ids":[legacy["rules"][0]["id"]],"error":"fixture removal failure"});
+    let receipt = agent
+        .oneshot(request("POST", 42, Some(report)))
+        .await
+        .unwrap();
+    assert_eq!(receipt.status(), StatusCode::OK);
+    let view = db
+        .store
+        .forwarding_overview(
+            &AdminContext::system_admin("test"),
+            "platform.acme",
+            "alice",
+        )
+        .await
+        .unwrap();
+    assert_eq!(view.entitlements[0].reconcile_status, "error");
+    let error = view.entitlements[0].last_error.as_deref().unwrap();
+    assert!(error.contains("protocol v43"));
+    assert!(error.contains("fixture removal failure"));
+}
+
+#[path = "http_integration/user_traffic.rs"]
+mod user_traffic_tests;

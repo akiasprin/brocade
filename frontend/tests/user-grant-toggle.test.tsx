@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ConsoleSnapshot, GrantWrite, SnapshotIngress, UserListItem } from '../src/api';
 import { draft } from '../src/draft';
 import { UsersPane } from '../src/panes/users';
+import { userTrafficPolicyKey } from '../src/panes/user-traffic-policy';
 import { SessionProvider } from '../src/session';
 import type { Win } from '../src/wm/store';
 
@@ -76,7 +77,8 @@ function mount(readSnapshot: () => Promise<Response>, write: (body: GrantWrite) 
   client.setQueryData(['users'], { users: [user] });
   client.setQueryData(['tenants'], { tenants: [{ id: user.tenant_id, name: '默认' }] });
   client.setQueryData(['quotas'], { quotas: [] });
-  client.setQueryData(['usage-monthly'], { views: [] });
+  client.setQueryData(['user-cycles'], { views: [] });
+  client.setQueryData(userTrafficPolicyKey(user), []);
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

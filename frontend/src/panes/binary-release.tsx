@@ -14,6 +14,7 @@ import {
   type BinaryComponent,
   type XrayReleaseStrategy,
   XRAY_HANDOFF_PROTOCOL_VERSION,
+  XRAY_HANDOFF_RESTART_FALLBACK_PROTOCOL_VERSION,
 } from '../api';
 import { Confirm, ErrorBox } from '../ui/bits';
 import { randomKey } from '../ui/platform';
@@ -51,16 +52,19 @@ function baseEligible(node: NodeAgentStateItem, component: BinaryComponent) {
   );
 }
 
-function handoffReady(node: NodeAgentStateItem) {
+function handoffStrategyEligible(node: NodeAgentStateItem) {
   return (
     node.agent_protocol_version != null &&
     node.agent_protocol_version >= XRAY_HANDOFF_PROTOCOL_VERSION &&
-    node.runtime_versions?.xray_handoff?.state === 'ready'
+    (node.runtime_versions?.xray_handoff?.state === 'ready' ||
+      node.agent_protocol_version >= XRAY_HANDOFF_RESTART_FALLBACK_PROTOCOL_VERSION)
   );
 }
 
 function eligible(node: NodeAgentStateItem, component: BinaryComponent, strategy: XrayReleaseStrategy) {
-  return baseEligible(node, component) && (component !== 'xray' || strategy === 'restart' || handoffReady(node));
+  return (
+    baseEligible(node, component) && (component !== 'xray' || strategy === 'restart' || handoffStrategyEligible(node))
+  );
 }
 
 function unavailableReason(node: NodeAgentStateItem, component: BinaryComponent, strategy: XrayReleaseStrategy) {
@@ -73,7 +77,7 @@ function unavailableReason(node: NodeAgentStateItem, component: BinaryComponent,
   if (!installed) return '还没上报 Xray 摘要；先发布支持该能力的 Agent';
   if (!running) return 'Xray 当前未运行';
   if (running !== installed) return '运行中 Xray 与受管路径不一致；先完成本地收敛';
-  if (strategy !== 'restart' && !handoffReady(node)) {
+  if (strategy !== 'restart' && !handoffStrategyEligible(node)) {
     return node.runtime_versions?.xray_handoff?.reason || 'Agent 尚未确认运行中的 Xray 可平滑交接';
   }
   return '';
@@ -509,7 +513,10 @@ export function BinaryReleaseTab({
             release.xrayStrategy === 'restart' ? (
               <>直接重启会立即中断这批机器上的现有 Xray 连接；该选择会写入发布审计。</>
             ) : (
-              <>新实例接管后，旧连接最多保留 {release.xrayDrainTimeoutSecs} 秒；到期结束旧进程，剩余旧连接断开。</>
+              <>
+                新实例接管后，旧连接最多保留 {release.xrayDrainTimeoutSecs} 秒；到期结束旧进程，剩余旧连接断开。 Agent
+                v40 起交接条件不足时会降级直接重启，并记录原因。
+              </>
             )
           }
           confirmLabel={release.xrayStrategy === 'restart' ? '确认破坏性升级' : '确认升级'}

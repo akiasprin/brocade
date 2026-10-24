@@ -6,6 +6,7 @@ import (
 	gotls "crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"github.com/xtls/xray-core/common/sourceaccess"
 	"io"
 	"net/http"
 	"slices"
@@ -180,7 +181,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			Port: remoteAddr.(*net.TCPAddr).Port,
 		}
 	}
-	if len(forwardedAddrs) > 0 && forwardedAddrs[0].Family().IsIP() {
+	if !sourceaccess.Configured() && len(forwardedAddrs) > 0 && forwardedAddrs[0].Family().IsIP() {
 		remoteAddr = &net.TCPAddr{
 			IP:   forwardedAddrs[0].IP(),
 			Port: 0,

@@ -1,9 +1,14 @@
-use std::{collections::BTreeSet, net::IpAddr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
+};
 
+#[cfg(test)]
 use brocade_core::forwarding::target_ip_is_blocked as address_is_private;
+use brocade_core::forwarding::target_ip_is_blocked_by_policy;
 use brocade_deployment::protocol::{
     ForwardingDesiredState, ForwardingProtocol, ForwardingReconcileReport, ForwardingRuleDesired,
-    ForwardingUsageReportRequest, ForwardingUsageReportResult,
+    ForwardingRuleReconcileResult, ForwardingUsageReportRequest, ForwardingUsageReportResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -50,7 +55,7 @@ fn default_max_rules() -> u16 {
     DEFAULT_FORWARDING_MAX_RULES
 }
 fn default_allow_private_targets() -> bool {
-    true
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,8 +76,9 @@ pub struct ForwardingEntitlementView {
     pub applied_generation: Option<i64>,
     pub reconcile_status: String,
     pub last_error: Option<String>,
-    pub monthly_limit_bytes: Option<u64>,
-    pub monthly_used_bytes: u64,
+    pub reported_at: Option<String>,
+    pub cycle_limit_bytes: Option<u64>,
+    pub cycle_used_bytes: u64,
     pub quota_suspended: bool,
     pub quota_job_id: Option<i64>,
     pub quota_job_status: Option<String>,
@@ -108,6 +114,7 @@ pub struct ForwardingRuleView {
     pub target_port: u16,
     pub enabled: bool,
     pub runtime_status: String,
+    pub runtime_error: Option<String>,
     pub uplink_bytes: u64,
     pub downlink_bytes: u64,
     pub created_at: String,
@@ -249,6 +256,25 @@ pub(crate) async fn bump_node_generation(
     .await?)
 }
 
+async fn lock_entitlement(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: &str,
+    user_id: &str,
+    node_id: &str,
+) -> Result<()> {
+    let _: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM forwarding_entitlements
+          WHERE tenant_id = $1 AND user_id = $2 AND node_id = $3
+          FOR UPDATE",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(node_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn set_entitlement(
     pool: &PgPool,
     actor: &AdminContext,
@@ -260,37 +286,30 @@ pub async fn set_entitlement(
     require_entitlement_admin(actor, tenant_id)?;
     validate_entitlement(&write)?;
     let mut tx = pool.begin().await?;
-    let eligible: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-            SELECT 1
-              FROM users u CROSS JOIN nodes n
-             WHERE u.tenant_id = $1 AND u.id = $2
-               AND n.id = $3 AND n.retired_at IS NULL AND n.api_port IS NOT NULL
-        )",
-    )
-    .bind(tenant_id)
-    .bind(user_id)
-    .bind(node_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    if !eligible {
-        return Err(StoreError::NotFound(
-            "user or active Xray-capable node was not found".to_owned(),
-        ));
-    }
-    // Serialize policy edits with rule creation/update. Otherwise a rule could pass validation
-    // against the old policy while an administrator narrows the same entitlement.
-    let _: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM forwarding_entitlements
-          WHERE tenant_id = $1 AND user_id = $2 AND node_id = $3
-          FOR UPDATE",
+    crate::user_traffic::lock_user_tx(&mut tx, tenant_id, user_id).await?;
+    // Keep ownership stable through the grant: a concurrent tenant transfer must not let an
+    // authorization based on the previous owner commit against the new owner's node.
+    let node_tenant: Option<String> = sqlx::query_scalar(
+        "SELECT n.tenant_id
+           FROM users u CROSS JOIN nodes n
+          WHERE u.tenant_id = $1 AND u.id = $2
+            AND n.id = $3 AND n.retired_at IS NULL AND n.api_port IS NOT NULL
+          FOR SHARE OF n",
     )
     .bind(tenant_id)
     .bind(user_id)
     .bind(node_id)
     .fetch_optional(&mut *tx)
     .await?;
+    let node_tenant = node_tenant.ok_or_else(|| {
+        StoreError::NotFound("user or active Xray-capable node was not found".to_owned())
+    })?;
+    actor.require_tenant_access(&node_tenant, "forwarding entry node")?;
+    // Serialize policy edits with rule creation/update. Otherwise a rule could pass validation
+    // against the old policy while an administrator narrows the same entitlement.
+    lock_entitlement(&mut tx, tenant_id, user_id, node_id).await?;
     if write.enabled {
+        crate::user_traffic::lock_user_tx(&mut tx, tenant_id, user_id).await?;
         let invalid_rules: i64 = sqlx::query_scalar(
             "SELECT count(*)::bigint
                FROM forwarding_rules
@@ -363,6 +382,7 @@ pub async fn set_entitlement(
     .bind(actor.operator_id())
     .execute(&mut *tx)
     .await?;
+    disable_blocked_rules(&mut tx, node_id, Some((tenant_id, user_id))).await?;
     bump_node_generation(&mut tx, node_id).await?;
     tx.commit().await?;
     overview(pool, actor, tenant_id, user_id).await
@@ -399,9 +419,15 @@ pub async fn delete_entitlement(
     // would make a later grant for the same user and node silently reactivate old listeners.
     // Soft deletion preserves rule identity and historical usage while freeing the listen ports.
     sqlx::query(
-        "UPDATE forwarding_rules
+        "WITH locked_rules AS MATERIALIZED (
+             SELECT id FROM forwarding_rules
+              WHERE tenant_id = $1 AND user_id = $2 AND node_id = $3 AND deleted_at IS NULL
+              ORDER BY id FOR UPDATE
+         )
+         UPDATE forwarding_rules r
             SET deleted_at = now(), enabled = false, updated_at = now()
-          WHERE tenant_id = $1 AND user_id = $2 AND node_id = $3 AND deleted_at IS NULL",
+           FROM locked_rules
+          WHERE r.id = locked_rules.id",
     )
     .bind(tenant_id)
     .bind(user_id)
@@ -437,8 +463,8 @@ pub async fn overview(
                 count(r.id) FILTER (WHERE r.deleted_at IS NULL)::bigint AS rule_count,
                 COALESCE(s.desired_generation, 0) AS desired_generation,
                 s.applied_generation, COALESCE(s.reconcile_status, 'pending') AS reconcile_status,
-                s.last_error, q.limit_bytes AS monthly_limit_bytes,
-                {month_used} AS monthly_used_bytes, COALESCE(q.suspended,false) AS quota_suspended,
+                s.last_error, s.reported_at::text AS reported_at, q.limit_bytes AS cycle_limit_bytes,
+                {cycle_used} AS cycle_used_bytes, COALESCE(q.suspended,false) AS quota_suspended,
                 q.last_job_id AS quota_job_id, j.status AS quota_job_status, j.last_error AS quota_job_error
            FROM forwarding_entitlements e
            JOIN nodes n ON n.id = e.node_id
@@ -451,9 +477,9 @@ pub async fn overview(
           GROUP BY e.tenant_id,e.user_id,e.node_id, n.name, n.public_ipv4, n.public_ipv6,
                    e.enabled, e.tcp_allowed, e.udp_allowed, e.listen_port_start,
                    e.listen_port_end, e.max_rules, e.allow_private_targets,
-                   s.desired_generation, s.applied_generation, s.reconcile_status, s.last_error,
+                   s.desired_generation, s.applied_generation, s.reconcile_status, s.last_error, s.reported_at,
                    q.tenant_id,q.user_id,q.node_id,j.id
-          ORDER BY n.name, e.node_id", month_used=crate::forwarding_quota::MONTH_USED
+          ORDER BY n.name, e.node_id", cycle_used=crate::forwarding_quota::CYCLE_USED
     ))
     .bind(tenant_id)
     .bind(user_id)
@@ -479,15 +505,16 @@ pub async fn overview(
                 applied_generation: row.try_get("applied_generation")?,
                 reconcile_status: row.try_get("reconcile_status")?,
                 last_error: row.try_get("last_error")?,
-                monthly_limit_bytes: row
-                    .try_get::<Option<i64>, _>("monthly_limit_bytes")?
+                reported_at: row.try_get("reported_at")?,
+                cycle_limit_bytes: row
+                    .try_get::<Option<i64>, _>("cycle_limit_bytes")?
                     .map(|n| {
                         u64::try_from(n).map_err(|_| {
                             StoreError::InvalidData("negative forwarding quota".to_owned())
                         })
                     })
                     .transpose()?,
-                monthly_used_bytes: u64::try_from(row.try_get::<i64, _>("monthly_used_bytes")?)
+                cycle_used_bytes: u64::try_from(row.try_get::<i64, _>("cycle_used_bytes")?)
                     .map_err(|_| StoreError::InvalidData("negative forwarding usage".to_owned()))?,
                 quota_suspended: row.try_get("quota_suspended")?,
                 quota_job_id: row.try_get("quota_job_id")?,
@@ -504,22 +531,41 @@ pub async fn overview(
                 COALESCE(sum(s.uplink_bytes), 0)::bigint AS uplink_bytes,
                 COALESCE(sum(s.downlink_bytes), 0)::bigint AS downlink_bytes,
                 CASE
-                  WHEN NOT e.enabled OR NOT r.enabled THEN 'disabled'
+                  WHEN NOT e.enabled OR NOT r.enabled OR owner.status <> 'active' THEN 'disabled'
+                  WHEN owner.service_suspended THEN 'service-paused'
                   WHEN COALESCE(q.suspended,false) THEN 'quota-paused'
-                  WHEN state.reconcile_status = 'error' THEN 'error'
-                  WHEN state.applied_generation = state.desired_generation
+                  WHEN state.reported_at < now() - interval '90 seconds' THEN 'unknown'
+                  WHEN result.value->'rule' = jsonb_build_object(
+                      'id',r.id,'protocol',r.protocol,'listen_port',r.listen_port,
+                      'target_host',r.target_host,'target_port',r.target_port,
+                      'allow_private_targets',e.allow_private_targets)
+                    THEN CASE
+                      WHEN (result.value->>'applied')::boolean THEN 'active'
+                      WHEN result.value->>'error' IS NOT NULL THEN 'error'
+                      ELSE 'pending'
+                    END
+                  WHEN state.rule_results IS NULL AND state.reconcile_status = 'error' THEN 'unknown'
+                  WHEN state.rule_results IS NULL AND state.applied_generation = state.desired_generation
                        AND state.applied_rule_ids @> jsonb_build_array(r.id) THEN 'active'
                   ELSE 'pending'
-                END AS runtime_status
+                END AS runtime_status,
+                CASE WHEN result.value->'rule' = jsonb_build_object(
+                    'id',r.id,'protocol',r.protocol,'listen_port',r.listen_port,
+                    'target_host',r.target_host,'target_port',r.target_port,
+                      'allow_private_targets',e.allow_private_targets)
+                  THEN result.value->>'error' END AS runtime_error
            FROM forwarding_rules r
            JOIN forwarding_entitlements e
              ON e.tenant_id = r.tenant_id AND e.user_id = r.user_id AND e.node_id = r.node_id
+           JOIN users owner ON owner.tenant_id=r.tenant_id AND owner.id=r.user_id
            LEFT JOIN forwarding_node_state state ON state.node_id = r.node_id
+           LEFT JOIN LATERAL (SELECT state.rule_results->r.id::text AS value) result ON TRUE
            LEFT JOIN forwarding_node_quotas q ON q.tenant_id=r.tenant_id AND q.user_id=r.user_id AND q.node_id=r.node_id
            LEFT JOIN forwarding_usage_rollups s ON s.rule_id = r.id
           WHERE r.tenant_id = $1 AND r.user_id = $2 AND r.deleted_at IS NULL
-          GROUP BY r.id, e.enabled, q.suspended, state.reconcile_status,
-                   state.applied_generation, state.desired_generation, state.applied_rule_ids
+          GROUP BY r.id, e.enabled, e.allow_private_targets, owner.status, owner.service_suspended, q.suspended, state.reconcile_status,
+                   state.applied_generation, state.desired_generation, state.applied_rule_ids,
+                   state.rule_results, state.reported_at, result.value
           ORDER BY r.created_at, r.id",
     )
     .bind(tenant_id)
@@ -548,6 +594,7 @@ pub async fn create_rule(
     require_rule_write_access(actor, tenant_id, user_id)?;
     validate_rule_shape(&write)?;
     let mut tx = pool.begin().await?;
+    crate::user_traffic::lock_user_tx(&mut tx, tenant_id, user_id).await?;
     validate_rule_against_entitlement(&mut tx, tenant_id, user_id, &write, None).await?;
     let result = sqlx::query(
         "INSERT INTO forwarding_rules (
@@ -585,8 +632,12 @@ pub async fn update_rule(
     require_rule_write_access(actor, tenant_id, user_id)?;
     validate_rule_shape(&write)?;
     let mut tx = pool.begin().await?;
-    let old_node: Option<String> = sqlx::query_scalar(
-        "SELECT node_id FROM forwarding_rules
+    crate::user_traffic::lock_user_tx(&mut tx, tenant_id, user_id).await?;
+    // Policy edits and entitlement deletion take the grant before its rules. Acquire the
+    // destination grant in the same order; validate its current policy after locking the rule.
+    lock_entitlement(&mut tx, tenant_id, user_id, &write.node_id).await?;
+    let previous = sqlx::query(
+        "SELECT node_id,protocol,listen_port,target_host,target_port,enabled FROM forwarding_rules
           WHERE id = $1 AND tenant_id = $2 AND user_id = $3 AND deleted_at IS NULL
           FOR UPDATE",
     )
@@ -595,9 +646,19 @@ pub async fn update_rule(
     .bind(user_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let old_node = old_node.ok_or_else(|| StoreError::NotFound("forwarding rule".to_owned()))?;
+    let previous = previous.ok_or_else(|| StoreError::NotFound("forwarding rule".to_owned()))?;
+    let old_node: String = previous.try_get("node_id")?;
+    let runtime_changed = old_node != write.node_id
+        || previous.try_get::<String, _>("protocol")? != protocol_name(write.protocol)
+        || previous.try_get::<i32, _>("listen_port")? != i32::from(write.listen_port)
+        || previous.try_get::<String, _>("target_host")? != write.target_host.trim()
+        || previous.try_get::<i32, _>("target_port")? != i32::from(write.target_port)
+        || previous.try_get::<bool, _>("enabled")? != write.enabled;
     remember_rule_node(&mut tx, rule_id, &old_node).await?;
-    validate_rule_against_entitlement(&mut tx, tenant_id, user_id, &write, Some(rule_id)).await?;
+    if runtime_changed && write.enabled {
+        validate_rule_against_entitlement(&mut tx, tenant_id, user_id, &write, Some(rule_id))
+            .await?;
+    }
     let result = sqlx::query(
         "UPDATE forwarding_rules SET
              node_id = $4, name = $5, protocol = $6, listen_port = $7,
@@ -618,9 +679,11 @@ pub async fn update_rule(
     .await;
     map_port_conflict(result)?;
     remember_rule_node(&mut tx, rule_id, &write.node_id).await?;
-    bump_node_generation(&mut tx, &old_node).await?;
-    if old_node != write.node_id {
-        bump_node_generation(&mut tx, &write.node_id).await?;
+    if runtime_changed {
+        // Opposite moves and quota batches must acquire node states in the same order.
+        for node in BTreeSet::from([old_node.as_str(), write.node_id.as_str()]) {
+            bump_node_generation(&mut tx, node).await?;
+        }
     }
     tx.commit().await?;
     overview(pool, actor, tenant_id, user_id).await
@@ -704,12 +767,13 @@ async fn validate_rule_against_entitlement(
         )));
     }
     if write.enabled {
+        crate::user_traffic::lock_user_tx(tx, tenant_id, user_id).await?;
         let exhausted: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS(SELECT 1 FROM forwarding_entitlements e
             JOIN forwarding_node_quotas q USING(tenant_id,user_id,node_id)
             WHERE e.tenant_id=$1 AND e.user_id=$2 AND e.node_id=$3 AND q.limit_bytes IS NOT NULL
             AND {} >= q.limit_bytes)",
-            crate::forwarding_quota::MONTH_USED
+            crate::forwarding_quota::CYCLE_USED
         ))
         .bind(tenant_id)
         .bind(user_id)
@@ -718,7 +782,8 @@ async fn validate_rule_against_entitlement(
         .await?;
         if exhausted {
             return Err(StoreError::Conflict(
-                "forwarding monthly quota is exhausted; raise or remove the quota first".to_owned(),
+                "forwarding current cycle quota is exhausted; raise or remove the quota first"
+                    .to_owned(),
             ));
         }
         ensure_static_port_available(tx, &write.node_id, write.protocol, write.listen_port).await?;
@@ -730,17 +795,59 @@ async fn validate_rule_against_entitlement(
             "forwarding rule limit {max} has been reached"
         )));
     }
-    if !row.try_get::<bool, _>("allow_private_targets")?
-        && write
-            .target_host
-            .trim_matches(['[', ']'])
-            .parse::<IpAddr>()
-            .is_ok_and(address_is_private)
+    let allow_private_targets: bool = row.try_get("allow_private_targets")?;
+    if write
+        .target_host
+        .trim_matches(['[', ']'])
+        .parse::<IpAddr>()
+        .is_ok_and(|address| target_ip_is_blocked_by_policy(address, allow_private_targets))
     {
         return Err(StoreError::Forbidden(
-            "private, loopback, link-local and special forwarding targets are not allowed"
-                .to_owned(),
+            "forwarding target is blocked by the address policy".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+/// Retire forbidden literal targets without changing allowed rules or their accounting identity.
+/// Run on policy edits and desired-state reads so legacy rows cannot remain authorized forever.
+async fn disable_blocked_rules(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+    owner: Option<(&str, &str)>,
+) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT r.id, r.target_host, e.allow_private_targets
+           FROM forwarding_rules r JOIN forwarding_entitlements e
+             ON e.tenant_id=r.tenant_id AND e.user_id=r.user_id AND e.node_id=r.node_id
+          WHERE r.node_id=$1 AND r.deleted_at IS NULL AND r.enabled
+            AND ($2::text IS NULL OR (r.tenant_id=$2 AND r.user_id=$3))
+          ORDER BY r.id
+          FOR UPDATE OF r",
+    )
+    .bind(node_id)
+    .bind(owner.map(|value| value.0))
+    .bind(owner.map(|value| value.1))
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut blocked = Vec::new();
+    for row in rows {
+        let host: String = row.try_get("target_host")?;
+        let allow_private: bool = row.try_get("allow_private_targets")?;
+        if host
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|address| target_ip_is_blocked_by_policy(address, allow_private))
+        {
+            blocked.push(row.try_get::<i64, _>("id")?);
+        }
+    }
+    if !blocked.is_empty() {
+        sqlx::query("UPDATE forwarding_rules SET enabled=false, updated_at=now() WHERE id=ANY($1)")
+            .bind(&blocked)
+            .execute(&mut **tx)
+            .await?;
+        bump_node_generation(tx, node_id).await?;
     }
     Ok(())
 }
@@ -832,6 +939,7 @@ async fn desired_for_node_tx(
     tx: &mut Transaction<'_, Postgres>,
     node_id: &str,
 ) -> Result<ForwardingDesiredState> {
+    disable_blocked_rules(tx, node_id, None).await?;
     let generation = sqlx::query_scalar(
         "INSERT INTO forwarding_node_state (node_id) VALUES ($1)
          ON CONFLICT (node_id) DO UPDATE SET node_id = EXCLUDED.node_id
@@ -841,7 +949,7 @@ async fn desired_for_node_tx(
     .fetch_one(&mut **tx)
     .await?;
     let rows = sqlx::query(
-        "SELECT r.id, r.protocol, r.listen_port, r.target_host, r.target_port
+        "SELECT r.id, r.protocol, r.listen_port, r.target_host, r.target_port, e.allow_private_targets
            FROM forwarding_rules r
            JOIN forwarding_entitlements e
              ON e.tenant_id = r.tenant_id AND e.user_id = r.user_id AND e.node_id = r.node_id
@@ -849,7 +957,7 @@ async fn desired_for_node_tx(
            JOIN nodes n ON n.id = r.node_id
            LEFT JOIN forwarding_node_quotas q ON q.tenant_id=r.tenant_id AND q.user_id=r.user_id AND q.node_id=r.node_id
           WHERE r.node_id = $1 AND r.deleted_at IS NULL AND r.enabled
-            AND e.enabled AND NOT COALESCE(q.suspended,false) AND u.status = 'active' AND n.retired_at IS NULL
+            AND e.enabled AND NOT COALESCE(q.suspended,false) AND u.status = 'active' AND NOT u.service_suspended AND n.retired_at IS NULL
             AND r.listen_port BETWEEN e.listen_port_start AND e.listen_port_end
             AND (r.protocol NOT IN ('tcp', 'tcp_udp') OR e.tcp_allowed)
             AND (r.protocol NOT IN ('udp', 'tcp_udp') OR e.udp_allowed)
@@ -867,6 +975,7 @@ async fn desired_for_node_tx(
                 listen_port: integer_to_u16(row.try_get("listen_port")?)?,
                 target_host: row.try_get("target_host")?,
                 target_port: integer_to_u16(row.try_get("target_port")?)?,
+                allow_private_targets: Some(row.try_get("allow_private_targets")?),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -894,6 +1003,17 @@ pub async fn record_reconcile(
             "forwarding reconcile error is too long".to_owned(),
         ));
     }
+    if let Some(results) = &report.rule_results {
+        if results.len() > 1_024
+            || results
+                .iter()
+                .any(|result| result.error.as_ref().is_some_and(|error| error.len() > 384))
+        {
+            return Err(StoreError::InvalidData(
+                "forwarding rule results exceed their bounds".to_owned(),
+            ));
+        }
+    }
     let mut tx = pool.begin().await?;
     let desired = desired_for_node_tx(&mut tx, node_id).await?;
     if desired.generation == report.generation {
@@ -919,12 +1039,78 @@ pub async fn record_reconcile(
                 "successful forwarding reconcile report is incomplete".to_owned(),
             ));
         }
+        let results = match report.rule_results {
+            Some(mut results) => {
+                let definitions = desired
+                    .rules
+                    .iter()
+                    .map(|rule| (rule.id, rule))
+                    .collect::<BTreeMap<_, _>>();
+                let mut seen = BTreeSet::new();
+                for result in &mut results {
+                    // A legacy receipt can still prove a literal public target. A missing
+                    // policy on a domain/private target cannot prove the new security boundary.
+                    if result.rule.allow_private_targets.is_none()
+                        && brocade_core::forwarding::target_host_is_public_ip(
+                            &result.rule.target_host,
+                        )
+                    {
+                        if let Some(expected) = definitions.get(&result.rule.id) {
+                            result.rule.allow_private_targets = expected.allow_private_targets;
+                        }
+                    }
+                    if !seen.insert(result.rule.id)
+                        || definitions.get(&result.rule.id) != Some(&&result.rule)
+                        || (result.applied
+                            && (!applied.contains(&result.rule.id) || result.error.is_some()))
+                        || (report.error.is_none() && (!result.applied || result.error.is_some()))
+                    {
+                        return Err(StoreError::InvalidData(
+                            "forwarding rule result does not match the desired configuration"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                if seen != wanted {
+                    return Err(StoreError::InvalidData(
+                        "forwarding per-rule report is incomplete".to_owned(),
+                    ));
+                }
+                Some(results)
+            }
+            // Legacy successful receipts still prove exact definitions at this generation.
+            None if report.error.is_none() => Some(
+                desired
+                    .rules
+                    .iter()
+                    .cloned()
+                    .map(|rule| ForwardingRuleReconcileResult {
+                        rule,
+                        applied: true,
+                        error: None,
+                    })
+                    .collect(),
+            ),
+            None => None,
+        };
+        let results = results.map(|results| {
+            results
+                .into_iter()
+                .map(|result| {
+                    (
+                        result.rule.id.to_string(),
+                        serde_json::to_value(result).expect("forwarding result is serializable"),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>()
+        });
         sqlx::query(
             "UPDATE forwarding_node_state SET
                  applied_generation = $2,
                  reconcile_status = CASE WHEN $3::text IS NULL THEN 'converged' ELSE 'error' END,
                  applied_rule_ids = $4,
                  last_error = $3,
+                 rule_results = $5,
                  reported_at = now()
               WHERE node_id = $1 AND desired_generation = $2",
         )
@@ -932,6 +1118,7 @@ pub async fn record_reconcile(
         .bind(report.generation)
         .bind(report.error.as_deref())
         .bind(json!(report.applied_rule_ids))
+        .bind(results.map(serde_json::Value::Object))
         .execute(&mut *tx)
         .await?;
         crate::forwarding_quota::acknowledged_tx(
@@ -959,15 +1146,8 @@ pub(crate) async fn prune_usage_report_receipts_hours(
             "forwarding usage receipt retention must be at least one hour".to_owned(),
         ));
     }
-    let retain_secs = i64::from(retain_hours.min(crate::MAX_RETENTION_HOURS)) * 3_600;
-    Ok(sqlx::query(
-        "DELETE FROM forwarding_usage_report_receipts
-          WHERE received_at < now() - make_interval(secs => $1::double precision)",
-    )
-    .bind(retain_secs)
-    .execute(pool)
-    .await?
-    .rows_affected())
+    crate::retention::cleanup::prune_batch(pool, "forwarding_usage_report_receipts", retain_hours)
+        .await
 }
 
 /// Fine windows are bounded; durable daily rollups and counter heads never expire here.
@@ -981,39 +1161,23 @@ pub(crate) async fn prune_usage_samples_hours(
     sample_retain_hours: u32,
     window_retain_hours: u32,
 ) -> Result<u64> {
-    let sample_secs = i64::from(sample_retain_hours.min(crate::MAX_RETENTION_HOURS));
-    let sample_secs = sample_secs
-        .checked_mul(3_600)
-        .filter(|_| sample_retain_hours > 0)
-        .ok_or_else(|| StoreError::InvalidData("invalid forwarding retention".to_owned()))?;
-    let window_secs = i64::from(window_retain_hours.min(crate::MAX_RETENTION_HOURS));
-    let window_secs = window_secs
-        .checked_mul(3_600)
-        .filter(|_| window_retain_hours > 0)
-        .ok_or_else(|| StoreError::InvalidData("invalid forwarding retention".to_owned()))?;
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET LOCAL statement_timeout='10s'")
-        .execute(&mut *tx)
-        .await?;
-    let samples = sqlx::query(
-        "DELETE FROM forwarding_usage_samples WHERE id IN (
-        SELECT id FROM forwarding_usage_samples WHERE read_at<now()-make_interval(secs=>$1::double precision)
-        ORDER BY id LIMIT 10000 FOR UPDATE SKIP LOCKED)",
+    if sample_retain_hours == 0 || window_retain_hours == 0 {
+        return Err(StoreError::InvalidData(
+            "invalid forwarding retention".to_owned(),
+        ));
+    }
+    let samples = crate::retention::cleanup::prune_batch(
+        pool,
+        "forwarding_usage_samples",
+        sample_retain_hours,
     )
-    .bind(sample_secs)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    let windows = sqlx::query(
-        "DELETE FROM forwarding_usage_windows WHERE ctid IN (
-        SELECT ctid FROM forwarding_usage_windows WHERE window_end<now()-make_interval(secs=>$1::double precision)
-        ORDER BY window_end LIMIT 10000 FOR UPDATE SKIP LOCKED)",
+    .await?;
+    let windows = crate::retention::cleanup::prune_batch(
+        pool,
+        "forwarding_usage_windows",
+        window_retain_hours,
     )
-    .bind(window_secs)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    tx.commit().await?;
+    .await?;
     Ok(samples + windows)
 }
 
@@ -1320,6 +1484,7 @@ fn rule_view_from_row(row: sqlx::postgres::PgRow) -> Result<ForwardingRuleView> 
         target_port: integer_to_u16(row.try_get("target_port")?)?,
         enabled: row.try_get("enabled")?,
         runtime_status: row.try_get("runtime_status")?,
+        runtime_error: row.try_get("runtime_error")?,
         uplink_bytes: i64_to_u64(row.try_get("uplink_bytes")?)?,
         downlink_bytes: i64_to_u64(row.try_get("downlink_bytes")?)?,
         created_at: row.try_get("created_at")?,
@@ -1382,7 +1547,7 @@ mod tests {
             serde_json::from_str(r#"{"enabled":true}"#).unwrap();
         assert!(value.tcp_allowed);
         assert!(value.udp_allowed);
-        assert!(value.allow_private_targets);
+        assert!(!value.allow_private_targets);
         assert_eq!(value.listen_port_start, 30_000);
         assert_eq!(value.listen_port_end, 59_999);
         assert_eq!(value.max_rules, 100);

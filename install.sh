@@ -31,6 +31,7 @@ usage() {
 Usage: [sudo] sh install.sh [--public-ip IP] [--port PORT]
                               [--managed-db | --database-url postgresql://...]
                               [--no-start]
+       [sudo] sh install.sh --upgrade
 
 Installs the two binaries from this release bundle, the minimal OS prerequisites, and a dedicated
 non-login `brocade` account. Serves HTTP directly on the server IP, port 8080 by default.
@@ -40,6 +41,8 @@ An interactive terminal lets you confirm the detected IP, port, and database cho
 PostgreSQL is not installed by apt/apk and no project is compiled.
 Starts the managed systemd service and prints the ready URL. Without systemd, the launcher
 continues in the foreground. --no-start installs files without starting the runtime.
+--upgrade updates an existing installer-managed service from v0.3.1 or later. It preserves
+configuration, checks the database, backs up installation/data, and runs forward migrations.
 EOF
 }
 
@@ -50,6 +53,7 @@ port_specified=false
 database_type=
 database_url=
 start_runtime=true
+upgrade=false
 while [ "$#" -gt 0 ]; do
     case $1 in
         -h|--help)
@@ -58,6 +62,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --no-start)
             start_runtime=false
+            shift
+            ;;
+        --upgrade)
+            upgrade=true
             shift
             ;;
         --public-ip)
@@ -126,6 +134,48 @@ valid_database_url() {
     esac
     return 0
 }
+
+# Upgrade reads the installation's authority rather than re-detecting addresses or selecting a DB.
+read_upgrade_configuration() {
+    [ "$start_runtime" = true ] || die "--upgrade 不能与 --no-start 同时使用"
+    [ -z "$database_type" ] && [ -z "$public_ip" ] && [ "$port_specified" = false ] ||
+        die "升级会保留原配置，请勿同时指定数据库、IP 或端口"
+    for saved in "$listen_address_path" "$public_url_path" "$database_type_path"; do
+        [ -f "$saved" ] && [ ! -L "$saved" ] || die "升级缺少原有配置：$saved"
+    done
+    IFS= read -r saved_listen_address < "$listen_address_path" || die "无法读取原监听地址"
+    IFS= read -r saved_public_url < "$public_url_path" || die "无法读取原访问地址"
+    IFS= read -r database_type < "$database_type_path" || die "无法读取原数据库类型"
+    case $database_type in
+        managed) ;;
+        external)
+            [ -f "$database_url_path" ] && [ ! -L "$database_url_path" ] || die "缺少原数据库连接配置"
+            IFS= read -r database_url < "$database_url_path" || die "无法读取原数据库连接配置"
+            valid_database_url || die "原数据库连接配置无效"
+            ;;
+        *) die "原数据库类型不受支持；请勿重新选择数据库来绕过"
+            ;;
+    esac
+    [ -n "$saved_listen_address" ] && [ -n "$saved_public_url" ] || die "原入口配置为空"
+    [ -f "$launcher_path" ] && [ ! -L "$launcher_path" ] &&
+        [ -f "$console_path" ] && [ ! -L "$console_path" ] || die "缺少原安装二进制"
+    command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ] ||
+        die "--upgrade 当前要求安装器管理的 systemd 服务；手动部署请按文档升级"
+    [ -f /etc/systemd/system/brocade.service ] &&
+        [ ! -L /etc/systemd/system/brocade.service ] &&
+        grep -Fq '# Managed by Brocade installer' /etc/systemd/system/brocade.service ||
+        die "brocade.service 不由安装器管理，请按手动部署文档升级"
+    systemctl is-active --quiet brocade.service || die "请先确认原 brocade.service 正常运行后再升级"
+    command -v tar >/dev/null 2>&1 && command -v gzip >/dev/null 2>&1 ||
+        die "升级压缩备份需要 tar 和 gzip"
+    if [ "$database_type" = external ]; then
+        command -v pg_dump >/dev/null 2>&1 && command -v pg_restore >/dev/null 2>&1 ||
+            die "外部数据库升级需先安装匹配服务端版本的 pg_dump、pg_restore 客户端"
+    fi
+}
+if [ "$upgrade" = true ]; then
+    read_upgrade_configuration
+fi
 
 prompt_database_type() {
     [ -t 0 ] || die "非交互安装必须指定 --managed-db 或 --database-url postgresql://..."
@@ -329,12 +379,35 @@ database_type_stage=$config_root/.database-type.$$
 database_url_stage=$config_root/.database-url.$$
 service_stage=$config_root/.brocade.service.$$
 ready_error=$config_root/.install-ready.$$
+upgrade_service_stopped=false
+upgrade_published=false
+upgrade_success=false
+upgrade_backup=
 cleanup_staging() {
+    if [ "$upgrade_service_stopped" = true ] && [ "$upgrade_success" = false ]; then
+        if [ -e "$upgrade_backup/database/migration-started" ]; then
+            systemctl stop brocade.service || true
+            say "升级未完成，数据库迁移可能已开始；服务保持停止，不自动回退旧程序或恢复数据库。" >&2
+            say "备份与恢复记录：$upgrade_backup" >&2
+        else
+            if [ "$upgrade_published" = true ]; then
+                systemctl stop brocade.service || true
+                if ! tar -C / -xzpf "$upgrade_backup/installation.tar.gz"; then
+                    say "恢复旧安装失败；服务保持停止，请检查 $upgrade_backup" >&2
+                    return
+                fi
+            fi
+            # Explicit recovery must not inherit the failed candidate's systemd start counter.
+            systemctl reset-failed brocade.service || say "清理旧服务启动限制失败，请检查 $upgrade_backup" >&2
+            systemctl start brocade.service || say "旧服务恢复失败，请检查 $upgrade_backup" >&2
+        fi
+    fi
     rm -f "$launcher_stage" "$console_stage" "$command_stage" \
         "$listen_address_stage" "$public_url_stage" \
         "$database_type_stage" "$database_url_stage" "$service_stage" "$ready_error"
 }
-trap cleanup_staging 0 HUP INT TERM
+trap cleanup_staging 0
+trap 'exit 130' HUP INT TERM
 
 install -o root -g root -m 0755 "$script_dir/brocade-launcher" "$launcher_stage"
 install -o root -g root -m 0755 "$script_dir/brocade-console" "$console_stage"
@@ -355,6 +428,10 @@ resolve_origin() {
     run_launcher "$@"
 }
 
+if [ "$upgrade" = true ]; then
+    public_url=$saved_public_url
+    listen_address=$saved_listen_address
+else
 if [ -z "$public_ip" ] && [ -t 0 ]; then
     detected_origin=$(resolve_origin) || die "无法识别 IP；请加 --public-ip IP 重试"
     detected_ip=${detected_origin#http://}
@@ -379,6 +456,56 @@ case $public_url in
     http://\[*) listen_address="[::]:$port" ;;
     *) listen_address="0.0.0.0:$port" ;;
 esac
+fi
+
+run_upgrade_database() {
+    if [ "$database_type" = external ]; then
+        (
+            DATABASE_URL=$database_url
+            export DATABASE_URL
+            run_launcher upgrade-database --external-db --previous-launcher "$launcher_path" \
+                --console-bin "$console_stage" --backup-dir "$upgrade_backup/database" \
+                --data-dir "$data_root" --cache-dir "$cache_root" "$@"
+        )
+    else
+        (
+            unset DATABASE_URL
+            run_launcher upgrade-database --managed-db --previous-launcher "$launcher_path" \
+                --console-bin "$console_stage" --backup-dir "$upgrade_backup/database" \
+                --data-dir "$data_root" --cache-dir "$cache_root" \
+                --cold-backup "$upgrade_backup/data.tar.gz" "$@"
+        )
+    fi
+}
+
+if [ "$upgrade" = true ]; then
+    backup_root=/var/backups/brocade-upgrades
+    [ ! -L "$backup_root" ] || die "升级备份目录不能是符号链接"
+    install -d -o root -g "$service_group" -m 0710 "$backup_root"
+    upgrade_backup=$backup_root/$(date -u +%Y%m%dT%H%M%SZ)-$$
+    mkdir -m 0710 "$upgrade_backup"
+    chown root:"$service_group" "$upgrade_backup"
+    install -d -o "$service_user" -g "$service_group" -m 0700 "$upgrade_backup/database"
+    say "检查 v0.3.1 起的数据库兼容性…"
+    run_upgrade_database --check-only
+    say "停止原服务并备份安装、配置、密钥和数据…"
+    systemctl stop brocade.service
+    upgrade_service_stopped=true
+    set -- \
+        opt/brocade/brocade-launcher opt/brocade/brocade-console \
+        opt/brocade/BROCADE_PLATFORM opt/brocade/SHA256SUMS \
+        usr/local/bin/brocade etc/brocade etc/systemd/system/brocade.service
+    if [ -d /etc/systemd/system/brocade.service.d ]; then
+        set -- "$@" etc/systemd/system/brocade.service.d
+    fi
+    tar -C / -czpf "$upgrade_backup/installation.tar.gz" "$@"
+    tar -C /var/lib -czpf "$upgrade_backup/data.tar.gz" brocade
+    chown root:"$service_group" "$upgrade_backup/data.tar.gz"
+    chmod 0640 "$upgrade_backup/data.tar.gz"
+    sha256sum "$launcher_path" "$console_path" > "$upgrade_backup/previous-binaries.sha256"
+    say "备份数据库并执行前向迁移…"
+    run_upgrade_database
+fi
 
 # The public command supplies system paths and, when invoked through sudo/root, drops privileges
 # before the Rust launcher starts. This keeps `sudo brocade up` convenient without ever running
@@ -502,6 +629,7 @@ fi
 
 # Publish Console and launcher before their defaults, then publish the public command last. A
 # concurrent invocation therefore uses either the previous wrapper or a complete new configuration.
+if [ "$upgrade" = true ]; then upgrade_published=true; fi
 mv -f "$console_stage" "$console_path"
 mv -f "$launcher_stage" "$launcher_path"
 install -o root -g root -m 0644 "$script_dir/BROCADE_PLATFORM" "$install_root/BROCADE_PLATFORM"
@@ -518,7 +646,7 @@ else
     rm -f "$database_url_path"
 fi
 mv -f "$command_stage" "$command_path"
-trap - 0 HUP INT TERM
+if [ "$upgrade" = false ]; then trap - 0 HUP INT TERM; fi
 
 say "Brocade 已安装完成。"
 say "访问方式：服务器 IP 直连 HTTP"
@@ -545,6 +673,7 @@ if [ -e "$service_unit" ] || [ -L "$service_unit" ]; then
         grep -Fq '# Managed by Brocade installer' "$service_unit" ||
         die "brocade.service 已存在且不由安装器管理；请核对服务配置后使用 --no-start 安装"
 fi
+if [ "$upgrade" = false ]; then
 cat >"$service_stage" <<EOF
 # Managed by Brocade installer
 [Unit]
@@ -571,10 +700,16 @@ chmod 0644 "$service_stage"
 mv -f "$service_stage" "$service_unit"
 systemctl daemon-reload
 systemctl enable brocade.service
+fi
+if [ "$upgrade" = true ]; then
+    # Repeated operator-requested upgrades may exhaust the old unit's StartLimitBurst even when
+    # every previous process was healthy. Reset once; the unit's normal retry limits still apply.
+    systemctl reset-failed brocade.service
+fi
 systemctl restart brocade.service
 
 say "正在等待数据库、控制台与公网入口就绪…"
-trap 'rm -f "$ready_error"' 0
+if [ "$upgrade" = false ]; then trap 'rm -f "$ready_error"' 0; fi
 ready_attempt=0
 until "$command_path" url >/dev/null 2>"$ready_error"; do
     ready_attempt=$((ready_attempt + 1))
@@ -585,6 +720,8 @@ until "$command_path" url >/dev/null 2>"$ready_error"; do
     sleep 1
 done
 rm -f "$ready_error"
-trap - 0
+upgrade_success=true
+trap - 0 HUP INT TERM
+if [ "$upgrade" = true ]; then say "升级完成；备份保留在 $upgrade_backup"; fi
 say "Brocade 已启动并设置开机启动。请打开下面的完整链接；首次使用时创建管理员："
 "$command_path" url

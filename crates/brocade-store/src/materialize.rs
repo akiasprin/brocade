@@ -923,7 +923,7 @@ async fn load_users(pool: &PgPool) -> Result<Vec<User>> {
     let rows = sqlx::query(
         "SELECT tenant_id, id, uuid::text AS uuid \
          FROM users \
-         WHERE status = 'active' \
+         WHERE status = 'active' AND NOT service_suspended \
          ORDER BY tenant_id, id",
     )
     .fetch_all(pool)
@@ -936,7 +936,7 @@ async fn load_users_tx(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<User>> 
     let rows = sqlx::query(
         "SELECT tenant_id, id, uuid::text AS uuid \
          FROM users \
-         WHERE status = 'active' \
+         WHERE status = 'active' AND NOT service_suspended \
          ORDER BY tenant_id, id",
     )
     .fetch_all(&mut **tx)
@@ -956,7 +956,7 @@ fn user_from_row(row: &sqlx::postgres::PgRow) -> Result<User> {
 async fn load_external_outbounds(pool: &PgPool) -> Result<Vec<ExternalOutbound>> {
     let rows = sqlx::query(
         "SELECT id, tenant_id, name, address, port, protocol, credential_sealed,
-                protocol_options, security
+                protocol_options, security, target_strategy
          FROM external_outbounds
          ORDER BY tenant_id, id",
     )
@@ -973,7 +973,7 @@ async fn load_external_outbounds_tx(
 ) -> Result<Vec<ExternalOutbound>> {
     let rows = sqlx::query(
         "SELECT id, tenant_id, name, address, port, protocol, credential_sealed,
-                protocol_options, security
+                protocol_options, security, target_strategy
          FROM external_outbounds
          ORDER BY tenant_id, id",
     )
@@ -1162,6 +1162,10 @@ fn external_outbound_from_row(
         port: u16_column("external_outbounds.port", row.try_get("port")?)?,
         protocol,
         security,
+        target_strategy: row
+            .try_get::<Option<String>, _>("target_strategy")?
+            .map(|value| serde_json::from_value(Value::String(value)))
+            .transpose()?,
         bindings,
     })
 }
@@ -2177,7 +2181,7 @@ async fn load_grants(pool: &PgPool, app_id: &str) -> Result<Vec<Grant>> {
          JOIN users u \
            ON u.tenant_id = g.tenant_id \
           AND u.id = g.user_id \
-          AND u.status = 'active' \
+          AND u.status = 'active' AND NOT u.service_suspended \
          WHERE g.app_id = $1 \
          ORDER BY g.tenant_id, g.user_id, g.ingress_id",
     )
@@ -2195,7 +2199,7 @@ async fn load_grants_tx(tx: &mut Transaction<'_, Postgres>, app_id: &str) -> Res
          JOIN users u \
            ON u.tenant_id = g.tenant_id \
           AND u.id = g.user_id \
-          AND u.status = 'active' \
+          AND u.status = 'active' AND NOT u.service_suspended \
          WHERE g.app_id = $1 \
          ORDER BY g.tenant_id, g.user_id, g.ingress_id",
     )

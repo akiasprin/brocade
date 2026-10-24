@@ -1601,6 +1601,7 @@ fn adding_a_managed_masque_outbound_can_hot_swap() {
         vec![direct_app("direct", "hk", "i-hk", 8443, true, any_egress())],
     );
     before.external_outbounds = vec![ExternalOutbound {
+        target_strategy: None,
         id: "warp-8f3a-2d71".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "WARP".to_owned(),

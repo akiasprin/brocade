@@ -9,11 +9,13 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use crate::{forwarding, AdminContext, ForwardingOverview, Result, StoreError};
 
 const WORKER_LOCK: i64 = 0x6272_6f63_6671_756f;
-// Both the editor and enforcer use the same durable monthly attribution, including deleted rules.
-pub(crate) const MONTH_USED: &str = "((SELECT COALESCE(sum(s.uplink_bytes+s.downlink_bytes),0)::bigint
- FROM forwarding_usage_rollups s WHERE s.tenant_id=e.tenant_id AND s.user_id=e.user_id AND s.node_id=e.node_id
- AND s.period_start >= date_trunc('month',now() AT TIME ZONE 'Asia/Hong_Kong') AT TIME ZONE 'Asia/Hong_Kong'
- AND s.period_start < (date_trunc('month',now() AT TIME ZONE 'Asia/Hong_Kong')+interval '1 month') AT TIME ZONE 'Asia/Hong_Kong')
+// Both the editor and enforcer use the same per-user cycle and durable attribution, including deleted rules.
+pub(crate) const CYCLE_USED: &str =
+    "((SELECT COALESCE(sum(s.uplink_bytes+s.downlink_bytes),0)::bigint
+ FROM users owner CROSS JOIN LATERAL user_traffic_cycle(owner.traffic_reset_day,now()) cycle
+ JOIN forwarding_usage_rollups s ON s.tenant_id=owner.tenant_id AND s.user_id=owner.id
+ WHERE owner.tenant_id=e.tenant_id AND owner.id=e.user_id AND s.node_id=e.node_id
+ AND s.period_start >= cycle.starts_at AND s.period_start < cycle.ends_at)
  * COALESCE((SELECT CASE u.traffic_accounting_mode WHEN 'double' THEN 2 ELSE 1 END
              FROM users u WHERE u.tenant_id=e.tenant_id AND u.id=e.user_id),1))";
 
@@ -64,6 +66,7 @@ pub async fn set_quota(
         })?),
     };
     let mut tx = pool.begin().await?;
+    crate::user_traffic::lock_user_tx(&mut tx, tenant_id, user_id).await?;
     let found = sqlx::query("SELECT 1 FROM forwarding_entitlements WHERE tenant_id=$1 AND user_id=$2 AND node_id=$3 FOR UPDATE")
         .bind(tenant_id).bind(user_id).bind(node_id).fetch_optional(&mut *tx).await?;
     if found.is_none() {
@@ -95,11 +98,12 @@ pub async fn enforce(pool: &PgPool) -> Result<ForwardingQuotaOutcome> {
         return Ok(ForwardingQuotaOutcome::default());
     }
     // A bounded batch also bounds locks and the number of outbox entries per timer round.
+    // Bytewise node order matches rule moves, which can hold multiple generation locks.
     let rows = sqlx::query(&format!("SELECT q.tenant_id,q.user_id,q.node_id,q.limit_bytes,q.suspended,
-        {MONTH_USED} AS used_bytes FROM forwarding_node_quotas q
+        {CYCLE_USED} AS used_bytes FROM forwarding_node_quotas q
         JOIN forwarding_entitlements e USING(tenant_id,user_id,node_id)
-        WHERE q.suspended IS DISTINCT FROM (q.limit_bytes IS NOT NULL AND {MONTH_USED}>=q.limit_bytes)
-        ORDER BY q.tenant_id,q.user_id,q.node_id LIMIT 128 FOR UPDATE OF q"))
+        WHERE q.suspended IS DISTINCT FROM (q.limit_bytes IS NOT NULL AND {CYCLE_USED}>=q.limit_bytes)
+        ORDER BY q.node_id COLLATE \"C\",q.tenant_id,q.user_id LIMIT 128 FOR UPDATE OF q"))
         .fetch_all(&mut *tx).await?;
     let mut outcome = ForwardingQuotaOutcome::default();
     for row in rows {
@@ -114,7 +118,7 @@ pub async fn enforce(pool: &PgPool) -> Result<ForwardingQuotaOutcome> {
         let job_id: i64 = sqlx::query_scalar("INSERT INTO jobs(kind,status,payload) VALUES('forwarding-quota','queued',$1) RETURNING id")
             .bind(json!({"tenant_id":tenant,"user_id":user,"node_id":node,"generation":generation,
                 "suspended":suspended,"limit_bytes":limit,"used_bytes":used,"requested_by":"system:forwarding-quota",
-                "note":if suspended {"转发月度配额耗尽，暂停该用户在该机器上的转发"} else {"转发月度配额恢复，仅恢复仍手动启用的规则"}}))
+                "note":if suspended {"转发本期配额耗尽，暂停该用户在该机器上的转发"} else {"转发本期配额恢复，仅恢复仍手动启用的规则"}}))
             .fetch_one(&mut *tx).await?;
         sqlx::query("UPDATE forwarding_node_quotas SET suspended=$4,last_job_id=$5 WHERE tenant_id=$1 AND user_id=$2 AND node_id=$3")
             .bind(&tenant).bind(&user).bind(&node).bind(suspended).bind(job_id).execute(&mut *tx).await?;

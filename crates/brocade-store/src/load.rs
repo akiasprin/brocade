@@ -2123,28 +2123,11 @@ pub(crate) async fn prune_load_samples_hours(
     load_retain_hours: u32,
     hop_retain_hours: u32,
 ) -> Result<u64> {
-    let load_cutoff = format!(
-        "{} hours",
-        load_retain_hours.min(crate::MAX_RETENTION_HOURS)
-    );
-    let hop_cutoff = format!("{} hours", hop_retain_hours.min(crate::MAX_RETENTION_HOURS));
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(load_rollup::RETENTION_LOCK)
-        .execute(&mut *tx)
+    let load = crate::retention::cleanup::prune_batch(pool, "node_load_samples", load_retain_hours)
         .await?;
-    let load = sqlx::query("DELETE FROM node_load_samples WHERE window_end < now() - $1::interval")
-        .bind(&load_cutoff)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    tx.commit().await?;
     let hops =
-        sqlx::query("DELETE FROM node_hop_link_samples WHERE window_end < now() - $1::interval")
-            .bind(&hop_cutoff)
-            .execute(pool)
-            .await?
-            .rows_affected();
+        crate::retention::cleanup::prune_batch(pool, "node_hop_link_samples", hop_retain_hours)
+            .await?;
     Ok(load + hops)
 }
 

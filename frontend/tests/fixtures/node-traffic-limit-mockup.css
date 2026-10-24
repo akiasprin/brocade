@@ -1,0 +1,927 @@
+/* 机器配置「流量统计 · 自动限速」改版 mockup。面板、表单行、跑道（cap-bar / cap-q / node-traffic-pace）、
+   读数行与接收/发送直接沿用生产样式，这里只补审阅外壳（mk-）和改版新增的部分（ntl-）。 */
+
+/* ── 审阅外壳：不属于设计 ── */
+html,
+body {
+  height: auto;
+  min-height: 100%;
+  overflow: auto;
+}
+body {
+  margin: 0;
+  background: var(--ground);
+}
+.mk-bar {
+  position: sticky;
+  z-index: 20;
+  top: 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--sheet);
+}
+.mk-bar-row {
+  display: flex;
+  max-width: 1480px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  margin: 0 auto;
+  padding: 10px 24px 6px;
+}
+.mk-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--ink);
+  font: 600 14px var(--sans);
+  white-space: nowrap;
+}
+.mk-title small {
+  color: var(--ink-4);
+  font: 400 10px var(--mono);
+  letter-spacing: 0.06em;
+}
+.mk-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-left: auto;
+}
+.mk-ctl {
+  --ctl-h: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.mk-ctl-label {
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.mk-ctl select {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  color: var(--ink);
+  font: 12px var(--sans);
+}
+.mk-ctl .segsw button {
+  padding: 0 9px;
+  font-size: 12px;
+}
+.mk-scene-note {
+  max-width: 1480px;
+  box-sizing: border-box;
+  margin: 0 auto;
+  padding: 0 24px 9px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.mk-scene-note b {
+  margin-right: 10px;
+  color: var(--ink-2);
+  font-weight: 600;
+}
+.mk-stage {
+  padding: 16px 0 48px;
+}
+.mk-frame {
+  margin: 0 auto;
+}
+.mk-option-note {
+  margin: 0;
+  padding: 7px 10px;
+  border: 1px dashed color-mix(in srgb, var(--action) 45%, var(--line));
+  border-radius: 8px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.mk-option-note b {
+  margin-right: 10px;
+  color: var(--action);
+  font-weight: 600;
+}
+.mk-stub-field {
+  width: 200px;
+}
+.mk-gallery > div,
+.mk-compare > div {
+  gap: 10px;
+}
+
+/* ══ 共用 ══ */
+
+/* 方案 C 与对照视图里占满两栏的一格。 */
+.ntl-span {
+  grid-column: 1 / -1;
+}
+
+/* 标题栏状态片：只在值得一眼看到的状态出现（限速中、失败、等待）。金色 = 正在限速，
+   错误色 = 有一层没生效，其余中性。圆点只给前两种，中性状态不需要额外的强调。 */
+.ntl-chip {
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  gap: 6px;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--ink-3);
+  font: 10.5px/1 var(--mono);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.ntl-chip i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.ntl-chip.gold {
+  border-color: color-mix(in srgb, var(--gold) 45%, var(--line));
+  background: var(--gold-wash);
+  color: var(--gold);
+}
+.ntl-chip.err {
+  border-color: color-mix(in srgb, var(--err) 45%, var(--line));
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+  color: var(--err);
+}
+.ntl-chip + .node-traffic-source {
+  margin-left: 2px;
+}
+.panel.config-panel > header .node-traffic-source {
+  align-self: center;
+}
+
+/* 行内状态：开关右侧，已保存策略的执行结果。 */
+.ntl-state {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+  color: var(--ink-3);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.ntl-state.gold {
+  color: var(--ink-2);
+}
+.ntl-state.err {
+  color: var(--err);
+}
+.ntl-state small {
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.fgrid .v .sub.ntl-layers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 14px;
+}
+.ntl-layers > span {
+  color: var(--ink-3);
+}
+.ntl-layers > .gold {
+  color: var(--ink-3);
+}
+.ntl-layers > .err,
+.ntl-layers em {
+  color: var(--err);
+  font-style: normal;
+}
+.ntl-problem {
+  margin: 8px 0 0;
+  color: var(--err);
+  font-size: 11.5px;
+}
+
+/* ── 规则：「达到 [80 %] 限至 [100 Mbps]」，数值与单位拼成一格 ── */
+.ntl-rules {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  container: ntl-rules / inline-size;
+}
+/* 一条规则一行；值列窄于 350px 时拆成两行：「达到 [80 %] ×」「限至 [100 Mbps]」，不在字段中间折行。 */
+.ntl-rule {
+  display: grid;
+  grid-template-areas: 'dot k1 amt k2 rate x';
+  grid-template-columns: 6px repeat(5, auto);
+  justify-content: start;
+  align-items: center;
+  gap: 6px 8px;
+  min-height: var(--ctl-h);
+}
+.ntl-rule::before {
+  grid-area: dot;
+}
+.ntl-rule > :nth-child(1) {
+  grid-area: k1;
+}
+.ntl-rule > :nth-child(2) {
+  grid-area: amt;
+  justify-self: start;
+}
+.ntl-rule > :nth-child(3) {
+  grid-area: k2;
+}
+.ntl-rule > :nth-child(4) {
+  grid-area: rate;
+  justify-self: start;
+}
+.ntl-rule > .ntl-x {
+  grid-area: x;
+}
+@container ntl-rules (max-width: 350px) {
+  .ntl-rule {
+    grid-template-areas:
+      'dot k1 amt x'
+      '. k2 rate .';
+    grid-template-columns: 6px repeat(3, auto);
+  }
+}
+/* 左侧固定一格圆点：当前起作用的那条为金色，其余透明，行首始终对齐。 */
+.ntl-rule::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  margin-right: -2px;
+  border-radius: 50%;
+  background: transparent;
+}
+.ntl-rule.on::before {
+  background: var(--gold);
+}
+.ntl-rule.idle::before {
+  box-sizing: border-box;
+  border: 1px solid var(--ink-4);
+}
+.ntl-rule.idle > :not(.ntl-x) {
+  opacity: 0.55;
+}
+.ntl-rule-k {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.ntl-num {
+  display: inline-flex;
+  min-width: 0;
+}
+.ntl-num > input.f {
+  width: 58px;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  text-align: right;
+}
+.ntl-num > select.f {
+  width: auto;
+  margin-left: -1px;
+  padding-right: 22px;
+  background-position: right 8px center;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  background-color: var(--band);
+  color: var(--ink-2);
+}
+.ntl-num > :focus {
+  position: relative;
+  z-index: 1;
+}
+.ntl-num.bad > input.f {
+  position: relative;
+  border-color: var(--err);
+}
+.ntl-x {
+  display: inline-grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border: 0;
+  border-radius: var(--r-ctl);
+  background: none;
+  color: var(--ink-4);
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .ntl-x:hover {
+    background: var(--btn-h);
+    color: var(--ink);
+  }
+}
+.ntl-x:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 1px;
+}
+.btn.sm.ntl-add {
+  gap: 5px;
+  min-height: 26px;
+  margin-left: 14px;
+  color: var(--ink-2);
+}
+
+/* ══ 进度条 ①：切口 + 旗标（A、C；D 用同一根条） ══
+   每档阈值在条上切一道 3px 的口（底色与卡面相同），旗杆从切口垂下，旗面写「阈值 速度」。
+   越过第一道有效阈值后的已用部分叠斜纹：数据色不变，只说明这一段是在限速下跑的。 */
+.ntl-run {
+  position: relative;
+  display: block;
+  margin-top: 2px;
+}
+.ntl-bar {
+  position: relative;
+  display: block;
+  height: 8px;
+}
+.ntl-bar.empty {
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+}
+.ntl-cut {
+  position: absolute;
+  top: -1px;
+  bottom: -1px;
+  width: 3px;
+  margin-left: -1.5px;
+  background: var(--block);
+}
+/* 永远不会生效的规则只留一道细缝。 */
+.ntl-cut.idle {
+  width: 1px;
+  margin-left: -0.5px;
+}
+.cap-bar > .ntl-hatch {
+  background: repeating-linear-gradient(
+    -45deg,
+    transparent 0 3px,
+    color-mix(in srgb, var(--block) 55%, transparent) 3px 5px
+  );
+}
+.ntl-flags {
+  position: relative;
+  display: block;
+  height: 31px;
+}
+/* 旗面两行：阈值在上（浅），速度在下。靠右端时整面翻到旗杆左侧、右对齐。 */
+.ntl-flag {
+  position: absolute;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 5px 0 0 6px;
+  color: var(--ink-2);
+  font: 10.5px/13px var(--mono);
+  white-space: nowrap;
+}
+.ntl-flag::before {
+  position: absolute;
+  top: 0;
+  bottom: 2px;
+  left: 0;
+  width: 1px;
+  background: color-mix(in srgb, var(--ink-3) 55%, transparent);
+  content: '';
+}
+.ntl-flag b {
+  color: var(--ink-4);
+  font: 400 10px/12px var(--mono);
+}
+.ntl-flag.flip {
+  align-items: flex-end;
+  padding: 5px 6px 0 0;
+  transform: translateX(-100%);
+}
+.ntl-flag.flip::before {
+  right: 0;
+  left: auto;
+}
+.ntl-flag.bare {
+  height: 6px;
+  padding: 0;
+}
+.ntl-flag.on {
+  color: var(--gold);
+}
+.ntl-flag.on::before {
+  background: var(--gold);
+}
+.ntl-flag.on b {
+  color: color-mix(in srgb, var(--gold) 65%, var(--ink-4));
+}
+.ntl-flag.idle {
+  opacity: 0.55;
+}
+
+/* ══ 进度条 ②：限速天际线（B） ══
+   跑道上方一条阶梯线，高度是允许的速度（对数刻度），线下铺一层浅色。已用多少仍由下面的跑道表达，
+   线上只有一个圆点标出当前位置；正在限速时圆点与那一档的速度一起转金色。竖直的落差正好落在跑道的切口上。 */
+.ntl-sky {
+  position: relative;
+  display: block;
+}
+.ntl-sky-plot {
+  position: relative;
+  height: 50px;
+}
+.ntl-sky-plot svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.ntl-sky .wash {
+  fill: color-mix(in srgb, var(--data) 8%, transparent);
+}
+.ntl-sky .quota {
+  stroke: var(--ink-3);
+  stroke-width: 1;
+  stroke-dasharray: 2 3;
+}
+.ntl-sky .line {
+  fill: none;
+  stroke: color-mix(in srgb, var(--data) 70%, var(--ink-3));
+  stroke-width: 1.25;
+}
+.ntl-sky-rate {
+  position: absolute;
+  padding: 0 0 2px 5px;
+  color: var(--ink-3);
+  font: 10.5px/12px var(--mono);
+  white-space: nowrap;
+}
+.ntl-sky-rate.flip {
+  padding: 0 5px 2px 0;
+  transform: translateX(-100%);
+}
+.ntl-sky-rate.now {
+  color: var(--ink);
+}
+.ntl-sky-rate.on {
+  color: var(--gold);
+}
+.ntl-sky-dot {
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  margin: 0 0 -4.5px -4.5px;
+  border-radius: 50%;
+  background: var(--ink);
+  box-shadow: 0 0 0 2px var(--block);
+}
+.ntl-sky-dot.on {
+  background: var(--gold);
+}
+.ntl-sky-axis {
+  position: relative;
+  height: 18px;
+}
+.ntl-sky-axis span {
+  position: absolute;
+  top: 6px;
+  padding-left: 4px;
+  color: var(--ink-4);
+  font: 10px/1 var(--mono);
+  white-space: nowrap;
+}
+.ntl-sky-axis span::before {
+  position: absolute;
+  top: -6px;
+  left: 0;
+  width: 1px;
+  height: 6px;
+  background: color-mix(in srgb, var(--ink-3) 55%, transparent);
+  content: '';
+}
+.ntl-sky-axis span.flip {
+  padding: 0 4px 0 0;
+  transform: translateX(-100%);
+}
+.ntl-sky-axis span.flip::before {
+  right: 0;
+  left: auto;
+}
+.ntl-sky-axis span.q {
+  color: var(--ink-3);
+}
+.ntl-sections {
+  margin-top: 8px;
+}
+.ntl-group {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0 2px;
+}
+.ntl-group-t {
+  flex: none;
+  color: var(--ink-2);
+  font: 600 11px/1 var(--mono);
+  letter-spacing: 0.12em;
+}
+.ntl-group-line {
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+.ntl-group .segsw {
+  flex: none;
+}
+.ntl-group .ntl-state {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 设置行里的控件宽度与生产卡一致。 */
+select.f.ntl-mode,
+input.f.ntl-quota {
+  width: 128px;
+}
+input.f.ntl-day {
+  width: 64px;
+}
+select.f.ntl-month {
+  width: 82px;
+}
+
+/* ══ 方案 C：通栏双栏 ══ */
+.panel.config-panel.ntl-c {
+  container: ntl-c / inline-size;
+}
+.ntl-c-top {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+  margin-top: 2px;
+}
+.ntl-c-read {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 10px;
+  padding: 2px 26px 6px 2px;
+}
+.ntl-c-k {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 16px;
+}
+.ntl-c-tag {
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--ink-3);
+  font: 10px/15px var(--mono);
+  letter-spacing: 0.04em;
+}
+.ntl-c-value {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 6px;
+  margin: 2px 0 4px;
+  color: var(--ink);
+  font: 600 30px/1 var(--sans);
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+}
+.ntl-c-value small {
+  color: var(--ink-3);
+  font: 500 15px/1 var(--sans);
+  letter-spacing: 0;
+}
+.ntl-c-value .of {
+  margin-left: 4px;
+  color: var(--ink-3);
+  font: 400 14px/1 var(--sans);
+  letter-spacing: 0;
+}
+.ntl-c-value .pct {
+  margin-left: auto;
+  color: var(--ink-2);
+  font: 500 16px/1 var(--sans);
+  letter-spacing: -0.01em;
+}
+.ntl-c-value .pct.over {
+  color: var(--err);
+}
+.ntl-c-value.void {
+  color: var(--ink-4);
+}
+.ntl-c-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+}
+.ntl-c-foot .node-traffic-reset {
+  margin-left: auto;
+}
+.ntl-tile {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px 2px 6px 22px;
+  border-left: 1px solid var(--line-soft);
+}
+.ntl-tile-rate {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  margin: 2px 0 0;
+  color: var(--ink);
+  font: 600 26px/1 var(--sans);
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.ntl-tile-rate small {
+  color: var(--ink-3);
+  font: 500 13px/1 var(--sans);
+  letter-spacing: 0;
+}
+.ntl-tile-rate.on {
+  color: var(--gold);
+}
+.ntl-tile-rate.on small {
+  color: color-mix(in srgb, var(--gold) 70%, var(--ink-3));
+}
+.ntl-tile-rate.dim {
+  color: var(--ink-3);
+}
+.ntl-tile.off .ntl-tile-rate {
+  color: var(--ink-4);
+  font-size: 20px;
+  font-weight: 500;
+}
+.ntl-tile-sub {
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.ntl-tile-sub.gold {
+  color: var(--ink-2);
+}
+.ntl-tile-sub.err {
+  color: var(--err);
+}
+.ntl-tile-layers {
+  display: grid;
+  gap: 4px;
+  margin: 4px 0 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+  font-size: 12px;
+}
+.ntl-tile-layers > div {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 8px;
+}
+.ntl-tile-layers dt {
+  color: var(--ink-4);
+  font: 11px/18px var(--mono);
+}
+.ntl-tile-layers dd {
+  margin: 0;
+  color: var(--ink-2);
+  line-height: 18px;
+}
+.ntl-tile-layers .gold dd {
+  color: var(--ink-2);
+}
+.ntl-tile-layers .err dd {
+  color: var(--err);
+}
+.ntl-tile-layers em {
+  display: block;
+  color: var(--err);
+  font: 10.5px/1.45 var(--mono);
+  font-style: normal;
+  overflow-wrap: anywhere;
+}
+.ntl-tile-next {
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.ntl-tile-next > span {
+  margin-right: 8px;
+  color: var(--ink-4);
+}
+.ntl-c-forms {
+  display: grid;
+  align-items: start;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 28px;
+  margin-top: 12px;
+}
+@container ntl-c (max-width: 720px) {
+  .ntl-c-top,
+  .ntl-c-forms {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .ntl-c-read {
+    padding-right: 2px;
+  }
+  .ntl-tile {
+    margin-top: 10px;
+    padding: 12px 2px 4px;
+    border-top: 1px solid var(--line-soft);
+    border-left: 0;
+  }
+}
+
+/* ══ 进度条 ③：标签即规则（D） ══
+   旗面在条的上方写速度，下方刻度写阈值；旗杆落在切口上。可编辑时旗面是按钮，点开就地改。 */
+.ntl-pinrun {
+  position: relative;
+  margin-top: 2px;
+}
+.ntl-pinrun.with-add {
+  padding-right: 34px;
+}
+.ntl-pinrun-track {
+  position: relative;
+  min-width: 0;
+}
+.ntl-pins {
+  position: relative;
+}
+.ntl-pin {
+  position: absolute;
+  bottom: 0;
+  padding-bottom: calc(7px + var(--lane, 0) * 22px);
+}
+.ntl-pin::after {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 1px;
+  height: calc(16px + var(--lane, 0) * 22px);
+  background: color-mix(in srgb, var(--ink-3) 55%, transparent);
+  content: '';
+}
+.ntl-pin > button,
+.ntl-pin > span {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  height: 18px;
+  box-sizing: border-box;
+  align-items: center;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px 4px 4px 0;
+  background: var(--sheet);
+  color: var(--ink-2);
+  font: 10.5px/1 var(--mono);
+  white-space: nowrap;
+}
+.ntl-pin > button {
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .ntl-pin > button:hover {
+    border-color: color-mix(in srgb, var(--action) 55%, var(--line));
+    color: var(--ink);
+  }
+}
+.ntl-pin > button:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 1px;
+}
+.ntl-pin.flip {
+  transform: translateX(-100%);
+}
+.ntl-pin.flip::after {
+  right: 0;
+  left: auto;
+}
+.ntl-pin.flip > button,
+.ntl-pin.flip > span {
+  border-radius: 4px 4px 0 4px;
+}
+.ntl-pin.on > button,
+.ntl-pin.on > span {
+  border-color: color-mix(in srgb, var(--gold) 55%, var(--line));
+  background: color-mix(in srgb, var(--gold) 14%, var(--block));
+  color: var(--gold);
+}
+.ntl-pin.on::after {
+  background: var(--gold);
+}
+.ntl-pin.idle > button,
+.ntl-pin.idle > span {
+  border-style: dashed;
+  color: var(--ink-4);
+}
+.ntl-pin.open > button {
+  border-color: var(--action);
+  color: var(--ink);
+}
+.ntl-ticks {
+  position: relative;
+  height: 17px;
+}
+.ntl-ticks span {
+  position: absolute;
+  top: 6px;
+  padding-left: 4px;
+  color: var(--ink-4);
+  font: 10px/1 var(--mono);
+  white-space: nowrap;
+}
+.ntl-ticks span::before {
+  position: absolute;
+  top: -6px;
+  left: 0;
+  width: 1px;
+  height: 6px;
+  background: color-mix(in srgb, var(--ink-3) 55%, transparent);
+  content: '';
+}
+.ntl-ticks span.flip {
+  padding: 0 4px 0 0;
+  transform: translateX(-100%);
+}
+.ntl-ticks span.flip::before {
+  right: 0;
+  left: auto;
+}
+.ntl-ticks span.idle {
+  opacity: 0.55;
+}
+.ntl-pin-add {
+  position: absolute;
+  right: 0;
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1px dashed color-mix(in srgb, var(--ink-3) 60%, var(--line));
+  border-radius: 50%;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .ntl-pin-add:hover {
+    border-style: solid;
+    border-color: var(--action);
+    color: var(--action);
+  }
+}
+.ntl-pin-add:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+}
+.ntl-pop {
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + 4px);
+  left: clamp(0px, calc(var(--anchor) - 22px), calc(100% - 256px));
+  display: grid;
+  width: 256px;
+  max-width: 100%;
+  box-sizing: border-box;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--float);
+  -webkit-backdrop-filter: var(--float-filter);
+  backdrop-filter: var(--float-filter);
+  box-shadow: var(--float-edge), var(--shadow);
+}
+.ntl-pop-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ntl-pop-row .k {
+  width: 28px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.ntl-pop-eq {
+  color: var(--ink-4);
+  font: 11px var(--mono);
+  white-space: nowrap;
+}
+.ntl-pop-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+.ntl-pop-foot .sp {
+  flex: 1;
+}

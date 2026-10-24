@@ -9,8 +9,12 @@ import type {
   NodePingProbeView,
   PingProbeFamilySeries,
   PingProbePoint,
+  UsageNodeBucket,
+  UsageNodeSeries,
+  UsageNodeSeriesList,
 } from '../src/api';
 import type { LoadRange } from '../src/panes/nodes';
+import { loadRangeKey } from '../src/ui/observe-range';
 import {
   observeAreaFill,
   observeBpsReading,
@@ -279,18 +283,25 @@ function reportWith(change: (sample: LoadSample) => void): NodeLoadView {
 
 const halfHour: LoadRange = { seconds: 30 * 60, label: '30m', menuLabel: '近 30 分钟', heading: '30 MINUTES' };
 
-function renderThroughput(value: NodeLoadView, linked = false, range: LoadRange = halfHour) {
+function renderThroughput(
+  value: NodeLoadView,
+  linked = false,
+  range: LoadRange = halfHour,
+  buckets: UsageNodeBucket[] = [],
+  forwarding: UsageNodeSeries['forwarding'] = [],
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY } },
   });
-  client.setQueryData(['node-load-history', value.node_id, range.seconds], value);
-  client.setQueryData(['usage-node-series', value.node_id, range.seconds], {
+  client.setQueryData(['node-load-history', value.node_id, loadRangeKey(range)], value);
+  client.setQueryData(['usage-node-series', value.node_id, loadRangeKey(range)], {
     since: '',
     month_start: '',
     nodes: [
       {
         node_id: value.node_id,
-        buckets: [],
+        buckets,
+        forwarding,
         month_user_uplink_bytes: 0,
         month_user_downlink_bytes: 0,
         month_relay_uplink_bytes: 0,
@@ -299,11 +310,12 @@ function renderThroughput(value: NodeLoadView, linked = false, range: LoadRange 
       },
     ],
   });
-  return render(
+  const view = render(
     <QueryClientProvider client={client}>
       <ThroughputPanel nodeId={value.node_id} range={range} linked={linked} />
     </QueryClientProvider>,
   );
+  return { ...view, client };
 }
 
 describe('deep host telemetry', () => {
@@ -741,6 +753,202 @@ describe('deep host telemetry', () => {
       expect(line.areaStyle.opacity).toBe(1);
     }
     expect(chartMock.connect).not.toHaveBeenCalled();
+  });
+
+  it('shows the last measured XRAY rate and time without dropping pending data to zero', async () => {
+    const view = renderThroughput(report(), false, halfHour, [
+      {
+        window_end: new Date(95_000).toISOString(),
+        user_uplink_bytes: 15_000_000,
+        user_downlink_bytes: 30_000_000,
+        relay_uplink_bytes: 0,
+        relay_downlink_bytes: 0,
+      },
+    ]);
+
+    const legend = view.getByLabelText('XRAY 流量图例');
+    expect(legend.textContent).toContain('接入 12.0 Mbit/s');
+    expect(legend.textContent).toContain('中继 0.00 Mbit/s');
+    expect(legend.textContent).toContain('转发 —');
+    expect(legend.getAttribute('title')).toContain(new Date(95_000).toISOString());
+    expect(view.queryByText(/最后样本/)).toBeNull();
+    await waitFor(() =>
+      expect(chartMock.setOption.mock.calls.some(([option]) => option.series?.[0]?.name === '接入')).toBe(true),
+    );
+    const chart = chartMock.setOption.mock.calls.find(([option]) => option.series?.[0]?.name === '接入')?.[0];
+    expect(chart.xAxis[0].max).toBe(130_000);
+    expect(chart.series[0].data).toEqual([[95_000, 12_000_000]]);
+    expect(chart.series[1].data).toEqual([[95_000, 0]]);
+  });
+
+  it('shows missing XRAY samples as unavailable and real idle reports as zero', () => {
+    const missing = renderThroughput(report());
+    expect(missing.getByLabelText('XRAY 流量图例').textContent).toContain('接入 —');
+    expect(missing.getByLabelText('XRAY 流量图例').textContent).toContain('中继 —');
+    expect(missing.getByLabelText('XRAY 流量图例').getAttribute('title')).toBe('尚无接入与中继样本');
+    missing.unmount();
+
+    const idle = renderThroughput(report(), false, halfHour, [
+      {
+        window_end: new Date(95_000).toISOString(),
+        user_uplink_bytes: 0,
+        user_downlink_bytes: 0,
+        relay_uplink_bytes: 0,
+        relay_downlink_bytes: 0,
+      },
+    ]);
+    const readings = idle.getByLabelText('XRAY 流量图例').querySelectorAll('b');
+    expect(readings[0].textContent).toBe('0.00 bit/s');
+    expect(readings[1].textContent).toBe('0.00 bit/s');
+  });
+
+  const throughputReport = (ends: number[], end = 200): NodeLoadView => {
+    const series = ends.map(time => ({
+      ...sample(),
+      window_start_unix_secs: time - 30,
+      window_end_unix_secs: time,
+      nic_rx_bps: time * 1000,
+    }));
+    return { ...report(), range_end_unix_secs: end, series, latest_sample: series.at(-1)! };
+  };
+  const usageBucket = (end: number): UsageNodeBucket => ({
+    window_end: new Date(end * 1000).toISOString(),
+    user_uplink_bytes: 15_000_000,
+    user_downlink_bytes: 30_000_000,
+    relay_uplink_bytes: 0,
+    relay_downlink_bytes: 0,
+  });
+  const throughputCharts = () =>
+    chartMock.setOption.mock.calls
+      .filter(([option]) => ['接收', '接入'].includes(option.series?.[0]?.name))
+      .map(([option]) => option);
+
+  it('advances a shared completed range even when NIC and XRAY timestamps never match', async () => {
+    for (const offset of [0, 30, 60]) {
+      chartMock.setOption.mockClear();
+      const view = renderThroughput(throughputReport([100 + offset, 130 + offset]), false, halfHour, [
+        usageBucket(95 + offset),
+        usageBucket(125 + offset),
+      ]);
+
+      await waitFor(() => expect(throughputCharts()).toHaveLength(2));
+      const [nic, xray] = throughputCharts();
+      expect(nic.xAxis[0].max).toBe((130 + offset) * 1000);
+      expect(xray.xAxis[0].max).toBe(nic.xAxis[0].max);
+      expect(nic.series[0].data.at(-1)).toEqual([(130 + offset) * 1000, (130 + offset) * 1000]);
+      expect(xray.series[0].data.at(-1)[0]).toBe((125 + offset) * 1000);
+      expect(view.getByLabelText('网卡流量图例').getAttribute('title')).toContain(
+        new Date((130 + offset) * 1000).toISOString(),
+      );
+      expect(view.queryByText('滞后')).toBeNull();
+      view.unmount();
+    }
+  });
+
+  it('holds the newer NIC window when its preceding window is closer to the latest XRAY sample', async () => {
+    renderThroughput(throughputReport([100, 130]), false, halfHour, [usageBucket(105)]);
+
+    await waitFor(() => expect(throughputCharts()).toHaveLength(2));
+    for (const chart of throughputCharts()) expect(chart.xAxis[0].max).toBe(105_000);
+    expect(throughputCharts()[0].series[0].data).toEqual([[100_000, 100_000]]);
+    expect(throughputCharts()[1].series[0].data).toEqual([[105_000, 12_000_000]]);
+  });
+
+  it('stops waiting for XRAY after one refresh of skew and lets NIC continue', async () => {
+    const view = renderThroughput(throughputReport([100, 130, 160]), false, halfHour, [usageBucket(95)]);
+
+    await waitFor(() => expect(throughputCharts()).toHaveLength(2));
+    for (const chart of throughputCharts()) expect(chart.xAxis[0].max).toBe(160_000);
+    expect(throughputCharts()[0].series[0].data.at(-1)).toEqual([160_000, 160_000]);
+    const lag = view.getByText('滞后');
+    expect(lag.tagName).toBe('SPAN');
+    expect(lag.className).toBe('');
+    expect(lag.parentElement).toBe(view.getByText('XRAY 流量').parentElement);
+    expect(view.getByText('网卡流量').parentElement?.textContent).not.toContain('滞后');
+    expect(view.queryByText(/最后样本|样本延迟/)).toBeNull();
+  });
+
+  it('does not retract displayed NIC samples when a delayed XRAY source catches up', async () => {
+    const view = renderThroughput(throughputReport([100, 130]), false, halfHour, [usageBucket(95)]);
+    await waitFor(() => expect(throughputCharts()).toHaveLength(2));
+    const key = ['usage-node-series', 'n1', halfHour.seconds];
+    act(() =>
+      view.client.setQueryData<UsageNodeSeriesList>(key, previous => ({
+        ...previous!,
+        nodes: previous!.nodes.map(node => ({ ...node, buckets: [usageBucket(105)] })),
+      })),
+    );
+    await waitFor(
+      () =>
+        expect(view.getByLabelText('XRAY 流量图例').getAttribute('title')).toContain(new Date(105_000).toISOString()),
+      { timeout: 2000 },
+    );
+
+    expect(view.getByLabelText('网卡流量图例').getAttribute('title')).toContain(new Date(130_000).toISOString());
+    expect(throughputCharts().at(-1).xAxis[0].max).toBe(130_000);
+    view.unmount();
+    view.client.clear();
+  });
+
+  it('lets XRAY advance when NIC is delayed and ignores a missing optional forwarding series', async () => {
+    const view = renderThroughput(throughputReport([70, 100]), false, halfHour, [usageBucket(125), usageBucket(155)]);
+
+    await waitFor(() => expect(throughputCharts()).toHaveLength(2));
+    for (const chart of throughputCharts()) expect(chart.xAxis[0].max).toBe(155_000);
+    expect(throughputCharts()[1].series[0].data.at(-1)).toEqual([155_000, 12_000_000]);
+    const lag = view.getByText('滞后');
+    expect(lag.className).toBe('');
+    expect(lag.parentElement).toBe(view.getByText('网卡流量').parentElement);
+    expect(view.getByText('XRAY 流量').parentElement?.textContent).not.toContain('滞后');
+  });
+
+  it('keeps first samples visible before the two sources have any overlapping history', async () => {
+    const view = renderThroughput(throughputReport([130]), false, halfHour, [usageBucket(105)]);
+
+    await waitFor(() => expect(throughputCharts()).toHaveLength(2));
+    expect(throughputCharts()[0].series[0].data).toEqual([[130_000, 130_000]]);
+    expect(throughputCharts()[1].series[0].data).toEqual([[105_000, 12_000_000]]);
+    expect(view.queryByText('滞后')).toBeNull();
+  });
+
+  it('bounds forwarding to the same displayed interval without letting an old report stall the panel', async () => {
+    const view = renderThroughput(
+      throughputReport([100, 130, 160]),
+      false,
+      halfHour,
+      [usageBucket(155)],
+      [
+        {
+          window_start: new Date(40_000).toISOString(),
+          window_end: new Date(70_000).toISOString(),
+          uplink_bytes: 30,
+          downlink_bytes: 0,
+          has_gap: false,
+        },
+        {
+          window_start: new Date(155_000).toISOString(),
+          window_end: new Date(210_000).toISOString(),
+          uplink_bytes: 55,
+          downlink_bytes: 0,
+          has_gap: false,
+        },
+      ],
+    );
+
+    await waitFor(() => expect(throughputCharts()).toHaveLength(2));
+    expect(throughputCharts()[1].xAxis[0].max).toBe(160_000);
+    expect(throughputCharts()[1].series[2].data).toEqual([[70_000, 8]]);
+    expect(view.getByTitle('转发样本落后超过 30 秒，其他数据继续更新')).toBeTruthy();
+  });
+
+  it('keeps a fixed historical range intact instead of aligning it to recent samples', async () => {
+    const range = { ...halfHour, startUnixSecs: 0, endUnixSecs: 200 };
+    const view = renderThroughput(throughputReport([100, 130]), false, range, [usageBucket(95)]);
+
+    await waitFor(() => expect(throughputCharts()).toHaveLength(2));
+    for (const chart of throughputCharts()) expect(chart.xAxis[0].max).toBe(200_000);
+    expect(throughputCharts()[0].series[0].data.at(-1)).toEqual([130_000, 130_000]);
+    expect(view.queryByText('滞后')).toBeNull();
   });
 
   it('renders time-based throughput bars with real gaps and preserves line charts for other callers', () => {
@@ -1490,6 +1698,8 @@ describe('deep host telemetry', () => {
       label: '24h',
       menuLabel: '近 24 小时',
       heading: '24 HOURS',
+      startUnixSecs: 1_000,
+      endUnixSecs: 87_400,
     });
     const network = chartMock.setOption.mock.calls.find(([option]) =>
       option.series?.some((line: { name: string }) => line.name === '接收'),

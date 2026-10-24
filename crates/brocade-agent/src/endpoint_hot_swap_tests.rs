@@ -317,14 +317,14 @@ fn native_endpoint_swap(mux: bool) {
         let before = content.to_string();
         content["outbounds"][1]["settings"]["vnext"][0]["address"] = address.into();
         let swap = hot_swap(&before, &content.to_string()).unwrap();
-        assert_eq!(swap.operations().len(), 8);
+        assert_eq!(swap.operations().len(), 6);
         for (step, operation) in swap.operations().into_iter().enumerate() {
             super::apply_hot_swap_operation(operation, &call, &stage).unwrap();
             exchange(&mut original_tcp, b'4');
-            let expected = if step < 2 { old_marker } else { new_marker };
+            let expected = if step < 1 { old_marker } else { new_marker };
             exchange(&mut connect(public), expected);
             exchange(&mut connect(public_v6), expected);
-            if step == 3 {
+            if step == 2 {
                 // The real tag is absent here; failed installation must leave the bridge usable.
                 let invalid = HotSwapOperation::AddOutbounds(vec![
                     json!({"tag":"out:app/chain>receiver","protocol":"invalid-fixture-protocol"}),
@@ -434,4 +434,211 @@ fn native_endpoint_swap(mux: bool) {
     for (stream, marker) in &mut bridge_connections {
         exchange(stream, *marker);
     }
+}
+
+#[test]
+#[ignore = "requires BROCADE_TEST_XRAY; run serially"]
+fn native_atomic_routing_replacement_keeps_denials_balancers_and_tcp() {
+    let source = std::env::var_os("BROCADE_TEST_XRAY").expect("BROCADE_TEST_XRAY is required");
+    let echo = Echo::start(b'A');
+    let root = std::env::temp_dir().join(format!("atomic-routes-{}", std::process::id()));
+    assert!(!root.exists());
+    super::create_private_dir(&root).unwrap();
+    let _fixture = Fixture {
+        root: root.clone(),
+        environment: ["BROCADE_XRAY_BIN", "BROCADE_TEST_LOG_SINK"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect(),
+        receiver: None,
+    };
+    let binary = root.join("xray");
+    std::fs::copy(source, &binary).unwrap();
+    std::env::set_var("BROCADE_XRAY_BIN", &binary);
+    std::env::set_var("BROCADE_TEST_LOG_SINK", "cat >/dev/null");
+    let api = free_address();
+    let public = free_address();
+    let denied = free_address();
+    let mut content = json!({
+        "log":{"loglevel":"error"},
+        "api":{"tag":"api","listen":api.to_string(),"services":["RoutingService","HandlerService","StatsService"]},
+        "inbounds":[
+            {"tag":"allowed","listen":"127.0.0.1","port":public.port(),"protocol":"dokodemo-door","settings":{"address":"127.0.0.1","port":echo.address.port(),"network":"tcp"}},
+            {"tag":"denied","listen":"127.0.0.1","port":denied.port(),"protocol":"dokodemo-door","settings":{"address":"127.0.0.1","port":echo.address.port(),"network":"tcp"}}
+        ],
+        "outbounds":[{"tag":"blocked","protocol":"blackhole"},{"tag":"direct","protocol":"freedom","settings":{"ipsBlocked":[]}}],
+        "routing":{"balancers":[{"tag":"health","selector":["direct"]}],"rules":[
+            {"type":"field","ruleTag":"deny","inboundTag":["denied"],"outboundTag":"blocked"},
+            {"type":"field","ruleTag":"fallback-0","inboundTag":["allowed","denied"],"outboundTag":"direct"},
+            {"type":"field","ruleTag":"health","domain":["full:never.audit.invalid"],"balancerTag":"health"}
+        ]}
+    });
+    let checkpoint = root.join("xray.json");
+    super::write_private(&checkpoint, &content.to_string()).unwrap();
+    assert!(super::apply_xray(&checkpoint, api).unwrap().is_complete());
+    let process = super::serving_xray_process_in(&root).unwrap();
+    let mut established = connect(public);
+    exchange(&mut established, b'A');
+    let stop = Arc::new(AtomicBool::new(false));
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let leaked = Arc::new(AtomicBool::new(false));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let stop = stop.clone();
+            let attempts = attempts.clone();
+            let leaked = leaked.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let mut stream = connect(denied);
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(200)))
+                        .unwrap();
+                    if stream.write_all(b"ping").is_ok() {
+                        let mut reply = [0; 1];
+                        if matches!(stream.read(&mut reply), Ok(count) if count > 0) {
+                            leaked.store(true, Ordering::Release);
+                        }
+                    }
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+    // Join on assertion unwinding as well, before the fixture retires its listeners.
+    struct Traffic {
+        stop: Arc<AtomicBool>,
+        workers: Vec<thread::JoinHandle<()>>,
+    }
+    impl Drop for Traffic {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            for worker in self.workers.drain(..) {
+                if let Err(error) = worker.join() {
+                    if !thread::panicking() {
+                        std::panic::resume_unwind(error);
+                    }
+                }
+            }
+        }
+    }
+    let traffic = Traffic { stop, workers };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while attempts.load(Ordering::Relaxed) < 20 {
+        assert!(Instant::now() < deadline, "denied traffic did not start");
+        thread::sleep(Duration::from_millis(5));
+    }
+    for round in 1..=20 {
+        let previous = content.to_string();
+        content["routing"]["rules"][1]["ruleTag"] = format!("fallback-{round}").into();
+        let swap = hot_swap(&previous, &content.to_string()).unwrap();
+        assert_eq!(swap.operations().len(), 1);
+        super::apply_hot_swap(&root, api, &swap).unwrap();
+        super::run_command(
+            binary.to_str().unwrap(),
+            &["api", "bi", &format!("--server={api}"), "health"],
+        )
+        .unwrap();
+        super::write_private(&checkpoint, &content.to_string()).unwrap();
+        exchange(&mut established, b'A');
+        exchange(&mut connect(public), b'A');
+        assert_eq!(super::serving_xray_process_in(&root), Some(process));
+    }
+    let mut invalid = content.clone();
+    invalid["routing"]["rules"][0]["outboundTag"] = "direct".into();
+    invalid["routing"]["rules"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"field","ruleTag":"invalid"}));
+    let swap = hot_swap(&content.to_string(), &invalid.to_string()).unwrap();
+    assert!(super::apply_hot_swap(&root, api, &swap).is_err());
+    exchange(&mut established, b'A');
+    drop(traffic);
+    assert!(
+        attempts.load(Ordering::Relaxed) >= 20,
+        "insufficient concurrent denied traffic"
+    );
+    assert!(
+        !leaked.load(Ordering::Acquire),
+        "denied traffic reached the origin during a rule update"
+    );
+    assert_eq!(super::serving_xray_process_in(&root), Some(process));
+    assert_eq!(
+        std::fs::read_to_string(checkpoint).unwrap(),
+        content.to_string()
+    );
+}
+
+#[test]
+#[ignore = "requires BROCADE_TEST_XRAY and BROCADE_TEST_LEGACY_XRAY; run serially"]
+fn native_old_router_is_rejected_before_mutation_after_disk_upgrade() {
+    let source = std::env::var_os("BROCADE_TEST_XRAY").expect("BROCADE_TEST_XRAY is required");
+    let legacy =
+        std::env::var_os("BROCADE_TEST_LEGACY_XRAY").expect("BROCADE_TEST_LEGACY_XRAY is required");
+    let echo = Echo::start(b'A');
+    let root = std::env::temp_dir().join(format!("old-routes-{}", std::process::id()));
+    assert!(!root.exists());
+    super::create_private_dir(&root).unwrap();
+    let _fixture = Fixture {
+        root: root.clone(),
+        environment: ["BROCADE_XRAY_BIN", "BROCADE_TEST_LOG_SINK"]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect(),
+        receiver: None,
+    };
+    let binary = root.join("xray");
+    std::fs::copy(legacy, &binary).unwrap();
+    std::env::set_var("BROCADE_XRAY_BIN", &binary);
+    std::env::set_var("BROCADE_TEST_LOG_SINK", "cat >/dev/null");
+    let api = free_address();
+    let public = free_address();
+    let before = json!({
+        "log":{"loglevel":"error"},
+        "api":{"tag":"api","listen":api.to_string(),"services":["RoutingService","HandlerService","StatsService"]},
+        "inbounds":[{"tag":"allowed","listen":"127.0.0.1","port":public.port(),"protocol":"dokodemo-door","settings":{"address":"127.0.0.1","port":echo.address.port(),"network":"tcp"}}],
+        "outbounds":[{"tag":"direct","protocol":"freedom","settings":{"ipsBlocked":[]}}],
+        "routing":{"rules":[{"type":"field","ruleTag":"before","network":"tcp","outboundTag":"direct"}]}
+    });
+    let checkpoint = root.join("xray.json");
+    super::write_private(&checkpoint, &before.to_string()).unwrap();
+    assert!(super::apply_xray(&checkpoint, api).unwrap().is_complete());
+    let process = super::serving_xray_process_in(&root).unwrap();
+    let mut established = connect(public);
+    exchange(&mut established, b'A');
+    let next_binary = root.join("xray.next");
+    std::fs::copy(source, &next_binary).unwrap();
+    std::fs::rename(next_binary, &binary).unwrap();
+    let installed = super::run_command(binary.to_str().unwrap(), &["version"]).unwrap();
+    assert!(super::xray_version_has_capability(
+        &installed,
+        "atomic-routing-reload-v1"
+    ));
+    let mut after = before.clone();
+    after["outbounds"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"tag":"new","protocol":"blackhole"}));
+    after["routing"]["rules"][0]["ruleTag"] = "after".into();
+    let swap = hot_swap(&before.to_string(), &after.to_string()).unwrap();
+    let error = super::apply_hot_swap(&root, api, &swap).unwrap_err();
+    assert!(error.contains("不支持原子路由重载"), "{error}");
+    let list = |verb: &str| -> Value {
+        serde_json::from_str(
+            &super::run_command(
+                binary.to_str().unwrap(),
+                &["api", verb, &format!("--server={api}")],
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(list("lso")["outbounds"].as_array().unwrap().len(), 1);
+    assert_eq!(list("lsrules")["rules"][0]["ruleTag"], "before");
+    assert_eq!(super::serving_xray_process_in(&root), Some(process));
+    assert_eq!(
+        std::fs::read_to_string(checkpoint).unwrap(),
+        before.to_string()
+    );
+    exchange(&mut established, b'A');
+    exchange(&mut connect(public), b'A');
 }

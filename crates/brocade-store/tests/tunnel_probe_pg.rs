@@ -96,6 +96,7 @@ async fn tunnel_probe_policy_queue_claim_cancel_and_history_are_durable() {
             &system_admin(),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
+                    target_strategy: None,
                     id: "custom-1111-1111".to_owned(),
                     tenant_id: "platform.acme".to_owned(),
                     name: "Vendor edge".to_owned(),
@@ -120,6 +121,7 @@ async fn tunnel_probe_policy_queue_claim_cancel_and_history_are_durable() {
             &system_admin(),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
+                    target_strategy: None,
                     id: "custom-2222-2222".to_owned(),
                     tenant_id: "platform.acme".to_owned(),
                     name: "Future edge".to_owned(),
@@ -525,6 +527,7 @@ async fn tunnel_probe_policy_queue_claim_cancel_and_history_are_durable() {
             &system_admin(),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
+                    target_strategy: None,
                     id: "custom-1111-1111".to_owned(),
                     tenant_id: "other.example".to_owned(),
                     name: "Other vendor".to_owned(),
@@ -610,6 +613,7 @@ async fn manual_draft_probe_freezes_an_encrypted_source_without_affecting_servin
             &system_admin(),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
+                    target_strategy: None,
                     id: "custom-1111-1111".to_owned(),
                     tenant_id: "platform.acme".to_owned(),
                     name: "Serving edge".to_owned(),
@@ -631,6 +635,7 @@ async fn manual_draft_probe_freezes_an_encrypted_source_without_affecting_servin
 
     let draft_ops = vec![ModelOp::UpsertExternalOutbound {
         outbound: UpsertExternalOutboundRequest {
+            target_strategy: None,
             id: "custom-1111-1111".to_owned(),
             tenant_id: "platform.acme".to_owned(),
             name: "Draft edge".to_owned(),
@@ -845,6 +850,7 @@ async fn manual_probe_does_not_reuse_an_active_run_after_the_id_changes_tenant()
             &system_admin(),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
+                    target_strategy: None,
                     id: "custom-3333-3333".to_owned(),
                     tenant_id: "platform.acme".to_owned(),
                     name: "Platform edge".to_owned(),
@@ -887,6 +893,7 @@ async fn manual_probe_does_not_reuse_an_active_run_after_the_id_changes_tenant()
             &system_admin(),
             vec![ModelOp::UpsertExternalOutbound {
                 outbound: UpsertExternalOutboundRequest {
+                    target_strategy: None,
                     id: "custom-3333-3333".to_owned(),
                     tenant_id: "other.example".to_owned(),
                     name: "Other edge".to_owned(),

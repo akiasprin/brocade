@@ -2,11 +2,14 @@ package core
 
 import (
 	"context"
+	"github.com/xtls/xray-core/common/sourceaccess"
+	"os"
 	"reflect"
 	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/machinelimit"
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/features"
@@ -187,6 +190,17 @@ func NewWithContext(ctx context.Context, config *Config) (*Instance, error) {
 }
 
 func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
+	server.ctx = machinelimit.NewContext(server.ctx)
+	if path := os.Getenv(sourceaccess.Env); path != "" {
+		manager, err := sourceaccess.New(path)
+		if err != nil {
+			return true, err
+		}
+		server.ctx = sourceaccess.Context(server.ctx, manager)
+		if err := server.AddFeature(manager); err != nil {
+			return true, err
+		}
+	}
 	server.ctx = context.WithValue(server.ctx, "cone",
 		platform.NewEnvFlag(platform.UseCone).GetValue(func() string { return "" }) != "true")
 
@@ -239,6 +253,18 @@ func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
 	}
 	server.resolveLock.Unlock()
 
+	if manager := sourceaccess.FromContext(server.ctx); manager != nil {
+		sm := server.GetFeature(stats.ManagerType()).(stats.Manager)
+		revision, err := sm.RegisterCounter(sourceaccess.RevisionStat)
+		if err != nil {
+			return true, err
+		}
+		healthy, err := sm.RegisterCounter(sourceaccess.HealthyStat)
+		if err != nil {
+			return true, err
+		}
+		manager.SetCounters(revision, healthy)
+	}
 	if err := addInboundHandlers(server, config.Inbound); err != nil {
 		return true, err
 	}

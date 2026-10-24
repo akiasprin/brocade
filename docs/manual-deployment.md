@@ -221,7 +221,7 @@ sudo systemctl reload nginx
 
 ```sh
 sudo install -d -o postgres -g postgres -m 0700 /var/backups/brocade
-sudo -u postgres pg_dump --format=custom \
+sudo -u postgres pg_dump --format=custom --compress=6 \
   --file=/var/backups/brocade/before-upgrade.dump brocade
 sha256sum /opt/brocade/brocade-console
 ```

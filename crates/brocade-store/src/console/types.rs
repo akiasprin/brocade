@@ -329,6 +329,10 @@ pub struct UserListItem {
     pub status: String,
     pub account_type: UserAccountType,
     pub traffic_accounting_mode: UserTrafficAccountingMode,
+    pub traffic_reset_day: u8,
+    pub service_starts_at: Option<String>,
+    pub service_expires_at: Option<String>,
+    pub service_state: crate::UserServiceState,
     pub login_enabled: bool,
     pub direct_login_enabled: bool,
     pub created_at: String,
@@ -421,11 +425,12 @@ pub struct ClashSubscriptionUsage {
     pub total_bytes: Option<u64>,
     pub remaining_bytes: Option<u64>,
     pub reset_at: String,
+    pub expires_at: Option<String>,
     pub has_gap: bool,
 }
 
-// Per user × view traffic quotas. Calendar months, reset at the start of each.
-// The granularity matches usage's monthly rollup grouping key, one quota row per consumption
+// Per user × view traffic quotas. All views share the user's configured billing cycle.
+// The granularity matches usage's user/view rollup grouping key, one quota row per consumption
 // row.
 //
 // It stamps no revision: quotas affect no artifact, and changing one alters not a byte of what
@@ -585,6 +590,8 @@ pub struct UpsertExternalOutboundRequest {
     pub port: u16,
     pub protocol: ExternalOutboundProtocol,
     pub security: ExternalOutboundSecurity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_strategy: Option<DomainStrategy>,
     #[serde(default)]
     pub note: Option<String>,
 }

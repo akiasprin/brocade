@@ -4,6 +4,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { NodeAgentStateItem, NodeTrafficItem, NodeTrafficView, UsageNodeSeries } from '../src/api';
 
 let exactBytes: typeof import('../src/panes/nodes').exactBytes;
+let NicMonthTotal: typeof import('../src/panes/nodes').NicMonthTotal;
 let trafficCalibrationBytes: typeof import('../src/panes/nodes').trafficCalibrationBytes;
 let TrafficAccountingCard: typeof import('../src/panes/nodes').TrafficAccountingCard;
 let usageRoleTimeline: typeof import('../src/panes/nodes').usageRoleTimeline;
@@ -17,7 +18,7 @@ beforeAll(async () => {
       removeEventListener: vi.fn(),
     })),
   );
-  ({ exactBytes, trafficCalibrationBytes, TrafficAccountingCard, usageRoleTimeline } =
+  ({ exactBytes, NicMonthTotal, trafficCalibrationBytes, TrafficAccountingCard, usageRoleTimeline } =
     await import('../src/panes/nodes'));
 });
 
@@ -53,7 +54,99 @@ const view: NodeTrafficView = {
   ],
 };
 
+describe('machine list traffic accounting label', () => {
+  it.each([
+    ['inbound_only', '单向入站', '单·12.00 GiB'],
+    ['outbound_only', '单向出站', '单·12.00 GiB'],
+    ['bidirectional_max', '双向取大', '单·12.00 GiB'],
+    ['bidirectional_sum', '双向合计', '12.00 GiB'],
+  ] as const)('shows the saved %s accounting mode beside its total', (accounting_mode, label, total) => {
+    const { container } = render(
+      <NicMonthTotal
+        traffic={{ ...view.nodes[0], accounting_mode, total_bytes: '12884901888' }}
+        pending={false}
+        retired={false}
+      />,
+    );
+
+    const summary = container.querySelector('.lst-sum');
+    expect(summary?.textContent).toBe(`${total}本月`);
+    expect(summary?.getAttribute('title')).toContain(`${label}\n`);
+    expect(summary?.getAttribute('title')).toContain('（UTC）');
+    expect(summary?.getAttribute('title')).toContain('造成采集缺口');
+  });
+
+  it('keeps an unreported total unknown and labels a calibrated zero as single-direction usage', () => {
+    const traffic: NodeTrafficItem = {
+      ...view.nodes[0],
+      accounting_mode: 'outbound_only',
+      total_bytes: '0',
+      tracking_started_at_unix_secs: null,
+      calibrated_at_unix_secs: null,
+    };
+    const { container, rerender } = render(<NicMonthTotal traffic={traffic} pending={false} retired={false} />);
+    expect(container.querySelector('.lst-sum')?.textContent).toBe('—本月');
+
+    rerender(
+      <NicMonthTotal
+        traffic={{ ...traffic, calibrated_at_unix_secs: view.nodes[0].period_start_unix_secs }}
+        pending={false}
+        retired={false}
+      />,
+    );
+    expect(container.querySelector('.lst-sum')?.textContent).toBe('单·0 B本月');
+  });
+});
+
 describe('node traffic accounting values', () => {
+  const start = Date.parse('2026-10-14T10:00:00Z') / 1000;
+  const usage = (buckets: UsageNodeSeries['buckets']): UsageNodeSeries => ({
+    node_id: 'n1',
+    month_user_uplink_bytes: 0,
+    month_user_downlink_bytes: 0,
+    month_relay_uplink_bytes: 0,
+    month_relay_downlink_bytes: 0,
+    month_has_gap: false,
+    buckets,
+  });
+  const bucket = (end: number, user = 30, relay = 15): UsageNodeSeries['buckets'][number] => ({
+    window_end: new Date(end * 1000).toISOString(),
+    user_uplink_bytes: user,
+    user_downlink_bytes: 0,
+    relay_uplink_bytes: relay,
+    relay_downlink_bytes: 0,
+  });
+
+  it('keeps the last reported rates and exact times while the next usage window is pending', () => {
+    const result = usageRoleTimeline(usage([bucket(start + 5), bucket(start + 35, 60, 30)]), start, start + 90);
+
+    expect(result.timesUnixSecs).toEqual([start + 5, start + 35]);
+    expect(result.user).toEqual([8, 16]);
+    expect(result.relay).toEqual([4, 8]);
+  });
+
+  it('breaks missing reports and preserves reported idle windows without filling the range', () => {
+    const result = usageRoleTimeline(
+      usage([bucket(start + 95, 0, 0), bucket(start + 5), bucket(start + 35)]),
+      start,
+      start + 150,
+    );
+
+    expect(result.timesUnixSecs).toEqual([start + 5, start + 35, start + 65, start + 95]);
+    expect(result.user).toEqual([8, 8, null, 0]);
+    expect(result.relay).toEqual([4, 4, null, 0]);
+  });
+
+  it('leaves absent, empty and out-of-range usage unmeasured', () => {
+    const invalid = { ...bucket(start), window_end: 'invalid' };
+    for (const source of [undefined, usage([]), usage([bucket(start - 1), bucket(start + 91), invalid])]) {
+      const result = usageRoleTimeline(source, start, start + 90);
+      expect(result.timesUnixSecs).toEqual([]);
+      expect(result.user).toEqual([]);
+      expect(result.relay).toEqual([]);
+    }
+  });
+
   it('uses real forwarding duration rather than the access 30-second cadence', () => {
     const source: UsageNodeSeries = {
       node_id: 'n1',

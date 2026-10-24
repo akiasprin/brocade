@@ -9,6 +9,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
@@ -23,22 +24,35 @@ import (
 )
 
 func init() {
-	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+	create := func(ctx context.Context, config *Config) (interface{}, error) {
+		if config == nil {
+			return nil, errors.New("missing forwarding config")
+		}
+		if inbound := session.InboundFromContext(ctx); inbound != nil && strings.HasPrefix(inbound.Tag, "fwd:") && config.ForwardingTargetPolicy == nil {
+			return nil, errors.New("user forwarding requires a target address policy; upgrade the Agent")
+		}
 		d := new(DokodemoDoor)
 		err := core.RequireFeatures(ctx, func(pm policy.Manager) error {
-			return d.Init(config.(*Config), pm, session.SockoptFromContext(ctx))
+			return d.Init(config, pm, session.SockoptFromContext(ctx))
 		})
 		return d, err
+	}
+	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		return create(ctx, config.(*Config))
+	}))
+	common.Must(common.RegisterConfig((*ForwardingConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		return create(ctx, config.(*ForwardingConfig).Config)
 	}))
 }
 
 type DokodemoDoor struct {
-	policyManager policy.Manager
-	config        *Config
-	address       net.Address
-	port          net.Port
-	portMap       map[string]string
-	sockopt       *session.Sockopt
+	policyManager       policy.Manager
+	config              *Config
+	address             net.Address
+	port                net.Port
+	portMap             map[string]string
+	forwardingTargetIPs geodata.IPMatcher
+	sockopt             *session.Sockopt
 }
 
 // Init initializes the DokodemoDoor instance with necessary parameters.
@@ -52,6 +66,19 @@ func (d *DokodemoDoor) Init(config *Config, pm policy.Manager, sockopt *session.
 	d.portMap = config.PortMap
 	d.policyManager = pm
 	d.sockopt = sockopt
+	if targetPolicy := config.ForwardingTargetPolicy; targetPolicy != nil {
+		if len(targetPolicy.BlockedCidrs) == 0 {
+			return errors.New("forwarding target policy must not be empty")
+		}
+		rules, err := geodata.ParseIPRules(targetPolicy.BlockedCidrs)
+		if err != nil {
+			return errors.New("invalid forwarding target policy").Base(err)
+		}
+		d.forwardingTargetIPs, err = geodata.IPReg.BuildIPMatcher(rules)
+		if err != nil {
+			return errors.New("cannot build forwarding target policy").Base(err)
+		}
+	}
 
 	return nil
 }
@@ -147,6 +174,15 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 	}
 
 	inbound := session.InboundFromContext(ctx)
+	if strings.HasPrefix(inbound.Tag, "fwd:") && d.forwardingTargetIPs == nil {
+		return errors.New("user forwarding has no target address policy")
+	}
+	inbound.ForwardingTargetIPMatcher = d.forwardingTargetIPs
+	if strings.HasPrefix(inbound.Tag, "fwd:") {
+		// User forwarding always exits through the dedicated direct outbound. Model routing
+		// must not move it into a proxy hop that loses the inbound's address policy.
+		ctx = session.SetForcedOutboundTagToContext(ctx, "out:forward")
+	}
 	inbound.Name = "dokodemo-door"
 	inbound.CanSpliceCopy.Store(spliceCopyState(conn))
 	inbound.User = &protocol.MemoryUser{

@@ -20,7 +20,7 @@ export function SiteUsageSettingsCard({ editable }: { editable: boolean }) {
       </div>
       <p className="settings-block-note">策略随节点轮询生效，无需发布或重启；统计结果仅管理员可见，不影响计费用量。</p>
       <p className="settings-block-note">
-        域名与目标明细保留 24 小时，不记录 URL
+        域名与目标明细默认保留 24 小时，可在“数据保留”中分别调整。不记录 URL
         或请求内容。容量满时优先淘汰已可靠保存的冷条目；缓冲满时标记受限。调整容量会重建采集窗口。
       </p>
       {!editable && <p className="settings-block-note">仅系统管理员可修改。</p>}

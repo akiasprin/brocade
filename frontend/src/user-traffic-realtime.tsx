@@ -42,10 +42,8 @@ const HISTORY_REFRESH_MILLIS = 30_000;
 /** 大人群列表只展开到与左侧读数栏大致齐平；手机上再缩短首屏。 */
 const CROWD_FOLD = 14;
 const CROWD_FOLD_NARROW = 8;
-/** 读数栏只列当前最忙的几条接入链，其余合为一行，读数栏不随链数变长。 */
-const CHAIN_FOLD = 5;
 const MORE_STEP = 60;
-/** 与协议 MAX_REALTIME_USER_TRAFFIC_ROWS 一致：一台机器一份报告最多这么多行。 */
+/** 与协议 MAX_REALTIME_USER_TRAFFIC_ROWS 一致，保留的用户行与每行来源身份均受此上限约束。 */
 const RETAINED_LIMIT = 2_048;
 const SPARK_HEIGHT = 30;
 const SCOPE_NOTE = '统计入口 Xray 的接入与转发；中继不提供最终用户身份';
@@ -176,7 +174,7 @@ export function aggregateUserTraffic(users: RealtimeUserTrafficRate[]): LiveTraf
   return [...grouped.values()];
 }
 
-/** 近 1 小时的窗口落在 30 秒格上（与机器详情 XRAY 流量同一对齐方式）。格内有窗口而没有字节是
+/** 旧版近 1 小时的窗口落在 30 秒格上。格内有窗口而没有字节是
  * 空闲，记 0；格内没有窗口是未采集，记 null。用户详情的合计跨机器相加，任一台采集到即算采集。 */
 function legacyHourModel(history: UserTrafficHistory): HourModel {
   const last = slotOf(history.range_end_unix_secs);
@@ -394,6 +392,13 @@ export function hourModel(history: UserTrafficHistory): HourModel {
   return { rangeStart, rangeEnd, slots, rows, totalDown, totalUp, peak };
 }
 
+/** 来源键持续保留，缺席项用零占位；是否能显示为零由报告完整性决定，名称继续由模型映射。 */
+function retainSources(previous: LiveTrafficRow['sources'], current: LiveTrafficRow['sources']) {
+  if (!previous) return current;
+  const keys = [...new Set([...Object.keys(current ?? {}), ...Object.keys(previous)])].slice(0, RETAINED_LIMIT);
+  return Object.fromEntries(keys.map(key => [key, current?.[key] ?? { down: 0, up: 0 }]));
+}
+
 /** 合并一份新报告。未就绪或未连接（null）的读数不覆盖最后一次有效数据；报告完整时，
  * 不在其中的已有行即为空闲。行数受协议上限约束，超出时先丢最久未活跃的。 */
 export function mergeRetained(
@@ -418,7 +423,7 @@ export function mergeRetained(
       ingresses: row.ingresses ?? before?.ingresses,
       forwardingDown: known ? row.forwardingDown : before?.forwardingDown,
       forwardingUp: known ? row.forwardingUp : before?.forwardingUp,
-      sources: known ? row.sources : before?.sources,
+      sources: known ? retainSources(before?.sources, row.sources) : before?.sources,
       lastActiveMs: active ? (row.measuredAt ?? at) : (before?.lastActiveMs ?? null),
     });
   }
@@ -435,7 +440,7 @@ export function mergeRetained(
               measuredAt: at,
               forwardingDown: row.forwardingDown === undefined ? undefined : 0,
               forwardingUp: row.forwardingUp === undefined ? undefined : 0,
-              sources: row.sources === undefined ? undefined : {},
+              sources: retainSources(row.sources, undefined),
             }
           : { ...row, current: false },
       );
@@ -764,18 +769,17 @@ function SourceName({ source }: { source: TrafficSource }) {
   );
 }
 
-/** 当前来源按接入链合并（同一条链的多个接入点合为一项），从大到小。 */
-function sourcesOf(row: CardRow, sourceOf: (key: string) => TrafficSource) {
+/** 当前来源按接入链合并，同一条链的多个接入点合为一项，已见过的零值来源仍保留。 */
+function sourcesOf(row: CardRow, sourceOf: (key: string) => TrafficSource, counted: boolean) {
   const merged = new Map<string, TrafficSource & { value: number }>();
   for (const [key, rate] of Object.entries(row.sources ?? {})) {
-    const value = rate.down + rate.up;
-    if (value <= 0) continue;
+    const value = counted ? rate.down + rate.up : 0;
     const source = sourceOf(key);
     const entry = merged.get(source.key) ?? { ...source, value: 0 };
     entry.value += value;
     merged.set(source.key, entry);
   }
-  return [...merged.values()].sort((a, b) => b.value - a.value || nameOrder.compare(a.name, b.name));
+  return [...merged.values()];
 }
 
 type TrafficTier = 'empty' | 'list' | 'crowd' | 'machines';
@@ -914,15 +918,14 @@ function TrafficCard({
   const chainRates = users
     ? [
         ...rows
-          .filter(row => showsLive && row.down !== null && counted(row))
-          .flatMap(row => sourcesOf(row, sourceOf))
+          .flatMap(row => sourcesOf(row, sourceOf, showsLive && row.down !== null && counted(row)))
           .reduce((merged, source) => {
             const entry = merged.get(source.key) ?? { ...source, value: 0 };
             entry.value += source.value;
             return merged.set(source.key, entry);
           }, new Map<string, TrafficSource & { value: number }>())
           .values(),
-      ].sort((a, b) => b.value - a.value || nameOrder.compare(a.name, b.name))
+      ].sort((a, b) => nameOrder.compare(a.name, b.name) || a.key.localeCompare(b.key))
     : [];
   const currentSum = totals.down + totals.up;
   const hero = observeBpsReadingParts(currentSum * 8);
@@ -1038,31 +1041,21 @@ function TrafficCard({
             <span className="rut-chains-none">{showsLive ? '没有正在传输的连接' : '—'}</span>
           ) : (
             <ol>
-              {chainRates.slice(0, CHAIN_FOLD).map(chain => (
-                <li key={chain.key} title={`${chain.name} · 占当前 ${shareOf(chain.value, currentSum)}`}>
+              {chainRates.map(chain => (
+                <li
+                  key={chain.key}
+                  title={
+                    showsLive && (chain.value > 0 || complete)
+                      ? `${chain.name} · 占当前 ${shareOf(chain.value, currentSum)}`
+                      : chain.name
+                  }
+                >
                   <SourceName source={chain} />
                   <b>
-                    <Rate value={chain.value} pair={chain.value} />
+                    <Rate value={showsLive && (chain.value > 0 || complete) ? chain.value : null} pair={chain.value} />
                   </b>
                 </li>
               ))}
-              {chainRates.length > CHAIN_FOLD && (
-                <li
-                  className="rest"
-                  title={chainRates
-                    .slice(CHAIN_FOLD)
-                    .map(chain => chain.name)
-                    .join('、')}
-                >
-                  <span>其余 {chainRates.length - CHAIN_FOLD} 条</span>
-                  <b>
-                    <Rate
-                      value={chainRates.slice(CHAIN_FOLD).reduce((sum, chain) => sum + chain.value, 0)}
-                      pair={chainRates.slice(CHAIN_FOLD).reduce((sum, chain) => sum + chain.value, 0)}
-                    />
-                  </b>
-                </li>
-              )}
             </ol>
           )}
         </section>

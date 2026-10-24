@@ -18,7 +18,6 @@ pub const TUNNEL_PROBE_RETENTION_DAYS: u32 = 7;
 pub const TUNNEL_PROBE_GLOBAL_CONCURRENCY: i64 = 30;
 pub const TUNNEL_PROBE_LEASE_SECS: i32 = 30;
 const MAX_DUE_PER_TICK: i64 = 32;
-const PRUNE_BATCH: i64 = 5_000;
 const SCHEDULER_ADVISORY_LOCK: i64 = 0x4252_4f43_5052_4f42;
 /// A sampled Serving run whose first byte takes longer than this degrades the tunnel.
 const SLOW_TTFB_MS: u32 = 300;
@@ -1782,19 +1781,7 @@ pub async fn prune(pool: &PgPool, retain_days: u32) -> Result<u64> {
 }
 
 pub(crate) async fn prune_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
-    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
-    Ok(sqlx::query(
-        "DELETE FROM external_outbound_probe_runs WHERE id IN (
-             SELECT id FROM external_outbound_probe_runs
-              WHERE finished_at < now() - make_interval(secs => $1::double precision)
-              ORDER BY finished_at LIMIT $2
-         )",
-    )
-    .bind(retain_secs)
-    .bind(PRUNE_BATCH)
-    .execute(pool)
-    .await?
-    .rows_affected())
+    crate::retention::cleanup::prune_batch(pool, "external_outbound_probe_runs", retain_hours).await
 }
 
 #[cfg(test)]

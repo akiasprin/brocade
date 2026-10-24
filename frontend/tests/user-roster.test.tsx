@@ -1,10 +1,18 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AdminRole, ConsoleSnapshot, SnapshotIngress, UserListItem, UserPresenceList } from '../src/api';
+import type {
+  AdminRole,
+  ConsoleSnapshot,
+  SnapshotIngress,
+  SourceAccessView,
+  UserListItem,
+  UserPresenceList,
+} from '../src/api';
 import { draft } from '../src/draft';
 import * as route from '../src/forge/route';
 import { quotaStage, sessionDurationText, UsersPane } from '../src/panes/users';
+import { userTrafficPolicyKey } from '../src/panes/user-traffic-policy';
 import { SessionProvider } from '../src/session';
 import { Icon } from '../src/ui/icons';
 import type { Win } from '../src/wm/store';
@@ -95,9 +103,22 @@ beforeEach(() => {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/source-access')) return Response.json({ revision: 0, ips: [], nodes: [] });
       if (String(input) === '/grant-probes/capability') {
         return Response.json({ available: false, reason: '测试中不发起拨测' });
       }
+      if (String(input).endsWith('/traffic-policy'))
+        return Response.json(
+          ['access', 'forwarding'].map(kind => ({
+            kind,
+            app_id: kind === 'access' ? 'tokyo' : null,
+            policy: null,
+            used_bytes: '0',
+            exhausted: false,
+            service_available: true,
+            unsupported_nodes: [],
+          })),
+        );
       if (isForwardingRead(String(input))) return Response.json(forwardingEmpty(String(input)));
       if (isSubscriptionRead(String(input))) return Response.json(subscription);
       if (String(input).endsWith('/realtime/snapshot')) return Response.json({ policy: { enabled: true }, nodes: [] });
@@ -168,6 +189,8 @@ const backgroundReadsOnly = () =>
     .mocked(fetch)
     .mock.calls.every(
       ([input]) =>
+        String(input).endsWith('/source-access') ||
+        String(input).endsWith('/traffic-policy') ||
         String(input).endsWith('/presence-history') ||
         String(input).endsWith('/realtime/snapshot') ||
         String(input).endsWith('/realtime/history') ||
@@ -219,7 +242,13 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function mount(role: AdminRole = 'system-admin', operatorId = role === 'user' ? 'alice' : 'operator') {
+function mount(
+  role: AdminRole = 'system-admin',
+  operatorId = role === 'user' ? 'alice' : 'operator',
+  masked = role === 'user',
+  seedPolicies = true,
+  seedCycle = true,
+) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
   clients.push(client);
   client.setQueryData(['snapshot'], snapshot);
@@ -278,6 +307,7 @@ function mount(role: AdminRole = 'system-admin', operatorId = role === 'user' ? 
   });
   // 模拟旧版本留下的自助在线来源缓存；普通用户也不能因缓存命中而看到来源 IP。
   client.setQueryData(['user-presence', 'user'], client.getQueryData(['user-presence', 'system-admin']));
+  client.setQueryData(['user-presence', 'readonly'], client.getQueryData(['user-presence', 'system-admin']));
   if (role === 'user') client.setQueryData(['me-user'], person('alice'));
   client.setQueryData(['tenants'], { tenants: [{ id: tenant, name: '默认' }] });
   client.setQueryData(['quotas'], {
@@ -300,7 +330,29 @@ function mount(role: AdminRole = 'system-admin', operatorId = role === 'user' ? 
       },
     ],
   });
-  client.setQueryData(['usage-monthly'], { views: [usage('alice', 54.1), usage('dave', 50.41), usage('erin', 12.3)] });
+  const limits = new Map([
+    ['alice', 100],
+    ['dave', 50],
+  ]);
+  for (const user of seedPolicies ? users : [])
+    client.setQueryData(
+      userTrafficPolicyKey(user),
+      ['access', 'forwarding'].map(kind => ({
+        kind,
+        app_id: kind === 'access' ? 'tokyo' : null,
+        policy:
+          kind === 'access' && limits.has(user.id)
+            ? { quota_bytes: String(limits.get(user.id)! * GiB), exhausted_action: { kind: 'suspend' } }
+            : null,
+        used_bytes: '0',
+        exhausted: user.id === 'dave',
+        service_available: true,
+        unsupported_nodes: [],
+        pending_nodes: [],
+      })),
+    );
+  if (seedCycle)
+    client.setQueryData(['user-cycles'], { views: [usage('alice', 54.1), usage('dave', 50.41), usage('erin', 12.3)] });
   const content = (selectedWin: Win) => (
     <QueryClientProvider client={client}>
       <SessionProvider
@@ -311,7 +363,7 @@ function mount(role: AdminRole = 'system-admin', operatorId = role === 'user' ? 
             tenant_scope: null,
             token_prefix: null,
             self_user: role === 'user' ? { tenant_id: tenant, user_id: 'alice' } : undefined,
-            masked_assets: role === 'user',
+            masked_assets: masked,
           },
           initial: { node_count: 0, chain_group_count: [] },
         }}
@@ -333,6 +385,30 @@ function mount(role: AdminRole = 'system-admin', operatorId = role === 'user' ? 
 }
 
 describe('user roster rows', () => {
+  it('保留账期编辑输入并在原位展示后台名册刷新错误', async () => {
+    const { view, client } = mount();
+    const terms = view.getByRole('button', { name: /^重置日/ });
+    expect(terms.closest('.user-usage-ledger')).toBeTruthy();
+    fireEvent.click(terms);
+    const input = within(view.getByRole('dialog')).getByLabelText('每月流量重置日') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '15' } });
+    const original = fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: RequestInfo | URL, init?: RequestInit) =>
+        String(url).startsWith('/users?')
+          ? Promise.resolve(Response.json({ error: '名册读取失败' }, { status: 503 }))
+          : original(url, init),
+      ),
+    );
+    await act(async () => {
+      await client.refetchQueries({ queryKey: ['users'], exact: true });
+    });
+    expect(await view.findByText('名册读取失败')).toBeTruthy();
+    expect(view.getByRole('dialog')).toBeTruthy();
+    expect(input.value).toBe('15');
+    expect(view.getByRole('button', { name: '重新读取用户状态' })).toBeTruthy();
+  });
   it('shows single/double accounting and recalculates billed monthly usage without changing raw directions', async () => {
     const originalFetch = fetch;
     const profileWrites: unknown[] = [];
@@ -368,7 +444,7 @@ describe('user roster rows', () => {
     expect(help.getAttribute('aria-expanded')).toBe('true');
     expect(within(description).getByText(doubleDescription)).toBeTruthy();
     expect(
-      within(card).getByText('切换后将按新口径重算本月用量，可能立即暂停或恢复受额度控制的接入线路或转发入口。'),
+      within(card).getByText('切换后将按新口径重算本期用量，可能立即暂停或恢复受额度控制的接入线路或转发入口。'),
     ).toBeTruthy();
     const accountingControl = view.getByRole('group', { name: '用户流量计量口径' });
     expect(card.querySelector(':scope > header button')).toBeNull();
@@ -378,7 +454,7 @@ describe('user roster rows', () => {
     expect(description.hidden).toBe(true);
     fireEvent.click(within(accountingControl).getByRole('button', { name: '双向' }));
     const confirmation = view.getByRole('dialog', { name: '切换为双向计量' });
-    expect(within(confirmation).getByText(/本月的接入与转发用量将按新口径重新核算/)).toBeTruthy();
+    expect(within(confirmation).getByText(/本期的接入与转发用量将按新口径重新核算/)).toBeTruthy();
     expect(within(confirmation).getByText(/重算后若额度耗尽，相关线路或转发入口将自动暂停/)).toBeTruthy();
     expect(profileWrites).toEqual([]);
     expect(within(accountingControl).getByRole('button', { name: '单向', pressed: true })).toBeTruthy();
@@ -389,16 +465,44 @@ describe('user roster rows', () => {
     expect(nativeConfirm).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(view.queryByRole('dialog', { name: '切换为双向计量' })).toBeNull());
     expect(await within(card).findByText(doubleDescription)).toBeTruthy();
-    expect(view.container.querySelector('.user-monthly-badge')?.textContent).toBe('108.20 GiB');
+    expect(card.querySelector('.user-usage-hero-value')?.textContent).toBe('108.20 GiB');
     fireEvent.click(view.getByRole('tab', { name: '转发' }));
     const forwardingCard = view.container.querySelector<HTMLElement>('.user-forwarding-usage')!;
-    const forwardingAccounting = within(forwardingCard).getByRole('group', { name: '用户流量计量口径' });
+    const forwardingAccounting = await within(forwardingCard).findByRole('group', { name: '用户流量计量口径' });
     expect(forwardingAccounting.closest('.fwd-ledger')).toBeTruthy();
     expect(within(forwardingAccounting).getByRole('button', { name: '双向', pressed: true })).toBeTruthy();
     expect(within(forwardingCard).getByText(doubleDescription).parentElement?.hidden).toBe(true);
     fireEvent.click(within(forwardingAccounting).getByRole('button', { name: '单向' }));
     const singleConfirmation = view.getByRole('dialog', { name: '切换为单向计量' });
     expect(within(singleConfirmation).getByText(/因额度耗尽而暂停的线路或转发入口将自动恢复/)).toBeTruthy();
+  });
+
+  it.each([
+    ['接入', '.user-usage-ledger'],
+    ['转发', '.fwd-ledger'],
+  ])('在%s读数栏的计量口径之后显示账期与有效期，并从这里打开编辑', async (tab, ledger) => {
+    const { view } = mount();
+    fireEvent.click(view.getByRole('tab', { name: tab }));
+    const control = await view.findByRole('group', { name: '用户流量计量口径' });
+    const terms = view.getByRole('button', { name: /^重置日/ });
+    expect(terms.closest(ledger)).toBe(control.closest(ledger));
+    const accounting = control.closest('.user-usage-accounting')!;
+    expect(accounting.nextElementSibling?.classList.contains('user-usage-accounting-note')).toBe(true);
+    expect(accounting.nextElementSibling?.nextElementSibling).toBe(terms);
+    expect(terms.textContent).toBe('重置日每月 1 日有效期长期有效');
+    fireEvent.click(terms);
+    expect(view.getByRole('dialog', { name: 'alice 的账期与有效期' })).toBeTruthy();
+    expect(terms.getAttribute('aria-expanded')).toBe('true');
+  });
+
+  it('只读身份的两个读数栏只显示账期与有效期', async () => {
+    const { view } = mount('readonly');
+    for (const tab of ['接入', '转发']) {
+      fireEvent.click(view.getByRole('tab', { name: tab }));
+      await view.findByRole('group', { name: '用户流量计量口径' });
+      expect(view.queryByRole('button', { name: /^重置日/ })).toBeNull();
+    }
+    expect(view.container.querySelectorAll('dl.user-service-terms')).toHaveLength(2);
   });
 
   it.each(['接入', '转发'])('cancels accounting changes from %s without saving and restores focus', async tab => {
@@ -475,8 +579,10 @@ describe('user roster rows', () => {
     expect(view.getAllByRole('tab').map(tab => tab.textContent)).toEqual(['接入', '转发', '统计']);
     expect(view.getByRole('tab', { name: '转发' }).querySelector('svg')?.innerHTML).toBe(expected);
     const titles = () =>
-      [...view.getByRole('tabpanel').querySelectorAll(':scope > .panel > header h4')].map(title => title.textContent);
-    // 订阅与节点（含网络拨测）回到标题栏按钮打开的弹窗，不占「接入」页签的位置。
+      [...view.getByRole('tabpanel').querySelectorAll(':scope > .panel > :is(header, summary) h4')].map(
+        title => title.textContent,
+      );
+    // 订阅与节点（含网络拨测）回到标题栏按钮打开的弹窗，不占「接入」页签的位置；来源封禁并入在线设备。
     expect(titles()).toEqual(['用量与额度', '在线设备', '接入授权']);
     fireEvent.click(view.getByRole('tab', { name: '转发' }));
     expect(titles()).toEqual(['用量与额度', '转发入口']);
@@ -518,7 +624,7 @@ describe('user roster rows', () => {
     expect((reviewer.view.getByRole('button', { name: '订阅' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it('keeps the detail header to identity, one status line and the two common entries', async () => {
+  it('keeps availability and a compact UUID in the header while usage stays in the ledger', async () => {
     const uuid = '1ec1d194-83bd-4fee-9da2-2898771b2eaa';
     const { view, selectUser, client } = mount();
     await seedUsers(
@@ -536,25 +642,71 @@ describe('user roster rows', () => {
         button => button.getAttribute('aria-label') ?? button.textContent,
       ),
     ).toEqual(['节点', '订阅', '更多操作']);
-    // 状态交给头像灯，名称旁只显示「用量图标 + 数值」；第二行直接显示完整 UUID。
-    const status = header().querySelector('.dsub')!;
-    const usageBadge = header().querySelector('.user-monthly-badge')!;
-    expect(usageBadge.textContent).toBe('54.10 GiB');
-    expect(usageBadge.querySelector('.ui-icon')).toBeTruthy();
-    expect([...status.children].map(child => child.textContent)).toEqual([uuid]);
-    expect(status.textContent).not.toContain('可用');
-    expect(status.textContent).not.toContain('本月');
-    expect(status.textContent).not.toContain('接入点');
-    expect(status.querySelector('.user-summary-uuid')?.textContent).toBe(uuid);
+    const status = within(header()).getByRole('status', { name: /可用/ });
+    expect(status.textContent).toBe('可用');
+    expect(status.getAttribute('title')).toContain('个接入点');
+    const copy = within(header()).getByRole('button', { name: '复制完整 UUID' });
+    expect(copy.textContent).toBe('UUID1ec1d194…2eaa');
+    expect(within(copy).getByTitle(uuid)).toBeTruthy();
+    expect(header().textContent).not.toContain('54.10 GiB');
+    expect(view.getByRole('region', { name: '本期接入' }).querySelector('.user-usage-hero-value')?.textContent).toBe(
+      '54.10 GiB',
+    );
     expect(header().querySelector('.dstat, .user-duuid, .segsw')).toBeNull();
     expect(within(header()).queryByText('修改密码')).toBeNull();
 
     act(() => selectUser('carol'));
     expect(within(header()).getByText('测试').classList.contains('test')).toBe(true);
-    expect(header().querySelector('.dsub > .bad')).toBeNull();
+    expect(within(header()).getByRole('status').textContent).toBe('未授权');
     act(() => selectUser('erin'));
-    // 已停用等详细原因留在状态灯，不再挤进 UUID 行。
-    expect(header().querySelector('.node-lamp.bad')?.getAttribute('aria-label')).toContain('已停用');
+    expect(within(header()).getByRole('status', { name: /已停用/ }).textContent).toBe('已停用');
+  });
+
+  it('copies the full UUID and resets feedback when selecting another user', async () => {
+    const writeText = vi.fn(async () => undefined);
+    vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
+    const aliceUuid = '00000000-0000-4000-8000-000000000001';
+    const carolUuid = '00000000-0000-4000-8000-000000000002';
+    const { view, client, selectUser } = mount();
+    await seedUsers(
+      client,
+      users.map(user => ({ ...user, uuid: user.id === 'alice' ? aliceUuid : carolUuid })),
+    );
+    const header = () => within(view.container.querySelector<HTMLElement>('.user-dhead-main')!);
+    await act(async () => fireEvent.click(header().getByRole('button', { name: '复制完整 UUID' })));
+    expect(writeText).toHaveBeenLastCalledWith(aliceUuid);
+    expect(header().getByRole('button', { name: 'UUID 已复制' })).toBeTruthy();
+    act(() => selectUser('carol'));
+    const copy = header().getByRole('button', { name: '复制完整 UUID' });
+    expect(copy.textContent).toContain('00000000…0002');
+    await act(async () => fireEvent.click(copy));
+    expect(writeText).toHaveBeenLastCalledWith(carolUuid);
+  });
+
+  it('shows a missing UUID without offering a copy action', async () => {
+    const { view, client } = mount();
+    await seedUsers(
+      client,
+      users.map(user => ({ ...user, uuid: undefined })),
+    );
+    const header = within(view.container.querySelector<HTMLElement>('.user-dhead-main')!);
+    expect(header.getByText('UUID —')).toBeTruthy();
+    expect(header.queryByRole('button', { name: '复制完整 UUID' })).toBeNull();
+  });
+
+  it.each([
+    ['pending', '未生效'],
+    ['expired', '已到期'],
+  ] as const)('keeps %s service status distinct from available access', async (serviceState, label) => {
+    const { view, client } = mount();
+    await seedUsers(
+      client,
+      users.map(user => (user.id === 'alice' ? { ...user, service_state: serviceState } : user)),
+    );
+    const header = within(view.container.querySelector<HTMLElement>('.user-dhead-main')!);
+    const status = header.getByRole('status', { name: /无法连接/ });
+    expect(status.textContent).toBe(label);
+    expect(status.getAttribute('data-tone')).toBe('bad');
   });
 
   it('collects UUID, account type, password and lifecycle actions in the more menu', async () => {
@@ -711,7 +863,7 @@ describe('user roster rows', () => {
   it('counts forwarding in user totals but does not apply it to line quotas', async () => {
     const { view, row, selectUser, client } = mount();
     await act(async () => {
-      client.setQueryData(['usage-monthly'], {
+      client.setQueryData(['user-cycles'], {
         views: [usage('alice', 1)],
         forwarding: [
           {
@@ -730,12 +882,12 @@ describe('user roster rows', () => {
     });
     expect(row('alice').querySelector('.user-row-usage')?.textContent).toContain('3');
     expect(row('alice').querySelector('.user-row-quota')?.textContent).toContain('余裕');
-    const access = view.getByRole('region', { name: '本月接入' });
+    const access = view.getByRole('region', { name: '本期接入' });
     expect(access.querySelector('.user-usage-hero-value')?.textContent).toBe('1.00 GiB');
     expect(view.getByRole('list', { name: '各线路的用量与额度' }).textContent).not.toContain('Web');
     fireEvent.click(view.getByRole('tab', { name: '转发' }));
     expect(view.getByRole('tabpanel', { name: '转发' })).toBeTruthy();
-    expect(view.queryByRole('region', { name: '本月接入' })).toBeNull();
+    expect(view.queryByRole('region', { name: '本期接入' })).toBeNull();
   });
   it('lets public visitors read forwarding while keeping statistics and write actions closed', async () => {
     const { view, selectUser } = mount('readonly', 'public');
@@ -765,7 +917,10 @@ describe('user roster rows', () => {
     [50, '余裕'],
     [74.99, '余裕'],
     [75, '余裕'],
-    [94.99, '余裕'],
+    [79.99, '余裕'],
+    [80, '80%'],
+    [80.01, '80%'],
+    [94.99, '95%'],
     [95, '95%'],
     [99.99, '100%'],
     [100.82, '101%'],
@@ -786,20 +941,20 @@ describe('user roster rows', () => {
 
   it('switches details immediately while preserving the roster and isolating per-user editors', () => {
     const { view, selectUser } = mount();
-    const quotaInput = () => view.queryByRole('textbox', { name: '东京 的月度额度（GiB）' }) as HTMLInputElement | null;
+    const quotaInput = () => view.queryByRole('textbox', { name: '本期流量额度（GiB）' }) as HTMLInputElement | null;
     const roster = view.getByRole('listbox', { name: '用户列表' });
     const aliceDetail = view.container.querySelector('.user-split-detail');
-    fireEvent.click(view.getByRole('button', { name: '改额度' }));
+    fireEvent.click(view.getByRole('button', { name: '东京 · 额度与超额处理' }));
     expect(quotaInput()?.value).toBe('100');
 
     selectUser('dave');
     const daveDetail = view.container.querySelector('.user-split-detail');
     expect(view.getByRole('listbox', { name: '用户列表' })).toBe(roster);
-    expect(daveDetail).not.toBe(aliceDetail);
+    expect(daveDetail).toBe(aliceDetail);
     expect(daveDetail?.querySelector('.dname > b')?.textContent).toBe('dave');
     expect(quotaInput()).toBeNull();
     expect(view.queryByText('加载中…')).toBeNull();
-    fireEvent.click(view.getByRole('button', { name: '改额度' }));
+    fireEvent.click(view.getByRole('button', { name: '东京 · 额度与超额处理' }));
     expect(quotaInput()?.value).toBe('50');
 
     selectUser('alice');
@@ -808,15 +963,30 @@ describe('user roster rows', () => {
     expect(quotaInput()).toBeNull();
   });
 
-  it('preserves an unsaved quota edit when switching tabs', () => {
+  it('opens quota handling from the app row without an access total editor', () => {
     const { view } = mount();
-    fireEvent.click(view.getByRole('button', { name: '改额度' }));
-    const input = view.getByRole('textbox', { name: '东京 的月度额度（GiB）' }) as HTMLInputElement;
+    const control = view.getByRole('button', { name: '东京 · 额度与超额处理' });
+    expect(control.closest('.qta-r')?.textContent).toContain('东京');
+    expect(view.queryByRole('button', { name: '设置接入总额度' })).toBeNull();
+    fireEvent.click(control);
+    const dialog = view.getByRole('form', { name: '东京 · 额度与超额处理' });
+    expect(dialog.closest('.qta-r')).toBeTruthy();
+    expect(view.queryByRole('dialog')).toBeNull();
+    const input = within(dialog).getByRole('textbox', { name: '本期流量额度（GiB）' }) as HTMLInputElement;
+    expect(input.value).toBe('100');
+    fireEvent.change(input, { target: { value: '120' } });
+    expect(input.value).toBe('120');
+  });
+
+  it('preserves the inline quota draft while switching detail tabs', () => {
+    const { view } = mount();
+    fireEvent.click(view.getByRole('button', { name: '东京 · 额度与超额处理' }));
+    const input = view.getByRole('textbox', { name: '本期流量额度（GiB）' }) as HTMLInputElement;
     fireEvent.change(input, { target: { value: '120' } });
     fireEvent.click(view.getByRole('tab', { name: '转发' }));
-    expect(view.queryByRole('textbox', { name: '东京 的月度额度（GiB）' })).toBeNull();
+    expect(view.queryByRole('textbox', { name: '本期流量额度（GiB）' })).toBeNull();
     fireEvent.click(view.getByRole('tab', { name: '接入' }));
-    expect(view.getByRole('textbox', { name: '东京 的月度额度（GiB）' })).toBe(input);
+    expect(view.getByRole('textbox', { name: '本期流量额度（GiB）' })).toBe(input);
     expect(input.value).toBe('120');
   });
 
@@ -841,7 +1011,7 @@ describe('user roster rows', () => {
     expect(tokyo.querySelector('.qta-app > :last-child')?.classList.contains('qta-flags')).toBe(true);
     expect(tokyo.querySelector('.qta-sub')?.textContent).toBe('东京 IIJ');
     expect(tokyo.querySelector('.qta-figs')?.textContent).toBe('54.10GiB/ 100 GiB');
-    expect(tokyo.querySelector('.qta-left')?.textContent).toBe('剩余45.90 GiB');
+    expect(tokyo.querySelector('.qta-left-value')?.textContent).toBe('剩余45.90 GiB');
     expect(card().querySelector('.user-dcard-foot')).toBeNull();
 
     // dave 用尽额度：执行器撤销的接入点不在 grants 里，只能从额度记录读出。
@@ -850,9 +1020,9 @@ describe('user roster rows', () => {
     expect(daveRoute.classList.contains('over')).toBe(true);
     expect(daveRoute.querySelector('.qta-sub.stop')?.textContent).toBe('系统已停用 1 个接入点');
     expect(daveRoute.querySelector('.qta-sub.stop')?.getAttribute('title')).toBe(
-      '东京 IIJ 已被系统停用；补足额度或月初重置后自动恢复',
+      '东京 IIJ 已被系统停用；补足额度或账期重置后自动恢复',
     );
-    expect(daveRoute.querySelector('.qta-left')?.textContent).toBe('超出419.8 MiB');
+    expect(daveRoute.querySelector('.qta-left-value')?.textContent).toBe('超出419.8 MiB');
     expect(daveRoute.querySelector('.qta-pct')?.textContent).toBe('101%');
   });
 
@@ -1026,6 +1196,7 @@ describe('user roster rows', () => {
     expect(view.queryByText('1.1.1.1')).toBeNull();
     expect(view.container.querySelector('.user-presence-card')).toBeNull();
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/presence'))).toBe(false);
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).endsWith('/source-access'))).toBe(false);
   });
 
   it('shows local source location and chain names with working chain navigation', async () => {
@@ -1053,7 +1224,7 @@ describe('user roster rows', () => {
     fireEvent.click(within(card).getByRole('button', { name: '收起 1 条接入链详情' }));
     expect(within(card).queryByLabelText(/^在线时长 /)).toBeNull();
     expect(within(card).getByLabelText('本次会话流量 3 KiB')).toBeTruthy();
-    expect(view.container.querySelector('.user-dhead .node-lamp')?.getAttribute('aria-label')).toContain('可用');
+    expect(view.container.querySelector('.user-account-state')?.getAttribute('aria-label')).toContain('可用');
     expect(view.container.querySelector('.user-dhead .dsub')?.textContent).not.toContain('接入点');
     expect(backgroundReadsOnly()).toBe(true);
   });
@@ -1507,5 +1678,464 @@ describe('user roster rows', () => {
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/machine-usage'))).toBe(false);
     expect(view.queryByRole('region', { name: '其他站点 Top N' })).toBeNull();
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/other-domains'))).toBe(false);
+  });
+});
+
+describe('traffic policy access', () => {
+  it('falls back to public access without forbidden requests when a user leaves their forwarding tab', async () => {
+    const { view, selectUser, row } = mount('user', 'alice');
+    fireEvent.click(view.getByRole('tab', { name: '转发' }));
+    await view.findByRole('searchbox', { name: '搜索规则' });
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input) === `/users/${tenant}/alice/forwarding`)).toBe(
+      true,
+    );
+    fireEvent.focus(row('dave'));
+    await act(async () => selectUser('dave'));
+    expect(view.queryByRole('tab', { name: '转发' })).toBeNull();
+    expect(view.container.querySelector('.user-forwarding-usage')).toBeNull();
+    expect(view.container.querySelector('.dname > b')?.textContent).toBe('dave');
+    expect(view.getByRole('tabpanel').getAttribute('aria-label')).toBe('接入');
+    expect(
+      vi.mocked(fetch).mock.calls.some(([input]) => /\/dave\/(forwarding|traffic-policy)$/.test(String(input))),
+    ).toBe(false);
+    expect(view.queryByText('当前账号不能查看这项内容')).toBeNull();
+    await act(async () => selectUser('alice'));
+    expect(view.getByRole('tab', { name: '转发', selected: true })).toBeTruthy();
+    await view.findByRole('searchbox', { name: '搜索规则' });
+  });
+
+  it('prefetches on focus and replaces complete details without a loading frame', async () => {
+    let finish!: (value: Response) => void;
+    const response = new Promise<Response>(resolve => {
+      finish = resolve;
+    });
+    const original = fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) =>
+        String(input) === `/users/${tenant}/dave/traffic-policy` ? response : original(input, init),
+      ),
+    );
+    const { view, client, selectUser, row } = mount();
+    const roster = view.getByRole('listbox', { name: '用户列表' });
+    const detail = view.container.querySelector('.user-split-detail');
+    const header = detail!.querySelector('.user-dhead');
+    const tabs = detail!.querySelector('.user-detail-tabs');
+    const card = detail!.querySelector('.user-usage-card');
+    const body = card!.querySelector('.user-usage');
+    const previousContent = body!.textContent;
+    client.removeQueries({ queryKey: userTrafficPolicyKey(person('dave')), exact: true });
+    fireEvent.focus(row('dave'));
+    await vi.waitFor(() =>
+      expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).endsWith('/dave/traffic-policy'))).toBe(true),
+    );
+    expect(detail!.querySelector('.dname')?.textContent).toContain('alice');
+    selectUser('dave');
+    expect(view.getByRole('listbox', { name: '用户列表' })).toBe(roster);
+    expect(view.container.querySelector('.user-split-detail')).toBe(detail);
+    expect(detail!.querySelector('.user-dhead')).toBe(header);
+    expect(detail!.querySelector('.user-detail-tabs')).toBe(tabs);
+    expect(detail!.querySelector('.user-usage-card')).toBe(card);
+    expect(card!.querySelector('.user-usage')).toBe(body);
+    expect(detail!.querySelector('.dname')?.textContent).toContain('alice');
+    expect(body!.textContent).toBe(previousContent);
+    expect(body!.hasAttribute('aria-busy')).toBe(false);
+    expect(detail!.hasAttribute('inert')).toBe(true);
+    expect(view.queryByRole('status', { name: '读取用量与额度…' })).toBeNull();
+    expect(body!.querySelectorAll('.qta-r')).toHaveLength(1);
+    expect(
+      vi.mocked(fetch).mock.calls.filter(([input]) => String(input).endsWith('/dave/traffic-policy')),
+    ).toHaveLength(1);
+    await act(async () =>
+      finish(
+        Response.json([
+          {
+            kind: 'access',
+            app_id: 'tokyo',
+            policy: { quota_bytes: String(50 * GiB), exhausted_action: { kind: 'suspend' } },
+            used_bytes: String(50.41 * GiB),
+            exhausted: true,
+            service_available: true,
+            unsupported_nodes: [],
+          },
+        ]),
+      ),
+    );
+    await view.findByText('已停用', { selector: '.qta-policy-flag' });
+    expect(detail!.querySelector('.dname')?.textContent).toContain('dave');
+    expect(view.getByRole('listbox', { name: '用户列表' })).toBe(roster);
+    expect(view.container.querySelector('.user-split-detail')).toBe(detail);
+    expect(card!.querySelector('.user-usage')).toBe(body);
+    expect(body!.hasAttribute('aria-busy')).toBe(false);
+    expect(detail!.hasAttribute('inert')).toBe(false);
+  });
+
+  it('settles a failed selection with its own error instead of retaining the previous user forever', async () => {
+    const original = fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) =>
+        String(input).endsWith('/dave/traffic-policy')
+          ? Promise.resolve(Response.json({ error: '目标用户策略暂不可用' }, { status: 503 }))
+          : original(input, init),
+      ),
+    );
+    const { view, client, selectUser } = mount();
+    client.removeQueries({ queryKey: userTrafficPolicyKey(person('dave')), exact: true });
+    selectUser('dave');
+    const detail = view.container.querySelector('.user-split-detail')!;
+    expect(detail.querySelector('.dname')?.textContent).toContain('alice');
+    await view.findByText(/目标用户策略暂不可用/);
+    expect(detail.querySelector('.dname')?.textContent).toContain('dave');
+    expect(detail.hasAttribute('inert')).toBe(false);
+    expect(detail.querySelector('.user-usage-loading')).toBeNull();
+  });
+
+  it('does not request unopened tabs, including after switching to another user', async () => {
+    const { view, selectUser } = mount();
+    const reads = () => vi.mocked(fetch).mock.calls.map(([input]) => String(input));
+    const unvisitedRead = (path: string) =>
+      isForwardingRead(path) || /\/(site-usage|other-domains|sniffing-failed-targets|machine-usage)\?/.test(path);
+    await act(async () => {});
+    expect(reads().some(unvisitedRead)).toBe(false);
+    fireEvent.click(view.getByRole('tab', { name: '转发' }));
+    await vi.waitFor(() => expect(reads()).toContain(`/users/${tenant}/alice/forwarding`));
+    fireEvent.click(view.getByRole('tab', { name: '统计' }));
+    await vi.waitFor(() => expect(reads()).toContain(`/users/${tenant}/alice/site-usage?period=day`));
+    fireEvent.click(view.getByRole('tab', { name: '接入' }));
+    await act(async () => selectUser('dave'));
+    expect(
+      reads()
+        .filter(path => path.includes('/dave/'))
+        .some(unvisitedRead),
+    ).toBe(false);
+  });
+
+  it('does not replace a newer selection when an earlier policy request finishes late', async () => {
+    let finish!: (value: Response) => void;
+    const response = new Promise<Response>(resolve => {
+      finish = resolve;
+    });
+    const original = fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) =>
+        String(input).endsWith('/dave/traffic-policy') ? response : original(input, init),
+      ),
+    );
+    const { view, client, selectUser } = mount();
+    client.removeQueries({ queryKey: userTrafficPolicyKey(person('dave')), exact: true });
+    selectUser('dave');
+    expect(view.container.querySelector('.dname')?.textContent).toContain('alice');
+    selectUser('carol');
+    expect(view.container.querySelector('.dname')?.textContent).toContain('carol');
+    await act(async () => finish(Response.json([])));
+    expect(view.container.querySelector('.dname')?.textContent).toContain('carol');
+  });
+
+  it.each(['policy', 'usage'])('waits for both usage and policies when %s resolves last', async last => {
+    let resolvePolicy!: (value: Response) => void;
+    let resolveUsage!: (value: Response) => void;
+    const policyResponse = new Promise<Response>(resolve => {
+      resolvePolicy = resolve;
+    });
+    const usageResponse = new Promise<Response>(resolve => {
+      resolveUsage = resolve;
+    });
+    const original = fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith('/traffic-policy')) return policyResponse;
+        if (String(input) === '/usage/user-cycles') return usageResponse;
+        return original(input, init);
+      }),
+    );
+    const { view, client } = mount('system-admin', 'operator', false, false, false);
+    expect(view.container.querySelector('.qta-r')).toBeNull();
+    const policy = () =>
+      resolvePolicy(
+        Response.json([
+          {
+            kind: 'access',
+            app_id: 'tokyo',
+            policy: { quota_bytes: String(100 * GiB), exhausted_action: { kind: 'throttle', rate_bps: 5_000_000 } },
+            used_bytes: String(121 * GiB),
+            exhausted: true,
+            service_available: true,
+            unsupported_nodes: [],
+          },
+        ]),
+      );
+    const usageReady = () => resolveUsage(Response.json({ views: [usage('alice', 121)] }));
+    await act(async () => {
+      (last === 'policy' ? usageReady : policy)();
+    });
+    await vi.waitFor(() =>
+      expect(
+        client.getQueryState(last === 'policy' ? ['user-cycles'] : userTrafficPolicyKey(person('alice')))?.status,
+      ).toBe('success'),
+    );
+    expect(view.container.querySelector('.qta-r')).toBeNull();
+    await act(async () => {
+      (last === 'policy' ? policy : usageReady)();
+    });
+    const state = await view.findByText('限速中 · 5 Mbps');
+    expect(state.closest('.qta-r')?.textContent).toContain('超出21.00 GiB');
+    expect(state.closest('.qta-r')?.classList.contains('warn')).toBe(true);
+    await act(async () => {
+      await client.refetchQueries({ queryKey: userTrafficPolicyKey(person('alice')) });
+    });
+    expect(view.getByText('限速中 · 5 Mbps')).toBe(state);
+  });
+
+  it('reads the signed-in user policy while leaving other users on public quota readings', async () => {
+    const { view, client, selectUser, row } = mount('user', 'alice', true, false);
+    await vi.waitFor(() =>
+      expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url) === `/users/${tenant}/alice/traffic-policy`)).toBe(
+        true,
+      ),
+    );
+    client.setQueryData(userTrafficPolicyKey(person('erin')), [
+      {
+        kind: 'access',
+        app_id: 'tokyo',
+        policy: { quota_bytes: '1024', exhausted_action: { kind: 'throttle', rate_bps: 99_000_000 } },
+        used_bytes: '0',
+        exhausted: false,
+        service_available: true,
+        unsupported_nodes: [],
+      },
+    ]);
+    fireEvent.focus(row('erin'));
+    selectUser('erin');
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes('/erin/traffic-policy'))).toBe(false);
+    expect(view.queryByText(/99 Mbps/)).toBeNull();
+    selectUser('alice');
+    expect(view.queryByText('当前账号不能查看这项内容')).toBeNull();
+  });
+
+  it('keeps policy failures inside the quota column alongside the public quota readings', async () => {
+    const original = fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) =>
+        String(input).endsWith('/traffic-policy')
+          ? Promise.resolve(Response.json({ error: '策略暂不可用' }, { status: 503 }))
+          : original(input, init),
+      ),
+    );
+    const { view } = mount('system-admin', 'operator', false, false);
+    const accessCard = view.container.querySelector('.user-usage-card:not(.user-forwarding-usage)')!;
+    const error = await within(accessCard as HTMLElement).findByText(/策略暂不可用/);
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/traffic-policy'))).toHaveLength(1);
+    const quotas = view.getByRole('list', { name: '各线路的用量与额度' });
+    expect(error.closest('.user-access-quotas')).toBe(quotas.parentElement);
+    expect(quotas.parentElement?.parentElement?.classList.contains('user-usage')).toBe(true);
+    expect(quotas.parentElement?.parentElement?.children).toHaveLength(2);
+    expect(quotas.querySelectorAll('.qta-r').length).toBeGreaterThan(0);
+  });
+});
+
+describe('source bans in 在线设备', () => {
+  const banPath = `/users/${tenant}/alice/source-access`;
+  const historyPath = `/users/${tenant}/alice/presence-history`;
+  const applied = [{ node_id: 'n1', phase: 'applied' as const }];
+  // 名单接口的替身：PUT 按版本做乐观并发，成功后相关机器回到「待同步」，与 Console 一致。
+  function stubBans(initial: SourceAccessView, history: ReturnType<typeof offlineSource>[] = []) {
+    let current = initial;
+    const writes: { revision: number; ips: string[] }[] = [];
+    const original = fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        if (path === banPath && init?.method === 'PUT') {
+          const body = JSON.parse(String(init.body)) as { revision: number; ips: string[] };
+          writes.push(body);
+          if (body.revision !== current.revision)
+            return Response.json({ error: '封禁名单已被其他操作修改，请刷新后重试' }, { status: 409 });
+          current = {
+            ...current,
+            revision: current.revision + 1,
+            ips: [...new Set(body.ips)].sort(),
+            nodes: current.nodes.map(node => ({ ...node, phase: 'pending' as const })),
+          };
+          return Response.json(current);
+        }
+        if (path === banPath) return Response.json(current);
+        if (path === historyPath)
+          return Response.json({
+            tenant_id: tenant,
+            user_id: 'alice',
+            retention_days: 30,
+            truncated: false,
+            sources: history,
+          });
+        return original(input, init);
+      }),
+    );
+    return {
+      writes,
+      reads: () =>
+        vi.mocked(fetch).mock.calls.filter(([input, init]) => String(input) === banPath && !init?.method).length,
+      replace: (next: SourceAccessView) => (current = next),
+    };
+  }
+  const presenceCard = (view: ReturnType<typeof mount>['view']) =>
+    view.container.querySelector<HTMLElement>('.user-presence-card')!;
+  const rowsWith = (card: HTMLElement, ip: string) =>
+    [...card.querySelectorAll<HTMLElement>('.user-presence-row')].filter(row => row.textContent?.includes(ip));
+
+  it('bans an online source from its row after confirming and keeps it marked online until its machine confirms', async () => {
+    const bans = stubBans({ revision: 4, ips: [], nodes: applied });
+    const { view, client } = mount();
+    const card = presenceCard(view);
+    fireEvent.click(await within(card).findByRole('button', { name: '封禁 1.1.1.1' }));
+    const dialog = view.getByRole('dialog', { name: '封禁 1.1.1.1' });
+    expect(within(dialog).getByText('断开该来源的会话，并拒绝再次接入。')).toBeTruthy();
+    expect(bans.writes).toHaveLength(0);
+    fireEvent.click(within(dialog).getByRole('button', { name: '封禁' }));
+
+    const group = await within(card).findByRole('list', { name: '已封禁的来源' });
+    expect(bans.writes).toEqual([{ revision: 4, ips: ['1.1.1.1'] }]);
+    // 移出时间线，只在「已封禁」组里出现一次；读数仍按全部来源计，另写封禁数。
+    expect(rowsWith(card, '1.1.1.1')).toHaveLength(1);
+    expect(rowsWith(card, '1.1.1.1')[0].closest('.source-ban-group')).toBeTruthy();
+    expect(readingOf(card)).toContain('在线 1');
+    expect(readingOf(card)).toContain('封禁 1');
+    expect(within(group).getByText('仍在线 · 东京 IIJ · 协议未知')).toBeTruthy();
+    expect(within(group).getByRole('button', { name: '同步中 0/1' })).toBeTruthy();
+
+    // 经过它的机器确认了当前名单：会话已关闭，在线快照还没刷新也不再写「仍在线」。
+    bans.replace({ revision: 5, ips: ['1.1.1.1'], nodes: applied });
+    await act(async () => {
+      await client.refetchQueries({ queryKey: ['source-access', banPath] });
+    });
+    expect(await within(group).findByRole('button', { name: '已生效' })).toBeTruthy();
+    expect(within(group).queryByText(/仍在线/)).toBeNull();
+    expect(within(group).getByText('东京 IIJ · 协议未知')).toBeTruthy();
+  });
+
+  it('lists bans with their own region, says when an address has not appeared and unbans in place', async () => {
+    const bans = stubBans(
+      {
+        revision: 2,
+        ips: ['198.51.100.23', '9.9.9.9'],
+        nodes: applied,
+        source_countries: [{ ip: '198.51.100.23', country: 'RU' }],
+      },
+      [offlineSource('9.9.9.9', Date.now() - 2 * HOUR, ['vless'])],
+    );
+    const { view } = mount();
+    const card = presenceCard(view);
+    const group = await within(card).findByRole('list', { name: '已封禁的来源' });
+    const never = within(group).getByText('198.51.100.23').closest<HTMLElement>('.user-presence-row')!;
+    expect(never.querySelector('.user-presence-location')?.textContent).toBe('俄罗斯');
+    expect(await within(never).findByText('30 天内未出现')).toBeTruthy();
+    const seen = within(group).getByText('9.9.9.9').closest<HTMLElement>('.user-presence-row')!;
+    expect(seen.querySelector('.user-presence-time')?.textContent).toMatch(/^\d{2}[:-]\d{2}$/);
+    expect(within(seen).getByText('东京 IIJ · VLESS')).toBeTruthy();
+    // 最近出现过的排在前面；历史时间线不再重复列出它。
+    expect([...group.querySelectorAll('.user-presence-row code')].map(code => code.textContent)).toEqual([
+      '9.9.9.9',
+      '198.51.100.23',
+    ]);
+    expect(rowsWith(card, '9.9.9.9')).toHaveLength(1);
+
+    fireEvent.click(within(group).getByRole('button', { name: '解除封禁 9.9.9.9' }));
+    await vi.waitFor(() => expect(bans.writes).toEqual([{ revision: 2, ips: ['198.51.100.23'] }]));
+    // 解除后回到历史时间线。
+    expect(await within(card).findByRole('button', { name: '复制历史来源 IP 9.9.9.9' })).toBeTruthy();
+    expect(rowsWith(card, '9.9.9.9')[0].closest('.source-ban-group')).toBeNull();
+  });
+
+  it('adds a typed address with what is known about it, skips duplicates and keeps the input on a conflict', async () => {
+    const bans = stubBans({ revision: 1, ips: ['203.0.113.9'], nodes: applied });
+    const { view } = mount();
+    const card = presenceCard(view);
+    fireEvent.click(await within(card).findByRole('button', { name: '封禁其他 IP' }));
+    const input = within(card).getByRole<HTMLInputElement>('textbox', { name: '来源 IP' });
+    expect(document.activeElement).toBe(input);
+    fireEvent.change(input, { target: { value: '1.1.1.1' } });
+    expect(within(card).getByText(/台湾 · 在线，封禁后断开/)).toBeTruthy();
+    fireEvent.change(input, { target: { value: '::ffff:203.0.113.9' } });
+    expect(within(card).getByText('已在名单中')).toBeTruthy();
+    expect(within(card).getByRole('button', { name: '封禁' }).hasAttribute('disabled')).toBe(true);
+
+    // 另一位管理员先保存了：这次提交被拒绝，输入保留，名单重新读取后再提交即可。
+    bans.replace({ revision: 2, ips: ['198.51.100.1', '203.0.113.9'], nodes: applied });
+    fireEvent.change(input, { target: { value: '192.0.2.7' } });
+    fireEvent.click(within(card).getByRole('button', { name: '封禁' }));
+    expect(await within(card).findByText('封禁名单已被其他操作修改，请刷新后重试')).toBeTruthy();
+    expect(input.value).toBe('192.0.2.7');
+    expect(await within(card).findByText('198.51.100.1')).toBeTruthy();
+    fireEvent.click(within(card).getByRole('button', { name: '封禁' }));
+    await vi.waitFor(() =>
+      expect(bans.writes.at(-1)).toEqual({ revision: 2, ips: ['198.51.100.1', '203.0.113.9', '192.0.2.7'] }),
+    );
+    expect(await within(card).findByRole('button', { name: '封禁其他 IP' })).toBeTruthy();
+    expect(within(card).getByText('192.0.2.7')).toBeTruthy();
+  });
+
+  it('lists the rollout by machine name with the reported failure', async () => {
+    stubBans({
+      revision: 3,
+      ips: ['198.51.100.23'],
+      nodes: [
+        { node_id: 'n1', phase: 'applied' },
+        { node_id: 'n2', phase: 'error', error: '写入策略文件失败' },
+      ],
+    });
+    const { view } = mount();
+    const card = presenceCard(view);
+    fireEvent.click(await within(card).findByRole('button', { name: '1 台异常' }));
+    const nodes = view.getByRole('dialog', { name: '各机器执行情况' });
+    expect([...nodes.querySelectorAll('li')].map(item => item.textContent)).toEqual([
+      '东京测试节点已生效',
+      '澳门测试节点执行异常写入策略文件失败',
+    ]);
+  });
+
+  it('shows a masked list to a read-only reviewer without matching it against sources or offering changes', async () => {
+    stubBans({
+      revision: 3,
+      ips: ['1.1.1.1', '203.0.***.***', '203.0.***.***'],
+      nodes: applied,
+      source_countries: [
+        { ip: '203.0.***.***', country: 'RU' },
+        { ip: '203.0.***.***', country: 'JP' },
+      ],
+    });
+    const { view } = mount('readonly', 'operator', true);
+    const card = presenceCard(view);
+    const group = await within(card).findByRole('list', { name: '已封禁的来源' });
+    // 脱敏后的地址可能同形：不拿它去对照在线来源，时间线保持原样，同形地址也不写地区。
+    expect(within(card).getByRole('button', { name: '复制来源 IP 1.1.1.1' }).closest('.source-ban-group')).toBeNull();
+    expect(within(group).queryByText(/仍在线/)).toBeNull();
+    expect([...group.querySelectorAll('.user-presence-location')].map(location => location.textContent)).toEqual([
+      '位置未知',
+      '位置未知',
+      '位置未知',
+    ]);
+    expect(within(card).queryByRole('button', { name: /^封禁 / })).toBeNull();
+    expect(within(card).queryByRole('button', { name: /^解除封禁/ })).toBeNull();
+    expect(within(card).queryByRole('button', { name: /封禁其他 IP|封禁 IP/ })).toBeNull();
+  });
+
+  it('reports an unreadable list instead of offering bans against an empty one', async () => {
+    const original = fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) =>
+        String(input) === banPath ? Promise.resolve(Response.json({})) : original(input, init),
+      ),
+    );
+    const { view } = mount();
+    const card = presenceCard(view);
+    expect(await within(card).findByText(/来源封禁响应无效/)).toBeTruthy();
+    expect(within(card).queryByRole('button', { name: /^封禁 / })).toBeNull();
+    expect(within(card).queryByRole('button', { name: /封禁其他 IP|封禁 IP/ })).toBeNull();
+    expect(within(card).queryByRole('list', { name: '已封禁的来源' })).toBeNull();
   });
 });

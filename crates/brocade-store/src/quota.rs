@@ -6,7 +6,7 @@
 //! in the control-plane process calls it once every 60 seconds.
 //!
 //! Three steps to a round:
-//!   1. Account: how much each (tenant, user, view) with a quota used this month, who went over,
+//!   1. Account: how much each (tenant, user, view) with a quota used this cycle, who went over,
 //!      and who should be restored;
 //!   2. Edit the model: revoke and add grants, composing the whole round into one revision;
 //!   3. Put the revision on the durable grants queue and run it immediately. The shared worker
@@ -24,7 +24,7 @@
 //!     completes without anyone confirming;
 //!   - Revoking does not lose usage: adding and removing grants does not affect xray's counters
 //!     at all, the values survive an `rmu`, and adding one back resumes the count. Otherwise one
-//!     revocation would zero the usage and hand the user a whole extra month of quota;
+//!     revocation would zero the usage and hand the user a whole extra cycle of quota;
 //!   - Repetition is harmless: model writes, `adu`/`rmu`, and the durable grants worker are all
 //!     idempotent. Several instances are serialized by the worker's advisory lock.
 
@@ -62,7 +62,7 @@ pub struct QuotaGrantChange {
 pub struct QuotaEnforcementPlan {
     /// Grants still in place whose quota is spent
     pub suspend: Vec<QuotaGrantChange>,
-    /// Ones the system revoked that should no longer be (a month reset, a raised quota, a
+    /// Ones the system revoked that should no longer be (a cycle reset, a raised quota, a
     /// deleted quota)
     pub restore: Vec<QuotaGrantChange>,
 }
@@ -89,15 +89,14 @@ pub struct QuotaEnforcementOutcome {
     pub deferred: Vec<String>,
 }
 
-// This month's consumption does not go through `list_monthly_usage_summary` here: that query
+// This cycle's consumption does not go through `list_monthly_usage_summary` here: that query
 // carries `coalesce(s.app_id, i.app_id)` and a LEFT JOIN on ingresses, serving someone opening a
 // page and wanting historical completeness; this one runs every 60 seconds and has to hit the
 // daily `usage_rollups` projection, so a one-minute enforcement round reads at most one row per
 // elapsed day instead of every 30-second accounting window.
 //
-// Month boundaries follow the same convention as everywhere else: date_trunc at +08, decided
-// server-side.
-const MONTH_USED_SQL: &str = "
+// Billing boundaries come from the same per-user UTC+8 cycle used by subscriptions and forwarding.
+const CYCLE_USED_SQL: &str = "
     SELECT q.tenant_id, q.user_id, q.app_id, q.limit_bytes,
            coalesce((
                SELECT sum(s.uplink_bytes + s.downlink_bytes)
@@ -106,13 +105,13 @@ const MONTH_USED_SQL: &str = "
                WHERE s.tenant_id = q.tenant_id
                  AND s.user_id = q.user_id
                  AND s.app_id = q.app_id
-                 AND s.period_start >= (date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
-                                        AT TIME ZONE 'Asia/Hong_Kong')
-                 AND s.period_start < ((date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
-                                        + INTERVAL '1 month') AT TIME ZONE 'Asia/Hong_Kong')
+                 AND s.period_start >= cycle.starts_at
+                 AND s.period_start < cycle.ends_at
            ), 0)::bigint AS used_bytes
     FROM user_app_quotas q
     JOIN users owner ON owner.tenant_id = q.tenant_id AND owner.id = q.user_id
+    CROSS JOIN LATERAL user_traffic_cycle(owner.traffic_reset_day, now()) cycle
+    WHERE q.exhausted_action='suspend'
 ";
 
 /// Account. Writes nothing.
@@ -121,7 +120,7 @@ pub async fn plan_quota_enforcement(pool: &PgPool) -> Result<QuotaEnforcementPla
     // presence is the source of truth. A surviving suspension record must not exempt a grant
     // restored by another writer; DELETE's rows_affected already gives idempotent counts.
     let suspend = sqlx::query(&format!(
-        "WITH used AS ({MONTH_USED_SQL})
+        "WITH used AS ({CYCLE_USED_SQL})
          SELECT g.tenant_id, g.user_id, g.app_id, g.ingress_id
          FROM used u
          JOIN grants g
@@ -136,12 +135,12 @@ pub async fn plan_quota_enforcement(pool: &PgPool) -> Result<QuotaEnforcementPla
 
     // To restore: a suspension record remains with no spent quota holding it down. One LEFT
     // JOIN covers all three cases — the quota was deleted, raised, or reset at the start of the
-    // month. Suspensions whose ingress is long gone also fall into this set
+    // cycle. Suspensions whose ingress is long gone also fall into this set
     // (`upsert_grant_tx` reports NotFound from `ensure_ingress_in_app_tx`), so they are filtered
     // against the surviving ingresses first and cleared in passing during execution: what they
     // point at is gone, and keeping them only produces one error per round.
     let restore = sqlx::query(&format!(
-        "WITH used AS ({MONTH_USED_SQL})
+        "WITH used AS ({CYCLE_USED_SQL})
          SELECT s.tenant_id, s.user_id, s.app_id, s.ingress_id
          FROM quota_suspensions s
          LEFT JOIN used u
@@ -165,7 +164,7 @@ pub async fn plan_quota_enforcement(pool: &PgPool) -> Result<QuotaEnforcementPla
 /// Quotas are hard limits. Re-enabling while still over quota is rejected immediately rather
 /// than creating a short window until the next worker round. An explicit manual disable clears a
 /// system suspension even where the grant is already absent: that records that the operator, not
-/// the quota worker, now owns the disabled state, so a later month reset must not restore it.
+/// the quota worker, now owns the disabled state, so a later cycle reset must not restore it.
 pub(crate) async fn prepare_operator_grant_tx(
     tx: &mut Transaction<'_, Postgres>,
     actor: &AdminContext,
@@ -180,8 +179,17 @@ pub(crate) async fn prepare_operator_grant_tx(
     }
 
     if enabled {
+        let node: String =
+            sqlx::query_scalar("SELECT node_id FROM ingresses WHERE id=$1 AND app_id=$2")
+                .bind(ingress_id)
+                .bind(app_id)
+                .fetch_one(&mut **tx)
+                .await?;
+        crate::user_traffic::check_node_tx(tx, tenant_id, user_id, "access", Some(app_id), &node)
+            .await?;
+
         let exceeded: bool = sqlx::query_scalar(&format!(
-            "WITH used AS ({MONTH_USED_SQL})
+            "WITH used AS ({CYCLE_USED_SQL})
              SELECT EXISTS (
                  SELECT 1 FROM used
                  WHERE tenant_id = $1 AND user_id = $2 AND app_id = $3
@@ -195,7 +203,7 @@ pub(crate) async fn prepare_operator_grant_tx(
         .await?;
         if exceeded {
             return Err(StoreError::Unsupported(format!(
-                "grant {tenant_id}/{user_id}/{app_id}/{ingress_id} cannot be enabled while its monthly quota is exhausted; raise or remove the quota first"
+                "grant {tenant_id}/{user_id}/{app_id}/{ingress_id} cannot be enabled while its current cycle quota is exhausted; raise or remove the quota first"
             )));
         }
     }

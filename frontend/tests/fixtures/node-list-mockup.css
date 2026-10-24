@@ -1,0 +1,587 @@
+/* 机器页页头与布局 mockup。外壳与详情页是生产的；这里只补审阅条（mk-）和方案部件（nl-）。 */
+
+/* ── 审阅外壳：不属于设计 ── */
+body {
+  display: flex;
+  flex-direction: column;
+}
+#mk-root {
+  flex: none;
+}
+#root {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.mk-bar {
+  position: relative;
+  z-index: 30;
+  border-bottom: 1px solid var(--line);
+  background: var(--sheet);
+}
+.mk-bar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  padding: 9px 20px 5px;
+}
+.mk-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--ink);
+  font: 600 14px var(--sans);
+  white-space: nowrap;
+}
+.mk-title small {
+  color: var(--ink-4);
+  font: 400 10px var(--mono);
+  letter-spacing: 0.06em;
+}
+.mk-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-left: auto;
+}
+.mk-ctl {
+  --ctl-h: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.mk-ctl-label {
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.mk-ctl select {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  color: var(--ink);
+  font: 12px var(--sans);
+}
+.mk-ctl .segsw button {
+  padding: 0 9px;
+  font-size: 12px;
+}
+.mk-scene-note {
+  margin: 0;
+  padding: 0 20px 8px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.mk-scene-note b {
+  margin-right: 10px;
+  color: var(--action);
+  font-weight: 600;
+}
+html[data-mk-replace='true'] .fg-view > :not(.mk-slot) {
+  display: none !important;
+}
+.mk-slot {
+  display: contents;
+}
+
+/* ══ 方案共用：页头 ══
+   页头是机器详情的 .nd-page-head 原样；这里只补列表页才有的三处：身份牌里的图标色、
+   「纳管机器」按钮的图标间距、需处理页签里卡片的一行原因。 */
+.nl-plate .nd-idplate-clip {
+  color: var(--ink-2);
+}
+.nl-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.nl-why {
+  overflow: hidden;
+  margin: 7px 0 -5px;
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.nl-why.warn {
+  color: var(--gold);
+}
+.nl-why.bad {
+  color: var(--err);
+}
+.nl-empty {
+  margin: 0;
+  padding: 48px 0;
+  color: var(--ink-4);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* ══ B 按地区分段：小地区并排，分组标题沿用 h4.sec（小字加一条填满剩余宽度的线） ══ */
+.nl-shelf {
+  display: grid;
+  grid-auto-flow: row dense;
+  gap: 20px 14px;
+  align-items: start;
+}
+.nl-shelf-group {
+  min-width: 0;
+}
+h4.sec.nl-shelf-head {
+  min-height: 18px;
+  gap: 8px;
+  margin: 0 0 10px;
+  color: var(--ink-2);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+.nl-region-flag {
+  display: inline-flex;
+  flex: none;
+  width: 15px;
+  justify-content: center;
+  color: var(--ink-4);
+}
+.nl-region-count {
+  color: var(--ink-4);
+  font: 500 10.5px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ══ C 卡片 / 列表 ══ */
+.nl-view {
+  --ctl-h: 30px;
+  height: 30px;
+}
+.nl-view button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+.nl-table-wrap {
+  margin: -6px -20px -8px;
+  overflow-x: auto;
+}
+table.t.nl-table {
+  font-size: 12.5px;
+}
+table.t.nl-table th {
+  padding-top: 0;
+  padding-bottom: 7px;
+  color: var(--ink-4);
+  font-size: 11px;
+}
+table.t.nl-table td {
+  height: 36px;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  box-sizing: border-box;
+}
+table.t.nl-table tr > :first-child {
+  padding-left: 20px;
+}
+table.t.nl-table tr > :last-child {
+  padding-right: 20px;
+}
+table.t.nl-table :is(th, td).nl-c-rate,
+table.t.nl-table :is(th, td).nl-c-ago {
+  text-align: right;
+}
+.nl-table tr.rowlink {
+  cursor: pointer;
+}
+.nl-table tr.rowlink:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+@media (hover: hover) {
+  .nl-table tr.rowlink:hover td {
+    background: var(--hover);
+  }
+}
+.nl-table tr.off td {
+  opacity: 0.55;
+}
+.nl-table tr.picked td {
+  background: color-mix(in srgb, var(--action) 7%, transparent);
+}
+.nl-c-pick {
+  width: 14px;
+}
+.nl-name {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+}
+.nl-name > b {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.nl-name-flag {
+  display: inline-flex;
+  flex: none;
+  width: 15px;
+}
+.nl-name-why {
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 11px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.nl-name-why.warn {
+  color: var(--gold);
+}
+.nl-name-why.bad {
+  color: var(--err);
+}
+.nl-c-wave {
+  width: 150px;
+}
+.nl-spark.rut-spark {
+  width: 140px;
+  height: 22px;
+}
+.nl-spark.none {
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+}
+.nl-c-rate,
+.nl-c-ago {
+  text-align: right;
+  white-space: nowrap;
+}
+.nl-rate {
+  color: var(--ink-2);
+  font: 12px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.nl-rate small,
+.nl-rate.none {
+  color: var(--ink-4);
+}
+.nl-rate small {
+  margin-left: 3px;
+  font-size: 10px;
+}
+.nl-c-month {
+  width: 230px;
+}
+.nl-month {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.nl-month-value {
+  min-width: 10ch;
+  color: var(--ink-2);
+  font: 12px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.nl-month.none {
+  color: var(--ink-4);
+}
+.nl-quota {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.nl-quota .cap-bar {
+  width: 64px;
+  height: 4px;
+}
+.nl-quota em {
+  min-width: 3.5ch;
+  color: var(--ink-4);
+  font: normal 10.5px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.nl-quota.hot em {
+  color: var(--gold);
+}
+.nl-c-ping .nc-tcp-latest .values {
+  font-size: 11px;
+}
+.nl-c-ping .nc-tcp-latest em {
+  font-size: 9px;
+}
+.nl-c-ping .nc-ip {
+  font-size: 11.5px;
+}
+.nl-c-ago {
+  width: 40px;
+  color: var(--ink-4);
+  font: 11px var(--mono);
+}
+.nl-c-ago.bad {
+  color: var(--err);
+}
+
+/* ══ D 侧栏分组 ══ */
+.nl-search {
+  display: flex;
+  flex: 0 1 300px;
+  min-width: 0;
+  align-items: center;
+  align-self: center;
+  gap: 7px;
+  height: 30px;
+  margin: 0 10px 0 auto;
+  padding: 0 10px;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  color: var(--ink-4);
+}
+.nl-search:focus-within {
+  border-color: color-mix(in srgb, var(--action) 55%, var(--line));
+}
+.nl-search input.f {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  background: none;
+  outline: none;
+  box-shadow: none;
+}
+.nd-page-head > .nl-search + .nd-tools {
+  margin-left: 0;
+}
+.nl-rail-body {
+  display: grid;
+  grid-template-columns: 176px minmax(0, 1fr);
+  gap: 22px;
+  align-items: start;
+}
+.nl-rail {
+  position: sticky;
+  top: 78px;
+  display: grid;
+  gap: 16px;
+}
+.nl-rail-sec {
+  display: grid;
+  gap: 1px;
+}
+.nl-rail-title {
+  padding: 0 10px 5px;
+  color: var(--ink-4);
+  font: 600 10.5px var(--mono);
+  letter-spacing: 0.1em;
+}
+.nl-rail-item {
+  display: flex;
+  height: 30px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--ink-3);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.nl-rail-item[aria-pressed='true'] {
+  background: var(--action-wash);
+  color: var(--action);
+  font-weight: 600;
+}
+@media (hover: hover) {
+  .nl-rail-item:not([aria-pressed='true']):hover {
+    background: var(--hover);
+    color: var(--ink-2);
+  }
+}
+.nl-rail-label {
+  display: inline-flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+.nl-rail-flag {
+  display: inline-flex;
+  flex: none;
+  width: 15px;
+  justify-content: center;
+}
+.nl-rail-main {
+  min-width: 0;
+}
+
+/* 窄页：同详情页头分两层；D 的搜索框落到第二层，侧栏横排成一行。 */
+@container (max-width: 700px) {
+  .nl-view-label {
+    display: none;
+  }
+  .nd-sheet > .nd-paper > .nd-page-head > .nl-search {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    flex: none;
+    width: auto;
+    margin: 0 10px 0;
+  }
+  .nl-rail-body {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+  .nl-rail {
+    position: static;
+    display: flex;
+    gap: 6px;
+    margin: 0 -10px;
+    padding: 0 10px 2px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .nl-rail-sec {
+    display: flex;
+    gap: 4px;
+  }
+  .nl-rail-title {
+    display: none;
+  }
+  .nl-rail-item {
+    flex: none;
+    border: 1px solid var(--line-soft);
+  }
+  .nl-table-wrap {
+    margin-inline: -10px;
+  }
+  table.t.nl-table tr > :first-child {
+    padding-left: 10px;
+  }
+  table.t.nl-table tr > :last-child {
+    padding-right: 10px;
+  }
+}
+/* 详情页的 meta 是 IP，用等宽字；这里是中文读数，等宽字会把汉字逐个拉开，同 .nd-name 改回正文字体。 */
+.nd-ident-meta.nl-meta {
+  font-family: var(--sans);
+  font-size: 11px;
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 角标原有金色与灰色两档；失联用告警色，同状态灯。 */
+.nd-tab-badge.err {
+  background: color-mix(in srgb, var(--err) 18%, transparent);
+  color: var(--err);
+}
+table.t.nl-table .nl-c-rate {
+  width: 96px;
+}
+table.t.nl-table .nl-c-ping {
+  width: 150px;
+}
+/* 名称列定宽，多出的宽度给走势：列表的价值在纵向比较，走势越宽越好读。 */
+table.t.nl-table .nl-c-name {
+  width: 300px;
+  max-width: 300px;
+}
+table.t.nl-table .nl-c-wave {
+  width: auto;
+  min-width: 140px;
+}
+.nl-table .nl-spark.rut-spark {
+  width: 100%;
+  min-width: 140px;
+}
+table.t.nl-table .nl-c-ip {
+  width: 150px;
+}
+.nl-c-ip .nc-ip {
+  font-size: 11.5px;
+}
+
+/* C 的列表在窄页不横向滚动：每台一块三行——名称与上报、走势、本月与延迟。 */
+@container (max-width: 700px) {
+  .nl-table-wrap {
+    overflow: visible;
+  }
+  table.t.nl-table,
+  table.t.nl-table tbody {
+    display: block;
+  }
+  table.t.nl-table thead {
+    display: none;
+  }
+  table.t.nl-table tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'name ago'
+      'wave wave'
+      'month ping';
+    align-items: center;
+    gap: 6px 10px;
+    padding: 10px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  table.t.nl-table td {
+    display: block;
+    height: auto;
+    padding: 0;
+    border: 0;
+  }
+  table.t.nl-table tr > :first-child,
+  table.t.nl-table tr > :last-child {
+    padding: 0;
+  }
+  table.t.nl-table td.nl-c-pick {
+    display: none;
+  }
+  table.t.nl-table .nl-c-name {
+    grid-area: name;
+    width: auto;
+    max-width: none;
+  }
+  table.t.nl-table .nl-c-ago {
+    grid-area: ago;
+    width: auto;
+  }
+  table.t.nl-table .nl-c-wave {
+    grid-area: wave;
+    min-width: 0;
+  }
+  .nl-table .nl-spark.rut-spark {
+    min-width: 0;
+    height: 26px;
+  }
+  table.t.nl-table .nl-c-month {
+    grid-area: month;
+    width: auto;
+  }
+  table.t.nl-table .nl-c-ping {
+    grid-area: ping;
+    width: auto;
+    text-align: right;
+  }
+  table.t.nl-table .nl-c-rate,
+  table.t.nl-table .nl-c-ip {
+    display: none;
+  }
+}
+.mk-common {
+  display: block;
+  color: var(--ink-4);
+}

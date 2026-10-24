@@ -1,5 +1,5 @@
 //! Serving client subscriptions. Every pull renders fresh content
-//! from the last fully converged serving projection and accounts the current calendar month.
+//! from the last fully converged serving projection and accounts the current user billing cycle.
 //! Committed-but-unpublished revisions are intentionally invisible, while an open/uncertain
 //! release makes pulls temporarily unavailable instead of returning a configuration which may not
 //! match the fleet. Administrator-only sharing links are separate operational state.
@@ -328,6 +328,23 @@ async fn build_dynamic_clash(
     template: DynamicClashTemplate,
     hide_reason: bool,
 ) -> Result<DynamicClashSubscription> {
+    // Manual authorization follows the serving checkpoint. Only the operational time policy
+    // is checked live, so an unpublished manual disable cannot rewrite a stable subscription.
+    let eligible: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE tenant_id=$1 AND id=$2
+          AND user_service_state(service_starts_at,service_expires_at,now())='active')",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    if !eligible {
+        return Err(if hide_reason {
+            public_not_found()
+        } else {
+            StoreError::NotFound("用户服务尚未生效或已到期".into())
+        });
+    }
     let output = crate::compile_cache::compile_incremental(snapshot);
     let mut plan = crate::compile_cache::project_user(&output, tenant_id, user_id)
         .map(|plan| plan.as_ref().clone())
@@ -428,10 +445,9 @@ async fn subscription_usage(
 ) -> Result<ClashSubscriptionUsage> {
     let row = sqlx::query(
         "WITH bounds AS (
-             SELECT date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
-                        AT TIME ZONE 'Asia/Hong_Kong' AS month_start,
-                    (date_trunc('month', now() AT TIME ZONE 'Asia/Hong_Kong')
-                         + INTERVAL '1 month') AT TIME ZONE 'Asia/Hong_Kong' AS month_end
+             SELECT c.starts_at AS cycle_start,c.ends_at AS cycle_end
+             FROM users u CROSS JOIN LATERAL user_traffic_cycle(u.traffic_reset_day,now()) c
+             WHERE u.tenant_id=$1 AND u.id=$2
          ), used AS (
              SELECT coalesce(sum(s.uplink_bytes), 0)::bigint AS upload_bytes,
                     coalesce(sum(s.downlink_bytes), 0)::bigint AS download_bytes,
@@ -440,8 +456,8 @@ async fn subscription_usage(
              WHERE s.tenant_id = $1
                AND s.user_id = $2
                AND s.app_id = ANY($3::text[])
-               AND s.period_start >= b.month_start
-               AND s.period_start < b.month_end
+               AND s.period_start >= b.cycle_start
+               AND s.period_start < b.cycle_end
          ), limits AS (
              SELECT count(*)::bigint AS limited_count,
                     coalesce(sum(q.limit_bytes), 0)::bigint AS total_bytes
@@ -452,9 +468,10 @@ async fn subscription_usage(
          )
          SELECT u.upload_bytes, u.download_bytes, u.has_gap,
                 owner.traffic_accounting_mode,
+                (to_jsonb(owner.service_expires_at AT TIME ZONE 'UTC') #>> '{}') || 'Z' AS expires_at,
                 CASE WHEN l.limited_count = cardinality($3::text[])
                      THEN l.total_bytes ELSE NULL END AS total_bytes,
-                to_char(b.month_end AT TIME ZONE 'Asia/Hong_Kong',
+                to_char(b.cycle_end AT TIME ZONE 'Asia/Hong_Kong',
                         'YYYY-MM-DD\"T\"HH24:MI:SS') || '+08:00' AS reset_at
          FROM used u
          CROSS JOIN limits l
@@ -496,6 +513,7 @@ async fn subscription_usage(
         total_bytes,
         remaining_bytes,
         reset_at: row.try_get("reset_at")?,
+        expires_at: row.try_get("expires_at")?,
         has_gap: row.try_get("has_gap")?,
     })
 }

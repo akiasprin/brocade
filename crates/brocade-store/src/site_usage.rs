@@ -683,10 +683,7 @@ pub(crate) async fn prune(pool: &PgPool) -> Result<u64> {
 }
 
 pub(crate) async fn prune_hours(pool: &PgPool, retain_hours: u32) -> Result<u64> {
-    let retain_secs = i64::from(retain_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
-    Ok(sqlx::query("DELETE FROM user_site_usage_hourly WHERE ctid IN (SELECT ctid FROM user_site_usage_hourly WHERE bucket < extract(epoch FROM now())::bigint-$1 ORDER BY bucket LIMIT 10000)")
-        .bind(retain_secs)
-        .execute(pool).await?.rows_affected())
+    crate::retention::cleanup::prune_batch(pool, "user_site_usage_hourly", retain_hours).await
 }
 
 #[cfg(test)]

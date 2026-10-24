@@ -1,0 +1,275 @@
+/* 在线设备里的来源封禁：行内禁行钮、卡底「已封禁」一组、手动添加与各机器执行情况。
+   时间线的列、竖线与节点沿用 styles.css 的 .user-presence-*，这里只补封禁特有的部分。 */
+
+/* 禁行钮与复制钮同一尺寸、同一出现方式（.user-presence-row .user-fcopy：悬停或聚焦时出现，触屏常显）；
+   指向它时转为告警色。确认面板打开期间保持可见，面板贴着它。 */
+@media (hover: hover) {
+  .user-fcopy.source-ban-button:hover {
+    color: var(--err);
+    border-color: color-mix(in srgb, var(--err) 45%, var(--line));
+  }
+}
+.user-presence-row .user-fcopy.source-ban-button[aria-expanded='true'] {
+  opacity: 1;
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 45%, var(--line));
+}
+
+/* 「已封禁」一组与上方时间线以一条细线分开；组标题仍落在时刻列，执行情况靠右。 */
+.source-ban-group {
+  margin-top: 6px;
+  padding-top: 2px;
+  border-top: 1px solid var(--line-soft);
+}
+.user-presence-day.source-ban-day {
+  grid-template-columns: 40px minmax(0, 1fr);
+  column-gap: 12px;
+}
+.source-ban-day > .source-ban-rollout {
+  justify-self: end;
+  margin-bottom: -2px;
+}
+/* 时间线节点换成禁行标记：空心圆加斜杠。已断开为告警色；仍有机器未确认、来源还在线时为注意色。 */
+.user-presence-row.source-ban-row .user-presence-mark.banned {
+  width: 9px;
+  height: 9px;
+  background: var(--card);
+  box-shadow:
+    inset 0 0 0 1.5px var(--err),
+    0 0 0 3px var(--card);
+}
+.user-presence-mark.banned::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 1.5px;
+  height: 8px;
+  margin: -4px 0 0 -0.75px;
+  border-radius: 1px;
+  background: var(--err);
+  transform: rotate(-45deg);
+}
+.user-presence-row.source-ban-row.live .user-presence-mark.banned {
+  box-shadow:
+    inset 0 0 0 1.5px var(--gold),
+    0 0 0 3px var(--card);
+}
+.source-ban-row.live .user-presence-mark.banned::after {
+  background: var(--gold);
+}
+.source-ban-seen {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.source-ban-seen.gold {
+  color: var(--gold);
+}
+.source-ban-unban {
+  min-height: 26px;
+  justify-self: end;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  color: var(--action);
+  background: transparent;
+  font: 12px var(--sans);
+  white-space: nowrap;
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .source-ban-unban:hover:not(:disabled) {
+    color: var(--action-hover);
+    background: var(--action-wash);
+  }
+}
+.source-ban-unban:disabled {
+  color: var(--ink-4);
+  cursor: default;
+}
+.source-ban-unban:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -2px;
+}
+@container user-presence (max-width: 760px) {
+  .user-presence-row.source-ban-row {
+    grid-template-areas:
+      'time mark ip end'
+      '. . sub sub';
+  }
+  .source-ban-row > .source-ban-unban {
+    grid-area: end;
+  }
+}
+
+/* 整份名单的执行情况：状态点 + 文字，点开逐台列出机器。 */
+.source-ban-rollout {
+  display: inline-flex;
+  min-height: 22px;
+  box-sizing: border-box;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--ink-3);
+  background: transparent;
+  font: 11px/1 var(--sans);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.source-ban-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+}
+.source-ban-rollout.ok .source-ban-dot {
+  background: var(--ok);
+}
+.source-ban-rollout.gold {
+  color: var(--gold);
+}
+.source-ban-rollout.err {
+  color: var(--err);
+}
+.source-ban-rollout.idle {
+  padding: 0;
+  color: var(--ink-4);
+  cursor: default;
+}
+@media (hover: hover) {
+  button.source-ban-rollout:hover {
+    background: var(--hover);
+  }
+}
+button.source-ban-rollout[aria-expanded='true'] {
+  background: var(--action-wash);
+}
+button.source-ban-rollout:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -2px;
+}
+.source-ban-nodes {
+  width: min(300px, calc(100vw - 16px));
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+}
+.source-ban-nodes li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 3px 12px;
+  padding: 7px 14px;
+}
+.source-ban-nodes li + li {
+  border-top: 1px solid var(--line-soft);
+}
+.source-ban-node-name {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.source-ban-node-phase {
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.source-ban-node-phase.ok {
+  color: var(--ok);
+}
+.source-ban-node-phase.gold {
+  color: var(--gold);
+}
+.source-ban-node-phase.err {
+  color: var(--err);
+}
+.source-ban-nodes small {
+  grid-column: 1 / -1;
+  color: var(--ink-3);
+  font: 11px/1.45 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+/* 行内封禁的确认：贴着禁行钮弹出，写对象和后果。 */
+.source-ban-confirm {
+  width: min(300px, calc(100vw - 16px));
+  padding: 12px 14px;
+}
+.source-ban-confirm > p {
+  margin: 6px 0 12px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.source-ban-confirm > .source-ban-confirm-title {
+  margin: 0;
+  color: var(--ink);
+  font: 600 13px var(--sans);
+}
+.source-ban-confirm-title code {
+  font: 600 12.5px var(--mono);
+  overflow-wrap: anywhere;
+}
+.source-ban-confirm > .error {
+  margin-bottom: 12px;
+}
+.source-ban-confirm footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* 手动添加：与 IP 列左对齐（时刻列 40 + 间距 12 + 节点列 12 + 间距 12）。 */
+.source-ban-add-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.source-ban-add {
+  padding: 6px 0 2px 76px;
+}
+.source-ban-add-row {
+  display: flex;
+  max-width: 480px;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+.source-ban-add-row input.f {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.source-ban-add-row .btn {
+  flex: none;
+}
+.source-ban-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0 0;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.source-ban-hint.gold {
+  color: var(--gold);
+}
+.source-ban-add > .error {
+  margin-top: 8px;
+}
+/* 窄卡里输入框和两个按钮挤不下 IP 列的宽度，改为占满整行。 */
+@container user-presence (max-width: 760px) {
+  .source-ban-add {
+    padding-left: 0;
+  }
+}

@@ -33,6 +33,12 @@ enum DetailKind {
     FailedTarget,
 }
 impl DetailKind {
+    fn history_table(self) -> &'static str {
+        match self {
+            Self::Domain => "user_other_domain_hourly",
+            Self::FailedTarget => "user_sniffing_failed_hourly",
+        }
+    }
     // Only private, fixed SQL identifiers are selected here; every external value stays bound.
     fn sql(self, source: &'static str) -> Cow<'static, str> {
         match self {
@@ -172,6 +178,7 @@ async fn record_for(
     report: OtherDomainReport,
     kind: DetailKind,
 ) -> Result<()> {
+    let history_hours = crate::retention::ttl_hours(pool, kind.history_table()).await?;
     let mut tx = pool.begin().await?;
     sqlx::query(&kind.sql("SET LOCAL statement_timeout='10s'"))
         .execute(&mut *tx)
@@ -192,9 +199,10 @@ async fn record_for(
         .await?;
     validate_for(&report, now, kind)?;
     let checkpointed = report.version == DETAIL_CHECKPOINT_VERSION;
-    let retention_floor = (now / 3600 - 23) * 3600;
-    if checkpointed && report.read_at_unix_secs / 3600 * 3600 < retention_floor {
-        // Already outside the product's history window. Acknowledge an expired durable
+    // Checkpoint replay and its deduplication lifetime are independent of history retention.
+    let replay_floor = (now / 3600 - 23) * 3600;
+    if checkpointed && report.read_at_unix_secs / 3600 * 3600 < replay_floor {
+        // Already outside the checkpoint replay window. Acknowledge an expired durable
         // checkpoint so it cannot permanently pin the Agent's bounded FIFO.
         tx.commit().await?;
         return Ok(());
@@ -269,7 +277,7 @@ async fn record_for(
         counter_epochs.push(report.epoch.clone());
     }
     let old=sqlx::query(&kind.sql("SELECT bucket,label,domain,epoch,uplink_bytes,downlink_bytes FROM other_domain_counter_heads WHERE node_id=$1 AND epoch=ANY($2) AND bucket >= $3 AND bucket=ANY($4)"))
-        .bind(node).bind(&counter_epochs).bind(retention_floor).bind(&report_buckets).fetch_all(&mut *tx).await?
+        .bind(node).bind(&counter_epochs).bind(replay_floor).bind(&report_buckets).fetch_all(&mut *tx).await?
         .into_iter().map(|r| ((r.get::<i64,_>("bucket"),r.get::<String,_>("label"),r.get::<String, _>(kind.key_column()),r.get::<String,_>("epoch")),(r.get::<i64,_>("uplink_bytes"),r.get::<i64,_>("downlink_bytes")))).collect::<BTreeMap<_,_>>();
     let mut limited = report.limited;
     let same_epoch = previous
@@ -325,7 +333,7 @@ async fn record_for(
         .bind(node).bind(&report_buckets).fetch_all(&mut *tx).await?.into_iter()
         .map(|r| (r.get::<i64,_>("bucket"), r.get::<i64,_>("n") as usize)).collect::<BTreeMap<_,_>>();
     for r in &report.counters {
-        if checkpointed && r.bucket < retention_floor {
+        if checkpointed && r.bucket < replay_floor {
             continue;
         }
         let Some((tenant, user)) = owners.get(&r.label) else {
@@ -446,11 +454,11 @@ async fn record_for(
         &kind.sql("DELETE FROM other_domain_counter_heads WHERE node_id=$1 AND bucket < $2"),
     )
     .bind(node)
-    .bind(retention_floor)
+    .bind(replay_floor)
     .execute(&mut *tx)
     .await?;
     sqlx::query(&kind.sql("DELETE FROM user_other_domain_hourly WHERE ctid IN (SELECT ctid FROM user_other_domain_hourly WHERE node_id=$1 AND bucket < $2 ORDER BY bucket LIMIT 1024)"))
-        .bind(node).bind((now/3600-23)*3600).execute(&mut *tx).await?;
+        .bind(node).bind(now - i64::from(history_hours) * 3600).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -530,9 +538,10 @@ async fn query_for(
     };
     let bounds = crate::site_usage::destination_bounds(pool, period, range).await?;
     let now = bounds.now;
-    // Detail hours are kept for 24 hours (prune_for); a longer period starts at the oldest kept
-    // hour and the returned range start says so.
-    let start = bounds.start.max((bounds.clock / 3600 - 23) * 3600).min(now);
+    let history_hours = crate::retention::ttl_hours(pool, kind.history_table()).await?;
+    // Match cleanup's age cutoff, rounding up to the first retained whole-hour bucket.
+    let retained_since = (bounds.clock - i64::from(history_hours) * 3600 + 3599) / 3600 * 3600;
+    let start = bounds.start.max(retained_since).min(now);
     let policy = policy_for(pool, kind).await?;
     let state=sqlx::query(&kind.sql("SELECT count(*) FILTER (WHERE read_at >= $2)::bigint AS reporting,bool_or(limited) AS limited,max(observed_since) AS since,max(read_at) AS latest FROM node_other_domain_state WHERE node_id=ANY($1)")).bind(&nodes).bind(bounds.clock-600).fetch_one(pool).await?;
     let rows = match scope {
@@ -562,7 +571,14 @@ async fn query_for(
     })
 }
 pub(crate) async fn prune(pool: &PgPool) -> Result<()> {
-    prune_hours(pool, 24, 24, 2, 2).await
+    prune_hours(
+        pool,
+        crate::retention::ttl_hours(pool, DetailKind::Domain.history_table()).await?,
+        crate::retention::ttl_hours(pool, DetailKind::FailedTarget.history_table()).await?,
+        crate::retention::ttl_hours(pool, "other_domain_counter_heads").await?,
+        crate::retention::ttl_hours(pool, "sniffing_failed_counter_heads").await?,
+    )
+    .await
 }
 
 pub(crate) async fn prune_hours(
@@ -595,27 +611,13 @@ async fn prune_for_hours(
     history_hours: u32,
     head_hours: u32,
 ) -> Result<()> {
-    let history_cutoff = i64::from(history_hours.clamp(1, crate::MAX_RETENTION_HOURS)) * 3_600;
-    // A legacy two-hour override must not erase deduplication while v2 reports can replay.
-    let head_cutoff = i64::from(head_hours.clamp(24, crate::MAX_RETENTION_HOURS)) * 3_600;
-    for (sql, cutoff) in [
-        (
-            "DELETE FROM user_other_domain_hourly WHERE ctid IN (SELECT ctid FROM user_other_domain_hourly WHERE bucket < extract(epoch FROM now())::bigint-$1 ORDER BY bucket LIMIT 10000)",
-            history_cutoff,
-        ),
-        (
-            "DELETE FROM other_domain_counter_heads WHERE ctid IN (SELECT ctid FROM other_domain_counter_heads WHERE bucket < extract(epoch FROM now())::bigint-$1 ORDER BY bucket LIMIT 10000)",
-            head_cutoff,
-        ),
-    ] {
+    let heads = match kind {
+        DetailKind::Domain => "other_domain_counter_heads",
+        DetailKind::FailedTarget => "sniffing_failed_counter_heads",
+    };
+    for (table, hours) in [(kind.history_table(), history_hours), (heads, head_hours)] {
         for _ in 0..64 {
-            if sqlx::query(&kind.sql(sql))
-                .bind(cutoff)
-                .execute(pool)
-                .await?
-                .rows_affected()
-                < 10_000
-            {
+            if crate::retention::cleanup::prune_batch(pool, table, hours).await? < 10_000 {
                 break;
             }
         }

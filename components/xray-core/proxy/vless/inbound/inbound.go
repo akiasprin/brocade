@@ -5,6 +5,7 @@ import (
 	"context"
 	gotls "crypto/tls"
 	"encoding/base64"
+	"github.com/xtls/xray-core/common/sourceaccess"
 	"io"
 	"strconv"
 	"strings"
@@ -574,6 +575,11 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	}
 	inbound.Name = "vless"
 	inbound.User = request.User
+	releaseAccess, err := sourceaccess.Register(ctx, request.User.Email, connection.RemoteAddr(), func() { cancelSession(); _ = connection.SetDeadline(time.Now()); _ = connection.Close() })
+	if err != nil {
+		return err
+	}
+	defer releaseAccess()
 	inbound.VlessRoute = net.PortFromBytes(userSentID[6:8])
 
 	account := request.User.Account.(*vless.MemoryAccount)

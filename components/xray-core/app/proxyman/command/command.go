@@ -70,6 +70,10 @@ type handlerServer struct {
 	ohm outbound.Manager
 }
 
+func (s *handlerServer) GetForwardingTargetPolicy(context.Context, *ForwardingTargetPolicyRequest) (*ForwardingTargetPolicyResponse, error) {
+	return &ForwardingTargetPolicyResponse{Version: 1}, nil
+}
+
 func (s *handlerServer) AddInbound(ctx context.Context, request *AddInboundRequest) (*AddInboundResponse, error) {
 	if err := core.AddInboundHandler(s.s, request.Inbound); err != nil {
 		return nil, err

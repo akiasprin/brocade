@@ -1,0 +1,714 @@
+/* 由 palette-mockup-gen.mjs 生成：苹果系配色的完整令牌，只在 palette-mockup 里加载。
+   两个轴与 macOS 相同：<html> 的 data-base 选中性底（iOS / macOS 系统灰），data-accent 选强调色。
+   data-palette 保留；暗色块带 :not([data-theme='light'])，特异度不低于生产的主题块与调色盘块，且在它们之后加载。 */
+
+/* ── iOS ── */
+:root[data-base='ios']:not([data-theme='light']) {
+  --ground: #000000;
+  --sheet: #121214;
+  --surface: #0d0d0e;
+  --block: #1c1c1e;
+  --band: #18181a;
+  --sunk: #0a0a0b;
+  --line: #2a2a2c;
+  --grid-line: #2a2a2c;
+  --line-soft: rgba(255, 255, 255, 0.05);
+  --grid-image: none;
+  --ink: #f5f5f7;
+  --ink-2: #d1d1d6;
+  --ink-3: #98989d;
+  --ink-4: #6c6c70;
+  --ok: #30d158;
+  --gold: #ff9f0a;
+  --err: #ff453a;
+  --add: rgba(48, 209, 88, 0.16);
+  --del: rgba(255, 69, 58, 0.14);
+  --add-ink: #30d158;
+  --del-ink: #ff453a;
+  --btn: #2c2c2e;
+  --btn-h: #3a3a3c;
+  --btn-a: #48484a;
+  --hover: color-mix(in srgb, var(--ink) 6%, transparent);
+  --hover-2: color-mix(in srgb, var(--ink) 10%, transparent);
+  --hue-1: #91a0b1;
+  --hue-2: #89a4a7;
+  --hue-3: #a19baf;
+  --hue-4: #8ca2ae;
+  --scrim: rgba(0, 0, 0, 0.5);
+  --shadow: 0 2px 8px rgba(0, 0, 0, 0.5), 0 12px 32px rgba(0, 0, 0, 0.45);
+  --sheet-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 3px 10px rgba(0, 0, 0, 0.25);
+}
+:root[data-base='ios'][data-theme='light'] {
+  --ground: #f2f2f7;
+  --sheet: #ffffff;
+  --surface: #fafafc;
+  --block: #fbfbfd;
+  --card: #ffffff;
+  --band: #f5f5f7;
+  --sunk: #f2f2f7;
+  --line: #e5e5ea;
+  --grid-line: #e5e5ea;
+  --line-soft: rgba(0, 0, 0, 0.04);
+  --grid-image: none;
+  --ink: #1d1d1f;
+  --ink-2: #424245;
+  --ink-3: #6e6e73;
+  --ink-4: #86868b;
+  --ok: #008f35;
+  --gold: #c67200;
+  --err: #e91d19;
+  --add: rgba(0, 143, 53, 0.1);
+  --del: rgba(233, 29, 25, 0.09);
+  --add-ink: #008f35;
+  --del-ink: #e91d19;
+  --btn: #ffffff;
+  --btn-h: #f5f5f7;
+  --btn-a: #ebebf0;
+  --hover: color-mix(in srgb, var(--ink) 5%, transparent);
+  --hover-2: color-mix(in srgb, var(--ink) 8%, transparent);
+  --hue-1: #546577;
+  --hue-2: #4c696d;
+  --hue-3: #665f75;
+  --hue-4: #4f6774;
+  --scrim: rgba(0, 0, 0, 0.32);
+  --shadow: 0 2px 8px rgba(0, 0, 0, 0.06), 0 12px 32px rgba(0, 0, 0, 0.12);
+  --sheet-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 2px 10px rgba(0, 0, 0, 0.04);
+}
+
+/* iOS · 蓝 */
+:root[data-base='ios'][data-accent='blue']:not([data-theme='light']) {
+  --action: #0a84ff;
+  --action-hover: #499aff;
+  --action-active: #0072e1;
+  --action-wash: rgba(10, 132, 255, 0.18);
+  --action-on: #ffffff;
+  --data: #0a84ff;
+  --data-secondary: #8e8e93;
+  --data-wash: rgba(10, 132, 255, 0.14);
+  --primary: #0071e3;
+  --primary-hover: #0074e8;
+  --primary-active: #006edb;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #0a84ff;
+  --observe-2: #f74f9e;
+  --observe-3: #63e6e2;
+  --observe-4: #bf5af2;
+  --observe-5: #ffd60a;
+  --observe-6: #64d2ff;
+  --observe-7: #40c8e0;
+  --observe-8: #ac8e68;
+  --observe-9: #6262ec;
+  --observe-10: #8e8e93;
+  --code-n: #f74f9e;
+}
+:root[data-base='ios'][data-accent='blue'][data-theme='light'] {
+  --action: #0066cc;
+  --action-hover: #2179e0;
+  --action-active: #0056ad;
+  --action-wash: rgba(0, 102, 204, 0.1);
+  --action-on: #ffffff;
+  --data: #0070ea;
+  --data-secondary: #8d8c91;
+  --data-wash: rgba(0, 112, 234, 0.09);
+  --primary: #0071e3;
+  --primary-hover: #0074e8;
+  --primary-active: #006edb;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #0070ea;
+  --observe-2: #f34c9b;
+  --observe-3: #009e97;
+  --observe-4: #af52de;
+  --observe-5: #ac8900;
+  --observe-6: #0497cf;
+  --observe-7: #009bb2;
+  --observe-8: #a2845e;
+  --observe-9: #5856d6;
+  --observe-10: #8d8c91;
+  --code-n: #d52b82;
+}
+
+/* iOS · 紫 */
+:root[data-base='ios'][data-accent='purple']:not([data-theme='light']) {
+  --action: #bf5af2;
+  --action-hover: #cf75ff;
+  --action-active: #ac45dd;
+  --action-wash: rgba(191, 90, 242, 0.18);
+  --action-on: #ffffff;
+  --data: #bf5af2;
+  --data-secondary: #8e8e93;
+  --data-wash: rgba(191, 90, 242, 0.14);
+  --primary: #a749d5;
+  --primary-hover: #a94bd6;
+  --primary-active: #9a3bc8;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #bf5af2;
+  --observe-2: #63e6e2;
+  --observe-3: #0a84ff;
+  --observe-4: #f74f9e;
+  --observe-5: #ffd60a;
+  --observe-6: #64d2ff;
+  --observe-7: #6262ec;
+  --observe-8: #40c8e0;
+  --observe-9: #ac8e68;
+  --observe-10: #8e8e93;
+  --code-n: #f74f9e;
+}
+:root[data-base='ios'][data-accent='purple'][data-theme='light'] {
+  --action: #a042ce;
+  --action-hover: #b356e2;
+  --action-active: #8d2cba;
+  --action-wash: rgba(160, 66, 206, 0.1);
+  --action-on: #ffffff;
+  --data: #a648d4;
+  --data-secondary: #8d8c91;
+  --data-wash: rgba(166, 72, 212, 0.09);
+  --primary: #a749d5;
+  --primary-hover: #a94bd6;
+  --primary-active: #9a3bc8;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #a648d4;
+  --observe-2: #009e97;
+  --observe-3: #007aff;
+  --observe-4: #f34c9b;
+  --observe-5: #ac8900;
+  --observe-6: #0497cf;
+  --observe-7: #5856d6;
+  --observe-8: #009bb2;
+  --observe-9: #a2845e;
+  --observe-10: #8d8c91;
+  --code-n: #d52b82;
+}
+
+/* iOS · 粉 */
+:root[data-base='ios'][data-accent='pink']:not([data-theme='light']) {
+  --action: #f74f9e;
+  --action-hover: #ff74b0;
+  --action-active: #e1398c;
+  --action-wash: rgba(247, 79, 158, 0.18);
+  --action-on: #ffffff;
+  --data: #f74f9e;
+  --data-secondary: #8e8e93;
+  --data-wash: rgba(247, 79, 158, 0.14);
+  --primary: #d62c83;
+  --primary-hover: #d82e85;
+  --primary-active: #c81877;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #f74f9e;
+  --observe-2: #63e6e2;
+  --observe-3: #6262ec;
+  --observe-4: #64d2ff;
+  --observe-5: #ffd60a;
+  --observe-6: #bf5af2;
+  --observe-7: #0a84ff;
+  --observe-8: #40c8e0;
+  --observe-9: #ac8e68;
+  --observe-10: #8e8e93;
+  --code-n: #40c8e0;
+}
+:root[data-base='ios'][data-accent='pink'][data-theme='light'] {
+  --action: #cf227c;
+  --action-hover: #e53c8e;
+  --action-active: #b8006a;
+  --action-wash: rgba(207, 34, 124, 0.1);
+  --action-on: #ffffff;
+  --data: #d52b82;
+  --data-secondary: #8d8c91;
+  --data-wash: rgba(213, 43, 130, 0.09);
+  --primary: #d62c83;
+  --primary-hover: #d82e85;
+  --primary-active: #c81877;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #d52b82;
+  --observe-2: #009e97;
+  --observe-3: #5856d6;
+  --observe-4: #0497cf;
+  --observe-5: #ac8900;
+  --observe-6: #af52de;
+  --observe-7: #007aff;
+  --observe-8: #009bb2;
+  --observe-9: #a2845e;
+  --observe-10: #8d8c91;
+  --code-n: #008094;
+}
+
+/* iOS · 青 */
+:root[data-base='ios'][data-accent='teal']:not([data-theme='light']) {
+  --action: #40c8e0;
+  --action-hover: #58dcf4;
+  --action-active: #21b5cc;
+  --action-wash: rgba(64, 200, 224, 0.18);
+  --action-on: #ffffff;
+  --data: #40c8e0;
+  --data-secondary: #8e8e93;
+  --data-wash: rgba(64, 200, 224, 0.14);
+  --primary: #008094;
+  --primary-hover: #088296;
+  --primary-active: #007385;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #40c8e0;
+  --observe-2: #f74f9e;
+  --observe-3: #6262ec;
+  --observe-4: #bf5af2;
+  --observe-5: #ffd60a;
+  --observe-6: #0a84ff;
+  --observe-7: #ac8e68;
+  --observe-8: #64d2ff;
+  --observe-9: #63e6e2;
+  --observe-10: #8e8e93;
+  --code-n: #f74f9e;
+}
+:root[data-base='ios'][data-accent='teal'][data-theme='light'] {
+  --action: #007a8d;
+  --action-hover: #268c9f;
+  --action-active: #006777;
+  --action-wash: rgba(0, 122, 141, 0.1);
+  --action-on: #ffffff;
+  --data: #008094;
+  --data-secondary: #8d8c91;
+  --data-wash: rgba(0, 128, 148, 0.09);
+  --primary: #008094;
+  --primary-hover: #088296;
+  --primary-active: #007385;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #008094;
+  --observe-2: #f34c9b;
+  --observe-3: #5856d6;
+  --observe-4: #af52de;
+  --observe-5: #ac8900;
+  --observe-6: #007aff;
+  --observe-7: #a2845e;
+  --observe-8: #0497cf;
+  --observe-9: #009e97;
+  --observe-10: #8d8c91;
+  --code-n: #d52b82;
+}
+
+/* iOS · 石墨 */
+:root[data-base='ios'][data-accent='graphite']:not([data-theme='light']) {
+  --action: #f5f5f7;
+  --action-hover: #ffffff;
+  --action-active: #d1d1d6;
+  --action-wash: rgba(245, 245, 247, 0.12);
+  --action-on: #1d1d1f;
+  --data: #0a84ff;
+  --data-secondary: #8e8e93;
+  --data-wash: rgba(10, 132, 255, 0.14);
+  --primary: #f5f5f7;
+  --primary-hover: #ffffff;
+  --primary-active: #d1d1d6;
+  --primary-on: #1d1d1f;
+  --primary-line: transparent;
+  --observe-1: #0a84ff;
+  --observe-2: #f74f9e;
+  --observe-3: #63e6e2;
+  --observe-4: #bf5af2;
+  --observe-5: #ffd60a;
+  --observe-6: #64d2ff;
+  --observe-7: #40c8e0;
+  --observe-8: #ac8e68;
+  --observe-9: #6262ec;
+  --observe-10: #8e8e93;
+  --code-n: #bf5af2;
+}
+:root[data-base='ios'][data-accent='graphite'][data-theme='light'] {
+  --action: #1d1d1f;
+  --action-hover: #424245;
+  --action-active: #000000;
+  --action-wash: rgba(29, 29, 31, 0.07);
+  --action-on: #ffffff;
+  --data: #0070ea;
+  --data-secondary: #8d8c91;
+  --data-wash: rgba(0, 112, 234, 0.09);
+  --primary: #1d1d1f;
+  --primary-hover: #303033;
+  --primary-active: #000000;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #0070ea;
+  --observe-2: #f34c9b;
+  --observe-3: #009e97;
+  --observe-4: #af52de;
+  --observe-5: #ac8900;
+  --observe-6: #0497cf;
+  --observe-7: #009bb2;
+  --observe-8: #a2845e;
+  --observe-9: #5856d6;
+  --observe-10: #8d8c91;
+  --code-n: #a648d4;
+}
+
+/* ── macOS ── */
+:root[data-base='mac']:not([data-theme='light']) {
+  --ground: #1e1e1e;
+  --sheet: #252525;
+  --surface: #1e1e1e;
+  --block: #2d2d2d;
+  --band: #292929;
+  --sunk: #1a1a1a;
+  --line: #3a3a3a;
+  --grid-line: #3a3a3a;
+  --line-soft: rgba(255, 255, 255, 0.05);
+  --grid-image: none;
+  --ink: #ececec;
+  --ink-2: #c8c8c8;
+  --ink-3: #9a9a9a;
+  --ink-4: #737373;
+  --ok: #30d158;
+  --gold: #ff9f0a;
+  --err: #ff5c4e;
+  --add: rgba(48, 209, 88, 0.16);
+  --del: rgba(255, 92, 78, 0.14);
+  --add-ink: #30d158;
+  --del-ink: #ff5c4e;
+  --btn: #3a3a3a;
+  --btn-h: #444444;
+  --btn-a: #4e4e4e;
+  --hover: color-mix(in srgb, var(--ink) 6%, transparent);
+  --hover-2: color-mix(in srgb, var(--ink) 10%, transparent);
+  --hue-1: #91a0b1;
+  --hue-2: #89a4a7;
+  --hue-3: #a19baf;
+  --hue-4: #8ca2ae;
+  --scrim: rgba(0, 0, 0, 0.5);
+  --shadow: 0 2px 8px rgba(0, 0, 0, 0.5), 0 12px 32px rgba(0, 0, 0, 0.45);
+  --sheet-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 3px 10px rgba(0, 0, 0, 0.25);
+}
+:root[data-base='mac'][data-theme='light'] {
+  --ground: #ececec;
+  --sheet: #ffffff;
+  --surface: #f6f6f6;
+  --block: #fcfcfc;
+  --card: #ffffff;
+  --band: #f5f5f5;
+  --sunk: #f3f3f3;
+  --line: #e0e0e0;
+  --grid-line: #e0e0e0;
+  --line-soft: rgba(0, 0, 0, 0.04);
+  --grid-image: none;
+  --ink: #1f1f1f;
+  --ink-2: #444444;
+  --ink-3: #6e6e6e;
+  --ink-4: #8e8e8e;
+  --ok: #008f35;
+  --gold: #c67200;
+  --err: #e91d19;
+  --add: rgba(0, 143, 53, 0.1);
+  --del: rgba(233, 29, 25, 0.09);
+  --add-ink: #008f35;
+  --del-ink: #e91d19;
+  --btn: #ffffff;
+  --btn-h: #f5f5f5;
+  --btn-a: #ebebeb;
+  --hover: color-mix(in srgb, var(--ink) 5%, transparent);
+  --hover-2: color-mix(in srgb, var(--ink) 8%, transparent);
+  --hue-1: #546577;
+  --hue-2: #4c696d;
+  --hue-3: #665f75;
+  --hue-4: #4f6774;
+  --scrim: rgba(0, 0, 0, 0.32);
+  --shadow: 0 2px 8px rgba(0, 0, 0, 0.06), 0 12px 32px rgba(0, 0, 0, 0.12);
+  --sheet-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 2px 10px rgba(0, 0, 0, 0.04);
+}
+
+/* macOS · 蓝 */
+:root[data-base='mac'][data-accent='blue']:not([data-theme='light']) {
+  --action: #3c94ff;
+  --action-hover: #66a9ff;
+  --action-active: #2681ea;
+  --action-wash: rgba(60, 148, 255, 0.18);
+  --action-on: #ffffff;
+  --data: #3c94ff;
+  --data-secondary: #8e8e93;
+  --data-wash: rgba(60, 148, 255, 0.14);
+  --primary: #0071e3;
+  --primary-hover: #0074e8;
+  --primary-active: #006edb;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #3c94ff;
+  --observe-2: #f74f9e;
+  --observe-3: #63e6e2;
+  --observe-4: #bf5af2;
+  --observe-5: #ffd60a;
+  --observe-6: #64d2ff;
+  --observe-7: #40c8e0;
+  --observe-8: #ac8e68;
+  --observe-9: #7072fd;
+  --observe-10: #8e8e93;
+  --code-n: #fc53a2;
+}
+:root[data-base='mac'][data-accent='blue'][data-theme='light'] {
+  --action: #0066cc;
+  --action-hover: #2179e0;
+  --action-active: #0056ad;
+  --action-wash: rgba(0, 102, 204, 0.1);
+  --action-on: #ffffff;
+  --data: #0070ec;
+  --data-secondary: #8e8d92;
+  --data-wash: rgba(0, 112, 236, 0.09);
+  --primary: #0071e3;
+  --primary-hover: #0074e8;
+  --primary-active: #006edb;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #0070ec;
+  --observe-2: #f44d9c;
+  --observe-3: #009e97;
+  --observe-4: #af52de;
+  --observe-5: #ad8900;
+  --observe-6: #0497cf;
+  --observe-7: #009bb2;
+  --observe-8: #a2845e;
+  --observe-9: #5856d6;
+  --observe-10: #8e8d92;
+  --code-n: #d62c83;
+}
+
+/* macOS · 紫 */
+:root[data-base='mac'][data-accent='purple']:not([data-theme='light']) {
+  --action: #cb66fe;
+  --action-hover: #d589ff;
+  --action-active: #b852e9;
+  --action-wash: rgba(203, 102, 254, 0.18);
+  --action-on: #ffffff;
+  --data: #cb66fe;
+  --data-secondary: #8e8e93;
+  --data-wash: rgba(203, 102, 254, 0.14);
+  --primary: #a749d5;
+  --primary-hover: #a94bd6;
+  --primary-active: #9a3bc8;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #cb66fe;
+  --observe-2: #63e6e2;
+  --observe-3: #0a84ff;
+  --observe-4: #f74f9e;
+  --observe-5: #ffd60a;
+  --observe-6: #64d2ff;
+  --observe-7: #7072fd;
+  --observe-8: #40c8e0;
+  --observe-9: #ac8e68;
+  --observe-10: #8e8e93;
+  --code-n: #fc53a2;
+}
+:root[data-base='mac'][data-accent='purple'][data-theme='light'] {
+  --action: #9c3dca;
+  --action-hover: #af51de;
+  --action-active: #8927b6;
+  --action-wash: rgba(156, 61, 202, 0.1);
+  --action-on: #ffffff;
+  --data: #a649d5;
+  --data-secondary: #8e8d92;
+  --data-wash: rgba(166, 73, 213, 0.09);
+  --primary: #a749d5;
+  --primary-hover: #a94bd6;
+  --primary-active: #9a3bc8;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #a649d5;
+  --observe-2: #009e97;
+  --observe-3: #007aff;
+  --observe-4: #f44d9c;
+  --observe-5: #ad8900;
+  --observe-6: #0497cf;
+  --observe-7: #5856d6;
+  --observe-8: #009bb2;
+  --observe-9: #a2845e;
+  --observe-10: #8e8d92;
+  --code-n: #d62c83;
+}
+
+/* macOS · 粉 */
+:root[data-base='mac'][data-accent='pink']:not([data-theme='light']) {
+  --action: #fc53a2;
+  --action-hover: #ff7db4;
+  --action-active: #e63d90;
+  --action-wash: rgba(252, 83, 162, 0.18);
+  --action-on: #ffffff;
+  --data: #fc53a2;
+  --data-secondary: #8e8e93;
+  --data-wash: rgba(252, 83, 162, 0.14);
+  --primary: #d62c83;
+  --primary-hover: #d82e85;
+  --primary-active: #c81877;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #fc53a2;
+  --observe-2: #63e6e2;
+  --observe-3: #7072fd;
+  --observe-4: #64d2ff;
+  --observe-5: #ffd60a;
+  --observe-6: #bf5af2;
+  --observe-7: #0a84ff;
+  --observe-8: #40c8e0;
+  --observe-9: #ac8e68;
+  --observe-10: #8e8e93;
+  --code-n: #40c8e0;
+}
+:root[data-base='mac'][data-accent='pink'][data-theme='light'] {
+  --action: #ca1b79;
+  --action-hover: #e0378b;
+  --action-active: #b10067;
+  --action-wash: rgba(202, 27, 121, 0.1);
+  --action-on: #ffffff;
+  --data: #d62c83;
+  --data-secondary: #8e8d92;
+  --data-wash: rgba(214, 44, 131, 0.09);
+  --primary: #d62c83;
+  --primary-hover: #d82e85;
+  --primary-active: #c81877;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #d62c83;
+  --observe-2: #009e97;
+  --observe-3: #5856d6;
+  --observe-4: #0497cf;
+  --observe-5: #ad8900;
+  --observe-6: #af52de;
+  --observe-7: #007aff;
+  --observe-8: #009bb2;
+  --observe-9: #a2845e;
+  --observe-10: #8e8d92;
+  --code-n: #008094;
+}
+
+/* macOS · 青 */
+:root[data-base='mac'][data-accent='teal']:not([data-theme='light']) {
+  --action: #40c8e0;
+  --action-hover: #58dcf4;
+  --action-active: #21b5cc;
+  --action-wash: rgba(64, 200, 224, 0.18);
+  --action-on: #ffffff;
+  --data: #40c8e0;
+  --data-secondary: #8e8e93;
+  --data-wash: rgba(64, 200, 224, 0.14);
+  --primary: #008094;
+  --primary-hover: #088296;
+  --primary-active: #007385;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #40c8e0;
+  --observe-2: #f74f9e;
+  --observe-3: #7072fd;
+  --observe-4: #bf5af2;
+  --observe-5: #ffd60a;
+  --observe-6: #0a84ff;
+  --observe-7: #ac8e68;
+  --observe-8: #64d2ff;
+  --observe-9: #63e6e2;
+  --observe-10: #8e8e93;
+  --code-n: #fc53a2;
+}
+:root[data-base='mac'][data-accent='teal'][data-theme='light'] {
+  --action: #007688;
+  --action-hover: #25889a;
+  --action-active: #006373;
+  --action-wash: rgba(0, 118, 136, 0.1);
+  --action-on: #ffffff;
+  --data: #008094;
+  --data-secondary: #8e8d92;
+  --data-wash: rgba(0, 128, 148, 0.09);
+  --primary: #008094;
+  --primary-hover: #088296;
+  --primary-active: #007385;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #008094;
+  --observe-2: #f44d9c;
+  --observe-3: #5856d6;
+  --observe-4: #af52de;
+  --observe-5: #ad8900;
+  --observe-6: #007aff;
+  --observe-7: #a2845e;
+  --observe-8: #0497cf;
+  --observe-9: #009e97;
+  --observe-10: #8e8d92;
+  --code-n: #d62c83;
+}
+
+/* macOS · 石墨 */
+:root[data-base='mac'][data-accent='graphite']:not([data-theme='light']) {
+  --action: #ececec;
+  --action-hover: #ffffff;
+  --action-active: #c8c8c8;
+  --action-wash: rgba(236, 236, 236, 0.12);
+  --action-on: #1d1d1f;
+  --data: #3c94ff;
+  --data-secondary: #8e8e93;
+  --data-wash: rgba(60, 148, 255, 0.14);
+  --primary: #ececec;
+  --primary-hover: #ffffff;
+  --primary-active: #c8c8c8;
+  --primary-on: #1d1d1f;
+  --primary-line: transparent;
+  --observe-1: #3c94ff;
+  --observe-2: #f74f9e;
+  --observe-3: #63e6e2;
+  --observe-4: #bf5af2;
+  --observe-5: #ffd60a;
+  --observe-6: #64d2ff;
+  --observe-7: #40c8e0;
+  --observe-8: #ac8e68;
+  --observe-9: #7072fd;
+  --observe-10: #8e8e93;
+  --code-n: #cb66fe;
+}
+:root[data-base='mac'][data-accent='graphite'][data-theme='light'] {
+  --action: #1f1f1f;
+  --action-hover: #444444;
+  --action-active: #000000;
+  --action-wash: rgba(31, 31, 31, 0.07);
+  --action-on: #ffffff;
+  --data: #0070ec;
+  --data-secondary: #8e8d92;
+  --data-wash: rgba(0, 112, 236, 0.09);
+  --primary: #1f1f1f;
+  --primary-hover: #333333;
+  --primary-active: #000000;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --observe-1: #0070ec;
+  --observe-2: #f44d9c;
+  --observe-3: #009e97;
+  --observe-4: #af52de;
+  --observe-5: #ad8900;
+  --observe-6: #0497cf;
+  --observe-7: #009bb2;
+  --observe-8: #a2845e;
+  --observe-9: #5856d6;
+  --observe-10: #8e8d92;
+  --code-n: #a649d5;
+}
+
+/* ── 结构差异（不是令牌）──
+   苹果把「着色」与「填充」分开：链接、页签文字取 --action，选中与按下的实底取 --primary，白字对比不低于 4.5。
+   生产里下列 8 处是 --action 实底配 --action-on，这里改指 --primary 一组；落地时同样改这 8 处。 */
+:root[data-accent]
+  :is(
+    .fg-menu button:hover,
+    .pv-steps li.current i,
+    .wz-stages li.current > span,
+    .wz-protocols > label.on i,
+    .observe-range-menu .observe-range-apply,
+    .external-outbound-tabs button.on,
+    .ov-chips button[aria-pressed='true'],
+    .cg-steps li.current i
+  ) {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: var(--primary-on);
+}
+
+/* 石墨的操作色与正文同色，链接靠下划线辨认（同生产玄墨）。 */
+:root[data-accent='graphite'] a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}

@@ -138,6 +138,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
     let mldsa65_verify = general_purpose::URL_SAFE_NO_PAD.encode(vec![0_u8; 1952]);
     doc.external_outbounds = vec![
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-1111-1111".to_owned(),
             tenant: "platform".to_owned(),
             name: "VLESS".to_owned(),
@@ -161,6 +162,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-2222-2222".to_owned(),
             tenant: "platform".to_owned(),
             name: "SOCKS5".to_owned(),
@@ -174,6 +176,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-3333-3333".to_owned(),
             tenant: "platform".to_owned(),
             name: "VLESS XHTTP".to_owned(),
@@ -194,6 +197,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                         address: "download.example.net".to_owned(),
                         port: 8443,
                         security: ExternalOutboundSecurity::Tls {
+                            allow_insecure: false,
                             alpn: Vec::new(),
                             ech_config_list: None,
                             pinned_peer_cert_sha256: None,
@@ -219,6 +223,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-4444-4444".to_owned(),
             tenant: "platform".to_owned(),
             name: "HTTP CONNECT".to_owned(),
@@ -229,6 +234,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                 credential: String::new(),
             },
             security: ExternalOutboundSecurity::Tls {
+                allow_insecure: false,
                 alpn: vec!["h2".to_owned(), "http/1.1".to_owned()],
                 ech_config_list: Some("ech-config-list".to_owned()),
                 pinned_peer_cert_sha256: Some("00".repeat(32)),
@@ -239,6 +245,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-5555-5555".to_owned(),
             tenant: "platform".to_owned(),
             name: "SS2022".to_owned(),
@@ -252,6 +259,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-6666-6666".to_owned(),
             tenant: "platform".to_owned(),
             name: "Shadowsocks XChaCha20".to_owned(),
@@ -265,6 +273,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-7777-7777".to_owned(),
             tenant: "platform".to_owned(),
             name: "WireGuard".to_owned(),
@@ -285,6 +294,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-8888-8888".to_owned(),
             tenant: "platform".to_owned(),
             name: "VLESS WebSocket".to_owned(),
@@ -301,6 +311,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                 }),
             },
             security: ExternalOutboundSecurity::Tls {
+                allow_insecure: false,
                 alpn: Vec::new(),
                 ech_config_list: None,
                 pinned_peer_cert_sha256: None,
@@ -311,6 +322,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-9999-9999".to_owned(),
             tenant: "platform".to_owned(),
             name: "VLESS mKCP".to_owned(),
@@ -327,6 +339,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                 }),
             },
             security: ExternalOutboundSecurity::Tls {
+                allow_insecure: false,
                 alpn: Vec::new(),
                 ech_config_list: None,
                 pinned_peer_cert_sha256: None,
@@ -337,6 +350,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-aaaa-aaaa".to_owned(),
             tenant: "platform".to_owned(),
             name: "VLESS HTTP/2".to_owned(),
@@ -353,6 +367,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                 }),
             },
             security: ExternalOutboundSecurity::Tls {
+                allow_insecure: false,
                 alpn: Vec::new(),
                 ech_config_list: None,
                 pinned_peer_cert_sha256: None,
@@ -363,6 +378,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-bbbb-bbbb".to_owned(),
             tenant: "platform".to_owned(),
             name: "VLESS gRPC".to_owned(),
@@ -380,6 +396,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                 }),
             },
             security: ExternalOutboundSecurity::Tls {
+                allow_insecure: false,
                 alpn: Vec::new(),
                 ech_config_list: None,
                 pinned_peer_cert_sha256: None,
@@ -390,6 +407,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-cccc-cccc".to_owned(),
             tenant: "platform".to_owned(),
             name: "VLESS HTTPUpgrade".to_owned(),
@@ -406,6 +424,7 @@ fn external_proxy_protocols_load_in_the_real_binary() {
                 }),
             },
             security: ExternalOutboundSecurity::Tls {
+                allow_insecure: false,
                 alpn: Vec::new(),
                 ech_config_list: None,
                 pinned_peer_cert_sha256: None,
@@ -475,6 +494,7 @@ fn managed_warp_binding_lowers_into_a_config_the_real_binary_accepts() {
     };
     let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
     doc.external_outbounds = vec![ExternalOutbound {
+        target_strategy: None,
         id: "warp-8f3a-2d71".to_owned(),
         tenant: "platform".to_owned(),
         name: "Cloudflare WARP".to_owned(),
@@ -1727,7 +1747,7 @@ fn split_reality_upload_and_tls_download_load_in_the_real_binary() {
                     && tags
                         .iter()
                         .any(|tag| tag == "in:relay/i-relay:download:8443")
-            }) && rule["outboundTag"] == "out:internal"
+            }) && rule["outboundTag"] == xray::SPLIT_FRONT_OUTBOUND_TAG
         }));
 
     let dir = std::env::temp_dir().join("brocade-xray-split");
@@ -2828,21 +2848,10 @@ fn the_pinned_tag_matches_the_binary_these_tests_use() {
     );
 }
 
-/// The point of naming every rule: a compiled table has to be installable into a running
-/// xray, so that a routing change stops costing every connection on the machine.
-///
-/// The procedure is fixed, and both halves of it are load-bearing. `adrules` **replaces**
-/// the table unless `-append` is given, and a replacement destroys the balancers — after
-/// which the liveness balancer cannot be rebuilt at all (`app/router: duplicate balancer
-/// tag` on the way back, and an unreferenced one is never reclaimed), so hop liveness
-/// would be silently dead for the rest of the process's life. Appending first also means
-/// the old rules, still ahead of the new ones, keep deciding until the moment they are
-/// removed, so no request is ever routed by a half-installed table.
-///
-/// That leaves one requirement on the compiler, which is what this test really guards:
-/// the two generations must not share a single `ruleTag`. Both tables are present at
-/// once during the append and xray rejects a duplicate — atomically, so a collision does
-/// not half-apply, it leaves the machine on its old routing while reporting a failure.
+/// A compiled table must replace the running rules in one atomic operation while
+/// rebuilding balancers against the existing observatory. Rule tags remain useful for
+/// inspecting the installed generation, but replacement does not require tags to
+/// differ between generations.
 #[test]
 fn a_compiled_rule_table_swaps_into_a_running_xray() {
     let Some(binary) = xray_binary() else {
@@ -2907,13 +2916,6 @@ fn a_compiled_rule_table_swaps_into_a_running_xray() {
     };
 
     let (old_tags, new_tags) = (tags_of(&before), tags_of(&after));
-    for tag in &new_tags {
-        assert!(
-            !old_tags.contains(tag),
-            "{tag} 两代都有：追加时 xray 会因 duplicate ruleTag 整批拒绝，机器留在旧路由上",
-        );
-    }
-
     let dir = std::env::temp_dir().join("brocade-rule-swap");
     fs::create_dir_all(&dir).unwrap();
     let api = "127.0.0.1:19187";
@@ -2982,8 +2984,7 @@ fn a_compiled_rule_table_swaps_into_a_running_xray() {
                 .collect())
         };
 
-        // Every compiled rule is addressable. An unnamed one is reported as `{}` and
-        // `rmrules` cannot reach it, which would strand the whole table.
+        // Rule names identify the complete compiled generation in inspection output.
         let live = installed("装载后")?;
         if live != old_tags {
             return Err(format!(
@@ -2991,37 +2992,27 @@ fn a_compiled_rule_table_swaps_into_a_running_xray() {
             ));
         }
 
-        // The balancer is declared once, at startup, and must be referenced but never
-        // re-declared: sending `routing.balancers` again is rejected as a duplicate.
+        // Upstream replacement rebuilds balancers, so submit the complete routing block.
         let payload = dir.join("next.json");
         fs::write(
             &payload,
-            serde_json::to_string(&json!({ "routing": { "rules": rules_of(&after) } })).unwrap(),
+            serde_json::to_string(
+                &json!({ "routing": serde_json::from_str::<Value>(&after).unwrap()["routing"] }),
+            )
+            .unwrap(),
         )
         .map_err(|error| error.to_string())?;
 
-        let (ok, text) = api_call(&["adrules", "-append", payload.to_str().unwrap()]);
+        let (ok, text) = api_call(&["adrules", payload.to_str().unwrap()]);
         if !ok {
-            return Err(format!("追加新表失败：{text}"));
+            return Err(format!("原子替换规则表失败：{text}"));
         }
-        let both = installed("追加后")?;
-        if both.len() != old_tags.len() + new_tags.len() {
-            return Err(format!("追加后两代应当并存，实际 {both:?}"));
-        }
-
-        let mut remove = vec!["rmrules"];
-        remove.extend(old_tags.iter().map(String::as_str));
-        let (ok, text) = api_call(&remove);
-        if !ok {
-            return Err(format!("撤旧表失败：{text}"));
-        }
-        let live = installed("撤旧后")?;
+        let live = installed("替换后")?;
         if live != new_tags {
             return Err(format!("换表后剩下的不是新表：{live:?} vs {new_tags:?}"));
         }
 
-        // What a naive replace would have destroyed. Hop liveness rides on this balancer,
-        // and losing it produces no error anywhere — the probes simply stop.
+        // The rebuilt balancer must still resolve its existing observatory after replacement.
         let (ok, text) = api_call(&["bi", HOP_HEALTH_BALANCER_TAG]);
         if !ok {
             return Err(format!("换表后判活 balancer 没了：{text}"));

@@ -1,6 +1,6 @@
 # 验证标准
 
-验证从最接近改动的快速检查开始，再按影响面扩大。不得声称未实际运行的检查通过。
+验证以确认目标行为、关键约束和回归风险为目的，深度与范围遵循[工程哲学](../engineering-philosophy.md)的情境判断及实践与反思原则。下方矩阵和命令供选择参考，具体范围由任务决定。
 
 ## 选择原则
 
@@ -9,6 +9,7 @@
 - 协议、公共类型或跨 crate 行为：相关 crate 测试加 workspace 检查。
 - PostgreSQL 行为：普通测试加显式启用的 Docker 集成测试。
 - 前端页面：相邻 Node/Vitest 测试；公共组件、令牌或路由变化扩大到完整前端检查。
+- 前端视觉呈现：按[前端视觉验收](frontend.md#视觉验收)执行截图比较与实际看图，并配合相关行为验证。
 - Xray fork：受影响 Go 包的 test/vet；协议、并发或数据面热路径按 CI 运行 race、fuzz-seed 和真实进程场景。
 - Console 生成的 Xray 配置：普通测试必须执行本次 Console 构建所内嵌的 Xray；禁止隐式读取 `.tools/xray`、因本地工具缺失而跳过，或让本地与 CI 使用不同来源。只有显式开启的真实外部 E2E 可通过 `BROCADE_XRAY_BIN` 选择另一个待验产物。
 - 安装、部署或构建链：检查 `install.sh`、环境示例、目标架构和嵌入产物。
@@ -27,11 +28,21 @@ node --test tests/<name>.test.mjs
 npx vitest run tests/<name>.test.tsx --config vitest.config.ts
 ```
 
+涉及视觉呈现时，另运行 `npm run test:visual`，首次使用先执行 `npx playwright install chromium`。当前 `npm test` 不包含该入口；运行环境与报告位置见[视觉测试配置](../../frontend/playwright.config.ts)，验收要求仍由[前端标准](frontend.md#视觉验收)统一维护。
+
 ```sh
 cd components/xray-core
 go test ./path/to/changed/package
 go vet ./path/to/changed/package
 ```
+
+Node 入口中的浏览器用例串行运行，避免多个 Vite/Chromium 测试文件与构建同时抢占资源。
+每个自行创建 Vite 的浏览器夹具使用独立临时缓存并在结束后删除；不要通过增加超时或重试掩盖失败。
+浏览器用例与 Docker PostgreSQL 集成测试不能同时运行：容器网卡增删会触发 Chromium 的
+`ERR_NETWORK_CHANGED` 并取消本机模块请求。CI 按顺序执行，本地发布检查也必须先结束数据库测试。
+
+Console 升级发布必须通过[官方 v0.3.1 强制真实验收](../../scripts/tests/upgrade/README.md)，包括
+外置与受管 PostgreSQL。CI 使用同次发行构建的产物，不允许仅用模拟服务或空匹配结果代替。
 
 ## PostgreSQL 集成测试
 

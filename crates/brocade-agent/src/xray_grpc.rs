@@ -25,7 +25,11 @@ use brocade_deployment::protocol::{
 
 mod transport;
 
+pub(crate) use transport::deadline_after;
+
 const ADD_INBOUND_PATH: &str = "/xray.app.proxyman.command.HandlerService/AddInbound";
+const FORWARDING_POLICY_PATH: &str =
+    "/xray.app.proxyman.command.HandlerService/GetForwardingTargetPolicy";
 const REMOVE_INBOUND_PATH: &str = "/xray.app.proxyman.command.HandlerService/RemoveInbound";
 const LIST_INBOUNDS_PATH: &str = "/xray.app.proxyman.command.HandlerService/ListInbounds";
 const ALTER_INBOUND_PATH: &str = "/xray.app.proxyman.command.HandlerService/AlterInbound";
@@ -42,7 +46,7 @@ const HYSTERIA2_ACCOUNT: &str = "xray.proxy.hysteria.account.Account";
 const ANYTLS_ACCOUNT: &str = "xray.proxy.anytls.Account";
 const MTPROTO_ACCOUNT: &str = "xray.proxy.mtproto.Account";
 const RECEIVER_CONFIG: &str = "xray.app.proxyman.ReceiverConfig";
-const DOKODEMO_CONFIG: &str = "xray.proxy.dokodemo.Config";
+const FORWARDING_CONFIG: &str = "xray.proxy.dokodemo.ForwardingConfig";
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const END_STREAM: u8 = 0x1;
 const ACK: u8 = 0x1;
@@ -142,9 +146,104 @@ pub(crate) fn add_forwarding_inbound(
     listen_port: u16,
     target_host: &str,
     target_port: u16,
+    allow_private_targets: bool,
 ) -> Result<(), String> {
-    let request = forwarding_inbound_request(tag, protocol, listen_port, target_host, target_port);
+    let request = forwarding_inbound_request(
+        tag,
+        protocol,
+        listen_port,
+        target_host,
+        target_port,
+        allow_private_targets,
+    );
     grpc_unary(api_address, ADD_INBOUND_PATH, &request).map(|_| ())
+}
+
+pub(crate) fn forwarding_target_policy_supported(api_address: SocketAddr) -> bool {
+    let Ok(response) = grpc_unary(api_address, FORWARDING_POLICY_PATH, &[]) else {
+        return false;
+    };
+    let mut cursor = 0;
+    while let Ok(Some((number, field))) = next_field(&response, &mut cursor) {
+        if let (1, Field::Varint(version)) = (number, field) {
+            return version >= 1;
+        }
+    }
+    false
+}
+
+/// Missing checkpoints cannot prove the destination of a live listener. Inspect the actual
+/// proxy settings before preserving a public-IP listener during recovery.
+pub(crate) fn forwarding_target_is_public(api_address: SocketAddr, tag: &str) -> bool {
+    let inspect = || -> Result<bool, String> {
+        let response = grpc_unary(api_address, LIST_INBOUNDS_PATH, &[])?;
+        let mut cursor = 0;
+        while let Some((number, field)) = next_field(&response, &mut cursor)? {
+            if let (1, Field::Bytes(inbound)) = (number, field) {
+                let mut inbound_cursor = 0;
+                let mut found = false;
+                let mut proxy = None;
+                while let Some((number, field)) = next_field(inbound, &mut inbound_cursor)? {
+                    match (number, field) {
+                        (1, Field::Bytes(value)) => found = value == tag.as_bytes(),
+                        (3, Field::Bytes(value)) => proxy = Some(value),
+                        _ => {}
+                    }
+                }
+                if found {
+                    return proxy
+                        .map(decode_public_forwarding_target)
+                        .transpose()
+                        .map(|value| value.unwrap_or(false));
+                }
+            }
+        }
+        Ok(false)
+    };
+    // Failure to inspect never authorizes preserving an unproven destination.
+    inspect().unwrap_or(false)
+}
+
+fn decode_public_forwarding_target(message: &[u8]) -> Result<bool, String> {
+    fn bytes(message: &[u8], wanted: u32) -> Result<Option<&[u8]>, String> {
+        let mut cursor = 0;
+        while let Some((number, field)) = next_field(message, &mut cursor)? {
+            if let Field::Bytes(value) = field {
+                if number == wanted {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        Ok(None)
+    }
+    let name = bytes(message, 1)?.unwrap_or_default();
+    let mut proxy = bytes(message, 2)?.unwrap_or_default();
+    if name == FORWARDING_CONFIG.as_bytes() {
+        proxy = bytes(proxy, 1)?.unwrap_or_default();
+    } else if name != b"xray.proxy.dokodemo.Config" {
+        return Ok(false);
+    }
+    let address = bytes(proxy, 1)?.unwrap_or_default();
+    let ip = bytes(address, 1)?;
+    let domain = bytes(address, 2)?;
+    if ip.is_some() && domain.is_some() {
+        return Ok(false);
+    }
+    if let Some(ip) = ip {
+        let ip = match ip.len() {
+            4 => IpAddr::V4(std::net::Ipv4Addr::from(
+                <[u8; 4]>::try_from(ip).map_err(|_| "invalid IPv4 address")?,
+            )),
+            16 => IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(ip).map_err(|_| "invalid IPv6 address")?,
+            )),
+            _ => return Ok(false),
+        };
+        return Ok(!brocade_core::forwarding::target_ip_is_blocked(ip));
+    }
+    Ok(domain
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .is_some_and(brocade_core::forwarding::target_host_is_public_ip))
 }
 
 fn forwarding_inbound_request(
@@ -153,6 +252,7 @@ fn forwarding_inbound_request(
     listen_port: u16,
     target_host: &str,
     target_port: u16,
+    allow_private_targets: bool,
 ) -> Vec<u8> {
     let mut port_range = Vec::new();
     varint_field(&mut port_range, 1, u64::from(listen_port));
@@ -171,6 +271,11 @@ fn forwarding_inbound_request(
     let mut proxy = Vec::new();
     message_field(&mut proxy, 1, &address);
     varint_field(&mut proxy, 2, u64::from(target_port));
+    let mut policy = Vec::new();
+    for cidr in brocade_core::forwarding::blocked_target_cidrs(allow_private_targets) {
+        bytes_field(&mut policy, 1, cidr.as_bytes());
+    }
+    message_field(&mut proxy, 8, &policy);
     if matches!(
         protocol,
         ForwardingProtocol::Tcp | ForwardingProtocol::TcpUdp
@@ -187,7 +292,13 @@ fn forwarding_inbound_request(
     let mut inbound = Vec::new();
     bytes_field(&mut inbound, 1, tag.as_bytes());
     message_field(&mut inbound, 2, &typed_message(RECEIVER_CONFIG, &receiver));
-    message_field(&mut inbound, 3, &typed_message(DOKODEMO_CONFIG, &proxy));
+    let mut protected_proxy = Vec::new();
+    message_field(&mut protected_proxy, 1, &proxy);
+    message_field(
+        &mut inbound,
+        3,
+        &typed_message(FORWARDING_CONFIG, &protected_proxy),
+    );
     let mut request = Vec::new();
     message_field(&mut request, 1, &inbound);
     request
@@ -929,6 +1040,7 @@ mod tests {
             20_042,
             "example.com",
             8443,
+            false,
         );
         let inbound = bytes_fields(&request, 1).remove(0);
         assert_eq!(bytes_fields(&inbound, 1), [b"fwd:42".to_vec()]);
@@ -943,11 +1055,55 @@ mod tests {
 
         let proxy = bytes_fields(&inbound, 3).remove(0);
         let (proxy_type, proxy) = typed_value(&proxy);
-        assert_eq!(proxy_type, DOKODEMO_CONFIG);
+        assert_eq!(proxy_type, FORWARDING_CONFIG);
+        let proxy = bytes_fields(&proxy, 1).remove(0);
         let address = bytes_fields(&proxy, 1).remove(0);
         assert_eq!(bytes_fields(&address, 2), [b"example.com".to_vec()]);
         assert_eq!(varint_fields(&proxy, 2), [8443]);
         assert_eq!(varint_fields(&proxy, 7), [2, 3]);
+        let policy = bytes_fields(&proxy, 8).remove(0);
+        let blocked = bytes_fields(&policy, 1);
+        assert!(blocked.contains(&b"127.0.0.0/8".to_vec()));
+        assert!(blocked.contains(&b"10.0.0.0/8".to_vec()));
+    }
+
+    #[test]
+    fn recovery_proves_the_actual_forwarding_target_instead_of_trusting_its_tag() {
+        for (host, public) in [
+            ("1.1.1.1", true),
+            ("2606:4700:4700::1111", true),
+            ("127.0.0.1", false),
+            ("::ffff:127.0.0.1", false),
+            ("localhost", false),
+            ("10.0.0.1", false),
+        ] {
+            let request = forwarding_inbound_request(
+                "fwd:42",
+                ForwardingProtocol::Tcp,
+                40042,
+                host,
+                443,
+                false,
+            );
+            let inbound = bytes_fields(&request, 1).remove(0);
+            let proxy = bytes_fields(&inbound, 3).remove(0);
+            assert_eq!(
+                decode_public_forwarding_target(&proxy).unwrap(),
+                public,
+                "{host}"
+            );
+            let (_, protected) = typed_value(&proxy);
+            let legacy = bytes_fields(&protected, 1).remove(0);
+            assert_eq!(
+                decode_public_forwarding_target(&typed_message(
+                    "xray.proxy.dokodemo.Config",
+                    &legacy
+                ))
+                .unwrap(),
+                public,
+                "legacy {host}"
+            );
+        }
     }
 
     #[test]

@@ -162,6 +162,7 @@ fn external_vless_rejects_fields_the_embedded_xray_cannot_preserve() {
     };
     doc.external_outbounds = vec![
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-grpc".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "gRPC".to_owned(),
@@ -179,6 +180,7 @@ fn external_vless_rejects_fields_the_embedded_xray_cannot_preserve() {
                 }),
             },
             security: ExternalOutboundSecurity::Tls {
+                allow_insecure: false,
                 alpn: Vec::new(),
                 ech_config_list: None,
                 pinned_peer_cert_sha256: Some("not-a-sha256".to_owned()),
@@ -189,6 +191,7 @@ fn external_vless_rejects_fields_the_embedded_xray_cannot_preserve() {
             bindings: Vec::new(),
         },
         ExternalOutbound {
+            target_strategy: None,
             id: "custom-reality".to_owned(),
             tenant: "platform.acme".to_owned(),
             name: "REALITY".to_owned(),
@@ -266,6 +269,7 @@ fn external_shadowsocks_accepts_classic_and_ss2022_credentials_on_raw_transport(
         grants: Vec::new(),
     };
     doc.external_outbounds = vec![ExternalOutbound {
+        target_strategy: None,
         id: "custom-1111-1111".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "SS".to_owned(),
@@ -276,6 +280,7 @@ fn external_shadowsocks_accepts_classic_and_ss2022_credentials_on_raw_transport(
             method: "aes-256-gcm".to_owned(),
         },
         security: ExternalOutboundSecurity::Tls {
+            allow_insecure: false,
             alpn: Vec::new(),
             ech_config_list: None,
             pinned_peer_cert_sha256: None,
@@ -384,6 +389,7 @@ fn managed_warp_runtime_overrides_are_validated() {
         grants: Vec::new(),
     };
     doc.external_outbounds = vec![ExternalOutbound {
+        target_strategy: None,
         id: "warp-8f3a-2d71".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "Cloudflare WARP".to_owned(),
@@ -441,6 +447,7 @@ fn managed_vpngate_pool_is_node_only_and_validates_its_selection_policy() {
         true,
     )]);
     doc.external_outbounds = vec![ExternalOutbound {
+        target_strategy: None,
         id: "vpngate-1111-1111".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "VPN Gate 日本".to_owned(),
@@ -455,6 +462,7 @@ fn managed_vpngate_pool_is_node_only_and_validates_its_selection_policy() {
             max_candidates: 0,
         },
         security: ExternalOutboundSecurity::Tls {
+            allow_insecure: false,
             alpn: Vec::new(),
             ech_config_list: None,
             pinned_peer_cert_sha256: None,
@@ -513,6 +521,7 @@ fn managed_vpngate_pool_is_node_only_and_validates_its_selection_policy() {
 fn managed_vpngate_pool_rejects_the_reserved_unknown_region() {
     let mut model = doc(Vec::new());
     model.external_outbounds.push(ExternalOutbound {
+        target_strategy: None,
         id: "vpngate-1111-1111".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "unknown region".to_owned(),
@@ -560,6 +569,7 @@ fn vpngate_manual_pool_validates_members_and_keeps_legacy_defaults() {
     assert!(server_ids.is_empty());
     let mut model = doc(Vec::new());
     model.external_outbounds.push(ExternalOutbound {
+        target_strategy: None,
         id: "vpngate-1111-1111".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "manual".to_owned(),
@@ -650,6 +660,7 @@ fn vpngate_runtime_limit_is_per_referencing_node_not_the_global_catalogue() {
     )]);
     doc.external_outbounds = (0..17)
         .map(|index| ExternalOutbound {
+            target_strategy: None,
             id: format!("vpngate-{index:04x}-0000"),
             tenant: "platform.acme".to_owned(),
             name: format!("VPN Gate {index}"),
@@ -733,6 +744,7 @@ fn external_tunnel_visibility_follows_tenant_ancestry() {
         grants: Vec::new(),
     };
     doc.external_outbounds = vec![ExternalOutbound {
+        target_strategy: None,
         id: "custom-2222-2222".to_owned(),
         tenant: "platform".to_owned(),
         name: "共享出口".to_owned(),
@@ -794,6 +806,7 @@ fn external_vless_websocket_validates_path_host_and_flow() {
         grants: Vec::new(),
     };
     doc.external_outbounds = vec![ExternalOutbound {
+        target_strategy: None,
         id: "custom-4444-4444".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "External WebSocket".to_owned(),
@@ -810,6 +823,7 @@ fn external_vless_websocket_validates_path_host_and_flow() {
             }),
         },
         security: ExternalOutboundSecurity::Tls {
+            allow_insecure: false,
             alpn: Vec::new(),
             ech_config_list: None,
             pinned_peer_cert_sha256: None,
@@ -887,6 +901,7 @@ fn external_vless_xhttp_validates_the_complete_upload_and_download_shape() {
         grants: Vec::new(),
     };
     doc.external_outbounds = vec![ExternalOutbound {
+        target_strategy: None,
         id: "custom-3333-3333".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "External XHTTP".to_owned(),
@@ -915,6 +930,7 @@ fn external_vless_xhttp_validates_the_complete_upload_and_download_shape() {
             }),
         },
         security: ExternalOutboundSecurity::Tls {
+            allow_insecure: false,
             alpn: Vec::new(),
             ech_config_list: None,
             pinned_peer_cert_sha256: None,
@@ -962,6 +978,7 @@ fn external_vless_xhttp_validates_the_complete_upload_and_download_shape() {
         address: "download.example.net".to_owned(),
         port: 443,
         security: ExternalOutboundSecurity::Tls {
+            allow_insecure: false,
             alpn: Vec::new(),
             ech_config_list: None,
             pinned_peer_cert_sha256: None,
@@ -1016,6 +1033,7 @@ fn external_socks_auth_and_wireguard_shape_are_validated() {
         grants: Vec::new(),
     };
     doc.external_outbounds = vec![ExternalOutbound {
+        target_strategy: None,
         id: "custom-3333-3333".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "External".to_owned(),
@@ -1026,6 +1044,7 @@ fn external_socks_auth_and_wireguard_shape_are_validated() {
             credential: String::new(),
         },
         security: ExternalOutboundSecurity::Tls {
+            allow_insecure: false,
             alpn: Vec::new(),
             ech_config_list: None,
             pinned_peer_cert_sha256: None,
@@ -5315,6 +5334,7 @@ fn proxy_outbound_security_requires_tls_for_anytls_and_accepts_native_encryption
         steps: vec![],
     };
     doc.external_outbounds = vec![ExternalOutbound {
+        target_strategy: None,
         id: "custom-4444-4444".to_owned(),
         tenant: "platform.acme".to_owned(),
         name: "Proxy".to_owned(),
@@ -5370,6 +5390,7 @@ fn proxy_outbound_security_requires_tls_for_anytls_and_accepts_native_encryption
         transport: ExternalVlessTransport::Raw,
     };
     doc.external_outbounds[0].security = ExternalOutboundSecurity::Tls {
+        allow_insecure: false,
         alpn: Vec::new(),
         ech_config_list: None,
         pinned_peer_cert_sha256: None,

@@ -1,0 +1,194 @@
+/* 读数栏里的「重置日」「有效期」：与上方「计量口径」同一组，左标签、右取值。
+   可编辑时整块是一个按钮，四周外扩 8px 铺悬停面，文字仍与读数栏其余各行对齐。 */
+.user-service-terms {
+  display: grid;
+  width: calc(100% + 16px);
+  box-sizing: border-box;
+  gap: 7px;
+  margin: -8px -8px -4px;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+}
+.user-service-terms > * {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.user-service-term-key {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+.user-service-term-value {
+  overflow: hidden;
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-service-term-value.gold {
+  color: var(--gold);
+}
+.user-service-term-value.err {
+  color: var(--err);
+}
+button.user-service-terms {
+  cursor: pointer;
+}
+button.user-service-terms .user-service-term-value::after {
+  content: '›' / '';
+  margin-left: 6px;
+  color: var(--ink-4);
+}
+@media (hover: hover) and (pointer: fine) {
+  button.user-service-terms:hover {
+    background: var(--hover);
+  }
+}
+button.user-service-terms[aria-expanded='true'] {
+  background: var(--action-wash);
+}
+button.user-service-terms:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 1px;
+}
+/* 窄卡的读数栏是两列网格，这两行与「计量口径」一样占满整行。 */
+@container user-usage (max-width: 620px) {
+  .user-service-terms {
+    grid-column: 1 / -1;
+  }
+}
+
+/* 编辑面板：贴在读数栏右侧，放不下时在下方（ui/dialog.tsx 的 popover）。 */
+.user-service-pop {
+  width: min(380px, calc(100vw - 16px));
+}
+.user-service-pop > header {
+  display: flex;
+  min-height: 44px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.user-service-pop h3 {
+  margin: 0 auto 0 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+.user-service-tz {
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.user-service-fields {
+  display: grid;
+  padding: 4px 14px;
+}
+.user-service-row {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.user-service-row:last-child {
+  border-bottom: 0;
+}
+.user-service-key {
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: var(--ctl-h);
+  white-space: nowrap;
+}
+.user-service-value {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+}
+input.f.user-service-day {
+  width: 64px;
+}
+input.f.user-service-time {
+  width: 196px;
+  max-width: 100%;
+}
+.user-service-pop input.f[aria-invalid='true'] {
+  border-color: var(--err);
+}
+.user-service-renew {
+  --ctl-h: 26px;
+  display: flex;
+  flex-basis: 100%;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.user-service-renew .btn {
+  font-variant-numeric: tabular-nums;
+}
+.user-service-problem {
+  margin: 0;
+  padding: 0 14px 6px 70px;
+  color: var(--err);
+  font-size: 11.5px;
+}
+.user-service-preview {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin: 2px 14px 0;
+  padding: 9px 0 0;
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+}
+.user-service-preview:empty {
+  display: none;
+}
+.user-service-preview > .callout {
+  flex-basis: 100%;
+}
+.user-service-shift {
+  padding: 0 6px;
+  border-radius: 4px;
+}
+.user-service-shift.ok {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
+}
+.user-service-shift.err {
+  color: var(--err);
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+}
+.user-service-pop > .callout {
+  margin: 10px 14px 0;
+}
+.user-service-pop > footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 14px 14px;
+}

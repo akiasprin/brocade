@@ -89,6 +89,11 @@ jobs:
           go test -race ./proxy ./proxy/freedom -count=1 -timeout=3m
           go vet ./proxy ./proxy/freedom
 
+      - name: DNS cache ownership and blackhole response synchronization
+        run: |
+          go test -race ./proxy/dns ./proxy/blackhole -count=3 -timeout=3m
+          go vet ./proxy/dns ./proxy/blackhole
+
       - name: Data-plane deterministic, kTLS and fuzz-seed tests
         run: |
           go test ./proxy/anytls -count=10 -timeout=5m
@@ -124,10 +129,22 @@ jobs:
         run: |
           go test -race ./testing/scenarios -run '^TestQuotaRevocationRealProcesses' -count=3 -timeout=5m
 
+      - name: Source IP admission, live sessions and trusted split frontend
+        run: |
+          go test -race ./common/sourceaccess ./app/proxyman/inbound ./transport/internet/splithttp -count=3 -timeout=3m
+          go vet ./common/sourceaccess ./app/proxyman/inbound ./transport/internet/websocket ./transport/internet/httpupgrade
+          # Existing splithttp protobuf config copies predate the source policy.
+          go vet -copylocks=false ./transport/internet/splithttp
+
       - name: Online source protocol tracking
         run: |
-          go test -race ./app/stats/... ./app/dispatcher ./features/stats -count=3 -timeout=3m
-          go vet ./app/stats/... ./app/dispatcher ./features/stats
+          go test -race ./app/stats/... ./app/dispatcher ./features/stats ./common/machinelimit -count=3 -timeout=3m
+          go vet ./app/stats/... ./app/dispatcher ./features/stats ./common/machinelimit
+
+      - name: Atomic routing reload, RPC and webhook concurrency regressions
+        run: |
+          go test -race ./app/router/... -count=3 -timeout=3m
+          go vet ./app/router/...
 
       - name: Site observation catalog and deterministic importer
         run: |
@@ -297,6 +314,20 @@ jobs:
 
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Bind real Xray tests to this Console build
+        run: |
+          set -euo pipefail
+          mapfile -t xray_candidates < <(find target/debug/build -path '*/out/xray-x86_64' -type f -print)
+          test "${#xray_candidates[@]}" -gt 0
+          expected_sha=$(sha256sum "${xray_candidates[0]}" | cut -d ' ' -f 1)
+          for candidate in "${xray_candidates[@]}"; do
+            test "$(sha256sum "$candidate" | cut -d ' ' -f 1)" = "$expected_sha"
+          done
+          install -m 0755 "${xray_candidates[0]}" "$RUNNER_TEMP/check-xray"
+          sh scripts/prepare-xray-assets.sh
+          echo "BROCADE_XRAY_BIN=$RUNNER_TEMP/check-xray" >> "$GITHUB_ENV"
+          echo "XRAY_LOCATION_ASSET=$GITHUB_WORKSPACE/components/xray-core/resources" >> "$GITHUB_ENV"
+
       # BROCADE_RUN_PG_TESTS is not optional here. Without it the integration tests skip silently
       # and CI is green all the same — and what green means quietly becomes "nobody has exercised
       # the database layer". The runner ships docker, so testcontainers starts.
@@ -430,6 +461,7 @@ jobs:
         if: matrix.arch == 'x86_64' && matrix.libc == 'musl'
         env:
           BROCADE_RUN_LAUNCHER_PG_TESTS: "1"
+          BROCADE_UPGRADE_CONSOLE_BIN: ${{ github.workspace }}/target/${{ matrix.triple }}/release/brocade-console
           BROCADE_ZIG_TARGET: x86_64-linux-musl
           CC_x86_64_unknown_linux_musl: ${{ github.workspace }}/scripts/zig-cc
           AR_x86_64_unknown_linux_musl: ${{ github.workspace }}/scripts/zig-ar
@@ -505,4 +537,72 @@ jobs:
           path: |
             ${{ steps.dist.outputs.archive }}
             ${{ steps.dist.outputs.checksum }}
+          if-no-files-found: error
+
+  upgrade-v031:
+    name: mandatory v0.3.1 real upgrade and restore
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Read the candidate version
+        id: version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: brocade-dist-${{ steps.version.outputs.value }}-linux-x86_64-gnu
+          path: upgrade-inputs/candidate-archive
+
+      - name: Verify the candidate and exact official v0.3.1 baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          mkdir -p upgrade-inputs/candidate upgrade-inputs/old
+          (cd upgrade-inputs/candidate-archive && sha256sum -c *.sha256)
+          tar -xzf upgrade-inputs/candidate-archive/*.tar.gz --strip-components=1 -C upgrade-inputs/candidate
+          cmp install.sh upgrade-inputs/candidate/install.sh
+          gh release download v0.3.1 --repo "$GITHUB_REPOSITORY" \
+            --pattern 'brocade-dist-0.3.1-linux-x86_64-gnu.tar.gz*' --dir upgrade-inputs/old
+          (cd upgrade-inputs/old && sha256sum -c *.sha256)
+          echo '9f92762df9486ec7103b7016a4d0f107fc09e60a5628b18a3d405f5d64226837  upgrade-inputs/old/brocade-dist-0.3.1-linux-x86_64-gnu.tar.gz' | sha256sum -c -
+
+      - name: Require KVM and prepare a verified Ubuntu guest
+        run: |
+          set -eu
+          test -c /dev/kvm
+          sudo chmod a+rw /dev/kvm
+          docker build -t brocade-upgrade-qemu:ci scripts/tests/upgrade
+          base=https://cloud-images.ubuntu.com/releases/24.04/release
+          curl --fail --location --retry 3 --max-time 180 \
+            "$base/ubuntu-24.04-server-cloudimg-amd64.img" -o upgrade-inputs/ubuntu.img
+          curl --fail --location --retry 3 --max-time 60 "$base/SHA256SUMS" -o upgrade-inputs/SHA256SUMS
+          digest=$(awk '$2 == "*ubuntu-24.04-server-cloudimg-amd64.img" {print $1}' upgrade-inputs/SHA256SUMS)
+          test ${#digest} -eq 64
+          echo "$digest  upgrade-inputs/ubuntu.img" | sha256sum -c -
+          echo "UPGRADE_VM_SHA256=$digest" >> "$GITHUB_ENV"
+
+      - name: Real v0.3.1 upgrade, rollback, preserved billing and reboot
+        run: |
+          python3 scripts/tests/upgrade/run_kvm.py \
+            --console upgrade-inputs/candidate/brocade-console \
+            --launcher upgrade-inputs/candidate/brocade-launcher \
+            --release-031 upgrade-inputs/old/brocade-dist-0.3.1-linux-x86_64-gnu.tar.gz \
+            --vm-image upgrade-inputs/ubuntu.img --vm-image-sha256 "$UPGRADE_VM_SHA256" \
+            --qemu-image brocade-upgrade-qemu:ci --output upgrade-acceptance
+          python3 -c 'import json; r=json.load(open("upgrade-acceptance/results/result.json")); assert r["passed"] and r["versions"] == ["v0.3.1"]'
+
+      - name: Preserve real upgrade evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: upgrade-v031-evidence
+          path: |
+            upgrade-acceptance/manifest.json
+            upgrade-acceptance/results
           if-no-files-found: error

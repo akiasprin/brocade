@@ -1,0 +1,602 @@
+/* 用户「账期与有效期」改版 mockup。页面主体是生产的用户页，这里只补审阅外壳（mk-）和改版部件（usm-）。 */
+
+/* ── 审阅外壳：不属于设计 ── */
+html,
+body {
+  height: auto;
+  min-height: 100%;
+  overflow: auto !important;
+}
+body {
+  margin: 0;
+  background: var(--ground);
+}
+.mk-bar {
+  position: sticky;
+  z-index: 30;
+  top: 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--sheet);
+}
+.mk-bar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  padding: 10px 20px 6px;
+}
+.mk-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--ink);
+  font: 600 14px var(--sans);
+  white-space: nowrap;
+}
+.mk-title small {
+  color: var(--ink-4);
+  font: 400 10px var(--mono);
+  letter-spacing: 0.06em;
+}
+.mk-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-left: auto;
+}
+.mk-ctl {
+  --ctl-h: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.mk-ctl-label {
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.mk-ctl select {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  color: var(--ink);
+  font: 12px var(--sans);
+}
+.mk-ctl .segsw button {
+  padding: 0 9px;
+  font-size: 12px;
+}
+.mk-scene-note {
+  margin: 0;
+  padding: 0 20px 9px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.mk-scene-note b {
+  margin-right: 10px;
+  color: var(--action);
+  font-weight: 600;
+}
+.mk-stage {
+  padding: 20px;
+}
+@media (max-width: 620px) {
+  .mk-stage {
+    padding: 12px;
+  }
+}
+.mk-hide-legacy .user-service-policy {
+  display: none;
+}
+.usm-slot {
+  display: contents;
+}
+
+/* ══ 方案 A / D：页头徽标 ══
+   常态与名称旁的「本期流量」角标同一写法（图标 + 灰字、无底），可点时才有悬停面；
+   七天内到期、未生效为注意色，已到期为错误色，此时加一层同色淡底。 */
+.usm-chip {
+  display: inline-flex;
+  height: 22px;
+  box-sizing: border-box;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  margin: 0 -4px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--ink-3);
+  background: transparent;
+  font: 500 11px/18px var(--sans);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.usm-chip.static {
+  cursor: default;
+}
+@media (hover: hover) and (pointer: fine) {
+  .usm-chip:not(.static):hover {
+    background: var(--hover);
+    color: var(--ink);
+  }
+}
+.usm-chip[aria-expanded='true'] {
+  background: var(--action-wash);
+  color: var(--action);
+}
+.usm-chip.gold,
+.usm-chip.gold:hover {
+  margin: 0;
+  border-color: color-mix(in srgb, var(--gold) 45%, var(--line));
+  color: var(--gold);
+  background: var(--gold-wash);
+}
+.usm-chip.err,
+.usm-chip.err:hover {
+  margin: 0;
+  border-color: color-mix(in srgb, var(--err) 45%, var(--line));
+  color: var(--err);
+  background: color-mix(in srgb, var(--err) 9%, transparent);
+}
+.usm-chip:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 1px;
+}
+/* 名称行放不下时徽标换到下一行，不挤掉用户名（生产的名称可缩到 0 宽）。 */
+.user-dhead .dname:has(.usm-chip) {
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+
+/* ══ 弹出面板（A、B） ══ */
+.usm-pop {
+  position: fixed;
+  z-index: 60;
+  box-sizing: border-box;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--float-sheet);
+  -webkit-backdrop-filter: var(--float-filter);
+  backdrop-filter: var(--float-filter);
+  box-shadow:
+    var(--float-edge),
+    0 18px 46px color-mix(in srgb, #000 30%, transparent),
+    0 2px 8px color-mix(in srgb, #000 16%, transparent);
+}
+
+/* ══ 共用编辑器 ══ */
+.usm-editor {
+  display: grid;
+}
+.usm-head {
+  display: flex;
+  min-height: 44px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px 8px 14px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.usm-head > span:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  margin-right: auto;
+}
+.usm-head b {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+.usm-head small {
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usm-head > button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: var(--ink-3);
+  background: transparent;
+  cursor: pointer;
+}
+.usm-head > button:hover {
+  color: var(--ink);
+  background: var(--hover-2);
+}
+.usm-tz {
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.usm-fields {
+  display: grid;
+  padding: 4px 14px;
+}
+.usm-row {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.usm-row:last-child {
+  border-bottom: 0;
+}
+.usm-k {
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: var(--ctl-h);
+  white-space: nowrap;
+}
+.usm-v {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+}
+input.f.usm-day {
+  width: 64px;
+}
+input.f.usm-time {
+  width: 196px;
+  max-width: 100%;
+}
+input.f[aria-invalid='true'] {
+  border-color: var(--err);
+}
+.usm-renew {
+  display: flex;
+  flex-basis: 100%;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.usm-renew button {
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  color: var(--ink-2);
+  background: transparent;
+  font: 11.5px var(--sans);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.usm-renew button:hover:not(:disabled) {
+  color: var(--ink);
+  background: var(--hover);
+}
+.usm-renew button:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 1px;
+}
+.usm-problem {
+  margin: 0;
+  padding: 0 14px 6px 70px;
+  color: var(--err);
+  font-size: 11.5px;
+}
+.usm-preview {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin: 2px 14px 0;
+  padding: 9px 0 0;
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+}
+.usm-shift {
+  padding: 0 6px;
+  border-radius: 4px;
+}
+.usm-shift.ok {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
+}
+.usm-shift.err {
+  color: var(--err);
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+}
+.usm-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 14px 14px;
+}
+
+/* ══ 方案 B：读数栏两行 ══
+   与「计量口径」同一组：左标签、右取值，整块是一个按钮；悬停或打开时铺一层面。 */
+.usm-terms {
+  display: grid;
+  width: calc(100% + 16px);
+  box-sizing: border-box;
+  gap: 7px;
+  margin: -10px -8px -4px;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.usm-terms.static {
+  cursor: default;
+}
+@media (hover: hover) and (pointer: fine) {
+  .usm-terms:not(.static):hover {
+    background: var(--hover);
+  }
+}
+.usm-terms[aria-expanded='true'] {
+  background: var(--action-wash);
+}
+.usm-terms:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 1px;
+}
+.usm-terms-edit {
+  display: none;
+}
+.usm-term {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.usm-term-k {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+.usm-term-v {
+  overflow: hidden;
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usm-term-v.gold {
+  color: var(--gold);
+}
+.usm-term-v.err {
+  color: var(--err);
+}
+.usm-terms:not(.static) .usm-term-v::after {
+  content: '›';
+  margin-left: 6px;
+  color: var(--ink-4);
+}
+
+/* ══ 方案 C：页头时间轴 ══
+   横轴从生效（或本期起点）到到期；刻度是每次重置，竖条是生效／到期，圆点是今天。
+   有效区间用墨色两档：已过去的深一档。长期有效向右淡出，立即生效向左淡入。 */
+.usm-band {
+  border-top: 1px solid var(--line-soft);
+}
+.usm-band-row {
+  display: flex;
+  min-height: 38px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 16px;
+  padding: 0 18px;
+}
+.usm-band-rule {
+  flex: none;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.usm-track {
+  position: relative;
+  min-width: 96px;
+  height: 16px;
+  flex: 1;
+}
+.usm-track::before {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  left: 0;
+  height: 1px;
+  background: var(--line-soft);
+  content: '';
+}
+.usm-track > i {
+  position: absolute;
+  top: 50%;
+  display: block;
+}
+.usm-track-span,
+.usm-track-elapsed {
+  height: 4px;
+  margin-top: -2px;
+  border-radius: 2px;
+}
+.usm-track-span {
+  background: color-mix(in srgb, var(--ink) 20%, transparent);
+}
+.usm-track-elapsed {
+  background: color-mix(in srgb, var(--ink) 48%, transparent);
+}
+.usm-track-span.open-end {
+  -webkit-mask-image: linear-gradient(90deg, #000 72%, transparent);
+  mask-image: linear-gradient(90deg, #000 72%, transparent);
+}
+.usm-track-span.open-start {
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 10%);
+  mask-image: linear-gradient(90deg, transparent, #000 10%);
+}
+.usm-track-span.open-start.open-end {
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 10% 72%, transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 10% 72%, transparent);
+}
+.usm-track-tick {
+  width: 1px;
+  height: 8px;
+  margin-top: -4px;
+  background: var(--ink-4);
+}
+.usm-track-mark {
+  width: 2px;
+  height: 14px;
+  margin: -7px 0 0 -1px;
+  border-radius: 1px;
+  background: var(--ink-3);
+}
+.usm-track-mark.gold {
+  background: var(--gold);
+}
+.usm-track-mark.err {
+  background: var(--err);
+}
+.usm-track-now {
+  width: 8px;
+  height: 8px;
+  margin: -4px 0 0 -4px;
+  border-radius: 50%;
+  background: var(--ink);
+  box-shadow: 0 0 0 2px var(--band);
+}
+.usm-band-end {
+  display: inline-flex;
+  flex: none;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--ink-2);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.usm-band-end small {
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.usm-band-end.gold {
+  color: var(--gold);
+}
+.usm-band-end.err {
+  color: var(--err);
+}
+.btn.usm-band-edit {
+  display: inline-flex;
+  min-height: 26px;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  margin-right: -8px;
+  padding: 0 8px;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+@media (hover: hover) and (pointer: fine) {
+  .btn.usm-band-edit:hover {
+    border-color: transparent;
+    background: var(--hover);
+    color: var(--ink);
+  }
+}
+.usm-editor.band {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 26px;
+  padding: 10px 18px 12px;
+  border-top: 1px dashed var(--line-soft);
+}
+/* 字段行与按钮同属一个换行容器：放得下时按钮跟在最后一行末尾。 */
+.usm-editor.band .usm-fields {
+  display: contents;
+}
+.usm-editor.band .usm-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 0;
+  border: 0;
+}
+.usm-editor.band .usm-renew {
+  flex-basis: auto;
+}
+.usm-editor.band .usm-foot {
+  margin-left: auto;
+  padding: 0;
+}
+.usm-editor.band .usm-foot .usm-tz {
+  margin-right: 6px;
+}
+.usm-editor.band .usm-problem,
+.usm-editor.band .usm-preview {
+  flex-basis: 100%;
+  order: 3;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+/* ══ 方案 D：对话框与菜单项 ══ */
+.usm-dialog {
+  width: min(440px, calc(100vw - 28px));
+  max-height: min(620px, calc(100dvh - 28px));
+  overflow: auto;
+}
+.usm-menu-entry small .gold {
+  color: var(--gold);
+}
+.usm-menu-entry small .err {
+  color: var(--err);
+}
+.usm-menu-entry:hover small span {
+  color: inherit;
+}
+
+@media (max-width: 620px) {
+  .usm-band-row {
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    padding: 8px 14px;
+  }
+  .usm-track {
+    order: 3;
+    flex-basis: 100%;
+  }
+  .usm-band-end {
+    margin-left: auto;
+  }
+  .usm-editor.band {
+    padding: 10px 14px 12px;
+  }
+}

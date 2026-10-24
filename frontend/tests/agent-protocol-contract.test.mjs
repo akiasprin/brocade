@@ -29,6 +29,14 @@ test('frontend and control plane expose the same Agent protocol version', () => 
   assert.equal(frontendMinimum, rustMinimum);
 });
 
+test('frontend and Console agree on the first Agent with forwarding target policies', () => {
+  const rustVersion = rust.match(/pub const FORWARDING_TARGET_POLICY_PROTOCOL_VERSION: u32 = (\d+);/)?.[1];
+  const frontendVersion = api.match(/export const FORWARDING_TARGET_POLICY_PROTOCOL_VERSION = (\d+);/)?.[1];
+  assert.ok(rustVersion, 'Rust forwarding target policy protocol constant is missing');
+  assert.ok(frontendVersion, 'Frontend forwarding target policy protocol constant is missing');
+  assert.equal(frontendVersion, rustVersion);
+});
+
 test('frontend and compiler expose the same VPN Gate candidate bound', () => {
   const rustLimit = core.match(/pub const VPNGATE_MAX_CANDIDATES: u8 = (\d+);/)?.[1];
   const frontendLimit = api.match(/export const VPNGATE_MAX_CANDIDATES = (\d+);/)?.[1];
@@ -49,4 +57,12 @@ test('frontend and runtime expose the same VPN Gate connection timeout ceiling',
   const frontendTimeout = api.match(/export const VPNGATE_CONNECT_THRESHOLD_MAX_MS = ([\d_]+);/)?.[1];
   assert.ok(rustTimeout, 'Rust VPN Gate connection timeout ceiling is missing');
   assert.equal(frontendTimeout?.replaceAll('_', ''), rustTimeout.replaceAll('_', ''));
+});
+
+test('frontend and Store agree on explicit handoff restart fallback capability', () => {
+  const rustVersion = rust.match(/pub const XRAY_HANDOFF_RESTART_FALLBACK_PROTOCOL_VERSION: u32 = (\d+);/)?.[1];
+  const frontendVersion = api.match(/export const XRAY_HANDOFF_RESTART_FALLBACK_PROTOCOL_VERSION = (\d+);/)?.[1];
+  assert.ok(rustVersion, 'Rust handoff fallback protocol constant is missing');
+  assert.ok(frontendVersion, 'Frontend handoff fallback protocol constant is missing');
+  assert.equal(frontendVersion, rustVersion);
 });

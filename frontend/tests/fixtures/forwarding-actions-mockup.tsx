@@ -34,7 +34,7 @@ import { UserTrafficAccountingSetting } from '../../src/user-traffic-accounting'
 import {
   GiB,
   jobsOf,
-  monthlyOf,
+  cycleUsageOf,
   overviewOf,
   SCENE_KEYS,
   SCENES,
@@ -1761,7 +1761,7 @@ function RuleRow({
             </code>
           </span>
           <span className="fwd-proto">{PROTOCOL_LABEL[rule.protocol]}</span>
-          <span className="fwd-month">
+          <span className="fwd-cycle">
             <b>{bytes(month)}</b>
             <span className="fwd-bar" aria-hidden="true">
               <i style={{ width: `${month ? Math.max(2, (month / maxMonth) * 100) : 0}%` }} />
@@ -1988,7 +1988,7 @@ function installCurrentFetch(scene: Scene, pingOutcome: PingOutcome) {
       return Response.json({
         nodes: scene.entries.map(entry => ({ node_id: entry.id, public_ipv4_country: entry.country })),
       });
-    if (path === '/usage/monthly-summary') return Response.json(monthlyOf(scene));
+    if (path === '/usage/user-cycles') return Response.json(cycleUsageOf(scene));
     const jobs = path.match(/forwarding-nodes\/([^/]+)\/quota\/jobs/);
     if (jobs) return Response.json(jobsOf(scene, decodeURIComponent(jobs[1])));
     if (init?.method === 'PUT' && path.includes('/forwarding-nodes/')) {
@@ -2000,7 +2000,7 @@ function installCurrentFetch(scene: Scene, pingOutcome: PingOutcome) {
           item.node_id !== nodeId
             ? item
             : path.endsWith('/quota')
-              ? { ...item, monthly_limit_bytes: body.limit_bytes }
+              ? { ...item, cycle_limit_bytes: body.limit_bytes }
               : { ...item, ...body },
         ),
       };
@@ -2040,22 +2040,30 @@ function Current({ scene, pingOutcome }: { scene: Scene; pingOutcome: PingOutcom
 /* ══ 审阅外壳 ══ */
 
 function DetailFrame({ children }: { children: ReactNode }) {
+  const uuid = '5b1f7c2e-8d4a-4f0e-9b6c-2a71d0e3c9f4';
   return (
     <section className="panel user-split-detail mk-detail">
       <div className="user-dhead">
         <div className="user-dhead-main">
           <div className="user-dhead-identity">
-            <GeneratedUserAvatar id="alice" variant="plate" lamp={{ tone: '', title: '正常' }} />
+            <GeneratedUserAvatar id="alice" variant="plate" />
             <div className="dtitle">
               <div className="dname">
                 <b className="mono">alice</b>
-                <span className="user-monthly-badge">
-                  <Icon of="usage" size={12} />
-                  <span className="mono">412.60 GiB</span>
+                <span className="user-account-state" data-tone="ok">
+                  可用
                 </span>
               </div>
               <p className="dsub">
-                <span className="mono user-summary-uuid">5b1f7c2e-8d4a-4f0e-9b6c-2a71d0e3c9f4</span>
+                <CopyButton className="user-uuid-copy" text={uuid} label="复制完整 UUID" iconOnly>
+                  {state => (
+                    <>
+                      <span className="user-uuid-label">UUID</span>
+                      <span className="mono">5b1f7c2e…c9f4</span>
+                      <Icon of={copyStateIcon(state)} size={12} />
+                    </>
+                  )}
+                </CopyButton>
               </p>
             </div>
           </div>

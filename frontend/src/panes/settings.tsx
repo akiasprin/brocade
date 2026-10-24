@@ -1,4 +1,5 @@
 import { useServerForm } from '../ui/server-form';
+import { useNow } from '../ui/clock';
 import { ReverseHealthSettings, reversePoliciesError } from '../reverse-health-settings';
 import { useRef, useState, useSyncExternalStore } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -1740,7 +1741,8 @@ function DeploymentSection({ editable, settings }: { editable: boolean; settings
           />
           <span className="hint">
             默认关闭。配置优先热更新；不能热更新时，关闭则重启，开启则交接。交接时旧 TCP 最多保留 2
-            分钟，到期断开剩余连接，UDP 会话需重建。Xray 二进制升级始终默认重启，开启后可手动选择交接。
+            分钟，到期断开剩余连接，UDP 会话需重建。Agent v40 起交接条件不足时降级重启并记录原因。Xray
+            二进制升级始终默认重启，开启后可手动选择交接。
           </span>
           <span className="hint">
             仅影响之后创建的发布单，不改变已有发布或进行中的交接；需 Agent 协议 37 或更新版本。
@@ -2056,6 +2058,70 @@ function formatRetentionBytes(bytes: number) {
   return `${value >= 10 || rank === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[rank]}`;
 }
 
+const RETENTION_TIME_FORMAT = new Intl.DateTimeFormat('zh-CN', {
+  dateStyle: 'short',
+  timeStyle: 'medium',
+  hour12: false,
+});
+
+function retentionTime(unixSecs: number) {
+  return RETENTION_TIME_FORMAT.format(new Date(unixSecs * 1000));
+}
+
+function RetentionCleanupStatus({ policy }: { policy: DataRetentionPolicy }) {
+  const run = policy.cleanup;
+  const now = useNow();
+  const failureLabels: Record<string, string> = {
+    statement_timeout: '清理超时',
+    lock_timeout: '等待数据库锁超时',
+    connection_timeout: '数据库连接超时',
+    database_error: '数据库清理失败',
+    cleanup_error: '清理失败',
+  };
+  const changed = run && run.ttl_hours !== policy.ttl_hours;
+  const overdue = run && now / 1000 > run.next_run_unix_secs + 120;
+  const status = !run
+    ? '等待首次清理'
+    : changed
+      ? '保留期已更新，等待重新检查'
+      : run.error_code
+        ? (failureLabels[run.error_code] ?? '清理失败')
+        : overdue
+          ? '清理延迟'
+          : run.has_backlog === true
+            ? '存在过期积压，将继续分批清理'
+            : run.has_backlog === false
+              ? '上轮无过期积压'
+              : '过期积压尚未确认，将重新检查';
+  const tone =
+    run?.error_code && !changed
+      ? 'error'
+      : !run || changed || overdue || run.has_backlog !== false
+        ? 'pending'
+        : 'settled';
+  return (
+    <div className="retention-cleanup" data-state={tone}>
+      <span className="retention-cleanup-status">{status}</span>
+      {run && (
+        <small>
+          最近检查 {retentionTime(run.finished_at_unix_secs)} · 下次计划 {retentionTime(run.next_run_unix_secs)}
+        </small>
+      )}
+      <small>
+        {run?.last_success_unix_secs != null
+          ? `最近成功 ${retentionTime(run.last_success_unix_secs)} · 清理 ${run.deleted_rows.toLocaleString()} 行`
+          : '暂无成功清理记录'}
+      </small>
+      <small>
+        待回收约 {(policy.estimated_dead_rows ?? 0).toLocaleString()} 行 ·{' '}
+        {policy.last_vacuum_unix_secs != null
+          ? `最近空间回收 ${retentionTime(policy.last_vacuum_unix_secs)}`
+          : '暂无空间回收统计'}
+      </small>
+    </div>
+  );
+}
+
 function RetentionPolicyRow({ policy, editable }: { policy: DataRetentionPolicy; editable: boolean }) {
   const qc = useQueryClient();
   const initialUnit = retentionUnitOf(policy.ttl_hours);
@@ -2099,6 +2165,7 @@ function RetentionPolicyRow({ policy, editable }: { policy: DataRetentionPolicy;
           约 {policy.estimated_rows.toLocaleString()} 行 · {formatRetentionBytes(policy.total_bytes)} · 默认{' '}
           {formatRetentionDuration(policy.default_ttl_hours)}
         </small>
+        <RetentionCleanupStatus policy={policy} />
       </div>
       <div className="retention-policy-control">
         <label>
@@ -2175,7 +2242,11 @@ export function DataRetentionSection({ editable, data }: { editable: boolean; da
       </summary>
       <p className="cardsub">只列出可按时间安全清理的历史与临时表；核心模型、发布审计和长期汇总不在此处。</p>
       <p className="settings-block-note data-retention-warning">
-        保存后不产生修订，也不需要发布。缩短 TTL 不会立即锁表清空，后台会按原有批次逐步清理；已删除的数据无法恢复。
+        保存后不产生修订，也不需要发布。后台按表分批清理，有积压或失败时自动重试；已删除的数据无法恢复。
+      </p>
+      <p className="settings-block-note">
+        清理状态每 30
+        秒刷新，积压以最近检查为准。行数与待回收行数为数据库估值；空间回收主要供后续写入复用，磁盘占用不一定立即下降。
       </p>
       {categories.map(category => {
         const policies = data.policies.filter(policy => policy.category === category.key);
@@ -3297,7 +3368,11 @@ export function SettingsPane() {
   const dist = useQuery({ queryKey: ['distribution'], queryFn: () => fetchDistribution() });
   const deploymentSettings = useQuery({ queryKey: ['deployment-settings'], queryFn: fetchDeploymentSettings });
   const logPolicy = useQuery({ queryKey: ['agent-log-policy'], queryFn: fetchAgentLogPolicy });
-  const dataRetention = useQuery({ queryKey: ['data-retention'], queryFn: fetchDataRetention });
+  const dataRetention = useQuery({
+    queryKey: ['data-retention'],
+    queryFn: fetchDataRetention,
+    refetchInterval: 30_000,
+  });
   const hostNetworkTuning = useQuery({
     queryKey: ['host-network-tuning'],
     queryFn: fetchHostNetworkTuning,
@@ -3474,7 +3549,7 @@ export function SettingsPane() {
     dist.error ??
     deploymentSettings.error ??
     logPolicy.error ??
-    dataRetention.error ??
+    (dataRetention.data ? null : dataRetention.error) ??
     hostNetworkTuning.error ??
     pingProbe.error ??
     vpngate.error ??
@@ -4107,11 +4182,8 @@ export function SettingsPane() {
               editable={editable}
             />
 
-            {dataRetention.error ? (
-              <ErrorBox error={dataRetention.error} />
-            ) : (
-              <DataRetentionSection editable={editable} data={dataRetention.data!} />
-            )}
+            {dataRetention.error && <ErrorBox error={dataRetention.error} />}
+            {dataRetention.data && <DataRetentionSection editable={editable} data={dataRetention.data} />}
           </fieldset>
         </div>
       </div>

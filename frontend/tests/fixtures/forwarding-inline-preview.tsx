@@ -5,7 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ForwardingEntitlement, ForwardingRule, UserListItem, UserTrafficAccountingMode } from '../../src/api';
 import { UserForwardingCard } from '../../src/panes/user-forwarding';
 import { theme } from '../../src/forge/theme';
-import { jobsOf, monthlyOf, overviewOf, SCENES, type SceneKey } from './forwarding-actions-mockup-data';
+import { jobsOf, cycleUsageOf, overviewOf, SCENES, type SceneKey } from './forwarding-actions-mockup-data';
 import { createMockProbeTransport } from './forwarding-actions-mockup-probe';
 import '../../src/styles.css';
 
@@ -52,7 +52,7 @@ globalThis.fetch = async (input, init) => {
         public_ipv4_country: node.country,
       })),
     });
-  if (path === '/usage/monthly-summary') return Response.json(monthlyOf(scene));
+  if (path === '/usage/user-cycles') return Response.json(cycleUsageOf(scene));
   const jobs = path.match(/forwarding-nodes\/([^/]+)\/quota\/jobs/);
   if (jobs) return Response.json(jobsOf(scene, decodeURIComponent(jobs[1])));
   if (init?.method && init.method !== 'GET') {
@@ -72,8 +72,8 @@ globalThis.fetch = async (input, init) => {
       }
       const body = JSON.parse(String(init.body));
       if (node[2] && existing) {
-        existing.monthly_limit_bytes = body.limit_bytes;
-        existing.quota_suspended = body.limit_bytes != null && (existing.monthly_used_bytes ?? 0) >= body.limit_bytes;
+        existing.cycle_limit_bytes = body.limit_bytes;
+        existing.quota_suspended = body.limit_bytes != null && (existing.cycle_used_bytes ?? 0) >= body.limit_bytes;
         rulesFor(existing);
       } else if (existing) {
         Object.assign(existing, body);
@@ -94,8 +94,8 @@ globalThis.fetch = async (input, init) => {
           applied_generation: 1,
           reconcile_status: 'converged',
           last_error: null,
-          monthly_limit_bytes: null,
-          monthly_used_bytes: 0,
+          cycle_limit_bytes: null,
+          cycle_used_bytes: 0,
         });
       }
       return response();
