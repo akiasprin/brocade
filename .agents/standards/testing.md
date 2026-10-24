@@ -38,8 +38,9 @@ go vet ./path/to/changed/package
 
 Node 入口中的浏览器用例串行运行，避免多个 Vite/Chromium 测试文件与构建同时抢占资源。
 每个自行创建 Vite 的浏览器夹具使用独立临时缓存并在结束后删除；不要通过增加超时或重试掩盖失败。
-浏览器用例与 Docker PostgreSQL 集成测试不能同时运行：容器网卡增删会触发 Chromium 的
-`ERR_NETWORK_CHANGED` 并取消本机模块请求。CI 按顺序执行，本地发布检查也必须先结束数据库测试。
+浏览器用例与 Docker PostgreSQL 集成测试不能在同一网络命名空间同时运行：容器网卡增删会触发 Chromium 的
+`ERR_NETWORK_CHANGED` 并取消本机模块请求。CI 按顺序执行；本地先结束数据库/容器操作，或将浏览器及其 Vite 服务一起置于独立网络命名空间。
+Linux 支持用户网络命名空间时，可用 `unshare -Urn sh -c 'ip link set lo up && cd frontend && npm test'`，保持全部断言且不依赖宿主机网卡状态。
 
 Console 升级发布必须通过[官方 v0.3.1 强制真实验收](../../scripts/tests/upgrade/README.md)，包括
 外置与受管 PostgreSQL。CI 使用同次发行构建的产物，不允许仅用模拟服务或空匹配结果代替。
