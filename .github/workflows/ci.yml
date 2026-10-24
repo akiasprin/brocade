@@ -43,6 +43,10 @@ jobs:
   xray-data-plane:
     name: xray data-plane test, vet and race
     runs-on: ubuntu-latest
+    # Fixed work avoids Go's fuzztime deadline race (go.dev/issue/75804).
+    # 300k covers the observed work from the former 10s budgets; each test keeps its 2m limit.
+    env:
+      BROCADE_FUZZ_LIMIT: 300000x
     defaults:
       run:
         working-directory: components/xray-core
@@ -73,7 +77,7 @@ jobs:
           go vet ./common/protocol/quic
 
       - name: QUIC Initial parser fuzz
-        run: go test ./common/protocol/quic -run '^$' -fuzz '^FuzzSniffQUIC$' -fuzztime=10s -timeout=2m
+        run: go test ./common/protocol/quic -run '^$' -fuzz '^FuzzSniffQUIC$' -fuzztime="${BROCADE_FUZZ_LIMIT}" -timeout=2m
 
       - name: ActivityTimer deterministic concurrency regressions
         run: go test -race ./common/signal -run '^TestActivityTimerConcurrent' -count=100 -timeout=1m
@@ -102,16 +106,16 @@ jobs:
           go test ./proxy/mtproto -count=10 -timeout=5m
 
       - name: AnyTLS settings fuzz
-        run: go test ./proxy/anytls -run '^$' -fuzz '^FuzzAnyTLSSettings$' -fuzztime=10s -timeout=2m
+        run: go test ./proxy/anytls -run '^$' -fuzz '^FuzzAnyTLSSettings$' -fuzztime="${BROCADE_FUZZ_LIMIT}" -timeout=2m
 
       - name: AnyTLS padding fuzz
-        run: go test ./proxy/anytls -run '^$' -fuzz '^FuzzAnyTLSPaddingScheme$' -fuzztime=10s -timeout=2m
+        run: go test ./proxy/anytls -run '^$' -fuzz '^FuzzAnyTLSPaddingScheme$' -fuzztime="${BROCADE_FUZZ_LIMIT}" -timeout=2m
 
       - name: AnyTLS session-frame fuzz
-        run: go test ./proxy/anytls -run '^$' -fuzz '^FuzzAnyTLSSessionFrames$' -fuzztime=10s -timeout=2m
+        run: go test ./proxy/anytls -run '^$' -fuzz '^FuzzAnyTLSSessionFrames$' -fuzztime="${BROCADE_FUZZ_LIMIT}" -timeout=2m
 
       - name: AnyTLS UoT-record fuzz
-        run: go test ./proxy/anytls -run '^$' -fuzz '^FuzzAnyTLSUoTRecords$' -fuzztime=10s -timeout=2m
+        run: go test ./proxy/anytls -run '^$' -fuzz '^FuzzAnyTLSUoTRecords$' -fuzztime="${BROCADE_FUZZ_LIMIT}" -timeout=2m
 
       - name: Data-plane race tests
         run: go test -race ./transport/internet/tls ./proxy/anytls ./proxy/mtproto -count=3 -timeout=10m
@@ -161,10 +165,10 @@ jobs:
         run: go test ./common/buf ./common/mux ./app/reverse ./app/proxyman/outbound ./app/stats/command ./infra/conf ./proxy/vless/... -count=1 -timeout=10m
 
       - name: Mux metadata fuzz
-        run: go test ./common/mux -run '^$' -fuzz '^FuzzFrameMetadataUnmarshal$' -fuzztime=10s -timeout=2m
+        run: go test ./common/mux -run '^$' -fuzz '^FuzzFrameMetadataUnmarshal$' -fuzztime="${BROCADE_FUZZ_LIMIT}" -timeout=2m
 
       - name: Mux reverse-health framing fuzz
-        run: go test ./common/mux -run '^$' -fuzz '^FuzzProbeFrameRoundTrip$' -fuzztime=10s -timeout=2m
+        run: go test ./common/mux -run '^$' -fuzz '^FuzzProbeFrameRoundTrip$' -fuzztime="${BROCADE_FUZZ_LIMIT}" -timeout=2m
 
       # These launch real Xray processes and put a controllable TCP fault proxy
       # between them. Unit-level state-machine checks cannot prove failover,

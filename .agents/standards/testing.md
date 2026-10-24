@@ -10,7 +10,7 @@
 - PostgreSQL 行为：普通测试加显式启用的 Docker 集成测试。
 - 前端页面：相邻 Node/Vitest 测试；公共组件、令牌或路由变化扩大到完整前端检查。
 - 前端视觉呈现：按[前端视觉验收](frontend.md#视觉验收)执行截图比较与实际看图，并配合相关行为验证。
-- Xray fork：受影响 Go 包的 test/vet；协议、并发或数据面热路径按 CI 运行 race、fuzz-seed 和真实进程场景。
+- Xray fork：受影响 Go 包的 test/vet；协议、并发或数据面热路径按 CI 运行 race、fuzz-seed 和真实进程场景。fuzz 使用 CI 定义的固定输入数量和整进程超时，避免 Go 的计时终止竞态（[go.dev/issue/75804](https://go.dev/issue/75804)）；错误仍使检查失败，不自动重试取绿。
 - Console 生成的 Xray 配置：普通测试必须执行本次 Console 构建所内嵌的 Xray；禁止隐式读取 `.tools/xray`、因本地工具缺失而跳过，或让本地与 CI 使用不同来源。只有显式开启的真实外部 E2E 可通过 `BROCADE_XRAY_BIN` 选择另一个待验产物。
 - 安装、部署或构建链：检查 `install.sh`、环境示例、目标架构和嵌入产物。
 
