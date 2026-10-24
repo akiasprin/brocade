@@ -2,12 +2,14 @@
 
 本文是仓库级开发约定，适用于人类贡献者与编码 Agent。任务中的明确要求优先于本文；若从子目录启动任务且该目录存在更具体的 `AGENTS.md` 或 `AGENTS.override.md`，以更接近当前工作目录的规则为准。
 
+思考与判断的共同出发点见 `.agents/engineering-philosophy.md`；本文件维护项目边界与开发约定。
+
 ## 开始工作前
 
 1. 先阅读本文件、下方“按任务读取”列出的相关文档，以及准备修改的实现和测试。需要项目全貌时再阅读 `README.md`；公开行为、安装与环境配置见 `docs/` 对应主题和相关 crate 的 `Cargo.toml`。
 2. 执行 `git status --short`，把已有改动视为用户工作；不要覆盖、回退、格式化或顺手整理无关内容。
 3. 先定位数据流和既有抽象，再动手。优先使用 `rg` / `rg --files` 搜索，避免凭文件名猜实现位置。
-4. 让改动保持小而完整：解决根因，补回归测试，只更新受影响的文档和夹具，不做无关重构。
+4. 让改动保持小而完整：解决根因，按影响面完成必要验证，只更新受影响的文档和夹具，不做无关重构。
 5. 未经明确要求，不创建提交、不改写历史、不推送远端，也不执行破坏性的 Git 命令。
 
 ## 按任务读取
@@ -18,6 +20,7 @@
 
 | 任务 | 继续阅读 |
 | --- | --- |
+| 理解工程理念、深度思考与判断原则 | `.agents/engineering-philosophy.md` |
 | 理解系统边界或跨层数据流 | `.agents/architecture/system-overview.md` |
 | 修改前端视觉、交互或组件 | `.agents/standards/frontend.md` |
 | 修改 Rust、PostgreSQL、协议或 Xray | `.agents/standards/backend.md` |
@@ -25,6 +28,7 @@
 | 部署 Console 或变更宿主机服务 | `.agents/runbooks/console-deployment.md` |
 | 发布、回滚 Agent/Xray/配置/授权 | `.agents/runbooks/release-and-rollback.md` |
 | 排查生产异常 | `.agents/runbooks/incident-response.md` |
+| 深入分析设计、疑难修复或复杂实施方案 | `.agents/standards/design-planning.md` |
 | 记录长期架构决策 | `.agents/adr/README.md` |
 | 执行较长、跨层或需交接的改造 | `.agents/plans/TEMPLATE.md` |
 
@@ -84,13 +88,13 @@ brocade-core -> artifacts -> embedded Brocade Xray
 - 新增依赖前确认标准库和现有依赖不能满足需求，并评估二进制体积、跨平台/静态链接、许可证和供应链成本。
 - 不引入无界队列、缓存、日志或重试。网络和进程操作应设置合理超时，并考虑取消、退避和重复执行。
 - 改变用户可见行为、配置、API、协议、数据库或生成产物时，同步更新测试和相关文档。
-- 当需求、方案或交互形态替换既有实现时，不得只在旧路径旁叠加新路径。交付前应以旧实现的路由键、组件与函数名、参数、CSS 选择器、持久化键、用户文案和测试夹具为线索反向搜索，删除无调用方分支、失效样式和过期契约；确需保留的兼容路径必须说明适用范围和保留原因。
+- 替换既有实现时，应沿旧入口与引用检查并清理失效代码、样式、配置和契约，使新方案完整接管职责。保留兼容路径时说明适用范围和原因。
 
 领域规范不在这里重复维护。前端任务遵循 `.agents/standards/frontend.md`；Rust、PostgreSQL、协议、Shell 与 Xray 任务遵循 `.agents/standards/backend.md`。
 
 ## 验证
 
-先运行与改动最相关的快速测试，再按影响面扩大范围。具体矩阵和命令以 `.agents/standards/testing.md` 为入口，CI 的最终定义以 `.github/workflows/ci.yml` 为准。不要声称未实际运行的检查已经通过；因环境限制未运行的检查必须在交付说明中列出。测试通过不等于旧实现已经清除；替换实现后还必须执行上述残留扫描。测试若依赖源码分区、字符串哨兵或索引边界，必须先断言标记存在且顺序有效，禁止让 `indexOf == -1`、空匹配或退化切片静默通过。
+先运行与改动最相关的快速检查，再按影响面扩大范围。具体矩阵和命令以 `.agents/standards/testing.md` 为入口，CI 的最终定义以 `.github/workflows/ci.yml` 为准。验证应能证明目标行为和关键前提成立，避免因空匹配或失效测试条件而产生假通过；替换实现还须检查旧路径是否清理完整。如实说明实际结果与未验证范围。
 
 ## Git 提交规范
 
@@ -130,4 +134,4 @@ build(xray): update embedded upstream baseline
 
 ## 完成定义
 
-交付前确认：改动符合上述架构不变量；新增行为有测试；格式、lint 和相关测试已运行；API/配置/协议/迁移/`docs/` 已按需同步；diff 中没有无关文件、秘密或本地产物；最终说明列出实际验证结果和任何未验证项。
+交付前确认：改动符合架构不变量；按影响面完成必要验证；相关契约、配置和文档已同步；diff 没有无关内容、秘密或本地产物；最终说明能够让用户判断结果、验证边界和遗留事项。

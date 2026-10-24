@@ -11,14 +11,14 @@ Use this workflow when the user asks for a frontend design review, consistency a
 
 Read `.agents/standards/frontend.md`, then inspect only the affected implementation and tests. Treat `frontend/src/styles.css`, `frontend/src/ui/`, and `frontend/tests/` as evidence of the current system, not as permission to preserve accidental inconsistencies.
 
-## Workflow
+## Review guidance
 
-1. Establish the reviewed surface and whether the request is read-only or includes implementation.
-2. Inventory reused tokens, shared components, page-local variants, interaction states and responsive behavior.
-3. Check semantic color roles, surface hierarchy, typography, spacing, keyboard/focus behavior, loading/empty/error states, reduced motion and narrow viewports.
-4. Separate findings into system-level gaps and isolated defects. Prefer one shared correction over repeated page patches.
-5. If implementation is requested, preserve existing state ownership and add behavioral tests next to the affected contract.
-6. Run the smallest relevant checks from `.agents/standards/testing.md`, expanding to full frontend checks for shared tokens, components or routing.
+- Establish the reviewed surface and whether the request is read-only or includes implementation; choose coverage according to the affected experience.
+- Use shared tokens, components and comparable project surfaces to understand the design. Assess intentional changes by user needs, coherent rules and usability.
+- Ground visual findings in rendered pages or supplied screenshots. For implemented visual changes, perform the visual acceptance required by `.agents/standards/frontend.md`; identify unverified coverage.
+- Consider hierarchy, semantic color, typography, spacing, interaction states, accessibility and responsive behavior where relevant.
+- Separate system-level gaps from isolated defects. Prefer shared corrections when they address the actual cause, preserving existing state ownership and affected behavior contracts.
+- Select checks through `.agents/standards/testing.md`, expanding coverage when the impact warrants it.
 
 ## Output
 
