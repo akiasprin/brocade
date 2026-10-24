@@ -548,7 +548,7 @@ jobs:
 
   upgrade-v031:
     name: mandatory v0.3.1 real upgrade and restore
-    needs: [check, build]
+    needs: [build]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
