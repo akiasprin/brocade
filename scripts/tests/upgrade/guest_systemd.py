@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Destructive drills guarded to an explicitly marked, disposable KVM guest."""
+import base64
 import hashlib
 import http.cookiejar
 import json
@@ -7,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import time
 import traceback
@@ -51,6 +53,12 @@ def record(case, **values):
 def sha(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def file_snapshot(path):
+    metadata = Path(path).stat()
+    return {'sha256': sha(path), 'mode': stat.S_IMODE(metadata.st_mode),
+            'uid': metadata.st_uid, 'gid': metadata.st_gid}
 
 
 def http(path, payload=None, token=None):
@@ -201,16 +209,24 @@ def make_fixture(version, mode):
     cmd('chown', 'brocade:brocade', str(sentinel))
     dropin = Path('/etc/systemd/system/brocade.service.d')
     dropin.mkdir()
-    (dropin / 'drill.conf').write_text('[Service]\nTimeoutStopSec=75s\n')
+    dropin_text = '[Service]\nTimeoutStopSec=75s\n'
+    external_secret = Path('/etc/brocade/upgrade-drill.env')
+    if mode == 'external':
+        external_secret.write_text('BROCADE_SECRET_KEY=' + base64.b64encode(os.urandom(32)).decode() + '\n')
+        external_secret.chmod(0o600)
+        dropin_text += f'EnvironmentFile={external_secret}\n'
+    (dropin / 'drill.conf').write_text(dropin_text)
     cmd('systemctl', 'daemon-reload')
+    cmd('systemctl', 'restart', 'brocade.service')
+    wait_ready()
     preserved = ['/etc/brocade/agent-public-url', '/etc/brocade/listen-address',
                  '/etc/brocade/database-type', '/etc/systemd/system/brocade.service',
                  str(dropin / 'drill.conf'), str(sentinel)]
     if mode == 'external':
-        preserved += ['/etc/brocade/database-url']
+        preserved += ['/etc/brocade/database-url', str(external_secret)]
     elif (DATA / 'secret-key').exists():
         preserved += [str(DATA / 'secret-key')]
-    return old, name, {p: sha(p) for p in preserved}
+    return old, name, {p: file_snapshot(p) for p in preserved}
 
 
 def verify(mode, name, preserved, expected='1,2'):
@@ -221,7 +237,7 @@ def verify(mode, name, preserved, expected='1,2'):
     assert sql(mode, 'SELECT site_name FROM control_state') == name
     assert sql(mode, "SELECT encode(checksum,'hex') FROM _sqlx_migrations WHERE version=1") == CHECKSUM
     assert sql(mode, 'SELECT count(*) FROM binary_releases') == '0'
-    assert all(sha(p) == checksum for p, checksum in preserved.items())
+    assert all(file_snapshot(p) == original for p, original in preserved.items()), 'private file bytes, permissions or ownership changed'
     assert data_snapshot(mode) == EXPECTED_DATA, 'user identity, quotas or usage changed across upgrade/restore'
     assert http('/quotas')['quotas'], 'preserved quota must remain readable through the real API'
     version = '0.3.1' if expected == '1' else (ROOT / 'inputs/candidate-version').read_text().strip()
