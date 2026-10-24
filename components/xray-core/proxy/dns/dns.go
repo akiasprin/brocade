@@ -4,6 +4,7 @@ import (
 	"context"
 	go_errors "errors"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -335,6 +336,9 @@ func (h *Handler) handleIPQuery(id uint16, qType dnsmessage.Type, domain string,
 		return
 	}
 
+	// The returned entries may belong to a cache and be observed by asynchronous logging.
+	// Normalize a private slice instead of replacing entries in the client's shared result.
+	ips = slices.Clone(ips)
 	switch qType {
 	case dnsmessage.TypeA:
 		for i, ip := range ips {
