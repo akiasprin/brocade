@@ -203,7 +203,7 @@ Agent 不领取配置或授权工单，避免结构变更破坏交接。pause/ex
 - Xray 发布页和新发布记录中的版本是最后一次修改 `components/xray-core` 的完整 Git
   提交号；只有该目录未提交时才追加 `-dirty`。上游 banner/安装兼容版本仍单独保留，
   Git revision 只负责追溯 Brocade fork 来源，不替代构建标识或每架构摘要。
-- 编译器版本系列只有一个来源：`components/xray-core/.go-version`。CI 和 Console 构建共用其 major/minor，允许同系列补丁版本（例如 `1.26.x`），并在产物记录中保存实际补丁版本；跨系列或无法解析的本地版本直接报错，可通过 `BROCADE_GO` 指向匹配的编译器。
+- 编译器版本系列只有一个来源：`components/xray-core/.go-version`。CI 和 Console 构建共用其 major/minor 与最低安全补丁版本，允许同系列较新的补丁版本（例如 `~1.26.10`），并在产物记录中保存实际补丁版本；跨系列或无法解析的本地版本直接报错，可通过 `BROCADE_GO` 指向匹配的编译器。
 - 编译配方由 `crates/brocade-console/build/xray.rs` 固定，隔离宿主机的 Go 默认参数、workspace、实验开关和 CPU 级别，关闭 VCS 和自动 PGO。Console 的 Git 提交号、前端变化不会注入 Xray 字节。
 - 依据 Go 实际选择的生产源文件、汇编、嵌入资源、依赖及标准库计算输入指纹；包含未提交/未跟踪的生产文件，不把无关文档和测试当成数据面变更。源码在构建途中变化会报错重试。
 - 每个 `OUT_DIR/xray-<arch>` 都有对应的 `.build.json`，记录源码指纹、精确编译配方、ELF 架构、大小和 SHA-256。构建日志打印路径与摘要；归档预编译文件时必须成对保存。CI 单独上传双架构记录。
