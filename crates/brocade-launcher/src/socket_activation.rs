@@ -190,6 +190,12 @@ mod tests {
     #[test]
     #[ignore = "only executed as the Console subprocess by the delegation test"]
     fn socket_child() {
+        // --include-ignored also visits this helper in the parent harness. Only the
+        // explicit delegated subprocess owns the inherited listener descriptors.
+        if env::var_os("BROCADE_SOCKET_TEST_CHILD").is_none() {
+            return;
+        }
+        assert_eq!(env::var("BROCADE_SOCKET_TEST_CHILD").unwrap(), "1");
         assert_eq!(
             env::var("LISTEN_PID").unwrap(),
             std::process::id().to_string()
@@ -236,6 +242,7 @@ mod tests {
                 .unwrap();
             let mut child = activation
                 .console_command(&env::current_exe().unwrap())
+                .env("BROCADE_SOCKET_TEST_CHILD", "1")
                 .args([
                     "--ignored",
                     "--exact",

@@ -79,6 +79,7 @@ beforeAll(async () => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 beforeEach(() => {
@@ -529,6 +530,7 @@ describe('deep host telemetry', () => {
   });
 
   it('mounts every deep EChart immediately and requests ten metrics per parallel batch', async () => {
+    vi.useFakeTimers({ now: 10_250 });
     const value = report();
     value.series = value.series.map(entry => ({
       ...entry,
@@ -588,30 +590,34 @@ describe('deep host telemetry', () => {
     expect(requestedBatches[1]).toContain('cpu.throttled_usec');
     expect(requestedBatches[1]).toContain('cpu.cores.busy_pct');
 
-    await waitFor(() =>
-      expect(
-        chartMock.setOption.mock.calls.find(([option]) =>
-          option.series?.some((line: { name: string }) => line.name === '每窗口 throttled'),
-        ),
-      ).toBeTruthy(),
-    );
+    await act(() => vi.advanceTimersByTimeAsync(20));
+    expect(
+      chartMock.setOption.mock.calls.find(([option]) =>
+        option.series?.some((line: { name: string }) => line.name === '每窗口 throttled'),
+      ),
+    ).toBeTruthy();
     expect(view.container.querySelectorAll('.history-chart-card[aria-busy="true"]')).toHaveLength(4);
 
-    resolveFetch(metricResponse(requestedBatches[0]));
-
-    await waitFor(() =>
-      expect(
-        chartMock.setOption.mock.calls.find(([option]) =>
-          option.series?.some((line: { name: string }) => line.name === '用户态'),
-        ),
-      ).toBeTruthy(),
-    );
+    await act(async () => {
+      resolveFetch(metricResponse(requestedBatches[0]));
+      await pendingResponse;
+    });
+    // The remaining batch becomes visible at the shared second boundary. Advance
+    // that clock explicitly instead of racing waitFor's one-second deadline.
+    await act(() => vi.advanceTimersByTimeAsync(1_000));
+    expect(
+      chartMock.setOption.mock.calls.find(([option]) =>
+        option.series?.some((line: { name: string }) => line.name === '用户态'),
+      ),
+    ).toBeTruthy();
     expect(view.container.querySelectorAll('.history-chart-card[aria-busy="true"]')).toHaveLength(0);
     expect(chartMock.hideLoading).toHaveBeenCalled();
     const cpuChart = chartMock.setOption.mock.calls.find(([option]) =>
       option.series?.some((line: { name: string }) => line.name === '用户态'),
     )?.[0];
     expect(cpuChart.series[0].data).toHaveLength(1);
+    view.unmount();
+    client.clear();
     fetchMock.mockRestore();
   });
 

@@ -521,7 +521,18 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(versions, [1, 2]);
+        let migrations = Path::new(env!("CARGO_MANIFEST_DIR")).join("../brocade-store/migrations");
+        let mut expected_versions: Vec<i64> = fs::read_dir(migrations)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_str().unwrap();
+                name.split_once('_').unwrap().0.parse().unwrap()
+            })
+            .collect();
+        expected_versions.sort_unstable();
+        assert!(expected_versions.len() >= 2);
+        assert_eq!(versions, expected_versions);
         let name: String = sqlx::query_scalar("SELECT site_name FROM control_state")
             .fetch_one(&pool)
             .await

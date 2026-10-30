@@ -23,7 +23,10 @@ def run(args):
     output = args.output.resolve()
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
     repo = Path(__file__).resolve().parents[3]
-    source = (repo / 'crates/brocade-store/migrations/0001_init.sql').read_text()
+    migrations = repo / 'crates/brocade-store/migrations'
+    versions = sorted(int(path.name.split('_', 1)[0]) for path in migrations.glob('*.sql'))
+    assert versions and versions[0] == 1 and len(versions) >= 2
+    source = (migrations / '0001_init.sql').read_text()
     checksum = hashlib.sha384(source.encode()).hexdigest()
     assert checksum == '794044a4f1b7ead02b8102e21bc7f94d3c01f309216a5e15ada747c61de528c04b494a46e993f683a7d256aa37cd0947'
     container = 'brocade-upgrade-' + uuid.uuid4().hex[:12]
@@ -48,7 +51,7 @@ def run(args):
         console = str(args.console.resolve())
         launcher = str(args.launcher.resolve())
         before = json.loads(command([console, 'database-check'], env=env))
-        assert before['compatible'] and before['pending_versions'] == [2]
+        assert before['compatible'] and before['pending_versions'] == versions[1:]
         previous = output / 'previous-launcher'
         previous.write_text("#!/bin/sh\nprintf 'brocade 0.3.1\\n'\n")
         previous.chmod(0o700)
@@ -60,7 +63,7 @@ def run(args):
         listing = command(['pg_restore', '--list', str(backup / 'database.dump')])
         assert any('Compression:' in line and 'gzip' in line for line in listing.splitlines())
         after = json.loads(command([console, 'database-check'], env=env))
-        assert after['compatible'] and after['installed_versions'] == [1, 2] and not after['pending_versions']
+        assert after['compatible'] and after['installed_versions'] == versions and not after['pending_versions']
         assert sql("SELECT site_name FROM control_state") == 'preserved upgrade fixture'
         assert sql("SELECT encode(checksum,'hex') FROM _sqlx_migrations WHERE version=1") == checksum
         assert sql('SELECT count(*) FROM binary_releases') == '0'
@@ -87,7 +90,7 @@ def run(args):
         assert sql('SELECT string_agg(version::text,\',\' ORDER BY version) FROM _sqlx_migrations', 'restored') == '1'
         assert sql("SELECT count(*) FROM information_schema.columns WHERE table_name='forwarding_node_state' AND column_name='rule_results'", 'restored') == '0'
         result = {'passed': True, 'source': 'official v0.3.1 exact schema', 'installed_before': [1],
-                  'installed_after': [1, 2], 'receipt_preserved': True, 'backup_restored': True,
+                  'installed_after': versions, 'receipt_preserved': True, 'backup_restored': True,
                   'failed_migration_rolled_back': True, 'gzip_compression_verified': True,
                   'fleet_release_created': False}
         (output / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
