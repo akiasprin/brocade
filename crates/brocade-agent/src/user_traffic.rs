@@ -556,15 +556,22 @@ pub(crate) fn spawn(options: Options) -> Result<(), String> {
     let policy_options = options.clone();
     thread::Builder::new()
         .name("user-traffic-policies".into())
-        .spawn(move || loop {
-            if let Some(service) = SERVICE.get() {
-                if let Err(error) = synchronize(service) {
-                    eprintln!("user traffic policies: {error}");
+        .spawn(move || {
+            let mut wake = crate::wake::Cursor::new(
+                brocade_deployment::agent_channel::WakeDomain::UserTraffic,
+            );
+            loop {
+                if let Some(service) = SERVICE.get() {
+                    if let Err(error) = synchronize(service) {
+                        eprintln!("user traffic policies: {error}");
+                    }
+                } else {
+                    let _ = initialize(&policy_options);
                 }
-            } else {
-                let _ = initialize(&policy_options);
+                // These assignments expire with the two-second admission lease. A persistent
+                // socket does not extend that lease; keep refreshing even without a change.
+                wake.wait(Duration::from_secs(1));
             }
-            thread::sleep(Duration::from_millis(1000));
         })
         .map_err(|_| "user traffic policy worker")?;
     thread::Builder::new()

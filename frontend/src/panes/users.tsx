@@ -7,6 +7,7 @@ import {
   useEffect,
   useId,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -51,6 +52,7 @@ import { Icon, ListIcon, PanelTitle } from '../ui/icons';
 import { bytes, shareOf } from '../ui/format';
 import { useNodeNames } from '../ui/node-name';
 import { RegionFlag } from '../ui/region-flag';
+import { SOURCE_LOCATION_TITLE, SourceAddress, sourceNetwork } from '../ui/source-address';
 import { GeneratedUserAvatar, type AvatarLamp } from '../ui/user-avatar';
 import { FieldLoading, PanelLoading } from '../ui/loading';
 import { useNow } from '../ui/clock';
@@ -73,6 +75,7 @@ import { UserMachineUsageCard } from '../user-machine-usage';
 import { UserTrafficAccountingSetting } from '../user-traffic-accounting';
 import { UserForwardingCard } from './user-forwarding';
 import { UserServiceTerms } from './user-service-policy';
+import { UserCycleReset } from './user-cycle-reset';
 import {
   UserAppTrafficPolicyEditor,
   useUserTrafficPolicies,
@@ -188,15 +191,6 @@ export const userPresenceText = (presence: UserPresence | undefined) => {
   return count > 0 ? `在线来源 ${count}` : '暂无在线连接';
 };
 
-const SOURCE_REGION_NAMES = new Intl.DisplayNames(['zh-Hans'], { type: 'region', style: 'short' });
-const SOURCE_OPERATOR_NAMES = new Map<NetworkOperator, string>([
-  ['chinanet', '电信'],
-  ['cmcc', '移动'],
-  ['unicom', '联通'],
-  ['cernet', '教育网'],
-  ['cstnet', '科技网'],
-]);
-
 const SOURCE_PROTOCOL_NAMES = new Map([
   ['vless', 'VLESS'],
   ['anytls', 'AnyTLS'],
@@ -299,25 +293,7 @@ function PresenceChainLink({ chain }: { chain: PresenceChain }) {
   );
 }
 
-const SOURCE_LOCATION_TITLE = '本地 GeoIP · 国家／地区与网络归属参考，非精确位置或宽带品牌';
-
-// 来源的网络归属：本地 GeoIP 国家／地区 + BGP 运营商。国内运营商合写为网络名（「中国电信」
-// 「中国教育网」）；境外地区有运营商归属时写「香港 · 移动」。国家库未命中时保留运营商，
-// 不从运营商反推国家。
-function sourceNetwork(
-  country: string | undefined,
-  operator: NetworkOperator | undefined,
-): { code: string | undefined; label: string } {
-  const code = country?.trim().toUpperCase();
-  const name = code && /^[A-Z]{2}$/.test(code) && code !== 'ZZ' ? SOURCE_REGION_NAMES.of(code) : undefined;
-  const region = name && name !== code ? name : undefined;
-  const operatorName = operator ? SOURCE_OPERATOR_NAMES.get(operator) : undefined;
-  if (!region) return { code: undefined, label: operatorName ? `位置未知 · ${operatorName}` : '位置未知' };
-  if (!operatorName) return { code, label: region };
-  return { code, label: code === 'CN' ? `中国${operatorName}` : `${region} · ${operatorName}` };
-}
-
-// PostgreSQL 的 timestamptz::text 形如「2026-10-05 06:21:22.409123+00」：日期与时刻以空格分隔，
+// PostgreSQL的 timestamptz::text 形如「2026-10-05 06:21:22.409123+00」：日期与时刻以空格分隔，
 // 时区偏移只写小时，秒的小数为 6 位，均不是 ECMAScript 规定的日期格式。先改写为该格式再解析，
 // 不依赖各浏览器 Date.parse 对其他写法的宽松解析。
 function observedAt(at: string): number {
@@ -392,11 +368,13 @@ function SessionFacts({
   downlink,
   onlineSince,
   until,
+  trafficLabel = '本次会话流量',
 }: {
   uplink: number | null | undefined;
   downlink: number | null | undefined;
   onlineSince?: string | null;
   until: number;
+  trafficLabel?: string;
 }) {
   const hasTraffic = uplink != null && downlink != null;
   if (!hasTraffic && !onlineSince) return null;
@@ -415,8 +393,8 @@ function SessionFacts({
       {hasTraffic && (
         <span
           className="user-presence-traffic"
-          aria-label={`本次会话流量 ${bytes(uplink + downlink)}`}
-          title={`本次会话流量：下行 ${bytes(downlink)} · 上行 ${bytes(uplink)}`}
+          aria-label={`${trafficLabel} ${bytes(uplink + downlink)}`}
+          title={`${trafficLabel}：下行 ${bytes(downlink)} · 上行 ${bytes(uplink)}`}
         >
           <Icon of="usage" size={11} />
           <b>{bytes(uplink + downlink)}</b>
@@ -431,6 +409,40 @@ type PresenceBucket = 'online' | 'today' | 'yesterday' | 'week' | 'retention';
 const PRESENCE_BUCKETS: PresenceBucket[] = ['online', 'today', 'yesterday', 'week', 'retention'];
 const OLDER_PRESENCE_BUCKETS = new Set<PresenceBucket>(['week', 'retention']);
 const PRESENCE_HISTORY_PREVIEW_LIMIT = 5;
+const PRESENCE_HISTORY_MERGE_MS = 3_600_000;
+
+type PresenceSource = UserOnlineSource & { history?: UserOnlineSource[] };
+
+// 以组内最新记录为锚点限制总跨度，避免相邻记录不断接续，把整天合成一行。
+// 脱敏前缀不代表同一地址；无法解析的时间也不能用于合并。
+export function mergePresenceHistory(sources: UserOnlineSource[], masked: boolean): PresenceSource[] {
+  const ordered = [...sources].sort((a, b) => lastSeenOrder(b) - lastSeenOrder(a) || a.ip.localeCompare(b.ip));
+  if (masked) return ordered;
+  const rows: PresenceSource[] = [];
+  const latestByIp = new Map<string, PresenceSource>();
+  for (const source of ordered) {
+    const latest = latestByIp.get(source.ip);
+    const span = latest ? observedAt(latest.last_observed_at) - observedAt(source.last_observed_at) : NaN;
+    if (!latest || !Number.isFinite(span) || span < 0 || span >= PRESENCE_HISTORY_MERGE_MS) {
+      const row = { ...source };
+      rows.push(row);
+      latestByIp.set(source.ip, row);
+      continue;
+    }
+    latest.history = [...(latest.history ?? [{ ...latest }]), source];
+    latest.ingress_ids = [...new Set([...latest.ingress_ids, ...source.ingress_ids])];
+    latest.node_ids = [...new Set([...latest.node_ids, ...source.node_ids])];
+    latest.accesses = latest.history.flatMap(item =>
+      item.accesses?.length
+        ? item.accesses
+        : item.ingress_ids.map(ingress_id => ({ node_id: '', ingress_id, protocols: null })),
+    );
+    for (const key of ['session_uplink_bytes', 'session_downlink_bytes'] as const) {
+      latest[key] = latest[key] == null || source[key] == null ? null : latest[key] + source[key];
+    }
+  }
+  return rows;
+}
 
 function offlineBucket(lastSeen: number, today: number): PresenceBucket {
   if (Number.isNaN(lastSeen)) return 'retention';
@@ -440,27 +452,7 @@ function offlineBucket(lastSeen: number, today: number): PresenceBucket {
   return days < 7 ? 'week' : 'retention';
 }
 
-// IPv6 的前 64 位用正文墨色，接口标识降一档：同一 /64 下轮换的隐私地址可以直接对上。
-// 接口标识的冒号后允许断行，窄卡里不会把一组十六进制拆到两行。
-function SourceAddress({ ip }: { ip: string }) {
-  const groups = ip.split(':');
-  if (groups.length <= 4 || !groups.slice(0, 4).every(Boolean)) return <code>{ip}</code>;
-  return (
-    <code>
-      {groups.slice(0, 4).join(':')}
-      <span className="user-presence-iid">
-        {groups.slice(4).map((group, index) => (
-          <Fragment key={index}>
-            :<wbr />
-            {group}
-          </Fragment>
-        ))}
-      </span>
-    </code>
-  );
-}
-
-// 时间线的一行：最后出现时刻 │ 来源 IP │ 网络 │ 接入链 │ 本次流量。
+//时间线的一行：最后出现时刻 │ 来源 IP │ 网络 │ 接入链 │ 本次流量。
 // 在线时长只在展开后的接入链明细中显示，排在该链流量之前。
 // 在线来源不写时刻，所在分组「在线」已经表达它此刻仍在线。卡片每秒随时钟重渲染，
 // 行只在数据或日期变化时重渲染。
@@ -474,7 +466,7 @@ const PresenceRow = memo(function PresenceRow({
   now,
   onBan,
 }: {
-  source: UserOnlineSource;
+  source: PresenceSource;
   online: boolean;
   older: boolean;
   country: string | undefined;
@@ -488,12 +480,19 @@ const PresenceRow = memo(function PresenceRow({
   const accessId = useId();
   const lastSeen = observedAt(source.last_observed_at);
   const network = sourceNetwork(country, operator);
-  const title = observedTitle(source, online);
+  const title = source.history
+    ? `合并 ${source.history.length} 段历史记录\n${source.history.map(item => observedTitle(item, false)).join('\n\n')}`
+    : observedTitle(source, online);
   const time = online ? '' : Number.isNaN(lastSeen) ? '—' : older ? monthDayOf(lastSeen) : clockOf(lastSeen);
   const past = online ? '' : '历史';
   const chains = chainsOf(source, apps);
   const accessCount = chains.length;
-  const accessSummary = accessSummaryOf(chains);
+  const accessSummary = `${accessSummaryOf(chains)}${source.history ? ` · ${source.history.length} 段记录` : ''}`;
+  const detailChains = source.history
+    ? source.history.flatMap((item, index) =>
+        chainsOf(item, apps).map(chain => ({ ...chain, key: `${index}/${chain.key}`, source: item })),
+      )
+    : chains.map(chain => ({ ...chain, source }));
   const until = online ? now : lastSeen;
   return (
     <li className={`user-presence-row${online ? '' : ' off'}${accessExpanded ? ' expanded' : ''}`}>
@@ -535,17 +534,27 @@ const PresenceRow = memo(function PresenceRow({
           )}
         </button>
       </span>
-      <SessionFacts uplink={source.session_uplink_bytes} downlink={source.session_downlink_bytes} until={until} />
+      <SessionFacts
+        uplink={source.session_uplink_bytes}
+        downlink={source.session_downlink_bytes}
+        until={until}
+        trafficLabel={source.history ? '合计流量' : undefined}
+      />
       {accessExpanded && accessCount > 0 && (
         <div id={accessId} className="user-presence-access">
-          {chains.map(chain => {
+          {detailChains.map(chain => {
             const uplink = accessMetric(chain.accesses, 'session_uplink_bytes');
             const downlink = accessMetric(chain.accesses, 'session_downlink_bytes');
             const onlineSince = accessOnlineSince(chain.accesses);
-            const lastObserved = accessLastObserved(chain.accesses, source.last_observed_at);
+            const lastObserved = accessLastObserved(chain.accesses, chain.source.last_observed_at);
             return (
               <span key={chain.key} className="user-presence-access-item">
                 <span className="user-presence-access-name">
+                  {source.history && (
+                    <time className="user-presence-protocols" title={observedTitle(chain.source, false)}>
+                      {clockOf(observedAt(chain.source.last_observed_at))}
+                    </time>
+                  )}
                   <PresenceChainLink chain={chain} />
                   <span className="user-presence-protocols">{protocolText(chain.accesses)}</span>
                 </span>
@@ -738,32 +747,50 @@ function UserPresenceCard({
   // 当前打开的这一位用户读取（见 store 的 history 说明）。刚离线的地址要立即出现在历史里：
   // 在线地址集合进入查询键，集合变化即重新读取，读取期间沿用上一份结果，时间线不闪烁。
   const onlineKey = online
-    .map(source => source.ip)
+    .map(
+      source =>
+        `${source.ip}:${
+          source.accesses
+            ?.map(access => `${access.ingress_id}:${access.online_since_at ?? ''}`)
+            .sort()
+            .join(',') ?? ''
+        }`,
+    )
     .sort()
     .join(' ');
   const history = useQuery({
     queryKey: ['user-presence-history', user.tenant_id, user.id, onlineKey],
     queryFn: () => fetchUserOnlineSourceHistory(user.tenant_id, user.id),
     enabled: !pending,
-    staleTime: 30_000,
+    staleTime: 0,
+    // 同一地址在两次轮询之间重连时，在线 IP 集合可能不变，历史仍需定期更新。
+    refetchInterval: 30_000,
     placeholderData: keepPreviousData,
   });
-  // 重新读取完成前，上一份历史里可能还有刚恢复在线的地址；同一地址只在「在线」出现一次。
+  const mergedHistory = useMemo(
+    () => mergePresenceHistory(history.data?.sources ?? [], masked),
+    [history.data?.sources, masked],
+  );
+  // 已结束周期按时间逐条展示，地址重新上线也不隐藏旧周期。
+  // 旧 Console 仅返回地址快照，仍沿用旧版去重，避免重复当前快照。
   const onlineIps = new Set(online.map(source => source.ip));
   const offline = (history.data?.sources ?? [])
-    .filter(source => !onlineIps.has(source.ip))
+    .filter(source => source.session_id || !onlineIps.has(source.ip))
     .sort((a, b) => lastSeenOrder(b) - lastSeenOrder(a) || a.ip.localeCompare(b.ip));
+  const addressCount = new Set([...online, ...offline].map(source => source.ip)).size;
   const retentionDays = history.data?.retention_days ?? 30;
   const historyCountries = new Map(history.data?.source_countries?.map(({ ip, country }) => [ip, country]));
   const historyOperators = new Map(history.data?.source_operators?.map(({ ip, operator }) => [ip, operator]));
 
-  // 已封禁的地址移出时间线，在卡底自成一组；读数与说明仍按全部来源计算。
+  // 封禁名单在卡底管理；已结束周期仍按时间排列，不因当前被封禁而隐藏。
   const bannedIps = new Set(masked ? [] : (bans?.ips ?? []));
   const timelineOnline = online.filter(source => !bannedIps.has(source.ip));
-  const timelineOffline = offline.filter(source => !bannedIps.has(source.ip));
+  const timelineOffline = mergedHistory.filter(
+    source => source.session_id || (!onlineIps.has(source.ip) && !bannedIps.has(source.ip)),
+  );
   const visibleOffline = historyExpanded ? timelineOffline : timelineOffline.slice(0, PRESENCE_HISTORY_PREVIEW_LIMIT);
 
-  const groups = new Map<PresenceBucket, UserOnlineSource[]>();
+  const groups = new Map<PresenceBucket, PresenceSource[]>();
   // 在线来源按首次出现由近到远：新出现的地址排在最上面
   if (timelineOnline.length) {
     groups.set(
@@ -786,7 +813,10 @@ function UserPresenceCard({
   const visibleBuckets = PRESENCE_BUCKETS.filter(bucket => groups.has(bucket));
 
   // 名单与在线来源按地址对照。名单自带全部地址的地区；脱敏后同形的地址对不上号，只在名单里唯一时才写地区。
-  const sourceByIp = new Map([...offline, ...online].map(source => [source.ip, source]));
+  const sourceByIp = new Map(online.map(source => [source.ip, source]));
+  for (const source of offline) {
+    if (!sourceByIp.has(source.ip)) sourceByIp.set(source.ip, source);
+  }
   const banCountries = new Map(bans?.source_countries?.map(({ ip, country }) => [ip, country]));
   const banOperators = new Map(bans?.source_operators?.map(({ ip, operator }) => [ip, operator]));
   const confirmedNodes = new Set(bans?.nodes.filter(node => node.phase === 'applied').map(node => node.node_id));
@@ -855,10 +885,11 @@ function UserPresenceCard({
     <>
       {partial ? '在线至少 ' : '在线 '}
       <b>{online.length}</b>
-      {history.data && (
+      {history.data && !masked && (
         <>
           {' '}
-          · {retentionDays} 天 <b>{online.length + offline.length}</b> 个地址
+          · {retentionDays} 天{history.data.truncated ? '至少 ' : ' '}
+          <b>{addressCount}</b> 个地址
         </>
       )}
     </>
@@ -951,7 +982,7 @@ function UserPresenceCard({
                 </li>
                 {groups.get(bucket)!.map(source => (
                   <PresenceRow
-                    key={source.ip}
+                    key={source.session_id ?? source.ip}
                     source={source}
                     online={bucket === 'online'}
                     older={OLDER_PRESENCE_BUCKETS.has(bucket)}
@@ -959,7 +990,7 @@ function UserPresenceCard({
                     operator={bucket === 'online' ? operators?.[source.ip] : historyOperators.get(source.ip)}
                     apps={apps}
                     now={now}
-                    onBan={canBan && bans ? banSource : undefined}
+                    onBan={canBan && bans && !bannedIps.has(source.ip) ? banSource : undefined}
                   />
                 ))}
               </Fragment>
@@ -968,12 +999,12 @@ function UserPresenceCard({
         )}
         {!pending && history.isPending && (
           <div className="user-presence-pending">
-            <FieldLoading label="读取离线来源" />
+            <FieldLoading label="读取会话历史" />
           </div>
         )}
         {!!history.error && <ErrorBox error={history.error} />}
-        {history.data?.truncated && (historyExpanded || timelineOffline.length <= PRESENCE_HISTORY_PREVIEW_LIMIT) && (
-          <span className="user-presence-history-note">记录较多，仅显示最近 256 个来源 IP。</span>
+        {history.data?.truncated && (
+          <span className="user-presence-history-note">记录较多，仅显示最近 256 段已结束会话。</span>
         )}
         {timelineOffline.length > PRESENCE_HISTORY_PREVIEW_LIMIT && (
           <button
@@ -982,7 +1013,7 @@ function UserPresenceCard({
             aria-expanded={historyExpanded}
             onClick={() => setHistoryExpanded(expanded => !expanded)}
           >
-            {historyExpanded ? '收起历史来源' : `显示其余 ${hiddenHistoryCount} 个历史来源`}
+            {historyExpanded ? '收起历史记录' : `显示其余 ${hiddenHistoryCount} 条历史记录`}
           </button>
         )}
         {bans && bannedRows.length > 0 && (
@@ -1324,6 +1355,7 @@ function UserUsageLedger({
   accountingMode,
   accountingDisabled,
   onAccountingModeChange,
+  cycleReset,
   servicePolicy,
 }: {
   state: CycleUsageState;
@@ -1332,6 +1364,8 @@ function UserUsageLedger({
   accountingMode: UserTrafficAccountingMode;
   accountingDisabled: boolean;
   onAccountingModeChange: (mode: UserTrafficAccountingMode) => void;
+  /** 本期用量重置（user-cycle-reset.tsx），在「本期接入」一行右端。 */
+  cycleReset: ReactNode;
   /** 账期与有效期（user-service-policy.tsx），排在计量口径之后。 */
   servicePolicy: ReactNode;
 }) {
@@ -1346,6 +1380,7 @@ function UserUsageLedger({
     <section className="user-usage-ledger" aria-label="本期接入">
       <div className="user-usage-hero">
         <span className="user-usage-hero-label">本期接入</span>
+        {cycleReset}
         {known ? (
           <strong className="user-usage-hero-value">
             {figure} <small>{unit}</small>
@@ -2621,8 +2656,8 @@ function UserList({
           aria-label={detailTabs.length === 1 ? '接入' : undefined}
           hidden={activeDetailTab !== 'access'}
         >
-          {/* 用量与额度：左侧读数栏沿用用量页写法（本期接入、重置日、上下行），底部是计量口径与账期、有效期，
-              右侧每条线路一行。合计已在读数栏，标题读数只写线路数。 */}
+          {/* 用量与额度：左侧读数栏沿用用量页写法（本期接入、重置日、上下行），「本期接入」右端是本期用量的「重置」，
+              底部是计量口径与账期、有效期；右侧每条线路一行。合计已在读数栏，标题读数只写线路数。 */}
           <section className="panel config-panel user-dcard user-usage-card">
             <header>
               <PanelTitle of="usage">用量与额度</PanelTitle>
@@ -2639,11 +2674,10 @@ function UserList({
                 accountingMode={u.traffic_accounting_mode ?? 'single'}
                 accountingDisabled={!editable || profile.isPending}
                 onAccountingModeChange={changeAccountingMode}
-                servicePolicy={
-                  <>
-                    <UserServiceTerms user={u} editable={editable} onSaved={refresh} />
-                  </>
+                cycleReset={
+                  <UserCycleReset key={`reset:${r.key}`} user={u} period={cyclePeriodOf(u)} editable={editable} />
                 }
+                servicePolicy={<UserServiceTerms user={u} editable={editable} onSaved={refresh} />}
               />
               {quotaRows.length === 0 ? (
                 <span className="dim qta-empty">尚未授权任何线路</span>
@@ -2713,11 +2747,10 @@ function UserList({
                 canViewRealtime={canViewUserRealtimeTraffic(who)}
                 accountingDisabled={!editable || profile.isPending}
                 onAccountingModeChange={changeAccountingMode}
-                servicePolicy={
-                  <>
-                    <UserServiceTerms user={u} editable={editable} onSaved={refresh} />
-                  </>
+                cycleReset={
+                  <UserCycleReset key={`reset:${r.key}`} user={u} period={cyclePeriodOf(u)} editable={editable} />
                 }
+                servicePolicy={<UserServiceTerms user={u} editable={editable} onSaved={refresh} />}
               />
             </UserDetailTabContent>
           </div>

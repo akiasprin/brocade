@@ -5,6 +5,19 @@ import type { ReactNode } from 'react';
    Icon 是通用件，尺寸和着色类由调用点给（顶栏导航 14px、产物/诊断 13px）。 */
 
 const PATHS = {
+  unlock: (
+    <>
+      <rect x="3" y="7.2" width="10" height="6.6" rx="1.6" />
+      <path d="M5.4 7.2V5a2.6 2.6 0 0 1 5.1-.8" />
+      <path d="M8 9.8v1.6" />
+    </>
+  ),
+  refresh: (
+    <>
+      <path d="M13 8a5 5 0 1 1-1.5-3.6" />
+      <path d="M11.9 1.9v2.7H9.2" />
+    </>
+  ),
   /* 终端主机：机器既是受管节点，也是可进入诊断与配置的操作目标。 */
   nodes: (
     <>

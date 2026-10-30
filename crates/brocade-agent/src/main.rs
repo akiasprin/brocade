@@ -1,5 +1,6 @@
 mod accounting;
 mod certfile;
+mod channel;
 mod command;
 mod conntrack;
 mod conntrack_tuning;
@@ -23,6 +24,7 @@ mod options;
 mod other_domain;
 mod phantun;
 mod probe;
+mod probe_identity;
 mod public_ip;
 mod realtime;
 mod selfupdate;
@@ -32,8 +34,10 @@ mod spool;
 mod traffic;
 mod traffic_limit;
 mod traffic_limit_budget;
+mod unlock_probe;
 mod user_traffic;
 mod vpngate;
+mod wake;
 mod wg;
 mod xray_grpc;
 mod xray_process;
@@ -1826,14 +1830,22 @@ fn run_forever(options: Options) -> Result<(), String> {
     {
         let options = options.clone();
         thread::Builder::new()
+            .name("unlock-probe".to_owned())
+            .spawn(move || unlock_probe::run(options))
+            .map_err(|error| format!("cannot spawn unlock probe thread: {error}"))?;
+    }
+
+    {
+        let options = options.clone();
+        thread::Builder::new()
             .name("forwarding-probe".to_owned())
             .spawn(move || forwarding_probe::run(options))
             .map_err(|error| format!("cannot spawn forwarding probe thread: {error}"))?;
     }
 
     {
-        // One outbound connection, idle until the control plane says somebody is watching. It is
-        // independent of load and usage on purpose: neither their 30-second cadence nor their
+        // One outbound connection carries worker RPCs and update hints even without a browser.
+        // Live sampling stays on demand, independently of load and usage: neither their 30-second cadence nor their
         // persistence/accounting semantics changes when this stream is enabled.
         let options = options.clone();
         let vpngate_realtime = Arc::clone(&vpngate_realtime);
@@ -1952,6 +1964,8 @@ fn run_forever(options: Options) -> Result<(), String> {
         thread::Builder::new()
             .name("probe-targets".to_owned())
             .spawn(move || {
+                let mut wake =
+                    wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Probe);
                 let mut tick = Instant::now();
                 loop {
                     each_round("probe-targets", || {
@@ -1962,7 +1976,9 @@ fn run_forever(options: Options) -> Result<(), String> {
                     });
                     let now = Instant::now();
                     tick = next_periodic_tick(tick, PROBE_TARGETS_REFRESH_INTERVAL, now);
-                    thread::sleep(tick.saturating_duration_since(now));
+                    if wake.wait(tick.saturating_duration_since(now)) {
+                        tick = Instant::now();
+                    }
                 }
             })
             .map_err(|error| format!("cannot spawn probe-targets thread: {error}"))?;
@@ -2126,6 +2142,8 @@ fn run_forever(options: Options) -> Result<(), String> {
         thread::Builder::new()
             .name("ping-settings".to_owned())
             .spawn(move || {
+                let mut wake =
+                    wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Probe);
                 let mut tick = Instant::now();
                 loop {
                     each_round("ping-settings", || {
@@ -2136,7 +2154,9 @@ fn run_forever(options: Options) -> Result<(), String> {
                     });
                     let now = Instant::now();
                     tick = next_periodic_tick(tick, PING_PROBE_SETTINGS_INTERVAL, now);
-                    thread::sleep(tick.saturating_duration_since(now));
+                    if wake.wait(tick.saturating_duration_since(now)) {
+                        tick = Instant::now();
+                    }
                 }
             })
             .map_err(|error| format!("cannot spawn PING settings thread: {error}"))?;
@@ -2193,6 +2213,8 @@ fn run_forever(options: Options) -> Result<(), String> {
         thread::Builder::new()
             .name("e2e-targets".to_owned())
             .spawn(move || {
+                let mut wake =
+                    wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Probe);
                 let mut tick = Instant::now();
                 loop {
                     each_round("e2e-targets", || {
@@ -2203,7 +2225,9 @@ fn run_forever(options: Options) -> Result<(), String> {
                     });
                     let now = Instant::now();
                     tick = next_periodic_tick(tick, E2E_TARGETS_REFRESH_INTERVAL, now);
-                    thread::sleep(tick.saturating_duration_since(now));
+                    if wake.wait(tick.saturating_duration_since(now)) {
+                        tick = Instant::now();
+                    }
                 }
             })
             .map_err(|error| format!("cannot spawn e2e-targets thread: {error}"))?;
@@ -2299,6 +2323,7 @@ fn run_forever(options: Options) -> Result<(), String> {
     xrayupdate::spawn_xray_updates(&options, &xray_updates);
     selfupdate::spawn_selfupdate(&options, &wants_exit);
 
+    let mut apply_wake = wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Desired);
     let mut apply_tick = Instant::now();
     loop {
         if TERMINATION_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -2346,7 +2371,9 @@ fn run_forever(options: Options) -> Result<(), String> {
         }
         let now = Instant::now();
         apply_tick = next_periodic_tick(apply_tick, APPLY_INTERVAL, now);
-        thread::sleep(apply_tick.saturating_duration_since(now));
+        if apply_wake.wait(apply_tick.saturating_duration_since(now)) {
+            apply_tick = Instant::now();
+        }
     }
 }
 
@@ -2666,6 +2693,16 @@ fn apply_once_inner(
             return Err(error);
         }
     };
+    // Error pages have no policy headers. They must not turn a temporary Console
+    // outage into an explicit collection-off transition and discard coverage.
+    let desired = match response.status {
+        200 => Some(
+            serde_json::from_str::<DesiredStateResponse>(&response.body)
+                .map_err(|error| error.to_string())?,
+        ),
+        204 => None,
+        _ => return Err(format!("desired request failed: HTTP {}", response.status)),
+    };
     if let Err(error) = site_usage::apply_policy(
         &options.state_dir,
         response.header(brocade_deployment::site_usage::SITE_USAGE_ENABLED_HEADER),
@@ -2689,6 +2726,11 @@ fn apply_once_inner(
         response.header(brocade_deployment::other_domain::OTHER_DOMAIN_POLICY_HEADER),
     ) {
         warn(format!("域名采集策略未能落地：{error}"));
+    }
+    if let Err(error) =
+        probe_identity::observe(&options.state_dir, response.header(probe_identity::HEADER))
+    {
+        warn(format!("probe identity: {error}"));
     }
     match log_policy_from_response(&response) {
         Ok(Some(policy)) => match logcap::apply_policy(&options.state_dir, policy) {
@@ -2716,7 +2758,7 @@ fn apply_once_inner(
         Ok(None) => {}
         Err(error) => warn(format!("控制面返回的 host network tuning 无效：{error}")),
     }
-    if response.status == 204 {
+    let Some(response) = desired else {
         println!("no desired state");
         // Record it on disk: `health` runs in another process and cannot contact the
         // control plane, yet it has to distinguish a machine not included in any plan
@@ -2730,14 +2772,8 @@ fn apply_once_inner(
         // Every idle round therefore reconciles locally, replaying the artifacts already
         // received.
         return reconcile_local(&options.state_dir, Drift::OnlyWhenBroken);
-    }
-    if response.status != 200 {
-        return Err(format!("desired request failed: HTTP {}", response.status));
-    }
+    };
     clear_no_desired(&options.state_dir);
-
-    let response: DesiredStateResponse =
-        serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
     let (desired, certificates) = match response {
         DesiredStateResponse::Converged => {
             // The control plane sends this state as HTTP 204, which the branch above already
@@ -3948,6 +3984,16 @@ fn apply_xray_with_grants(
     ));
     let mut launch_environment = vec![
         journal,
+        shell_quote(&format!(
+            "{}={}",
+            probe_identity::ENV,
+            probe_identity::path(&accounting_dir).display()
+        )),
+        shell_quote(&format!(
+            "{}={}",
+            probe_identity::PROFILE_ENV,
+            probe_identity::profile(&content)?
+        )),
         shell_quote(&format!(
             "{}={}",
             source_access::ENV,

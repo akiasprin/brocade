@@ -25,6 +25,12 @@ const names = [
   '韩国首尔',
   '备用入口',
 ];
+if (scene === 'dense')
+  names.splice(
+    0,
+    names.length,
+    ...Array.from({ length: 36 }, (_, i) => `多地域机器 ${i} 东京 Singapore ABCDEFGHIJKLMNOPQRSTUVWXYZ`),
+  );
 function bounds(period: SiteUsagePeriod) {
   const day = Math.floor((now + 28800) / 86400) * 86400 - 28800;
   const start = period === 'day' ? day : period === 'week' ? day - 6 * 86400 : Date.UTC(2026, 9, 1) / 1000 - 28800;
@@ -35,13 +41,13 @@ function usage(period: SiteUsagePeriod): UserMachineUsage {
   const { start, end } = bounds(period);
   const step = period === 'month' ? 86400 : 3600;
   const count = Math.ceil((now - start) / step);
-  const rows: UserMachineUsageRow[] = names.slice(0, scene === 'few' ? 3 : 10).map((_, index) => {
+  const rows: UserMachineUsageRow[] = names.slice(0, scene === 'few' ? 3 : names.length).map((_, index) => {
     const points: UserMachineUsageRow['points'] = Array.from({ length: count }, (_, slot) => {
       const at = start + slot * step;
       const gap = scene === 'gap' && index === 1 && at >= now - 4 * 3600;
       const prior = scene === 'launch' && period === 'month' && slot < 10;
       const amount =
-        scene === 'empty' || index >= 8 || gap || prior
+        scene === 'empty' || (scene !== 'dense' && index >= 8) || gap || prior
           ? 0
           : Math.round(((0.1 + ((slot * 7 + index * 13) % 17) / 10) * (step / 3600) * 1024 ** 3) / (index + 1) ** 1.6);
       const up = Math.round(amount * 0.03);

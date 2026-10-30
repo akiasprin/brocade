@@ -3,9 +3,12 @@ import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { UserSiteUsageCard } from '../../src/user-site-usage';
 import { GeneratedUserAvatar } from '../../src/ui/user-avatar';
+import { theme } from '../../src/forge/theme';
 import type { SiteUsagePeriod, UserSiteUsageRow } from '../../src/api';
 import '../../src/styles.css';
 
+if (theme.snapshot() !== (new URLSearchParams(location.search).get('theme') === 'light' ? 'light' : 'dark'))
+  theme.toggle();
 const now = Math.floor(Date.now() / 1000);
 const dailyRows: UserSiteUsageRow[] = [
   { site_id: 'youtube', name: 'YouTube', uplink_bytes: 300_000_000, downlink_bytes: 24_700_000_000 },
@@ -67,6 +70,10 @@ globalThis.fetch = async input => {
       limited: false,
       latest_report_unix_secs: now,
       observed_since_unix_secs: now - 86400,
+      first_record_unix_secs: Math.min(
+        Math.floor(now / 3600) * 3600,
+        bounds(failed[1] as SiteUsagePeriod).detailStart + 2 * 3600,
+      ),
       rows: ['tcp://192.0.2.1:443', 'udp://[2001:db8::1]:443', 'tcp://198.51.100.20:8443', 'udp://203.0.113.8:53'].map(
         (target, index) => ({
           target,
@@ -86,6 +93,10 @@ globalThis.fetch = async input => {
       limited: false,
       latest_report_unix_secs: now,
       observed_since_unix_secs: now - 86400,
+      first_record_unix_secs: Math.min(
+        Math.floor(now / 3600) * 3600,
+        bounds(domains[1] as SiteUsagePeriod).detailStart + 2 * 3600,
+      ),
       rows: [
         'video.cinema.example',
         'updates.software.example',
@@ -132,7 +143,9 @@ globalThis.fetch = async input => {
     expected_nodes: 4,
     limited: false,
     latest_report_unix_secs: now,
-    observed_since_unix_secs: now - 31 * 86400,
+    observed_since_unix_secs: new URLSearchParams(location.search).has('resumed')
+      ? bounds('day').start + 105 * 60
+      : now - 31 * 86400,
     rows,
   });
 };

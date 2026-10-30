@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark" data-palette="dailan">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" />
+    <title>机器来源封禁验收</title>
+    <script>
+      /* 首帧之前写好主题：生产的颜色过渡不应从另一种外观渐变过来。配色保持生产默认。 */
+      (() => {
+        const theme = new URLSearchParams(location.search).get('theme') === 'light' ? 'light' : 'dark';
+        try {
+          localStorage.setItem('brocade-console:theme', theme);
+          localStorage.setItem('brocade-console:palette', 'dailan');
+        } catch {}
+        document.documentElement.dataset.theme = theme;
+        document.querySelector('meta[name="color-scheme"]').content = theme;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./node-source-access-preview.tsx"></script>
+  </body>
+</html>

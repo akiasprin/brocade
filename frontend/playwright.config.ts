@@ -13,6 +13,7 @@ export default defineConfig({
   },
   webServer: {
     command: 'node scripts/visual-preview.mjs',
+    gracefulShutdown: { signal: 'SIGTERM', timeout: 5000 },
     url: 'http://127.0.0.1:4318/tests/fixtures/user-header-preview.html',
     reuseExistingServer: false,
   },

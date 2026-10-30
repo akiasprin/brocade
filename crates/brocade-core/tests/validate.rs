@@ -3130,7 +3130,7 @@ fn validate_rejects_invalid_or_non_domain_machine_dns() {
         position: 0,
         selector: DestMatch::IpCidr(vec!["203.0.113.0/24".to_owned()]),
         resolution: EgressDnsResolution {
-            address: "resolver.example.com".to_owned(),
+            address: "resolver.example.com".to_owned().into(),
             port: 0,
             transport: EgressDnsTransport::Udp,
             address_strategy: EgressDnsAddressStrategy::UseIpv4,
@@ -3248,7 +3248,7 @@ fn machine_dns_overlap_is_resolved_by_machine_priority_not_chain_order() {
             position: 0,
             selector: app.steps[0].rules[0].dest_match.clone(),
             resolution: EgressDnsResolution {
-                address: "192.0.2.53".to_owned(),
+                address: "192.0.2.53".to_owned().into(),
                 port: 53,
                 transport: EgressDnsTransport::Tcp,
                 address_strategy: EgressDnsAddressStrategy::UseIp,
@@ -3260,7 +3260,7 @@ fn machine_dns_overlap_is_resolved_by_machine_priority_not_chain_order() {
             position: 1,
             selector: app.steps[1].rules[0].dest_match.clone(),
             resolution: EgressDnsResolution {
-                address: "198.51.100.53".to_owned(),
+                address: "198.51.100.53".to_owned().into(),
                 port: 53,
                 transport: EgressDnsTransport::Tcp,
                 address_strategy: EgressDnsAddressStrategy::UseIpv6,

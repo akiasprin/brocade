@@ -229,11 +229,28 @@ export function observeAxisTick(strong: string, interval?: (index: number) => bo
 
 /** Minor graduations per major division on the time axis. */
 const MINOR_TICKS_PER_STEP = 4;
+const DAY_MS = 86_400_000;
 
 /** Round wall-clock steps a time axis is allowed to snap its major ticks to (milliseconds). */
 const TIME_STEPS_MS = [
-  30_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_200_000, 1_800_000, 3_600_000, 7_200_000, 10_800_000,
-  21_600_000, 43_200_000, 86_400_000,
+  30_000,
+  60_000,
+  120_000,
+  300_000,
+  600_000,
+  900_000,
+  1_200_000,
+  1_800_000,
+  3_600_000,
+  7_200_000,
+  10_800_000,
+  21_600_000,
+  43_200_000,
+  86_400_000,
+  2 * DAY_MS,
+  3 * DAY_MS,
+  5 * DAY_MS,
+  7 * DAY_MS,
 ];
 
 /**
@@ -251,9 +268,15 @@ export function observeTimeInterval(spanMs: number, targetDivisions = 6): number
  * Every whole multiple of `stepMs` on the local wall clock inside [minMs, maxMs]: whole minutes,
  * whole ten minutes, whole hours. The time zone offset is applied before rounding, so a 6-hour step
  * lands on 00:00 / 06:00 / 12:00 / 18:00 locally rather than on UTC boundaries.
+ * Calendar reports may pin an explicit UTC offset instead of using the browser's time zone.
  */
-export function observeWallClockTicks(minMs: number, maxMs: number, stepMs: number): number[] {
-  const zoneMs = new Date(minMs).getTimezoneOffset() * 60_000;
+export function observeWallClockTicks(
+  minMs: number,
+  maxMs: number,
+  stepMs: number,
+  utcOffsetMinutes?: number,
+): number[] {
+  const zoneMs = (utcOffsetMinutes === undefined ? new Date(minMs).getTimezoneOffset() : -utcOffsetMinutes) * 60_000;
   const ticks: number[] = [];
   for (let value = Math.ceil((minMs - zoneMs) / stepMs) * stepMs + zoneMs; value <= maxMs; value += stepMs) {
     ticks.push(value);
@@ -263,11 +286,25 @@ export function observeWallClockTicks(minMs: number, maxMs: number, stepMs: numb
 
 const two = (value: number) => String(value).padStart(2, '0');
 
-/** Axis label for a time tick: HH:MM, or HH:MM:SS once the step is shorter than a minute. */
-function timeTickText(valueMs: number, withSeconds: boolean): string {
-  const date = new Date(valueMs);
+function clockText(date: Date, withSeconds: boolean): string {
   const minutes = `${two(date.getHours())}:${two(date.getMinutes())}`;
   return withSeconds ? `${minutes}:${two(date.getSeconds())}` : minutes;
+}
+
+function dateText(date: Date, withYear: boolean): string {
+  const day = `${two(date.getMonth() + 1)}-${two(date.getDate())}`;
+  return withYear ? `${date.getFullYear()}-${day}` : day;
+}
+
+/** A time alone is ambiguous when the chart contains more than one calendar day. */
+export function observeTimeTooltip(valueMs: number, minMs: number, maxMs: number): string {
+  const first = new Date(minMs);
+  const last = new Date(maxMs);
+  const date = new Date(valueMs);
+  const time = clockText(date, true);
+  return first.toDateString() === last.toDateString()
+    ? time
+    : `${dateText(date, first.getFullYear() !== last.getFullYear())} ${time}`;
 }
 
 /**
@@ -288,6 +325,8 @@ export function observeTimeAxes(minMs: number, maxMs: number, strong: string, so
   const major = new Set(majors);
   const minors = observeWallClockTicks(minMs, maxMs, step / MINOR_TICKS_PER_STEP).filter(value => !major.has(value));
   const withSeconds = step < 60_000;
+  const withDate = maxMs - minMs > DAY_MS;
+  const withYear = new Date(minMs).getFullYear() !== new Date(maxMs).getFullYear();
   return [
     {
       type: 'value' as const,
@@ -302,7 +341,13 @@ export function observeTimeAxes(minMs: number, maxMs: number, strong: string, so
         margin: 8,
         hideOverlap: true,
         customValues: majors,
-        formatter: (value: number) => timeTickText(value, withSeconds),
+        formatter: (value: number) => {
+          const date = new Date(value);
+          const time = clockText(date, withSeconds);
+          if (!withDate) return time;
+          const day = dateText(date, withYear);
+          return step >= DAY_MS ? day : `${day}\n${time}`;
+        },
       },
     },
     {

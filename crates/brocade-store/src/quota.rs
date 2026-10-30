@@ -98,19 +98,8 @@ pub struct QuotaEnforcementOutcome {
 // Billing boundaries come from the same per-user UTC+8 cycle used by subscriptions and forwarding.
 const CYCLE_USED_SQL: &str = "
     SELECT q.tenant_id, q.user_id, q.app_id, q.limit_bytes,
-           coalesce((
-               SELECT sum(s.uplink_bytes + s.downlink_bytes)
-                      * CASE owner.traffic_accounting_mode WHEN 'double' THEN 2 ELSE 1 END
-               FROM usage_rollups s
-               WHERE s.tenant_id = q.tenant_id
-                 AND s.user_id = q.user_id
-                 AND s.app_id = q.app_id
-                 AND s.period_start >= cycle.starts_at
-                 AND s.period_start < cycle.ends_at
-           ), 0)::bigint AS used_bytes
+           user_traffic_usage(q.tenant_id,q.user_id,'access',q.app_id) AS used_bytes
     FROM user_app_quotas q
-    JOIN users owner ON owner.tenant_id = q.tenant_id AND owner.id = q.user_id
-    CROSS JOIN LATERAL user_traffic_cycle(owner.traffic_reset_day, now()) cycle
     WHERE q.exhausted_action='suspend'
 ";
 
@@ -411,6 +400,11 @@ async fn apply_quota_changes(
     let mut applied = QuotaEnforcementPlan::default();
 
     for item in &plan.suspend {
+        // Resets and service-policy edits share this transaction's control lock. Planning ran
+        // before that lock, so only a fresh read here can authorize the stop.
+        if !quota_exceeded_tx(&mut tx, item).await? {
+            continue;
+        }
         let (_, c) =
             upsert_grant_tx(&mut tx, actor, revision_id, grant_request(item, false)).await?;
         changed |= c;
@@ -424,6 +418,10 @@ async fn apply_quota_changes(
     }
 
     for item in &plan.restore {
+        // A reset can be followed by new traffic while this plan waits for the lock.
+        if quota_exceeded_tx(&mut tx, item).await? {
+            continue;
+        }
         // The ingress is gone: the grant went with it and there is nothing to restore. Clear
         // the suspension record and be done — kept, it produces a NotFound from
         // `ensure_ingress_in_app_tx` every round.
@@ -463,6 +461,22 @@ async fn apply_quota_changes(
     }
     tx.commit().await?;
     Ok((revision_id, applied))
+}
+
+async fn quota_exceeded_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    item: &QuotaGrantChange,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(&format!(
+        "WITH used AS ({CYCLE_USED_SQL}) SELECT EXISTS(
+         SELECT 1 FROM used WHERE tenant_id=$1 AND user_id=$2 AND app_id=$3
+           AND used_bytes>=limit_bytes)"
+    ))
+    .bind(&item.tenant_id)
+    .bind(&item.user_id)
+    .bind(&item.app_id)
+    .fetch_one(&mut **tx)
+    .await?)
 }
 
 fn grant_request(item: &QuotaGrantChange, enabled: bool) -> CreateGrantRequest {

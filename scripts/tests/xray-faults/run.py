@@ -196,6 +196,9 @@ class Traffic:
 
 class Lab:
     def __init__(self, case, output):
+        # A permitted private target stays entirely inside this network namespace.
+        # Loopback is intentionally forbidden for managed user forwarding.
+        subprocess.run(['ip', 'addr', 'add', '10.77.0.1/32', 'dev', 'lo'], check=True, timeout=5)
         self.case, self.output = case, output
         self.state = Path('/tmp/bf')
         self.state.mkdir(mode=0o700, exist_ok=True)
@@ -211,7 +214,7 @@ class Lab:
         self.api, self.public, self.udp, self.vless, self.added, self.forward = [free_port() for _ in range(6)]
         self.secure_public = None
         self.user = 'b831381d-6324-4d53-ad4f-000000000000'
-        self.upstream = EchoServer(('127.0.0.1', 0), Echo)
+        self.upstream = EchoServer(('0.0.0.0', 0), Echo)
         threading.Thread(target=self.upstream.serve_forever, daemon=True).start()
         self.udp_upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_upstream.bind(('127.0.0.1', 0))
@@ -239,6 +242,10 @@ class Lab:
                     reply = lab.desired
                 elif self.path == '/agent/v1/usage':
                     lab.usages.append(body)
+                elif self.path == '/agent/v1/user-traffic/policies':
+                    reply = {'sources': [], 'sha256': hashlib.sha256(b'[]').hexdigest()}
+                elif self.path == '/agent/v1/user-traffic/budget':
+                    reply = {'mode': 'unlimited', 'valid_ms': 10000, 'managed': False}
                 elif self.path == '/agent/v1/forwarding/desired':
                     reply = read_json(lab.state / 'forwarding-desired.json')
                 elif self.path == '/agent/v1/xray-release':
@@ -283,7 +290,7 @@ class Lab:
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         self.server = f'http://127.0.0.1:{self.http.server_port}'
         self.base = {
-            'log': {'loglevel': 'warning'}, 'stats': {},
+            'log': {'loglevel': 'info'}, 'stats': {},
             'api': {'tag': 'api', 'services': ['HandlerService', 'StatsService']},
             'policy': {'levels': {'0': {'statsUserUplink': True, 'statsUserDownlink': True}},
                        'system': {'statsInboundUplink': True, 'statsInboundDownlink': True}},
@@ -339,6 +346,10 @@ class Lab:
             self.processes.append(self.client)
             log.close()
         private_json(self.state / 'xray.json', self.base)
+        # Provision the authoritative empty source policy with the initial test
+        # configuration, as Console enrollment does; missing retained policy is
+        # correctly fail-closed on an already provisioned Agent.
+        private_json(self.state / 'source-access-policy.json', {'revision': 0, 'node_ips': [], 'users': []})
         (self.state / 'usage-generation').write_text('1')
         count = 4096 if case.endswith('4096') else 1024 if case.endswith('1024') else 64
         self.grants = [{'tag': 'vless', 'clients': [
@@ -350,7 +361,8 @@ class Lab:
         private_json(self.state / 'grants.desired.json', self.grants)
         private_json(self.state / 'forwarding-desired.json', {'generation': 72, 'rules': [
             {'id': 42, 'protocol': 'tcp', 'listen_port': self.forward,
-             'target_host': '127.0.0.1', 'target_port': self.upstream.server_address[1]}]})
+             'target_host': '10.77.0.1', 'target_port': self.upstream.server_address[1],
+             'allow_private_targets': True}]})
         self.traffic = None
         self.resident = None
         self.collision = None
@@ -401,30 +413,38 @@ class Lab:
         return found
 
     def business(self):
+        stage = 'starting'
         try:
             for port in [self.public, self.forward]:
+                stage = 'tcp-' + ('public' if port == self.public else 'forward')
                 with socket.create_connection(('127.0.0.1', port), .3) as connection:
                     connection.settimeout(.3)
                     exchange(connection, b'final-business-check')
             if self.secure_public and self.traffic:
+                stage = 'vision'
                 with self.traffic.connect('vision') as connection:
                     exchange(connection, b'final-vision-check')
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
+                stage = 'udp'
                 connection.settimeout(.3)
                 connection.sendto(b'final-udp-check', ('127.0.0.1', self.udp))
                 if connection.recv(1024) != b'final-udp-check':
                     return False
             # Real API readback, including every frozen grant (not just TCP port health).
             for grant in self.grants:
+                stage = 'grant-readback-' + grant['tag']
                 result = subprocess.run([str(self.xray), 'api', 'inbounduser', f'--server=127.0.0.1:{self.api}',
                                          f"-tag={grant['tag']}"], capture_output=True, timeout=2)
                 if result.returncode != 0 or any(client['email'].encode() not in result.stdout or client['uuid'].encode() not in result.stdout
                                                   for client in grant['clients']):
+                    self.business_error = f'{stage}: exit={result.returncode}, returned={result.stdout[:1024]!r}, error={result.stderr[:256]!r}'
                     return False
                 if result.stdout.count(b'"email"') != len(grant['clients']):
+                    self.business_error = stage + ': wrong user count'
                     return False
             return True
-        except (OSError, TimeoutError, subprocess.TimeoutExpired):
+        except (OSError, TimeoutError, subprocess.TimeoutExpired, RuntimeError) as error:
+            self.business_error = stage + ': ' + str(error)
             return False
 
     def offer_work(self):
@@ -486,7 +506,10 @@ class Lab:
                       20, 'repeated handoff did not terminate with healthy business')
         def directory_count():
             return len(list((self.state / 'xray-handoff').iterdir()))
-        self.wait(lambda: directory_count() <= 3, 25, 'retired generations accumulated after 8 handoffs')
+        # The production guard runs every 30 seconds and removes at most four
+        # directories per pass. Eight transitions can require two passes;
+        # earlier checks during a live handoff correctly defer pruning.
+        self.wait(lambda: directory_count() <= 3, 75, 'retired generations accumulated after 8 handoffs')
         self.event('eight-handoffs-complete', peak_generations=peak, retained_generations=directory_count())
 
     def inject(self):
@@ -581,7 +604,11 @@ class Lab:
     def run(self):
         initial = self.start_agent('repair')
         require(initial.wait(20) == 0, 'initial repair failed')
-        require(self.business(), 'initial forwarding/grants unavailable')
+        # The resident Agent owns the live admission endpoint used by forwarding.
+        self.resident = self.start_agent()
+        self.wait(lambda: (self.state / 'user-traffic-control.json').is_file(), 5, 'resident user budget service did not initialize')
+        baseline = self.business()
+        require(baseline, 'initial forwarding/grants unavailable: ' + getattr(self, 'business_error', 'payload mismatch'))
         old = self.pids()
         require(len(old) == 1, f'expected one old generation, found {old}')
         self.old_pid = old[0]
@@ -623,6 +650,11 @@ class Lab:
             with (self.state / 'fault-fill').open('wb') as filler:
                 os.posix_fallocate(filler.fileno(), 0, free - 1024)
         self.report_offline = self.case.endswith('report-offline')
+        # Start a fresh work poll as in the original fixture. The temporary
+        # baseline resident was needed for admission; this controlled restart
+        # leaves the serving Xray and its shared accounting state intact.
+        self.resident.kill()
+        self.resident.wait(2)
         self.resident = self.start_agent()
         self.inject()
         negative = any(self.case.endswith(suffix) for suffix in ['bind-conflict', 'invalid', 'bad-digest', 'bad-version'])
@@ -793,18 +825,19 @@ def outside(args):
         case_output = output / f'{iteration:02d}-{case}'
         case_output.mkdir()
         name = f'brocade-fault-{uuid.uuid4().hex[:12]}'
-        command = ['docker', 'run', '--rm', '--name', name, '--network', 'none', '--pids-limit', '512',
+        case_timeout = 180 if case == 'config-repeat' else 100
+        command = ['docker', 'run', '--rm', '--init', '--name', name, '--network', 'none', '--cap-add', 'NET_ADMIN', '--pids-limit', '512',
                    '--memory', '768m', '--cpus', args.cpus, '--env', f'LAB_UID={os.getuid()}', '--env', f'LAB_GID={os.getgid()}', '--label', 'brocade.test=xray-faults',
                    '--mount', f'type=bind,src={agent},dst=/inputs/agent,readonly',
                    '--mount', f'type=bind,src={xray},dst=/inputs/xray,readonly',
                    '--mount', f'type=bind,src={frozen_runner},dst=/lab/run.py,readonly',
                    '--mount', f'type=bind,src={case_output},dst=/results',
-                   image, 'timeout', '100', 'python3', '/lab/run.py', '--inside', '--case', case, '--output', '/results']
+                   image, 'timeout', str(case_timeout), 'python3', '/lab/run.py', '--inside', '--case', case, '--output', '/results']
         if case.endswith('spool-full'):
             command[2:2] = ['--tmpfs', '/tmp/bf:rw,exec,size=64m,mode=0700']
         began = time.monotonic()
         try:
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=110)
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=case_timeout + 10)
             (case_output / 'docker.log').write_text(completed.stdout + completed.stderr)
             row = read_json(case_output / 'result.json') or {'case': case, 'passed': False, 'error': 'missing result'}
             row.update(iteration=iteration, exit_code=completed.returncode, wall_ms=(time.monotonic()-began)*1000)

@@ -2,21 +2,17 @@
 // 链路页的总览表、机器详情。判定分散实现时，同一条链在两个页面上会显示为不同的
 // 健康状态，无法确定以哪个为准。
 //
-// ## 使用四档而非两档的原因
+// ## 单独区分出口不符的原因
 //
 // 「连通但出口 IP 不符」必须作为独立一档。它表示流量未穿过完整的链（通常从链头直接
 // 出网），而此时规则表合法、每一跳都连通、编译无警告——静态校验无法发现该情况。
 // 归入成功会隐藏该功能最需要报告的状态；归入失败会导致排查一条实际连通的链。
 //
-// 另有第五档「未探测」：它与探测后不通完全不同，合并后新建的链会持续显示为故障。
+// 另有「未探测」：它与探测后不通完全不同，合并后新建的链会持续显示为故障。
 
 import type { E2eExitVerdict, E2eProbeItem, E2eProbeSampleSeries, E2eProbeStatus } from '../api';
 
-export type ProbeTone = 'ok' | 'slow' | 'odd' | 'down' | 'none';
-
-// 超过该值标为黄色。它不表示故障，而表示需要关注——跨洲链路本身延迟较高，
-// 因此它只改变颜色，不改变结论。
-const SLOW_MS = 300;
+export type ProbeTone = 'ok' | 'odd' | 'down' | 'none';
 
 /** 火花线最多画几根柱子。
  *
@@ -128,7 +124,8 @@ export function toneOf(item: E2eProbeItem | null | undefined): ProbeTone {
   if (!item) return 'none';
   if (item.status !== 'ok') return 'down';
   if (item.exit_verdict === 'mismatch') return 'odd';
-  return (item.ttfb_ms ?? 0) > SLOW_MS ? 'slow' : 'ok';
+  // 延迟由数值和曲线表达；成功探测不因延迟高而升级为告警。
+  return 'ok';
 }
 
 /** 悬停时显示的说明：与横幅使用同一结论，其后补充细节。
@@ -193,7 +190,7 @@ export function ProbeSpark({ samples }: { samples: E2eProbeSampleSeries }) {
         return (
           <i
             key={`${probedAt}-${index}`}
-            className={failed ? 'down' : (ttfb ?? 0) > SLOW_MS ? 'slow' : ''}
+            className={failed ? 'down' : ''}
             style={{ height: `${height}%` }}
             title={`${new Date(probedAt * 1_000).toLocaleString()} · ${failed ? STATUS_TEXT[status] : `${ttfb}ms`}`}
           />
@@ -234,8 +231,6 @@ export function ExitVerdict({ item }: { item: E2eProbeItem }) {
 // 右侧是火花线。延迟使用大号字体，因为它是本屏唯一需要与历史值比较的量，其余都是判定结果。
 export function ProbeBanner({ item }: { item: E2eProbeItem | null | undefined }) {
   const tone = toneOf(item);
-  // slow 与 ok 使用同一颜色：它表示延迟较高但结果正确，与出口不符不属于同一严重程度，
-  // 而延迟情况已由数值和火花线中的柱高表示。
   const toneCls = tone === 'down' ? 'tone-err' : tone === 'odd' ? 'tone-odd' : 'tone-ok';
   if (!item) {
     return (

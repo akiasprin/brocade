@@ -72,7 +72,7 @@ fn machine_egress_dns_without_route_references_loads_in_the_real_binary() {
             position: 0,
             selector: DestMatch::DomainSuffix(vec!["example.com".to_owned()]),
             resolution: EgressDnsResolution {
-                address: "192.0.2.53".to_owned(),
+                address: "192.0.2.53".to_owned().into(),
                 port: 53,
                 transport: EgressDnsTransport::Tcp,
                 address_strategy: EgressDnsAddressStrategy::UseIpv4,
@@ -84,7 +84,7 @@ fn machine_egress_dns_without_route_references_loads_in_the_real_binary() {
             position: 1,
             selector: DestMatch::DomainKeyword(vec!["ipv6-only".to_owned()]),
             resolution: EgressDnsResolution {
-                address: "2001:db8::53".to_owned(),
+                address: "2001:db8::53".to_owned().into(),
                 port: 5353,
                 transport: EgressDnsTransport::Udp,
                 address_strategy: EgressDnsAddressStrategy::UseIpv6,
@@ -1154,6 +1154,22 @@ fn reverse_fixture() -> (
     brocade_core::ir::system::SystemIr,
     brocade_core::ir::routing::AppIr,
 ) {
+    let (sys_doc, app) = reverse_fixture_model();
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&sys_doc, &mut diagnostics);
+    let app_ir = compile_hops(
+        compile_app(&sys_doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(
+        diagnostics.iter().all(|d| d.level != Level::Error),
+        "{diagnostics:#?}"
+    );
+    (sys, app_ir)
+}
+
+fn reverse_fixture_model() -> (ModelSnapshot, AppView) {
     let (sys_doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
     app.steps = vec![
         Step {
@@ -1193,10 +1209,29 @@ fn reverse_fixture() -> (
         },
     ];
 
+    (sys_doc, app)
+}
+
+#[test]
+#[ignore = "explicit fixture export for the isolated Docker/KVM topology"]
+fn export_rendered_reverse_topology() {
+    let directory = PathBuf::from(
+        std::env::var_os("BROCADE_REVERSE_EXPORT").expect("explicit output required"),
+    );
+    fs::create_dir(&directory).unwrap();
+    let (mut doc, mut app) = reverse_fixture_model();
+    for node in &mut doc.nodes {
+        let octet = if node.id == "hk" { 20 } else { 30 };
+        node.public_ipv4 = Some(format!("10.234.77.{octet}"));
+        node.overlay_addr = Ipv4Addr::new(10, 234, 77, octet);
+        node.api_port = Some(10086);
+    }
+    doc.overlay_cidr = Ipv4Net::new(Ipv4Addr::new(10, 234, 77, 0), 24).unwrap();
+    app.steps[0].hop_in.as_mut().unwrap().port = 20010;
     let mut diagnostics = Vec::new();
-    let sys = compile_system(&sys_doc, &mut diagnostics);
+    let sys = compile_system(&doc, &mut diagnostics);
     let app_ir = compile_hops(
-        compile_app(&sys_doc, &app, &mut diagnostics),
+        compile_app(&doc, &app, &mut diagnostics),
         &sys,
         &mut diagnostics,
     );
@@ -1204,7 +1239,14 @@ fn reverse_fixture() -> (
         diagnostics.iter().all(|d| d.level != Level::Error),
         "{diagnostics:#?}"
     );
-    (sys, app_ir)
+    for (node, name) in [("hk", "entry"), ("sg", "exit-a")] {
+        let rendered = json::xray(&xray::build(&project_node(
+            &sys,
+            std::slice::from_ref(&app_ir),
+            node,
+        )));
+        fs::write(directory.join(format!("{name}.json")), rendered).unwrap();
+    }
 }
 
 fn xray_binary() -> Option<PathBuf> {
@@ -3355,5 +3397,303 @@ fn random_vless_encryption_ingress_carries_real_traffic_without_tls() {
     assert!(
         server_log_text.contains("taking detour [out:egress]"),
         "合法 VLESS Encryption 流量没有进入业务出站：\n{server_log_text}"
+    );
+}
+
+#[test]
+fn unlock_families_cross_two_managed_hops_and_never_fall_back_to_the_other_family() {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    let Some(binary) = xray_binary() else {
+        eprintln!("跳过：没找到 xray 二进制（设 BROCADE_XRAY_BIN 或放到 .tools/xray）");
+        return;
+    };
+    struct Processes(Vec<std::process::Child>);
+    impl Drop for Processes {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    struct Directory(PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    struct Servers {
+        stop: Arc<AtomicBool>,
+        workers: Vec<thread::JoinHandle<()>>,
+    }
+    impl Drop for Servers {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            for worker in self.workers.drain(..) {
+                let _ = worker.join();
+            }
+        }
+    }
+    let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let service_port = v4.local_addr().unwrap().port();
+    let v6 = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, service_port))
+        .expect("IPv6 loopback is required for real dual-stack acceptance");
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut servers = Servers {
+        stop: stop.clone(),
+        workers: Vec::new(),
+    };
+    let hits = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+    for (listener, label, count) in [(v4, "ipv4", hits[0].clone()), (v6, "ipv6", hits[1].clone())] {
+        listener.set_nonblocking(true).unwrap();
+        let stop = stop.clone();
+        servers.workers.push(thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut socket,_)) => {
+                        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        let mut request=Vec::new();let mut byte=[0];
+                        while !request.ends_with(b"\r\n\r\n") && request.len()<8192 { if socket.read_exact(&mut byte).is_err() { break; } request.push(byte[0]); }
+                        if request.starts_with(b"GET ") { count.fetch_add(1,Ordering::AcqRel);let response=format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{label}",label.len());let _=socket.write_all(response.as_bytes()); }
+                    },
+                    Err(error) if error.kind()==std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(5)),
+                    Err(error) => panic!("test listener failed: {error}"),
+                }
+            }
+        }));
+    }
+    let ports = free_tcp_ports(5);
+    let entry = ports[0];
+    let relay = ports[1];
+    let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
+    doc.overlay_cidr = Ipv4Net::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap();
+    for node in &mut doc.nodes {
+        node.overlay_addr = if node.id == "hk" {
+            Ipv4Addr::new(127, 0, 0, 2)
+        } else {
+            Ipv4Addr::new(127, 0, 0, 3)
+        };
+        node.api_port = None;
+    }
+    app.ingresses[0].port = entry;
+    app.steps[1].hop_in.as_mut().unwrap().port = relay;
+    let mut diagnostics = Vec::new();
+    let sys = compile_system(&doc, &mut diagnostics);
+    let app = compile_hops(
+        compile_app(&doc, &app, &mut diagnostics),
+        &sys,
+        &mut diagnostics,
+    );
+    assert!(
+        diagnostics.iter().all(|item| item.level != Level::Error),
+        "{diagnostics:?}"
+    );
+    let apps = vec![app];
+    let source = project_node(&sys, &apps, "hk");
+    let exit = project_node(&sys, &apps, "sg");
+    let source_tag = source.xray.as_ref().unwrap().inbounds[0].tag.clone();
+    let clients = source
+        .grant_sync
+        .updates
+        .iter()
+        .find(|update| update.inbound_tag == source_tag)
+        .unwrap()
+        .clients
+        .iter()
+        .map(|client| json!({"id":client.uuid,"email":client.label}))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        clients.len(),
+        4,
+        "automatic, two family credentials and original-exit DNS credential"
+    );
+    let mut source_json: Value = serde_json::from_str(&json::xray(&xray::build(&source))).unwrap();
+    // TLS/REALITY transport is covered by the existing embedded-chain acceptance. This
+    // isolated test changes only the first transport so it can measure the compiled routing.
+    source_json["inbounds"] = json!([{"tag":source_tag,"listen":"127.0.0.2","port":entry,"protocol":"vless","settings":{"decryption":"none","clients":clients}}]);
+    source_json
+        .as_object_mut()
+        .unwrap()
+        .remove("burstObservatory");
+    source_json["routing"]
+        .as_object_mut()
+        .unwrap()
+        .remove("balancers");
+    source_json["routing"]["rules"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|rule| rule.get("balancerTag").is_none());
+    let mut exit_json: Value = serde_json::from_str(&json::xray(&xray::build(&exit))).unwrap();
+    source_json.as_object_mut().unwrap().remove("geodata");
+    exit_json.as_object_mut().unwrap().remove("geodata");
+    exit_json["dns"] = json!({"hosts":{"service.family.invalid":["127.0.0.1","::1"],"only4.family.invalid":"127.0.0.1"},"servers":[]});
+    source_json["dns"] = json!({"hosts":{"only4.family.invalid":"::1"},"servers":[]});
+    for client in exit_json["inbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|inbound| {
+            inbound["settings"]["clients"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+    {
+        let label = client["email"].as_str().unwrap();
+        if label.starts_with("probe#") {
+            assert!(
+                !label.contains('@'),
+                "probe must bypass business user budgets"
+            );
+        }
+    }
+    let root = Directory(std::env::temp_dir().join(format!("brocade-unlock-families-{entry}")));
+    fs::create_dir(&root.0).unwrap();
+    let mut processes = Processes(Vec::new());
+    for (name, config) in [("source", source_json), ("exit", exit_json)] {
+        let path = root.0.join(format!("{name}.json"));
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let log = fs::File::create(root.0.join(format!("{name}.log"))).unwrap();
+        processes.0.push(
+            Command::new(&binary)
+                .args(["run", "-c"])
+                .arg(path)
+                // Probes must bypass business admission entirely. A misclassified relay
+                // label would try this unavailable budget controller and close the flow.
+                .env(
+                    "XRAY_BROCADE_USER_LIMIT_FILE",
+                    root.0.join("absent-budget-controller.json"),
+                )
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for (index, family) in [Some(IpFamily::V4), Some(IpFamily::V6), None]
+        .into_iter()
+        .enumerate()
+    {
+        let port = ports[index + 2];
+        let base = brocade_core::model::probe_uuid(INGRESS_PRIVATE, "i-relay");
+        let uuid = match family {
+            Some(family) => brocade_core::model::probe_family_uuid(&base, family),
+            None => brocade_core::model::probe_dns_uuid(&base),
+        };
+        let config = json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":port,"protocol":"socks","settings":{"auth":"noauth"}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"127.0.0.2","port":entry,"users":[{"id":uuid,"encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}}]});
+        let path = root.0.join(format!("client-{index}.json"));
+        fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        processes.0.push(
+            Command::new(&binary)
+                .args(["run", "-c"])
+                .arg(path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Xray family client did not start"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let request = |port: u16, host: &str| {
+        Command::new("curl")
+            .args([
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--max-time",
+                "4",
+                "--noproxy",
+                "",
+                "--socks5-hostname",
+            ])
+            .arg(format!("127.0.0.1:{port}"))
+            .arg(format!("http://{host}:{service_port}/"))
+            .output()
+            .unwrap()
+    };
+    // Give both server listeners a bounded readiness check before making a service request.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.3", relay)).is_err()
+        || TcpStream::connect(("127.0.0.2", entry)).is_err()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "compiled relay did not start\nsource: {}\nexit: {}",
+            fs::read_to_string(root.0.join("source.log")).unwrap_or_default(),
+            fs::read_to_string(root.0.join("exit.log")).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    for (index, expected) in ["ipv4", "ipv6"].into_iter().enumerate() {
+        let response = request(ports[index + 2], "service.family.invalid");
+        let logs = fs::read_to_string(root.0.join("source.log")).unwrap()
+            + &fs::read_to_string(root.0.join("exit.log")).unwrap();
+        assert!(
+            response.status.success(),
+            "{}\n{logs}",
+            String::from_utf8_lossy(&response.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&response.stdout), expected);
+    }
+    assert_eq!(hits[0].load(Ordering::Acquire), 1);
+    assert_eq!(hits[1].load(Ordering::Acquire), 1);
+    assert!(
+        !request(ports[3], "only4.family.invalid").status.success(),
+        "IPv6 must not fall back to an available IPv4 answer"
+    );
+    assert_eq!(
+        hits[0].load(Ordering::Acquire),
+        1,
+        "the IPv4 endpoint remained live and must not receive the IPv6 request"
+    );
+    let mut stream = TcpStream::connect(("127.0.0.1", ports[4])).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .unwrap();
+    stream.write_all(&[5, 1, 0]).unwrap();
+    let mut greeting = [0; 2];
+    stream.read_exact(&mut greeting).unwrap();
+    assert_eq!(greeting, [5, 0]);
+    let host = b"only4.family.invalid";
+    let mut connect = vec![5, 1, 0, 3, host.len() as u8];
+    connect.extend(host);
+    connect.extend(443u16.to_be_bytes());
+    stream.write_all(&connect).unwrap();
+    let mut reply = [0; 10];
+    stream.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply[..2], &[5, 0]);
+    let mut query = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in "only4.family.invalid".split('.') {
+        query.push(label.len() as u8);
+        query.extend(label.as_bytes());
+    }
+    query.extend([0, 0, 28, 0, 1]);
+    stream
+        .write_all(&(query.len() as u16).to_be_bytes())
+        .unwrap();
+    stream.write_all(&query).unwrap();
+    let mut prefix = [0; 2];
+    stream.read_exact(&mut prefix).unwrap();
+    let mut response = vec![0; u16::from_be_bytes(prefix) as usize];
+    stream.read_exact(&mut response).unwrap();
+    assert_eq!(
+        response[3] & 15,
+        0,
+        "DNS errors must not masquerade as no AAAA"
+    );
+    assert_eq!(
+        &response[6..8],
+        &[0, 0],
+        "the exit has no AAAA; the entry's IPv6 answer must never be used"
     );
 }

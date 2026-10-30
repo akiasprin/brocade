@@ -1,0 +1,1430 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark" data-variant="soft">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Brocade · 工具栏按钮设计</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --ground: #0f1012;
+        --sheet: #18191b;
+        --surface: #161718;
+        --block: #1f2023;
+        --line: #303237;
+        --line-soft: #25272b;
+        --ink: #e2e4e7;
+        --ink-2: #c2c5c9;
+        --ink-3: #8d9196;
+        --action: #a3afc1;
+        --action-wash: #29303c;
+        --button: #25272b;
+        --button-hover: #303339;
+        --button-edge: #36393f;
+        --ok: #6bb69b;
+        --chart: #8492a8;
+        --chart-2: #a59ebc;
+        --shadow: 0 12px 36px #0005, 0 2px 8px #0003;
+        --ctl-h: 32px;
+        --r-ctl: 8px;
+        --mono: ui-monospace, 'SFMono-Regular', Consolas, monospace;
+        --sans:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei',
+          sans-serif;
+      }
+      [data-theme='light'] {
+        color-scheme: light;
+        --ground: #f4f4f3;
+        --sheet: #ffffff;
+        --surface: #f8f8f7;
+        --block: #eeefee;
+        --line: #d4d6d9;
+        --line-soft: #e9eaec;
+        --ink: #24272d;
+        --ink-2: #464c56;
+        --ink-3: #6c727c;
+        --action: #526783;
+        --action-wash: #e8edf4;
+        --button: #edeef0;
+        --button-hover: #e1e4e9;
+        --button-edge: #d9dce1;
+        --ok: #348065;
+        --chart: #637c9c;
+        --chart-2: #9180a6;
+        --shadow: 0 12px 36px #1e263b14, 0 2px 8px #1e263b0a;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--ground);
+        color: var(--ink);
+        font: 13px/1.5 var(--sans);
+      }
+      button,
+      input {
+        font: inherit;
+      }
+      button {
+        cursor: pointer;
+        -webkit-tap-highlight-color: transparent;
+      }
+      button,
+      input {
+        color: inherit;
+      }
+      button:focus-visible,
+      input:focus-visible {
+        outline: 2px solid var(--action);
+        outline-offset: 3px;
+      }
+      button:disabled {
+        cursor: not-allowed;
+      }
+      svg {
+        display: block;
+      }
+      .ic {
+        width: 15px;
+        height: 15px;
+        flex: none;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.6;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      .sprite {
+        position: absolute;
+        width: 0;
+        height: 0;
+        overflow: hidden;
+      }
+      .page {
+        width: min(1160px, calc(100% - 80px));
+        margin: 0 auto;
+        padding: 34px 0 30px;
+      }
+      .masthead {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding-bottom: 30px;
+      }
+      .brand {
+        display: flex;
+        gap: 11px;
+        align-items: center;
+        font: 11px var(--mono);
+        letter-spacing: 0.08em;
+        color: var(--ink-3);
+      }
+      .brand strong {
+        color: var(--ink-2);
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.15em;
+      }
+      .brand-mark {
+        display: flex;
+        align-items: center;
+        gap: 3px;
+        height: 18px;
+      }
+      .brand-mark i {
+        width: 3px;
+        height: 15px;
+        background: var(--action);
+        border-radius: 1px;
+        transform: skewY(-25deg);
+      }
+      .brand-mark i:nth-child(2) {
+        height: 10px;
+      }
+      .brand-mark i:nth-child(3) {
+        height: 18px;
+      }
+      .theme-button {
+        border: 1px solid var(--line);
+        background: transparent;
+        color: var(--ink-2);
+        border-radius: 7px;
+        padding: 7px 11px;
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        font-size: 12px;
+      }
+      .intro {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 24px;
+        margin-bottom: 26px;
+      }
+      .eyebrow {
+        font: 10px var(--mono);
+        color: var(--ink-3);
+        letter-spacing: 0.1em;
+        margin: 0 0 10px;
+      }
+      h1 {
+        margin: 0 0 9px;
+        font-size: 32px;
+        font-weight: 550;
+        letter-spacing: -0.04em;
+        line-height: 1.25;
+      }
+      .intro p:last-child {
+        color: var(--ink-3);
+        margin: 0;
+        font-size: 13px;
+      }
+      .version {
+        color: var(--ink-3);
+        font: 11px var(--mono);
+        padding-bottom: 3px;
+        white-space: nowrap;
+      }
+      .directions {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        border-top: 1px solid var(--line-soft);
+        padding: 17px 0 23px;
+      }
+      .direction {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 13px;
+        border: 1px solid transparent;
+        border-radius: 8px;
+        background: transparent;
+        color: var(--ink-3);
+        font-size: 12px;
+      }
+      .direction b {
+        font: 10px var(--mono);
+      }
+      .direction[aria-pressed='true'] {
+        color: var(--ink);
+        background: var(--block);
+        border-color: var(--line);
+      }
+      .recommend {
+        margin-left: 2px;
+        padding: 1px 5px;
+        border-radius: 4px;
+        color: var(--action);
+        background: var(--action-wash);
+        font-size: 9px;
+      }
+      .section-label {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
+        margin: 0 0 12px;
+      }
+      .section-label h2 {
+        font-size: 12px;
+        font-weight: 500;
+        margin: 0;
+        color: var(--ink-2);
+      }
+      .section-label span {
+        font-size: 11px;
+        color: var(--ink-3);
+      }
+      .stage {
+        display: grid;
+        grid-template-columns: 1.05fr 1fr;
+        gap: 18px;
+      }
+      .context {
+        min-width: 0;
+      }
+      .context-label {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        font-size: 11px;
+        color: var(--ink-3);
+        margin: 0 0 9px 2px;
+      }
+      .context-label b {
+        color: var(--action);
+        font: 10px var(--mono);
+      }
+      .panel {
+        border: 1px solid var(--line-soft);
+        border-radius: 13px;
+        background: var(--sheet);
+        overflow: visible;
+      }
+      .panel-head {
+        min-height: 69px;
+        padding: 17px 20px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        border-bottom: 1px solid var(--line-soft);
+      }
+      .panel-title {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        min-width: 0;
+      }
+      .panel-title h3 {
+        margin: 0;
+        font-size: 13px;
+        font-weight: 550;
+        white-space: nowrap;
+      }
+      .status-dot {
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: var(--ok);
+        flex: none;
+      }
+      .toolbar {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        flex: none;
+      }
+      /* Every toolbar context uses this same control; variants change the surface as a unit. */
+      .ctl {
+        min-height: var(--ctl-h);
+        display: inline-flex;
+        justify-content: center;
+        align-items: center;
+        gap: 7px;
+        border-radius: var(--r-ctl);
+        border: 1px solid var(--button-edge);
+        padding: 0 10px;
+        color: var(--ink-2);
+        background: var(--button);
+        white-space: nowrap;
+        line-height: 1;
+        font-size: 12px;
+        transition:
+          background 0.13s,
+          border-color 0.13s,
+          color 0.13s;
+      }
+      .ctl .ic {
+        color: var(--ink-3);
+      }
+      .ctl .chevron {
+        width: 12px;
+        height: 12px;
+        margin-left: 3px;
+      }
+      .ctl.icon {
+        width: var(--ctl-h);
+        padding: 0;
+      }
+      .ctl.icon .ic {
+        color: currentColor;
+      }
+      .ctl[aria-expanded='true'],
+      .ctl.is-open {
+        background: var(--action-wash);
+        border-color: color-mix(in srgb, var(--action) 45%, var(--line));
+        color: var(--action);
+      }
+      .ctl[aria-expanded='true'] .ic,
+      .ctl.is-open .ic {
+        color: currentColor;
+      }
+      .ctl[aria-expanded='true'] .chevron {
+        transform: rotate(180deg);
+      }
+      .ctl.is-hover {
+        background: var(--button-hover);
+        border-color: color-mix(in srgb, var(--button-edge) 70%, var(--ink-3));
+        color: var(--ink);
+      }
+      .ctl:disabled {
+        opacity: 0.38;
+      }
+      :where(.stage, .states, .alternative)[data-variant='outline'] .ctl {
+        background: transparent;
+        border-color: var(--button-edge);
+      }
+      :where(.stage, .states, .alternative)[data-variant='outline'] .ctl.is-hover {
+        background: var(--button-hover);
+      }
+      :where(.stage, .states, .alternative)[data-variant='outline'] .ctl.is-open,
+      :where(.stage, .states, .alternative)[data-variant='outline'] .ctl[aria-expanded='true'] {
+        background: var(--action-wash);
+      }
+      :where(.stage, .states, .alternative)[data-variant='grouped'] .toolbar {
+        gap: 0;
+        border: 1px solid var(--button-edge);
+        border-radius: var(--r-ctl);
+        background: var(--button);
+        padding: 2px;
+      }
+      :where(.stage, .states, .alternative)[data-variant='grouped'] .toolbar .ctl {
+        border-color: transparent;
+        background: transparent;
+        min-height: calc(var(--ctl-h) - 6px);
+        border-radius: 5px;
+      }
+      :where(.stage, .states, .alternative)[data-variant='grouped'] .toolbar .ctl + .ctl {
+        margin-left: 5px;
+        position: relative;
+      }
+      :where(.stage, .states, .alternative)[data-variant='grouped'] .toolbar .ctl + .ctl::before {
+        content: '';
+        position: absolute;
+        height: 12px;
+        width: 1px;
+        background: var(--button-edge);
+        left: -4px;
+        top: 50%;
+        transform: translateY(-50%);
+      }
+      :where(.stage, .states, .alternative)[data-variant='grouped'] .toolbar .ctl.icon {
+        width: calc(var(--ctl-h) - 6px);
+      }
+      :where(.stage, .states, .alternative)[data-variant='grouped'] .toolbar .ctl[aria-expanded='true'],
+      :where(.stage, .states, .alternative)[data-variant='grouped'] .toolbar .ctl.is-open {
+        background: var(--action-wash);
+      }
+      :where(.stage, .states, .alternative)[data-variant='grouped'] .toolbar .ctl.is-hover {
+        background: var(--button-hover);
+      }
+      @media (hover: hover) {
+        .ctl:hover:not(:disabled),
+        [data-variant] .toolbar .ctl:hover:not(:disabled) {
+          background: var(--button-hover);
+          color: var(--ink);
+        }
+        .ctl:hover:not(:disabled) .ic {
+          color: currentColor;
+        }
+        .direction:hover,
+        .theme-button:hover {
+          color: var(--ink);
+          background: var(--block);
+        }
+      }
+      .ctl:active:not(:disabled) {
+        background: var(--action-wash);
+      }
+      .chart-body {
+        padding: 22px 20px 16px;
+      }
+      .readings {
+        display: flex;
+        gap: 32px;
+        margin-bottom: 20px;
+      }
+      .reading-label {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+        color: var(--ink-3);
+        font-size: 10px;
+        margin-bottom: 5px;
+      }
+      .legend {
+        width: 8px;
+        height: 3px;
+        border-radius: 2px;
+        background: var(--chart);
+      }
+      .legend.second {
+        background: var(--chart-2);
+      }
+      .reading-value {
+        font: 22px var(--mono);
+        color: var(--ink-2);
+        letter-spacing: -0.04em;
+      }
+      .reading-value small {
+        font: 10px var(--sans);
+        color: var(--ink-3);
+        margin-left: 5px;
+        letter-spacing: 0;
+      }
+      .chart {
+        width: 100%;
+        height: 112px;
+        overflow: visible;
+      }
+      .chart-grid {
+        stroke: var(--line-soft);
+        stroke-width: 1;
+      }
+      .chart-fill {
+        fill: url(#traffic-fill);
+      }
+      .chart-rx {
+        fill: none;
+        stroke: var(--chart);
+        stroke-width: 1.8;
+        stroke-linejoin: round;
+      }
+      .chart-tx {
+        fill: none;
+        stroke: var(--chart-2);
+        stroke-width: 1.6;
+        stroke-linejoin: round;
+      }
+      .chart-axis {
+        display: flex;
+        justify-content: space-between;
+        color: var(--ink-3);
+        font: 9px var(--mono);
+        margin-top: 10px;
+      }
+      .panel-foot {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 11px 20px;
+        border-top: 1px solid var(--line-soft);
+        color: var(--ink-3);
+        font-size: 10px;
+      }
+      .panel-foot span:last-child {
+        color: var(--ok);
+      }
+      .identity {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 25px 22px 23px;
+      }
+      .avatar {
+        width: 43px;
+        height: 43px;
+        display: grid;
+        place-items: center;
+        border: 1px solid var(--line);
+        border-radius: 13px;
+        background: var(--block);
+        font: 18px var(--mono);
+        color: var(--action);
+      }
+      .identity strong {
+        display: block;
+        font-size: 16px;
+        font-weight: 500;
+        margin-bottom: 2px;
+      }
+      .identity small {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        color: var(--ink-3);
+        font-size: 10px;
+      }
+      .facts {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        margin: 0 22px 24px;
+      }
+      .fact {
+        border-left: 1px solid var(--line-soft);
+        padding-left: 18px;
+      }
+      .fact:first-child {
+        border: 0;
+        padding: 0;
+      }
+      .fact dt {
+        color: var(--ink-3);
+        font-size: 10px;
+        margin-bottom: 6px;
+      }
+      .fact dd {
+        margin: 0;
+        font: 18px var(--mono);
+        color: var(--ink-2);
+      }
+      .fact dd small {
+        color: var(--ink-3);
+        font: 10px var(--sans);
+        margin-left: 4px;
+      }
+      .quota {
+        margin: 0 22px 22px;
+      }
+      .quota-label {
+        display: flex;
+        justify-content: space-between;
+        font-size: 10px;
+        color: var(--ink-3);
+        margin-bottom: 8px;
+      }
+      .quota-track {
+        height: 4px;
+        background: var(--block);
+        border-radius: 3px;
+      }
+      .quota-track i {
+        display: block;
+        width: 34%;
+        height: 100%;
+        background: var(--chart);
+        border-radius: inherit;
+      }
+      .design-note {
+        display: flex;
+        gap: 10px;
+        padding: 15px 0 24px;
+        color: var(--ink-3);
+        font-size: 11px;
+        align-items: baseline;
+      }
+      .design-note b {
+        flex: none;
+        font-weight: 500;
+        color: var(--action);
+      }
+      .states {
+        border-top: 1px solid var(--line-soft);
+        padding-top: 20px;
+        margin-bottom: 28px;
+      }
+      .states-grid {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 12px;
+        padding: 17px 20px;
+        background: var(--surface);
+        border: 1px solid var(--line-soft);
+        border-radius: 11px;
+      }
+      .state-name {
+        font-size: 10px;
+        color: var(--ink-3);
+        margin-bottom: 11px;
+      }
+      .state-controls {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .is-focus {
+        outline: 2px solid var(--action);
+        outline-offset: 3px;
+      }
+      .alternatives {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 18px;
+      }
+      .alternative {
+        background: var(--surface);
+        border: 1px solid var(--line-soft);
+        border-radius: 11px;
+        padding: 17px 20px;
+      }
+      .alternative-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 18px;
+        gap: 12px;
+      }
+      .alternative h3 {
+        margin: 0;
+        font-weight: 500;
+        font-size: 12px;
+      }
+      .alternative p {
+        margin: 3px 0 0;
+        color: var(--ink-3);
+        font-size: 10px;
+      }
+      .alternative-head b {
+        font: 10px var(--mono);
+        color: var(--ink-3);
+      }
+      .alternative-samples {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+      .sample {
+        display: grid;
+        gap: 8px;
+      }
+      .sample > span {
+        font-size: 9px;
+        color: var(--ink-3);
+      }
+      .footer {
+        display: flex;
+        justify-content: space-between;
+        margin-top: 26px;
+        font-size: 10px;
+        color: var(--ink-3);
+        gap: 20px;
+      }
+      .footer span:last-child {
+        font-family: var(--mono);
+      }
+      .popup {
+        position: fixed;
+        z-index: 20;
+        width: 220px;
+        border: 1px solid var(--line);
+        border-radius: 11px;
+        padding: 6px;
+        margin: 0;
+        color: var(--ink-2);
+        background: var(--sheet);
+        box-shadow: var(--shadow);
+      }
+      .popup-title {
+        padding: 8px 9px 7px;
+        font-size: 10px;
+        color: var(--ink-3);
+      }
+      .popup button {
+        width: 100%;
+        border: 0;
+        background: transparent;
+        padding: 9px;
+        border-radius: 6px;
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        text-align: left;
+        font-size: 12px;
+      }
+      .popup button:hover,
+      .popup button:focus-visible {
+        background: var(--button);
+      }
+      .popup button .check {
+        margin-left: auto;
+        color: var(--action);
+        visibility: hidden;
+      }
+      .popup button[aria-checked='true'] {
+        color: var(--action);
+        background: var(--action-wash);
+      }
+      .popup button[aria-checked='true'] .check {
+        visibility: visible;
+      }
+      .popup-rule {
+        height: 1px;
+        margin: 5px 8px;
+        background: var(--line-soft);
+      }
+      .popup-foot {
+        color: var(--ink-3);
+        font-size: 10px;
+        padding: 8px 9px 5px;
+      }
+      [hidden] {
+        display: none !important;
+      }
+      dialog {
+        width: min(420px, calc(100vw - 36px));
+        padding: 0;
+        border: 1px solid var(--line);
+        border-radius: 15px;
+        background: var(--sheet);
+        color: var(--ink);
+        box-shadow: var(--shadow);
+      }
+      dialog::backdrop {
+        background: #0007;
+        backdrop-filter: blur(3px);
+      }
+      .dialog-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 19px 22px;
+        border-bottom: 1px solid var(--line-soft);
+      }
+      .dialog-head h2 {
+        margin: 0;
+        font-size: 15px;
+        font-weight: 500;
+      }
+      .dialog-body {
+        padding: 20px 22px 24px;
+      }
+      .dialog-body p {
+        margin: 0 0 16px;
+        color: var(--ink-3);
+        font-size: 12px;
+      }
+      .node-row {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 13px 0;
+        border-top: 1px solid var(--line-soft);
+        font-size: 12px;
+      }
+      .node-row span:last-child {
+        margin-left: auto;
+        color: var(--ink-3);
+        font: 10px var(--mono);
+      }
+      .url-example {
+        border: 1px solid var(--line);
+        background: var(--ground);
+        padding: 12px;
+        border-radius: 7px;
+        font: 11px/1.8 var(--mono);
+        overflow-wrap: anywhere;
+      }
+      .toast {
+        position: fixed;
+        bottom: 24px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: var(--sheet);
+        color: var(--ink-2);
+        border: 1px solid var(--line);
+        box-shadow: var(--shadow);
+        border-radius: 9px;
+        padding: 11px 17px;
+        font-size: 12px;
+        z-index: 30;
+        width: max-content;
+        max-width: calc(100% - 32px);
+      }
+      @media (max-width: 1050px) {
+        .page {
+          width: calc(100% - 48px);
+        }
+        .panel-head {
+          padding: 16px;
+          gap: 8px;
+        }
+        .alternative-samples {
+          flex-wrap: wrap;
+        }
+      }
+      @media (max-width: 850px) {
+        .stage {
+          grid-template-columns: 1fr;
+          gap: 20px;
+        }
+        .panel-head {
+          padding: 17px 20px;
+        }
+        .states-grid {
+          grid-template-columns: repeat(3, 1fr);
+          row-gap: 23px;
+        }
+        .version {
+          display: none;
+        }
+      }
+      @media (max-width: 540px) {
+        :root {
+          --ctl-h: 40px;
+        }
+        .page {
+          width: calc(100% - 32px);
+          padding-top: 22px;
+        }
+        .masthead {
+          padding-bottom: 30px;
+        }
+        .brand {
+          font-size: 9px;
+          gap: 7px;
+        }
+        .brand strong {
+          font-size: 10px;
+        }
+        .theme-button {
+          width: 36px;
+          height: 36px;
+          justify-content: center;
+          padding: 0;
+        }
+        .theme-button span {
+          display: none;
+        }
+        h1 {
+          font-size: 28px;
+        }
+        .intro p:last-child {
+          max-width: 280px;
+          line-height: 1.8;
+          font-size: 12px;
+        }
+        .intro {
+          margin-bottom: 22px;
+        }
+        .directions {
+          gap: 3px;
+          padding-bottom: 22px;
+        }
+        .direction {
+          font-size: 11px;
+          padding: 8px 9px;
+          gap: 6px;
+        }
+        .recommend {
+          display: none;
+        }
+        .section-label span {
+          display: none;
+        }
+        .panel-head {
+          padding: 12px;
+          min-height: 65px;
+        }
+        .panel-title h3 {
+          font-size: 12px;
+        }
+        .panel-title .status-dot {
+          display: none;
+        }
+        .ctl {
+          padding: 0 10px;
+          gap: 6px;
+        }
+        .ctl .ic {
+          width: 14px;
+          height: 14px;
+        }
+        .toolbar {
+          gap: 5px;
+        }
+        .chart-body {
+          padding: 19px 16px 16px;
+        }
+        .reading-value {
+          font-size: 21px;
+        }
+        .panel-foot {
+          padding: 11px 14px;
+          font-size: 9px;
+        }
+        .design-note {
+          line-height: 1.8;
+          padding-bottom: 20px;
+        }
+        .states-grid {
+          grid-template-columns: repeat(2, 1fr);
+          padding: 17px;
+        }
+        .alternatives {
+          grid-template-columns: 1fr;
+        }
+        .alternative {
+          padding: 17px;
+        }
+        .alternative-samples {
+          gap: 17px;
+        }
+        .footer {
+          font-size: 9px;
+          align-items: start;
+        }
+        .footer span:first-child {
+          max-width: 220px;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before {
+          transition: none !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <svg class="sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+      <symbol id="calendar" viewBox="0 0 24 24">
+        <rect x="4" y="5" width="16" height="16" rx="3" />
+        <path d="M8 3v4m8-4v4M4 10h16m-11 4h.01M12 14h.01M16 14h.01M8 17h.01M12 17h.01" />
+      </symbol>
+      <symbol id="client" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="13" rx="2" />
+        <path d="M8 21h8m-4-4v4" />
+      </symbol>
+      <symbol id="feed" viewBox="0 0 24 24">
+        <path d="M5 4a15 15 0 0 1 15 15M5 11a8 8 0 0 1 8 8" />
+        <circle cx="5" cy="19" r="1" />
+      </symbol>
+      <symbol id="more" viewBox="0 0 24 24">
+        <circle cx="5" cy="12" r=".8" fill="currentColor" />
+        <circle cx="12" cy="12" r=".8" fill="currentColor" />
+        <circle cx="19" cy="12" r=".8" fill="currentColor" />
+      </symbol>
+      <symbol id="chevron" viewBox="0 0 24 24"><path d="m7 10 5 5 5-5" /></symbol>
+      <symbol id="sun" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="4" />
+        <path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.4 1.4m11.2 11.2L19 19M5 19l1.4-1.4M17.6 6.4 19 5" />
+      </symbol>
+      <symbol id="check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6" /></symbol>
+      <symbol id="close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6" /></symbol>
+      <symbol id="refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2 6M20 4v7h-7" /></symbol>
+      <symbol id="activity" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4" /></symbol>
+    </svg>
+    <main class="page">
+      <header class="masthead">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><strong>BROCADE</strong
+          ><span>/ BUTTON STUDY</span>
+        </div>
+        <button type="button" class="theme-button" id="theme-toggle" aria-label="切换到浅色主题">
+          <svg class="ic"><use href="#sun" /></svg><span>浅色预览</span>
+        </button>
+      </header>
+      <div class="intro">
+        <div>
+          <p class="eyebrow">ONE SYSTEM, EVERY TOOLBAR</p>
+          <h1>工具栏按钮，一套语言。</h1>
+          <p>时间选择、节点、订阅与更多，用同一种表面表达「可操作」。</p>
+        </div>
+        <div class="version">DESIGN EXPLORATION / 01</div>
+      </div>
+      <nav class="directions" aria-label="设计方向">
+        <button class="direction" type="button" data-direction="soft" aria-pressed="true">
+          <b>A</b>轻填充<span class="recommend">推荐</span>
+        </button>
+        <button class="direction" type="button" data-direction="outline" aria-pressed="false"><b>B</b>细描边</button>
+        <button class="direction" type="button" data-direction="grouped" aria-pressed="false">
+          <b>C</b>成组工具栏
+        </button>
+      </nav>
+      <div class="section-label">
+        <h2>放回实际使用场景</h2>
+        <span>点击时间、节点、订阅或更多，体验展开状态</span>
+      </div>
+      <section class="stage" aria-label="工具栏场景">
+        <div class="context">
+          <p class="context-label"><b>01</b> 时间选择 + 图标操作</p>
+          <article class="panel" aria-label="节点监测示例">
+            <header class="panel-head">
+              <div class="panel-title">
+                <span class="status-dot"></span>
+                <h3>流量趋势</h3>
+              </div>
+              <div class="toolbar" data-context="traffic">
+                <button
+                  class="ctl"
+                  type="button"
+                  data-popup="range"
+                  aria-expanded="false"
+                  aria-haspopup="menu"
+                  aria-controls="toolbar-popup"
+                >
+                  <svg class="ic"><use href="#calendar" /></svg><span class="range-label">近 1 小时</span
+                  ><svg class="ic chevron"><use href="#chevron" /></svg>
+                </button>
+                <button
+                  class="ctl icon"
+                  type="button"
+                  data-popup="traffic"
+                  aria-label="图表更多操作"
+                  aria-expanded="false"
+                  aria-haspopup="menu"
+                  aria-controls="toolbar-popup"
+                >
+                  <svg class="ic"><use href="#more" /></svg>
+                </button>
+              </div>
+            </header>
+            <div class="chart-body">
+              <div class="readings">
+                <div>
+                  <div class="reading-label"><i class="legend"></i>接收</div>
+                  <div class="reading-value">128.4<small>Mbit/s</small></div>
+                </div>
+                <div>
+                  <div class="reading-label"><i class="legend second"></i>发送</div>
+                  <div class="reading-value">42.8<small>Mbit/s</small></div>
+                </div>
+              </div>
+              <svg
+                class="chart"
+                viewBox="0 0 500 112"
+                preserveAspectRatio="none"
+                role="img"
+                aria-label="示例接收与发送速率曲线"
+              >
+                <defs>
+                  <linearGradient id="traffic-fill" x1="0" x2="0" y1="0" y2="1">
+                    <stop offset="0" stop-color="var(--chart)" stop-opacity=".15" />
+                    <stop offset="1" stop-color="var(--chart)" stop-opacity="0" />
+                  </linearGradient>
+                </defs>
+                <path class="chart-grid" d="M0 1h500M0 37h500M0 74h500M0 111h500" />
+                <path
+                  class="chart-fill"
+                  d="M0 85 14 83 26 89 38 75 51 78 65 63 77 69 90 56 104 66 116 43 129 50 142 39 155 48 168 42 181 54 194 35 207 42 220 27 233 35 246 16 259 28 272 23 285 42 298 35 311 50 324 38 337 31 350 40 363 19 376 26 389 36 402 27 415 42 428 33 441 41 454 28 467 37 480 29 500 35V112H0Z"
+                />
+                <path
+                  class="chart-rx"
+                  d="M0 85 14 83 26 89 38 75 51 78 65 63 77 69 90 56 104 66 116 43 129 50 142 39 155 48 168 42 181 54 194 35 207 42 220 27 233 35 246 16 259 28 272 23 285 42 298 35 311 50 324 38 337 31 350 40 363 19 376 26 389 36 402 27 415 42 428 33 441 41 454 28 467 37 480 29 500 35"
+                />
+                <path
+                  class="chart-tx"
+                  d="M0 100 20 98 40 101 60 93 80 96 100 88 120 91 140 80 160 86 180 82 200 89 220 78 240 83 260 76 280 85 300 79 320 85 340 73 360 79 380 72 400 80 420 74 440 82 460 73 480 78 500 74"
+                />
+              </svg>
+              <div class="chart-axis">
+                <span id="axis-start">21:00</span><span id="axis-mid">21:30</span><span>22:00</span>
+              </div>
+            </div>
+            <footer class="panel-foot">
+              <span id="traffic-caption">示例数据 · 每 10 秒一个采样</span><span>实时连接正常</span>
+            </footer>
+          </article>
+        </div>
+        <div class="context">
+          <p class="context-label"><b>02</b> 快捷入口 + 图标操作</p>
+          <article class="panel" aria-label="用户详情示例">
+            <header class="panel-head">
+              <div class="panel-title"><h3>用户详情</h3></div>
+              <div class="toolbar" data-context="user">
+                <button class="ctl" type="button" data-dialog="nodes">
+                  <svg class="ic"><use href="#client" /></svg><span>节点</span>
+                </button>
+                <button class="ctl" type="button" data-dialog="subscription">
+                  <svg class="ic"><use href="#feed" /></svg><span>订阅</span>
+                </button>
+                <button
+                  class="ctl icon"
+                  type="button"
+                  data-popup="user"
+                  aria-label="用户更多操作"
+                  aria-expanded="false"
+                  aria-haspopup="menu"
+                  aria-controls="toolbar-popup"
+                >
+                  <svg class="ic"><use href="#more" /></svg>
+                </button>
+              </div>
+            </header>
+            <div class="identity">
+              <div class="avatar">L</div>
+              <div>
+                <strong>Lin</strong><small><span class="status-dot"></span>正常使用中<span>·</span>个人用户</small>
+              </div>
+            </div>
+            <dl class="facts">
+              <div class="fact">
+                <dt>已用流量</dt>
+                <dd>68.2<small>GB</small></dd>
+              </div>
+              <div class="fact">
+                <dt>可用节点</dt>
+                <dd>8<small>个</small></dd>
+              </div>
+              <div class="fact">
+                <dt>在线设备</dt>
+                <dd>3<small>台</small></dd>
+              </div>
+            </dl>
+            <div class="quota">
+              <div class="quota-label"><span>本月额度</span><span>68.2 / 200 GB</span></div>
+              <div class="quota-track"><i></i></div>
+            </div>
+            <footer class="panel-foot"><span>示例用户 · 最近活跃于 1 分钟前</span><span>授权有效</span></footer>
+          </article>
+        </div>
+      </section>
+      <p class="design-note">
+        <b id="chosen-name">A / 轻填充</b
+        ><span id="chosen-note">用低对比底色建立点击区域，细边缘收口；所有操作保持同等视觉重量。</span>
+      </p>
+      <section class="states" aria-label="按钮交互状态">
+        <div class="section-label">
+          <h2>同一套状态规则</h2>
+          <span>统一高度、圆角、图标与文字间距</span>
+        </div>
+        <div class="states-grid" id="state-examples"></div>
+      </section>
+      <div class="section-label">
+        <h2>另外两个方向</h2>
+        <span>上方切换后可查看完整场景</span>
+      </div>
+      <section class="alternatives" id="alternative-examples" aria-label="其他设计方向"></section>
+      <footer class="footer">
+        <span>HTML 交互草稿 · 页面数据为示例 · 暂未应用到产品</span><span>统一尺寸 / 圆角 / 图标 / 状态</span>
+      </footer>
+    </main>
+    <div id="toolbar-popup" class="popup" role="menu" hidden></div>
+    <dialog id="detail-dialog" aria-labelledby="dialog-title">
+      <div class="dialog-head">
+        <h2 id="dialog-title"></h2>
+        <button class="ctl icon" type="button" id="dialog-close" aria-label="关闭弹窗">
+          <svg class="ic"><use href="#close" /></svg>
+        </button>
+      </div>
+      <div class="dialog-body" id="dialog-body"></div>
+    </dialog>
+    <div class="toast" role="status" id="toast" hidden></div>
+    <script>
+      const root = document.documentElement;
+      const params = new URLSearchParams(location.search);
+      const variants = {
+        soft: {
+          name: 'A / 轻填充',
+          short: '轻填充',
+          note: '用低对比底色建立点击区域，细边缘收口；所有操作保持同等视觉重量。',
+        },
+        outline: {
+          name: 'B / 细描边',
+          short: '细描边',
+          note: '保留轻量边界，底色融入面板；文字按钮与图标按钮使用相同描边。',
+        },
+        grouped: {
+          name: 'C / 成组工具栏',
+          short: '成组工具栏',
+          note: '同一组操作共用外框与底色，内部细线分隔；两种场景采用同一分组规则。',
+        },
+      };
+      const icon = (name, extra = '') => `<svg class="ic ${extra}" aria-hidden="true"><use href="#${name}"/></svg>`;
+      const control = (name, text, extra = '') =>
+        `<button type="button" class="ctl ${extra}" ${text ? '' : 'aria-label="更多操作示例"'}>${icon(name)}${text ? `<span>${text}</span>` : ''}${name === 'calendar' ? icon('chevron', 'chevron') : ''}</button>`;
+      let activeTrigger = null;
+      let selectedRange = '近 1 小时';
+      let toastTimer;
+      const popup = document.querySelector('#toolbar-popup');
+      const dialog = document.querySelector('#detail-dialog');
+      const stateList = [
+        ['默认', ''],
+        ['悬停', 'is-hover'],
+        ['展开', 'is-open'],
+        ['键盘聚焦', 'is-focus'],
+        ['不可用', 'disabled'],
+      ];
+      document.querySelector('#state-examples').innerHTML = stateList
+        .map(
+          ([label, state]) =>
+            `<div><div class="state-name">${label}</div><div class="state-controls toolbar">${control('client', '节点', state === 'disabled' ? '' : state)}${control('more', '', `icon ${state === 'disabled' ? '' : state}`)}</div></div>`,
+        )
+        .join('');
+      document.querySelectorAll('#state-examples > div:last-child button').forEach(button => (button.disabled = true));
+      document.querySelectorAll('#state-examples button').forEach(button => (button.tabIndex = -1));
+      function closeMenu(restoreFocus = false) {
+        if (!activeTrigger) return;
+        const previous = activeTrigger;
+        previous.setAttribute('aria-expanded', 'false');
+        activeTrigger = null;
+        popup.hidden = true;
+        if (restoreFocus) previous.focus();
+      }
+      function selectVariant(variant) {
+        closeMenu();
+        root.dataset.variant = variant;
+        document.querySelectorAll('.stage, .states').forEach(section => (section.dataset.variant = variant));
+        document
+          .querySelectorAll('[data-direction]')
+          .forEach(button => button.setAttribute('aria-pressed', String(button.dataset.direction === variant)));
+        document.querySelector('#chosen-name').textContent = variants[variant].name;
+        document.querySelector('#chosen-note').textContent = variants[variant].note;
+        document.querySelector('#alternative-examples').innerHTML = Object.entries(variants)
+          .filter(([name]) => name !== variant)
+          .map(
+            ([name, value]) =>
+              `<article class="alternative" data-variant="${name}"><div class="alternative-head"><div><h3>${value.name}</h3><p>相同规则，覆盖两种操作场景</p></div><b>0${Object.keys(variants).indexOf(name) + 1}</b></div><div class="alternative-samples"><div class="sample"><span>时间选择</span><div class="toolbar">${control('calendar', '近 1 小时')}${control('more', '', 'icon')}</div></div><div class="sample"><span>快捷入口</span><div class="toolbar">${control('client', '节点')}${control('feed', '订阅')}${control('more', '', 'icon')}</div></div></div></article>`,
+          )
+          .join('');
+        document.querySelectorAll('.alternative button').forEach(button => {
+          button.tabIndex = -1;
+          button.setAttribute('aria-label', `${valueForVariant(button)} · 点击预览`);
+        });
+        const url = new URL(location.href);
+        url.searchParams.set('variant', variant);
+        history.replaceState(null, '', url);
+      }
+      function valueForVariant(button) {
+        return variants[button.closest('[data-variant]').dataset.variant].short;
+      }
+      function setTheme(theme) {
+        root.dataset.theme = theme;
+        const next = theme === 'dark' ? '浅色' : '深色';
+        document.querySelector('#theme-toggle span').textContent = `${next}预览`;
+        document.querySelector('#theme-toggle').setAttribute('aria-label', `切换到${next}主题`);
+        const url = new URL(location.href);
+        url.searchParams.set('theme', theme);
+        history.replaceState(null, '', url);
+      }
+      function notify(message) {
+        clearTimeout(toastTimer);
+        const toast = document.querySelector('#toast');
+        toast.textContent = message;
+        toast.hidden = false;
+        toastTimer = setTimeout(() => {
+          toast.hidden = true;
+        }, 3000);
+      }
+      function showDialog(kind) {
+        closeMenu(true);
+        const content = {
+          nodes: [
+            '节点',
+            `<p>Lin 的节点预览 · 以下为示例数据</p><div class="node-row">${icon('client')}香港 · 01<span>VLESS</span></div><div class="node-row">${icon('client')}东京 · 02<span>VLESS</span></div><div class="node-row">${icon('client')}新加坡 · 03<span>Trojan</span></div>`,
+          ],
+          subscription: [
+            '订阅',
+            `<p>Clash 订阅地址预览 · 示例地址不包含真实凭据</p><div class="url-example">https://console.example/sub/lin<br/>?format=clash</div><div class="node-row">${icon('feed')}Clash<span>8 个可用节点</span></div>`,
+          ],
+          activity: [
+            '最近活动',
+            '<p>Lin 的活动预览 · 以下为示例数据</p><div class="node-row">节点连接<span>21:59</span></div><div class="node-row">订阅更新<span>21:42</span></div><div class="node-row">设备上线<span>21:30</span></div>',
+          ],
+        };
+        document.querySelector('#dialog-title').textContent = content[kind][0];
+        document.querySelector('#dialog-body').innerHTML = content[kind][1];
+        dialog.showModal();
+      }
+      function positionMenu() {
+        if (!activeTrigger) return;
+        const box = activeTrigger.getBoundingClientRect();
+        const width = popup.offsetWidth;
+        const height = popup.offsetHeight;
+        popup.style.left = `${Math.max(10, Math.min(box.right - width, innerWidth - width - 10))}px`;
+        popup.style.top = `${Math.max(10, box.bottom + height + 16 > innerHeight ? box.top - height - 8 : box.bottom + 8)}px`;
+      }
+      function openMenu(trigger, focusLast = false) {
+        if (activeTrigger === trigger) {
+          closeMenu();
+          return;
+        }
+        closeMenu();
+        activeTrigger = trigger;
+        trigger.setAttribute('aria-expanded', 'true');
+        const kind = trigger.dataset.popup;
+        popup.setAttribute(
+          'aria-label',
+          kind === 'range' ? '选择时间范围' : kind === 'traffic' ? '图表操作' : '用户操作',
+        );
+        if (kind === 'range') {
+          popup.innerHTML =
+            '<div class="popup-title" role="none">时间范围</div>' +
+            ['近 30 分钟', '近 1 小时', '近 6 小时', '近 12 小时', '近 24 小时']
+              .map(
+                label =>
+                  `<button type="button" role="menuitemradio" aria-checked="${label === selectedRange}" data-range="${label}">${icon('calendar')}<span>${label}</span>${icon('check', 'check')}</button>`,
+              )
+              .join('') +
+            '<div class="popup-rule" role="separator"></div><div class="popup-foot" role="none">选择后更新图表范围</div>';
+        } else if (kind === 'traffic') {
+          popup.innerHTML = `<div class="popup-title" role="none">图表操作</div><button type="button" role="menuitem" data-action="refresh">${icon('refresh')}刷新数据</button><button type="button" role="menuitem" data-action="reset">${icon('calendar')}恢复近 1 小时</button>`;
+        } else {
+          popup.innerHTML = `<div class="popup-title" role="none">Lin · 更多操作</div><button type="button" role="menuitem" data-dialog="activity">${icon('activity')}最近活动</button><button type="button" role="menuitem" data-dialog="nodes">${icon('client')}查看可用节点</button>`;
+        }
+        popup.hidden = false;
+        positionMenu();
+        const buttons = [...popup.querySelectorAll('button')];
+        (focusLast
+          ? buttons.at(-1)
+          : buttons.find(button => button.getAttribute('aria-checked') === 'true') || buttons[0]
+        ).focus();
+      }
+      function chooseRange(label) {
+        selectedRange = label;
+        document.querySelector('.range-label').textContent = label;
+        const axis = {
+          '近 30 分钟': ['21:30', '21:45'],
+          '近 1 小时': ['21:00', '21:30'],
+          '近 6 小时': ['16:00', '19:00'],
+          '近 12 小时': ['10:00', '16:00'],
+          '近 24 小时': ['昨天 22:00', '10:00'],
+        };
+        document.querySelector('#axis-start').textContent = axis[label][0];
+        document.querySelector('#axis-mid').textContent = axis[label][1];
+        document.querySelector('#traffic-caption').textContent =
+          label === '近 1 小时' ? '示例数据 · 每 10 秒一个采样' : `示例数据 · ${label}聚合趋势`;
+        closeMenu(true);
+      }
+      document.addEventListener('click', event => {
+        const target = event.target.closest('button');
+        if (target?.dataset.direction) {
+          selectVariant(target.dataset.direction);
+          return;
+        }
+        if (target?.closest('.alternative')) {
+          selectVariant(target.closest('.alternative').dataset.variant);
+          return;
+        }
+        if (target?.dataset.popup) {
+          openMenu(target);
+          return;
+        }
+        if (target?.dataset.range) {
+          chooseRange(target.dataset.range);
+          return;
+        }
+        if (target?.dataset.dialog) {
+          showDialog(target.dataset.dialog);
+          return;
+        }
+        if (target?.dataset.action) {
+          if (target.dataset.action === 'reset') chooseRange('近 1 小时');
+          else {
+            closeMenu(true);
+            notify('已刷新示例数据');
+          }
+          return;
+        }
+        if (!popup.contains(event.target)) closeMenu();
+      });
+      document.addEventListener('keydown', event => {
+        if (event.key === 'Escape') closeMenu(true);
+        const trigger = event.target.closest('[data-popup]');
+        if (trigger && ['ArrowDown', 'ArrowUp'].includes(event.key)) {
+          event.preventDefault();
+          openMenu(trigger, event.key === 'ArrowUp');
+          return;
+        }
+        if (popup.hidden || !popup.contains(event.target)) return;
+        const items = [...popup.querySelectorAll('button')];
+        const index = items.indexOf(document.activeElement);
+        if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+          event.preventDefault();
+          const next =
+            event.key === 'Home'
+              ? 0
+              : event.key === 'End'
+                ? items.length - 1
+                : (index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+          items[next].focus();
+        } else if (event.key === 'Tab') closeMenu();
+      });
+      addEventListener('resize', positionMenu);
+      addEventListener('scroll', () => closeMenu(), { passive: true });
+      document
+        .querySelector('#theme-toggle')
+        .addEventListener('click', () => setTheme(root.dataset.theme === 'dark' ? 'light' : 'dark'));
+      document.querySelector('#dialog-close').addEventListener('click', () => dialog.close());
+      dialog.addEventListener('click', event => {
+        if (event.target === dialog) {
+          const box = dialog.getBoundingClientRect();
+          if (
+            event.clientX < box.left ||
+            event.clientX > box.right ||
+            event.clientY < box.top ||
+            event.clientY > box.bottom
+          )
+            dialog.close();
+        }
+      });
+      selectVariant(Object.hasOwn(variants, params.get('variant')) ? params.get('variant') : 'soft');
+      setTheme(params.get('theme') === 'light' ? 'light' : 'dark');
+    </script>
+  </body>
+</html>

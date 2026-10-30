@@ -188,6 +188,12 @@ fn connect_vless_user(port: u16, target: SocketAddr, udp: bool, identity: u8) ->
     stream
 }
 fn tcp_roundtrip(mut stream: TcpStream, bytes: usize, vless: bool) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
     let payload = vec![73u8; bytes];
     stream.write_all(&payload).unwrap();
     if vless {
@@ -249,6 +255,19 @@ fn user_global_native_tcp_udp_forwarding_and_existing_sessions_share_budget() {
     let server = console(Arc::clone(&mode));
     let mut children = Children(Vec::new());
     let mut ports = Vec::new();
+    let mut anytls_ports = Vec::new();
+    let mut api_addresses = Vec::new();
+    use base64::Engine as _;
+    let certificate = format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        base64::engine::general_purpose::STANDARD
+            .encode(include_bytes!("../http/testdata/localhost.der"))
+    );
+    let private_key = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        base64::engine::general_purpose::STANDARD
+            .encode(include_bytes!("../http/testdata/localhost-key.der"))
+    );
     let mut forwards = Vec::new();
     let mut other_ports = Vec::new();
     for node in 0..2 {
@@ -258,6 +277,12 @@ fn user_global_native_tcp_udp_forwarding_and_existing_sessions_share_budget() {
         let api = free_port();
         let forward = free_port();
         let mut config = json!({"log":{"loglevel":"error"},"api":{"tag":"api","listen":format!("127.0.0.1:{api}"),"services":["HandlerService","StatsService"]},"stats":{},"inbounds":[{"tag":"entry","listen":"127.0.0.1","port":port,"protocol":"vless","settings":{"decryption":"none","clients":[{"id":"01010101-0101-0101-0101-010101010101","email":format!("alice@platform#in{node}")},{"id":"02020202-0202-0202-0202-020202020202","email":format!("bob@platform#in{node}")}]}}],"outbounds":[{"tag":"out:forward","protocol":"freedom"}]});
+        let anytls = free_port();
+        config["inbounds"].as_array_mut().unwrap().push(json!({
+            "tag":"anytls", "listen":"127.0.0.1", "port":anytls, "protocol":"anytls",
+            "settings":{"users":[{"password":"01010101-0101-0101-0101-010101010101","email":format!("alice@platform#in{node}")}]},
+            "streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"certificates":[{"certificate":[certificate],"key":[private_key]}]}}
+        }));
         let other_port = free_port();
         config["inbounds"].as_array_mut().unwrap().push(json!({"tag":"other-app","listen":"127.0.0.1","port":other_port,"protocol":"vless","settings":{"decryption":"none","clients":[{"id":"01010101-0101-0101-0101-010101010101","email":format!("alice@platform#other{node}")}]}}));
         other_ports.push(other_port);
@@ -272,6 +297,10 @@ fn user_global_native_tcp_udp_forwarding_and_existing_sessions_share_budget() {
             .args(["run", "-config"])
             .arg(&file)
             .env("XRAY_BROCADE_USER_LIMIT_FILE", control_path(&dir))
+            .env(
+                "xray.anytls.splice",
+                std::env::var("BROCADE_E2E_ANYTLS_SPLICE").unwrap_or_else(|_| "on".into()),
+            )
             .env_remove("XRAY_BROCADE_MACHINE_LIMIT_FILE")
             .env_remove("XRAY_BROCADE_MACHINE_LIMIT_REQUIRED")
             .stdout(Stdio::from(
@@ -310,6 +339,31 @@ fn user_global_native_tcp_udp_forwarding_and_existing_sessions_share_budget() {
             true,
         )
         .unwrap();
+        let anytls_client = free_port();
+        let client_path = dir.join("anytls-client.json");
+        std::fs::write(&client_path, serde_json::to_vec(&json!({
+            "log":{"loglevel":"error"},
+            "inbounds":[{"listen":"127.0.0.1","port":anytls_client,"protocol":"dokodemo-door","settings":{"address":target.ip().to_string(),"port":target.port(),"network":"tcp,udp"}}],
+            "outbounds":[{"protocol":"anytls","settings":{"address":"127.0.0.1","port":anytls,"password":"01010101-0101-0101-0101-010101010101"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true}}}]
+        })).unwrap()).unwrap();
+        children.0.push(
+            Command::new(&binary)
+                .args(["run", "-config"])
+                .arg(client_path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(
+                    std::fs::File::create(dir.join("anytls-client.log")).unwrap(),
+                ))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, anytls_client)).is_err() {
+            assert!(Instant::now() < deadline, "AnyTLS client not ready");
+            thread::sleep(Duration::from_millis(20));
+        }
+        anytls_ports.push(anytls_client);
+        api_addresses.push(address);
         ports.push(port);
         forwards.push(forward);
     }
@@ -332,6 +386,26 @@ fn user_global_native_tcp_udp_forwarding_and_existing_sessions_share_budget() {
     assert!(
         tcp_elapsed >= Duration::from_millis(1800),
         "two nodes each received a complete speed allowance: {tcp_elapsed:?}"
+    );
+    let now = Instant::now();
+    thread::scope(|scope| {
+        for &port in &anytls_ports {
+            scope.spawn(move || {
+                tcp_roundtrip(
+                    TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap(),
+                    65536,
+                    false,
+                )
+            });
+        }
+    });
+    let anytls_elapsed = now.elapsed();
+    assert!(
+        anytls_elapsed >= Duration::from_millis(1800),
+        "AnyTLS bypassed the shared user budget: {anytls_elapsed:?}"
+    );
+    eprintln!(
+        "two-node AnyTLS TCP exact payload 262144 bytes, shared 800 Kbps budget: {anytls_elapsed:?}"
     );
     // The same UUID in another app must not inherit this app's exhausted state.
     mode.store(5, Ordering::SeqCst);
@@ -480,9 +554,57 @@ fn user_global_native_tcp_udp_forwarding_and_existing_sessions_share_budget() {
         canceled_elapsed >= Duration::from_millis(1300),
         "removing the user quota bypassed the active machine limit: {canceled_elapsed:?}"
     );
+    let now = Instant::now();
+    tcp_roundtrip(
+        TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, anytls_ports[0])).unwrap(),
+        16384,
+        false,
+    );
+    let anytls_machine_elapsed = now.elapsed();
+    assert!(
+        anytls_machine_elapsed >= Duration::from_millis(1300),
+        "AnyTLS bypassed the active machine ceiling: {anytls_machine_elapsed:?}"
+    );
+    for address in api_addresses {
+        let performance =
+            crate::xray_grpc::query_stats(address, "anytls>>>performance>>>").unwrap();
+        let counter = |suffix: &str| {
+            performance
+                .iter()
+                .find(|s| s.name.ends_with(suffix))
+                .map_or(0, |s| s.value)
+        };
+        eprintln!(
+            "AnyTLS performance: authenticated kTLS={}, splice={}, writev={}, machine transfer={anytls_machine_elapsed:?}",
+            counter(">>>ktls_authenticated_connections"),
+            counter(">>>splice_connections"),
+            counter(">>>writev_syscalls")
+        );
+        if std::env::var_os("BROCADE_REQUIRE_KTLS").is_some() {
+            assert!(
+                counter(">>>ktls_authenticated_connections") > 0,
+                "real kTLS required"
+            );
+            if std::env::var("BROCADE_E2E_ANYTLS_SPLICE").as_deref() == Ok("off") {
+                assert!(
+                    counter(">>>writev_syscalls") > 0,
+                    "real vectored write required"
+                );
+            } else {
+                assert!(
+                    counter(">>>splice_connections") > 0,
+                    "real framed splice required"
+                );
+            }
+        }
+    }
     eprintln!("independent app budgets: 131072 payload bytes, {apps_elapsed:?}");
-    eprintln!("machine ceiling: two users and two apps, 98304 payload bytes, {machine_elapsed:?}; quota recovery with same machine ceiling: {recovered_elapsed:?}; quota removed: {canceled_elapsed:?}");
-    eprintln!("two-node user TCP payload 262144 bytes at 800 Kbps: {tcp_elapsed:?}; TCP, UDP, forwarding, app independence, outage and recovery verified");
+    eprintln!(
+        "machine ceiling: two users and two apps, 98304 payload bytes, {machine_elapsed:?}; quota recovery with same machine ceiling: {recovered_elapsed:?}; quota removed: {canceled_elapsed:?}"
+    );
+    eprintln!(
+        "two-node user TCP payload 262144 bytes at 800 Kbps: {tcp_elapsed:?}; TCP, UDP, forwarding, app independence, outage and recovery verified"
+    );
     drop(children);
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -1,3 +1,5 @@
+import { lazy } from '../ui/lazy';
+import { NodeUnlockPanel } from './node-unlock';
 import { SourceAccessPanel } from './source-access';
 import {
   TrafficLimitChip,
@@ -17,7 +19,6 @@ import { draft } from '../draft';
 import { NODE_DRAFT_PANELS, nodeDraftPanelKey, useNodeDraftFocus } from '../forge/draft-node-location';
 import {
   Fragment,
-  lazy,
   Suspense,
   useEffect,
   useId,
@@ -99,7 +100,8 @@ import {
   type ProvisionNodeResult,
   type UsageNodeSeries,
 } from '../api';
-import { configHandoffForceCandidate } from '../xray-handoff';
+import { configHandoffForceCandidate, type ConfigHandoffForceCandidate } from '../xray-handoff';
+import { useNodeTokenReceipt } from '../ui/node-token-receipt';
 import { fetchPreviewStatus } from '../preview/api';
 import { PreviewProvision, type PreviewWizDrill } from '../preview/provision';
 import { can, isVisitor, useSession } from '../session';
@@ -145,6 +147,7 @@ import { cancelVisualTransition } from '../ui/motion';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import { OBSERVE_MS_UNIT, OBSERVE_SERIES_COLOR_VARS } from '../ui/observe-chart';
 import { observeSeriesData } from '../ui/observe-series';
+import { ObserveLegendItem, useObserveFocus } from '../ui/observe-focus';
 import {
   customLoadRange,
   DEFAULT_LOAD_RANGE,
@@ -302,6 +305,7 @@ export function NodesPane({ win, bare = false }: { win: Win; bare?: boolean }) {
       <ChainStep id={drill.id} />
     ) : (
       <NodeDetail
+        key={drill.id}
         id={drill.id}
         initialTab={drill.tab}
         rangeQuery={{ range: drill.range, from: drill.from, to: drill.to }}
@@ -710,12 +714,14 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   // 使用详情页的 `chainUseOf`（同一套判定，两处不会给出不同角色），
   // 数据来自外壳已在拉取的 `['snapshot']`，不新增请求。
   // 使用 `null` 而非空 Map：该机器未加入任何链与数据尚未就绪是两种状态。
-  // 批量退役。行内不常驻删除和退役控件——列表上一次误触即导致一台机器停止服务，
-  // 因此入口是显式的「多选」：不启用多选时，本页只有导航操作。
+  // 批量退役与移除。行内不常驻删除和退役控件——列表上一次误触即导致一台机器停止服务，
+  // 因此入口是显式的「多选」：不启用多选时，本页只有导航操作。退役机器与在用机器排在
+  // 同一网格里，一次多选覆盖两类：在用机器勾选后退役下线，已停用的退役机器勾选后永久
+  // 移除。两类操作各有自己的按钮与台数，混选时也不会一并执行。
   //
   // 这几个 hook 必须位于下面两条 early return 之前：放在 `list` 附近可读性更好，但
   // 那样它们只在数据就绪的那次渲染中被调用，hook 数量前后不一致会导致 React 报错（#310）。
-  const [selectionMode, setSelectionMode] = useState<'retire' | 'remove' | null>(null);
+  const [selecting, setSelecting] = useState(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [removalNotice, setRemovalNotice] = useState<string | null>(null);
   const togglePick = (id: string) =>
@@ -726,11 +732,11 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
       return next;
     });
   const exitSelect = () => {
-    setSelectionMode(null);
+    setSelecting(false);
     setPicked(new Set());
   };
-  const beginSelect = (mode: 'retire' | 'remove') => {
-    setSelectionMode(mode);
+  const beginSelect = () => {
+    setSelecting(true);
     setPicked(new Set());
   };
   const retireAll = useMutation({
@@ -776,7 +782,6 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
     },
   });
 
-  const section = sheeted ? 'fg-sheet' : 'panel';
   if (nodes.isPending) return <Loading variant="nodes" sheeted={sheeted} />;
   if (nodes.error) return <ErrorBox error={nodes.error} />;
 
@@ -795,18 +800,17 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
       // 同名机器（`name` 没有唯一约束）之间仍需一个确定的顺序，否则两次渲染可能不同。
       NAME_ORDER.compare(a.node_id, b.node_id),
   );
-  const live = list.filter(n => !n.retired_at);
-  const retired = list.filter(n => !!n.retired_at);
   // React Query deliberately reuses the last successful list on route changes. Names and layout
   // remain useful, but an old last_poll_at must not briefly turn every lamp red before the forced
   // mount refresh completes.
   const nodeSnapshotFresh = nodeListSnapshotFresh(nodes.dataUpdatedAt);
   const isolatedNodeIds = new Set(list.filter(n => n.operationally_isolated).map(n => n.node_id));
-  const removable = retired.filter(nodeRemovalReady);
+  const removable = list.filter(nodeRemovalReady);
   // 已退役的不计入：对其再次提交退役是不产生任何变更的草稿操作，
   // 而计入后会使操作者认为本次退役了 N 台。
   const pickedLive = [...picked].filter(id => list.some(n => n.node_id === id && !n.retired_at));
   const pickedRetired = [...picked].filter(id => removable.some(n => n.node_id === id));
+  const busy = retireAll.isPending || removeNodes.isPending;
   const confirmRemoval = (ids: string[]) => {
     const targets = [...new Set(ids)].sort();
     if (targets.length === 0) return;
@@ -820,69 +824,63 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
     removeNodes.mutate(targets);
   };
   const trafficOf = new Map((traffic.data?.nodes ?? []).map(item => [item.node_id, item]));
+  const system = can(who.role, 'system');
   const renderHeader = () => (
     <header>
       <ListIcon of="nodes" />
       <h4>机器</h4>
       <span className="sp" />
-      {selectionMode === 'retire' ? (
-        <>
-          <button className="btn" onClick={exitSelect}>
-            取消
-          </button>
-          {/* 退役直接创建停用发布，不进入浏览器草稿。 */}
-          <button
-            className="btn danger"
-            disabled={pickedLive.length === 0 || retireAll.isPending}
-            title={`退役选中的 ${pickedLive.length} 台：保留记录，并为 Agent 创建完整停用发布`}
-            onClick={() => retireAll.mutate()}
-          >
-            {retireAll.isPending ? '提交中…' : `退役下线${pickedLive.length > 0 ? ` ${pickedLive.length}` : ''}`}
-          </button>
-        </>
-      ) : (
-        <>
-          <button
-            className="btn"
-            disabled={!can(who.role, 'system') || selectionMode !== null}
-            onClick={() => beginSelect('retire')}
-          >
-            多选
-          </button>
-          <button
-            className="btn primary"
-            disabled={!can(who.role, 'system')}
-            onClick={() => go({ p: 'provision', step: 1 })}
-          >
-            ＋ 纳管机器
-          </button>
-        </>
-      )}
+      {/* 访客不显示标题栏操作：这些入口全部触发写接口，与机器详情的处理相同。 */}
+      {!isVisitor(who) &&
+        (selecting ? (
+          <>
+            <button className="btn" type="button" disabled={busy} onClick={exitSelect}>
+              取消
+            </button>
+            {/* 退役直接创建停用发布，不进入浏览器草稿。 */}
+            <button
+              className="btn danger"
+              type="button"
+              disabled={pickedLive.length === 0 || busy}
+              title={`退役选中的 ${pickedLive.length} 台：保留记录，并为 Agent 创建完整停用发布`}
+              onClick={() => retireAll.mutate()}
+            >
+              {retireAll.isPending ? '提交中…' : `退役下线${pickedLive.length > 0 ? ` ${pickedLive.length}` : ''}`}
+            </button>
+            {/* 没有可移除的退役机器时不画，多选只剩退役一种操作。 */}
+            {removable.length > 0 && (
+              <button
+                className="btn danger node-remove-button"
+                type="button"
+                disabled={pickedRetired.length === 0 || busy}
+                onClick={() => confirmRemoval(pickedRetired)}
+              >
+                <Icon of="trash" size={13} className="node-remove-button-icon" />
+                {removeNodes.isPending
+                  ? '移除中…'
+                  : `移除选中${pickedRetired.length > 0 ? ` ${pickedRetired.length}` : ''}`}
+              </button>
+            )}
+          </>
+        ) : (
+          <>
+            {/* 还没有机器时没有可勾选的，不画多选。 */}
+            {list.length > 0 && (
+              <button className="btn" type="button" disabled={!system} onClick={beginSelect}>
+                多选
+              </button>
+            )}
+            <button
+              className="btn primary"
+              type="button"
+              disabled={!system}
+              onClick={() => go({ p: 'provision', step: 1 })}
+            >
+              ＋ 纳管机器
+            </button>
+          </>
+        ))}
     </header>
-  );
-  const renderCards = (items: NodeAgentStateItem[], purpose: 'retire' | 'remove') => (
-    <div className="ncards">
-      {items.map(n => (
-        <NodeCard
-          key={n.node_id}
-          node={n}
-          snapshotFresh={nodeSnapshotFresh}
-          isolatedNodeIds={isolatedNodeIds}
-          traffic={trafficOf.get(n.node_id)}
-          load={loadOf.get(n.node_id)}
-          pingProbe={pingProbeOf.get(n.node_id)}
-          pingProbeIntervalSecs={pingProbe.data?.interval_secs ?? 60}
-          pingProbeReady={pingProbe.isSuccess}
-          trafficPending={traffic.isPending}
-          selecting={selectionMode === purpose}
-          selectable={purpose === 'retire' ? !n.retired_at : nodeRemovalReady(n)}
-          checked={picked.has(n.node_id)}
-          onPick={() => togglePick(n.node_id)}
-          onPrepare={() => void prefetchNodeDetailData(qc, n.node_id, !isVisitor(who))}
-          go={go}
-        />
-      ))}
-    </div>
   );
   const emptyMachines = (
     <EmptyState
@@ -901,94 +899,56 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
       先登记机器身份与网络信息，再在目标机器上安装 Agent。
     </EmptyState>
   );
+  // 退役机器按上面的排序排在同一网格末尾：卡片半透明，右上角写退役状态，不单列一张卡。
+  const body = (
+    <>
+      {retireAll.error && <ErrorBox error={retireAll.error} />}
+      {removeNodes.error && <ErrorBox error={removeNodes.error} />}
+      {removalNotice && <div className="callout">{removalNotice}</div>}
+      {list.length === 0 ? (
+        emptyMachines
+      ) : (
+        <div className="ncards">
+          {list.map(n => (
+            <NodeCard
+              key={n.node_id}
+              node={n}
+              snapshotFresh={nodeSnapshotFresh}
+              isolatedNodeIds={isolatedNodeIds}
+              traffic={trafficOf.get(n.node_id)}
+              load={loadOf.get(n.node_id)}
+              pingProbe={pingProbeOf.get(n.node_id)}
+              pingProbeIntervalSecs={pingProbe.data?.interval_secs ?? 60}
+              pingProbeReady={pingProbe.isSuccess}
+              trafficPending={traffic.isPending}
+              selecting={selecting}
+              selectable={!n.retired_at || nodeRemovalReady(n)}
+              checked={picked.has(n.node_id)}
+              onPick={() => togglePick(n.node_id)}
+              onPrepare={() => void prefetchNodeDetailData(qc, n.node_id, !isVisitor(who))}
+              go={go}
+            />
+          ))}
+        </div>
+      )}
+    </>
+  );
 
   if (sheeted) {
     return (
       <div className="cardpage node-cardpage">
         <section className="panel titled node-list-panel" data-page-title="true">
           {renderHeader()}
-          {retireAll.error && <ErrorBox error={retireAll.error} />}
-          {removalNotice && <div className="callout">{removalNotice}</div>}
-          {list.length === 0 ? (
-            emptyMachines
-          ) : live.length === 0 ? (
-            <Empty>没有在用机器。</Empty>
-          ) : (
-            renderCards(live, 'retire')
-          )}
+          {body}
         </section>
-        {retired.length > 0 && (
-          <section className="panel titled node-retired-panel">
-            <header>
-              <PanelTitle of="nodes">退役机器</PanelTitle>
-              <span className="hint">
-                {retired.length} 台{removable.length !== retired.length ? ` · ${removable.length} 台可移除` : ''}
-              </span>
-              <span className="sp" />
-              {selectionMode === 'remove' ? (
-                <>
-                  <button className="btn" type="button" disabled={removeNodes.isPending} onClick={exitSelect}>
-                    取消
-                  </button>
-                  <button
-                    className="btn danger node-remove-button"
-                    type="button"
-                    disabled={pickedRetired.length === 0 || removeNodes.isPending}
-                    onClick={() => confirmRemoval(pickedRetired)}
-                  >
-                    <Icon of="trash" size={13} className="node-remove-button-icon" />
-                    {removeNodes.isPending
-                      ? '移除中…'
-                      : `移除选中${pickedRetired.length > 0 ? ` ${pickedRetired.length}` : ''}`}
-                  </button>
-                </>
-              ) : (
-                <>
-                  <button
-                    className="btn"
-                    type="button"
-                    disabled={
-                      !can(who.role, 'system') ||
-                      removable.length === 0 ||
-                      selectionMode !== null ||
-                      removeNodes.isPending
-                    }
-                    onClick={() => beginSelect('remove')}
-                  >
-                    多选
-                  </button>
-                  <button
-                    className="btn danger node-remove-button"
-                    type="button"
-                    disabled={
-                      !can(who.role, 'system') ||
-                      removable.length === 0 ||
-                      selectionMode !== null ||
-                      removeNodes.isPending
-                    }
-                    onClick={() => confirmRemoval(removable.map(node => node.node_id))}
-                  >
-                    <Icon of="trash" size={13} className="node-remove-button-icon" />
-                    {removeNodes.isPending ? '移除中…' : '移除全部'}
-                  </button>
-                </>
-              )}
-            </header>
-            {removeNodes.error && <ErrorBox error={removeNodes.error} />}
-            {renderCards(retired, 'remove')}
-          </section>
-        )}
       </div>
     );
   }
 
   return (
-    <div className={section}>
+    <div className="panel">
       {renderHeader()}
-      {retireAll.error && <ErrorBox error={retireAll.error} />}
-      {removeNodes.error && <ErrorBox error={removeNodes.error} />}
-      {removalNotice && <div className="callout">{removalNotice}</div>}
-      {list.length === 0 ? emptyMachines : renderCards(list, 'retire')}
+      {body}
     </div>
   );
 }
@@ -2091,6 +2051,8 @@ export function ThroughputPanel({
 }) {
   const displayIdentity = `${nodeId}:${loadRangeKey(range)}`;
   const [displayedRange, setDisplayedRange] = useState({ identity: displayIdentity, end: 0 });
+  const nicFocus = useObserveFocus(['接收', '发送']);
+  const xrayFocus = useObserveFocus(['接入', '中继', '转发']);
   const load = useMetricQuery({
     ...nodeLoadRangeQuery(nodeId, range),
     refetchInterval: fixedLoadRange(range) ? false : range.seconds <= 60 * 60 ? 10_000 : 30_000,
@@ -2215,16 +2177,27 @@ export function ThroughputPanel({
           <footer
             className="load-network-legend"
             aria-label="网卡流量图例"
+            data-focused={nicFocus.focusedLine ? '' : undefined}
             title={`最后采样 ${iso(latest.window_end_unix_secs)}`}
           >
-            <span className="rx">
+            <ObserveLegendItem
+              className="rx"
+              aria-label="接收曲线"
+              pressed={nicFocus.focusedLine === '接收'}
+              onToggle={() => nicFocus.onFocusLine('接收')}
+            >
               <i />
               接收 <b>{latestNic ? nicUnit.read(latestNic.nic_rx_bps) : '—'}</b>
-            </span>
-            <span className="tx">
+            </ObserveLegendItem>
+            <ObserveLegendItem
+              className="tx"
+              aria-label="发送曲线"
+              pressed={nicFocus.focusedLine === '发送'}
+              onToggle={() => nicFocus.onFocusLine('发送')}
+            >
               <i />
               发送 <b>{latestNic ? nicUnit.read(latestNic.nic_tx_bps) : '—'}</b>
-            </span>
+            </ObserveLegendItem>
           </footer>
         </div>
         <Suspense fallback={<ObservationReading ChartLoading={observationModules?.ObservationChartLoading} />}>
@@ -2237,6 +2210,7 @@ export function ThroughputPanel({
             tx={nicTx}
             rxName="接收"
             txName="发送"
+            focusedLine={nicFocus.focusedLine}
             group={group}
           />
         </Suspense>
@@ -2260,22 +2234,36 @@ export function ThroughputPanel({
             <footer
               className="load-network-legend"
               aria-label="XRAY 流量图例"
+              data-focused={xrayFocus.focusedLine ? '' : undefined}
               title={
                 xrayTimes.length > 0
                   ? `接入与中继最后采样 ${iso(xrayTimes[xrayTimes.length - 1])}`
                   : '尚无接入与中继样本'
               }
             >
-              <span className="rx">
+              <ObserveLegendItem
+                className="rx"
+                aria-label="接入曲线"
+                pressed={xrayFocus.focusedLine === '接入'}
+                onToggle={() => xrayFocus.onFocusLine('接入')}
+              >
                 <i />
                 接入 <b>{user[user.length - 1] == null ? '—' : xrayUnit.read(user[user.length - 1]!)}</b>
-              </span>
-              <span className="tx">
+              </ObserveLegendItem>
+              <ObserveLegendItem
+                className="tx"
+                aria-label="中继曲线"
+                pressed={xrayFocus.focusedLine === '中继'}
+                onToggle={() => xrayFocus.onFocusLine('中继')}
+              >
                 <i />
                 中继 <b>{relay[relay.length - 1] == null ? '—' : xrayUnit.read(relay[relay.length - 1]!)}</b>
-              </span>
-              <span
+              </ObserveLegendItem>
+              <ObserveLegendItem
                 className="forwarding"
+                aria-label="转发曲线"
+                pressed={xrayFocus.focusedLine === '转发'}
+                onToggle={() => xrayFocus.onFocusLine('转发')}
                 title={
                   forwardingTimes.length > 0
                     ? `最后样本 ${iso(forwardingTimes[forwardingTimes.length - 1])}`
@@ -2287,7 +2275,7 @@ export function ThroughputPanel({
                 <b>
                   {forwarding[forwarding.length - 1] == null ? '—' : xrayUnit.read(forwarding[forwarding.length - 1]!)}
                 </b>
-              </span>
+              </ObserveLegendItem>
             </footer>
           </div>
           <Suspense fallback={<ObservationReading ChartLoading={observationModules?.ObservationChartLoading} />}>
@@ -2303,6 +2291,7 @@ export function ThroughputPanel({
               thirdName="转发"
               thirdTimesUnixSecs={forwardingTimes}
               thirdWindowStartsUnixSecs={forwardingStarts}
+              focusedLine={xrayFocus.focusedLine}
               group={group}
             />
           </Suspense>
@@ -4651,13 +4640,12 @@ function PingLegendItem({
     `\n未探测：${skipped}${reason ? `（${pingSkipReasonText(reason, family)}）` : ''}\n最新样本：${sampledAt}`;
   const accessibleDetail = reason ? `未探测：${pingSkipReasonText(reason, family)}` : `丢包率 ${lossText}`;
   return (
-    <button
-      type="button"
+    <ObserveLegendItem
       className="ping-probe-legend-item"
       title={title}
       aria-label={`${target.name}曲线，${accessibleDetail}`}
-      aria-pressed={pressed}
-      onClick={onToggle}
+      pressed={pressed}
+      onToggle={onToggle}
     >
       <i style={{ background: `var(${PING_SERIES_CSS[color % PING_SERIES_CSS.length]})` }} />
       <span className="ping-probe-name">{target.name}</span>
@@ -4669,7 +4657,7 @@ function PingLegendItem({
       >
         {reason ? pingSkipReasonShort(reason, family) : lossText}
       </b>
-    </button>
+    </ObserveLegendItem>
   );
 }
 
@@ -4843,8 +4831,7 @@ function PingProbeBlock({
     [targets, family],
   );
   const bodyRef = useRef<HTMLDivElement>(null);
-  const [focusedLine, setFocusedLine] = useState<string | null>(null);
-  const activeLine = focusedLine && lines.some(line => line.name === focusedLine) ? focusedLine : null;
+  const { focusedLine: activeLine, onFocusLine } = useObserveFocus(lines.map(line => line.name));
   useFamilySwitchFade(bodyRef, family);
   const label = `${protocol.toUpperCase()} PING`;
   const hasSamples = lines.some(line => line.samples.length > 0);
@@ -4860,12 +4847,7 @@ function PingProbeBlock({
             时延轴永远是毫秒（见 observeMsUnit），所以这里不必反算值轴。 */}
         {hasSamples && <span className="chart-unit">({OBSERVE_MS_UNIT})</span>}
         {targets.length > 0 && (
-          <PingProbeLegend
-            targets={targets}
-            family={family}
-            focusedLine={activeLine}
-            onFocusLine={name => setFocusedLine(current => (current === name ? null : name))}
-          />
+          <PingProbeLegend targets={targets} family={family} focusedLine={activeLine} onFocusLine={onFocusLine} />
         )}
         {corner}
       </div>
@@ -5491,7 +5473,7 @@ function NodeChainsSection({
     <Suspense fallback={<NodeRuleCardState kind="chains" />}>
       <header>
         <PanelTitle of="chains">链路规则</PanelTitle>
-        <span className="rule-sheet-meta">{inChains.length} 条</span>
+        <span className="rule-sheet-meta header-stat">{inChains.length} 条</span>
         <span className="sp" />
         <button className="btn" disabled={!canCreate} title="以当前机器作为入口" onClick={() => go({ p: 'chain', id })}>
           添加新链
@@ -5546,7 +5528,7 @@ function NodeChainsSection({
 const IDENT_FIELD = { width: 220 };
 
 /** 机器详情保留运行观测、机器配置与规则关系；用户流量在用量页查看。 */
-type NodeTab = 'observed' | 'config' | 'chains';
+type NodeTab = 'observed' | 'config' | 'chains' | 'unlock';
 
 function NodeDetailLayout({
   sheeted,
@@ -5668,9 +5650,10 @@ function NodeDetail({
   /* 反向隧道卡显示的是对端机器，名称与本页其他位置同源。 */
   const nodeNameOf = (other: string) => nodes.data?.nodes.find(x => x.node_id === other)?.name || other;
   /* 签发的 node token 同样只显示一次 */
-  const [issued, setIssued] = useState<{ token: string; install_command: string } | null>(null);
+  const { receipt: issued, receive: receiveToken, dismiss: dismissToken } = useNodeTokenReceipt(id);
   const [confirmIsolationFor, setConfirmIsolationFor] = useState<string | null>(null);
-  const [confirmForceRetirement, setConfirmForceRetirement] = useState(false);
+  const [unlockActionTarget, setUnlockActionTarget] = useState<HTMLSpanElement | null>(null);
+  const [confirmForceRetirement, setConfirmForceRetirement] = useState<ConfigHandoffForceCandidate | null>(null);
 
   // 身份表单始终可编辑，不再设置「改名称 / 公网 IP」开关。
   // 取消编辑模式不会导致误改：不保存则不生效，且「保存到草稿」只在有修改时出现。
@@ -5723,7 +5706,7 @@ function NodeDetail({
   const issue = useMutation({
     mutationFn: () => issueNodeToken(id),
     onSuccess: r => {
-      setIssued({ token: r.token, install_command: r.install_command });
+      receiveToken(r);
       refresh();
     },
   });
@@ -5766,7 +5749,7 @@ function NodeDetail({
   const forceRetirement = useMutation({
     mutationFn: (deploymentId: number) => forceConfigXrayRetirement(deploymentId, id),
     onSuccess: () => {
-      setConfirmForceRetirement(false);
+      setConfirmForceRetirement(null);
       refresh();
       qc.invalidateQueries({ queryKey: ['deployments'] });
     },
@@ -5822,7 +5805,7 @@ function NodeDetail({
     setTabState({ id, tab: next });
     return true;
   };
-  const tabs: NodeTab[] = ['observed', 'config', 'chains'];
+  const tabs: NodeTab[] = ['observed', 'unlock', 'config', 'chains'];
   const tabId = (value: NodeTab) => `${tabIdBase}-${value}-tab`;
   const panelId = (value: NodeTab) => `${tabIdBase}-${value}-panel`;
   const moveTab = (event: ReactKeyboardEvent<HTMLButtonElement>, currentTab: NodeTab) => {
@@ -6082,6 +6065,19 @@ function NodeDetail({
           </button>
           <button
             type="button"
+            id={tabId('unlock')}
+            role="tab"
+            aria-selected={tab === 'unlock'}
+            aria-controls={panelId('unlock')}
+            tabIndex={tab === 'unlock' ? 0 : -1}
+            onKeyDown={event => moveTab(event, 'unlock')}
+            onClick={() => setTab('unlock')}
+          >
+            <Icon of="unlock" size={14} />
+            解锁
+          </button>
+          <button
+            type="button"
             id={tabId('config')}
             role="tab"
             aria-selected={tab === 'config'}
@@ -6126,6 +6122,9 @@ function NodeDetail({
           )}
           {!pub && (
             <div className="nd-acts">
+              {tab === 'unlock' && can(who.role, 'edit') && (
+                <span ref={setUnlockActionTarget} className="node-unlock-actions" />
+              )}
               <div className="fg-menuwrap">
                 {/* stopPropagation 是必须的：document 级关闭监听在 effect 里绑定，
                 而打开菜单的这次点击绑定发生后仍会冒泡到 document——不拦下，
@@ -6183,7 +6182,7 @@ function NodeDetail({
                           role="menuitem"
                           className="dg"
                           disabled={!system || forceRetirement.isPending}
-                          onClick={() => setConfirmForceRetirement(true)}
+                          onClick={() => setConfirmForceRetirement(forceCandidate)}
                         >
                           <Icon of="warn" size={14} className="action-menu-icon" />
                           <span>
@@ -6328,7 +6327,7 @@ function NodeDetail({
       )}
       {issued && (
         <div className="callout warn">
-          <b>{id}</b> 的 node token —— 只显示这一次：
+          <b>{issued.node_id}</b> 的 node token —— 只显示这一次：
           <div className="mono" style={{ overflowWrap: 'anywhere', color: 'var(--gold)', margin: '8px 0' }}>
             {issued.token}
           </div>
@@ -6347,7 +6346,7 @@ function NodeDetail({
             <CopyButton className="btn" text={issued.token} label="复制 token" />
             <CopyButton className="btn primary" text={issued.install_command} label="复制命令" />
             <span className="sp" />
-            <button className="btn" onClick={() => setIssued(null)}>
+            <button className="btn" onClick={dismissToken}>
               我抄好了
             </button>
           </div>
@@ -6377,6 +6376,18 @@ function NodeDetail({
       {!pub && deployments.error && <ErrorBox error={deployments.error} />}
       {tab === 'observed' && snapshot.error && <ErrorBox error={snapshot.error} />}
       {tab === 'observed' && observationModules.status === 'error' && <ErrorBox error={observationModules.error} />}
+
+      {tab === 'unlock' && (
+        <section
+          id={panelId('unlock')}
+          className="nd-tab-panel"
+          role="tabpanel"
+          aria-labelledby={tabId('unlock')}
+          tabIndex={0}
+        >
+          <NodeUnlockPanel key={id} node={n} editable={can(who.role, 'edit')} actionTarget={unlockActionTarget} />
+        </section>
+      )}
 
       {tab === 'observed' && (
         /* LOAD 是监控页的第一视图；Ping 紧随流量曲线，三张机器状态卡顺延到下一块。 */
@@ -6647,22 +6658,24 @@ function NodeDetail({
           onCancel={() => setConfirmIsolationFor(null)}
         />
       )}
-      {confirmForceRetirement && forceCandidate && (
-        <Confirm
-          title={`强制完成 ${n.name || id} 的 Xray 交接？`}
-          body={
-            <p>
-              当前配置发布 #{forceCandidate.deploymentId} 的新 Xray 已接管新连接；上一代仍承载{' '}
-              {forceCandidate.activeConnections} 条存量 TCP
-              连接。继续会只终止上一代并中断这些连接，新连接继续由当前实例接入。
-            </p>
-          }
-          confirmLabel="强制完成交接"
-          confirmDisabled={forceRetirement.isPending}
-          onConfirm={() => forceRetirement.mutate(forceCandidate.deploymentId)}
-          onCancel={() => setConfirmForceRetirement(false)}
-        />
-      )}
+      {confirmForceRetirement &&
+        forceCandidate?.deploymentId === confirmForceRetirement.deploymentId &&
+        forceCandidate.claimGeneration === confirmForceRetirement.claimGeneration && (
+          <Confirm
+            title={`强制完成 ${n.name || id} 的 Xray 交接？`}
+            body={
+              <p>
+                当前配置发布 #{forceCandidate.deploymentId} 的新 Xray 已接管新连接；上一代仍承载{' '}
+                {forceCandidate.activeConnections} 条存量 TCP
+                连接。继续会只终止上一代并中断这些连接，新连接继续由当前实例接入。
+              </p>
+            }
+            confirmLabel="强制完成交接"
+            confirmDisabled={forceRetirement.isPending}
+            onConfirm={() => forceRetirement.mutate(confirmForceRetirement.deploymentId)}
+            onCancel={() => setConfirmForceRetirement(null)}
+          />
+        )}
     </NodeDetailLayout>
   );
 }
@@ -6684,8 +6697,8 @@ function Provision({ drill, go }: { drill: WizDrill; go: (d: Drill) => void }) {
   // 存在 node 表示机器已入库，本屏切换为安装与上线页；
   // result 是创建时的响应，从地址栏返回时不存在。
   const node = drill.p === 'install' ? drill.node : null;
-  const result = drill.p === 'install' ? drill.result : undefined;
-  if (node) return <ProvisionInstall node={node} result={result} go={go} />;
+  const result = drill.p === 'install' && drill.result?.node.id === node ? drill.result : undefined;
+  if (node) return <ProvisionInstall key={node} node={node} result={result} go={go} />;
   return <ProvisionForm go={go} />;
 }
 
@@ -7093,15 +7106,13 @@ export function ProvisionInstall({
   const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), refetchInterval: 3_000 });
   const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions() });
   const current = revisions.data?.current_revision;
-  const [reissued, setReissued] = useState<{ token: string; install_command: string; token_prefix: string } | null>(
-    null,
-  );
+  const { receipt: reissued, receive: receiveToken } = useNodeTokenReceipt(node);
   const [confirmIssue, setConfirmIssue] = useState(false);
   const [enableOpenvpn, setEnableOpenvpn] = useState(false);
   const issue = useMutation({
     mutationFn: () => issueNodeToken(node),
     onSuccess: r => {
-      setReissued({ token: r.token, install_command: r.install_command, token_prefix: r.token_prefix });
+      receiveToken(r);
       setConfirmIssue(false);
       qc.invalidateQueries({ queryKey: ['nodes'] });
     },
@@ -7464,8 +7475,13 @@ export function ProvisionInstall({
         <button type="button" className="btn" onClick={() => returnTo('nodes')}>
           回机器列表
         </button>
-        <button type="button" className="btn" onClick={() => go({ p: 'node', id: node })}>
-          看{nodeLabel}
+        <button
+          type="button"
+          className="btn"
+          aria-label={`查看 ${nodeLabel} 的机器详情`}
+          onClick={() => go({ p: 'node', id: node })}
+        >
+          查看机器
         </button>
         <button
           type="button"

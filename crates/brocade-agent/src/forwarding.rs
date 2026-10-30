@@ -33,6 +33,7 @@ const FORWARDING_DESIRED_FILE: &str = "forwarding-desired.json";
 const FORWARDING_TAG_PREFIX: &str = "fwd:";
 
 pub(crate) fn run_forever(options: Options, meter: Arc<Mutex<()>>) {
+    let mut wake = crate::wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Desired);
     let mut tick = Instant::now();
     loop {
         let interval = match run_round(&options, &meter) {
@@ -45,7 +46,9 @@ pub(crate) fn run_forever(options: Options, meter: Arc<Mutex<()>>) {
         };
         let now = Instant::now();
         tick = next_periodic_tick(tick, interval, now);
-        thread::sleep(tick.saturating_duration_since(now));
+        if wake.wait(tick.saturating_duration_since(now)) {
+            tick = Instant::now();
+        }
     }
 }
 

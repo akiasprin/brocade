@@ -1,5 +1,6 @@
+import { lazy } from './ui/lazy';
 import { useMetricQuery } from './ui/metric-cadence';
-import { lazy, memo, Suspense, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, Suspense, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   fetchNodeTrafficHistory,
   fetchUserTrafficHistory,

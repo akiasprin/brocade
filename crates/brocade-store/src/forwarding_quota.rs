@@ -13,9 +13,8 @@ const WORKER_LOCK: i64 = 0x6272_6f63_6671_756f;
 pub(crate) const CYCLE_USED: &str =
     "((SELECT COALESCE(sum(s.uplink_bytes+s.downlink_bytes),0)::bigint
  FROM users owner CROSS JOIN LATERAL user_traffic_cycle(owner.traffic_reset_day,now()) cycle
- JOIN forwarding_usage_rollups s ON s.tenant_id=owner.tenant_id AND s.user_id=owner.id
- WHERE owner.tenant_id=e.tenant_id AND owner.id=e.user_id AND s.node_id=e.node_id
- AND s.period_start >= cycle.starts_at AND s.period_start < cycle.ends_at)
+ CROSS JOIN LATERAL user_cycle_forwarding_usage(owner.tenant_id,owner.id,cycle.starts_at,cycle.ends_at) s
+ WHERE owner.tenant_id=e.tenant_id AND owner.id=e.user_id AND s.node_id=e.node_id)
  * COALESCE((SELECT CASE u.traffic_accounting_mode WHEN 'double' THEN 2 ELSE 1 END
              FROM users u WHERE u.tenant_id=e.tenant_id AND u.id=e.user_id),1))";
 
@@ -97,6 +96,9 @@ pub async fn enforce(pool: &PgPool) -> Result<ForwardingQuotaOutcome> {
     if !locked {
         return Ok(ForwardingQuotaOutcome::default());
     }
+    // Serialize with cycle resets and service-policy edits before reading usage or taking
+    // quota/node locks. A reset that commits first invalidates the old stop decision.
+    crate::console::lock_control_state(&mut tx).await?;
     // A bounded batch also bounds locks and the number of outbox entries per timer round.
     // Bytewise node order matches rule moves, which can hold multiple generation locks.
     let rows = sqlx::query(&format!("SELECT q.tenant_id,q.user_id,q.node_id,q.limit_bytes,q.suspended,

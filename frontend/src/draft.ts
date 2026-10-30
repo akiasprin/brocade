@@ -42,6 +42,7 @@ export type ModelOp =
   | { op: 'upsert_app'; app: { id: string; label: string } }
   | { op: 'reorder_apps'; ids: string[] }
   | { op: 'reorder_chains'; app_id: string; ids: string[] }
+  | { op: 'move_chain'; app_id: string; chain_id: string; target_app_id: string }
   | { op: 'upsert_external_outbound'; outbound: ExternalOutboundWrite }
   | { op: 'delete_external_outbound'; tenant_id: string; id: string }
   | {
@@ -223,6 +224,14 @@ function entryOf(op: ModelOp): DraftEntry {
       return {
         key: `chain-order:${op.app_id}`,
         label: `调整链顺序 ${op.app_id}`,
+        op,
+      };
+    case 'move_chain':
+      // Moves are ordered transitions. Coalescing A→B and a later A→C would invalidate the
+      // intervening B→A and any edits made while the chain belonged to B.
+      return {
+        key: `chain-move:${op.chain_id}:${randomKey()}`,
+        label: `移动链 ${op.chain_id} → ${op.target_app_id}`,
         op,
       };
     case 'delete_external_outbound':
@@ -514,7 +523,8 @@ export class DraftStore {
   push(op: ModelOp) {
     const baseEntries = this.entries;
     const baseBranches = this.branches;
-    const key = entryOf(op).key;
+    const proposed = entryOf(op);
+    const key = proposed.key;
     this.prepare();
     // The caller constructed this operation from the last displayed draft. If the same target
     // changed before its storage event arrived, rebasing here would silently overwrite that edit
@@ -525,7 +535,7 @@ export class DraftStore {
       this.entries = baseEntries;
       this.branches = baseBranches;
     }
-    let entry = entryOf(op);
+    let entry = proposed;
     const at = this.entries.findIndex(e => e.key === entry.key);
     // Editing an object created earlier in the same draft must retain create-only collision
     // semantics. Replacing it with an upsert would let a coincidentally occupied random ID update

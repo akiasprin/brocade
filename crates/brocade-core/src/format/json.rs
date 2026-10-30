@@ -224,6 +224,7 @@ fn xray_config(config: &XrayConfig) -> Value {
             }),
         );
     }
+    value["brocadeUnlockIpFamilies"] = json!(2);
     // Agent-only metadata: a group change changes the artifact and is not hot-swappable.
     if let Some(group) = &config.certificate_group_id {
         value["brocadeCertificateGroup"] = json!(group);
@@ -285,6 +286,9 @@ fn dns_config(config: &XrayConfig) -> Value {
         object.insert("tag".to_owned(), json!(tag));
     }
     object.insert("serveStale".to_owned(), json!(config.dns.serve_stale));
+    if config.dns.enable_parallel_query {
+        object.insert("enableParallelQuery".to_owned(), json!(true));
+    }
     object.insert(
         "serveExpiredTTL".to_owned(),
         json!(config.dns.serve_expired_ttl_secs),
@@ -1275,6 +1279,7 @@ fn outbound(outbound: &XrayOutbound) -> Value {
             object.insert("settings".to_owned(), settings);
             Value::Object(object)
         }
+        XrayOutbound::Dns { tag } => json!({ "tag": tag, "protocol": "dns", "settings": {} }),
         XrayOutbound::Blackhole { tag, http_response } => {
             let mut value = json!({
                 "tag": tag,

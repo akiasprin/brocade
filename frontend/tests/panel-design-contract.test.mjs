@@ -121,7 +121,11 @@ test('所有面板标题固定使用 PanelTitle，列表页只使用 ListIcon �
 
   for (const { file, classes, tail } of panelDeclarations()) {
     const content = tail.replace(/^(?:\s*\{\/\*[\s\S]*?\*\/\})*\s*/, '');
-    const header = content.match(/^<(header|summary)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/);
+    let header = content.match(/^<(header|summary)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/);
+    if (!header && file === 'source-access.tsx' && /^<Head\b/.test(content)) {
+      header = panes.get(file).match(/function Head\b[\s\S]*?<(header)>([\s\S]*?)<\/\1>/);
+      assert.ok(header, `${file}: 委托标题必须解析到实际 header`);
+    }
     if (!header) {
       if (classes.includes('config-panel') || classes.includes('titled')) {
         assert.match(content, delegatedHeaders, `${file}: 带色带的面板必须有公共标题或显式委托标题`);
@@ -180,8 +184,8 @@ test('门面标题使用 42px 公共令牌，内部面板保持 36px 且不继�
     if (classes.some(name => name.endsWith('-list-panel'))) {
       assert.match(tag, /data-page-title="true"/, `${file}: 主列表必须声明门面标题层级`);
     }
-    if (classes.includes('config-panel') || classes.includes('node-retired-panel')) {
-      assert.doesNotMatch(tag, /data-page-title/, `${file}: 内部配置和次级列表不得升级为门面标题`);
+    if (classes.includes('config-panel')) {
+      assert.doesNotMatch(tag, /data-page-title/, `${file}: 内部配置面板不得升级为门面标题`);
     }
   }
 });

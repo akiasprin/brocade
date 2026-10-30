@@ -1,4 +1,5 @@
 import { useId, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { fetchUserMachineUsage, type SiteUsagePeriod, type UserMachineUsage, type UserMachineUsageRow } from './api';
 import { NodeTrafficDialog } from './node-traffic';
 import { SegmentedControl } from './ui/bits';
@@ -138,8 +139,7 @@ export function UserMachineUsageCard({
     identity: string;
     row: number;
     index: number;
-    left: number;
-    top: number;
+    anchor: HTMLElement;
     pinned: boolean;
   } | null>(null);
   if (usage && (usage.tenantId !== tenantId || usage.userId !== userId)) setUsage(null);
@@ -218,14 +218,11 @@ export function UserMachineUsageCard({
       <i className="uxm-now" style={{ left: position(nowAt) }} aria-hidden="true" />
     ) : null;
   const reveal = (element: HTMLElement, row: number, index: number, pinned = false) => {
-    const bounds = element.getBoundingClientRect();
-    const container = panel.current!.getBoundingClientRect();
     setSelection({
       identity,
       row,
       index,
-      left: Math.max(8, Math.min(bounds.left - container.left, container.width - 240)),
-      top: bounds.bottom - container.top + 6,
+      anchor: element,
       pinned,
     });
   };
@@ -500,7 +497,7 @@ export function UserMachineUsageCard({
         />
       )}
       {selected && selectedCell && (
-        <div id={tooltipId} role="tooltip" className="uxm-tip" style={{ left: selected.left, top: selected.top }}>
+        <MachineUsageTooltip id={tooltipId} anchor={selected.anchor}>
           <div className="uxm-tip-head">{label(selectedCell)} · UTC+8</div>
           <div className="uxm-tip-name">{selectedName}</div>
           {selectedCell.future ? (
@@ -533,8 +530,41 @@ export function UserMachineUsageCard({
               关闭读数
             </button>
           )}
-        </div>
+        </MachineUsageTooltip>
       )}
     </section>
+  );
+}
+
+function MachineUsageTooltip({ id, anchor, children }: { id: string; anchor: HTMLElement; children: ReactNode }) {
+  const tip = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const element = tip.current;
+    if (!element) return;
+    const place = () => {
+      const bounds = anchor.getBoundingClientRect();
+      const width = element.offsetWidth;
+      const height = element.offsetHeight;
+      const below = bounds.bottom + 6;
+      const top = below + height <= innerHeight - 8 ? below : bounds.top - height - 6;
+      element.style.left = `${Math.max(8, Math.min(bounds.left, innerWidth - width - 8))}px`;
+      element.style.top = `${Math.max(8, Math.min(top, innerHeight - height - 8))}px`;
+    };
+    place();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(place);
+    observer?.observe(element);
+    window.addEventListener('resize', place);
+    window.addEventListener('scroll', place, true);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', place);
+      window.removeEventListener('scroll', place, true);
+    };
+  }, [anchor]);
+  return createPortal(
+    <div ref={tip} id={id} role="tooltip" className="uxm-tip uxm-live-tip">
+      {children}
+    </div>,
+    document.body,
   );
 }

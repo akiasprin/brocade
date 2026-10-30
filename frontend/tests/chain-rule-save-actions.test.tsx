@@ -116,6 +116,21 @@ afterEach(() => {
 });
 
 describe('链路规则统一保存', () => {
+  it('reports incomplete DNS only on save and leaves the draft untouched', async () => {
+    const view = renderScopedEditor([egress({ t: 'geosite', v: ['netflix'] })], []);
+    fireEvent.change(view.getByRole('combobox', { name: /DNS 解析方式/ }), { target: { value: 'custom' } });
+    expect(view.queryByRole('alert')).toBeNull();
+    const save = view.getByRole('button', { name: '保存到草稿' });
+    await waitFor(() => expect((save as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(save);
+    await waitFor(() => expect(view.getByRole('alert').textContent).toBe('请填写完整的 DNS 地址，用逗号分隔'));
+    const address = view.getByRole('textbox', { name: /DNS 地址/ });
+    expect(view.getByRole('alert').closest('tr')).toBe(address.closest('tr'));
+    expect(draft.ops()).toHaveLength(0);
+    fireEvent.change(address, { target: { value: '192.0.2.53' } });
+    await waitFor(() => expect(view.queryByRole('alert')).toBeNull());
+  });
+
   it.each([true, false])('保存后预览字段顺序变化仍禁用按钮，并能继续编辑和丢弃草稿（统一保存：%s）', async scoped => {
     const baseline = [egress({ t: 'domain_suffix', v: ['before.example'] })];
     const source = step('source', baseline);

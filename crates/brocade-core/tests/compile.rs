@@ -210,7 +210,7 @@ fn compile_output_warns_when_as_is_bypasses_machine_dns_policies() {
         position: 0,
         selector: DestMatch::DomainSuffix(vec!["example.com".to_owned()]),
         resolution: EgressDnsResolution {
-            address: "192.0.2.53".to_owned(),
+            address: "192.0.2.53".to_owned().into(),
             port: 53,
             transport: EgressDnsTransport::Tcp,
             address_strategy: EgressDnsAddressStrategy::UseIp,
@@ -629,7 +629,22 @@ fn an_open_entrance_adds_no_rules() {
         .project_node("hk")
         .expect("hk 编译得出来");
     let xray = plan.xray.expect("hk 上有 xray");
-    assert_eq!(xray.routing_rules.len(), 1, "只该有链路自己那一条");
+    use brocade_core::physical::node::XrayRuleSelector;
+    let ordinary = xray.routing_rules.iter().filter(|rule| !matches!(&rule.selector, XrayRuleSelector::Users(users) if users.iter().any(|user| user.starts_with("probe#")))).collect::<Vec<_>>();
+    assert_eq!(
+        ordinary.len(),
+        1,
+        "an open entrance has no guard rules for ordinary users"
+    );
+    assert_eq!(
+        xray.routing_rules.len(),
+        7,
+        "one ordinary table and three diagnostic tables with strict fallbacks"
+    );
+    assert!(xray
+        .routing_rules
+        .iter()
+        .all(|rule| rule.dest_match == DestMatch::Any));
 }
 
 /// Client-side Front membership must not disable machine-side sniffing or its ingress guards.

@@ -23,7 +23,7 @@ const U64_MAX = 18_446_744_073_709_551_615n;
 const MIN_RATE_BPS = 1_000n;
 const MAX_RATE_BPS = 1_000_000_000_000n;
 /** 回执超过这个时长只算上次报告，不当作当前结果。 */
-const RECEIPT_FRESH_SECS = 90;
+export const TRAFFIC_LIMIT_RECEIPT_FRESH_SECS = 300;
 
 /* ══ 草稿 ══ */
 
@@ -241,7 +241,7 @@ function stepTitle(step: LimitStep): string {
 type LimitTone = 'gold' | 'err' | 'mute';
 const PHASE: Record<TrafficLimitPhase, string> = {
   disabled: '未启用',
-  waiting: '等待计量基线',
+  waiting: '等待应用确认',
   ready: '未达到阈值',
   limited: '已限速',
   error: '应用失败',
@@ -270,7 +270,7 @@ export interface TrafficLimitStatus {
   reportedAt: number | null;
 }
 
-/** 与修订对得上、且不超过 90 秒的回执才算确认；其余一律按等待处理，不把旧回执当作当前结果。 */
+/** 当前修订的回执在 300 秒内有效；过期或旧修订按等待处理。 */
 export function trafficLimitStatus(limit: NodeTrafficLimitView | undefined, nowSecs: number): TrafficLimitStatus {
   if (!limit)
     return {
@@ -289,7 +289,7 @@ export function trafficLimitStatus(limit: NodeTrafficLimitView | undefined, nowS
     !!observation &&
     observation.revision === limit.revision &&
     reportedAt !== null &&
-    nowSecs - reportedAt < RECEIPT_FRESH_SECS;
+    nowSecs - reportedAt < TRAFFIC_LIMIT_RECEIPT_FRESH_SECS;
   const layers: LimitLayerState[] = [];
   for (const layer of ['system', 'application'] as const) {
     const result = observation?.[layer];
@@ -307,7 +307,7 @@ export function trafficLimitStatus(limit: NodeTrafficLimitView | undefined, nowS
     confirmed,
     layers,
     reportedAt,
-    rate: confirmed ? (observation?.rate_bps ?? null) : null,
+    rate: confirmed && observation?.phase === 'limited' ? (observation.rate_bps ?? null) : null,
     error: confirmed && !layers.some(layer => layer.error) ? (observation?.error ?? null) : null,
   };
   if (!limit.supported && policy.enabled)
@@ -332,7 +332,7 @@ export function trafficLimitStatus(limit: NodeTrafficLimitView | undefined, nowS
     case 'error':
       return { ...base, text: '应用失败', tone: 'err', chip: { text: '限速应用失败', tone: 'err' } };
     case 'waiting':
-      return { ...base, text: '等待计量基线', tone: 'mute', chip: { text: '限速等待基线', tone: 'mute' } };
+      return { ...base, text: '等待应用确认', tone: 'mute', chip: { text: '限速待确认', tone: 'mute' } };
     default:
       return { ...base, text: PHASE[observation!.phase], tone: null, chip: null };
   }

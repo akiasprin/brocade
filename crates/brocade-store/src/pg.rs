@@ -1946,6 +1946,16 @@ impl PgStore {
         crate::user_service::cycle_usage(&self.pool, actor).await
     }
 
+    pub async fn reset_user_cycle_usage(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+        request: crate::UserCycleResetRequest,
+    ) -> Result<crate::UserCycleResetResult> {
+        crate::user_cycle_reset::reset(&self.pool, actor, tenant_id, user_id, request).await
+    }
+
     pub async fn upsert_grant(
         &self,
         actor: &AdminContext,

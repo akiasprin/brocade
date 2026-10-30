@@ -29,9 +29,6 @@ import { HEAT_STEPS, heatOf, type HeatKind } from '../ui/traffic-heat';
 const MIN_FRESH_MILLIS = 10_000;
 /** 不超过这么多台机器时列宽放得下读数，格子写出数值，列名横排。 */
 const WIDE_MACHINES = 6;
-/** 超过这么多台机器时，较窄的卡片里读数栏移到矩阵上方；超过 PACKED_MACHINES 台在任何宽度下都如此。 */
-const DENSE_MACHINES = 12;
-const PACKED_MACHINES = 28;
 /** 超过这么多位用户时只展开近期有流量的行，其余收起成一行说明。 */
 const CROWD_USERS = 24;
 /** 最后一次有流量之后仍算活跃的时长：突发流量之间的空档不让行在列表里进出。 */
@@ -42,7 +39,7 @@ const FLOW_PREVIEW = 3;
 const IDLE_NAMES = 12;
 const CONNECTING_NAMES = 4;
 
-type CellState = 'rate' | 'idle' | 'unknown' | 'not-entitled';
+type CellState = 'rate' | 'idle' | 'pending' | 'unknown' | 'not-entitled';
 
 export interface FleetTrafficCell {
   state: CellState;
@@ -92,6 +89,7 @@ export interface FleetTrafficMatrixUser {
 export interface FleetTrafficMatrix {
   nodes: FleetTrafficMatrixNode[];
   users: FleetTrafficMatrixUser[];
+  entitlementsKnown: boolean;
   nodeTotals: Map<string, { down: number; up: number }>;
   nicRx: number;
   nicTx: number;
@@ -166,26 +164,25 @@ function orderByRegion(nodes: FleetTrafficMatrixNode[]): FleetTrafficMatrixNode[
 
 /** Pure cross-product builder. Missing rows become zero only after that individual machine has
  * supplied a fresh, complete `all_users` report; another machine's newer frame cannot certify it.
- * Users with no grant on any visible machine and no current rate have nothing to show and are
- * left out. */
+ * Once grants are known, users with no grant on any visible machine and no current rate are
+ * left out. Until then, roster users remain visible with pending cells. */
 export function buildFleetTrafficMatrix(
   payload: FleetTrafficSnapshot,
   nodeList: NodeAgentStateItem[],
   userList: UserListItem[],
   nowMillis: number,
 ): FleetTrafficMatrix {
+  const entitlementsKnown = payload.expected !== undefined;
+  const expectedNodes = payload.expected ?? [];
   const liveNodes = new Map(payload.nodes.map(node => [node.node_id, node]));
   const expected = new Map(
-    payload.expected.map(node => [
-      node.node_id,
-      new Set(node.users.map(user => userKey(user.tenant_id, user.user_id))),
-    ]),
+    expectedNodes.map(node => [node.node_id, new Set(node.users.map(user => userKey(user.tenant_id, user.user_id)))]),
   );
   const users = new Map<string, { tenantId: string; userId: string }>();
   for (const user of userList) {
     users.set(userKey(user.tenant_id, user.id), { tenantId: user.tenant_id, userId: user.id });
   }
-  for (const node of payload.expected) {
+  for (const node of expectedNodes) {
     for (const user of node.users) {
       users.set(userKey(user.tenant_id, user.user_id), { tenantId: user.tenant_id, userId: user.user_id });
     }
@@ -206,6 +203,7 @@ export function buildFleetTrafficMatrix(
   );
   const knownNodes = new Set(activeNodeStates.keys());
   for (const node of payload.nodes) knownNodes.add(node.node_id);
+  for (const node of expectedNodes) knownNodes.add(node.node_id);
 
   const nodes = orderByRegion(
     [...knownNodes].map((id): FleetTrafficMatrixNode => {
@@ -276,11 +274,13 @@ export function buildFleetTrafficMatrix(
         // is briefly older. The Console has already applied the administrator's tenant boundary.
         const cell: FleetTrafficCell = rate
           ? { state: 'rate', down: rate.down, up: rate.up, partial: !nodeQuality?.complete }
-          : !entitled
-            ? { state: 'not-entitled', down: 0, up: 0, partial: false }
-            : nodeQuality?.complete
-              ? { state: 'idle', down: 0, up: 0, partial: false }
-              : { state: 'unknown', down: 0, up: 0, partial: false };
+          : !entitlementsKnown
+            ? { state: 'pending', down: 0, up: 0, partial: false }
+            : !entitled
+              ? { state: 'not-entitled', down: 0, up: 0, partial: false }
+              : nodeQuality?.complete
+                ? { state: 'idle', down: 0, up: 0, partial: false }
+                : { state: 'unknown', down: 0, up: 0, partial: false };
         cells.set(node.id, cell);
         if (entitled) entitledCount += 1;
         if (cell.state === 'unknown') unknownCount += 1;
@@ -311,12 +311,15 @@ export function buildFleetTrafficMatrix(
         unknown: unknownCount,
       };
     })
-    .filter(user => user.entitled > 0 || [...user.cells.values()].some(cell => cell.state === 'rate'))
+    .filter(
+      user => !entitlementsKnown || user.entitled > 0 || [...user.cells.values()].some(cell => cell.state === 'rate'),
+    )
     .sort((left, right) => nameOrder.compare(left.userId, right.userId) || left.key.localeCompare(right.key));
 
   return {
     nodes,
     users: rows,
+    entitlementsKnown,
     nodeTotals,
     nicRx,
     nicTx,
@@ -330,10 +333,11 @@ export function buildFleetTrafficMatrix(
 
 /* ── 读数 ── */
 
-type CellKind = HeatKind | 'unknown' | 'na';
+type CellKind = HeatKind | 'pending' | 'unknown' | 'na';
 
 function cellKind(cell: FleetTrafficCell): CellKind {
   if (cell.state === 'not-entitled') return 'na';
+  if (cell.state === 'pending') return 'pending';
   if (cell.state === 'unknown') return 'unknown';
   return heatOf(cell.down + cell.up);
 }
@@ -362,6 +366,7 @@ function machineIssue(node: FleetTrafficMatrixNode): string | null {
 
 function cellText(cell: FleetTrafficCell, node: FleetTrafficMatrixNode) {
   if (cell.state === 'not-entitled') return '未授权到这台机器';
+  if (cell.state === 'pending') return '正在读取授权';
   if (cell.state === 'unknown') return machineIssue(node) ?? '没有当前读数';
   if (cell.state === 'idle' || cell.down + cell.up === 0) return '已采集，当前没有流量';
   return `${pairText(cell.down, cell.up)}${cell.partial ? ` · ${PARTIAL_TEXT}` : ''}`;
@@ -406,8 +411,16 @@ function Readout({ matrix, focus }: { matrix: FleetTrafficMatrix; focus: BoardFo
     const total = user.down + user.up;
     return (
       <>
-        <b>{user.userId}</b> · {total > 0 ? pairText(user.down, user.up) : '当前空闲'} · {user.active} 台有流量 /{' '}
-        {user.entitled} 台已授权{user.unknown > 0 ? ` · ${user.unknown} 台无读数` : ''}
+        <b>{user.userId}</b> ·{' '}
+        {total > 0
+          ? pairText(user.down, user.up)
+          : !matrix.entitlementsKnown
+            ? '—'
+            : user.unknown > 0
+              ? '当前读数不完整'
+              : '当前空闲'}{' '}
+        · {user.active} 台有流量 / {matrix.entitlementsKnown ? user.entitled : '—'} 台已授权
+        {user.unknown > 0 ? ` · ${user.unknown} 台无读数` : ''}
       </>
     );
   }
@@ -419,7 +432,7 @@ function Readout({ matrix, focus }: { matrix: FleetTrafficMatrix; focus: BoardFo
       <>
         <b>{node.name}</b> ·{' '}
         {reporting(node)
-          ? `用户 ${pairText(total.down, total.up)} · ${node.active} 位活跃 / ${node.entitled} 位已授权`
+          ? `用户 ${pairText(total.down, total.up)} · ${node.active} 位活跃 / ${matrix.entitlementsKnown ? node.entitled : '—'} 位已授权`
           : issue}
         {reporting(node) && issue ? ` · ${issue}` : ''}
         {node.rx !== null && node.tx !== null
@@ -436,7 +449,14 @@ function Readout({ matrix, focus }: { matrix: FleetTrafficMatrix; focus: BoardFo
       </>
     );
   }
-  return <>{matrix.currentNodes > 0 ? '当前没有用户流量' : '没有机器提供当前读数'}</>;
+  return <>{emptyTrafficText(matrix)}</>;
+}
+
+function emptyTrafficText(matrix: FleetTrafficMatrix): string {
+  if (!matrix.entitlementsKnown) return '';
+  if (matrix.nodes.some(node => node.phase === 'pending')) return '正在等待速率数据';
+  if (matrix.nodes.length === 0 || matrix.nodes.some(node => !node.complete)) return '当前读数不完整';
+  return '当前没有用户流量';
 }
 
 /* ── 读数栏 ── */
@@ -462,15 +482,15 @@ function FleetLedger({ matrix, status }: { matrix: FleetTrafficMatrix; status: R
 
   return (
     <section className="usage-ledger flt-ledger" aria-label="机队当前速率">
-      <div className="user-usage-hero">
-        <span className="user-usage-hero-label" title={RATE_SUM_NOTE}>
+      <div className="usage-hero">
+        <span className="usage-hero-label" title={RATE_SUM_NOTE}>
           最近速率合计
         </span>
-        <strong className="user-usage-hero-value">
+        <strong className="usage-hero-value">
           {total > 0 ? hero.number : '0'} <small>{hero.unit}</small>
         </strong>
-        <span className="rut-hero-sub">
-          <b>{matrix.activeUsers}</b> 位活跃 · <b>{matrix.users.length}</b> 位已授权
+        <span className="usage-period rut-hero-sub">
+          <b>{matrix.activeUsers}</b> 位活跃 · <b>{matrix.entitlementsKnown ? matrix.users.length : '—'}</b> 位已授权
         </span>
         {status}
       </div>
@@ -643,7 +663,11 @@ function FleetBoard({
     setFocus(current => (focusKey(current) === focusKey(target) ? null : current));
 
   return (
-    <section className={`flt-board${wide ? ' wide' : ''}`} aria-label="用户与机器的当前速率">
+    <section
+      className={`flt-board${wide ? ' wide' : ''}${matrix.entitlementsKnown ? '' : ' pending'}`}
+      aria-label="用户与机器的当前速率"
+      aria-busy={matrix.entitlementsKnown ? undefined : true}
+    >
       <div className="flt-scroll">
         <table
           className="flt-grid"
@@ -758,7 +782,7 @@ function FleetBoard({
                             <i
                               className={`flt-cell ${kind}${cell.partial ? ' partial' : ''}${focused ? ' focus' : ''}`}
                             />
-                            {wide && kind !== 'na' && (
+                            {wide && kind !== 'na' && kind !== 'pending' && (
                               <span className="flt-cv" aria-hidden="true">
                                 {kind === 'unknown' ? '—' : rateText(cell.down + cell.up)}
                               </span>
@@ -769,7 +793,7 @@ function FleetBoard({
                             <i
                               className={`flt-cell ${kind}${cell.partial ? ' partial' : ''}${focused ? ' focus' : ''}`}
                             />
-                            {wide && kind !== 'na' && (
+                            {wide && kind !== 'na' && kind !== 'pending' && (
                               <span className="flt-cv" aria-hidden="true">
                                 {kind === 'unknown' ? '—' : rateText(cell.down + cell.up)}
                               </span>
@@ -781,7 +805,11 @@ function FleetBoard({
                     );
                   })}
                   <td className={`flt-sum${total > 0 ? '' : ' zero'}`}>
-                    {total > 0 ? rateText(total) : user.unknown === user.entitled && user.entitled > 0 ? '—' : '0'}
+                    {total > 0
+                      ? rateText(total)
+                      : !matrix.entitlementsKnown || (user.unknown === user.entitled && user.entitled > 0)
+                        ? '—'
+                        : '0'}
                   </td>
                 </tr>
               );
@@ -873,7 +901,7 @@ function FleetList({
   return (
     <section className="flt-list" aria-label="按用户的当前速率">
       {rows.length === 0 ? (
-        <p className="flt-list-empty">{connecting.length > 0 ? '正在等待速率数据' : '当前没有用户流量'}</p>
+        <p className="flt-list-empty">{emptyTrafficText(matrix)}</p>
       ) : (
         <ul className="flt-flows">
           {rows.map(user => {
@@ -999,18 +1027,14 @@ function FleetCockpit({
   const seen = useLastActive(matrix, now);
   const recent = (user: FleetTrafficMatrixUser) =>
     user.down + user.up > 0 || now - (seen.get(user.key) ?? Number.NEGATIVE_INFINITY) <= ACTIVE_HOLD_MILLIS;
-  const crowd = matrix.users.length > CROWD_USERS;
+  const crowd = matrix.entitlementsKnown && matrix.users.length > CROWD_USERS;
   const boardRows = crowd && !expanded ? matrix.users.filter(recent) : matrix.users;
   const listRows = matrix.users.filter(recent);
 
   return (
-    <div
-      className={`flt-cockpit${
-        matrix.nodes.length > PACKED_MACHINES ? ' dense packed' : matrix.nodes.length > DENSE_MACHINES ? ' dense' : ''
-      }`}
-    >
+    <div className="flt-cockpit">
       <FleetLedger matrix={matrix} status={status} />
-      {matrix.users.length === 0 ? (
+      {matrix.entitlementsKnown && matrix.users.length === 0 ? (
         <p className="flt-empty">尚无用户授权到这些机器</p>
       ) : (
         <>
@@ -1023,12 +1047,14 @@ function FleetCockpit({
             allowDetails={allowMachineDetails}
             onOpenNode={onOpenNode}
           />
-          <FleetList
-            matrix={matrix}
-            rows={listRows}
-            idle={matrix.users.filter(user => !recent(user) && user.unknown === 0)}
-            allowDetails={allowMachineDetails}
-          />
+          {matrix.entitlementsKnown && (
+            <FleetList
+              matrix={matrix}
+              rows={listRows}
+              idle={matrix.users.filter(user => !recent(user) && user.unknown === 0)}
+              allowDetails={allowMachineDetails}
+            />
+          )}
         </>
       )}
     </div>

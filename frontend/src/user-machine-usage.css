@@ -472,14 +472,20 @@
   outline-offset: 1px;
   z-index: 1;
 }
-.uxm-card .uxm-tip {
+.uxm-live-tip {
+  position: fixed;
+  z-index: 500;
   pointer-events: auto;
   width: 232px;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100dvh - 16px);
+  overflow: auto;
+  overflow-wrap: anywhere;
 }
-.uxm-card .uxm-tip p {
+.uxm-live-tip p {
   margin: 4px 0;
 }
-.uxm-card .uxm-tip .btn {
+.uxm-live-tip .btn {
   margin-top: 6px;
 }
 .uxm-card .uxm-idle {

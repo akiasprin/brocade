@@ -50,6 +50,47 @@ const liveNode = (
 });
 
 describe('fleet traffic matrix', () => {
+  it('keeps roster users and pending cells until grants confirm which rows belong in the matrix', () => {
+    const payload: FleetTrafficSnapshot = {
+      policy: { enabled: true },
+      nodes: [liveNode('n1', NOW, []), liveNode('n2', NOW, [])],
+    };
+    const nodes = [nodeState('n1'), nodeState('n2')];
+    const users = [user('alice'), user('bob')];
+    const pending = buildFleetTrafficMatrix(payload, nodes, users, NOW);
+    expect(pending.entitlementsKnown).toBe(false);
+    expect(pending.users.map(row => row.userId)).toEqual(['alice', 'bob']);
+    for (const row of pending.users) {
+      expect([...row.cells.values()].map(cell => cell.state)).toEqual(['pending', 'pending']);
+      expect(row.unknown).toBe(0);
+    }
+
+    payload.expected = [{ node_id: 'n1', users: [{ tenant_id: 'platform', user_id: 'bob' }] }];
+    const confirmed = buildFleetTrafficMatrix(payload, nodes, users, NOW);
+    expect(confirmed.entitlementsKnown).toBe(true);
+    expect(confirmed.users.map(row => row.userId)).toEqual(['bob']);
+    expect(confirmed.users[0].cells.get('n1')?.state).toBe('idle');
+    expect(confirmed.users[0].cells.get('n2')?.state).toBe('not-entitled');
+  });
+
+  it('takes machine IDs and granted users from the authorization snapshot before the roster arrives', () => {
+    const matrix = buildFleetTrafficMatrix(
+      {
+        policy: { enabled: true },
+        nodes: [],
+        expected: [{ node_id: 'n1', users: [{ tenant_id: 'platform', user_id: 'alice' }] }],
+      },
+      [],
+      [],
+      NOW,
+    );
+
+    expect(matrix.entitlementsKnown).toBe(true);
+    expect(matrix.nodes.map(node => node.id)).toEqual(['n1']);
+    expect(matrix.users.map(user => user.userId)).toEqual(['alice']);
+    expect(matrix.users[0].cells.get('n1')?.state).toBe('unknown');
+  });
+
   it('distinguishes an entitled zero from an unknown machine and a missing entitlement', () => {
     const payload: FleetTrafficSnapshot = {
       policy: { enabled: true },

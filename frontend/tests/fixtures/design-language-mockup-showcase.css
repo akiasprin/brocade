@@ -1,0 +1,493 @@
+/* ═══ D · 展示页（apple.com）═══
+   规则：
+   1. 顶部一条 48px 的半透明全局导航，链接居中、只有文字；当前页用正文色加粗，其余为次级灰。导航随页面滚走。
+   2. 内容限宽居中，两侧大留白。列表页以 48px 粗体标题开场，详情页的名称也是标题级字号。
+   3. 一切内容都是色块：白页上的 #f5f5f7 圆角块（暗色为黑页上的 #1c1c1e），圆角 22，无边框、无投影、无图标装饰。
+   4. 读数是主角：30px 以上的 SF Pro Display，紧字距；标签退成小号灰字。
+   5. 按钮是全圆角胶囊：主按钮 #0071e3 实底白字，次按钮是强调色描边；分段控件的选中项用正文色实底反白。 */
+
+:root[data-lang='showcase']:not([data-theme='light']) {
+  --sc-page: #000000;
+  --sc-tile: #1c1c1e;
+  --sc-tile-2: #2c2c2e;
+  --sc-nav: rgba(22, 22, 23, 0.8);
+  --sc-sep: rgba(255, 255, 255, 0.12);
+  --sc-track: rgba(255, 255, 255, 0.1);
+  --sc-ink-strong: #f5f5f7;
+  --sc-ink-inverse: #1d1d1f;
+  --sc-field-line: rgba(255, 255, 255, 0.2);
+  --ground: var(--sc-page);
+  --sheet: var(--sc-tile);
+  --card: var(--sc-tile);
+  --sheet-shadow: none;
+  --float: rgba(28, 28, 30, 0.86);
+  --float-sheet: rgba(28, 28, 30, 0.86);
+}
+:root[data-lang='showcase'][data-theme='light'] {
+  --sc-page: #ffffff;
+  --sc-tile: #f5f5f7;
+  --sc-tile-2: #e8e8ed;
+  --sc-nav: rgba(255, 255, 255, 0.8);
+  --sc-sep: rgba(0, 0, 0, 0.1);
+  --sc-track: rgba(0, 0, 0, 0.06);
+  --sc-ink-strong: #1d1d1f;
+  --sc-ink-inverse: #ffffff;
+  --sc-field-line: #d2d2d7;
+  --ink: #1d1d1f;
+  --ground: var(--sc-page);
+  --sheet: var(--sc-tile);
+  --card: var(--sc-tile);
+  --sheet-shadow: none;
+  --float: rgba(255, 255, 255, 0.88);
+  --float-sheet: rgba(255, 255, 255, 0.88);
+}
+:root[data-lang='showcase'] {
+  --r-card: 22px;
+  --r-ctl: 980px;
+  --ctl-h: 36px;
+}
+
+:root[data-lang='showcase'] body,
+:root[data-lang='showcase'] #stage,
+:root[data-lang='showcase'] body:has(.forge)::before {
+  background: var(--sc-page);
+}
+
+/* ── 全局导航 ── */
+:root[data-lang='showcase'] .forge:not(.narrow) .fg-top {
+  height: 48px;
+  padding: 0 24px 0 28px;
+  border: 0;
+  background: var(--sc-nav);
+  -webkit-backdrop-filter: blur(20px) saturate(1.8);
+  backdrop-filter: blur(20px) saturate(1.8);
+}
+:root[data-lang='showcase'] .forge:not(.narrow) .fg-top > .fg-vr {
+  display: none;
+}
+:root[data-lang='showcase'] .fg-home {
+  color: var(--sc-ink-strong);
+}
+:root[data-lang='showcase'] .fg-brand {
+  color: var(--sc-ink-strong);
+  font: 600 17px/1 var(--display);
+  letter-spacing: -0.02em;
+}
+:root[data-lang='showcase'] .forge:not(.narrow) .fg-top > .fg-nav {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  height: 100%;
+  gap: 8px;
+  transform: translateX(-50%);
+}
+:root[data-lang='showcase'] .forge:not(.narrow) .fg-nv {
+  height: 100%;
+  padding: 0 16px;
+  border-radius: 0;
+  color: var(--ink-3);
+  font: 400 13px var(--sans);
+}
+:root[data-lang='showcase'] .forge:not(.narrow) .fg-nv-ic {
+  display: none;
+}
+:root[data-lang='showcase'] .fg-nv:hover {
+  background: none;
+  color: var(--sc-ink-strong);
+}
+:root[data-lang='showcase'] .fg-nv[aria-current='true'] {
+  background: none;
+  box-shadow: none;
+  color: var(--sc-ink-strong);
+  font-weight: 600;
+}
+:root[data-lang='showcase'] .fg-tgl {
+  color: var(--sc-ink-strong);
+}
+:root[data-lang='showcase'] .fg-tgl:hover {
+  background: none;
+  opacity: 0.7;
+}
+:root[data-lang='showcase'] .fg-tgl .fg-badge {
+  box-shadow: 0 0 0 2px var(--sc-page);
+}
+:root[data-lang='showcase'] .fg-who {
+  gap: 8px;
+  color: var(--sc-ink-strong);
+  font: 400 13px var(--sans);
+}
+:root[data-lang='showcase'] .fg-who-plate {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--sc-ink-strong);
+  color: var(--sc-ink-inverse);
+  font: 600 12px var(--sans);
+}
+
+/* ── 路径与读数：页面顶端的一行小字 ── */
+:root[data-lang='showcase'] .fg-crumb,
+:root[data-lang='showcase'] .fg-view {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 1320px;
+  margin-inline: auto;
+}
+:root[data-lang='showcase'] .forge:not(.narrow) .fg-crumb {
+  height: 52px;
+  padding: 0 44px;
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  font-size: 13px;
+}
+:root[data-lang='showcase'] .fg-crumb .cur {
+  color: var(--sc-ink-strong);
+}
+:root[data-lang='showcase'] .fg-crumb-link {
+  color: var(--action);
+}
+:root[data-lang='showcase'] .fg-crumb .sep::before {
+  font-size: 13px;
+}
+:root[data-lang='showcase'] .fg-crumb-right {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+:root[data-lang='showcase'] .fg-crumb-right :is(.ft-rd-value, .ft-state) {
+  color: var(--sc-ink-strong);
+}
+
+/* ── 内容 ── */
+:root[data-lang='showcase'] :is(.cardpage, .nd-sheet) {
+  margin: 0 44px 72px;
+}
+:root[data-lang='showcase'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) {
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+:root[data-lang='showcase'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header {
+  min-height: 64px;
+  margin: 4px 0 28px;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+:root[data-lang='showcase'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header h4 {
+  color: var(--sc-ink-strong);
+  font: 700 48px/1.08 var(--display);
+  letter-spacing: -0.03em;
+  text-transform: none;
+}
+:root[data-lang='showcase'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header .list-ico {
+  display: none;
+}
+:root[data-lang='showcase'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header :is(.btn, .segsw) {
+  height: 36px;
+  min-height: 36px;
+}
+
+/* 色块 */
+:root[data-lang='showcase'] .fg-view :is(.panel, .chart-card, .kpi, .ncard, .chain-card) {
+  border: 0;
+  border-radius: 22px;
+  background: var(--sc-tile);
+  box-shadow: none;
+}
+:root[data-lang='showcase'] .ncards {
+  grid-template-columns: repeat(auto-fill, minmax(286px, 1fr));
+  gap: 20px;
+}
+:root[data-lang='showcase'] .ncard {
+  padding: 22px 22px 20px;
+}
+@media (hover: hover) and (pointer: fine) {
+  :root[data-lang='showcase'] :is(.ncard, .chain-card):hover {
+    transform: scale(1.01);
+  }
+}
+:root[data-lang='showcase'] :is(.ncard, .chain-card) {
+  transition: transform 0.25s ease;
+}
+:root[data-lang='showcase'] .nc-head b,
+:root[data-lang='showcase'] .chain-card-title {
+  color: var(--sc-ink-strong);
+  font: 600 17px var(--display);
+  letter-spacing: -0.01em;
+}
+:root[data-lang='showcase'] .lst-sum {
+  color: var(--sc-ink-strong);
+  font: 600 32px var(--display);
+  letter-spacing: -0.025em;
+}
+:root[data-lang='showcase'] .lst-sum small {
+  color: var(--ink-3);
+  font: 400 13px var(--sans);
+  letter-spacing: 0;
+}
+:root[data-lang='showcase'] .chain-card-grid {
+  gap: 20px;
+}
+:root[data-lang='showcase'] .chain-card {
+  padding: 20px 22px 18px;
+}
+:root[data-lang='showcase'] .chain-section-head {
+  margin-bottom: 6px;
+}
+:root[data-lang='showcase'] .chain-section-name {
+  color: var(--sc-ink-strong);
+  font: 700 28px var(--display);
+  letter-spacing: -0.02em;
+}
+:root[data-lang='showcase'] .chain-section + .chain-section {
+  margin-top: 28px;
+  border-top: 0;
+}
+:root[data-lang='showcase'] .cp-hop {
+  border-radius: 980px;
+}
+
+/* 详情页：名称是标题级，正文是一组色块 */
+:root[data-lang='showcase'] .nd-sheet > .nd-paper {
+  --nd-paper-surface: var(--sc-tile);
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+:root[data-lang='showcase'] .nd-sheet > .nd-paper > .nd-page-head {
+  min-height: 76px;
+  margin: 0 0 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+:root[data-lang='showcase'] .nd-sheet > .nd-paper > .nd-page-head .nd-id {
+  color: var(--sc-ink-strong);
+  font: 700 36px/1.1 var(--display);
+  letter-spacing: -0.03em;
+}
+:root[data-lang='showcase'] .nd-ident-meta {
+  font-size: 15px;
+}
+:root[data-lang='showcase'] .nd-sheet.nd-node-detail > .nd-paper > .nd-paper-body {
+  padding: 0;
+}
+:root[data-lang='showcase'] .nd-sheet:not(.nd-node-detail) > .nd-paper > .nd-paper-body {
+  overflow: hidden;
+  padding: 26px 28px 30px;
+  border-radius: 28px;
+  background: var(--sc-tile);
+}
+:root[data-lang='showcase'] .nd-sheet .nd-tabs::before {
+  display: none;
+}
+:root[data-lang='showcase'] .nd-tabs {
+  align-self: center;
+  margin-left: 24px;
+}
+
+/* 用户详情 */
+:root[data-lang='showcase'] .fg-view .panel.user-split-detail {
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+:root[data-lang='showcase'] .user-dhead {
+  margin: 0 0 8px;
+  border: 0;
+  background: none;
+}
+:root[data-lang='showcase'] .user-dhead .dname b {
+  font: 700 32px/1.1 var(--display);
+  letter-spacing: -0.03em;
+}
+:root[data-lang='showcase'] .user-split {
+  gap: 20px;
+}
+:root[data-lang='showcase'] .user-split-roster {
+  border: 0;
+  border-radius: 22px;
+  background: var(--sc-tile);
+}
+
+/* 分段与页签：胶囊槽，选中项正文色实底反白 */
+:root[data-lang='showcase'] :is(.nd-tabs-seg, .segsw) {
+  height: auto;
+  min-height: 36px;
+  gap: 2px;
+  padding: 3px;
+  border: 0;
+  border-radius: 980px;
+  background: var(--sc-track);
+}
+:root[data-lang='showcase'] :is(.nd-tabs button, .segsw button) {
+  height: 30px;
+  padding: 0 16px;
+  border-radius: 980px;
+  color: var(--sc-ink-strong);
+  font-size: 14px;
+  font-weight: 400;
+}
+:root[data-lang='showcase'] .nd-tabs button[aria-selected='true'],
+:root[data-lang='showcase'] .segsw button[aria-pressed='true'],
+:root[data-lang='showcase'] .segsw button[aria-pressed='true']:hover:not(:disabled) {
+  background: var(--sc-ink-strong);
+  box-shadow: none;
+  color: var(--sc-ink-inverse);
+  font-weight: 500;
+}
+:root[data-lang='showcase'] .nd-tabs button[aria-selected='true'] .nd-tab-ic {
+  color: inherit;
+}
+:root[data-lang='showcase'] :is(.nd-tabs button, .segsw button) :is(.nd-tab-badge, b, small) {
+  color: inherit;
+}
+
+/* 色块标题：无图标，21px 标题字 */
+:root[data-lang='showcase']
+  :is(.nd-tab-observed > .panel, .nd-tab-pair > .panel, .panel.config-panel, .panel.titled)
+  > :is(header, summary) {
+  min-height: 52px;
+  border-bottom-color: transparent;
+  background: none;
+}
+:root[data-lang='showcase']
+  :is(.nd-tab-observed > .panel, .nd-tab-pair > .panel, .panel.config-panel, .panel.titled)
+  > :is(header, summary)
+  h4,
+:root[data-lang='showcase'] .panel > :is(header, summary) h4 {
+  color: var(--sc-ink-strong);
+  font: 600 19px/1.3 var(--display);
+  letter-spacing: -0.01em;
+  text-transform: none;
+}
+:root[data-lang='showcase'] :is(.panel-title-icon, .chart-title-icon, .list-ico) {
+  display: none;
+}
+:root[data-lang='showcase'] .kpi {
+  padding: 16px 18px 40px;
+}
+:root[data-lang='showcase'] .kpi .kpi-l {
+  color: var(--ink-3);
+  font: 400 13px var(--sans);
+  text-transform: none;
+}
+:root[data-lang='showcase'] .kpi .kpi-v {
+  color: var(--sc-ink-strong);
+  font: 600 34px var(--display);
+  letter-spacing: -0.03em;
+}
+:root[data-lang='showcase'] .kpi-band,
+:root[data-lang='showcase'] .nd-observe-throughput {
+  gap: 20px;
+}
+
+/* ── 控件：胶囊 ── */
+:root[data-lang='showcase'] .btn {
+  padding: 0 18px;
+  border: 1px solid var(--action);
+  border-radius: 980px;
+  background: none;
+  color: var(--action);
+  font-size: 14px;
+  font-weight: 400;
+}
+@media (hover: hover) {
+  :root[data-lang='showcase'] .btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--action) 8%, transparent);
+  }
+  :root[data-lang='showcase'] .btn.primary:hover:not(:disabled) {
+    background: var(--primary-hover);
+  }
+}
+:root[data-lang='showcase'] .btn.primary {
+  border-color: transparent;
+  background: var(--primary);
+  color: var(--primary-on);
+}
+:root[data-lang='showcase'] .btn:disabled,
+:root[data-lang='showcase'] .btn.primary:disabled {
+  border-color: var(--sc-sep);
+  background: none;
+  color: var(--ink-4);
+}
+:root[data-lang='showcase'] :is(input.f, select.f) {
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid var(--sc-field-line);
+  border-radius: 12px;
+  background: var(--sc-page);
+  font-size: 15px;
+}
+:root[data-lang='showcase'] textarea.f {
+  border: 1px solid var(--sc-field-line);
+  border-radius: 12px;
+  background: var(--sc-page);
+  font-size: 15px;
+}
+:root[data-lang='showcase'] :is(input.f, textarea.f, select.f):focus {
+  border-color: var(--action);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--action) 30%, transparent);
+}
+:root[data-lang='showcase'] .st {
+  padding: 3px 10px;
+  border-color: transparent;
+  border-radius: 980px;
+  background: var(--sc-tile-2);
+  font: 400 12px var(--sans);
+}
+
+/* ── 浮层 ── */
+:root[data-lang='showcase'] :is(.fg-menu, .fg-pop) {
+  border: 0;
+  border-radius: 18px;
+  box-shadow: 0 0 0 1px var(--sc-sep), 0 20px 60px rgba(0, 0, 0, 0.2);
+}
+:root[data-lang='showcase'] .fg-menu button {
+  min-height: 38px;
+  border-radius: 10px;
+  font-size: 14px;
+}
+:root[data-lang='showcase'] .dialog-surface {
+  border: 0;
+  border-radius: 28px;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.3);
+}
+:root[data-lang='showcase'] .kpi .kpi-v.kpi-uptime {
+  font-size: 26px;
+}
+
+/* ── 手机：留白与标题收到手机尺度 ── */
+:root[data-lang='showcase'] .forge.narrow :is(.cardpage, .nd-sheet) {
+  margin: 0 16px 48px;
+}
+:root[data-lang='showcase'] .forge.narrow .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header {
+  margin: 8px 0 20px;
+}
+:root[data-lang='showcase'] .forge.narrow .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header h4 {
+  font-size: 34px;
+}
+:root[data-lang='showcase'] .forge.narrow .nd-sheet > .nd-paper > .nd-page-head .nd-id {
+  font-size: 24px;
+}
+:root[data-lang='showcase'] .forge.narrow .chain-section-name {
+  font-size: 22px;
+}
+:root[data-lang='showcase'] .forge.narrow .kpi .kpi-v {
+  font-size: 26px;
+}
+:root[data-lang='showcase'] .forge.narrow .kpi .kpi-v.kpi-uptime {
+  font-size: 19px;
+}
+:root[data-lang='showcase'] .forge.narrow .lst-sum {
+  font-size: 28px;
+}

@@ -1,7 +1,8 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ConsoleSnapshot, NodeAgentStateItem, Rule } from '../src/api';
+import * as api from '../src/api';
 import { draft } from '../src/draft';
 import { MachineEgressDnsRules, RuleEditor, type ForwardPeer } from '../src/panes/rules';
 import { confirmDiscardChanges } from '../src/ui/navigation-guard';
@@ -125,6 +126,7 @@ function renderMachineRules(
     { node: 'hk', position: 1, selector: { t: 'geosite', v: ['media'] }, resolution },
     { node: 'sg', position: 0, selector: { t: 'geosite', v: ['other'] }, resolution },
   ],
+  readOnly = false,
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY } },
@@ -132,6 +134,11 @@ function renderMachineRules(
   client.setQueryData<ConsoleSnapshot>(['snapshot'], {
     snapshot: {
       revision: 1,
+      nodes: [
+        { id: 'hk', name: '香港落地' },
+        { id: 'sg', name: '新加坡落地' },
+        { id: 'empty', name: '空节点' },
+      ],
       apps: referenced
         ? [
             {
@@ -160,12 +167,89 @@ function renderMachineRules(
   });
   return render(
     <QueryClientProvider client={client}>
-      <MachineEgressDnsRules nodeId="hk" nodeName="香港落地" showHeader={showHeader} />
+      <MachineEgressDnsRules nodeId="hk" nodeName="香港落地" showHeader={showHeader} readOnly={readOnly} />
     </QueryClientProvider>,
   );
 }
 
 describe('machine-scoped egress DNS', () => {
+  it('stages a comma-separated group using one protocol and structured addresses', async () => {
+    const view = renderMachineRules();
+    const address = view.getByLabelText('DNS 地址（域名后缀 netflix.com）');
+    fireEvent.change(address, { target: { value: '192.0.2.53, 2001:db8::53, 198.51.100.53' } });
+    expect((address as HTMLInputElement).value).toBe('192.0.2.53, 2001:db8::53, 198.51.100.53');
+    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+    await waitFor(() => expect(draft.ops().some(op => op.op === 'set_node_egress_dns')).toBe(true));
+    const op = draft.ops().find(op => op.op === 'set_node_egress_dns');
+    expect(op).toMatchObject({
+      resolution: { ...resolution, address: ['192.0.2.53', '2001:db8::53', '198.51.100.53'] },
+    });
+  });
+
+  it('keeps typed addresses and reports an invalid group only after saving', async () => {
+    const view = renderMachineRules();
+    const value = '192.0.2.1, 192.0.2.2, 192.0.2.3, 192.0.2.4';
+    const address = view.getByLabelText('DNS 地址（域名后缀 netflix.com）');
+    fireEvent.change(address, { target: { value } });
+    expect((address as HTMLInputElement).value).toBe(value);
+    expect(view.queryByRole('alert')).toBeNull();
+    expect(address.getAttribute('aria-invalid')).toBe('false');
+    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+    await waitFor(() => expect(view.getByRole('alert').textContent).toBe('每组最多 3 个 DNS 地址'));
+    expect(address.getAttribute('aria-describedby')).toBe(view.getByRole('alert').id);
+    expect(view.getByRole('alert').closest('.egress-dns-editor')).toBe(address.closest('.egress-dns-editor'));
+    expect(draft.ops()).toHaveLength(0);
+    fireEvent.change(address, { target: { value: '192.0.2.1, 2001:db8::53' } });
+    await waitFor(() => expect(view.queryByRole('alert')).toBeNull());
+    expect(address.getAttribute('aria-invalid')).toBe('false');
+  });
+
+  it('loads grouped addresses and rejects unfinished comma input on save before staging', async () => {
+    const view = renderMachineRules(false, false, [
+      {
+        node: 'hk',
+        position: 0,
+        selector: { t: 'domain_suffix', v: ['netflix.com'] },
+        resolution: { ...resolution, address: ['192.0.2.53', '2001:db8::53'] },
+      },
+    ]);
+    const address = view.getByLabelText('DNS 地址（域名后缀 netflix.com）');
+    expect((address as HTMLInputElement).value).toBe('192.0.2.53, 2001:db8::53');
+    fireEvent.change(address, { target: { value: '192.0.2.53,' } });
+    expect((address as HTMLInputElement).value).toBe('192.0.2.53,');
+    expect(view.queryByRole('alert')).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+    await waitFor(() => expect(view.getByRole('alert').textContent).toBe('请填写完整的 DNS 地址，用逗号分隔'));
+    expect(draft.ops()).toHaveLength(0);
+  });
+
+  it('validates every policy before staging selector removals or other valid edits', async () => {
+    const view = renderMachineRules();
+    fireEvent.change(view.getByLabelText('DNS 匹配内容（域名后缀 netflix.com）'), {
+      target: { value: 'disneyplus.com' },
+    });
+    const address = view.getByLabelText('DNS 地址（geosite media）');
+    fireEvent.change(address, { target: { value: '' } });
+    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+    await waitFor(() => expect(view.getByRole('alert')).toBeTruthy());
+    expect(view.getByRole('alert').closest('tr')).toBe(address.closest('tr'));
+    expect(draft.ops()).toHaveLength(0);
+  });
+
+  it('shows a storage failure on its policy row and clears it when editing', async () => {
+    vi.spyOn(api, 'setNodeEgressDns').mockRejectedValueOnce(new Error('草稿保存失败'));
+    const view = renderMachineRules();
+    const address = view.getByLabelText('DNS 地址（geosite media）');
+    fireEvent.change(address, { target: { value: '198.51.100.53' } });
+    expect(view.queryByRole('alert')).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+    await waitFor(() => expect(view.getByRole('alert').textContent).toBe('草稿保存失败'));
+    expect(view.getByRole('alert').closest('tr')).toBe(address.closest('tr'));
+    expect(view.queryAllByRole('alert')).toHaveLength(1);
+    fireEvent.change(address, { target: { value: '203.0.113.53' } });
+    await waitFor(() => expect(view.queryByRole('alert')).toBeNull());
+  });
+
   it('does not report a read-only rule table as an unsaved local edit', () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
     renderEditor(
@@ -262,9 +346,14 @@ describe('machine-scoped egress DNS', () => {
     expect(footer?.className).toBe('toolbar');
     expect(footer?.textContent).toContain('改动落进草稿，顶栏按「提交」才写进库。');
     expect(footer?.textContent).toContain('1 项配置有改动');
-    expect(save.disabled).toBe(true);
-    fireEvent.change(view.getByLabelText('DNS 匹配内容（域名后缀）'), { target: { value: 'example.com' } });
-    fireEvent.change(view.getByLabelText('DNS 地址（域名后缀 example.com）'), { target: { value: '1.1.1.1' } });
+    expect(view.queryByRole('alert')).toBeNull();
+    expect((view.getByLabelText('DNS 匹配类型（geosite）') as HTMLSelectElement).value).toBe('geosite');
+    fireEvent.change(view.getByLabelText('DNS 匹配内容（geosite）'), { target: { value: 'netflix' } });
+    fireEvent.click(save);
+    await waitFor(() => expect(view.getByRole('alert').textContent).toBe('请填写完整的 DNS 地址，用逗号分隔'));
+    expect(draft.ops()).toHaveLength(0);
+    fireEvent.change(view.getByLabelText('DNS 地址（geosite netflix）'), { target: { value: '1.1.1.1' } });
+    await waitFor(() => expect(view.queryByRole('alert')).toBeNull());
     expect(save.disabled).toBe(false);
     fireEvent.click(save);
 
@@ -272,7 +361,7 @@ describe('machine-scoped egress DNS', () => {
     expect(draft.ops()[0]).toEqual({
       op: 'set_node_egress_dns',
       node_id: 'hk',
-      selector: { t: 'domain_suffix', v: ['example.com'] },
+      selector: { t: 'geosite', v: ['netflix'] },
       resolution: {
         address: '1.1.1.1',
         port: 53,
@@ -284,7 +373,7 @@ describe('machine-scoped egress DNS', () => {
     expect(draft.ops()[1]).toEqual({
       op: 'reorder_node_egress_dns',
       node_id: 'hk',
-      selectors: [{ t: 'domain_suffix', v: ['example.com'] }],
+      selectors: [{ t: 'geosite', v: ['netflix'] }],
     });
   });
 
@@ -314,14 +403,14 @@ describe('machine-scoped egress DNS', () => {
         .slice(0, 2)
         .map(op => (op.op === 'set_node_egress_dns' ? op.selector : null)),
     ).toEqual([
-      { t: 'domain_suffix', v: ['one.example'] },
-      { t: 'domain_suffix', v: ['two.example'] },
+      { t: 'geosite', v: ['one.example'] },
+      { t: 'geosite', v: ['two.example'] },
     ]);
     expect(draft.ops()[2]).toMatchObject({
       op: 'reorder_node_egress_dns',
       selectors: [
-        { t: 'domain_suffix', v: ['one.example'] },
-        { t: 'domain_suffix', v: ['two.example'] },
+        { t: 'geosite', v: ['one.example'] },
+        { t: 'geosite', v: ['two.example'] },
       ],
     });
   });
@@ -401,11 +490,180 @@ describe('machine-scoped egress DNS', () => {
     });
   });
 
-  it('states the machine-wide DNS limitation as one plain sentence', () => {
+  it('copies the edited policy beside its source and saves the renamed copy with all DNS options', async () => {
+    draft.init('machine-dns-copy-test');
+    draft.clear();
+    const grouped = {
+      address: ['192.0.2.53', '2001:db8::53'],
+      port: 5353,
+      transport: 'udp' as const,
+      address_strategy: 'use_ipv6' as const,
+      fallback: 'machine' as const,
+    };
+    const view = renderMachineRules(false, true, [
+      { node: 'hk', position: 0, selector: { t: 'geosite', v: ['disney'] }, resolution: grouped },
+      { node: 'hk', position: 1, selector: { t: 'geosite', v: ['media'] }, resolution },
+    ]);
+    fireEvent.change(view.getByLabelText('端口（geosite disney）'), { target: { value: '5354' } });
+    fireEvent.click(view.getByRole('button', { name: '复制 DNS 策略（geosite disney）' }));
+
+    const rows = view.container.querySelectorAll('.node-egress-rules-table tbody tr');
+    expect(rows).toHaveLength(3);
+    const copy = within(rows[1] as HTMLElement);
+    const match = copy.getByLabelText('DNS 匹配内容（geosite disney）');
+    expect(document.activeElement).toBe(match);
+    expect((copy.getByLabelText('DNS 地址（geosite disney）') as HTMLInputElement).value).toBe(
+      '192.0.2.53, 2001:db8::53',
+    );
+    expect((copy.getByLabelText('端口（geosite disney）') as HTMLInputElement).value).toBe('5354');
+    expect((copy.getByLabelText('传输（geosite disney）') as HTMLSelectElement).value).toBe('udp');
+    expect((copy.getByLabelText('地址策略（geosite disney）') as HTMLSelectElement).value).toBe('use_ipv6');
+    expect((copy.getByLabelText('失败处理（geosite disney）') as HTMLSelectElement).value).toBe('machine');
+    expect(view.queryByRole('alert')).toBeNull();
+    fireEvent.change(match, { target: { value: 'dazn' } });
+    fireEvent.change(copy.getByLabelText('DNS 地址（geosite dazn）'), { target: { value: '198.51.100.53' } });
+    expect((view.getByLabelText('DNS 地址（geosite disney）') as HTMLInputElement).value).toBe(
+      '192.0.2.53, 2001:db8::53',
+    );
+    expect(grouped.address).toEqual(['192.0.2.53', '2001:db8::53']);
+    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+
+    await waitFor(() => expect(draft.ops()).toHaveLength(3));
+    expect(draft.ops()[1]).toMatchObject({
+      op: 'set_node_egress_dns',
+      node_id: 'hk',
+      selector: { t: 'geosite', v: ['dazn'] },
+      resolution: { ...grouped, address: '198.51.100.53', port: 5354 },
+    });
+    expect(draft.ops()[2]).toEqual({
+      op: 'reorder_node_egress_dns',
+      node_id: 'hk',
+      selectors: [
+        { t: 'geosite', v: ['disney'] },
+        { t: 'geosite', v: ['dazn'] },
+        { t: 'geosite', v: ['media'] },
+      ],
+    });
+  });
+
+  it('appends imported rows in source order without checking overlapping selectors or replacing local edits', () => {
+    draft.init('machine-dns-import-overlap-test');
+    draft.clear();
+    const view = renderMachineRules(false, true, [
+      { node: 'hk', position: 0, selector: { t: 'geosite', v: ['disney'] }, resolution },
+      { node: 'sg', position: 1, selector: { t: 'geosite', v: ['netflix'] }, resolution },
+      { node: 'sg', position: 0, selector: { t: 'geosite', v: ['disney'] }, resolution },
+    ]);
+    fireEvent.change(view.getByLabelText('DNS 地址（geosite disney）'), { target: { value: '203.0.113.53' } });
+    fireEvent.click(view.getByRole('button', { name: '从节点导入' }));
+    const dialog = within(view.getByRole('dialog', { name: '从节点导入 DNS 策略' }));
+    const source = dialog.getByLabelText('来源节点');
+    expect(within(source).queryByRole('option', { name: '香港落地' })).toBeNull();
+    fireEvent.change(source, { target: { value: 'sg' } });
+    expect(dialog.getByText('将导入 2 条策略，按原顺序追加到当前列表末尾。')).toBeTruthy();
+    fireEvent.click(dialog.getByRole('button', { name: '追加导入' }));
+
+    const rows = [...view.container.querySelectorAll('.node-egress-rules-table tbody tr')];
+    expect(rows.map(row => row.querySelector<HTMLInputElement>('.rule-new-dns-value')!.value)).toEqual([
+      'disney',
+      'disney',
+      'netflix',
+    ]);
+    expect(
+      view.getAllByLabelText('DNS 地址（geosite disney）').map(input => (input as HTMLInputElement).value),
+    ).toEqual(['203.0.113.53', '192.0.2.53']);
+    expect(view.queryByRole('alert')).toBeNull();
+    expect(view.queryByRole('dialog')).toBeNull();
+    expect(draft.ops()).toHaveLength(0);
+  });
+
+  it('saves imported DNS groups and their appended order without writing the source node', async () => {
+    draft.init('machine-dns-import-save-test');
+    draft.clear();
+    const imported = { ...resolution, address: ['198.51.100.53', '2001:db8::53'], transport: 'udp' as const };
+    const view = renderMachineRules(false, true, [
+      { node: 'hk', position: 0, selector: { t: 'geosite', v: ['disney'] }, resolution },
+      { node: 'sg', position: 1, selector: { t: 'geosite', v: ['spotify'] }, resolution: imported },
+      { node: 'sg', position: 0, selector: { t: 'geosite', v: ['netflix'] }, resolution: imported },
+    ]);
+    fireEvent.click(view.getByRole('button', { name: '从节点导入' }));
+    fireEvent.change(view.getByLabelText('来源节点'), { target: { value: 'sg' } });
+    fireEvent.click(view.getByRole('button', { name: '追加导入' }));
+    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+
+    await waitFor(() => expect(draft.ops()).toHaveLength(3));
+    expect(draft.ops()).toEqual([
+      { op: 'set_node_egress_dns', node_id: 'hk', selector: { t: 'geosite', v: ['netflix'] }, resolution: imported },
+      { op: 'set_node_egress_dns', node_id: 'hk', selector: { t: 'geosite', v: ['spotify'] }, resolution: imported },
+      {
+        op: 'reorder_node_egress_dns',
+        node_id: 'hk',
+        selectors: [
+          { t: 'geosite', v: ['disney'] },
+          { t: 'geosite', v: ['netflix'] },
+          { t: 'geosite', v: ['spotify'] },
+        ],
+      },
+    ]);
+  });
+
+  it('imports into an empty machine and allows cancelling the added rows', () => {
+    const view = renderMachineRules(false, true, [
+      { node: 'sg', position: 0, selector: { t: 'geosite', v: ['netflix'] }, resolution },
+    ]);
+    fireEvent.click(view.getByRole('button', { name: '从节点导入' }));
+    fireEvent.change(view.getByLabelText('来源节点'), { target: { value: 'sg' } });
+    fireEvent.click(view.getByRole('button', { name: '追加导入' }));
+    expect(view.getByLabelText('DNS 匹配内容（geosite netflix）')).toBeTruthy();
+    fireEvent.click(view.getByRole('button', { name: '取消' }));
+    expect(view.queryByLabelText('DNS 匹配内容（geosite netflix）')).toBeNull();
+  });
+
+  it('supports keyboard sorting from the drag handle without altering the DNS fields', async () => {
+    draft.init('machine-dns-keyboard-order-test');
+    draft.clear();
+    const view = renderMachineRules();
+    const handle = view.getByRole('button', { name: '拖动排序 DNS 策略（geosite media）' });
+    fireEvent.keyDown(handle, { key: 'ArrowUp' });
+    expect(document.activeElement).toBe(handle);
+    expect(
+      [...view.container.querySelectorAll<HTMLInputElement>('.rule-new-dns-value')].map(input => input.value),
+    ).toEqual(['media', 'netflix.com']);
+    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+    await waitFor(() => expect(draft.ops()).toHaveLength(1));
+    expect(draft.ops()[0]).toEqual({
+      op: 'reorder_node_egress_dns',
+      node_id: 'hk',
+      selectors: [
+        { t: 'geosite', v: ['media'] },
+        { t: 'domain_suffix', v: ['netflix.com'] },
+      ],
+    });
+  });
+
+  it('does not leave a focus request behind when a keyboard move reaches the list boundary', () => {
+    const view = renderMachineRules();
+    fireEvent.keyDown(view.getByRole('button', { name: '拖动排序 DNS 策略（域名后缀 netflix.com）' }), {
+      key: 'ArrowUp',
+    });
+    const address = view.getByLabelText('DNS 地址（域名后缀 netflix.com）');
+    address.focus();
+    fireEvent.change(address, { target: { value: '203.0.113.53' } });
+    expect(document.activeElement).toBe(address);
+  });
+
+  it('keeps copying, importing and drag sorting unavailable to read-only viewers', () => {
+    const view = renderMachineRules(false, true, undefined, true);
+    expect(view.queryByRole('button', { name: /复制 DNS 策略/ })).toBeNull();
+    expect(view.queryByRole('button', { name: /拖动排序 DNS 策略/ })).toBeNull();
+    expect((view.getByRole('button', { name: '从节点导入' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('states the group input and machine-wide DNS limitation plainly', () => {
     const view = renderMachineRules();
 
     const hint = view.getByText(
-      'Xray 的 DNS 选择不携带原路由和出站上下文；DNS 查询可以指定出口，但解析结果无法按出站隔离。',
+      'DNS 地址可用逗号分隔，最多 3 个，同组竞速。Xray 的解析结果无法按出站隔离。',
     );
     expect(hint.classList.contains('note')).toBe(true);
     expect(hint.classList.contains('st-warn')).toBe(false);
@@ -644,11 +902,11 @@ describe('machine-scoped egress DNS', () => {
     expect(view.getByLabelText('DNS 地址（机器策略：域名后缀 netflix.com）')).toBeTruthy();
   });
 
-  it('keeps the machine-wide DNS limitation concise in the chain editor', () => {
+  it('shows group input guidance and the DNS limitation in the chain editor', () => {
     const view = renderEditor();
 
     expect(
-      view.getByText('Xray 的 DNS 选择不携带原路由和出站上下文；DNS 查询可以指定出口，但解析结果无法按出站隔离。'),
+      view.getByText('DNS 地址可用逗号分隔，最多 3 个，同组竞速。Xray 的解析结果无法按出站隔离。'),
     ).toBeTruthy();
   });
 

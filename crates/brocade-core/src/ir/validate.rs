@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::{IpAddr, Ipv4Addr},
+    net::Ipv4Addr,
 };
 
 use base64::{engine::general_purpose, Engine as _};
@@ -165,11 +165,11 @@ pub fn validate_model_snapshot(snapshot: &ModelSnapshot, diagnostics: &mut Vec<D
                 "DNS 策略只支持域名后缀、域名关键词、域名正则和 Geosite",
             ));
         }
-        if policy.resolution.address.trim().parse::<IpAddr>().is_err() {
+        if !policy.resolution.address.valid() {
             diagnostics.push(Diagnostic::error(
                 "dns.address",
                 &path,
-                "DNS 策略地址必须是 IPv4 或 IPv6 字面量，不能填写域名",
+                "DNS 策略须包含 1–16 个 IPv4 或 IPv6 地址，不能填写域名",
             ));
         }
         if policy.resolution.port == 0 {

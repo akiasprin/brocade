@@ -368,6 +368,7 @@ export function UserForwardingCard({
   canViewRealtime = false,
   accountingDisabled,
   onAccountingModeChange,
+  cycleReset,
   servicePolicy,
 }: {
   user: UserListItem;
@@ -378,6 +379,8 @@ export function UserForwardingCard({
   canViewRealtime?: boolean;
   accountingDisabled: boolean;
   onAccountingModeChange: (mode: UserTrafficAccountingMode) => void;
+  /** 本期用量重置由用户页提供（与「接入」读数栏同一份），在「本期转发」一行右端。 */
+  cycleReset?: ReactNode;
   /** 账期与有效期由用户页提供（与「接入」读数栏同一份），排在计量口径之后。 */
   servicePolicy?: ReactNode;
 }) {
@@ -871,6 +874,7 @@ export function UserForwardingCard({
               <aside className="fwd-ledger user-usage-ledger" aria-label="本期转发">
                 <div className="user-usage-hero">
                   <span className="user-usage-hero-label">本期转发</span>
+                  {cycleReset}
                   {cycleTraffic ? (
                     <strong className="user-usage-hero-value">
                       {figure} <small>{unit}</small>

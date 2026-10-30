@@ -3,7 +3,7 @@ import type { PingProbeFamily, PingProbePoint, PingProbeSkipReason, PingProbeTar
 export const PING_FAMILY_LABEL: Record<PingProbeFamily, string> = { ipv4: 'IPv4', ipv6: 'IPv6' };
 export const MAX_PING_PROBE_TARGETS = 6;
 
-/** 北京、上海、重庆按 2026-10-19 ITDOG 当地测点延迟核对；地域不取 IPv6 地址库的默认标注。 */
+/** 北京、上海、重庆按 2026-10-19 ITDOG 当地测点延迟核对；广东于 2026-10-28 更新，电信另经远端双栈复测。地域不取 IPv6 地址库的默认标注。 */
 export const PING_PROBE_PRESETS = [
   {
     label: '北京',
@@ -25,11 +25,11 @@ export const PING_PROBE_PRESETS = [
   },
   {
     label: '广东',
-    source: '广东三网探测地址',
+    source: '电信：微信头像 CDN；联通：阿里图片 / 微信头像 CDN；移动：腾讯视频 / QQ 首页 CDN',
     carriers: [
-      { name: '广东电信', ipv4: '125.89.169.2', ipv6: '240e:97c:2f:1::5c' },
-      { name: '广东联通', ipv4: '157.148.118.157', ipv6: '2408:8756:f50:2::65' },
-      { name: '广东移动', ipv4: '120.241.227.7', ipv6: '2409:8c54:871:1::73' },
+      { name: '广东电信', ipv4: '183.61.254.74', ipv6: '240e:97d:10:1705:3a::e' },
+      { name: '广东联通', ipv4: '58.255.175.14', ipv6: '2408:8756:2cff:e409:3c::26' },
+      { name: '广东移动', ipv4: '120.233.185.200', ipv6: '2409:8c54:871:4::87' },
     ],
   },
   {

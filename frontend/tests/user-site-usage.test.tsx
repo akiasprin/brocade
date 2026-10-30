@@ -24,10 +24,16 @@ vi.mock('../src/site-usage-chart', () => ({
     series,
     period,
     focusKey,
+    startUnixSecs,
+    observedSinceUnixSecs,
+    uncertainBeforeUnixSecs,
   }: {
     series: SiteUsageChartSeries[];
     period: string;
     focusKey: string | null;
+    startUnixSecs: number;
+    observedSinceUnixSecs: number | null;
+    uncertainBeforeUnixSecs?: number | null;
   }) => (
     <div
       data-testid="site-usage-chart"
@@ -35,6 +41,10 @@ vi.mock('../src/site-usage-chart', () => ({
       data-focus={focusKey ?? ''}
       data-series={series.map(item => item.key).join(',')}
       data-slots={series[0]?.values.length ?? 0}
+      data-start={startUnixSecs}
+      data-observed-since={observedSinceUnixSecs ?? ''}
+      data-uncertain-before={uncertainBeforeUnixSecs ?? ''}
+      data-values={JSON.stringify(series[0]?.values)}
     />
   ),
 }));
@@ -102,6 +112,7 @@ const detail = <T extends 'domain' | 'target'>(
     expected_nodes: 12,
     limited: false,
     observed_since_unix_secs: DAY_START + 4 * 3600 + 57 * 60,
+    first_record_unix_secs: values.length > 0 ? DAY_START + 2 * 3600 : null,
     latest_report_unix_secs: NOW,
     rows: values.map((value, index) => ({ [key]: value, uplink_bytes: 10, downlink_bytes: 1000 - index * 50 })),
     ...extra,
@@ -234,41 +245,94 @@ it('states how much of a category its detail covers', async () => {
   const other = await screen.findByRole('region', { name: '其他站点明细' });
   const note = await within(other).findByText(/覆盖/);
   expect(note.textContent).toBe(
-    '明细自今天 01:00 起保留 · 自今天 04:57 起采集 · 覆盖 8 KiB，占其他站点 78.5% · 只保留前 10 个主机 · 10 / 12 台入口已上报 · 计数受限，部分流量未计入',
+    '最早记录：今天 02:00 · 覆盖 8 KiB，占其他站点 78.5% · 只保留前 10 个主机 · 10 / 12 台入口已上报 · 计数受限，部分流量未计入',
   );
 });
 
-it('shows the returned retention boundary and keeps a full calendar week when details cover it', async () => {
+it('shows the first actual record instead of the retention boundary or current collection window', async () => {
   const weekStart = DAY_START - 5 * 86_400;
   const retainedSince = DAY_START - 7 * 86_400 + 6 * 3600;
   fetchSites.mockResolvedValue(sites({ period: 'month', range_start_unix_secs: DAY_START - 16 * 86_400 }));
   fetchDomains.mockResolvedValue(
-    domains({ range_start_unix_secs: retainedSince, observed_since_unix_secs: retainedSince - 86_400 }),
+    domains({
+      range_start_unix_secs: retainedSince,
+      observed_since_unix_secs: NOW - 60,
+      first_record_unix_secs: retainedSince + 3 * 3600,
+    }),
   );
   fetchTargets.mockResolvedValue(
     detail('target', ['tcp://192.0.2.1:443'], {
       range_start_unix_secs: DAY_START - 3 * 86_400,
       observed_since_unix_secs: retainedSince,
+      first_record_unix_secs: DAY_START - 2 * 86_400 + 3600,
     }),
   );
   card();
   const other = await screen.findByRole('region', { name: '其他站点明细' });
-  expect((await within(other).findByText(/覆盖/)).textContent).toMatch(/^明细自10-10 06:00 起保留/);
+  expect((await within(other).findByText(/覆盖/)).textContent).toMatch(/^最早记录：10-10 09:00/);
   const failed = screen.getByRole('region', { name: '嗅探失败明细' });
-  expect((await within(failed).findByText(/覆盖/)).textContent).toMatch(/^明细自10-14 00:00 起保留/);
-  expect(screen.queryByText(/明细只保留近 24 小时/)).toBeNull();
+  expect((await within(failed).findByText(/覆盖/)).textContent).toMatch(/^最早记录：10-15 01:00/);
+  expect(within(other).queryByText(/起保留|起采集/)).toBeNull();
 
   fetchSites.mockResolvedValue(sites({ period: 'week', range_start_unix_secs: weekStart }));
   fetchDomains.mockResolvedValue(
-    domains({ range_start_unix_secs: weekStart, observed_since_unix_secs: retainedSince }),
+    domains({
+      range_start_unix_secs: weekStart,
+      observed_since_unix_secs: NOW - 60,
+      first_record_unix_secs: weekStart + 2 * 3600,
+    }),
   );
   fireEvent.click(screen.getByRole('button', { name: '当周' }));
   await waitFor(() => expect(fetchDomains).toHaveBeenLastCalledWith('root', 'alice', 'week'));
-  await waitFor(() => expect(within(other).getByText(/覆盖/).textContent).not.toContain('起保留'));
-  expect(within(other).getByText(/覆盖/).textContent).not.toContain('起采集');
+  await waitFor(() => expect(within(other).getByText(/覆盖/).textContent).toMatch(/^最早记录：10-12 02:00/));
 });
 
-it('marks a high sniffing-failure share, a late observation start and missing reporters', async () => {
+it.each([null, undefined])('does not infer a first record when the actual timestamp is %s', async first => {
+  fetchDomains.mockResolvedValue(domains({ first_record_unix_secs: first }));
+  card();
+  const other = await screen.findByRole('region', { name: '其他站点明细' });
+  const note = await within(other).findByText(/覆盖/);
+  expect(note.textContent).not.toMatch(/最早记录|起采集|起保留/);
+});
+
+it('does not show a first record for empty detail rows', async () => {
+  fetchDomains.mockResolvedValue(domains({ rows: [], first_record_unix_secs: null }));
+  card();
+  const other = await screen.findByRole('region', { name: '其他站点明细' });
+  const note = await within(other).findByText(/暂无记录/);
+  expect(note.textContent).not.toMatch(/最早记录|起采集|起保留/);
+});
+
+it('retains midnight history when collection later establishes a new continuous baseline', async () => {
+  const resumed = DAY_START + 105 * 60;
+  fetchSites.mockResolvedValue(
+    sites({
+      observed_since_unix_secs: resumed,
+      rows: [row('youtube', 'YouTube', 200)],
+      series: [
+        {
+          site_id: 'youtube',
+          points: [
+            [DAY_START, 0, 150],
+            [DAY_START + 2 * 3600, 0, 50],
+          ],
+        },
+      ],
+    }),
+  );
+  const { container } = card();
+  const chart = await screen.findByTestId('site-usage-chart');
+  expect(container.querySelector('.site-usage-total')?.textContent).toBe('200B');
+  expect(chart.dataset.start).toBe(String(DAY_START));
+  expect(chart.dataset.observedSince).toBe('');
+  expect(chart.dataset.uncertainBefore).toBe(String(resumed));
+  expect(JSON.parse(chart.dataset.values!)[0]).toBe(150);
+  expect(JSON.parse(chart.dataset.values!)[2]).toBe(50);
+  expect(screen.queryByText(/观测起点/)).toBeNull();
+  expect(screen.getByText('站点采集可能有缺口').title).toContain('此前已有记录继续计入');
+});
+
+it('marks a high sniffing-failure share, uncertain historical coverage and missing reporters', async () => {
   fetchSites.mockResolvedValue(
     sites({
       reporting_nodes: 10,
@@ -279,7 +343,7 @@ it('marks a high sniffing-failure share, a late observation start and missing re
   card();
   const list = await screen.findByRole('region', { name: '各站点流量' });
   expect(within(list).getByText('50.0%', { selector: '.site-usage-pct.warn' })).toBeTruthy();
-  expect(screen.getByText('观测起点 今天 02:22').classList.contains('warn')).toBe(true);
+  expect(screen.getByText('站点采集可能有缺口').classList.contains('warn')).toBe(true);
   const status = screen.getByRole('status');
   expect(status.classList.contains('warn')).toBe(true);
   expect(status.textContent).toBe('10 / 12 台入口已上报');
@@ -334,7 +398,7 @@ it('puts forwarding first in the user ranking and chart and includes it in total
   expect(forwarding.querySelector('.site-brand-icon svg')).toBeTruthy();
   expect(container.querySelector('.site-usage-total')?.textContent).toBe('1000B');
   expect(container.querySelector('.site-usage-label')?.textContent).toContain('1 类站点 · 端口转发');
-  expect(screen.getByText('站点观测起点 今天 02:00')).toBeTruthy();
+  expect(screen.getByText('站点采集可能有缺口')).toBeTruthy();
   const chart = await screen.findByTestId('site-usage-chart');
   expect(chart.dataset.series).toBe('forwarding,github');
   fireEvent.mouseEnter(forwarding.closest('li')!);

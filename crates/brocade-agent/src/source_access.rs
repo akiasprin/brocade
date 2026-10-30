@@ -14,6 +14,22 @@ use std::{
 
 pub(crate) const ENV: &str = "XRAY_BROCADE_SOURCE_ACCESS_FILE";
 const MAX_FILE: usize = MAX_SOURCE_ACCESS_BYTES;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Synchronization {
+    AwaitingXray,
+    Reported,
+}
+
+impl Synchronization {
+    fn connected_interval(self) -> Duration {
+        match self {
+            Self::AwaitingXray => Duration::from_secs(3),
+            Self::Reported => Duration::from_secs(60),
+        }
+    }
+}
+
 pub(crate) fn policy_path(dir: &Path) -> PathBuf {
     dir.join("source-access-policy.json")
 }
@@ -69,17 +85,28 @@ pub(crate) fn spawn(options: Options) -> Result<(), String> {
     }
     thread::Builder::new()
         .name("source-access".into())
-        .spawn(move || loop {
-            if let Err(error) = synchronize(&options, false) {
-                eprintln!("source access synchronization: {error}");
+        .spawn(move || {
+            let mut wake = crate::wake::Cursor::new(
+                brocade_deployment::agent_channel::WakeDomain::SourceAccess,
+            );
+            loop {
+                let interval = match synchronize(&options, false) {
+                    Ok(state) => state.connected_interval(),
+                    Err(error) => {
+                        eprintln!("source access synchronization: {error}");
+                        Duration::from_secs(3)
+                    }
+                };
+                // Xray's receipt cannot trigger a Console wake. Retry pending
+                // confirmation quickly, then return to the ordinary heartbeat.
+                wake.wait_connected(Duration::from_secs(3), interval);
             }
-            thread::sleep(Duration::from_secs(3));
         })
         .map_err(|error| error.to_string())?;
     Ok(())
 }
 
-fn synchronize(options: &Options, force: bool) -> Result<(), String> {
+fn synchronize(options: &Options, force: bool) -> Result<Synchronization, String> {
     let client = HttpClient::new(&options.server)?;
     let previous = saved(&options.state_dir).ok().flatten();
     // A first complete read binds retained state to the current enrollment, even
@@ -92,7 +119,7 @@ fn synchronize(options: &Options, force: bool) -> Result<(), String> {
     let response =
         client.request_timeout("GET", &path, &options.token, None, Duration::from_secs(5))?;
     if response.status == 404 {
-        return Ok(());
+        return Ok(Synchronization::Reported);
     } // Downgrading Console never releases cached bans.
     let desired = match response.status {
         200 => {
@@ -119,7 +146,15 @@ fn synchronize(options: &Options, force: bool) -> Result<(), String> {
             response.status
         ));
     }
-    Ok(())
+    Ok(synchronization(&report))
+}
+
+fn synchronization(report: &SourceAccessObservation) -> Synchronization {
+    if report.supported && report.error.is_some() {
+        Synchronization::AwaitingXray
+    } else {
+        Synchronization::Reported
+    }
 }
 
 #[derive(Deserialize)]
@@ -134,8 +169,13 @@ fn confirmed(dir: &Path, desired: &SourceAccessDesired) -> Result<bool, String> 
     let expected = policy_path(
         &std::fs::canonicalize(dir).map_err(|_| "source access state directory unavailable")?,
     );
-    let config =
-        std::fs::read_to_string(dir.join("xray.json")).map_err(|_| "等待 Xray 接入配置")?;
+    let config = std::fs::read_to_string(dir.join("xray.json")).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            SourceAccessWaitReason::Configuration.message()
+        } else {
+            "无法读取 Xray 接入配置"
+        }
+    })?;
     let config: serde_json::Value =
         serde_json::from_str(&config).map_err(|_| "Xray 接入配置无效")?;
     let split = config["inbounds"].as_array().is_some_and(|inbounds| {
@@ -155,7 +195,7 @@ fn confirmed(dir: &Path, desired: &SourceAccessDesired) -> Result<bool, String> 
             return Err("XHTTP 独立下载入口需要发布新配置以保留真实来源 IP".into());
         }
         if crate::xrayupdate::read_upgrade_runtime(dir)?.is_some() {
-            return Err("XHTTP 独立下载入口交接中，等待旧代退出后确认来源策略".into());
+            return Err(SourceAccessWaitReason::SplitHandoff.message().into());
         }
     }
     let serving = crate::serving_xray_process_in(dir).ok_or("Xray 尚未运行")?;
@@ -198,7 +238,7 @@ fn confirmed(dir: &Path, desired: &SourceAccessDesired) -> Result<bool, String> 
     for (pid, ticks) in processes {
         let same = || crate::process_ref(pid).is_some_and(|p| p.start_ticks == ticks);
         if !same() {
-            return Err("Xray 代际正在切换，等待接入策略确认".into());
+            return Err(SourceAccessWaitReason::GenerationSwitch.message().into());
         }
         let environment = read_bounded(&PathBuf::from(format!("/proc/{pid}/environ")), 64 * 1024)?
             .ok_or("Xray environment unavailable")?;
@@ -214,19 +254,31 @@ fn confirmed(dir: &Path, desired: &SourceAccessDesired) -> Result<bool, String> 
             4096,
         )?
         else {
-            return Err("等待 Xray 应用接入策略".into());
+            return Err(SourceAccessWaitReason::Receipt.message().into());
         };
         let receipt: Receipt =
             serde_json::from_slice(&bytes).map_err(|_| "invalid source access receipt")?;
         if !same() || receipt.pid_start_ticks != ticks || receipt.boot_id != boot.trim() {
             return Err("Xray 接入策略回执身份不一致".into());
         }
-        if !receipt.healthy || receipt.revision != desired.revision {
-            return Err("等待全部 Xray 代际应用接入策略".into());
-        }
+        confirm_receipt(&receipt, desired.revision)?;
     }
     Ok(true)
 }
+
+fn confirm_receipt(receipt: &Receipt, desired_revision: i64) -> Result<(), String> {
+    if !receipt.healthy {
+        return Err("Xray 接入策略状态异常，请检查本地策略和回执".into());
+    }
+    if receipt.revision < desired_revision {
+        return Err(SourceAccessWaitReason::Revision.message().into());
+    }
+    if receipt.revision > desired_revision {
+        return Err("Xray 接入策略回执版本超前".into());
+    }
+    Ok(())
+}
+
 fn observation(dir: &Path, desired: &SourceAccessDesired) -> SourceAccessObservation {
     match confirmed(dir, desired) {
         Ok(true) => SourceAccessObservation {
@@ -266,6 +318,57 @@ pub(crate) fn verify_executable(dir: &Path, executable: &Path) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_access_retries_pending_confirmation_then_returns_to_heartbeat() {
+        let mut report = SourceAccessObservation {
+            revision: 4,
+            supported: true,
+            error: Some(SourceAccessWaitReason::Revision.message().into()),
+        };
+        assert_eq!(
+            synchronization(&report).connected_interval(),
+            Duration::from_secs(3)
+        );
+        report.error = Some("Xray 接入策略状态异常，请检查本地策略和回执".into());
+        assert_eq!(
+            synchronization(&report).connected_interval(),
+            Duration::from_secs(3)
+        );
+        report.error = None;
+        assert_eq!(
+            synchronization(&report).connected_interval(),
+            Duration::from_secs(60)
+        );
+        report.supported = false;
+        report.error = Some("Xray 尚不支持来源封禁，请升级 Agent 和 Xray".into());
+        assert_eq!(
+            synchronization(&report).connected_interval(),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn source_access_receipt_distinguishes_pending_from_failed_or_inconsistent() {
+        let mut receipt = Receipt {
+            revision: 3,
+            healthy: true,
+            pid_start_ticks: 1,
+            boot_id: "test-boot".into(),
+        };
+        let pending = confirm_receipt(&receipt, 4).unwrap_err();
+        assert!(SourceAccessWaitReason::matches_message(&pending));
+        receipt.healthy = false;
+        let failed = confirm_receipt(&receipt, 4).unwrap_err();
+        assert!(!SourceAccessWaitReason::matches_message(&failed));
+        receipt.revision = 4;
+        assert!(confirm_receipt(&receipt, 4).is_err());
+        receipt.healthy = true;
+        assert!(confirm_receipt(&receipt, 4).is_ok());
+        let inconsistent = confirm_receipt(&receipt, 3).unwrap_err();
+        assert!(!SourceAccessWaitReason::matches_message(&inconsistent));
+    }
+
     #[test]
     fn durable_source_access_never_regresses_and_corruption_recovers_from_authority() {
         let dir =

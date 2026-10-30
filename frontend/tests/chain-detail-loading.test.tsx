@@ -81,6 +81,12 @@ const responses: Record<string, unknown> = {
   '/settings': settings,
   '/revisions?limit=50': { current_revision: 7, revisions: [] },
   '/compile/7': compiled,
+  '/apps/app-1/chains/chain-1/unlock-probe/capabilities': {
+    family_mode: 'split',
+    ipv6_available: true,
+    ipv6_reason: null,
+  },
+  '/apps/app-1/chains/chain-1/unlock-probe?family=v4': null,
 };
 const clients: QueryClient[] = [];
 
@@ -328,7 +334,13 @@ describe('链详情统一等待首屏依赖', () => {
     fireEvent.click(view.getByRole('button', { name: /entry入口/ }));
     expect(view.container.querySelector('.rule-editor')).toBeTruthy();
     expect(view.queryByRole('status')).toBeNull();
-    expect(fetcher.mock.calls.map(([path]) => path).sort()).toEqual(['/compile/7', '/revisions?limit=50', '/settings']);
+    expect(fetcher.mock.calls.map(([path]) => path).sort()).toEqual([
+      '/apps/app-1/chains/chain-1/unlock-probe/capabilities',
+      '/apps/app-1/chains/chain-1/unlock-probe?family=v4',
+      '/compile/7',
+      '/revisions?limit=50',
+      '/settings',
+    ]);
   });
 
   it('冷启动时并行请求全部首屏依赖，仍等机器列表就绪才显示', async () => {
@@ -417,7 +429,10 @@ describe('链详情统一等待首屏依赖', () => {
     client.setQueryData(['compile', 7], compiled);
     const view = mount();
     expect(view.queryByRole('status')).toBeNull();
-    expect(fetcher).not.toHaveBeenCalled();
+    expect(fetcher.mock.calls.map(([path]) => path)).toEqual([
+      '/apps/app-1/chains/chain-1/unlock-probe/capabilities',
+      '/apps/app-1/chains/chain-1/unlock-probe?family=v4',
+    ]);
     fireEvent.click(view.getByRole('button', { name: '测试线路' }));
     const input = view.getByRole('textbox', { name: '链名' });
     fireEvent.change(input, { target: { value: '未保存的名称' } });

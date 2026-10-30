@@ -305,7 +305,8 @@ async fn removal_upgrade_from_deployed_history(with_target_strategy: bool) {
     drop(connection);
     sqlx::raw_sql(&conversion).execute(db.pool()).await.unwrap();
     let check = db.store.check_database_upgrade().await.unwrap();
-    assert!(check.compatible && check.pending_versions.is_empty());
+    assert!(check.compatible);
+    assert_eq!(check.pending_versions, [3]);
     assert_eq!(check.installed_versions, [1, 2]);
     let receipts_after: Vec<(i64, serde_json::Value)> = sqlx::query_as(
         "SELECT version,to_jsonb(m)-'checksum' FROM _sqlx_migrations m ORDER BY version",

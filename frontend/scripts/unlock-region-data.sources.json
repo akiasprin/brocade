@@ -1,0 +1,1432 @@
+{
+  "sources": {
+    "network.txt": {
+      "url": "https://www.fastly.com/documentation/guides/getting-started/concepts/using-fastlys-global-pop-network/",
+      "sha256": "77bf1bfe6d1a37c8ff9f5bc9488419e00617ff8a95315b73c8cff0dec647cc56"
+    },
+    "countries.geojson": {
+      "url": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/v5.1.2/geojson/ne_10m_admin_0_countries.geojson",
+      "sha256": "239eec57ac17f100a11e2536cffc56752c318b50ae765b0918ff7aab4ce8f255"
+    },
+    "airports.csv": {
+      "url": "https://davidmegginson.github.io/ourairports-data/airports.csv",
+      "sha256": "27c6500d0a742edece15c5aaf960e08c01df0d4356c5c86255897b5d3749ad3b"
+    },
+    "iso-package.tgz": {
+      "url": "https://registry.npmjs.org/i18n-iso-countries/-/i18n-iso-countries-7.14.0.tgz",
+      "sha256": "bb418ebfb965789fcfbcce7dee59888d901ef64b03601da78b2e224cd6f5825c"
+    }
+  },
+  "fastly_pops": 201,
+  "mapped_pops": 201,
+  "unmapped_pops": [],
+  "evidence": {
+    "ABQ": {
+      "coordinates": [
+        35.11,
+        -106.558
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "ACC": {
+      "coordinates": [
+        5.573,
+        -0.203
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "ADL": {
+      "coordinates": [
+        -34.9285,
+        138.6007
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "ADS": {
+      "coordinates": [
+        32.896828,
+        -97.037997
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "AGC": {
+      "coordinates": [
+        40.453,
+        -80.192
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "AKL": {
+      "coordinates": [
+        -37.008056,
+        174.791667
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "AMS": {
+      "coordinates": [
+        52.308613,
+        4.763889
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "APA": {
+      "coordinates": [
+        39.742,
+        -105.018
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "AZP": {
+      "coordinates": [
+        19.475,
+        -99.194
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BER": {
+      "coordinates": [
+        52.502,
+        13.369
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BFI": {
+      "coordinates": [
+        47.449,
+        -122.309306
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BGY": {
+      "coordinates": [
+        45.477,
+        9.102
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BJC": {
+      "coordinates": [
+        39.742,
+        -105.018
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BKK": {
+      "coordinates": [
+        13.756,
+        100.501
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BMA": {
+      "coordinates": [
+        59.354372,
+        17.94165
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BNA": {
+      "coordinates": [
+        36.196,
+        -86.817
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BNE": {
+      "coordinates": [
+        -27.384167,
+        153.1175
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BOG": {
+      "coordinates": [
+        4.711,
+        -74.072
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BOM": {
+      "coordinates": [
+        18.975,
+        72.825833
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BOS": {
+      "coordinates": [
+        42.364347,
+        -71.005181
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BQH": {
+      "coordinates": [
+        51.238,
+        -0.575
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BRU": {
+      "coordinates": [
+        50.871,
+        4.476
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BSB": {
+      "coordinates": [
+        -15.7087,
+        -47.9144
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BTF": {
+      "coordinates": [
+        40.724,
+        -111.855
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BUR": {
+      "coordinates": [
+        34.198312,
+        -118.357404
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "BWI": {
+      "coordinates": [
+        39.29,
+        -76.612
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "CCU": {
+      "coordinates": [
+        22.588,
+        88.393
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "CHC": {
+      "coordinates": [
+        -43.532,
+        172.636
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "CHI": {
+      "coordinates": [
+        41.863,
+        -87.641
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "CMH": {
+      "coordinates": [
+        40.116,
+        -83.002
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "CPH": {
+      "coordinates": [
+        55.728081,
+        12.37752
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "CPT": {
+      "coordinates": [
+        -33.97,
+        18.464
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "CRG": {
+      "coordinates": [
+        30.332,
+        -81.656
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "CWB": {
+      "coordinates": [
+        -25.459,
+        -49.26
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "CYW": {
+      "coordinates": [
+        20.613,
+        -100.396
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "DCA": {
+      "coordinates": [
+        38.944533,
+        -77.455811
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "DEL": {
+      "coordinates": [
+        28.506912,
+        77.378557
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "DEN": {
+      "coordinates": [
+        39.861656,
+        -104.673178
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "DFW": {
+      "coordinates": [
+        32.896828,
+        -97.037997
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "DTW": {
+      "coordinates": [
+        42.448,
+        -83.263
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "DUB": {
+      "coordinates": [
+        53.35,
+        -6.26
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "DUS": {
+      "coordinates": [
+        51.188,
+        6.867
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "DWH": {
+      "coordinates": [
+        30.144,
+        -95.4732
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "DXB": {
+      "coordinates": [
+        25.032,
+        55.19
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "EWR": {
+      "coordinates": [
+        40.736844,
+        -74.173402
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "EZE": {
+      "coordinates": [
+        -34.815,
+        -58.5348
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "FCO": {
+      "coordinates": [
+        41.89891,
+        12.51206
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "FJR": {
+      "coordinates": [
+        25.112225,
+        56.323964
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "FLE": {
+      "coordinates": [
+        37.602,
+        -77.49
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "FOR": {
+      "coordinates": [
+        -3.735,
+        -38.458
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "FRA": {
+      "coordinates": [
+        50.026421,
+        8.543125
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "FXE": {
+      "coordinates": [
+        25.945,
+        -80.205
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "GIG": {
+      "coordinates": [
+        -22.81341,
+        -43.249423
+      ],
+      "method": "ourairports-within-5km-unanimous-country"
+    },
+    "GRU": {
+      "coordinates": [
+        -23.432075,
+        -46.469511
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "HDO": {
+      "coordinates": [
+        28.631,
+        77.069
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "HEL": {
+      "coordinates": [
+        60.1699,
+        24.9384
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "HHR": {
+      "coordinates": [
+        33.942536,
+        -118.408075
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "HKG": {
+      "coordinates": [
+        22.308919,
+        113.914603
+      ],
+      "method": "ourairports-within-5km-unanimous-country"
+    },
+    "HMP": {
+      "coordinates": [
+        33.749,
+        -84.388
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "HNL": {
+      "coordinates": [
+        21.364,
+        -157.869
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "HYD": {
+      "coordinates": [
+        17.442,
+        78.378
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "IAD": {
+      "coordinates": [
+        38.944533,
+        -77.455811
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "IAH": {
+      "coordinates": [
+        29.99022,
+        -95.336783
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "ICN": {
+      "coordinates": [
+        36.38,
+        128.124
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "ITM": {
+      "coordinates": [
+        34.785528,
+        135.438222
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "IXB": {
+      "coordinates": [
+        26.727,
+        88.395
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "IXD": {
+      "coordinates": [
+        25.453,
+        81.835
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "IXM": {
+      "coordinates": [
+        9.922,
+        78.094
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "IXR": {
+      "coordinates": [
+        23.833,
+        86.477
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "IXZ": {
+      "coordinates": [
+        11.608,
+        92.705
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "JAX": {
+      "coordinates": [
+        30.3322,
+        -81.6557
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "JCE": {
+      "coordinates": [
+        37.775,
+        -122.419
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "JGA": {
+      "coordinates": [
+        22.355,
+        69.845
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "JNB": {
+      "coordinates": [
+        -26.13778,
+        28.19756
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "KNU": {
+      "coordinates": [
+        26.401,
+        80.413
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "KTU": {
+      "coordinates": [
+        25.199,
+        75.834
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "KUL": {
+      "coordinates": [
+        3.149,
+        101.706
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "LAX": {
+      "coordinates": [
+        33.942536,
+        -118.408075
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "LCY": {
+      "coordinates": [
+        51.505278,
+        0.055278
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "LGA": {
+      "coordinates": [
+        40.639751,
+        -73.778925
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "LGW": {
+      "coordinates": [
+        51.238,
+        -0.575
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "LHR": {
+      "coordinates": [
+        51.4775,
+        -0.461389
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "LIM": {
+      "coordinates": [
+        -12.088902,
+        -76.973405
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "LIN": {
+      "coordinates": [
+        45.47,
+        9.036
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "LIS": {
+      "coordinates": [
+        38.788,
+        -9.123
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "LON": {
+      "coordinates": [
+        51.499,
+        -0.011
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "LTN": {
+      "coordinates": [
+        51.581,
+        -0.243
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MAA": {
+      "coordinates": [
+        12.9941,
+        80.1709
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MAD": {
+      "coordinates": [
+        40.439323,
+        -3.621211
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MAN": {
+      "coordinates": [
+        53.4808,
+        -2.2426
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MCC": {
+      "coordinates": [
+        38.693,
+        -121.345
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MCI": {
+      "coordinates": [
+        39.101,
+        -94.581
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MEL": {
+      "coordinates": [
+        -37.673333,
+        144.843333
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MEM": {
+      "coordinates": [
+        35.051,
+        -89.882
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MFE": {
+      "coordinates": [
+        26.199,
+        -98.232
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MIA": {
+      "coordinates": [
+        25.79325,
+        -80.290556
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MIC": {
+      "coordinates": [
+        44.978,
+        -93.265
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MNL": {
+      "coordinates": [
+        14.566,
+        121.022
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MQY": {
+      "coordinates": [
+        36.196,
+        -86.817
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MRS": {
+      "coordinates": [
+        43.311,
+        5.373
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MSP": {
+      "coordinates": [
+        44.971401,
+        -93.254501
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MUC": {
+      "coordinates": [
+        48.143,
+        11.555
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "MXP": {
+      "coordinates": [
+        45.4642,
+        9.19
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "NMI": {
+      "coordinates": [
+        19.124,
+        73.005
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "NRT": {
+      "coordinates": [
+        35.617,
+        139.748
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "NYC": {
+      "coordinates": [
+        40.778,
+        -74.073
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "OLV": {
+      "coordinates": [
+        35.051,
+        -89.882
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "ORD": {
+      "coordinates": [
+        41.863,
+        -87.641
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "OSL": {
+      "coordinates": [
+        59.922,
+        10.809
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "OWD": {
+      "coordinates": [
+        42.356,
+        -71.057
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "PAE": {
+      "coordinates": [
+        47.498,
+        -122.29
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "PAO": {
+      "coordinates": [
+        37.454965,
+        -122.110783
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "PAR": {
+      "coordinates": [
+        48.856654,
+        2.38532
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "PDK": {
+      "coordinates": [
+        33.876819,
+        -84.302921
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "PDX": {
+      "coordinates": [
+        45.552,
+        -122.914
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "PER": {
+      "coordinates": [
+        -31.940278,
+        115.966944
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "PHX": {
+      "coordinates": [
+        33.396,
+        -111.97
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "PIT": {
+      "coordinates": [
+        40.453,
+        -80.192
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "PNQ": {
+      "coordinates": [
+        18.59,
+        73.727
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "PPM": {
+      "coordinates": [
+        25.945,
+        -80.205
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "PUT": {
+      "coordinates": [
+        14.637,
+        77.565
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "PWT": {
+      "coordinates": [
+        47.606,
+        -122.332
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAA": {
+      "coordinates": [
+        30.271,
+        76.853
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAB": {
+      "coordinates": [
+        20.296,
+        85.825
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAC": {
+      "coordinates": [
+        22.58,
+        88.297
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAD": {
+      "coordinates": [
+        28.984,
+        77.706
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAE": {
+      "coordinates": [
+        17.351,
+        78.548
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAF": {
+      "coordinates": [
+        23.296,
+        77.354
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAG": {
+      "coordinates": [
+        28.684,
+        77.155
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAH": {
+      "coordinates": [
+        13.033,
+        77.559
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAI": {
+      "coordinates": [
+        19.061,
+        72.847
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAJ": {
+      "coordinates": [
+        24.08,
+        88.264
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAK": {
+      "coordinates": [
+        21.078,
+        79.152
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAL": {
+      "coordinates": [
+        30.71,
+        76.703
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAM": {
+      "coordinates": [
+        25.526,
+        85.276
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAN": {
+      "coordinates": [
+        9.999,
+        76.317
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAO": {
+      "coordinates": [
+        19.076,
+        72.878
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAP": {
+      "coordinates": [
+        13.022,
+        80.203
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAR": {
+      "coordinates": [
+        22.573,
+        88.433
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAS": {
+      "coordinates": [
+        27.236,
+        77.875
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAU": {
+      "coordinates": [
+        23.092,
+        72.673
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAV": {
+      "coordinates": [
+        30.364,
+        76.177
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAW": {
+      "coordinates": [
+        23.709,
+        86.964
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAX": {
+      "coordinates": [
+        26.11,
+        91.71
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAY": {
+      "coordinates": [
+        26.997,
+        75.785
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QAZ": {
+      "coordinates": [
+        26.919,
+        80.964
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QBA": {
+      "coordinates": [
+        30.936,
+        75.835
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QBB": {
+      "coordinates": [
+        21.393,
+        79.327
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QBD": {
+      "coordinates": [
+        28.615,
+        77.385
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QBE": {
+      "coordinates": [
+        25.607,
+        85.066
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QBF": {
+      "coordinates": [
+        31.098,
+        77.151
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QBG": {
+      "coordinates": [
+        34.071,
+        74.846
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QBI": {
+      "coordinates": [
+        16.506,
+        80.648
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QBJ": {
+      "coordinates": [
+        17.969,
+        79.593
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QBK": {
+      "coordinates": [
+        12.983,
+        77.751
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QBL": {
+      "coordinates": [
+        23.183,
+        77.456
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QBM": {
+      "coordinates": [
+        20.261,
+        85.786
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QBN": {
+      "coordinates": [
+        17.437,
+        78.376
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QBO": {
+      "coordinates": [
+        9.951,
+        76.335
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QPG": {
+      "coordinates": [
+        1.350189,
+        103.994433
+      ],
+      "method": "ourairports-within-5km-unanimous-country"
+    },
+    "QQP": {
+      "coordinates": [
+        51.513,
+        -0.099
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "QRO": {
+      "coordinates": [
+        20.566,
+        -100.258
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "RFD": {
+      "coordinates": [
+        41.863,
+        -87.641
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "RHV": {
+      "coordinates": [
+        37.383,
+        -121.986
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "RIC": {
+      "coordinates": [
+        37.602,
+        -77.49
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "RPR": {
+      "coordinates": [
+        21.228,
+        81.598
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "RTM": {
+      "coordinates": [
+        52.357,
+        4.951
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "RUH": {
+      "coordinates": [
+        24.717,
+        46.643
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "SAF": {
+      "coordinates": [
+        35.11034,
+        -106.55762
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "SCL": {
+      "coordinates": [
+        -33.3936,
+        -70.7935
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "SHL": {
+      "coordinates": [
+        25.578,
+        91.876
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "SIN": {
+      "coordinates": [
+        1.350189,
+        103.994433
+      ],
+      "method": "ourairports-within-5km-unanimous-country"
+    },
+    "SJC": {
+      "coordinates": [
+        37.3626,
+        -121.929022
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "SMF": {
+      "coordinates": [
+        38.693,
+        -121.345
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "SOF": {
+      "coordinates": [
+        42.703,
+        23.306
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "SRQ": {
+      "coordinates": [
+        26.142,
+        -81.795
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "SSE": {
+      "coordinates": [
+        17.66,
+        75.906
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "STL": {
+      "coordinates": [
+        38.629,
+        -90.197
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "STP": {
+      "coordinates": [
+        45.019,
+        -93.178
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "STV": {
+      "coordinates": [
+        21.266,
+        72.952
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "SXV": {
+      "coordinates": [
+        11.642,
+        78.132
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "SYD": {
+      "coordinates": [
+        -33.946111,
+        151.177222
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "TLH": {
+      "coordinates": [
+        30.438,
+        -84.281
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "TOJ": {
+      "coordinates": [
+        40.433899,
+        -3.62408
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "TSS": {
+      "coordinates": [
+        40.707,
+        -74.029
+      ],
+      "method": "ourairports-within-5km-unanimous-country"
+    },
+    "TTD": {
+      "coordinates": [
+        45.487,
+        -122.804
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "TTN": {
+      "coordinates": [
+        39.953,
+        -75.165
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "UGN": {
+      "coordinates": [
+        41.878,
+        -87.629
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "VIE": {
+      "coordinates": [
+        48.269,
+        16.41
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "VNC": {
+      "coordinates": [
+        27.1,
+        -82.371
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "VNS": {
+      "coordinates": [
+        24.652,
+        84.32
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "VTZ": {
+      "coordinates": [
+        17.749,
+        83.267
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "WIE": {
+      "coordinates": [
+        50.11975,
+        8.738472
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "WLG": {
+      "coordinates": [
+        -41.327221,
+        174.805278
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "WSI": {
+      "coordinates": [
+        -33.919,
+        151.189
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "WVI": {
+      "coordinates": [
+        37.242,
+        -121.782
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "YIP": {
+      "coordinates": [
+        42.331,
+        -83.045
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "YUL": {
+      "coordinates": [
+        45.497497,
+        -73.570959
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "YVR": {
+      "coordinates": [
+        49.1967,
+        -123.1815
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "YYC": {
+      "coordinates": [
+        51.047,
+        -114.08
+      ],
+      "method": "natural-earth-polygon"
+    },
+    "YYZ": {
+      "coordinates": [
+        43.677223,
+        -79.630556
+      ],
+      "method": "natural-earth-polygon"
+    }
+  }
+}

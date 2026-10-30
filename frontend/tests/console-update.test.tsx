@@ -25,6 +25,7 @@ function DirtySurface({ exposeClear }: { exposeClear: (clear: () => void) => voi
 afterEach(() => {
   cleanup();
   document.querySelectorAll('meta[name="brocade-ui-version"]').forEach(marker => marker.remove());
+  sessionStorage.clear();
   vi.restoreAllMocks();
 });
 
@@ -88,8 +89,8 @@ it('recovers from a removed lazy chunk through the same reload status', async ()
   const preloadError = new Event('vite:preloadError', { cancelable: true });
   act(() => window.dispatchEvent(preloadError));
 
-  expect(preloadError.defaultPrevented).toBe(true);
-  expect(screen.getByRole('status').textContent).toContain('网站版本已更新，加载新版中…');
+  expect(preloadError.defaultPrevented).toBe(false);
+  expect(screen.getByRole('status').textContent).toContain('界面加载失败，重新加载中…');
   await waitFor(() => expect(reloadPage).toHaveBeenCalledOnce());
 });
 
@@ -103,4 +104,42 @@ it('does not compare a Vite development page with the proxied production version
 
   await act(async () => undefined);
   expect(readLatestVersion).not.toHaveBeenCalled();
+});
+
+it('keeps a readable failure instead of looping when the same module fails after reload', async () => {
+  sessionStorage.setItem('brocade.module-reload-at', String(Date.now()));
+  const reloadPage = vi.fn();
+  render(
+    <TestRoot>
+      <ConsoleUpdate reloadDelayMs={0} reloadPage={reloadPage} />
+    </TestRoot>,
+  );
+  act(() => window.dispatchEvent(new Event('vite:preloadError')));
+  expect(screen.getByRole('status').textContent).toContain('界面仍无法加载');
+  expect(reloadPage).not.toHaveBeenCalled();
+  act(() => window.dispatchEvent(new Event('brocade:module-reload')));
+  await waitFor(() => expect(reloadPage).toHaveBeenCalledOnce());
+});
+
+it('refreshes only failed same-origin module preloads before replacing the document', async () => {
+  const fetcher = vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({}));
+  const reloadPage = vi.fn();
+  render(
+    <TestRoot>
+      <ConsoleUpdate reloadDelayMs={0} reloadPage={reloadPage} />
+    </TestRoot>,
+  );
+  const link = document.createElement('link');
+  link.rel = 'modulepreload';
+  link.href = '/assets/failed-chunk.js';
+  document.body.append(link);
+  fireEvent.error(link);
+  act(() => window.dispatchEvent(new Event('vite:preloadError')));
+  await waitFor(() => expect(reloadPage).toHaveBeenCalledOnce());
+  expect(fetcher).toHaveBeenCalledOnce();
+  expect(fetcher).toHaveBeenCalledWith(
+    link.href,
+    expect.objectContaining({ cache: 'reload', signal: expect.any(AbortSignal) }),
+  );
+  link.remove();
 });

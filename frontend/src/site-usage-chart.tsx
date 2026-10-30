@@ -7,7 +7,13 @@ import { palette } from './forge/palette';
 import { theme } from './forge/theme';
 import { echartsEntranceAnimation, useEchartsViewportEntry } from './ui/echarts-motion';
 import { OBSERVE_TOOLTIP_CLASS } from './ui/observe-brush';
-import { observeAxisLine, observeAxisTick, observeValueAxis } from './ui/observe-chart';
+import {
+  observeAxisLine,
+  observeAxisTick,
+  observeTimeInterval,
+  observeValueAxis,
+  observeWallClockTicks,
+} from './ui/observe-chart';
 import { bytes } from './ui/format';
 import type { SiteUsagePeriod } from './api';
 
@@ -35,7 +41,10 @@ const WEEK = ['日', '一', '二', '三', '四', '五', '六'];
 const two = (value: number) => String(value).padStart(2, '0');
 const wall = (unixSecs: number) => new Date((unixSecs + ZONE_SECS) * 1000);
 const hm = (unixSecs: number) => `${two(wall(unixSecs).getUTCHours())}:${two(wall(unixSecs).getUTCMinutes())}`;
-const md = (unixSecs: number) => `${two(wall(unixSecs).getUTCMonth() + 1)}-${two(wall(unixSecs).getUTCDate())}`;
+const md = (unixSecs: number, withYear = false) => {
+  const date = wall(unixSecs);
+  return `${withYear ? `${date.getUTCFullYear()}-` : ''}${two(date.getUTCMonth() + 1)}-${two(date.getUTCDate())}`;
+};
 const weekday = (unixSecs: number) => `周${WEEK[wall(unixSecs).getUTCDay()]}`;
 
 /** Bucket indexes that carry an axis label: every six hours, every day, the 1st and every fifth day. */
@@ -92,8 +101,10 @@ export default function SiteUsageChart({
   bucketSecs,
   nowUnixSecs,
   observedSinceUnixSecs,
+  uncertainBeforeUnixSecs = null,
   series,
   focusKey,
+  customRange = false,
 }: {
   period: SiteUsagePeriod;
   startUnixSecs: number;
@@ -101,10 +112,14 @@ export default function SiteUsageChart({
   nowUnixSecs: number;
   /** Later than the period start when observation began inside the period. */
   observedSinceUnixSecs: number | null;
+  /** A recent continuous baseline says nothing about where earlier gaps occurred. */
+  uncertainBeforeUnixSecs?: number | null;
   /** Bottom to top of the stack. */
   series: SiteUsageChartSeries[];
   /** The series the list beside the chart points at; the others fade. */
   focusKey: string | null;
+  /** A fixed range uses its actual bounds and cadence, independently of the period query key. */
+  customRange?: boolean;
 }) {
   const elRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
@@ -140,10 +155,12 @@ export default function SiteUsageChart({
     // An identical notMerge write would cancel the entrance sweep and drop a hovered tooltip.
     const sig = JSON.stringify([
       period,
+      customRange,
       startUnixSecs,
       bucketSecs,
       nowUnixSecs,
       observedSinceUnixSecs,
+      uncertainBeforeUnixSecs,
       series,
       themeName,
       paletteKey,
@@ -163,7 +180,16 @@ export default function SiteUsageChart({
       series.reduce((sum, item) => sum + (item.values[index] ?? 0), 0),
     );
     const valueAxis = bytesAxis(Math.max(...totals, 0));
-    const marks = labelled(period, startUnixSecs, bucketSecs, count);
+    const endUnixSecs = startUnixSecs + count * bucketSecs;
+    const tickStep = Math.max(bucketSecs * 1000, observeTimeInterval(count * bucketSecs * 1000));
+    const marks = customRange
+      ? observeWallClockTicks(startUnixSecs * 1000, endUnixSecs * 1000, tickStep, ZONE_SECS / 60).map(
+          value => (value / 1000 - startUnixSecs) / bucketSecs,
+        )
+      : labelled(period, startUnixSecs, bucketSecs, count);
+    const withYear = wall(startUnixSecs).getUTCFullYear() !== wall(endUnixSecs).getUTCFullYear();
+    const withDate = withYear || md(startUnixSecs) !== md(endUnixSecs);
+    const customClock = (at: number) => `${withDate ? `${md(at, withYear)} ` : ''}${hm(at)}`;
     const nowAt = (nowUnixSecs - startUnixSecs) / bucketSecs;
     const unobservedTo =
       observedSinceUnixSecs !== null ? Math.min(count, (observedSinceUnixSecs - startUnixSecs) / bucketSecs) : 0;
@@ -182,7 +208,7 @@ export default function SiteUsageChart({
       ...(index === 0
         ? {
             markLine:
-              nowAt < count
+              !customRange && nowAt < count
                 ? {
                     silent: true,
                     symbol: 'none',
@@ -230,8 +256,9 @@ export default function SiteUsageChart({
             if (from >= nowUnixSecs) return '';
             const to = Math.min(from + bucketSecs, nowUnixSecs);
             const until = to === nowUnixSecs ? '现在' : hm(to);
-            const head =
-              period === 'month'
+            const head = customRange
+              ? `${customClock(from)} – ${customClock(to)}`
+              : period === 'month'
                 ? `${md(from)} ${weekday(from)}${to === nowUnixSecs ? ' · 截至现在' : ''}`
                 : `${period === 'week' ? `${md(from)} ${weekday(from)} ` : ''}${hm(from)} – ${until}`;
             const rows = [...list]
@@ -247,7 +274,12 @@ export default function SiteUsageChart({
                   `<div style="display:flex;gap:10px;justify-content:space-between"><span><i style="display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:6px;background:${colors[item.seriesIndex]}"></i>${series[item.seriesIndex].name}</span><b style="color:${ink};font-weight:500">${bytes(item.value[1] ?? 0)}</b></div>`,
               )
               .join('');
-            const empty = bucket + 1 <= unobservedTo ? '未观测' : '无流量';
+            const empty =
+              bucket + 1 <= unobservedTo
+                ? '未观测'
+                : uncertainBeforeUnixSecs !== null && startUnixSecs + bucket * bucketSecs < uncertainBeforeUnixSecs
+                  ? '无记录 · 采集可能不完整'
+                  : '无流量';
             return `<div style="color:${ink4};font-size:9.5px;margin-bottom:4px">${head}</div>${rows || empty}`;
           },
         },
@@ -264,7 +296,13 @@ export default function SiteUsageChart({
             margin: 8,
             hideOverlap: true,
             customValues: marks,
-            formatter: (value: number) => labelText(period, startUnixSecs + Math.round(value) * bucketSecs),
+            formatter: (value: number) => {
+              const at = startUnixSecs + Math.round(value) * bucketSecs;
+              if (!customRange) return labelText(period, at);
+              if (!withDate) return hm(at);
+              const date = md(at, withYear);
+              return tickStep >= 86_400_000 ? date : `${date}\n${hm(at)}`;
+            },
           },
           axisPointer: { snap: true },
         },
@@ -303,10 +341,12 @@ export default function SiteUsageChart({
     lastSig.current = sig;
   }, [
     period,
+    customRange,
     startUnixSecs,
     bucketSecs,
     nowUnixSecs,
     observedSinceUnixSecs,
+    uncertainBeforeUnixSecs,
     series,
     themeName,
     paletteKey,

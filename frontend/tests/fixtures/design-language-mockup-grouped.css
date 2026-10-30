@@ -1,0 +1,490 @@
+/* ═══ C · 分组卡片（iPadOS 与「健康」）═══
+   规则：
+   1. 顶部是浮动的胶囊页签栏（iPadOS 18），只有文字；返回用左上角的「‹ 上一级」，不画面包屑。
+   2. 每页一个大标题（34px 粗体）。内容是分组灰底上的白卡（暗色为纯黑底上的 #1c1c1e 卡），圆角 14，无边框无投影。
+   3. 卡片抬头沿用「健康」摘要卡：左上角是强调色的分类名，右上角是灰色时间与 ›；读数用圆体粗字，单位小号灰字。
+   4. 控件是 iOS 的尺寸：分段控件灰槽白滑块，按钮是强调色淡染底 + 强调色字，主按钮实底；点按目标不低于 34px。
+   5. 字号整体放大一档，信息密度低于 A、B。 */
+
+:root[data-lang='grouped']:not([data-theme='light']) {
+  --gp-ground: #000000;
+  --gp-card: #1c1c1e;
+  --gp-card-2: #2c2c2e;
+  --gp-sep: rgba(84, 84, 88, 0.6);
+  --gp-fill: rgba(118, 118, 128, 0.24);
+  --gp-fill-2: rgba(118, 118, 128, 0.18);
+  --gp-thumb: #636366;
+  --gp-thumb-shadow: 0 3px 8px rgba(0, 0, 0, 0.28), 0 3px 1px rgba(0, 0, 0, 0.1);
+  --gp-bar: rgba(22, 22, 24, 0.72);
+  --gp-tint: color-mix(in srgb, var(--action) 20%, transparent);
+  --ground: var(--gp-ground);
+  --sheet: var(--gp-card);
+  --card: var(--gp-card);
+  --sheet-shadow: none;
+  --float: rgba(37, 37, 39, 0.84);
+  --float-sheet: rgba(37, 37, 39, 0.84);
+}
+:root[data-lang='grouped'][data-theme='light'] {
+  --gp-ground: #f2f2f7;
+  --gp-card: #ffffff;
+  --gp-card-2: #f2f2f7;
+  --gp-sep: rgba(60, 60, 67, 0.16);
+  --gp-fill: rgba(118, 118, 128, 0.12);
+  --gp-fill-2: rgba(118, 118, 128, 0.08);
+  --gp-thumb: #ffffff;
+  --gp-thumb-shadow: 0 3px 8px rgba(0, 0, 0, 0.12), 0 3px 1px rgba(0, 0, 0, 0.04);
+  --gp-bar: rgba(242, 242, 247, 0.78);
+  --gp-tint: color-mix(in srgb, var(--action) 12%, transparent);
+  --ground: var(--gp-ground);
+  --sheet: var(--gp-card);
+  --card: var(--gp-card);
+  --sheet-shadow: none;
+  --float: rgba(250, 250, 252, 0.86);
+  --float-sheet: rgba(250, 250, 252, 0.86);
+}
+:root[data-lang='grouped'] {
+  --r-card: 14px;
+  --r-ctl: 10px;
+  --ctl-h: 34px;
+}
+
+:root[data-lang='grouped'] body,
+:root[data-lang='grouped'] #stage,
+:root[data-lang='grouped'] body:has(.forge)::before {
+  background: var(--gp-ground);
+}
+
+/* ── 外壳：顶部浮动页签栏 ── */
+:root[data-lang='grouped'] .forge:not(.narrow) .fg-top {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  height: 66px;
+  padding: 0 28px 0 30px;
+  border: 0;
+  background: var(--gp-bar);
+  -webkit-backdrop-filter: blur(24px) saturate(1.8);
+  backdrop-filter: blur(24px) saturate(1.8);
+}
+:root[data-lang='grouped'] .forge:not(.narrow) .fg-top > .fg-vr {
+  display: none;
+}
+:root[data-lang='grouped'] .fg-brand {
+  color: var(--ink);
+  font: 700 19px/1 var(--display);
+  letter-spacing: -0.01em;
+}
+:root[data-lang='grouped'] .forge:not(.narrow) .fg-top > .fg-nav {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  gap: 0;
+  padding: 4px;
+  overflow: visible;
+  border-radius: 999px;
+  background: var(--gp-fill);
+  transform: translate(-50%, -50%);
+}
+:root[data-lang='grouped'] .forge:not(.narrow) .fg-nv {
+  height: 34px;
+  padding: 0 20px;
+  border-radius: 999px;
+  color: var(--ink);
+  font: 600 15px var(--sans);
+}
+:root[data-lang='grouped'] .forge:not(.narrow) .fg-nv-ic {
+  display: none;
+}
+:root[data-lang='grouped'] .fg-nv[aria-current='true'] {
+  background: var(--gp-thumb);
+  box-shadow: var(--gp-thumb-shadow);
+  color: var(--action);
+  font-weight: 600;
+}
+:root[data-lang='grouped'] .fg-nv[aria-current='true'] .fg-badge {
+  box-shadow: none;
+}
+:root[data-lang='grouped'] .fg-tgl {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: var(--gp-fill-2);
+  color: var(--action);
+}
+:root[data-lang='grouped'] .fg-tgl-ic svg {
+  width: 18px;
+  height: 18px;
+}
+:root[data-lang='grouped'] .fg-tgl .fg-badge {
+  top: -2px;
+  right: -2px;
+  box-shadow: 0 0 0 2px var(--gp-ground);
+}
+:root[data-lang='grouped'] .fg-who {
+  height: 38px;
+  padding: 0 4px;
+  gap: 8px;
+  border-radius: 999px;
+  color: var(--ink);
+  font: 600 15px var(--sans);
+}
+:root[data-lang='grouped'] .fg-who-plate {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: linear-gradient(180deg, #a1a1a6, #7c7c82);
+  color: #ffffff;
+  font: 600 15px var(--rounded);
+}
+:root[data-lang='grouped'] .fg-who-caret {
+  display: none;
+}
+
+/* ── 返回行：只留上一级，带 ‹；右侧是实时读数 ── */
+:root[data-lang='grouped'] .forge:not(.narrow) .fg-crumb {
+  height: 40px;
+  padding: 0 32px;
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  font-size: 17px;
+}
+:root[data-lang='grouped'] .fg-crumb :is(.cur, .sep, .fg-crumb-link) {
+  display: none;
+}
+:root[data-lang='grouped'] .fg-crumb .fg-crumb-link:has(+ .sep + .cur) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: -6px;
+  color: var(--action);
+  font-size: 17px;
+}
+:root[data-lang='grouped'] .fg-crumb .fg-crumb-link:has(+ .sep + .cur)::before {
+  content: '‹';
+  font-size: 32px;
+  font-weight: 300;
+  line-height: 17px;
+  transform: translateY(-2px);
+}
+:root[data-lang='grouped'] .fg-crumb-link:hover {
+  text-decoration: none;
+  opacity: 0.7;
+}
+:root[data-lang='grouped'] .fg-crumb-right {
+  color: var(--ink-3);
+  font-size: 13px;
+}
+
+/* ── 内容 ── */
+:root[data-lang='grouped'] :is(.cardpage, .nd-sheet) {
+  margin: 4px 32px 48px;
+}
+/* 列表页：容器退掉，标题成为大标题，操作在大标题右侧 */
+:root[data-lang='grouped'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) {
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+:root[data-lang='grouped'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header {
+  min-height: 48px;
+  margin: 0 0 18px;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+:root[data-lang='grouped'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header h4 {
+  color: var(--ink);
+  font: 700 34px/1.1 var(--display);
+  letter-spacing: -0.02em;
+  text-transform: none;
+}
+:root[data-lang='grouped'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header .list-ico {
+  display: none;
+}
+:root[data-lang='grouped'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header :is(.btn, .segsw) {
+  height: 34px;
+  min-height: 34px;
+}
+
+/* 白卡 */
+:root[data-lang='grouped'] .fg-view :is(.panel, .chart-card, .kpi, .ncard, .chain-card) {
+  border: 0;
+  border-radius: 14px;
+  background: var(--gp-card);
+  box-shadow: none;
+}
+:root[data-lang='grouped'] .ncards {
+  gap: 16px;
+}
+:root[data-lang='grouped'] .ncard {
+  padding: 16px 16px 14px;
+}
+@media (hover: hover) and (pointer: fine) {
+  :root[data-lang='grouped'] :is(.ncard, .chain-card):hover {
+    background: color-mix(in srgb, var(--gp-card), var(--ink) 3%);
+  }
+}
+/* 「健康」摘要卡的抬头：分类名取强调色，右上角时间带 › */
+:root[data-lang='grouped'] .nc-head b,
+:root[data-lang='grouped'] .chain-card-title {
+  color: var(--action);
+  font: 600 16px var(--sans);
+}
+:root[data-lang='grouped'] .nc-ago {
+  color: var(--ink-3);
+  font-size: 13px;
+}
+:root[data-lang='grouped'] .nc-ago::after {
+  content: '  ›';
+  color: var(--ink-4);
+  font-size: 15px;
+  white-space: pre;
+}
+:root[data-lang='grouped'] .lst-sum {
+  font: 700 28px var(--rounded);
+  letter-spacing: 0;
+}
+:root[data-lang='grouped'] .lst-sum small {
+  color: var(--ink-3);
+  font: 600 13px var(--rounded);
+}
+:root[data-lang='grouped'] .nc-dock .btn {
+  height: 30px;
+  min-height: 30px;
+}
+:root[data-lang='grouped'] .chain-card-grid {
+  gap: 16px;
+}
+/* 分组标题：卡组上方的 22px 粗体，同「健康」的「收藏」「亮点」 */
+:root[data-lang='grouped'] .chain-section-name {
+  font: 700 22px var(--display);
+  letter-spacing: -0.01em;
+}
+:root[data-lang='grouped'] .chain-card-latency b,
+:root[data-lang='grouped'] .chain-card-latency {
+  font-family: var(--rounded);
+}
+:root[data-lang='grouped'] .cp-hop {
+  border-radius: 8px;
+}
+
+/* 详情页：页头是大标题区，正文是一列白卡 */
+:root[data-lang='grouped'] .nd-sheet > .nd-paper {
+  --nd-paper-surface: var(--gp-card);
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+:root[data-lang='grouped'] .nd-sheet > .nd-paper > .nd-page-head {
+  min-height: 64px;
+  margin: 0 0 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+:root[data-lang='grouped'] .nd-sheet > .nd-paper > .nd-page-head .nd-id {
+  font: 700 30px/1.15 var(--display);
+  letter-spacing: -0.02em;
+}
+:root[data-lang='grouped'] .nd-ident-meta {
+  font-size: 15px;
+}
+:root[data-lang='grouped'] .nd-sheet.nd-node-detail > .nd-paper > .nd-paper-body {
+  padding: 0;
+}
+:root[data-lang='grouped'] .nd-sheet:not(.nd-node-detail) > .nd-paper > .nd-paper-body {
+  overflow: hidden;
+  border-radius: 14px;
+  background: var(--gp-card);
+}
+:root[data-lang='grouped'] .nd-sheet .nd-tabs::before {
+  display: none;
+}
+:root[data-lang='grouped'] .nd-tabs {
+  align-self: center;
+  margin-left: 18px;
+}
+
+/* 用户详情：页头是大标题区，下面一列白卡 */
+:root[data-lang='grouped'] .fg-view .panel.user-split-detail {
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+:root[data-lang='grouped'] .user-dhead {
+  margin: 0 0 6px;
+  border: 0;
+  background: none;
+}
+:root[data-lang='grouped'] .user-dhead .dname b {
+  font: 700 28px/1.15 var(--display);
+  letter-spacing: -0.02em;
+}
+:root[data-lang='grouped'] .user-split-roster {
+  border: 0;
+  border-radius: 14px;
+  background: var(--gp-card);
+}
+
+/* 分段控件：灰槽白滑块 */
+:root[data-lang='grouped'] :is(.nd-tabs-seg, .segsw) {
+  height: auto;
+  min-height: 34px;
+  gap: 0;
+  padding: 2px;
+  border: 0;
+  border-radius: 9px;
+  background: var(--gp-fill);
+}
+:root[data-lang='grouped'] :is(.nd-tabs button, .segsw button) {
+  height: 30px;
+  padding: 0 16px;
+  border-radius: 7px;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 500;
+}
+:root[data-lang='grouped'] .nd-tabs button[aria-selected='true'],
+:root[data-lang='grouped'] .segsw button[aria-pressed='true'],
+:root[data-lang='grouped'] .segsw button[aria-pressed='true']:hover:not(:disabled) {
+  background: var(--gp-thumb);
+  box-shadow: var(--gp-thumb-shadow);
+  color: var(--ink);
+  font-weight: 600;
+}
+:root[data-lang='grouped'] .nd-tabs button[aria-selected='true'] .nd-tab-ic {
+  color: var(--action);
+}
+
+/* 卡片标题：强调色分类名 + 同色图标 */
+:root[data-lang='grouped']
+  :is(.nd-tab-observed > .panel, .nd-tab-pair > .panel, .panel.config-panel, .panel.titled)
+  > :is(header, summary) {
+  border-bottom-color: var(--gp-sep);
+  background: none;
+}
+:root[data-lang='grouped']
+  :is(.nd-tab-observed > .panel, .nd-tab-pair > .panel, .panel.config-panel, .panel.titled)
+  > :is(header, summary)
+  h4,
+:root[data-lang='grouped'] .panel > :is(header, summary) h4 {
+  color: var(--ink);
+  font: 600 17px/1.3 var(--display);
+  letter-spacing: 0;
+  text-transform: none;
+}
+:root[data-lang='grouped'] :is(.panel-title-icon, .chart-title-icon) {
+  color: var(--action);
+}
+:root[data-lang='grouped'] .kpi .kpi-l {
+  color: var(--ink-3);
+  font: 600 13px var(--sans);
+  text-transform: none;
+}
+:root[data-lang='grouped'] .kpi .kpi-v {
+  font: 700 28px var(--rounded);
+}
+:root[data-lang='grouped'] .kpi-band,
+:root[data-lang='grouped'] .nd-observe-throughput {
+  gap: 16px;
+}
+
+/* ── 控件 ── */
+:root[data-lang='grouped'] .btn {
+  padding: 0 16px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--gp-tint);
+  color: var(--action);
+  font-size: 14px;
+  font-weight: 600;
+}
+@media (hover: hover) {
+  :root[data-lang='grouped'] .btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--action) 20%, transparent);
+  }
+  :root[data-lang='grouped'] .btn.primary:hover:not(:disabled) {
+    background: var(--primary-hover);
+  }
+}
+:root[data-lang='grouped'] .btn.primary {
+  background: var(--primary);
+  color: var(--primary-on);
+}
+:root[data-lang='grouped'] .btn.primary:disabled {
+  background: var(--gp-fill-2);
+  color: var(--ink-4);
+}
+:root[data-lang='grouped'] :is(input.f, select.f) {
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: var(--gp-fill);
+  font-size: 15px;
+}
+:root[data-lang='grouped'] textarea.f {
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: var(--gp-fill);
+  font-size: 15px;
+}
+:root[data-lang='grouped'] :is(input.f, textarea.f, select.f):focus {
+  border-color: var(--action);
+  box-shadow: none;
+}
+:root[data-lang='grouped'] .st {
+  padding: 2px 9px;
+  border-color: transparent;
+  border-radius: 999px;
+  background: var(--gp-fill-2);
+  font: 600 12px var(--sans);
+}
+
+/* ── 浮层 ── */
+:root[data-lang='grouped'] :is(.fg-menu, .fg-pop) {
+  border: 0;
+  border-radius: 14px;
+  box-shadow:
+    0 0 0 0.5px var(--gp-sep),
+    0 20px 50px rgba(0, 0, 0, 0.22);
+}
+:root[data-lang='grouped'] .fg-menu {
+  padding: 6px;
+}
+:root[data-lang='grouped'] .fg-menu button {
+  min-height: 40px;
+  border-radius: 9px;
+  font-size: 15px;
+}
+:root[data-lang='grouped'] .dialog-surface {
+  border: 0;
+  border-radius: 16px;
+  background: var(--gp-ground);
+}
+
+/* ── 手机：大标题与读数降一档 ── */
+:root[data-lang='grouped'] .forge.narrow :is(.cardpage, .nd-sheet) {
+  margin: 4px 16px 40px;
+}
+:root[data-lang='grouped'] .forge.narrow .nd-sheet > .nd-paper > .nd-page-head .nd-id {
+  font-size: 22px;
+}
+:root[data-lang='grouped'] .forge.narrow .kpi .kpi-v {
+  font-size: 24px;
+}
+:root[data-lang='grouped'] .forge.narrow .kpi .kpi-v.kpi-uptime {
+  font-size: 19px;
+}
+:root[data-lang='grouped'] .forge.narrow .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header h4 {
+  font-size: 28px;
+}

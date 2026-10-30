@@ -17,6 +17,7 @@ use crate::{Result, StoreError};
 pub(crate) struct SubscriptionServingProjection {
     pub(crate) snapshot: ModelSnapshot,
     _generation: u64,
+    topology_revision: u64,
     client_snapshot_id: u64,
     unavailable_reason: Option<String>,
 }
@@ -27,6 +28,10 @@ impl SubscriptionServingProjection {
             Some(reason) => Err(StoreError::Unavailable(reason.clone())),
             None => Ok(()),
         }
+    }
+
+    pub(crate) fn topology_revision(&self) -> u64 {
+        self.topology_revision
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -115,6 +120,7 @@ pub(crate) async fn load_subscription_serving_projection(
     Ok(SubscriptionServingProjection {
         snapshot,
         _generation: revision_to_u64("subscription generation", row.try_get("generation")?)?,
+        topology_revision: revision_to_u64("topology_revision_id", topology_revision)?,
         client_snapshot_id: revision_to_u64("client_snapshot_id", client_snapshot_id)?,
         unavailable_reason,
     })
@@ -266,6 +272,8 @@ pub(crate) async fn activate_deployment_tx(
             .bind(serde_json::to_value(&isolated_nodes)?)
             .execute(&mut **tx)
             .await?;
+            // Compare actual published paths; changes wake diagnostics in both detection modes.
+            crate::unlock_probe::wake_discovery(tx).await?;
         }
         "grants" => {
             // A grant-only release cannot establish topology on a fresh installation. Once a
@@ -553,27 +561,35 @@ pub(crate) fn permission_projection(
 ) -> ModelSnapshot {
     topology.revision = topology.revision.max(permissions.revision);
     topology.users = permissions.users.clone();
-    let latest_apps = permissions
-        .apps
-        .iter()
-        .map(|app| (app.id.as_str(), app))
-        .collect::<BTreeMap<_, _>>();
+    // Ingress IDs are globally unique and remain stable when a chain changes billing group.
+    // Keep authoring ownership separate from the still-running topology: matching by app ID
+    // would interpret a move as a revocation before the configuration is even published.
+    let mut grants_by_ingress = BTreeMap::<&str, Vec<_>>::new();
+    for grant in permissions.apps.iter().flat_map(|app| &app.grants) {
+        grants_by_ingress
+            .entry(&grant.ingress)
+            .or_default()
+            .push(grant);
+    }
     for app in &mut topology.apps {
-        let ingress_ids = app
+        app.grants = app
             .ingresses
             .iter()
-            .map(|ingress| ingress.id.clone())
-            .collect::<BTreeSet<_>>();
-        if let Some(latest) = latest_apps.get(app.id.as_str()) {
-            app.grants = latest
-                .grants
-                .iter()
-                .filter(|grant| ingress_ids.contains(&grant.ingress))
-                .cloned()
-                .collect();
-        } else {
-            app.grants.clear();
-        }
+            .flat_map(|ingress| {
+                grants_by_ingress
+                    .get(ingress.id.as_str())
+                    .into_iter()
+                    .flatten()
+            })
+            .map(|grant| (*grant).clone())
+            .collect();
+        app.grants.sort_by(|left, right| {
+            (&left.tenant, &left.user, &left.ingress).cmp(&(
+                &right.tenant,
+                &right.user,
+                &right.ingress,
+            ))
+        });
     }
     topology
 }

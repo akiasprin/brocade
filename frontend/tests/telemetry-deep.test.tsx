@@ -1,5 +1,5 @@
 import { StrictMode } from 'react';
-import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
@@ -781,6 +781,78 @@ describe('deep host telemetry', () => {
     expect(chart.series[1].data).toEqual([[95_000, 0]]);
   });
 
+  it('focuses every throughput role independently in each plot and restores all curves', async () => {
+    const view = renderThroughput(report(), true);
+    const chart = (name: string) =>
+      [...chartMock.setOption.mock.calls].reverse().find(([option]) => option.series?.[0]?.name === name)?.[0];
+    await waitFor(() => expect(chart('接入')).toBeTruthy());
+    const original = chart('接收');
+    const receive = within(view.getByLabelText('网卡流量图例')).getByRole('button', { name: '接收曲线' });
+    fireEvent.click(receive);
+    expect(receive.getAttribute('aria-pressed')).toBe('true');
+
+    for (const name of ['接入', '中继', '转发']) {
+      const button = within(view.getByLabelText('XRAY 流量图例')).getByRole('button', { name: `${name}曲线` });
+      fireEvent.click(button);
+      expect(button.getAttribute('aria-pressed')).toBe('true');
+      expect(chart('接入').series.map((line: { lineStyle: { opacity: number } }) => line.lineStyle.opacity)).toEqual(
+        ['接入', '中继', '转发'].map(role => (role === name ? 1 : 0.14)),
+      );
+      expect(chart('接收').series[0].lineStyle).toMatchObject({ width: 2.5, opacity: 1 });
+      expect(receive.getAttribute('aria-pressed')).toBe('true');
+    }
+
+    const send = within(view.getByLabelText('网卡流量图例')).getByRole('button', { name: '发送曲线' });
+    fireEvent.click(send);
+    expect(receive.getAttribute('aria-pressed')).toBe('false');
+    expect(chart('接收').series[0].lineStyle.opacity).toBe(0.14);
+    expect(chart('接收').series[1].lineStyle).toMatchObject({ width: 2.5, opacity: 1 });
+    fireEvent.click(send);
+    expect(send.getAttribute('aria-pressed')).toBe('false');
+    expect(chart('接收').series.map((line: { lineStyle: { opacity: number } }) => line.lineStyle.opacity)).toEqual([
+      1, 1,
+    ]);
+    expect(JSON.stringify(chart('接收').xAxis)).toBe(JSON.stringify(original.xAxis));
+    expect(JSON.stringify(chart('接收').yAxis)).toBe(JSON.stringify(original.yAxis));
+    expect(chart('接收').series.map((line: { data: unknown }) => line.data)).toEqual(
+      original.series.map((line: { data: unknown }) => line.data),
+    );
+    view.unmount();
+    view.client.clear();
+  });
+
+  it.each([
+    ['CPU', 'CPU 时间占比', '用户态', '内核态'],
+    ['内存', '容量构成', '匿名页', '共享/tmpfs'],
+    ['磁盘', '块设备吞吐', '读取', '写入'],
+    ['连接表', '连接与套接字', 'TCP 已建立', 'TIME_WAIT'],
+  ])('focuses %s history curves without changing data, stack totals or axes', (category, title, first, second) => {
+    const view = render(<LoadCard report={report()} />);
+    fireEvent.click(view.getByRole('button', { name: new RegExp(category) }));
+    const legend = within(view.getByLabelText(`${title} 图例`));
+    const chart = () =>
+      [...chartMock.setOption.mock.calls].reverse().find(([option]) => option.series?.[0]?.name === first)?.[0];
+    const original = chartMock.setOption.mock.calls.find(([option]) => option.series?.[0]?.name === first)?.[0];
+    const firstButton = legend.getByRole('button', { name: `${first}曲线` });
+    const secondButton = legend.getByRole('button', { name: `${second}曲线` });
+    fireEvent.click(firstButton);
+    expect(firstButton.getAttribute('aria-pressed')).toBe('true');
+    expect(chart().series[0].lineStyle).toMatchObject({ width: 2.5, opacity: 1 });
+    expect(chart().series[1].lineStyle.opacity).toBe(0.14);
+    fireEvent.click(secondButton);
+    expect(firstButton.getAttribute('aria-pressed')).toBe('false');
+    expect(chart().series[0].lineStyle.opacity).toBe(0.14);
+    expect(chart().series[1].lineStyle).toMatchObject({ width: 2.5, opacity: 1 });
+    expect(JSON.stringify(chart().xAxis)).toBe(JSON.stringify(original.xAxis));
+    expect(JSON.stringify(chart().yAxis)).toBe(JSON.stringify(original.yAxis));
+    expect(chart().series.map((line: { data: unknown; stack?: string }) => [line.data, line.stack])).toEqual(
+      original.series.map((line: { data: unknown; stack?: string }) => [line.data, line.stack]),
+    );
+    fireEvent.click(secondButton);
+    expect(secondButton.getAttribute('aria-pressed')).toBe('false');
+    expect(chart().series.every((line: { lineStyle: { opacity: number } }) => line.lineStyle.opacity === 1)).toBe(true);
+  });
+
   it('shows missing XRAY samples as unavailable and real idle reports as zero', () => {
     const missing = renderThroughput(report());
     expect(missing.getByLabelText('XRAY 流量图例').textContent).toContain('接入 —');
@@ -964,6 +1036,7 @@ describe('deep host telemetry', () => {
     const view = render(<ThroughputChart {...props} presentation="bar" />);
     const bars = chartMock.setOption.mock.calls.at(-1)?.[0];
     expect(bars.series.map((series: { type: string }) => series.type)).toEqual(['bar', 'bar']);
+    expect(bars.series[0].emphasis).toBeUndefined();
     expect(bars.series[0].data).toEqual([
       [100000, 100],
       [130000, null],
@@ -1212,6 +1285,45 @@ describe('deep host telemetry', () => {
     expect(tooltip).toContain('无响应');
     expect(tooltip).toContain('21 ms');
   });
+
+  it.each(['ipv4', 'ipv6'] as const)(
+    'limits the %s loss lane to the focused target and restores aggregate loss',
+    family => {
+      const lines = [
+        { name: '甲', color: 0, lostAt: 110 },
+        { name: '乙', color: 1, lostAt: 130 },
+        { name: '零丢包', color: 2, lostAt: -1 },
+      ].map(({ name, color, lostAt }) => ({
+        name,
+        color,
+        samples: [100, 110, 120, 130, 140].map(probed_at_unix_secs => ({
+          probed_at_unix_secs,
+          attempted: true,
+          latency_us: probed_at_unix_secs === lostAt ? null : 12_000,
+        })),
+      }));
+      const props = { lines, family, bounds: { startUnixSecs: 0, endUnixSecs: 150 } };
+      const view = render(<PingLatencyChart {...props} />);
+      const periods = () =>
+        chartMock.setOption.mock.calls.at(-1)?.[0].series.find((series: { type: string }) => series.type === 'custom')
+          ?.data;
+      const allLosses = [
+        [105_000, 115_000],
+        [125_000, 135_000],
+      ];
+      expect(periods()).toEqual(allLosses);
+      view.rerender(<PingLatencyChart {...props} focusedLine="甲" />);
+      expect(periods()).toEqual([[105_000, 115_000]]);
+      view.rerender(<PingLatencyChart {...props} focusedLine="乙" />);
+      expect(periods()).toEqual([[125_000, 135_000]]);
+      view.rerender(<PingLatencyChart {...props} focusedLine="零丢包" />);
+      expect(periods()).toBeUndefined();
+      view.rerender(<PingLatencyChart {...props} focusedLine="已删除" />);
+      expect(periods()).toEqual(allLosses);
+      view.rerender(<PingLatencyChart {...props} focusedLine={null} />);
+      expect(periods()).toEqual(allLosses);
+    },
+  );
 
   it('anchors the live Ping axis to query refreshes, not parent renders or the wall clock', async () => {
     vi.useFakeTimers();

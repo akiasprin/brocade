@@ -16,6 +16,10 @@ listen_address_path=$config_root/listen-address
 public_url_path=$config_root/agent-public-url
 database_type_path=$config_root/database-type
 database_url_path=$config_root/database-url
+service_unit=/etc/systemd/system/brocade.service
+socket_unit=/etc/systemd/system/brocade.socket
+socket_dropin_dir=/etc/systemd/system/brocade.service.d
+socket_dropin=$socket_dropin_dir/20-brocade-socket.conf
 
 say() {
     printf '%s\n' "$*"
@@ -29,7 +33,7 @@ die() {
 usage() {
     cat <<'EOF'
 Usage: [sudo] sh install.sh [--public-ip IP] [--port PORT]
-                              [--managed-db | --database-url postgresql://...]
+                              [--managed-db | --database-url postgresql://... | --database-url-file PATH]
                               [--no-start]
        [sudo] sh install.sh --upgrade
 
@@ -52,6 +56,7 @@ port=$default_port
 port_specified=false
 database_type=
 database_url=
+database_url_file=
 start_runtime=true
 upgrade=false
 while [ "$#" -gt 0 ]; do
@@ -93,6 +98,13 @@ while [ "$#" -gt 0 ]; do
             database_type=managed
             shift
             ;;
+        --database-url-file)
+            [ -z "$database_type" ] || die "--database-url-file 不能与其他数据库类型同时使用"
+            [ "$#" -ge 2 ] || die "--database-url-file 后需要填写私有文件路径"
+            database_type=external
+            database_url_file=$2
+            shift 2
+            ;;
         --database-url)
             [ -z "$database_type" ] || die "--database-url 不能与其他数据库类型同时使用"
             [ "$#" -ge 2 ] || die "--database-url 后需要填写 PostgreSQL 连接地址"
@@ -114,6 +126,17 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ "$(id -u)" -eq 0 ] || die "需要 root 权限；请用 root 执行（有 sudo 时可执行 sudo sh install.sh）"
+
+if [ -n "$database_url_file" ]; then
+    [ -f "$database_url_file" ] && [ ! -L "$database_url_file" ] || die "数据库连接文件必须是普通文件"
+    command -v stat >/dev/null 2>&1 || die "读取数据库私有文件需要 stat"
+    case $(stat -c '%u:%a' "$database_url_file") in
+        0:600|0:400) ;;
+        *) die "数据库连接文件必须属于 root，权限为 0600 或 0400" ;;
+    esac
+    [ "$(stat -c '%s' "$database_url_file")" -le 2049 ] || die "数据库连接文件过大"
+    database_url=$(cat "$database_url_file") || die "无法读取数据库连接文件"
+fi
 
 valid_port() {
     case $port in
@@ -147,8 +170,9 @@ read_upgrade_configuration() {
     IFS= read -r saved_public_url < "$public_url_path" || die "无法读取原访问地址"
     IFS= read -r database_type < "$database_type_path" || die "无法读取原数据库类型"
     case $database_type in
-        managed) ;;
-        external)
+        managed|managed-socket-v1) database_type=managed ;;
+        external|external-socket-v1)
+            database_type=external
             [ -f "$database_url_path" ] && [ ! -L "$database_url_path" ] || die "缺少原数据库连接配置"
             IFS= read -r database_url < "$database_url_path" || die "无法读取原数据库连接配置"
             valid_database_url || die "原数据库连接配置无效"
@@ -175,6 +199,18 @@ read_upgrade_configuration() {
 }
 if [ "$upgrade" = true ]; then
     read_upgrade_configuration
+fi
+
+# Validate ownership before publishing any files, including a fresh install over an old layout.
+if [ "$start_runtime" = true ]; then
+    for owned_unit in "$service_unit" "$socket_unit" "$socket_dropin"; do
+        if [ -e "$owned_unit" ] || [ -L "$owned_unit" ]; then
+            [ -f "$owned_unit" ] && [ ! -L "$owned_unit" ] &&
+                grep -Fq '# Managed by Brocade installer' "$owned_unit" ||
+                die "$owned_unit 不由安装器管理；请先按手动部署流程迁移"
+        fi
+    done
+    [ ! -L "$socket_dropin_dir" ] || die "$socket_dropin_dir 不能是符号链接"
 fi
 
 prompt_database_type() {
@@ -235,7 +271,7 @@ else
     say "  数据库：已有 PostgreSQL"
 fi
 
-script_dir=$(CDPATH= cd -P "$(dirname "$0")" && pwd)
+script_dir=$(CDPATH='' cd -P "$(dirname "$0")" && pwd)
 for required in brocade-launcher brocade-console BROCADE_PLATFORM SHA256SUMS; do
     [ -f "$script_dir/$required" ] || die "发行包缺少 $required"
 done
@@ -378,33 +414,60 @@ public_url_stage=$config_root/.agent-public-url.$$
 database_type_stage=$config_root/.database-type.$$
 database_url_stage=$config_root/.database-url.$$
 service_stage=$config_root/.brocade.service.$$
+socket_stage=$config_root/.brocade.socket.$$
+socket_dropin_stage=$config_root/.brocade-socket-dropin.$$
 ready_error=$config_root/.install-ready.$$
 upgrade_service_stopped=false
 upgrade_published=false
 upgrade_success=false
 upgrade_backup=
+socket_existed=false
+socket_dropin_existed=false
+socket_was_active=false
+[ ! -f "$socket_unit" ] || socket_existed=true
+[ ! -f "$socket_dropin" ] || socket_dropin_existed=true
+if [ "$socket_existed" = true ] && command -v systemctl >/dev/null 2>&1 &&
+    systemctl is-active --quiet brocade.socket; then
+    socket_was_active=true
+fi
+stop_runtime() {
+    # A live socket would otherwise reactivate Console in the middle of the cold backup.
+    if [ -f "$socket_unit" ]; then systemctl stop brocade.socket; fi
+    systemctl stop brocade.service
+}
 cleanup_staging() {
     if [ "$upgrade_service_stopped" = true ] && [ "$upgrade_success" = false ]; then
         if [ -e "$upgrade_backup/database/migration-started" ]; then
-            systemctl stop brocade.service || true
+            stop_runtime || true
             say "升级未完成，数据库迁移可能已开始；服务保持停止，不自动回退旧程序或恢复数据库。" >&2
             say "备份与恢复记录：$upgrade_backup" >&2
         else
             if [ "$upgrade_published" = true ]; then
-                systemctl stop brocade.service || true
+                stop_runtime || true
                 if ! tar -C / -xzpf "$upgrade_backup/installation.tar.gz"; then
                     say "恢复旧安装失败；服务保持停止，请检查 $upgrade_backup" >&2
                     return
                 fi
+                if [ "$socket_existed" = false ]; then
+                    systemctl disable brocade.socket || true
+                    rm -f "$socket_unit"
+                fi
+                if [ "$socket_dropin_existed" = false ]; then rm -f "$socket_dropin"; fi
+                systemctl daemon-reload || return
             fi
             # Explicit recovery must not inherit the failed candidate's systemd start counter.
             systemctl reset-failed brocade.service || say "清理旧服务启动限制失败，请检查 $upgrade_backup" >&2
+            if [ "$socket_was_active" = true ]; then
+                systemctl reset-failed brocade.socket || true
+                systemctl start brocade.socket || say "旧监听恢复失败，请检查 $upgrade_backup" >&2
+            fi
             systemctl start brocade.service || say "旧服务恢复失败，请检查 $upgrade_backup" >&2
         fi
     fi
     rm -f "$launcher_stage" "$console_stage" "$command_stage" \
         "$listen_address_stage" "$public_url_stage" \
-        "$database_type_stage" "$database_url_stage" "$service_stage" "$ready_error"
+        "$database_type_stage" "$database_url_stage" "$service_stage" \
+        "$socket_stage" "$socket_dropin_stage" "$ready_error"
 }
 trap cleanup_staging 0
 trap 'exit 130' HUP INT TERM
@@ -489,14 +552,18 @@ if [ "$upgrade" = true ]; then
     say "检查 v0.3.1 起的数据库兼容性…"
     run_upgrade_database --check-only
     say "停止原服务并备份安装、配置、密钥和数据…"
-    systemctl stop brocade.service
     upgrade_service_stopped=true
+    stop_runtime
     set -- \
         opt/brocade/brocade-launcher opt/brocade/brocade-console \
         opt/brocade/BROCADE_PLATFORM opt/brocade/SHA256SUMS \
         usr/local/bin/brocade etc/brocade etc/systemd/system/brocade.service
     if [ -d /etc/systemd/system/brocade.service.d ]; then
         set -- "$@" etc/systemd/system/brocade.service.d
+    fi
+    if [ -f "$socket_unit" ]; then set -- "$@" etc/systemd/system/brocade.socket; fi
+    if [ -d /etc/systemd/system/brocade.socket.d ]; then
+        set -- "$@" etc/systemd/system/brocade.socket.d
     fi
     tar -C / -czpf "$upgrade_backup/installation.tar.gz" "$@"
     tar -C /var/lib -czpf "$upgrade_backup/data.tar.gz" brocade
@@ -546,8 +613,9 @@ if [ -r "$database_type_path" ]; then
     }
 fi
 case $database_type in
-    managed) ;;
-    external)
+    managed|managed-socket-v1) database_type=managed ;;
+    external|external-socket-v1)
+        database_type=external
         if [ -z "${DATABASE_URL:-}" ]; then
             [ -r "$database_url_path" ] || {
                 printf 'brocade: 外部数据库模式缺少连接地址配置\n' >&2
@@ -619,7 +687,9 @@ printf '%s\n' "$listen_address" >"$listen_address_stage"
 chmod 0644 "$listen_address_stage"
 printf '%s\n' "$public_url" >"$public_url_stage"
 chmod 0644 "$public_url_stage"
-printf '%s\n' "$database_type" >"$database_type_stage"
+# This tagged selector is also the installation-format boundary. Old installers only
+# recognize managed/external and must reject this layout before stopping its live socket.
+printf '%s-socket-v1\n' "$database_type" >"$database_type_stage"
 chmod 0644 "$database_type_stage"
 if [ "$database_type" = external ]; then
     printf '%s\n' "$database_url" >"$database_url_stage"
@@ -667,7 +737,6 @@ if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
     exec "$command_path" up
 fi
 
-service_unit=/etc/systemd/system/brocade.service
 if [ -e "$service_unit" ] || [ -L "$service_unit" ]; then
     [ -f "$service_unit" ] && [ ! -L "$service_unit" ] &&
         grep -Fq '# Managed by Brocade installer' "$service_unit" ||
@@ -698,15 +767,51 @@ WantedBy=multi-user.target
 EOF
 chmod 0644 "$service_stage"
 mv -f "$service_stage" "$service_unit"
-systemctl daemon-reload
-systemctl enable brocade.service
 fi
+
+# Keep the listener in PID 1 across ordinary service restarts. Full --upgrade deliberately
+# stops both units while backing up/migrating, then restores socket activation afterwards.
+if [ "$upgrade" = false ] && [ "$socket_was_active" = true ]; then stop_runtime; fi
+cat >"$socket_stage" <<EOF
+# Managed by Brocade installer
+[Unit]
+Description=Brocade Console listener
+
+[Socket]
+ListenStream=$listen_address
+Accept=no
+Backlog=4096
+NoDelay=true
+FileDescriptorName=admin
+Service=brocade.service
+
+[Install]
+WantedBy=sockets.target
+EOF
+cat >"$socket_dropin_stage" <<'EOF'
+# Managed by Brocade installer
+[Unit]
+Requires=brocade.socket
+After=brocade.socket
+EOF
+chmod 0644 "$socket_stage" "$socket_dropin_stage"
+install -d -o root -g root -m 0755 "$socket_dropin_dir"
+mv -f "$socket_stage" "$socket_unit"
+mv -f "$socket_dropin_stage" "$socket_dropin"
+systemctl daemon-reload
+systemctl enable brocade.service brocade.socket
 if [ "$upgrade" = true ]; then
     # Repeated operator-requested upgrades may exhaust the old unit's StartLimitBurst even when
     # every previous process was healthy. Reset once; the unit's normal retry limits still apply.
     systemctl reset-failed brocade.service
 fi
-systemctl restart brocade.service
+systemctl reset-failed brocade.socket
+systemctl start brocade.socket
+if [ "$upgrade" = true ]; then
+    systemctl start brocade.service
+else
+    systemctl restart brocade.service
+fi
 
 say "正在等待数据库、控制台与公网入口就绪…"
 if [ "$upgrade" = false ]; then trap 'rm -f "$ready_error"' 0; fi

@@ -19,6 +19,7 @@ import {
 } from '../ui/observe-chart';
 import { PING_FAMILY_LABEL, pingLatencyMs, pingSampleLost, pingSampleText } from '../ui/ping-probe';
 import { observeSampleStepSecs, observeSeriesData } from '../ui/observe-series';
+import { observeSeriesFocus } from '../ui/observe-focus';
 import { echartsEntranceAnimation, useEchartsViewportEntry } from '../ui/echarts-motion';
 import { OBSERVE_TOOLTIP_CLASS, ObserveBrushPlot, type ObserveBrushExtent } from '../ui/observe-brush';
 
@@ -232,9 +233,9 @@ export function PingLatencyChart({
     const activeLine = focusedLine && lines.some(entry => entry.name === focusedLine) ? focusedLine : null;
     const series: Array<Record<string, unknown>> = lines.map((entry, index) => {
       const color = colorOf(entry);
-      const focused = activeLine === entry.name;
-      const muted = activeLine !== null && !focused;
+      const focus = observeSeriesFocus(entry.name, activeLine);
       return {
+        ...focus,
         name: entry.name,
         type: 'line' as const,
         symbol: 'circle',
@@ -242,18 +243,15 @@ export function PingLatencyChart({
         showSymbol: false,
         smooth: false,
         connectNulls: false,
-        z: focused ? 3 : 2,
         lineStyle: {
           ...observeSeriesLine(color),
-          width: focused ? 2.5 : 1.5,
-          opacity: muted ? 0.14 : 1,
+          ...focus.lineStyle,
         },
         areaStyle: {
           ...observeAreaStyle(color, themeName, { count: lines.length, paper: cv('--card') }),
-          opacity: muted ? 0.05 : 1,
+          ...focus.areaStyle,
         },
-        itemStyle: { color, borderColor: glass, borderWidth: 1.5, opacity: muted ? 0.14 : 1 },
-        emphasis: { disabled: true },
+        itemStyle: { color, borderColor: glass, borderWidth: 1.5, ...focus.itemStyle },
         data: observeSeriesData(
           times,
           times.map(time => {
@@ -263,7 +261,8 @@ export function PingLatencyChart({
         ),
       };
     });
-    const lossPeriods = pingLossPeriods(lines, pingSampleStepMs(times));
+    const lossLines = activeLine === null ? lines : lines.filter(entry => entry.name === activeLine);
+    const lossPeriods = pingLossPeriods(lossLines, pingSampleStepMs(times));
     if (lossPeriods.length > 0) series.push(pingLossLane(lossPeriods, err));
     chart.setOption(
       {

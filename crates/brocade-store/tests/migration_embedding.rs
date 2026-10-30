@@ -33,7 +33,7 @@ impl Drop for TestDirectory {
 }
 
 #[test]
-fn repository_prerelease_changes_are_consolidated_in_0002() {
+fn repository_keeps_consolidated_baseline_and_appends_unlock_schedule() {
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     let sources = migrations::sources(&directory).unwrap();
     assert_eq!(
@@ -41,8 +41,25 @@ fn repository_prerelease_changes_are_consolidated_in_0002() {
             .iter()
             .map(|source| source.version)
             .collect::<Vec<_>>(),
-        [1, 2]
+        [1, 2, 3]
     );
+    let notifications = fs::read_to_string(&sources[2].path).unwrap();
+    assert!(notifications.contains("pg_notify"));
+    assert!(notifications.contains("AFTER UPDATE OF status, attempt ON binary_release_targets"));
+    let schedule = fs::read_to_string(&sources[2].path).unwrap();
+    assert!(schedule.contains("CREATE TABLE unlock_probe_jobs"));
+    assert!(schedule.contains("CREATE TABLE unlock_probe_discovery"));
+    assert!(schedule.contains("ADD COLUMN address_family"));
+    assert!(
+        !schedule.contains("SET address_family"),
+        "legacy automatic results must not be assigned a family"
+    );
+    assert!(schedule.contains("unlock_refresh_stale BOOLEAN NOT NULL DEFAULT TRUE"));
+    assert!(
+        !schedule.contains("SET address_family"),
+        "settings migration must preserve current observations"
+    );
+    assert!(schedule.contains("ADD COLUMN readiness_failures"));
     let second = fs::read_to_string(&sources[1].path).unwrap();
     assert!(second.contains("ADD COLUMN target_strategy TEXT"));
     assert!(second.contains(

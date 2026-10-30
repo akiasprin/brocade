@@ -60,6 +60,86 @@ fn accept_request(listener: &TcpListener) -> TcpStream {
 }
 
 #[test]
+fn desired_delivery_error_responses_preserve_collection_policy() {
+    for status in [200, 401, 403, 429, 500, 502, 503] {
+        for policy in [None, Some("0")] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let options = options(
+                &format!("error-policy-{status}-{policy:?}"),
+                format!("http://{}", listener.local_addr().unwrap()),
+            );
+            create_private_dir(&options.state_dir).unwrap();
+            site_usage::apply_policy(&options.state_dir, Some("1")).unwrap();
+            let server = thread::spawn(move || {
+                let mut stream = accept_request(&listener);
+                assert!(read_request(&mut stream)
+                    .0
+                    .starts_with("GET /agent/v1/desired "));
+                write!(stream, "HTTP/1.1 {status} Error\r\nContent-Length: 0\r\n").unwrap();
+                if let Some(policy) = policy {
+                    write!(
+                        stream,
+                        "{}: {policy}\r\n",
+                        brocade_deployment::site_usage::SITE_USAGE_ENABLED_HEADER
+                    )
+                    .unwrap();
+                }
+                stream.write_all(b"Connection: close\r\n\r\n").unwrap();
+            });
+            let error = apply_once_inner(options.clone(), None, false).unwrap_err();
+            if status == 200 {
+                assert!(error.contains("EOF while parsing"), "{error}");
+            } else {
+                assert_eq!(error, format!("desired request failed: HTTP {status}"));
+            }
+            server.join().unwrap();
+            assert_eq!(
+                fs::read(site_usage::control_path(&options.state_dir)).unwrap(),
+                b"1\n"
+            );
+            fs::remove_dir_all(options.state_dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn desired_delivery_successful_idle_responses_still_apply_collection_policy() {
+    for policy in [Some("1"), Some("0"), None] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let options = options(
+            &format!("idle-policy-{policy:?}"),
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        create_private_dir(&options.state_dir).unwrap();
+        site_usage::apply_policy(&options.state_dir, Some("1")).unwrap();
+        let server = thread::spawn(move || {
+            let mut stream = accept_request(&listener);
+            assert!(read_request(&mut stream)
+                .0
+                .starts_with("GET /agent/v1/desired "));
+            stream.write_all(b"HTTP/1.1 204 No Content\r\n").unwrap();
+            if let Some(policy) = policy {
+                write!(
+                    stream,
+                    "{}: {policy}\r\n",
+                    brocade_deployment::site_usage::SITE_USAGE_ENABLED_HEADER
+                )
+                .unwrap();
+            }
+            stream.write_all(b"Connection: close\r\n\r\n").unwrap();
+        });
+        apply_once_inner(options.clone(), None, false).unwrap();
+        server.join().unwrap();
+        let expected = if policy == Some("1") { b"1\n" } else { b"0\n" };
+        assert_eq!(
+            fs::read(site_usage::control_path(&options.state_dir)).unwrap(),
+            expected
+        );
+        fs::remove_dir_all(options.state_dir).unwrap();
+    }
+}
+
+#[test]
 fn desired_delivery_recovers_lost_response_and_waits_for_observation_ack() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let options = options(

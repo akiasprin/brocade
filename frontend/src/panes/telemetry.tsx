@@ -31,10 +31,12 @@ import {
   observeLoadingOptions,
   observeSeriesLine,
   observeTimeAxes,
+  observeTimeTooltip,
   observeValueAxis,
 } from '../ui/observe-chart';
 import type { ObserveAxisUnit, ObserveValueAxis } from '../ui/observe-chart';
 import { observeSeriesData } from '../ui/observe-series';
+import { ObserveLegendItem, observeSeriesFocus, useObserveFocus } from '../ui/observe-focus';
 import { echartsEntranceAnimation, useEchartsViewportEntry } from '../ui/echarts-motion';
 import {
   OBSERVE_TOOLTIP_CLASS,
@@ -598,6 +600,7 @@ export function ThroughputChart({
   thirdTimesUnixSecs,
   thirdWindowStartsUnixSecs,
   group,
+  focusedLine,
 }: {
   presentation?: 'line' | 'bar';
   /** 每个速率点对应的真实窗口结束时间。 */
@@ -617,6 +620,7 @@ export function ThroughputChart({
   thirdTimesUnixSecs?: number[];
   thirdWindowStartsUnixSecs?: number[];
   group?: string;
+  focusedLine?: string | null;
 }) {
   const elRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
@@ -667,6 +671,7 @@ export function ThroughputChart({
       thirdTimesUnixSecs,
       thirdWindowStartsUnixSecs,
       group,
+      focusedLine,
       themeName,
       paletteKey,
     ]);
@@ -686,13 +691,11 @@ export function ThroughputChart({
     const xMin = rangeStartUnixSecs * 1000;
     const xMax = rangeEndUnixSecs * 1000;
     // x 轴刻度落在墙钟整点上（observeTimeAxes），tooltip 到秒。
-    const hms = (ms: number) =>
-      new Date(ms).toLocaleTimeString('zh-CN', {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false,
-      });
+    const hms = (ms: number) => observeTimeTooltip(ms, xMin, xMax);
+    const activeLine =
+      focusedLine && [rxName, txName, ...(third && thirdName ? [thirdName] : [])].includes(focusedLine)
+        ? focusedLine
+        : null;
 
     const mk = (
       name: string,
@@ -700,23 +703,31 @@ export function ThroughputChart({
       color: string,
       times = timesUnixSecs,
       starts = windowStartsUnixSecs,
-    ) => ({
-      name,
-      type: presentation,
-      ...(presentation === 'bar'
-        ? { barMaxWidth: 8, barGap: '20%', itemStyle: { color } }
-        : {
-            symbol: 'circle',
-            symbolSize: 5,
-            showSymbol: false,
-            smooth: false,
-            connectNulls: false,
-            lineStyle: observeSeriesLine(color),
-            areaStyle: observeAreaStyle(color, themeName, { count: third ? 3 : 2, paper: cv('--card') }),
-            itemStyle: { color, borderColor: glass, borderWidth: 1.5 },
-          }),
-      data: observeSeriesData(times, data, { windowStartsUnixSecs: starts }),
-    });
+    ) => {
+      const focus = observeSeriesFocus(name, activeLine);
+      return {
+        ...focus,
+        emphasis: activeLine === null ? undefined : focus.emphasis,
+        name,
+        type: presentation,
+        ...(presentation === 'bar'
+          ? { barMaxWidth: 8, barGap: '20%', itemStyle: { color, ...focus.itemStyle } }
+          : {
+              symbol: 'circle',
+              symbolSize: 5,
+              showSymbol: false,
+              smooth: false,
+              connectNulls: false,
+              lineStyle: { ...observeSeriesLine(color), ...focus.lineStyle },
+              areaStyle: {
+                ...observeAreaStyle(color, themeName, { count: third ? 3 : 2, paper: cv('--card') }),
+                ...focus.areaStyle,
+              },
+              itemStyle: { color, borderColor: glass, borderWidth: 1.5, ...focus.itemStyle },
+            }),
+        data: observeSeriesData(times, data, { windowStartsUnixSecs: starts }),
+      };
+    };
 
     chart.setOption(
       {
@@ -784,6 +795,7 @@ export function ThroughputChart({
     presentation,
     enteredViewport,
     group,
+    focusedLine,
     paletteKey,
     rangeEndUnixSecs,
     rangeStartUnixSecs,
@@ -920,6 +932,7 @@ function HistoryChart({
   const unit = valueUnit?.(unitAxis);
   const axisText = unit?.text ?? formatValue!;
   const readValue = unit?.read ?? formatValue!;
+  const { focusedLine, onFocusLine } = useObserveFocus(lines.map(line => line.name));
 
   useEffect(() => {
     const el = elRef.current;
@@ -962,6 +975,7 @@ function HistoryChart({
       max,
       threshold,
       group,
+      focusedLine,
       unit?.name,
       themeName,
       paletteKey,
@@ -997,13 +1011,7 @@ function HistoryChart({
     // 刻度落在墙钟整点上（observeTimeAxes），tooltip 到秒。
     const xMin = Math.min(firstMs, lastMs - 30_000);
     const yMax = max ?? valueAxis?.max;
-    const clockAt = (ms: number) =>
-      new Date(ms).toLocaleTimeString('zh-CN', {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false,
-      });
+    const clockAt = (ms: number) => observeTimeTooltip(ms, xMin, lastMs);
     // 首次拿到数据时让 ECharts 用折线自己的裁剪动画从时间轴左端扫入。后续实时轮询、
     // 主题切换和窗口内数据刷新都直接更新，避免每 10 秒重新播放整段历史。
     chart.setOption(
@@ -1022,13 +1030,15 @@ function HistoryChart({
         tooltip: {
           trigger: 'axis',
           confine: true,
+          enterable: true,
           className: OBSERVE_TOOLTIP_CLASS,
           backgroundColor: glass,
           borderColor: line,
           borderWidth: 1,
           padding: [7, 9],
           textStyle: { color: ink3, fontSize: 11, fontFamily: TP_MONO },
-          extraCssText: 'border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.18); backdrop-filter:blur(8px);',
+          extraCssText:
+            'border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.18); backdrop-filter:blur(8px); box-sizing:border-box; max-height:min(320px,calc(100dvh - 32px)); overflow-y:auto; overscroll-behavior:contain;',
           axisPointer: { type: 'line', lineStyle: { color: ink4, width: 1, type: 'dashed' }, z: 0 },
           formatter: (params: unknown) => {
             const rows = params as { seriesName: string; color: string; value: [number, number | null] }[];
@@ -1063,42 +1073,47 @@ function HistoryChart({
           axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: axisText },
           splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
         },
-        series: lines.map((lineSeries, index) => ({
-          name: lineSeries.name,
-          type: 'line' as const,
-          symbol: 'circle',
-          symbolSize: 5,
-          showSymbol: false,
-          smooth: false,
-          connectNulls: false,
-          stack: lineSeries.stack,
-          stackStrategy: lineSeries.stack ? ('all' as const) : undefined,
-          areaStyle: areaFill(lineSeries, index),
-          lineStyle: {
-            ...observeSeriesLine(colors[index]),
-            type: lineSeries.dashed ? ('dashed' as const) : ('solid' as const),
-            opacity: 1,
-          },
-          itemStyle: { color: colors[index], borderColor: glass, borderWidth: 1.5 },
-          data: observeSeriesData(times, lineSeries.values, { windowStartsUnixSecs: windowStarts }),
-          markLine:
-            index === 0 && threshold
-              ? {
-                  silent: true,
-                  symbol: ['none', 'none'],
-                  label: {
-                    show: true,
-                    position: 'insideEndTop',
-                    formatter: threshold.label,
-                    color: cv('--err', '#bd4b4b'),
-                    fontSize: 8,
-                    fontFamily: TP_MONO,
-                  },
-                  lineStyle: { color: cv('--err', '#bd4b4b'), width: 1, type: 'dashed', opacity: 0.55 },
-                  data: [{ yAxis: threshold.value }],
-                }
-              : undefined,
-        })),
+        series: lines.map((lineSeries, index) => {
+          const focus = observeSeriesFocus(lineSeries.name, focusedLine);
+          const area = areaFill(lineSeries, index);
+          return {
+            ...focus,
+            name: lineSeries.name,
+            type: 'line' as const,
+            symbol: 'circle',
+            symbolSize: 5,
+            showSymbol: false,
+            smooth: false,
+            connectNulls: false,
+            stack: lineSeries.stack,
+            stackStrategy: lineSeries.stack ? ('all' as const) : undefined,
+            areaStyle: area ? { ...area, ...focus.areaStyle } : undefined,
+            lineStyle: {
+              ...observeSeriesLine(colors[index]),
+              type: lineSeries.dashed ? ('dashed' as const) : ('solid' as const),
+              ...focus.lineStyle,
+            },
+            itemStyle: { color: colors[index], borderColor: glass, borderWidth: 1.5, ...focus.itemStyle },
+            data: observeSeriesData(times, lineSeries.values, { windowStartsUnixSecs: windowStarts }),
+            markLine:
+              index === 0 && threshold
+                ? {
+                    silent: true,
+                    symbol: ['none', 'none'],
+                    label: {
+                      show: true,
+                      position: 'insideEndTop',
+                      formatter: threshold.label,
+                      color: cv('--err', '#bd4b4b'),
+                      fontSize: 8,
+                      fontFamily: TP_MONO,
+                    },
+                    lineStyle: { color: cv('--err', '#bd4b4b'), width: 1, type: 'dashed', opacity: 0.55 },
+                    data: [{ yAxis: threshold.value }],
+                  }
+                : undefined,
+          };
+        }),
       },
       true,
     );
@@ -1109,6 +1124,7 @@ function HistoryChart({
     axisText,
     enteredViewport,
     group,
+    focusedLine,
     lines,
     max,
     paletteKey,
@@ -1146,15 +1162,21 @@ function HistoryChart({
         {renderedCurrent && <strong>{renderedCurrent}</strong>}
       </header>
       <ObserveBrushPlot className="history-chart" hostRef={elRef} chartRef={chartRef} extentRef={extentRef} />
-      <footer className="history-chart-legend" aria-label={`${title} 图例`}>
+      <footer className="history-chart-legend" aria-label={`${title} 图例`} data-focused={focusedLine ? '' : undefined}>
         {lines.map((line, index) => {
           const value = ready ? latest(line.values) : null;
           const color = `var(${historyLineColorVar(line, index)})`;
           return (
-            <span key={line.name} className={line.area ? 'area' : line.dashed ? 'dashed' : undefined}>
+            <ObserveLegendItem
+              key={line.name}
+              className={line.area ? 'area' : line.dashed ? 'dashed' : undefined}
+              aria-label={`${line.name}曲线`}
+              pressed={focusedLine === line.name}
+              onToggle={() => onFocusLine(line.name)}
+            >
               <i style={{ background: color }} />
               {line.name} <b>{value === null ? '—' : readValue(value)}</b>
-            </span>
+            </ObserveLegendItem>
           );
         })}
       </footer>

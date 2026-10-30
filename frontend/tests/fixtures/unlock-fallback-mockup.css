@@ -1,0 +1,318 @@
+/* 解锁报告 · DNS 回退 mockup。外壳、链详情和弹窗骨架是生产的；这里只补审阅条（mk-）和方案部件（fb-）。 */
+
+/* ── 审阅外壳：不属于设计 ── */
+body {
+  display: flex;
+  flex-direction: column;
+}
+#mk-root {
+  flex: none;
+}
+#root {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.mk-bar {
+  position: relative;
+  z-index: 30;
+  border-bottom: 1px solid var(--line);
+  background: var(--sheet);
+}
+.mk-bar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  padding: 9px 20px 5px;
+}
+.mk-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--ink);
+  font: 600 14px var(--sans);
+  white-space: nowrap;
+}
+.mk-title small {
+  color: var(--ink-4);
+  font: 400 10px var(--mono);
+  letter-spacing: 0.06em;
+}
+.mk-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-left: auto;
+}
+.mk-ctl {
+  --ctl-h: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.mk-ctl-label {
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.mk-ctl select {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  color: var(--ink);
+  font: 12px var(--sans);
+}
+.mk-ctl .segsw button {
+  padding: 0 9px;
+  font-size: 12px;
+}
+.mk-scene-note {
+  margin: 0;
+  padding: 0 20px 8px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.mk-scene-note b {
+  margin-right: 10px;
+  color: var(--action);
+  font-weight: 600;
+}
+.mk-common {
+  display: block;
+  color: var(--ink-4);
+}
+
+/* ── 插槽：方案部件替换生产入口，现状不动 ── */
+.mk-head-slot {
+  display: contents;
+}
+html[data-mk-option]:not([data-mk-option='current']) .chain-detail-head .nd-tools > .unlock-head-btn,
+html[data-mk-option]:not([data-mk-option='current']) .chain-unlock-scroll:not(.mk-list-slot *),
+html[data-mk-option]:not([data-mk-option='current']) .chain-unlock-legend:not(.mk-list-slot *) {
+  display: none;
+}
+.mk-list-slot {
+  display: contents;
+}
+
+/* ══ 共用：计数条上的回退项画空心，不计入可用数 ══ */
+
+.unlock-b-strip i[data-route] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.25px color-mix(in srgb, var(--ink) 30%, transparent);
+}
+
+/* ══ A 回退标记：保留读数，去掉状态色和投影 ══ */
+
+.unlock-b-tile[data-route] {
+  background: transparent;
+  box-shadow: none;
+}
+.unlock-b-tile[data-route] .unlock-b-name {
+  color: var(--ink-2);
+}
+.unlock-b-tile[data-route] .unlock-mark .site-brand-icon {
+  color: var(--ink-3);
+}
+.unlock-b-tile[data-route] .unlock-b-top .unlock-glyph {
+  color: var(--ink-4);
+}
+.unlock-b-tile[data-route] .unlock-b-region b {
+  color: var(--ink-3);
+}
+.unlock-b-tile[data-route] .unlock-b-region-name {
+  color: var(--ink-4);
+}
+.unlock-b-tile[data-route] .unlock-b-region .geo-flag {
+  filter: grayscale(1);
+  opacity: 0.55;
+}
+.unlock-b-tile[data-route] .unlock-b-label {
+  color: var(--ink-3);
+}
+.fb-tag {
+  flex: none;
+  height: 20px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--ink) 9%, transparent);
+  color: var(--ink-2);
+  font: 500 11.5px/20px var(--sans);
+  cursor: pointer;
+}
+.fb-tag:hover,
+.fb-tag[aria-expanded='true'] {
+  background: color-mix(in srgb, var(--ink) 15%, transparent);
+  color: var(--ink);
+}
+.fb-tag:focus-visible,
+.fb-lone:focus-visible,
+.fb-chip:focus-visible,
+.fb-yield-go:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+}
+
+/* ══ B 让位：主读数换成常规流量使用的地址族 ══ */
+
+.fb-yield {
+  background: transparent;
+  box-shadow: none;
+}
+.fb-yield .unlock-b-name {
+  color: var(--ink-2);
+}
+.fb-yield .unlock-mark .site-brand-icon {
+  color: var(--ink-3);
+}
+.fb-yield-go {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 2px;
+  margin: 1px 0 0 -3px;
+  padding: 1px 3px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-2);
+  font: 600 18px/24px var(--sans);
+  cursor: pointer;
+}
+.fb-yield-go svg {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  color: var(--ink-4);
+}
+.fb-yield-go:hover,
+.fb-yield-go:hover svg {
+  color: var(--action);
+}
+.fb-yield-note {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fb-yield-note .unlock-glyph {
+  width: 13px;
+  height: 13px;
+  color: var(--ink-4);
+}
+.fb-yield-note b {
+  color: var(--ink-3);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* ══ C 收纳：末尾一行紧凑条目 ══ */
+
+.fb-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.fb-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 12px 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--ink-2);
+  font: 13px var(--sans);
+  cursor: pointer;
+}
+.fb-chip:hover,
+.fb-chip[aria-expanded='true'] {
+  background: var(--hover-2);
+}
+.fb-chip .unlock-mark {
+  width: 16px;
+  height: 16px;
+}
+.fb-chip .unlock-mark .site-brand-icon {
+  color: var(--ink-3);
+}
+.fb-chip .unlock-glyph {
+  width: 13px;
+  height: 13px;
+  color: var(--ink-4);
+}
+.fb-chip-name {
+  font-weight: 500;
+}
+.fb-chip-reading {
+  color: var(--ink-3);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+/* ══ D 实际：只走一族的服务标出这一族 ══ */
+
+.fb-lone {
+  flex: none;
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink-3);
+  font: 500 11px/18px var(--sans);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.fb-lone:hover,
+.fb-lone[aria-expanded='true'] {
+  background: var(--hover-2);
+  color: var(--ink);
+}
+.fb-v6 {
+  margin-left: 2px;
+  color: var(--ink-3);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* ══ 解析路径弹层：沿用 YouTube 分项的版式 ══ */
+
+.fb-path h3 {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.fb-path h3 small {
+  display: inline;
+  color: var(--ink-3);
+  font-size: 12px;
+  font-weight: 400;
+}
+.fb-path dd .unlock-glyph {
+  width: 14px;
+  height: 14px;
+}
+.fb-code {
+  color: var(--ink);
+  font: 12px var(--mono);
+}
+
+/* ══ 线路列表：只走一族的格注「仅 v4」 ══ */
+
+.fb-cut-lone {
+  color: var(--ink-4);
+}

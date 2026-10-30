@@ -98,6 +98,41 @@ pub struct SourceAccessObservation {
     pub error: Option<String>,
 }
 
+/// Existing Agents use the observation's diagnostic field for both pending
+/// confirmation and failures. Keep these exact messages compatible during upgrades.
+#[derive(Debug, Clone, Copy)]
+pub enum SourceAccessWaitReason {
+    Configuration,
+    SplitHandoff,
+    GenerationSwitch,
+    Receipt,
+    Revision,
+}
+
+impl SourceAccessWaitReason {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Configuration => "等待 Xray 接入配置",
+            Self::SplitHandoff => "XHTTP 独立下载入口交接中，等待旧代退出后确认来源策略",
+            Self::GenerationSwitch => "Xray 代际正在切换，等待接入策略确认",
+            Self::Receipt => "等待 Xray 应用接入策略",
+            Self::Revision => "等待全部 Xray 代际应用接入策略",
+        }
+    }
+
+    pub fn matches_message(message: &str) -> bool {
+        [
+            Self::Configuration,
+            Self::SplitHandoff,
+            Self::GenerationSwitch,
+            Self::Receipt,
+            Self::Revision,
+        ]
+        .into_iter()
+        .any(|reason| reason.message() == message)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceAccessNode {
     pub node_id: String,
@@ -118,11 +153,32 @@ pub struct SourceAccessView {
     pub revision: i64,
     pub ips: Vec<String>,
     pub nodes: Vec<SourceAccessNode>,
+    /// Read-only user denials relevant to a node's current or quota-suspended grants.
+    /// Omitted for user-scoped views and by older Consoles; `ips` remains scope-local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_bans: Option<Vec<SourceAccessUser>>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_access_views_accept_older_consoles_without_user_bans() {
+        let old_view = serde_json::json!({"revision": 0, "ips": [], "nodes": []});
+        let mut view: SourceAccessView = serde_json::from_value(old_view.clone()).unwrap();
+        assert!(view.user_bans.is_none());
+        assert_eq!(serde_json::to_value(&view).unwrap(), old_view);
+        view.user_bans = Some(vec![SourceAccessUser {
+            tenant_id: "platform.acme".into(),
+            user_id: "alice".into(),
+            ips: vec!["192.0.2.1".into()],
+        }]);
+        let json = serde_json::to_value(&view).unwrap();
+        let decoded: SourceAccessView = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.user_bans, view.user_bans);
+    }
+
     #[test]
     fn source_ips_are_numeric_canonical_and_bounded() {
         let write = SourceAccessWrite {

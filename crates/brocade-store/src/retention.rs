@@ -272,8 +272,8 @@ const DEFINITIONS: &[Definition] = &[
     history(
         "user_online_sources",
         "用户在线来源历史",
-        "账号来源地址的最近观测；过期离线节点留下的来源会被清理。",
-        30 * 24,
+        "账号各入口的在线周期与已结束会话；过期历史和陈旧来源会被清理。",
+        crate::user_presence::USER_ONLINE_SOURCE_RETENTION_DAYS * 24,
     ),
     history(
         "node_traffic_forecasts",

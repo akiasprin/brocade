@@ -20,9 +20,9 @@ flate2 = "1.1"
 libc = "0.2"
 # HTTP framing and deadlines use the same reqwest/rustls stack as the Console.
 # Keep native TLS, OpenSSL and AWS-LC out of static musl builds.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots"] }
-# Only the one-shot notification primitive is needed by our bounded system resolver.
-tokio = { version = "1", features = ["sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots", "socks"] }
+# The live channel has its own single-thread runtime; HTTP and collection retain their independent schedules.
+tokio = { version = "1", features = ["sync", "rt", "net", "time", "macros"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 # Trust anchors are compiled into the binary rather than read from the target machine's
 # /etc/ssl/certs. The agent installs on other people's machines, and how old that root store
@@ -31,7 +31,13 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 # the agent version — but the latter is in our hands and a new agent release fixes it, while
 # the former is not.
 webpki-roots = "1.0.9"
-# The live channel is the one place where the Agent keeps an HTTP connection open. Using a
-# protocol implementation here avoids inventing WebSocket framing, masking and close semantics;
-# TLS still uses compiled webpki roots, just like the Agent's ordinary HTTP client above.
+# The live channel negotiates standard permessage-deflate with default compression settings.
+# TLS still uses our compiled trust anchors and shared handshake deadline.
+yawc = { version = "=0.5.0", default-features = false, features = ["tls"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+base64 = "0.22.1"
+
+[dev-dependencies]
+# Exercise rolling upgrades against a peer without compression support.
 tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }

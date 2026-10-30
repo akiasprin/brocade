@@ -703,6 +703,70 @@ fn is_local_dns(server: &str) -> bool {
     value == "localhost" || value == "fakedns" || value.contains("+local://")
 }
 
+/// Resolver addresses in one policy. A singleton retains the historical JSON string shape.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EgressDnsAddresses(pub Vec<String>);
+
+impl From<String> for EgressDnsAddresses {
+    fn from(address: String) -> Self {
+        Self(vec![address])
+    }
+}
+
+impl From<&str> for EgressDnsAddresses {
+    fn from(address: &str) -> Self {
+        address.to_owned().into()
+    }
+}
+
+impl From<Vec<String>> for EgressDnsAddresses {
+    fn from(addresses: Vec<String>) -> Self {
+        Self(addresses)
+    }
+}
+
+impl EgressDnsAddresses {
+    /// Bound server-side resource use independently of the editor's three-member limit.
+    pub const MAX_MEMBERS: usize = 16;
+
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+
+    pub fn valid(&self) -> bool {
+        !self.0.is_empty()
+            && self.0.len() <= Self::MAX_MEMBERS
+            && self
+                .0
+                .iter()
+                .all(|address| address.trim().parse::<IpAddr>().is_ok())
+    }
+}
+
+impl Serialize for EgressDnsAddresses {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0.as_slice() {
+            [address] => address.serialize(serializer),
+            addresses => addresses.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EgressDnsAddresses {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Addresses {
+            One(String),
+            Many(Vec<String>),
+        }
+        Ok(match Addresses::deserialize(deserializer)? {
+            Addresses::One(address) => address.into(),
+            Addresses::Many(addresses) => addresses.into(),
+        })
+    }
+}
+
 /// The resolver half of one machine-owned DNS policy.
 ///
 /// This does not replace [`Node::dns`] and never reaches the operating system resolver. Every
@@ -711,10 +775,10 @@ fn is_local_dns(server: &str) -> bool {
 /// matching lookup on the machine.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct EgressDnsResolution {
-    /// An IP literal. Hostnames are deliberately refused: resolving the resolver through itself
+    /// IP literals in one racing group. Hostnames are deliberately refused: resolving the resolver through itself
     /// creates a bootstrap loop, while resolving it elsewhere makes this supposedly isolated
     /// policy depend on the machine default.
-    pub address: String,
+    pub address: EgressDnsAddresses,
     #[serde(default = "default_dns_port")]
     pub port: u16,
     #[serde(default)]
@@ -3559,6 +3623,48 @@ pub fn is_probe_label(label: &str) -> bool {
 
 const PROBE_LABEL_PREFIX: &str = "probe#";
 
+/// Separate credentials carry the selected final-address family across managed relay hops.
+/// Labels retain the probe prefix so they are excluded from user accounting.
+pub fn probe_family_label(base: &str, family: IpFamily) -> String {
+    // Relay labels contain `@`. Combined with the probe's `#`, that would match
+    // Xray's user-budget identity shape. Escape losslessly before adding the prefix.
+    probe_transport_label(base, probe_family_key(family))
+}
+fn probe_transport_label(base: &str, role: &str) -> String {
+    let base = base.replace('%', "%25").replace('@', "%40");
+    format!("probe#{role}:{base}")
+}
+/// DNS diagnostics follow the HTTPS routing graph and query the final node's own resolver.
+pub fn probe_dns_label(base: &str) -> String {
+    probe_transport_label(base, "dns")
+}
+pub fn probe_dns_uuid(base_uuid: &str) -> String {
+    probe_uuid(base_uuid, "dns")
+}
+pub fn probe_dns_tag(base: &str) -> String {
+    format!("probe:dns:{base}")
+}
+pub fn probe_family_uuid(base_uuid: &str, family: IpFamily) -> String {
+    probe_uuid(base_uuid, probe_family_key(family))
+}
+pub fn probe_family_key(family: IpFamily) -> &'static str {
+    match family {
+        IpFamily::V4 => "v4",
+        IpFamily::V6 => "v6",
+    }
+}
+pub fn probe_family_tag(base: &str, family: IpFamily) -> String {
+    format!("{base}:probe-{}", probe_family_key(family))
+}
+pub fn probe_family_base(tag: &str, family: IpFamily) -> Option<&str> {
+    tag.strip_suffix(&probe_family_tag("", family))
+}
+
+/// Family-specific diagnostic transports are not physical peer identities.
+pub fn is_probe_family_tag(tag: &str) -> bool {
+    tag.ends_with(":probe-v4") || tag.ends_with(":probe-v6")
+}
+
 /// The probe credential's UUID, derived from the ingress's REALITY private key and its
 /// ingress id.
 ///
@@ -3608,6 +3714,17 @@ pub fn probe_uuid(private_key: &str, ingress: &str) -> String {
 #[cfg(test)]
 mod probe_identity_tests {
     use super::{grant_label, is_probe_label, parse_grant_label, probe_label, probe_uuid};
+
+    #[test]
+    fn family_relay_labels_never_match_xray_budget_identity() {
+        for family in [super::IpFamily::V4, super::IpFamily::V6] {
+            let label = super::probe_family_label("chain@node", family);
+            assert!(is_probe_label(&label));
+            assert!(!label.contains('@'));
+            assert_eq!(parse_grant_label(&label), None);
+            assert_ne!(label, super::probe_family_label("chain%40node", family));
+        }
+    }
 
     /// A probe label has to be one `parse_grant_label` does not recognize. If this breaks,
     /// probe traffic is attributed to a real user's account and that user is overcharged.

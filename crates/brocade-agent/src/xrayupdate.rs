@@ -428,32 +428,7 @@ fn configured_handoff_endpoints(
         }
     }
     for (tag, inbound, address, dependency) in static_rows {
-        let protocol = inbound
-            .get("protocol")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let transport = inbound
-            .pointer("/streamSettings/network")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("tcp");
-        let dokodemo_network = inbound
-            .pointer("/settings/network")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("tcp");
-        let (has_tcp, has_udp) = if protocol == "dokodemo-door" {
-            (
-                dokodemo_network
-                    .split(',')
-                    .any(|network| network.trim() == "tcp"),
-                dokodemo_network
-                    .split(',')
-                    .any(|network| network.trim() == "udp"),
-            )
-        } else if transport == "hysteria" {
-            (false, true)
-        } else {
-            (true, false)
-        };
+        let (has_tcp, has_udp) = inbound_listener_networks(inbound);
         let role = if direct_api.is_none() && api_tag == Some(tag.as_str()) {
             "control"
         } else if cover_addresses.contains(&address) {
@@ -543,6 +518,51 @@ fn configured_handoff_endpoints(
     }
 
     Ok(endpoints)
+}
+
+fn inbound_listener_networks(inbound: &serde_json::Value) -> (bool, bool) {
+    let protocol = inbound["protocol"].as_str().unwrap_or_default();
+    if protocol == "dokodemo-door" {
+        let networks = inbound
+            .pointer("/settings/network")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("tcp");
+        return (
+            networks.split(',').any(|network| network.trim() == "tcp"),
+            networks.split(',').any(|network| network.trim() == "udp"),
+        );
+    }
+    let transport = inbound
+        .pointer("/streamSettings/network")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("tcp");
+    let alpn: Vec<&str> = match inbound.pointer("/streamSettings/tlsSettings/alpn") {
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect(),
+        Some(serde_json::Value::String(value)) => value.split(',').collect(),
+        _ => Vec::new(),
+    };
+    match transport.to_ascii_lowercase().as_str() {
+        "hysteria" => (false, true),
+        // XHTTP selects HTTP/3 only for the exact single-ALPN TLS mode.
+        "xhttp" | "splithttp"
+            if inbound
+                .pointer("/streamSettings/security")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|security| security.eq_ignore_ascii_case("tls"))
+                && alpn == ["h3"] =>
+        {
+            (false, true)
+        }
+        // MASQUE's server defaults to H3, and can bind both socket families.
+        "masque" => {
+            let h2 = alpn.contains(&"h2");
+            (h2, alpn.contains(&"h3") || !h2)
+        }
+        _ => (true, false),
+    }
 }
 
 fn write_bootstrap_handoff(
@@ -963,24 +983,66 @@ fn handoff_rpc_inner(
             .map_err(|_| "代际控制辅助数据缓冲区长度超出平台上限".to_owned())?;
         message.msg_controllen = control_bytes;
     }
-    let received = unsafe {
-        libc::recvmsg(
-            fd.as_raw_fd(),
-            &mut message,
-            if receive_fds {
-                libc::MSG_CMSG_CLOEXEC
-            } else {
-                0
-            },
-        )
-    };
-    if received < 0 {
-        return Err(format!(
-            "代际控制 {operation} 等待响应失败（PID {}，超时上限 2 秒）：{}",
-            peer.pid,
-            io::Error::last_os_error()
-        ));
+    let receive_deadline = Instant::now() + Duration::from_secs(2);
+    let control_capacity = message.msg_controllen;
+    let received = loop {
+        // SAFETY: fd is owned and message references the live response/iovec and
+        // optional ancillary buffers; recvmsg cannot outlive this call.
+        let received = unsafe {
+            libc::recvmsg(
+                fd.as_raw_fd(),
+                &mut message,
+                if receive_fds {
+                    libc::MSG_CMSG_CLOEXEC
+                } else {
+                    0
+                },
+            )
+        };
+        if received >= 0 {
+            break Ok(received);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            break Err(error);
+        }
+        // A signal did not consume the seqpacket. Resume this same receive,
+        // preserving ancillary capacity and the original response deadline;
+        // never resend the already delivered control operation.
+        let remaining = receive_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control response deadline elapsed",
+            ));
+        }
+        let timeout = libc::timeval {
+            tv_sec: remaining.as_secs() as _,
+            tv_usec: remaining.subsec_micros().max(1) as _,
+        };
+        // SAFETY: the owned socket and initialized timeval remain valid for
+        // setsockopt, and the supplied length exactly matches the value.
+        if unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &timeout as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&timeout) as libc::socklen_t,
+            )
+        } != 0
+        {
+            break Err(io::Error::last_os_error());
+        }
+        message.msg_controllen = control_capacity;
+        message.msg_flags = 0;
     }
+    .map_err(|error| {
+        format!(
+            "代际控制 {operation} 等待响应失败（PID {}，超时上限 2 秒）：{}",
+            peer.pid, error
+        )
+    })?;
     if received == 0 {
         return Err(format!(
             "代际控制 {operation} 响应提前关闭（PID {}）",
@@ -1322,6 +1384,23 @@ fn launch_handoff_candidate(
     candidate: &CandidateHandoff,
     exported: &[OwnedFd],
 ) -> Result<(HandoffRuntimeStatus, crate::ProcessRef), String> {
+    // The staged generation has a different executable directory. Keep the installed Xray's
+    // default asset search root, or a valid config using adjacent GeoIP/GeoSite data will fail
+    // only after the old generation has paused. Explicit Xray environment flags take priority.
+    let asset_directory = if std::env::var_os("xray.location.asset").is_none()
+        && std::env::var_os("XRAY_LOCATION_ASSET").is_none()
+    {
+        let installed = fs::canonicalize(crate::which_xray()?)
+            .map_err(|error| format!("解析已安装 Xray 资源目录失败：{error}"))?;
+        Some(
+            installed
+                .parent()
+                .ok_or("已安装 Xray 缺少资源目录")?
+                .to_path_buf(),
+        )
+    } else {
+        None
+    };
     let config = state_dir.join("xray.json");
     let content = fs::read_to_string(&config)
         .map_err(|error| format!("读取候选 splice 配置失败：{error}"))?;
@@ -1382,10 +1461,23 @@ fn launch_handoff_candidate(
     crate::user_traffic::verify_executable(accounting_dir, &candidate.executable)?;
     crate::source_access::verify_executable(accounting_dir, &candidate.executable)?;
     let mut command = Command::new(&candidate.executable);
+    if let Some(directory) = asset_directory {
+        command.env("XRAY_LOCATION_ASSET", directory);
+    }
     command
         .args(["run", "-config"])
         .arg(&config)
         .envs(crate::xray_launch_environment(splice_mode))
+        .env(
+            crate::probe_identity::ENV,
+            crate::probe_identity::path(accounting_dir),
+        )
+        .env(
+            crate::probe_identity::PROFILE_ENV,
+            crate::probe_identity::profile(
+                &fs::read_to_string(&config).map_err(|_| "read candidate probe profile failed")?,
+            )?,
+        )
         .env("XRAY_BROCADE_ACCOUNTING_FILE", &accounting)
         .env("XRAY_BROCADE_ACCOUNTING_SHARED", "join")
         .env(
@@ -2763,13 +2855,31 @@ pub(crate) fn spawn_xray_updates(options: &Options, queue: &Arc<XrayUpdateQueue>
     let queue = Arc::clone(queue);
     let spawned = thread::Builder::new()
         .name("xray-update".to_owned())
-        .spawn(move || loop {
-            crate::each_round("xray-update", || {
-                if let Err(error) = poll_cycle(&options, &queue) {
-                    crate::warn(format!("xray-update: {error}"));
-                }
-            });
-            thread::sleep(update_interval(&options.token));
+        .spawn(move || {
+            let mut wake = crate::wake::Cursor::new(
+                brocade_deployment::agent_channel::WakeDomain::XrayRelease,
+            );
+            loop {
+                let mut failed = false;
+                crate::each_round("xray-update", || {
+                    if let Err(error) = poll_cycle(&options, &queue) {
+                        failed = true;
+                        crate::warn(format!("xray-update: {error}"));
+                    }
+                });
+                let pending = options.state_dir.join(UPGRADE_RUNTIME_FILE).exists()
+                    || options.state_dir.join(REPORT_FILE).exists()
+                    || queue
+                        .pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_some();
+                wake.wait(if failed || pending {
+                    Duration::from_secs(15)
+                } else {
+                    update_interval(&options.token)
+                });
+            }
         });
     if let Err(error) = spawned {
         crate::warn(format!(
@@ -2819,6 +2929,7 @@ pub(crate) fn apply_pending(
     };
     let Some(current) = current else {
         cleanup_file(&prepared.candidate);
+        crate::wake::notify(&[brocade_deployment::agent_channel::WakeDomain::XrayRelease]);
         return Ok(());
     };
     if current.release_id != prepared.offer.release_id
@@ -2826,6 +2937,7 @@ pub(crate) fn apply_pending(
         || current.sha256 != prepared.offer.sha256
     {
         cleanup_file(&prepared.candidate);
+        crate::wake::notify(&[brocade_deployment::agent_channel::WakeDomain::XrayRelease]);
         return Ok(());
     }
     let staged_sha = match file_sha256_hex(&prepared.candidate) {
@@ -3027,6 +3139,7 @@ fn poll_cycle(options: &Options, queue: &Arc<XrayUpdateQueue>) -> Result<(), Str
             offer.release_id, offer.attempt
         );
         *pending = Some(PreparedUpdate { offer, candidate });
+        crate::wake::notify(&[brocade_deployment::agent_channel::WakeDomain::Desired]);
     } else {
         cleanup_file(&candidate);
     }
@@ -5041,7 +5154,9 @@ fn report_with_state(
 
 fn finish_report(options: &Options, report: XrayReleaseReport) -> Result<(), String> {
     write_stored_report(&options.state_dir, REPORT_FILE, report)?;
-    retry_stored_report(options)
+    retry_stored_report(options)?;
+    crate::wake::notify(&[brocade_deployment::agent_channel::WakeDomain::XrayRelease]);
+    Ok(())
 }
 
 fn write_stored_report(
@@ -5473,6 +5588,55 @@ mod tests {
 
     #[test]
     fn handoff_status_rpc_requires_the_exact_private_process_endpoint() {
+        handoff_status_rpc_case(false);
+    }
+
+    #[test]
+    fn handoff_status_rpc_resumes_interrupted_receive_without_replaying() {
+        const CHILD: &str = "BROCADE_TEST_HANDOFF_EINTR_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "xrayupdate::tests::handoff_status_rpc_resumes_interrupted_receive_without_replaying", "--nocapture"])
+                .env(CHILD, "1")
+                .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated interrupted-receive test exceeded its process deadline");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // Signal disposition is changed only in this isolated test process.
+        extern "C" fn handler(_: libc::c_int) {}
+        // SAFETY: an all-zero sigaction is valid before installing its handler
+        // and explicitly initializing the signal mask below.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handler as *const () as usize;
+        // SAFETY: action is live and its mask points to writable sigset_t storage.
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+        }
+        // SAFETY: the C handler has the required ABI; only this isolated child
+        // changes its signal disposition, with no old action requested.
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut()) },
+            0
+        );
+        handoff_status_rpc_case(true);
+    }
+
+    fn handoff_status_rpc_case(interrupt: bool) {
         let dir = temp_dir("handoff-status-rpc");
         let control_path = dir.join("control.sock");
         let listener = bind_test_seqpacket(&control_path);
@@ -5481,6 +5645,8 @@ mod tests {
         // Process identity includes the executable digest. Compute it before accepting the RPC so
         // the fixture itself cannot consume the client's deliberately short control timeout.
         let server_process = current_process();
+        // SAFETY: pthread_self has no preconditions and identifies this live test thread.
+        let receiving_thread = unsafe { libc::pthread_self() } as usize;
         let server = thread::spawn(move || {
             let client = unsafe {
                 libc::accept4(
@@ -5506,6 +5672,19 @@ mod tests {
                 serde_json::from_slice(&request[..received as usize]).unwrap();
             assert_eq!(request["operation"], "status");
             assert_eq!(request["generation_id"], server_generation);
+            if interrupt {
+                for _ in 0..3 {
+                    thread::sleep(Duration::from_millis(20));
+                    // SAFETY: the receiving thread remains alive until this
+                    // server sends its reply and joins; SIGUSR2 is installed above.
+                    assert_eq!(
+                        unsafe {
+                            libc::pthread_kill(receiving_thread as libc::pthread_t, libc::SIGUSR2)
+                        },
+                        0
+                    );
+                }
+            }
             let response = serde_json::to_vec(&serde_json::json!({
                 "status": {
                     "scope": "whole-generation",
@@ -5745,6 +5924,55 @@ mod tests {
             }));
         }
         assert!(bootstrap.manifest_path().is_file());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bootstrap_manifest_matches_http_alpn_listener_families() {
+        let dir = temp_dir("http-listeners");
+        for (transport, security, alpn, expected) in [
+            ("xhttp", "tls", serde_json::json!(["h3"]), vec!["udp"]),
+            ("XHTTP", "TLS", serde_json::json!(["h3"]), vec!["udp"]),
+            ("splithttp", "tls", serde_json::json!("h3"), vec!["udp"]),
+            ("xhttp", "tls", serde_json::json!(["h2", "h3"]), vec!["tcp"]),
+            ("xhttp", "none", serde_json::json!(["h3"]), vec!["tcp"]),
+            ("xhttp", "tls", serde_json::Value::Null, vec!["tcp"]),
+            ("masque", "tls", serde_json::Value::Null, vec!["udp"]),
+            ("masque", "tls", serde_json::json!(["h2"]), vec!["tcp"]),
+            (
+                "masque",
+                "tls",
+                serde_json::json!(["h2", "h3"]),
+                vec!["tcp", "udp"],
+            ),
+            (
+                "masque",
+                "tls",
+                serde_json::json!("h2,h3"),
+                vec!["tcp", "udp"],
+            ),
+            (
+                "masque",
+                "tls",
+                serde_json::json!(["http/1.1"]),
+                vec!["udp"],
+            ),
+        ] {
+            let config = serde_json::json!({"api": {"listen": "127.0.0.1:10085"}, "inbounds": [{
+                "tag": "entry", "listen": "127.0.0.1", "port": 8443, "protocol": "vless",
+                "streamSettings": {"network": transport, "security": security, "tlsSettings": {"alpn": alpn}}
+            }]});
+            let endpoints = configured_handoff_endpoints(&dir, &config.to_string()).unwrap();
+            let actual: Vec<_> = endpoints
+                .iter()
+                .filter(|endpoint| endpoint.role == "public")
+                .map(|endpoint| endpoint.network.as_str())
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "transport={transport} security={security} alpn={alpn}"
+            );
+        }
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -187,13 +187,6 @@ export function TunnelProbeChart({
     const peak = Math.max(slowMs * 1.05, ...values.map(value => value ?? 0));
     const valueAxis = observeValueAxis(peak);
     const axes = observeTimeAxes(startMs, endMs, ink3, lineSoft);
-    if (windowSecs > 86_400) {
-      // Day-long steps would label every tick 00:00; a multi-day window names the day instead.
-      axes[0].axisLabel.formatter = (value: number) => {
-        const date = new Date(value);
-        return `${two(date.getMonth() + 1)}-${two(date.getDate())}`;
-      };
-    }
     // Without any run before it, the left part of the window is unobserved, not zero.
     const firstMs = points.length > 0 ? points[0].finished_at_unix_secs * 1000 : endMs;
     const unobserved = firstMs - startMs > gapSecs * 1000;

@@ -1,4 +1,5 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
+import { lazy } from './ui/lazy';
+import { Suspense, useCallback, useEffect, useState } from 'react';
 import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import {
   fetchAuthState,
@@ -47,9 +48,9 @@ function prefetchInitialRouteData(queryClient: QueryClient, hash: string, sessio
     if (nodeId) {
       // The nodes chunk is already being preloaded for this route. Reuse that import and start its
       // chart chunk plus bounded default-range reads while authentication UI is still settling.
-      void import('./panes/nodes').then(module =>
-        module.prefetchNodeDetailData(queryClient, nodeId, !isVisitor(session.who)),
-      );
+      void import('./panes/nodes')
+        .then(module => module.prefetchNodeDetailData(queryClient, nodeId, !isVisitor(session.who)))
+        .catch(() => undefined);
     }
     return;
   }
@@ -141,7 +142,7 @@ export function App() {
 
   useEffect(() => {
     if (brandingQuery.data) {
-      document.title = `${brandingQuery.data.site_name} | Invisible networks. Infallible control.`;
+      document.title = brandingQuery.data.site_name;
       syncFavicon(brandingQuery.data.icon_data_url);
     }
   }, [brandingQuery.data]);

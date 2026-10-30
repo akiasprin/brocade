@@ -327,3 +327,83 @@ async fn source_traffic_custom_range_uses_retained_windows_and_destinations_use_
         .await
         .is_err());
 }
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn source_traffic_chain_moves_reconcile_across_historical_app_rows_once() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query("INSERT INTO usage_user_ingress_rollups(node_id,period_start,tenant_id,user_id,ingress_id,app_id,chain_id,uplink_bytes,downlink_bytes)
+        SELECT 'n1',date_trunc('day',now() AT TIME ZONE 'Asia/Hong_Kong') AT TIME ZONE 'Asia/Hong_Kong','platform.acme','alice',ingress,app,'chn-a1b2-c3d4',0,bytes
+        FROM (VALUES ('before','app-old',100),('after','app-main',200)) entries(ingress,app,bytes)")
+        .execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO usage_user_node_rollups(node_id,period_start,tenant_id,user_id,uplink_bytes,downlink_bytes)
+        VALUES('n1',date_trunc('day',now() AT TIME ZONE 'Asia/Hong_Kong') AT TIME ZONE 'Asia/Hong_Kong','platform.acme','alice',0,300)")
+        .execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO source_traffic_daily(node_id,bucket,tenant_id,user_id,app_id,chain_id,ingress_id,source_ip,uplink_bytes,downlink_bytes)
+        SELECT 'n1',extract(epoch FROM date_trunc('day',now() AT TIME ZONE 'Asia/Hong_Kong') AT TIME ZONE 'Asia/Hong_Kong')::bigint,
+        'platform.acme','alice',app,'chn-a1b2-c3d4',ingress,'192.0.2.1',0,bytes
+        FROM (VALUES ('before','app-old',120),('after','app-main',80)) entries(ingress,app,bytes)")
+        .execute(db.pool()).await.unwrap();
+    let details = db
+        .store
+        .node_inflow_details(
+            &system_admin(),
+            "n1",
+            ("platform.acme", "alice"),
+            SiteUsagePeriod::Day,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !details.accounting_mismatch,
+        "a group move alone must not imply a different chain ledger"
+    );
+    assert_eq!(details.accounting_downlink_bytes, 300);
+    assert_eq!(
+        details
+            .rows
+            .iter()
+            .map(|r| r.traffic.downlink_bytes)
+            .sum::<u64>(),
+        300
+    );
+    assert_eq!(
+        details
+            .rows
+            .iter()
+            .filter(|r| r.source_ip.is_none())
+            .map(|r| r.traffic.downlink_bytes)
+            .sum::<u64>(),
+        100
+    );
+    // Real over-reporting remains visible even when the chain spans several groups.
+    sqlx::query("UPDATE source_traffic_daily SET downlink_bytes=300 WHERE app_id='app-main'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let details = db
+        .store
+        .node_inflow_details(
+            &system_admin(),
+            "n1",
+            ("platform.acme", "alice"),
+            SiteUsagePeriod::Day,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(details.accounting_mismatch);
+    assert_eq!(
+        details
+            .rows
+            .iter()
+            .map(|r| r.traffic.downlink_bytes)
+            .sum::<u64>(),
+        420
+    );
+}

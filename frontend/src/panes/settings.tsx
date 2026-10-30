@@ -30,6 +30,7 @@ import {
   startVpngateIntelligenceRefresh,
   saveDistribution,
   saveDeploymentSettings,
+  refreshAllUnlockProbes,
   saveDataRetention,
   saveAgentLogDefault,
   saveHostNetworkTuning,
@@ -327,6 +328,7 @@ const NAV: NavItem[] = [
   { id: 'set-visitor', label: '访客模式', icon: 'access' },
   { id: 'set-dist', label: '分发', icon: 'deploy' },
   { id: 'set-deployment', label: '发布', icon: 'deploy' },
+  { id: 'set-unlock', label: '解锁检测', icon: 'unlock' },
   { id: 'set-cert', label: '证书', icon: 'certificate' },
   { id: 'set-site-usage', label: '出流量统计', icon: 'usage' },
   // 探测配置不进产物：机器下一轮读到新值即生效，最长等一个原有周期。
@@ -1291,7 +1293,7 @@ function CertGroups({ view, editable }: { view: CertsView; editable: boolean }) 
               <section className="certgrp-section">
                 <header>
                   <b>已签发证书与申领记录</b>
-                  <span>{group.certificates.length} 张</span>
+                  <span className="header-stat">{group.certificates.length} 张</span>
                 </header>
                 <div className="certtbl">
                   {group.certificates.length === 0 ? (
@@ -1692,9 +1694,9 @@ function VisitorAccessSection({ editable, enabled }: { editable: boolean; enable
   );
 }
 
-function DeploymentSection({ editable, settings }: { editable: boolean; settings: DeploymentSettings }) {
+function useDeploymentSettingsUpdate() {
   const qc = useQueryClient();
-  const update = useMutation({
+  return useMutation({
     onMutate: () => qc.cancelQueries({ queryKey: ['deployment-settings'] }),
     mutationFn: (next: Partial<DeploymentSettings>) => saveDeploymentSettings(next),
     onSuccess: async settings => {
@@ -1702,8 +1704,105 @@ function DeploymentSection({ editable, settings }: { editable: boolean; settings
       qc.setQueryData(['deployment-settings'], settings);
       qc.invalidateQueries({ queryKey: ['deployments'] });
       qc.invalidateQueries({ queryKey: ['plan-artifacts'] });
+      qc.invalidateQueries({ queryKey: ['chain-unlock-probe'] });
+      qc.invalidateQueries({ queryKey: ['chain-unlock-probes'] });
+      qc.invalidateQueries({ queryKey: ['node-unlock-probe'] });
+      qc.invalidateQueries({ queryKey: ['chain-unlock-capabilities'] });
+      qc.invalidateQueries({ queryKey: ['node-unlock-capabilities'] });
     },
   });
+}
+
+export function UnlockSection({ editable, settings }: { editable: boolean; settings: DeploymentSettings }) {
+  const update = useDeploymentSettingsUpdate();
+  const qc = useQueryClient();
+  const [hours, setHours] = useState<string | null>(null);
+  const interval = hours ?? String(settings.unlock_detection_interval_hours);
+  const valid = /^\d+$/.test(interval) && Number(interval) >= 1 && Number(interval) <= 720;
+  const refresh = useMutation({
+    mutationFn: refreshAllUnlockProbes,
+    onSuccess: () => {
+      for (const key of [
+        'chain-unlock-probe',
+        'chain-unlock-probes',
+        'node-unlock-probe',
+        'chain-unlock-capabilities',
+        'node-unlock-capabilities',
+      ])
+        qc.invalidateQueries({ queryKey: [key] });
+    },
+  });
+  return (
+    <section className="panel config-panel" id="set-unlock">
+      <header>
+        <SettingsTitle id="set-unlock">解锁检测</SettingsTitle>
+      </header>
+      <p className="cardsub">全量检测所有运行中的机器和线路。链路或机器 DNS 变更生效后，立即重测受影响的路径。</p>
+      {update.error && <ErrorBox error={update.error} />}
+      {refresh.error && <ErrorBox error={refresh.error} />}
+      <Group label="检测安排">
+        <Fld label="检测模式">
+          <SegmentedControl
+            value={settings.unlock_detection_mode}
+            options={[
+              { value: 'manual', label: '手动' },
+              { value: 'scheduled', label: '定时循环' },
+            ]}
+            disabled={!editable || update.isPending}
+            ariaLabel="解锁检测模式"
+            onChange={next => update.mutate({ unlock_detection_mode: next })}
+          />
+          <span className="hint">手动模式停止定时循环，配置变更仍会触发检测。</span>
+        </Fld>
+        <Fld label="循环间隔（小时）">
+          <input
+            className="f"
+            style={{ maxWidth: 100 }}
+            aria-label="解锁检测循环间隔（小时）"
+            type="number"
+            min={1}
+            max={720}
+            step={1}
+            value={interval}
+            disabled={!editable || update.isPending}
+            onChange={event => setHours(event.target.value)}
+          />
+          <button
+            type="button"
+            className="btn"
+            disabled={
+              !editable || update.isPending || !valid || Number(interval) === settings.unlock_detection_interval_hours
+            }
+            onClick={() =>
+              update.mutate({ unlock_detection_interval_hours: Number(interval) }, { onSuccess: () => setHours(null) })
+            }
+          >
+            保存间隔
+          </button>
+          <span className="hint">每 {valid ? Number(interval) : 'X'} 小时全量检测一遍；手动模式保留此设置。</span>
+        </Fld>
+        <Fld label="全量刷新">
+          <button
+            type="button"
+            className="btn"
+            disabled={!editable || refresh.isPending}
+            onClick={() => refresh.mutate()}
+          >
+            {refresh.isPending ? '正在安排…' : '立即全量检测'}
+          </button>
+          {refresh.isSuccess && (
+            <span className="hint" role="status">
+              已安排全量检测，机器在线后依次执行。
+            </span>
+          )}
+        </Fld>
+      </Group>
+    </section>
+  );
+}
+
+function DeploymentSection({ editable, settings }: { editable: boolean; settings: DeploymentSettings }) {
+  const update = useDeploymentSettingsUpdate();
 
   return (
     <section className="panel config-panel" id="set-deployment">
@@ -3602,6 +3701,8 @@ export function SettingsPane() {
             )}
 
             <DeploymentSection editable={editable} settings={deploymentSettings.data!} />
+
+            <UnlockSection editable={editable} settings={deploymentSettings.data!} />
 
             {certs.error ? <ErrorBox error={certs.error} /> : <CertSection editable={editable} view={certs.data!} />}
 

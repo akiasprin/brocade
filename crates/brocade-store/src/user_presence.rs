@@ -1,8 +1,8 @@
 //! Current and recently disconnected public source addresses for user credentials.
 //!
-//! Xray owns connection truth; the Store keeps each node's latest accepted snapshot plus a
-//! bounded 30-day tail for incident review. Presence never enters revisions, artifacts, usage
-//! accounting or the Agent's durable spool.
+//! Xray owns connection truth; the Store keeps each node's latest accepted snapshot and a
+//! bounded tail of completed epochs (30 days by default). Presence never enters revisions,
+//! artifacts, usage accounting or the Agent's durable spool.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,10 +35,16 @@ pub enum UserPresenceState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserOnlineSourceView {
     pub ip: String,
+    /// Stable identity of an ended ingress/IP epoch. Live presence remains grouped by IP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// When Console first confirmed the epoch had ended; absent for live or legacy snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_at: Option<String>,
     pub first_observed_at: String,
     pub last_observed_at: String,
     pub xray_last_seen_at: String,
-    /// Start and byte counters for the current (or most recently ended) continuous online epoch.
+    /// Start and byte counters for this live or completed continuous online epoch.
     /// Missing means the reporting Agent/Xray predates source-session accounting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub online_since_at: Option<String>,
@@ -280,24 +286,6 @@ pub(crate) async fn replace_node_snapshot(
 ) -> Result<()> {
     let sources = normalize_snapshot(observed_at_unix_secs, users)?;
 
-    // First close the preceding snapshot. Rows present below are reactivated by the upsert in the
-    // same transaction, so readers never observe the intermediate state.
-    sqlx::query(
-        "UPDATE user_online_sources
-            SET active = FALSE,
-                last_observed_at = GREATEST(last_observed_at, to_timestamp($2)),
-                offline_at = to_timestamp($2)
-          WHERE node_id = $1 AND active",
-    )
-    .bind(node_id)
-    .bind(observed_at_unix_secs as f64)
-    .execute(&mut **tx)
-    .await?;
-
-    if sources.is_empty() {
-        return Ok(());
-    }
-
     let tenant_ids = sources
         .iter()
         .map(|source| source.tenant_id.clone())
@@ -335,6 +323,51 @@ pub(crate) async fn replace_node_snapshot(
         .map(|source| source.session_downlink_bytes)
         .collect::<Vec<_>>();
 
+    // node_agent_state is already locked by the runtime-report transaction. End only missing
+    // sources or epochs whose Xray start/counters changed, including reconnects between reports.
+    // A failed/missing snapshot never reaches this function and cannot fabricate an offline event.
+    sqlx::query(
+        "WITH incoming AS (
+            SELECT value.* FROM unnest(
+                $3::text[], $4::text[], $5::text[], $6::text[],
+                $7::bigint[], $8::bigint[], $9::bigint[]
+            ) AS value(tenant_id, user_id, ingress_id, source_ip, online_since, uplink, downlink)
+            JOIN grants g USING (tenant_id, user_id, ingress_id)
+            JOIN ingresses i ON i.id = value.ingress_id AND i.node_id = $1
+         )
+         UPDATE user_online_sources source
+            SET active = FALSE,
+                last_observed_at = GREATEST(source.last_observed_at, to_timestamp($2)),
+                offline_at = to_timestamp($2)
+          WHERE source.node_id = $1 AND source.active
+            AND NOT EXISTS (
+                SELECT 1 FROM incoming value
+                 WHERE value.tenant_id = source.tenant_id AND value.user_id = source.user_id
+                   AND value.ingress_id = source.ingress_id AND value.source_ip::inet = source.source_ip
+                   AND (
+                       (source.online_since_at IS NOT NULL AND value.online_since IS NOT NULL
+                        AND source.online_since_at <> to_timestamp(value.online_since::double precision))
+                       OR value.uplink < source.session_uplink_bytes
+                       OR value.downlink < source.session_downlink_bytes
+                   ) IS NOT TRUE
+            )",
+    )
+    .bind(node_id)
+    .bind(observed_at_unix_secs as f64)
+    .bind(&tenant_ids)
+    .bind(&user_ids)
+    .bind(&ingress_ids)
+    .bind(&ips)
+    .bind(&online_since)
+    .bind(&session_uplink)
+    .bind(&session_downlink)
+    .execute(&mut **tx)
+    .await?;
+
+    if sources.is_empty() {
+        return Ok(());
+    }
+
     // Joining current grants and ingress ownership drops probe labels, stale credentials and a
     // compromised node attempting to attribute an address to another node's listener.
     sqlx::query(
@@ -366,7 +399,7 @@ pub(crate) async fn replace_node_snapshot(
            JOIN ingresses ingress
              ON ingress.id = value.ingress_id
             AND ingress.node_id = $1
-         ON CONFLICT (node_id, tenant_id, user_id, ingress_id, source_ip)
+         ON CONFLICT (node_id, tenant_id, user_id, ingress_id, source_ip) WHERE active
          DO UPDATE SET
             active = TRUE,
             last_observed_at = EXCLUDED.last_observed_at,
@@ -552,21 +585,19 @@ pub async fn list(pool: &PgPool, actor: &AdminContext) -> Result<UserPresenceLis
     })
 }
 
-/// List recently disconnected public source addresses for one user.
+/// List completed ingress/IP epochs for one user, including addresses currently online again.
 ///
 /// History is intentionally separate from [`list`]: the roster polls current presence, while
-/// incident-review addresses are fetched only after an administrator expands one user. An IP
-/// that is current on any freshly reporting node is omitted even if another node already has an
-/// offline row for the same address.
+/// incident-review epochs are fetched only after an administrator expands one user. Expired
+/// active snapshots are unknown, not completed sessions: only a successful report can end one.
 pub async fn history(
     pool: &PgPool,
     actor: &AdminContext,
     tenant_id: &str,
     user_id: &str,
 ) -> Result<UserOnlineSourceHistory> {
-    let retention_days = crate::retention::ttl_hours(pool, "user_online_sources")
-        .await?
-        .div_ceil(24);
+    let retention_hours = crate::retention::ttl_hours(pool, "user_online_sources").await?;
+    let retention_days = retention_hours.div_ceil(24);
     let tenant_id = required_text(tenant_id, "tenant_id")?;
     let user_id = required_text(user_id, "user_id")?;
     if actor.role() == AdminRole::User || actor.operator_id() == PUBLIC_OPERATOR_ID {
@@ -591,23 +622,15 @@ pub async fn history(
     let fetch_limit = i64::try_from(USER_ONLINE_SOURCE_HISTORY_LIMIT + 1)
         .expect("online source history limit fits i64");
     let rows = sqlx::query(
-        "SELECT host(source.source_ip) AS ip,
-                min(source.first_observed_at)::text AS first_observed_at,
-                max(source.last_observed_at)::text AS last_observed_at,
-                max(source.xray_last_seen_at)::text AS xray_last_seen_at,
-                CASE WHEN count(*) FILTER (WHERE source.online_since_at IS NULL) = 0
-                     THEN min(source.online_since_at)::text END AS online_since_at,
-                CASE WHEN count(*) FILTER (WHERE source.session_uplink_bytes IS NULL) = 0
-                     THEN LEAST(sum(source.session_uplink_bytes),
-                                9223372036854775807::numeric)::bigint END
-                     AS session_uplink_bytes,
-                CASE WHEN count(*) FILTER (WHERE source.session_downlink_bytes IS NULL) = 0
-                     THEN LEAST(sum(source.session_downlink_bytes),
-                                9223372036854775807::numeric)::bigint END
-                     AS session_downlink_bytes,
-                array_agg(DISTINCT source.node_id ORDER BY source.node_id) AS node_ids,
-                array_agg(DISTINCT source.ingress_id ORDER BY source.ingress_id) AS ingress_ids,
-                jsonb_agg(jsonb_build_object(
+        "SELECT host(source.source_ip) AS ip, source.session_id::text AS session_id,
+                source.offline_at::text AS offline_at,
+                source.first_observed_at::text AS first_observed_at,
+                source.last_observed_at::text AS last_observed_at,
+                source.xray_last_seen_at::text AS xray_last_seen_at,
+                source.online_since_at::text AS online_since_at,
+                source.session_uplink_bytes, source.session_downlink_bytes,
+                ARRAY[source.node_id] AS node_ids, ARRAY[source.ingress_id] AS ingress_ids,
+                jsonb_build_array(jsonb_build_object(
                     'node_id', source.node_id, 'ingress_id', source.ingress_id,
                     'protocols', source.protocols,
                     'last_observed_at', source.last_observed_at::text,
@@ -615,30 +638,18 @@ pub async fn history(
                     'online_since_at', source.online_since_at::text,
                     'session_uplink_bytes', source.session_uplink_bytes,
                     'session_downlink_bytes', source.session_downlink_bytes
-                ) ORDER BY source.node_id, source.ingress_id) AS accesses
+                )) AS accesses
            FROM user_online_sources source
           WHERE source.tenant_id = $1
             AND source.user_id = $2
-            AND source.last_observed_at >= now() - make_interval(days => $3)
-            AND NOT EXISTS (
-                SELECT 1
-                  FROM user_online_sources current_source
-                  JOIN node_agent_state agent ON agent.node_id = current_source.node_id
-                 WHERE current_source.tenant_id = source.tenant_id
-                   AND current_source.user_id = source.user_id
-                   AND current_source.source_ip = source.source_ip
-                   AND current_source.active
-                   AND agent.online_sources_reported_at >=
-                       now() - make_interval(secs => $4)
-            )
-          GROUP BY source.source_ip
-          ORDER BY max(source.last_observed_at) DESC, host(source.source_ip)
-          LIMIT $5",
+            AND NOT source.active
+            AND source.last_observed_at >= now() - make_interval(secs => $3)
+          ORDER BY source.last_observed_at DESC, host(source.source_ip), source.session_id DESC
+          LIMIT $4",
     )
     .bind(&tenant_id)
     .bind(&user_id)
-    .bind(USER_ONLINE_SOURCE_RETENTION_DAYS as i32)
-    .bind(ONLINE_SOURCE_FRESH_SECS as i32)
+    .bind(f64::from(retention_hours) * 3600.0)
     .bind(fetch_limit)
     .fetch_all(pool)
     .await?;
@@ -650,6 +661,8 @@ pub async fn history(
         .map(|row| {
             Ok(UserOnlineSourceView {
                 ip: row.try_get("ip")?,
+                session_id: row.try_get("session_id")?,
+                offline_at: row.try_get("offline_at")?,
                 first_observed_at: row.try_get("first_observed_at")?,
                 last_observed_at: row.try_get("last_observed_at")?,
                 xray_last_seen_at: row.try_get("xray_last_seen_at")?,

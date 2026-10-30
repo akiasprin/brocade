@@ -821,14 +821,12 @@ fn managed_vpngate_pools_lower_to_deterministic_local_socks_endpoints() {
     assert_eq!(jp["streamSettings"]["security"], "none");
 
     let sg = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "sg")));
-    assert!(sg["outbounds"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|candidate| !candidate["tag"]
+    assert!(sg["outbounds"].as_array().unwrap().iter().all(|candidate| {
+        !candidate["tag"]
             .as_str()
             .unwrap_or_default()
-            .starts_with("out:external/vpngate-")));
+            .starts_with("out:external/vpngate-")
+    }));
 }
 
 #[test]
@@ -2648,7 +2646,14 @@ fn every_freedom_outbound_takes_the_nodes_domain_strategy() {
     );
     for outbound in &freedom {
         assert_eq!(
-            outbound["settings"]["domainStrategy"], "UseIPv6v4",
+            outbound["settings"]["domainStrategy"],
+            if outbound["tag"].as_str().unwrap().ends_with(":probe-v4") {
+                "ForceIPv4"
+            } else if outbound["tag"].as_str().unwrap().ends_with(":probe-v6") {
+                "ForceIPv6"
+            } else {
+                "UseIPv6v4"
+            },
             "outbound {} kept the old value",
             outbound["tag"]
         );
@@ -2778,6 +2783,15 @@ fn project_node_merges_xray_structure_from_all_app_views() {
             "out:forward",
             "out:relay/c-relay>sg",
             "out:egress",
+            "out:forward:probe-v4",
+            "out:relay/c-relay>sg:probe-v4",
+            "out:egress:probe-v4",
+            "out:forward:probe-v6",
+            "out:relay/c-relay>sg:probe-v6",
+            "out:egress:probe-v6",
+            "probe:dns",
+            "probe:dns:out:relay/c-relay>sg",
+            "out:probe-family-unsupported",
             "out:block",
             "out:reality-guard",
             "out:internal"
@@ -2880,6 +2894,16 @@ fn xray_tags_are_namespaced_by_app() {
             "out:forward",
             "out:a/c>sg",
             "out:b/c>sg",
+            "out:forward:probe-v4",
+            "out:a/c>sg:probe-v4",
+            "out:b/c>sg:probe-v4",
+            "out:forward:probe-v6",
+            "out:a/c>sg:probe-v6",
+            "out:b/c>sg:probe-v6",
+            "probe:dns",
+            "probe:dns:out:a/c>sg",
+            "probe:dns:out:b/c>sg",
+            "out:probe-family-unsupported",
             "out:reality-guard",
             "out:internal"
         ]
@@ -3055,7 +3079,7 @@ fn machine_egress_dns_is_global_without_replacing_default_dns() {
             position: 0,
             selector: DestMatch::Geosite(vec!["netflix".to_owned()]),
             resolution: EgressDnsResolution {
-                address: "192.0.2.53".to_owned(),
+                address: "192.0.2.53".to_owned().into(),
                 port: 53,
                 transport: EgressDnsTransport::Tcp,
                 address_strategy: EgressDnsAddressStrategy::UseIpv4,
@@ -3067,7 +3091,7 @@ fn machine_egress_dns_is_global_without_replacing_default_dns() {
             position: 1,
             selector: DestMatch::DomainKeyword(vec!["disney".to_owned()]),
             resolution: EgressDnsResolution {
-                address: "2001:db8::53".to_owned(),
+                address: "2001:db8::53".to_owned().into(),
                 port: 5353,
                 transport: EgressDnsTransport::Udp,
                 address_strategy: EgressDnsAddressStrategy::UseIpv6,
@@ -3079,7 +3103,7 @@ fn machine_egress_dns_is_global_without_replacing_default_dns() {
             position: 2,
             selector: DestMatch::DomainKeyword(vec!["v4-first".to_owned()]),
             resolution: EgressDnsResolution {
-                address: "198.51.100.53".to_owned(),
+                address: "198.51.100.53".to_owned().into(),
                 port: 53,
                 transport: EgressDnsTransport::Tcp,
                 address_strategy: EgressDnsAddressStrategy::UseIpv4v6,
@@ -3091,7 +3115,7 @@ fn machine_egress_dns_is_global_without_replacing_default_dns() {
             position: 3,
             selector: DestMatch::DomainKeyword(vec!["v6-first".to_owned()]),
             resolution: EgressDnsResolution {
-                address: "203.0.113.53".to_owned(),
+                address: "203.0.113.53".to_owned().into(),
                 port: 53,
                 transport: EgressDnsTransport::Tcp,
                 address_strategy: EgressDnsAddressStrategy::UseIpv6v4,
@@ -3185,6 +3209,11 @@ fn machine_egress_dns_is_global_without_replacing_default_dns() {
 
     let dns_tag = servers[0]["tag"].as_str().unwrap();
     assert!(dns_tag.starts_with("dns:egress:"));
+    assert_eq!(
+        Some(dns_tag.to_owned()),
+        brocade_core::physical::node::egress_dns_policy_tag(&doc.node_egress_dns[0]),
+        "diagnostic identity must equal the tag actually emitted into Xray",
+    );
     let routes = value["routing"]["rules"].as_array().unwrap();
     let dns_route = routes
         .iter()
@@ -3204,7 +3233,9 @@ fn machine_egress_dns_is_global_without_replacing_default_dns() {
     );
     let traffic_route = routes
         .iter()
-        .find(|rule| rule["domain"] == serde_json::json!(["geosite:netflix"]))
+        .find(|rule| {
+            rule["domain"] == serde_json::json!(["geosite:netflix"]) && rule.get("user").is_none()
+        })
         .unwrap();
     let traffic_outbound_tag = traffic_route["outboundTag"].as_str().unwrap();
     assert_ne!(traffic_outbound_tag, dns_outbound_tag);
@@ -3234,7 +3265,9 @@ fn machine_egress_dns_is_global_without_replacing_default_dns() {
     assert_eq!(
         routes
             .iter()
-            .find(|rule| rule["domain"] == serde_json::json!(["disney"]))
+            .find(|rule| {
+                rule["domain"] == serde_json::json!(["disney"]) && rule.get("user").is_none()
+            })
             .unwrap()["outboundTag"],
         v6_outbound_tag
     );
@@ -3252,7 +3285,7 @@ fn machine_egress_dns_is_emitted_without_a_route_reference() {
         position: 0,
         selector: selector.clone(),
         resolution: EgressDnsResolution {
-            address: "192.0.2.53".to_owned(),
+            address: "192.0.2.53".to_owned().into(),
             port: 53,
             transport: EgressDnsTransport::Tcp,
             address_strategy: EgressDnsAddressStrategy::UseIpv4,
@@ -3313,17 +3346,100 @@ fn machine_egress_dns_is_emitted_without_a_route_reference() {
 }
 
 #[test]
+fn dns_group_members_race_under_one_policy_and_stop_after_the_last_member() {
+    for transport in [EgressDnsTransport::Udp, EgressDnsTransport::Tcp] {
+        let mut doc = doc(vec![node("exit", [10, 66, 0, 1], true, Dns::System)]);
+        doc.node_egress_dns = vec![NodeEgressDnsPolicy {
+            node: "exit".into(),
+            position: 0,
+            selector: DestMatch::DomainSuffix(vec!["stream.example".into()]),
+            resolution: EgressDnsResolution {
+                address: vec![
+                    "192.0.2.53".into(),
+                    "2001:db8::53".into(),
+                    "198.51.100.53".into(),
+                ]
+                .into(),
+                port: 5353,
+                transport,
+                address_strategy: EgressDnsAddressStrategy::UseIp,
+                fallback: EgressDnsFallback::Stop,
+            },
+        }];
+        let app = AppView {
+            id: "group".into(),
+            label: "group".into(),
+            chains: vec![chain("stream")],
+            ingresses: vec![ingress("stream-in", "stream", "exit")],
+            fronts: vec![],
+            steps: vec![step("stream", "exit", Vec::new(), None)],
+            grants: vec![],
+        };
+        let mut diagnostics = Vec::new();
+        let system = compile_system(&doc, &mut diagnostics);
+        let app = compile_hops(
+            compile_app(&doc, &app, &mut diagnostics),
+            &system,
+            &mut diagnostics,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let value = parse_xray(&xray::build(&project_node(&system, &[app], "exit")));
+        let dns = &value["dns"];
+        assert_eq!(dns["enableParallelQuery"], true);
+        let servers = dns["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 4);
+        assert_eq!(servers[0]["tag"], servers[1]["tag"]);
+        assert_eq!(servers[1]["tag"], servers[2]["tag"]);
+        assert_eq!(servers[0]["finalQuery"], false);
+        assert_eq!(servers[1]["finalQuery"], false);
+        assert_eq!(servers[2]["finalQuery"], true);
+        for server in &servers[..3] {
+            assert_eq!(server["port"], 5353);
+            assert_eq!(
+                server["domains"],
+                serde_json::json!(["domain:stream.example"])
+            );
+            assert_eq!(server["skipFallback"], true);
+            assert_eq!(
+                server["address"].as_str().unwrap().starts_with("tcp://"),
+                transport == EgressDnsTransport::Tcp
+            );
+        }
+        assert_eq!(
+            value["routing"]["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|rule| rule["inboundTag"] == serde_json::json!([servers[0]["tag"]]))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn dns_address_groups_preserve_historical_singletons() {
+    let legacy = serde_json::json!({"address":"192.0.2.53","port":53,"transport":"udp","address_strategy":"use_ip","fallback":"machine"});
+    let resolution: EgressDnsResolution = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&resolution).unwrap(), legacy);
+    let group = serde_json::json!({"address":["192.0.2.53","2001:db8::53"],"port":53,"transport":"udp","address_strategy":"use_ip","fallback":"machine"});
+    let resolution: EgressDnsResolution = serde_json::from_value(group.clone()).unwrap();
+    assert!(resolution.address.valid());
+    assert_eq!(serde_json::to_value(resolution).unwrap(), group);
+}
+
+#[test]
 fn machine_dns_priority_overrides_chain_rule_order() {
     let mut doc = doc(vec![node("hk", [10, 66, 0, 1], true, Dns::System)]);
     let alpha_resolution = EgressDnsResolution {
-        address: "192.0.2.53".to_owned(),
+        address: "192.0.2.53".to_owned().into(),
         port: 53,
         transport: EgressDnsTransport::Tcp,
         address_strategy: EgressDnsAddressStrategy::UseIp,
         fallback: EgressDnsFallback::Stop,
     };
     let beta_resolution = EgressDnsResolution {
-        address: "198.51.100.53".to_owned(),
+        address: "198.51.100.53".to_owned().into(),
         ..alpha_resolution.clone()
     };
     let alpha = DestMatch::DomainSuffix(vec!["alpha.example".to_owned()]);
@@ -3679,6 +3795,12 @@ fn reverse_hop_renders_portal_upstream_and_bridge_downstream() {
 
     // ── Downstream: the bridge tag rides on the dialling outbound ──
     let downstream = parse_xray(&xray::build(&project_node(&sys, &[app_ir], "sg")));
+    assert!(downstream.get("burstObservatory").is_none(),
+        "reverse-only credentials must not be used as ordinary HTTP probe outbounds: {downstream:#?}");
+    assert!(
+        downstream["routing"].get("balancers").is_none(),
+        "a reverse-only node must not instantiate an unused HTTP observatory balancer"
+    );
     assert!(
         downstream.get("reverse").is_none(),
         "顶层 reverse 块必须消失：{downstream:#?}"

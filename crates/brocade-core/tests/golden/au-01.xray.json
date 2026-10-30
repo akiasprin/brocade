@@ -7,6 +7,7 @@
     ],
     "tag": "api"
   },
+  "brocadeUnlockIpFamilies": 2,
   "dns": {
     "serveExpiredTTL": 129600,
     "serveStale": true,
@@ -133,6 +134,21 @@
             "email": "c-brc-jp@au-01",
             "id": "be28706f-a93f-4be2-b66e-5cfc726024dd",
             "level": 0
+          },
+          {
+            "email": "probe#dns:c-brc-jp%40au-01",
+            "id": "60274aad-0f05-447e-ab75-ede56f442131",
+            "level": 0
+          },
+          {
+            "email": "probe#v4:c-brc-jp%40au-01",
+            "id": "73168ecd-0007-4525-a9c4-6be7bc2ccccb",
+            "level": 0
+          },
+          {
+            "email": "probe#v6:c-brc-jp%40au-01",
+            "id": "310ec9b5-e9a2-4ec4-b338-4f017d2b3ba9",
+            "level": 0
           }
         ],
         "decryption": "none"
@@ -168,6 +184,21 @@
             "email": "c-brc-smart@au-01",
             "id": "741ba094-e89d-4ac4-9f43-26823594ede9",
             "level": 0
+          },
+          {
+            "email": "probe#dns:c-brc-smart%40au-01",
+            "id": "16be743b-4160-48d3-a01b-070e656e0297",
+            "level": 0
+          },
+          {
+            "email": "probe#v4:c-brc-smart%40au-01",
+            "id": "b6a52b72-00bb-4ef1-9ab5-e742c3c2f376",
+            "level": 0
+          },
+          {
+            "email": "probe#v6:c-brc-smart%40au-01",
+            "id": "809a42f9-c39f-4889-9af0-17cb7757eeb9",
+            "level": 0
           }
         ],
         "decryption": "none"
@@ -202,6 +233,21 @@
           {
             "email": "c-lin-au@au-01",
             "id": "a0621a1d-d3f0-4a8b-a9cd-95efbe50d542",
+            "level": 0
+          },
+          {
+            "email": "probe#dns:c-lin-au%40au-01",
+            "id": "477496ed-6b7b-4a3a-a43e-bbcf9916f428",
+            "level": 0
+          },
+          {
+            "email": "probe#v4:c-lin-au%40au-01",
+            "id": "3aa67f70-ddc5-4d4a-809f-b58ba00b4353",
+            "level": 0
+          },
+          {
+            "email": "probe#v6:c-lin-au%40au-01",
+            "id": "70e78502-521b-4c05-8902-05f909aafa0f",
             "level": 0
           }
         ],
@@ -248,6 +294,43 @@
       "tag": "out:egress"
     },
     {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "ForceIPv4"
+      },
+      "tag": "out:forward:probe-v4"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "ForceIPv4"
+      },
+      "tag": "out:egress:probe-v4"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "ForceIPv6"
+      },
+      "tag": "out:forward:probe-v6"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "ForceIPv6"
+      },
+      "tag": "out:egress:probe-v6"
+    },
+    {
+      "protocol": "dns",
+      "settings": {},
+      "tag": "probe:dns"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "out:probe-family-unsupported"
+    },
+    {
       "protocol": "blackhole",
       "tag": "out:reality-guard"
     },
@@ -286,7 +369,7 @@
           "api"
         ],
         "outboundTag": "api",
-        "ruleTag": "r:345c144e:000",
+        "ruleTag": "r:88f89af2:000",
         "type": "field"
       },
       {
@@ -294,7 +377,7 @@
           "dns-out"
         ],
         "outboundTag": "out:egress",
-        "ruleTag": "r:345c144e:001",
+        "ruleTag": "r:88f89af2:001",
         "type": "field"
       },
       {
@@ -305,7 +388,7 @@
           "in:frt/i-frt-au:guard"
         ],
         "outboundTag": "out:internal",
-        "ruleTag": "r:345c144e:002",
+        "ruleTag": "r:88f89af2:002",
         "type": "field"
       },
       {
@@ -313,23 +396,167 @@
           "in:frt/i-frt-au:guard"
         ],
         "outboundTag": "out:reality-guard",
-        "ruleTag": "r:345c144e:003",
+        "ruleTag": "r:88f89af2:003",
         "type": "field"
       },
       {
+        "outboundTag": "out:egress:probe-v4",
+        "ruleTag": "r:88f89af2:004",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-jp%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:88f89af2:005",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-jp%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "out:egress:probe-v6",
+        "ruleTag": "r:88f89af2:006",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-jp%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:88f89af2:007",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-jp%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:88f89af2:008",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-jp%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:88f89af2:009",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-jp%40au-01"
+        ]
+      },
+      {
         "outboundTag": "out:egress",
-        "ruleTag": "r:345c144e:004",
+        "ruleTag": "r:88f89af2:010",
         "type": "field",
         "user": [
           "c-brc-jp@au-01"
         ]
       },
       {
+        "outboundTag": "out:egress:probe-v4",
+        "ruleTag": "r:88f89af2:011",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-smart%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:88f89af2:012",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-smart%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "out:egress:probe-v6",
+        "ruleTag": "r:88f89af2:013",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-smart%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:88f89af2:014",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-smart%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:88f89af2:015",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-smart%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:88f89af2:016",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-smart%40au-01"
+        ]
+      },
+      {
         "outboundTag": "out:egress",
-        "ruleTag": "r:345c144e:005",
+        "ruleTag": "r:88f89af2:017",
         "type": "field",
         "user": [
           "c-brc-smart@au-01"
+        ]
+      },
+      {
+        "outboundTag": "out:egress:probe-v4",
+        "ruleTag": "r:88f89af2:018",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-frt-au"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:88f89af2:019",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-frt-au"
+        ]
+      },
+      {
+        "outboundTag": "out:egress:probe-v6",
+        "ruleTag": "r:88f89af2:020",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-frt-au"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:88f89af2:021",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-frt-au"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:88f89af2:022",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-frt-au"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:88f89af2:023",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-frt-au"
         ]
       },
       {
@@ -337,12 +564,60 @@
           "in:frt/i-frt-au"
         ],
         "outboundTag": "out:egress",
-        "ruleTag": "r:345c144e:006",
+        "ruleTag": "r:88f89af2:024",
         "type": "field"
       },
       {
+        "outboundTag": "out:egress:probe-v4",
+        "ruleTag": "r:88f89af2:025",
+        "type": "field",
+        "user": [
+          "probe#v4:c-lin-au%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:88f89af2:026",
+        "type": "field",
+        "user": [
+          "probe#v4:c-lin-au%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "out:egress:probe-v6",
+        "ruleTag": "r:88f89af2:027",
+        "type": "field",
+        "user": [
+          "probe#v6:c-lin-au%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:88f89af2:028",
+        "type": "field",
+        "user": [
+          "probe#v6:c-lin-au%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:88f89af2:029",
+        "type": "field",
+        "user": [
+          "probe#dns:c-lin-au%40au-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:88f89af2:030",
+        "type": "field",
+        "user": [
+          "probe#dns:c-lin-au%40au-01"
+        ]
+      },
+      {
         "outboundTag": "out:egress",
-        "ruleTag": "r:345c144e:007",
+        "ruleTag": "r:88f89af2:031",
         "type": "field",
         "user": [
           "c-lin-au@au-01"

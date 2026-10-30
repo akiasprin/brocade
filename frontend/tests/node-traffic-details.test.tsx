@@ -220,7 +220,13 @@ it('renders proportional flows, highlights by keyboard and exposes exact per-cha
   expect(container.querySelectorAll('.ntf-link.dim')).toHaveLength(1);
   fireEvent.click(alice);
   const detail = await screen.findByRole('dialog', { name: 'alice · 流入明细' });
-  expect((await within(detail).findByRole('table')).textContent).toContain('香港');
+  // 两条链上的同一个来源只排一行，条形按流入统计里的链色分段。
+  const sources = await within(detail).findByRole('list', { name: '来源' });
+  expect(sources.querySelectorAll(':scope > li')).toHaveLength(1);
+  expect(
+    [...sources.querySelectorAll<HTMLElement>('.nid-meter > i')].map(segment => segment.style.background).sort(),
+  ).toEqual(['var(--observe-1)', 'var(--observe-6)']);
+  expect(within(detail).getByRole('group', { name: /接入链/ }).textContent).toContain('香港');
   expect(vi.mocked(fetchNodeInflowDetails)).toHaveBeenCalledWith('n1', 'platform', 'alice', 'day', undefined);
   expect(container.textContent).not.toContain('platform');
   fireEvent.blur(alice);
@@ -241,7 +247,7 @@ it('switches to the mobile bars below 720px and supports focus and expansion', a
   fireEvent.click(alice);
   expect(alice.getAttribute('aria-haspopup')).toBe('dialog');
   const detail = await screen.findByRole('dialog', { name: 'alice · 流入明细' });
-  expect(await within(detail).findByRole('table')).toBeTruthy();
+  expect(await within(detail).findByRole('list', { name: '来源' })).toBeTruthy();
   fireEvent.click(within(detail).getByRole('button', { name: '关闭流入明细' }));
   await waitFor(() => expect(screen.queryByRole('dialog', { name: 'alice · 流入明细' })).toBeNull());
   act(() => {
@@ -290,7 +296,7 @@ it('keeps tenants distinct, includes forwarding and unattributed bytes, and dist
   ).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: 'alice · 420 B' }));
   const detail = await screen.findByRole('dialog', { name: 'alice · 流入明细' });
-  expect(await within(detail).findByText('端口转发')).toBeTruthy();
+  expect(await within(detail).findByText('端口转发 · 不区分来源')).toBeTruthy();
   unmount();
   vi.mocked(fetchNodeInflowUsage).mockResolvedValue(inflow({ rows: [], latest_report_unix_secs: null }));
   mount(<NodeInflowUsageCard nodeId="n2" period="day" />);
@@ -605,4 +611,29 @@ it('counts authorized users once across several ingress grants and excludes othe
   ];
   model.snapshot.apps[0].grants.push({ tenant: 'platform', user: 'alice', ingress: 'entry-1' });
   expect(trafficUserKeys(model, 'n1')).toEqual(['platform/alice', 'platform/bob']);
+});
+
+it('keeps a moved chain in one source with its current name and unchanged totals', async () => {
+  vi.mocked(fetchNodeInflowUsage).mockImplementation(async (_node, period) => ({
+    ...inflow(),
+    period,
+    rows: [row('alice', 'a', 100, { app_id: 'app-old' }), row('alice', 'a', 200)],
+  }));
+  const { container } = mount(<NodeInflowUsageCard nodeId="n1" period="month" sourceOf={trafficSources(snapshot)} />);
+  await screen.findByRole('img', { name: /用户到接入链的流向/ });
+  expect(container.querySelector('.site-usage-total')?.textContent).toBe('300 B');
+  expect(container.textContent).toContain('1 个来源');
+  expect(screen.queryByText('接入链 a')).toBeNull();
+  expect(screen.getAllByText('香港').length).toBeGreaterThan(0);
+  expect(container.querySelectorAll('path.ntf-link')).toHaveLength(1);
+  fireEvent.click(screen.getByRole('button', { name: 'alice · 300 B' }));
+  const detail = await screen.findByRole('dialog', { name: 'alice · 流入明细' });
+  const sources = await within(detail).findByRole('list', { name: '来源' });
+  expect(within(detail).queryByRole('group', { name: /接入链/ })).toBeNull();
+  expect(sources.querySelectorAll('.nid-meter > i')).toHaveLength(1);
+  expect(
+    [...sources.querySelectorAll<HTMLElement>('.nid-meter > i')].every(
+      part => part.style.background === 'var(--observe-1)',
+    ),
+  ).toBe(true);
 });

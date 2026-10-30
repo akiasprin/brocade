@@ -78,7 +78,7 @@ export function ChainProxyListSection({
       <header>
         <ListIcon of="client" />
         <h4>链式代理</h4>
-        <span className="hint">{fronts.length} 个前置组</span>
+        <span className="hint header-stat">{fronts.length} 个前置组</span>
         <span className="rd">客户端订阅 · 无需发布机器</span>
         <button className="btn" disabled={!editable || apps.length === 0} onClick={onCreate}>
           ＋ 新建前置组

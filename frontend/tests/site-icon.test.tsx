@@ -41,3 +41,16 @@ it('uses local generic icons for unclassified traffic and unknown categories', (
     view.unmount();
   }
 });
+
+it.each([
+  ['dazn', 1],
+  ['hbomax', 6],
+] as const)('renders the complete %s vector without font or network assets', (id, shapes) => {
+  const fetch = vi.spyOn(globalThis, 'fetch');
+  const view = render(<SiteIcon siteId={id} />);
+  const icon = view.container.querySelector(`[data-site-icon="${id}"]`);
+  expect(icon?.querySelectorAll('svg > path')).toHaveLength(shapes);
+  expect(icon?.querySelectorAll('text, img, image, use, script, .ui-icon')).toHaveLength(0);
+  expect(icon?.querySelector('svg')?.getAttribute('fill')).toBe('currentColor');
+  expect(fetch).not.toHaveBeenCalled();
+});

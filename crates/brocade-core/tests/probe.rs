@@ -123,7 +123,7 @@ fn probe_identity_rides_the_grant_channel() {
             let client = update
                 .clients
                 .iter()
-                .find(|client| is_probe_label(&client.label))
+                .find(|client| client.label == brocade_core::model::probe_label(&target.ingress_id))
                 .unwrap_or_else(|| panic!("{} 的下发里没有探测凭据", target.ingress_id));
 
             // The UUID in the work list and the one shipped to xray must be the same. Were

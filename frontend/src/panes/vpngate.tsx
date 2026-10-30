@@ -655,7 +655,7 @@ function CountrySummary({
         <header>
           <PanelTitle of="outbound">{countryCode ? `${vpngateRegionName(countryCode)}出口池` : '地区概要'}</PanelTitle>
           {countryCode && (
-            <span className="cg-meta">
+            <span className="cg-meta cg-meta-identity">
               <RegionFlag code={countryCode} />
               <small>{countryCode}</small>
             </span>
@@ -671,7 +671,7 @@ function CountrySummary({
     <section className="panel config-panel cg-sec vpngate-country-summary">
       <header>
         <PanelTitle of="outbound">{vpngateRegionName(countryCode)}出口池</PanelTitle>
-        <span className="cg-meta">
+        <span className="cg-meta cg-meta-identity">
           <RegionFlag code={countryCode} />
           <small>{countryCode}</small>
         </span>

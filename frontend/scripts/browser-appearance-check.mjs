@@ -248,7 +248,7 @@ for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
               const tag = kind === 'summary' ? 'summary' : 'header';
               const container = kind === 'summary' ? 'details' : 'section';
               const title = kind === 'list' ? `${icon}<h4>${text}</h4>` : `<h4 class="panel-title">${icon}${text}</h4>`;
-              return `<${container} class="panel ${kind === 'list' ? 'titled node-list-panel' : 'config-panel'}"><${tag}>${title}</${tag}></${container}>`;
+              return `<${container} class="panel ${kind === 'list' ? 'titled chain-list-panel' : 'config-panel'}"><${tag}>${title}</${tag}></${container}>`;
             }),
           )
           .join('');

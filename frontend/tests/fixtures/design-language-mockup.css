@@ -1,0 +1,73 @@
+/* 设计语言 mockup 自己的评审条。虚线表示不属于产品。 */
+
+/* 候选语言没有生产调色盘可选，账户菜单里的色板行在语言激活时隐藏。 */
+:root[data-lang] .fg-appearance-row:has(.fg-tone-list) {
+  display: none;
+}
+
+.mk-dock {
+  position: fixed;
+  left: 50%;
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  z-index: 2147483000;
+  transform: translateX(-50%);
+  display: grid;
+  gap: 6px;
+  max-width: calc(100vw - 24px);
+  padding: 8px 10px;
+  border: 1px dashed color-mix(in srgb, var(--ink-3) 60%, transparent);
+  border-radius: 14px;
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+  backdrop-filter: blur(14px) saturate(1.4);
+  box-shadow: var(--shadow);
+  color: var(--ink-2);
+  font: 12px/1.4 var(--sans);
+}
+.mk-dock.folded {
+  padding: 4px;
+}
+.mk-dock-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.mk-dock-note {
+  max-width: 640px;
+  margin: 0;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.mk-fold,
+.mk-unfold {
+  appearance: none;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--ink-3);
+  font: 12px var(--sans);
+  cursor: pointer;
+}
+.mk-fold {
+  width: 26px;
+  height: 26px;
+  font-size: 15px;
+}
+.mk-unfold {
+  padding: 5px 10px;
+}
+.mk-fold:hover,
+.mk-unfold:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+@media (max-width: 720px) {
+  .mk-dock {
+    left: 12px;
+    right: 12px;
+    transform: none;
+    max-width: none;
+  }
+}

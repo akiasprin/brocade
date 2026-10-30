@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tarfile
 import time
 import traceback
 import urllib.request
@@ -25,6 +26,8 @@ DB_PASSWORD = uuid.uuid4().hex + '@drill'
 EXPECTED_DATA = None
 HTTP = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 PORT = 19081
+CANDIDATE_MIGRATIONS = json.loads((ROOT / 'inputs/candidate-migrations.json').read_text())
+EXPECTED_RECEIPTS = ','.join(sorted(CANDIDATE_MIGRATIONS, key=int))
 CHECKSUM = '794044a4f1b7ead02b8102e21bc7f94d3c01f309216a5e15ada747c61de528c04b494a46e993f683a7d256aa37cd0947'
 
 
@@ -109,7 +112,7 @@ def install(bundle, mode, upgrade=False, label='install', env=None, success=True
             args += ['--managed-db']
         else:
             from urllib.parse import quote
-            args += ['--database-url', f'postgresql://postgres:{quote(DB_PASSWORD, safe="")}@127.0.0.1/brocade']
+            args += ['--database-url', f'postgresql://drill_app:{quote(DB_PASSWORD, safe="")}@127.0.0.1/brocade']
     result = cmd(*args, check=False, timeout=900, env=env)
     (RESULTS / (label + '.log')).write_text(clean(result.stdout + result.stderr))
     assert (result.returncode == 0) == success, f'{label}: unexpected exit {result.returncode}; inspect log'
@@ -117,12 +120,15 @@ def install(bundle, mode, upgrade=False, label='install', env=None, success=True
 
 
 def reset():
+    cmd('systemctl', 'stop', 'brocade.socket', check=False)
     cmd('systemctl', 'stop', 'brocade.service', check=False)
+    cmd('systemctl', 'disable', 'brocade.socket', check=False)
     cmd('systemctl', 'disable', 'brocade.service', check=False)
     for path in ['/opt/brocade', '/etc/brocade', '/etc/systemd/system/brocade.service.d',
                  '/var/lib/brocade', '/var/backups/brocade-upgrades']:
         shutil.rmtree(path, ignore_errors=True)
     Path('/etc/systemd/system/brocade.service').unlink(missing_ok=True)
+    Path('/etc/systemd/system/brocade.socket').unlink(missing_ok=True)
     cmd('systemctl', 'daemon-reload')
     cmd('systemctl', 'reset-failed')
     cmd('runuser', '-u', 'postgres', '--', 'dropdb', '--if-exists', 'brocade')
@@ -188,7 +194,7 @@ def make_fixture(version, mode):
     reset()
     if mode == 'external':
         cmd('runuser', '-u', 'postgres', '--', 'psql', '-Xq', '-v', 'ON_ERROR_STOP=1',
-            input=f"ALTER USER postgres PASSWORD '{DB_PASSWORD}'; CREATE DATABASE brocade;")
+            input=f"CREATE ROLE drill_app LOGIN PASSWORD '{DB_PASSWORD}'; CREATE DATABASE brocade OWNER drill_app;")
     old = Path('/opt/drill') / version
     old.mkdir(parents=True, exist_ok=True)
     cmd('tar', '-xzf', str(ROOT / f'inputs/{version}.tar.gz'), '--strip-components=1', '-C', str(old))
@@ -201,6 +207,8 @@ def make_fixture(version, mode):
     name = version + '-' + mode
     sql(mode, f"UPDATE control_state SET site_name='{name}';")
     seed_upgrade_data(mode)
+    if mode == 'external':
+        sql(mode, "CREATE SCHEMA drill_archive; CREATE TABLE drill_archive.audit(id TEXT PRIMARY KEY); INSERT INTO drill_archive.audit VALUES('preserve-backup-audit'); GRANT USAGE ON SCHEMA drill_archive TO drill_app; GRANT SELECT ON TABLE drill_archive.audit TO drill_app;")
     EXPECTED_DATA = data_snapshot(mode)
     # Sentinel data has a private random key and an explicit restrictive mode in both DB modes.
     sentinel = DATA / 'upgrade-drill-key'
@@ -229,17 +237,31 @@ def make_fixture(version, mode):
     return old, name, {p: file_snapshot(p) for p in preserved}
 
 
-def verify(mode, name, preserved, expected='1,2'):
+def verify(mode, name, preserved, expected=EXPECTED_RECEIPTS):
     assert active()
     assert wait_ready()['initialized']
     assert http('/auth/login', {'operator_id': 'drill-admin', 'password': PASSWORD})['admin']
     assert receipts(mode) == expected
+    if expected == EXPECTED_RECEIPTS:
+        actual = json.loads(sql(mode, "SELECT jsonb_object_agg(version::text,encode(checksum,'hex')) FROM _sqlx_migrations"))
+        assert actual == CANDIDATE_MIGRATIONS
     assert sql(mode, 'SELECT site_name FROM control_state') == name
     assert sql(mode, "SELECT encode(checksum,'hex') FROM _sqlx_migrations WHERE version=1") == CHECKSUM
     assert sql(mode, 'SELECT count(*) FROM binary_releases') == '0'
-    assert all(file_snapshot(p) == original for p, original in preserved.items()), 'private file bytes, permissions or ownership changed'
+    for path, original in preserved.items():
+        current = file_snapshot(path)
+        if path == '/etc/brocade/database-type' and expected != '1':
+            # A versioned installation selector prevents the old, socket-unaware installer
+            # from replacing this runtime. The database choice and file ownership stay fixed.
+            assert Path(path).read_text().strip() == mode + '-socket-v1'
+            assert all(current[k] == original[k] for k in ['uid', 'gid', 'mode'])
+        else:
+            assert current == original, 'private file bytes, permissions or ownership changed'
     assert data_snapshot(mode) == EXPECTED_DATA, 'user identity, quotas or usage changed across upgrade/restore'
     assert http('/quotas')['quotas'], 'preserved quota must remain readable through the real API'
+    if mode == 'external':
+        assert sql(mode, 'SELECT count(*) FROM drill_archive.audit') == '1'
+        assert sql(mode, "SELECT rolsuper FROM pg_roles WHERE rolname='drill_app'") == 'f'
     version = '0.3.1' if expected == '1' else (ROOT / 'inputs/candidate-version').read_text().strip()
     assert cmd('/opt/brocade/brocade-launcher', '--version').stdout.strip() == 'brocade ' + version
 
@@ -249,13 +271,23 @@ def latest_backup():
 
 
 def restore(mode, backup, label):
+    cmd('systemctl', 'stop', 'brocade.socket', check=False)
     cmd('systemctl', 'stop', 'brocade.service')
+    # Restoring the actual v0.3.1 installation must also retire files introduced later;
+    # tar extraction alone would retain a new socket and activate an incompatible launcher.
+    with tarfile.open(backup / 'installation.tar.gz') as archive:
+        members = set(archive.getnames())
+    if 'etc/systemd/system/brocade.socket' not in members:
+        cmd('systemctl', 'disable', 'brocade.socket', check=False)
+        Path('/etc/systemd/system/brocade.socket').unlink(missing_ok=True)
+    if 'etc/systemd/system/brocade.service.d/20-brocade-socket.conf' not in members:
+        Path('/etc/systemd/system/brocade.service.d/20-brocade-socket.conf').unlink(missing_ok=True)
     shutil.rmtree(DATA)
     cmd('tar', '-C', '/', '-xzpf', str(backup / 'installation.tar.gz'))
     cmd('tar', '-C', '/var/lib', '-xzpf', str(backup / 'data.tar.gz'))
     if mode == 'external':
         cmd('runuser', '-u', 'postgres', '--', 'dropdb', 'brocade')
-        cmd('runuser', '-u', 'postgres', '--', 'createdb', 'brocade')
+        cmd('runuser', '-u', 'postgres', '--', 'createdb', '-O', 'drill_app', 'brocade')
         # Root-only backup paths remain private; send dump contents through stdin to the DB owner.
         with (backup / 'database/database.dump').open('rb') as stream:
             restored = subprocess.run(['runuser', '-u', 'postgres', '--', 'pg_restore',
@@ -269,7 +301,95 @@ def restore(mode, backup, label):
     record(label, database=mode, old_version=cmd('/opt/brocade/brocade-launcher', '--version').stdout.strip())
 
 
+def socket_restart(mode, name, preserved):
+    assert cmd('systemctl', 'is-active', '--quiet', 'brocade.socket', check=False).returncode == 0
+    invocation = cmd('systemctl', 'show', 'brocade.socket', '-p', 'InvocationID', '--value').stdout.strip()
+    parent = cmd('systemctl', 'show', 'brocade.service', '-p', 'MainPID', '--value').stdout.strip()
+    children = Path(f'/proc/{parent}/task/{parent}/children').read_text().split()
+    console = next(pid for pid in children if Path(f'/proc/{pid}/exe').resolve().name == 'brocade-console')
+    inherited = os.readlink(f'/proc/{console}/fd/3')
+    assert inherited.startswith('socket:[') and inherited == os.readlink(f'/proc/{parent}/fd/3')
+    cmd('systemctl', 'restart', 'brocade.service')
+    wait_ready()
+    verify(mode, name, preserved)
+    assert cmd('systemctl', 'show', 'brocade.socket', '-p', 'InvocationID', '--value').stdout.strip() == invocation
+    record('socket-survives-service-restart', database=mode, descriptor_shared=True,
+           listener_invocation_preserved=True, original_data_readable=True)
+
+
+def repeat_with_socket_backup_check(mode, candidate):
+    if mode != 'external':
+        install(candidate, mode, True, 'socket-managed-repeat')
+        return
+    faultbin = Path('/opt/drill/socket-backup-check')
+    faultbin.mkdir(exist_ok=True)
+    (faultbin / 'pg_dump').write_text('''#!/bin/sh
+set -eu
+! systemctl is-active --quiet brocade.socket
+! systemctl is-active --quiet brocade.service
+printf 'verified\\n' >/var/lib/brocade/run/socket-backup-checked
+exec /usr/bin/pg_dump "$@"
+''')
+    (faultbin / 'pg_dump').chmod(0o755)
+    install(candidate, mode, True, 'socket-backup-stop-check',
+            env={**os.environ, 'PATH': str(faultbin) + ':' + os.environ['PATH']})
+    assert (DATA / 'run/socket-backup-checked').read_text().strip() == 'verified'
+    record('socket-stopped-during-logical-backup', database=mode, service_stopped=True, actual_dump=True)
+
+
+def manual_adoption(candidate, preserved):
+    """Rehearse the exact operator script, when supplied, against the real populated database."""
+    script = ROOT / 'inputs/adopt-runtime.py'
+    if not script.exists():
+        return
+    cmd('systemctl', 'stop', 'brocade.socket', 'brocade.service')
+    cmd('systemctl', 'disable', 'brocade.socket', 'brocade.service')
+    secret = Path('/etc/brocade/upgrade-drill.env').read_text()
+    url = Path('/etc/brocade/database-url').read_text().strip()
+    manual_env = Path('/opt/brocade/env')
+    manual_env.write_text(f'DATABASE_URL={url}\nBROCADE_ADMIN_BIND=0.0.0.0:{PORT}\nBROCADE_AGENT_PUBLIC_URL=http://192.0.2.20:{PORT}\nBROCADE_PROBE_RUNTIME_DIR=/run/brocade/probes\n' + secret)
+    manual_env.chmod(0o600)
+    saved = Path('/opt/drill/pre-adoption-authority')
+    saved.mkdir()
+    for name in ['listen-address', 'agent-public-url', 'database-type', 'database-url']:
+        shutil.move('/etc/brocade/' + name, saved / name)
+    shutil.move('/etc/systemd/system/brocade.service.d', saved / 'dropins')
+    Path('/etc/systemd/system/brocade.service').unlink()
+    Path('/etc/systemd/system/brocade.socket').unlink()
+    Path('/etc/systemd/system/brocade-console.service').write_text('[Unit]\nRequires=brocade-console.socket\nAfter=brocade-console.socket\n[Service]\nEnvironmentFile=/opt/brocade/env\nWorkingDirectory=/opt/brocade\nRuntimeDirectory=brocade\nExecStart=/opt/brocade/brocade-console\n')
+    Path('/etc/systemd/system/brocade-console.socket').write_text(f'[Socket]\nListenStream=0.0.0.0:{PORT}\nService=brocade-console.service\n[Install]\nWantedBy=sockets.target\n')
+    cmd('systemctl', 'daemon-reload')
+    cmd('systemctl', 'enable', 'brocade-console.socket')
+    cmd('systemctl', 'start', 'brocade-console.socket', 'brocade-console.service')
+    wait_ready()
+    assert data_snapshot('external') == EXPECTED_DATA
+    result = cmd('python3', str(script), '--bundle', str(candidate), '--backup-dir', '/var/backups/brocade-adoption-drill',
+                 '--public-ip', '192.0.2.20', '--port', str(PORT), '--expected-console-sha256', sha(candidate / 'brocade-console'),
+                 '--expected-launcher-sha256', sha(candidate / 'brocade-launcher'),
+                 '--expected-boot-id', Path('/proc/sys/kernel/random/boot_id').read_text().strip(), check=False, timeout=1200)
+    (RESULTS / 'manual-adoption.log').write_text(clean(result.stdout + result.stderr))
+    assert result.returncode == 0, 'manual adoption failed; inspect private rehearsal log'
+    # Operator-specific settings are restored alongside the newly managed socket drop-in.
+    shutil.copy2(saved / 'dropins/drill.conf', '/etc/systemd/system/brocade.service.d/drill.conf')
+    cmd('systemctl', 'daemon-reload')
+    cmd('systemctl', 'restart', 'brocade.service')
+    wait_ready()
+    preserved['/etc/systemd/system/brocade.service'] = file_snapshot('/etc/systemd/system/brocade.service')
+    install(candidate, 'external', True, 'adopted-runtime-upgrade')
+    assert data_snapshot('external') == EXPECTED_DATA
+    assert cmd('systemctl', 'is-enabled', 'brocade-console.socket', check=False).stdout.strip() == 'disabled'
+    record('manual-service-adopted-and-upgraded', database='external', same_database=True,
+           non_root=True, original_key_and_environment_preserved=True, ordinary_restart_socket_preserved=True)
+
+
 def faults_before(mode, candidate, name, preserved):
+    sql(mode, 'REVOKE USAGE ON SCHEMA drill_archive FROM drill_app')
+    install(candidate, mode, True, 'archive-permission-denied', success=False)
+    assert active() and receipts(mode) == '1'
+    assert not (latest_backup() / 'database/migration-started').exists()
+    sql(mode, 'GRANT USAGE ON SCHEMA drill_archive TO drill_app')
+    verify(mode, name, preserved, '1')
+    record('archive-backup-permission-failure', non_superuser=True, service_restored=True, no_schema_migration=True)
     sql(mode, "UPDATE _sqlx_migrations SET checksum=decode(repeat('00',48),'hex') WHERE version=1")
     install(candidate, mode, True, 'unknown-checksum', success=False)
     assert active() and receipts(mode) == '1'
@@ -297,6 +417,9 @@ def faults_before(mode, candidate, name, preserved):
 
 def failed_migration(mode, candidate, name, preserved):
     sql(mode, 'CREATE TABLE node_traffic_limit (injected BOOLEAN)')
+    if mode == 'external':
+        # Keep this fault readable by pg_dump so it reaches the intended DDL conflict.
+        sql(mode, 'ALTER TABLE node_traffic_limit OWNER TO drill_app')
     install(candidate, mode, True, 'ddl-conflict', success=False)
     assert not active()
     backup = latest_backup()
@@ -363,7 +486,7 @@ def main():
         assert wait_ready()['initialized']
         assert active()
         assert cmd('systemctl', 'is-enabled', '--quiet', 'brocade.service', check=False).returncode == 0
-        assert receipts(saved['mode']) == '1,2'
+        assert receipts(saved['mode']) == EXPECTED_RECEIPTS
         assert sql(saved['mode'], 'SELECT site_name FROM control_state') == saved['name']
         verify(saved['mode'], saved['name'], saved['preserved'])
         record('real-kvm-reboot', database=saved['mode'], boot_changed=True, service_enabled=True,
@@ -387,6 +510,7 @@ def main():
             failed_migration(mode, candidate, name, preserved)
         install(candidate, mode, True, f'{version}-{mode}-upgrade')
         verify(mode, name, preserved)
+        socket_restart(mode, name, preserved)
         assert sha('/opt/brocade/brocade-console') == sha(candidate / 'brocade-console')
         assert sha('/opt/brocade/brocade-launcher') == sha(candidate / 'brocade-launcher')
         backup = latest_backup()
@@ -406,12 +530,13 @@ def main():
             health_failure(mode, candidate, name, preserved, migrated=True)
         else:
             install(candidate, mode, True, f'{version}-{mode}-upgrade-again')
-        install(candidate, mode, True, f'{version}-{mode}-repeat')
+        repeat_with_socket_backup_check(mode, candidate)
         verify(mode, name, preserved)
         assert not (latest_backup() / 'database/migration-started').exists()
-        record('idempotent-repeat', version=version, database=mode, receipts='1,2')
+        record('idempotent-repeat', version=version, database=mode, receipts=EXPECTED_RECEIPTS)
         if version == 'v0.3.1' and mode == 'external':
             health_failure(mode, candidate, name, preserved, migrated=False)
+            manual_adoption(candidate, preserved)
         STATE.write_text(json.dumps({'mode': mode, 'next_mode': index + 1, 'name': name, 'password': PASSWORD,
             'expected_data': EXPECTED_DATA, 'preserved': preserved,
             'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip()}))

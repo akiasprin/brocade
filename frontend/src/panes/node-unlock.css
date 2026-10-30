@@ -1,0 +1,635 @@
+.unlock-page {
+  display: flex;
+  max-width: 1180px;
+  flex-direction: column;
+  gap: 16px;
+  margin: 2px 0 6px;
+}
+.unlock-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+  min-height: 30px;
+}
+.unlock-bar > .unlock-run {
+  margin-left: auto;
+}
+.unlock-footer {
+  display: flex;
+  min-width: 0;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px 16px;
+}
+.unlock-footer > .segsw {
+  flex: none;
+}
+.unlock-footer .segsw button {
+  min-width: 56px;
+}
+.unlock-footer[data-variant='dialog'] {
+  padding: 10px 16px 12px;
+  border-top: 1px solid var(--line);
+}
+.unlock-lead {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  color: var(--ink-3);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.unlock-lead b {
+  color: var(--ink);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.unlock-lead-part {
+  color: var(--gold);
+}
+.unlock-lead[data-stale] {
+  opacity: 0.5;
+}
+.unlock-meta {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  min-width: 0;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.unlock-meta-part {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+.unlock-meta-part + .unlock-meta-part::before {
+  content: '·';
+  margin: 0 8px;
+  color: var(--ink-4);
+}
+.unlock-meta time {
+  font-variant-numeric: tabular-nums;
+}
+.unlock-meta-lead {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-2);
+}
+.unlock-meta-lead[data-tone='warn'] {
+  color: var(--gold);
+}
+.unlock-meta-lead[data-tone='err'] {
+  color: var(--err);
+}
+.unlock-run {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.unlock-run-icon,
+.unlock-run-icon svg {
+  display: block;
+}
+.node-unlock-actions {
+  display: inline-flex;
+  align-items: center;
+}
+.unlock-body {
+  transition: opacity 0.2s ease;
+}
+/* 重测或检测失败时引用的历史结果减淡；线路变更通过独立的底部提示说明。 */
+.unlock-body[data-stale] {
+  opacity: 0.5;
+}
+.unlock-problem {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+.unlock-problem .err,
+.unlock-problem > :first-child {
+  margin: 0;
+}
+.unlock-nothing {
+  padding: 56px 24px;
+}
+.unlock-nothing > p {
+  margin-bottom: 16px;
+}
+.unlock-nothing-line {
+  margin: 0;
+  color: var(--ink-3);
+  font-size: 12.5px;
+}
+.unlock-change {
+  color: var(--gold);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.unlock-glyph {
+  display: block;
+  flex: none;
+  overflow: visible;
+}
+.unlock-glyph .fill {
+  fill: currentColor;
+}
+.unlock-glyph .mark {
+  fill: none;
+  stroke: #fff;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.unlock-glyph .ring {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+}
+.unlock-glyph .dash {
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+.unlock-glyph .spin {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-dasharray: 25 13;
+  stroke-linecap: round;
+  transform-origin: 8px 8px;
+  animation: unlock-spin 0.9s linear infinite;
+}
+@keyframes unlock-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .unlock-glyph .spin {
+    animation: none;
+  }
+}
+.unlock-glyph[data-tone='ok'] {
+  color: var(--ok);
+}
+.unlock-glyph[data-tone='part'] {
+  color: var(--gold);
+}
+.unlock-glyph[data-tone='no'] {
+  color: var(--err);
+}
+.unlock-glyph[data-tone='unknown'] {
+  color: var(--ink-4);
+}
+.unlock-glyph[data-tone='wait'] {
+  color: var(--ink-3);
+}
+.unlock-glyph[data-tone='info'] {
+  color: var(--ink-3);
+}
+.unlock-region {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-2);
+  font: 500 12px var(--sans);
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+.unlock-region.none {
+  color: var(--ink-4);
+}
+.unlock-mark {
+  display: inline-grid;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  place-items: center;
+}
+.unlock-mark .site-brand-icon {
+  width: 100%;
+  height: 100%;
+  color: var(--ink-2);
+}
+.unlock-mark .site-brand-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+/* ── YouTube 分项：ⓘ 与弹出层 ── */
+.unlock-info {
+  display: inline-grid;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  place-items: center;
+  margin: -2px 0 -2px 2px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: var(--ink-4);
+  vertical-align: middle;
+  cursor: pointer;
+}
+.unlock-info:hover,
+.unlock-info[aria-expanded='true'] {
+  color: var(--ink-2);
+  background: var(--hover-2);
+}
+.unlock-yt {
+  width: min(340px, calc(100vw - 16px));
+  box-sizing: border-box;
+  padding: 10px 14px;
+}
+.unlock-yt dl {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px 14px;
+  margin: 0;
+}
+.unlock-yt dt {
+  color: var(--ink-3);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.unlock-yt dd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-width: 0;
+  margin: 0;
+  color: var(--ink);
+  font-size: 12.5px;
+}
+.unlock-yt-dim {
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.unlock-yt code.unlock-yt-dim {
+  font-family: var(--mono);
+}
+
+.unlock-b {
+  display: grid;
+  gap: 16px;
+}
+.unlock-b-row {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  align-items: start;
+  gap: 0 12px;
+}
+.unlock-b-row h3 {
+  margin: 13px 0 0;
+  color: var(--ink-3);
+  font: 500 11.5px var(--sans);
+  letter-spacing: 0.02em;
+}
+.unlock-b-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 1fr));
+  gap: 10px;
+}
+.unlock-b-tile {
+  display: flex;
+  min-width: 0;
+  min-height: 120px;
+  box-sizing: border-box;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 13px 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+  box-shadow: var(--sheet-shadow);
+}
+.unlock-b-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.unlock-b-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 读数固定在标志行下方，说明行贴底：同一排磁贴的地区码在同一条水平线上。 */
+.unlock-b-region {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+.unlock-b-region .geo-flag {
+  width: 21px;
+  height: 14px;
+  border-radius: 2px;
+}
+.unlock-b-region b {
+  color: var(--ink);
+  font: 600 22px/1 var(--sans);
+  letter-spacing: 0.02em;
+}
+.unlock-b-region b.none {
+  color: var(--ink-4);
+  font-weight: 400;
+}
+.unlock-b-region-name {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.unlock-b-tile[data-tone='no'] .unlock-b-region b,
+.unlock-b-tile[data-tone='unknown'] .unlock-b-region b {
+  color: var(--ink-3);
+}
+.unlock-b-foot {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: auto;
+  color: var(--ink-3);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.unlock-b-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.unlock-b-tile[data-tone='no'] .unlock-b-label {
+  color: var(--err);
+}
+.unlock-b-tile[data-tone='part'] .unlock-b-label {
+  color: var(--gold);
+}
+.unlock-b-hero {
+  align-items: center;
+  gap: 8px;
+}
+.unlock-b-hero b {
+  font: 600 26px/1 var(--sans);
+}
+.unlock-b-strip {
+  display: inline-flex;
+  gap: 3px;
+  margin-left: 8px;
+}
+.unlock-b-strip i {
+  width: 9px;
+  height: 14px;
+  border-radius: 2.5px;
+  background: color-mix(in srgb, var(--ink) 12%, transparent);
+}
+.unlock-b-strip i[data-tone='ok'] {
+  background: var(--ok);
+}
+.unlock-b-strip i[data-tone='part'] {
+  background: var(--gold);
+}
+.unlock-b-strip i[data-tone='no'] {
+  background: var(--err);
+}
+.unlock-b-strip i[data-tone='info'] {
+  background: var(--ink-3);
+}
+.unlock-b[data-variant='dialog'] .unlock-b-row {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 7px;
+}
+.unlock-b[data-variant='dialog'] .unlock-b-row h3 {
+  margin: 0 0 0 2px;
+}
+.unlock-head-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.unlock-head-count {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+.unlock-head-count[data-tone='ok'] {
+  color: var(--ok);
+}
+.unlock-dialog {
+  width: min(1040px, calc(100vw - 32px));
+  max-height: min(760px, calc(100dvh - 48px));
+}
+.unlock-dialog-title {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  min-width: 0;
+  gap: 1px 8px;
+}
+.unlock-dialog-title-icon {
+  grid-column: 1;
+  grid-row: 1;
+  align-self: center;
+  color: var(--ink);
+}
+.unlock-dialog-title b {
+  grid-column: 2;
+  grid-row: 1;
+  overflow: hidden;
+  color: var(--ink);
+  font: 600 14px var(--sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.unlock-dialog-title small {
+  grid-column: 2;
+  grid-row: 2;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.unlock-dialog-body {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 14px;
+  overflow: auto;
+  padding: 4px 16px 18px;
+}
+
+@media (max-width: 620px) {
+  .unlock-b-row,
+  .unlock-b[data-variant='dialog'] .unlock-b-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 7px;
+  }
+  .unlock-b-row h3 {
+    margin: 0 0 0 2px;
+  }
+  .unlock-b-region-name {
+    display: none;
+  }
+  .unlock-b-label {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .unlock-dialog-body {
+    padding: 4px 12px 16px;
+  }
+  .unlock-footer[data-variant='dialog'] {
+    padding: 10px 12px 12px;
+  }
+}
+.unlock-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.unlock-status small {
+  color: var(--ink-3);
+}
+.unlock-info {
+  width: 28px;
+  height: 28px;
+}
+.unlock-info:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.unlock-yt {
+  width: min(420px, calc(100vw - 16px));
+  max-height: calc(100dvh - 16px);
+  overflow: auto;
+}
+.unlock-yt h3 {
+  margin: 0 0 12px;
+  font-size: 13px;
+}
+.unlock-yt .unlock-yt-close {
+  float: right;
+}
+.unlock-yt dl > div {
+  display: contents;
+}
+.unlock-yt small {
+  display: block;
+  font-size: 11px;
+  font-family: var(--sans);
+  color: var(--ink-3);
+}
+.unlock-yt dd {
+  overflow-wrap: anywhere;
+}
+.unlock-dns-members {
+  display: flex !important;
+  width: 100%;
+  flex-direction: column;
+  gap: 3px;
+}
+.unlock-yt .youtube-unlock-cdn-node {
+  font-family: var(--mono);
+}
+
+.unlock-b-tile .unlock-b-foot .unlock-b-summary {
+  color: var(--ink-3);
+}
+
+/* A: conditional DNS fallback stays visible without semantic status emphasis. */
+.unlock-b-strip i[data-route] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.25px color-mix(in srgb, var(--ink) 30%, transparent);
+}
+
+/* ══ A 回退标记：保留读数，去掉状态色和投影 ══ */
+
+.unlock-b-tile[data-route] {
+  background: transparent;
+  box-shadow: none;
+}
+.unlock-b-tile[data-route] .unlock-b-name {
+  color: var(--ink-2);
+}
+.unlock-b-tile[data-route] .unlock-mark .site-brand-icon {
+  color: var(--ink-3);
+}
+.unlock-b-tile[data-route] .unlock-b-top .unlock-glyph {
+  color: var(--ink-4);
+}
+.unlock-b-tile[data-route] .unlock-b-region b {
+  color: var(--ink-3);
+}
+.unlock-b-tile[data-route] .unlock-b-region-name {
+  color: var(--ink-4);
+}
+.unlock-b-tile[data-route] .unlock-b-region .geo-flag {
+  filter: grayscale(1);
+  opacity: 0.55;
+}
+.unlock-b-tile[data-route] .unlock-b-label {
+  color: var(--ink-3);
+}
+.unlock-dns-tag {
+  flex: none;
+  height: 20px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--ink) 9%, transparent);
+  color: var(--ink-2);
+  font: 500 11.5px/20px var(--sans);
+  cursor: pointer;
+}
+.unlock-dns-tag:hover,
+.unlock-dns-tag[aria-expanded='true'] {
+  background: color-mix(in srgb, var(--ink) 15%, transparent);
+  color: var(--ink);
+}
+.unlock-dns-tag:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+}
+
+.unlock-dns-path h3 {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding-right: 18px;
+}
+.unlock-dns-path h3 small {
+  color: var(--ink-3);
+  font: 500 12px var(--sans);
+}
+.unlock-dns-path dd {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.unlock-dns-path dd > span,
+.unlock-dns-path dd > code {
+  display: block;
+}
+.unlock-dns-path dd small {
+  display: block;
+  color: var(--ink-3);
+  margin-top: 3px;
+}
+.unlock-dns-path code {
+  font: 11.5px var(--mono);
+  overflow-wrap: anywhere;
+}

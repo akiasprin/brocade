@@ -16,7 +16,7 @@ use crate::plan::{
 pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 20;
 
 /// Wire contract spoken by this Agent build.
-pub const AGENT_PROTOCOL_VERSION: u32 = 45;
+pub const AGENT_PROTOCOL_VERSION: u32 = 57;
 
 /// First Agent that can restart when handoff prerequisites are unavailable, and recover
 /// unresponsive generations through a durable checkpoint without waiting for the Console.
@@ -1252,7 +1252,7 @@ mod agent_release_compat_tests {
         assert_eq!(new.release_id, None);
         assert_eq!(new.attempt, None);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
-        assert_eq!(AGENT_PROTOCOL_VERSION, 45);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 57);
         assert_eq!(CONFIG_XRAY_UPDATE_POLICY_PROTOCOL_VERSION, 37);
         assert_eq!(CONFIG_XRAY_HANDOFF_ONLY_PROTOCOL_VERSION, 32);
         assert_eq!(CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION, 33);
@@ -2592,6 +2592,12 @@ pub struct NodeTrafficReading {
 /// value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeVersions {
+    /// Actual running Xray and its origin environment support connection-bound evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlock_connection_trace: Option<bool>,
+    /// The live managed profile supports propagating a diagnostic family to its final egress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlock_ip_families: Option<bool>,
     /// The sha256 of the running Agent binary, lowercase hex. `unknown` means the Agent could not
     /// read `/proc/self/exe`. The control plane computes its embedded build id at compile time
     /// (`brocade-console/build.rs`), so rollout state can be compared directly.
@@ -4033,7 +4039,7 @@ mod tests {
             error: Option<String>,
         }
 
-        assert_eq!(AGENT_PROTOCOL_VERSION, 45);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 57);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
         let report: XrayReleaseReport = serde_json::from_value(serde_json::json!({
             "release_id": 7,

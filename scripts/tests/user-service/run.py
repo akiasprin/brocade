@@ -31,6 +31,7 @@ def main():
     parser.add_argument('--console', type=Path, required=True)
     parser.add_argument('--node-fixture', type=Path, default=Path(__file__).with_name('node.py'))
     parser.add_argument('--support-fixture', type=Path)
+    parser.add_argument('--node-arg', action='append', default=[])
     parser.add_argument('--geoip', type=Path, required=True)
     parser.add_argument('--geosite', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
@@ -55,6 +56,7 @@ def main():
                 'image_id': command('docker', 'image', 'inspect', args.image, '--format', '{{.Id}}'),
                 'database_image_id': command('docker', 'image', 'inspect', args.database_image, '--format', '{{.Id}}'),
                 'git_head': command('git', 'rev-parse', 'HEAD')}
+    manifest['node_arguments'] = args.node_arg
     if args.support_fixture:
         manifest['support_sha256'] = digest(inputs / 'support.py')
     write_json(output / 'manifest.json', manifest)
@@ -85,7 +87,7 @@ def main():
             'cap_add': state['HostConfig']['CapAdd'], 'network_mode': state['HostConfig']['NetworkMode'],
             'pid_mode': state['HostConfig']['PidMode'], 'published_ports': state['HostConfig']['PortBindings'],
             'network_internal': json.loads(command('docker', 'network', 'inspect', network))[0]['Internal']})
-        command('docker', 'exec', '-d', node, 'python3', '/lab/inputs/node.py')
+        command('docker', 'exec', '-d', node, 'python3', '/lab/inputs/node.py', *args.node_arg)
         deadline, delivered, sql_id = time.monotonic() + 1200, 0, None
         while time.monotonic() < deadline:
             request = results / 'sql-request.json'

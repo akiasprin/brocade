@@ -1,0 +1,713 @@
+/* 面板规范 mockup。审阅条（mk-）不属于设计；方案样式以 ps- 开头，只在 :root[data-ps='a'…'d'] 下生效，
+   现状只用 src/styles.css。 */
+
+/* ── 审阅外壳 ── */
+html,
+body {
+  height: auto;
+  overflow: visible;
+}
+body {
+  min-height: 100vh;
+  background: var(--sheet);
+}
+.mk-bar {
+  position: relative;
+  z-index: 300;
+  border-bottom: 1px solid var(--line);
+  background: var(--sheet);
+}
+.mk-bar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  padding: 9px 20px 5px;
+}
+.mk-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--ink);
+  font: 600 14px var(--sans);
+  white-space: nowrap;
+}
+.mk-title small {
+  color: var(--ink-4);
+  font: 400 10px var(--mono);
+  letter-spacing: 0.06em;
+}
+.mk-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-left: auto;
+}
+.mk-ctl {
+  --ctl-h: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.mk-ctl-label {
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.mk-ctl .segsw button {
+  padding: 0 9px;
+  font-size: 12px;
+}
+.mk-scene-note {
+  max-width: 1180px;
+  margin: 0;
+  padding: 0 20px 6px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.mk-scene-note b {
+  margin-right: 10px;
+  color: var(--action);
+  font-weight: 600;
+}
+.mk-common {
+  padding: 0 20px 10px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+.mk-common summary {
+  width: max-content;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.mk-common ol {
+  margin: 4px 0 0;
+  padding-left: 20px;
+  columns: 2 420px;
+  column-gap: 32px;
+}
+.mk-common li {
+  break-inside: avoid;
+}
+@media (max-width: 620px) {
+  .mk-bar-row,
+  .mk-scene-note,
+  .mk-common {
+    padding-right: 12px;
+    padding-left: 12px;
+  }
+}
+
+/* ── 台面：桌面为详情页内容宽，手机为 390px 视口减两侧 16px ── */
+.ps-stage {
+  padding: 32px 24px 72px;
+}
+.ps-frame {
+  max-width: 1340px;
+  margin: 0 auto;
+  container-type: inline-size;
+}
+.ps-stage[data-width='phone'] .ps-frame {
+  max-width: 358px;
+}
+
+/* ══ 方案共用：系统色与字体 ══ */
+:root:is([data-ps='a'], [data-ps='b'], [data-ps='c'], [data-ps='d']) {
+  --ps-text:
+    -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', 'PingFang SC', 'Hiragino Sans GB',
+    'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif;
+  --ps-display:
+    -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', 'PingFang SC', 'Hiragino Sans GB',
+    'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif;
+  --ps-rounded:
+    ui-rounded, 'SF Pro Rounded', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Noto Sans CJK SC', sans-serif;
+  --ps-code: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
+  --ps-ground: #000000;
+  --ps-card: #1c1c1e;
+  --ps-label: #f5f5f7;
+  --ps-label-2: #98989d;
+  --ps-label-3: #6e6e73;
+  --ps-sep: #38383a;
+  --ps-green: #30d158;
+  --ps-orange: #ff9f0a;
+  --ps-orange-ink: #ff9f0a;
+  --ps-red: #ff453a;
+  --ps-red-ink: #ff6961;
+  --ps-gray: #8e8e93;
+  --ps-link: #2997ff;
+  --ps-blue: #0a84ff;
+  --ps-teal: #40c8e0;
+  --ps-indigo: #7d7aff;
+}
+:root:is([data-ps='a'], [data-ps='b'], [data-ps='c'], [data-ps='d'])[data-theme='light'] {
+  --ps-ground: #f2f2f7;
+  --ps-card: #ffffff;
+  --ps-label: #1d1d1f;
+  --ps-label-2: #6e6e73;
+  --ps-label-3: #86868b;
+  --ps-sep: #e5e5ea;
+  --ps-green: #34c759;
+  --ps-orange: #ff9500;
+  --ps-orange-ink: #b35400;
+  --ps-red: #ff3b30;
+  --ps-red-ink: #d70015;
+  --ps-gray: #aeaeb2;
+  --ps-link: #0066cc;
+  --ps-blue: #0071e3;
+  --ps-teal: #008299;
+  --ps-indigo: #5856d6;
+}
+:root:is([data-ps='a'], [data-ps='b'], [data-ps='c'], [data-ps='d']) body {
+  background: var(--ps-ground);
+}
+.ps-frame :is(.ps-a, .ps-b, .ps-c, .ps-d) {
+  color: var(--ps-label);
+  font-family: var(--ps-text);
+  -webkit-font-smoothing: antialiased;
+}
+/* 特异度只取 .ps-frame 一级：压过生产的元素规则，又让下面各方案的单类规则按顺序覆盖。 */
+.ps-frame :where(.ps-a, .ps-b, .ps-c, .ps-d) :where(h3, h4, p, dl, dd, ul) {
+  margin: 0;
+}
+
+/* 读数：主值、单位、第二取值、附加读数 */
+.ps-val {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: top;
+  font-variant-numeric: tabular-nums;
+}
+.ps-val > .ps-glyph {
+  display: inline-block;
+  margin-right: 0.3em;
+  vertical-align: -0.12em;
+}
+.ps-val.is-link > .ps-glyph {
+  margin: 0 0 0 0.3em;
+  vertical-align: -0.02em;
+}
+.ps-unit {
+  margin-left: 0.22em;
+}
+.ps-sub::before,
+.ps-tail::before {
+  content: '·';
+  margin: 0 0.4em;
+}
+.ps-val.is-code .ps-main {
+  font-family: var(--ps-code);
+  font-size: 0.92em;
+  letter-spacing: 0;
+}
+.ps-val.is-hot {
+  color: var(--ps-orange-ink);
+}
+.ps-glyph {
+  flex: none;
+}
+.ps-glyph-ok {
+  color: var(--ps-green);
+}
+.ps-glyph-off {
+  color: var(--ps-gray);
+}
+.ps-glyph-warn {
+  color: var(--ps-orange);
+}
+.ps-glyph-bad {
+  color: var(--ps-red);
+}
+.ps-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+  vertical-align: top;
+}
+.ps-state.is-dirty {
+  color: var(--ps-orange-ink);
+}
+.ps-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--ps-green);
+}
+.ps-state.is-disabled .ps-dot,
+.ps-state.is-unknown .ps-dot {
+  background: var(--ps-gray);
+}
+.ps-state.is-dirty .ps-dot {
+  background: var(--ps-orange);
+}
+/* 判定：只有符号着色，文字是正文色 */
+:is(.ps-a-alert, .ps-b-note, .ps-c-alert, .ps-d-issue) code {
+  font-family: var(--ps-code);
+  font-size: 0.92em;
+}
+:is(.ps-a-alert, .ps-b-note, .ps-c-alert, .ps-d-issue) b {
+  font-weight: 600;
+}
+
+/* ══ A 分组表单 ══ */
+.ps-a-title {
+  margin-bottom: 12px;
+  font: 600 20px/1.25 var(--ps-display);
+  letter-spacing: -0.01em;
+}
+.ps-a-box {
+  padding: 0;
+  list-style: none;
+  border-radius: 12px;
+  background: var(--ps-card);
+  overflow: hidden;
+}
+.ps-a-alerts {
+  margin-bottom: 24px;
+}
+.ps-a-alert {
+  position: relative;
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 10px;
+  padding: 12px 16px;
+  font: 400 13px/1.55 var(--ps-text);
+}
+.ps-a-alert > .ps-glyph {
+  margin-top: 2px;
+}
+.ps-a-alert + .ps-a-alert::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 42px;
+  border-top: 1px solid var(--ps-sep);
+}
+.ps-a-groups {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 24px 20px;
+  align-items: start;
+}
+@container (min-width: 720px) {
+  .ps-a-groups {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@container (min-width: 1040px) {
+  .ps-a-groups {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+.ps-a-gh {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 16px 7px;
+}
+.ps-a-gh h4 {
+  font: 600 13px/1.3 var(--ps-text);
+  color: var(--ps-label-2);
+}
+.ps-a-gh span {
+  font: 400 12px/1.3 var(--ps-text);
+  color: var(--ps-label-3);
+  white-space: nowrap;
+}
+.ps-a-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 40px;
+  padding: 0 16px;
+  font: 400 13px/1.35 var(--ps-text);
+}
+.ps-a-row + .ps-a-row::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 16px;
+  border-top: 1px solid var(--ps-sep);
+}
+.ps-a-k {
+  flex: none;
+}
+.ps-a-row > :is(.ps-val, .ps-state) {
+  min-width: 0;
+  color: var(--ps-label-2);
+  text-align: right;
+}
+.ps-a :is(.ps-sub, .ps-tail),
+.ps-a .ps-val.is-link > .ps-glyph,
+.ps-a .ps-state:is(.is-disabled, .is-unknown) {
+  color: var(--ps-label-3);
+}
+.ps-a .ps-a-row > .ps-val.is-hot,
+.ps-a .ps-a-row > .ps-state.is-dirty {
+  color: var(--ps-orange-ink);
+}
+@container (max-width: 520px) {
+  .ps-a-title {
+    font-size: 22px;
+  }
+  .ps-a-row {
+    min-height: 44px;
+    font-size: 15px;
+  }
+  .ps-a-alert {
+    font-size: 14px;
+  }
+}
+
+/* ══ B 规格表 ══ */
+.ps-b {
+  padding: 26px 32px 30px;
+  border-radius: 18px;
+  background: var(--ps-card);
+}
+.ps-b-title {
+  margin-bottom: 18px;
+  font: 600 24px/1.2 var(--ps-display);
+  letter-spacing: -0.015em;
+}
+.ps-b-sec {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px 0;
+  padding: 22px 0;
+  border-top: 1px solid var(--ps-sep);
+}
+.ps-b-sec:last-of-type {
+  padding-bottom: 2px;
+}
+.ps-b-sh h4 {
+  font: 600 17px/1.3 var(--ps-text);
+  letter-spacing: -0.01em;
+}
+.ps-b-sh p {
+  margin-top: 3px;
+  font: 400 13px/1.4 var(--ps-text);
+  color: var(--ps-label-2);
+}
+.ps-b-cells {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px 24px;
+}
+.ps-b-c {
+  min-width: 0;
+}
+.ps-b-c.is-wide {
+  grid-column: span 2;
+}
+.ps-b-c dt {
+  font: 400 12px/1.4 var(--ps-text);
+  color: var(--ps-label-2);
+}
+.ps-b-c dd {
+  margin-top: 4px;
+  font: 400 17px/1.35 var(--ps-text);
+  letter-spacing: -0.015em;
+}
+.ps-b-c dd > .ps-val {
+  display: block;
+}
+.ps-b :is(.ps-sub, .ps-tail),
+.ps-b .ps-val.is-dim {
+  color: var(--ps-label-2);
+}
+.ps-b .ps-val.is-link {
+  color: var(--ps-link);
+}
+.ps-b-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+}
+.ps-b-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.ps-b-item:is(.is-disabled, .is-unknown) {
+  color: var(--ps-label-2);
+}
+.ps-b-item.is-dirty {
+  color: var(--ps-orange-ink);
+}
+.ps-b-notes {
+  display: grid;
+  gap: 10px;
+  margin-top: 22px;
+  padding-top: 20px;
+  border-top: 1px solid var(--ps-sep);
+}
+.ps-b-note {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  gap: 10px;
+  font: 400 14px/1.6 var(--ps-text);
+}
+.ps-b-note > .ps-glyph {
+  margin-top: 4px;
+}
+@container (min-width: 760px) {
+  .ps-b-sec {
+    grid-template-columns: 180px minmax(0, 1fr);
+    gap: 0 24px;
+  }
+  .ps-b-cells {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  .ps-b-notes {
+    padding-left: 204px;
+  }
+}
+@container (max-width: 520px) {
+  .ps-b {
+    padding: 20px 18px 22px;
+    border-radius: 16px;
+  }
+  .ps-b-title {
+    font-size: 22px;
+  }
+  .ps-b-sec {
+    padding: 18px 0;
+  }
+  .ps-b-c dd {
+    font-size: 16px;
+  }
+}
+
+/* ══ C 摘要卡 ══ */
+.ps-c-title {
+  margin-bottom: 12px;
+  font: 700 22px/1.2 var(--ps-display);
+  letter-spacing: -0.015em;
+}
+.ps-c-card {
+  border-radius: 18px;
+  background: var(--ps-card);
+}
+.ps-c-alerts {
+  margin-bottom: 16px;
+  padding: 2px 18px;
+}
+.ps-c-alert {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 12px;
+  padding: 13px 0;
+  font: 400 14px/1.55 var(--ps-text);
+}
+.ps-c-alert + .ps-c-alert {
+  border-top: 1px solid var(--ps-sep);
+}
+.ps-c-alert > .ps-glyph {
+  margin-top: 2px;
+}
+.ps-c-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+@container (min-width: 760px) {
+  .ps-c-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@container (min-width: 1080px) {
+  .ps-c-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+.ps-c-src {
+  --ps-tint: var(--ps-blue);
+  padding: 14px 18px 10px;
+}
+.ps-c-src[data-src='host'] {
+  --ps-tint: var(--ps-teal);
+}
+.ps-c-src[data-src='config'] {
+  --ps-tint: var(--ps-indigo);
+}
+.ps-c-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.ps-c-ic {
+  color: var(--ps-tint);
+}
+.ps-c-ic svg {
+  stroke-width: 1.8;
+}
+.ps-c-head h4 {
+  font: 600 15px/1.3 var(--ps-text);
+  color: var(--ps-tint);
+}
+.ps-c-meta {
+  margin-left: auto;
+  font: 400 13px/1.3 var(--ps-text);
+  color: var(--ps-label-2);
+  white-space: nowrap;
+}
+.ps-c-hero {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 28px;
+  margin: 14px 0 14px;
+}
+.ps-c-stat {
+  display: grid;
+  gap: 2px;
+}
+.ps-c-num {
+  font: 600 30px/1.1 var(--ps-rounded);
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.ps-c-num small {
+  margin-left: 3px;
+  font: 600 15px var(--ps-rounded);
+  letter-spacing: 0;
+  color: var(--ps-label-2);
+}
+.ps-c-num > span + span {
+  margin-left: 8px;
+}
+.ps-c-cap {
+  font: 400 12px/1.3 var(--ps-text);
+  color: var(--ps-label-2);
+}
+.ps-c-rows {
+  padding-top: 6px;
+  border-top: 1px solid var(--ps-sep);
+}
+.ps-c-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 29px;
+  font: 400 13px/1.35 var(--ps-text);
+}
+.ps-c-row dt {
+  flex: none;
+  color: var(--ps-label-2);
+}
+.ps-c-row dd {
+  min-width: 0;
+  text-align: right;
+}
+.ps-c :is(.ps-sub, .ps-tail),
+.ps-c .ps-val.is-dim,
+.ps-c .ps-state:is(.is-disabled, .is-unknown) {
+  color: var(--ps-label-2);
+}
+.ps-c .ps-val.is-link {
+  color: var(--ps-link);
+}
+
+/* ══ D 检查器 ══ */
+.ps-d {
+  border: 1px solid var(--ps-sep);
+  border-radius: 10px;
+  background: var(--ps-card);
+  overflow: hidden;
+}
+.ps-d-head {
+  display: flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--ps-sep);
+}
+.ps-d-head h3 {
+  font: 600 13px/1 var(--ps-text);
+}
+.ps-d-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+.ps-d-sec {
+  min-width: 0;
+  padding: 10px 14px 12px;
+}
+.ps-d-sec + .ps-d-sec {
+  border-top: 1px solid var(--ps-sep);
+}
+@container (min-width: 840px) {
+  .ps-d-cols {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .ps-d-sec + .ps-d-sec {
+    border-top: 0;
+    border-left: 1px solid var(--ps-sep);
+  }
+}
+.ps-d-sec h4 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font: 700 11px/1.3 var(--ps-text);
+}
+.ps-d-sec h4 span {
+  margin-left: auto;
+  font-weight: 400;
+  color: var(--ps-label-3);
+  white-space: nowrap;
+}
+.ps-d-form {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 10px;
+  font: 400 12px/18px var(--ps-text);
+}
+.ps-d-row {
+  display: contents;
+}
+.ps-d-row dt {
+  color: var(--ps-label-2);
+  text-align: right;
+}
+.ps-d-row dd {
+  min-width: 0;
+}
+.ps-d :is(.ps-sub, .ps-tail),
+.ps-d .ps-val.is-dim,
+.ps-d .ps-state:is(.is-disabled, .is-unknown) {
+  color: var(--ps-label-2);
+}
+.ps-d .ps-val.is-link {
+  color: var(--ps-link);
+}
+.ps-d-issues {
+  padding: 6px 14px;
+  border-top: 1px solid var(--ps-sep);
+}
+.ps-d-issue {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  gap: 8px;
+  padding: 5px 0;
+  font: 400 12px/1.5 var(--ps-text);
+}
+.ps-d-issue > .ps-glyph {
+  margin-top: 3px;
+}

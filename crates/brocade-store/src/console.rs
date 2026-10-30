@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 mod artifacts;
+mod chain_move;
 mod lists;
 mod nodes;
 mod redact;
@@ -8,6 +9,7 @@ mod steps;
 mod subscriptions;
 mod types;
 pub use artifacts::*;
+pub(crate) use chain_move::move_chain_tx;
 pub use lists::*;
 pub use nodes::*;
 pub(crate) use redact::*;

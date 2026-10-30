@@ -7,6 +7,7 @@
     ],
     "tag": "api"
   },
+  "brocadeUnlockIpFamilies": 2,
   "burstObservatory": {
     "pingConfig": {
       "destination": "http://www.gstatic.com/generate_204",
@@ -64,6 +65,21 @@
             "email": "c-brc-jp@sg-01",
             "id": "32761913-59d6-4020-b79a-91fc28289f66",
             "level": 0
+          },
+          {
+            "email": "probe#dns:c-brc-jp%40sg-01",
+            "id": "9c91d4e5-0aa5-4454-95db-2ec6819ff2a1",
+            "level": 0
+          },
+          {
+            "email": "probe#v4:c-brc-jp%40sg-01",
+            "id": "f964a003-38d3-401e-aa11-0a49f37f9a2f",
+            "level": 0
+          },
+          {
+            "email": "probe#v6:c-brc-jp%40sg-01",
+            "id": "cd69b5d5-8f5f-4a90-876d-4539eca29ff5",
+            "level": 0
           }
         ],
         "decryption": "none"
@@ -98,6 +114,21 @@
           {
             "email": "c-brc-smart@sg-01",
             "id": "03a64703-2213-4beb-8e30-cbb84b1da52b",
+            "level": 0
+          },
+          {
+            "email": "probe#dns:c-brc-smart%40sg-01",
+            "id": "3bbac2e7-df2d-483d-b6cc-f3765fb3fb9f",
+            "level": 0
+          },
+          {
+            "email": "probe#v4:c-brc-smart%40sg-01",
+            "id": "fbb4c37c-825e-4d5b-8c83-1fcccd49bf8f",
+            "level": 0
+          },
+          {
+            "email": "probe#v6:c-brc-smart%40sg-01",
+            "id": "c859e79b-7767-4d01-a8f9-54d8c836b1cd",
             "level": 0
           }
         ],
@@ -134,6 +165,21 @@
             "email": "c-lin-au@sg-01",
             "id": "0a082e1e-80ce-4df9-8e6d-c3758ce96f73",
             "level": 0
+          },
+          {
+            "email": "probe#dns:c-lin-au%40sg-01",
+            "id": "8c67a587-8b0f-4e2a-9761-364f64fcbdd2",
+            "level": 0
+          },
+          {
+            "email": "probe#v4:c-lin-au%40sg-01",
+            "id": "dffd43c6-26ad-47bc-a3bb-808854668cc2",
+            "level": 0
+          },
+          {
+            "email": "probe#v6:c-lin-au%40sg-01",
+            "id": "1e756064-ce2c-4800-805b-2bac0120507a",
+            "level": 0
           }
         ],
         "decryption": "none"
@@ -168,6 +214,21 @@
           {
             "email": "c-lin-us@sg-01",
             "id": "b136544a-f92b-4c7a-a2de-dc3639eb40c0",
+            "level": 0
+          },
+          {
+            "email": "probe#dns:c-lin-us%40sg-01",
+            "id": "fa3c76e4-56f5-4217-b5f7-c0e6a46ee164",
+            "level": 0
+          },
+          {
+            "email": "probe#v4:c-lin-us%40sg-01",
+            "id": "8cac9293-a7c8-484b-b8ac-7a327450edfa",
+            "level": 0
+          },
+          {
+            "email": "probe#v6:c-lin-us%40sg-01",
+            "id": "e125e3ff-abed-4f80-987c-69bdd3073a4f",
             "level": 0
           }
         ],
@@ -372,6 +433,479 @@
     {
       "protocol": "freedom",
       "settings": {
+        "domainStrategy": "ForceIPv4"
+      },
+      "tag": "out:forward:probe-v4"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.3",
+            "port": 20002,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "73168ecd-0007-4525-a9c4-6be7bc2ccccb"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:brc/c-brc-jp>au-01:probe-v4"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.4",
+            "port": 20003,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "9ede5b2a-9982-4992-9137-c566174912df"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:brc/c-brc-jp>us-01:probe-v4"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.3",
+            "port": 20001,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "b6a52b72-00bb-4ef1-9ab5-e742c3c2f376"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:brc/c-brc-smart>au-01:probe-v4"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.4",
+            "port": 20002,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "8672b276-86fa-4c09-98f7-e9517a34ecab"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:brc/c-brc-smart>us-01:probe-v4"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.3",
+            "port": 20000,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "3aa67f70-ddc5-4d4a-809f-b58ba00b4353"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:lin/c-lin-au>au-01:probe-v4"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.4",
+            "port": 20000,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "072b73b3-1f9b-4773-88a5-f9037c5d2b59"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:lin/c-lin-us>us-01:probe-v4"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "ForceIPv6"
+      },
+      "tag": "out:forward:probe-v6"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.3",
+            "port": 20002,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "310ec9b5-e9a2-4ec4-b338-4f017d2b3ba9"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:brc/c-brc-jp>au-01:probe-v6"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.4",
+            "port": 20003,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "07b86e1a-90d6-4db8-b5de-990f3005560a"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:brc/c-brc-jp>us-01:probe-v6"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.3",
+            "port": 20001,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "809a42f9-c39f-4889-9af0-17cb7757eeb9"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:brc/c-brc-smart>au-01:probe-v6"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.4",
+            "port": 20002,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "0f22a6e5-7a04-4c37-8612-e704b94bc64c"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:brc/c-brc-smart>us-01:probe-v6"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.3",
+            "port": 20000,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "70e78502-521b-4c05-8902-05f909aafa0f"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:lin/c-lin-au>au-01:probe-v6"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.4",
+            "port": 20000,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "bb452284-3575-499b-9f57-696a36295f01"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:lin/c-lin-us>us-01:probe-v6"
+    },
+    {
+      "protocol": "dns",
+      "settings": {},
+      "tag": "probe:dns"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.3",
+            "port": 20002,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "60274aad-0f05-447e-ab75-ede56f442131"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "probe:dns:out:brc/c-brc-jp>au-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.4",
+            "port": 20003,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "1c9b4d74-06a2-4b86-a17b-4d1c1741fb03"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "probe:dns:out:brc/c-brc-jp>us-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.3",
+            "port": 20001,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "16be743b-4160-48d3-a01b-070e656e0297"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "probe:dns:out:brc/c-brc-smart>au-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.4",
+            "port": 20002,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "34477da3-ec8c-44db-8ba4-63acd904e052"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "probe:dns:out:brc/c-brc-smart>us-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.3",
+            "port": 20000,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "477496ed-6b7b-4a3a-a43e-bbcf9916f428"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "probe:dns:out:lin/c-lin-au>au-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.4",
+            "port": 20000,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "e30fca43-35c1-4e0d-b176-72ee5dec07f5"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "probe:dns:out:lin/c-lin-us>us-01"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "out:probe-family-unsupported"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
         "domainStrategy": "UseIP"
       },
       "tag": "out:internal"
@@ -420,15 +954,129 @@
           "api"
         ],
         "outboundTag": "api",
-        "ruleTag": "r:ef805560:000",
+        "ruleTag": "r:39fa4859:000",
         "type": "field"
       },
       {
         "domain": [
           "geosite:netflix"
         ],
+        "outboundTag": "out:brc/c-brc-jp>au-01:probe-v4",
+        "ruleTag": "r:39fa4859:001",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-jp%40sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:openai"
+        ],
+        "outboundTag": "out:brc/c-brc-jp>us-01:probe-v4",
+        "ruleTag": "r:39fa4859:002",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-jp%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:brc/c-brc-jp>us-01:probe-v4",
+        "ruleTag": "r:39fa4859:003",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-jp%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:39fa4859:004",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-jp%40sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:netflix"
+        ],
+        "outboundTag": "out:brc/c-brc-jp>au-01:probe-v6",
+        "ruleTag": "r:39fa4859:005",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-jp%40sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:openai"
+        ],
+        "outboundTag": "out:brc/c-brc-jp>us-01:probe-v6",
+        "ruleTag": "r:39fa4859:006",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-jp%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:brc/c-brc-jp>us-01:probe-v6",
+        "ruleTag": "r:39fa4859:007",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-jp%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:39fa4859:008",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-jp%40sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:netflix"
+        ],
+        "outboundTag": "probe:dns:out:brc/c-brc-jp>au-01",
+        "ruleTag": "r:39fa4859:009",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-jp%40sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:openai"
+        ],
+        "outboundTag": "probe:dns:out:brc/c-brc-jp>us-01",
+        "ruleTag": "r:39fa4859:010",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-jp%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns:out:brc/c-brc-jp>us-01",
+        "ruleTag": "r:39fa4859:011",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-jp%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:39fa4859:012",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-jp%40sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:netflix"
+        ],
         "outboundTag": "out:brc/c-brc-jp>au-01",
-        "ruleTag": "r:ef805560:001",
+        "ruleTag": "r:39fa4859:013",
         "type": "field",
         "user": [
           "c-brc-jp@sg-01"
@@ -439,7 +1087,7 @@
           "geosite:openai"
         ],
         "outboundTag": "out:brc/c-brc-jp>us-01",
-        "ruleTag": "r:ef805560:002",
+        "ruleTag": "r:39fa4859:014",
         "type": "field",
         "user": [
           "c-brc-jp@sg-01"
@@ -447,10 +1095,124 @@
       },
       {
         "outboundTag": "out:brc/c-brc-jp>us-01",
-        "ruleTag": "r:ef805560:003",
+        "ruleTag": "r:39fa4859:015",
         "type": "field",
         "user": [
           "c-brc-jp@sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:netflix"
+        ],
+        "outboundTag": "out:brc/c-brc-smart>au-01:probe-v4",
+        "ruleTag": "r:39fa4859:016",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-smart%40sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:openai"
+        ],
+        "outboundTag": "out:brc/c-brc-smart>us-01:probe-v4",
+        "ruleTag": "r:39fa4859:017",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-smart%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:brc/c-brc-smart>us-01:probe-v4",
+        "ruleTag": "r:39fa4859:018",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-smart%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:39fa4859:019",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-smart%40sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:netflix"
+        ],
+        "outboundTag": "out:brc/c-brc-smart>au-01:probe-v6",
+        "ruleTag": "r:39fa4859:020",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-smart%40sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:openai"
+        ],
+        "outboundTag": "out:brc/c-brc-smart>us-01:probe-v6",
+        "ruleTag": "r:39fa4859:021",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-smart%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:brc/c-brc-smart>us-01:probe-v6",
+        "ruleTag": "r:39fa4859:022",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-smart%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:39fa4859:023",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-smart%40sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:netflix"
+        ],
+        "outboundTag": "probe:dns:out:brc/c-brc-smart>au-01",
+        "ruleTag": "r:39fa4859:024",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-smart%40sg-01"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:openai"
+        ],
+        "outboundTag": "probe:dns:out:brc/c-brc-smart>us-01",
+        "ruleTag": "r:39fa4859:025",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-smart%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns:out:brc/c-brc-smart>us-01",
+        "ruleTag": "r:39fa4859:026",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-smart%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:39fa4859:027",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-smart%40sg-01"
         ]
       },
       {
@@ -458,7 +1220,7 @@
           "geosite:netflix"
         ],
         "outboundTag": "out:brc/c-brc-smart>au-01",
-        "ruleTag": "r:ef805560:004",
+        "ruleTag": "r:39fa4859:028",
         "type": "field",
         "user": [
           "c-brc-smart@sg-01"
@@ -469,7 +1231,7 @@
           "geosite:openai"
         ],
         "outboundTag": "out:brc/c-brc-smart>us-01",
-        "ruleTag": "r:ef805560:005",
+        "ruleTag": "r:39fa4859:029",
         "type": "field",
         "user": [
           "c-brc-smart@sg-01"
@@ -477,23 +1239,119 @@
       },
       {
         "outboundTag": "out:brc/c-brc-smart>us-01",
-        "ruleTag": "r:ef805560:006",
+        "ruleTag": "r:39fa4859:030",
         "type": "field",
         "user": [
           "c-brc-smart@sg-01"
         ]
       },
       {
+        "outboundTag": "out:lin/c-lin-au>au-01:probe-v4",
+        "ruleTag": "r:39fa4859:031",
+        "type": "field",
+        "user": [
+          "probe#v4:c-lin-au%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:39fa4859:032",
+        "type": "field",
+        "user": [
+          "probe#v4:c-lin-au%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:lin/c-lin-au>au-01:probe-v6",
+        "ruleTag": "r:39fa4859:033",
+        "type": "field",
+        "user": [
+          "probe#v6:c-lin-au%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:39fa4859:034",
+        "type": "field",
+        "user": [
+          "probe#v6:c-lin-au%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns:out:lin/c-lin-au>au-01",
+        "ruleTag": "r:39fa4859:035",
+        "type": "field",
+        "user": [
+          "probe#dns:c-lin-au%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:39fa4859:036",
+        "type": "field",
+        "user": [
+          "probe#dns:c-lin-au%40sg-01"
+        ]
+      },
+      {
         "outboundTag": "out:lin/c-lin-au>au-01",
-        "ruleTag": "r:ef805560:007",
+        "ruleTag": "r:39fa4859:037",
         "type": "field",
         "user": [
           "c-lin-au@sg-01"
         ]
       },
       {
+        "outboundTag": "out:lin/c-lin-us>us-01:probe-v4",
+        "ruleTag": "r:39fa4859:038",
+        "type": "field",
+        "user": [
+          "probe#v4:c-lin-us%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:39fa4859:039",
+        "type": "field",
+        "user": [
+          "probe#v4:c-lin-us%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:lin/c-lin-us>us-01:probe-v6",
+        "ruleTag": "r:39fa4859:040",
+        "type": "field",
+        "user": [
+          "probe#v6:c-lin-us%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:39fa4859:041",
+        "type": "field",
+        "user": [
+          "probe#v6:c-lin-us%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns:out:lin/c-lin-us>us-01",
+        "ruleTag": "r:39fa4859:042",
+        "type": "field",
+        "user": [
+          "probe#dns:c-lin-us%40sg-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:39fa4859:043",
+        "type": "field",
+        "user": [
+          "probe#dns:c-lin-us%40sg-01"
+        ]
+      },
+      {
         "outboundTag": "out:lin/c-lin-us>us-01",
-        "ruleTag": "r:ef805560:008",
+        "ruleTag": "r:39fa4859:044",
         "type": "field",
         "user": [
           "c-lin-us@sg-01"
@@ -504,7 +1362,7 @@
         "domain": [
           "full:invalid.brocade.never-match"
         ],
-        "ruleTag": "r:ef805560:009",
+        "ruleTag": "r:39fa4859:045",
         "type": "field"
       }
     ]

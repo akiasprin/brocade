@@ -12,6 +12,20 @@ use std::{
     time::Instant,
 };
 
+// Unlock detection may run five service workers; keep room for other optional probes.
+const PUBLIC_DNS_LOOKUP_LIMIT: usize = 8;
+
+/// The lookup succeeded, but its addresses cannot serve an IPv6-only request.
+/// Keep this distinct from DNS failures and an exhausted resolver budget.
+#[derive(Debug)]
+pub(super) struct NoIpv6Addresses;
+impl std::fmt::Display for NoIpv6Addresses {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DNS returned no IPv6 addresses")
+    }
+}
+impl std::error::Error for NoIpv6Addresses {}
+
 #[derive(Debug)]
 struct Pool {
     active: AtomicUsize,
@@ -133,6 +147,9 @@ impl reqwest::dns::Resolve for BoundedResolver {
                 .filter(|address| family.is_none_or(|value| value.accepts(address)))
                 .collect();
             if addresses.is_empty() {
+                if family == Some(AddressFamily::V6) {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, NoIpv6Addresses).into());
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "DNS returned no matching addresses",
@@ -152,7 +169,7 @@ pub(super) fn control() -> Arc<BoundedResolver> {
 pub(super) fn public() -> Arc<BoundedResolver> {
     static RESOLVER: OnceLock<Arc<BoundedResolver>> = OnceLock::new();
     RESOLVER
-        .get_or_init(|| Arc::new(BoundedResolver::new(2)))
+        .get_or_init(|| Arc::new(BoundedResolver::new(PUBLIC_DNS_LOOKUP_LIMIT)))
         .clone()
 }
 
@@ -160,6 +177,46 @@ pub(super) fn public() -> Arc<BoundedResolver> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn public_dns_admits_all_negotiated_unlock_workers() {
+        let resolver = BoundedResolver::new(PUBLIC_DNS_LOOKUP_LIMIT);
+        let workers = brocade_deployment::unlock_probe::V53_UNLOCK_SERVICES
+            .len()
+            .div_ceil(3);
+        let (started, entered) = mpsc::sync_channel(workers);
+        let (finished, completed) = mpsc::sync_channel(workers);
+        let mut releases = Vec::new();
+        for _ in 0..workers {
+            let (release, wait) = mpsc::sync_channel(0);
+            releases.push(release);
+            let started = started.clone();
+            let finished = finished.clone();
+            resolver
+                .pool
+                .start(
+                    move || {
+                        started.send(()).unwrap();
+                        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Ok(vec![])
+                    },
+                    move |_| {
+                        finished.send(()).unwrap();
+                    },
+                )
+                .unwrap();
+        }
+        for _ in 0..workers {
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for _ in 0..workers {
+            completed.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert_eq!(resolver.pool.active.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn control_dns_accepts_a_startup_burst_and_releases_workers() {

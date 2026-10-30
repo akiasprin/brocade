@@ -1,0 +1,304 @@
+.chain-unlock-scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+.chain-unlock-table {
+  width: 100%;
+  min-width: 960px;
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: fixed;
+}
+.chain-unlock-table th,
+.chain-unlock-table td {
+  padding: 0;
+  font-weight: inherit;
+}
+.chain-unlock-table .cut-corner {
+  width: 188px;
+}
+.chain-unlock-table .cut-when {
+  width: 84px;
+}
+.cut-cats th {
+  padding: 2px 8px 6px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--ink-4);
+  font: 500 10.5px var(--sans);
+  letter-spacing: 0.04em;
+  text-align: left;
+}
+.cut-cats th.cut-corner,
+.cut-cats th.cut-when {
+  border-bottom-color: transparent;
+}
+.cut-cats th:not(.cut-corner, .cut-when),
+.chain-unlock-table [data-first] {
+  border-left: 1px solid var(--line-soft);
+}
+.cut-heads th {
+  padding: 9px 2px 9px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-3);
+  font: 500 10.5px var(--sans);
+  text-align: center;
+  vertical-align: bottom;
+  white-space: nowrap;
+}
+.cut-heads th .unlock-mark {
+  display: grid;
+  width: max-content;
+  margin: 0 auto 6px;
+}
+.cut-heads th > span:last-child {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cut-heads th.cut-corner,
+.cut-heads th.cut-when {
+  padding: 9px 8px 9px 4px;
+  color: var(--ink-4);
+  text-align: left;
+}
+.cut-heads th.cut-when {
+  padding-right: 4px;
+  text-align: right;
+}
+.cut-group th {
+  padding: 16px 4px 6px;
+  text-align: left;
+  white-space: nowrap;
+}
+.chain-unlock-table tbody:first-of-type .cut-group th {
+  padding-top: 12px;
+}
+.cut-group .no {
+  margin-right: 10px;
+  color: var(--ink-4);
+  font: 500 11px var(--mono);
+}
+.cut-group b {
+  color: var(--ink);
+  font: 600 13px var(--sans);
+}
+.cut-group .count {
+  margin-left: 10px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.cut-row {
+  cursor: pointer;
+}
+.cut-row > * {
+  height: 40px;
+  border-top: 1px solid var(--line-soft);
+  transition: background-color 0.12s ease;
+}
+.cut-group + .cut-row > * {
+  border-top-color: var(--line);
+}
+@media (hover: hover) and (pointer: fine) {
+  .cut-row:hover > * {
+    background-color: var(--hover-2);
+  }
+  .cut-row:hover > .cut-chain {
+    background: linear-gradient(var(--hover-2), var(--hover-2)), var(--block);
+  }
+}
+.cut-row[data-off] > td,
+.cut-row[data-off] .cut-chain-in {
+  opacity: 0.55;
+}
+.cut-chain,
+.chain-unlock-table .cut-corner {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--block);
+}
+.cut-chain-in {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px 0 4px;
+}
+.cut-chain .geo-flag {
+  width: 18px;
+  height: 12px;
+  flex: none;
+  border-radius: 2px;
+}
+.cut-name {
+  overflow: hidden;
+  color: var(--ink);
+  font: 500 13px var(--sans);
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cut-chain .chain-card-status {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  box-sizing: border-box;
+  border-radius: 50%;
+  background: var(--ok);
+}
+.cut-chain .chain-card-status[data-tone='warn'] {
+  background: var(--gold);
+}
+.cut-chain .chain-card-status[data-tone='bad'] {
+  background: var(--err);
+}
+.cut-chain .chain-card-status[data-tone='idle'] {
+  border: 1px solid var(--ink-4);
+  background: transparent;
+}
+.cut-row td {
+  text-align: center;
+}
+.cut-cell {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ink-2);
+  font: 500 10.5px var(--mono);
+  letter-spacing: 0.01em;
+}
+.cut-cell .unlock-glyph {
+  width: 12px;
+  height: 12px;
+}
+.chain-unlock-table td:is([data-tone='no'], [data-tone='unknown'], [data-tone='info']) .cut-cell {
+  color: var(--ink-4);
+}
+.chain-unlock-table td[data-dim] .cut-cell {
+  opacity: 0.42;
+}
+.cut-cell .cut-dot {
+  top: -4px;
+  right: auto;
+  left: 9px;
+}
+.chain-unlock-table .cut-blank {
+  padding-left: 14px;
+  border-left: 1px solid var(--line-soft);
+  color: var(--ink-4);
+  font-size: 12px;
+  text-align: left;
+}
+.cut-row .cut-when {
+  padding-right: 4px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  text-align: right;
+  white-space: nowrap;
+}
+.cut-row .cut-when[data-tone='obsolete'] {
+  color: var(--gold);
+}
+.cut-row .cut-when[data-tone='running'] {
+  color: var(--ink-2);
+}
+
+@media (max-width: 760px) {
+  .chain-unlock-table {
+    min-width: 920px;
+  }
+  .chain-unlock-table .cut-corner {
+    width: 124px;
+  }
+  .chain-unlock-table .cut-when {
+    width: 72px;
+  }
+  .cut-chain .geo-flag {
+    display: none;
+  }
+}
+
+.chain-unlock-scroll {
+  min-width: 0;
+}
+.chain-unlock-table .cut-chain-in {
+  width: 100%;
+  min-height: 40px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.cut-chain-in:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+.cut-dot {
+  display: inline-block;
+  flex: none;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--gold);
+}
+.cut-cell .cut-dot {
+  position: absolute;
+}
+.cut-auto {
+  display: block;
+  color: var(--ink-4);
+  font-size: 10px;
+}
+.chain-list-actions {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 9px;
+  margin-left: auto;
+}
+.chain-unlock-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px 8px;
+  margin: 12px 4px 0;
+  color: var(--ink-3);
+  font-size: 11px;
+}
+.chain-unlock-legend .unlock-glyph {
+  width: 12px;
+  height: 12px;
+}
+.chain-unlock-legend > span {
+  margin-left: auto;
+  color: var(--ink-4);
+}
+.chain-unlock-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cut-group-in {
+  position: sticky;
+  left: 0;
+  display: inline-flex;
+  align-items: baseline;
+  background: var(--block);
+}
+
+.cut-regions {
+  position: relative;
+  display: block;
+  line-height: 14px;
+  text-align: left;
+}
+.cut-v6 {
+  /* Supplementary regions must not move the primary reading or its status glyph. */
+  position: absolute;
+  top: 100%;
+  left: 0;
+  color: var(--ink-3);
+  font: 500 9.5px / 12px var(--mono);
+  white-space: nowrap;
+}

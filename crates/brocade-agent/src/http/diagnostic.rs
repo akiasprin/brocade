@@ -27,7 +27,12 @@ pub(super) fn category(error: &(dyn Error + 'static)) -> String {
         }
         if let Some(error) = error.downcast_ref::<io::Error>() {
             errno = error.raw_os_error().or(errno);
-            if error.kind() == io::ErrorKind::TimedOut {
+            if error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<super::resolver::NoIpv6Addresses>())
+            {
+                category = "dns_no_ipv6";
+            } else if error.kind() == io::ErrorKind::TimedOut {
                 category = "timeout";
             } else if error.kind() == io::ErrorKind::WouldBlock {
                 category = "capacity";
@@ -80,5 +85,53 @@ mod tests {
         assert!(text.contains("received_bytes=0"));
         assert!(category(&io::Error::from_raw_os_error(libc::EMFILE))
             .contains(&format!("os_errno={}", libc::EMFILE)));
+    }
+
+    #[test]
+    fn confirmed_ipv6_address_absence_has_a_distinct_safe_category() {
+        let absent = io::Error::new(
+            io::ErrorKind::NotFound,
+            super::super::resolver::NoIpv6Addresses,
+        );
+        assert_eq!(category(&absent), "dns_no_ipv6");
+        assert!(Progress::new(Instant::now())
+            .error("send", &absent)
+            .contains("kind=dns_no_ipv6 "));
+        for error in [
+            io::Error::new(io::ErrorKind::NotFound, "ordinary lookup failure"),
+            io::Error::new(io::ErrorKind::WouldBlock, "DNS capacity exhausted"),
+            io::Error::new(io::ErrorKind::TimedOut, "DNS lookup did not complete"),
+        ] {
+            assert_ne!(category(&error), "dns_no_ipv6");
+        }
+    }
+
+    #[test]
+    fn ipv6_address_absence_survives_the_reqwest_error_chain() {
+        struct NoIpv6;
+        impl reqwest::dns::Resolve for NoIpv6 {
+            fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(async {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        super::super::resolver::NoIpv6Addresses,
+                    )
+                    .into())
+                })
+            }
+        }
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .dns_resolver(std::sync::Arc::new(NoIpv6))
+            .build()
+            .unwrap();
+        let error = client
+            .get("http://no-ipv6.example.invalid/")
+            .send()
+            .unwrap_err();
+        assert_eq!(category(&error), "dns_no_ipv6");
+        assert!(Progress::new(Instant::now())
+            .error("send", &error)
+            .contains("kind=dns_no_ipv6 "));
     }
 }

@@ -3,6 +3,8 @@ import type { HopWireKind } from '../ui/format';
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   createApp,
+  egressDnsEndpointText,
+  egressDnsIssue,
   createChain,
   createIngress,
   createUser,
@@ -977,7 +979,7 @@ export function ChainWizard({
     for (const change of activeDnsChanges) {
       list.push({
         op: 'set_node_egress_dns',
-        arg: `${nameOf(change.node)}：${change.selector.t}${matchValues(change.selector) ? `=${matchValues(change.selector)}` : ''} → ${change.resolution ? `自定义 DNS ${change.resolution.address}:${change.resolution.port}` : '默认 DNS'}`,
+        arg: `${nameOf(change.node)}：${change.selector.t}${matchValues(change.selector) ? `=${matchValues(change.selector)}` : ''} → ${change.resolution ? `自定义 DNS ${egressDnsEndpointText(change.resolution)}` : '默认 DNS'}`,
       });
     }
     /* 授权排在最后：grant 引用接入面，接入面需要先创建。草稿按顺序回放。 */
@@ -1124,11 +1126,7 @@ export function ChainWizard({
     anyTlsEnabled || hy2Enabled ? (!headCertificate ? `先为入口节点分配${headCertificateLabel}` : null) : null,
     !realityTargetReady ? '补全 VLESS · TLS/REALITY 伪装目标' : null,
     wizardRuleIssue(headId, stagedRules),
-    activeDnsChanges.find(
-      change =>
-        change.resolution &&
-        (!change.resolution.address.trim() || change.resolution.port < 1 || change.resolution.port > 65535),
-    )
+    activeDnsChanges.find(change => change.resolution && !!egressDnsIssue(change.resolution))
       ? '补全自定义 DNS 地址和端口'
       : null,
     pathTargetIssue,

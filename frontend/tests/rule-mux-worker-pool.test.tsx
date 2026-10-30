@@ -175,6 +175,55 @@ describe('规则页 Mux Worker 池', () => {
     expect(DEFAULT_HOP_MUX.max_requests_per_worker).toBe(128);
   });
 
+  it('清空后重新输入复用流和零预热，不会拼接旧值，并保留应用结果', async () => {
+    const view = renderEditor({ t: 'mux', v: { ...GLOBAL_MUX, concurrency: 64, reuse_threshold: 32 } });
+    fireEvent.click(view.getByRole('button', { name: '配置参数' }));
+    const dialog = view.getByRole('dialog');
+    const apply = within(dialog).getByRole('button', { name: '应用' }) as HTMLButtonElement;
+    const concurrency = muxField(dialog, '复用流数量');
+    fireEvent.change(concurrency, { target: { value: '' } });
+    expect(concurrency.value).toBe('');
+    expect(apply.disabled).toBe(true);
+    fireEvent.change(concurrency, { target: { value: '1' } });
+    fireEvent.change(concurrency, { target: { value: '12' } });
+    const prewarm = muxField(dialog, '预热目标');
+    fireEvent.change(prewarm, { target: { value: '' } });
+    expect(prewarm.value).toBe('');
+    expect(apply.disabled).toBe(true);
+    fireEvent.change(prewarm, { target: { value: '0' } });
+    expect(prewarm.value).toBe('0');
+    expect(apply.disabled).toBe(false);
+    fireEvent.click(apply);
+    fireEvent.click(view.getByRole('button', { name: '配置参数' }));
+    expect(muxField(view.getByRole('dialog'), '复用流数量').value).toBe('12');
+    expect(muxField(view.getByRole('dialog'), '预热目标').value).toBe('0');
+    fireEvent.click(within(view.getByRole('dialog')).getByRole('button', { name: '应用' }));
+    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+    await waitFor(() =>
+      expect(savedPools()).toEqual(
+        Array(2).fill({ t: 'mux', v: { ...GLOBAL_MUX, concurrency: 12, prewarm_workers: 0, reuse_threshold: 32 } }),
+      ),
+    );
+  });
+
+  it.each(['复用流数量', '累计子连接', '预热目标', '复用阈值', '超额空闲寿命', '探活并发', '探活周期', '探活超时'])(
+    '%s 允许暂时清空，空值禁止应用',
+    label => {
+      const view = renderEditor({ t: 'mux', v: { ...GLOBAL_MUX } });
+      fireEvent.click(view.getByRole('button', { name: '配置参数' }));
+      const dialog = view.getByRole('dialog');
+      const input = muxField(dialog, label);
+      fireEvent.change(input, { target: { value: '' } });
+      expect(input.value).toBe('');
+      expect((within(dialog).getByRole('button', { name: '应用' }) as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.click(within(dialog).getByRole('button', { name: '跟随全局' }));
+      expect(input.value).not.toBe('');
+      expect((within(dialog).getByRole('button', { name: '应用' }) as HTMLButtonElement).disabled).toBe(false);
+      fireEvent.click(within(dialog).getByRole('button', { name: '单独配置' }));
+      expect(input.value).not.toBe('');
+    },
+  );
+
   it('选择 Mux 只写入跟随全局形状，并同步所有指向同一目标的规则', async () => {
     const view = renderEditor();
 

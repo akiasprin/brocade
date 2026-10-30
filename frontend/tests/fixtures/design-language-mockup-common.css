@@ -1,0 +1,54 @@
+/* 四套设计语言共用的部分：字体角色与读数。颜色令牌来自 palette-mockup-schemes.css（data-base × data-accent）。
+   苹果平台只有代码使用 SF Mono；读数、地址和代号都用 SF Pro，靠等宽数字（tnum）对齐。生产里大量的
+   var(--mono) 读数因此整体换成无衬线，真正的代码区再显式改回等宽。站点名的衬线体也一并退出。 */
+:root[data-lang] {
+  --sans:
+    -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', 'PingFang SC', 'Hiragino Sans GB',
+    'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif;
+  --display:
+    -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', 'PingFang SC', 'Hiragino Sans GB',
+    'Noto Sans CJK SC', 'Microsoft YaHei', sans-serif;
+  --rounded:
+    ui-rounded, 'SF Pro Rounded', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Noto Sans CJK SC', sans-serif;
+  --code: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'JetBrains Mono', Consolas, monospace;
+  --mono: var(--sans);
+  --serif: var(--sans);
+  --grid-image: none;
+}
+:root[data-lang] :is(pre, code, kbd, samp, textarea.f.mono, .cm-editor, .cm-content, .code, .yaml) {
+  font-family: var(--code);
+}
+:root[data-lang] body {
+  font-feature-settings: 'tnum';
+}
+
+/* 首层面包屑只有当前页名，与页面自己的标题重复；下钻后才显示路径。 */
+:root[data-lang] .fg-crumb > .cur:first-child {
+  display: none;
+}
+/* 路径分隔改用苹果的 › */
+:root[data-lang] .fg-crumb .sep {
+  font-size: 0;
+}
+:root[data-lang] .fg-crumb .sep::before {
+  content: '›';
+  font-size: 15px;
+  line-height: 1;
+}
+
+/* 等宽字体时代留下的字距与全大写：SF Pro 不需要额外字距。 */
+:root[data-lang]
+  :is(
+    .kpi .kpi-l,
+    .panel > header h4,
+    .panel > summary h4,
+    .st,
+    .plot-label,
+    .fg-badge,
+    .nd-rt-c,
+    .chain-card-latency,
+    .lst-sum,
+    .kpi .kpi-v
+  ) {
+  letter-spacing: 0;
+}

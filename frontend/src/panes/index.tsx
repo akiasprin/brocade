@@ -1,4 +1,5 @@
-import { lazy, useMemo, type ReactNode } from 'react';
+import { lazy } from '../ui/lazy';
+import { useMemo, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   fetchCompileView,

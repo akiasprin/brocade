@@ -6519,11 +6519,45 @@ async fn insert_or_supersede_obligation_tx(
     target: &PlannedTarget,
     usage_generation_id: Option<i64>,
 ) -> Result<i64> {
+    // A full configuration owns the permission snapshot from its revision too. Replaying an
+    // older grants obligation afterwards can revoke newer users or address deleted inbounds.
+    // Newer permission revisions still follow the config, and unmanaged grants cover nothing.
+    let covered_grants_revision = (kind == DeploymentKind::Config
+        && !matches!(target.desired.grants, DesiredGrants::Unmanaged { .. }))
+    .then_some(revision_id);
+
+    // Reports lock their deployment before its obligation. Take those same locks first so
+    // supersession cannot hold an obligation while waiting for its in-flight report to settle.
+    sqlx::query(
+        "SELECT deployment.id
+           FROM deployments deployment
+          WHERE EXISTS (
+              SELECT 1 FROM node_convergence_obligations obligation
+               WHERE obligation.source_deployment_id = deployment.id
+                 AND obligation.node_id = $1
+                 AND obligation.lifecycle_epoch = $3
+                 AND (obligation.kind = $2 OR (
+                     obligation.kind = 'grants' AND obligation.source_revision_id <= $4
+                 ))
+                 AND obligation.status IN (
+                     'pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty'
+                 )
+          )
+          ORDER BY CASE deployment.kind WHEN 'config' THEN 0 ELSE 1 END, deployment.id
+          FOR UPDATE OF deployment",
+    )
+    .bind(&target.node_id)
+    .bind(kind.as_str())
+    .bind(lifecycle_epoch)
+    .bind(covered_grants_revision)
+    .fetch_all(&mut **tx)
+    .await?;
+
     let previous = sqlx::query(
         "SELECT source_deployment_id, status
            FROM node_convergence_obligations
           WHERE node_id = $1
-            AND kind = $2
+            AND (kind = $2 OR (kind = 'grants' AND source_revision_id <= $4))
             AND lifecycle_epoch = $3
             AND status IN (
                 'pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty'
@@ -6534,6 +6568,7 @@ async fn insert_or_supersede_obligation_tx(
     .bind(&target.node_id)
     .bind(kind.as_str())
     .bind(lifecycle_epoch)
+    .bind(covered_grants_revision)
     .fetch_all(&mut **tx)
     .await?;
 
@@ -6555,7 +6590,7 @@ async fn insert_or_supersede_obligation_tx(
         "UPDATE node_convergence_obligations
             SET status = 'superseded', superseded_at = now()
           WHERE node_id = $1
-            AND kind = $2
+            AND (kind = $2 OR (kind = 'grants' AND source_revision_id <= $4))
             AND lifecycle_epoch = $3
             AND status IN (
                 'pending', 'dispatched', 'converging', 'failed-recovered', 'failed-dirty'
@@ -6564,6 +6599,7 @@ async fn insert_or_supersede_obligation_tx(
     .bind(&target.node_id)
     .bind(kind.as_str())
     .bind(lifecycle_epoch)
+    .bind(covered_grants_revision)
     .execute(&mut **tx)
     .await?;
 

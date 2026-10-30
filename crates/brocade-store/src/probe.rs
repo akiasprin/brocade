@@ -171,7 +171,7 @@ pub async fn record_link_probe(
                 _ => {
                     return Err(StoreError::InvalidData(
                         "link probe with status ok must carry both mtu values".to_owned(),
-                    ))
+                    ));
                 }
             },
             // The two undeterminable outcomes carry no number.
@@ -569,8 +569,16 @@ pub struct E2eProbeSampleSeries {
 /// looks exactly like a genuinely broken chain.
 pub async fn e2e_probe_targets(pool: &PgPool, node_id: &str) -> Result<E2eProbeTargetList> {
     let snapshot = crate::materialize::load_current_immutable_snapshot(pool).await?;
+    e2e_targets_from_snapshot(pool, &snapshot, node_id).await
+}
+
+pub(crate) async fn e2e_targets_from_snapshot(
+    pool: &PgPool,
+    snapshot: &ModelSnapshot,
+    node_id: &str,
+) -> Result<E2eProbeTargetList> {
     let probe_settings = snapshot.settings.probe.clone();
-    let plan = e2e_probe_plan(&snapshot, node_id)?;
+    let plan = e2e_probe_plan(snapshot, node_id)?;
     let pinned_peer_cert_sha256 = self_signed_certificate_pin(pool, node_id).await?;
 
     Ok(E2eProbeTargetList {
@@ -944,7 +952,7 @@ pub async fn e2e_probe_view(
                 _ => {
                     return Err(StoreError::InvalidData(
                         "exit IP intelligence row is incomplete".to_owned(),
-                    ))
+                    ));
                 }
             };
             Ok(E2eProbeItem {
@@ -1011,6 +1019,36 @@ fn verdict_text(verdict: E2eExitVerdict, status: E2eProbeStatus) -> &'static str
         E2eExitVerdict::Mismatch => "mismatch",
         E2eExitVerdict::Unknown => "unknown",
     }
+}
+
+/// This projection carries only graph identities, never additional probe credentials.
+pub(crate) fn unlock_family_probe_nodes(
+    snapshot: &ModelSnapshot,
+    node: &str,
+    app: &str,
+    chain: &str,
+) -> Result<Option<Vec<String>>> {
+    Ok(e2e_probe_plan(snapshot, node)?
+        .targets
+        .into_iter()
+        .find(|target| target.app_id.as_deref() == Some(app) && target.chain_id == chain)
+        .and_then(|target| target.family_probe_nodes))
+}
+
+/// An observed connection names its own exit. The graph fences that identity,
+/// rather than collapsing a branching chain to one guessed terminal.
+pub(crate) fn unlock_dns_exits(
+    snapshot: &ModelSnapshot,
+    node: &str,
+    app: &str,
+    chain: &str,
+) -> Result<Option<Vec<String>>> {
+    Ok(e2e_probe_plan(snapshot, node)?
+        .targets
+        .into_iter()
+        .find(|target| target.app_id.as_deref() == Some(app) && target.chain_id == chain)
+        .filter(|target| target.family_probe_nodes.is_some())
+        .map(|target| target.exit_nodes))
 }
 
 #[cfg(test)]

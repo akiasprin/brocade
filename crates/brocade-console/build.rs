@@ -121,6 +121,9 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
+#[path = "build/agents.rs"]
+mod agent_build;
+
 #[path = "build/source_revision.rs"]
 mod source_revision;
 #[path = "build/xray.rs"]
@@ -185,9 +188,9 @@ const CONSOLE_ASSETS_ENV: &str = "BROCADE_CONSOLE_ASSETS_DIR";
 /// The escape hatch naming where npm is, for a machine that keeps node outside PATH.
 const NPM_ENV_VAR: &str = "BROCADE_NPM";
 /// The vendored Xray baseline distributed to every new node.
-const XRAY_VERSION: &str = "v26.4.25";
+const XRAY_VERSION: &str = "v26.10.21";
 /// `git describe --always` for the upstream baseline, matching Xray's release workflow banner.
-const XRAY_UPSTREAM_BUILD: &str = "b4f0898";
+const XRAY_UPSTREAM_BUILD: &str = "1b1647c";
 /// Xray source is part of this repository. The build must never clone or select an upstream tag.
 const XRAY_SOURCE_DIR: &str = "components/xray-core";
 /// Escape hatch for locating Go outside PATH.
@@ -342,6 +345,8 @@ fn main() {
         );
     }
 
+    build_agents(&workspace, zig.as_deref());
+
     for target in TARGETS {
         let built = match env::var(override_var(target.arch)) {
             // For cross-compiling with another toolchain, or embedding a file that already
@@ -358,7 +363,9 @@ fn main() {
                 println!("cargo:rerun-if-changed={}", path.display());
                 path
             }
-            _ => build_agent(&out_dir, target, zig.as_deref()),
+            _ => agent_build::target_dir(&workspace)
+                .join(target.triple)
+                .join("release/brocade-agent"),
         };
         embed_binary(
             &out_dir,
@@ -600,8 +607,10 @@ fn zig_wrapper(out_dir: &Path, target: &Target, zig: &Path) -> (PathBuf, PathBuf
 
     let write = |name: String, body: String| -> PathBuf {
         let path = out_dir.join(name);
-        fs::write(&path, body)
-            .unwrap_or_else(|error| panic!("写不了 zig 包装脚本 {}: {error}", path.display()));
+        if fs::read(&path).ok().as_deref() != Some(body.as_bytes()) {
+            fs::write(&path, body)
+                .unwrap_or_else(|error| panic!("写不了 zig 包装脚本 {}: {error}", path.display()));
+        }
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
             .unwrap_or_else(|error| panic!("给 {} 加执行位失败: {error}", path.display()));
         path
@@ -668,69 +677,42 @@ fn target_installed(triple: &str) -> bool {
         .is_dir()
 }
 
-fn build_agent(out_dir: &Path, target: &Target, zig: Option<&Path>) -> PathBuf {
-    let triple = target.triple;
-    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-    // Placed under OUT_DIR: `cargo clean` clears it along with everything else and it does not
-    // contend for the outer target's lock. Both architectures share this one directory, so common
-    // dependencies are unpacked once.
-    let target_dir = out_dir.join("agent-target");
-    let workspace = workspace_root();
-
-    let mut command = Command::new(&cargo);
-    command
-        .args(["build", "--release", "-p", "brocade-agent", "--target"])
-        .arg(triple)
-        .arg("--manifest-path")
-        .arg(workspace.join("Cargo.toml"))
-        .arg("--target-dir")
-        .arg(&target_dir)
-        // Run from the workspace root rather than build.rs's own directory: cargo gives rustc
-        // relative paths only where the source sits beneath the current directory, and otherwise
-        // absolute paths are stamped into the binary through `file!()`. The consequences are, one,
-        // the build machine's directory structure shipping to every node, and two, artifacts that
-        // are no longer reproducible — an operator's own build produces a sha disagreeing with what
-        // the control plane reports, leaving nobody able to verify whether what is distributed is
-        // the agent in the source. And this binary runs as root on every node.
-        .current_dir(&workspace)
-        // Those inherited from the outer build would have the nested cargo touch the outer target
-        // directory, or inherit a RUSTFLAGS meant for the control plane (which may hold things true
-        // only of the host architecture). All of them are stripped.
-        .env_remove("CARGO_TARGET_DIR")
-        .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env_remove("CARGO_BUILD_TARGET");
-    if let Some(flags) = target.linker {
-        // The per-target variable rather than a global RUSTFLAGS: only this one target needs a
-        // different linker, and setting it globally would affect the other architecture's build
-        // too.
-        command.env(
-            format!(
-                "CARGO_TARGET_{}_RUSTFLAGS",
-                triple.to_uppercase().replace('-', "_")
-            ),
-            flags,
-        );
+fn build_agents(workspace: &Path, zig: Option<&Path>) {
+    let targets = TARGETS
+        .iter()
+        .filter(|target| !env_set(&override_var(target.arch)))
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return;
     }
-    // Prepare a compiler for ring's C and assembly. Where the build machine brings its own
-    // `CC_<triple>`, not one word is touched — that configuration was set deliberately, and
-    // overriding it treats "I have my own toolchain" as unsaid.
-    if let (Some(zig), false) = (zig, env_set(&cc_var(triple))) {
-        let (cc, ar) = zig_wrapper(out_dir, target, zig);
-        command.env(cc_var(triple), cc).env(ar_var(triple), ar);
+    let cache = agent_build::target_dir(workspace);
+    fs::create_dir_all(&cache).expect("cannot create persistent Agent build cache");
+    let triples = targets
+        .iter()
+        .map(|target| target.triple)
+        .collect::<Vec<_>>();
+    let mut command = agent_build::command(workspace, &cache, &triples);
+    for target in targets {
+        if let Some(flags) = target.linker {
+            command.env(
+                format!(
+                    "CARGO_TARGET_{}_RUSTFLAGS",
+                    target.triple.to_uppercase().replace('-', "_")
+                ),
+                flags,
+            );
+        }
+        if let (Some(zig), false) = (zig, env_set(&cc_var(target.triple))) {
+            let (cc, ar) = zig_wrapper(&cache, target, zig);
+            command
+                .env(cc_var(target.triple), cc)
+                .env(ar_var(target.triple), ar);
+        }
     }
-
-    let status = command
-        .status()
-        .unwrap_or_else(|error| panic!("起不了 cargo 去编 {triple} 的 agent：{error}"));
-    if !status.success() {
-        panic!(
-            "编不出 {triple} 的 brocade-agent（退出码 {:?}）。\n\
-             控制面分发的就是这个二进制，编不出来就不该编出一个会分发过期版本的控制面。",
-            status.code()
-        );
-    }
-    target_dir.join(triple).join("release/brocade-agent")
+    run(
+        &mut command,
+        "build both Agent architectures in one Cargo graph",
+    );
 }
 
 fn embed_binary(out_dir: &Path, built: &Path, name: &str, arch: &str, sha_env_prefix: &str) {

@@ -1,4 +1,5 @@
-import { Fragment, lazy, Suspense, useMemo, useState, useSyncExternalStore } from 'react';
+import { lazy } from '../ui/lazy';
+import { Fragment, Suspense, useMemo, useState, useSyncExternalStore } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   ApiError,
@@ -142,7 +143,7 @@ export function TunnelsPane({ win }: { win: Win }) {
         <VpngatePage countryCode={selectedVpngateCountry} onCountryChange={selectVpngateCountry} />
       </Suspense>
     );
-  if (selectedId) return <TunnelDetail tunnelId={selectedId} />;
+  if (selectedId) return <TunnelDetail key={selectedId} tunnelId={selectedId} />;
   return <TunnelList go={go} />;
 }
 
@@ -1685,6 +1686,13 @@ export function WarpBindingCard({
 
 export function WarpEdit({ tunnel, onClose }: { tunnel: ExternalOutbound; onClose: () => void }) {
   return (
-    <WarpMasqueEditor tenantId={tunnel.tenant} id={tunnel.id} tunnel={tunnel} onClose={onClose} onSaved={onClose} />
+    <WarpMasqueEditor
+      key={`${tunnel.tenant}/${tunnel.id}`}
+      tenantId={tunnel.tenant}
+      id={tunnel.id}
+      tunnel={tunnel}
+      onClose={onClose}
+      onSaved={onClose}
+    />
   );
 }

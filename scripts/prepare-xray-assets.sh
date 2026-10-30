@@ -1,13 +1,13 @@
 #!/bin/sh
 set -eu
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 xray_root="$repo_root/components/xray-core"
 asset_dir="${XRAY_ASSET_DIR:-$xray_root/resources}"
 cache_dir="${XRAY_ASSET_CACHE_DIR:-$repo_root/.tools}"
 geodata_base="${BROCADE_GEODATA_BASE:-https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/202609022346}"
 
-# These are the assets currently used by the v26.4.25 fork checkout. Change them only together
+# These are the assets currently used by the Brocade fork checkout. Change them only together
 # with an intentional rule-data refresh; the files themselves stay ignored by the Xray fork.
 # Fetch the matching dated release: the moving release branch cannot satisfy pinned digests
 # after upstream publishes its next daily update.

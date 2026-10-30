@@ -66,3 +66,27 @@ test('frontend and Store agree on explicit handoff restart fallback capability',
   assert.ok(frontendVersion, 'Frontend handoff fallback protocol constant is missing');
   assert.equal(frontendVersion, rustVersion);
 });
+
+test('unlock diagnostics share the same minimum protocol and service identities', () => {
+  const unlock = readFileSync(new URL('../../crates/brocade-deployment/src/unlock_probe.rs', import.meta.url), 'utf8');
+  const version = unlock.match(/pub const UNLOCK_PROBE_PROTOCOL_VERSION: u32 = (\d+);/)?.[1];
+  assert.ok(version);
+  assert.equal(api.match(/export const UNLOCK_PROBE_PROTOCOL_VERSION = (\d+);/)?.[1], version);
+  for (const service of ['chatgpt', 'claude', 'gemini', 'netflix', 'disney_plus', 'youtube_premium', 'tiktok', 'prime_video', 'reddit', 'spotify', 'hbo_max', 'dazn', 'bbc_iplayer', 'crunchyroll', 'paramount_plus']) {
+    assert.ok(api.includes(`'${service}'`), `missing unlock service: ${service}`);
+  }
+});
+
+test('chain unlock and daily schedule constants agree with the shared wire contract',()=>{
+ const unlock=readFileSync(new URL('../../crates/brocade-deployment/src/unlock_probe.rs',import.meta.url),'utf8');
+ for(const name of ['CHAIN_UNLOCK_PROBE_PROTOCOL_VERSION','YOUTUBE_UNLOCK_DETAILS_PROTOCOL_VERSION','UNLOCK_PROBE_INTERVAL_SECS','UNLOCK_AUTOMATIC_CHAIN_PROTOCOL_VERSION','UNLOCK_EXTENDED_SERVICES_PROTOCOL_VERSION','UNLOCK_REDUCED_SERVICES_PROTOCOL_VERSION']) {
+  const rustValue=unlock.match(new RegExp(`pub const ${name}: u(?:32|64) = ([0-9_]+);`))?.[1];
+  const uiValue=api.match(new RegExp(`export const ${name} = ([0-9_]+);`))?.[1];
+  assert.ok(rustValue);assert.equal(uiValue?.replaceAll('_',''),rustValue.replaceAll('_',''));
+ }
+});
+
+test('automatic chain diagnostics require the same protocol in Console and frontend',()=>{
+ const shared=readFileSync(new URL('../../crates/brocade-deployment/src/unlock_probe.rs',import.meta.url),'utf8');
+ assert.equal(shared.match(/UNLOCK_AUTOMATIC_CHAIN_PROTOCOL_VERSION: u32 = (\d+);/)?.[1],api.match(/UNLOCK_AUTOMATIC_CHAIN_PROTOCOL_VERSION = (\d+);/)?.[1]);
+});

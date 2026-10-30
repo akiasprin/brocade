@@ -8,7 +8,7 @@ import type {
   NodeTrafficView,
   TrafficLimitObservation,
 } from '../src/api';
-import { trafficLimitForm, trafficLimitPolicy } from '../src/panes/nodes-traffic-limit';
+import { trafficLimitForm, trafficLimitPolicy, trafficLimitStatus } from '../src/panes/nodes-traffic-limit';
 
 let TrafficAccountingCard: typeof import('../src/panes/nodes').TrafficAccountingCard;
 
@@ -80,6 +80,54 @@ function observed(patch: Partial<TrafficLimitObservation>): TrafficLimitObservat
 }
 
 const ok = (item: NodeTrafficItem) => ({ ok: true, status: 200, json: async () => ({ nodes: [item] }) });
+
+describe('machine traffic limit confirmation', () => {
+  it('retains a confirmed limit through missed heartbeats and expires it at 300 seconds', () => {
+    const limit = traffic(
+      {},
+      {
+        revision: 1,
+        policy: { enabled: true, layer: 'application', rules: [] },
+        observation: observed({ phase: 'limited', rate_bps: 100_000_000 }),
+        reported_at_unix_secs: 1_000,
+      },
+    ).limit!;
+    for (const elapsed of [60, 90, 120, 180, 240, 299.999]) {
+      const status = trafficLimitStatus(limit, 1_000 + elapsed);
+      expect(status.confirmed).toBe(true);
+      expect(status.text).toBe('已限速');
+      expect(status.rate).toBe(100_000_000);
+    }
+    const expired = trafficLimitStatus(limit, 1_300);
+    expect(expired.confirmed).toBe(false);
+    expect(expired.text).toBe('等待应用确认');
+    expect(expired.rate).toBeNull();
+    expect(trafficLimitStatus({ ...limit, revision: 2 }, 1_060).confirmed).toBe(false);
+  });
+
+  it('shows generation handoff as pending while retaining individual layer results', () => {
+    const limit = traffic(
+      {},
+      {
+        revision: 1,
+        policy: { enabled: true, layer: 'both', rules: [] },
+        observation: observed({
+          phase: 'waiting',
+          rate_bps: 100_000_000,
+          system: { phase: 'limited', rate_bps: 100_000_000, error: null },
+          application: { phase: 'waiting', rate_bps: null, error: '等待旧代排空后再确认应用层上限' },
+        }),
+        reported_at_unix_secs: 1_000,
+      },
+    ).limit!;
+    const status = trafficLimitStatus(limit, 1_060);
+    expect(status.text).toBe('等待应用确认');
+    expect(status.chip?.text).toBe('限速待确认');
+    expect(status.tone).toBe('mute');
+    expect(status.rate).toBeNull();
+    expect(status.layers.map(layer => layer.text)).toEqual(['已限速', '等待应用确认']);
+  });
+});
 
 function renderCard(item: NodeTrafficItem, canEdit = true, fetchMock = vi.fn().mockResolvedValue(ok(item))) {
   vi.stubGlobal('fetch', fetchMock);

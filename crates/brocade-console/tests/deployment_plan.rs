@@ -657,7 +657,10 @@ fn grants_converge_when_observation_carries_email_uuid_and_flow() {
     // The probe credential is in this list too: it ships down the same channel as a real user
     // (`physical/node.rs`), so "added correctly on the machine" must include it — without it a
     // credential really is missing and it should judge that a sync is needed. The UUID is computed
-    // explicitly through `probe_uuid`, pinning down that it is genuinely derived.
+    // explicitly through `probe_uuid`, pinning down that it is genuinely derived. DNS and
+    // address-family probes have their own derived credentials in the same grant list.
+    let probe_label = brocade_core::model::probe_label("i-hk");
+    let probe_uuid = brocade_core::model::probe_uuid("priv-i-hk", "i-hk");
     let observed = AppliedGrantsState::Present {
         inbounds: vec![ObservedInbound {
             tag: "in:direct/i-hk".to_owned(),
@@ -668,8 +671,35 @@ fn grants_converge_when_observation_carries_email_uuid_and_flow() {
                     flow: Some("xtls-rprx-vision".to_owned()),
                 },
                 ObservedClient {
-                    email: brocade_core::model::probe_label("i-hk"),
-                    uuid: brocade_core::model::probe_uuid("priv-i-hk", "i-hk"),
+                    email: probe_label.clone(),
+                    uuid: probe_uuid.clone(),
+                    flow: Some("xtls-rprx-vision".to_owned()),
+                },
+                ObservedClient {
+                    email: brocade_core::model::probe_dns_label(&probe_label),
+                    uuid: brocade_core::model::probe_dns_uuid(&probe_uuid),
+                    flow: Some("xtls-rprx-vision".to_owned()),
+                },
+                ObservedClient {
+                    email: brocade_core::model::probe_family_label(
+                        &probe_label,
+                        brocade_core::model::IpFamily::V4,
+                    ),
+                    uuid: brocade_core::model::probe_family_uuid(
+                        &probe_uuid,
+                        brocade_core::model::IpFamily::V4,
+                    ),
+                    flow: Some("xtls-rprx-vision".to_owned()),
+                },
+                ObservedClient {
+                    email: brocade_core::model::probe_family_label(
+                        &probe_label,
+                        brocade_core::model::IpFamily::V6,
+                    ),
+                    uuid: brocade_core::model::probe_family_uuid(
+                        &probe_uuid,
+                        brocade_core::model::IpFamily::V6,
+                    ),
                     flow: Some("xtls-rprx-vision".to_owned()),
                 },
             ],

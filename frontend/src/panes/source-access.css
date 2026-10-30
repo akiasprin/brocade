@@ -1,58 +1,425 @@
-.source-access-body {
-  display: grid;
-  gap: 12px;
-  min-width: 0;
-  overflow-wrap: anywhere;
+.panel.config-panel.source-access-panel {
+  container: source-access / inline-size;
+  /* 列宽：禁行标记 14 · 间距 10 · 地址。各组的行、入口与提示都从地址列起排。 */
+  --source-access-indent: 24px;
 }
-.source-access-panel > summary .sp {
-  flex: 1;
+.source-access-stat {
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
-.source-access-body p {
-  margin: 0;
-}
-.source-access-body .note {
-  line-height: 1.55;
+.source-access-stat b {
+  color: var(--ink-2);
+  font-weight: 600;
 }
 .source-access-status {
-  font-size: 12px;
-}
-.source-access-list {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-  border-block: 1px solid var(--line-soft);
-}
-.source-access-list li {
-  display: flex;
+  display: inline-flex;
+  flex: none;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 0;
+  gap: 6px;
+  align-self: center;
+  color: var(--ink-3);
+  font: 11px/1 var(--sans);
+  white-space: nowrap;
 }
-.source-access-list li + li {
+.source-access-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.source-access-status.ok .source-access-dot {
+  background: var(--ok);
+}
+.source-access-status.gold {
+  color: var(--gold);
+}
+.source-access-status.err {
+  color: var(--err);
+}
+.source-access-phase {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0 0 8px;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.source-access-phase svg {
+  flex: none;
+  margin-top: 1px;
+}
+.source-access-phase.err {
+  color: var(--err);
+}
+.source-access-phase.gold {
+  color: var(--gold);
+}
+
+/* ══ 行：禁行标记 · 地址 · 归属 · 行尾 ══ */
+
+.source-access-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.source-access-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) max-content auto;
+  grid-template-areas: 'mark ip place end';
+  align-items: center;
+  column-gap: 10px;
+  min-height: 34px;
+  padding: 5px 0;
+  box-sizing: border-box;
+}
+/* 内缩的分隔线从地址列开始，禁行标记一列连成一条竖向的节奏（iOS 列表的做法）。 */
+.source-access-row + .source-access-row::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: var(--source-access-indent);
   border-top: 1px solid var(--line-soft);
 }
-.source-access-list code,
-.source-access-dialog code {
-  overflow-wrap: anywhere;
+.source-access-mark {
+  grid-area: mark;
+  position: relative;
+  justify-self: center;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px var(--err);
+}
+.source-access-mark::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 1.5px;
+  height: 8px;
+  margin: -4px 0 0 -0.75px;
+  border-radius: 1px;
+  background: var(--err);
+  transform: rotate(-45deg);
+}
+.source-access-ip {
+  grid-area: ip;
+  display: flex;
   min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+.source-access-address {
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.source-access-address:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+.source-access-address > code {
+  display: block;
+  width: max-content;
+  white-space: nowrap;
+  min-width: 0;
+  color: var(--ink);
+  font: 12px/1.45 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+/* 长 IPv6 在地址列内横向查看，地区、复制与解除始终留在同一行。 */
+.source-access-address wbr {
+  display: none;
+}
+.source-access-ip > .user-fcopy {
+  flex: none;
+}
+.source-access-place {
+  grid-area: place;
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.source-access-place > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.source-access-end {
+  grid-area: end;
+  display: flex;
+  justify-content: flex-end;
+}
+.source-access-unban {
+  margin-right: -8px;
+}
+/* 复制钮与用户页一样悬停或聚焦时出现，触屏常显。 */
+@media (hover: hover) {
+  .source-access-row .user-fcopy {
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .source-access-row:hover .user-fcopy,
+  .source-access-row .user-fcopy:focus-visible,
+  .source-access-row .user-fcopy:is(.done, .failed) {
+    opacity: 1;
+  }
+}
+
+/* ══ 添加与折叠 ══ */
+
+.source-access-add-link,
+.source-access-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 30px;
+  padding: 0;
+  border: 0;
+  color: var(--action);
+  background: none;
+  font: 12px var(--sans);
+  cursor: pointer;
+}
+.source-access-add-link,
+.source-access-more,
+.source-access-add,
+.source-access-legacy,
+.source-access-empty {
+  margin-left: var(--source-access-indent);
+}
+.source-access-more {
+  display: flex;
+  min-height: 26px;
+  font-size: 11.5px;
+}
+.source-access-add-link:disabled {
+  color: var(--ink-4);
+  cursor: default;
+}
+@media (hover: hover) {
+  .source-access-add-link:hover:not(:disabled),
+  .source-access-more:hover {
+    color: var(--action-hover);
+  }
+}
+.source-access-add-link:focus-visible,
+.source-access-more:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 .source-access-add {
+  padding: 6px 0 4px;
+}
+.source-access-add-row {
   display: flex;
-  align-items: flex-end;
+  max-width: 420px;
+  min-width: 0;
+  align-items: center;
   gap: 8px;
+}
+.source-access-add-row input.f {
+  flex: 1 1 auto;
   min-width: 0;
 }
-.source-access-add label {
-  display: grid;
+.source-access-add-row .btn {
+  flex: none;
+}
+.source-access-hint {
+  flex-wrap: wrap;
+}
+.source-access-add > .callout {
+  margin: 8px 0 0;
+}
+.source-access-legacy,
+.source-access-empty {
+  margin-top: 4px;
+  margin-bottom: 2px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.source-access-empty {
+  margin-top: 2px;
+  padding: 6px 0 0;
+}
+
+/* ══ 用户 ══ */
+
+.source-access-user {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
   gap: 6px;
-  flex: 1;
-  min-width: 0;
+  padding: 0;
+  border: 0;
+  color: var(--ink);
+  background: none;
+  font: 500 12px var(--sans);
+  cursor: pointer;
 }
-.source-access-add input {
+.source-access-panel .user-avatar.mini {
+  width: 18px;
+  height: 18px;
+  font-size: 10px;
+}
+.source-access-user .user-avatar {
+  flex: none;
+}
+.source-access-user-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (hover: hover) {
+  .source-access-user:hover .source-access-user-name {
+    color: var(--action);
+  }
+}
+.source-access-user:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.source-access-tenant {
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+}
+.source-access-users {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.source-access-users > li {
+  padding: 4px 0 2px;
+}
+.source-access-users > li + li {
+  margin-top: 2px;
+  border-top: 1px solid var(--line-soft);
+}
+.source-access-user-line {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 8px;
+}
+.source-access-chev {
+  margin-left: auto;
+  color: var(--ink-4);
+  font-size: 13px;
+}
+
+/* ══ C 本机为主：用户名单收成卡底一行 ══ */
+
+.source-access-userbar {
+  margin-top: 6px;
+  border-top: 1px solid var(--line-soft);
+}
+.source-access-userbar-toggle {
+  display: flex;
   width: 100%;
+  min-height: 38px;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0 0;
+  border: 0;
+  color: var(--ink-2);
+  background: none;
+  font: 12px var(--sans);
+  text-align: left;
+  cursor: pointer;
+}
+.source-access-faces {
+  display: inline-flex;
+  flex: none;
+  width: auto;
+  min-width: 14px;
+  justify-content: flex-start;
+  padding-left: 0;
+}
+.source-access-faces .user-avatar {
+  flex: none;
+  box-shadow: 0 0 0 1.5px var(--card);
+}
+.source-access-faces .user-avatar + .user-avatar {
+  margin-left: -6px;
+}
+.source-access-userbar-text b {
+  color: var(--ink);
+  font-weight: 600;
+}
+.source-access-userbar-names {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-4);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.source-access-userbar-chev {
+  flex: none;
+  margin-left: auto;
+  color: var(--ink-4);
+  transition: transform 160ms ease;
+}
+.source-access-userbar.open .source-access-userbar-chev {
+  transform: rotate(180deg);
+}
+@media (hover: hover) {
+  .source-access-userbar-toggle:hover .source-access-userbar-text {
+    color: var(--ink);
+  }
+}
+.source-access-userbar-toggle:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.source-access-userbar .source-access-users {
+  margin-top: 4px;
+}
+
+@container source-access (max-width: 460px) {
+  .source-access-add-row {
+    max-width: none;
+  }
+  .source-access-userbar-names {
+    display: none;
+  }
+}
+.source-access-panel {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.source-access-panel > header .sp {
+  flex: 1;
+}
+.source-access-user-line {
   min-width: 0;
 }
-.source-access-add > button {
-  flex-shrink: 0;
+.source-access-user-line .source-access-tenant {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.source-access-userbar-text {
+  flex: none;
+}
+.source-access-lookup {
+  color: var(--ink-4);
+  font-size: 11.5px;
+  margin: 6px 0 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  .source-access-userbar-chev,
+  .source-access-row .user-fcopy {
+    transition: none;
+  }
 }

@@ -466,7 +466,7 @@ export const fetchCompileView = (revision: number): Promise<CompileView> =>
 /* ── 节点 ── */
 
 /* 与 brocade_deployment::protocol 中的同名结构逐字段对应 */
-export const AGENT_PROTOCOL_VERSION = 45;
+export const AGENT_PROTOCOL_VERSION = 57;
 export const FORWARDING_TARGET_POLICY_PROTOCOL_VERSION = 43;
 export const MIN_AGENT_PROTOCOL_VERSION = 20;
 export const REALTIME_USER_TRAFFIC_PROTOCOL_VERSION = 27;
@@ -479,6 +479,8 @@ export const VPNGATE_DEFAULT_PROBE_WORKERS = 16;
 export const VPNGATE_MAX_PROBE_WORKERS = 128;
 
 export interface NodeVersions {
+  unlock_ip_families?: boolean | null;
+  unlock_connection_trace?: boolean | null;
   agent: string;
   xray: string | null;
   /** 受管路径上的 Xray 与实际服务进程分别取摘要；原子替换后、重启前两者会短暂不同。 */
@@ -1143,7 +1145,21 @@ export interface UserCyclePeriod {
   user_id: string;
   starts_at: string;
   ends_at: string;
+  reset_id?: number | null;
+  reset_at?: string | null;
 }
+
+export interface UserCycleResetRequest {
+  request_id: string;
+  expected_reset_id: number | null;
+  expected_period_start: string;
+  expected_period_end: string;
+}
+export const resetUserCycleUsage = (tenant: string, user: string, body: UserCycleResetRequest) =>
+  post<{ reset_id: number; reset_at: string; duplicate: boolean }>(
+    `/users/${encodeURIComponent(tenant)}/${encodeURIComponent(user)}/cycle-usage/reset`,
+    body,
+  );
 export interface UserCycleUsage {
   traffic_policies?: {
     tenant_id: string;
@@ -1198,6 +1214,10 @@ export interface UserOnlineSourceAccess {
 
 export interface UserOnlineSource {
   ip: string;
+  /** Present for each completed ingress/IP epoch; reconnects have distinct identities. */
+  session_id?: string;
+  /** Console confirmation time, not an exact TCP disconnect timestamp. */
+  offline_at?: string;
   first_observed_at: string;
   last_observed_at: string;
   xray_last_seen_at: string;
@@ -1807,6 +1827,7 @@ export const reorderChains = async (appId: string, ids: string[]) => {
     .some(
       entry =>
         (entry.op.op === 'create_app' && entry.op.app.id === appId) ||
+        (entry.op.op === 'move_chain' && (entry.op.app_id === appId || entry.op.target_app_id === appId)) ||
         ((entry.op.op === 'create_chain' || entry.op.op === 'delete_chain') && entry.op.app_id === appId),
     );
   if (hasPendingMembershipChange) {
@@ -1834,13 +1855,33 @@ export const upsertChain = async (
     name: body.name,
     subscription_country: body.subscription_country ?? null,
   };
-  if (draft.snapshot().find(entry => entry.key === key)?.op.op === 'create_chain') {
+  if (
+    draft.snapshot().find(entry => entry.key === key)?.op.op === 'create_chain' ||
+    draft.ops().some(op => op.op === 'move_chain' && op.chain_id === body.id)
+  ) {
     draft.push({ op: 'upsert_chain', app_id: appId, chain });
     return { revision_id: 0 } as ModelWriteResult;
   }
   return immediateModelWrite(() =>
     post<ModelWriteResult>(`/apps/${encodeURIComponent(appId)}/chains`, { ...chain, note: body.note }),
   );
+};
+
+/** Changing a billing group requires an atomic model revision and configuration publication. */
+export const moveChain = async (appId: string, chainId: string, targetAppId: string) => {
+  if (appId === targetAppId) return { revision_id: 0 } as ModelWriteResult;
+  const last = draft.ops().at(-1);
+  // A slow/failed preview can leave the source card visible. Retrying that same transition must
+  // not replay it twice; later transitions (including returning to the source) stay ordered.
+  if (
+    last?.op === 'move_chain' &&
+    last.app_id === appId &&
+    last.chain_id === chainId &&
+    last.target_app_id === targetAppId
+  )
+    return { revision_id: 0 } as ModelWriteResult;
+  draft.push({ op: 'move_chain', app_id: appId, chain_id: chainId, target_app_id: targetAppId });
+  return { revision_id: 0 } as ModelWriteResult;
 };
 
 export const createChain = async (
@@ -2164,8 +2205,15 @@ export type GrantWrite = {
   enabled: boolean;
 };
 
-export const upsertGrant = (grant: GrantWrite) =>
-  immediateModelWrite(() => post<{ revision_id: number }>('/grants', grant));
+export const upsertGrant = async (grant: GrantWrite) => {
+  if (
+    draft.ops().some(op => op.op === 'move_chain' && (op.app_id === grant.app_id || op.target_app_id === grant.app_id))
+  ) {
+    draft.push({ op: 'upsert_grant', grant });
+    return { revision_id: 0 };
+  }
+  return immediateModelWrite(() => post<{ revision_id: number }>('/grants', grant));
+};
 
 // A new chain's ingress does not exist until its structural draft commits, so the wizard stages
 // its initial grants in that same transaction.  Normal permission edits use `upsertGrant` above.
@@ -2302,11 +2350,53 @@ export interface ListenerRef {
 }
 
 export interface EgressDnsResolution {
-  address: string;
+  /** Historical single-address strings and structured groups share one field. */
+  address: string | string[];
   port: number;
   transport: 'udp' | 'tcp';
   address_strategy: 'use_ip' | 'use_ipv4v6' | 'use_ipv6v4' | 'use_ipv4' | 'use_ipv6';
   fallback: 'stop' | 'machine';
+}
+
+export const EGRESS_DNS_EDITOR_MAX_MEMBERS = 3;
+export const egressDnsMembers = (address: EgressDnsResolution['address']): string[] =>
+  (Array.isArray(address) ? address : address.split(/[,，]/)).map(value => value.trim());
+export const egressDnsAddressText = (address: EgressDnsResolution['address']): string =>
+  Array.isArray(address) ? address.join(', ') : address;
+export const egressDnsEndpointText = (resolution: EgressDnsResolution): string =>
+  egressDnsMembers(resolution.address)
+    .map(address => `${address.includes(':') ? `[${address}]` : address}:${resolution.port}`)
+    .join(', ');
+
+function canonicalDnsIp(address: string): string | null {
+  if (address.includes(':')) {
+    try {
+      return new URL(`http://[${address}]/`).hostname.slice(1, -1);
+    } catch {
+      return null;
+    }
+  }
+  const parts = address.split('.');
+  return parts.length === 4 && parts.every(part => /^(0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255)
+    ? parts.join('.')
+    : null;
+}
+
+export function egressDnsIssue(resolution: EgressDnsResolution): string | null {
+  const members = egressDnsMembers(resolution.address);
+  if (members.length > EGRESS_DNS_EDITOR_MAX_MEMBERS) return '每组最多 3 个 DNS 地址';
+  if (members.some(address => !address)) return '请填写完整的 DNS 地址，用逗号分隔';
+  if (members.some(address => canonicalDnsIp(address) === null)) return 'DNS 地址须为 IPv4 或 IPv6，端口在右侧填写';
+  if (!Number.isInteger(resolution.port) || resolution.port < 1 || resolution.port > 65535)
+    return 'DNS 端口须为 1–65535';
+  return null;
+}
+
+export function normalizedEgressDns(resolution: EgressDnsResolution): EgressDnsResolution {
+  const issue = egressDnsIssue(resolution);
+  if (issue) throw new Error(issue);
+  const members = [...new Set(egressDnsMembers(resolution.address).map(address => canonicalDnsIp(address)!))];
+  return { ...resolution, address: members.length === 1 ? members[0] : members };
 }
 
 export type ExternalOutboundProtocol =
@@ -2927,7 +3017,12 @@ export const putStep = (
 // DNS 策略是机器级配置，保存后由该机器始终下发。线路编辑器只是其中一个编辑入口；
 // 独立草稿操作写入或移除 `(node, selector)`，避免保存、删除链路时取得策略所有权。
 export const setNodeEgressDns = (nodeId: string, selector: DestMatch, resolution: EgressDnsResolution | null) => {
-  draft.push({ op: 'set_node_egress_dns', node_id: nodeId, selector, resolution });
+  draft.push({
+    op: 'set_node_egress_dns',
+    node_id: nodeId,
+    selector,
+    resolution: resolution && normalizedEgressDns(resolution),
+  });
   return Promise.resolve({ revision_id: 0 });
 };
 
@@ -3562,6 +3657,7 @@ export interface UserSiteUsage {
   expected_nodes: number;
   limited: boolean;
   latest_report_unix_secs: number | null;
+  /** 相关入口最近连续采集基线的最大值；不是最早历史记录，也不能定位精确缺口。 */
   observed_since_unix_secs: number | null;
   rows: { site_id: string; name: string; uplink_bytes: number; downlink_bytes: number }[];
   /** 各类别的时间分布，points 为 [格起点, 上行, 下行]；没有流量的格不列出。 */
@@ -3636,6 +3732,9 @@ export interface NodeInflowDetails {
   accounting_uplink_bytes: number;
   accounting_downlink_bytes: number;
   rows: NodeInflowDetailRow[];
+  /** Local GeoIP for the source addresses, as on presence. Older Consoles omit both. */
+  source_countries?: SourceCountry[];
+  source_operators?: SourceOperator[];
 }
 /** 机器流出：站点分类及独立 forwarding 类型。转发总量来自日账本，小时图仅含保留的窗口明细；
  * 站点采集开关、覆盖与观测起点只描述认证代理入口，不限制转发账本。 */
@@ -3709,6 +3808,8 @@ export interface UserOtherDomains {
   expected_nodes: number;
   limited: boolean;
   observed_since_unix_secs: number | null;
+  /** 当前范围内真实明细的最早小时桶，计算不受 Top N 截断影响。旧 Console 可能缺省。 */
+  first_record_unix_secs?: number | null;
   latest_report_unix_secs: number | null;
   rows: { domain: string; uplink_bytes: number; downlink_bytes: number }[];
 }
@@ -3873,10 +3974,19 @@ export const fetchSettings = () => currentDraftRead(() => api<ModelSettings>('/s
 export interface DeploymentSettings {
   unattended: boolean;
   xray_handoff_beta: boolean;
+  unlock_detection_mode: 'manual' | 'scheduled';
+  unlock_detection_interval_hours: number;
 }
 export const fetchDeploymentSettings = () => api<DeploymentSettings>('/deployment-settings');
 export const saveDeploymentSettings = (body: Partial<DeploymentSettings>) =>
   api<DeploymentSettings>('/deployment-settings', '', { method: 'PUT', body: JSON.stringify(body) });
+export interface UnlockDetectionPolicy {
+  mode: 'manual' | 'scheduled';
+  interval_hours: number;
+  requested_at: number;
+  next_run_at: number | null;
+}
+export const refreshAllUnlockProbes = () => post<UnlockDetectionPolicy>('/unlock-probes/refresh', {});
 export const saveSettings = async (body: ModelSettings) => {
   draft.push({ op: 'update_settings', settings: body });
   return { revision_id: 0 };
@@ -5583,6 +5693,8 @@ export interface SourceAccessView {
   revision: number;
   ips: string[];
   nodes: SourceAccessNode[];
+  /** Read-only user denials for this node's active or quota-suspended grants. Older Consoles omit this. */
+  user_bans?: { tenant_id: string; user_id: string; ips: string[] }[];
   /** Local GeoIP for the listed addresses, as on presence. Older Consoles omit both. */
   source_countries?: SourceCountry[];
   source_operators?: SourceOperator[];
@@ -5594,10 +5706,262 @@ export const sourceAccessPath = (scope: SourceAccessScope) =>
     : `/users/${encodeURIComponent(scope.tenantId)}/${encodeURIComponent(scope.userId)}/source-access`;
 export const fetchSourceAccess = async (scope: SourceAccessScope) => {
   const view = await api<SourceAccessView>(sourceAccessPath(scope));
-  if (!view || !Number.isSafeInteger(view.revision) || !Array.isArray(view.ips) || !Array.isArray(view.nodes)) {
+  if (
+    !view ||
+    !Number.isSafeInteger(view.revision) ||
+    !Array.isArray(view.ips) ||
+    !Array.isArray(view.nodes) ||
+    (view.user_bans !== undefined &&
+      (!Array.isArray(view.user_bans) ||
+        view.user_bans.some(
+          user =>
+            !user ||
+            typeof user.tenant_id !== 'string' ||
+            typeof user.user_id !== 'string' ||
+            !Array.isArray(user.ips) ||
+            user.ips.some(ip => typeof ip !== 'string'),
+        )))
+  ) {
     throw new Error('来源封禁响应无效，请确认 Console 已升级');
   }
   return view;
 };
 export const saveSourceAccess = (scope: SourceAccessScope, revision: number, ips: string[]) =>
   api<SourceAccessView>(sourceAccessPath(scope), '', { method: 'PUT', body: JSON.stringify({ revision, ips }) });
+
+// On-demand machine egress diagnostics. Service identities follow brocade-deployment/unlock_probe.
+export type UnlockIpFamily = 'v4' | 'v6';
+export type UnlockProbeSelection = UnlockIpFamily | 'auto';
+export const UNLOCK_AUTOMATIC_CHAIN_PROTOCOL_VERSION = 52;
+export const UNLOCK_EXTENDED_SERVICES_PROTOCOL_VERSION = 53;
+export const UNLOCK_REDUCED_SERVICES_PROTOCOL_VERSION = 54;
+export const UNLOCK_DUAL_STACK_PROTOCOL_VERSION = 50;
+export const UNLOCK_PROBE_PROTOCOL_VERSION = 46;
+export const CHAIN_UNLOCK_PROBE_PROTOCOL_VERSION = 47;
+export const YOUTUBE_UNLOCK_DETAILS_PROTOCOL_VERSION = 49;
+export const UNLOCK_PROBE_INTERVAL_SECS = 86_400;
+export type UnlockService =
+  | 'chatgpt'
+  | 'claude'
+  | 'gemini'
+  | 'netflix'
+  | 'disney_plus'
+  | 'youtube_premium'
+  | 'tiktok'
+  | 'prime_video'
+  | 'reddit'
+  | 'spotify'
+  | 'hbo_max'
+  | 'dazn'
+  | 'bbc_iplayer'
+  | 'crunchyroll'
+  | 'paramount_plus';
+export interface UnlockResult {
+  service: UnlockService;
+  status: 'available' | 'unsupported_region' | 'restricted' | 'partial' | 'failed' | 'skipped';
+  code:
+    | 'web_available'
+    | 'region_unsupported'
+    | 'access_denied'
+    | 'originals_only'
+    | 'web_only'
+    | 'app_only'
+    | 'timeout'
+    | 'network_error'
+    | 'no_ipv6_dns'
+    | 'no_ipv4_dns'
+    | 'no_ipv6_egress'
+    | 'unrecognized_response';
+  region: string | null;
+  client_dns?: boolean;
+  youtube?: YoutubeDiagnostics | null;
+  dns_path?: UnlockDnsPath | null;
+  dns_parts?: UnlockDnsPartPath[];
+  connection_requests?: Partial<Record<UnlockPart, number>>;
+  connection_observations?: UnlockConnectionObservation[];
+}
+export type UnlockPart = 'service' | 'webpage' | 'premium' | 'cdn';
+export interface UnlockDnsPartPath {
+  part: UnlockPart;
+  kind: 'direct' | 'fallback' | 'partial' | 'unknown';
+  paths: UnlockDnsPath[];
+  exits: string[];
+}
+export interface UnlockConnectionObservation {
+  part: UnlockPart;
+  version: number;
+  id: string;
+  domain: string;
+  exit: string;
+  outbound: string;
+  profile: string;
+  normal_strategy: string;
+  /** Connected peer family on success; attempted destination family on failure. */
+  family?: UnlockIpFamily;
+  connected: boolean;
+  complete: boolean;
+  error?: string;
+  lookups: {
+    version: number;
+    domain: string;
+    strategy: string;
+    complete: boolean;
+    steps: {
+      tag: string;
+      scoped: boolean;
+      outcome: 'answer' | 'empty' | 'error';
+      other: boolean;
+      winner?: number;
+      members?: UnlockDnsMember[];
+    }[];
+  }[];
+}
+export interface UnlockDnsMember {
+  index: number;
+  outcome: 'answer' | 'empty' | 'error';
+  other: boolean;
+  attempts: number;
+  elapsed_ms: number;
+  rcode?: number;
+  cache?: '' | 'hit' | 'stale' | 'miss';
+}
+export interface UnlockDnsRule {
+  selector: DestMatch;
+  resolution: EgressDnsResolution;
+  selected_member?: number | null;
+  members?: UnlockDnsMember[];
+}
+export interface UnlockDnsPath {
+  exit: string;
+  normal_family: UnlockIpFamily | null;
+  fallback: 'stop' | 'machine';
+  rules: UnlockDnsRule[];
+  answer_from?: 'machine' | 'policy' | 'mixed';
+  reason?: 'no_address' | 'resolver_error';
+}
+export interface YoutubePageResult {
+  status: UnlockResult['status'];
+  code: UnlockResult['code'];
+  http_status: number | null;
+  page_region: string | null;
+  topbar_region: string | null;
+  privacy_region: string | null;
+}
+export interface YoutubeCdnResult {
+  http_status: number | null;
+  node: string | null;
+  airport: string | null;
+  country: string | null;
+  error: UnlockResult['code'] | null;
+  elapsed_ms: number;
+}
+export interface YoutubeDiagnostics {
+  webpage: YoutubePageResult;
+  premium: YoutubePageResult;
+  cdn: YoutubeCdnResult;
+}
+export interface NodeUnlockProbe {
+  automatic?: boolean;
+  family?: UnlockIpFamily | null;
+  id: string;
+  node_id: string;
+  state: 'queued' | 'running' | 'complete' | 'expired' | 'obsolete';
+  created_at: number;
+  completed_at: number | null;
+  results: UnlockResult[];
+  next_run_at?: number;
+  retry_at?: number | null;
+  trigger?: 'manual' | 'scheduled';
+  app_id?: string | null;
+  chain_id?: string | null;
+  protocol?: string | null;
+  configuration_revision?: number | null;
+  path_error?: 'client_unavailable' | 'configuration_changed' | 'family_unavailable' | null;
+  previous_results?: UnlockResult[];
+  previous_completed_at?: number | null;
+}
+const unlockFamilyQuery = (family?: UnlockIpFamily) => (family ? `?family=${family}` : '');
+function validateUnlockFamily<T extends NodeUnlockProbe | null>(view: T, family?: UnlockIpFamily, strict = false): T {
+  if (view && family && ((view.family != null && view.family !== family) || (strict && view.family !== family))) {
+    throw new Error('解锁检测响应的地址族不一致，请重新读取或升级 Console');
+  }
+  return view;
+}
+
+export const fetchNodeUnlockProbe = (node: string, family?: UnlockIpFamily) =>
+  api<NodeUnlockProbe | null>(`/nodes/${encodeURIComponent(node)}/unlock-probe${unlockFamilyQuery(family)}`).then(
+    view => validateUnlockFamily(view, family),
+  );
+export const startNodeUnlockProbe = (node: string, family?: UnlockIpFamily) =>
+  post<NodeUnlockProbe>(`/nodes/${encodeURIComponent(node)}/unlock-probe${unlockFamilyQuery(family)}`, {}).then(view =>
+    validateUnlockFamily(view, family, true),
+  );
+
+const chainUnlockPath = (app: string, chain: string) =>
+  `/apps/${encodeURIComponent(app)}/chains/${encodeURIComponent(chain)}/unlock-probe`;
+function chainUnlockQuery(selection?: UnlockProbeSelection) {
+  return selection === 'auto' ? '?automatic=true' : unlockFamilyQuery(selection);
+}
+function validateChainSelection<T extends NodeUnlockProbe | null>(
+  view: T,
+  selection?: UnlockProbeSelection,
+  strict = false,
+): T {
+  if (selection === 'auto') {
+    if (view && (!view.automatic || view.family != null)) throw new Error('自动检测响应的模式不一致，请重新读取');
+    return view;
+  }
+  return validateUnlockFamily(view, selection, strict);
+}
+export const fetchChainUnlockProbe = (app: string, chain: string, selection?: UnlockProbeSelection) =>
+  api<NodeUnlockProbe | null>(chainUnlockPath(app, chain) + chainUnlockQuery(selection)).then(view =>
+    validateChainSelection(view, selection),
+  );
+export const startChainUnlockProbe = (app: string, chain: string, selection?: UnlockProbeSelection) =>
+  post<NodeUnlockProbe>(chainUnlockPath(app, chain) + chainUnlockQuery(selection), {}).then(view =>
+    validateChainSelection(view, selection, true),
+  );
+
+export interface UnlockProbeCapabilities {
+  family_mode?: 'split' | 'automatic';
+  automatic_ready?: boolean;
+  ipv6_available: boolean | null;
+  ipv6_reason: string | null;
+  detection_mode?: 'manual' | 'scheduled';
+  interval_hours?: number;
+  next_run_at?: number | null;
+}
+export const fetchNodeUnlockCapabilities = (node: string) =>
+  api<UnlockProbeCapabilities>(`/nodes/${encodeURIComponent(node)}/unlock-probe/capabilities`);
+export const fetchChainUnlockCapabilities = (app: string, chain: string) =>
+  api<UnlockProbeCapabilities>(chainUnlockPath(app, chain) + '/capabilities');
+
+export interface ChainUnlockProbeItem {
+  app_id: string;
+  chain_id: string;
+  capabilities: UnlockProbeCapabilities;
+  probes: Record<UnlockProbeSelection, NodeUnlockProbe | null>;
+}
+export interface ChainUnlockProbePage {
+  chains: ChainUnlockProbeItem[];
+  next_cursor: string | null;
+}
+/** Fetch one bounded page; the list controls pagination and never issues per-chain requests. */
+export async function fetchChainUnlockProbes(after?: string, signal?: AbortSignal) {
+  const query = new URLSearchParams({ limit: '100' });
+  if (after) query.set('after', after);
+  const page = await api<ChainUnlockProbePage>(`/chains/unlock-probes?${query}`, '', { signal });
+  if (page.next_cursor !== null && (page.chains.length === 0 || (after && page.next_cursor <= after))) {
+    throw new Error('解锁摘要分页没有前进，请重新读取');
+  }
+  for (const item of page.chains) {
+    for (const selection of ['v4', 'v6', 'auto'] as const) {
+      const probe = item.probes[selection];
+      validateChainSelection(probe, selection, true);
+      if (probe && (probe.app_id !== item.app_id || probe.chain_id !== item.chain_id)) {
+        throw new Error('解锁摘要的线路不一致，请重新读取');
+      }
+    }
+  }
+  return page;
+}

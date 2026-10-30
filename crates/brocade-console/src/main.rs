@@ -435,19 +435,40 @@ async fn database_command() -> Result<bool, Box<dyn std::error::Error>> {
     let store = PgStore::connect(&url)
         .await
         .map_err(|_| "数据库连接失败；请检查原有数据库配置，不会创建新库")?;
-    let check = store
-        .check_database_upgrade()
-        .await
-        .map_err(|_| "无法读取数据库迁移历史")?;
+    let prerelease_compat = match env::var("BROCADE_PRERELEASE_0003_COMPAT").as_deref() {
+        Err(env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        _ => return Err("BROCADE_PRERELEASE_0003_COMPAT 只接受 0 或 1".into()),
+    };
+    let cycle_compat = match env::var("BROCADE_PRERELEASE_USER_CYCLE_RESET_COMPAT").as_deref() {
+        Err(env::VarError::NotPresent) | Ok("0") => false,
+        Ok("1") => true,
+        _ => return Err("BROCADE_PRERELEASE_USER_CYCLE_RESET_COMPAT 只接受 0 或 1".into()),
+    };
+    if cycle_compat && prerelease_compat {
+        return Err("不能同时选择两条预发布兼容路径".into());
+    }
+    let check = if cycle_compat {
+        store.check_user_cycle_reset_upgrade().await
+    } else if prerelease_compat {
+        store.check_prerelease_0003_upgrade().await
+    } else {
+        store.check_database_upgrade().await
+    }
+    .map_err(|_| "无法读取数据库迁移历史")?;
     println!("{}", serde_json::to_string(&check)?);
     if !check.compatible {
         return Err("数据库不在支持的升级路径中，未执行迁移".into());
     }
     if migrate {
-        store
-            .migrate_database_schema()
-            .await
-            .map_err(|_| "数据库迁移失败；保留备份和迁移历史，请检查后重试")?;
+        if cycle_compat {
+            store.migrate_user_cycle_reset_schema().await
+        } else if prerelease_compat {
+            store.migrate_prerelease_0003_schema().await
+        } else {
+            store.migrate_database_schema().await
+        }
+        .map_err(|_| "数据库迁移失败；保留备份和迁移历史，请检查后重试")?;
     }
     Ok(true)
 }

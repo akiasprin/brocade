@@ -31,11 +31,14 @@ python3 scripts/tests/upgrade/run_kvm.py \
 
 | 演练 | 成功判据 |
 | --- | --- |
-| 官方 v0.3.1 × 两种数据库正常升级 | 0001→0002，旧管理员可登录，配置、账户、密钥、接入/机器额度、用量/计数头及旧 checksum 保留，未创建二进制发布单 |
+| 官方 v0.3.1 × 两种数据库正常升级 | 0001→候选的完整迁移链，旧管理员可登录，配置、账户、密钥、接入/机器额度、用量/计数头及旧 checksum 保留，未创建二进制发布单 |
 | 压缩备份恢复 | gzip 校验通过，外部逻辑备份有压缩；恢复原安装和数据库后，官方旧版能启动并登录 |
 | 迁移前拒绝及备份失败 | 未知 checksum、较新迁移、缺 pg_dump、压缩失败时不修改 schema，旧服务可用 |
+| 非超级用户备份权限 | 外置库用普通应用角色；管理员归档表仅授予读取，撤销 schema USAGE 后备份失败，旧服务恢复且未开始迁移 |
 | 迁移中失败 | 注入真实 DDL 冲突后整条事务回滚，保留备份及开始标记，服务停服 |
 | 升级后启动失败 | 已迁移时保持停服待修复；没有待应用迁移时恢复旧安装及服务 |
+| systemd socket 传递及普通重启 | Console 与 launcher 共享实际监听 FD；普通 service 重启后 socket InvocationID 保持，原数据可读 |
+| socket 部署再次完整升级 | 真实 pg_dump 执行时 socket/service 均为停止，防止自动激活写库；升级后监听恢复 |
 | 重复升级及整机重启 | 不重复迁移；虚拟机 boot ID 改变后，systemd 自动拉起服务并读到原数据 |
 
 启动失败由真实 systemd 拒绝启动或仅在隔离测试包中的 launcher 包装脚本注入，数据库维护
@@ -81,3 +84,5 @@ BROCADE_RUN_UPGRADE_INSTALLER_TESTS=1 \
 BROCADE_UPGRADE_CONSOLE_BIN="$PWD/target/debug/brocade-console" \
   cargo test -p brocade-launcher --locked managed_upgrade_checks -- --ignored
 ```
+
+一次性手动部署纳管可额外传 `--adoption-script /path/to/adopt-runtime.py`，在同一隔离虚拟机用真实服务、非空数据库和原密钥演练，再走一次实际安装器升级。此操作脚本只用于明确的生产纳管，不改变官方 v0.3.1 兼容基线。

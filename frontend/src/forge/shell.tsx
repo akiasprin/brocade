@@ -1,9 +1,9 @@
+import { lazy } from '../ui/lazy';
 // 编译台外壳：一条顶栏、一块工作区，以及贯通到顶的产物栏。
 // 页面自身负责对象下钻；顶栏负责主导航与诊断入口。
 
 import {
   Fragment,
-  lazy,
   Suspense,
   useEffect,
   useLayoutEffect,

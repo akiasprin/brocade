@@ -3,7 +3,7 @@
 // ?presence=sources gives alice online and recent sources (one of them banned) instead of an empty presence.
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import type { AdminRole, ConsoleSnapshot, SnapshotIngress, UserListItem } from '../../src/api';
+import type { AdminRole, ConsoleSnapshot, SnapshotIngress, UserListItem, UserOnlineSource } from '../../src/api';
 import { UsersPane } from '../../src/panes/users';
 import { SessionProvider } from '../../src/session';
 import { theme } from '../../src/forge/theme';
@@ -86,7 +86,13 @@ const policyFor = (app: string) => ({
 });
 // Documentation-range addresses; regions and operators are made up for layout.
 const MINUTE = 60_000;
-const presenceSource = (ip: string, chain: string, minutesAgo: number, online: boolean, gib: number) => {
+const presenceSource = (
+  ip: string,
+  chain: string,
+  minutesAgo: number,
+  online: boolean,
+  gib: number,
+): UserOnlineSource => {
   const last = new Date(Date.now() - (online ? 0.3 : minutesAgo) * MINUTE).toISOString();
   const since = new Date(Date.now() - minutesAgo * MINUTE - (online ? 0 : 50 * MINUTE)).toISOString();
   const access = {
@@ -125,6 +131,25 @@ const historySources = withSources
       presenceSource('203.0.113.17', 'jp-01', 4 * 24 * 60 + 70, false, 14.2),
     ]
   : [];
+if (params.has('sessionHistory')) {
+  historySources.push(
+    presenceSource('198.51.100.77', 'tw-01', 14 * 60, false, 2.4),
+    presenceSource('198.51.100.77', 'hk-01', 14 * 60 + 20, false, 0.1),
+    presenceSource('198.51.100.77', 'tw-01', 14 * 60 + 59, false, 0.2),
+    presenceSource('198.51.100.77', 'hk-01', 28 * 60, false, 0.2),
+    presenceSource('203.0.113.61', 'jp-01', 2 * 24 * 60, false, 0.8),
+    {
+      ...presenceSource('198.51.100.77', 'jp-01', 3 * 24 * 60, false, 0),
+      online_since_at: null,
+      session_uplink_bytes: null,
+      session_downlink_bytes: null,
+    },
+  );
+  historySources.forEach((source, index) => {
+    source.session_id = String(index + 1);
+    source.offline_at = source.last_observed_at;
+  });
+}
 const regions: Record<string, string> = {
   '198.51.100.77': 'VN',
   '203.0.113.24': 'CN',

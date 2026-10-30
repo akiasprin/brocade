@@ -88,6 +88,9 @@ mod node_initialization_tests;
 #[path = "cases/online_source_defaults.rs"]
 mod online_source_defaults_tests;
 
+#[path = "cases/online_source_sessions.rs"]
+mod online_source_session_tests;
+
 #[path = "cases/ping_probe_recovery.rs"]
 mod ping_probe_recovery_tests;
 
@@ -96,6 +99,9 @@ mod unattended_deployment_tests;
 
 #[path = "cases/desired_delivery.rs"]
 mod desired_delivery_tests;
+
+#[path = "cases/isolated_stale_grants.rs"]
+mod isolated_stale_grants_tests;
 
 #[path = "cases/xray_handoff_beta.rs"]
 mod xray_handoff_beta_tests;
@@ -115,6 +121,9 @@ mod forwarding_total_removal_tests;
 
 #[path = "cases/validation_limits.rs"]
 mod validation_limits_tests;
+
+#[path = "cases/chain_group_move.rs"]
+mod chain_group_move_tests;
 
 #[path = "cases/retention.rs"]
 mod retention_tests;
@@ -149,15 +158,25 @@ mod machine_traffic_limit_tests;
 #[path = "cases/user_service.rs"]
 mod user_service_tests;
 
+#[path = "cases/user_cycle_reset.rs"]
+mod user_cycle_reset_tests;
+
+#[path = "cases/user_cycle_reset_upgrade.rs"]
+mod user_cycle_reset_upgrade_tests;
+
 impl TestPg {
     async fn start_if_enabled() -> Option<Self> {
+        Self::start_if_enabled_with_tag("16-alpine").await
+    }
+
+    async fn start_if_enabled_with_tag(tag: &str) -> Option<Self> {
         if std::env::var("BROCADE_RUN_PG_TESTS").as_deref() != Ok("1") {
             eprintln!("skipping Postgres integration test; set BROCADE_RUN_PG_TESTS=1 to run");
             return None;
         }
 
         let container = Postgres::default()
-            .with_tag("16-alpine")
+            .with_tag(tag)
             .start()
             .await
             .expect("start postgres container");
@@ -215,6 +234,13 @@ fn system_admin() -> AdminContext {
 /// the initial deployed model before exercising subscription semantics.
 async fn seed_subscription_serving(db: &TestPg) -> u64 {
     let snapshot = db.store.materialize_snapshot(None).await.unwrap();
+    seed_subscription_serving_snapshot(db, snapshot).await
+}
+
+async fn seed_subscription_serving_snapshot(
+    db: &TestPg,
+    snapshot: brocade_core::model::ModelSnapshot,
+) -> u64 {
     let revision = snapshot.revision;
     let mut snapshot_document = serde_json::to_value(&snapshot).unwrap();
     seal_external_credentials_for_fixture(&mut snapshot_document);
@@ -5084,6 +5110,8 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
     db.store.issue_node_token("n1").await.unwrap();
 
     let versions = NodeVersions {
+        unlock_ip_families: None,
+        unlock_connection_trace: None,
         agent: "0.1.0".to_owned(),
         xray: Some("Xray 26.3.27 (Xray, Penetrates Everything.)".to_owned()),
         xray_installed_sha256: Some("a".repeat(64)),
@@ -5235,6 +5263,8 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
                 observed_at_unix_secs: usage_report_base_unix() + 1,
                 certificate: Default::default(),
                 versions: NodeVersions {
+                    unlock_ip_families: None,
+                    unlock_connection_trace: None,
                     xray: Some("Xray 26.7.28".to_owned()),
                     ..versions.clone()
                 },
@@ -6769,6 +6799,8 @@ async fn delayed_runtime_report_cannot_overwrite_a_newer_snapshot() {
         observed_at_unix_secs,
         certificate: Default::default(),
         versions: NodeVersions {
+            unlock_ip_families: None,
+            unlock_connection_trace: None,
             agent: agent.to_owned(),
             xray: None,
             xray_installed_sha256: None,
@@ -6949,6 +6981,8 @@ async fn config_xray_force_retirement_is_exact_idempotent_and_settled_by_runtime
                 observed_at_unix_secs: now + 1,
                 certificate: Default::default(),
                 versions: NodeVersions {
+                    unlock_ip_families: None,
+                    unlock_connection_trace: None,
                     agent: "force-retirement-test".to_owned(),
                     xray: None,
                     xray_installed_sha256: None,
@@ -7109,6 +7143,8 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
             observed_at_unix_secs,
             certificate: Default::default(),
             versions: NodeVersions {
+                unlock_ip_families: None,
+                unlock_connection_trace: None,
                 agent: "online-source-test".to_owned(),
                 xray: None,
                 xray_installed_sha256: None,
@@ -7818,6 +7854,8 @@ async fn node_runtime_report_is_rejected_without_an_active_token() {
         observed_at_unix_secs: usage_report_base_unix(),
         certificate: Default::default(),
         versions: NodeVersions {
+            unlock_ip_families: None,
+            unlock_connection_trace: None,
             agent: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
             xray: None,
             xray_installed_sha256: None,
@@ -10593,18 +10631,148 @@ async fn materialize_minimal_fixture_and_compile() {
         node_plan.grant_sync.updates[0].inbound_tag,
         "in:app-main/ing-a1b2"
     );
-    // Two clients: one real user and one derived credential for end-to-end probing. The latter
-    // ships down the same channel as a real user — the only way it can reach the ingress (argued
-    // in `physical/node.rs`).
+    // The real user and the base, DNS, IPv4 and IPv6 probe credentials share the grant channel.
     let clients = &node_plan.grant_sync.updates[0].clients;
-    assert_eq!(clients.len(), 2, "{clients:#?}");
+    assert_eq!(clients.len(), 5, "{clients:#?}");
+    let probe_label = brocade_core::model::probe_label("ing-a1b2");
     assert_eq!(
         clients
             .iter()
             .filter(|client| brocade_core::model::is_probe_label(&client.label))
-            .count(),
-        1,
-        "探测凭据不多不少一份：{clients:#?}"
+            .map(|client| client.label.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            probe_label.clone(),
+            brocade_core::model::probe_dns_label(&probe_label),
+            brocade_core::model::probe_family_label(
+                &probe_label,
+                brocade_core::model::IpFamily::V4
+            ),
+            brocade_core::model::probe_family_label(
+                &probe_label,
+                brocade_core::model::IpFamily::V6
+            ),
+        ]),
+        "基础、DNS 及两个地址族的探测凭据必须完整且唯一：{clients:#?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn dns_groups_round_trip_without_rewriting_single_address_history() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let selector = DestMatch::Geosite(vec!["category-ai-!cn".into()]);
+    let single = EgressDnsResolution {
+        address: "192.0.2.53".into(),
+        port: 53,
+        transport: EgressDnsTransport::Udp,
+        address_strategy: EgressDnsAddressStrategy::UseIp,
+        fallback: EgressDnsFallback::Machine,
+    };
+    let original = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::SetNodeEgressDns {
+                node_id: "n1".into(),
+                selector: selector.clone(),
+                resolution: Some(single.clone()),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    let mut group = single.clone();
+    group.address = vec![
+        " 192.0.2.53 ".into(),
+        "2001:DB8::0053".into(),
+        "192.0.2.53".into(),
+    ]
+    .into();
+    let grouped = db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::SetNodeEgressDns {
+                node_id: "n1".into(),
+                selector: selector.clone(),
+                resolution: Some(group),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    let stored: serde_json::Value =
+        sqlx::query_scalar("SELECT resolution FROM node_egress_dns WHERE node_id='n1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        stored["address"],
+        serde_json::json!(["192.0.2.53", "2001:db8::53"])
+    );
+    let historical = db
+        .store
+        .materialize_snapshot(Some(original.revision_id))
+        .await
+        .unwrap();
+    assert_eq!(historical.node_egress_dns[0].resolution, single);
+    let grouped_snapshot = db
+        .store
+        .materialize_snapshot(Some(grouped.revision_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        grouped_snapshot.node_egress_dns[0]
+            .resolution
+            .address
+            .as_slice()
+            .len(),
+        2
+    );
+    let mut invalid = single.clone();
+    invalid.address = vec!["192.0.2.53".into(), "resolver.example".into()].into();
+    assert!(db
+        .store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::SetNodeEgressDns {
+                node_id: "n1".into(),
+                selector: selector.clone(),
+                resolution: Some(invalid),
+            }],
+            None
+        )
+        .await
+        .is_err());
+    db.store
+        .apply_draft(
+            &system_admin(),
+            vec![ModelOp::SetNodeEgressDns {
+                node_id: "n1".into(),
+                selector,
+                resolution: Some(single.clone()),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    let before = db
+        .store
+        .materialize_snapshot(Some(grouped.revision_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        before.node_egress_dns[0]
+            .resolution
+            .address
+            .as_slice()
+            .len(),
+        2
     );
 }
 
@@ -10640,7 +10808,7 @@ async fn egress_dns_is_stored_once_per_machine_without_changing_chain_rules() {
     .unwrap();
 
     let resolution = EgressDnsResolution {
-        address: "192.0.2.53".to_owned(),
+        address: "192.0.2.53".to_owned().into(),
         port: 53,
         transport: EgressDnsTransport::Tcp,
         address_strategy: EgressDnsAddressStrategy::UseIpv4v6,
@@ -10784,7 +10952,7 @@ async fn egress_dns_priority_is_persisted_and_reordered_as_one_machine_list() {
     let first = DestMatch::DomainSuffix(vec!["first.example".to_owned()]);
     let second = DestMatch::Geosite(vec!["second".to_owned()]);
     let resolution = EgressDnsResolution {
-        address: "192.0.2.53".to_owned(),
+        address: "192.0.2.53".to_owned().into(),
         port: 53,
         transport: EgressDnsTransport::Tcp,
         address_strategy: EgressDnsAddressStrategy::UseIp,
@@ -19639,6 +19807,68 @@ async fn deployment_note_says_what_changed_and_how_many_nodes() {
         "港新线路换落地",
         "人写的话只收两头空白，不动内容"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn load_unknown_probe_peers_do_not_block_nic_windows_or_replay() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query("INSERT INTO nodes (id,tenant_id,name,public_ipv4,overlay_addr,wg_private_key,wg_public_key,wg_listen_port,api_port,overlay,egress_allowed,dns_kind) VALUES ('n2','platform.acme','Peer','n2.example.net','10.66.0.2','peer-private','peer-public',51820,10085,TRUE,TRUE,'system')")
+        .execute(db.pool()).await.unwrap();
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let hop = |peer: &str, start: i64| {
+        serde_json::from_value(json!({
+            "chain_id":"app-main/chn-a1b2-c3d4", "peer_node_id":peer,
+            "window_start_unix_secs":start, "window_end_unix_secs":start+30,
+            "conns":1,"conns_measured":0,"btlbw_p50_bps":null,"btlbw_p90_bps":null,
+            "min_rtt_us":1000,"rtt_p50_us":1000,"rtt_p90_us":1000,
+            "retrans_pct":0,"busy_pct":0,"rwnd_limited_pct":0,"sndbuf_limited_pct":0
+        }))
+        .unwrap()
+    };
+    for (read_at, start) in [(now - 900, now - 930), (now, now - 30)] {
+        let mut report = minute_load_report(read_at, vec![minute_load_sample(start)]);
+        report.sent_at_unix_secs = Some(now);
+        report.hops = vec![
+            hop("n2", start),
+            hop("n2:probe-v4", start),
+            hop("deleted-peer", start),
+            hop("n1", start),
+        ];
+        let accepted = db
+            .store
+            .record_load_report("n1", report.clone())
+            .await
+            .expect("an unknown optional hop must not roll back a real NIC window");
+        assert_eq!(accepted.accepted_samples, 1);
+        assert_eq!(accepted.accepted_hops, 1);
+        assert_eq!(accepted.rejected_hops, 3);
+        let retry = db.store.record_load_report("n1", report).await.unwrap();
+        assert_eq!(retry.accepted_samples, 0);
+        assert_eq!(retry.skipped_samples, 1);
+        assert_eq!(retry.accepted_hops, 0);
+        assert_eq!(retry.rejected_hops, 4);
+    }
+    let rows:Vec<(i64,i64)>=sqlx::query_as("SELECT nic_rx_bps,nic_tx_bps FROM node_load_samples WHERE node_id='n1' ORDER BY window_start")
+        .fetch_all(db.pool()).await.unwrap();
+    assert_eq!(rows, vec![(30, 60), (30, 60)]);
+    let peers: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT peer_node_id FROM node_hop_link_samples WHERE node_id='n1'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(peers, vec!["n2"]);
+    let observed:i64=sqlx::query_scalar("SELECT extract(epoch FROM load_reported_at)::bigint FROM node_agent_state WHERE node_id='n1'")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(observed, now);
 }
 
 fn minute_load_sample(start: i64) -> LoadSample {
@@ -29976,3 +30206,9 @@ mod user_traffic_tests;
 
 #[path = "cases/source_access.rs"]
 mod source_access_tests;
+
+#[path = "cases/unlock_probe.rs"]
+mod unlock_probe_tests;
+
+#[path = "cases/unlock_migration_consolidation.rs"]
+mod unlock_migration_consolidation_tests;

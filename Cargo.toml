@@ -27,7 +27,7 @@ resolver = "2"
 # the actual bytes, because nobody remembers to bump a version on the way to a node and every build
 # since the last bump would otherwise claim to be the same thing (`brocade-agent/src/identity.rs`).
 # This is here to be read by people, and the sha is there to be compared by machines.
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 # Matches the version pinned in rust-toolchain.toml. clippy decides which lints apply from it (a
 # construct requiring 1.9x, say, should not be suggested below the MSRV).

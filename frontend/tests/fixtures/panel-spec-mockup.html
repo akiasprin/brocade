@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <title>面板规范 mockup</title>
+    <script>
+      (() => {
+        // 首帧之前写好方案与主题，避免先画一帧生产样式。现状使用生产的黛蓝调色盘。
+        const query = new URLSearchParams(location.search);
+        const root = document.documentElement;
+        const theme = query.get('theme') === 'light' ? 'light' : 'dark';
+        const option = query.get('option') || 'a';
+        root.dataset.theme = theme;
+        root.dataset.palette = 'dailan';
+        root.dataset.ps = ['a', 'b', 'c', 'd', 'current'].includes(option) ? option : 'a';
+        document.querySelector('meta[name="color-scheme"]').content = theme;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="mk-root"></div>
+    <script type="module">
+      import RefreshRuntime from '/@react-refresh';
+      RefreshRuntime.injectIntoGlobalHook(window);
+      window.$RefreshReg$ = () => {};
+      window.$RefreshSig$ = () => type => type;
+      window.__vite_plugin_react_preamble_installed__ = true;
+    </script>
+    <script type="module" src="./panel-spec-mockup.tsx"></script>
+  </body>
+</html>

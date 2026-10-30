@@ -117,6 +117,9 @@ pub struct UserDetailUsage<Row> {
     pub expected_nodes: u64,
     pub limited: bool,
     pub observed_since_unix_secs: Option<i64>,
+    /// Earliest stored hour bucket in this scope and range, before the Top-N limit.
+    #[serde(default)]
+    pub first_record_unix_secs: Option<i64>,
     pub latest_report_unix_secs: Option<i64>,
     pub rows: Vec<Row>,
 }
@@ -132,6 +135,7 @@ impl<Row> UserDetailUsage<Row> {
             expected_nodes: self.expected_nodes,
             limited: self.limited,
             observed_since_unix_secs: self.observed_since_unix_secs,
+            first_record_unix_secs: self.first_record_unix_secs,
             latest_report_unix_secs: self.latest_report_unix_secs,
             rows: self.rows.into_iter().map(map).collect(),
         }

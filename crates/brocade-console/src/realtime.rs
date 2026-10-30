@@ -22,6 +22,7 @@ use serde::Serialize;
 use tokio::sync::{broadcast, watch, Mutex};
 
 const RING_RETENTION: Duration = Duration::from_secs(120);
+const WAKE_DOMAIN_COUNT: usize = brocade_deployment::agent_channel::WakeDomain::ALL.len();
 const RING_MAX_SAMPLES: usize = 600;
 const EVENT_CHANNEL_CAPACITY: usize = 2048;
 const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(15);
@@ -75,6 +76,7 @@ struct AgentConnection {
     // `watch` carries desired state rather than a queue of transitions. Rapid setting edits or
     // tab churn coalesce to the newest command instead of growing an unbounded per-node queue.
     commands: watch::Sender<AgentRealtimeCommand>,
+    changes: watch::Sender<[u64; WAKE_DOMAIN_COUNT]>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -158,11 +160,13 @@ pub struct RealtimeService {
     inner: Arc<Mutex<Inner>>,
     events: broadcast::Sender<RealtimeBroadcast>,
     stop_grace: Duration,
+    listener_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub struct AgentRealtimeSession {
     pub session: u64,
     pub commands: watch::Receiver<AgentRealtimeCommand>,
+    pub changes: watch::Receiver<[u64; WAKE_DOMAIN_COUNT]>,
 }
 
 pub struct RealtimeSubscription {
@@ -203,6 +207,95 @@ impl Drop for WatchLease {
 }
 
 impl RealtimeService {
+    pub(crate) async fn wake_agents(
+        &self,
+        domains: &[brocade_deployment::agent_channel::WakeDomain],
+    ) {
+        self.wake_matching(domains, None).await;
+    }
+    async fn wake_matching(
+        &self,
+        domains: &[brocade_deployment::agent_channel::WakeDomain],
+        node: Option<&str>,
+    ) {
+        let inner = self.inner.lock().await;
+        for (node_id, agent) in &inner.agents {
+            if node.is_some_and(|node| node != node_id) {
+                continue;
+            }
+            agent.changes.send_modify(|versions| {
+                for domain in domains {
+                    versions[*domain as usize] = versions[*domain as usize].wrapping_add(1);
+                }
+            });
+        }
+    }
+    pub(crate) fn ensure_change_listener(
+        &self,
+        store: brocade_store::PgStore,
+        shutdown: crate::lifecycle::ShutdownSignal,
+    ) {
+        use std::sync::atomic::Ordering;
+        if self.listener_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                let listening = async {
+                    let mut listener =
+                        sqlx::postgres::PgListener::connect_with(store.pool()).await?;
+                    listener.listen("brocade_agent_change").await?;
+                    service
+                        .wake_agents(&brocade_deployment::agent_channel::WakeDomain::ALL)
+                        .await;
+                    backoff = Duration::from_secs(1);
+                    loop {
+                        let Some(notification) = listener.try_recv().await? else {
+                            // Reconnect can miss notifications. The next connection re-LISTENs
+                            // before asking all workers to re-read their durable desired state.
+                            break;
+                        };
+                        #[derive(serde::Deserialize)]
+                        struct Change {
+                            domain: String,
+                            node: Option<String>,
+                        }
+                        let Ok(change) = serde_json::from_str::<Change>(notification.payload())
+                        else {
+                            continue;
+                        };
+                        use brocade_deployment::agent_channel::WakeDomain;
+                        let domains = match change.domain.as_str() {
+                            "release" => vec![WakeDomain::AgentRelease, WakeDomain::XrayRelease],
+                            "desired" => vec![
+                                WakeDomain::Desired,
+                                WakeDomain::UserTraffic,
+                                WakeDomain::Probe,
+                            ],
+                            payload => match serde_json::from_value(serde_json::Value::String(
+                                payload.into(),
+                            )) {
+                                Ok(domain) => vec![domain],
+                                Err(_) => continue,
+                            },
+                        };
+                        service
+                            .wake_matching(&domains, change.node.as_deref())
+                            .await;
+                    }
+                    Ok::<(), sqlx::Error>(())
+                };
+                tokio::select! {
+                    _ = shutdown.requested() => return,
+                    result = listening => if let Err(error) = result { eprintln!("Agent change listener: {error}"); },
+                }
+                tokio::select! { _ = shutdown.requested() => return, _ = tokio::time::sleep(backoff) => {} }
+                backoff = (backoff * 2).min(Duration::from_secs(60));
+            }
+        });
+    }
     pub fn new(policy: RealtimeTelemetryPolicy) -> Self {
         Self::with_stop_grace(policy, DEFAULT_STOP_GRACE)
     }
@@ -220,6 +313,7 @@ impl RealtimeService {
             })),
             events,
             stop_grace,
+            listener_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -255,6 +349,7 @@ impl RealtimeService {
             AgentRealtimeCommand::Stop
         };
         let (commands, receiver) = watch::channel(initial);
+        let (changes, change_receiver) = watch::channel([0; WAKE_DOMAIN_COUNT]);
         inner.agents.insert(
             node_id.clone(),
             AgentConnection {
@@ -262,6 +357,7 @@ impl RealtimeService {
                 last_sequence: None,
                 active,
                 commands,
+                changes,
             },
         );
         let interval_secs = inner.policy.interval_secs;
@@ -271,6 +367,7 @@ impl RealtimeService {
         AgentRealtimeSession {
             session,
             commands: receiver,
+            changes: change_receiver,
         }
     }
 
@@ -1563,5 +1660,32 @@ mod tests {
         let samples = &snapshot.snapshots[0].samples;
         assert_eq!(samples.len(), RING_MAX_SAMPLES);
         assert_eq!(samples[0].sample.sequence, 6);
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+    use brocade_deployment::agent_channel::WakeDomain;
+    #[tokio::test]
+    async fn wake_domains_are_retained_independently_of_sampling_and_other_nodes() {
+        let service = RealtimeService::new(Default::default());
+        let mut first = service.register_agent("n1".into()).await;
+        let second = service.register_agent("n2".into()).await;
+        service
+            .wake_matching(&[WakeDomain::AgentRelease], Some("n1"))
+            .await;
+        service
+            .wake_matching(&[WakeDomain::XrayRelease], Some("n1"))
+            .await;
+        let _subscription = service.subscribe(["n1".into()]).await;
+        assert!(matches!(
+            *first.commands.borrow_and_update(),
+            AgentRealtimeCommand::Start { .. }
+        ));
+        let versions = *first.changes.borrow_and_update();
+        assert_eq!(versions[WakeDomain::AgentRelease as usize], 1);
+        assert_eq!(versions[WakeDomain::XrayRelease as usize], 1);
+        assert_eq!(*second.changes.borrow(), [0; WAKE_DOMAIN_COUNT]);
     }
 }

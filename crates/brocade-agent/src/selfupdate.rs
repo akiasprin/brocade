@@ -141,6 +141,8 @@ pub(crate) fn selfupdate_cycle(options: &Options) -> Result<bool, String> {
             write_pending(options, &pending)?;
         }
         send_pending(options, &pending)?;
+        // A newer assignment may have supplied the wake that delivered this old receipt.
+        crate::wake::notify(&[brocade_deployment::agent_channel::WakeDomain::AgentRelease]);
         return Ok(false);
     }
     let Some(offer) = fetch_offer(options)? else {
@@ -541,21 +543,35 @@ pub(crate) fn spawn_selfupdate(options: &Options, wants_exit: &Arc<AtomicBool>) 
     let wants_exit = Arc::clone(wants_exit);
     let spawned = std::thread::Builder::new()
         .name("selfupdate".to_owned())
-        .spawn(move || loop {
-            crate::each_round("selfupdate", || match selfupdate_cycle(&options) {
-                Ok(true) => wants_exit.store(true, Ordering::SeqCst),
-                Ok(false) => {}
-                Err(error) => warn(format!("selfupdate: {error}")),
-            });
-            if wants_exit.load(Ordering::SeqCst) {
-                break;
+        .spawn(move || {
+            let mut wake = crate::wake::Cursor::new(
+                brocade_deployment::agent_channel::WakeDomain::AgentRelease,
+            );
+            loop {
+                let mut failed = false;
+                crate::each_round("selfupdate", || match selfupdate_cycle(&options) {
+                    Ok(true) => {
+                        wants_exit.store(true, Ordering::SeqCst);
+                        crate::wake::notify(&[
+                            brocade_deployment::agent_channel::WakeDomain::Desired,
+                        ]);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        failed = true;
+                        warn(format!("selfupdate: {error}"));
+                    }
+                });
+                if wants_exit.load(Ordering::SeqCst) {
+                    break;
+                }
+                let interval = if failed || options.state_dir.join(PENDING_FILE).exists() {
+                    Duration::from_secs(15)
+                } else {
+                    SELFUPDATE_INTERVAL
+                };
+                wake.wait(interval);
             }
-            let interval = if options.state_dir.join(PENDING_FILE).exists() {
-                Duration::from_secs(15)
-            } else {
-                SELFUPDATE_INTERVAL
-            };
-            std::thread::sleep(interval);
         });
     if let Err(error) = spawned {
         // Not fatal. A machine that cannot self-update still converges, still reports, and still

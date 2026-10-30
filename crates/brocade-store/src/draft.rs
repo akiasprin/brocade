@@ -70,6 +70,12 @@ pub enum ModelOp {
         app_id: String,
         ids: Vec<String>,
     },
+    /// Move an intact chain; the source app is an optimistic concurrency precondition.
+    MoveChain {
+        app_id: String,
+        chain_id: String,
+        target_app_id: String,
+    },
     DeleteExternalOutbound {
         tenant_id: String,
         id: String,
@@ -180,6 +186,13 @@ impl ModelOp {
             }
             ModelOp::ReorderApps { .. } => "调整线路顺序".to_owned(),
             ModelOp::ReorderChains { app_id, .. } => format!("调整链顺序 {app_id}"),
+            ModelOp::MoveChain {
+                app_id,
+                chain_id,
+                target_app_id,
+            } => {
+                format!("移动链 {app_id}/{chain_id} → {target_app_id}")
+            }
             ModelOp::DeleteExternalOutbound { tenant_id, id } => {
                 format!("删除代理出站 {tenant_id}/{id}")
             }
@@ -289,6 +302,11 @@ async fn apply_op(
         ModelOp::ReorderChains { app_id, ids } => {
             c::reorder_chains_tx(tx, actor, app_id, ids).await?
         }
+        ModelOp::MoveChain {
+            app_id,
+            chain_id,
+            target_app_id,
+        } => c::move_chain_tx(tx, actor, app_id, chain_id, target_app_id).await?,
         ModelOp::DeleteExternalOutbound { tenant_id, id } => {
             c::delete_external_outbound_tx(tx, actor, &tenant_id, &id).await?
         }

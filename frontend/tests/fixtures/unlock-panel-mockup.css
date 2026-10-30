@@ -1,0 +1,596 @@
+/* 解锁面板整体设计 mockup。外壳、链详情、机器页和磁贴骨架是生产的；这里只补审阅条（mk-）和方案部件（pm-）。 */
+
+/* ── 审阅外壳：不属于设计 ── */
+body {
+  display: flex;
+  flex-direction: column;
+}
+#mk-root {
+  flex: none;
+}
+#root {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.mk-bar {
+  position: relative;
+  z-index: 30;
+  border-bottom: 1px solid var(--line);
+  background: var(--sheet);
+}
+.mk-bar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  padding: 9px 20px 5px;
+}
+.mk-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--ink);
+  font: 600 14px var(--sans);
+  white-space: nowrap;
+}
+.mk-title small {
+  color: var(--ink-4);
+  font: 400 10px var(--mono);
+  letter-spacing: 0.06em;
+}
+.mk-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-left: auto;
+}
+.mk-ctl {
+  --ctl-h: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.mk-ctl-label {
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.mk-ctl select {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  color: var(--ink);
+  font: 12px var(--sans);
+}
+.mk-ctl .segsw button {
+  padding: 0 9px;
+  font-size: 12px;
+}
+.mk-scene-note {
+  margin: 0;
+  padding: 0 20px 8px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.mk-scene-note b {
+  margin-right: 10px;
+  color: var(--action);
+  font-weight: 600;
+}
+.mk-common {
+  display: block;
+  color: var(--ink-4);
+}
+
+/* ── 插槽：方案部件替换生产入口，现状不动 ── */
+.mk-head-slot,
+.mk-tab-slot {
+  display: contents;
+}
+html[data-mk-option]:not([data-mk-option='current']) .chain-detail-head .nd-tools > .unlock-head-btn,
+html[data-mk-option]:not([data-mk-option='current']) .nd-tab-panel > .node-unlock:not(.pm-tab),
+html[data-mk-option]:not([data-mk-option='current']) .node-unlock-actions {
+  display: none;
+}
+
+/* ══ 共用：状态行 ══
+   每项服务的结论只在一处表达：底部一行，符号与文字在一起。回退是这一行的一种状态（中性的折返符号 + 「回退」），
+   卡面、旗帜和地区保持完整，不再整卡变淡。 */
+
+.pm-status {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 20px;
+}
+.pm-status .unlock-glyph {
+  width: 14px;
+  height: 14px;
+}
+.pm-status-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pm-status[data-tone='part'] .pm-status-text {
+  color: var(--gold);
+}
+.pm-status[data-tone='no'] .pm-status-text {
+  color: var(--err);
+}
+.pm-status:is([data-tone='unknown'], [data-tone='wait'], [data-tone='info']) .pm-status-text {
+  color: var(--ink-3);
+}
+.pm-status-fallback {
+  align-self: flex-start;
+  margin: -2px 0 -2px -5px;
+  padding: 2px 7px 2px 5px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  font: inherit;
+  cursor: pointer;
+}
+.pm-status-fallback:hover,
+.pm-status-fallback[aria-expanded='true'] {
+  background: var(--hover-2);
+}
+.pm-status-fallback .pm-status-text {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.pm-status-fallback i {
+  color: var(--ink-3);
+  font-style: normal;
+  font-weight: 400;
+}
+.pm-status-fallback i::before {
+  content: '·';
+  margin: 0 6px;
+  color: var(--ink-4);
+}
+.pm-fallback-glyph {
+  color: var(--ink-3);
+}
+.pm-fallback-glyph .ring {
+  stroke-width: 1.4;
+}
+.pm-fallback-glyph .dash {
+  stroke-width: 1.35;
+  stroke-linejoin: round;
+}
+.pm-status-note {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  font: inherit;
+  cursor: pointer;
+}
+.pm-status-note::before {
+  content: '·';
+  margin: 0 6px 0 0;
+  color: var(--ink-4);
+}
+.pm-status-note:hover,
+.pm-status-note[aria-expanded='true'] {
+  color: var(--ink);
+}
+.pm-status-fallback:focus-visible,
+.pm-status-note:focus-visible,
+.pm-fam-tab:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+}
+
+/* 地区：大号用于磁贴和分类卡，小号用于紧凑条目。不可用与未取得的地区码降一级，回退保持正常颜色。 */
+.pm-region {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+.pm-region .geo-flag {
+  flex: none;
+  border-radius: 2px;
+}
+.pm-region[data-size='large'] {
+  margin-top: 2px;
+}
+.pm-region[data-size='large'] .geo-flag {
+  width: 21px;
+  height: 14px;
+}
+.pm-region[data-size='large'] b {
+  color: var(--ink);
+  font: 600 22px/1 var(--sans);
+  letter-spacing: 0.02em;
+}
+.pm-region[data-size='large'] .pm-region-name {
+  color: var(--ink-3);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.pm-region[data-size='small'] {
+  gap: 6px;
+}
+.pm-region[data-size='small'] .geo-flag {
+  width: 18px;
+  height: 12px;
+}
+.pm-region[data-size='small'] b {
+  color: var(--ink);
+  font: 600 14.5px/1 var(--sans);
+  letter-spacing: 0.02em;
+}
+b.pm-region.none {
+  color: var(--ink-4);
+  font: 400 22px/1 var(--sans);
+}
+:is([data-tone='no'], [data-tone='unknown']):not([data-route]) .pm-region b {
+  color: var(--ink-3);
+}
+
+.pm-foot {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  margin-top: auto;
+}
+
+/* ══ A / B：磁贴 ══ */
+
+.pm-tile {
+  gap: 13px;
+}
+.pm-tile[data-route] {
+  background: var(--card);
+  box-shadow: var(--sheet-shadow);
+}
+.pm-tile[data-route] .unlock-b-name {
+  color: var(--ink);
+}
+.pm-tile[data-route] .unlock-mark .site-brand-icon {
+  color: inherit;
+}
+
+/* ══ 顶部统计；B 的两族摘要也固定放在底部 ══ */
+
+.pm-summary {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+.pm-count-note {
+  color: var(--ink-3);
+  font: 12px/1.5 var(--sans);
+}
+.pm-fam {
+  display: inline-flex;
+  max-width: 100%;
+  box-sizing: border-box;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--sunk);
+}
+.pm-fam-tab {
+  display: flex;
+  min-width: 150px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+  padding: 9px 14px 11px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink-2);
+  text-align: left;
+  cursor: pointer;
+}
+.pm-fam-tab:hover {
+  background: var(--hover);
+}
+.pm-fam-tab[aria-pressed='true'] {
+  background: var(--card);
+  box-shadow: var(--sheet-shadow);
+  color: var(--ink);
+}
+.pm-fam-name {
+  color: var(--ink-3);
+  font: 600 11.5px var(--sans);
+  letter-spacing: 0.05em;
+}
+.pm-fam-tab[aria-pressed='true'] .pm-fam-name {
+  color: var(--ink-2);
+}
+.pm-fam-count {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.pm-fam-count b {
+  color: var(--ink-2);
+  font: 600 24px/1 var(--sans);
+  font-variant-numeric: tabular-nums;
+}
+.pm-fam-tab[aria-pressed='true'] .pm-fam-count b {
+  color: var(--ink);
+}
+.pm-fam-tab .unlock-b-strip {
+  gap: 2px;
+  margin: 1px 0 0;
+}
+.pm-fam-tab .unlock-b-strip i {
+  width: 7px;
+  height: 10px;
+  border-radius: 2px;
+}
+.pm-fam-tab[data-stale] :is(.pm-fam-count, .unlock-b-strip) {
+  opacity: 0.6;
+}
+.pm-fam .pm-count-note {
+  font-size: 11px;
+}
+
+/* ══ C：分类卡 ══ */
+
+.pm-cats {
+  display: grid;
+  gap: 16px;
+}
+.pm-cat-sec h3,
+.pm-items-sec h3 {
+  margin: 0 0 7px 2px;
+  color: var(--ink-3);
+  font: 500 11.5px var(--sans);
+  letter-spacing: 0.02em;
+}
+.pm-cat {
+  display: grid;
+  overflow: hidden;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--line);
+  box-shadow: var(--sheet-shadow);
+}
+.pm-cat[data-count='8'] {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.pm-cat[data-count='2'] {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.pm-cell {
+  display: flex;
+  min-width: 0;
+  min-height: 112px;
+  box-sizing: border-box;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--card);
+}
+.pm-cell-top {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+.pm-cell-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--ink);
+  font: 500 14.5px var(--sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pm-cat[data-count='8'] .pm-region[data-size='large'] b {
+  font-size: 20px;
+}
+
+/* ══ D：紧凑条目 ══ */
+
+.pm-items-wrap {
+  display: grid;
+  gap: 14px;
+}
+.pm-items {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 228px), 1fr));
+  gap: 8px;
+}
+.pm-item {
+  position: relative;
+  display: grid;
+  min-height: 58px;
+  box-sizing: border-box;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+  box-shadow: var(--sheet-shadow);
+}
+.pm-item-main {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+}
+.pm-item-head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.pm-item-name {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 2px;
+  overflow: hidden;
+  color: var(--ink);
+  font: 500 14px/20px var(--sans);
+  white-space: nowrap;
+}
+.pm-item .pm-status {
+  font-size: 12.5px;
+}
+.pm-item .pm-status .unlock-glyph {
+  width: 12px;
+  height: 12px;
+}
+.pm-item .unlock-info {
+  width: 22px;
+  height: 22px;
+  margin: -4px 0;
+}
+.pm-dot {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--gold);
+}
+
+/* ══ 解析路径弹层：只列事实 ══ */
+
+.pm-path h3 {
+  margin: 0 0 12px;
+  padding-right: 26px;
+  color: var(--ink);
+  font: 600 13px var(--sans);
+}
+.pm-path-group {
+  margin: 12px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.pm-path-group h4 {
+  margin: 0 0 8px;
+  color: var(--ink-2);
+  font: 600 12px var(--sans);
+}
+.pm-path-group dl {
+  margin: 0;
+}
+.pm-rule {
+  display: flex;
+  width: 100%;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.pm-code {
+  color: var(--ink);
+  font: 12px var(--mono);
+}
+.pm-connections {
+  flex-direction: column;
+  align-items: flex-start !important;
+}
+.pm-connections > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+
+/* 计数栏在弹窗正文（可收缩的纵向 flex）里不能被压扁：「重新检测」换行时会盖住第一个分类标题。 */
+[data-pm-option] .unlock-bar {
+  flex: none;
+}
+
+@media (max-width: 620px) {
+  .pm-fam {
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .pm-fam-tab {
+    min-width: 0;
+    flex: 1;
+    padding: 7px 10px;
+  }
+  .pm-cat[data-count='8'] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .pm-cat[data-count='3'] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .pm-cell .pm-region-name {
+    display: none;
+  }
+  .pm-cell {
+    min-height: 96px;
+    gap: 8px;
+    padding: 10px 12px;
+  }
+  /* AI 保留完整分类卡，用两行排布缩短三项纵向占用。 */
+  .pm-cat[data-count='3'] .pm-cell {
+    display: grid;
+    min-height: 0;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 4px 10px;
+  }
+  .pm-cat[data-count='3'] .pm-cell > .pm-region {
+    grid-column: 2;
+    grid-row: 1;
+    margin: 0;
+  }
+  .pm-cat[data-count='3'] .pm-foot {
+    grid-column: 1 / -1;
+    margin: 0;
+  }
+  .pm-cat[data-count='3'] .pm-region[data-size='large'] b {
+    font-size: 17px;
+  }
+}
+
+/* 紧凑条目里状态行更窄：收紧回退按钮与分隔点的留白，「回退 · 地区不支持」不被截断。 */
+.pm-item .pm-status-fallback {
+  margin: 0;
+  padding: 0 4px 0 0;
+}
+.pm-item .pm-status-fallback i::before {
+  margin: 0 4px;
+}
+.pm-item .pm-status {
+  gap: 5px;
+}
+
+/* 分类卡的格子较窄：状态行允许换行，不截断回退的结论。 */
+.pm-cell .pm-status-text {
+  white-space: normal;
+}
+.pm-cell .pm-status-fallback i {
+  white-space: nowrap;
+}

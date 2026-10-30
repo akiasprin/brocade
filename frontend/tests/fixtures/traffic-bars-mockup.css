@@ -1,0 +1,193 @@
+/* 柱状图 mockup。页面主体是生产的机器用量（实时 → 流入 → 流出），这里只有审阅外壳（mk- / tb-）
+   和方案对 HTML 柱的改动；两张 ECharts 柱图的改动在 traffic-bars-mockup-echarts.ts。 */
+
+/* ── 审阅外壳：不属于设计 ── */
+html,
+body {
+  height: auto;
+  min-height: 100%;
+  overflow: auto !important;
+}
+body {
+  margin: 0;
+  background: var(--ground);
+}
+.mk-bar {
+  position: relative;
+  z-index: 30;
+  border-bottom: 1px solid var(--line);
+  background: var(--sheet);
+}
+.mk-bar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  padding: 10px 20px 6px;
+}
+.mk-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--ink);
+  font: 600 14px var(--sans);
+  white-space: nowrap;
+}
+.mk-title small {
+  color: var(--ink-4);
+  font: 400 10px var(--mono);
+  letter-spacing: 0.06em;
+}
+.mk-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-left: auto;
+}
+.mk-ctl {
+  --ctl-h: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.mk-ctl-label {
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.mk-ctl select {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  color: var(--ink);
+  font: 12px var(--sans);
+}
+.mk-ctl .segsw button {
+  padding: 0 9px;
+  font-size: 12px;
+}
+.mk-scene-note {
+  margin: 0;
+  padding: 0 20px 8px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.mk-scene-note b {
+  margin-right: 10px;
+  color: var(--action);
+  font-weight: 600;
+}
+.mk-common {
+  padding: 0 20px 10px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+.mk-common summary {
+  width: max-content;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.mk-common ol {
+  margin: 4px 0 0;
+  padding-left: 20px;
+  columns: 2 420px;
+  column-gap: 32px;
+}
+.mk-common li {
+  break-inside: avoid;
+}
+.tb-stage {
+  max-width: 1280px;
+  margin: 16px auto 40px;
+  padding: 0 16px;
+}
+.tb-stage[data-width='card'] {
+  max-width: 720px;
+}
+.tb-stage[data-width='phone'] {
+  max-width: 390px;
+  padding: 0;
+}
+.tb-surface {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--sheet);
+}
+.tb-body {
+  overflow: visible;
+}
+.tb-stage[data-width='phone'] .tb-body {
+  padding: 12px;
+}
+@media (max-width: 620px) {
+  .mk-bar-row,
+  .mk-scene-note,
+  .mk-common {
+    padding-right: 12px;
+    padding-left: 12px;
+  }
+}
+
+/* ══ 方案：HTML 部分 ══ */
+
+/* 方案 B 的中性灰：与 ECharts 里一样，取墨色按比例混入卡面。 */
+:root {
+  --tb-gray: color-mix(in srgb, var(--ink) 24%, var(--card));
+}
+:root[data-theme='light'] {
+  --tb-gray: color-mix(in srgb, var(--ink) 15%, var(--card));
+}
+
+/* 去掉图下说明行；端口转发未分配的那一行仍保留。 */
+html:not([data-tb-option='current']) .site-usage-plot > .site-usage-chart + .site-usage-note {
+  display: none;
+}
+
+/* 第 5 类站点与第 5 条接入链：观测色第 7 档 → 第 3 档。 */
+html:not([data-tb-option='current']) :is(.site-usage, .nti-card) [style*='--observe-7'] {
+  background: var(--observe-3) !important;
+  fill: var(--observe-3) !important;
+}
+/* 流入统计的端口转发与流出统计同色（观测色第 2 档）。 */
+html:not([data-tb-option='current']) .nti-card [style*='var(--ink) 40%'] {
+  background: var(--observe-2) !important;
+  fill: var(--observe-2) !important;
+}
+
+/* 图中悬停的类别：右侧对应行与指向时相同的底色。 */
+.site-usage-item.tb-hot > .site-usage-row {
+  background: var(--hover);
+}
+
+/* 流入统计窄卡：聚焦一条链后其余链段（链段本来就会移到最左对齐）。 */
+html[data-tb-option='a'] .nti-bar > i.dim,
+html[data-tb-option='c'] .nti-bar > i.dim {
+  opacity: 0.5;
+}
+html[data-tb-option='b'] .nti-bar > i.dim {
+  opacity: 1;
+  background: var(--tb-gray) !important;
+}
+
+/* 流入统计流向图：其余流向、节点与标签。流向平时是 40% 填充，聚焦的 80%。 */
+html[data-tb-option='a'] .ntf-link.dim,
+html[data-tb-option='c'] .ntf-link.dim {
+  fill-opacity: 0.2;
+}
+html[data-tb-option='b'] .ntf-link.dim {
+  fill: var(--tb-gray) !important;
+  fill-opacity: 0.7;
+}
+html:not([data-tb-option='current']) .ntf-node.dim,
+html:not([data-tb-option='current']) .ntf-label.dim {
+  opacity: 0.6;
+}
+html[data-tb-option='b'] .ntf-node.dim {
+  opacity: 1;
+  fill: var(--tb-gray) !important;
+}

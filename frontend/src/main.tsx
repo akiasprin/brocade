@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ApiError } from './api';
 import { App } from './app';
+import { ModuleBoundary } from './ui/lazy';
 import { observeBrowserAppearance } from './forge/browser-appearance';
 import { ConsoleUpdate } from './ui/console-update';
 import './styles.css';
@@ -37,7 +38,9 @@ createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
       <ConsoleUpdate />
-      <App />
+      <ModuleBoundary>
+        <App />
+      </ModuleBoundary>
     </QueryClientProvider>
   </StrictMode>,
 );

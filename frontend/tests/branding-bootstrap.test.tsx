@@ -58,7 +58,7 @@ describe('站点标题初始化', () => {
     script.type = 'application/json';
     script.textContent = JSON.stringify({ site_name: '我的站点', icon_data_url: null });
     document.head.append(script);
-    document.title = '我的站点 | Invisible networks. Infallible control.';
+    document.title = '我的站点';
     let finish!: (response: Response) => void;
     const branding = new Promise<Response>(resolve => {
       finish = resolve;
@@ -69,9 +69,9 @@ describe('站点标题初始化', () => {
     );
     mount();
     expect(initialBranding()?.site_name).toBe('我的站点');
-    expect(document.title).toBe('我的站点 | Invisible networks. Infallible control.');
+    expect(document.title).toBe('我的站点');
     finish(Response.json({ site_name: '更新后的站点', icon_data_url: null }));
-    await waitFor(() => expect(document.title).toBe('更新后的站点 | Invisible networks. Infallible control.'));
+    await waitFor(() => expect(document.title).toBe('更新后的站点'));
   });
 
   it('把站点图标同步为 favicon，并接受接口返回的新图标', async () => {
@@ -104,16 +104,16 @@ describe('站点标题初始化', () => {
   });
 
   it('没有首页配置时保留中性标题，不用默认名称覆盖它', () => {
-    document.title = 'Invisible networks. Infallible control.';
+    document.title = '控制台';
     vi.stubGlobal(
       'fetch',
       vi.fn(() => new Promise(() => {})),
     );
     mount();
-    expect(document.title).toBe('Invisible networks. Infallible control.');
+    expect(document.title).toBe('控制台');
   });
   it('站点外观接口失败时使用中性名称，不把失败误报成默认站点', async () => {
-    document.title = 'Invisible networks. Infallible control.';
+    document.title = '控制台';
     vi.stubGlobal(
       'fetch',
       vi.fn(async (path: string) => {
@@ -128,6 +128,6 @@ describe('站点标题初始化', () => {
     expect((await view.findByText('控制台')).classList.contains('login-word')).toBe(true);
     expect(view.getByText('Invisible networks. Infallible control.')).toBeTruthy();
     expect(view.queryByText(/Brocade/)).toBeNull();
-    expect(document.title).toBe('Invisible networks. Infallible control.');
+    expect(document.title).toBe('控制台');
   });
 });

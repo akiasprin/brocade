@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, net::IpAddr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
+};
 
 use sha2::{Digest, Sha256};
 
@@ -211,6 +214,7 @@ pub struct XrayDns {
     pub servers: Vec<XrayDnsServer>,
     pub serve_stale: bool,
     pub serve_expired_ttl_secs: u32,
+    pub enable_parallel_query: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -542,6 +546,9 @@ pub enum XrayOutbound {
         domain_strategy: String,
         address_policy: XrayFreedomAddressPolicy,
     },
+    Dns {
+        tag: String,
+    },
     Blackhole {
         tag: String,
         /// Ask xray to send its small built-in HTTP 403 before closing the connection.
@@ -785,6 +792,74 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
             .iter()
             .map(|outbound| egress_outbound(outbound, xray.domain_strategy)),
     );
+    // Probe-only variants retain the same peer, TLS, DNS and source binding. A family
+    // cannot fall back to the system resolver or to a different address family.
+    for family in [crate::model::IpFamily::V4, crate::model::IpFamily::V6] {
+        let mut fallback = outbounds[0].clone();
+        if let XrayOutbound::Freedom {
+            tag,
+            domain_strategy,
+            ..
+        } = &mut fallback
+        {
+            *tag = crate::model::probe_family_tag(tag, family);
+            *domain_strategy = match family {
+                crate::model::IpFamily::V4 => "ForceIPv4",
+                crate::model::IpFamily::V6 => "ForceIPv6",
+            }
+            .into();
+        }
+        outbounds.push(fallback);
+        for outbound in &xray.forward_outbounds {
+            if matches!(outbound.security, HopDialWire::Shadowsocks2022 { .. })
+                || bridge_tags.contains_key(outbound.tag.as_str())
+            {
+                continue;
+            }
+            let mut plan = outbound.clone();
+            plan.tag = crate::model::probe_family_tag(&plan.tag, family);
+            plan.uuid = crate::model::probe_family_uuid(&plan.uuid, family);
+            // Daily diagnostics do not maintain a second prewarmed relay pool.
+            plan.pool = HopPool::None;
+            outbounds.push(forward_outbound(&plan, &bridge_tags, xray.relay_mux));
+        }
+        for outbound in &xray.egress_outbounds {
+            let mut value = egress_outbound(outbound, xray.domain_strategy);
+            if let XrayOutbound::Freedom {
+                tag,
+                domain_strategy,
+                ..
+            } = &mut value
+            {
+                *tag = crate::model::probe_family_tag(tag, family);
+                *domain_strategy = match family {
+                    crate::model::IpFamily::V4 => "ForceIPv4",
+                    crate::model::IpFamily::V6 => "ForceIPv6",
+                }
+                .into();
+            }
+            outbounds.push(value);
+        }
+    }
+    outbounds.push(XrayOutbound::Dns {
+        tag: "probe:dns".into(),
+    });
+    for outbound in &xray.forward_outbounds {
+        if matches!(outbound.security, HopDialWire::Shadowsocks2022 { .. })
+            || bridge_tags.contains_key(outbound.tag.as_str())
+        {
+            continue;
+        }
+        let mut plan = outbound.clone();
+        plan.tag = crate::model::probe_dns_tag(&plan.tag);
+        plan.uuid = crate::model::probe_dns_uuid(&plan.uuid);
+        plan.pool = HopPool::None;
+        outbounds.push(forward_outbound(&plan, &bridge_tags, xray.relay_mux));
+    }
+    outbounds.push(XrayOutbound::Blackhole {
+        tag: "out:probe-family-unsupported".into(),
+        http_response: false,
+    });
     outbounds.extend(xray.external_outbounds.iter().map(external_outbound));
     if xray.block_outbound {
         outbounds.push(XrayOutbound::Blackhole {
@@ -870,7 +945,11 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
             balancer_tag: None,
         });
     }
+    let mut dns_routes = BTreeSet::new();
     for dns in &xray.egress_dns {
+        if !dns_routes.insert((&dns.tag, &dns.outbound_tag)) {
+            continue;
+        }
         rules.push(XrayRoutingRule {
             rule_tag: String::new(),
             inbound_tags: vec![dns.tag.clone()],
@@ -973,15 +1052,17 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
         }
     }));
 
-    // Liveness applies only to hops that exist. A machine with no forwarding outbound,
-    // such as a pure exit or a pure ingress, emits no observatory, because a synthetic
-    // probe target would measure nothing.
-    let hop_health = (!xray.forward_outbounds.is_empty()).then(|| XrayHopHealth {
-        subjects: xray
-            .forward_outbounds
-            .iter()
-            .map(|outbound| outbound.tag.clone())
-            .collect(),
+    // A reverse credential may create carriers only; upstream rejects ordinary
+    // forward requests authenticated by it. Its dedicated health probes already
+    // keep the carrier counters live and expose the bidirectional lease via RPC.
+    let health_subjects = xray
+        .forward_outbounds
+        .iter()
+        .filter(|outbound| !bridge_tags.contains_key(outbound.tag.as_str()))
+        .map(|outbound| outbound.tag.clone())
+        .collect::<Vec<_>>();
+    let hop_health = (!health_subjects.is_empty()).then(|| XrayHopHealth {
+        subjects: health_subjects,
         probe_url: HOP_HEALTH_PROBE_URL.to_owned(),
         probe_interval_secs: HOP_HEALTH_PROBE_INTERVAL_SECS,
         balancer_tag: HOP_HEALTH_BALANCER_TAG.to_owned(),
@@ -1487,13 +1568,18 @@ pub(crate) fn domain_strategy_name(strategy: DomainStrategy) -> &'static str {
 fn dns_config(dns: &Dns, dns_route: Option<&str>, scoped: &[XrayEgressDnsPlan]) -> XrayDns {
     let mut servers = scoped
         .iter()
-        .map(|server| XrayDnsServer::Scoped {
+        .enumerate()
+        .map(|(index, server)| XrayDnsServer::Scoped {
             address: dns_server_address(server),
             port: server.port,
             domains: server.domains.clone(),
             query_strategy: dns_query_strategy_name(server.address_strategy).to_owned(),
             tag: server.tag.clone(),
-            final_query: matches!(server.fallback, crate::model::EgressDnsFallback::Stop),
+            // Xray truncates the selected list at finalQuery, before forming groups.
+            final_query: matches!(server.fallback, crate::model::EgressDnsFallback::Stop)
+                && scoped
+                    .get(index + 1)
+                    .is_none_or(|next| next.tag != server.tag),
         })
         .collect::<Vec<_>>();
     servers.extend(match dns {
@@ -1509,6 +1595,7 @@ fn dns_config(dns: &Dns, dns_route: Option<&str>, scoped: &[XrayEgressDnsPlan]) 
         servers,
         serve_stale: true,
         serve_expired_ttl_secs: DNS_SERVE_EXPIRED_TTL_SECS,
+        enable_parallel_query: !scoped.is_empty(),
     }
 }
 

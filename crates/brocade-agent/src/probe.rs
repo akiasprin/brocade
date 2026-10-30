@@ -143,6 +143,11 @@ fn hop_of_tag(tag: &str) -> Option<(&str, &str)> {
     let tag = tag
         .strip_suffix(brocade_deployment::hotswap::ENDPOINT_SWAP_SUFFIX)
         .unwrap_or(tag);
+    // Probe clones use the same peer address as ordinary forwards. Letting their
+    // tags through also overwrites the physical peer in the NIC socket attribution map.
+    if brocade_core::model::is_probe_family_tag(tag) {
+        return None;
+    }
     let (chain, peer) = tag.strip_prefix("out:")?.split_once('>')?;
     let Some((source, target)) = chain.split_once('~') else {
         return Some((chain, peer));
@@ -1456,4 +1461,62 @@ pub(crate) fn hop_targets(xray_json: &str) -> BTreeMap<std::net::IpAddr, (String
         }
     }
     out
+}
+
+#[cfg(test)]
+mod family_telemetry_tests {
+    use super::*;
+    use brocade_core::model::{probe_family_tag, IpFamily};
+
+    #[test]
+    fn family_probe_outbounds_never_become_physical_hops() {
+        for base in ["out:app/chain>peer", "out:app/chain~owner>peer"] {
+            assert_eq!(hop_of_tag(base), Some(("app/chain", "peer")));
+            for family in [IpFamily::V4, IpFamily::V6] {
+                let tag = probe_family_tag(base, family);
+                assert_eq!(hop_of_tag(&tag), None);
+                let swapped = format!("{tag}{}", brocade_deployment::hotswap::ENDPOINT_SWAP_SUFFIX);
+                assert_eq!(hop_of_tag(&swapped), None);
+            }
+        }
+    }
+
+    #[test]
+    fn probe_clones_cannot_overwrite_real_socket_peer_attribution() {
+        let base = "out:app/chain>peer";
+        let outbound = |tag: String| serde_json::json!({"tag":tag,"settings":{"vnext":[{"address":"10.66.0.2","port":12345}]}});
+        let normal = outbound(base.into());
+        let v4 = outbound(probe_family_tag(base, IpFamily::V4));
+        let v6 = outbound(probe_family_tag(base, IpFamily::V6));
+        for items in [
+            vec![normal.clone(), v4.clone(), v6.clone()],
+            vec![v4, v6, normal],
+        ] {
+            let config = serde_json::json!({"outbounds":items}).to_string();
+            let peers = hop_targets(&config);
+            assert_eq!(peers.len(), 1);
+            assert_eq!(
+                peers[&"10.66.0.2".parse::<std::net::IpAddr>().unwrap()],
+                ("app/chain".into(), "peer".into())
+            );
+        }
+    }
+
+    #[test]
+    fn liveness_counters_ignore_both_probe_families() {
+        let base = "out:app/chain>peer";
+        let stat = |tag: &str| crate::xray_grpc::XrayStat {
+            name: format!("outbound>>>{tag}>>>traffic>>>downlink"),
+            value: 100,
+        };
+        let stats = vec![
+            stat(base),
+            stat(&probe_family_tag(base, IpFamily::V4)),
+            stat(&probe_family_tag(base, IpFamily::V6)),
+        ];
+        assert_eq!(
+            hop_downlinks_from_stats(&stats),
+            BTreeMap::from([(base.to_owned(), 100)])
+        );
+    }
 }

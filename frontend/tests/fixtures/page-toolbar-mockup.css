@@ -1,0 +1,497 @@
+/* 页头工具栏 mockup：四个候选方案都是挂在 <html data-tb> 上的一层样式，作用于真实页面的页头操作区。
+   范围是详情页页头右侧（机器、线路、隧道、发布）与用户详情身份栏右侧的 .btn：时间范围、返回上一个范围、
+   节点 / 订阅、更多、解锁、检测、页面主操作。分段控件（用量的本月 / 上月）与页签不在本稿范围。
+
+   四个方案共用同一套结构与状态规则，只换下面这组变量：
+     --tb-h       控件高度            --tb-r / --tb-pad   圆角与左右内距
+     --tb-face    常态底              --tb-face-h / -a    悬停 / 按下底（展开菜单时停在 --tb-face-open）
+     --tb-edge    收边（只用阴影，不用 border）
+     --tb-ink / --tb-icon / --tb-chevron   文字、图标、下拉箭头
+   主操作一律是强调色实底配白字（--primary / --primary-on），危险操作只把文字换成 --err。 */
+
+/* 候选方案没有生产调色盘可选，账户菜单里的色板行在方案激活时隐藏。 */
+:root[data-tb] .fg-appearance-row:has(.fg-tone-list) {
+  display: none;
+}
+
+/* ══ 共用结构 ══ */
+
+:root[data-tb] :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools),
+:root[data-tb] :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools) :is(.nd-acts, .user-dacts),
+:root[data-tb] .panel[data-page-title='true'] > header :is(.chain-list-actions, .user-roster-head-actions) {
+  gap: var(--tb-gap);
+}
+/* 列表标题栏比详情页头矮一档，按钮跟着小一档；外观规则不变。 */
+:root[data-tb] .panel[data-page-title='true'] > header {
+  --tb-h: var(--tb-h-compact);
+  --tb-pad: var(--tb-pad-compact);
+}
+:root[data-tb] .panel[data-page-title='true'] > header .btn {
+  font-size: 12px;
+}
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: auto;
+  height: var(--tb-h);
+  min-height: var(--tb-h);
+  margin: 0;
+  padding: 0 var(--tb-pad);
+  border: 0;
+  border-radius: var(--tb-r);
+  background: var(--tb-face);
+  box-shadow: var(--tb-edge);
+  color: var(--tb-ink);
+  font-size: 12.5px;
+  font-weight: var(--tb-weight);
+  letter-spacing: 0;
+  transition:
+    background-color 0.12s ease,
+    box-shadow 0.12s ease,
+    color 0.12s ease,
+    opacity 0.12s ease,
+    transform 0.08s ease-out;
+}
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn
+  .ui-icon {
+  color: var(--tb-icon);
+}
+/* 只有图标的按钮：更多、返回上一个时间范围。 */
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  :is(.fg-more, .user-dact-more, .observe-range-return) {
+  width: var(--tb-h);
+  padding: 0;
+  border-radius: var(--tb-r-icon, var(--tb-r));
+}
+/* 生产把返回与时间按钮拼成一组、共用中间那条边框；各方案改为两枚独立按钮（C 由外层玻璃成组）。 */
+:root[data-tb] .observe-range {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--tb-gap);
+}
+:root[data-tb] .observe-range-return + .observe-range-trigger {
+  margin-left: 0;
+}
+/* 时间范围是下拉选择：补上箭头。伪元素放在内容之后（order），::after 仍留给生产的读取中圆点。 */
+:root[data-tb] .observe-range-trigger::before {
+  order: 3;
+  width: 9px;
+  height: 9px;
+  margin-left: -1px;
+  color: var(--tb-chevron);
+  background: currentColor;
+  content: '';
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Cpath d='M1.6 3.4 5 6.8l3.4-3.4' fill='none' stroke='%23000' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Cpath d='M1.6 3.4 5 6.8l3.4-3.4' fill='none' stroke='%23000' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+}
+:root[data-tb] .observe-range-clock {
+  color: var(--tb-icon);
+}
+
+@media (hover: hover) {
+  :root[data-tb]
+    :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+    .btn:hover:not(:disabled) {
+    border-color: transparent;
+    background: var(--tb-face-h);
+  }
+}
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn:active:not(:disabled) {
+  background: var(--tb-face-a);
+  transform: scale(0.97);
+}
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn[aria-expanded='true'],
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .observe-range.open
+  .observe-range-trigger {
+  border-color: transparent;
+  background: var(--tb-face-open);
+}
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn:focus-visible {
+  z-index: 1;
+  outline: 3px solid color-mix(in srgb, var(--action) 50%, transparent);
+  outline-offset: 1px;
+}
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn:disabled {
+  opacity: 0.38;
+}
+
+/* 主操作：强调色实底白字，四个方案相同，只有收边随方案。禁用时退回普通按钮的外观再减淡。 */
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn.primary {
+  background: var(--primary);
+  box-shadow: var(--tb-primary-edge, none);
+  color: var(--primary-on);
+  font-weight: 500;
+}
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn.primary
+  .ui-icon {
+  color: inherit;
+}
+@media (hover: hover) {
+  :root[data-tb]
+    :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+    .btn.primary:hover:not(:disabled) {
+    background: var(--primary-hover);
+    color: var(--primary-on);
+  }
+}
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn.primary:active:not(:disabled) {
+  background: var(--primary-active);
+}
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn.primary:disabled {
+  border-color: transparent;
+  background: var(--tb-face);
+  box-shadow: var(--tb-edge);
+  font-weight: var(--tb-weight);
+}
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn:is(:disabled, .primary:disabled),
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn:is(:disabled, .primary:disabled)
+  .ui-icon {
+  color: var(--tb-ink-disabled, var(--tb-ink));
+}
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn.danger,
+:root[data-tb]
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn.danger
+  .ui-icon {
+  color: var(--err);
+}
+
+/* ══ A 灰底胶囊 ══
+   iOS 的 bordered 按钮：系统灰（tertiarySystemFill）胶囊，图标与文字取强调色；只有图标的按钮是正圆。
+   暗色把强调色提亮一档（接近系统的高对比蓝），小字在灰底上才够清楚。 */
+:root[data-tb='a'] {
+  --tb-h: 30px;
+  --tb-r: 999px;
+  --tb-pad: 13px;
+  --tb-h-compact: 26px;
+  --tb-pad-compact: 11px;
+  --tb-gap: 8px;
+  --tb-weight: 500;
+  --tb-face: rgba(120, 120, 128, 0.24);
+  --tb-face-h: rgba(120, 120, 128, 0.32);
+  --tb-face-a: rgba(120, 120, 128, 0.42);
+  --tb-face-open: rgba(120, 120, 128, 0.38);
+  --tb-edge: none;
+  --tb-ink: color-mix(in srgb, var(--action) 82%, #fff);
+  --tb-icon: var(--tb-ink);
+  --tb-chevron: var(--tb-ink);
+}
+:root[data-tb='a'][data-theme='light'] {
+  --tb-face: rgba(120, 120, 128, 0.12);
+  --tb-face-h: rgba(120, 120, 128, 0.18);
+  --tb-face-a: rgba(120, 120, 128, 0.26);
+  --tb-face-open: rgba(120, 120, 128, 0.22);
+  --tb-ink: var(--action);
+}
+
+/* ══ B 无底蓝字 ══
+   iOS 导航栏按钮：常态没有底和边，强调色的图标与文字本身就是可点的信号；悬停才出现系统灰圆角底。
+   「更多」画成带圈的省略号（ellipsis.circle），只有图标的按钮也有明确的落点。 */
+:root[data-tb='b'] {
+  --tb-h: 30px;
+  --tb-r: 8px;
+  --tb-pad: 8px;
+  --tb-h-compact: 26px;
+  --tb-pad-compact: 7px;
+  --tb-gap: 4px;
+  --tb-weight: 500;
+  --tb-face: transparent;
+  --tb-face-h: rgba(120, 120, 128, 0.22);
+  --tb-face-a: rgba(120, 120, 128, 0.34);
+  --tb-face-open: rgba(120, 120, 128, 0.22);
+  --tb-edge: none;
+  --tb-ink: color-mix(in srgb, var(--action) 82%, #fff);
+  --tb-icon: var(--tb-ink);
+  --tb-chevron: var(--tb-ink);
+  --tb-ink-disabled: var(--ink-4);
+  --tb-primary-pad: 13px;
+}
+:root[data-tb='b'][data-theme='light'] {
+  --tb-face-h: rgba(120, 120, 128, 0.12);
+  --tb-face-a: rgba(120, 120, 128, 0.2);
+  --tb-face-open: rgba(120, 120, 128, 0.12);
+  --tb-ink: var(--action);
+}
+:root[data-tb='b']
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn.primary {
+  margin-left: 4px;
+  padding: 0 var(--tb-primary-pad);
+}
+:root[data-tb='b']
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn:disabled {
+  opacity: 1;
+}
+:root[data-tb='b'] :is(.fg-more, .user-dact-more)::before {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 19px;
+  height: 19px;
+  box-sizing: border-box;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  content: '';
+  transform: translate(-50%, -50%);
+}
+:root[data-tb='b'] :is(.fg-more, .user-dact-more) .ui-icon svg {
+  width: 13px;
+  height: 13px;
+}
+
+/* ══ C 玻璃分组 ══
+   macOS 26 的工具栏：相关操作合进同一枚玻璃胶囊（时间范围与返回、节点与订阅），单独的操作各占一枚；
+   胶囊浮在纸面之上，靠细高光与软阴影成立，不画描边。胶囊里的按钮只在悬停 / 按下时出现内层高亮。
+   图标与文字用正文色，强调色只留给主操作（蓝色玻璃）。 */
+:root[data-tb='c'] {
+  --tb-h: 32px;
+  --tb-r: 999px;
+  --tb-pad: 13px;
+  --tb-h-compact: 28px;
+  --tb-pad-compact: 12px;
+  --tb-gap: 10px;
+  --tb-weight: 500;
+  --tb-glass: rgba(255, 255, 255, 0.075);
+  --tb-glass-edge:
+    inset 0 0.5px 0 rgba(255, 255, 255, 0.22), 0 0 0 0.5px rgba(255, 255, 255, 0.1), 0 3px 12px rgba(0, 0, 0, 0.45);
+  --tb-hl: rgba(255, 255, 255, 0.1);
+  --tb-hl-a: rgba(255, 255, 255, 0.17);
+  --tb-face: var(--tb-glass);
+  --tb-face-h: linear-gradient(var(--tb-hl), var(--tb-hl)), var(--tb-glass);
+  --tb-face-a: linear-gradient(var(--tb-hl-a), var(--tb-hl-a)), var(--tb-glass);
+  --tb-face-open: var(--tb-face-a);
+  --tb-edge: var(--tb-glass-edge);
+  --tb-ink: var(--ink);
+  --tb-icon: var(--ink-2);
+  --tb-chevron: var(--ink-3);
+  --tb-primary-edge: inset 0 1px 0 rgba(255, 255, 255, 0.3), 0 3px 12px rgba(0, 0, 0, 0.45);
+}
+:root[data-tb='c'][data-theme='light'] {
+  --tb-glass: rgba(255, 255, 255, 0.82);
+  --tb-glass-edge:
+    inset 0 1px 0 #fff, 0 0 0 0.5px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.06), 0 4px 14px rgba(0, 0, 0, 0.08);
+  --tb-hl: rgba(120, 120, 128, 0.13);
+  --tb-hl-a: rgba(120, 120, 128, 0.22);
+  --tb-primary-edge:
+    inset 0 1px 0 rgba(255, 255, 255, 0.3), 0 0 0 0.5px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.1),
+    0 4px 14px rgba(0, 0, 0, 0.1);
+}
+:root[data-tb='c']
+  :is(.nd-page-head > .nd-tools, .nd-page-head > .nd-acts, .user-dhead-tools, .panel[data-page-title='true'] > header)
+  .btn {
+  -webkit-backdrop-filter: blur(12px) saturate(1.8);
+  backdrop-filter: blur(12px) saturate(1.8);
+}
+/* 成组：外层是玻璃胶囊，里面的按钮去掉材质，只留内层高亮。 */
+:root[data-tb='c'] :is(.nd-page-head > .nd-tools, .user-dhead-tools) :is(.observe-range, .user-dacts) {
+  gap: 2px;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--tb-glass);
+  box-shadow: var(--tb-glass-edge);
+  -webkit-backdrop-filter: blur(12px) saturate(1.8);
+  backdrop-filter: blur(12px) saturate(1.8);
+}
+:root[data-tb='c'] :is(.nd-page-head > .nd-tools, .user-dhead-tools) :is(.observe-range, .user-dacts) .btn {
+  --tb-face: transparent;
+  --tb-face-h: var(--tb-hl);
+  --tb-face-a: var(--tb-hl-a);
+  --tb-face-open: var(--tb-hl-a);
+  --tb-edge: none;
+  height: calc(var(--tb-h) - 6px);
+  min-height: calc(var(--tb-h) - 6px);
+  padding: 0 10px;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+:root[data-tb='c']
+  :is(.nd-page-head > .nd-tools, .user-dhead-tools)
+  :is(.observe-range, .user-dacts)
+  .observe-range-return {
+  width: calc(var(--tb-h) - 6px);
+  padding: 0;
+}
+
+/* ══ D 原生按钮 ══
+   macOS 的推按钮与弹出按钮：白色（暗色为浅一档的灰）圆角矩形，0.5px 阴影收边加 1px 落影，像略微浮起。
+   图标与文字用正文色；时间范围是弹出按钮，右端是强调色方块里的上下箭头。 */
+:root[data-tb='d'] {
+  --tb-h: 30px;
+  --tb-r: 7px;
+  --tb-pad: 11px;
+  --tb-h-compact: 26px;
+  --tb-pad-compact: 10px;
+  --tb-gap: 8px;
+  --tb-weight: 400;
+  --tb-plate: rgba(255, 255, 255, 0.17);
+  --tb-face: var(--tb-plate);
+  --tb-face-h: linear-gradient(rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.05)), var(--tb-plate);
+  --tb-face-a: linear-gradient(rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.13)), var(--tb-plate);
+  --tb-face-open: var(--tb-face-a);
+  --tb-edge: inset 0 0.5px 0 rgba(255, 255, 255, 0.16), 0 0 0 0.5px rgba(0, 0, 0, 0.55), 0 1px 1.5px rgba(0, 0, 0, 0.3);
+  --tb-ink: var(--ink);
+  --tb-icon: var(--ink-2);
+  --tb-chevron: #fff;
+  --tb-primary-edge:
+    inset 0 0.5px 0 rgba(255, 255, 255, 0.22), 0 0 0 0.5px rgba(0, 0, 0, 0.4), 0 1px 1.5px rgba(0, 0, 0, 0.3);
+}
+:root[data-tb='d'][data-theme='light'] {
+  --tb-plate: #fff;
+  --tb-face-h: linear-gradient(rgba(0, 0, 0, 0.03), rgba(0, 0, 0, 0.03)), var(--tb-plate);
+  --tb-face-a: linear-gradient(rgba(0, 0, 0, 0.09), rgba(0, 0, 0, 0.09)), var(--tb-plate);
+  --tb-edge: 0 0 0 0.5px rgba(0, 0, 0, 0.2), 0 0.5px 1.5px rgba(0, 0, 0, 0.16);
+  --tb-primary-edge:
+    inset 0 0.5px 0 rgba(255, 255, 255, 0.2), 0 0 0 0.5px rgba(0, 0, 0, 0.12), 0 0.5px 1.5px rgba(0, 0, 0, 0.18);
+}
+:root[data-tb='d'] :is(.nd-page-head > .nd-tools, .user-dhead-tools) .observe-range-trigger {
+  padding-right: 4px;
+  gap: 7px;
+}
+:root[data-tb='d'] .observe-range-trigger::before {
+  width: 17px;
+  height: 18px;
+  margin-left: 2px;
+  border-radius: 4.5px;
+  background: var(--primary)
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 12'%3E%3Cpath d='M2.6 4.6 5 2.2l2.4 2.4M2.6 7.4 5 9.8l2.4-2.4' fill='none' stroke='%23fff' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+    center / 9px 11px no-repeat;
+  box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.2);
+  -webkit-mask: none;
+  mask: none;
+}
+
+/* ══ 窄屏 ══
+   用户身份栏在 440px 以下只留图标（同生产）；四个方案都把触控目标放到 36px。 */
+@container user-header (max-width: 440px) {
+  :root[data-tb] .user-dhead-tools .btn.user-dact {
+    width: 36px;
+    height: 36px;
+    min-height: 36px;
+    padding: 0;
+  }
+  :root[data-tb='c'] .user-dhead-tools .user-dacts .btn.user-dact {
+    width: 32px;
+    height: 32px;
+    min-height: 32px;
+  }
+}
+
+/* ══ 评审条（不属于产品，虚线框）══ */
+.mk-dock {
+  position: fixed;
+  left: 50%;
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  z-index: 2147483000;
+  transform: translateX(-50%);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  max-width: calc(100vw - 24px);
+  padding: 8px 10px;
+  border: 1px dashed color-mix(in srgb, var(--ink-3) 60%, transparent);
+  border-radius: 14px;
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+  backdrop-filter: blur(14px) saturate(1.4);
+  box-shadow: var(--shadow);
+  color: var(--ink-2);
+  font: 12px/1.4 var(--sans);
+}
+.mk-dock.folded {
+  padding: 4px;
+}
+.mk-dock-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.mk-dock-note {
+  flex: 1 1 220px;
+  min-width: 0;
+  max-width: 420px;
+  margin: 0;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.mk-fold,
+.mk-unfold {
+  appearance: none;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--ink-3);
+  font: 12px var(--sans);
+  cursor: pointer;
+}
+.mk-fold {
+  width: 26px;
+  height: 26px;
+  margin-left: auto;
+  font-size: 15px;
+}
+.mk-unfold {
+  padding: 5px 10px;
+}
+.mk-fold:hover,
+.mk-unfold:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+@media (max-width: 720px) {
+  .mk-dock {
+    left: 12px;
+    right: 12px;
+    transform: none;
+    max-width: none;
+  }
+  /* 五个方案在手机宽度放不下：第一行横向滚动，收起按钮留在行尾。 */
+  .mk-dock-row:first-child {
+    flex-wrap: nowrap;
+  }
+  .mk-dock-row:first-child > .segsw {
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .mk-dock-row:first-child > .segsw > button {
+    flex: none;
+  }
+}

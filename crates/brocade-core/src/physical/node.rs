@@ -1323,6 +1323,21 @@ fn xray_hop_inbounds(
                     label: hop.credential.label.clone(),
                 });
             }
+            if !matches!(hop_in.security, HopWire::Shadowsocks2022 { .. }) {
+                let ordinary = clients.clone();
+                for client in ordinary {
+                    clients.push(XrayClientPlan {
+                        uuid: crate::model::probe_dns_uuid(&client.uuid),
+                        label: crate::model::probe_dns_label(&client.label),
+                    });
+                    for family in [crate::model::IpFamily::V4, crate::model::IpFamily::V6] {
+                        clients.push(XrayClientPlan {
+                            uuid: crate::model::probe_family_uuid(&client.uuid, family),
+                            label: crate::model::probe_family_label(&client.label, family),
+                        });
+                    }
+                }
+            }
             // A port with no clients admits no connection, and leaving it open only
             // exposes one more listening address.
             if clients.is_empty() {
@@ -1562,18 +1577,36 @@ fn xray_egress_dns(policies: &[crate::model::NodeEgressDnsPolicy]) -> Vec<XrayEg
             continue;
         }
         let resolution = &policy.resolution;
-        plans.push(XrayEgressDnsPlan {
-            tag: custom_dns_policy_tag(None, resolution, policy.position, &domains),
-            outbound_tag: custom_egress_tag(None, resolution),
-            address: resolution.address.clone(),
-            port: resolution.port,
-            transport: resolution.transport,
-            address_strategy: resolution.address_strategy,
-            fallback: resolution.fallback,
-            domains,
-        });
+        let tag = custom_dns_policy_tag(None, resolution, policy.position, &domains);
+        for address in resolution.address.as_slice() {
+            plans.push(XrayEgressDnsPlan {
+                tag: tag.clone(),
+                outbound_tag: custom_egress_tag(None, resolution),
+                address: address.clone(),
+                port: resolution.port,
+                transport: resolution.transport,
+                address_strategy: resolution.address_strategy,
+                fallback: resolution.fallback,
+                domains: domains.clone(),
+            });
+        }
     }
     plans
+}
+
+/// Reconcile diagnostic policy tags against the same canonical identity used in
+/// generated Xray configuration. No geosite interpretation belongs in Console.
+pub fn egress_dns_policy_tag(policy: &crate::model::NodeEgressDnsPolicy) -> Option<String> {
+    policy.selector.canonical_egress_dns_selector()?;
+    let mut domains = custom_dns_domains(&policy.selector)?;
+    domains.sort();
+    domains.dedup();
+    Some(custom_dns_policy_tag(
+        None,
+        &policy.resolution,
+        policy.position,
+        &domains,
+    ))
 }
 
 fn custom_dns_domains(dest_match: &DestMatch) -> Option<Vec<String>> {
@@ -1626,7 +1659,12 @@ fn custom_dns_identity(send_through: Option<IpAddr>, resolution: &EgressDnsResol
     hasher.update(b"brocade/egress-dns/v1");
     hasher.update(send_through.map(|ip| ip.to_string()).unwrap_or_default());
     hasher.update([0]);
-    hasher.update(resolution.address.trim().as_bytes());
+    for (index, address) in resolution.address.as_slice().iter().enumerate() {
+        if index > 0 {
+            hasher.update([0]);
+        }
+        hasher.update(address.trim().as_bytes());
+    }
     hasher.update([0]);
     hasher.update(resolution.port.to_le_bytes());
     hasher.update([
@@ -1814,6 +1852,84 @@ fn xray_routing_rules(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Vec<Xray
                 )]));
             }
 
+            // Preserve every match and its order; only the diagnostic credential selects
+            // a family-specific forward/egress. Ordinary users retain the original table.
+            for family in [
+                Some(crate::model::IpFamily::V4),
+                Some(crate::model::IpFamily::V6),
+                None,
+            ] {
+                let label = |base: &str| match family {
+                    Some(family) => crate::model::probe_family_label(base, family),
+                    None => crate::model::probe_dns_label(base),
+                };
+                let transport_tag = |base: &str| match family {
+                    Some(family) => crate::model::probe_family_tag(base, family),
+                    None => crate::model::probe_dns_tag(base),
+                };
+                let mut users = Vec::new();
+                if let Some(accept) = &step.accept {
+                    users.push(label(&accept.label));
+                }
+                users.extend(
+                    app.ingresses
+                        .iter()
+                        .filter(|ingress| ingress.chain == step.chain && ingress.node == node_id)
+                        .map(|ingress| label(&crate::model::probe_label(&ingress.id))),
+                );
+                if users.is_empty() {
+                    continue;
+                }
+                for rule in &step.rules {
+                    let dest_match = if family.is_none() {
+                        let Some(value) = https_dns_probe_match(&rule.dest_match) else {
+                            continue;
+                        };
+                        value
+                    } else {
+                        rule.dest_match.clone()
+                    };
+                    let base = action_tag(app, &step.chain, &step.node, rule);
+                    let supported_forward =
+                        rule.action.forward_ref(&step.chain).is_some_and(|forward| {
+                            !forward.dial.is_reverse()
+                                && app.hops.iter().any(|hop| {
+                                    hop.chain == step.chain
+                                        && hop.from == node_id
+                                        && hop.to == forward.target_node
+                                        && hop.target_chain == forward.target_chain
+                                        && !matches!(
+                                            hop.security,
+                                            HopDialWire::Shadowsocks2022 { .. }
+                                        )
+                                })
+                        });
+                    let outbound_tag = match &rule.action {
+                        Action::Block => base,
+                        Action::Egress { .. } if family.is_none() => "probe:dns".into(),
+                        Action::Egress { .. } => transport_tag(&base),
+                        _ if supported_forward => transport_tag(&base),
+                        _ => "out:probe-family-unsupported".to_owned(),
+                    };
+                    rules.push(XrayRoutingRulePlan {
+                        selector: XrayRuleSelector::Users(users.clone()),
+                        dest_match,
+                        source_ips: Vec::new(),
+                        outbound_tag,
+                    });
+                }
+                // The ordinary table falls through to out:forward. Diagnostics must retain
+                // that same exit while enforcing the family (or using its original DNS).
+                rules.push(XrayRoutingRulePlan {
+                    selector: XrayRuleSelector::Users(users),
+                    dest_match: DestMatch::Any,
+                    source_ips: Vec::new(),
+                    outbound_tag: match family {
+                        Some(family) => crate::model::probe_family_tag("out:forward", family),
+                        None => "probe:dns".into(),
+                    },
+                });
+            }
             for selector in selectors {
                 for rule in &step.rules {
                     rules.push(XrayRoutingRulePlan {
@@ -1828,6 +1944,36 @@ fn xray_routing_rules(sys: &SystemIr, apps: &[AppIr], node_id: &str) -> Vec<Xray
     }
 
     rules
+}
+
+// DNS messages themselves are not TLS. Evaluate protocol-dependent rules using the
+// HTTPS request being diagnosed, preserving all destination constraints and rule order.
+fn https_dns_probe_match(value: &DestMatch) -> Option<DestMatch> {
+    match value {
+        DestMatch::SniffingFailed => None,
+        DestMatch::Protocol(protocols) => protocols
+            .iter()
+            .any(|p| p == "tls")
+            .then_some(DestMatch::Any),
+        DestMatch::Network(crate::model::Network::Udp) => None,
+        DestMatch::Network(crate::model::Network::Tcp) => Some(DestMatch::Any),
+        DestMatch::All(values) => {
+            let values = values
+                .iter()
+                .map(https_dns_probe_match)
+                .collect::<Option<Vec<_>>>()?;
+            let values = values
+                .into_iter()
+                .filter(|v| !matches!(v, DestMatch::Any))
+                .collect::<Vec<_>>();
+            Some(if values.is_empty() {
+                DestMatch::Any
+            } else {
+                DestMatch::All(values)
+            })
+        }
+        other => Some(other.clone()),
+    }
 }
 
 fn grant_sync_plan(apps: &[AppIr], node_id: &str) -> GrantSyncPlan {
@@ -1869,6 +2015,20 @@ fn grant_sync_plan(apps: &[AppIr], node_id: &str) -> GrantSyncPlan {
                 flow: ingress.wires.flow().map(str::to_owned),
             });
 
+            let base_uuid = crate::model::probe_uuid(&ingress.identity.private_key, &ingress.id);
+            let base_label = crate::model::probe_label(&ingress.id);
+            clients.push(GrantClientPlan {
+                uuid: crate::model::probe_dns_uuid(&base_uuid),
+                label: crate::model::probe_dns_label(&base_label),
+                flow: ingress.wires.flow().map(str::to_owned),
+            });
+            for family in [crate::model::IpFamily::V4, crate::model::IpFamily::V6] {
+                clients.push(GrantClientPlan {
+                    uuid: crate::model::probe_family_uuid(&base_uuid, family),
+                    label: crate::model::probe_family_label(&base_label, family),
+                    flow: ingress.wires.flow().map(str::to_owned),
+                });
+            }
             clients.sort_by(|a, b| a.label.cmp(&b.label));
 
             // One update per listener rather than per ingress. A two-wire ingress has two
@@ -2202,4 +2362,25 @@ fn reverse_dial_tag(app: &AppIr, chain: &str, from: &str) -> String {
 // outbound list derive the tag from one definition.
 fn egress_tag(send_through: Option<IpAddr>) -> String {
     routing_egress_tag(send_through.as_ref())
+}
+
+#[cfg(test)]
+mod unlock_dns_tests {
+    use super::*;
+    #[test]
+    fn original_https_protocol_and_sniffing_context_select_the_dns_exit() {
+        let domain = DestMatch::DomainSuffix(vec!["youtube.com".into()]);
+        assert_eq!(
+            https_dns_probe_match(&DestMatch::All(vec![
+                domain.clone(),
+                DestMatch::Protocol(vec!["tls".into()])
+            ])),
+            Some(DestMatch::All(vec![domain]))
+        );
+        assert_eq!(https_dns_probe_match(&DestMatch::SniffingFailed), None);
+        assert_eq!(
+            https_dns_probe_match(&DestMatch::Protocol(vec!["http".into()])),
+            None
+        );
+    }
 }

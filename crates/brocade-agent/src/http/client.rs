@@ -98,6 +98,42 @@ fn build(
     family: Option<AddressFamily>,
     tls: Arc<rustls::ClientConfig>,
 ) -> Result<reqwest::blocking::Client, String> {
+    build_with_proxy(class, family, tls, None)
+}
+pub(super) fn diagnostic_family(
+    family: AddressFamily,
+) -> Result<reqwest::blocking::Client, String> {
+    build(TrafficClass::Public, Some(family), tls_config()?)
+}
+pub(super) fn socks(port: u16) -> Result<reqwest::blocking::Client, String> {
+    build_with_proxy(TrafficClass::Public, None, tls_config()?, Some(port))
+}
+fn build_with_proxy(
+    class: TrafficClass,
+    family: Option<AddressFamily>,
+    tls: Arc<rustls::ClientConfig>,
+    socks_proxy: Option<u16>,
+) -> Result<reqwest::blocking::Client, String> {
+    // reqwest keeps ALPN unchanged for preconfigured rustls clients. Advertise the
+    // HTTP/1.1 transport we actually support; some public edges reject absent ALPN.
+    // Clone first so control and WebSocket TLS retain their existing configuration.
+    let tls = match class {
+        TrafficClass::Control => tls,
+        TrafficClass::Public => {
+            let mut config = (*tls).clone();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            // A ticket obtained through one chain/family must not be resumed on another
+            // exit. Cloning ClientConfig otherwise shares its global session store.
+            config.resumption = if socks_proxy.is_some() {
+                // A routing graph can select different exits for the same host.
+                // Anonymous chain readings must not inherit an earlier exit's ticket.
+                rustls::client::Resumption::disabled()
+            } else {
+                rustls::client::Resumption::in_memory_sessions(32)
+            };
+            Arc::new(config)
+        }
+    };
     let resolver = match class {
         TrafficClass::Control => resolver::control(),
         TrafficClass::Public => resolver::public(),
@@ -124,6 +160,14 @@ fn build(
             "brocade-agent/{}",
             crate::identity::self_identity()
         ));
+    if let Some(port) = socks_proxy {
+        // The `h` carries the destination hostname through the chain. Environment NO_PROXY
+        // never bypasses this explicit loopback proxy, and failure never falls back to direct.
+        builder = builder.proxy(
+            reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))
+                .map_err(|error| diagnostic::category(&error))?,
+        );
+    }
     if let Some(family) = family {
         builder = builder.local_address(match family {
             AddressFamily::V4 => std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),

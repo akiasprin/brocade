@@ -6,36 +6,10 @@ import type { SourceAccessNode } from '../api';
 import { ErrorBox } from '../ui/bits';
 import { DialogClose, DialogLayer } from '../ui/dialog';
 import { Icon } from '../ui/icons';
+import { canonicalSourceIp } from '../ui/source-address';
 import { useNodeNames } from '../ui/node-name';
 import { SOURCE_ACCESS_PHASE_TEXT } from './source-access';
 import './user-source-access.css';
-
-/**
- * 输入地址的规范写法，与 Console 的 normalize_ip 结果一致：IPv6 按 RFC 5952 压缩为小写，
- * IPv4-mapped IPv6 写成 IPv4。只用来对照已知来源和名单；认不出的输入照原样提交，由 Console 给出校验结论。
- */
-export function canonicalSourceIp(raw: string): string | null {
-  const value = raw.trim();
-  if (!value || /[\s/%[\]]/.test(value)) return null;
-  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value);
-  if (v4) {
-    const parts = v4.slice(1);
-    if (parts.some(part => (part.length > 1 && part.startsWith('0')) || Number(part) > 255)) return null;
-    return parts.map(Number).join('.');
-  }
-  if (!value.includes(':')) return null;
-  let host: string;
-  try {
-    host = new URL(`http://[${value}]/`).hostname.slice(1, -1);
-  } catch {
-    return null;
-  }
-  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
-  if (!mapped) return host;
-  const high = parseInt(mapped[1], 16);
-  const low = parseInt(mapped[2], 16);
-  return [high >> 8, high & 255, low >> 8, low & 255].join('.');
-}
 
 type RolloutTone = 'ok' | 'gold' | 'err';
 

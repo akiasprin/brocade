@@ -7,6 +7,7 @@
     ],
     "tag": "api"
   },
+  "brocadeUnlockIpFamilies": 2,
   "burstObservatory": {
     "pingConfig": {
       "destination": "http://www.gstatic.com/generate_204",
@@ -495,6 +496,268 @@
       "tag": "out:egress"
     },
     {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "ForceIPv4"
+      },
+      "tag": "out:forward:probe-v4"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.2",
+            "port": 20002,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "fbb4c37c-825e-4d5b-8c83-1fcccd49bf8f"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:brc/c-brc-smart>sg-01:probe-v4"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.2",
+            "port": 20001,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "dffd43c6-26ad-47bc-a3bb-808854668cc2"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:lin/c-lin-au>sg-01:probe-v4"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.2",
+            "port": 20000,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "8cac9293-a7c8-484b-b8ac-7a327450edfa"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:lin/c-lin-us>sg-01:probe-v4"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "ForceIPv4"
+      },
+      "tag": "out:egress:probe-v4"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "ForceIPv6"
+      },
+      "tag": "out:forward:probe-v6"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.2",
+            "port": 20002,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "c859e79b-7767-4d01-a8f9-54d8c836b1cd"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:brc/c-brc-smart>sg-01:probe-v6"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.2",
+            "port": 20001,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "1e756064-ce2c-4800-805b-2bac0120507a"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:lin/c-lin-au>sg-01:probe-v6"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.2",
+            "port": 20000,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "e125e3ff-abed-4f80-987c-69bdd3073a4f"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "out:lin/c-lin-us>sg-01:probe-v6"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "ForceIPv6"
+      },
+      "tag": "out:egress:probe-v6"
+    },
+    {
+      "protocol": "dns",
+      "settings": {},
+      "tag": "probe:dns"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.2",
+            "port": 20002,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "3bbac2e7-df2d-483d-b6cc-f3765fb3fb9f"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "probe:dns:out:brc/c-brc-smart>sg-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.2",
+            "port": 20001,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "8c67a587-8b0f-4e2a-9761-364f64fcbdd2"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "probe:dns:out:lin/c-lin-au>sg-01"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "10.66.0.2",
+            "port": 20000,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "fa3c76e4-56f5-4217-b5f7-c0e6a46ee164"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "sockopt": {
+          "tcpFastOpen": true
+        }
+      },
+      "tag": "probe:dns:out:lin/c-lin-us>sg-01"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "out:probe-family-unsupported"
+    },
+    {
       "protocol": "blackhole",
       "tag": "out:block"
     },
@@ -550,7 +813,7 @@
           "api"
         ],
         "outboundTag": "api",
-        "ruleTag": "r:0210603f:000",
+        "ruleTag": "r:0c2d264c:000",
         "type": "field"
       },
       {
@@ -561,7 +824,7 @@
           "in:brc/i-brc-hk:guard"
         ],
         "outboundTag": "out:internal",
-        "ruleTag": "r:0210603f:001",
+        "ruleTag": "r:0c2d264c:001",
         "type": "field"
       },
       {
@@ -572,7 +835,7 @@
           "in:frt/i-frt-hk:guard"
         ],
         "outboundTag": "out:internal",
-        "ruleTag": "r:0210603f:002",
+        "ruleTag": "r:0c2d264c:002",
         "type": "field"
       },
       {
@@ -583,7 +846,7 @@
           "in:lin/i-lin-au:guard"
         ],
         "outboundTag": "out:internal",
-        "ruleTag": "r:0210603f:003",
+        "ruleTag": "r:0c2d264c:003",
         "type": "field"
       },
       {
@@ -594,7 +857,7 @@
           "in:lin/i-lin-us:guard"
         ],
         "outboundTag": "out:internal",
-        "ruleTag": "r:0210603f:004",
+        "ruleTag": "r:0c2d264c:004",
         "type": "field"
       },
       {
@@ -605,8 +868,89 @@
           "in:lin/i-lin-us:guard"
         ],
         "outboundTag": "out:reality-guard",
-        "ruleTag": "r:0210603f:005",
+        "ruleTag": "r:0c2d264c:005",
         "type": "field"
+      },
+      {
+        "domain": [
+          "geosite:category-ads"
+        ],
+        "outboundTag": "out:block",
+        "ruleTag": "r:0c2d264c:006",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-brc-hk"
+        ]
+      },
+      {
+        "outboundTag": "out:brc/c-brc-smart>sg-01:probe-v4",
+        "ruleTag": "r:0c2d264c:007",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-brc-hk"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:0c2d264c:008",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-brc-hk"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:category-ads"
+        ],
+        "outboundTag": "out:block",
+        "ruleTag": "r:0c2d264c:009",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-brc-hk"
+        ]
+      },
+      {
+        "outboundTag": "out:brc/c-brc-smart>sg-01:probe-v6",
+        "ruleTag": "r:0c2d264c:010",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-brc-hk"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:0c2d264c:011",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-brc-hk"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:category-ads"
+        ],
+        "outboundTag": "out:block",
+        "ruleTag": "r:0c2d264c:012",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-brc-hk"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns:out:brc/c-brc-smart>sg-01",
+        "ruleTag": "r:0c2d264c:013",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-brc-hk"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:0c2d264c:014",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-brc-hk"
+        ]
       },
       {
         "domain": [
@@ -616,7 +960,7 @@
           "in:brc/i-brc-hk"
         ],
         "outboundTag": "out:block",
-        "ruleTag": "r:0210603f:006",
+        "ruleTag": "r:0c2d264c:015",
         "type": "field"
       },
       {
@@ -624,8 +968,92 @@
           "in:brc/i-brc-hk"
         ],
         "outboundTag": "out:brc/c-brc-smart>sg-01",
-        "ruleTag": "r:0210603f:007",
+        "ruleTag": "r:0c2d264c:016",
         "type": "field"
+      },
+      {
+        "domain": [
+          "domain:au1.example.net",
+          "domain:us1.example.net"
+        ],
+        "outboundTag": "out:egress:probe-v4",
+        "ruleTag": "r:0c2d264c:017",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-frt-hk"
+        ]
+      },
+      {
+        "outboundTag": "out:block",
+        "ruleTag": "r:0c2d264c:018",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-frt-hk"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:0c2d264c:019",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-frt-hk"
+        ]
+      },
+      {
+        "domain": [
+          "domain:au1.example.net",
+          "domain:us1.example.net"
+        ],
+        "outboundTag": "out:egress:probe-v6",
+        "ruleTag": "r:0c2d264c:020",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-frt-hk"
+        ]
+      },
+      {
+        "outboundTag": "out:block",
+        "ruleTag": "r:0c2d264c:021",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-frt-hk"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:0c2d264c:022",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-frt-hk"
+        ]
+      },
+      {
+        "domain": [
+          "domain:au1.example.net",
+          "domain:us1.example.net"
+        ],
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:0c2d264c:023",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-frt-hk"
+        ]
+      },
+      {
+        "outboundTag": "out:block",
+        "ruleTag": "r:0c2d264c:024",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-frt-hk"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:0c2d264c:025",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-frt-hk"
+        ]
       },
       {
         "domain": [
@@ -636,7 +1064,7 @@
           "in:frt/i-frt-hk"
         ],
         "outboundTag": "out:egress",
-        "ruleTag": "r:0210603f:008",
+        "ruleTag": "r:0c2d264c:026",
         "type": "field"
       },
       {
@@ -644,16 +1072,145 @@
           "in:frt/i-frt-hk"
         ],
         "outboundTag": "out:block",
-        "ruleTag": "r:0210603f:009",
+        "ruleTag": "r:0c2d264c:027",
         "type": "field"
+      },
+      {
+        "outboundTag": "out:lin/c-lin-au>sg-01:probe-v4",
+        "ruleTag": "r:0c2d264c:028",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-lin-au"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:0c2d264c:029",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-lin-au"
+        ]
+      },
+      {
+        "outboundTag": "out:lin/c-lin-au>sg-01:probe-v6",
+        "ruleTag": "r:0c2d264c:030",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-lin-au"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:0c2d264c:031",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-lin-au"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns:out:lin/c-lin-au>sg-01",
+        "ruleTag": "r:0c2d264c:032",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-lin-au"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:0c2d264c:033",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-lin-au"
+        ]
       },
       {
         "inboundTag": [
           "in:lin/i-lin-au"
         ],
         "outboundTag": "out:lin/c-lin-au>sg-01",
-        "ruleTag": "r:0210603f:010",
+        "ruleTag": "r:0c2d264c:034",
         "type": "field"
+      },
+      {
+        "domain": [
+          "geosite:category-ads"
+        ],
+        "outboundTag": "out:block",
+        "ruleTag": "r:0c2d264c:035",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-lin-us"
+        ]
+      },
+      {
+        "outboundTag": "out:lin/c-lin-us>sg-01:probe-v4",
+        "ruleTag": "r:0c2d264c:036",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-lin-us"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:0c2d264c:037",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-lin-us"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:category-ads"
+        ],
+        "outboundTag": "out:block",
+        "ruleTag": "r:0c2d264c:038",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-lin-us"
+        ]
+      },
+      {
+        "outboundTag": "out:lin/c-lin-us>sg-01:probe-v6",
+        "ruleTag": "r:0c2d264c:039",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-lin-us"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:0c2d264c:040",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-lin-us"
+        ]
+      },
+      {
+        "domain": [
+          "geosite:category-ads"
+        ],
+        "outboundTag": "out:block",
+        "ruleTag": "r:0c2d264c:041",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-lin-us"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns:out:lin/c-lin-us>sg-01",
+        "ruleTag": "r:0c2d264c:042",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-lin-us"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:0c2d264c:043",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-lin-us"
+        ]
       },
       {
         "domain": [
@@ -663,7 +1220,7 @@
           "in:lin/i-lin-us"
         ],
         "outboundTag": "out:block",
-        "ruleTag": "r:0210603f:011",
+        "ruleTag": "r:0c2d264c:044",
         "type": "field"
       },
       {
@@ -671,7 +1228,7 @@
           "in:lin/i-lin-us"
         ],
         "outboundTag": "out:lin/c-lin-us>sg-01",
-        "ruleTag": "r:0210603f:012",
+        "ruleTag": "r:0c2d264c:045",
         "type": "field"
       },
       {
@@ -679,7 +1236,7 @@
         "domain": [
           "full:invalid.brocade.never-match"
         ],
-        "ruleTag": "r:0210603f:013",
+        "ruleTag": "r:0c2d264c:046",
         "type": "field"
       }
     ]

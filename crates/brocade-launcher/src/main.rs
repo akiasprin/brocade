@@ -4,6 +4,7 @@ mod download;
 mod entry;
 mod paths;
 mod platform;
+mod socket_activation;
 mod upgrade;
 
 use access::AccessArgs;
@@ -113,6 +114,7 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn up(args: UpArgs) -> Result<()> {
+    let activation = socket_activation::SocketActivation::receive()?;
     let access = args.access.resolve()?;
     let paths = LauncherPaths::resolve(args.data_dir.clone(), args.cache_dir.clone())?;
     let _instance = paths::InstanceLock::acquire(&paths.runtime)?;
@@ -162,7 +164,17 @@ async fn up(args: UpArgs) -> Result<()> {
     };
     let bootstrap_token = bootstrap_token(&paths.data, optional_env("BROCADE_BOOTSTRAP_TOKEN")?)?;
     let console_bin = console_binary(args.console_bin.clone())?;
-    let mut console_command = Command::new(&console_bin);
+    let mut console_command = match &activation {
+        Some(activation) => activation.console_command(&console_bin),
+        None => {
+            let mut command = Command::new(&console_bin);
+            command
+                .env_remove("LISTEN_PID")
+                .env_remove("LISTEN_FDS")
+                .env_remove("LISTEN_FDNAMES");
+            command
+        }
+    };
     console_command
         .env("DATABASE_URL", &database_url)
         .env("BROCADE_ADMIN_BIND", access.bind.to_string())

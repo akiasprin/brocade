@@ -51,6 +51,8 @@ pub struct ProbeChainTarget {
     /// Which Brocade machines this chain may exit from directly. A forking chain has several;
     /// see the module header. External proxies are terminal but are not Brocade exit nodes.
     pub exit_nodes: Vec<String>,
+    /// Nodes whose live profile must support family propagation; None is an uncontrolled path.
+    pub family_probe_nodes: Option<Vec<String>>,
     /// Those machines' public addresses, both families included. The IP the endpoint
     /// saw must fall in this set to agree. Empty means the check cannot be made — an
     /// exit is behind NAT on either family, has no public address, or the route may terminate in
@@ -219,6 +221,7 @@ pub fn project_probe(apps: &[AppIr], node_id: &str) -> ProbePlan {
                 xhttp: ingress.wires.xhttp().cloned(),
                 expected_exit_ips: expected_exit_ips(app, &exits),
                 exit_nodes: exits.direct_nodes.into_iter().collect(),
+                family_probe_nodes: family_probe_nodes(apps, &ingress.chain, &ingress.node),
             });
         }
     }
@@ -376,6 +379,15 @@ fn exit_expectation(apps: &[AppIr], chain_id: &str, root: &str) -> ExitExpectati
         let Some(step) = steps.get(&(chain.as_str(), node.as_str())) else {
             continue;
         };
+        // Xray's first outbound is direct when no rule matches. Include that real
+        // fallback in exit capability and expected-address analysis.
+        if !step
+            .rules
+            .iter()
+            .any(|rule| matches!(rule.dest_match, crate::model::DestMatch::Any))
+        {
+            exits.direct_nodes.insert(node.clone());
+        }
         for rule in &step.rules {
             match &rule.action {
                 Action::Egress { .. } => {
@@ -443,6 +455,45 @@ fn sorted_apps(apps: &[AppIr]) -> Vec<&AppIr> {
     let mut apps = apps.iter().collect::<Vec<_>>();
     apps.sort_by(|a, b| a.app_id.cmp(&b.app_id));
     apps
+}
+
+/// Trace the same ordered rule graph without resolving any service domain locally.
+fn family_probe_nodes(apps: &[AppIr], chain: &str, root: &str) -> Option<Vec<String>> {
+    let steps = apps
+        .iter()
+        .flat_map(|app| app.steps.iter())
+        .map(|step| ((step.chain.as_str(), step.node.as_str()), step))
+        .collect::<BTreeMap<_, _>>();
+    let mut queue = VecDeque::from([(chain.to_owned(), root.to_owned())]);
+    let mut visited = BTreeSet::new();
+    let mut nodes = BTreeSet::new();
+    while let Some((chain, node)) = queue.pop_front() {
+        if !visited.insert((chain.clone(), node.clone())) {
+            continue;
+        }
+        let step = steps.get(&(chain.as_str(), node.as_str()))?;
+        if step.hop_in.as_ref().is_some_and(|hop| {
+            matches!(hop.security, crate::model::HopWire::Shadowsocks2022 { .. })
+        }) {
+            return None;
+        }
+        nodes.insert(node.clone());
+        for rule in &step.rules {
+            if matches!(rule.action, Action::Proxy { .. }) {
+                return None;
+            }
+            if let Some(forward) = rule.action.forward_ref(&step.chain) {
+                if forward.dial.is_reverse() {
+                    return None;
+                }
+                queue.push_back((
+                    forward.target_chain.to_owned(),
+                    forward.target_node.to_owned(),
+                ));
+            }
+        }
+    }
+    Some(nodes.into_iter().collect())
 }
 
 #[cfg(test)]

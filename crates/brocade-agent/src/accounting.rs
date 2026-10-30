@@ -830,6 +830,8 @@ mod tests {
             }
         }
         let binary = std::env::var("BROCADE_TEST_XRAY").expect("newly built Xray is required");
+        let old_binary = std::env::var("BROCADE_TEST_XRAY_OLD").unwrap_or_else(|_| binary.clone());
+        let launches = std::cell::Cell::new(0);
         let dir =
             std::env::temp_dir().join(format!("brocade-native-accounting-{}", std::process::id()));
         crate::create_private_dir(&dir).unwrap();
@@ -842,8 +844,21 @@ mod tests {
         };
         let api_address = std::net::SocketAddr::from(([127, 0, 0, 1], port()));
         let inbound_port = port();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addresses = crate::run_command("ip", &["-o", "-4", "addr", "show"]).unwrap();
+        let target_host = addresses
+            .split_whitespace()
+            .filter_map(|value| {
+                value
+                    .split_once('/')
+                    .and_then(|(ip, _)| ip.parse::<std::net::IpAddr>().ok())
+            })
+            .find(|ip| !brocade_core::forwarding::target_ip_is_blocked_by_policy(*ip, true))
+            .expect("accounting fixture needs a permitted local IPv4 address");
+        let listener = TcpListener::bind((target_host, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let target_port = listener.local_addr().unwrap().port();
+        let blocked_cidrs =
+            brocade_core::forwarding::blocked_target_cidrs(true).collect::<Vec<_>>();
         let config = dir.join("xray.json");
         fs::write(&config, serde_json::to_vec(&serde_json::json!({
             "log": {"loglevel": "warning"}, "stats": {},
@@ -851,17 +866,24 @@ mod tests {
             "policy": {"system": {"statsInboundUplink": true, "statsInboundDownlink": true}},
             "inbounds": [
                 {"tag": "api", "listen": "127.0.0.1", "port": api_address.port(), "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}},
-                {"tag": "fwd:7", "listen": "127.0.0.1", "port": inbound_port, "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1", "port": target_port, "network": "tcp"}}
-            ], "outbounds": [{"protocol": "freedom", "tag": "direct"}],
+                {"tag": "fwd:7", "listen": "127.0.0.1", "port": inbound_port, "protocol": "dokodemo-door", "settings": {"address": target_host.to_string(), "port": target_port, "network": "tcp", "forwardingTargetPolicy": {"blocked_cidrs": blocked_cidrs}}}
+            ], "outbounds": [{"protocol": "freedom", "tag": "out:forward", "settings": {"ipsBlocked": []}}],
             "routing": {"rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]}
         })).unwrap()).unwrap();
         let launch = || {
+            let executable = if launches.get() == 0 {
+                &old_binary
+            } else {
+                &binary
+            };
+            launches.set(launches.get() + 1);
+            let log = fs::File::create(dir.join(format!("xray-{}.log", launches.get()))).unwrap();
             let mut child = ChildGuard(
-                Command::new(&binary)
+                Command::new(executable)
                     .args(["run", "-config", config.to_str().unwrap()])
                     .env("XRAY_BROCADE_ACCOUNTING_FILE", journal_path(&dir))
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
+                    .stdout(Stdio::from(log.try_clone().unwrap()))
+                    .stderr(Stdio::from(log))
                     .spawn()
                     .unwrap(),
             );
@@ -885,7 +907,21 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         client.write_all(&[1; 1024]).unwrap();
-        let (mut server, _) = listener.accept().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut server = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "accounting target was not reached: {}",
+                        fs::read_to_string(dir.join("xray-1.log")).unwrap()
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accounting fixture accept: {error}"),
+            }
+        };
         server
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();

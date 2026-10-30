@@ -28,6 +28,8 @@ pub struct UserCyclePeriod {
     pub user_id: String,
     pub starts_at: String,
     pub ends_at: String,
+    pub reset_id: Option<i64>,
+    pub reset_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,12 +91,8 @@ pub async fn preview(
         "SELECT to_char(c.starts_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS starts_at,
                 to_char(c.ends_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ends_at,
                 user_service_state($4::timestamptz, $5::timestamptz, now()) AS service_state,
-                (SELECT coalesce(sum(s.uplink_bytes+s.downlink_bytes),0)::bigint FROM usage_rollups s
-                  WHERE s.tenant_id=u.tenant_id AND s.user_id=u.id
-                    AND s.period_start >= c.starts_at AND s.period_start < c.ends_at) AS access_used,
-                (SELECT coalesce(sum(s.uplink_bytes+s.downlink_bytes),0)::bigint FROM forwarding_usage_rollups s
-                  WHERE s.tenant_id=u.tenant_id AND s.user_id=u.id
-                    AND s.period_start >= c.starts_at AND s.period_start < c.ends_at) AS forwarding_used,
+                (SELECT coalesce(sum(s.uplink_bytes+s.downlink_bytes),0)::bigint FROM user_cycle_access_usage(u.tenant_id,u.id,c.starts_at,c.ends_at) s) AS access_used,
+                (SELECT coalesce(sum(s.uplink_bytes+s.downlink_bytes),0)::bigint FROM user_cycle_forwarding_usage(u.tenant_id,u.id,c.starts_at,c.ends_at) s) AS forwarding_used,
                 CASE u.traffic_accounting_mode WHEN 'double' THEN 2 ELSE 1 END AS multiplier
          FROM users u CROSS JOIN user_traffic_cycle($3, now()) c WHERE u.tenant_id=$1 AND u.id=$2",
     ).bind(tenant).bind(user).bind(i32::from(policy.traffic_reset_day))
@@ -227,8 +225,13 @@ pub async fn cycle_usage(pool: &PgPool, actor: &AdminContext) -> Result<UserCycl
     let pattern = actor.tenant_scope_like_pattern();
     let rows=sqlx::query("SELECT u.tenant_id,u.id AS user_id,
             to_char(c.starts_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS starts_at,
-            to_char(c.ends_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ends_at
+            to_char(c.ends_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS ends_at,
+            state.reset_id,
+            CASE WHEN event.reset_at>=c.starts_at AND event.reset_at<c.ends_at
+                 THEN to_char(event.reset_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS reset_at
         FROM users u CROSS JOIN LATERAL user_traffic_cycle(u.traffic_reset_day,now()) c
+        LEFT JOIN user_cycle_reset_state state ON state.tenant_id=u.tenant_id AND state.user_id=u.id
+        LEFT JOIN user_cycle_resets event ON event.id=state.reset_id
         WHERE ($1::text IS NULL OR u.tenant_id=$1 OR u.tenant_id LIKE $2 ESCAPE '\\') ORDER BY u.tenant_id,u.id")
         .bind(scope).bind(&pattern).fetch_all(&mut *tx).await?;
     let periods = rows
@@ -239,16 +242,22 @@ pub async fn cycle_usage(pool: &PgPool, actor: &AdminContext) -> Result<UserCycl
                 user_id: r.try_get("user_id")?,
                 starts_at: r.try_get("starts_at")?,
                 ends_at: r.try_get("ends_at")?,
+                reset_id: r.try_get("reset_id")?,
+                reset_at: r.try_get("reset_at")?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let rows=sqlx::query("SELECT s.tenant_id,s.user_id,s.app_id,sum(s.uplink_bytes)::bigint AS uplink_bytes,
-            sum(s.downlink_bytes)::bigint AS downlink_bytes,bool_or(s.has_gap) AS has_gap
+    let rows = sqlx::query(
+        "SELECT u.tenant_id,u.id AS user_id,s.app_id,s.uplink_bytes,s.downlink_bytes,s.has_gap
         FROM users u CROSS JOIN LATERAL user_traffic_cycle(u.traffic_reset_day,now()) c
-        JOIN usage_rollups s ON s.tenant_id=u.tenant_id AND s.user_id=u.id AND s.period_start>=c.starts_at AND s.period_start<c.ends_at
+        CROSS JOIN LATERAL user_cycle_access_usage(u.tenant_id,u.id,c.starts_at,c.ends_at) s
         WHERE ($1::text IS NULL OR u.tenant_id=$1 OR u.tenant_id LIKE $2 ESCAPE '\\')
-        GROUP BY s.tenant_id,s.user_id,s.app_id ORDER BY s.tenant_id,s.user_id,s.app_id")
-        .bind(scope).bind(&pattern).fetch_all(&mut *tx).await?;
+        ORDER BY u.tenant_id,u.id,s.app_id",
+    )
+    .bind(scope)
+    .bind(&pattern)
+    .fetch_all(&mut *tx)
+    .await?;
     let views = rows
         .iter()
         .map(|r| {
@@ -262,14 +271,19 @@ pub async fn cycle_usage(pool: &PgPool, actor: &AdminContext) -> Result<UserCycl
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let rows=sqlx::query("SELECT s.tenant_id,s.user_id,s.node_id,s.rule_id,r.name AS rule_name,
-            sum(s.uplink_bytes)::bigint AS uplink_bytes,sum(s.downlink_bytes)::bigint AS downlink_bytes,bool_or(s.has_gap) AS has_gap
+    let rows = sqlx::query(
+        "SELECT u.tenant_id,u.id AS user_id,s.node_id,s.rule_id,r.name AS rule_name,
+            s.uplink_bytes,s.downlink_bytes,s.has_gap
         FROM users u CROSS JOIN LATERAL user_traffic_cycle(u.traffic_reset_day,now()) c
-        JOIN forwarding_usage_rollups s ON s.tenant_id=u.tenant_id AND s.user_id=u.id AND s.period_start>=c.starts_at AND s.period_start<c.ends_at
+        CROSS JOIN LATERAL user_cycle_forwarding_usage(u.tenant_id,u.id,c.starts_at,c.ends_at) s
         JOIN forwarding_rules r ON r.id=s.rule_id
         WHERE ($1::text IS NULL OR u.tenant_id=$1 OR u.tenant_id LIKE $2 ESCAPE '\\')
-        GROUP BY s.tenant_id,s.user_id,s.node_id,s.rule_id,r.name ORDER BY s.tenant_id,s.user_id,s.node_id,s.rule_id")
-        .bind(scope).bind(&pattern).fetch_all(&mut *tx).await?;
+        ORDER BY u.tenant_id,u.id,s.node_id,s.rule_id",
+    )
+    .bind(scope)
+    .bind(&pattern)
+    .fetch_all(&mut *tx)
+    .await?;
     let forwarding = rows
         .iter()
         .map(|r| {

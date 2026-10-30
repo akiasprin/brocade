@@ -755,12 +755,8 @@ fn assemble_chained_client_config(
         .and_then(|outbounds| outbounds.first_mut())
         .ok_or_else(|| "目标拨测配置没有出站".to_owned())?;
     target_outbound["tag"] = serde_json::json!("probe-target");
-    target_outbound["proxySettings"] = serde_json::json!({
-        "tag": "probe-member",
-        // Mihomo's dialer-proxy changes how the target proxy reaches its server. Xray's
-        // transport-layer form has the same boundary; the target protocol still runs above it.
-        "transportLayer": true,
-    });
+    // Chain the transport dialer while preserving the target protocol and its socket options.
+    target_outbound["streamSettings"]["sockopt"]["dialerProxy"] = serde_json::json!("probe-member");
     member_outbound["tag"] = serde_json::json!("probe-member");
     target_config["outbounds"] = serde_json::json!([target_outbound.clone(), member_outbound]);
     serde_json::to_string(&target_config)
@@ -1044,6 +1040,131 @@ struct ProbeProcess {
     log: TempFile,
 }
 
+/// A private SOCKS listener whose only outbound is the selected chain's real ingress.
+/// Its process and credential-bearing files are reaped together when the session is dropped.
+pub struct ChainProbeClient {
+    _process: ProbeProcess,
+    port: u16,
+    trace: Option<TempFile>,
+    trace_ports: std::collections::BTreeMap<String, u16>,
+}
+impl ChainProbeClient {
+    pub fn socks_port(&self) -> u16 {
+        self.port
+    }
+    pub fn trace_path(&self) -> Option<&str> {
+        self.trace.as_ref().map(|file| file.path.as_str())
+    }
+    pub fn trace_port(&self, group: &str) -> Option<u16> {
+        self.trace_ports.get(group).copied()
+    }
+}
+pub fn start_chain_client(
+    target: &E2eProbeTarget,
+    options: &ProbeOptions,
+) -> Result<ChainProbeClient, String> {
+    if options.cancellation.is_cancelled() {
+        return Err("probe canceled".into());
+    }
+    let port = free_local_port().ok_or("no local probe port available")?;
+    let process = spawn_xray(
+        target,
+        None,
+        port,
+        &options.xray_binary,
+        &options.runtime_dir,
+    )?;
+    if !wait_for_listen(port, &options.cancellation) {
+        return Err("chain probe client did not become ready".into());
+    }
+    Ok(ChainProbeClient {
+        _process: process,
+        port,
+        trace: None,
+        trace_ports: Default::default(),
+    })
+}
+
+/// Actual requests use separate private listeners for each service/subitem. Each
+/// accepted connection receives its own random correlation ID in Xray.
+pub fn start_traced_chain_client(
+    target: &E2eProbeTarget,
+    options: &ProbeOptions,
+    groups: &[String],
+) -> Result<ChainProbeClient, String> {
+    if groups.is_empty()
+        || groups.len() > 32
+        || groups.iter().any(|group| {
+            group.is_empty()
+                || group.len() > 96
+                || !group
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        })
+    {
+        return Err("invalid probe trace groups".into());
+    }
+    if options.cancellation.is_cancelled() {
+        return Err("probe canceled".into());
+    }
+    let trace = TempFile::write(&options.runtime_dir, "", ".connections.jsonl")?;
+    let mut ports = std::collections::BTreeMap::new();
+    for group in groups {
+        let mut selected = None;
+        for _ in 0..32 {
+            if let Some(port) = free_local_port() {
+                if !ports.values().any(|p| *p == port) {
+                    selected = Some(port);
+                    break;
+                }
+            }
+        }
+        ports.insert(
+            group.clone(),
+            selected.ok_or("no private probe trace port available")?,
+        );
+    }
+    if ports.len() != groups.len() {
+        return Err("duplicate probe trace group".into());
+    }
+    let port = *ports.values().next().ok_or("no trace listener")?;
+    let process = spawn_xray_config_trace(
+        port,
+        &options.xray_binary,
+        &options.runtime_dir,
+        Some(&trace.path),
+        |log| {
+            let mut config: serde_json::Value =
+                serde_json::from_str(&client_config(target, port, log))
+                    .map_err(|_| "invalid chain client configuration")?;
+            let template = config["inbounds"][0].clone();
+            let inbounds = ports
+                .iter()
+                .map(|(group, port)| {
+                    let mut inbound = template.clone();
+                    inbound["tag"] = serde_json::json!(format!("probe:request:{group}"));
+                    inbound["port"] = serde_json::json!(port);
+                    inbound
+                })
+                .collect::<Vec<_>>();
+            config["inbounds"] = serde_json::json!(inbounds);
+            serde_json::to_string(&config)
+                .map_err(|_| "invalid traced chain client configuration".into())
+        },
+    )?;
+    for port in ports.values() {
+        if !wait_for_listen(*port, &options.cancellation) {
+            return Err("traced chain probe client did not become ready".into());
+        }
+    }
+    Ok(ChainProbeClient {
+        _process: process,
+        port,
+        trace: Some(trace),
+        trace_ports: ports,
+    })
+}
+
 impl ProbeProcess {
     fn kill(&mut self) {
         // Kill this one PID only. Killing by name takes the production xray with
@@ -1147,6 +1268,19 @@ fn spawn_xray_config<F>(
 where
     F: FnOnce(&str) -> Result<String, String>,
 {
+    spawn_xray_config_trace(_socks_port, xray_binary, runtime_dir, None, config)
+}
+
+fn spawn_xray_config_trace<F>(
+    _socks_port: u16,
+    xray_binary: &Path,
+    runtime_dir: &Path,
+    trace_path: Option<&str>,
+    config: F,
+) -> Result<ProbeProcess, String>
+where
+    F: FnOnce(&str) -> Result<String, String>,
+{
     let log = TempFile::write(runtime_dir, "", ".log")?;
     let config = config(&log.path)?;
     let file = TempFile::write(runtime_dir, &config, ".json")?;
@@ -1172,6 +1306,13 @@ where
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    command
+        .env_remove(brocade_deployment::unlock_probe::PROBE_IDENTITY_ENV)
+        .env_remove(brocade_deployment::unlock_probe::PROBE_FILE_ENV)
+        .env_remove(brocade_deployment::unlock_probe::PROBE_PROFILE_ENV);
+    if let Some(path) = trace_path {
+        command.env(brocade_deployment::unlock_probe::PROBE_FILE_ENV, path);
+    }
     kill_probe_with_parent(&mut command);
     let child = command
         .spawn()
@@ -2265,8 +2406,11 @@ mod tests {
             outbounds[0]["settings"]["vnext"][0]["users"][0]["id"],
             "target-user"
         );
-        assert_eq!(outbounds[0]["proxySettings"]["tag"], "probe-member");
-        assert_eq!(outbounds[0]["proxySettings"]["transportLayer"], true);
+        assert_eq!(
+            outbounds[0]["streamSettings"]["sockopt"]["dialerProxy"],
+            "probe-member"
+        );
+        assert!(outbounds[0].get("proxySettings").is_none());
         assert_eq!(outbounds[1]["tag"], "probe-member");
         assert_eq!(
             outbounds[1]["settings"]["vnext"][0]["address"],
@@ -2315,8 +2459,11 @@ mod tests {
             outbounds[0]["settings"]["vnext"][0]["address"],
             "target.example"
         );
-        assert_eq!(outbounds[0]["proxySettings"]["tag"], "probe-member");
-        assert_eq!(outbounds[0]["proxySettings"]["transportLayer"], true);
+        assert_eq!(
+            outbounds[0]["streamSettings"]["sockopt"]["dialerProxy"],
+            "probe-member"
+        );
+        assert!(outbounds[0].get("proxySettings").is_none());
         assert_eq!(outbounds[1]["tag"], "probe-member");
         assert_eq!(outbounds[1]["protocol"], "vless");
         assert_eq!(outbounds[1]["settings"]["address"], "vendor.example");

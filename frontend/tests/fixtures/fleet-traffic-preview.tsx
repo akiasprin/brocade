@@ -2,7 +2,9 @@
 // Serve frontend/ with Vite and open tests/fixtures/fleet-traffic-preview.html?scene=prod.
 // Query: scene=prod|few|solo|crowd|heavy|quiet|degraded|disabled|public|empty, theme=dark|light,
 // w=<frame width>, run=0 freezes the rates (timestamps keep advancing), nav=0 hides the scene bar,
-// delay=<milliseconds> delays content reads for entrance-motion acceptance.
+// delay=<milliseconds> delays content reads for entrance-motion acceptance;
+// auth_delay=<milliseconds> delays only the authorization snapshot so SSE can arrive first;
+// machines=1..48 sets the machine count in the heavy scene.
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ConsoleInitialData, UsageMonthlySummary, Whoami } from '../../src/api';
@@ -21,6 +23,7 @@ const width = Number(params.get('w')) || 1280;
 const frozen = params.get('run') === '0';
 const showNav = params.get('nav') !== '0';
 const readDelay = Math.max(0, Math.min(2000, Number(params.get('delay')) || 0));
+const authorizationDelay = Math.max(0, Math.min(60_000, Number(params.get('auth_delay')) || 0));
 
 /** 1 Mb/s in the bytes-per-second unit the realtime protocol carries. */
 const MB = 1_000_000 / 8;
@@ -186,7 +189,8 @@ const HEAVY_CARRIERS = ['CN2 GIA 4837 高防', 'BGP 三网优化', 'CMIN2 精品
 /** Large readings and long names at once: Gbit/s rates, TiB months, carrier-length machine names,
  * an email-length top user, and more machines than the matrix shows without scrolling. */
 function heavyWorld(): World {
-  const machines: Machine[] = Array.from({ length: 48 }, (_, index) => {
+  const machineCount = Math.max(1, Math.min(48, Number(params.get('machines')) || 48));
+  const machines: Machine[] = Array.from({ length: machineCount }, (_, index) => {
     const [city, country] = CITIES[index % CITIES.length];
     const carrier = HEAVY_CARRIERS[Math.floor(index / CITIES.length) % HEAVY_CARRIERS.length];
     return {
@@ -437,6 +441,7 @@ globalThis.fetch = async (input: RequestInfo | URL) => {
     });
   if (path === '/usage/monthly-summary') return Response.json(monthly(url.searchParams.get('month_offset')));
   if (path === '/realtime/fleet-traffic/snapshot') {
+    if (authorizationDelay > 0) await new Promise(resolve => setTimeout(resolve, authorizationDelay));
     snapshotReads += 1;
     if (streamDown && snapshotReads > 1) return Response.json({ error: 'fixture stream down' }, { status: 503 });
     return Response.json(snapshot());

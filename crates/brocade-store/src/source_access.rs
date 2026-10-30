@@ -100,10 +100,14 @@ impl PgStore {
         authorize(actor, node, tenant, false)?;
         let key = scope(node, tenant, user)?;
         exists(self.pool(), node, tenant, user).await?;
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await?;
         let policy =
             sqlx::query("SELECT revision,ips FROM source_access_policies WHERE scope_key=$1")
                 .bind(key)
-                .fetch_optional(self.pool())
+                .fetch_optional(&mut *tx)
                 .await?;
         let (revision, ips) = match policy {
             Some(row) => (
@@ -112,16 +116,49 @@ impl PgStore {
             ),
             None => (0, Vec::new()),
         };
+        let mut confirmation_revision = revision;
+        let user_bans = if let Some(node) = node {
+            let policies = sqlx::query(
+                "SELECT p.tenant_id,p.user_id,p.revision,p.ips
+                 FROM source_access_policies p WHERE p.user_id IS NOT NULL AND (
+                    EXISTS(SELECT 1 FROM grants g JOIN ingresses i ON i.app_id=g.app_id AND i.id=g.ingress_id
+                        WHERE g.tenant_id=p.tenant_id AND g.user_id=p.user_id AND i.node_id=$1)
+                    OR EXISTS(SELECT 1 FROM quota_suspensions q JOIN ingresses i ON i.app_id=q.app_id AND i.id=q.ingress_id
+                        WHERE q.tenant_id=p.tenant_id AND q.user_id=p.user_id AND i.node_id=$1))
+                 ORDER BY p.tenant_id COLLATE \"C\",p.user_id COLLATE \"C\"",
+            )
+            .bind(node)
+            .fetch_all(&mut *tx)
+            .await?;
+            let mut bans = Vec::new();
+            for policy in policies {
+                // Clearing a user's list also needs confirmation, even though no row is displayed.
+                confirmation_revision = confirmation_revision.max(policy.try_get("revision")?);
+                let ips: Vec<String> = serde_json::from_value(policy.try_get("ips")?)?;
+                if !ips.is_empty() {
+                    bans.push(SourceAccessUser {
+                        tenant_id: policy.try_get("tenant_id")?,
+                        user_id: policy.try_get("user_id")?,
+                        ips,
+                    });
+                }
+            }
+            Some(bans)
+        } else {
+            None
+        };
         // User denials are delivered to infrastructure nodes so new grants and draining
         // generations cannot temporarily escape a ban. Only relevant nodes are displayed.
-        let rows=sqlx::query("SELECT n.id,s.revision,s.supported,s.error,s.reported_at>now()-interval '30 seconds' AS fresh,
+        // Connected Agents heartbeat every 60 seconds; retain confirmation across
+        // ordinary heartbeats and tolerate a missed report without status flapping.
+        let rows=sqlx::query("SELECT n.id,s.revision,s.supported,s.error,s.reported_at>now()-interval '180 seconds' AS fresh,
                 a.agent_protocol_version AS protocol
             FROM nodes n LEFT JOIN source_access_node_state s ON s.node_id=n.id
             LEFT JOIN node_agent_state a ON a.node_id=n.id WHERE n.retired_at IS NULL AND
             (($1::text IS NOT NULL AND n.id=$1) OR ($1::text IS NULL AND (
                 EXISTS(SELECT 1 FROM grants g JOIN ingresses i ON i.app_id=g.app_id AND i.id=g.ingress_id WHERE g.tenant_id=$2 AND g.user_id=$3 AND i.node_id=n.id)
                 OR EXISTS(SELECT 1 FROM quota_suspensions q JOIN ingresses i ON i.app_id=q.app_id AND i.id=q.ingress_id WHERE q.tenant_id=$2 AND q.user_id=$3 AND i.node_id=n.id)))) ORDER BY n.id")
-            .bind(node).bind(tenant).bind(user).fetch_all(self.pool()).await?;
+            .bind(node).bind(tenant).bind(user).fetch_all(&mut *tx).await?;
         let nodes = rows
             .into_iter()
             .map(|row| -> Result<SourceAccessNode> {
@@ -129,7 +166,7 @@ impl PgStore {
                 let fresh = row.try_get::<Option<bool>, _>("fresh")?.unwrap_or(false);
                 let applied = row
                     .try_get::<Option<i64>, _>("revision")?
-                    .is_some_and(|r| r >= revision);
+                    .is_some_and(|r| r >= confirmation_revision);
                 let protocol = row.try_get::<Option<i32>, _>("protocol")?;
                 let phase = if protocol
                     .is_some_and(|version| version < SOURCE_ACCESS_PROTOCOL_VERSION as i32)
@@ -139,8 +176,12 @@ impl PgStore {
                     SourceAccessPhase::Pending
                 } else if supported == Some(false) {
                     SourceAccessPhase::Unsupported
-                } else if row.try_get::<Option<String>, _>("error")?.is_some() {
-                    SourceAccessPhase::Error
+                } else if let Some(error) = row.try_get::<Option<String>, _>("error")? {
+                    if SourceAccessWaitReason::matches_message(&error) {
+                        SourceAccessPhase::Pending
+                    } else {
+                        SourceAccessPhase::Error
+                    }
                 } else if applied {
                     SourceAccessPhase::Applied
                 } else {
@@ -153,10 +194,12 @@ impl PgStore {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        tx.commit().await?;
         Ok(SourceAccessView {
             revision,
             ips,
             nodes,
+            user_bans,
         })
     }
 

@@ -11,10 +11,19 @@ fn no_store(mut response: Response) -> Response {
     response
 }
 
-/// A denied address may never have appeared in the user's presence history, so the list carries
-/// the same local country/operator decoration as presence instead of relying on that history.
+fn source_addresses(view: &SourceAccessView) -> Vec<String> {
+    view.ips
+        .iter()
+        .chain(view.user_bans.iter().flatten().flat_map(|user| &user.ips))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Include both scopes: a user-only denial may never have appeared in presence or the node list.
 async fn located(state: &AppState, view: SourceAccessView) -> ApiResult<Response> {
-    let addresses = view.ips.clone();
+    let addresses = source_addresses(&view);
     Ok(no_store(
         with_source_locations(state, view, addresses)
             .await?
@@ -117,6 +126,27 @@ pub(super) async fn agent_source_access_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brocade_deployment::source_access::SourceAccessUser;
+
+    #[test]
+    fn location_addresses_include_user_only_bans_and_deduplicate_scopes() {
+        let mut view = SourceAccessView {
+            revision: 7,
+            ips: vec!["192.0.2.1".into()],
+            nodes: vec![],
+            user_bans: Some(vec![SourceAccessUser {
+                tenant_id: "platform".into(),
+                user_id: "alice".into(),
+                ips: vec!["192.0.2.1".into(), "2001:db8::1".into()],
+            }]),
+        };
+        assert_eq!(source_addresses(&view), ["192.0.2.1", "2001:db8::1"]);
+        view.ips.clear();
+        assert_eq!(source_addresses(&view), ["192.0.2.1", "2001:db8::1"]);
+        view.user_bans = None;
+        assert!(source_addresses(&view).is_empty());
+    }
+
     #[test]
     fn source_access_routes_are_never_exposed_to_visitors_or_ordinary_users() {
         for path in [

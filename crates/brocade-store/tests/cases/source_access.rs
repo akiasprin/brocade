@@ -14,6 +14,175 @@ fn write(revision: i64, ips: &[&str]) -> SourceAccessWrite {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and Docker PostgreSQL"]
+async fn source_access_node_view_separates_relevant_user_bans_and_confirms_their_revisions() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    let actor = system_admin();
+    sqlx::query("INSERT INTO node_agent_state(node_id,agent_protocol_version) VALUES('n1',45)")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO tenants(id,name) VALUES('platform.other','Other tenant')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO users(tenant_id,id,uuid) VALUES('platform.other','alice','b8dfa1b1-2f29-47f5-8a4e-5b27b3b8d55c')")
+        .execute(db.pool()).await.unwrap();
+    let node = db
+        .store
+        .update_source_access(&actor, Some("n1"), None, None, write(0, &["192.0.2.10"]))
+        .await
+        .unwrap();
+    db.store
+        .report_source_access(
+            "n1",
+            SourceAccessObservation {
+                revision: node.revision,
+                supported: true,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    let user = db
+        .store
+        .update_source_access(
+            &actor,
+            None,
+            Some("platform.acme"),
+            Some("alice"),
+            write(0, &["192.0.2.10", "2001:db8::1"]),
+        )
+        .await
+        .unwrap();
+    // The same user ID in another tenant has no grant here, despite fleet-wide delivery.
+    db.store
+        .update_source_access(
+            &actor,
+            None,
+            Some("platform.other"),
+            Some("alice"),
+            write(0, &["192.0.2.12"]),
+        )
+        .await
+        .unwrap();
+    let view = db
+        .store
+        .source_access_view(&actor, Some("n1"), None, None)
+        .await
+        .unwrap();
+    let expected = vec![SourceAccessUser {
+        tenant_id: "platform.acme".into(),
+        user_id: "alice".into(),
+        ips: user.ips.clone(),
+    }];
+    assert_eq!(view.revision, node.revision);
+    assert_eq!(view.ips, node.ips);
+    assert_eq!(view.user_bans, Some(expected.clone()));
+    assert_eq!(view.nodes[0].phase, SourceAccessPhase::Pending);
+    assert!(db
+        .store
+        .source_access_view(&actor, None, Some("platform.acme"), Some("alice"))
+        .await
+        .unwrap()
+        .user_bans
+        .is_none());
+    assert!(matches!(
+        db.store
+            .source_access_view(&tenant_admin("platform.acme"), Some("n1"), None, None)
+            .await,
+        Err(StoreError::Forbidden(_))
+    ));
+    db.store
+        .report_source_access(
+            "n1",
+            SourceAccessObservation {
+                revision: user.revision,
+                supported: true,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store
+            .source_access_view(&actor, Some("n1"), None, None)
+            .await
+            .unwrap()
+            .nodes[0]
+            .phase,
+        SourceAccessPhase::Applied
+    );
+
+    // Quota suspension retains the user association even after its active grant is removed.
+    sqlx::query("INSERT INTO quota_suspensions(tenant_id,user_id,app_id,ingress_id) VALUES('platform.acme','alice','app-main','ing-a1b2')")
+        .execute(db.pool()).await.unwrap();
+    sqlx::query("DELETE FROM grants WHERE tenant_id='platform.acme' AND user_id='alice'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let cleared = db
+        .store
+        .update_source_access(&actor, Some("n1"), None, None, write(node.revision, &[]))
+        .await
+        .unwrap();
+    assert!(cleared.ips.is_empty());
+    assert_eq!(cleared.user_bans, Some(expected));
+    db.store
+        .report_source_access(
+            "n1",
+            SourceAccessObservation {
+                revision: cleared.revision,
+                supported: true,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    let cleared_user = db
+        .store
+        .update_source_access(
+            &actor,
+            None,
+            Some("platform.acme"),
+            Some("alice"),
+            write(user.revision, &[]),
+        )
+        .await
+        .unwrap();
+    let view = db
+        .store
+        .source_access_view(&actor, Some("n1"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(view.user_bans, Some(vec![]));
+    assert_eq!(view.nodes[0].phase, SourceAccessPhase::Pending);
+    db.store
+        .report_source_access(
+            "n1",
+            SourceAccessObservation {
+                revision: cleared_user.revision,
+                supported: true,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store
+            .source_access_view(&actor, Some("n1"), None, None)
+            .await
+            .unwrap()
+            .nodes[0]
+            .phase,
+        SourceAccessPhase::Applied
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and Docker PostgreSQL"]
 async fn source_access_deleted_policy_invalidates_cached_snapshots_and_keeps_audit() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -62,6 +231,11 @@ async fn source_access_normalizes_persists_combines_scopes_and_audits_without_re
         .fetch_one(db.pool())
         .await
         .unwrap();
+    let migrations: Vec<(i64, Vec<u8>, bool)> =
+        sqlx::query_as("SELECT version,checksum,success FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
     let user = db
         .store
         .update_source_access(
@@ -129,13 +303,13 @@ async fn source_access_normalizes_persists_combines_scopes_and_audits_without_re
         model
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM _sqlx_migrations WHERE version NOT IN (1,2)"
+        sqlx::query_as::<_, (i64, Vec<u8>, bool)>(
+            "SELECT version,checksum,success FROM _sqlx_migrations ORDER BY version"
         )
-        .fetch_one(db.pool())
+        .fetch_all(db.pool())
         .await
         .unwrap(),
-        0
+        migrations
     );
 }
 
@@ -316,6 +490,42 @@ async fn source_access_receipts_cannot_confirm_old_failed_or_unsupported_generat
             Some("awaiting generation".into()),
             SourceAccessPhase::Error,
         ),
+        (
+            policy.revision,
+            true,
+            Some(SourceAccessWaitReason::Revision.message().into()),
+            SourceAccessPhase::Pending,
+        ),
+        (
+            policy.revision,
+            true,
+            Some(SourceAccessWaitReason::Receipt.message().into()),
+            SourceAccessPhase::Pending,
+        ),
+        (
+            policy.revision,
+            true,
+            Some(SourceAccessWaitReason::Configuration.message().into()),
+            SourceAccessPhase::Pending,
+        ),
+        (
+            policy.revision,
+            true,
+            Some(SourceAccessWaitReason::SplitHandoff.message().into()),
+            SourceAccessPhase::Pending,
+        ),
+        (
+            policy.revision,
+            true,
+            Some(SourceAccessWaitReason::GenerationSwitch.message().into()),
+            SourceAccessPhase::Pending,
+        ),
+        (
+            policy.revision,
+            true,
+            Some("Xray 接入策略状态异常，请检查本地策略和回执".into()),
+            SourceAccessPhase::Error,
+        ),
         (policy.revision, true, None, SourceAccessPhase::Applied),
     ] {
         db.store
@@ -359,7 +569,20 @@ async fn source_access_receipts_cannot_confirm_old_failed_or_unsupported_generat
             .phase,
         SourceAccessPhase::Applied
     );
-    sqlx::query("UPDATE source_access_node_state SET reported_at=now()-interval '1 minute'")
+    sqlx::query("UPDATE source_access_node_state SET reported_at=now()-interval '90 seconds'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store
+            .source_access_view(&system_admin(), Some("n1"), None, None)
+            .await
+            .unwrap()
+            .nodes[0]
+            .phase,
+        SourceAccessPhase::Applied
+    );
+    sqlx::query("UPDATE source_access_node_state SET reported_at=now()-interval '181 seconds'")
         .execute(db.pool())
         .await
         .unwrap();

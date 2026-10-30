@@ -198,7 +198,7 @@ async fn deployment_settings_api_defaults_to_unattended_and_requires_system_admi
         get_json(&app, &token, "/deployment-settings").await,
         (
             StatusCode::OK,
-            json!({"unattended": true, "xray_handoff_beta": false})
+            json!({"unattended": true, "xray_handoff_beta": false, "unlock_detection_mode":"scheduled","unlock_detection_interval_hours":24})
         )
     );
     assert_eq!(
@@ -211,12 +211,12 @@ async fn deployment_settings_api_defaults_to_unattended_and_requires_system_admi
         .await,
         (
             StatusCode::OK,
-            json!({"unattended": false, "xray_handoff_beta": false})
+            json!({"unattended": false, "xray_handoff_beta": false, "unlock_detection_mode":"scheduled","unlock_detection_interval_hours":24})
         )
     );
     assert_eq!(
         get_json(&app, &token, "/deployment-settings").await.1,
-        json!({"unattended": false, "xray_handoff_beta": false})
+        json!({"unattended": false, "xray_handoff_beta": false, "unlock_detection_mode":"scheduled","unlock_detection_interval_hours":24})
     );
     assert_eq!(
         put_json(
@@ -228,7 +228,7 @@ async fn deployment_settings_api_defaults_to_unattended_and_requires_system_admi
         .await,
         (
             StatusCode::OK,
-            json!({"unattended":false,"xray_handoff_beta":true})
+            json!({"unattended":false,"xray_handoff_beta":true,"unlock_detection_mode":"scheduled","unlock_detection_interval_hours":24})
         )
     );
     assert_eq!(
@@ -240,8 +240,21 @@ async fn deployment_settings_api_defaults_to_unattended_and_requires_system_admi
         )
         .await
         .1,
-        json!({"unattended":false,"xray_handoff_beta":true}),
+        json!({"unattended":false,"xray_handoff_beta":true,"unlock_detection_mode":"scheduled","unlock_detection_interval_hours":24}),
         "legacy clients cannot clear Beta by saving another field"
+    );
+    assert_eq!(
+        put_json(
+            &app,
+            &token,
+            "/deployment-settings",
+            json!({"unlock_detection_mode":"manual","unlock_detection_interval_hours":24})
+        )
+        .await,
+        (
+            StatusCode::OK,
+            json!({"unattended":false,"xray_handoff_beta":true,"unlock_detection_mode":"manual","unlock_detection_interval_hours":24})
+        )
     );
     let invalid = app
         .clone()
@@ -275,13 +288,44 @@ async fn deployment_settings_api_defaults_to_unattended_and_requires_system_admi
             &app,
             reader,
             "/deployment-settings",
-            json!({"unattended": true})
+            json!({"unattended": true,"unlock_detection_mode":"scheduled","unlock_detection_interval_hours":24})
         )
         .await
         .0,
         StatusCode::FORBIDDEN
     );
     assert!(!db.store.deployment_settings().await.unwrap().unattended);
+    assert_eq!(
+        db.store
+            .deployment_settings()
+            .await
+            .unwrap()
+            .unlock_detection_mode,
+        brocade_store::UnlockDetectionMode::Manual
+    );
+    assert_eq!(
+        post_json(&app, reader, "/unlock-probes/refresh", json!({}))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post_json(&app, &token, "/unlock-probes/refresh", json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        put_json(
+            &app,
+            &token,
+            "/deployment-settings",
+            json!({"unlock_detection_interval_hours":0})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
 }
 
 #[tokio::test]
@@ -494,6 +538,16 @@ async fn node_traffic_statistics_require_signed_in_operators_and_are_never_cache
     assert_eq!(status, StatusCode::OK);
     assert_eq!(inflow["period"], "week");
     assert!(inflow["rows"].is_array() && inflow["idle_users"].is_array());
+    // Source rows carry the same local GeoIP decoration as 在线设备.
+    let (status, details) = get_json(
+        &app,
+        &token,
+        "/nodes/n1/inflow-details?tenant_id=platform.acme&user_id=alice",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(details["rows"].is_array());
+    assert!(details["source_countries"].is_array() && details["source_operators"].is_array());
     let (status, sites) = get_json(&app, &token, "/nodes/n1/site-usage?period=month").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(sites["bucket_secs"], 86_400);
@@ -1602,13 +1656,9 @@ async fn initial_html_uses_current_branding_without_default_title_flash() {
         let bootstrap: Value = serde_json::from_str(raw).unwrap();
         assert_eq!(bootstrap["site_name"], name);
         if path == "/" {
-            assert!(
-                html.contains("<title>我的站点 | Invisible networks. Infallible control.</title>")
-            );
+            assert!(html.contains("<title>我的站点</title>"));
         } else {
-            assert!(html.contains(
-                "<title>新站点 &lt;/script&gt;&lt;b&gt;&amp; | Invisible networks. Infallible control.</title>"
-            ));
+            assert!(html.contains("<title>新站点 &lt;/script&gt;&lt;b&gt;&amp;</title>"));
         }
     }
 }
@@ -6293,12 +6343,14 @@ async fn http_forwarding_tcp_ping_is_manual_scoped_fenced_and_shared_across_list
     sqlx::query("INSERT INTO nodes(id,name,tenant_id,public_ipv4,overlay_addr,wg_private_key,wg_public_key,wg_listen_port,api_port,overlay,egress_allowed,dns_kind,dns_servers) SELECT 'n2','Other node',tenant_id,'n2.example.net','10.66.0.2','wg-private-2','wg-public-2',wg_listen_port,api_port,overlay,egress_allowed,dns_kind,dns_servers FROM nodes WHERE id='n1'")
         .execute(db.pool()).await.unwrap();
     let token = admin_token(&db).await;
+    let realtime = RealtimeService::new(Default::default());
+    let mut channel = realtime.register_agent("n1".into()).await;
     let services = ConsoleServices::new(
         Default::default(),
         Default::default(),
         Default::default(),
         brocade_console::geoip::GeoIpLookup::default(),
-        RealtimeService::new(Default::default()),
+        realtime,
     );
     let agent = services
         .clone()
@@ -6362,6 +6414,28 @@ async fn http_forwarding_tcp_ping_is_manual_scoped_fenced_and_shared_across_list
         .await
         .unwrap();
     assert_eq!(own.status(), StatusCode::ACCEPTED);
+    assert!(
+        channel.changes.borrow_and_update()
+            [brocade_deployment::agent_channel::WakeDomain::ForwardingProbe as usize]
+            > 0,
+        "a manually queued probe must wake the connected Agent on the shared service"
+    );
+    let probe_version = channel.changes.borrow_and_update()
+        [brocade_deployment::agent_channel::WakeDomain::Probe as usize];
+    let (settings_status, settings) = get_json(&app, &token, "/ping-probe/settings").await;
+    assert_eq!(settings_status, StatusCode::OK);
+    assert_eq!(
+        put_json(&app, &token, "/ping-probe/settings", settings)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert!(
+        channel.changes.borrow_and_update()
+            [brocade_deployment::agent_channel::WakeDomain::Probe as usize]
+            > probe_version,
+        "saving ping probe settings must wake the settings workers immediately"
+    );
     let started = response_json(own).await;
     let job = started["id"].as_str().unwrap();
     assert_eq!(started["state"], "queued");
@@ -10932,3 +11006,243 @@ async fn http_forwarding_target_policy_keeps_legacy_public_rules_and_reports_upg
 
 #[path = "http_integration/user_traffic.rs"]
 mod user_traffic_tests;
+
+#[path = "http_integration/unlock_access.rs"]
+mod unlock_access_tests;
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_unlock_probe_is_scoped_protocol_gated_and_shared_across_listeners() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    sqlx::query("INSERT INTO nodes(id,name,tenant_id,public_ipv4,overlay_addr,wg_private_key,wg_public_key,wg_listen_port,api_port,overlay,egress_allowed,dns_kind,dns_servers) SELECT 'n2','Other node',tenant_id,'n2.example.net','10.66.0.2','wg-private-2','wg-public-2',wg_listen_port,api_port,overlay,egress_allowed,dns_kind,dns_servers FROM nodes WHERE id='n1'").execute(db.pool()).await.unwrap();
+    let token = admin_token(&db).await;
+    let services = ConsoleServices::new(
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        brocade_console::geoip::GeoIpLookup::default(),
+        RealtimeService::new(Default::default()),
+    );
+    let agent = services
+        .clone()
+        .agent_router(db.store.clone(), "http://127.0.0.1".into());
+    let app = admin_router_with_services(db.store.clone(), services);
+    let node_token = db.store.issue_node_token("n1").await.unwrap().token;
+    let other_token = db.store.issue_node_token("n2").await.unwrap().token;
+    let path = "/nodes/n1/unlock-probe";
+    assert_eq!(
+        get_json(&app, &token, path).await,
+        (StatusCode::OK, json!(null))
+    );
+    db.store
+        .record_node_poll_with_protocol("n1", None, Some(45))
+        .await
+        .unwrap();
+    assert_eq!(
+        post_json(&app, &token, path, json!({})).await.0,
+        StatusCode::CONFLICT
+    );
+    db.store
+        .record_node_poll_with_protocol("n1", None, Some(46))
+        .await
+        .unwrap();
+    let started = post_json(&app, &token, path, json!({"url":"http://127.0.0.1"})).await;
+    assert_eq!(started.0, StatusCode::OK, "{}", started.1);
+    assert_eq!(started.1["state"], "queued");
+    assert_eq!(
+        post_json(&app, &token, path, json!({})).await.1["id"],
+        started.1["id"]
+    );
+    async fn agent_request(
+        app: &Router,
+        token: &str,
+        method: &str,
+        path: &str,
+        body: Value,
+        protocol: &str,
+    ) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("x-brocade-protocol-version", protocol)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (
+            status,
+            if bytes.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            },
+        )
+    }
+    let target_path = "/agent/v1/unlock-probe/target";
+    assert_eq!(
+        agent_request(&agent, &node_token, "GET", target_path, Value::Null, "45")
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let other_scheduled =
+        agent_request(&agent, &other_token, "GET", target_path, Value::Null, "46").await;
+    assert_eq!(other_scheduled.0, StatusCode::OK);
+    assert_ne!(other_scheduled.1["probe_id"], started.1["id"]);
+    assert!(other_scheduled.1.get("chain").is_none());
+    let target = agent_request(&agent, &node_token, "GET", target_path, Value::Null, "46").await;
+    assert_eq!(target.0, StatusCode::OK);
+    assert_eq!(target.1, json!({"probe_id": started.1["id"]}));
+    let mut report = json!({"probe_id":started.1["id"], "results":brocade_deployment::unlock_probe::LEGACY_UNLOCK_SERVICES.into_iter().map(|service|json!({"service":service,"status":"failed","code":"network_error","region":null})).collect::<Vec<_>>()});
+    report["results"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|result| result["service"] == "youtube_premium")
+        .unwrap()["youtube"] = json!({
+        "webpage":{"status":"available","code":"web_available","http_status":200,"page_region":"US","topbar_region":null,"privacy_region":"MO"},
+        "premium":{"status":"failed","code":"network_error","http_status":null,"page_region":null,"topbar_region":null,"privacy_region":null},
+        "cdn":{"http_status":null,"node":null,"airport":null,"country":null,"error":"timeout","elapsed_ms":0}
+    });
+    let report_path = "/agent/v1/unlock-probe/report";
+    assert_eq!(
+        agent_request(
+            &agent,
+            &other_token,
+            "POST",
+            report_path,
+            report.clone(),
+            "46"
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        agent_request(
+            &agent,
+            &node_token,
+            "POST",
+            report_path,
+            json!({"probe_id":started.1["id"],"results":[]}),
+            "46"
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            agent_request(
+                &agent,
+                &node_token,
+                "POST",
+                report_path,
+                report.clone(),
+                "46"
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let result = get_json(&app, &token, path).await.1;
+    assert_eq!(result["state"], "complete");
+    assert_eq!(result["results"].as_array().unwrap().len(), 9);
+    let youtube = result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|result| result["service"] == "youtube_premium")
+        .unwrap();
+    assert_eq!(youtube["youtube"]["webpage"]["status"], "available");
+    assert_eq!(youtube["youtube"]["webpage"]["privacy_region"], "MO");
+    assert_eq!(youtube["youtube"]["cdn"]["error"], "timeout");
+    db.store
+        .record_node_poll_with_protocol("n1", None, Some(54))
+        .await
+        .unwrap();
+    let extended_path = "/nodes/n1/unlock-probe?family=v4";
+    let started = post_json(&app, &token, extended_path, json!({})).await;
+    assert_eq!(started.0, StatusCode::OK);
+    let target = agent_request(&agent, &node_token, "GET", target_path, Value::Null, "54").await;
+    assert_eq!(target.0, StatusCode::OK);
+    assert_eq!(target.1["services"].as_array().unwrap().len(), 12);
+    assert_eq!(target.1["family"], "v4");
+    let report = json!({"probe_id":target.1["probe_id"], "family":"v4", "results":brocade_deployment::unlock_probe::UNLOCK_SERVICES.into_iter().map(|service|json!({"service":service,"status":"available","code":"web_available","region":"HK"})).collect::<Vec<_>>()});
+    assert_eq!(
+        agent_request(&agent, &node_token, "POST", report_path, report, "54")
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    let extended = get_json(&app, &token, extended_path).await;
+    assert_eq!(extended.0, StatusCode::OK);
+    assert_eq!(extended.1["results"].as_array().unwrap().len(), 12);
+    for service in ["spotify", "hbo_max", "dazn"] {
+        assert!(extended.1["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|result| result["service"] == service && result["region"] == "HK"));
+    }
+    assert_eq!(
+        get_json(&app, &token, path).await.1["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        9
+    );
+    for (id, role, scope) in [
+        ("unlock-reader", "readonly", "platform.acme"),
+        ("unlock-other", "editor", "other"),
+    ] {
+        if scope == "other" {
+            sqlx::query("INSERT INTO tenants(id,name) VALUES('other','Other')")
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let created = post_json(&app, &token, "/admin/operators", json!({"id":id,"display_name":"Unlock test","role":role,"tenant_scope":scope,"password":"fixture-unlock-password"})).await;
+        assert_eq!(created.0, StatusCode::CREATED);
+        let issued = post_json(
+            &app,
+            &token,
+            &format!("/admin/operators/{id}/token"),
+            json!({}),
+        )
+        .await;
+        let actor = issued.1["token"].as_str().unwrap();
+        if role == "readonly" {
+            assert_eq!(get_json(&app, actor, path).await.0, StatusCode::OK);
+            assert_eq!(
+                post_json(&app, actor, path, json!({})).await.0,
+                StatusCode::FORBIDDEN
+            );
+        } else {
+            assert_eq!(get_json(&app, actor, path).await.0, StatusCode::NOT_FOUND);
+            assert_eq!(
+                post_json(&app, actor, path, json!({})).await.0,
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
+}
+
+#[path = "http_integration/realtime_compression.rs"]
+mod realtime_compression;
+
+#[path = "http_integration/agent_channel.rs"]
+mod agent_channel;

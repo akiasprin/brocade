@@ -135,7 +135,9 @@ export function DiagTable({ diagnostics, names }: { diagnostics: Diagnostic[]; n
                       <td className="c-at" title={d.location}>
                         {at}
                       </td>
-                      <td className="c-msg">{d.message}</td>
+                      <td className="c-msg">
+                        <div className="dg-message">{d.message}</div>
+                      </td>
                     </tr>
                     {open === i && (
                       <tr className="dg-det">

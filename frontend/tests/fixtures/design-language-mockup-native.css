@@ -1,0 +1,542 @@
+/* ═══ B · 原生桌面（macOS 原生应用：系统设置、活动监视器）═══
+   规则：
+   1. 窗口结构：贴边全高侧栏 + 内容窗格。侧栏是半透明的浅灰（暗色为深灰），每项带一个彩色圆角方块图标；
+      内容窗格是白纸（暗色 #1e1e1e），顶部一条工具栏放页面标题与路径。
+   2. 内容用分组框组织：极淡的填充加一条发丝线，圆角 10，不用投影。
+   3. 控件紧凑：24px 高，圆角 6；按钮是白底细描边（暗色为浅灰填充），主按钮是强调色实底。
+   4. 选中态是强调色实底白字（侧栏选中行、菜单高亮），与 macOS 获得焦点的列表一致。
+   5. 字号以 13px 为正文，读数 20px 左右；信息密度四套里最高。 */
+
+:root[data-lang='native']:not([data-theme='light']) {
+  --nt-pane: #1e1e1e;
+  --nt-sidebar: #2a2a2c;
+  --nt-sidebar-line: #000000;
+  --nt-sep: rgba(255, 255, 255, 0.08);
+  --nt-box: rgba(255, 255, 255, 0.04);
+  --nt-box-line: rgba(255, 255, 255, 0.075);
+  --nt-btn: rgba(255, 255, 255, 0.16);
+  --nt-btn-h: rgba(255, 255, 255, 0.22);
+  --nt-btn-edge: inset 0 0.5px 0 rgba(255, 255, 255, 0.18), 0 0.5px 1px rgba(0, 0, 0, 0.4);
+  --nt-track: rgba(255, 255, 255, 0.09);
+  --nt-thumb: #636366;
+  --nt-thumb-edge: inset 0 0.5px 0 rgba(255, 255, 255, 0.2), 0 1px 2px rgba(0, 0, 0, 0.4);
+  --nt-field: rgba(255, 255, 255, 0.055);
+  --nt-field-line: rgba(255, 255, 255, 0.1);
+  --nt-row-alt: rgba(255, 255, 255, 0.025);
+  --ground: var(--nt-pane);
+  --sheet: var(--nt-pane);
+  --card: #262628;
+  --sheet-shadow: none;
+  --float: rgba(42, 42, 44, 0.86);
+  --float-sheet: rgba(42, 42, 44, 0.86);
+  --float-edge: inset 0 0.5px 0 rgba(255, 255, 255, 0.14);
+}
+:root[data-lang='native'][data-theme='light'] {
+  --nt-pane: #ffffff;
+  --nt-sidebar: #e8e8ea;
+  --nt-sidebar-line: #d6d6d8;
+  --nt-sep: rgba(0, 0, 0, 0.08);
+  --nt-box: #f6f6f7;
+  --nt-box-line: rgba(0, 0, 0, 0.065);
+  --nt-btn: #ffffff;
+  --nt-btn-h: #fafafa;
+  --nt-btn-edge: 0 0 0 0.5px rgba(0, 0, 0, 0.16), 0 0.5px 1.5px rgba(0, 0, 0, 0.14);
+  --nt-track: rgba(0, 0, 0, 0.065);
+  --nt-thumb: #ffffff;
+  --nt-thumb-edge: 0 0 0 0.5px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.14);
+  --nt-field: #ffffff;
+  --nt-field-line: rgba(0, 0, 0, 0.16);
+  --nt-row-alt: rgba(0, 0, 0, 0.022);
+  --ground: var(--nt-pane);
+  --sheet: var(--nt-pane);
+  --card: #f6f6f7;
+  --sheet-shadow: none;
+  --float: rgba(246, 246, 248, 0.86);
+  --float-sheet: rgba(246, 246, 248, 0.86);
+  --float-edge: inset 0 0.5px 0 rgba(255, 255, 255, 0.7);
+}
+:root[data-lang='native'] {
+  --r-card: 10px;
+  --r-ctl: 6px;
+  --ctl-h: 24px;
+  /* 侧栏图标块：系统色，避开状态色的绿 / 橙 / 红；通知沿用系统设置的红色块。 */
+  --nt-tile-nodes: #0a84ff;
+  --nt-tile-chains: #32ade6;
+  --nt-tile-users: #5e5ce6;
+  --nt-tile-deploy: #bf5af2;
+  --nt-tile-usage: #8e8e93;
+  --nt-tile-notice: #ff453a;
+}
+:root[data-lang='native'][data-theme='light'] {
+  --nt-tile-nodes: #007aff;
+  --nt-tile-chains: #2ea3d6;
+  --nt-tile-users: #5856d6;
+  --nt-tile-deploy: #af52de;
+  --nt-tile-usage: #8e8e93;
+  --nt-tile-notice: #ff3b30;
+}
+
+:root[data-lang='native'] body,
+:root[data-lang='native'] #stage,
+:root[data-lang='native'] body:has(.forge)::before {
+  background: var(--nt-pane);
+}
+
+/* ── 外壳：贴边侧栏 ── */
+:root[data-lang='native'] .forge:not(.narrow) .fg-desk:not(.is-topo) {
+  display: grid;
+  grid-template-columns: 224px minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+:root[data-lang='native'] .forge:not(.narrow) .fg-desk:not(.is-topo) > * {
+  grid-column: 2;
+  min-width: 0;
+}
+:root[data-lang='native'] .forge:not(.narrow) .fg-desk:not(.is-topo) > .fg-top {
+  grid-column: 1;
+  grid-row: 1 / span 3;
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  align-self: start;
+  box-sizing: border-box;
+  height: 100dvh;
+  margin: 0;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 1px;
+  padding: 14px 10px 10px;
+  border: 0;
+  border-right: 1px solid var(--nt-sidebar-line);
+  border-radius: 0;
+  background: var(--nt-sidebar);
+}
+:root[data-lang='native'] .forge:not(.narrow) .fg-top > .fg-home {
+  justify-content: flex-start;
+  gap: 8px;
+  height: 30px;
+  margin: 0 0 12px;
+  padding: 0 8px;
+  color: var(--action);
+}
+:root[data-lang='native'] .fg-brand {
+  color: var(--ink);
+  font: 600 13px/1 var(--sans);
+}
+:root[data-lang='native'] .forge:not(.narrow) .fg-top > .fg-vr {
+  display: none;
+}
+:root[data-lang='native'] .forge:not(.narrow) .fg-top > .fg-nav {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 1px;
+  overflow: visible;
+}
+:root[data-lang='native'] .forge:not(.narrow) :is(.fg-nv, .fg-top .fg-tgl) {
+  justify-content: flex-start;
+  gap: 8px;
+  width: 100%;
+  height: 30px;
+  padding: 0 7px;
+  border-radius: 6px;
+  color: var(--ink);
+  font-size: 13px;
+}
+:root[data-lang='native'] :is(.fg-nv-ic, .fg-top .fg-tgl-ic) {
+  width: 21px;
+  height: 21px;
+  border-radius: 5px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.2), transparent 60%) var(--nt-tile, var(--nt-tile-usage));
+  color: #ffffff;
+}
+:root[data-lang='native'] :is(.fg-nv-ic, .fg-top .fg-tgl-ic) svg {
+  width: 13px;
+  height: 13px;
+  stroke-width: 1.7px;
+}
+:root[data-lang='native'] .fg-nv[aria-label='机器'] {
+  --nt-tile: var(--nt-tile-nodes);
+}
+:root[data-lang='native'] .fg-nv[aria-label='线路'] {
+  --nt-tile: var(--nt-tile-chains);
+}
+:root[data-lang='native'] .fg-nv[aria-label='用户'] {
+  --nt-tile: var(--nt-tile-users);
+}
+:root[data-lang='native'] .fg-nv[aria-label='发布'] {
+  --nt-tile: var(--nt-tile-deploy);
+}
+:root[data-lang='native'] .fg-nv[aria-label='用量'] {
+  --nt-tile: var(--nt-tile-usage);
+}
+:root[data-lang='native'] .fg-top .fg-tgl {
+  --nt-tile: var(--nt-tile-notice);
+}
+:root[data-lang='native'] .fg-nv[aria-current='true'] {
+  background: var(--primary);
+  box-shadow: none;
+  color: var(--primary-on);
+  font-weight: 500;
+}
+:root[data-lang='native'] .fg-nv[aria-current='true'] .fg-nv-ic {
+  transform: none;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35);
+}
+:root[data-lang='native'] .fg-nv .fg-badge {
+  margin-left: auto;
+}
+:root[data-lang='native'] .forge:not(.narrow) .fg-top > .sp {
+  flex: 1;
+}
+:root[data-lang='native'] .forge:not(.narrow) .fg-top .fg-tgl-label {
+  position: static;
+  width: auto;
+  height: auto;
+  overflow: visible;
+  clip-path: none;
+}
+:root[data-lang='native'] .forge:not(.narrow) .fg-top .fg-tgl .fg-badge {
+  position: static;
+  margin-left: auto;
+  box-shadow: none;
+}
+:root[data-lang='native'] .forge:not(.narrow) .fg-top .fg-who {
+  width: 100%;
+  max-width: none;
+  height: 40px;
+  margin-top: 6px;
+  padding: 0 8px 0 6px;
+  gap: 8px;
+  border-top: 1px solid var(--nt-sep);
+  border-radius: 0;
+  color: var(--ink);
+  font: 13px var(--sans);
+}
+:root[data-lang='native'] .fg-who-plate {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: linear-gradient(180deg, #a5a5aa, #7c7c82);
+  color: #ffffff;
+  font: 600 11px var(--sans);
+}
+:root[data-lang='native'] .forge:not(.narrow) .fg-top .fg-who-caret {
+  margin-left: auto;
+}
+:root[data-lang='native'] .forge:not(.narrow) .fg-top .fg-menuwrap:not(.machine-notification-wrap) > :is(.fg-menu, .fg-pop) {
+  top: auto;
+  right: auto;
+  bottom: calc(100% + 4px);
+  left: 0;
+}
+:root[data-lang='native'] .forge:not(.narrow) .fg-top .machine-notification-wrap > .fg-pop {
+  top: auto;
+  right: auto;
+  bottom: -4px;
+  left: calc(100% + 14px);
+}
+
+/* ── 工具栏：页面标题与路径 ── */
+:root[data-lang='native'] .forge:not(.narrow) .fg-crumb {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  height: 52px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--nt-sep);
+  background: color-mix(in srgb, var(--nt-pane) 84%, transparent);
+  -webkit-backdrop-filter: blur(20px) saturate(1.8);
+  backdrop-filter: blur(20px) saturate(1.8);
+  color: var(--ink-3);
+  font-size: 15px;
+}
+:root[data-lang='native'] .fg-crumb > .cur:first-child {
+  display: inline;
+}
+:root[data-lang='native'] .fg-crumb .cur {
+  color: var(--ink);
+  font: 600 15px var(--display);
+}
+:root[data-lang='native'] .fg-crumb-link {
+  color: var(--ink-3);
+  font: 600 15px var(--display);
+}
+:root[data-lang='native'] .fg-crumb-link:hover {
+  color: var(--ink);
+  text-decoration: none;
+}
+:root[data-lang='native'] .fg-crumb-right {
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+
+/* ── 内容窗格 ── */
+:root[data-lang='native'] :is(.cardpage, .nd-sheet) {
+  margin: 16px 20px 32px;
+}
+/* 列表页：标题已在工具栏，列表容器只剩右侧的操作行。 */
+:root[data-lang='native'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) {
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+:root[data-lang='native'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header {
+  min-height: 26px;
+  margin: 0 0 12px;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+:root[data-lang='native'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header :is(h4, .list-ico) {
+  display: none;
+}
+
+/* 分组框：卡片、面板、图表、读数砖同一种材质 */
+:root[data-lang='native'] .fg-view :is(.panel, .chart-card, .kpi, .ncard, .chain-card) {
+  border: 1px solid var(--nt-box-line);
+  border-radius: 10px;
+  background: var(--nt-box);
+  box-shadow: none;
+}
+:root[data-lang='native'] .ncards {
+  gap: 10px;
+}
+:root[data-lang='native'] .ncard {
+  padding: 12px 12px 10px;
+}
+@media (hover: hover) and (pointer: fine) {
+  :root[data-lang='native'] :is(.ncard, .chain-card):hover {
+    border-color: color-mix(in srgb, var(--action) 55%, var(--nt-box-line));
+  }
+}
+:root[data-lang='native'] .nc-head b,
+:root[data-lang='native'] .chain-card-title {
+  font: 600 13px var(--sans);
+}
+:root[data-lang='native'] .lst-sum {
+  font: 500 19px var(--display);
+}
+:root[data-lang='native'] .nc-dock .btn {
+  height: 22px;
+  min-height: 22px;
+}
+:root[data-lang='native'] .chain-card-grid {
+  gap: 10px;
+}
+:root[data-lang='native'] .chain-section-name {
+  font: 600 13px var(--sans);
+}
+:root[data-lang='native'] .cp-hop {
+  border-radius: 5px;
+}
+
+/* 详情页：内容窗格本身就是纸，页头是窗格顶部的一行 */
+:root[data-lang='native'] .nd-sheet > .nd-paper {
+  --nd-paper-surface: var(--nt-pane);
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+:root[data-lang='native'] .nd-sheet > .nd-paper > .nd-page-head {
+  min-height: 48px;
+  margin: 0 0 14px;
+  padding: 0 0 12px;
+  border-bottom: 1px solid var(--nt-sep);
+  border-radius: 0;
+  background: none;
+}
+:root[data-lang='native'] .nd-sheet > .nd-paper > .nd-page-head .nd-id {
+  font: 600 17px var(--display);
+}
+:root[data-lang='native'] .nd-sheet > .nd-paper > .nd-paper-body {
+  padding: 0;
+}
+:root[data-lang='native'] .nd-sheet .nd-tabs::before {
+  display: none;
+}
+:root[data-lang='native'] .nd-tabs {
+  align-self: center;
+  margin-left: 14px;
+}
+:root[data-lang='native'] .nd-tabs-seg {
+  height: auto;
+  gap: 0;
+  padding: 2px;
+  border-radius: 7px;
+  background: var(--nt-track);
+}
+:root[data-lang='native'] .nd-tabs button {
+  height: 22px;
+  padding: 0 12px;
+  border-radius: 5px;
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 400;
+}
+:root[data-lang='native'] .nd-tabs button[aria-selected='true'] {
+  background: var(--nt-thumb);
+  box-shadow: var(--nt-thumb-edge);
+  color: var(--ink);
+  font-weight: 500;
+}
+:root[data-lang='native'] .nd-tabs button[aria-selected='true'] .nd-tab-ic {
+  color: var(--action);
+}
+
+/* 用户详情：外层不再套框，页头是窗格里的一行 */
+:root[data-lang='native'] .fg-view .panel.user-split-detail {
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+:root[data-lang='native'] .user-dhead {
+  margin: 0 0 4px;
+  border-bottom: 1px solid var(--nt-sep);
+  background: none;
+}
+:root[data-lang='native'] .user-dhead-main {
+  min-height: 52px;
+  grid-template-rows: minmax(52px, auto);
+  padding: 0 2px;
+}
+
+/* 面板标题：框内第一行，13px 粗体，不再大写加字距 */
+:root[data-lang='native']
+  :is(.nd-tab-observed > .panel, .nd-tab-pair > .panel, .panel.config-panel, .panel.titled)
+  > :is(header, summary) {
+  border-bottom-color: var(--nt-sep);
+  background: none;
+}
+:root[data-lang='native']
+  :is(.nd-tab-observed > .panel, .nd-tab-pair > .panel, .panel.config-panel, .panel.titled)
+  > :is(header, summary)
+  h4,
+:root[data-lang='native'] .panel > :is(header, summary) h4 {
+  color: var(--ink);
+  font: 600 13px/1.3 var(--sans);
+  letter-spacing: 0;
+  text-transform: none;
+}
+:root[data-lang='native'] .kpi .kpi-l {
+  color: var(--ink-3);
+  font: 11px var(--sans);
+  text-transform: none;
+}
+:root[data-lang='native'] .kpi .kpi-v {
+  font: 500 20px var(--display);
+}
+:root[data-lang='native'] .kpi-band {
+  gap: 8px;
+}
+
+/* ── 控件：紧凑、圆角 6 ── */
+:root[data-lang='native'] .btn {
+  padding: 0 11px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--nt-btn);
+  box-shadow: var(--nt-btn-edge);
+  color: var(--ink);
+  font-size: 13px;
+}
+@media (hover: hover) {
+  :root[data-lang='native'] .btn:hover:not(:disabled) {
+    background: var(--nt-btn-h);
+  }
+  :root[data-lang='native'] .btn.primary:hover:not(:disabled) {
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0)) var(--primary-hover);
+  }
+}
+:root[data-lang='native'] .btn.primary {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0)) var(--primary);
+  box-shadow:
+    inset 0 0.5px 0 rgba(255, 255, 255, 0.25),
+    0 0.5px 1.5px rgba(0, 0, 0, 0.25);
+  color: var(--primary-on);
+}
+:root[data-lang='native'] .btn.primary:disabled {
+  background: var(--nt-btn);
+  box-shadow: var(--nt-btn-edge);
+  color: var(--ink-4);
+}
+:root[data-lang='native'] .segsw {
+  min-height: 24px;
+  padding: 2px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--nt-track);
+}
+:root[data-lang='native'] .segsw button {
+  padding: 0 11px;
+  border-radius: 5px;
+  color: var(--ink);
+  font-size: 12.5px;
+}
+:root[data-lang='native'] .segsw button[aria-pressed='true'],
+:root[data-lang='native'] .segsw button[aria-pressed='true']:hover:not(:disabled) {
+  background: var(--nt-thumb);
+  box-shadow: var(--nt-thumb-edge);
+  color: var(--ink);
+  font-weight: 500;
+}
+:root[data-lang='native'] :is(input.f, select.f) {
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--nt-field-line);
+  border-radius: 6px;
+  background: var(--nt-field);
+  font-size: 13px;
+}
+:root[data-lang='native'] textarea.f {
+  border: 1px solid var(--nt-field-line);
+  border-radius: 6px;
+  background: var(--nt-field);
+}
+:root[data-lang='native'] :is(input.f, textarea.f, select.f):focus {
+  border-color: var(--action);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--action) 40%, transparent);
+}
+:root[data-lang='native'] .st {
+  padding: 1px 6px;
+  border-color: transparent;
+  border-radius: 4px;
+  background: var(--hover-2);
+  font: 500 11px var(--sans);
+}
+/* 列表与表格：隔行底色 */
+:root[data-lang='native'] .tbl tbody tr:nth-child(even) > td {
+  background: var(--nt-row-alt);
+}
+
+/* ── 浮层：菜单与弹层是系统菜单的半透明材质 ── */
+:root[data-lang='native'] :is(.fg-menu, .fg-pop) {
+  border: 1px solid var(--nt-box-line);
+  border-radius: 10px;
+  box-shadow:
+    var(--float-edge),
+    0 10px 30px rgba(0, 0, 0, 0.24),
+    0 0 0 0.5px rgba(0, 0, 0, 0.18);
+}
+:root[data-lang='native'] .fg-menu {
+  padding: 5px;
+}
+:root[data-lang='native'] .fg-menu button {
+  min-height: 26px;
+  padding: 4px 8px;
+  border-radius: 5px;
+  font-size: 13px;
+}
+:root[data-lang='native'] .dialog-surface {
+  border: 1px solid var(--nt-box-line);
+  border-radius: 12px;
+  box-shadow:
+    0 0 0 0.5px rgba(0, 0, 0, 0.2),
+    0 20px 60px rgba(0, 0, 0, 0.35);
+}

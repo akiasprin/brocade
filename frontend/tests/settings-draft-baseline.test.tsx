@@ -76,7 +76,12 @@ const committedSettings = () => ({
 
 const ROUTES: Record<string, () => unknown> = {
   '/settings': committedSettings,
-  '/deployment-settings': () => ({ unattended: true }),
+  '/deployment-settings': () => ({
+    unattended: true,
+    xray_handoff_beta: false,
+    unlock_detection_mode: 'scheduled',
+    unlock_detection_interval_hours: 24,
+  }),
   '/branding': () => ({ site_name: 'brocade', icon: null, accent: null }),
   '/auth/state': () => ({ public_open: false }),
   '/certs': () => ({ groups: [], nodes: [], letsencrypt: 'https://acme', letsencrypt_staging: 'https://acme-staging' }),
@@ -189,10 +194,22 @@ const publicCaCertsWithGroup = (): CertsView => {
 };
 
 function stubFetch() {
-  let deploymentSettings = { unattended: true, xray_handoff_beta: false };
+  let deploymentSettings = {
+    unattended: true,
+    xray_handoff_beta: false,
+    unlock_detection_mode: 'scheduled',
+    unlock_detection_interval_hours: 24,
+  };
   vi.stubGlobal(
     'fetch',
     vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/unlock-probes/refresh' && init?.method === 'POST')
+        return Response.json({
+          mode: deploymentSettings.unlock_detection_mode,
+          interval_hours: deploymentSettings.unlock_detection_interval_hours,
+          requested_at: 1,
+          next_run_at: null,
+        });
       if (path === '/deployment-settings' && init?.method === 'PUT') {
         deploymentSettings = { ...deploymentSettings, ...JSON.parse(String(init.body)) };
         return Response.json(deploymentSettings);
@@ -393,9 +410,9 @@ const pingPresetCases = [
   [
     '广东',
     [
-      ['广东电信', '125.89.169.2', '240e:97c:2f:1::5c'],
-      ['广东联通', '157.148.118.157', '2408:8756:f50:2::65'],
-      ['广东移动', '120.241.227.7', '2409:8c54:871:1::73'],
+      ['广东电信', '183.61.254.74', '240e:97d:10:1705:3a::e'],
+      ['广东联通', '58.255.175.14', '2408:8756:2cff:e409:3c::26'],
+      ['广东移动', '120.233.185.200', '2409:8c54:871:4::87'],
     ],
   ],
   [
@@ -775,6 +792,7 @@ describe('设置页分段保存的基准', () => {
       'set-visitor',
       'set-dist',
       'set-deployment',
+      'set-unlock',
       'set-agent-logs',
       'set-cert',
       'set-xray',
@@ -1470,4 +1488,43 @@ it('反向隧道参数无效时禁止保存连接策略', async () => {
   expect(connection.getByRole('alert').textContent).toContain('参数超出范围');
   fireEvent.click(save);
   expect(settingsOp()).toBeUndefined();
+});
+
+it('解锁检测模式和循环间隔立即保存，不写配置草稿', async () => {
+  render(<Harness />);
+  const toggle = within(await screen.findByRole('group', { name: '解锁检测模式' }));
+  expect(toggle.getByRole('button', { name: '定时循环' }).getAttribute('aria-pressed')).toBe('true');
+  fireEvent.click(toggle.getByRole('button', { name: '手动' }));
+  await waitFor(() => expect(toggle.getByRole('button', { name: '手动' }).getAttribute('aria-pressed')).toBe('true'));
+  expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+    '/deployment-settings',
+    expect.objectContaining({ method: 'PUT', body: JSON.stringify({ unlock_detection_mode: 'manual' }) }),
+  );
+  fireEvent.change(screen.getByLabelText('解锁检测循环间隔（小时）'), { target: { value: '6' } });
+  fireEvent.click(screen.getByRole('button', { name: '保存间隔' }));
+  await waitFor(() =>
+    expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+      '/deployment-settings',
+      expect.objectContaining({ method: 'PUT', body: JSON.stringify({ unlock_detection_interval_hours: 6 }) }),
+    ),
+  );
+  expect(draft.isEmpty()).toBe(true);
+  fireEvent.change(screen.getByLabelText('解锁检测循环间隔（小时）'), { target: { value: '0' } });
+  expect((screen.getByRole('button', { name: '保存间隔' }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+it('全量刷新使用独立运行入口且不创建配置草稿', async () => {
+  render(<Harness />);
+  fireEvent.click(await screen.findByRole('button', { name: '立即全量检测' }));
+  await screen.findByText('已安排全量检测，机器在线后依次执行。');
+  expect(vi.mocked(fetch)).toHaveBeenCalledWith('/unlock-probes/refresh', expect.objectContaining({ method: 'POST' }));
+  expect(draft.isEmpty()).toBe(true);
+});
+
+it('非系统管理员不能修改检测模式、间隔或全量刷新', async () => {
+  render(<Harness role="editor" />);
+  const toggle = within(await screen.findByRole('group', { name: '解锁检测模式' }));
+  expect((toggle.getByRole('button', { name: '手动' }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByLabelText('解锁检测循环间隔（小时）') as HTMLInputElement).disabled).toBe(true);
+  expect((screen.getByRole('button', { name: '立即全量检测' }) as HTMLButtonElement).disabled).toBe(true);
 });

@@ -64,11 +64,11 @@ test('建链向导是可刷新、可返回的正式下钻位置', () => {
 
 test('机器详情页签实现完整的键盘和 ARIA 关系', () => {
   assert.match(nodes, /role="tablist" aria-label=/);
-  assert.equal((nodes.match(/role="tab"/g) ?? []).length, 3);
-  assert.equal((nodes.match(/aria-controls=\{panelId\(/g) ?? []).length, 3);
-  assert.equal((nodes.match(/role="tabpanel"/g) ?? []).length, 4);
-  assert.equal((nodes.match(/aria-labelledby=\{tabId\(/g) ?? []).length, 3);
-  assert.match(nodes, /const tabs: NodeTab\[\] = \['observed', 'config', 'chains'\]/);
+  assert.equal((nodes.match(/role="tab"/g) ?? []).length, 4);
+  assert.equal((nodes.match(/aria-controls=\{panelId\(/g) ?? []).length, 4);
+  assert.equal((nodes.match(/role="tabpanel"/g) ?? []).length, 5);
+  assert.equal((nodes.match(/aria-labelledby=\{tabId\(/g) ?? []).length, 4);
+  assert.match(nodes, /const tabs: NodeTab\[\] = \['observed', 'unlock', 'config', 'chains'\]/);
   assert.doesNotMatch(nodes, /showsTrafficTab|NodeTrafficTab|nd-tab-traffic|tabId\('traffic'\)/);
   assert.match(nodes, /function NodeDetailTabState[\s\S]*?role="tabpanel"[\s\S]*?aria-labelledby=\{tabId\}/);
   assert.match(nodes, /event\.key === 'ArrowRight' \|\| event\.key === 'ArrowDown'/);

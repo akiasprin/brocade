@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <title>线路解锁 · 生产页面验收</title>
+    <script>
+      (() => {
+        // 主题与色板写进本地偏好后再加载模块：外壳的主题、色板仓库在模块初始化时读取。
+        const query = new URLSearchParams(location.search);
+        const theme = query.get('theme') === 'light' ? 'light' : 'dark';
+        const palette = query.get('palette') || 'dailan';
+        try {
+          localStorage.setItem('brocade-console:theme', theme);
+          localStorage.setItem('brocade-console:palette', palette);
+        } catch {}
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.dataset.palette = palette;
+        document.querySelector('meta[name="color-scheme"]').content = theme;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import RefreshRuntime from '/@react-refresh';
+      RefreshRuntime.injectIntoGlobalHook(window);
+      window.$RefreshReg$ = () => {};
+      window.$RefreshSig$ = () => type => type;
+      window.__vite_plugin_react_preamble_installed__ = true;
+    </script>
+    <script type="module" src="./chain-unlock-preview.tsx"></script>
+  </body>
+</html>

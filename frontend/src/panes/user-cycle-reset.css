@@ -1,0 +1,46 @@
+/* 读数栏「本期接入 / 本期转发」一行右端的「重置」：文字按钮，与标签同一行居中，悬停才有底面。
+   以读数栏为定位框：窄卡读数栏是两列网格时，它落在整栏右上角，不挤占合计那一列。
+   左右各 8px 内距铺悬停面，文字右缘仍与读数栏内容右缘对齐。 */
+.user-usage-ledger:has(.user-cycle-reset-action) {
+  position: relative;
+}
+.user-cycle-reset-action {
+  position: absolute;
+  /* 读数栏上内距 16px + 标签半行 8px − 按钮半高 12px */
+  top: 12px;
+  right: calc(var(--panel-content-x) - 8px);
+  height: 24px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  color: var(--action);
+  background: transparent;
+  font: 500 12px/24px var(--sans);
+  white-space: nowrap;
+  cursor: pointer;
+}
+@media (hover: hover) and (pointer: fine) {
+  .user-cycle-reset-action:hover:not(:disabled) {
+    background: var(--hover);
+  }
+}
+.user-cycle-reset-action:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 1px;
+}
+.user-cycle-reset-action:disabled {
+  color: var(--ink-4);
+  cursor: default;
+}
+@container user-usage (max-width: 620px) {
+  .user-cycle-reset-action {
+    top: 10px;
+    right: calc(var(--panel-content-x-compact) - 8px);
+  }
+}
+/* 读数栏两列时右列是组成条，下移一行让出「重置」；单列时组成条在合计下方，不受影响。 */
+@container user-usage (min-width: 401px) and (max-width: 620px) {
+  .user-usage-ledger:has(.user-cycle-reset-action) .user-usage-compose {
+    margin-top: 24px;
+  }
+}

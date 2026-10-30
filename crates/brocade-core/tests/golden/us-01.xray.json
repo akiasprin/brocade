@@ -7,6 +7,7 @@
     ],
     "tag": "api"
   },
+  "brocadeUnlockIpFamilies": 2,
   "dns": {
     "serveExpiredTTL": 129600,
     "serveStale": true,
@@ -133,6 +134,21 @@
             "email": "c-brc-jp@us-01",
             "id": "3083b3f5-d4c8-44d2-9e54-7634dac4f621",
             "level": 0
+          },
+          {
+            "email": "probe#dns:c-brc-jp%40us-01",
+            "id": "1c9b4d74-06a2-4b86-a17b-4d1c1741fb03",
+            "level": 0
+          },
+          {
+            "email": "probe#v4:c-brc-jp%40us-01",
+            "id": "9ede5b2a-9982-4992-9137-c566174912df",
+            "level": 0
+          },
+          {
+            "email": "probe#v6:c-brc-jp%40us-01",
+            "id": "07b86e1a-90d6-4db8-b5de-990f3005560a",
+            "level": 0
           }
         ],
         "decryption": "none"
@@ -167,6 +183,21 @@
           {
             "email": "c-brc-smart@us-01",
             "id": "8233e9d2-0751-4b08-ac2f-999f7708c790",
+            "level": 0
+          },
+          {
+            "email": "probe#dns:c-brc-smart%40us-01",
+            "id": "34477da3-ec8c-44db-8ba4-63acd904e052",
+            "level": 0
+          },
+          {
+            "email": "probe#v4:c-brc-smart%40us-01",
+            "id": "8672b276-86fa-4c09-98f7-e9517a34ecab",
+            "level": 0
+          },
+          {
+            "email": "probe#v6:c-brc-smart%40us-01",
+            "id": "0f22a6e5-7a04-4c37-8612-e704b94bc64c",
             "level": 0
           }
         ],
@@ -203,6 +234,21 @@
             "email": "c-lin-jp@us-01",
             "id": "a5f4d148-c88b-48b6-bbeb-1d4abb9b26f5",
             "level": 0
+          },
+          {
+            "email": "probe#dns:c-lin-jp%40us-01",
+            "id": "c4642125-7a46-47ce-adc1-37c5d639965b",
+            "level": 0
+          },
+          {
+            "email": "probe#v4:c-lin-jp%40us-01",
+            "id": "dfb505c7-5aa1-43a2-8ec4-2df480e15a0e",
+            "level": 0
+          },
+          {
+            "email": "probe#v6:c-lin-jp%40us-01",
+            "id": "3f226bb8-9fe5-457a-8c85-e574cb7d2869",
+            "level": 0
           }
         ],
         "decryption": "none"
@@ -237,6 +283,21 @@
           {
             "email": "c-lin-us@us-01",
             "id": "336e37ff-0582-4d02-b572-fd18755776c8",
+            "level": 0
+          },
+          {
+            "email": "probe#dns:c-lin-us%40us-01",
+            "id": "e30fca43-35c1-4e0d-b176-72ee5dec07f5",
+            "level": 0
+          },
+          {
+            "email": "probe#v4:c-lin-us%40us-01",
+            "id": "072b73b3-1f9b-4773-88a5-f9037c5d2b59",
+            "level": 0
+          },
+          {
+            "email": "probe#v6:c-lin-us%40us-01",
+            "id": "bb452284-3575-499b-9f57-696a36295f01",
             "level": 0
           }
         ],
@@ -283,6 +344,43 @@
       "tag": "out:egress"
     },
     {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "ForceIPv4"
+      },
+      "tag": "out:forward:probe-v4"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "ForceIPv4"
+      },
+      "tag": "out:egress:probe-v4"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "ForceIPv6"
+      },
+      "tag": "out:forward:probe-v6"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "ForceIPv6"
+      },
+      "tag": "out:egress:probe-v6"
+    },
+    {
+      "protocol": "dns",
+      "settings": {},
+      "tag": "probe:dns"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "out:probe-family-unsupported"
+    },
+    {
       "protocol": "blackhole",
       "tag": "out:reality-guard"
     },
@@ -321,7 +419,7 @@
           "api"
         ],
         "outboundTag": "api",
-        "ruleTag": "r:ebcc29cf:000",
+        "ruleTag": "r:a45e5d26:000",
         "type": "field"
       },
       {
@@ -329,7 +427,7 @@
           "dns-out"
         ],
         "outboundTag": "out:egress",
-        "ruleTag": "r:ebcc29cf:001",
+        "ruleTag": "r:a45e5d26:001",
         "type": "field"
       },
       {
@@ -340,7 +438,7 @@
           "in:frt/i-frt-us:guard"
         ],
         "outboundTag": "out:internal",
-        "ruleTag": "r:ebcc29cf:002",
+        "ruleTag": "r:a45e5d26:002",
         "type": "field"
       },
       {
@@ -348,23 +446,167 @@
           "in:frt/i-frt-us:guard"
         ],
         "outboundTag": "out:reality-guard",
-        "ruleTag": "r:ebcc29cf:003",
+        "ruleTag": "r:a45e5d26:003",
         "type": "field"
       },
       {
+        "outboundTag": "out:egress:probe-v4",
+        "ruleTag": "r:a45e5d26:004",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-jp%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:a45e5d26:005",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-jp%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "out:egress:probe-v6",
+        "ruleTag": "r:a45e5d26:006",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-jp%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:a45e5d26:007",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-jp%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:a45e5d26:008",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-jp%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:a45e5d26:009",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-jp%40us-01"
+        ]
+      },
+      {
         "outboundTag": "out:egress",
-        "ruleTag": "r:ebcc29cf:004",
+        "ruleTag": "r:a45e5d26:010",
         "type": "field",
         "user": [
           "c-brc-jp@us-01"
         ]
       },
       {
+        "outboundTag": "out:egress:probe-v4",
+        "ruleTag": "r:a45e5d26:011",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-smart%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:a45e5d26:012",
+        "type": "field",
+        "user": [
+          "probe#v4:c-brc-smart%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "out:egress:probe-v6",
+        "ruleTag": "r:a45e5d26:013",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-smart%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:a45e5d26:014",
+        "type": "field",
+        "user": [
+          "probe#v6:c-brc-smart%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:a45e5d26:015",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-smart%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:a45e5d26:016",
+        "type": "field",
+        "user": [
+          "probe#dns:c-brc-smart%40us-01"
+        ]
+      },
+      {
         "outboundTag": "out:egress",
-        "ruleTag": "r:ebcc29cf:005",
+        "ruleTag": "r:a45e5d26:017",
         "type": "field",
         "user": [
           "c-brc-smart@us-01"
+        ]
+      },
+      {
+        "outboundTag": "out:egress:probe-v4",
+        "ruleTag": "r:a45e5d26:018",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-frt-us"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:a45e5d26:019",
+        "type": "field",
+        "user": [
+          "probe#v4:probe#i-frt-us"
+        ]
+      },
+      {
+        "outboundTag": "out:egress:probe-v6",
+        "ruleTag": "r:a45e5d26:020",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-frt-us"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:a45e5d26:021",
+        "type": "field",
+        "user": [
+          "probe#v6:probe#i-frt-us"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:a45e5d26:022",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-frt-us"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:a45e5d26:023",
+        "type": "field",
+        "user": [
+          "probe#dns:probe#i-frt-us"
         ]
       },
       {
@@ -372,20 +614,116 @@
           "in:frt/i-frt-us"
         ],
         "outboundTag": "out:egress",
-        "ruleTag": "r:ebcc29cf:006",
+        "ruleTag": "r:a45e5d26:024",
         "type": "field"
       },
       {
+        "outboundTag": "out:egress:probe-v4",
+        "ruleTag": "r:a45e5d26:025",
+        "type": "field",
+        "user": [
+          "probe#v4:c-lin-jp%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:a45e5d26:026",
+        "type": "field",
+        "user": [
+          "probe#v4:c-lin-jp%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "out:egress:probe-v6",
+        "ruleTag": "r:a45e5d26:027",
+        "type": "field",
+        "user": [
+          "probe#v6:c-lin-jp%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:a45e5d26:028",
+        "type": "field",
+        "user": [
+          "probe#v6:c-lin-jp%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:a45e5d26:029",
+        "type": "field",
+        "user": [
+          "probe#dns:c-lin-jp%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:a45e5d26:030",
+        "type": "field",
+        "user": [
+          "probe#dns:c-lin-jp%40us-01"
+        ]
+      },
+      {
         "outboundTag": "out:egress",
-        "ruleTag": "r:ebcc29cf:007",
+        "ruleTag": "r:a45e5d26:031",
         "type": "field",
         "user": [
           "c-lin-jp@us-01"
         ]
       },
       {
+        "outboundTag": "out:egress:probe-v4",
+        "ruleTag": "r:a45e5d26:032",
+        "type": "field",
+        "user": [
+          "probe#v4:c-lin-us%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v4",
+        "ruleTag": "r:a45e5d26:033",
+        "type": "field",
+        "user": [
+          "probe#v4:c-lin-us%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "out:egress:probe-v6",
+        "ruleTag": "r:a45e5d26:034",
+        "type": "field",
+        "user": [
+          "probe#v6:c-lin-us%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "out:forward:probe-v6",
+        "ruleTag": "r:a45e5d26:035",
+        "type": "field",
+        "user": [
+          "probe#v6:c-lin-us%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:a45e5d26:036",
+        "type": "field",
+        "user": [
+          "probe#dns:c-lin-us%40us-01"
+        ]
+      },
+      {
+        "outboundTag": "probe:dns",
+        "ruleTag": "r:a45e5d26:037",
+        "type": "field",
+        "user": [
+          "probe#dns:c-lin-us%40us-01"
+        ]
+      },
+      {
         "outboundTag": "out:egress",
-        "ruleTag": "r:ebcc29cf:008",
+        "ruleTag": "r:a45e5d26:038",
         "type": "field",
         "user": [
           "c-lin-us@us-01"

@@ -1,5 +1,6 @@
+import { lazy } from './ui/lazy';
 import { useMetricQuery } from './ui/metric-cadence';
-import { lazy, Suspense, useId, useMemo, useState } from 'react';
+import { Suspense, useId, useMemo, useState } from 'react';
 import { getDomain } from 'tldts';
 import {
   fetchNodeOtherDomains,
@@ -285,19 +286,16 @@ const DETAIL: Record<DetailKind, { label: string; by: string; unit: string; capp
   'sniffing-failed': { label: '嗅探失败', by: '按目标 IP 与端口', unit: '个目标', capped: '个目标' },
 };
 
-/** 明细的采集范围：只写当前成立的几项。 */
+/** 最早时间只来自真实明细，不从保留边界或当前采集窗口推算。 */
 function coverageText(
   kind: DetailKind,
   detail: UserOtherDomains | UserSniffingFailedTargets,
-  site: UserSiteUsage | undefined,
   categoryTotal: number,
 ): string {
   const parts: string[] = [];
   if (!detail.collection_enabled) parts.push('明细采集已关闭，显示已保留的数据');
-  if (!site || detail.range_start_unix_secs > site.range_start_unix_secs)
-    parts.push(`明细自${moment(detail.range_start_unix_secs, detail.range_end_unix_secs)} 起保留`);
-  if (detail.observed_since_unix_secs !== null && detail.observed_since_unix_secs > detail.range_start_unix_secs)
-    parts.push(`自${moment(detail.observed_since_unix_secs, detail.range_end_unix_secs)} 起采集`);
+  if (detail.first_record_unix_secs != null)
+    parts.push(`最早记录：${moment(detail.first_record_unix_secs, detail.range_end_unix_secs)}`);
   const covered = detail.rows.reduce((sum, row) => sum + row.uplink_bytes + row.downlink_bytes, 0);
   parts.push(
     `覆盖 ${bytes(covered)}${categoryTotal > 0 ? `，占${DETAIL[kind].label} ${shareOf(covered, categoryTotal)}` : ''}`,
@@ -355,7 +353,6 @@ function DetailSection({
   id,
   kind,
   query,
-  site,
   categoryTotal,
   color,
   open,
@@ -364,7 +361,6 @@ function DetailSection({
   id: string;
   kind: DetailKind;
   query: { data?: UserOtherDomains | UserSniffingFailedTargets; isPending: boolean; isError: boolean };
-  site: UserSiteUsage | undefined;
   categoryTotal: number;
   color: SiteUsageColor;
   open: boolean;
@@ -421,7 +417,7 @@ function DetailSection({
               ? `${config.label}明细读取失败，请稍后重试。`
               : !detail
                 ? '正在读取明细…'
-                : `${coverageText(kind, detail, site, categoryTotal)}${items.length === 0 ? ' · 暂无记录' : ''}`}
+                : `${coverageText(kind, detail, categoryTotal)}${items.length === 0 ? ' · 暂无记录' : ''}`}
           </p>
           {items.length > 0 && (
             <div className={`site-usage-dcols${columns.length === 1 ? ' one' : ''}`}>
@@ -623,9 +619,11 @@ function SiteUsageCard({
           <span className="site-usage-meta">
             {data.observed_since_unix_secs !== null && data.observed_since_unix_secs > data.range_start_unix_secs && (
               <>
-                <span className="warn" title="此前至少一台入口机器尚未开始站点统计，所选范围内更早的站点流量未计入">
-                  {nodeId !== null || categories.forwarding ? '站点观测起点' : '观测起点'}{' '}
-                  {moment(data.observed_since_unix_secs, data.range_end_unix_secs)}
+                <span
+                  className="warn"
+                  title={`最近连续采集从${moment(data.observed_since_unix_secs, data.range_end_unix_secs)}开始；统计仍覆盖完整所选范围，此前已有记录继续计入。无法仅据此确定具体缺口。`}
+                >
+                  站点采集可能有缺口
                 </span>
                 {' · '}
               </>
@@ -789,11 +787,13 @@ function SiteUsageCard({
                     <Suspense fallback={<div className="site-usage-chart" />}>
                       <LazySiteUsageChart
                         period={data.period}
+                        customRange={range !== undefined}
                         startUnixSecs={data.range_start_unix_secs}
                         bucketSecs={data.bucket_secs}
                         nowUnixSecs={data.range_end_unix_secs}
-                        observedSinceUnixSecs={
-                          !categories.forwarding &&
+                        observedSinceUnixSecs={null}
+                        uncertainBeforeUnixSecs={
+                          categories.sites.length > 0 &&
                           data.observed_since_unix_secs !== null &&
                           data.observed_since_unix_secs > data.range_start_unix_secs
                             ? data.observed_since_unix_secs
@@ -804,7 +804,7 @@ function SiteUsageCard({
                       />
                     </Suspense>
                     <p className="site-usage-note">
-                      {data.period === 'month' ? '每天' : '每小时'}一柱 · 固定本月主要 {TOP_SITES}{' '}
+                      {data.bucket_secs >= 86_400 ? '每天' : '每小时'}一柱 · 固定本月主要 {TOP_SITES}{' '}
                       类站点着色，其余站点合为一层{categories.forwarding ? '；端口转发单独显示' : ''}
                     </p>
                     {forwardingUnplaced > 0 && (
@@ -882,7 +882,6 @@ function SiteUsageCard({
               id={detailId(kind)}
               kind={kind}
               query={kind === 'other' ? domains : targets}
-              site={data}
               categoryTotal={
                 site.isPlaceholderData || (kind === 'other' ? domains : targets).isPlaceholderData
                   ? 0

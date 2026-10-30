@@ -118,8 +118,7 @@
   margin: 0;
   color: var(--err);
 }
-.nt-selected-range,
-.nid-range {
+.nt-selected-range {
   display: flex;
   flex: none;
   flex-wrap: wrap;
@@ -131,205 +130,421 @@
   background: var(--band);
   font: 12px/1.5 var(--mono);
 }
-.node-inflow-dialog {
-  display: flex;
-  flex-direction: column;
-  width: min(1120px, 100%);
-  max-height: calc(100dvh - 40px);
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-}
-.nid-identity {
-  overflow-wrap: anywhere;
-  color: var(--ink-3);
-  font-size: 12px;
-}
-.node-inflow-dialog .node-usage-identity {
-  flex-wrap: wrap;
-}
-.node-inflow-dialog .node-usage-close {
-  flex: none;
-  padding: 6px;
-}
-.nid-range > span:last-child {
-  margin-left: auto;
-}
-.nid-body {
-  overflow-y: auto;
-  min-height: 0;
-  overscroll-behavior: contain;
-}
-.nid-summary {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 8px 20px;
-  padding: 18px 20px;
-  color: var(--ink-3);
-  font-size: 12px;
-}
-.nid-summary > strong {
-  color: var(--ink);
-  font: 600 26px/1.2 var(--mono);
-  letter-spacing: -0.04em;
-}
-.nid-summary b {
-  color: var(--ink-2);
-  font: 500 12px/1.5 var(--mono);
-}
-.nid-count {
-  margin-left: auto;
-}
 @media (pointer: coarse) {
   .nt-range-editor input {
     font-size: 16px;
   }
-  .node-inflow-dialog .node-usage-close,
-  .nid-source .copy-button,
-  .nid-sort {
-    min-width: 44px;
-    min-height: 44px;
-  }
-}
-.nid-table-scroll {
-  overflow-x: auto;
-  scrollbar-width: thin;
-}
-.nid-table {
-  width: 100%;
-  min-width: 820px;
-  border-collapse: collapse;
-  text-align: left;
-}
-.nid-table th,
-.nid-table td {
-  padding: 14px 12px;
-  border-bottom: 1px solid var(--line-soft);
-  vertical-align: middle;
-}
-.nid-table th:first-child,
-.nid-table td:first-child {
-  padding-left: 20px;
-}
-.nid-table th:last-child,
-.nid-table td:last-child {
-  padding-right: 20px;
-}
-.nid-table thead {
-  border-block: 1px solid var(--line);
-  background: var(--band);
-  color: var(--ink-3);
-}
-.nid-table thead th {
-  padding-block: 8px;
-  font: 500 12px/1.5 var(--sans);
-  white-space: nowrap;
-}
-.nid-table tbody tr:hover {
-  background: var(--band);
-}
-.nid-user,
-.nid-source {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-.nid-user > span,
-.nid-chain-name {
-  max-width: 220px;
-  overflow-wrap: anywhere;
-  font-size: 13px;
-}
-.nid-source code {
-  max-width: 240px;
-  overflow-wrap: anywhere;
-  color: var(--ink);
-  font: 12px/1.5 var(--mono);
-  background: none;
-  padding: 0;
-}
-.nid-source .copy-button {
-  flex: none;
-  padding: 4px;
-}
-.nid-unknown {
-  color: var(--ink-3);
-  font-size: 12px;
-}
-.nid-unknown small {
-  display: block;
-  margin-top: 3px;
-  color: var(--ink-4);
-  font-size: 11px;
-}
-.nid-table .nid-number {
-  min-width: 100px;
-  text-align: right;
-  white-space: nowrap;
-  font: 12px/1.5 var(--mono);
-  font-variant-numeric: tabular-nums;
-}
-.nid-number strong {
-  font-weight: 600;
-}
-.nid-sort {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  border: 0;
-  padding: 3px 0;
-  color: var(--ink-3);
-  background: transparent;
-  font: 500 12px/1.5 var(--sans);
-  cursor: pointer;
-}
-.nid-number[aria-sort] .nid-sort {
-  color: var(--ink);
-}
-.nid-meter {
-  display: flex;
-  overflow: hidden;
-  height: 3px;
-  margin-top: 6px;
-  border-radius: 3px;
-  background: color-mix(in srgb, var(--ink) 5%, transparent);
-}
-.nid-meter > i.down {
-  background: var(--observe-1);
-}
-.nid-meter > i.up {
-  background: var(--observe-2);
-}
-.nid-table tfoot {
-  border-top: 1px solid var(--line);
-  background: var(--band);
-  font-weight: 600;
-}
-.nid-notes,
-.nid-note {
-  padding: 12px 20px;
-  color: var(--ink-3);
-  font-size: 12px;
-}
-.nid-notes p {
-  margin: 0 0 6px;
-}
-.nid-notes > span {
-  display: block;
-  text-align: right;
 }
 @media (max-width: 620px) {
   .nt-range-editor label {
     flex: 1 1 220px;
   }
-  .nid-summary,
-  .nid-notes,
-  .nid-note {
-    padding-inline: 12px;
+}
+
+/* ── 流入明细：一位用户在本机的来源排行 ── */
+.node-inflow-dialog {
+  /* 不透明的中性灰：端口转发；未记录来源与未按接入链记录 */
+  --nid-gray-1: color-mix(in srgb, var(--ink) 44%, var(--sheet));
+  --nid-gray-2: color-mix(in srgb, var(--ink) 24%, var(--sheet));
+  container: nid / inline-size;
+  display: flex;
+  width: min(860px, 100%);
+  max-height: calc(100dvh - 40px);
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+.nid-who {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+.nid-who h2 {
+  flex: none;
+  max-width: 50%;
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font: 600 15px/20px var(--sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nid-where {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-inflow-dialog .node-usage-close {
+  flex: none;
+  width: var(--ctl-h);
+  padding: 0;
+}
+.nid-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.nid-state {
+  margin: 0;
+  padding: 18px 20px;
+  color: var(--ink-3);
+  font-size: 12.5px;
+}
+
+/* 读数栏：合计 │ 上下行 │ 来源数，与用户页「用量与额度」同一写法 */
+.nid-readout {
+  display: grid;
+  grid-template-areas: 'hero io facts';
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 280px) minmax(112px, auto);
+  align-items: end;
+  gap: 32px;
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.nid-hero {
+  display: grid;
+  min-width: 0;
+  grid-area: hero;
+}
+.nid-hero-label {
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+}
+.nid-hero-value {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 8px;
+  color: var(--ink);
+  font: 600 32px/1 var(--sans);
+  letter-spacing: -0.035em;
+  white-space: nowrap;
+}
+.nid-hero-value small {
+  color: var(--ink-3);
+  font: 500 14px/1 var(--sans);
+  letter-spacing: 0;
+}
+.nid-io {
+  min-width: 0;
+  grid-area: io;
+}
+.nid-io .usage-split {
+  height: 6px;
+}
+.nid-io .usage-io {
+  gap: 5px;
+  margin-top: 10px;
+}
+.nid-io .usage-io > div {
+  grid-template-columns: minmax(0, 1fr) auto 46px;
+  gap: 10px;
+}
+.nid-io .usage-io dt {
+  gap: 7px;
+  font-size: 12px;
+}
+.nid-io .usage-io dd {
+  font-size: 12.5px;
+}
+.nid-io .usage-io .usage-share {
+  font-size: 11.5px;
+}
+.nid-facts {
+  display: grid;
+  grid-area: facts;
+  gap: 5px;
+  margin: 0;
+}
+.nid-facts > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 18px;
+}
+.nid-facts dt {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.nid-facts dd {
+  margin: 0;
+  color: var(--ink);
+  font: 500 12.5px var(--sans);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 完整性只在出现时写一行连续文字，分隔用全角分号 */
+.nid-notices {
+  padding: 12px 20px 0;
+}
+.nid-notice {
+  margin: 0;
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 18px;
+}
+.nid-notice svg {
+  margin-right: 6px;
+  vertical-align: -2px;
+}
+.nid-help {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.nid-help svg {
+  margin: 0 0 0 3px;
+}
+.nid-help:focus-visible {
+  border-radius: 3px;
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+}
+.nid-note {
+  margin: 6px 0 0 19px;
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+/* 列表头：标题 + 合计／下行／上行 */
+.nid-list {
+  padding: 14px 20px 18px;
+}
+.nid-listbar {
+  --ctl-h: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.nid-listbar-title {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.nid-listbar .segsw button {
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+/* 组成条与图例：两条链以上才出现，点图例只看这条链的来源 */
+.nid-compose {
+  display: flex;
+  height: 10px;
+  gap: 2px;
+  margin: 4px 0 12px;
+}
+.nid-compose > i {
+  display: block;
+  min-width: 3px;
+  border-radius: 2px;
+}
+.nid-compose > i:first-child {
+  border-top-left-radius: 5px;
+  border-bottom-left-radius: 5px;
+}
+.nid-compose > i:last-child {
+  border-top-right-radius: 5px;
+  border-bottom-right-radius: 5px;
+}
+.nid-compose > i.on {
+  box-shadow:
+    0 0 0 1.5px var(--sheet),
+    0 0 0 3px var(--ink-3);
+}
+.nid-legend {
+  margin-bottom: 14px;
+}
+.nid-legend .nti-key {
+  min-height: 30px;
+}
+
+/* 来源行：地址 │ 网络 │ 条形 │ 流量 │ 占比 */
+.nid-lines {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.nid-line {
+  display: grid;
+  min-height: 34px;
+  grid-template-areas: 'addr net track num pct';
+  grid-template-columns: minmax(0, 1fr) 128px minmax(64px, 176px) 78px 44px;
+  align-items: center;
+  gap: 12px;
+  margin: 0 -8px;
+  padding: 0 8px;
+  border-radius: 6px;
+}
+@media (hover: hover) {
+  .nid-line:hover {
+    background: var(--hover);
   }
-  .nid-count {
-    margin-left: 0;
+}
+.nid-addr {
+  display: flex;
+  min-width: 0;
+  grid-area: addr;
+  align-items: center;
+  gap: 6px;
+}
+.nid-addr code {
+  min-width: 0;
+  padding: 0;
+  overflow-wrap: anywhere;
+  background: none;
+  color: var(--ink);
+  font: 12.5px/1.45 var(--mono);
+}
+.nid-unknown {
+  color: var(--ink-3);
+  font-size: 12.5px;
+}
+.nid-net {
+  display: flex;
+  min-width: 0;
+  grid-area: net;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  color: var(--ink-2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.nid-net > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nid-net .geo-flag {
+  width: 16px;
+  height: 11px;
+  flex: none;
+  border-radius: 2px;
+}
+.nid-track {
+  display: flex;
+  min-width: 0;
+  grid-area: track;
+  align-items: center;
+}
+.nid-meter {
+  display: flex;
+  height: 8px;
+  min-width: 3px;
+  gap: 1px;
+}
+.nid-meter > i {
+  display: block;
+  min-width: 2px;
+  border-radius: 1px;
+}
+.nid-meter > i:first-child {
+  border-top-left-radius: 2px;
+  border-bottom-left-radius: 2px;
+}
+.nid-meter > i:last-child {
+  border-top-right-radius: 3px;
+  border-bottom-right-radius: 3px;
+}
+.nid-num {
+  grid-area: num;
+  color: var(--ink);
+  font: 500 12.5px/18px var(--sans);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.nid-pct {
+  grid-area: pct;
+  color: var(--ink-4);
+  font: 500 11.5px/18px var(--sans);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+/* 复制钮在悬停或键盘聚焦时出现；触屏没有悬停，始终显示（同在线设备） */
+@media (hover: hover) {
+  .nid-line .user-fcopy {
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .nid-line:hover .user-fcopy,
+  .nid-line .user-fcopy:is(:focus-visible, .done, .failed) {
+    opacity: 1;
+  }
+}
+.nid-more-row {
+  padding-top: 2px;
+}
+.nid-more {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 6px;
+  margin-left: -8px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-3);
+  font: 12px var(--sans);
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .nid-more:hover {
+    background: var(--hover);
+    color: var(--ink);
+  }
+}
+.nid-more:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -2px;
+}
+/* 窄宽度：读数栏两行；来源排成两行，流量与占比上下同列、右缘对齐，不再横向滚动 */
+@container nid (max-width: 600px) {
+  .nid-readout {
+    grid-template-areas:
+      'hero facts'
+      'io io';
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 16px 20px;
+    padding: 16px;
+  }
+  .nid-hero-value {
+    font-size: 28px;
+  }
+  .nid-notices {
+    padding-inline: 16px;
+  }
+  .nid-list {
+    padding: 12px 16px 16px;
+  }
+  .nid-line {
+    grid-template-areas:
+      'addr addr num'
+      'net track pct';
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    row-gap: 3px;
+    padding-block: 7px;
+  }
+}
+@media (pointer: coarse) {
+  .node-inflow-dialog .node-usage-close {
+    width: 44px;
+    min-height: 44px;
   }
 }
 .nt-details > .panel {

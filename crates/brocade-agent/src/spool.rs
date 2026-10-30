@@ -266,14 +266,28 @@ fn observe_versions(
             reason: Some(format!("Xray 双进程状态损坏：{error}")),
         },
     );
+    let installed = crate::installed_xray_sha256();
+    let running = crate::running_xray_sha256();
     NodeVersions {
+        unlock_connection_trace: Some(
+            !xray_upgrade_in_progress
+                && crate::probe_identity::ready(
+                    state_dir,
+                    xray_version_output.as_deref(),
+                    installed.as_deref(),
+                    running.as_deref(),
+                ),
+        ),
+        unlock_ip_families: Some(
+            crate::unlock_probe::profile_supports_families(state_dir) && !xray_upgrade_in_progress,
+        ),
         // The sha256 of the running binary rather than `CARGO_PKG_VERSION`: nobody bumps a
         // workspace version on the way to a node, so that number claimed every build since it was
         // last touched was the same thing. See `identity.rs`.
         agent: crate::identity::self_identity().to_owned(),
         xray: first_line(xray_version_output.clone()),
-        xray_installed_sha256: crate::installed_xray_sha256(),
-        xray_running_sha256: crate::running_xray_sha256(),
+        xray_installed_sha256: installed,
+        xray_running_sha256: running,
         xray_handoff: Some(xray_handoff),
         kernel_tls_module: Some(crate::kernel_tls_module_loaded()),
         phantun: first_line(run_command("phantun-client", &["--version"]).ok()),

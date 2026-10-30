@@ -1,5 +1,6 @@
 """Exercise installer file publication/recovery in disposable containers; systemctl is simulated."""
 import base64
+import itertools
 import os
 from pathlib import Path
 import subprocess
@@ -11,15 +12,19 @@ import uuid
 class InstallerUpgradeTests(unittest.TestCase):
     def test_installation_preservation_and_failure_boundaries(self):
         installer = Path(__file__).resolve().parents[3] / 'install.sh'
-        for scenario in ['success', 'backup-failure', 'migration-failure', 'health-failure', 'health-failure-no-schema']:
-            with self.subTest(scenario=scenario):
+        for socket_mode, scenario in itertools.product(
+            ['legacy', 'socket'],
+            ['success', 'backup-failure', 'migration-failure', 'health-failure',
+             'health-failure-no-schema', 'secret-file-install', 'insecure-secret-file'],
+        ):
+            with self.subTest(scenario=scenario, socket=socket_mode):
                 container = 'brocade-upgrade-installer-' + uuid.uuid4().hex[:10]
                 try:
                     subprocess.run(['docker', 'run', '-d', '--name', container, '--network', 'none',
                                     'brocade-forwarding-continuity:local', 'sleep', 'infinity'],
                                    capture_output=True, check=True, timeout=30)
                     source = SETUP.replace('@INSTALLER@', base64.b64encode(installer.read_bytes()).decode())
-                    result = subprocess.run(['docker', 'exec', '-i', container, 'sh', '-s', '--', scenario],
+                    result = subprocess.run(['docker', 'exec', '-i', container, 'sh', '-s', '--', scenario, socket_mode],
                                             input=source, capture_output=True, text=True, timeout=90)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 finally:
@@ -29,7 +34,10 @@ class InstallerUpgradeTests(unittest.TestCase):
 SETUP = r'''
 set -eu
 scenario=$1
+socket_mode=$2
 mkdir -p /bundle /opt/brocade /etc/brocade /var/lib/brocade /run/systemd/system /etc/systemd/system
+touch /control.log
+chmod 0666 /control.log
 printf '%s\n' "$scenario" > /scenario
 cat >/usr/local/bin/systemctl <<'EOF'
 #!/bin/sh
@@ -49,9 +57,17 @@ chmod 755 /usr/local/bin/systemctl /usr/local/bin/brocade /opt/brocade/brocade-l
 printf 'x86_64-gnu\n' >/opt/brocade/BROCADE_PLATFORM
 printf 'old-manifest\n' >/opt/brocade/SHA256SUMS
 printf '# Managed by Brocade installer\n# preserve-custom-service-setting\n' >/etc/systemd/system/brocade.service
+if [ "$socket_mode" = socket ]; then
+  mkdir -p /etc/systemd/system/brocade.service.d
+  printf '# Managed by Brocade installer\n[Socket]\nListenStream=0.0.0.0:9001\n' >/etc/systemd/system/brocade.socket
+  printf '# Managed by Brocade installer\n[Unit]\nRequires=brocade.socket\nAfter=brocade.socket\n' >/etc/systemd/system/brocade.service.d/20-brocade-socket.conf
+  cp /etc/systemd/system/brocade.socket /socket-before
+fi
 printf 'http://192.0.2.20:9001\n' >/etc/brocade/agent-public-url
 printf '0.0.0.0:9001\n' >/etc/brocade/listen-address
 printf 'external\n' >/etc/brocade/database-type
+[ "$socket_mode" != socket ] || printf 'external-socket-v1\n' >/etc/brocade/database-type
+cp /etc/brocade/database-type /database-type-before
 printf 'postgresql://fixture:fixture@127.0.0.1/brocade\n' >/etc/brocade/database-url
 printf 'preserve-secret\n' >/var/lib/brocade/secret-key
 printf '#!/bin/sh\nexit 0\n' >/usr/local/bin/pg_dump
@@ -62,6 +78,7 @@ cat >/bundle/brocade-launcher <<'EOF'
 set -eu
 case $1 in
  --version) printf 'brocade 0.3.2\n';;
+ address) printf 'http://192.0.2.20:9001\n';;
  upgrade-database)
     backup=
     check=false
@@ -73,6 +90,7 @@ case $1 in
       shift
     done
     [ "$check" = false ] || exit 0
+    printf 'database-backup\n' >>/control.log
     scenario=$(cat /scenario)
     [ "$scenario" != backup-failure ] || exit 9
     printf 'fixture-dump' >"$backup/database.dump"
@@ -95,10 +113,29 @@ printf 'x86_64-gnu\n' >/bundle/BROCADE_PLATFORM
 printf '%s' '@INSTALLER@' | base64 -d >/bundle/install.sh
 (cd /bundle; sha256sum brocade-launcher brocade-console BROCADE_PLATFORM install.sh >SHA256SUMS)
 status=0
+case $scenario in
+ secret-file-install|insecure-secret-file)
+    cp /etc/brocade/database-url /database-input
+    chmod 0600 /database-input
+    [ "$scenario" != insecure-secret-file ] || chmod 0644 /database-input
+    sh /bundle/install.sh --database-url-file /database-input --public-ip 192.0.2.20 --port 9001 --no-start >/result.log 2>&1 || status=$?
+    ! grep -q 'fixture:fixture' /result.log
+    if [ "$scenario" = secret-file-install ]; then
+      [ "$status" = 0 ] || { cat /result.log; exit 1; }
+      cmp /etc/brocade/database-url /database-input
+    else
+      [ "$status" != 0 ]
+      [ "$(cat /opt/brocade/brocade-console)" = old-console ]
+    fi
+    exit 0
+    ;;
+esac
 sh /bundle/install.sh --upgrade >/result.log 2>&1 || status=$?
 if [ "$scenario" = success ]; then
     [ "$status" = 0 ] || { cat /result.log; exit 1; }
     cmp /opt/brocade/brocade-console /bundle/brocade-console
+    grep -q 'ListenStream=0.0.0.0:9001' /etc/systemd/system/brocade.socket
+    grep -q 'Requires=brocade.socket' /etc/systemd/system/brocade.service.d/20-brocade-socket.conf
 else
     [ "$status" != 0 ] || exit 1
 fi
@@ -106,16 +143,34 @@ case $scenario in
  backup-failure|health-failure-no-schema)
     [ "$(cat /opt/brocade/brocade-console)" = old-console ]
     grep -qx 'start brocade.service' /control.log
+    if [ "$socket_mode" = socket ]; then
+      cmp /etc/systemd/system/brocade.socket /socket-before
+      grep -qx 'start brocade.socket' /control.log
+    else
+      test ! -e /etc/systemd/system/brocade.socket
+      test ! -e /etc/systemd/system/brocade.service.d/20-brocade-socket.conf
+    fi
     ;;
  migration-failure|health-failure)
     ! grep -qx 'start brocade.service' /control.log
     [ "$(tail -n 1 /control.log)" = 'stop brocade.service' ]
     ;;
 esac
+if [ "$socket_mode" = socket ]; then
+  python3 - <<'PY'
+from pathlib import Path
+lines=Path('/control.log').read_text().splitlines()
+assert lines.index('stop brocade.socket') < lines.index('stop brocade.service') < lines.index('database-backup')
+PY
+fi
 [ "$(cat /var/lib/brocade/secret-key)" = preserve-secret ]
 [ "$(cat /etc/brocade/agent-public-url)" = http://192.0.2.20:9001 ]
 [ "$(cat /etc/brocade/listen-address)" = 0.0.0.0:9001 ]
-[ "$(cat /etc/brocade/database-type)" = external ]
+if [ "$scenario" = success ] || [ "$scenario" = health-failure ]; then
+  [ "$(cat /etc/brocade/database-type)" = external-socket-v1 ]
+else
+  cmp /etc/brocade/database-type /database-type-before
+fi
 grep -q preserve-custom-service-setting /etc/systemd/system/brocade.service
 backup=$(find /var/backups/brocade-upgrades -mindepth 1 -maxdepth 1 -type d | head -n 1)
 [ -s "$backup/installation.tar.gz" ]

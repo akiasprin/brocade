@@ -31,6 +31,7 @@ def main():
     parser.add_argument('--vm-image-sha256', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--qemu-image', default='cube-qemu-lab:24.04')
+    parser.add_argument('--adoption-script', type=Path, help='additional one-time manual deployment adoption rehearsal')
     args = parser.parse_args()
     if digest(args.release_031) != V031_SHA256:
         raise ValueError('the upgrade baseline must be the exact official v0.3.1 GNU archive')
@@ -64,6 +65,11 @@ def main():
         f'{digest(candidate / name)}  {name}\n'
         for name in ['brocade-console', 'brocade-launcher', 'BROCADE_PLATFORM', 'install.sh']))
     (inputs / 'DISPOSABLE_UPGRADE_DRILL').write_text('KVM-only\n')
+    migrations = {str(int(path.name.split('_', 1)[0])): hashlib.sha384(path.read_bytes()).hexdigest()
+                  for path in sorted((repo / 'crates/brocade-store/migrations').glob('*.sql'))}
+    (inputs / 'candidate-migrations.json').write_text(json.dumps(migrations, sort_keys=True) + '\n')
+    if args.adoption_script:
+        shutil.copy2(args.adoption_script, inputs / 'adopt-runtime.py')
     (output / 'manifest.json').write_text(json.dumps({
         'console_sha256': digest(args.console), 'launcher_sha256': digest(args.launcher),
         'candidate_version': version,
@@ -71,6 +77,7 @@ def main():
         'guest_script_sha256': digest(inputs / 'guest.py'),
         'v0.3.1_sha256': digest(args.release_031),
         'os_image_sha256': digest(args.vm_image), 'qemu_image': args.qemu_image,
+        'adoption_script_sha256': digest(args.adoption_script) if args.adoption_script else None,
     }, indent=2) + '\n')
     startup = '''#!/bin/sh
 set -eu

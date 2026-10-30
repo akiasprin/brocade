@@ -80,31 +80,27 @@ async fn detect_runtime_libc(program: &Path, deadline: Duration) -> Result<Libc>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, os::unix::fs::PermissionsExt, time::Instant};
+    use std::time::Instant;
 
-    fn probe_script(root: &Path, body: &str) -> std::path::PathBuf {
-        let script = root.join("ldd");
-        fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        script
+    fn probe_script(name: &str) -> std::path::PathBuf {
+        // Immutable executables avoid ETXTBSY when parallel process spawns briefly inherit
+        // another thread's writable fixture descriptor before their own exec closes it.
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(format!("ldd-{name}.sh"))
     }
 
     #[tokio::test]
     async fn static_launcher_selects_postgres_for_the_runtime_libc() {
-        let root = tempfile::tempdir().unwrap();
-        for (body, expected, artifact) in [
+        for (fixture, expected, artifact) in [
+            ("gnu", Libc::Gnu, "embedded-postgres-binaries-linux-amd64"),
             (
-                "printf 'ldd (Ubuntu GLIBC 2.35) 2.35\\n'",
-                Libc::Gnu,
-                "embedded-postgres-binaries-linux-amd64",
-            ),
-            (
-                "printf 'musl libc (x86_64)\\nVersion 1.2.5\\n' >&2; exit 1",
+                "musl",
                 Libc::Musl,
                 "embedded-postgres-binaries-linux-amd64-alpine",
             ),
         ] {
-            let script = probe_script(root.path(), body);
+            let script = probe_script(fixture);
             let libc = detect_runtime_libc(&script, Duration::from_secs(1))
                 .await
                 .unwrap();
@@ -122,12 +118,8 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_or_broken_runtime_does_not_guess_a_postgres_asset() {
-        let root = tempfile::tempdir().unwrap();
-        for body in [
-            "printf 'unknown libc\\n'",
-            "printf 'GNU error\\n' >&2; exit 1",
-        ] {
-            let script = probe_script(root.path(), body);
+        for fixture in ["unknown", "error"] {
+            let script = probe_script(fixture);
             assert!(detect_runtime_libc(&script, Duration::from_secs(1))
                 .await
                 .is_err());
@@ -136,8 +128,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_libc_probe_has_a_deadline() {
-        let root = tempfile::tempdir().unwrap();
-        let script = probe_script(root.path(), "exec sleep 10");
+        let script = probe_script("slow");
         let start = Instant::now();
         let error = detect_runtime_libc(&script, Duration::from_millis(50))
             .await

@@ -3,7 +3,7 @@
 //! The resolver is stored once per node and selector. Every stored policy is emitted to that
 //! machine's Xray instance and is never copied into, activated by, or owned by a chain.
 
-use std::net::IpAddr;
+use std::{collections::BTreeSet, net::IpAddr};
 
 use brocade_core::model::{DestMatch, EgressDnsResolution, ModelSnapshot, NodeEgressDnsPolicy};
 use sqlx::{Postgres, Row, Transaction};
@@ -79,10 +79,10 @@ pub(crate) async fn set_policy_tx(
 
     let selector = serde_json::to_value(selector)?;
     match resolution {
-        Some(resolution) => {
-            if resolution.address.trim().parse::<IpAddr>().is_err() {
+        Some(mut resolution) => {
+            if !resolution.address.valid() {
                 return Err(StoreError::InvalidData(
-                    "指定 DNS 的地址必须是 IPv4 或 IPv6 字面量，不能填写域名".to_owned(),
+                    "指定 DNS 须包含 1–16 个 IPv4 或 IPv6 地址，不能填写域名".to_owned(),
                 ));
             }
             if resolution.port == 0 {
@@ -90,6 +90,20 @@ pub(crate) async fn set_policy_tx(
                     "指定 DNS 的端口必须在 1–65535 之间".to_owned(),
                 ));
             }
+            let mut seen = BTreeSet::new();
+            resolution.address.0 = resolution
+                .address
+                .as_slice()
+                .iter()
+                .map(|address| {
+                    address
+                        .trim()
+                        .parse::<IpAddr>()
+                        .expect("valid() checked each resolver IP before canonicalization")
+                })
+                .filter(|address| seen.insert(*address))
+                .map(|address| address.to_string())
+                .collect();
             Ok(sqlx::query(
                 "INSERT INTO node_egress_dns (
                     node_id, position, selector, resolution, created_revision

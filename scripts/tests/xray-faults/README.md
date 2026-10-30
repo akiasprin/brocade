@@ -26,9 +26,18 @@ no-op. They certify the executor, not cross-version data-plane compatibility.
 
 `--cases` accepts a comma-separated subset from `CASES` in `run.py`.
 `--cpus` defaults to `2`; `--jobs` is bounded to 1–8. Each container has its own
-network with loopback only, 768 MiB memory and 512 PID limit. ENOSPC uses a
+network with loopback only, 768 MiB memory and 512 PID limit. A permitted private
+test address is assigned to that isolated loopback using `NET_ADMIN`; managed
+forwarding retains the production loopback/metadata deny policy. `--init` reaps
+orphaned children as a host init would. ENOSPC uses a
 separate 64 MiB executable tmpfs; the host filesystem is never filled. Cleanup
 uses exact randomly owned container names, with retained results on failure.
+
+The fixture provisions an explicit empty source-access checkpoint and starts the
+real resident admission service before checking forwarding. Its local Console
+returns explicit unlimited test budgets. Repeated-handoff retention waits for
+the production 30-second pruning cadence and bounded four-directory batches;
+that case has a 180-second process limit, other cases retain 100 seconds.
 
 The matrix covers:
 

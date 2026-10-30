@@ -544,10 +544,12 @@ async fn query_for(
     let start = bounds.start.max(retained_since).min(now);
     let policy = policy_for(pool, kind).await?;
     let state=sqlx::query(&kind.sql("SELECT count(*) FILTER (WHERE read_at >= $2)::bigint AS reporting,bool_or(limited) AS limited,max(observed_since) AS since,max(read_at) AS latest FROM node_other_domain_state WHERE node_id=ANY($1)")).bind(&nodes).bind(bounds.clock-600).fetch_one(pool).await?;
+    // The window aggregate runs before LIMIT, so an older low-volume host still establishes
+    // the first real record. Reuse the exact row filters, including tenant scope and retention.
     let rows = match scope {
-        DetailScope::User { tenant, user } => sqlx::query(&kind.sql("SELECT domain,sum(uplink_bytes)::bigint AS up,sum(downlink_bytes)::bigint AS down FROM user_other_domain_hourly WHERE tenant_id=$1 AND user_id=$2 AND bucket >= $3 AND bucket <= $4 GROUP BY domain ORDER BY sum(uplink_bytes::numeric+downlink_bytes::numeric) DESC,domain LIMIT $5"))
+        DetailScope::User { tenant, user } => sqlx::query(&kind.sql("SELECT domain,sum(uplink_bytes)::bigint AS up,sum(downlink_bytes)::bigint AS down,min(min(bucket)) OVER () AS first_record FROM user_other_domain_hourly WHERE tenant_id=$1 AND user_id=$2 AND bucket >= $3 AND bucket <= $4 GROUP BY domain ORDER BY sum(uplink_bytes::numeric+downlink_bytes::numeric) DESC,domain LIMIT $5"))
             .bind(tenant).bind(user).bind(start).bind(if range.is_some() { now - 1 } else { now }).bind(i64::from(policy.top_n)).fetch_all(pool).await?,
-        DetailScope::Node(node) => sqlx::query(&kind.sql("SELECT domain,sum(uplink_bytes)::bigint AS up,sum(downlink_bytes)::bigint AS down FROM user_other_domain_hourly WHERE node_id=$1 AND bucket >= $2 AND bucket <= $3 AND ($5::text IS NULL OR tenant_id=$5 OR tenant_id LIKE $6 ESCAPE '\\') GROUP BY domain ORDER BY sum(uplink_bytes::numeric+downlink_bytes::numeric) DESC,domain LIMIT $4"))
+        DetailScope::Node(node) => sqlx::query(&kind.sql("SELECT domain,sum(uplink_bytes)::bigint AS up,sum(downlink_bytes)::bigint AS down,min(min(bucket)) OVER () AS first_record FROM user_other_domain_hourly WHERE node_id=$1 AND bucket >= $2 AND bucket <= $3 AND ($5::text IS NULL OR tenant_id=$5 OR tenant_id LIKE $6 ESCAPE '\\') GROUP BY domain ORDER BY sum(uplink_bytes::numeric+downlink_bytes::numeric) DESC,domain LIMIT $4"))
             .bind(node).bind(start).bind(if range.is_some() { now - 1 } else { now }).bind(i64::from(policy.top_n)).bind(actor.tenant_scope()).bind(actor.tenant_scope_like_pattern()).fetch_all(pool).await?,
     };
     Ok(UserOtherDomains {
@@ -559,6 +561,7 @@ async fn query_for(
         expected_nodes: nodes.len() as u64,
         limited: state.get::<Option<bool>, _>("limited").unwrap_or(false),
         observed_since_unix_secs: state.get("since"),
+        first_record_unix_secs: rows.first().map(|row| row.get("first_record")),
         latest_report_unix_secs: state.get("latest"),
         rows: rows
             .into_iter()

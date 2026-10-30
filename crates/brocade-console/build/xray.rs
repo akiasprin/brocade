@@ -18,6 +18,7 @@ pub const GO_VERSION: &str = include_str!("../../../components/xray-core/.go-ver
 const MAX_RECORDS: usize = 128;
 const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -338,11 +339,20 @@ fn ledger<T>(directory: &Path, action: impl FnOnce(&mut Ledger) -> Result<T>) ->
         .truncate(false)
         .write(true)
         .open(directory.join("lock"))?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let started = Instant::now();
+    let mut next_report = PROGRESS_INTERVAL;
     loop {
         match lock.try_lock() {
             Ok(()) => break,
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+            Err(TryLockError::WouldBlock) => {
+                let elapsed = started.elapsed();
+                if elapsed >= next_report {
+                    println!(
+                        "cargo:warning=Xray build ledger lock: waiting for {:.1}s",
+                        elapsed.as_secs_f64()
+                    );
+                    next_report = elapsed + PROGRESS_INTERVAL;
+                }
                 thread::sleep(Duration::from_millis(50));
             }
             Err(error) => return Err(format!("cannot lock Xray build ledger: {error}").into()),
@@ -456,9 +466,14 @@ fn run(command: &mut Command) -> Result<Vec<u8>> {
         .stdout(stdout.reopen()?)
         .stderr(stderr.reopen()?)
         .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(15 * 60);
+    let started = Instant::now();
+    let mut next_report = PROGRESS_INTERVAL;
     loop {
         if let Some(status) = child.try_wait()? {
+            println!(
+                "cargo:warning=Xray Go command finished in {:.1}s ({status})",
+                started.elapsed().as_secs_f64()
+            );
             if !status.success() {
                 let error = read_bounded(stderr.path(), MAX_JSON_BYTES)?;
                 return Err(format!(
@@ -476,10 +491,13 @@ fn run(command: &mut Command) -> Result<Vec<u8>> {
             child.wait()?;
             return Err("Xray Go command exceeded its output limit".into());
         }
-        if Instant::now() >= deadline {
-            child.kill()?;
-            child.wait()?;
-            return Err("Xray Go command exceeded 15 minutes".into());
+        let elapsed = started.elapsed();
+        if elapsed >= next_report {
+            println!(
+                "cargo:warning=Xray Go command running for {:.1}s",
+                elapsed.as_secs_f64()
+            );
+            next_report = elapsed + PROGRESS_INTERVAL;
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -657,11 +675,19 @@ mod tests {
         fs::create_dir(source.join("main")).unwrap();
         fs::write(
             source.join("go.mod"),
-            "module example.test/xray-build\n\ngo 1.26\n",
+            "module example.test/xray-build\n\ngo 1.26\n\nrequire example.test/compat v0.0.0\nreplace example.test/compat => ./third_party/compat\n",
         )
         .unwrap();
         fs::write(source.join("go.sum"), "").unwrap();
-        fs::write(source.join("main/main.go"), "package main\nimport _ \"embed\"\n//go:embed view.html\nvar view string\nfunc main() {}\n").unwrap();
+        fs::create_dir_all(source.join("third_party/compat")).unwrap();
+        fs::write(
+            source.join("third_party/compat/go.mod"),
+            "module example.test/compat\n\ngo 1.26\n",
+        )
+        .unwrap();
+        let compatibility_source = source.join("third_party/compat/compat.go");
+        fs::write(&compatibility_source, "package compat\nconst Version = 1\n").unwrap();
+        fs::write(source.join("main/main.go"), "package main\nimport (\n_ \"embed\"\n_ \"example.test/compat\"\n)\n//go:embed view.html\nvar view string\nfunc main() {}\n").unwrap();
         fs::write(source.join("main/view.html"), "first").unwrap();
         let go = PathBuf::from(std::env::var_os("BROCADE_GO").unwrap_or_else(|| "go".into()));
         recipe().check_toolchain(&go, source).unwrap();
@@ -677,7 +703,10 @@ mod tests {
             "package main\nvar added = 1\n",
         )
         .unwrap();
-        assert_ne!(embedded, inputs(&go, source, &recipe()).unwrap());
+        let production = inputs(&go, source, &recipe()).unwrap();
+        assert_ne!(embedded, production);
+        fs::write(&compatibility_source, "package compat\nconst Version = 2\n").unwrap();
+        assert_ne!(production, inputs(&go, source, &recipe()).unwrap());
     }
 
     #[cfg(unix)]

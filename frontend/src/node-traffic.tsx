@@ -10,6 +10,7 @@ import {
   type TrafficTimeRange,
 } from './api';
 import { NodeInflowDetailsDialog } from './node-inflow-details';
+import { inflowSourceKey } from './node-inflow-source';
 import { parseTrafficRange, trafficDateInput, trafficRangeText } from './node-traffic-range';
 import { fallbackSource, NodeUserTrafficCard, type TrafficSource } from './user-traffic-realtime';
 import { NodeRealtimeProvider } from './node-realtime';
@@ -33,16 +34,13 @@ const PERIODS = [
 ] as const;
 const COLORS = ['--observe-1', '--observe-6', '--observe-4', '--observe-5', '--observe-7'];
 const FOLD = 12;
-const sourceId = (row: NodeInflowRow) =>
-  row.source === 'chain' ? JSON.stringify([row.app_id, row.chain_id, row.ingress_id]) : row.source;
-
 /** Names come from the current model; attribution always comes from the recorded row. */
 export function trafficSources(snapshot: ConsoleSnapshot | undefined) {
   const sources = new Map<string, TrafficSource>();
   for (const app of snapshot?.snapshot.apps ?? []) {
     for (const chain of app.chains) {
       const source: TrafficSource = {
-        key: JSON.stringify([app.id, chain.id, null]),
+        key: inflowSourceKey({ source: 'chain', app_id: app.id, chain_id: chain.id, ingress_id: null }),
         name: chain.name || chain.id,
         country: chain.subscription_country ?? null,
       };
@@ -87,7 +85,7 @@ function inflowModel(data: NodeInflowUsage, sourceOf: (key: string) => TrafficSo
   const users = new Map<string, InflowUser>();
   const sources = new Map<string, InflowSource>();
   for (const row of data.rows) {
-    const id = sourceId(row);
+    const id = inflowSourceKey(row);
     const total = row.downlink_bytes + row.uplink_bytes;
     if (total === 0) continue;
     const userId = `${row.tenant_id}/${row.user_id}`;
@@ -574,6 +572,7 @@ export function NodeInflowUsageCard({
           period={period}
           range={range}
           sourceOf={sourceOf}
+          colorOf={key => views?.find(view => view.id === key)?.color}
           onClose={() => setSelected(null)}
         />
       )}

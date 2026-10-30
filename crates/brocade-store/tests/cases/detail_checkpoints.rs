@@ -184,6 +184,15 @@ async fn configured_history_retention_case(failed: bool) {
                     detail.range_start_unix_secs,
                     sites.range_start_unix_secs.max(cutoff)
                 );
+                assert_eq!(
+                    detail.first_record_unix_secs,
+                    seed_buckets
+                        .iter()
+                        .copied()
+                        .filter(|&bucket| bucket >= detail.range_start_unix_secs)
+                        .min(),
+                    "first record must follow the actual retained rows in {table}"
+                );
                 let expected = seed_buckets
                     .iter()
                     .filter(|&&bucket| bucket >= detail.range_start_unix_secs)
@@ -247,6 +256,148 @@ async fn detail_history_domain_retention_is_configurable_for_uploads_queries_and
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn detail_history_failed_retention_is_configurable_for_uploads_queries_and_cleanup() {
     configured_history_retention_case(true).await;
+}
+
+async fn first_record_case(failed: bool) {
+    use brocade_deployment::source_traffic::TrafficTimeRange;
+
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let budget = OtherDomainPolicy {
+        enabled: true,
+        top_n: 1,
+        ..Default::default()
+    };
+    if failed {
+        db.store
+            .update_sniffing_failed_policy(
+                &system_admin(),
+                SniffingFailedPolicy::from_budget(budget),
+            )
+            .await
+            .unwrap();
+    } else {
+        db.store
+            .update_other_domain_policy(&system_admin(), budget)
+            .await
+            .unwrap();
+    }
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let hour = now / 3600 * 3600;
+    let generation = install_usage_generation(db.pool(), "n1", alice_usage_bindings(), now).await;
+    record_checkpoint(
+        &db,
+        failed,
+        OtherDomainReport {
+            version: 2,
+            epoch: "a".repeat(32),
+            activation_unix_secs: now,
+            read_at_unix_secs: now,
+            usage_generation_id: generation,
+            limited: false,
+            counters: Vec::new(),
+        },
+    )
+    .await;
+    for node in [false, true] {
+        let empty = query_history(&db, failed, node, SiteUsagePeriod::Month).await;
+        assert_eq!(empty.observed_since_unix_secs, Some(now));
+        assert_eq!(empty.first_record_unix_secs, None);
+    }
+    sqlx::raw_sql(
+        "INSERT INTO tenants (id,name) VALUES ('platform.other','Other');
+         INSERT INTO users (tenant_id,id,uuid) VALUES
+         ('platform.acme','bob','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'),
+         ('platform.other','alice','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb');",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let (table, key) = if failed {
+        ("user_sniffing_failed_hourly", "target")
+    } else {
+        ("user_other_domain_hourly", "domain")
+    };
+    // The oldest visible record is deliberately outside Top 1. Earlier rows from another
+    // tenant/user, outside retention, and after a custom range must not set its timestamp.
+    for (index, (age, tenant, user, bytes)) in [
+        (48, "platform.acme", "alice", 1_i64),
+        (5, "platform.other", "alice", 1),
+        (4, "platform.acme", "bob", 1),
+        (3, "platform.acme", "alice", 1),
+        (1, "platform.acme", "alice", 100),
+        (0, "platform.acme", "alice", 1000),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = if failed {
+            format!("tcp://192.0.2.{}:443", index + 1)
+        } else {
+            format!("host{index}.example")
+        };
+        sqlx::query(&format!("INSERT INTO {table} (bucket,node_id,tenant_id,user_id,{key},uplink_bytes,downlink_bytes) VALUES ($1,'n1',$2,$3,$4,$5,0)"))
+            .bind(hour - age * 3600).bind(tenant).bind(user).bind(name).bind(bytes)
+            .execute(db.pool()).await.unwrap();
+    }
+    let user = query_history(&db, failed, false, SiteUsagePeriod::Month).await;
+    let first = [hour - 3 * 3600, hour - 3600, hour]
+        .into_iter()
+        .find(|&bucket| bucket >= user.range_start_unix_secs);
+    assert_eq!(user.first_record_unix_secs, first);
+    assert_eq!(user.rows, vec![1000]);
+
+    for (start, end, expected) in [
+        (hour - 24 * 3600, hour, Some(hour - 4 * 3600)),
+        (hour - 2 * 3600, hour, Some(hour - 3600)),
+        (hour - 12 * 3600, hour - 10 * 3600, None),
+    ] {
+        let range = Some(TrafficTimeRange {
+            start_unix_secs: start,
+            end_unix_secs: end,
+        });
+        let actor = tenant_admin("platform.acme");
+        let node = if failed {
+            db.store
+                .node_sniffing_failed_targets_range(&actor, "n1", SiteUsagePeriod::Day, range)
+                .await
+                .unwrap()
+                .map_rows(|r| r.uplink_bytes + r.downlink_bytes)
+        } else {
+            db.store
+                .node_other_domains_range(&actor, "n1", SiteUsagePeriod::Day, range)
+                .await
+                .unwrap()
+                .map_rows(|r| r.uplink_bytes + r.downlink_bytes)
+        };
+        assert_eq!(node.first_record_unix_secs, expected);
+        assert_eq!(
+            node.rows,
+            if expected.is_some() {
+                vec![100]
+            } else {
+                vec![]
+            }
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn detail_history_domain_first_record_uses_scoped_rows_before_top_n() {
+    first_record_case(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn detail_history_failed_first_record_uses_scoped_rows_before_top_n() {
+    first_record_case(true).await;
 }
 
 async fn checkpoint_replay_case(failed: bool) {

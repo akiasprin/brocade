@@ -232,7 +232,11 @@ pub struct NodeInflowDetails {
 type SourceKey = (Option<String>, Option<String>, Option<String>);
 fn source_key(row: &NodeInflowRow) -> SourceKey {
     (
-        row.app_id.clone(),
+        if row.chain_id.is_none() {
+            row.app_id.clone()
+        } else {
+            None
+        },
         row.chain_id.clone(),
         if row.chain_id.is_none() {
             row.ingress_id.clone()
@@ -323,7 +327,6 @@ pub(crate) async fn details(
     let mut authenticated_up = 0;
     let mut authenticated_down = 0;
     let mut authenticated_gap = false;
-    let mut accounting_mismatch = false;
     for mut row in base
         .rows
         .into_iter()
@@ -337,11 +340,20 @@ pub(crate) async fn details(
             authenticated_gap |= row.has_gap;
         }
         let (up, down) = if row.source == NodeInflowSource::Chain {
-            known.remove(&source_key(&row)).unwrap_or_default()
+            // One chain can have several historical app rows. Consume its observation only
+            // once across those rows before deciding whether anything exceeds the ledger.
+            known
+                .get_mut(&source_key(&row))
+                .map_or((0, 0), |remaining| {
+                    let up = remaining.0.min(row.uplink_bytes);
+                    let down = remaining.1.min(row.downlink_bytes);
+                    remaining.0 -= up;
+                    remaining.1 -= down;
+                    (up, down)
+                })
         } else {
             (0, 0)
         };
-        accounting_mismatch |= up > row.uplink_bytes || down > row.downlink_bytes;
         row.uplink_bytes = row.uplink_bytes.saturating_sub(up);
         row.downlink_bytes = row.downlink_bytes.saturating_sub(down);
         if row.uplink_bytes > 0 || row.downlink_bytes > 0 {
@@ -351,7 +363,7 @@ pub(crate) async fn details(
             });
         }
     }
-    accounting_mismatch |= !known.is_empty();
+    let accounting_mismatch = known.values().any(|&(up, down)| up > 0 || down > 0);
     if accounting_mismatch {
         // A day's billing partition can predate a chain change. Subtract observed bytes
         // once across authenticated traffic instead of duplicating them in another chain's

@@ -1,4 +1,4 @@
-//! On-demand, non-durable NIC rates.
+//! Always-connected compressed transport for on-demand samples and negotiated worker RPCs.
 //!
 //! The connection is always initiated by the Agent, so neither the browser nor the control plane
 //! needs inbound access to a machine. A connected socket is cheap and idle; samples begin only on
@@ -8,7 +8,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
-    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -18,10 +17,8 @@ use brocade_deployment::protocol::{
     RealtimeUserTrafficSelector, RealtimeUserTrafficState, AGENT_PROTOCOL_VERSION,
     MAX_REALTIME_FORWARDING_TARGETS, MAX_REALTIME_USER_TRAFFIC_ROWS,
 };
-use tungstenite::{
-    client::IntoClientRequest, protocol::WebSocketConfig, Error as WebSocketError, Message,
-    WebSocket,
-};
+use futures_util::SinkExt;
+use yawc::{CompressionLevel, Frame, OpCode, Options as WebSocketOptions, WebSocket};
 
 use crate::{
     http::{HttpClient, Stream},
@@ -29,14 +26,17 @@ use crate::{
 };
 
 mod diagnostics;
+#[cfg(test)]
+mod transport_tests;
 const INITIAL_RECONNECT: Duration = Duration::from_secs(1);
 const MAX_RECONNECT: Duration = Duration::from_secs(300);
 /// NIC rates stay at the requested live cadence, while the much larger worker snapshots refresh
 /// only often enough for their 15-second UI freshness budget. This removes repeated serialization
 /// and transport of an unchanged fleet-shaped report from every one-second sample.
 const DIAGNOSTICS_REFRESH: Duration = Duration::from_secs(5);
-const MAX_FRAME_BYTES: usize = 512 * 1024;
+use brocade_deployment::agent_channel::MAX_FRAME_BYTES;
 const MAX_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 fn accepted_interval(interval_millis: u32) -> bool {
     matches!(interval_millis, 1_000 | 2_000 | 5_000)
 }
@@ -447,72 +447,78 @@ pub(crate) fn run(options: &Options, vpngate: VpngateCache) {
             return;
         }
     };
-    let mut backoff = INITIAL_RECONNECT;
-    loop {
-        match connect(options) {
-            Ok(socket) => {
-                backoff = INITIAL_RECONNECT;
-                if let Err(error) = serve(socket, &options.state_dir, &diagnostics, &vpngate) {
-                    eprintln!("realtime: connection ended: {error}");
-                }
-            }
-            Err(error) => eprintln!("realtime: connect failed: {error}"),
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("realtime: cannot start live-channel runtime: {error}");
+            return;
         }
-        thread::sleep(backoff);
-        backoff = backoff.saturating_mul(2).min(MAX_RECONNECT);
-    }
+    };
+    runtime.block_on(async {
+        let mut backoff = INITIAL_RECONNECT;
+        loop {
+            match connect(options).await {
+                Ok(socket) => {
+                    backoff = INITIAL_RECONNECT;
+                    if let Err(error) = serve(socket, options, &diagnostics, &vpngate).await {
+                        eprintln!("realtime: connection ended: {error}");
+                    }
+                }
+                Err(error) => eprintln!("realtime: connect failed: {error}"),
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = backoff.saturating_mul(2).min(MAX_RECONNECT);
+        }
+    });
 }
 
-fn connect(options: &Options) -> Result<WebSocket<Stream>, String> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let url = websocket_url(&options.server)?;
-    let mut request = url
-        .as_str()
-        .into_client_request()
-        .map_err(|_| "invalid control-plane WebSocket URL".to_owned())?;
-    let headers = request.headers_mut();
-    headers.insert(
-        "authorization",
-        format!("Bearer {}", options.token)
-            .parse()
-            .map_err(|_| "node token is not a valid HTTP header".to_owned())?,
-    );
-    headers.insert(
-        "user-agent",
-        format!("brocade-agent/{}", crate::identity::self_identity())
-            .parse()
-            .expect("binary identity is a valid HTTP header"),
-    );
-    headers.insert(
-        "x-brocade-protocol-version",
-        AGENT_PROTOCOL_VERSION
-            .to_string()
-            .parse()
-            .expect("protocol version is a valid HTTP header"),
-    );
-    // TCP, system DNS, TLS and Upgrade share one deadline. The stream enforces it beneath
-    // rustls so TLS control messages cannot extend a blocked HTTP Upgrade indefinitely.
-    let client = HttpClient::new(&options.server)?;
-    let stream = client.connect_stream(deadline)?;
-    let config = WebSocketConfig::default()
-        // Commands and samples are tiny JSON values. Bounding both directions prevents a broken
-        // or hostile peer from turning this optional channel into unbounded Agent memory.
-        .read_buffer_size(4 * 1024)
-        .write_buffer_size(0)
-        .max_write_buffer_size(MAX_WRITE_BUFFER_BYTES)
-        .max_message_size(Some(MAX_FRAME_BYTES))
-        .max_frame_size(Some(MAX_FRAME_BYTES));
-    let (mut socket, _) = tungstenite::client::client_with_config(request, stream, Some(config))
-        .map_err(|_| "WebSocket handshake failed or timed out".to_owned())?;
-    // Tungstenite documents every I/O error except WouldBlock as fatal. A read timeout therefore
-    // cannot be used as a periodic wake-up: treating TimedOut as recoverable corrupts its state,
-    // while treating it as fatal reconnects every idle interval. Nonblocking I/O plus a socket
-    // readiness wait gives sampling a precise clock and leaves WouldBlock recoverable.
-    socket
-        .get_mut()
-        .finish_handshake()
-        .map_err(|error| format!("WebSocket handshake completion failed: {:?}", error.kind()))?;
-    Ok(socket)
+fn websocket_options() -> WebSocketOptions {
+    WebSocketOptions::default()
+        .with_compression_level(CompressionLevel::default())
+        .with_utf8()
+        .with_read_buffer_capacity(4 * 1024)
+        .with_backpressure_boundary(MAX_WRITE_BUFFER_BYTES)
+        .with_max_payload_read(MAX_FRAME_BYTES + 1)
+        .with_max_read_buffer(MAX_FRAME_BYTES + 1)
+}
+
+async fn connect(options: &Options) -> Result<WebSocket<Stream>, String> {
+    connect_until(options, Instant::now() + Duration::from_secs(10)).await
+}
+
+pub(crate) async fn connect_until(
+    options: &Options,
+    deadline: Instant,
+) -> Result<WebSocket<Stream>, String> {
+    let url = websocket_url(&options.server)?
+        .parse()
+        .map_err(|_| "invalid control-plane WebSocket URL")?;
+    let request = yawc::HttpRequest::builder()
+        .header(brocade_deployment::agent_channel::CAPABILITY_HEADER, "1")
+        .header("authorization", format!("Bearer {}", options.token))
+        .header(
+            "user-agent",
+            format!("brocade-agent/{}", crate::identity::self_identity()),
+        )
+        .header(
+            "x-brocade-protocol-version",
+            AGENT_PROTOCOL_VERSION.to_string(),
+        );
+    let stream = HttpClient::new(&options.server)?
+        .connect_stream(deadline)
+        .await?;
+    // DNS, TCP, TLS and Upgrade keep the original shared deadline. Established connections
+    // have no handshake timer; their independent sampling and writes use the live-channel clock.
+    tokio::time::timeout_at(
+        deadline.into(),
+        WebSocket::handshake_with_request(url, stream, websocket_options(), request),
+    )
+    .await
+    .map_err(|_| "WebSocket handshake timed out".to_owned())?
+    .map_err(|_| "WebSocket handshake failed".to_owned())
 }
 
 fn websocket_url(server: &str) -> Result<String, String> {
@@ -526,12 +532,17 @@ fn websocket_url(server: &str) -> Result<String, String> {
     Err("server URL must start with http:// or https://".to_owned())
 }
 
-fn serve(
+async fn serve(
     mut socket: WebSocket<Stream>,
-    state_dir: &Path,
+    options: &Options,
     diagnostics_worker: &diagnostics::Worker,
     vpngate: &VpngateCache,
 ) -> Result<(), String> {
+    let state_dir = &options.state_dir;
+    let mut registration = None;
+    let mut outgoing = None;
+    let mut pending = BTreeMap::<u64, crate::channel::Pending>::new();
+    let mut expiry = tokio::time::interval(Duration::from_millis(100));
     let subscription = diagnostics_worker.subscribe();
     let mut active: Option<(Duration, bool, Option<RealtimeUserTrafficSelector>)> = None;
     let mut next_sample = Instant::now();
@@ -539,126 +550,180 @@ fn serve(
     let mut mux_baseline = None;
     let mut sampler = RateSampler::default();
     let mut user_traffic_sampler = UserTrafficSampler::default();
-    let mut write_pending = false;
     sampler.reset();
 
     loop {
-        if write_pending {
-            write_pending = flush_pending(&mut socket)?;
-        }
-        let mut would_block = false;
-        match socket.read() {
-            Ok(Message::Text(text)) => {
-                let command = serde_json::from_str::<AgentRealtimeCommand>(text.as_str())
-                    .map_err(|_| "control plane sent an invalid command".to_owned())?;
-                match command {
-                    AgentRealtimeCommand::Start {
-                        interval_millis,
-                        diagnostics,
-                        user_traffic,
-                    } if accepted_interval(interval_millis)
-                        && valid_user_traffic_selector(&user_traffic) =>
-                    {
-                        let interval = Duration::from_millis(u64::from(interval_millis));
-                        if active
-                            .as_ref()
-                            .is_none_or(|(current, _, _)| *current != interval)
-                        {
-                            sampler.reset();
-                            user_traffic_sampler.reset();
-                            next_sample = Instant::now();
-                        }
-                        // The baseline contains all observed counters, not just selected users.
-                        // A watcher change or authorization renewal only changes which deltas we
-                        // emit. Preserve the baseline; new/reset counters get their own gap, and
-                        // advance_counters rejects a baseline that has become too old.
-                        if diagnostics
-                            && active
-                                .as_ref()
-                                .is_none_or(|(_, current_diagnostics, _)| !current_diagnostics)
-                        {
-                            next_diagnostics = Instant::now();
-                            mux_baseline = None;
-                        } else if !diagnostics {
-                            mux_baseline = None;
-                        }
-                        subscription.set_enabled(diagnostics);
-                        active = Some((interval, diagnostics, user_traffic));
-                    }
-                    AgentRealtimeCommand::Start { .. } => {
-                        return Err(
-                            "control plane sent an invalid realtime sampling command".to_owned()
-                        );
-                    }
-                    AgentRealtimeCommand::Stop => {
-                        subscription.set_enabled(false);
-                        active = None;
-                        mux_baseline = None;
-                        sampler.reset();
-                        user_traffic_sampler.reset();
+        let due = active.as_ref().map(|_| next_sample);
+        let incoming = tokio::select! {
+            frame = socket.next_frame() => Some(frame),
+            request = receive_rpc(&mut outgoing), if pending.len() < brocade_deployment::agent_channel::MAX_IN_FLIGHT => {
+                if let Some(mut request) = request {
+                    if let Some(text) = request.encode(Instant::now())? {
+                        tokio::time::timeout_at(request.deadline.into(), socket.send(Frame::text(text)))
+                            .await.map_err(|_| "Agent channel RPC write timed out")?
+                            .map_err(|_| "Agent channel RPC write failed")?;
+                        pending.insert(request.id, crate::channel::Pending { allow_http: request.allow_http, deadline: request.deadline, reply: request.reply });
                     }
                 }
+                None
+            },
+            _ = expiry.tick(), if !pending.is_empty() => {
+                pending.retain(|_, request| {
+                    if request.deadline > Instant::now() { return true; }
+                    let _ = request.reply.send(Err("Agent channel RPC timed out".into()));
+                    false
+                });
+                None
+            },
+            _ = wait_for_sample(due) => None,
+        };
+        if let Some(incoming) = incoming {
+            match incoming {
+                Ok(frame) if frame.opcode() == OpCode::Text => {
+                    let command =
+                        match serde_json::from_slice::<AgentRealtimeCommand>(frame.payload()) {
+                            Ok(command) => command,
+                            Err(_) => {
+                                use brocade_deployment::agent_channel::AgentChannelResponse;
+                                match serde_json::from_slice::<AgentChannelResponse>(
+                                    frame.payload(),
+                                )
+                                .map_err(|_| "control plane sent an invalid command")?
+                                {
+                                    AgentChannelResponse::Ready { version: 1 }
+                                        if registration.is_none() =>
+                                    {
+                                        let (guard, receiver) = crate::channel::register(options)?;
+                                        registration = Some(guard);
+                                        outgoing = Some(receiver);
+                                    }
+                                    AgentChannelResponse::Wake { domains }
+                                        if registration.is_some() =>
+                                    {
+                                        crate::wake::notify(&domains)
+                                    }
+                                    AgentChannelResponse::RpcResult {
+                                        id,
+                                        status,
+                                        body,
+                                        headers,
+                                    } if registration.is_some() => {
+                                        let mut values = BTreeMap::<String, Vec<String>>::new();
+                                        for (name, value) in headers {
+                                            values.entry(name).or_default().push(value);
+                                        }
+                                        crate::channel::complete(
+                                            &mut pending,
+                                            id,
+                                            Some(crate::http::HttpResponse {
+                                                status,
+                                                body,
+                                                headers: values,
+                                            }),
+                                        );
+                                    }
+                                    AgentChannelResponse::HttpRequired { id }
+                                        if registration.is_some() =>
+                                    {
+                                        crate::channel::complete(&mut pending, id, None)
+                                    }
+                                    _ => return Err("unsupported Agent channel negotiation".into()),
+                                }
+                                continue;
+                            }
+                        };
+                    match command {
+                        AgentRealtimeCommand::Start {
+                            interval_millis,
+                            diagnostics,
+                            user_traffic,
+                        } if accepted_interval(interval_millis)
+                            && valid_user_traffic_selector(&user_traffic) =>
+                        {
+                            let interval = Duration::from_millis(u64::from(interval_millis));
+                            if active
+                                .as_ref()
+                                .is_none_or(|(current, _, _)| *current != interval)
+                            {
+                                sampler.reset();
+                                user_traffic_sampler.reset();
+                                next_sample = Instant::now();
+                            }
+                            // The baseline contains all observed counters, not just selected users.
+                            // A watcher change or authorization renewal only changes which deltas we
+                            // emit. Preserve the baseline; new/reset counters get their own gap, and
+                            // advance_counters rejects a baseline that has become too old.
+                            if diagnostics
+                                && active
+                                    .as_ref()
+                                    .is_none_or(|(_, current_diagnostics, _)| !current_diagnostics)
+                            {
+                                next_diagnostics = Instant::now();
+                                mux_baseline = None;
+                            } else if !diagnostics {
+                                mux_baseline = None;
+                            }
+                            subscription.set_enabled(diagnostics);
+                            active = Some((interval, diagnostics, user_traffic));
+                        }
+                        AgentRealtimeCommand::Start { .. } => {
+                            return Err("control plane sent an invalid realtime sampling command"
+                                .to_owned());
+                        }
+                        AgentRealtimeCommand::Stop => {
+                            subscription.set_enabled(false);
+                            active = None;
+                            mux_baseline = None;
+                            sampler.reset();
+                            user_traffic_sampler.reset();
+                        }
+                    }
+                }
+                Ok(frame) if frame.opcode() == OpCode::Close => {
+                    flush_control(&mut socket).await?;
+                    return Ok(());
+                }
+                Ok(frame) if frame.opcode() == OpCode::Ping => flush_control(&mut socket).await?,
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = flush_control(&mut socket).await;
+                    return Err(error.to_string());
+                }
             }
-            Ok(Message::Close(_)) => return Ok(()),
-            Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_)) => {}
-            Err(WebSocketError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                would_block = true;
-            }
-            Err(error) => return Err(error.to_string()),
         }
 
         if let Some((interval, diagnostics, ref user_traffic_selector)) = active {
             let now = Instant::now();
             if now >= next_sample {
-                if write_pending {
-                    // Do not build an in-memory sample queue when the control plane is not
-                    // reading. The already queued sample is retained by tungstenite; the next
-                    // delivered point starts a new segment rather than drawing across the loss.
-                    sampler.reset();
-                    user_traffic_sampler.reset();
-                } else {
-                    match read_nic(now) {
-                        Ok(reading) => {
-                            let user_traffic = user_traffic_selector.as_ref().map(|selector| {
-                                user_traffic_sampler.advance(state_dir, selector, now)
-                            });
-                            if let Some(mut sample) = sampler.advance(reading, interval) {
-                                sample.user_traffic = user_traffic;
-                                if populate_diagnostics(
-                                    &mut sample,
-                                    diagnostics,
-                                    now >= next_diagnostics,
-                                    &diagnostics_worker.health,
-                                    &diagnostics_worker.mux,
-                                    vpngate,
-                                    &mut mux_baseline,
-                                ) {
-                                    next_diagnostics = now + DIAGNOSTICS_REFRESH;
-                                }
-                                let text = encode_sample(&mut sample)?;
-                                write_pending = send_sample(&mut socket, text)?;
+                match read_nic(now) {
+                    Ok(reading) => {
+                        let user_traffic = user_traffic_selector
+                            .as_ref()
+                            .map(|selector| user_traffic_sampler.advance(state_dir, selector, now));
+                        if let Some(mut sample) = sampler.advance(reading, interval) {
+                            sample.user_traffic = user_traffic;
+                            if populate_diagnostics(
+                                &mut sample,
+                                diagnostics,
+                                now >= next_diagnostics,
+                                &diagnostics_worker.health,
+                                &diagnostics_worker.mux,
+                                vpngate,
+                                &mut mux_baseline,
+                            ) {
+                                next_diagnostics = now + DIAGNOSTICS_REFRESH;
                             }
+                            let text = encode_sample(&mut sample)?;
+                            send_sample(&mut socket, text).await?;
                         }
-                        Err(_) => sampler.reset(),
                     }
+                    Err(_) => sampler.reset(),
                 }
                 next_sample += interval;
                 if next_sample <= now {
                     next_sample = now + interval;
                 }
             }
-        }
-        if would_block {
-            // Drain all tungstenite/rustls buffered frames before waiting on the kernel socket.
-            // Flush also covers automatic Pong/Close replies; POLLOUT wakes a blocked writer.
-            write_pending = flush_pending(&mut socket)?;
-            let timeout = active
-                .as_ref()
-                .map(|_| next_sample.saturating_duration_since(Instant::now()));
-            socket
-                .get_ref()
-                .wait_for_io(write_pending, timeout)
-                .map_err(|error| error.to_string())?;
         }
     }
 }
@@ -681,26 +746,30 @@ fn encode_sample(sample: &mut AgentRealtimeSample) -> Result<String, String> {
     Ok(text)
 }
 
-/// Tungstenite queues the frame before returning WouldBlock. Retrying send would duplicate it;
-/// remember only that flushing is pending. Other errors end the socket and trigger backoff.
-fn send_sample(socket: &mut WebSocket<Stream>, text: String) -> Result<bool, String> {
-    match socket.send(Message::Text(text.into())) {
-        Ok(()) => Ok(false),
-        Err(WebSocketError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            Ok(true)
-        }
-        Err(error) => Err(error.to_string()),
+async fn wait_for_sample(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
     }
 }
 
-fn flush_pending(socket: &mut WebSocket<Stream>) -> Result<bool, String> {
-    match socket.flush() {
-        Ok(()) => Ok(false),
-        Err(WebSocketError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            Ok(true)
-        }
-        Err(error) => Err(error.to_string()),
-    }
+async fn send_sample(socket: &mut WebSocket<Stream>, text: String) -> Result<(), String> {
+    tokio::time::timeout(WRITE_TIMEOUT, socket.send(Frame::text(text)))
+        .await
+        .map_err(|_| "realtime sample write timed out".to_owned())?
+        .map_err(|error| error.to_string())
+}
+
+async fn flush_control(socket: &mut WebSocket<Stream>) -> Result<(), String> {
+    // yawc queues automatic Pong/Close replies. Drive readiness before flushing so they
+    // reach the peer even when no samples are active or this is the last read before exit.
+    tokio::time::timeout(WRITE_TIMEOUT, async {
+        std::future::poll_fn(|cx| socket.poll_ready_unpin(cx)).await?;
+        socket.flush().await
+    })
+    .await
+    .map_err(|_| "realtime control write timed out".to_owned())?
+    .map_err(|error| error.to_string())
 }
 
 fn read_nic(instant: Instant) -> Result<NicReading, String> {
@@ -734,10 +803,21 @@ fn unix_millis() -> i64 {
         .unwrap_or(0)
 }
 
+async fn receive_rpc(
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<crate::channel::Outgoing>>,
+) -> Option<crate::channel::Outgoing> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::options::ApplyMode;
+    use std::thread;
+    use tungstenite::Message;
 
     #[test]
     fn user_rates_use_non_resetting_deltas_and_exact_label_selection() {
@@ -1112,9 +1192,9 @@ mod tests {
         assert!(state_delta.mux.is_some());
     }
 
-    #[test]
+    #[tokio::test]
     #[allow(clippy::result_large_err)] // tungstenite's required handshake callback signature
-    fn the_custom_agent_transport_completes_a_real_websocket_handshake() {
+    async fn the_custom_agent_transport_completes_a_real_websocket_handshake() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -1146,18 +1226,19 @@ mod tests {
             apply_mode: ApplyMode::StateDir,
             vpngate_stats_window: std::time::Duration::from_secs(900),
         };
-        let socket = connect(&options).unwrap();
+        let socket = connect(&options).await.unwrap();
         serve(
             socket,
-            &options.state_dir,
+            &options,
             &diagnostics::Worker::start(options.state_dir.clone()).unwrap(),
             &Default::default(),
         )
+        .await
         .unwrap();
         server.join().unwrap();
     }
-    #[test]
-    fn buffered_commands_and_ping_are_drained_before_readiness_wait() {
+    #[tokio::test]
+    async fn buffered_commands_and_ping_are_drained_before_sampling_wait() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -1201,11 +1282,12 @@ mod tests {
         };
         let worker = diagnostics::Worker::start(options.state_dir.clone()).unwrap();
         serve(
-            connect(&options).unwrap(),
-            &options.state_dir,
+            connect(&options).await.unwrap(),
+            &options,
             &worker,
             &Default::default(),
         )
+        .await
         .unwrap();
         server.join().unwrap();
         assert!(worker.health.lock().unwrap().is_none());

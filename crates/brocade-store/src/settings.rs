@@ -16,28 +16,57 @@ use sqlx::{PgPool, Row};
 
 use crate::{AdminContext, Result, StoreError};
 
-/// Live release policy; it changes no model revision or generated artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnlockDetectionMode {
+    Manual,
+    Scheduled,
+}
+impl UnlockDetectionMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Scheduled => "scheduled",
+        }
+    }
+    pub(crate) fn parse(value: String) -> Result<Self> {
+        match value.as_str() {
+            "manual" => Ok(Self::Manual),
+            "scheduled" => Ok(Self::Scheduled),
+            _ => Err(StoreError::InvalidData(
+                "invalid unlock detection mode".into(),
+            )),
+        }
+    }
+}
+
+/// Live release and diagnostic policy; changes no model revision or generated artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentSettings {
     pub unattended: bool,
     pub xray_handoff_beta: bool,
+    pub unlock_detection_mode: UnlockDetectionMode,
+    pub unlock_detection_interval_hours: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateDeploymentSettings {
     pub unattended: Option<bool>,
     pub xray_handoff_beta: Option<bool>,
+    pub unlock_detection_mode: Option<UnlockDetectionMode>,
+    pub unlock_detection_interval_hours: Option<u32>,
 }
 
 pub async fn load_deployment_settings(pool: &PgPool) -> Result<DeploymentSettings> {
-    let row = sqlx::query(
-        "SELECT deployment_unattended, xray_handoff_beta FROM control_state WHERE id = TRUE",
-    )
-    .fetch_one(pool)
-    .await?;
+    let row=sqlx::query("SELECT deployment_unattended,xray_handoff_beta,unlock_detection_mode,unlock_detection_interval_hours FROM control_state WHERE id=TRUE").fetch_one(pool).await?;
     Ok(DeploymentSettings {
         unattended: row.try_get("deployment_unattended")?,
         xray_handoff_beta: row.try_get("xray_handoff_beta")?,
+        unlock_detection_mode: UnlockDetectionMode::parse(row.try_get("unlock_detection_mode")?)?,
+        unlock_detection_interval_hours: u32::try_from(
+            row.try_get::<i32, _>("unlock_detection_interval_hours")?,
+        )
+        .map_err(|_| StoreError::InvalidData("invalid unlock detection interval".into()))?,
     })
 }
 
@@ -48,23 +77,41 @@ pub async fn update_deployment_settings(
 ) -> Result<DeploymentSettings> {
     if !actor.is_system_admin() {
         return Err(StoreError::Forbidden(
-            "only system-admin can update deployment settings".to_owned(),
+            "only system-admin can update deployment settings".into(),
         ));
     }
-    let row = sqlx::query(
-        "UPDATE control_state SET
-        deployment_unattended = COALESCE($1, deployment_unattended),
-        xray_handoff_beta = COALESCE($2, xray_handoff_beta)
-        WHERE id = TRUE RETURNING deployment_unattended, xray_handoff_beta",
-    )
-    .bind(settings.unattended)
-    .bind(settings.xray_handoff_beta)
-    .fetch_one(pool)
-    .await?;
-    Ok(DeploymentSettings {
-        unattended: row.try_get("deployment_unattended")?,
-        xray_handoff_beta: row.try_get("xray_handoff_beta")?,
-    })
+    if settings
+        .unlock_detection_interval_hours
+        .is_some_and(|hours| !(1..=720).contains(&hours))
+    {
+        return Err(StoreError::InvalidData(
+            "解锁检测间隔须为 1–720 小时".into(),
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    let previous:(String,i32)=sqlx::query_as("SELECT unlock_detection_mode,unlock_detection_interval_hours FROM control_state WHERE id=TRUE FOR UPDATE").fetch_one(&mut *tx).await?;
+    let mode = match settings.unlock_detection_mode {
+        Some(mode) => mode.as_str(),
+        None => previous.0.as_str(),
+    };
+    let hours = settings
+        .unlock_detection_interval_hours
+        .map_or(previous.1, |v| v as i32);
+    let changed = mode != previous.0 || hours != previous.1;
+    sqlx::query("UPDATE control_state SET deployment_unattended=COALESCE($1,deployment_unattended),xray_handoff_beta=COALESCE($2,xray_handoff_beta),unlock_detection_mode=$3,unlock_detection_interval_hours=$4 WHERE id=TRUE")
+        .bind(settings.unattended).bind(settings.xray_handoff_beta).bind(mode).bind(hours).execute(&mut *tx).await?;
+    if changed {
+        if mode == "scheduled" {
+            sqlx::query("UPDATE control_state SET unlock_detection_requested_at=now(),unlock_detection_next_run_at=now()+make_interval(hours=>$1) WHERE id=TRUE").bind(hours).execute(&mut *tx).await?;
+            crate::unlock_probe::wake_discovery(&mut tx).await?;
+        } else {
+            sqlx::query("UPDATE control_state SET unlock_detection_next_run_at=NULL WHERE id=TRUE")
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    tx.commit().await?;
+    load_deployment_settings(pool).await
 }
 
 /// The non-empty values flow may take. Xray-core's vless inbound accepts only `vless.XRV` and

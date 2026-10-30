@@ -29,6 +29,8 @@ mod onboarding;
 mod other_domain;
 mod pg;
 mod ping_probe;
+mod prerelease_0003;
+mod prerelease_user_cycle;
 mod probe;
 mod provision;
 mod public_ip;
@@ -43,14 +45,21 @@ mod source_traffic;
 mod subscription_client;
 mod traffic;
 mod traffic_limit;
+mod unlock_probe;
 mod upgrade;
+pub use unlock_probe::{
+    ChainUnlockProbeItem, ChainUnlockProbePage, ChainUnlockProbeReports, UnlockDetectionPolicy,
+    UnlockProbeState, UnlockProbeTrigger, UnlockProbeView,
+};
 mod user_traffic;
 pub use traffic_limit::NodeTrafficLimitView;
 mod tunnel_probe;
 mod usage;
+mod user_cycle_reset;
 mod user_machine_usage;
 mod user_presence;
 mod user_service;
+pub use user_cycle_reset::{UserCycleResetRequest, UserCycleResetResult};
 pub use user_service::{
     UserCyclePeriod, UserCycleUsage, UserServicePolicyPreview, UserServicePolicyWrite,
     UserServiceState,
@@ -214,7 +223,8 @@ pub use retention::{
     RetentionCleanupView, RetentionSchedule, UpdateDataRetentionPolicy, MAX_RETENTION_HOURS,
 };
 pub use settings::{
-    DeploymentSettings, SettingsSnapshot, UpdateDeploymentSettings, UpdateSettingsResult,
+    DeploymentSettings, SettingsSnapshot, UnlockDetectionMode, UpdateDeploymentSettings,
+    UpdateSettingsResult,
 };
 pub use site_usage::{NodeSiteUsage, NodeSiteUser, NodeSiteUsers};
 pub use source_traffic::{NodeInflowDetailRow, NodeInflowDetails};

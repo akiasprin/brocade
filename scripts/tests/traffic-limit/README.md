@@ -58,6 +58,33 @@ verifier; it changes only the disposable environment, never host or fleet rules.
 The fixture's bounded checkpoint readers have a host-safe regression test:
 `python3 -m unittest discover -s scripts/tests/traffic-limit -p 'test_*.py'`.
 
+NIC adoption and cleanup also have Agent-only kernel regressions. Set
+`BROCADE_TRAFFIC_LIMIT_NET_IMAGE` to an image containing full iproute2 and run:
+
+```sh
+BROCADE_TRAFFIC_LIMIT_NET_IMAGE=brocade-forwarding-continuity:local \
+  cargo test -p brocade-agent --locked traffic_limit_ -- --ignored \
+  --skip traffic_limit_netlink_guest --skip traffic_limit_real_xray_generations \
+  --test-threads=1 --nocapture
+```
+
+Both selected tests must pass; an empty match is not acceptance. The additional
+compatibility fixture needs host `/dev/net/tun`, mounted only into its disposable
+container. It creates a persistent multiqueue TAP there to obtain a real
+kernel-default `mq 0:` with `:1` parents, rather than synthesizing that JSON. Cases
+cover repeated adoption/disable, legacy ingress, shared ingress and egress blocks,
+foreign filters on both owned HTB roots, and IPv4-only redirect drift. Existing
+cases cover ordinary schedulers, HTB default drift, exact 32/64-bit rates and
+external shaping preservation. The tests share only a container helper; the
+netlink guest entry retains its existing exact test name.
+
+When the fixture image has older glibc than the host, build the test executable
+for `x86_64-unknown-linux-musl` using the repository's configured cross toolchain
+and add that `--target` to the command. A guest that cannot start the executable
+is a failed fixture, not a successful compatibility check. Compare iproute2
+versions using separate images; these container runs share the host Linux kernel
+and do not certify older kernels or ARM64.
+
 Results retain the binary and fixture SHA-256, guest OS/kernel, target/measured
 throughput, real configuration receipts, logs, and restart evidence. KVM must
 produce a different kernel boot ID; Docker records different container start

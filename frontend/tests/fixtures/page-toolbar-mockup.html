@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark" data-palette="dailan">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" />
+    <title>页头工具栏 mockup</title>
+    <script>
+      /* 首帧之前写好方案与主题：生产的颜色过渡不应从旧外观渐变过来。
+         候选方案都放在苹果系配色上（iOS 中性底 × 蓝），现状保留生产配色。 */
+      (() => {
+        const params = new URLSearchParams(location.search);
+        const theme = params.get('theme') === 'light' ? 'light' : 'dark';
+        try {
+          localStorage.setItem('brocade-console:theme', theme);
+          localStorage.setItem('brocade-console:palette', 'dailan');
+        } catch {}
+        const option = params.get('tb') ?? 'a';
+        const root = document.documentElement;
+        root.dataset.theme = theme;
+        if (['a', 'b', 'c', 'd'].includes(option)) {
+          root.dataset.tb = option;
+          root.dataset.base = 'ios';
+          root.dataset.accent = 'blue';
+        }
+        document.querySelector('meta[name="color-scheme"]').content = theme;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="mk-dock"></div>
+    <script type="module">
+      import RefreshRuntime from '/@react-refresh';
+      RefreshRuntime.injectIntoGlobalHook(window);
+      window.$RefreshReg$ = () => {};
+      window.$RefreshSig$ = () => type => type;
+      window.__vite_plugin_react_preamble_installed__ = true;
+    </script>
+    <script type="module" src="./page-toolbar-mockup.tsx"></script>
+  </body>
+</html>

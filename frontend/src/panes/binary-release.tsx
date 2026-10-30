@@ -132,7 +132,13 @@ export function useBinaryRelease(component: BinaryComponent) {
   const xrayStrategy = handoffBeta && selection.beta ? selection.strategy : 'restart';
   const setXrayStrategy = (strategy: Exclude<XrayReleaseStrategy, 'handoff'>) =>
     setSelection({ beta: handoffBeta, strategy });
-  const [xrayDrainTimeoutSecs, setXrayDrainTimeoutSecs] = useState(120);
+  const [xrayDrainTimeoutSecs, setXrayDrainTimeoutSecs] = useState('120');
+  const drainSeconds = Number(xrayDrainTimeoutSecs);
+  const drainTimeoutValid =
+    /^\d+$/.test(xrayDrainTimeoutSecs) &&
+    Number.isInteger(drainSeconds) &&
+    drainSeconds >= 10 &&
+    drainSeconds <= 86_400;
 
   const view = releases.data;
   const fleet = nodes.data?.nodes ?? [];
@@ -164,8 +170,10 @@ export function useBinaryRelease(component: BinaryComponent) {
     await qc.invalidateQueries({ queryKey: ['nodes'] });
   };
   const create = useMutation({
-    mutationFn: () =>
-      createBinaryRelease(component, {
+    mutationFn: () => {
+      if (component === 'xray' && xrayStrategy !== 'restart' && !drainTimeoutValid)
+        throw new Error('排空等待须为 10–86400 秒的整数。');
+      return createBinaryRelease(component, {
         idempotency_key: idempotencyKey,
         build_id: releases.data!.available.build_id,
         nodes: selected,
@@ -173,10 +181,11 @@ export function useBinaryRelease(component: BinaryComponent) {
         ...(component === 'xray'
           ? {
               xray_strategy: xrayStrategy,
-              ...(xrayStrategy === 'restart' ? {} : { xray_drain_timeout_secs: xrayDrainTimeoutSecs }),
+              ...(xrayStrategy === 'restart' ? {} : { xray_drain_timeout_secs: drainSeconds }),
             }
           : {}),
-      }),
+      });
+    },
     onSuccess: async view => {
       setAskCreate(false);
       await accept(view);
@@ -220,6 +229,7 @@ export function useBinaryRelease(component: BinaryComponent) {
     setXrayStrategy,
     xrayDrainTimeoutSecs,
     setXrayDrainTimeoutSecs,
+    drainTimeoutValid,
     create,
     cancel,
     retry,
@@ -452,17 +462,20 @@ export function BinaryReleaseTab({
                         type="number"
                         min={10}
                         max={86_400}
-                        step={10}
+                        step={1}
                         aria-label="旧进程排空等待秒数"
                         value={release.xrayDrainTimeoutSecs}
                         disabled={busy}
-                        onChange={event =>
-                          release.setXrayDrainTimeoutSecs(
-                            Math.min(86_400, Math.max(10, Number(event.currentTarget.value) || 10)),
-                          )
-                        }
+                        aria-invalid={!release.drainTimeoutValid}
+                        aria-describedby={!release.drainTimeoutValid ? 'xray-drain-error' : undefined}
+                        onChange={event => release.setXrayDrainTimeoutSecs(event.currentTarget.value)}
                       />
                       <span>秒</span>
+                      {!release.drainTimeoutValid && (
+                        <span id="xray-drain-error" role="alert">
+                          请输入 10–86400 秒的整数
+                        </span>
+                      )}
                     </label>
                   )}
                 </div>
@@ -477,7 +490,12 @@ export function BinaryReleaseTab({
               <button
                 className={selected.length ? 'btn primary' : 'btn'}
                 type="button"
-                disabled={!editable || selected.length === 0 || busy}
+                disabled={
+                  !editable ||
+                  selected.length === 0 ||
+                  busy ||
+                  (release.component === 'xray' && release.xrayStrategy !== 'restart' && !release.drainTimeoutValid)
+                }
                 onClick={approve}
               >
                 {release.create.isPending ? '批准中…' : '批准'}

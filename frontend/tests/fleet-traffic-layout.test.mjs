@@ -8,20 +8,17 @@ const end = css.indexOf('/* ── 首次上线引导层', start);
 assert.ok(start > 0 && end > start, '机队实时流量样式标记存在且顺序有效');
 const styles = css.slice(start, end);
 
-test('实时页签铺满连续纸，矩阵按板面宽度均分列宽', () => {
+test('实时页签铺满连续纸，矩阵列宽、方格和地区间距固定', () => {
   assert.ok(start > 0 && end > start && styles.length > 0);
-  assert.match(styles, /\.flt-cockpit\s*\{[^}]*grid-template-columns:\s*300px minmax\(0, 1fr\);[^}]*margin:\s*0;/);
-  assert.match(styles, /\.flt-board\s*\{[^}]*container-type:\s*inline-size;/);
-  assert.match(styles, /--flt-col:\s*clamp\(\s*22px,[\s\S]*?100cqw[\s\S]*?var\(--flt-columns\)\),\s*30px\s*\)/);
+  assert.match(css, /\.usage-cockpit,\s*\.flt-cockpit\s*\{[^}]*grid-template-columns:\s*300px minmax\(0, 1fr\);/);
+  assert.doesNotMatch(styles, /--flt-ledger-unit/);
+  assert.match(styles, /--flt-col:\s*30px;/);
+  assert.match(styles, /--flt-cell:\s*calc\(var\(--flt-col\) - 6px\);/);
+  assert.match(styles, /--flt-gap:\s*8px;/);
+  assert.doesNotMatch(styles, /cqw|--flt-col:\s*clamp|--flt-gap:\s*6px/);
   // 窄屏不缩小表格，改为按用户的流向列表；用量卡 620px 以下的单列读数栏不被覆盖。
-  assert.match(
-    styles,
-    /@container \(max-width: 680px\)\s*\{\s*\.flt-board\s*\{\s*display:\s*none;\s*\}\s*\.flt-list\s*\{\s*display:\s*block;/,
-  );
-  assert.match(
-    styles,
-    /@container \(min-width: 621px\) and \(max-width: 1080px\)\s*\{\s*\.flt-cockpit\.dense > \.usage-ledger/,
-  );
+  assert.match(styles, /@container \(max-width: 680px\)\s*\{\s*\.flt-board\s*\{\s*display:\s*none;/);
+  assert.match(styles, /\.flt-list\s*\{\s*display:\s*block;/);
 });
 
 test('吸附列、准星和空闲格跟随页签纸面取色', () => {

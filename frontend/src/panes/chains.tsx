@@ -1,3 +1,6 @@
+import { ChainUnlockTable } from './chain-unlock-table';
+import { ChainGroupMove } from './chain-group-move';
+import { ChainUnlockControl } from './node-unlock';
 import { useMetricQuery } from '../ui/metric-cadence';
 import { useInitialReady } from '../ui/use-initial-ready';
 import {
@@ -68,6 +71,7 @@ import {
   createApp,
   reorderApps,
   reorderChains,
+  moveChain,
 } from '../api';
 import { DEFAULT_VLESS_ENCRYPTION, encryptionTicketError, encryptionPaddingError } from '../vless-encryption';
 import type { VlessEncryptionOptions } from '../api';
@@ -102,7 +106,7 @@ export { subscriptionFlag } from '../ui/subscription-country';
 import { RegionFlag } from '../ui/region-flag';
 import { Icon, ListIcon, PanelTitle, type IconName } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
-import { navigate, returnTo } from '../forge/route';
+import { navigate, navigateInPlace, returnTo } from '../forge/route';
 import { ProbeBanner, byChain, toneOf, toneTitle } from '../ui/probe';
 import { appId as randomAppId } from '../model-id';
 import { type CrumbSeg, type Win } from '../wm/store';
@@ -267,9 +271,22 @@ export function ChainsPane({ win }: { win: Win }) {
   // 面包屑用链名。snapshot 在列表页已拉取，通常命中缓存；名称缺失或未加载时回退到链 id。
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const chainName = (app: string, chain: string) =>
-    snapshot.data?.snapshot.apps.find(a => a.id === app)?.chains.find(c => c.id === chain)?.name || chain;
+    snapshot.data?.snapshot.apps.find(a => a.id === app)?.chains.find(c => c.id === chain)?.name ||
+    snapshot.data?.snapshot.apps.flatMap(a => a.chains).find(c => c.id === chain)?.name ||
+    chain;
   useCrumb(win, crumbOf(drill, chainName));
-  if (drill.p === 'chain') return <ChainDetail app={drill.app} chain={drill.chain} />;
+  const currentApp =
+    drill.p === 'chain'
+      ? snapshot.data?.snapshot.apps.find(app => app.chains.some(chain => chain.id === drill.chain))?.id
+      : undefined;
+  if (drill.p === 'chain')
+    return (
+      <ChainDetail
+        key={`${currentApp ?? drill.app}/${drill.chain}`}
+        app={currentApp ?? drill.app}
+        chain={drill.chain}
+      />
+    );
   if (drill.p === 'new') return <NewChain app={drill.app} />;
   return <ChainList go={go} />;
 }
@@ -320,7 +337,7 @@ function chainAttentionTone(
   if (disabled || !ingress) return 'bad';
   const probeTone = toneOf(probe);
   if (probeTone === 'down') return 'bad';
-  if (probeTone === 'odd' || probeTone === 'slow') return 'warn';
+  if (probeTone === 'odd') return 'warn';
   if (probeTone === 'none' || users === 0) return 'idle';
   return 'ok';
 }
@@ -2409,8 +2426,8 @@ export function IngressStreamRow({
         hysteria2: next.hysteria2 ?? null,
         mtproto: next.mtproto === undefined ? (currentWires(ingress).mtproto ?? null) : next.mtproto,
       };
-      const base = ingressUpsertBody(ingress, { wires });
-      return upsertIngress(appId, base, base);
+      const base = ingressUpsertBody(ingress);
+      return upsertIngress(appId, ingressUpsertBody(ingress, { wires }), base);
     },
     onSuccess: async () => {
       setDraftPath(null);
@@ -4233,6 +4250,21 @@ function orderElements(root: HTMLElement, order: OrderDrag): HTMLElement[] {
 }
 
 function ChainList({ go }: { go: (d: Drill) => void }) {
+  const [view, setView] = useState<'cards' | 'unlock'>(() => {
+    try {
+      return localStorage.getItem('brocade-console:chain-view') === 'unlock' ? 'unlock' : 'cards';
+    } catch {
+      return 'cards';
+    }
+  });
+  const changeView = (next: 'cards' | 'unlock') => {
+    setView(next);
+    try {
+      localStorage.setItem('brocade-console:chain-view', next);
+    } catch {
+      /* Preference storage may be unavailable; the current view still works. */
+    }
+  };
   const { who } = useSession();
   const qc = useQueryClient();
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
@@ -4286,7 +4318,9 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
   const [renaming, setRenaming] = useState<{ id: string; label: string } | null>(null);
   const [orderError, setOrderError] = useState<unknown>(null);
   const [orderDrag, setOrderDragState] = useState<OrderDrag | null>(null);
+  const [chainDropTarget, setChainDropTarget] = useState<string | null>(null);
   const orderDragRef = useRef<OrderDrag | null>(null);
+  const orderDragCleanup = useRef<(() => void) | null>(null);
   const createGuardScope = 'chains:create-group';
   const renameGuardScope = renaming ? `chains:rename-group:${renaming.id}` : 'chains:rename-group';
   const creatingDirty = creating !== null && creating.label !== '';
@@ -4316,6 +4350,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
 
   useEffect(
     () => () => {
+      orderDragCleanup.current?.();
       document.body.classList.remove('chain-order-dragging');
       sectionsRef.current?.classList.remove('app-order-dragging');
       // 拖拽进行中卸载（如导航离开）时，幽灵是挂在 body 上的游离节点，一并清掉。
@@ -4373,6 +4408,11 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     });
   };
 
+  const stageGroupMove = (source: string, chain: string, target: string) => {
+    setOrderError(null);
+    void moveChain(source, chain, target).then(invalidate).catch(setOrderError);
+  };
+
   const nudgeOrder = (event: ReactKeyboardEvent<HTMLButtonElement>, order: OrderDrag) => {
     const offset =
       event.key === 'ArrowUp' || event.key === 'ArrowLeft'
@@ -4404,6 +4444,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     // 明确抓手始终可拖；整张链卡还必须运行在支持悬停的精细指针设备上。
     const finePointer = window.matchMedia('(hover: hover) and (pointer: fine)').matches;
     if (!canStartOrderDrag(event.pointerType, onGrip, finePointer)) return;
+    orderDragCleanup.current?.();
     // 此处不 preventDefault：按下若未越过阈值仍是一次点击（打开这条链），而在部分实现里
     // 取消 pointerdown 会连带吞掉紧随的 click。文本选区改由越阈后 start() 清除、并靠
     // `.chain-order-dragging` 的 user-select:none 兜住。
@@ -4434,6 +4475,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     let frameDirty = false;
     let scrollOrigin = 0;
     let slots: OrderSlot[] = [];
+    let targetAppId: string | null = null;
 
     const scrollPosition = () => (scroller === window ? window.scrollY : (scroller as HTMLElement).scrollTop);
 
@@ -4445,6 +4487,15 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     const evaluate = () => {
       const current = orderDragRef.current;
       if (!current) return;
+      if (descriptor.kind === 'chains') {
+        const group = [...(dragRoot?.querySelectorAll<HTMLElement>('[data-order-kind="app"]') ?? [])].find(element => {
+          const rect = element.getBoundingClientRect();
+          return lastX >= rect.left && lastX <= rect.right && lastY >= rect.top && lastY <= rect.bottom;
+        });
+        targetAppId = group?.dataset.orderId ?? null;
+        setChainDropTarget(targetAppId !== descriptor.appId ? targetAppId : null);
+        if (targetAppId !== descriptor.appId) return;
+      }
       const order = orderForPointer(
         descriptor.order,
         descriptor.active,
@@ -4545,10 +4596,12 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     const finish = (commit: boolean) => {
       if (ended) return;
       ended = true;
+      orderDragCleanup.current = null;
       cancelAnimationFrame(raf);
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
       window.removeEventListener('pointercancel', cancel);
+      window.removeEventListener('keydown', keydown);
       document.body.classList.remove('chain-order-dragging');
       if (ghost) {
         ghost.remove();
@@ -4562,7 +4615,15 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
         dragRoot.classList.remove('app-order-dragging');
       }
       setOrderDrag(null);
+      setChainDropTarget(null);
       if (!started) return;
+      if (descriptor.kind === 'chains') {
+        if (commit && targetAppId && targetAppId !== descriptor.appId) {
+          stageGroupMove(descriptor.appId, descriptor.active, targetAppId);
+          return;
+        }
+        if (!targetAppId) return;
+      }
       if (commit && current && !sameOrder(current.order, current.original)) persistOrder(current);
     };
     const up = (pointer: PointerEvent) => {
@@ -4575,11 +4636,19 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     const cancel = (pointer: PointerEvent) => {
       if (pointer.pointerId === pointerId) finish(false);
     };
+    const keydown = (key: KeyboardEvent) => {
+      if (key.key === 'Escape') {
+        key.preventDefault();
+        finish(false);
+      }
+    };
     // 监听放在 window：App 换位会搬动包含抓手的 DOM 分组，部分浏览器会在此时中断
     // 元素级 pointer 事件；window 与 pointer capture 配合可让整个手势持续到抬手。
     window.addEventListener('pointermove', move, { passive: false });
     window.addEventListener('pointerup', up);
     window.addEventListener('pointercancel', cancel);
+    window.addEventListener('keydown', keydown);
+    orderDragCleanup.current = () => finish(false);
   };
 
   const create = useMutation({
@@ -4647,6 +4716,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
       row => row.chain.id,
     ),
   }));
+  const chainAppIds = new Map(snapshotApps.flatMap(app => app.chains.map(chain => [chain.id, app.id] as const)));
   const listenerChainReferences = snapshotApps.flatMap(app =>
     app.steps.flatMap(source =>
       source.rules.flatMap(rule =>
@@ -4654,7 +4724,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
           ? [
               {
                 source: rowKey(app.id, source.chain),
-                target: rowKey(app.id, rule.a.listener.chain),
+                target: rowKey(chainAppIds.get(rule.a.listener.chain) ?? app.id, rule.a.listener.chain),
                 at: `${source.chain}/${source.node}`,
               },
             ]
@@ -4701,45 +4771,61 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
           <ListIcon of="chains" />
           <h4>线路</h4>
           <span className="sp" />
-          {selecting ? (
-            <>
-              <button className="btn" onClick={exitSelect}>
-                取消
-              </button>
-              {/* 选中数量显示在按钮上：它是此时唯一需要确认的信息。删除只写入草稿，
+          <div className="chain-list-actions">
+            <SegmentedControl
+              value={view}
+              options={[
+                { value: 'cards', label: '卡片' },
+                { value: 'unlock', label: '解锁' },
+              ]}
+              ariaLabel="线路视图"
+              disabled={selecting || creating !== null || renaming !== null}
+              onChange={changeView}
+            />
+            {selecting ? (
+              <>
+                <button className="btn" onClick={exitSelect}>
+                  取消
+                </button>
+                {/* 选中数量显示在按钮上：它是此时唯一需要确认的信息。删除只写入草稿，
                   顶栏草稿条会逐条列出且提交前可预览，因此此处不再增加确认。 */}
-              <button
-                className="btn danger"
-                disabled={picked.size === 0 || blockedPickedReferences.length > 0}
-                title={
-                  blockedPickedReferences.length > 0
-                    ? `不能删除：先同时选择引用方 ${[
-                        ...new Set(blockedPickedReferences.map(reference => reference.at)),
-                      ].join('、')}`
-                    : `删除选中的 ${picked.size} 条链：接入面和挂在下面的授权关系一起删。进草稿，提交才生效`
-                }
-                onClick={() => {
-                  // 引用方先删、监听所有者后删，与服务端的引用保护约束一致。
-                  for (const key of pickedDeletionOrder()) {
-                    const slash = key.indexOf('/');
-                    deleteChain(key.slice(0, slash), key.slice(slash + 1));
+                <button
+                  className="btn danger"
+                  disabled={picked.size === 0 || blockedPickedReferences.length > 0}
+                  title={
+                    blockedPickedReferences.length > 0
+                      ? `不能删除：先同时选择引用方 ${[
+                          ...new Set(blockedPickedReferences.map(reference => reference.at)),
+                        ].join('、')}`
+                      : `删除选中的 ${picked.size} 条链：接入面和挂在下面的授权关系一起删。进草稿，提交才生效`
                   }
-                  exitSelect();
-                }}
-              >
-                删除链{picked.size > 0 && ` ${picked.size}`}
-              </button>
-            </>
-          ) : (
-            <>
-              <button className="btn" disabled={!!creating || !owner} onClick={() => setSelecting(true)}>
-                多选
-              </button>
-              <button className="btn primary" disabled={!!creating || !owner} onClick={beginCreate}>
-                ＋ 新建分组
-              </button>
-            </>
-          )}
+                  onClick={() => {
+                    // 引用方先删、监听所有者后删，与服务端的引用保护约束一致。
+                    for (const key of pickedDeletionOrder()) {
+                      const slash = key.indexOf('/');
+                      deleteChain(key.slice(0, slash), key.slice(slash + 1));
+                    }
+                    exitSelect();
+                  }}
+                >
+                  删除链{picked.size > 0 && ` ${picked.size}`}
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  className="btn"
+                  disabled={view === 'unlock' || !!creating || !owner}
+                  onClick={() => setSelecting(true)}
+                >
+                  多选
+                </button>
+                <button className="btn primary" disabled={!!creating || !owner} onClick={beginCreate}>
+                  ＋ 新建分组
+                </button>
+              </>
+            )}
+          </div>
         </header>
 
         {probes.error && <ErrorBox error={probes.error} />}
@@ -4793,11 +4879,19 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
           >
             分组是线路的计费单元；同类链放在同一个分组里。
           </EmptyState>
+        ) : view === 'unlock' ? (
+          <ChainUnlockTable
+            groups={groups.map(group => ({
+              ...group,
+              chains: group.chains.map(row => ({ ...row, tone: chainTone(row), title: chainToneTitle(row) })),
+            }))}
+            onOpen={(app, chain) => go({ p: 'chain', app, chain })}
+          />
         ) : (
           <div className={`chain-sections${orderDrag?.kind === 'apps' ? ' app-order-dragging' : ''}`} ref={sectionsRef}>
             {groups.map((g, gi) => (
               <section
-                className={`chain-section${orderDrag?.kind === 'apps' && orderDrag.active === g.app.id ? ' order-drag-active' : ''}`}
+                className={`chain-section${orderDrag?.kind === 'apps' && orderDrag.active === g.app.id ? ' order-drag-active' : ''}${chainDropTarget === g.app.id ? ' chain-drop-target' : ''}`}
                 key={g.app.id}
                 data-order-kind="app"
                 data-order-id={g.app.id}
@@ -5461,6 +5555,17 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
             statusTone={attentionTone}
             statusLabel={attentionTitle}
           />
+          <div className="nd-tools">
+            {can(who.role, 'system') && (
+              <ChainGroupMove
+                apps={snapshot.data?.snapshot.apps ?? []}
+                app={a}
+                chain={c}
+                onMoved={target => navigateInPlace('chains', { p: 'chain', app: target, chain })}
+              />
+            )}
+            <ChainUnlockControl app={app} chain={chain} name={c.name || chain} editable={editable} />
+          </div>
         </header>
         <div className="nd-paper-body chain-detail-body">
           {/* 「主干」一节已移除：主干由规则表派生（chainSpine 沿 any→Forward 遍历得出），
@@ -5807,7 +5912,9 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
             <section className="panel config-panel rule-sheet-card node-chain-sheet">
               <header>
                 <PanelTitle of="chains">链路规则</PanelTitle>
-                <span className="rule-sheet-meta">{spine.length === 1 ? '直出' : `${spine.length - 1} 跳`}</span>
+                <span className="rule-sheet-meta header-stat">
+                  {spine.length === 1 ? '直出' : `${spine.length - 1} 跳`}
+                </span>
               </header>
               {/* 此处不提供「追加一跳」和「改顺序」。这两项操作都在下方的规则表中完成：
             转发目标的候选是全部机器，链外的机器标注为「链外」——选中后该机器即成为该链的
@@ -6255,7 +6362,11 @@ export function defaultChainRuleOccurrence(
   return found;
 }
 
-export function ChainRulesPanel({
+export function ChainRulesPanel(props: Parameters<typeof ChainRulesPanelContent>[0]) {
+  return <ChainRulesPanelContent key={`${props.appId}/${props.chain.id}`} {...props} />;
+}
+
+function ChainRulesPanelContent({
   appId,
   chain,
   spine,
@@ -6580,9 +6691,9 @@ export function ChainRulesPanel({
           <span className="disc" aria-hidden="true">
             {expanded ? '▾' : '▸'}
           </span>
-          {/* 名称和标签占一格，宽度不足时截断——右侧两列是定宽的，不应被此处挤占 */}
+          {/* 名称和标签在自己的列内换行，删除控件始终保留独立空间。 */}
           <span className="who">
-            <b title={node}>{nameOf(node)}</b>
+            <b title={`${nameOf(node)} · ${node}`}>{nameOf(node)}</b>
             {badges}
           </span>
           {/* 删除：与项目列表中删除链使用同一控件和同一反馈（见 DelBtn）。

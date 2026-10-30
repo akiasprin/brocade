@@ -1,0 +1,673 @@
+/* 流入明细 mockup。机器用量弹层与基础控件是生产的；这里只补审阅条（mk-）和方案部件（nidm-）。 */
+
+/* ── 审阅外壳：不属于设计 ── */
+.mk-bar {
+  position: relative;
+  z-index: 300;
+  border-bottom: 1px solid var(--line);
+  background: var(--sheet);
+}
+.mk-bar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 22px;
+  padding: 9px 20px 5px;
+}
+.mk-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--ink);
+  font: 600 14px var(--sans);
+  white-space: nowrap;
+}
+.mk-title small {
+  color: var(--ink-4);
+  font: 400 10px var(--mono);
+  letter-spacing: 0.06em;
+}
+.mk-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-left: auto;
+}
+.mk-ctl {
+  --ctl-h: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.mk-ctl-label {
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.mk-ctl select {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  color: var(--ink);
+  font: 12px var(--sans);
+}
+.mk-ctl .segsw button {
+  padding: 0 9px;
+  font-size: 12px;
+}
+.mk-scene-note {
+  max-width: 1180px;
+  margin: 0;
+  padding: 0 20px 6px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.mk-scene-note b {
+  margin-right: 10px;
+  color: var(--action);
+  font-weight: 600;
+}
+.mk-common {
+  padding: 0 20px 10px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+.mk-common summary {
+  width: max-content;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.mk-common ol {
+  margin: 4px 0 0;
+  padding-left: 20px;
+  columns: 2 420px;
+  column-gap: 32px;
+}
+.mk-common li {
+  break-inside: avoid;
+}
+@media (max-width: 620px) {
+  .mk-bar-row,
+  .mk-scene-note,
+  .mk-common {
+    padding-right: 12px;
+    padding-left: 12px;
+  }
+}
+/* 弹窗让出审阅条，方案可以随时切换。 */
+html[data-mk-nav='true'] .dialog-layer:not(.popover) {
+  top: var(--mk-bar-h, 0px);
+}
+
+/* ══ 弹窗 ══ */
+.nidm-dialog {
+  /* 不透明的中性灰：未记录来源、端口转发与未按接入链记录 */
+  --nidm-gray-1: color-mix(in srgb, var(--ink) 44%, var(--sheet));
+  --nidm-gray-2: color-mix(in srgb, var(--ink) 24%, var(--sheet));
+  container: nidm / inline-size;
+  display: flex;
+  width: min(860px, 100%);
+  max-height: calc(100dvh - 40px - var(--mk-bar-h, 0px));
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+.nidm-dialog.option-c {
+  width: min(1000px, 100%);
+}
+.nidm-who {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+.nidm-who h2 {
+  flex: none;
+  max-width: 50%;
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font: 600 15px/20px var(--sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nidm-where {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nidm-dialog .node-usage-close {
+  flex: none;
+  width: var(--ctl-h);
+  padding: 0;
+}
+.nidm-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.nidm-state {
+  margin: 0;
+  padding: 18px 20px;
+  color: var(--ink-3);
+  font-size: 12.5px;
+}
+
+/* ── 读数栏：合计 │ 上下行 │ 来源数 ── */
+.nidm-readout {
+  display: grid;
+  grid-template-areas: 'hero io facts';
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 280px) minmax(112px, auto);
+  align-items: end;
+  gap: 32px;
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.nidm-hero {
+  display: grid;
+  grid-area: hero;
+  min-width: 0;
+}
+.nidm-hero-label {
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+}
+.nidm-hero-value {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 8px;
+  color: var(--ink);
+  font: 600 32px/1 var(--sans);
+  letter-spacing: -0.035em;
+  white-space: nowrap;
+}
+.nidm-hero-value small {
+  color: var(--ink-3);
+  font: 500 14px/1 var(--sans);
+  letter-spacing: 0;
+}
+.nidm-io {
+  grid-area: io;
+  min-width: 0;
+}
+.nidm-io .usage-split {
+  height: 6px;
+}
+.nidm-io .usage-io {
+  gap: 5px;
+  margin-top: 10px;
+}
+.nidm-io .usage-io > div {
+  grid-template-columns: minmax(0, 1fr) auto 46px;
+  gap: 10px;
+}
+.nidm-io .usage-io dt {
+  gap: 7px;
+  font-size: 12px;
+}
+.nidm-io .usage-io dd {
+  font-size: 12.5px;
+}
+.nidm-io .usage-io .usage-share {
+  font-size: 11.5px;
+}
+.nidm-facts {
+  display: grid;
+  grid-area: facts;
+  gap: 5px;
+  margin: 0;
+}
+.nidm-facts > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 18px;
+}
+.nidm-facts dt {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.nidm-facts dd {
+  margin: 0;
+  color: var(--ink);
+  font: 500 12.5px var(--sans);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── 完整性：只在出现时一行 ── */
+.nidm-notices {
+  padding: 12px 20px 0;
+}
+/* 一段连续文字：分隔用全角分号，不再有弹性布局的间隙 */
+.nidm-notice {
+  margin: 0;
+  color: var(--warn);
+  font-size: 12px;
+  line-height: 18px;
+}
+.nidm-notice svg {
+  margin-right: 6px;
+  vertical-align: -2px;
+}
+.nidm-help svg {
+  margin: 0 0 0 3px;
+}
+.nidm-help {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.nidm-help:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+.nidm-note {
+  margin: 6px 0 0 19px;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+/* ── 列表头：标题 + 合计／下行／上行 ── */
+.nidm-list {
+  padding: 14px 20px 18px;
+}
+.nidm-listbar {
+  --ctl-h: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.nidm-listbar-title {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.nidm-listbar .segsw button {
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+/* ── 来源行：地址 │ 网络 │ 条形 │ 流量 │ 占比 ── */
+.nidm-lines {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.nidm-line {
+  display: grid;
+  grid-template-areas: 'addr net track num pct';
+  grid-template-columns: minmax(0, 1fr) 128px minmax(64px, 176px) 78px 44px;
+  min-height: 34px;
+  align-items: center;
+  gap: 12px;
+  margin: 0 -8px;
+  padding: 0 8px;
+  border-radius: 6px;
+}
+@media (hover: hover) {
+  .nidm-line:hover {
+    background: var(--hover);
+  }
+}
+.nidm-addr {
+  display: flex;
+  grid-area: addr;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+.nidm-addr code {
+  min-width: 0;
+  padding: 0;
+  overflow-wrap: anywhere;
+  background: none;
+  color: var(--ink);
+  font: 12.5px/1.45 var(--mono);
+}
+.nidm-iid {
+  color: var(--ink-3);
+}
+.nidm-unknown {
+  color: var(--ink-3);
+  font-size: 12.5px;
+}
+.nidm-net {
+  display: flex;
+  grid-area: net;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  color: var(--ink-2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.nidm-net > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nidm-net .geo-flag,
+.nidm-flow-label .geo-flag {
+  width: 16px;
+  height: 11px;
+  flex: none;
+  border-radius: 2px;
+}
+.nidm-track {
+  display: flex;
+  grid-area: track;
+  min-width: 0;
+  align-items: center;
+}
+.nidm-meter {
+  display: flex;
+  height: 8px;
+  min-width: 3px;
+  gap: 1px;
+}
+.nidm-meter > i {
+  display: block;
+  min-width: 2px;
+  border-radius: 1px;
+}
+.nidm-meter > i:first-child {
+  border-top-left-radius: 2px;
+  border-bottom-left-radius: 2px;
+}
+.nidm-meter > i:last-child {
+  border-top-right-radius: 3px;
+  border-bottom-right-radius: 3px;
+}
+.nidm-num {
+  grid-area: num;
+  color: var(--ink);
+  font: 500 12.5px/18px var(--sans);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.nidm-pct {
+  grid-area: pct;
+  color: var(--ink-4);
+  font: 500 11.5px/18px var(--sans);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+/* 复制钮在悬停或键盘聚焦时出现；触屏没有悬停，始终显示（同在线设备） */
+@media (hover: hover) {
+  .nidm-line .user-fcopy,
+  .nidm-flow-label .user-fcopy {
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .nidm-line:hover .user-fcopy,
+  .nidm-flow-label:hover .user-fcopy,
+  :is(.nidm-line, .nidm-flow-label) .user-fcopy:is(:focus-visible, .done, .failed) {
+    opacity: 1;
+  }
+}
+.nidm-more-row {
+  padding-top: 2px;
+}
+.nidm-more {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 6px;
+  margin-left: -8px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-3);
+  font: 12px var(--sans);
+  cursor: pointer;
+}
+.nidm-more:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+.nidm-more:focus-visible,
+.nidm-flow-rest:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -2px;
+}
+
+/* ══ A · 按接入链分组 ══ */
+.nidm-groups {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.nidm-group + .nidm-group {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+.nidm-group-head {
+  display: grid;
+  /* .nidm-num / .nidm-pct carry named areas for the source rows; the head names them too. */
+  grid-template-areas: 'name count num pct';
+  grid-template-columns: auto minmax(0, 1fr) 78px 44px;
+  min-height: 32px;
+  align-items: center;
+  gap: 12px;
+}
+.nidm-chain {
+  color: var(--ink);
+  font: 500 13px/18px var(--sans);
+}
+.nidm-group-head .nidm-num {
+  font-weight: 600;
+  font-size: 13px;
+}
+.nidm-group-count {
+  color: var(--ink-4);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.nidm-group .nidm-lines {
+  padding-left: 22px;
+}
+
+/* ══ B · 来源排行 ══ */
+.nidm-compose {
+  display: flex;
+  height: 10px;
+  gap: 2px;
+  margin: 4px 0 12px;
+}
+.nidm-compose > i {
+  display: block;
+  min-width: 3px;
+  border-radius: 2px;
+}
+.nidm-compose > i:first-child {
+  border-top-left-radius: 5px;
+  border-bottom-left-radius: 5px;
+}
+.nidm-compose > i:last-child {
+  border-top-right-radius: 5px;
+  border-bottom-right-radius: 5px;
+}
+.nidm-compose > i.on {
+  box-shadow:
+    0 0 0 1.5px var(--sheet),
+    0 0 0 3px var(--ink-3);
+}
+.nidm-legend {
+  margin-bottom: 14px;
+}
+.nidm-legend .nti-key {
+  min-height: 30px;
+}
+
+/* ══ C · 流向图 ══ */
+.nidm-flow {
+  position: relative;
+  margin: 6px 0 4px;
+}
+.nidm-flow-svg {
+  position: absolute;
+  top: 0;
+  overflow: visible;
+}
+.nidm-flow-labels {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+.nidm-flow-labels.left {
+  left: 0;
+}
+.nidm-flow-labels.right {
+  right: 0;
+}
+.nidm-flow-label {
+  position: absolute;
+  display: flex;
+  min-height: 24px;
+  max-width: calc(100% - 14px);
+  align-items: center;
+  gap: 7px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  white-space: nowrap;
+  transform: translateY(-50%);
+  transition: opacity 140ms;
+}
+.nidm-flow-label.left {
+  right: 14px;
+  justify-content: flex-end;
+}
+.nidm-flow-label.right {
+  left: 14px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: var(--sans);
+  text-align: left;
+  cursor: pointer;
+}
+.nidm-flow-label.right:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 3px;
+}
+.nidm-flow-label code {
+  padding: 0;
+  background: none;
+  color: var(--ink);
+  font: 12px var(--mono);
+}
+.nidm-flow-label b {
+  flex: none;
+  color: var(--ink);
+  font: 500 11.5px var(--sans);
+  font-variant-numeric: tabular-nums;
+}
+.nidm-flow-label.off {
+  opacity: 0.5;
+}
+.nidm-flag-none {
+  width: 16px;
+  flex: none;
+}
+.nidm-flow-rest {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  font: 12.5px var(--sans);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+.nidm-flow-link {
+  fill-opacity: 0.45;
+  transition: fill-opacity 140ms;
+}
+.nidm-flow-link.on {
+  fill-opacity: 0.8;
+}
+.nidm-flow-link.off {
+  fill-opacity: 0.22;
+}
+.nidm-flow-node {
+  fill: color-mix(in srgb, var(--ink) 55%, transparent);
+  transition: opacity 140ms;
+}
+.nidm-flow-node.off {
+  opacity: 0.5;
+}
+.nidm-flow-fold {
+  margin-top: 8px;
+}
+
+/* ══ 窄宽度：读数栏两行，来源排成两行，流量始终可见 ══ */
+@container nidm (max-width: 600px) {
+  .nidm-readout {
+    grid-template-areas:
+      'hero facts'
+      'io io';
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 16px 20px;
+    padding: 16px;
+  }
+  .nidm-hero-value {
+    font-size: 28px;
+  }
+  .nidm-notices {
+    padding-inline: 16px;
+  }
+  .nidm-list {
+    padding: 12px 16px 16px;
+  }
+  /* 流量与占比上下同列、右缘对齐，组头的流量与它们对齐，占比放在流量左边。 */
+  .nidm-line {
+    grid-template-areas:
+      'addr addr num'
+      'net track pct';
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    row-gap: 3px;
+    padding-block: 7px;
+  }
+  .nidm-group .nidm-lines {
+    padding-left: 0;
+  }
+  .nidm-group-head {
+    grid-template-areas: 'name count pct num';
+    grid-template-columns: minmax(0, auto) minmax(0, 1fr) auto auto;
+  }
+}
+@media (pointer: coarse) {
+  .nidm-dialog .node-usage-close {
+    width: 44px;
+    min-height: 44px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nidm-flow-link,
+  .nidm-flow-node,
+  .nidm-flow-label {
+    transition: none;
+  }
+}

@@ -1,3 +1,8 @@
+mod agent_rpc;
+mod realtime_channel;
+use realtime_channel::agent_realtime;
+mod unlock_probe;
+use unlock_probe::*;
 mod source_access;
 use source_access::*;
 use std::{
@@ -17,10 +22,7 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use axum::{
     body::{Body, Bytes},
-    extract::{
-        ws::{Message as WebSocketMessage, WebSocket},
-        DefaultBodyLimit, Path, Query, Request, State, WebSocketUpgrade,
-    },
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::sse::{Event, KeepAlive, Sse},
@@ -850,6 +852,7 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         "/bootstrap",
         "/whoami",
         "/model/snapshot",
+        "/chains/unlock-probes",
         "/nodes/agent-state",
         "/notifications",
         "/revisions",
@@ -887,6 +890,20 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         || is_user_grant_probe_plan_path(path)
         || is_user_forwarding_overview_path(path)
         || is_tunnel_probe_view_path(path)
+        || is_unlock_probe_view_path(path)
+}
+
+fn is_unlock_probe_view_path(path: &str) -> bool {
+    let parts = path.split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["", "nodes", node, "unlock-probe"]
+        | ["", "nodes", node, "unlock-probe", "capabilities"] => !node.is_empty(),
+        ["", "apps", app, "chains", chain, "unlock-probe"]
+        | ["", "apps", app, "chains", chain, "unlock-probe", "capabilities"] => {
+            !app.is_empty() && !chain.is_empty()
+        }
+        _ => false,
+    }
 }
 
 fn is_user_forwarding_overview_path(path: &str) -> bool {
@@ -1325,6 +1342,14 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/model/preview/artifact", post(preview_draft_artifact))
         .route("/compile/{revision_id}", get(compile_revision))
         .route("/nodes/agent-state", get(node_agent_state))
+        .route(
+            "/apps/{app_id}/chains/{chain_id}/unlock-probe",
+            get(get_chain_unlock_probe).post(start_chain_unlock_probe),
+        )
+        .route(
+            "/nodes/{node_id}/unlock-probe",
+            get(get_node_unlock_probe).post(start_node_unlock_probe),
+        )
         .route("/notifications", get(machine_notifications))
         .route("/notifications/read", post(mark_machine_notifications_read))
         .route("/notifications/clear", post(clear_machine_notifications))
@@ -1401,6 +1426,16 @@ fn admin_router_with_state(state: AppState) -> Router {
             post(restore_node_service),
         )
         .route("/nodes/{node_id}/cert-group", put(set_node_cert_group))
+        .route("/chains/unlock-probes", get(get_chain_unlock_probes))
+        .route("/unlock-probes/refresh", post(refresh_all_unlock_probes))
+        .route(
+            "/nodes/{node_id}/unlock-probe/capabilities",
+            get(get_node_unlock_capabilities),
+        )
+        .route(
+            "/apps/{app_id}/chains/{chain_id}/unlock-probe/capabilities",
+            get(get_chain_unlock_capabilities),
+        )
         .route("/nodes/{node_id}/agent-token", post(issue_node_token))
         .route("/nodes/{node_id}/agent-token", delete(revoke_node_token))
         .route("/users", get(list_users).post(create_user))
@@ -1460,6 +1495,10 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route(
             "/users/{tenant_id}/{user_id}/service-policy",
             put(update_user_service_policy),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/cycle-usage/reset",
+            post(reset_user_cycle_usage),
         )
         .route(
             "/users/{tenant_id}/{user_id}/service-policy/preview",
@@ -1667,6 +1706,10 @@ fn admin_router_with_state(state: AppState) -> Router {
         // `mask_assets`.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            agent_rpc::wake_after_admin_change,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             mask_assets,
         ))
         // Outside the masking layer, so a route the public account may not have is refused
@@ -1857,6 +1900,14 @@ fn agent_routes() -> Router<AppState> {
             post(agent_forwarding_reconcile),
         )
         .route("/agent/v1/forwarding/usage", post(agent_forwarding_usage))
+        .route(
+            "/agent/v1/unlock-probe/target",
+            get(agent_unlock_probe_target),
+        )
+        .route(
+            "/agent/v1/unlock-probe/report",
+            post(agent_unlock_probe_report),
+        )
         .route(
             "/agent/v1/forwarding/tcp-ping-target",
             get(agent_forwarding_probe_target),
@@ -3129,17 +3180,26 @@ async fn node_inflow_details(
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     require_visible_node(&state, &admin, &node).await?;
+    let result = state
+        .store
+        .node_inflow_details(
+            &admin,
+            &node,
+            (&query.tenant_id, &query.user_id),
+            query.usage.period,
+            query.usage.range()?,
+        )
+        .await?;
+    // An address used on several chains has one row per chain; look each address up once.
+    let addresses = result
+        .rows
+        .iter()
+        .filter_map(|row| row.source_ip.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     Ok(no_store_json(
-        state
-            .store
-            .node_inflow_details(
-                &admin,
-                &node,
-                (&query.tenant_id, &query.user_id),
-                query.usage.period,
-                query.usage.range()?,
-            )
-            .await?,
+        with_source_locations(&state, result, addresses).await?.0,
     ))
 }
 
@@ -5915,6 +5975,22 @@ async fn update_user_service_policy(
     Ok(Json(result).into_response())
 }
 
+async fn reset_user_cycle_usage(
+    State(state): State<AppState>,
+    Path((tenant, user)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<brocade_store::UserCycleResetRequest>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    let result = state
+        .store
+        .reset_user_cycle_usage(&admin, &tenant, &user, request)
+        .await?;
+    state.quota_wake.notify_one();
+    state.grants_wake.notify_one();
+    Ok(Json(result).into_response())
+}
+
 async fn preview_user_service_policy(
     State(state): State<AppState>,
     Path((tenant, user)): Path<(String, String)>,
@@ -7448,6 +7524,11 @@ async fn agent_desired(State(state): State<AppState>, headers: HeaderMap) -> Api
             true => StatusCode::NO_CONTENT.into_response(),
         },
     };
+    response.headers_mut().insert(
+        brocade_deployment::unlock_probe::PROBE_NODE_ID_HEADER,
+        HeaderValue::from_str(&node.node_id)
+            .map_err(|_| StoreError::InvalidData("invalid node identity header".into()))?,
+    );
     if needs_policy_upgrade && response.status() == StatusCode::NO_CONTENT {
         response.headers_mut().insert(
             "x-brocade-agent-upgrade-required",
@@ -8346,135 +8427,6 @@ async fn agent_load(
         .record_load_report(&node.node_id, request)
         .await?;
     Ok(Json(result).into_response())
-}
-
-async fn agent_realtime(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    websocket: WebSocketUpgrade,
-) -> ApiResult<Response> {
-    let token = bearer_token(&headers)
-        .ok_or(ApiError::Unauthorized)?
-        .to_owned();
-    let node = authenticate_agent(&state.store, &headers).await?;
-    require_active_agent(&node)?;
-    let node_id = node.node_id;
-    let store = state.store.clone();
-    let shutdown = state.shutdown.clone();
-    Ok(websocket
-        // The complete sample is well below one KiB. Bound allocation before parsing so an
-        // authenticated but compromised node cannot make this process buffer a giant frame.
-        .max_frame_size(512 * 1024)
-        .max_message_size(512 * 1024)
-        .on_upgrade(move |socket| {
-            serve_agent_realtime(state.realtime, store, node_id, token, shutdown, socket)
-        })
-        .into_response())
-}
-
-async fn serve_agent_realtime(
-    realtime: crate::realtime::RealtimeService,
-    store: PgStore,
-    node_id: String,
-    token: String,
-    shutdown: crate::lifecycle::ShutdownSignal,
-    mut socket: WebSocket,
-) {
-    let mut session = realtime.register_agent(node_id.clone()).await;
-    let session_id = session.session;
-    let initial = session.commands.borrow_and_update().clone();
-    let Ok(initial) = serde_json::to_string(&initial) else {
-        realtime.unregister_agent(&node_id, session_id).await;
-        return;
-    };
-    if socket
-        .send(WebSocketMessage::Text(initial.into()))
-        .await
-        .is_err()
-    {
-        realtime.unregister_agent(&node_id, session_id).await;
-        return;
-    }
-    // `interval` ticks immediately. That first empty Ping can race the demand command sent when a
-    // subscriber arrives, making a freshly connected Agent observe control traffic out of order.
-    // The initial command above already proves the socket is writable, so the first heartbeat is
-    // due only after one complete idle interval.
-    let mut heartbeat = tokio::time::interval_at(
-        tokio::time::Instant::now() + Duration::from_secs(20),
-        Duration::from_secs(20),
-    );
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut reauthenticate = tokio::time::interval_at(
-        tokio::time::Instant::now() + Duration::from_secs(60),
-        Duration::from_secs(60),
-    );
-    reauthenticate.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    loop {
-        tokio::select! {
-            _ = shutdown.requested() => {
-                let _ = socket.send(WebSocketMessage::Close(None)).await;
-                break;
-            }
-            changed = session.commands.changed() => {
-                if changed.is_err() { break; }
-                let command = session.commands.borrow_and_update().clone();
-                let Ok(text) = serde_json::to_string(&command) else { break };
-                if socket.send(WebSocketMessage::Text(text.into())).await.is_err() {
-                    break;
-                }
-            }
-            incoming = socket.recv() => {
-                match incoming {
-                    Some(Ok(WebSocketMessage::Text(text))) => {
-                        let sample = match serde_json::from_str::<AgentRealtimeSample>(text.as_str()) {
-                            Ok(sample) => sample,
-                            Err(_) => break,
-                        };
-                        match realtime.record_sample(&node_id, session_id, sample).await {
-                            Ok(()) | Err(crate::realtime::RecordSampleError::Inactive) => {}
-                            Err(_) => break,
-                        }
-                    }
-                    Some(Ok(WebSocketMessage::Ping(payload))) => {
-                        if socket.send(WebSocketMessage::Pong(payload)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(WebSocketMessage::Pong(_))) => {}
-                    Some(Ok(WebSocketMessage::Close(_))) | None | Some(Err(_)) => break,
-                    // This endpoint has one deliberately narrow JSON text protocol.
-                    Some(Ok(WebSocketMessage::Binary(_))) => break,
-                }
-            }
-            _ = heartbeat.tick() => {
-                if socket
-                    .send(WebSocketMessage::Ping(Vec::new().into()))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            _ = reauthenticate.tick() => {
-                // A WebSocket outlives the request that authenticated it. Re-check periodically so
-                // revoking a token or retiring a node also closes an already-open live channel.
-                let still_allowed = store
-                    .authenticate_node_token(&token)
-                    .await
-                    .is_ok_and(|node| {
-                        node.is_some_and(|node| {
-                            node.node_id == node_id
-                                && node.lifecycle_phase == NodeLifecyclePhase::Active
-                        })
-                    });
-                if !still_allowed {
-                    break;
-                }
-            }
-        }
-    }
-    realtime.unregister_agent(&node_id, session_id).await;
 }
 
 /// Runtime TCP and ICMP targets. The same settings are returned to every active node. A
@@ -11077,7 +11029,7 @@ mod tests {
         assert!(upstream.contains(&format!("tag = \"{BROCADE_XRAY_VERSION}\"")));
         assert!(upstream.contains("anytls = true"));
         assert!(upstream.contains("sniffing_failure_routing = true"));
-        assert!(build_script.contains("const XRAY_UPSTREAM_BUILD: &str = \"b4f0898\""));
+        assert!(build_script.contains("const XRAY_UPSTREAM_BUILD: &str = \"1b1647c\""));
         assert!(xray_builder.contains("core.build={build_id}"));
         for source in [build_script, xray_builder] {
             assert!(!source.contains("fn repository_build_id"));

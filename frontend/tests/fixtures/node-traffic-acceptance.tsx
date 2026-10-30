@@ -27,6 +27,8 @@ import {
 } from './node-traffic-mockup-data';
 import '../../src/styles.css';
 
+export { getInstanceByDom } from 'echarts/core';
+
 const params = new URLSearchParams(location.search);
 const scene = params.get('scene') ?? 'typical';
 if (!(scene in SCENES)) throw new Error(`Unknown acceptance scene: ${scene}`);
@@ -111,10 +113,10 @@ function inflow(period: SiteUsagePeriod): NodeInflowUsage {
     idle_users: input.idle.map(user => ({ tenant_id: user.tenant, user_id: user.id })),
   };
 }
-function sites(period: SiteUsagePeriod): NodeSiteUsage {
+function sites(period: SiteUsagePeriod, from: number | null = null, until: number | null = null): NodeSiteUsage {
   const agg = aggregate(built, period),
     rows = siteRowsOf(built, agg);
-  return {
+  const report: NodeSiteUsage = {
     period,
     collection_enabled: world.sites,
     catalog_version: 1,
@@ -151,6 +153,28 @@ function sites(period: SiteUsagePeriod): NodeSiteUsage {
       other_uplink_bytes: 0,
       other_downlink_bytes: Math.round(row.users.slice(4).reduce((sum, user) => sum + user.total, 0)),
     })),
+  };
+  if (from === null || until === null) return report;
+  const series = report.series.map(item => ({
+    ...item,
+    points: item.points.filter(([at]) => at >= from && at < until),
+  }));
+  return {
+    ...report,
+    range_start_unix_secs: from,
+    range_end_unix_secs: until,
+    period_end_unix_secs: until,
+    observed_since_unix_secs: Math.max(from, report.observed_since_unix_secs ?? from),
+    series,
+    rows: report.rows.map(row => {
+      const points = series.find(item => item.site_id === row.site_id)?.points ?? [];
+      return {
+        ...row,
+        uplink_bytes: points.reduce((sum, [, up]) => sum + up, 0),
+        downlink_bytes: points.reduce((sum, [, , down]) => sum + down, 0),
+      };
+    }),
+    top_users: [],
   };
 }
 const hour = liveHistory(built);
@@ -283,7 +307,8 @@ window.fetch = async (input, init) => {
       }),
     });
   }
-  if (url.pathname.endsWith('/site-usage')) return Response.json(sites(period));
+  if (url.pathname.endsWith('/site-usage'))
+    return Response.json(sites(period, custom ? from : null, custom ? until : null));
   if (url.pathname.endsWith('/other-domains') || url.pathname.endsWith('/sniffing-failed-targets'))
     return Response.json(detail);
   if (url.pathname.endsWith('/traffic-history'))

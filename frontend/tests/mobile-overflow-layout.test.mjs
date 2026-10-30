@@ -6,7 +6,6 @@ const traffic = readFileSync(new URL('../src/user-traffic-realtime.tsx', import.
 const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
 const users = readFileSync(new URL('../src/panes/users.tsx', import.meta.url), 'utf8');
 const shell = readFileSync(new URL('../src/forge/shell.tsx', import.meta.url), 'utf8');
-const capacity = readFileSync(new URL('../src/panes/capacity.tsx', import.meta.url), 'utf8');
 
 test('手机端菜单留在视口内并允许纵向滚动', () => {
   assert.match(
@@ -146,12 +145,6 @@ test('手机端流量预测保留机器读数、风险和用户构成', () => {
     styles,
     /@container \(max-width: 760px\)\s*\{[^@]*?\.cap-user\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\) 46px 64px 64px;/,
   );
-  // 标题栏只收起总台数，需要处理的计数保留。
-  assert.match(
-    styles,
-    /@media \(max-width: 820px\)\s*\{\s*\.cap-rd \.opt,\s*\.cap-rd \.opt \+ \.dot\s*\{\s*display:\s*none;/,
-  );
-  assert.match(capacity, /<span className="opt">/);
 });
 
 test('页面内容容器不会通过动画变换成为固定弹窗的包含块', () => {

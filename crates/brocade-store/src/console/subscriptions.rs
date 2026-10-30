@@ -452,12 +452,8 @@ async fn subscription_usage(
              SELECT coalesce(sum(s.uplink_bytes), 0)::bigint AS upload_bytes,
                     coalesce(sum(s.downlink_bytes), 0)::bigint AS download_bytes,
                     coalesce(bool_or(s.has_gap), false) AS has_gap
-             FROM usage_rollups s, bounds b
-             WHERE s.tenant_id = $1
-               AND s.user_id = $2
-               AND s.app_id = ANY($3::text[])
-               AND s.period_start >= b.cycle_start
-               AND s.period_start < b.cycle_end
+             FROM bounds b CROSS JOIN LATERAL user_cycle_access_usage($1,$2,b.cycle_start,b.cycle_end) s
+             WHERE s.app_id = ANY($3::text[])
          ), limits AS (
              SELECT count(*)::bigint AS limited_count,
                     coalesce(sum(q.limit_bytes), 0)::bigint AS total_bytes

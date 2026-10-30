@@ -9,7 +9,7 @@
 `v0.3.0` 的 GNU 包要求 glibc 2.39，且该版本 musl 安装器不支持跨 libc 安装。兼容 Ubuntu 22.04、Debian 12 等较旧 GNU 系统时，请下载 `v0.3.1` 或更新版本：
 
 ```sh
-v=0.3.3 p=linux-x86_64-gnu
+v=0.3.4 p=linux-x86_64-gnu
 url=https://github.com/akiasprin/brocade/releases/download/v$v/brocade-dist-$v-$p.tar.gz
 curl -fLO "$url" && curl -fLO "$url.sha256"
 sha256sum -c brocade-dist-$v-$p.tar.gz.sha256
@@ -44,7 +44,13 @@ sudo sh install.sh --public-ip 192.0.2.10 --port 9000 \
   --database-url postgresql://brocade:password@database.example.net/brocade
 ```
 
-省略 `--public-ip` 时，安装器使用默认路由的本机地址；省略 `--port` 时使用 8080。包含密码的数据库连接地址优先在交互菜单中填写，避免进入 shell 历史。安装器校验发行包与 CPU/libc 后补齐系统 CA、账号工具及 GNU 构建所需的 `liblzma`/`libgcc`，创建 `brocade` 服务账号并原子安装二进制和配置。有 systemd 时自动启用并启动 `brocade.service`，等待就绪后输出 `http://服务器IP:8080/#/initialize/...` 完整初始化链接；打开后设置管理员用户名和密码即可。无 systemd 时在当前终端前台运行。自动化仅安装文件可加 `--no-start`，随后手动启动：
+自动化安装可通过 root 所有、权限 `0600` 或 `0400` 的单行私有文件提供数据库 URL，避免密码出现在进程参数中：
+
+```sh
+sudo sh install.sh --public-ip 192.0.2.10 --database-url-file /root/brocade-database-url
+```
+
+省略 `--public-ip` 时，安装器使用默认路由的本机地址；省略 `--port` 时使用 8080。包含密码的数据库连接地址优先在交互菜单中填写，避免进入 shell 历史。安装器校验发行包与 CPU/libc 后补齐系统 CA、账号工具及 GNU 构建所需的 `liblzma`/`libgcc`，创建 `brocade` 服务账号并原子安装二进制和配置。有 systemd 时自动启用 `brocade.socket` 和 `brocade.service`，由 systemd 持有监听，launcher 以专用账号运行并把监听传给 Console，等待就绪后输出 `http://服务器IP:8080/#/initialize/...` 完整初始化链接；打开后设置管理员用户名和密码即可。无 systemd 时在当前终端前台运行。自动化仅安装文件可加 `--no-start`，随后手动启动：
 
 ```sh
 sudo brocade up
@@ -71,6 +77,8 @@ sudo sh install.sh --upgrade
 ```
 
 升级复用 `/etc/brocade` 中原来的数据库、访问 IP 和端口，不重新选择，也不生成替代密钥。
+日常 `systemctl restart brocade.service` 保留 socket；完整 `--upgrade` 会先停止 socket 再停止 service，防止备份期间被请求自动拉起写库，结束后恢复两者。旧安装器部署升级后也会获得 socket 托管，已有自定义 service 与 drop-in 保留。
+新版安装器把数据库类型文件保存为 `managed-socket-v1` 或 `external-socket-v1`，只为标识新的安装布局，实际数据库选择不变。旧的 `managed` / `external` 可正常升级；不认识 socket 布局的旧安装器会在停服前拒绝，不允许用旧包覆盖此部署。
 不要同时传入 `--managed-db`、`--database-url`、`--public-ip`、`--port` 或 `--no-start`。
 原服务须正常运行；外部数据库模式还要求本机已有兼容服务端版本的 `pg_dump`、`pg_restore`。
 
@@ -89,12 +97,13 @@ Console/launcher 并检查入口就绪。升级存在停服窗口；数据较大
 
 升级 Console 不会自动升级任何机器上的 Agent 或 Xray；它们通过「发布」页的发布单更新，见[模型、修订与发布](concepts.md#agent-与-xray-发布单)。
 
-v0.3.3 的强制升级验收基线为官方 v0.3.1，覆盖外置 PostgreSQL 和受管 PostgreSQL、旧账户登录、
+v0.3.4 的强制升级验收基线为官方 v0.3.1，覆盖外置 PostgreSQL 和受管 PostgreSQL、旧账户登录、
 配置/密钥/额度/用量保留、压缩备份恢复、重复升级及真实 systemd 重启。安装器不会自动发布节点
 Agent/Xray。真实验收与证据要求见[升级验收](../scripts/tests/upgrade/README.md)。
 
 Console 内嵌全部数据库迁移，兼容库无需逐个启动中间版本。官方 v0.3.1 使用
-`0001` 基线；预检逐条核对既有迁移的版本、成功状态和 SHA-384，拒绝未知校验值、失败历史、
+`0001` 基线，官方 v0.3.3 的 `0002` 保持原始字节；本期用量归零与其它未发布结构归入 `0003`。
+这两种正式基线均使用普通升级，不需要预发布兼容变量。预检逐条核对迁移的版本、成功状态和 SHA-384，拒绝未知校验值、失败历史、
 空库误升级和数据库版本高于程序的降级。不支持 v0.3.1 之前的历史转换、自行改库或
 PostgreSQL 大版本转换，不会改写 SQLx 校验值。
 
@@ -107,6 +116,8 @@ brocade-console database-check
 brocade-console database-migrate
 ```
 
+已经部署旧开发版 `0002`/`0003` 的环境须先按[精确兼容转换](../.agents/runbooks/console-deployment.md#本期用量归零归入-0003-与旧开发库兼容)
+在隔离恢复库演练；包含已有归零事件的库保留事件、用量基线和原始账本，不通过删除结构或直接改回执升级。
 只读预检核对迁移回执，不承诺探测所有人工修改的结构；不兼容 DDL 仍会使正常迁移失败。
 手动部署的进程管理、数据库与密钥备份由操作者按[手动部署](manual-deployment.md)完成。
 
@@ -115,9 +126,9 @@ brocade-console database-migrate
 使用托管 PostgreSQL 时，`/var/lib/brocade` 保存数据库数据和密封密钥 `secret-key`。停止服务后完整复制该目录：
 
 ```sh
-sudo systemctl stop brocade
+sudo systemctl stop brocade.socket brocade.service
 sudo tar -C /var/lib -czf brocade-backup.tar.gz brocade
-sudo systemctl start brocade
+sudo systemctl start brocade.socket brocade.service
 ```
 
 备份包含密钥，应按凭据保管。使用已有 PostgreSQL 时，用 `pg_dump --format=custom --compress=6` 保存压缩数据库备份；若为 Console 配置了 `BROCADE_SECRET_KEY`，与数据库备份一同保管。丢失密钥后，已密封的 DNS 凭据和证书私钥无法恢复。

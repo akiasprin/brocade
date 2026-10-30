@@ -25,6 +25,8 @@ struct PendingReport {
 pub(crate) fn run(options: Options) {
     let mut pending = None;
     let mut failed = false;
+    let mut wake =
+        crate::wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::ForwardingProbe);
     loop {
         let pause = match round(&options, &mut pending) {
             Ok(true) => {
@@ -43,7 +45,10 @@ pub(crate) fn run(options: Options) {
                 15
             }
         };
-        thread::sleep(Duration::from_secs(pause));
+        wake.wait_connected(
+            Duration::from_secs(pause),
+            Duration::from_secs(if pause == 3 { 60 } else { pause }),
+        );
     }
 }
 

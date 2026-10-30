@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIsMutating } from '@tanstack/react-query';
 import { prepareForDocumentReload } from './navigation-guard';
+import { MODULE_ERROR_EVENT, MODULE_RELOAD_EVENT } from './lazy';
 
 const DEFAULT_CHECK_INTERVAL_MS = 60_000;
 const DEFAULT_RELOAD_DELAY_MS = 650;
 
-type UpdatePhase = 'idle' | 'ready' | 'blocked' | 'reloading';
+type UpdatePhase = 'idle' | 'ready' | 'blocked' | 'reloading' | 'failed';
+const MODULE_RELOAD_KEY = 'brocade.module-reload-at';
 type VersionReader = (signal: AbortSignal) => Promise<string | null>;
 
 interface ConsoleUpdateProps {
@@ -45,13 +47,29 @@ export function ConsoleUpdate({
 }: ConsoleUpdateProps = {}) {
   const [currentVersion] = useState(documentVersion);
   const [phase, setPhase] = useState<UpdatePhase>('idle');
+  const [moduleFailed, setModuleFailed] = useState(false);
   const mutationCount = useIsMutating();
   const reloadTimerRef = useRef<number | null>(null);
+  const repairControllerRef = useRef<AbortController | null>(null);
+  const failedPreloadsRef = useRef(new Set<string>());
   const reloadingRef = useRef(false);
 
   const requestReload = useCallback(
-    (interaction?: Event) => {
+    (interaction?: Event, automaticModuleRecovery = false) => {
       if (reloadingRef.current) return;
+      if (automaticModuleRecovery) {
+        // A persistent chunk/network failure must leave a readable retry surface, not a reload loop.
+        try {
+          const previous = Number(sessionStorage.getItem(MODULE_RELOAD_KEY));
+          if (previous && Date.now() - previous < 60_000) {
+            setPhase('failed');
+            return;
+          }
+        } catch {
+          setPhase('failed');
+          return;
+        }
+      }
       if (mutationCount > 0 || !prepareForDocumentReload()) {
         setPhase('blocked');
         return;
@@ -61,9 +79,41 @@ export function ConsoleUpdate({
       // its target may no longer exist or may now mean something different.
       interaction?.preventDefault();
       interaction?.stopImmediatePropagation();
+      if (automaticModuleRecovery) {
+        try {
+          sessionStorage.setItem(MODULE_RELOAD_KEY, String(Date.now()));
+        } catch {
+          setPhase('failed');
+          return;
+        }
+      }
       reloadingRef.current = true;
       setPhase('reloading');
-      reloadTimerRef.current = window.setTimeout(reloadPage, reloadDelayMs);
+      reloadTimerRef.current = window.setTimeout(() => {
+        const urls = [...failedPreloadsRef.current];
+        failedPreloadsRef.current.clear();
+        if (urls.length === 0) {
+          reloadPage();
+          return;
+        }
+        // WebKit can retain failed preloads across reloads: https://bugs.webkit.org/show_bug.cgi?id=270357.
+        // A reload-mode fetch evicts the poisoned resource before the fresh document imports it.
+        const controller = new AbortController();
+        repairControllerRef.current = controller;
+        const timeout = window.setTimeout(() => controller.abort(), 2_000);
+        void Promise.allSettled(
+          urls.map(url =>
+            fetch(url, { cache: 'reload', credentials: 'same-origin', signal: controller.signal }).then(response =>
+              response.arrayBuffer(),
+            ),
+          ),
+        ).finally(() => {
+          window.clearTimeout(timeout);
+          if (repairControllerRef.current !== controller) return;
+          repairControllerRef.current = null;
+          reloadPage();
+        });
+      }, reloadDelayMs);
     },
     [mutationCount, reloadDelayMs, reloadPage],
   );
@@ -114,29 +164,56 @@ export function ConsoleUpdate({
   }, [phase, requestReload]);
 
   useEffect(() => {
-    const onPreloadError = (event: Event) => {
-      // Vite emits this when an old open page asks for a hashed lazy chunk removed by deployment.
-      // Suppress the default exception and use the same edit-safe reload path.
-      event.preventDefault();
-      setPhase('ready');
-      requestReload();
+    const onResourceError = (event: Event) => {
+      const link = event.target;
+      if (!(link instanceof HTMLLinkElement) || link.rel !== 'modulepreload') return;
+      const url = new URL(link.href, window.location.href);
+      if (url.origin !== window.location.origin || !url.pathname.endsWith('.js')) return;
+      const failed = failedPreloadsRef.current;
+      failed.add(url.href);
+      if (failed.size > 64) failed.delete(failed.values().next().value!);
     };
+    const onPreloadError = () => {
+      // Vite emits this when an old open page asks for a hashed lazy chunk removed by deployment.
+      // Let the import reject into its local boundary; suppressing it returns an undefined module.
+      setModuleFailed(true);
+      requestReload(undefined, true);
+    };
+    const onManualReload = () => requestReload();
     window.addEventListener('vite:preloadError', onPreloadError);
-    return () => window.removeEventListener('vite:preloadError', onPreloadError);
+    document.addEventListener('error', onResourceError, true);
+    window.addEventListener(MODULE_ERROR_EVENT, onPreloadError);
+    window.addEventListener(MODULE_RELOAD_EVENT, onManualReload);
+    return () => {
+      window.removeEventListener('vite:preloadError', onPreloadError);
+      document.removeEventListener('error', onResourceError, true);
+      window.removeEventListener(MODULE_ERROR_EVENT, onPreloadError);
+      window.removeEventListener(MODULE_RELOAD_EVENT, onManualReload);
+    };
   }, [requestReload]);
 
   useEffect(
     () => () => {
       if (reloadTimerRef.current !== null) window.clearTimeout(reloadTimerRef.current);
+      repairControllerRef.current?.abort();
+      repairControllerRef.current = null;
     },
     [],
   );
 
-  if (phase !== 'blocked' && phase !== 'reloading') return null;
+  if (phase !== 'blocked' && phase !== 'reloading' && phase !== 'failed') return null;
   return (
     <div className={`console-update-status ${phase}`} role="status" aria-live="assertive">
       <span aria-hidden="true" />
-      {phase === 'reloading' ? '网站版本已更新，加载新版中…' : '新版可用，完成当前操作后加载'}
+      {phase === 'reloading'
+        ? moduleFailed
+          ? '界面加载失败，重新加载中…'
+          : '网站版本已更新，加载新版中…'
+        : phase === 'failed'
+          ? '界面仍无法加载，请检查网络后重试'
+          : moduleFailed
+            ? '界面加载失败，完成当前操作后重新加载'
+            : '新版可用，完成当前操作后加载'}
     </div>
   );
 }

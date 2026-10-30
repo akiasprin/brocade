@@ -2531,29 +2531,34 @@
 }
 
 /* ── 黛蓝 · 默认回退 ──
-   宝蓝建立交互秩序，同色系的深蓝承载连续数据。真实选择由 data-palette 覆盖；
+   灰蓝建立交互秩序，同色系的低彩度蓝承载连续数据。真实选择由 data-palette 覆盖；
    这里与默认色板保持一致，避免首屏执行 JavaScript 前短暂闪回旧配色。 */
 :root,
 [data-theme='dark'] {
-  --action: #4c7dd9;
-  --action-hover: #6190e9;
-  --action-active: #3b6ac5;
-  --action-wash: rgba(76, 125, 217, 0.17);
+  --action: #7f8da6;
+  --action-hover: #919fb5;
+  --action-active: #77859d;
+  --action-wash: rgba(127, 141, 166, 0.13);
   --action-on: #080f1c;
-  --data: #5773b7;
+  --data: #8492a8;
   --data-secondary: #758196;
-  --data-wash: rgba(87, 115, 183, 0.13);
+  --data-wash: rgba(132, 146, 168, 0.09);
+  --primary: #252b35;
+  --primary-hover: #2e3744;
+  --primary-active: #354051;
+  --primary-on: #a3afc1;
+  --primary-line: #3b4555;
 }
 :root[data-theme='light'],
 [data-theme='light'] {
-  --action: #3f5aa6;
-  --action-hover: #5470b8;
-  --action-active: #2f4482;
-  --action-wash: rgba(63, 90, 166, 0.1);
+  --action: #5b697f;
+  --action-hover: #63738b;
+  --action-active: #505f75;
+  --action-wash: rgba(91, 105, 127, 0.08);
   --action-on: #ffffff;
-  --data: #306ca7;
+  --data: #5f708a;
   --data-secondary: #6a5f90;
-  --data-wash: rgba(48, 108, 167, 0.09);
+  --data-wash: rgba(95, 112, 138, 0.07);
 }
 
 /* ── 调色盘候选（更多菜单里的色板，`forge/palette.ts` 写入 data-palette） ──
@@ -2572,18 +2577,21 @@
      各档取主题色相、OKLCH 彩度 0.008（块 ×1.1、边框 ×1.25）；玄墨的灰白主题色没有色相，
      改取数据色的钢青 225°。低明度下 8 位量化使实际色相偏离 20° 以内。网格线取 OKLCH 明度
      27.8%（L* 约 16，随台面上移约 1.5）、彩度约 0.02。亮色保留原有底调，边框向纸色收浅。
-   - 主题色明度约 60%，操作色文字对纸不低于 4.5，实底上的深色文字对操作色不低于 4.5。纸比纯黑
-     色阶亮 1.5 L*，堇紫与藕粉的操作色三档 OKLCH 明度因此分别提高 0.010 与 0.0075。
-     洗色随操作色加深提到 17%，否则选中行与选中页签的底色在暗色底上无法辨认。
+   - 主题色明度约 60%（黛蓝为低彩度灰蓝，明度约 64%），操作色文字对纸不低于 4.5，实底上的
+     深色文字对操作色不低于 4.5。纸比纯黑色阶亮 1.5 L*，堇紫与藕粉的操作色三档 OKLCH 明度
+     因此分别提高 0.010 与 0.0075。
+     洗色一般取 17%；黛蓝取 13%，降低蓝色铺底的亮感。
    - 主按钮与导航选中项取洗色（--primary 一组）：主题色的 oklch(43.5% C H) 按 22% 混入块色
      作底、55% 作边框，悬停与按下为 32%、40%，文字取同色相的浅色。操作色实底对标题条
-     的对比度在 4.5 以上，是整屏最醒目的彩色块；洗色底降到 1.2 左右。
-   - 数据色取同族：主题色色相 −12°、明度 72%、彩度为主题色的 75%（上限 0.13）。曲线按 72%
-     不透明度绘制，明度 56.5% 的旧取值在暗色底上发暗发浑，且与主题色几乎同色；色相偏移让曲线
-     与操作色可区分，也让松绿、藕粉离状态绿、错误红更远。
+     的对比度在 4.5 以上，是整屏最醒目的彩色块；洗色底降到 1.2 左右。黛蓝采用更中性的灰蓝洗色，
+     文字明度约 75%，按下状态的文字对比度仍不低于 4.5。
+   - 数据色一般取同族：主题色色相 −12°、明度 72%、彩度为主题色的 75%（上限 0.13）。曲线按 72%
+     不透明度绘制；色相偏移让曲线与操作色可区分，也让松绿、藕粉离状态绿、错误红更远。
+     黛蓝取灰蓝，明度约 65.6%、彩度约 0.037，减少曲线亮感；原色对块色的对比度仍高于 5。
    - 图表分类色（--observe-1..10）按调色盘各取一套，见本节末「暗色图表分类色」。
-   - 亮色沿用对应暗色分类盘的色相与槽位，主数据色明度降到 52%，其它彩色槽降到 54%，
-     中性槽降到 55%；超出 sRGB 时只收缩彩度。线条对白底及块色的对比度均不低于 4.5。
+   - 亮色沿用对应暗色分类盘的色相与槽位，主数据色通常明度降到 52%，黛蓝保留低彩度灰蓝；
+     其它彩色槽降到 54%，中性槽降到 55%；超出 sRGB 时只收缩彩度。
+     线条对白底及块色的对比度均不低于 4.5。
      槽 1 与 --data 同色，ECharts、KPI、SVG 和图例共用这一事实，不另外维护 JS 主题色表。 */
 
 /* 堇紫：操作色 oklch(61% 0.17 298)，文字对纸 4.55，实底上的深色文字 4.72；明度降低会使
@@ -2660,18 +2668,19 @@
   --primary-line: transparent;
 }
 
-/* 黛蓝：操作色为宝蓝 oklch(60% 0.15 262)，文字对纸 4.64。数据色取同族天蓝
-   oklch(72% 0.113 250)，曲线对纸 7.51。主按钮文字对洗色底 8.65。
+/* 黛蓝：操作色取灰蓝 oklch(64.1% 0.041 262)，文字对纸 5.55。数据色取同族灰蓝
+   oklch(65.6% 0.037 259)，对块色 5.46。主按钮文字对洗色底 6.41、按下底 4.72。
+   亮色沿用同族深灰蓝，操作色对白底 5.57，主按钮悬停时白字对底色 4.82。
    代码数字色需要与关键字（蓝）区分，随主色改用灰紫粉。 */
 :root[data-palette='dailan'] {
-  --action: #4c7dd9;
-  --action-hover: #6190e9;
-  --action-active: #3b6ac5;
-  --action-wash: rgba(76, 125, 217, 0.17);
+  --action: #7f8da6;
+  --action-hover: #919fb5;
+  --action-active: #77859d;
+  --action-wash: rgba(127, 141, 166, 0.13);
   --action-on: #080f1c;
-  --data: #6ca9e8;
+  --data: #8492a8;
   --data-secondary: #758196;
-  --data-wash: rgba(108, 169, 232, 0.13);
+  --data-wash: rgba(132, 146, 168, 0.09);
   --ground: #040608;
   --sheet: #111317;
   --surface: #0f1114;
@@ -2686,22 +2695,25 @@
   --hue-3: #7fa8b0;
   --hue-4: #9890b0;
   --code-n: #c99fc8;
-  --primary: #1a263d;
-  --primary-hover: #1b2a4a;
-  --primary-active: #1b2e54;
-  --primary-on: #a4c5ff;
-  --primary-line: #1c3568;
+  --primary: #252b35;
+  --primary-hover: #2e3744;
+  --primary-active: #354051;
+  --primary-on: #a3afc1;
+  --primary-line: #3b4555;
 }
 :root[data-theme='light'][data-palette='dailan'] {
-  --action: #3f5aa6;
-  --action-hover: #5470b8;
-  --action-active: #2f4482;
-  --action-wash: rgba(63, 90, 166, 0.1);
+  /* 小字在标题带、名册与卡片上均需可读，不能把说明文字当作装饰灰。 */
+  --ink-3: #4f5968;
+  --ink-4: #576373;
+  --action: #5b697f;
+  --action-hover: #63738b;
+  --action-active: #505f75;
+  --action-wash: rgba(91, 105, 127, 0.08);
   --action-on: #ffffff;
-  --data: #306ca7;
+  --data: #5f708a;
   --data-secondary: #6a5f90;
-  --data-wash: rgba(48, 108, 167, 0.09);
-  --observe-1: #306ca7;
+  --data-wash: rgba(95, 112, 138, 0.07);
+  --observe-1: #5f708a;
   --observe-2: #995577;
   --observe-3: #017e84;
   --observe-4: #7362a3;
@@ -2717,9 +2729,9 @@
   --block: #fafafb;
   --band: #eef0f5;
   --sunk: #f5f6f9;
-  --line: #e6e9ef;
+  --line: #dfe3eb;
   --grid-line: #d9dde6;
-  --line-soft: rgba(20, 35, 70, 0.04);
+  --line-soft: rgba(20, 35, 70, 0.07);
   --hue-1: #55697e;
   --hue-2: #5a6188;
   --hue-3: #4d757c;
@@ -2990,7 +3002,7 @@
   --observe-10: #817e88;
 }
 :root[data-palette='dailan']:not([data-theme='light']) {
-  --observe-1: #6ca9e8;
+  --observe-1: #8492a8;
   --observe-2: #db91b4;
   --observe-3: #4fbec4;
   --observe-4: #af9ee4;
@@ -3053,6 +3065,11 @@ html {
   --safe-right: env(safe-area-inset-right, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-left: env(safe-area-inset-left, 0px);
+  --shell-nav-h: 48px;
+  --shell-crumb-h: 36px;
+  /* 两条横栏各有 1px 下边框。启动台面与工作区共用已知的外壳尺寸，首帧就使用
+     同一网格坐标；数据、草稿条和页面内容变化都不能重新定位背景。 */
+  --workspace-grid-origin-y: calc(var(--safe-top) + var(--shell-nav-h) + var(--shell-crumb-h) + 2px);
 }
 html,
 body {
@@ -3188,6 +3205,10 @@ body:has(.forge)::before {
   background-image: var(--grid-image);
   background-size: 32px 32px;
   background-position: center top;
+}
+#stage::before,
+body:has(.forge)::before {
+  background-position: var(--safe-left) var(--workspace-grid-origin-y);
 }
 /* 网格放在滚动内容外。触屏由文档滚动时，视口高的装饰层吸附在顶端；负外边距
    抵消其占位，页面的坐标和滚动高度不变。桌面的文档不滚动，同一层天然静止。
@@ -6259,8 +6280,8 @@ textarea.f::placeholder {
 .vpngate-runtime-paths.stale {
   color: var(--warn);
 }
-.vpngate-usage-section {
-  container: vpngate-runtime / inline-size;
+.cg-sec.panel.vpngate-usage-section {
+  container-name: cg-section vpngate-runtime;
 }
 @container vpngate-runtime (max-width: 1060px) {
   .vpngate-runtime-list .vpngate-runtime-row {
@@ -9045,7 +9066,7 @@ textarea.f::placeholder {
 .ping-probe-legend > :is(span, button) {
   max-width: 190px;
 }
-.ping-probe-legend-item {
+.observe-legend-item {
   display: inline-flex;
   min-width: 0;
   align-items: center;
@@ -9059,15 +9080,19 @@ textarea.f::placeholder {
   white-space: nowrap;
   cursor: pointer;
 }
-.ping-probe-legend-item[aria-pressed='true'] {
+.observe-legend-item[aria-pressed='true'] {
   background: var(--action-wash);
   color: var(--ink-2);
 }
-.ping-probe-legend[data-focused] .ping-probe-legend-item[aria-pressed='false'] {
+[data-focused] > .observe-legend-item[aria-pressed='false'] {
   opacity: 0.45;
 }
+.observe-legend-item:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+}
 @media (hover: hover) {
-  .ping-probe-legend-item:hover {
+  .observe-legend-item:hover {
     background: var(--action-wash);
     color: var(--ink-2);
     opacity: 1 !important;
@@ -9264,6 +9289,17 @@ textarea.f::placeholder {
   :is(.nd-tab-observed > .panel, .nd-tab-pair > .panel, .panel.config-panel, .panel.titled) > :is(header, summary) {
     padding-block: 4px;
   }
+  /* 手机标题栏只保留标题、身份、状态和操作；统计读数留在正文。 */
+  .header-stat,
+  .panel
+    > :is(header, summary)
+    :is(.config-disclosure-summary, .cg-meta:not(.cg-meta-identity), .rt, .cap-rd, .vpngate-selected-count),
+  .chain-section-head > :is(.count, .tunnel-group-agg),
+  .fwr-group-head > .fwr-group-count,
+  .nd-page-head .nd-tab-badge.dim,
+  .unlock-head-count {
+    display: none;
+  }
 }
 /* 列表与普通面板标题共用 12px 等宽字体、字重和字距，不为列表额外放大。 */
 .nd-tab-observed > .panel > :is(header, summary) h4,
@@ -9383,6 +9419,81 @@ textarea.f::placeholder {
 }
 .node-egress-dns-new-row {
   background: color-mix(in srgb, var(--violet) 4%, transparent);
+}
+.node-egress-dns-position {
+  width: 48px;
+  white-space: nowrap;
+}
+.node-egress-dns-position > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.node-egress-rules-table .dns-priority-cell > .btn + .dns-priority,
+.node-egress-rules-table .dns-priority-cell > .btn.danger {
+  margin-left: 4px;
+}
+.node-egress-rules-table.dns-order-dragging,
+.node-egress-rules-table.dns-order-dragging * {
+  cursor: grabbing;
+  user-select: none;
+}
+.node-egress-rules-table tr.dns-order-active {
+  background: color-mix(in srgb, var(--action) 8%, transparent);
+  outline: 1px solid var(--line);
+  outline-offset: -1px;
+}
+.node-egress-rules-table tr.dns-order-before > td {
+  box-shadow: inset 0 2px var(--action);
+}
+.node-egress-rules-table tr.dns-order-after > td {
+  box-shadow: inset 0 -2px var(--action);
+}
+.node-dns-import-dialog {
+  width: min(440px, calc(100vw - 40px));
+  max-height: calc(100dvh - 40px);
+  overflow-y: auto;
+}
+.node-dns-import-dialog > header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 13px;
+}
+.node-dns-import-body {
+  padding: 16px;
+}
+.node-dns-import-body > label {
+  display: grid;
+  gap: 8px;
+  font-size: 12px;
+}
+.node-dns-import-body .f {
+  min-width: 0;
+  width: 100%;
+}
+.node-dns-import-body > .note {
+  margin: 12px 0 0;
+}
+.node-dns-import-dialog > footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--line-soft);
+}
+@container rules (max-width: 640px) {
+  .node-egress-rules-table tr.dns-order-before {
+    box-shadow: inset 0 2px var(--action);
+  }
+  .node-egress-rules-table tr.dns-order-after {
+    box-shadow: inset 0 -2px var(--action);
+  }
+  .node-egress-rules-table tr:is(.dns-order-before, .dns-order-after) > td {
+    box-shadow: none;
+  }
 }
 /* 方案 A：技术限制是一条低对比说明带，紧贴标题与规则表。标题本身仍保留公共规则规定的
    11px 下外边距；这里用等量负外边距接住它，不改标题条的任何计算样式。 */
@@ -10633,13 +10744,13 @@ input.f {
   margin: 0;
   min-width: 0;
   width: 100%;
-  padding: 7px 12px 7px calc(12px + var(--depth, 0) * var(--indent));
+  padding: 7px 12px 7px calc(12px + min(var(--depth, 0), 6) * var(--indent));
   border: 0;
   border-top: 1px solid var(--line-soft);
   border-radius: 0;
   background: transparent;
 }
-/* 名称与标签所在的格：宽度不足时截断 */
+/* 名称允许收缩和换行，右侧操作列保留自己的空间。 */
 .chain-rule-node-head .who {
   display: flex;
   align-items: center;
@@ -10648,7 +10759,10 @@ input.f {
   overflow: hidden;
 }
 .chain-rule-node-head .who > b {
-  flex: none;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  text-align: left;
 }
 .chain-rule-node-head .who > .st {
   flex: none;
@@ -10930,7 +11044,7 @@ input.f {
 .egress-dns-editor {
   min-width: 0;
   display: inline-grid;
-  grid-template-columns: minmax(205px, 240px) 82px 126px 138px;
+  grid-template-columns: minmax(280px, 360px) 82px 126px 138px;
   align-items: center;
   gap: 8px;
   margin-left: 8px;
@@ -10942,6 +11056,16 @@ input.f {
   gap: 4px;
   align-items: center;
   min-width: 0;
+}
+.egress-dns-error {
+  grid-column: 5;
+  grid-row: 1;
+  max-width: min(300px, 25cqw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--err);
+  font-size: 11.5px;
 }
 .egress-dns-endpoint .f,
 .egress-dns-editor > .f {
@@ -11261,6 +11385,17 @@ input.f {
   }
   .egress-dns-endpoint {
     grid-template-columns: minmax(0, 1fr) 8px 74px;
+  }
+  .egress-dns-error {
+    grid-column: 2;
+    grid-row: 4;
+    max-width: 100%;
+  }
+  .egress-dns-editor:has(.egress-dns-error) {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .egress-dns-editor:has(.egress-dns-error) > :not(.egress-dns-fallback, .egress-dns-error) {
+    grid-column: 1 / -1;
   }
   /* 重排 / 优先级 = 卡片脚；空脚（机器 DNS 行占位的 120px 空格）不占位 */
   .rule-table > tbody > tr > td:last-child:not(:first-child, .rule-match-cell, .rule-action-cell) {
@@ -11856,9 +11991,6 @@ details.raw .tbl {
 .tone-odd .spark i {
   background: color-mix(in srgb, var(--gold) 45%, transparent);
 }
-.tone-odd .spark i.slow {
-  background: var(--gold);
-}
 .tone-ok .spark i {
   background: color-mix(in srgb, var(--ok) 45%, transparent);
 }
@@ -12193,6 +12325,10 @@ details.raw .tbl {
   gap: 7px 12px;
 }
 .form-adv {
+  box-sizing: border-box;
+  container-type: inline-size;
+  min-width: 0;
+  max-width: 100%;
   margin-top: 10px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -14533,7 +14669,7 @@ body.has-artpanel .topo-deck {
   display: flex;
   align-items: center;
   gap: 10px;
-  height: 48px;
+  height: var(--shell-nav-h);
   padding: 0 12px 0 18px;
   border-bottom: 1px solid var(--line);
   background: var(--surface);
@@ -15485,6 +15621,10 @@ body.has-artpanel .topo-deck {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.dg-message {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 /* 详情行占满整宽，不受列宽约束，完整消息在此显示且不截断。这是表格化的主要收益：
    长消息不再被两个定宽列压缩为窄条。 */
 .dg-det td {
@@ -15492,6 +15632,7 @@ body.has-artpanel .topo-deck {
   background: color-mix(in srgb, var(--ink) 3%, transparent);
 }
 .dg-det .full {
+  overflow-wrap: anywhere;
   font-size: 12.5px;
   color: var(--ink-2);
   line-height: 1.62;
@@ -15499,6 +15640,8 @@ body.has-artpanel .topo-deck {
   margin: 4px 0 8px;
 }
 .dg-det .kv {
+  min-width: 0;
+  overflow-wrap: anywhere;
   display: flex;
   gap: 9px;
   font: 10.5px var(--mono);
@@ -15510,6 +15653,9 @@ body.has-artpanel .topo-deck {
   color: var(--ink-3);
   font-weight: 400;
   flex: 0 0 44px;
+}
+.dg-det .kv > span {
+  min-width: 0;
 }
 .dg-band td {
   padding: 5px 13px !important;
@@ -15583,7 +15729,7 @@ body.has-artpanel .topo-deck {
   display: flex;
   align-items: center;
   gap: 7px;
-  height: 36px;
+  height: var(--shell-crumb-h);
   padding: 0 24px;
   background: var(--sheet);
   border-bottom: 1px solid var(--line);
@@ -16137,6 +16283,12 @@ body.fg-dragging * {
    本段实现的是 forge 的对应形态：改变布局形态，而非压缩桌面布局。
    ═══════════════════════════════════════════════════════════════════ */
 @media (max-width: 820px) {
+  html {
+    --shell-nav-h: 44px;
+    --shell-crumb-h: 34px;
+    /* 窄屏不渲染面包屑，只计导航行及其下边框。 */
+    --workspace-grid-origin-y: calc(var(--safe-top) + var(--shell-nav-h) + 1px);
+  }
   /* ─── 导航行：品牌 + 四个高频页面 + 通知 + 账户（44px）───
      此处原为「品牌 / 产物 / 诊断 / ⋯」，导航位于屏幕底部的 tab bar。
      该布局共三层：顶栏 53 + 面包屑 35 + tab bar 52 = 140px，占 844 屏高的 16.6%。
@@ -16147,7 +16299,6 @@ body.fg-dragging * {
      该行移除的内容：「产物」「诊断」（都是按需查看的辅助面板，收入账户菜单），以及修订
      读数 `r77 · 3 台待发`——同一信息由菜单中的「发布」状态承担。 */
   .fg-top {
-    height: 44px;
     flex-wrap: nowrap;
     gap: 5px;
     padding: 0 8px;
@@ -16260,24 +16411,15 @@ body.fg-dragging * {
   .dg-b {
     max-height: 60vh;
   }
-  /* 窄屏无法容纳四列：位置列整列隐藏，其内容在展开的详情中仍可查看。
-     诊断码列同时收窄：它是 `hop.plaintext` 这类定长字符串，截断后仍可识别。
-
-     说明列改为折行，不再使用 `nowrap + ellipsis`。此前该列只剩 90px，而一条说明
-     是 800 余 px 的完整句子——每条都只显示前六个字，四条诊断呈现相同，该列失去作用。
-     折行后行高增加，但一屏本身也只能显示两三条。
-     `vertical-align:top` 是配套设置：折为三行的说明与单行的诊断码基线对齐时，
-     诊断码会落到该格中部，两列的第一行不对齐。 */
-  /* `table-layout:auto`：fixed 布局下声明的宽度是强制分配，位置列虽然已 `display:none`，
-     其 196px 仍从总宽中扣除——说明列因此只分到 77px（表宽 368，减去 22 + 112 + 196
-     后所剩无几）。auto 使浏览器按内容分配宽度，下面两个 width 退化为建议值，
-     内容最长的说明列会获得较大宽度。 */
+  /* 窄屏保留可读的诊断码列宽。消息预览最多三行，完整消息与位置在展开行换行。 */
   .dg-tbl {
     table-layout: auto;
   }
   .dg-tbl th.c-at,
   .dg-tbl td.c-at {
     display: none;
+    width: 0;
+    padding: 0;
   }
   .dg-tbl th.c-lv {
     width: 16px;
@@ -16285,6 +16427,7 @@ body.fg-dragging * {
   }
   .dg-tbl th.c-code {
     width: 112px;
+    min-width: 112px;
   }
   /* 状态点所在的格只有一个 6px 圆点，右侧不留内距——保留会在圆点与诊断码之间
      形成 20px 空隙，而说明列正需要这 20px。 */
@@ -16297,15 +16440,24 @@ body.fg-dragging * {
     vertical-align: top;
   }
   .dg-tbl td.c-code {
+    min-width: 112px;
+    max-width: 112px;
     white-space: normal;
     overflow-wrap: anywhere;
     line-height: 1.45;
   }
   .dg-tbl td.c-msg {
+    overflow-wrap: anywhere;
     white-space: normal;
     overflow: visible;
     text-overflow: clip;
     line-height: 1.55;
+  }
+  .dg-message {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    overflow: hidden;
   }
   .dg-det td {
     padding-left: 30px !important;
@@ -16352,7 +16504,6 @@ body.fg-dragging * {
 
   /* ─── 面包屑：单行，宽度不足时横向滚动 ─── */
   .fg-crumb {
-    height: 34px;
     padding: 0 12px;
     gap: 6px;
     overflow-x: auto;
@@ -18634,7 +18785,8 @@ h4.sec > .wz-sec-note {
 /* 名称沿用机器详情的标题排版，但保留点击即改名。负外边距抵消 hover 内距，
    进入编辑前后文字基线和左沿都不移动。 */
 .chain-detail-identity .nd-id > button {
-  max-width: 100%;
+  /* Include the padding cancelled by the negative margins, so a fitting name is not clipped. */
+  max-width: calc(100% + 8px);
   padding: 1px 4px;
   margin: -1px -4px;
   overflow: hidden;
@@ -18882,6 +19034,7 @@ h4.sec > .btn {
     padding-top: 9px;
     padding-bottom: 9px;
     padding-right: 12px;
+    padding-left: calc(12px + min(var(--depth, 0), 3) * var(--indent));
   }
   .chain-rule-node-head .disc {
     grid-area: disc;
@@ -21144,6 +21297,12 @@ h4.sec > .btn {
   .rut-grid.machines .rut-item {
     grid-template-columns: 28px minmax(0, 1fr) 48px 92px;
     column-gap: 8px;
+  }
+}
+/* 读数标签与用量卡在同一卡宽收紧上内距。 */
+@container rut (max-width: 620px) {
+  .rut-now {
+    padding-top: 14px;
   }
 }
 @media (max-width: 480px) {
@@ -23428,12 +23587,6 @@ select.f.fwr-sort {
 .pb-ok .ms {
   color: var(--ok);
 }
-.pb-slow .dot {
-  background: var(--gold);
-}
-.pb-slow .ms {
-  color: var(--gold);
-}
 .pb-odd .dot {
   background: var(--gold);
 }
@@ -23475,9 +23628,6 @@ select.f.fwr-sort {
   border-radius: 1px;
   flex: none;
   background: color-mix(in srgb, var(--action) 55%, transparent);
-}
-.spark i.slow {
-  background: color-mix(in srgb, var(--gold) 70%, transparent);
 }
 .spark i.down {
   background: color-mix(in srgb, var(--err) 70%, transparent);
@@ -24470,7 +24620,7 @@ body.observe-brushing .observe-chart-tip {
   color: var(--ink-3);
   font-size: 10px;
 }
-.history-chart-legend > span {
+.history-chart-legend > :is(span, button) {
   display: inline-flex;
   align-items: baseline;
   gap: 5px;
@@ -25416,12 +25566,7 @@ body.observe-brushing .observe-chart-tip {
 .node-cardpage > .panel {
   margin: 0;
 }
-.node-cardpage > .panel + .panel {
-  margin-top: 12px;
-}
-/* 退役机器使用与在用机器相同的普通标题栏。它曾是 details/summary，浏览器的展开标记
-   会落在「移除全部」右侧，使按钮无法与上方「纳管节点」的右边缘对齐，也像按钮自带
-   一个下拉菜单。退役清单本身不需要折叠，改为普通 section 后两层操作栏严格同宽。 */
+/* `.btn` 不设 gap；「移除选中」的垃圾桶图标与文字之间的间距在这里给出。 */
 .node-remove-button {
   display: inline-flex;
   align-items: center;
@@ -25958,10 +26103,12 @@ body.observe-brushing .observe-chart-tip {
   gap: 2px 14px;
 }
 .node-traffic-limit-state.err,
-.node-traffic-limit-state em,
-.node-traffic-limit-layers .err,
-.node-traffic-limit-layers em {
+.node-traffic-limit-layers .err {
   color: var(--err);
+}
+.node-traffic-limit-state em,
+.node-traffic-limit-layers em {
+  color: inherit;
   font-style: normal;
 }
 /* 限速规则一行一条：「达到 [80 %] 限至 [100 Mbps]」，数值与单位拼成一格。值列窄于 350px 时拆成两行
@@ -26582,6 +26729,22 @@ body.observe-brushing .observe-chart-tip {
 .hy2-quic-fld.wide > span {
   flex: none;
   text-align: left;
+}
+@container (max-width: 260px) {
+  .form-adv .hy2-quic-fld {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+  }
+  .form-adv .hy2-quic-fld > span {
+    flex: none;
+    text-align: left;
+  }
+  .form-adv .hy2-quic-fld > input.f {
+    box-sizing: border-box;
+    width: 100%;
+    flex: auto;
+  }
 }
 @media (max-width: 720px) {
   .hy2-quic {
@@ -27965,6 +28128,37 @@ body.observe-brushing .observe-chart-tip {
 .chain-section + .chain-section {
   border-top: 1px solid var(--line-soft);
 }
+.chain-drop-target {
+  outline: 2px solid var(--action);
+  outline-offset: 4px;
+}
+
+.chain-group-move {
+  width: min(480px, calc(100vw - 32px));
+}
+
+.chain-group-move-body {
+  display: grid;
+  gap: 16px;
+  padding: 20px;
+}
+
+.chain-group-move-body p {
+  margin: 0;
+}
+
+.chain-group-move-field {
+  display: grid;
+  gap: 8px;
+}
+
+.chain-group-move-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 20px 20px;
+}
+
 .chain-section-head {
   min-height: 28px;
   display: flex;
@@ -29401,14 +29595,8 @@ body.observe-brushing .observe-chart-tip {
   color: var(--err);
 }
 
-/* 流量预测窄宽度：标题栏只留需要处理的计数；列表行改为三层（名称 + 结论 / 跑道 / 已用与预计），
+/* 流量预测窄宽度：列表行改为三层（名称 + 结论 / 跑道 / 已用与预计），
    详情上下堆叠，用户占用去掉占比条。 */
-@media (max-width: 820px) {
-  .cap-rd .opt,
-  .cap-rd .opt + .dot {
-    display: none;
-  }
-}
 @container (max-width: 760px) {
   .cap-row {
     grid-template-columns: minmax(0, 1fr) auto 12px;
@@ -29473,7 +29661,8 @@ body.observe-brushing .observe-chart-tip {
 }
 
 /* 读数栏与柱形图铺满月度页签，竖线连接页头和纸底。 */
-.usage-cockpit {
+.usage-cockpit,
+.flt-cockpit {
   display: grid;
   grid-template-columns: 300px minmax(0, 1fr);
   margin: 0;
@@ -30638,13 +30827,17 @@ body.observe-brushing .observe-chart-tip {
     justify-self: end;
   }
 }
-.external-summary-impact > span {
+.external-summary-impact > span:first-child {
   flex: none;
   padding: 1px 5px;
   border: 1px solid color-mix(in srgb, var(--ok) 35%, var(--line));
   border-radius: 3px;
   color: var(--ok);
   font: 600 8px var(--mono);
+}
+.external-summary-impact-copy {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .external-outbound-summary.missing {
   padding: 9px 10px;
@@ -32050,6 +32243,21 @@ table.t.trvh tr.rvh-row-warn td {
 .ov-one > summary .tail {
   color: var(--ink-3);
 }
+.ov-one.ov-rev > summary {
+  display: grid;
+  grid-template-columns: 10px minmax(60px, 0.6fr) minmax(0, 1fr) auto auto 8px;
+}
+.ov-one.ov-rev > summary > .peer,
+.ov-one.ov-rev > summary > b {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.ov-one.ov-rev > summary > .nums {
+  grid-column: 5;
+}
+.ov-one.ov-rev > summary::after {
+  grid-column: 6;
+}
 .ov-one.v-bad > summary .tail {
   color: var(--err);
 }
@@ -32074,6 +32282,32 @@ table.t.trvh tr.rvh-row-warn td {
 }
 
 @media (max-width: 720px) {
+  .ov-one.ov-rev > summary {
+    grid-template-columns: 9px minmax(0, 1fr) 8px;
+    grid-template-areas: 'lamp name arrow' '. peer .' '. mix .' '. nums .';
+    row-gap: 3px;
+  }
+  .ov-one.ov-rev > summary > .lamp {
+    grid-area: lamp;
+  }
+  .ov-one.ov-rev > summary > b {
+    grid-area: name;
+  }
+  .ov-one.ov-rev > summary > .peer {
+    grid-area: peer;
+  }
+  .ov-one.ov-rev > summary > .ov-bar {
+    grid-area: mix;
+    width: 96px;
+  }
+  .ov-one.ov-rev > summary > .nums {
+    grid-area: nums;
+    margin-left: 0;
+    white-space: normal;
+  }
+  .ov-one.ov-rev > summary::after {
+    grid-area: arrow;
+  }
   .ov-one.ov-mux > summary {
     grid-template-columns: 9px minmax(0, 1fr) 8px;
     grid-template-areas:
@@ -34508,6 +34742,7 @@ body.fg-dragging .fg-rail {
 }
 .cg-main {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
   gap: 12px;
 }
@@ -34545,16 +34780,40 @@ body.fg-dragging .fg-rail {
 
 /* 分区：配置卡的色带标题，内容贴边 */
 .cg-sec.panel {
+  container: cg-section / inline-size;
   margin: 0;
   padding: 0;
   overflow: clip;
 }
 .cg-sec.panel > :is(header, summary) {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
   margin: 0;
   padding-inline: 13px;
+}
+.cg-sec.panel > :is(header, summary) > .panel-title {
+  flex: none;
+  white-space: nowrap;
+}
+.cg-sec.panel > :is(header, summary) > .cg-meta {
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+@container cg-section (max-width: 620px) {
+  .cg-sec.panel > :is(header, summary) {
+    flex-wrap: nowrap;
+  }
+  .cg-sec.panel > :is(header, summary) > .cg-meta:not(.cg-meta-identity) {
+    display: none;
+  }
+  .cg-sec.panel > summary > .cgf-disclosure-state {
+    margin-left: auto;
+  }
 }
 .cg-sec.panel > summary {
   list-style: none;
@@ -35587,6 +35846,13 @@ body.fg-dragging .fg-rail {
 /* ── 页头 ⋯ 菜单与确认框 ── */
 .cg-menu-wrap {
   position: relative;
+  z-index: 30;
+}
+.cg-menu-wrap::details-content {
+  block-size: auto;
+  overflow: visible;
+  opacity: 1;
+  transition: none;
 }
 .cg-menu {
   position: absolute;
@@ -37043,8 +37309,8 @@ button.site-usage-row:focus-visible {
  * 实时页签的按需工作面，与月度台账同一纸面：左侧读数栏（复用 .usage-ledger），右侧「用户 ×
  * 机器」热力矩阵。矩阵是真实的数据表（行头为用户、列头为机器），一格只画四种事实：有速率按固定
  * 十进档取 --observe-1 色阶；已采集且为 0 是同一色相最浅的一档（0 也是读数，不画成灰色占位）；
- * 授权了却没有当前读数是空心格；未授权留白。机器按地区成组、组间留缝，列名斜排，整个机队一屏
- * 放下；机器不多时列宽放得下读数，格子直接写数值。窄屏改为按用户的流向列表。 */
+ * 授权了却没有当前读数是空心格；未授权留白。机器按地区成组、组间留缝，列名斜排，间距固定，
+ * 放不下时横向滚动；机器不多时列宽放得下读数，格子直接写数值。窄屏改为按用户的流向列表。 */
 .flt-panel {
   /* 吸附列、准星与空闲格跟随页签纸面，不另铺配置卡的底色。 */
   --flt-surface: var(--nd-paper-surface, var(--sheet));
@@ -37056,12 +37322,6 @@ button.site-usage-row:focus-visible {
   padding: 22px 18px;
   color: var(--ink-3);
   font-size: 13px;
-}
-/* 读数栏与矩阵铺满实时页签，与月度页签共用内容边缘。 */
-.flt-cockpit {
-  display: grid;
-  grid-template-columns: 300px minmax(0, 1fr);
-  margin: 0;
 }
 .flt-empty {
   display: grid;
@@ -37084,7 +37344,6 @@ button.site-usage-row:focus-visible {
 }
 
 .flt-board {
-  container-type: inline-size;
   display: flex;
   min-width: 0;
   flex-direction: column;
@@ -37100,21 +37359,17 @@ button.site-usage-row:focus-visible {
   overscroll-behavior-inline: contain;
   scrollbar-width: thin;
 }
-/* 列宽由板面宽度均分，格子在 22–30px 之间（22px 时斜排列名之间仍有 15px 间距）；放不下时
- * 整表横向滚动，用户列吸附在左侧。
+/* 固定 30px 列宽和 24px 方格，窗口变化时保持 6px 格间距与斜排列名的阅读节奏；
+ * 空间不足时整表横向滚动，用户列吸附在左侧。
  * --flt-columns / --flt-gaps 由组件按机器数与地区组数写入。 */
 .flt-grid {
   --flt-user-w: 148px;
   --flt-sum-w: 92px;
   --flt-gap: 8px;
-  --flt-head-h: 104px;
-  --flt-col: clamp(
-    22px,
-    calc((100cqw - var(--flt-user-w) - var(--flt-sum-w) - var(--flt-gaps) * var(--flt-gap)) / var(--flt-columns)),
-    30px
-  );
-  --flt-row: max(var(--flt-col), 24px);
-  --flt-cell: calc(var(--flt-col) - 4px);
+  --flt-head-h: 136px;
+  --flt-col: 30px;
+  --flt-row: var(--flt-col);
+  --flt-cell: calc(var(--flt-col) - 6px);
   width: calc(
     var(--flt-user-w) + var(--flt-sum-w) + var(--flt-columns) * var(--flt-col) + var(--flt-gaps) * var(--flt-gap)
   );
@@ -37174,20 +37429,20 @@ button.site-usage-row:focus-visible {
   width: 100%;
   box-sizing: border-box;
 }
-/* 斜排列名：左下角落在格子中线，向右上 45° 展开；相邻列名之间留出 15px 以上的垂直间距。 */
+/* 斜排列名：左下角落在格子中线，向右上 45° 展开；表头高度容纳最长标签旋转后的范围。 */
 .flt-mlabel {
   position: absolute;
   bottom: 22px;
   left: calc(50% - 5px);
   display: flex;
-  max-width: 132px;
+  max-width: 144px;
   align-items: center;
   padding: 0 2px;
   border: 0;
   border-radius: 3px;
   background: none;
   color: var(--ink-3);
-  font: 11px/14px var(--sans);
+  font: 11px/16px var(--sans);
   white-space: nowrap;
   transform: rotate(-45deg);
   transform-origin: 0 100%;
@@ -37333,6 +37588,7 @@ button.site-usage-row:focus-visible {
 .flt-key .unknown {
   --flt-cell-ring: inset 0 0 0 1px color-mix(in srgb, var(--ink-4) 62%, transparent);
 }
+.flt-cell.pending,
 .flt-cell.na {
   visibility: hidden;
 }
@@ -37382,11 +37638,7 @@ button.site-usage-row:focus-visible {
 
 /* 机器不多：列宽放得下读数，色块缩成行内标记，列名横排。 */
 .flt-board.wide .flt-grid {
-  --flt-col: clamp(
-    96px,
-    calc((100cqw - var(--flt-user-w) - var(--flt-sum-w) - var(--flt-gaps) * var(--flt-gap)) / var(--flt-columns)),
-    168px
-  );
+  --flt-col: 168px;
   --flt-row: 32px;
   --flt-cell: 10px;
   --flt-head-h: 30px;
@@ -37589,56 +37841,19 @@ button.site-usage-row:focus-visible {
   }
 }
 
-/* 机器多时矩阵需要整行宽度：读数栏移到上方（排法同用量卡 900px 以下）；超过 28 台在任何宽度下
- * 都这样排。620px 以下交给用量卡的单列读数栏，这里不再覆盖。 */
-.flt-cockpit.packed {
-  grid-template-columns: minmax(0, 1fr);
-}
-@container (max-width: 1080px) {
-  .flt-cockpit.dense {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-@container (min-width: 621px) {
-  .flt-cockpit.packed > .usage-ledger {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    gap: 22px 28px;
-    border-right: 0;
-    border-bottom: 1px solid var(--line-soft);
-  }
-  .flt-cockpit.packed > .usage-ledger > .usage-facts {
-    margin-top: 0;
-  }
-}
-@container (min-width: 621px) and (max-width: 1080px) {
-  .flt-cockpit.dense > .usage-ledger {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    gap: 22px 28px;
-    border-right: 0;
-    border-bottom: 1px solid var(--line-soft);
-  }
-  .flt-cockpit.dense > .usage-ledger > .usage-facts {
-    margin-top: 0;
-  }
-}
+/* 宽屏保留左侧读数栏；机器多时在矩阵内部横向滚动，只有内容区域较窄时才移到上方。
+ * 读数栏内部沿用用量卡在 900px / 620px 下的排布。 */
 @container (max-width: 900px) {
   .flt-cockpit {
     grid-template-columns: minmax(0, 1fr);
   }
 }
-/* 较窄的板面（以 .flt-board 为容器）：收窄用户列与合计列、组间缝。 */
-@container (max-width: 860px) {
-  .flt-grid {
-    --flt-user-w: 116px;
-    --flt-sum-w: 76px;
-    --flt-gap: 6px;
-  }
-}
 @container (max-width: 680px) {
   .flt-board {
     display: none;
+  }
+  .flt-board.pending {
+    display: flex;
   }
   .flt-list {
     display: block;

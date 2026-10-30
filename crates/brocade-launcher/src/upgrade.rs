@@ -374,9 +374,16 @@ mod tests {
     }
 
     fn program(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        fs::write(path, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        // Keep executable bytes immutable: another test's fork can briefly inherit an
+        // open writer and make execve return ETXTBSY even after this thread closes it.
+        let mut body_path = path.as_os_str().to_owned();
+        body_path.push(".body");
+        fs::write(PathBuf::from(body_path), format!("set -eu\n{body}\n")).unwrap();
+        if !path.exists() {
+            let runner =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test-program.sh");
+            std::os::unix::fs::symlink(runner, path).unwrap();
+        }
     }
 
     #[tokio::test]

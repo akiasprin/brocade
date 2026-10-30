@@ -356,8 +356,26 @@ pub async fn record_load_report(
         }
     }
 
+    let peer_ids = request
+        .hops
+        .iter()
+        .map(|hop| hop.peer_node_id.as_str())
+        .collect::<Vec<_>>();
+    // Optional, stale peer observations must not poison the durable host-window queue.
+    // Hold the existing peer keys until commit so deletion cannot race the FK insert.
+    let known_peers = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM nodes WHERE id = ANY($1) ORDER BY id FOR KEY SHARE",
+    )
+    .bind(&peer_ids)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
     for hop in &request.hops {
-        if hop.window_end_unix_secs <= hop.window_start_unix_secs {
+        if hop.peer_node_id == node_id
+            || !known_peers.contains(&hop.peer_node_id)
+            || hop.window_end_unix_secs <= hop.window_start_unix_secs
+        {
             rejected_hops += 1;
             continue;
         }

@@ -1,0 +1,626 @@
+/* ═══ A · 液态玻璃（macOS 26 / iPadOS 26 的 Liquid Glass）═══
+   规则：
+   1. 两层。导航层（侧栏、工具栏读数、页头）是浮在内容之上的玻璃；内容层（卡片、图表、表单）是不透明的纸。
+      玻璃不用于内容，内容不叠玻璃。
+   2. 圆角同心：外框 24 → 卡片 22 → 内块 16 → 控件全圆角。控件一律胶囊形。
+   3. 玻璃需要背后有东西才成立，台面换成极淡的壁纸色晕；卡片本身仍是系统白 / 系统灰。
+   4. 选中态用强调色的淡染，主操作才用强调色实底。
+   玻璃的模糊放在 ::before 上：带 backdrop-filter 的元素会成为后代的模糊根，侧栏里的弹出菜单若嵌在
+   这样的元素内，就模糊不到侧栏外的页面。 */
+
+:root[data-lang='glass']:not([data-theme='light']) {
+  --card: #1c1c1e;
+  --lg-wall:
+    radial-gradient(1100px 760px at 6% -12%, rgba(64, 104, 255, 0.3), transparent 62%),
+    radial-gradient(960px 680px at 102% 2%, rgba(175, 82, 222, 0.18), transparent 62%),
+    radial-gradient(1100px 820px at 72% 112%, rgba(48, 176, 199, 0.16), transparent 62%), #040406;
+  --lg-fill: rgba(40, 40, 46, 0.5);
+  --lg-fill-strong: rgba(36, 36, 42, 0.82);
+  --lg-line: rgba(255, 255, 255, 0.11);
+  --lg-edge: inset 0 1px 0 rgba(255, 255, 255, 0.13), inset 0 0 0 0.5px rgba(255, 255, 255, 0.04);
+  --lg-shadow: 0 16px 44px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.3);
+  --lg-ctl: rgba(255, 255, 255, 0.09);
+  --lg-ctl-h: rgba(255, 255, 255, 0.15);
+  --lg-ctl-line: rgba(255, 255, 255, 0.08);
+  --lg-track: rgba(118, 118, 128, 0.24);
+  --lg-thumb: rgba(255, 255, 255, 0.17);
+  --lg-thumb-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 1px 4px rgba(0, 0, 0, 0.35);
+  --lg-card: #1c1c1e;
+  --lg-card-line: rgba(255, 255, 255, 0.06);
+  --lg-card-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --lg-card-lift: 0 2px 6px rgba(0, 0, 0, 0.35), 0 16px 36px rgba(0, 0, 0, 0.4);
+  --lg-inset: rgba(255, 255, 255, 0.045);
+  --lg-select: color-mix(in srgb, var(--action) 24%, transparent);
+  --sheet-shadow: var(--lg-card-shadow);
+  --float: var(--lg-fill-strong);
+  --float-sheet: var(--lg-fill-strong);
+  --float-filter: blur(30px) saturate(1.9);
+  --float-edge: var(--lg-edge);
+}
+:root[data-lang='glass'][data-theme='light'] {
+  --card: #ffffff;
+  --lg-wall:
+    radial-gradient(1100px 760px at 4% -12%, rgba(120, 162, 255, 0.42), transparent 62%),
+    radial-gradient(960px 680px at 104% 0%, rgba(214, 164, 255, 0.3), transparent 62%),
+    radial-gradient(1100px 820px at 76% 114%, rgba(255, 196, 160, 0.34), transparent 62%), #eef0f6;
+  --lg-fill: rgba(255, 255, 255, 0.55);
+  --lg-fill-strong: rgba(250, 250, 253, 0.84);
+  --lg-line: rgba(255, 255, 255, 0.78);
+  --lg-edge: inset 0 1px 0 rgba(255, 255, 255, 0.95), inset 0 0 0 0.5px rgba(255, 255, 255, 0.5);
+  --lg-shadow: 0 12px 36px rgba(32, 44, 90, 0.12), 0 1px 3px rgba(32, 44, 90, 0.08);
+  --lg-ctl: rgba(255, 255, 255, 0.78);
+  --lg-ctl-h: #ffffff;
+  --lg-ctl-line: rgba(0, 0, 0, 0.06);
+  --lg-track: rgba(118, 118, 128, 0.12);
+  --lg-thumb: #ffffff;
+  --lg-thumb-shadow: 0 1px 3px rgba(0, 0, 0, 0.12), 0 0 0 0.5px rgba(0, 0, 0, 0.04);
+  --lg-card: #ffffff;
+  --lg-card-line: rgba(0, 0, 0, 0.035);
+  --lg-card-shadow: 0 1px 2px rgba(24, 36, 80, 0.04), 0 8px 24px rgba(24, 36, 80, 0.06);
+  --lg-card-lift: 0 2px 6px rgba(24, 36, 80, 0.06), 0 18px 40px rgba(24, 36, 80, 0.12);
+  --lg-inset: rgba(118, 118, 128, 0.07);
+  --lg-select: color-mix(in srgb, var(--action) 13%, transparent);
+  --sheet-shadow: var(--lg-card-shadow);
+  --float: var(--lg-fill-strong);
+  --float-sheet: var(--lg-fill-strong);
+  --float-filter: blur(30px) saturate(1.9);
+  --float-edge: var(--lg-edge);
+}
+:root[data-lang='glass'] {
+  --r-card: 20px;
+  --r-ctl: 999px;
+  --ctl-h: 32px;
+}
+
+/* ── 台面：壁纸色晕 ── */
+:root[data-lang='glass'] body,
+:root[data-lang='glass'] #stage,
+:root[data-lang='glass'] body:has(.forge)::before {
+  background: var(--lg-wall);
+}
+
+/* ── 外壳：浮动玻璃侧栏 ── */
+:root[data-lang='glass'] .forge:not(.narrow) .fg-desk:not(.is-topo) {
+  display: grid;
+  grid-template-columns: 248px minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+:root[data-lang='glass'] .forge:not(.narrow) .fg-desk:not(.is-topo) > * {
+  grid-column: 2;
+  min-width: 0;
+}
+:root[data-lang='glass'] .forge:not(.narrow) .fg-desk:not(.is-topo) > .fg-top {
+  grid-column: 1;
+  grid-row: 1 / span 3;
+  position: sticky;
+  top: 10px;
+  z-index: 40;
+  align-self: start;
+  box-sizing: border-box;
+  height: calc(100dvh - 20px);
+  margin: 10px 0 10px 10px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  padding: 18px 10px 10px;
+  border: 1px solid var(--lg-line);
+  border-radius: 24px;
+  background: none;
+  box-shadow: var(--lg-edge), var(--lg-shadow);
+}
+:root[data-lang='glass'] .fg-top::before,
+:root[data-lang='glass'] .fg-crumb-right::before,
+:root[data-lang='glass'] .nd-sheet > .nd-paper > .nd-page-head::before,
+:root[data-lang='glass'] .user-dhead::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background: var(--lg-fill);
+  -webkit-backdrop-filter: blur(30px) saturate(1.9);
+  backdrop-filter: blur(30px) saturate(1.9);
+  pointer-events: none;
+}
+:root[data-lang='glass'] .forge:not(.narrow) .fg-top > .fg-home {
+  justify-content: flex-start;
+  gap: 9px;
+  height: 34px;
+  margin: 0 0 14px;
+  padding: 0 10px;
+  color: var(--action);
+}
+:root[data-lang='glass'] .fg-brand {
+  color: var(--ink);
+  font: 600 16px/1 var(--display);
+  letter-spacing: -0.01em;
+}
+:root[data-lang='glass'] .fg-logo {
+  width: 22px;
+  height: 22px;
+}
+:root[data-lang='glass'] .forge:not(.narrow) .fg-top > .fg-vr {
+  display: none;
+}
+:root[data-lang='glass'] .forge:not(.narrow) .fg-top > .fg-nav {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  overflow: visible;
+}
+:root[data-lang='glass'] .forge:not(.narrow) .fg-nv {
+  justify-content: flex-start;
+  gap: 11px;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: 12px;
+  color: var(--ink);
+  font-size: 14px;
+}
+:root[data-lang='glass'] .fg-nv-ic {
+  color: var(--action);
+}
+:root[data-lang='glass'] .fg-nv-ic svg {
+  width: 17px;
+  height: 17px;
+}
+:root[data-lang='glass'] .fg-nv[aria-current='true'] {
+  background: var(--lg-select);
+  box-shadow: none;
+  color: var(--ink);
+  font-weight: 600;
+}
+:root[data-lang='glass'] .fg-nv[aria-current='true'] .fg-nv-ic {
+  transform: none;
+}
+:root[data-lang='glass'] .fg-nv .fg-badge {
+  margin-left: auto;
+}
+:root[data-lang='glass'] .forge:not(.narrow) .fg-top > .sp {
+  flex: 1;
+}
+/* 侧栏底部：通知与账户是两行，名称直接显示。 */
+:root[data-lang='glass'] .forge:not(.narrow) .fg-top .fg-tgl {
+  justify-content: flex-start;
+  gap: 11px;
+  width: 100%;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: 12px;
+  color: var(--ink-2);
+}
+:root[data-lang='glass'] .forge:not(.narrow) .fg-top .fg-tgl-ic svg {
+  width: 17px;
+  height: 17px;
+}
+:root[data-lang='glass'] .forge:not(.narrow) .fg-top .fg-tgl-label {
+  position: static;
+  width: auto;
+  height: auto;
+  overflow: visible;
+  clip-path: none;
+  font-size: 14px;
+}
+:root[data-lang='glass'] .forge:not(.narrow) .fg-top .fg-tgl .fg-badge {
+  position: static;
+  margin-left: auto;
+  box-shadow: none;
+}
+:root[data-lang='glass'] .forge:not(.narrow) .fg-top .fg-who {
+  width: 100%;
+  max-width: none;
+  height: 46px;
+  margin-top: 6px;
+  padding: 0 10px 0 7px;
+  gap: 10px;
+  border-radius: 16px;
+  color: var(--ink);
+  font: 500 13.5px var(--sans);
+  box-shadow: inset 0 0 0 1px var(--lg-ctl-line);
+  background: var(--lg-ctl);
+}
+:root[data-lang='glass'] .fg-who-plate {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: linear-gradient(160deg, color-mix(in srgb, var(--action) 70%, #fff), var(--action));
+  color: #fff;
+  font: 600 13px var(--sans);
+}
+:root[data-lang='glass'] .forge:not(.narrow) .fg-top .fg-who-caret {
+  margin-left: auto;
+  transform: rotate(-90deg);
+}
+/* 侧栏底部弹出：账户菜单向上展开，通知面板贴着侧栏向右展开。 */
+:root[data-lang='glass'] .forge:not(.narrow) .fg-top .fg-menuwrap:not(.machine-notification-wrap) > :is(.fg-menu, .fg-pop) {
+  top: auto;
+  right: auto;
+  bottom: calc(100% + 8px);
+  left: 0;
+}
+:root[data-lang='glass'] .forge:not(.narrow) .fg-top .machine-notification-wrap > .fg-pop {
+  top: auto;
+  right: auto;
+  bottom: -6px;
+  left: calc(100% + 18px);
+}
+
+/* ── 工具栏：路径 + 读数胶囊，内容从下面滚过 ── */
+:root[data-lang='glass'] .forge:not(.narrow) .fg-crumb {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  height: 64px;
+  padding: 0 28px 0 26px;
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  font-size: 15px;
+}
+:root[data-lang='glass'] .forge:not(.narrow) .fg-crumb::after {
+  content: '';
+  position: absolute;
+  inset: 0 0 -16px;
+  z-index: -1;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  -webkit-mask-image: linear-gradient(#000 50%, transparent);
+  mask-image: linear-gradient(#000 50%, transparent);
+  pointer-events: none;
+}
+:root[data-lang='glass'] .fg-crumb .cur {
+  color: var(--ink);
+  font: 600 15px var(--display);
+}
+:root[data-lang='glass'] .fg-crumb-link {
+  color: var(--ink-3);
+  font-size: 15px;
+}
+:root[data-lang='glass'] .fg-crumb-link:hover {
+  color: var(--action);
+  text-decoration: none;
+}
+:root[data-lang='glass'] .fg-crumb-right {
+  position: relative;
+  isolation: isolate;
+  align-items: center;
+  gap: 12px;
+  height: 34px;
+  padding: 0 15px;
+  border: 1px solid var(--lg-line);
+  border-radius: 999px;
+  box-shadow: var(--lg-edge), 0 4px 16px rgba(0, 0, 0, 0.08);
+  color: var(--ink-2);
+  font-size: 12.5px;
+}
+:root[data-lang='glass'] .fg-crumb-right :is(.ft-rd-value, .ft-state) {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+/* ── 内容区 ── */
+:root[data-lang='glass'] :is(.cardpage, .nd-sheet) {
+  margin: 2px 28px 48px 24px;
+}
+
+/* 列表页：外层容器退掉，标题成为页面大标题，卡片直接落在台面上。 */
+:root[data-lang='glass'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) {
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+:root[data-lang='glass'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header {
+  min-height: 44px;
+  margin: 0 0 18px;
+  padding: 0 2px;
+  border: 0;
+  background: none;
+}
+:root[data-lang='glass'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header h4 {
+  color: var(--ink);
+  font: 700 30px/1.15 var(--display);
+  letter-spacing: -0.02em;
+  text-transform: none;
+}
+:root[data-lang='glass'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header .list-ico {
+  display: none;
+}
+:root[data-lang='glass'] .fg-view .panel:is(.node-list-panel, .chain-list-panel) > header :is(.btn, .segsw) {
+  height: 34px;
+  min-height: 34px;
+}
+
+/* 卡片 */
+:root[data-lang='glass'] .ncards {
+  gap: 16px;
+}
+:root[data-lang='glass'] :is(.ncard, .chain-card) {
+  border: 1px solid var(--lg-card-line);
+  border-radius: 22px;
+  background: var(--lg-card);
+  box-shadow: var(--lg-card-shadow);
+  transition:
+    box-shadow 0.2s ease,
+    transform 0.2s ease;
+}
+:root[data-lang='glass'] .ncard {
+  padding: 17px 16px 15px;
+}
+@media (hover: hover) and (pointer: fine) {
+  :root[data-lang='glass'] :is(.ncard, .chain-card):hover {
+    border-color: var(--lg-card-line);
+    box-shadow: var(--lg-card-lift);
+    transform: translateY(-1px);
+  }
+}
+:root[data-lang='glass'] .nc-head b {
+  font: 600 15px var(--display);
+}
+:root[data-lang='glass'] .lst-sum {
+  font: 600 23px var(--display);
+  letter-spacing: -0.01em;
+}
+:root[data-lang='glass'] .nc-dock .btn {
+  height: 28px;
+  min-height: 28px;
+}
+
+/* 线路分组 */
+:root[data-lang='glass'] .chain-section-head {
+  padding-inline: 2px;
+}
+:root[data-lang='glass'] .chain-section-name {
+  font: 700 19px var(--display);
+  letter-spacing: -0.01em;
+}
+:root[data-lang='glass'] .chain-section + .chain-section {
+  border-top: 0;
+}
+:root[data-lang='glass'] .chain-card-grid {
+  gap: 16px;
+}
+:root[data-lang='glass'] .chain-card-title {
+  font: 600 15px var(--display);
+}
+:root[data-lang='glass'] .cp-hop {
+  border-radius: 999px;
+}
+
+/* 详情页：纸退掉，页头成为一条玻璃栏。机器详情的正文本来就由面板组成，面板各自成卡；
+   用量、发布这类正文是一整张版面的页面，正文整体成一张卡。 */
+:root[data-lang='glass'] .nd-sheet > .nd-paper {
+  --nd-paper-surface: var(--lg-card);
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+:root[data-lang='glass'] .nd-sheet:not(.nd-node-detail) > .nd-paper > .nd-paper-body {
+  overflow: hidden;
+  border: 1px solid var(--lg-card-line);
+  border-radius: 24px;
+  background: var(--lg-card);
+  box-shadow: var(--lg-card-shadow);
+}
+:root[data-lang='glass'] .nd-sheet > .nd-paper > .nd-page-head {
+  position: relative;
+  isolation: isolate;
+  min-height: 66px;
+  margin: 0 0 18px;
+  padding: 0 12px 0 14px;
+  border: 1px solid var(--lg-line);
+  border-radius: 24px;
+  box-shadow: var(--lg-edge), var(--lg-shadow);
+}
+:root[data-lang='glass'] .nd-sheet > .nd-paper > .nd-page-head .nd-id {
+  font: 700 19px var(--display);
+  letter-spacing: -0.01em;
+}
+:root[data-lang='glass'] .nd-sheet.nd-node-detail > .nd-paper > .nd-paper-body {
+  padding: 0;
+}
+
+/* 用户详情同样拆成玻璃页头 + 一列卡片 */
+:root[data-lang='glass'] .fg-view .panel.user-split-detail {
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+:root[data-lang='glass'] .user-dhead {
+  position: relative;
+  isolation: isolate;
+  margin: 0 0 6px;
+  border: 1px solid var(--lg-line);
+  border-radius: 24px;
+  background: none;
+  box-shadow: var(--lg-edge), var(--lg-shadow);
+}
+:root[data-lang='glass'] .user-split-roster {
+  border-radius: 24px;
+}
+
+/* 页签：胶囊分段 */
+:root[data-lang='glass'] .nd-sheet .nd-tabs::before {
+  display: none;
+}
+:root[data-lang='glass'] .nd-tabs {
+  align-self: center;
+  margin-left: 6px;
+}
+:root[data-lang='glass'] .nd-tabs-seg {
+  height: auto;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--lg-track);
+}
+:root[data-lang='glass'] .nd-tabs button {
+  height: 30px;
+  padding: 0 15px;
+  border-radius: 999px;
+  color: var(--ink-2);
+  font-size: 13px;
+  font-weight: 500;
+}
+:root[data-lang='glass'] .nd-tabs button[aria-selected='true'] {
+  background: var(--lg-thumb);
+  box-shadow: var(--lg-thumb-shadow);
+  color: var(--ink);
+  font-weight: 600;
+}
+:root[data-lang='glass'] .nd-tabs button[aria-selected='true'] .nd-tab-ic {
+  color: var(--action);
+}
+
+/* 面板、图表、读数砖：不透明的纸，圆角同心 */
+:root[data-lang='glass'] .fg-view :is(.panel, .chart-card, .kpi) {
+  border: 1px solid var(--lg-card-line);
+  background: var(--lg-card);
+  box-shadow: var(--lg-card-shadow);
+}
+:root[data-lang='glass'] .fg-view :is(.panel, .chart-card) {
+  border-radius: 22px;
+}
+:root[data-lang='glass'] .fg-view .kpi {
+  border-radius: 18px;
+}
+:root[data-lang='glass'] .kpi .kpi-l {
+  color: var(--ink-3);
+  font: 500 11.5px var(--sans);
+  text-transform: none;
+}
+:root[data-lang='glass'] .kpi .kpi-v {
+  font: 600 24px var(--display);
+}
+:root[data-lang='glass'] .kpi-band {
+  gap: 12px;
+}
+:root[data-lang='glass'] .nd-observe-throughput {
+  gap: 16px;
+}
+:root[data-lang='glass']
+  :is(.nd-tab-observed > .panel, .nd-tab-pair > .panel, .panel.config-panel, .panel.titled)
+  > :is(header, summary) {
+  border-bottom-color: transparent;
+  background: none;
+}
+:root[data-lang='glass']
+  :is(.nd-tab-observed > .panel, .nd-tab-pair > .panel, .panel.config-panel, .panel.titled)
+  > :is(header, summary)
+  h4,
+:root[data-lang='glass'] .panel > :is(header, summary) h4 {
+  color: var(--ink);
+  font: 600 15px/1.3 var(--display);
+  letter-spacing: 0;
+  text-transform: none;
+}
+:root[data-lang='glass'] .panel-title-icon,
+:root[data-lang='glass'] .chart-title-icon {
+  color: var(--action);
+}
+
+/* ── 控件：胶囊 ── */
+:root[data-lang='glass'] .btn {
+  padding: 0 15px;
+  border: 1px solid var(--lg-ctl-line);
+  border-radius: 999px;
+  background: var(--lg-ctl);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 500;
+}
+@media (hover: hover) {
+  :root[data-lang='glass'] .btn:hover:not(:disabled) {
+    background: var(--lg-ctl-h);
+  }
+  :root[data-lang='glass'] .btn.primary:hover:not(:disabled) {
+    background: var(--primary-hover);
+  }
+}
+:root[data-lang='glass'] .btn.primary {
+  border-color: transparent;
+  background: var(--primary);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.2),
+    0 2px 8px color-mix(in srgb, var(--primary) 30%, transparent);
+  color: var(--primary-on);
+}
+:root[data-lang='glass'] .btn.primary:disabled {
+  border-color: var(--lg-ctl-line);
+  background: var(--lg-ctl);
+  box-shadow: none;
+  color: var(--ink-4);
+}
+:root[data-lang='glass'] .segsw {
+  min-height: 32px;
+  padding: 2px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--lg-track);
+}
+:root[data-lang='glass'] .segsw button {
+  padding: 0 14px;
+  border-radius: 999px;
+  color: var(--ink-2);
+  font-size: 13px;
+}
+:root[data-lang='glass'] .segsw button[aria-pressed='true'],
+:root[data-lang='glass'] .segsw button[aria-pressed='true']:hover:not(:disabled) {
+  background: var(--lg-thumb);
+  box-shadow: var(--lg-thumb-shadow);
+  color: var(--ink);
+  font-weight: 600;
+}
+:root[data-lang='glass'] :is(input.f, select.f) {
+  min-height: 34px;
+  padding: 0 13px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: var(--lg-track);
+  font-size: 13px;
+}
+:root[data-lang='glass'] textarea.f {
+  border: 1px solid transparent;
+  border-radius: 14px;
+  background: var(--lg-track);
+}
+:root[data-lang='glass'] :is(input.f, textarea.f, select.f):focus {
+  border-color: var(--action);
+  background: var(--lg-card);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--action) 24%, transparent);
+}
+:root[data-lang='glass'] .st {
+  padding: 2px 9px;
+  border-color: transparent;
+  border-radius: 999px;
+  background: var(--hover-2);
+  font: 500 11px var(--sans);
+}
+
+/* ── 浮层：菜单、弹层、对话框都是玻璃 ── */
+:root[data-lang='glass'] :is(.fg-menu, .fg-pop) {
+  border: 1px solid var(--lg-line);
+  border-radius: 20px;
+  box-shadow:
+    var(--lg-edge),
+    0 24px 60px rgba(0, 0, 0, 0.26),
+    0 2px 8px rgba(0, 0, 0, 0.12);
+}
+:root[data-lang='glass'] .fg-menu button {
+  border-radius: 12px;
+}
+:root[data-lang='glass'] .dialog-surface {
+  border: 1px solid var(--lg-line);
+  border-radius: 28px;
+  box-shadow:
+    var(--lg-edge),
+    0 30px 80px rgba(0, 0, 0, 0.35);
+}

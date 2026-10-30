@@ -1,0 +1,675 @@
+/* 机器详情「来源 IP 封禁」mockup。只用生产令牌，跟随生产的明暗与配色；禁行标记、解除与提示沿用
+   user-source-access.css 的 .source-ban-*。 */
+
+.mk-hide-legacy #root .nd-tab-config .source-access-panel {
+  display: none !important;
+}
+.mk-slot {
+  display: contents;
+}
+
+/* ══ 卡片 ══ */
+
+.panel.config-panel.nsb {
+  container: nsb / inline-size;
+  /* 列宽：禁行标记 14 · 间距 10 · 地址。各组的行、入口与提示都从地址列起排。 */
+  --nsb-indent: 24px;
+}
+.nsb-stat {
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.nsb-stat b {
+  color: var(--ink-2);
+  font-weight: 600;
+}
+.nsb-status {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  align-self: center;
+  color: var(--ink-3);
+  font: 11px/1 var(--sans);
+  white-space: nowrap;
+}
+.nsb-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.nsb-status.ok .nsb-dot {
+  background: var(--ok);
+}
+.nsb-status.gold {
+  color: var(--gold);
+}
+.nsb-status.err {
+  color: var(--err);
+}
+.nsb-phase {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0 0 8px;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.nsb-phase svg {
+  flex: none;
+  margin-top: 1px;
+}
+.nsb-phase.err {
+  color: var(--err);
+}
+.nsb-phase.gold {
+  color: var(--gold);
+}
+
+/* ══ 组 ══ */
+
+.nsb-group + .nsb-group {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
+}
+.nsb-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 2px;
+  color: var(--ink);
+  font: 600 12px var(--sans);
+}
+.nsb-group-head small {
+  color: var(--ink-4);
+  font: 400 11px var(--sans);
+}
+
+/* ══ 行：禁行标记 · 地址 · 归属 · 行尾 ══ */
+
+.nsb-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.nsb-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 14px minmax(0, 176px) minmax(0, 1fr) auto;
+  grid-template-areas: 'mark ip place end';
+  align-items: center;
+  column-gap: 10px;
+  min-height: 34px;
+  padding: 5px 0;
+  box-sizing: border-box;
+}
+/* 内缩的分隔线从地址列开始，禁行标记一列连成一条竖向的节奏（iOS 列表的做法）。 */
+.nsb-row + .nsb-row::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: var(--nsb-indent);
+  border-top: 1px solid var(--line-soft);
+}
+.nsb-mark {
+  grid-area: mark;
+  position: relative;
+  justify-self: center;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px var(--err);
+}
+.nsb-mark::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 1.5px;
+  height: 8px;
+  margin: -4px 0 0 -0.75px;
+  border-radius: 1px;
+  background: var(--err);
+  transform: rotate(-45deg);
+}
+.nsb-ip {
+  grid-area: ip;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+.nsb-ip > code {
+  min-width: 0;
+  color: var(--ink);
+  font: 12px/1.45 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.nsb-place {
+  grid-area: place;
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.nsb-place > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nsb-sub {
+  grid-area: sub;
+  min-width: 0;
+}
+.nsb-end {
+  grid-area: end;
+  display: flex;
+  justify-content: flex-end;
+}
+.nsb-unban {
+  margin-right: -8px;
+}
+/* 复制钮与用户页一样悬停或聚焦时出现，触屏常显。 */
+@media (hover: hover) {
+  .nsb-row .user-fcopy {
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+  .nsb-row:hover .user-fcopy,
+  .nsb-row .user-fcopy:focus-visible,
+  .nsb-row .user-fcopy:is(.done, .failed) {
+    opacity: 1;
+  }
+}
+
+/* ══ 添加与折叠 ══ */
+
+.nsb-add-link,
+.nsb-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 30px;
+  padding: 0;
+  border: 0;
+  color: var(--action);
+  background: none;
+  font: 12px var(--sans);
+  cursor: pointer;
+}
+.nsb-add-link,
+.nsb-more,
+.nsb-add,
+.nsb-legacy,
+.nsb-empty {
+  margin-left: var(--nsb-indent);
+}
+.nsb-more {
+  display: flex;
+  min-height: 26px;
+  font-size: 11.5px;
+}
+.nsb-add-link:disabled {
+  color: var(--ink-4);
+  cursor: default;
+}
+@media (hover: hover) {
+  .nsb-add-link:hover:not(:disabled),
+  .nsb-more:hover {
+    color: var(--action-hover);
+  }
+}
+.nsb-add-link:focus-visible,
+.nsb-more:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.nsb-add {
+  padding: 6px 0 4px;
+}
+.nsb-add-row {
+  display: flex;
+  max-width: 420px;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+.nsb-add-row input.f {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.nsb-add-row .btn {
+  flex: none;
+}
+.nsb-hint {
+  flex-wrap: wrap;
+}
+.nsb-add > .callout {
+  margin: 8px 0 0;
+}
+.nsb-legacy,
+.nsb-empty {
+  margin-top: 4px;
+  margin-bottom: 2px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.nsb-empty {
+  margin-top: 2px;
+  padding: 6px 0 0;
+}
+
+/* ══ 用户 ══ */
+
+.nsb-user {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  color: var(--ink);
+  background: none;
+  font: 500 12px var(--sans);
+  cursor: pointer;
+}
+.nsb .user-avatar.mini {
+  width: 18px;
+  height: 18px;
+  font-size: 10px;
+}
+.nsb-user .user-avatar {
+  flex: none;
+}
+.nsb-user-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (hover: hover) {
+  .nsb-user:hover .nsb-user-name {
+    color: var(--action);
+  }
+}
+.nsb-user:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.nsb-tenant {
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+}
+.nsb-users {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.nsb-users > li {
+  padding: 4px 0 2px;
+}
+.nsb-users > li + li {
+  margin-top: 2px;
+  border-top: 1px solid var(--line-soft);
+}
+.nsb-user-line {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 8px;
+}
+.nsb-chev {
+  margin-left: auto;
+  color: var(--ink-4);
+  font-size: 13px;
+}
+
+/* ══ B 按地址合并：地址与归属上下两行，右侧写对谁生效 ══ */
+
+.nsb-merged .nsb-row {
+  grid-template-columns: 14px minmax(0, 1fr) minmax(0, 188px) 44px;
+  grid-template-areas:
+    'mark ip sub end'
+    '. place sub end';
+  row-gap: 1px;
+  padding: 7px 0;
+}
+.nsb-merged .nsb-mark {
+  align-self: start;
+  margin-top: 4px;
+}
+.nsb-scope {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+.nsb-scope-node {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink);
+  font: 500 12px var(--sans);
+  white-space: nowrap;
+}
+.nsb-scope-node svg {
+  color: var(--ink-3);
+}
+.nsb-b > .nsb-add-link,
+.nsb-b > .nsb-add {
+  margin-top: 2px;
+}
+
+/* ══ C 本机为主：用户名单收成卡底一行 ══ */
+
+.nsb-userbar {
+  margin-top: 6px;
+  border-top: 1px solid var(--line-soft);
+}
+.nsb-userbar-toggle {
+  display: flex;
+  width: 100%;
+  min-height: 38px;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0 0;
+  border: 0;
+  color: var(--ink-2);
+  background: none;
+  font: 12px var(--sans);
+  text-align: left;
+  cursor: pointer;
+}
+.nsb-faces {
+  display: inline-flex;
+  flex: none;
+  width: 14px;
+  justify-content: flex-start;
+  padding-left: 0;
+}
+.nsb-faces .user-avatar {
+  flex: none;
+  box-shadow: 0 0 0 1.5px var(--card);
+}
+.nsb-faces .user-avatar + .user-avatar {
+  margin-left: -6px;
+}
+.nsb-faces {
+  width: auto;
+  min-width: 14px;
+}
+.nsb-userbar-text b {
+  color: var(--ink);
+  font-weight: 600;
+}
+.nsb-userbar-names {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-4);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nsb-userbar-chev {
+  flex: none;
+  margin-left: auto;
+  color: var(--ink-4);
+  transition: transform 160ms ease;
+}
+.nsb-userbar.open .nsb-userbar-chev {
+  transform: rotate(180deg);
+}
+@media (hover: hover) {
+  .nsb-userbar-toggle:hover .nsb-userbar-text {
+    color: var(--ink);
+  }
+}
+.nsb-userbar-toggle:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.nsb-userbar .nsb-users {
+  margin-top: 4px;
+}
+
+/* ══ D 紧凑网格 ══ */
+
+/* 每行一份名单：左列是归属（本机，或某位用户），右侧格子排地址。 */
+.nsb-grid-block {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  align-items: start;
+  column-gap: 12px;
+  padding: 2px 0;
+}
+.nsb-grid-block:not(.user) {
+  margin-bottom: 4px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.nsb-grid-block > .nsb-add,
+.nsb-grid-block > .nsb-legacy {
+  grid-column: 2;
+  margin-left: 0;
+}
+.nsb-grid-who {
+  display: flex;
+  min-width: 0;
+  min-height: 30px;
+  align-items: center;
+}
+.nsb-grid-block.user > .nsb-grid-who:not(:has(.nsb-user)) {
+  color: var(--ink);
+  font: 500 12px var(--sans);
+}
+.nsb-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 0 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.nsb-cell {
+  display: flex;
+  min-width: 0;
+  min-height: 30px;
+  align-items: center;
+  gap: 6px;
+}
+.nsb-cell.v6 {
+  grid-column: 1 / -1;
+}
+.nsb-cell > code {
+  min-width: 0;
+  color: var(--ink);
+  font: 12px/1.45 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.nsb-cell-noflag {
+  width: 16px;
+  height: 11px;
+  flex: none;
+  border-radius: 2px;
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.nsb-cell.busy {
+  opacity: 0.45;
+}
+.nsb-cell-x {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  place-items: center;
+  margin-left: -2px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: var(--ink-4);
+  background: none;
+  cursor: pointer;
+}
+.nsb-cell-x svg {
+  stroke-width: 1.8;
+}
+@media (hover: hover) {
+  .nsb-cell-x {
+    opacity: 0;
+  }
+  .nsb-cell:hover .nsb-cell-x,
+  .nsb-cell-x:focus-visible {
+    opacity: 1;
+  }
+  .nsb-cell-x:hover {
+    color: var(--err);
+    background: color-mix(in srgb, var(--err) 12%, transparent);
+  }
+}
+.nsb-cell.add > .nsb-add-link {
+  margin-left: 0;
+}
+.nsb-add.inline {
+  padding-top: 4px;
+}
+
+/* ══ 窄卡（手机与窄窗） ══ */
+
+@container nsb (max-width: 460px) {
+  .nsb-row {
+    grid-template-columns: 14px minmax(0, 1fr) auto;
+    grid-template-areas:
+      'mark ip end'
+      '. place end';
+    row-gap: 1px;
+    padding: 7px 0;
+  }
+  .nsb-row .nsb-mark {
+    align-self: start;
+    margin-top: 4px;
+  }
+  .nsb-merged .nsb-row {
+    grid-template-columns: 14px minmax(0, 1fr) auto;
+    grid-template-areas:
+      'mark ip end'
+      '. place end'
+      '. sub sub';
+    row-gap: 3px;
+  }
+  .nsb-merged .nsb-sub {
+    margin-top: 3px;
+  }
+  .nsb-add-row {
+    max-width: none;
+  }
+  .nsb-grid-block {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .nsb-grid-block > .nsb-add,
+  .nsb-grid-block > .nsb-legacy {
+    grid-column: 1;
+  }
+  .nsb-grid-who {
+    min-height: 26px;
+  }
+  .nsb-userbar-names {
+    display: none;
+  }
+}
+
+/* ══ 评审条 ══ */
+
+.mk-dock {
+  position: fixed;
+  left: 50%;
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  z-index: 2147483000;
+  transform: translateX(-50%);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  width: max-content;
+  max-width: min(720px, calc(100vw - 24px));
+  padding: 8px 10px;
+  border: 1px dashed color-mix(in srgb, var(--ink-3) 60%, transparent);
+  border-radius: 14px;
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+  backdrop-filter: blur(14px) saturate(1.4);
+  box-shadow: var(--shadow);
+  color: var(--ink-2);
+  font: 12px/1.4 var(--sans);
+}
+.mk-dock.folded {
+  padding: 4px;
+}
+.mk-dock-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.mk-scene {
+  width: auto;
+  min-width: 0;
+}
+.mk-dock-note {
+  max-width: 680px;
+  margin: 0;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.mk-fold,
+.mk-unfold {
+  appearance: none;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--ink-3);
+  font: 12px var(--sans);
+  cursor: pointer;
+}
+.mk-fold {
+  width: 26px;
+  height: 26px;
+  margin-left: auto;
+  font-size: 15px;
+}
+.mk-unfold {
+  padding: 5px 10px;
+}
+.mk-fold:hover,
+.mk-unfold:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+@media (max-width: 720px) {
+  .mk-dock {
+    left: 12px;
+    right: 12px;
+    width: auto;
+    transform: none;
+    max-width: none;
+  }
+  .mk-dock-row:first-child {
+    flex-wrap: nowrap;
+  }
+  .mk-dock-row:first-child > .segsw {
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .mk-dock-row:first-child > .segsw > button {
+    flex: none;
+  }
+}

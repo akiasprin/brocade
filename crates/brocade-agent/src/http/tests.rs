@@ -1,7 +1,7 @@
 use super::*;
 use std::{
-    io::{BufRead, BufReader},
-    net::{Shutdown, TcpListener},
+    io::{BufRead, BufReader, Write},
+    net::{Shutdown, TcpListener, TcpStream},
     sync::mpsc,
     thread,
 };
@@ -109,6 +109,7 @@ fn bounded_request(
         RequestTransport {
             family: None,
             timeout,
+            ..RequestTransport::default()
         },
     )
 }
@@ -205,10 +206,25 @@ fn utf8_lengths_are_bytes_and_content_encoding_is_not_implicitly_decoded() {
         "{}"
     );
 }
+
+#[test]
+fn repeated_set_cookie_headers_preserve_independent_values() {
+    let response = response_from_wire(b"HTTP/1.1 200 OK\r\nSet-Cookie: privacy=mock; Expires=Wed, 01 Jan 2030 00:00:00 GMT\r\nSet-Cookie: rollout=mock\r\nContent-Length: 0\r\n\r\n").unwrap();
+    assert_eq!(
+        response.header_values("Set-Cookie").collect::<Vec<_>>(),
+        [
+            "privacy=mock; Expires=Wed, 01 Jan 2030 00:00:00 GMT",
+            "rollout=mock",
+        ]
+    );
+    assert_eq!(response.header("set-cookie"), Some("rollout=mock"));
+}
 #[test]
 fn redirects_and_error_statuses_return_to_the_application_without_replay() {
     for status in [302, 409, 429, 503] {
-        let raw=format!("HTTP/1.1 {status} Test\r\nLocation: http://127.0.0.1:1/private\r\nContent-Length: 2\r\n\r\n{{}}");
+        let raw = format!(
+            "HTTP/1.1 {status} Test\r\nLocation: http://127.0.0.1:1/private\r\nContent-Length: 2\r\n\r\n{{}}"
+        );
         let response = exchange(raw.as_bytes(), "POST", false).unwrap();
         assert_eq!(response.status, status);
     }
@@ -594,24 +610,157 @@ fn a_pooled_post_with_a_truncated_response_is_never_replayed() {
     server.join().unwrap();
 }
 
-#[test]
-fn readiness_wait_wakes_on_data_and_respects_the_sample_deadline() {
+#[tokio::test]
+async fn a_websocket_stream_read_waits_without_blocking_the_runtime() {
+    use tokio::io::AsyncReadExt;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (mut peer, _) = accept(&listener);
-    let mut stream = Stream::Plain(DeadlineTcpStream {
-        tcp: client,
-        deadline: None,
-    });
-    stream.finish_handshake().unwrap();
-    let started = Instant::now();
-    stream
-        .wait_for_io(false, Some(Duration::from_millis(25)))
+    let address = listener.local_addr().unwrap();
+    let mut stream = HttpClient::new(&format!("http://{address}"))
+        .unwrap()
+        .connect_stream(Instant::now() + Duration::from_secs(1))
+        .await
         .unwrap();
+    let (mut peer, _) = accept(&listener);
+    let mut bytes = [0; 5];
+    let started = Instant::now();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), stream.read_exact(&mut bytes))
+            .await
+            .is_err()
+    );
     assert!(started.elapsed() >= Duration::from_millis(20));
     peer.write_all(b"ready").unwrap();
-    stream.wait_for_io(false, None).unwrap();
-    let mut bytes = [0; 5];
-    stream.read_exact(&mut bytes).unwrap();
+    stream.read_exact(&mut bytes).await.unwrap();
     assert_eq!(&bytes, b"ready");
+}
+
+#[test]
+fn diagnostic_family_clients_cannot_connect_using_the_other_address_family() {
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
+    for (family, address, other) in [
+        (
+            super::AddressFamily::V4,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            super::AddressFamily::V6,
+        ),
+        (
+            super::AddressFamily::V6,
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            super::AddressFamily::V4,
+        ),
+    ] {
+        let listener =
+            TcpListener::bind((address, 0)).expect("both loopback families are required");
+        let socket_address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut byte = [0];
+            while !bytes.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                bytes.push(byte[0]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let url = format!("http://{socket_address}/");
+        let wrong = super::diagnostic_family_client(other).unwrap();
+        assert!(
+            wrong
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(1))
+                .send()
+                .is_err(),
+            "a selected family must never use the other literal family"
+        );
+        let client = super::diagnostic_family_client(family).unwrap();
+        assert_eq!(
+            client
+                .get(url)
+                .timeout(std::time::Duration::from_secs(3))
+                .send()
+                .unwrap()
+                .text()
+                .unwrap(),
+            "ok"
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn diagnostic_gzip_downloads_complete_html_without_changing_ordinary_http() {
+    use flate2::{write::GzEncoder, Compression};
+    let html = format!(
+        "<html><head>netflix og:video</head><body>{}</body></html>",
+        "完整网页".repeat(8192)
+    );
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(html.as_bytes()).unwrap();
+    let compressed = encoder.finish().unwrap();
+    assert!(compressed.len() < html.len() / 20);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = accept(&listener);
+        let (headers, _) = read_request(&mut stream);
+        assert!(headers.contains("accept-encoding: gzip"));
+        assert!(!headers.contains("authorization:"));
+        assert!(!headers.contains("x-brocade-protocol"));
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            compressed.len()
+        )
+        .unwrap();
+        stream.write_all(&compressed).unwrap();
+    });
+    let response = HttpClient::new(&origin)
+        .unwrap()
+        .request_public_diagnostic("GET", "/", None, "text/html", &[], Duration::from_secs(5))
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(response.body, html);
+    assert_eq!(response.header("content-encoding"), Some("gzip"));
+    assert_eq!(
+        response_from_wire(
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 2\r\n\r\n{}"
+        )
+        .unwrap()
+        .body,
+        "{}"
+    );
+}
+
+#[test]
+fn diagnostic_gzip_rejects_invalid_trailers_and_excessive_decoded_bodies() {
+    use flate2::{write::GzEncoder, Compression};
+    let compress = |bytes: &[u8]| {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    };
+    let valid = compress(b"<html>netflix og:video</html>");
+    let encoding = ["gzip".to_owned()];
+    let start = Instant::now();
+    let progress = diagnostic::Progress::new(start);
+    let deadline = start + Duration::from_secs(10);
+    let mut truncated = valid.clone();
+    truncated.truncate(truncated.len() - 4);
+    let mut corrupt = valid;
+    let n = corrupt.len();
+    corrupt[n - 8] ^= 1;
+    for bytes in [truncated, corrupt] {
+        let error =
+            decode_diagnostic_body(bytes, Some(&encoding), deadline, &progress).unwrap_err();
+        assert!(error.contains("invalid_gzip"));
+    }
+    let bomb = compress(&vec![b'x'; MAX_HTTP_RESPONSE_BYTES + 1]);
+    let error = decode_diagnostic_body(bomb, Some(&encoding), deadline, &progress).unwrap_err();
+    assert!(error.contains("decoded_body_exceeds_limit"));
 }

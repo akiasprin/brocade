@@ -1554,7 +1554,7 @@ mod tests {
         let config = directory.join("xray.json");
         let mut content = serde_json::json!({
             "log": { "loglevel": "warning" },
-            "api": { "tag": "api", "services": ["HandlerService", "StatsService"] },
+            "api": { "tag": "api", "services": ["HandlerService", "StatsService", "RoutingService"] },
             "stats": {},
             "policy": { "levels": { "0": {
                 "statsUserUplink": true,
@@ -1616,7 +1616,7 @@ mod tests {
             ],
             // The integration target is loopback; override the normal private-IP deny only
             // inside this isolated fixture, never in generated production configuration.
-            "outbounds": [{ "tag": "direct", "protocol": "freedom", "settings": { "ipsBlocked": [] } }],
+            "outbounds": [{ "tag": "out:forward", "protocol": "freedom", "settings": { "ipsBlocked": [] } }],
             "routing": { "rules": [{
                 "type": "field",
                 "inboundTag": ["api"],

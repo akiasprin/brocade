@@ -38,6 +38,32 @@ fn legacy(snapshot: &ModelSnapshot) -> Option<BTreeMap<String, DesiredGrants>> {
 }
 
 #[tokio::test]
+async fn permission_projection_keeps_running_accounts_when_an_ingress_changes_group() {
+    let base = model();
+    let expected = compiled_grants(&base).await.unwrap();
+    assert!(
+        expected.is_some(),
+        "the running topology must be publishable"
+    );
+    let mut moved = base.clone();
+    moved.apps[0].id = "new-group".to_owned();
+    let projected = crate::serving::permission_projection(base.clone(), &moved);
+    assert_eq!(
+        compiled_grants(&projected).await.unwrap(),
+        expected,
+        "moving a stable ingress must not revoke accounts on its still-running topology"
+    );
+
+    moved.apps[0].grants.clear();
+    let revoked = crate::serving::permission_projection(base, &moved);
+    assert_ne!(
+        compiled_grants(&revoked).await.unwrap(),
+        expected,
+        "an explicit revocation after moving must still reach the running ingress"
+    );
+}
+
+#[tokio::test]
 async fn grants_short_path_matches_full_plans_for_permission_changes() {
     let base = model();
     let mut cases = Vec::new();

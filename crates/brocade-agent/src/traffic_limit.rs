@@ -18,7 +18,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+mod adoption;
 mod kernel;
+#[cfg(test)]
+mod network_tests;
 
 const DESIRED: &str = "traffic-limit-desired.json";
 const STATUS: &str = "traffic-limit-status.json";
@@ -45,11 +48,20 @@ pub(crate) fn spawn(options: Options, snapshot: Arc<TrafficSnapshot>) -> Result<
     let sync_options = options.clone();
     thread::Builder::new()
         .name("traffic-limit-sync".into())
-        .spawn(move || loop {
-            if let Err(e) = synchronize(&sync_options) {
-                eprintln!("traffic-limit sync: {e}");
+        .spawn(move || {
+            let mut wake = crate::wake::Cursor::new(
+                brocade_deployment::agent_channel::WakeDomain::TrafficLimit,
+            );
+            loop {
+                let interval = match synchronize(&sync_options) {
+                    Ok(interval) => interval,
+                    Err(error) => {
+                        eprintln!("traffic-limit sync: {error}");
+                        Duration::from_secs(15)
+                    }
+                };
+                wake.wait_connected(interval.min(Duration::from_secs(15)), interval);
             }
-            thread::sleep(Duration::from_secs(15));
         })
         .map_err(|e| format!("spawn traffic limit synchronization: {e}"))?;
     thread::Builder::new()
@@ -70,12 +82,12 @@ pub(crate) fn spawn(options: Options, snapshot: Arc<TrafficSnapshot>) -> Result<
     Ok(())
 }
 
-fn synchronize(options: &Options) -> Result<(), String> {
+fn synchronize(options: &Options) -> Result<Duration, String> {
     let client = HttpClient::new(&options.server)?;
     // Fetch first: a failed receipt must not prevent the operator from disabling a limit.
     let response = client.request("GET", "/agent/v1/traffic-limit", &options.token, None)?;
     if response.status == 404 {
-        return Ok(());
+        return Ok(Duration::from_secs(60));
     } // New Agent, old Console: keep the saved policy.
     if response.status != 200 {
         return Err(format!(
@@ -105,7 +117,11 @@ fn synchronize(options: &Options) -> Result<(), String> {
     if previous.as_ref() != Some(&desired) {
         save(&path, &desired)?;
     }
-    if let Some(status) = recent_status(&options.state_dir, SystemTime::now())? {
+    let status = recent_status(&options.state_dir, SystemTime::now())?;
+    // The local worker applies a newly saved revision on its own clock. An old
+    // receipt cannot confirm it, and stable heartbeats must not delay that confirmation.
+    let interval = synchronization_interval(desired.revision, status.as_ref());
+    if let Some(status) = status.filter(|status| status.revision == desired.revision) {
         let body = serde_json::to_string(&status).map_err(|e| e.to_string())?;
         let response = client.request(
             "POST",
@@ -120,7 +136,21 @@ fn synchronize(options: &Options) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    Ok(interval)
+}
+
+fn synchronization_interval(revision: u64, status: Option<&TrafficLimitObservation>) -> Duration {
+    if status.is_some_and(|status| {
+        status.revision == revision
+            && matches!(
+                status.phase,
+                TrafficLimitPhase::Disabled | TrafficLimitPhase::Ready | TrafficLimitPhase::Limited
+            )
+    }) {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(3)
+    }
 }
 
 fn recent_status(dir: &Path, now: SystemTime) -> Result<Option<TrafficLimitObservation>, String> {
@@ -195,8 +225,41 @@ fn used_bytes(
     Ok((used, period))
 }
 
+#[derive(Debug)]
+pub(crate) enum LimitApplyError {
+    Waiting(String),
+    Failed(String),
+}
+
+impl LimitApplyError {
+    fn phase(&self) -> TrafficLimitPhase {
+        match self {
+            Self::Waiting(_) => TrafficLimitPhase::Waiting,
+            Self::Failed(_) => TrafficLimitPhase::Error,
+        }
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::Waiting(message) | Self::Failed(message) => message,
+        }
+    }
+}
+
+impl From<String> for LimitApplyError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for LimitApplyError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.into())
+    }
+}
+
 fn layer_result(
-    result: Result<(), String>,
+    result: Result<(), LimitApplyError>,
     rate: Option<u64>,
     enabled: bool,
 ) -> TrafficLayerObservation {
@@ -213,10 +276,36 @@ fn layer_result(
             error: None,
         },
         Err(error) => TrafficLayerObservation {
-            phase: TrafficLimitPhase::Error,
+            phase: error.phase(),
             rate_bps: None,
-            error: Some(error.chars().take(500).collect()),
+            error: Some(error.into_message().chars().take(500).collect()),
         },
+    }
+}
+
+fn combine_layers(
+    system: &TrafficLayerObservation,
+    application: &TrafficLayerObservation,
+) -> Result<(), LimitApplyError> {
+    let layers = [system, application];
+    let failed = layers
+        .iter()
+        .any(|layer| layer.phase == TrafficLimitPhase::Error);
+    let waiting = layers
+        .iter()
+        .any(|layer| layer.phase == TrafficLimitPhase::Waiting);
+    if !failed && !waiting {
+        return Ok(());
+    }
+    let message = layers
+        .iter()
+        .filter_map(|layer| layer.error.as_deref())
+        .collect::<Vec<_>>()
+        .join("；");
+    if failed {
+        Err(LimitApplyError::Failed(message))
+    } else {
+        Err(LimitApplyError::Waiting(message))
     }
 }
 
@@ -224,24 +313,31 @@ pub(crate) fn apply_application(
     dir: &Path,
     enabled: bool,
     rate: Option<u64>,
-) -> Result<(), String> {
+) -> Result<(), LimitApplyError> {
     crate::traffic_limit_budget::ensure_configured(dir, enabled, rate)?;
     if !enabled {
         return Ok(());
     }
-    let config =
-        fs::read_to_string(dir.join("xray.json")).map_err(|_| "等待 Xray 启动以确认应用层限速")?;
+    let config = fs::read_to_string(dir.join("xray.json")).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            LimitApplyError::Waiting("等待 Xray 启动以确认应用层限速".into())
+        } else {
+            LimitApplyError::Failed("无法读取 Xray 应用层限速配置".into())
+        }
+    })?;
     let api = crate::xray_api_address(&config).ok_or("Xray 本地 API 地址不可用")?;
     let _deadline = crate::xray_grpc::deadline_after(Some(Duration::from_secs(2)));
     let stats = crate::xray_grpc::query_stats(api, crate::traffic_limit_budget::STATS_NAME)
         .map_err(|_| "应用层限速未确认，需要支持机器限速的受管 Xray 及可用本地 API")?;
-    if !stats.iter().any(|s| {
-        s.name == crate::traffic_limit_budget::STATS_NAME
-            && u64::try_from(s.value).ok() == Some(rate.unwrap_or(0))
-    }) {
-        return Err(
-            "Xray 尚未确认应用层上限；请升级支持机器限速的受管 Xray，并重启使能力生效".into(),
-        );
+    let stat = stats
+        .iter()
+        .find(|stat| stat.name == crate::traffic_limit_budget::STATS_NAME)
+        .ok_or("Xray 尚不支持应用层上限，请升级支持机器限速的受管 Xray")?;
+    let applied = u64::try_from(stat.value).map_err(|_| "Xray 应用层限速回执值无效")?;
+    if applied != rate.unwrap_or(0) {
+        return Err(LimitApplyError::Waiting(
+            "等待 Xray 确认新的应用层上限".into(),
+        ));
     }
     confirm_application_generations(dir)
 }
@@ -293,7 +389,7 @@ pub(crate) fn generation_supports_capability(
     Ok(supported)
 }
 
-fn confirm_application_generations(dir: &Path) -> Result<(), String> {
+fn confirm_application_generations(dir: &Path) -> Result<(), LimitApplyError> {
     let Some(runtime) = crate::xrayupdate::read_upgrade_runtime(dir)? else {
         return Ok(());
     };
@@ -306,18 +402,27 @@ fn confirm_application_generations(dir: &Path) -> Result<(), String> {
         .filter(|p| p.alive)
     {
         live += 1;
-        if !generation_supports_limit(process)? {
-            return Err(format!(
-                "Xray 进程 {} 尚不支持机器限速，等待旧代排空后再确认应用层上限",
-                process.pid
-            ));
-        }
         let identity_matches = || {
             crate::process_ref(process.pid)
                 .is_some_and(|p| p.start_ticks == process.pid_start_ticks)
         };
         if !identity_matches() {
-            return Err("Xray 代际身份已变化，等待重新确认".into());
+            return Err(LimitApplyError::Waiting(
+                "Xray 代际身份已变化，等待重新确认".into(),
+            ));
+        }
+        let supported = generation_supports_limit(process).map_err(|error| {
+            if identity_matches() {
+                LimitApplyError::Failed(error)
+            } else {
+                LimitApplyError::Waiting("Xray 代际身份已变化，等待重新确认".into())
+            }
+        })?;
+        if !supported {
+            return Err(LimitApplyError::Waiting(format!(
+                "Xray 进程 {} 尚不支持机器限速，等待旧代排空后再确认应用层上限",
+                process.pid
+            )));
         }
         let environment = crate::fsutil::read_bounded(
             &std::path::PathBuf::from(format!("/proc/{}/environ", process.pid)),
@@ -330,14 +435,16 @@ fn confirm_application_generations(dir: &Path) -> Result<(), String> {
                 .is_some_and(|path| path == expected.as_os_str().as_encoded_bytes())
         });
         if !identity_matches() || !shared {
-            return Err(format!(
+            return Err(LimitApplyError::Waiting(format!(
                 "Xray 进程 {} 尚未接入整机共享预算，等待旧代排空后再确认应用层上限",
                 process.pid
-            ));
+            )));
         }
     }
     if live == 0 {
-        return Err("Xray 代际状态尚未收敛，等待应用层确认".into());
+        return Err(LimitApplyError::Waiting(
+            "Xray 代际状态尚未收敛，等待应用层确认".into(),
+        ));
     }
     Ok(())
 }
@@ -386,7 +493,8 @@ fn local_round(
                     reading.as_ref().map(|r| r.interface.as_str()),
                     report.rate_bps.filter(|_| system),
                     network,
-                ),
+                )
+                .map_err(LimitApplyError::Failed),
                 report.rate_bps.filter(|_| system),
                 system,
             );
@@ -396,21 +504,10 @@ fn local_round(
                 report.rate_bps.filter(|_| application),
                 application,
             );
-            let errors: Vec<_> = [
-                system_result.error.as_deref(),
-                application_result.error.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-            let error = (!errors.is_empty()).then(|| errors.join("；"));
+            let result = combine_layers(&system_result, &application_result);
             report.system = Some(system_result);
             report.application = Some(application_result);
-            if let Some(error) = error {
-                Err(error)
-            } else {
-                Ok(())
-            }
+            result
         }
         Err(error) => {
             // Invalid/missing counters never silently remove the existing cap. The loopback
@@ -424,23 +521,30 @@ fn local_round(
                             Some(&saved.interface),
                             Some(saved.rate_bps),
                             network,
-                        ),
+                        )
+                        .map_err(LimitApplyError::Failed),
                         Some(saved.rate_bps),
                         true,
                     ));
                 }
                 Ok(None) => {}
-                Err(error) => report.system = Some(layer_result(Err(error), None, true)),
+                Err(error) => report.system = Some(layer_result(Err(error.into()), None, true)),
             }
-            Err(error)
+            let failed = report
+                .system
+                .as_ref()
+                .is_some_and(|layer| layer.phase == TrafficLimitPhase::Error);
+            Err(
+                if desired.policy.enabled && desired.anchor.is_none() && !failed {
+                    LimitApplyError::Waiting(error)
+                } else {
+                    LimitApplyError::Failed(error)
+                },
+            )
         }
     };
-    report.phase = if result.is_err() {
-        if desired.policy.enabled && desired.anchor.is_none() {
-            TrafficLimitPhase::Waiting
-        } else {
-            TrafficLimitPhase::Error
-        }
+    report.phase = if let Err(error) = &result {
+        error.phase()
     } else if !desired.policy.enabled {
         TrafficLimitPhase::Disabled
     } else if report.rate_bps.is_some() {
@@ -448,11 +552,19 @@ fn local_round(
     } else {
         TrafficLimitPhase::Ready
     };
-    if let Err(error) = &result {
-        report.error = Some(error.chars().take(500).collect());
-    }
+    let failure = match result {
+        Ok(()) => None,
+        Err(LimitApplyError::Waiting(message)) => {
+            report.error = Some(message.chars().take(500).collect());
+            None
+        }
+        Err(LimitApplyError::Failed(message)) => {
+            report.error = Some(message.chars().take(500).collect());
+            Some(message)
+        }
+    };
     save(&dir.join(STATUS), &report)?;
-    result
+    failure.map_or(Ok(()), Err)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,6 +628,9 @@ fn reconcile_network(
     network: &mut impl Network,
 ) -> Result<(), String> {
     let mut saved: Option<AppliedNetwork> = read_json(&dir.join(NETWORK))?;
+    if let Some(saved) = &saved {
+        validate_saved_network(saved)?;
+    }
     if let Some(old) = saved
         .as_ref()
         .filter(|s| rate.is_none() || Some(s.interface.as_str()) != interface)
@@ -534,24 +649,21 @@ fn reconcile_network(
         .filter(|s| valid_interface(s) && *s != IFB)
         .ok_or("无效物理网卡名称")?;
     let existing = qdiscs(network, interface)?;
+    adoption::check_ingress_blocks(&existing)?;
     let root = existing
         .iter()
         .find(|q| q["root"] == true)
         .ok_or("无法识别网卡根队列")?;
     let previous_root = if owned_root(root) {
+        adoption::check_filters(network, interface, &existing)?;
         saved
             .as_ref()
             .map(|s| s.previous_root.clone())
             .ok_or("限速队列存在但缺少所有权检查点")?
     } else {
         let kind = root["kind"].as_str().ok_or("缺少根队列类型")?;
-        let handle = root["handle"].as_str().unwrap_or("");
-        // Only kernel-assigned default queues may be adopted. Custom handles/QoS need an operator.
-        if !matches!(kind, "fq" | "fq_codel" | "pfifo_fast" | "mq" | "noqueue")
-            || !(handle == "0:" || handle.starts_with("80"))
-        {
-            return Err("网卡已有自定义 QoS，拒绝覆盖".into());
-        }
+        adoption::check(&existing, root)?;
+        adoption::check_filters(network, interface, &existing)?;
         saved
             .as_ref()
             .map(|s| s.previous_root.clone())
@@ -565,6 +677,18 @@ fn reconcile_network(
         {
             return Err("限速 IFB 名称已被其他配置占用".into());
         }
+        // Check both devices before changing either. Otherwise a foreign IFB qdisc
+        // is only discovered after the physical NIC's root has already been replaced.
+        let queues = qdiscs(network, IFB)?;
+        adoption::check_ingress_blocks(&queues)?;
+        if !queues.iter().any(owned_root) {
+            let root = queues
+                .iter()
+                .find(|q| q["root"] == true)
+                .ok_or("无法识别限速 IFB 根队列")?;
+            adoption::check(&queues, root)?;
+        }
+        adoption::check_filters(network, IFB, &queues)?;
     }
     let filters = if existing
         .iter()
@@ -633,18 +757,27 @@ fn reconcile_network(
 fn exclusive_ingress(filters: &[Value]) -> bool {
     filters.is_empty()
         || (filters.iter().any(owned_filter)
-            && filters.iter().all(|f| {
-                f["pref"].as_u64() == Some(PREF)
-                    && f["kind"] == "matchall"
-                    && (f["options"].is_null() || owned_filter(f))
-            }))
+            && filters
+                .iter()
+                .all(|f| owned_filter_header(f) && (f["options"].is_null() || owned_filter(f))))
+}
+
+fn owned_filter_header(filter: &Value) -> bool {
+    filter["pref"].as_u64() == Some(PREF)
+        && filter["kind"] == "matchall"
+        && filter["protocol"] == "all"
+        && filter.get("block").is_none()
+        && filter
+            .get("chain")
+            .is_none_or(|chain| chain.as_u64() == Some(0))
 }
 
 fn owned_filter(filter: &Value) -> bool {
-    filter["pref"].as_u64() == Some(PREF)
-        && filter["kind"] == "matchall"
-        && filter["chain"].as_u64().unwrap_or(0) == 0
+    owned_filter_header(filter)
         && filter["options"]["handle"].as_u64() == Some(0xbcd0)
+        && filter["options"]
+            .get("skip_sw")
+            .is_none_or(|skip| skip == false)
         && filter["options"]["actions"]
             .as_array()
             .is_some_and(|actions| {
@@ -653,6 +786,7 @@ fn owned_filter(filter: &Value) -> bool {
                     && actions[0]["to_dev"] == IFB
                     && actions[0]["mirred_action"] == "redirect"
                     && actions[0]["direction"] == "egress"
+                    && actions[0]["control_action"]["type"] == "stolen"
             })
 }
 
@@ -665,16 +799,13 @@ fn ensure_shaper(network: &mut impl Network, interface: &str, rate: u64) -> Resu
         queues = qdiscs(network, interface)?;
     }
     if !queues.iter().any(owned_root) {
-        if interface == IFB
-            && queues.iter().any(|q| {
-                q["root"] == true
-                    && !(matches!(
-                        q["kind"].as_str(),
-                        Some("noqueue" | "fq" | "fq_codel" | "pfifo_fast")
-                    ) && q["handle"] == "0:")
-            })
-        {
-            return Err("限速 IFB 存在非受管根队列".into());
+        if interface == IFB {
+            let root = queues
+                .iter()
+                .find(|q| q["root"] == true)
+                .ok_or("无法识别限速 IFB 根队列")?;
+            adoption::check(&queues, root)?;
+            adoption::check_filters(network, interface, &queues)?;
         }
         network.run(
             "tc",
@@ -740,25 +871,42 @@ fn verify_shaper(network: &mut impl Network, interface: &str, rate: u64) -> Resu
     {
         return Err(format!("{interface} 限速上限回读不一致"));
     }
+    // HTB filters can select the unshaped direct path even when class rates match.
+    adoption::check_filters(network, interface, &queues)?;
     Ok(())
 }
 
 fn cleanup(saved: &AppliedNetwork, network: &mut impl Network) -> Result<(), String> {
-    if !valid_interface(&saved.interface)
-        || !matches!(
-            saved.previous_root.as_str(),
-            "fq" | "fq_codel" | "pfifo_fast" | "mq" | "noqueue"
-        )
-    {
-        return Err("无效限速所有权检查点".into());
-    }
+    validate_saved_network(saved)?;
     let links = json(network, "ip", &["-j", "-d", "link", "show"])?;
+    let ifb = links.iter().find(|link| link["ifname"] == IFB);
+    if let Some(ifb) = ifb {
+        if ifb["linkinfo"]["info_kind"] != "ifb"
+            || (ifb["ifalias"] != OWNER && !ifb["ifalias"].as_str().unwrap_or("").is_empty())
+        {
+            return Err("拒绝删除其他配置占用的 IFB".into());
+        }
+    }
     if links.iter().any(|l| l["ifname"] == saved.interface) {
+        let existing = qdiscs(network, &saved.interface)?;
+        adoption::check_ingress_blocks(&existing)?;
         let filters = json(
             network,
             "tc",
             &["-j", "filter", "show", "dev", &saved.interface, "ingress"],
         )?;
+        if filters.iter().any(|filter| {
+            !owned_filter(filter)
+                && filter["options"]["actions"]
+                    .as_array()
+                    .is_some_and(|actions| {
+                        actions
+                            .iter()
+                            .any(|action| action["kind"] == "mirred" && action["to_dev"] == IFB)
+                    })
+        }) {
+            return Err("入站存在指向限速 IFB 的非自有过滤器，拒绝删除依赖资源".into());
+        }
         if filters.iter().any(owned_filter) {
             network.run(
                 "tc",
@@ -778,7 +926,7 @@ fn cleanup(saved: &AppliedNetwork, network: &mut impl Network) -> Result<(), Str
                 ],
             )?;
         }
-        if qdiscs(network, &saved.interface)?.iter().any(owned_root) {
+        if existing.iter().any(owned_root) {
             if matches!(saved.previous_root.as_str(), "mq" | "noqueue") {
                 network.run("tc", &["qdisc", "del", "dev", &saved.interface, "root"])?;
             } else {
@@ -796,13 +944,20 @@ fn cleanup(saved: &AppliedNetwork, network: &mut impl Network) -> Result<(), Str
             }
         }
     }
-    if let Some(ifb) = links.iter().find(|l| l["ifname"] == IFB) {
-        if ifb["linkinfo"]["info_kind"] != "ifb"
-            || (ifb["ifalias"] != OWNER && !ifb["ifalias"].as_str().unwrap_or("").is_empty())
-        {
-            return Err("拒绝删除其他配置占用的 IFB".into());
-        }
+    if ifb.is_some() {
         network.run("ip", &["link", "del", "dev", IFB])?;
+    }
+    Ok(())
+}
+
+fn validate_saved_network(saved: &AppliedNetwork) -> Result<(), String> {
+    if !valid_interface(&saved.interface)
+        || saved.interface == IFB
+        || !(adoption::scheduler_kind(&saved.previous_root) || saved.previous_root == "mq")
+        || !(1_000..=brocade_deployment::traffic_limit::MAX_TRAFFIC_RATE_BPS)
+            .contains(&saved.rate_bps)
+    {
+        return Err("无效限速所有权检查点".into());
     }
     Ok(())
 }
@@ -823,6 +978,68 @@ pub(crate) fn restore_saved_network(dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn traffic_limit_confirmation_waits_quickly_then_returns_to_heartbeat() {
+        let mut status = TrafficLimitObservation {
+            revision: 7,
+            phase: TrafficLimitPhase::Limited,
+            interface: Some("eth0".into()),
+            rate_bps: Some(100_000_000),
+            used_bytes: Some("100".into()),
+            period_start_unix_secs: Some(1),
+            error: None,
+            system: None,
+            application: None,
+        };
+        assert_eq!(synchronization_interval(7, None), Duration::from_secs(3));
+        assert_eq!(
+            synchronization_interval(8, Some(&status)),
+            Duration::from_secs(3)
+        );
+        for phase in [TrafficLimitPhase::Waiting, TrafficLimitPhase::Error] {
+            status.phase = phase;
+            assert_eq!(
+                synchronization_interval(7, Some(&status)),
+                Duration::from_secs(3)
+            );
+        }
+        for phase in [
+            TrafficLimitPhase::Limited,
+            TrafficLimitPhase::Ready,
+            TrafficLimitPhase::Disabled,
+        ] {
+            status.phase = phase;
+            assert_eq!(
+                synchronization_interval(7, Some(&status)),
+                Duration::from_secs(60)
+            );
+        }
+    }
+
+    #[test]
+    fn traffic_limit_handoff_is_pending_and_a_real_layer_failure_takes_precedence() {
+        let applied = layer_result(Ok(()), Some(100_000_000), true);
+        let waiting = layer_result(
+            Err(LimitApplyError::Waiting("等待旧代排空".into())),
+            Some(100_000_000),
+            true,
+        );
+        assert_eq!(waiting.phase, TrafficLimitPhase::Waiting);
+        assert_eq!(waiting.rate_bps, None);
+        assert!(matches!(
+            combine_layers(&applied, &waiting),
+            Err(LimitApplyError::Waiting(_))
+        ));
+        let failed = layer_result(Err("IFB 不可用".into()), Some(100_000_000), true);
+        assert_eq!(failed.phase, TrafficLimitPhase::Error);
+        assert!(matches!(
+            combine_layers(&failed, &waiting),
+            Err(LimitApplyError::Failed(_))
+        ));
+        assert!(combine_layers(&applied, &applied).is_ok());
+    }
+
     #[test]
     fn traffic_limit_generation_metadata_fifo_is_rejected_without_blocking() {
         let dir = std::env::temp_dir().join(format!(
@@ -1052,7 +1269,7 @@ mod tests {
             assert!(!class_matches(&invalid, 100_000_000));
         }
         assert!(owned_filter(
-            &serde_json::json!({"pref":49152,"kind":"matchall","options":{"handle":48336,"actions":[{"kind":"mirred","to_dev":"bc-limit0","mirred_action":"redirect","direction":"egress"}]}})
+            &serde_json::json!({"protocol":"all","pref":49152,"kind":"matchall","options":{"handle":48336,"actions":[{"kind":"mirred","to_dev":"bc-limit0","mirred_action":"redirect","direction":"egress","control_action":{"type":"stolen"}}]}})
         ));
         for interface in ["eth0;reboot", "../eth0", "-eth0", "eth0\n"] {
             assert!(!valid_interface(interface));
@@ -1067,6 +1284,7 @@ mod tests {
                     ("tc", ["-j", "qdisc", "show", "dev", "eth0"]) => Ok(
                         r#"[{"kind":"htb","handle":"bcd0:","root":true,"options":{"default":"0x10"}},{"kind":"fq","handle":"bcd1:","parent":"bcd0:10"}]"#.into(),
                     ),
+                    ("tc", ["-j", "filter", "show", "dev", "eth0", "parent", _]) => Ok("[]".into()),
                     _ => Err(format!("unexpected network mutation: {program} {args:?}")),
                 }
             }
@@ -1096,70 +1314,20 @@ mod tests {
     #[test]
     #[ignore = "requires Docker and an image with iproute2; BROCADE_TRAFFIC_LIMIT_NET_IMAGE"]
     fn traffic_limit_system_real_kernel_reconciles_caps_and_preserves_external_qos() {
-        struct DockerNetwork(String);
-        impl Network for DockerNetwork {
-            fn run(&mut self, program: &str, args: &[&str]) -> Result<String, String> {
-                let mut command = vec!["exec", self.0.as_str(), program];
-                command.extend_from_slice(args);
-                crate::command::run_command_with_timeout(
-                    "docker",
-                    &command,
-                    Duration::from_secs(10),
-                )
-            }
-            fn classes(&mut self, interface: &str) -> Result<Vec<kernel::Class>, String> {
-                let variable = format!("BROCADE_HTB_INTERFACE={interface}");
-                let output = crate::command::run_command_with_timeout(
-                    "docker",
-                    &[
-                        "exec",
-                        "--env",
-                        &variable,
-                        &self.0,
-                        "/brocade-test",
-                        "--exact",
-                        "traffic_limit::tests::traffic_limit_netlink_guest",
-                        "--ignored",
-                        "--nocapture",
-                    ],
-                    Duration::from_secs(10),
-                )?;
-                let json = output
-                    .lines()
-                    .find_map(|line| line.strip_prefix("HTB_CLASSES="))
-                    .ok_or("missing kernel class fixture result")?;
-                serde_json::from_str(json).map_err(|error| error.to_string())
-            }
-        }
-        impl Drop for DockerNetwork {
-            fn drop(&mut self) {
-                let _ = crate::run_command("docker", &["rm", "-f", &self.0]);
-            }
-        }
-        let image =
-            std::env::var("BROCADE_TRAFFIC_LIMIT_NET_IMAGE").expect("explicit network test image");
-        let executable = std::env::current_exe().unwrap();
-        let mount = format!("{}:/brocade-test:ro", executable.display());
-        let id = crate::run_command(
-            "docker",
-            &[
-                "run",
-                "-d",
-                "--volume",
-                &mount,
-                "--network",
-                "none",
-                "--cap-add",
-                "NET_ADMIN",
-                &image,
-                "sleep",
-                "120",
-            ],
-        )
-        .unwrap();
-        let mut network = DockerNetwork(id.trim().to_owned());
+        let mut network = super::network_tests::DockerNetwork::start(false);
         network
-            .run("ip", &["link", "add", "limit-test0", "type", "dummy"])
+            .run(
+                "ip",
+                &[
+                    "link",
+                    "add",
+                    "limit-test0",
+                    "numtxqueues",
+                    "2",
+                    "type",
+                    "dummy",
+                ],
+            )
             .unwrap();
         network
             .run("ip", &["link", "set", "limit-test0", "up"])
@@ -1270,6 +1438,220 @@ mod tests {
             .unwrap()
             .iter()
             .any(|l| l["ifname"] == IFB));
+        network
+            .run("tc", &["qdisc", "del", "dev", "limit-test0", "root"])
+            .unwrap();
+        network
+            .run(
+                "tc",
+                &[
+                    "filter",
+                    "add",
+                    "dev",
+                    "limit-test0",
+                    "egress",
+                    "pref",
+                    "1",
+                    "matchall",
+                    "action",
+                    "pass",
+                ],
+            )
+            .unwrap();
+        let egress_filters = network
+            .run(
+                "tc",
+                &["-j", "filter", "show", "dev", "limit-test0", "egress"],
+            )
+            .unwrap();
+        assert!(egress_filters.contains("matchall"));
+        for kind in [
+            "fq",
+            "fq_codel",
+            "pfifo_fast",
+            "pfifo",
+            "bfifo",
+            "sfq",
+            "codel",
+            "pie",
+            "fq_pie",
+            "mq",
+        ] {
+            network
+                .run(
+                    "tc",
+                    &[
+                        "qdisc",
+                        "replace",
+                        "dev",
+                        "limit-test0",
+                        "root",
+                        "handle",
+                        "1:",
+                        kind,
+                    ],
+                )
+                .unwrap();
+            if kind == "mq" {
+                for (parent, handle) in [("1:1", "8001:"), ("1:2", "8002:")] {
+                    network
+                        .run(
+                            "tc",
+                            &[
+                                "qdisc",
+                                "replace",
+                                "dev",
+                                "limit-test0",
+                                "parent",
+                                parent,
+                                "handle",
+                                handle,
+                                "fq",
+                                "limit",
+                                "32768",
+                                "flow_limit",
+                                "32768",
+                            ],
+                        )
+                        .unwrap();
+                }
+            }
+            for _ in 0..2 {
+                reconcile_network(&dir, Some("limit-test0"), Some(30_000_000), &mut network)
+                    .unwrap_or_else(|error| panic!("{kind} adoption/retry: {error}"));
+                verify_shaper(&mut network, "limit-test0", 30_000_000).unwrap();
+                verify_shaper(&mut network, IFB, 30_000_000).unwrap();
+            }
+            reconcile_network(&dir, None, None, &mut network).unwrap();
+            assert_eq!(
+                egress_filters,
+                network
+                    .run(
+                        "tc",
+                        &["-j", "filter", "show", "dev", "limit-test0", "egress"]
+                    )
+                    .unwrap()
+            );
+            assert!(!dir.join(NETWORK).exists());
+            let queues = qdiscs(&mut network, "limit-test0").unwrap();
+            let root = queues.iter().find(|q| q["root"] == true).unwrap();
+            // Deleting our root on this dummy restores its kernel noqueue default;
+            // real multi-TX physical NICs restore their kernel mq default instead.
+            assert_eq!(root["kind"], if kind == "mq" { "noqueue" } else { kind });
+            if root["handle"] != "0:" {
+                network
+                    .run("tc", &["qdisc", "del", "dev", "limit-test0", "root"])
+                    .unwrap();
+            }
+        }
+        network
+            .run(
+                "tc",
+                &[
+                    "qdisc",
+                    "replace",
+                    "dev",
+                    "limit-test0",
+                    "root",
+                    "handle",
+                    "1:",
+                    "mq",
+                ],
+            )
+            .unwrap();
+        for (kind, options) in [
+            (
+                "tbf",
+                vec!["rate", "1mbit", "burst", "32k", "latency", "50ms"],
+            ),
+            ("fq", vec!["maxrate", "1mbit"]),
+            ("sfq", vec![]),
+        ] {
+            let mut args = vec![
+                "qdisc",
+                "replace",
+                "dev",
+                "limit-test0",
+                "parent",
+                "1:1",
+                "handle",
+                "8001:",
+                kind,
+            ];
+            args.extend(options);
+            network.run("tc", &args).unwrap();
+            if kind == "sfq" {
+                network
+                    .run(
+                        "tc",
+                        &[
+                            "filter",
+                            "add",
+                            "dev",
+                            "limit-test0",
+                            "parent",
+                            "8001:",
+                            "protocol",
+                            "all",
+                            "pref",
+                            "1",
+                            "matchall",
+                            "action",
+                            "pass",
+                        ],
+                    )
+                    .unwrap();
+            }
+            let before = qdiscs(&mut network, "limit-test0").unwrap();
+            let filters_before = network
+                .run(
+                    "tc",
+                    &[
+                        "-j",
+                        "filter",
+                        "show",
+                        "dev",
+                        "limit-test0",
+                        "parent",
+                        "8001:",
+                    ],
+                )
+                .unwrap();
+            assert!(
+                reconcile_network(&dir, Some("limit-test0"), Some(30_000_000), &mut network)
+                    .is_err(),
+                "custom {kind} must be preserved"
+            );
+            assert_eq!(before, qdiscs(&mut network, "limit-test0").unwrap());
+            assert_eq!(
+                filters_before,
+                network
+                    .run(
+                        "tc",
+                        &[
+                            "-j",
+                            "filter",
+                            "show",
+                            "dev",
+                            "limit-test0",
+                            "parent",
+                            "8001:"
+                        ]
+                    )
+                    .unwrap()
+            );
+            assert!(!dir.join(NETWORK).exists());
+            assert!(!json(&mut network, "ip", &["-j", "-d", "link", "show"])
+                .unwrap()
+                .iter()
+                .any(|l| l["ifname"] == IFB));
+            network
+                .run(
+                    "tc",
+                    &["qdisc", "del", "dev", "limit-test0", "parent", "1:1"],
+                )
+                .unwrap();
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 }

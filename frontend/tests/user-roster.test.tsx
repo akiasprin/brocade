@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   AdminRole,
   ConsoleSnapshot,
+  OnlineSourceProtocol,
   SnapshotIngress,
   SourceAccessView,
   UserListItem,
@@ -11,7 +12,7 @@ import type {
 } from '../src/api';
 import { draft } from '../src/draft';
 import * as route from '../src/forge/route';
-import { quotaStage, sessionDurationText, UsersPane } from '../src/panes/users';
+import { mergePresenceHistory, quotaStage, sessionDurationText, UsersPane } from '../src/panes/users';
 import { userTrafficPolicyKey } from '../src/panes/user-traffic-policy';
 import { SessionProvider } from '../src/session';
 import { Icon } from '../src/ui/icons';
@@ -210,7 +211,7 @@ const seedUsers = async (client: QueryClient, list: UserListItem[]) => {
 const readingOf = (card: HTMLElement) => card.querySelector('header .rt')?.textContent;
 const two = (value: number) => String(value).padStart(2, '0');
 const HOUR = 3_600_000;
-const offlineSource = (ip: string, lastSeen: number, protocols: string[]) => ({
+const offlineSource = (ip: string, lastSeen: number, protocols: OnlineSourceProtocol[]) => ({
   ip,
   first_observed_at: new Date(lastSeen - HOUR).toISOString(),
   last_observed_at: new Date(lastSeen).toISOString(),
@@ -240,6 +241,39 @@ afterEach(() => {
   draft.clear();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+describe('presence history merging', () => {
+  it('limits the entire group to strictly less than an hour, regardless of input order or intervening IPs', () => {
+    const at = Date.parse('2026-10-28T00:15:00Z');
+    const source = (minutes: number, ip = '198.51.100.7') => offlineSource(ip, at - minutes * 60_000, ['vless']);
+    const sources = [source(90), source(30), source(0), source(10, '203.0.113.8'), source(60), source(59)];
+    const original = structuredClone(sources);
+    const rows = mergePresenceHistory(sources, false);
+    expect(rows.map(row => [row.ip, row.history?.length ?? 1])).toEqual([
+      ['198.51.100.7', 3],
+      ['203.0.113.8', 1],
+      ['198.51.100.7', 2],
+    ]);
+    expect(rows[0].history?.map(item => item.last_observed_at)).toEqual(
+      [source(0), source(30), source(59)].map(item => item.last_observed_at),
+    );
+    expect(rows[0].session_downlink_bytes).toBe(6_144);
+    expect(sources).toEqual(original);
+  });
+
+  it('keeps unknown metrics unknown and does not merge unparseable timestamps or masked addresses', () => {
+    const at = Date.parse('2026-10-28T00:15:00Z');
+    const newest = offlineSource('198.51.100.7', at, ['vless']);
+    const missing = { ...offlineSource(newest.ip, at - 60_000, ['anytls']), session_downlink_bytes: null };
+    const invalid = { ...newest, last_observed_at: 'unknown' };
+    const merged = mergePresenceHistory([missing, newest, invalid], false);
+    expect(merged).toHaveLength(2);
+    expect(merged[0].session_downlink_bytes).toBeNull();
+    expect(merged[0].session_uplink_bytes).toBe(2_048);
+    expect(merged[1].last_observed_at).toBe('unknown');
+    expect(mergePresenceHistory([newest, missing], true)).toEqual([newest, missing]);
+  });
 });
 
 function mount(
@@ -1105,7 +1139,7 @@ describe('user roster rows', () => {
     expect(within(card).queryByText('4.4.4.4')).toBeNull();
     expect(within(card).queryByText('5.5.5.5')).toBeNull();
 
-    const older = within(card).getByRole('button', { name: '显示其余 2 个历史来源' });
+    const older = within(card).getByRole('button', { name: '显示其余 2 条历史记录' });
     expect(older.getAttribute('aria-expanded')).toBe('false');
     fireEvent.click(older);
     expect([...card.querySelectorAll('.user-presence-day')].map(day => day.textContent)).toEqual([
@@ -1121,12 +1155,149 @@ describe('user roster rows', () => {
     expect(oldest.querySelector('.user-presence-time')?.textContent).toBe(
       `${two(oldestDay.getMonth() + 1)}-${two(oldestDay.getDate())}`,
     );
-    fireEvent.click(within(card).getByRole('button', { name: '收起历史来源' }));
+    fireEvent.click(within(card).getByRole('button', { name: '收起历史记录' }));
     expect(within(card).queryByText('4.4.4.4')).toBeNull();
     expect(fetchMock.mock.calls.filter(([input]) => String(input) === historyPath)).toHaveLength(1);
   });
 
-  it('lists a returning address only once and summarizes an offline user by the last appearance', async () => {
+  it('lists completed epochs as ordinary timeline rows even when the IP is online again', async () => {
+    const fallback = fetch;
+    const path = `/users/${tenant}/alice/presence-history`;
+    const now = Date.now();
+    const sources = [
+      { ...offlineSource('1.1.1.1', now - HOUR, ['vless']), session_id: '22' },
+      { ...offlineSource('1.1.1.1', now - 2 * HOUR, ['anytls']), session_id: '21', session_downlink_bytes: 4_096 },
+      { ...offlineSource('8.8.8.8', now - 3 * HOUR, ['vless']), session_id: '20' },
+      { ...offlineSource('8.8.8.8', now - 4 * HOUR, ['hysteria2']), session_id: '19' },
+    ];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+      String(input) === path
+        ? Response.json({ tenant_id: tenant, user_id: 'alice', retention_days: 30, truncated: false, sources })
+        : fallback(input, init),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const { view, client } = mount();
+    const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
+    await vi.waitFor(() => expect(within(card).getAllByText('1.1.1.1')).toHaveLength(3));
+    expect(readingOf(card)).toBe('在线 1 · 30 天 2 个地址');
+    const rows = [...card.querySelectorAll<HTMLElement>('.user-presence-row.off')];
+    expect(rows).toHaveLength(4);
+    expect(rows.map(row => row.querySelector('code')?.textContent)).toEqual([
+      '1.1.1.1',
+      '1.1.1.1',
+      '8.8.8.8',
+      '8.8.8.8',
+    ]);
+    expect(rows[0].querySelector<HTMLElement>('.user-presence-time')?.title).toContain(
+      new Date(now - HOUR).toLocaleString(),
+    );
+    expect(within(rows[1]).getByText('5 KiB')).toBeTruthy();
+    expect(within(rows[1]).getByRole('button', { name: '展开 1 条接入链详情' }).textContent).toContain('AnyTLS');
+    fireEvent.click(within(rows[1]).getByRole('button', { name: '展开 1 条接入链详情' }));
+    expect(rows[1].querySelector('.user-presence-access')).toBeTruthy();
+    expect(rows[0].querySelector('.user-presence-access')).toBeNull();
+    expect(card.querySelector('details')).toBeNull();
+    expect(within(card).queryByText(/更早.*段会话/)).toBeNull();
+    // The same IP set with a new Xray epoch still refreshes history.
+    const key = ['user-presence', 'system-admin'];
+    const data = client.getQueryData<UserPresenceList>(key)!;
+    const source = data.users[0].sources[0];
+    act(() =>
+      client.setQueryData(key, {
+        ...data,
+        users: [
+          {
+            ...data.users[0],
+            sources: [
+              {
+                ...source,
+                accesses: source.accesses?.map(access => ({ ...access, online_since_at: new Date(now).toISOString() })),
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    await vi.waitFor(() => expect(fetchMock.mock.calls.filter(([input]) => String(input) === path)).toHaveLength(2));
+  });
+
+  it('merges nearby history across chains while retaining each epoch and counting preview rows after merging', async () => {
+    const fallback = fetch;
+    const path = `/users/${tenant}/alice/presence-history`;
+    const now = Date.now();
+    const recent = { ...offlineSource('1.1.1.1', now - HOUR, ['vless']), session_id: 'new' };
+    const olderSource = offlineSource('1.1.1.1', now - HOUR - 59 * 60_000, ['anytls']);
+    const older = {
+      ...olderSource,
+      session_id: 'old',
+      node_ids: ['n2'],
+      ingress_ids: ['mfm-cmi'],
+      accesses: [{ ...olderSource.accesses[0], node_id: 'n2', ingress_id: 'mfm-cmi' }],
+    };
+    const sources = [
+      older,
+      recent,
+      ...Array.from({ length: 5 }, (_, index) => ({
+        ...offlineSource('8.8.8.8', now - (index + 3) * HOUR, ['vless']),
+        session_id: `other-${index}`,
+      })),
+    ];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+        String(input) === path
+          ? Response.json({ tenant_id: tenant, user_id: 'alice', retention_days: 30, truncated: false, sources })
+          : fallback(input, init),
+      ),
+    );
+    const { view } = mount();
+    const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
+    const summary = await within(card).findByRole('button', { name: '展开 2 条接入链详情' });
+    const merged = summary.closest<HTMLElement>('.user-presence-row')!;
+    expect(summary.textContent).toContain('VLESS / AnyTLS · 2 段记录');
+    expect(within(merged).getByLabelText('合计流量 6 KiB')).toBeTruthy();
+    expect(within(card).getAllByText('1.1.1.1')).toHaveLength(2); // Current online row stays separate.
+    expect(card.querySelectorAll('.user-presence-row.off')).toHaveLength(5);
+    expect(readingOf(card)).toBe('在线 1 · 30 天 2 个地址');
+    fireEvent.click(summary);
+    const details = merged.querySelector<HTMLElement>('.user-presence-access')!;
+    expect(within(details).getByRole('button', { name: '东京 IIJ' })).toBeTruthy();
+    expect(within(details).getByRole('button', { name: '澳门 CMI' })).toBeTruthy();
+    expect(details.querySelectorAll('time')).toHaveLength(2);
+    expect(within(details).getAllByLabelText('本次会话流量 3 KiB')).toHaveLength(2);
+    fireEvent.click(within(card).getByRole('button', { name: '显示其余 1 条历史记录' }));
+    expect(card.querySelectorAll('.user-presence-row.off')).toHaveLength(6);
+  });
+
+  it('keeps masked epochs separate when their address prefixes look identical', async () => {
+    const fallback = fetch;
+    const path = `/users/${tenant}/alice/presence-history`;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+        String(input) === path
+          ? Response.json({
+              tenant_id: tenant,
+              user_id: 'alice',
+              retention_days: 30,
+              truncated: true,
+              sources: [
+                { ...offlineSource('1.1.1.1', Date.now() - HOUR, ['vless']), session_id: '1' },
+                { ...offlineSource('1.1.1.1', Date.now() - HOUR - 60_000, ['anytls']), session_id: '2' },
+              ],
+            })
+          : fallback(input, init),
+      ),
+    );
+    const { view } = mount('readonly', 'operator', true);
+    const card = view.container.querySelector<HTMLElement>('.user-presence-card')!;
+    expect(await within(card).findByText('记录较多，仅显示最近 256 段已结束会话。')).toBeTruthy();
+    expect(within(card).getAllByText('1.1.1.1')).toHaveLength(3);
+    expect(card.querySelectorAll('details')).toHaveLength(0);
+    expect(readingOf(card)).toBe('在线 1');
+  });
+
+  it('supports legacy address snapshots and summarizes an offline user by the last appearance', async () => {
     const historyPath = `/users/${tenant}/alice/presence-history`;
     const today = new Date().setHours(0, 0, 0, 0);
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -2015,6 +2186,22 @@ describe('source bans in 在线设备', () => {
     expect(await within(group).findByRole('button', { name: '已生效' })).toBeTruthy();
     expect(within(group).queryByText(/仍在线/)).toBeNull();
     expect(within(group).getByText('东京 IIJ · 协议未知')).toBeTruthy();
+  });
+
+  it('keeps banned IP epochs on the timeline and uses the latest epoch in the ban list', async () => {
+    const now = Date.now();
+    const recent = { ...offlineSource('9.9.9.9', now - HOUR, ['anytls']), session_id: '22' };
+    const earlier = { ...offlineSource('9.9.9.9', now - 2 * HOUR, ['vless']), session_id: '21' };
+    stubBans({ revision: 2, ips: ['9.9.9.9'], nodes: applied }, [earlier, recent]);
+    const { view } = mount();
+    const card = presenceCard(view);
+    const group = await within(card).findByRole('list', { name: '已封禁的来源' });
+    expect(await within(group).findByText('东京 IIJ · AnyTLS')).toBeTruthy();
+    const timeline = within(card).getByRole('list', { name: '在线与最近 30 天的来源' });
+    expect(within(timeline).getAllByText('9.9.9.9')).toHaveLength(2);
+    expect(within(timeline).queryByRole('button', { name: '封禁 9.9.9.9' })).toBeNull();
+    expect(within(group).getAllByRole('button', { name: '解除封禁 9.9.9.9' })).toHaveLength(1);
+    expect(card.querySelector('details')).toBeNull();
   });
 
   it('lists bans with their own region, says when an address has not appeared and unbans in place', async () => {

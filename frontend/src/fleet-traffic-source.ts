@@ -27,7 +27,8 @@ export interface FleetTrafficNode {
 export interface FleetTrafficSnapshot {
   policy: { enabled: boolean };
   nodes: FleetTrafficNode[];
-  expected: FleetTrafficExpectedNode[];
+  /** SSE snapshots omit grants; absence is unknown until an HTTP snapshot supplies them. */
+  expected?: FleetTrafficExpectedNode[];
 }
 
 interface FleetTrafficState {
@@ -65,21 +66,26 @@ export function useFleetTrafficSource(enabled = true) {
     let pollTimer: ReturnType<typeof setTimeout> | undefined;
     let pollAbort: AbortController | undefined;
     let polling = false;
+    let fetching = false;
+    let entitlementsKnown = false;
+    let snapshotFailures = 0;
 
-    const acceptSnapshot = (
-      next: Omit<FleetTrafficSnapshot, 'expected'> & { expected?: FleetTrafficExpectedNode[] },
-    ) => {
+    const acceptSnapshot = (next: FleetTrafficSnapshot) => {
       if (stopped || !Array.isArray(next.nodes)) return;
       update(previous => ({
         policy: next.policy,
         nodes: mergeNodes(previous?.nodes ?? [], next.nodes),
-        expected: Array.isArray(next.expected) ? next.expected : (previous?.expected ?? []),
+        expected: Array.isArray(next.expected) ? next.expected : previous?.expected,
       }));
     };
 
     const fetchSnapshot = async () => {
+      if (stopped || fetching) return;
+      if (pollTimer) clearTimeout(pollTimer);
+      fetching = true;
       const abort = new AbortController();
       pollAbort = abort;
+      const timeout = setTimeout(() => abort.abort(), 15_000);
       try {
         const response = await fetch('/realtime/fleet-traffic/snapshot', {
           credentials: 'include',
@@ -87,22 +93,33 @@ export function useFleetTrafficSource(enabled = true) {
           signal: abort.signal,
         });
         if (!response.ok) throw new Error(`fleet traffic snapshot returned ${response.status}`);
-        acceptSnapshot((await response.json()) as FleetTrafficSnapshot);
+        const next = (await response.json()) as FleetTrafficSnapshot;
+        if (!Array.isArray(next.nodes) || !Array.isArray(next.expected)) {
+          throw new Error('fleet traffic snapshot omitted nodes or authorization');
+        }
+        acceptSnapshot(next);
+        entitlementsKnown = true;
+        snapshotFailures = 0;
       } catch {
-        if (!stopped) setState(previous => ({ ...previous, failed: true }));
+        if (!stopped) {
+          snapshotFailures += 1;
+          setState(previous => ({ ...previous, failed: true }));
+        }
+      } finally {
+        clearTimeout(timeout);
+        fetching = false;
+        if (!stopped && (polling || !entitlementsKnown)) {
+          const delay = polling ? 2_000 : Math.min(2_000 * 2 ** Math.min(snapshotFailures - 1, 4), 30_000);
+          pollTimer = setTimeout(() => void fetchSnapshot(), delay);
+        }
       }
-    };
-
-    const poll = async () => {
-      await fetchSnapshot();
-      if (!stopped) pollTimer = setTimeout(() => void poll(), 2_000);
     };
 
     const startPolling = () => {
       if (polling || stopped) return;
       polling = true;
       source?.close();
-      void poll();
+      void fetchSnapshot();
     };
 
     const open = () => {
@@ -182,8 +199,8 @@ export function useFleetTrafficSource(enabled = true) {
       };
     };
 
-    // The SSE snapshot intentionally carries no authorization matrix. Fetch it once, then let the
-    // stream own the one-second readings; an SSE-less proxy continues through bounded polling.
+    // SSE carries no authorization matrix. Retry its HTTP snapshot until grants are known, then
+    // let the stream own the readings; an SSE-less proxy continues through bounded polling.
     void fetchSnapshot();
     open();
     return () => {
@@ -197,6 +214,7 @@ export function useFleetTrafficSource(enabled = true) {
   const facts = JSON.stringify([
     state.failed,
     state.payload?.policy.enabled,
+    state.payload?.expected !== undefined,
     state.payload?.nodes.map(node => [
       node.node_id,
       node.connected,

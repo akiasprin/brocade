@@ -9,6 +9,7 @@ import type {
   TrafficLimitPhase,
   TrafficLimitRule,
 } from '../../src/api';
+import { TRAFFIC_LIMIT_RECEIPT_FRESH_SECS } from '../../src/panes/nodes-traffic-limit';
 
 export const DAY = 86_400;
 const KiB = 1024;
@@ -251,7 +252,7 @@ export const nextStep = (steps: Step[]) => steps.find(step => step.effective && 
 export type Tone = 'gold' | 'err' | 'mute';
 const PHASE: Record<TrafficLimitPhase, string> = {
   disabled: '未启用',
-  waiting: '等待计量基线',
+  waiting: '等待应用确认',
   ready: '未达到阈值',
   limited: '已限速',
   error: '应用失败',
@@ -292,7 +293,11 @@ export function statusOf(limit: NodeTrafficLimitView | undefined, now: number): 
     };
   const { policy, observation } = limit;
   const reportedAgo = limit.reported_at_unix_secs === null ? null : now - limit.reported_at_unix_secs;
-  const confirmed = !!observation && observation.revision === limit.revision && reportedAgo !== null && reportedAgo < 90;
+  const confirmed =
+    !!observation &&
+    observation.revision === limit.revision &&
+    reportedAgo !== null &&
+    reportedAgo < TRAFFIC_LIMIT_RECEIPT_FRESH_SECS;
   const layers: LayerState[] = [];
   if (observation)
     for (const layer of ['system', 'application'] as const) {
@@ -307,7 +312,12 @@ export function statusOf(limit: NodeTrafficLimitView | undefined, now: number): 
         error: result.error,
       });
     }
-  const base = { confirmed, layers, reportedAgo, rate: confirmed ? (observation?.rate_bps ?? null) : null };
+  const base = {
+    confirmed,
+    layers,
+    reportedAgo,
+    rate: confirmed && observation?.phase === 'limited' ? (observation.rate_bps ?? null) : null,
+  };
   if (!limit.supported && policy.enabled)
     return { ...base, text: 'Agent 待升级', tone: 'mute', chip: { text: 'Agent 待升级', tone: 'mute' } };
   if (!confirmed) {
@@ -330,7 +340,7 @@ export function statusOf(limit: NodeTrafficLimitView | undefined, now: number): 
     case 'error':
       return { ...base, text: '应用失败', tone: 'err', chip: { text: '限速应用失败', tone: 'err' } };
     case 'waiting':
-      return { ...base, text: '等待计量基线', tone: 'mute', chip: { text: '限速等待基线', tone: 'mute' } };
+      return { ...base, text: '等待应用确认', tone: 'mute', chip: { text: '限速待确认', tone: 'mute' } };
     default:
       return { ...base, text: PHASE[observation!.phase], tone: null, chip: null };
   }
@@ -546,6 +556,36 @@ export const SCENES = {
     rx: 702 * GiB,
     tx: 516 * GiB,
     limit: { enabled: true, rules: TWO_STEPS, observed: { phase: 'waiting', application: ['waiting', null] } },
+  }),
+  handoff: build({
+    label: '等待旧代确认',
+    note: '网卡已经执行，Xray 正常交接中，尚未确认整机上限。',
+    quotaTiB: 2,
+    rx: 1200 * GiB,
+    tx: 600 * GiB,
+    limit: {
+      enabled: true,
+      layer: 'both',
+      rules: TWO_STEPS,
+      observed: {
+        phase: 'waiting',
+        rate: 100 * Mbps,
+        system: ['limited', 100 * Mbps],
+        application: ['waiting', null, '等待旧代排空后再确认应用层上限'],
+      },
+    },
+  }),
+  heartbeat: build({
+    label: '确认有效期内',
+    note: '上次上报已过四分钟，当前修订的确认仍在 300 秒有效期内。',
+    quotaTiB: 2,
+    rx: 1200 * GiB,
+    tx: 600 * GiB,
+    limit: {
+      enabled: true,
+      rules: TWO_STEPS,
+      observed: { phase: 'limited', rate: 100 * Mbps, application: ['limited', 100 * Mbps], ago: 240 },
+    },
   }),
   upgrade: build({
     label: 'Agent 待升级',

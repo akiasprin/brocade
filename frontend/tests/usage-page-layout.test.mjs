@@ -272,9 +272,9 @@ test('realtime readings update without replaying the content entrance', async t 
   const page = await usagePage(t, 1280, { reducedMotion: 'no-preference', run: 1 });
   await page.waitForFunction(() => window.usageEntrances.includes('realtime'));
   const surface = await page.locator('.flt-panel').elementHandle();
-  const before = await page.locator('.flt-ledger .user-usage-hero-value').textContent();
+  const before = await page.locator('.flt-ledger .usage-hero-value').textContent();
   await page.waitForFunction(
-    previous => document.querySelector('.flt-ledger .user-usage-hero-value')?.textContent !== previous,
+    previous => document.querySelector('.flt-ledger .usage-hero-value')?.textContent !== previous,
     before,
   );
   assert.equal(await surface.evaluate(element => element === document.querySelector('.flt-panel')), true);

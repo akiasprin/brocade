@@ -7,7 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-axum = { version = "0.8.9", features = ["ws"] }
+axum = "0.8.9"
+yawc = { version = "=0.5.0", default-features = false, features = ["axum"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 async-stream = "0.3"
 brocade-deployment = { path = "../brocade-deployment" }
 brocade-probe = { path = "../brocade-probe" }
@@ -21,6 +23,8 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
 tower-http = { version = "0.6", features = ["fs"] }
+tower = { version = "0.5.3", features = ["util"] }
+sqlx = { package = "brocade-sqlx", path = "../brocade-sqlx" }
 # ── 证书签发 ─────────────────────────────────────────────────────────────────────
 # 控制面第一次需要主动往外发请求（ACME 和 DNS 提供商），所以第一次有 HTTP 客户端。
 # 不像 agent 那样手写：agent 手写是因为它是要塞进另一个二进制的静态 musl 产物，体积

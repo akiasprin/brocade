@@ -20,6 +20,7 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 const MB = 1_000_000 / 8;
@@ -115,7 +116,242 @@ function mount(allowMachineDetails = true) {
 const readingOf = (ledger: HTMLElement, label: string) =>
   within(ledger).getByText(label, { selector: 'dt' }).parentElement?.querySelector('dd')?.textContent;
 
+function streamSnapshots() {
+  const listeners = new Map<string, (event: MessageEvent) => void>();
+  vi.stubGlobal(
+    'EventSource',
+    class {
+      addEventListener(type: string, listener: (event: MessageEvent) => void) {
+        listeners.set(type, listener);
+      }
+      close() {}
+    },
+  );
+  return async (payload: FleetTrafficSnapshot) => {
+    const listener = listeners.get('snapshot');
+    expect(listener).toBeDefined();
+    await act(async () => listener!(new MessageEvent('snapshot', { data: JSON.stringify(payload) })));
+  };
+}
+
 describe('fleet realtime traffic panel', () => {
+  it.each([false, true])(
+    'draws the actual matrix before authorization and updates its cells in place (traffic=%s)',
+    async withTraffic => {
+      let finish!: () => void;
+      const until = new Promise<void>(resolve => {
+        finish = resolve;
+      });
+      const payload = snapshot();
+      if (!withTraffic) payload.nodes[0].samples[0].sample.user_traffic!.users = [];
+      serve(payload, { path: '/realtime/fleet-traffic/snapshot', until });
+      const emit = streamSnapshots();
+      const view = mount();
+      const { expected: _expected, ...stream } = payload;
+      await emit(stream);
+
+      const ledger = await view.findByLabelText('机队当前速率');
+      expect(ledger.querySelector('.rut-hero-sub')?.textContent).toBe(`${withTraffic ? 1 : 0} 位活跃 · — 位已授权`);
+      const board = view.getByLabelText('用户与机器的当前速率');
+      expect(board.getAttribute('aria-busy')).toBe('true');
+      const table = view.getByRole('table');
+      const bob = table.querySelector('tr[data-user="platform/bob"]')!;
+      const bobJapan = bob.querySelector('td[data-node="jp"]')!;
+      const bobTaiwan = bob.querySelector('td[data-node="tw"]')!;
+      expect(bob.querySelectorAll('.flt-cell.pending')).toHaveLength(3);
+      expect(bob.querySelector('.flt-sum')?.textContent).toBe('—');
+      expect(view.container.querySelector('.loading-skeleton')).toBeNull();
+      expect(view.queryByText('用户授权信息尚未取得')).toBeNull();
+      expect(view.queryByText('尚无用户授权到这些机器')).toBeNull();
+      if (withTraffic) {
+        expect(ledger.querySelector('.usage-hero-value')?.textContent).toBe('25.0 Mbit/s');
+        const alice = table.querySelector('tr[data-user="platform/alice"]')!;
+        expect(alice.querySelector('td[data-node="hk"] .flt-cell')?.classList.contains('pending')).toBe(false);
+        expect(alice.querySelector('td[data-node="jp"] .flt-cell')?.classList.contains('pending')).toBe(true);
+      }
+
+      await act(async () => finish());
+      await waitFor(() => expect(ledger.querySelector('.rut-hero-sub')?.textContent).toContain('2 位已授权'));
+      expect(view.getByLabelText('机队当前速率')).toBe(ledger);
+      expect(view.getByRole('table')).toBe(table);
+      expect(table.querySelector('tr[data-user="platform/bob"] td[data-node="jp"]')).toBe(bobJapan);
+      expect(table.querySelector('tr[data-user="platform/bob"] td[data-node="tw"]')).toBe(bobTaiwan);
+      expect(board.hasAttribute('aria-busy')).toBe(false);
+      expect(table.querySelectorAll('.flt-cell.pending')).toHaveLength(0);
+      expect(bobJapan.querySelector('.flt-cell')?.classList.contains('idle')).toBe(true);
+      expect(bobTaiwan.querySelector('.flt-cell')?.classList.contains('na')).toBe(true);
+
+      await emit(stream);
+      expect(ledger.querySelector('.rut-hero-sub')?.textContent).toContain('2 位已授权');
+    },
+  );
+
+  it.each(['unavailable', 'missing-grants'])(
+    'retries authorization while SSE is available after a snapshot is %s',
+    async failure => {
+      vi.useFakeTimers();
+      const payload = snapshot();
+      payload.nodes[0].samples[0].sample.user_traffic!.users = [];
+      serve(payload);
+      const fetchData = vi.mocked(fetch).getMockImplementation()!;
+      let snapshotReads = 0;
+      vi.mocked(fetch).mockImplementation((input, init) => {
+        if (String(input) === '/realtime/fleet-traffic/snapshot' && ++snapshotReads === 1) {
+          const { expected: _expected, ...stream } = payload;
+          return Promise.resolve(
+            failure === 'unavailable' ? Response.json({}, { status: 503 }) : Response.json(stream),
+          );
+        }
+        return fetchData(input, init);
+      });
+      const emit = streamSnapshots();
+      const view = mount();
+      const { expected: _expected, ...stream } = payload;
+      await emit(stream);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(view.getByLabelText('用户与机器的当前速率').getAttribute('aria-busy')).toBe('true');
+      expect(view.getByRole('table').querySelectorAll('.flt-cell.pending')).toHaveLength(6);
+      expect(view.queryByText('尚无用户授权到这些机器')).toBeNull();
+      expect(view.queryByText('用户授权信息尚未取得')).toBeNull();
+      expect(snapshotReads).toBe(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_999);
+      });
+      expect(snapshotReads).toBe(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(snapshotReads).toBe(2);
+      expect(view.getByLabelText('用户与机器的当前速率').hasAttribute('aria-busy')).toBe(false);
+      expect(view.getByRole('table')).toBeTruthy();
+      expect(view.getByLabelText('机队当前速率').querySelector('.rut-hero-sub')?.textContent).toContain('2 位已授权');
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(snapshotReads).toBe(2);
+    },
+  );
+
+  it('times out a stalled authorization request and retries without overlapping requests', async () => {
+    vi.useFakeTimers();
+    const payload = snapshot();
+    serve(payload);
+    const fetchData = vi.mocked(fetch).getMockImplementation()!;
+    let snapshotReads = 0;
+    let aborted = false;
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      if (String(input) === '/realtime/fleet-traffic/snapshot' && ++snapshotReads === 1) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            aborted = true;
+            reject(new DOMException('Aborted', 'AbortError'));
+          });
+        });
+      }
+      return fetchData(input, init);
+    });
+    const emit = streamSnapshots();
+    const view = mount();
+    const { expected: _expected, ...stream } = payload;
+    await emit(stream);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(14_999);
+    });
+    expect(aborted).toBe(false);
+    expect(snapshotReads).toBe(1);
+    expect(view.getByLabelText('用户与机器的当前速率').getAttribute('aria-busy')).toBe('true');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(aborted).toBe(true);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(snapshotReads).toBe(2);
+    expect(view.getByLabelText('用户与机器的当前速率').hasAttribute('aria-busy')).toBe(false);
+    expect(view.getByRole('table')).toBeTruthy();
+  });
+
+  it('backs off authorization retries and cancels them when leaving the panel', async () => {
+    vi.useFakeTimers();
+    const payload = snapshot();
+    serve(payload);
+    const fetchData = vi.mocked(fetch).getMockImplementation()!;
+    let snapshotReads = 0;
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      if (String(input) === '/realtime/fleet-traffic/snapshot') {
+        snapshotReads += 1;
+        return Promise.resolve(Response.json({}, { status: 503 }));
+      }
+      return fetchData(input, init);
+    });
+    const emit = streamSnapshots();
+    const view = mount();
+    const { expected: _expected, ...stream } = payload;
+    await emit(stream);
+    for (const delay of [2_000, 4_000, 8_000, 16_000, 30_000]) {
+      const before = snapshotReads;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(delay - 1);
+      });
+      expect(snapshotReads).toBe(before);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(snapshotReads).toBe(before + 1);
+    }
+    view.unmount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(snapshotReads).toBe(6);
+  });
+
+  it('shows confirmed empty grants and retains that fact through SSE snapshots without grants', async () => {
+    const payload = snapshot();
+    payload.expected = [];
+    payload.nodes.forEach(node => {
+      node.samples[0].sample.user_traffic!.users = [];
+    });
+    serve(payload);
+    const emit = streamSnapshots();
+    const view = mount();
+
+    await view.findByText('尚无用户授权到这些机器');
+    const { expected: _expected, ...stream } = payload;
+    await emit(stream);
+    expect(view.getByText('尚无用户授权到这些机器')).toBeTruthy();
+    expect(view.getByLabelText('机队当前速率').querySelector('.rut-hero-sub')?.textContent).toBe(
+      '0 位活跃 · 0 位已授权',
+    );
+  });
+
+  it.each(['complete', 'offline', 'partial'] as const)(
+    'only concludes that there is no traffic from complete machine readings (%s)',
+    async phase => {
+      const payload = snapshot();
+      payload.nodes.forEach(node => {
+        node.connected = phase !== 'offline';
+        node.active = true;
+        node.samples[0].received_at_unix_millis = Date.now();
+        node.samples[0].sample.user_traffic!.users = [];
+        node.samples[0].sample.user_traffic!.truncated = phase === 'partial';
+      });
+      serve(payload);
+      const view = mount();
+      await view.findByRole('table');
+
+      const expected = phase === 'complete' ? '当前没有用户流量' : '当前读数不完整';
+      expect(view.container.querySelector('.flt-readout')?.textContent).toBe(expected);
+      expect(view.container.querySelector('.flt-list-empty')?.textContent).toBe(expected);
+      if (phase !== 'complete') expect(view.queryAllByText('当前没有用户流量')).toHaveLength(0);
+    },
+  );
+
   it.each([true, false])(
     'hides owner text and tooltips while keeping same-name users separate (details=%s)',
     async allowDetails => {
@@ -126,7 +362,7 @@ describe('fleet realtime traffic panel', () => {
         downlink_bytes_per_sec: 3 * MB,
         uplink_bytes_per_sec: MB,
       });
-      payload.expected[0].users.push({ tenant_id: 'hidden-branch', user_id: 'alice' });
+      payload.expected![0].users.push({ tenant_id: 'hidden-branch', user_id: 'alice' });
       serve(payload);
       const view = mount(allowDetails);
       const table = await view.findByRole('table');
@@ -171,8 +407,8 @@ describe('fleet realtime traffic panel', () => {
     const view = mount();
 
     const ledger = await view.findByLabelText('机队当前速率');
-    expect(ledger.querySelector('.user-usage-hero-value')?.textContent).toBe('25.0 Mbit/s');
-    expect(ledger.querySelector('.user-usage-hero-label')?.getAttribute('title')).toContain('各机独立采样');
+    expect(ledger.querySelector('.usage-hero-value')?.textContent).toBe('25.0 Mbit/s');
+    expect(ledger.querySelector('.usage-hero-label')?.getAttribute('title')).toContain('各机独立采样');
     expect(ledger.querySelector('.rut-hero-sub')?.textContent).toBe('1 位活跃 · 2 位已授权');
     expect(readingOf(ledger, '最高用户')).toBe('alice · 25.0 Mbit/s');
     expect(readingOf(ledger, '最忙机器')).toBe('香港 HKIX · 25.0 Mbit/s');
@@ -297,7 +533,7 @@ describe('fleet realtime traffic panel', () => {
       const view = mount();
 
       const ledger = await view.findByLabelText('机队当前速率');
-      expect(ledger.querySelector('.user-usage-hero-value')?.textContent).toBe('25.0 Mbit/s');
+      expect(ledger.querySelector('.usage-hero-value')?.textContent).toBe('25.0 Mbit/s');
       expect(readingOf(ledger, '有读数')).toBe('1 / 3 台');
       expect(view.getByRole('status').textContent).toBe('实时 · 每秒更新');
       expect(view.queryByRole('status', { name: '读取实时用量' })).toBeNull();
@@ -325,7 +561,7 @@ describe('fleet realtime traffic panel', () => {
 
     const ledger = await view.findByLabelText('机队当前速率');
     await view.findByText(/机器名册读取失败/);
-    expect(ledger.querySelector('.user-usage-hero-value')?.textContent).toBe('25.0 Mbit/s');
+    expect(ledger.querySelector('.usage-hero-value')?.textContent).toBe('25.0 Mbit/s');
     expect(view.getByRole('table')).toBeTruthy();
     expect(view.queryByRole('status', { name: '读取实时用量' })).toBeNull();
   });
