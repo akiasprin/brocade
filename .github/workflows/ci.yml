@@ -68,8 +68,32 @@ jobs:
       - name: Prepare pinned Xray assets
         run: sh "$GITHUB_WORKSPACE/scripts/prepare-xray-assets.sh"
 
+      - name: REALITY compatibility boundaries and dependency races
+        run: |
+          go test -race ./transport/internet/reality -count=3 -timeout=2m
+          go vet ./transport/internet/reality
+          go -C third_party/reality test -race -run '^TestBrocade' -count=3 -timeout=2m .
+          go -C third_party/reality vet .
+
+      - name: REALITY real-process fingerprint and cover compatibility
+        run: |
+          go build -buildvcs=false -o "$RUNNER_TEMP/reality-xray" ./main
+          fixture="$GITHUB_WORKSPACE/scripts/tests/xray-reality-compat/run.py"
+          python3 "$fixture" --binary "$RUNNER_TEMP/reality-xray" --label default
+          python3 "$fixture" --binary "$RUNNER_TEMP/reality-xray" --label strict --strict
+          python3 "$fixture" --binary "$RUNNER_TEMP/reality-xray" --label empty --empty-cover
+          python3 "$fixture" --binary "$RUNNER_TEMP/reality-xray" --label strict-empty --strict --empty-cover
+
       - name: Xray reachable-vulnerability audit
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./main
+
+      - name: Frozen Xray admission, attribution and DNS end-to-end contracts
+        env:
+          BROCADE_XRAY_BIN: ${{ runner.temp }}/reality-xray
+        run: |
+          go test ./testing/scenarios \
+            -run '^TestBrocadeFrozen(DNSRetryCacheAndProtocol|DNSColdWarmDiagnosticsAndBudget|DNSCanceledLeaderAndStaleRefresh|SourceBansAndAttribution|SiteStatisticsDoNotDuplicateRelay|OtherDomainAndFailedTargetAttribution|SS2022OversizedKeys)$' \
+            -count=1 -timeout=3m
 
       - name: QUIC sniffing compatibility, fuzz seeds and races
         run: |
@@ -94,10 +118,11 @@ jobs:
           go test -race ./proxy ./proxy/freedom -count=1 -timeout=3m
           go vet ./proxy ./proxy/freedom
 
-      - name: DNS cache ownership and blackhole response synchronization
+      - name: DNS provenance, cache ownership and blackhole response synchronization
         run: |
-          go test -race ./proxy/dns ./proxy/blackhole -count=3 -timeout=3m
-          go vet ./proxy/dns ./proxy/blackhole
+          go test -race ./features/probetrace ./app/dispatcher ./proxy/dns ./proxy/blackhole -count=3 -timeout=3m
+          go test -race ./app/dns -run '^Test(SerialTrace|RuleDNS|ParallelRuleGroup|ResponseTTL|UDPDomainResolver|LongDomain)' -count=3 -timeout=3m
+          go vet ./features/probetrace ./app/dispatcher ./app/dns ./features/dns ./proxy/dns ./proxy/blackhole
 
       - name: Data-plane deterministic, kTLS and fuzz-seed tests
         run: |
@@ -123,6 +148,11 @@ jobs:
       - name: Data-plane vet
         run: go vet ./transport/internet/tls ./proxy/anytls ./proxy/mtproto
 
+      - name: Shadowsocks relay key and early-close compatibility
+        run: |
+          go test -race ./proxy/shadowsocks_2022 -count=3 -timeout=2m
+          go vet ./proxy/shadowsocks_2022
+
       - name: Quota revocation sessions and user isolation
         run: |
           go test -race ./common/protocol ./proxy/vless/... ./proxy/hysteria/... ./transport/internet/hysteria -count=3 -timeout=3m
@@ -138,8 +168,7 @@ jobs:
         run: |
           go test -race ./common/sourceaccess ./app/proxyman/inbound ./transport/internet/splithttp -count=3 -timeout=3m
           go vet ./common/sourceaccess ./app/proxyman/inbound ./transport/internet/websocket ./transport/internet/httpupgrade
-          # Existing splithttp protobuf config copies predate the source policy.
-          go vet -copylocks=false ./transport/internet/splithttp
+          go vet ./transport/internet/splithttp
 
       - name: Online source protocol tracking
         run: |
@@ -158,8 +187,8 @@ jobs:
 
       - name: WARP MASQUE transport and node stack
         run: |
-          go test -race ./proxy/masque/... ./transport/internet/masque/... ./transport/internet/tls -count=1 -timeout=3m
-          go vet ./proxy/masque/... ./transport/internet/masque/...
+          go test -race ./proxy/masque/... ./proxy/wireguard/... ./transport/internet/masque/... ./transport/internet/tls ./transport/internet/finalmask/... -count=1 -timeout=3m
+          go vet ./proxy/masque/... ./proxy/wireguard/... ./transport/internet/masque/... ./transport/internet/finalmask/...
 
       - name: Mux and reverse deterministic tests
         run: go test ./common/buf ./common/mux ./app/reverse ./app/proxyman/outbound ./app/stats/command ./infra/conf ./proxy/vless/... -count=1 -timeout=10m
@@ -304,6 +333,8 @@ jobs:
       - name: Rust dependency vulnerability audit
         run: |
           python3 -m unittest discover -s scripts/tests -p test_rust_vulnerability_audit.py
+          python3 -m unittest discover -s scripts/tests -p test_build_release.py
+          python3 -m unittest discover -s scripts/tests -p test_prepare_consolidated_0003_compat.py
           metadata="${RUNNER_TEMP}/rust-audit-metadata.json"
           cargo metadata --format-version 1 --locked > "$metadata"
           results=$(

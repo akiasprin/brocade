@@ -28,7 +28,7 @@ node --test tests/<name>.test.mjs
 npx vitest run tests/<name>.test.tsx --config vitest.config.ts
 ```
 
-涉及视觉呈现时，另运行 `npm run test:visual`，首次使用先执行 `npx playwright install chromium`。当前 `npm test` 不包含该入口；运行环境与报告位置见[视觉测试配置](../../frontend/playwright.config.ts)，验收要求仍由[前端标准](frontend.md#视觉验收)统一维护。
+涉及视觉呈现时，另运行 `npm run test:visual`，首次使用先执行 `npx playwright install chromium webkit`。当前 `npm test` 不包含该入口；运行环境与报告位置见[视觉测试配置](../../frontend/playwright.config.ts)，验收要求仍由[前端标准](frontend.md#视觉验收)统一维护。
 
 ```sh
 cd components/xray-core
@@ -44,6 +44,18 @@ Linux 支持用户网络命名空间时，可用 `unshare -Urn sh -c 'ip link se
 
 Console 升级发布必须通过[官方 v0.3.1 强制真实验收](../../scripts/tests/upgrade/README.md)，包括
 外置与受管 PostgreSQL。CI 使用同次发行构建的产物，不允许仅用模拟服务或空匹配结果代替。
+
+## 构建入口变更
+
+固定缓存、双架构调度和耗时记录遵循[部署规范](../runbooks/console-deployment.md#固定位置双架构与耗时记录)。修改该入口时，按影响面验证真实 Cargo 双目标并发、带时区的开始/结束记录、系统校时不改变单调时钟耗时、长时间无输出时的耗时报告、人工取消时的进程组清理与取消记录、锁争用和失败不会接纳旧产物；构建不得因累计或阶段耗时被终止：
+
+```sh
+python3 -m unittest discover -s scripts/tests -p test_build_release.py
+cargo test -p brocade-console --test agent_build --locked
+cargo test -p brocade-console --test xray_build --locked
+```
+
+真实并发夹具只证明调度正确，不代表完整 Brocade 构建的实际耗时，也不能替代本次发行物的升级演练。
 
 ## PostgreSQL 集成测试
 
