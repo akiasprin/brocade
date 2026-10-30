@@ -8,6 +8,8 @@ option java_multiple_files = true;
 
 message Config {
   bool show = 1;
+  // Missing preserves old Brocade clients; false opts into upstream admission.
+  optional bool allow_legacy_x25519 = 14;
   string dest = 2;
   string type = 3;
   uint64 xver = 4;

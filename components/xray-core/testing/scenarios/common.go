@@ -3,6 +3,7 @@ package scenarios
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -102,6 +103,23 @@ var (
 
 func genTestBinaryPath() {
 	testBinaryPathGen.Do(func() {
+		// Explicit release E2E must exercise the frozen artifact, not rebuild a
+		// similarly named binary from a worktree that may still be changing.
+		if selected := os.Getenv("BROCADE_XRAY_BIN"); selected != "" {
+			path, err := filepath.Abs(selected)
+			common.Must(err)
+			info, err := os.Stat(path)
+			common.Must(err)
+			if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+				panic("BROCADE_XRAY_BIN must select an executable regular file")
+			}
+			contents, err := os.ReadFile(path)
+			common.Must(err)
+			testBinaryPath = path
+			testBinaryCleanFn = func() {}
+			fmt.Printf("Frozen Xray: %s sha256=%x\n", path, sha256.Sum256(contents))
+			return
+		}
 		var tempDir string
 		common.Must(retry.Timed(5, 100).On(func() error {
 			dir, err := os.MkdirTemp("", "xray")

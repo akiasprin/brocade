@@ -109,7 +109,7 @@ func makeExternalIngress(t *testing.T, name string) externalIngressSpec {
 		spec.port = tcp.PickPort()
 		userID := uuid.New()
 		spec.uuid = userID.String()
-		spec.inbound = serial.ToTypedMessage(&vlessinbound.Config{Clients: []*protocol.User{{
+		spec.inbound = serial.ToTypedMessage(&vlessinbound.Config{Users: []*protocol.User{{
 			Email:   "external-vless@example.com",
 			Account: serial.ToTypedMessage(&vless.Account{Id: spec.uuid}),
 		}}})
@@ -125,7 +125,7 @@ func makeExternalIngress(t *testing.T, name string) externalIngressSpec {
 			TransportSettings: []*internet.TransportConfig{{
 				ProtocolName: "hysteria",
 				Settings: serial.ToTypedMessage(&hytransport.Config{
-					Version: 2, Auth: externalHysteriaAuth, UdpIdleTimeout: 60,
+					Auth: externalHysteriaAuth, UdpIdleTimeout: 60,
 				}),
 			}},
 			SecurityType: serial.GetMessageType(&xtls.Config{}),
@@ -151,13 +151,13 @@ func startExternalUDPTopology(t *testing.T, protocolName string, mode externalMu
 	relayConfig := &core.Config{
 		Inbound: []*core.InboundHandlerConfig{{
 			ReceiverSettings: testMuxReceiver(relayPort, nil),
-			ProxySettings: serial.ToTypedMessage(&vlessinbound.Config{Clients: []*protocol.User{{
+			ProxySettings: serial.ToTypedMessage(&vlessinbound.Config{Users: []*protocol.User{{
 				Email:   "external-hop@example.com",
 				Account: serial.ToTypedMessage(&vless.Account{Id: relayID.String()}),
 			}}}),
 		}},
 		Outbound: []*core.OutboundHandlerConfig{{
-			ProxySettings: serial.ToTypedMessage(&freedom.Config{IpsBlocked: &freedom.IPRules{}}),
+			ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
 		}},
 	}
 	ingressConfig := &core.Config{

@@ -171,13 +171,13 @@ func startRealVLESSReverseScenario(t *testing.T) *realVLESSReverseScenario {
 				Tag:              "external",
 				ReceiverSettings: testMuxReceiver(externalPort, nil),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address: net.NewIPOrDomain(destination.Address), Port: uint32(destination.Port), Networks: []net.Network{net.Network_TCP},
+					RewriteAddress: net.NewIPOrDomain(destination.Address), RewritePort: uint32(destination.Port), AllowedNetworks: []net.Network{net.Network_TCP},
 				}),
 			},
 			{
 				Tag:              "reverse-carrier",
 				ReceiverSettings: testMuxReceiver(reversePort, nil),
-				ProxySettings: serial.ToTypedMessage(&vlessinbound.Config{Clients: []*protocol.User{{
+				ProxySettings: serial.ToTypedMessage(&vlessinbound.Config{Users: []*protocol.User{{
 					Email: "reverse@example.test",
 					Account: serial.ToTypedMessage(&vless.Account{Id: userID.String(), Reverse: &vless.Reverse{
 						Tag: vlessReversePortalTag, Health: testVLESSReverseHealth(),
@@ -188,7 +188,7 @@ func startRealVLESSReverseScenario(t *testing.T) *realVLESSReverseScenario {
 				Tag:              "external-udp",
 				ReceiverSettings: testMuxReceiver(externalUDPPort, nil),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address: net.NewIPOrDomain(udpDestination.Address), Port: uint32(udpDestination.Port), Networks: []net.Network{net.Network_UDP},
+					RewriteAddress: net.NewIPOrDomain(udpDestination.Address), RewritePort: uint32(udpDestination.Port), AllowedNetworks: []net.Network{net.Network_UDP},
 				}),
 			},
 		},
@@ -203,7 +203,7 @@ func startRealVLESSReverseScenario(t *testing.T) *realVLESSReverseScenario {
 		}),
 		Outbound: []*core.OutboundHandlerConfig{
 			{Tag: "fail-closed", ProxySettings: serial.ToTypedMessage(&blackhole.Config{})},
-			{Tag: "freedom", ProxySettings: serial.ToTypedMessage(&freedom.Config{IpsBlocked: &freedom.IPRules{}})},
+			{Tag: "freedom", ProxySettings: serial.ToTypedMessage(&freedom.Config{})},
 			{
 				Tag: "reverse",
 				ProxySettings: serial.ToTypedMessage(&vlessoutbound.Config{Vnext: &protocol.ServerEndpoint{
@@ -801,7 +801,7 @@ func TestVLESSReverseRealProcessOneWayBlackholeRecovery(t *testing.T) {
 		}
 		return true
 	})
-	waitMuxScenario(t, "old drained physical carrier cleanup", 3*time.Second, func() bool {
+	waitMuxScenario(t, "old drained physical carrier cleanup", mux.ReverseDrainTimeout+time.Second, func() bool {
 		return scenario.proxy.active.Load() == 2
 	})
 }

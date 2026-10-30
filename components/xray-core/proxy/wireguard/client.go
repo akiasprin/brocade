@@ -1,31 +1,16 @@
-/*
-
-Some of codes are copied from https://github.com/octeep/wireproxy, license below.
-
-Copyright (c) 2022 Wind T.F. Wong <octeep@pm.me>
-
-Permission to use, copy, modify, and distribute this software for any
-purpose with or without fee is hereby granted, provided that the above
-copyright notice and this permission notice appear in all copies.
-
-THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
-ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-
-*/
-
 package wireguard
 
 import (
 	"context"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
+
+	"golang.zx2c4.com/wireguard/tun"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -33,116 +18,193 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/policy"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
+	"golang.zx2c4.com/wireguard/device"
 )
 
-// Handler is an outbound connection that silently swallow the entire payload.
 type Handler struct {
-	conf          *DeviceConfig
-	net           Tunnel
-	bind          *netBindClient
-	policyManager policy.Manager
-	dns           dns.Client
-	// cached configuration
-	endpoints        []netip.Addr
-	hasIPv4, hasIPv6 bool
-	wgLock           sync.Mutex
+	p policy.Manager
+
+	canup *atomic.Bool
+	tnet  *Net
+	bind  *bind
+	dev   *device.Device
+	ipc   string
+	mu    sync.Mutex
 }
 
-// New creates a new wireguard handler.
-func New(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
+func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 	v := core.MustFromContext(ctx)
+	p := v.GetFeature(policy.ManagerType()).(policy.Manager)
+	d := v.GetFeature(dns.ClientType()).(dns.Client)
 
-	endpoints, hasIPv4, hasIPv6, err := parseEndpoints(conf)
+	streamSettings := session.StreamSettingsFromContext(ctx).(*internet.MemoryStreamConfig)
+	tag := session.FullHandlerFromContext(ctx).Tag()
+	var uplinkCounter stats.Counter
+	var downlinkCounter stats.Counter
+	if len(tag) > 0 && p.ForSystem().Stats.OutboundUplink {
+		statsManager := v.GetFeature(stats.ManagerType()).(stats.Manager)
+		name := "outbound>>>" + tag + ">>>traffic>>>uplink"
+		c, _ := statsManager.GetOrRegisterCounter(name)
+		if c != nil {
+			uplinkCounter = c
+		}
+	}
+	if len(tag) > 0 && p.ForSystem().Stats.OutboundDownlink {
+		statsManager := v.GetFeature(stats.ManagerType()).(stats.Manager)
+		name := "outbound>>>" + tag + ">>>traffic>>>downlink"
+		c, _ := statsManager.GetOrRegisterCounter(name)
+		if c != nil {
+			downlinkCounter = c
+		}
+	}
+
+	if len(conf.Peers) == 0 {
+		return nil, errors.New("empty peers")
+	}
+	for _, peer := range conf.Peers {
+		if peer.PublicKey == "" {
+			return nil, errors.New("peer without publickey")
+		}
+		if peer.Endpoint == "" {
+			return nil, errors.New("peer without endpoint")
+		}
+	}
+
+	localAddresses := make([]netip.Addr, 0, len(conf.Endpoint))
+	for _, localaddress := range conf.Endpoint {
+		addr, err := netip.ParseAddr(localaddress)
+		if err == nil {
+			localAddresses = append(localAddresses, addr)
+			continue
+		}
+		prefix, err := netip.ParsePrefix(localaddress)
+		if err == nil {
+			localAddresses = append(localAddresses, prefix.Addr())
+			continue
+		}
+		return nil, err
+	}
+
+	dns := conf.DNS
+	if len(dns) == 0 {
+		dns = []string{"1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001"}
+	}
+	dnses := make([]netip.Addr, 0, len(dns))
+	for _, dns := range dns {
+		dnses = append(dnses, netip.MustParseAddr(dns))
+	}
+
+	kernelTunSupported, err := KernelTunSupported()
+	if err != nil {
+		errors.LogWarningInner(context.Background(), err, "Failed to check kernel TUN support")
+	}
+	var tun tun.Device
+	var tnet *Net
+	if !conf.NoKernelTun && kernelTunSupported {
+		errors.LogWarning(context.Background(), "Using kernel TUN")
+		tun, tnet, err = createKernelTun(localAddresses, dnses, int(conf.Mtu))
+	} else {
+		errors.LogWarning(context.Background(), "Using built-in TCP/IP stack")
+		tun, tnet, err = CreateNetTUN(localAddresses, dnses, int(conf.Mtu), nil)
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	d := v.GetFeature(dns.ClientType()).(dns.Client)
+	blockup := newblockup(tun)
+	bind := &bind{}
+	logger := &device.Logger{
+		Verbosef: func(format string, args ...any) {
+			log.Record(&log.GeneralMessage{
+				Severity: log.Severity_Debug,
+				Content:  fmt.Sprintf(format, args...),
+			})
+		},
+		Errorf: func(format string, args ...any) {
+			log.Record(&log.GeneralMessage{
+				Severity: log.Severity_Error,
+				Content:  fmt.Sprintf(format, args...),
+			})
+		},
+	}
+	dev := device.NewDevice(blockup, bind, logger)
+	bind.ctx = context.Background()
+	bind.resolveFunc = MakeResolveLocal(d, streamSettings)
+	bind.listenFunc = func(ctx context.Context) (net.PacketConn, error) {
+		dest, err := net.ParseDestination("udp:" + conf.Peers[0].Endpoint)
+		if err != nil {
+			return nil, err
+		}
+		var pktConn net.PacketConn
+		if streamSettings.FinalMask != nil {
+			conn, err := streamSettings.FinalMask.DialUDP(ctx, dest)
+			if err != nil {
+				return nil, errors.New("failed to dial to dest").Base(err)
+			}
+			pktConn = conn.(*net.PacketConnWrapper).PacketConn
+		} else {
+			conn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
+			if err != nil {
+				return nil, errors.New("failed to dial to dest").Base(err)
+			}
+			switch c := conn.(type) {
+			case *net.PacketConnWrapper:
+				pktConn = c.PacketConn
+			case *cnc.Connection:
+				pktConn = &internet.FakePacketConn{Conn: c}
+			default:
+				panic(reflect.TypeOf(c))
+			}
+		}
+		if uplinkCounter != nil || downlinkCounter != nil {
+			pktConn = &PacketCounterConnection{
+				PacketConn:   pktConn,
+				ReadCounter:  downlinkCounter,
+				WriteCounter: uplinkCounter,
+			}
+		}
+		return pktConn, nil
+	}
+	bind.downFunc = dev.Down
+	bind.reserved = conf.Reserved
+	var cfg strings.Builder
+	cfg.WriteString("private_key=" + conf.SecretKey + "\n")
+	for _, peer := range conf.Peers {
+		cfg.WriteString("public_key=" + peer.PublicKey + "\n")
+		if peer.PreSharedKey != "" {
+			cfg.WriteString("preshared_key=" + peer.PreSharedKey + "\n")
+		}
+		cfg.WriteString("endpoint=" + peer.Endpoint + "\n")
+		for _, ip := range peer.AllowedIps {
+			cfg.WriteString("allowed_ip=" + ip + "\n")
+		}
+		if peer.KeepAlive != "" {
+			cfg.WriteString("persistent_keepalive_interval=" + peer.KeepAlive + "\n")
+		}
+	}
+
 	return &Handler{
-		conf:          conf,
-		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
-		dns:           d,
-		endpoints:     endpoints,
-		hasIPv4:       hasIPv4,
-		hasIPv6:       hasIPv6,
+		p: p,
+
+		canup: blockup.canup,
+		tnet:  tnet,
+		bind:  bind,
+		dev:   dev,
+		ipc:   cfg.String(),
 	}, nil
 }
 
-func (h *Handler) Close() (err error) {
-	go func() {
-		h.wgLock.Lock()
-		defer h.wgLock.Unlock()
-
-		if h.net != nil {
-			_ = h.net.Close()
-			h.net = nil
-		}
-	}()
-
-	return nil
-}
-
-func (h *Handler) processWireGuard(ctx context.Context, dialer internet.Dialer) (err error) {
-	h.wgLock.Lock()
-	defer h.wgLock.Unlock()
-
-	if h.bind != nil && h.bind.dialer == dialer && h.net != nil {
-		return nil
-	}
-
-	log.Record(&log.GeneralMessage{
-		Severity: log.Severity_Info,
-		Content:  "switching dialer",
-	})
-
-	if h.net != nil {
-		_ = h.net.Close()
-		h.net = nil
-	}
-	if h.bind != nil {
-		_ = h.bind.Close()
-		h.bind = nil
-	}
-
-	// bind := conn.NewStdNetBind() // TODO: conn.Bind wrapper for dialer
-	h.bind = &netBindClient{
-		netBind: netBind{
-			dns: h.dns,
-			dnsOption: dns.IPOption{
-				IPv4Enable: h.hasIPv4,
-				IPv6Enable: h.hasIPv6,
-			},
-			workers:   int(h.conf.NumWorkers),
-			readQueue: make(chan *netReadInfo),
-		},
-		ctx:      ctx,
-		dialer:   dialer,
-		reserved: h.conf.Reserved,
-	}
-	defer func() {
-		if err != nil {
-			h.bind.Close()
-			h.bind = nil
-		}
-	}()
-
-	h.net, err = h.makeVirtualTun()
-	if err != nil {
-		return errors.New("failed to create virtual tun interface").Base(err)
-	}
-	return nil
-}
-
-// Process implements OutboundHandler.Dispatch().
+// Process implements proxy.Outbound.Process.
 func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
@@ -151,41 +213,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 	ob.Name = "wireguard"
 	ob.CanSpliceCopy.Store(session.SpliceCopyDisabled)
+	dialer.SetOutboundGateway(ctx, ob)
 
-	if err := h.processWireGuard(ctx, dialer); err != nil {
+	if err := h.up(ctx); err != nil {
 		return err
 	}
-
-	// Destination of the inner request.
-	destination := ob.Target
-	command := protocol.RequestCommandTCP
-	if destination.Network == net.Network_UDP {
-		command = protocol.RequestCommandUDP
-	}
-
-	// resolve dns
-	addr := destination.Address
-	if addr.Family().IsDomain() {
-		ips, _, err := h.dns.LookupIP(addr.Domain(), dns.IPOption{
-			IPv4Enable: h.hasIPv4 && h.conf.preferIP4(),
-			IPv6Enable: h.hasIPv6 && h.conf.preferIP6(),
-		})
-		{ // Resolve fallback
-			if (len(ips) == 0 || err != nil) && h.conf.hasFallback() {
-				ips, _, err = h.dns.LookupIP(addr.Domain(), dns.IPOption{
-					IPv4Enable: h.hasIPv4 && h.conf.fallbackIP4(),
-					IPv6Enable: h.hasIPv6 && h.conf.fallbackIP6(),
-				})
-			}
-		}
-		if err != nil {
-			return errors.New("failed to lookup DNS").Base(err)
-		} else if len(ips) == 0 {
-			return dns.ErrEmptyResponse
-		}
-		addr = net.IPAddress(ips[dice.Roll(len(ips))])
-	}
-	destination.Address = addr
 
 	var newCtx context.Context
 	var newCancel context.CancelFunc
@@ -193,59 +225,63 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		newCtx, newCancel = context.WithCancel(context.Background())
 	}
 
-	p := h.policyManager.ForLevel(0)
-
+	sessionPolicy := h.p.ForLevel(0)
 	ctx, cancel := context.WithCancel(ctx)
 	timer := signal.CancelAfterInactivity(ctx, func() {
 		cancel()
 		if newCancel != nil {
 			newCancel()
 		}
-	}, p.Timeouts.ConnectionIdle)
-	addrPort := netip.AddrPortFrom(toNetIpAddr(addr), destination.Port.Value())
+	}, sessionPolicy.Timeouts.ConnectionIdle)
 
-	var requestFunc func() error
-	var responseFunc func() error
+	if newCtx != nil {
+		ctx = newCtx
+	}
 
-	if command == protocol.RequestCommandTCP {
-		conn, err := h.net.DialContextTCPAddrPort(ctx, addrPort)
+	var reader buf.Reader
+	var writer buf.Writer
+
+	switch ob.Target.Network {
+	case net.Network_TCP:
+		var conn net.Conn
+		var err error
+		if sessionPolicy.Timeouts.Handshake != 0 {
+			timeoutCtx, timeoutCancel := context.WithTimeout(ctx, sessionPolicy.Timeouts.Handshake)
+			conn, err = h.tnet.DialContext(timeoutCtx, "tcp", ob.Target.NetAddr())
+			timeoutCancel()
+		} else {
+			conn, err = h.tnet.Dial("tcp", ob.Target.NetAddr())
+		}
 		if err != nil {
 			return errors.New("failed to create TCP connection").Base(err)
 		}
 		defer conn.Close()
-
-		requestFunc = func() error {
-			defer timer.SetTimeout(p.Timeouts.DownlinkOnly)
-			return buf.Copy(link.Reader, buf.NewWriter(conn), buf.UpdateActivity(timer))
-		}
-		responseFunc = func() error {
-			defer timer.SetTimeout(p.Timeouts.UplinkOnly)
-			return buf.Copy(buf.NewReader(conn), link.Writer, buf.UpdateActivity(timer))
-		}
-	} else if command == protocol.RequestCommandUDP {
-		conn, err := h.net.DialUDPAddrPort(netip.AddrPort{}, addrPort)
+		reader = buf.NewReader(conn)
+		writer = buf.NewWriter(conn)
+	case net.Network_UDP:
+		conn, err := h.tnet.Dial("udp", ob.Target.NetAddr())
 		if err != nil {
 			return errors.New("failed to create UDP connection").Base(err)
 		}
 		defer conn.Close()
-
-		conn = &udpConnClient{
-			Conn: conn,
-			dest: destination,
+		c := &UDPConnClient{
+			PacketConn: conn.(*net.PacketConnWrapper).PacketConn,
+			Dest:       conn.RemoteAddr().(*net.UDPAddr),
 		}
-
-		requestFunc = func() error {
-			defer timer.SetTimeout(p.Timeouts.DownlinkOnly)
-			return buf.Copy(link.Reader, buf.NewWriter(conn), buf.UpdateActivity(timer))
-		}
-		responseFunc = func() error {
-			defer timer.SetTimeout(p.Timeouts.UplinkOnly)
-			return buf.Copy(buf.NewReader(conn), link.Writer, buf.UpdateActivity(timer))
-		}
+		reader = c
+		writer = c
+	default:
+		panic(ob.Target.Network)
 	}
 
-	if newCtx != nil {
-		ctx = newCtx
+	requestFunc := func() error {
+		defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
+		return buf.Copy(link.Reader, writer, buf.UpdateActivity(timer))
+	}
+
+	responseFunc := func() error {
+		defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
+		return buf.Copy(reader, link.Writer, buf.UpdateActivity(timer))
 	}
 
 	responseDonePost := task.OnSuccess(responseFunc, task.Close(link.Writer))
@@ -258,107 +294,92 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	return nil
 }
 
-// creates a tun interface on netstack given a configuration
-func (h *Handler) makeVirtualTun() (Tunnel, error) {
-	t, err := h.conf.createTun()(h.endpoints, int(h.conf.Mtu), nil)
-	if err != nil {
-		return nil, err
+func (h *Handler) Close() (err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.dev != nil {
+		h.dev.Close()
+		h.dev = nil
 	}
-
-	h.bind.dnsOption.IPv4Enable = h.hasIPv4
-	h.bind.dnsOption.IPv6Enable = h.hasIPv6
-
-	if err = t.BuildDevice(h.createIPCRequest(), h.bind); err != nil {
-		_ = t.Close()
-		return nil, err
-	}
-	return t, nil
+	return nil
 }
 
-// serialize the config into an IPC request
-func (h *Handler) createIPCRequest() string {
-	var request strings.Builder
-
-	request.WriteString(fmt.Sprintf("private_key=%s\n", h.conf.SecretKey))
-
-	if !h.conf.IsClient {
-		// placeholder, we'll handle actual port listening on Xray
-		request.WriteString("listen_port=1337\n")
+func (h *Handler) up(ctx context.Context) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.dev == nil {
+		return errors.New("closed")
 	}
-
-	for _, peer := range h.conf.Peers {
-		if peer.PublicKey != "" {
-			request.WriteString(fmt.Sprintf("public_key=%s\n", peer.PublicKey))
+	h.bind.SetCtx(ctx)
+	if !h.canup.Load() {
+		h.canup.Store(true)
+	}
+	if len(h.ipc) > 0 {
+		if err := h.dev.IpcSet(h.ipc); err != nil {
+			return err
 		}
+		h.ipc = ""
+	}
+	return h.dev.Up()
+}
 
-		if peer.PreSharedKey != "" {
-			request.WriteString(fmt.Sprintf("preshared_key=%s\n", peer.PreSharedKey))
+func MakeResolveLocal(d dns.Client, streamSettings *internet.MemoryStreamConfig) func(host string) (net.IP, error) {
+	return func(host string) (net.IP, error) {
+		if ip := net.ParseIP(host); ip != nil {
+			return ip, nil
 		}
-
-		address, port, err := net.SplitHostPort(peer.Endpoint)
+		ips, _, err := d.LookupIP(host, dns.IPOption{IPv4Enable: true, IPv6Enable: true})
 		if err != nil {
-			errors.LogError(h.bind.ctx, "failed to split endpoint ", peer.Endpoint, " into address and port")
+			return nil, err
 		}
-		addr := net.ParseAddress(address)
-		if addr.Family().IsDomain() {
-			dialerIp := h.bind.dialer.DestIpAddress()
-			if dialerIp != nil {
-				addr = net.ParseAddress(dialerIp.String())
-				errors.LogInfo(h.bind.ctx, "createIPCRequest use dialer dest ip: ", addr)
-			} else {
-				ips, _, err := h.dns.LookupIP(addr.Domain(), dns.IPOption{
-					IPv4Enable: h.conf.preferIP4(),
-					IPv6Enable: h.conf.preferIP6(),
-				})
-				{ // Resolve fallback
-					if (len(ips) == 0 || err != nil) && h.conf.hasFallback() {
-						ips, _, err = h.dns.LookupIP(addr.Domain(), dns.IPOption{
-							IPv4Enable: h.conf.fallbackIP4(),
-							IPv6Enable: h.conf.fallbackIP6(),
-						})
-					}
-				}
-				if err != nil {
-					errors.LogInfoInner(h.bind.ctx, err, "createIPCRequest failed to lookup DNS")
-				} else if len(ips) == 0 {
-					errors.LogInfo(h.bind.ctx, "createIPCRequest empty lookup DNS")
+		got := ips
+		if streamSettings.SocketSettings != nil {
+			var got4, got6 []net.IP
+			for _, ip := range ips {
+				if ip.To4() != nil {
+					got4 = append(got4, ip)
 				} else {
-					addr = net.IPAddress(ips[dice.Roll(len(ips))])
+					got6 = append(got6, ip)
 				}
 			}
+			switch streamSettings.SocketSettings.DomainStrategy {
+			case internet.DomainStrategy_AS_IS, internet.DomainStrategy_USE_IP, internet.DomainStrategy_FORCE_IP:
+				got = ips
+			case internet.DomainStrategy_USE_IP4, internet.DomainStrategy_FORCE_IP4:
+				got = got4
+			case internet.DomainStrategy_USE_IP6, internet.DomainStrategy_FORCE_IP6:
+				got = got6
+			case internet.DomainStrategy_USE_IP46, internet.DomainStrategy_FORCE_IP46:
+				got = got4
+				if len(got) == 0 {
+					got = got6
+				}
+			case internet.DomainStrategy_USE_IP64, internet.DomainStrategy_FORCE_IP64:
+				got = got6
+				if len(got) == 0 {
+					got = got4
+				}
+			}
+			if len(got) == 0 {
+				return nil, dns.ErrEmptyResponse
+			}
 		}
-
-		if peer.Endpoint != "" {
-			request.WriteString(fmt.Sprintf("endpoint=%s:%s\n", addr, port))
-		}
-
-		for _, ip := range peer.AllowedIps {
-			request.WriteString(fmt.Sprintf("allowed_ip=%s\n", ip))
-		}
-
-		if peer.KeepAlive != 0 {
-			request.WriteString(fmt.Sprintf("persistent_keepalive_interval=%d\n", peer.KeepAlive))
-		}
+		return got[dice.Roll(len(got))], nil
 	}
-
-	return request.String()[:request.Len()]
 }
 
-type udpConnClient struct {
-	net.Conn
-	dest net.Destination
+type UDPConnClient struct {
+	net.PacketConn
+	Dest *net.UDPAddr
 }
 
-func (c *udpConnClient) ReadMultiBuffer() (buf.MultiBuffer, error) {
+func (c *UDPConnClient) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	b := buf.New()
 	b.Resize(0, buf.Size)
-	n, addr, err := c.Conn.(net.PacketConn).ReadFrom(b.Bytes())
+	n, addr, err := c.PacketConn.ReadFrom(b.Bytes())
 	if err != nil {
 		b.Release()
 		return nil, err
-	}
-	if addr == nil { // should never hit
-		addr = c.dest.RawNetAddr()
 	}
 	b.Resize(0, int32(n))
 
@@ -371,13 +392,19 @@ func (c *udpConnClient) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	return buf.MultiBuffer{b}, nil
 }
 
-func (c *udpConnClient) WriteMultiBuffer(mb buf.MultiBuffer) error {
+func (c *UDPConnClient) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	for i, b := range mb {
-		dst := c.dest
+		dst := c.Dest
 		if b.UDP != nil {
-			dst = *b.UDP
+			if b.UDP.Address.Family().IsDomain() {
+				if b.UDP.Port != net.Port(dst.Port) {
+					dst = &net.UDPAddr{IP: dst.IP, Port: int(b.UDP.Port)}
+				}
+			} else {
+				dst = b.UDP.RawNetAddr().(*net.UDPAddr)
+			}
 		}
-		_, err := c.Conn.(net.PacketConn).WriteTo(b.Bytes(), dst.RawNetAddr())
+		_, err := c.PacketConn.WriteTo(b.Bytes(), dst)
 		if err != nil {
 			buf.ReleaseMulti(mb[i:])
 			return err
@@ -385,4 +412,121 @@ func (c *udpConnClient) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		b.Release()
 	}
 	return nil
+}
+
+type PacketCounterConnection struct {
+	net.PacketConn
+	ReadCounter  stats.Counter
+	WriteCounter stats.Counter
+}
+
+func (c *PacketCounterConnection) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	n, addr, err = c.PacketConn.ReadFrom(p)
+	if err == nil && c.ReadCounter != nil {
+		c.ReadCounter.Add(int64(n))
+	}
+	return
+}
+
+func (c *PacketCounterConnection) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	n, err = c.PacketConn.WriteTo(p, addr)
+	if err == nil && c.WriteCounter != nil {
+		c.WriteCounter.Add(int64(n))
+	}
+	return
+}
+
+type entry struct {
+	saddr    []string
+	deadline time.Time
+}
+
+type cache struct {
+	running bool
+	m       map[string]entry
+	mu      sync.Mutex
+}
+
+func (c *cache) run() {
+	if c.running {
+		return
+	}
+	c.running = true
+	if c.m == nil {
+		c.m = make(map[string]entry)
+	}
+	go c.gc()
+}
+
+func (c *cache) gc() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for now := range ticker.C {
+		c.mu.Lock()
+		for key, entry := range c.m {
+			if now.After(entry.deadline) {
+				delete(c.m, key)
+			}
+		}
+		if len(c.m) == 0 {
+			c.running = false
+			c.mu.Unlock()
+			return
+		}
+		c.mu.Unlock()
+	}
+}
+
+func (c *cache) LookupHost(host string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.run()
+	if entry, ok := c.m[host]; ok {
+		if time.Now().Before(entry.deadline) {
+			return entry.saddr
+		}
+		delete(c.m, host)
+	}
+	return nil
+}
+
+func (c *cache) Cache(host string, saddr []string, ttl uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.run()
+	if _, exists := c.m[host]; !exists && len(c.m) >= 4096 {
+		return
+	}
+	c.m[host] = entry{
+		saddr:    saddr,
+		deadline: time.Now().Add(time.Second * time.Duration(ttl)),
+	}
+}
+
+type blockup struct {
+	tun.Device
+	ch    chan tun.Event
+	canup *atomic.Bool
+}
+
+func newblockup(t tun.Device) *blockup {
+	ch := make(chan tun.Event, cap(t.Events()))
+	canup := &atomic.Bool{}
+	go func() {
+		for e := range t.Events() {
+			if e&tun.EventUp != 0 && !canup.Load() {
+				continue
+			}
+			select {
+			case ch <- e:
+			default:
+			}
+		}
+		close(ch)
+	}()
+	return &blockup{Device: t, ch: ch, canup: canup}
+}
+
+func (b *blockup) Events() <-chan tun.Event {
+	return b.ch
 }

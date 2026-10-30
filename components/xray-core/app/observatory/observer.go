@@ -78,6 +78,12 @@ func (o *Observer) background() {
 			sleepTime = time.Duration(o.config.ProbeInterval)
 		}
 
+		if len(outbounds) == 0 {
+			errors.LogWarning(o.ctx, "no outbound matches subjectSelector ", o.config.SubjectSelector)
+			time.Sleep(sleepTime)
+			continue
+		}
+
 		if !o.config.EnableConcurrency {
 			sort.Strings(outbounds)
 			for _, v := range outbounds {
@@ -186,7 +192,7 @@ func (o *Observer) probe(outbound string) ProbeResult {
 		return nil
 	})
 	if err != nil {
-		var errorMessage = "the outbound " + outbound + " is dead: GET request failed:" + err.Error() + "with outbound handler report underlying connection failed"
+		errorMessage := "the outbound " + outbound + " is dead: GET request failed:" + err.Error() + "with outbound handler report underlying connection failed"
 		errors.LogInfoInner(o.ctx, errorCollectorForRequest.UnderlyingError(), errorMessage)
 		return ProbeResult{Alive: false, LastErrorReason: errorMessage}
 	}

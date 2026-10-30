@@ -17,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/policy"
+	"github.com/xtls/xray-core/features/probetrace"
 	"github.com/xtls/xray-core/features/routing"
 	routing_session "github.com/xtls/xray-core/features/routing/session"
 	"github.com/xtls/xray-core/features/stats"
@@ -365,15 +366,22 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	sniffingRequest := content.SniffingRequest
 	ctx = withSiteUsage(ctx, d.stats)
 	inbound, outbound := d.getLink(ctx)
-	if !sniffingRequest.Enabled {
-		logSniffDecision(ctx, sniffingRequest, destination, nil, nil, "disabled", "none", 0)
-		setSniffingState(content, false, false)
-		go d.routedDispatch(ctx, outbound, destination)
-	} else {
-		go func() {
+	go func() {
+		var err error
+		ctx, err = probetrace.Prepare(ctx, destination, outbound)
+		if err != nil {
+			common.Interrupt(outbound.Reader)
+			common.Interrupt(outbound.Writer)
+			return
+		}
+		if !sniffingRequest.Enabled {
+			logSniffDecision(ctx, sniffingRequest, destination, nil, nil, "disabled", "none", 0)
+			setSniffingState(content, false, false)
+			d.routedDispatch(ctx, outbound, destination)
+		} else {
 			originalDestinationWasIP := destination.Address.Family().IsIP()
 			cReader := &cachedReader{
-				reader: outbound.Reader.(*pipe.Reader),
+				reader: outbound.Reader.(buf.TimeoutReader),
 			}
 			outbound.Reader = cReader
 			started := time.Now()
@@ -411,8 +419,8 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 			logSniffDecision(ctx, sniffingRequest, ob.OriginalTarget, result, err, reason, applied, time.Since(started))
 			setSniffingState(content, originalDestinationWasIP, domainRecovered)
 			d.routedDispatch(ctx, outbound, destination)
-		}()
-	}
+		}
+	}()
 	return inbound, nil
 }
 
@@ -435,6 +443,11 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		ctx = session.ContextWithContent(ctx, content)
 	}
 	ctx = withSiteUsage(ctx, d.stats)
+	var traceErr error
+	ctx, traceErr = probetrace.Prepare(ctx, destination, outbound)
+	if traceErr != nil {
+		return traceErr
+	}
 	outbound = WrapLink(ctx, d.policy, d.stats, outbound)
 	sniffingRequest := content.SniffingRequest
 	if !sniffingRequest.Enabled {
@@ -586,6 +599,9 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 				return // DO NOT CHANGE: the traffic shouldn't be processed by default outbound if the specified outbound tag doesn't exist (yet), e.g., VLESS Reverse Proxy
 			}
 		} else {
+			if err != common.ErrNoClue {
+				errors.LogErrorInner(ctx, err, "failed to pick route for ", destination)
+			}
 			errors.LogInfo(ctx, "default route for ", destination)
 		}
 	}

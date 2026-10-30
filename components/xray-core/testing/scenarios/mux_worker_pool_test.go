@@ -237,7 +237,7 @@ func makeMuxIngressProtocol(t *testing.T, name string, serverPort net.Port) muxI
 	case "VLESS":
 		userID := protocol.NewID(uuid.New())
 		return muxIngressProtocol{
-			inbound: serial.ToTypedMessage(&vlessinbound.Config{Clients: []*protocol.User{{
+			inbound: serial.ToTypedMessage(&vlessinbound.Config{Users: []*protocol.User{{
 				Email: "mux-ingress-vless@example.com", Account: serial.ToTypedMessage(&vless.Account{Id: userID.String()}),
 			}}}),
 			outbound: serial.ToTypedMessage(&vlessoutbound.Config{Vnext: &protocol.ServerEndpoint{
@@ -281,7 +281,7 @@ func makeMuxIngressProtocol(t *testing.T, name string, serverPort net.Port) muxI
 			inboundStream: &internet.StreamConfig{
 				ProtocolName: "hysteria",
 				TransportSettings: []*internet.TransportConfig{{ProtocolName: "hysteria", Settings: serial.ToTypedMessage(&hytransport.Config{
-					Version: 2, Auth: auth, UdpIdleTimeout: 60,
+					Auth: auth, UdpIdleTimeout: 60,
 				})}},
 				SecurityType: serial.GetMessageType(&tls.Config{}),
 				SecuritySettings: []*serial.TypedMessage{serial.ToTypedMessage(&tls.Config{
@@ -289,7 +289,7 @@ func makeMuxIngressProtocol(t *testing.T, name string, serverPort net.Port) muxI
 				})},
 			},
 			outbound: serial.ToTypedMessage(&hyproxy.ClientConfig{
-				Version: 2,
+
 				Server: &protocol.ServerEndpoint{
 					Address: net.NewIPOrDomain(net.LocalHostIP), Port: uint32(serverPort),
 					User: &protocol.User{Email: "mux-ingress-hysteria2@example.com", Account: serial.ToTypedMessage(&hyaccount.Account{Auth: auth})},
@@ -298,7 +298,7 @@ func makeMuxIngressProtocol(t *testing.T, name string, serverPort net.Port) muxI
 			outboundStream: &internet.StreamConfig{
 				ProtocolName: "hysteria",
 				TransportSettings: []*internet.TransportConfig{{ProtocolName: "hysteria", Settings: serial.ToTypedMessage(&hytransport.Config{
-					Version: 2, Auth: auth, UdpIdleTimeout: 60,
+					Auth: auth, UdpIdleTimeout: 60,
 				})}},
 				SecurityType: serial.GetMessageType(&tls.Config{}),
 				SecuritySettings: []*serial.TypedMessage{serial.ToTypedMessage(&tls.Config{
@@ -362,11 +362,11 @@ func startRealMuxScenarioWithPool(t *testing.T, protocolName string, concurrency
 	relayConfig := &core.Config{
 		Inbound: []*core.InboundHandlerConfig{{
 			ReceiverSettings: testMuxReceiver(relayPort, nil),
-			ProxySettings: serial.ToTypedMessage(&vlessinbound.Config{Clients: []*protocol.User{{
+			ProxySettings: serial.ToTypedMessage(&vlessinbound.Config{Users: []*protocol.User{{
 				Email: "mux-hop@example.com", Account: serial.ToTypedMessage(&vless.Account{Id: relayID.String()}),
 			}}}),
 		}},
-		Outbound: []*core.OutboundHandlerConfig{{ProxySettings: serial.ToTypedMessage(&freedom.Config{IpsBlocked: &freedom.IPRules{}})}},
+		Outbound: []*core.OutboundHandlerConfig{{ProxySettings: serial.ToTypedMessage(&freedom.Config{})}},
 	}
 	ingressConfig := &core.Config{
 		Inbound: []*core.InboundHandlerConfig{{
@@ -386,7 +386,7 @@ func startRealMuxScenarioWithPool(t *testing.T, protocolName string, concurrency
 		Inbound: []*core.InboundHandlerConfig{{
 			ReceiverSettings: testMuxReceiver(clientPort, nil),
 			ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-				Address: net.NewIPOrDomain(destination.Address), Port: uint32(destination.Port), Networks: []net.Network{net.Network_TCP},
+				RewriteAddress: net.NewIPOrDomain(destination.Address), RewritePort: uint32(destination.Port), AllowedNetworks: []net.Network{net.Network_TCP},
 			}),
 		}},
 		Outbound: []*core.OutboundHandlerConfig{{

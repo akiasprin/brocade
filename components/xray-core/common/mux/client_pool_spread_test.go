@@ -101,7 +101,7 @@ func TestBaseGrowthFailureFallsBackToExistingCapacity(t *testing.T) {
 	picker := newPoolPickerForTest(clock, cfg, factory)
 	active := newBlackholeWorker(t, cfg, 2)
 	addWorkerForTest(t, picker, active, workerActive, clock.Now())
-	active.sessionManager.Allocate(&active.strategy)
+	active.sessionManager.Allocate(&active.strategy, nil, nil)
 	t.Cleanup(func() { picker.Close() })
 	chosen, err := picker.PickAvailable()
 	if err != nil || chosen != active || factory.count() != 1 {
@@ -177,7 +177,7 @@ func TestWarmCreationReservesBaseBudgetBeforeFactoryReturns(t *testing.T) {
 	picker := newPoolPickerForTest(clock, cfg, factory)
 	active := newBlackholeWorker(t, cfg, 2)
 	addWorkerForTest(t, picker, active, workerActive, clock.Now())
-	active.sessionManager.Allocate(&active.strategy)
+	active.sessionManager.Allocate(&active.strategy, nil, nil)
 	t.Cleanup(func() { unblock.Do(func() { close(release) }); picker.Close() })
 	picker.poolUsed = true
 	picker.requestEnsurePrewarm()

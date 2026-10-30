@@ -46,8 +46,9 @@ func NewCommonConn(conn net.Conn, useAES bool) *CommonConn {
 
 // VisionBuffers exposes the read-ahead owned by this connection so Vision can
 // preserve it when switching from framed reads to direct copy.
-func (c *CommonConn) VisionBuffers() (*bytes.Reader, *bytes.Buffer) {
-	return &c.input, &c.rawInput
+func (c *CommonConn) VisionBuffers() (*bytes.Reader, **bytes.Buffer) {
+	raw := &c.rawInput
+	return &c.input, &raw
 }
 
 func (c *CommonConn) Write(b []byte) (int, error) {

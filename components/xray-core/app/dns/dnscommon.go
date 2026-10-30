@@ -34,11 +34,13 @@ type record struct {
 
 // IPRecord is a cacheable item for a resolved domain
 type IPRecord struct {
-	ReqID     uint16
-	IP        []net.IP
-	Expire    time.Time
-	RCode     dnsmessage.RCode
-	RawHeader *dnsmessage.Header
+	ReqID      uint16
+	IP         []net.IP
+	Expire     time.Time
+	RCode      dnsmessage.RCode
+	RawHeader  *dnsmessage.Header
+	Error      error
+	RetryAfter time.Time
 }
 
 func (r *IPRecord) getIPs() ([]net.IP, int32, error) {
@@ -48,6 +50,9 @@ func (r *IPRecord) getIPs() ([]net.IP, int32, error) {
 
 	untilExpire := time.Until(r.Expire).Seconds()
 	ttl := int32(math.Ceil(untilExpire))
+	if r.Error != nil {
+		return nil, ttl, r.Error
+	}
 
 	if r.RCode != dnsmessage.RCodeSuccess {
 		return nil, ttl, dns_feature.RCodeError(r.RCode)
@@ -188,10 +193,10 @@ func parseResponse(payload []byte) (*IPRecord, error) {
 	var parser dnsmessage.Parser
 	h, err := parser.Start(payload)
 	if err != nil {
-		return nil, errors.New("failed to parse DNS response").Base(err).AtWarning()
+		return nil, errors.New("failed to parse DNS response").Base(err)
 	}
 	if err := parser.SkipAllQuestions(); err != nil {
-		return nil, errors.New("failed to skip questions in DNS response").Base(err).AtWarning()
+		return nil, errors.New("failed to skip questions in DNS response").Base(err)
 	}
 
 	now := time.Now()
@@ -258,7 +263,11 @@ L:
 
 // toDnsContext create a new background context with parent inbound, session and dns log
 func toDnsContext(ctx context.Context, addr string) context.Context {
-	dnsCtx := core.ToBackgroundDetachedContext(ctx)
+	// Standalone resolvers may supply their own dispatcher without a core instance.
+	dnsCtx := context.Background()
+	if core.FromContext(ctx) != nil {
+		dnsCtx = core.ToBackgroundDetachedContext(ctx)
+	}
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		dnsCtx = session.ContextWithInbound(dnsCtx, inbound)
 	}

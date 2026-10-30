@@ -137,7 +137,7 @@ func TestVlessXtlsVisionRealityLocalCoverHTTPS(t *testing.T) {
 					},
 				}),
 				ProxySettings: serial.ToTypedMessage(&inbound.Config{
-					Clients: []*protocol.User{
+					Users: []*protocol.User{
 						{
 							Account: serial.ToTypedMessage(&vless.Account{
 								Id:   userID.String(),
@@ -166,23 +166,21 @@ func TestVlessXtlsVisionRealityLocalCoverHTTPS(t *testing.T) {
 					},
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(net.LocalHostIP),
-					Port:     1,
-					Networks: []net.Network{net.Network_TCP},
+					RewriteAddress:  net.NewIPOrDomain(net.LocalHostIP),
+					RewritePort:     1,
+					AllowedNetworks: []net.Network{net.Network_TCP},
 				}),
 			},
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				Tag: "direct",
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{
-					IpsBlocked: &freedom.IPRules{},
-				}),
+				Tag:           "direct",
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
 			},
 			{
 				Tag: "cover-response",
 				ProxySettings: serial.ToTypedMessage(&blackhole.Config{
-					Response: serial.ToTypedMessage(&blackhole.HTTPResponse{}),
+					Response: &blackhole.Response{Type: "http"},
 				}),
 			},
 		},
@@ -197,9 +195,9 @@ func TestVlessXtlsVisionRealityLocalCoverHTTPS(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(net.LocalHostIP),
-					Port:     originPort,
-					Networks: []net.Network{net.Network_TCP},
+					RewriteAddress:  net.NewIPOrDomain(net.LocalHostIP),
+					RewritePort:     originPort,
+					AllowedNetworks: []net.Network{net.Network_TCP},
 				}),
 			},
 		},

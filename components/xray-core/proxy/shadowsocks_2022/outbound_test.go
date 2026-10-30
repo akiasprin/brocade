@@ -12,6 +12,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -43,7 +44,13 @@ func (d fixedDialer) Dial(context.Context, net.Destination) (stat.Connection, er
 }
 
 func TestOutboundClosesServerOnEarlyPayloadError(t *testing.T) {
-	ctx := session.ContextWithOutbounds(context.Background(), []*session.Outbound{{Target: net.TCPDestination(net.LocalHostIP, 443)}})
+	instance, err := core.New(&core.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Close()
+	ctx := context.WithValue(context.Background(), core.XrayKey(1), instance)
+	ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{Target: net.TCPDestination(net.LocalHostIP, 443)}})
 	outbound, err := NewClient(ctx, &ClientConfig{Address: net.NewIPOrDomain(net.LocalHostIP), Port: 443, Method: "2022-blake3-aes-128-gcm", Key: base64.StdEncoding.EncodeToString(make([]byte, 16))})
 	if err != nil {
 		t.Fatal(err)

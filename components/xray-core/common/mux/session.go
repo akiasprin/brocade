@@ -59,8 +59,8 @@ func (m *SessionManager) Count() int {
 	return int(m.count)
 }
 
-func (m *SessionManager) Allocate(Strategy *ClientStrategy) *Session {
-	return m.allocateLink(Strategy, nil)
+func (m *SessionManager) Allocate(Strategy *ClientStrategy, input buf.Reader, output buf.Writer) *Session {
+	return m.allocateLink(Strategy, &transport.Link{Reader: input, Writer: output})
 }
 
 func (m *SessionManager) allocateLink(Strategy *ClientStrategy, link *transport.Link) *Session {

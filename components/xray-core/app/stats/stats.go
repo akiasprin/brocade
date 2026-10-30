@@ -175,6 +175,11 @@ func (m *Manager) RegisterCounter(name string) (stats.Counter, error) {
 	return m.siteCounter(name, c), nil
 }
 
+// GetOrRegisterCounter implements stats.Manager.
+func (m *Manager) GetOrRegisterCounter(name string) (stats.Counter, error) {
+	return stats.GetOrRegisterCounter(m, name)
+}
+
 // UnregisterCounter implements stats.Manager.
 func (m *Manager) UnregisterCounter(name string) error {
 	m.access.Lock()
@@ -250,6 +255,11 @@ func (m *Manager) RegisterOnlineMap(name string) (stats.OnlineMap, error) {
 	return om, nil
 }
 
+// GetOrRegisterOnlineMap implements stats.Manager.
+func (m *Manager) GetOrRegisterOnlineMap(name string) (stats.OnlineMap, error) {
+	return stats.GetOrRegisterOnlineMap(m, name)
+}
+
 // UnregisterOnlineMap implements stats.Manager.
 func (m *Manager) UnregisterOnlineMap(name string) error {
 	m.access.Lock()
@@ -300,6 +310,11 @@ func (m *Manager) RegisterChannel(name string) (stats.Channel, error) {
 		return c, c.Start()
 	}
 	return c, nil
+}
+
+// GetOrRegisterChannel implements stats.Manager.
+func (m *Manager) GetOrRegisterChannel(name string) (stats.Channel, error) {
+	return stats.GetOrRegisterChannel(m, name)
 }
 
 // UnregisterChannel implements stats.Manager.

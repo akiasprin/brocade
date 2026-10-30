@@ -116,20 +116,6 @@ func (c *ClientSession) EncodeRequestBody(request *protocol.RequestHeader, write
 	}
 
 	switch request.Security {
-	case protocol.SecurityType_NONE:
-		if request.Option.Has(protocol.RequestOptionChunkStream) {
-			if request.Command.TransferType() == protocol.TransferTypeStream {
-				return crypto.NewChunkStreamWriter(sizeParser, writer), nil
-			}
-			auth := &crypto.AEADAuthenticator{
-				AEAD:                    new(NoOpAuthenticator),
-				NonceGenerator:          crypto.GenerateEmptyBytes(),
-				AdditionalDataGenerator: crypto.GenerateEmptyBytes(),
-			}
-			return crypto.NewAuthenticationWriter(auth, sizeParser, writer, protocol.TransferTypePacket, padding), nil
-		}
-
-		return buf.NewWriter(writer), nil
 	case protocol.SecurityType_AES128_GCM:
 		aead := crypto.NewAesGcm(c.requestBodyKey[:])
 		auth := &crypto.AEADAuthenticator{
@@ -223,7 +209,7 @@ func (c *ClientSession) DecodeResponseHeader(reader io.Reader) (*protocol.Respon
 	defer buffer.Release()
 
 	if _, err := buffer.ReadFullFrom(c.responseReader, 4); err != nil {
-		return nil, errors.New("failed to read response header").Base(err).AtWarning()
+		return nil, errors.New("failed to read response header").Base(err)
 	}
 
 	if buffer.Byte(0) != c.responseHeader {
@@ -267,22 +253,6 @@ func (c *ClientSession) DecodeResponseBody(request *protocol.RequestHeader, read
 	}
 
 	switch request.Security {
-	case protocol.SecurityType_NONE:
-		if request.Option.Has(protocol.RequestOptionChunkStream) {
-			if request.Command.TransferType() == protocol.TransferTypeStream {
-				return crypto.NewChunkStreamReader(sizeParser, reader), nil
-			}
-
-			auth := &crypto.AEADAuthenticator{
-				AEAD:                    new(NoOpAuthenticator),
-				NonceGenerator:          crypto.GenerateEmptyBytes(),
-				AdditionalDataGenerator: crypto.GenerateEmptyBytes(),
-			}
-
-			return crypto.NewAuthenticationReader(auth, sizeParser, reader, protocol.TransferTypePacket, padding), nil
-		}
-
-		return buf.NewReader(reader), nil
 	case protocol.SecurityType_AES128_GCM:
 		aead := crypto.NewAesGcm(c.responseBodyKey[:])
 

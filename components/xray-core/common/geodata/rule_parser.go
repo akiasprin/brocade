@@ -172,7 +172,7 @@ func ParseDomainRule(r string, defaultType Domain_Type) (*DomainRule, error) {
 	}
 
 	prefix := 0
-	for _, ext := range [...]string{"ext:", "ext-domain:"} {
+	for _, ext := range [...]string{"ext:", "ext-domain:", "ext-site:"} {
 		if strings.HasPrefix(r, ext) {
 			prefix = len(ext)
 			break
@@ -201,7 +201,7 @@ func ParseDomainRules(rules []string, defaultType Domain_Type) ([]*DomainRule, e
 		}
 
 		prefix := 0
-		for _, ext := range [...]string{"ext:", "ext-domain:"} {
+		for _, ext := range [...]string{"ext:", "ext-domain:", "ext-site:"} {
 			if strings.HasPrefix(r, ext) {
 				prefix = len(ext)
 				break

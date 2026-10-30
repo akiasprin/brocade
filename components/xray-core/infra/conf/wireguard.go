@@ -3,9 +3,13 @@ package conf
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"strconv"
 	"strings"
 
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/proxy/wireguard"
 	"google.golang.org/protobuf/proto"
 )
@@ -16,9 +20,12 @@ type WireGuardPeerConfig struct {
 	Endpoint     string   `json:"endpoint"`
 	KeepAlive    uint32   `json:"keepAlive"`
 	AllowedIPs   []string `json:"allowedIPs,omitempty"`
+
+	Level uint32 `json:"level"`
+	Email string `json:"email"`
 }
 
-func (c *WireGuardPeerConfig) Build() (proto.Message, error) {
+func (c *WireGuardPeerConfig) Build() (*wireguard.PeerConfig, error) {
 	var err error
 	config := new(wireguard.PeerConfig)
 
@@ -37,8 +44,9 @@ func (c *WireGuardPeerConfig) Build() (proto.Message, error) {
 	}
 
 	config.Endpoint = c.Endpoint
-	// default 0
-	config.KeepAlive = c.KeepAlive
+	if c.KeepAlive != 0 {
+		config.KeepAlive = strconv.FormatUint(uint64(c.KeepAlive), 10)
+	}
 	if c.AllowedIPs == nil {
 		config.AllowedIps = []string{"0.0.0.0/0", "::0/0"}
 	} else {
@@ -51,14 +59,13 @@ func (c *WireGuardPeerConfig) Build() (proto.Message, error) {
 type WireGuardConfig struct {
 	IsClient bool `json:""`
 
-	NoKernelTun    bool                   `json:"noKernelTun"`
-	SecretKey      string                 `json:"secretKey"`
-	Address        []string               `json:"address"`
-	Peers          []*WireGuardPeerConfig `json:"peers"`
-	MTU            int32                  `json:"mtu"`
-	NumWorkers     int32                  `json:"workers"`
-	Reserved       []byte                 `json:"reserved"`
-	DomainStrategy string                 `json:"domainStrategy"`
+	NoKernelTun bool                   `json:"noKernelTun"`
+	SecretKey   string                 `json:"secretKey"`
+	Address     []string               `json:"address"`
+	Peers       []*WireGuardPeerConfig `json:"peers"`
+	MTU         int32                  `json:"mtu"`
+	Reserved    []byte                 `json:"reserved"`
+	DNS         []string               `json:"remoteDNS"`
 }
 
 func (c *WireGuardConfig) Build() (proto.Message, error) {
@@ -77,14 +84,32 @@ func (c *WireGuardConfig) Build() (proto.Message, error) {
 		config.Endpoint = c.Address
 	}
 
-	if c.Peers != nil {
+	if c.IsClient {
 		config.Peers = make([]*wireguard.PeerConfig, len(c.Peers))
 		for i, p := range c.Peers {
 			msg, err := p.Build()
 			if err != nil {
 				return nil, err
 			}
-			config.Peers[i] = msg.(*wireguard.PeerConfig)
+			config.Peers[i] = msg
+		}
+	} else {
+		config.Users = make([]*protocol.User, len(c.Peers))
+		processUser := func(idx int) error {
+			p := c.Peers[idx]
+			m, err := p.Build()
+			if err != nil {
+				return err
+			}
+			config.Users[idx] = &protocol.User{
+				Email:   p.Email,
+				Level:   p.Level,
+				Account: serial.ToTypedMessage(m),
+			}
+			return nil
+		}
+		if err := task.ParallelForN(len(c.Peers), processUser); err != nil {
+			return nil, err
 		}
 	}
 
@@ -93,32 +118,15 @@ func (c *WireGuardConfig) Build() (proto.Message, error) {
 	} else {
 		config.Mtu = c.MTU
 	}
-	// these a fallback code exists in wireguard-go code,
-	// we don't need to process fallback manually
-	config.NumWorkers = c.NumWorkers
 
 	if len(c.Reserved) != 0 && len(c.Reserved) != 3 {
 		return nil, errors.New(`"reserved" should be empty or 3 bytes`)
 	}
 	config.Reserved = c.Reserved
 
-	switch strings.ToLower(c.DomainStrategy) {
-	case "forceip", "":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP
-	case "forceipv4":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP4
-	case "forceipv6":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP6
-	case "forceipv4v6":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP46
-	case "forceipv6v4":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP64
-	default:
-		return nil, errors.New("unsupported domain strategy: ", c.DomainStrategy)
-	}
-
 	config.IsClient = c.IsClient
 	config.NoKernelTun = c.NoKernelTun
+	config.DNS = c.DNS
 
 	return config, nil
 }

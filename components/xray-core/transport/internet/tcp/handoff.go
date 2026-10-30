@@ -29,31 +29,55 @@ func ListenHandoffControl(ctx context.Context, address string) (net.Listener, er
 	if err != nil || gate == nil {
 		return listener, err
 	}
-	return &handoffControlListener{Listener: listener, gate: gate}, nil
+	return &handoffStreamListener{Listener: listener, gate: gate}, nil
 }
 
-type handoffControlListener struct {
+// ListenHandoffTransport preserves raw TCP connections for an HTTP transport.
+// Its serving goroutine must call FinishHandoffConnection after the connection
+// and its requests have finished; control listeners do not take this pin.
+func ListenHandoffTransport(ctx context.Context, address string, config *internet.SocketConfig) (net.Listener, error) {
+	addr, err := net.ResolveTCPAddr("tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	listener, gate, err := openHandoffListener(addr.String(), false, config, func() (net.Listener, error) {
+		return internet.ListenSystem(ctx, addr, config)
+	})
+	if err != nil || gate == nil {
+		return listener, err
+	}
+	return &handoffStreamListener{Listener: listener, gate: gate, business: true}, nil
+}
+
+type handoffStreamListener struct {
 	net.Listener
-	gate handoffGate
+	gate     handoffGate
+	business bool
 }
 
-func (l *handoffControlListener) Accept() (net.Conn, error) {
+func (l *handoffStreamListener) Accept() (net.Conn, error) {
 	for {
 		if !l.gate.beforeAccept() {
 			return nil, net.ErrClosed
 		}
 		conn, err := l.Listener.Accept()
-		// Control sockets are excluded from active business counters. Complete the accept barrier
-		// without registering a proxyman lifetime pin (HTTP/gRPC does not run through proxyman).
-		l.gate.afterAccept(false)
+		l.gate.afterAccept(err == nil && l.business)
 		if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
 			continue
+		}
+		if err == nil && l.business {
+			if err := l.gate.prepareConnection(conn); err != nil {
+				_ = conn.Close()
+				l.gate.finishConnection()
+				return nil, err
+			}
+			l.gate.trackConnection(conn)
 		}
 		return conn, err
 	}
 }
 
-func (l *handoffControlListener) Close() error {
+func (l *handoffStreamListener) Close() error {
 	l.gate.close()
 	return l.Listener.Close()
 }

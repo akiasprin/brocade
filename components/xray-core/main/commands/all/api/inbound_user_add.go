@@ -12,6 +12,8 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/infra/conf"
 	"github.com/xtls/xray-core/infra/conf/serial"
+	"github.com/xtls/xray-core/proxy/hysteria"
+	"github.com/xtls/xray-core/proxy/masque"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
 	"github.com/xtls/xray-core/proxy/shadowsocks_2022"
 	"github.com/xtls/xray-core/proxy/trojan"
@@ -62,7 +64,8 @@ func addInboundUserAction(ctx context.Context, client handlerService.HandlerServ
 		Operation: cserial.ToTypedMessage(
 			&handlerService.AddUserOperation{
 				User: user,
-			}),
+			},
+		),
 	})
 	return err
 }
@@ -80,12 +83,16 @@ func extractInboundUsers(inb *core.InboundHandlerConfig) []*protocol.User {
 	case *vmessin.Config:
 		return ty.User
 	case *vlessin.Config:
-		return ty.Clients
+		return ty.Users
 	case *trojan.ServerConfig:
 		return ty.Users
 	case *shadowsocks.ServerConfig:
 		return ty.Users
 	case *shadowsocks_2022.MultiUserServerConfig:
+		return ty.Users
+	case *masque.ServerConfig:
+		return ty.Users
+	case *hysteria.ServerConfig:
 		return ty.Users
 	default:
 		fmt.Println("unsupported inbound type")

@@ -115,11 +115,7 @@ Start:
 
 	request, err := http.ReadRequest(reader)
 	if err != nil {
-		trace := errors.New("failed to read http request").Base(err)
-		if errors.Cause(err) != io.EOF && !isTimeout(errors.Cause(err)) {
-			trace.AtWarning()
-		}
-		return trace
+		return errors.New("failed to read http request").Base(err)
 	}
 
 	if len(s.config.Accounts) > 0 {
@@ -147,7 +143,7 @@ Start:
 	}
 	dest, err := http_proto.ParseHost(host, defaultPort)
 	if err != nil {
-		return errors.New("malformed proxy host: ", host).AtWarning().Base(err)
+		return errors.New("malformed proxy host: ", host).Base(err)
 	}
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 		From:   conn.RemoteAddr(),
@@ -258,7 +254,7 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 		requestWriter := buf.NewBufferedWriter(link.Writer)
 		common.Must(requestWriter.SetBuffered(false))
 		if err := request.Write(requestWriter); err != nil {
-			return errors.New("failed to write whole request").Base(err).AtWarning()
+			return errors.New("failed to write whole request").Base(err)
 		}
 		return nil
 	}
@@ -295,7 +291,7 @@ func (s *Server) handlePlainHTTP(ctx context.Context, request *http.Request, wri
 			response.Header.Set("Proxy-Connection", "close")
 		}
 		if err := response.Write(writer); err != nil {
-			return errors.New("failed to write response").Base(err).AtWarning()
+			return errors.New("failed to write response").Base(err)
 		}
 		return nil
 	}
@@ -328,7 +324,7 @@ func readResponseAndHandle100Continue(r *bufio.Reader, req *http.Request, writer
 					return nil, errors.New("failed to read http 1xx response").Base(err)
 				}
 				ResponseHeader1xx = append(ResponseHeader1xx, data...)
-				if bytes.Equal(ResponseHeader1xx[len(ResponseHeader1xx)-4:], []byte{'\r', '\n', '\r', '\n'}) {
+				if len(ResponseHeader1xx) >= 4 && bytes.Equal(ResponseHeader1xx[len(ResponseHeader1xx)-4:], []byte{'\r', '\n', '\r', '\n'}) {
 					break
 				}
 				if len(ResponseHeader1xx) > 1024 {

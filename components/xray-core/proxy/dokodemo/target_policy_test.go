@@ -57,7 +57,7 @@ func TestForwardingPolicyStopsTheLoopbackManagementAPIAttack(t *testing.T) {
 	for _, host := range []string{"127.0.0.1", "localhost", "::ffff:127.0.0.1"} {
 		t.Run(host, func(t *testing.T) {
 			port := freePolicyPort(t)
-			proxy := &dokodemo.Config{Address: xnet.NewIPOrDomain(xnet.ParseAddress(host)), Port: apiPort, Networks: []xnet.Network{xnet.Network_TCP}}
+			proxy := &dokodemo.Config{RewriteAddress: xnet.NewIPOrDomain(xnet.ParseAddress(host)), RewritePort: apiPort, AllowedNetworks: []xnet.Network{xnet.Network_TCP}}
 			receiver := &proxyman.ReceiverConfig{PortList: &xnet.PortList{Range: []*xnet.PortRange{{From: port, To: port}}}, Listen: xnet.NewIPOrDomain(xnet.LocalHostIP)}
 			inbound := &core.InboundHandlerConfig{Tag: fmt.Sprintf("fwd:%d", port), ReceiverSettings: serial.ToTypedMessage(receiver), ProxySettings: serial.ToTypedMessage(proxy)}
 			if _, err := client.AddInbound(ctx, &command.AddInboundRequest{Inbound: inbound}); err == nil {
@@ -91,7 +91,7 @@ func TestForwardingPolicyStopsTheLoopbackManagementAPIAttack(t *testing.T) {
 		}
 		defer target.Close()
 		port := freePolicyPort(t)
-		proxy := &dokodemo.Config{Address: xnet.NewIPOrDomain(xnet.DomainAddress("localhost")), Port: uint32(target.LocalAddr().(*net.UDPAddr).Port), Networks: []xnet.Network{xnet.Network_UDP}, ForwardingTargetPolicy: &dokodemo.ForwardingTargetPolicy{BlockedCidrs: []string{"127.0.0.0/8", "::1/128"}}}
+		proxy := &dokodemo.Config{RewriteAddress: xnet.NewIPOrDomain(xnet.DomainAddress("localhost")), RewritePort: uint32(target.LocalAddr().(*net.UDPAddr).Port), AllowedNetworks: []xnet.Network{xnet.Network_UDP}, ForwardingTargetPolicy: &dokodemo.ForwardingTargetPolicy{BlockedCidrs: []string{"127.0.0.0/8", "::1/128"}}}
 		receiver := &proxyman.ReceiverConfig{PortList: &xnet.PortList{Range: []*xnet.PortRange{{From: port, To: port}}}, Listen: xnet.NewIPOrDomain(xnet.LocalHostIP)}
 		_, err = client.AddInbound(ctx, &command.AddInboundRequest{Inbound: &core.InboundHandlerConfig{Tag: fmt.Sprintf("fwd:%d", port), ReceiverSettings: serial.ToTypedMessage(receiver), ProxySettings: serial.ToTypedMessage(&dokodemo.ForwardingConfig{Config: proxy})}})
 		if err != nil {

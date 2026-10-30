@@ -56,8 +56,68 @@ func TestReverseConfirmedFailureDrainsActiveRequestsByDefault(t *testing.T) {
 	h.mu.Lock()
 	h.checkLocked(now.Add(2 * time.Second))
 	h.mu.Unlock()
+	if h.done.Done() {
+		t.Fatal("empty session map closed the carrier before its ordered drain fence")
+	}
+	h.mu.Lock()
+	h.checkLocked(now.Add(13 * time.Second))
+	h.mu.Unlock()
 	if !h.done.Done() || h.snapshot.State != "DEAD" {
 		t.Fatalf("idle draining worker was not reclaimed: %+v", h.snapshot)
+	}
+}
+
+func TestReverseDrainWaitsForFreshPongAfterFinalFrames(t *testing.T) {
+	h := healthForTest(t)
+	idle := false
+	h.config.DrainIdle = func() bool { return idle }
+	h.ownValidated, h.peerValidated = true, true
+	h.Drain()
+	h.mu.Lock()
+	h.checkLocked(time.Now())
+	h.mu.Unlock()
+	if h.done.Done() || h.drainProbeID != 0 {
+		t.Fatal("drain did not retain a session's pending End write")
+	}
+	idle = true
+	h.mu.Lock()
+	h.checkLocked(time.Now())
+	id := h.drainProbeID
+	h.mu.Unlock()
+	if id == 0 || h.done.Done() {
+		t.Fatal("no ordered probe was sent before closing the idle carrier")
+	}
+	if err := h.receive(&FrameMetadata{Option: OptionProbe | OptionAck, ProbeID: id - 1}); err != nil {
+		t.Fatal(err)
+	}
+	if h.done.Done() {
+		t.Fatal("a previous Pong acknowledged later buffered business frames")
+	}
+	if err := h.receive(&FrameMetadata{Option: OptionProbe | OptionAck, ProbeID: id}); err != nil {
+		t.Fatal(err)
+	}
+	if !h.done.Done() || h.snapshot.Reason != "drain_complete" {
+		t.Fatal("matching ordered drain fence did not reclaim the carrier")
+	}
+}
+
+func TestReverseConfirmedIdleFailureFencesBufferedTail(t *testing.T) {
+	h := healthForTest(t)
+	h.config.ActiveSessions = func() uint32 { return 0 }
+	h.config.DrainIdle = func() bool { return true }
+	h.mu.Lock()
+	h.failHealthLocked("confirmation_timeout")
+	h.checkLocked(time.Now())
+	id := h.drainProbeID
+	h.mu.Unlock()
+	if h.done.Done() || h.snapshot.State != "DRAINING" || id == 0 {
+		t.Fatal("health timeout aborted the buffered tail of an apparently idle worker")
+	}
+	if err := h.receive(&FrameMetadata{Option: OptionProbe | OptionAck, ProbeID: id}); err != nil {
+		t.Fatal(err)
+	}
+	if !h.done.Done() {
+		t.Fatal("idle worker survived its confirmed drain fence")
 	}
 }
 func TestReverseConfirmedFailureCanDisconnectActiveRequests(t *testing.T) {

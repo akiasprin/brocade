@@ -5,8 +5,6 @@ import (
 	"context"
 	go_errors "errors"
 	"fmt"
-	"os"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -17,6 +15,7 @@ import (
 	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/features/dns"
 )
 
@@ -33,6 +32,7 @@ type DNS struct {
 	domainMatcher          geodata.DomainMatcher
 	matcherInfos           []*DomainMatcherInfo
 	checkSystem            bool
+	script                 *scriptEngine
 }
 
 // DomainMatcherInfo contains information attached to index returned by Server.domainMatcher.
@@ -88,7 +88,7 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		return nil, errors.New("failed to create hosts").Base(err)
 	}
 
-	var defaultTag = config.Tag
+	defaultTag := config.Tag
 	if len(config.Tag) == 0 {
 		defaultTag = generateRandomTag()
 	}
@@ -141,7 +141,7 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 			serveExpiredTTL = *ns.ServeExpiredTTL
 		}
 
-		var tag = defaultTag
+		tag := defaultTag
 		if len(ns.Tag) > 0 {
 			tag = ns.Tag
 		}
@@ -171,6 +171,13 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		clients = append(clients, NewLocalDNSClient(ipOption))
 	}
 
+	var script *scriptEngine
+	if config.Script != "" {
+		if script, err = newScriptEngine(config.Script); err != nil {
+			return nil, errors.New("failed to prepare DNS script").Base(err)
+		}
+	}
+
 	return &DNS{
 		hosts:                  hosts,
 		ipOption:               &ipOption,
@@ -182,6 +189,7 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		disableFallbackIfMatch: config.DisableFallbackIfMatch,
 		enableParallelQuery:    config.EnableParallelQuery,
 		checkSystem:            checkSystem,
+		script:                 script,
 	}, nil
 }
 
@@ -192,11 +200,19 @@ func (*DNS) Type() interface{} {
 
 // Start implements common.Runnable.
 func (s *DNS) Start() error {
+	if s.script != nil {
+		if err := s.script.start(s); err != nil {
+			return errors.New("failed to initialize DNS script").Base(err)
+		}
+	}
 	return nil
 }
 
 // Close implements common.Closable.
 func (s *DNS) Close() error {
+	if s.script != nil {
+		s.script.close()
+	}
 	return nil
 }
 
@@ -214,6 +230,28 @@ func (s *DNS) IsOwnLink(ctx context.Context) bool {
 	return false
 }
 
+// MayUseSystemResolver reports whether any name server configured here could
+// still resolve through the system resolver. That is what happens when no name
+// server is configured at all, and it is also what a name server pointed at
+// "localhost" does. Callers that are about to redirect the system resolver need
+// to know, because a resolution path that reaches it would then loop back to
+// them.
+//
+// Any such server is enough: name servers can be selected per domain, so a
+// single local one makes some query reach the system resolver even when
+// independent upstreams are configured alongside it.
+func (s *DNS) MayUseSystemResolver() bool {
+	if len(s.clients) == 0 {
+		return true
+	}
+	for _, client := range s.clients {
+		if _, isLocal := client.server.(*LocalNameServer); isLocal {
+			return true
+		}
+	}
+	return false
+}
+
 // LookupIP implements dns.Client.
 func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	// Normalize the FQDN form query
@@ -223,7 +261,7 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 	}
 
 	if s.checkSystem {
-		supportIPv4, supportIPv6 := checkRoutes()
+		supportIPv4, supportIPv6 := utils.CheckRoutes()
 		option.IPv4Enable = option.IPv4Enable && supportIPv4
 		option.IPv6Enable = option.IPv6Enable && supportIPv6
 	} else {
@@ -232,12 +270,18 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 	}
 
 	if !option.IPv4Enable && !option.IPv6Enable {
+		staticTrace(option.Trace, domain, "xray.strategy", "empty")
 		return nil, 0, dns.ErrEmptyResponse
 	}
 
 	// Static host lookup
 	switch addrs, err := s.hosts.Lookup(domain, option); {
 	case err != nil:
+		outcome := "error"
+		if go_errors.Is(err, dns.ErrEmptyResponse) {
+			outcome = "empty"
+		}
+		staticTrace(option.Trace, domain, "xray.hosts", outcome)
 		if go_errors.Is(err, dns.ErrEmptyResponse) {
 			return nil, 0, dns.ErrEmptyResponse
 		}
@@ -245,6 +289,7 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 	case addrs == nil: // Domain not recorded in static host
 		break
 	case len(addrs) == 0: // Domain recorded, but no valid IP returned (e.g. IPv4 address with only IPv6 enabled)
+		staticTrace(option.Trace, domain, "xray.hosts", "empty")
 		return nil, 0, dns.ErrEmptyResponse
 	case len(addrs) == 1 && addrs[0].Family().IsDomain(): // Domain replacement
 		errors.LogInfo(s.ctx, "domain replaced: ", domain, " -> ", addrs[0].Domain())
@@ -255,15 +300,32 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 		if err != nil {
 			return nil, 0, err
 		}
+		staticTrace(option.Trace, domain, "xray.hosts", "answer")
 		return ips, 10, nil // Hosts ttl is 10
 	}
 
 	// Name servers lookup
+	if option.Trace != nil {
+		option.Trace.Domain = domain
+	}
+	if s.script != nil {
+		return s.script.query(domain, option)
+	}
 	if s.enableParallelQuery {
 		return s.parallelQuery(domain, option)
 	} else {
 		return s.serialQuery(domain, option)
 	}
+}
+
+func staticTrace(trace *dns.LookupTrace, domain, tag, outcome string) {
+	if trace == nil {
+		return
+	}
+	trace.Version = 1
+	trace.Complete = true
+	trace.Domain = domain
+	trace.Steps = []dns.LookupTraceStep{{Tag: tag, Outcome: outcome}}
 }
 
 func (s *DNS) sortClients(domain string) []*Client {
@@ -364,13 +426,29 @@ func mergeQueryErrors(domain string, errs []error) error {
 
 func (s *DNS) serialQuery(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	var errs []error
+	trace := option.Trace
+	option.Trace = nil
+	ctx := s.ctx
+	if option.Context != nil {
+		ctx = option.Context
+	}
+	if trace != nil {
+		trace.Version = 1
+		trace.Complete = true
+	}
 	for _, client := range s.sortClients(domain) {
 		if !option.FakeEnable && strings.EqualFold(client.Name(), "FakeDNS") {
 			errors.LogDebug(s.ctx, "skip DNS resolution for domain ", domain, " at server ", client.Name())
 			continue
 		}
 
-		ips, ttl, err := client.QueryIP(s.ctx, domain, option)
+		result := client.query(ctx, domain, option, trace != nil)
+		ips, ttl, err := result.ips, result.ttl, result.err
+		winner := -1
+		if len(ips) > 0 {
+			winner = 0
+		}
+		appendGroupTrace(trace, []*Client{client}, []*queryResult{&result}, group{0, 0}, winner)
 
 		if len(ips) > 0 {
 			return ips, ttl, nil
@@ -388,8 +466,17 @@ func (s *DNS) serialQuery(domain string, option dns.IPOption) ([]net.IP, uint32,
 func (s *DNS) parallelQuery(domain string, option dns.IPOption) ([]net.IP, uint32, error) {
 	var errs []error
 	clients := s.sortClients(domain)
+	trace := option.Trace
+	option.Trace = nil
+	if trace != nil {
+		trace.Version, trace.Complete = 1, true
+	}
 
-	resultsChan := asyncQueryAll(domain, option, clients, s.ctx)
+	ctx := s.ctx
+	if option.Context != nil {
+		ctx = option.Context
+	}
+	resultsChan := asyncQueryAll(domain, option, clients, ctx, trace != nil)
 
 	groups, groupOf := makeGroups( /*s.ctx,*/ clients)
 	results := make([]*queryResult, len(clients))
@@ -410,11 +497,17 @@ func (s *DNS) parallelQuery(domain string, option dns.IPOption) ([]net.IP, uint3
 			g := groups[nextGroup]
 
 			// group race, minimum rtt -> return
+			winner := -1
 			for j := g.start; j <= g.end; j++ {
 				r := results[j]
-				if r != nil && r.err == nil && len(r.ips) > 0 {
-					return r.ips, r.ttl, nil
+				if r != nil && r.err == nil && len(r.ips) > 0 && (winner < 0 || r.finished.Before(results[winner].finished)) {
+					winner = j
 				}
+			}
+			if winner >= 0 {
+				appendGroupTrace(trace, clients, results, g, winner)
+				r := results[winner]
+				return r.ips, r.ttl, nil
 			}
 
 			// current group is incomplete and no one success -> continue pending
@@ -423,6 +516,7 @@ func (s *DNS) parallelQuery(domain string, option dns.IPOption) ([]net.IP, uint3
 			}
 
 			// all failed -> log and continue next group
+			appendGroupTrace(trace, clients, results, g, -1)
 			for j := g.start; j <= g.end; j++ {
 				r := results[j]
 				e := r.err
@@ -440,13 +534,18 @@ func (s *DNS) parallelQuery(domain string, option dns.IPOption) ([]net.IP, uint3
 }
 
 type queryResult struct {
-	ips   []net.IP
-	ttl   uint32
-	err   error
-	index int
+	ips      []net.IP
+	ttl      uint32
+	err      error
+	index    int
+	other    bool
+	attempts uint32
+	elapsed  uint32
+	cache    uint32
+	finished time.Time
 }
 
-func asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx context.Context) chan queryResult {
+func asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx context.Context, trace bool) chan queryResult {
 	if len(clients) == 0 {
 		ch := make(chan queryResult)
 		close(ch)
@@ -462,14 +561,9 @@ func asyncQueryAll(domain string, option dns.IPOption, clients []*Client, ctx co
 		}
 
 		go func(i int, c *Client) {
-			qctx := ctx
-			if !c.server.IsDisableCache() {
-				nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.timeoutMs*2)
-				qctx = nctx
-				defer cancel()
-			}
-			ips, ttl, err := c.QueryIP(qctx, domain, option)
-			ch <- queryResult{ips: ips, ttl: ttl, err: err, index: i}
+			result := c.query(ctx, domain, option, trace)
+			result.index = i
+			ch <- result
 		}(i, client)
 	}
 	return ch
@@ -538,68 +632,4 @@ func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		return New(ctx, config.(*Config))
 	}))
-}
-
-func probeRoutes() (ipv4 bool, ipv6 bool) {
-	if conn, err := net.Dial("udp4", "192.33.4.12:53"); err == nil {
-		ipv4 = true
-		conn.Close()
-	}
-	if conn, err := net.Dial("udp6", "[2001:500:2::c]:53"); err == nil {
-		ipv6 = true
-		conn.Close()
-	}
-	return
-}
-
-var routeCache struct {
-	sync.Once
-	sync.RWMutex
-	expire     time.Time
-	ipv4, ipv6 bool
-}
-
-func checkRoutes() (bool, bool) {
-	if !isGUIPlatform {
-		routeCache.Once.Do(func() {
-			routeCache.ipv4, routeCache.ipv6 = probeRoutes()
-		})
-		return routeCache.ipv4, routeCache.ipv6
-	}
-
-	routeCache.RWMutex.RLock()
-	now := time.Now()
-	if routeCache.expire.After(now) {
-		routeCache.RWMutex.RUnlock()
-		return routeCache.ipv4, routeCache.ipv6
-	}
-	routeCache.RWMutex.RUnlock()
-
-	routeCache.RWMutex.Lock()
-	defer routeCache.RWMutex.Unlock()
-
-	now = time.Now()
-	if routeCache.expire.After(now) { // double-check
-		return routeCache.ipv4, routeCache.ipv6
-	}
-	routeCache.ipv4, routeCache.ipv6 = probeRoutes()    // ~2ms
-	routeCache.expire = now.Add(100 * time.Millisecond) // ttl
-	return routeCache.ipv4, routeCache.ipv6
-}
-
-var isGUIPlatform = detectGUIPlatform()
-
-func detectGUIPlatform() bool {
-	switch runtime.GOOS {
-	case "android", "ios", "windows", "darwin":
-		return true
-	case "linux", "freebsd", "openbsd":
-		if t := os.Getenv("XDG_SESSION_TYPE"); t == "wayland" || t == "x11" {
-			return true
-		}
-		if os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != "" {
-			return true
-		}
-	}
-	return false
 }

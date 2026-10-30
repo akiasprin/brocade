@@ -186,10 +186,10 @@ func (p *framedFastPathPolicy) ForLevel(uint32) policy.Session { return p.sessio
 func (*framedFastPathPolicy) ForSystem() policy.System { return policy.System{} }
 
 func TestFramedDownlinkFastPathRunsAfterFreedomDNSAndPreservesCounters(t *testing.T) {
-	previousUseSplice := useSplice
-	useSplice = true
+	previousUseSplice := useSplice.Load()
+	useSplice.Store(true)
 	t.Cleanup(func() {
-		useSplice = previousUseSplice
+		useSplice.Store(previousUseSplice)
 		internet.InitSystemDialer(nil, nil)
 	})
 
@@ -265,7 +265,6 @@ func TestFramedDownlinkFastPathRunsAfterFreedomDNSAndPreservesCounters(t *testin
 				policyManager: policy.DefaultManager{},
 				config: &Config{
 					DomainStrategy: test.strategy,
-					IpsBlocked:     &IPRules{},
 				},
 			}
 			if err := handler.Process(ctx, link, dialer); err != nil {
@@ -311,9 +310,9 @@ func TestFramedDownlinkFastPathRunsAfterFreedomDNSAndPreservesCounters(t *testin
 }
 
 func TestFramedDownlinkFastPathFallsBackForOpaqueOutbound(t *testing.T) {
-	previousUseSplice := useSplice
-	useSplice = true
-	t.Cleanup(func() { useSplice = previousUseSplice })
+	previousUseSplice := useSplice.Load()
+	useSplice.Store(true)
+	t.Cleanup(func() { useSplice.Store(previousUseSplice) })
 
 	originConn, originPeer := freedomTCPConnPair(t)
 	defer originConn.Close()
@@ -345,7 +344,7 @@ func TestFramedDownlinkFastPathFallsBackForOpaqueOutbound(t *testing.T) {
 
 	handler := &Handler{
 		policyManager: policy.DefaultManager{},
-		config:        &Config{IpsBlocked: &IPRules{}},
+		config:        &Config{},
 	}
 	if err := handler.Process(ctx, link, dialer); err != nil {
 		t.Fatal(err)
@@ -362,9 +361,9 @@ func TestFramedDownlinkFastPathFallsBackForOpaqueOutbound(t *testing.T) {
 }
 
 func TestFramedDownlinkFastPathRefreshesInactivityTimer(t *testing.T) {
-	previousUseSplice := useSplice
-	useSplice = true
-	t.Cleanup(func() { useSplice = previousUseSplice })
+	previousUseSplice := useSplice.Load()
+	useSplice.Store(true)
+	t.Cleanup(func() { useSplice.Store(previousUseSplice) })
 
 	originConn, originPeer := freedomTCPConnPair(t)
 	defer originConn.Close()
@@ -393,7 +392,7 @@ func TestFramedDownlinkFastPathRefreshesInactivityTimer(t *testing.T) {
 	}}
 	handler := &Handler{
 		policyManager: policyManager,
-		config:        &Config{IpsBlocked: &IPRules{}},
+		config:        &Config{},
 	}
 	if err := handler.Process(ctx, link, dialer); err != nil {
 		t.Fatalf("fast path expired while callbacks were reporting activity: %v", err)

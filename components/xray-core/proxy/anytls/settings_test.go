@@ -55,7 +55,7 @@ func TestParseSettingsDefaultsAndVersionHandling(t *testing.T) {
 
 func TestClientMetadataContainsBrocadeBuildIdentity(t *testing.T) {
 	metadata := clientMetadata()
-	if !strings.HasPrefix(metadata, "brocade-xray/26.4.25+") {
+	if !strings.HasPrefix(metadata, "brocade-xray/26.10.21+") {
 		t.Fatalf("metadata = %q, missing version/build prefix", metadata)
 	}
 }

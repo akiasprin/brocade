@@ -1,6 +1,8 @@
 package account
 
 import (
+	"github.com/google/uuid"
+	"github.com/xtls/xray-core/common/net"
 	"sync"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -10,13 +12,17 @@ import (
 )
 
 func (a *Account) AsAccount() (protocol.Account, error) {
-	return &MemoryAccount{
-		Auth: a.Auth,
-	}, nil
+	var vr net.Port
+	if id, err := uuid.Parse(a.Auth); err == nil {
+		vr = net.PortFromBytes(id[6:8])
+	}
+	return &MemoryAccount{Auth: a.Auth, VR: vr}, nil
 }
 
 type MemoryAccount struct {
-	Auth string
+	Auth   string
+	VR     net.Port
+	source *protocol.MemoryUser
 }
 
 func (a *MemoryAccount) Equals(another protocol.Account) bool {
@@ -35,6 +41,7 @@ func (a *MemoryAccount) ToProto() proto.Message {
 type Validator struct {
 	emails map[string]struct{}
 	users  map[string]*protocol.MemoryUser
+	ids    map[uuid.UUID]*protocol.MemoryUser
 
 	mutex    sync.Mutex
 	sessions protocol.UserSessions
@@ -45,6 +52,7 @@ func NewValidator() *Validator {
 	return &Validator{
 		emails: make(map[string]struct{}),
 		users:  make(map[string]*protocol.MemoryUser),
+		ids:    make(map[uuid.UUID]*protocol.MemoryUser),
 	}
 }
 
@@ -56,6 +64,13 @@ func (v *Validator) Add(u *protocol.MemoryUser) error {
 		return errors.New("Hysteria authentication already exists")
 	}
 
+	id, uuidErr := uuid.Parse(u.Account.(*MemoryAccount).Auth)
+	if uuidErr == nil {
+		id[6], id[7] = 0, 0
+		if _, exists := v.ids[id]; exists {
+			return errors.New("Hysteria authentication identifier already exists")
+		}
+	}
 	if u.Email != "" {
 		if _, ok := v.emails[u.Email]; ok {
 			return errors.New("User ", u.Email, " already exists.")
@@ -63,6 +78,9 @@ func (v *Validator) Add(u *protocol.MemoryUser) error {
 		v.emails[u.Email] = struct{}{}
 	}
 	v.users[u.Account.(*MemoryAccount).Auth] = u
+	if uuidErr == nil {
+		v.ids[id] = u
+	}
 	v.managed = true
 
 	return nil
@@ -92,6 +110,10 @@ func (v *Validator) Del(email string) error {
 	for key, user := range v.users {
 		if user.Email == email {
 			delete(v.users, key)
+			if id, err := uuid.Parse(key); err == nil {
+				id[6], id[7] = 0, 0
+				delete(v.ids, id)
+			}
 			removed = user
 			break
 		}
@@ -103,17 +125,49 @@ func (v *Validator) Del(email string) error {
 }
 
 func (v *Validator) RegisterConnection(user *protocol.MemoryUser, close func()) (func(), bool) {
-	return v.sessions.Register(user, func() bool {
-		return v.Get(user.Account.(*MemoryAccount).Auth) == user
+	account := user.Account.(*MemoryAccount)
+	canonical := user
+	if account.source != nil {
+		canonical = account.source
+	}
+	return v.sessions.Register(canonical, func() bool {
+		v.mutex.Lock()
+		defer v.mutex.Unlock()
+		return v.findAuthLocked(account.Auth) == canonical
 	}, close)
 }
 
+func (v *Validator) findAuthLocked(auth string) *protocol.MemoryUser {
+	if user := v.users[auth]; user != nil {
+		return user
+	}
+	id, err := uuid.Parse(auth)
+	if err != nil {
+		return nil
+	}
+	id[6], id[7] = 0, 0
+	return v.ids[id]
+}
 func (v *Validator) Get(auth string) *protocol.MemoryUser {
 	v.mutex.Lock()
 	defer v.mutex.Unlock()
-
-	return v.users[auth]
+	user := v.findAuthLocked(auth)
+	if user == nil || user.Account.(*MemoryAccount).Auth == auth {
+		return user
+	}
+	id, err := uuid.Parse(auth)
+	if err != nil {
+		return user
+	}
+	return &protocol.MemoryUser{Email: user.Email, Level: user.Level, Account: &MemoryAccount{Auth: auth, VR: net.PortFromBytes(id[6:8]), source: user}}
 }
+func (v *Validator) GetByID(id uuid.UUID) *protocol.MemoryUser {
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
+	return v.findAuthLocked(id.String())
+}
+func (v *Validator) DelByEmail(email string) error { return v.Del(email) }
+func (v *Validator) NotEmpty() bool                { return v.GetCount() > 0 }
 
 func (v *Validator) GetByEmail(email string) *protocol.MemoryUser {
 	if email == "" {

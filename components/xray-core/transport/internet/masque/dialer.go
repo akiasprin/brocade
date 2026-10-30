@@ -72,36 +72,40 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		quicConfig.MaxIdleTimeout = 30 * time.Second
 	}
 	if quicParams.KeepAlivePeriod == 0 {
-		quicConfig.KeepAlivePeriod = net.QuicgoH3KeepAlivePeriod
+		if keepAlivePeriod := config.keepAlivePeriod(); keepAlivePeriod == 0 {
+			quicConfig.KeepAlivePeriod = net.QuicgoH3KeepAlivePeriod
+		} else if keepAlivePeriod > 0 {
+			quicConfig.KeepAlivePeriod = keepAlivePeriod
+		}
 	}
 
 	var pktConn net.PacketConn
 	var udpAddr net.Addr
-	conn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
-	if err != nil {
-		return nil, errors.New("failed to dial to dest").Base(err)
-	}
-	switch c := conn.(type) {
-	case *internet.PacketConnWrapper:
-		pktConn, udpAddr = c.PacketConn, c.RemoteAddr()
-	case *net.UDPConn:
-		pktConn, udpAddr = c, c.RemoteAddr()
-	case *cnc.Connection:
-		pktConn, udpAddr = &internet.FakePacketConn{Conn: c}, &net.UDPAddr{IP: []byte{0, 0, 0, 0}}
-	default:
-		conn.Close()
-		return nil, errors.New("unsupported packet connection ", reflect.TypeOf(conn))
-	}
-	if streamSettings.UdpmaskManager != nil {
-		wrapped, err := streamSettings.UdpmaskManager.WrapPacketConnClient(pktConn)
+	if streamSettings.FinalMask != nil {
+		conn, err := streamSettings.FinalMask.DialUDP(ctx, dest)
 		if err != nil {
-			pktConn.Close()
-			return nil, err
+			return nil, errors.New("failed to dial to dest").Base(err)
 		}
-		pktConn = wrapped
+		pktConn = conn.(*net.PacketConnWrapper).PacketConn
+		udpAddr = conn.RemoteAddr()
+	} else {
+		conn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
+		if err != nil {
+			return nil, errors.New("failed to dial to dest").Base(err)
+		}
+		switch c := conn.(type) {
+		case *net.PacketConnWrapper:
+			pktConn = c.PacketConn
+			udpAddr = c.RemoteAddr()
+		case *cnc.Connection:
+			pktConn = &internet.FakePacketConn{Conn: c}
+			udpAddr = &net.UDPAddr{IP: []byte{0, 0, 0, 0}}
+		default:
+			panic(reflect.TypeOf(c))
+		}
 	}
 
-	tr := &quic.Transport{Conn: pktConn}
+	tr := &quic.Transport{Conn: pktConn, DisableGSO: quicParams.DisableGSO}
 	if config.Warp != nil {
 		tr.ConnectionIDLength = 20
 	}
@@ -118,7 +122,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	case "", "bbr", "brutal":
 		congestion.UseBBR(qconn, bbr.Profile(quicParams.BbrProfile))
 	case "force-brutal":
-		congestion.UseBrutal(qconn, quicParams.BrutalUp)
+		congestion.UseBrutal(qconn, quicParams.BrutalUp, quicParams.BrutalDisableLossCompensation)
 	default:
 		qconn.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeNoError), "")
 		return nil, errors.New("unknown congestion control: ", quicParams.Congestion)
@@ -133,7 +137,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	if config.Warp != nil {
 		client = connectip.NewCloudflareClientConn(cc, qconn)
 	}
-	conn, err = establish(ctx, client, quicConn{qconn}, func() {
+	conn, err := establish(ctx, client, quicConn{qconn}, func() {
 		qconn.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeRequestCanceled), "")
 	}, config, authority(config, gotlsConfig.ServerName, dest.Port))
 	if err != nil {
@@ -154,19 +158,16 @@ func dialHTTP2(ctx context.Context, dest net.Destination, streamSettings *intern
 		return nil, err
 	}
 
-	conn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
+	var conn net.Conn
+	var err error
+	if streamSettings.FinalMask != nil {
+		conn, err = streamSettings.FinalMask.DialTCP(ctx, dest)
+	} else {
+		conn, err = internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
+	}
 	if err != nil {
 		return nil, errors.New("failed to dial to dest").Base(err)
 	}
-	if streamSettings.TcpmaskManager != nil {
-		wrapped, err := streamSettings.TcpmaskManager.WrapConnClient(conn)
-		if err != nil {
-			conn.Close()
-			return nil, err
-		}
-		conn = wrapped
-	}
-
 	if fingerprint := tls.GetFingerprint(tlsConfig.Fingerprint); fingerprint != nil {
 		conn = tls.UClient(conn, gotlsConfig, fingerprint)
 	} else {
@@ -182,7 +183,11 @@ func dialHTTP2(ctx context.Context, dest net.Destination, streamSettings *intern
 		return nil, errors.New("the server negotiated ", strconv.Quote(protocol), " instead of h2")
 	}
 
-	cc, err := newHTTP2ClientConn(conn)
+	keepAlivePeriod := config.keepAlivePeriod()
+	if keepAlivePeriod == 0 {
+		keepAlivePeriod = net.ChromeH2KeepAlivePeriod
+	}
+	cc, err := newHTTP2ClientConn(conn, keepAlivePeriod)
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -215,22 +220,7 @@ func establish(ctx context.Context, client tunnelClient, hconn httpConn, abort f
 	for k, v := range config.Headers {
 		header.Set(k, v)
 	}
-	switch header.Get("User-Agent") {
-	case "":
-		header["User-Agent"] = nil
-	case "chrome":
-		header.Set("User-Agent", utils.ChromeUA)
-	case "firefox":
-		header.Set("User-Agent", utils.FirefoxUA)
-	case "safari":
-		header.Set("User-Agent", utils.SafariUA)
-	case "edge":
-		header.Set("User-Agent", utils.MSEdgeUA)
-	case "curl":
-		header.Set("User-Agent", utils.CurlUA)
-	case "golang":
-		header.Del("User-Agent")
-	}
+	setUserAgent(header)
 
 	ipConn, _, err := client.Dial(req)
 	if err != nil {
@@ -328,6 +318,28 @@ func authority(config *Config, serverName string, port net.Port) string {
 		return host
 	}
 	return net.JoinHostPort(host, port.String())
+}
+
+func setUserAgent(header http.Header) {
+	if _, ok := header["User-Agent"]; !ok {
+		header.Set("User-Agent", "chrome")
+	}
+	switch header.Get("User-Agent") {
+	case "":
+		header["User-Agent"] = nil
+	case "chrome":
+		header.Set("User-Agent", utils.ChromeUA)
+	case "firefox":
+		header.Set("User-Agent", utils.FirefoxUA)
+	case "safari":
+		header.Set("User-Agent", utils.SafariUA)
+	case "edge":
+		header.Set("User-Agent", utils.MSEdgeUA)
+	case "curl":
+		header.Set("User-Agent", utils.CurlUA)
+	case "golang":
+		header.Del("User-Agent")
+	}
 }
 
 func init() {

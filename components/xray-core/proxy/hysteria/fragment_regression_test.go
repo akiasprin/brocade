@@ -47,7 +47,7 @@ func TestUDPReaderPreservesFragmentedDatagrams(t *testing.T) {
 			for id := range 4 {
 				messages = append(messages, regressionFragments(regressionPayload(size, byte(id)), 1197, uint16(id+1))...)
 			}
-			reader := &UDPReader{Reader: &regressionDatagrams{messages: messages}, buf: make([]byte, MaxUDPSize), df: &Defragger{}}
+			reader := &UDPReader{reader: &regressionDatagrams{messages: messages}, df: &Defragger{}}
 			for id := range 4 {
 				mb, err := reader.ReadMultiBuffer()
 				if err != nil {

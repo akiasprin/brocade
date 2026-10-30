@@ -935,10 +935,12 @@ func (b *packetHandoffBinding) BeforeAccept(parent context.Context) (context.Con
 	c := b.owner
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for !c.closed && !b.closed && (!c.ready || (b.endpoint.Role == "cover" && c.coverPaused) || (b.endpoint.Role != "cover" && c.paused)) {
+	stop := context.AfterFunc(parent, func() { c.mu.Lock(); c.cond.Broadcast(); c.mu.Unlock() })
+	defer stop()
+	for !c.closed && !b.closed && parent.Err() == nil && (!c.ready || (b.endpoint.Role == "cover" && c.coverPaused) || (b.endpoint.Role != "cover" && c.paused)) {
 		c.cond.Wait()
 	}
-	if c.closed || b.closed {
+	if c.closed || b.closed || parent.Err() != nil {
 		return nil, false
 	}
 	ctx, cancel := context.WithCancel(parent)

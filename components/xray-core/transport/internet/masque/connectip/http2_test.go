@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/apernet/quic-go/http3"
 	"io"
 	"net"
 	"net/http"
@@ -17,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apernet/quic-go/http3"
 	"github.com/apernet/quic-go/quicvarint"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

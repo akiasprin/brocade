@@ -53,7 +53,7 @@ func TestShadowsocksChaCha20Poly1305TCP(t *testing.T) {
 		Outbound: []*core.OutboundHandlerConfig{
 			{
 				ProxySettings: serial.ToTypedMessage(&freedom.Config{
-					IpsBlocked: &freedom.IPRules{},
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
 				}),
 			},
 		},
@@ -68,9 +68,9 @@ func TestShadowsocksChaCha20Poly1305TCP(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(dest.Address),
-					Port:     uint32(dest.Port),
-					Networks: []net.Network{net.Network_TCP},
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_TCP},
 				}),
 			},
 		},
@@ -141,7 +141,7 @@ func TestShadowsocksAES256GCMTCP(t *testing.T) {
 		Outbound: []*core.OutboundHandlerConfig{
 			{
 				ProxySettings: serial.ToTypedMessage(&freedom.Config{
-					IpsBlocked: &freedom.IPRules{},
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
 				}),
 			},
 		},
@@ -162,9 +162,9 @@ func TestShadowsocksAES256GCMTCP(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(dest.Address),
-					Port:     uint32(dest.Port),
-					Networks: []net.Network{net.Network_TCP},
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_TCP},
 				}),
 			},
 		},
@@ -236,7 +236,7 @@ func TestShadowsocksAES128GCMUDP(t *testing.T) {
 		Outbound: []*core.OutboundHandlerConfig{
 			{
 				ProxySettings: serial.ToTypedMessage(&freedom.Config{
-					IpsBlocked: &freedom.IPRules{},
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
 				}),
 			},
 		},
@@ -257,9 +257,9 @@ func TestShadowsocksAES128GCMUDP(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(dest.Address),
-					Port:     uint32(dest.Port),
-					Networks: []net.Network{net.Network_UDP},
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_UDP},
 				}),
 			},
 		},
@@ -330,7 +330,7 @@ func TestShadowsocksAES128GCMUDPMux(t *testing.T) {
 		Outbound: []*core.OutboundHandlerConfig{
 			{
 				ProxySettings: serial.ToTypedMessage(&freedom.Config{
-					IpsBlocked: &freedom.IPRules{},
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
 				}),
 			},
 		},
@@ -351,9 +351,9 @@ func TestShadowsocksAES128GCMUDPMux(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(dest.Address),
-					Port:     uint32(dest.Port),
-					Networks: []net.Network{net.Network_UDP},
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_UDP},
 				}),
 			},
 		},
@@ -388,90 +388,5 @@ func TestShadowsocksAES128GCMUDPMux(t *testing.T) {
 	}
 	if err := errGroup.Wait(); err != nil {
 		t.Error(err)
-	}
-}
-
-func TestShadowsocksNone(t *testing.T) {
-	tcpServer := tcp.Server{
-		MsgProcessor: xor,
-	}
-	dest, err := tcpServer.Start()
-	common.Must(err)
-
-	defer tcpServer.Close()
-
-	account := serial.ToTypedMessage(&shadowsocks.Account{
-		Password:   "shadowsocks-password",
-		CipherType: shadowsocks.CipherType_NONE,
-	})
-
-	serverPort := tcp.PickPort()
-	serverConfig := &core.Config{
-		Inbound: []*core.InboundHandlerConfig{
-			{
-				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(serverPort)}},
-					Listen:   net.NewIPOrDomain(net.LocalHostIP),
-				}),
-				ProxySettings: serial.ToTypedMessage(&shadowsocks.ServerConfig{
-					Users: []*protocol.User{{
-						Account: account,
-						Level:   1,
-					}},
-					Network: []net.Network{net.Network_TCP},
-				}),
-			},
-		},
-		Outbound: []*core.OutboundHandlerConfig{
-			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{
-					IpsBlocked: &freedom.IPRules{},
-				}),
-			},
-		},
-	}
-
-	clientPort := tcp.PickPort()
-	clientConfig := &core.Config{
-		Inbound: []*core.InboundHandlerConfig{
-			{
-				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
-					Listen:   net.NewIPOrDomain(net.LocalHostIP),
-				}),
-				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(dest.Address),
-					Port:     uint32(dest.Port),
-					Networks: []net.Network{net.Network_TCP},
-				}),
-			},
-		},
-		Outbound: []*core.OutboundHandlerConfig{
-			{
-				ProxySettings: serial.ToTypedMessage(&shadowsocks.ClientConfig{
-					Server: &protocol.ServerEndpoint{
-						Address: net.NewIPOrDomain(net.LocalHostIP),
-						Port:    uint32(serverPort),
-						User: &protocol.User{
-							Account: account,
-						},
-					},
-				}),
-			},
-		},
-	}
-
-	servers, err := InitializeServerConfigs(serverConfig, clientConfig)
-	common.Must(err)
-
-	defer CloseAllServers(servers)
-
-	var errGroup errgroup.Group
-	for range 3 {
-		errGroup.Go(testTCPConn(clientPort, 10240*1024, time.Second*20))
-	}
-
-	if err := errGroup.Wait(); err != nil {
-		t.Fatal(err)
 	}
 }

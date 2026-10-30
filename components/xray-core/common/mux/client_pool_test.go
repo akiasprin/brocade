@@ -583,7 +583,7 @@ func TestPickerPrefersIdleReadyBeforeActiveCapacity(t *testing.T) {
 	active := newBlackholeWorker(t, cfg, 2)
 	addWorkerForTest(t, picker, idle, workerIdleReady, clock.Now())
 	addWorkerForTest(t, picker, active, workerActive, clock.Now())
-	if session := active.sessionManager.Allocate(&active.strategy); session == nil {
+	if session := active.sessionManager.Allocate(&active.strategy, nil, nil); session == nil {
 		t.Fatal("failed to make active worker carry a session")
 	}
 	t.Cleanup(func() { picker.Close() })
@@ -607,7 +607,7 @@ func TestUnpooledPickerChoosesLeastLoadedWorker(t *testing.T) {
 
 	for worker, sessions := range map[*ClientWorker]int{heavy: 3, light: 1, middle: 2} {
 		for range sessions {
-			if worker.sessionManager.Allocate(&worker.strategy) == nil {
+			if worker.sessionManager.Allocate(&worker.strategy, nil, nil) == nil {
 				t.Fatalf("failed to allocate session %d for worker %p", sessions, worker)
 			}
 		}
@@ -634,7 +634,7 @@ func TestPickerCountsReservationsWhenBalancing(t *testing.T) {
 	addWorkerForTest(t, picker, first, workerActive, clock.Now())
 	addWorkerForTest(t, picker, second, workerActive, clock.Now())
 	for _, worker := range []*ClientWorker{first, second} {
-		if worker.sessionManager.Allocate(&worker.strategy) == nil {
+		if worker.sessionManager.Allocate(&worker.strategy, nil, nil) == nil {
 			t.Fatal("failed to seed active worker")
 		}
 	}

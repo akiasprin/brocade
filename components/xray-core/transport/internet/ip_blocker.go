@@ -34,7 +34,7 @@ func checkDialIP(ctx context.Context, ip net.IP) error {
 	// A dialerProxy's socket belongs to another outbound: its proxy endpoint is not
 	// the logical target governed by this policy. Keep the guard scoped to its owner.
 	if ok && blocker.outbound == currentDialOutbound(ctx) && blocker.blocked != nil && blocker.blocked(ip) {
-		return errors.New("blocked target IP: ", ip).AtInfo()
+		return errors.New("blocked target IP: ", ip)
 	}
 	return nil
 }

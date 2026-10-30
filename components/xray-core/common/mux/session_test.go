@@ -13,19 +13,19 @@ func TestSessionIDsDoNotWrapAtUint16Boundary(t *testing.T) {
 		t.Run(fmt.Sprint(limit), func(t *testing.T) {
 			m := NewSessionManager()
 			strategy := &ClientStrategy{MaxConcurrency: 2, MaxConnection: limit}
-			first := m.Allocate(strategy)
+			first := m.Allocate(strategy, nil, nil)
 			if first == nil || first.ID != 1 {
 				t.Fatal("first session was not allocated")
 			}
 			// Keep ID 1 active while the other slot reaches the final ID.
 			for id := 2; id <= 65535; id++ {
-				s := m.Allocate(strategy)
+				s := m.Allocate(strategy, nil, nil)
 				if s == nil || int(s.ID) != id {
 					t.Fatalf("session %d was not allocated with its expected ID", id)
 				}
 				m.Remove(false, s.ID)
 			}
-			if s := m.Allocate(strategy); s != nil {
+			if s := m.Allocate(strategy, nil, nil); s != nil {
 				t.Fatalf("exhausted IDs wrapped to %d", s.ID)
 			}
 			if m.Count() != 65535 || m.Size() != 1 {
@@ -42,7 +42,7 @@ func TestSessionIDsDoNotWrapAtUint16Boundary(t *testing.T) {
 func TestSessionManagerAdd(t *testing.T) {
 	m := NewSessionManager()
 
-	s := m.Allocate(&ClientStrategy{})
+	s := m.Allocate(&ClientStrategy{}, nil, nil)
 	if s.ID != 1 {
 		t.Error("id: ", s.ID)
 	}
@@ -50,7 +50,7 @@ func TestSessionManagerAdd(t *testing.T) {
 		t.Error("size: ", m.Size())
 	}
 
-	s = m.Allocate(&ClientStrategy{})
+	s = m.Allocate(&ClientStrategy{}, nil, nil)
 	if s.ID != 2 {
 		t.Error("id: ", s.ID)
 	}
@@ -72,7 +72,7 @@ func TestSessionManagerAdd(t *testing.T) {
 
 func TestSessionManagerClose(t *testing.T) {
 	m := NewSessionManager()
-	s := m.Allocate(&ClientStrategy{})
+	s := m.Allocate(&ClientStrategy{}, nil, nil)
 
 	if m.CloseIfNoSessionAndIdle(m.Size(), m.Count()) {
 		t.Error("able to close")

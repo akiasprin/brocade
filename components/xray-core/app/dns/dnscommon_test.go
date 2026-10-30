@@ -51,7 +51,8 @@ func Test_parseResponse(t *testing.T) {
 
 	ans = new(dns.Msg)
 	ans.Id = 1
-	ans.Answer = append(ans.Answer,
+	ans.Answer = append(
+		ans.Answer,
 		common.Must2(dns.NewRR("google.com. IN CNAME m.test.google.com")),
 		common.Must2(dns.NewRR("google.com. IN CNAME fake.google.com")),
 		common.Must2(dns.NewRR("google.com. IN A 8.8.8.8")),
@@ -61,7 +62,8 @@ func Test_parseResponse(t *testing.T) {
 
 	ans = new(dns.Msg)
 	ans.Id = 2
-	ans.Answer = append(ans.Answer,
+	ans.Answer = append(
+		ans.Answer,
 		common.Must2(dns.NewRR("google.com. IN CNAME m.test.google.com")),
 		common.Must2(dns.NewRR("google.com. IN CNAME fake.google.com")),
 		common.Must2(dns.NewRR("google.com. IN CNAME m.test.google.com")),
@@ -78,7 +80,7 @@ func Test_parseResponse(t *testing.T) {
 	}{
 		{
 			"empty",
-			&IPRecord{0, []net.IP(nil), time.Time{}, dnsmessage.RCodeSuccess, nil},
+			&IPRecord{RCode: dnsmessage.RCodeSuccess},
 			false,
 		},
 		{
@@ -89,17 +91,15 @@ func Test_parseResponse(t *testing.T) {
 		{
 			"a record",
 			&IPRecord{
-				1,
-				[]net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("8.8.4.4")},
-				time.Time{},
-				dnsmessage.RCodeSuccess,
-				nil,
+				ReqID: 1,
+				IP:    []net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("8.8.4.4")},
+				RCode: dnsmessage.RCodeSuccess,
 			},
 			false,
 		},
 		{
 			"aaaa record",
-			&IPRecord{2, []net.IP{net.ParseIP("2001:4860:4860::8888"), net.ParseIP("2001:4860:4860::8844")}, time.Time{}, dnsmessage.RCodeSuccess, nil},
+			&IPRecord{ReqID: 2, IP: []net.IP{net.ParseIP("2001:4860:4860::8888"), net.ParseIP("2001:4860:4860::8844")}, RCode: dnsmessage.RCodeSuccess},
 			false,
 		},
 	}

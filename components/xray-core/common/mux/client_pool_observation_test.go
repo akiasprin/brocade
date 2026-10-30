@@ -34,7 +34,7 @@ func TestMuxDispatchDecisionCountersDistinguishReuseAndDial(t *testing.T) {
 			if tt.seed {
 				worker := newBlackholeWorker(t, cfg, 2)
 				addWorkerForTest(t, picker, worker, tt.state, clock.Now())
-				if tt.state == workerActive && worker.sessionManager.Allocate(&worker.strategy) == nil {
+				if tt.state == workerActive && worker.sessionManager.Allocate(&worker.strategy, nil, nil) == nil {
 					t.Fatal("allocate active session")
 				}
 			}
@@ -73,7 +73,7 @@ func TestMuxSnapshotUsesReverseHealthVocabularyAndPoolDimensions(t *testing.T) {
 
 	worker := newBlackholeWorker(t, cfg, 4)
 	addWorkerForTest(t, picker, worker, workerActive, clock.Now())
-	if worker.sessionManager.Allocate(&worker.strategy) == nil {
+	if worker.sessionManager.Allocate(&worker.strategy, nil, nil) == nil {
 		t.Fatal("allocate worker session")
 	}
 	worker.poolAccess.Lock()
@@ -196,7 +196,7 @@ func TestMuxTransportCloseReportsAffectedSessions(t *testing.T) {
 	picker.EnableObservation("tcp")
 	worker := newBlackholeWorker(t, cfg, 2)
 	addWorkerForTest(t, picker, worker, workerActive, clock.Now())
-	if worker.sessionManager.Allocate(&worker.strategy) == nil {
+	if worker.sessionManager.Allocate(&worker.strategy, nil, nil) == nil {
 		t.Fatal("allocate worker session")
 	}
 	t.Cleanup(func() {
@@ -249,7 +249,7 @@ func TestMuxLifecycleReasonMatchesSnapshotAndEvent(t *testing.T) {
 			name:   "planned rotation after recovery",
 			reason: "planned_rotation",
 			run: func(t *testing.T, picker *IncrementalWorkerPicker, worker *ClientWorker) {
-				if worker.sessionManager.Allocate(&worker.strategy) == nil {
+				if worker.sessionManager.Allocate(&worker.strategy, nil, nil) == nil {
 					t.Fatal("allocate active session")
 				}
 				worker.poolAccess.Lock()

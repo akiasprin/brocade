@@ -33,7 +33,8 @@ type ClassicNameServer struct {
 
 type udpDnsRequest struct {
 	dnsRequest
-	ctx context.Context
+	ctx        context.Context
+	stopCancel func() bool
 }
 
 // NewClassicNameServer creates udp server object for remote resolving.
@@ -114,11 +115,17 @@ func (s *ClassicNameServer) HandleResponse(ctx context.Context, packet *udp_prot
 		errors.LogErrorInner(ctx, err, s.Name(), " cannot find the pending request")
 		return
 	}
+	if req.stopCancel != nil {
+		req.stopCancel()
+	}
+	if req.ctx.Err() != nil {
+		return
+	}
 
 	// if truncated, retry with EDNS0 option(udp payload size: 1350)
 	if ipRec.RawHeader.Truncated {
 		// if already has EDNS0 option, no need to retry
-		if len(req.msg.Additionals) == 0 {
+		if len(req.msg.Additionals) == 0 && reserveQuery(req.ctx) {
 			// copy necessary meta data from original request
 			// and add EDNS0 option
 			opt := new(dnsmessage.Resource)
@@ -134,6 +141,8 @@ func (s *ClassicNameServer) HandleResponse(ctx context.Context, packet *udp_prot
 			s.udpServer.Dispatch(toDnsContext(newReq.ctx, s.address.String()), *s.address, b)
 			return
 		}
+		ipRec.Error = errors.New("truncated UDP DNS response")
+		ipRec.IP = nil
 	}
 
 	s.cacheController.updateRecord(&req.dnsRequest, ipRec)
@@ -147,7 +156,17 @@ func (s *ClassicNameServer) addPendingRequest(req *udpDnsRequest) {
 	s.Lock()
 	id := req.msg.ID
 	req.expire = time.Now().Add(time.Second * 8)
+	if deadline, ok := req.ctx.Deadline(); ok && deadline.Before(req.expire) {
+		req.expire = deadline
+	}
 	s.requests[id] = req
+	req.stopCancel = context.AfterFunc(req.ctx, func() {
+		s.Lock()
+		if s.requests[id] == req {
+			delete(s.requests, id)
+		}
+		s.Unlock()
+	})
 	s.Unlock()
 	common.Must(s.requestsCleanup.Start())
 }
@@ -166,16 +185,19 @@ func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<
 		errors.LogErrorInner(ctx, err, "failed to build dns query for ", fqdn)
 		if noResponseErrCh != nil {
 			if option.IPv4Enable {
-				noResponseErrCh <- err
+				reportQueryError(ctx, noResponseErrCh, err)
 			}
 			if option.IPv6Enable {
-				noResponseErrCh <- err
+				reportQueryError(ctx, noResponseErrCh, err)
 			}
 		}
 		return
 	}
 
 	for _, req := range reqs {
+		if !reserveQuery(ctx) {
+			break
+		}
 		udpReq := &udpDnsRequest{
 			dnsRequest: *req,
 			ctx:        ctx,
@@ -185,7 +207,7 @@ func (s *ClassicNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<
 		if err != nil {
 			errors.LogErrorInner(ctx, err, "failed to pack dns query")
 			if noResponseErrCh != nil {
-				noResponseErrCh <- err
+				reportQueryError(ctx, noResponseErrCh, err)
 			}
 			return
 		}

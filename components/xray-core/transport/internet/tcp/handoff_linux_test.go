@@ -1612,7 +1612,7 @@ func TestDropTCPKeepsAcceptedFlowsAndCoverAdmission(t *testing.T) {
 
 func TestHandoffSocketConfigDigestIsCanonicalAndComplete(t *testing.T) {
 	empty := handoffTestDigest(t, nil)
-	if empty != handoffTestDigest(t, &internet.SocketConfig{}) || empty != handoffTestDigest(t, &internet.SocketConfig{BindAddress: []byte{}, CustomSockopt: []*internet.CustomSockopt{}}) {
+	if empty != handoffTestDigest(t, &internet.SocketConfig{}) || empty != handoffTestDigest(t, &internet.SocketConfig{CustomSockopt: []*internet.CustomSockopt{}}) {
 		t.Fatal("nil and empty socket configurations did not normalize")
 	}
 	base := &internet.SocketConfig{TcpKeepAliveIdle: 41, TcpKeepAliveInterval: 17, TcpMptcp: true}

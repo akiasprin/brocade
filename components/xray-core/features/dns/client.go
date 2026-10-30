@@ -1,6 +1,8 @@
 package dns
 
 import (
+	"context"
+
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
@@ -12,6 +14,9 @@ type IPOption struct {
 	IPv4Enable bool
 	IPv6Enable bool
 	FakeEnable bool
+	Trace      *LookupTrace
+	// Context carries the caller lifetime when DNS is used during a connection.
+	Context context.Context
 }
 
 // Client is a Xray feature for querying DNS information.

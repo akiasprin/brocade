@@ -2,12 +2,13 @@ package hysteria
 
 import (
 	"context"
+	"crypto/rand"
 	gotls "crypto/tls"
-	"encoding/binary"
 	"github.com/xtls/xray-core/common/sourceaccess"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,137 +22,20 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/proxy/hysteria/account"
-	hyCtx "github.com/xtls/xray-core/proxy/hysteria/ctx"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
-type udpSessionManagerServer struct {
-	conn           *quic.Conn
-	m              map[uint32]*InterUdpConn
-	addConn        internet.ConnHandler
-	stopCh         chan struct{}
-	udpIdleTimeout time.Duration
-	mutex          sync.RWMutex
-
-	user *protocol.MemoryUser
-}
-
-func (m *udpSessionManagerServer) close(udpConn *InterUdpConn) {
-	if !udpConn.closed {
-		udpConn.closed = true
-		close(udpConn.ch)
-		delete(m.m, udpConn.id)
-	}
-}
-
-func (m *udpSessionManagerServer) clean() {
-	ticker := time.NewTicker(idleCleanupInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			m.mutex.RLock()
-			now := time.Now()
-			timeoutConn := make([]*InterUdpConn, 0, len(m.m))
-			for _, udpConn := range m.m {
-				if now.Sub(udpConn.GetLast()) > m.udpIdleTimeout {
-					timeoutConn = append(timeoutConn, udpConn)
-				}
-			}
-			m.mutex.RUnlock()
-
-			for _, udpConn := range timeoutConn {
-				m.mutex.Lock()
-				m.close(udpConn)
-				m.mutex.Unlock()
-			}
-		case <-m.stopCh:
-			return
-		}
-	}
-}
-
-func (m *udpSessionManagerServer) run() {
-	for {
-		d, err := m.conn.ReceiveDatagram(context.Background())
-		if err != nil {
-			break
-		}
-
-		if len(d) < 4 {
-			continue
-		}
-		id := binary.BigEndian.Uint32(d[:4])
-
-		m.feed(id, d)
-	}
-
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
-	close(m.stopCh)
-
-	for _, udpConn := range m.m {
-		m.close(udpConn)
-	}
-}
-
-func (m *udpSessionManagerServer) feed(id uint32, d []byte) {
-	m.mutex.RLock()
-	udpConn, ok := m.m[id]
-	if ok {
-		select {
-		case udpConn.ch <- d:
-		default:
-		}
-		m.mutex.RUnlock()
-		return
-	}
-	m.mutex.RUnlock()
-
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
-	udpConn, ok = m.m[id]
-	if !ok {
-		udpConn = &InterUdpConn{
-			conn:   m.conn,
-			local:  m.conn.LocalAddr(),
-			remote: m.conn.RemoteAddr(),
-
-			id:   id,
-			ch:   make(chan []byte, udpMessageChanSize),
-			last: time.Now(),
-
-			user: m.user,
-		}
-		udpConn.closeFunc = func() {
-			m.mutex.Lock()
-			m.close(udpConn)
-			m.mutex.Unlock()
-		}
-		m.m[id] = udpConn
-		m.addConn(udpConn)
-	}
-
-	select {
-	case udpConn.ch <- d:
-	default:
-	}
-}
-
 type httpHandler struct {
-	ctx     context.Context
-	conn    *quic.Conn
-	addConn internet.ConnHandler
-
-	config      *Config
-	quicParams  *internet.QuicParams
+	ctx         context.Context
 	validator   *account.Validator
+	config      *Config
 	masqHandler http.Handler
+	quicParams  *internet.QuicParams
+	addConn     internet.ConnHandler
+	conn        *quic.Conn
 
 	auth        bool
 	mutex       sync.Mutex
@@ -161,24 +45,24 @@ type httpHandler struct {
 	releaseUser func()
 }
 
-func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
 	if r.Method == http.MethodPost && r.Host == URLHost && r.URL.Path == URLPath {
 		h.mutex.Lock()
 		defer h.mutex.Unlock()
 		if h.closed {
-			return
+			return false
 		}
 
 		if h.auth {
-			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(hyCtx.RequireDatagramFromContext(h.ctx)))
+			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(h.validator != nil))
 			w.Header().Set(CommonHeaderCCRX, strconv.FormatUint(h.quicParams.BrutalDown, 10))
-			w.Header().Set(CommonHeaderPadding, authResponsePadding.String())
+			w.Header().Set(CommonHeaderPadding, AuthResponsePadding.String())
 			w.WriteHeader(StatusAuthOK)
-			return
+			return true
 		}
 
 		auth := r.Header.Get(RequestHeaderAuth)
-		clientDown, _ := strconv.ParseUint(r.Header.Get(CommonHeaderCCRX), 10, 64)
+		down, _ := strconv.ParseUint(r.Header.Get(CommonHeaderCCRX), 10, 64)
 
 		var user *protocol.MemoryUser
 		var ok bool
@@ -195,49 +79,45 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				})
 				if !admitted {
 					h.masqHandler.ServeHTTP(w, r)
-					return
+					return false
 				}
 				releaseAccess, err := sourceaccess.RegisterPeer(h.ctx, user.Email, h.conn.RemoteAddr, func() { _ = h.conn.CloseWithError(closeErrCodeOK, "source IP access denied") })
 				if err != nil {
 					release()
 					_ = h.conn.CloseWithError(closeErrCodeOK, "source IP access denied")
-					return
+					return false
 				}
 				h.releaseUser = func() { releaseAccess(); release() }
 			}
 			h.auth = true
 			h.user = user
 
-			switch h.quicParams.Congestion {
+			conn := h.conn
+			quicParams := h.quicParams
+			switch quicParams.Congestion {
 			case "reno":
-				errors.LogDebug(context.Background(), h.conn.RemoteAddr(), " ", "congestion reno")
 			case "bbr":
-				errors.LogDebug(context.Background(), h.conn.RemoteAddr(), " ", "congestion bbr ", h.quicParams.BbrProfile)
-				congestion.UseBBR(h.conn, bbr.Profile(h.quicParams.BbrProfile))
-			case "brutal", "":
-				if h.quicParams.BrutalUp == 0 || clientDown == 0 {
-					errors.LogDebug(context.Background(), h.conn.RemoteAddr(), " ", "congestion bbr ", h.quicParams.BbrProfile)
-					congestion.UseBBR(h.conn, bbr.Profile(h.quicParams.BbrProfile))
+				congestion.UseBBR(conn, bbr.Profile(quicParams.BbrProfile))
+			case "", "brutal":
+				if quicParams.BrutalUp == 0 || down == 0 {
+					congestion.UseBBR(conn, bbr.Profile(quicParams.BbrProfile))
 				} else {
-					errors.LogDebug(context.Background(), h.conn.RemoteAddr(), " ", "congestion brutal bytes per second ", min(h.quicParams.BrutalUp, clientDown))
-					congestion.UseBrutal(h.conn, min(h.quicParams.BrutalUp, clientDown))
+					congestion.UseBrutal(conn, min(quicParams.BrutalUp, down), quicParams.BrutalDisableLossCompensation)
 				}
 			case "force-brutal":
-				errors.LogDebug(context.Background(), h.conn.RemoteAddr(), " ", "congestion brutal bytes per second ", h.quicParams.BrutalUp)
-				congestion.UseBrutal(h.conn, h.quicParams.BrutalUp)
+				congestion.UseBrutal(conn, quicParams.BrutalUp, quicParams.BrutalDisableLossCompensation)
 			default:
-				errors.LogDebug(context.Background(), h.conn.RemoteAddr(), " ", "congestion reno")
+				panic(quicParams.Congestion)
 			}
 
-			if hyCtx.RequireDatagramFromContext(h.ctx) {
-				udpSM := &udpSessionManagerServer{
-					conn:           h.conn,
-					m:              make(map[uint32]*InterUdpConn),
-					addConn:        h.addConn,
-					stopCh:         make(chan struct{}),
-					udpIdleTimeout: time.Duration(h.config.UdpIdleTimeout) * time.Second,
+			if h.validator != nil {
+				udpSM := &udpSessionManager{
+					conn: h.conn,
+					m:    make(map[uint32]*InterConn),
 
-					user: h.user,
+					addConn:        h.addConn,
+					udpIdleTimeout: time.Duration(h.config.UdpIdleTimeout) * time.Second,
+					user:           h.user,
 				}
 				h.workers.Add(2)
 				go func() {
@@ -250,14 +130,20 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}()
 			}
 
-			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(hyCtx.RequireDatagramFromContext(h.ctx)))
+			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(h.validator != nil))
 			w.Header().Set(CommonHeaderCCRX, strconv.FormatUint(h.quicParams.BrutalDown, 10))
-			w.Header().Set(CommonHeaderPadding, authResponsePadding.String())
+			w.Header().Set(CommonHeaderPadding, AuthResponsePadding.String())
 			w.WriteHeader(StatusAuthOK)
-			return
+			return true
 		}
 	}
+	return false
+}
 
+func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.AuthHTTP(w, r) {
+		return
+	}
 	h.masqHandler.ServeHTTP(w, r)
 }
 
@@ -282,6 +168,7 @@ func (h *httpHandler) StreamDispatcher(ft http3.FrameType, stream *quic.Stream, 
 			remote: h.conn.RemoteAddr(),
 
 			user: user,
+			lock: make(chan struct{}, 1),
 		})
 		return true, nil
 	default:
@@ -301,16 +188,17 @@ func (h *httpHandler) releaseAuthentication() {
 }
 
 type Listener struct {
-	ctx      context.Context
-	pktConn  net.PacketConn
-	listener *quic.Listener
-	handoff  internet.PacketHandoffGate
-	addConn  internet.ConnHandler
-
-	config      *Config
-	quicParams  *internet.QuicParams
+	ctx         context.Context
+	handoff     internet.PacketHandoffGate
 	validator   *account.Validator
+	config      *Config
 	masqHandler http.Handler
+	quicParams  *internet.QuicParams
+	addConn     internet.ConnHandler
+
+	pktConn  net.PacketConn
+	tr       *quic.Transport
+	listener *quic.Listener
 }
 
 func (l *Listener) handleClient(conn *quic.Conn) {
@@ -318,20 +206,19 @@ func (l *Listener) handleClient(conn *quic.Conn) {
 		defer l.handoff.FinishConnection()
 	}
 	handler := &httpHandler{
-		ctx:     l.ctx,
-		conn:    conn,
-		addConn: l.addConn,
-
-		config:      l.config,
-		quicParams:  l.quicParams,
+		ctx:         l.ctx,
 		validator:   l.validator,
+		config:      l.config,
 		masqHandler: l.masqHandler,
+		quicParams:  l.quicParams,
+		addConn:     l.addConn,
+		conn:        conn,
 	}
-	h3 := http3.Server{
+	h3s := http3.Server{
 		Handler:          handler,
 		StreamDispatcher: handler.StreamDispatcher,
 	}
-	err := h3.ServeQUICConn(conn)
+	err := h3s.ServeQUICConn(conn)
 	_ = conn.CloseWithError(closeErrCodeOK, "")
 	handler.releaseAuthentication()
 	handler.workers.Wait()
@@ -356,7 +243,9 @@ func (l *Listener) keepAccepting() {
 			}
 		}
 		if err != nil {
-			errors.LogInfoInner(context.Background(), err, "failed to accept QUIC connection")
+			if err != quic.ErrServerClosed {
+				errors.LogErrorInner(context.Background(), err, "failed to serve hysteria")
+			}
 			break
 		}
 		go l.handleClient(conn)
@@ -371,9 +260,7 @@ func (l *Listener) Close() error {
 	if l.handoff != nil {
 		l.handoff.Close()
 	}
-	err := l.listener.Close()
-	_ = l.pktConn.Close()
-	return err
+	return errors.Combine(l.listener.Close(), l.tr.Close(), l.pktConn.Close())
 }
 
 func Listen(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
@@ -386,11 +273,10 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		return nil, errors.New("tls config is nil")
 	}
 
+	validator := ValidatorFromContext(ctx)
 	config := streamSettings.ProtocolSettings.(*Config)
 
-	validator := hyCtx.ValidatorFromContext(ctx)
-
-	if config.Auth == "" && validator == nil {
+	if validator == nil && config.Auth == "" {
 		return nil, errors.New("validator is nil")
 	}
 
@@ -406,21 +292,43 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 			return nil, err
 		}
 		transport := http.DefaultTransport.(*http.Transport)
-		if config.MasqUrlInsecure {
-			transport = transport.Clone()
-			transport.TLSClientConfig = &gotls.Config{
-				InsecureSkipVerify: true,
+		switch u.Scheme {
+		case "http", "https":
+			if config.MasqUrlInsecure {
+				transport = transport.Clone()
+				if transport.TLSClientConfig == nil {
+					transport.TLSClientConfig = &gotls.Config{}
+				}
+				transport.TLSClientConfig.InsecureSkipVerify = true
 			}
+		case "", "unix":
+			path := u.Path
+			u = &url.URL{Scheme: "http", Host: "localhost"}
+			dialer := &net.Dialer{Timeout: 30 * time.Second}
+			transport = transport.Clone()
+			transport.Proxy = nil
+			transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.DialContext(ctx, "unix", path)
+			}
+			transport.MaxIdleConns = masqueradeProxyMaxIdleConnections
+			transport.MaxIdleConnsPerHost = masqueradeProxyMaxIdleConnsPerHost
+		default:
+			return nil, errors.New("unknown scheme")
 		}
 		masqHandler = &httputil.ReverseProxy{
-			Rewrite: func(pr *httputil.ProxyRequest) {
-				pr.SetURL(u)
+			Rewrite: func(r *httputil.ProxyRequest) {
+				r.SetURL(u)
 				if !config.MasqUrlRewriteHost {
-					pr.Out.Host = pr.In.Host
+					r.Out.Host = r.In.Host
+				}
+				if config.MasqUrlXForwarded {
+					r.SetXForwarded()
 				}
 			},
-			Transport: transport,
+			Transport:  transport,
+			BufferPool: newMasqueradeProxyBufferPool(),
 			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+				errors.LogErrorInner(context.Background(), err, "HTTP reverse proxy error")
 				w.WriteHeader(http.StatusBadGateway)
 			},
 		}
@@ -440,47 +348,28 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		return nil, errors.New("unknown masq type")
 	}
 
-	logicalAddress := (&net.UDPAddr{IP: address.IP(), Port: int(port)}).String()
-	raw, handoff, err := internet.OpenPacketHandoffListener(logicalAddress, streamSettings.SocketSettings, func(bindAddress string) (net.PacketConn, error) {
-		udpAddress, err := net.ResolveUDPAddr("udp", bindAddress)
-		if err != nil {
-			return nil, err
-		}
-		return internet.ListenSystemPacket(context.Background(), udpAddress, streamSettings.SocketSettings)
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	var pktConn net.PacketConn
-	pktConn = raw
-
-	if streamSettings.UdpmaskManager != nil {
-		pktConn, err = streamSettings.UdpmaskManager.WrapPacketConnServer(raw)
-		if err != nil {
-			raw.Close()
-			return nil, errors.New("mask err").Base(err)
-		}
-	}
-
 	quicParams := streamSettings.QuicParams
 	if quicParams == nil {
 		quicParams = &internet.QuicParams{
 			BbrProfile: string(bbr.ProfileStandard),
-			UdpHop:     &internet.UdpHop{},
 		}
 	}
 
 	quicConfig := &quic.Config{
+		// QUIC's 1280-byte payload default exceeds a 1280-byte IP path
+		// once UDP/IP headers are added, preventing the first server flight.
+		// Start at the protocol minimum; PMTU discovery can grow it later.
+		InitialPacketSize:              1200,
 		InitialStreamReceiveWindow:     quicParams.InitStreamReceiveWindow,
 		MaxStreamReceiveWindow:         quicParams.MaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: quicParams.InitConnReceiveWindow,
 		MaxConnectionReceiveWindow:     quicParams.MaxConnReceiveWindow,
 		MaxIdleTimeout:                 time.Duration(quicParams.MaxIdleTimeout) * time.Second,
 		MaxIncomingStreams:             quicParams.MaxIncomingStreams,
-		DisablePathMTUDiscovery:        quicParams.DisablePathMtuDiscovery,
+		DisablePathMTUDiscovery:        quicParams.DisablePathMtuDiscovery || (runtime.GOOS != "linux" && runtime.GOOS != "windows" && runtime.GOOS != "darwin"),
 		EnableDatagrams:                true,
 		MaxDatagramFrameSize:           MaxDatagramFrameSize,
+		AssumePeerMaxDatagramFrameSize: MaxDatagramFrameSize,
 		DisablePathManager:             true,
 	}
 	if quicParams.InitStreamReceiveWindow == 0 {
@@ -502,30 +391,76 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		quicConfig.MaxIncomingStreams = 1024
 	}
 
-	qListener, err := quic.Listen(pktConn, tlsConfig.GetTLSConfig(), quicConfig)
+	pktConn, handoff, err := internet.ListenPacketWithHandoff(ctx, &net.UDPAddr{IP: address.IP(), Port: int(port)}, streamSettings)
 	if err != nil {
+		return nil, err
+	}
+
+	var k *quic.StatelessResetKey
+	if !quicParams.DisableStatelessReset {
+		k = &quic.StatelessResetKey{}
+		common.Must2(rand.Read((*k)[:]))
+	}
+
+	tr := &quic.Transport{Conn: pktConn, DisableGSO: quicParams.DisableGSO, StatelessResetKey: k}
+
+	listener, err := tr.Listen(tlsConfig.GetTLSConfig(tls.WithNextProto("h3")), quicConfig)
+	if err != nil {
+		_ = tr.Close()
 		_ = pktConn.Close()
 		return nil, err
 	}
 
-	listener := &Listener{
-		ctx:      ctx,
-		pktConn:  pktConn,
-		listener: qListener,
-		handoff:  handoff,
-		addConn:  handler,
-
-		config:      config,
-		quicParams:  quicParams,
+	l := &Listener{
+		ctx:         ctx,
+		handoff:     handoff,
 		validator:   validator,
+		config:      config,
 		masqHandler: masqHandler,
+		quicParams:  quicParams,
+		addConn:     handler,
+
+		pktConn:  pktConn,
+		tr:       tr,
+		listener: listener,
 	}
 
-	go listener.keepAccepting()
+	go l.keepAccepting()
 
-	return listener, nil
+	return l, nil
 }
 
 func init() {
 	common.Must(internet.RegisterTransportListener(protocolName, Listen))
+}
+
+const (
+	masqueradeProxyBufferSize          = 32 * 1024
+	masqueradeProxyMaxIdleConnections  = 100
+	masqueradeProxyMaxIdleConnsPerHost = 32
+)
+
+type masqueradeProxyBufferPool struct {
+	pool sync.Pool
+}
+
+func newMasqueradeProxyBufferPool() *masqueradeProxyBufferPool {
+	return &masqueradeProxyBufferPool{
+		pool: sync.Pool{
+			New: func() any {
+				return make([]byte, masqueradeProxyBufferSize)
+			},
+		},
+	}
+}
+
+func (p *masqueradeProxyBufferPool) Get() []byte {
+	return p.pool.Get().([]byte)
+}
+
+func (p *masqueradeProxyBufferPool) Put(buf []byte) {
+	if cap(buf) < masqueradeProxyBufferSize {
+		return
+	}
+	p.pool.Put(buf[:masqueradeProxyBufferSize])
 }

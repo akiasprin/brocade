@@ -143,7 +143,7 @@ func TestVisionReaderDirectCopySuppressesOuterCloseNotify(t *testing.T) {
 	payload := buf.FromBytes([]byte{0x17, 0x03, 0x03, 0x00, 0x01, 0x00})
 	padded := XtlsPadding(payload, CommandPaddingDirect, &writerUUID, false, context.Background(), []uint32{1, 1, 1, 1})
 	reader := NewVisionReader(&oneMultiBufferReader{buffer: buf.MultiBuffer{padded}}, state, true,
-		context.Background(), conn, &bytes.Reader{}, &bytes.Buffer{}, nil)
+		context.Background(), conn, &bytes.Reader{}, new(*bytes.Buffer), nil)
 	result, err := reader.ReadMultiBuffer()
 	buf.ReleaseMulti(result)
 	if err != nil {

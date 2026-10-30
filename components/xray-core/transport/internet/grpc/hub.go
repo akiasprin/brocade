@@ -19,24 +19,25 @@ import (
 
 type Listener struct {
 	encoding.UnimplementedGRPCServiceServer
-	ctx     context.Context
-	handler internet.ConnHandler
-	local   net.Addr
-	config  *Config
+	ctx                  context.Context
+	handler              internet.ConnHandler
+	local                net.Addr
+	config               *Config
+	trustedXForwardedFor []string
 
 	s *grpc.Server
 }
 
 func (l Listener) Tun(server encoding.GRPCService_TunServer) error {
 	tunCtx, cancel := context.WithCancel(l.ctx)
-	l.handler(encoding.NewHunkConn(server, cancel))
+	l.handler(encoding.NewHunkConn(server, cancel, l.trustedXForwardedFor))
 	<-tunCtx.Done()
 	return nil
 }
 
 func (l Listener) TunMulti(server encoding.GRPCService_TunMultiServer) error {
 	tunCtx, cancel := context.WithCancel(l.ctx)
-	l.handler(encoding.NewMultiHunkConn(server, cancel))
+	l.handler(encoding.NewMultiHunkConn(server, cancel, l.trustedXForwardedFor))
 	<-tunCtx.Done()
 	return nil
 }
@@ -74,6 +75,9 @@ func Listen(ctx context.Context, address net.Address, port net.Port, settings *i
 	}
 
 	listener.ctx = ctx
+	if settings.SocketSettings != nil {
+		listener.trustedXForwardedFor = settings.SocketSettings.TrustedXForwardedFor
+	}
 
 	config := tls.ConfigFromStreamSettings(settings)
 
@@ -100,28 +104,20 @@ func Listen(ctx context.Context, address net.Address, port net.Port, settings *i
 	go func() {
 		var streamListener net.Listener
 		var err error
+		var addr net.Addr
 		if port == net.Port(0) { // unix
-			streamListener, err = internet.ListenSystem(ctx, &net.UnixAddr{
-				Name: address.Domain(),
-				Net:  "unix",
-			}, settings.SocketSettings)
-			if err != nil {
-				errors.LogErrorInner(ctx, err, "failed to listen on ", address)
-				return
-			}
+			addr = &net.UnixAddr{Name: address.Domain(), Net: "unix"}
 		} else { // tcp
-			streamListener, err = internet.ListenSystem(ctx, &net.TCPAddr{
-				IP:   address.IP(),
-				Port: int(port),
-			}, settings.SocketSettings)
-			if err != nil {
-				errors.LogErrorInner(ctx, err, "failed to listen on ", address, ":", port)
-				return
-			}
+			addr = &net.TCPAddr{IP: address.IP(), Port: int(port)}
 		}
-
-		if settings.TcpmaskManager != nil {
-			streamListener, _ = settings.TcpmaskManager.WrapListener(streamListener)
+		if settings.FinalMask != nil {
+			streamListener, err = settings.FinalMask.Listen(ctx, addr)
+		} else {
+			streamListener, err = internet.ListenSystem(ctx, addr, settings.SocketSettings)
+		}
+		if err != nil {
+			errors.LogErrorInner(ctx, err, "failed to listen on ", address, ":", port)
+			return
 		}
 
 		errors.LogDebug(ctx, "gRPC listen for service name `"+grpcSettings.getServiceName()+"` tun `"+grpcSettings.getTunStreamName()+"` multi tun `"+grpcSettings.getTunMultiStreamName()+"`")

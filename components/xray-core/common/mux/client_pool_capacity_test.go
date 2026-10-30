@@ -21,7 +21,7 @@ func TestPickerChoosesIdleBeforeAnyActiveLoad(t *testing.T) {
 		worker := newBlackholeWorker(t, cfg, 4)
 		addWorkerForTest(t, picker, worker, workerActive, clock.Now())
 		for range load {
-			if worker.sessionManager.Allocate(&worker.strategy) == nil {
+			if worker.sessionManager.Allocate(&worker.strategy, nil, nil) == nil {
 				t.Fatal("failed to seed active worker")
 			}
 		}
@@ -41,7 +41,7 @@ func TestPickerConsumesIdleThenBalancesReservations(t *testing.T) {
 	active := newBlackholeWorker(t, cfg, 4)
 	addWorkerForTest(t, picker, idle, workerIdleReady, clock.Now())
 	addWorkerForTest(t, picker, active, workerActive, clock.Now())
-	if active.sessionManager.Allocate(&active.strategy) == nil {
+	if active.sessionManager.Allocate(&active.strategy, nil, nil) == nil {
 		t.Fatal("failed to seed active worker")
 	}
 	t.Cleanup(func() { picker.Close() })

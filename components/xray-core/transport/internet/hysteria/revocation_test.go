@@ -22,7 +22,6 @@ import (
 	"github.com/xtls/xray-core/common/sourceaccess"
 	"github.com/xtls/xray-core/common/sourceaccess/testutil"
 	"github.com/xtls/xray-core/proxy/hysteria/account"
-	hyCtx "github.com/xtls/xray-core/proxy/hysteria/ctx"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
@@ -49,7 +48,7 @@ func quotaQUICListener(t *testing.T, validator *account.Validator, staticAuth st
 	ctx, cancel := context.WithCancel(base)
 	var workers sync.WaitGroup
 	workers.Add(1)
-	l := &Listener{ctx: hyCtx.ContextWithRequireDatagram(ctx, true), validator: validator, config: &Config{Auth: staticAuth, UdpIdleTimeout: 5}, quicParams: &internet.QuicParams{Congestion: "reno"}, masqHandler: http.NotFoundHandler(), addConn: func(conn stat.Connection) {
+	l := &Listener{ctx: ctx, validator: validator, config: &Config{Auth: staticAuth, UdpIdleTimeout: 5}, quicParams: &internet.QuicParams{Congestion: "reno"}, masqHandler: http.NotFoundHandler(), addConn: func(conn stat.Connection) {
 		workers.Add(1)
 		go func() { defer workers.Done(); defer conn.Close(); _, _ = io.Copy(conn, conn) }()
 	}}
@@ -116,7 +115,7 @@ func quotaQUICStream(t *testing.T, conn *quic.Conn) *interConn {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &interConn{stream: stream, local: conn.LocalAddr(), remote: conn.RemoteAddr(), client: true}
+	return &interConn{stream: stream, local: conn.LocalAddr(), remote: conn.RemoteAddr(), client: true, lock: make(chan struct{}, 1)}
 }
 
 func quotaQUICExchange(conn *interConn) error {

@@ -408,7 +408,7 @@ func TestLocalAnyTLSHighConcurrency(t *testing.T) {
 			}}}),
 		}},
 		Outbound: []*core.OutboundHandlerConfig{{
-			ProxySettings: serial.ToTypedMessage(&freedom.Config{IpsBlocked: &freedom.IPRules{}}),
+			ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
 		}},
 	}
 
@@ -424,7 +424,7 @@ func TestLocalAnyTLSHighConcurrency(t *testing.T) {
 				Listen:   xnet.NewIPOrDomain(xnet.LocalHostIP),
 			}),
 			ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-				Address: xnet.NewIPOrDomain(xnet.LocalHostIP), Port: originPort, Networks: []xnet.Network{xnet.Network_TCP},
+				RewriteAddress: xnet.NewIPOrDomain(xnet.LocalHostIP), RewritePort: originPort, AllowedNetworks: []xnet.Network{xnet.Network_TCP},
 			}),
 		}},
 		Outbound: []*core.OutboundHandlerConfig{{

@@ -20,6 +20,7 @@ import (
 type Router struct {
 	domainStrategy Config_DomainStrategy
 	snapshot       atomic.Pointer[routingSnapshot]
+	script         *scriptEngine
 	dns            dns.Client
 
 	ctx        context.Context
@@ -61,11 +62,22 @@ func (r *Router) Init(ctx context.Context, config *Config, d dns.Client, ohm out
 	r.ohm = ohm
 	r.dispatcher = dispatcher
 
+	if config.Script != "" {
+		script, err := newScriptEngine(config.Script)
+		if err != nil {
+			return errors.New("failed to prepare routing script").Base(err)
+		}
+		r.script = script
+	}
 	return r.ReloadRules(config, false)
 }
 
 // PickRoute implements routing.Router.
 func (r *Router) PickRoute(ctx routing.Context) (routing.Route, error) {
+	if r.script != nil {
+		return r.script.pickRoute(ctx)
+	}
+
 	originalCtx := ctx
 	rule, ctx, err := r.pickRouteInternal(ctx)
 	if err != nil {
@@ -255,6 +267,11 @@ func (r *Router) pickRouteInternal(ctx routing.Context) (*Rule, routing.Context,
 
 // Start implements common.Runnable.
 func (r *Router) Start() error {
+	if r.script != nil {
+		if err := r.script.start(r); err != nil {
+			return errors.New("failed to initialize routing script").Base(err)
+		}
+	}
 	return nil
 }
 
@@ -268,6 +285,9 @@ func closeWebhooks(rules []*Rule) {
 
 // Close implements common.Closable.
 func (r *Router) Close() error {
+	if r.script != nil {
+		r.script.close()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.closed = true

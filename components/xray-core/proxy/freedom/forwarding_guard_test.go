@@ -40,12 +40,12 @@ func (*forwardingSystemDialer) DestIpAddress() xnet.IP                          
 func (*forwardingSystemDialer) SetOutboundGateway(context.Context, *session.Outbound) {}
 
 func TestFreedomOnlyBlocksExplicitIPRules(t *testing.T) {
-	for _, blocked := range []*IPRules{nil, {}} {
+	for _, blocked := range [][]*FinalRuleConfig{nil, {}} {
 		handler := new(Handler)
-		if err := handler.Init(&Config{IpsBlocked: blocked}, policy.DefaultManager{}); err != nil {
+		if err := handler.Init(&Config{FinalRules: blocked}, policy.DefaultManager{}); err != nil {
 			t.Fatal(err)
 		}
-		if handler.blockedIPMatcher != nil {
+		if len(handler.finalRules) != 0 {
 			t.Fatal("missing or empty ipsBlocked unexpectedly enabled an IP blocker")
 		}
 	}
@@ -55,10 +55,10 @@ func TestFreedomOnlyBlocksExplicitIPRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := new(Handler)
-	if err := handler.Init(&Config{IpsBlocked: &IPRules{Rules: rules}}, policy.DefaultManager{}); err != nil {
+	if err := handler.Init(&Config{FinalRules: []*FinalRuleConfig{{Action: RuleAction_Block, Ip: rules}}}, policy.DefaultManager{}); err != nil {
 		t.Fatal(err)
 	}
-	if handler.blockedIPMatcher == nil || !handler.blockedIPMatcher.Match(xnet.LocalHostIP.IP()) {
+	if !handler.finalBlocked(xnet.Network_TCP, xnet.LocalHostIP, 443) {
 		t.Fatal("explicit ipsBlocked rule did not enable the IP blocker")
 	}
 }
@@ -126,7 +126,7 @@ func TestForwardingUDPGuardCoversCachedAndNewPacketDestinations(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := new(Handler)
-	if err := handler.Init(&Config{DomainStrategy: internet.DomainStrategy_USE_IP, IpsBlocked: &IPRules{Rules: rules}}, policy.DefaultManager{}); err != nil {
+	if err := handler.Init(&Config{DomainStrategy: internet.DomainStrategy_USE_IP, FinalRules: []*FinalRuleConfig{{Action: RuleAction_Block, Ip: rules}}}, policy.DefaultManager{}); err != nil {
 		t.Fatal(err)
 	}
 	internet.InitSystemDialer(&forwardingDNS{}, nil)
@@ -152,6 +152,7 @@ func TestForwardingUDPGuardCoversCachedAndNewPacketDestinations(t *testing.T) {
 	}
 	// Explicitly allowed traffic still uses the same packet writer normally.
 	writer.BlockedIPMatcher = nil
+	handler.finalRules = nil
 	b := buf.New()
 	b.Write([]byte("allowed"))
 	dest := xnet.DestinationFromAddr(receiver.LocalAddr())

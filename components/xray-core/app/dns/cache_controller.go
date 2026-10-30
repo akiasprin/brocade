@@ -84,15 +84,11 @@ func (c *CacheController) collectExpiredKeys() ([]string, error) {
 	}
 
 	now := time.Now()
-	if c.serveStale && c.serveExpiredTTL != 0 {
-		now = now.Add(time.Duration(c.serveExpiredTTL) * time.Second)
-	}
 
 	expiredKeys := make([]string, 0, len(c.ips)/4) // pre-allocate
 
 	for domain, rec := range c.ips {
-		if (rec.A != nil && rec.A.Expire.Before(now)) ||
-			(rec.AAAA != nil && rec.AAAA.Expire.Before(now)) {
+		if c.recordExpired(rec.A, now) || c.recordExpired(rec.AAAA, now) {
 			expiredKeys = append(expiredKeys, domain)
 		}
 	}
@@ -115,19 +111,16 @@ func (c *CacheController) writeAndShrink(expiredKeys []string) {
 	}
 
 	now := time.Now()
-	if c.serveStale && c.serveExpiredTTL != 0 {
-		now = now.Add(time.Duration(c.serveExpiredTTL) * time.Second)
-	}
 
 	for _, domain := range expiredKeys {
 		rec := c.ips[domain]
 		if rec == nil {
 			continue
 		}
-		if rec.A != nil && rec.A.Expire.Before(now) {
+		if c.recordExpired(rec.A, now) {
 			rec.A = nil
 		}
-		if rec.AAAA != nil && rec.AAAA.Expire.Before(now) {
+		if c.recordExpired(rec.AAAA, now) {
 			rec.AAAA = nil
 		}
 		if rec.A == nil && rec.AAAA == nil {
@@ -139,7 +132,8 @@ func (c *CacheController) writeAndShrink(expiredKeys []string) {
 
 	if lenAfter == 0 {
 		if c.highWatermark >= minSizeForEmptyRebuild {
-			errors.LogDebug(context.Background(), c.name,
+			errors.LogDebug(
+				context.Background(), c.name,
 				" rebuilding empty cache map to reclaim memory.",
 				" size_before_cleanup=", lenBefore,
 				" peak_size_before_rebuild=", c.highWatermark,
@@ -153,7 +147,8 @@ func (c *CacheController) writeAndShrink(expiredKeys []string) {
 
 	if reductionFromPeak := c.highWatermark - lenAfter; reductionFromPeak > shrinkAbsoluteThreshold &&
 		float64(reductionFromPeak) > float64(c.highWatermark)*shrinkRatioThreshold {
-		errors.LogDebug(context.Background(), c.name,
+		errors.LogDebug(
+			context.Background(), c.name,
 			" shrinking cache map to reclaim memory.",
 			" new_size=", lenAfter,
 			" peak_size_before_shrink=", c.highWatermark,
@@ -165,7 +160,6 @@ func (c *CacheController) writeAndShrink(expiredKeys []string) {
 		c.highWatermark = lenAfter
 		go c.migrate()
 	}
-
 }
 
 type migrationEntry struct {
@@ -255,6 +249,12 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 		errors.LogInfo(context.Background(), c.name, " got answer: ", req.domain, " ", req.reqType, " -> ", rep.IP, ", rtt: ", rtt)
 		return
 	}
+	// Server/protocol failures are published to the in-flight retry owner. Only
+	// the final failure gets a short cache entry; it must not replace a good IP.
+	// In particular, truncated UDP packets can have a success RCODE and Error.
+	if rep.Error != nil || rep.RCode != dnsmessage.RCodeSuccess && rep.RCode != dnsmessage.RCodeNameError {
+		return
+	}
 
 	c.Lock()
 	lockWait := time.Since(req.start) - rtt
@@ -302,9 +302,55 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 
 	errors.LogInfo(context.Background(), c.name, " got answer: ", req.domain, " ", req.reqType, " -> ", rep.IP, ", rtt: ", rtt, ", lock: ", lockWait)
 
-	if !c.serveStale || c.serveExpiredTTL != 0 {
-		common.Must(c.cacheCleanup.Start())
+	common.Must(c.cacheCleanup.Start())
+}
+
+func (c *CacheController) recordExpired(record *IPRecord, now time.Time) bool {
+	if record == nil {
+		return false
 	}
+	expire := record.Expire
+	if c.serveStale && positiveRecord(record) {
+		if c.serveExpiredTTL == 0 {
+			return false
+		}
+		expire = expire.Add(-time.Duration(c.serveExpiredTTL) * time.Second)
+	}
+	return expire.Before(now)
+}
+
+func (c *CacheController) storeFailure(domain string, ipv6 bool, err error) {
+	if c.disableCache {
+		return
+	}
+	now := time.Now()
+	c.Lock()
+	previous := c.ips[domain]
+	if previous == nil && c.dirtyips != nil {
+		previous = c.dirtyips[domain]
+	}
+	next := &record{}
+	if previous != nil {
+		*next = *previous
+	}
+	old := next.A
+	if ipv6 {
+		old = next.AAAA
+	}
+	failure := &IPRecord{Expire: now.Add(resolutionFailureTTL), Error: err}
+	if positiveRecord(old) && !c.recordExpired(old, now) {
+		copy := *old
+		copy.RetryAfter = now.Add(resolutionFailureTTL)
+		failure = &copy
+	}
+	if ipv6 {
+		next.AAAA = failure
+	} else {
+		next.A = failure
+	}
+	c.ips[domain] = next
+	c.Unlock()
+	common.Must(c.cacheCleanup.Start())
 }
 
 func (c *CacheController) findRecords(domain string) *record {

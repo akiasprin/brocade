@@ -2,6 +2,7 @@ package reality
 
 import (
 	"context"
+	"crypto/ecdh"
 	stderrors "errors"
 	gonet "net"
 	"testing"
@@ -107,9 +108,15 @@ func TestRealityServerBoundsSilentFallback(t *testing.T) {
 		DialContext: func(_ context.Context, _, _ string) (gonet.Conn, error) {
 			return targetServer, nil
 		},
-		Type:        "tcp",
-		Dest:        "cover.invalid:443",
-		PrivateKey:  make([]byte, 32),
+		Type: "tcp",
+		Dest: "cover.invalid:443",
+		PrivateKey: func() *ecdh.PrivateKey {
+			key, err := ecdh.X25519().NewPrivateKey(make([]byte, 32))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return key
+		}(),
 		ServerNames: map[string]bool{"cover.invalid": true},
 		ShortIds:    map[[8]byte]bool{{}: true},
 	}

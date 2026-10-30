@@ -96,11 +96,11 @@ func quotaRevocationRealProcesses(t *testing.T, transportName string) {
 			serial.ToTypedMessage(&stats.Config{}),
 			serial.ToTypedMessage(&policy.Config{Level: map[uint32]*policy.Policy{1: {Stats: &policy.Policy_Stats{UserUplink: true, UserDownlink: true}}}}),
 		},
-		Inbound:  []*core.InboundHandlerConfig{{Tag: "quota-entry", ReceiverSettings: testMuxReceiver(serverPort, wire), ProxySettings: serial.ToTypedMessage(&inbound.Config{Clients: []*protocol.User{alice, bob}, Decryption: "none"})}},
-		Outbound: []*core.OutboundHandlerConfig{{ProxySettings: serial.ToTypedMessage(&freedom.Config{IpsBlocked: &freedom.IPRules{}})}},
+		Inbound:  []*core.InboundHandlerConfig{{Tag: "quota-entry", ReceiverSettings: testMuxReceiver(serverPort, wire), ProxySettings: serial.ToTypedMessage(&inbound.Config{Users: []*protocol.User{alice, bob}, Decryption: "none"})}},
+		Outbound: []*core.OutboundHandlerConfig{{ProxySettings: serial.ToTypedMessage(&freedom.Config{})}},
 	}
 	client := &core.Config{
-		Inbound:  []*core.InboundHandlerConfig{{ReceiverSettings: testMuxReceiver(muxPort, nil), ProxySettings: serial.ToTypedMessage(&dokodemo.Config{Address: net.NewIPOrDomain(net.LocalHostIP), Port: uint32(targetPort), Networks: []net.Network{net.Network_TCP}})}},
+		Inbound:  []*core.InboundHandlerConfig{{ReceiverSettings: testMuxReceiver(muxPort, nil), ProxySettings: serial.ToTypedMessage(&dokodemo.Config{RewriteAddress: net.NewIPOrDomain(net.LocalHostIP), RewritePort: uint32(targetPort), AllowedNetworks: []net.Network{net.Network_TCP}})}},
 		Outbound: []*core.OutboundHandlerConfig{{SenderSettings: testMuxSender(wire, 4), ProxySettings: serial.ToTypedMessage(&outbound.Config{Vnext: &protocol.ServerEndpoint{Address: net.NewIPOrDomain(net.LocalHostIP), Port: uint32(serverPort), User: alice}})}},
 	}
 	processes, err := InitializeServerConfigs(server, client)
@@ -152,7 +152,7 @@ func quotaRevocationRealProcesses(t *testing.T, transportName string) {
 				cancel()
 				return nil, err
 			}
-			return grpcEncoding.NewHunkConn(stream, cancel), nil
+			return grpcEncoding.NewHunkConn(stream, cancel, nil), nil
 		}
 	}
 	handler := command.NewHandlerServiceClient(api)

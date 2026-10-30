@@ -124,10 +124,16 @@ type ReverseHealth struct {
 	snapshot                                                   ReverseHealthSnapshot
 	started, lastAck, nextProbe, pendingDeadline, hardDeadline time.Time
 	pendingID, nextID, peerID                                  uint64
+	drainProbeID                                               uint64
+	drainDeadline                                              time.Time
 	sentAt                                                     time.Time
 	ownValidated, peerValidated                                bool
 	recoveryAcks                                               int
 }
+
+// ReverseDrainTimeout bounds final-frame confirmation after a worker stops
+// accepting sessions. It is independent of the shorter health quarantine lease.
+const ReverseDrainTimeout = sessionEndTimeout
 
 func newReverseHealth(config ReverseHealthConfig, writer *healthWriter, closed *done.Instance) *ReverseHealth {
 	now := time.Now()
@@ -202,10 +208,13 @@ func (h *ReverseHealth) failLocked(reason string) {
 	h.done.Close() // done.Close only closes a channel; transport cleanup runs outside this lock.
 }
 func (h *ReverseHealth) failHealthLocked(reason string) {
-	if h.config.DisconnectOnHealthFailure || h.config.ActiveSessions == nil || h.config.ActiveSessions() == 0 {
+	if h.config.DisconnectOnHealthFailure || h.config.ActiveSessions == nil {
 		h.failLocked(reason)
 		return
 	}
+	// The final application read may have completed before its queued bytes
+	// cross the carrier. Even an apparently idle worker must enter the ordered
+	// drain path rather than aborting those bytes on a missed health probe.
 	h.pendingID = 0
 	h.transitionLocked("DRAINING", reason)
 	if err := h.writer.enqueue(FrameMetadata{SessionStatus: SessionStatusKeepAlive, Option: OptionProbe | OptionDrain, ProbeID: h.nextID}); err != nil && h.counters != nil {
@@ -246,7 +255,16 @@ func (h *ReverseHealth) checkLocked(now time.Time) {
 		return
 	}
 	if state == "DRAINING" && h.config.DrainIdle != nil && h.config.DrainIdle() {
-		h.failLocked("drain_complete")
+		// An empty session map does not mean its final frames have crossed
+		// the carrier: the transport pipe may still hold payload and End.
+		// A fresh Pong fences those ordered writes before either end closes.
+		if h.drainDeadline.IsZero() {
+			h.drainDeadline = now.Add(ReverseDrainTimeout)
+			h.probeLocked(now, h.drainDeadline.Sub(now))
+			h.drainProbeID = h.pendingID
+		} else if !now.Before(h.drainDeadline) {
+			h.failLocked("drain_confirmation_timeout")
+		}
 		return
 	}
 	if state == "DRAINING" && !h.config.DisconnectOnHealthFailure {
@@ -363,6 +381,17 @@ func (h *ReverseHealth) receive(meta *FrameMetadata) error {
 		}
 		h.lastAck = now
 		h.pendingID = 0
+		if h.snapshot.State == "DRAINING" && meta.ProbeID == h.drainProbeID {
+			if h.config.DrainIdle != nil && h.config.DrainIdle() {
+				h.failLocked("drain_complete")
+			} else {
+				// A dispatch already in flight may have arrived after quarantine.
+				// Wait for its End too, then require another ordered fence.
+				h.drainProbeID = 0
+				h.drainDeadline = time.Time{}
+			}
+			return nil
+		}
 		if !h.ownValidated {
 			h.ownValidated = true
 			if !h.sendLocked(meta.ProbeID, OptionValidated) {

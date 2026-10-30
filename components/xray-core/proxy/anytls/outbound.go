@@ -237,7 +237,7 @@ func (c *Client) createSession(ctx context.Context, dialer internet.Dialer) (*se
 		return nil
 	})
 	if err != nil {
-		return nil, errors.New("anytls: failed to establish connection").AtWarning().Base(err)
+		return nil, errors.New("anytls: failed to establish connection").Base(err)
 	}
 
 	paddingScheme, authPadding := c.paddingSnapshot()

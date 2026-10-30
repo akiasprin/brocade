@@ -41,7 +41,8 @@ func NewTCPNameServer(
 	}
 
 	s.dial = func(ctx context.Context) (net.Conn, error) {
-		link, err := dispatcher.Dispatch(toDnsContext(ctx, s.destination.String()), *s.destination)
+		dnsCtx := queryNetworkContext{Context: toDnsContext(ctx, s.destination.String()), request: ctx}
+		link, err := dispatcher.Dispatch(dnsCtx, *s.destination)
 		if err != nil {
 			return nil, err
 		}
@@ -118,10 +119,10 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 		errors.LogErrorInner(ctx, err, "failed to build dns query for ", fqdn)
 		if noResponseErrCh != nil {
 			if option.IPv4Enable {
-				noResponseErrCh <- err
+				reportQueryError(ctx, noResponseErrCh, err)
 			}
 			if option.IPv6Enable {
-				noResponseErrCh <- err
+				reportQueryError(ctx, noResponseErrCh, err)
 			}
 		}
 		return
@@ -135,6 +136,9 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 	}
 
 	for _, req := range reqs {
+		if !reserveQuery(ctx) {
+			break
+		}
 		go func(r *dnsRequest) {
 			dnsCtx := ctx
 
@@ -155,7 +159,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "failed to pack dns query")
 				if noResponseErrCh != nil {
-					noResponseErrCh <- err
+					reportQueryError(ctx, noResponseErrCh, err)
 				}
 				return
 			}
@@ -164,17 +168,22 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "failed to dial namesever")
 				if noResponseErrCh != nil {
-					noResponseErrCh <- err
+					reportQueryError(ctx, noResponseErrCh, err)
 				}
 				return
 			}
 			defer conn.Close()
+			// Some dispatched connections do not implement deadlines. Cancellation
+			// still has to unblock reads on both dispatched and local TCP sockets.
+			stopClose := context.AfterFunc(dnsCtx, func() { conn.Close() })
+			defer stopClose()
+			_ = conn.SetDeadline(deadline)
 			dnsReqBuf := buf.New()
 			err = binary.Write(dnsReqBuf, binary.BigEndian, uint16(b.Len()))
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "binary write failed")
 				if noResponseErrCh != nil {
-					noResponseErrCh <- err
+					reportQueryError(ctx, noResponseErrCh, err)
 				}
 				return
 			}
@@ -182,7 +191,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "buffer write failed")
 				if noResponseErrCh != nil {
-					noResponseErrCh <- err
+					reportQueryError(ctx, noResponseErrCh, err)
 				}
 				return
 			}
@@ -192,7 +201,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "failed to send query")
 				if noResponseErrCh != nil {
-					noResponseErrCh <- err
+					reportQueryError(ctx, noResponseErrCh, err)
 				}
 				return
 			}
@@ -204,7 +213,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			if err != nil && n == 0 {
 				errors.LogErrorInner(ctx, err, "failed to read response length")
 				if noResponseErrCh != nil {
-					noResponseErrCh <- err
+					reportQueryError(ctx, noResponseErrCh, err)
 				}
 				return
 			}
@@ -213,7 +222,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "failed to parse response length")
 				if noResponseErrCh != nil {
-					noResponseErrCh <- err
+					reportQueryError(ctx, noResponseErrCh, err)
 				}
 				return
 			}
@@ -222,7 +231,7 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			if err != nil && n == 0 {
 				errors.LogErrorInner(ctx, err, "failed to read response length")
 				if noResponseErrCh != nil {
-					noResponseErrCh <- err
+					reportQueryError(ctx, noResponseErrCh, err)
 				}
 				return
 			}
@@ -231,12 +240,14 @@ func (s *TCPNameServer) sendQuery(ctx context.Context, noResponseErrCh chan<- er
 			if err != nil {
 				errors.LogErrorInner(ctx, err, "failed to parse DNS over TCP response")
 				if noResponseErrCh != nil {
-					noResponseErrCh <- err
+					reportQueryError(ctx, noResponseErrCh, err)
 				}
 				return
 			}
 
-			s.cacheController.updateRecord(r, rec)
+			if dnsCtx.Err() == nil {
+				s.cacheController.updateRecord(r, rec)
+			}
 		}(req)
 	}
 }

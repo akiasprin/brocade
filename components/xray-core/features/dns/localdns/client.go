@@ -30,12 +30,20 @@ func (*Client) Close() error { return nil }
 
 // LookupIP implements Client.
 func (c *Client) LookupIP(host string, option dns.IPOption) ([]net.IP, uint32, error) {
+	ctx := option.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.LookupIPContext(ctx, host, option)
+}
+
+func (c *Client) LookupIPContext(ctx context.Context, host string, option dns.IPOption) ([]net.IP, uint32, error) {
 	var ips []net.IP
 	var err error
 	if len(internet.Controllers) > 0 {
-		ips, err = c.r.LookupIP(context.Background(), "ip", host)
+		ips, err = c.r.LookupIP(ctx, "ip", host)
 	} else {
-		ips, err = net.LookupIP(host)
+		ips, err = net.DefaultResolver.LookupIP(ctx, "ip", host)
 	}
 	if err != nil {
 		return nil, 0, err
@@ -97,6 +105,9 @@ func New() *Client {
 	r := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if internet.IsSkippedDNSServer(address) {
+				return nil, errors.New("skipped DNS server ", address)
+			}
 			return d.DialContext(ctx, network, address)
 		},
 	}

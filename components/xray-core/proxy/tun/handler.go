@@ -2,6 +2,8 @@ package tun
 
 import (
 	"context"
+	"net/netip"
+	"strings"
 	"syscall"
 
 	"github.com/xtls/xray-core/common"
@@ -15,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -30,6 +33,46 @@ type Handler struct {
 	dispatcher      routing.Dispatcher
 	tag             string
 	sniffingRequest session.SniffingRequest
+	uplinkCounter   stats.Counter
+	downlinkCounter stats.Counter
+}
+
+type tunUDPStatsWriter struct {
+	writer  buf.Writer
+	counter stats.Counter
+}
+
+func (w *tunUDPStatsWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	for len(mb) > 0 {
+		remaining, packet := buf.SplitFirst(mb)
+		packetSize := packet.Len()
+		if err := w.writer.WriteMultiBuffer(buf.MultiBuffer{packet}); err != nil {
+			buf.ReleaseMulti(remaining)
+			return err
+		}
+		w.counter.Add(int64(packetSize))
+		mb = remaining
+	}
+	return nil
+}
+
+// TCPWriter is the writing side of a TCP connection of the stack for the dispatcher. It has no Close: the outbound
+// closes its writer when the other side has no more to send, and the system may still be sending
+type TCPWriter struct {
+	Writer buf.Writer
+	// Counter counts what is written, if there is one
+	Counter stats.Counter
+}
+
+func (w *TCPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	size := mb.Len()
+	if err := w.Writer.WriteMultiBuffer(mb); err != nil {
+		return err
+	}
+	if w.Counter != nil {
+		w.Counter.Add(int64(size))
+	}
+	return nil
 }
 
 // ConnectionHandler interface with the only method that stack is going to push new connections to
@@ -40,10 +83,11 @@ type ConnectionHandler interface {
 // Handler implements ConnectionHandler
 var _ ConnectionHandler = (*Handler)(nil)
 
+// Handler implements common.Runnable
+var _ common.Runnable = (*Handler)(nil)
+
 // Init the Handler instance with necessary parameters
 func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routing.Dispatcher) error {
-	var err error
-
 	// Retrieve tag and sniffing config from context (set by AlwaysOnInboundHandler)
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		t.tag = inbound.Tag
@@ -56,6 +100,27 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 	t.policyManager = pm
 	t.dispatcher = dispatcher
 
+	if len(t.tag) > 0 && pm.ForSystem().Stats.InboundUplink {
+		statsManager := core.MustFromContext(ctx).GetFeature(stats.ManagerType()).(stats.Manager)
+		name := "inbound>>>" + t.tag + ">>>traffic>>>uplink"
+		c, _ := statsManager.GetOrRegisterCounter(name)
+		if c != nil {
+			t.uplinkCounter = c
+		}
+	}
+	if len(t.tag) > 0 && pm.ForSystem().Stats.InboundDownlink {
+		statsManager := core.MustFromContext(ctx).GetFeature(stats.ManagerType()).(stats.Manager)
+		name := "inbound>>>" + t.tag + ">>>traffic>>>downlink"
+		c, _ := statsManager.GetOrRegisterCounter(name)
+		if c != nil {
+			t.downlinkCounter = c
+		}
+	}
+
+	return nil
+}
+
+func (t *Handler) Start() error {
 	tunName := t.config.Name
 	tunInterface, err := NewTun(t.config)
 	if err != nil {
@@ -77,14 +142,24 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 			iface := updater.Get()
 			if iface == nil {
 				errors.LogInfo(context.Background(), "[tun] falied to set interface > iface == nil")
-				return nil
+				return errors.New("iface not found")
 			}
-			return c.Control(func(fd uintptr) {
+			var controlErr, sockErr error
+			controlErr = c.Control(func(fd uintptr) {
+				addrPort, _ := netip.ParseAddrPort(address)
+				// skip loopback
+				if addrPort.Addr().IsLoopback() || strings.HasPrefix(strings.ToLower(address), "localhost:") {
+					return
+				}
 				err := setinterface(network, address, fd, iface)
 				if err != nil {
-					errors.LogInfoInner(context.Background(), err, "[tun] falied to set interface")
+					sockErr = errors.New("[tun] falied to set interface").Base(err)
 				}
 			})
+			if sockErr != nil {
+				return sockErr
+			}
+			return controlErr
 		})
 	}
 
@@ -92,7 +167,8 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 
 	tunStackOptions := StackOptions{
 		Tun:         tunInterface,
-		IdleTimeout: pm.ForLevel(t.config.UserLevel).Timeouts.ConnectionIdle,
+		MTU:         t.config.MTU,
+		IdleTimeout: t.policyManager.ForLevel(t.config.UserLevel).Timeouts.ConnectionIdle,
 	}
 	tunStack, err := NewStack(t.ctx, tunStackOptions, t)
 	if err != nil {
@@ -114,6 +190,18 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 		return err
 	}
 
+	// Platform-specific system DNS takeover, where the platform implements it.
+	// Rather no TUN than one that the system DNS bypasses.
+	if c, ok := tunInterface.(interface {
+		ConfigureSystemDNS(context.Context, string) error
+	}); ok {
+		if err := c.ConfigureSystemDNS(t.ctx, t.tag); err != nil {
+			_ = tunStack.Close()
+			_ = tunInterface.Close()
+			return errors.New("unable to set the system DNS (remove autoSystemDnsToGateway to run without)").Base(err)
+		}
+	}
+
 	t.stack = tunStack
 	t.tun = tunInterface
 
@@ -132,6 +220,7 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	ctx = c.ContextWithID(ctx, session.NewID())
 
 	source := net.DestinationFromAddr(conn.RemoteAddr())
+
 	inbound := session.Inbound{
 		Name:   "tun",
 		Tag:    t.tag,
@@ -156,9 +245,18 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	})
 	errors.LogInfo(ctx, "processing from ", source, " to ", destination)
 
+	// both kinds of connection are buf.Reader and buf.Writer, what they carry is counted on the way
+	reader := &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn), Counter: t.uplinkCounter}
+	writer := buf.NewWriter(conn)
+	if destination.Network != net.Network_UDP {
+		writer = &TCPWriter{Writer: writer, Counter: t.downlinkCounter}
+	} else if t.downlinkCounter != nil {
+		writer = &tunUDPStatsWriter{writer: writer, counter: t.downlinkCounter}
+	}
+
 	link := &transport.Link{
-		Reader: &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn)},
-		Writer: buf.NewWriter(conn),
+		Reader: reader,
+		Writer: writer,
 	}
 	if err := t.dispatcher.DispatchLink(ctx, destination, link); err != nil {
 		errors.LogError(ctx, errors.New("connection closed").Base(err))
@@ -167,7 +265,7 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 
 // Close implements common.Closable.
 func (t *Handler) Close() error {
-	return errors.Combine(t.stack.Close(), t.tun.Close())
+	return errors.Combine(common.CloseIfExists(t.stack), common.CloseIfExists(t.tun))
 }
 
 // Network implements proxy.Inbound

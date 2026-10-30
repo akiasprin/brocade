@@ -3,6 +3,7 @@ package splithttp
 import (
 	"context"
 	"crypto/rand"
+	"google.golang.org/protobuf/proto"
 	"math"
 	"math/big"
 	"sync"
@@ -55,14 +56,19 @@ func (c *XmuxClient) maybeClose() {
 }
 
 type XmuxManager struct {
-	xmuxConfig  XmuxConfig
+	xmuxConfig  *XmuxConfig
 	concurrency int32
 	connections int32
 	newConnFunc func() XmuxConn
 	xmuxClients []*XmuxClient
 }
 
-func NewXmuxManager(xmuxConfig XmuxConfig, newConnFunc func() XmuxConn) *XmuxManager {
+func NewXmuxManager(xmuxConfig *XmuxConfig, newConnFunc func() XmuxConn) *XmuxManager {
+	if xmuxConfig == nil {
+		xmuxConfig = &XmuxConfig{}
+	} else {
+		xmuxConfig = proto.Clone(xmuxConfig).(*XmuxConfig)
+	}
 	return &XmuxManager{
 		xmuxConfig:  xmuxConfig,
 		concurrency: xmuxConfig.GetNormalizedMaxConcurrency().rand(),
@@ -92,6 +98,14 @@ func (m *XmuxManager) newXmuxClient() *XmuxClient {
 }
 
 func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when locking
+	return m.getXmuxClient(ctx, true)
+}
+
+func (m *XmuxManager) GetExistingXmuxClient(ctx context.Context) *XmuxClient {
+	return m.getXmuxClient(ctx, false)
+}
+
+func (m *XmuxManager) getXmuxClient(ctx context.Context, create bool) *XmuxClient {
 	for i := 0; i < len(m.xmuxClients); {
 		xmuxClient := m.xmuxClients[i]
 		if xmuxClient.XmuxConn.IsClosed() ||
@@ -112,11 +126,14 @@ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when l
 	}
 
 	if len(m.xmuxClients) == 0 {
+		if !create {
+			return nil
+		}
 		errors.LogDebug(ctx, "XMUX: creating xmuxClient because xmuxClients is empty")
 		return m.newXmuxClient()
 	}
 
-	if m.connections > 0 && len(m.xmuxClients) < int(m.connections) {
+	if create && m.connections > 0 && len(m.xmuxClients) < int(m.connections) {
 		errors.LogDebug(ctx, "XMUX: creating xmuxClient because maxConnections was not hit, xmuxClients = ", len(m.xmuxClients))
 		return m.newXmuxClient()
 	}
@@ -133,6 +150,9 @@ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient { // when l
 	}
 
 	if len(xmuxClients) == 0 {
+		if !create {
+			return nil
+		}
 		errors.LogDebug(ctx, "XMUX: creating xmuxClient because maxConcurrency was hit, xmuxClients = ", len(m.xmuxClients))
 		return m.newXmuxClient()
 	}

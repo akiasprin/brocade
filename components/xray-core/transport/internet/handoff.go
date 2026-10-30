@@ -59,3 +59,62 @@ func OpenPacketHandoffListener(logicalAddress string, config *SocketConfig, bind
 	}
 	return controller(logicalAddress, config, bind)
 }
+
+// ListenPacketWithHandoff registers the raw socket before applying UDP masks.
+// Generation identity and admission belong to that socket, while the transport
+// must receive the masked connection to preserve its wire protocol.
+func ListenPacketWithHandoff(ctx context.Context, addr *net.UDPAddr, settings *MemoryStreamConfig) (net.PacketConn, PacketHandoffGate, error) {
+	var config *SocketConfig
+	if settings != nil {
+		config = settings.SocketSettings
+	}
+	packetHandoffRegistry.RLock()
+	controller := packetHandoffRegistry.controller
+	packetHandoffRegistry.RUnlock()
+
+	var raw net.PacketConn
+	var gate PacketHandoffGate
+	bound := false
+	listenPacket := func(ctx context.Context, addr net.Addr) (net.PacketConn, error) {
+		if controller == nil {
+			return ListenSystemPacket(ctx, addr, config)
+		}
+		if bound {
+			return nil, fmt.Errorf("UDP handoff cannot manage multiple sockets for one masked listener")
+		}
+		bound = true
+		var err error
+		raw, gate, err = controller(addr.String(), config, func(bindAddress string) (net.PacketConn, error) {
+			udpAddress, err := net.ResolveUDPAddr("udp", bindAddress)
+			if err != nil {
+				return nil, err
+			}
+			return ListenSystemPacket(ctx, udpAddress, config)
+		})
+		return raw, err
+	}
+
+	var conn net.PacketConn
+	var err error
+	if settings != nil && settings.FinalMask != nil {
+		conn, err = settings.FinalMask.WithPacketListener(listenPacket).ListenPacket(ctx, addr)
+	} else {
+		conn, err = listenPacket(ctx, addr)
+	}
+	if err == nil && controller != nil && !bound {
+		err = fmt.Errorf("UDP mask does not expose a raw socket for handoff")
+	}
+	if err != nil {
+		if conn != nil {
+			conn.Close()
+		}
+		if raw != nil {
+			raw.Close()
+		}
+		if gate != nil {
+			gate.Close()
+		}
+		return nil, nil, err
+	}
+	return conn, gate, nil
+}

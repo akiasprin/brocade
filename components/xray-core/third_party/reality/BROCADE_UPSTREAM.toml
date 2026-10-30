@@ -1,0 +1,14 @@
+repository = "https://github.com/XTLS/REALITY.git"
+commit = "83f621788ca88b83179810b12baa7ae518aacb83"
+version = "v0.0.0-20261014101318-83f621788ca8"
+imported_at = "2026-10-28"
+license = "MPL-2.0 AND BSD-3-Clause"
+
+# The module keeps its canonical import path. Config.AllowLegacyX25519 is opt-in at
+# this dependency layer; Brocade enables it by default for historical server configs.
+# Modern profiles still need their complete hybrid key share. Authentication remains
+# subject to ECDH, AEAD, SNI, short ID and the configured version/time constraints.
+legacy_x25519_admission = true
+optional_sni_ack_fits_record = true
+# The official handshake's unreachable tail is removed so full go vet can run.
+unreachable_handshake_tail_removed = true

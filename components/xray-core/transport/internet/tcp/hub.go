@@ -43,36 +43,26 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
 	}
 	var listener net.Listener
 	var err error
+	var addr net.Addr
 	if port == net.Port(0) { // unix
-		if !address.Family().IsDomain() {
-			return nil, errors.New("invalid unix listen: ", address).AtError()
+		addr = &net.UnixAddr{Name: address.Domain(), Net: "unix"}
+	} else { // tcp
+		addr = &net.TCPAddr{IP: address.IP(), Port: int(port)}
+	}
+	if port == 0 || streamSettings.FinalMask != nil {
+		if streamSettings.FinalMask != nil {
+			listener, err = streamSettings.FinalMask.Listen(ctx, addr)
+		} else {
+			listener, err = internet.ListenSystem(ctx, addr, streamSettings.SocketSettings)
 		}
-		listener, err = internet.ListenSystem(ctx, &net.UnixAddr{
-			Name: address.Domain(),
-			Net:  "unix",
-		}, streamSettings.SocketSettings)
-		if err != nil {
-			return nil, errors.New("failed to listen Unix Domain Socket on ", address).Base(err)
-		}
-		errors.LogInfo(ctx, "listening Unix Domain Socket on ", address)
 	} else {
-		addr := &net.TCPAddr{
-			IP:   address.IP(),
-			Port: int(port),
-		}
-		unsupported := streamSettings.TcpmaskManager != nil || tcpSettings.HeaderSettings != nil || (streamSettings.SocketSettings != nil && streamSettings.SocketSettings.AcceptProxyProtocol)
-		listener, l.handoff, err = openHandoffListener(addr.String(), unsupported, streamSettings.SocketSettings, func() (net.Listener, error) {
-			return internet.ListenSystem(ctx, addr, streamSettings.SocketSettings)
-		})
-		if err != nil {
-			return nil, errors.New("failed to listen TCP on ", address, ":", port).Base(err)
-		}
-		errors.LogInfo(ctx, "listening TCP on ", address, ":", port)
+		unsupported := tcpSettings.HeaderSettings != nil || (streamSettings.SocketSettings != nil && streamSettings.SocketSettings.AcceptProxyProtocol)
+		listener, l.handoff, err = openHandoffListener(addr.String(), unsupported, streamSettings.SocketSettings, func() (net.Listener, error) { return internet.ListenSystem(ctx, addr, streamSettings.SocketSettings) })
 	}
-
-	if streamSettings.TcpmaskManager != nil {
-		listener, _ = streamSettings.TcpmaskManager.WrapListener(listener)
+	if err != nil {
+		return nil, errors.New("failed to listen ", addr.Network(), " on ", address, ":", port).Base(err)
 	}
+	errors.LogInfo(ctx, "listening ", addr.Network(), " on ", address, ":", port)
 
 	if streamSettings.SocketSettings != nil && streamSettings.SocketSettings.AcceptProxyProtocol {
 		errors.LogWarning(ctx, "accepting PROXY protocol")
@@ -92,11 +82,11 @@ func ListenTCP(ctx context.Context, address net.Address, port net.Port, streamSe
 	if tcpSettings.HeaderSettings != nil {
 		headerConfig, err := tcpSettings.HeaderSettings.GetInstance()
 		if err != nil {
-			return nil, errors.New("invalid header settings").Base(err).AtError()
+			return nil, errors.New("invalid header settings").Base(err)
 		}
 		auth, err := internet.CreateConnectionAuthenticator(headerConfig)
 		if err != nil {
-			return nil, errors.New("invalid header settings.").Base(err).AtError()
+			return nil, errors.New("invalid header settings.").Base(err)
 		}
 		l.authConfig = auth
 	}

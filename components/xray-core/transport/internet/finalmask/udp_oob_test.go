@@ -2,12 +2,14 @@ package finalmask_test
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"sync/atomic"
 	"syscall"
 	"testing"
 
+	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
 	"golang.org/x/net/ipv4"
@@ -118,17 +120,21 @@ func wrapSalamanderOOBPair(t *testing.T) (
 	t.Helper()
 	clientRaw := newScriptedOOBPacketConn(t)
 	serverRaw := newScriptedOOBPacketConn(t)
-	manager := finalmask.NewUdpmaskManager([]finalmask.Udpmask{
-		&salamander.Config{Password: "oob-test-password"},
-	})
-	clientPacketConn, err := manager.WrapPacketConnClient(clientRaw)
+	manager := finalmask.NewFinalMask(nil, []finalmask.UDPMask{&salamander.Config{Password: "oob-test-password"}}, nil, nil,
+		func(context.Context, xnet.Destination) (net.PacketConn, net.Addr, error) {
+			return clientRaw, serverRaw.LocalAddr(), nil
+		},
+		func(context.Context, net.Addr) (net.PacketConn, error) { return serverRaw, nil })
+	wrapped, err := manager.DialUDP(context.Background(), xnet.DestinationFromAddr(serverRaw.LocalAddr()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverPacketConn, err := manager.WrapPacketConnServer(serverRaw)
+	clientPacketConn := wrapped.(*xnet.PacketConnWrapper).PacketConn
+	serverPacketConn, err := manager.ListenPacket(context.Background(), serverRaw.LocalAddr())
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	client, ok := clientPacketConn.(quicOOBPacketConn)
 	if !ok {
 		t.Fatalf("client finalmask dropped QUIC UDP capabilities: %T", clientPacketConn)

@@ -162,7 +162,7 @@ func TestServerActiveSessionAndNewIdleTransitionRemainProtected(t *testing.T) {
 	clock := newFakePoolClock()
 	w := newServerIdleWorkerForTest(clock)
 	serverIdlePingForTest(t, w)
-	s := w.sessionManager.Allocate(&ClientStrategy{MaxConcurrency: 2})
+	s := w.sessionManager.Allocate(&ClientStrategy{MaxConcurrency: 2}, nil, nil)
 	if s == nil {
 		t.Fatal("allocate business session")
 	}
@@ -236,7 +236,7 @@ func TestServerPoolSessionBetweenIdleChecksReceivesGrace(t *testing.T) {
 	w := newServerIdleWorkerForTest(clock)
 	serverIdlePingForTest(t, w)
 	clock.Advance(serverPeerIdleGrace)
-	s := w.sessionManager.Allocate(&ClientStrategy{MaxConcurrency: 1})
+	s := w.sessionManager.Allocate(&ClientStrategy{MaxConcurrency: 1}, nil, nil)
 	if s == nil {
 		t.Fatal("allocate business session")
 	}

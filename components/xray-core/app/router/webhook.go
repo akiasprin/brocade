@@ -7,60 +7,15 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"path/filepath"
-	"runtime"
-	"strings"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/features/routing"
 	routing_session "github.com/xtls/xray-core/features/routing/session"
 )
-
-// parseURL splits a webhook URL into an HTTP URL and an optional Unix socket
-// path. For regular http/https URLs the input is returned unchanged with an
-// empty socketPath. For Unix sockets the format is:
-//
-//	/path/to/socket.sock:/http/path
-//	@abstract:/http/path
-//	@@padded:/http/path
-//
-// The :/ separator after the socket path delimits the HTTP request path.
-// If omitted, "/" is used.
-func parseURL(raw string) (httpURL, socketPath string) {
-	if len(raw) == 0 || (!filepath.IsAbs(raw) && raw[0] != '@') {
-		return raw, ""
-	}
-	if idx := strings.Index(raw, ":/"); idx >= 0 {
-		return "http://localhost" + raw[idx+1:], raw[:idx]
-	}
-	return "http://localhost/", raw
-}
-
-// resolveSocketPath applies platform-specific transformations to a Unix
-// socket path, matching the behaviour of the listen side in
-// transport/internet/system_listener.go.
-//
-// For abstract sockets (prefix @) on Linux/Android:
-//   - single @ — used as-is (lock-free abstract socket)
-//   - double @@ — stripped to single @ and padded to
-//     syscall.RawSockaddrUnix{}.Path length (HAProxy compat)
-func resolveSocketPath(path string) string {
-	if len(path) == 0 || path[0] != '@' {
-		return path
-	}
-	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
-		return path
-	}
-	if len(path) > 1 && path[1] == '@' {
-		fullAddr := make([]byte, len(syscall.RawSockaddrUnix{}.Path))
-		copy(fullAddr, path[1:])
-		return string(fullAddr)
-	}
-	return path
-}
 
 func ptr[T any](v T) *T { return &v }
 
@@ -86,6 +41,7 @@ type WebhookNotifier struct {
 	deduplication uint32
 	client        *http.Client
 	seen          sync.Map
+	lastSweep     atomic.Int64
 	done          chan struct{}
 	wg            sync.WaitGroup
 	closeOnce     sync.Once
@@ -97,7 +53,7 @@ func NewWebhookNotifier(cfg *WebhookConfig) (*WebhookNotifier, error) {
 		return nil, nil
 	}
 
-	httpURL, socketPath := parseURL(cfg.Url)
+	httpURL, socketPath := utils.SplitHTTPUnixURL(cfg.Url)
 	h := &WebhookNotifier{
 		url:           httpURL,
 		deduplication: cfg.Deduplication,
@@ -108,7 +64,7 @@ func NewWebhookNotifier(cfg *WebhookConfig) (*WebhookNotifier, error) {
 	}
 
 	if socketPath != "" {
-		dialAddr := resolveSocketPath(socketPath)
+		dialAddr := utils.ResolveSocketPath(socketPath)
 		h.client.Transport = &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
@@ -122,11 +78,6 @@ func NewWebhookNotifier(cfg *WebhookConfig) (*WebhookNotifier, error) {
 		for k, v := range cfg.Headers {
 			h.headers[k] = v
 		}
-	}
-
-	if h.deduplication > 0 {
-		h.wg.Add(1)
-		go h.cleanupLoop()
 	}
 
 	return h, nil
@@ -250,6 +201,7 @@ func (h *WebhookNotifier) isDuplicate(email string) bool {
 	}
 	ttl := time.Duration(h.deduplication) * time.Second
 	now := time.Now()
+	h.maybeSweep(now, ttl)
 	if v, loaded := h.seen.LoadOrStore(email, now); loaded {
 		if now.Sub(v.(time.Time)) < ttl {
 			return true
@@ -259,27 +211,23 @@ func (h *WebhookNotifier) isDuplicate(email string) bool {
 	return false
 }
 
-func (h *WebhookNotifier) cleanupLoop() {
-	defer h.wg.Done()
-	ttl := time.Duration(h.deduplication) * time.Second
-	ticker := time.NewTicker(ttl)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-h.done:
-			return
-		case <-ticker.C:
-			now := time.Now()
-			h.seen.Range(func(key, value any) bool {
-				if now.Sub(value.(time.Time)) >= ttl {
-					h.seen.Delete(key)
-				}
-				return true
-			})
-		}
+func (h *WebhookNotifier) maybeSweep(now time.Time, ttl time.Duration) {
+	last := h.lastSweep.Load()
+	if now.UnixNano()-last < int64(ttl) {
+		return
 	}
+	if !h.lastSweep.CompareAndSwap(last, now.UnixNano()) {
+		return // another goroutine did the sweep
+	}
+	h.seen.Range(func(key, value any) bool {
+		if now.Sub(value.(time.Time)) >= ttl {
+			h.seen.Delete(key)
+		}
+		return true
+	})
 }
 
+// Only need to call if the Notifier is really used, otherwise GC can clean it
 func (h *WebhookNotifier) Close() error {
 	h.closeOnce.Do(func() {
 		h.lifecycle.Lock()

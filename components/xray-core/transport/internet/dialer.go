@@ -38,7 +38,7 @@ var transportDialerCache = make(map[string]dialFunc)
 // RegisterTransportDialer registers a Dialer with given name.
 func RegisterTransportDialer(protocol string, dialer dialFunc) error {
 	if _, found := transportDialerCache[protocol]; found {
-		return errors.New(protocol, " dialer already registered").AtError()
+		return errors.New(protocol, " dialer already registered")
 	}
 	transportDialerCache[protocol] = dialer
 	return nil
@@ -58,7 +58,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *MemoryStrea
 		protocol := streamSettings.ProtocolName
 		dialer := transportDialerCache[protocol]
 		if dialer == nil {
-			return nil, errors.New(protocol, " dialer not registered").AtError()
+			return nil, errors.New(protocol, " dialer not registered")
 		}
 		return dialer(ctx, dest, streamSettings)
 	}
@@ -66,7 +66,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *MemoryStrea
 	if dest.Network == net.Network_UDP {
 		udpDialer := transportDialerCache["udp"]
 		if udpDialer == nil {
-			return nil, errors.New("UDP dialer not registered").AtError()
+			return nil, errors.New("UDP dialer not registered")
 		}
 		return udpDialer(ctx, dest, streamSettings)
 	}
@@ -85,17 +85,41 @@ var (
 )
 
 func LookupForIP(domain string, strategy DomainStrategy, localAddr net.Address) ([]net.IP, error) {
+	return LookupForIPTrace(domain, strategy, localAddr, nil)
+}
+
+// LookupForIPTrace records the exact lookups used by this dial; ordinary callers allocate none.
+func LookupForIPTrace(domain string, strategy DomainStrategy, localAddr net.Address, lookups *[]dns.LookupTrace) ([]net.IP, error) {
+	return LookupForIPTraceContext(nil, domain, strategy, localAddr, lookups)
+}
+
+func LookupForIPTraceContext(ctx context.Context, domain string, strategy DomainStrategy, localAddr net.Address, lookups *[]dns.LookupTrace) ([]net.IP, error) {
 	if dnsClient == nil {
-		return nil, errors.New("DNS client not initialized").AtError()
+		return nil, errors.New("DNS client not initialized")
 	}
 
-	ips, _, err := dnsClient.LookupIP(domain, dns.IPOption{
+	query := func(option dns.IPOption) ([]net.IP, uint32, error) {
+		option.Context = ctx
+		if lookups == nil {
+			return dnsClient.LookupIP(domain, option)
+		}
+		if len(*lookups) >= 8 {
+			(*lookups)[7].Complete = false
+			return dnsClient.LookupIP(domain, option)
+		}
+		trace := dns.LookupTrace{Domain: domain, Strategy: strategy.String()}
+		option.Trace = &trace
+		ips, ttl, err := dnsClient.LookupIP(domain, option)
+		*lookups = append(*lookups, trace)
+		return ips, ttl, err
+	}
+	ips, _, err := query(dns.IPOption{
 		IPv4Enable: (localAddr == nil && strategy.PreferIP4()) || (localAddr != nil && localAddr.Family().IsIPv4() && (strategy.PreferIP4() || strategy.FallbackIP4())),
 		IPv6Enable: (localAddr == nil && strategy.PreferIP6()) || (localAddr != nil && localAddr.Family().IsIPv6() && (strategy.PreferIP6() || strategy.FallbackIP6())),
 	})
 	{ // Resolve fallback
 		if (len(ips) == 0 || err != nil) && strategy.HasFallback() && localAddr == nil {
-			ips, _, err = dnsClient.LookupIP(domain, dns.IPOption{
+			ips, _, err = query(dns.IPOption{
 				IPv4Enable: strategy.FallbackIP4(),
 				IPv6Enable: strategy.FallbackIP6(),
 			})
@@ -133,7 +157,6 @@ func redirect(ctx context.Context, dst net.Destination, obt string, h outbound.H
 		cnc.ConnectionOnClose(common.ChainedClosable{uw, dw}),
 	)
 	return nc
-
 }
 
 func checkAddressPortStrategy(ctx context.Context, dest net.Destination, sockopt *SocketConfig) (*net.Destination, error) {
@@ -270,11 +293,11 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 
 	if len(sockopt.DialerProxy) > 0 {
 		if obm == nil {
-			return nil, errors.New("there is no outbound manager for dialerProxy").AtError()
+			return nil, errors.New("there is no outbound manager for dialerProxy")
 		}
 		h := obm.GetHandler(sockopt.DialerProxy)
 		if h == nil {
-			return nil, errors.New("there is no outbound handler for dialerProxy").AtError()
+			return nil, errors.New("there is no outbound handler for dialerProxy")
 		}
 		return redirect(ctx, dest, sockopt.DialerProxy, h), nil
 	}

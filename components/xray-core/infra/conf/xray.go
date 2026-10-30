@@ -3,6 +3,7 @@ package conf
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -14,7 +15,13 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 	core "github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/proxy/freedom"
+	"github.com/xtls/xray-core/proxy/masque"
+	"github.com/xtls/xray-core/proxy/vless"
+	"github.com/xtls/xray-core/proxy/vless/inbound"
+	"github.com/xtls/xray-core/proxy/vless/outbound"
 	"github.com/xtls/xray-core/transport/internet"
+	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -32,6 +39,7 @@ var (
 		"trojan":        func() interface{} { return new(TrojanServerConfig) },
 		"wireguard":     func() interface{} { return &WireGuardConfig{IsClient: false} },
 		"hysteria":      func() interface{} { return new(HysteriaServerConfig) },
+		"masque":        func() interface{} { return new(MasqueServerConfig) },
 		"tun":           func() interface{} { return new(TunConfig) },
 	}, "protocol", "settings")
 
@@ -210,7 +218,7 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 	// TUN inbound doesn't need port configuration as it uses network interface instead
 	if strings.ToLower(c.Protocol) == "tun" {
 		// Skip port validation for TUN
-	} else if c.ListenOn == nil {
+	} else if c.ListenOn == nil || len(c.ListenOn.String()) == 0 {
 		// Listen on anyip, must set PortList
 		if c.PortList == nil {
 			return nil, errors.New("Listen on AnyIP but no Port(s) set in InboundDetour.")
@@ -246,7 +254,7 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 		receiverSettings.StreamSettings = ss
 		if strings.Contains(ss.SecurityType, "reality") && (receiverSettings.PortList == nil ||
 			len(receiverSettings.PortList.Ports()) != 1 || receiverSettings.PortList.Ports()[0] != 443) {
-			errors.LogWarning(context.Background(), `REALITY: Listening on non-443 ports may get your IP blocked by the GFW`)
+			errors.LogWarning(context.Background(), `REALITY: Listening on non-443 ports will increase the likelihood of your server's IP being blocked by the GFW`)
 		}
 	}
 	if c.SniffingConfig != nil {
@@ -272,6 +280,12 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 	if err != nil {
 		return nil, errors.New("failed to build inbound handler for protocol ", c.Protocol).Base(err)
 	}
+	if _, ok := ts.(*masque.ServerConfig); !ok && receiverSettings.StreamSettings != nil && receiverSettings.StreamSettings.ProtocolName == "masque" {
+		return nil, errors.New("the masque transport can only be used by the masque inbound")
+	}
+	if err := validateXDrive(ts, receiverSettings.StreamSettings, nil, receiverSettings.PortList); err != nil {
+		return nil, err
+	}
 
 	return &core.InboundHandlerConfig{
 		Tag:              c.Tag,
@@ -286,33 +300,104 @@ type OutboundDetourConfig struct {
 	Tag            string           `json:"tag"`
 	Settings       *json.RawMessage `json:"settings"`
 	StreamSetting  *StreamConfig    `json:"streamSettings"`
-	ProxySettings  *ProxyConfig     `json:"proxySettings"`
+	ProxySettings  *json.RawMessage `json:"proxySettings"`
 	MuxSettings    *MuxConfig       `json:"mux"`
 	TargetStrategy string           `json:"targetStrategy"`
 }
 
-func (c *OutboundDetourConfig) checkChainProxyConfig() error {
-	if c.StreamSetting == nil || c.ProxySettings == nil || c.StreamSetting.SocketSettings == nil {
+func requiresTransportSecurity(address *Address) bool {
+	if address == nil || address.Address == nil {
+		return false
+	}
+	if address.Family().IsIP() {
+		return !geodata.GetPrivateIPMatcher().Match(address.IP())
+	}
+	domain := strings.TrimSuffix(strings.ToLower(address.Domain()), ".")
+	return !geodata.GetPrivateDomainMatcher().MatchAny(domain)
+}
+
+func validateOutboundTransportSecurity(rawConfig interface{}, senderSettings *proxyman.SenderConfig) error {
+	if senderSettings.StreamSettings != nil && senderSettings.StreamSettings.GetSecurityType() != "" {
 		return nil
 	}
-	if len(c.ProxySettings.Tag) > 0 && len(c.StreamSetting.SocketSettings.DialerProxy) > 0 {
-		return errors.New("proxySettings.tag is conflicted with sockopt.dialerProxy").AtWarning()
+
+	// Brocade's revisioned relay and external-outbound models explicitly select
+	// the wire security. Preserve their existing encryption="none" snapshots;
+	// the dial address alone cannot tell whether another layer protects the link.
+
+	if tjCfg, ok := rawConfig.(*TrojanClientConfig); ok {
+		if requiresTransportSecurity(tjCfg.Servers[0].Address) {
+			return errors.New("trojan without TLS is prohibited unless the server address is a private IP or domain")
+		}
+	}
+
+	return nil
+}
+
+// validateXDrive allows only VLESS with encryption on xdrive, and on the client Mux.Cool for every connection
+func validateXDrive(ts proto.Message, ss *internet.StreamConfig, ms *proxyman.MultiplexingConfig, pl *net.PortList) error {
+	if ss == nil || ss.ProtocolName != "xdrive" {
+		return nil
+	}
+	switch c := ts.(type) {
+	case *outbound.Config:
+		a, err := c.Vnext.User.Account.GetInstance()
+		if err != nil {
+			return err
+		}
+		account := a.(*vless.Account)
+		if account.Flow != "" {
+			return errors.New(`the xdrive transport doesn't support VLESS "flow"`)
+		}
+		if account.Encryption == "none" {
+			return errors.New(`the xdrive transport needs VLESS "encryption", run "xray vlessenc" to get one`)
+		}
+		// reverse opens its own mux
+		if account.Reverse == nil && (ms == nil || !ms.Enabled || ms.Concurrency < 0 || ms.XudpConcurrency < 0 || ms.XudpProxyUDP443 == "skip") {
+			return errors.New(`the xdrive transport needs "mux" enabled, with no negative "concurrency" or "xudpConcurrency" and no "xudpProxyUDP443":"skip"`)
+		}
+		if account.Testpre != 0 {
+			return errors.New(`the xdrive transport doesn't support VLESS "testpre"`)
+		}
+	case *inbound.Config:
+		if c.Decryption == "none" {
+			return errors.New(`the xdrive transport needs VLESS "decryption", run "xray vlessenc" to get one`)
+		}
+		for _, user := range c.Users {
+			a, err := user.Account.GetInstance()
+			if err != nil {
+				return err
+			}
+			if a.(*vless.Account).Flow != "" {
+				return errors.New(`the xdrive transport doesn't support VLESS "flow"`)
+			}
+		}
+		// every port gets its own listener on the same folder, and each of them accepts the same session
+		if pl != nil && len(pl.Ports()) != 1 {
+			return errors.New("the xdrive transport can only listen on one port")
+		}
+	default:
+		return errors.New("the xdrive transport can only be used by VLESS")
 	}
 	return nil
 }
 
 // Build implements Buildable.
 func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
+	if c.StreamSetting != nil && c.StreamSetting.Method != nil {
+		c.StreamSetting.Network = c.StreamSetting.Method
+	}
 	if c.Protocol == "masque" {
 		if c.StreamSetting == nil || c.StreamSetting.Network == nil || string(*c.StreamSetting.Network) != "masque" || c.StreamSetting.Security != "tls" {
 			return nil, errors.New("MASQUE outbound requires MASQUE transport with TLS")
 		}
-		if c.MuxSettings != nil && c.MuxSettings.Enabled {
-			return nil, errors.New("MASQUE outbound does not support mux")
-		}
 	} else if c.StreamSetting != nil && c.StreamSetting.Network != nil && string(*c.StreamSetting.Network) == "masque" {
 		return nil, errors.New("MASQUE transport requires MASQUE outbound")
 	}
+	if c.ProxySettings != nil {
+		return nil, errors.PrintRemovedFeatureError(`outbound "proxySettings"`, `"streamSettings.sockopt.dialerProxy"`)
+	}
+
 	senderSettings := &proxyman.SenderConfig{}
 	switch strings.ToLower(c.TargetStrategy) {
 	case "asis", "":
@@ -340,13 +425,10 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 	default:
 		return nil, errors.New("unsupported target domain strategy: ", c.TargetStrategy)
 	}
-	if err := c.checkChainProxyConfig(); err != nil {
-		return nil, err
-	}
 
 	if c.SendThrough != nil {
 		address := ParseSendThough(c.SendThrough)
-		//Check if CIDR exists
+		// Check if CIDR exists
 		if strings.Contains(*c.SendThrough, "/") {
 			senderSettings.ViaCidr = strings.Split(*c.SendThrough, "/")[1]
 		} else {
@@ -366,26 +448,6 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 			return nil, errors.New("failed to build stream settings for outbound detour").Base(err)
 		}
 		senderSettings.StreamSettings = ss
-	}
-
-	if c.ProxySettings != nil {
-		ps, err := c.ProxySettings.Build()
-		if err != nil {
-			return nil, errors.New("invalid outbound detour proxy settings").Base(err)
-		}
-		if ps.TransportLayerProxy {
-			if senderSettings.StreamSettings != nil {
-				if senderSettings.StreamSettings.SocketSettings != nil {
-					senderSettings.StreamSettings.SocketSettings.DialerProxy = ps.Tag
-				} else {
-					senderSettings.StreamSettings.SocketSettings = &internet.SocketConfig{DialerProxy: ps.Tag}
-				}
-			} else {
-				senderSettings.StreamSettings = &internet.StreamConfig{SocketSettings: &internet.SocketConfig{DialerProxy: ps.Tag}}
-			}
-			ps = nil
-		}
-		senderSettings.ProxySettings = ps
 	}
 
 	if c.MuxSettings != nil {
@@ -408,6 +470,41 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 	if err != nil {
 		return nil, errors.New("failed to build outbound handler for protocol ", c.Protocol).Base(err)
 	}
+	if err := validateXDrive(ts, senderSettings.StreamSettings, senderSettings.MultiplexSettings, nil); err != nil {
+		return nil, err
+	}
+	if err := validateOutboundTransportSecurity(rawConfig, senderSettings); err != nil {
+		return nil, err
+	}
+
+	if _, ok := ts.(*masque.ClientConfig); !ok && senderSettings.StreamSettings != nil && senderSettings.StreamSettings.ProtocolName == "masque" {
+		return nil, errors.New("the masque transport can only be used by the masque outbound")
+	}
+
+	if fc, ok := ts.(*freedom.Config); ok {
+		if senderSettings.StreamSettings != nil &&
+			senderSettings.StreamSettings.SocketSettings != nil &&
+			senderSettings.StreamSettings.SocketSettings.AddressPortStrategy != internet.AddressPortStrategy_None {
+			return nil, errors.New(`freedom outbound does not support "sockopt.addressPortStrategy"`)
+		}
+
+		var strategy internet.DomainStrategy
+		if strategy = senderSettings.TargetStrategy; strategy != internet.DomainStrategy_AS_IS {
+			errors.LogWarning(context.Background(), `The "outbound.targetStrategy" setting is not supported directly by freedom and has been automatically migrated to "sockopt.domainStrategy" with no behavior change.`)
+			senderSettings.TargetStrategy = internet.DomainStrategy_AS_IS
+		} else if strategy = fc.DomainStrategy; strategy != internet.DomainStrategy_AS_IS {
+			errors.LogWarning(context.Background(), `The "freedom.domainStrategy" setting is deprecated and will be removed. For compatibility, its value has been automatically migrated to "sockopt.domainStrategy". Please update your config before removal.`)
+		}
+		if strategy != internet.DomainStrategy_AS_IS {
+			if senderSettings.StreamSettings == nil {
+				senderSettings.StreamSettings = &internet.StreamConfig{}
+			}
+			if senderSettings.StreamSettings.SocketSettings == nil {
+				senderSettings.StreamSettings.SocketSettings = &internet.SocketConfig{}
+			}
+			senderSettings.StreamSettings.SocketSettings.DomainStrategy = strategy
+		}
+	}
 
 	return &core.OutboundHandlerConfig{
 		SenderSettings: serial.ToTypedMessage(senderSettings),
@@ -423,11 +520,20 @@ func (c *StatsConfig) Build() (*stats.Config, error) {
 	return &stats.Config{}, nil
 }
 
+type EnvConfig map[string]string
+
+func (c EnvConfig) Override(o EnvConfig) {
+	for key, value := range o {
+		c[key] = value
+	}
+}
+
 type Config struct {
 	// Deprecated: Global transport config is no longer used
 	// left for returning error
 	Transport map[string]json.RawMessage `json:"transport"`
 
+	Env              EnvConfig               `json:"env"`
 	LogConfig        *LogConfig              `json:"log"`
 	RouterConfig     *RouterConfig           `json:"routing"`
 	DNSConfig        *DNSConfig              `json:"dns"`
@@ -483,6 +589,12 @@ func (c *Config) Override(o *Config, fn string) {
 	if o.Transport != nil {
 		c.Transport = o.Transport
 	}
+	if o.Env != nil {
+		if c.Env == nil {
+			c.Env = EnvConfig{}
+		}
+		c.Env.Override(o.Env)
+	}
 	if o.Policy != nil {
 		c.Policy = o.Policy
 	}
@@ -530,7 +642,6 @@ func (c *Config) Override(o *Config, fn string) {
 				c.InboundConfigs = append(c.InboundConfigs, o.InboundConfigs[i])
 				errors.LogInfo(context.Background(), "[", fn, "] appended inbound with tag: ", o.InboundConfigs[i].Tag)
 			}
-
 		}
 	}
 
@@ -559,6 +670,12 @@ func (c *Config) Override(o *Config, fn string) {
 
 // Build implements Buildable.
 func (c *Config) Build() (*core.Config, error) {
+	for key, value := range c.Env {
+		if err := os.Setenv(key, value); err != nil {
+			return nil, errors.New("failed to apply environment configuration").Base(err)
+		}
+	}
+
 	if err := PostProcessConfigureFile(c); err != nil {
 		return nil, errors.New("failed to post-process configuration file").Base(err)
 	}

@@ -3,7 +3,6 @@ package kcp
 import (
 	"context"
 	"io"
-	reflect "reflect"
 	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
@@ -11,7 +10,6 @@ import (
 	"github.com/xtls/xray-core/common/dice"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -51,48 +49,15 @@ func DialKCP(ctx context.Context, dest net.Destination, streamSettings *internet
 	dest.Network = net.Network_UDP
 	errors.LogInfo(ctx, "dialing mKCP to ", dest)
 
-	conn, err := internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
-	if err != nil {
-		return nil, errors.New("failed to dial to dest: ", err).AtWarning().Base(err)
+	var conn net.Conn
+	var err error
+	if streamSettings.FinalMask != nil {
+		conn, err = streamSettings.FinalMask.DialUDP(ctx, dest)
+	} else {
+		conn, err = internet.DialSystem(ctx, dest, streamSettings.SocketSettings)
 	}
-
-	if streamSettings.UdpmaskManager != nil {
-		switch c := conn.(type) {
-		case *internet.PacketConnWrapper:
-			pktConn, err := streamSettings.UdpmaskManager.WrapPacketConnClient(c.PacketConn)
-			if err != nil {
-				conn.Close()
-				return nil, errors.New("mask err").Base(err)
-			}
-			c.PacketConn = pktConn
-		case *net.UDPConn:
-			pktConn, err := streamSettings.UdpmaskManager.WrapPacketConnClient(c)
-			if err != nil {
-				conn.Close()
-				return nil, errors.New("mask err").Base(err)
-			}
-			conn = &internet.PacketConnWrapper{
-				PacketConn: pktConn,
-				Dest:       c.RemoteAddr().(*net.UDPAddr),
-			}
-		case *cnc.Connection:
-			fakeConn := &internet.FakePacketConn{Conn: c}
-			pktConn, err := streamSettings.UdpmaskManager.WrapPacketConnClient(fakeConn)
-			if err != nil {
-				conn.Close()
-				return nil, errors.New("mask err").Base(err)
-			}
-			conn = &internet.PacketConnWrapper{
-				PacketConn: pktConn,
-				Dest: &net.UDPAddr{
-					IP:   []byte{0, 0, 0, 0},
-					Port: 0,
-				},
-			}
-		default:
-			conn.Close()
-			return nil, errors.New("unknown conn ", reflect.TypeOf(c))
-		}
+	if err != nil {
+		return nil, errors.New("failed to dial to dest: ", err).Base(err)
 	}
 
 	kcpSettings := streamSettings.ProtocolSettings.(*Config)

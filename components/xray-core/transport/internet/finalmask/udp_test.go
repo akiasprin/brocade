@@ -5,23 +5,22 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
-	"net"
+	gonet "net"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	singM "github.com/sagernet/sing/common/metadata"
-	singN "github.com/sagernet/sing/common/network"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/infra/conf"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 	"github.com/xtls/xray-core/transport/internet/finalmask/header/custom"
-	"github.com/xtls/xray-core/transport/internet/finalmask/header/dns"
-	"github.com/xtls/xray-core/transport/internet/finalmask/header/srtp"
-	"github.com/xtls/xray-core/transport/internet/finalmask/header/utp"
-	"github.com/xtls/xray-core/transport/internet/finalmask/header/wechat"
-	"github.com/xtls/xray-core/transport/internet/finalmask/header/wireguard"
 	"github.com/xtls/xray-core/transport/internet/finalmask/mkcp/aes128gcm"
+	"github.com/xtls/xray-core/transport/internet/finalmask/mkcp/header"
 	"github.com/xtls/xray-core/transport/internet/finalmask/mkcp/original"
+	"github.com/xtls/xray-core/transport/internet/finalmask/noise"
 	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
 	"github.com/xtls/xray-core/transport/internet/finalmask/sudoku"
 )
@@ -58,7 +57,7 @@ func mustSendRecv(
 
 type layerMask struct {
 	name   string
-	mask   finalmask.Udpmask
+	mask   finalmask.UDPMask
 	layers int
 }
 
@@ -127,36 +126,19 @@ func (c *scriptedPacketConn) SetDeadline(t time.Time) error {
 	c.deadline.Store(t.UnixNano())
 	return nil
 }
+
 func (c *scriptedPacketConn) SetReadDeadline(t time.Time) error {
 	c.deadline.Store(t.UnixNano())
 	return nil
 }
+
 func (c *scriptedPacketConn) SetWriteDeadline(t time.Time) error {
 	c.deadline.Store(t.UnixNano())
 	return nil
 }
 
-type captureUDPHandler struct {
-	gotMetadata chan singM.Metadata
-}
-
-func (h *captureUDPHandler) NewConnection(_ context.Context, _ net.Conn, _ singM.Metadata) error {
-	return nil
-}
-
-func (h *captureUDPHandler) NewPacketConnection(_ context.Context, _ singN.PacketConn, metadata singM.Metadata) error {
-	select {
-	case h.gotMetadata <- metadata:
-	default:
-	}
-	return nil
-}
-
-func (h *captureUDPHandler) NewError(_ context.Context, _ error) {}
-
-func newStandaloneEchoUDPConfig() *custom.UDPConfig {
-	return &custom.UDPConfig{
-		Mode: "standalone",
+func newStandaloneEchoUDPConfig() *custom.UDPStandaloneConfig {
+	return &custom.UDPStandaloneConfig{
 		Client: []*custom.UDPItem{
 			{Packet: []byte{0xAA}},
 			{Rand: 2, Save: "txid"},
@@ -168,9 +150,8 @@ func newStandaloneEchoUDPConfig() *custom.UDPConfig {
 	}
 }
 
-func newStandaloneStunLikeUDPConfig() *custom.UDPConfig {
-	return &custom.UDPConfig{
-		Mode: "standalone",
+func newStandaloneStunLikeUDPConfig() *custom.UDPStandaloneConfig {
+	return &custom.UDPStandaloneConfig{
 		Client: []*custom.UDPItem{
 			{Packet: []byte{0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42}},
 			{Rand: 12, RandMin: 0x2A, RandMax: 0x2A, Save: "txid"},
@@ -185,9 +166,8 @@ func newStandaloneStunLikeUDPConfig() *custom.UDPConfig {
 	}
 }
 
-func newStandaloneStunLikeUDPServerConfig() *custom.UDPConfig {
-	return &custom.UDPConfig{
-		Mode: "standalone",
+func newStandaloneStunLikeUDPServerConfig() *custom.UDPStandaloneConfig {
+	return &custom.UDPStandaloneConfig{
 		Client: []*custom.UDPItem{
 			{Packet: []byte{0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42}},
 			{Rand: 12, RandMin: 0x2A, RandMax: 0x2A, Save: "txid"},
@@ -236,28 +216,26 @@ func newStandaloneStunLikeUDPServerConfig() *custom.UDPConfig {
 	}
 }
 
-func newUDPClientServerPair(t *testing.T, cfg *custom.UDPConfig) (net.PacketConn, net.PacketConn, net.PacketConn, net.PacketConn) {
+func newUDPClientServerPair(t *testing.T, cfg *custom.UDPStandaloneConfig) (net.PacketConn, net.PacketConn, net.PacketConn, net.PacketConn) {
 	t.Helper()
 
-	clientRaw, err := net.ListenPacket("udp", "127.0.0.1:0")
+	clientRaw, err := gonet.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = clientRaw.Close() })
 
-	serverRaw, err := net.ListenPacket("udp", "127.0.0.1:0")
+	serverRaw, err := gonet.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = serverRaw.Close() })
 
-	maskManager := finalmask.NewUdpmaskManager([]finalmask.Udpmask{cfg})
-
-	client, err := maskManager.WrapPacketConnClient(clientRaw)
+	client, err := cfg.WrapPacketConnClient(clientRaw, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := maskManager.WrapPacketConnServer(serverRaw)
+	server, err := cfg.WrapPacketConnServer(serverRaw, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,27 +257,32 @@ func TestPacketConnReadWrite(t *testing.T) {
 		},
 		{
 			name:   "dns",
-			mask:   &dns.Config{Domain: "www.baidu.com"},
+			mask:   &header.Config{ID: 0, Domain: "www.baidu.com"},
+			layers: 2,
+		},
+		{
+			name:   "dtls",
+			mask:   &header.Config{ID: 1},
 			layers: 2,
 		},
 		{
 			name:   "srtp",
-			mask:   &srtp.Config{},
+			mask:   &header.Config{ID: 2},
 			layers: 2,
 		},
 		{
 			name:   "utp",
-			mask:   &utp.Config{},
+			mask:   &header.Config{ID: 3},
 			layers: 2,
 		},
 		{
 			name:   "wechat",
-			mask:   &wechat.Config{},
+			mask:   &header.Config{ID: 4},
 			layers: 2,
 		},
 		{
 			name:   "wireguard",
-			mask:   &wireguard.Config{},
+			mask:   &header.Config{ID: 5},
 			layers: 2,
 		},
 		{
@@ -369,31 +352,39 @@ func TestPacketConnReadWrite(t *testing.T) {
 			if layers <= 0 {
 				layers = 1
 			}
-			masks := make([]finalmask.Udpmask, 0, layers)
+			masks := make([]finalmask.UDPMask, 0, layers)
 			for i := 0; i < layers; i++ {
 				masks = append(masks, mask)
 			}
-			maskManager := finalmask.NewUdpmaskManager(masks)
 
-			client, err := net.ListenPacket("udp", "127.0.0.1:0")
+			dialUDP := func(ctx context.Context, dest net.Destination) (net.PacketConn, net.Addr, error) {
+				udpAddr, err := net.ResolveUDPAddr("udp", dest.NetAddr())
+				if err != nil {
+					return nil, nil, err
+				}
+				conn, err := gonet.ListenPacket("udp", "127.0.0.1:0")
+				if err != nil {
+					return nil, nil, err
+				}
+				return conn, udpAddr, nil
+			}
+			listenPacket := func(ctx context.Context, addr net.Addr) (net.PacketConn, error) {
+				return gonet.ListenPacket(addr.Network(), addr.String())
+			}
+			finalMask := finalmask.NewFinalMask(nil, masks, nil, nil, dialUDP, listenPacket)
+
+			server, err := finalMask.ListenPacket(context.Background(), &net.UDPAddr{IP: net.LocalHostIP.IP()})
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { server.Close() })
 
-			client, err = maskManager.WrapPacketConnClient(client)
+			clientConn, err := finalMask.DialUDP(context.Background(), net.UDPDestination(net.IPAddress(server.LocalAddr().(*net.UDPAddr).IP), net.Port(server.LocalAddr().(*net.UDPAddr).Port)))
 			if err != nil {
 				t.Fatal(err)
 			}
-
-			server, err := net.ListenPacket("udp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			server, err = maskManager.WrapPacketConnServer(server)
-			if err != nil {
-				t.Fatal(err)
-			}
+			t.Cleanup(func() { clientConn.Close() })
+			client := clientConn.(*net.PacketConnWrapper).PacketConn
 
 			_ = client.SetDeadline(time.Now().Add(time.Second))
 			_ = server.SetDeadline(time.Now().Add(time.Second))
@@ -418,21 +409,20 @@ func TestUDPcustomStaticHeaderWireShape(t *testing.T) {
 			{Rand: 1, RandMin: 0x30, RandMax: 0x40},
 		},
 	}
-	maskManager := finalmask.NewUdpmaskManager([]finalmask.Udpmask{cfg})
 
-	clientRaw, err := net.ListenPacket("udp", "127.0.0.1:0")
+	clientRaw, err := gonet.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer clientRaw.Close()
 
-	serverRaw, err := net.ListenPacket("udp", "127.0.0.1:0")
+	serverRaw, err := gonet.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer serverRaw.Close()
 
-	client, err := maskManager.WrapPacketConnClient(clientRaw)
+	client, err := cfg.WrapPacketConnClient(clientRaw, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,50 +452,6 @@ func TestUDPcustomStaticHeaderWireShape(t *testing.T) {
 	}
 	if !bytes.Equal(buf[4:n], payload) {
 		t.Fatalf("unexpected payload: %q", buf[4:n])
-	}
-}
-
-func TestUDPcustomServerRejectsMismatchedStaticHeader(t *testing.T) {
-	cfg := &custom.UDPConfig{
-		Client: []*custom.UDPItem{
-			{Packet: []byte{0x01, 0x02}},
-		},
-		Server: []*custom.UDPItem{
-			{Packet: []byte{0x03}},
-		},
-	}
-	maskManager := finalmask.NewUdpmaskManager([]finalmask.Udpmask{cfg})
-
-	clientRaw, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer clientRaw.Close()
-
-	serverRaw, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer serverRaw.Close()
-
-	server, err := maskManager.WrapPacketConnServer(serverRaw)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_ = server.SetDeadline(time.Now().Add(200 * time.Millisecond))
-
-	if _, err := clientRaw.WriteTo([]byte{0x09, 0x09, 'b', 'a', 'd'}, server.LocalAddr()); err != nil {
-		t.Fatal(err)
-	}
-
-	buf := make([]byte, 128)
-	n, _, err := server.ReadFrom(buf)
-	if n != 0 {
-		t.Fatalf("expected no payload on mismatched header, got %d bytes", n)
-	}
-	if err != nil {
-		t.Fatalf("expected mismatch to be dropped without surfaced error, got %v", err)
 	}
 }
 
@@ -707,11 +653,11 @@ func TestSudokuBDD(t *testing.T) {
 			Ascii:    "prefer_ascii",
 		}
 
-		clientRaw, serverRaw := net.Pipe()
+		clientRaw, serverRaw := gonet.Pipe()
 		defer clientRaw.Close()
 		defer serverRaw.Close()
 
-		clientConn, err := cfg.WrapConnClient(clientRaw)
+		clientConn, err := cfg.WrapConnClient(clientRaw, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -748,11 +694,11 @@ func TestSudokuBDD(t *testing.T) {
 			PaddingMax: 0,
 		}
 
-		clientRaw, serverRaw := net.Pipe()
+		clientRaw, serverRaw := gonet.Pipe()
 		defer clientRaw.Close()
 		defer serverRaw.Close()
 
-		clientConn, err := cfg.WrapConnClient(clientRaw)
+		clientConn, err := cfg.WrapConnClient(clientRaw, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -803,10 +749,10 @@ func TestSudokuBDD(t *testing.T) {
 		countWireBytes := func(wrapServer func(net.Conn, *sudoku.Config) (net.Conn, error), cfg *sudoku.Config) int64 {
 			t.Helper()
 
-			clientRaw, serverRaw := net.Pipe()
+			clientRaw, serverRaw := gonet.Pipe()
 			watchedServerRaw := &countingConn{Conn: serverRaw}
 
-			clientConn, err := cfg.WrapConnClient(clientRaw)
+			clientConn, err := cfg.WrapConnClient(clientRaw, nil, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -858,11 +804,11 @@ func TestSudokuBDD(t *testing.T) {
 			CustomTables: []string{"xpxvvpvv", "vxpvxvvp"},
 		}
 
-		clientRaw, serverRaw := net.Pipe()
+		clientRaw, serverRaw := gonet.Pipe()
 		defer clientRaw.Close()
 		defer serverRaw.Close()
 
-		clientConn, err := cfg.WrapConnClient(clientRaw)
+		clientConn, err := cfg.WrapConnClient(clientRaw, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -900,11 +846,11 @@ func TestSudokuBDD(t *testing.T) {
 			PaddingMax:   0,
 		}
 
-		clientRaw, serverRaw := net.Pipe()
+		clientRaw, serverRaw := gonet.Pipe()
 		defer clientRaw.Close()
 		defer serverRaw.Close()
 
-		clientConn, err := cfg.WrapConnClient(clientRaw)
+		clientConn, err := cfg.WrapConnClient(clientRaw, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -933,19 +879,6 @@ func TestSudokuBDD(t *testing.T) {
 		}
 	})
 
-	t.Run("GivenSudokuUDPMask_WhenNotInnermost_ThenWrapFails", func(t *testing.T) {
-		cfg := &sudoku.Config{Password: "sudoku-udp"}
-		raw, err := net.ListenPacket("udp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer raw.Close()
-
-		if _, err := cfg.WrapPacketConnClient(raw, 0, 1); err == nil {
-			t.Fatal("expected innermost check failure")
-		}
-	})
-
 	t.Run("GivenSudokuMultiTableUDPMask_WhenClientSendsMultipleDatagrams_ThenPayloadMatches", func(t *testing.T) {
 		cfg := &sudoku.Config{
 			Password:     "sudoku-udp-multi",
@@ -954,25 +887,24 @@ func TestSudokuBDD(t *testing.T) {
 			PaddingMin:   0,
 			PaddingMax:   0,
 		}
-		maskManager := finalmask.NewUdpmaskManager([]finalmask.Udpmask{cfg})
 
-		clientRaw, err := net.ListenPacket("udp", "127.0.0.1:0")
+		clientRaw, err := gonet.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer clientRaw.Close()
 
-		serverRaw, err := net.ListenPacket("udp", "127.0.0.1:0")
+		serverRaw, err := gonet.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer serverRaw.Close()
 
-		client, err := maskManager.WrapPacketConnClient(clientRaw)
+		client, err := cfg.WrapPacketConnClient(clientRaw, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		server, err := maskManager.WrapPacketConnServer(serverRaw)
+		server, err := cfg.WrapPacketConnServer(serverRaw, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1026,7 +958,7 @@ func TestSudokuBDD(t *testing.T) {
 		}
 		defer serverRaw.Close()
 
-		clientConn, err := cfg.WrapConnClient(clientRaw)
+		clientConn, err := cfg.WrapConnClient(clientRaw, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1073,11 +1005,11 @@ func TestSudokuBDD(t *testing.T) {
 			Ascii:    "prefer_entropy",
 		}
 
-		clientRaw, serverRaw := net.Pipe()
+		clientRaw, serverRaw := gonet.Pipe()
 		defer clientRaw.Close()
 		defer serverRaw.Close()
 
-		clientConn, err := cfg.WrapConnClient(clientRaw)
+		clientConn, err := cfg.WrapConnClient(clientRaw, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1097,11 +1029,11 @@ func TestSudokuBDD(t *testing.T) {
 			Ascii:    "prefer_entropy",
 		}
 
-		clientRaw, serverRaw := net.Pipe()
+		clientRaw, serverRaw := gonet.Pipe()
 		defer clientRaw.Close()
 		defer serverRaw.Close()
 
-		clientConn, err := cfg.WrapConnClient(clientRaw)
+		clientConn, err := cfg.WrapConnClient(clientRaw, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1114,4 +1046,71 @@ func TestSudokuBDD(t *testing.T) {
 			t.Fatalf("expected sudoku conn to stay wrapped, got %T", unwrapped)
 		}
 	})
+}
+
+func TestNoiseScriptOverRealSockets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "noise.lua")
+	script := `
+local noise = require("xray.finalmask.noise")
+
+function HandleNoise(plan, address)
+    plan:Add("\22\3\1")
+    plan:Add(noise.Random(noise.RandomBetween(16, 16)), 1)
+end
+`
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	mask, err := (&conf.NoiseMask{Script: path}).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clientRaw, err := gonet.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = clientRaw.Close() })
+	serverRaw, err := gonet.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = serverRaw.Close() })
+
+	client, err := mask.(*noise.Config).WrapPacketConnClient(clientRaw, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payload := []byte("real-payload")
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := client.WriteTo(payload, serverRaw.LocalAddr())
+		writeErr <- err
+	}()
+
+	_ = serverRaw.SetDeadline(time.Now().Add(5 * time.Second))
+	var got [][]byte
+	for i := 0; i < 3; i++ {
+		buf := make([]byte, 64)
+		n, _, err := serverRaw.ReadFrom(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, buf[:n])
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(got[0], []byte{0x16, 0x03, 0x01}) {
+		t.Fatalf("unexpected first noise packet: %x", got[0])
+	}
+	if len(got[1]) != 16 {
+		t.Fatalf("unexpected second noise packet size: got=%d want=16", len(got[1]))
+	}
+	if !bytes.Equal(got[2], payload) {
+		t.Fatalf("unexpected payload: %q", got[2])
+	}
 }

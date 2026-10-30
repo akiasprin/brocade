@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"io"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -23,7 +24,9 @@ import (
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
+	feature_dns "github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/policy"
+	"github.com/xtls/xray-core/features/probetrace"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport"
@@ -31,10 +34,11 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
-var useSplice bool
+var useSplice atomic.Bool
+var allNetworks = [8]bool{true, true, true, true, true, true, true, true}
 
 func responseSpliceEnabled(inbound *session.Inbound) bool {
-	return responseSpliceAllowed(useSplice, inbound)
+	return responseSpliceAllowed(useSplice.Load(), inbound)
 }
 
 func responseSpliceAllowed(enabled bool, inbound *session.Inbound) bool {
@@ -55,6 +59,10 @@ func responseSpliceAllowed(enabled bool, inbound *session.Inbound) bool {
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		h := new(Handler)
+		if stream, ok := session.StreamSettingsFromContext(ctx).(*internet.MemoryStreamConfig); ok && stream != nil && stream.SocketSettings != nil {
+			h.resolveStrategy = stream.SocketSettings.DomainStrategy
+			h.usesDialerProxy = stream.SocketSettings.DialerProxy != ""
+		}
 		if err := core.RequireFeatures(ctx, func(pm policy.Manager) error {
 			return h.Init(config.(*Config), pm)
 		}); err != nil {
@@ -62,33 +70,157 @@ func init() {
 		}
 		return h, nil
 	}))
+	platform.RegisterEnvReload(reloadEnvSettings)
+
+}
+
+type FinalRule struct {
+	action     RuleAction
+	network    [8]bool
+	port       net.MemoryPortList
+	ip         geodata.IPMatcher
+	blockDelay *Range
+}
+
+func buildFinalRule(config *FinalRuleConfig) (*FinalRule, error) {
+	rule := &FinalRule{
+		action:     config.GetAction(),
+		blockDelay: config.GetBlockDelay(),
+	}
+
+	if len(config.Networks) == 0 {
+		rule.network = allNetworks
+	} else {
+		for _, network := range config.Networks {
+			rule.network[int(network)] = true
+		}
+	}
+
+	if config.PortList != nil {
+		rule.port = net.PortListFromProto(config.PortList)
+	}
+
+	if len(config.Ip) > 0 {
+		matcher, err := geodata.IPReg.BuildIPMatcher(config.Ip)
+		if err != nil {
+			return nil, err
+		}
+		rule.ip = matcher
+	}
+
+	return rule, nil
+}
+
+func (r *FinalRule) matchNetwork(network net.Network) bool {
+	return r.network[int(network)]
+}
+
+func (r *FinalRule) matchPort(port net.Port) bool {
+	if len(r.port) == 0 {
+		return true
+	}
+	return r.port.Contains(port)
+}
+
+func (r *FinalRule) matchIP(addr net.Address) bool {
+	if r.ip == nil {
+		return true
+	}
+	return addr != nil && addr.Family().IsIP() && r.ip.Match(addr.IP())
+}
+
+func (r *FinalRule) Apply(network net.Network, address net.Address, port net.Port) bool {
+	if !r.matchNetwork(network) {
+		return false
+	}
+	if !r.matchPort(port) {
+		return false
+	}
+	return r.matchIP(address)
+}
+
+func (h *Handler) matchFinalRule(network net.Network, address net.Address, port net.Port, defaultRule *FinalRule) *FinalRule {
+	for _, rule := range h.finalRules {
+		if rule.Apply(network, address, port) {
+			return rule
+		}
+	}
+	if defaultRule != nil && defaultRule.Apply(network, address, port) {
+		return defaultRule
+	}
+	return nil
+}
+
+func (h *Handler) blockDelay(rule *FinalRule) time.Duration {
+	min := uint64(30)
+	max := uint64(90)
+	if rule.blockDelay != nil {
+		min = rule.blockDelay.Min
+		max = rule.blockDelay.Max
+	}
+	span := max - min
+	if max < min {
+		span = min - max
+	}
+	return time.Duration(min+uint64(dice.Roll(int(span+1)))) * time.Second
+}
+
+func (h *Handler) blackhole(ctx context.Context, input buf.Reader, output buf.Writer, rule *FinalRule, dest *net.Destination) error {
+	delay := h.blockDelay(rule)
+	errors.LogInfo(ctx, "blocked target: ", *dest, ", blackholing connection for ", delay)
+	timer := time.AfterFunc(delay, func() {
+		common.Interrupt(input)
+		common.Interrupt(output)
+		errors.LogInfo(ctx, "closed blackholed connection to blocked target: ", *dest)
+	})
+	defer timer.Stop()
+	defer common.Close(output)
+	_ = buf.Copy(input, buf.Discard)
+	return nil
+}
+
+func reloadEnvSettings() error {
 	const defaultFlagValue = "NOT_DEFINED_AT_ALL"
 	value := platform.NewEnvFlag(platform.UseFreedomSplice).GetValue(func() string { return defaultFlagValue })
+	enabled := false
 	switch value {
 	case defaultFlagValue, "auto", "enable":
-		useSplice = true
+		enabled = true
 	}
+	useSplice.Store(enabled)
+	return nil
 }
 
 // Handler handles Freedom connections.
 type Handler struct {
 	policyManager    policy.Manager
 	config           *Config
-	blockedIPMatcher geodata.IPMatcher
+	blockedIPMatcher ipMatcher
+	finalRules       []*FinalRule
+	resolveStrategy  internet.DomainStrategy
+	usesDialerProxy  bool
 }
+
+// ProbeTraceTerminal distinguishes a real socket dial from a relay transport.
+func (*Handler) ProbeTraceTerminal() {}
 
 // Init initializes the Handler with necessary parameters.
 func (h *Handler) Init(config *Config, pm policy.Manager) error {
 	h.config = config
 	h.policyManager = pm
-	// Freedom permits every destination unless the outbound names rules explicitly. Admission
-	// policy belongs to routing; an absent option must not create a protocol-dependent guard.
-	if config.IpsBlocked != nil && len(config.IpsBlocked.Rules) > 0 {
-		m, err := geodata.IPReg.BuildIPMatcher(config.IpsBlocked.Rules)
-		if err != nil {
-			return errors.New("failed to build blocked ip matcher").Base(err)
+	if h.usesDialerProxy { // freedom is not the final outbound, final rules do not apply
+		if len(config.FinalRules) > 0 {
+			errors.LogWarning(context.Background(), `The "finalRules" setting is ignored when "sockopt.dialerProxy" is set, since freedom is not the final outbound.`)
 		}
-		h.blockedIPMatcher = m
+		return nil
+	}
+	h.finalRules = make([]*FinalRule, 0, len(config.FinalRules))
+	for _, rc := range config.FinalRules {
+		rule, err := buildFinalRule(rc)
+		if err != nil {
+			return errors.New("failed to build final rule").Base(err)
+		}
+		h.finalRules = append(h.finalRules, rule)
 	}
 	return nil
 }
@@ -140,8 +272,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			return forwardingMatcher.Match(ip) || (outboundMatcher != nil && outboundMatcher.Match(ip))
 		})
 	}
-	if blockedIPMatcher != nil {
+	if blockedIPMatcher != nil || (!h.usesDialerProxy && len(h.finalRules) > 0) {
+		forwardingMatcher := blockedIPMatcher
+		blockedIPMatcher = ipMatchFunc(func(ip net.IP) bool {
+			return (forwardingMatcher != nil && forwardingMatcher.Match(ip)) || h.finalBlocked(ob.Target.Network, net.IPAddress(ip), ob.Target.Port)
+		})
 		ctx = internet.ContextWithIPBlocker(ctx, blockedIPMatcher.Match)
+
 	}
 
 	destination := ob.Target
@@ -168,17 +305,36 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	output := link.Writer
 
 	var conn stat.Connection
-	err := retry.ExponentialBackoff(5, 100).On(func() error {
+	trace := probetrace.FromContext(ctx)
+	var lookups []feature_dns.LookupTrace
+	var tracedLookups *[]feature_dns.LookupTrace
+	if trace != nil {
+		tracedLookups = &lookups
+	}
+	traceCode := "connect_error"
+	traceFamily := ""
+	if trace != nil {
+		defer func() { trace.Finish(ob.Tag, traceFamily, false, traceCode, lookups) }()
+	}
+	attempts := 5
+	if trace != nil {
+		attempts = 1
+	}
+	err := retry.ExponentialBackoff(attempts, 100).On(func() error {
 		dialDest := destination
-		if h.config.DomainStrategy.HasStrategy() && dialDest.Address.Family().IsDomain() {
-			strategy := h.config.DomainStrategy
+		if h.domainStrategy().HasStrategy() && dialDest.Address.Family().IsDomain() {
+			strategy := h.domainStrategy()
 			if destination.Network == net.Network_UDP && origTargetAddr != nil && outGateway == nil {
 				strategy = strategy.GetDynamicStrategy(origTargetAddr.Family())
 			}
-			ips, err := internet.LookupForIP(dialDest.Address.Domain(), strategy, outGateway)
+			ips, err := internet.LookupForIPTraceContext(ctx, dialDest.Address.Domain(), strategy, outGateway, tracedLookups)
 			if err != nil {
+				traceCode = "dns_error"
+				if errors.Cause(err) == feature_dns.ErrEmptyResponse {
+					traceCode = "dns_empty"
+				}
 				errors.LogInfoInner(ctx, err, "failed to get IP address for domain ", dialDest.Address.Domain())
-				if h.config.DomainStrategy.ForceIP() {
+				if h.domainStrategy().ForceIP() {
 					return err
 				}
 			} else {
@@ -192,14 +348,23 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		if isBlockedAddress(blockedIPMatcher, dialDest.Address) {
-			return errors.New("blocked target IP: ", dialDest.Address).AtInfo()
+			return errors.New("blocked target IP: ", dialDest.Address)
+		}
+		if trace != nil {
+			traceFamily = probetrace.Family(dialDest.Address)
 		}
 		rawConn, err := dialer.Dial(ctx, dialDest)
 		if err != nil {
+			if trace != nil {
+				traceCode = internet.ProbeDialErrorCode(err)
+			}
 			return err
 		}
 
 		conn = rawConn
+		if trace != nil {
+			trace.Finish(ob.Tag, probetrace.Family(net.DestinationFromAddr(conn.RemoteAddr()).Address), true, "", lookups)
+		}
 		return nil
 	})
 	if err != nil {
@@ -207,7 +372,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 	if remoteAddr := net.DestinationFromAddr(conn.RemoteAddr()).Address; isBlockedAddress(blockedIPMatcher, remoteAddr) {
 		conn.Close()
-		return errors.New("blocked target IP: ", remoteAddr).AtInfo()
+		return errors.New("blocked target IP: ", remoteAddr)
 	}
 	if h.config.ProxyProtocol > 0 && h.config.ProxyProtocol <= 2 {
 		version := byte(h.config.ProxyProtocol)
@@ -275,7 +440,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	responseDone := func() error {
 		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
-		if destination.Network == net.Network_TCP && inbound != nil && inbound.FramedDownlinkSplicer != nil &&
+		if trace == nil && destination.Network == net.Network_TCP && inbound != nil && inbound.FramedDownlinkSplicer != nil &&
 			responseSpliceEnabled(inbound) && proxy.IsRAWTransportWithoutSecurity(conn) {
 			rawConn, readCounter, _ := proxy.UnwrapRawConn(conn)
 			var userCounter stats.Counter
@@ -317,7 +482,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		if destination.Network == net.Network_TCP {
 			reader = buf.NewReader(conn)
 		} else {
-			reader = NewPacketReader(conn, UDPOverride, destination, blockedIPMatcher)
+			reader = NewPacketReader(conn, UDPOverride, destination, blockedIPMatcher, h)
 		}
 		if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
 			return errors.New("failed to process response").Base(err)
@@ -336,7 +501,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	return nil
 }
 
-func NewPacketReader(conn net.Conn, UDPOverride net.Destination, DialDest net.Destination, blockedIPMatcher ipMatcher) buf.Reader {
+func NewPacketReader(conn net.Conn, UDPOverride net.Destination, DialDest net.Destination, blockedIPMatcher ipMatcher, handlers ...*Handler) buf.Reader {
+	var handler *Handler
+	if len(handlers) > 0 {
+		handler = handlers[0]
+	}
 	iConn := conn
 	statConn, ok := iConn.(*stat.CounterConnection)
 	if ok {
@@ -356,6 +525,7 @@ func NewPacketReader(conn net.Conn, UDPOverride net.Destination, DialDest net.De
 			PacketConnWrapper: c,
 			Counter:           counter,
 			BlockedIPMatcher:  blockedIPMatcher,
+			Handler:           handler,
 			IsOverridden:      isOverridden,
 			InitUnchangedAddr: DialDest.Address,
 			InitChangedAddr:   net.DestinationFromAddr(conn.RemoteAddr()).Address,
@@ -365,6 +535,7 @@ func NewPacketReader(conn net.Conn, UDPOverride net.Destination, DialDest net.De
 }
 
 type PacketReader struct {
+	Handler *Handler
 	*internet.PacketConnWrapper
 	stats.Counter
 	BlockedIPMatcher  ipMatcher
@@ -384,7 +555,7 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		}
 		udpAddr := d.(*net.UDPAddr)
 		sourceAddr := net.IPAddress(udpAddr.IP)
-		if isBlockedAddress(r.BlockedIPMatcher, sourceAddr) {
+		if isBlockedAddress(r.BlockedIPMatcher, sourceAddr) || r.Handler.finalBlocked(net.Network_UDP, sourceAddr, net.Port(udpAddr.Port)) {
 			continue
 		}
 		b.Resize(0, int32(n))
@@ -476,11 +647,11 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 					b.UDP.Address = ip
 				} else {
 					ShouldUseSystemResolver := true
-					if w.Handler.config.DomainStrategy.HasStrategy() {
-						ips, err := internet.LookupForIP(b.UDP.Address.Domain(), w.Handler.config.DomainStrategy, w.LocalAddr)
+					if w.Handler.domainStrategy().HasStrategy() {
+						ips, err := internet.LookupForIP(b.UDP.Address.Domain(), w.Handler.domainStrategy(), w.LocalAddr)
 						if err != nil {
 							// drop packet if resolve failed when forceIP
-							if w.Handler.config.DomainStrategy.ForceIP() {
+							if w.Handler.domainStrategy().ForceIP() {
 								b.Release()
 								continue
 							}
@@ -503,7 +674,7 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 					}
 				}
 			}
-			if isBlockedAddress(w.BlockedIPMatcher, b.UDP.Address) {
+			if isBlockedAddress(w.BlockedIPMatcher, b.UDP.Address) || w.Handler.finalBlocked(net.Network_UDP, b.UDP.Address, b.UDP.Port) {
 				b.Release()
 				continue
 			}
@@ -684,4 +855,18 @@ func GenerateRandomBytes(n int64) ([]byte, error) {
 	}
 
 	return b, nil
+}
+
+func (h *Handler) domainStrategy() internet.DomainStrategy {
+	if h.resolveStrategy.HasStrategy() {
+		return h.resolveStrategy
+	}
+	return h.config.DomainStrategy
+}
+func (h *Handler) finalBlocked(network net.Network, address net.Address, port net.Port) bool {
+	if h == nil || h.usesDialerProxy {
+		return false
+	}
+	rule := h.matchFinalRule(network, address, port, nil)
+	return rule != nil && rule.action == RuleAction_Block
 }

@@ -20,9 +20,9 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
-	"github.com/xtls/xray-core/proxy/hysteria/account"
-	hyCtx "github.com/xtls/xray-core/proxy/hysteria/ctx"
+	hysteria_proxy "github.com/xtls/xray-core/proxy/hysteria"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/hysteria"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tcp"
 	"github.com/xtls/xray-core/transport/internet/udp"
@@ -160,19 +160,20 @@ func (w *tcpWorker) Start() error {
 	if strings.HasPrefix(w.tag, "fwd:") {
 		w.forwarding = &forwardingConnections{}
 	}
-	ctx := context.Background()
+	// Transport authentication (notably Hy2's QUIC carrier) needs the same
+	// instance-scoped admission policy as the dispatched streams. A fresh
+	// background context silently disables source revocation at that layer.
+	ctx := w.ctx
 
-	type HysteriaInboundValidator interface{ HysteriaInboundValidator() *account.Validator }
-	if v, ok := w.proxy.(HysteriaInboundValidator); ok {
-		ctx = hyCtx.ContextWithRequireDatagram(ctx, true)
-		ctx = hyCtx.ContextWithValidator(ctx, v.HysteriaInboundValidator())
+	if v, ok := w.proxy.(*hysteria_proxy.Server); ok {
+		ctx = hysteria.ContextWithValidator(ctx, v.HysteriaInboundValidator())
 	}
 
 	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, func(conn stat.Connection) {
 		go w.callback(conn)
 	})
 	if err != nil {
-		return errors.New("failed to listen TCP on ", w.port).AtWarning().Base(err)
+		return errors.New("failed to listen TCP on ", w.port).Base(err)
 	}
 	w.hub = hub
 	return nil
@@ -580,7 +581,7 @@ func (w *dsWorker) Start() error {
 		go w.callback(conn)
 	})
 	if err != nil {
-		return errors.New("failed to listen Unix Domain Socket on ", w.address).AtWarning().Base(err)
+		return errors.New("failed to listen Unix Domain Socket on ", w.address).Base(err)
 	}
 	w.hub = hub
 	return nil

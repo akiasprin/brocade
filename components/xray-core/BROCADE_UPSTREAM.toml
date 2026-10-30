@@ -1,16 +1,11 @@
-# Brocade's vendored Xray baseline. Keep the Go module path unchanged so upstream
-# packages and future protocol patches continue to use their canonical imports.
-
+# Canonical Xray source baseline; keep the upstream Go module path unchanged.
 repository = "https://github.com/XTLS/Xray-core.git"
-tag = "v26.4.25"
-commit = "b4f08981becb71eaa995fa98ed2098ade92566bb"
-imported_at = "2026-09-03"
+tag = "v26.10.21"
+commit = "1b1647cd9ddf0abc34b981d4611fc03bcac1ca74"
+imported_at = "2026-10-28"
 license = "MPL-2.0"
 
-# Brocade-maintained capabilities carried on top of this upstream baseline. The fork is the only
-# Xray runtime supported by Brocade; the unpatched community binary is not a compatible deployment
-# target. `sniffing_failure_routing` marks IP destinations whose bounded sniffing attempt did not
-# recover a domain, allowing an explicit safe route instead of falling through to the default.
+# Retained Brocade capabilities. Official Xray binaries do not provide these contracts.
 anytls = true
 external_tls_allow_insecure = true
 sniffing_failure_routing = true
@@ -19,130 +14,19 @@ legacy_agent_vision_splice = true
 online_source_protocols = true
 machine_traffic_limit = true
 user_traffic_limit = true
+reality_legacy_x25519 = true
+reality_empty_encrypted_extensions = true
+reverse_drain_fence = true
 
-# Selected upstream backports; the full-tree baseline above remains unchanged.
-[[backports]]
-commit = "598bde74122f5f0207c7c6a56ccb74fbbbe33fca"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6678"
-description = "Adapt atomic routing snapshots with upstream AddRule full-routing replacement semantics"
+# Former 26.4.25 backports are absorbed by the new baseline. Brocade-specific behavior is
+# reapplied to the new APIs: atomic routing snapshots, persistent accounting/checkpoints,
+# source access, session revocation, Mux/reverse health, TLS/kTLS, listener handoff, DNS
+# provenance/retries, bounded tunnel DNS caches and UDP mask/hopping GSO preservation.
+# Historical finalmask.quicParams.udpHop inputs are lowered to a compatibility mask;
+# the general upstream UDP-hop mask retains its independent local/remote semantics.
 
-[[backports]]
-commit = "1d62941bd2a0f1ca410c7b81c1aeb198dd105825"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6041"
-description = "Partial backport: isolate retained UDP fragment payloads from reusable read buffers; preserve legacy Hy2 protocol"
-
-[[backports]]
-commit = "8f15190c230fe6975c9b18e31316c6bc494f3863"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6471"
-description = "Reject truncated QUIC header-protection samples before slicing"
-
-[[backports]]
-commit = "d9c54026c5ff1652d8fc2e58ffd06706dd27a6a6"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6695"
-description = "Sniff QUIC v2 Initial packets and recover SNI alongside v1 and draft-29"
-
-# Outbound-only MASQUE/WARP implementation imported from the v26.10.10 tree.
-# Brocade adapts it to the baseline's stream context, splice atomics, mask managers and packet
-# wrapper; the netstack is isolated under proxy/masque with a bounded DNS cache. The inbound
-# and later XMUX/lightweight-stack migrations are deliberately not imported. QUIC uses the
-# v26.10.10 dependency version (v0.61.1-0.20260806010916-184d081eef3e).
-
-[[backports]]
-commit = "7d3e44fee26795011f45b6cbdf6d53022a3e507e"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6807"
-description = "Proxy: Add MASQUE outbound & transport (IETF CONNECT-IP, RFC 9484) (#6807)"
-
-[[backports]]
-commit = "df261e447907233af19a20ed90c0cc41905e67dd"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6810"
-description = "MASQUE client: Support HTTP/2 (Extended CONNECT, RFC 8441) (#6810)"
-
-[[backports]]
-commit = "9e55a6ed180570124cf6f9332dc86e68e2f3873b"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6878"
-description = "MASQUE client: Support WARP (#6878)"
-
-[[backports]]
-commit = "5121c28b855c9d7f12deaeb1352116eb490754bb"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6882"
-description = "QUIC sniffer: Handle zero-filled datagram tails (#6882)"
-
-[[backports]]
-commit = "6ce8dc53e79842af71f0b4a360cb65d9eaa1e8f7"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6723"
-description = "common/buf/writer.go: Fix buffered writes failing when payload exceeds remaining capacity (#6723)"
-
-[[backports]]
-commit = "a2cec2e580e8ea1900701b11b425e0351de2ec71"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6207"
-description = "DNS: Avoid panic on domain too long (#6207)"
-
-[[backports]]
-commit = "2eedef51a241cf6f49bb35fb179eb1a1ceeaf09e"
-pull_request = "https://github.com/XTLS/Xray-core/pull/7091"
-description = "DNS: Fix pubsub cleanup sizing every topic's slice by the topic count (#7091)"
-
-[[backports]]
-commit = "ac04c445bd09541cc9c35a120ee01d8a177a4d83"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6363"
-description = "DNS: Fix unexpected TTL clamp (#6363)"
-
-[[backports]]
-commit = "cb206ddc74766509f57321c48d08ec807b9dfbad"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6163"
-description = "DNS: Avoid passing domain to WriteTo func (#6163)"
-
-[[backports]]
-commit = "540b9070f5bc0e67a04341f11bde598153957b91"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6688"
-description = "Transport: Bind the UDP outbound socket in the destination family (#6688)"
-
-[[backports]]
-commit = "2776ea6d7426e1d024924df02d749d7021b2747f"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6698"
-description = "SS2022 outbound: Close connection to server on early returns (#6698)"
-
-[[backports]]
-commit = "9d9eaf399fbcba14e883c34a53dffcdfe5143669"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6095"
-description = "XHTTP client: Fix potential memory leak in stream-up/one (#6095)"
-
-[[backports]]
-commit = "4c3842711dd6abc8401f83678f30bb56e3f8819b"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6140"
-description = "XHTTP client: Fix packet-up `OpenUsage` counting and H3 `keepAlivePeriod` parameter (#6140)"
-
-[[backports]]
-commit = "986c512e0f7bc40069e84de903ae2d5a32e324b4"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6316"
-description = "XHTTP client: Avoid panic when `host` is invalid (#6316)"
-
-[[backports]]
-commit = "1e036ce1c5076f695d149a672ca578ebf907f882"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6332"
-description = "XHTTP/3 client: Actively close underlying QUIC & UDP (#6332)"
-
-[[backports]]
-commit = "77f98eba0978cbcb425e2f8ec3cec86bd5aa8444"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6665"
-description = "XHTTP client: Fix a race condition and a data race (#6665)"
-
-[[backports]]
-commit = "eef6e63bc16d6e97fd98178556d49aad7978809a"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6694"
-description = "XHTTP client: Fix a data race in WaitReadCloser (#6694)"
-
-[[backports]]
-commit = "dffc7ada5eef8a8b3df7da8928536ce57135a119"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6632"
-description = "XHTTP client: Define Request.GetBody() for packet-up so h2 can replay after GOAWAY (#6632)"
-
-[[backports]]
-commit = "ca4b156b57b11d77545039b4000ed3bbc2fdabdd"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6106"
-description = "Burst observatory: Fix time compare, cancel pending ping on instance close or new schedule started (#6106)"
-
-[[backports]]
-commit = "c4dfcd4c1a998cc7eb5be61ef7c2e5dbb65dfcff"
-pull_request = "https://github.com/XTLS/Xray-core/pull/6221"
-description = "Burst observatory: Fix init check (#6221)"
+[[dependencies]]
+module = "github.com/xtls/reality"
+path = "third_party/reality"
+upstream = "83f621788ca88b83179810b12baa7ae518aacb83"
+description = "Connection-scoped legacy X25519 admission and record-size-compatible optional SNI acknowledgement; see dependency baseline"

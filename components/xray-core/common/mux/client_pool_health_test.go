@@ -103,7 +103,7 @@ func TestActiveControlQueueFailureQuarantinesWithoutClosingBusiness(t *testing.T
 	}
 	p := newPoolPickerForTest(clock, cfg, &testWorkerFactory{})
 	addWorkerForTest(t, p, w, workerActive, clock.Now())
-	w.sessionManager.Allocate(&w.strategy)
+	w.sessionManager.Allocate(&w.strategy, nil, nil)
 	t.Cleanup(func() { p.Close(); input.Close() })
 	go w.poolControl.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte("blocked complete frame"))})
 	select {
@@ -240,7 +240,7 @@ func TestActiveAndIdleProbeBudgetUsesOldestDue(t *testing.T) {
 	id := healthProbeForTest(first)
 	second := newBlackholeWorker(t, p.config, 8)
 	addWorkerForTest(t, p, second, workerActive, clock.Now())
-	second.sessionManager.Allocate(&second.strategy)
+	second.sessionManager.Allocate(&second.strategy, nil, nil)
 	second.poolAccess.Lock()
 	second.healthNextProbe = clock.Now()
 	second.poolAccess.Unlock()

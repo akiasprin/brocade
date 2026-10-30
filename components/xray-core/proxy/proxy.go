@@ -216,7 +216,7 @@ type VisionReader struct {
 	isUplink     bool
 	conn         net.Conn
 	input        *bytes.Reader
-	rawInput     *bytes.Buffer
+	rawInput     **bytes.Buffer
 	ob           *session.Outbound
 
 	// internal
@@ -224,12 +224,12 @@ type VisionReader struct {
 }
 
 type visionBufferProvider interface {
-	VisionBuffers() (*bytes.Reader, *bytes.Buffer)
+	VisionBuffers() (*bytes.Reader, **bytes.Buffer)
 }
 
 // VisionBuffers resolves transport read-ahead without coupling VLESS to the
 // private layout of crypto/tls, uTLS, REALITY, or VLESS encryption wrappers.
-func VisionBuffers(conn net.Conn) (*bytes.Reader, *bytes.Buffer, bool) {
+func VisionBuffers(conn net.Conn) (*bytes.Reader, **bytes.Buffer, bool) {
 	provider, ok := conn.(visionBufferProvider)
 	if !ok {
 		return nil, nil, false
@@ -238,7 +238,7 @@ func VisionBuffers(conn net.Conn) (*bytes.Reader, *bytes.Buffer, bool) {
 	return input, rawInput, input != nil && rawInput != nil
 }
 
-func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, input *bytes.Reader, rawInput *bytes.Buffer, ob *session.Outbound) *VisionReader {
+func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, input *bytes.Reader, rawInput **bytes.Buffer, ob *session.Outbound) *VisionReader {
 	return &VisionReader{
 		Reader:       reader,
 		trafficState: trafficState,
@@ -312,12 +312,15 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		if inputBuffer, err := buf.ReadFrom(w.input); err == nil && !inputBuffer.IsEmpty() {
 			buffer, _ = buf.MergeMulti(buffer, inputBuffer)
 		}
-		if rawInputBuffer, err := buf.ReadFrom(w.rawInput); err == nil && !rawInputBuffer.IsEmpty() {
-			buffer, _ = buf.MergeMulti(buffer, rawInputBuffer)
-		}
 		*w.input = bytes.Reader{} // release memory
 		w.input = nil
-		*w.rawInput = bytes.Buffer{} // release memory
+
+		if raw := *w.rawInput; raw != nil {
+			if rawInputBuffer, err := buf.ReadFrom(raw); err == nil && !rawInputBuffer.IsEmpty() {
+				buffer, _ = buf.MergeMulti(buffer, rawInputBuffer)
+			}
+			// *raw = bytes.Buffer{} // may not be suitable for Go 1.27.3+
+		}
 		w.rawInput = nil
 
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
@@ -1023,6 +1026,14 @@ func SuppressOuterCloseNotify(conn net.Conn) {
 		suppressor.SuppressCloseNotify()
 	}
 }
+
+type CloseNotifySuppressor interface {
+	SuppressCloseNotify()
+}
+
+// Close our local TLS conn instance might send a incorrect close_notify alert
+// if the XTLS direct copy mode is enabled and cause TLS BAD_RECORD_MAC on users' browser
+// Close the underlying connection directly to avoid this issue.
 
 // UnwrapRawConn support unwrap encryption, stats, mask wrappers, tls, utls, reality, proxyproto, uds-wrapper conn and get raw tcp/uds conn from it
 func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {

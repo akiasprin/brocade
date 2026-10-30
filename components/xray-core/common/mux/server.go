@@ -118,7 +118,7 @@ func newServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.
 	if config != nil {
 		hc := *config
 		hc.ActiveSessions = worker.ActiveConnections
-		hc.DrainIdle = func() bool { return worker.ActiveConnections() == 0 }
+		hc.DrainIdle = func() bool { return worker.ActiveConnections() == 0 && worker.endingSessions.Load() == 0 }
 		worker.health = newReverseHealth(hc, copyLink.Writer.(*healthWriter), worker.done)
 	} else {
 		worker.timer = time.NewTicker(serverIdleCheckInterval)
@@ -361,9 +361,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		ID:           meta.SessionID,
 		transferType: protocol.TransferTypeStream,
 	}
-	if w.health == nil {
-		s.lifecycle = w.newSessionLifecycle(realPoolClock{})
-	}
+	s.lifecycle = w.newSessionLifecycle(realPoolClock{})
 	if meta.Target.Network == net.Network_UDP {
 		s.transferType = protocol.TransferTypePacket
 	}
@@ -468,7 +466,7 @@ func (w *ServerWorker) handleFrame(ctx context.Context, reader *buf.BufferedRead
 		err = w.handleStatusKeep(&meta, reader)
 	default:
 		status := meta.SessionStatus
-		return errors.New("unknown status: ", status).AtError()
+		return errors.New("unknown status: ", status)
 	}
 
 	if err != nil {

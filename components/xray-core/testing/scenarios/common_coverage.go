@@ -5,11 +5,15 @@ package scenarios
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 )
 
 func BuildXray() error {
+	if os.Getenv("BROCADE_XRAY_BIN") != "" {
+		return fmt.Errorf("coverage requires an instrumented build; unset BROCADE_XRAY_BIN")
+	}
 	genTestBinaryPath()
 	if _, err := os.Stat(testBinaryPath); err == nil {
 		return nil

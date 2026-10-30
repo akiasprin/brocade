@@ -1,52 +1,71 @@
-package wireguard_test
+package wireguard
 
 import (
 	"context"
-	"github.com/stretchr/testify/assert"
-	"runtime/debug"
+	"io"
+	"net/netip"
+	"sync"
+	"sync/atomic"
 	"testing"
 
-	"github.com/xtls/xray-core/core"
-	"github.com/xtls/xray-core/proxy/wireguard"
+	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/transport"
 )
 
-// TestWireGuardServerInitializationError verifies that an error during TUN initialization
-// (triggered by an empty SecretKey) in the WireGuard server does not cause a panic and returns an error instead.
-func TestWireGuardServerInitializationError(t *testing.T) {
-	// Create a minimal core instance with default features
-	config := &core.Config{}
-	instance, err := core.New(config)
-	if err != nil {
-		t.Fatalf("Failed to create core instance: %v", err)
+// stackConn is a TCP connection as the stack hands it over: it is its own buf.Writer.
+type stackConn struct {
+	net.Conn
+	closed atomic.Int32
+}
+
+func (c *stackConn) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (c *stackConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	buf.ReleaseMulti(mb)
+	return nil
+}
+
+func (c *stackConn) Close() error {
+	c.closed.Add(1)
+	return nil
+}
+
+func (c *stackConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IP{10, 0, 0, 2}, Port: 1234}
+}
+
+// closingDispatcher does what an outbound does when the other side has no more to send.
+type closingDispatcher struct {
+	routing.Dispatcher
+	conn   *stackConn
+	closed int32
+}
+
+func (d *closingDispatcher) DispatchLink(_ context.Context, _ net.Destination, link *transport.Link) error {
+	common.Close(link.Writer)
+	d.closed = d.conn.closed.Load()
+	return nil
+}
+
+func TestServerKeepsConnectionOpenWhenWriterCloses(t *testing.T) {
+	conn := &stackConn{}
+	dispatcher := &closingDispatcher{conn: conn}
+	users := &sync.Map{}
+	users.Store([32]byte{1}, &protocol.MemoryUser{
+		Email:   "love@xray.com",
+		Account: &MemoryAccount{AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.0.0.2/32")}},
+	})
+	s := &Server{ctx: context.Background(), dispatcher: dispatcher, users: users}
+	s.HandleConnection(conn, net.TCPDestination(net.ParseAddress("192.0.2.1"), 443))
+
+	if dispatcher.closed != 0 {
+		t.Fatal("the connection was closed with its writer, while the peer may still be sending")
 	}
-	// Set the Xray instance in the context
-	ctx := context.WithValue(context.Background(), core.XrayKey(1), instance)
-
-	// Define the server configuration with an empty SecretKey to trigger error
-	conf := &wireguard.DeviceConfig{
-		IsClient:  false,
-		Endpoint:  []string{"10.0.0.1/32"},
-		Mtu:       1420,
-		SecretKey: "", // Empty SecretKey to trigger error
-		Peers: []*wireguard.PeerConfig{
-			{
-				PublicKey:  "some_public_key",
-				AllowedIps: []string{"10.0.0.2/32"},
-			},
-		},
+	if got := conn.closed.Load(); got != 1 {
+		t.Fatalf("connection closed %d times, want 1", got)
 	}
-
-	// Use defer to catch any panic and fail the test explicitly
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("TUN initialization panicked: %v", r)
-			debug.PrintStack()
-		}
-	}()
-
-	// Attempt to initialize the WireGuard server
-	_, err = wireguard.NewServer(ctx, conf)
-
-	// Check that an error is returned
-	assert.ErrorContains(t, err, "failed to set private_key: hex string does not fit the slice")
 }

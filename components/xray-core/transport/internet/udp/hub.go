@@ -59,26 +59,9 @@ func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSe
 	}
 
 	var err error
-	logicalAddress := (&net.UDPAddr{IP: address.IP(), Port: int(port)}).String()
-	hub.conn, hub.handoff, err = internet.OpenPacketHandoffListener(logicalAddress, sockopt, func(bindAddress string) (net.PacketConn, error) {
-		udpAddress, err := net.ResolveUDPAddr("udp", bindAddress)
-		if err != nil {
-			return nil, err
-		}
-		return internet.ListenSystemPacket(ctx, udpAddress, sockopt)
-	})
+	hub.conn, hub.handoff, err = internet.ListenPacketWithHandoff(ctx, &net.UDPAddr{IP: address.IP(), Port: int(port)}, streamSettings)
 	if err != nil {
 		return nil, err
-	}
-
-	raw := hub.conn
-
-	if streamSettings.UdpmaskManager != nil {
-		hub.conn, err = streamSettings.UdpmaskManager.WrapPacketConnServer(raw)
-		if err != nil {
-			raw.Close()
-			return nil, errors.New("mask err").Base(err)
-		}
 	}
 
 	errors.LogInfo(ctx, "listening UDP on ", address, ":", port)
