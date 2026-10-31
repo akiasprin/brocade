@@ -1,0 +1,105 @@
+/* 生成文件：node tests/fixtures/color-scheme-mockup-gen.mjs tests/fixtures/color-scheme-mockup-schemes.css
+   中性底沿用生产黛蓝；这里只覆盖角色色。A / C / D 共用苹果系统蓝与系统状态色，差别在
+   color-scheme-mockup.css 的结构层；B 是宝蓝与灰雾蓝之间的柔和蓝。 */
+:root:is([data-scheme='a'], [data-scheme='c'], [data-scheme='d']):not([data-theme='light']) {
+  --action: #2997ff;
+  --action-hover: #56a8ff;
+  --action-active: #148af1;
+  --action-wash: rgba(41, 151, 255, 0.16);
+  --action-on: #00122b;
+  --primary: #0071e3;
+  --primary-hover: #0069d3;
+  --primary-active: #0060c3;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --data: #0a84ff;
+  --data-secondary: #40c8e0;
+  --data-wash: rgba(10, 132, 255, 0.12);
+  --ok: #30d158;
+  --gold: #ff9f0a;
+  --err: #ff453a;
+  --observe-1: #0a84ff;
+  --observe-2: #f857b0;
+  --observe-3: #40c8e0;
+  --observe-4: #bf5af2;
+  --observe-5: #66d4cf;
+  --observe-6: #ff9f0a;
+  --observe-7: #6260eb;
+  --observe-8: #ffd60a;
+  --observe-9: #ac8e68;
+  --observe-10: #8e8e93;
+  --code-k: #56a8ff;
+}
+:root[data-theme='light']:is([data-scheme='a'], [data-scheme='c'], [data-scheme='d']) {
+  --action: #0066cc;
+  --action-hover: #2179e0;
+  --action-active: #0058b2;
+  --action-wash: rgba(0, 102, 204, 0.09);
+  --action-on: #ffffff;
+  --primary: #0071e3;
+  --primary-hover: #0069d3;
+  --primary-active: #0060c3;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --data: #007aff;
+  --data-secondary: #099eb4;
+  --data-wash: rgba(0, 122, 255, 0.08);
+  --ok: #007f2e;
+  --gold: #a25c00;
+  --err: #dd0008;
+  --observe-1: #007aff;
+  --observe-2: #e23b9b;
+  --observe-3: #099eb4;
+  --observe-4: #af52de;
+  --observe-5: #00a199;
+  --observe-6: #d37a00;
+  --observe-7: #5856d6;
+  --observe-8: #af8b00;
+  --observe-9: #a2845e;
+  --observe-10: #8e8e93;
+  --hover: color-mix(in srgb, var(--ink) 5%, transparent);
+  --hover-2: color-mix(in srgb, var(--ink) 9%, transparent);
+  --btn-h: color-mix(in srgb, var(--ink) 5%, var(--sheet));
+  --btn-a: color-mix(in srgb, var(--ink) 10%, var(--sheet));
+  --code-k: #0066cc;
+}
+:root:is([data-scheme='b']):not([data-theme='light']) {
+  --action: #719ad6;
+  --action-hover: #80aae7;
+  --action-active: #6891cc;
+  --action-wash: rgba(113, 154, 214, 0.15);
+  --action-on: #07101f;
+  --primary: #1c2b40;
+  --primary-hover: #21334f;
+  --primary-active: #263b5b;
+  --primary-on: #b2c9ec;
+  --primary-line: #2d4870;
+  --data: #7ba6d2;
+  --data-secondary: #7b95b0;
+  --data-wash: rgba(123, 166, 210, 0.11);
+  --observe-1: #7ba6d2;
+  --observe-2: #e297ba;
+  --observe-3: #6ac2c6;
+  --observe-4: #ac9be0;
+  --code-k: #80aae7;
+}
+:root[data-theme='light']:is([data-scheme='b']) {
+  --action: #3862a7;
+  --action-hover: #4772b9;
+  --action-active: #2a5397;
+  --action-wash: rgba(56, 98, 167, 0.09);
+  --action-on: #ffffff;
+  --primary: #3862a7;
+  --primary-hover: #436eb4;
+  --primary-active: #2a5397;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --data: #346fa9;
+  --data-secondary: #577594;
+  --data-wash: rgba(52, 111, 169, 0.08);
+  --observe-1: #346fa9;
+  --observe-2: #a14e78;
+  --observe-3: #0a7e83;
+  --observe-4: #6e5ba1;
+  --code-k: #3862a7;
+}

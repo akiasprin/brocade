@@ -1,0 +1,294 @@
+/* 配色彩度 mockup：评审条、并排视图，以及 C / D 两个方案改变「颜色落在哪里」的结构层。
+   令牌取值在 color-scheme-mockup-schemes.css（由 -gen.mjs 生成）。虚线表示不属于产品。 */
+
+/* 方案激活时没有生产调色盘可选，账户菜单里的色板行隐藏。 */
+:root[data-scheme] .fg-appearance-row:has(.fg-tone-list) {
+  display: none;
+}
+
+/* ══ A / C / D 共用：实底操作色上的文字 ══
+   系统蓝在暗色里是浅蓝（#2997ff），白字压不住；菜单悬停、步骤标记、选中芯片这类实底改走主按钮那组
+   （#0071e3 + 白字），与主按钮同一种蓝。 */
+:root:is([data-scheme='a'], [data-scheme='c'], [data-scheme='d'])
+  :is(
+    .fg-menu button:hover,
+    .pv-steps li.current i,
+    .wz-stages li.current > span,
+    .wz-protocols > label.on i,
+    .observe-range-menu .observe-range-apply,
+    .external-outbound-tabs button.on,
+    .ov-chips button[aria-pressed='true'],
+    .cg-steps li.current i
+  ) {
+  background: var(--primary);
+  color: var(--primary-on);
+}
+:root:is([data-scheme='a'], [data-scheme='c'], [data-scheme='d']) .fg-menu button:hover small {
+  color: var(--primary-on);
+}
+
+/* ══ C 多彩数据 ══
+   选中态不着色：导航与页签取中性浮起底，界面外框只剩主按钮与链接是蓝色，颜色留给数据。 */
+:root[data-scheme='c'] .fg-nv[aria-current='true'] {
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+  color: var(--ink);
+  box-shadow: none;
+}
+:root[data-scheme='c'] .fg-nv[aria-current='true'] .mark {
+  background: var(--err);
+}
+:root[data-scheme='c'] :is(.nd-tabs, .user-dhead .user-detail-tabs) button[aria-selected='true'] {
+  background: color-mix(in srgb, var(--ink) 9%, transparent);
+  color: var(--ink);
+}
+:root[data-scheme='c'] .nd-tabs button[aria-selected='true'] .nd-tab-ic {
+  color: var(--ink);
+}
+
+/* 指标分色（健康 App 的类目色）：每项读数一个固定颜色，标签与迷你趋势同色。槽位避开状态绿、橙、红；
+   告警与故障两档仍由 .kpi.warn / .kpi.bad 改成状态色。 */
+:root[data-scheme='c'] .kpi-band > .kpi:nth-child(1) {
+  --kpi-tone: var(--observe-1); /* CPU · 蓝 */
+}
+:root[data-scheme='c'] .kpi-band > .kpi:nth-child(2) {
+  --kpi-tone: var(--observe-4); /* 内存 · 紫 */
+}
+:root[data-scheme='c'] .kpi-band > .kpi:nth-child(3) {
+  --kpi-tone: var(--observe-3); /* 磁盘 · 青 */
+}
+:root[data-scheme='c'] .kpi-band > .kpi:nth-child(4) {
+  --kpi-tone: var(--observe-5); /* 连接表 · 薄荷 */
+}
+:root[data-scheme='c'] .kpi-band > .kpi:nth-child(5) {
+  --kpi-tone: var(--observe-2); /* Load · 洋红 */
+}
+:root[data-scheme='c'] .kpi-band > .kpi:nth-child(6) {
+  --kpi-tone: var(--observe-10); /* 已运行 · 中性 */
+}
+:root[data-scheme='c'] .kpi-band > .kpi:not(.warn, .bad) .kpi-spark {
+  color: var(--kpi-tone);
+}
+:root[data-scheme='c'] .kpi-band > .kpi:not(.warn, .bad) .kpi-l {
+  color: var(--kpi-tone);
+  font-weight: 600;
+}
+/* 亮色白底上系统色做文字偏浅，标签向正文色收一档，迷你趋势保持原色。 */
+:root[data-scheme='c'][data-theme='light'] .kpi-band > .kpi:not(.warn, .bad) .kpi-l {
+  color: color-mix(in oklab, var(--kpi-tone), var(--ink) 28%);
+}
+:root[data-scheme='c'] .kpi-spark-area {
+  opacity: 0.22;
+}
+:root[data-scheme='c'] :is(.history-plot, .node-nic-plot) .area {
+  fill: color-mix(in srgb, currentColor 11%, transparent);
+}
+
+/* ══ D 分区色 ══
+   五个主分区各取一个系统色（避开状态色族的蓝、青、靛、紫，发布取橙：它本来就是「待发布」的颜色）。
+   导航图标做成彩色图块（系统设置的侧栏），选中项回到中性浮起底；页面内的标题图标随所在分区着色。
+   操作色仍是系统蓝，分区色只表达「在哪」，不表达「可点」。 */
+:root[data-scheme='d'] {
+  --sec-nodes: #0a84ff;
+  --sec-chains: #40c8e0;
+  --sec-users: #5e5ce6;
+  --sec-deploy: #ff9f0a;
+  --sec-usage: #bf5af2;
+  --sec: var(--ink-3);
+}
+:root[data-scheme='d'][data-theme='light'] {
+  --sec-nodes: #007aff;
+  --sec-chains: #30b0c7;
+  --sec-users: #5856d6;
+  --sec-deploy: #ff9500;
+  --sec-usage: #af52de;
+}
+:root[data-scheme='d']:has(.fg-nv[aria-label='机器'][aria-current='true']) {
+  --sec: var(--sec-nodes);
+}
+:root[data-scheme='d']:has(.fg-nv[aria-label='线路'][aria-current='true']) {
+  --sec: var(--sec-chains);
+}
+:root[data-scheme='d']:has(.fg-nv[aria-label='用户'][aria-current='true']) {
+  --sec: var(--sec-users);
+}
+:root[data-scheme='d']:has(.fg-nv[aria-label='发布'][aria-current='true']) {
+  --sec: var(--sec-deploy);
+}
+:root[data-scheme='d']:has(.fg-nv[aria-label='用量'][aria-current='true']) {
+  --sec: var(--sec-usage);
+}
+:root[data-scheme='d'] .fg-nv[aria-label='机器'] {
+  --sec: var(--sec-nodes);
+}
+:root[data-scheme='d'] .fg-nv[aria-label='线路'] {
+  --sec: var(--sec-chains);
+}
+:root[data-scheme='d'] .fg-nv[aria-label='用户'] {
+  --sec: var(--sec-users);
+}
+:root[data-scheme='d'] .fg-nv[aria-label='发布'] {
+  --sec: var(--sec-deploy);
+}
+:root[data-scheme='d'] .fg-nv[aria-label='用量'] {
+  --sec: var(--sec-usage);
+}
+:root[data-scheme='d'] .fg-nv {
+  padding-left: 4px;
+  gap: 7px;
+}
+:root[data-scheme='d'] .fg-nv-ic {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: var(--sec);
+  color: #ffffff;
+}
+:root[data-scheme='d'] .fg-nv-ic svg {
+  width: 13px;
+  height: 13px;
+}
+:root[data-scheme='d'] .fg-nv[aria-current='true'] {
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+  color: var(--ink);
+  box-shadow: none;
+}
+:root[data-scheme='d'] .fg-nv[aria-current='true'] .fg-nv-ic {
+  transform: none;
+}
+:root[data-scheme='d'] .fg-nv[aria-current='true'] .mark {
+  background: var(--err);
+}
+:root[data-scheme='d'] :is(.list-ico, .panel-title-icon, .chart-title-icon) {
+  color: var(--sec);
+}
+:root[data-scheme='d'] .nd-page-identity .cg-plate {
+  border-color: transparent;
+  background: var(--sec);
+  color: #ffffff;
+}
+
+/* ══ 评审条 ══ */
+
+.mk-dock {
+  position: fixed;
+  left: 50%;
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  z-index: 2147483000;
+  transform: translateX(-50%);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  max-width: calc(100vw - 24px);
+  padding: 8px 10px;
+  border: 1px dashed color-mix(in srgb, var(--ink-3) 60%, transparent);
+  border-radius: 14px;
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+  backdrop-filter: blur(14px) saturate(1.4);
+  box-shadow: var(--shadow);
+  color: var(--ink-2);
+  font: 12px/1.4 var(--sans);
+}
+.mk-dock.folded {
+  padding: 4px;
+}
+.mk-dock-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.mk-dock-note {
+  max-width: 640px;
+  margin: 0;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.mk-fold,
+.mk-unfold {
+  appearance: none;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--ink-3);
+  font: 12px var(--sans);
+  cursor: pointer;
+}
+.mk-fold {
+  width: 26px;
+  height: 26px;
+  margin-left: auto;
+  font-size: 15px;
+}
+.mk-unfold {
+  padding: 5px 10px;
+}
+.mk-fold:hover,
+.mk-unfold:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+/* ══ 并排视图 ══ */
+
+.mk-grid-open body {
+  overflow: hidden;
+}
+.mk-grid-view {
+  position: fixed;
+  inset: 0;
+  z-index: 2147482000;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 560px), 1fr));
+  align-content: start;
+  gap: 18px;
+  overflow: auto;
+  padding: 18px 18px 150px;
+  background: var(--ground);
+}
+.mk-tile {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+.mk-tile figcaption {
+  color: var(--ink);
+  font: 600 13px/1.3 var(--sans);
+}
+.mk-tile-box {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.mk-tile-box iframe {
+  position: absolute;
+  top: 0;
+  left: 0;
+  border: 0;
+  transform-origin: 0 0;
+}
+
+@media (max-width: 720px) {
+  .mk-dock {
+    left: 12px;
+    right: 12px;
+    transform: none;
+    max-width: none;
+  }
+  .mk-dock-row {
+    flex-wrap: nowrap;
+  }
+  .mk-dock-row > .segsw {
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .mk-dock-row > .segsw > button {
+    flex: none;
+  }
+}
