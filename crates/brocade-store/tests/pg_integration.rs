@@ -28658,13 +28658,16 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
         .await
         .unwrap();
     let meter = "0123456789abcdef0123456789abcdef";
+    // Whole-byte/s direction rates after the one-hour floor keep rounded remaining-period
+    // forecasts exact even on the last day of the month.
+    const COUNTER_SCALE: u64 = 36;
     let reading = |sequence, rx_bytes, tx_bytes, discontinuities| NodeTrafficReading {
         meter_id: meter.to_owned(),
         sequence,
         interface: "eth0".to_owned(),
         boot_id: "11111111-2222-3333-4444-555555555555".to_owned(),
-        rx_bytes,
-        tx_bytes,
+        rx_bytes: rx_bytes * COUNTER_SCALE,
+        tx_bytes: tx_bytes * COUNTER_SCALE,
         discontinuities,
         sampled_at_unix_secs: None,
         day_boundaries: Vec::new(),
@@ -28693,9 +28696,9 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
         .unwrap();
     assert_eq!(
         (before.rx_bytes.as_str(), before.tx_bytes.as_str()),
-        ("100", "200")
+        ("3600", "7200")
     );
-    assert_eq!(before.total_bytes, "300");
+    assert_eq!(before.total_bytes, "10800");
     assert!(
         before.has_gap,
         "tracking began after this UTC period started"
@@ -28735,11 +28738,11 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
         .find(|node| node.node_id == "n1")
         .unwrap();
     assert_eq!(capacity.quota_bytes.as_deref(), Some("10995116277760"));
-    // Seconds of tracking: no complete day yet, so the rate is the 300 bytes over the one-hour
+    // Seconds of tracking: no complete day yet, so the rate is the 10_800 bytes over the one-hour
     // floor, and no machine has history for a measured error.
     assert_eq!(
         (capacity.daily_rate_bytes.as_str(), capacity.rate_days),
-        ("7200", 0)
+        ("259200", 0)
     );
     assert_eq!(capacity.band.basis, MachineTrafficBandBasis::Default);
     assert_eq!(capacity.confidence, MachineTrafficConfidence::Low);
@@ -28747,7 +28750,7 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
         !capacity.needs_calibration,
         "the calibration follows the late tracking start"
     );
-    // The chart reads the same ledger the totals use: one UTC day holding the 300 accounted
+    // The chart reads the same ledger the totals use: one UTC day holding the 10_800 accounted
     // bytes, in whichever window that day falls, plus the anchors that explain the total.
     let ledger = capacity
         .days
@@ -28755,7 +28758,10 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
         .chain(&capacity.previous_days)
         .map(|day| (day.day_start_unix_secs, day.bytes.as_str()))
         .collect::<Vec<_>>();
-    assert_eq!(ledger, vec![((now - 3).div_euclid(86_400) * 86_400, "300")]);
+    assert_eq!(
+        ledger,
+        vec![((now - 3).div_euclid(86_400) * 86_400, "10800")]
+    );
     assert_eq!(
         capacity.previous_period_start_unix_secs,
         2 * capacity.period_start_unix_secs - capacity.period_end_unix_secs
@@ -28784,7 +28790,7 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
         .iter()
         .find(|node| node.node_id == "n1")
         .unwrap();
-    assert_eq!(after.total_bytes, "1073741944");
+    assert_eq!(after.total_bytes, "1073746144");
     assert!(after.has_gap, "a reboot after calibration remains visible");
     assert_eq!(after.last_gap_reason.as_deref(), Some("machine-reboot"));
     // The Agent reported right up to the reboot, so the forecast keeps trusting the total.
@@ -28802,7 +28808,7 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
     assert_eq!(capacity.gap_reason, None);
 
     // A mode switch never reuses a calibration made under a different formula. Max is taken over
-    // the whole period's direction totals: max(160, 260), not the sum of daily maxima.
+    // the whole period's direction totals: max(5760, 9360), not the sum of daily maxima.
     db.store
         .update_node_traffic(
             &system_admin(),
@@ -28828,7 +28834,7 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
         switched.accounting_mode,
         NodeTrafficAccountingMode::BidirectionalMax
     );
-    assert_eq!(switched.total_bytes, "260");
+    assert_eq!(switched.total_bytes, "9360");
     assert_eq!(switched.calibrated_at_unix_secs, None);
 
     db.store
@@ -28856,7 +28862,7 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
         .iter()
         .find(|node| node.node_id == "n1")
         .unwrap();
-    assert_eq!(recalibrated.total_bytes, "1030");
+    assert_eq!(recalibrated.total_bytes, "2080");
 
     // An older already-open UI has no mode field. Its quota edit must preserve the selected mode
     // and that mode's calibration instead of silently resetting both to the legacy default.
@@ -28885,7 +28891,7 @@ async fn node_traffic_is_idempotent_across_restart_calibration_and_reboot() {
         legacy_write.accounting_mode,
         NodeTrafficAccountingMode::BidirectionalMax
     );
-    assert_eq!(legacy_write.total_bytes, "1030");
+    assert_eq!(legacy_write.total_bytes, "2080");
     assert_eq!(legacy_write.quota_bytes.as_deref(), Some("12345"));
 }
 
