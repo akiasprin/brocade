@@ -33,7 +33,7 @@ impl Drop for TestDirectory {
 }
 
 #[test]
-fn repository_keeps_consolidated_baseline_and_appends_unlock_schedule() {
+fn repository_preserves_published_migrations_and_appends_app_rate_limits() {
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     let sources = migrations::sources(&directory).unwrap();
     assert_eq!(
@@ -41,7 +41,7 @@ fn repository_keeps_consolidated_baseline_and_appends_unlock_schedule() {
             .iter()
             .map(|source| source.version)
             .collect::<Vec<_>>(),
-        [1, 2, 3]
+        [1, 2, 3, 4]
     );
     let notifications = fs::read_to_string(&sources[2].path).unwrap();
     assert!(notifications.contains("pg_notify"));
