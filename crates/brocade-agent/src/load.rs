@@ -14,8 +14,9 @@
 //! machine on the control plane would be paid for nothing.
 //!
 //! What that costs is the control plane's ability to notice a counter reset on its own, which is
-//! why every report carries `btime`: it changes exactly when the machine rebooted and every
-//! cumulative counter in here went back to zero.
+//! why every report carries `btime` as calendar metadata. It is not a boot identity: setting the
+//! wall clock changes it too. Local differencing and restart handoffs use the kernel boot ID and
+//! CLOCK_BOOTTIME, which survive clock corrections without pretending counters were reset.
 
 use std::{
     collections::BTreeMap,
@@ -53,7 +54,7 @@ pub(crate) const SUBS_PER_WINDOW: usize = 3;
 /// startup while remaining short enough that a forgotten file cannot turn stale operational state
 /// into current telemetry.
 const HANDOFF_FILE: &str = "load-handoff.json";
-const HANDOFF_VERSION: u32 = 1;
+const HANDOFF_VERSION: u32 = 2;
 const HANDOFF_MAX_AGE_SECS: u64 = 65;
 const HANDOFF_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -80,6 +81,8 @@ static PENDING: Mutex<Vec<Sub>> = Mutex::new(Vec::new());
 struct LoadHandoff {
     version: u32,
     saved_at_unix_secs: u64,
+    #[serde(default)]
+    saved_at_boottime_secs: u64,
     previous: Raw,
     pending: Vec<Sub>,
 }
@@ -89,6 +92,10 @@ struct LoadHandoff {
 struct Raw {
     at: u64,
     btime: i64,
+    #[serde(default)]
+    boot_id: String,
+    #[serde(default)]
+    boottime_secs: u64,
     /// Total jiffies per class, from `/proc/stat`'s first line.
     cpu: CpuTimes,
     cpu_cores: BTreeMap<u32, CpuTimes>,
@@ -153,7 +160,7 @@ struct Sub {
     disk: Option<DiskDelta>,
     /// Per-process CPU share over this sub-interval.
     proc_cpu_pct: BTreeMap<String, f32>,
-    /// btime changed, or the counters went backwards: this sub-sample's differences are not real.
+    /// A real reboot, missed interval or counter regression makes this interval incomplete.
     gap: bool,
 }
 
@@ -307,21 +314,21 @@ pub(crate) fn tick(state_dir: &Path, now: u64) -> Option<(LoadSample, Vec<Proces
 }
 
 fn tick_locked(state_dir: &Path, now: u64) -> Option<(LoadSample, Vec<ProcessSample>)> {
-    let raw = read_raw(now, state_dir);
+    let raw = match read_raw(now, state_dir) {
+        Ok(raw) => raw,
+        Err(error) => {
+            crate::warn(format!("load: could not sample host: {error}"));
+            return None;
+        }
+    };
     let mut previous = PREVIOUS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    // A replacement Agent starts immediately after the old process saves its final whole-second
-    // timestamp. Its first tick can therefore land in that same second. There is no interval to
-    // difference yet: consuming the handoff here would manufacture a clock-regression gap and
-    // break the very window the handoff exists to preserve. Keep both the baseline and the
-    // one-shot resumed allowance for the next real tick.
-    if should_defer_restored_tick(
-        previous.as_ref(),
-        &raw,
-        FIRST_TICK_AFTER_HANDOFF.load(Ordering::SeqCst),
-    ) {
+    // A replacement Agent or an exit-time read can land in the same monotonic second as the
+    // baseline. Keep it and the resumed allowance until an actual interval has elapsed, regardless
+    // of whether the wall clock advanced or regressed in between.
+    if should_defer_tick(previous.as_ref(), &raw) {
         return None;
     }
 
@@ -337,6 +344,10 @@ fn tick_locked(state_dir: &Path, now: u64) -> Option<(LoadSample, Vec<ProcessSam
     let mut pending = PENDING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Err(error) = reanchor_pending(&mut pending, sub.window_start_unix_secs) {
+        crate::warn(format!("load: discarded invalid pending window: {error}"));
+        pending.clear();
+    }
     pending.push(sub);
     if pending.len() < SUBS_PER_WINDOW {
         return None;
@@ -347,8 +358,25 @@ fn tick_locked(state_dir: &Path, now: u64) -> Option<(LoadSample, Vec<ProcessSam
     Some((aggregate(&subs, state_dir), processes(&subs, &raw)))
 }
 
-fn should_defer_restored_tick(previous: Option<&Raw>, raw: &Raw, resumed: bool) -> bool {
-    resumed && previous.is_some_and(|previous| previous.at == raw.at)
+fn should_defer_tick(previous: Option<&Raw>, raw: &Raw) -> bool {
+    previous.is_some_and(|previous| {
+        previous.boot_id == raw.boot_id && previous.boottime_secs == raw.boottime_secs
+    })
+}
+
+/// Only unfinished observations move: their counters and durations are already measured, but
+/// their calendar positions must follow the corrected clock of the next reading. Published
+/// history is immutable and may still have a genuine calendar discontinuity at the correction.
+fn reanchor_pending(pending: &mut [Sub], mut end: u64) -> Result<(), String> {
+    for sub in pending.iter_mut().rev() {
+        let start = end
+            .checked_sub(sub.elapsed_secs)
+            .ok_or("pending window predates the Unix epoch")?;
+        sub.window_start_unix_secs = start;
+        sub.window_end_unix_secs = end;
+        end = start;
+    }
+    Ok(())
 }
 
 /// Freeze the sampler at a normal process-exit boundary and take one final reading. The result is
@@ -365,19 +393,8 @@ pub(crate) fn freeze_for_handoff(
         return None;
     }
 
-    // The wall-clock protocol has whole-second precision. A second read in the same second cannot
-    // form a real interval and would be flagged as a clock regression, so retain the existing
-    // baseline and let the new process take the next reading instead.
-    let already_at_now = PREVIOUS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .is_some_and(|previous| previous.at >= now);
-    if already_at_now {
-        None
-    } else {
-        tick_locked(state_dir, now)
-    }
+    // tick_locked defers a duplicate monotonic second even if the wall clock changed on exit.
+    tick_locked(state_dir, now)
 }
 
 /// Persist the frozen baseline and unfinished window exactly once for a normal restart.
@@ -405,10 +422,15 @@ pub(crate) fn save_frozen_handoff(state_dir: &Path, now: u64) -> Result<bool, St
     let handoff = LoadHandoff {
         version: HANDOFF_VERSION,
         saved_at_unix_secs: now,
+        saved_at_boottime_secs: read_boottime_secs()?,
         previous,
         pending,
     };
-    validate_handoff(&handoff, now, handoff.previous.btime)?;
+    validate_handoff(
+        &handoff,
+        handoff.saved_at_boottime_secs,
+        &handoff.previous.boot_id,
+    )?;
     let bytes =
         serde_json::to_vec(&handoff).map_err(|error| format!("encode load handoff: {error}"))?;
     if bytes.len() as u64 > HANDOFF_MAX_BYTES {
@@ -442,19 +464,25 @@ pub(crate) fn restore_handoff(state_dir: &Path, now: u64) -> Result<bool, String
         ));
     }
     let bytes = fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    let handoff: LoadHandoff = match serde_json::from_slice(&bytes) {
+    let mut handoff: LoadHandoff = match serde_json::from_slice(&bytes) {
         Ok(handoff) => handoff,
         Err(error) => {
             remove_handoff_file(&path)?;
             return Err(format!("discarded invalid load handoff: {error}"));
         }
     };
-    let current_btime = current_btime();
-    if let Err(error) = validate_handoff(&handoff, now, current_btime) {
+    let boottime = read_boottime_secs()?;
+    let boot_id = read_boot_id()?;
+    if let Err(error) = validate_handoff(&handoff, boottime, &boot_id) {
         remove_handoff_file(&path)?;
         crate::warn(format!("load: ignored restart handoff: {error}"));
         return Ok(false);
     }
+    let previous_at = now
+        .checked_sub(boottime - handoff.previous.boottime_secs)
+        .ok_or("restored baseline predates the Unix epoch")?;
+    reanchor_pending(&mut handoff.pending, previous_at)?;
+    handoff.previous.at = previous_at;
 
     *PREVIOUS
         .lock()
@@ -493,22 +521,22 @@ fn remove_handoff_file(path: &Path) -> Result<(), String> {
     }
 }
 
-fn validate_handoff(handoff: &LoadHandoff, now: u64, current_btime: i64) -> Result<(), String> {
+fn validate_handoff(handoff: &LoadHandoff, boottime: u64, boot_id: &str) -> Result<(), String> {
     if handoff.version != HANDOFF_VERSION {
         return Err(format!(
             "unsupported version {} (expected {})",
             handoff.version, HANDOFF_VERSION
         ));
     }
-    if handoff.saved_at_unix_secs > now || handoff.previous.at > now {
-        return Err("handoff timestamp is in the future".to_owned());
+    if handoff.saved_at_boottime_secs > boottime || handoff.previous.boottime_secs > boottime {
+        return Err("handoff monotonic timestamp is in the future".to_owned());
     }
-    if now.saturating_sub(handoff.saved_at_unix_secs) > HANDOFF_MAX_AGE_SECS
-        || now.saturating_sub(handoff.previous.at) > HANDOFF_MAX_AGE_SECS
+    if boottime.saturating_sub(handoff.saved_at_boottime_secs) > HANDOFF_MAX_AGE_SECS
+        || boottime.saturating_sub(handoff.previous.boottime_secs) > HANDOFF_MAX_AGE_SECS
     {
         return Err("handoff is older than 65 seconds".to_owned());
     }
-    if current_btime <= 0 || handoff.previous.btime != current_btime {
+    if boot_id.is_empty() || handoff.previous.boot_id != boot_id {
         return Err("machine boot identity changed".to_owned());
     }
     if handoff.pending.len() >= SUBS_PER_WINDOW {
@@ -553,11 +581,14 @@ fn difference(before: &Raw, now: &Raw) -> Sub {
 }
 
 fn difference_inner(before: &Raw, now: &Raw, resumed_handoff: bool) -> Sub {
-    let clock_regressed = now.at <= before.at;
-    let elapsed = now.at.saturating_sub(before.at).max(1);
+    let clock_regressed = now.boottime_secs <= before.boottime_secs;
+    let elapsed = now
+        .boottime_secs
+        .saturating_sub(before.boottime_secs)
+        .max(1);
     // A reboot resets every counter in here. Treating that as growth would report a machine that
     // just came up as having transferred its whole lifetime's bytes in ten seconds.
-    let rebooted = before.btime != now.btime;
+    let rebooted = before.boot_id != now.boot_id;
     let aggregate_cpu_regressed = cpu_times_regressed(before.cpu, now.cpu);
     let core_cpu_regressed = now.cpu_cores.iter().any(|(cpu, current)| {
         before
@@ -766,7 +797,7 @@ fn difference_inner(before: &Raw, now: &Raw, resumed_handoff: bool) -> Sub {
     }
 
     Sub {
-        window_start_unix_secs: before.at,
+        window_start_unix_secs: now.at.saturating_sub(elapsed),
         window_end_unix_secs: now.at,
         elapsed_secs: elapsed,
         cpu_user_pct: share(now.cpu.user, before.cpu.user),
@@ -1396,13 +1427,15 @@ fn read_nic_mtu(nic: &str) -> Option<u32> {
         .ok()
 }
 
-fn read_raw(now: u64, state_dir: &Path) -> Raw {
+fn read_raw(now: u64, state_dir: &Path) -> Result<Raw, String> {
     let stat = fs::read_to_string("/proc/stat").unwrap_or_default();
     let vm = read_vmstat();
     let pids = find_pids();
-    Raw {
+    Ok(Raw {
         at: now,
         btime: parse_btime(&stat).unwrap_or(0),
+        boot_id: read_boot_id()?,
+        boottime_secs: read_boottime_secs()?,
         cpu: parse_cpu(&stat),
         cpu_cores: parse_cpu_cores(&stat),
         context_switches: parse_stat_counter(&stat, "ctxt "),
@@ -1419,7 +1452,32 @@ fn read_raw(now: u64, state_dir: &Path) -> Raw {
         disk: read_disk_counters(state_dir),
         proc_cpu: read_proc_cpu(&pids),
         pids,
+    })
+}
+
+fn read_boot_id() -> Result<String, String> {
+    let id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|error| format!("read kernel boot identity: {error}"))?;
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("kernel boot identity is empty".to_owned());
     }
+    Ok(id.to_owned())
+}
+
+fn read_boottime_secs() -> Result<u64, String> {
+    let mut clock = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock points to a valid writable timespec; CLOCK_BOOTTIME is a Linux clock ID.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut clock) } != 0 {
+        return Err(format!(
+            "read boot clock: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    u64::try_from(clock.tv_sec).map_err(|_| "kernel boot clock is negative".to_owned())
 }
 
 fn parse_cpu(stat: &str) -> CpuTimes {
@@ -2514,6 +2572,8 @@ mod tests {
     fn disk_window_preserves_rates_latency_busy_queue_and_pressure() {
         let raw = |at: u64, reads: u64, writes: u64, read_ms: u64, write_ms: u64| Raw {
             at,
+            boottime_secs: at,
+            boot_id: "boot-a".to_owned(),
             btime: 1,
             cpu: CpuTimes {
                 total: at * 10,
@@ -2605,6 +2665,8 @@ mod tests {
     fn a_reboot_zeroes_the_deltas_and_flags_the_gap() {
         let before = Raw {
             at: 100,
+            boottime_secs: 100,
+            boot_id: "boot-a".to_owned(),
             btime: 1_700_000_000,
             cpu: CpuTimes {
                 user: 1000,
@@ -2626,7 +2688,9 @@ mod tests {
         };
         let after = Raw {
             at: 110,
+            boottime_secs: 110,
             btime: 1_700_000_500, // rebooted
+            boot_id: "boot-b".to_owned(),
             cpu: CpuTimes {
                 user: 10,
                 system: 5,
@@ -2662,6 +2726,8 @@ mod tests {
     fn counters_going_backwards_clamp_to_zero_rather_than_going_negative() {
         let before = Raw {
             at: 100,
+            boottime_secs: 100,
+            boot_id: "boot-a".to_owned(),
             btime: 1_700_000_000,
             cpu: CpuTimes {
                 user: 1000,
@@ -2682,6 +2748,8 @@ mod tests {
         };
         let after = Raw {
             at: 110,
+            boottime_secs: 110,
+            boot_id: "boot-a".to_owned(),
             btime: 1_700_000_000,
             cpu: CpuTimes {
                 user: 990,
@@ -2713,6 +2781,8 @@ mod tests {
     fn per_core_iowait_regression_drops_that_core_instead_of_emitting_over_100_percent() {
         let before = Raw {
             at: 100,
+            boottime_secs: 100,
+            boot_id: "boot-a".to_owned(),
             btime: 1_700_000_000,
             cpu: CpuTimes {
                 user: 100,
@@ -2737,6 +2807,8 @@ mod tests {
         };
         let after = Raw {
             at: 110,
+            boottime_secs: 110,
+            boot_id: "boot-a".to_owned(),
             btime: 1_700_000_000,
             cpu: CpuTimes {
                 user: 120,
@@ -2774,6 +2846,8 @@ mod tests {
     fn pressure_and_rates_use_the_real_elapsed_interval() {
         let before = Raw {
             at: 100,
+            boottime_secs: 100,
+            boot_id: "boot-a".to_owned(),
             btime: 1,
             cpu: CpuTimes {
                 total: 1000,
@@ -2791,6 +2865,8 @@ mod tests {
         };
         let after = Raw {
             at: 140,
+            boottime_secs: 140,
+            boot_id: "boot-a".to_owned(),
             btime: 1,
             cpu: CpuTimes {
                 user: 100,
@@ -2820,9 +2896,113 @@ mod tests {
     }
 
     #[test]
+    fn clock_steps_preserve_counter_rates_and_reanchor_unpublished_windows() {
+        let before = Raw {
+            at: 1_000,
+            btime: 100,
+            boot_id: "same-boot".to_owned(),
+            boottime_secs: 500,
+            cpu: CpuTimes {
+                total: 1_000,
+                ..Default::default()
+            },
+            net: NetCounters {
+                rx_bytes: 100,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for corrected_at in [970, 1_050] {
+            let after = Raw {
+                at: corrected_at,
+                btime: before.btime + corrected_at as i64 - 1_010,
+                boottime_secs: 510,
+                cpu: CpuTimes {
+                    user: 50,
+                    total: 1_100,
+                    ..Default::default()
+                },
+                net: NetCounters {
+                    rx_bytes: 1_100,
+                    ..Default::default()
+                },
+                ..before.clone()
+            };
+            let sub = difference(&before, &after);
+            assert!(!sub.gap, "a wall-clock step is not a reboot or missed tick");
+            assert_eq!(sub.elapsed_secs, 10);
+            assert_eq!(sub.cpu_user_pct, 50.0);
+            assert_eq!(sub.nic_rx_bps, 800);
+            assert_eq!(sub.window_start_unix_secs, corrected_at - 10);
+            let mut pending = vec![Sub {
+                window_start_unix_secs: 990,
+                window_end_unix_secs: 1_000,
+                elapsed_secs: 10,
+                nic_rx_bps: 800,
+                ..Default::default()
+            }];
+            reanchor_pending(&mut pending, sub.window_start_unix_secs).unwrap();
+            pending.push(sub);
+            let sample = aggregate(&pending, Path::new("/tmp"));
+            assert!(!sample.has_gap);
+            assert_eq!(sample.nic_rx_bps, 800);
+            assert_eq!(sample.window_start_unix_secs, corrected_at as i64 - 20);
+            assert_eq!(sample.window_end_unix_secs, corrected_at as i64);
+        }
+    }
+
+    #[test]
+    fn unchanged_wall_time_does_not_hide_a_real_sampling_stall() {
+        let before = Raw {
+            at: 1_000,
+            boot_id: "same-boot".to_owned(),
+            boottime_secs: 100,
+            ..Default::default()
+        };
+        let after = Raw {
+            boottime_secs: 140,
+            ..before.clone()
+        };
+        assert!(!should_defer_tick(Some(&before), &after));
+        let sub = difference(&before, &after);
+        assert!(sub.gap);
+        assert_eq!(sub.elapsed_secs, 40);
+    }
+
+    #[test]
+    fn a_different_boot_cannot_reuse_an_equal_calendar_boot_timestamp() {
+        let before = Raw {
+            at: 1_000,
+            btime: 100,
+            boot_id: "boot-a".to_owned(),
+            boottime_secs: 100,
+            net: NetCounters {
+                rx_bytes: 100,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let after = Raw {
+            at: 1_010,
+            boot_id: "boot-b".to_owned(),
+            boottime_secs: 110,
+            net: NetCounters {
+                rx_bytes: 1_100,
+                ..Default::default()
+            },
+            ..before.clone()
+        };
+        let sub = difference(&before, &after);
+        assert!(sub.gap);
+        assert_eq!(sub.nic_rx_bps, 0);
+    }
+
+    #[test]
     fn restart_handoff_keeps_a_short_longer_interval_valid() {
         let before = Raw {
             at: 100,
+            boottime_secs: 100,
+            boot_id: "boot-a".to_owned(),
             btime: 1,
             cpu: CpuTimes {
                 total: 1_000,
@@ -2836,6 +3016,8 @@ mod tests {
         };
         let after = Raw {
             at: 140,
+            boottime_secs: 140,
+            boot_id: "boot-a".to_owned(),
             btime: 1,
             cpu: CpuTimes {
                 user: 100,
@@ -2863,32 +3045,30 @@ mod tests {
     fn restored_handoff_defers_a_same_second_first_tick() {
         let previous = Raw {
             at: 2_000_000_000,
+            boottime_secs: 2_000_000_000,
+            boot_id: "boot-a".to_owned(),
             ..Default::default()
         };
         let same_second = Raw {
             at: previous.at,
+            boottime_secs: previous.at,
+            boot_id: "boot-a".to_owned(),
             ..Default::default()
         };
         let next_tick = Raw {
             at: previous.at + SUB_INTERVAL_SECS,
+            boottime_secs: previous.at + SUB_INTERVAL_SECS,
+            boot_id: "boot-a".to_owned(),
             ..Default::default()
         };
 
-        assert!(should_defer_restored_tick(
-            Some(&previous),
-            &same_second,
-            true
-        ));
-        assert!(!should_defer_restored_tick(
-            Some(&previous),
-            &next_tick,
-            true
-        ));
-        assert!(!should_defer_restored_tick(
-            Some(&previous),
-            &same_second,
-            false
-        ));
+        assert!(should_defer_tick(Some(&previous), &same_second,));
+        assert!(!should_defer_tick(Some(&previous), &next_tick,));
+        let another_boot = Raw {
+            boot_id: "boot-b".to_owned(),
+            ..same_second
+        };
+        assert!(!should_defer_tick(Some(&previous), &another_boot));
     }
 
     #[test]
@@ -2902,21 +3082,27 @@ mod tests {
         let handoff = LoadHandoff {
             version: HANDOFF_VERSION,
             saved_at_unix_secs: 130,
+            saved_at_boottime_secs: 130,
             previous: Raw {
                 at: 130,
+                boottime_secs: 130,
+                boot_id: "boot-a".to_owned(),
                 btime: 7,
                 ..Default::default()
             },
             pending: vec![sub(100, 110), sub(110, 130)],
         };
 
-        validate_handoff(&handoff, 140, 7).unwrap();
+        validate_handoff(&handoff, 140, "boot-a").unwrap();
         let encoded = serde_json::to_vec(&handoff).unwrap();
         let decoded: LoadHandoff = serde_json::from_slice(&encoded).unwrap();
-        validate_handoff(&decoded, 140, 7).unwrap();
-        assert!(validate_handoff(&handoff, 196, 7).is_err(), "stale handoff");
+        validate_handoff(&decoded, 140, "boot-a").unwrap();
         assert!(
-            validate_handoff(&handoff, 140, 8).is_err(),
+            validate_handoff(&handoff, 196, "boot-a").is_err(),
+            "stale handoff"
+        );
+        assert!(
+            validate_handoff(&handoff, 140, "boot-b").is_err(),
             "machine reboot"
         );
 
@@ -2924,7 +3110,29 @@ mod tests {
             pending: vec![sub(100, 110), sub(111, 130)],
             ..handoff
         };
-        assert!(validate_handoff(&broken, 140, 7).is_err());
+        assert!(validate_handoff(&broken, 140, "boot-a").is_err());
+    }
+
+    #[test]
+    fn handoff_age_uses_boot_clock_and_rejects_legacy_wall_clock_identity() {
+        let mut handoff = LoadHandoff {
+            version: HANDOFF_VERSION,
+            saved_at_unix_secs: 2_000,
+            saved_at_boottime_secs: 100,
+            previous: Raw {
+                at: 2_000,
+                boottime_secs: 100,
+                boot_id: "same-boot".to_owned(),
+                ..Default::default()
+            },
+            pending: Vec::new(),
+        };
+        assert!(validate_handoff(&handoff, 110, "same-boot").is_ok());
+        assert!(validate_handoff(&handoff, 166, "same-boot").is_err());
+        assert!(validate_handoff(&handoff, 90, "same-boot").is_err());
+        assert!(validate_handoff(&handoff, 110, "another-boot").is_err());
+        handoff.version = 1;
+        assert!(validate_handoff(&handoff, 110, "same-boot").is_err());
     }
 
     #[test]
@@ -2946,7 +3154,25 @@ mod tests {
     }
 
     #[test]
-    fn one_restart_write_round_trips_the_sampler_state() {
+    fn legacy_handoff_is_discarded_without_blocking_sampling() {
+        let dir = std::env::temp_dir().join(format!("brocade-load-legacy-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(HANDOFF_FILE);
+        let mut previous = serde_json::to_value(Raw::default()).unwrap();
+        previous.as_object_mut().unwrap().remove("boot_id");
+        previous.as_object_mut().unwrap().remove("boottime_secs");
+        let legacy = serde_json::json!({
+            "version": 1, "saved_at_unix_secs": 2_000_000_000_u64,
+            "previous": previous, "pending": [],
+        });
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(!restore_handoff(&dir, 2_000_000_000).unwrap());
+        assert!(!path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn one_restart_write_round_trips_after_clock_rollback() {
         fn reset_sampler() {
             *PREVIOUS
                 .lock()
@@ -2971,11 +3197,15 @@ mod tests {
 
         let now = 2_000_000_000;
         let btime = current_btime();
+        let boot_id = read_boot_id().unwrap();
+        let boottime_secs = read_boottime_secs().unwrap();
         assert!(btime > 0);
         *PREVIOUS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Raw {
             at: now,
+            boottime_secs,
+            boot_id,
             btime,
             net: NetCounters {
                 rx_bytes: 123,
@@ -2997,7 +3227,7 @@ mod tests {
         assert!(save_frozen_handoff(&dir, now).unwrap());
         assert!(dir.join(HANDOFF_FILE).is_file());
         reset_sampler();
-        assert!(restore_handoff(&dir, now + 5).unwrap());
+        assert!(restore_handoff(&dir, now - 40).unwrap());
         assert_eq!(
             PREVIOUS
                 .lock()

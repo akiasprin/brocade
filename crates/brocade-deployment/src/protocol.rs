@@ -2805,9 +2805,9 @@ pub struct SpoolBacklog {
 // data has to be auditable and replay-proof. Load history remains useful across a maintenance
 // window but not indefinitely, so the Agent persists only its newest hour and the control plane
 // deduplicates each replayed window. The control plane cannot derive a rate from a later cumulative
-// reading, which is why `btime` is included in every completed window: it changes when the machine
-// reboots and every cumulative counter returns to zero. Usage makes the same determination with
-// `xray_started_at`, and this reuses that approach rather than introducing a second one.
+// reading. `btime` remains calendar metadata for historical grouping; wall-clock corrections can
+// change it without a reboot. The Agent uses the kernel boot ID and elapsed boot time locally to
+// detect counter resets and measure intervals before it sends these already-differenced windows.
 //
 // None of this enters the model and none of it creates a revision. It is runtime observation, in
 // the same category as `user_app_quotas`.
@@ -2823,8 +2823,8 @@ pub struct LoadReportRequest {
     /// and remain valid for fresh, non-replayed reports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent_at_unix_secs: Option<i64>,
-    /// `/proc/stat`'s btime. A change means the machine rebooted and every cumulative counter
-    /// restarted, which invalidates the differences in this round's first window.
+    /// `/proc/stat`'s calendar boot time. Clock corrections can change it without a reboot;
+    /// it is metadata, not the identity used to validate cumulative-counter differences.
     pub btime_unix_secs: i64,
     pub host: HostFacts,
     /// Usually one entry. The Agent persists up to 120 reports and replays them in chronological
