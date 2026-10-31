@@ -24,7 +24,9 @@ fn accept(listener: &TcpListener) -> (TcpStream, SocketAddr) {
         }
     }
 }
-fn warm_control_client() {
+pub(crate) fn warm_control_client() {
+    // Hashing the large debug executable is startup work, outside fixture request deadlines.
+    crate::identity::self_identity();
     client::shared(
         client::TrafficClass::Control,
         None,

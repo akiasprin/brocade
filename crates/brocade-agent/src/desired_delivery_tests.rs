@@ -61,6 +61,7 @@ fn accept_request(listener: &TcpListener) -> TcpStream {
 
 #[test]
 fn desired_delivery_error_responses_preserve_collection_policy() {
+    http::tests::warm_control_client();
     for status in [200, 401, 403, 429, 500, 502, 503] {
         for policy in [None, Some("0")] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -104,6 +105,7 @@ fn desired_delivery_error_responses_preserve_collection_policy() {
 
 #[test]
 fn desired_delivery_successful_idle_responses_still_apply_collection_policy() {
+    http::tests::warm_control_client();
     for policy in [Some("1"), Some("0"), None] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let options = options(
@@ -141,6 +143,7 @@ fn desired_delivery_successful_idle_responses_still_apply_collection_policy() {
 
 #[test]
 fn desired_delivery_recovers_lost_response_and_waits_for_observation_ack() {
+    http::tests::warm_control_client();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let options = options(
         "lost-response",

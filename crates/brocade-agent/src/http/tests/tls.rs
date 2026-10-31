@@ -161,6 +161,7 @@ fn http_tls_control_messages_cannot_extend_the_request_deadline() {
 }
 #[tokio::test]
 async fn websocket_upgrade_uses_the_same_absolute_deadline_beneath_tls() {
+    crate::identity::self_identity();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -309,6 +310,7 @@ fn a_wrong_tls_certificate_name_fails_closed() {
 }
 #[tokio::test]
 async fn a_successful_websocket_does_not_keep_the_handshake_deadline() {
+    crate::identity::self_identity();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let (release, wait) = mpsc::sync_channel(1);
