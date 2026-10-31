@@ -85,7 +85,7 @@ async fn exact_deployed_unlock_history_consolidates_without_changing_observation
     sqlx::raw_sql(&conversion).execute(db.pool()).await.unwrap();
     let check = db.store.check_database_upgrade().await.unwrap();
     assert!(check.compatible);
-    assert!(check.pending_versions.is_empty());
+    assert_eq!(check.pending_versions, [4]);
     assert_eq!(check.installed_versions, [1, 2, 3]);
     db.store.migrate().await.unwrap();
     assert_eq!(
@@ -94,7 +94,7 @@ async fn exact_deployed_unlock_history_consolidates_without_changing_observation
             .await
             .unwrap()
             .installed_versions,
-        [1, 2, 3]
+        [1, 2, 3, 4]
     );
     let after: serde_json::Value = sqlx::query_scalar(
         "SELECT jsonb_build_object('job',(SELECT to_jsonb(j)-'readiness_failures'-'dns_fingerprint' FROM unlock_probe_jobs j),
@@ -123,7 +123,12 @@ async fn assert_channel_notifications_work(pool: &PgPool) {
         "SELECT count(*) FROM pg_trigger WHERE tgfoid='public.notify_agent_channel_change()'::regprocedure
          AND NOT tgisinternal AND tgenabled='O'",
     ).fetch_one(pool).await.unwrap();
-    assert_eq!(triggers, 13);
+    let base: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.user_app_rate_limits') IS NOT NULL")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(triggers, if base { 14 } else { 13 });
     let mut listener = sqlx::postgres::PgListener::connect_with(pool)
         .await
         .unwrap();
@@ -167,7 +172,7 @@ async fn previous_consolidated_0003_adds_notifications_without_rewriting_busines
         .unwrap();
     let snapshot = "SELECT jsonb_build_object('control',(SELECT to_jsonb(c)-'unlock_detection_mode'-'unlock_detection_interval_hours'-'unlock_detection_requested_at'-'unlock_detection_next_run_at' FROM control_state c),
         'discovery',(SELECT jsonb_agg(to_jsonb(d)) FROM unlock_probe_discovery d),
-        'receipts',(SELECT jsonb_agg(to_jsonb(m)-'checksum' ORDER BY version) FROM _sqlx_migrations m))";
+        'receipts',(SELECT jsonb_agg(to_jsonb(m)-'checksum' ORDER BY version) FROM _sqlx_migrations m WHERE version<=3))";
     let before: serde_json::Value = sqlx::query_scalar(snapshot)
         .fetch_one(db.pool())
         .await
@@ -193,7 +198,7 @@ async fn previous_consolidated_0003_adds_notifications_without_rewriting_busines
     sqlx::raw_sql(&conversion).execute(db.pool()).await.unwrap();
     let check = db.store.check_database_upgrade().await.unwrap();
     assert!(check.compatible);
-    assert!(check.pending_versions.is_empty());
+    assert_eq!(check.pending_versions, [4]);
     assert_eq!(check.installed_versions, [1, 2, 3]);
     let after: serde_json::Value = sqlx::query_scalar(snapshot)
         .fetch_one(db.pool())
@@ -258,7 +263,7 @@ async fn launcher_compatible_0003_conversion_is_opt_in_read_only_and_atomic() {
         assert!(check.compatible);
         assert_eq!(
             check.pending_versions,
-            [3],
+            [3, 4],
             "the old launcher must write its migration-started marker"
         );
         assert_eq!(
@@ -331,7 +336,10 @@ async fn current_channel_0003_converts_readiness_atomically_without_new_migratio
         .split_once("\n-- Consolidated path-based unlock readiness.\n")
         .unwrap()
         .0;
-    assert_eq!(format!("{:x}",Sha384::digest(previous.as_bytes())),"9528c5fe2b11fb063af638d6a11a30079fd70413e91cc55ee3df1bfc5f23e274a779d877254f412623bb8cb4ee776aaf");
+    assert_eq!(
+        format!("{:x}", Sha384::digest(previous.as_bytes())),
+        "9528c5fe2b11fb063af638d6a11a30079fd70413e91cc55ee3df1bfc5f23e274a779d877254f412623bb8cb4ee776aaf"
+    );
     install_previous_schema(&db, previous).await;
     insert_minimal_fixture(db.pool()).await;
     let receipts = "SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM _sqlx_migrations m";
@@ -342,7 +350,7 @@ async fn current_channel_0003_converts_readiness_atomically_without_new_migratio
     assert!(!db.store.check_database_upgrade().await.unwrap().compatible);
     let check = db.store.check_prerelease_0003_upgrade().await.unwrap();
     assert!(check.compatible);
-    assert_eq!(check.pending_versions, [3]);
+    assert_eq!(check.pending_versions, [3, 4]);
     assert_eq!(
         sqlx::query_scalar::<_, serde_json::Value>(receipts)
             .fetch_one(db.pool())
@@ -365,10 +373,10 @@ async fn current_channel_0003_converts_readiness_atomically_without_new_migratio
     db.store.migrate_prerelease_0003_schema().await.unwrap();
     let check = db.store.check_database_upgrade().await.unwrap();
     assert!(check.compatible && check.pending_versions.is_empty());
-    assert_eq!(check.installed_versions, [1, 2, 3]);
+    assert_eq!(check.installed_versions, [1, 2, 3, 4]);
     assert_channel_notifications_work(db.pool()).await;
     let after: serde_json::Value = sqlx::query_scalar(
-        "SELECT jsonb_agg(to_jsonb(m)-'checksum' ORDER BY version) FROM _sqlx_migrations m",
+        "SELECT jsonb_agg(to_jsonb(m)-'checksum' ORDER BY version) FROM _sqlx_migrations m WHERE version<=3",
     )
     .fetch_one(db.pool())
     .await

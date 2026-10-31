@@ -252,6 +252,7 @@ pub use user_presence::{
     UserPresenceList, UserPresenceState, UserPresenceView, USER_ONLINE_SOURCE_HISTORY_LIMIT,
     USER_ONLINE_SOURCE_RETENTION_DAYS,
 };
+pub use user_traffic::UserTrafficPolicyWrite;
 pub use vpngate::{
     RequestVpngatePoolSwitch, UpdateVpngateCatalogNode, UpdateVpngateCatalogSettings,
     UpdateVpngateIntelligenceCredentials, UpdateVpngateIntelligenceNode, UpdateVpngateProbeNode,

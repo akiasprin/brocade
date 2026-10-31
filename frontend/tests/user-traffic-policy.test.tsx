@@ -25,6 +25,7 @@ const views = (
     exhausted: false,
     service_available: true,
     unsupported_nodes: [],
+    base_rate_supported: true,
     ...extra,
   }));
 const clients: QueryClient[] = [];
@@ -161,7 +162,7 @@ describe('app access quota presentation', () => {
     expect(container.querySelector('.qta-meter')).toBeNull();
     expect(screen.queryByText(/用满后/)).toBeNull();
   });
-  it('only offers post-exhaustion speed and saves only the selected app quota', async () => {
+  it('saves independent and post-exhaustion speeds only for the selected app', async () => {
     const fetcher = vi
       .fn()
       .mockResolvedValue(
@@ -171,8 +172,8 @@ describe('app access quota presentation', () => {
       );
     vi.stubGlobal('fetch', fetcher);
     mount();
-    fireEvent.click(screen.getByRole('button', { name: 'Main · 额度与超额处理' }));
-    expect(screen.getByRole('form', { name: 'Main · 额度与超额处理' }).closest('.qta-r')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Main · 额度与限速' }));
+    expect(screen.getByRole('form', { name: 'Main · 额度与限速' }).closest('.qta-r')).toBeTruthy();
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(screen.queryByLabelText('正常速度上限')).toBeNull();
     expect(screen.queryByLabelText('超额速度上限（Mbps）')).toBeNull();
@@ -185,12 +186,13 @@ describe('app access quota presentation', () => {
     expect(url).toBe('/users/platform/alice/traffic-policy/access/app-main');
     expect(JSON.parse(String(init.body))).toEqual({
       quota_bytes: String(500 * 1024 ** 3),
+      base_rate_bps: null,
       exhausted_action: { kind: 'throttle', rate_bps: 5_000_000 },
     });
   });
   it('blocks unsupported nodes and invalid values, then permits suspend', () => {
     mount(views(null, { unsupported_nodes: ['东京'] }));
-    fireEvent.click(screen.getByRole('button', { name: 'Main · 额度与超额处理' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Main · 额度与限速' }));
     fireEvent.change(screen.getByLabelText('本期流量额度（GiB）'), { target: { value: '100' } });
     fireEvent.click(screen.getByRole('button', { name: '限速' }));
     expect(screen.getByRole('alert').textContent).toContain('东京');
@@ -202,7 +204,7 @@ describe('app access quota presentation', () => {
   it('retains entered values when saving fails', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ error: '保存失败' }, { status: 500 })));
     mount();
-    fireEvent.click(screen.getByRole('button', { name: 'Main · 额度与超额处理' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Main · 额度与限速' }));
     fireEvent.change(screen.getByLabelText('本期流量额度（GiB）'), { target: { value: '100' } });
     fireEvent.click(screen.getByRole('button', { name: '保存' }));
     await screen.findByText('保存失败');
@@ -212,7 +214,7 @@ describe('app access quota presentation', () => {
     const fetcher = vi.fn();
     vi.stubGlobal('fetch', fetcher);
     mount(views({ quota_bytes: String(100 * 1024 ** 3), exhausted_action: { kind: 'suspend' } }));
-    const edit = screen.getByRole('button', { name: 'Main · 额度与超额处理' });
+    const edit = screen.getByRole('button', { name: 'Main · 额度与限速' });
     fireEvent.click(edit);
     fireEvent.change(screen.getByLabelText('本期流量额度（GiB）'), { target: { value: '120' } });
     fireEvent.click(screen.getByRole('button', { name: '取消' }));
@@ -233,8 +235,8 @@ describe('app access quota presentation', () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json(data));
     vi.stubGlobal('fetch', fetcher);
     mount(data);
-    fireEvent.click(screen.getByRole('button', { name: 'Second · 额度与超额处理' }));
-    expect(screen.getByRole('button', { name: 'Main · 额度与超额处理' }).getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(screen.getByRole('button', { name: 'Second · 额度与限速' }));
+    expect(screen.getByRole('button', { name: 'Main · 额度与限速' }).getAttribute('aria-expanded')).toBe('false');
     expect((screen.getByLabelText('本期流量额度（GiB）') as HTMLInputElement).value).toBe('50');
     fireEvent.change(screen.getByLabelText('本期流量额度（GiB）'), { target: { value: '60' } });
     fireEvent.click(screen.getByRole('button', { name: '保存' }));
@@ -242,4 +244,75 @@ describe('app access quota presentation', () => {
     expect(fetcher.mock.calls[0][0]).toBe('/users/platform/alice/traffic-policy/access/app-second');
     expect(JSON.parse(fetcher.mock.calls[0][1].body).quota_bytes).toBe(String(60 * 1024 ** 3));
   });
+});
+
+describe('independent speed units and compatibility', () => {
+  it('saves a quota-free base rate in Kbps and keeps equivalent unit switches clean', async () => {
+    const data = views({ quota_bytes: null, base_rate_bps: 1001, exhausted_action: { kind: 'suspend' } });
+    const fetcher = vi
+      .fn()
+      .mockImplementation((_url, init) => Promise.resolve(Response.json(views(JSON.parse(init.body)))));
+    vi.stubGlobal('fetch', fetcher);
+    mount(data);
+    expect(screen.getByText('常态限速 1.001 Kbps')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Main · 额度与限速' }));
+    expect((screen.getByLabelText('常态速度单位') as HTMLSelectElement).value).toBe('Kbps');
+    fireEvent.change(screen.getByLabelText('常态速度单位'), { target: { value: 'Mbps' } });
+    expect((screen.getByLabelText('常态速度上限（Mbps）') as HTMLInputElement).value).toBe('0.001001');
+    expect((screen.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText('常态速度单位'), { target: { value: 'Kbps' } });
+    fireEvent.change(screen.getByLabelText('常态速度上限（Kbps）'), { target: { value: '512' } });
+    expect(screen.queryByLabelText('超额速度单位')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+    expect(JSON.parse(fetcher.mock.calls[0][1].body)).toMatchObject({ quota_bytes: null, base_rate_bps: 512000 });
+  });
+  it('saves the exhausted cap in Kbps while the base cap remains in Mbps', async () => {
+    const data = views({
+      quota_bytes: String(100 * 1024 ** 3),
+      base_rate_bps: 50000000,
+      exhausted_action: { kind: 'throttle', rate_bps: 5000000 },
+    });
+    const fetcher = vi
+      .fn()
+      .mockImplementation((_url, init) => Promise.resolve(Response.json(views(JSON.parse(init.body)))));
+    vi.stubGlobal('fetch', fetcher);
+    mount(data);
+    fireEvent.click(screen.getByRole('button', { name: 'Main · 额度与限速' }));
+    fireEvent.change(screen.getByLabelText('超额速度单位'), { target: { value: 'Kbps' } });
+    expect((screen.getByLabelText('超额速度上限（Kbps）') as HTMLInputElement).value).toBe('5000');
+    fireEvent.change(screen.getByLabelText('超额速度上限（Kbps）'), { target: { value: '512' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+    expect(JSON.parse(fetcher.mock.calls[0][1].body)).toMatchObject({
+      base_rate_bps: 50000000,
+      exhausted_action: { kind: 'throttle', rate_bps: 512000 },
+    });
+  });
+  it('disables the new control against an older Console and never submits a silently ignored cap', () => {
+    mount(views(null, { base_rate_supported: false }));
+    fireEvent.click(screen.getByRole('button', { name: 'Main · 额度与限速' }));
+    expect((screen.getByLabelText('常态速度上限（Mbps）') as HTMLInputElement).disabled).toBe(true);
+    expect(screen.getByText('请升级 Console，以支持常态限速。')).toBeTruthy();
+    expect(() =>
+      saveUserTrafficPolicy(
+        'platform',
+        'alice',
+        { kind: 'access', app_id: 'app-main' },
+        { quota_bytes: null, base_rate_bps: 1000, exhausted_action: { kind: 'suspend' } },
+      ),
+    ).toThrow('请先升级 Console');
+  });
+});
+
+it('does not treat an ignored base-rate field in an old 200 response as successful', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(views(null, { base_rate_supported: false }))));
+  await expect(
+    saveUserTrafficPolicy(
+      'platform',
+      'alice',
+      { kind: 'access', app_id: 'app-main', base_rate_supported: true },
+      { quota_bytes: null, base_rate_bps: 512000, exhausted_action: { kind: 'suspend' } },
+    ),
+  ).rejects.toThrow('Console 未确认常态限速');
 });

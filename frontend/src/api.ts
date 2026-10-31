@@ -5641,10 +5641,13 @@ export function reverseHealthError(p: ReverseHealthPolicy): string | null {
 
 export type UserTrafficKind = 'access' | 'forwarding';
 export interface UserTrafficPolicy {
+  base_rate_bps?: number | null;
   quota_bytes: string | null;
   exhausted_action: { kind: 'suspend' } | { kind: 'throttle'; rate_bps: number };
 }
 export interface UserTrafficPolicyView {
+  base_rate_supported?: boolean;
+  effective?: { mode: 'unlimited'; managed: boolean } | { mode: 'limited'; rate_bps: number } | { mode: 'suspended' };
   kind: UserTrafficKind;
   app_id: string | null;
   policy: UserTrafficPolicy | null;
@@ -5676,12 +5679,21 @@ export const fetchUserTrafficPolicies = async (tenant: string, user: string): Pr
 export const saveUserTrafficPolicy = (
   tenant: string,
   user: string,
-  view: Pick<UserTrafficPolicyView, 'kind' | 'app_id'>,
+  view: Pick<UserTrafficPolicyView, 'kind' | 'app_id' | 'base_rate_supported'>,
   policy: UserTrafficPolicy,
 ) => {
   if (view.kind !== 'access' || !view.app_id) throw new Error('接入额度必须指定 app');
+  if (policy.base_rate_bps != null && view.base_rate_supported !== true)
+    throw new Error('请先升级 Console，以支持常态限速');
   const path = `${userTrafficPolicyPath(tenant, user)}/access/${encodeURIComponent(view.app_id)}`;
-  return api<UserTrafficPolicyView[]>(path, '', { method: 'PUT', body: JSON.stringify(policy) });
+  return api<UserTrafficPolicyView[]>(path, '', { method: 'PUT', body: JSON.stringify(policy) }).then(data => {
+    if (policy.base_rate_bps != null) {
+      const saved = data.find(row => row.kind === 'access' && row.app_id === view.app_id);
+      if (saved?.base_rate_supported !== true || saved.policy?.base_rate_bps !== policy.base_rate_bps)
+        throw new Error('Console 未确认常态限速，请升级后重新保存');
+    }
+    return data;
+  });
 };
 
 export interface SourceAccessNode {

@@ -4,6 +4,57 @@ use brocade_deployment::user_traffic::*;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
+/// A full replacement, or an older client's edit which did not know the independent rate field.
+#[derive(Debug)]
+pub struct UserTrafficPolicyWrite {
+    policy: UserTrafficPolicy,
+    replace_base_rate: bool,
+}
+impl From<UserTrafficPolicy> for UserTrafficPolicyWrite {
+    fn from(policy: UserTrafficPolicy) -> Self {
+        Self {
+            policy,
+            replace_base_rate: true,
+        }
+    }
+}
+impl UserTrafficPolicyWrite {
+    pub fn preserving_base_rate(policy: UserTrafficPolicy) -> Self {
+        Self {
+            policy,
+            replace_base_rate: false,
+        }
+    }
+}
+
+/// Decode the shared scope projection once; all execution paths use UserTrafficPolicy::effect.
+pub(crate) fn policy_from_row(row: &sqlx::postgres::PgRow) -> Result<UserTrafficPolicy> {
+    let rate = |column| -> Result<Option<u64>> {
+        row.try_get::<Option<i64>, _>(column)?
+            .map(|value| {
+                u64::try_from(value)
+                    .map_err(|_| StoreError::InvalidData("invalid user traffic rate".into()))
+            })
+            .transpose()
+    };
+    Ok(UserTrafficPolicy {
+        quota_bytes: row
+            .try_get::<Option<i64>, _>("quota_bytes")?
+            .map(|value| value.to_string()),
+        base_rate_bps: rate("base_rate_bps")?,
+        exhausted_action: if row.try_get::<Option<String>, _>("action")?.as_deref()
+            == Some("throttle")
+        {
+            ExhaustedAction::Throttle {
+                rate_bps: rate("rate_bps")?
+                    .ok_or_else(|| StoreError::InvalidData("missing exhausted rate".into()))?,
+            }
+        } else {
+            ExhaustedAction::Suspend
+        },
+    })
+}
+
 fn require_read(actor: &AdminContext, tenant: &str, user: &str) -> Result<()> {
     actor.require_tenant_access(tenant, "user traffic policy")?;
     if actor.role() == AdminRole::User
@@ -49,6 +100,7 @@ pub async fn views(
         "SELECT 'access'::text, app_id FROM (
         SELECT app_id FROM grants WHERE tenant_id=$1 AND user_id=$2
         UNION SELECT app_id FROM user_app_quotas WHERE tenant_id=$1 AND user_id=$2
+        UNION SELECT app_id FROM user_app_rate_limits WHERE tenant_id=$1 AND user_id=$2
         UNION SELECT app_id FROM quota_suspensions WHERE tenant_id=$1 AND user_id=$2) apps
         WHERE EXISTS(SELECT 1 FROM apps a WHERE a.id=apps.app_id)
         ORDER BY 1,2",
@@ -62,45 +114,41 @@ pub async fn views(
         let kind: UserTrafficKind = serde_json::from_value(kind.into())?;
         let row=sqlx::query("SELECT u.status='active' AND NOT u.service_suspended AS available,
             user_traffic_usage(u.tenant_id,u.id,$3,$4)::text AS used,
-            p.quota_bytes::text AS quota,p.action,p.rate_bps,p.exhausted
+            p.quota_bytes,p.action,p.rate_bps,p.base_rate_bps,p.exhausted
             FROM users u LEFT JOIN user_traffic_scopes p ON p.tenant_id=u.tenant_id AND p.user_id=u.id AND p.kind=$3 AND p.scope=$4
             WHERE u.tenant_id=$1 AND u.id=$2")
             .bind(tenant).bind(user).bind(kind.as_str()).bind(&scope).fetch_one(pool).await?;
-        let policy = row
-            .try_get::<Option<String>, _>("action")?
-            .map(|action| -> Result<UserTrafficPolicy> {
-                Ok(UserTrafficPolicy {
-                    quota_bytes: row.try_get("quota")?,
-                    exhausted_action: if action == "throttle" {
-                        ExhaustedAction::Throttle {
-                            rate_bps: u64::try_from(row.try_get::<i64, _>("rate_bps")?)
-                                .map_err(|_| StoreError::InvalidData("invalid rate".into()))?,
-                        }
-                    } else {
-                        ExhaustedAction::Suspend
-                    },
-                })
-            })
-            .transpose()?;
+        let policy = if row.try_get::<Option<String>, _>("action")?.is_some() {
+            Some(policy_from_row(&row)?)
+        } else {
+            None
+        };
+        let exhausted = row
+            .try_get::<Option<bool>, _>("exhausted")?
+            .unwrap_or(false);
+        let available = row.try_get("available")?;
         result.push(UserTrafficPolicyView {
             kind,
             app_id: (kind == UserTrafficKind::Access).then_some(scope.clone()),
             policy: policy.clone(),
             used_bytes: row.try_get("used")?,
-            exhausted: row
-                .try_get::<Option<bool>, _>("exhausted")?
-                .unwrap_or(false),
-            service_available: row.try_get("available")?,
+            exhausted,
+            service_available: available,
             unsupported_nodes: unsupported(pool, tenant, user, kind, &scope).await?,
-            pending_nodes: if kind == UserTrafficKind::Access
-                && policy
-                    .as_ref()
-                    .is_none_or(|p| matches!(p.exhausted_action, ExhaustedAction::Suspend))
-            {
-                Vec::new()
-            } else {
+            pending_nodes: if policy.as_ref().is_some_and(UserTrafficPolicy::needs_budget) {
                 pending(pool, tenant, user, kind, &scope).await?
+            } else {
+                Vec::new()
             },
+            base_rate_supported: true,
+            effective: policy.as_ref().map_or(
+                if available {
+                    UserTrafficEffect::Unlimited { managed: false }
+                } else {
+                    UserTrafficEffect::Suspended
+                },
+                |policy| policy.effect(exhausted, available),
+            ),
         });
     }
     Ok(result)
@@ -133,8 +181,12 @@ pub async fn update(
     user: &str,
     kind: UserTrafficKind,
     app: Option<&str>,
-    policy: UserTrafficPolicy,
+    write: UserTrafficPolicyWrite,
 ) -> Result<Vec<UserTrafficPolicyView>> {
+    let UserTrafficPolicyWrite {
+        mut policy,
+        replace_base_rate,
+    } = write;
     require_read(actor, tenant, user)?;
     if !matches!(
         actor.role(),
@@ -173,9 +225,15 @@ pub async fn update(
     {
         return Err(StoreError::NotFound("app".into()));
     }
-    if policy.quota_bytes.is_some()
-        && matches!(policy.exhausted_action, ExhaustedAction::Throttle { .. })
-    {
+    if !replace_base_rate {
+        // The user lock above makes preservation atomic with concurrent policy edits.
+        policy.base_rate_bps = sqlx::query_scalar::<_, i64>(
+            "SELECT base_rate_bps FROM user_app_rate_limits WHERE tenant_id=$1 AND user_id=$2 AND app_id=$3"
+        ).bind(tenant).bind(user).bind(scope).fetch_optional(&mut *tx).await?
+            .map(|rate| u64::try_from(rate).map_err(|_| StoreError::InvalidData("invalid base rate".into())))
+            .transpose()?;
+    }
+    if policy.needs_budget() {
         // The user parent lock serializes entry authorization with this capability check.
         let sql=format!("SELECT n.id FROM ({SCOPE_NODES_SQL}) target JOIN nodes n ON n.id=target.id LEFT JOIN node_agent_state agent ON agent.node_id=n.id
             WHERE COALESCE(agent.agent_protocol_version,0)<44 OR NOT n.user_traffic_supported OR n.user_traffic_support_at IS NULL OR n.user_traffic_support_at<now()-interval '90 seconds'");
@@ -188,7 +246,7 @@ pub async fn update(
             .await?;
         if !nodes.is_empty() {
             return Err(StoreError::Unsupported(
-                "启用超额限速前，请升级相关机器的 Agent 和 Xray，并等待用户限速能力确认".into(),
+                "启用用户限速前，请升级相关机器的 Agent 和 Xray，并等待用户限速能力确认".into(),
             ));
         }
     }
@@ -202,6 +260,15 @@ pub async fn update(
         .map(|v| v.parse::<i64>())
         .transpose()
         .map_err(|_| StoreError::InvalidData("invalid quota".into()))?;
+    // Write the independent cap before quota deletion, so its cleanup trigger preserves live budgets.
+    let rate_changed = if let Some(base) = policy.base_rate_bps {
+        sqlx::query("INSERT INTO user_app_rate_limits(tenant_id,user_id,app_id,base_rate_bps) VALUES($1,$2,$3,$4)
+            ON CONFLICT(tenant_id,user_id,app_id) DO UPDATE SET base_rate_bps=$4,revision=user_app_rate_limits.revision+1,updated_at=now()
+            WHERE user_app_rate_limits.base_rate_bps IS DISTINCT FROM $4")
+            .bind(tenant).bind(user).bind(scope).bind(base as i64).execute(&mut *tx).await?.rows_affected()>0
+    } else {
+        false
+    };
     let changed = if let Some(quota) = quota {
         sqlx::query("INSERT INTO user_app_quotas(tenant_id,user_id,app_id,limit_bytes,exhausted_action,rate_bps) VALUES($1,$2,$3,$4,$5,$6)
                 ON CONFLICT(tenant_id,user_id,app_id) DO UPDATE SET limit_bytes=$4,exhausted_action=$5,rate_bps=$6,
@@ -218,11 +285,26 @@ pub async fn update(
             .rows_affected()
             > 0
     };
+    let rate_removed = if policy.base_rate_bps.is_none() {
+        sqlx::query(
+            "DELETE FROM user_app_rate_limits WHERE tenant_id=$1 AND user_id=$2 AND app_id=$3",
+        )
+        .bind(tenant)
+        .bind(user)
+        .bind(scope)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0
+    } else {
+        false
+    };
+    let changed = changed || rate_changed || rate_removed;
     if changed {
         sqlx::query("INSERT INTO user_traffic_policy_events(tenant_id,user_id,kind,scope,policy,actor) VALUES($1,$2,$3,$4,$5,$6)")
             .bind(tenant).bind(user).bind(kind.as_str()).bind(scope).bind(serde_json::to_value(&policy)?).bind(actor.operator_id()).execute(&mut *tx).await?;
     }
-    if quota.is_some() {
+    if policy.needs_budget() {
         let nodes: Vec<String> =
             sqlx::query_scalar(&format!("SELECT id FROM ({SCOPE_NODES_SQL}) target"))
                 .bind(tenant)
@@ -283,7 +365,7 @@ pub async fn support(pool: &PgPool, node: &str, supported: bool) -> Result<bool>
     .bind(supported)
     .execute(pool)
     .await?;
-    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_traffic_scopes p WHERE p.kind='access' AND p.action='throttle' AND p.quota_bytes IS NOT NULL AND
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_traffic_scopes p WHERE p.kind='access' AND p.budget_managed AND
       EXISTS(SELECT 1 FROM ingresses i WHERE i.node_id=$1 AND
         (EXISTS(SELECT 1 FROM grants g WHERE g.tenant_id=p.tenant_id AND g.user_id=p.user_id AND g.app_id=p.scope AND g.ingress_id=i.id AND g.app_id=i.app_id)
         OR EXISTS(SELECT 1 FROM quota_suspensions q WHERE q.tenant_id=p.tenant_id AND q.user_id=p.user_id AND q.app_id=p.scope AND q.ingress_id=i.id AND q.app_id=i.app_id))))")
@@ -366,7 +448,7 @@ pub async fn budget(
             managed: false,
         });
     }
-    let row=sqlx::query("SELECT exhausted,action,rate_bps,quota_bytes FROM user_traffic_scopes WHERE tenant_id=$1 AND user_id=$2 AND kind=$3 AND scope=$4")
+    let row=sqlx::query("SELECT exhausted,action,rate_bps,base_rate_bps,quota_bytes FROM user_traffic_scopes WHERE tenant_id=$1 AND user_id=$2 AND kind=$3 AND scope=$4")
         .bind(&tenant).bind(&user).bind(kind).bind(&scope).fetch_optional(&mut *tx).await?;
     let Some(policy) = row else {
         return Ok(UserBudgetGrant::Unlimited {
@@ -374,29 +456,21 @@ pub async fn budget(
             managed: false,
         });
     };
-    // Existing stop-on-quota access uses the authorization worker. Only the throttle action
-    // needs the user budget feature; upgrading Agent alone must not require a new Xray for legacy quotas.
-    if kind == "access"
-        && policy.try_get::<String, _>("action")? == "suspend"
-        && !policy.try_get::<bool, _>("exhausted")?
-    {
-        return Ok(UserBudgetGrant::Unlimited {
-            valid_ms: BUDGET_TTL_MS,
-            managed: false,
-        });
-    }
-    if !policy.try_get::<bool, _>("exhausted")? {
-        return Ok(UserBudgetGrant::Unlimited {
-            valid_ms: BUDGET_TTL_MS,
-            managed: policy.try_get::<Option<i64>, _>("quota_bytes")?.is_some(),
-        });
-    }
-    if policy.try_get::<String, _>("action")? == "suspend" {
-        return Ok(UserBudgetGrant::Suspended {
-            valid_ms: BUDGET_TTL_MS,
-        });
-    }
-    let rate = policy.try_get::<i64, _>("rate_bps")? as u64;
+    let policy_config = policy_from_row(&policy)?;
+    let rate = match policy_config.effect(policy.try_get("exhausted")?, true) {
+        UserTrafficEffect::Unlimited { managed } => {
+            return Ok(UserBudgetGrant::Unlimited {
+                valid_ms: BUDGET_TTL_MS,
+                managed,
+            });
+        }
+        UserTrafficEffect::Suspended => {
+            return Ok(UserBudgetGrant::Suspended {
+                valid_ms: BUDGET_TTL_MS,
+            });
+        }
+        UserTrafficEffect::Limited { rate_bps } => rate_bps,
+    };
     sqlx::query("INSERT INTO user_traffic_budgets(tenant_id,user_id,kind,scope) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
         .bind(&tenant).bind(&user).bind(kind).bind(&scope).execute(&mut *tx).await?;
     // A single database row serializes all nodes, Console instances and Xray generations.
@@ -493,24 +567,24 @@ pub(crate) async fn check_node_tx(
 ) -> Result<()> {
     lock_user_tx(tx, tenant, user).await?;
     let unsupported:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_traffic_scopes p JOIN nodes n ON n.id=$4 LEFT JOIN node_agent_state agent ON agent.node_id=n.id
-  WHERE p.tenant_id=$1 AND p.user_id=$2 AND p.kind=$3 AND p.scope=$5 AND p.action='throttle' AND p.quota_bytes IS NOT NULL AND
+  WHERE p.tenant_id=$1 AND p.user_id=$2 AND p.kind=$3 AND p.scope=$5 AND p.budget_managed AND
    (COALESCE(agent.agent_protocol_version,0)<44 OR NOT n.user_traffic_supported OR n.user_traffic_support_at IS NULL OR n.user_traffic_support_at<now()-interval '90 seconds'))")
   .bind(tenant).bind(user).bind(kind).bind(node).bind(scope.unwrap_or("")).fetch_one(&mut **tx).await?;
     if unsupported {
         return Err(StoreError::Unsupported(
-            "该用户已设置超额限速，请先升级入口机器的 Agent 和 Xray，并等待能力确认".into(),
+            "该用户已设置用户限速，请先升级入口机器的 Agent 和 Xray，并等待能力确认".into(),
         ));
     }
     Ok(())
 }
 
-const ASSIGNMENTS_SQL:&str="SELECT g.user_id||'@'||g.tenant_id||'#'||g.ingress_id AS source,
-    CASE WHEN u.status<>'active' OR u.service_suspended OR p.suspended THEN 'suspended'
-         WHEN p.exhausted AND p.action='throttle' THEN 'limited' ELSE 'unlimited' END AS mode,p.rate_bps,p.quota_bytes IS NOT NULL AS managed,p.revision
+const ASSIGNMENTS_SQL: &str = "SELECT g.user_id||'@'||g.tenant_id||'#'||g.ingress_id AS source,
+    u.status='active' AND NOT u.service_suspended AS available,
+    p.action,p.rate_bps,p.base_rate_bps,p.quota_bytes,p.exhausted,p.revision
     FROM grants g JOIN ingresses i ON i.app_id=g.app_id AND i.id=g.ingress_id
     JOIN users u ON u.tenant_id=g.tenant_id AND u.id=g.user_id
     JOIN user_traffic_scopes p ON p.tenant_id=u.tenant_id AND p.user_id=u.id AND p.kind='access' AND p.scope=g.app_id
-    WHERE i.node_id=$1 AND p.action='throttle'
+    WHERE i.node_id=$1 AND p.budget_managed
     ORDER BY source LIMIT 4097";
 
 /// Configured app quotas use policy leases. Removing a source releases old Agent policy caches.
@@ -531,15 +605,8 @@ pub async fn assignments(pool: &PgPool, node: &str) -> Result<UserTrafficSnapsho
                 source: row.try_get("source")?,
                 revision: u64::try_from(row.try_get::<i64, _>("revision")?)
                     .map_err(|_| StoreError::InvalidData("invalid policy revision".into()))?,
-                effect: match row.try_get::<String, _>("mode")?.as_str() {
-                    "suspended" => UserTrafficEffect::Suspended,
-                    "limited" => UserTrafficEffect::Limited {
-                        rate_bps: row.try_get::<i64, _>("rate_bps")? as u64,
-                    },
-                    _ => UserTrafficEffect::Unlimited {
-                        managed: row.try_get("managed")?,
-                    },
-                },
+                effect: policy_from_row(row)?
+                    .effect(row.try_get("exhausted")?, row.try_get("available")?),
             })
         })
         .collect::<Result<Vec<_>>>()?;

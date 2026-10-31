@@ -59,8 +59,8 @@ for (const [name, width, theme] of [
     await expect(card.locator('.user-usage-ledger .user-traffic-policy')).toHaveCount(0);
     await expect(card.locator('.qta-policy-flag')).toHaveText('用满后限速 5 Mbps');
     await expect(card).toHaveScreenshot(`access-${name}.png`);
-    await page.getByRole('button', { name: 'APAC Premium · 额度与超额处理' }).click();
-    const dialog = page.getByRole('form', { name: 'APAC Premium · 额度与超额处理' });
+    await page.getByRole('button', { name: 'APAC Premium · 额度与限速' }).click();
+    const dialog = page.getByRole('form', { name: 'APAC Premium · 额度与限速' });
     await expect(page.getByRole('dialog')).toHaveCount(0);
     await expect(dialog.getByLabel('本期流量额度（GiB）')).toHaveValue('500');
     await expect(dialog.getByLabel('超额速度上限（Mbps）')).toHaveValue('5');
@@ -79,7 +79,7 @@ for (const [name, width, theme] of [
 test('forwarding has no user total quota and read-only viewers cannot edit', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 1000 });
   await preview(page, '&role=readonly');
-  await expect(page.getByRole('button', { name: 'APAC Premium · 额度与超额处理' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'APAC Premium · 额度与限速' })).toHaveCount(0);
   await page.getByRole('tab', { name: '转发', exact: true }).click();
   const card = page.locator('.user-forwarding-usage');
   await expect(card.locator('.user-traffic-policy')).toHaveCount(0);
@@ -141,8 +141,8 @@ test('quota boundary labels stay inside the track at intermediate widths and ext
 test('unsupported nodes prevent enabling throttle', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 1000 });
   await preview(page, '&traffic=unsupported');
-  await page.getByRole('button', { name: 'APAC Premium · 额度与超额处理' }).click();
-  const dialog = page.getByRole('form', { name: 'APAC Premium · 额度与超额处理' });
+  await page.getByRole('button', { name: 'APAC Premium · 额度与限速' }).click();
+  const dialog = page.getByRole('form', { name: 'APAC Premium · 额度与限速' });
   await expect(page.getByRole('dialog')).toHaveCount(0);
   await expect(dialog.getByRole('alert')).toContainText('请先升级');
   await dialog.getByLabel('超额速度上限（Mbps）').fill('6');
@@ -158,16 +158,16 @@ for (const width of [1280, 390])
     const card = page.locator('.user-usage-card:not(.user-forwarding-usage)');
     const first = card
       .getByRole('listitem')
-      .filter({ has: page.getByRole('button', { name: 'APAC Premium · 额度与超额处理' }) });
+      .filter({ has: page.getByRole('button', { name: 'APAC Premium · 额度与限速' }) });
     const second = card
       .getByRole('listitem')
-      .filter({ has: page.getByRole('button', { name: 'JP Budget · 额度与超额处理' }) });
+      .filter({ has: page.getByRole('button', { name: 'JP Budget · 额度与限速' }) });
     await expect(first.getByText('限速中 · 5 Mbps', { exact: true })).toBeVisible();
     await expect(second.getByText('用满后停用', { exact: true })).toBeVisible();
     await expect(second).toContainText('剩余38.00 GiB');
     await expect(card).toHaveScreenshot(`independent-apps-${width}.png`);
-    await second.getByRole('button', { name: 'JP Budget · 额度与超额处理' }).click();
-    const dialog = page.getByRole('form', { name: 'JP Budget · 额度与超额处理' });
+    await second.getByRole('button', { name: 'JP Budget · 额度与限速' }).click();
+    const dialog = page.getByRole('form', { name: 'JP Budget · 额度与限速' });
     await expect(page.getByRole('dialog')).toHaveCount(0);
     await expect(first.locator('form')).toHaveCount(0);
     await expect(dialog.getByLabel('本期流量额度（GiB）')).toHaveValue('50');
@@ -177,9 +177,9 @@ for (const width of [1280, 390])
     await card.screenshot({ path: `${evidence}user-app-quota-inline-${width}.png` });
     await dialog.getByRole('button', { name: '取消' }).click();
     await expect(dialog).toHaveCount(0);
-    await expect(second.getByRole('button', { name: 'JP Budget · 额度与超额处理' })).toBeFocused();
-    await first.getByRole('button', { name: 'APAC Premium · 额度与超额处理' }).click();
-    const appA = page.getByRole('form', { name: 'APAC Premium · 额度与超额处理' });
+    await expect(second.getByRole('button', { name: 'JP Budget · 额度与限速' })).toBeFocused();
+    await first.getByRole('button', { name: 'APAC Premium · 额度与限速' }).click();
+    const appA = page.getByRole('form', { name: 'APAC Premium · 额度与限速' });
     await expect(appA.getByLabel('本期流量额度（GiB）')).toHaveValue('100');
     await expect(appA.getByLabel('超额速度上限（Mbps）')).toHaveValue('5');
     await expect(second.locator('form')).toHaveCount(0);
@@ -271,11 +271,9 @@ for (const scene of ['all', 'normal', 'single', 'throttled', 'suspended', 'pendi
 test('B edits a suspended app into throttling and then completes synchronization', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 1100 });
   await page.goto('/tests/fixtures/user-quota-status-mockup.html?option=b&scene=suspended&nav=0');
-  const row = page
-    .getByRole('listitem')
-    .filter({ has: page.getByRole('button', { name: 'EU Lite · 额度与超额处理' }) });
+  const row = page.getByRole('listitem').filter({ has: page.getByRole('button', { name: 'EU Lite · 额度与限速' }) });
   await expect(row.getByText('已停用', { exact: true })).toBeVisible();
-  await row.getByRole('button', { name: 'EU Lite · 额度与超额处理' }).click();
+  await row.getByRole('button', { name: 'EU Lite · 额度与限速' }).click();
   const form = row.getByRole('form');
   await form.getByRole('button', { name: '限速', exact: true }).click();
   await form.getByLabel('超额速度上限（Mbps）').fill('3');

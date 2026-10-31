@@ -978,7 +978,7 @@ describe('user roster rows', () => {
     const quotaInput = () => view.queryByRole('textbox', { name: '本期流量额度（GiB）' }) as HTMLInputElement | null;
     const roster = view.getByRole('listbox', { name: '用户列表' });
     const aliceDetail = view.container.querySelector('.user-split-detail');
-    fireEvent.click(view.getByRole('button', { name: '东京 · 额度与超额处理' }));
+    fireEvent.click(view.getByRole('button', { name: '东京 · 额度与限速' }));
     expect(quotaInput()?.value).toBe('100');
 
     selectUser('dave');
@@ -988,7 +988,7 @@ describe('user roster rows', () => {
     expect(daveDetail?.querySelector('.dname > b')?.textContent).toBe('dave');
     expect(quotaInput()).toBeNull();
     expect(view.queryByText('加载中…')).toBeNull();
-    fireEvent.click(view.getByRole('button', { name: '东京 · 额度与超额处理' }));
+    fireEvent.click(view.getByRole('button', { name: '东京 · 额度与限速' }));
     expect(quotaInput()?.value).toBe('50');
 
     selectUser('alice');
@@ -999,11 +999,11 @@ describe('user roster rows', () => {
 
   it('opens quota handling from the app row without an access total editor', () => {
     const { view } = mount();
-    const control = view.getByRole('button', { name: '东京 · 额度与超额处理' });
+    const control = view.getByRole('button', { name: '东京 · 额度与限速' });
     expect(control.closest('.qta-r')?.textContent).toContain('东京');
     expect(view.queryByRole('button', { name: '设置接入总额度' })).toBeNull();
     fireEvent.click(control);
-    const dialog = view.getByRole('form', { name: '东京 · 额度与超额处理' });
+    const dialog = view.getByRole('form', { name: '东京 · 额度与限速' });
     expect(dialog.closest('.qta-r')).toBeTruthy();
     expect(view.queryByRole('dialog')).toBeNull();
     const input = within(dialog).getByRole('textbox', { name: '本期流量额度（GiB）' }) as HTMLInputElement;
@@ -1014,7 +1014,7 @@ describe('user roster rows', () => {
 
   it('preserves the inline quota draft while switching detail tabs', () => {
     const { view } = mount();
-    fireEvent.click(view.getByRole('button', { name: '东京 · 额度与超额处理' }));
+    fireEvent.click(view.getByRole('button', { name: '东京 · 额度与限速' }));
     const input = view.getByRole('textbox', { name: '本期流量额度（GiB）' }) as HTMLInputElement;
     fireEvent.change(input, { target: { value: '120' } });
     fireEvent.click(view.getByRole('tab', { name: '转发' }));

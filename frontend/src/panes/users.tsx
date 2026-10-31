@@ -1155,9 +1155,16 @@ export function QuotaRow({
   const [editing, setEditing] = useState(false);
   const editorId = useId();
   const editButton = useRef<HTMLButtonElement>(null);
+  const restoreEditFocus = useRef(false);
+  useLayoutEffect(() => {
+    if (!editing && restoreEditFocus.current) {
+      restoreEditFocus.current = false;
+      editButton.current?.focus();
+    }
+  }, [editing]);
   const closeEditor = () => {
+    restoreEditFocus.current = true;
     setEditing(false);
-    queueMicrotask(() => editButton.current?.focus());
   };
   const label = app.label || app.id;
   const pct = limit !== null && used !== null ? (used / limit) * 100 : null;
@@ -1254,8 +1261,8 @@ export function QuotaRow({
             type="button"
             className="btn qta-pencil"
             disabled={!policy || editing}
-            aria-label={`${label} · 额度与超额处理`}
-            title="编辑额度"
+            aria-label={`${label} · 额度与限速`}
+            title="编辑额度与限速"
             aria-expanded={editing}
             aria-controls={editing ? editorId : undefined}
             onClick={() => setEditing(true)}
@@ -1273,7 +1280,7 @@ export function QuotaRow({
             key={`${user.tenant_id}/${user.id}/${app.id}`}
             user={user}
             view={policy}
-            label={`${label} · 额度与超额处理`}
+            label={`${label} · 额度与限速`}
             onClose={closeEditor}
           />
         </div>

@@ -210,7 +210,7 @@ async fn online_source_sessions_upgrade_preserves_rows_and_rolls_back_ddl_failur
             .await
             .unwrap()
             .pending_versions,
-        [3]
+        [3, 4]
     );
     assert_eq!(
         sqlx::query_scalar::<_, serde_json::Value>(receipt_sql)

@@ -106,7 +106,7 @@ async fn previous_schema(tx: &mut Transaction<'_, Postgres>) -> Result<Option<Pr
             .await?;
     let source: Vec<_> = MIGRATOR.iter().collect();
     if history.len() != 3
-        || source.len() != 3
+        || source.len() < 3
         || history
             .iter()
             .enumerate()
@@ -160,7 +160,11 @@ impl PgStore {
         tx.commit().await?;
         if allowed.is_some() {
             check.compatible = true;
-            check.pending_versions = vec![3];
+            check.pending_versions = MIGRATOR
+                .iter()
+                .filter(|m| m.version >= 3)
+                .map(|m| m.version)
+                .collect();
             check.reason = None;
         }
         Ok(check)

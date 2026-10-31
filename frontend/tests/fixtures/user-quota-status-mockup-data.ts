@@ -184,6 +184,7 @@ export function viewOf(world: World, item: Line): UserTrafficPolicyView {
     exhausted: exhaustedOf(item),
     service_available: world.serviceAvailable,
     unsupported_nodes: [],
+    base_rate_supported: true,
     // The Console reports synchronisation only for throttle policies.
     pending_nodes: item.action?.kind === 'throttle' ? item.pending.map(machineName) : [],
   };

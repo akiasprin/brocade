@@ -1,0 +1,23 @@
+/* Local demo controls only; the whole page and policy editor are production components. */
+.rate-demo-tools {
+  position: fixed;
+  z-index: 100;
+  right: 16px;
+  bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--card);
+  color: var(--ink-3);
+  font-size: 11px;
+}
+@media (max-width: 820px) {
+  .rate-demo-tools {
+    bottom: 64px;
+    right: 8px;
+    gap: 5px;
+  }
+}
