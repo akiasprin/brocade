@@ -64,7 +64,7 @@ fn page_result(page: Result<Page, UnlockCode>, homepage: bool) -> YoutubePageRes
                 page_region: None,
                 topbar_region: None,
                 privacy_region: None,
-            }
+            };
         }
     };
     let (status, code) = if homepage {
@@ -440,7 +440,11 @@ mod tests {
     fn youtube_privacy_country_overrides_us_page_localization() {
         let body = r#"{"GL":"US","INNERTUBE_CONTEXT":{"client":{"gl":"US"}},"browseId":"SPunlimited"} Premium is not available in your country"#;
         let encoded = general_purpose::URL_SAFE.encode(b"\x0a\x02MO\x12\x00");
-        let wire = format!("HTTP/1.1 200 OK\r\nSet-Cookie: VISITOR_PRIVACY_METADATA={}; Path=/; Secure\r\nSet-Cookie: unrelated=mock\r\nContent-Length: {}\r\n\r\n{body}", encoded.replace('=', "%3D"), body.len());
+        let wire = format!(
+            "HTTP/1.1 200 OK\r\nSet-Cookie: VISITOR_PRIVACY_METADATA={}; Path=/; Secure\r\nSet-Cookie: unrelated=mock\r\nContent-Length: {}\r\n\r\n{body}",
+            encoded.replace('=', "%3D"),
+            body.len()
+        );
         let page = Page {
             response: crate::http::tests::response_from_wire(wire.as_bytes()).unwrap(),
             url: reqwest::Url::parse("https://www.youtube.com/premium?hl=en").unwrap(),
