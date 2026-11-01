@@ -58,6 +58,16 @@ html[data-mk-replace='true'] .fg-view > :not(.mk-slot) {
   margin-top: 3px;
   color: var(--ink-4);
 }
+.mk-dock-phone {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--ink-2);
+}
+.mk-dock-phone > small {
+  display: block;
+  color: var(--ink-4);
+  font-size: 11px;
+}
 .mk-fold,
 .mk-unfold {
   appearance: none;
@@ -101,13 +111,131 @@ html[data-mk-replace='true'] .fg-view > :not(.mk-slot) {
   .mk-dock-row:first-child > .segsw > button {
     flex: none;
   }
-  .mk-dock-note {
+  .mk-dock-note,
+  .mk-device {
     display: none;
   }
 }
-/* 评审条浮在页面底部，给最后一行内容留出位置。 */
-html[data-mk-replace='true'] .fg-view {
+/* 评审条浮在页面底部，给最后一行内容留出位置；手机预览框里没有评审条。 */
+html[data-mk-replace='true']:not([data-mk-embed='true']) .fg-view {
   padding-bottom: 120px;
+}
+
+/* ── 手机预览：机框与台面，同样不属于设计 ──
+   外层的生产外壳在预览时隐藏；机框按视口等比缩小，框内布局视口固定 390×790（状态栏占 54）。
+   台面的底部留白由脚本按评审条的实际高度设置。 */
+html[data-mk-device='phone'] #root {
+  display: none;
+}
+.mk-stage {
+  position: fixed;
+  inset: 0;
+  z-index: 2147482000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 40px;
+  box-sizing: border-box;
+  padding: 24px;
+  background: var(--ground);
+}
+.mk-phone-slot {
+  position: relative;
+  flex: none;
+}
+.mk-phone {
+  position: absolute;
+  top: 0;
+  left: 0;
+  box-sizing: border-box;
+  width: 414px;
+  height: 868px;
+  padding: 12px;
+  border-radius: 60px;
+  background: #0b0b0c;
+  box-shadow:
+    0 0 0 1.5px #4a4a4e,
+    0 32px 80px -24px rgb(0 0 0 / 0.55);
+  transform-origin: 0 0;
+}
+.mk-phone-screen {
+  position: relative;
+  display: grid;
+  grid-template-rows: 54px minmax(0, 1fr);
+  width: 390px;
+  height: 844px;
+  overflow: hidden;
+  border-radius: 48px;
+  background: var(--surface);
+}
+.mk-phone-status {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 126px minmax(0, 1fr);
+  align-items: center;
+  justify-items: center;
+  padding-top: 2px;
+  color: var(--ink);
+  font: 600 16px/1 var(--sans);
+  letter-spacing: -0.01em;
+}
+.mk-phone-glyphs {
+  grid-column: 3;
+  fill: currentColor;
+}
+.mk-phone-glyphs :is(.arc, .shell) {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+}
+.mk-phone-glyphs .shell {
+  stroke-width: 1;
+  opacity: 0.45;
+}
+.mk-phone-glyphs .cap {
+  opacity: 0.45;
+}
+.mk-phone-island {
+  position: absolute;
+  top: 11px;
+  left: 50%;
+  width: 122px;
+  height: 35px;
+  margin-left: -61px;
+  border-radius: 18px;
+  background: #000;
+}
+.mk-phone-screen > iframe {
+  display: block;
+  width: 390px;
+  height: 790px;
+  border: 0;
+  background: var(--surface);
+}
+.mk-phone-home {
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  width: 134px;
+  height: 5px;
+  margin-left: -67px;
+  border-radius: 3px;
+  background: var(--ink);
+  opacity: 0.7;
+  pointer-events: none;
+}
+@media (min-width: 900px) {
+  .mk-stage > .mk-dock {
+    position: static;
+    width: 460px;
+    max-width: none;
+    transform: none;
+  }
+}
+/* 手机的滚动条是浮层，不占宽度；框内隐藏桌面滚动条，免得内容宽度少 15px。 */
+html[data-mk-embed='true'],
+html[data-mk-embed='true'] * {
+  scrollbar-width: none !important;
 }
 
 /* ══ 方案共用 ══ */
@@ -803,5 +931,11 @@ html[data-mk-replace='true'] .fg-view {
   }
   .np-split.np-detail-route > .np-roster {
     display: none;
+  }
+  /* 用户页手机版把名册封在 520px 的内层滚动里，上面还有搜索；机器名册下面没有别的内容，
+     名册就是整页，交给页面滚动。 */
+  .np-roster .user-roster-options {
+    max-height: none;
+    overflow: visible;
   }
 }

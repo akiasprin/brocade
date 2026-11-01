@@ -19,7 +19,40 @@
         root.dataset.theme = theme;
         root.dataset.palette = 'dailan';
         document.querySelector('meta[name="color-scheme"]').content = theme;
+        if (query.get('embed') === '1') emulateTouch(root);
+        else if (query.get('device') === 'phone') root.dataset.mkDevice = 'phone';
       })();
+
+      /* 手机预览框里的页面按触屏渲染。桌面浏览器里的 iframe 仍报告鼠标与悬停，这里把 hover / pointer
+         媒体条件改写成触屏的取值，样式表和 matchMedia 都照手机生效（触屏滚动主体、常显的操作等）。
+         要在模块加载前装好：样式由 Vite 以 <style> 注入，监听 head 的变化随注入随改。 */
+      function emulateTouch(root) {
+        root.dataset.mkEmbed = 'true';
+        const TOUCH = /\(\s*(?:any-)?(?:hover\s*:\s*none|pointer\s*:\s*coarse)\s*\)/g;
+        const MOUSE = /\(\s*(?:any-)?(?:hover\s*:\s*hover|pointer\s*:\s*fine)\s*\)/g;
+        const touch = text => text.replace(TOUCH, '(min-width: 0px)').replace(MOUSE, '(min-width: 100000px)');
+        const nativeMatchMedia = window.matchMedia.bind(window);
+        window.matchMedia = query => nativeMatchMedia(touch(query));
+        const rewrite = rules => {
+          for (const rule of rules) {
+            if (rule instanceof CSSMediaRule) {
+              const next = touch(rule.media.mediaText);
+              if (next !== rule.media.mediaText) rule.media.mediaText = next;
+            }
+            if (rule.cssRules) rewrite(rule.cssRules);
+          }
+        };
+        let queued = false;
+        const sweep = () => {
+          queued = false;
+          for (const sheet of document.styleSheets) rewrite(sheet.cssRules);
+        };
+        new MutationObserver(() => {
+          if (queued) return;
+          queued = true;
+          queueMicrotask(sweep);
+        }).observe(document.head, { childList: true, subtree: true, characterData: true });
+      }
     </script>
   </head>
   <body>
