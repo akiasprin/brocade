@@ -52,9 +52,9 @@ use phantun::{
 };
 use probe::{
     collect_e2e_probe_report, collect_link_probe_report, collect_ping_probe_report, e2e_once,
-    fetch_e2e_probe_targets, fetch_ping_probe_settings, fetch_probe_targets, judge_hops,
-    ping_probe_once, probe_once, read_hop_downlinks, send_e2e_probe_report, send_link_probe_report,
-    send_ping_probe_report, xray_listen_ports, PingProbePlan, XrayListenProtocol,
+    fetch_e2e_probe_targets, fetch_ping_probe_settings, fetch_probe_targets, ping_probe_once,
+    probe_once, send_e2e_probe_report, send_link_probe_report, send_ping_probe_report,
+    xray_listen_ports, PingProbePlan, XrayListenProtocol,
 };
 use spool::{
     collect_runtime_report, collect_spool_backlog, record_local_reconcile, runtime_cycle,
@@ -96,10 +96,10 @@ use brocade_deployment::{
     },
     protocol::{
         AgentObservationRequest, DesiredStateResponse, E2eProbeRequest, E2eProbeTargetList,
-        GeodataFileState, GeodataObservation, LinkHealthRequest, LinkProbeRequest,
-        LoadReportRequest, NodeDesiredDeployment, NodeRuntimeReport, PingProbeReportRequest,
-        ProbeTargetList, ReportedNodeState, RouteIpReport, SpoolBacklog, TargetApplyResult,
-        UsageCounter, UsageReportRequest, XrayUpgradePhase, XrayUpgradeRuntime, XrayUpgradeSource,
+        GeodataFileState, GeodataObservation, LinkProbeRequest, LoadReportRequest,
+        NodeDesiredDeployment, NodeRuntimeReport, PingProbeReportRequest, ProbeTargetList,
+        ReportedNodeState, RouteIpReport, SpoolBacklog, TargetApplyResult, UsageCounter,
+        UsageReportRequest, XrayUpgradePhase, XrayUpgradeRuntime, XrayUpgradeSource,
     },
 };
 
@@ -1906,22 +1906,8 @@ fn run_forever(options: Options) -> Result<(), String> {
             options.clone(),
             Arc::clone(&runtime_reports),
         )?;
-        let health_reports = Arc::new(LatestReport::<LinkHealthRequest>::default());
-
-        let report_options = options.clone();
-        let reports_in = Arc::clone(&health_reports);
-        thread::Builder::new()
-            .name("link-health-report".to_owned())
-            .spawn(move || {
-                report_latest_forever("link-health", &reports_in, |report| {
-                    send_health_report(&report_options, report)
-                })
-            })
-            .map_err(|error| format!("cannot spawn link-health-report thread: {error}"))?;
-
         let options = options.clone();
         let meter = Arc::clone(&meter);
-        let reports_out = Arc::clone(&health_reports);
         thread::Builder::new()
             .name("usage".to_owned())
             .spawn(move || {
@@ -1940,11 +1926,6 @@ fn run_forever(options: Options) -> Result<(), String> {
                         );
                         if let Err(error) = collect_usage_report(&options) {
                             eprintln!("usage: {error}");
-                        }
-                        match collect_health_report(&options) {
-                            Ok(Some(report)) => reports_out.publish(report),
-                            Ok(None) => {}
-                            Err(error) => eprintln!("link-health: {error}"),
                         }
                     });
                     let now = Instant::now();
@@ -3060,51 +3041,12 @@ fn collect_usage_report(options: &Options) -> Result<(), String> {
 fn usage_cycle(options: &Options) -> Result<(), String> {
     let sampled = collect_usage_report(options);
     let drained = spool_drain(USAGE_SPOOL, options).map(|_| ());
-    if let Err(error) = health_cycle(options) {
-        eprintln!("link-health: {error}");
-    }
     match (sampled, drained) {
         (Ok(()), result) | (result, Ok(())) => result,
         (Err(sample), Err(drain)) => Err(format!(
             "本轮 usage 采集失败：{sample}；历史 usage spool 发送也失败：{drain}"
         )),
     }
-}
-
-/// Read the outbound counters once, compare against the previous round, and report
-/// each hop's liveness.
-fn collect_health_report(options: &Options) -> Result<Option<LinkHealthRequest>, String> {
-    let xray_content = match fs::read_to_string(options.state_dir.join("xray.json")) {
-        Ok(content) => content,
-        // No xray on this machine (impossible for a pure backbone relay, but real for
-        // a wg-only node)
-        Err(_) => return Ok(None),
-    };
-    let Some(api_address) = xray_api_address(&xray_content) else {
-        return Ok(None);
-    };
-    let now = read_hop_downlinks(api_address)?;
-    Ok(judge_hops(now, current_unix_secs()? as u64))
-}
-
-fn send_health_report(options: &Options, report: &LinkHealthRequest) -> Result<(), String> {
-    let client = HttpClient::new(&options.server)?;
-    let body = serde_json::to_string(&report).map_err(|error| error.to_string())?;
-    let response = client.request("POST", "/agent/v1/link-health", &options.token, Some(&body))?;
-    if !(200..300).contains(&response.status) {
-        return Err(format!(
-            "link health report failed: HTTP {} {}",
-            response.status, response.body
-        ));
-    }
-    Ok(())
-}
-
-fn health_cycle(options: &Options) -> Result<(), String> {
-    if let Some(report) = collect_health_report(options)? {
-        send_health_report(options, &report)?;
-    }
-    Ok(())
 }
 
 /// One host-sampling tick. Most ticks accumulate and produce nothing.
@@ -6485,102 +6427,6 @@ mod tests {
             crate::probe::probe_path_mtu("192.0.2.1", ProbeTransport::Udp),
             (LinkProbeStatus::Unreachable, None, None)
         );
-    }
-
-    /// Liveness is judged by the delta, not the absolute value.
-    ///
-    /// With no baseline, the first round has to return unknown rather than dead, so a
-    /// newly restarted agent does not mark every link as failed. A counter that
-    /// decreased means xray restarted, since the counters are cumulative and held in
-    /// process memory, and that round has no usable delta either.
-    #[test]
-    fn hop_health_needs_a_baseline_and_survives_counter_resets() {
-        let tag = "out:relay/c-relay>sg-01".to_owned();
-
-        // First round: a baseline only, with nothing to report
-        let first = crate::probe::judge_hops(BTreeMap::from([(tag.clone(), 1000)]), 100);
-        assert!(first.is_none(), "第一轮没有上一轮可比，不该报");
-
-        // Second round grew → alive
-        let second = crate::probe::judge_hops(BTreeMap::from([(tag.clone(), 1600)]), 130).unwrap();
-        assert_eq!(second.window_secs, 30);
-        assert_eq!(second.hops[0].chain_id, "relay/c-relay");
-        assert_eq!(second.hops[0].peer_node_id, "sg-01");
-        assert!(second.hops[0].alive);
-        assert_eq!(second.hops[0].downlink_bytes, 600);
-
-        // Third round did not grow → dead (the observatory is running, so no delta
-        // means this hop is down)
-        let third = crate::probe::judge_hops(BTreeMap::from([(tag.clone(), 1600)]), 160).unwrap();
-        assert!(!third.hops[0].alive);
-        assert_eq!(third.hops[0].downlink_bytes, 0);
-
-        // Fourth round's counter shrank = xray restarted; treat it as no data rather
-        // than negative growth
-        let fourth = crate::probe::judge_hops(BTreeMap::from([(tag, 40)]), 190).unwrap();
-        assert!(!fourth.hops[0].alive);
-        assert_eq!(fourth.hops[0].downlink_bytes, 0, "不能算成负数或回绕");
-    }
-
-    /// Forwarding outbounds only. `out:egress` always carries traffic (measuring no
-    /// relay liveness) and `out:block` never does.
-    #[test]
-    fn hop_downlinks_ignore_egress_and_block() {
-        let stat = |name: &str, value: i64| XrayStat {
-            name: name.to_owned(),
-            value,
-        };
-        let parsed = crate::probe::hop_downlinks_from_stats(&[
-            stat(
-                "outbound>>>out:relay/c-relay>sg-01>>>traffic>>>downlink",
-                900,
-            ),
-            stat(
-                "outbound>>>out:relay/c-source~c-owner>jp-01>>>traffic>>>downlink",
-                450,
-            ),
-            // Same-process listener references have an outbound counter, but they are not a
-            // machine link. Reporting this would be rejected as a self peer by the store.
-            stat(
-                "outbound>>>out:relay/c-source~c-owner@local>hk-01>>>traffic>>>downlink",
-                300,
-            ),
-            stat("outbound>>>out:relay/c-relay>sg-01>>>traffic>>>uplink", 120),
-            stat("outbound>>>out:egress>>>traffic>>>downlink", 999_999),
-            stat("outbound>>>out:block>>>traffic>>>downlink", 0),
-        ]);
-        assert_eq!(
-            parsed.keys().collect::<Vec<_>>(),
-            [
-                "out:relay/c-relay>sg-01",
-                "out:relay/c-source~c-owner>jp-01"
-            ]
-        );
-        assert_eq!(
-            parsed["out:relay/c-relay>sg-01"], 900,
-            "只取 downlink，不要 uplink"
-        );
-        assert_eq!(parsed["out:relay/c-source~c-owner>jp-01"], 450);
-    }
-
-    #[test]
-    fn listener_outbound_counters_to_the_same_peer_are_aggregated() {
-        let previous = BTreeMap::from([
-            ("out:relay/c-source~c-owner-a>jp-01".to_owned(), 100),
-            ("out:relay/c-source~c-owner-b>jp-01".to_owned(), 200),
-        ]);
-        let now = BTreeMap::from([
-            ("out:relay/c-source~c-owner-a>jp-01".to_owned(), 150),
-            ("out:relay/c-source~c-owner-b>jp-01".to_owned(), 270),
-        ]);
-
-        let hops = crate::probe::hop_health_deltas(&now, &previous);
-
-        assert_eq!(hops.len(), 1);
-        assert_eq!(hops[0].chain_id, "relay/c-source");
-        assert_eq!(hops[0].peer_node_id, "jp-01");
-        assert_eq!(hops[0].downlink_bytes, 120);
-        assert!(hops[0].alive);
     }
 
     /// The suggestion is the path MTU minus wg's encapsulation overhead, and the

@@ -207,23 +207,6 @@ fn xray_config(config: &XrayConfig) -> Value {
     // "The feature legacy reverse has been removed" the moment the key is present, so
     // writing it does not degrade — it stops the node's xray from starting at all).
     // Both ends now ride on the credential; see the client and outbound renderers.
-    if let Some(health) = &config.hop_health {
-        // `burstObservatory` is the key this version knows, and it only starts once
-        // a rule references the balancer — writing this section alone is not enough
-        // (`XrayRouting::balancers`).
-        value.as_object_mut().unwrap().insert(
-            "burstObservatory".to_owned(),
-            json!({
-                "subjectSelector": health.subjects,
-                "pingConfig": {
-                    "destination": health.probe_url,
-                    "interval": format!("{}s", health.probe_interval_secs),
-                    "timeout": "5s",
-                    "samplingCount": 2,
-                },
-            }),
-        );
-    }
     value["brocadeUnlockIpFamilies"] = json!(2);
     // Agent-only metadata: a group change changes the artifact and is not hot-swappable.
     if let Some(group) = &config.certificate_group_id {
@@ -238,25 +221,6 @@ fn routing_config(config: &XrayConfig) -> Value {
         "domainStrategy".to_owned(),
         json!(config.routing.domain_strategy),
     );
-    if !config.routing.balancers.is_empty() {
-        routing.insert(
-            "balancers".to_owned(),
-            json!(config
-                .routing
-                .balancers
-                .iter()
-                .map(|balancer| json!({
-                    "tag": balancer.tag,
-                    "selector": balancer.selector,
-                    // leastPing is the only strategy that consumes the observatory's
-                    // results. We do not read its choice (the counters are the
-                    // test), but the strategy must match or the observatory runs for
-                    // nothing.
-                    "strategy": { "type": "leastPing" },
-                }))
-                .collect::<Vec<_>>()),
-        );
-    }
     routing.insert(
         "rules".to_owned(),
         json!(config
@@ -1645,13 +1609,7 @@ fn routing_rule(rule: &XrayRoutingRule) -> Value {
         object.insert("user".to_owned(), json!(rule.users));
     }
     put_condition(&mut object, &rule.condition);
-    // The two are exclusive: a rule pointing at a balancer writes no outboundTag.
-    // The liveness rule takes the former, matching a domain that never appears,
-    // purely so the balancer gets instantiated.
-    match &rule.balancer_tag {
-        Some(tag) => object.insert("balancerTag".to_owned(), json!(tag)),
-        None => object.insert("outboundTag".to_owned(), json!(rule.outbound_tag)),
-    };
+    object.insert("outboundTag".to_owned(), json!(rule.outbound_tag));
     Value::Object(object)
 }
 

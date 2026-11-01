@@ -20,7 +20,6 @@ import {
   SCENES,
   WINDOW_SECS,
   agentState,
-  linkHealth,
   nicView,
   pingLatest,
   reports,
@@ -328,7 +327,6 @@ globalThis.fetch = async (input, init) => {
     });
   if (path === '/ping-probe/nodes/latest')
     return json({ interval_secs: 10, nodes: machines.flatMap(machine => pingLatest(machine, now) ?? []) });
-  if (path === '/links/health') return json({ hops: linkHealth(machines, now) });
   if (path === '/links/mtu') return json({ links: [], nodes: [], default_mtu: 1420 });
   if (path === '/agent-log-policy') return json({ global: { max_mib: 64 }, nodes: [] });
   if (path === '/tenants') return json({ tenants: [{ id: 'platform', name: '平台' }] });
@@ -362,7 +360,7 @@ globalThis.fetch = async (input, init) => {
       state: 'present',
       sha256: null,
       byte_len: null,
-      content: JSON.stringify({ burstObservatory: { subjectSelector: [] } }),
+      content: JSON.stringify({}),
       redacted: false,
     });
   return Response.json({ error: `示例未提供 ${path}` }, { status: 404 });

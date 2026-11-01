@@ -23,7 +23,7 @@ import { App } from '../../src/app';
 import { SessionProvider, type Session } from '../../src/session';
 import { SegmentedControl } from '../../src/ui/bits';
 import { MACHINES, TENANT, chainSnapshot, e2eProbes, previewSnapshot } from './list-head-mockup-data';
-import { agentState, linkHealth, nicView, pingLatest, reports, trafficItem } from './node-list-mockup-data';
+import { agentState, nicView, pingLatest, reports, trafficItem } from './node-list-mockup-data';
 import { settings } from './unlock-mockup-data';
 import { SCENES, nowSecs, unlockCapabilities, unlockJob, type SceneKey } from './chain-unlock-mockup-data';
 import {
@@ -264,7 +264,6 @@ globalThis.fetch = async (input, init) => {
     });
   if (path === '/ping-probe/nodes/latest')
     return json({ interval_secs: 10, nodes: MACHINES.flatMap(machine => pingLatest(machine, now) ?? []) });
-  if (path === '/links/health') return json({ hops: linkHealth(MACHINES, now) });
   if (path === '/links/mtu') return json({ links: [], nodes: [], default_mtu: 1420 });
   if (path === '/agent-log-policy') return json({ global: { max_mib: 64 }, nodes: [] });
   if (path === '/probes/e2e') return json(e2eProbes(now));

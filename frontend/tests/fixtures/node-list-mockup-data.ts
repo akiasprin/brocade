@@ -1,7 +1,6 @@
 // Synthetic fleet for the machine list (机器页) header and layout mockup. Never imported by the app.
 // Names follow the production pattern 「城市 线路」; addresses are documentation ranges.
 import type {
-  LinkHealthItem,
   NodeAgentStateItem,
   NodeNicSample,
   NodeNicView,
@@ -346,21 +345,6 @@ export function pingLatest(machine: Machine, nowSecs: number): NodePingProbeLate
       };
     }),
   };
-}
-
-export function linkHealth(machines: Machine[], nowSecs: number): LinkHealthItem[] {
-  return machines
-    .filter(reports)
-    .slice(0, 6)
-    .map(machine => ({
-      node_id: machine.id,
-      chain_id: 'apac-main',
-      peer_node_id: 'hk-hkix',
-      alive: true,
-      downlink_bytes: 1_240_000,
-      window_secs: 30,
-      checked_at: iso(nowSecs - 8),
-    }));
 }
 
 /** Month totals and quota for the header readouts. */

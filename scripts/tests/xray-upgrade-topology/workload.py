@@ -218,8 +218,6 @@ def serve(role):
                         inbound["streamSettings"] = {"network": "tcp"}
                         inbound["settings"]["clients"] = [{"id": USER, "email": EMAIL}]
                 reverse.pop("geodata", None)
-                if "burstObservatory" in reverse:
-                    reverse["burstObservatory"]["pingConfig"]["destination"] = "http://" + IPS["exit-a"] + ":8080/generate_204"
                 path = RESULTS / (role + "-reverse.json")
                 save(path, reverse)
                 with (RESULTS / (role + "-reverse.log")).open("wb") as reverse_log:

@@ -16,6 +16,9 @@ use serde_json::Value;
 /// A bounded, reusable runtime alias. Telemetry folds its counters into the original hop.
 pub const ENDPOINT_SWAP_SUFFIX: &str = "~brocade-endpoint-swap";
 const ENDPOINT_RULE_PREFIX: &str = "brocade:endpoint-swap:";
+// Historical revisions may still carry this monitoring-only balancer. Keep recognizing it
+// during endpoint swaps until those revisions are no longer used for rollback.
+const LEGACY_HOP_HEALTH_BALANCER_TAG: &str = "hop-health";
 
 pub enum HotSwapOperation {
     AddOutbounds(Vec<Value>),
@@ -314,16 +317,14 @@ fn endpoint_swap_plan(
                     .as_str()
                     .is_some_and(|tag| changed.contains_key(tag));
                 if references_changed {
-                    // The compiler's health-only balancer does not route application traffic.
+                    // Older revisions' health-only balancer does not route application traffic.
                     // Real balancer selections / fallback tags cannot be redirected by our
                     // bridge table, and therefore must use handoff instead.
-                    use brocade_core::artifacts::xray::{
-                        HOP_HEALTH_BALANCER_TAG, NEVER_MATCH_DOMAIN,
-                    };
-                    if balancer["tag"] != HOP_HEALTH_BALANCER_TAG
+                    use brocade_core::artifacts::xray::NEVER_MATCH_DOMAIN;
+                    if balancer["tag"] != LEGACY_HOP_HEALTH_BALANCER_TAG
                         || balancer.get("fallbackTag").is_some()
                         || before_rules.iter().chain(after_rules).any(|rule| {
-                            rule["balancerTag"] == HOP_HEALTH_BALANCER_TAG
+                            rule["balancerTag"] == LEGACY_HOP_HEALTH_BALANCER_TAG
                                 && rule["domain"] != serde_json::json!([NEVER_MATCH_DOMAIN])
                         })
                     {
@@ -405,7 +406,7 @@ mod tests {
 
     use super::hot_swap;
 
-    /// A config shaped like the compiler's, small enough to vary one thing at a time.
+    /// A legacy revision with its monitoring balancer, retained to cover rollback compatibility.
     fn config(
         inbound_port: u16,
         outbounds: &[&str],
@@ -454,6 +455,33 @@ mod tests {
         let mut after = before.clone();
         after["outbounds"][1]["settings"]["vnext"][0]["address"] = json!("2001:db8::1");
         (before, after)
+    }
+
+    #[test]
+    fn endpoint_swap_without_the_retired_monitor_keeps_the_hot_path() {
+        let (mut before, mut after) = endpoint_configs();
+        for config in [&mut before, &mut after] {
+            config["routing"]
+                .as_object_mut()
+                .unwrap()
+                .remove("balancers");
+        }
+        let swap = hot_swap(&before.to_string(), &after.to_string()).unwrap();
+        assert!(swap.endpoint_swap.is_some());
+    }
+
+    #[test]
+    fn retiring_a_running_observatory_requires_handoff() {
+        let (mut before, mut after) = endpoint_configs();
+        before["burstObservatory"] = json!({
+            "subjectSelector": ["out:a"],
+            "pingConfig": {"destination":"http://www.gstatic.com/generate_204", "interval":"10s"}
+        });
+        after["routing"]
+            .as_object_mut()
+            .unwrap()
+            .remove("balancers");
+        assert!(hot_swap(&before.to_string(), &after.to_string()).is_none());
     }
 
     #[test]

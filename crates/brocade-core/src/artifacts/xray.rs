@@ -78,25 +78,12 @@ pub const FORWARD_OUTBOUND_TAG: &str = "out:forward";
 /// No routing rule references it, so user traffic cannot reach it; only the `geodata`
 /// block selects it by tag.
 ///
-/// Its name must contain no `>`: liveness recognizes forwarding outbounds by the shape
-/// `out:{app}/{chain}>{to}` (the agent's `hop_of_tag`), so a `>` would make it look
-/// like a hop; billing reads only the `user>>>` family and never touches it anyway.
-/// Sidestepping both, it enters no ledger at all.
+/// Its name contains no `>` so network telemetry does not mistake it for a forwarding
+/// peer. Billing reads only the `user>>>` family and never touches it.
 pub const INTERNAL_OUTBOUND_TAG: &str = "out:internal";
 pub const NEVER_MATCH_DOMAIN: &str = "full:invalid.brocade.never-match";
-/// The liveness balancer's tag. Purely a read handle, taking no part in real routing
-/// (`XrayRouting::balancers`).
-pub const HOP_HEALTH_BALANCER_TAG: &str = "hop-health";
-// Probe address and interval. The 10-second interval trades probe traffic for
-// sensitivity. One round trip is roughly 850 bytes, so every 10 seconds is about 7 MB
-// per hop per day, which is recorded in the backbone counters as operator cost rather
-// than user usage.
-pub const HOP_HEALTH_PROBE_URL: &str = "http://www.gstatic.com/generate_204";
-pub const HOP_HEALTH_PROBE_INTERVAL_SECS: u16 = 10;
-
-// Config is not boxed: the two variants differ by 440 bytes, and a snapshot holds at
-// most a few dozen machines, so boxing would save tens of kilobytes. The cost would be
-// that every later reader has to work out why the indirection is there.
+// A snapshot holds at most a few dozen machines, so keep configs inline rather than
+// adding indirection for a small reduction in snapshot size.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum XrayArtifact {
@@ -115,8 +102,6 @@ pub struct XrayConfig {
     pub inbounds: Vec<XrayInbound>,
     pub outbounds: Vec<XrayOutbound>,
     pub routing: XrayRouting,
-    /// Emitted only where this machine has forwarding outbounds (`XrayHopHealth`).
-    pub hop_health: Option<XrayHopHealth>,
     /// Automatic `.dat` updates. Not an `Option`, because every machine running xray
     /// emits this block.
     pub geodata: XrayGeodata,
@@ -156,34 +141,6 @@ pub struct XrayGeodataAsset {
 // traffic arrives on. The routing table below therefore needed no rewrite; only the
 // two setup rules were removed, because there is no longer a control connection to
 // recognize.
-
-/// Relay-hop liveness.
-///
-/// The test is the outbound's counters rather than the observatory's verdict. The probe
-/// traffic travels that outbound, so the hop's state appears directly in
-/// `outbound>>>out:{app}/{chain}>{to}>>>traffic>>>downlink`, where growth means the hop
-/// works. This requires no new read channel: `xray api` has no observatory verb,
-/// `ObservatoryService.GetOutboundStatus` is gRPC only, and the agent writes its own
-/// HTTP. `xray api bi` was tested and emits only Selects, with no health data.
-///
-/// It also removes the ambiguity between idle and dead: the observatory produces
-/// traffic for as long as the hop is up, so a zero delta means the hop is down and no
-/// separate active probe is needed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct XrayHopHealth {
-    /// The outbounds to observe, each by full name.
-    ///
-    /// The `out:` prefix must not be written: `subjectSelector` matches by prefix and
-    /// would also select `out:egress` and `out:block`. The first is always up, being a
-    /// direct freedom outbound that measures no relay liveness, and the second is
-    /// always down, being a blackhole, so both would distort the result.
-    pub subjects: Vec<String>,
-    pub probe_url: String,
-    pub probe_interval_secs: u16,
-    /// What the routing rule whose only job is to instantiate the balancer
-    /// matches.
-    pub balancer_tag: String,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XrayApi {
@@ -601,16 +558,6 @@ pub struct XrayShadowsocksUser {
 pub struct XrayRouting {
     pub domain_strategy: String,
     pub rules: Vec<XrayRoutingRule>,
-    /// The liveness balancer. It takes no part in routing, but some rule has to
-    /// reference it, or xray does not instantiate it and the observatory does not
-    /// start. The rule below therefore matches a domain that never appears.
-    pub balancers: Vec<XrayBalancer>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct XrayBalancer {
-    pub tag: String,
-    pub selector: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -624,10 +571,6 @@ pub struct XrayRoutingRule {
     pub users: Vec<String>,
     pub condition: XrayMatchCondition,
     pub outbound_tag: String,
-    /// Points at a balancer rather than a concrete outbound. Only the liveness rule
-    /// uses it, and its purpose is to instantiate the balancer; see
-    /// `XrayRouting::balancers`.
-    pub balancer_tag: Option<String>,
 }
 
 /// Names every rule in the table, as `r:<generation>:<index>`.
@@ -695,10 +638,8 @@ fn stamp_rule_tags(rules: &mut [XrayRoutingRule]) {
             field(&mut hasher, b"^failed$");
         }
         field(&mut hasher, rule.outbound_tag.as_bytes());
-        field(
-            &mut hasher,
-            rule.balancer_tag.as_deref().unwrap_or("").as_bytes(),
-        );
+        // Preserve existing rule generations for tables that never used the retired balancer.
+        field(&mut hasher, b"");
     }
     let digest = hasher.finalize();
     let generation = hex_lower(&digest[..4]);
@@ -932,7 +873,6 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
             users: Vec::new(),
             condition: XrayMatchCondition::default(),
             outbound_tag: API_TAG.to_owned(),
-            balancer_tag: None,
         });
     }
     if let Some(dns_route) = &xray.dns_route {
@@ -942,7 +882,6 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
             users: Vec::new(),
             condition: XrayMatchCondition::default(),
             outbound_tag: dns_route.clone(),
-            balancer_tag: None,
         });
     }
     let mut dns_routes = BTreeSet::new();
@@ -956,7 +895,6 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
             users: Vec::new(),
             condition: XrayMatchCondition::default(),
             outbound_tag: dns.outbound_tag.clone(),
-            balancer_tag: None,
         });
     }
     if !cover_tags.is_empty() {
@@ -966,7 +904,6 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
             users: Vec::new(),
             condition: XrayMatchCondition::default(),
             outbound_tag: REALITY_COVER_OUTBOUND_TAG.to_owned(),
-            balancer_tag: None,
         });
     }
     // One pass letting each guarded ingress reach the names it impersonates, then one catching
@@ -989,7 +926,6 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
                 ..XrayMatchCondition::default()
             },
             outbound_tag: INTERNAL_OUTBOUND_TAG.to_owned(),
-            balancer_tag: None,
         });
     }
     if !guards.is_empty() {
@@ -999,7 +935,6 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
             users: Vec::new(),
             condition: XrayMatchCondition::default(),
             outbound_tag: REALITY_GUARD_OUTBOUND_TAG.to_owned(),
-            balancer_tag: None,
         });
     }
     let split_fronts = xray
@@ -1022,7 +957,6 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
             users: Vec::new(),
             condition: XrayMatchCondition::default(),
             outbound_tag: SPLIT_FRONT_OUTBOUND_TAG.to_owned(),
-            balancer_tag: None,
         });
     }
     // The reverse tunnel previously required two setup rules ahead of everything else,
@@ -1048,41 +982,8 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
                 condition
             },
             outbound_tag: rule.outbound_tag.clone(),
-            balancer_tag: None,
         }
     }));
-
-    // A reverse credential may create carriers only; upstream rejects ordinary
-    // forward requests authenticated by it. Its dedicated health probes already
-    // keep the carrier counters live and expose the bidirectional lease via RPC.
-    let health_subjects = xray
-        .forward_outbounds
-        .iter()
-        .filter(|outbound| !bridge_tags.contains_key(outbound.tag.as_str()))
-        .map(|outbound| outbound.tag.clone())
-        .collect::<Vec<_>>();
-    let hop_health = (!health_subjects.is_empty()).then(|| XrayHopHealth {
-        subjects: health_subjects,
-        probe_url: HOP_HEALTH_PROBE_URL.to_owned(),
-        probe_interval_secs: HOP_HEALTH_PROBE_INTERVAL_SECS,
-        balancer_tag: HOP_HEALTH_BALANCER_TAG.to_owned(),
-    });
-    if hop_health.is_some() {
-        // Its only effect is that the balancer gets referenced and therefore
-        // instantiated. It matches a domain that never appears, so it has no effect
-        // whatever on real traffic.
-        rules.push(XrayRoutingRule {
-            rule_tag: String::new(),
-            inbound_tags: Vec::new(),
-            users: Vec::new(),
-            condition: XrayMatchCondition {
-                domain: vec![NEVER_MATCH_DOMAIN.to_owned()],
-                ..XrayMatchCondition::default()
-            },
-            outbound_tag: String::new(),
-            balancer_tag: Some(HOP_HEALTH_BALANCER_TAG.to_owned()),
-        });
-    }
 
     // After the table is final and in its final order: the name carries the position,
     // and the generation is a digest of every rule in it.
@@ -1127,18 +1028,8 @@ pub fn build(plan: &NodePlan) -> XrayArtifact {
         outbounds,
         routing: XrayRouting {
             domain_strategy: "AsIs".to_owned(),
-            balancers: hop_health
-                .as_ref()
-                .map(|health| {
-                    vec![XrayBalancer {
-                        tag: health.balancer_tag.clone(),
-                        selector: health.subjects.clone(),
-                    }]
-                })
-                .unwrap_or_default(),
             rules,
         },
-        hop_health,
         geodata: geodata_config(&xray.geodata),
     })
 }
@@ -1876,7 +1767,6 @@ mod tests {
             users: Vec::new(),
             condition: XrayMatchCondition::default(),
             outbound_tag: outbound.to_owned(),
-            balancer_tag: None,
         }
     }
 

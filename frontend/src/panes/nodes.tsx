@@ -36,10 +36,8 @@ import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tansta
 import {
   abandonNode,
   fetchAgentLogPolicy,
-  fetchArtifactContentView,
   fetchCompileView,
   fetchDeployments,
-  fetchLinkHealth,
   fetchLinkMtu,
   fetchNodes,
   fetchRevisions,
@@ -79,7 +77,6 @@ import {
   type NodeConnection,
   type DomainStrategy,
   type GroupCertificate,
-  type LinkHealthItem,
   type NodeAgentStateItem,
   type NodeCertificateState,
   type NodeLoadView,
@@ -612,43 +609,6 @@ function PublicIpHistoryDetails({
 // 更重要的是关闭状态下无法确定其含义：一个灰色的开关，需要先根据「该行标签是
 // IPv4 NAT」推断灰色表示不经 NAT。两格都有文字标签则不需要该推断。
 
-interface BurstObservatoryInfo {
-  subjects: string[];
-}
-
-const obj = (value: unknown): Record<string, unknown> | null =>
-  value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
-
-const strList = (value: unknown) =>
-  Array.isArray(value) ? value.filter((x): x is string => typeof x === 'string') : [];
-
-// 只取 subjectSelector：面板当前需要从产物中获取的唯一信息是该跳是否在探测清单中。
-// 探测参数和 balancer 相关项此前也会解析并显示，展示移除后解析一并移除。
-function parseBurstObservatory(content: string | null | undefined): BurstObservatoryInfo | null {
-  if (!content) return null;
-  let root: unknown;
-  try {
-    root = JSON.parse(content);
-  } catch {
-    return null;
-  }
-
-  const burst = obj(obj(root)?.burstObservatory);
-  if (!burst) return null;
-
-  return { subjects: strList(burst.subjectSelector) };
-}
-
-const hopSubject = (hop: Pick<LinkHealthItem, 'chain_id' | 'peer_node_id'>) =>
-  `out:${hop.chain_id}>${hop.peer_node_id}`;
-
-const parseHopSubject = (subject: string) => {
-  const rest = subject.startsWith('out:') ? subject.slice(4) : subject;
-  const [chainId, peerNodeId] = rest.split('>');
-  if (!chainId || !peerNodeId) return null;
-  return { chainId, peerNodeId };
-};
-
 /** 列表排序用的标签，与卡片上 `<b>` 渲染的是同一个值。 */
 const nodeLabel = (n: NodeAgentStateItem) => n.name || n.node_id;
 
@@ -771,7 +731,6 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
         ['node-load-list'],
         ['node-nic-list'],
         ['ping-probe-nodes'],
-        ['link-health'],
         ['link-mtu'],
         ['certs'],
         ['agent-log-policy'],
@@ -1898,69 +1857,6 @@ function PollAgo({ at }: { at: string | null }) {
           ? `${Math.floor(s / 3600)}h`
           : `${Math.floor(s / 86400)}d`;
   return <span title={at}>{text}</span>;
-}
-
-// 该机器发出的中继跳当前是否连通。
-// 判定依据是 outbound 计数器的增量：产物中的 observatory 每 10 秒通过每个转发出口探测一次，
-// 因此该跳连通时 downlink 会持续增长；增量为零即表示不通。
-//
-// 与上面的「已应用」属于两类事实，因此分开显示：
-// 「已应用」表示配置是否已下发到该机器，此处表示链路是否连通。配置全部正常而用户无法连接，
-// 正是因为此前只有前者。
-// 链路统计单独提取：观测页顶部的状态条使用这份数据（RELAY STATUS 表已移除）。
-export function useHopStats(nodeId: string, artifactReadable = true) {
-  const health = useQuery({
-    queryKey: ['link-health'],
-    queryFn: () => fetchLinkHealth(),
-    refetchInterval: 30_000,
-  });
-  const artifact = useQuery({
-    queryKey: ['artifact', 'view', 'burst-observatory', nodeId, 'xray'],
-    queryFn: () => fetchArtifactContentView('node', nodeId, 'xray'),
-    enabled: artifactReadable,
-    retry: false,
-  });
-  const observatory = parseBurstObservatory(artifact.data?.content);
-  const mine = health.error ? [] : (health.data?.hops ?? []).filter(h => h.node_id === nodeId);
-  const rows = new Map<
-    string,
-    { subject: string; chainId: string; peerNodeId: string; health: LinkHealthItem | null }
-  >();
-  for (const subject of observatory?.subjects ?? []) {
-    const parsed = parseHopSubject(subject);
-    if (!parsed) continue;
-    rows.set(subject, { subject, ...parsed, health: null });
-  }
-  for (const hop of mine) {
-    const subject = hopSubject(hop);
-    rows.set(subject, {
-      subject,
-      chainId: hop.chain_id,
-      peerNodeId: hop.peer_node_id,
-      health: hop,
-    });
-  }
-  // 产物中不存在的跳整行不显示。这类记录是 link_health 的历史残留——链已修改、节点已移出，
-  // 而该表按 (node, chain, peer) 保留旧记录，agent 也不会上报该跳已不再管理。
-  // 此前为其添加红色的「不在产物」标记，结果是表格持续增长并混入不存在的跳。
-  // 无法获取 observatory 时（没有 xray 产物，或该次请求失败）无法判定，全部保留：
-  // 显示多余记录优于因一次取数失败而清空整张表。
-  const subjectSet = new Set(observatory?.subjects ?? []);
-  const inArtifact = (subject: string) => !observatory || subjectSet.has(subject);
-  const list = [...rows.values()].filter(r => inArtifact(r.subject));
-  // 状态条的「N/M 通」使用同一口径：表中不显示的跳不应计入，
-  // 否则顶部显示 3/5 而下方只能列出 3 行。
-  const shown = mine.filter(h => inArtifact(hopSubject(h)));
-  const loading = health.isLoading && (!artifactReadable || artifact.isLoading);
-  const dead = shown.filter(h => !h.alive);
-  const expected = list.length;
-  const reported = shown.length;
-  const alive = shown.length - dead.length;
-  // 窗口长度由行内移至表头：同一次上报中所有跳共用一个窗口，每格重复「/ 60s」
-  // 是重复显示同一数值。取第一条上报的即可；没有任何上报时不显示秒数，
-  // 此时整列本身也是「—」。
-  const windowSecs = mine[0]?.window_secs ?? null;
-  return { list, loading, dead, expected, reported, alive, observatory, windowSecs };
 }
 
 /** 保留实际上报的窗口结束时间；缺少上报时断线，不能把待更新的尾部或历史缺口补成 0。 */
@@ -4394,8 +4290,8 @@ export function runtimeFindings(
   return out;
 }
 
-export function runtimeFindingAttentionCount(findings: readonly Finding[], unreachableHops = 0): number {
-  return findings.filter(finding => finding.tone !== 'info').length + unreachableHops;
+export function runtimeFindingAttentionCount(findings: readonly Finding[]): number {
+  return findings.filter(finding => finding.tone !== 'info').length;
 }
 
 /** 成因说明。位置和语气与 USAGE 卡下方的采集缺口说明一致。 */
@@ -5758,13 +5654,8 @@ function NodeDetail({
   /* 验证接入：执行一次不做任何修改的空收敛，确认该机器是否已与当前模型一致 */
   const verify = useMutation({ mutationFn: () => verifyDeployment({ node_id: id }) });
 
-  /* ── 页签角标的两个来源 ──
-     分页之后另外两页不在屏幕上，「那边有事」只能由页签自己说出来，否则在配置页改地址时
-     不会知道观测页刚出了 finding。两处都复用已有的查询键，不引入新的取数：
-     `['node-load-history', id, 1h]` 与 LoadCardFor 的默认范围共用，为 HOST 和 Agent
-     进程提供始终较新的低频事实。用户切到更长范围后，长历史另走带范围的缓存键，
-     不会让 HOST 因为 24 小时查询而延迟刷新；
-     跳的存活同理，与下面的 HopHealth 共用 useHopStats。 */
+  /* 状态卡与 LoadCardFor 共用默认近一小时查询，为 HOST 和 Agent 进程提供较新的低频事实。
+     用户切到更长范围后，长历史另走带范围的缓存键，保留此查询以免状态读数延迟刷新。 */
   const initialRange = DEFAULT_LOAD_RANGE;
   const load = useMetricQuery({
     ...nodeLoadRangeQuery(id, initialRange),
@@ -5780,7 +5671,6 @@ function NodeDetail({
     ...nodePingRangeQuery(id, initialRange),
   });
   const observationModules = useNodeObservationModules();
-  const { dead } = useHopStats(id, can(who.role, 'artifacts'));
 
   /* 页签是一次浏览中的位置，不进地址栏。安装页可定向打开配置，但不改变既有详情 URL。
      换机器时使用新入口指定的位置，不继承上一台的阅读位置。 */
@@ -6038,9 +5928,8 @@ function NodeDetail({
   const chartsLinked = true;
 
   /* 观测页的角标只计需要关注的当前问题。detailOnly 仍可进入角标，例如旧 Xray；info
-     是正常过渡或数据说明，只在卡内呈现。跳不通与 finding 合计成一个数：两者在这一页
-     上是同一件事，「有几处要看」。 */
-  const findingCount = runtimeFindingAttentionCount(runtimeFindings(n, wireguardEnabled, isolatedNodeIds), dead.length);
+     是正常过渡或数据说明，只在卡内呈现。 */
+  const findingCount = runtimeFindingAttentionCount(runtimeFindings(n, wireguardEnabled, isolatedNodeIds));
   const lamp = nodeLampState(n, wireguardEnabled, isolatedNodeIds);
 
   /* A1 页头：身份、页签与操作共用 sheet 内的一条横梁，当前页由满宽底部刻度标记。 */

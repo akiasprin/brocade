@@ -154,26 +154,6 @@ fn exchange(stream: &mut TcpStream, marker: u8) {
 }
 
 #[test]
-fn temporary_endpoint_counters_keep_separate_baselines_and_one_hop_identity() {
-    use std::collections::BTreeMap;
-    let original = "out:app/chain>receiver".to_owned();
-    let temporary = format!("{original}{ENDPOINT_SWAP_SUFFIX}");
-    let previous = BTreeMap::from([(original.clone(), 100), (temporary.clone(), 40)]);
-    let now = BTreeMap::from([(original.clone(), 125), (temporary.clone(), 60)]);
-    let hops = crate::probe::hop_health_deltas(&now, &previous);
-    assert_eq!(hops.len(), 1);
-    assert_eq!(hops[0].chain_id, "app/chain");
-    assert_eq!(hops[0].peer_node_id, "receiver");
-    assert_eq!(hops[0].downlink_bytes, 45);
-    // A recreated temporary counter must not subtract bytes from the canonical handler.
-    let reset = BTreeMap::from([(original, 130), (temporary, 1)]);
-    assert_eq!(
-        crate::probe::hop_health_deltas(&reset, &now)[0].downlink_bytes,
-        5
-    );
-}
-
-#[test]
 #[ignore = "requires BROCADE_TEST_XRAY and IPv6 loopback; run serially"]
 fn native_vless_endpoint_swap_preserves_dual_stack_listeners_and_tcp_flows() {
     native_endpoint_swap(false);
@@ -200,6 +180,7 @@ fn native_endpoint_swap(mux: bool) {
             .collect(),
         receiver: None,
     };
+    super::source_access::initialize(&root).unwrap();
     let binary = root.join("xray");
     std::fs::copy(source, &binary).unwrap();
     std::env::set_var("BROCADE_XRAY_BIN", &binary);
@@ -304,9 +285,12 @@ fn native_endpoint_swap(mux: bool) {
     };
     let mut bridge_connections = Vec::new();
     let read_counters = || {
-        crate::probe::hop_downlinks_from_stats(
-            &crate::xray_grpc::query_stats(api, "outbound>>>").unwrap(),
-        )
+        crate::xray_grpc::query_stats(api, "outbound>>>out:app/chain>receiver")
+            .unwrap()
+            .into_iter()
+            .filter(|stat| stat.name.ends_with(">>>traffic>>>downlink"))
+            .map(|stat| (stat.name, u64::try_from(stat.value).unwrap()))
+            .collect::<std::collections::BTreeMap<_, _>>()
     };
     let mut counters = read_counters();
     for (round, (address, old_marker, new_marker)) in
