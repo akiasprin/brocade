@@ -9,6 +9,7 @@ __pycache__/
 *.local
 .DS_Store
 /.tools/
+/brocade-agent-state/
 /.claude/worktrees/
 /mockups/
 /handbook/
