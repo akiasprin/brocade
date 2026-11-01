@@ -22,6 +22,15 @@ cargo test -p <crate-name> --locked <test-filter>
 cargo clippy -p <crate-name> --all-targets --locked -- -D warnings
 ```
 
+修改 Agent 的 TCP 连接跟踪策略时，另运行私有用户／网络命名空间验证；第二条命令传入
+第一条输出的 Agent 测试可执行文件路径。夹具只在私有 veth 网络中启动对端，验证 IPv4／IPv6
+双向免跟踪、普通 TCP／UDP／回环的正向对照，以及规则丢失后的收敛，不修改宿主网络：
+
+```sh
+cargo test -p brocade-agent --bin brocade-agent --locked --no-run
+python3 crates/brocade-agent/tests/conntrack_netns.py /absolute/path/to/compiled/agent-test-binary
+```
+
 ```sh
 cd frontend
 node --test tests/<name>.test.mjs

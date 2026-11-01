@@ -710,6 +710,8 @@ fn difference_inner(before: &Raw, now: &Raw, resumed_handoff: bool) -> Sub {
         _ => None,
     };
     let network_detail = now.network.has_any().then(|| NetworkDetailSample {
+        hy2_netns_active: None,
+        hy2_conntrack_count: None,
         // Levels belong to the end of this sub-window; counters are differences over it.
         tcp_curr_estab: now.network.tcp_curr_estab,
         tcp_inuse: now.network.tcp_inuse,
@@ -928,10 +930,13 @@ fn aggregate(subs: &[Sub], state_dir: &Path) -> LoadSample {
         .last()
         .map(|sub| sub.window_end_unix_secs)
         .unwrap_or(window_start);
+    let (hy2_netns_active, hy2_conntrack_count) = crate::hy2_network::observe(state_dir);
     let network_detail = subs
         .last()
         .and_then(|sub| sub.network_detail.as_ref())
         .map(|last| NetworkDetailSample {
+            hy2_netns_active,
+            hy2_conntrack_count,
             // Socket inventory is a level, so the last sub-sample is the honest value for the
             // window. Event counters are deltas and therefore add across all three sub-samples.
             tcp_curr_estab: last.tcp_curr_estab,

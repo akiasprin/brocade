@@ -14,6 +14,7 @@ mod forwarding_probe;
 mod fsutil;
 mod host_tuning;
 mod http;
+mod hy2_network;
 mod hy2_port_hop;
 mod icmp;
 mod identity;
@@ -984,8 +985,13 @@ fn reconcile_local_inner(
     drop(backbone);
 
     let hop_conf = state_dir.join("hy2_port_hop.json");
-    if hop_conf.exists() && !state_dir.join("hy2_port_hop.disabled").exists() {
-        let content = fs::read_to_string(&hop_conf).map_err(|error| error.to_string())?;
+    if hy2_network::managed(state_dir)? {
+        let config = fs::read_to_string(state_dir.join("xray.json")).map_err(|e| e.to_string())?;
+        if !hy2_network::needs_recovery(state_dir, &config)? {
+            hy2_network::reconcile(state_dir)?;
+        }
+    } else if hop_conf.exists() && !state_dir.join("hy2_port_hop.disabled").exists() {
+        let content = hy2_network::effective_hops(state_dir)?;
         if force || !hy2_port_hop::matches_content(&content) {
             hy2_port_hop::apply_content(&content)?;
             acted.push("port-hop".to_owned());
@@ -1000,6 +1006,7 @@ fn reconcile_local_inner(
         let mut recovery_error = None;
         let restarted = if force
             || splice_mode_changed
+            || hy2_network::needs_recovery(state_dir, &content)?
             || matches!(
                 xray_runtime(state_dir, &content),
                 WorkloadRuntime::Broken(_)
@@ -1047,6 +1054,7 @@ fn reconcile_local_inner(
                 "Xray 已启动并保留已恢复业务，但动态状态还没完全恢复：{error}"
             ));
         }
+        hy2_network::finish_pending(state_dir)?;
     }
 
     if acted.is_empty() {
@@ -1692,7 +1700,7 @@ fn run_forever(options: Options) -> Result<(), String> {
     }
     match conntrack_tuning::reconcile() {
         Ok(result) if result.changed => println!(
-            "连接跟踪参数已收敛（nf_conntrack_max={}，UDP 超时 30/60 秒）",
+            "连接跟踪容量已收敛（nf_conntrack_max={}，UDP 超时按 HY2 网络空间管理）",
             result.target_max
         ),
         Ok(_) => {}
@@ -3411,10 +3419,32 @@ fn converge_linux(
     // without a billable usage generation. The boolean controls sampling only; the callback
     // still acquires the mutex so configuration handoff cannot race forwarding or accounting.
     before_xray_change(desired.usage_generation_id.is_some())?;
-    converge_linux_xray(
+    let hy2_restart = hy2_network::listener_change(
         state_dir,
         &desired.desired.xray,
-        false,
+        &desired.desired.hy2_port_hop,
+    )?;
+    hy2_network::stage(
+        state_dir,
+        &desired.desired.hy2_port_hop,
+        &desired.desired.xray,
+    )?;
+    let effective_xray = if hy2_restart
+        && matches!(desired.desired.xray, DesiredArtifact::Unmanaged { .. })
+    {
+        let content = fs::read_to_string(state_dir.join("xray.json")).map_err(|e| e.to_string())?;
+        DesiredArtifact::Present {
+            sha256: sha256_hex(content.as_bytes()),
+            content,
+        }
+    } else {
+        desired.desired.xray.clone()
+    };
+    let hy2_serving_before = serving_xray_process_in(state_dir);
+    let applied_xray = converge_linux_xray(
+        state_dir,
+        &effective_xray,
+        hy2_restart,
         Some((desired.deployment_id, desired.claim_generation)),
         desired
             .xray_config_update_policy
@@ -3424,7 +3454,14 @@ fn converge_linux(
             DesiredGrants::Disabled { .. } => Some(&[]),
             DesiredGrants::Unmanaged { .. } => None,
         },
-    )?;
+    );
+    if let Err(error) = applied_xray {
+        if hy2_serving_before.is_some() && serving_xray_process_in(state_dir) == hy2_serving_before
+        {
+            hy2_network::discard_pending(state_dir)?;
+        }
+        return Err(error);
+    }
     // After xray, because the ports come out of its config: applying first would exempt the
     // previous release's ports and leave the new ones tracked until the next convergence.
     conntrack::apply(&desired.desired.xray)?;
@@ -3452,7 +3489,7 @@ fn converge_linux_hy2_port_hop(state_dir: &Path, desired: &DesiredArtifact) -> R
         "hy2_port_hop.disabled",
         desired,
     )?;
-    hy2_port_hop::apply(desired)
+    hy2_network::apply(state_dir, desired)
 }
 
 fn converge_linux_wireguard(state_dir: &Path, desired: &DesiredArtifact) -> Result<(), String> {
@@ -3534,7 +3571,7 @@ fn converge_linux_xray(
             let api_address = xray_api_address(content).unwrap_or(crate::DEFAULT_XRAY_API_ADDRESS);
             let bounded_log = state_dir.join(XRAY_BOUNDED_LOG_MARKER).exists();
             let serving_before = serving_xray_process_in(state_dir).is_some();
-            if serving_before && previous.as_deref() == Some(content) {
+            if !force_restart && serving_before && previous.as_deref() == Some(content) {
                 let _ = fs::remove_file(state_dir.join("xray.disabled"));
                 return Ok(());
             }
@@ -3654,7 +3691,7 @@ fn converge_linux_xray(
                     write_private(&rollback, previous)?;
                     let previous_api_address =
                         xray_api_address(previous).unwrap_or(crate::DEFAULT_XRAY_API_ADDRESS);
-                    match apply_xray(&rollback, previous_api_address) {
+                    match apply_xray_recovery(&rollback, previous_api_address) {
                         Ok(rollback_recovery) if rollback_recovery.is_complete() => {
                             return Err(format!(
                                 "新 Xray 配置启动失败，已恢复上一份配置和动态业务状态：{update_error}"
@@ -3697,6 +3734,7 @@ fn converge_linux_xray(
         }
         DesiredArtifact::Disabled { reason } => {
             accounting::stop(state_dir)?;
+            hy2_network::cleanup(state_dir)?;
             let _ = fs::remove_file(state_dir.join("xray.json"));
             let _ = fs::remove_file(state_dir.join(XRAY_BOUNDED_LOG_MARKER));
             let _ = fs::remove_file(state_dir.join(XRAY_SPLICE_MODE_MARKER));
@@ -3886,6 +3924,26 @@ fn apply_xray_with_grants(
     api_address: SocketAddr,
     desired_grants: Option<&[GrantInbound]>,
 ) -> Result<XrayRuntimeRecovery, String> {
+    apply_xray_with_network(path, api_address, desired_grants, false)
+}
+
+fn apply_xray_recovery(
+    path: &Path,
+    api_address: SocketAddr,
+) -> Result<XrayRuntimeRecovery, String> {
+    hy2_network::discard_pending(
+        path.parent()
+            .ok_or("xray recovery has no state directory")?,
+    )?;
+    apply_xray_with_network(path, api_address, None, true)
+}
+
+fn apply_xray_with_network(
+    path: &Path,
+    api_address: SocketAddr,
+    desired_grants: Option<&[GrantInbound]>,
+    network_recovery: bool,
+) -> Result<XrayRuntimeRecovery, String> {
     let content =
         fs::read_to_string(path).map_err(|error| format!("读取待启动的 xray 配置失败：{error}"))?;
     let disable_splice =
@@ -3905,6 +3963,7 @@ fn apply_xray_with_grants(
         warn("启动 Xray 前仍未观察到 Linux tls 内核模块；AnyTLS 将按 auto 回退");
     }
     let state_dir = path.parent().ok_or("xray config has no state directory")?;
+    let isolate_hy2 = hy2_network::preflight(state_dir, &content, &xray, network_recovery)?;
     if let Err(error) = traffic_limit_budget::initialize(state_dir) {
         warn(format!("应用层限速预算初始化失败，将独立重试：{error}"));
     }
@@ -3977,22 +4036,34 @@ fn apply_xray_with_grants(
         )));
         launch_environment.push(shell_quote("XRAY_BROCADE_ACCOUNTING_SHARED=owner"));
     }
-    let launch = format!(
-        "env {} {}",
-        launch_environment.join(" "),
-        xray_launch_command(splice_mode, &executable, &conf)
-    );
     let log_dir = state_dir.join("logs");
     create_private_dir(&log_dir)?;
     let log_path = log_dir.join("xray.log");
     let sink = logcap::command(&log_path, state_dir, logcap::WorkloadLog::Xray)?;
-    let pipeline = shell_quote(&format!("{launch} 2>&1 | {sink}"));
     run_command(&xray, &["-test", "-config", &path.display().to_string()])?;
     // Xray closes its listeners as soon as SIGTERM starts the synchronous feature teardown.
     // Waiting for that teardown before launching the replacement makes the entire wait a service
     // outage. Bound the graceful phase tightly, then kill a stuck old process; a configuration
     // restart cannot preserve its sessions in either case.
     accounting::stop(state_dir)?;
+    if let Some(policy) = hy2_network::prepare_start(state_dir, &content, isolate_hy2)? {
+        launch_environment.push(shell_quote(&format!(
+            "{}={}",
+            hy2_network::ENV,
+            policy.display()
+        )));
+    }
+    #[cfg(test)]
+    if !network_recovery && env::var_os("BROCADE_TEST_HY2_FAIL_AFTER_PREPARE").is_some() {
+        return Err("test interruption after HY2 network preparation".into());
+    }
+    let launch = format!(
+        "env -u {} {} {}",
+        hy2_network::ENV,
+        launch_environment.join(" "),
+        xray_launch_command(splice_mode, &executable, &conf)
+    );
+    let pipeline = shell_quote(&format!("{launch} 2>&1 | {sink}"));
     write_private(&live_path, &content)?;
     accounting::before_launch(state_dir)?;
     let launcher = run_shell(&format!(
@@ -4049,6 +4120,8 @@ fn apply_xray_with_grants(
             xrayupdate::activate_bootstrap_handoff(bootstrap, process.pid)?;
         }
         wait_for_xray_runtime_health(state_dir, &content)?;
+        hy2_network::activate(state_dir)?;
+        hy2_network::finish_pending(state_dir)?;
         Ok(recovery)
     })();
     match started {
@@ -4358,7 +4431,7 @@ fn observe_linux_state(state_dir: &Path, desired: &NodeDesiredDeployment) -> Rep
         phantun,
         wireguard,
         xray,
-        hy2_port_hop: if hy2_port_hop::matches(&desired.desired.hy2_port_hop) {
+        hy2_port_hop: if hy2_network::matches(state_dir, &desired.desired.hy2_port_hop) {
             match &desired.desired.hy2_port_hop {
                 DesiredArtifact::Present { sha256, .. } => AppliedArtifactState::Present {
                     sha256: sha256.clone(),
@@ -5355,6 +5428,23 @@ fn process_owns_listener(
     port: u16,
     protocol: XrayListenProtocol,
 ) -> Result<bool, String> {
+    let inodes = process_socket_inodes(pid)?;
+    let (tables, listening_state): (&[&str], &str) = match protocol {
+        XrayListenProtocol::Tcp => (&["tcp", "tcp6"], "0A"),
+        XrayListenProtocol::Udp => (&["udp", "udp6"], "07"),
+    };
+    for table in tables {
+        let path = format!("/proc/{pid}/net/{table}");
+        let content =
+            fs::read_to_string(&path).map_err(|error| format!("读取 {path} 失败：{error}"))?;
+        if socket_table_has_listener(&content, &inodes, port, listening_state) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn process_socket_inodes(pid: libc::pid_t) -> Result<BTreeSet<u64>, String> {
     let fd_dir = format!("/proc/{pid}/fd");
     let mut inodes = BTreeSet::new();
     for entry in fs::read_dir(&fd_dir).map_err(|error| format!("读取 {fd_dir} 失败：{error}"))?
@@ -5374,19 +5464,7 @@ fn process_owns_listener(
             inodes.insert(inode);
         }
     }
-    let (tables, listening_state): (&[&str], &str) = match protocol {
-        XrayListenProtocol::Tcp => (&["tcp", "tcp6"], "0A"),
-        XrayListenProtocol::Udp => (&["udp", "udp6"], "07"),
-    };
-    for table in tables {
-        let path = format!("/proc/{pid}/net/{table}");
-        let content =
-            fs::read_to_string(&path).map_err(|error| format!("读取 {path} 失败：{error}"))?;
-        if socket_table_has_listener(&content, &inodes, port, listening_state) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(inodes)
 }
 
 fn socket_table_has_listener(

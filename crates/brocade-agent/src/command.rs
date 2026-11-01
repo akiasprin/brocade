@@ -67,7 +67,31 @@ pub(crate) fn capture_command_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Result<CapturedOutput, String> {
-    let mut child = Command::new(program)
+    capture_configured_command(program, args, timeout, false)
+}
+
+/// Probe kernel networking in an anonymous child namespace. No persistent netns
+/// names or host interfaces survive cancellation or an Agent process restart.
+pub(crate) fn run_shell_in_private_network(script: &str, timeout: Duration) -> Result<(), String> {
+    let output = capture_configured_command("sh", &["-c", script], timeout, true)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "HY2 私有网络预检失败（{}）：{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn capture_configured_command(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    private_network: bool,
+) -> Result<CapturedOutput, String> {
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -75,7 +99,33 @@ pub(crate) fn capture_command_with_timeout(
         // `0` makes the child the leader of a fresh process group.  Killing only
         // `sh` leaves its `curl`/`wg` grandchild running and, because that child
         // still owns the output pipes, leaves the reader threads waiting too.
-        .process_group(0)
+        .process_group(0);
+    if private_network {
+        #[cfg(not(target_os = "linux"))]
+        return Err("HY2 网络空间预检需要 Linux".into());
+        #[cfg(target_os = "linux")]
+        {
+            let parent = std::process::id() as libc::pid_t;
+            // SAFETY: the post-fork child performs only Linux syscalls and
+            // allocation-free errno construction before exec. Parent threads
+            // never change namespaces. PDEATHSIG closes the cancellation gap.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() != parent {
+                        return Err(std::io::Error::from_raw_os_error(libc::ECANCELED));
+                    }
+                    if libc::unshare(libc::CLONE_NEWNET) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| format!("failed to run {program}: {error}"))?;
 

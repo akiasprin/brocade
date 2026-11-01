@@ -1237,6 +1237,7 @@ const DETAIL_METRIC_GROUPS: Record<LoadDetail, readonly (readonly string[])[]> =
   ],
   network: [
     [
+      'network.hy2_conntrack_count',
       'network.tcp_curr_estab',
       'network.tcp_time_wait',
       'network.tcp_orphan',
@@ -1447,6 +1448,7 @@ function hydrateMetricReport(report: NodeLoadView, view: NodeLoadMetricView, det
       return { ...sample, disk_detail };
     }
     const network_detail: NetworkDetailSample = {
+      hy2_conntrack_count: metricAt(view, 'network.hy2_conntrack_count', index),
       tcp_curr_estab: metricAt(view, 'network.tcp_curr_estab', index),
       tcp_inuse: metricAt(view, 'network.tcp_inuse', index),
       tcp_time_wait: metricAt(view, 'network.tcp_time_wait', index),
@@ -2127,15 +2129,6 @@ const NetworkHistory = memo(function NetworkHistory({
   const conntrackMax = report.host?.conntrack_max ?? null;
   const socketPart = (sample: LoadSample, key: 'tcp_curr_estab' | 'tcp_time_wait' | 'tcp_orphan' | 'udp_inuse') =>
     sample.network_detail?.[key] ?? null;
-  const otherConntrack = (sample: LoadSample) => {
-    if (sample.conntrack_count === null || !sample.network_detail) return null;
-    const known =
-      (sample.network_detail.tcp_curr_estab ?? 0) +
-      (sample.network_detail.tcp_time_wait ?? 0) +
-      (sample.network_detail.tcp_orphan ?? 0) +
-      (sample.network_detail.udp_inuse ?? 0);
-    return Math.max(0, sample.conntrack_count - known);
-  };
   const hasPortPressure = samples.some(sample => sample.network_detail?.ephemeral_port_capacity != null);
   const primaryState = metricGroupState(metricStates, 0);
   const snapshotState = metricGroupState(metricStates, 1);
@@ -2162,7 +2155,8 @@ const NetworkHistory = memo(function NetworkHistory({
           meta={
             last.conntrack_count === null
               ? undefined
-              : read => `conntrack ${read(last.conntrack_count!)}${conntrackMax ? ` / ${read(conntrackMax)}` : ''}`
+              : read =>
+                  `主空间 conntrack ${read(last.conntrack_count!)}${conntrackMax ? ` / ${read(conntrackMax)}` : ''}`
           }
           max={conntrackMax && conntrackMax > 0 ? conntrackMax : undefined}
           threshold={
@@ -2172,51 +2166,32 @@ const NetworkHistory = memo(function NetworkHistory({
             {
               name: 'TCP 已建立',
               color: '--observe-system',
-              stack: 'conntrack',
-              area: true,
               values: historyValues(samples, sample => socketPart(sample, 'tcp_curr_estab')),
             },
             {
               name: 'TIME_WAIT',
               color: '--observe-iowait',
-              stack: 'conntrack',
-              area: true,
               values: historyValues(samples, sample => socketPart(sample, 'tcp_time_wait')),
             },
             {
               name: 'TCP orphan',
               color: '--observe-steal',
-              stack: 'conntrack',
-              area: true,
               values: historyValues(samples, sample => socketPart(sample, 'tcp_orphan')),
             },
             {
               name: 'UDP',
               color: '--observe-softirq',
-              stack: 'conntrack',
-              area: true,
               values: historyValues(samples, sample => socketPart(sample, 'udp_inuse')),
             },
             {
-              name: '其他',
+              name: '主空间跟踪',
               color: '--observe-user',
-              stack: 'conntrack',
-              area: true,
-              values: historyValues(samples, otherConntrack),
+              values: historyValues(samples, sample => sample.conntrack_count),
             },
-            ...(conntrackMax && conntrackMax > 0
-              ? [
-                  {
-                    name: '余量',
-                    color: '--observe-free',
-                    stack: 'conntrack',
-                    area: true,
-                    values: historyValues(samples, sample =>
-                      sample.conntrack_count === null ? null : Math.max(0, conntrackMax - sample.conntrack_count),
-                    ),
-                  },
-                ]
-              : []),
+            {
+              name: 'HY2 跟踪',
+              values: historyValues(samples, sample => detail(sample, value => value.hy2_conntrack_count)),
+            },
           ]}
         />
         {(!primaryState.ready || hasPortPressure) && (

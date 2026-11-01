@@ -1512,6 +1512,13 @@ fn load_metric_series(samples: &[LoadSample], metric_id: &str) -> Option<Vec<Opt
         "network.conntrack_count" => metric_series(samples, |sample| {
             sample.conntrack_count.map(|value| value as f64)
         }),
+        "network.hy2_conntrack_count" => metric_series(samples, |sample| {
+            sample
+                .network_detail
+                .as_ref()?
+                .hy2_conntrack_count
+                .map(|value| value as f64)
+        }),
         "network.tcp_curr_estab" => metric_series(samples, |sample| {
             sample
                 .network_detail
@@ -2715,6 +2722,20 @@ mod tests {
     #[test]
     fn metric_projection_rejects_unknown_selectors() {
         assert_eq!(load_metric_series(&[sample()], "cpu.not-a-field"), None);
+    }
+
+    #[test]
+    fn hy2_conntrack_projection_preserves_unknown_and_zero_separately() {
+        let old = sample();
+        let mut isolated = sample();
+        isolated
+            .network_detail
+            .get_or_insert_with(Default::default)
+            .hy2_conntrack_count = Some(0);
+        assert_eq!(
+            load_metric_series(&[old, isolated], "network.hy2_conntrack_count"),
+            Some(vec![None, Some(0.0)])
+        );
     }
 
     #[test]

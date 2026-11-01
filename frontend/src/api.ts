@@ -5106,6 +5106,8 @@ export interface DiskDetailSample {
 
 /** 新 Agent 上报的网络深度观测。连接/内存字段是窗口末快照，其余字段是该 30 秒窗口增量。 */
 export interface NetworkDetailSample {
+  hy2_netns_active?: boolean | null;
+  hy2_conntrack_count?: number | null;
   tcp_curr_estab: number | null;
   tcp_inuse: number | null;
   tcp_time_wait: number | null;

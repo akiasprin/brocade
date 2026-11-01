@@ -195,7 +195,7 @@ class Traffic:
 
 
 class Lab:
-    def __init__(self, case, output):
+    def __init__(self, case, output, inputs=Path('/inputs')):
         # A permitted private target stays entirely inside this network namespace.
         # Loopback is intentionally forbidden for managed user forwarding.
         subprocess.run(['ip', 'addr', 'add', '10.77.0.1/32', 'dev', 'lo'], check=True, timeout=5)
@@ -204,9 +204,9 @@ class Lab:
         self.state.mkdir(mode=0o700, exist_ok=True)
         self.xray = Path('/tmp/bin/xray')
         self.xray.parent.mkdir()
-        shutil.copy2('/inputs/xray', self.xray)
+        shutil.copy2(inputs / 'xray', self.xray)
         self.xray.chmod(0o755)
-        self.agent = '/inputs/agent'
+        self.agent = str(inputs / 'agent')
         self.env = {**os.environ, 'BROCADE_XRAY_BIN': str(self.xray)}
         self.processes, self.events, self.observations, self.receipts, self.usages = [], [], [], [], []
         self.desired, self.offer = None, None
@@ -342,7 +342,7 @@ class Lab:
                     'shortId': '0123456789abcdef'}}}]}
             private_json(Path('/tmp/client.json'), client_config)
             log = (output / 'client.log').open('wb')
-            self.client = subprocess.Popen(['/inputs/xray', 'run', '-config', '/tmp/client.json'], stdout=log, stderr=log)
+            self.client = subprocess.Popen([str(inputs / 'xray'), 'run', '-config', '/tmp/client.json'], stdout=log, stderr=log)
             self.processes.append(self.client)
             log.close()
         private_json(self.state / 'xray.json', self.base)

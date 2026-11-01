@@ -986,12 +986,7 @@ tune_conntrack() {
         want=$current
     fi
 
-    # udp_timeout_stream 是这里的主角：默认 120 秒，而端口跳转换过去的旧目的端口是**立刻**
-    # 废弃的，压两分钟纯粹是占位。砍到 60 秒直接把占用减半。
-    #
-    # 不砍得更狠是因为回程：落点回包时 conntrack 负责把源端口改回客户端发往的那个跳转端口，
-    # 表项一旦过期，服务端主动发的包就带着监听口的源端口出去，客户端那边 QUIC 会认不出来。
-    # hysteria2 的保活是十秒级，60 秒留了六倍余量。要再紧可以调，但那是拿余量换表容量。
+    # UDP 超时由 Agent 按 HY2 实际后端管理；保留旧值，不覆盖宿主机其他 UDP 服务。
     conf=/etc/sysctl.d/99-brocade.conf
     # 先删掉本函数以前写过的行再追加，否则重装一次就多一份。sysctl 是后者覆盖前者，重复不
     # 会出错，但一个越读越长的文件会让人以为有人手工改过。
@@ -1002,8 +997,6 @@ tune_conntrack() {
     if [ -f "$conf" ]; then
         grep -v \
             -e '^[[:space:]]*net\.netfilter\.nf_conntrack_max[[:space:]]*=' \
-            -e '^[[:space:]]*net\.netfilter\.nf_conntrack_udp_timeout[[:space:]]*=' \
-            -e '^[[:space:]]*net\.netfilter\.nf_conntrack_udp_timeout_stream[[:space:]]*=' \
             -e '^# Brocade: conntrack for Hysteria 2 port hopping\.$' \
             -e '^# 连接跟踪。hy2 端口跳转' \
             -e '^# 机器上是三四千条。' \
@@ -1015,8 +1008,6 @@ tune_conntrack() {
     if ! cat >> "$conf" <<SYSCTL
 # Brocade: conntrack for Hysteria 2 port hopping.
 net.netfilter.nf_conntrack_max = $want
-net.netfilter.nf_conntrack_udp_timeout = 30
-net.netfilter.nf_conntrack_udp_timeout_stream = 60
 SYSCTL
     then
         echo "写不了 $conf，跳过连接表调整。不影响安装。" >&2

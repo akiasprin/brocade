@@ -2255,9 +2255,9 @@ fn reconcile_pool(
     let health = bounded_parallel_map(
         &metadata.backends,
         RUNTIME_BACKENDS_PER_POOL,
-        |_, backend| {
+        |_, backend| -> Result<_, String> {
             if backend.failure_reason == Some(VpngateFailureReason::AdmissionRejected) {
-                return (backend.slot, backend.failure_reason);
+                return Ok((backend.slot, backend.failure_reason));
             }
             let spec = backend_namespace(pool, backend.slot);
             if let Some(reason) = backend_runtime_failure(
@@ -2268,18 +2268,20 @@ fn reconcile_pool(
                 &spec,
                 pool.socks_port,
             ) {
-                return (backend.slot, Some(reason));
+                return Ok((backend.slot, Some(reason)));
             }
+            reconcile_namespace_snat(&spec)?;
             let reason = (!egress_reachable(
                 &backend.peer_address,
                 pool.socks_port,
                 desired.health_probe_url.as_deref(),
             ))
             .then_some(brocade_deployment::protocol::VpngateFailureReason::EgressUnreachable);
-            (backend.slot, reason)
+            Ok((backend.slot, reason))
         },
     );
-    for (slot, reason) in health {
+    for result in health {
+        let (slot, reason) = result?;
         let Some(backend) = metadata
             .backends
             .iter_mut()
@@ -3652,6 +3654,10 @@ struct NamespaceSpec {
 }
 
 impl NamespaceSpec {
+    fn nat_source(&self) -> String {
+        format!("{}/32", self.peer_address)
+    }
+
     fn cidr(&self) -> String {
         let mut octets = self.host_address.octets();
         octets[3] &= !3;
@@ -3971,10 +3977,7 @@ fn setup_namespace(spec: &NamespaceSpec) -> Result<(), String> {
             ],
         )?;
         run("sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
-        ensure_iptables(
-            Some("nat"),
-            &["POSTROUTING", "-s", &spec.cidr(), "-j", "MASQUERADE"],
-        )?;
+        reconcile_namespace_snat(spec)?;
         ensure_iptables(
             None,
             &["FORWARD", "-i", &spec.host_interface, "-j", "ACCEPT"],
@@ -4002,6 +4005,10 @@ fn setup_namespace(spec: &NamespaceSpec) -> Result<(), String> {
 }
 
 fn cleanup_namespace(spec: &NamespaceSpec) -> Result<(), String> {
+    delete_iptables(
+        Some("nat"),
+        &["POSTROUTING", "-s", &spec.nat_source(), "-j", "MASQUERADE"],
+    );
     delete_iptables(
         Some("nat"),
         &["POSTROUTING", "-s", &spec.cidr(), "-j", "MASQUERADE"],
@@ -4103,6 +4110,49 @@ fn validate_namespace_resolver_file(path: &Path) -> Result<PathBuf, String> {
         return Err("VPN Gate DNS hook may only update a namespace resolver".to_owned());
     }
     Ok(expected)
+}
+
+// Only the namespace peer originates VPN traffic. Matching its entire /30 also
+// NATs the host-side address, which can belong to an unrelated wildcard listener.
+// Add the narrower rule before removing our exact previous rule so live tunnels
+// keep their egress while an Agent adopts existing backend processes.
+fn reconcile_namespace_snat(spec: &NamespaceSpec) -> Result<(), String> {
+    ensure_iptables(
+        Some("nat"),
+        &["POSTROUTING", "-s", &spec.nat_source(), "-j", "MASQUERADE"],
+    )?;
+    let old = spec.cidr();
+    let check = command_output(Command::new("iptables").args([
+        "-w",
+        "5",
+        "-t",
+        "nat",
+        "-C",
+        "POSTROUTING",
+        "-s",
+        &old,
+        "-j",
+        "MASQUERADE",
+    ]))?;
+    match check.status.code() {
+        Some(0) => run(
+            "iptables",
+            &[
+                "-w",
+                "5",
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-s",
+                &old,
+                "-j",
+                "MASQUERADE",
+            ],
+        ),
+        Some(1) => Ok(()),
+        _ => Err("cannot inspect the previous VPN Gate source NAT rule".to_owned()),
+    }
 }
 
 fn ensure_iptables(table: Option<&str>, rule: &[&str]) -> Result<(), String> {
@@ -4687,6 +4737,74 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    #[ignore = "requires hy2-netns/production.py in an owned Docker/KVM network namespace"]
+    fn namespace_snat_is_peer_scoped_and_converges_prior_rules() {
+        use std::net::UdpSocket;
+        let ancestor =
+            std::env::var("BROCADE_HY2_LAB_ANCESTOR_FD").expect("private lab guard required");
+        assert_ne!(
+            fs::read_link(format!("/proc/self/fd/{ancestor}")).unwrap(),
+            fs::read_link("/proc/self/ns/net").unwrap()
+        );
+        run("ip", &["link", "show", "wan"]).unwrap();
+        let spec = NamespaceSpec {
+            name: "brocade-vg-snat-test".into(),
+            host_interface: "bvsnath".into(),
+            peer_interface: "bvsnatn".into(),
+            host_address: "169.254.240.1".parse().unwrap(),
+            peer_address: "169.254.240.2".parse().unwrap(),
+        };
+        assert!(!Path::new("/sys/class/net")
+            .join(&spec.host_interface)
+            .exists());
+        struct Cleanup(NamespaceSpec);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = cleanup_namespace(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(spec.clone());
+        setup_namespace(&spec).unwrap();
+        // Recreate the previously shipped /30 rule while the tunnel is live.
+        ensure_iptables(
+            Some("nat"),
+            &["POSTROUTING", "-s", &spec.cidr(), "-j", "MASQUERADE"],
+        )
+        .unwrap();
+        let server = UdpSocket::bind("198.18.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let send_host = || {
+            let socket = UdpSocket::bind((spec.host_address, 0)).unwrap();
+            socket
+                .send_to(b"host-source-control", server.local_addr().unwrap())
+                .unwrap();
+            let mut bytes = [0; 64];
+            let (_, source) = server.recv_from(&mut bytes).unwrap();
+            source.ip()
+        };
+        assert_ne!(
+            send_host(),
+            std::net::IpAddr::V4(spec.host_address),
+            "old /30 source NAT positive control did not execute"
+        );
+        reconcile_namespace_snat(&spec).unwrap();
+        reconcile_namespace_snat(&spec).unwrap();
+        assert_eq!(
+            send_host(),
+            std::net::IpAddr::V4(spec.host_address),
+            "VPN NAT rewrote a host-side socket"
+        );
+        let script="import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3); s.sendto(b'vpn-peer-source-control',('198.18.0.2',18081)); assert s.recv(128)==b'vpn-peer-source-control'";
+        run(
+            "ip",
+            &["netns", "exec", &spec.name, "python3", "-c", script],
+        )
+        .unwrap();
+    }
 
     #[test]
     fn vpngate_capability_requires_an_openable_character_device() {

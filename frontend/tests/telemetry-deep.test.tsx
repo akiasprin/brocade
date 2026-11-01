@@ -761,6 +761,24 @@ describe('deep host telemetry', () => {
     expect(chartMock.connect).not.toHaveBeenCalled();
   });
 
+  it('keeps namespace conntrack counts separate from socket inventories', () => {
+    const value = reportWith(sample => {
+      sample.conntrack_count = 100;
+      sample.network_detail!.tcp_curr_estab = 8000;
+      sample.network_detail!.hy2_conntrack_count = 4200;
+    });
+    const view = render(<LoadCard report={value} />);
+    fireEvent.click(view.getByRole('button', { name: /连接表/ }));
+    const chart = chartMock.setOption.mock.calls.find(([option]) =>
+      option.series?.some((line: { name: string }) => line.name === 'HY2 跟踪'),
+    )?.[0];
+    expect(chart).toBeTruthy();
+    expect(chart.series.find((line: { name: string }) => line.name === '主空间跟踪').data.at(-1)[1]).toBe(100);
+    expect(chart.series.find((line: { name: string }) => line.name === 'HY2 跟踪').data.at(-1)[1]).toBe(4200);
+    expect(chart.series.every((line: { stack?: string }) => !line.stack)).toBe(true);
+    expect(chart.series.some((line: { name: string }) => line.name === '其他')).toBe(false);
+  });
+
   it('shows the last measured XRAY rate and time without dropping pending data to zero', async () => {
     const view = renderThroughput(report(), false, halfHour, [
       {

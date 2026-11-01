@@ -3026,6 +3026,12 @@ pub struct DiskDetailSample {
 /// averaging a current socket count that only has meaning at one instant.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NetworkDetailSample {
+    /// Separate from the host count: namespace isolation does not turn failed
+    /// collection into zero and these entries must not be subtracted from sockets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hy2_netns_active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hy2_conntrack_count: Option<u64>,
     /// TCP sockets currently in ESTABLISHED or CLOSE-WAIT (`Tcp.CurrEstab`).
     pub tcp_curr_estab: Option<u64>,
     /// IPv4 and IPv6 socket inventory. `alloc`, `orphan`, `tw` and memory are global kernel

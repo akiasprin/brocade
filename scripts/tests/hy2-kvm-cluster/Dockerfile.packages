@@ -1,0 +1,5 @@
+FROM brocade-hy2-docker-host:20261031
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::archives=/packages install -y --no-install-recommends \
+      ufw firewalld wireguard-tools \
+ && rm -rf /var/lib/apt/lists/*

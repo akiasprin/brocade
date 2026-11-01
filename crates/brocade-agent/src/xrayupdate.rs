@@ -166,6 +166,12 @@ pub(crate) fn observe_handoff_capability(
             reason: Some("Xray 发布正在进行".to_owned()),
         };
     }
+    if crate::hy2_network::restart_required(state_dir) {
+        return XrayHandoffCapability {
+            state: XrayHandoffState::Unsupported,
+            reason: Some("HY2 独立网络空间只支持重启更新".into()),
+        };
+    }
     if !xray_version_output
         .is_some_and(|output| crate::xray_version_has_capability(output, XRAY_HANDOFF_CAPABILITY))
     {
@@ -202,6 +208,9 @@ pub(crate) fn installed_xray_supports_handoff() -> bool {
 }
 
 pub(crate) fn config_handoff_unavailable_reason(state_dir: &Path, desired: &str) -> Option<String> {
+    if crate::hy2_network::restart_required(state_dir) {
+        return Some("HY2 独立网络空间只支持重启更新".into());
+    }
     let result = (|| -> Result<(), String> {
         let (process, _, status) = observe_serving_handoff_generation(state_dir)?;
         if !status.ready || !status.accepting || !status.retirement_supported {
@@ -3267,6 +3276,8 @@ fn preflight(candidate: &Path, offer: &XrayReleaseOffer, options: &Options) -> R
     }
     let config = options.state_dir.join("xray.json");
     if xray_enabled(&options.state_dir) {
+        let content = fs::read_to_string(&config).map_err(|e| e.to_string())?;
+        crate::hy2_network::preflight(&options.state_dir, &content, &program, false)?;
         let config = config.to_string_lossy().into_owned();
         run_command_with_timeout(
             &program,
@@ -3315,6 +3326,14 @@ fn perform_update(
         ));
     }
     if offer.strategy != XrayReleaseStrategy::Restart {
+        if crate::hy2_network::restart_required(&options.state_dir) {
+            return Some(failure_report(
+                options,
+                offer,
+                XrayReleaseOutcome::Unsupported,
+                "HY2 独立网络空间只支持 restart，未停止当前服务".into(),
+            ));
+        }
         return perform_handoff_update_at_target(options, meter, offer, candidate, &target);
     }
     Some(perform_update_at_target(
@@ -3336,6 +3355,9 @@ pub(crate) fn begin_config_handoff(
     desired_path: &Path,
     desired_grants: Option<&[brocade_deployment::plan::GrantInbound]>,
 ) -> Result<(), String> {
+    if crate::hy2_network::restart_required(state_dir) {
+        return Err("HY2 独立网络空间只支持重启更新".into());
+    }
     if deployment_id <= 0 {
         return Err("配置交接身份超出范围".to_owned());
     }
@@ -4780,12 +4802,13 @@ fn perform_update_at_target(
         );
     }
     let attempted = replace_executable(candidate, target)
-        .and_then(|()| start_and_restore_runtime(options, offer.sha256.as_str()));
+        .and_then(|()| start_and_restore_runtime(options, offer.sha256.as_str(), false));
     let recovery = match attempted {
         Ok(recovery) => recovery,
         Err(update_error) => {
-            let recovered = replace_executable(&backup, target)
-                .and_then(|()| start_and_restore_runtime(options, offer.previous_sha256.as_str()));
+            let recovered = replace_executable(&backup, target).and_then(|()| {
+                start_and_restore_runtime(options, offer.previous_sha256.as_str(), true)
+            });
             return match recovered {
                 Ok(recovery) if recovery.is_complete() => report_with_state(
                     offer,
@@ -4849,12 +4872,17 @@ fn perform_update_at_target(
 fn start_and_restore_runtime(
     options: &Options,
     expected_sha256: &str,
+    network_recovery: bool,
 ) -> Result<crate::XrayRuntimeRecovery, String> {
     let config = options.state_dir.join("xray.json");
     let content =
         fs::read_to_string(&config).map_err(|error| format!("读取当前 Xray 配置失败：{error}"))?;
     let api_address = crate::xray_api_address(&content).unwrap_or(crate::DEFAULT_XRAY_API_ADDRESS);
-    let recovery = crate::apply_xray(&config, api_address)?;
+    let recovery = if network_recovery {
+        crate::apply_xray_recovery(&config, api_address)?
+    } else {
+        crate::apply_xray(&config, api_address)?
+    };
     // The API listener can accept before the remaining inbound handlers finish starting. Keep
     // the all-listeners gate, but do not roll back a valid binary on that transient snapshot.
     wait_for_startup_health(STARTUP_HEALTH_TIMEOUT, || {
