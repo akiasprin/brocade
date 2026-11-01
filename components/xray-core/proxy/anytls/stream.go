@@ -39,7 +39,7 @@ type stream struct {
 	deliveryDoneHook  func()
 	deliveryFinished  bool
 	synAckReceived    atomic.Bool
-	startWorker       func(func())
+	startWorker       func(func()) bool
 
 	isUDP      bool
 	udpTarget  *xnet.Destination
@@ -170,7 +170,10 @@ func (st *stream) startDeliveryWorker(deliver func(buf.MultiBuffer) error) {
 			return
 		}
 		if st.startWorker != nil {
-			st.startWorker(func() { st.deliveryLoop(deliver) })
+			if !st.startWorker(func() { st.deliveryLoop(deliver) }) {
+				st.close(errSessionClosed)
+				st.discardDeliveryQueue()
+			}
 		} else {
 			go st.deliveryLoop(deliver)
 		}
@@ -256,19 +259,21 @@ func (st *stream) stopDelivery() {
 	st.deliveryStopOnce.Do(func() { close(st.deliveryStop) })
 }
 
-func (st *stream) deliveryLoop(deliver func(buf.MultiBuffer) error) {
-	defer func() {
-		for {
-			select {
-			case body := <-st.deliveryCh:
-				st.signalDeliverySpace()
-				buf.ReleaseMulti(body)
-			default:
-				st.finishDelivery()
-				return
-			}
+func (st *stream) discardDeliveryQueue() {
+	for {
+		select {
+		case body := <-st.deliveryCh:
+			st.signalDeliverySpace()
+			buf.ReleaseMulti(body)
+		default:
+			st.finishDelivery()
+			return
 		}
-	}()
+	}
+}
+
+func (st *stream) deliveryLoop(deliver func(buf.MultiBuffer) error) {
+	defer st.discardDeliveryQueue()
 	for {
 		select {
 		case body := <-st.deliveryCh:
