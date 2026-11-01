@@ -1,8 +1,8 @@
 # Canonical Xray source baseline; keep the upstream Go module path unchanged.
 repository = "https://github.com/XTLS/Xray-core.git"
-tag = "v26.10.21"
-commit = "1b1647cd9ddf0abc34b981d4611fc03bcac1ca74"
-imported_at = "2026-10-28"
+tag = "v26.10.31"
+commit = "a4a3dff5b20c2faae567b742c172c7b95e75c083"
+imported_at = "2026-10-31"
 license = "MPL-2.0"
 
 # Retained Brocade capabilities. Official Xray binaries do not provide these contracts.

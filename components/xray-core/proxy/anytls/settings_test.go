@@ -4,6 +4,8 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+
+	"github.com/xtls/xray-core/core"
 )
 
 func TestParseSettings(t *testing.T) {
@@ -55,7 +57,7 @@ func TestParseSettingsDefaultsAndVersionHandling(t *testing.T) {
 
 func TestClientMetadataContainsBrocadeBuildIdentity(t *testing.T) {
 	metadata := clientMetadata()
-	if !strings.HasPrefix(metadata, "brocade-xray/26.10.21+") {
+	if !strings.HasPrefix(metadata, "brocade-xray/"+core.Version()+"+") {
 		t.Fatalf("metadata = %q, missing version/build prefix", metadata)
 	}
 }

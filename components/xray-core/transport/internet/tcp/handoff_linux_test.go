@@ -1210,7 +1210,7 @@ func TestHandoffKeepAliveRebindFromMPTCP(t *testing.T) {
 	t.Setenv("GODEBUG", "multipathtcp=1")
 	for _, ip := range []string{"127.0.0.1", "::1"} {
 		t.Run(ip, func(t *testing.T) {
-			bound, err := internet.ListenSystem(context.Background(), &net.TCPAddr{IP: net.ParseIP(ip)}, nil)
+			bound, err := internet.ListenSystem(context.Background(), &net.TCPAddr{IP: net.ParseIP(ip)}, &internet.SocketConfig{TcpMptcp: true})
 			if err != nil {
 				t.Fatal(err)
 			}

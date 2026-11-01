@@ -4,6 +4,7 @@ go 1.27
 
 require (
 	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e
+	github.com/bufbuild/protocompile v0.14.1
 	github.com/ghodss/yaml v1.0.1-0.20220118164431-d8423dcdf344
 	github.com/golang/mock v1.7.0-rc.1
 	github.com/google/go-cmp v0.7.0
@@ -14,7 +15,7 @@ require (
 	github.com/miekg/dns v1.1.73
 	github.com/pelletier/go-toml v1.9.5
 	github.com/pion/stun/v3 v3.1.7
-	github.com/pires/go-proxyproto v0.15.0
+	github.com/pires/go-proxyproto v0.16.0
 	github.com/refraction-networking/utls v1.8.3-0.20260301010127-aa6edf4b11af
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/sagernet/sing v0.5.1
@@ -59,8 +60,14 @@ require (
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/tools v0.51.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
+	google.golang.org/grpc/cmd/protoc-gen-go-grpc v1.6.2 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gvisor.dev/gvisor v0.0.0-20260122175437-89a5d21be8f0 // indirect
 )
 
 replace github.com/xtls/reality => ./third_party/reality
+
+tool (
+	google.golang.org/grpc/cmd/protoc-gen-go-grpc
+	google.golang.org/protobuf/cmd/protoc-gen-go
+)

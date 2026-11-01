@@ -11038,7 +11038,7 @@ mod tests {
         assert!(upstream.contains(&format!("tag = \"{BROCADE_XRAY_VERSION}\"")));
         assert!(upstream.contains("anytls = true"));
         assert!(upstream.contains("sniffing_failure_routing = true"));
-        assert!(build_script.contains("const XRAY_UPSTREAM_BUILD: &str = \"1b1647c\""));
+        assert!(build_script.contains("const XRAY_UPSTREAM_BUILD: &str = \"a4a3dff\""));
         assert!(xray_builder.contains("core.build={build_id}"));
         for source in [build_script, xray_builder] {
             assert!(!source.contains("fn repository_build_id"));

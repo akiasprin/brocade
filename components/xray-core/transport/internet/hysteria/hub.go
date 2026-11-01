@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -391,7 +392,7 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		quicConfig.MaxIncomingStreams = 1024
 	}
 
-	pktConn, handoff, err := internet.ListenPacketWithHandoff(ctx, &net.UDPAddr{IP: address.IP(), Port: int(port)}, streamSettings)
+	pktConn, handoff, err := internet.ListenPacketWithHandoffInNamespace(ctx, &net.UDPAddr{IP: address.IP(), Port: int(port)}, streamSettings, os.Getenv("XRAY_BROCADE_HY2_NAMESPACE"))
 	if err != nil {
 		return nil, err
 	}

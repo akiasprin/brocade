@@ -64,6 +64,18 @@ func OpenPacketHandoffListener(logicalAddress string, config *SocketConfig, bind
 // Generation identity and admission belong to that socket, while the transport
 // must receive the masked connection to preserve its wire protocol.
 func ListenPacketWithHandoff(ctx context.Context, addr *net.UDPAddr, settings *MemoryStreamConfig) (net.PacketConn, PacketHandoffGate, error) {
+	return listenPacketWithHandoff(ctx, addr, settings, ListenSystemPacket)
+}
+
+// ListenPacketWithHandoffInNamespace keeps lifecycle and masks unchanged while
+// selecting the network namespace only for this inbound's raw UDP socket.
+func ListenPacketWithHandoffInNamespace(ctx context.Context, addr *net.UDPAddr, settings *MemoryStreamConfig, policy string) (net.PacketConn, PacketHandoffGate, error) {
+	return listenPacketWithHandoff(ctx, addr, settings, func(ctx context.Context, actual net.Addr, config *SocketConfig) (net.PacketConn, error) {
+		return listenPacketNamespace(ctx, actual, config, addr.String(), policy)
+	})
+}
+
+func listenPacketWithHandoff(ctx context.Context, addr *net.UDPAddr, settings *MemoryStreamConfig, bind func(context.Context, net.Addr, *SocketConfig) (net.PacketConn, error)) (net.PacketConn, PacketHandoffGate, error) {
 	var config *SocketConfig
 	if settings != nil {
 		config = settings.SocketSettings
@@ -77,7 +89,7 @@ func ListenPacketWithHandoff(ctx context.Context, addr *net.UDPAddr, settings *M
 	bound := false
 	listenPacket := func(ctx context.Context, addr net.Addr) (net.PacketConn, error) {
 		if controller == nil {
-			return ListenSystemPacket(ctx, addr, config)
+			return bind(ctx, addr, config)
 		}
 		if bound {
 			return nil, fmt.Errorf("UDP handoff cannot manage multiple sockets for one masked listener")
@@ -89,7 +101,7 @@ func ListenPacketWithHandoff(ctx context.Context, addr *net.UDPAddr, settings *M
 			if err != nil {
 				return nil, err
 			}
-			return ListenSystemPacket(ctx, udpAddress, config)
+			return bind(ctx, udpAddress, config)
 		})
 		return raw, err
 	}
