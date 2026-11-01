@@ -9258,6 +9258,11 @@ textarea.f::placeholder {
   border-bottom: 1px solid var(--line-soft);
   background: var(--band);
 }
+/* 运行状态与上方流量卡共用连续卡面，标题不再单独铺色带或分隔线。 */
+.nd-tab-observed > .nd-runtime > header {
+  border-bottom: 0;
+  background: none;
+}
 /* 门面标题表达整个页面或名册的入口层级；只提升本栏，不向内部内容面板传递高度。 */
 .panel.titled[data-page-title='true'] > header {
   min-height: var(--page-title-h);
@@ -10996,17 +11001,42 @@ input.f {
   width: 190px;
 }
 .rule-action-cell {
+  min-width: 0;
+}
+/* 单元格保留 table-cell，换行只发生在内部；否则浏览器会补匿名单元格，
+   动作格的边框和行高便无法与匹配、操作两列对齐。 */
+.rule-action-fields,
+.rule-dial-fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  white-space: normal;
+}
+.rule-action-cell .rule-action-fields > *,
+.rule-action-cell .rule-dial-fields > * {
+  margin-left: 0;
+  max-width: 100%;
+}
+.rule-action-fields > .external-target-picker {
+  flex: 1 1 180px;
+  width: auto;
+  min-width: 160px;
+  max-width: 330px;
+}
+.rule-dial-fields {
+  max-width: 100%;
+}
+.rule-dial-fields > .mono {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.rule-operations-cell {
   white-space: nowrap;
 }
 .rule-action-select {
   width: 112px;
-  font-weight: 500;
-}
-.rule-action-select:is(.rule-action-forward, .rule-action-egress),
-.rule-ro[disabled] .rule-action-select:is(.rule-action-forward, .rule-action-egress) {
-  color: var(--ink-2);
-  border-color: color-mix(in srgb, var(--ink-3) 30%, var(--line));
-  background-color: color-mix(in srgb, var(--ink) 3%, var(--sunk));
 }
 .rule-action-select.rule-action-block,
 .rule-ro[disabled] .rule-action-select.rule-action-block {
@@ -11120,7 +11150,15 @@ input.f {
 }
 @container rules (max-width: 1050px) {
   .rule-table .rule-match-cell {
-    width: auto;
+    width: 190px;
+    white-space: normal;
+  }
+  .rule-table .rule-match-cell > .f {
+    display: block;
+    max-width: 100%;
+  }
+  .rule-table .rule-match-cell > .f + .f {
+    margin: 6px 0 0;
   }
 }
 @container rules (max-width: 1800px) {
@@ -11138,6 +11176,7 @@ input.f {
 }
 .rule-table td {
   padding: 5px 7px;
+  vertical-align: top;
 }
 .rule-table td:first-child {
   width: 18px !important;
@@ -11234,23 +11273,16 @@ input.f {
    桌面是一张表：序号 | 匹配 | 动作 | 重排，一行铺开。窄下来单行放不下——动作格里还
    串着转发目标、走法、推导地址，DNS 策略还有多个并排参数。分三档，且
    **表结构保持不变**（tests 依赖 tbody/tr/td、兜底 `*`、每行四格）：
-   · ≤1440px：动作格改 flex 换行，目标 / 走法落到动作选择器下方，不再横向溢出；
+   · ≤1440px：动作格内部按组换行，走法和地址一起落到目标下方；
      DNS 参数缩短但仍维持一行，优先利用移除说明标签后腾出的空间。
-   · ≤1050px：匹配格放开定宽（上方独立的 1050px 断点块）。
+   · ≤1050px：匹配类别和值上下排列；DNS 地址单独一行，为其他参数和操作留出空间。
    · ≤640px：整行折成卡片——序号做抬头、重排做卡脚，匹配 / 动作各补一枚小标签，
      控件占满整宽，DNS 参数落成一列、这一跳逐项一行。
-   所有规则表统一使用 `.rule-table`，链路规则、线路里的 XRAY 链路和机器 DNS 策略不再
-   分别维护一份响应式选择器。 */
+   `.rule-table` 提供共用控件和 DNS 参数适配；下方 `.rule-editor-table` 将链路规则
+   按「匹配 → 去向」收紧为连续列表。 */
 @container rules (max-width: 1440px) {
-  /* 动作格里 inline 子元素之间未必有空白文本节点，white-space 不足以断行，改 flex-wrap。 */
-  .rule-table .rule-action-cell {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
-  }
-  .rule-table .rule-action-cell > :is(.egress-dns-reference, .egress-dns-editor, .egress-dns-usage) {
-    margin-left: 0;
+  .rule-dial-fields {
+    flex-basis: 100%;
   }
   .egress-dns-choice {
     width: 136px;
@@ -11262,6 +11294,21 @@ input.f {
   .egress-dns-endpoint {
     grid-template-columns: minmax(90px, 1fr) 4px 52px;
     gap: 3px;
+  }
+}
+
+@container rules (max-width: 1050px) {
+  .egress-dns-editor {
+    flex: 1 1 100%;
+    grid-template-columns: 68px minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .egress-dns-endpoint {
+    grid-column: 1 / -1;
+  }
+  .egress-dns-error {
+    grid-column: 1 / -1;
+    grid-row: auto;
+    max-width: 100%;
   }
 }
 
@@ -11313,9 +11360,18 @@ input.f {
     min-height: 26px;
   }
   .rule-table > tbody > tr > td.rule-action-cell {
+    display: block !important;
+    margin-top: 7px;
+  }
+  .rule-table .rule-action-fields,
+  .rule-table .rule-dial-fields {
+    flex-basis: auto;
     flex-direction: column;
     align-items: stretch;
-    margin-top: 7px;
+  }
+  .rule-table .rule-action-fields > .external-target-picker {
+    flex: none;
+    max-width: none;
   }
   .rule-table .rule-match-cell::before,
   .rule-table .rule-action-cell::before {
@@ -11334,8 +11390,10 @@ input.f {
     content: '动作';
   }
   /* 匹配：类别定宽，值占余下整行 */
-  .rule-table .rule-match-cell > .f {
+  .rule-table .rule-match-cell > .f,
+  .rule-table .rule-match-cell > .f + .f {
     margin-left: 0 !important;
+    margin-top: 0;
   }
   .rule-table .rule-match-cell select.f {
     flex: 0 0 auto;
@@ -11349,9 +11407,6 @@ input.f {
     min-width: 0;
   }
   /* 动作：逐项整宽堆叠 */
-  .rule-table .rule-action-cell > * {
-    margin-left: 0 !important;
-  }
   .egress-dns-reference {
     display: flex;
     flex-direction: column;
@@ -11460,6 +11515,293 @@ input.f {
   }
   .rule-editor .hopfld-sep {
     display: none;
+  }
+}
+
+/* 链路规则按「匹配 → 去向」连续阅读。条件是一组字段，连接方式和推导地址降为
+   去向下方的次行；仅用横向分隔区分规则，避免把每个字段围成独立的格子。 */
+.rule-editor-table {
+  table-layout: fixed;
+}
+.rule-editor-table .rule-number-column {
+  width: 30px;
+}
+.rule-editor-table .rule-match-column {
+  width: 32%;
+}
+.rule-editor-table .rule-tools-column {
+  width: 96px;
+}
+.rule-editor-table :is(th, td) {
+  padding: 8px;
+  border-inline: 0;
+  border-top: 0;
+  border-bottom: 1px solid var(--line-soft);
+  background: transparent;
+}
+.rule-editor-table thead th {
+  padding-block: 7px;
+  color: var(--ink-4);
+  font: 10px var(--sans);
+}
+.rule-editor-table .rule-tools-heading {
+  text-align: right;
+}
+.rule-editor-table td:first-child {
+  padding-top: 15px;
+  color: var(--ink-4);
+  font-size: 10px;
+}
+.rule-editor-table .rule-match-cell {
+  width: auto;
+  white-space: normal;
+}
+.rule-match-fields {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+}
+.rule-match-fields:focus-within {
+  border-color: var(--action);
+}
+.rule-editor-table .rule-match-fields > .f {
+  height: calc(var(--ctl-h) - 2px);
+  min-height: calc(var(--ctl-h) - 2px);
+  margin: 0;
+  padding-block: 0;
+  border: 0;
+  border-radius: 0;
+  background-color: transparent;
+  box-shadow: none;
+  font-size: 12px;
+}
+.rule-editor-table .rule-match-fields > :is(select.f, .rule-readonly-select) {
+  flex: 0 0 96px;
+  width: 96px;
+  min-width: 0;
+  padding-inline: 8px 20px;
+  border-right: 1px solid var(--line-soft);
+  color: var(--ink-3);
+}
+.rule-editor-table .rule-match-fields > :is(input.f, .rule-readonly-value) {
+  flex: 1 1 0;
+  width: 0;
+  min-width: 0;
+  padding-inline: 9px;
+}
+.rule-match-fields:has(> :only-child) {
+  width: max-content;
+  max-width: 100%;
+}
+.rule-editor-table .rule-match-fields > :only-child {
+  border-right: 0;
+}
+.rule-editor-table .rule-action-fields {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  align-items: start;
+  gap: 6px;
+}
+.rule-editor-table .machine-dns-shared-row .rule-action-fields {
+  grid-template-columns: minmax(0, 1fr);
+}
+.rule-editor-table .machine-dns-shared-row .egress-dns-editor {
+  grid-column: 1 / -1;
+}
+.rule-editor-table .rule-fallback-row .rule-action-fields:not(:has(> .rule-action-select)) {
+  display: flex;
+}
+.rule-editor-table .rule-action-select {
+  width: 104px;
+  min-width: 0;
+  height: var(--ctl-h);
+}
+.rule-editor-table .rule-action-fields > .external-target-picker {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+}
+.rule-editor-table .external-target-trigger,
+.rule-editor-table .external-target-trigger.node-target,
+.rule-editor-table .external-target-trigger.listener-target {
+  min-height: var(--ctl-h);
+  border-color: var(--line);
+  background: var(--sunk);
+}
+.rule-editor-table .external-target-trigger[aria-expanded='true'] {
+  border-color: var(--action);
+  background: var(--action-wash);
+}
+.rule-editor-table .external-target-trigger .external-target-kind,
+.rule-editor-table .external-target-trigger.node-target .external-target-kind,
+.rule-editor-table .external-target-trigger.listener-target .external-target-kind {
+  min-width: 28px;
+  padding: 1px 4px;
+  border-color: transparent;
+  background: var(--hover);
+  color: var(--ink-3);
+  font-size: 8px;
+}
+.rule-editor-table .rule-dial-fields {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  grid-column: 1 / -1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.rule-editor-table .rule-dial-fields > .mono:only-child {
+  grid-column: 1 / -1;
+}
+.rule-editor-table .rule-dial-fields > .mono {
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.rule-row-actions {
+  display: inline-flex;
+  gap: 1px;
+}
+.rule-editor-table .rule-operations-cell {
+  padding-inline: 0;
+  text-align: right;
+}
+.rule-editor-table .rule-row-actions .btn {
+  width: 30px;
+  min-width: 0;
+  min-height: var(--ctl-h);
+  margin: 0;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--ink-3);
+}
+.rule-editor-table .rule-row-actions .btn:disabled {
+  opacity: 0.22;
+}
+@media (hover: hover) {
+  .rule-editor-table .external-target-trigger:hover {
+    border-color: var(--action);
+    background: var(--action-wash);
+  }
+  .rule-editor-table .rule-row-actions .btn:hover:not(:disabled) {
+    color: var(--ink);
+    background: var(--hover);
+  }
+  .rule-editor-table .rule-row-actions .danger:hover:not(:disabled) {
+    color: var(--err);
+    background: color-mix(in srgb, var(--err) 8%, transparent);
+  }
+}
+.rule-editor-table .rule-fallback-sign {
+  font-size: 9px;
+}
+@container rules (640px < width <= 1050px) {
+  .rule-editor-table .rule-match-fields:has(> :nth-child(2)) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+    gap: 6px;
+    border: 0;
+    background: transparent;
+  }
+  .rule-editor-table .rule-match-fields:has(> :nth-child(2)) > .f {
+    width: 100%;
+    height: var(--ctl-h);
+    min-height: var(--ctl-h);
+    box-sizing: border-box;
+    border: 1px solid var(--line);
+    border-radius: var(--r-ctl);
+    background-color: var(--sunk);
+  }
+  .rule-editor-table .rule-match-fields:has(> :nth-child(2)) > .f:focus {
+    border-color: var(--action);
+  }
+}
+@container rules (min-width: 1441px) {
+  .rule-editor-table .rule-action-fields:has(> .rule-dial-fields) {
+    grid-template-columns: 104px minmax(160px, 0.85fr) minmax(0, 1.15fr);
+  }
+  .rule-editor-table .rule-dial-fields {
+    grid-column: 3;
+    min-height: var(--ctl-h);
+  }
+}
+@container rules (max-width: 640px) {
+  .rule-editor-table > colgroup,
+  .rule-editor-table > thead {
+    display: none;
+  }
+  .rule-editor-table > tbody > tr {
+    display: grid;
+    grid-template-columns: 18px minmax(0, 1fr) 92px;
+    gap: 8px;
+    margin: 0;
+    padding: 12px 0;
+    border: 0;
+    border-bottom: 1px solid var(--line-soft);
+    border-radius: 0;
+    background: transparent;
+  }
+  .rule-editor-table.rule-editor-readonly > tbody > tr {
+    grid-template-columns: 18px minmax(0, 1fr);
+  }
+  .rule-editor-table > tbody > tr > td {
+    min-width: 0;
+    margin: 0;
+    border: 0;
+  }
+  .rule-editor-table > tbody > tr > td:first-child {
+    grid-column: 1;
+    grid-row: 1;
+    align-self: center;
+    margin: 0;
+    padding: 0 !important;
+    border: 0;
+  }
+  .rule-editor-table > tbody > tr > td.rule-match-cell {
+    display: block !important;
+    grid-column: 2;
+    grid-row: 1;
+    padding: 0 !important;
+  }
+  .rule-editor-table > tbody > tr > td.rule-action-cell {
+    grid-column: 2 / -1;
+    grid-row: 2;
+    margin: 0;
+    padding: 0 !important;
+  }
+  .rule-editor-table .rule-match-cell::before,
+  .rule-editor-table .rule-action-cell::before {
+    content: none;
+  }
+  .rule-editor-table .rule-match-fields > :is(select.f, .rule-readonly-select) {
+    flex-basis: 78px;
+    width: 78px !important;
+    min-width: 0;
+    font-size: 11px;
+  }
+  .rule-editor-table .rule-action-fields {
+    grid-template-columns: 104px minmax(0, 1fr);
+  }
+  .rule-editor-table .rule-action-fields > .external-target-picker {
+    display: block;
+  }
+  .rule-editor-table > tbody > tr > td:last-child:not(.rule-action-cell) {
+    grid-column: 3;
+    grid-row: 1;
+    margin: 0;
+    padding: 0 !important;
+    border: 0;
+  }
+  .rule-editor-table .rule-action-fields .rule-action-select {
+    width: 104px !important;
+  }
+  .rule-editor-table .egress-dns-editor {
+    grid-column: 1 / -1;
   }
 }
 
@@ -28800,6 +29142,7 @@ body.observe-brushing .observe-chart-tip {
 }
 .external-target-trigger {
   display: grid;
+  box-sizing: border-box;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;

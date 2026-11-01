@@ -24,8 +24,10 @@ for (const [width, theme] of [
       await expect(page.locator('.nd-tabs')).toHaveScreenshot(`observation-tabs-${width}-${theme}-${badge}.png`);
       const runtime = page.locator('.nd-runtime');
       await runtime.scrollIntoViewIfNeeded();
+      await expect(runtime.locator(':scope > header')).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+      await expect(runtime.locator(':scope > header')).toHaveCSS('border-bottom-width', '0px');
       if (badge) await expect(runtime.getByText(/握手超过 180 秒/)).toBeVisible();
-      await expect(runtime).toHaveScreenshot(`runtime-${width}-${theme}-${badge}.png`);
+      await expect(runtime).toHaveScreenshot(`runtime-${width}-${theme}-${badge}.png`, { threshold: 0.01 });
       expect(errors).toEqual([]);
     });
   }

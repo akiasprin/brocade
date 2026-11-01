@@ -304,7 +304,7 @@ describe('machine-scoped egress DNS', () => {
       [],
     );
     const matchSelects = () =>
-      Array.from(view.container.querySelectorAll<HTMLSelectElement>('td.rule-match-cell > select'));
+      Array.from(view.container.querySelectorAll<HTMLSelectElement>('td.rule-match-cell select'));
 
     expect(matchSelects().map(select => select.value)).toEqual(['geosite', 'any']);
     fireEvent.click(view.getByRole('button', { name: '＋ 嗅探失败兜底' }));
@@ -662,9 +662,7 @@ describe('machine-scoped egress DNS', () => {
   it('states the group input and machine-wide DNS limitation plainly', () => {
     const view = renderMachineRules();
 
-    const hint = view.getByText(
-      'DNS 地址可用逗号分隔，最多 3 个，同组竞速。Xray 的解析结果无法按出站隔离。',
-    );
+    const hint = view.getByText('DNS 地址可用逗号分隔，最多 3 个，同组竞速。Xray 的解析结果无法按出站隔离。');
     expect(hint.classList.contains('note')).toBe(true);
     expect(hint.classList.contains('st-warn')).toBe(false);
     expect(hint.classList.contains('err')).toBe(false);
@@ -905,9 +903,7 @@ describe('machine-scoped egress DNS', () => {
   it('shows group input guidance and the DNS limitation in the chain editor', () => {
     const view = renderEditor();
 
-    expect(
-      view.getByText('DNS 地址可用逗号分隔，最多 3 个，同组竞速。Xray 的解析结果无法按出站隔离。'),
-    ).toBeTruthy();
+    expect(view.getByText('DNS 地址可用逗号分隔，最多 3 个，同组竞速。Xray 的解析结果无法按出站隔离。')).toBeTruthy();
   });
 
   it('highlights the NODE target instead of the Forward action and keeps focus on the trigger', () => {

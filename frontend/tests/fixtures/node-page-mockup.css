@@ -1,0 +1,807 @@
+/* 机器页重新设计 mockup。外壳、标题栏与详情页是生产的；这里只补评审条（mk-）和方案部件（np-）。
+   颜色全部取生产令牌（柔和蓝调色盘），方案只改排版、面与读数的组织。 */
+
+/* ── 评审外壳：不属于设计 ── */
+html[data-mk-replace='true'] .fg-view > :not(.mk-slot) {
+  display: none !important;
+}
+.mk-slot {
+  display: contents;
+}
+.mk-dock {
+  position: fixed;
+  left: 50%;
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  z-index: 2147483000;
+  transform: translateX(-50%);
+  display: grid;
+  gap: 6px;
+  width: max-content;
+  max-width: min(760px, calc(100vw - 24px));
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border: 1px dashed color-mix(in srgb, var(--ink-3) 60%, transparent);
+  border-radius: 14px;
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+  backdrop-filter: blur(14px) saturate(1.4);
+  box-shadow: var(--shadow);
+  color: var(--ink-2);
+  font: 12px/1.4 var(--sans);
+}
+.mk-dock.folded {
+  padding: 4px;
+}
+.mk-dock-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.mk-dock-row select {
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--sunk);
+  color: var(--ink-2);
+  font: 12px var(--sans);
+}
+.mk-dock-note {
+  max-width: 720px;
+  margin: 0;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.mk-dock-common {
+  display: block;
+  margin-top: 3px;
+  color: var(--ink-4);
+}
+.mk-fold,
+.mk-unfold {
+  appearance: none;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--ink-3);
+  font: 12px var(--sans);
+  cursor: pointer;
+}
+.mk-fold {
+  width: 26px;
+  height: 26px;
+  margin-left: auto;
+  font-size: 15px;
+}
+.mk-unfold {
+  padding: 5px 10px;
+}
+.mk-fold:hover,
+.mk-unfold:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+@media (max-width: 720px) {
+  .mk-dock {
+    left: 12px;
+    right: 12px;
+    width: auto;
+    transform: none;
+  }
+  .mk-dock-row:first-child {
+    flex-wrap: nowrap;
+  }
+  .mk-dock-row:first-child > .segsw {
+    min-width: 0;
+    flex: 1 1 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .mk-dock-row:first-child > .segsw > button {
+    flex: none;
+  }
+  .mk-dock-note {
+    display: none;
+  }
+}
+/* 评审条浮在页面底部，给最后一行内容留出位置。 */
+html[data-mk-replace='true'] .fg-view {
+  padding-bottom: 120px;
+}
+
+/* ══ 方案共用 ══ */
+.np-page,
+.np-split {
+  --np-fill: color-mix(in srgb, var(--ink) 4.5%, var(--block));
+  --np-fill-hover: color-mix(in srgb, var(--ink) 7.5%, var(--block));
+  --np-hair: color-mix(in srgb, var(--ink) 8%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+:root[data-theme='light'] :is(.np-page, .np-split) {
+  --np-fill: color-mix(in srgb, var(--ink) 3.6%, var(--block));
+  --np-fill-hover: color-mix(in srgb, var(--ink) 6%, var(--block));
+  --np-hair: color-mix(in srgb, var(--ink) 9%, transparent);
+}
+.np-loading {
+  min-height: 320px;
+}
+.np-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.np-name.mono {
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.np-flag {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+}
+.np-flag .geo-flag {
+  width: 18px;
+  height: 12px;
+  border-radius: 2.5px;
+  box-shadow: 0 0 0 0.5px color-mix(in srgb, var(--ink) 22%, transparent);
+}
+.np-flag-none {
+  display: block;
+  width: 18px;
+  height: 12px;
+  border-radius: 2.5px;
+  background: color-mix(in srgb, var(--ink) 12%, transparent);
+}
+.np-pick {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--action);
+}
+.np-status {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.np-status > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.np-status.warn {
+  color: var(--gold);
+}
+.np-status.bad {
+  color: var(--err);
+}
+.np-status.idle,
+.np-status.ok {
+  color: var(--ink-3);
+  font-weight: 400;
+}
+.np-status-icon {
+  display: inline-flex;
+  flex: none;
+}
+.np-rate {
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.np-rate small,
+.np-roster-rate small,
+.np-tile-rate small {
+  margin-left: 3px;
+  color: var(--ink-3);
+  font-size: 0.72em;
+  font-weight: 400;
+}
+.np-rate.none {
+  color: var(--ink-4);
+  font-weight: 400;
+}
+.np-latency {
+  display: inline-flex;
+  flex: none;
+  align-items: baseline;
+  gap: 0;
+  color: var(--ink-3);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.np-latency > span + span::before {
+  content: '·';
+  margin: 0 4px;
+  color: var(--ink-4);
+}
+.np-latency .lost {
+  color: var(--ink-4);
+}
+.np-latency small {
+  margin-left: 3px;
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.np-latency.stale {
+  opacity: 0.55;
+}
+.np-addr {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.np-addr.none {
+  color: var(--ink-4);
+}
+.np-pct {
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 500;
+}
+.np-pct.warn {
+  color: var(--gold);
+}
+.np-pct.bad {
+  color: var(--err);
+}
+.np-bar {
+  position: relative;
+  display: block;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--ink) 11%, transparent);
+}
+.np-bar > i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: var(--data);
+}
+.np-bar.warn > i {
+  background: var(--gold);
+}
+.np-bar.bad > i {
+  background: var(--err);
+}
+.np-ring.warn .value {
+  stroke: var(--gold);
+}
+.np-ring.bad .value {
+  stroke: var(--err);
+}
+
+/* 走势：曲线取数据色，异常两档取状态色；面积是同色由浓到淡的渐变。 */
+.np-spark {
+  display: block;
+  width: 100%;
+  overflow: visible;
+  color: var(--data);
+}
+.np-spark.empty {
+  border-bottom: 1px dashed var(--np-hair);
+}
+.np-spark .line {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+.np-spark .base {
+  fill: none;
+  stroke: color-mix(in srgb, currentColor 35%, transparent);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.np-spark.tone-warn {
+  color: var(--gold);
+}
+.np-spark.tone-bad {
+  color: var(--err);
+}
+.np-spark.tone-idle {
+  color: var(--ink-4);
+}
+
+/* 可点的面：悬停换一档填充，按下微缩，键盘焦点是一圈操作色。 */
+:is(.np-widget, .np-tile, .np-row) {
+  cursor: pointer;
+  outline: none;
+  transition:
+    background-color 0.15s ease,
+    box-shadow 0.15s ease,
+    transform 0.12s ease;
+}
+:is(.np-widget, .np-tile, .np-row):focus-visible {
+  box-shadow: 0 0 0 2px var(--action);
+}
+:is(.np-widget, .np-tile):active {
+  transform: scale(0.985);
+}
+:is(.np-widget, .np-tile, .np-row).off {
+  opacity: 0.5;
+}
+:is(.np-widget, .np-tile).picked {
+  box-shadow: inset 0 0 0 2px var(--action);
+}
+
+/* ══ A 小组件 ══ */
+.np-widgets {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(272px, 1fr));
+  gap: 12px;
+}
+.np-widget {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 12px;
+  box-sizing: border-box;
+  padding: 14px 16px 15px;
+  border-radius: 16px;
+  background: var(--np-fill);
+}
+@media (hover: hover) and (pointer: fine) {
+  .np-widget:hover {
+    background: var(--np-fill-hover);
+  }
+}
+.np-w-head {
+  display: flex;
+  min-width: 0;
+  height: 20px;
+  align-items: center;
+  gap: 8px;
+}
+.np-w-head .np-name {
+  flex: 1;
+}
+.np-w-head .np-status {
+  max-width: 58%;
+}
+.np-w-live {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: end;
+  gap: 16px;
+}
+.np-w-live .np-rate {
+  font-size: 24px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 26px;
+}
+.np-w-live .np-rate small {
+  font-size: 12px;
+}
+.np-w-live .np-rate.none {
+  font-size: 22px;
+}
+.np-w-month {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 5px;
+  margin-top: -2px;
+  color: var(--ink-3);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.np-w-month-label {
+  color: var(--ink-3);
+}
+.np-w-month b {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+.np-w-month b.none {
+  color: var(--ink-4);
+  font-weight: 400;
+}
+.np-w-quota {
+  color: var(--ink-3);
+}
+.np-widget > .np-bar {
+  margin-top: -6px;
+}
+@media (max-width: 560px) {
+  .np-widgets {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+}
+
+/* ══ B 清单 ══
+   一行一台：所有行共用同一组列宽（--np-cols），数字右对齐，纵向扫读即可比较。
+   行间是从文字起点开始的发丝线，悬停整行换底。 */
+.np-list {
+  display: grid;
+  margin: -2px -4px 0;
+}
+.np-list-head,
+.np-row {
+  display: grid;
+  grid-template-columns: var(--np-cols);
+  align-items: center;
+  column-gap: 14px;
+  padding: 0 12px;
+}
+.np-list-head {
+  min-height: 30px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.np-list-head small {
+  font-size: inherit;
+}
+.np-row {
+  position: relative;
+  min-height: 56px;
+  box-sizing: border-box;
+  border-radius: 10px;
+}
+.np-row::before {
+  position: absolute;
+  top: 0;
+  right: 12px;
+  left: 46px;
+  height: 1px;
+  background: var(--np-hair);
+  content: '';
+}
+.np-row.selecting::before {
+  left: 78px;
+}
+@media (hover: hover) and (pointer: fine) {
+  .np-row:hover {
+    background: var(--np-fill);
+  }
+  .np-row:hover::before,
+  .np-row:hover + .np-row::before {
+    opacity: 0;
+  }
+}
+.np-row.picked {
+  background: color-mix(in srgb, var(--action) 10%, transparent);
+}
+.np-c-name {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+.np-c-name .np-status,
+.np-c-name .np-addr {
+  line-height: 16px;
+}
+.np-c-wave {
+  min-width: 0;
+}
+.np-c-rate,
+.np-c-ping {
+  justify-self: end;
+  text-align: right;
+}
+.np-c-rate .np-rate {
+  font-size: 14px;
+  font-weight: 600;
+}
+.np-c-month {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+.np-list-head .np-c-month {
+  display: block;
+}
+.np-month-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.np-month-line b,
+.np-c-month > b {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 500;
+}
+.np-c-month > b.none {
+  color: var(--ink-4);
+  font-weight: 400;
+}
+.np-unlimited {
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.np-c-month > .np-unlimited {
+  line-height: 4px;
+}
+.np-c-ping {
+  color: var(--ink-2);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.np-c-ping small {
+  margin-left: 2px;
+  color: var(--ink-4);
+  font-size: 10.5px;
+}
+.np-list-head .np-c-ping {
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.np-c-ping.lost {
+  color: var(--ink-4);
+}
+.np-c-ping.stale {
+  opacity: 0.5;
+}
+.np-chevron {
+  display: block;
+  width: 7px;
+  height: 7px;
+  border-top: 1.5px solid var(--ink-4);
+  border-right: 1.5px solid var(--ink-4);
+  transform: rotate(45deg);
+}
+.np-row:hover .np-chevron {
+  border-color: var(--ink-3);
+}
+@media (max-width: 1080px) {
+  .np-list :is(.np-list-head, .np-row) > .np-c-wave {
+    display: none;
+  }
+  .np-list :is(.np-list-head, .np-row) {
+    grid-template-columns: var(--np-cols-narrow);
+  }
+}
+/* 手机：两行一台。左边旗与名称、地址或原因；右边当前速率与本月额度。 */
+@media (max-width: 820px) {
+  .np-list {
+    margin: -4px -6px 0;
+  }
+  .np-list-head {
+    display: none;
+  }
+  .np-list-head + .np-row::before {
+    display: none;
+  }
+  .np-list .np-row {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      'flag name rate'
+      'flag name month';
+    row-gap: 2px;
+    min-height: 58px;
+    padding: 9px 10px;
+  }
+  .np-list .np-row.selecting {
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      'pick flag name rate'
+      'pick flag name month';
+  }
+  .np-row::before {
+    left: 42px;
+    right: 10px;
+  }
+  .np-row.selecting::before {
+    left: 70px;
+  }
+  .np-row > .np-c-pick {
+    grid-area: pick;
+  }
+  .np-row > .np-c-flag {
+    grid-area: flag;
+    align-self: center;
+  }
+  .np-row > .np-c-name {
+    grid-area: name;
+  }
+  .np-row > .np-c-rate {
+    grid-area: rate;
+  }
+  .np-row > .np-c-month {
+    grid-area: month;
+    justify-self: end;
+    display: block;
+  }
+  .np-row > .np-c-month .np-bar,
+  .np-row > .np-c-month .np-unlimited {
+    display: none;
+  }
+  .np-row > .np-c-month .np-month-line {
+    gap: 6px;
+  }
+  .np-row > .np-c-month .np-month-line b {
+    color: var(--ink-3);
+    font-size: 12px;
+    font-weight: 400;
+  }
+  .np-row > :is(.np-c-wave, .np-c-ping, .np-c-go) {
+    display: none;
+  }
+}
+
+/* ══ C 磁贴 ══
+   旗面身份牌 + 名称 + 一行读数。异常磁贴整块染上状态色的洗色，读数换成原因。 */
+.np-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(212px, 1fr));
+  gap: 10px;
+}
+.np-tile {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 11px 14px 11px 12px;
+  border-radius: 14px;
+  background: var(--np-fill);
+}
+@media (hover: hover) and (pointer: fine) {
+  .np-tile:hover {
+    background: var(--np-fill-hover);
+  }
+}
+.np-tile.tone-warn {
+  background: color-mix(in srgb, var(--gold) 13%, var(--np-fill));
+}
+.np-tile.tone-bad {
+  background: color-mix(in srgb, var(--err) 14%, var(--np-fill));
+}
+.np-tile-text {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+.np-tile-name {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+.np-tile-name .np-name {
+  flex: 1;
+  font-size: 13.5px;
+}
+.np-tile-line {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 17px;
+  white-space: nowrap;
+}
+.np-tile-line > .np-status {
+  flex: 1 1 auto;
+}
+.np-tile-rate {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.np-tile-rate.none {
+  color: var(--ink-4);
+  font-weight: 400;
+}
+.np-tile-month {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  font-size: 11.5px;
+}
+.np-tile-month .np-pct {
+  font-size: 11.5px;
+}
+.np-tile-bytes {
+  color: var(--ink-4);
+}
+.np-plate .nd-idplate-clip {
+  border-color: var(--np-hair);
+  border-radius: 10px;
+  box-shadow: none;
+}
+.np-plate .node-lamp {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  width: 10px;
+  height: 10px;
+  box-shadow: 0 0 0 2px var(--block);
+}
+.np-tile .np-plate .node-lamp {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--block) 70%, var(--np-fill));
+}
+@media (max-width: 820px) {
+  .np-tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .np-tile {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+    gap: 10px;
+    padding: 12px;
+  }
+  .np-tile-name .np-name {
+    font-size: 13px;
+  }
+}
+
+/* ══ D 名册 ══
+   直接用用户页的双栏与名册行（.user-split / .user-row）。这里只把身份牌放进头像位，
+   并让详情栏铺满右侧。 */
+.np-split {
+  grid-template-columns: minmax(0, 340px) minmax(0, 1fr);
+}
+.np-roster-row > .np-plate {
+  grid-area: face;
+}
+.np-roster-row .user-row-name .np-name {
+  font-size: 13.5px;
+  line-height: 18px;
+}
+.np-roster-row .user-row-meta :is(.np-status, .np-latency, .np-addr) {
+  font-size: 11.5px;
+}
+.np-roster-row .user-row-meta .np-latency {
+  color: var(--ink-4);
+}
+.np-roster-rate {
+  color: var(--ink-2);
+}
+.np-roster-rate.none {
+  color: var(--ink-4);
+}
+.np-roster-month {
+  color: var(--ink-4);
+}
+.np-roster-row.off > .np-plate {
+  opacity: 0.5;
+}
+.np-roster-row.checked {
+  background: color-mix(in srgb, var(--action) 10%, transparent);
+}
+.np-roster .user-roster-options {
+  padding: 0 0 6px;
+}
+.np-split-detail {
+  min-width: 0;
+}
+.np-split-detail > .nd-sheet {
+  margin: 0;
+}
+@media (max-width: 820px) {
+  .np-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .np-split.np-detail-route > .np-roster {
+    display: none;
+  }
+}

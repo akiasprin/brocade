@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark" data-palette="dailan">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" />
+    <title>机器页重新设计 mockup</title>
+    <script>
+      /* 主题与色板写进本地偏好后再加载模块：外壳的主题、色板仓库在模块初始化时读取。 */
+      (() => {
+        const query = new URLSearchParams(location.search);
+        const theme = query.get('theme') === 'light' ? 'light' : 'dark';
+        try {
+          localStorage.setItem('brocade-console:theme', theme);
+          localStorage.setItem('brocade-console:palette', 'dailan');
+        } catch {}
+        const root = document.documentElement;
+        root.dataset.theme = theme;
+        root.dataset.palette = 'dailan';
+        document.querySelector('meta[name="color-scheme"]').content = theme;
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="mk-root"></div>
+    <script type="module">
+      import RefreshRuntime from '/@react-refresh';
+      RefreshRuntime.injectIntoGlobalHook(window);
+      window.$RefreshReg$ = () => {};
+      window.$RefreshSig$ = () => type => type;
+      window.__vite_plugin_react_preamble_installed__ = true;
+    </script>
+    <script type="module" src="./node-page-mockup.tsx"></script>
+  </body>
+</html>
