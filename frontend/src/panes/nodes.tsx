@@ -1,3 +1,6 @@
+import { useCardPressFeedback } from '../ui/card-press';
+import { useObservationUpdates } from '../observation-events';
+import { freshFleetNicSample, useFleetRealtime, type FleetRealtimeNode } from '../fleet-realtime';
 import { lazy } from '../ui/lazy';
 import { NodeUnlockPanel } from './node-unlock';
 import { SourceAccessPanel } from './source-access';
@@ -123,7 +126,12 @@ import { type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import { RegionFlag } from '../ui/region-flag';
 import { trafficGapReason } from '../ui/traffic-gap';
-import { machineQuotaBytes, machineQuotaTiB } from '../ui/machine-traffic-quota';
+import {
+  MACHINE_QUOTA_UNITS,
+  machineQuotaBytes,
+  machineQuotaInput,
+  type MachineQuotaUnit,
+} from '../ui/machine-traffic-quota';
 import {
   navigate,
   navigateInPlace,
@@ -279,6 +287,7 @@ const crumbOf = (d: Drill, nameOf: (id: string) => string): CrumbSeg[] => {
 };
 
 export function NodesPane({ win, bare = false }: { win: Win; bare?: boolean }) {
+  useObservationUpdates();
   const drill = (win.data.drill as Drill | undefined) ?? { p: 'list' };
   const go = (d: Drill) => navigate('nodes', d);
   // 面包屑用机器名。nodes 查询在列表页已拉取，通常命中缓存；名称缺失或未加载时回退到 id。
@@ -622,6 +631,7 @@ export const nodeListSnapshotFresh = (dataUpdatedAt: number, now = Date.now()) =
 
 /** 机器列表只读取批量指标；打开卡片后由整页详情加载详细观测。 */
 function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: boolean }) {
+  const realtime = useFleetRealtime();
   const { who } = useSession();
   const now = useNow();
   const qc = useQueryClient();
@@ -835,6 +845,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
             <div role="listitem" key={n.node_id}>
               <NodeCard
                 node={n}
+                realtime={realtime.nodes.get(n.node_id)}
                 snapshotFresh={nodeSnapshotFresh}
                 isolatedNodeIds={isolatedNodeIds}
                 traffic={trafficOf.get(n.node_id)}
@@ -947,6 +958,7 @@ function nodeLifecycleLabel(node: NodeAgentStateItem): string | null {
 
 function NodeCard({
   node,
+  realtime,
   now,
   snapshotFresh,
   isolatedNodeIds,
@@ -964,6 +976,7 @@ function NodeCard({
   go,
 }: {
   node: NodeAgentStateItem;
+  realtime?: FleetRealtimeNode;
   now: number;
   snapshotFresh: boolean;
   isolatedNodeIds: ReadonlySet<string>;
@@ -980,6 +993,7 @@ function NodeCard({
   onPrepare: () => void;
   go: (d: Drill) => void;
 }) {
+  const pressCard = useCardPressFeedback();
   const statusId = useId();
   const healthId = useId();
   const retired = node.lifecycle_phase !== 'active';
@@ -1022,7 +1036,17 @@ function NodeCard({
     !retired &&
     now / 1000 - sample.window_end_unix_secs >= -1 &&
     now / 1000 - sample.window_end_unix_secs <= 60;
-  const rate = current ? observeBpsReadingParts(sample.nic_rx_bps + sample.nic_tx_bps) : null;
+  const event = realtime?.latest;
+  const realtimeCurrent = !retired && !!freshFleetNicSample(realtime, now);
+  // Once a live reading exists, a disconnect or gap must not silently replace it with an older
+  // historical average. Before the first frame, the labelled 30-second window is the fallback.
+  const rate = event
+    ? realtimeCurrent
+      ? observeBpsReadingParts((event.sample.rx_bytes_per_sec + event.sample.tx_bytes_per_sec) * 8)
+      : null
+    : current
+      ? observeBpsReadingParts(sample.nic_rx_bps + sample.nic_tx_bps)
+      : null;
   const measured =
     traffic && (traffic.tracking_started_at_unix_secs !== null || traffic.calibrated_at_unix_secs !== null);
   const quota = traffic?.quota_bytes ? Number(traffic.quota_bytes) : 0;
@@ -1082,9 +1106,11 @@ function NodeCard({
           <span
             className={`node-card-rate${rate ? '' : ' none'}`}
             title={
-              sample
-                ? `网卡收发合计 · 30 秒均值 · ${iso(sample.window_end_unix_secs)}${current ? '' : ' · 非实时读数'}`
-                : '等待网卡采样'
+              event
+                ? `网卡收发合计 · 实时采样 · ${iso(event.received_at_unix_millis / 1000)}${realtimeCurrent ? '' : ' · 读数不可用'}`
+                : sample
+                  ? `网卡收发合计 · 30 秒均值 · ${iso(sample.window_end_unix_secs)}${current ? '' : ' · 非实时读数'}`
+                  : '等待网卡采样'
             }
           >
             {rate ? (
@@ -1118,7 +1144,9 @@ function NodeCard({
     </>
   );
   return selecting ? (
-    <label className={className}>{content}</label>
+    <label className={className} onPointerDown={pressCard}>
+      {content}
+    </label>
   ) : (
     <button
       type="button"
@@ -1130,6 +1158,7 @@ function NodeCard({
       onMouseLeave={cancelPrepare}
       onFocus={prepareNow}
       onPointerDown={event => {
+        pressCard(event);
         if (event.pointerType !== 'mouse') prepareNow();
       }}
       onClick={() => {
@@ -3186,6 +3215,7 @@ type TrafficForm = {
   reset_month: string;
   reset_day: string;
   quota: string;
+  quota_unit: MachineQuotaUnit;
   calibration: string;
   calibration_unit: TrafficCalibrationUnit;
 };
@@ -3250,12 +3280,14 @@ export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateI
     },
   });
   const mine = traffic.data?.nodes.find(item => item.node_id === node.node_id) ?? null;
+  const quotaInput = machineQuotaInput(mine?.quota_bytes ?? null);
   const base: TrafficForm = {
     cycle_kind: mine?.cycle_kind ?? 'monthly',
     accounting_mode: mine?.accounting_mode ?? 'bidirectional_sum',
     reset_month: String(mine?.reset_month ?? 1),
     reset_day: String(mine?.reset_day ?? 1),
-    quota: machineQuotaTiB(mine?.quota_bytes ?? null),
+    quota: quotaInput.amount,
+    quota_unit: quotaInput.unit,
     calibration: '',
     calibration_unit: 'GiB',
   };
@@ -3279,7 +3311,9 @@ export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateI
   const shown = form ?? base;
   const resetDay = Number(shown.reset_day);
   const resetMonth = Number(shown.reset_month);
-  const quota = machineQuotaBytes(shown.quota);
+  // Keep the stored bytes intact when only other accounting settings change.
+  const quotaDirty = shown.quota !== base.quota || shown.quota_unit !== base.quota_unit;
+  const quota = quotaDirty ? machineQuotaBytes(shown.quota, shown.quota_unit) : (mine?.quota_bytes ?? null);
   const calibration = shown.calibration.trim()
     ? trafficCalibrationBytes(shown.calibration, shown.calibration_unit)
     : null;
@@ -3296,7 +3330,7 @@ export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateI
     shown.accounting_mode !== base.accounting_mode ||
     shown.reset_day !== base.reset_day ||
     (shown.cycle_kind === 'yearly' && shown.reset_month !== base.reset_month);
-  const dirty = policyDirty || shown.quota !== base.quota || shown.calibration.trim() !== '';
+  const dirty = policyDirty || quotaDirty || shown.calibration.trim() !== '';
 
   /* 自动限速的草稿单独跟踪来源（修订与策略），计量设置先保存成功时不会把它冲掉。 */
   const limit = mine?.limit;
@@ -3441,7 +3475,7 @@ export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateI
           <span className="nd-ctl-line">
             <input
               className="f mono"
-              style={{ width: 128 }}
+              style={{ width: 112 }}
               inputMode="decimal"
               placeholder="不限"
               value={shown.quota}
@@ -3450,7 +3484,19 @@ export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateI
               aria-invalid={quota === undefined || undefined}
               onChange={event => set({ quota: event.target.value })}
             />
-            <span>TiB</span>
+            <select
+              className="f words"
+              value={shown.quota_unit}
+              disabled={!canEdit}
+              aria-label="机器流量额度单位"
+              onChange={event => set({ quota_unit: event.target.value as MachineQuotaUnit })}
+            >
+              {MACHINE_QUOTA_UNITS.map(unit => (
+                <option key={unit} value={unit}>
+                  {unit}
+                </option>
+              ))}
+            </select>
           </span>
         </Row>
         <Row k="校准">
@@ -3562,6 +3608,7 @@ function TrafficPeriodSummary({
   const left = Math.max(end - now, 0);
   const used = Number(traffic.total_bytes);
   const quota = quotaBytes === null ? null : Number(quotaBytes);
+  const quotaInput = machineQuotaInput(quotaBytes);
   const counted = countedTrafficDirections(traffic);
   const limited = trafficLimitStatus(traffic.limit, now).rate !== null;
   return (
@@ -3570,7 +3617,14 @@ function TrafficPeriodSummary({
         <span className="node-traffic-used">
           本期
           <b>{tracked ? exactBytes(traffic.total_bytes) : '—'}</b>
-          {quotaBytes !== null && <span>/ {machineQuotaTiB(quotaBytes)} TiB</span>}
+          {quotaBytes !== null && (
+            <span>
+              /{' '}
+              {machineQuotaBytes(quotaInput.amount, quotaInput.unit) === quotaBytes
+                ? `${quotaInput.amount} ${quotaInput.unit}`
+                : exactBytes(quotaBytes)}
+            </span>
+          )}
           {quota !== null && tracked && (
             <span className={used > quota ? 'over' : undefined}>{Math.round((used / quota) * 100)}%</span>
           )}

@@ -287,6 +287,40 @@ describe('node traffic accounting values', () => {
     return panel!;
   }
 
+  it('saves a fractional GiB quota and previews it in the summary', async () => {
+    const panel = renderCard({ quota_bytes: null });
+    fireEvent.change(screen.getByLabelText('机器流量额度单位'), { target: { value: 'GiB' } });
+    fireEvent.change(screen.getByLabelText('机器流量额度'), { target: { value: '100.25' } });
+    expect(panel.querySelector('.node-traffic-used')?.textContent).toContain('/ 100.25 GiB');
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    expect(JSON.parse(String(init?.body)).quota_bytes).toBe('107642617856');
+  });
+
+  it('reopens GiB quotas and restores both the amount and unit when reverting', () => {
+    renderCard({ quota_bytes: '107374182400' });
+    const input = screen.getByLabelText('机器流量额度') as HTMLInputElement;
+    const unit = screen.getByLabelText('机器流量额度单位') as HTMLSelectElement;
+    expect(input.value).toBe('100');
+    expect(unit.value).toBe('GiB');
+    fireEvent.change(unit, { target: { value: 'TiB' } });
+    fireEvent.change(input, { target: { value: '2' } });
+    fireEvent.click(screen.getByRole('button', { name: '还原' }));
+    expect(input.value).toBe('100');
+    expect(unit.value).toBe('GiB');
+    expect(screen.queryByRole('button', { name: '保存' })).toBeNull();
+  });
+
+  it('preserves an exact quota when only the reset day is changed', async () => {
+    renderCard({ quota_bytes: '107374182401' });
+    fireEvent.change(screen.getByLabelText('重置日'), { target: { value: '15' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(fetch).mock.calls[0];
+    expect(JSON.parse(String(init?.body)).quota_bytes).toBe('107374182401');
+  });
+
   it('compares the used share of the quota with the elapsed share of the period', () => {
     const now = Math.floor(Date.now() / 1000);
     const end = now + 3.25 * DAY;
@@ -337,6 +371,7 @@ describe('node traffic accounting values', () => {
     expect(screen.queryByRole('button', { name: '校准' })).toBeNull();
     expect(screen.queryByLabelText('当前流量校准值')).toBeNull();
     expect((screen.getByLabelText('机器流量计量口径') as HTMLSelectElement).disabled).toBe(true);
+    expect((screen.getByLabelText('机器流量额度单位') as HTMLSelectElement).disabled).toBe(true);
     expect(panel.querySelector('.config-panel-savebar')).toBeNull();
   });
 });

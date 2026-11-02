@@ -189,7 +189,10 @@ describe('machine traffic limits in the traffic accounting card', () => {
     });
   });
 
-  it('requires a quota for percentage rules and saves the quota before the limit', async () => {
+  it.each([
+    ['2', 'TiB', String(2 * TIB)],
+    ['2000.5', 'GiB', '2148020518912'],
+  ])('requires a quota in %s %s and saves it before the percentage limit', async (amount, unit, bytes) => {
     const fetchMock = vi.fn().mockResolvedValue(ok(traffic()));
     renderCard(traffic({ quota_bytes: null }), true, fetchMock);
     fireEvent.click(screen.getByRole('button', { name: '开启' }));
@@ -202,14 +205,15 @@ describe('machine traffic limits in the traffic accounting card', () => {
     expect(screen.getByLabelText('规则 1 阈值').getAttribute('aria-invalid')).toBe('true');
     expect(screen.getByRole('button', { name: '保存' }).hasAttribute('disabled')).toBe(true);
 
-    fireEvent.change(screen.getByLabelText('机器流量额度'), { target: { value: '2' } });
+    fireEvent.change(screen.getByLabelText('机器流量额度单位'), { target: { value: unit } });
+    fireEvent.change(screen.getByLabelText('机器流量额度'), { target: { value: amount } });
     expect(screen.queryByText('按百分比限速需要先填写流量额度。')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: '保存' }));
 
     // 服务端用已保存的额度校验百分比限速，所以先存额度。
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     expect(urlOf(fetchMock, 0)).toBe('/node-traffic/nodes/hk');
-    expect(bodyOf(fetchMock, 0).quota_bytes).toBe(String(2 * TIB));
+    expect(bodyOf(fetchMock, 0).quota_bytes).toBe(bytes);
     expect(urlOf(fetchMock, 1)).toBe('/node-traffic/nodes/hk/limit');
     expect(bodyOf(fetchMock, 1).rules).toEqual([
       { threshold: { kind: 'quota_percent', basis_points: 8000 }, rate_bps: 100_000_000 },

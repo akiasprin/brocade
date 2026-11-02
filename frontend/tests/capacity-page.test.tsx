@@ -356,6 +356,25 @@ describe('machine capacity forecast', () => {
     fireEvent.click(await view.findByRole('button', { name: '机器详情 ›' }));
     expect(navigate).toHaveBeenCalledExactlyOnceWith('nodes', { p: 'node', id: 'mo-over' });
   });
+
+  it('saves a quota in fractional GiB and clears it while that unit is selected', async () => {
+    const view = renderPane();
+    fireEvent.click(await view.findByRole('button', { name: '设置配额 ›' }));
+    const input = view.getByRole('textbox', { name: '新加坡 UNSET 机器配额' });
+    fireEvent.change(view.getByLabelText('新加坡 UNSET 机器配额单位'), { target: { value: 'GiB' } });
+    fireEvent.change(input, { target: { value: '100.25' } });
+    fireEvent.click(view.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(view.queryByRole('textbox', { name: '新加坡 UNSET 机器配额' })).toBeNull());
+    const puts = () => fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === 'PUT');
+    expect(JSON.parse(String((puts()[0][1] as RequestInit).body)).quota_bytes).toBe('107642617856');
+
+    fireEvent.click(view.getByRole('button', { name: '设置配额' }));
+    fireEvent.change(view.getByLabelText('新加坡 UNSET 机器配额单位'), { target: { value: 'GiB' } });
+    fireEvent.change(view.getByRole('textbox', { name: '新加坡 UNSET 机器配额' }), { target: { value: '' } });
+    fireEvent.click(view.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(puts()).toHaveLength(2));
+    expect(JSON.parse(String((puts()[1][1] as RequestInit).body)).quota_bytes).toBeNull();
+  });
 });
 
 describe('cumulative ledger series', () => {

@@ -17,12 +17,12 @@ const healthy: GrantAutomationStatus = {
 afterEach(cleanup);
 
 describe('permission automation status', () => {
-  it('keeps the healthy idle state out of the breadcrumb', () => {
+  it('keeps the healthy idle state out of the top bar', () => {
     const view = render(<RuntimeCrumbStatus state={compactGrantAutomation(healthy, false, false)} />);
     expect(view.container.textContent).toBe('');
   });
 
-  it('keeps transient background checks out of the breadcrumb', () => {
+  it('keeps transient background checks out of the top bar', () => {
     const view = render(<RuntimeCrumbStatus state={{ text: '检查中', tone: 'normal' }} />);
     expect(view.container.textContent).toBe('');
   });

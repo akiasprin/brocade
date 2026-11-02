@@ -3,7 +3,6 @@ import { lazy } from '../ui/lazy';
 // 页面自身负责对象下钻；顶栏负责主导航与诊断入口。
 
 import {
-  Fragment,
   Suspense,
   useEffect,
   useLayoutEffect,
@@ -39,7 +38,7 @@ import { wm, type CrumbSeg } from '../wm/store';
 import { draft } from '../draft';
 import { DraftBar } from './draft-bar';
 import { ArtifactRail, blastRadius, useChangedArtifacts } from './artifacts';
-import { navigate, returnTo, startRouting, type Loc } from './route';
+import { navigate, returnTo, startRouting } from './route';
 import { can, isPublic, isVisitor, type Session } from '../session';
 import { forge, useForge, type NavKey } from './state';
 import { theme } from './theme';
@@ -54,6 +53,7 @@ import { FleetTrafficMeter } from '../ui/fleet-traffic';
 import { MachineNotifications } from '../ui/machine-notifications';
 import { routeForViewer } from './access';
 import { ROLE_LABEL } from '../ui/role-label';
+import { useTopbarFit } from './topbar-fit';
 
 const TopoCanvas = lazy(() => import('../topo/canvas').then(module => ({ default: module.TopoCanvas })));
 const OnboardingGuide = lazy(() => import('../panes/onboarding').then(module => ({ default: module.OnboardingGuide })));
@@ -98,8 +98,8 @@ const MORE: Face[] = [
   { key: 'topo', label: '拓扑', icon: 'topology' },
 ];
 
-/* 不进入页面列表，但需要标题：面包屑和窗口名都读取 LABEL。 */
-const OFF_NAV: Face[] = [{ key: 'password', label: '修改密码' }];
+/* 不进入页面列表，但当前页入口和窗口名仍需同一份身份。 */
+const OFF_NAV: Face[] = [{ key: 'password', label: '修改密码', icon: 'security' }];
 
 const LABEL: Record<NavKey, string> = Object.fromEntries(
   [...NAV, ...MORE, ...OFF_NAV].map(f => [f.key, f.label]),
@@ -214,7 +214,7 @@ export function ForgeShell({
   // 都只显示一个红色角标，会导致持续等待一个不会自动继续的操作。
   const awaitingDeploy = (deployments.data?.deployments ?? []).find(d => d.awaiting_confirmation);
   // 权限任务在生成 deployment 之前就可能失败，因此不能从发布列表推断这层状态。
-  // 放在全局面包屑后，每个页面都能看到同一份队列读数。
+  // 放在全局顶栏后，每个桌面页面都能看到同一份队列读数。
   const grantAutomation = useQuery({
     queryKey: ['grant-automation'],
     queryFn: () => fetchGrantAutomationStatus(),
@@ -244,7 +244,7 @@ export function ForgeShell({
   }, [nodeList.data, snapshot.data]);
 
   const grantRuntime = compactGrantAutomation(grantAutomation.data, grantAutomation.isPending, !!grantAutomation.error);
-  // 面包屑只留一段需要关注的短状态；健康且空闲时不显示常驻文案。
+  // 顶栏只留一段需要关注的短状态；健康且空闲时不显示常驻文案。
   // 修订号只跟随活动发布出现，避免把当前修订误读成需要处理的状态。
   const runtimeReadError = revisions.error ?? compile.error;
   const crumbRuntime: RuntimeCrumbState = runtimeReadError
@@ -289,6 +289,8 @@ export function ForgeShell({
             pendingTargets={pendingTargets}
             activeDeploy={activeDeploy}
             awaitingDeploy={awaitingDeploy}
+            runtime={pub ? undefined : crumbRuntime}
+            revision={activeDeploy ? current : undefined}
             railOpen={panel.open}
             onboardingAvailable={
               session.who.role === 'system-admin' &&
@@ -297,18 +299,6 @@ export function ForgeShell({
             }
             onLogout={() => confirmDiscardChanges() && onLogout()}
           />
-
-          {/* 手机端由主导航和浏览器历史承担定位，不再重复显示面包屑。 */}
-          {!narrow && (
-            <div className="fg-crumb">
-              <ForgeCrumb nav={nav} />
-              <span className="fg-crumb-right">
-                <FleetTrafficMeter />
-                {/* 公开访客无权读取发布状态和修订号，实时流量仍按节点读取权限展示。 */}
-                {!pub && <RuntimeCrumbStatus state={crumbRuntime} revision={activeDeploy ? current : undefined} />}
-              </span>
-            </div>
-          )}
 
           <DraftBar current={current} />
 
@@ -371,6 +361,7 @@ function MainNav({
   pendingTargets,
   activeDeploy,
   awaitingDeploy,
+  returning,
 }: {
   className: 'fg-nav' | 'fg-facebar';
   faces: Face[];
@@ -379,19 +370,26 @@ function MainNav({
   pendingTargets: number | undefined;
   activeDeploy: { id: number } | undefined;
   awaitingDeploy: { id: number } | undefined;
+  returning: boolean;
 }) {
+  const items = visible(faces, who);
+  // 菜单页在桌面导航末尾临时占一格；不复制名称、图标或角色约束。
+  const current = className === 'fg-nav' && visible([...MORE, ...OFF_NAV], who).find(f => f.key === nav);
+  if (current) items.push(current);
+
   return (
     <nav className={className} aria-label="主导航">
-      {visible(faces, who).map(f => (
+      {items.map(f => (
         <button
           key={f.key}
-          className="fg-nv"
+          type="button"
+          className={`fg-nv${current && f.key === current.key ? ' fg-nv-context' : ''}${returning && nav === f.key ? ' is-back' : ''}`}
           aria-current={nav === f.key ? 'true' : 'false'}
-          aria-label={f.label}
-          title={f.label}
-          onClick={() => navigate(f.key)}
+          aria-label={returning && nav === f.key ? `返回${f.label}` : f.label}
+          title={returning && nav === f.key ? `返回${f.label}` : f.label}
+          onClick={() => (returning && nav === f.key ? returnTo(f.key) : navigate(f.key))}
         >
-          {f.icon && <Icon of={f.icon} size={14} className="fg-nv-ic" />}
+          {f.icon && <Icon of={returning && nav === f.key ? 'chevronLeft' : f.icon} size={14} className="fg-nv-ic" />}
           <span className="fg-nv-label">{f.label}</span>
           {f.key === 'deploy' && activeDeploy && (
             <span
@@ -414,10 +412,8 @@ function MainNav({
   );
 }
 
-/* 窄屏没有面包屑。此前进入下级后会多出一行「‹ 返回 + 当前层级名称」（.fg-backrow），
-   现已移除：窄屏一共只有 44px 的一行头部，再加一行 40px 是为了一个动作和一个已经写在
-   内容区标题里的名字。退出下级有两条现成的路——点导航行里高亮的那一格（navigate 不带
-   drill 即回到该页首页，见 route.ts），以及浏览器的后退（每次下钻都 pushState）。 */
+/* 下钻时选中格的图标变成返回箭头，点击回模块首页；层级同步仍由面板负责，外壳不解析
+   私有 drill。桌面用户页的名册常驻，选中用户不算离开列表。 */
 
 /* ══ 顶栏 ══ */
 
@@ -449,6 +445,8 @@ function TopBar({
   pendingTargets,
   activeDeploy,
   awaitingDeploy,
+  runtime,
+  revision,
   railOpen,
   onboardingAvailable,
   onLogout,
@@ -469,11 +467,18 @@ function TopBar({
   // 含破坏性动作的波次停在等待确认状态的那条发布。它同时存在于 activeDeploy 中，
   // 此处只是改变角标的文案——红色角标显示发布编号时会被理解为正在自动推进。
   awaitingDeploy: { id: number } | undefined;
+  runtime: RuntimeCrumbState | undefined;
+  revision: number | undefined;
   railOpen: boolean;
   onboardingAvailable: boolean;
   onLogout: () => void;
 }) {
   const st = useForge();
+  const windows = useSyncExternalStore(wm.subscribe, wm.snapshot);
+  const segs = (windows.wins.find(win => win.key === `tab:${nav}`)?.data.crumb as CrumbSeg[] | undefined) ?? [];
+  const returning = segs.length > 0 && !(nav === 'users' && !narrow);
+  const topRef = useRef<HTMLDivElement>(null);
+  useTopbarFit(topRef, narrow);
   const [more, setMore] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const moreButtonRef = useRef<HTMLButtonElement>(null);
@@ -808,7 +813,7 @@ function TopBar({
 
   if (narrow) {
     /* 窄屏只有这一行：品牌 + 机器 / 线路 / 用户 / 用量 + 通知 + 账户牌。其他页面、产物和诊断
-       收入账户菜单。下钻不再增加第二行，理由见上方 `.fg-backrow` 的说明。 */
+       收入账户菜单。下钻时只更换选中格的图标，不增加第二行。 */
     return (
       <div className="fg-top fg-navrow">
         <BrandHome branding={branding} />
@@ -820,6 +825,7 @@ function TopBar({
           pendingTargets={pendingTargets}
           activeDeploy={activeDeploy}
           awaitingDeploy={awaitingDeploy}
+          returning={returning}
         />
         <MachineNotifications
           narrow
@@ -847,7 +853,7 @@ function TopBar({
   }
 
   return (
-    <div className="fg-top">
+    <div className="fg-top" ref={topRef}>
       <BrandHome branding={branding} />
       <span className="fg-vr" />
 
@@ -859,9 +865,15 @@ function TopBar({
         pendingTargets={pendingTargets}
         activeDeploy={activeDeploy}
         awaitingDeploy={awaitingDeploy}
+        returning={returning}
       />
 
       <span className="sp" />
+
+      <span className="fg-topstat">
+        <FleetTrafficMeter />
+        {runtime && <RuntimeCrumbStatus state={runtime} revision={revision} />}
+      </span>
 
       <MachineNotifications
         narrow={false}
@@ -891,42 +903,6 @@ function TopBar({
 }
 
 /* ══ 工作区 ══ */
-
-// 顶部面包屑。第一段是当前所在的页面（机器、线路等），其后是面板内的下钻层级。
-// *
-// * 下钻状态保存在 `win.data.drill` 中，其结构由面板自行定义，因此此处不解析它，
-// * 只读取面板写入的 `crumb`；点击某一段时将该段携带的 `drill` 原样写回，面板会返回该层级。
-// * 点击第一段时清除 `drill`——各面板使用 `?? { p: 'list' }` 作为默认值，清除后回到列表。
-function ForgeCrumb({ nav }: { nav: NavKey }) {
-  const snap = useSyncExternalStore(wm.subscribe, wm.snapshot);
-  const win = snap.wins.find(w => w.key === `tab:${nav}`);
-  const segs = (win?.data.crumb as CrumbSeg[] | undefined) ?? [];
-  const goto = (drill?: unknown) => returnTo(nav, drill as Loc['drill']);
-
-  return (
-    <>
-      {segs.length === 0 ? (
-        <span className="cur">{LABEL[nav]}</span>
-      ) : (
-        <button type="button" className="fg-crumb-link" onClick={() => goto()}>
-          {LABEL[nav]}
-        </button>
-      )}
-      {segs.map((seg, i) => (
-        <Fragment key={i}>
-          <span className="sep">/</span>
-          {i === segs.length - 1 || seg.drill === undefined ? (
-            <span className="cur">{seg.label}</span>
-          ) : (
-            <button type="button" className="fg-crumb-link" onClick={() => goto(seg.drill)}>
-              {seg.label}
-            </button>
-          )}
-        </Fragment>
-      ))}
-    </>
-  );
-}
 
 function Work({ nav }: { nav: NavKey }) {
   const snap = useSyncExternalStore(wm.subscribe, wm.snapshot);

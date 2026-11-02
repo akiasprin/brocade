@@ -235,6 +235,7 @@ globalThis.fetch = async (input, init) => {
 
 /** The realtime channels stay silent; every reading falls back to the polled queries. */
 class SilentEventSource extends EventTarget {
+  static sources: SilentEventSource[] = [];
   static readonly CONNECTING = 0;
   static readonly OPEN = 1;
   static readonly CLOSED = 2;
@@ -244,10 +245,20 @@ class SilentEventSource extends EventTarget {
   onerror: ((event: Event) => void) | null = null;
   constructor(readonly url: string) {
     super();
+    SilentEventSource.sources.push(this);
   }
-  close() {}
+  close() {
+    SilentEventSource.sources = SilentEventSource.sources.filter(source => source !== this);
+  }
 }
 Object.defineProperty(window, 'EventSource', { value: SilentEventSource, configurable: true });
+Object.defineProperty(window, '__nodePreviewPush', {
+  value: (url: string, event: string, data: unknown) => {
+    for (const source of SilentEventSource.sources) {
+      if (source.url === url) source.dispatchEvent(new MessageEvent(event, { data: JSON.stringify(data) }));
+    }
+  },
+});
 
 if (!location.hash) history.replaceState(null, '', `${location.search}#/nodes`);
 const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });

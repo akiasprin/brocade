@@ -120,7 +120,7 @@ test('content navigation updates directly without workspace snapshot transitions
     assert.match(pane, new RegExp(`const go = [^\\n]+=> navigate\\('${nav}',`));
     assert.doesNotMatch(pane, /runVisualTransition/);
   }
-  assert.match(shell, /const goto = \(drill\?: unknown\) => returnTo\(nav, drill as Loc\['drill'\]\)/);
+  assert.match(shell, /returning && nav === f\.key \? returnTo\(f\.key\) : navigate\(f\.key\)/);
   assert.match(nodes, /setTabState\(\{ id, tab: next \}\)/);
   assert.doesNotMatch(nodes, /data-tab-transition|tabSwitched|switched:\s*(?:true|false)/);
   assert.doesNotMatch(

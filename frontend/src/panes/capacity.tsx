@@ -16,7 +16,12 @@ import { useNodeCountries } from '../ui/node-name';
 import { RegionFlag } from '../ui/region-flag';
 import { trafficGapReason } from '../ui/traffic-gap';
 import { GeneratedUserAvatar } from '../ui/user-avatar';
-import { machineQuotaBytes, machineQuotaTiB } from '../ui/machine-traffic-quota';
+import {
+  MACHINE_QUOTA_UNITS,
+  machineQuotaBytes,
+  machineQuotaInput,
+  type MachineQuotaUnit,
+} from '../ui/machine-traffic-quota';
 
 const DAY = 86_400;
 const KiB = 1024;
@@ -37,10 +42,10 @@ function volume(n: number): string {
   return `${n.toFixed(0)} B`;
 }
 
-/** 配额按 TiB 录入、最多两位小数；能还原成录入值的配额照录入的写法显示（1 TiB、0.5 TiB）。 */
+/** 能还原成 GiB/TiB 录入值的配额沿用其单位，其余按流量数量级显示。 */
 function quotaText(quota: string): string {
-  const tib = machineQuotaTiB(quota);
-  return machineQuotaBytes(tib) === quota ? `${tib} TiB` : volume(Number(quota));
+  const { amount, unit } = machineQuotaInput(quota);
+  return machineQuotaBytes(amount, unit) === quota ? `${amount} ${unit}` : volume(Number(quota));
 }
 
 const pad2 = (n: number) => String(n).padStart(2, '0');
@@ -835,9 +840,11 @@ function UserShares({ machine }: { machine: Machine }) {
 function QuotaEditor({ node, onDone }: { node: MachineTrafficModelNode; onDone: () => void }) {
   const qc = useQueryClient();
   const errorId = useId();
-  const [draft, setDraft] = useState(() => machineQuotaTiB(node.quota_bytes));
+  const initial = machineQuotaInput(node.quota_bytes);
+  const [draft, setDraft] = useState(initial.amount);
+  const [unit, setUnit] = useState(initial.unit);
   const [attempted, setAttempted] = useState(false);
-  const parsed = machineQuotaBytes(draft);
+  const parsed = draft === initial.amount && unit === initial.unit ? node.quota_bytes : machineQuotaBytes(draft, unit);
   const save = useMutation({
     mutationFn: (quota: string | null) =>
       saveNodeTraffic(node.node_id, {
@@ -880,9 +887,21 @@ function QuotaEditor({ node, onDone }: { node: MachineTrafficModelNode; onDone: 
           onKeyDown={event => {
             if (event.key === 'Escape' && !save.isPending) onDone();
           }}
-        />{' '}
-        TiB
+        />
       </label>
+      <select
+        className="f words"
+        value={unit}
+        aria-label={`${nameOf(node)} 机器配额单位`}
+        disabled={save.isPending}
+        onChange={event => setUnit(event.target.value as MachineQuotaUnit)}
+      >
+        {MACHINE_QUOTA_UNITS.map(option => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </select>
       <button className="btn primary" type="submit" disabled={save.isPending}>
         {save.isPending ? '保存中…' : '保存'}
       </button>

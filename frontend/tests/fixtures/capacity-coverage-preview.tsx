@@ -53,6 +53,6 @@ client.setQueryData(['usage-machine-model'], model);
 client.setQueryData(['nodes'], { nodes: [{ node_id: node.node_id, name: node.name, public_ipv4_country: 'JP' }] });
 createRoot(document.getElementById('root')!).render(
   <QueryClientProvider client={client}>
-    <CapacityPane />
+    <CapacityPane canEdit={params.has('edit')} />
   </QueryClientProvider>,
 );

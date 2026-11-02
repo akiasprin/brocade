@@ -1,3 +1,5 @@
+import { useCardPressFeedback } from '../ui/card-press';
+import { useObservationUpdates } from '../observation-events';
 import { ChainUnlockTable } from './chain-unlock-table';
 import { ChainGroupMove } from './chain-group-move';
 import { ChainUnlockControl } from './node-unlock';
@@ -267,6 +269,7 @@ const crumbOf = (d: Drill, chainName: (app: string, chain: string) => string): C
   d.p === 'chain' ? [{ label: chainName(d.app, d.chain) }] : d.p === 'new' ? [{ label: '建链向导' }] : [];
 
 export function ChainsPane({ win }: { win: Win }) {
+  useObservationUpdates();
   const drill = (win.data.drill as Drill | undefined) ?? { p: 'list' };
   const go = (d: Drill) => navigate('chains', d);
   // 面包屑用链名。snapshot 在列表页已拉取，通常命中缓存；名称缺失或未加载时回退到链 id。
@@ -4257,6 +4260,7 @@ const CHAIN_LIST_VIEWS = [
 type ChainListView = (typeof CHAIN_LIST_VIEWS)[number]['key'];
 
 function ChainList({ go }: { go: (d: Drill) => void }) {
+  const pressCard = useCardPressFeedback();
   const [view, setView] = useState<'cards' | 'unlock'>(() => {
     try {
       return localStorage.getItem('brocade-console:chain-view') === 'unlock' ? 'unlock' : 'cards';
@@ -4310,6 +4314,20 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
   // 主按钮变为删除——当前处于可删除状态由整页形态表示，而不依靠一个图标。
   const [selecting, setSelecting] = useState(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [keyboardPressedChain, setKeyboardPressedChain] = useState<string | null>(null);
+  useEffect(() => {
+    if (keyboardPressedChain === null) return;
+    const clear = () => setKeyboardPressedChain(null);
+    const visibility = () => {
+      if (document.visibilityState === 'hidden') clear();
+    };
+    window.addEventListener('blur', clear);
+    document.addEventListener('visibilitychange', visibility);
+    return () => {
+      window.removeEventListener('blur', clear);
+      document.removeEventListener('visibilitychange', visibility);
+    };
+  }, [keyboardPressedChain]);
   const rowKey = (appId: string, chainId: string) => `${appId}/${chainId}`;
   const togglePick = (key: string) =>
     setPicked(prev => {
@@ -5046,28 +5064,40 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                             role="button"
                             tabIndex={0}
                             data-route-focus={`chain:${key}`}
+                            data-card-pressed={keyboardPressedChain === key ? 'true' : undefined}
                             key={key}
                             className={`chain-card tone-${tone}${r.disabled ? ' off' : ''}${checked ? ' picked' : ''}${orderDrag?.kind === 'chains' && orderDrag.active === r.chain.id ? ' order-drag-active' : ''}`}
                             data-order-kind="chain"
                             data-order-app={g.app.id}
                             data-order-id={r.chain.id}
-                            onPointerDown={event =>
+                            onPointerDown={event => {
+                              pressCard(event);
                               beginOrderDrag(event, {
                                 kind: 'chains',
                                 appId: g.app.id,
                                 active: r.chain.id,
                                 original: g.chains.map(row => row.chain.id),
                                 order: g.chains.map(row => row.chain.id),
-                              })
-                            }
+                              });
+                            }}
                             onClick={open}
                             onKeyDown={e => {
                               if (e.target !== e.currentTarget) return;
-                              if (e.key === 'Enter' || e.key === ' ') {
+                              if (e.key === ' ') {
                                 e.preventDefault();
-                                open();
+                                if (!e.repeat) setKeyboardPressedChain(key);
+                              } else if (e.key === 'Enter') {
+                                e.preventDefault();
+                                if (!e.repeat) open();
                               }
                             }}
+                            onKeyUp={e => {
+                              if (e.target !== e.currentTarget || e.key !== ' ') return;
+                              e.preventDefault();
+                              setKeyboardPressedChain(null);
+                              if (keyboardPressedChain === key) open();
+                            }}
+                            onBlur={() => setKeyboardPressedChain(null)}
                           >
                             <header className="chain-card-head">
                               <span className="chain-status-slot">

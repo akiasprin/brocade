@@ -30,16 +30,7 @@ test('floating layers share one translucent material', () => {
     // 对话框本身半透明，遮罩只压暗 40%，否则背后的页面只剩一块暗色。
     assert.match(t.get('--scrim'), /^rgba\(\d+, \d+, \d+, 0\.4\)$/);
   }
-  for (const selector of [
-    '.fw',
-    '.fg-menu',
-    '.fg-pop',
-    '.observe-range-menu',
-    '.external-target-menu',
-    '.cg-menu',
-    '.topo-callout',
-    '.sheet',
-  ]) {
+  for (const selector of ['.fw', '.fg-pop', '.topo-callout', '.sheet']) {
     const body = rule(selector);
     assert.match(body, /background: var\(--float\);/, `${selector} uses the floating material`);
     assert.match(body, /backdrop-filter: var\(--float-filter\);/, `${selector} blurs what is behind it`);
@@ -51,13 +42,14 @@ test('floating layers share one translucent material', () => {
   assert.match(rule('.dialog-scrim'), /background: var\(--scrim\);[^}]*backdrop-filter: blur\(4px\);/s);
 });
 
-test('menus do not carry appearance-transition exceptions', () => {
+test('menus keep uniform borders without appearance-transition exceptions', () => {
   for (const selector of ['.fg-menu', '.observe-range-menu', '.external-target-menu', '.cg-menu']) {
     const body = rule(selector);
     assert.match(body, /background: var\(--float\);/, `${selector} uses the menu material`);
     assert.match(body, /-webkit-backdrop-filter: var\(--float-filter\);/, `${selector} supports WebKit blur`);
     assert.match(body, /backdrop-filter: var\(--float-filter\);/, `${selector} supports standard blur`);
-    assert.match(body, /box-shadow:\s*var\(--float-edge\),/, `${selector} keeps the glass edge`);
+    assert.match(body, /border: 1px solid var\(--line\);/, `${selector} uses the same border on all sides`);
+    assert.doesNotMatch(body, /var\(--float-edge\)/, `${selector} does not double the top edge with a highlight`);
   }
   assert.doesNotMatch(styles, /view-transition-(?:name|group|image-pair|old|new)\(account-menu\)/);
   assert.doesNotMatch(styles, /view-transition-name:\s*account-menu/);
@@ -95,9 +87,9 @@ test('papers and panels stay opaque without backdrop blur', () => {
       assert.doesNotMatch(target, /\.(?:fg-sheet|nd-paper|panel|blk)\b/, `${selector.trim()} blurs a content surface`);
     }
   }
-  // 顶栏随内容滚走且为实色，不参与半透明。
+  // 顶栏使用共享半透明底色，按钮文字保持完整不透明，菜单不增加额外包含块。
   assert.doesNotMatch(styles, /\.fg-top::before/);
-  assert.match(rule('.fg-top'), /background: var\(--surface\);/);
+  assert.match(rule('.fg-top'), /background: var\(--glass\);/);
 });
 
 test('draft panel links and temporary highlights keep interaction and change-state semantics separate', () => {

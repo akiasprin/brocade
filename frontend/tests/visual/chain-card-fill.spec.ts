@@ -42,6 +42,9 @@ for (const width of [1440, 390])
         await page.mouse.down();
         await page.mouse.move(bounds!.x + 110, bounds!.y + 30, { steps: 5 });
         await expect(card).toHaveClass(/order-drag-active/);
+        await expect
+          .poll(() => card.evaluate(element => new DOMMatrixReadOnly(getComputedStyle(element).transform).a))
+          .toBe(1);
         await expect(card).toHaveScreenshot(`chain-drag-${theme}.png`);
         await page.keyboard.press('Escape');
         await page.mouse.up();

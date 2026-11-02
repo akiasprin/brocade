@@ -32,7 +32,7 @@ test('每条历史记录恢复滚动，但不重新聚焦上次打开的列表�
 });
 
 test('窄屏不重复显示面包屑，进入新页面后焦点仍落在主内容', () => {
-  assert.match(shell, /\{!narrow && \(\s*<div className="fg-crumb">/);
+  assert.doesNotMatch(shell, /fg-crumb|ForgeCrumb/);
   assert.doesNotMatch(shell, /ForgeMobileBack|fg-mobile-crumb/);
   assert.match(shell, /role="main" aria-label=\{`\$\{LABEL\[nav\]\}内容`\} tabIndex=\{-1\}/);
 });

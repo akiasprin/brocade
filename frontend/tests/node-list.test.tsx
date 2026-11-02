@@ -50,6 +50,48 @@ const win: Win = {
 const fleet = (machines = SCENES.typical.machines()) =>
   machines.map(machine => agentState(machine, Math.floor(Date.now() / 1000)));
 
+it('shows live NIC rates and gaps without replacing the historical curve', async () => {
+  class Events {
+    static sources: Events[] = [];
+    handlers = new Map<string, (event: { data: string }) => void>();
+    constructor(readonly url: string) {
+      Events.sources.push(this);
+    }
+    addEventListener(name: string, callback: (event: { data: string }) => void) {
+      this.handlers.set(name, callback);
+    }
+    close() {}
+    send(name: string, value: unknown) {
+      this.handlers.get(name)?.({ data: JSON.stringify(value) });
+    }
+  }
+  vi.stubGlobal('EventSource', Events);
+  const machine = SCENES.calm.machines()[0];
+  const now = Math.floor(Date.now() / 1000);
+  mount(fleet([machine]), admin, true, { nic: [nicView(machine, now, 24)], traffic: [] });
+  const source = Events.sources.find(source => source.url === '/realtime/nodes/events')!;
+  await waitFor(() => expect(document.querySelector('.node-card-rate.none')).toBeNull());
+  const curve = document.querySelector('.node-card-comet')!.innerHTML;
+  act(() =>
+    source.send('sample', {
+      node_id: machine.id,
+      received_at_unix_millis: Date.now(),
+      sample: { rx_bytes_per_sec: 15_000_000, tx_bytes_per_sec: 5_000_000, has_gap: false },
+    }),
+  );
+  expect(document.querySelector('.node-card-rate')!.textContent).toContain('160');
+  expect(document.querySelector('.node-card-rate')!.getAttribute('title')).toContain('实时采样');
+  expect(document.querySelector('.node-card-comet')!.innerHTML).toBe(curve);
+  act(() =>
+    source.send('sample', {
+      node_id: machine.id,
+      received_at_unix_millis: Date.now() + 1,
+      sample: { rx_bytes_per_sec: 0, tx_bytes_per_sec: 0, has_gap: true },
+    }),
+  );
+  expect(document.querySelector('.node-card-rate')!.textContent).toBe('—');
+});
+
 /** 典型场景：24 台在线与 3 台退役（洛杉矶 旧 GIA、首尔 旧机已停用；香港 旧 BGP 仍在退役中）。 */
 function mount(
   nodes: NodeAgentStateItem[],

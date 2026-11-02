@@ -114,8 +114,8 @@
   --glass: color-mix(in srgb, var(--surface) 84%, transparent);
   --glass-strong: color-mix(in srgb, var(--surface) 94%, transparent);
   /* 浮层材质：菜单、弹出层、浮动窗口与对话框共用。底色 64% 不透明，背后的内容模糊 20px、
-     饱和度提到 180%；上沿 1px 高光把浮层与背后同色的内容分开。亮色块有同名声明：局部换肤
-     的子树需要按自己的 --surface / --sheet 重新求值。 */
+     饱和度提到 180%；窗口与气泡可用上沿高光，菜单只用四边一致的 1px 边框。亮色块有同名
+     声明：局部换肤的子树需要按自己的 --surface / --sheet 重新求值。 */
   --float: color-mix(in srgb, var(--surface) 64%, transparent);
   --float-sheet: color-mix(in srgb, var(--sheet) 64%, transparent);
   --float-filter: blur(20px) saturate(1.8);
@@ -3069,10 +3069,8 @@ html {
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-left: env(safe-area-inset-left, 0px);
   --shell-nav-h: 48px;
-  --shell-crumb-h: 36px;
-  /* 只有面包屑横栏保留 1px 下边框。启动台面与工作区共用已知的外壳尺寸，首帧就使用
-     同一网格坐标；数据、草稿条和页面内容变化都不能重新定位背景。 */
-  --workspace-grid-origin-y: calc(var(--safe-top) + var(--shell-nav-h) + var(--shell-crumb-h) + 1px);
+  /* 网格从顶栏底部开始；草稿条和页面内容变化不能重新定位背景。 */
+  --workspace-grid-origin-y: calc(var(--safe-top) + var(--shell-nav-h));
 }
 html,
 body {
@@ -15050,7 +15048,7 @@ body.has-artpanel .topo-deck {
    一、顶栏只覆盖左列。右侧输出栏从 y=0 贯通到底，与浏览器顶边对齐。
        v1 的结构是顶栏横贯全宽、下方三栏，产物栏被下压 46px。
    二、移除左侧模型树，导航移入顶栏。在当前规模下该树只增加成本：
-       查看机器数量由零次点击变为两次。层级信息交给面包屑表示。
+       查看机器数量由零次点击变为两次。下钻后的返回入口由导航格承担。
    三、诊断由常驻面板改为顶栏气泡。它的使用方式是查看、进入、关闭，
        为其保留整段右列会把低频内容常驻化，并占用产物栏一半高度。
    四、内容位于网格台面上的一张纸内，纸内各节平铺，不嵌套容器。
@@ -15085,7 +15083,7 @@ body.has-artpanel .topo-deck {
   gap: 10px;
   height: var(--shell-nav-h);
   padding: 0 12px 0 18px;
-  background: var(--surface);
+  background: var(--glass);
 }
 .fg-home {
   flex: 0 0 auto;
@@ -15173,6 +15171,24 @@ body.has-artpanel .topo-deck {
   color: var(--primary-on);
   box-shadow: inset 0 0 0 1px var(--primary-line);
   font-weight: 500;
+}
+.fg-nv-context {
+  position: relative;
+  margin-left: 13px;
+}
+.fg-nv-context::before {
+  content: '';
+  position: absolute;
+  top: 5px;
+  bottom: 5px;
+  left: -8px;
+  width: 1px;
+  background: var(--line);
+}
+@media (hover: hover) {
+  .fg-nv.is-back:hover {
+    background: var(--primary-hover);
+  }
 }
 .fg-nv .mark {
   width: 5px;
@@ -15394,7 +15410,6 @@ body.has-artpanel .topo-deck {
   -webkit-backdrop-filter: var(--float-filter);
   backdrop-filter: var(--float-filter);
   box-shadow:
-    var(--float-edge),
     0 18px 46px color-mix(in srgb, #000 30%, transparent),
     0 2px 8px color-mix(in srgb, #000 16%, transparent);
 }
@@ -16133,52 +16148,51 @@ body.has-artpanel .topo-deck {
   overflow: hidden;
 }
 
-/* ── 面包屑：左侧为当前页面，右侧为修订号和影响范围 ── */
-/* 底色与内容区一致。此前它没有底色，显示的是台面，与下方的网格区域同色——
-   而网格区域有细线、它没有，同一底色下一侧有线一侧没有，视觉上反而像两种颜色。
-   改为内容区底色后三层分明：顶栏、这一条、以及中间的网格台面。 */
-.fg-crumb {
-  flex: 0 0 auto;
-  display: flex;
+/* ── 顶栏流量与发布状态 ── */
+.fg-topstat {
+  display: inline-flex;
+  flex: none;
   align-items: center;
-  gap: 7px;
-  height: var(--shell-crumb-h);
-  padding: 0 24px;
-  background: var(--sheet);
-  border-bottom: 1px solid var(--line);
-  font-size: 12px;
-  color: var(--ink-3);
-}
-.fg-crumb .cur {
-  color: var(--ink);
-}
-.fg-crumb-link {
-  appearance: none;
-  border: 0;
-  padding: 0;
-  background: none;
-  font: inherit;
-  color: var(--focus);
-  cursor: pointer;
-}
-.fg-crumb-link:hover {
-  text-decoration: underline dotted;
-}
-.fg-crumb-link:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 3px;
-  border-radius: 2px;
-}
-.fg-crumb .sep {
-  color: var(--ink-4);
-}
-.fg-crumb-right {
-  margin-left: auto;
-  display: flex;
-  /* 两段分别使用 sans 与 mono；按行盒中心对齐会因字体 ascender 不同而一高一低。
-     对齐文字基线，再由外层 .fg-crumb 将整组垂直居中。 */
-  align-items: baseline;
   gap: 14px;
+  height: 100%;
+  margin-right: 6px;
+}
+.fg-topstat > .ft {
+  height: auto;
+}
+.fg-topstat > .ft + .fg-blast {
+  position: relative;
+  padding-left: 15px;
+}
+.fg-topstat > .ft + .fg-blast::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 1px;
+  height: 14px;
+  margin-top: -7px;
+  background: var(--line);
+}
+/* 按实际可用空间依次收起账户名、流量、品牌字标和次要标签，保留状态与操作入口。 */
+.fg-top[data-fit~='account'] .fg-who:not(.guest-login) {
+  width: 30px;
+  justify-content: center;
+  padding: 0;
+}
+.fg-top[data-fit~='account'] .fg-who:not(.guest-login) :is(.fg-who-name, .fg-who-caret),
+.fg-top[data-fit~='traffic'] .fg-topstat > .ft,
+.fg-top[data-fit~='traffic'] .fg-topstat > .ft + .fg-blast::before,
+.fg-top[data-fit~='brand'] .fg-brand,
+.fg-top[data-fit~='meta'] .fg-topstat .fg-meta,
+.fg-top[data-fit~='label'] .fg-nv-context .fg-nv-label {
+  display: none;
+}
+.fg-top[data-fit~='traffic'] .fg-topstat > .ft + .fg-blast {
+  padding-left: 0;
+}
+.fg-top[data-fit~='traffic'] .fg-topstat:not(:has(> .fg-blast, > .fg-meta)) {
+  display: none;
 }
 .fg-meta {
   font: 11px var(--mono);
@@ -16203,7 +16217,7 @@ body.has-artpanel .topo-deck {
   font-weight: 500;
 }
 
-/* ── 实时流量条：页面标题和下钻路径留在左侧，紧凑双向读数固定在右侧。 ── */
+/* ── 实时流量：顶栏右侧的紧凑双向读数 ── */
 .ft {
   display: flex;
   flex: 0 0 auto;
@@ -16272,7 +16286,7 @@ body.has-artpanel .topo-deck {
 }
 
 /* ── 草稿条 ──
-   未提交的编辑显示在面包屑下方。使用 gold 而非 err：它表示存在未完成的操作，
+   未提交的编辑显示在顶栏下方。使用 gold 而非 err：它表示存在未完成的操作，
    不是错误；红色会被理解为出现故障。独立提示层使用悬浮材质隔开背后的网格和正文，
    不支持模糊时保留实色底，不能退回近乎透明的金色洗色。 */
 .fg-draft {
@@ -16698,16 +16712,13 @@ body.fg-dragging * {
 @media (max-width: 820px) {
   html {
     --shell-nav-h: 44px;
-    --shell-crumb-h: 34px;
-    /* 窄屏不渲染面包屑，导航行也没有下边框。 */
-    --workspace-grid-origin-y: calc(var(--safe-top) + var(--shell-nav-h));
   }
   /* ─── 导航行：品牌 + 四个高频页面 + 通知 + 账户（44px）───
      此处原为「品牌 / 产物 / 诊断 / ⋯」，导航位于屏幕底部的 tab bar。
      该布局共三层：顶栏 53 + 面包屑 35 + tab bar 52 = 140px，占 844 屏高的 16.6%。
      随后导航上移为独立一行（45 + 41 = 86px），再并入导航行剩一行；面包屑那一行
      （`.fg-backrow`：‹ 返回 + 当前层级名称）现已一并去掉，窄屏头部固定 44px，
-     不随下钻变高。理由见 shell.tsx 中对应位置的说明。
+     不随下钻变高；选中格的返回箭头由 shell.tsx 统一渲染。
 
      该行移除的内容：「产物」「诊断」（都是按需查看的辅助面板，收入账户菜单），以及修订
      读数 `r77 · 3 台待发`——同一信息由菜单中的「发布」状态承担。 */
@@ -16913,23 +16924,6 @@ body.fg-dragging * {
   .fg-appearance-row {
     min-height: 30px;
     padding: 1px 2px 1px 7px;
-  }
-
-  /* ─── 面包屑：单行，宽度不足时横向滚动 ─── */
-  .fg-crumb {
-    padding: 0 12px;
-    gap: 6px;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-  .fg-crumb::-webkit-scrollbar {
-    display: none;
-  }
-  .fg-crumb-right {
-    gap: 9px;
-  }
-  .fg-blast {
-    font-size: 11px;
   }
 
   /* ─── 草稿条：固定在屏幕底部 ───
@@ -24668,7 +24662,7 @@ select.f.fwr-sort {
   background: var(--float);
   -webkit-backdrop-filter: var(--float-filter);
   backdrop-filter: var(--float-filter);
-  box-shadow: var(--float-edge), var(--shadow);
+  box-shadow: var(--shadow);
 }
 .observe-range-menu[hidden] {
   display: none;
@@ -25999,6 +25993,10 @@ body.observe-brushing .observe-chart-tip {
   min-width: 0;
 }
 .node-card {
+  --node-card-edge: var(--ink-3);
+  --card-fill: var(--node-card-fill);
+  --card-hover: var(--node-card-hover);
+  --card-edge: var(--node-card-edge);
   appearance: none;
   display: flex;
   width: 100%;
@@ -26016,29 +26014,15 @@ body.observe-brushing .observe-chart-tip {
   text-align: left;
   cursor: pointer;
   outline: none;
-  transition:
-    background-color 0.15s ease,
-    box-shadow 0.15s ease,
-    transform 0.12s ease;
 }
-@media (hover: hover) and (pointer: fine) {
-  .node-card:hover {
-    background: var(--node-card-hover);
-  }
+.node-card.tone-ok {
+  --node-card-edge: var(--action);
 }
-.node-card.picked {
-  box-shadow:
-    inset 0 0 0 2px var(--action),
-    var(--sheet-shadow);
+.node-card.tone-warn {
+  --node-card-edge: var(--gold);
 }
-.node-card:focus-visible,
-.node-card:has(input:focus-visible) {
-  box-shadow:
-    0 0 0 2px var(--action),
-    var(--sheet-shadow);
-}
-button.node-card:active {
-  transform: scale(0.985);
+.node-card.tone-bad {
+  --node-card-edge: var(--err);
 }
 .node-card.off {
   opacity: 0.5;
@@ -28834,6 +28818,9 @@ button.node-card:active {
   /* 边框（悬停/选中）用色，默认与状态灯同源。正常档单独取主题色，见 `.tone-ok`；
      不动 `--chain-tone` 本身——它还供状态灯使用，改它会把灯也改掉。 */
   --chain-edge: var(--chain-tone);
+  --card-fill: var(--chain-card-fill);
+  --card-hover: var(--chain-card-hover);
+  --card-edge: var(--chain-edge);
   box-sizing: border-box;
   min-width: 0;
   min-height: 194px;
@@ -28848,9 +28835,6 @@ button.node-card:active {
   color: var(--ink-2);
   cursor: pointer;
   touch-action: manipulation;
-  transition:
-    border-color 0.15s ease,
-    background-color 0.15s ease;
 }
 :root[data-theme='light'] .chain-card {
   --chain-card-fill: var(--sheet);
@@ -28867,35 +28851,56 @@ button.node-card:active {
 .chain-card.tone-bad {
   --chain-tone: var(--err);
 }
-/* 同机器卡：触控端不能用粘滞 hover 充当选中反馈，否则首触可能被 WebKit 吞掉。 */
-@media (hover: hover) and (pointer: fine) {
-  .chain-card:hover {
-    border-color: color-mix(in srgb, var(--chain-edge) 45%, var(--line));
-  }
-  .chain-card:hover:not(.picked, .order-drag-active) {
-    background: var(--chain-card-hover);
-  }
-}
-.chain-card:active {
-  border-color: color-mix(in srgb, var(--chain-edge) 55%, var(--line));
-}
-.chain-card:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 2px;
-}
 .chain-card.off {
   opacity: 0.55;
 }
-/* 同机器卡：选中态随状态分档（`--chain-edge`）。正常档取主题色，其余档保持状态色——
-   选中模式下灯被复选框顶掉，边框是这张卡唯一还在说状态的东西。 */
-.chain-card.picked {
-  border-color: color-mix(in srgb, var(--chain-edge) 65%, var(--line));
+/* 两类卡片共用交互状态。hover 仅供鼠标；按下覆盖触屏、原生按钮和键盘激活。
+   内描边不改变几何尺寸，选中内框与键盘焦点外圈可以同时存在。 */
+:is(.node-card, .chain-card) {
+  touch-action: manipulation;
+  outline: none;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    transform 0.12s ease;
+}
+@media (hover: hover) and (pointer: fine) {
+  :is(.node-card, .chain-card):hover:not(.picked, .order-drag-active) {
+    background: var(--card-hover);
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--card-edge) 45%, var(--line)),
+      var(--sheet-shadow);
+  }
+}
+:is(.node-card, .chain-card):is(:active, [data-card-pressed='true'], [data-card-pointer-pressed='true']):not(
+    .picked,
+    .order-drag-active
+  ) {
+  background: var(--card-hover);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--card-edge) 55%, var(--line)),
+    var(--sheet-shadow);
+}
+:is(.node-card, .chain-card):is(:active, [data-card-pressed='true'], [data-card-pointer-pressed='true']):not(
+    .order-drag-active
+  ) {
+  transform: scale(0.985);
+}
+:is(.node-card, .chain-card).picked {
+  box-shadow:
+    inset 0 0 0 2px color-mix(in srgb, var(--card-edge) 65%, var(--line)),
+    var(--sheet-shadow);
   background:
     linear-gradient(
-      color-mix(in srgb, var(--chain-edge) 7%, transparent),
-      color-mix(in srgb, var(--chain-edge) 7%, transparent)
+      color-mix(in srgb, var(--card-edge) 7%, transparent),
+      color-mix(in srgb, var(--card-edge) 7%, transparent)
     ),
-    var(--chain-card-fill);
+    var(--card-fill);
+}
+:is(.node-card, .chain-card):is(:focus-visible, :has(input:focus-visible)) {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
 }
 .chain-card-head {
   display: flex;
@@ -29349,7 +29354,7 @@ button.node-card:active {
   background: var(--float);
   -webkit-backdrop-filter: var(--float-filter);
   backdrop-filter: var(--float-filter);
-  box-shadow: var(--float-edge), var(--shadow);
+  box-shadow: var(--shadow);
   transform-origin: bottom center;
   animation: external-target-menu-in 90ms ease-out;
 }
@@ -36290,7 +36295,7 @@ body.fg-dragging .fg-rail {
   background: var(--float);
   -webkit-backdrop-filter: var(--float-filter);
   backdrop-filter: var(--float-filter);
-  box-shadow: var(--float-edge), var(--shadow);
+  box-shadow: var(--shadow);
 }
 .cg-menu button {
   display: grid;

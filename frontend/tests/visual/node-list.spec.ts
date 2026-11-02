@@ -51,6 +51,32 @@ for (const engine of ['chromium', 'webkit'] as const) {
     ],
   });
   test.describe(`Comet health cards ${engine}`, () => {
+    test('live NIC frames update current rates and preserve gaps', async ({ page }) => {
+      const errors = await preview(page, 390, 'dark');
+      const target = card(page, '香港 HKIX');
+      await target.scrollIntoViewIfNeeded();
+      const curve = await target.locator('.node-card-comet').innerHTML();
+      const send = async (gap: boolean) =>
+        page.evaluate(gap => {
+          const push = (window as unknown as { __nodePreviewPush: (url: string, event: string, data: unknown) => void })
+            .__nodePreviewPush;
+          push('/realtime/nodes/events', 'sample', {
+            node_id: 'hk-hkix',
+            received_at_unix_millis: Date.now() + (gap ? 1 : 0),
+            sample: { rx_bytes_per_sec: 15_000_000, tx_bytes_per_sec: 5_000_000, has_gap: gap },
+          });
+        }, gap);
+      await send(false);
+      await expect(target.locator('.node-card-rate')).toHaveText('160Mbit/s');
+      await expect(target.locator('.node-card-rate')).toHaveAttribute('title', /实时采样/);
+      expect(await target.locator('.node-card-comet').innerHTML()).toBe(curve);
+      await noOverflow(page);
+      await expect(page).toHaveScreenshot(`comet-${engine}-390-live.png`);
+      await send(true);
+      await expect(target.locator('.node-card-rate')).toHaveText('—');
+      await expect(page).toHaveScreenshot(`comet-${engine}-390-live-gap.png`);
+      expect(errors).toEqual([]);
+    });
     for (const width of [1440, 900])
       for (const theme of ['dark', 'light']) {
         test(`desktop ${width} ${theme}`, async ({ page }) => {

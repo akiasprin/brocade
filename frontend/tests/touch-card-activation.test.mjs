@@ -9,16 +9,16 @@ test('clickable cards do not expose sticky hover rules to touch pointers', () =>
   const css = styles.replace(/\/\*[\s\S]*?\*\//g, '');
   const pointerMedia = /@media \(hover: hover\) and \(pointer: fine\)\s*\{[\s\S]*?^\}/gm;
   const pointerRules = css.match(pointerMedia) ?? [];
-  assert.match(pointerRules.join('\n'), /\.chain-card:hover\s*\{/);
+  assert.match(pointerRules.join('\n'), /:is\(\.node-card, \.chain-card\):hover/);
   assert.doesNotMatch(
     css.replace(pointerMedia, ''),
-    /\.chain-card:hover/,
+    /:is\(\.node-card, \.chain-card\):hover/,
     'every card hover selector, including conditional fills, must require a fine hover pointer',
   );
 });
 
 test('touch cards retain immediate pressed feedback', () => {
-  assert.match(styles, /\.chain-card:active\s*\{[^}]*border-color:/s);
+  assert.match(styles, /:is\(\.node-card, \.chain-card\):is\(:active,[^}]*box-shadow:/s);
 });
 
 test('chain cards reject compatibility mouse dragging on coarse touch surfaces', () => {

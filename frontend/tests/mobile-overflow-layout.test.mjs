@@ -38,7 +38,7 @@ test('隧道连接表的长值单行省略，窄详情页头只留一层', () =>
 });
 
 test('手机端不渲染桌面面包屑或额外返回条', () => {
-  assert.match(shell, /\{!narrow && \(\s*<div className="fg-crumb">/);
+  assert.doesNotMatch(shell, /fg-crumb|ForgeCrumb/);
   assert.doesNotMatch(shell, /ForgeMobileBack|fg-mobile-crumb/);
   assert.doesNotMatch(styles, /\.fg-mobile-crumb/);
 });
