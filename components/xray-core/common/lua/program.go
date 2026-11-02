@@ -11,7 +11,7 @@ import (
 
 	"github.com/xtls/xray-core/common/base64"
 	"github.com/xtls/xray-core/common/errors"
-	"github.com/xtls/xray-core/common/platform"
+	"github.com/xtls/xray-core/common/platform/filesystem"
 	glua "github.com/yuin/gopher-lua"
 	"github.com/yuin/gopher-lua/parse"
 )
@@ -35,7 +35,7 @@ func Compile(script string) (*Program, error) {
 	if strings.HasPrefix(script, base64.GzipPrefix) || strings.HasPrefix(script, base64.Prefix) {
 		// TODO: Restore inline script support and re-enable the related tests.
 		return nil, errors.New("currently unavailable")
-	} else if name, err = platform.ResolveLuaFile(script); err == nil {
+	} else if name, err = filesystem.ResolveLuaFile(script); err == nil {
 		code, err = os.ReadFile(name)
 		// TODO: Restore privileged signature authorization and re-enable the related tests and CLI entries.
 		// if err == nil {

@@ -188,9 +188,9 @@ const CONSOLE_ASSETS_ENV: &str = "BROCADE_CONSOLE_ASSETS_DIR";
 /// The escape hatch naming where npm is, for a machine that keeps node outside PATH.
 const NPM_ENV_VAR: &str = "BROCADE_NPM";
 /// The vendored Xray baseline distributed to every new node.
-const XRAY_VERSION: &str = "v26.10.21";
+const XRAY_VERSION: &str = "v26.10.31";
 /// `git describe --always` for the upstream baseline, matching Xray's release workflow banner.
-const XRAY_UPSTREAM_BUILD: &str = "1b1647c";
+const XRAY_UPSTREAM_BUILD: &str = "a4a3dff";
 /// Xray source is part of this repository. The build must never clone or select an upstream tag.
 const XRAY_SOURCE_DIR: &str = "components/xray-core";
 /// Escape hatch for locating Go outside PATH.
