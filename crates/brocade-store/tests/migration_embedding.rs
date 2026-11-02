@@ -1,6 +1,7 @@
 #[path = "../build/migrations.rs"]
 mod migrations;
 
+use sha2::{Digest, Sha384};
 use std::{
     fs,
     path::PathBuf,
@@ -43,6 +44,20 @@ fn repository_preserves_published_migrations_and_appends_app_rate_limits() {
             .collect::<Vec<_>>(),
         [1, 2, 3, 4]
     );
+    // v0.3.4 shipped these exact SQLx migration bytes. Only version 4 is new in v0.3.5.
+    let published_checksums = [
+        "794044a4f1b7ead02b8102e21bc7f94d3c01f309216a5e15ada747c61de528c04b494a46e993f683a7d256aa37cd0947",
+        "54300599c9b4cce71f9e574b3f43141fee2fbd50279f829feda08f537bcde441a725ff1af4e0fbbf96fb9d80966552f1",
+        "6b9c70bc99b3ecd499b33fea34c0a927d8dcaa604d90e09937899bfee2415b20a21d81d2c599de4c18222ace1f2204e8",
+    ];
+    for (source, checksum) in sources.iter().zip(published_checksums) {
+        assert_eq!(
+            format!("{:x}", Sha384::digest(fs::read(&source.path).unwrap())),
+            checksum,
+            "published migration {} must remain byte-for-byte unchanged",
+            source.version
+        );
+    }
     let notifications = fs::read_to_string(&sources[2].path).unwrap();
     assert!(notifications.contains("pg_notify"));
     assert!(notifications.contains("AFTER UPDATE OF status, attempt ON binary_release_targets"));
