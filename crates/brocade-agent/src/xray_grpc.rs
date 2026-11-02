@@ -702,7 +702,7 @@ fn decode_online_source(message: &[u8]) -> Result<OnlineSource, String> {
             (4..=6, _) => {
                 return Err(
                     "xray sent an invalid online source session metric wire type".to_owned(),
-                )
+                );
             }
             _ => {}
         }
@@ -738,7 +738,7 @@ fn decode_online_source(message: &[u8]) -> Result<OnlineSource, String> {
             )
         }
         _ => {
-            return Err("xray sent incomplete or invalid online source session metrics".to_owned())
+            return Err("xray sent incomplete or invalid online source session metrics".to_owned());
         }
     };
     protocols.sort_unstable();

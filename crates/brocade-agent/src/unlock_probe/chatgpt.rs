@@ -131,8 +131,12 @@ fn confirm_with<
             break;
         }
         if attempt > 0 {
-            eprintln!("unlock probe service=Chatgpt retry={attempt} web_pending={} app_pending={} region_pending={}",
-                pending(&web), pending(&mobile), region.is_none());
+            eprintln!(
+                "unlock probe service=Chatgpt retry={attempt} web_pending={} app_pending={} region_pending={}",
+                pending(&web),
+                pending(&mobile),
+                region.is_none()
+            );
             pause();
         }
         if pending(&web) && Instant::now() < deadline {

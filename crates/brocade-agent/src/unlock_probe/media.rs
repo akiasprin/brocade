@@ -456,7 +456,9 @@ mod tests {
             let data = STANDARD.encode(format!(
                 r#"{{"appName":"{name}","market":"HK","isAnonymous":true}}"#
             ));
-            let page = format!("<title>Spotify</title><script id='appServerConfig' type='text/plain'>{data}</script>");
+            let page = format!(
+                "<title>Spotify</title><script id='appServerConfig' type='text/plain'>{data}</script>"
+            );
             let outcome = check(S::Spotify, 200, &page, SPOTIFY_URL);
             assert_eq!(outcome.status, U::Available);
             assert_eq!(outcome.region.as_deref(), Some("HK"));

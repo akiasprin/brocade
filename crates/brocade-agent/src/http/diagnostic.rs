@@ -64,11 +64,15 @@ impl Progress {
         self.message(phase, &category(error))
     }
     pub(super) fn message(&self, phase: &str, kind: &str) -> String {
-        format!("HTTP phase={phase} kind={kind} status={} received_bytes={} content_length={} elapsed_ms={}",
-            self.status.map_or_else(|| "unknown".to_owned(), |status| status.to_string()),
+        format!(
+            "HTTP phase={phase} kind={kind} status={} received_bytes={} content_length={} elapsed_ms={}",
+            self.status
+                .map_or_else(|| "unknown".to_owned(), |status| status.to_string()),
             self.received_bytes,
-            self.content_length.map_or_else(|| "unknown".to_owned(), |length| length.to_string()),
-            self.started.elapsed().as_millis())
+            self.content_length
+                .map_or_else(|| "unknown".to_owned(), |length| length.to_string()),
+            self.started.elapsed().as_millis()
+        )
     }
 }
 #[cfg(test)]

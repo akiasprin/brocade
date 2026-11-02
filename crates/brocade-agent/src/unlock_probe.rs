@@ -1639,14 +1639,32 @@ mod tests {
             vec![("Fastly-Debug", "1".into())]
         );
         for (headers, expected) in [
-            ("Fastly-Debug-Path: (D cache-hkg123-HKG 1700000000) (F cache-iad123-IAD 1600000000)\r\n", "HKG"),
-            ("X-Served-By: cache-lhr123-LHR\r\nFastly-Debug-Path: (D cache-hkg123-HKG 1700000000)\r\n", "LHR"),
-            ("Fastly-Debug-Path: (F cache-hkg123-HKG 1700000000) (D cache-iad123-IAD 1600000000)\r\n", "MO"),
-            ("Fastly-Debug-Path: (D unknown 1700000000) (D cache-iad123-IAD 1600000000)\r\n", "MO"),
-            ("Fastly-Debug-Path: (D cache-hkg123-HKG not-a-timestamp)\r\n", "MO"),
+            (
+                "Fastly-Debug-Path: (D cache-hkg123-HKG 1700000000) (F cache-iad123-IAD 1600000000)\r\n",
+                "HKG",
+            ),
+            (
+                "X-Served-By: cache-lhr123-LHR\r\nFastly-Debug-Path: (D cache-hkg123-HKG 1700000000)\r\n",
+                "LHR",
+            ),
+            (
+                "Fastly-Debug-Path: (F cache-hkg123-HKG 1700000000) (D cache-iad123-IAD 1600000000)\r\n",
+                "MO",
+            ),
+            (
+                "Fastly-Debug-Path: (D unknown 1700000000) (D cache-iad123-IAD 1600000000)\r\n",
+                "MO",
+            ),
+            (
+                "Fastly-Debug-Path: (D cache-hkg123-HKG not-a-timestamp)\r\n",
+                "MO",
+            ),
         ] {
             let body = r#"<title>Reddit</title><shreddit-app country="MO"></shreddit-app>"#;
-            let wire = format!("HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\n\r\n{body}", body.len());
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
             let page = Page {
                 response: crate::http::tests::response_from_wire(wire.as_bytes()).unwrap(),
                 url: reqwest::Url::parse("https://www.reddit.com/").unwrap(),

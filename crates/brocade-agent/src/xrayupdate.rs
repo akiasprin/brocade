@@ -107,7 +107,7 @@ pub(crate) fn read_upgrade_runtime(state_dir: &Path) -> Result<Option<XrayUpgrad
             return Err(format!(
                 "读取 Xray 双进程状态 {} 失败：{error}",
                 path.display()
-            ))
+            ));
         }
     };
     let metadata = file
@@ -3080,7 +3080,7 @@ fn poll_cycle(options: &Options, queue: &Arc<XrayUpdateQueue>) -> Result<(), Str
                 &download,
                 &candidate,
                 format!("计算下载的 Xray 摘要失败：{error}"),
-            )
+            );
         }
     };
     if got != offer.sha256 {
@@ -3193,7 +3193,7 @@ fn validate_offer(offer: &XrayReleaseOffer) -> Result<(), String> {
     }
     match offer.strategy {
         XrayReleaseStrategy::Restart if offer.drain_timeout_secs.is_some() => {
-            return Err("restart 发布不能携带排空超时".to_owned())
+            return Err("restart 发布不能携带排空超时".to_owned());
         }
         XrayReleaseStrategy::Handoff | XrayReleaseStrategy::HandoffForce => {
             if !offer.drain_timeout_secs.is_some_and(|seconds| {
@@ -3303,7 +3303,7 @@ fn perform_update(
                 offer,
                 XrayReleaseOutcome::Unsupported,
                 error,
-            ))
+            ));
         }
     };
     if let Err(error) = validate_managed_target(&target) {
@@ -3446,7 +3446,7 @@ pub(crate) fn begin_config_handoff(
                 &status,
                 None,
                 "旧代没有完成 pause barrier",
-            )
+            );
         }
         Err(error) => {
             return rollback_config_handoff_before_switch(
@@ -3457,7 +3457,7 @@ pub(crate) fn begin_config_handoff(
                 &old_status,
                 None,
                 &error,
-            )
+            );
         }
     };
     runtime.phase = XrayUpgradePhase::Switching;
@@ -3495,7 +3495,7 @@ pub(crate) fn begin_config_handoff(
                 &paused,
                 None,
                 &error,
-            )
+            );
         }
     };
     let exported = match relocate_handoff_descriptors(&exported) {
@@ -3509,7 +3509,7 @@ pub(crate) fn begin_config_handoff(
                 &exported_status,
                 None,
                 &error,
-            )
+            );
         }
     };
     let candidate_handoff = match prepare_candidate_handoff_for_listeners(
@@ -3530,7 +3530,7 @@ pub(crate) fn begin_config_handoff(
                 &exported_status,
                 None,
                 &error,
-            )
+            );
         }
     };
 
@@ -3558,7 +3558,7 @@ pub(crate) fn begin_config_handoff(
                     &exported_status,
                     None,
                     &error,
-                )
+                );
             }
         };
     drop(exported);
@@ -3576,7 +3576,7 @@ pub(crate) fn begin_config_handoff(
                 &exported_status,
                 Some((&candidate_handoff.manifest, candidate_process)),
                 &format!("记录候选进程身份失败：{error}"),
-            )
+            );
         }
     };
     runtime.candidate = Some(candidate_upgrade);
@@ -3652,7 +3652,7 @@ pub(crate) fn begin_config_handoff(
                 &exported_status,
                 Some((&candidate_handoff.manifest, candidate_process)),
                 "候选配置 seal 后状态不安全",
-            )
+            );
         }
         Err(error) => {
             return rollback_config_handoff_before_switch(
@@ -3663,7 +3663,7 @@ pub(crate) fn begin_config_handoff(
                 &exported_status,
                 Some((&candidate_handoff.manifest, candidate_process)),
                 &error,
-            )
+            );
         }
     };
     let resumed = match handoff_rpc(
@@ -3683,7 +3683,7 @@ pub(crate) fn begin_config_handoff(
                 &exported_status,
                 Some((&candidate_handoff.manifest, candidate_process)),
                 "候选配置没有进入 accepting 状态",
-            )
+            );
         }
         Err(error) => {
             return rollback_config_handoff_before_switch(
@@ -3694,7 +3694,7 @@ pub(crate) fn begin_config_handoff(
                 &exported_status,
                 Some((&candidate_handoff.manifest, candidate_process)),
                 &error,
-            )
+            );
         }
     };
     let old_status_after_udp = match drop_generation_udp(
@@ -3919,7 +3919,7 @@ fn perform_handoff_update_at_target(
                 offer,
                 pre_update_failure_outcome(options, offer),
                 error,
-            ))
+            ));
         }
     };
     if !crate::xray_version_has_capability(&candidate_version, XRAY_HANDOFF_CAPABILITY) {
@@ -3949,7 +3949,7 @@ fn perform_handoff_update_at_target(
                     candidate,
                     target,
                     &handoff_blocked_reason(&status),
-                ))
+                ));
             }
             Err(error) => {
                 return Some(restart_handoff_fallback(
@@ -3959,7 +3959,7 @@ fn perform_handoff_update_at_target(
                     candidate,
                     target,
                     &format!("当前 Xray 不具备真实 handoff 运行态：{error}"),
-                ))
+                ));
             }
         };
     let old_sha = match file_sha256_hex(&PathBuf::from(format!("/proc/{}/exe", old_process.pid))) {
@@ -3970,7 +3970,7 @@ fn perform_handoff_update_at_target(
                 offer,
                 XrayReleaseOutcome::Unsupported,
                 format!("运行中旧代摘要 {sha} 与发布冻结摘要不一致"),
-            ))
+            ));
         }
         Err(error) => {
             return Some(failure_report(
@@ -3978,7 +3978,7 @@ fn perform_handoff_update_at_target(
                 offer,
                 XrayReleaseOutcome::Unsupported,
                 error,
-            ))
+            ));
         }
     };
     let backup = options.state_dir.join(PREVIOUS_FILE);
@@ -4009,7 +4009,7 @@ fn perform_handoff_update_at_target(
                 offer,
                 XrayReleaseOutcome::Unsupported,
                 error,
-            ))
+            ));
         }
     };
     let mut runtime = XrayUpgradeRuntime {
@@ -4070,7 +4070,7 @@ fn perform_handoff_update_at_target(
                 None,
                 &backup,
                 "旧代没有完成 pause barrier",
-            ))
+            ));
         }
         Err(error) => {
             return Some(rollback_handoff_before_switch(
@@ -4083,7 +4083,7 @@ fn perform_handoff_update_at_target(
                 None,
                 &backup,
                 &error,
-            ))
+            ));
         }
     };
     runtime.phase = XrayUpgradePhase::Switching;
@@ -4104,7 +4104,7 @@ fn perform_handoff_update_at_target(
                 None,
                 &backup,
                 "旧代 export fence epoch 溢出",
-            ))
+            ));
         }
     };
     let (exported_status, exported) = match handoff_export_rpc(
@@ -4125,7 +4125,7 @@ fn perform_handoff_update_at_target(
                 None,
                 &backup,
                 &error,
-            ))
+            ));
         }
     };
     let exported = match relocate_handoff_descriptors(&exported) {
@@ -4141,7 +4141,7 @@ fn perform_handoff_update_at_target(
                 None,
                 &backup,
                 &error,
-            ))
+            ));
         }
     };
     let candidate_handoff =
@@ -4159,7 +4159,7 @@ fn perform_handoff_update_at_target(
                     None,
                     &backup,
                     &error,
-                ))
+                ));
             }
         };
     let (candidate_status, candidate_process) =
@@ -4176,7 +4176,7 @@ fn perform_handoff_update_at_target(
                     None,
                     &backup,
                     &error,
-                ))
+                ));
             }
         };
     drop(exported);
@@ -4207,7 +4207,7 @@ fn perform_handoff_update_at_target(
                 None,
                 &backup,
                 &format!("读取运行配置失败：{error}"),
-            ))
+            ));
         }
     };
     let api_address = crate::xray_api_address(&config).unwrap_or(crate::DEFAULT_XRAY_API_ADDRESS);
@@ -4250,7 +4250,7 @@ fn perform_handoff_update_at_target(
                 None,
                 &backup,
                 "候选 seal 后状态不安全",
-            ))
+            ));
         }
         Err(error) => {
             return Some(rollback_handoff_before_switch(
@@ -4263,7 +4263,7 @@ fn perform_handoff_update_at_target(
                 None,
                 &backup,
                 &error,
-            ))
+            ));
         }
     };
     if let Err(error) = replace_executable(candidate, target)
@@ -4300,7 +4300,7 @@ fn perform_handoff_update_at_target(
                 Some(target),
                 &backup,
                 "候选没有进入 accepting 状态",
-            ))
+            ));
         }
         Err(error) => {
             return Some(rollback_handoff_before_switch(
@@ -4313,7 +4313,7 @@ fn perform_handoff_update_at_target(
                 Some(target),
                 &backup,
                 &error,
-            ))
+            ));
         }
     };
     if let Err(error) = drop_generation_udp(
@@ -4360,7 +4360,7 @@ fn perform_handoff_update_at_target(
                 offer,
                 &mut runtime,
                 format!("交接后无法确认旧代排空状态：{error}"),
-            ))
+            ));
         }
     };
     runtime.old.active_connections = Some(status.active);
@@ -4379,7 +4379,7 @@ fn perform_handoff_update_at_target(
                     offer,
                     &mut runtime,
                     format!("旧代 public 已排空但 cover drain 失败：{error}"),
-                ))
+                ));
             }
         };
         runtime.old.active_connections = Some(status.active);
@@ -4453,7 +4453,7 @@ fn perform_handoff_update_at_target(
                 offer,
                 &mut runtime,
                 "旧代退役后候选不再 accepting".to_owned(),
-            ))
+            ));
         }
         Err(error) => return Some(handoff_dirty_failure(options, offer, &mut runtime, error)),
     };
@@ -4633,10 +4633,10 @@ fn restart_handoff_fallback(
                 offer,
                 XrayReleaseOutcome::FailedDirty,
                 "已有双进程交接，拒绝重启降级或创建第三代进程".to_owned(),
-            )
+            );
         }
         Err(error) => {
-            return failure_report(options, offer, XrayReleaseOutcome::FailedDirty, error)
+            return failure_report(options, offer, XrayReleaseOutcome::FailedDirty, error);
         }
     }
     eprintln!("xray-update: 平滑条件不足，将降级为直接重启，现有连接将中断：{reason}");
@@ -7710,7 +7710,10 @@ mod tests {
                 .iter()
                 .find(|listener| listener.address == format!("127.0.0.1:{public_port}"))
                 .unwrap();
-            assert_ne!(old_listener.socket_cookie, new_listener.socket_cookie, "changed socket options must use a fresh kernel socket, not merely bypass the digest check");
+            assert_ne!(
+                old_listener.socket_cookie, new_listener.socket_cookie,
+                "changed socket options must use a fresh kernel socket, not merely bypass the digest check"
+            );
             assert_ne!(
                 old_listener.socket_config_sha256,
                 new_listener.socket_config_sha256
