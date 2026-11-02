@@ -1494,23 +1494,43 @@ pub async fn record_usage_report(
         if is_probe_label(&label) {
             continue;
         }
-        let Some(binding) = generation.bindings.get(&label) else {
-            skipped_counters += 1;
-            unknown_counters.push(UnknownCounterObservation {
-                fingerprint: unknown_counter_fingerprint(node_id, &label),
-                xray_epoch: xray_epoch.clone(),
-                uplink_bytes: counter.uplink_bytes,
-                downlink_bytes: counter.downlink_bytes,
-            });
-            continue;
-        };
-        let first_reading_policy = binding.first_reading_policy();
+        let binding = generation.bindings.get(&label);
+        let first_reading_policy = binding.map_or(
+            FirstReadingPolicy::EstablishBaseline,
+            FrozenBinding::first_reading_policy,
+        );
         let previous = usage_head_for_update(&mut tx, node_id, &label).await?;
-        let Some(owner) = binding.to_counter_owner(&label) else {
+        let mut resolved = binding
+            .and_then(|binding| binding.to_counter_owner(&label))
+            .map(|owner| (owner, generation.id, metadata));
+        if resolved.is_none() {
+            if let Some(head) = previous.as_ref().filter(|head| {
+                head.generation_id < generation.id
+                    && head.xray_epoch == xray_epoch
+                    && request.read_at_unix_secs >= head.read_at_unix_secs
+                    && uplink_bytes >= head.uplink_bytes
+                    && downlink_bytes >= head.downlink_bytes
+                    && (uplink_bytes > head.uplink_bytes || downlink_bytes > head.downlink_bytes)
+            }) {
+                resolved =
+                    retired_chain_owner(&mut tx, node_id, &label, head.generation_id).await?;
+            }
+        }
+        let Some((mut owner, accounting_generation, accounting_metadata)) = resolved else {
+            if binding.is_none() {
+                skipped_counters += 1;
+                unknown_counters.push(UnknownCounterObservation {
+                    fingerprint: unknown_counter_fingerprint(node_id, &label),
+                    xray_epoch: xray_epoch.clone(),
+                    uplink_bytes: counter.uplink_bytes,
+                    downlink_bytes: counter.downlink_bytes,
+                });
+                continue;
+            }
             // Persistent Xray counters survive a topology change that removes their owner from
             // this machine. An unchanged value in the same namespace is already accounted for;
-            // it neither advances the head nor indicates foreign traffic. Require the exact
-            // durable baseline: new bytes, regressions and unproven namespaces still reject.
+            // it neither advances the head nor indicates foreign traffic. Only a proven relay
+            // tail above may grow; revoked users and unproven namespaces still reject.
             if previous.as_ref().is_some_and(|head| {
                 request.read_at_unix_secs >= head.read_at_unix_secs
                     && xray_epoch == head.xray_epoch
@@ -1523,6 +1543,17 @@ pub async fn record_usage_report(
             }
             continue;
         };
+        if let CounterOwner::ChainHop(hop) = &mut owner {
+            if !resolve_chain_owner_node(&mut tx, hop, accounting_generation, previous.as_ref())
+                .await?
+            {
+                // A stale node ID in a frozen JSON binding must not roll back unrelated users
+                // and poison the durable queue with repeated FK failures. Keep this head intact
+                // so a later provable ownership map can recover the cumulative delta.
+                rejected_counters += 1;
+                continue;
+            }
+        }
         let canonical_label = match &owner {
             CounterOwner::User(grant) => &grant.label,
             CounterOwner::ChainHop(hop) => &hop.label,
@@ -1600,7 +1631,7 @@ pub async fn record_usage_report(
                         previous.read_at_unix_secs,
                         uplink_bytes - previous.uplink_bytes,
                         downlink_bytes - previous.downlink_bytes,
-                        previous.generation_id != generation.id,
+                        previous.generation_id != accounting_generation,
                     )
                 };
                 if window_start < request.read_at_unix_secs {
@@ -1614,9 +1645,9 @@ pub async fn record_usage_report(
                         uplink_bytes: uplink_delta,
                         downlink_bytes: downlink_delta,
                         has_gap,
-                        revision_id: metadata.revision_id,
-                        deployment_id: metadata.deployment_id,
-                        generation_id: generation.id,
+                        revision_id: accounting_metadata.revision_id,
+                        deployment_id: accounting_metadata.deployment_id,
+                        generation_id: accounting_generation,
                     };
                     let sample_inserted = match &owner {
                         CounterOwner::User(_) => insert_usage_sample(&mut tx, insert).await?,
@@ -1663,9 +1694,9 @@ pub async fn record_usage_report(
                     uplink_bytes,
                     downlink_bytes,
                     has_gap,
-                    revision_id: metadata.revision_id,
-                    deployment_id: metadata.deployment_id,
-                    generation_id: generation.id,
+                    revision_id: accounting_metadata.revision_id,
+                    deployment_id: accounting_metadata.deployment_id,
+                    generation_id: accounting_generation,
                 };
                 let sample_inserted = match &owner {
                     CounterOwner::User(_) => insert_usage_sample(&mut tx, insert).await?,
@@ -1697,7 +1728,7 @@ pub async fn record_usage_report(
                 request.xray_started_at_unix_secs,
                 uplink_bytes,
                 downlink_bytes,
-                generation.id,
+                accounting_generation,
                 &agent_instance_id,
                 sequence_i64,
             )
@@ -2492,6 +2523,89 @@ struct UsageHead {
     downlink_bytes: i64,
     xray_epoch: String,
     generation_id: i64,
+}
+
+/// A configuration handoff preserves the cumulative namespace while old connections drain.
+/// The durable head identifies the last authorized owner; a new topology cannot reinterpret
+/// its remaining bytes. Keep that generation on the head and samples, while raw readings and
+/// delivery receipts continue to identify the generation actually reported by the Agent.
+async fn retired_chain_owner(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: &str,
+    label: &str,
+    generation_id: i64,
+) -> Result<Option<(CounterOwner, i64, UsageMetadata)>> {
+    let row = sqlx::query(
+        "SELECT bindings -> $3 AS binding, revision_id, deployment_id
+         FROM usage_generations WHERE id = $1 AND node_id = $2",
+    )
+    .bind(generation_id)
+    .bind(node_id)
+    .bind(label)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let Some(binding) = row.try_get::<Option<serde_json::Value>, _>("binding")? else {
+        return Ok(None);
+    };
+    let binding: FrozenBinding = serde_json::from_value(binding)?;
+    let Some(owner @ CounterOwner::ChainHop(_)) = binding.to_counter_owner(label) else {
+        // Revocation of a user credential is not permission to attribute new bytes through an
+        // obsolete authorization. This continuation is limited to already-accounted relay hops.
+        return Ok(None);
+    };
+    Ok(Some((
+        owner,
+        generation_id,
+        UsageMetadata {
+            revision_id: row.try_get("revision_id")?,
+            deployment_id: row.try_get("deployment_id")?,
+        },
+    )))
+}
+
+/// Node-ID migrations may move FK-backed ledger rows but leave IDs inside frozen JSON intact.
+/// A sample at the exact durable head is authoritative evidence of that counter's destination,
+/// including reverse hops whose accounting machine differs from their reporting machine.
+async fn resolve_chain_owner_node(
+    tx: &mut Transaction<'_, Postgres>,
+    hop: &mut ChainHopMapping,
+    generation_id: i64,
+    previous: Option<&UsageHead>,
+) -> Result<bool> {
+    if let Some(head) = previous.filter(|head| head.generation_id == generation_id) {
+        // The exact window end uses the existing index and bounds the evidence search to one
+        // sampling round. Do not scan retained history or infer an alias from a label suffix.
+        let owners = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT node_id FROM usage_chain_samples
+             WHERE window_end = to_timestamp($1::double precision)
+               AND generation_id = $2 AND hop_label = $3
+               AND tenant_id = $4 AND app_id = $5 AND chain_id = $6
+             ORDER BY node_id LIMIT 2",
+        )
+        .bind(head.read_at_unix_secs)
+        .bind(generation_id)
+        .bind(&hop.label)
+        .bind(&hop.tenant_id)
+        .bind(&hop.app_id)
+        .bind(&hop.chain_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        match owners.as_slice() {
+            [owner] => hop.node_id.clone_from(owner),
+            [] => {}
+            _ => return Ok(false),
+        }
+    }
+    // Hold the destination through all sample/rollup inserts. A concurrent removal must wait
+    // for this report rather than turning a valid resolution into a foreign-key error.
+    Ok(
+        sqlx::query_scalar::<_, String>("SELECT id FROM nodes WHERE id = $1 FOR KEY SHARE")
+            .bind(&hop.node_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
+    )
 }
 
 async fn usage_head_for_update(

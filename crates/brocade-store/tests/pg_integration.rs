@@ -155,6 +155,9 @@ mod node_traffic_history_tests;
 #[path = "cases/usage_retired_counters.rs"]
 mod usage_retired_counter_tests;
 
+#[path = "cases/usage_transitions.rs"]
+mod usage_transition_tests;
+
 #[path = "cases/deployment_artifact_preview.rs"]
 mod deployment_artifact_preview_tests;
 

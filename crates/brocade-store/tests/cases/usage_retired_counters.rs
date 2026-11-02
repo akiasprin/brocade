@@ -66,10 +66,19 @@ async fn usage_report_skips_only_proven_unchanged_retired_counters() {
         assert_eq!(duplicate.rejected_counters, 0);
     }
 
-    // Either direction moving, an unproven epoch or an older timestamp still signals a problem.
+    // A revoked user's growth is not a relay tail and must remain rejected.
+    for (sequence, up, down) in [(5, 151, 300), (6, 150, 301)] {
+        let mut request = report(retired, sequence, base + 70, "journal:stable", 150, 300);
+        request.counters[0].uplink_bytes = up;
+        request.counters[0].downlink_bytes = down;
+        let result = db.store.record_usage_report("n1", request).await.unwrap();
+        assert_eq!(result.rejected_counters, 1);
+        assert_eq!(result.skipped_counters, 1);
+    }
+
+    // Regressions, an unproven epoch or an older timestamp still signal a problem. A proven
+    // relay tail's monotonic growth is covered separately from revoked user credentials.
     for (index, (read_at, epoch, up, down)) in [
-        (base + 70, "journal:stable", 151, 300),
-        (base + 71, "journal:stable", 150, 301),
         (base + 72, "journal:stable", 149, 300),
         (base + 73, "journal:stable", 150, 299),
         (base + 74, "journal:other", 150, 300),
@@ -82,7 +91,7 @@ async fn usage_report_skips_only_proven_unchanged_retired_counters() {
             .store
             .record_usage_report(
                 "n1",
-                report(retired, index as u64 + 5, read_at, epoch, up, down),
+                report(retired, index as u64 + 7, read_at, epoch, up, down),
             )
             .await
             .unwrap();
