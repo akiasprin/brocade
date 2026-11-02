@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>用户额度 · 生产组件验收</title>
+    <style>
+      html,
+      body {
+        height: auto;
+        min-height: 100%;
+        overflow: auto !important;
+      }
+      body {
+        margin: 0;
+        background: var(--ground);
+      }
+      #root {
+        padding: 20px;
+      }
+      @media (max-width: 620px) {
+        #root {
+          padding: 12px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import RefreshRuntime from '/@react-refresh';
+      RefreshRuntime.injectIntoGlobalHook(window);
+      window.$RefreshReg$ = () => {};
+      window.$RefreshSig$ = () => type => type;
+      window.__vite_plugin_react_preamble_installed__ = true;
+    </script>
+    <script type="module" src="./user-quota-preview.tsx"></script>
+  </body>
+</html>

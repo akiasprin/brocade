@@ -37,10 +37,10 @@ test('initial loading stays blank and real surfaces animate only when mounted', 
   assert.match(styles, /\.loading-boundary-guard ~ \*:has\(~ \.loading-boundary-end\)\s*\{[^}]*visibility:\s*hidden/s);
   assert.match(
     styles,
-    /\.loading-boundary-guard[\s\S]*?:is\(\.fg-sheet, \.panel, \.chart-card, \.ncard, \.chain-card, \.tunnel-row\)[^{]*\{[^}]*animation-play-state:\s*paused/s,
+    /\.loading-boundary-guard[\s\S]*?:is\(\.fg-sheet, \.panel, \.chart-card, \.chain-card, \.tunnel-row\)[^{]*\{[^}]*animation-play-state:\s*paused/s,
   );
   assert.match(styles, /\.fg-view :is\(\.fg-sheet, \.panel, \.chart-card\)\s*\{[^}]*motion-surface-mount/s);
-  assert.match(styles, /\.fg-view :is\(\.ncard, \.chain-card, \.tunnel-row\)\s*\{[^}]*motion-card-mount/s);
+  assert.match(styles, /\.fg-view :is\(\.chain-card, \.tunnel-row\)\s*\{[^}]*motion-card-mount/s);
   assert.match(styles, /@keyframes motion-surface-mount[\s\S]*translate3d\(0, 6px, 0\)/);
 });
 

@@ -14,7 +14,6 @@ let ObserveRangeControl: typeof import('../src/panes/nodes').ObserveRangeControl
 let ObserveLinkControl: typeof import('../src/panes/nodes').ObserveLinkControl;
 let LOAD_RANGES: typeof import('../src/panes/nodes').LOAD_RANGES;
 let DEFAULT_LOAD_RANGE: typeof import('../src/panes/nodes').DEFAULT_LOAD_RANGE;
-let TcpProbeLatest: typeof import('../src/panes/nodes').TcpProbeLatest;
 let pingRefreshMillis: typeof import('../src/panes/nodes').pingRefreshMillis;
 let nodeListSnapshotFresh: typeof import('../src/panes/nodes').nodeListSnapshotFresh;
 
@@ -28,7 +27,6 @@ beforeAll(async () => {
     ObserveLinkControl,
     LOAD_RANGES,
     DEFAULT_LOAD_RANGE,
-    TcpProbeLatest,
     pingRefreshMillis,
     nodeListSnapshotFresh,
   } = await import('../src/panes/nodes'));
@@ -292,92 +290,12 @@ describe('machine telemetry range', () => {
     expect(view.series.every(sample => sample.cpu_detail === null && sample.network_detail === null)).toBe(true);
   });
 
-  it('uses the bounded latest-observation endpoint for machine cards', async () => {
+  it('uses the bounded latest-observation API endpoint', async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL) => Response.json({ interval_secs: 60, nodes: [] }));
     vi.stubGlobal('fetch', fetchMock);
 
     await fetchLatestNodePingProbes();
 
     expect(String(fetchMock.mock.calls[0][0])).toBe('/ping-probe/nodes/latest');
-  });
-
-  it('renders the latest TCP attempt without deriving a percentile', () => {
-    const now = Math.floor(Date.now() / 1000);
-    const view = render(
-      <TcpProbeLatest
-        intervalSecs={60}
-        view={{
-          node_id: 'n1',
-          targets: [
-            {
-              name: 'TCP',
-              kind: 'tcp',
-              ipv4: {
-                address: 'tcp://192.0.2.1:443',
-                latest: { probed_at_unix_secs: now, attempted: true, latency_us: 37_250 },
-              },
-              ipv6: null,
-            },
-          ],
-        }}
-      />,
-    );
-
-    expect(view.container.textContent).toBe('37ms');
-    expect(view.container.textContent).not.toContain('P95');
-    expect(view.container.querySelector('.nc-tcp-latest')?.getAttribute('title')).toContain('最新样本');
-  });
-
-  it('reads IPv4 first, keeps IPv6 timeout detail in the title and does not render a badge', () => {
-    const now = Math.floor(Date.now() / 1000);
-    const point = (latency_us: number | null) => ({ probed_at_unix_secs: now, attempted: true, latency_us });
-    const view = render(
-      <TcpProbeLatest
-        intervalSecs={60}
-        view={{
-          node_id: 'n1',
-          targets: [
-            {
-              name: 'A',
-              kind: 'tcp',
-              ipv4: { address: 'tcp://192.0.2.1:443', latest: point(null) },
-              ipv6: { address: 'tcp://[2001:db8::1]:443', latest: point(20_000) },
-            },
-            {
-              name: 'B',
-              kind: 'tcp',
-              ipv4: { address: 'tcp://b.example:443', latest: point(30_000) },
-              ipv6: { address: 'tcp://b.example:443', latest: point(null) },
-            },
-            {
-              name: 'C',
-              kind: 'tcp',
-              ipv4: null,
-              ipv6: { address: 'tcp://[2001:db8::3]:443', latest: point(45_000) },
-            },
-            {
-              name: 'D',
-              kind: 'tcp',
-              ipv4: { address: 'tcp://d.example:443', latest: point(50_000) },
-              ipv6: {
-                address: 'tcp://d.example:443',
-                latest: { probed_at_unix_secs: now, attempted: false, latency_us: null, skip_reason: 'no_route' },
-              },
-            },
-          ],
-        }}
-      />,
-    );
-
-    const reading = view.container.querySelector('.nc-tcp-latest')!;
-    expect(reading.querySelector('.values')?.textContent).toBe('— / 30 / 45');
-    expect(reading.querySelectorAll('.values .lost')).toHaveLength(1);
-    expect(reading.querySelector('.v6')).toBeNull();
-    expect(reading.textContent).not.toContain('v6');
-    expect(reading.textContent).not.toContain('×');
-    const title = reading.getAttribute('title') ?? '';
-    expect(title).toContain('A：IPv4 无响应 · IPv6 20 ms');
-    expect(title).toContain('C：IPv6 45 ms');
-    expect(title).toContain('D：IPv4 50 ms · IPv6 未探测（机器没有 IPv6 路由）');
   });
 });

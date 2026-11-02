@@ -5,7 +5,7 @@ for (const width of [1440, 390])
     await page.clock.setFixedTime(new Date('2026-10-26T08:00:00Z'));
     await page.setViewportSize({ width, height: 1100 });
     await page.goto('/tests/fixtures/chain-unlock-preview.html?scene=calm&dns-fallback=1');
-    await page.getByRole('group', { name: '线路视图' }).getByRole('button', { name: '解锁', exact: true }).click();
+    await page.getByRole('tablist', { name: '线路视图' }).getByRole('tab', { name: '解锁', exact: true }).click();
     const cell = page.locator('.cut-row [data-service="chatgpt"]').first();
     await expect(cell).toHaveAttribute('title', /常规流量仅 IPv4/);
     await expect(cell.locator('.cut-v6')).toHaveCount(0);

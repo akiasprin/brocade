@@ -50,15 +50,17 @@ for (const [theme, palette] of [
   ['dark', dark.dailan],
   ['light', light.dailan],
 ])
-  test(`default ${theme} role colors match the gray-blue palette before JavaScript loads`, () => {
+  test(`default ${theme} role colors match the soft-blue palette before JavaScript loads`, () => {
     const fallback = new Map([...tokens(`[data-theme='${theme}']`), ...tokens(`[data-theme='${theme}']`, true)]);
     for (const [name, value] of palette) {
       if (/^--(?:action|data|primary)(?:-|$)/.test(name)) assert.equal(fallback.get(name), value, name);
     }
-    assert.ok(oklch(palette.get('--action')).chroma < 0.045, 'gray-blue interactions remain muted');
+    // 宝蓝（0.15）在暗色下发亮，灰雾蓝（0.041）把整页读成灰阶；柔和蓝落在两者之间。
+    const { chroma } = oklch(palette.get('--action'));
+    assert.ok(chroma >= 0.08 && chroma <= 0.13, `soft-blue interactions have a visible but restrained hue (${chroma})`);
   });
 
-test('light gray-blue secondary text remains readable across its surfaces', () => {
+test('light dailan secondary text remains readable across its surfaces', () => {
   const t = light.dailan;
   for (const name of ['--ink-3', '--ink-4']) {
     for (const surface of ['--sheet', '--block', '--band', '--surface', '--sunk']) {
@@ -71,16 +73,13 @@ test('dark data colors are in-family tints of the theme color', () => {
   for (const key of PALETTES) {
     const t = dark[key];
     const data = oklch(t.get('--data'));
-    // 黛蓝降低明度与彩度，收敛曲线亮感；其它方案保留原来的明度层级。
-    assert.ok(Math.abs(data.lightness - (key === 'dailan' ? 0.656 : 0.72)) < 0.005, `${key} data lightness`);
+    // 曲线按 72% 不透明度绘制；明度 0.72 才能在暗色底上读清，0.565 的旧取值发暗发浑。
+    assert.ok(Math.abs(data.lightness - 0.72) < 0.005, `${key} data lightness`);
     for (const background of ['--sheet', '--block']) {
       assert.ok(contrast(t.get('--data'), t.get(background)) >= 4.5, `${key} data on ${background}`);
     }
     const action = oklch(t.get('--action'));
-    if (key === 'dailan') {
-      assert.ok(hueGap(data.hue, action.hue) < 6, 'gray-blue data stays in the action hue family');
-      assert.ok(data.chroma < 0.04, 'gray-blue data remains muted');
-    } else if (action.chroma > 0.05) {
+    if (action.chroma > 0.05) {
       // 同族：色相比操作色低 12°，彩度为操作色的 75%（上限 0.13）。
       assert.ok(hueGap(data.hue, action.hue - 12) < 3, `${key} data hue sits 12° below its action`);
       assert.ok(Math.abs(data.chroma - Math.min(action.chroma * 0.75, 0.13)) < 0.008, `${key} data chroma`);
@@ -89,11 +88,7 @@ test('dark data colors are in-family tints of the theme color', () => {
       assert.ok(data.chroma < 0.05, `${key} achromatic palette keeps a muted data color`);
     }
     const rgb = channels(t.get('--data')).map(c => Math.round(c * 255));
-    assert.equal(
-      t.get('--data-wash'),
-      `rgba(${rgb.join(', ')}, ${key === 'dailan' ? 0.09 : 0.13})`,
-      `${key} data wash`,
-    );
+    assert.equal(t.get('--data-wash'), `rgba(${rgb.join(', ')}, 0.13)`, `${key} data wash`);
   }
 });
 
@@ -148,21 +143,16 @@ test('light chart colors remain readable on white cards and palette surfaces', (
       }
     }
     const rgb = channels(t.get('--data')).map(c => Math.round(c * 255));
-    assert.equal(
-      t.get('--data-wash'),
-      `rgba(${rgb.join(', ')}, ${key === 'dailan' ? 0.07 : 0.09})`,
-      `${key} data wash follows its hue`,
-    );
+    assert.equal(t.get('--data-wash'), `rgba(${rgb.join(', ')}, 0.09)`, `${key} data wash follows its hue`);
   }
 });
 
-test('light gray-blue interactions keep readable text in every action state', () => {
+test('light dailan interactions keep readable text in every action state', () => {
   const t = light.dailan;
   for (const name of ['--action', '--action-hover', '--action-active']) {
     assert.ok(contrast(t.get(name), t.get('--sheet')) >= 4.5, `${name} text on paper`);
     assert.ok(contrast(t.get('--action-on'), t.get(name)) >= 4.5, `white label on ${name}`);
   }
-  assert.ok(oklch(t.get('--data')).chroma < 0.05, 'light data remains muted');
 });
 
 test('unstacked chart fills are tinted against the resolved card color', () => {

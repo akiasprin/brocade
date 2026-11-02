@@ -53,7 +53,6 @@ let ThroughputChart: typeof import('../src/panes/telemetry').ThroughputChart;
 let downsampleKpiSeries: typeof import('../src/panes/telemetry').downsampleKpiSeries;
 let loadFindings: typeof import('../src/panes/telemetry').loadFindings;
 let HostCard: typeof import('../src/panes/nodes').HostCard;
-let NicWave: typeof import('../src/panes/nodes').NicWave;
 let ThroughputPanel: typeof import('../src/panes/nodes').ThroughputPanel;
 let PingProbePanel: typeof import('../src/panes/nodes').PingProbePanel;
 let PingLatencyChart: typeof import('../src/panes/node-observation-charts').PingLatencyChart;
@@ -72,7 +71,7 @@ beforeAll(async () => {
     },
   );
   ({ LoadCard, ThroughputChart, downsampleKpiSeries, loadFindings } = await import('../src/panes/telemetry'));
-  ({ HostCard, NicWave, ThroughputPanel, PingProbePanel } = await import('../src/panes/nodes'));
+  ({ HostCard, ThroughputPanel, PingProbePanel } = await import('../src/panes/nodes'));
   ({ PingLatencyChart, ObservationChartLoading } = await import('../src/panes/node-observation-charts'));
 });
 
@@ -381,24 +380,6 @@ describe('deep host telemetry', () => {
     expect(view.getByTitle('Debian GNU/Linux 13 (trixie) · KVM')).toBeTruthy();
     expect(view.getByTitle('6.12.0-amd64 · x86_64')).toBeTruthy();
     expect(view.getByTitle('128.0 MiB / 128.0 MiB')).toBeTruthy();
-  });
-
-  it('fills a node card from its first through last drawable window while retaining internal gaps', () => {
-    const value = report();
-    value.series = Array.from({ length: 7 }, (_, index) => {
-      const next = sample();
-      next.window_start_unix_secs = 100 + index * 30;
-      next.window_end_unix_secs = 130 + index * 30;
-      next.has_gap = index === 0 || index === 3 || index === 6;
-      next.nic_rx_bps = 100 + index * 10;
-      return next;
-    });
-
-    const view = render(<NicWave load={value} />);
-    const lines = [...view.container.querySelectorAll('.node-nic-plot path.line')];
-    expect(lines).toHaveLength(2);
-    expect(lines[0].getAttribute('d')).toMatch(/^M0\.0,/);
-    expect(lines[1].getAttribute('d')).toMatch(/100\.0,[0-9.]+$/);
   });
 
   it('uses seven time marks and advances the value ceiling by one standard tick', () => {
@@ -759,6 +740,24 @@ describe('deep host telemetry', () => {
       expect(line.areaStyle.opacity).toBe(1);
     }
     expect(chartMock.connect).not.toHaveBeenCalled();
+  });
+
+  it('keeps namespace conntrack counts separate from socket inventories', () => {
+    const value = reportWith(sample => {
+      sample.conntrack_count = 100;
+      sample.network_detail!.tcp_curr_estab = 8000;
+      sample.network_detail!.hy2_conntrack_count = 4200;
+    });
+    const view = render(<LoadCard report={value} />);
+    fireEvent.click(view.getByRole('button', { name: /连接表/ }));
+    const chart = chartMock.setOption.mock.calls.find(([option]) =>
+      option.series?.some((line: { name: string }) => line.name === 'HY2 跟踪'),
+    )?.[0];
+    expect(chart).toBeTruthy();
+    expect(chart.series.find((line: { name: string }) => line.name === '主空间跟踪').data.at(-1)[1]).toBe(100);
+    expect(chart.series.find((line: { name: string }) => line.name === 'HY2 跟踪').data.at(-1)[1]).toBe(4200);
+    expect(chart.series.every((line: { stack?: string }) => !line.stack)).toBe(true);
+    expect(chart.series.some((line: { name: string }) => line.name === '其他')).toBe(false);
   });
 
   it('shows the last measured XRAY rate and time without dropping pending data to zero', async () => {

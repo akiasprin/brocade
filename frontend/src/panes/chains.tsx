@@ -8,6 +8,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -104,7 +105,7 @@ import {
 } from '../ui/subscription-country';
 export { subscriptionFlag } from '../ui/subscription-country';
 import { RegionFlag } from '../ui/region-flag';
-import { Icon, ListIcon, PanelTitle, type IconName } from '../ui/icons';
+import { Icon, PanelTitle, type IconName } from '../ui/icons';
 import { useNodeNames } from '../ui/node-name';
 import { navigate, navigateInPlace, returnTo } from '../forge/route';
 import { ProbeBanner, byChain, toneOf, toneTitle } from '../ui/probe';
@@ -4249,6 +4250,12 @@ function orderElements(root: HTMLElement, order: OrderDrag): HTMLElement[] {
   );
 }
 
+const CHAIN_LIST_VIEWS = [
+  { key: 'cards', label: '卡片', icon: 'chains' },
+  { key: 'unlock', label: '解锁', icon: 'unlock' },
+] as const;
+type ChainListView = (typeof CHAIN_LIST_VIEWS)[number]['key'];
+
 function ChainList({ go }: { go: (d: Drill) => void }) {
   const [view, setView] = useState<'cards' | 'unlock'>(() => {
     try {
@@ -4265,6 +4272,9 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
       /* Preference storage may be unavailable; the current view still works. */
     }
   };
+  const tabIdBase = useId();
+  const tabId = (key: ChainListView) => `${tabIdBase}-${key}-tab`;
+  const panelId = `${tabIdBase}-panel`;
   const { who } = useSession();
   const qc = useQueryClient();
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
@@ -4682,6 +4692,23 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     setCreating({ id: randomAppId(new Set(appsNow().map(app => app.id))), label: '' });
   };
 
+  const viewLocked = selecting || creating !== null || renaming !== null;
+  const moveViewTab = (event: ReactKeyboardEvent<HTMLButtonElement>, from: ChainListView) => {
+    if (viewLocked) return;
+    const index = CHAIN_LIST_VIEWS.findIndex(item => item.key === from);
+    let next: number | null = null;
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % CHAIN_LIST_VIEWS.length;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowUp')
+      next = (index - 1 + CHAIN_LIST_VIEWS.length) % CHAIN_LIST_VIEWS.length;
+    if (event.key === 'Home') next = 0;
+    if (event.key === 'End') next = CHAIN_LIST_VIEWS.length - 1;
+    if (next === null) return;
+    event.preventDefault();
+    const key = CHAIN_LIST_VIEWS[next].key;
+    changeView(key);
+    window.requestAnimationFrame(() => document.getElementById(tabId(key))?.focus());
+  };
+
   if (snapshot.isPending || nodeList.isPending) return <Loading variant="chains" />;
   if (snapshot.error || nodeList.error) return <ErrorBox error={snapshot.error ?? nodeList.error} />;
 
@@ -4762,335 +4789,350 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
     chainAttentionTitle(r.disabled, r.ingress, probeOf.get(r.chain.id), r.users);
 
   return (
-    <div className="cardpage chain-cardpage">
-      <section className="panel titled chain-list-panel" data-page-title="true">
-        {/* 主操作与机器页保持同一位置。按钮不按角色隐藏，只按角色禁用：此前整组包在
-          `owner &&` 里，readonly 和 public 看到的线路页标题栏右端是空的，而机器页和
-          用户页是灰按钮，同一个台面上三页的标题栏各一种形态。 */}
-        <header>
-          <ListIcon of="chains" />
-          <h4>线路</h4>
-          <span className="sp" />
-          <div className="chain-list-actions">
-            <SegmentedControl
-              value={view}
-              options={[
-                { value: 'cards', label: '卡片' },
-                { value: 'unlock', label: '解锁' },
-              ]}
-              ariaLabel="线路视图"
-              disabled={selecting || creating !== null || renaming !== null}
-              onChange={changeView}
-            />
-            {selecting ? (
-              <>
-                <button className="btn" onClick={exitSelect}>
+    <div className="nd-sheet nd-page chain-cardpage">
+      <div className="fg-sheet nd-paper chain-list-panel">
+        <header className="nd-page-head">
+          <div className="nd-page-identity">
+            <span className="cg-plate">
+              <Icon of="chains" size={18} />
+            </span>
+            <h1 className="nd-id nd-name">线路</h1>
+          </div>
+          <div className="nd-tabs" role="tablist" aria-label="线路视图">
+            <div className="nd-tabs-seg">
+              {CHAIN_LIST_VIEWS.map(item => (
+                <button
+                  key={item.key}
+                  type="button"
+                  id={tabId(item.key)}
+                  role="tab"
+                  aria-selected={view === item.key}
+                  aria-controls={panelId}
+                  tabIndex={view === item.key ? 0 : -1}
+                  disabled={viewLocked && view !== item.key}
+                  onKeyDown={event => moveViewTab(event, item.key)}
+                  onClick={() => view !== item.key && changeView(item.key)}
+                >
+                  <Icon of={item.icon} size={14} className="nd-tab-ic" />
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          {!isVisitor(who) && (
+            <div className="nd-tools">
+              {selecting ? (
+                <>
+                  <button className="btn" onClick={exitSelect}>
+                    取消
+                  </button>
+                  {/* 选中数量显示在按钮上：它是此时唯一需要确认的信息。删除只写入草稿，
+                  顶栏草稿条会逐条列出且提交前可预览，因此此处不再增加确认。 */}
+                  <button
+                    className="btn danger"
+                    disabled={picked.size === 0 || blockedPickedReferences.length > 0}
+                    title={
+                      blockedPickedReferences.length > 0
+                        ? `不能删除：先同时选择引用方 ${[
+                            ...new Set(blockedPickedReferences.map(reference => reference.at)),
+                          ].join('、')}`
+                        : `删除选中的 ${picked.size} 条链：接入面和挂在下面的授权关系一起删。进草稿，提交才生效`
+                    }
+                    onClick={() => {
+                      // 引用方先删、监听所有者后删，与服务端的引用保护约束一致。
+                      for (const key of pickedDeletionOrder()) {
+                        const slash = key.indexOf('/');
+                        deleteChain(key.slice(0, slash), key.slice(slash + 1));
+                      }
+                      exitSelect();
+                    }}
+                  >
+                    删除链{picked.size > 0 && ` ${picked.size}`}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    className="btn"
+                    disabled={view === 'unlock' || !!creating || !owner}
+                    onClick={() => setSelecting(true)}
+                  >
+                    多选
+                  </button>
+                  <button className="btn primary" disabled={!!creating || !owner} onClick={beginCreate}>
+                    ＋ 新建分组
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+        </header>
+        <div className="nd-paper-body chain-list-body" role="tabpanel" id={panelId} aria-labelledby={tabId(view)}>
+          {probes.error && <ErrorBox error={probes.error} />}
+          {orderError !== null && <ErrorBox error={orderError} />}
+
+          {/* 技术 ID 自动生成；创建时只要求用户填写真正用于辨识的分组名称。 */}
+          {creating && (
+            <form
+              className="prj-newbar"
+              onSubmit={e => {
+                e.preventDefault();
+                create.mutate();
+              }}
+            >
+              <div className="row">
+                <span className="k">新分组</span>
+                <input
+                  className="f nm"
+                  autoFocus
+                  value={creating.label}
+                  // 名称默认留空：名称由用户指定，复制 ID 作为默认值不提供任何信息，
+                  // 而留空可直接表明该字段需要填写。提交时留空则回退为 ID（见 create）。
+                  placeholder="分组名称，比如：「三网优化」"
+                  onChange={e => setCreating({ ...creating, label: e.target.value })}
+                  onKeyDown={e => e.key === 'Escape' && cancelCreating()}
+                />
+                <button className="btn primary" disabled={create.isPending}>
+                  {create.isPending ? '创建中…' : '创建'}
+                </button>
+                <button type="button" className="btn" onClick={cancelCreating}>
                   取消
                 </button>
-                {/* 选中数量显示在按钮上：它是此时唯一需要确认的信息。删除只写入草稿，
-                  顶栏草稿条会逐条列出且提交前可预览，因此此处不再增加确认。 */}
-                <button
-                  className="btn danger"
-                  disabled={picked.size === 0 || blockedPickedReferences.length > 0}
-                  title={
-                    blockedPickedReferences.length > 0
-                      ? `不能删除：先同时选择引用方 ${[
-                          ...new Set(blockedPickedReferences.map(reference => reference.at)),
-                        ].join('、')}`
-                      : `删除选中的 ${picked.size} 条链：接入面和挂在下面的授权关系一起删。进草稿，提交才生效`
-                  }
-                  onClick={() => {
-                    // 引用方先删、监听所有者后删，与服务端的引用保护约束一致。
-                    for (const key of pickedDeletionOrder()) {
-                      const slash = key.indexOf('/');
-                      deleteChain(key.slice(0, slash), key.slice(slash + 1));
-                    }
-                    exitSelect();
-                  }}
-                >
-                  删除链{picked.size > 0 && ` ${picked.size}`}
-                </button>
-              </>
-            ) : (
-              <>
-                <button
-                  className="btn"
-                  disabled={view === 'unlock' || !!creating || !owner}
-                  onClick={() => setSelecting(true)}
-                >
-                  多选
-                </button>
+              </div>
+              {/* 只说明该字段的含义；技术 ID 和草稿机制都不需要用户在这里处理。 */}
+              <p className="note">
+                分组是线路的<b>计费单元</b>：同类链放在一个分组里。
+              </p>
+              {create.error && <ErrorBox error={create.error} />}
+            </form>
+          )}
+
+          {groups.length === 0 ? (
+            <EmptyState
+              icon="chains"
+              title="还没有线路分组"
+              action={
                 <button className="btn primary" disabled={!!creating || !owner} onClick={beginCreate}>
-                  ＋ 新建分组
+                  创建第一个线路分组
                 </button>
-              </>
-            )}
-          </div>
-        </header>
-
-        {probes.error && <ErrorBox error={probes.error} />}
-        {orderError !== null && <ErrorBox error={orderError} />}
-
-        {/* 技术 ID 自动生成；创建时只要求用户填写真正用于辨识的分组名称。 */}
-        {creating && (
-          <form
-            className="prj-newbar"
-            onSubmit={e => {
-              e.preventDefault();
-              create.mutate();
-            }}
-          >
-            <div className="row">
-              <span className="k">新分组</span>
-              <input
-                className="f nm"
-                autoFocus
-                value={creating.label}
-                // 名称默认留空：名称由用户指定，复制 ID 作为默认值不提供任何信息，
-                // 而留空可直接表明该字段需要填写。提交时留空则回退为 ID（见 create）。
-                placeholder="分组名称，比如：「三网优化」"
-                onChange={e => setCreating({ ...creating, label: e.target.value })}
-                onKeyDown={e => e.key === 'Escape' && cancelCreating()}
-              />
-              <button className="btn primary" disabled={create.isPending}>
-                {create.isPending ? '创建中…' : '创建'}
-              </button>
-              <button type="button" className="btn" onClick={cancelCreating}>
-                取消
-              </button>
-            </div>
-            {/* 只说明该字段的含义；技术 ID 和草稿机制都不需要用户在这里处理。 */}
-            <p className="note">
-              分组是线路的<b>计费单元</b>：同类链放在一个分组里。
-            </p>
-            {create.error && <ErrorBox error={create.error} />}
-          </form>
-        )}
-
-        {groups.length === 0 ? (
-          <EmptyState
-            icon="chains"
-            title="还没有线路分组"
-            action={
-              <button className="btn primary" disabled={!!creating || !owner} onClick={beginCreate}>
-                创建第一个线路分组
-              </button>
-            }
-          >
-            分组是线路的计费单元；同类链放在同一个分组里。
-          </EmptyState>
-        ) : view === 'unlock' ? (
-          <ChainUnlockTable
-            groups={groups.map(group => ({
-              ...group,
-              chains: group.chains.map(row => ({ ...row, tone: chainTone(row), title: chainToneTitle(row) })),
-            }))}
-            onOpen={(app, chain) => go({ p: 'chain', app, chain })}
-          />
-        ) : (
-          <div className={`chain-sections${orderDrag?.kind === 'apps' ? ' app-order-dragging' : ''}`} ref={sectionsRef}>
-            {groups.map((g, gi) => (
-              <section
-                className={`chain-section${orderDrag?.kind === 'apps' && orderDrag.active === g.app.id ? ' order-drag-active' : ''}${chainDropTarget === g.app.id ? ' chain-drop-target' : ''}`}
-                key={g.app.id}
-                data-order-kind="app"
-                data-order-id={g.app.id}
-              >
-                <header className="chain-section-head">
-                  <span className="no">{String(gi + 1).padStart(2, '0')}</span>
-                  <button
-                    type="button"
-                    className="order-grip app-order-grip"
-                    disabled={!owner || selecting}
-                    aria-label={`拖动调整线路 ${g.app.label} 的顺序`}
-                    title={owner ? '按住拖动排序；聚焦后也可使用方向键' : '只有系统管理员可以调整顺序'}
-                    onPointerDown={event =>
-                      beginOrderDrag(event, {
-                        kind: 'apps',
-                        active: g.app.id,
-                        original: groups.map(group => group.app.id),
-                        order: groups.map(group => group.app.id),
-                      })
-                    }
-                    onKeyDown={event =>
-                      nudgeOrder(event, {
-                        kind: 'apps',
-                        active: g.app.id,
-                        original: groups.map(group => group.app.id),
-                        order: groups.map(group => group.app.id),
-                      })
-                    }
-                  />
-                  {renaming?.id === g.app.id ? (
-                    <form
-                      className="prj-ren"
-                      onSubmit={e => {
-                        e.preventDefault();
-                        rename.mutate();
-                      }}
-                    >
-                      <input
-                        className="f"
-                        autoFocus
-                        value={renaming.label}
-                        onChange={e => setRenaming({ ...renaming, label: e.target.value })}
-                        onKeyDown={e => e.key === 'Escape' && cancelRenaming()}
-                      />
-                      <button className="btn primary" disabled={rename.isPending}>
-                        {rename.isPending ? '保存中…' : '保存'}
-                      </button>
-                      <button type="button" className="btn" onClick={cancelRenaming}>
-                        取消
-                      </button>
-                      {rename.error && <ErrorBox error={rename.error} />}
-                    </form>
-                  ) : (
-                    <>
-                      {/* 线路名本身就是改名的入口，不再走「⋯ → 改线路名」两步。那个菜单里只有
+              }
+            >
+              分组是线路的计费单元；同类链放在同一个分组里。
+            </EmptyState>
+          ) : view === 'unlock' ? (
+            <ChainUnlockTable
+              groups={groups.map(group => ({
+                ...group,
+                chains: group.chains.map(row => ({ ...row, tone: chainTone(row), title: chainToneTitle(row) })),
+              }))}
+              onOpen={(app, chain) => go({ p: 'chain', app, chain })}
+            />
+          ) : (
+            <div
+              className={`chain-sections${orderDrag?.kind === 'apps' ? ' app-order-dragging' : ''}`}
+              ref={sectionsRef}
+            >
+              {groups.map(g => (
+                <section
+                  className={`chain-section${orderDrag?.kind === 'apps' && orderDrag.active === g.app.id ? ' order-drag-active' : ''}${chainDropTarget === g.app.id ? ' chain-drop-target' : ''}`}
+                  key={g.app.id}
+                  data-order-kind="app"
+                  data-order-id={g.app.id}
+                >
+                  <header className="chain-section-head">
+                    <button
+                      type="button"
+                      className="order-grip app-order-grip"
+                      disabled={!owner || selecting}
+                      aria-label={`拖动调整线路 ${g.app.label} 的顺序`}
+                      title={owner ? '按住拖动排序；聚焦后也可使用方向键' : '只有系统管理员可以调整顺序'}
+                      onPointerDown={event =>
+                        beginOrderDrag(event, {
+                          kind: 'apps',
+                          active: g.app.id,
+                          original: groups.map(group => group.app.id),
+                          order: groups.map(group => group.app.id),
+                        })
+                      }
+                      onKeyDown={event =>
+                        nudgeOrder(event, {
+                          kind: 'apps',
+                          active: g.app.id,
+                          original: groups.map(group => group.app.id),
+                          order: groups.map(group => group.app.id),
+                        })
+                      }
+                    />
+                    {renaming?.id === g.app.id ? (
+                      <form
+                        className="prj-ren"
+                        onSubmit={e => {
+                          e.preventDefault();
+                          rename.mutate();
+                        }}
+                      >
+                        <input
+                          className="f"
+                          autoFocus
+                          value={renaming.label}
+                          onChange={e => setRenaming({ ...renaming, label: e.target.value })}
+                          onKeyDown={e => e.key === 'Escape' && cancelRenaming()}
+                        />
+                        <button className="btn primary" disabled={rename.isPending}>
+                          {rename.isPending ? '保存中…' : '保存'}
+                        </button>
+                        <button type="button" className="btn" onClick={cancelRenaming}>
+                          取消
+                        </button>
+                        {rename.error && <ErrorBox error={rename.error} />}
+                      </form>
+                    ) : (
+                      <>
+                        {/* 线路名本身就是改名的入口，不再走「⋯ → 改线路名」两步。那个菜单里只有
                           这一项，等于给一个动作套了一层抽屉。没有改名权限的人看到的仍是纯文本。 */}
-                      {owner ? (
-                        <button
-                          type="button"
-                          className="chain-section-name"
-                          title="点一下改线路名"
-                          onClick={() => {
-                            if (!confirmDiscardChanges(renameGuardScope)) return;
-                            rename.reset();
-                            setRenaming({ id: g.app.id, label: g.app.label || g.app.id });
-                          }}
-                        >
-                          {g.app.label || g.app.id}
-                        </button>
-                      ) : (
-                        <b>{g.app.label || g.app.id}</b>
-                      )}
-                      {g.app.label && g.app.label !== g.app.id && <span className="id">{g.app.id}</span>}
-                      <span className="count">{g.chains.length} 条链</span>
-                      <div className="chain-section-actions">
-                        <button
-                          className="new-chain"
-                          disabled={!editable}
-                          title="在这条线路下建一条链"
-                          onClick={() => go({ p: 'new', app: g.app.id })}
-                        >
-                          ＋ 新建链
-                        </button>
-                      </div>
-                    </>
-                  )}
-                </header>
-                {orderDrag?.kind === 'apps' ? null : g.chains.length === 0 ? (
-                  <p className="chain-section-empty">还没有链。用上面的「＋ 新建链」建一条。</p>
-                ) : (
-                  <div className="chain-card-grid">
-                    {g.chains.map(r => {
-                      const tone = chainTone(r);
-                      const probe = probeOf.get(r.chain.id);
-                      const key = rowKey(r.app.id, r.chain.id);
-                      const checked = picked.has(key);
-                      const listenerReferenceCount = listenerChainReferences.filter(
-                        reference => reference.target === key,
-                      ).length;
-                      const open = () => {
-                        // 刚结束一次拖动排序：抬手后紧跟的 click 不应再打开这条链。
-                        if (justDragged.current) {
-                          justDragged.current = false;
-                          return;
-                        }
-                        if (selecting) togglePick(key);
-                        else go({ p: 'chain', app: r.app.id, chain: r.chain.id });
-                      };
-                      return (
-                        <div
-                          role="button"
-                          tabIndex={0}
-                          data-route-focus={`chain:${key}`}
-                          key={key}
-                          className={`chain-card tone-${tone}${r.disabled ? ' off' : ''}${checked ? ' picked' : ''}${orderDrag?.kind === 'chains' && orderDrag.active === r.chain.id ? ' order-drag-active' : ''}`}
-                          data-order-kind="chain"
-                          data-order-app={g.app.id}
-                          data-order-id={r.chain.id}
-                          onPointerDown={event =>
-                            beginOrderDrag(event, {
-                              kind: 'chains',
-                              appId: g.app.id,
-                              active: r.chain.id,
-                              original: g.chains.map(row => row.chain.id),
-                              order: g.chains.map(row => row.chain.id),
-                            })
-                          }
-                          onClick={open}
-                          onKeyDown={e => {
-                            if (e.target !== e.currentTarget) return;
-                            if (e.key === 'Enter' || e.key === ' ') {
-                              e.preventDefault();
-                              open();
-                            }
-                          }}
-                        >
-                          <header className="chain-card-head">
-                            <span className="chain-status-slot">
-                              {selecting ? (
-                                <input
-                                  type="checkbox"
-                                  className="chain-card-pick"
-                                  checked={checked}
-                                  aria-label={`选中 ${r.chain.name || r.chain.id}`}
-                                  onChange={() => togglePick(key)}
-                                  onClick={e => e.stopPropagation()}
-                                />
-                              ) : (
-                                <i
-                                  className={`chain-card-status ${tone}`}
-                                  title={chainToneTitle(r)}
-                                  aria-label={chainToneTitle(r)}
-                                />
-                              )}
-                            </span>
-                            <span className="chain-card-flag">
-                              <RegionFlag code={r.chain.subscription_country} />
-                            </span>
-                            <span className="chain-card-title">
-                              <b>{r.chain.name || r.chain.id}</b>
-                              {r.chain.name && r.chain.name !== r.chain.id && <span>{r.chain.id}</span>}
-                              {listenerReferenceCount > 0 && (
-                                <span title="其它线路正在引用这条链拥有的监听子树">
-                                  {listenerReferenceCount} 处监听引用
-                                </span>
-                              )}
-                            </span>
-                            <ChainLatency probe={probe} />
-                          </header>
-                          <div className="chain-card-path">
-                            <ChainPath
-                              spine={r.spine}
-                              retired={retired}
-                              ingress={r.ingress}
-                              disabled={r.disabled}
-                              showTail={false}
-                            />
-                          </div>
-                          <ProbeLatencyPlot probe={probe} />
-                          <footer className="chain-card-foot">
-                            <span className="stat">
-                              <small>用户</small>
-                              <b>{r.users}</b>
-                            </span>
-                            <span className="stat access">
-                              <small>接入</small>
-                              <b title={chainAccessLabel(r.ingress)}>{chainAccessLabel(r.ingress)}</b>
-                            </span>
-                          </footer>
+                        {owner ? (
+                          <button
+                            type="button"
+                            className="chain-section-name"
+                            title="点一下改线路名"
+                            onClick={() => {
+                              if (!confirmDiscardChanges(renameGuardScope)) return;
+                              rename.reset();
+                              setRenaming({ id: g.app.id, label: g.app.label || g.app.id });
+                            }}
+                          >
+                            {g.app.label || g.app.id}
+                          </button>
+                        ) : (
+                          <b>{g.app.label || g.app.id}</b>
+                        )}
+                        <span className="count">{g.chains.length} 条链</span>
+                        <div className="chain-section-actions">
+                          <button
+                            className="new-chain"
+                            disabled={!editable}
+                            title="在这条线路下建一条链"
+                            onClick={() => go({ p: 'new', app: g.app.id })}
+                          >
+                            ＋ 新建链
+                          </button>
                         </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </section>
-            ))}
-          </div>
-        )}
-      </section>
+                      </>
+                    )}
+                  </header>
+                  {orderDrag?.kind === 'apps' ? null : g.chains.length === 0 ? (
+                    <p className="chain-section-empty">还没有链。用上面的「＋ 新建链」建一条。</p>
+                  ) : (
+                    <div className="chain-card-grid">
+                      {g.chains.map(r => {
+                        const tone = chainTone(r);
+                        const probe = probeOf.get(r.chain.id);
+                        const key = rowKey(r.app.id, r.chain.id);
+                        const checked = picked.has(key);
+                        const listenerReferenceCount = listenerChainReferences.filter(
+                          reference => reference.target === key,
+                        ).length;
+                        const open = () => {
+                          // 刚结束一次拖动排序：抬手后紧跟的 click 不应再打开这条链。
+                          if (justDragged.current) {
+                            justDragged.current = false;
+                            return;
+                          }
+                          if (selecting) togglePick(key);
+                          else go({ p: 'chain', app: r.app.id, chain: r.chain.id });
+                        };
+                        return (
+                          <div
+                            role="button"
+                            tabIndex={0}
+                            data-route-focus={`chain:${key}`}
+                            key={key}
+                            className={`chain-card tone-${tone}${r.disabled ? ' off' : ''}${checked ? ' picked' : ''}${orderDrag?.kind === 'chains' && orderDrag.active === r.chain.id ? ' order-drag-active' : ''}`}
+                            data-order-kind="chain"
+                            data-order-app={g.app.id}
+                            data-order-id={r.chain.id}
+                            onPointerDown={event =>
+                              beginOrderDrag(event, {
+                                kind: 'chains',
+                                appId: g.app.id,
+                                active: r.chain.id,
+                                original: g.chains.map(row => row.chain.id),
+                                order: g.chains.map(row => row.chain.id),
+                              })
+                            }
+                            onClick={open}
+                            onKeyDown={e => {
+                              if (e.target !== e.currentTarget) return;
+                              if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                open();
+                              }
+                            }}
+                          >
+                            <header className="chain-card-head">
+                              <span className="chain-status-slot">
+                                {selecting ? (
+                                  <input
+                                    type="checkbox"
+                                    className="chain-card-pick"
+                                    checked={checked}
+                                    aria-label={`选中 ${r.chain.name || r.chain.id}`}
+                                    onChange={() => togglePick(key)}
+                                    onClick={e => e.stopPropagation()}
+                                  />
+                                ) : (
+                                  <i
+                                    className={`chain-card-status ${tone}`}
+                                    title={chainToneTitle(r)}
+                                    aria-label={chainToneTitle(r)}
+                                  />
+                                )}
+                              </span>
+                              <span className="chain-card-flag">
+                                <RegionFlag code={r.chain.subscription_country} />
+                              </span>
+                              <span className="chain-card-title">
+                                <b>{r.chain.name || r.chain.id}</b>
+                                {r.chain.name && r.chain.name !== r.chain.id && <span>{r.chain.id}</span>}
+                                {listenerReferenceCount > 0 && (
+                                  <span title="其它线路正在引用这条链拥有的监听子树">
+                                    {listenerReferenceCount} 处监听引用
+                                  </span>
+                                )}
+                              </span>
+                              <ChainLatency probe={probe} />
+                            </header>
+                            <div className="chain-card-path">
+                              <ChainPath
+                                spine={r.spine}
+                                retired={retired}
+                                ingress={r.ingress}
+                                disabled={r.disabled}
+                                showTail={false}
+                              />
+                            </div>
+                            <ProbeLatencyPlot probe={probe} />
+                            <footer className="chain-card-foot">
+                              <span className="stat">
+                                <small>用户</small>
+                                <b>{r.users}</b>
+                              </span>
+                              <span className="stat access">
+                                <small>接入</small>
+                                <b title={chainAccessLabel(r.ingress)}>{chainAccessLabel(r.ingress)}</b>
+                              </span>
+                            </footer>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </section>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

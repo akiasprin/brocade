@@ -1,11 +1,10 @@
-// Production App and machine configuration, using the same scenarios as the approved C mockup.
-// No candidate panel, portal or mockup styles are loaded here.
+// Production App and machine configuration with synthetic source-access scenarios.
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { App } from '../../src/app';
 import { observeBrowserAppearance } from '../../src/forge/browser-appearance';
 import { theme } from '../../src/forge/theme';
-import { installBackend, NODE, resetWorld, SCENE_KEYS, type SceneKey } from './node-source-ban-mockup-data';
+import { installBackend, NODE, resetWorld, SCENE_KEYS, type SceneKey } from './node-source-access-data';
 import '../../src/styles.css';
 
 const params = new URLSearchParams(location.search);

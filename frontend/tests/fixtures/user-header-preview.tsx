@@ -71,6 +71,7 @@ const appExhausted = (app: string) => app !== 'budget' && ['exhausted', 'stopped
 const appLimit = (app: string) =>
   app === 'budget' ? 50 : trafficState === 'extreme' ? 1 : appExhausted(app) ? 100 : 500;
 const policyFor = (app: string) => ({
+  base_rate_supported: true,
   kind: 'access',
   app_id: app,
   policy: {

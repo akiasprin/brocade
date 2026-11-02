@@ -42,14 +42,29 @@ export function useUserTrafficPolicies(user?: UserListItem) {
   return { ...query, readable, data: readable ? query.data : undefined, error: readable ? query.error : null };
 }
 const rateText = (rate: number) => (rate >= 1_000_000 ? `${rate / 1_000_000} Mbps` : `${rate / 1000} Kbps`);
+const baseRateText = (view: UserTrafficPolicyView) =>
+  view.policy?.base_rate_bps ? `常态限速 ${rateText(view.policy.base_rate_bps)}` : '';
 export const userTrafficPolicyState = (view?: UserTrafficPolicyView) => {
   if (!view) return '';
   if (!view.service_available) return '服务已暂停';
   if (!view.policy) return '';
   const action = view.policy.exhausted_action;
-  if (action.kind === 'throttle')
-    return `${view.exhausted ? '额度已满 · ' : '用满后'}限速 ${rateText(action.rate_bps)}`;
-  return view.exhausted ? '额度已满 · 停用' : '用满后停用';
+  const base = baseRateText(view);
+  if (view.policy.quota_bytes === null) return base;
+  const rate =
+    view.effective?.mode === 'limited'
+      ? view.effective.rate_bps
+      : action.kind === 'throttle'
+        ? Math.min(view.policy.base_rate_bps ?? Infinity, action.rate_bps)
+        : 0;
+  const quota = view.exhausted
+    ? action.kind === 'throttle'
+      ? `限速中 · ${rateText(rate)}`
+      : '已停用'
+    : action.kind === 'throttle'
+      ? `用满后限速 ${rateText(action.rate_bps)}`
+      : '用满后停用';
+  return [base, quota].filter(Boolean).join(' · ');
 };
 
 /** The quota boundary stays at the allowance when the track expands to include overflow. */
@@ -64,16 +79,8 @@ export function UserTrafficQuotaMeter({
 }) {
   const paused = view?.service_available === false;
   const action = view?.policy?.exhausted_action;
-  const pending = action?.kind === 'throttle' ? (view?.pending_nodes?.length ?? 0) : 0;
-  const label = paused
-    ? '服务暂停'
-    : !view?.policy || limit === null
-      ? ''
-      : view.exhausted
-        ? action?.kind === 'throttle'
-          ? `限速中 · ${rateText(action.rate_bps)}`
-          : '已停用'
-        : userTrafficPolicyState(view);
+  const pending = view?.pending_nodes?.length ?? 0;
+  const label = paused ? '服务暂停' : userTrafficPolicyState(view);
   const tone = paused ? 'idle' : view?.exhausted ? (action?.kind === 'throttle' ? 'warn' : 'err') : '';
   const status = (label || pending > 0) && (
     <span className={`qta-policy-flag ${tone}`}>
@@ -153,13 +160,27 @@ function PolicyEditor({
   const initialRate =
     original?.exhausted_action.kind === 'throttle' ? String(original.exhausted_action.rate_bps / 1_000_000) : '5';
   const [quota, setQuota] = useState(initialQuota);
+  const [base, setBase] = useState(rateDraft(original?.base_rate_bps));
+  const [excess, setExcess] = useState(
+    rateDraft(original?.exhausted_action.kind === 'throttle' ? original.exhausted_action.rate_bps : 5_000_000),
+  );
   const [action, setAction] = useState<'suspend' | 'throttle'>(initialAction);
-  const [rate, setRate] = useState(initialRate);
+  const rate = String(rateBps(excess) / 1_000_000);
+  const baseChanged = (base.value.trim() === '' ? null : rateBps(base)) !== (original?.base_rate_bps ?? null);
+  const hasQuota = quota.trim() !== '';
+  const baseSupported = view.base_rate_supported === true;
   const guard = `user-traffic-policy:${user.tenant_id}:${user.id}:${view.kind}:${view.app_id ?? ''}`;
   const dirty =
-    quota !== initialQuota || action !== initialAction || (action === 'throttle' && rate !== initialRate) || !original;
+    quota !== initialQuota ||
+    baseChanged ||
+    action !== initialAction ||
+    (hasQuota && action === 'throttle' && rate !== initialRate) ||
+    !original;
   const clear = useUnsavedChanges(
-    quota !== initialQuota || action !== initialAction || (action === 'throttle' && rate !== initialRate),
+    quota !== initialQuota ||
+      baseChanged ||
+      action !== initialAction ||
+      (hasQuota && action === 'throttle' && rate !== initialRate),
     label,
     guard,
   );
@@ -169,11 +190,14 @@ function PolicyEditor({
     (/^\d+(?:\.\d{1,2})?$/.test(quota.trim()) &&
       Number(quota) > 0 &&
       Number(quota) * 1024 ** 3 <= Number.MAX_SAFE_INTEGER);
-  const rateValid = /^\d+(?:\.\d{1,3})?$/.test(rate.trim()) && Number(rate) >= 0.001 && Number(rate) <= 1_000_000;
-  const unsupported = action === 'throttle' && quota.trim() !== '' && view.unsupported_nodes.length > 0;
+  const rateValid = validRate(excess);
+  const baseValid = base.value.trim() === '' || validRate(base);
+  const unsupported =
+    (base.value.trim() !== '' || (action === 'throttle' && hasQuota)) && view.unsupported_nodes.length > 0;
   const save = useMutation({
     mutationFn: () => {
       const policy: UserTrafficPolicy = {
+        ...(baseSupported ? { base_rate_bps: base.value.trim() === '' ? null : rateBps(base) } : {}),
         quota_bytes:
           quota === initialQuota && original
             ? original.quota_bytes
@@ -200,7 +224,15 @@ function PolicyEditor({
   });
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (quotaValid && (action !== 'throttle' || rateValid) && !unsupported && !save.isPending) save.mutate();
+    if (
+      dirty &&
+      quotaValid &&
+      baseValid &&
+      (!hasQuota || action !== 'throttle' || rateValid) &&
+      !unsupported &&
+      !save.isPending
+    )
+      save.mutate();
   };
   const cancel = () => {
     if (!save.isPending) {
@@ -223,19 +255,6 @@ function PolicyEditor({
       onChange={event => setQuota(event.target.value)}
     />
   );
-  const rateInput = (
-    <input
-      id={`${id}-rate`}
-      className="f mono fwe-num"
-      aria-label="超额速度上限（Mbps）"
-      inputMode="decimal"
-      autoComplete="off"
-      value={rate}
-      disabled={save.isPending}
-      aria-invalid={!rateValid || undefined}
-      onChange={event => setRate(event.target.value)}
-    />
-  );
   const actionControl = (
     <SegmentedControl
       value={action}
@@ -251,7 +270,14 @@ function PolicyEditor({
   const saveButton = (
     <button
       className="btn primary"
-      disabled={!dirty || !quotaValid || (action === 'throttle' && !rateValid) || unsupported || save.isPending}
+      disabled={
+        !dirty ||
+        !quotaValid ||
+        !baseValid ||
+        (hasQuota && action === 'throttle' && !rateValid) ||
+        unsupported ||
+        save.isPending
+      }
     >
       {save.isPending ? '保存中…' : '保存'}
     </button>
@@ -279,17 +305,29 @@ function PolicyEditor({
             {quotaValid ? '留空表示不限' : '请输入正数，最多两位小数'}
           </small>
         </InlineField>
-        <InlineField label="用满后">{actionControl}</InlineField>
-        {action === 'throttle' && (
+        <InlineField label="常态限速" htmlFor={`${id}-base`}>
+          <SpeedInput
+            id={`${id}-base`}
+            label="常态"
+            draft={base}
+            onChange={setBase}
+            disabled={save.isPending || !baseSupported}
+            optional
+          />
+          <small className={!baseValid ? 'bad' : undefined} role={!baseValid ? 'alert' : undefined}>
+            {!baseSupported
+              ? '请升级 Console，以支持常态限速。'
+              : baseValid
+                ? '立即限速，上下行跨机器合计；留空表示不限。'
+                : '速度需在 1 Kbps–1 Tbps 之间，精确到 1 bps。'}
+          </small>
+        </InlineField>
+        {hasQuota && <InlineField label="用满后">{actionControl}</InlineField>}
+        {hasQuota && action === 'throttle' && (
           <InlineField label="超额速度" htmlFor={`${id}-rate`}>
-            <span className="fwe-unit">
-              {rateInput}
-              <i>Mbps</i>
-            </span>
+            <SpeedInput id={`${id}-rate`} label="超额" draft={excess} onChange={setExcess} disabled={save.isPending} />
             <small className={!rateValid ? 'bad' : undefined} role={!rateValid ? 'alert' : undefined}>
-              {rateValid
-                ? '未用满时不限速；上下行跨机器合计，仍受机器上限约束。'
-                : '速度需为 0.001–1,000,000 Mbps，最多三位小数。'}
+              {rateValid ? '用满后与常态上限取较低值。' : '速度需在 1 Kbps–1 Tbps 之间，精确到 1 bps。'}
             </small>
           </InlineField>
         )}
@@ -308,5 +346,65 @@ function PolicyEditor({
         {saveButton}
       </footer>
     </form>
+  );
+}
+
+type RateDraft = { value: string; unit: 'Mbps' | 'Kbps' };
+const rateDraft = (bps?: number | null): RateDraft => ({
+  value: bps == null ? '' : String(bps / (bps >= 1_000_000 ? 1_000_000 : 1000)),
+  unit: bps != null && bps < 1_000_000 ? 'Kbps' : 'Mbps',
+});
+const rateBps = (draft: RateDraft) => Math.round(Number(draft.value) * (draft.unit === 'Mbps' ? 1_000_000 : 1000));
+const validRate = (draft: RateDraft) =>
+  (draft.unit === 'Mbps' ? /^\d+(?:\.\d{1,6})?$/ : /^\d+(?:\.\d{1,3})?$/).test(draft.value.trim()) &&
+  rateBps(draft) >= 1000 &&
+  rateBps(draft) <= 1_000_000_000_000;
+function SpeedInput({
+  id,
+  label,
+  draft,
+  onChange,
+  disabled,
+  optional = false,
+}: {
+  id: string;
+  label: string;
+  draft: RateDraft;
+  onChange: (value: RateDraft) => void;
+  disabled: boolean;
+  optional?: boolean;
+}) {
+  return (
+    <span className="fwe-unit">
+      <input
+        id={id}
+        className="f mono fwe-num"
+        aria-label={`${label}速度上限（${draft.unit}）`}
+        inputMode="decimal"
+        autoComplete="off"
+        placeholder={optional ? '不限' : undefined}
+        disabled={disabled}
+        value={draft.value}
+        aria-invalid={(!(optional && draft.value.trim() === '') && !validRate(draft)) || undefined}
+        onChange={event => onChange({ ...draft, value: event.target.value })}
+      />
+      <select
+        className="f"
+        aria-label={`${label}速度单位`}
+        value={draft.unit}
+        disabled={disabled}
+        onChange={event => {
+          const unit = event.target.value as RateDraft['unit'];
+          const value =
+            draft.value.trim() === '' || !Number.isFinite(Number(draft.value))
+              ? draft.value
+              : String(Number((Number(draft.value) * (unit === 'Kbps' ? 1000 : 0.001)).toPrecision(15)));
+          onChange({ value, unit });
+        }}
+      >
+        <option value="Mbps">Mbps</option>
+        <option value="Kbps">Kbps</option>
+      </select>
+    </span>
   );
 }

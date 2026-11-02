@@ -5,8 +5,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ForwardingEntitlement, ForwardingRule, UserListItem, UserTrafficAccountingMode } from '../../src/api';
 import { UserForwardingCard } from '../../src/panes/user-forwarding';
 import { theme } from '../../src/forge/theme';
-import { jobsOf, cycleUsageOf, overviewOf, SCENES, type SceneKey } from './forwarding-actions-mockup-data';
-import { createMockProbeTransport } from './forwarding-actions-mockup-probe';
+import { jobsOf, cycleUsageOf, overviewOf, SCENES, type SceneKey } from './forwarding-data';
+import { createMockProbeTransport } from './forwarding-probe-transport';
 import '../../src/styles.css';
 
 const params = new URLSearchParams(location.search);

@@ -1,4 +1,4 @@
-// Browser acceptance uses production components with the mockup's deterministic seven scenes.
+// Browser acceptance uses production components with seven deterministic traffic scenarios.
 // Never imported by the app. Serve frontend with Vite configFile:false, plugins:[react()].
 import { createRoot } from 'react-dom/client';
 import { useState } from 'react';
@@ -24,7 +24,7 @@ import {
   SCENES,
   siteRowsOf,
   type SceneKey,
-} from './node-traffic-mockup-data';
+} from './node-traffic-data';
 import '../../src/styles.css';
 
 export { getInstanceByDom } from 'echarts/core';

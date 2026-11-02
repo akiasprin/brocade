@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NodeAgentStateItem, Whoami } from '../src/api';
 import { draft } from '../src/draft';
 import { NodesPane } from '../src/panes/nodes';
@@ -29,6 +29,15 @@ const win: Win = {
   data: { drill: { p: 'node', id: 'n1', tab: 'chains' } },
 };
 
+const machines = [{ node_id: 'n1', name: '东京' } as NodeAgentStateItem];
+
+beforeEach(() => {
+  vi.stubGlobal(
+    'matchMedia',
+    vi.fn((media: string) => ({ matches: false, media, addEventListener() {}, removeEventListener() {} })),
+  );
+});
+
 afterEach(() => {
   cleanup();
   draft.clear();
@@ -42,12 +51,14 @@ describe('machine rule tab loading', () => {
       resolveSnapshot = resolve;
     });
     const fetcher = vi.fn((path: string) =>
-      path === '/model/snapshot' ? pendingSnapshot : Promise.resolve(Response.json({})),
+      path === '/model/snapshot'
+        ? pendingSnapshot
+        : Promise.resolve(Response.json(path === '/nodes/agent-state' ? { nodes: machines } : {})),
     );
     vi.stubGlobal('fetch', fetcher);
 
     const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
-    client.setQueryData(['nodes'], { nodes: [{ node_id: 'n1', name: '东京' } as NodeAgentStateItem] });
+    client.setQueryData(['nodes'], { nodes: machines });
     render(
       <QueryClientProvider client={client}>
         <SessionProvider value={{ who, initial: { node_count: 1, chain_group_count: [] } }}>
@@ -87,11 +98,13 @@ describe('machine rule tab loading', () => {
   });
 
   it('普通用户不会把无权读取的设置错误带进只读规则树', async () => {
-    const fetcher = vi.fn((_path: string) => Promise.resolve(Response.json({})));
+    const fetcher = vi.fn((path: string) =>
+      Promise.resolve(Response.json(path === '/nodes/agent-state' ? { nodes: machines } : {})),
+    );
     vi.stubGlobal('fetch', fetcher);
 
     const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
-    client.setQueryData(['nodes'], { nodes: [{ node_id: 'n1', name: '东京' } as NodeAgentStateItem] });
+    client.setQueryData(['nodes'], { nodes: machines });
     client.setQueryData(['snapshot'], {
       snapshot: {
         revision: 1,

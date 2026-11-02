@@ -47,7 +47,7 @@ for (const width of [390, 1440]) {
     test(`loaded forwarding preserves its layout at ${width}px in ${theme}`, async ({ page }) => {
       await page.clock.setFixedTime(new Date('2026-10-23T12:00:00Z'));
       await page.setViewportSize({ width, height: 844 });
-      await page.goto(`/tests/fixtures/forwarding-actions-mockup.html?v=current&scene=fleet&nav=0&theme=${theme}`);
+      await page.goto(`/tests/fixtures/forwarding-inline-preview.html?scene=fleet&theme=${theme}`);
       const card = page.locator('.fwr-panel');
       await expect(card.locator('.fwr-item').first()).toBeVisible();
       expect(await card.locator('.fwr-item').count()).toBeGreaterThanOrEqual(5);

@@ -14,10 +14,10 @@ import type {
 import type { ModelOp } from '../../src/draft';
 import { App } from '../../src/app';
 import { type Session } from '../../src/session';
-import { MACHINES, TENANT, chainSnapshot, e2eProbes, previewSnapshot } from './list-head-mockup-data';
-import { agentState, linkHealth, nicView, pingLatest, reports, trafficItem } from './node-list-mockup-data';
-import { settings } from './unlock-mockup-data';
-import { SCENES, nowSecs, unlockCapabilities, unlockJob, type SceneKey } from './chain-unlock-mockup-data';
+import { MACHINES, TENANT, chainSnapshot, e2eProbes, previewSnapshot } from './chain-data';
+import { agentState, nicView, pingLatest, reports, trafficItem } from './node-roster-data';
+import { settings } from './unlock-data';
+import { SCENES, nowSecs, unlockCapabilities, unlockJob, type SceneKey } from './chain-unlock-data';
 import { youtubeSplitResult } from './youtube-unlock-data';
 import { withDialFailure } from './unlock-dial-data';
 import '../../src/styles.css';
@@ -50,7 +50,7 @@ const masked = (ip: string | null) =>
       : ip.replace(/\.\d+\.\d+$/, '.***.***');
 const numberParam = (url: URL, name: string) => Number(url.searchParams.get(name));
 
-/** The list mockup's Hysteria 2 wires predate bandwidth and masquerade; 链详情 reads both. */
+/** Add the protocol fields required by production chain details to the synthetic list data. */
 function withDetailFields(view: ConsoleSnapshot): ConsoleSnapshot {
   for (const app of view.snapshot.apps)
     for (const ingress of app.ingresses) {
@@ -340,7 +340,6 @@ globalThis.fetch = async (input, init) => {
     });
   if (path === '/ping-probe/nodes/latest')
     return json({ interval_secs: 10, nodes: MACHINES.flatMap(machine => pingLatest(machine, now) ?? []) });
-  if (path === '/links/health') return json({ hops: linkHealth(MACHINES, now) });
   if (path === '/links/mtu') return json({ links: [], nodes: [], default_mtu: 1420 });
   if (path === '/agent-log-policy') return json({ global: { max_mib: 64 }, nodes: [] });
   if (path === '/probes/e2e') return json(e2eProbes(now));

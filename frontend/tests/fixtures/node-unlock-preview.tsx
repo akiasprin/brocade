@@ -8,7 +8,7 @@ import { nodes, snapshot, settings, compiled, report, appId, pairs } from './ui-
 import { UNLOCK_SERVICE_NAMES } from '../../src/panes/node-unlock';
 import type { NodeUnlockProbe, UnlockDnsPath, UnlockConnectionObservation, UnlockPart } from '../../src/api';
 import type { Win } from '../../src/wm/store';
-import { SCENES, type SceneKey } from './unlock-mockup-data';
+import { SCENES, type SceneKey } from './unlock-data';
 import { youtubeSplitResult } from './youtube-unlock-data';
 import { withDialFailure, type DialScenario } from './unlock-dial-data';
 import '../../src/styles.css';

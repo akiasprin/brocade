@@ -1,11 +1,8 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { cleanup, render, screen } from '@testing-library/react';
+import { afterEach, describe, expect, it } from 'vitest';
 import { ApiError, type Whoami } from '../src/api';
 import { routeForViewer } from '../src/forge/access';
 import { ErrorBox } from '../src/ui/bits';
-
-let useHopStats: typeof import('../src/panes/nodes').useHopStats;
 
 const viewer = (role: Whoami['role'], operatorId: string = role): Whoami => ({
   operator_id: operatorId,
@@ -15,22 +12,7 @@ const viewer = (role: Whoami['role'], operatorId: string = role): Whoami => ({
   masked_assets: role === 'readonly' || role === 'user',
 });
 
-beforeAll(async () => {
-  vi.stubGlobal(
-    'matchMedia',
-    vi.fn(() => ({
-      matches: false,
-      addEventListener: vi.fn(),
-      removeEventListener: vi.fn(),
-    })),
-  );
-  ({ useHopStats } = await import('../src/panes/nodes'));
-});
-
-afterEach(() => {
-  cleanup();
-  vi.unstubAllGlobals();
-});
+afterEach(cleanup);
 
 describe('访客路由权限', () => {
   const guest = viewer('readonly', 'public');
@@ -67,46 +49,6 @@ describe('访客路由权限', () => {
     expect(routeForViewer({ nav: 'capacity' }, viewer('system-admin'))).toEqual({ nav: 'capacity' });
     const provision = { nav: 'nodes' as const, drill: { p: 'provision' } };
     expect(routeForViewer(provision, viewer('system-admin'))).toEqual(provision);
-  });
-});
-
-describe('访客机器详情请求', () => {
-  function HopHarness() {
-    const state = useHopStats('hk', false);
-    return <span>{`${state.reported}/${state.expected}`}</span>;
-  }
-
-  it('只读取公开链路健康，不尝试获取 Xray 产物', async () => {
-    const request = vi.fn(async (input: RequestInfo | URL) => {
-      const path = String(input);
-      if (path === '/links/health') {
-        return Response.json({
-          hops: [
-            {
-              node_id: 'hk',
-              chain_id: 'hk-jp',
-              peer_node_id: 'jp',
-              alive: true,
-              downlink_bytes: 128,
-              window_secs: 60,
-              checked_at: '2026-10-10T00:00:00Z',
-            },
-          ],
-        });
-      }
-      throw new Error(`访客不应请求 ${path}`);
-    });
-    vi.stubGlobal('fetch', request);
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-
-    render(
-      <QueryClientProvider client={client}>
-        <HopHarness />
-      </QueryClientProvider>,
-    );
-
-    await waitFor(() => expect(screen.getByText('1/1')).toBeTruthy());
-    expect(request.mock.calls.map(call => String(call[0]))).toEqual(['/links/health']);
   });
 });
 

@@ -22,3 +22,4 @@ __pycache__/
 /.agents/local/
 /.codex/visualizations/
 /scripts/tests/site-usage/results/
+/docs/audits/*.log

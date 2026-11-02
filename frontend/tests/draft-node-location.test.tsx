@@ -175,7 +175,13 @@ describe('machine panel focus lifecycle', () => {
     client.setQueryData(['agent-log-policy'], { nodes: [] });
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => Response.json({})),
+      vi.fn(async (path: string) =>
+        Response.json(
+          path === '/nodes/agent-state'
+            ? { nodes: [{ ...machines[0], dns: { t: 'system' }, domain_strategy: 'as_is', overlay: false }] }
+            : {},
+        ),
+      ),
     );
     const view = render(
       <QueryClientProvider client={client}>

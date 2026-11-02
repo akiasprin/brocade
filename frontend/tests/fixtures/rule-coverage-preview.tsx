@@ -8,6 +8,7 @@ import '../../src/styles.css';
 
 const params = new URLSearchParams(location.search);
 const listener = params.get('mode') === 'listener';
+const layout = params.has('layout');
 const readOnly = params.get('role') === 'readonly';
 const mode = listener ? 'listener' : 'forward';
 if (theme.snapshot() !== (params.get('theme') === 'light' ? 'light' : 'dark')) theme.toggle();
@@ -29,7 +30,29 @@ const saved = draft
   .slice()
   .reverse()
   .find(op => op.op === 'put_step' && op.chain_id === 'chain' && op.node_id === 'source');
-const rules = saved?.op === 'put_step' ? saved.step.rules : [baseRule];
+const layoutRules: Rule[] = [
+  { m: { t: 'ip_cidr', v: ['192.0.2.1'] }, a: { t: 'egress', send_through: null } },
+  {
+    m: { t: 'geosite', v: ['dmm'] },
+    a: {
+      t: 'forward',
+      to: 'relay',
+      dial: { t: 'addr', v: '192.0.2.20:22000' },
+      pool: { t: 'mux', v: { ...DEFAULT_HOP_MUX } },
+    },
+  },
+  {
+    m: { t: 'geosite', v: ['tiktok'] },
+    a: {
+      t: 'forward',
+      to: 'relay',
+      dial: { t: 'addr', v: '[2001:db8:1234:5678:90ab:cdef:1234:5678]:22000' },
+      pool: { t: 'mux', v: { ...DEFAULT_HOP_MUX } },
+    },
+  },
+  { m: { t: 'geosite', v: ['category-ads-all'] }, a: { t: 'block' } },
+];
+const rules = saved?.op === 'put_step' ? saved.step.rules : layout ? layoutRules : [baseRule];
 const source: SnapshotStep = { chain: 'chain', node: 'source', accept: null, hop_in: null, rules };
 const relay: SnapshotStep = {
   chain: listener ? 'owner' : 'chain',
@@ -101,7 +124,22 @@ const model = {
         : []),
     ],
   },
-  node_egress_dns: [],
+  node_egress_dns: params.has('dns')
+    ? [
+        {
+          node: 'source',
+          position: 0,
+          selector: { t: 'geosite', v: ['netflix'] },
+          resolution: {
+            address: '192.0.2.53, 2001:db8::53',
+            port: 53,
+            transport: 'udp',
+            address_strategy: 'use_ip',
+            fallback: 'machine',
+          },
+        },
+      ]
+    : [],
   redacted: false,
 } as unknown as ConsoleSnapshot;
 const nodes = {
@@ -114,7 +152,7 @@ const nodes = {
       egress_allowed: true,
       retired_at: null,
       public_ipv4: '192.0.2.20',
-      public_ipv6: null,
+      public_ipv6: layout ? '2001:db8:1234:5678:90ab:cdef:1234:5678' : null,
       public_ipv4_nat: false,
       public_ipv6_nat: false,
     },
@@ -161,7 +199,7 @@ const peers: ForwardPeer[] = listener
         id: 'relay',
         name,
         public_ipv4: '192.0.2.20',
-        public_ipv6: null,
+        public_ipv6: layout ? '2001:db8:1234:5678:90ab:cdef:1234:5678' : null,
         public_ipv4_nat: false,
         public_ipv6_nat: false,
         step: relay,
@@ -171,8 +209,25 @@ const peers: ForwardPeer[] = listener
     ];
 createRoot(document.getElementById('root')!).render(
   <QueryClientProvider client={client}>
-    <section className="panel config-panel rule-sheet-card node-chain-sheet">
+    <section
+      className="panel config-panel rule-sheet-card node-chain-sheet"
+      style={params.has('container') ? { maxWidth: Number(params.get('container')), margin: '0 auto' } : undefined}
+    >
+      {layout && (
+        <header>
+          <h4>链路规则</h4>
+        </header>
+      )}
       <div className="chain-rule-tree">
+        {layout && (
+          <div className="chain-rule-node-head">
+            <span className="disc">▾</span>
+            <span className="who">
+              <b>香港入口</b>
+              <span className="st">入口</span>
+            </span>
+          </div>
+        )}
         <div className="chain-rule-body">
           <RuleEditor
             appId="app"
@@ -182,7 +237,10 @@ createRoot(document.getElementById('root')!).render(
             accept={null}
             peers={peers}
             isForwardTarget={false}
-            fallback={{ rules: [], pending: false }}
+            fallback={{
+              rules: layout ? [{ m: { t: 'any' }, a: { t: 'egress', send_through: null } }] : [],
+              pending: false,
+            }}
             readOnly={readOnly}
           />
         </div>

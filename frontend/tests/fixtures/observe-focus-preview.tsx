@@ -67,6 +67,8 @@ report.series = report.series.map((sample, index) => {
       pressure_full_pct: 0,
     },
     network_detail: {
+      hy2_netns_active: true,
+      hy2_conntrack_count: 2200 * wave,
       tcp_curr_estab: 40 * wave,
       tcp_inuse: 95,
       tcp_time_wait: 20,

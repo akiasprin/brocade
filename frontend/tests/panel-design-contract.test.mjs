@@ -54,6 +54,15 @@ test('所有页面只能复用机器、线路和用户页的三种面板骨架',
   const declarations = panelDeclarations();
   assert.ok(declarations.length > 30, '面板扫描异常，可能漏掉了 panes 下的页面');
 
+  const nodes = readFileSync(new URL('../src/panes/nodes.tsx', import.meta.url), 'utf8');
+  assert.match(
+    nodes,
+    /<header className="nd-page-head">[\s\S]*?<span className="cg-plate">[\s\S]*?<h1 className="nd-id nd-name">机器<\/h1>/,
+  );
+  assert.match(nodes, /className="fg-sheet nd-paper node-list-panel"/);
+  const chains = panes.get('chains.tsx');
+  assert.match(chains, /className="fg-sheet nd-paper chain-list-panel"/);
+  assert.match(chains, /<header className="nd-page-head">[\s\S]*?<h1 className="nd-id nd-name">线路<\/h1>/);
   for (const { file, classes, tag } of declarations) {
     assert.equal(classes[0], 'panel', `${file}: panel 必须是面板的第一个骨架类`);
     assert.ok(
@@ -168,17 +177,8 @@ test('门面标题使用 42px 公共令牌，内部面板保持 36px 且不继�
   const pagePanels = declarations.filter(({ tag }) => tag.includes('data-page-title="true"'));
   assert.deepEqual(
     pagePanels.map(({ file }) => file).sort(),
-    [
-      'capacity.tsx',
-      'chain-proxy.tsx',
-      'chains.tsx',
-      'nodes.tsx',
-      'password.tsx',
-      'tunnels.tsx',
-      'users.tsx',
-      'users.tsx',
-    ],
-    '门面标题包括各列表、预测、密码页和用户名册的正常/空状态；用量使用连续纸页头',
+    ['capacity.tsx', 'chain-proxy.tsx', 'password.tsx', 'tunnels.tsx', 'users.tsx', 'users.tsx'],
+    '门面标题包括各面板列表、预测、密码页和用户名册的正常/空状态；用量、机器和线路使用连续纸页头',
   );
   for (const { file, classes, tag } of declarations) {
     if (classes.some(name => name.endsWith('-list-panel'))) {
@@ -311,7 +311,7 @@ const referenceClasses = new Set([
   'history-chart-card',
   'load-network',
   'load-metric',
-  // 发布 mockup 的修饰类只编排既有 titled/config-panel 骨架，并继续使用全局设计 token。
+  // 发布页面的修饰类只编排既有 titled/config-panel 骨架，并继续使用全局设计 token。
   // 明确列出允许项，避免把所有发布页私有类都加入基准后掩盖新的面板皮肤。
   'cg-sec',
   // 隧道列表复用基准列表骨架，不提供自己的面板皮肤。

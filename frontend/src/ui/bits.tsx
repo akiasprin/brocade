@@ -409,39 +409,32 @@ function SkeletonEditor() {
   );
 }
 
-function SkeletonPageHead() {
+function SkeletonPageHead({ actions = false }: { actions?: boolean }) {
   return (
-    <div className="loading-skeleton-page-head">
+    <div className={`loading-skeleton-page-head${actions ? ' loading-skeleton-panel-head page-title' : ''}`}>
       <i className="loading-skeleton-page-icon" />
       <span>
         <i className="loading-bar title" />
         <i className="loading-bar subtitle" />
       </span>
-      <i className="loading-skeleton-page-status" />
+      <i className={actions ? 'loading-skeleton-head-action' : 'loading-skeleton-page-status'} />
     </div>
   );
 }
 
-function SkeletonNodeCards({ count = 11 }: { count?: number }) {
+function SkeletonNodeCards({ count = 6 }: { count?: number }) {
   return (
-    <div className="loading-skeleton-node-grid">
-      {skeletonRange(count).map(card => (
-        <article className="loading-skeleton-node-card" key={card}>
-          <div className="loading-skeleton-node-head">
-            <i className="loading-skeleton-dot" />
+    <div className="node-cardpage">
+      <SkeletonPageHead actions />
+      <div className="node-card-grid">
+        {skeletonRange(count).map(card => (
+          <div className="node-card loading-skeleton-node-card" key={card}>
+            <i className="loading-bar title" />
             <i className="loading-bar" />
-            <i className="loading-bar tiny" />
+            <i className="loading-bar faint" />
           </div>
-          <div className="loading-skeleton-node-trace">
-            <i />
-          </div>
-          <div className="loading-skeleton-node-foot">
-            <i className="loading-bar value" />
-            <i className="loading-bar tiny" />
-            <i className="loading-skeleton-chip" />
-          </div>
-        </article>
-      ))}
+        ))}
+      </div>
     </div>
   );
 }
@@ -566,12 +559,7 @@ function SkeletonListPage({ kind, initial }: { kind: 'nodes' | 'chains' | 'tunne
     );
   }
 
-  return (
-    <section className={`loading-skeleton-panel loading-skeleton-list-shell ${kind}`}>
-      <SkeletonListHead />
-      <SkeletonNodeCards count={initial?.node_count} />
-    </section>
-  );
+  return <SkeletonNodeCards count={initial?.node_count} />;
 }
 
 function SkeletonUserCardHead() {

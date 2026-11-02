@@ -93,10 +93,10 @@ test('aggregates both families, no-AAAA and regions without a family switch; det
       .getByText('不分族'),
   ).toBeVisible();
   await expect(page).toHaveScreenshot('d-dual-stack-aggregate.png');
-  await page.getByRole('group', { name: '线路视图' }).getByRole('button', { name: '卡片' }).click();
+  await page.getByRole('tablist', { name: '线路视图' }).getByRole('tab', { name: '卡片' }).click();
   await expect(page.locator('.chain-card')).toHaveCount(16);
   await expect(page.getByRole('table')).toHaveCount(0);
-  await page.getByRole('group', { name: '线路视图' }).getByRole('button', { name: '解锁' }).click();
+  await page.getByRole('tablist', { name: '线路视图' }).getByRole('tab', { name: '解锁' }).click();
   const first = page.locator('.cut-chain button').first();
   await first.focus();
   await page.keyboard.press('Enter');
@@ -113,8 +113,13 @@ for (const role of ['readonly', 'public'])
     const errors = await preview(page, 390, 'light', `role=${role}&error=1`);
     await expect(page.getByText('摘要暂不可用')).toBeVisible();
     await expect(page.getByRole('button', { name: '重试' })).toBeVisible();
-    await expect(page.getByRole('button', { name: '多选', exact: true })).toBeDisabled();
-    await expect(page.getByRole('button', { name: '＋ 新建分组', exact: true })).toBeDisabled();
+    if (role === 'public') {
+      await expect(page.getByRole('button', { name: '多选', exact: true })).toHaveCount(0);
+      await expect(page.getByRole('button', { name: '＋ 新建分组', exact: true })).toHaveCount(0);
+    } else {
+      await expect(page.getByRole('button', { name: '多选', exact: true })).toBeDisabled();
+      await expect(page.getByRole('button', { name: '＋ 新建分组', exact: true })).toBeDisabled();
+    }
     await expect(page).toHaveScreenshot(`d-error-${role}.png`);
     expect(errors).toEqual([]);
   });
@@ -126,8 +131,8 @@ for (const width of [1440, 390])
     await page.goto('/tests/fixtures/chain-unlock-preview.html?view=cards#/chains');
     await expect(page.locator('.chain-card')).toHaveCount(16);
     await expect(page.getByRole('table')).toHaveCount(0);
-    await expect(page.getByRole('group', { name: '线路视图' }).getByRole('button', { name: '卡片' })).toHaveAttribute(
-      'aria-pressed',
+    await expect(page.getByRole('tablist', { name: '线路视图' }).getByRole('tab', { name: '卡片' })).toHaveAttribute(
+      'aria-selected',
       'true',
     );
     expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
@@ -160,7 +165,10 @@ test('WebKit mobile table keeps fixed names and complete headings', async ({ pla
   }
 });
 
-for (const [width, theme] of [[1440, 'dark'], [390, 'light']] as const)
+for (const [width, theme] of [
+  [1440, 'dark'],
+  [390, 'light'],
+] as const)
   test(`CN and MO Premium keep the same notice when IPv6 fails ${width} ${theme}`, async ({ page }) => {
     const errors = await preview(page, width, theme, 'premium-region-notice=1');
     const rows = [
@@ -168,7 +176,9 @@ for (const [width, theme] of [[1440, 'dark'], [390, 'light']] as const)
       page.locator('.cut-row').filter({ has: page.getByRole('button', { name: /东京 IIJ/ }) }),
     ];
     const scroll = page.getByRole('region', { name: /线路解锁对照表/ });
-    await scroll.evaluate(element => { element.scrollLeft = 250; });
+    await scroll.evaluate(element => {
+      element.scrollLeft = 250;
+    });
     for (const [index, row] of rows.entries()) {
       const premium = row.locator('[data-service="youtube_premium"]');
       await expect(premium).toHaveAttribute('data-tone', 'info');

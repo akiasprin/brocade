@@ -1,5 +1,15 @@
 import { expect, test, type Page } from '@playwright/test';
-import { SCENES, agentState, nicView, pingLatest, reports, trafficItem } from '../fixtures/node-list-mockup-data';
+import {
+  SCENES,
+  agentState,
+  nicView,
+  pingLatest,
+  reports,
+  trafficItem,
+  loadOverview,
+  usageSeries,
+  pingSeries,
+} from '../fixtures/node-roster-data';
 
 const now = Date.UTC(2026, 9, 28, 12);
 const machines = SCENES.typical.machines();
@@ -49,6 +59,25 @@ async function openWorkspace(page: Page, theme: string) {
       },
       '/tenants': { tenants: [] },
     };
+    const rangeEnd = now / 1000;
+    const rangeStart = rangeEnd - 3600;
+    const overview = path.match(/^\/load\/nodes\/([^/]+)\/overview$/);
+    if (overview) {
+      const machine = machines.find(machine => machine.id === overview[1])!;
+      return route.fulfill({ json: loadOverview(machine, rangeStart, rangeEnd) });
+    }
+    if (path === '/usage/node-series') {
+      const machine = machines.find(machine => machine.id === url.searchParams.get('node_id'))!;
+      return route.fulfill({ json: usageSeries(machine, rangeStart, rangeEnd) });
+    }
+    const ping = path.match(/^\/ping-probe\/nodes\/([^/]+)\/series$/);
+    if (ping) {
+      const machine = machines.find(machine => machine.id === ping[1])!;
+      return route.fulfill({ json: pingSeries(machine, rangeStart, rangeEnd) });
+    }
+    const history = path.match(/^\/nodes\/([^/]+)\/public-ip-history$/);
+    if (history)
+      return route.fulfill({ json: { node_id: history[1], events: [], visible_days: 14, retention_days: 90 } });
     if (path === '/bootstrap') await bootstrapPending;
     if (path === '/nodes/agent-state') await pending;
     if (path in body) await route.fulfill({ json: body[path] });
@@ -72,9 +101,12 @@ async function gridPixels(page: Page) {
   // while comparing the grid itself; the full page screenshots below retain the actual content.
   const hidden = await page.addStyleTag({ content: '.fg-view, .fg-view * { visibility: hidden !important; }' });
   try {
+    // A raw screenshot does not wait for stable frames as toHaveScreenshot does. Let the
+    // temporary visibility rule and WebKit's sticky scroll layer paint before sampling pixels.
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     return await page.screenshot({ clip: { x: 2, y: 160, width: 8, height: 96 } });
   } finally {
-    await hidden.evaluate(el => el.remove());
+    await hidden.evaluate(el => el.parentNode?.removeChild(el));
   }
 }
 
@@ -139,6 +171,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
           await test.info().attach('startup-grid', { body: startup, contentType: 'image/png' });
           enter();
           await expect(page.locator('.fg-view')).toBeVisible();
+          expect(await page.locator('.fg-top').evaluate(el => getComputedStyle(el).borderBottomWidth)).toBe('0px');
           await expect(page.locator('.fg-view .loading-boundary-guard')).toBeAttached();
           await expectOrigin(page, origin);
           expect((await gridPixels(page)).equals(startup), 'grid jumped when the shell mounted').toBe(true);
@@ -150,7 +183,9 @@ for (const engine of ['chromium', 'webkit'] as const) {
           });
           release();
           await expect(page.locator('.fg-view .loading-boundary-guard')).toHaveCount(0);
-          await expect(page.locator('.ncard')).toHaveCount(machines.length);
+          await expect(page.locator('.node-card')).toHaveCount(machines.length);
+          await expect(page.locator('.nd-throughput-panel')).toHaveCount(0);
+          await expect(page.locator('.node-card-rate:not(.none)').first()).toBeVisible();
           await page.evaluate(() => document.fonts.ready);
           await expectAligned(page);
           expect(await page.evaluate(() => getComputedStyle(document.body, '::before').backgroundPosition)).toBe(
@@ -164,7 +199,8 @@ for (const engine of ['chromium', 'webkit'] as const) {
           await test.info().attach('loaded-grid', { body: before, contentType: 'image/png' });
           expect(before.equals(startup), 'grid jumped when data finished loading').toBe(true);
           await page.locator('body').evaluate(el => el.style.setProperty('--grid-image', 'none'));
-          expect((await gridPixels(page)).equals(before), 'grid is visible in the gutter').toBe(false);
+          const absent = await gridPixels(page);
+          expect(absent.equals(before), 'grid is visible in the gutter').toBe(false);
           await page.locator('body').evaluate(el => el.style.removeProperty('--grid-image'));
           const maxScroll = await page.evaluate(touch => {
             const scroller = touch ? document.scrollingElement! : document.querySelector('.fg-desk')!;
@@ -173,7 +209,23 @@ for (const engine of ['chromium', 'webkit'] as const) {
           expect(maxScroll, 'the real list has enough content to exercise scrolling').toBeGreaterThan(200);
           for (const offset of [73, 173, maxScroll]) {
             await scroll(page, offset, device.touch);
-            expect((await gridPixels(page)).equals(before), `grid moved at ${offset}px`).toBe(true);
+            await expectAligned(page);
+            const immediate = await gridPixels(page);
+            if (!immediate.equals(before)) {
+              await test.info().attach(`grid-${offset}-immediate`, { body: immediate, contentType: 'image/png' });
+              await test.info().attach(`grid-${offset}-expected`, { body: before, contentType: 'image/png' });
+              await test.info().attach(`grid-${offset}-state`, {
+                body: JSON.stringify({
+                  wasBlank: immediate.equals(absent),
+                  dom: await page.evaluate(() => ({
+                    scrollY,
+                    origin: getComputedStyle(document.body, '::before').backgroundPosition,
+                  })),
+                }),
+                contentType: 'application/json',
+              });
+            }
+            expect(immediate.equals(before), `grid moved at ${offset}px`).toBe(true);
           }
 
           // Content/chrome changes must never relocate a background that has already been painted.

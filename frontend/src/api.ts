@@ -4713,32 +4713,12 @@ export interface LinkMtuView {
 
 export const fetchLinkMtu = (token = '') => api<LinkMtuView>('/links/mtu', token);
 
-// 中继跳的连通状态。判定依据是 outbound 计数器的增量——产物中的 observatory 每 10 秒
-// 通过每个转发出口探测一次，因此该跳连通时 downlink 会持续增长。
-//
-// 这是链路层面的事实，不是控制面层面的事实。配置是否已下发在节点的「已应用」字段中，
-// 两者必须分别查看：配置已下发不代表链路连通，链路连通也不代表配置是最新的。
-export interface LinkHealthItem {
-  node_id: string;
-  chain_id: string;
-  peer_node_id: string;
-  alive: boolean;
-  downlink_bytes: number;
-  /* 两次读数之间的时间间隔。窗口过短时零增量不可靠——探测结果可能尚未计入计数器 */
-  window_secs: number;
-  checked_at: string;
-}
-
-export const fetchLinkHealth = (token = '') => api<{ hops: LinkHealthItem[] }>('/links/health', token);
-
 // 端到端探测：一条链的整条数据面当前是否连通。
 //
-// 与上面两类的分工——`LinkMtuItem` 表示两台机器之间 underlay 链路的路径 MTU，
-// `LinkHealthItem` 表示到下一跳的计数器是否仍在增长，本类表示
+// 与路径 MTU 的分工——`LinkMtuItem` 表示两台机器之间 underlay 链路的路径 MTU，本类表示
 // 用户从入口接入后能否穿过整条链出网。
 //
-// 前两者无法覆盖该场景的原因：REALITY 参数配置错误、路由规则遗漏、出口被封禁——
-// 这三种情况都不会使任何一跳的计数器停止增长，但用户已经无法使用。
+// 路径 MTU 无法覆盖 REALITY 参数配置错误、路由规则遗漏和出口被封禁等故障。
 //
 // `exit_verdict` 的三个档位是本类存在的主要原因。「连通但出口 IP 不符」表示流量
 // 未穿过完整的链（通常从链头直接出网），而规则表合法、每跳均连通、编译无警告——
@@ -4997,12 +4977,12 @@ export const fetchMyArtifact = (family?: ArtifactFamily, protocol?: ArtifactProt
 
 // ── 遥测：主机负载 + 逐跳链路质量 ────────────────────────────────
 //
-// 与上面三类探测的分工：`LinkMtuItem` 表示两台机器之间链路的路径 MTU，`LinkHealthItem`
-// 表示到下一跳的计数器是否仍在增长，`E2eProbeItem` 表示用户能否穿过完整的链——三者都是
+// 与其他探测的分工：`LinkMtuItem` 表示两台机器之间链路的路径 MTU，
+// `E2eProbeItem` 表示用户能否穿过完整的链——两者都是
 // **主动探测**，各自发送探测包。
 //
 // 本类不发送任何探测包：BBR 在每条实际转发连接上、每个 RTT 都会更新其对瓶颈带宽和最小 RTT
-// 的估计，agent 读取一次 netlink 即可获取。因此它可以回答前三类无法回答的问题——链路的瓶颈
+// 的估计，agent 读取一次 netlink 即可获取。因此它可以回答主动探测无法回答的问题——链路的瓶颈
 // 位于哪一跳、速度下降是本端还是线路导致、应调整哪台机器的缓冲区。
 //
 // 时间统一使用 unix 秒，不使用其他位置的 timestamptz 文本格式。服务端两侧共用同一组结构体
@@ -5126,6 +5106,8 @@ export interface DiskDetailSample {
 
 /** 新 Agent 上报的网络深度观测。连接/内存字段是窗口末快照，其余字段是该 30 秒窗口增量。 */
 export interface NetworkDetailSample {
+  hy2_netns_active?: boolean | null;
+  hy2_conntrack_count?: number | null;
   tcp_curr_estab: number | null;
   tcp_inuse: number | null;
   tcp_time_wait: number | null;
@@ -5317,7 +5299,7 @@ function expandNodeLoadOverview(view: NodeLoadOverviewView): NodeLoadView {
   };
 }
 
-/** 一跳一个窗口的链路质量。键为 (chain_id, peer_node_id)，与 link_health 使用同一键。 */
+/** 一跳一个窗口的链路质量，按 (chain_id, peer_node_id) 标识物理对端。 */
 export interface HopLinkSample {
   chain_id: string;
   peer_node_id: string;
@@ -5641,10 +5623,13 @@ export function reverseHealthError(p: ReverseHealthPolicy): string | null {
 
 export type UserTrafficKind = 'access' | 'forwarding';
 export interface UserTrafficPolicy {
+  base_rate_bps?: number | null;
   quota_bytes: string | null;
   exhausted_action: { kind: 'suspend' } | { kind: 'throttle'; rate_bps: number };
 }
 export interface UserTrafficPolicyView {
+  base_rate_supported?: boolean;
+  effective?: { mode: 'unlimited'; managed: boolean } | { mode: 'limited'; rate_bps: number } | { mode: 'suspended' };
   kind: UserTrafficKind;
   app_id: string | null;
   policy: UserTrafficPolicy | null;
@@ -5676,12 +5661,21 @@ export const fetchUserTrafficPolicies = async (tenant: string, user: string): Pr
 export const saveUserTrafficPolicy = (
   tenant: string,
   user: string,
-  view: Pick<UserTrafficPolicyView, 'kind' | 'app_id'>,
+  view: Pick<UserTrafficPolicyView, 'kind' | 'app_id' | 'base_rate_supported'>,
   policy: UserTrafficPolicy,
 ) => {
   if (view.kind !== 'access' || !view.app_id) throw new Error('接入额度必须指定 app');
+  if (policy.base_rate_bps != null && view.base_rate_supported !== true)
+    throw new Error('请先升级 Console，以支持常态限速');
   const path = `${userTrafficPolicyPath(tenant, user)}/access/${encodeURIComponent(view.app_id)}`;
-  return api<UserTrafficPolicyView[]>(path, '', { method: 'PUT', body: JSON.stringify(policy) });
+  return api<UserTrafficPolicyView[]>(path, '', { method: 'PUT', body: JSON.stringify(policy) }).then(data => {
+    if (policy.base_rate_bps != null) {
+      const saved = data.find(row => row.kind === 'access' && row.app_id === view.app_id);
+      if (saved?.base_rate_supported !== true || saved.policy?.base_rate_bps !== policy.base_rate_bps)
+        throw new Error('Console 未确认常态限速，请升级后重新保存');
+    }
+    return data;
+  });
 };
 
 export interface SourceAccessNode {

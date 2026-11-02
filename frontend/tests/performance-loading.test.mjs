@@ -109,7 +109,7 @@ test('机器详情只按明确导航意图预取，并由滚动窗口补齐预�
   assert.match(nodes, /queryClient\.prefetchQuery\(\{[\s\S]*nodeUsageRangeQuery\(nodeId, range\)/);
   assert.match(nodes, /queryClient\.prefetchQuery\(nodePingRangeQuery\(nodeId, range\)\)/);
   assert.match(nodes, /onMouseEnter=\{schedulePrepare\}/);
-  assert.match(nodes, /onFocus=\{event =>/);
+  assert.match(nodes, /onFocus=\{prepareNow\}/);
   assert.match(nodes, /onPointerDown=\{event =>/);
   assert.match(nodes, /window\.setTimeout\(prepareNow, 120\)/);
   assert.doesNotMatch(nodes, /items\.map\([^)]*prefetchNodeDetailData/);
@@ -170,7 +170,10 @@ test('机器列表先返回基础数据，再加载有界的轻量遥测', () =>
   assert.match(nodes, /<NicMonthTotal[\s\S]*?<small>本月<\/small>/);
   assert.doesNotMatch(nodes, /nicTotalTracked|本期 \{exactBytes\(nicTotal\.total_bytes\)\}/);
   assert.doesNotMatch(nodes, /fetchNodeLoadListWindows\(LIST_NIC_WINDOWS\)/);
-  assert.match(nodes, /Math\.max\(query\.state\.data\?\.interval_secs \?\? 10, 10\) \* 1_000/);
+  assert.match(nodes, /const LIST_NIC_WINDOWS = 24/);
+  assert.match(nodes, /fetchNodeLoadListWindows\(LIST_HEALTH_WINDOWS\)/);
+  assert.match(nodes, /const LIST_HEALTH_WINDOWS = 6/);
+  assert.doesNotMatch(nodes, /fetchLatestNodePingProbes/);
   assert.match(api, /\/load\/nodes\/nic\?windows=\$\{windows\}/);
 });
 

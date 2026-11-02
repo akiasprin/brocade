@@ -114,13 +114,17 @@ const winWith = (drill: Record<string, unknown>): Win => ({
   data: { drill },
 });
 
-function mount(drill: Record<string, unknown>) {
+function mount(drill: Record<string, unknown>, node: Partial<NodeAgentStateItem> = {}) {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL) => respond(String(input))),
   );
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  client.setQueryData(['nodes'], { nodes: [{ node_id: 'n1', name: '东京' } as NodeAgentStateItem] });
+  client.setQueryData(['nodes'], { nodes: [{ node_id: 'n1', name: '东京', ...node } as NodeAgentStateItem] });
+  // A cached result from the retired monitor must not affect the current node's health badge.
+  client.setQueryData(['link-health'], {
+    hops: [{ node_id: 'n1', chain_id: 'main/chain', peer_node_id: 'peer', alive: false }],
+  });
   const tree = (next: Record<string, unknown>) => (
     <QueryClientProvider client={client}>
       <SessionProvider value={{ who, initial: { node_count: 1, chain_group_count: [] } }}>
@@ -137,6 +141,33 @@ const enterFrom = (fromHash: string, hash: string) =>
   window.history.replaceState({ brocadeRoute: { index: 2, scrollTop: 0, fromHash } }, '', hash);
 
 describe('machine detail observation range in the address', () => {
+  it('ignores legacy relay failures and stops requesting their health and artifact data', async () => {
+    mount({ p: 'node', id: 'n1' });
+
+    await waitFor(() => expect(screen.getByRole('tab', { name: '观测' })).toBeTruthy());
+    const paths = vi.mocked(fetch).mock.calls.map(([input]) => String(input));
+    expect(paths.some(path => path.startsWith('/load/nodes/n1/overview?'))).toBe(true);
+    expect(paths.some(path => path === '/links/health' || path.startsWith('/artifacts/content/'))).toBe(false);
+  });
+
+  it('continues to count actionable runtime findings', () => {
+    mount(
+      { p: 'node', id: 'n1' },
+      {
+        usage_last_result: {
+          accepted_readings: 2,
+          inserted_samples: 1,
+          skipped_counters: 0,
+          rejected_counters: 1,
+          gap_samples: 0,
+        },
+      },
+    );
+
+    expect(screen.getByRole('tab', { name: '观测1' })).toBeTruthy();
+    expect(screen.getByText(/异常项没有入账/)).toBeTruthy();
+  });
+
   it('keeps machine detail focused on observation, configuration, rules and unlock diagnostics', () => {
     mount({ p: 'node', id: 'n1' });
 

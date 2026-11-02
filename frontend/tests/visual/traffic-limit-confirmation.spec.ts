@@ -6,12 +6,12 @@ for (const { width, theme } of [
 ]) {
   for (const scene of ['handoff', 'heartbeat', 'partial'] as const) {
     test(`${scene}-${width}-${theme}`, async ({ page }) => {
+      const errors: string[] = [];
+      page.on('pageerror', error => errors.push(error.message));
       await page.setViewportSize({ width, height: 1000 });
       await page.clock.setFixedTime(new Date('2026-10-22T09:00:00+08:00'));
-      await page.goto(
-        `/tests/fixtures/node-traffic-limit-mockup.html?scene=${scene}&option=a&view=compare&nav=0&theme=${theme}`,
-      );
-      const card = page.locator('.node-traffic-accounting:not(.ntl-card)');
+      await page.goto(`/tests/fixtures/traffic-limit-preview.html?scene=${scene}&theme=${theme}`);
+      const card = page.locator('.node-traffic-accounting');
       await expect(card).toBeVisible();
       await page.evaluate(() => document.fonts.ready);
       if (scene === 'handoff') {
@@ -35,6 +35,8 @@ for (const { width, theme } of [
         await expect(card.locator('.node-traffic-flag.on')).toHaveCount(0);
       }
       await expect(card).toHaveScreenshot(`${scene}-${width}-${theme}.png`, { animations: 'disabled' });
+      expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
+      expect(errors).toEqual([]);
     });
   }
 }

@@ -2531,34 +2531,34 @@
 }
 
 /* ── 黛蓝 · 默认回退 ──
-   灰蓝建立交互秩序，同色系的低彩度蓝承载连续数据。真实选择由 data-palette 覆盖；
+   柔和蓝建立交互秩序，同色系的浅蓝承载连续数据。真实选择由 data-palette 覆盖；
    这里与默认色板保持一致，避免首屏执行 JavaScript 前短暂闪回旧配色。 */
 :root,
 [data-theme='dark'] {
-  --action: #7f8da6;
-  --action-hover: #919fb5;
-  --action-active: #77859d;
-  --action-wash: rgba(127, 141, 166, 0.13);
+  --action: #7698d6;
+  --action-hover: #8aabe7;
+  --action-active: #6586c3;
+  --action-wash: rgba(118, 152, 214, 0.15);
   --action-on: #080f1c;
-  --data: #8492a8;
+  --data: #81a9d2;
   --data-secondary: #758196;
-  --data-wash: rgba(132, 146, 168, 0.09);
-  --primary: #252b35;
-  --primary-hover: #2e3744;
-  --primary-active: #354051;
-  --primary-on: #a3afc1;
-  --primary-line: #3b4555;
+  --data-wash: rgba(129, 169, 210, 0.13);
+  --primary: #1e2a40;
+  --primary-hover: #23334f;
+  --primary-active: #283a5b;
+  --primary-on: #b4c8ec;
+  --primary-line: #314770;
 }
 :root[data-theme='light'],
 [data-theme='light'] {
-  --action: #5b697f;
-  --action-hover: #63738b;
-  --action-active: #505f75;
-  --action-wash: rgba(91, 105, 127, 0.08);
+  --action: #3c61a7;
+  --action-hover: #4b71b9;
+  --action-active: #2e5297;
+  --action-wash: rgba(60, 97, 167, 0.09);
   --action-on: #ffffff;
-  --data: #5f708a;
+  --data: #316ca5;
   --data-secondary: #6a5f90;
-  --data-wash: rgba(95, 112, 138, 0.07);
+  --data-wash: rgba(49, 108, 165, 0.09);
 }
 
 /* ── 调色盘候选（更多菜单里的色板，`forge/palette.ts` 写入 data-palette） ──
@@ -2577,21 +2577,20 @@
      各档取主题色相、OKLCH 彩度 0.008（块 ×1.1、边框 ×1.25）；玄墨的灰白主题色没有色相，
      改取数据色的钢青 225°。低明度下 8 位量化使实际色相偏离 20° 以内。网格线取 OKLCH 明度
      27.8%（L* 约 16，随台面上移约 1.5）、彩度约 0.02。亮色保留原有底调，边框向纸色收浅。
-   - 主题色明度约 60%（黛蓝为低彩度灰蓝，明度约 64%），操作色文字对纸不低于 4.5，实底上的
-     深色文字对操作色不低于 4.5。纸比纯黑色阶亮 1.5 L*，堇紫与藕粉的操作色三档 OKLCH 明度
+   - 主题色明度约 60%（黛蓝为 68%，见其色板注释），操作色文字对纸不低于 4.5，实底上的深色
+     文字对操作色不低于 4.5。纸比纯黑色阶亮 1.5 L*，堇紫与藕粉的操作色三档 OKLCH 明度
      因此分别提高 0.010 与 0.0075。
-     洗色一般取 17%；黛蓝取 13%，降低蓝色铺底的亮感。
+     洗色随操作色加深提到 17%，否则选中行与选中页签的底色在暗色底上无法辨认。黛蓝的操作色
+     更浅，洗色取 15%，铺底明度与其它方案持平。
    - 主按钮与导航选中项取洗色（--primary 一组）：主题色的 oklch(43.5% C H) 按 22% 混入块色
-     作底、55% 作边框，悬停与按下为 32%、40%，文字取同色相的浅色。操作色实底对标题条
-     的对比度在 4.5 以上，是整屏最醒目的彩色块；洗色底降到 1.2 左右。黛蓝采用更中性的灰蓝洗色，
-     文字明度约 75%，按下状态的文字对比度仍不低于 4.5。
-   - 数据色一般取同族：主题色色相 −12°、明度 72%、彩度为主题色的 75%（上限 0.13）。曲线按 72%
-     不透明度绘制；色相偏移让曲线与操作色可区分，也让松绿、藕粉离状态绿、错误红更远。
-     黛蓝取灰蓝，明度约 65.6%、彩度约 0.037，减少曲线亮感；原色对块色的对比度仍高于 5。
+     作底、55% 作边框，悬停与按下为 32%、40%，文字取 oklch(82% 0.6C H)。操作色实底对标题条
+     的对比度在 4.5 以上，是整屏最醒目的彩色块；洗色底降到 1.2 左右。
+   - 数据色取同族：主题色色相 −12°、明度 72%、彩度为主题色的 75%（上限 0.13）。曲线按 72%
+     不透明度绘制，明度 56.5% 的旧取值在暗色底上发暗发浑，且与主题色几乎同色；色相偏移让曲线
+     与操作色可区分，也让松绿、藕粉离状态绿、错误红更远。
    - 图表分类色（--observe-1..10）按调色盘各取一套，见本节末「暗色图表分类色」。
-   - 亮色沿用对应暗色分类盘的色相与槽位，主数据色通常明度降到 52%，黛蓝保留低彩度灰蓝；
-     其它彩色槽降到 54%，中性槽降到 55%；超出 sRGB 时只收缩彩度。
-     线条对白底及块色的对比度均不低于 4.5。
+   - 亮色沿用对应暗色分类盘的色相与槽位，主数据色明度降到 52%，其它彩色槽降到 54%，
+     中性槽降到 55%；超出 sRGB 时只收缩彩度。线条对白底及块色的对比度均不低于 4.5。
      槽 1 与 --data 同色，ECharts、KPI、SVG 和图例共用这一事实，不另外维护 JS 主题色表。 */
 
 /* 堇紫：操作色 oklch(61% 0.17 298)，文字对纸 4.55，实底上的深色文字 4.72；明度降低会使
@@ -2668,19 +2667,23 @@
   --primary-line: transparent;
 }
 
-/* 黛蓝：操作色取灰蓝 oklch(64.1% 0.041 262)，文字对纸 5.55。数据色取同族灰蓝
-   oklch(65.6% 0.037 259)，对块色 5.46。主按钮文字对洗色底 6.41、按下底 4.72。
-   亮色沿用同族深灰蓝，操作色对白底 5.57，主按钮悬停时白字对底色 4.82。
+/* 黛蓝：柔和蓝，操作色 oklch(68% 0.10 262)，文字对纸 6.40。彩度介于此前的宝蓝（0.15，暗色下
+   导航、按钮文字与曲线发亮）与灰雾蓝（0.041，整页读成灰阶）之间，明度比其它方案的 60% 高。
+   数据色按同族规则取 oklch(72% 0.075 250)，曲线对纸 7.56。主按钮洗色不按通用配方：按配方
+   取值时底色彩度只有 0.033，导航选中项偏灰；底色改取 oklch(28.5% 0.045 262)，悬停、按下与
+   边框依次提亮，文字 oklch(83% 0.055 262) 对洗色底 8.50、按下底 6.72。
+   亮色操作色 oklch(50% 0.12 262)，对白底 6.07，悬停时白字 4.81。0.075 的数据蓝落到白底上
+   发灰，亮色数据色彩度提到 0.11，对白底 5.50。
    代码数字色需要与关键字（蓝）区分，随主色改用灰紫粉。 */
 :root[data-palette='dailan'] {
-  --action: #7f8da6;
-  --action-hover: #919fb5;
-  --action-active: #77859d;
-  --action-wash: rgba(127, 141, 166, 0.13);
+  --action: #7698d6;
+  --action-hover: #8aabe7;
+  --action-active: #6586c3;
+  --action-wash: rgba(118, 152, 214, 0.15);
   --action-on: #080f1c;
-  --data: #8492a8;
+  --data: #81a9d2;
   --data-secondary: #758196;
-  --data-wash: rgba(132, 146, 168, 0.09);
+  --data-wash: rgba(129, 169, 210, 0.13);
   --ground: #040608;
   --sheet: #111317;
   --surface: #0f1114;
@@ -2695,25 +2698,25 @@
   --hue-3: #7fa8b0;
   --hue-4: #9890b0;
   --code-n: #c99fc8;
-  --primary: #252b35;
-  --primary-hover: #2e3744;
-  --primary-active: #354051;
-  --primary-on: #a3afc1;
-  --primary-line: #3b4555;
+  --primary: #1e2a40;
+  --primary-hover: #23334f;
+  --primary-active: #283a5b;
+  --primary-on: #b4c8ec;
+  --primary-line: #314770;
 }
 :root[data-theme='light'][data-palette='dailan'] {
   /* 小字在标题带、名册与卡片上均需可读，不能把说明文字当作装饰灰。 */
   --ink-3: #4f5968;
   --ink-4: #576373;
-  --action: #5b697f;
-  --action-hover: #63738b;
-  --action-active: #505f75;
-  --action-wash: rgba(91, 105, 127, 0.08);
+  --action: #3c61a7;
+  --action-hover: #4b71b9;
+  --action-active: #2e5297;
+  --action-wash: rgba(60, 97, 167, 0.09);
   --action-on: #ffffff;
-  --data: #5f708a;
+  --data: #316ca5;
   --data-secondary: #6a5f90;
-  --data-wash: rgba(95, 112, 138, 0.07);
-  --observe-1: #5f708a;
+  --data-wash: rgba(49, 108, 165, 0.09);
+  --observe-1: #316ca5;
   --observe-2: #995577;
   --observe-3: #017e84;
   --observe-4: #7362a3;
@@ -3002,7 +3005,7 @@
   --observe-10: #817e88;
 }
 :root[data-palette='dailan']:not([data-theme='light']) {
-  --observe-1: #8492a8;
+  --observe-1: #81a9d2;
   --observe-2: #db91b4;
   --observe-3: #4fbec4;
   --observe-4: #af9ee4;
@@ -3067,9 +3070,9 @@ html {
   --safe-left: env(safe-area-inset-left, 0px);
   --shell-nav-h: 48px;
   --shell-crumb-h: 36px;
-  /* 两条横栏各有 1px 下边框。启动台面与工作区共用已知的外壳尺寸，首帧就使用
+  /* 只有面包屑横栏保留 1px 下边框。启动台面与工作区共用已知的外壳尺寸，首帧就使用
      同一网格坐标；数据、草稿条和页面内容变化都不能重新定位背景。 */
-  --workspace-grid-origin-y: calc(var(--safe-top) + var(--shell-nav-h) + var(--shell-crumb-h) + 2px);
+  --workspace-grid-origin-y: calc(var(--safe-top) + var(--shell-nav-h) + var(--shell-crumb-h) + 1px);
 }
 html,
 body {
@@ -4427,7 +4430,6 @@ textarea.f::placeholder {
     );
 }
 .loading-skeleton-plot > i,
-.loading-skeleton-node-trace > i,
 .loading-skeleton-chain-trace > i {
   position: absolute;
   inset: 20% 0 0;
@@ -4561,116 +4563,10 @@ textarea.f::placeholder {
   border-radius: 999px;
   background: color-mix(in srgb, var(--ok) 22%, transparent);
 }
-.loading-skeleton-list-shell > .loading-skeleton-node-grid {
-  /* 与真实 .cardpage .panel.titled 的 13px 内距一致，外框本身已有 1px 边框。 */
-  margin: 13px 13px 16px;
-}
 .loading-skeleton-tunnel-groups {
   margin: 13px 14px 16px;
 }
-.loading-skeleton-node-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(268px, 1fr));
-  gap: 14px;
-}
-.loading-skeleton-node-card {
-  min-width: 0;
-  height: 156px;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 11px;
-  background: var(--card);
-}
-.loading-skeleton-node-head,
-.loading-skeleton-node-foot {
-  display: grid;
-  align-items: center;
-  gap: 9px;
-  padding: 0 14px;
-}
-.loading-skeleton-node-head {
-  height: 49px;
-  grid-template-columns: 7px minmax(0, 1fr) auto;
-  border-bottom: 1px solid var(--line-soft);
-}
-.loading-skeleton-node-head .loading-bar:not(.tiny) {
-  width: min(58%, 132px);
-  height: 9px;
-}
-.loading-skeleton-node-card:nth-child(4n + 2) .loading-skeleton-node-head .loading-bar:not(.tiny) {
-  width: min(46%, 106px);
-}
-.loading-skeleton-node-card:nth-child(4n + 3) .loading-skeleton-node-head .loading-bar:not(.tiny) {
-  width: min(68%, 154px);
-}
-.loading-skeleton-node-trace {
-  position: relative;
-  height: 54px;
-  overflow: hidden;
-  border-bottom: 1px solid var(--line-soft);
-  background: color-mix(in srgb, var(--sunk) 34%, transparent);
-}
-.loading-skeleton-node-trace > i {
-  inset: 12% 0 0;
-  opacity: 0.72;
-}
-.loading-skeleton-node-card:nth-child(3n + 2) .loading-skeleton-node-trace > i {
-  clip-path: polygon(
-    0 78%,
-    9% 74%,
-    17% 66%,
-    25% 72%,
-    34% 26%,
-    42% 68%,
-    51% 61%,
-    60% 70%,
-    69% 58%,
-    78% 64%,
-    88% 34%,
-    100% 47%,
-    100% 100%,
-    0 100%
-  );
-}
-.loading-skeleton-node-card:nth-child(3n) .loading-skeleton-node-trace > i {
-  clip-path: polygon(
-    0 70%,
-    8% 66%,
-    16% 73%,
-    25% 62%,
-    33% 67%,
-    42% 54%,
-    51% 72%,
-    59% 18%,
-    67% 57%,
-    77% 50%,
-    86% 63%,
-    94% 55%,
-    100% 59%,
-    100% 100%,
-    0 100%
-  );
-}
-.loading-skeleton-node-foot {
-  height: 51px;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-}
-.loading-skeleton-node-foot .value {
-  width: 94px;
-  height: 13px;
-  background: var(--skeleton-fill-strong);
-}
-.loading-skeleton-node-card:nth-child(3n + 2) .loading-skeleton-node-foot .value {
-  width: 72px;
-}
-.loading-skeleton-node-card:nth-child(3n) .loading-skeleton-node-foot .value {
-  width: 108px;
-}
-.loading-skeleton-node-foot .loading-skeleton-chip {
-  width: 58px;
-  height: 22px;
-}
-/* 线路的卡壳、分组留白和 4/2/1 列直接使用真实页面的类；这里只画占位内容。 */
+/* 线路骨架的卡壳、分组留白与自适应列数沿用真实页面的类；这里只画占位内容。 */
 .loading-skeleton-chain-page > .panel {
   margin: 0;
 }
@@ -5920,11 +5816,8 @@ textarea.f::placeholder {
 /* A routed surface is already mounted while its nested requests register with the boundary. Pause
  * its entrance at the first frame instead of spending the animation behind `visibility: hidden`;
  * removing the guard then resumes the same animation without remounting page state. */
-.loading-boundary-guard
-  ~ :is(.fg-sheet, .panel, .chart-card, .ncard, .chain-card, .tunnel-row):has(~ .loading-boundary-end),
-.loading-boundary-guard
-  ~ *:has(~ .loading-boundary-end)
-  :is(.fg-sheet, .panel, .chart-card, .ncard, .chain-card, .tunnel-row) {
+.loading-boundary-guard ~ :is(.fg-sheet, .panel, .chart-card, .chain-card, .tunnel-row):has(~ .loading-boundary-end),
+.loading-boundary-guard ~ *:has(~ .loading-boundary-end) :is(.fg-sheet, .panel, .chart-card, .chain-card, .tunnel-row) {
   animation-play-state: paused;
 }
 
@@ -7433,7 +7326,6 @@ textarea.f::placeholder {
   .loading-skeleton-head-stat {
     display: none;
   }
-  .loading-skeleton-node-grid,
   .loading-skeleton-dual,
   .loading-skeleton-detail-columns {
     grid-template-columns: 1fr;
@@ -7450,15 +7342,7 @@ textarea.f::placeholder {
   .loading-skeleton-editor-toolbar > .hint {
     display: none;
   }
-  .loading-skeleton-node-card {
-    height: 138px;
-  }
-  .loading-skeleton-node-trace {
-    height: 42px;
-  }
-  .loading-skeleton-node-foot {
-    height: 47px;
-  }
+
   .loading-skeleton-user-split {
     grid-template-columns: 1fr;
   }
@@ -8194,7 +8078,7 @@ textarea.f::placeholder {
 /* 状态灯落右下角作 presence 点：不透明纸色描一圈，像从底板边角抠出来。
    详情页和机器列表共用这一个组合标识；3 级选择器压过 .node-lamp.warn/.bad 的彩色 halo，
    只改 box-shadow 与尺寸/定位，灯的语义色仍由 tone 类给出。 */
-:is(.nd-page-head, .nc-head) .nd-idplate .node-lamp {
+.nd-page-head .nd-idplate .node-lamp {
   position: absolute;
   right: -3px;
   bottom: -3px;
@@ -9254,6 +9138,11 @@ textarea.f::placeholder {
   box-sizing: border-box;
   border-bottom: 1px solid var(--line-soft);
   background: var(--band);
+}
+/* 运行状态与上方流量卡共用连续卡面，标题不再单独铺色带或分隔线。 */
+.nd-tab-observed > .nd-runtime > header {
+  border-bottom: 0;
+  background: none;
 }
 /* 门面标题表达整个页面或名册的入口层级；只提升本栏，不向内部内容面板传递高度。 */
 .panel.titled[data-page-title='true'] > header {
@@ -10993,17 +10882,42 @@ input.f {
   width: 190px;
 }
 .rule-action-cell {
+  min-width: 0;
+}
+/* 单元格保留 table-cell，换行只发生在内部；否则浏览器会补匿名单元格，
+   动作格的边框和行高便无法与匹配、操作两列对齐。 */
+.rule-action-fields,
+.rule-dial-fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  white-space: normal;
+}
+.rule-action-cell .rule-action-fields > *,
+.rule-action-cell .rule-dial-fields > * {
+  margin-left: 0;
+  max-width: 100%;
+}
+.rule-action-fields > .external-target-picker {
+  flex: 1 1 180px;
+  width: auto;
+  min-width: 160px;
+  max-width: 330px;
+}
+.rule-dial-fields {
+  max-width: 100%;
+}
+.rule-dial-fields > .mono {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.rule-operations-cell {
   white-space: nowrap;
 }
 .rule-action-select {
   width: 112px;
-  font-weight: 500;
-}
-.rule-action-select:is(.rule-action-forward, .rule-action-egress),
-.rule-ro[disabled] .rule-action-select:is(.rule-action-forward, .rule-action-egress) {
-  color: var(--ink-2);
-  border-color: color-mix(in srgb, var(--ink-3) 30%, var(--line));
-  background-color: color-mix(in srgb, var(--ink) 3%, var(--sunk));
 }
 .rule-action-select.rule-action-block,
 .rule-ro[disabled] .rule-action-select.rule-action-block {
@@ -11117,7 +11031,15 @@ input.f {
 }
 @container rules (max-width: 1050px) {
   .rule-table .rule-match-cell {
-    width: auto;
+    width: 190px;
+    white-space: normal;
+  }
+  .rule-table .rule-match-cell > .f {
+    display: block;
+    max-width: 100%;
+  }
+  .rule-table .rule-match-cell > .f + .f {
+    margin: 6px 0 0;
   }
 }
 @container rules (max-width: 1800px) {
@@ -11135,6 +11057,7 @@ input.f {
 }
 .rule-table td {
   padding: 5px 7px;
+  vertical-align: top;
 }
 .rule-table td:first-child {
   width: 18px !important;
@@ -11231,23 +11154,16 @@ input.f {
    桌面是一张表：序号 | 匹配 | 动作 | 重排，一行铺开。窄下来单行放不下——动作格里还
    串着转发目标、走法、推导地址，DNS 策略还有多个并排参数。分三档，且
    **表结构保持不变**（tests 依赖 tbody/tr/td、兜底 `*`、每行四格）：
-   · ≤1440px：动作格改 flex 换行，目标 / 走法落到动作选择器下方，不再横向溢出；
+   · ≤1440px：动作格内部按组换行，走法和地址一起落到目标下方；
      DNS 参数缩短但仍维持一行，优先利用移除说明标签后腾出的空间。
-   · ≤1050px：匹配格放开定宽（上方独立的 1050px 断点块）。
+   · ≤1050px：匹配类别和值上下排列；DNS 地址单独一行，为其他参数和操作留出空间。
    · ≤640px：整行折成卡片——序号做抬头、重排做卡脚，匹配 / 动作各补一枚小标签，
      控件占满整宽，DNS 参数落成一列、这一跳逐项一行。
-   所有规则表统一使用 `.rule-table`，链路规则、线路里的 XRAY 链路和机器 DNS 策略不再
-   分别维护一份响应式选择器。 */
+   `.rule-table` 提供共用控件和 DNS 参数适配；下方 `.rule-editor-table` 将链路规则
+   按「匹配 → 去向」收紧为连续列表。 */
 @container rules (max-width: 1440px) {
-  /* 动作格里 inline 子元素之间未必有空白文本节点，white-space 不足以断行，改 flex-wrap。 */
-  .rule-table .rule-action-cell {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
-  }
-  .rule-table .rule-action-cell > :is(.egress-dns-reference, .egress-dns-editor, .egress-dns-usage) {
-    margin-left: 0;
+  .rule-dial-fields {
+    flex-basis: 100%;
   }
   .egress-dns-choice {
     width: 136px;
@@ -11259,6 +11175,21 @@ input.f {
   .egress-dns-endpoint {
     grid-template-columns: minmax(90px, 1fr) 4px 52px;
     gap: 3px;
+  }
+}
+
+@container rules (max-width: 1050px) {
+  .egress-dns-editor {
+    flex: 1 1 100%;
+    grid-template-columns: 68px minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .egress-dns-endpoint {
+    grid-column: 1 / -1;
+  }
+  .egress-dns-error {
+    grid-column: 1 / -1;
+    grid-row: auto;
+    max-width: 100%;
   }
 }
 
@@ -11310,9 +11241,18 @@ input.f {
     min-height: 26px;
   }
   .rule-table > tbody > tr > td.rule-action-cell {
+    display: block !important;
+    margin-top: 7px;
+  }
+  .rule-table .rule-action-fields,
+  .rule-table .rule-dial-fields {
+    flex-basis: auto;
     flex-direction: column;
     align-items: stretch;
-    margin-top: 7px;
+  }
+  .rule-table .rule-action-fields > .external-target-picker {
+    flex: none;
+    max-width: none;
   }
   .rule-table .rule-match-cell::before,
   .rule-table .rule-action-cell::before {
@@ -11331,8 +11271,10 @@ input.f {
     content: '动作';
   }
   /* 匹配：类别定宽，值占余下整行 */
-  .rule-table .rule-match-cell > .f {
+  .rule-table .rule-match-cell > .f,
+  .rule-table .rule-match-cell > .f + .f {
     margin-left: 0 !important;
+    margin-top: 0;
   }
   .rule-table .rule-match-cell select.f {
     flex: 0 0 auto;
@@ -11346,9 +11288,6 @@ input.f {
     min-width: 0;
   }
   /* 动作：逐项整宽堆叠 */
-  .rule-table .rule-action-cell > * {
-    margin-left: 0 !important;
-  }
   .egress-dns-reference {
     display: flex;
     flex-direction: column;
@@ -11457,6 +11396,293 @@ input.f {
   }
   .rule-editor .hopfld-sep {
     display: none;
+  }
+}
+
+/* 链路规则按「匹配 → 去向」连续阅读。条件是一组字段，连接方式和推导地址降为
+   去向下方的次行；仅用横向分隔区分规则，避免把每个字段围成独立的格子。 */
+.rule-editor-table {
+  table-layout: fixed;
+}
+.rule-editor-table .rule-number-column {
+  width: 30px;
+}
+.rule-editor-table .rule-match-column {
+  width: 32%;
+}
+.rule-editor-table .rule-tools-column {
+  width: 96px;
+}
+.rule-editor-table :is(th, td) {
+  padding: 8px;
+  border-inline: 0;
+  border-top: 0;
+  border-bottom: 1px solid var(--line-soft);
+  background: transparent;
+}
+.rule-editor-table thead th {
+  padding-block: 7px;
+  color: var(--ink-4);
+  font: 10px var(--sans);
+}
+.rule-editor-table .rule-tools-heading {
+  text-align: right;
+}
+.rule-editor-table td:first-child {
+  padding-top: 15px;
+  color: var(--ink-4);
+  font-size: 10px;
+}
+.rule-editor-table .rule-match-cell {
+  width: auto;
+  white-space: normal;
+}
+.rule-match-fields {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+}
+.rule-match-fields:focus-within {
+  border-color: var(--action);
+}
+.rule-editor-table .rule-match-fields > .f {
+  height: calc(var(--ctl-h) - 2px);
+  min-height: calc(var(--ctl-h) - 2px);
+  margin: 0;
+  padding-block: 0;
+  border: 0;
+  border-radius: 0;
+  background-color: transparent;
+  box-shadow: none;
+  font-size: 12px;
+}
+.rule-editor-table .rule-match-fields > :is(select.f, .rule-readonly-select) {
+  flex: 0 0 96px;
+  width: 96px;
+  min-width: 0;
+  padding-inline: 8px 20px;
+  border-right: 1px solid var(--line-soft);
+  color: var(--ink-3);
+}
+.rule-editor-table .rule-match-fields > :is(input.f, .rule-readonly-value) {
+  flex: 1 1 0;
+  width: 0;
+  min-width: 0;
+  padding-inline: 9px;
+}
+.rule-match-fields:has(> :only-child) {
+  width: max-content;
+  max-width: 100%;
+}
+.rule-editor-table .rule-match-fields > :only-child {
+  border-right: 0;
+}
+.rule-editor-table .rule-action-fields {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  align-items: start;
+  gap: 6px;
+}
+.rule-editor-table .machine-dns-shared-row .rule-action-fields {
+  grid-template-columns: minmax(0, 1fr);
+}
+.rule-editor-table .machine-dns-shared-row .egress-dns-editor {
+  grid-column: 1 / -1;
+}
+.rule-editor-table .rule-fallback-row .rule-action-fields:not(:has(> .rule-action-select)) {
+  display: flex;
+}
+.rule-editor-table .rule-action-select {
+  width: 104px;
+  min-width: 0;
+  height: var(--ctl-h);
+}
+.rule-editor-table .rule-action-fields > .external-target-picker {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+}
+.rule-editor-table .external-target-trigger,
+.rule-editor-table .external-target-trigger.node-target,
+.rule-editor-table .external-target-trigger.listener-target {
+  min-height: var(--ctl-h);
+  border-color: var(--line);
+  background: var(--sunk);
+}
+.rule-editor-table .external-target-trigger[aria-expanded='true'] {
+  border-color: var(--action);
+  background: var(--action-wash);
+}
+.rule-editor-table .external-target-trigger .external-target-kind,
+.rule-editor-table .external-target-trigger.node-target .external-target-kind,
+.rule-editor-table .external-target-trigger.listener-target .external-target-kind {
+  min-width: 28px;
+  padding: 1px 4px;
+  border-color: transparent;
+  background: var(--hover);
+  color: var(--ink-3);
+  font-size: 8px;
+}
+.rule-editor-table .rule-dial-fields {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  grid-column: 1 / -1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.rule-editor-table .rule-dial-fields > .mono:only-child {
+  grid-column: 1 / -1;
+}
+.rule-editor-table .rule-dial-fields > .mono {
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.rule-row-actions {
+  display: inline-flex;
+  gap: 1px;
+}
+.rule-editor-table .rule-operations-cell {
+  padding-inline: 0;
+  text-align: right;
+}
+.rule-editor-table .rule-row-actions .btn {
+  width: 30px;
+  min-width: 0;
+  min-height: var(--ctl-h);
+  margin: 0;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--ink-3);
+}
+.rule-editor-table .rule-row-actions .btn:disabled {
+  opacity: 0.22;
+}
+@media (hover: hover) {
+  .rule-editor-table .external-target-trigger:hover {
+    border-color: var(--action);
+    background: var(--action-wash);
+  }
+  .rule-editor-table .rule-row-actions .btn:hover:not(:disabled) {
+    color: var(--ink);
+    background: var(--hover);
+  }
+  .rule-editor-table .rule-row-actions .danger:hover:not(:disabled) {
+    color: var(--err);
+    background: color-mix(in srgb, var(--err) 8%, transparent);
+  }
+}
+.rule-editor-table .rule-fallback-sign {
+  font-size: 9px;
+}
+@container rules (640px < width <= 1050px) {
+  .rule-editor-table .rule-match-fields:has(> :nth-child(2)) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-items: stretch;
+    gap: 6px;
+    border: 0;
+    background: transparent;
+  }
+  .rule-editor-table .rule-match-fields:has(> :nth-child(2)) > .f {
+    width: 100%;
+    height: var(--ctl-h);
+    min-height: var(--ctl-h);
+    box-sizing: border-box;
+    border: 1px solid var(--line);
+    border-radius: var(--r-ctl);
+    background-color: var(--sunk);
+  }
+  .rule-editor-table .rule-match-fields:has(> :nth-child(2)) > .f:focus {
+    border-color: var(--action);
+  }
+}
+@container rules (min-width: 1441px) {
+  .rule-editor-table .rule-action-fields:has(> .rule-dial-fields) {
+    grid-template-columns: 104px minmax(160px, 0.85fr) minmax(0, 1.15fr);
+  }
+  .rule-editor-table .rule-dial-fields {
+    grid-column: 3;
+    min-height: var(--ctl-h);
+  }
+}
+@container rules (max-width: 640px) {
+  .rule-editor-table > colgroup,
+  .rule-editor-table > thead {
+    display: none;
+  }
+  .rule-editor-table > tbody > tr {
+    display: grid;
+    grid-template-columns: 18px minmax(0, 1fr) 92px;
+    gap: 8px;
+    margin: 0;
+    padding: 12px 0;
+    border: 0;
+    border-bottom: 1px solid var(--line-soft);
+    border-radius: 0;
+    background: transparent;
+  }
+  .rule-editor-table.rule-editor-readonly > tbody > tr {
+    grid-template-columns: 18px minmax(0, 1fr);
+  }
+  .rule-editor-table > tbody > tr > td {
+    min-width: 0;
+    margin: 0;
+    border: 0;
+  }
+  .rule-editor-table > tbody > tr > td:first-child {
+    grid-column: 1;
+    grid-row: 1;
+    align-self: center;
+    margin: 0;
+    padding: 0 !important;
+    border: 0;
+  }
+  .rule-editor-table > tbody > tr > td.rule-match-cell {
+    display: block !important;
+    grid-column: 2;
+    grid-row: 1;
+    padding: 0 !important;
+  }
+  .rule-editor-table > tbody > tr > td.rule-action-cell {
+    grid-column: 2 / -1;
+    grid-row: 2;
+    margin: 0;
+    padding: 0 !important;
+  }
+  .rule-editor-table .rule-match-cell::before,
+  .rule-editor-table .rule-action-cell::before {
+    content: none;
+  }
+  .rule-editor-table .rule-match-fields > :is(select.f, .rule-readonly-select) {
+    flex-basis: 78px;
+    width: 78px !important;
+    min-width: 0;
+    font-size: 11px;
+  }
+  .rule-editor-table .rule-action-fields {
+    grid-template-columns: 104px minmax(0, 1fr);
+  }
+  .rule-editor-table .rule-action-fields > .external-target-picker {
+    display: block;
+  }
+  .rule-editor-table > tbody > tr > td:last-child:not(.rule-action-cell) {
+    grid-column: 3;
+    grid-row: 1;
+    margin: 0;
+    padding: 0 !important;
+    border: 0;
+  }
+  .rule-editor-table .rule-action-fields .rule-action-select {
+    width: 104px !important;
+  }
+  .rule-editor-table .egress-dns-editor {
+    grid-column: 1 / -1;
   }
 }
 
@@ -14671,7 +14897,6 @@ body.has-artpanel .topo-deck {
   gap: 10px;
   height: var(--shell-nav-h);
   padding: 0 12px 0 18px;
-  border-bottom: 1px solid var(--line);
   background: var(--surface);
 }
 .fg-home {
@@ -16286,8 +16511,8 @@ body.fg-dragging * {
   html {
     --shell-nav-h: 44px;
     --shell-crumb-h: 34px;
-    /* 窄屏不渲染面包屑，只计导航行及其下边框。 */
-    --workspace-grid-origin-y: calc(var(--safe-top) + var(--shell-nav-h) + 1px);
+    /* 窄屏不渲染面包屑，导航行也没有下边框。 */
+    --workspace-grid-origin-y: calc(var(--safe-top) + var(--shell-nav-h));
   }
   /* ─── 导航行：品牌 + 四个高频页面 + 通知 + 账户（44px）───
      此处原为「品牌 / 产物 / 诊断 / ⋯」，导航位于屏幕底部的 tab bar。
@@ -25559,13 +25784,352 @@ body.observe-brushing .observe-chart-tip {
 
    因此此处使用 grid-column 而非 flex-wrap：父元素此时不是 flex，flex-wrap 不生效。 */
 
-/* ── 机器卡片 ──────────────────────────────────────────────
-   由行改为卡片的取舍见 nodes.tsx 的 NodeCard。此处只说明视觉规则：
-   **不使用分隔线**。层次由留白和字重表示——三条线会把 130px 的卡片切为四段，
-   而卡片本身是一个整体。 */
-.node-cardpage > .panel {
-  margin: 0;
+/* ── 机器卡片：弱彗星走势与 CPU、内存、磁盘三环 ── */
+.node-cardpage {
+  --node-card-fill: var(--block);
+  --node-card-hover: color-mix(in srgb, var(--ink) 4%, var(--block));
+  --node-card-hair: color-mix(in srgb, var(--ink) 8%, transparent);
+  font-variant-numeric: tabular-nums;
 }
+:root[data-theme='light'] .node-cardpage {
+  --node-card-fill: var(--sheet);
+  --node-card-hover: color-mix(in srgb, var(--ink) 2.5%, var(--sheet));
+  --node-card-hair: color-mix(in srgb, var(--ink) 9%, transparent);
+}
+.node-cardpage .nd-page-head > .nd-tools {
+  margin-left: auto;
+}
+.node-list-body {
+  padding: 16px 18px 20px;
+}
+.node-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+.node-card-grid > [role='listitem'] {
+  min-width: 0;
+}
+.node-card {
+  appearance: none;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  flex-direction: column;
+  box-sizing: border-box;
+  padding: 16px;
+  border: 0;
+  border-radius: 18px;
+  background: var(--node-card-fill);
+  box-shadow: var(--sheet-shadow);
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  outline: none;
+  transition:
+    background-color 0.15s ease,
+    box-shadow 0.15s ease,
+    transform 0.12s ease;
+}
+@media (hover: hover) and (pointer: fine) {
+  .node-card:hover {
+    background: var(--node-card-hover);
+  }
+}
+.node-card.picked {
+  box-shadow:
+    inset 0 0 0 2px var(--action),
+    var(--sheet-shadow);
+}
+.node-card:focus-visible,
+.node-card:has(input:focus-visible) {
+  box-shadow:
+    0 0 0 2px var(--action),
+    var(--sheet-shadow);
+}
+button.node-card:active {
+  transform: scale(0.985);
+}
+.node-card.off {
+  opacity: 0.5;
+}
+.node-card-head {
+  display: flex;
+  min-width: 0;
+  height: 20px;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 14px;
+  box-sizing: content-box;
+}
+.node-card-pick {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--action);
+}
+.node-card-flag {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+}
+.node-card-flag .geo-flag {
+  width: 18px;
+  height: 12px;
+  border-radius: 2.5px;
+  box-shadow: 0 0 0 0.5px color-mix(in srgb, var(--ink) 22%, transparent);
+}
+.node-card-flag > i {
+  width: 18px;
+  height: 12px;
+  border-radius: 2.5px;
+  background: color-mix(in srgb, var(--ink) 12%, transparent);
+}
+.node-card-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-card-name.mono {
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.node-card-status {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 55%;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.node-card-status > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.node-card-status > .icon {
+  flex: none;
+}
+.node-card-status.warn,
+.node-card-corner.warn,
+.node-card-percent.warn {
+  color: var(--gold);
+}
+.node-card-status.bad,
+.node-card-corner.bad,
+.node-card-percent.bad {
+  color: var(--err);
+}
+.node-card-status.idle,
+.node-card-status.ok {
+  color: var(--ink-3);
+  font-weight: 400;
+}
+.node-card-corner {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  color: var(--ink-2);
+}
+.node-card-percent {
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.node-card-ring.warn .value {
+  stroke: var(--gold);
+}
+.node-card-ring.bad .value {
+  stroke: var(--err);
+}
+.node-card-comet {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 46px;
+  margin-top: auto;
+  color: var(--data);
+}
+.node-card-comet.empty {
+  box-sizing: border-box;
+  border-bottom: 1px dashed var(--node-card-hair);
+}
+.node-card-comet > svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.node-card-comet .trail {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+.node-card-comet.tone-warn {
+  color: var(--gold);
+}
+.node-card-comet.tone-bad {
+  color: var(--err);
+}
+.node-card-comet.tone-idle {
+  color: var(--ink-4);
+}
+.node-card-comet.stale {
+  opacity: 0.55;
+}
+.node-card-comet-now {
+  position: absolute;
+  left: 100%;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow:
+    0 0 0 2px var(--node-card-fill),
+    0 0 0 4px color-mix(in srgb, currentColor 16%, transparent);
+  transform: translate(-50%, -50%);
+}
+.node-card-foot {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+.node-card-now {
+  flex: none;
+}
+.node-card-rate {
+  color: var(--ink-2);
+  font-size: inherit;
+  font-weight: 600;
+}
+.node-card-rate small {
+  margin-left: 3px;
+  color: var(--ink-3);
+  font-size: inherit;
+  font-weight: 400;
+  line-height: 1;
+}
+.node-card-rate.none {
+  color: var(--ink-4);
+  font-weight: 400;
+}
+.node-card-month {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-card-month b {
+  color: var(--ink-2);
+  font-weight: 600;
+}
+.node-card-month b.none {
+  color: var(--ink-4);
+  font-weight: 400;
+}
+.node-card-quota {
+  color: var(--ink-3);
+  font-weight: 400;
+}
+.node-card-resources {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--node-card-hair);
+  color: var(--ink-3);
+  font-size: 12.5px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+.node-card-resource {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+}
+.node-card-resource > svg {
+  flex: none;
+}
+.node-card-resource b {
+  color: var(--ink-2);
+  font-weight: 600;
+}
+.node-card-resource.warn b {
+  color: var(--gold);
+}
+.node-card-resource.bad b {
+  color: var(--err);
+}
+.node-card-resource.none b {
+  color: var(--ink-4);
+  font-weight: 400;
+}
+@container (max-width: 700px) {
+  .node-cardpage > .nd-paper > .nd-page-head {
+    grid-template-rows: 50px;
+    height: 50px;
+    min-height: 50px;
+  }
+}
+@media (max-width: 820px) {
+  .node-list-body {
+    padding: 12px;
+  }
+}
+@media (max-width: 560px) {
+  .node-card-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+  .node-cardpage .nd-tools {
+    gap: 4px;
+  }
+  .node-cardpage .nd-tools .btn {
+    padding-inline: 7px;
+    font-size: 12px;
+  }
+}
+@media (max-width: 360px) {
+  .node-cardpage .nd-tools .btn {
+    padding-inline: 5px;
+    font-size: 11px;
+  }
+  .node-card-resources {
+    gap: 6px;
+    font-size: 12px;
+  }
+  .node-card-resource {
+    gap: 4px;
+  }
+}
+
 /* `.btn` 不设 gap；「移除选中」的垃圾桶图标与文字之间的间距在这里给出。 */
 .node-remove-button {
   display: inline-flex;
@@ -25577,122 +26141,6 @@ body.observe-brushing .observe-chart-tip {
   flex: none;
 }
 
-.ncards,
-.loading-skeleton-list-shell.nodes > .loading-skeleton-node-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(268px, 1fr));
-  gap: 14px;
-  /* 使用 start 而非默认的 stretch：失联和已退役的卡片内容较少，拉伸到与正常卡片
-     等高会在中间留下大片空白。高度较小本身即是一种状态信号。 */
-  align-items: start;
-}
-
-.ncard {
-  /* 悬停与选中态的边框色，按状态分档。正常档与曲线一致取主题色
-     （同 `.ncard.tone-ok .node-nic-plot`），状态本身仍由左上角的灯表达；
-     其余三档保持语义色，与 `.node-lamp` 一一对应。 */
-  --card-edge: var(--action);
-  position: relative;
-  display: block;
-  width: 100%;
-  /* 本项目没有全局的 `* { box-sizing: border-box }`，只在个别选择器上设置。
-     因此此处必须显式声明：否则 padding 32px 加 border 2px 会叠加在 grid 计算的
-     轨道宽度之外，每张卡片比轨道宽 34px，整行溢出容器——表现为右边框不可见。 */
-  box-sizing: border-box;
-  /* grid item 的 min-width 默认为 auto，不允许小于内容宽度；而卡片内的面积图会延伸到
-     padding 之外。与 `.lst-row .body` 处的 min-width:0 属同一问题。 */
-  min-width: 0;
-  text-align: left;
-  background: var(--sheet);
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  /* Match the loading card's 14px content inset. Keeping a second inset here made the real
-     status lamp and every header item jump right when the skeleton was replaced. */
-  padding: 15px 14px 13px;
-  overflow: hidden;
-  cursor: pointer;
-  font: inherit;
-  color: inherit;
-  transition: border-color 0.15s ease;
-}
-/* WebKit 会在触屏上保留 `:hover`，刷新后的第一次触摸可能只建立 hover 而不激活卡片。
-   悬停反馈只交给真正支持悬停的精细主指针；触屏用短暂的 :active 表达按下。 */
-@media (hover: hover) and (pointer: fine) {
-  .ncard:hover {
-    border-color: color-mix(in srgb, var(--card-edge) 45%, var(--line));
-  }
-}
-.ncard:active {
-  border-color: color-mix(in srgb, var(--card-edge) 55%, var(--line));
-}
-.ncard:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 2px;
-}
-.ncard.off {
-  opacity: 0.5;
-}
-.ncard.tone-warn {
-  --card-edge: var(--gold);
-}
-.ncard.tone-bad {
-  --card-edge: var(--err);
-}
-.ncard.tone-idle {
-  --card-edge: var(--ink-4);
-}
-/* 选中态随状态分档。组合标识仍保留状态灯，边框同样按状态着色，让异常卡在多选时也不会
-   被统一的选中色抹掉。正常档与曲线一致取主题色。 */
-.ncard.picked {
-  border-color: var(--card-edge);
-  background: color-mix(in srgb, var(--card-edge) 7%, var(--sheet));
-}
-.nc-head {
-  display: flex;
-  align-items: center;
-  gap: 0;
-}
-.nc-head > b {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-}
-.nc-ago {
-  font: 10.5px var(--mono);
-  color: var(--ink-4);
-}
-.nc-ago.bad {
-  color: var(--err);
-}
-
-/* 槽宽与圆点一致，使其左沿成为卡片的视觉锚点；右侧留白已包含光晕所需空间。 */
-.nc-status-slot {
-  display: inline-grid;
-  width: 7px;
-  height: 14px;
-  flex: none;
-  place-items: center;
-  margin-right: 9px;
-}
-.nc-region-flag {
-  display: inline-flex;
-  flex: none;
-  align-items: center;
-  margin-right: 9px;
-}
-.nc-pick-slot {
-  display: inline-grid;
-  width: 14px;
-  height: 14px;
-  flex: none;
-  place-items: center;
-  margin-right: 8px;
-}
 /* 列表卡和详情书签共用的状态灯：绿色表示无需处理、黄色表示有警告、红色表示需立即查看、
    灰色表示从未上报或已退役。具体项在 title 中，悬停即可查看。 */
 .node-lamp {
@@ -25715,14 +26163,6 @@ body.observe-brushing .observe-chart-tip {
   background: var(--ink-4);
   box-shadow: none;
 }
-.nc-pick {
-  flex: none;
-  width: 14px;
-  height: 14px;
-  margin: 0;
-  accent-color: var(--action);
-}
-
 /* Country is an identity prefix, not a badge. The box only states how large one cell renders;
    which cell it is comes from `background-size`/`-position` set in ui/region-flag.tsx. */
 .geo-flag {
@@ -25734,122 +26174,6 @@ body.observe-brushing .observe-chart-tip {
   border-radius: 1.5px;
   background-image: url('./ui/flags.png');
   background-repeat: no-repeat;
-}
-/* 与线路卡共用 `.history-plot` 的曲线、极值点和 Tooltip。这里只校正机器卡 16px 的
-   左右内距（线路卡是 15px），并保留机器页原来的中性色。 */
-.node-nic-plot {
-  width: calc(100% + 32px);
-  margin: 13px -16px 0;
-  color: var(--ink-3);
-}
-/* 曲线取数据色而不是状态灯的绿，同 `.load-metric`：一屏九张卡里八张在线，八条绿曲线
-   是这一页面积最大的着色，异常那一两张反而不跳。状态仍由左上角的灯给出——灯是绿的、
-   曲线是蓝的，这一处不一致是这条规则的代价，换来的是异常卡片能一眼看到。
-   warn / bad 两档不动：那两档本来就少，着色正是要让它们跳出来。 */
-.ncard.tone-ok .node-nic-plot {
-  color: var(--data);
-}
-.ncard.tone-ok.picked {
-  --card-edge: var(--action);
-}
-.ncard.tone-warn .node-nic-plot {
-  color: var(--gold);
-}
-.ncard.tone-bad .node-nic-plot {
-  color: var(--err);
-}
-
-.nc-foot {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 9px;
-  min-height: 26px;
-}
-/* 操作只在 hover 时显示。常驻显示时一屏九张卡片即九个按钮，
-   而本页的主要用途是查看而非操作。 */
-/* 脱离文档流固定在卡片右下角，覆盖在 IP 之上。按钮显示时用户的操作目标是按钮，
-   此时遮挡 IP 不影响使用。.btn 自带不透明底色，覆盖部分不会与 IP 文字重叠。 */
-.nc-dock {
-  position: absolute;
-  z-index: 10;
-  /* 比正文内距更靠近右下角，同时为圆角边框保留可见的间距。 */
-  right: 10px;
-  bottom: 10px;
-  visibility: hidden;
-  opacity: 0;
-  transition: opacity 0.12s ease;
-}
-.ncard:focus-within .nc-dock {
-  z-index: 10;
-  visibility: visible;
-  opacity: 1;
-}
-@media (hover: hover) and (pointer: fine) {
-  .ncard:hover .nc-dock {
-    z-index: 10;
-    visibility: visible;
-    opacity: 1;
-  }
-}
-.nc-dock .btn {
-  padding: 2px 9px;
-  font-size: 11px;
-}
-
-@media (hover: none) {
-  /* 触摸屏没有 hover 状态，隐藏后无法访问 */
-  .nc-dock {
-    visibility: visible;
-    opacity: 1;
-  }
-}
-@media (max-width: 560px) {
-  .ncards,
-  .loading-skeleton-list-shell.nodes > .loading-skeleton-node-grid {
-    grid-template-columns: 1fr;
-  }
-}
-
-/* 卡片右下角的地址。等宽字体与原有色阶保持不变，过长时截断并在 title 显示全值。 */
-.nc-ip {
-  font: 11px var(--mono);
-  color: var(--ink-3);
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.nc-ip.none {
-  color: var(--ink-4);
-}
-/* 底部 IP 固定在最右侧；IPv6 在小卡片内可收缩，不挤压本月总量。 */
-.nc-foot .nc-ip {
-  flex: 0 1 auto;
-  max-width: 23ch;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  margin-left: 8px;
-}
-
-@media (max-width: 820px) {
-  /* 窄屏允许标题栏的操作按钮换行。 */
-  .node-list-panel > header {
-    flex-wrap: wrap;
-    row-gap: 9px;
-  }
-}
-
-/* 卡片底部只保留网卡本月累计，字号沿用移除业务累计之前的单值摘要。 */
-.nc-foot .lst-sum {
-  display: inline-flex;
-  min-width: 0;
-  align-items: center;
-  gap: 5px;
-  text-align: left;
-  font: 300 19px/1 var(--mono);
-  letter-spacing: -0.02em;
 }
 /* 流量统计：一行本期读数、一根额度条、接收与发送，下面是计量设置与自动限速。卡片常驻在身份下方，
    不使用 details 折叠。额度条沿用流量预测页的跑道（cap-bar / cap-q），竖线是本期时间进度。 */
@@ -26233,13 +26557,6 @@ body.observe-brushing .observe-chart-tip {
   margin-left: 14px;
   color: var(--ink-2);
 }
-.nc-foot .lst-sum small {
-  display: inline;
-  margin-left: 0;
-  font: 10.5px/1 var(--sans);
-  letter-spacing: 0;
-}
-
 /* ── 设置页的证书清单 ──
  *
  * 一台一行，五列：机器、名称、状态、到期时间、（出错时）最后一条错误。使用 grid 而非 table，
@@ -28011,11 +28328,9 @@ body.observe-brushing .observe-chart-tip {
 }
 
 /* ═══ 线路列表 · 链卡 ═══════════════════════════════════════════════
- * 外层沿用机器列表和设置页的 `.panel.titled`：有底色的标题条与内容属于同一张段卡，
- * 而不是一条悬浮页头加若干直接落在网格台面上的卡片。项目只作为段卡内部的章节，靠留白
- * 和细分隔线分组；链才是需要点击和横向比较的对象，因此一条链一张卡。 */
-.chain-cardpage > .panel {
-  margin: 0;
+ * 页头与用量、机器页共用连续纸面；分组通过名称和留白划分，链卡以阴影浮起。 */
+.chain-list-body {
+  padding: 16px 18px 20px;
 }
 /* 用户页与上面两页同一层结构。它此前是裸 `.fg-sheet > header`：同一个台面上从机器页
    切到用户页，标题会从 13px 无衬线的色带标题变成 15px 等宽大写的浮动标题，两种页头。 */
@@ -28120,13 +28435,10 @@ body.observe-brushing .observe-chart-tip {
   background: color-mix(in srgb, var(--action) 7%, var(--sheet));
 }
 .chain-section {
-  padding: 18px 2px;
+  padding: 12px 0 14px;
 }
 .chain-section:first-child {
-  padding-top: 3px;
-}
-.chain-section + .chain-section {
-  border-top: 1px solid var(--line-soft);
+  padding-top: 0;
 }
 .chain-drop-target {
   outline: 2px solid var(--action);
@@ -28165,12 +28477,6 @@ body.observe-brushing .observe-chart-tip {
   align-items: center;
   gap: 10px;
   margin-bottom: 12px;
-}
-.chain-section-head .no {
-  flex: none;
-  color: color-mix(in srgb, var(--ink) 28%, transparent);
-  font: 600 17px/1 var(--mono);
-  font-variant-numeric: tabular-nums;
 }
 /* 分组排序使用一枚六点抓手。链卡本身就是拖动区域，不再在标题左侧重复放一枚按钮；
    分组抓手仍保留键盘入口，聚焦后可使用方向键移动。 */
@@ -28258,7 +28564,7 @@ body.observe-brushing .observe-chart-tip {
 .chain-section-head > h5,
 .chain-section-head > .chain-section-name {
   color: var(--ink);
-  font: 600 13px var(--sans);
+  font: 600 17px/24px var(--sans);
 }
 .chain-section-head > h5 {
   margin: 0;
@@ -28282,17 +28588,17 @@ body.observe-brushing .observe-chart-tip {
   outline-offset: 2px;
   border-radius: 3px;
 }
-.chain-section-head .id,
 .chain-section-head .count {
-  color: var(--ink-4);
-  font: 10.5px var(--mono);
+  color: var(--ink-3);
+  font: 13px var(--sans);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 .chain-section-head .count {
-  margin-left: auto;
+  margin-left: 0;
 }
 .chain-section-actions {
+  margin-left: auto;
   flex: none;
   display: flex;
   align-items: center;
@@ -28300,29 +28606,21 @@ body.observe-brushing .observe-chart-tip {
 }
 .chain-section-head .new-chain {
   box-sizing: border-box;
-  height: 25px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-ctl);
-  background: var(--block);
-  color: var(--ink-2);
-  font: 600 10.5px var(--sans);
+  padding: 3px 7px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--action);
+  font: 500 13px var(--sans);
   cursor: pointer;
 }
-.chain-section-head .new-chain {
-  padding: 0 9px;
-  border-color: color-mix(in srgb, var(--action) 34%, var(--line));
-  background: var(--action-wash);
-  color: var(--ink);
-}
-.chain-section-head .new-chain:hover {
-  border-color: color-mix(in srgb, var(--action) 55%, var(--line));
-  background: color-mix(in srgb, var(--action) 20%, transparent);
+.chain-section-head .new-chain:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--action) 10%, transparent);
 }
 /* 禁用时退掉主色，与 `.btn.primary:disabled` 同一处理：只读角色打开这一页时每个线路分组
    都有一枚常驻禁用的按钮，留着 accent 底色会使整页最亮的若干处都是点不了的东西。
    放在 :hover 之后——两条选择器权重相同，靠顺序覆盖掉悬停态的着色。 */
 .chain-section-head .new-chain:disabled {
-  border-color: var(--line);
   background: none;
   color: var(--ink-4);
   font-weight: 400;
@@ -28335,14 +28633,15 @@ body.observe-brushing .observe-chart-tip {
   font-size: 12.5px;
 }
 
-/* 与机器页同为四列：链卡的信息量已经收敛，三列会留下过多横向空白，并让四条链产生
- * 一个孤立的第二行。1024 和手机分别降为两列、一列。 */
+/* auto-fill 保留小分组的空列，使各组卡片等宽；窄于 330px 的容器允许单卡收至可用宽度。 */
 .chain-card-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(330px, 100%), 1fr));
   gap: 12px;
 }
 .chain-card {
+  --chain-card-fill: var(--block);
+  --chain-card-hover: color-mix(in srgb, var(--ink) 4%, var(--block));
   --chain-tone: var(--ink-3);
   /* 边框（悬停/选中）用色，默认与状态灯同源。正常档单独取主题色，见 `.tone-ok`；
      不动 `--chain-tone` 本身——它还供状态灯使用，改它会把灯也改掉。 */
@@ -28354,13 +28653,20 @@ body.observe-brushing .observe-chart-tip {
   flex-direction: column;
   padding: 14px 15px 12px;
   overflow: hidden;
-  border: 1px solid var(--line);
+  border: 1px solid transparent;
   border-radius: 12px;
-  background: var(--sheet);
+  background: var(--chain-card-fill);
+  box-shadow: var(--sheet-shadow);
   color: var(--ink-2);
   cursor: pointer;
   touch-action: manipulation;
-  transition: border-color 0.15s ease;
+  transition:
+    border-color 0.15s ease,
+    background-color 0.15s ease;
+}
+:root[data-theme='light'] .chain-card {
+  --chain-card-fill: var(--sheet);
+  --chain-card-hover: color-mix(in srgb, var(--ink) 2.5%, var(--sheet));
 }
 .chain-card.tone-ok {
   --chain-tone: var(--ok);
@@ -28377,6 +28683,9 @@ body.observe-brushing .observe-chart-tip {
 @media (hover: hover) and (pointer: fine) {
   .chain-card:hover {
     border-color: color-mix(in srgb, var(--chain-edge) 45%, var(--line));
+  }
+  .chain-card:hover:not(.picked, .order-drag-active) {
+    background: var(--chain-card-hover);
   }
 }
 .chain-card:active {
@@ -28398,7 +28707,7 @@ body.observe-brushing .observe-chart-tip {
       color-mix(in srgb, var(--chain-edge) 7%, transparent),
       color-mix(in srgb, var(--chain-edge) 7%, transparent)
     ),
-    var(--sheet);
+    var(--chain-card-fill);
 }
 .chain-card-head {
   display: flex;
@@ -28453,8 +28762,8 @@ body.observe-brushing .observe-chart-tip {
   border-color: color-mix(in srgb, var(--action) 58%, var(--line));
   outline: 1px solid color-mix(in srgb, var(--action) 25%, transparent);
   outline-offset: -2px;
-  background: color-mix(in srgb, var(--action) 6%, var(--sheet));
-  box-shadow: none;
+  background: color-mix(in srgb, var(--action) 6%, var(--chain-card-fill));
+  box-shadow: var(--sheet-shadow);
   cursor: grabbing;
 }
 .chain-card-title {
@@ -28548,7 +28857,7 @@ body.observe-brushing .observe-chart-tip {
   margin: 0 -15px;
   color: var(--chain-tone);
 }
-/* 同 `.ncard.tone-ok .node-nic-plot`：正常那一档的曲线取数据色。只覆盖曲线，不动
+/* 正常档曲线取数据色。只覆盖曲线，不动
    `--chain-tone` 本身——那个值还供状态灯使用，改它会把灯也改掉。 */
 .chain-card.tone-ok .chain-latency-plot {
   color: var(--data);
@@ -28567,9 +28876,6 @@ body.observe-brushing .observe-chart-tip {
   overflow: visible;
 }
 .history-plot .area {
-  fill: color-mix(in srgb, currentColor 5%, transparent);
-}
-.node-nic-plot .area {
   fill: color-mix(in srgb, currentColor 5%, transparent);
 }
 .history-plot .line {
@@ -28595,44 +28901,15 @@ body.observe-brushing .observe-chart-tip {
   font: 8.5px var(--mono);
   white-space: nowrap;
   text-shadow:
-    0 1px 2px var(--sheet),
-    0 0 5px var(--sheet);
+    0 1px 2px var(--chain-card-fill, var(--sheet)),
+    0 0 5px var(--chain-card-fill, var(--sheet));
 }
 .history-plot .plot-label {
   left: 15px;
   color: var(--ink-4);
 }
-.node-nic-plot .plot-label {
-  left: 16px;
-}
-.nc-tcp-latest {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 4px;
-  color: var(--ink-4);
-  font-family: var(--mono);
-  line-height: 1;
-  white-space: nowrap;
-  opacity: 0.82;
-}
-.nc-tcp-latest .values {
-  color: inherit;
-  font-size: 9.5px;
-  font-weight: 400;
-  letter-spacing: -0.02em;
-  font-variant-numeric: tabular-nums;
-}
-.nc-tcp-latest em {
-  color: inherit;
-  font-size: 7px;
-  font-style: normal;
-}
 /* 样本过期仍写在 title 里，不给整组延迟染成警告色。探测轮次会受网络和调度抖动影响，
  * 短暂超过两轮并不等于机器异常；主读数无响应保留灰白色「—」，IPv6 结果只放在 title 里。 */
-.nc-tcp-latest .lost {
-  color: var(--ink-4);
-  font-style: normal;
-}
 .history-plot > .exit {
   right: 15px;
   display: inline-flex;
@@ -28667,7 +28944,7 @@ body.observe-brushing .observe-chart-tip {
   box-sizing: border-box;
   border: 1px solid currentColor;
   border-radius: 50%;
-  background: var(--sheet);
+  background: var(--chain-card-fill, var(--sheet));
   transform: translate(-50%, -50%);
   transition:
     background 0.12s ease,
@@ -28713,27 +28990,6 @@ body.observe-brushing .observe-chart-tip {
 }
 .history-plot .extreme-point.edge-right .plot-tip {
   right: 5px;
-  left: auto;
-  transform: none;
-}
-/* NIC 小图的极值高度不一定对应语义方向：Y 轴有 3.75 MB/窗口的下限时，
-   「最高」也可能靠近底部。上下改由实际坐标决定，保证大约 20px 高的 tooltip 留在 52px 画布内。
-   左右的 9px 等于圆点热区半宽：父元素有 translateX(-50%)，补足后 tooltip 边缘才与画布对齐。 */
-.node-nic-plot .extreme-point.tip-below .plot-tip {
-  top: 14px;
-  bottom: auto;
-}
-.node-nic-plot .extreme-point.tip-above .plot-tip {
-  top: auto;
-  bottom: 14px;
-}
-.node-nic-plot .extreme-point.edge-left .plot-tip {
-  right: auto;
-  left: 9px;
-  transform: none;
-}
-.node-nic-plot .extreme-point.edge-right .plot-tip {
-  right: 9px;
   left: auto;
   transform: none;
 }
@@ -28797,6 +29053,7 @@ body.observe-brushing .observe-chart-tip {
 }
 .external-target-trigger {
   display: grid;
+  box-sizing: border-box;
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
@@ -31303,40 +31560,18 @@ body.observe-brushing .observe-chart-tip {
   }
 }
 
-@media (max-width: 1100px) {
-  .chain-card-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
 @media (max-width: 760px) {
   /* 与机器页一致，窄屏允许标题栏的操作按钮换行。 */
-  .chain-list-panel > header,
   .tunnel-list-panel > header,
   .chain-proxy-list-panel > header,
   .user-list-panel > header {
     flex-wrap: wrap;
     row-gap: 9px;
   }
-  .chain-section {
-    padding: 16px 2px;
-  }
   .chain-section-head {
     flex-wrap: wrap;
     gap: 7px 8px;
     margin-bottom: 10px;
-  }
-  .chain-section-head .id {
-    display: none;
-  }
-  .chain-section-head .count {
-    margin-left: auto;
-  }
-  .chain-section-actions {
-    margin-left: auto;
-  }
-  .chain-card-grid {
-    grid-template-columns: minmax(0, 1fr);
   }
   .chain-card-foot {
     gap: 10px;
@@ -32959,19 +33194,19 @@ details.more > summary::before,
 .fg-view :is(.fg-sheet, .nd-paper) :is(.panel, .chart-card) {
   animation-delay: 35ms;
 }
-.fg-view :is(.ncard, .chain-card, .tunnel-row) {
+.fg-view :is(.chain-card, .tunnel-row) {
   animation: motion-card-mount 260ms var(--motion-ease-out) 45ms backwards;
 }
-.fg-view :is(.ncard, .chain-card, .tunnel-row):nth-child(2) {
+.fg-view :is(.chain-card, .tunnel-row):nth-child(2) {
   animation-delay: 60ms;
 }
-.fg-view :is(.ncard, .chain-card, .tunnel-row):nth-child(3) {
+.fg-view :is(.chain-card, .tunnel-row):nth-child(3) {
   animation-delay: 75ms;
 }
-.fg-view :is(.ncard, .chain-card, .tunnel-row):nth-child(4) {
+.fg-view :is(.chain-card, .tunnel-row):nth-child(4) {
   animation-delay: 90ms;
 }
-.fg-view :is(.ncard, .chain-card, .tunnel-row):nth-child(n + 5) {
+.fg-view :is(.chain-card, .tunnel-row):nth-child(n + 5) {
   animation-delay: 105ms;
 }
 /* 用户详情按用户身份重新挂载以隔离编辑状态，但名册选择不是页面入场；内部面板也直接显示。 */
@@ -33405,27 +33640,15 @@ html[data-motion-transition='appearance']::view-transition-new(root) {
     transform: none;
   }
 }
-.spine-ed .hop-ctl,
-.nc-dock {
+.spine-ed .hop-ctl {
   transform: translate3d(4px, 0, 0);
   transition:
     opacity var(--motion-fast) var(--motion-ease-standard),
     transform var(--motion-medium) var(--motion-ease-out);
 }
 .spine-ed .hop:hover .hop-ctl,
-.spine-ed .hop:focus-within .hop-ctl,
-.ncard:focus-within .nc-dock {
+.spine-ed .hop:focus-within .hop-ctl {
   transform: translate3d(0, 0, 0);
-}
-@media (hover: hover) and (pointer: fine) {
-  .ncard:hover .nc-dock {
-    transform: translate3d(0, 0, 0);
-  }
-}
-@media (hover: none) {
-  .nc-dock {
-    transform: none;
-  }
 }
 :is(.tunnel-kind-grid > button, .grant-card, .kpi.kpi-expand) {
   transition:
@@ -38042,4 +38265,17 @@ button.site-usage-row:focus-visible {
   .onb-guide-actions .btn {
     flex: 1 1 auto;
   }
+}
+
+.node-card-month .lst-sum {
+  color: inherit;
+  font: inherit;
+}
+
+.loading-skeleton-node-card {
+  min-height: 179px;
+  gap: 10px;
+}
+.loading-skeleton-node-card > .loading-bar:nth-child(2) {
+  height: 46px;
 }

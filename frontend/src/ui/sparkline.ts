@@ -23,6 +23,7 @@ const fixed = (value: number) => value.toFixed(2);
  *
  * Within each collected segment:
  * - `bases`: a baseline at zero, so a quiet but collected stretch reads as zero, not as a gap.
+ * - `curves`: each complete curve, including zero and sub-pixel runs.
  * - `areas`: the curve closed on the baseline.
  * - `lines`: the same curve over each run of non-zero values, extended to the zero on either side
  *   so a rise starts and ends on the baseline. A run is stroked only if it stands at least 1px
@@ -36,7 +37,7 @@ export function sparklinePaths(
   scale: number,
   height: number,
   top = 2.5,
-): { bases: string[]; areas: string[]; lines: string[] } {
+): { bases: string[]; areas: string[]; curves: string[]; lines: string[] } {
   // The baseline is a 1px stroke on the bottom pixel row; zero sits on its centre.
   const zero = height - 0.5;
   const safeScale = scale > 0 ? scale : 1;
@@ -57,6 +58,7 @@ export function sparklinePaths(
   });
   const bases: string[] = [];
   const areas: string[] = [];
+  const curves: string[] = [];
   const lines: string[] = [];
   for (const { start, values: segment, ys } of segments) {
     const end = start + ys.length - 1;
@@ -66,6 +68,7 @@ export function sparklinePaths(
     bases.push(`M${start} ${zero}H${end}`);
     let area = `M${start} ${fixed(ys[0])}`;
     for (let index = 1; index < ys.length; index += 1) area += to(index);
+    curves.push(area);
     areas.push(`${area}L${end} ${zero}L${start} ${zero}Z`);
     const drawn = segment.map(() => false);
     for (let first = 0; first < segment.length; first += 1) {
@@ -86,5 +89,5 @@ export function sparklinePaths(
     });
     if (line) lines.push(line);
   }
-  return { bases, areas, lines };
+  return { bases, areas, curves, lines };
 }

@@ -5,28 +5,10 @@ import test from 'node:test';
 const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
 const nodes = readFileSync(new URL('../src/panes/nodes.tsx', import.meta.url), 'utf8');
 
-test('machine-card latency stays neutral when a probe sample is stale', () => {
-  assert.match(styles, /\.nc-tcp-latest\s*\{[^}]*color: var\(--ink-4\);/s);
-  assert.doesNotMatch(styles, /\.nc-tcp-latest\.stale\s*\{[^}]*color:/s);
-});
-
-test('machine-card primary packet loss stays neutral without an IPv6 loss badge', () => {
-  assert.match(styles, /\.nc-tcp-latest \.lost\s*\{[^}]*color: var\(--ink-4\);/s);
-  assert.doesNotMatch(styles, /\.nc-tcp-latest \.lost\s*\{[^}]*color: var\(--err\);/s);
-  assert.doesNotMatch(styles, /\.nc-tcp-latest \.v6\s*\{/s);
-  assert.doesNotMatch(nodes, /className="v6"/);
-});
-
-test('machine-card status, region and name use one consistent gap', () => {
-  assert.match(styles, /\.nc-status-slot\s*\{[^}]*margin-right: 9px;/s);
-  assert.match(styles, /\.nc-region-flag\s*\{[^}]*margin-right: 9px;/s);
-  assert.doesNotMatch(styles, /\.nc-status-slot\.with-region\s*\{/s);
-});
-
-test('machine-card monthly usage suffix is vertically centered with its value', () => {
-  assert.match(styles, /\.nc-foot\s*\{[^}]*align-items: center;/s);
-  assert.match(styles, /\.nc-foot \.lst-sum\s*\{[^}]*display: inline-flex;[^}]*align-items: center;/s);
-  assert.match(styles, /\.nc-foot \.lst-sum small\s*\{[^}]*font: 10\.5px\/1 var\(--sans\);/s);
+test('machine cards use tabular body text without list latency', () => {
+  assert.match(styles, /\.node-cardpage\s*\{[^}]*font-variant-numeric: tabular-nums;/s);
+  assert.doesNotMatch(nodes, /TcpProbeLatest|fetchLatestNodePingProbes|NodeRosterRow/);
+  assert.match(nodes, /<NodeCardComet/);
 });
 
 test('machine-detail toolbar uses the shared button and more icon conventions', () => {

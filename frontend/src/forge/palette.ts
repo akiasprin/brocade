@@ -27,8 +27,8 @@ export const PALETTES: PaletteOption[] = [
   {
     key: 'dailan',
     name: '黛蓝',
-    description: '灰蓝操作 · 同色系数据',
-    action: '#7f8da6',
+    description: '柔蓝操作 · 同色系数据',
+    action: '#7698d6',
   },
   {
     key: 'songlv',

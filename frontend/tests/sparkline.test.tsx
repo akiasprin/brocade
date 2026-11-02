@@ -16,6 +16,14 @@ describe('compact trend paths', () => {
     expect(paths.lines[0].endsWith(' 5 29.50')).toBe(true);
   });
 
+  it('exposes complete curves for zero and tiny traffic without closing them to the baseline', () => {
+    const paths = sparklinePaths([0, 0, null, 0, 0.01, 0], 100, 46);
+    expect(paths.curves).toHaveLength(2);
+    expect(paths.curves[0]).toMatch(/^M0 45.50C/);
+    expect(paths.curves.every(path => !/[LZ]/.test(path))).toBe(true);
+    expect(paths.lines).toHaveLength(0);
+  });
+
   it('strokes a rise from the baseline even where its foot is below one pixel', () => {
     // 0.3 is under a pixel at this scale; stroking only the visible point and its neighbours
     // started the stroke in mid-air and the foot of the rise looked cut off.
