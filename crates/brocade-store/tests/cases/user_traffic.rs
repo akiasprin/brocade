@@ -16,6 +16,7 @@ async fn setup(db: &TestPg) {
 }
 fn policy(quota: u64, rate: Option<u64>) -> UserTrafficPolicy {
     UserTrafficPolicy {
+        base_rate_bps: None,
         quota_bytes: Some(quota.to_string()),
         exhausted_action: rate.map_or(ExhaustedAction::Suspend, |rate_bps| {
             ExhaustedAction::Throttle { rate_bps }
@@ -171,6 +172,7 @@ async fn user_scoped_app_quotas_keep_usage_budgets_suspension_and_recovery_indep
             UserTrafficKind::Access,
             Some("app-main"),
             UserTrafficPolicy {
+                base_rate_bps: None,
                 quota_bytes: None,
                 exhausted_action: ExhaustedAction::Suspend,
             },
@@ -626,4 +628,413 @@ async fn user_scoped_quota_policy_receipts_match_exact_snapshot_and_show_offline
             .pending_nodes,
         vec!["n2"]
     );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn constant_app_speed_without_quota_is_shared_audited_and_capability_checked() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    let cap = UserTrafficPolicy {
+        quota_bytes: None,
+        base_rate_bps: Some(8000),
+        exhausted_action: ExhaustedAction::Suspend,
+    };
+    let view = db
+        .store
+        .update_user_traffic_policy(
+            &system_admin(),
+            TENANT,
+            "alice",
+            UserTrafficKind::Access,
+            Some("app-main"),
+            cap.clone(),
+        )
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(view.base_rate_supported);
+    assert!(!view.exhausted);
+    assert_eq!(view.used_bytes, "0");
+    assert_eq!(view.pending_nodes, ["n1", "n2"]);
+    assert_eq!(
+        view.effective,
+        UserTrafficEffect::Limited { rate_bps: 8000 }
+    );
+    assert!(db
+        .store
+        .report_user_traffic_support("n1", true)
+        .await
+        .unwrap_or(false));
+    let assignment = db.store.user_traffic_assignments("n1").await.unwrap();
+    assert_eq!(assignment.sources[0].effect, view.effective);
+    db.store
+        .acknowledge_user_traffic("n1", &assignment.sha256)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store
+            .user_traffic_policies(&system_admin(), TENANT, "alice")
+            .await
+            .unwrap()[0]
+            .pending_nodes,
+        ["n2"]
+    );
+    assert!(matches!(
+        db.store
+            .user_traffic_budget("n1", request("alice@platform.acme#ing-a1b2", 21))
+            .await
+            .unwrap(),
+        UserBudgetGrant::Limited {
+            rate_bps: 8000,
+            bytes: 1000,
+            ..
+        }
+    ));
+    assert!(matches!(
+        db.store
+            .user_traffic_budget("n2", request("alice@platform.acme#ing-n2", 22))
+            .await
+            .unwrap(),
+        UserBudgetGrant::Retry { .. }
+    ));
+    let status = db
+        .store
+        .list_user_cycle_usage(&system_admin())
+        .await
+        .unwrap();
+    assert_eq!(status.traffic_policies[0].rate_bps, Some(8000));
+    assert!(!status.traffic_policies[0].exhausted);
+    assert!(db
+        .store
+        .update_user_traffic_policy(
+            &publisher("platform.other"),
+            TENANT,
+            "alice",
+            UserTrafficKind::Access,
+            Some("app-main"),
+            cap.clone()
+        )
+        .await
+        .is_err());
+    sqlx::query("UPDATE nodes SET user_traffic_supported=false WHERE id='n2'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut changed = cap.clone();
+    changed.base_rate_bps = Some(16000);
+    assert!(db
+        .store
+        .update_user_traffic_policy(
+            &system_admin(),
+            TENANT,
+            "alice",
+            UserTrafficKind::Access,
+            Some("app-main"),
+            changed
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        db.store
+            .user_traffic_policies(&system_admin(), TENANT, "alice")
+            .await
+            .unwrap()[0]
+            .policy
+            .as_ref()
+            .unwrap()
+            .base_rate_bps,
+        Some(8000)
+    );
+    let audits: i64 = sqlx::query_scalar("SELECT count(*) FROM user_traffic_policy_events")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(audits, 1, "failed changes must roll back without audits");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn constant_app_speed_survives_quota_removal_reset_and_composes_with_exhaustion() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    let mut cap = policy(1024, Some(4000));
+    cap.base_rate_bps = Some(8000);
+    db.store
+        .update_user_traffic_policy(
+            &system_admin(),
+            TENANT,
+            "alice",
+            UserTrafficKind::Access,
+            Some("app-main"),
+            cap.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.store
+            .user_traffic_budget("n1", request("alice@platform.acme#ing-a1b2", 31))
+            .await
+            .unwrap(),
+        UserBudgetGrant::Limited { rate_bps: 8000, .. }
+    ));
+    let clock: String = sqlx::query_scalar("SELECT next_at::text FROM user_traffic_budgets")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    cap.quota_bytes = None;
+    db.store
+        .update_user_traffic_policy(
+            &system_admin(),
+            TENANT,
+            "alice",
+            UserTrafficKind::Access,
+            Some("app-main"),
+            cap.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        clock,
+        sqlx::query_scalar::<_, String>("SELECT next_at::text FROM user_traffic_budgets")
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM user_traffic_budget_receipts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        1
+    );
+    cap.quota_bytes = Some("1024".into());
+    usage(&db, 2048).await;
+    let views = db
+        .store
+        .update_user_traffic_policy(
+            &system_admin(),
+            TENANT,
+            "alice",
+            UserTrafficKind::Access,
+            Some("app-main"),
+            cap.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        views[0].effective,
+        UserTrafficEffect::Limited { rate_bps: 4000 }
+    );
+    cap.base_rate_bps = Some(2000);
+    let views = db
+        .store
+        .update_user_traffic_policy(
+            &system_admin(),
+            TENANT,
+            "alice",
+            UserTrafficKind::Access,
+            Some("app-main"),
+            cap.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        views[0].effective,
+        UserTrafficEffect::Limited { rate_bps: 2000 }
+    );
+    cap.exhausted_action = ExhaustedAction::Suspend;
+    let views = db
+        .store
+        .update_user_traffic_policy(
+            &system_admin(),
+            TENANT,
+            "alice",
+            UserTrafficKind::Access,
+            Some("app-main"),
+            cap.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(views[0].effective, UserTrafficEffect::Suspended);
+    let period = db
+        .store
+        .list_user_cycle_usage(&system_admin())
+        .await
+        .unwrap()
+        .periods
+        .remove(0);
+    db.store
+        .reset_user_cycle_usage(
+            &system_admin(),
+            TENANT,
+            "alice",
+            brocade_store::UserCycleResetRequest {
+                request_id: format!("{:032x}", 91),
+                expected_reset_id: None,
+                expected_period_start: period.starts_at,
+                expected_period_end: period.ends_at,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store
+            .user_traffic_assignments("n1")
+            .await
+            .unwrap()
+            .sources[0]
+            .effect,
+        UserTrafficEffect::Limited { rate_bps: 2000 }
+    );
+    cap.base_rate_bps = None;
+    cap.exhausted_action = ExhaustedAction::Throttle { rate_bps: 4000 };
+    db.store
+        .update_user_traffic_policy(
+            &system_admin(),
+            TENANT,
+            "alice",
+            UserTrafficKind::Access,
+            Some("app-main"),
+            cap.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store
+            .user_traffic_assignments("n1")
+            .await
+            .unwrap()
+            .sources[0]
+            .effect,
+        UserTrafficEffect::Unlimited { managed: true }
+    );
+    cap.quota_bytes = None;
+    db.store
+        .update_user_traffic_policy(
+            &system_admin(),
+            TENANT,
+            "alice",
+            UserTrafficKind::Access,
+            Some("app-main"),
+            cap,
+        )
+        .await
+        .unwrap();
+    assert!(db
+        .store
+        .user_traffic_assignments("n1")
+        .await
+        .unwrap()
+        .sources
+        .is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM user_traffic_budgets")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn constant_app_speed_new_migration_preserves_restored_existing_database_and_rolls_back_conflicts(
+) {
+    use sha2::{Digest, Sha384};
+    let Some(mut db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    let mut old = sqlx::migrate::Migrator::DEFAULT;
+    old.migrations = std::borrow::Cow::Owned(
+        [
+            (1, "init", include_str!("../../migrations/0001_init.sql")),
+            (
+                2,
+                "forwarding rule results",
+                include_str!("../../migrations/0002_forwarding_rule_results.sql"),
+            ),
+            (
+                3,
+                "unlock probe schedule",
+                include_str!("../../migrations/0003_unlock_probe_schedule.sql"),
+            ),
+        ]
+        .into_iter()
+        .map(|(version, description, sql)| {
+            sqlx::migrate::Migration::new(
+                version,
+                description.into(),
+                sqlx::migrate::MigrationType::Simple,
+                sql.into(),
+                false,
+            )
+        })
+        .collect(),
+    );
+    old.run(db.pool()).await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha384::digest(include_bytes!(
+                "../../migrations/0003_unlock_probe_schedule.sql"
+            ))
+        ),
+        "6b9c70bc99b3ecd499b33fea34c0a927d8dcaa604d90e09937899bfee2415b20a21d81d2c599de4c18222ace1f2204e8"
+    );
+    sqlx::query("INSERT INTO user_app_quotas(tenant_id,user_id,app_id,limit_bytes,exhausted_action,rate_bps) VALUES($1,'alice','app-main',1024,'throttle',8000)").bind(TENANT).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO user_traffic_budgets(tenant_id,user_id,kind,scope,next_at) VALUES($1,'alice','access','app-main',now()+interval '30 seconds')").bind(TENANT).execute(db.pool()).await.unwrap();
+    let admin = super::user_cycle_reset_upgrade_tests::restore_billing_backup(&mut db).await;
+    let before:serde_json::Value=sqlx::query_scalar("SELECT jsonb_build_object('users',(SELECT jsonb_agg(to_jsonb(u)) FROM users u),'quota',(SELECT jsonb_agg(to_jsonb(q)) FROM user_app_quotas q),'clock',(SELECT jsonb_agg(to_jsonb(b)) FROM user_traffic_budgets b),'receipts',(SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM _sqlx_migrations m))").fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        db.store
+            .check_database_upgrade()
+            .await
+            .unwrap()
+            .pending_versions,
+        [4]
+    );
+    sqlx::query("CREATE TABLE user_app_rate_limits(conflict TEXT)")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(db.store.migrate_database_schema().await.is_err());
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(versions, [1, 2, 3]);
+    sqlx::query("DROP TABLE user_app_rate_limits")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.store.migrate_database_schema().await.unwrap();
+    let after:serde_json::Value=sqlx::query_scalar("SELECT jsonb_build_object('users',(SELECT jsonb_agg(to_jsonb(u)) FROM users u),'quota',(SELECT jsonb_agg(to_jsonb(q)) FROM user_app_quotas q),'clock',(SELECT jsonb_agg(to_jsonb(b)) FROM user_traffic_budgets b),'receipts',(SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM _sqlx_migrations m WHERE version<4))").fetch_one(db.pool()).await.unwrap();
+    assert_eq!(after, before);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM user_app_rate_limits")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    db.store.migrate_database_schema().await.unwrap();
+    assert_eq!(
+        db.store
+            .user_traffic_policies(&system_admin(), TENANT, "alice")
+            .await
+            .unwrap()[0]
+            .policy
+            .as_ref()
+            .unwrap()
+            .base_rate_bps,
+        None
+    );
+    admin.close().await;
 }

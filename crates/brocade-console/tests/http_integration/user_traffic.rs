@@ -191,3 +191,87 @@ async fn user_app_policy_http_checks_scope_protocol_permissions_and_exhaustion()
         StatusCode::FORBIDDEN
     );
 }
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn user_app_constant_rate_http_needs_no_quota_and_reaches_agent_budget() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    let (admin, token) = admin_app(&db).await;
+    let agent = agent_router(db.store.clone());
+    let node = db.store.issue_node_token("n1").await.unwrap();
+    sqlx::query("INSERT INTO node_agent_state(node_id,agent_protocol_version) VALUES('n1',44) ON CONFLICT(node_id) DO UPDATE SET agent_protocol_version=44").execute(db.pool()).await.unwrap();
+    db.store
+        .report_user_traffic_support("n1", true)
+        .await
+        .unwrap();
+    let saved = put_json(
+        &admin,
+        &token,
+        "/users/platform.acme/alice/traffic-policy/access/app-a1b2",
+        json!({"quota_bytes":null,"base_rate_bps":512000,"exhausted_action":{"kind":"suspend"}}),
+    )
+    .await;
+    assert_eq!(saved.0, StatusCode::OK, "{saved:?}");
+    assert_eq!(saved.1[0]["base_rate_supported"], true);
+    assert_eq!(
+        saved.1[0]["effective"],
+        json!({"mode":"limited","rate_bps":512000})
+    );
+    assert_eq!(saved.1[0]["exhausted"], false);
+    assert_eq!(saved.1[0]["used_bytes"], "0");
+    assert!(get_json(&admin, &token, "/quotas").await.1["quotas"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let budget=agent_json(&agent,&node.token,"POST","/agent/v1/user-traffic/budget",44,Some(json!({"source":"alice@platform.acme#ing-b2c3","request_id":"00000000000000000000000000000002","bytes":16384}))).await;
+    assert_eq!(budget.0, StatusCode::OK);
+    assert_eq!(budget.1["mode"], "limited");
+    assert_eq!(budget.1["rate_bps"], 512000);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn old_policy_clients_preserve_base_rate_but_explicit_null_clears_it() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    let (admin, token) = admin_app(&db).await;
+    sqlx::query("INSERT INTO node_agent_state(node_id,agent_protocol_version) VALUES('n1',44) ON CONFLICT(node_id) DO UPDATE SET agent_protocol_version=44").execute(db.pool()).await.unwrap();
+    db.store
+        .report_user_traffic_support("n1", true)
+        .await
+        .unwrap();
+    let path = "/users/platform.acme/alice/traffic-policy/access/app-a1b2";
+    let saved = put_json(
+        &admin,
+        &token,
+        path,
+        json!({"quota_bytes":null,"base_rate_bps":512000,"exhausted_action":{"kind":"suspend"}}),
+    )
+    .await;
+    assert_eq!(saved.0, StatusCode::OK);
+    let old = put_json(
+        &admin,
+        &token,
+        path,
+        json!({"quota_bytes":"1024","exhausted_action":{"kind":"suspend"}}),
+    )
+    .await;
+    assert_eq!(old.0, StatusCode::OK);
+    assert_eq!(old.1[0]["policy"]["base_rate_bps"], 512000);
+    let cleared = put_json(
+        &admin,
+        &token,
+        path,
+        json!({"quota_bytes":"1024","base_rate_bps":null,"exhausted_action":{"kind":"suspend"}}),
+    )
+    .await;
+    assert_eq!(cleared.0, StatusCode::OK);
+    assert!(cleared.1[0]["policy"]["base_rate_bps"].is_null());
+}

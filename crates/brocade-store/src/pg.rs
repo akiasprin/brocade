@@ -1897,9 +1897,9 @@ impl PgStore {
         user: &str,
         kind: brocade_deployment::user_traffic::UserTrafficKind,
         app: Option<&str>,
-        policy: brocade_deployment::user_traffic::UserTrafficPolicy,
+        policy: impl Into<crate::UserTrafficPolicyWrite>,
     ) -> Result<Vec<brocade_deployment::user_traffic::UserTrafficPolicyView>> {
-        crate::user_traffic::update(&self.pool, actor, tenant, user, kind, app, policy).await
+        crate::user_traffic::update(&self.pool, actor, tenant, user, kind, app, policy.into()).await
     }
     pub async fn enforce_user_traffic_policies(&self) -> Result<usize> {
         crate::user_traffic::enforce(&self.pool).await

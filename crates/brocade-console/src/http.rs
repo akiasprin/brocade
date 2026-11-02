@@ -5879,9 +5879,18 @@ async fn update_user_access_traffic_policy(
     State(state): State<AppState>,
     Path((tenant, user, app)): Path<(String, String, String)>,
     headers: HeaderMap,
-    Json(policy): Json<brocade_deployment::user_traffic::UserTrafficPolicy>,
+    Json(request): Json<serde_json::Value>,
 ) -> ApiResult<Response> {
     let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    let replace_base_rate = request.get("base_rate_bps").is_some();
+    let policy =
+        serde_json::from_value::<brocade_deployment::user_traffic::UserTrafficPolicy>(request)
+            .map_err(|_| StoreError::InvalidData("用户流量策略请求无效".into()))?;
+    let policy = if replace_base_rate {
+        policy.into()
+    } else {
+        brocade_store::UserTrafficPolicyWrite::preserving_base_rate(policy)
+    };
     let result = state
         .store
         .update_user_traffic_policy(

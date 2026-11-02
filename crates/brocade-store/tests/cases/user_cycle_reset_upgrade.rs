@@ -7,9 +7,18 @@ const OLD_THIRD: &str =
 
 async fn install(db: &TestPg, reset: bool, third: bool) {
     use sha2::{Digest, Sha384};
-    assert_eq!(format!("{:x}",Sha384::digest(RELEASED_SECOND)),"54300599c9b4cce71f9e574b3f43141fee2fbd50279f829feda08f537bcde441a725ff1af4e0fbbf96fb9d80966552f1");
-    assert_eq!(format!("{:x}",Sha384::digest(OLD_SECOND)),"a28f8fca174df0c854d77581b7cf3f73e85e9df99dbf65e54eed7d8536420a3dc43389948cfdfbfd2d5f003fb32ec7db");
-    assert_eq!(format!("{:x}",Sha384::digest(OLD_THIRD)),"0c8f0c30cb8cfc07fead32837a7090b13f4ef5bd8e812c9a6c4818db370bfcc8e937ea7562209955aa96c94eb3a12347");
+    assert_eq!(
+        format!("{:x}", Sha384::digest(RELEASED_SECOND)),
+        "54300599c9b4cce71f9e574b3f43141fee2fbd50279f829feda08f537bcde441a725ff1af4e0fbbf96fb9d80966552f1"
+    );
+    assert_eq!(
+        format!("{:x}", Sha384::digest(OLD_SECOND)),
+        "a28f8fca174df0c854d77581b7cf3f73e85e9df99dbf65e54eed7d8536420a3dc43389948cfdfbfd2d5f003fb32ec7db"
+    );
+    assert_eq!(
+        format!("{:x}", Sha384::digest(OLD_THIRD)),
+        "0c8f0c30cb8cfc07fead32837a7090b13f4ef5bd8e812c9a6c4818db370bfcc8e937ea7562209955aa96c94eb3a12347"
+    );
     let mut migrations = vec![
         sqlx::migrate::Migration::new(
             1,
@@ -66,7 +75,7 @@ async fn billing(db: &TestPg) -> serde_json::Value {
         .fetch_one(db.pool()).await.unwrap()
 }
 
-async fn restore_billing_backup(db: &mut TestPg) -> PgPool {
+pub(super) async fn restore_billing_backup(db: &mut TestPg) -> PgPool {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let dump = Command::new("docker")
@@ -133,16 +142,9 @@ async fn restore_billing_backup(db: &mut TestPg) -> PgPool {
 }
 
 async fn reset(db: &TestPg, previous: Option<i64>, key: u8) -> i64 {
-    let cycles = db
-        .store
-        .list_user_cycle_usage(&system_admin())
-        .await
-        .unwrap();
-    let period = cycles
-        .periods
-        .iter()
-        .find(|p| p.tenant_id == "platform.acme" && p.user_id == "alice")
-        .unwrap();
+    // Build the request from the old cycle function: the candidate's new policy projection does
+    // not exist yet while this fixture is still simulating the previously deployed Console.
+    let (starts_at,ends_at):(String,String)=sqlx::query_as("SELECT to_char(c.starts_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),to_char(c.ends_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') FROM users u CROSS JOIN LATERAL user_traffic_cycle(u.traffic_reset_day,now()) c WHERE u.tenant_id='platform.acme' AND u.id='alice'").fetch_one(db.pool()).await.unwrap();
     db.store
         .reset_user_cycle_usage(
             &system_admin(),
@@ -151,8 +153,8 @@ async fn reset(db: &TestPg, previous: Option<i64>, key: u8) -> i64 {
             brocade_store::UserCycleResetRequest {
                 request_id: format!("{key:032x}"),
                 expected_reset_id: previous,
-                expected_period_start: period.starts_at.clone(),
-                expected_period_end: period.ends_at.clone(),
+                expected_period_start: starts_at,
+                expected_period_end: ends_at,
             },
         )
         .await
@@ -170,7 +172,7 @@ async fn official_v033_upgrade_preserves_published_0002_without_opt_in() {
     let before = receipts(&db).await;
     let check = db.store.check_database_upgrade().await.unwrap();
     assert!(check.compatible);
-    assert_eq!(check.pending_versions, [3]);
+    assert_eq!(check.pending_versions, [3, 4]);
     db.store.migrate_database_schema().await.unwrap();
     let after = receipts(&db).await;
     assert_eq!(before[1], after[1]);
@@ -200,7 +202,7 @@ async fn user_cycle_upgrade_is_opt_in_atomic_and_preserves_existing_billing() {
     for _ in 0..2 {
         let check = db.store.check_user_cycle_reset_upgrade().await.unwrap();
         assert!(check.compatible);
-        assert_eq!(check.pending_versions, [3]);
+        assert_eq!(check.pending_versions, [3, 4]);
         assert_eq!(receipts(&db).await, before);
     }
     // Reject actual DDL after the new tables were created: both DDL and receipts must roll back.
@@ -261,7 +263,7 @@ async fn assert_misplaced_reset_roundtrip(mut db: TestPg) {
     assert!(!db.store.check_database_upgrade().await.unwrap().compatible);
     let check = db.store.check_user_cycle_reset_upgrade().await.unwrap();
     assert!(check.compatible);
-    assert_eq!(check.pending_versions, [3]);
+    assert_eq!(check.pending_versions, [3, 4]);
     assert_eq!(receipts(&db).await, history);
     sqlx::raw_sql("CREATE FUNCTION reject_cycle_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture blocked function'; END; $$;
         CREATE EVENT TRIGGER reject_cycle_function ON ddl_command_start WHEN TAG IN ('CREATE FUNCTION') EXECUTE FUNCTION reject_cycle_ddl();")
@@ -348,18 +350,43 @@ async fn misplaced_reset_rejects_schema_drift_and_unknown_receipts_without_chang
     reset(&db, None, 1).await;
     let before = billing(&db).await;
     let history = receipts(&db).await;
-    for (change,repair) in [
-        ("ALTER TABLE user_cycle_access_baselines ALTER COLUMN uplink_bytes DROP NOT NULL", "ALTER TABLE user_cycle_access_baselines ALTER COLUMN uplink_bytes SET NOT NULL"),
-        ("ALTER TABLE usage_samples DISABLE TRIGGER user_cycle_access_late_sample", "ALTER TABLE usage_samples ENABLE TRIGGER user_cycle_access_late_sample"),
-        ("ALTER TABLE user_cycle_access_baselines ALTER COLUMN app_id TYPE TEXT COLLATE \"C\"", "ALTER TABLE user_cycle_access_baselines ALTER COLUMN app_id TYPE TEXT COLLATE \"default\""),
-        ("ALTER FUNCTION user_cycle_excluded_bytes(bigint,timestamptz,timestamptz,timestamptz) PARALLEL SAFE", "ALTER FUNCTION user_cycle_excluded_bytes(bigint,timestamptz,timestamptz,timestamptz) PARALLEL UNSAFE"),
-        ("ALTER FUNCTION user_cycle_excluded_bytes(bigint,timestamptz,timestamptz,timestamptz) SECURITY DEFINER", "ALTER FUNCTION user_cycle_excluded_bytes(bigint,timestamptz,timestamptz,timestamptz) SECURITY INVOKER"),
-        ("CREATE INDEX user_cycle_unreviewed ON user_cycle_reset_state(reset_id)","DROP INDEX user_cycle_unreviewed"),
+    for (change, repair) in [
+        (
+            "ALTER TABLE user_cycle_access_baselines ALTER COLUMN uplink_bytes DROP NOT NULL",
+            "ALTER TABLE user_cycle_access_baselines ALTER COLUMN uplink_bytes SET NOT NULL",
+        ),
+        (
+            "ALTER TABLE usage_samples DISABLE TRIGGER user_cycle_access_late_sample",
+            "ALTER TABLE usage_samples ENABLE TRIGGER user_cycle_access_late_sample",
+        ),
+        (
+            "ALTER TABLE user_cycle_access_baselines ALTER COLUMN app_id TYPE TEXT COLLATE \"C\"",
+            "ALTER TABLE user_cycle_access_baselines ALTER COLUMN app_id TYPE TEXT COLLATE \"default\"",
+        ),
+        (
+            "ALTER FUNCTION user_cycle_excluded_bytes(bigint,timestamptz,timestamptz,timestamptz) PARALLEL SAFE",
+            "ALTER FUNCTION user_cycle_excluded_bytes(bigint,timestamptz,timestamptz,timestamptz) PARALLEL UNSAFE",
+        ),
+        (
+            "ALTER FUNCTION user_cycle_excluded_bytes(bigint,timestamptz,timestamptz,timestamptz) SECURITY DEFINER",
+            "ALTER FUNCTION user_cycle_excluded_bytes(bigint,timestamptz,timestamptz,timestamptz) SECURITY INVOKER",
+        ),
+        (
+            "CREATE INDEX user_cycle_unreviewed ON user_cycle_reset_state(reset_id)",
+            "DROP INDEX user_cycle_unreviewed",
+        ),
     ] {
         sqlx::raw_sql(change).execute(db.pool()).await.unwrap();
-        assert!(!db.store.check_user_cycle_reset_upgrade().await.unwrap().compatible);
+        assert!(
+            !db.store
+                .check_user_cycle_reset_upgrade()
+                .await
+                .unwrap()
+                .compatible
+        );
         assert!(db.store.migrate_user_cycle_reset_schema().await.is_err());
-        assert_eq!(receipts(&db).await,history);assert_eq!(billing(&db).await,before);
+        assert_eq!(receipts(&db).await, history);
+        assert_eq!(billing(&db).await, before);
         sqlx::raw_sql(repair).execute(db.pool()).await.unwrap();
     }
     sqlx::query(

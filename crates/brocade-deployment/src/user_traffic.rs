@@ -1,4 +1,4 @@
-//! Per-app access quotas. Speed applies only after the billing quota is exhausted.
+//! Per-app access quotas and independent, aggregate user speed caps.
 use serde::{Deserialize, Serialize};
 
 pub const USER_TRAFFIC_PROTOCOL_VERSION: u32 = 44;
@@ -32,10 +32,18 @@ pub enum ExhaustedAction {
 pub struct UserTrafficPolicy {
     /// None removes this scope's quota.
     pub quota_bytes: Option<String>,
+    /// Independent of the quota; None leaves the normal speed uncapped.
+    #[serde(default)]
+    pub base_rate_bps: Option<u64>,
     pub exhausted_action: ExhaustedAction,
 }
 impl UserTrafficPolicy {
     pub fn validate(&self) -> Result<(), String> {
+        if self.base_rate_bps.is_some_and(|rate| {
+            !(1_000..=crate::traffic_limit::MAX_TRAFFIC_RATE_BPS).contains(&rate)
+        }) {
+            return Err("常态速度需在 1 Kbps–1 Tbps 之间".into());
+        }
         if let Some(value) = &self.quota_bytes {
             let bytes = crate::traffic_limit::decimal_bytes(value)?;
             if bytes == 0 || bytes > i64::MAX as u64 {
@@ -48,6 +56,34 @@ impl UserTrafficPolicy {
             }
         }
         Ok(())
+    }
+
+    pub fn needs_budget(&self) -> bool {
+        self.base_rate_bps.is_some()
+            || (self.quota_bytes.is_some()
+                && matches!(self.exhausted_action, ExhaustedAction::Throttle { .. }))
+    }
+
+    /// One resolver for management status, node assignments and byte reservations.
+    pub fn effect(&self, exhausted: bool, available: bool) -> UserTrafficEffect {
+        if !available {
+            return UserTrafficEffect::Suspended;
+        }
+        let mut rate = self.base_rate_bps;
+        if self.quota_bytes.is_some() && exhausted {
+            match self.exhausted_action {
+                ExhaustedAction::Suspend => return UserTrafficEffect::Suspended,
+                ExhaustedAction::Throttle { rate_bps } => {
+                    rate = Some(rate.map_or(rate_bps, |base| base.min(rate_bps)));
+                }
+            }
+        }
+        rate.map_or(
+            UserTrafficEffect::Unlimited {
+                managed: self.needs_budget(),
+            },
+            |rate_bps| UserTrafficEffect::Limited { rate_bps },
+        )
     }
 }
 
@@ -62,6 +98,10 @@ pub struct UserTrafficPolicyView {
     pub service_available: bool,
     pub unsupported_nodes: Vec<String>,
     pub pending_nodes: Vec<String>,
+    /// Explicit capability marker so an older Console cannot silently ignore a base cap.
+    #[serde(default)]
+    pub base_rate_supported: bool,
+    pub effective: UserTrafficEffect,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,9 +136,10 @@ pub enum UserBudgetGrant {
 mod tests {
     use super::*;
     #[test]
-    fn only_exhausted_speed_can_be_configured_and_values_are_bounded() {
+    fn independent_and_exhausted_speeds_are_bounded() {
         let mut policy = UserTrafficPolicy {
             quota_bytes: Some("1".into()),
+            base_rate_bps: None,
             exhausted_action: ExhaustedAction::Throttle { rate_bps: 1_000 },
         };
         assert!(policy.validate().is_ok());
@@ -143,4 +184,64 @@ pub struct UserTrafficAssignment {
 pub struct UserTrafficSnapshot {
     pub sources: Vec<UserTrafficAssignment>,
     pub sha256: String,
+}
+
+#[cfg(test)]
+mod base_rate_tests {
+    use super::*;
+    #[test]
+    fn constant_speed_quota_and_service_priority() {
+        let mut policy = UserTrafficPolicy {
+            quota_bytes: None,
+            base_rate_bps: Some(50_000_000),
+            exhausted_action: ExhaustedAction::Throttle {
+                rate_bps: 5_000_000,
+            },
+        };
+        assert_eq!(
+            policy.effect(false, true),
+            UserTrafficEffect::Limited {
+                rate_bps: 50_000_000
+            }
+        );
+        assert_eq!(
+            policy.effect(true, true),
+            UserTrafficEffect::Limited {
+                rate_bps: 50_000_000
+            },
+            "no quota cannot exhaust"
+        );
+        policy.quota_bytes = Some("100".into());
+        assert_eq!(
+            policy.effect(true, true),
+            UserTrafficEffect::Limited {
+                rate_bps: 5_000_000
+            }
+        );
+        policy.base_rate_bps = Some(1000);
+        assert_eq!(
+            policy.effect(true, true),
+            UserTrafficEffect::Limited { rate_bps: 1000 }
+        );
+        policy.exhausted_action = ExhaustedAction::Suspend;
+        assert_eq!(policy.effect(true, true), UserTrafficEffect::Suspended);
+        assert_eq!(policy.effect(false, false), UserTrafficEffect::Suspended);
+        policy.base_rate_bps = None;
+        assert_eq!(
+            policy.effect(false, true),
+            UserTrafficEffect::Unlimited { managed: false }
+        );
+        for base in [0, 999, 1_000_000_000_001] {
+            policy.base_rate_bps = Some(base);
+            assert!(policy.validate().is_err());
+        }
+        for base in [1000, 1_000_000_000_000] {
+            policy.base_rate_bps = Some(base);
+            assert!(policy.validate().is_ok());
+        }
+        let old: UserTrafficPolicy =
+            serde_json::from_str(r#"{"quota_bytes":null,"exhausted_action":{"kind":"suspend"}}"#)
+                .unwrap();
+        assert_eq!(old.base_rate_bps, None);
+    }
 }

@@ -299,14 +299,17 @@ pub async fn cycle_usage(pool: &PgPool, actor: &AdminContext) -> Result<UserCycl
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let rows=sqlx::query("SELECT p.tenant_id,p.user_id,p.kind,p.scope,p.quota_bytes::text AS quota_bytes,
-    user_traffic_usage(p.tenant_id,p.user_id,p.kind,p.scope)::text AS used_bytes,p.exhausted,p.suspended,p.rate_bps
-    FROM user_traffic_scopes p WHERE ($1::text IS NULL OR p.tenant_id=$1 OR p.tenant_id LIKE $2 ESCAPE '\\') ORDER BY p.tenant_id,p.user_id,p.kind,p.scope")
+    let rows=sqlx::query("SELECT p.tenant_id,p.user_id,p.kind,p.scope,p.quota_bytes,
+    user_traffic_usage(p.tenant_id,p.user_id,p.kind,p.scope)::text AS used_bytes,p.exhausted,p.suspended,p.rate_bps,p.base_rate_bps,p.action,
+    u.status='active' AND NOT u.service_suspended AS available
+    FROM user_traffic_scopes p JOIN users u ON u.tenant_id=p.tenant_id AND u.id=p.user_id WHERE ($1::text IS NULL OR p.tenant_id=$1 OR p.tenant_id LIKE $2 ESCAPE '\\') ORDER BY p.tenant_id,p.user_id,p.kind,p.scope")
     .bind(scope).bind(&pattern).fetch_all(&mut *tx).await?;
     let traffic_policies = rows
         .iter()
         .map(
             |row| -> Result<brocade_deployment::user_traffic::UserTrafficStatus> {
+                let policy = crate::user_traffic::policy_from_row(row)?;
+                let effect = policy.effect(row.try_get("exhausted")?, row.try_get("available")?);
                 Ok(brocade_deployment::user_traffic::UserTrafficStatus {
                     tenant_id: row.try_get("tenant_id")?,
                     user_id: row.try_get("user_id")?,
@@ -314,17 +317,19 @@ pub async fn cycle_usage(pool: &PgPool, actor: &AdminContext) -> Result<UserCycl
                     app_id: (row.try_get::<String, _>("kind")? == "access")
                         .then(|| row.try_get::<String, _>("scope"))
                         .transpose()?,
-                    quota_bytes: row.try_get("quota_bytes")?,
+                    quota_bytes: policy.quota_bytes,
                     used_bytes: row.try_get("used_bytes")?,
                     exhausted: row.try_get("exhausted")?,
-                    suspended: row.try_get("suspended")?,
-                    rate_bps: row
-                        .try_get::<Option<i64>, _>("rate_bps")?
-                        .map(|v| {
-                            u64::try_from(v)
-                                .map_err(|_| StoreError::InvalidData("invalid rate".into()))
-                        })
-                        .transpose()?,
+                    suspended: matches!(
+                        effect,
+                        brocade_deployment::user_traffic::UserTrafficEffect::Suspended
+                    ),
+                    rate_bps: match effect {
+                        brocade_deployment::user_traffic::UserTrafficEffect::Limited {
+                            rate_bps,
+                        } => Some(rate_bps),
+                        _ => None,
+                    },
                 })
             },
         )
