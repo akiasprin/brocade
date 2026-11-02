@@ -460,7 +460,7 @@ describe('链详情统一等待首屏依赖', () => {
     fireEvent.click(view.getByRole('button', { name: /entry入口/ }));
     const page = view.container.querySelector('.chain-detailpage');
     const editor = view.container.querySelector('.rule-editor')!;
-    fireEvent.click(within(editor as HTMLElement).getByRole('button', { name: '＋ 加一条' }));
+    fireEvent.click(within(editor as HTMLElement).getByRole('button', { name: '＋ 添加规则' }));
     const saveRules = view.getByRole('button', { name: '保存到草稿' }) as HTMLButtonElement;
     await waitFor(() => expect(saveRules.disabled).toBe(false));
     const protocol = view.getByRole('checkbox', { name: 'VLESS · TLS / REALITY（TCP / XHTTP）' });

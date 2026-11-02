@@ -125,7 +125,7 @@ test('手机端图表和拓扑操作不会把关键控件推出屏幕', () => {
   );
   assert.match(
     styles,
-    /\.fg-sheet \.tbl:not\(\.cards\)\s*\{[\s\S]*?width:\s*max-content;[\s\S]*?min-width:\s*100%;[\s\S]*?max-width:\s*100%;[\s\S]*?box-sizing:\s*border-box;/,
+    /\.fg-sheet \.tbl:not\(\.cards, \.rule-editor-table, \.machine-dns-policy-table\)\s*\{[\s\S]*?width:\s*max-content;[\s\S]*?min-width:\s*100%;[\s\S]*?max-width:\s*100%;[\s\S]*?box-sizing:\s*border-box;/,
   );
 });
 

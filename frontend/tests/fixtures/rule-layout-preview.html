@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>链路规则生产组件验收</title>
+    <style>
+      html,
+      body {
+        height: auto !important;
+        overflow: visible !important;
+      }
+      #root {
+        max-width: 1720px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+      @media (max-width: 820px) {
+        #root {
+          padding: 10px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import RefreshRuntime from '/@react-refresh';
+      RefreshRuntime.injectIntoGlobalHook(window);
+      window.$RefreshReg$ = () => {};
+      window.$RefreshSig$ = () => type => type;
+      window.__vite_plugin_react_preamble_installed__ = true;
+    </script>
+    <script type="module" src="./rule-layout-preview.tsx"></script>
+  </body>
+</html>

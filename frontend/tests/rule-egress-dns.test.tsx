@@ -327,7 +327,7 @@ describe('machine-scoped egress DNS', () => {
     )!;
     expect(geositeFallbackOption.disabled).toBe(true);
 
-    fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    fireEvent.click(view.getByRole('button', { name: '＋ 添加规则' }));
     expect(matchSelects().map(select => select.value)).toEqual(['geosite', 'domain_suffix', 'sniffing_failed', 'any']);
   });
 
@@ -709,18 +709,22 @@ describe('machine-scoped egress DNS', () => {
     expect(view.queryByRole('spinbutton', { name: '端口（机器策略：域名后缀 netflix.com）' })).toBeNull();
   });
 
-  it('renders every machine DNS policy as an independently ordered shared row', () => {
+  it('separates ordered machine DNS policies from route and fallback rows', () => {
     const view = renderEditor();
     expect(view.container.querySelector('.rule-editor > table')?.classList.contains('rule-table')).toBe(true);
     const rows = view.container.querySelectorAll('.rule-editor > .tbl > tbody > tr');
 
-    expect(rows).toHaveLength(4);
-    expect(view.container.querySelectorAll('.machine-dns-shared-row')).toHaveLength(2);
+    expect(rows).toHaveLength(2);
+    const dnsRows = view.container.querySelectorAll('.machine-dns-policy-table tbody > tr');
+    expect(dnsRows).toHaveLength(2);
+    expect(view.getByRole('region', { name: 'DNS 解析策略' })).toBeTruthy();
     expect(view.getByText('media')).toBeTruthy();
     expect((rows[0].querySelector('input') as HTMLInputElement).value).toBe('netflix.com');
-    expect(rows[1].textContent).toContain('D1');
-    expect(rows[2].textContent).toContain('D2');
-    expect(rows[3].classList.contains('rule-fallback-row')).toBe(true);
+    expect(dnsRows[0].textContent).toContain('D1');
+    expect(dnsRows[1].textContent).toContain('D2');
+    expect(rows[1].classList.contains('rule-fallback-row')).toBe(true);
+    const add = view.getByRole('button', { name: '＋ 添加规则' });
+    expect(view.container.querySelector('.rule-editor-table')?.nextElementSibling).toBe(add.parentElement);
   });
 
   it('inserts a newly added rule before an existing Any egress fallback', () => {
@@ -734,7 +738,7 @@ describe('machine-scoped egress DNS', () => {
       [],
     );
 
-    fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    fireEvent.click(view.getByRole('button', { name: '＋ 添加规则' }));
     const authoredRows = Array.from(view.container.querySelectorAll('.rule-editor > .tbl > tbody > tr'));
 
     expect(authoredRows).toHaveLength(2);
@@ -849,14 +853,11 @@ describe('machine-scoped egress DNS', () => {
     expect(fallback?.querySelector('td')?.textContent).toBe('*');
   });
 
-  it('uses real dropdowns and edits the machine policy in its shared row', () => {
+  it('keeps route DNS selection and edits or deletes policies in their own section', () => {
     const view = renderEditor();
     const routeChoice = view.getByLabelText('DNS 解析方式（线路规则：域名后缀 netflix.com）') as HTMLSelectElement;
-    const policyChoice = view.getByLabelText('DNS 解析方式（机器策略：域名后缀 netflix.com）') as HTMLSelectElement;
     expect(routeChoice.value).toBe('custom');
-    expect(policyChoice.value).toBe('custom');
-    expect(Array.from(policyChoice.options).map(option => option.text)).toEqual(['默认 DNS 解析', '自定义 DNS 解析']);
-    expect(policyChoice.tagName).toBe('SELECT');
+    expect(view.queryByLabelText('DNS 解析方式（机器策略：域名后缀 netflix.com）')).toBeNull();
     expect(view.queryByText('机器全局下发')).toBeNull();
 
     expect((view.getByLabelText('DNS 地址（机器策略：域名后缀 netflix.com）') as HTMLInputElement).value).toBe(
@@ -888,7 +889,8 @@ describe('machine-scoped egress DNS', () => {
         .closest('tr')
         ?.classList.contains('machine-dns-shared-row'),
     ).toBe(true);
-    fireEvent.change(policyChoice, { target: { value: 'machine' } });
+    fireEvent.click(view.getByRole('button', { name: '删除策略（域名后缀 netflix.com）' }));
+    expect(view.container.querySelectorAll('.machine-dns-shared-row')).toHaveLength(1);
     expect(view.queryByLabelText('DNS 地址（机器策略：域名后缀 netflix.com）')).toBeNull();
   });
 
@@ -903,7 +905,11 @@ describe('machine-scoped egress DNS', () => {
   it('shows group input guidance and the DNS limitation in the chain editor', () => {
     const view = renderEditor();
 
-    expect(view.getByText('DNS 地址可用逗号分隔，最多 3 个，同组竞速。Xray 的解析结果无法按出站隔离。')).toBeTruthy();
+    const help = view.getByLabelText('DNS 解析策略说明');
+    expect(help.closest('details')?.open).toBe(false);
+    fireEvent.click(help);
+    expect(help.closest('details')?.open).toBe(true);
+    expect(view.getByText(/DNS 策略按机器生效；线路只提供编辑入口。DNS 地址可用逗号分隔/)).toBeTruthy();
   });
 
   it('highlights the NODE target instead of the Forward action and keeps focus on the trigger', () => {

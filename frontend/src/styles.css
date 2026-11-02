@@ -10911,7 +10911,9 @@ input.f {
 }
 .rule-dial-fields > .mono {
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .rule-operations-cell {
   white-space: nowrap;
@@ -10946,9 +10948,6 @@ input.f {
 }
 .machine-dns-shared-row > td {
   color: var(--ink-3);
-}
-.machine-dns-shared-row :is(.rule-readonly-select, .rule-readonly-value) {
-  font-size: 12px;
 }
 .egress-dns-editor-row > td {
   width: auto !important;
@@ -11152,19 +11151,9 @@ input.f {
 
 /* ═══ 规则表的窄屏适配 ═══
    桌面是一张表：序号 | 匹配 | 动作 | 重排，一行铺开。窄下来单行放不下——动作格里还
-   串着转发目标、走法、推导地址，DNS 策略还有多个并排参数。分三档，且
-   **表结构保持不变**（tests 依赖 tbody/tr/td、兜底 `*`、每行四格）：
-   · ≤1440px：动作格内部按组换行，走法和地址一起落到目标下方；
-     DNS 参数缩短但仍维持一行，优先利用移除说明标签后腾出的空间。
-   · ≤1050px：匹配类别和值上下排列；DNS 地址单独一行，为其他参数和操作留出空间。
-   · ≤640px：整行折成卡片——序号做抬头、重排做卡脚，匹配 / 动作各补一枚小标签，
-     控件占满整宽，DNS 参数落成一列、这一跳逐项一行。
-   `.rule-table` 提供共用控件和 DNS 参数适配；下方 `.rule-editor-table` 将链路规则
-   按「匹配 → 去向」收紧为连续列表。 */
+   串着转发目标、走法、推导地址。`.rule-table` 提供机器 DNS 编辑器的共用适配；
+   下方 `.rule-editor-table` 负责链路规则，`.machine-dns-policy-table` 负责机器策略。 */
 @container rules (max-width: 1440px) {
-  .rule-dial-fields {
-    flex-basis: 100%;
-  }
   .egress-dns-choice {
     width: 136px;
   }
@@ -11244,8 +11233,8 @@ input.f {
     display: block !important;
     margin-top: 7px;
   }
-  .rule-table .rule-action-fields,
-  .rule-table .rule-dial-fields {
+  .rule-table:not(.rule-editor-table) .rule-action-fields,
+  .rule-table:not(.rule-editor-table) .rule-dial-fields {
     flex-basis: auto;
     flex-direction: column;
     align-items: stretch;
@@ -11295,10 +11284,10 @@ input.f {
     gap: 6px;
     width: 100%;
   }
-  .rule-table .rule-action-cell .f,
-  .rule-table .rule-action-cell .rule-action-select,
-  .rule-table .rule-action-cell .rule-readonly-select,
-  .rule-table .egress-dns-choice {
+  .rule-table:not(.rule-editor-table) .rule-action-cell .f,
+  .rule-table:not(.rule-editor-table) .rule-action-cell .rule-action-select,
+  .rule-table:not(.rule-editor-table) .rule-action-cell .rule-readonly-select,
+  .rule-table:not(.rule-editor-table) .egress-dns-choice {
     display: block;
     width: 100% !important;
     box-sizing: border-box;
@@ -11337,7 +11326,10 @@ input.f {
     grid-column: 1 / -1;
   }
   /* 重排 / 优先级 = 卡片脚；空脚（机器 DNS 行占位的 120px 空格）不占位 */
-  .rule-table > tbody > tr > td:last-child:not(:first-child, .rule-match-cell, .rule-action-cell) {
+  .rule-table:not(.rule-editor-table)
+    > tbody
+    > tr
+    > td:last-child:not(:first-child, .rule-match-cell, .rule-action-cell) {
     margin-top: 7px;
     padding-top: 6px !important;
     border-top: 1px dashed var(--line-soft);
@@ -11399,8 +11391,7 @@ input.f {
   }
 }
 
-/* 链路规则按「匹配 → 去向」连续阅读。条件是一组字段，连接方式和推导地址降为
-   去向下方的次行；仅用横向分隔区分规则，避免把每个字段围成独立的格子。 */
+/* 规则与机器 DNS 分区；匹配类型和内容各自成框，连接档位与地址整体换行。 */
 .rule-editor-table {
   table-layout: fixed;
 }
@@ -11408,7 +11399,7 @@ input.f {
   width: 30px;
 }
 .rule-editor-table .rule-match-column {
-  width: 32%;
+  width: 28%;
 }
 .rule-editor-table .rule-tools-column {
   width: 96px;
@@ -11437,73 +11428,61 @@ input.f {
   width: auto;
   white-space: normal;
 }
+.rule-editor select.f {
+  font-family: var(--sans);
+}
 .rule-match-fields {
   display: flex;
   align-items: center;
+  gap: 6px;
   min-width: 0;
-  border: 1px solid var(--line);
-  border-radius: var(--r-ctl);
-  background: var(--sunk);
-}
-.rule-match-fields:focus-within {
-  border-color: var(--action);
 }
 .rule-editor-table .rule-match-fields > .f {
-  height: calc(var(--ctl-h) - 2px);
-  min-height: calc(var(--ctl-h) - 2px);
+  box-sizing: border-box;
+  height: var(--ctl-h);
+  min-height: var(--ctl-h);
   margin: 0;
-  padding-block: 0;
-  border: 0;
-  border-radius: 0;
-  background-color: transparent;
-  box-shadow: none;
   font-size: 12px;
 }
 .rule-editor-table .rule-match-fields > :is(select.f, .rule-readonly-select) {
-  flex: 0 0 96px;
-  width: 96px;
+  flex: 0 0 104px;
+  width: 104px;
   min-width: 0;
-  padding-inline: 8px 20px;
-  border-right: 1px solid var(--line-soft);
-  color: var(--ink-3);
+  padding-inline: 8px 24px;
 }
 .rule-editor-table .rule-match-fields > :is(input.f, .rule-readonly-value) {
   flex: 1 1 0;
   width: 0;
   min-width: 0;
-  padding-inline: 9px;
-}
-.rule-match-fields:has(> :only-child) {
-  width: max-content;
-  max-width: 100%;
-}
-.rule-editor-table .rule-match-fields > :only-child {
-  border-right: 0;
+  padding-inline: 8px;
 }
 .rule-editor-table .rule-action-fields {
-  display: grid;
-  grid-template-columns: 104px minmax(0, 1fr);
-  align-items: start;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 6px;
 }
-.rule-editor-table .machine-dns-shared-row .rule-action-fields {
-  grid-template-columns: minmax(0, 1fr);
+.rule-editor-table .egress-dns-reference {
+  display: inline-flex;
+  flex: 0 1 auto;
+  flex-direction: row;
+  width: auto;
 }
-.rule-editor-table .machine-dns-shared-row .egress-dns-editor {
-  grid-column: 1 / -1;
-}
-.rule-editor-table .rule-fallback-row .rule-action-fields:not(:has(> .rule-action-select)) {
-  display: flex;
+.rule-editor-table .egress-dns-choice {
+  width: 136px;
 }
 .rule-editor-table .rule-action-select {
+  flex: 0 0 104px;
   width: 104px;
   min-width: 0;
   height: var(--ctl-h);
 }
 .rule-editor-table .rule-action-fields > .external-target-picker {
-  width: 100%;
-  min-width: 0;
-  max-width: none;
+  flex: 1 1 160px;
+  width: auto;
+  min-width: 140px;
+  max-width: 300px;
 }
 .rule-editor-table .external-target-trigger,
 .rule-editor-table .external-target-trigger.node-target,
@@ -11527,20 +11506,31 @@ input.f {
   font-size: 8px;
 }
 .rule-editor-table .rule-dial-fields {
-  display: grid;
-  grid-template-columns: 104px minmax(0, 1fr);
-  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: row;
+  flex: 0 1 auto;
+  flex-wrap: nowrap;
   align-items: center;
-  gap: 6px;
+  gap: 10px;
+  min-width: 0;
+  max-width: 100%;
+}
+.rule-editor-table .rule-dial-fields > select.f {
+  flex: 0 0 104px;
+  width: 104px;
+}
+.rule-editor-table .rule-dial-fields > input.f {
+  flex: 1 1 160px;
+  width: auto !important;
   min-width: 0;
 }
-.rule-editor-table .rule-dial-fields > .mono:only-child {
-  grid-column: 1 / -1;
-}
 .rule-editor-table .rule-dial-fields > .mono {
+  min-width: 0;
+  overflow: hidden;
   color: var(--ink-3);
-  font-size: 11px;
-  line-height: 1.5;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .rule-row-actions {
   display: inline-flex;
@@ -11550,7 +11540,7 @@ input.f {
   padding-inline: 0;
   text-align: right;
 }
-.rule-editor-table .rule-row-actions .btn {
+.rule-editor .rule-row-actions .btn {
   width: 30px;
   min-width: 0;
   min-height: var(--ctl-h);
@@ -11560,7 +11550,7 @@ input.f {
   background: transparent;
   color: var(--ink-3);
 }
-.rule-editor-table .rule-row-actions .btn:disabled {
+.rule-editor .rule-row-actions .btn:disabled {
   opacity: 0.22;
 }
 @media (hover: hover) {
@@ -11568,11 +11558,11 @@ input.f {
     border-color: var(--action);
     background: var(--action-wash);
   }
-  .rule-editor-table .rule-row-actions .btn:hover:not(:disabled) {
+  .rule-editor .rule-row-actions .btn:hover:not(:disabled) {
     color: var(--ink);
     background: var(--hover);
   }
-  .rule-editor-table .rule-row-actions .danger:hover:not(:disabled) {
+  .rule-editor .rule-row-actions .danger:hover:not(:disabled) {
     color: var(--err);
     background: color-mix(in srgb, var(--err) 8%, transparent);
   }
@@ -11581,34 +11571,8 @@ input.f {
   font-size: 9px;
 }
 @container rules (640px < width <= 1050px) {
-  .rule-editor-table .rule-match-fields:has(> :nth-child(2)) {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    align-items: stretch;
-    gap: 6px;
-    border: 0;
-    background: transparent;
-  }
-  .rule-editor-table .rule-match-fields:has(> :nth-child(2)) > .f {
-    width: 100%;
-    height: var(--ctl-h);
-    min-height: var(--ctl-h);
-    box-sizing: border-box;
-    border: 1px solid var(--line);
-    border-radius: var(--r-ctl);
-    background-color: var(--sunk);
-  }
-  .rule-editor-table .rule-match-fields:has(> :nth-child(2)) > .f:focus {
-    border-color: var(--action);
-  }
-}
-@container rules (min-width: 1441px) {
-  .rule-editor-table .rule-action-fields:has(> .rule-dial-fields) {
-    grid-template-columns: 104px minmax(160px, 0.85fr) minmax(0, 1.15fr);
-  }
-  .rule-editor-table .rule-dial-fields {
-    grid-column: 3;
-    min-height: var(--ctl-h);
+  .rule-editor-table .rule-match-column {
+    width: 34%;
   }
 }
 @container rules (max-width: 640px) {
@@ -11618,7 +11582,7 @@ input.f {
   }
   .rule-editor-table > tbody > tr {
     display: grid;
-    grid-template-columns: 18px minmax(0, 1fr) 92px;
+    grid-template-columns: 20px minmax(0, 1fr);
     gap: 8px;
     margin: 0;
     padding: 12px 0;
@@ -11660,20 +11624,20 @@ input.f {
     content: none;
   }
   .rule-editor-table .rule-match-fields > :is(select.f, .rule-readonly-select) {
-    flex-basis: 78px;
-    width: 78px !important;
+    flex-basis: 96px;
+    width: 96px !important;
     min-width: 0;
-    font-size: 11px;
+    font-size: 13px;
   }
   .rule-editor-table .rule-action-fields {
-    grid-template-columns: 104px minmax(0, 1fr);
+    display: flex;
   }
   .rule-editor-table .rule-action-fields > .external-target-picker {
     display: block;
   }
-  .rule-editor-table > tbody > tr > td:last-child:not(.rule-action-cell) {
-    grid-column: 3;
-    grid-row: 1;
+  .rule-editor-table > tbody > tr > td.rule-operations-cell {
+    grid-column: 2 / -1;
+    grid-row: 3;
     margin: 0;
     padding: 0 !important;
     border: 0;
@@ -11681,8 +11645,232 @@ input.f {
   .rule-editor-table .rule-action-fields .rule-action-select {
     width: 104px !important;
   }
-  .rule-editor-table .egress-dns-editor {
-    grid-column: 1 / -1;
+  .rule-editor-table .rule-action-fields > .external-target-picker {
+    flex: 1 1 140px;
+    max-width: none;
+  }
+  .rule-editor-table .rule-dial-fields {
+    flex-basis: 100%;
+  }
+  .rule-editor .rule-row-actions .btn {
+    width: 44px;
+    min-height: 44px;
+  }
+  .rule-editor-table .rule-fallback-sign:not(.inline) {
+    grid-column: 2 / -1;
+    grid-row: 3;
+    width: auto !important;
+    padding: 0;
+  }
+}
+
+.egress-dns-options {
+  display: contents;
+}
+.rule-add-actions {
+  margin-top: 8px;
+}
+.machine-dns-section {
+  margin-top: 18px;
+  min-width: 0;
+}
+.machine-dns-heading {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+  margin-bottom: 2px;
+}
+.machine-dns-heading > b {
+  font: 600 12px var(--sans);
+  color: var(--ink-2);
+}
+.machine-dns-help > summary {
+  list-style: none;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.machine-dns-help > summary::-webkit-details-marker {
+  display: none;
+}
+.machine-dns-help-text {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 30;
+  box-sizing: border-box;
+  width: 320px;
+  max-width: 100%;
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--block);
+  box-shadow: var(--shadow);
+  color: var(--ink-2);
+  font: 11.5px/1.5 var(--sans);
+}
+.machine-dns-heading:has(.machine-dns-help[open]) > .machine-dns-help-text {
+  display: block;
+}
+.machine-dns-policy-table,
+.machine-dns-policy-table > :is(thead, tbody) {
+  display: block;
+  width: 100%;
+  min-width: 0;
+}
+.machine-dns-policy-table tr {
+  display: grid;
+  grid-template-columns: 26px minmax(110px, 16%) minmax(200px, 460px) 56px 72px 104px 124px minmax(0, 1fr) 92px;
+  align-items: start;
+  gap: 6px 8px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.machine-dns-policy-table :is(th, td) {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.machine-dns-policy-table th {
+  color: var(--ink-4);
+  font: 10.5px var(--sans);
+  text-align: left;
+}
+.machine-dns-policy-table tr > :first-child {
+  width: auto !important;
+  padding-left: 2px;
+}
+.machine-dns-policy-table td:first-child {
+  color: var(--ink-4);
+  font: 10.5px/var(--ctl-h) var(--mono);
+}
+.machine-dns-policy-table .machine-dns-controls,
+.machine-dns-policy-table :is(.egress-dns-editor, .egress-dns-endpoint) {
+  display: contents;
+}
+.machine-dns-policy-table .f {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  height: var(--ctl-h);
+  min-height: var(--ctl-h);
+  margin: 0;
+  font-size: 12px;
+}
+.machine-dns-policy-table input.f {
+  padding-inline: 8px;
+}
+.machine-dns-policy-table select.f {
+  padding: 0 24px 0 8px;
+  background-position: right 8px center;
+}
+.machine-dns-policy-table :is(.rule-operations-cell, .rule-tools-heading) {
+  grid-column: -2;
+  text-align: right;
+}
+.machine-dns-match-fields {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--ctl-h);
+  min-width: 0;
+}
+.machine-dns-kind {
+  flex: none;
+  color: var(--ink-3);
+  font: 11.5px var(--sans);
+}
+.machine-dns-value {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.machine-dns-policy-table :is(.dns-priority, .dns-priority-buttons) {
+  gap: 1px;
+  margin: 0;
+}
+.machine-dns-policy-table .egress-dns-error {
+  grid-column: 3 / -2;
+  grid-row: 2;
+  max-width: 100%;
+}
+@container rules (max-width: 1050px) {
+  .machine-dns-policy-table tr {
+    grid-template-columns: 26px minmax(110px, 22%) minmax(0, 1fr) 92px;
+  }
+  .machine-dns-policy-table th:nth-child(n + 4):not(.rule-tools-heading) {
+    display: none;
+  }
+  .machine-dns-policy-table .egress-dns-endpoint {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 56px;
+    gap: 6px;
+    grid-column: 3;
+    grid-row: 1;
+  }
+  .machine-dns-policy-table .egress-dns-options {
+    display: grid;
+    grid-template-columns: 72px minmax(0, 1fr) minmax(0, 1.2fr);
+    gap: 6px;
+    grid-column: 3;
+    grid-row: 2;
+  }
+  .machine-dns-policy-table .egress-dns-error {
+    grid-row: 3;
+  }
+  .machine-dns-policy-table .rule-operations-cell {
+    grid-column: 4;
+    grid-row: 1;
+  }
+}
+@container rules (max-width: 640px) {
+  .machine-dns-policy-table > thead {
+    display: none;
+  }
+  .machine-dns-policy-table tr {
+    grid-template-columns: 20px minmax(0, 1fr);
+    gap: 8px 6px;
+    padding: 12px 0;
+  }
+  .machine-dns-policy-table td:first-child {
+    grid-column: 1;
+    grid-row: 1;
+    line-height: 30px;
+  }
+  .machine-dns-policy-table .machine-dns-match {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .machine-dns-match-fields {
+    min-height: 30px;
+  }
+  .machine-dns-policy-table .egress-dns-endpoint {
+    grid-column: 2;
+    grid-row: 2;
+  }
+  .machine-dns-policy-table .egress-dns-options {
+    grid-column: 2;
+    grid-row: 3;
+    grid-template-columns: 70px minmax(0, 1fr) minmax(0, 1.3fr);
+  }
+  .machine-dns-policy-table .rule-operations-cell {
+    grid-column: 2;
+    grid-row: 4;
+  }
+  .machine-dns-policy-table .egress-dns-error {
+    grid-column: 2;
+    grid-row: 5;
+    white-space: normal;
+  }
+  .rule-add-actions > .btn {
+    flex: 1 1 0;
   }
 }
 
@@ -14822,7 +15010,7 @@ body.has-artpanel .topo-deck {
   .tbl.cards td .btn {
     margin: 2px 6px 2px 0;
   }
-  .tbl:not(.cards) {
+  .tbl:not(.cards, .rule-editor-table, .machine-dns-policy-table) {
     display: block;
     overflow-x: auto;
     overscroll-behavior-x: contain;
@@ -16909,7 +17097,7 @@ body.fg-dragging * {
   /* 无表头的明细表（发布详情中波次下方的机器表）已设置 overflow-x:auto，
      但表格宽度仍为 100%，因此不会溢出，只是压缩列宽——「下发于 5 分钟前」
      被折为两行。按内容确定宽度后才能实际触发横向滚动。 */
-  .fg-sheet .tbl:not(.cards) {
+  .fg-sheet .tbl:not(.cards, .rule-editor-table, .machine-dns-policy-table) {
     width: max-content;
     min-width: 100%;
     max-width: 100%;
@@ -30831,7 +31019,7 @@ button.node-card:active {
 }
 .listener-reference-facts small {
   color: var(--ink-4);
-  font-size: 8.5px;
+  font-size: 10.5px;
   font-weight: 400;
 }
 .listener-reference-facts b {
@@ -30872,8 +31060,9 @@ button.node-card:active {
 .hop-target-facts input.f,
 .hop-target-facts select.f {
   box-sizing: border-box;
-  height: 27px;
-  font-size: 10.5px;
+  height: var(--ctl-h);
+  min-height: var(--ctl-h);
+  font-size: 11.5px;
 }
 .hop-target-facts .hop-target-port {
   min-width: 82px;
@@ -30918,6 +31107,18 @@ button.node-card:active {
 .hop-target-note strong {
   color: var(--gold);
   font-weight: 600;
+}
+
+@media (max-width: 820px) {
+  .rule-editor {
+    --ctl-h: 44px;
+  }
+  .rule-editor :is(input.f, select.f) {
+    box-sizing: border-box;
+    height: var(--ctl-h);
+    min-height: var(--ctl-h);
+    font-size: 13px;
+  }
 }
 
 @container rules (max-width: 820px) {
@@ -30965,8 +31166,8 @@ button.node-card:active {
     text-overflow: ellipsis;
   }
   .listener-reference-facts select.f,
-  .hop-target-facts input.f,
-  .hop-target-facts select.f {
+  .hop-target-panel .hop-target-facts .hopfld > .f {
+    max-width: none;
     width: 100%;
     min-width: 0;
   }

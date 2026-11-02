@@ -612,6 +612,7 @@ export function MachineEgressDnsControls({
   accessibleSuffix = '',
   showChoice = true,
   showEditor = true,
+  columns = false,
   error = null,
 }: {
   resolution: EgressDnsResolution | null;
@@ -622,6 +623,7 @@ export function MachineEgressDnsControls({
   accessibleSuffix?: string;
   showChoice?: boolean;
   showEditor?: boolean;
+  columns?: boolean;
   error?: string | null;
 }) {
   const previousCustom = useRef<EgressDnsResolution | null>(resolution);
@@ -631,11 +633,63 @@ export function MachineEgressDnsControls({
     if (resolution) previousCustom.current = resolution;
   }, [resolution]);
   const label = (name: string) => `${name}${accessibleSuffix}`;
+  const options = resolution && (
+    <>
+      <select
+        className="f words egress-dns-transport"
+        aria-label={label('传输')}
+        title="传输"
+        value={resolution.transport}
+        onChange={event =>
+          onChange({
+            ...resolution,
+            transport: event.target.value as EgressDnsResolution['transport'],
+          })
+        }
+      >
+        <option value="tcp">TCP</option>
+        <option value="udp">UDP</option>
+      </select>
+      <select
+        className="f words egress-dns-family"
+        aria-label={label('地址策略')}
+        title="地址策略"
+        value={resolution.address_strategy}
+        onChange={event =>
+          onChange({
+            ...resolution,
+            address_strategy: event.target.value as EgressDnsResolution['address_strategy'],
+          })
+        }
+      >
+        <option value="use_ip">UseIP</option>
+        <option value="use_ipv4v6">UseIPv4v6</option>
+        <option value="use_ipv6v4">UseIPv6v4</option>
+        <option value="use_ipv4">UseIPv4</option>
+        <option value="use_ipv6">UseIPv6</option>
+      </select>
+      <select
+        className="f words egress-dns-fallback"
+        aria-label={label('失败处理')}
+        title="失败处理"
+        value={resolution.fallback}
+        onChange={event =>
+          onChange({
+            ...resolution,
+            fallback: event.target.value as EgressDnsResolution['fallback'],
+          })
+        }
+      >
+        <option value="stop">停止连接</option>
+        <option value="machine">回退机器 DNS</option>
+      </select>
+    </>
+  );
   return (
     <>
       {showChoice && (
         <select
-          className="f egress-dns-choice"
+          className="f words egress-dns-choice"
           aria-label={label('DNS 解析方式')}
           value={resolution ? 'custom' : 'machine'}
           title={supported ? `修改 ${nodeName} 的机器 DNS 策略` : '自定义 DNS 只支持域名类规则'}
@@ -663,7 +717,7 @@ export function MachineEgressDnsControls({
               spellCheck={false}
               onChange={event => onChange({ ...resolution, address: event.target.value })}
             />
-            <i>:</i>
+            {!columns && <i>:</i>}
             <input
               className="f mono egress-dns-port"
               aria-label={label('端口')}
@@ -675,54 +729,7 @@ export function MachineEgressDnsControls({
               onChange={event => onChange({ ...resolution, port: Number(event.target.value) || 0 })}
             />
           </span>
-          <select
-            className="f words egress-dns-transport"
-            aria-label={label('传输')}
-            title="传输"
-            value={resolution.transport}
-            onChange={event =>
-              onChange({
-                ...resolution,
-                transport: event.target.value as EgressDnsResolution['transport'],
-              })
-            }
-          >
-            <option value="tcp">TCP</option>
-            <option value="udp">UDP</option>
-          </select>
-          <select
-            className="f words egress-dns-family"
-            aria-label={label('地址策略')}
-            title="地址策略"
-            value={resolution.address_strategy}
-            onChange={event =>
-              onChange({
-                ...resolution,
-                address_strategy: event.target.value as EgressDnsResolution['address_strategy'],
-              })
-            }
-          >
-            <option value="use_ip">UseIP</option>
-            <option value="use_ipv4v6">UseIPv4v6</option>
-            <option value="use_ipv6v4">UseIPv6v4</option>
-            <option value="use_ipv4">UseIPv4</option>
-            <option value="use_ipv6">UseIPv6</option>
-          </select>
-          <select
-            className="f words egress-dns-fallback"
-            aria-label={label('失败处理')}
-            title="失败处理"
-            value={resolution.fallback}
-            onChange={event =>
-              onChange({
-                ...resolution,
-                fallback: event.target.value as EgressDnsResolution['fallback'],
-              })
-            }
-          >
-            <option value="stop">停止连接</option>
-            <option value="machine">回退机器 DNS</option>
-          </select>
+          {columns ? <span className="egress-dns-options">{options}</span> : options}
           {addressIssue && (
             <small id={errorId} className="egress-dns-error" role="alert" title={addressIssue}>
               {addressIssue}
@@ -1260,20 +1267,10 @@ export const DIAL_LABEL: Record<DialKind, string> = {
   custom: '自定义',
 };
 
-// Break IPv6 at address groups without inserting whitespace into copied values.
+// 地址作为整体阅读，窄屏由外层省略；title 保留完整值供查看。
 function ruleAddress(address: string | null | undefined) {
   if (!address) return null;
-  const groups = address.split(':');
-  return groups.map((group, index) => (
-    <Fragment key={index}>
-      {group}
-      {index < groups.length - 1 && (
-        <>
-          :<wbr />
-        </>
-      )}
-    </Fragment>
-  ));
+  return <span title={address}>{address}</span>;
 }
 
 // 下拉框中的排列顺序。只定义一份——档位的优先级（`defaultHopDial` 取第一个可用的）
@@ -2192,7 +2189,9 @@ function RuleEditorReady({
       },
     ];
   });
-  const orderedNodeDnsPolicies = orderedDnsPolicies([...nodeDnsPolicies, ...pendingDnsPolicies], dnsOrder);
+  const orderedNodeDnsPolicies = orderedDnsPolicies([...nodeDnsPolicies, ...pendingDnsPolicies], dnsOrder).filter(
+    policy => effectiveDnsFor(policy.selector) !== null,
+  );
   const dnsPolicyIndex = (selector: DestMatch) =>
     orderedNodeDnsPolicies.findIndex(
       policy => egressDnsSelectorKey(policy.selector) === egressDnsSelectorKey(selector),
@@ -2758,7 +2757,6 @@ function RuleEditorReady({
           <b className="mono">
             {chainId} / {nodeId}
           </b>
-          <span className="note">DNS 策略按机器生效；线路只提供编辑入口</span>
           <span className="sp" />
           {onClose && (
             <button className="btn" onClick={onClose}>
@@ -2766,12 +2764,6 @@ function RuleEditorReady({
             </button>
           )}
         </div>
-
-        {(nodeDnsPolicies.length > 0 || rules.some(rule => rule.a.t === 'egress' && supportsEgressDns(rule.m))) && (
-          <p className="note node-egress-dns-limit">
-            DNS 地址可用逗号分隔，最多 3 个，同组竞速。Xray 的解析结果无法按出站隔离。
-          </p>
-        )}
 
         <table className={`tbl rule-table rule-editor-table${readOnly ? ' rule-editor-readonly' : ''}`}>
           <colgroup>
@@ -2828,7 +2820,7 @@ function RuleEditorReady({
                     <td className="rule-match-cell">
                       <span className="rule-match-fields">
                         <select
-                          className="f"
+                          className="f words"
                           aria-label={`匹配类型（规则 ${i + 1}）`}
                           value={r.m.t}
                           onChange={e => {
@@ -2853,7 +2845,7 @@ function RuleEditorReady({
                         </select>
                         {kind?.list !== false && r.m.t !== 'any' && (
                           <input
-                            className="f"
+                            className="f mono"
                             placeholder={kind?.hint}
                             aria-label={`匹配内容（规则 ${i + 1}）`}
                             value={matchValues(r.m)}
@@ -2865,7 +2857,7 @@ function RuleEditorReady({
                     <td className="rule-action-cell">
                       <div className="rule-action-fields">
                         <select
-                          className={`f rule-action-select rule-action-${ruleActionTone(r.a.t)}`}
+                          className={`f words rule-action-select rule-action-${ruleActionTone(r.a.t)}`}
                           value={r.a.t === 'proxy' || r.a.t === 'reuse_listener' ? 'forward' : r.a.t}
                           onChange={e => {
                             const t = e.target.value as 'forward' | 'egress' | 'block';
@@ -3323,7 +3315,6 @@ function RuleEditorReady({
                               <>
                                 <input
                                   className="f mono"
-                                  style={{ width: 150 }}
                                   placeholder="10.0.0.9 / 2001:db8::9"
                                   value={customHost}
                                   onChange={e => {
@@ -3366,6 +3357,7 @@ function RuleEditorReady({
                         <span className="rule-row-actions">
                           <button
                             className="btn"
+                            aria-label={`上移（规则 ${i + 1}）`}
                             disabled={i === 0 || isPinnedTerminalRule(r)}
                             onClick={() => move(i, -1)}
                             title={
@@ -3380,6 +3372,7 @@ function RuleEditorReady({
                           </button>
                           <button
                             className="btn"
+                            aria-label={`下移（规则 ${i + 1}）`}
                             disabled={
                               i === rules.length - 1 || isPinnedTerminalRule(r) || isPinnedTerminalRule(rules[i + 1])
                             }
@@ -3408,53 +3401,6 @@ function RuleEditorReady({
                     )}
                   </tr>
                 </Fragment>
-              );
-            })}
-            {orderedNodeDnsPolicies.map((policy, index) => {
-              const kind = MATCH_KINDS.find(candidate => candidate.t === policy.selector.t);
-              const value = matchValues(policy.selector);
-              return (
-                <tr className="machine-dns-shared-row" key={`machine-dns-${egressDnsSelectorKey(policy.selector)}`}>
-                  <td className="mono dim" style={{ width: 24 }}>
-                    D{index + 1}
-                  </td>
-                  <td className="rule-match-cell">
-                    <span className="rule-match-fields">
-                      <span className="f rule-readonly-select">{kind?.label ?? policy.selector.t}</span>
-                      {value && <span className="f rule-readonly-value">{value}</span>}
-                    </span>
-                  </td>
-                  <td className="rule-action-cell">
-                    <div className="rule-action-fields">
-                      <MachineEgressDnsControls
-                        resolution={effectiveDnsFor(policy.selector)}
-                        supported
-                        onChange={next => patchMachineDns(policy.selector, next)}
-                        readOnly={readOnly}
-                        nodeName={selfNode?.name || nodeId}
-                        accessibleSuffix={`（机器策略：${kind?.label ?? policy.selector.t}${value ? ` ${value}` : ''}）`}
-                        error={
-                          save.error instanceof EgressDnsValidationError &&
-                          egressDnsSelectorKey(save.error.selector) === egressDnsSelectorKey(policy.selector)
-                            ? save.error.message
-                            : null
-                        }
-                      />
-                    </div>
-                  </td>
-                  {!readOnly && (
-                    <td className="dns-priority-cell" style={{ width: 120, textAlign: 'right' }}>
-                      <DnsPriorityControl
-                        index={index}
-                        count={orderedNodeDnsPolicies.length}
-                        label={`${kind?.label ?? policy.selector.t} ${value}`.trim()}
-                        readOnly={readOnly}
-                        showLabel={false}
-                        onMove={delta => moveMachineDns(policy.selector, delta)}
-                      />
-                    </td>
-                  )}
-                </tr>
               );
             })}
             {fallback?.pending && (
@@ -3519,7 +3465,7 @@ function RuleEditorReady({
                     <td className="rule-action-cell">
                       <div className="rule-action-fields">
                         <span
-                          className={`f rule-action-select rule-action-${ruleActionTone(r.a.t)} rule-readonly-select`}
+                          className={`f words rule-action-select rule-action-${ruleActionTone(r.a.t)} rule-readonly-select`}
                         >
                           {actionLabel}
                         </span>
@@ -3548,6 +3494,23 @@ function RuleEditorReady({
               })}
           </tbody>
         </table>
+
+        <div className="toolbar rule-add-actions">
+          <button className="btn" onClick={addRule}>
+            ＋ 添加规则
+          </button>
+          {hasSniffingDependentRule && !hasSniffingFallback && (
+            <>
+              <button
+                className="btn"
+                onClick={addSniffingFallback}
+                title="域名/Geosite 规则依赖嗅探；匹配条件与转发、从本机出网或拒绝动作独立配置。"
+              >
+                ＋ 嗅探失败兜底
+              </button>
+            </>
+          )}
+        </div>
 
         {rules.map((rule, ruleIndex) => {
           if (rule.a.t !== 'proxy') return null;
@@ -3995,22 +3958,108 @@ function RuleEditorReady({
           </div>
         )}
 
+        {orderedNodeDnsPolicies.length > 0 && (
+          <section className="machine-dns-section" aria-label="DNS 解析策略">
+            <header className="machine-dns-heading">
+              <b>DNS 解析策略</b>
+              <span className="note">整机生效</span>
+              <details className="machine-dns-help">
+                <summary aria-label="DNS 解析策略说明" aria-controls={`${handleId}-dns-help`}>
+                  ⓘ
+                </summary>
+              </details>
+              <p className="machine-dns-help-text" id={`${handleId}-dns-help`}>
+                DNS 策略按机器生效；线路只提供编辑入口。DNS 地址可用逗号分隔，最多 3 个，同组竞速。Xray
+                的解析结果无法按出站隔离。
+              </p>
+            </header>
+            <table className={`tbl machine-dns-policy-table${readOnly ? ' rule-editor-readonly' : ''}`}>
+              <thead>
+                <tr>
+                  <th scope="col">#</th>
+                  <th scope="col">匹配</th>
+                  <th scope="col">DNS 服务器</th>
+                  <th scope="col">端口</th>
+                  <th scope="col">传输</th>
+                  <th scope="col">地址策略</th>
+                  <th scope="col">失败时</th>
+                  {!readOnly && (
+                    <th scope="col" className="rule-tools-heading">
+                      操作
+                    </th>
+                  )}
+                </tr>
+              </thead>
+              <tbody>
+                {orderedNodeDnsPolicies.map((policy, index) => {
+                  const kind = MATCH_KINDS.find(candidate => candidate.t === policy.selector.t);
+                  const value = matchValues(policy.selector);
+                  return (
+                    <tr className="machine-dns-shared-row" key={`machine-dns-${egressDnsSelectorKey(policy.selector)}`}>
+                      <td className="mono dim" style={{ width: 24 }}>
+                        D{index + 1}
+                      </td>
+                      <td className="machine-dns-match">
+                        <span className="machine-dns-match-fields">
+                          <span className="machine-dns-kind">{kind?.label ?? policy.selector.t}</span>
+                          {value && <span className="machine-dns-value mono">{value}</span>}
+                        </span>
+                      </td>
+                      <td className="machine-dns-controls" colSpan={5}>
+                        <MachineEgressDnsControls
+                          columns
+                          showChoice={false}
+                          resolution={effectiveDnsFor(policy.selector)}
+                          supported
+                          onChange={next => patchMachineDns(policy.selector, next)}
+                          readOnly={readOnly}
+                          nodeName={selfNode?.name || nodeId}
+                          accessibleSuffix={`（机器策略：${kind?.label ?? policy.selector.t}${value ? ` ${value}` : ''}）`}
+                          error={
+                            save.error instanceof EgressDnsValidationError &&
+                            egressDnsSelectorKey(save.error.selector) === egressDnsSelectorKey(policy.selector)
+                              ? save.error.message
+                              : null
+                          }
+                        />
+                      </td>
+                      {!readOnly && (
+                        <td className="rule-operations-cell">
+                          <span className="rule-row-actions">
+                            <DnsPriorityControl
+                              index={index}
+                              count={orderedNodeDnsPolicies.length}
+                              label={`${kind?.label ?? policy.selector.t} ${value}`.trim()}
+                              readOnly={readOnly}
+                              showLabel={false}
+                              onMove={delta => moveMachineDns(policy.selector, delta)}
+                            />
+                            <button
+                              type="button"
+                              className="btn danger"
+                              aria-label={`删除策略（${kind?.label ?? policy.selector.t} ${value}）`}
+                              title="删除策略"
+                              disabled={save.isPending}
+                              onClick={() => patchMachineDns(policy.selector, null)}
+                            >
+                              <Icon of="trash" size={13} />
+                            </button>
+                          </span>
+                        </td>
+                      )}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </section>
+        )}
+
         {save.error && !(save.error instanceof EgressDnsValidationError) && <ErrorBox error={save.error} />}
 
         {/* 整块常驻，只读时由外层 `fieldset disabled` 一并禁用：按角色隐藏会使只读视角
           看不到这张表可以增行和保存，页面读起来像是一份静态清单。 */}
         <div className="toolbar">
-          <button className="btn" onClick={addRule}>
-            ＋ 加一条
-          </button>
-          {hasSniffingDependentRule && !hasSniffingFallback && (
-            <>
-              <button className="btn" onClick={addSniffingFallback}>
-                ＋ 嗅探失败兜底
-              </button>
-              <span className="note">域名/Geosite 规则依赖嗅探；匹配条件与转发、从本机出网或拒绝动作独立配置。</span>
-            </>
-          )}
           <span className="sp" />
           {/* 位于规则树中时按钮统一收敛到末尾，此处只保留该表已修改的标记 */}
           {bus ? (
