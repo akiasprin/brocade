@@ -34,7 +34,7 @@ impl Drop for TestDirectory {
 }
 
 #[test]
-fn repository_preserves_published_migrations_and_appends_app_rate_limits() {
+fn repository_preserves_all_published_migrations() {
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     let sources = migrations::sources(&directory).unwrap();
     assert_eq!(
@@ -44,11 +44,12 @@ fn repository_preserves_published_migrations_and_appends_app_rate_limits() {
             .collect::<Vec<_>>(),
         [1, 2, 3, 4]
     );
-    // v0.3.4 shipped these exact SQLx migration bytes. Only version 4 is new in v0.3.5.
+    // v0.3.5 shipped this complete chain; all four SQLx checksums are immutable.
     let published_checksums = [
         "794044a4f1b7ead02b8102e21bc7f94d3c01f309216a5e15ada747c61de528c04b494a46e993f683a7d256aa37cd0947",
         "54300599c9b4cce71f9e574b3f43141fee2fbd50279f829feda08f537bcde441a725ff1af4e0fbbf96fb9d80966552f1",
         "6b9c70bc99b3ecd499b33fea34c0a927d8dcaa604d90e09937899bfee2415b20a21d81d2c599de4c18222ace1f2204e8",
+        "a2b744d7d340033156e92b9e2d7baaf15c174a6a72c22de9bb34c619e7c4270b62c77c56ecbafec6e9a73fea5fa99737",
     ];
     for (source, checksum) in sources.iter().zip(published_checksums) {
         assert_eq!(
