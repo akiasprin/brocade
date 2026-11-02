@@ -74,12 +74,21 @@ type session struct {
 	workers       sync.WaitGroup
 }
 
-func (s *session) startWorker(work func()) {
+func (s *session) startWorker(work func()) bool {
+	// close marks the session before taking streamsMu. Admission under that same
+	// lock makes every Add precede close's Wait, including the zero-worker case.
+	s.streamsMu.Lock()
+	if s.isClosed() {
+		s.streamsMu.Unlock()
+		return false
+	}
 	s.workers.Add(1)
+	s.streamsMu.Unlock()
 	go func() {
 		defer s.workers.Done()
 		work()
 	}()
+	return true
 }
 
 func (s *session) peerVersionValue() byte {
@@ -261,7 +270,9 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 		}
 	}
 	s.startStreamDelivery(st)
-	s.startWorker(func() { s.pumpDownlink(st.sid, l) })
+	if !s.startWorker(func() { s.pumpDownlink(st.sid, l) }) {
+		return errSessionClosed
+	}
 	return nil
 }
 
@@ -326,7 +337,9 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, br *buf.B
 		}
 
 		s.startStreamDelivery(st)
-		s.startWorker(func() { s.pumpDownlink(st.sid, link) })
+		if !s.startWorker(func() { s.pumpDownlink(st.sid, link) }) {
+			return errSessionClosed
+		}
 		return nil
 	}
 
