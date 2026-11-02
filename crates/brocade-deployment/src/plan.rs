@@ -497,8 +497,8 @@ pub fn plan_deployment(
         }
         // Outside retirement, Unmanaged explicitly means that Brocade must leave an artifact
         // alone. Retirement is the one stronger contract: absence of proof is not proof that a
-        // listener, interface or rule is gone, so every non-Disabled observation gets one
-        // idempotent disable and read-back.
+        // listener, interface or rule is gone. Any remaining teardown debt therefore carries
+        // all four idempotent disables, so narrowing preserves the complete read-back contract.
         let applied = applied_by_node.get(target.node_id.as_str()).copied();
         target.actions = retirement_actions(&target.desired, applied);
         target.disruptive = target
@@ -856,37 +856,10 @@ fn retirement_actions(
     desired: &NodeDesiredState,
     applied: Option<&NodeAppliedState>,
 ) -> Vec<PlannedAction> {
-    let mut actions = Vec::new();
-    let mut require_disabled =
-        |desired: &DesiredArtifact, observed: Option<&AppliedArtifactState>, action| {
-            if matches!(desired, DesiredArtifact::Disabled { .. })
-                && !matches!(observed, Some(AppliedArtifactState::Disabled))
-            {
-                actions.push(action);
-            }
-        };
-    require_disabled(
-        &desired.phantun,
-        applied.map(|state| &state.phantun),
-        PlannedAction::DisablePhantun,
-    );
-    require_disabled(
-        &desired.hy2_port_hop,
-        applied.map(|state| &state.hy2_port_hop),
-        PlannedAction::DisableHy2PortHop,
-    );
-    require_disabled(
-        &desired.wireguard,
-        applied.map(|state| &state.wireguard),
-        PlannedAction::DisableWireGuard,
-    );
-    require_disabled(
-        &desired.xray,
-        applied.map(|state| &state.xray),
-        PlannedAction::DisableXray,
-    );
-    actions.sort();
-    actions
+    if applied.is_some_and(retirement_artifacts_disabled) {
+        return Vec::new();
+    }
+    forced_actions(desired)
 }
 
 fn retirement_artifacts_disabled(applied: &NodeAppliedState) -> bool {

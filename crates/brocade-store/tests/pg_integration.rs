@@ -100,6 +100,12 @@ mod unattended_deployment_tests;
 #[path = "cases/desired_delivery.rs"]
 mod desired_delivery_tests;
 
+#[path = "cases/node_retirement.rs"]
+mod node_retirement_tests;
+
+#[path = "cases/node_removal.rs"]
+mod node_removal_tests;
+
 #[path = "cases/isolated_stale_grants.rs"]
 mod isolated_stale_grants_tests;
 

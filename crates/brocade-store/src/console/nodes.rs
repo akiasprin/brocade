@@ -180,6 +180,8 @@ pub async fn remove_retired_nodes(
         removed_chains.push(chain_id);
     }
 
+    remove_node_forwarding_tx(&mut tx, &node_ids).await?;
+
     // Model-release work and its convergence rows go first because both may point at usage
     // generations. Xray binary-release targets are intentionally different: their node_id is an
     // immutable audit snapshot and survives this deletion.
@@ -207,6 +209,14 @@ pub async fn remove_retired_nodes(
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM usage_node_rollups WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM usage_user_node_rollups WHERE node_id = ANY($1)")
+        .bind(&node_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM usage_user_ingress_rollups WHERE node_id = ANY($1)")
         .bind(&node_ids)
         .execute(&mut *tx)
         .await?;
@@ -289,6 +299,59 @@ pub async fn remove_retired_nodes(
         removed_nodes: node_ids,
         removed_chains,
     })
+}
+
+async fn remove_node_forwarding_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    node_ids: &[String],
+) -> Result<()> {
+    // A rule can move independently of the model revision. Lock its identity before deleting
+    // node-scoped accounting so a concurrent move cannot change which history must survive.
+    sqlx::query("SELECT id FROM forwarding_rules WHERE node_id = ANY($1) ORDER BY id FOR UPDATE")
+        .bind(node_ids)
+        .fetch_all(&mut **tx)
+        .await?;
+    for statement in [
+        "DELETE FROM forwarding_usage_report_receipts WHERE node_id = ANY($1)",
+        "DELETE FROM forwarding_usage_counter_heads WHERE node_id = ANY($1)",
+        "DELETE FROM forwarding_usage_samples WHERE node_id = ANY($1)",
+        "DELETE FROM forwarding_usage_rollups WHERE node_id = ANY($1)",
+        "DELETE FROM forwarding_usage_windows WHERE node_id = ANY($1)",
+        "DELETE FROM forwarding_rule_nodes WHERE node_id = ANY($1)",
+    ] {
+        sqlx::query(statement)
+            .bind(node_ids)
+            .execute(&mut **tx)
+            .await?;
+    }
+    // History on surviving machines still references the rule identity after a move. Anchor
+    // that identity to a surviving assignment and keep it deleted, without enabling a listener
+    // or discarding another machine's billed usage to satisfy the node foreign key.
+    sqlx::query(
+        "UPDATE forwarding_rules rule
+            SET node_id = surviving.node_id, enabled = false,
+                deleted_at = COALESCE(rule.deleted_at, now()), updated_at = now()
+           FROM (
+               SELECT r.id, min(assignment.node_id) AS node_id
+                 FROM forwarding_rules r
+                 JOIN forwarding_rule_nodes assignment ON assignment.rule_id = r.id
+                WHERE r.node_id = ANY($1) AND NOT (assignment.node_id = ANY($1))
+                GROUP BY r.id
+           ) surviving
+          WHERE rule.id = surviving.id",
+    )
+    .bind(node_ids)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM forwarding_rules WHERE node_id = ANY($1)")
+        .bind(node_ids)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM forwarding_entitlements WHERE node_id = ANY($1)")
+        .bind(node_ids)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

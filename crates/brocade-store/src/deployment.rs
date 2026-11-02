@@ -785,6 +785,18 @@ pub async fn transition_node_status(
         .targets
         .iter()
         .any(|target| target.node_id == node_id && target.status == PlannedTargetStatus::Pending);
+    if lifecycle_phase == NodeLifecyclePhase::Retiring.as_str() && !retirement_target_pending {
+        // The planner omits retired nodes only once every artifact is confirmed disabled.
+        // A legacy partial teardown may already have supplied the last missing observation;
+        // settle against its existing attachment even if other machines still need a release.
+        crate::lifecycle::complete_retirement_tx(
+            &mut tx,
+            node_id,
+            lifecycle_epoch,
+            attached_deployment_id,
+        )
+        .await?;
+    }
     let deployment_id = if plan.summary.changed_targets > 0 {
         let idempotency_base = format!("system:node-lifecycle:{node_id}:{lifecycle_epoch}");
         let prior_attempts = sqlx::query_scalar::<_, i64>(
@@ -809,12 +821,7 @@ pub async fn transition_node_status(
             &plan,
         )
         .await?;
-        if lifecycle_phase == NodeLifecyclePhase::Retiring.as_str() {
-            if !retirement_target_pending {
-                return Err(StoreError::InvalidData(format!(
-                    "retiring node {node_id} has no teardown target"
-                )));
-            }
+        if lifecycle_phase == NodeLifecyclePhase::Retiring.as_str() && retirement_target_pending {
             crate::lifecycle::attach_deployment_tx(
                 &mut tx,
                 node_id,
@@ -825,10 +832,6 @@ pub async fn transition_node_status(
         }
         Some(deployment_id)
     } else {
-        if lifecycle_phase == NodeLifecyclePhase::Retiring.as_str() {
-            crate::lifecycle::complete_retirement_tx(&mut tx, node_id, lifecycle_epoch, None)
-                .await?;
-        }
         None
     };
 
