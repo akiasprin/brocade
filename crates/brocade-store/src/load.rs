@@ -405,6 +405,10 @@ pub async fn record_load_report(
                 &request.host,
                 request.read_at_unix_secs,
                 clock_skew_secs,
+                request
+                    .sent_at_unix_secs
+                    .filter(|sent| sent.abs_diff(request.read_at_unix_secs) <= 1)
+                    .map(|_| server_now),
             )
             .await?
         }
@@ -971,12 +975,16 @@ async fn upsert_host_facts(
     host: &HostFacts,
     read_at: i64,
     clock_skew_secs: i64,
+    immediate_delivery_at: Option<i64>,
 ) -> Result<bool> {
     let json = serde_json::to_value(host).map_err(|error| {
         StoreError::InvalidData(format!("host facts not serializable: {error}"))
     })?;
     // Token enrollment normally creates the row first. Keeping this write atomic as an UPSERT
-    // also makes ingestion robust if initialization and the first report race.
+    // also makes ingestion robust if initialization and the first report race. A corrected clock
+    // can put a new observation behind the stored timestamp: release that fence only when the
+    // stored observation is still in the server's future, the new one is not, delivery was
+    // immediate and measured clock skew improved. Queued replays must not acquire this exception.
     let result = sqlx::query(
         "INSERT INTO node_agent_state (node_id, load_host_facts, load_reported_at, load_clock_skew_secs)
          VALUES ($1, $2, to_timestamp($3), $4)
@@ -985,12 +993,18 @@ async fn upsert_host_facts(
                 load_reported_at = EXCLUDED.load_reported_at,
                 load_clock_skew_secs = EXCLUDED.load_clock_skew_secs
           WHERE node_agent_state.load_reported_at IS NULL
-             OR node_agent_state.load_reported_at <= EXCLUDED.load_reported_at",
+             OR node_agent_state.load_reported_at <= EXCLUDED.load_reported_at
+             OR ($5::double precision IS NOT NULL
+                 AND node_agent_state.load_reported_at > to_timestamp($5)
+                 AND EXCLUDED.load_reported_at <= to_timestamp($5)
+                 AND abs(node_agent_state.load_clock_skew_secs)
+                     > abs(EXCLUDED.load_clock_skew_secs))",
     )
     .bind(node_id)
     .bind(json)
     .bind(read_at)
     .bind(clock_skew_secs)
+    .bind(immediate_delivery_at.map(|time| time as f64))
     .execute(&mut **tx)
     .await?;
     Ok(result.rows_affected() == 1)
@@ -1689,6 +1703,13 @@ async fn node_load_view_inner(
             .push(") AND window_start < to_timestamp(")
             .push_bind(end_unix_secs)
             .push(')');
+    } else if let Some(reported_at) = reported_at {
+        // After a clock correction, retained samples from the old future must not outrank the
+        // fresh report. Explicit history ranges still expose the original stored timestamps.
+        samples_query
+            .push(" AND window_end <= to_timestamp(")
+            .push_bind(reported_at)
+            .push(')');
     }
     let limit = match selection {
         LoadSeriesQuery::Absolute { .. } => max_samples,
@@ -1717,10 +1738,12 @@ async fn node_load_view_inner(
                         conntrack_count, network_detail, uptime_secs
                  FROM node_load_samples
                  WHERE node_id = $1
+                   AND ($2::double precision IS NULL OR window_end <= to_timestamp($2))
                  ORDER BY window_start DESC
                  LIMIT 1",
             )
             .bind(node_id)
+            .bind(reported_at.map(|time| time as f64))
             .fetch_optional(pool)
             .await?;
             row.as_ref().map(load_sample_from_row).transpose()?
@@ -1886,6 +1909,12 @@ pub async fn list_node_load(
             .push(") AND window_start < to_timestamp(")
             .push_bind(end_unix_secs)
             .push(')');
+    } else {
+        samples_query.push(
+            " AND window_end <= COALESCE(
+                (SELECT load_reported_at FROM node_agent_state WHERE node_id=requested.node_id),
+                'infinity'::timestamptz)",
+        );
     }
     samples_query
         .push(" ORDER BY window_start DESC LIMIT ")
@@ -1934,6 +1963,9 @@ pub async fn list_node_load(
                            conntrack_count, network_detail, uptime_secs
                       FROM node_load_samples
                      WHERE node_id = requested.node_id
+                       AND window_end <= COALESCE(
+                           (SELECT load_reported_at FROM node_agent_state WHERE node_id=requested.node_id),
+                           'infinity'::timestamptz)
                      ORDER BY window_start DESC
                      LIMIT 1
                ) sample ON TRUE
@@ -1991,6 +2023,9 @@ pub async fn list_node_nic(
                 SELECT window_start, window_end, has_gap, nic_rx_bps, nic_tx_bps
                   FROM node_load_samples
                  WHERE node_id = n.id
+                   AND window_end <= COALESCE(
+                       (SELECT load_reported_at FROM node_agent_state WHERE node_id=n.id),
+                       'infinity'::timestamptz)
                  ORDER BY window_start DESC
                  LIMIT $3
            ) sample ON TRUE

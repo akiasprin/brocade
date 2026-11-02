@@ -19905,6 +19905,112 @@ fn minute_load_report(now: i64, samples: Vec<LoadSample>) -> LoadReportRequest {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn corrected_load_clock_replaces_future_state_without_admitting_delayed_snapshots() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+
+    let mut future = minute_load_report(now + 120, vec![minute_load_sample(now + 90)]);
+    future.host.kernel = "future-clock".to_owned();
+    db.store.record_load_report("n1", future).await.unwrap();
+
+    for (read_at, sent_at, marker) in [
+        (now - 30, Some(now), "queued-report"),
+        (now, None, "legacy-report"),
+    ] {
+        let mut delayed = minute_load_report(read_at, vec![minute_load_sample(read_at - 30)]);
+        delayed.sent_at_unix_secs = sent_at;
+        delayed.host.kernel = marker.to_owned();
+        db.store.record_load_report("n1", delayed).await.unwrap();
+        let kernel: String = sqlx::query_scalar(
+            "SELECT load_host_facts->>'kernel' FROM node_agent_state WHERE node_id='n1'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            kernel, "future-clock",
+            "{marker} must retain the ordering fence"
+        );
+    }
+
+    let mut corrected = minute_load_report(now, vec![minute_load_sample(now - 30)]);
+    corrected.host.kernel = "corrected-clock".to_owned();
+    db.store.record_load_report("n1", corrected).await.unwrap();
+    let state: (String, i64) = sqlx::query_as(
+        "SELECT load_host_facts->>'kernel', extract(epoch FROM load_reported_at)::bigint
+         FROM node_agent_state WHERE node_id='n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(state, ("corrected-clock".to_owned(), now));
+
+    for selection in [
+        LoadSeriesQuery::LatestWindows { windows: 1 },
+        LoadSeriesQuery::Absolute {
+            start_unix_secs: now - 300,
+            end_unix_secs: now + 300,
+        },
+    ] {
+        let view = db
+            .store
+            .node_load_view(&system_admin(), "n1", selection, 64)
+            .await
+            .unwrap();
+        assert_eq!(view.latest_sample.unwrap().window_end_unix_secs, now);
+        if matches!(selection, LoadSeriesQuery::Absolute { .. }) {
+            assert!(
+                view.series
+                    .iter()
+                    .any(|sample| sample.window_end_unix_secs > now),
+                "explicit history must retain the original future timestamps"
+            );
+        }
+        let fleet = db
+            .store
+            .list_node_load(&system_admin(), selection, 64)
+            .await
+            .unwrap();
+        let current = fleet
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "n1")
+            .unwrap();
+        assert_eq!(
+            current.latest_sample.as_ref().unwrap().window_end_unix_secs,
+            now
+        );
+    }
+    let nic = db
+        .store
+        .list_node_nic(&system_admin(), 1, 64)
+        .await
+        .unwrap();
+    let current = nic.nodes.iter().find(|node| node.node_id == "n1").unwrap();
+    assert_eq!(current.series.len(), 1);
+    assert_eq!(current.series[0].window_end_unix_secs, now);
+
+    let mut older = minute_load_report(now - 10, vec![minute_load_sample(now - 40)]);
+    older.host.kernel = "older-report".to_owned();
+    db.store.record_load_report("n1", older).await.unwrap();
+    let kernel: String = sqlx::query_scalar(
+        "SELECT load_host_facts->>'kernel' FROM node_agent_state WHERE node_id='n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(kernel, "corrected-clock");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn load_minute_compaction_is_bounded_atomic_retry_safe_and_query_aligned() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
