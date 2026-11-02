@@ -4,7 +4,9 @@
 
 ## REALITY 指纹兼容
 
-内置 Brocade Xray 的上游基线为 `v26.10.21`。服务端保留旧 TLS 1.3 X25519 ClientHello 的兼容入口，旧客户端的 `edge / ios / qq` 可继续连接；现代混合 ML-KEM 握手沿用上游校验。兼容入口仍校验密钥、SNI、short ID 和时间，不接受声明混合组却剥离其 key share 的输入，也不让旧指纹获得后量子密钥交换能力。
+内置 Brocade Xray 的上游基线为 `v26.10.31`。服务端保留旧 TLS 1.3 X25519 ClientHello 的兼容入口，旧客户端的 `edge / ios / qq` 可继续连接；现代混合 ML-KEM 握手沿用上游校验。兼容入口仍校验密钥、SNI、short ID 和时间，不接受声明混合组却剥离其 key share 的输入，也不让旧指纹获得后量子密钥交换能力。
+
+TCP 监听默认关闭 MPTCP，不再继承 Go 的默认开启行为；显式设置 `sockopt.tcpMptcp: true` 仍可请求启用。该变更作用于新建监听，FD 热交接保留旧监听的实际协议；要关闭已有 MPTCP 监听，应先在宿主机禁用并重建相关监听。此项是针对 CVE-2026-98432 的应用侧缓解，不能替代 Linux 内核安全补丁。
 
 服务端 `realitySettings.allowLegacyX25519` 缺省为 true，已有发布快照无需重写；手工配置可显式设为 false，恢复上游仅接受现代混合握手的策略。该字段是 Brocade 扩展。版本横幅另声明 `reality-legacy-x25519-v1` 与 `reality-empty-ee-v1` 能力，官方二进制不提供这些兼容约定。
 

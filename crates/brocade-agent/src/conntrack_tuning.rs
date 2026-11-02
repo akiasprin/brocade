@@ -10,8 +10,6 @@ const MIN_CONNTRACK_MAX: u64 = 32_768;
 const TRANSPORT_COMMENT: &str = "# Brocade: TCP transport defaults.";
 const CONFIG_COMMENT: &str = "# Brocade: conntrack for Hysteria 2 port hopping.";
 const MAX_KEY: &str = "net.netfilter.nf_conntrack_max";
-const UDP_TIMEOUT_KEY: &str = "net.netfilter.nf_conntrack_udp_timeout";
-const UDP_STREAM_TIMEOUT_KEY: &str = "net.netfilter.nf_conntrack_udp_timeout_stream";
 
 pub(crate) struct ReconcileResult {
     pub(crate) target_max: u64,
@@ -22,8 +20,6 @@ pub(crate) fn reconcile() -> Result<ReconcileResult, String> {
     const CONFIG_PATH: &str = "/etc/sysctl.d/99-brocade.conf";
     const MODULE_CONFIG_PATH: &str = "/etc/modules-load.d/brocade.conf";
     const MAX_PATH: &str = "/proc/sys/net/netfilter/nf_conntrack_max";
-    const UDP_TIMEOUT_PATH: &str = "/proc/sys/net/netfilter/nf_conntrack_udp_timeout";
-    const UDP_STREAM_TIMEOUT_PATH: &str = "/proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream";
 
     if !Path::new(MAX_PATH).is_file() {
         crate::run_command("modprobe", &["nf_conntrack"])
@@ -47,8 +43,6 @@ pub(crate) fn reconcile() -> Result<ReconcileResult, String> {
     }
 
     changed |= write_u64_if_different(Path::new(MAX_PATH), target)?;
-    changed |= write_u64_if_different(Path::new(UDP_TIMEOUT_PATH), 30)?;
-    changed |= write_u64_if_different(Path::new(UDP_STREAM_TIMEOUT_PATH), 60)?;
 
     Ok(ReconcileResult {
         target_max: target,
@@ -166,8 +160,6 @@ fn render_config(existing: &str, target_max: u64) -> String {
     lines.extend([
         CONFIG_COMMENT.to_owned(),
         format!("{MAX_KEY} = {target_max}"),
-        format!("{UDP_TIMEOUT_KEY} = 30"),
-        format!("{UDP_STREAM_TIMEOUT_KEY} = 60"),
     ]);
     lines.join("\n") + "\n"
 }
@@ -193,10 +185,7 @@ fn is_managed_line(line: &str) -> bool {
     let Some((key, _)) = trimmed.split_once('=') else {
         return false;
     };
-    matches!(
-        key.trim(),
-        MAX_KEY | UDP_TIMEOUT_KEY | UDP_STREAM_TIMEOUT_KEY
-    )
+    key.trim() == MAX_KEY
 }
 
 #[cfg(test)]
@@ -223,11 +212,11 @@ net.netfilter.nf_conntrack_tcp_timeout_established = 1800\n";
             rendered,
             "# Brocade: TCP transport defaults.\n\
 net.core.default_qdisc = fq\n\n\
+net.netfilter.nf_conntrack_udp_timeout = 120\n\
+net.netfilter.nf_conntrack_udp_timeout_stream = 120\n\
 net.netfilter.nf_conntrack_tcp_timeout_established = 1800\n\n\
 # Brocade: conntrack for Hysteria 2 port hopping.\n\
-net.netfilter.nf_conntrack_max = 32768\n\
-net.netfilter.nf_conntrack_udp_timeout = 30\n\
-net.netfilter.nf_conntrack_udp_timeout_stream = 60\n"
+net.netfilter.nf_conntrack_max = 32768\n"
         );
         assert_eq!(render_config(&rendered, 32_768), rendered);
     }

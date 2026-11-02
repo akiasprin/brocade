@@ -1,0 +1,4 @@
+FROM brocade-hy2-netns:20261031-compat
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::archives=/packages install -y --no-install-recommends docker.io curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*

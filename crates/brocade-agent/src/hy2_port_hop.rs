@@ -22,11 +22,11 @@
 use crate::{run_shell, DesiredArtifact};
 
 /// One range folded onto one port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Redirect {
-    start: u16,
-    end: u16,
-    to: u16,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Redirect {
+    pub(crate) start: u16,
+    pub(crate) end: u16,
+    pub(crate) to: u16,
 }
 
 /// Apply the artifact, or take the table down when there is nothing to apply.
@@ -114,7 +114,7 @@ pub(crate) fn notrack_installed() -> bool {
     notrack_present(&text)
 }
 
-fn parse(content: &str) -> Result<Vec<Redirect>, String> {
+pub(crate) fn parse(content: &str) -> Result<Vec<Redirect>, String> {
     let value: serde_json::Value = serde_json::from_str(content)
         .map_err(|error| format!("hy2_port_hop.json 解析失败：{error}"))?;
     let Some(items) = value.get("redirects").and_then(|v| v.as_array()) else {
