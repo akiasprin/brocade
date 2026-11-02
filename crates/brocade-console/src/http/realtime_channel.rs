@@ -69,7 +69,10 @@ pub(super) async fn agent_realtime(
                 authenticated.insert(name, value.clone());
             }
         }
-        Some((agent_routes().with_state(state.clone()), authenticated))
+        Some((
+            agent_routes(state.clone()).with_state(state.clone()),
+            authenticated,
+        ))
     } else {
         None
     };

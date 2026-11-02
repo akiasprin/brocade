@@ -35,6 +35,70 @@ const BOOTSTRAP_TOKEN: &str = "bootstrap-test-token-with-at-least-32-bytes";
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn observation_events_require_read_access_and_follow_committed_agent_reports() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    let token = admin_token(&db).await;
+    let node_token = db.store.issue_node_token("n1").await.unwrap();
+    let app = merged_router(
+        db.store.clone(),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+        "https://console.example".into(),
+    );
+    let path = "/realtime/observations/events";
+    let anonymous = app
+        .clone()
+        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(path)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let mut stream = response.into_body().into_data_stream();
+    let ready = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(std::str::from_utf8(&ready)
+        .unwrap()
+        .contains("event: ready"));
+    let report = app
+        .oneshot(
+            Request::get("/agent/v1/desired")
+                .header("authorization", format!("Bearer {}", node_token.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(report.status().is_success(), "{}", report.status());
+    let changed = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let changed = std::str::from_utf8(&changed).unwrap();
+    assert!(changed.contains("event: invalidate"), "{changed}");
+    assert!(changed.contains("[\"nodes\"]"), "{changed}");
+    assert!(!changed.contains("n1"));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn user_service_policy_http_previews_saves_and_protects_readonly_access() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;

@@ -157,6 +157,7 @@ struct Inner {
 
 #[derive(Clone, Debug)]
 pub struct RealtimeService {
+    pub(crate) observations: crate::observations::ObservationEvents,
     inner: Arc<Mutex<Inner>>,
     events: broadcast::Sender<RealtimeBroadcast>,
     stop_grace: Duration,
@@ -303,6 +304,7 @@ impl RealtimeService {
     fn with_stop_grace(policy: RealtimeTelemetryPolicy, stop_grace: Duration) -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
+            observations: Default::default(),
             inner: Arc::new(Mutex::new(Inner {
                 policy,
                 next_session: 0,

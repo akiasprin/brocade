@@ -1,4 +1,5 @@
 mod agent_rpc;
+mod observations;
 mod realtime_channel;
 use realtime_channel::agent_realtime;
 mod unlock_probe;
@@ -380,7 +381,7 @@ impl ConsoleServices {
             .and_realtime(self.realtime)
             .and_shutdown(self.shutdown);
         state.forwarding_probes = self.forwarding_probes;
-        agent_routes()
+        agent_routes(state.clone())
             .route("/healthz", get(healthz))
             .with_state(state)
     }
@@ -719,7 +720,7 @@ pub fn merged_router_with_wakes(
         .and_grants_wake(grants_wake)
         .and_cert_wake(cert_wake)
         .and_geoip(geoip);
-    admin_router_with_state(state.clone()).merge(agent_routes().with_state(state))
+    admin_router_with_state(state.clone()).merge(agent_routes(state.clone()).with_state(state))
 }
 
 pub fn merged_router_with_wakes_and_realtime(
@@ -735,7 +736,7 @@ pub fn merged_router_with_wakes_and_realtime(
         .and_shutdown(services.shutdown)
         .and_bootstrap_credential(services.bootstrap_credential);
     state.forwarding_probes = services.forwarding_probes;
-    admin_router_with_state(state.clone()).merge(agent_routes().with_state(state))
+    admin_router_with_state(state.clone()).merge(agent_routes(state.clone()).with_state(state))
 }
 
 /// How much of a response is read back in order to mask it. The largest thing a
@@ -870,6 +871,7 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         "/usage/monthly-summary",
         "/usage/user-cycles",
         "/realtime/nodes/events",
+        "/realtime/observations/events",
         "/realtime/fleet-traffic/events",
         "/realtime/fleet-traffic/snapshot",
         "/vpngate",
@@ -1202,6 +1204,7 @@ fn admin_router_with_state(state: AppState) -> Router {
             get(get_sniffing_failed_policy).put(update_sniffing_failed_policy),
         )
         .route("/realtime/nodes/events", get(realtime_fleet_events))
+        .route("/realtime/observations/events", get(observations::events))
         .route(
             "/realtime/fleet-traffic/events",
             get(realtime_fleet_traffic_events),
@@ -1706,6 +1709,10 @@ fn admin_router_with_state(state: AppState) -> Router {
         // `mask_assets`.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            observations::after_report,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             agent_rpc::wake_after_admin_change,
         ))
         .layer(axum::middleware::from_fn_with_state(
@@ -1735,7 +1742,7 @@ pub fn agent_router(store: PgStore) -> Router {
 /// The agent face on its own listener.
 pub fn agent_router_with_origin(store: PgStore, agent_origin: String) -> Router {
     let state = AppState::with_agent_origin(store, Arc::new(Notify::new()), agent_origin);
-    agent_routes()
+    agent_routes(state.clone())
         .route("/healthz", get(healthz))
         .with_state(state)
 }
@@ -1762,7 +1769,7 @@ pub fn agent_router_with_origin_realtime_and_shutdown(
     let state = AppState::with_agent_origin(store, Arc::new(Notify::new()), agent_origin)
         .and_realtime(realtime)
         .and_shutdown(shutdown);
-    agent_routes()
+    agent_routes(state.clone())
         .route("/healthz", get(healthz))
         .with_state(state)
 }
@@ -1783,11 +1790,11 @@ pub fn merged_router(store: PgStore, quota_wake: Arc<Notify>, agent_origin: Stri
     let state = AppState::with_agent_origin(store, quota_wake, agent_origin);
     // `/healthz` is the one path both faces answer, and merging two routers that each declare it
     // makes axum panic. The console's copy stands; `agent_routes` leaves it out.
-    admin_router_with_state(state.clone()).merge(agent_routes().with_state(state))
+    admin_router_with_state(state.clone()).merge(agent_routes(state.clone()).with_state(state))
 }
 
 /// The agent-facing routes, without `/healthz`. See `merged_router`.
-fn agent_routes() -> Router<AppState> {
+fn agent_routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/enroll/install.sh", get(install_script))
         .route("/enroll/dist", get(install_dist))
@@ -1928,6 +1935,10 @@ fn agent_routes() -> Router<AppState> {
         .route("/agent/v1/link-health", post(agent_link_health))
         .route("/agent/v1/e2e-targets", get(agent_e2e_targets))
         .route("/agent/v1/e2e-probe", post(agent_e2e_probe))
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            observations::after_report,
+        ))
         .layer(axum::middleware::from_fn(crate::performance::middleware))
 }
 

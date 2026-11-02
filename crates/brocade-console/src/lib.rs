@@ -10,6 +10,7 @@ pub mod http;
 pub mod lifecycle;
 pub mod mask;
 pub mod notifications;
+mod observations;
 pub mod performance;
 pub mod realtime;
 pub mod socket_activation;
