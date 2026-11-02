@@ -8,22 +8,6 @@
     "tag": "api"
   },
   "brocadeUnlockIpFamilies": 2,
-  "burstObservatory": {
-    "pingConfig": {
-      "destination": "http://www.gstatic.com/generate_204",
-      "interval": "10s",
-      "samplingCount": 2,
-      "timeout": "5s"
-    },
-    "subjectSelector": [
-      "out:brc/c-brc-jp>au-01",
-      "out:brc/c-brc-jp>us-01",
-      "out:brc/c-brc-smart>au-01",
-      "out:brc/c-brc-smart>us-01",
-      "out:lin/c-lin-au>au-01",
-      "out:lin/c-lin-us>us-01"
-    ]
-  },
   "dns": {
     "serveExpiredTTL": 129600,
     "serveStale": true,
@@ -931,22 +915,6 @@
     }
   },
   "routing": {
-    "balancers": [
-      {
-        "selector": [
-          "out:brc/c-brc-jp>au-01",
-          "out:brc/c-brc-jp>us-01",
-          "out:brc/c-brc-smart>au-01",
-          "out:brc/c-brc-smart>us-01",
-          "out:lin/c-lin-au>au-01",
-          "out:lin/c-lin-us>us-01"
-        ],
-        "strategy": {
-          "type": "leastPing"
-        },
-        "tag": "hop-health"
-      }
-    ],
     "domainStrategy": "AsIs",
     "rules": [
       {
@@ -954,7 +922,7 @@
           "api"
         ],
         "outboundTag": "api",
-        "ruleTag": "r:39fa4859:000",
+        "ruleTag": "r:b46153a9:000",
         "type": "field"
       },
       {
@@ -962,7 +930,7 @@
           "geosite:netflix"
         ],
         "outboundTag": "out:brc/c-brc-jp>au-01:probe-v4",
-        "ruleTag": "r:39fa4859:001",
+        "ruleTag": "r:b46153a9:001",
         "type": "field",
         "user": [
           "probe#v4:c-brc-jp%40sg-01"
@@ -973,7 +941,7 @@
           "geosite:openai"
         ],
         "outboundTag": "out:brc/c-brc-jp>us-01:probe-v4",
-        "ruleTag": "r:39fa4859:002",
+        "ruleTag": "r:b46153a9:002",
         "type": "field",
         "user": [
           "probe#v4:c-brc-jp%40sg-01"
@@ -981,7 +949,7 @@
       },
       {
         "outboundTag": "out:brc/c-brc-jp>us-01:probe-v4",
-        "ruleTag": "r:39fa4859:003",
+        "ruleTag": "r:b46153a9:003",
         "type": "field",
         "user": [
           "probe#v4:c-brc-jp%40sg-01"
@@ -989,7 +957,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v4",
-        "ruleTag": "r:39fa4859:004",
+        "ruleTag": "r:b46153a9:004",
         "type": "field",
         "user": [
           "probe#v4:c-brc-jp%40sg-01"
@@ -1000,7 +968,7 @@
           "geosite:netflix"
         ],
         "outboundTag": "out:brc/c-brc-jp>au-01:probe-v6",
-        "ruleTag": "r:39fa4859:005",
+        "ruleTag": "r:b46153a9:005",
         "type": "field",
         "user": [
           "probe#v6:c-brc-jp%40sg-01"
@@ -1011,7 +979,7 @@
           "geosite:openai"
         ],
         "outboundTag": "out:brc/c-brc-jp>us-01:probe-v6",
-        "ruleTag": "r:39fa4859:006",
+        "ruleTag": "r:b46153a9:006",
         "type": "field",
         "user": [
           "probe#v6:c-brc-jp%40sg-01"
@@ -1019,7 +987,7 @@
       },
       {
         "outboundTag": "out:brc/c-brc-jp>us-01:probe-v6",
-        "ruleTag": "r:39fa4859:007",
+        "ruleTag": "r:b46153a9:007",
         "type": "field",
         "user": [
           "probe#v6:c-brc-jp%40sg-01"
@@ -1027,7 +995,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v6",
-        "ruleTag": "r:39fa4859:008",
+        "ruleTag": "r:b46153a9:008",
         "type": "field",
         "user": [
           "probe#v6:c-brc-jp%40sg-01"
@@ -1038,7 +1006,7 @@
           "geosite:netflix"
         ],
         "outboundTag": "probe:dns:out:brc/c-brc-jp>au-01",
-        "ruleTag": "r:39fa4859:009",
+        "ruleTag": "r:b46153a9:009",
         "type": "field",
         "user": [
           "probe#dns:c-brc-jp%40sg-01"
@@ -1049,7 +1017,7 @@
           "geosite:openai"
         ],
         "outboundTag": "probe:dns:out:brc/c-brc-jp>us-01",
-        "ruleTag": "r:39fa4859:010",
+        "ruleTag": "r:b46153a9:010",
         "type": "field",
         "user": [
           "probe#dns:c-brc-jp%40sg-01"
@@ -1057,7 +1025,7 @@
       },
       {
         "outboundTag": "probe:dns:out:brc/c-brc-jp>us-01",
-        "ruleTag": "r:39fa4859:011",
+        "ruleTag": "r:b46153a9:011",
         "type": "field",
         "user": [
           "probe#dns:c-brc-jp%40sg-01"
@@ -1065,7 +1033,7 @@
       },
       {
         "outboundTag": "probe:dns",
-        "ruleTag": "r:39fa4859:012",
+        "ruleTag": "r:b46153a9:012",
         "type": "field",
         "user": [
           "probe#dns:c-brc-jp%40sg-01"
@@ -1076,7 +1044,7 @@
           "geosite:netflix"
         ],
         "outboundTag": "out:brc/c-brc-jp>au-01",
-        "ruleTag": "r:39fa4859:013",
+        "ruleTag": "r:b46153a9:013",
         "type": "field",
         "user": [
           "c-brc-jp@sg-01"
@@ -1087,7 +1055,7 @@
           "geosite:openai"
         ],
         "outboundTag": "out:brc/c-brc-jp>us-01",
-        "ruleTag": "r:39fa4859:014",
+        "ruleTag": "r:b46153a9:014",
         "type": "field",
         "user": [
           "c-brc-jp@sg-01"
@@ -1095,7 +1063,7 @@
       },
       {
         "outboundTag": "out:brc/c-brc-jp>us-01",
-        "ruleTag": "r:39fa4859:015",
+        "ruleTag": "r:b46153a9:015",
         "type": "field",
         "user": [
           "c-brc-jp@sg-01"
@@ -1106,7 +1074,7 @@
           "geosite:netflix"
         ],
         "outboundTag": "out:brc/c-brc-smart>au-01:probe-v4",
-        "ruleTag": "r:39fa4859:016",
+        "ruleTag": "r:b46153a9:016",
         "type": "field",
         "user": [
           "probe#v4:c-brc-smart%40sg-01"
@@ -1117,7 +1085,7 @@
           "geosite:openai"
         ],
         "outboundTag": "out:brc/c-brc-smart>us-01:probe-v4",
-        "ruleTag": "r:39fa4859:017",
+        "ruleTag": "r:b46153a9:017",
         "type": "field",
         "user": [
           "probe#v4:c-brc-smart%40sg-01"
@@ -1125,7 +1093,7 @@
       },
       {
         "outboundTag": "out:brc/c-brc-smart>us-01:probe-v4",
-        "ruleTag": "r:39fa4859:018",
+        "ruleTag": "r:b46153a9:018",
         "type": "field",
         "user": [
           "probe#v4:c-brc-smart%40sg-01"
@@ -1133,7 +1101,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v4",
-        "ruleTag": "r:39fa4859:019",
+        "ruleTag": "r:b46153a9:019",
         "type": "field",
         "user": [
           "probe#v4:c-brc-smart%40sg-01"
@@ -1144,7 +1112,7 @@
           "geosite:netflix"
         ],
         "outboundTag": "out:brc/c-brc-smart>au-01:probe-v6",
-        "ruleTag": "r:39fa4859:020",
+        "ruleTag": "r:b46153a9:020",
         "type": "field",
         "user": [
           "probe#v6:c-brc-smart%40sg-01"
@@ -1155,7 +1123,7 @@
           "geosite:openai"
         ],
         "outboundTag": "out:brc/c-brc-smart>us-01:probe-v6",
-        "ruleTag": "r:39fa4859:021",
+        "ruleTag": "r:b46153a9:021",
         "type": "field",
         "user": [
           "probe#v6:c-brc-smart%40sg-01"
@@ -1163,7 +1131,7 @@
       },
       {
         "outboundTag": "out:brc/c-brc-smart>us-01:probe-v6",
-        "ruleTag": "r:39fa4859:022",
+        "ruleTag": "r:b46153a9:022",
         "type": "field",
         "user": [
           "probe#v6:c-brc-smart%40sg-01"
@@ -1171,7 +1139,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v6",
-        "ruleTag": "r:39fa4859:023",
+        "ruleTag": "r:b46153a9:023",
         "type": "field",
         "user": [
           "probe#v6:c-brc-smart%40sg-01"
@@ -1182,7 +1150,7 @@
           "geosite:netflix"
         ],
         "outboundTag": "probe:dns:out:brc/c-brc-smart>au-01",
-        "ruleTag": "r:39fa4859:024",
+        "ruleTag": "r:b46153a9:024",
         "type": "field",
         "user": [
           "probe#dns:c-brc-smart%40sg-01"
@@ -1193,7 +1161,7 @@
           "geosite:openai"
         ],
         "outboundTag": "probe:dns:out:brc/c-brc-smart>us-01",
-        "ruleTag": "r:39fa4859:025",
+        "ruleTag": "r:b46153a9:025",
         "type": "field",
         "user": [
           "probe#dns:c-brc-smart%40sg-01"
@@ -1201,7 +1169,7 @@
       },
       {
         "outboundTag": "probe:dns:out:brc/c-brc-smart>us-01",
-        "ruleTag": "r:39fa4859:026",
+        "ruleTag": "r:b46153a9:026",
         "type": "field",
         "user": [
           "probe#dns:c-brc-smart%40sg-01"
@@ -1209,7 +1177,7 @@
       },
       {
         "outboundTag": "probe:dns",
-        "ruleTag": "r:39fa4859:027",
+        "ruleTag": "r:b46153a9:027",
         "type": "field",
         "user": [
           "probe#dns:c-brc-smart%40sg-01"
@@ -1220,7 +1188,7 @@
           "geosite:netflix"
         ],
         "outboundTag": "out:brc/c-brc-smart>au-01",
-        "ruleTag": "r:39fa4859:028",
+        "ruleTag": "r:b46153a9:028",
         "type": "field",
         "user": [
           "c-brc-smart@sg-01"
@@ -1231,7 +1199,7 @@
           "geosite:openai"
         ],
         "outboundTag": "out:brc/c-brc-smart>us-01",
-        "ruleTag": "r:39fa4859:029",
+        "ruleTag": "r:b46153a9:029",
         "type": "field",
         "user": [
           "c-brc-smart@sg-01"
@@ -1239,7 +1207,7 @@
       },
       {
         "outboundTag": "out:brc/c-brc-smart>us-01",
-        "ruleTag": "r:39fa4859:030",
+        "ruleTag": "r:b46153a9:030",
         "type": "field",
         "user": [
           "c-brc-smart@sg-01"
@@ -1247,7 +1215,7 @@
       },
       {
         "outboundTag": "out:lin/c-lin-au>au-01:probe-v4",
-        "ruleTag": "r:39fa4859:031",
+        "ruleTag": "r:b46153a9:031",
         "type": "field",
         "user": [
           "probe#v4:c-lin-au%40sg-01"
@@ -1255,7 +1223,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v4",
-        "ruleTag": "r:39fa4859:032",
+        "ruleTag": "r:b46153a9:032",
         "type": "field",
         "user": [
           "probe#v4:c-lin-au%40sg-01"
@@ -1263,7 +1231,7 @@
       },
       {
         "outboundTag": "out:lin/c-lin-au>au-01:probe-v6",
-        "ruleTag": "r:39fa4859:033",
+        "ruleTag": "r:b46153a9:033",
         "type": "field",
         "user": [
           "probe#v6:c-lin-au%40sg-01"
@@ -1271,7 +1239,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v6",
-        "ruleTag": "r:39fa4859:034",
+        "ruleTag": "r:b46153a9:034",
         "type": "field",
         "user": [
           "probe#v6:c-lin-au%40sg-01"
@@ -1279,7 +1247,7 @@
       },
       {
         "outboundTag": "probe:dns:out:lin/c-lin-au>au-01",
-        "ruleTag": "r:39fa4859:035",
+        "ruleTag": "r:b46153a9:035",
         "type": "field",
         "user": [
           "probe#dns:c-lin-au%40sg-01"
@@ -1287,7 +1255,7 @@
       },
       {
         "outboundTag": "probe:dns",
-        "ruleTag": "r:39fa4859:036",
+        "ruleTag": "r:b46153a9:036",
         "type": "field",
         "user": [
           "probe#dns:c-lin-au%40sg-01"
@@ -1295,7 +1263,7 @@
       },
       {
         "outboundTag": "out:lin/c-lin-au>au-01",
-        "ruleTag": "r:39fa4859:037",
+        "ruleTag": "r:b46153a9:037",
         "type": "field",
         "user": [
           "c-lin-au@sg-01"
@@ -1303,7 +1271,7 @@
       },
       {
         "outboundTag": "out:lin/c-lin-us>us-01:probe-v4",
-        "ruleTag": "r:39fa4859:038",
+        "ruleTag": "r:b46153a9:038",
         "type": "field",
         "user": [
           "probe#v4:c-lin-us%40sg-01"
@@ -1311,7 +1279,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v4",
-        "ruleTag": "r:39fa4859:039",
+        "ruleTag": "r:b46153a9:039",
         "type": "field",
         "user": [
           "probe#v4:c-lin-us%40sg-01"
@@ -1319,7 +1287,7 @@
       },
       {
         "outboundTag": "out:lin/c-lin-us>us-01:probe-v6",
-        "ruleTag": "r:39fa4859:040",
+        "ruleTag": "r:b46153a9:040",
         "type": "field",
         "user": [
           "probe#v6:c-lin-us%40sg-01"
@@ -1327,7 +1295,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v6",
-        "ruleTag": "r:39fa4859:041",
+        "ruleTag": "r:b46153a9:041",
         "type": "field",
         "user": [
           "probe#v6:c-lin-us%40sg-01"
@@ -1335,7 +1303,7 @@
       },
       {
         "outboundTag": "probe:dns:out:lin/c-lin-us>us-01",
-        "ruleTag": "r:39fa4859:042",
+        "ruleTag": "r:b46153a9:042",
         "type": "field",
         "user": [
           "probe#dns:c-lin-us%40sg-01"
@@ -1343,7 +1311,7 @@
       },
       {
         "outboundTag": "probe:dns",
-        "ruleTag": "r:39fa4859:043",
+        "ruleTag": "r:b46153a9:043",
         "type": "field",
         "user": [
           "probe#dns:c-lin-us%40sg-01"
@@ -1351,19 +1319,11 @@
       },
       {
         "outboundTag": "out:lin/c-lin-us>us-01",
-        "ruleTag": "r:39fa4859:044",
+        "ruleTag": "r:b46153a9:044",
         "type": "field",
         "user": [
           "c-lin-us@sg-01"
         ]
-      },
-      {
-        "balancerTag": "hop-health",
-        "domain": [
-          "full:invalid.brocade.never-match"
-        ],
-        "ruleTag": "r:39fa4859:045",
-        "type": "field"
       }
     ]
   },

@@ -8,19 +8,6 @@
     "tag": "api"
   },
   "brocadeUnlockIpFamilies": 2,
-  "burstObservatory": {
-    "pingConfig": {
-      "destination": "http://www.gstatic.com/generate_204",
-      "interval": "10s",
-      "samplingCount": 2,
-      "timeout": "5s"
-    },
-    "subjectSelector": [
-      "out:brc/c-brc-smart>sg-01",
-      "out:lin/c-lin-au>sg-01",
-      "out:lin/c-lin-us>sg-01"
-    ]
-  },
   "dns": {
     "serveExpiredTTL": 129600,
     "serveStale": true,
@@ -793,19 +780,6 @@
     }
   },
   "routing": {
-    "balancers": [
-      {
-        "selector": [
-          "out:brc/c-brc-smart>sg-01",
-          "out:lin/c-lin-au>sg-01",
-          "out:lin/c-lin-us>sg-01"
-        ],
-        "strategy": {
-          "type": "leastPing"
-        },
-        "tag": "hop-health"
-      }
-    ],
     "domainStrategy": "AsIs",
     "rules": [
       {
@@ -813,7 +787,7 @@
           "api"
         ],
         "outboundTag": "api",
-        "ruleTag": "r:0c2d264c:000",
+        "ruleTag": "r:3db57bdf:000",
         "type": "field"
       },
       {
@@ -824,7 +798,7 @@
           "in:brc/i-brc-hk:guard"
         ],
         "outboundTag": "out:internal",
-        "ruleTag": "r:0c2d264c:001",
+        "ruleTag": "r:3db57bdf:001",
         "type": "field"
       },
       {
@@ -835,7 +809,7 @@
           "in:frt/i-frt-hk:guard"
         ],
         "outboundTag": "out:internal",
-        "ruleTag": "r:0c2d264c:002",
+        "ruleTag": "r:3db57bdf:002",
         "type": "field"
       },
       {
@@ -846,7 +820,7 @@
           "in:lin/i-lin-au:guard"
         ],
         "outboundTag": "out:internal",
-        "ruleTag": "r:0c2d264c:003",
+        "ruleTag": "r:3db57bdf:003",
         "type": "field"
       },
       {
@@ -857,7 +831,7 @@
           "in:lin/i-lin-us:guard"
         ],
         "outboundTag": "out:internal",
-        "ruleTag": "r:0c2d264c:004",
+        "ruleTag": "r:3db57bdf:004",
         "type": "field"
       },
       {
@@ -868,7 +842,7 @@
           "in:lin/i-lin-us:guard"
         ],
         "outboundTag": "out:reality-guard",
-        "ruleTag": "r:0c2d264c:005",
+        "ruleTag": "r:3db57bdf:005",
         "type": "field"
       },
       {
@@ -876,7 +850,7 @@
           "geosite:category-ads"
         ],
         "outboundTag": "out:block",
-        "ruleTag": "r:0c2d264c:006",
+        "ruleTag": "r:3db57bdf:006",
         "type": "field",
         "user": [
           "probe#v4:probe#i-brc-hk"
@@ -884,7 +858,7 @@
       },
       {
         "outboundTag": "out:brc/c-brc-smart>sg-01:probe-v4",
-        "ruleTag": "r:0c2d264c:007",
+        "ruleTag": "r:3db57bdf:007",
         "type": "field",
         "user": [
           "probe#v4:probe#i-brc-hk"
@@ -892,7 +866,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v4",
-        "ruleTag": "r:0c2d264c:008",
+        "ruleTag": "r:3db57bdf:008",
         "type": "field",
         "user": [
           "probe#v4:probe#i-brc-hk"
@@ -903,7 +877,7 @@
           "geosite:category-ads"
         ],
         "outboundTag": "out:block",
-        "ruleTag": "r:0c2d264c:009",
+        "ruleTag": "r:3db57bdf:009",
         "type": "field",
         "user": [
           "probe#v6:probe#i-brc-hk"
@@ -911,7 +885,7 @@
       },
       {
         "outboundTag": "out:brc/c-brc-smart>sg-01:probe-v6",
-        "ruleTag": "r:0c2d264c:010",
+        "ruleTag": "r:3db57bdf:010",
         "type": "field",
         "user": [
           "probe#v6:probe#i-brc-hk"
@@ -919,7 +893,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v6",
-        "ruleTag": "r:0c2d264c:011",
+        "ruleTag": "r:3db57bdf:011",
         "type": "field",
         "user": [
           "probe#v6:probe#i-brc-hk"
@@ -930,7 +904,7 @@
           "geosite:category-ads"
         ],
         "outboundTag": "out:block",
-        "ruleTag": "r:0c2d264c:012",
+        "ruleTag": "r:3db57bdf:012",
         "type": "field",
         "user": [
           "probe#dns:probe#i-brc-hk"
@@ -938,7 +912,7 @@
       },
       {
         "outboundTag": "probe:dns:out:brc/c-brc-smart>sg-01",
-        "ruleTag": "r:0c2d264c:013",
+        "ruleTag": "r:3db57bdf:013",
         "type": "field",
         "user": [
           "probe#dns:probe#i-brc-hk"
@@ -946,7 +920,7 @@
       },
       {
         "outboundTag": "probe:dns",
-        "ruleTag": "r:0c2d264c:014",
+        "ruleTag": "r:3db57bdf:014",
         "type": "field",
         "user": [
           "probe#dns:probe#i-brc-hk"
@@ -960,7 +934,7 @@
           "in:brc/i-brc-hk"
         ],
         "outboundTag": "out:block",
-        "ruleTag": "r:0c2d264c:015",
+        "ruleTag": "r:3db57bdf:015",
         "type": "field"
       },
       {
@@ -968,7 +942,7 @@
           "in:brc/i-brc-hk"
         ],
         "outboundTag": "out:brc/c-brc-smart>sg-01",
-        "ruleTag": "r:0c2d264c:016",
+        "ruleTag": "r:3db57bdf:016",
         "type": "field"
       },
       {
@@ -977,7 +951,7 @@
           "domain:us1.example.net"
         ],
         "outboundTag": "out:egress:probe-v4",
-        "ruleTag": "r:0c2d264c:017",
+        "ruleTag": "r:3db57bdf:017",
         "type": "field",
         "user": [
           "probe#v4:probe#i-frt-hk"
@@ -985,7 +959,7 @@
       },
       {
         "outboundTag": "out:block",
-        "ruleTag": "r:0c2d264c:018",
+        "ruleTag": "r:3db57bdf:018",
         "type": "field",
         "user": [
           "probe#v4:probe#i-frt-hk"
@@ -993,7 +967,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v4",
-        "ruleTag": "r:0c2d264c:019",
+        "ruleTag": "r:3db57bdf:019",
         "type": "field",
         "user": [
           "probe#v4:probe#i-frt-hk"
@@ -1005,7 +979,7 @@
           "domain:us1.example.net"
         ],
         "outboundTag": "out:egress:probe-v6",
-        "ruleTag": "r:0c2d264c:020",
+        "ruleTag": "r:3db57bdf:020",
         "type": "field",
         "user": [
           "probe#v6:probe#i-frt-hk"
@@ -1013,7 +987,7 @@
       },
       {
         "outboundTag": "out:block",
-        "ruleTag": "r:0c2d264c:021",
+        "ruleTag": "r:3db57bdf:021",
         "type": "field",
         "user": [
           "probe#v6:probe#i-frt-hk"
@@ -1021,7 +995,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v6",
-        "ruleTag": "r:0c2d264c:022",
+        "ruleTag": "r:3db57bdf:022",
         "type": "field",
         "user": [
           "probe#v6:probe#i-frt-hk"
@@ -1033,7 +1007,7 @@
           "domain:us1.example.net"
         ],
         "outboundTag": "probe:dns",
-        "ruleTag": "r:0c2d264c:023",
+        "ruleTag": "r:3db57bdf:023",
         "type": "field",
         "user": [
           "probe#dns:probe#i-frt-hk"
@@ -1041,7 +1015,7 @@
       },
       {
         "outboundTag": "out:block",
-        "ruleTag": "r:0c2d264c:024",
+        "ruleTag": "r:3db57bdf:024",
         "type": "field",
         "user": [
           "probe#dns:probe#i-frt-hk"
@@ -1049,7 +1023,7 @@
       },
       {
         "outboundTag": "probe:dns",
-        "ruleTag": "r:0c2d264c:025",
+        "ruleTag": "r:3db57bdf:025",
         "type": "field",
         "user": [
           "probe#dns:probe#i-frt-hk"
@@ -1064,7 +1038,7 @@
           "in:frt/i-frt-hk"
         ],
         "outboundTag": "out:egress",
-        "ruleTag": "r:0c2d264c:026",
+        "ruleTag": "r:3db57bdf:026",
         "type": "field"
       },
       {
@@ -1072,12 +1046,12 @@
           "in:frt/i-frt-hk"
         ],
         "outboundTag": "out:block",
-        "ruleTag": "r:0c2d264c:027",
+        "ruleTag": "r:3db57bdf:027",
         "type": "field"
       },
       {
         "outboundTag": "out:lin/c-lin-au>sg-01:probe-v4",
-        "ruleTag": "r:0c2d264c:028",
+        "ruleTag": "r:3db57bdf:028",
         "type": "field",
         "user": [
           "probe#v4:probe#i-lin-au"
@@ -1085,7 +1059,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v4",
-        "ruleTag": "r:0c2d264c:029",
+        "ruleTag": "r:3db57bdf:029",
         "type": "field",
         "user": [
           "probe#v4:probe#i-lin-au"
@@ -1093,7 +1067,7 @@
       },
       {
         "outboundTag": "out:lin/c-lin-au>sg-01:probe-v6",
-        "ruleTag": "r:0c2d264c:030",
+        "ruleTag": "r:3db57bdf:030",
         "type": "field",
         "user": [
           "probe#v6:probe#i-lin-au"
@@ -1101,7 +1075,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v6",
-        "ruleTag": "r:0c2d264c:031",
+        "ruleTag": "r:3db57bdf:031",
         "type": "field",
         "user": [
           "probe#v6:probe#i-lin-au"
@@ -1109,7 +1083,7 @@
       },
       {
         "outboundTag": "probe:dns:out:lin/c-lin-au>sg-01",
-        "ruleTag": "r:0c2d264c:032",
+        "ruleTag": "r:3db57bdf:032",
         "type": "field",
         "user": [
           "probe#dns:probe#i-lin-au"
@@ -1117,7 +1091,7 @@
       },
       {
         "outboundTag": "probe:dns",
-        "ruleTag": "r:0c2d264c:033",
+        "ruleTag": "r:3db57bdf:033",
         "type": "field",
         "user": [
           "probe#dns:probe#i-lin-au"
@@ -1128,7 +1102,7 @@
           "in:lin/i-lin-au"
         ],
         "outboundTag": "out:lin/c-lin-au>sg-01",
-        "ruleTag": "r:0c2d264c:034",
+        "ruleTag": "r:3db57bdf:034",
         "type": "field"
       },
       {
@@ -1136,7 +1110,7 @@
           "geosite:category-ads"
         ],
         "outboundTag": "out:block",
-        "ruleTag": "r:0c2d264c:035",
+        "ruleTag": "r:3db57bdf:035",
         "type": "field",
         "user": [
           "probe#v4:probe#i-lin-us"
@@ -1144,7 +1118,7 @@
       },
       {
         "outboundTag": "out:lin/c-lin-us>sg-01:probe-v4",
-        "ruleTag": "r:0c2d264c:036",
+        "ruleTag": "r:3db57bdf:036",
         "type": "field",
         "user": [
           "probe#v4:probe#i-lin-us"
@@ -1152,7 +1126,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v4",
-        "ruleTag": "r:0c2d264c:037",
+        "ruleTag": "r:3db57bdf:037",
         "type": "field",
         "user": [
           "probe#v4:probe#i-lin-us"
@@ -1163,7 +1137,7 @@
           "geosite:category-ads"
         ],
         "outboundTag": "out:block",
-        "ruleTag": "r:0c2d264c:038",
+        "ruleTag": "r:3db57bdf:038",
         "type": "field",
         "user": [
           "probe#v6:probe#i-lin-us"
@@ -1171,7 +1145,7 @@
       },
       {
         "outboundTag": "out:lin/c-lin-us>sg-01:probe-v6",
-        "ruleTag": "r:0c2d264c:039",
+        "ruleTag": "r:3db57bdf:039",
         "type": "field",
         "user": [
           "probe#v6:probe#i-lin-us"
@@ -1179,7 +1153,7 @@
       },
       {
         "outboundTag": "out:forward:probe-v6",
-        "ruleTag": "r:0c2d264c:040",
+        "ruleTag": "r:3db57bdf:040",
         "type": "field",
         "user": [
           "probe#v6:probe#i-lin-us"
@@ -1190,7 +1164,7 @@
           "geosite:category-ads"
         ],
         "outboundTag": "out:block",
-        "ruleTag": "r:0c2d264c:041",
+        "ruleTag": "r:3db57bdf:041",
         "type": "field",
         "user": [
           "probe#dns:probe#i-lin-us"
@@ -1198,7 +1172,7 @@
       },
       {
         "outboundTag": "probe:dns:out:lin/c-lin-us>sg-01",
-        "ruleTag": "r:0c2d264c:042",
+        "ruleTag": "r:3db57bdf:042",
         "type": "field",
         "user": [
           "probe#dns:probe#i-lin-us"
@@ -1206,7 +1180,7 @@
       },
       {
         "outboundTag": "probe:dns",
-        "ruleTag": "r:0c2d264c:043",
+        "ruleTag": "r:3db57bdf:043",
         "type": "field",
         "user": [
           "probe#dns:probe#i-lin-us"
@@ -1220,7 +1194,7 @@
           "in:lin/i-lin-us"
         ],
         "outboundTag": "out:block",
-        "ruleTag": "r:0c2d264c:044",
+        "ruleTag": "r:3db57bdf:044",
         "type": "field"
       },
       {
@@ -1228,15 +1202,7 @@
           "in:lin/i-lin-us"
         ],
         "outboundTag": "out:lin/c-lin-us>sg-01",
-        "ruleTag": "r:0c2d264c:045",
-        "type": "field"
-      },
-      {
-        "balancerTag": "hop-health",
-        "domain": [
-          "full:invalid.brocade.never-match"
-        ],
-        "ruleTag": "r:0c2d264c:046",
+        "ruleTag": "r:3db57bdf:045",
         "type": "field"
       }
     ]

@@ -2310,9 +2310,9 @@ fn forward_action_tag(
         return forward_tag(app, source_chain, forward.target_node);
     }
     // `~` and `@` are outside the model slug alphabet, so both boundaries are unambiguous. The
-    // agent strips the target-listener suffix when reporting remote link health. A local listener
-    // reference carries an explicit marker and is omitted there: link_health rejects self peers,
-    // and a loopback socket is not a machine-to-machine link.
+    // agent strips the target-listener suffix when attributing sockets to physical peers. A local
+    // listener reference carries an explicit marker and is omitted from that attribution:
+    // a loopback socket is not a machine-to-machine link.
     let target = if source_node == forward.target_node {
         format!("{}@local", forward.target_chain)
     } else {

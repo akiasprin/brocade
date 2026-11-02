@@ -1632,23 +1632,12 @@ pub struct LinkProbeResult {
     pub unknown_peers: u64,
 }
 
-/// A relay hop's liveness.
-///
-/// The test is the delta of the outbound's counters rather than the observatory's own verdict.
-/// The probe traffic travels that outbound, since the artifacts' `burstObservatory` sends every
-/// 10 seconds, so the hop's state appears directly in
-/// `outbound>>>out:{app}/{chain}>{to}>>>traffic>>>downlink`. This requires no new read channel:
-/// `xray api` has no observatory verb, `GetOutboundStatus` is gRPC only, and the agent writes its
-/// own HTTP.
-///
-/// It also removes the ambiguity between idle and dead: the observatory produces traffic for as
-/// long as the hop is up, so a zero delta means the hop is down and no separate active probe is
-/// needed.
+/// Legacy counter-based relay monitoring report, accepted for older Agents during upgrades.
+/// New Agents no longer collect or send this family; these DTOs preserve wire compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkHealthRequest {
     pub checked_at_unix_secs: i64,
-    /// The elapsed time between the two readings. The control plane uses it to decide how far a
-    /// zero delta can be relied on: too short an interval may not yet include a probe.
+    /// Legacy elapsed time between counter readings, retained without changing the wire shape.
     pub window_secs: u64,
     pub hops: Vec<LinkHealth>,
 }
@@ -2057,10 +2046,8 @@ pub struct UserTrafficHistory {
 // - this measures a chain's entire data plane, from the port a user dials, through every relay,
 //   to the exit
 //
-// Every hop being up does not imply the chain works. `link_health` tests whether a node's
-// outbound toward its next hop is still accumulating bytes. A mistyped REALITY parameter, a
-// missing routing rule, or a blocked exit stops none of the hop counters, while users can no
-// longer connect.
+// Underlay reachability does not imply the chain works: REALITY parameters, routing rules
+// and exit connectivity must be exercised through the actual data plane.
 // ══════════════════════════════════════════════════════════════════════
 
 /// Which chains this machine probes as their head.

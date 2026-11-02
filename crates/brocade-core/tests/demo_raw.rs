@@ -33,6 +33,19 @@ fn demo_raw_configs_match_core_compiler() {
     for node_id in ["au-01", "hk-01", "jp-01", "sg-01", "us-01"] {
         let plan = output.project_node(node_id).unwrap();
         let xray_text = json::xray(&xray::build(&plan));
+        let rendered: serde_json::Value = serde_json::from_str(&xray_text).unwrap();
+        assert!(rendered.get("burstObservatory").is_none(), "{node_id}");
+        assert!(rendered.get("observatory").is_none(), "{node_id}");
+        assert!(rendered["routing"].get("balancers").is_none(), "{node_id}");
+        assert!(
+            rendered["routing"]["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|rule| rule.get("balancerTag").is_none()),
+            "{node_id}"
+        );
+        assert_eq!(rendered["policy"]["system"]["statsOutboundDownlink"], true);
         let wireguard_text = ini::wireguard(&wireguard::build(&plan));
         let grants_batch = grants::build(&plan);
         let grants_text = json::grant_sync_batch(&grants_batch);

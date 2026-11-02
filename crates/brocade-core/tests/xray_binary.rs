@@ -22,10 +22,7 @@ use std::{
 
 use base64::{engine::general_purpose, Engine as _};
 use brocade_core::{
-    artifacts::{
-        subscription,
-        xray::{self, HOP_HEALTH_BALANCER_TAG},
-    },
+    artifacts::{subscription, xray},
     format::{json, uri},
     ir::{hops::compile_hops, routing::compile_app, system::compile_system},
     model::{
@@ -2783,75 +2780,6 @@ fn node(id: &str, overlay: [u8; 4]) -> Node {
     }
 }
 
-/// The liveness section must actually send probes, not merely load as configuration.
-///
-/// xray passes unrecognized top-level keys silently (insert a `thisKeyDoesNotExist` and it
-/// still reports Configuration OK), so `-test` proves nothing here. The only thing that
-/// counts is `app/observatory/burst: checking <tag>` appearing in the log once it runs.
-///
-/// So this test watches behavior rather than shape: with `burstObservatory` configured but
-/// no rule referencing the balancer, the config passes just the same while not one probe is
-/// ever sent.
-#[test]
-fn the_hop_health_observatory_actually_probes() {
-    let Some(binary) = xray_binary() else {
-        eprintln!("跳过：没找到 xray 二进制（设 BROCADE_XRAY_BIN 或放到 .tools/xray）");
-        return;
-    };
-
-    let (sys, app_ir) = fixture(HopDial::Overlay, HopWire::None);
-    let config = json::xray(&xray::build(&project_node(
-        &sys,
-        std::slice::from_ref(&app_ir),
-        "hk",
-    )));
-    assert!(
-        config.contains("burstObservatory"),
-        "hk 有转发出口，该出判活段：{config}"
-    );
-
-    let dir = std::env::temp_dir().join("brocade-hop-health");
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("xray.json");
-    // The log has to go to debug for the observatory to be visible; the artifact itself
-    // uses warning.
-    fs::write(
-        &path,
-        config
-            // The log has to go to debug for the observatory to be visible; the artifact
-            // itself uses warning.
-            .replace("\"loglevel\": \"warning\"", "\"loglevel\": \"debug\"")
-            // The ingress is 443 in the fixture, which non-root cannot bind, so xray exits
-            // before the observatory starts. Liveness has nothing to do with the ingress
-            // port, and a high port changes nothing this test sets out to prove.
-            .replace("\"port\": 443", "\"port\": 18443"),
-    )
-    .unwrap();
-
-    let mut child = Command::new(&binary)
-        .args(["run", "-c"])
-        .arg(&path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("跑不起来 xray");
-    std::thread::sleep(std::time::Duration::from_secs(4));
-    let _ = child.kill();
-    let output = child.wait_with_output().unwrap();
-    let log = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let _ = fs::remove_dir_all(&dir);
-
-    assert!(
-        log.contains("app/observatory/burst: checking"),
-        "observatory 没有真的开始探测。只配 burstObservatory 是不够的，\
-         必须有一条路由规则引用 balancer 才会实例化：\n{log}"
-    );
-}
-
 /// The vendored upstream baseline is the release these tests validate against.
 ///
 /// They are one decision seen from two sides: `BROCADE_UPSTREAM.toml` records the fork's upstream
@@ -2906,7 +2834,7 @@ fn a_compiled_rule_table_swaps_into_a_running_xray() {
 
     // Two tables from the same machine, differing only in its rules: the second splits
     // the catch-all in two by matching a domain ahead of it. Same outbounds, same
-    // inbounds, same balancer — so what the swap exercises is the rule table alone.
+    // inbounds — so what the swap exercises is the rule table alone.
     let compile = |extra: Option<DestMatch>| {
         let (mut doc, mut app) = base_model(HopDial::Overlay, HopWire::None);
         doc.settings = Default::default();
@@ -3057,11 +2985,6 @@ fn a_compiled_rule_table_swaps_into_a_running_xray() {
             return Err(format!("换表后剩下的不是新表：{live:?} vs {new_tags:?}"));
         }
 
-        // The rebuilt balancer must still resolve its existing observatory after replacement.
-        let (ok, text) = api_call(&["bi", HOP_HEALTH_BALANCER_TAG]);
-        if !ok {
-            return Err(format!("换表后判活 balancer 没了：{text}"));
-        }
         Ok(())
     })();
 
@@ -3514,18 +3437,6 @@ fn unlock_families_cross_two_managed_hops_and_never_fall_back_to_the_other_famil
     // TLS/REALITY transport is covered by the existing embedded-chain acceptance. This
     // isolated test changes only the first transport so it can measure the compiled routing.
     source_json["inbounds"] = json!([{"tag":source_tag,"listen":"127.0.0.2","port":entry,"protocol":"vless","settings":{"decryption":"none","clients":clients}}]);
-    source_json
-        .as_object_mut()
-        .unwrap()
-        .remove("burstObservatory");
-    source_json["routing"]
-        .as_object_mut()
-        .unwrap()
-        .remove("balancers");
-    source_json["routing"]["rules"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|rule| rule.get("balancerTag").is_none());
     let mut exit_json: Value = serde_json::from_str(&json::xray(&xray::build(&exit))).unwrap();
     source_json.as_object_mut().unwrap().remove("geodata");
     exit_json.as_object_mut().unwrap().remove("geodata");

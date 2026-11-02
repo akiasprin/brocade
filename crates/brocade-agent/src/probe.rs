@@ -1,20 +1,19 @@
-//! The probing family: path MTU, relay-hop liveness, and end-to-end probe
-//! scheduling. All three measure and report without changing any state on the
+//! The probing family: path MTU, Ping, and end-to-end probe scheduling.
+//! These measure and report without changing any state on the
 //! machine — entirely apart from the convergence path, which is why each runs on
 //! its own thread (see `run_forever` in main.rs).
 use std::{
     collections::BTreeMap,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
-    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
 
 use brocade_deployment::protocol::{
-    E2eExitVerdict, E2eProbeRequest, E2eProbeStatus, E2eProbeTargetList, LinkHealth,
-    LinkHealthRequest, LinkProbe, LinkProbeRequest, LinkProbeStatus, PingProbeEndpoint,
-    PingProbeFamily, PingProbeReportRequest, PingProbeSample, PingProbeSkipReason,
-    PingProbeTargetsResponse, ProbeTargetList, ProbeTransport,
+    E2eExitVerdict, E2eProbeRequest, E2eProbeStatus, E2eProbeTargetList, LinkProbe,
+    LinkProbeRequest, LinkProbeStatus, PingProbeEndpoint, PingProbeFamily, PingProbeReportRequest,
+    PingProbeSample, PingProbeSkipReason, PingProbeTargetsResponse, ProbeTargetList,
+    ProbeTransport,
 };
 
 use crate::{current_unix_secs, e2e, http::HttpClient, icmp, options::Options};
@@ -90,56 +89,14 @@ pub(crate) fn probe_path_mtu_with(
     (LinkProbeStatus::Ok, Some(low))
 }
 
-// Last round's readings for liveness. Held in process memory rather than on
-// disk: after a restart the first round has no baseline, and reporting "unknown"
-// is more honest than reporting "dead" — a freshly started agent should not paint
-// the whole link map red.
-static HOP_BASELINE: Mutex<Option<(u64, BTreeMap<String, u64>)>> = Mutex::new(None);
-
-/// Cumulative downlink counters for every forwarding outbound, read from xray.
-///
-/// Tags look like `outbound>>>out:{app}/{chain}>{to}>>>traffic>>>downlink`. Only
-/// forwarding outbounds count; `out:egress` and `out:block` do not — the first
-/// always carries traffic (so it measures no relay liveness), the second never
-/// does.
-pub(crate) fn read_hop_downlinks(api_address: SocketAddr) -> Result<BTreeMap<String, u64>, String> {
-    Ok(hop_downlinks_from_stats(&crate::xray_grpc::query_stats(
-        api_address,
-        "outbound>>>out:",
-    )?))
-}
-
-pub(crate) fn hop_downlinks_from_stats(
-    stats: &[crate::xray_grpc::XrayStat],
-) -> BTreeMap<String, u64> {
-    let mut out = BTreeMap::new();
-    for stat in stats {
-        let Ok(value) = u64::try_from(stat.value) else {
-            continue;
-        };
-        let Some(rest) = stat.name.strip_prefix("outbound>>>") else {
-            continue;
-        };
-        let Some((tag, "traffic>>>downlink")) = rest.split_once(">>>") else {
-            continue;
-        };
-        // A forwarding outbound's tag reads out:{app}/{chain}>{to}; that '>' is
-        // what separates it from egress/block
-        if hop_of_tag(tag).is_some() {
-            out.insert(tag.to_owned(), value);
-        }
-    }
-    out
-}
-
 /// `out:{app}/{chain}>{to}` → (app/chain, to). Remote listener references use
 /// `out:{app}/{source-chain}~{listener-chain}>{to}`; the target-listener suffix distinguishes
 /// two ports on one peer in Xray while telemetry remains keyed to the source chain and peer node.
 /// A suffix ending in `@local` is a same-process loopback reference, not a link, and is omitted.
 /// `None` for anything else (egress/block/local listener).
 fn hop_of_tag(tag: &str) -> Option<(&str, &str)> {
-    // Existing TCP flows can outlive the temporary endpoint-swap handler. Keep each
-    // raw counter's own baseline, then fold both tags into the same physical hop.
+    // Existing TCP flows can outlive the temporary endpoint-swap handler. Both tags
+    // still identify the same physical peer for socket attribution.
     let tag = tag
         .strip_suffix(brocade_deployment::hotswap::ENDPOINT_SWAP_SUFFIX)
         .unwrap_or(tag);
@@ -153,63 +110,6 @@ fn hop_of_tag(tag: &str) -> Option<(&str, &str)> {
         return Some((chain, peer));
     };
     (!target.ends_with("@local")).then_some((source, peer))
-}
-
-/// Compare this round's readings against the last to judge each hop's liveness.
-///
-/// The first round has no baseline and returns nothing — it does not report
-/// everything dead. The counters are cumulative and reset when xray restarts, so
-/// a value below the previous one is treated as a fresh start rather than
-/// negative growth.
-pub(crate) fn judge_hops(now: BTreeMap<String, u64>, at: u64) -> Option<LinkHealthRequest> {
-    let mut guard = HOP_BASELINE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous = guard.replace((at, now.clone()));
-    let (previous_at, previous) = previous?;
-    let window_secs = at.saturating_sub(previous_at);
-
-    let hops = hop_health_deltas(&now, &previous);
-
-    (!hops.is_empty()).then_some(LinkHealthRequest {
-        checked_at_unix_secs: at as i64,
-        window_secs,
-        hops,
-    })
-}
-
-/// Fold Xray's per-outbound counters into the control plane's per-chain/per-peer identity.
-///
-/// Listener references keep their target listener in the outbound tag, so two rules on one
-/// source chain may legitimately produce two counters for the same peer machine. Sending both
-/// rows would collide with the store's `(chain, peer)` key; keeping only one would make liveness
-/// depend on tag ordering. Sum their deltas and report one physical link instead.
-pub(crate) fn hop_health_deltas(
-    now: &BTreeMap<String, u64>,
-    previous: &BTreeMap<String, u64>,
-) -> Vec<LinkHealth> {
-    let mut totals = BTreeMap::<(String, String), u64>::new();
-    for (tag, value) in now {
-        let Some((chain_id, peer)) = hop_of_tag(tag) else {
-            continue;
-        };
-        let before = previous.get(tag).copied().unwrap_or(0);
-        // A drop means xray restarted and the counter reset; this round has no trustworthy delta,
-        // so treat that outbound as no data while retaining any sibling outbound's valid delta.
-        let delta = value.saturating_sub(before);
-        *totals
-            .entry((chain_id.to_owned(), peer.to_owned()))
-            .or_default() += delta;
-    }
-    totals
-        .into_iter()
-        .map(|((chain_id, peer_node_id), downlink_bytes)| LinkHealth {
-            chain_id,
-            peer_node_id,
-            alive: downlink_bytes > 0,
-            downlink_bytes,
-        })
-        .collect()
 }
 
 pub(crate) fn fetch_probe_targets(options: &Options) -> Result<ProbeTargetList, String> {
@@ -1469,6 +1369,18 @@ mod family_telemetry_tests {
     use brocade_core::model::{probe_family_tag, IpFamily};
 
     #[test]
+    fn local_and_non_forwarding_outbounds_have_no_physical_peer() {
+        for tag in [
+            "out:egress",
+            "out:block",
+            "out:internal",
+            "out:app/source~owner@local>self",
+        ] {
+            assert_eq!(hop_of_tag(tag), None, "{tag}");
+        }
+    }
+
+    #[test]
     fn family_probe_outbounds_never_become_physical_hops() {
         for base in ["out:app/chain>peer", "out:app/chain~owner>peer"] {
             assert_eq!(hop_of_tag(base), Some(("app/chain", "peer")));
@@ -1500,23 +1412,5 @@ mod family_telemetry_tests {
                 ("app/chain".into(), "peer".into())
             );
         }
-    }
-
-    #[test]
-    fn liveness_counters_ignore_both_probe_families() {
-        let base = "out:app/chain>peer";
-        let stat = |tag: &str| crate::xray_grpc::XrayStat {
-            name: format!("outbound>>>{tag}>>>traffic>>>downlink"),
-            value: 100,
-        };
-        let stats = vec![
-            stat(base),
-            stat(&probe_family_tag(base, IpFamily::V4)),
-            stat(&probe_family_tag(base, IpFamily::V6)),
-        ];
-        assert_eq!(
-            hop_downlinks_from_stats(&stats),
-            BTreeMap::from([(base.to_owned(), 100)])
-        );
     }
 }
