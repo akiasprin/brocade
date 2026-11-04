@@ -14,6 +14,7 @@ use std::{
 
 mod chatgpt;
 mod connections;
+mod ipv6;
 mod media;
 mod youtube;
 #[derive(Clone)]
@@ -133,6 +134,9 @@ fn measure(
     state_dir: &std::path::Path,
 ) -> (Vec<UnlockResult>, Option<UnlockPathError>) {
     let services = target.services();
+    if let Some(results) = skip_absent_local_ipv6(target, ipv6::available) {
+        return (results, None);
+    }
     let Some(chain) = &target.chain else {
         let client = target.family.map(|family| {
             crate::http::diagnostic_family_client(match family {
@@ -249,6 +253,42 @@ fn measure(
         ),
     }
     // The private Xray and its files stay alive until all requests have finished.
+}
+
+fn skip_absent_local_ipv6(
+    target: &UnlockProbeTarget,
+    available: impl FnOnce() -> std::io::Result<bool>,
+) -> Option<Vec<UnlockResult>> {
+    if target.chain.is_some() || target.family != Some(brocade_core::model::IpFamily::V6) {
+        return None;
+    }
+    match available() {
+        Ok(true) => None,
+        Ok(false) => Some(
+            target
+                .services()
+                .iter()
+                .copied()
+                .map(|service| {
+                    if service == UnlockService::YoutubePremium {
+                        youtube::skipped(UnlockCode::NoIpv6Egress)
+                    } else {
+                        result(
+                            service,
+                            UnlockStatus::Skipped,
+                            UnlockCode::NoIpv6Egress,
+                            None,
+                        )
+                    }
+                })
+                .collect(),
+        ),
+        // Missing inventory is unknown, not proof that the family is absent.
+        Err(error) => {
+            eprintln!("unlock local IPv6 inventory: {error}");
+            None
+        }
+    }
 }
 
 pub(crate) fn run(options: Options) {
@@ -753,6 +793,13 @@ fn country(raw: &str) -> Option<String> {
             "CAN" => "CA",
             "AUS" => "AU",
             "IND" => "IN",
+            "AFG" => "AF",
+            "RUS" => "RU",
+            "BLR" => "BY",
+            "CUB" => "CU",
+            "IRN" => "IR",
+            "PRK" => "KP",
+            "SYR" => "SY",
             _ => &raw,
         }
         .to_owned(),
@@ -1195,7 +1242,9 @@ fn parse(service: UnlockService, status: u16, body: &str, url: &str) -> UnlockRe
         region = body
             .split_once(",2,1,200,\"")
             .and_then(|(_, tail)| tail.split_once('"'))
-            .and_then(|(code, _)| country(code));
+            .map(|(code, _)| code)
+            .filter(|code| code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_uppercase()))
+            .and_then(country);
     }
     let tiktok_hk_restriction = service == S::Tiktok
         && reqwest::Url::parse(url).is_ok_and(|url| {
@@ -1211,9 +1260,6 @@ fn parse(service: UnlockService, status: u16, body: &str, url: &str) -> UnlockRe
         || lower.contains("forbidden-location")
         || url.contains("app-unavailable-in-region")
         || (service == S::DisneyPlus && (url.contains("/unavailable") || url.contains("/preview")))
-        || (service == S::Gemini
-            && (body.contains("45631641,null,false")
-                || field(&body, "45631641").and_then(|v| v.as_bool()) == Some(false)))
         || (service == S::PrimeVideo
             && field(&body, "isServiceRestricted").and_then(|v| v.as_bool()) == Some(true));
     // A redirect from the application homepage to its company site is not access to
@@ -1253,6 +1299,17 @@ fn parse(service: UnlockService, status: u16, body: &str, url: &str) -> UnlockRe
         (U::Restricted, C::AccessDenied)
     } else if !(200..300).contains(&status) {
         (U::Failed, C::UnrecognizedResponse)
+    } else if service == S::Gemini
+        && matches!(
+            region.as_deref(),
+            Some("AF" | "CN" | "RU" | "BY" | "CU" | "IR" | "KP" | "SY")
+        )
+    {
+        // Region-based probing follows Clash Verge Rev and subs-check. This list tracks
+        // the personal web app's support policy, checked on 2026-11-03:
+        // https://support.google.com/gemini/answer/13575153?hl=en
+        // Hong Kong/Macau are supported; mainland China is Workspace-only.
+        (U::UnsupportedRegion, C::RegionUnsupported)
     } else {
         let available = match service {
             S::Chatgpt => serde_json::from_str::<serde_json::Value>(&body)
@@ -1273,8 +1330,9 @@ fn parse(service: UnlockService, status: u16, body: &str, url: &str) -> UnlockRe
                         || lower.contains("continue with"))
             }
             S::Gemini => {
-                body.contains("45631641,null,true")
-                    || field(&body, "45631641").and_then(|v| v.as_bool()) == Some(true)
+                // Use Google's request-specific country, as other unlock checkers do.
+                // The 45631641 bootstrap switch is false on supported DE/GB responses.
+                region.is_some()
             }
             S::DisneyPlus => {
                 field(&body, "inSupportedLocation").and_then(|v| v.as_bool()) == Some(true)
@@ -1326,10 +1384,22 @@ fn netflix_with_check(
     let region = pages
         .into_iter()
         .flatten()
-        .map(|page| page.url.path())
-        .find_map(|path| {
-            let segment = path.trim_start_matches('/').split('/').next()?;
-            country(segment.split('-').next()?)
+        .find_map(|page| {
+            // The US site keeps /title/... without a country prefix. Its geo bootstrap
+            // still identifies this request as US; locale menus and signup country do not.
+            // Netflix's inline JavaScript uses \xHH strings, which JSON needs as \u00HH.
+            let body = page.response.body.replace("\\x", "\\u00");
+            field(&body, "requestCountry")
+                .and_then(|value| value.get("id")?.as_str().map(str::to_owned))
+                .filter(|code| code.len() == 2)
+                .and_then(|code| country(&code))
+        })
+        .or_else(|| {
+            pages.into_iter().flatten().find_map(|page| {
+                let segment = page.url.path().trim_start_matches('/').split('/').next()?;
+                let code = segment.split('-').next()?;
+                (code.len() == 2).then(|| country(code)).flatten()
+            })
         });
     let statuses = pages.map(|page| page.map(|page| page.response.status));
     let (status, code) = if matches!(
@@ -1375,6 +1445,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn netflix_reads_request_country_when_us_title_urls_have_no_region_prefix() {
+        for (code, name) in [
+            ("US", r"United\x20States"),
+            ("DE", "Germany"),
+            ("JP", "Japan"),
+        ] {
+            let body = format!(
+                r#"netflix <meta property="og:video"><script>netflix.reactContext={{"models":{{"geo":{{"data":{{"supportedLocales":[{{"country":"GB"}}],"requestCountry":{{"id":"{code}","countryName":"{name}"}}}}}}}}}};</script>"#
+            );
+            let outcome = netflix_with_check(|url| {
+                let mut page = netflix_page(200, &body);
+                page.url = reqwest::Url::parse(url).unwrap();
+                Ok(page)
+            })
+            .unwrap();
+            assert_eq!(outcome.status, UnlockStatus::Available);
+            assert_eq!(outcome.region.as_deref(), Some(code));
+            assert!(outcome.valid());
+        }
+    }
+    #[test]
+    fn netflix_never_defaults_a_missing_country_or_uses_a_language_menu_country() {
+        for metadata in [
+            "",
+            r#"{"country":"US","supportedLocales":[{"country":"US"}],"countryOfSignup":"US"}"#,
+            r#"{"requestCountry":{"id":"invalid","countryName":"United States"}}"#,
+            r#"{"requestCountry":{"id":true}}"#,
+        ] {
+            let body = format!(r#"netflix <meta property="og:video"> {metadata}"#);
+            let outcome = netflix_with_check(|url| {
+                let mut page = netflix_page(200, &body);
+                page.url = reqwest::Url::parse(url).unwrap();
+                Ok(page)
+            })
+            .unwrap();
+            assert_eq!(outcome.status, UnlockStatus::Available);
+            assert_eq!(outcome.region, None, "{metadata}");
+            assert!(outcome.valid());
+        }
+    }
+    #[test]
+    fn netflix_request_country_takes_precedence_over_a_localized_url() {
+        let outcome=netflix_with_check(|_|Ok(netflix_page(200,r#"netflix og:video {"requestCountry":{"id":"US","countryName":"United\x20States"}}"#))).unwrap();
+        assert_eq!(outcome.status, UnlockStatus::Available);
+        assert_eq!(outcome.region.as_deref(), Some("US"));
+        assert!(outcome.valid());
+    }
     #[test]
     fn netflix_keeps_a_confirmed_title_when_either_request_fails() {
         for failure in [UnlockCode::NetworkError, UnlockCode::Timeout] {
@@ -1445,6 +1563,28 @@ mod tests {
         assert_eq!(outcome.status, UnlockStatus::Restricted);
     }
 
+    #[test]
+    #[ignore = "contacts only Netflix through the actual machine HTTP transport; sanitized result only"]
+    fn live_netflix_country_through_machine_transport() {
+        let target = UnlockProbeTarget {
+            probe_id: "0".repeat(32),
+            services: Some(vec![UnlockService::Netflix]),
+            family: Some(brocade_core::model::IpFamily::V4),
+            family_ready: None,
+            ipv6_egress_check: false,
+            chain: None,
+            connection_trace: false,
+        };
+        let started = Instant::now();
+        let (results, path_error) = measure(&target, std::path::Path::new("/unused-direct-probe"));
+        assert!(path_error.is_none());
+        assert_eq!(results.len(), 1);
+        assert!(results[0].valid());
+        println!(
+            "{}",
+            serde_json::json!({"result":results[0],"elapsed_ms":started.elapsed().as_millis()})
+        );
+    }
     #[test]
     #[ignore = "contacts Netflix through an explicitly selected diagnostic SOCKS proxy"]
     fn live_netflix_transport() {
@@ -1899,7 +2039,7 @@ mod tests {
         let gemini = parse(
             UnlockService::Gemini,
             200,
-            r#",2,1,200,"HKG" 45631641,null,false"#,
+            r#",2,1,200,"HKG" 45631641,null,false This service is not available in your country"#,
             "",
         );
         assert_eq!(gemini.region.as_deref(), Some("HK"));
@@ -1946,6 +2086,103 @@ mod tests {
         );
     }
     #[test]
+    fn gemini_uses_service_region_instead_of_internal_feature_switches() {
+        // Reduced from actual DE/GB responses. Region-based checks follow Clash Verge Rev
+        // and subs-check; the public support list now also includes Hong Kong and Macau.
+        for (region, expected) in [
+            ("DEU", "DE"),
+            ("GBR", "GB"),
+            ("HKG", "HK"),
+            ("MAC", "MO"),
+            ("USA", "US"),
+            ("JPN", "JP"),
+        ] {
+            for switch in [
+                "45631641,null,false",
+                r#"{\"45631641\":false}"#,
+                "45631641,null,true",
+                "",
+            ] {
+                let body = format!(
+                    r#"<title>Google Gemini</title><chat-app-orchestrator></chat-app-orchestrator><a>Sign in</a>,2,1,200,"{region}" {switch}"#,
+                );
+                let outcome = parse(
+                    UnlockService::Gemini,
+                    200,
+                    &body,
+                    "https://gemini.google.com/app",
+                );
+                assert_eq!(outcome.status, UnlockStatus::Available, "{region} {switch}");
+                assert_eq!(outcome.code, UnlockCode::WebAvailable);
+                assert_eq!(outcome.region.as_deref(), Some(expected));
+                assert!(outcome.valid());
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_region_policy_and_explicit_denials_are_independent_of_feature_switches() {
+        for (region, expected) in [
+            ("AFG", "AF"),
+            ("CHN", "CN"),
+            ("RUS", "RU"),
+            ("BLR", "BY"),
+            ("CUB", "CU"),
+            ("IRN", "IR"),
+            ("PRK", "KP"),
+            ("SYR", "SY"),
+        ] {
+            let body = format!(r#",2,1,200,"{region}" 45631641,null,true"#);
+            let outcome = parse(UnlockService::Gemini, 200, &body, "");
+            assert_eq!(outcome.status, UnlockStatus::UnsupportedRegion, "{region}");
+            assert_eq!(outcome.code, UnlockCode::RegionUnsupported);
+            assert_eq!(outcome.region.as_deref(), Some(expected));
+            assert!(outcome.valid());
+        }
+        for (status, suffix, expected) in [
+            (
+                200,
+                "This service is not available in your country",
+                UnlockStatus::UnsupportedRegion,
+            ),
+            (403, "", UnlockStatus::Restricted),
+            (451, "", UnlockStatus::Restricted),
+            (
+                200,
+                "<title>Just a moment</title>",
+                UnlockStatus::Restricted,
+            ),
+            (503, "", UnlockStatus::Failed),
+        ] {
+            let body = format!(r#",2,1,200,"DEU" 45631641,null,true {suffix}"#);
+            let outcome = parse(UnlockService::Gemini, status, &body, "");
+            assert_eq!(outcome.status, expected);
+            assert_eq!(outcome.region.as_deref(), Some("DE"));
+            assert!(outcome.valid());
+        }
+    }
+
+    #[test]
+    fn gemini_requires_a_complete_service_region_even_when_the_old_switch_is_true() {
+        for body in [
+            "<title>Google Gemini</title>",
+            "45631641,null,true",
+            r#"{\"45631641\":true}"#,
+            r#",2,1,200,"DE" 45631641,null,true"#,
+            r#",2,1,200,"deu" 45631641,null,true"#,
+            r#",2,1,200,"DEUX" 45631641,null,true"#,
+            r#",2,1,200,"DEU 45631641,null,true"#,
+            r#"{"country":"DEU","45631641":true}"#,
+        ] {
+            let outcome = parse(UnlockService::Gemini, 200, body, "");
+            assert_eq!(outcome.status, UnlockStatus::Failed, "{body}");
+            assert_eq!(outcome.code, UnlockCode::UnrecognizedResponse);
+            assert_eq!(outcome.region, None);
+            assert!(outcome.valid());
+        }
+    }
+
+    #[test]
     fn sanitized_live_response_shapes_do_not_depend_on_obsolete_fields_or_captcha_libraries() {
         // Reduced from 2026-10-25 public responses; no visitor IDs, tokens or page content.
         assert_eq!(
@@ -1961,7 +2198,7 @@ mod tests {
         let gemini = parse(
             UnlockService::Gemini,
             200,
-            r#"[2,1,200,"TWN"] {\"45631641\":true}"#,
+            r#"[0,2,1,200,"TWN"] {\"45631641\":true}"#,
             "",
         );
         assert_eq!(gemini.status, UnlockStatus::Available);
@@ -2068,6 +2305,69 @@ mod tests {
             .status,
             UnlockStatus::Restricted
         );
+    }
+
+    #[test]
+    #[ignore = "contacts Gemini through the production HTTP transport and parser; metadata only"]
+    fn live_gemini_response_through_production_parser() {
+        for (family, address_family) in [
+            ("v4", crate::http::AddressFamily::V4),
+            ("v6", crate::http::AddressFamily::V6),
+        ] {
+            let context = ProbeContext {
+                client: crate::http::diagnostic_family_client(address_family).unwrap(),
+                request_timeout: REQUEST_TIMEOUT,
+                ipv6: family == "v6",
+                trace: None,
+                trace_expected: false,
+                service: Some(UnlockService::Gemini),
+                part: brocade_deployment::unlock_probe::UnlockPart::Service,
+                requests: Default::default(),
+            };
+            let started = Instant::now();
+            match get(
+                "https://gemini.google.com/",
+                started + SERVICE_TIMEOUT,
+                Some(&context),
+            ) {
+                Ok(page) => {
+                    let body = page
+                        .response
+                        .body
+                        .replace("\\\"", "\"")
+                        .replace("&quot;", "\"");
+                    let outcome = parse(
+                        UnlockService::Gemini,
+                        page.response.status,
+                        &page.response.body,
+                        page.url.as_str(),
+                    );
+                    assert!(outcome.valid());
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "family": family,
+                            "http_status": page.response.status,
+                            "host": page.url.host_str(),
+                            "path": page.url.path(),
+                            "bytes": page.response.body.len(),
+                            "elapsed_ms": started.elapsed().as_millis(),
+                            "internal_feature": field(&body, "45631641"),
+                            "legacy_false_switch": body.contains("45631641,null,false")
+                                || field(&body, "45631641").and_then(|value| value.as_bool()) == Some(false),
+                            "application_shell": body.contains("<chat-app-orchestrator"),
+                            "result": outcome,
+                        })
+                    );
+                }
+                Err(code) => println!(
+                    "{}",
+                    serde_json::json!({
+                        "family": family, "error": code, "elapsed_ms": started.elapsed().as_millis(),
+                    })
+                ),
+            }
+        }
     }
 
     #[test]
@@ -2616,6 +2916,84 @@ mod retry_confirmation_tests {
 #[cfg(test)]
 mod ipv6_skip_tests {
     use super::*;
+    fn target() -> UnlockProbeTarget {
+        UnlockProbeTarget {
+            probe_id: "0".repeat(32),
+            services: Some(brocade_deployment::unlock_probe::V53_UNLOCK_SERVICES.to_vec()),
+            family: Some(brocade_core::model::IpFamily::V6),
+            family_ready: None,
+            ipv6_egress_check: false,
+            chain: None,
+            connection_trace: false,
+        }
+    }
+    #[test]
+    fn absent_local_ipv6_skips_every_service_and_both_youtube_pages() {
+        let target = target();
+        let readings = skip_absent_local_ipv6(&target, || Ok(false)).unwrap();
+        assert_eq!(readings.len(), target.services().len());
+        for reading in &readings {
+            assert_eq!(
+                (reading.status, reading.code),
+                (UnlockStatus::Skipped, UnlockCode::NoIpv6Egress)
+            );
+            assert!(reading.valid());
+        }
+        let youtube = readings
+            .iter()
+            .find(|reading| reading.service == UnlockService::YoutubePremium)
+            .unwrap()
+            .youtube
+            .as_ref()
+            .unwrap();
+        for page in [&youtube.webpage, &youtube.premium] {
+            assert_eq!(
+                (page.status, page.code),
+                (UnlockStatus::Skipped, UnlockCode::NoIpv6Egress)
+            );
+        }
+        assert_eq!(youtube.cdn.error, Some(UnlockCode::NoIpv6Egress));
+    }
+    #[test]
+    fn local_absence_does_not_reject_ipv4_or_a_chain_with_a_remote_ipv6_exit() {
+        let mut target = target();
+        assert!(skip_absent_local_ipv6(&target, || Ok(true)).is_none());
+        assert!(skip_absent_local_ipv6(&target, || Err(
+            std::io::ErrorKind::PermissionDenied.into()
+        ))
+        .is_none());
+        target.family = Some(brocade_core::model::IpFamily::V4);
+        assert!(skip_absent_local_ipv6(&target, || panic!(
+            "IPv4 must not inspect IPv6 capability"
+        ))
+        .is_none());
+        target.family = Some(brocade_core::model::IpFamily::V6);
+        target.chain=Some(serde_json::from_value(serde_json::json!({
+            "app_id":null,"chain_id":"chain","chain_name":"remote IPv6","ingress_id":"ipv4-relay",
+            "dial_host":"127.0.0.1","port":443,"uuid":"00000000-0000-4000-8000-000000000006",
+            "security":{"type":"tls","value":{"server_name":"localhost","flow":null}},"expected_exit_ips":[]
+        })).unwrap());
+        assert!(skip_absent_local_ipv6(&target, || panic!(
+            "local absence says nothing about a remote exit"
+        ))
+        .is_none());
+    }
+    #[test]
+    #[ignore = "checks this host's real IPv6 capability and probes only Gemini when present"]
+    fn live_machine_ipv6_capability() {
+        let mut target = target();
+        target.services = Some(vec![UnlockService::Gemini]);
+        let started = Instant::now();
+        let (readings, path_error) =
+            measure(&target, std::path::Path::new("/unused-machine-probe"));
+        assert!(path_error.is_none());
+        assert_eq!(readings.len(), 1);
+        assert!(readings[0].valid());
+        println!(
+            "{}",
+            serde_json::json!({"result":readings[0],"elapsed_ms":started.elapsed().as_millis()})
+        );
+    }
     #[test]
     fn final_http_dns_evidence_skips_only_a_confirmed_missing_ipv6_family() {
         let mut context = ProbeContext {
@@ -2743,21 +3121,22 @@ mod dial_failure_tests {
         );
         let reading = &readings[0];
         assert!(reading.valid());
-        let (status, code, count, error) = if value["mode"] == "no-address" {
-            (
-                UnlockStatus::Skipped,
-                UnlockCode::NoIpv6Egress,
-                1,
-                "ipv6_no_address",
-            )
-        } else {
-            (
-                UnlockStatus::Failed,
-                UnlockCode::NetworkError,
-                2,
-                "network_unreachable",
-            )
-        };
+        let (status, code, count, error) =
+            if value["mode"] == "no-address" || value["mode"] == "ula-no-route" {
+                (
+                    UnlockStatus::Skipped,
+                    UnlockCode::NoIpv6Egress,
+                    1,
+                    "ipv6_no_address",
+                )
+            } else {
+                (
+                    UnlockStatus::Failed,
+                    UnlockCode::NetworkError,
+                    2,
+                    "network_unreachable",
+                )
+            };
         assert_eq!((reading.status, reading.code), (status, code));
         let detail = reading.youtube.as_ref().unwrap();
         assert_eq!((detail.webpage.status, detail.webpage.code), (status, code));

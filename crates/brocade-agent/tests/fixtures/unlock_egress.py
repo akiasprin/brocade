@@ -12,8 +12,10 @@ assert Path('/.dockerenv').exists() and os.environ.get('BROCADE_PROBE_EGRESS_DOC
 binary, agent, directory, mode = sys.argv[1:]
 root = Path(directory)
 root.mkdir(mode=0o700, parents=True, exist_ok=True)
-assert mode in ['no-address', 'address-without-route']
+assert mode in ['no-address', 'ula-no-route', 'address-without-route']
 subprocess.run(['ip', 'link', 'set', 'lo', 'up'], check=True)
+if mode == 'ula-no-route':
+    subprocess.run(['ip', '-6', 'addr', 'add', 'fd00:1234::2/128', 'dev', 'lo'], check=True)
 if mode == 'address-without-route':
     subprocess.run(['ip', '-6', 'addr', 'add', '2001:db8:1::2/128', 'dev', 'lo'], check=True)
 used = set()

@@ -33,7 +33,7 @@ func probeDialError(ctx context.Context, src net.Address, dest net.Destination, 
 	if err == nil || probetrace.FromContext(ctx) == nil || dest.Network != net.Network_TCP || !dest.Address.Family().IsIP() {
 		return err
 	}
-	checkSources := usableIPv6Source
+	checkSources := func() (bool, error) { return usableIPv6Source(dest) }
 	// Transparent/external socket controllers can select sources outside the normal
 	// interface inventory. Their failures remain specific without asserting absence.
 	ControllersLock.Lock()
@@ -91,7 +91,7 @@ func wildcardProbeSource(source net.Address) bool {
 	return source == nil || source.Family().IsIP() && source.IP().IsUnspecified()
 }
 
-func usableIPv6Source() (bool, error) {
+func usableIPv6Source(dest net.Destination) (bool, error) {
 	interfaces, err := stdnet.Interfaces()
 	if err != nil {
 		return false, err
@@ -106,17 +106,47 @@ func usableIPv6Source() (bool, error) {
 			inventoryErr = err
 			continue
 		}
-		for _, address := range addresses {
-			ip, _, err := stdnet.ParseCIDR(address.String())
+		usable, err := probeIPv6Sources(addresses, func() (bool, error) {
+			// UDP connect asks the kernel to select a route/source without sending packets.
+			// ULA alone (e.g. the Brocade overlay) does not establish Internet egress;
+			// a routed ULA source still supports NAT66 or a gateway on another host.
+			conn, err := stdnet.DialUDP("udp6", nil, &stdnet.UDPAddr{IP: dest.Address.IP(), Port: int(dest.Port)})
 			if err != nil {
-				inventoryErr = err
-				continue
+				if stderrors.Is(err, syscall.ENETUNREACH) {
+					return false, nil
+				}
+				return false, err
 			}
-			// Global addresses on loopback and ULA sources used with NAT66 count too.
-			if ip.To4() == nil && ip.IsGlobalUnicast() {
-				return true, nil
-			}
+			defer conn.Close()
+			return conn.LocalAddr().(*stdnet.UDPAddr).IP.IsGlobalUnicast(), nil
+		})
+		if usable {
+			return true, nil
+		}
+		if err != nil {
+			inventoryErr = err
 		}
 	}
 	return false, inventoryErr
+}
+
+func probeIPv6Sources(addresses []stdnet.Addr, routedULA func() (bool, error)) (bool, error) {
+	private := false
+	for _, address := range addresses {
+		ip, _, err := stdnet.ParseCIDR(address.String())
+		if err != nil {
+			return false, err
+		}
+		if ip.To4() == nil && ip.IsGlobalUnicast() {
+			if !ip.IsPrivate() {
+				// A configured global source with a broken route stays a network failure.
+				return true, nil
+			}
+			private = true
+		}
+	}
+	if private {
+		return routedULA()
+	}
+	return false, nil
 }

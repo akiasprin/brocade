@@ -239,6 +239,11 @@ pub(super) fn detect(deadline: Instant, proxy: Option<&super::ProbeContext>) -> 
     })
 }
 
+pub(super) fn skipped(code: UnlockCode) -> UnlockResult {
+    debug_assert!(code.is_family_skip());
+    detect_with(|_| Err(code))
+}
+
 fn detect_with(mut request: impl FnMut(&str) -> Result<Page, UnlockCode>) -> UnlockResult {
     // Independent facts, one path and one service deadline. A failed homepage, Premium
     // response or CDN mapping never substitutes its state or country for another item.

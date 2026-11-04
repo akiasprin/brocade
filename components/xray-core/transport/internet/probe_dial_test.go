@@ -105,3 +105,27 @@ func TestProbeDialDockerNetwork(t *testing.T) {
 	}
 	conn.Close()
 }
+
+func TestProbeIPv6SourceDistinguishesULALocalRoutesFromInternetEgress(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		addresses []stdnet.Addr
+		route     bool
+		routeErr  error
+		want      bool
+		wantErr   bool
+	}{
+		{name: "loopback and link-local", addresses: []stdnet.Addr{&stdnet.IPNet{IP: stdnet.ParseIP("::1"), Mask: stdnet.CIDRMask(128, 128)}, &stdnet.IPNet{IP: stdnet.ParseIP("fe80::1"), Mask: stdnet.CIDRMask(64, 128)}}},
+		{name: "ULA overlay without public route", addresses: []stdnet.Addr{&stdnet.IPNet{IP: stdnet.ParseIP("fd00::1"), Mask: stdnet.CIDRMask(64, 128)}}},
+		{name: "ULA NAT66 route", addresses: []stdnet.Addr{&stdnet.IPNet{IP: stdnet.ParseIP("fd00::1"), Mask: stdnet.CIDRMask(64, 128)}}, route: true, want: true},
+		{name: "public source without route remains a failure", addresses: []stdnet.Addr{&stdnet.IPNet{IP: stdnet.ParseIP("2001:db8::1"), Mask: stdnet.CIDRMask(64, 128)}}, want: true},
+		{name: "route inventory failure remains unknown", addresses: []stdnet.Addr{&stdnet.IPNet{IP: stdnet.ParseIP("fd00::1"), Mask: stdnet.CIDRMask(64, 128)}}, routeErr: os.ErrPermission, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			actual, err := probeIPv6Sources(test.addresses, func() (bool, error) { return test.route, test.routeErr })
+			if actual != test.want || (err != nil) != test.wantErr {
+				t.Fatalf("usable=%v error=%v", actual, err)
+			}
+		})
+	}
+}
