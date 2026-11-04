@@ -138,3 +138,9 @@ sudo systemctl start brocade.socket brocade.service
 ```
 
 备份包含密钥，应按凭据保管。使用已有 PostgreSQL 时，用 `pg_dump --format=custom --compress=6` 保存压缩数据库备份；若为 Console 配置了 `BROCADE_SECRET_KEY`，与数据库备份一同保管。丢失密钥后，已密封的 DNS 凭据和证书私钥无法恢复。
+
+### 机器 Xray 开关的数据库升级
+
+本版本新增 `0005_node_xray_enabled.sql`，保留已发布 0001–0004 的原始内容。迁移为已有机器设置默认开启，历史快照缺失开关时沿用开启语义，不改变既有运行配置。应用后迁移链为 `[1,2,3,4,5]`；不识别 0005 的旧 Console 无法直接启动，应保留携带相同迁移的回退构建，不得删除迁移回执或覆盖历史快照。
+
+升级前备份并验证恢复。先升级 Console，再更新 Agent，最后发布开关配置；新版 Agent 能区分主动关闭与独立转发、来源策略和应用层限速的待恢复状态。仅升级 Console 不会关闭节点上的 Xray。

@@ -248,6 +248,7 @@ struct BinaryReleaseObservation {
     running_sha256: Option<String>,
     agent_protocol_version: Option<u32>,
     xray_handoff_ready: bool,
+    xray_disabled: bool,
 }
 
 fn release_strategy(value: Option<&str>) -> Result<Option<XrayReleaseStrategy>> {
@@ -570,6 +571,7 @@ pub async fn create_binary_release(
     for node_id in &nodes {
         let observation = &observations[node_id];
         if component == BinaryComponent::Xray
+            && !observation.xray_disabled
             && xray_strategy != Some(XrayReleaseStrategy::Restart)
             && (observation.agent_protocol_version.unwrap_or_default()
                 < XRAY_HANDOFF_PROTOCOL_VERSION
@@ -581,7 +583,11 @@ pub async fn create_binary_release(
                 "node {node_id} has not reported a ready managed Xray handoff runtime"
             )));
         }
-        if observation.running_sha256.as_deref() != Some(observation.installed_sha256.as_str()) {
+        if observation.running_sha256.as_deref() != Some(observation.installed_sha256.as_str())
+            && !(component == BinaryComponent::Xray
+                && observation.xray_disabled
+                && observation.running_sha256.is_none())
+        {
             return Err(StoreError::InvalidData(format!(
                 "node {node_id} is not currently running its managed Xray"
             )));
@@ -619,12 +625,13 @@ pub async fn create_binary_release(
     for node_id in &nodes {
         sqlx::query(
             "INSERT INTO binary_release_targets
-                        (release_id, node_id, before_sha256)
-                 VALUES ($1, $2, $3)",
+                        (release_id, node_id, before_sha256, xray_service_was_disabled)
+                 VALUES ($1, $2, $3, $4)",
         )
         .bind(id)
         .bind(node_id)
         .bind(&observations[node_id].installed_sha256)
+        .bind(component == BinaryComponent::Xray && observations[node_id].xray_disabled)
         .execute(&mut *tx)
         .await?;
     }
@@ -1051,7 +1058,7 @@ async fn settle_report(pool: &PgPool, node_id: &str, report: ExecutionReport<'_>
     }
     let row = sqlx::query(
         "SELECT t.status, t.attempt, t.before_sha256, t.desired_sha256,
-                a.receipt_capable, a.error AS attempt_error,
+                t.xray_service_was_disabled, a.receipt_capable, a.error AS attempt_error,
                 a.evidence AS attempt_evidence, t.dispatched_at
            FROM binary_release_targets t JOIN binary_release_attempts a
              ON (a.release_id, a.node_id, a.attempt) = (t.release_id, t.node_id, t.attempt)
@@ -1103,7 +1110,13 @@ async fn settle_report(pool: &PgPool, node_id: &str, report: ExecutionReport<'_>
                         "successful Xray report does not identify the approved bytes".to_owned(),
                     ));
                 }
-                if !performed || before == desired || !r.xray_enabled || running != Some(desired) {
+                let installation_only = row.try_get::<bool, _>("xray_service_was_disabled")?
+                    && !r.xray_enabled
+                    && running.is_none();
+                if !performed
+                    || before == desired
+                    || (!installation_only && (!r.xray_enabled || running != Some(desired)))
+                {
                     error =
                         Some("未证明本次真实替换并启动目标 Xray，不能作为发布成功证据".to_owned());
                     "unverified"
@@ -1492,6 +1505,7 @@ async fn release_observations(
 ) -> Result<BTreeMap<String, BinaryReleaseObservation>> {
     let rows = sqlx::query(
         "SELECT n.id, lifecycle.phase, state.agent_protocol_version,
+                EXISTS(SELECT 1 FROM node_applied_state applied WHERE applied.node_id=n.id AND applied.xray_state='disabled') AS xray_disabled,
                 state.runtime_versions->>'agent' AS agent_running_sha256,
                 state.runtime_versions->>'xray_installed_sha256' AS xray_installed_sha256,
                 state.runtime_versions->>'xray_running_sha256' AS xray_running_sha256,
@@ -1574,6 +1588,7 @@ async fn release_observations(
                     })
                     .transpose()?,
                 xray_handoff_ready: row.try_get("xray_handoff_ready")?,
+                xray_disabled: row.try_get("xray_disabled")?,
             },
         );
     }

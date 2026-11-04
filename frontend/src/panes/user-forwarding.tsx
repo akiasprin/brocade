@@ -214,6 +214,7 @@ const RULE_STATUS: Record<ForwardingRule['runtime_status'], { tone: string; text
   error: { tone: 'bad', text: '收敛失败' },
   disabled: { tone: 'off', text: '已停用' },
   'quota-paused': { tone: 'warn', text: '配额暂停' },
+  'xray-paused': { tone: 'off', text: 'Xray 已关闭' },
   'service-paused': { tone: 'warn', text: '有效期暂停' },
   unknown: { tone: 'warn', text: '状态待确认' },
 };

@@ -352,7 +352,7 @@ function chainAttentionTitle(
   probe: E2eProbeItem | undefined,
   users: number,
 ): string {
-  if (disabled) return '含退役机器，整链停用';
+  if (disabled) return '依赖机器已退役或关闭 Xray，整链暂停';
   if (!ingress) return '缺接入面：没有入口，这条链无法接入';
   const probeTone = toneOf(probe);
   if (probeTone !== 'ok' && probeTone !== 'none') return toneTitle(probe);
@@ -4737,7 +4737,7 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
   const retired = new Set((nodeList.data?.nodes ?? []).filter(n => n.retired_at).map(n => n.node_id));
   const rows = chainRows(snapshot.data.snapshot.apps ?? []).map(r => ({
     ...r,
-    disabled: r.members.some(n => retired.has(n)),
+    disabled: (snapshot.data.xray_disabled_chains ?? []).includes(r.chain.id) || r.members.some(n => retired.has(n)),
   }));
   // 两层都直接保持 snapshot 的 position 顺序。停用状态只改变外观，不再把链挪到末尾：
   // 否则操作者刚排好的 chain 顺序会在这张主列表上失效，而其他页面又是另一种顺序。
@@ -5211,7 +5211,7 @@ function ChainPath({
       {showTail && (
         <span className="cp-tail">
           {disabled
-            ? '含退役机器，整链停用'
+            ? '依赖机器不可用，整链暂停'
             : !ingress
               ? '缺接入面'
               : spine.length === 1
@@ -5564,8 +5564,8 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
   // 停用表示链上含退役节点（与编译器判定一致，即从入口 BFS 的可达范围）。此处列出
   // 具体是哪几台退役，在横幅中标明，无需返回列表核对。
   const retiredSet = new Set((nodes.data?.nodes ?? []).filter(n => n.retired_at).map(n => n.node_id));
-  const retiredHops = spine.filter(n => retiredSet.has(n));
-  const disabled = retiredHops.length > 0;
+  const retiredHops = chainMembers(a, c.id).filter(n => retiredSet.has(n));
+  const disabled = (snapshot.data?.xray_disabled_chains ?? []).includes(c.id) || retiredHops.length > 0;
   // 该链需要列出的每一跳。主干之外还有分叉：规则中 Forward 到主干外的机器同样是该链的
   // 成员，有各自的规则表和中转端口。只列出主干时，配置分流后该机器会从界面上消失，
   // 其规则无法再访问。
@@ -5661,10 +5661,12 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                         <span className="n">停用</span>
                       </span>
                       <span className="probe-say">
-                        <span className="l1">链上有退役机器：{retiredHops.map(nameOf).join('、')}</span>
-                        <span className="l2">
-                          入口不渲染、整链不编译，发布不受影响。把退役机器移出链（或让它复出）后自动恢复。
+                        <span className="l1">
+                          {retiredHops.length > 0
+                            ? `链上有退役机器：${retiredHops.map(nameOf).join('、')}`
+                            : '依赖机器已关闭 Xray'}
                         </span>
+                        <span className="l2">线路配置仍可修改。恢复依赖机器并发布后，按保存的配置重新启用。</span>
                       </span>
                     </div>
                   </div>

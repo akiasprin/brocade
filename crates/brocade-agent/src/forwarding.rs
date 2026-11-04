@@ -63,6 +63,12 @@ fn run_round(options: &Options, meter: &Mutex<()>) -> Result<bool, String> {
         let _guard = meter
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Configuration owns the process boundary. Keep fetching edits while stopped; the
+        // Console will send an empty effective set after acknowledging the disable receipt.
+        // Do not report stale non-empty work as a failure in that short transition.
+        if options.state_dir.join("xray.disabled").exists() && !desired.rules.is_empty() {
+            return Ok(true);
+        }
         let _deadline = crate::xray_grpc::deadline_after(
             options
                 .state_dir
@@ -71,12 +77,16 @@ fn run_round(options: &Options, meter: &Mutex<()>) -> Result<bool, String> {
                 .then_some(Duration::from_secs(1)),
         );
         let report = reconcile(&options.state_dir, &desired);
-        let usage = collect_usage(&options.state_dir);
+        let usage = if options.state_dir.join("xray.disabled").exists() {
+            None
+        } else {
+            Some(collect_usage(&options.state_dir))
+        };
         (report, usage)
     };
-    if let Ok(usage_report) = usage {
+    if let Some(Ok(usage_report)) = usage {
         spool_push(FORWARDING_USAGE_SPOOL, &options.state_dir, &usage_report)?;
-    } else if let Err(error) = usage {
+    } else if let Some(Err(error)) = usage {
         eprintln!("forwarding usage: {error}");
     }
     let complete = report.error.is_none();

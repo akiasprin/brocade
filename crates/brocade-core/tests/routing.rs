@@ -540,6 +540,7 @@ fn node(id: &str, public_ipv4: Option<&str>, overlay: [u8; 4], egress_allowed: b
     Node {
         mtu: None,
         connection: Default::default(),
+        xray_enabled: true,
         retired: false,
         id: id.to_owned(),
         tenant: "platform.acme".to_owned(),

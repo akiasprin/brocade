@@ -523,6 +523,9 @@ pub struct Node {
     pub api_port: Option<u16>,
     pub overlay: bool,
     pub egress_allowed: bool,
+    /// Whether the managed Xray service may run. Configuration remains editable while stopped.
+    #[serde(default = "default_xray_enabled")]
+    pub xray_enabled: bool,
     pub dns: Dns,
     /// See [`DomainStrategy`].
     pub domain_strategy: DomainStrategy,
@@ -548,6 +551,10 @@ pub struct Node {
     /// `settings.connection`.
     #[serde(default)]
     pub connection: NodeConnection,
+}
+
+pub fn default_xray_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -2386,6 +2386,70 @@ function WgTransportRow({
   );
 }
 
+export function XrayCard({
+  node,
+  canEdit,
+  onSaved,
+}: {
+  node: NodeAgentStateItem;
+  canEdit: boolean;
+  onSaved: () => void;
+}) {
+  const qc = useQueryClient();
+  const model = useDraftNode(node.node_id);
+  const current = model?.xray_enabled ?? node.xray_enabled ?? true;
+  const [staged, setStaged] = useState<boolean | null>(null);
+  const value = staged ?? current;
+  const dirty = value !== current;
+  useUnsavedChanges(dirty, `${node.name || node.node_id} 的 Xray`, `node-tab:${node.node_id}:config`);
+  const save = useMutation({
+    mutationFn: () => updateNode(node.node_id, { xray_enabled: value }),
+    onSuccess: () => {
+      setStaged(null);
+      qc.invalidateQueries({ queryKey: ['snapshot'] });
+      qc.invalidateQueries({ queryKey: ['compile'] });
+      onSaved();
+    },
+  });
+  const applied = appliedOf(node)?.xray?.state;
+  const status =
+    !current && applied === 'disabled' ? '已关闭' : current && applied === 'present' ? '已启用' : '发布后生效';
+  return (
+    <div className="panel config-panel" data-draft-panel={nodeDraftPanelKey(node.node_id, 'xray')}>
+      <header>
+        <PanelTitle of="xray">XRAY</PanelTitle>
+      </header>
+      <div className="fgrid one">
+        <Row k="Xray 服务">
+          <SegSwitch
+            checked={value}
+            disabled={!canEdit || save.isPending}
+            onChange={setStaged}
+            off="关闭"
+            on="启用"
+            ariaLabel="Xray 服务"
+          />
+          <span className="sub">{status}，配置仍可编辑。</span>
+        </Row>
+      </div>
+      {dirty && (
+        <>
+          {save.error && <ErrorBox error={save.error} />}
+          <div className="toolbar">
+            <span className="sp" />
+            <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate()}>
+              {save.isPending ? '保存中…' : '保存到草稿'}
+            </button>
+            <button className="btn" disabled={save.isPending} onClick={() => setStaged(null)}>
+              还原
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // wg 层的全部配置：MTU、入站连接方式、私钥归属。
 // 合并为一张卡片是因为它们表示的是同一项内容——该机器的 overlay 接口配置。
 // 该机器是否加入 overlay。关闭表示不生成 wg 配置、不加入任何链路，agent 会移除 wg0；
@@ -2972,8 +3036,9 @@ export function DnsCard({
             {/* xray 不支持配置热重载（见 agent/src/main.rs 中的 “xray has no config hot reload”），
                 因此该修改不是无感知的：产物重新编译后 agent 会重启 xray，连接会中断。
                 代价与修改出网权限相当，该行的说明也是同样表述。 */}
-            保存后本机的 xray.json 将重新编译为 {DOMAIN_STRATEGY_LABEL[curStrategy]}，agent 应用时会重启
-            xray，现有连接会断开。
+            {(draftNode?.xray_enabled ?? node.xray_enabled ?? true)
+              ? `保存后本机的 xray.json 将重新编译为 ${DOMAIN_STRATEGY_LABEL[curStrategy]}，agent 应用时会重启 xray，现有连接会断开。`
+              : 'Xray 已配置关闭。此处修改仍保存到草稿，发布这些修改不会启动 Xray；重新开启并发布时应用。'}
           </span>
           {save.error && <ErrorBox error={save.error} />}
           <div className="toolbar">
@@ -3068,7 +3133,9 @@ function ConnectionCard({
 
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
 
-  const fromModel = useDraftNode(node.node_id)?.connection;
+  const draftNode = useDraftNode(node.node_id);
+  const fromModel = draftNode?.connection;
+  const xrayEnabled = draftNode?.xray_enabled ?? node.xray_enabled ?? true;
   // 快照尚未返回，或较旧的控制面不包含该字段时，视为未覆盖任何一项，而非使整张卡报错——
   // 四项均显示全局值、标题显示「跟全局一样」，与该情况下的实际状态一致。
   const mine = fromModel ?? node.connection ?? EMPTY_NODE_CONNECTION;
@@ -3190,7 +3257,9 @@ function ConnectionCard({
           <span className="sub" style={{ color: 'var(--gold)' }}>
             {/* 运行时配置更新只增删入站/出站/路由规则，不包含 policy 块
                 （见 brocade-deployment/src/hotswap.rs），因此该修改必然触发一次重启。 */}
-            保存后本机的 xray.json 将重新编译，agent 应用时会重启 xray，现有连接会断开。
+            {xrayEnabled
+              ? '保存后本机的 xray.json 将重新编译，agent 应用时会重启 xray，现有连接会断开。'
+              : 'Xray 已配置关闭。此处修改仍保存到草稿，发布这些修改不会启动 Xray；重新开启并发布时应用。'}
           </span>
           {save.error && <ErrorBox error={save.error} />}
           <div className="toolbar">
@@ -4081,7 +4150,7 @@ export function runtimeFindings(
   const xv = xrayVer(v?.xray);
   const xrayTooOld =
     xv !== null && (xv[0] < XRAY_GEODATA_MIN[0] || (xv[0] === XRAY_GEODATA_MIN[0] && xv[1] < XRAY_GEODATA_MIN[1]));
-  if (xrayTooOld) {
+  if (xrayTooOld && appliedOf(node)?.xray?.state !== 'disabled') {
     out.push({
       tone: 'bad',
       // `detailOnly`：版本号在列表中不构成可操作信息——「xray 25.9」既不说明问题所在
@@ -6438,7 +6507,7 @@ export function NodeDetail({
             </div>
 
             <TrafficAccountingCard node={n} canEdit={system} />
-            {system && <SourceAccessPanel key={`source-access:${id}`} nodeId={id} editable={system} />}
+            <XrayCard node={n} canEdit={system} onSaved={onSaved} />
             <WgCard
               node={n}
               listenPort={wgListenPort}
@@ -6448,6 +6517,7 @@ export function NodeDetail({
               canEdit={system}
               onSaved={onSaved}
             />
+            {system && <SourceAccessPanel key={`source-access:${id}`} nodeId={id} editable={system} />}
           </div>
 
           <div>

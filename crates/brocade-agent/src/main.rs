@@ -1583,7 +1583,7 @@ fn health(state_dir: &Path) -> Result<(), String> {
             }
         }
     } else if state_dir.join("xray.disabled").exists() {
-        report("xray", "disabled", "这台没有 xray 工作负载");
+        report("xray", "disabled", "Xray 已按最近应用的期望状态关闭");
     } else {
         failures += 1;
         report("xray", "MISSING", "状态目录里没有 xray.json，还没收敛过");

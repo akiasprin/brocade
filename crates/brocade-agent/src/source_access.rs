@@ -166,6 +166,9 @@ struct Receipt {
 }
 
 fn confirmed(dir: &Path, desired: &SourceAccessDesired) -> Result<bool, String> {
+    if dir.join("xray.disabled").exists() {
+        return Err(SourceAccessWaitReason::XrayDisabled.message().into());
+    }
     let expected = policy_path(
         &std::fs::canonicalize(dir).map_err(|_| "source access state directory unavailable")?,
     );
@@ -346,6 +349,32 @@ mod tests {
             synchronization(&report).connected_interval(),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn disabled_xray_retains_source_policies_and_reports_an_explicit_wait() {
+        let dir =
+            std::env::temp_dir().join(format!("brocade-source-disabled-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy = SourceAccessDesired {
+            revision: 4,
+            node_ips: vec!["192.0.2.1".into()],
+            users: vec![],
+        };
+        persist(&dir, &policy).unwrap();
+        std::fs::write(dir.join("xray.disabled"), "operator disabled").unwrap();
+        let report = observation(&dir, &policy);
+        assert_eq!(report.revision, 4);
+        assert!(report.supported);
+        assert_eq!(
+            report.error.as_deref(),
+            Some(SourceAccessWaitReason::XrayDisabled.message())
+        );
+        assert!(SourceAccessWaitReason::matches_message(
+            report.error.as_deref().unwrap()
+        ));
+        assert_eq!(saved(&dir).unwrap().unwrap(), policy);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

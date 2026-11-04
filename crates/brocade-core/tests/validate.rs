@@ -4897,6 +4897,7 @@ fn node(
     Node {
         mtu: None,
         connection: Default::default(),
+        xray_enabled: true,
         retired: false,
         id: id.to_owned(),
         tenant: tenant.to_owned(),

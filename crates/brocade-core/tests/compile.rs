@@ -463,6 +463,106 @@ fn a_front_drops_via_entries_whose_ingress_was_retired_away() {
     );
 }
 
+#[test]
+fn xray_can_stop_without_retiring_and_keeps_edits_for_reenable() {
+    let mut doc = snapshot(vec![node("hk", [10, 66, 0, 1], Dns::System)]);
+    doc.apps = vec![app("a", "c-a", "i-a", 443, any_egress())];
+    let before = compile(&doc).project_node("hk").unwrap();
+    let mut old = serde_json::to_value(&doc.nodes[0]).unwrap();
+    old.as_object_mut().unwrap().remove("xray_enabled");
+    assert!(serde_json::from_value::<Node>(old).unwrap().xray_enabled);
+    doc.nodes[0].xray_enabled = false;
+    let stopped = compile(&doc);
+    assert!(stopped.can_publish(), "{:#?}", stopped.diagnostics);
+    let plan = stopped.project_node("hk").unwrap();
+    assert_eq!(plan.wireguard, before.wireguard);
+    assert_eq!(plan.phantun, before.phantun);
+    assert!(plan.xray.is_none());
+    assert!(plan.hy2_port_hops.is_empty());
+    assert!(stopped.project_grants("hk").unwrap().is_none());
+    assert!(stopped
+        .project_user("platform.acme", "alice")
+        .unwrap()
+        .entries
+        .is_empty());
+    // Editing the dormant model must neither start Xray nor discard new settings.
+    doc.nodes[0].dns = Dns::Servers(vec!["1.1.1.1".into()]);
+    doc.apps[0].ingresses[0].port = 8443;
+    assert!(compile(&doc).project_node("hk").unwrap().xray.is_none());
+    let roundtrip: ModelSnapshot =
+        serde_json::from_value(serde_json::to_value(&doc).unwrap()).unwrap();
+    assert_eq!(roundtrip, doc);
+    doc.nodes[0].xray_enabled = true;
+    let resumed = compile(&doc).project_node("hk").unwrap().xray.unwrap();
+    assert_eq!(resumed.inbounds[0].port, 8443);
+    assert_eq!(resumed.dns, doc.nodes[0].dns);
+    assert_eq!(doc.apps[0].grants.len(), 1);
+}
+
+#[test]
+fn stopped_xray_in_a_branch_or_shared_listener_pauses_dependents() {
+    use brocade_core::model::{ListenerDial, ListenerRef};
+    let mut doc = snapshot(vec![
+        node("hk", [10, 66, 0, 1], Dns::System),
+        node("sg", [10, 66, 0, 2], Dns::System),
+    ]);
+    doc.nodes[1].xray_enabled = false;
+    let mut owner = app("a", "c-a", "i-a", 443, any_egress());
+    owner.steps[0].rules.insert(
+        0,
+        Rule {
+            dest_match: DestMatch::Any,
+            action: Action::Forward {
+                to: "sg".into(),
+                dial: HopDial::default(),
+                pool: HopPool::None,
+            },
+        },
+    );
+    let caller = app(
+        "b",
+        "c-b",
+        "i-b",
+        8443,
+        Rule {
+            dest_match: DestMatch::Any,
+            action: Action::ReuseListener {
+                listener: ListenerRef {
+                    chain: "c-a".into(),
+                    node: "hk".into(),
+                },
+                dial: ListenerDial::Overlay,
+                pool: HopPool::None,
+            },
+        },
+    );
+    doc.apps = vec![caller, owner];
+    let output = compile(&doc);
+    assert!(output.can_publish(), "{:#?}", output.diagnostics);
+    assert_eq!(
+        brocade_core::ir::routing::xray_disabled_chains(&doc)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["c-a", "c-b"]
+    );
+    assert!(output
+        .unpublishable_view()
+        .apps
+        .iter()
+        .all(|app| app.ingresses.is_empty() && app.steps.is_empty()));
+    assert_eq!(doc.apps[1].steps[0].rules.len(), 2);
+    let detached = doc.apps.remove(0);
+    let mut diagnostics = Vec::new();
+    let direct = brocade_core::ir::routing::compile_app(&doc, &detached, &mut diagnostics);
+    assert!(direct.ingresses.is_empty() && direct.chains.is_empty());
+    doc.apps.insert(0, detached);
+    doc.apps.reverse();
+    assert_eq!(
+        brocade_core::ir::routing::xray_disabled_chains(&doc).len(),
+        2
+    );
+}
+
 fn snapshot(nodes: Vec<Node>) -> ModelSnapshot {
     ModelSnapshot {
         revision: 51,
@@ -484,6 +584,7 @@ fn node(id: &str, overlay: [u8; 4], dns: Dns) -> Node {
     Node {
         mtu: None,
         connection: Default::default(),
+        xray_enabled: true,
         retired: false,
         id: id.to_owned(),
         tenant: "platform.acme".to_owned(),

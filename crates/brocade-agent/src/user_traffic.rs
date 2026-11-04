@@ -580,6 +580,10 @@ pub(crate) fn spawn(options: Options) -> Result<(), String> {
             if let Err(error) = initialize(&options) {
                 eprintln!("user traffic initialization: {error}");
             }
+            if options.state_dir.join("xray.disabled").exists() {
+                thread::sleep(Duration::from_secs(15));
+                continue;
+            }
             let ready = supported(&options.state_dir).unwrap_or(false);
             let report = if ready { "true" } else { "false" };
             if let Ok(client) = HttpClient::new(&options.server) {

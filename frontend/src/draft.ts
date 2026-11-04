@@ -131,6 +131,7 @@ export type ModelOp =
         wg_listen_port?: number;
         api_port?: number | null;
         overlay?: boolean;
+        xray_enabled?: boolean;
         egress_allowed?: boolean;
         dns?: Dns;
         domain_strategy?: DomainStrategy;

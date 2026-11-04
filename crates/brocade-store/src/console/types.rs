@@ -23,6 +23,9 @@ pub type RedactedModelSnapshot = Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsoleSnapshot {
+    /// Global compiler decision, including dependencies through shared listeners.
+    #[serde(default)]
+    pub xray_disabled_chains: Vec<String>,
     pub snapshot: RedactedModelSnapshot,
     /// Machine-owned DNS policies, repeated beside the redacted model for the console's
     /// narrow TypeScript snapshot declaration. The canonical copy also lives in ModelSnapshot so
@@ -113,6 +116,8 @@ pub struct NodeAgentStateItem {
     #[serde(default)]
     pub initialization: Option<crate::NodeInitialization>,
     pub node_id: String,
+    #[serde(default = "brocade_core::model::default_xray_enabled")]
+    pub xray_enabled: bool,
     pub tenant_id: String,
     pub name: String,
     pub public_ipv4: Option<String>,
@@ -1048,6 +1053,8 @@ pub struct UpdateNodeRequest {
     pub api_port: Option<u16>,
     #[serde(default)]
     pub overlay: Option<bool>,
+    #[serde(default)]
+    pub xray_enabled: Option<bool>,
     #[serde(default)]
     pub egress_allowed: Option<bool>,
     #[serde(default)]

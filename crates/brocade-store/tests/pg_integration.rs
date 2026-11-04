@@ -30333,3 +30333,6 @@ mod unlock_probe_tests;
 
 #[path = "cases/unlock_migration_consolidation.rs"]
 mod unlock_migration_consolidation_tests;
+
+#[path = "cases/node_xray.rs"]
+mod node_xray_tests;

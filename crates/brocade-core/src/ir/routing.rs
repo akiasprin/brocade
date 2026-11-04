@@ -302,7 +302,7 @@ where
         nodes: doc
             .nodes
             .iter()
-            .filter(|node| !node.retired)
+            .filter(|node| !node.retired && node.xray_enabled)
             .map(|node| AppNode {
                 id: node.id.clone(),
                 tenant: node.tenant.clone(),
@@ -345,14 +345,15 @@ where
         hops: Vec::new(),
     };
 
-    let retired = doc
-        .nodes
-        .iter()
-        .filter(|node| node.retired)
-        .map(|node| node.id.as_str())
-        .collect::<BTreeSet<_>>();
     let chain_roots = chain_roots(app, diagnostics);
-    let disabled_chains = disabled_chains(app, &retired, &chain_roots);
+    let disabled = xray_disabled_chains_in(
+        doc,
+        doc.apps
+            .iter()
+            .filter(|candidate| candidate.id != app.id)
+            .chain(std::iter::once(app)),
+    );
+    let disabled_chains = disabled.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let live_ingresses = app
         .ingresses
         .iter()
@@ -541,6 +542,73 @@ fn disabled_chains<'a>(
         .collect()
 }
 
+/// Preserve the editable model while removing unavailable Xray paths from every projection.
+/// Listener references may cross projects and form cycles, so propagate unavailability to a
+/// fixed point instead of depending on project traversal order.
+pub fn xray_disabled_chains(doc: &model::ModelSnapshot) -> BTreeSet<String> {
+    xray_disabled_chains_in(doc, &doc.apps)
+}
+
+fn xray_disabled_chains_in<'a>(
+    doc: &model::ModelSnapshot,
+    apps: impl IntoIterator<Item = &'a model::AppView>,
+) -> BTreeSet<String> {
+    let apps = apps.into_iter().collect::<Vec<_>>();
+    let unavailable = doc
+        .nodes
+        .iter()
+        .filter(|node| node.retired || !node.xray_enabled)
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if unavailable.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut disabled = BTreeSet::new();
+    for app in &apps {
+        let roots = selected_chain_roots(app);
+        disabled.extend(
+            disabled_chains(app, &unavailable, &roots)
+                .into_iter()
+                .map(str::to_owned),
+        );
+    }
+    loop {
+        let before = disabled.len();
+        for app in &apps {
+            for (chain, root) in selected_chain_roots(app) {
+                let mut queue = VecDeque::from([(chain.to_owned(), root.node.clone())]);
+                let mut seen = BTreeSet::new();
+                while let Some((owner_chain, node)) = queue.pop_front() {
+                    if !seen.insert((owner_chain.clone(), node.clone())) {
+                        continue;
+                    }
+                    if unavailable.contains(node.as_str()) || disabled.contains(&owner_chain) {
+                        disabled.insert(chain.to_owned());
+                        break;
+                    }
+                    for owner in &apps {
+                        for step in steps_at(owner, &owner_chain, &node) {
+                            for rule in &step.rules {
+                                match &rule.action {
+                                    Action::Forward { to, .. } => {
+                                        queue.push_back((owner_chain.clone(), to.clone()))
+                                    }
+                                    Action::ReuseListener { listener, .. } => queue
+                                        .push_back((listener.chain.clone(), listener.node.clone())),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if before == disabled.len() {
+            return disabled;
+        }
+    }
+}
+
 /// Resolve every chain's head once, before any compilation decision consumes it.
 ///
 /// The head is a machine, not an ingress: it is where the walk along Forwards begins. So several
@@ -644,7 +712,7 @@ fn is_live_ingress(
 ) -> bool {
     !node_by_id
         .get(ingress.node.as_str())
-        .is_some_and(|node| node.retired)
+        .is_some_and(|node| node.retired || !node.xray_enabled)
         && !disabled_chains.contains(ingress.chain.as_str())
 }
 
@@ -738,26 +806,16 @@ fn reachable_reused_listeners(
 pub(crate) fn reachable_listener_roots_across_apps(
     doc: &model::ModelSnapshot,
 ) -> BTreeSet<(String, String)> {
-    let retired = doc
-        .nodes
-        .iter()
-        .filter(|node| node.retired)
-        .map(|node| node.id.as_str())
-        .collect::<BTreeSet<_>>();
+    let disabled = xray_disabled_chains(doc);
     let mut owners = BTreeMap::<&str, &model::AppView>::new();
     let mut roots = BTreeMap::<&str, &model::Ingress>::new();
-    let mut disabled = BTreeSet::<&str>::new();
 
     for app in &doc.apps {
         let app_roots = selected_chain_roots(app);
-        let app_disabled = disabled_chains(app, &retired, &app_roots);
         for chain in &app.chains {
             // PostgreSQL makes chain ids globally unique. Keep the first occurrence deterministic
             // for malformed in-memory snapshots; validation still reports the duplicate ids.
             owners.entry(chain.id.as_str()).or_insert(app);
-            if app_disabled.contains(chain.id.as_str()) {
-                disabled.insert(chain.id.as_str());
-            }
             if let Some(root) = app_roots.get(chain.id.as_str()) {
                 roots.entry(chain.id.as_str()).or_insert(*root);
             }

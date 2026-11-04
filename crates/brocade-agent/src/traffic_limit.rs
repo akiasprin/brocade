@@ -318,6 +318,11 @@ pub(crate) fn apply_application(
     if !enabled {
         return Ok(());
     }
+    if dir.join("xray.disabled").exists() {
+        return Err(LimitApplyError::Waiting(
+            "Xray 已关闭，应用层限速已保存，等待重新启用".into(),
+        ));
+    }
     let config = fs::read_to_string(dir.join("xray.json")).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             LimitApplyError::Waiting("等待 Xray 启动以确认应用层限速".into())

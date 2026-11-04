@@ -5,6 +5,7 @@ import { navigate } from './route';
 
 export const NODE_DRAFT_PANELS = {
   identity: { label: '身份', tab: 'config' },
+  xray: { label: 'XRAY', tab: 'config' },
   wireguard: { label: 'WIREGUARD', tab: 'config' },
   dns: { label: 'DNS', tab: 'config' },
   connection: { label: '连接策略', tab: 'config' },
@@ -50,6 +51,7 @@ export function nodeDraftLocations(
           panels.add('identity');
         else if (['wg_listen_port', 'mtu', 'overlay', 'wg_transport'].includes(key)) panels.add('wireguard');
         else if (key === 'dns' || key === 'domain_strategy') panels.add('dns');
+        else if (key === 'xray_enabled') panels.add('xray');
         else if (key === 'connection') panels.add('connection');
         else panels.add('config');
       }

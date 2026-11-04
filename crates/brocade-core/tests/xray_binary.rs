@@ -2776,6 +2776,7 @@ fn node(id: &str, overlay: [u8; 4]) -> Node {
         egress_allowed: true,
         dns: Dns::System,
         domain_strategy: DomainStrategy::default(),
+        xray_enabled: true,
         retired: false,
     }
 }

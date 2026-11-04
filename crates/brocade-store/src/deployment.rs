@@ -4772,7 +4772,7 @@ async fn restore_node_tx(
         "INSERT INTO nodes (
             id, tenant_id, name, public_ipv4, public_ipv6, overlay_addr,
             wg_private_key, wg_public_key, wg_listen_port,
-            api_port, overlay, egress_allowed,
+            api_port, overlay, egress_allowed, xray_enabled,
             dns_kind, dns_servers, created_revision, mtu, wg_transport,
             public_ipv4_nat, public_ipv6_nat, domain_strategy, retired_at,
             conn_idle_secs, conn_uplink_only_secs, conn_downlink_only_secs, conn_buffer_size_kb
@@ -4780,7 +4780,7 @@ async fn restore_node_tx(
          VALUES (
             $1, $2, $3, $4, $5, $6::inet,
             $7, $8, $9,
-            $10, $11, $12,
+            $10, $11, $12, $26,
             $13, $14, $15, $16, $17,
             $18, $19, $21,
             CASE WHEN $20::boolean THEN now() ELSE NULL END,
@@ -4797,6 +4797,7 @@ async fn restore_node_tx(
             wg_listen_port = EXCLUDED.wg_listen_port,
             api_port = EXCLUDED.api_port,
             overlay = EXCLUDED.overlay,
+            xray_enabled = EXCLUDED.xray_enabled,
             egress_allowed = EXCLUDED.egress_allowed,
             dns_kind = EXCLUDED.dns_kind,
             dns_servers = EXCLUDED.dns_servers,
@@ -4837,6 +4838,7 @@ async fn restore_node_tx(
     .bind(conn_secs(node.connection.uplink_only_secs))
     .bind(conn_secs(node.connection.downlink_only_secs))
     .bind(conn_secs(node.connection.buffer_size_kb))
+    .bind(node.xray_enabled)
     .execute(&mut **tx)
     .await?;
     if let Some(label_id) = &node.certificate_group_id {

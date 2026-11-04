@@ -50,12 +50,19 @@ const masked = (ip: string | null) =>
       ? `${ip.split(':').slice(0, 2).join(':')}:***`
       : ip.replace(/\.\d+\.\d+$/, '.***.***');
 
+const xrayEnabled = params.get('xray') !== 'off';
 const snapshot = (): ConsoleSnapshot =>
   ({
     snapshot: {
       revision: 41,
       apps: [],
-      nodes: machines.map(machine => ({ id: machine.id, tenant: 'platform', name: machine.name, overlay: true })),
+      nodes: machines.map(machine => ({
+        id: machine.id,
+        tenant: 'platform',
+        name: machine.name,
+        overlay: true,
+        xray_enabled: xrayEnabled,
+      })),
     },
     node_egress_dns: [],
     redacted: who.masked_assets,
@@ -152,12 +159,29 @@ globalThis.fetch = async (input, init) => {
       active: [],
       events: [],
     });
+  if (path === '/certs')
+    return json({
+      sealing_available: false,
+      domain: null,
+      groups: [],
+      nodes: [],
+      scan: null,
+      letsencrypt: '',
+      letsencrypt_staging: '',
+    });
+  if (/^\/nodes\/[^/]+\/source-access$/.test(path)) return json({ revision: 1, ips: [], nodes: [], user_bans: [] });
   if (path === '/model/snapshot') return json(snapshot());
   if (path === '/nodes/agent-state')
     return json({
       nodes: machines.map(machine => {
         const state = agentState(machine, now);
-        return { ...state, public_ipv4: masked(state.public_ipv4), public_ipv6: masked(state.public_ipv6) };
+        return {
+          ...state,
+          xray_enabled: xrayEnabled,
+          applied: xrayEnabled ? state.applied : { ...state.applied, xray: { state: 'disabled' } },
+          public_ipv4: masked(state.public_ipv4),
+          public_ipv6: masked(state.public_ipv6),
+        };
       }),
     });
   if (

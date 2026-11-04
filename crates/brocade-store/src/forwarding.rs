@@ -532,6 +532,7 @@ pub async fn overview(
                 COALESCE(sum(s.downlink_bytes), 0)::bigint AS downlink_bytes,
                 CASE
                   WHEN NOT e.enabled OR NOT r.enabled OR owner.status <> 'active' THEN 'disabled'
+                  WHEN applied.xray_state = 'disabled' THEN 'xray-paused'
                   WHEN owner.service_suspended THEN 'service-paused'
                   WHEN COALESCE(q.suspended,false) THEN 'quota-paused'
                   WHEN state.reported_at < now() - interval '90 seconds' THEN 'unknown'
@@ -549,7 +550,8 @@ pub async fn overview(
                        AND state.applied_rule_ids @> jsonb_build_array(r.id) THEN 'active'
                   ELSE 'pending'
                 END AS runtime_status,
-                CASE WHEN result.value->'rule' = jsonb_build_object(
+                CASE WHEN applied.xray_state = 'disabled' THEN NULL
+                  WHEN result.value->'rule' = jsonb_build_object(
                     'id',r.id,'protocol',r.protocol,'listen_port',r.listen_port,
                     'target_host',r.target_host,'target_port',r.target_port,
                       'allow_private_targets',e.allow_private_targets)
@@ -558,12 +560,13 @@ pub async fn overview(
            JOIN forwarding_entitlements e
              ON e.tenant_id = r.tenant_id AND e.user_id = r.user_id AND e.node_id = r.node_id
            JOIN users owner ON owner.tenant_id=r.tenant_id AND owner.id=r.user_id
+           LEFT JOIN node_applied_state applied ON applied.node_id = r.node_id
            LEFT JOIN forwarding_node_state state ON state.node_id = r.node_id
            LEFT JOIN LATERAL (SELECT state.rule_results->r.id::text AS value) result ON TRUE
            LEFT JOIN forwarding_node_quotas q ON q.tenant_id=r.tenant_id AND q.user_id=r.user_id AND q.node_id=r.node_id
            LEFT JOIN forwarding_usage_rollups s ON s.rule_id = r.id
           WHERE r.tenant_id = $1 AND r.user_id = $2 AND r.deleted_at IS NULL
-          GROUP BY r.id, e.enabled, e.allow_private_targets, owner.status, owner.service_suspended, q.suspended, state.reconcile_status,
+          GROUP BY r.id, applied.xray_state, e.enabled, e.allow_private_targets, owner.status, owner.service_suspended, q.suspended, state.reconcile_status,
                    state.applied_generation, state.desired_generation, state.applied_rule_ids,
                    state.rule_results, state.reported_at, result.value
           ORDER BY r.created_at, r.id",
@@ -958,6 +961,7 @@ async fn desired_for_node_tx(
            LEFT JOIN forwarding_node_quotas q ON q.tenant_id=r.tenant_id AND q.user_id=r.user_id AND q.node_id=r.node_id
           WHERE r.node_id = $1 AND r.deleted_at IS NULL AND r.enabled
             AND e.enabled AND NOT COALESCE(q.suspended,false) AND u.status = 'active' AND NOT u.service_suspended AND n.retired_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM node_applied_state applied WHERE applied.node_id=n.id AND applied.xray_state='disabled')
             AND r.listen_port BETWEEN e.listen_port_start AND e.listen_port_end
             AND (r.protocol NOT IN ('tcp', 'tcp_udp') OR e.tcp_allowed)
             AND (r.protocol NOT IN ('udp', 'tcp_udp') OR e.udp_allowed)

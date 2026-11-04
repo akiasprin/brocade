@@ -1342,6 +1342,7 @@ fn node(id: &str, public_ipv4: &str, overlay: [u8; 4], dns: Dns) -> Node {
         egress_allowed: true,
         dns,
         domain_strategy: DomainStrategy::default(),
+        xray_enabled: true,
         retired: false,
     }
 }

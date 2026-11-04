@@ -281,6 +281,7 @@ fn node(id: &str, public_ipv4: &str, overlay: [u8; 4]) -> Node {
     Node {
         mtu: None,
         connection: Default::default(),
+        xray_enabled: true,
         retired: false,
         id: id.to_owned(),
         tenant: "platform.acme".to_owned(),

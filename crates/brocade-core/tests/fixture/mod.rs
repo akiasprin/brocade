@@ -62,6 +62,7 @@ fn model_node(node: &Value, system_nodes: &BTreeMap<String, SystemNodeFixture>) 
     Node {
         mtu: None,
         connection: Default::default(),
+        xray_enabled: true,
         retired: false,
         id: id.to_owned(),
         tenant: str_value(&node["tenant"]).to_owned(),

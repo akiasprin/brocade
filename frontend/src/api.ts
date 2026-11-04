@@ -628,6 +628,7 @@ export interface NodeAgentStateItem {
   // 是否显式写有 Egress，允许出网的中继同样可能只做转发。与 overlay 一致：修改时当前值
   // 读取编译视图（经过草稿预览的那一份），此字段是编译结果尚未返回时的回退值。
   egress_allowed: boolean;
+  xray_enabled?: boolean;
   // 该机器的 DNS 解析器及其解析结果的使用方式。两者都是模型字段而非 agent 观测值，
   // 在此返回是为了详情页能够显示和修改——此前它们只出现在建机器表单中。
   dns: Dns;
@@ -1362,7 +1363,8 @@ export interface ForwardingRule {
   target_host: string;
   target_port: ForwardingPort;
   enabled: boolean;
-  runtime_status: 'active' | 'pending' | 'error' | 'disabled' | 'quota-paused' | 'service-paused' | 'unknown';
+  runtime_status:
+    'active' | 'pending' | 'error' | 'disabled' | 'quota-paused' | 'service-paused' | 'xray-paused' | 'unknown';
   runtime_error?: string | null;
   uplink_bytes: number;
   downlink_bytes: number;
@@ -1783,9 +1785,7 @@ export const setQuota = (body: { tenant_id: string; user_id: string; app_id: str
   });
 
 // ── 应用层：项目 / 链 / 接入面 ──
-// 机器是否运行 xray 由计算得出（physical/node.rs 的 xray_plan：inbounds 来自该机器上的
-// 接入面，outbounds 来自链的转发边），因此使节点运行 xray 的方式是为其创建链和接入面，
-// 而不是在节点上增加开关。创建项目需要 system-admin，链和接入面需要 editor。
+// 机器 Xray 开关属于模型配置，经草稿提交和配置发布生效。
 // 请求体只声明当前支持的字段；服务端忽略新增字段以兼容滚动升级。
 export interface ModelWriteResult {
   revision_id: number;
@@ -3342,6 +3342,7 @@ export const deleteFront = (appId: string, frontId: string, expectedRevision: nu
     }),
   );
 export interface ConsoleSnapshot {
+  xray_disabled_chains?: string[];
   /* 服务端返回完整的 ModelSnapshot，此处只声明需要使用的部分——完整声明相当于在浏览器中
      维护第二份模型定义，最终会与 model.rs 产生差异。 */
   snapshot: {
@@ -3363,6 +3364,7 @@ export interface ConsoleSnapshot {
       public_ipv6_nat?: boolean;
       overlay?: boolean;
       egress_allowed?: boolean;
+      xray_enabled?: boolean;
       certificate_group_id?: string | null;
       certificate_name?: string | null;
       /** 当前服务证书实际使用的签发轨道。它与 certificate_name 同源，不能根据域名或 issuer 猜测。 */
@@ -4845,6 +4847,7 @@ export const updateNode = (
     api_port?: number | null;
     overlay?: boolean;
     egress_allowed?: boolean;
+    xray_enabled?: boolean;
     dns?: Dns;
     domain_strategy?: DomainStrategy;
     /* 0 表示清空并回退到全局默认值；字段不出现表示不修改 */

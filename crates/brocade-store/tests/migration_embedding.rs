@@ -42,7 +42,7 @@ fn repository_preserves_all_published_migrations() {
             .iter()
             .map(|source| source.version)
             .collect::<Vec<_>>(),
-        [1, 2, 3, 4]
+        [1, 2, 3, 4, 5]
     );
     // v0.3.5 shipped this complete chain; all four SQLx checksums are immutable.
     let published_checksums = [

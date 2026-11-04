@@ -103,6 +103,7 @@ pub struct SourceAccessObservation {
 #[derive(Debug, Clone, Copy)]
 pub enum SourceAccessWaitReason {
     Configuration,
+    XrayDisabled,
     SplitHandoff,
     GenerationSwitch,
     Receipt,
@@ -112,6 +113,7 @@ pub enum SourceAccessWaitReason {
 impl SourceAccessWaitReason {
     pub const fn message(self) -> &'static str {
         match self {
+            Self::XrayDisabled => "Xray 已关闭，来源策略已保存，等待重新启用",
             Self::Configuration => "等待 Xray 接入配置",
             Self::SplitHandoff => "XHTTP 独立下载入口交接中，等待旧代退出后确认来源策略",
             Self::GenerationSwitch => "Xray 代际正在切换，等待接入策略确认",
@@ -123,6 +125,7 @@ impl SourceAccessWaitReason {
     pub fn matches_message(message: &str) -> bool {
         [
             Self::Configuration,
+            Self::XrayDisabled,
             Self::SplitHandoff,
             Self::GenerationSwitch,
             Self::Receipt,

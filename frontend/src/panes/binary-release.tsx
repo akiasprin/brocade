@@ -37,7 +37,14 @@ import {
 
 const agentHash = (node: NodeAgentStateItem) => node.agent_version?.replace(/^brocade-agent\//, '') ?? null;
 const runningHash = (node: NodeAgentStateItem, component: BinaryComponent) =>
-  component === 'agent' ? agentHash(node) : node.runtime_versions?.xray_running_sha256;
+  component === 'agent'
+    ? agentHash(node)
+    : xrayStopped(node)
+      ? node.runtime_versions?.xray_installed_sha256
+      : node.runtime_versions?.xray_running_sha256;
+const xrayStopped = (node: NodeAgentStateItem) =>
+  (node.applied as { xray?: { state?: string } } | null)?.xray?.state === 'disabled' &&
+  !node.runtime_versions?.xray_running_sha256;
 function baseEligible(node: NodeAgentStateItem, component: BinaryComponent) {
   if (component === 'agent')
     return node.lifecycle_phase === 'active' && node.desired_poll_fresh && /^[0-9a-f]{64}$/.test(agentHash(node) ?? '');
@@ -48,7 +55,7 @@ function baseEligible(node: NodeAgentStateItem, component: BinaryComponent) {
     node.desired_poll_fresh &&
     node.runtime_report_fresh &&
     !!installed &&
-    running === installed
+    (running === installed || xrayStopped(node))
   );
 }
 
@@ -63,7 +70,8 @@ function handoffStrategyEligible(node: NodeAgentStateItem) {
 
 function eligible(node: NodeAgentStateItem, component: BinaryComponent, strategy: XrayReleaseStrategy) {
   return (
-    baseEligible(node, component) && (component !== 'xray' || strategy === 'restart' || handoffStrategyEligible(node))
+    baseEligible(node, component) &&
+    (component !== 'xray' || strategy === 'restart' || xrayStopped(node) || handoffStrategyEligible(node))
   );
 }
 
@@ -75,6 +83,7 @@ function unavailableReason(node: NodeAgentStateItem, component: BinaryComponent,
   const installed = node.runtime_versions?.xray_installed_sha256;
   const running = node.runtime_versions?.xray_running_sha256;
   if (!installed) return '还没上报 Xray 摘要；先发布支持该能力的 Agent';
+  if (xrayStopped(node)) return '';
   if (!running) return 'Xray 当前未运行';
   if (running !== installed) return '运行中 Xray 与受管路径不一致；先完成本地收敛';
   if (strategy !== 'restart' && !handoffStrategyEligible(node)) {

@@ -4094,6 +4094,7 @@ fn node(id: &str, overlay: [u8; 4], egress_allowed: bool, dns: Dns) -> Node {
     Node {
         mtu: None,
         connection: Default::default(),
+        xray_enabled: true,
         retired: false,
         id: id.to_owned(),
         tenant: "platform.acme".to_owned(),

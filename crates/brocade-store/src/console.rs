@@ -74,9 +74,13 @@ pub(crate) fn snapshot_view(snapshot: ModelSnapshot) -> Result<ConsoleSnapshot> 
             resolution: policy.resolution,
         })
         .collect();
+    let xray_disabled_chains = brocade_core::ir::routing::xray_disabled_chains(&snapshot)
+        .into_iter()
+        .collect();
     let mut value = serde_json::to_value(snapshot)?;
     redact_private_keys(&mut value);
     Ok(ConsoleSnapshot {
+        xray_disabled_chains,
         snapshot: value,
         node_egress_dns,
         redacted: true,
@@ -3154,6 +3158,7 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 n.public_ipv6_nat,
                 n.mtu,
                 n.overlay,
+                n.xray_enabled,
                 n.egress_allowed,
                 n.dns_kind,
                 n.dns_servers,
@@ -3271,6 +3276,7 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 n.public_ipv6_nat,
                 n.mtu,
                 n.overlay,
+                n.xray_enabled,
                 n.egress_allowed,
                 n.dns_kind,
                 n.dns_servers,
@@ -3545,6 +3551,7 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
         usage_generation_id: row.try_get("usage_generation_id")?,
         xray_started_at: row.try_get("xray_started_at")?,
         overlay: row.try_get("overlay")?,
+        xray_enabled: row.try_get("xray_enabled")?,
         egress_allowed: row.try_get("egress_allowed")?,
         mtu: row
             .try_get::<Option<i32>, _>("mtu")?

@@ -740,7 +740,7 @@ async fn load_nodes(pool: &PgPool) -> Result<Vec<Node>> {
     let rows = sqlx::query(
         "SELECT id, tenant_id, name, public_ipv4, public_ipv6, public_ipv4_nat, public_ipv6_nat, overlay_addr::text AS overlay_addr, \
             wg_private_key, wg_public_key, wg_listen_port, api_port, \
-            overlay, egress_allowed, dns_kind, dns_servers, domain_strategy, mtu, wg_transport, \
+            overlay, xray_enabled, egress_allowed, dns_kind, dns_servers, domain_strategy, mtu, wg_transport, \
             conn_idle_secs, conn_uplink_only_secs, conn_downlink_only_secs, conn_buffer_size_kb, \
             (retired_at IS NOT NULL) AS retired, \
             -- The machine's SNI: its group's name, and only once that group actually serves a
@@ -788,7 +788,7 @@ async fn load_nodes_tx(tx: &mut Transaction<'_, Postgres>) -> Result<Vec<Node>> 
     let rows = sqlx::query(
         "SELECT id, tenant_id, name, public_ipv4, public_ipv6, public_ipv4_nat, public_ipv6_nat, overlay_addr::text AS overlay_addr, \
             wg_private_key, wg_public_key, wg_listen_port, api_port, \
-            overlay, egress_allowed, dns_kind, dns_servers, domain_strategy, mtu, wg_transport, \
+            overlay, xray_enabled, egress_allowed, dns_kind, dns_servers, domain_strategy, mtu, wg_transport, \
             conn_idle_secs, conn_uplink_only_secs, conn_downlink_only_secs, conn_buffer_size_kb, \
             (retired_at IS NOT NULL) AS retired, \
             -- The machine's SNI: its group's name, and only once that group actually serves a
@@ -897,6 +897,7 @@ fn node_from_row(row: &sqlx::postgres::PgRow) -> Result<Node> {
         // A decommissioned node is materialized all the same: it still has to receive a
         // desired state turning all four configuration artifacts off. See the note in model.rs.
         retired: row.try_get("retired")?,
+        xray_enabled: row.try_get("xray_enabled")?,
         mtu: optional_port(row.try_get::<Option<i32>, _>("mtu")?)?,
         connection: NodeConnection {
             conn_idle_secs: node_conn("conn_idle_secs")?,

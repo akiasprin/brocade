@@ -522,6 +522,7 @@ pub(crate) async fn update_node_tx(
              wg_listen_port = COALESCE($8, wg_listen_port),
              api_port = CASE WHEN $9::boolean THEN $10 ELSE api_port END,
              overlay = COALESCE($11, overlay),
+             xray_enabled = COALESCE($27, xray_enabled),
              egress_allowed = COALESCE($12, egress_allowed),
              dns_kind = COALESCE($13, dns_kind),
              dns_servers = COALESCE($14, dns_servers),
@@ -537,7 +538,7 @@ pub(crate) async fn update_node_tx(
              created_revision = COALESCE(created_revision, $15)
          WHERE id = $1
            AND ROW(tenant_id, name, public_ipv4, public_ipv6, wg_listen_port, api_port,
-                   overlay, egress_allowed, dns_kind, dns_servers, domain_strategy, mtu,
+                   overlay, xray_enabled, egress_allowed, dns_kind, dns_servers, domain_strategy, mtu,
                    wg_transport, public_ipv4_nat, public_ipv6_nat,
                    conn_idle_secs, conn_uplink_only_secs, conn_downlink_only_secs,
                    conn_buffer_size_kb)
@@ -549,6 +550,7 @@ pub(crate) async fn update_node_tx(
                    COALESCE($8, wg_listen_port),
                    CASE WHEN $9::boolean THEN $10 ELSE api_port END,
                    COALESCE($11, overlay),
+                   COALESCE($27, xray_enabled),
                    COALESCE($12, egress_allowed),
                    COALESCE($13, dns_kind),
                    COALESCE($14, dns_servers),
@@ -597,6 +599,7 @@ pub(crate) async fn update_node_tx(
     .bind(conn_secs(connection.uplink_only_secs))
     .bind(conn_secs(connection.downlink_only_secs))
     .bind(conn_secs(connection.buffer_size_kb))
+    .bind(request.xray_enabled)
     .execute(&mut **tx)
     .await?
     .rows_affected()
