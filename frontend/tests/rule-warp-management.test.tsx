@@ -219,14 +219,15 @@ describe('tunnel navigation from forwarding rules', () => {
     expect(window.location.hash).toBe('#/tunnels/warp/warp-8f3a-2d71');
   });
 
-  it('sends resource creation and editing to the tunnel page', () => {
+  it('opens local outbound creation without staging an unused resource', () => {
     const view = renderEditor([{ m: { t: 'any' }, a: { t: 'proxy', outbound: warp.id } }]);
 
     fireEvent.click(view.getByRole('button', { name: /Cloudflare WARP/ }));
     expect(view.queryByRole('button', { name: '删除 供应商出口' })).toBeNull();
-    fireEvent.click(view.getByRole('button', { name: '管理隧道' }));
+    fireEvent.click(view.getByRole('button', { name: '新建代理出站' }));
 
-    expect(window.location.hash).toBe('#/tunnels');
+    expect(view.getByRole('textbox', { name: '分享链接' })).toBeTruthy();
+    expect(draft.ops()).toHaveLength(0);
   });
 
   it('lets the operator finish the current machine WARP identity without leaving the rule', async () => {

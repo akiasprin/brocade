@@ -1,6 +1,7 @@
 import {
   Fragment,
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useId,
@@ -10,7 +11,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { createPortal } from 'react-dom';
+import { ChoiceSelect, MenuLayer, menuArrowKey } from '../ui/choice-menu';
 import { HOP_WIRE_OPTIONS, hopWireLabel, type HopWireKind } from '../ui/format';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -285,6 +286,7 @@ interface RuleDraftHandle {
   /* 将组件内状态同步写入可跨页面保留的浏览器草稿所需的完整操作。 */
   stage: string;
   save: () => Promise<unknown>;
+  reset: () => void;
   // 该表对应的链和机器、草稿内容、链的当前状态和链头。
   // 判断哪些节点不再被引用需要整条链的规则表，单张表无法读取其他表的草稿
   // （见 orphansAfter 的注释），因此由总线收集完整后再计算。
@@ -346,18 +348,25 @@ function DraftSaveToolbar({
   saving,
   canSave,
   onSave,
+  onReset,
 }: {
   hint?: string;
   status: string;
   saving: boolean;
   canSave: boolean;
   onSave: () => void;
+  onReset?: () => void;
 }) {
   return (
-    <div className="toolbar">
+    <div className="toolbar rule-draft-save">
       {hint && <span className="note">{hint}</span>}
       <span className="sp" />
       <span className="note">{status}</span>
+      {onReset && canSave && (
+        <button className="btn" disabled={saving} onClick={onReset}>
+          还原
+        </button>
+      )}
       <button className="btn primary" disabled={saving || !canSave} onClick={onSave}>
         {saving ? '保存中…' : '保存到草稿'}
       </button>
@@ -549,6 +558,10 @@ export function RuleDraftScope({
         }
         saving={saving}
         canSave={pending.length > 0 && !blocked}
+        onReset={() => {
+          for (const handle of pending) handle.reset();
+          setError(null);
+        }}
         onSave={() => void saveAll()}
       />
     </RuleDraftCtx.Provider>
@@ -635,7 +648,7 @@ export function MachineEgressDnsControls({
   const label = (name: string) => `${name}${accessibleSuffix}`;
   const options = resolution && (
     <>
-      <select
+      <ChoiceSelect
         className="f words egress-dns-transport"
         aria-label={label('传输')}
         title="传输"
@@ -649,8 +662,8 @@ export function MachineEgressDnsControls({
       >
         <option value="tcp">TCP</option>
         <option value="udp">UDP</option>
-      </select>
-      <select
+      </ChoiceSelect>
+      <ChoiceSelect
         className="f words egress-dns-family"
         aria-label={label('地址策略')}
         title="地址策略"
@@ -667,8 +680,8 @@ export function MachineEgressDnsControls({
         <option value="use_ipv6v4">UseIPv6v4</option>
         <option value="use_ipv4">UseIPv4</option>
         <option value="use_ipv6">UseIPv6</option>
-      </select>
-      <select
+      </ChoiceSelect>
+      <ChoiceSelect
         className="f words egress-dns-fallback"
         aria-label={label('失败处理')}
         title="失败处理"
@@ -682,13 +695,13 @@ export function MachineEgressDnsControls({
       >
         <option value="stop">停止连接</option>
         <option value="machine">回退机器 DNS</option>
-      </select>
+      </ChoiceSelect>
     </>
   );
   return (
     <>
       {showChoice && (
-        <select
+        <ChoiceSelect
           className="f words egress-dns-choice"
           aria-label={label('DNS 解析方式')}
           value={resolution ? 'custom' : 'machine'}
@@ -701,7 +714,7 @@ export function MachineEgressDnsControls({
           <option value="custom" disabled={!supported}>
             自定义 DNS 解析
           </option>
-        </select>
+        </ChoiceSelect>
       )}
       {showEditor && resolution && supported && (
         <span className="egress-dns-editor">
@@ -1083,7 +1096,7 @@ export function MachineEgressDnsRules({
                         </>
                       ) : (
                         <>
-                          <select
+                          <ChoiceSelect
                             className="f"
                             aria-label={`DNS 匹配类型${suffix}`}
                             disabled={row.resolution === null}
@@ -1102,7 +1115,7 @@ export function MachineEgressDnsRules({
                                 </option>
                               ),
                             )}
-                          </select>
+                          </ChoiceSelect>
                           <input
                             className="f rule-new-dns-value"
                             aria-label={`DNS 匹配内容${suffix}`}
@@ -1201,14 +1214,14 @@ export function MachineEgressDnsRules({
             <div className="node-dns-import-body">
               <label>
                 <span>来源节点</span>
-                <select className="f" value={sourceNode} onChange={event => setSourceNode(event.target.value)}>
+                <ChoiceSelect className="f" value={sourceNode} onChange={event => setSourceNode(event.target.value)}>
                   <option value="">选择来源节点</option>
                   {sourceNodes.map(node => (
                     <option key={node.id} value={node.id}>
                       {node.name || node.id}
                     </option>
                   ))}
-                </select>
+                </ChoiceSelect>
               </label>
               <p className="note">
                 {sourceNode ? `将导入 ${importedPolicies.length} 条策略，` : '选择来源节点后，'}
@@ -1915,7 +1928,11 @@ export function seedHopIn(
   };
 }
 
+export type RuleEditorSection = 'rules' | 'links' | 'dns';
+
 type RuleEditorProps = {
+  section?: RuleEditorSection;
+  onDirtyChange?: (dirty: boolean) => void;
   appId: string;
   chainId: string;
   nodeId: string;
@@ -1941,6 +1958,7 @@ type RuleEditorProps = {
   onClose?: () => void;
   /* 由上层持有的共享草稿。不传入时由本组件自行管理（机器详情页中一台机器只出现一次，不需要共享）。 */
   shared?: {
+    reset?: () => void;
     outbounds: ExternalOutbound[];
     setOutbounds: (next: ExternalOutbound[]) => void;
     rules: Rule[];
@@ -2028,6 +2046,8 @@ function RuleEditorReady({
   saves = true,
   readOnly = false,
   editorDisabled,
+  section,
+  onDirtyChange,
 }: RuleEditorProps & { editorDisabled: boolean }) {
   const qc = useQueryClient();
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
@@ -2045,86 +2065,12 @@ function RuleEditorReady({
       (outbound.protocol.t !== 'warp' && chainTenant.startsWith(`${outbound.tenant}.`)),
   );
   const globalRelayMux = snapshot.data?.snapshot.settings?.relay_mux ?? DEFAULT_HOP_MUX;
+  const [creatingFor, setCreatingFor] = useState<number | null>(null);
   const [muxEditor, setMuxEditor] = useState<MuxEditorState | null>(null);
   const [targetPickerRule, setTargetPickerRule] = useState<number | null>(null);
   const [targetPickerView, setTargetPickerView] = useState<TargetPickerView>({ t: 'targets' });
   const [targetQuery, setTargetQuery] = useState('');
   const targetPickerRoot = useRef<HTMLSpanElement>(null);
-  const targetMenu = useRef<HTMLFieldSetElement>(null);
-  const [targetMenuPlacement, setTargetMenuPlacement] = useState<TargetMenuPlacement>({
-    below: false,
-    left: 0,
-    top: 0,
-    width: TARGET_MENU_WIDTH,
-    maxHeight: TARGET_MENU_MAX_HEIGHT,
-  });
-  useEffect(() => {
-    if (targetPickerRule === null) return;
-    const closeOutside = (event: PointerEvent) => {
-      if (event.target instanceof Node && targetPickerRoot.current?.contains(event.target)) return;
-      if (event.target instanceof Node && targetMenu.current?.contains(event.target)) return;
-      setTargetPickerRule(null);
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setTargetPickerRule(null);
-    };
-    document.addEventListener('pointerdown', closeOutside, true);
-    document.addEventListener('keydown', closeOnEscape);
-    return () => {
-      document.removeEventListener('pointerdown', closeOutside, true);
-      document.removeEventListener('keydown', closeOnEscape);
-    };
-  }, [targetPickerRule]);
-  /* 这是可搜索、可分组且带「新建」动作的自定义菜单，浏览器不会像处理原生
-     <select> 那样替它选择展开方向。点击时先按可用空间选择一次方向；展开后搜索只更新
-     可用高度，不跨过触发器翻面。滚动或缩放使原方向不可用时才切换。 */
-  useLayoutEffect(() => {
-    if (targetPickerRule === null) return;
-    const place = () => {
-      const root = targetPickerRoot.current;
-      const menu = targetMenu.current;
-      if (!root || !menu) return;
-      const rootRect = root.getBoundingClientRect();
-      const wanted = Math.min(TARGET_MENU_MAX_HEIGHT, Math.max(TARGET_MENU_MIN_HEIGHT, menu.scrollHeight + 2));
-      setTargetMenuPlacement(current => {
-        // The click handler chooses the side before mounting. Keep it while filtering changes the
-        // menu height; moving a live menu across the trigger looks like browser focus jumped.
-        const next = placeTargetMenu(rootRect, current.below, wanted);
-        return current.below === next.below &&
-          current.left === next.left &&
-          current.top === next.top &&
-          current.width === next.width &&
-          current.maxHeight === next.maxHeight
-          ? current
-          : next;
-      });
-    };
-    place();
-    // Provider submenus load their own catalogue and can change height without rerendering this
-    // editor. Observe content changes so an asynchronously populated menu is not stuck at its
-    // loading-message height. Attribute updates from placement itself are deliberately ignored.
-    const contentObserver = new MutationObserver(place);
-    if (targetMenu.current)
-      contentObserver.observe(targetMenu.current, { childList: true, subtree: true, characterData: true });
-    window.addEventListener('resize', place);
-    window.addEventListener('scroll', place, true);
-    window.visualViewport?.addEventListener('resize', place);
-    window.visualViewport?.addEventListener('scroll', place);
-    return () => {
-      contentObserver.disconnect();
-      window.removeEventListener('resize', place);
-      window.removeEventListener('scroll', place, true);
-      window.visualViewport?.removeEventListener('resize', place);
-      window.visualViewport?.removeEventListener('scroll', place);
-    };
-  }, [
-    targetPickerRule,
-    targetPickerView,
-    targetQuery,
-    externalOutbounds.length,
-    peers.length,
-    snapshot.data?.snapshot.apps,
-  ]);
   // 两份草稿（规则表、各转发目标的中转端口）默认由本组件持有；`shared` 非空时交由上层持有，
   // 因为同一台机器在树中出现两次时，两处编辑的必须是同一份——它们对应库中的同一条记录
   // （steps 主键为 chain_id + node_id）。
@@ -2429,6 +2375,9 @@ function RuleEditorReady({
     /* 反向接入的端口开在本机，修改它同样需要启用保存按钮 */
     (reverseTargets.length > 0 && hopInChanged(hopInBody(nodeId), selfHopIn));
   const dirty = structuralDirty || dnsChanges.length > 0 || dnsOrderDirty;
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
 
   const bus = useContext(RuleDraftCtx);
   // Read-only tables still derive repairable defaults (for example terminal ordering or a missing
@@ -2534,6 +2483,18 @@ function RuleEditorReady({
     },
   });
 
+  const reset = useCallback(() => {
+    if (shared?.reset) {
+      shared.reset();
+      return;
+    }
+    (shared?.setRules ?? ownRules[1])(pinTerminalRules(JSON.parse(initialRulesKey) as Rule[]));
+    (shared?.setHops ?? ownHops[1])(JSON.parse(initialHopsKey) as HopsDraft);
+    (shared?.setDns ?? ownDnsOverrides[1])({});
+    (shared?.setDnsOrder ?? ownDnsOrder[1])(null);
+    (shared?.setOutbounds ?? ownOutbounds[1])([]);
+  }, [initialRulesKey, initialHopsKey, shared, ownRules, ownHops, ownDnsOverrides, ownDnsOrder, ownOutbounds]);
+
   const handleId = useId();
   const stepsKey = JSON.stringify(steps ?? []);
   // The tree can construct a fresh empty array while a newly referenced step has not been saved
@@ -2568,6 +2529,7 @@ function RuleEditorReady({
       structuralDirty,
       stage: stagePlanKey,
       save: () => saveAsync({}),
+      reset,
       appId,
       chainId,
       nodeId,
@@ -2590,6 +2552,7 @@ function RuleEditorReady({
     registeredSteps,
     root,
     saveAsync,
+    reset,
     saves,
     stagePlanKey,
     structuralDirty,
@@ -2748,12 +2711,136 @@ function RuleEditorReady({
   const addSniffingFallback = () =>
     setRules(pinTerminalRules([...rules, { m: { t: 'sniffing_failed' }, a: defaultRuleAction() }]));
 
+  const renderDialControls = (r: Rule, i: number) => {
+    if (!isRelayAction(r.a)) return null;
+    const to = r.a.t === 'forward' ? r.a.to : r.a.listener.node;
+    const referenced = r.a.t === 'reuse_listener' ? listenerOf(r.a.listener) : null;
+    const peer = peerOf(to);
+    const targetAddrs = publicAddrsFor(to);
+    const dial = forwardDial(r.a);
+    const dk = r.a.t === 'reuse_listener' ? listenerDialKindOf(r.a.dial) : dialKindOf(dial, targetAddrs);
+    const customHost = r.a.t === 'reuse_listener' ? listenerHostOf(r.a.dial) : hostOf(dial);
+    return (
+      <span className="rule-dial-fields">
+        {r.a.t === 'reuse_listener' && referenced?.local ? (
+          <span className="listener-local-route mono">本机内部 · 回环:{referenced.step.hop_in?.port}</span>
+        ) : (
+          <ChoiceSelect
+            className="f"
+            value={dk}
+            aria-label="连接路径"
+            title="这一跳连接目标监听的地址"
+            onChange={e =>
+              r.a.t === 'reuse_listener'
+                ? setReferenceDial(i, r.a.listener, e.target.value as ListenerDialKind)
+                : setDial(i, to, e.target.value as DialKind)
+            }
+          >
+            {(r.a.t === 'reuse_listener' ? LISTENER_DIAL_ORDER : DIAL_ORDER).map(k => (
+              <option
+                key={k}
+                value={k}
+                data-group={k.startsWith('reverse') ? '反向连回本机' : k === 'custom' ? '其他' : '本机连到'}
+                data-badge={
+                  {
+                    public_ipv4: 'IPV4',
+                    public_ipv6: 'IPV6',
+                    overlay: 'WG',
+                    reverse_v4: 'REV4',
+                    reverse_v6: 'REV6',
+                    custom: 'ADDR',
+                  }[k]
+                }
+                disabled={dialUnavailable(k, targetAddrs, r.a.t === 'reuse_listener' ? null : selfAddrs)}
+              >
+                {DIAL_LABEL[k].replace(/^走 (?:XRAY )?/, '')}
+              </option>
+            ))}
+          </ChoiceSelect>
+        )}
+        {/* 前三档的地址由推导得出，只读；仅自定义档需要手动填写 */}
+        {r.a.t === 'reuse_listener' && referenced?.local ? null : dk === 'overlay' ? (
+          // 与公网两档一样直接显示地址。显示为「XX 的 overlay 地址」会要求
+          // 到其他位置查询该值——而它就在编译结果中，可直接获取。
+          // 获取失败只有一种情况：该机器尚未加入 overlay，这正是需要说明的内容。
+          <span className="mono dim">
+            {ruleAddress(overlayOf(to)) || (
+              <span style={{ color: 'var(--gold)' }}>{referenced?.nodeName || peer?.name || to} 不在 overlay 里</span>
+            )}
+          </span>
+        ) : dk === 'public_ipv4' ? (
+          <span className="mono dim">
+            {ruleAddress(publicIpv4Of(targetAddrs)) || (
+              <span style={{ color: 'var(--gold)' }}>这台机器没有可直连的公网 IPv4</span>
+            )}
+          </span>
+        ) : dk === 'public_ipv6' ? (
+          <span className="mono dim">
+            {ruleAddress(publicIpv6Of(targetAddrs)) || (
+              <span style={{ color: 'var(--gold)' }}>这台机器没有可直连的公网 IPv6</span>
+            )}
+          </span>
+        ) : dk === 'reverse_v4' || dk === 'reverse_v6' ? (
+          // 与前三档一样由推导得出，只读。显示的是本机的接入地址——
+          // 对端从该地址接入。连接由哪一方发起、通道如何建立属于传输层的内容，
+          // 界面不涉及。
+          <span className="mono dim">
+            {ruleAddress(selfPublicHostOf(dk === 'reverse_v6' ? 'v6' : 'v4')) || (
+              <span style={{ color: 'var(--gold)' }}>
+                这台机器没有可直连的{dk === 'reverse_v6' ? '公网 IPv6' : '公网 IPv4'}
+              </span>
+            )}
+          </span>
+        ) : (
+          <>
+            <input
+              className="f mono"
+              placeholder="10.0.0.9 / 2001:db8::9"
+              value={customHost}
+              onChange={e => {
+                if (r.a.t === 'reuse_listener') {
+                  setDialForListener(r.a.listener, { t: 'addr', v: e.target.value }, i);
+                } else {
+                  const port = Number(hopOf(to).port) || hopBase;
+                  setDialForTarget(to, { t: 'addr', v: formatHostPort(e.target.value, port) }, i);
+                }
+              }}
+            />
+            {natPublicHostOf(targetAddrs, customHost) && (
+              <span className="sub" style={{ color: 'var(--gold)' }}>
+                该地址为 {natPublicHostOf(targetAddrs, customHost)} 且标记为经 NAT，编译会拒绝。
+              </span>
+            )}
+          </>
+        )}
+      </span>
+    );
+  };
+  const dialControlsFor = (to: string) => {
+    const index = rules.findIndex(rule => rule.a.t === 'forward' && rule.a.to === to);
+    return index < 0 ? null : renderDialControls(rules[index], index);
+  };
+  const dnsCandidates = [
+    ...new Map(
+      rules
+        .filter(rule =>
+          section
+            ? supportsEgressDns(rule.m) && !effectiveDnsFor(rule.m)
+            : rule.a.t === 'egress' || supportsEgressDns(rule.m),
+        )
+        .map(rule => [egressDnsSelectorKey(rule.m), rule.m]),
+    ).values(),
+  ];
+  const showRules = !section || section === 'rules';
+  const showLinks = !section || section === 'links';
+  const showDns = !section || section === 'dns';
+
   return (
     <>
       {/* 使用 `fieldset` 仅为其 disabled 属性（它是 HTML 中唯一能一次禁用整棵子树
           表单控件的元素），因此样式上重置为无视觉效果的一层，见 styles.css 的 .rule-ro。 */}
-      <fieldset className="panel rule-editor rule-ro" disabled={readOnly}>
-        <div className="toolbar" style={{ marginBottom: 6 }}>
+      <fieldset className="panel rule-editor rule-ro" data-section={section} disabled={readOnly}>
+        <div className="toolbar" hidden={!!section} style={{ marginBottom: 6 }}>
           <b className="mono">
             {chainId} / {nodeId}
           </b>
@@ -2765,7 +2852,10 @@ function RuleEditorReady({
           )}
         </div>
 
-        <table className={`tbl rule-table rule-editor-table${readOnly ? ' rule-editor-readonly' : ''}`}>
+        <table
+          hidden={!showRules}
+          className={`tbl rule-table rule-editor-table${readOnly ? ' rule-editor-readonly' : ''}`}
+        >
           <colgroup>
             <col className="rule-number-column" />
             <col className="rule-match-column" />
@@ -2790,11 +2880,7 @@ function RuleEditorReady({
               const to = r.a.t === 'forward' ? r.a.to : r.a.t === 'reuse_listener' ? r.a.listener.node : '';
               const referenced = r.a.t === 'reuse_listener' ? listenerOf(r.a.listener) : null;
               const externalId = r.a.t === 'proxy' ? r.a.outbound : '';
-              const dial = forwardDial(r.a);
               const peer = peerOf(to);
-              const targetAddrs = r.a.t === 'reuse_listener' ? publicAddrsFor(to) : peer;
-              const dk = r.a.t === 'reuse_listener' ? listenerDialKindOf(r.a.dial) : dialKindOf(dial, targetAddrs);
-              const customHost = r.a.t === 'reuse_listener' ? listenerHostOf(r.a.dial) : hostOf(dial);
               const external = externalOutbounds.find(outbound => outbound.id === externalId) ?? null;
               const targetBadge = external
                 ? externalProtocolBadge(external.protocol.t)
@@ -2819,7 +2905,7 @@ function RuleEditorReady({
                     </td>
                     <td className="rule-match-cell">
                       <span className="rule-match-fields">
-                        <select
+                        <ChoiceSelect
                           className="f words"
                           aria-label={`匹配类型（规则 ${i + 1}）`}
                           value={r.m.t}
@@ -2832,6 +2918,14 @@ function RuleEditorReady({
                             <option
                               key={k.t}
                               value={k.t}
+                              data-group={
+                                ['geosite', 'domain_suffix', 'domain_keyword', 'domain_regex'].includes(k.t)
+                                  ? '域名'
+                                  : ['geoip', 'ip_cidr'].includes(k.t)
+                                    ? 'IP'
+                                    : '兜底'
+                              }
+                              data-detail={k.hint}
                               disabled={
                                 (k.t === 'any' && r.m.t !== 'any' && rules.some(isAnyRule)) ||
                                 (k.t === 'sniffing_failed' &&
@@ -2842,7 +2936,7 @@ function RuleEditorReady({
                               {k.label}
                             </option>
                           ))}
-                        </select>
+                        </ChoiceSelect>
                         {kind?.list !== false && r.m.t !== 'any' && (
                           <input
                             className="f mono"
@@ -2856,8 +2950,9 @@ function RuleEditorReady({
                     </td>
                     <td className="rule-action-cell">
                       <div className="rule-action-fields">
-                        <select
+                        <ChoiceSelect
                           className={`f words rule-action-select rule-action-${ruleActionTone(r.a.t)}`}
+                          aria-label={`处理方式（规则 ${i + 1}）`}
                           value={r.a.t === 'proxy' || r.a.t === 'reuse_listener' ? 'forward' : r.a.t}
                           onChange={e => {
                             const t = e.target.value as 'forward' | 'egress' | 'block';
@@ -2881,7 +2976,7 @@ function RuleEditorReady({
                           <option value="forward">转发给</option>
                           <option value="egress">从本机出网</option>
                           <option value="block">拒绝</option>
-                        </select>
+                        </ChoiceSelect>
                         {(isRelayAction(r.a) || r.a.t === 'proxy') && (
                           <span
                             className="external-target-picker"
@@ -2894,11 +2989,9 @@ function RuleEditorReady({
                               }`}
                               title={referenced?.blocked ?? undefined}
                               aria-expanded={targetPickerRule === i}
-                              onClick={event => {
+                              onClick={() => {
                                 const opening = targetPickerRule !== i;
                                 if (opening) {
-                                  const rect = event.currentTarget.getBoundingClientRect();
-                                  setTargetMenuPlacement(placeTargetMenu(rect));
                                   setTargetPickerView(
                                     r.a.t === 'reuse_listener'
                                       ? { t: 'listener-endpoints', chain: r.a.listener.chain }
@@ -2924,29 +3017,28 @@ function RuleEditorReady({
                               </span>
                               <span className="external-target-chevron">⌄</span>
                             </button>
-                            {targetPickerRule === i &&
-                              typeof document !== 'undefined' &&
-                              createPortal(
+                            {targetPickerRule === i && typeof document !== 'undefined' && (
+                              <MenuLayer
+                                anchor={targetPickerRoot}
+                                label="转发目标"
+                                onClose={() => setTargetPickerRule(null)}
+                              >
                                 <fieldset
-                                  ref={targetMenu}
+                                  onKeyDown={menuArrowKey}
                                   disabled={editorDisabled}
-                                  className={`external-target-menu${targetMenuPlacement.below ? ' below' : ''}`}
-                                  style={{
-                                    left: targetMenuPlacement.left,
-                                    top: targetMenuPlacement.top,
-                                    width: targetMenuPlacement.width,
-                                    maxHeight: targetMenuPlacement.maxHeight,
-                                  }}
+                                  className="dialog-surface external-target-menu"
                                 >
                                   {targetPickerView.t === 'targets' ? (
                                     <>
                                       <input
+                                        autoFocus
+                                        aria-label="搜索转发目标"
                                         className="f external-target-search"
                                         placeholder="搜索机器或代理出站"
                                         value={targetQuery}
                                         onChange={event => setTargetQuery(event.target.value)}
                                       />
-                                      <span className="external-target-menu-label">本链已有监听节点</span>
+                                      <span className="external-target-menu-label">BROCADE 节点</span>
                                       {[...visibleNextPeers, ...visibleInsidePeers].map(candidate => (
                                         <button
                                           type="button"
@@ -3000,7 +3092,7 @@ function RuleEditorReady({
                                           <span className="external-target-where">不能选</span>
                                         </button>
                                       ))}
-                                      <span className="external-target-menu-label">代理出站</span>
+                                      <span className="external-target-menu-label">外部出站</span>
                                       {targetMatches('VPN Gate', 'VPNGate', '国家', '地区', '节点池') && (
                                         <button
                                           type="button"
@@ -3065,17 +3157,17 @@ function RuleEditorReady({
                                       <button
                                         type="button"
                                         className="external-target-new"
-                                        aria-label="管理隧道"
+                                        aria-label="新建代理出站"
                                         onClick={() => {
                                           setTargetPickerRule(null);
-                                          navigate('tunnels');
+                                          setCreatingFor(i);
                                         }}
                                       >
                                         <Icon of="tunnels" size={12} className="external-target-new-icon" />
                                         <span className="external-target-copy">
-                                          <b>管理隧道</b>
+                                          <b>＋ 新建代理出站</b>
                                         </span>
-                                        <span className="external-target-where">新建、编辑和删除</span>
+                                        <span className="external-target-where">粘贴链接或手动填写</span>
                                       </button>
                                       <button
                                         type="button"
@@ -3087,9 +3179,9 @@ function RuleEditorReady({
                                       >
                                         <Icon of="tunnels" size={12} className="external-target-new-icon" />
                                         <span className="external-target-copy">
-                                          <b>自定义</b>
+                                          <b>↪ 复用其他链的监听</b>
                                         </span>
-                                        <span className="external-target-where">复用已有监听</span>
+                                        <span className="external-target-where">选择来源链</span>
                                       </button>
                                       {visibleNextPeers.length +
                                         visibleInsidePeers.length +
@@ -3239,113 +3331,9 @@ function RuleEditorReady({
                                       )}
                                     </>
                                   )}
-                                </fieldset>,
-                                document.body,
-                              )}
-                          </span>
-                        )}
-                        {isRelayAction(r.a) && (
-                          <span className="rule-dial-fields">
-                            {r.a.t === 'reuse_listener' && referenced?.local ? (
-                              <span className="listener-local-route mono">
-                                本机内部 · 回环:{referenced.step.hop_in?.port}
-                              </span>
-                            ) : (
-                              <select
-                                className="f"
-                                value={dk}
-                                title="这一跳连接目标监听的地址"
-                                onChange={e =>
-                                  r.a.t === 'reuse_listener'
-                                    ? setReferenceDial(i, r.a.listener, e.target.value as ListenerDialKind)
-                                    : setDial(i, to, e.target.value as DialKind)
-                                }
-                              >
-                                {(r.a.t === 'reuse_listener' ? LISTENER_DIAL_ORDER : DIAL_ORDER).map(k => (
-                                  <option
-                                    key={k}
-                                    value={k}
-                                    disabled={dialUnavailable(
-                                      k,
-                                      targetAddrs,
-                                      r.a.t === 'reuse_listener' ? null : selfAddrs,
-                                    )}
-                                  >
-                                    {DIAL_LABEL[k].replace(/^走 (?:XRAY )?/, '')}
-                                  </option>
-                                ))}
-                              </select>
+                                </fieldset>
+                              </MenuLayer>
                             )}
-                            {/* 前三档的地址由推导得出，只读；仅自定义档需要手动填写 */}
-                            {r.a.t === 'reuse_listener' && referenced?.local ? null : dk === 'overlay' ? (
-                              // 与公网两档一样直接显示地址。显示为「XX 的 overlay 地址」会要求
-                              // 到其他位置查询该值——而它就在编译结果中，可直接获取。
-                              // 获取失败只有一种情况：该机器尚未加入 overlay，这正是需要说明的内容。
-                              <span className="mono dim">
-                                {ruleAddress(overlayOf(to)) || (
-                                  <span style={{ color: 'var(--gold)' }}>
-                                    {referenced?.nodeName || peer?.name || to} 不在 overlay 里
-                                  </span>
-                                )}
-                              </span>
-                            ) : dk === 'public_ipv4' ? (
-                              <span className="mono dim">
-                                {ruleAddress(publicIpv4Of(targetAddrs)) || (
-                                  <span style={{ color: 'var(--gold)' }}>这台机器没有可直连的公网 IPv4</span>
-                                )}
-                              </span>
-                            ) : dk === 'public_ipv6' ? (
-                              <span className="mono dim">
-                                {ruleAddress(publicIpv6Of(targetAddrs)) || (
-                                  <span style={{ color: 'var(--gold)' }}>这台机器没有可直连的公网 IPv6</span>
-                                )}
-                              </span>
-                            ) : dk === 'reverse_v4' || dk === 'reverse_v6' ? (
-                              // 与前三档一样由推导得出，只读。显示的是本机的接入地址——
-                              // 对端从该地址接入。连接由哪一方发起、通道如何建立属于传输层的内容，
-                              // 界面不涉及。
-                              <span className="mono dim">
-                                {ruleAddress(selfPublicHostOf(dk === 'reverse_v6' ? 'v6' : 'v4')) || (
-                                  <span style={{ color: 'var(--gold)' }}>
-                                    这台机器没有可直连的{dk === 'reverse_v6' ? '公网 IPv6' : '公网 IPv4'}
-                                  </span>
-                                )}
-                              </span>
-                            ) : (
-                              <>
-                                <input
-                                  className="f mono"
-                                  placeholder="10.0.0.9 / 2001:db8::9"
-                                  value={customHost}
-                                  onChange={e => {
-                                    if (r.a.t === 'reuse_listener') {
-                                      setDialForListener(r.a.listener, { t: 'addr', v: e.target.value }, i);
-                                    } else {
-                                      const port = Number(hopOf(to).port) || hopBase;
-                                      setDialForTarget(to, { t: 'addr', v: formatHostPort(e.target.value, port) }, i);
-                                    }
-                                  }}
-                                />
-                                {natPublicHostOf(targetAddrs, customHost) && (
-                                  <span className="sub" style={{ color: 'var(--gold)' }}>
-                                    该地址为 {natPublicHostOf(targetAddrs, customHost)} 且标记为经 NAT，编译会拒绝。
-                                  </span>
-                                )}
-                              </>
-                            )}
-                          </span>
-                        )}
-                        {r.a.t === 'egress' && (
-                          <span className="egress-dns-reference">
-                            <MachineEgressDnsControls
-                              resolution={effectiveDnsFor(r.m)}
-                              supported={supportsEgressDns(r.m)}
-                              onChange={next => patchMachineDns(r.m, next)}
-                              readOnly={readOnly}
-                              nodeName={selfNode?.name || nodeId}
-                              accessibleSuffix={`（线路规则：${kind?.label ?? r.m.t}${matchValues(r.m) ? ` ${matchValues(r.m)}` : ''}）`}
-                              showEditor={false}
-                            />
                           </span>
                         )}
                       </div>
@@ -3495,7 +3483,7 @@ function RuleEditorReady({
           </tbody>
         </table>
 
-        <div className="toolbar rule-add-actions">
+        <div className="toolbar rule-add-actions" hidden={!showRules || readOnly}>
           <button className="btn" onClick={addRule}>
             ＋ 添加规则
           </button>
@@ -3512,13 +3500,11 @@ function RuleEditorReady({
           )}
         </div>
 
-        {rules.map((rule, ruleIndex) => {
-          if (rule.a.t !== 'proxy') return null;
-          const outboundId = rule.a.outbound;
+        {[...new Set(rules.flatMap(rule => (rule.a.t === 'proxy' ? [rule.a.outbound] : [])))].map(outboundId => {
           const outbound = externalOutbounds.find(candidate => candidate.id === outboundId);
           if (!outbound) {
             return (
-              <div className="external-outbound-summary missing" key={`external-${ruleIndex}`}>
+              <div hidden={!showLinks} className="external-outbound-summary missing" key={`external-${outboundId}`}>
                 代理出站 <code>{outboundId || '未选择'}</code> 不存在，请重新选择或创建资源。
               </div>
             );
@@ -3526,7 +3512,7 @@ function RuleEditorReady({
           const facts = externalOutboundFacts(outbound);
           const unavailable = externalUnavailableReason(outbound);
           return (
-            <section className="external-outbound-summary" key={`external-${ruleIndex}`}>
+            <section hidden={!showLinks} className="external-outbound-summary" key={`external-${outboundId}`}>
               <header>
                 <PanelTitle of="outbound">代理出站</PanelTitle>
                 <span className="external-summary-protocol">{externalOutboundProtocolLabel(outbound)}</span>
@@ -3611,7 +3597,11 @@ function RuleEditorReady({
         })}
 
         {referencedTargets.length > 0 && (
-          <div className="panel listener-reference-panel" style={{ marginTop: 10 }}>
+          <div
+            hidden={!showLinks}
+            className="panel listener-reference-panel rule-connection-panel"
+            style={{ marginTop: 10 }}
+          >
             <header>
               <PanelTitle of="chains">引用监听</PanelTitle>
               <span className="hint">这里只配置本机到目标的承载；端口、安全参数和下游规则均由源监听维护</span>
@@ -3660,6 +3650,12 @@ function RuleEditorReady({
                         </small>
                       </span>
                     </div>
+                    {referenceRule && (
+                      <div className="rule-connection-path">
+                        <span>连接路径</span>
+                        {renderDialControls(referenceRule, rules.indexOf(referenceRule))}
+                      </div>
+                    )}
                     <div className="listener-reference-facts listener-inline-facts">
                       <span>
                         <small>安全</small>
@@ -3675,7 +3671,7 @@ function RuleEditorReady({
                       </span>
                       <label>
                         <small>连接复用</small>
-                        <select
+                        <ChoiceSelect
                           className="f"
                           value={poolChoice(pool)}
                           onChange={event =>
@@ -3687,7 +3683,7 @@ function RuleEditorReady({
                               {POOL_LABEL[choice]}
                             </option>
                           ))}
-                        </select>
+                        </ChoiceSelect>
                       </label>
                       {pool.t === 'mux' && (
                         <span className="listener-reference-mux">
@@ -3719,7 +3715,11 @@ function RuleEditorReady({
           配置在此处而非对端页面，因为它属于该跳的组成部分。中转端口关联在
           `(chain, node)` 上，同一条链中多个上游连接同一目标时复用该入口配置。 */}
         {reverseTargets.length > 0 && (
-          <div className="panel listener-reference-panel hop-target-panel" style={{ marginTop: 10 }}>
+          <div
+            hidden={!showLinks}
+            className="panel listener-reference-panel hop-target-panel rule-connection-panel"
+            style={{ marginTop: 10 }}
+          >
             <header>
               <PanelTitle of="ingress">反向接入口</PanelTitle>
               <span className="hint">
@@ -3736,6 +3736,12 @@ function RuleEditorReady({
                     </b>
                   </span>
                 </div>
+                {reverseTargets.map(to => (
+                  <div className="rule-connection-path" key={to}>
+                    <span>{peerOf(to)?.name || to}</span>
+                    {dialControlsFor(to)}
+                  </div>
+                ))}
                 <div className="listener-reference-facts hop-target-facts">
                   <label className="hopfld hop-target-port">
                     <small>本机端口</small>
@@ -3748,7 +3754,7 @@ function RuleEditorReady({
                   </label>
                   <label className="hopfld hop-target-wire">
                     <small>承载协议</small>
-                    <select
+                    <ChoiceSelect
                       className="f"
                       value={hopOf(nodeId).kind}
                       onChange={event =>
@@ -3766,7 +3772,7 @@ function RuleEditorReady({
                           {option.reverseOk ? '' : ' — 反向隧道只有 VLESS 承载'}
                         </option>
                       ))}
-                    </select>
+                    </ChoiceSelect>
                   </label>
                 </div>
                 {hopOf(nodeId).kind === 'reality' && (
@@ -3804,10 +3810,13 @@ function RuleEditorReady({
         )}
 
         {normalTargets.length > 0 && (
-          <div className="panel listener-reference-panel hop-target-panel" style={{ marginTop: 10 }}>
+          <div
+            hidden={!showLinks}
+            className="panel listener-reference-panel hop-target-panel rule-connection-panel"
+            style={{ marginTop: 10 }}
+          >
             <header>
-              <PanelTitle of="chains">本链监听</PanelTitle>
-              <span className="hint">端口和协议属于目标监听；拨号和 Mux 属于当前链边</span>
+              <PanelTitle of="chains">连接</PanelTitle>
             </header>
             <div className="listener-reference-list">
               {normalTargets.map(to => {
@@ -3831,6 +3840,10 @@ function RuleEditorReady({
                         </b>
                       </span>
                     </div>
+                    <div className="rule-connection-path">
+                      <span>连接路径</span>
+                      {dialControlsFor(to)}
+                    </div>
                     <div className="listener-reference-facts hop-target-facts">
                       <label className="hopfld hop-target-port">
                         <small>目标端口</small>
@@ -3843,7 +3856,7 @@ function RuleEditorReady({
                       </label>
                       <label className="hopfld hop-target-wire">
                         <small>承载协议</small>
-                        <select
+                        <ChoiceSelect
                           className="f"
                           value={h.kind}
                           onChange={event =>
@@ -3855,11 +3868,11 @@ function RuleEditorReady({
                               {option.label}
                             </option>
                           ))}
-                        </select>
+                        </ChoiceSelect>
                       </label>
                       <label className="hopfld hop-target-pool">
                         <small>连接复用</small>
-                        <select
+                        <ChoiceSelect
                           className="f"
                           value={poolChoice(pool)}
                           onChange={event => {
@@ -3872,7 +3885,7 @@ function RuleEditorReady({
                               {POOL_LABEL[choice]}
                             </option>
                           ))}
-                        </select>
+                        </ChoiceSelect>
                       </label>
                       {pool.t === 'mux' && (
                         <span className="hopfld hop-target-mux">
@@ -3958,8 +3971,32 @@ function RuleEditorReady({
           </div>
         )}
 
+        {section === 'links' &&
+          forwardTargets.length + referencedTargets.length + rules.filter(rule => rule.a.t === 'proxy').length ===
+            0 && <p className="rule-empty-note">这台机器没有到其他目标的连接。</p>}
+        {showDns && dnsCandidates.length > 0 && (
+          <div className="rule-dns-choices">
+            {dnsCandidates.map(selector => (
+              <label key={egressDnsSelectorKey(selector)}>
+                <span className="mono">{matchValues(selector)}</span>
+                <MachineEgressDnsControls
+                  resolution={effectiveDnsFor(selector)}
+                  supported={supportsEgressDns(selector)}
+                  onChange={next => patchMachineDns(selector, next)}
+                  readOnly={readOnly}
+                  nodeName={selfNode?.name || nodeId}
+                  showEditor={false}
+                  accessibleSuffix={`（线路规则：${MATCH_KINDS.find(kind => kind.t === selector.t)?.label ?? selector.t}${matchValues(selector) ? ` ${matchValues(selector)}` : ''}）`}
+                />
+              </label>
+            ))}
+          </div>
+        )}
+        {section === 'dns' && orderedNodeDnsPolicies.length === 0 && (
+          <p className="rule-empty-note">这台机器没有 DNS 解析策略。</p>
+        )}
         {orderedNodeDnsPolicies.length > 0 && (
-          <section className="machine-dns-section" aria-label="DNS 解析策略">
+          <section hidden={!showDns} className="machine-dns-section" aria-label="DNS 解析策略">
             <header className="machine-dns-heading">
               <b>DNS 解析策略</b>
               <span className="note">整机生效</span>
@@ -4059,18 +4096,46 @@ function RuleEditorReady({
 
         {/* 整块常驻，只读时由外层 `fieldset disabled` 一并禁用：按角色隐藏会使只读视角
           看不到这张表可以增行和保存，页面读起来像是一份静态清单。 */}
-        <div className="toolbar">
+        <div className="toolbar" hidden={!!bus}>
           <span className="sp" />
           {/* 位于规则树中时按钮统一收敛到末尾，此处只保留该表已修改的标记 */}
           {bus ? (
             dirty && <span className="st st-warn">有改动，未落草稿</span>
           ) : (
-            <button className="btn primary" disabled={save.isPending || !dirty} onClick={() => save.mutate({})}>
-              {save.isPending ? '保存中…' : '保存到草稿'}
-            </button>
+            <>
+              <button
+                className="btn"
+                disabled={!dirty || save.isPending}
+                onClick={() => {
+                  reset();
+                  save.reset();
+                }}
+              >
+                还原
+              </button>
+              <button className="btn primary" disabled={save.isPending || !dirty} onClick={() => save.mutate({})}>
+                {save.isPending ? '保存中…' : '保存到草稿'}
+              </button>
+            </>
           )}
         </div>
       </fieldset>
+      {creatingFor !== null && (
+        <ExternalOutboundEditor
+          tenantId={chainTenant}
+          existing={null}
+          existingIds={new Set(externalOutbounds.map(outbound => outbound.id))}
+          deferStage
+          onClose={() => setCreatingFor(null)}
+          onSaved={outbound => {
+            const rule = rules[creatingFor];
+            if (!rule || editorDisabled || readOnly) return;
+            setPendingOutbounds([...pendingOutbounds, outbound]);
+            patch(creatingFor, { ...rule, a: { t: 'proxy', outbound: outbound.id } });
+            setCreatingFor(null);
+          }}
+        />
+      )}
       {muxEditor && (
         <MuxConfigDrawer
           targetName={muxEditor.targetName || peerOf(muxEditor.to)?.name || muxEditor.to}
@@ -5864,6 +5929,7 @@ export function ExternalOutboundEditor({
                 <span className="external-form-value">
                   <textarea
                     className="f mono external-share-link"
+                    aria-label="分享链接"
                     placeholder="anytls://… / vless://… / ss://… / socks5://… / https://…"
                     value={shareLink}
                     onChange={event => {

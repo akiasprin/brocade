@@ -10,7 +10,8 @@ export const NARROW_QUERY = `(max-width: ${NARROW_MAX}px)`;
 
 import { useSyncExternalStore } from 'react';
 
-const mql = (): MediaQueryList | null => (typeof window === 'undefined' ? null : window.matchMedia(NARROW_QUERY));
+const mql = (): MediaQueryList | null =>
+  typeof window === 'undefined' || typeof window.matchMedia !== 'function' ? null : window.matchMedia(NARROW_QUERY);
 
 /* wm/store.ts 这类不在 React 中的模块直接调用它 */
 export function isNarrow(): boolean {

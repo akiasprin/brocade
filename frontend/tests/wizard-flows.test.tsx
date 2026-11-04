@@ -1,3 +1,4 @@
+import { changeControl } from './choice-helpers';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -1595,7 +1596,7 @@ describe('新建链向导', () => {
     fireEvent.change(view.getByRole('textbox', { name: '香港边缘 第 1 条匹配取值' }), {
       target: { value: 'netflix' },
     });
-    fireEvent.change(view.getByRole('combobox', { name: /DNS 解析方式.*第 1 条/ }), {
+    changeControl(view.getByRole('combobox', { name: /DNS 解析方式.*第 1 条/ }), {
       target: { value: 'custom' },
     });
     expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);

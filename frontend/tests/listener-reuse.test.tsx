@@ -1,3 +1,4 @@
+import { changeControl } from './choice-helpers';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -474,12 +475,12 @@ describe('监听规则子树复用', () => {
     const row = view.container.querySelector('.rule-table tbody tr');
     if (!(row instanceof HTMLTableRowElement)) throw new Error('没有规则行');
     const action = row.querySelector('.rule-action-select');
-    if (!(action instanceof HTMLSelectElement)) throw new Error('没有动作选择器');
-    fireEvent.change(action, { target: { value: 'forward' } });
+    if (!(action instanceof HTMLButtonElement)) throw new Error('没有动作选择器');
+    changeControl(action, { target: { value: 'forward' } });
     expect(view.queryByRole('button', { name: /新加坡共享监听 · TCP 22000/ })).toBeNull();
     expect(view.queryByRole('button', { name: /同链监听 · TCP 21001/ })).toBeNull();
-    const custom = await view.findByRole('button', { name: /自定义.*复用已有监听/ });
-    const manage = view.getByRole('button', { name: '管理隧道' });
+    const custom = await view.findByRole('button', { name: /复用其他链的监听/ });
+    const manage = view.getByRole('button', { name: '新建代理出站' });
     expect(custom.textContent).not.toContain('↗');
     expect(manage.textContent).not.toContain('↗');
     expect(custom.querySelector('.external-target-new-icon')).not.toBeNull();
@@ -487,11 +488,11 @@ describe('监听规则子树复用', () => {
     expect(custom.querySelector('.external-target-copy')).not.toBeNull();
     expect(manage.querySelector('.external-target-copy')).not.toBeNull();
     const menu = custom.closest('.external-target-menu');
-    expect(menu?.parentElement).toBe(document.body);
+    expect(menu?.closest('.dialog-layer')?.parentElement).toBe(document.body);
     expect(view.container.contains(menu)).toBe(false);
     fireEvent.click(custom);
     const crossAppSearch = view.getByPlaceholderText('跨 App 搜索链、机器或端口');
-    fireEvent.change(crossAppSearch, { target: { value: '监听项目' } });
+    changeControl(crossAppSearch, { target: { value: '监听项目' } });
     const ownerChain = view.getByRole('button', { name: /共享出口.*1 个监听端点/ });
     fireEvent.click(ownerChain);
     const choice = await view.findByRole('button', { name: /新加坡共享监听 · TCP 22000/ });
@@ -505,13 +506,13 @@ describe('监听规则子树复用', () => {
     const referencePanel = [...view.container.querySelectorAll<HTMLElement>('.listener-reference-panel')].find(panel =>
       panel.querySelector('.panel-title')?.textContent?.includes('引用监听'),
     );
-    const referencePool = referencePanel?.querySelector('select');
-    if (!(referencePool instanceof HTMLSelectElement)) throw new Error('没有引用监听的连接复用选择器');
-    fireEvent.change(referencePool, { target: { value: 'mux' } });
+    const referencePool = referencePanel?.querySelector('.listener-inline-facts [role=combobox]');
+    if (!(referencePool instanceof HTMLButtonElement)) throw new Error('没有引用监听的连接复用选择器');
+    changeControl(referencePool, { target: { value: 'mux' } });
     const referenceMux = referencePanel?.querySelector('.listener-reference-mux');
     expect(referenceMux?.textContent).toContain('Mux 参数跟随全局配置参数');
     expect(referenceMux?.parentElement?.classList.contains('listener-inline-facts')).toBe(true);
-    fireEvent.change(referencePool, { target: { value: 'none' } });
+    changeControl(referencePool, { target: { value: 'none' } });
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
 
     await waitFor(() => {

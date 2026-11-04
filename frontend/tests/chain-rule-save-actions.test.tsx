@@ -1,3 +1,4 @@
+import { changeControl } from './choice-helpers';
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -118,7 +119,7 @@ afterEach(() => {
 describe('链路规则统一保存', () => {
   it('reports incomplete DNS only on save and leaves the draft untouched', async () => {
     const view = renderScopedEditor([egress({ t: 'geosite', v: ['netflix'] })], []);
-    fireEvent.change(view.getByRole('combobox', { name: /DNS 解析方式/ }), { target: { value: 'custom' } });
+    changeControl(view.getByRole('combobox', { name: /DNS 解析方式/ }), { target: { value: 'custom' } });
     expect(view.queryByRole('alert')).toBeNull();
     const save = view.getByRole('button', { name: '保存到草稿' });
     await waitFor(() => expect((save as HTMLButtonElement).disabled).toBe(false));
@@ -127,7 +128,7 @@ describe('链路规则统一保存', () => {
     const address = view.getByRole('textbox', { name: /DNS 地址/ });
     expect(view.getByRole('alert').closest('tr')).toBe(address.closest('tr'));
     expect(draft.ops()).toHaveLength(0);
-    fireEvent.change(address, { target: { value: '192.0.2.53' } });
+    changeControl(address, { target: { value: '192.0.2.53' } });
     await waitFor(() => expect(view.queryByRole('alert')).toBeNull());
   });
 
@@ -180,7 +181,7 @@ describe('链路规则统一保存', () => {
     const match = () => view.container.querySelector<HTMLInputElement>('td.rule-match-cell input')!;
 
     await waitFor(() => expect(save().disabled).toBe(true));
-    fireEvent.change(match(), { target: { value: 'after.example' } });
+    changeControl(match(), { target: { value: 'after.example' } });
     await waitFor(() => expect(save().disabled).toBe(false));
     fireEvent.click(save());
     await waitFor(() => expect(client.getQueryData(['snapshot'])).toEqual(preview));
@@ -188,9 +189,9 @@ describe('链路规则统一保存', () => {
     expect(match().value).toBe('after.example');
     if (scoped) expect(view.getByText('没有待保存的改动')).toBeTruthy();
 
-    fireEvent.change(match(), { target: { value: 'another.example' } });
+    changeControl(match(), { target: { value: 'another.example' } });
     await waitFor(() => expect(save().disabled).toBe(false));
-    fireEvent.change(match(), { target: { value: 'after.example' } });
+    changeControl(match(), { target: { value: 'after.example' } });
     await waitFor(() => expect(save().disabled).toBe(true));
 
     act(() => {
@@ -303,10 +304,10 @@ describe('链路规则统一保存', () => {
     );
     const editors = view.container.querySelectorAll<HTMLElement>('.rule-editor');
     const dial = within(editors[0]).getByTitle('这一跳连接目标监听的地址');
-    fireEvent.change(dial, { target: { value: 'public_ipv4' } });
+    changeControl(dial, { target: { value: 'public_ipv4' } });
     const childMatch = editors[1].querySelector<HTMLInputElement>('td.rule-match-cell input');
     if (!childMatch) throw new Error('没有找到下游规则匹配值');
-    fireEvent.change(childMatch, { target: { value: 'after.example' } });
+    changeControl(childMatch, { target: { value: 'after.example' } });
 
     await waitFor(() => expect(view.getByText('2 项配置有改动')).toBeTruthy());
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
@@ -358,7 +359,7 @@ describe('链路规则统一保存', () => {
     const view = render(editor(baseline));
     const match = () => view.container.querySelector<HTMLInputElement>('td.rule-match-cell input')!;
 
-    fireEvent.change(match(), { target: { value: 'after.example' } });
+    changeControl(match(), { target: { value: 'after.example' } });
     expect(match().value).toBe('after.example');
 
     // /model/preview 返回后，props 与本地表单一致：这一刻应将新值视为已保存基线。
@@ -395,7 +396,7 @@ describe('链路规则统一保存', () => {
     const view = render(editor(baselineRelay));
     const port = () => view.getByLabelText('目标端口') as HTMLInputElement;
 
-    fireEvent.change(port(), { target: { value: '21000' } });
+    changeControl(port(), { target: { value: '21000' } });
     expect(port().value).toBe('21000');
 
     view.rerender(editor(stagedRelay));

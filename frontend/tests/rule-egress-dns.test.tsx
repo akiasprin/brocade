@@ -1,3 +1,4 @@
+import { changeControl, choiceOptions } from './choice-helpers';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -176,7 +177,7 @@ describe('machine-scoped egress DNS', () => {
   it('stages a comma-separated group using one protocol and structured addresses', async () => {
     const view = renderMachineRules();
     const address = view.getByLabelText('DNS 地址（域名后缀 netflix.com）');
-    fireEvent.change(address, { target: { value: '192.0.2.53, 2001:db8::53, 198.51.100.53' } });
+    changeControl(address, { target: { value: '192.0.2.53, 2001:db8::53, 198.51.100.53' } });
     expect((address as HTMLInputElement).value).toBe('192.0.2.53, 2001:db8::53, 198.51.100.53');
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
     await waitFor(() => expect(draft.ops().some(op => op.op === 'set_node_egress_dns')).toBe(true));
@@ -190,7 +191,7 @@ describe('machine-scoped egress DNS', () => {
     const view = renderMachineRules();
     const value = '192.0.2.1, 192.0.2.2, 192.0.2.3, 192.0.2.4';
     const address = view.getByLabelText('DNS 地址（域名后缀 netflix.com）');
-    fireEvent.change(address, { target: { value } });
+    changeControl(address, { target: { value } });
     expect((address as HTMLInputElement).value).toBe(value);
     expect(view.queryByRole('alert')).toBeNull();
     expect(address.getAttribute('aria-invalid')).toBe('false');
@@ -199,7 +200,7 @@ describe('machine-scoped egress DNS', () => {
     expect(address.getAttribute('aria-describedby')).toBe(view.getByRole('alert').id);
     expect(view.getByRole('alert').closest('.egress-dns-editor')).toBe(address.closest('.egress-dns-editor'));
     expect(draft.ops()).toHaveLength(0);
-    fireEvent.change(address, { target: { value: '192.0.2.1, 2001:db8::53' } });
+    changeControl(address, { target: { value: '192.0.2.1, 2001:db8::53' } });
     await waitFor(() => expect(view.queryByRole('alert')).toBeNull());
     expect(address.getAttribute('aria-invalid')).toBe('false');
   });
@@ -215,7 +216,7 @@ describe('machine-scoped egress DNS', () => {
     ]);
     const address = view.getByLabelText('DNS 地址（域名后缀 netflix.com）');
     expect((address as HTMLInputElement).value).toBe('192.0.2.53, 2001:db8::53');
-    fireEvent.change(address, { target: { value: '192.0.2.53,' } });
+    changeControl(address, { target: { value: '192.0.2.53,' } });
     expect((address as HTMLInputElement).value).toBe('192.0.2.53,');
     expect(view.queryByRole('alert')).toBeNull();
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
@@ -225,11 +226,11 @@ describe('machine-scoped egress DNS', () => {
 
   it('validates every policy before staging selector removals or other valid edits', async () => {
     const view = renderMachineRules();
-    fireEvent.change(view.getByLabelText('DNS 匹配内容（域名后缀 netflix.com）'), {
+    changeControl(view.getByLabelText('DNS 匹配内容（域名后缀 netflix.com）'), {
       target: { value: 'disneyplus.com' },
     });
     const address = view.getByLabelText('DNS 地址（geosite media）');
-    fireEvent.change(address, { target: { value: '' } });
+    changeControl(address, { target: { value: '' } });
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
     await waitFor(() => expect(view.getByRole('alert')).toBeTruthy());
     expect(view.getByRole('alert').closest('tr')).toBe(address.closest('tr'));
@@ -240,13 +241,13 @@ describe('machine-scoped egress DNS', () => {
     vi.spyOn(api, 'setNodeEgressDns').mockRejectedValueOnce(new Error('草稿保存失败'));
     const view = renderMachineRules();
     const address = view.getByLabelText('DNS 地址（geosite media）');
-    fireEvent.change(address, { target: { value: '198.51.100.53' } });
+    changeControl(address, { target: { value: '198.51.100.53' } });
     expect(view.queryByRole('alert')).toBeNull();
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
     await waitFor(() => expect(view.getByRole('alert').textContent).toBe('草稿保存失败'));
     expect(view.getByRole('alert').closest('tr')).toBe(address.closest('tr'));
     expect(view.queryAllByRole('alert')).toHaveLength(1);
-    fireEvent.change(address, { target: { value: '203.0.113.53' } });
+    changeControl(address, { target: { value: '203.0.113.53' } });
     await waitFor(() => expect(view.queryByRole('alert')).toBeNull());
   });
 
@@ -272,7 +273,7 @@ describe('machine-scoped egress DNS', () => {
     const view = renderEditor(false, initial, false, []);
     const match = view.container.querySelector<HTMLInputElement>('td.rule-match-cell input')!;
 
-    fireEvent.change(match, { target: { value: 'disneyplus.com' } });
+    changeControl(match, { target: { value: 'disneyplus.com' } });
 
     expect(confirmDiscardChanges()).toBe(true);
     expect(confirm).not.toHaveBeenCalled();
@@ -304,7 +305,7 @@ describe('machine-scoped egress DNS', () => {
       [],
     );
     const matchSelects = () =>
-      Array.from(view.container.querySelectorAll<HTMLSelectElement>('td.rule-match-cell select'));
+      Array.from(view.container.querySelectorAll<HTMLSelectElement>('td.rule-match-cell [role=combobox]'));
 
     expect(matchSelects().map(select => select.value)).toEqual(['geosite', 'any']);
     fireEvent.click(view.getByRole('button', { name: '＋ 嗅探失败兜底' }));
@@ -312,19 +313,17 @@ describe('machine-scoped egress DNS', () => {
     expect(matchSelects().map(select => select.value)).toEqual(['geosite', 'sniffing_failed', 'any']);
     const fallbackSelect = matchSelects().find(select => select.value === 'sniffing_failed')!;
     const fallbackRow = fallbackSelect.closest('tr')!;
-    const action = fallbackRow.querySelector<HTMLSelectElement>('select.rule-action-select')!;
-    const egress = action.querySelector<HTMLOptionElement>('option[value="egress"]')!;
+    const action = fallbackRow.querySelector<HTMLSelectElement>('[role=combobox].rule-action-select')!;
+    const egress = choiceOptions(action).find(option => option.value === 'egress')!;
     const moveButtons = fallbackRow.querySelectorAll<HTMLButtonElement>('button.btn:not(.danger)');
     expect(action.value).toBe('egress');
     expect(egress.disabled).toBe(false);
     expect(moveButtons[0].disabled).toBe(true);
     expect(moveButtons[1].disabled).toBe(true);
-    fireEvent.change(action, { target: { value: 'block' } });
+    changeControl(action, { target: { value: 'block' } });
     expect(action.value).toBe('block');
 
-    const geositeFallbackOption = matchSelects()[0].querySelector<HTMLOptionElement>(
-      'option[value="sniffing_failed"]',
-    )!;
+    const geositeFallbackOption = choiceOptions(matchSelects()[0]).find(option => option.value === 'sniffing_failed')!;
     expect(geositeFallbackOption.disabled).toBe(true);
 
     fireEvent.click(view.getByRole('button', { name: '＋ 添加规则' }));
@@ -343,16 +342,16 @@ describe('machine-scoped egress DNS', () => {
     expect(view.container.querySelector('.node-egress-rules-table')?.classList.contains('rule-table')).toBe(true);
     const save = view.getByRole('button', { name: '保存到草稿' }) as HTMLButtonElement;
     const footer = save.closest('.toolbar');
-    expect(footer?.className).toBe('toolbar');
+    expect(footer?.classList.contains('toolbar')).toBe(true);
     expect(footer?.textContent).toContain('改动落进草稿，顶栏按「提交」才写进库。');
     expect(footer?.textContent).toContain('1 项配置有改动');
     expect(view.queryByRole('alert')).toBeNull();
     expect((view.getByLabelText('DNS 匹配类型（geosite）') as HTMLSelectElement).value).toBe('geosite');
-    fireEvent.change(view.getByLabelText('DNS 匹配内容（geosite）'), { target: { value: 'netflix' } });
+    changeControl(view.getByLabelText('DNS 匹配内容（geosite）'), { target: { value: 'netflix' } });
     fireEvent.click(save);
     await waitFor(() => expect(view.getByRole('alert').textContent).toBe('请填写完整的 DNS 地址，用逗号分隔'));
     expect(draft.ops()).toHaveLength(0);
-    fireEvent.change(view.getByLabelText('DNS 地址（geosite netflix）'), { target: { value: '1.1.1.1' } });
+    changeControl(view.getByLabelText('DNS 地址（geosite netflix）'), { target: { value: '1.1.1.1' } });
     await waitFor(() => expect(view.queryByRole('alert')).toBeNull());
     expect(save.disabled).toBe(false);
     fireEvent.click(save);
@@ -390,10 +389,10 @@ describe('machine-scoped egress DNS', () => {
 
     const contents = view.getAllByLabelText(/DNS 匹配内容/);
     const addresses = view.getAllByLabelText(/DNS 地址/);
-    fireEvent.change(contents[0], { target: { value: 'one.example' } });
-    fireEvent.change(addresses[0], { target: { value: '1.1.1.1' } });
-    fireEvent.change(contents[1], { target: { value: 'two.example' } });
-    fireEvent.change(addresses[1], { target: { value: '8.8.8.8' } });
+    changeControl(contents[0], { target: { value: 'one.example' } });
+    changeControl(addresses[0], { target: { value: '1.1.1.1' } });
+    changeControl(contents[1], { target: { value: 'two.example' } });
+    changeControl(addresses[1], { target: { value: '8.8.8.8' } });
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
 
     await waitFor(() => expect(draft.ops()).toHaveLength(3));
@@ -421,7 +420,7 @@ describe('machine-scoped egress DNS', () => {
     const view = renderMachineRules();
 
     const content = view.getByLabelText('DNS 匹配内容（域名后缀 netflix.com）');
-    fireEvent.change(content, { target: { value: 'disneyplus.com' } });
+    changeControl(content, { target: { value: 'disneyplus.com' } });
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
 
     await waitFor(() => expect(draft.ops()).toHaveLength(3));
@@ -453,7 +452,7 @@ describe('machine-scoped egress DNS', () => {
 
     expect(view.container.querySelectorAll('.node-egress-rules-table tbody tr')).toHaveLength(2);
     expect(view.queryByText('other')).toBeNull();
-    fireEvent.change(view.getByLabelText('DNS 地址（域名后缀 netflix.com）'), {
+    changeControl(view.getByLabelText('DNS 地址（域名后缀 netflix.com）'), {
       target: { value: '198.51.100.53' },
     });
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
@@ -504,7 +503,7 @@ describe('machine-scoped egress DNS', () => {
       { node: 'hk', position: 0, selector: { t: 'geosite', v: ['disney'] }, resolution: grouped },
       { node: 'hk', position: 1, selector: { t: 'geosite', v: ['media'] }, resolution },
     ]);
-    fireEvent.change(view.getByLabelText('端口（geosite disney）'), { target: { value: '5354' } });
+    changeControl(view.getByLabelText('端口（geosite disney）'), { target: { value: '5354' } });
     fireEvent.click(view.getByRole('button', { name: '复制 DNS 策略（geosite disney）' }));
 
     const rows = view.container.querySelectorAll('.node-egress-rules-table tbody tr');
@@ -520,8 +519,8 @@ describe('machine-scoped egress DNS', () => {
     expect((copy.getByLabelText('地址策略（geosite disney）') as HTMLSelectElement).value).toBe('use_ipv6');
     expect((copy.getByLabelText('失败处理（geosite disney）') as HTMLSelectElement).value).toBe('machine');
     expect(view.queryByRole('alert')).toBeNull();
-    fireEvent.change(match, { target: { value: 'dazn' } });
-    fireEvent.change(copy.getByLabelText('DNS 地址（geosite dazn）'), { target: { value: '198.51.100.53' } });
+    changeControl(match, { target: { value: 'dazn' } });
+    changeControl(copy.getByLabelText('DNS 地址（geosite dazn）'), { target: { value: '198.51.100.53' } });
     expect((view.getByLabelText('DNS 地址（geosite disney）') as HTMLInputElement).value).toBe(
       '192.0.2.53, 2001:db8::53',
     );
@@ -554,12 +553,12 @@ describe('machine-scoped egress DNS', () => {
       { node: 'sg', position: 1, selector: { t: 'geosite', v: ['netflix'] }, resolution },
       { node: 'sg', position: 0, selector: { t: 'geosite', v: ['disney'] }, resolution },
     ]);
-    fireEvent.change(view.getByLabelText('DNS 地址（geosite disney）'), { target: { value: '203.0.113.53' } });
+    changeControl(view.getByLabelText('DNS 地址（geosite disney）'), { target: { value: '203.0.113.53' } });
     fireEvent.click(view.getByRole('button', { name: '从节点导入' }));
     const dialog = within(view.getByRole('dialog', { name: '从节点导入 DNS 策略' }));
     const source = dialog.getByLabelText('来源节点');
     expect(within(source).queryByRole('option', { name: '香港落地' })).toBeNull();
-    fireEvent.change(source, { target: { value: 'sg' } });
+    changeControl(source, { target: { value: 'sg' } });
     expect(dialog.getByText('将导入 2 条策略，按原顺序追加到当前列表末尾。')).toBeTruthy();
     fireEvent.click(dialog.getByRole('button', { name: '追加导入' }));
 
@@ -587,7 +586,7 @@ describe('machine-scoped egress DNS', () => {
       { node: 'sg', position: 0, selector: { t: 'geosite', v: ['netflix'] }, resolution: imported },
     ]);
     fireEvent.click(view.getByRole('button', { name: '从节点导入' }));
-    fireEvent.change(view.getByLabelText('来源节点'), { target: { value: 'sg' } });
+    changeControl(view.getByLabelText('来源节点'), { target: { value: 'sg' } });
     fireEvent.click(view.getByRole('button', { name: '追加导入' }));
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
 
@@ -612,7 +611,7 @@ describe('machine-scoped egress DNS', () => {
       { node: 'sg', position: 0, selector: { t: 'geosite', v: ['netflix'] }, resolution },
     ]);
     fireEvent.click(view.getByRole('button', { name: '从节点导入' }));
-    fireEvent.change(view.getByLabelText('来源节点'), { target: { value: 'sg' } });
+    changeControl(view.getByLabelText('来源节点'), { target: { value: 'sg' } });
     fireEvent.click(view.getByRole('button', { name: '追加导入' }));
     expect(view.getByLabelText('DNS 匹配内容（geosite netflix）')).toBeTruthy();
     fireEvent.click(view.getByRole('button', { name: '取消' }));
@@ -648,7 +647,7 @@ describe('machine-scoped egress DNS', () => {
     });
     const address = view.getByLabelText('DNS 地址（域名后缀 netflix.com）');
     address.focus();
-    fireEvent.change(address, { target: { value: '203.0.113.53' } });
+    changeControl(address, { target: { value: '203.0.113.53' } });
     expect(document.activeElement).toBe(address);
   });
 
@@ -673,8 +672,8 @@ describe('machine-scoped egress DNS', () => {
     const view = renderMachineRules(true);
     const choice = view.getByLabelText('DNS 解析方式（域名后缀 netflix.com）') as HTMLSelectElement;
 
-    expect(Array.from(choice.options).map(option => option.text)).toEqual(['默认 DNS 解析', '自定义 DNS 解析']);
-    expect(Array.from(choice.options).find(option => option.value === 'machine')?.disabled).toBe(false);
+    expect(choiceOptions(choice).map(option => option.text)).toEqual(['默认 DNS 解析', '自定义 DNS 解析']);
+    expect(choiceOptions(choice).find(option => option.value === 'machine')?.disabled).toBe(false);
     expect(view.queryByText('机器全局下发')).toBeNull();
     expect(view.container.textContent).not.toContain('引用');
   });
@@ -742,8 +741,8 @@ describe('machine-scoped egress DNS', () => {
     const authoredRows = Array.from(view.container.querySelectorAll('.rule-editor > .tbl > tbody > tr'));
 
     expect(authoredRows).toHaveLength(2);
-    expect((authoredRows[0].querySelector('select') as HTMLSelectElement).value).toBe('domain_suffix');
-    expect((authoredRows[1].querySelector('select') as HTMLSelectElement).value).toBe('any');
+    expect((authoredRows[0].querySelector('[role=combobox]') as HTMLSelectElement).value).toBe('domain_suffix');
+    expect((authoredRows[1].querySelector('[role=combobox]') as HTMLSelectElement).value).toBe('any');
     expect((authoredRows[1].querySelector('.rule-action-select') as HTMLSelectElement).value).toBe('egress');
   });
 
@@ -755,9 +754,9 @@ describe('machine-scoped egress DNS', () => {
     expect(action.classList.contains('rule-action-egress')).toBe(true);
     expect(view.container.querySelector('.rule-fallback-row .rule-action-block')).not.toBeNull();
 
-    fireEvent.change(action, { target: { value: 'forward' } });
+    changeControl(action, { target: { value: 'forward' } });
     expect(action.classList.contains('rule-action-forward')).toBe(true);
-    fireEvent.change(action, { target: { value: 'block' } });
+    changeControl(action, { target: { value: 'block' } });
     expect(action.classList.contains('rule-action-block')).toBe(true);
   });
 
@@ -775,21 +774,21 @@ describe('machine-scoped egress DNS', () => {
       [],
     );
 
-    fireEvent.change(view.getByDisplayValue('域名后缀'), { target: { value: 'any' } });
+    changeControl(view.getByRole('combobox', { name: '匹配类型（规则 1）' }), { target: { value: 'any' } });
     const rows = Array.from(view.container.querySelectorAll('.rule-editor > .tbl > tbody > tr'));
 
-    expect((rows[0].querySelector('select') as HTMLSelectElement).value).toBe('geosite');
+    expect((rows[0].querySelector('[role=combobox]') as HTMLSelectElement).value).toBe('geosite');
     expect((rows[0].querySelector('input') as HTMLInputElement).value).toBe('media');
-    expect((rows[1].querySelector('select') as HTMLSelectElement).value).toBe('any');
+    expect((rows[1].querySelector('[role=combobox]') as HTMLSelectElement).value).toBe('any');
   });
 
   it('disables custom DNS on a non-domain match', () => {
     const view = renderEditor(false, initial, false, [], true, false, [{ m: { t: 'any' }, a: { t: 'block' } }]);
-    fireEvent.change(view.getByDisplayValue('域名后缀'), { target: { value: 'ip_cidr' } });
+    changeControl(view.getByRole('combobox', { name: /匹配类型/ }), { target: { value: 'ip_cidr' } });
 
     const choice = view.getByLabelText('DNS 解析方式（线路规则：IP 段）') as HTMLSelectElement;
     expect(choice.value).toBe('machine');
-    expect(Array.from(choice.options).find(option => option.value === 'custom')?.disabled).toBe(true);
+    expect(choiceOptions(choice).find(option => option.value === 'custom')?.disabled).toBe(true);
     expect(view.queryByLabelText('DNS 地址')).toBeNull();
   });
 
@@ -803,8 +802,8 @@ describe('machine-scoped egress DNS', () => {
 
     const choice = view.getByLabelText('DNS 解析方式（线路规则：域名后缀 netflix.com）') as HTMLSelectElement;
     expect(choice.value).toBe('machine');
-    fireEvent.change(choice, { target: { value: 'custom' } });
-    fireEvent.change(view.getByLabelText('DNS 地址（机器策略：域名后缀 netflix.com）'), {
+    changeControl(choice, { target: { value: 'custom' } });
+    changeControl(view.getByLabelText('DNS 地址（机器策略：域名后缀 netflix.com）'), {
       target: { value: '198.51.100.53' },
     });
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
@@ -867,7 +866,7 @@ describe('machine-scoped egress DNS', () => {
     expect((view.getByLabelText('传输（机器策略：域名后缀 netflix.com）') as HTMLSelectElement).value).toBe('tcp');
     const addressStrategy = view.getByLabelText('地址策略（机器策略：域名后缀 netflix.com）') as HTMLSelectElement;
     expect(addressStrategy.value).toBe('use_ip');
-    expect(Array.from(addressStrategy.options).map(option => option.text)).toEqual([
+    expect(choiceOptions(addressStrategy).map(option => option.text)).toEqual([
       'UseIP',
       'UseIPv4v6',
       'UseIPv6v4',
@@ -876,7 +875,7 @@ describe('machine-scoped egress DNS', () => {
     ]);
     const fallback = view.getByLabelText('失败处理（机器策略：域名后缀 netflix.com）') as HTMLSelectElement;
     expect(fallback.value).toBe('stop');
-    expect(Array.from(fallback.options).map(option => option.text)).toEqual(['停止连接', '回退机器 DNS']);
+    expect(choiceOptions(fallback).map(option => option.text)).toEqual(['停止连接', '回退机器 DNS']);
     expect(view.container.querySelector('.egress-dns-note')).toBeNull();
     expect(view.container.textContent).not.toContain('Xray 全局生效');
     expect(view.container.querySelector('.egress-dns-editor')?.querySelector('header, footer')).toBeNull();
@@ -896,7 +895,7 @@ describe('machine-scoped egress DNS', () => {
 
   it('keeps the machine policy when an unrelated route selector changes', () => {
     const view = renderEditor();
-    fireEvent.change(view.getByDisplayValue('域名后缀'), { target: { value: 'ip_cidr' } });
+    changeControl(view.getByRole('combobox', { name: /匹配类型/ }), { target: { value: 'ip_cidr' } });
 
     expect((view.getByLabelText('DNS 解析方式（线路规则：IP 段）') as HTMLSelectElement).value).toBe('machine');
     expect(view.getByLabelText('DNS 地址（机器策略：域名后缀 netflix.com）')).toBeTruthy();
@@ -912,7 +911,7 @@ describe('machine-scoped egress DNS', () => {
     expect(view.getByText(/DNS 策略按机器生效；线路只提供编辑入口。DNS 地址可用逗号分隔/)).toBeTruthy();
   });
 
-  it('highlights the NODE target instead of the Forward action and keeps focus on the trigger', () => {
+  it('highlights the NODE target and focuses its searchable menu', () => {
     const forwardRules: Rule[] = [
       {
         m: { t: 'domain_suffix', v: ['example.com'] },
@@ -944,15 +943,15 @@ describe('machine-scoped egress DNS', () => {
       },
     ];
     const view = renderEditor(false, forwardRules, false, [], true, true, [], peers);
-    const action = view.getByDisplayValue('转发给');
+    const action = view.getByRole('combobox', { name: /处理方式/ });
     const trigger = view.getByRole('button', { name: /新加坡节点/ });
 
     expect(action.classList.contains('rule-action-forward')).toBe(true);
     expect(trigger.classList.contains('node-target')).toBe(true);
     trigger.focus();
     fireEvent.click(trigger);
-    expect(document.activeElement).toBe(trigger);
-    expect(view.getByPlaceholderText('搜索机器或代理出站').hasAttribute('autofocus')).toBe(false);
+    expect(document.activeElement).toBe(view.getByRole('textbox', { name: '搜索转发目标' }));
+    expect(view.getByRole('dialog', { name: '转发目标' })).toBeTruthy();
     expect(trigger.getAttribute('aria-expanded')).toBe('true');
     const newListener = view.getByRole('button', { name: /NODE.*东京节点.*加入本链/ });
     expect(newListener.querySelector('.external-target-kind')?.textContent).toBe('NODE');
@@ -965,7 +964,7 @@ describe('machine-scoped egress DNS', () => {
     const view = renderEditor();
     const address = view.getByLabelText('DNS 地址（机器策略：域名后缀 netflix.com）') as HTMLInputElement;
 
-    fireEvent.change(address, { target: { value: '198.51.100.53' } });
+    changeControl(address, { target: { value: '198.51.100.53' } });
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
 
     await waitFor(() => expect(draft.ops()).toHaveLength(1));

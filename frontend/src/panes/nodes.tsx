@@ -5413,7 +5413,7 @@ function NodeChainsSection({
       {inChains.length === 0 ? null : canEdit ? (
         // 一台机器可能属于多条链，每条链又递归展开多台——若每张规则表各带一个
         // 「保存到草稿」，本屏会出现七八个。统一收敛为整段末尾的一个。
-        <RuleDraftScope hint="改动落进草稿，顶栏按「提交」才写进库。" guardScope={`node-tab:${id}:chains`}>
+        <RuleDraftScope guardScope={`node-tab:${id}:chains`}>
           {inChains.map(use => (
             <NodeChainRuleTree
               key={`${use.appId}/${use.chain.id}`}

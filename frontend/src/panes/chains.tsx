@@ -5,6 +5,8 @@ import { ChainGroupMove } from './chain-group-move';
 import { ChainUnlockControl } from './node-unlock';
 import { useMetricQuery } from '../ui/metric-cadence';
 import { useInitialReady } from '../ui/use-initial-ready';
+import { ActionMenu } from '../ui/choice-menu';
+import { useNarrow } from '../ui/viewport';
 import {
   createContext,
   useCallback,
@@ -116,6 +118,7 @@ import { type CrumbSeg, type Win } from '../wm/store';
 import { useCrumb } from '../wm/crumb';
 import {
   RuleDraftScope,
+  egressDnsSelectorKey,
   RuleEditor,
   actionListenerRef,
   forwardPeers,
@@ -359,36 +362,6 @@ function chainAttentionTitle(
   if (!probe) return '还没探过这条链';
   if (users === 0) return '通，但还没有人被授权';
   return `${users} 人在用`;
-}
-
-// 删除控件。两处使用：项目列表中删除整条链、规则树中将机器移出链。
-// 两处执行的是同一操作——向草稿推入一条删除——因此使用相同的样式和反馈。
-// 此前一处是标准红色按钮、一处是 21px 见方的小格，同一操作有两种外观。
-//
-// 常驻显示，不依赖 hover。此前两处都使用 `opacity:0` 加 hover 显示，移动端无法访问
-// （项目头上的「改名」也因此改为常驻）。视觉权重通过颜色控制：静止时为灰色，
-// 悬停时变为红色（见 styles.css 的 .del-ctl）。
-//
-// 不设二次确认。删除只写入草稿，而存在草稿时快照读取的是草稿预览——点击后该行立即消失，
-// 该反馈本身即为确认。顶栏草稿条会列出「删除链 xxx」，可逐条丢弃或全部丢弃，
-// 提交前可查看 diff。在此处增加确认拦截的是可随时撤销的操作，
-// 而不可逆的步骤在提交环节。操作后果写入 title——它需要在点击前被读到。
-function DelBtn({ title, onClick, disabled = false }: { title: string; onClick: () => void; disabled?: boolean }) {
-  return (
-    <button
-      className="del-ctl"
-      title={title}
-      aria-label={title}
-      disabled={disabled}
-      onClick={e => {
-        e.stopPropagation();
-        if (disabled) return;
-        onClick();
-      }}
-    >
-      ×
-    </button>
-  );
 }
 
 function chainRows(apps: SnapshotApp[]) {
@@ -6004,7 +5977,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
           保存条（RuleDraftScope）只在可编辑时包裹：它是一个「保存到草稿」按钮，
           只读时始终处于禁用状态。 */}
               {editable ? (
-                <RuleDraftScope hint="改动落进草稿，顶栏按「提交」才写进库。">
+                <RuleDraftScope>
                   <div className="node-chain-use chain-tree">
                     <ChainRulesPanel
                       appId={app}
@@ -6409,33 +6382,6 @@ export function effectiveChainRuleSteps(
   return [...effective.values()];
 }
 
-export function defaultChainRuleOccurrence(
-  spine: string[],
-  steps: SnapshotStep[],
-  selected: string | undefined,
-): string | null {
-  if (!selected) return null;
-  const rows = chainRuleRows(spine, steps);
-  const graph = chainRuleGraph(steps, rows);
-  const roots = spine[0] ? [spine[0]] : rows.slice(0, 1).map(row => row.node);
-  const seen = new Set<string>();
-  let found: string | null = null;
-  const walk = (node: string, path: string[]) => {
-    if (found) return;
-    const occurrence = [...path, node].join('>');
-    if (node === selected) {
-      found = occurrence;
-      return;
-    }
-    if (seen.has(node) || path.includes(node)) return;
-    seen.add(node);
-    for (const edge of graph.get(node) ?? []) walk(edge.to, [...path, node]);
-  };
-  for (const root of roots) walk(root, []);
-  for (const row of rows) if (!seen.has(row.node)) walk(row.node, []);
-  return found;
-}
-
 export function ChainRulesPanel(props: Parameters<typeof ChainRulesPanelContent>[0]) {
   return <ChainRulesPanelContent key={`${props.appId}/${props.chain.id}`} {...props} />;
 }
@@ -6468,6 +6414,7 @@ function ChainRulesPanelContent({
     name: string;
     tenant_id: string;
     public_ipv4: string | null;
+    public_ipv4_country?: string | null;
     public_ipv6: string | null;
     public_ipv4_nat: boolean;
     public_ipv6_nat: boolean;
@@ -6548,10 +6495,7 @@ function ChainRulesPanelContent({
   /* 树中显示机器名称，id 写入 title——名称是日常识别依据 */
   const nameMap = new Map(nodes.map(n => [n.node_id, n.name]));
   const nameOf = (id: string) => nameMap.get(id) || id;
-  const rendered = new Set<string>();
 
-  // 默认全部折叠：此前每层内联一整张 RuleEditor，四台机器即四张叠放的表单，超出一屏，
-  // 且树的结构被表单遮盖。折叠后每台机器收为一行摘要，缩进保留，结构可直接识别。
   const snapshotApp = snapshotForPorts.data?.snapshot.apps.find(candidate => candidate.id === appId) ?? null;
   const peersOf = (node: string) =>
     forwardPeers({
@@ -6619,28 +6563,18 @@ function ChainRulesPanelContent({
     }
   }
 
-  // 展开状态按出现位置记录（从根到该节点的完整路径），不按机器记录：
-  // 同一台机器在树中出现两次时，点击哪一处展开哪一处。另一处不同步展开——
-  // 两份相同的表单同时显示时无法确定正在编辑哪一份，而它们本就是同一份数据。
-  // 另一处改为高亮显示（见 .same-open），表示该机器在其他位置已展开。
-  const defaultOccurrence = defaultOpenSelected ? defaultChainRuleOccurrence(spine, effectiveSteps, selected) : null;
-  const defaultKey = defaultOccurrence ? `${selected ?? ''}:${defaultOccurrence}` : null;
-  const [open, setOpen] = useState<Set<string>>(() => new Set(defaultOccurrence ? [defaultOccurrence] : []));
-  const lastDefaultKey = useRef(defaultKey);
-  useEffect(() => {
-    if (!defaultOccurrence || !defaultKey || lastDefaultKey.current === defaultKey) return;
-    lastDefaultKey.current = defaultKey;
-    setOpen(previous => new Set(previous).add(defaultOccurrence));
-  }, [defaultOccurrence, defaultKey]);
-  const toggle = (occ: string) =>
-    setOpen(prev => {
-      const next = new Set(prev);
-      if (next.has(occ)) next.delete(occ);
-      else next.add(occ);
-      return next;
-    });
-  /* 至少有一处展开的机器——用于为同一机器的其余位置添加高亮 */
-  const openNodes = new Set([...open].map(occ => occ.split('>').pop() as string));
+  const phone = useNarrow();
+  const [selection, setSelection] = useState({
+    source: selected,
+    focused: selected ?? spine[0] ?? rows[0]?.node ?? '',
+    pushed: defaultOpenSelected,
+  });
+  if (selection.source !== selected)
+    setSelection({ source: selected, focused: selected ?? spine[0] ?? '', pushed: defaultOpenSelected });
+  const { focused, pushed } = selection;
+  const [tab, setTab] = useState<'rules' | 'links' | 'dns'>('rules');
+  const [dirtyNodes, setDirtyNodes] = useState<Record<string, boolean>>({});
+  const activeNode = rows.some(row => row.node === focused) ? focused : (spine[0] ?? rows[0]?.node ?? '');
 
   // 编译器补全在规则表末尾的规则。读取编译视图，不在此处推算：
   // 在浏览器中重新计算相当于实现第二个编译器，最终会与 Rust 的实现产生差异。
@@ -6660,205 +6594,59 @@ function ChainRulesPanelContent({
     return compilerFallbackRules(written, full);
   };
 
-  // 先统计每台机器在该树中出现的次数。
-  // 出现两次以上的，每一处都标记「共享配置」——包括第一处：只标记后续位置时，
-  // 第一处会被认为独占该配置，而实际上它与其他位置对应库中同一条记录（steps 主键 chain+node）。
-  // 遍历逻辑必须与下面的 renderNode 一致（相同的防环和防重复展开处理），
-  // 否则统计的次数与渲染的树不一致。
   const rootNodes = spine[0] ? [spine[0]] : rows.slice(0, 1).map(row => row.node);
-  const occurrences = (() => {
-    const count = new Map<string, number>();
-    const seen = new Set<string>();
-    const walk = (node: string, path: Set<string>) => {
-      count.set(node, (count.get(node) ?? 0) + 1);
-      if (seen.has(node) || path.has(node)) return;
-      seen.add(node);
-      const nextPath = new Set(path);
-      nextPath.add(node);
-      for (const edge of graph.get(node) ?? []) walk(edge.to, nextPath);
-    };
-    for (const root of rootNodes) walk(root, new Set());
-    /* 未从入口连通的节点（孤立组）同样各计入一次 */
-    for (const row of rows) if (!seen.has(row.node)) walk(row.node, new Set());
-    return count;
-  })();
-
-  // depth 只传递给 CSS：连线的对比度按层级递减，每深一层降低一档。
-  // 不传递时各层分隔线完全相同，第三层与第一层在视觉上距离相同。
-  const renderNode = (node: string, incoming: string[], path: Set<string>, depth = 0) => {
-    const row = rowOf.get(node);
-    const repeated = rendered.has(node) || path.has(node);
-    if (!repeated) rendered.add(node);
-    const step = stepOf(node);
-    const nextPath = new Set(path);
-    nextPath.add(node);
-    const children = graph.get(node) ?? [];
-
-    /* 该位置的唯一键：从根到此处的路径。同一台机器的两个位置路径不同。 */
-    const occ = [...path, node].join('>');
-    const expanded = open.has(occ);
-    const rootOccurrence = path.size === 0 && rootNodes.includes(node);
-    /* 该机器在其他位置已展开（而非此处）：高亮提示，不同步展开 */
-    const sameOpen = !expanded && openNodes.has(node);
-    const listensForHop = hopListeners.has(node);
-    const hopTitle = listensForHop ? `${nameOf(node)} 实际监听的中转端口与承载协议` : undefined;
-    const hopSummary = listensForHop ? (step?.hop_in ? summarizeHopIn(step) : '未配置') : '—';
-    const written = (draftRules[node] ?? step?.rules ?? []).length;
-    const blockingReferences = referencesBlockingRemoval(node);
-
-    const badges = (
-      <>
-        {rootOccurrence && rootLabel && (
-          <span className="st b-chain" title={rootLabelTitle}>
-            {rootLabel}
-          </span>
-        )}
-        {/* 「共享配置」排在最前：它表示的是该机器的属性（在该链中出现多次、共用一张规则表），
-            而其后的 geoip= / domain= 标签表示的是该边的属性（流量因何条件到达此处）。
-            机器的属性应紧邻机器名。 */}
-        {(occurrences.get(node) ?? 0) > 1 && (
-          <span className="st" title="这台机器在这条链上出现多次，共用同一张规则表">
-            共享配置
-          </span>
-        )}
-        {/* 「入口」是端点标签，使用 accent；其余 incoming 标签（匹配条件/主干默认/孤立）保持灰色。
-            「分叉」标签已移除：它表示的只是不在 spine 数组中这一实现细节，
-            与流量的实际结构不对应，显示出来会造成误解。 */}
-        {incoming.map(label => (
-          <span className={label === '入口' ? 'st b-role' : 'st'} key={label}>
-            {label}
-          </span>
-        ))}
-        {row?.spineIndex === null && !row?.targeted && row?.hasStep && <span className="st">规则节点</span>}
-        {selected && node === selected && <span className="st st-succeeded">当前节点</span>}
-        {blockingReferences.length > 0 && (
-          <span
-            className="st st-gold"
-            title={`先移除引用：${blockingReferences.map(source => `${source.chain}/${source.node}`).join('、')}`}
-          >
-            被 {blockingReferences.length} 处引用
-          </span>
-        )}
-      </>
-    );
-
-    return (
-      <div
-        className={`chain-rule-node${expanded ? ' open' : ''}${sameOpen ? ' same-open' : ''}`}
-        style={{ '--depth': depth } as CSSProperties}
-        key={`${node}/${incoming.join('+') || 'root'}`}
-      >
-        <div
-          role="button"
-          tabIndex={0}
-          className="chain-rule-node-head"
-          aria-expanded={expanded}
-          onClick={() => toggle(occ)}
-          onKeyDown={e => {
-            if (e.target !== e.currentTarget) return;
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              toggle(occ);
-            }
-          }}
-        >
-          <span className="disc" aria-hidden="true">
-            {expanded ? '▾' : '▸'}
-          </span>
-          {/* 名称和标签在自己的列内换行，删除控件始终保留独立空间。 */}
-          <span className="who">
-            <b title={`${nameOf(node)} · ${node}`}>{nameOf(node)}</b>
-            {badges}
-          </span>
-          {/* 删除：与项目列表中删除链使用同一控件和同一反馈（见 DelBtn）。
-                只对主干上的节点提供，且入口位（spineIndex 0）不可删除——删除它等同于删除
-                整条链，该操作在链列表中执行。分叉节点由上游的转发规则控制，不在此处删除。
-
-                该格始终渲染（无按钮时为空 span）：行使用 grid 布局，缺少一个 item 会使
-                后续列整体前移一格，右侧两列将与其他行错位。 */}
-          <span className="hopctl" onClick={e => e.stopPropagation()}>
-            {onRemove && row?.spineIndex != null && row.spineIndex > 0 && (
-              <DelBtn
-                disabled={portDependenciesPending || !!portDependenciesError || blockingReferences.length > 0}
-                title={
-                  blockingReferences.length > 0
-                    ? `无法移除：子树监听仍被 ${blockingReferences
-                        .map(source => `${source.chain}/${source.node}`)
-                        .join('、')} 引用`
-                    : '从这条链移除这台机器，其整张规则表一并删除。写入草稿，提交后生效'
-                }
-                onClick={() => onRemove(node)}
-              />
-            )}
-          </span>
-          <div className="meta">
-            <span className="m-rules">{written === 0 ? '没写规则' : `${written} 条规则`}</span>
-            <div className="m-hop" title={hopTitle}>
-              <span className="mono">{hopSummary}</span>
-            </div>
-          </div>
-        </div>
-        {
-          <>
-            {/* 折叠的节点仍然保持挂载：卸载会连同未保存的改动一起丢弃，
-                且 RuleDraftScope 按挂载顺序保存（上游必须在前）。 */}
-            <div className="chain-rule-body" hidden={!expanded}>
-              <RuleEditor
-                key={`${appId}/${chain.id}/${node}`}
-                appId={appId}
-                chainId={chain.id}
-                nodeId={node}
-                initial={step?.rules ?? []}
-                accept={step?.accept ?? null}
-                hopIn={step?.hop_in ?? null}
-                // 草稿由 panel 持有：同一台机器在树中出现两次时，两处是两个组件实例，
-                // 但读写同一份数据——库中只有一条记录。
-                shared={{
-                  rules: draftRules[node] ?? step?.rules ?? [],
-                  outbounds: draftOutbounds[node] ?? [],
-                  setOutbounds: next => setDraftOutbounds(prev => ({ ...prev, [node]: next })),
-                  setRules: next => setDraftRules(prev => ({ ...prev, [node]: next })),
-                  hops:
-                    draftHops[node] ??
-                    seedHops(peersOf(node), portPool, hopBase, {
-                      sourceNode: node,
-                      rules: draftRules[node] ?? step?.rules ?? [],
-                    }),
-                  setHops: next => setDraftHops(prev => ({ ...prev, [node]: next })),
-                  dns: draftDns[node] ?? {},
-                  setDns: next => setDraftDns(prev => ({ ...prev, [node]: next })),
-                  dnsOrder: draftDnsOrder[node] ?? null,
-                  setDnsOrder: next => setDraftDnsOrder(prev => ({ ...prev, [node]: next })),
-                }}
-                ruleDrafts={draftRules}
-                peers={peersOf(node)}
-                isForwardTarget={isForwardTargetInChain({
-                  nodeId: node,
-                  steps: effectiveSteps,
-                })}
-                /* 整条链的当前状态和链头：保存时据此计算不再被任何规则指向的节点，一并移除 */
-                steps={steps}
-                root={spine[0]}
-                // 同一台机器的多个位置共用一份草稿，由其中一处执行保存即可。
-                // 两处都注册时同一内容会被写入两次（结果幂等，但产生一次多余的请求）。
-                saves={!repeated}
-                readOnly={readOnly}
-                fallback={{
-                  rules: fallbackOf(node),
-                  pending: revisionsForPorts.isPending || compiledForPorts.isLoading,
-                }}
-              />
-            </div>
-            {children.length > 0 && (
-              <div className="chain-rule-children">
-                {children.map(edge => renderNode(edge.to, edge.labels, nextPath, depth + 1))}
-              </div>
-            )}
-          </>
-        }
-      </div>
-    );
+  const sidebarRows: Array<{
+    node: string;
+    incoming: string[];
+    parent?: string;
+    depth: number;
+    occurrence: string;
+    repeated: boolean;
+    orphan: boolean;
+  }> = [];
+  const visited = new Set<string>();
+  const walk = (node: string, incoming: string[], path: string[], orphan = false) => {
+    const repeated = visited.has(node);
+    sidebarRows.push({
+      node,
+      incoming: incoming.length ? incoming : ['全部流量'],
+      parent: path.at(-1),
+      depth: path.length,
+      occurrence: [...path, node].join('>'),
+      repeated,
+      orphan,
+    });
+    if (repeated) return;
+    visited.add(node);
+    for (const edge of graph.get(node) ?? []) walk(edge.to, edge.labels, [...path, node], orphan);
   };
+  for (const root of rootNodes) walk(root, ['入口'], []);
+  for (const row of rows) if (!visited.has(row.node)) walk(row.node, ['孤立'], [], true);
+  const activeRow = sidebarRows.find(row => row.node === activeNode);
+  const activeStep = stepOf(activeNode);
+  const activeRules = draftRules[activeNode] ?? activeStep?.rules ?? [];
+  const activeTargets = new Set(
+    activeRules.flatMap(rule =>
+      rule.a.t === 'forward'
+        ? [`node:${rule.a.to}`]
+        : rule.a.t === 'reuse_listener'
+          ? [`listener:${listenerRefKey(rule.a.listener)}`]
+          : rule.a.t === 'proxy'
+            ? [`proxy:${rule.a.outbound}`]
+            : [],
+    ),
+  );
+  const dnsKeys = new Set(
+    (snapshotForPorts.data?.node_egress_dns ?? [])
+      .filter(policy => policy.node === activeNode)
+      .map(policy => egressDnsSelectorKey(policy.selector)),
+  );
+  for (const [key, change] of Object.entries(draftDns[activeNode] ?? {})) {
+    if (change.resolution) dnsKeys.add(key);
+    else dnsKeys.delete(key);
+  }
+  const activeRemovalBlock = referencesBlockingRemoval(activeNode);
+  const activeSpineIndex = rowOf.get(activeNode)?.spineIndex;
 
   // 可编辑态首次必须等端口起点和占用表完整后再构造 RuleEditor 的共享草稿。否则这里先用
   // 20000/空占用表 seed，子组件随后即使拿到真实设置也只会收到已经冻结的默认值。
@@ -6867,15 +6655,12 @@ function ChainRulesPanelContent({
     return loadingFallback === undefined ? <Loading variant="editor" /> : loadingFallback;
   }
 
-  const tree = rootNodes.map(root => renderNode(root, ['入口'], new Set()));
-  const orphanTree = rows.flatMap(row => (rendered.has(row.node) ? [] : [renderNode(row.node, ['孤立'], new Set())]));
   return (
     <>
       {portDependenciesError && <ErrorBox error={portDependenciesError} />}
       {showHeader && (
-        <div className="toolbar" style={{ marginTop: 14 }}>
+        <div className="toolbar">
           <b>整条链规则</b>
-          <span className="note">从入口向下游递归展开，每一层都是可编辑规则。</span>
           <span className="sp" />
           {onClose && (
             <button className="btn" onClick={onClose}>
@@ -6884,17 +6669,212 @@ function ChainRulesPanelContent({
           )}
         </div>
       )}
-      <div className="chain-rule-tree" aria-busy={portDependenciesPending}>
-        {tree}
-        {orphanTree.length > 0 && (
-          <div className="chain-rule-orphans">
-            <div className="chain-rule-node-head">
-              <b>未从入口展开</b>
-              <span className="note">这些节点存在 step 或被规则引用，但当前规则图未从入口连通到它。</span>
+      {rootLabel && (
+        <div className="rule-machine-chain" title={rootLabelTitle}>
+          {rootLabel}
+        </div>
+      )}
+      <div
+        className={`chain-rule-workspace${phone ? ' is-phone' : ''}${pushed ? ' is-pushed' : ''}`}
+        aria-busy={portDependenciesPending}
+      >
+        <nav className="rule-machine-tree" aria-label="链上的机器" hidden={phone && pushed}>
+          {sidebarRows.map(row => (
+            <button
+              type="button"
+              key={row.occurrence}
+              className={`rule-machine-node${row.node === activeNode ? ' is-selected' : ''}`}
+              style={{ '--depth': row.depth } as CSSProperties}
+              aria-current={row.node === activeNode ? 'true' : undefined}
+              onClick={() => {
+                setSelection({ source: selected, focused: row.node, pushed: true });
+              }}
+            >
+              <span className="rule-machine-name">
+                <RegionFlag code={nodes.find(candidate => candidate.node_id === row.node)?.public_ipv4_country} />
+                <b title={`${nameOf(row.node)} · ${row.node}`}>{nameOf(row.node)}</b>
+                {dirtyNodes[row.node] && <span className="rule-dirty-dot" aria-label="有未保存改动" />}
+              </span>
+              <span className="rule-machine-via" title={row.incoming.join(' · ')}>
+                {row.incoming.join(' · ')}
+                {row.repeated ? ' · 共享配置' : ''}
+              </span>
+              <span className="rule-machine-go" aria-hidden="true">
+                ›
+              </span>
+            </button>
+          ))}
+        </nav>
+        <div className="rule-machine-detail" hidden={phone && !pushed}>
+          {phone && (
+            <button
+              type="button"
+              className="rule-machine-back"
+              onClick={() => setSelection(previous => ({ ...previous, pushed: false }))}
+            >
+              ‹ 机器
+            </button>
+          )}
+          <header className="rule-machine-heading">
+            <div>
+              <b className="rule-machine-title">
+                <RegionFlag code={nodes.find(candidate => candidate.node_id === activeNode)?.public_ipv4_country} />
+                {nameOf(activeNode)}
+              </b>
+              <div className="rule-machine-subtitle">
+                <span className="st">
+                  {activeRow?.orphan
+                    ? '孤立'
+                    : !activeRow?.parent
+                      ? '入口'
+                      : (graph.get(activeNode)?.length ?? 0) > 0
+                        ? '中转'
+                        : '出口'}
+                </span>
+                {activeRow?.parent && (
+                  <span>
+                    来自 {nameOf(activeRow.parent)} · {activeRow.incoming.join(' · ')}
+                  </span>
+                )}
+                {hopListeners.has(activeNode) && (
+                  <span>监听 {activeStep?.hop_in ? summarizeHopIn(activeStep) : '未配置'}</span>
+                )}
+              </div>
             </div>
-            {orphanTree}
+            <ActionMenu
+              key={activeNode}
+              label={`${nameOf(activeNode)} 的更多操作`}
+              items={[
+                {
+                  label: '打开机器详情',
+                  note: '运行观测、配置和规则',
+                  onSelect: () => navigate('nodes', { p: 'node', id: activeNode }),
+                },
+                ...(!readOnly && onRemove
+                  ? [
+                      {
+                        label: '从这条链移除',
+                        note: '这台机器在本链的规则表一并删除',
+                        danger: true,
+                        disabled:
+                          activeSpineIndex === 0
+                            ? '入口机器不能单独移除'
+                            : activeSpineIndex == null
+                              ? '分支机器由上游的转发规则管理'
+                              : activeRemovalBlock.length > 0
+                                ? `先移除监听引用：${activeRemovalBlock.map(source => `${source.chain}/${source.node}`).join('、')}`
+                                : portDependenciesPending || !!portDependenciesError
+                                  ? '配置更新完成后可移除'
+                                  : false,
+                        onSelect: () => onRemove(activeNode),
+                      },
+                    ]
+                  : []),
+              ]}
+            />
+          </header>
+          <div className="rule-machine-tabs">
+            <SegmentedControl
+              value={tab}
+              ariaLabel="机器配置"
+              options={[
+                {
+                  value: 'rules',
+                  label: (
+                    <>
+                      规则 <span className="header-stat">{activeRules.length}</span>
+                    </>
+                  ),
+                },
+                {
+                  value: 'links',
+                  label: (
+                    <>
+                      连接 <span className="header-stat">{activeTargets.size}</span>
+                    </>
+                  ),
+                },
+                {
+                  value: 'dns',
+                  label: (
+                    <>
+                      DNS 解析 <span className="header-stat">{dnsKeys.size}</span>
+                    </>
+                  ),
+                },
+              ]}
+              onChange={next => setTab(next as typeof tab)}
+            />
           </div>
-        )}
+          {/* 每台机器只有一个编辑器，始终按上游顺序挂载；隐藏而非卸载，以保留输入和批量保存注册。 */}
+          {sidebarRows
+            .filter(row => !row.repeated)
+            .map(({ node }) => {
+              const step = stepOf(node);
+              return (
+                <div key={node} hidden={node !== activeNode}>
+                  <RuleEditor
+                    key={`${appId}/${chain.id}/${node}`}
+                    appId={appId}
+                    chainId={chain.id}
+                    nodeId={node}
+                    initial={step?.rules ?? []}
+                    accept={step?.accept ?? null}
+                    hopIn={step?.hop_in ?? null}
+                    // 草稿由 panel 持有：同一台机器在树中出现两次时，两处是两个组件实例，
+                    // 但读写同一份数据——库中只有一条记录。
+                    shared={{
+                      reset: () => {
+                        const without = <T,>(previous: Record<string, T>) =>
+                          Object.fromEntries(Object.entries(previous).filter(([key]) => key !== node));
+                        setDraftRules(without);
+                        setDraftOutbounds(without);
+                        setDraftHops(without);
+                        setDraftDns(without);
+                        setDraftDnsOrder(without);
+                      },
+                      rules: draftRules[node] ?? step?.rules ?? [],
+                      outbounds: draftOutbounds[node] ?? [],
+                      setOutbounds: next => setDraftOutbounds(prev => ({ ...prev, [node]: next })),
+                      setRules: next => setDraftRules(prev => ({ ...prev, [node]: next })),
+                      hops:
+                        draftHops[node] ??
+                        seedHops(peersOf(node), portPool, hopBase, {
+                          sourceNode: node,
+                          rules: draftRules[node] ?? step?.rules ?? [],
+                        }),
+                      setHops: next => setDraftHops(prev => ({ ...prev, [node]: next })),
+                      dns: draftDns[node] ?? {},
+                      setDns: next => setDraftDns(prev => ({ ...prev, [node]: next })),
+                      dnsOrder: draftDnsOrder[node] ?? null,
+                      setDnsOrder: next => setDraftDnsOrder(prev => ({ ...prev, [node]: next })),
+                    }}
+                    ruleDrafts={draftRules}
+                    peers={peersOf(node)}
+                    isForwardTarget={isForwardTargetInChain({
+                      nodeId: node,
+                      steps: effectiveSteps,
+                    })}
+                    /* 整条链的当前状态和链头：保存时据此计算不再被任何规则指向的节点，一并移除 */
+                    steps={steps}
+                    root={spine[0]}
+                    // 同一台机器的多个位置共用一份草稿，由其中一处执行保存即可。
+                    // 两处都注册时同一内容会被写入两次（结果幂等，但产生一次多余的请求）。
+                    saves
+                    section={tab}
+                    onDirtyChange={dirty =>
+                      setDirtyNodes(previous => (previous[node] === dirty ? previous : { ...previous, [node]: dirty }))
+                    }
+                    readOnly={readOnly}
+                    fallback={{
+                      rules: fallbackOf(node),
+                      pending: revisionsForPorts.isPending || compiledForPorts.isLoading,
+                    }}
+                  />
+                </div>
+              );
+            })}
+        </div>
       </div>
     </>
   );

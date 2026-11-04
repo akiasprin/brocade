@@ -42,7 +42,7 @@ for (const theme of ['light', 'dark']) {
     await page.goto(`/tests/fixtures/dns-groups-preview.html?theme=${theme}&scene=create`);
     await page.getByRole('button', { name: '添加新策略' }).click();
     const row = page.locator('.node-egress-dns-new-row');
-    await expect(row.getByRole('combobox', { name: /DNS 匹配类型/ })).toHaveValue('geosite');
+    await expect(row.getByRole('combobox', { name: /DNS 匹配类型/ })).toHaveAttribute('value', 'geosite');
     await expect(page.getByRole('alert')).toHaveCount(0);
     await page.evaluate(() => document.fonts.ready);
     await expect(page).toHaveScreenshot(`dns-new-${theme}.png`);
@@ -72,7 +72,8 @@ for (const width of [1440, 390])
 
       await page.getByRole('button', { name: '从节点导入', exact: true }).click();
       const dialog = page.getByRole('dialog', { name: '从节点导入 DNS 策略' });
-      await dialog.getByLabel('来源节点').selectOption('preview-source');
+      await dialog.getByLabel('来源节点').click();
+      await page.locator('[role=option][data-value=preview-source]').click();
       await expect(dialog).toContainText('将导入 2 条策略，按原顺序追加到当前列表末尾。');
       await expect(dialog).toHaveScreenshot(`dns-import-${width}-${theme}.png`);
       await dialog.getByRole('button', { name: '追加导入', exact: true }).click();
@@ -93,9 +94,9 @@ test('copies local edits, drags the copy to D1 and preserves all resolver fields
   const copy = page.locator('.node-egress-dns-new-row');
   await copy.getByRole('textbox', { name: /DNS 匹配内容/ }).fill('dazn');
   await expect(copy.getByRole('textbox', { name: /DNS 地址/ })).toHaveValue('203.0.113.53, 2001:db8::53');
-  await expect(copy.getByRole('combobox', { name: /传输/ })).toHaveValue('udp');
-  await expect(copy.getByRole('combobox', { name: /地址策略/ })).toHaveValue('use_ip');
-  await expect(copy.getByRole('combobox', { name: /失败处理/ })).toHaveValue('machine');
+  await expect(copy.getByRole('combobox', { name: /传输/ })).toHaveAttribute('value', 'udp');
+  await expect(copy.getByRole('combobox', { name: /地址策略/ })).toHaveAttribute('value', 'use_ip');
+  await expect(copy.getByRole('combobox', { name: /失败处理/ })).toHaveAttribute('value', 'machine');
 
   const grip = await copy.getByRole('button', { name: /拖动排序/ }).boundingBox();
   const target = await page.locator('.node-egress-rules-table tbody tr').first().boundingBox();
@@ -110,7 +111,10 @@ test('copies local edits, drags the copy to D1 and preserves all resolver fields
   await expect(page.getByRole('textbox', { name: 'DNS 地址（geosite disney）', exact: true })).toHaveValue(
     '203.0.113.53, 2001:db8::53',
   );
-  await expect(page.getByRole('combobox', { name: '地址策略（geosite google）', exact: true })).toHaveValue('use_ipv6');
+  await expect(page.getByRole('combobox', { name: '地址策略（geosite google）', exact: true })).toHaveAttribute(
+    'value',
+    'use_ipv6',
+  );
   await expect(page.getByRole('button', { name: '保存到草稿' })).toBeEnabled();
 });
 

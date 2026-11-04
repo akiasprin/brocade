@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, render, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SnapshotChain, SnapshotIngress, SnapshotStep } from '../src/api';
 import { ChainRulesPanel, IngressStreamRow } from '../src/panes/chains';
@@ -100,7 +100,7 @@ describe('访客查看链路规则', () => {
     await waitFor(() => expect(fetcher).not.toHaveBeenCalled());
   });
 
-  it('折叠摘要只显示普通跳实际监听方自己的端口', async () => {
+  it('详情只显示普通跳实际监听方自己的端口', async () => {
     const client = await visitorClientWithCachedForbidden();
     const steps: SnapshotStep[] = [
       {
@@ -144,11 +144,11 @@ describe('访客查看链路规则', () => {
       </QueryClientProvider>,
     );
 
-    expect(
-      [...view.container.querySelectorAll('.chain-rule-node-head .m-hop > .mono')].map(node => node.textContent),
-    ).toEqual(['—', '20000 / VLESS-NONE']);
+    expect(view.container.querySelector('.rule-machine-subtitle')?.textContent).not.toContain('20000');
+    fireEvent.click(view.getByRole('button', { name: /^target/ }));
+    expect(view.container.querySelector('.rule-machine-subtitle')?.textContent).toContain('20000 / VLESS-NONE');
     const ownedListenerPanel = [...view.container.querySelectorAll<HTMLElement>('.hop-target-panel')].find(panel =>
-      panel.querySelector('.panel-title')?.textContent?.includes('本链监听'),
+      panel.querySelector('.panel-title')?.textContent?.includes('连接'),
     );
     expect(ownedListenerPanel).toBeTruthy();
     expect(ownedListenerPanel?.querySelector('.listener-reference-copy small')).toBeNull();
@@ -195,9 +195,10 @@ describe('访客查看链路规则', () => {
       </QueryClientProvider>,
     );
 
-    expect(
-      [...view.container.querySelectorAll('.chain-rule-node-head .m-hop > .mono')].map(node => node.textContent),
-    ).toEqual(['20002 / VLESS-ENCRY', '—']);
+    expect(view.container.querySelector('.rule-machine-subtitle')?.textContent).toContain('20002 / VLESS-ENCRY');
+    fireEvent.click(view.getByRole('button', { name: /^target/ }));
+    expect(view.container.querySelector('.rule-machine-subtitle')?.textContent).not.toContain('20001');
+    expect(view.container.querySelector('.rule-machine-subtitle')?.textContent).not.toContain('监听');
     const reversePanel = [...view.container.querySelectorAll<HTMLElement>('.hop-target-panel')].find(panel =>
       panel.querySelector('.panel-title')?.textContent?.includes('反向接入口'),
     );

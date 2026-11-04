@@ -1,3 +1,4 @@
+import { changeControl } from './choice-helpers';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -114,8 +115,8 @@ function renderEditor(pool: HopPool = { t: 'none' }, readOnly = false) {
 
 function connectionSelect(view: ReturnType<typeof renderEditor>) {
   const field = view.getByText('连接复用').closest('.hopfld');
-  const select = field?.querySelector('select');
-  if (!(select instanceof HTMLSelectElement)) throw new Error('没有找到出站连接选择器');
+  const select = field?.querySelector('[role=combobox]');
+  if (!(select instanceof HTMLButtonElement)) throw new Error('没有找到出站连接选择器');
   return select;
 }
 
@@ -152,11 +153,11 @@ describe('规则页 Mux Worker 池', () => {
     expect(muxField(dialog, '超额空闲寿命').getAttribute('max')).toBeNull();
     expect(muxField(dialog, '超额空闲寿命').value).toBe('22125');
     expect(muxField(dialog, '探活周期').value).toBe('9125');
-    fireEvent.change(muxField(dialog, '复用阈值'), { target: { value: '100000' } });
-    fireEvent.change(muxField(dialog, '预热目标'), { target: { value: '70000' } });
-    fireEvent.change(muxField(dialog, '探活并发'), { target: { value: '32' } });
-    fireEvent.change(muxField(dialog, '累计子连接'), { target: { value: '65535' } });
-    fireEvent.change(muxField(dialog, '超额空闲寿命'), { target: { value: '86400125' } });
+    changeControl(muxField(dialog, '复用阈值'), { target: { value: '100000' } });
+    changeControl(muxField(dialog, '预热目标'), { target: { value: '70000' } });
+    changeControl(muxField(dialog, '探活并发'), { target: { value: '32' } });
+    changeControl(muxField(dialog, '累计子连接'), { target: { value: '65535' } });
+    changeControl(muxField(dialog, '超额空闲寿命'), { target: { value: '86400125' } });
     fireEvent.click(within(dialog).getByRole('button', { name: '应用' }));
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
     const pool = {
@@ -181,16 +182,16 @@ describe('规则页 Mux Worker 池', () => {
     const dialog = view.getByRole('dialog');
     const apply = within(dialog).getByRole('button', { name: '应用' }) as HTMLButtonElement;
     const concurrency = muxField(dialog, '复用流数量');
-    fireEvent.change(concurrency, { target: { value: '' } });
+    changeControl(concurrency, { target: { value: '' } });
     expect(concurrency.value).toBe('');
     expect(apply.disabled).toBe(true);
-    fireEvent.change(concurrency, { target: { value: '1' } });
-    fireEvent.change(concurrency, { target: { value: '12' } });
+    changeControl(concurrency, { target: { value: '1' } });
+    changeControl(concurrency, { target: { value: '12' } });
     const prewarm = muxField(dialog, '预热目标');
-    fireEvent.change(prewarm, { target: { value: '' } });
+    changeControl(prewarm, { target: { value: '' } });
     expect(prewarm.value).toBe('');
     expect(apply.disabled).toBe(true);
-    fireEvent.change(prewarm, { target: { value: '0' } });
+    changeControl(prewarm, { target: { value: '0' } });
     expect(prewarm.value).toBe('0');
     expect(apply.disabled).toBe(false);
     fireEvent.click(apply);
@@ -213,7 +214,7 @@ describe('规则页 Mux Worker 池', () => {
       fireEvent.click(view.getByRole('button', { name: '配置参数' }));
       const dialog = view.getByRole('dialog');
       const input = muxField(dialog, label);
-      fireEvent.change(input, { target: { value: '' } });
+      changeControl(input, { target: { value: '' } });
       expect(input.value).toBe('');
       expect((within(dialog).getByRole('button', { name: '应用' }) as HTMLButtonElement).disabled).toBe(true);
       fireEvent.click(within(dialog).getByRole('button', { name: '跟随全局' }));
@@ -229,13 +230,13 @@ describe('规则页 Mux Worker 池', () => {
 
     const panel = view.container.querySelector('.hop-target-panel');
     expect(panel).not.toBeNull();
-    expect(panel?.textContent).toContain('端口和协议属于目标监听；拨号和 Mux 属于当前链边');
+    expect(panel?.querySelectorAll('.rule-connection-path')).toHaveLength(1);
     expect(panel?.textContent?.replace(/\s+/g, '')).toContain(
       '端口开在新加坡中继，连接由香港入口发起；目标端口必须唯一。',
     );
 
     expect(connectionSelect(view).value).toBe('none');
-    fireEvent.change(connectionSelect(view), { target: { value: 'mux' } });
+    changeControl(connectionSelect(view), { target: { value: 'mux' } });
 
     expect(view.getByText('跟随全局')).toBeTruthy();
     const muxSummary = view.getByText('Mux 参数').closest('.hop-target-mux');
@@ -261,7 +262,7 @@ describe('规则页 Mux Worker 池', () => {
 
     fireEvent.click(within(dialog).getByRole('button', { name: '单独配置' }));
     expect(muxField(dialog, '复用流数量').value).toBe('7');
-    fireEvent.change(muxField(dialog, '复用流数量'), { target: { value: '8' } });
+    changeControl(muxField(dialog, '复用流数量'), { target: { value: '8' } });
     fireEvent.click(within(dialog).getByRole('button', { name: '取消' }));
 
     await waitFor(() => expect(document.body.querySelector('.dialog-layer')).toBeNull());
@@ -278,7 +279,7 @@ describe('规则页 Mux Worker 池', () => {
     fireEvent.click(view.getByRole('button', { name: '配置参数' }));
     let dialog = view.getByRole('dialog', { name: '配置 新加坡中继 的 Mux' });
     fireEvent.click(within(dialog).getByRole('button', { name: '单独配置' }));
-    fireEvent.change(muxField(dialog, '复用流数量'), { target: { value: '8' } });
+    changeControl(muxField(dialog, '复用流数量'), { target: { value: '8' } });
     fireEvent.click(within(dialog).getByRole('button', { name: '应用' }));
 
     expect(view.getByText('单独配置')).toBeTruthy();
@@ -307,15 +308,15 @@ describe('规则页 Mux Worker 池', () => {
     fireEvent.click(view.getByRole('button', { name: '配置参数' }));
     const dialog = view.getByRole('dialog', { name: '配置 新加坡中继 的 Mux' });
     fireEvent.click(within(dialog).getByRole('button', { name: '单独配置' }));
-    fireEvent.change(muxField(dialog, '预热目标'), { target: { value: '5' } });
-    fireEvent.change(muxField(dialog, '复用阈值'), { target: { value: '4' } });
+    changeControl(muxField(dialog, '预热目标'), { target: { value: '5' } });
+    changeControl(muxField(dialog, '复用阈值'), { target: { value: '4' } });
     expect(within(dialog).getByText('预热目标不能大于复用阈值')).toBeTruthy();
     expect((within(dialog).getByRole('button', { name: '应用' }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(within(dialog).getByRole('button', { name: '取消' }));
     await waitFor(() => expect(document.body.querySelector('.dialog-layer')).toBeNull());
     expect(confirm).not.toHaveBeenCalled();
 
-    fireEvent.change(connectionSelect(view), { target: { value: 'none' } });
+    changeControl(connectionSelect(view), { target: { value: 'none' } });
     expect(view.queryByText('跟随全局')).toBeNull();
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
     await waitFor(() => expect(savedPools()).toEqual([{ t: 'none' }, { t: 'none' }]));

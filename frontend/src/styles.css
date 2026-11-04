@@ -9427,27 +9427,6 @@ textarea.f::placeholder {
   padding: 0 12px 13px;
   overflow: hidden;
 }
-/* 规则树自身有 `margin-bottom:-9px`（为铺满卡片的旧版本设置），会抵消上面大部分内距。
-   卡片现已自带内距，规则树不需要再向下延伸。 */
-.node-chain-use > .chain-rule-tree {
-  margin-bottom: 0;
-}
-/* 原标题带中的入口端口编辑器现在落在根节点摘要位，保持紧凑，不把树行重新撑成标题栏。 */
-.chain-rule-node-head .m-hop > .toolbar {
-  flex-wrap: nowrap;
-  justify-content: flex-end;
-  gap: 4px;
-  margin: 0;
-}
-.chain-rule-node-head .m-hop > .toolbar input.f {
-  width: 72px !important;
-  padding: 3px 6px;
-  font-size: 11.5px;
-}
-.chain-rule-node-head .m-hop > .toolbar .btn {
-  padding: 3px 6px;
-  font-size: 11px;
-}
 
 /* 卡片内的小型表格。此前 table.t 没有任何样式，单元格之间没有间距；
    在旧版的纯文本布局中不明显，放入卡片后表现突出。 */
@@ -10592,184 +10571,6 @@ input.f {
 .listener-map-terminal.is-proxy::before {
   background: var(--gold);
 }
-/* ═══ XRAY 链路：一条链一张卡 ═══
-   层级收敛为两级：卡片（一条链）→ 行（一台机器），展开的表单再降一级。
-   原实现为内容区 → 链块 → 树面板 → 行 → 表单，五层背景各有自己的边框和圆角，
-   形成嵌套结构，主次不明。
-
-   规则树铺满卡片宽度（用负外边距抵消卡片内距）：行是列表项，左右不留空白，
-   分隔线才能贯通整行，而不是在中途中断。 */
-.chain-rule-tree {
-  --indent: 16px;
-  margin: 0 -12px -9px;
-}
-.chain-rule-node {
-  min-width: 0;
-}
-
-/* 分隔线统一使用 border-top：N 行绘制 N 条线，第一条作为标题栏的分界，
-   末行下方不会多出一条无内容的线。 */
-/* 行使用 grid 而非 flex：右侧两列（规则数、中转口）需要逐行对齐。
-   使用 flex 时缩进通过 padding-left 实现，而名称和标签是不可收缩内容——
-   深至第五六层时，内容最小宽度之和超过容器宽度，flex:1 的占位压缩到 0 之后，
-   其余内容会超出右边界。每深一层整行右移 16px，最终中转口列被裁掉一半。
-
-   现在缩进仍使用 padding-left（第一列随之右移），但右侧两列定宽并贴靠容器右缘，
-   中间一格 minmax(0,1fr) 吸收全部宽度变化：名称过长时截断，不影响其他列。 */
-.chain-rule-node-head {
-  /* 必须声明 box-sizing：本仓库没有全局的 `*{box-sizing:border-box}`，
-     默认 content-box 下 `width:100%` 指内容宽度，缩进用的 padding-left 叠加在其外部——
-     每深一层整行多溢出 16px，右侧两列随之右移。 */
-  /* 第三列（重排按钮）定宽而非 auto：该组按钮只出现在主干节点上，使用 auto 时
-     有按钮的行与无按钮的行相差 55px，右侧两列会错位。无按钮时同样占位，
-     因为 hover 时该位置会出现按钮。 */
-  display: grid;
-  grid-template-columns: 9px minmax(0, 1fr) 72px 66px 150px;
-  box-sizing: border-box;
-  align-items: center;
-  gap: 6px;
-  margin: 0;
-  min-width: 0;
-  width: 100%;
-  padding: 7px 12px 7px calc(12px + min(var(--depth, 0), 6) * var(--indent));
-  border: 0;
-  border-top: 1px solid var(--line-soft);
-  border-radius: 0;
-  background: transparent;
-}
-/* 名称允许收缩和换行，右侧操作列保留自己的空间。 */
-.chain-rule-node-head .who {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  overflow: hidden;
-}
-.chain-rule-node-head .who > b {
-  min-width: 0;
-  overflow-wrap: anywhere;
-  white-space: normal;
-  text-align: left;
-}
-.chain-rule-node-head .who > .st {
-  flex: none;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-/* 摘要行即折叠开关。整行可点击：只点击三角图标时命中区域过小。
-   选择器匹配 `[role="button"]` 而非 `button`：行头已改为 div（内部需要放置重排按钮，
-   button 嵌套 button 是无效 HTML），若仍写 `button.` 该规则不会生效，
-   表现为光标不变为手型、hover 无反馈。 */
-.chain-rule-node-head[role='button'] {
-  text-align: left;
-  font: inherit;
-  color: inherit;
-  cursor: pointer;
-  transition:
-    background 0.12s,
-    box-shadow 0.12s;
-}
-.chain-rule-node-head .disc {
-  flex: none;
-  width: 9px;
-  font-size: 9px;
-  color: var(--ink-4);
-  line-height: 1;
-}
-/* 机器名是该行的主标识，使用正文色；右侧内容是次要信息，降一档。
-   .note 是段落样式（line-height:1.7 + margin-bottom），行内使用时必须清除这两个属性，
-   否则会被自身下外边距上移，与同行文字产生数像素错位。 */
-.chain-rule-node-head > .mono {
-  flex: none;
-  color: var(--ink);
-}
-.chain-rule-node-head .sp {
-  flex: 1;
-}
-.chain-rule-node-head > .note {
-  margin: 0;
-  line-height: inherit;
-  white-space: nowrap;
-  font-size: 11.5px;
-  color: var(--ink-3);
-}
-/* 规则树内的标签去掉边框，只保留浅底色。一行内三四个带边框的标签时，边框比文字更显著。 */
-.chain-rule-node-head .st {
-  border-color: transparent;
-  background: var(--hover-2);
-  color: var(--ink-3);
-  padding: 1px 7px;
-  font-size: 10px;
-  margin-right: 0;
-}
-.chain-rule-node-head .st-succeeded {
-  color: var(--ok);
-  background: color-mix(in srgb, var(--ok) 13%, transparent);
-}
-.chain-rule-node-head .st-gold,
-.chain-rule-node-head .st-warn {
-  color: var(--gold);
-  background: var(--gold-wash);
-}
-
-/* 同一台机器在其他位置已展开。此处不同步展开：两份相同的表单同时显示时，无法确定
-   当前正在编辑哪一份。此处只使用极淡底色和一条虚线左边框表示该机器已在别处展开，
-   点击可将编辑位置切换到此处。 */
-.chain-rule-node.same-open > .chain-rule-node-head {
-  background: color-mix(in srgb, var(--action) 4%, transparent);
-  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--action) 40%, transparent);
-}
-.chain-rule-node.same-open > .chain-rule-node-head .st {
-  color: var(--action);
-  background: var(--action-wash);
-}
-
-/* 展开状态：与 hover 同源的 accent 底色加左侧色条——当前展开项与可点击行属于同一类
-   状态，不应使用两套信号（灰色与蓝色）。 */
-.chain-rule-node.open > .chain-rule-node-head {
-  background: var(--action-wash);
-  box-shadow: inset 2px 0 0 var(--action);
-}
-.chain-rule-node.open > .chain-rule-node-head .disc {
-  color: var(--action);
-}
-/* hover 使用主题色而非灰色：该行可点击，而灰底与禁用、次要状态属于同一套信号。
-   选择器需比上面的 .open 更具体（0,3,1 > 0,3,0），否则悬停已展开的行时无反馈。 */
-.chain-rule-node > .chain-rule-node-head[role='button']:hover {
-  background: var(--action-wash);
-  box-shadow: inset 2px 0 0 var(--action);
-}
-
-/* 展开的表单：底色比行低一档，以表明它是该行的展开内容而非另一行。
-   不缩进、不留内距，占满整幅宽度——内部是 RuleEditor 的横向表格。
-   左侧一条淡 accent 色条，与行头展开时的 2px 色条同源（透过表单的半透明底色显示）。 */
-.chain-rule-body {
-  background: var(--sunk);
-  padding: 0;
-  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--action) 32%, transparent);
-}
-.chain-rule-orphans {
-  border-top: 1px dashed var(--line);
-}
-/* 该行是分组标题，不是树行。套用树行的 grid（9px 折叠箭头 / 名称 / 规则数 /
-   中转口 / 尾列）时，标题只有两个子元素，「未从入口展开」会落入 9px 的那一格，
-   五个字纵向排列，使整个标题高度达到 130px。因此改回单行布局。 */
-.chain-rule-orphans > .chain-rule-node-head {
-  display: flex;
-  align-items: baseline;
-  gap: 9px;
-  flex-wrap: wrap;
-  border-top: 0;
-  color: var(--ink-2);
-}
-.chain-rule-orphans > .chain-rule-node-head > b {
-  font: 600 12.5px var(--sans);
-  flex: none;
-}
-.chain-rule-orphans > .chain-rule-node-head > .note {
-  margin: 0;
-  min-width: 0;
-}
 /* 编译器补全仍是同一张规则表里的普通行。来源不是错误、选中或权限状态，因此不再使用
    虚线包围和整行底色；只在原操作列留下低调签名。只读角色没有操作列，签名便跟在动作
    内容末端，不改变表格列数。 */
@@ -10835,14 +10636,6 @@ input.f {
   border-color: var(--line);
   background: var(--sunk);
   cursor: default;
-}
-.chain-rule-tree .rule-editor {
-  padding: 7px 9px;
-  margin: 0;
-  background: color-mix(in srgb, var(--block) 72%, transparent);
-  border-color: var(--line-soft);
-  font-size: 12px;
-  border-radius: 0;
 }
 /* 规则表的根元素是 `fieldset`，使用它只是为了 `disabled` 属性（HTML 中唯一能一次禁用
    整棵子树表单控件的元素）。浏览器为 fieldset 设置的默认边框、内距，以及
@@ -11045,13 +10838,6 @@ input.f {
     gap: 6px;
   }
 }
-.chain-rule-tree .rule-editor > .toolbar:first-child {
-  display: none;
-}
-.chain-rule-tree .rule-editor > .note {
-  margin: 0 0 5px;
-  line-height: 1.45;
-}
 .rule-table td {
   padding: 5px 7px;
   vertical-align: top;
@@ -11077,74 +10863,6 @@ input.f {
 .rule-table select.f {
   padding: 0 23px 0 7px;
   font-size: 12px;
-}
-.chain-rule-tree .rule-editor .panel {
-  padding: 7px 9px;
-  margin: 7px 0 0;
-  background: color-mix(in srgb, var(--sunk) 58%, transparent);
-  border-color: var(--line-soft);
-}
-.chain-rule-tree .rule-editor .panel > header {
-  margin: 0 0 5px;
-}
-.chain-rule-tree .rule-editor .panel > header h4 {
-  font-size: 11px;
-}
-.chain-rule-tree .rule-editor .fgrid .row {
-  padding: 4px 0;
-  gap: 8px;
-}
-.chain-rule-tree .rule-editor .fgrid .k {
-  width: 58px;
-  font-size: 11px;
-}
-/* 转发目标的中转入口：目标名宽度随内容变化，不定宽；定宽右对齐用于成组的键值行对齐，
-   而此格中键是名称、值是控件，固定间距会留出大片空白 */
-.chain-rule-tree .rule-editor .fgrid .k.auto {
-  width: auto;
-  text-align: left;
-  white-space: nowrap;
-}
-/* 转发目标的中转入口：端口配置和转发加密两个带标签字段并排，中间用竖线分隔。
-   不使用 .sub（该类是块级元素，会使字段折成两行） */
-.chain-rule-tree .rule-editor .hop-in {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-.chain-rule-tree .rule-editor .hopfld {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex: none;
-}
-.chain-rule-tree .rule-editor .hopfld-lbl {
-  flex: none;
-  font-size: 10.5px;
-  letter-spacing: 0.05em;
-  color: var(--ink-4);
-}
-.chain-rule-tree .rule-editor .hopfld-sep {
-  flex: none;
-  width: 1px;
-  height: 16px;
-  background: var(--line);
-}
-/* 单位后缀（如「条流」）。字号和颜色与 .hopfld-lbl 一致：两者是同一字段的两部分，
-   分别位于输入框前后。不能使用 .sub：该类是块级元素，会使该格折到下一行。 */
-.chain-rule-tree .rule-editor .hopfld-unit {
-  flex: none;
-  font-size: 10.5px;
-  color: var(--ink-4);
-  margin-left: -2px;
-}
-.chain-rule-tree .rule-editor .fgrid .v .sub {
-  font-size: 10.5px;
-  line-height: 1.35;
-}
-.chain-rule-tree .rule-editor > .toolbar:last-child {
-  margin-top: 7px;
 }
 
 /* ═══ 规则表的窄屏适配 ═══
@@ -12510,35 +12228,6 @@ details.raw .tbl {
 .spine-ed .hop:focus-within .hop-ctl {
   opacity: 1;
   pointer-events: auto;
-}
-
-/* 树行末尾的摘要：两列各占一格（规则数 / 中转口），右对齐、等宽数字，便于纵向对比。
-   它们是 grid 的最后两列，因此无论缩进多深都在同一垂直线上。 */
-.chain-rule-node-head > .meta {
-  display: contents;
-}
-.chain-rule-node-head .m-rules {
-  text-align: right;
-  white-space: nowrap;
-}
-.chain-rule-node-head .m-hop {
-  text-align: right;
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.chain-rule-node-head .m-hop-direction {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* 端点标签：入口使用 accent。声明在 .st 的默认规则之后以覆盖颜色。 */
-.chain-rule-node-head .st.b-role,
-.chain-rule-node-head .st.b-chain {
-  color: var(--action);
-  background: var(--action-wash);
 }
 .d2 {
   color: var(--ink-2);
@@ -17980,10 +17669,6 @@ body.fg-dragging * {
   min-width: 0;
   cursor: default;
 }
-.pv-chain-fields .chain-rule-node-head:focus-visible {
-  outline: 2px solid var(--action);
-  outline-offset: 2px;
-}
 .pv-chain-fields .wzp-card > input {
   grid-column: 1;
   grid-row: 1;
@@ -18058,9 +17743,6 @@ body.fg-dragging * {
   resize: vertical;
 }
 .pv-chain-fields .wzr-tree {
-  margin: 0;
-}
-.pv-chain-fields .wzr-tree .chain-rule-tree {
   margin: 0;
 }
 .pv-chain-fields .wzr-empty,
@@ -19418,66 +19100,9 @@ h4.sec > .btn {
   display: inline-flex;
   align-items: center;
 }
-/* 规则树行内的删除：常驻显示，原因和样式与项目列表中的相同（见 .del-ctl 一节）。
-   此处原为 `opacity:0` 加 hover 显示，移动端无法访问；且同一操作在项目列表中
-   使用另一套样式，两处不一致。 */
-.chain-rule-node-head .hopctl {
-  display: flex;
-  justify-content: flex-end;
-  gap: 3px;
-  margin-right: 10px;
-}
 
 /* 逐跳树也按规则区域自己的宽度重排。它可能处在宽视口的窄左栏中，不能依赖全页的
    820px 手机断点。摘要改到第二行后，机器名、链标识与端点标签不会被右侧定宽列挤掉。 */
-@container rules (max-width: 820px) {
-  .chain-rule-tree {
-    --indent: 11px;
-  }
-  .chain-rule-node-head {
-    grid-template-columns: 9px minmax(0, 1fr) 26px;
-    grid-template-areas: 'disc who ctl' '.  meta meta';
-    row-gap: 3px;
-    padding-top: 9px;
-    padding-bottom: 9px;
-    padding-right: 12px;
-    padding-left: calc(12px + min(var(--depth, 0), 3) * var(--indent));
-  }
-  .chain-rule-node-head .disc {
-    grid-area: disc;
-    align-self: start;
-    margin-top: 4px;
-  }
-  .chain-rule-node-head .who {
-    grid-area: who;
-    flex-wrap: wrap;
-    overflow: visible;
-    gap: 5px 6px;
-  }
-  .chain-rule-node-head .who > .st {
-    overflow: visible;
-    text-overflow: clip;
-  }
-  .chain-rule-node-head .hopctl {
-    grid-area: ctl;
-    align-self: start;
-    margin-right: 0;
-  }
-  .chain-rule-node-head > .meta {
-    display: flex;
-    grid-area: meta;
-    align-items: center;
-    gap: 12px;
-    min-width: 0;
-  }
-  .chain-rule-node-head .m-rules,
-  .chain-rule-node-head .m-hop {
-    text-align: left;
-  }
-  .chain-rule-node-head .m-hop > .toolbar {
-    justify-content: flex-start;
-  }
-}
 
 /* ── 一条链的路径图 ──
    跳与跳之间用连线相接：实线加箭头表示流量方向。
@@ -38481,4 +38106,717 @@ button.site-usage-row:focus-visible {
 }
 .loading-skeleton-node-card > .loading-bar:nth-child(2) {
   height: 46px;
+}
+
+/* 链路规则 B：左侧机器树，右侧只编辑一台机器；配置状态继续由 RuleEditor 持有。 */
+.chain-rule-workspace {
+  display: grid;
+  grid-template-columns: 250px minmax(0, 1fr);
+  margin: 0 -12px -9px;
+  min-width: 0;
+  color: var(--ink);
+  font: 13px/1.45 var(--sans);
+}
+.rule-machine-tree {
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  padding: 10px 8px 14px;
+  border-right: 1px solid var(--line);
+}
+.rule-machine-node {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 7px 10px 7px calc(10px + min(var(--depth), 6) * 16px);
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .rule-machine-node:hover {
+    background: var(--hover);
+  }
+}
+.rule-machine-node.is-selected {
+  background: var(--action-wash);
+}
+.rule-machine-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.rule-machine-name b {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.rule-machine-via {
+  grid-column: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.rule-machine-go {
+  display: none;
+  grid-column: 2;
+  grid-row: 1 / span 2;
+}
+.rule-dirty-dot {
+  width: 5px;
+  height: 5px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--gold);
+}
+.rule-machine-detail {
+  min-width: 0;
+  padding: 10px 16px 16px 20px;
+}
+.rule-machine-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 12px;
+}
+.rule-machine-heading > div {
+  min-width: 0;
+}
+.rule-machine-title {
+  font-size: 17px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.rule-machine-subtitle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  align-items: center;
+  margin-top: 5px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.rule-machine-subtitle .st {
+  border: 0;
+  background: var(--hover-2);
+  color: var(--ink-3);
+}
+.rule-machine-tabs {
+  margin: 14px 0 10px;
+}
+.rule-machine-tabs .seg {
+  max-width: 100%;
+}
+.rule-machine-more {
+  flex: none;
+  width: 30px;
+  height: 28px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-3);
+  font: 20px var(--sans);
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .rule-machine-more:hover {
+    background: var(--hover);
+  }
+}
+.rule-machine-chain {
+  padding: 4px 0 8px;
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.rule-machine-back {
+  border: 0;
+  padding: 0 6px 8px 0;
+  background: none;
+  color: var(--action);
+  font: 15px var(--sans);
+  cursor: pointer;
+}
+.rule-empty-note {
+  margin: 14px 0;
+  color: var(--ink-3);
+  font-size: 13px;
+}
+.chain-rule-workspace [hidden],
+.rule-editor [hidden] {
+  display: none !important;
+}
+.rule-machine-detail .rule-editor {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  min-width: 0;
+}
+.rule-editor:where([data-section]) .rule-editor-table {
+  table-layout: auto;
+}
+.rule-editor:where([data-section]) .rule-editor-table thead {
+  display: none;
+}
+.rule-editor:where([data-section]) .rule-editor-table .rule-match-column {
+  width: 42%;
+}
+.rule-editor:where([data-section]) .rule-editor-table .rule-action-fields {
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.rule-editor:where([data-section]) .rule-editor-table td {
+  padding: 6px;
+  background: var(--hover);
+}
+.rule-editor:where([data-section]) .rule-match-fields {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+.rule-editor:where([data-section]) .rule-match-fields > input {
+  flex: 1;
+  width: 120px;
+  min-width: 0;
+}
+.rule-editor:where([data-section]) .rule-match-fields > .choice-select {
+  flex: none;
+  width: auto;
+}
+.rule-editor:where([data-section]) .rule-action-fields .external-target-picker {
+  flex: 1;
+  min-width: 110px;
+}
+.rule-editor:where([data-section]) .external-target-trigger {
+  height: 28px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0 7px;
+  gap: 6px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--hover-2);
+  color: var(--ink);
+}
+.rule-editor:where([data-section]) .external-target-trigger .external-target-kind {
+  display: none;
+}
+.rule-editor:where([data-section]) .external-target-trigger b {
+  font: 13px var(--sans);
+}
+.rule-editor:where([data-section]) .rule-readonly-select,
+.rule-editor:where([data-section]) .rule-readonly-target {
+  border: 0;
+  background: transparent;
+  min-height: 28px;
+}
+.rule-editor:where([data-section]) .rule-row-actions .btn {
+  border: 0;
+  background: none;
+  min-width: 24px;
+  padding: 0 4px;
+}
+.rule-editor:where([data-section]) .rule-add-actions {
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+.rule-editor:where([data-section]) .rule-add-actions .btn {
+  border: 0;
+  background: none;
+  color: var(--action);
+}
+.rule-draft-save {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.rule-connection-panel .hint,
+.rule-editor:where([data-section]) .external-summary-impact {
+  display: none;
+}
+.rule-editor:where([data-section]) .rule-connection-panel {
+  border: 0;
+  padding: 0;
+  margin: 0 !important;
+  background: none;
+  box-shadow: none;
+}
+.rule-editor:where([data-section]) .rule-connection-panel > header {
+  display: none;
+}
+.rule-editor:where([data-section]) .listener-reference-list {
+  display: grid;
+  gap: 12px;
+}
+.rule-editor:where([data-section]) .listener-reference-row {
+  padding: 0 14px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--hover);
+}
+.rule-editor:where([data-section]) .listener-reference-main {
+  min-height: 40px;
+  border-bottom: 1px solid var(--line);
+}
+.rule-editor:where([data-section]) .hop-target-facts,
+.rule-editor:where([data-section]) .listener-inline-facts {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+.rule-editor:where([data-section]) .hop-target-facts > label,
+.rule-editor:where([data-section]) .listener-inline-facts > label,
+.rule-connection-path {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  min-height: 40px;
+  border-bottom: 1px solid var(--line);
+}
+.rule-connection-path > span:first-child {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.rule-editor:where([data-section]) .hop-target-facts .f {
+  width: max-content;
+  max-width: 100%;
+}
+.rule-editor:where([data-section]) .hop-target-facts input {
+  width: 100px;
+}
+.rule-editor:where([data-section]) .hop-target-note {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.rule-editor:where([data-section]) .rule-dial-fields {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+.rule-editor:where([data-section]) .rule-dial-fields > .mono {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11.5px;
+}
+.rule-dns-choices {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.rule-dns-choices > label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px;
+}
+.rule-dns-choices .mono {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+
+/* 关键选择共用首版实底菜单，触发器保留原型的填充按钮。 */
+button.choice-select.f {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--hover-2);
+  color: var(--ink);
+  font: 13px var(--sans);
+  text-align: left;
+  cursor: pointer;
+}
+.choice-select > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.choice-chevron {
+  flex: none;
+  font: 9px/5px var(--mono);
+  color: var(--ink-3);
+}
+.choice-select:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.choice-select:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 1px;
+}
+.choice-layer .dialog-surface.choice-menu,
+.choice-layer .dialog-surface.external-target-menu {
+  width: min(430px, calc(100vw - 20px));
+  max-height: min(520px, calc(100dvh - 20px));
+  padding: 5px;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--block);
+  color: var(--ink);
+  box-shadow: var(--shadow);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  box-sizing: border-box;
+}
+.choice-layer .dialog-surface.choice-menu {
+  width: min(340px, calc(100vw - 20px));
+}
+.choice-menu-section {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 6px 5px;
+  color: var(--ink-4);
+  font: 10px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.choice-menu-section::after {
+  content: '';
+  height: 1px;
+  flex: 1;
+  background: var(--line);
+}
+.choice-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px;
+  min-height: 34px;
+  box-sizing: border-box;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  color: var(--ink);
+  font: 13px var(--sans);
+  text-align: left;
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .choice-menu button:hover {
+    background: var(--hover-2);
+    outline: none;
+  }
+}
+.choice-menu button:focus-visible {
+  background: var(--hover-2);
+  outline: none;
+}
+.choice-menu button.on {
+  border: 1px dashed var(--action);
+  background: var(--action-wash);
+}
+.choice-menu button:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+.choice-menu-copy {
+  flex: 1;
+  min-width: 0;
+}
+.choice-menu button small {
+  color: var(--ink-3);
+  font: 10.5px var(--mono);
+  max-width: 58%;
+}
+.choice-menu-badge {
+  flex: none;
+  min-width: 35px;
+  padding: 2px 5px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--ink-3);
+  font: 9px var(--mono);
+  text-align: center;
+}
+.choice-layer .external-target-menu > button.on,
+.choice-layer .external-target-option-select.on {
+  border: 1px dashed var(--action);
+  background: var(--action-wash);
+}
+.choice-layer .external-target-search {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--sunk);
+}
+.choice-layer .external-target-search:focus {
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--action);
+}
+.choice-layer .external-target-new-icon {
+  display: none;
+}
+.choice-layer .dialog-surface.machine-action-menu {
+  width: min(300px, calc(100vw - 20px));
+  border-radius: 10px;
+  background: var(--float);
+  backdrop-filter: var(--float-filter);
+}
+.machine-action-menu button {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+}
+.machine-action-menu button b {
+  font-weight: 500;
+}
+.machine-action-menu button small {
+  max-width: 100%;
+  font: 11px var(--sans);
+}
+.machine-action-menu button.danger {
+  color: var(--err);
+}
+@media (hover: hover) {
+  .machine-action-menu button:hover:not(:disabled) {
+    color: white;
+    background: var(--action);
+  }
+}
+.machine-action-menu button:focus-visible {
+  color: white;
+  background: var(--action);
+}
+@media (hover: hover) {
+  .machine-action-menu button.danger:hover:not(:disabled) {
+    background: var(--err);
+  }
+}
+.machine-action-menu button.danger:focus-visible {
+  background: var(--err);
+}
+@media (hover: hover) {
+  .machine-action-menu button:hover:not(:disabled) small {
+    color: inherit;
+  }
+}
+.machine-action-menu button:focus-visible small {
+  color: inherit;
+}
+.choice-layer.drawer {
+  align-items: end;
+}
+.choice-layer.drawer > .dialog-surface.choice-menu,
+.choice-layer.drawer > .dialog-surface.external-target-menu {
+  position: relative;
+  top: auto;
+  left: auto;
+  width: 100%;
+  max-height: min(80dvh, 680px);
+  border-radius: 7px 7px 0 0;
+  padding: 10px 10px max(12px, env(safe-area-inset-bottom));
+}
+.choice-layer.drawer .choice-menu button,
+.choice-layer.drawer .external-target-menu button {
+  min-height: 46px;
+  font-size: 15px;
+}
+.choice-layer.drawer .choice-menu-section,
+.choice-layer.drawer .external-target-menu-label {
+  font-size: 11px;
+}
+.chain-rule-workspace.is-phone {
+  display: block;
+}
+.chain-rule-workspace.is-phone .rule-machine-tree {
+  border: 0;
+  padding: 6px 8px 12px;
+}
+.chain-rule-workspace.is-phone .rule-machine-node {
+  min-height: 56px;
+  padding-block: 9px;
+}
+.chain-rule-workspace.is-phone .rule-machine-name {
+  font-size: 15px;
+}
+.chain-rule-workspace.is-phone .rule-machine-via {
+  font-size: 13px;
+}
+.chain-rule-workspace.is-phone .rule-machine-go {
+  display: block;
+  color: var(--ink-4);
+  font-size: 20px;
+}
+.chain-rule-workspace.is-phone .rule-machine-detail {
+  padding: 8px 13px 16px;
+}
+/* The table reflows at the detail's available width, including a narrow desktop panel. */
+.rule-machine-detail {
+  container-type: inline-size;
+  container-name: rule-detail;
+}
+@container rule-detail (max-width: 640px) {
+  .rule-editor:where([data-section]) .rule-editor-table,
+  .rule-editor:where([data-section]) .rule-editor-table tbody {
+    display: block;
+    width: 100%;
+  }
+  .rule-editor:where([data-section]) .rule-editor-table colgroup {
+    display: none;
+  }
+  .rule-editor:where([data-section]) .rule-editor-table tr {
+    display: grid;
+    grid-template-columns: 22px minmax(0, 1fr) auto;
+    border-bottom: 1px solid var(--line);
+    padding: 6px 0;
+  }
+  .rule-editor:where([data-section]) .rule-editor-table td {
+    display: block;
+    width: auto !important;
+    border: 0;
+  }
+  .rule-editor:where([data-section]) .rule-editor-table td:first-child {
+    grid-column: 1;
+    grid-row: 1 / span 2;
+  }
+  .rule-editor:where([data-section]) .rule-editor-table .rule-match-cell {
+    grid-column: 2 / -1;
+  }
+  .rule-editor:where([data-section]) .rule-editor-table .rule-action-cell {
+    grid-column: 2;
+  }
+  .rule-editor:where([data-section]) .rule-editor-table .rule-operations-cell,
+  .rule-editor:where([data-section]) .rule-fallback-sign {
+    grid-column: 3;
+    grid-row: 2;
+    align-self: center;
+  }
+  .rule-editor:where([data-section]) .rule-editor-table .rule-action-fields {
+    display: flex;
+    flex-direction: row;
+  }
+  .rule-editor:where([data-section]) .rule-editor-table .rule-action-fields .external-target-picker {
+    width: 100%;
+    flex-basis: 100%;
+  }
+  .rule-editor:where([data-section]) .rule-connection-path,
+  .rule-editor:where([data-section]) .hop-target-facts > label {
+    grid-template-columns: 85px minmax(0, 1fr);
+  }
+}
+.rule-editor:where([data-section]) .listener-reference-row {
+  display: block;
+}
+.rule-editor:where([data-section]) .listener-reference-main {
+  display: flex;
+}
+.rule-editor:where([data-section]) .hop-target-note > span,
+.rule-editor:where([data-section]) .hop-target-note:not(:has(strong)),
+.rule-editor:where([data-section]) .listener-reference-row > p:not(.hop-target-note) {
+  display: none;
+}
+.rule-editor:where([data-section]) .rule-match-fields input {
+  font-family: var(--sans);
+}
+.rule-machine-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.rule-machine-detail .rule-editor:where([data-section]) .rule-editor-table td {
+  background: transparent;
+}
+.rule-machine-detail .rule-editor:where([data-section]) .rule-editor-table tr {
+  background: var(--hover);
+}
+.rule-machine-detail .rule-editor:where([data-section]) :is(.hop-target-facts, .listener-inline-facts) > label {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+.rule-machine-detail .rule-editor:where([data-section]) :is(.hop-target-facts, .listener-inline-facts) > label > small {
+  font-size: 12px;
+}
+@container rule-detail (max-width: 640px) {
+  .rule-machine-detail .rule-editor:where([data-section]) .rule-editor-table tr {
+    grid-template-columns: 22px minmax(0, 1fr);
+  }
+  .rule-machine-detail .rule-editor:where([data-section]) .rule-editor-table td:first-child {
+    grid-row: 1 / span 3;
+    align-self: start;
+  }
+  .rule-machine-detail .rule-editor:where([data-section]) .rule-editor-table .rule-action-cell {
+    grid-column: 2 / -1;
+  }
+  .rule-machine-detail .rule-editor:where([data-section]) .rule-editor-table .rule-operations-cell {
+    grid-column: 2 / -1;
+    grid-row: 3;
+    justify-self: end;
+  }
+  .rule-machine-detail
+    .rule-editor:where([data-section])
+    .rule-editor-table
+    .rule-action-fields
+    .external-target-picker {
+    width: auto;
+    flex: 1;
+    min-width: 90px;
+  }
+  .rule-machine-detail .rule-editor:where([data-section]) :is(.hop-target-facts, .listener-inline-facts) > label {
+    grid-template-columns: 85px minmax(0, 1fr);
+  }
+}
+.choice-layer .external-target-menu > button.external-target-new {
+  grid-template-columns: minmax(0, 1fr) auto;
+  color: var(--action);
+  border-color: color-mix(in srgb, var(--action) 42%, var(--line));
+  background: var(--action-wash);
+}
+/* Phone menus use the shared drawer focus boundary and rise from the bottom. */
+@media (prefers-reduced-motion: no-preference) {
+  .choice-layer.drawer[data-motion-state='entering'] > .dialog-surface {
+    animation-name: choice-sheet-in;
+  }
+  .choice-layer.drawer[data-motion-state='exiting'] > .dialog-surface {
+    animation-name: choice-sheet-out;
+  }
+}
+@keyframes choice-sheet-in {
+  from {
+    opacity: 0.72;
+    transform: translate3d(0, 32px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+@keyframes choice-sheet-out {
+  to {
+    opacity: 0.72;
+    transform: translate3d(0, 32px, 0);
+  }
 }

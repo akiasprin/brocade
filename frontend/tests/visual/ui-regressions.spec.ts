@@ -41,19 +41,15 @@ for (const [width, theme] of [
     await expect(page).toHaveScreenshot(`reverse-stale-${width}.png`);
   });
 }
-test('deep rule heads keep the complete name outside the delete control', async ({ page }) => {
+test('deep machine names remain reachable in the rule sidebar', async ({ page }) => {
   await open(page, 'rules', 320, 844);
-  const heads = page.locator('.chain-rule-node-head');
-  await expect(heads).toHaveCount(12);
-  const last = heads.last();
+  const nodes = page.locator('.rule-machine-node');
+  await expect(nodes).toHaveCount(12);
+  const last = nodes.last();
   await last.scrollIntoViewIfNeeded();
-
-  const text = await last.locator('.who b').boundingBox();
-  const control = await last.locator('.hopctl').boundingBox();
-  expect(text!.x + text!.width).toBeLessThanOrEqual(control!.x);
-  expect(await last.locator('.who b').evaluate(el => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1);
-  expect(await last.evaluate(el => parseFloat(getComputedStyle(el).paddingLeft))).toBeLessThanOrEqual(45);
-
+  expect(await last.evaluate(el => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1);
+  await last.click();
+  await expect(page.locator('.rule-machine-title')).toContainText(await last.locator('b').innerText());
   await expect(page).toHaveScreenshot('deep-rules-320.png');
 });
 test('advanced protocol fields keep the right border clickable', async ({ page }) => {
