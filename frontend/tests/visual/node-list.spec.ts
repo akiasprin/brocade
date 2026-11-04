@@ -51,7 +51,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
     ],
   });
   test.describe(`Comet health cards ${engine}`, () => {
-    test('live NIC frames update current rates and preserve gaps', async ({ page }) => {
+    test('live NIC frames tolerate Console clock skew and preserve gaps', async ({ page }) => {
       const errors = await preview(page, 390, 'dark');
       const target = card(page, '香港 HKIX');
       await target.scrollIntoViewIfNeeded();
@@ -62,7 +62,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
             .__nodePreviewPush;
           push('/realtime/nodes/events', 'sample', {
             node_id: 'hk-hkix',
-            received_at_unix_millis: Date.now() + (gap ? 1 : 0),
+            received_at_unix_millis: Date.now() + 4_000 + (gap ? 1 : 0),
             sample: { rx_bytes_per_sec: 15_000_000, tx_bytes_per_sec: 5_000_000, has_gap: gap },
           });
         }, gap);
@@ -144,10 +144,13 @@ for (const engine of ['chromium', 'webkit'] as const) {
       });
     }
     for (const metrics of ['failed', 'stale', 'gap']) {
-      test(`metrics ${metrics} keep unknown readings`, async ({ page }) => {
+      test(`metrics ${metrics} preserve accepted resources or show missing readings`, async ({ page }) => {
         const errors = await preview(page, 1440, 'dark', 'typical', `metrics=${metrics}`);
         await expect(page.locator('.node-card-rate:not(.none)')).toHaveCount(0);
-        await expect(page.locator('.node-card-resource.none')).toHaveCount(81);
+        if (metrics === 'stale') {
+          await expect(card(page, '澳门 CTM').locator('.node-card-resources')).toHaveAttribute('data-state', 'ready');
+          await expect(card(page, '澳门 CTM').locator('.node-card-resource.none')).toHaveCount(0);
+        } else await expect(page.locator('.node-card-resource.none')).toHaveCount(81);
         await expect(page.locator('.node-card-comet-now')).toHaveCount(0);
         await noOverflow(page);
         await expect(page).toHaveScreenshot(`comet-${engine}-metrics-${metrics}.png`);

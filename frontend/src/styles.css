@@ -26161,9 +26161,6 @@ body.observe-brushing .observe-chart-tip {
 .node-card-comet.tone-idle {
   color: var(--ink-4);
 }
-.node-card-comet.stale {
-  opacity: 0.55;
-}
 .node-card-comet-now {
   position: absolute;
   left: 100%;

@@ -39,7 +39,7 @@ afterEach(() => {
 });
 const advance = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms));
 
-it('accepts actual zero rates and rejects gaps, disconnected nodes and stale or future readings', () => {
+it('accepts actual zero rates and Console clock skew while rejecting gaps, disconnections and expired readings', () => {
   const event = {
     node_id: 'n',
     received_at_unix_millis: 10_000,
@@ -48,7 +48,7 @@ it('accepts actual zero rates and rejects gaps, disconnected nodes and stale or 
   const node: FleetRealtimeNode = { connected: true, active: true, intervalSecs: 5, latest: event };
   expect(freshFleetNicSample(node, 25_000)).toBe(event);
   expect(freshFleetNicSample(node, 25_001)).toBeNull();
-  expect(freshFleetNicSample(node, 8_999)).toBeNull();
+  expect(freshFleetNicSample(node, 6_000)).toBe(event);
   expect(freshFleetNicSample({ ...node, connected: false }, 10_000)).toBeNull();
   expect(freshFleetNicSample({ ...node, active: false }, 10_000)).toBeNull();
   expect(

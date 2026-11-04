@@ -656,7 +656,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
     refetchInterval: 30_000,
     retry: false,
   });
-  const health = useMetricQuery({
+  const health = useQuery({
     queryKey: ['node-load-list', 'windows', LIST_HEALTH_WINDOWS],
     queryFn: () => fetchNodeLoadListWindows(LIST_HEALTH_WINDOWS),
     enabled: nodes.isSuccess,
@@ -1099,7 +1099,7 @@ function NodeCard({
           </span>
         )}
       </span>
-      <NodeCardComet samples={samples} tone={retired ? 'idle' : lamp.tone} stale={!current} />
+      <NodeCardComet samples={samples} tone={retired ? 'idle' : lamp.tone} current={current} />
       <span className="node-card-foot">
         <span className="node-card-now">
           当前{' '}
@@ -1136,8 +1136,7 @@ function NodeCard({
       <NodeCardResources
         id={healthId}
         load={health}
-        live={snapshotFresh && live === 'ok' && !retired}
-        now={now}
+        live={!retired && (node.runtime_report_fresh || node.desired_poll_fresh)}
         pending={healthPending}
         failed={healthFailed}
       />
@@ -1171,8 +1170,8 @@ function NodeCard({
   );
 }
 
-/** The whole history stays visible; only the newest, fresh sample gets an endpoint. */
-function NodeCardComet({ samples, tone, stale }: { samples: NodeNicView['series']; tone: string; stale: boolean }) {
+/** History keeps its contrast through refreshes; freshness only controls the endpoint. */
+function NodeCardComet({ samples, tone, current }: { samples: NodeNicView['series']; tone: string; current: boolean }) {
   const gradient = `node-card-${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`;
   const values = observeSeriesData(
     samples.map(sample => sample.window_end_unix_secs),
@@ -1189,7 +1188,7 @@ function NodeCardComet({ samples, tone, stale }: { samples: NodeNicView['series'
   const top =
     last == null ? null : ((height - 0.5 - Math.min(1, Math.max(0, last) / peak) * (height - 3)) / height) * 100;
   return (
-    <span className={`node-card-comet tone-${tone}${stale ? ' stale' : ''}`} aria-hidden="true">
+    <span className={`node-card-comet tone-${tone}`} aria-hidden="true">
       <svg viewBox={`0 0 ${span} ${height}`} preserveAspectRatio="none">
         <defs>
           <linearGradient id={`${gradient}-line`} gradientUnits="userSpaceOnUse" x1="0" x2={span} y1="0" y2="0">
@@ -1209,7 +1208,7 @@ function NodeCardComet({ samples, tone, stale }: { samples: NodeNicView['series'
           <path key={`line-${index}`} className="trail" d={path} stroke={`url(#${gradient}-line)`} />
         ))}
       </svg>
-      {!stale && top !== null && <i className="node-card-comet-now" style={{ top: `${top}%` }} />}
+      {current && top !== null && <i className="node-card-comet-now" style={{ top: `${top}%` }} />}
     </span>
   );
 }
@@ -1245,28 +1244,26 @@ function NodeCardResources({
   id,
   load,
   live,
-  now,
   pending,
   failed,
 }: {
   id: string;
   load?: NodeLoadView;
   live: boolean;
-  now: number;
   pending: boolean;
   failed: boolean;
 }) {
   const latest = load?.series.at(-1);
-  const age = latest ? now / 1000 - latest.window_end_unix_secs : Infinity;
-  const fresh = live && !failed && !!latest && !latest.has_gap && age >= -1 && age <= 60;
-  // Never reach backward past the 3-minute range to replace missing or stale observations.
-  const recent = fresh
+  const available = live && !failed && !!latest && !latest.has_gap;
+  // The server owns sample timestamps and online status. Keep the last reading until new data
+  // arrives; a browser clock offset or adjustment must never invalidate an accepted observation.
+  const recent = available
     ? load!.series
         .filter(
           sample =>
             !sample.has_gap &&
-            sample.window_end_unix_secs >= now / 1000 - 180 &&
-            sample.window_end_unix_secs <= now / 1000 + 1,
+            sample.window_end_unix_secs >= latest.window_end_unix_secs - 180 &&
+            sample.window_end_unix_secs <= latest.window_end_unix_secs,
         )
         .slice(-LIST_HEALTH_WINDOWS)
     : [];
@@ -1297,19 +1294,19 @@ function NodeCardResources({
     },
     {
       label: '磁盘',
-      share: used(fresh ? latest!.disk_free_bytes : null, load?.host?.disk_total_bytes),
+      share: used(available ? latest!.disk_free_bytes : null, load?.host?.disk_total_bytes),
       warn: 0.9,
       bad: 0.97,
       basis: '最新窗口磁盘占用',
     },
   ];
-  const state = failed ? 'error' : pending ? 'pending' : fresh ? 'ready' : 'unknown';
+  const state = failed ? 'error' : pending ? 'pending' : available ? 'ready' : 'unknown';
   const why = failed
     ? '主机指标加载失败'
     : pending
       ? '读取主机指标中'
-      : !fresh
-        ? '没有新鲜的主机采样'
+      : !available
+        ? '没有可用的主机采样'
         : `${recent.length} 个有效窗口；最新采样 ${iso(latest!.window_end_unix_secs)}`;
   return (
     <span id={id} className="node-card-resources" data-state={state} title={why}>

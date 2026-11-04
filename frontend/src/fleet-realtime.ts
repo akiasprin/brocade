@@ -24,12 +24,13 @@ export interface FleetRealtimeNode {
 /** Connection evidence and sampling freshness describe the NIC reading, not Agent lifecycle. */
 export function freshFleetNicSample(node: FleetRealtimeNode | undefined, nowMillis: number) {
   const event = node?.latest;
+  // Receipt time comes from Console, not this browser. A slightly faster Console clock must
+  // not reject every live reading; connection, gaps and the existing expiry bound still apply.
   if (
     !node?.connected ||
     !node.active ||
     !event ||
     event.sample.has_gap ||
-    nowMillis - event.received_at_unix_millis < -1_000 ||
     nowMillis - event.received_at_unix_millis > Math.max(10_000, node.intervalSecs * 3_000)
   )
     return null;

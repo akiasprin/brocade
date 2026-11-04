@@ -75,7 +75,7 @@ it('shows live NIC rates and gaps without replacing the historical curve', async
   act(() =>
     source.send('sample', {
       node_id: machine.id,
-      received_at_unix_millis: Date.now(),
+      received_at_unix_millis: Date.now() + 4_000,
       sample: { rx_bytes_per_sec: 15_000_000, tx_bytes_per_sec: 5_000_000, has_gap: false },
     }),
   );
@@ -85,7 +85,7 @@ it('shows live NIC rates and gaps without replacing the historical curve', async
   act(() =>
     source.send('sample', {
       node_id: machine.id,
-      received_at_unix_millis: Date.now() + 1,
+      received_at_unix_millis: Date.now() + 4_001,
       sample: { rx_bytes_per_sec: 0, tx_bytes_per_sec: 0, has_gap: true },
     }),
   );
@@ -394,22 +394,37 @@ describe('comet and health-ring cards', () => {
     await waitFor(() => expect(readings()).toEqual(['0%', '0%', '0%']));
     expect(document.querySelectorAll('.node-card-resource.none')).toHaveLength(0);
   });
-  it.each(['stale', 'gap', 'missing', 'offline', 'retired', 'invalid-totals', 'future'] as const)(
+  it.each([-600, 600])('shows accepted resource windows with a %i-second browser clock offset', async offset => {
+    const now = Math.floor(Date.now() / 1000);
+    const view = loadListView(machine, now);
+    view.host = { ...view.host!, mem_total_bytes: 1000, disk_total_bytes: 1000 };
+    view.series = view.series.map(sample => ({
+      ...sample,
+      window_start_unix_secs: sample.window_start_unix_secs + offset,
+      window_end_unix_secs: sample.window_end_unix_secs + offset,
+      cpu_user_pct: 20,
+      cpu_sys_pct: 5,
+      cpu_softirq_pct: 0,
+      mem_available_bytes: 600,
+      disk_free_bytes: 700,
+    }));
+    const page = mount(fleet([machine]), admin, true, { nic: [], traffic: [], health: [view] });
+    await waitFor(() => expect(readings()).toEqual(['25%', '40%', '30%']));
+    const next = { ...view, series: view.series.map(sample => ({ ...sample, cpu_user_pct: 30 })) };
+    await act(async () => page.client.setQueryData(['node-load-list', 'windows', 6], { nodes: [next] }));
+    await waitFor(() => expect(readings()).toEqual(['35%', '40%', '30%']));
+  });
+  it.each(['gap', 'missing', 'offline', 'retired', 'invalid-totals'] as const)(
     'does not report %s resource observations as healthy',
     async kind => {
       const now = Math.floor(Date.now() / 1000);
       const view = loadListView(machine, now);
       const nodes = fleet([machine]);
-      if (kind === 'stale' || kind === 'future')
-        view.series = view.series.map(sample => ({
-          ...sample,
-          window_start_unix_secs: sample.window_start_unix_secs + (kind === 'stale' ? -300 : 300),
-          window_end_unix_secs: sample.window_end_unix_secs + (kind === 'stale' ? -300 : 300),
-        }));
       if (kind === 'gap') view.series.at(-1)!.has_gap = true;
       if (kind === 'missing') view.series = [];
       if (kind === 'offline') {
         nodes[0].runtime_report_fresh = false;
+        nodes[0].desired_poll_fresh = false;
         nodes[0].last_poll_at = new Date(Date.now() - 300_000).toISOString();
       }
       if (kind === 'retired') {
