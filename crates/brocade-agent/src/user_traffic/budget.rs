@@ -369,22 +369,34 @@ pub(super) struct FetchJob {
     pool: Arc<Pool>,
     generation: u64,
     request: UserBudgetRequest,
+    deadline: Instant,
 }
 
-pub(super) fn start_fetchers() -> Result<SyncSender<FetchJob>, String> {
+pub(super) type FetchSender = SyncSender<FetchJob>;
+
+pub(super) fn start_fetchers() -> Result<FetchSender, String> {
     let (sender, receiver) = mpsc::sync_channel::<FetchJob>(MAX_CLIENTS);
     let receiver = Arc::new(Mutex::new(receiver));
     for index in 0..FETCH_WORKERS {
         let receiver = Arc::clone(&receiver);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| "user budget HTTP runtime unavailable")?;
+        let client = crate::http::asynchronous::control_client(1)?;
         thread::Builder::new()
             .name(format!("user-budget-fetch-{index}"))
-            .spawn(move || fetch_loop(receiver))
+            .spawn(move || fetch_loop(receiver, runtime, client))
             .map_err(|_| "user budget fetch worker unavailable")?;
     }
     Ok(sender)
 }
 
-fn fetch_loop(receiver: Arc<Mutex<Receiver<FetchJob>>>) {
+fn fetch_loop(
+    receiver: Arc<Mutex<Receiver<FetchJob>>>,
+    runtime: tokio::runtime::Runtime,
+    client: reqwest::Client,
+) {
     loop {
         let job = match receiver.lock() {
             Ok(receiver) => match receiver.recv() {
@@ -397,13 +409,16 @@ fn fetch_loop(receiver: Arc<Mutex<Receiver<FetchJob>>>) {
         let result = if job.service.generation.load(Ordering::Acquire) != job.generation {
             Err("user budget policy changed".into())
         } else {
-            fetch(&job.service, &job.request).and_then(|grant| {
-                let managed = !matches!(grant, UserBudgetGrant::Unlimited { managed: false, .. });
-                if !matches!(grant, UserBudgetGrant::Retry { .. }) {
-                    remember(&job.service, &job.request.source, managed)?;
-                }
-                Ok(grant)
-            })
+            runtime
+                .block_on(fetch(&job.service, &job.request, &client, job.deadline))
+                .and_then(|grant| {
+                    let managed =
+                        !matches!(grant, UserBudgetGrant::Unlimited { managed: false, .. });
+                    if !matches!(grant, UserBudgetGrant::Retry { .. }) {
+                        remember(&job.service, &job.request.source, managed)?;
+                    }
+                    Ok(grant)
+                })
         };
         let Ok(mut state) = job.pool.state.lock() else {
             continue;
@@ -510,6 +525,8 @@ fn schedule(
         pool: Arc::clone(pool),
         generation: state.generation,
         request,
+        // Queueing consumes the same short budget as the asynchronous request.
+        deadline: now + Duration::from_millis(BUDGET_TTL_MS),
     };
     match service.fetcher.try_send(job) {
         Ok(()) => {
