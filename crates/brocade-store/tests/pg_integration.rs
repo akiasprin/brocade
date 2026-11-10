@@ -563,14 +563,18 @@ async fn certificate_scan_lock_is_shared_by_console_instances() {
         "a second worker must skip while issuance is active"
     );
     drop(first);
-    assert!(
-        db.store
-            .try_certificate_scan_lock()
-            .await
-            .unwrap()
-            .is_some(),
-        "dropping the transaction releases the lock"
-    );
+    // SQLx queues rollback on drop; another pooled connection can reach PostgreSQL first.
+    // Assert eventual release while retaining the acquired lock for the rest of the test.
+    let _next = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(lock) = db.store.try_certificate_scan_lock().await.unwrap() {
+                break lock;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dropping the transaction releases the lock after asynchronous rollback");
 }
 
 #[tokio::test]
