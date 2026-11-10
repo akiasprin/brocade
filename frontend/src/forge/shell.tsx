@@ -79,10 +79,12 @@ const NAV: Face[] = [
   { key: 'usage', label: '用量', icon: 'usage' },
 ];
 
-/* 手机端保留四个主要入口，用量和发布移入账户菜单。
+/* 手机端保留四个主要入口：基础版常驻用量，容器版在机器右侧放容器、用量收入菜单。
    全部从同一份 Face 定义派生，避免角色权限和名称分叉。 */
-const MOBILE_NAV = NAV.filter(f => ['nodes', 'cvm', 'chains', 'users'].includes(f.key));
-const MOBILE_MORE = NAV.filter(f => f.key === 'deploy' || f.key === 'usage');
+const MOBILE_NAV = NAV.filter(f =>
+  (CVM_ENABLED ? ['nodes', 'cvm', 'chains', 'users'] : ['nodes', 'chains', 'users', 'usage']).includes(f.key),
+);
+const MOBILE_MORE = NAV.filter(f => f.key === 'deploy' || (CVM_ENABLED && f.key === 'usage'));
 
 // 收入账户牌菜单的项：都是低频访问的页面，占用顶栏位置的收益较低。
 // 窄屏同理：该行只放 NAV 的主工作流，这些低频页面仍从账户牌菜单进入。

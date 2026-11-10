@@ -29,6 +29,12 @@ for (const width of [1440, 390]) {
     await expect(page.locator('.nd-page-head')).toBeVisible();
     const cvm = page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: '容器', exact: true });
     await expect(cvm).toHaveCount(flavor === 'cvm' ? 1 : 0);
+    const primary = page.getByRole('navigation', { name: '主导航' });
+    if (width === 390) {
+      await expect(primary.locator('.fg-nv-label')).toHaveText(
+        flavor === 'base' ? ['机器', '线路', '用户', '用量'] : ['机器', '容器', '线路', '用户'],
+      );
+    }
     if (flavor === 'base') {
       await expect(page.getByText(/^CUBE(?:\[|$)/)).toHaveCount(0);
       await page.clock.runFor(31_000);
@@ -40,6 +46,20 @@ for (const width of [1440, 390]) {
     }
     await page.evaluate(() => document.fonts.ready);
     await expect(page).toHaveScreenshot(`${flavor}-machine-${width}.png`, { clip: { x: 0, y: 0, width, height: 190 } });
+    if (width === 390) {
+      await page.getByRole('button', { name: /账户与更多功能/ }).click();
+      const menu = page.getByRole('menu', { name: '账户与更多功能' });
+      await expect(menu).toBeVisible();
+      await expect(menu.getByRole('menuitem', { name: '用量', exact: true })).toHaveCount(flavor === 'cvm' ? 1 : 0);
+      await expect(menu).toHaveScreenshot(`${flavor}-mobile-menu.png`);
+      if (flavor === 'cvm') {
+        await menu.getByRole('menuitem', { name: '用量', exact: true }).click();
+      } else {
+        await page.keyboard.press('Escape');
+        await primary.getByRole('button', { name: '用量', exact: true }).click();
+      }
+      await expect(page).toHaveURL(/#\/usage$/);
+    }
     await page.evaluate(() => {
       location.hash = '#/cvm';
     });

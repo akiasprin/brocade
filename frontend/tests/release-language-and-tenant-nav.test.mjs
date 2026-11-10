@@ -69,7 +69,8 @@ test('流量预测是管理员独立页面，桌面与手机都从账户菜单�
   const mobileNav = shell.match(/const MOBILE_NAV = ([^;]+);/)?.[1] ?? '';
   const mobileMore = shell.match(/const MOBILE_MORE = ([\s\S]*?);\n/)?.[1] ?? '';
   const routable = state.match(/export const NAV_KEYS = \[([\s\S]*?)\n\]/)?.[1] ?? '';
-  assert.match(mobileNav, /\['nodes', 'cvm', 'chains', 'users'\]\.includes\(f\.key\)/);
+  assert.match(mobileNav, /CVM_ENABLED \? \['nodes', 'cvm', 'chains', 'users'\]/);
+  assert.match(mobileNav, /: \['nodes', 'chains', 'users', 'usage'\]/);
   assert.match(shell, /faces=\{MOBILE_NAV\}/);
   assert.doesNotMatch(mobileNav, /tunnels|deploy|capacity/);
   assert.match(mobileMore, /f\.key === 'deploy'/);
