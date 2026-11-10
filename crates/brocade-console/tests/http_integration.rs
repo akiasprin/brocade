@@ -4242,6 +4242,7 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
                 .uri("/agent/v1/agent-release")
                 .header("authorization", format!("Bearer {}", issued.token))
                 .header("x-brocade-arch", "x86_64")
+                .header("x-brocade-flavor", "base")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -4254,7 +4255,7 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
             SET agent_version = $1,
                 last_poll_at = now(),
                 runtime_reported_at = now(),
-                runtime_versions = jsonb_build_object('agent', $2::text)
+                runtime_versions = jsonb_build_object('agent', $2::text, 'agent_flavor', 'base')
           WHERE node_id = 'n1'",
     )
     .bind(format!("brocade-agent/{}", "a".repeat(64)))
@@ -4274,6 +4275,7 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
                     json!({
                         "build_id": brocade_console::http::embedded_release_id(),
                         "idempotency_key": "rescue-isolated-node",
+                        "agent_flavor": "base",
                         "nodes": ["n1"]
                     })
                     .to_string(),
@@ -4301,6 +4303,7 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
                 .uri("/agent/v1/agent-release")
                 .header("authorization", format!("Bearer {}", issued.token))
                 .header("x-brocade-arch", "x86_64")
+                .header("x-brocade-flavor", "base")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -4510,6 +4513,7 @@ async fn http_agent_protocol_isolation_preserves_the_approved_self_update_path()
                 .uri("/agent/v1/agent-release")
                 .header("authorization", format!("Bearer {}", issued.token))
                 .header("x-brocade-arch", "x86_64")
+                .header("x-brocade-flavor", "base")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -4963,11 +4967,7 @@ async fn http_deployment_artifact_preview_has_empty_new_baseline_and_restricts_s
     db.store.migrate().await.unwrap();
     insert_node(db.pool()).await;
     let (app, token) = admin_app(&db).await;
-    let revision: i64 =
-        sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id=TRUE")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+    let revision = refresh_current_model_snapshot(&db).await;
     let body = json!({"revision_id":revision});
     let (status, preview) = post_json(
         &app,
@@ -10320,13 +10320,14 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
     let previous = "1".repeat(64);
     sqlx::query("UPDATE node_agent_state SET agent_version = $1, last_poll_at = now(),
         runtime_reported_at = now(), agent_protocol_version = 24, runtime_versions = $2 WHERE node_id = 'n1'")
-        .bind(format!("brocade-agent/{previous}")).bind(json!({"agent": previous})).execute(db.pool()).await.unwrap();
+        .bind(format!("brocade-agent/{previous}")).bind(json!({"agent": previous, "agent_flavor": "base"})).execute(db.pool()).await.unwrap();
     let ask = |arch: Option<&'static str>| {
         let agent = agent.clone();
         let token = token.clone();
         async move {
             let mut request = Request::get("/agent/v1/agent-release")
-                .header("authorization", format!("Bearer {token}"));
+                .header("authorization", format!("Bearer {token}"))
+                .header("x-brocade-flavor", "base");
             if let Some(arch) = arch {
                 request = request.header("x-brocade-arch", arch);
             }
@@ -10354,18 +10355,18 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
         &admin_token,
         "/binary-releases/agent",
         json!({
-            "idempotency_key": "unknown", "build_id": available, "nodes": ["missing"]
+            "agent_flavor": "base", "idempotency_key": "unknown", "build_id": available, "nodes": ["missing"]
         }),
     )
     .await;
     assert_eq!(unknown.0, StatusCode::NOT_FOUND);
     let created = post_json(&admin, &admin_token, "/binary-releases/agent", json!({
-        "idempotency_key": "agent-http-1", "build_id": available, "nodes": ["n1"], "note": "test"
+        "agent_flavor": "base", "idempotency_key": "agent-http-1", "build_id": available, "nodes": ["n1"], "note": "test"
     })).await;
     assert_eq!(created.0, StatusCode::OK);
     let id = created.1["current"]["id"].as_i64().unwrap();
     assert_eq!(created.1["current"]["events"], json!([]));
-    // No protocol header: even an isolated legacy Agent retains the narrow repair channel.
+    // The repair channel needs product identity but no desired-state protocol header.
     let response = ask(Some("x86_64")).await;
     assert_eq!(response.status(), StatusCode::OK);
     let offer: Value =
@@ -10376,12 +10377,12 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
     assert_eq!(offer["sha256"], wanted);
     assert_eq!(
         offer["url"],
-        format!("http://10.0.0.7:9091/brocade-agent/x86_64?sha256={wanted}")
+        format!("http://10.0.0.7:9091/brocade-agent/x86_64?flavor=base&sha256={wanted}")
     );
     let legacy: brocade_deployment::protocol::BinarySource = serde_json::from_value(offer).unwrap();
     assert_eq!(legacy.sha256, wanted);
     assert_eq!(ask(None).await.status(), StatusCode::NO_CONTENT);
-    let report = json!({"release_id": id, "attempt": 1, "outcome": "running", "performed_update": false,
+    let report = json!({"release_id": id, "attempt": 1, "outcome": "running", "performed_update": true,
         "installed_sha256": wanted, "running_sha256": wanted, "error": null});
     let send = |hash: String| {
         let agent = agent.clone();
@@ -10411,7 +10412,7 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
         last_poll_at = now(), runtime_reported_at = now() WHERE node_id = 'n1'",
     )
     .bind(format!("brocade-agent/{wanted}"))
-    .bind(json!({"agent": wanted}))
+    .bind(json!({"agent": wanted, "agent_flavor": "base"}))
     .execute(db.pool())
     .await
     .unwrap();
@@ -10420,7 +10421,7 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
     assert_eq!(finished.1["current"]["status"], "succeeded");
     assert_eq!(
         finished.1["current"]["targets"][0]["verification"],
-        "observed"
+        "receipt"
     );
     let history = get_json(&admin, &admin_token, "/binary-releases/agent/history").await;
     assert_eq!(history.1["items"][0]["id"], id);
