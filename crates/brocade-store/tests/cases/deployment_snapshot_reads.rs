@@ -55,7 +55,32 @@ async fn planning_refreshes_operational_certificate_slots_without_rebuilding_the
         .fetch_one(db.pool())
         .await
         .unwrap();
-    sqlx::query("UPDATE ingresses SET transport_kind='vless-tls'")
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    let certificates: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM certificates WHERE label_id=$1 ORDER BY runtime_slot")
+            .bind(&group)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    for (id, fingerprint) in certificates.iter().zip(['a', 'b']) {
+        db.store
+            .record_certificate(IssuedCertificate {
+                certificate_id: id,
+                acme_directory: brocade_store::SELF_SIGNED_DIRECTORY,
+                cert_pem: "fixture certificate",
+                key_pem: "fixture private key",
+                not_after: "2126-01-01T00:00:00Z",
+                issuer: "Fixture CA",
+                peer_sha256: &fingerprint.to_string().repeat(64),
+            })
+            .await
+            .unwrap();
+    }
+    // REALITY's node-certificate cover advertises the live certificate-name set.
+    sqlx::query("UPDATE ingresses SET reality_fallback_mode='node-certificate'")
         .execute(db.pool())
         .await
         .unwrap();
