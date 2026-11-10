@@ -14,10 +14,23 @@ fn executable_self_test_requires_no_configuration_and_leaves_no_state() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
     assert_eq!(
-        String::from_utf8(output.stdout).unwrap().trim(),
-        brocade_deployment::protocol::AGENT_SELF_TEST_RESPONSE
+        lines.next(),
+        Some(brocade_deployment::protocol::AGENT_SELF_TEST_RESPONSE)
     );
+    let flavor = brocade_deployment::product::ProductFlavor::from_cvm(cfg!(feature = "cvm"));
+    assert_eq!(
+        lines.next().unwrap(),
+        format!("brocade-agent-product:{}:v1", flavor.as_str())
+    );
+    let metadata: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(
+        metadata,
+        serde_json::json!({"flavor": flavor, "arch": std::env::consts::ARCH})
+    );
+    assert!(lines.next().is_none());
     assert!(output.stderr.is_empty());
     assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
     fs::remove_dir(root).unwrap();
