@@ -256,6 +256,28 @@ async fn seed_subscription_serving(db: &TestPg) -> u64 {
     seed_subscription_serving_snapshot(db, snapshot).await
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn manual_grant_probes_allow_thirty_seconds_and_preserve_longer_settings() {
+    for (configured, expected) in [(10, 30), (75, 75)] {
+        let Some(db) = TestPg::start_if_enabled().await else {
+            return;
+        };
+        db.store.migrate().await.unwrap();
+        insert_minimal_fixture(db.pool()).await;
+        let mut snapshot = db.store.materialize_snapshot(None).await.unwrap();
+        snapshot.settings.probe.timeout_secs = configured;
+        seed_subscription_serving_snapshot(&db, snapshot.clone()).await;
+        let plan = db
+            .store
+            .user_grant_probe_plan(&system_admin(), "platform.acme", "alice")
+            .await
+            .unwrap();
+        assert!(!plan.items.is_empty());
+        assert_eq!(plan.timeout_secs, expected);
+    }
+}
+
 async fn seed_subscription_serving_snapshot(
     db: &TestPg,
     snapshot: brocade_core::model::ModelSnapshot,

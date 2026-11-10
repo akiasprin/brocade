@@ -20,6 +20,9 @@ use sqlx::PgPool;
 
 use crate::{input::required_text, AdminContext, Result, StoreError};
 
+// Interactive probes need time for cold paths and longer chains without changing periodic health checks.
+const MIN_MANUAL_PROBE_TIMEOUT_SECS: u64 = 30;
+
 #[derive(Debug, Clone)]
 pub struct UserGrantProbePlan {
     pub serving_generation: u64,
@@ -303,7 +306,8 @@ pub async fn user_grant_probe_plan(
         serving_generation: serving.generation(),
         serving_revision: serving.snapshot.revision,
         endpoint_url: serving.snapshot.settings.probe.endpoint_url.clone(),
-        timeout_secs: u64::from(serving.snapshot.settings.probe.timeout_secs),
+        timeout_secs: u64::from(serving.snapshot.settings.probe.timeout_secs)
+            .max(MIN_MANUAL_PROBE_TIMEOUT_SECS),
         items,
     })
 }
