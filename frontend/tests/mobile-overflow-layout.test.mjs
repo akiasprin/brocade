@@ -51,7 +51,7 @@ test('手机端导航栏与内容面板保留呼吸距离', () => {
   );
   assert.match(
     styles,
-    /@media \(max-width: 375px\)\s*\{\s*\.fg-facebar\s*\{\s*gap:\s*1px;\s*\}\s*\.fg-facebar \.fg-nv\s*\{\s*gap:\s*3px;\s*padding:\s*0 2px;/,
+    /@media \(max-width: 375px\)\s*\{\s*\.fg-top\s*\{\s*gap:\s*2px;\s*\}\s*\.fg-facebar\s*\{\s*gap:\s*1px;\s*\}\s*\.fg-facebar \.fg-nv\s*\{\s*gap:\s*2px;\s*padding:\s*0;/,
   );
   assert.match(styles, /@media \(max-width: 820px\)[\s\S]*?\.fg-sheet\s*\{[\s\S]*?margin:\s*12px 8px;/);
   assert.match(
@@ -125,7 +125,7 @@ test('手机端图表和拓扑操作不会把关键控件推出屏幕', () => {
   );
   assert.match(
     styles,
-    /\.fg-sheet \.tbl:not\(\.cards, \.rule-editor-table, \.machine-dns-policy-table\)\s*\{[\s\S]*?width:\s*max-content;[\s\S]*?min-width:\s*100%;[\s\S]*?max-width:\s*100%;[\s\S]*?box-sizing:\s*border-box;/,
+    /\.fg-sheet \.tbl:not\(\.cards, \.chain-rule-table\)\s*\{[\s\S]*?width:\s*max-content;[\s\S]*?min-width:\s*100%;[\s\S]*?max-width:\s*100%;[\s\S]*?box-sizing:\s*border-box;/,
   );
 });
 

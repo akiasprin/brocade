@@ -176,6 +176,9 @@ pub enum UserTrafficEffect {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserTrafficAssignment {
     pub source: String,
+    /// Console-derived user/app identity. Older peers omit/ignore it; never supplied by Xray.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_key: Option<String>,
     pub effect: UserTrafficEffect,
     pub revision: u64,
 }
@@ -189,6 +192,26 @@ pub struct UserTrafficSnapshot {
 #[cfg(test)]
 mod base_rate_tests {
     use super::*;
+    #[test]
+    fn shared_budget_assignment_preserves_old_peer_compatibility() {
+        let old = serde_json::json!({"source":"alice@tenant#entry", "effect":{"mode":"limited","rate_bps":8000}, "revision":1});
+        let assignment: UserTrafficAssignment = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(assignment.budget_key, None);
+        assert_eq!(serde_json::to_value(assignment).unwrap(), old);
+        let new = UserTrafficAssignment {
+            source: "alice@tenant#entry".into(),
+            budget_key: Some("a".repeat(64)),
+            effect: UserTrafficEffect::Limited { rate_bps: 8000 },
+            revision: 1,
+        };
+        assert_eq!(
+            serde_json::from_value::<UserTrafficAssignment>(
+                serde_json::to_value(new.clone()).unwrap()
+            )
+            .unwrap(),
+            new
+        );
+    }
     #[test]
     fn constant_speed_quota_and_service_priority() {
         let mut policy = UserTrafficPolicy {

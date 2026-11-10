@@ -59,6 +59,7 @@ ModelSnapshot -> IR -> 节点产物 -> 期望状态 -> Agent 收敛
 | `crates/brocade-console` | 管理端和节点端 HTTP API、实时通道、证书与内嵌资源；主要路由在 `src/http.rs`，构建嵌入逻辑在 `build.rs`。 |
 | `crates/brocade-deployment` | 发布计划、热切换和 Console/Agent 共享协议；协议入口为 `src/protocol.rs`。 |
 | `crates/brocade-agent` | 节点侧收敛、系统配置、观测、探测、自更新与离线缓冲。 |
+| `crates/brocade-cube` | Agent 内的 Rust Cube 客户端、原盘收敛、网卡对接、Guest I/O、观测和终端；直接调用固定 Cube／containerd 协议。 |
 | `crates/brocade-probe` | Console 与 Agent 共用的临时 Xray 客户端和端到端拨测。 |
 | `crates/brocade-launcher` | Console 和可选受管 PostgreSQL 的本机编排；默认 HTTP IP 入口端口 8080。 |
 | `crates/brocade-preview` | 基于 Docker 的本地集群预览环境。 |
@@ -67,6 +68,7 @@ ModelSnapshot -> IR -> 节点产物 -> 期望状态 -> Agent 收敛
 | `frontend/tests/` | Node 契约测试和 Vitest/Testing Library 组件测试。 |
 | `docs/` | 面向使用者与运维者的产品文档：安装、构建、手动部署与各功能的行为和升级说明；`README.md` 是概览与索引。 |
 | `components/xray-core` | Brocade 维护的 Xray fork；上游基线记录在 `BROCADE_UPSTREAM.toml`。只做明确需要的数据面改动。 |
+| `components/cube` | Brocade 维护的可选 Cube 节点栈；基线见 `BROCADE_UPSTREAM.toml`，Cubelet 管理原盘和网卡状态，CubeVS 执行双栈 LAN 策略；构建与安装边界见 `docs/cube-runtime.md`。 |
 | `.github/workflows/ci.yml` | CI 的最终检查定义；本地命令与 CI 有冲突时以这里为准。 |
 | `scripts/`、`install.sh` | 构建辅助脚本、资源准备和 POSIX 安装器。 |
 | `console.env.example` | Console 配置的公开清单和部署示例，新增/修改环境变量时同步更新。 |

@@ -1,3 +1,4 @@
+import { CVM_ENABLED } from '../product';
 import { lazy } from '../ui/lazy';
 import { useMemo, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
@@ -14,6 +15,7 @@ import { DiagTable } from '../ui/diag-table';
 import { useSession } from '../session';
 import type { Win } from '../wm/store';
 
+const CvmPane = CVM_ENABLED ? lazy(() => import('./cvm').then(module => ({ default: module.CvmPane }))) : null;
 const NodesPane = lazy(() => import('./nodes').then(module => ({ default: module.NodesPane })));
 const DeployPane = lazy(() => import('./deploy').then(module => ({ default: module.DeployPane })));
 const UsersPane = lazy(() => import('./users').then(module => ({ default: module.UsersPane })));
@@ -94,6 +96,9 @@ export function Pane({ win, bare = false }: { win: Win; bare?: boolean }) {
   const { initial, who } = useSession();
   let content: ReactNode;
   switch (win.key) {
+    case 'tab:cvm':
+      content = CvmPane ? <CvmPane win={win} bare={bare} /> : <Empty>当前版本不支持容器</Empty>;
+      break;
     case 'tab:nodes':
       content = <NodesPane win={win} bare={bare} />;
       break;

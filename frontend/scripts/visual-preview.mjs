@@ -11,6 +11,7 @@ process.once('exit', () => rmSync(cacheDir, { recursive: true, force: true }));
 const server = await createServer({
   root: fileURLToPath(new URL('..', import.meta.url)),
   configFile: false,
+  define: { __BROCADE_CVM__: process.env.BROCADE_PRODUCT_FLAVOR !== 'base' },
   cacheDir,
   plugins: [react()],
   optimizeDeps: {
@@ -18,6 +19,7 @@ const server = await createServer({
       'tests/fixtures/user-header-preview.html',
       'tests/fixtures/dns-groups-preview.html',
       'tests/fixtures/observe-focus-preview.html',
+      'tests/fixtures/cvm/preview.html',
     ],
   },
   server: { host: '127.0.0.1', port: 4318, strictPort: true, watch: null },

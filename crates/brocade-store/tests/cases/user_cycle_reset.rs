@@ -543,13 +543,15 @@ async fn user_cycle_reset_rejects_stale_periods_and_invalid_or_unprivileged_requ
     assert_eq!(used(&db).await, 25);
 }
 
-async fn wait_for_cycle_control_waiters(pool: &PgPool, minimum: i64) {
+async fn wait_for_cycle_model_waiters(pool: &PgPool, minimum: i64) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM pg_stat_activity
                  WHERE datname=current_database() AND pid<>pg_backend_pid()
-                   AND wait_event_type='Lock' AND query LIKE '%FROM control_state%'",
+                   AND wait_event_type='Lock'
+                   AND (query LIKE '%FROM control_state%'
+                        OR query='SELECT pg_advisory_xact_lock(1112687438,65)')",
             )
             .fetch_one(pool)
             .await
@@ -561,7 +563,7 @@ async fn wait_for_cycle_control_waiters(pool: &PgPool, minimum: i64) {
         }
     })
     .await
-    .expect("reset and quota workers must reach the control lock");
+    .expect("reset and quota workers must reach the ordered model-write locks");
 }
 
 #[tokio::test]
@@ -585,10 +587,12 @@ async fn user_cycle_reset_invalidates_a_waiting_access_suspension_plan() {
             .reset_user_cycle_usage(&system_admin(), TENANT, "alice", planned)
             .await
     });
-    wait_for_cycle_control_waiters(db.pool(), 1).await;
+    wait_for_cycle_model_waiters(db.pool(), 1).await;
     let store = db.store.clone();
     let worker = tokio::spawn(async move { store.enforce_quotas().await });
-    wait_for_cycle_control_waiters(db.pool(), 2).await;
+    // The reset owns the outer network lock while waiting for this control-row gate, so the
+    // worker queues at that outer lock. Both must have reached the model-write boundary.
+    wait_for_cycle_model_waiters(db.pool(), 2).await;
     gate.commit().await.unwrap();
     let (reset, outcome) = tokio::time::timeout(Duration::from_secs(5), async {
         (
@@ -632,7 +636,7 @@ async fn user_cycle_reset_rechecks_access_restoration_after_new_usage() {
         .unwrap();
     let store = db.store.clone();
     let worker = tokio::spawn(async move { store.enforce_quotas().await });
-    wait_for_cycle_control_waiters(db.pool(), 1).await;
+    wait_for_cycle_model_waiters(db.pool(), 1).await;
     add_raw(&db, 200).await;
     gate.commit().await.unwrap();
     let outcome = tokio::time::timeout(Duration::from_secs(5), worker)
@@ -709,10 +713,10 @@ async fn user_cycle_reset_invalidates_a_waiting_forwarding_suspension_plan() {
             .reset_user_cycle_usage(&system_admin(), TENANT, "alice", planned)
             .await
     });
-    wait_for_cycle_control_waiters(db.pool(), 1).await;
+    wait_for_cycle_model_waiters(db.pool(), 1).await;
     let store = db.store.clone();
     let worker = tokio::spawn(async move { store.enforce_forwarding_quotas().await });
-    wait_for_cycle_control_waiters(db.pool(), 2).await;
+    wait_for_cycle_model_waiters(db.pool(), 2).await;
     gate.commit().await.unwrap();
     let (_, outcome) = tokio::time::timeout(Duration::from_secs(5), async {
         (

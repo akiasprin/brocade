@@ -4,10 +4,14 @@ mod channel;
 mod command;
 mod conntrack;
 mod conntrack_tuning;
+#[cfg(feature = "cvm")]
+mod cvm;
 #[cfg(test)]
 mod desired_delivery_tests;
 #[cfg(test)]
 mod endpoint_hot_swap_tests;
+mod network_tracking;
+mod product;
 use brocade_probe as e2e;
 mod forwarding;
 mod forwarding_probe;
@@ -682,9 +686,17 @@ fn run() -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("self-test") => {
             println!("{}", brocade_deployment::protocol::AGENT_SELF_TEST_RESPONSE);
+            println!("{}", identity::product_marker());
+            println!(
+                "{}",
+                serde_json::json!({"flavor": identity::self_flavor(), "arch": identity::self_arch()})
+            );
             return Ok(());
         }
+        Some("product-check") => return product::check_base_transition(&args),
         Some("health") => return health(&health_state_dir(&args)),
+        #[cfg(feature = "cvm")]
+        Some("cvm-check") => return cvm::check(&args[1..]),
         Some("repair") => return reconcile_local(&health_state_dir(&args), Drift::Always),
         // Internal stdin consumer used by the Xray/Phantun launch pipelines. It must not require
         // a control-plane URL or token: doing so would put a secret on every child command line.
@@ -698,6 +710,10 @@ fn run() -> Result<(), String> {
     }
 
     let options = Options::parse(args)?;
+    #[cfg(not(feature = "cvm"))]
+    if matches!(options.command.as_str(), "run" | "apply-once") {
+        product::ensure_base_ready(&options.state_dir)?;
+    }
     match options.command.as_str() {
         "desired" => {
             let client = HttpClient::new(&options.server)?;
@@ -1716,6 +1732,8 @@ fn run_forever(options: Options) -> Result<(), String> {
         // Keep serving and leave a searchable warning for the operator.
         Err(error) => warn(format!("agent 日志上限未能落地：{error}")),
     }
+    #[cfg(feature = "cvm")]
+    cvm::spawn(options.clone())?;
     source_access::spawn(options.clone())?;
     user_traffic::spawn(options.clone())?;
     if let Err(error) = traffic_limit_budget::initialize(&options.state_dir) {
@@ -5404,8 +5422,7 @@ fn geodata_file_state(path: &Path) -> Option<GeodataFileState> {
 }
 
 fn file_sha256_hex(path: &Path) -> Result<String, String> {
-    let content = fs::read(path).map_err(|error| error.to_string())?;
-    Ok(sha256_hex(&content))
+    fsutil::file_sha256(path).map_err(|error| error.to_string())
 }
 
 /// The artifacts hold WireGuard private keys, REALITY private keys, and user UUIDs, so

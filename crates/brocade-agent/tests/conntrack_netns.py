@@ -5,11 +5,13 @@ Usage: python3 crates/brocade-agent/tests/conntrack_netns.py TEST_BINARY
 No host routes, rules, sysctls, or interfaces are modified.
 """
 import os
+import json
 import select
 import selectors
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -134,7 +136,111 @@ def tracking_query(args):
     return 0
 
 
+def bridge_peer():
+    guard()
+    if sys.stdin.readline().strip() != "configured":
+        raise RuntimeError("bridge peer was not configured")
+    run("ip", "link", "set", "lo", "up")
+    run("ip", "link", "set", "g0", "up")
+    run("ip", "-6", "addr", "add", "fd91::2/64", "dev", "g0", "nodad")
+    run("ip", "-6", "route", "add", "fd91::/64", "dev", "g0", "table", "30200")
+    run("ip", "-6", "route", "add", "default", "via", "fd91::1", "dev", "g0", "table", "30200")
+    run("ip", "-6", "rule", "add", "pref", "30080", "from", "fd91::2", "lookup", "30200")
+    run("ip", "-6", "route", "add", "unreachable", "default", "table", "30001")
+    run("ip", "-6", "rule", "add", "pref", "30100", "lookup", "30001")
+    for command in sys.stdin:
+        if command.strip() != "probe":
+            return
+        result = {}
+        for port in (23001, 23002):
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as stream:
+                stream.settimeout(.6)
+                try:
+                    # Do not bind a source: this exercises IPv6's second source-
+                    # policy lookup despite the unreachable generic default.
+                    stream.connect(("fd77::1", port))
+                    stream.sendall(b"bridge-proof")
+                    result[str(port)] = stream.recv(32).decode()
+                except OSError:
+                    result[str(port)] = "blocked"
+        print(json.dumps(result), flush=True)
+
+
+def bridge_check():
+    """Exercise the installed Agent policy against CVM's no-default guard."""
+    guard()
+    run("ip", "link", "add", "ctbridge", "type", "bridge")
+    run("ip", "link", "set", "ctbridge", "up")
+    run("ip", "-6", "addr", "add", "fd91::1/64", "dev", "ctbridge", "nodad")
+    run("ip", "-6", "addr", "add", "fd77::1/128", "dev", "lo", "nodad")
+    listeners = []
+    def echo(listener):
+        try:
+            while True:
+                stream, _ = listener.accept()
+                stream.settimeout(1)
+                with stream:
+                    stream.sendall(stream.recv(32))
+        except OSError:
+            return
+    for port in (23001, 23002):
+        listener = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        listener.bind(("fd77::1", port))
+        listener.listen(8)
+        listeners.append(listener)
+        threading.Thread(target=echo, args=(listener,), daemon=True).start()
+    # Only the CVM filter is installed here. The production Agent test has
+    # already installed the actual NOTRACK policy, including port 23001.
+    subprocess.run(["nft", "-f", "-"], input=b'''table inet conntrack_bridge_test {
+ chain ingress { type filter hook prerouting priority filter; policy accept;
+  iifname "ctbridge" ip6 saddr fd91::2 ip6 daddr != fd91::/64 ct direction original ct state new counter drop
+ }
+}
+''', check=True, timeout=5)
+    child = subprocess.Popen(
+        ["unshare", "--net", "--", sys.executable, str(Path(__file__).resolve()), "--bridge-peer"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, pass_fds=ancestor_fds(),
+    )
+    try:
+        deadline = time.monotonic() + 3
+        while os.readlink(f"/proc/{child.pid}/ns/net") == os.readlink("/proc/self/ns/net"):
+            if child.poll() is not None or time.monotonic() >= deadline:
+                raise RuntimeError("bridge peer did not enter its private namespace")
+            time.sleep(.01)
+        run("ip", "link", "add", "cth0", "type", "veth", "peer", "name", "g0")
+        run("ip", "link", "set", "cth0", "master", "ctbridge")
+        run("ip", "link", "set", "cth0", "up")
+        run("ip", "link", "set", "g0", "netns", str(child.pid))
+        child.stdin.write("configured\n")
+        def probe():
+            child.stdin.write("probe\n")
+            child.stdin.flush()
+            if not select.select([child.stdout], [], [], 5)[0]:
+                raise TimeoutError("bridge probe did not return")
+            return json.loads(child.stdout.readline())
+        assert probe() == {"23001": "blocked", "23002": "blocked"}, "NOTRACK bypassed the no-default guard"
+        run("nft", "delete", "table", "inet", "conntrack_bridge_test")
+        assert probe() == {"23001": "bridge-proof", "23002": "bridge-proof"}, "positive control could not reach listeners"
+        print("Bridge no-default guard blocks ordinary and NOTRACK-port flows; positive controls reached both.")
+    finally:
+        child.stdin.close()
+        try:
+            child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=3)
+        child.stdout.close()
+        for listener in listeners:
+            listener.close()
+
+
 def main():
+    if sys.argv[1:] == ["--bridge-peer"]:
+        bridge_peer()
+        return 0
+    if sys.argv[1:] == ["--bridge-check"]:
+        bridge_check()
+        return 0
     if sys.argv[1:2] == ["--tracked"]:
         return tracking_query(sys.argv[2:])
     if sys.argv[1:] == ["--peer"]:
@@ -191,11 +297,19 @@ def main():
         env = os.environ.copy()
         env["BROCADE_TEST_CONNTRACK_PEER"] = "ready"
         env["BROCADE_TEST_CONNTRACK_FIXTURE"] = str(Path(__file__).resolve())
-        return subprocess.run(
+        result = subprocess.run(
             [test_binary, "--exact", "conntrack::tests::installed_health_mux_policy_in_private_namespace",
              "--ignored", "--nocapture", "--test-threads=1"],
             env=env, pass_fds=ancestor_fds(), timeout=40,
-        ).returncode
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        print(result.stdout, end="", flush=True)
+        if result.returncode:
+            return result.returncode
+        if ("conntrack::tests::installed_health_mux_policy_in_private_namespace ... ok" not in result.stdout
+                or "test result: ok. 1 passed; 0 failed; 0 ignored;" not in result.stdout):
+            raise RuntimeError("expected exactly one executed namespace test, not an empty match")
+        return 0
     finally:
         peer_process.stdin.close()
         try:

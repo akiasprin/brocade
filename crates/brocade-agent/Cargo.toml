@@ -6,8 +6,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+cvm = ["dep:brocade-cube", "brocade-deployment/cvm"]
+
 [dependencies]
 brocade-core = { path = "../brocade-core" }
+brocade-cube = { path = "../brocade-cube", optional = true }
 brocade-deployment = { path = "../brocade-deployment" }
 brocade-probe = { path = "../brocade-probe" }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -22,7 +27,7 @@ libc = "0.2"
 # Keep native TLS, OpenSSL and AWS-LC out of static musl builds.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots", "socks"] }
 # The live channel has its own single-thread runtime; HTTP and collection retain their independent schedules.
-tokio = { version = "1", features = ["sync", "rt", "net", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "rt", "net", "time", "macros", "io-util"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 # Trust anchors are compiled into the binary rather than read from the target machine's
 # /etc/ssl/certs. The agent installs on other people's machines, and how old that root store
@@ -37,6 +42,9 @@ yawc = { version = "=0.5.0", default-features = false, features = ["tls"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 base64 = "0.22.1"
+# Reuse the workspace's ring/rcgen stack for private CVM transport identities.
+ring = "0.17"
+rcgen = "0.14"
 
 [dev-dependencies]
 # Exercise rolling upgrades against a peer without compression support.

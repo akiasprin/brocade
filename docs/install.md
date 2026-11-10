@@ -4,29 +4,50 @@
 
 ## 下载
 
-从 [Releases](https://github.com/akiasprin/brocade/releases/latest) 下载与服务器匹配的发行包和同名 `.sha256`，校验后解压。自 `v0.3.1` 起，GNU 包支持 glibc 2.35 及以上；Alpine 等 musl 系统选 `musl`。静态 musl 包也可安装到同架构 GNU 系统，launcher 会按宿主机的 libc 选择受管 PostgreSQL，不要求额外安装 musl 动态加载器。
+自动下载最新正式版基础包的完整命令见 [README「试用」](../README.md#试用)：按 CPU 架构选择兼容 GNU / musl 系统的静态包，校验后运行包内安装器，不需要额外下载脚本。命令兼容 v0.3.1–v0.3.5 没有变体字段的旧包名，临时下载目录在退出时清理。指定版本或容器版时使用下面的手动下载步骤。
 
-`v0.3.0` 的 GNU 包要求 glibc 2.39，且该版本 musl 安装器不支持跨 libc 安装。兼容 Ubuntu 22.04、Debian 12 等较旧 GNU 系统时，请下载 `v0.3.1` 或更新版本：
+从 [Releases](https://github.com/akiasprin/brocade/releases/latest) 下载与服务器匹配的发行包和同名 `.sha256`。默认选择 `base` 基础版；需要容器控制面时选择 `cvm` 容器扩展版。两者由同一源码构建，容器扩展安装通过切换 Console 完成。
+
+GNU 包支持 glibc 2.35 及以上；Alpine 等 musl 系统选 `musl`。静态 musl 包也可安装到同架构 GNU 系统，launcher 按宿主 libc 选择受管 PostgreSQL。
 
 ```sh
-v=0.3.5 p=linux-x86_64-gnu
-url=https://github.com/akiasprin/brocade/releases/download/v$v/brocade-dist-$v-$p.tar.gz
+v=0.3.6 flavor=base p=linux-x86_64-gnu
+url=https://github.com/akiasprin/brocade/releases/download/v$v/brocade-dist-$v-$flavor-$p.tar.gz
 curl -fLO "$url" && curl -fLO "$url.sha256"
-sha256sum -c brocade-dist-$v-$p.tar.gz.sha256
-tar xzf brocade-dist-$v-$p.tar.gz
-cd brocade-dist-$v-$p
+sha256sum -c brocade-dist-$v-$flavor-$p.tar.gz.sha256
+tar xzf brocade-dist-$v-$flavor-$p.tar.gz
+cd brocade-dist-$v-$flavor-$p
 ```
+
+## 产品变体与扩展切换
+
+基础版不包含 CVM HTTP 业务、容器界面、终端组件或 Cube 客户端依赖，只分发基础 Agent。容器版包含完整 CVM 控制面，并可分别分发基础与容器 Agent。两版共享数据库 schema；装上容器版 Console 不会自动更换 Agent、安装 Cube 或切换宿主内核。
+
+首次安装默认基础包；已有新产品安装省略变体参数时保持原变体。切换 Console 时下载目标变体发行包，校验后明确执行：
+
+```sh
+sudo sh install.sh --upgrade --flavor cvm
+# 先在容器版完成实例、网络、额度和在途任务清理，再退回基础版：
+sudo sh install.sh --upgrade --flavor base
+```
+
+安装器核对 `BROCADE_FLAVOR`、候选 `product-info` 和已安装的 `/etc/brocade/product-flavor`。基础版预检和启动都会拒绝仍有活动 CVM 资源的数据库；已完成物理清理的历史记录保留。
+
+实验环境清理完成后，若原安装尚无产品身份，首次切入普通版须显式执行 `sudo sh install.sh --upgrade --flavor base --initialize-product`。此选项只允许身份文件缺失且候选为 base，仍执行完整数据库预检、停写备份和恢复流程；不接管实验容器。已有身份的安装不能重复初始化。
+
+构建使用固定入口 `python3 scripts/build-release.py --flavor base` 或 `--flavor cvm`。前端独立构建使用同名 `BROCADE_PRODUCT_FLAVOR`，产物清单必须与 Console 一致。编译与缓存规范见[部署指南](../.agents/runbooks/console-deployment.md#固定位置双架构与耗时记录)。
 
 ## 安装
 
-CI 按版本、CPU 与 libc 生成 `brocade-dist-<version>-linux-<arch>-<libc>.tar.gz`。解压后的目录结构如下：
+CI 按版本、产品变体、CPU 与 libc 生成 `brocade-dist-<version>-<flavor>-linux-<arch>-<libc>.tar.gz`。解压后的目录结构如下：
 
 ```text
-brocade-dist-<version>-linux-x86_64-gnu/
+brocade-dist-<version>-<flavor>-linux-x86_64-gnu/
 ├── brocade-launcher
 ├── brocade-console
 ├── install.sh
 ├── BROCADE_PLATFORM
+├── BROCADE_FLAVOR
 └── SHA256SUMS
 ```
 
@@ -64,6 +85,8 @@ sudo brocade up
 
 首次启动生成一次性初始化凭据。完整链接把凭据放在 `#/initialize/...` fragment 中，网页接收后清除地址栏 fragment，只在内存保留直到提交。完整链接仅向交互终端输出，重定向和 systemd 日志只输出普通地址；再次获取入口运行 `sudo brocade url`。初始化成功后凭据失效，私有文件被删除。初始化只创建系统管理员和根租户；登录后由入门向导纳管首台机器、创建链和首个用户、发布配置并完成真实节点拨测。登录、订阅链接和 Agent 安装命令均支持 HTTP IP 入口。
 
+首次上线清单常驻控制台右下角，显示机器、线路、用户、发布和拨测五步的进度与结果。在纳管、安装、建链和发布计划页会自动收成胶囊，并避开贴底操作条；创建首个用户、发布与拨测可在清单内完成。发布失败后可查看对应变更单并重新发布；收起清单仍会跟踪正在进行的拨测，通过后自动记录完成。完成后不再自动出现，也可从账户菜单重新打开。
+
 ## 目录与账号
 
 系统安装器把数据和下载缓存分别放在 `/var/lib/brocade` 与 `/var/cache/brocade`；`sudo brocade` 会先降权到专用账号，PostgreSQL 和 Console 都不会以 root 运行。直接从解压目录执行时，默认仍为 `$XDG_DATA_HOME/brocade`（或 `~/.local/share/brocade`）与 `$XDG_CACHE_HOME/brocade`（或 `~/.cache/brocade`）。完整参数见 `brocade up --help`。
@@ -75,6 +98,8 @@ sudo brocade up
 ```sh
 sudo sh install.sh --upgrade
 ```
+
+要求失败后只向前修复时，使用 `sudo sh install.sh --upgrade --forward-only`。安装器仍执行预检、停写和备份；一旦已停服，任何失败都保持停服和现场，不自动恢复旧程序或重启旧服务。备份留供核查与隔离恢复验证。
 
 升级复用 `/etc/brocade` 中原来的数据库、访问 IP 和端口，不重新选择，也不生成替代密钥。
 日常 `systemctl restart brocade.service` 保留 socket；完整 `--upgrade` 会先停止 socket 再停止 service，防止备份期间被请求自动拉起写库，结束后恢复两者。旧安装器部署升级后也会获得 socket 托管，已有自定义 service 与 drop-in 保留。

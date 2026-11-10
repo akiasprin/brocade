@@ -122,6 +122,17 @@ pub async fn remove_retired_nodes(
     }
     for row in &rows {
         let node_id: String = row.try_get("id")?;
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM cvm_instances WHERE node_id=$1 UNION SELECT 1 FROM cvm_nic_bindings WHERE provider_node=$1 OR consumer_node=$1)",
+        )
+        .bind(&node_id)
+        .fetch_one(&mut *tx)
+        .await?
+        {
+            return Err(StoreError::Conflict(
+                "机器仍被 CVM 执行历史引用，请保留退役记录用于审计".into(),
+            ));
+        }
         let retired: bool = row.try_get("retired")?;
         let phase: String = row.try_get("phase")?;
         if !retired || !matches!(phase.as_str(), "retired" | "abandoned") {
@@ -383,6 +394,27 @@ pub(crate) async fn update_node_status_tx(
         }
     };
     ensure_node_exists_tx(tx, &node_id).await?;
+    if retired {
+        crate::resource_coordination::lock(tx).await?;
+        // Serialize retirement with CVM host admission, including its first reservation.
+        sqlx::query("SELECT id FROM nodes WHERE id=$1 FOR UPDATE")
+            .bind(&node_id)
+            .fetch_one(&mut **tx)
+            .await?;
+        let occupied:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_instances i JOIN cvm_volumes v ON v.instance_id=i.id WHERE i.node_id=$1 AND (i.reserved OR v.state<>'released'))").bind(&node_id).fetch_one(&mut **tx).await?;
+        if occupied {
+            return Err(StoreError::Conflict(
+                "请先完成 CVM 实例及系统盘清理，再退役承载机器".into(),
+            ));
+        }
+        #[cfg(feature = "cvm")]
+        {
+            crate::cvm::nics::retire_provider(tx, &node_id).await?;
+            crate::cvm::nics::entries::retire_node(tx, &node_id).await?;
+        }
+        #[cfg(not(feature = "cvm"))]
+        crate::extension_state::ensure_node_released(tx, &node_id).await?;
+    }
     // Decommissioning an already-decommissioned node leaves `COALESCE(retired_at, now())` at
     // the original instant, which compares equal to itself — the decommission time is not
     // refreshed, and no revision number is consumed for nothing.
@@ -449,6 +481,7 @@ pub(crate) async fn update_node_tx(
     node_id: &str,
     request: UpdateNodeRequest,
 ) -> Result<bool> {
+    crate::resource_coordination::lock(tx).await?;
     if !actor.is_system_admin() {
         return Err(StoreError::Forbidden(
             "only system-admin can update nodes".to_owned(),

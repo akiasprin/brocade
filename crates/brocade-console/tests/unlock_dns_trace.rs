@@ -18,12 +18,15 @@ fn embedded_xray_reports_actual_fallback_without_guessing_from_query_strategy() 
         .arg(dir.path())
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "simulation failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    if !output.status.success() {
+        let diagnostics = dir.keep();
+        panic!(
+            "simulation failed; diagnostics at {}:\n{}\n{}",
+            diagnostics.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let result: serde_json::Value =
         serde_json::from_slice(&fs::read(dir.path().join("simulation-results.json")).unwrap())
             .unwrap();

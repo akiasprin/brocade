@@ -77,7 +77,8 @@ use brocade_deployment::plan::DeploymentKind;
 
 #[derive(Clone)]
 pub struct PgStore {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
+    listener_pool: PgPool,
     usage_runtime: Arc<usage::UsageRuntimeState>,
 }
 
@@ -141,10 +142,7 @@ impl PgStore {
             })
             .connect(database_url)
             .await?;
-        Ok(Self {
-            pool,
-            usage_runtime: Arc::new(usage::UsageRuntimeState::default()),
-        })
+        Ok(Self::from_pool(pool))
     }
 
     /// Create the database named in `database_url` if the server does not have it, returning its
@@ -227,14 +225,27 @@ impl PgStore {
     }
 
     pub fn from_pool(pool: PgPool) -> Self {
+        // LISTEN retains its connection while idle. Keep that reservation out of the bounded
+        // business pool, and derive options from the same authority rather than a second URL.
+        let listener_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_lazy_with((*pool.connect_options()).clone());
         Self {
             pool,
+            listener_pool,
             usage_runtime: Arc::new(usage::UsageRuntimeState::default()),
         }
     }
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Dedicated notification connection; it shares credentials, not capacity, with the store.
+    pub fn listener_pool(&self) -> &PgPool {
+        &self.listener_pool
     }
 
     /// Numeric, read-only operational context. Never expose SQL text, client identities or values.
@@ -781,6 +792,42 @@ impl PgStore {
     ) -> Result<crate::BinaryRelease> {
         crate::binary_release::retry_binary_release_target(
             &self.pool, component, actor, id, node, build,
+        )
+        .await
+    }
+
+    pub async fn agent_release_target_flavor(
+        &self,
+        node: &str,
+    ) -> Result<Option<brocade_deployment::product::ProductFlavor>> {
+        let flavor: Option<String> = sqlx::query_scalar(
+            "SELECT r.artifacts->>'agent_flavor' FROM binary_releases r JOIN binary_release_targets t ON t.release_id=r.id
+             WHERE r.component='agent' AND r.active AND r.status='running' AND t.node_id=$1 AND t.status IN ('pending','dispatched') ORDER BY r.id DESC LIMIT 1"
+        ).bind(node).fetch_optional(&self.pool).await?.flatten();
+        flavor
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|_| StoreError::InvalidData("release Agent flavor is invalid".into()))
+            })
+            .transpose()
+    }
+
+    pub async fn claim_agent_release_for_flavor(
+        &self,
+        node: &str,
+        arch: &str,
+        build: &str,
+        flavor: brocade_deployment::product::ProductFlavor,
+    ) -> Result<Option<crate::BinaryReleaseAssignment>> {
+        crate::binary_release::claim_binary_release_for_flavor(
+            &self.pool,
+            crate::BinaryComponent::Agent,
+            node,
+            arch,
+            build,
+            true,
+            Some(flavor),
         )
         .await
     }

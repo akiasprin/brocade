@@ -1,0 +1,10 @@
+/build
+/.cargo
+/target
+**/*.rs.bk
+**/Cargo.lock
+**/rusty-tags.vi
+/rpm/SOURCES
+
+# Preserve the exact imported dependency resolution in Brocade.
+!/Cargo.lock

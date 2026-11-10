@@ -1,3 +1,4 @@
+import { TitleActions } from '../ui/title-actions';
 import { useMetricQuery } from '../ui/metric-cadence';
 import {
   useEffect,
@@ -425,7 +426,7 @@ export function VpngatePage({
             </div>
           </nav>
 
-          <div className="nd-acts vpngate-head-actions">
+          <TitleActions className="nd-acts vpngate-head-actions">
             <button
               className="btn"
               type="button"
@@ -441,7 +442,7 @@ export function VpngatePage({
             >
               {sync.isPending ? '排队中…' : '立即同步'}
             </button>
-          </div>
+          </TitleActions>
         </header>
 
         {overview.error && <ErrorBox error={overview.error} />}

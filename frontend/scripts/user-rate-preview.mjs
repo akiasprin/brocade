@@ -11,6 +11,7 @@ process.once('exit', () => rmSync(cacheDir, { recursive: true, force: true }));
 const server = await createServer({
   root: fileURLToPath(new URL('..', import.meta.url)),
   configFile: false,
+  define: { __BROCADE_CVM__: process.env.BROCADE_PRODUCT_FLAVOR !== 'base' },
   cacheDir,
   plugins: [react()],
   optimizeDeps: { entries: ['tests/fixtures/user-app-rate-preview.html'] },

@@ -41,15 +41,24 @@ for (const [width, theme] of [
     await expect(page).toHaveScreenshot(`reverse-stale-${width}.png`);
   });
 }
-test('deep machine names remain reachable in the rule sidebar', async ({ page }) => {
+test('deep machine names remain reachable in the rule tree', async ({ page }) => {
   await open(page, 'rules', 320, 844);
-  const nodes = page.locator('.rule-machine-node');
-  await expect(nodes).toHaveCount(12);
-  const last = nodes.last();
+  const heads = page.locator('.chain-rule-node-head');
+  await expect(heads).toHaveCount(12);
+  const last = heads.last();
   await last.scrollIntoViewIfNeeded();
-  expect(await last.evaluate(el => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1);
+  const name = last.locator('.who > b');
+  await expect(name).toBeVisible();
+  const box = (await name.boundingBox())!;
+  expect(box.width).toBeGreaterThan(40);
+  expect(box.x + box.width).toBeLessThanOrEqual(320);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBeLessThanOrEqual(1);
+  const initial = await last.getAttribute('aria-expanded');
+  const toggled = initial === 'true' ? 'false' : 'true';
   await last.click();
-  await expect(page.locator('.rule-machine-title')).toContainText(await last.locator('b').innerText());
+  await expect(last).toHaveAttribute('aria-expanded', toggled);
+  await last.click();
+  await expect(last).toHaveAttribute('aria-expanded', initial!);
   await expect(page).toHaveScreenshot('deep-rules-320.png');
 });
 test('advanced protocol fields keep the right border clickable', async ({ page }) => {

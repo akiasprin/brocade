@@ -101,8 +101,8 @@ for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
           });
           await page.setContent(`<!doctype html><html data-theme="${theme}" data-palette="dailan"><head>
             ${html.match(/<meta name="viewport"[^>]+>/)[0]}<style>${styles}</style></head><body>
-            <div class="forge${device.width <= 820 ? ' narrow' : ''}"><div class="fg-left"><div class="fg-desk">
-              <header class="fg-top"><button id="menu">Menu</button></header>
+            <div class="forge${device.width <= 820 ? ' narrow' : ''}"><div class="fg-left">
+              <div class="fg-desk"><header class="fg-top"><button id="menu">Menu</button></header>
               <main class="fg-view" style="min-height:2400px">
                 <section class="fg-sheet" style="margin-left:100px; margin-right:100px; height:1800px">
                   <button id="content">Content</button>
@@ -434,8 +434,8 @@ for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
       });
       await page.setContent(`<!doctype html><html data-theme="light" data-palette="dailan"><head>
         ${html.match(/<meta name="viewport"[^>]+>/)[0]}<style>${styles}</style>
-        </head><body><div id="root"><div class="forge narrow"><div class="fg-left"><div class="fg-desk">
-          <div class="fg-top"><button>Menu</button></div>
+        </head><body><div id="root"><div class="forge narrow"><div class="fg-left">
+          <div class="fg-desk"><div class="fg-top"><button>Menu</button></div>
           <main class="fg-view" style="min-height:1800px"><input aria-label="Search"></main>
         </div></div></div></div></body></html>`);
       assert.equal(await page.evaluate(() => matchMedia('(hover: none) and (pointer: coarse)').matches), true);
@@ -525,7 +525,7 @@ for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
     }
   });
 
-  test(`${engine}: the full-screen shell resizes and scrolls without fixed top-edge containers`, async () => {
+  test(`${engine}: desktop navigation scrolls with the workspace while the shell resizes without fixed full-screen ancestors`, async () => {
     const browser = await launcher.launch();
     try {
       const page = await browser.newPage({ viewport: { width: 390, height: 844 }, reducedMotion: 'reduce' });
@@ -543,8 +543,8 @@ for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
       assert.equal(await page.locator('#stage').evaluate(element => getComputedStyle(element).position), 'absolute');
       assert.deepEqual(await edge(), [], 'startup must not seed the fixed-container color cache');
       await page.locator('#root').evaluate(root => {
-        root.innerHTML = `<div class="forge"><div class="fg-left"><div class="fg-desk">
-          <div class="fg-top"><button>Menu</button></div>
+        root.innerHTML = `<div class="forge"><div class="fg-left">
+          <div class="fg-desk"><div class="fg-top"><button>Menu</button></div>
           <main class="fg-view" style="min-height:1800px">Content</main>
         </div></div></div>`;
       });
@@ -564,7 +564,12 @@ for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
         });
         assert.equal(await page.locator('.fg-top').evaluate(element => element.getBoundingClientRect().top), -300);
         assert.equal(await page.evaluate(() => window.scrollY), 0, 'only the workspace scrolls');
-        assert.deepEqual(await edge(), [], 'scrolling must not expose a full-screen fixed ancestor');
+        assert.deepEqual(await edge(), [], 'navigation scrolls away without a fixed ancestor');
+        assert.equal(await page.locator('.fg-top').evaluate(element => element.closest('.fg-desk') !== null), true);
+        assert.equal(
+          await page.locator('.fg-desk').evaluate(element => getComputedStyle(element).overscrollBehaviorY),
+          'none',
+        );
         await page.locator('.fg-desk').evaluate(element => {
           element.scrollTop = 0;
         });

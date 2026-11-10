@@ -5,10 +5,20 @@ members = [
     "crates/brocade-core",
     "crates/brocade-deployment",
     "crates/brocade-agent",
+    "crates/brocade-cube",
     "crates/brocade-probe",
     "crates/brocade-preview",
     "crates/brocade-sqlx",
     "crates/brocade-store",
+]
+# Vendored Cube components retain their own Rust workspaces and lockfiles.
+exclude = [
+    "components/cube/CubeShim",
+    "components/cube/cubecow",
+    "components/cube/hypervisor",
+    "components/cube/agent",
+    "components/cube/guest-init",
+    "components/cube/CubeAPI",
 ]
 resolver = "2"
 

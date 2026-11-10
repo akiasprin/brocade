@@ -15,6 +15,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+mod budget;
+use budget::{admit, source_entry, start_fetchers, Pool};
 const MAX_SOURCES: usize = 4096;
 const MAX_CLIENTS: usize = 256;
 static SERVICE: OnceLock<Arc<Service>> = OnceLock::new();
@@ -31,41 +33,16 @@ struct LocalRequest {
     source: String,
     bytes: u64,
 }
-struct Entry {
-    credits: u64,
-    rate: u64,
-    expires: Instant,
-    next: Instant,
-    unlimited: bool,
-    managed: bool,
-    generation: u64,
-    suspended: bool,
-    last: Instant,
-}
-impl Entry {
-    fn new() -> Self {
-        let now = Instant::now();
-        Self {
-            credits: 0,
-            rate: 0,
-            expires: now,
-            next: now,
-            unlimited: false,
-            managed: true,
-            generation: 0,
-            suspended: false,
-            last: now,
-        }
-    }
-}
 struct PolicyCache {
     effects: BTreeMap<String, UserTrafficEffect>,
+    groups: BTreeMap<String, String>,
     updated: Option<Instant>,
 }
 struct Service {
     options: Options,
     token: String,
-    entries: Mutex<BTreeMap<String, Arc<Mutex<Entry>>>>,
+    entries: Mutex<BTreeMap<String, Arc<Pool>>>,
+    fetcher: budget::FetchSender,
     known: Mutex<BTreeSet<String>>,
     unknown_checkpoint: AtomicBool,
     clients: AtomicUsize,
@@ -117,6 +94,7 @@ pub(crate) fn initialize(options: &Options) -> Result<(), String> {
         options: options.clone(),
         token,
         entries: Mutex::new(BTreeMap::new()),
+        fetcher: start_fetchers()?,
         known: Mutex::new(known),
         unknown_checkpoint: AtomicBool::new(unknown_checkpoint),
         clients: AtomicUsize::new(0),
@@ -124,6 +102,7 @@ pub(crate) fn initialize(options: &Options) -> Result<(), String> {
         generation: AtomicU64::new(0),
         policies: Mutex::new(PolicyCache {
             effects: BTreeMap::new(),
+            groups: BTreeMap::new(),
             updated: None,
         }),
     });
@@ -212,28 +191,6 @@ pub(crate) fn verify_executable(dir: &Path, program: &Path) -> Result<(), String
     }
     Ok(())
 }
-fn source_entry(service: &Service, source: &str) -> Result<Arc<Mutex<Entry>>, String> {
-    let mut entries = service
-        .entries
-        .lock()
-        .map_err(|_| "user budget cache lock")?;
-    if let Some(entry) = entries.get(source) {
-        return Ok(Arc::clone(entry));
-    }
-    // An active waiter holds a second Arc and cannot be evicted or duplicated.
-    entries.retain(|_, entry| {
-        Arc::strong_count(entry) > 1
-            || entry
-                .lock()
-                .is_ok_and(|entry| entry.last.elapsed() < Duration::from_secs(10))
-    });
-    if entries.len() >= MAX_SOURCES {
-        return Err("user budget cache capacity reached".into());
-    }
-    let entry = Arc::new(Mutex::new(Entry::new()));
-    entries.insert(source.into(), Arc::clone(&entry));
-    Ok(entry)
-}
 #[derive(Clone, Copy)]
 enum Admission {
     Allowed,
@@ -286,11 +243,25 @@ fn synchronize(service: &Service) -> Result<(), String> {
         return Err("user policy assignments exceed capacity".into());
     }
     let mut effects = BTreeMap::new();
+    let mut groups = BTreeMap::new();
+    let mut grouped_effects = BTreeMap::new();
     for row in rows {
         if row.revision == 0
             || matches!(row.effect,UserTrafficEffect::Limited{rate_bps} if !(1000..=1_000_000_000_000).contains(&rate_bps))
         {
             return Err("invalid user policy assignment".into());
+        }
+        if let Some(key) = row.budget_key {
+            if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("invalid user budget group".into());
+            }
+            if grouped_effects
+                .insert(key.clone(), row.effect.clone())
+                .is_some_and(|effect| effect != row.effect)
+            {
+                return Err("inconsistent user budget group".into());
+            }
+            groups.insert(row.source.clone(), key);
         }
         if row.source.len() > 512 || effects.insert(row.source, row.effect).is_some() {
             return Err("invalid or duplicate user policy source".into());
@@ -321,7 +292,7 @@ fn synchronize(service: &Service) -> Result<(), String> {
         *known = managed;
         service.unknown_checkpoint.store(false, Ordering::Release);
     }
-    if effects != policies.effects {
+    if effects != policies.effects || groups != policies.groups {
         let mut control = service
             .control
             .lock()
@@ -339,6 +310,7 @@ fn synchronize(service: &Service) -> Result<(), String> {
         service.generation.store(next.generation, Ordering::Release);
         *control = next;
         policies.effects = effects;
+        policies.groups = groups;
     }
     policies.updated = Some(Instant::now());
     drop(known);
@@ -357,7 +329,7 @@ fn synchronize(service: &Service) -> Result<(), String> {
     }
     Ok(())
 }
-fn serve(mut stream: TcpStream, service: &Service) -> Result<(), String> {
+fn serve(mut stream: TcpStream, service: &Arc<Service>) -> Result<(), String> {
     stream
         .set_nodelay(true)
         .map_err(|_| "user budget socket option")?;
@@ -416,117 +388,24 @@ fn progress(stream: &mut TcpStream, last: &mut Instant) -> Result<(), String> {
     }
     Ok(())
 }
-fn admit(
+async fn fetch(
     service: &Service,
-    source: &str,
-    mut bytes: u64,
-    entry: &Mutex<Entry>,
-    stream: &mut TcpStream,
-) -> Result<Admission, String> {
-    let mut last_progress = Instant::now();
-    while bytes > 0 {
-        progress(stream, &mut last_progress)?;
-        let mut state = entry.lock().map_err(|_| "user budget entry lock")?;
-        state.last = Instant::now();
-        let generation = service.generation.load(Ordering::Acquire);
-        if state.generation != generation {
-            state.credits = 0;
-            state.unlimited = false;
-            state.suspended = false;
-            state.expires = Instant::now();
-            state.generation = generation;
-        }
-
-        if state.expires <= Instant::now() {
-            state.credits = 0;
-            state.unlimited = false;
-            state.suspended = false;
-        }
-        if state.unlimited {
-            return Ok(if state.managed {
-                Admission::Open
-            } else {
-                Admission::Pass
-            });
-        }
-        if state.suspended {
-            return Ok(Admission::Suspended);
-        }
-        if state.credits == 0 {
-            // Holding only this source's lock prevents duplicated application of a reservation. Other users stay independent.
-            let started = Instant::now();
-            let grant = fetch(service, source)?;
-            match grant {
-                UserBudgetGrant::Unlimited { valid_ms, managed } => {
-                    remember(service, source, managed)?;
-                    state.unlimited = true;
-                    state.managed = managed;
-                    state.expires = started + Duration::from_millis(valid_ms.min(BUDGET_TTL_MS));
-                }
-                UserBudgetGrant::Suspended { valid_ms } => {
-                    remember(service, source, true)?;
-                    state.suspended = true;
-                    state.expires = started + Duration::from_millis(valid_ms.min(BUDGET_TTL_MS));
-                }
-                UserBudgetGrant::Limited {
-                    bytes,
-                    rate_bps,
-                    valid_ms,
-                } => {
-                    if bytes == 0
-                        || bytes > MAX_BUDGET_BYTES
-                        || !(1000..=1_000_000_000_000).contains(&rate_bps)
-                        || valid_ms > BUDGET_TTL_MS
-                    {
-                        return Err("invalid global budget grant".into());
-                    }
-                    remember(service, source, true)?;
-                    state.credits = bytes;
-                    state.rate = rate_bps;
-                    state.expires = started + Duration::from_millis(valid_ms);
-                    state.next = Instant::now();
-                }
-                UserBudgetGrant::Retry { after_ms } => {
-                    drop(state);
-                    let until = Instant::now() + Duration::from_millis(after_ms.clamp(1, 1000));
-                    while Instant::now() < until {
-                        progress(stream, &mut last_progress)?;
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    continue;
-                }
-            }
-            continue;
-        }
-        let amount = bytes.min(state.credits).min((state.rate / 800).max(1));
-        let now = Instant::now();
-        if state.next > now {
-            drop(state);
-            thread::sleep(Duration::from_millis(2));
-            continue;
-        }
-        state.credits -= amount;
-        state.next = now + Duration::from_secs_f64(amount as f64 * 8.0 / state.rate as f64);
-        bytes -= amount;
-    }
-    Ok(Admission::Allowed)
-}
-fn fetch(service: &Service, source: &str) -> Result<UserBudgetGrant, String> {
-    let mut random = [0u8; 16];
-    getrandom::fill(&mut random).map_err(|_| "user budget entropy")?;
-    let request = UserBudgetRequest {
-        source: source.into(),
-        request_id: random.iter().map(|b| format!("{b:02x}")).collect(),
-        bytes: MAX_BUDGET_BYTES,
-    };
+    request: &UserBudgetRequest,
+    client: &reqwest::Client,
+    deadline: Instant,
+) -> Result<UserBudgetGrant, String> {
+    let source = request.source.as_str();
     let body = serde_json::to_string(&request).map_err(|_| "user budget encoding")?;
-    let response = HttpClient::new(&service.options.server)?.request_timeout(
-        "POST",
-        "/agent/v1/user-traffic/budget",
-        &service.options.token,
-        Some(&body),
-        Duration::from_secs(2),
-    )?;
+    let response = HttpClient::new(&service.options.server)?
+        .post_json(
+            client,
+            "/agent/v1/user-traffic/budget",
+            &service.options.token,
+            body,
+            deadline,
+            4096,
+        )
+        .await?;
     if response.status == 404 {
         let known = service
             .known

@@ -58,7 +58,7 @@ fn upgrade_failure_restores_old_files_only_before_the_migration_boundary() {
             }
             let script = root.path().join("cleanup.sh");
             fs::write(&script, format!(
-            "#!/bin/sh\nset -eu\nupgrade_service_stopped=true\nupgrade_success=false\nupgrade_published={published}\nupgrade_backup=$1\n\
+            "#!/bin/sh\nset -eu\nforward_only=false\nupgrade_service_stopped=true\nupgrade_success=false\nupgrade_published={published}\nupgrade_backup=$1\n\
              launcher_stage=$1/launcher\nconsole_stage=$1/console\ncommand_stage=$1/command\nlisten_address_stage=$1/listen\n\
              public_url_stage=$1/public\ndatabase_type_stage=$1/type\ndatabase_url_stage=$1/url\nservice_stage=$1/service\nready_error=$1/ready\n\
              socket_unit=$1/socket\nsocket_dropin=$1/dropin\nsocket_stage=$1/socket-stage\nsocket_dropin_stage=$1/dropin-stage\n\

@@ -7,6 +7,8 @@ mod cert;
 mod compile_cache;
 mod console;
 mod credentials;
+#[cfg(feature = "cvm")]
+pub mod cvm;
 mod deployment;
 mod distribution;
 mod draft;
@@ -22,6 +24,7 @@ mod load;
 mod load_rollup;
 mod log_policy;
 mod materialize;
+pub mod model_timing;
 mod node_inflow_usage;
 mod node_traffic_history;
 mod notifications;
@@ -29,6 +32,7 @@ mod onboarding;
 mod other_domain;
 mod pg;
 mod ping_probe;
+mod port_reservations;
 mod prerelease_0003;
 mod prerelease_user_cycle;
 mod probe;
@@ -346,3 +350,7 @@ impl From<brocade_core::compile::PublishBlocked> for StoreError {
 }
 
 mod source_access;
+
+mod resource_coordination;
+
+mod extension_state;

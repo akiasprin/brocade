@@ -7,8 +7,15 @@ signal.alarm(180)
 ROOT=Path(sys.argv[2])
 BIN=Path(sys.argv[1]).resolve()
 COUNTS={}; LOCK=threading.Lock()
-def port():
- with socket.socket() as s:s.bind(('127.0.0.1',0));return s.getsockname()[1]
+def ports(count):
+ sockets=[]
+ try:
+  for _ in range(count):
+   listener=socket.socket();listener.bind(('127.0.0.1',0));sockets.append(listener)
+  return [listener.getsockname()[1] for listener in sockets]
+ finally:
+  for listener in sockets:listener.close()
+def port():return ports(1)[0]
 def read(s,n):
  out=b''
  while len(out)<n:
@@ -107,19 +114,23 @@ def relay(tag,ingress,index):
  return {'tag':tag,'protocol':'vless','settings':{'vnext':[{'address':'127.0.0.1','port':ingress,'users':[{'id':UUID[index],'encryption':'none'}]}]}}
 def run_case(name,strategy,family,stop,has_a,has_aaaa,pp,mp,sp,ep,hp,secondary=False,mixed=False,parallel=False,racing=False,retry=False):
  with LOCK:COUNTS.clear()
- mo,other,entry=port(),port(),port();normal=port();groups={'webpage':port(),'premium':port(),'cdn':port()}
+ mo,other,entry,normal,webpage,premium,cdn=ports(7);groups={'webpage':webpage,'premium':premium,'cdn':cdn}
  path=ROOT/(name+'-client.connections');path.write_bytes(b'');path.chmod(0o600)
- servers=[{'address':'127.0.0.1','port':pp,'domains':['domain:youtube.com','domain:googlevideo.com'],'tag':'dns:egress:shared','queryStrategy':strategy,'skipFallback':True,'finalQuery':stop and not racing,'disableCache':retry}]
+ # A trace can consult several members and both address families. Bound each
+ # loopback resolver well inside the HTTP client's unchanged ten-second deadline;
+ # the production four-second default can consume that deadline under packet loss.
+ servers=[{'address':'127.0.0.1','port':pp,'timeoutMs':500,'domains':['domain:youtube.com','domain:googlevideo.com'],'tag':'dns:egress:shared','queryStrategy':strategy,'skipFallback':True,'finalQuery':stop and not racing,'disableCache':retry}]
  if racing:
   servers.append({**servers[0],'port':sp,'finalQuery':stop})
- if secondary:servers.append({'address':'127.0.0.1','port':sp,'domains':['domain:youtube.com','domain:googlevideo.com'],'tag':'dns:egress:second','queryStrategy':'UseIP','skipFallback':True})
- servers.append({'address':'127.0.0.1','port':mp})
+ if secondary:servers.append({'address':'127.0.0.1','port':sp,'timeoutMs':500,'domains':['domain:youtube.com','domain:googlevideo.com'],'tag':'dns:egress:second','queryStrategy':'UseIP','skipFallback':True})
+ servers.append({'address':'127.0.0.1','port':mp,'timeoutMs':500})
  def exit_config(ingress):
   return {'log':{'loglevel':'debug'},'dns':{'servers':servers,'enableParallelQuery':racing or retry},'inbounds':[inbound(ingress)],'outbounds':[{'tag':'out:forward','protocol':'freedom','settings':{'domainStrategy':'UseIP'}},{'tag':'out:forward:probe-v4','protocol':'freedom','settings':{'domainStrategy':'ForceIPv4'}},{'tag':'out:forward:probe-v6','protocol':'freedom','settings':{'domainStrategy':'ForceIPv6'}}],'routing':{'rules':[{'type':'field','user':[LABELS[1]],'outboundTag':'out:forward:probe-v4'},{'type':'field','user':[LABELS[2]],'outboundTag':'out:forward:probe-v6'}]}}
- entry_cfg={'log':{'loglevel':'debug'},'dns':{'servers':[{'address':'127.0.0.1','port':ep}]},'inbounds':[inbound(entry)],'outbounds':[{'tag':'out:forward','protocol':'freedom','settings':{'domainStrategy':'UseIP'}}]+[relay(label+'-'+node,ingress,i) for node,ingress in [('mo',mo),('other',other)] for i,label in enumerate(['normal','v4','v6'])],'routing':{'rules':[{'type':'field','domain':['full:'+host],'user':[LABELS[i]],'outboundTag':label+'-'+('other' if mixed and host==HOSTS[1] else 'mo')} for host in HOSTS for i,label in enumerate(['normal','v4','v6'])]}}
+ entry_cfg={'log':{'loglevel':'debug'},'dns':{'servers':[{'address':'127.0.0.1','port':ep,'timeoutMs':500}]},'inbounds':[inbound(entry)],'outbounds':[{'tag':'out:forward','protocol':'freedom','settings':{'domainStrategy':'UseIP'}}]+[relay(label+'-'+node,ingress,i) for node,ingress in [('mo',mo),('other',other)] for i,label in enumerate(['normal','v4','v6'])],'routing':{'rules':[{'type':'field','domain':['full:'+host],'user':[LABELS[i]],'outboundTag':label+'-'+('other' if mixed and host==HOSTS[1] else 'mo')} for host in HOSTS for i,label in enumerate(['normal','v4','v6'])]}}
  client={'log':{'loglevel':'error'},'inbounds':[{'tag':'normal','listen':'127.0.0.1','port':normal,'protocol':'socks','settings':{'auth':'noauth'}}]+[{'tag':'probe:request:youtube_premium.'+part,'listen':'127.0.0.1','port':value,'protocol':'socks','settings':{'auth':'noauth'}} for part,value in groups.items()],'outbounds':[relay('normal',entry,0),relay('selected',entry,1 if family=='v4' else 2)],'routing':{'rules':[{'type':'field','inboundTag':['probe:request:youtube_premium.'+part for part in groups],'outboundTag':'selected'}]}}
  with xray(name+'-mo',exit_config(mo)),xray(name+'-other',exit_config(other)),xray(name+'-entry',entry_cfg),xray(name+'-client',client):
-  assert http(normal,'example.org',hp)=='ENTRY_DEFAULT'
+  ordinary=http(normal,'example.org',hp)
+  assert ordinary=='ENTRY_DEFAULT', f'{name}: ordinary control returned {ordinary!r}; ports={(mo,other,entry,normal,webpage,premium,cdn)}'
   assert path.read_bytes()==b'', 'ordinary traffic produced diagnostic evidence'
   cold=[]
   if strategy=='UseIPv4' and family=='v6':
@@ -185,7 +196,7 @@ def main():
  subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(key),'-out',str(cert),'-days','1','-subj','/CN=www.youtube.com'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
  key.chmod(0o600)
  TLS_SERVER=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);TLS_SERVER.load_cert_chain(cert,key)
- pp,mp,sp,ep=port(),port(),port(),port();results=[]
+ pp,mp,sp,ep=ports(4);results=[]
  with server(Server,('127.0.0.1',pp),DNS,role='policy',has_a=True,has_aaaa=True) as policy,server(Server,('127.0.0.1',mp),DNS,role='machine',has_a=True,has_aaaa=True),server(Server,('127.0.0.1',sp),DNS,role='secondary',has_a=True,has_aaaa=True),server(Server,('127.0.0.1',ep),DNS,role='entry',has_a=True,has_aaaa=False),server(H4,('127.0.0.1',0),HTTP,marker='POLICY_IPV4') as h4:
   hp=h4.server_address[1]
   with server(H4,('127.0.0.2',hp),HTTP,marker='MACHINE_IPV4'),server(H4,('127.0.0.3',hp),HTTP,marker='SECONDARY_IPV4'),server(H4,('127.0.0.4',hp),HTTP,marker='ENTRY_DEFAULT'),server(HTTP6,('::1',hp),HTTP,marker='IPV6_ENDPOINT'):

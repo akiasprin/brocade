@@ -15,7 +15,9 @@ class InstallerUpgradeTests(unittest.TestCase):
         for socket_mode, scenario in itertools.product(
             ['legacy', 'socket'],
             ['success', 'backup-failure', 'migration-failure', 'health-failure',
-             'health-failure-no-schema', 'secret-file-install', 'insecure-secret-file'],
+             'health-failure-no-schema', 'health-failure-forward-only-no-schema',
+             'backup-failure-forward-only', 'secret-file-install', 'insecure-secret-file',
+             'initialize-success', 'health-failure-initialize-no-schema'],
         ):
             with self.subTest(scenario=scenario, socket=socket_mode):
                 container = 'brocade-upgrade-installer-' + uuid.uuid4().hex[:10]
@@ -65,6 +67,8 @@ if [ "$socket_mode" = socket ]; then
 fi
 printf 'http://192.0.2.20:9001\n' >/etc/brocade/agent-public-url
 printf '0.0.0.0:9001\n' >/etc/brocade/listen-address
+printf 'base\n' >/etc/brocade/product-flavor
+case $scenario in *initialize*) rm /etc/brocade/product-flavor;; esac
 printf 'external\n' >/etc/brocade/database-type
 [ "$socket_mode" != socket ] || printf 'external-socket-v1\n' >/etc/brocade/database-type
 cp /etc/brocade/database-type /database-type-before
@@ -92,9 +96,9 @@ case $1 in
     [ "$check" = false ] || exit 0
     printf 'database-backup\n' >>/control.log
     scenario=$(cat /scenario)
-    [ "$scenario" != backup-failure ] || exit 9
+    case $scenario in backup-failure*) exit 9;; esac
     printf 'fixture-dump' >"$backup/database.dump"
-    [ "$scenario" = health-failure-no-schema ] || touch "$backup/migration-started"
+    case $scenario in *no-schema) ;; *) touch "$backup/migration-started";; esac
     [ "$scenario" != migration-failure ] || exit 9
     touch "$backup/database-complete"
     ;;
@@ -108,10 +112,15 @@ case $1 in
 esac
 EOF
 chmod 755 /bundle/brocade-launcher
-printf new-console >/bundle/brocade-console
+cat >/bundle/brocade-console <<'EOF'
+#!/bin/sh
+case $1 in product-info) printf '{"flavor":"base","features":{"cvm":false}}\n';; *) exit 2;; esac
+EOF
+chmod 755 /bundle/brocade-console
+printf 'base\n' >/bundle/BROCADE_FLAVOR
 printf 'x86_64-gnu\n' >/bundle/BROCADE_PLATFORM
 printf '%s' '@INSTALLER@' | base64 -d >/bundle/install.sh
-(cd /bundle; sha256sum brocade-launcher brocade-console BROCADE_PLATFORM install.sh >SHA256SUMS)
+(cd /bundle; sha256sum brocade-launcher brocade-console BROCADE_PLATFORM BROCADE_FLAVOR install.sh >SHA256SUMS)
 status=0
 case $scenario in
  secret-file-install|insecure-secret-file)
@@ -130,19 +139,24 @@ case $scenario in
     exit 0
     ;;
 esac
-sh /bundle/install.sh --upgrade >/result.log 2>&1 || status=$?
-if [ "$scenario" = success ]; then
+set --
+case $scenario in *forward-only*) set -- --forward-only;; esac
+case $scenario in *initialize*) set -- "$@" --flavor base --initialize-product;; esac
+sh /bundle/install.sh --upgrade "$@" >/result.log 2>&1 || status=$?
+if [ "$scenario" = success ] || [ "$scenario" = initialize-success ]; then
     [ "$status" = 0 ] || { cat /result.log; exit 1; }
     cmp /opt/brocade/brocade-console /bundle/brocade-console
+    [ "$(cat /etc/brocade/product-flavor)" = base ]
     grep -q 'ListenStream=0.0.0.0:9001' /etc/systemd/system/brocade.socket
     grep -q 'Requires=brocade.socket' /etc/systemd/system/brocade.service.d/20-brocade-socket.conf
 else
     [ "$status" != 0 ] || exit 1
 fi
 case $scenario in
- backup-failure|health-failure-no-schema)
+ backup-failure|health-failure-no-schema|health-failure-initialize-no-schema)
     [ "$(cat /opt/brocade/brocade-console)" = old-console ]
     grep -qx 'start brocade.service' /control.log
+    [ "$scenario" != health-failure-initialize-no-schema ] || test ! -e /etc/brocade/product-flavor
     if [ "$socket_mode" = socket ]; then
       cmp /etc/systemd/system/brocade.socket /socket-before
       grep -qx 'start brocade.socket' /control.log
@@ -155,6 +169,16 @@ case $scenario in
     ! grep -qx 'start brocade.service' /control.log
     [ "$(tail -n 1 /control.log)" = 'stop brocade.service' ]
     ;;
+ health-failure-forward-only-no-schema|backup-failure-forward-only)
+    ! grep -qx 'start brocade.service' /control.log
+    [ "$(tail -n 1 /control.log)" = 'stop brocade.service' ]
+    if [ "$scenario" = health-failure-forward-only-no-schema ]; then
+      cmp /opt/brocade/brocade-console /bundle/brocade-console
+      ! find /var/backups/brocade-upgrades -name migration-started | grep -q .
+    else
+      [ "$(cat /opt/brocade/brocade-console)" = old-console ]
+    fi
+    ;;
 esac
 if [ "$socket_mode" = socket ]; then
   python3 - <<'PY'
@@ -166,7 +190,7 @@ fi
 [ "$(cat /var/lib/brocade/secret-key)" = preserve-secret ]
 [ "$(cat /etc/brocade/agent-public-url)" = http://192.0.2.20:9001 ]
 [ "$(cat /etc/brocade/listen-address)" = 0.0.0.0:9001 ]
-if [ "$scenario" = success ] || [ "$scenario" = health-failure ]; then
+if [ "$scenario" = success ] || [ "$scenario" = initialize-success ] || [ "$scenario" = health-failure ] || [ "$scenario" = health-failure-forward-only-no-schema ]; then
   [ "$(cat /etc/brocade/database-type)" = external-socket-v1 ]
 else
   cmp /etc/brocade/database-type /database-type-before

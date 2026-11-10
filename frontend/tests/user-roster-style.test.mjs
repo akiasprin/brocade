@@ -22,7 +22,7 @@ test('用户名册选中行使用中性卡面和弱边线且不再绘制高亮�
 
 test('用量与额度：读数栏沿用用量页写法，线路行不铺底色，窄卡把读数栏移到上方', () => {
   const users = readFileSync(new URL('../src/panes/users.tsx', import.meta.url), 'utf8');
-  const ledger = users.slice(users.indexOf('function UserUsageLedger('), users.indexOf('function QuotaReset('));
+  const ledger = readFileSync(new URL('../src/panes/user-usage.tsx', import.meta.url), 'utf8');
   assert.match(ledger, /className="usage-split"/);
   assert.match(ledger, /className="usage-io"/);
   assert.doesNotMatch(users, /留空表示不限。/);
@@ -65,9 +65,9 @@ test('在线接入时间线：IPv6 不截断，入口默认收成摘要，窄卡
   assert.match(styles, /\.user-presence-mark\s*\{[^}]*background:\s*var\(--ok\);/);
 });
 
-test('转发额度在中等宽度同步三列网格区域，名称不跨到原位编辑器所在行', () => {
-  assert.match(
-    styles,
-    /@container user-usage \(max-width: 700px\)\s*\{\s*\.fwd-quota-row\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto auto;[^}]*grid-template-areas:\s*'name name acts'\s*'figs left left'\s*'meter meter meter';/,
-  );
+test('接入与转发额度复用列宽和 620px 换行规则', () => {
+  assert.match(styles, /\.qta-r\s*\{[^}]*grid-template-columns:\s*var\(--quota-columns\);/);
+  assert.match(styles, /\.qta\.fwe-aligned\s*\{[^}]*grid-template-columns:\s*var\(--quota-columns\);/);
+  assert.match(styles, /@container user-usage \(max-width: 620px\)\s*\{[\s\S]*?\.qta\s*\{[^}]*--quota-columns:/);
+  assert.doesNotMatch(styles, /@container user-usage \(max-width: 700px\)\s*\{\s*\.fwd-quota-row/);
 });

@@ -37,6 +37,94 @@ fn request(source: &str, id: u8) -> UserBudgetRequest {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn shared_budget_keys_and_idle_nodes_do_not_block_waiters() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    let cap = UserTrafficPolicy {
+        quota_bytes: None,
+        base_rate_bps: Some(8000),
+        exhausted_action: ExhaustedAction::Suspend,
+    };
+    db.store
+        .update_user_traffic_policy(
+            &system_admin(),
+            TENANT,
+            "alice",
+            UserTrafficKind::Access,
+            Some("app-main"),
+            cap.clone(),
+        )
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO ingresses SELECT (jsonb_populate_record(NULL::ingresses,to_jsonb(i)||'{\"id\":\"ing-same-node\",\"port\":24444}'::jsonb)).* FROM ingresses i WHERE id='ing-a1b2'").execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO grants(app_id,tenant_id,user_id,ingress_id) VALUES('app-main',$1,'alice','ing-same-node')").bind(TENANT).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO users(tenant_id,id,uuid) VALUES($1,'bob','02020202-0202-0202-0202-020202020202')").bind(TENANT).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO grants(app_id,tenant_id,user_id,ingress_id) VALUES('app-main',$1,'bob','ing-a1b2')").bind(TENANT).execute(db.pool()).await.unwrap();
+    db.store
+        .update_user_traffic_policy(
+            &system_admin(),
+            TENANT,
+            "bob",
+            UserTrafficKind::Access,
+            Some("app-main"),
+            cap,
+        )
+        .await
+        .unwrap();
+    let first = db.store.user_traffic_assignments("n1").await.unwrap();
+    let other = db.store.user_traffic_assignments("n2").await.unwrap();
+    let key = first
+        .sources
+        .iter()
+        .find(|r| r.source == "alice@platform.acme#ing-a1b2")
+        .unwrap()
+        .budget_key
+        .clone()
+        .unwrap();
+    assert_eq!(key.len(), 64);
+    assert_eq!(
+        first
+            .sources
+            .iter()
+            .find(|r| r.source == "alice@platform.acme#ing-same-node")
+            .unwrap()
+            .budget_key
+            .as_ref(),
+        Some(&key)
+    );
+    assert_eq!(other.sources[0].budget_key.as_ref(), Some(&key));
+    assert_ne!(
+        first
+            .sources
+            .iter()
+            .find(|r| r.source == "bob@platform.acme#ing-a1b2")
+            .unwrap()
+            .budget_key
+            .as_ref(),
+        Some(&key)
+    );
+    for (node, source, id) in [
+        ("n1", "alice@platform.acme#ing-a1b2", 1),
+        ("n2", "alice@platform.acme#ing-n2", 2),
+        ("n2", "alice@platform.acme#ing-n2", 3),
+    ] {
+        let mut tiny = request(source, id);
+        tiny.bytes = 1;
+        assert!(
+            matches!(
+                db.store.user_traffic_budget(node, tiny).await.unwrap(),
+                UserBudgetGrant::Limited { bytes: 1, .. }
+            ),
+            "a previously served idle node must not block the only waiting node"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn user_scoped_app_quotas_keep_usage_budgets_suspension_and_recovery_independent() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -72,6 +160,27 @@ async fn user_scoped_app_quotas_keep_usage_budgets_suspension_and_recovery_indep
             .await
             .unwrap();
     }
+    let assignments = db.store.user_traffic_assignments("n1").await.unwrap();
+    let main_key = assignments
+        .sources
+        .iter()
+        .find(|row| row.source == "alice@platform.acme#ing-a1b2")
+        .unwrap()
+        .budget_key
+        .as_ref()
+        .unwrap();
+    let other_key = assignments
+        .sources
+        .iter()
+        .find(|row| row.source == "alice@platform.acme#ing-other")
+        .unwrap()
+        .budget_key
+        .as_ref()
+        .unwrap();
+    assert_ne!(
+        main_key, other_key,
+        "different apps must not share local credits"
+    );
     usage(&db, 1024).await;
     db.store.enforce_user_traffic_policies().await.unwrap();
     let views = db
@@ -997,7 +1106,7 @@ async fn constant_app_speed_new_migration_preserves_restored_existing_database_a
             .await
             .unwrap()
             .pending_versions,
-        [4]
+        [4, 5]
     );
     sqlx::query("CREATE TABLE user_app_rate_limits(conflict TEXT)")
         .execute(db.pool())

@@ -329,10 +329,11 @@ it('retains midnight history when collection later establishes a new continuous 
   expect(JSON.parse(chart.dataset.values!)[0]).toBe(150);
   expect(JSON.parse(chart.dataset.values!)[2]).toBe(50);
   expect(screen.queryByText(/观测起点/)).toBeNull();
-  expect(screen.getByText('站点采集可能有缺口').title).toContain('此前已有记录继续计入');
+  expect(screen.queryByText('站点采集可能有缺口')).toBeNull();
+  expect(container.querySelector('.site-usage-meta')?.textContent).toBe('下行 200 B · 上行 0 B');
 });
 
-it('marks a high sniffing-failure share, uncertain historical coverage and missing reporters', async () => {
+it('keeps incomplete history quiet while marking high sniffing-failure share and missing reporters', async () => {
   fetchSites.mockResolvedValue(
     sites({
       reporting_nodes: 10,
@@ -343,7 +344,7 @@ it('marks a high sniffing-failure share, uncertain historical coverage and missi
   card();
   const list = await screen.findByRole('region', { name: '各站点流量' });
   expect(within(list).getByText('50.0%', { selector: '.site-usage-pct.warn' })).toBeTruthy();
-  expect(screen.getByText('站点采集可能有缺口').classList.contains('warn')).toBe(true);
+  expect(screen.queryByText('站点采集可能有缺口')).toBeNull();
   const status = screen.getByRole('status');
   expect(status.classList.contains('warn')).toBe(true);
   expect(status.textContent).toBe('10 / 12 台入口已上报');
@@ -398,7 +399,7 @@ it('puts forwarding first in the user ranking and chart and includes it in total
   expect(forwarding.querySelector('.site-brand-icon svg')).toBeTruthy();
   expect(container.querySelector('.site-usage-total')?.textContent).toBe('1000B');
   expect(container.querySelector('.site-usage-label')?.textContent).toContain('1 类站点 · 端口转发');
-  expect(screen.getByText('站点采集可能有缺口')).toBeTruthy();
+  expect(screen.queryByText('站点采集可能有缺口')).toBeNull();
   const chart = await screen.findByTestId('site-usage-chart');
   expect(chart.dataset.series).toBe('forwarding,github');
   fireEvent.mouseEnter(forwarding.closest('li')!);

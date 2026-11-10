@@ -113,24 +113,31 @@ pub async fn store_current_snapshot_tx(
     tx: &mut Transaction<'_, Postgres>,
     revision_id: u64,
 ) -> Result<()> {
-    let snapshot = load_current_snapshot_tx(tx).await?;
+    let snapshot =
+        crate::model_timing::measure("materialize_snapshot", load_current_snapshot_tx(tx)).await?;
     if snapshot.revision != revision_id {
         return Err(StoreError::InvalidData(format!(
             "cannot store snapshot for revision {revision_id}; control_state points at {}",
             snapshot.revision
         )));
     }
-    let mut value = serde_json::to_value(&snapshot)?;
-    seal_snapshot_external_credentials(&mut value)?;
-    sqlx::query(
-        "INSERT INTO model_snapshots (revision_id, snapshot)
+    let value = crate::model_timing::measure_sync("encode_snapshot", || {
+        let mut value = serde_json::to_value(&snapshot)?;
+        seal_snapshot_external_credentials(&mut value)?;
+        Ok::<_, StoreError>(value)
+    })?;
+    crate::model_timing::measure(
+        "persist_snapshot",
+        sqlx::query(
+            "INSERT INTO model_snapshots (revision_id, snapshot)
          VALUES ($1, $2)
          ON CONFLICT (revision_id) DO UPDATE SET
             snapshot = EXCLUDED.snapshot",
+        )
+        .bind(revision_to_i64(revision_id)?)
+        .bind(value)
+        .execute(&mut **tx),
     )
-    .bind(revision_to_i64(revision_id)?)
-    .bind(value)
-    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -315,6 +322,58 @@ pub(crate) async fn load_immutable_snapshot(pool: &PgPool, revision: u64) -> Res
             "serving revision {revision} has no immutable model snapshot"
         ))
     })
+}
+
+/// A release reads the model frozen at commit, with the current revision's operational
+/// certificate state overlaid in one batch. A coherent read transaction keeps a concurrent
+/// commit from mixing its certificate ownership with the requested model.
+pub(crate) async fn load_deployment_snapshot(
+    pool: &PgPool,
+    revision: u64,
+) -> Result<ModelSnapshot> {
+    let mut tx = crate::model_timing::measure("snapshot_pool_begin", pool.begin()).await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let current =
+        crate::model_timing::measure("snapshot_read_revision", current_revision_tx(&mut tx))
+            .await?;
+    let mut snapshot = crate::model_timing::measure(
+        "snapshot_read_frozen",
+        async {
+            let row = sqlx::query("SELECT revisions.id, snapshots.snapshot
+                FROM revisions LEFT JOIN model_snapshots snapshots ON snapshots.revision_id=revisions.id
+                WHERE revisions.id=$1")
+                .bind(revision_to_i64(revision)?).fetch_optional(&mut *tx).await?
+                .ok_or_else(|| StoreError::NotFound(format!("revision {revision}")))?;
+            let document = row.try_get::<Option<Value>, _>("snapshot")?.ok_or_else(|| {
+                StoreError::Unsupported(format!("model snapshot for revision {revision} is not available"))
+            })?;
+            decode_stored_snapshot(document, revision)
+        },
+    )
+    .await?;
+    if revision == current {
+        let live =
+            crate::model_timing::measure("snapshot_read_certificates", load_nodes_tx(&mut tx))
+                .await?;
+        let live = live
+            .into_iter()
+            .map(|node| (node.id.clone(), node))
+            .collect::<BTreeMap<_, _>>();
+        for node in &mut snapshot.nodes {
+            if let Some(current) = live.get(&node.id) {
+                node.certificate_group_id
+                    .clone_from(&current.certificate_group_id);
+                node.certificate_name.clone_from(&current.certificate_name);
+                node.certificate_names
+                    .clone_from(&current.certificate_names);
+                node.certificate_track = current.certificate_track;
+            }
+        }
+    }
+    tx.commit().await?;
+    Ok(snapshot)
 }
 
 /// Transaction-scoped immutable snapshot load for serving checkpoint composition. Unlike

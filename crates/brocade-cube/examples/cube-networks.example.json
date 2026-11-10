@@ -1,0 +1,7 @@
+{
+  "state_dir": "/data/cubelet/network-attachments-v2",
+  "vmm_root": "/run/vc/vm",
+  "max_interfaces": 3,
+  "shim_version": "REPLACE_WITH_BUILD_MANIFEST_SHIM_VERSION",
+  "shim_sha256": "REPLACE_WITH_BUILD_MANIFEST_SHIM_SHA256"
+}

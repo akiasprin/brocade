@@ -15,6 +15,12 @@ export function changeControl(element: Element, event: { target: { value: string
 }
 
 export function choiceOptions(element: Element) {
+  if (element instanceof HTMLSelectElement)
+    return Array.from(element.options).map(option => ({
+      value: option.value,
+      text: option.textContent,
+      disabled: option.disabled,
+    }));
   fireEvent.click(element);
   const options = screen.getAllByRole('option').map(option => ({
     value: option.getAttribute('data-value'),

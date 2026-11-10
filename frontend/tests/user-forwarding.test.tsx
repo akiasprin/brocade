@@ -9,6 +9,7 @@ import type {
   UsageForwardingMonthlyRow,
   UserCycleUsage,
   UserListItem,
+  UserTrafficAccountingMode,
 } from '../src/api';
 import { UserForwardingCard } from '../src/panes/user-forwarding';
 import { forwardingQuotaBytes, forwardingQuotaText, forwardingQuotaValue } from '../src/panes/forwarding-quota';
@@ -119,12 +120,19 @@ const writes = (request: ReturnType<typeof serve>) =>
       body: init?.body ? (JSON.parse(String(init.body)) as unknown) : undefined,
     }));
 
-function show(options: { canAuthorize?: boolean; canManageRules?: boolean; canViewRealtime?: boolean } = {}) {
+function show(
+  options: {
+    canAuthorize?: boolean;
+    canManageRules?: boolean;
+    canViewRealtime?: boolean;
+    accountingMode?: UserTrafficAccountingMode;
+  } = {},
+) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } } });
   const view = render(
     <QueryClientProvider client={client}>
       <UserForwardingCard
-        user={user}
+        user={{ ...user, traffic_accounting_mode: options.accountingMode ?? 'single' }}
         nodes={[
           { id: 'n1', name: '东京入口', api_port: 10085, public_ipv4: '198.51.100.10' },
           { id: 'n2', name: '洛杉矶入口', api_port: 10085 },
@@ -237,7 +245,7 @@ describe('A inline forwarding regression', () => {
     fireEvent.change(within(form).getByLabelText('本期转发额度（GiB）'), { target: { value: '150' } });
     current = overview([entry({ cycle_used_bytes: 8 * 1024 ** 3 })], [rule()]);
     await act(() => view.client.invalidateQueries({ queryKey: ['forwarding', user.tenant_id, user.id] }));
-    await waitFor(() => expect(view.container.querySelector('.qta-figs')?.textContent).toContain('8.00 GiB'));
+    await waitFor(() => expect(view.container.querySelector('.qta-figs')?.textContent).toContain('8.00GiB'));
     expect(view.getByRole('form')).toBe(form);
     expect((within(form).getByLabelText('本期转发额度（GiB）') as HTMLInputElement).value).toBe('150');
     fireEvent.click(view.getByRole('button', { name: '编辑 东京入口 :20042' }));
@@ -291,7 +299,7 @@ describe('A inline forwarding regression', () => {
     fireEvent.change(within(form).getByLabelText('本期转发额度（GiB）'), { target: { value: '200' } });
     fireEvent.click(within(form).getByRole('button', { name: '保存' }));
     await within(form).findByText(/授权已保存，配额保存失败/);
-    expect(view.container.querySelector('.qta-left')?.textContent).toContain('1 / 8');
+    expect(view.container.querySelector('.fwd-rule-count')?.textContent).toContain('1 / 8');
     expect((within(form).getByLabelText('本期转发额度（GiB）') as HTMLInputElement).value).toBe('200');
     expect(writes(request).map(write => write.path)).toEqual([
       `${BASE}/forwarding-nodes/n1`,
@@ -319,7 +327,7 @@ describe('A inline forwarding regression', () => {
     fireEvent.click(within(form).getByRole('button', { name: '保存' }));
     await within(form).findByText('授权保存失败');
     expect(writes(request)).toHaveLength(1);
-    expect(view.container.querySelector('.qta-left')?.textContent).toContain('1 / 4');
+    expect(view.container.querySelector('.fwd-rule-count')?.textContent).toContain('1 / 4');
     expect((within(form).getByLabelText('规则上限') as HTMLInputElement).value).toBe('8');
   });
 
@@ -385,7 +393,7 @@ describe('A inline forwarding regression', () => {
     fireEvent.change(within(ruleForm).getByLabelText('名称'), { target: { value: '保留输入' } });
     expect(finish).toBeTypeOf('function');
     finish!(overview([entry({ max_rules: 8 })], [rule()]));
-    await waitFor(() => expect(view.container.querySelector('.qta-left')?.textContent).toContain('1 / 8'));
+    await waitFor(() => expect(view.container.querySelector('.fwd-rule-count')?.textContent).toContain('1 / 8'));
     expect(view.getByRole('form', { name: '编辑入口 20042 的规则' })).toBe(ruleForm);
     expect((within(ruleForm).getByLabelText('名称') as HTMLInputElement).value).toBe('保留输入');
   });
@@ -533,7 +541,7 @@ describe('用户转发入口', () => {
     fireEvent.click(quota);
     expect(view.queryByRole('form', { name: /编辑入口/ })).toBeNull();
     expect(view.getByRole('form', { name: '编辑 东京入口 的转发授权' })).toBeTruthy();
-    expect(view.container.querySelector('.qta-figs')?.textContent).toContain('5.00 GiB');
+    expect(view.container.querySelector('.qta-figs')?.textContent).toContain('5.00GiB');
     expect(view.queryAllByRole('form')).toHaveLength(1);
     expect(view.getByRole('button', { name: '编辑 东京入口 :20042' })).toBeTruthy();
     fireEvent.click(view.getByRole('button', { name: '新建规则' }));
@@ -752,18 +760,20 @@ describe('用户转发入口', () => {
         ]),
     });
     const view = show();
-    const quotas = await view.findByRole('list', { name: '各转发入口的用量与规则额度' });
-    await waitFor(() => expect(quotas.textContent).toContain('5.0 MiB'));
+    const quotas = await view.findByRole('list', { name: '各转发入口的用量与额度' });
+    await waitFor(() => expect(quotas.querySelector('.qta-figs')?.textContent).toContain('5.0MiB'));
     expect(within(quotas).queryByText('入口机器')).toBeNull();
     const rows = within(quotas).getAllByRole('listitem');
     const tokyo = rows.find(row => row.textContent?.includes('东京入口'))!;
     const lax = rows.find(row => row.textContent?.includes('洛杉矶入口'))!;
-    expect(tokyo.querySelector('.qta-figs')?.textContent).toBe('5.0 MiB');
-    expect(tokyo.querySelector('.qta-left')?.textContent).toBe('规则1 / 4');
-    expect(tokyo.querySelector('.qta-pct')?.textContent).toBe('25%');
-    expect(lax.querySelector('.qta-figs')?.textContent).toBe('2.0 MiB');
-    expect(lax.querySelector('.qta-left')?.textContent).toBe('规则1 / 2');
-    expect(lax.querySelector('.qta-pct')?.textContent).toBe('50%');
+    expect(tokyo.querySelector('.qta-figs')?.textContent).toBe('5.0MiB');
+    expect(tokyo.querySelector('.fwd-rule-count')?.textContent).toBe('规则 1 / 4');
+    expect(tokyo.querySelector('.qta-left')?.textContent).toBe('不限额度');
+    expect(tokyo.querySelector('.qta-pct')).toBeNull();
+    expect(lax.querySelector('.qta-figs')?.textContent).toBe('2.0MiB');
+    expect(lax.querySelector('.fwd-rule-count')?.textContent).toBe('规则 1 / 2');
+    expect(lax.querySelector('.qta-left')?.textContent).toBe('不限额度');
+    expect(lax.querySelector('.qta-pct')).toBeNull();
   });
 
   it('月流量加载失败时保留未知读数，不伪装成零用量', async () => {
@@ -772,10 +782,47 @@ describe('用户转发入口', () => {
       'GET /usage/user-cycles': () => new Response('Unavailable', { status: 503 }),
     });
     const view = show();
-    const quotas = await view.findByRole('list', { name: '各转发入口的用量与规则额度' });
-    await waitFor(() => expect(view.container.querySelector('.user-usage-hero-value')?.textContent).toBe('—'));
+    const quotas = await view.findByRole('list', { name: '各转发入口的用量与额度' });
+    await waitFor(() => expect(view.container.querySelector('.user-usage-hero-value')?.textContent).toBe('暂不可用'));
     expect(quotas.querySelector('.qta-figs')?.textContent).toBe('—');
-    expect(quotas.querySelector('.qta-left')?.textContent).toBe('规则1 / 4');
+    expect(quotas.querySelector('.fwd-rule-count')?.textContent).toBe('规则 1 / 4');
+    expect(quotas.querySelector('.qta-left')?.textContent).toBe('用量暂不可用');
+    expect(quotas.querySelector('.qta-pct')).toBeNull();
+  });
+
+  it('双向计量的总量只翻倍一次，上下行明细沿用接入的原始计量口径', async () => {
+    serve({
+      [`GET ${BASE}/forwarding`]: () => overview([entry()], [rule()]),
+      'GET /usage/user-cycles': () => cycleUsage([usage(42, 4 * MiB, MiB)]),
+    });
+    const view = show({ accountingMode: 'double' });
+    await waitFor(() => expect(view.container.querySelector('.user-usage-hero-value')?.textContent).toBe('10.0 MiB'));
+    const ledger = view.container.querySelector('.user-usage-ledger')!;
+    expect(ledger.querySelector('.usage-io .up dd')?.textContent).toBe('1.0 MiB');
+    expect(ledger.querySelector('.usage-io .down dd')?.textContent).toBe('4.0 MiB');
+    expect(view.container.querySelector('.qta-figs')?.textContent).toBe('10.0MiB');
+  });
+
+  it('流量进度按机器额度计算，规则数量单独保留，超额时不截断百分比', async () => {
+    let current = overview([entry({ cycle_used_bytes: 5 * MiB, cycle_limit_bytes: 50 * MiB })], [rule()]);
+    serve({ [`GET ${BASE}/forwarding`]: () => current });
+    const view = show();
+    const quotas = await view.findByRole('list', { name: '各转发入口的用量与额度' });
+    expect(quotas.querySelector('.qta-pct')?.textContent).toBe('10%');
+    expect(quotas.querySelector('.qta-left')?.textContent).toBe('剩余45.0 MiB');
+    expect(quotas.querySelector('.fwd-rule-count')?.textContent).toBe('规则 1 / 4');
+    expect(within(quotas).getByText('用满后停用')).toBeTruthy();
+
+    current = overview(
+      [entry({ cycle_used_bytes: 60 * MiB, cycle_limit_bytes: 50 * MiB, quota_suspended: true })],
+      [rule()],
+    );
+    await act(() => view.client.invalidateQueries({ queryKey: ['forwarding', user.tenant_id, user.id] }));
+    await waitFor(() => expect(quotas.querySelector('.qta-pct')?.textContent).toBe('120%'));
+    expect(quotas.querySelector('.qta-left')?.textContent).toBe('超出10.0 MiB');
+    expect(quotas.querySelector('.qta-overflow')).toBeTruthy();
+    expect(quotas.querySelector('.qta-r')?.classList.contains('over')).toBe(true);
+    expect(within(quotas).getByText('额度已用满 · 已停用')).toBeTruthy();
   });
 
   it('新建规则只填一栏目标，入口端口取下一个空闲端口', async () => {

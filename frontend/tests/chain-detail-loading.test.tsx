@@ -330,9 +330,9 @@ describe('链详情统一等待首屏依赖', () => {
     expect(view.getByRole('checkbox', { name: 'VLESS · TLS / REALITY（TCP / XHTTP）' })).toBeTruthy();
     expect(view.getByRole('option', { name: '全局站点 site.example' })).toBeTruthy();
     expect(view.getByText('链路规则')).toBeTruthy();
-    expect(view.container.querySelector('.rule-machine-node')).toBeTruthy();
-    fireEvent.click(view.getByRole('button', { name: /entry.*入口/ }));
-    expect(view.container.querySelector('.rule-editor')).toBeTruthy();
+    // 机器树逐台展开即规则表：不用先选机器，编辑器已经在页面上。
+    expect(view.getByRole('button', { name: /entry.*入口/ }).getAttribute('aria-expanded')).toBe('true');
+    expect(view.container.querySelector('.chain-rule-body:not([hidden]) .rule-editor')).toBeTruthy();
     expect(view.queryByRole('status')).toBeNull();
     expect(fetcher.mock.calls.map(([path]) => path).sort()).toEqual([
       '/apps/app-1/chains/chain-1/unlock-probe/capabilities',
@@ -457,10 +457,9 @@ describe('链详情统一等待首屏依赖', () => {
     fireEvent.click(view.getByRole('button', { name: '测试线路' }));
     const input = view.getByRole('textbox', { name: '链名' }) as HTMLInputElement;
     fireEvent.change(input, { target: { value: '继续编辑的名称' } });
-    fireEvent.click(view.getByRole('button', { name: /entry.*入口/ }));
     const page = view.container.querySelector('.chain-detailpage');
     const editor = view.container.querySelector('.rule-editor')!;
-    fireEvent.click(within(editor as HTMLElement).getByRole('button', { name: '＋ 添加规则' }));
+    fireEvent.click(within(editor as HTMLElement).getByRole('button', { name: '＋ 加一条' }));
     const saveRules = view.getByRole('button', { name: '保存到草稿' }) as HTMLButtonElement;
     await waitFor(() => expect(saveRules.disabled).toBe(false));
     const protocol = view.getByRole('checkbox', { name: 'VLESS · TLS / REALITY（TCP / XHTTP）' });
@@ -472,7 +471,7 @@ describe('链详情统一等待首屏依赖', () => {
       expect(input.value).toBe('继续编辑的名称');
       expect(view.getByRole('checkbox', { name: 'VLESS · TLS / REALITY（TCP / XHTTP）' })).toBe(protocol);
       expect(view.getByRole('textbox', { name: 'VLESS · TLS / REALITY 监听端口', hidden: true })).toBe(port);
-      expect(view.getByRole('button', { name: /entry.*入口/ }).getAttribute('aria-current')).toBe('true');
+      expect(view.getByRole('button', { name: /entry.*入口/ }).getAttribute('aria-expanded')).toBe('true');
     };
     hold('/compile/8');
     act(() => client.setQueryData(['revisions'], { current_revision: 8, revisions: [] }));

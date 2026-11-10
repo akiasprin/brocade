@@ -6,6 +6,7 @@ import { useSyncExternalStore } from 'react';
 /** 顶栏导航的键。主工作流显示在顶栏上，其余收入「⋯」。 */
 export type NavKey =
   | 'nodes'
+  | 'cvm'
   | 'chains'
   | 'tunnels'
   | 'users'
@@ -22,6 +23,7 @@ export type NavKey =
 // 顺序不影响结果，此处不决定顶栏的排列（排列由 forge/shell.tsx 的 NAV / MORE 决定）。
 export const NAV_KEYS = [
   'nodes',
+  'cvm',
   'chains',
   'tunnels',
   'users',

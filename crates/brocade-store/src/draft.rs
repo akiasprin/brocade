@@ -40,6 +40,7 @@ use crate::console::{
     CreateUserRequest, PutStepRequest, UpdateNodeRequest, UpdateNodeStatusRequest,
     UpdateUserStatusRequest, UpsertExternalOutboundRequest,
 };
+use crate::model_timing as timing;
 use crate::{AdminContext, Result, StoreError};
 
 /// One edit within a draft. Each corresponds to an existing write interface — adding no
@@ -445,26 +446,45 @@ pub async fn apply_ops(
         n => format!("提交 {n} 处改动：{}", summarize(&ops)),
     });
 
-    let mut tx = pool.begin().await?;
+    let mut tx = timing::measure("pool_begin", pool.begin()).await?;
     let previous = crate::console::lock_control_state(&mut tx).await?;
-    let revision_id = crate::console::insert_revision(&mut tx, actor.operator_id(), &note).await?;
-    let mut changed = 0usize;
-    for op in ops {
-        if apply_op(&mut tx, actor, revision_id, op).await? {
-            changed += 1;
+    let revision_id = timing::measure(
+        "insert_revision",
+        crate::console::insert_revision(&mut tx, actor.operator_id(), &note),
+    )
+    .await?;
+    let mut changed = timing::measure("write_ops", async {
+        let mut changed = 0usize;
+        for op in ops {
+            if apply_op(&mut tx, actor, revision_id, op).await? {
+                changed += 1;
+            }
         }
-    }
-    if crate::console::prune_unreferenced_vpngate_outbounds_tx(&mut tx, actor).await? {
+        Ok::<_, StoreError>(changed)
+    })
+    .await?;
+    if timing::measure(
+        "prune_outbounds",
+        crate::console::prune_unreferenced_vpngate_outbounds_tx(&mut tx, actor),
+    )
+    .await?
+    {
         changed += 1;
     }
-    let revision_id =
-        crate::console::commit_revision(&mut tx, revision_id, previous, changed > 0).await?;
-    let mut client_config =
-        crate::subscription_client::commit_result_tx(&mut tx, revision_id).await?;
+    let revision_id = timing::measure(
+        "commit_revision",
+        crate::console::commit_revision(&mut tx, revision_id, previous, changed > 0),
+    )
+    .await?;
+    let mut client_config = timing::measure(
+        "client_commit_result",
+        crate::subscription_client::commit_result_tx(&mut tx, revision_id),
+    )
+    .await?;
     if changed == 0 {
         client_config.status = crate::ClientConfigCommitStatus::Unchanged;
     }
-    tx.commit().await?;
+    timing::measure("commit_tx", tx.commit()).await?;
 
     Ok(ApplyDraftResult {
         revision_id,
@@ -480,12 +500,19 @@ pub async fn preview_ops(
     actor: &AdminContext,
     ops: Vec<ModelOp>,
 ) -> Result<DraftPreview> {
-    let snapshot = draft_snapshot(pool, actor, ops).await?;
-    let output = crate::compile_cache::compile_snapshot(&snapshot).await?;
+    let snapshot = timing::measure("draft_snapshot", draft_snapshot(pool, actor, ops)).await?;
+    let output =
+        timing::measure("compile", crate::compile_cache::compile_snapshot(&snapshot)).await?;
     Ok(DraftPreview {
-        compile: crate::console::compile_view_from_output(&snapshot, &output)?,
-        artifacts: crate::console::artifact_index_from_output(&snapshot, &output)?,
-        snapshot: crate::console::snapshot_view(snapshot)?,
+        compile: timing::measure_sync("compile_view", || {
+            crate::console::compile_view_from_output(&snapshot, &output)
+        })?,
+        artifacts: timing::measure_sync("artifact_index", || {
+            crate::console::artifact_index_from_output(&snapshot, &output)
+        })?,
+        snapshot: timing::measure_sync("snapshot_view", || {
+            crate::console::snapshot_view(snapshot)
+        })?,
     })
 }
 
@@ -496,7 +523,7 @@ pub(crate) async fn draft_snapshot(
     actor: &AdminContext,
     ops: Vec<ModelOp>,
 ) -> Result<brocade_core::model::ModelSnapshot> {
-    let mut tx = pool.begin().await?;
+    let mut tx = timing::measure("pool_begin", pool.begin()).await?;
     // Borrow the current revision number rather than opening a new one. Every table's
     // `created_revision` has a foreign key into revisions, so this run needs a number that
     // exists; and inserting a row will not do — Postgres sequences do not participate in
@@ -505,14 +532,26 @@ pub(crate) async fn draft_snapshot(
     // visible rate. These rows vanish with the transaction anyway, so whatever
     // `created_revision` holds is seen by nobody.
     let revision_id = crate::console::lock_control_state(&mut tx).await?;
-    for op in ops {
-        apply_op(&mut tx, actor, revision_id, op).await?;
-    }
-    crate::console::prune_unreferenced_vpngate_outbounds_tx(&mut tx, actor).await?;
-    let snapshot = crate::materialize::load_current_snapshot_tx(&mut tx).await?;
+    timing::measure("write_ops", async {
+        for op in ops {
+            apply_op(&mut tx, actor, revision_id, op).await?;
+        }
+        Ok::<_, StoreError>(())
+    })
+    .await?;
+    timing::measure(
+        "prune_outbounds",
+        crate::console::prune_unreferenced_vpngate_outbounds_tx(&mut tx, actor),
+    )
+    .await?;
+    let snapshot = timing::measure(
+        "materialize_snapshot",
+        crate::materialize::load_current_snapshot_tx(&mut tx),
+    )
+    .await?;
     // Read and discard. Not a commit — a preview is read-only in meaning, whatever write
     // permissions the caller holds.
-    tx.rollback().await?;
+    timing::measure("rollback_preview", tx.rollback()).await?;
 
     Ok(crate::console::scope_snapshot(actor, snapshot))
 }

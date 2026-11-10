@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { QRCodeSVG } from 'qrcode.react';
 import {
   ApiError,
   cancelGrantProbe,
@@ -56,8 +57,9 @@ const PROTOCOL_PICKS: { value: ProtocolPick; label: string }[] = [
   { value: 'vless', label: 'VLESS' },
   { value: 'anytls', label: 'AnyTLS' },
   { value: 'hysteria2', label: 'Hysteria 2' },
-  { value: 'mtproto', label: 'MTProxy' },
 ];
+
+const NODE_PROTOCOL_PICKS = [...PROTOCOL_PICKS, { value: 'mtproto' as const, label: 'MTProxy' }];
 
 const TABS: { value: SubscriptionKind; label: string; icon: IconName }[] = [
   { value: 'clash', label: '订阅', icon: 'subscription' },
@@ -98,10 +100,23 @@ export function SubscriptionViewer({
   // 默认列出自签证书节点（带 insecure 标记），节点页签的说明行里可以改为不列出。切到 VLESS 不收回：
   // VLESS 自签入口没有可互通的链接写法，服务端无论是否允许 insecure 都会跳过并给出说明。
   const [allowInsecure, setAllowInsecure] = useState(true);
-  const narrow = useNarrow();
   const ids = useId();
   const tabId = (value: SubscriptionKind) => `${ids}-tab-${value}`;
   const panel: TabPanelProps = { role: 'tabpanel', id: `${ids}-panel`, 'aria-labelledby': tabId(tab) };
+
+  const changeTab = (next: SubscriptionKind) => {
+    if (next === 'clash' && protocol === 'mtproto') setProtocol('both');
+    setTab(next);
+  };
+  const filters = (
+    <SubscriptionFilters
+      protocol={protocol}
+      family={family}
+      includeMtproto={tab === 'uri'}
+      onProtocol={setProtocol}
+      onFamily={setFamily}
+    />
+  );
 
   // 与机器详情页签相同：左右方向键、Home / End 在两个页签之间移动并切换。
   const moveTab = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
@@ -114,13 +129,13 @@ export function SubscriptionViewer({
     if (next === null) return;
     event.preventDefault();
     const value = TABS[next].value;
-    setTab(value);
+    changeTab(value);
     window.requestAnimationFrame(() => document.getElementById(tabId(value))?.focus());
   };
 
   return (
     <DialogLayer label={`${user} 的订阅与节点`} onClose={onClose}>
-      <section className="dialog-surface sub-dialog">
+      <section className={`dialog-surface sub-dialog${tab === 'clash' ? ' sub-dialog-subscription' : ''}`}>
         <header className="sub-dialog-head">
           {identity}
           <b className="sub-dialog-user">{user}</b>
@@ -136,7 +151,7 @@ export function SubscriptionViewer({
                   aria-controls={panel.id}
                   tabIndex={tab === item.value ? 0 : -1}
                   onKeyDown={moveTab}
-                  onClick={() => setTab(item.value)}
+                  onClick={() => changeTab(item.value)}
                 >
                   <Icon of={item.icon} size={14} className="nd-tab-ic" />
                   {item.label}
@@ -148,42 +163,7 @@ export function SubscriptionViewer({
             <Icon of="close" size={14} />
           </DialogClose>
         </header>
-        <div className="sub-dialog-filter">
-          {narrow ? (
-            <>
-              <FilterPick
-                icon="protocol"
-                label="协议"
-                value={protocol}
-                options={PROTOCOL_PICKS}
-                onChange={setProtocol}
-              />
-              <FilterPick icon="family" label="地址族" value={family} options={FAMILY_PICKS} onChange={setFamily} />
-            </>
-          ) : (
-            <>
-              <span className="sub-dialog-field">
-                <span className="sub-dialog-label">
-                  <Icon of="protocol" size={13} />
-                  协议
-                </span>
-                <SegmentedControl
-                  ariaLabel="订阅协议"
-                  value={protocol}
-                  options={PROTOCOL_PICKS}
-                  onChange={setProtocol}
-                />
-              </span>
-              <span className="sub-dialog-field">
-                <span className="sub-dialog-label">
-                  <Icon of="family" size={13} />
-                  地址族
-                </span>
-                <SegmentedControl ariaLabel="地址族" value={family} options={FAMILY_PICKS} onChange={setFamily} />
-              </span>
-            </>
-          )}
-        </div>
+        {tab === 'uri' && filters}
         {tab === 'clash' ? (
           <ClashSubscription
             tenant={tenant}
@@ -192,6 +172,7 @@ export function SubscriptionViewer({
             protocol={protocol}
             family={family}
             panel={panel}
+            filters={filters}
           />
         ) : (
           <NodeLinks
@@ -202,13 +183,57 @@ export function SubscriptionViewer({
             family={family}
             allowInsecure={allowInsecure}
             onAllowInsecure={setAllowInsecure}
-            onUseSubscription={() => setTab('clash')}
+            onUseSubscription={() => changeTab('clash')}
             onProbePassed={onProbePassed}
             panel={panel}
           />
         )}
       </section>
     </DialogLayer>
+  );
+}
+
+function SubscriptionFilters({
+  protocol,
+  family,
+  includeMtproto,
+  onProtocol,
+  onFamily,
+}: {
+  protocol: ProtocolPick;
+  family: FamilyPick;
+  includeMtproto: boolean;
+  onProtocol: (value: ProtocolPick) => void;
+  onFamily: (value: FamilyPick) => void;
+}) {
+  const narrow = useNarrow();
+  const protocolPicks = includeMtproto ? NODE_PROTOCOL_PICKS : PROTOCOL_PICKS;
+  return (
+    <div className="sub-dialog-filter">
+      {narrow ? (
+        <>
+          <FilterPick icon="protocol" label="协议" value={protocol} options={protocolPicks} onChange={onProtocol} />
+          <FilterPick icon="family" label="地址族" value={family} options={FAMILY_PICKS} onChange={onFamily} />
+        </>
+      ) : (
+        <>
+          <span className="sub-dialog-field">
+            <span className="sub-dialog-label">
+              <Icon of="protocol" size={13} />
+              协议
+            </span>
+            <SegmentedControl ariaLabel="订阅协议" value={protocol} options={protocolPicks} onChange={onProtocol} />
+          </span>
+          <span className="sub-dialog-field">
+            <span className="sub-dialog-label">
+              <Icon of="family" size={13} />
+              地址族
+            </span>
+            <SegmentedControl ariaLabel="地址族" value={family} options={FAMILY_PICKS} onChange={onFamily} />
+          </span>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -254,7 +279,7 @@ function FilterPick<T extends string>({
 }
 
 /* ── 订阅 ──
- * 一个订阅一块：左侧图标列，标题与说明在上，读数在右；地址框与说明对齐到标题文字。 */
+ * 扫码优先；二维码、文本复制与下载共用服务端返回的筛选后地址。 */
 
 function ClashSubscription({
   tenant,
@@ -263,6 +288,7 @@ function ClashSubscription({
   protocol,
   family,
   panel,
+  filters,
 }: {
   tenant: string;
   user: string;
@@ -270,7 +296,9 @@ function ClashSubscription({
   protocol: ProtocolPick;
   family: FamilyPick;
   panel: TabPanelProps;
+  filters: ReactNode;
 }) {
+  const qrRef = useRef<SVGSVGElement>(null);
   const qc = useQueryClient();
   const queryKey = ['clash-subscription', tenant, user, selfService ? 'self' : 'admin'] as const;
   // 地址本身是访问凭据：只在打开「订阅」页签时读取，不随用户列表下发。
@@ -312,138 +340,215 @@ function ClashSubscription({
 
   return (
     <>
-      <div className="sub-dialog-body" {...panel}>
-        <section className="sub-item" aria-label="Clash 订阅">
-          <Icon of="subscription" size={16} className="sub-item-icon" />
-          <div className="sub-item-head">
-            <div className="sub-item-title">
-              <div className="sub-item-name">
-                <b>Clash 订阅</b>
-              </div>
-              <span className="sub-item-sub">模板 {value.template} · 适用 Mihomo / Clash Meta</span>
+      <div className="sub-dialog-body sub-subscription-body" {...panel}>
+        <section className="sub-subscription" aria-label="Clash 订阅">
+          <h2 className="sub-subscription-title">扫码添加订阅</h2>
+          <p className="sub-subscription-caption" title={`模板 ${value.template}`}>
+            Clash · Mihomo / Clash Meta
+          </p>
+          <figure className="sub-qr">
+            <QRCodeSVG
+              ref={qrRef}
+              value={standardUrl}
+              size={216}
+              level="M"
+              marginSize={4}
+              bgColor="#fff"
+              fgColor="#101112"
+              title="Clash 订阅地址二维码"
+            />
+          </figure>
+          {filters}
+          <SubscriptionUrl
+            key={standardUrl}
+            url={standardUrl}
+            name="Clash 订阅地址"
+            primary
+            onDownload={() => {
+              if (qrRef.current) downloadSubscriptionQr(qrRef.current);
+            }}
+          />
+          <dl className="sub-readings">
+            <div>
+              <dt>剩余流量</dt>
+              <dd className={value.remaining_bytes === 0 ? 'bad' : undefined}>
+                {value.remaining_bytes === null ? '不限量' : bytes(value.remaining_bytes)}
+              </dd>
             </div>
-            <dl className="sub-readings">
-              <div>
-                <dt>剩余流量</dt>
-                <dd className={value.remaining_bytes === 0 ? 'bad' : undefined}>
-                  {value.remaining_bytes === null ? '不限量' : bytes(value.remaining_bytes)}
-                </dd>
-              </div>
-              <div>
-                <dt>重置时间</dt>
-                <dd title="按 UTC+8 计">{formatResetAt(value.reset_at)}</dd>
-              </div>
-            </dl>
-          </div>
-          <div className="sub-item-body">
-            {/* key 随地址变化：切换协议或地址族后重新遮罩。 */}
-            <SubscriptionUrl key={standardUrl} url={standardUrl} name="Clash 订阅地址" />
-          </div>
+            <div>
+              <dt>重置时间</dt>
+              <dd title="按 UTC+8 计">{formatResetAt(value.reset_at)}</dd>
+            </div>
+          </dl>
         </section>
         {haitun && (
-          <section className="sub-item" aria-label="koipy 测速订阅">
-            <Icon of="observe" size={16} className="sub-item-icon" />
-            <div className="sub-item-head">
-              <div className="sub-item-title">
-                <div className="sub-item-name">
-                  <b>koipy 测速订阅</b>
-                  <span className={`sub-live${haitunUrls ? ' ok' : haitun.status === 'revoked' ? ' warn' : ''}`}>
-                    {haitunUrls ? '可用' : haitun.status === 'revoked' ? '已撤销' : '尚未生成'}
-                  </span>
+          <details className="sub-haitun">
+            <summary>
+              <Icon of="observe" size={14} />
+              <b>koipy 测速订阅</b>
+              <span className="sub-admin-badge">仅管理员</span>
+              <Icon of="chevronDown" size={13} />
+            </summary>
+            <section className="sub-item" aria-label="koipy 测速订阅">
+              <div className="sub-item-head">
+                <div className="sub-item-title">
+                  <div className="sub-item-name">
+                    <b>测速地址</b>
+                    <span className={`sub-live${haitunUrls ? ' ok' : haitun.status === 'revoked' ? ' warn' : ''}`}>
+                      {haitunUrls ? '可用' : haitun.status === 'revoked' ? '已撤销' : '尚未生成'}
+                    </span>
+                  </div>
                 </div>
-                <span className="sub-item-sub">仅管理员</span>
-              </div>
-              {haitunUrls ? (
-                <button
-                  type="button"
-                  className="btn sub-item-action"
-                  aria-label="撤销 koipy 测速地址"
-                  disabled={haitunPending}
-                  onClick={() => {
-                    if (
-                      !window.confirm(
-                        '撤销后，旧测速地址将无法继续拉取，不会自动生成新地址。但已下载的 UUID 和节点配置仍然有效；此操作不更换 UUID，也不发布授权。确定撤销？',
+                {haitunUrls ? (
+                  <button
+                    type="button"
+                    className="btn sub-item-action"
+                    aria-label="撤销 koipy 测速地址"
+                    disabled={haitunPending}
+                    onClick={() => {
+                      if (
+                        !window.confirm(
+                          '撤销后，旧测速地址将无法继续拉取，不会自动生成新地址。但已下载的 UUID 和节点配置仍然有效；此操作不更换 UUID，也不发布授权。确定撤销？',
+                        )
                       )
-                    )
-                      return;
-                    issueHaitun.reset();
-                    revokeHaitun.mutate();
-                  }}
-                >
-                  {revokeHaitun.isPending ? '撤销中…' : '撤销'}
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="btn sub-item-action"
-                  aria-label={haitun.status === 'revoked' ? '重新生成 koipy 测速地址' : '生成 koipy 测速地址'}
-                  disabled={haitunPending}
-                  onClick={() => {
-                    revokeHaitun.reset();
-                    issueHaitun.mutate();
-                  }}
-                >
-                  {issueHaitun.isPending ? '生成中…' : haitun.status === 'revoked' ? '重新生成' : '生成'}
-                </button>
-              )}
-            </div>
-            <div className="sub-item-body">
-              {haitunUrls && <SubscriptionUrl key={haitunUrl} url={haitunUrl} name="koipy 测速地址" />}
-              <p className="sub-item-note">
-                风险提示：测速订阅包含用户 UUID
-                等真实节点凭据，持有地址的人无需登录即可获取并使用节点，请仅交给可信测速服务。
-                撤销仅停止测速地址的后续拉取，不会自动生成新地址，不影响普通订阅，也不会使已下载的节点配置失效。
-                若凭据泄露，需撤销测速地址、更换用户 UUID 并发布授权，待节点生效后旧凭据才失效。
-              </p>
-              {actionError && <ErrorBox error={actionError} />}
-            </div>
-          </section>
+                        return;
+                      issueHaitun.reset();
+                      revokeHaitun.mutate();
+                    }}
+                  >
+                    {revokeHaitun.isPending ? '撤销中…' : '撤销'}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn sub-item-action"
+                    aria-label={haitun.status === 'revoked' ? '重新生成 koipy 测速地址' : '生成 koipy 测速地址'}
+                    disabled={haitunPending}
+                    onClick={() => {
+                      revokeHaitun.reset();
+                      issueHaitun.mutate();
+                    }}
+                  >
+                    {issueHaitun.isPending ? '生成中…' : haitun.status === 'revoked' ? '重新生成' : '生成'}
+                  </button>
+                )}
+              </div>
+              <div className="sub-item-body">
+                {haitunUrls && <SubscriptionUrl key={haitunUrl} url={haitunUrl} name="koipy 测速地址" />}
+                <p className="sub-item-note">
+                  风险提示：测速订阅包含用户 UUID
+                  等真实节点凭据，持有地址的人无需登录即可获取并使用节点，请仅交给可信测速服务。
+                  撤销仅停止测速地址的后续拉取，不会自动生成新地址，不影响普通订阅，也不会使已下载的节点配置失效。
+                  若凭据泄露，需撤销测速地址、更换用户 UUID 并发布授权，待节点生效后旧凭据才失效。
+                </p>
+                {actionError && <ErrorBox error={actionError} />}
+              </div>
+            </section>
+          </details>
         )}
       </div>
       <footer className="sub-dialog-foot">
-        <span>每次拉取按当前授权实时生成，不缓存</span>
-        <span>节点凭据变更需发布授权并等待节点生效</span>
+        <span>订阅与二维码包含访问凭据，请勿公开分享</span>
+        <span>按当前授权实时生成</span>
       </footer>
     </>
   );
 }
 
-/* 地址框：遮住的 Token 降一档墨色，主机与路径保持可读；「显示」与「复制」收在框内右侧。
- * 窄屏时地址整段换行显示，两个按钮落到框底各占一半。 */
-function SubscriptionUrl({ url, name }: { url: string; name: string }) {
+/* 二维码与复制地址共用筛选后的 URL，文本地址在筛选变化后重新遮罩。 */
+function SubscriptionUrl({
+  url,
+  name,
+  primary = false,
+  onDownload,
+}: {
+  url: string;
+  name: string;
+  primary?: boolean;
+  onDownload?: () => void;
+}) {
   const [revealed, setRevealed] = useState(false);
   const masked = revealed ? null : maskSubscriptionUrl(url);
+  const address = (
+    <code title={revealed ? url : undefined}>
+      {masked ? (
+        <>
+          {masked.head}
+          <span className="sub-url-mask">{TOKEN_MASK}</span>
+          {masked.tail}
+        </>
+      ) : (
+        url
+      )}
+    </code>
+  );
+  const reveal = (
+    <button
+      type="button"
+      className={primary ? 'sub-text-action sub-url-reveal' : 'sub-url-reveal'}
+      aria-label={`${revealed ? '隐藏' : '显示'} ${name}`}
+      aria-pressed={revealed}
+      onClick={() => setRevealed(current => !current)}
+    >
+      {revealed ? '隐藏' : '显示'}
+    </button>
+  );
+  const copy = (
+    <CopyButton
+      className={primary ? 'btn primary sub-subscription-copy' : 'sub-url-copy'}
+      text={url}
+      label={primary ? '复制订阅地址' : '复制'}
+    >
+      {(state, label) => (
+        <>
+          <Icon of={copyStateIcon(state)} size={13} />
+          {label}
+        </>
+      )}
+    </CopyButton>
+  );
+  if (!primary)
+    return (
+      <div className="sub-url">
+        {address}
+        {reveal}
+        {copy}
+      </div>
+    );
   return (
-    <div className="sub-url">
-      <code title={revealed ? url : undefined}>
-        {masked ? (
-          <>
-            {masked.head}
-            <span className="sub-url-mask">{TOKEN_MASK}</span>
-            {masked.tail}
-          </>
-        ) : (
-          url
-        )}
-      </code>
-      <button
-        type="button"
-        className="sub-url-reveal"
-        aria-label={`${revealed ? '隐藏' : '显示'} ${name}`}
-        onClick={() => setRevealed(current => !current)}
-      >
-        {revealed ? '隐藏' : '显示'}
-      </button>
-      <CopyButton className="sub-url-copy" text={url}>
-        {(state, label) => (
-          <>
-            <Icon of={copyStateIcon(state)} size={13} />
-            {label}
-          </>
-        )}
-      </CopyButton>
+    <div className="sub-subscription-url">
+      <div className="sub-subscription-label">
+        <span>订阅地址</span>
+        {reveal}
+      </div>
+      <div className="sub-url">{address}</div>
+      <div className="sub-subscription-actions">
+        {copy}
+        <button type="button" className="btn" onClick={onDownload}>
+          <Icon of="download" size={14} />
+          下载二维码
+        </button>
+      </div>
     </div>
   );
+}
+
+/** Export resolved colors so the downloaded SVG matches the current theme without external CSS. */
+function downloadSubscriptionQr(svg: SVGSVGElement) {
+  const image = svg.cloneNode(true) as SVGSVGElement;
+  const paths = svg.querySelectorAll('path');
+  image
+    .querySelectorAll('path')
+    .forEach((path, index) => path.setAttribute('fill', getComputedStyle(paths[index]).fill));
+  const blob = new Blob([new XMLSerializer().serializeToString(image)], { type: 'image/svg+xml;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'clash-subscription.svg';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
 }
 
 /* ── 节点 ── */
@@ -876,9 +981,9 @@ const probeJobKey = (tenant: string, user: string) => ['user-grant-probe-job', t
 /**
  * 一个用户的拨测计划与最近一轮任务。任务只存在 Console 内存里；浏览器把最近一轮放进查询缓存（不发请求，
  * 只由启动、取消、SSE 与轮询写入），关掉弹窗或切到「订阅」页签再回来仍能看到本轮结果，运行中的任务
- * 重新订阅；没有页面观察时按查询缓存的回收时间丢弃。
+ * 重新订阅；没有页面观察时按查询缓存的回收时间丢弃。入门向导的清单就地拨测也用它，与本弹窗共享同一轮任务。
  */
-function useUserGrantProbe(tenant: string, user: string) {
+export function useUserGrantProbe(tenant: string, user: string) {
   const qc = useQueryClient();
   const edits = useGrantEdits();
   const latestEdit = edits.reduce(

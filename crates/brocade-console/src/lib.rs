@@ -17,3 +17,8 @@ pub mod socket_activation;
 pub mod tunnel_probe;
 pub mod vpngate;
 mod warp;
+
+#[cfg(feature = "cvm")]
+mod cvm;
+
+pub mod product;

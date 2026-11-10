@@ -210,7 +210,21 @@ pub async fn list_revisions(
     actor: &AdminContext,
     limit: u32,
 ) -> Result<RevisionList> {
-    let current_revision = crate::materialize::current_revision(pool).await?;
+    let state = sqlx::query(
+        "SELECT current_revision,
+                (SELECT revision_id FROM deployments
+                  WHERE kind = 'config' AND status = 'succeeded'
+                    AND activation_status = 'activated'
+                  ORDER BY id DESC LIMIT 1) AS last_config_revision_id
+           FROM control_state WHERE id = TRUE",
+    )
+    .fetch_one(pool)
+    .await?;
+    let current_revision = i64_to_u64(state.try_get("current_revision")?, "current_revision")?;
+    let last_config_revision_id = state
+        .try_get::<Option<i64>, _>("last_config_revision_id")?
+        .map(|id| i64_to_u64(id, "last_config_revision_id"))
+        .transpose()?;
     let limit = i64::from(limit.clamp(1, 200));
     let rows = sqlx::query(
         "SELECT r.id,
@@ -231,6 +245,7 @@ pub async fn list_revisions(
 
     Ok(RevisionList {
         current_revision,
+        last_config_revision_id,
         revisions: rows
             .iter()
             .map(|row| revision_item_from_row(row, current_revision, actor.is_system_admin()))

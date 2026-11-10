@@ -16,12 +16,35 @@ from unittest.mock import patch
 
 
 PATH = Path(__file__).resolve().parents[1] / 'build-release.py'
+sys.path.insert(0, str(PATH.parent))
 SPEC = importlib.util.spec_from_file_location('release_build', PATH)
 BUILD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BUILD)
 
 
 class ReleaseBuildTests(unittest.TestCase):
+    def test_cube_runtime_dispatch_does_not_start_the_console_pipeline(self):
+        argv=['build-release.py','--cube-runtime-only','--cube-arch','x86_64',
+              '--cube-sysroot-libs','/target/sysroot','--cube-bpf-include','/target/include']
+        with patch.object(sys,'argv',argv), patch.object(BUILD,'build') as console, \
+                patch.object(BUILD,'stable_root'), patch.object(BUILD,'go_binary',return_value='/tools/go'), \
+                patch.object(BUILD.subprocess,'run',return_value=argparse.Namespace(returncode=0)) as runtime:
+            self.assertEqual(BUILD.main(),0)
+            console.assert_not_called()
+            command=runtime.call_args.args[0]
+            self.assertIn('--sysroot-libs',command)
+            self.assertIn('--arch',command)
+            self.assertIn('x86_64',command)
+            self.assertEqual(command[command.index('--glibc') + 1], '2.35')
+
+    def test_cube_runtime_requires_architecture_and_matching_sysroot(self):
+        with patch.object(sys,'argv',['build-release.py','--cube-runtime-only']), \
+                contextlib.redirect_stderr(io.StringIO()), patch.object(BUILD,'build') as console:
+            with self.assertRaises(SystemExit) as raised:
+                BUILD.main()
+            self.assertEqual(raised.exception.code,2)
+            console.assert_not_called()
+
     def assert_utc_timestamp(self, value):
         parsed = datetime.fromisoformat(value)
         self.assertIsNotNone(parsed.tzinfo)
@@ -113,7 +136,7 @@ time.sleep(30)
     def test_failed_preflight_replaces_previous_success_without_admitting_old_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            state = root / 'target/brocade-release'
+            state = root / 'target/brocade-release/base'
             state.mkdir(parents=True)
             result = state / 'preparation.json'
             result.write_text('{"build_complete":true}')
@@ -121,7 +144,7 @@ time.sleep(30)
                     patch.object(BUILD, 'go_binary', side_effect=BUILD.BuildError('toolchain unavailable')), \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaisesRegex(BUILD.BuildError, 'toolchain unavailable'):
-                    BUILD.build(argparse.Namespace(jobs=4), root, BUILD.BuildTimer())
+                    BUILD.build(argparse.Namespace(jobs=4, flavor='base'), root, BUILD.BuildTimer())
             record = json.loads(result.read_text())
             self.assertEqual(record['status'], 'failed')
             self.assertFalse(record['build_complete'])
@@ -151,8 +174,8 @@ time.sleep(30)
                     raise KeyboardInterrupt()
                 with patch.object(BUILD, 'go_binary', side_effect=cancel):
                     with self.assertRaises(KeyboardInterrupt):
-                        BUILD.build(argparse.Namespace(jobs=4), root, timer)
-            record = json.loads((root / 'target/brocade-release/preparation.json').read_text())
+                        BUILD.build(argparse.Namespace(jobs=4, flavor='base'), root, timer)
+            record = json.loads((root / 'target/brocade-release/base/preparation.json').read_text())
             self.assertEqual(record['status'], 'cancelled')
             self.assertFalse(record['build_complete'])
             self.assertFalse(record['deployment_ready'])
@@ -170,15 +193,15 @@ time.sleep(30)
     def test_contending_build_fails_immediately_without_overwriting_owner_record(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            state = root / 'target/brocade-release'
+            state = root / 'target/brocade-release/base'
             state.mkdir(parents=True)
             result = state / 'preparation.json'
             result.write_text('{"owner":"first"}')
-            with (state / 'lock').open('a') as lock:
+            with (state.parent / 'lock').open('a') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 with patch.object(BUILD, 'stable_root'), contextlib.redirect_stderr(io.StringIO()):
                     with self.assertRaisesRegex(BUILD.BuildError, 'another release build'):
-                        BUILD.build(argparse.Namespace(jobs=4), root, BUILD.BuildTimer())
+                        BUILD.build(argparse.Namespace(jobs=4, flavor='base'), root, BUILD.BuildTimer())
             self.assertEqual(json.loads(result.read_text()), {'owner': 'first'})
 
     def test_rejected_checkout_still_reports_the_attempt_start_and_finish(self):
@@ -198,7 +221,7 @@ time.sleep(30)
     def test_long_build_persists_progress_and_accepts_only_this_runs_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            state = root / 'target/brocade-release'
+            state = root / 'target/brocade-release/base'
             triples = ['x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu']
             sysroot = root / 'sysroot'
             for triple in triples + ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl']:
@@ -229,7 +252,7 @@ time.sleep(30)
                     patch.object(BUILD, 'agents', return_value=['cargo', 'build']), \
                     contextlib.redirect_stdout(io.StringIO()), \
                     contextlib.redirect_stderr(io.StringIO()) as messages:
-                BUILD.build(argparse.Namespace(jobs=4), root,
+                BUILD.build(argparse.Namespace(jobs=4, flavor='base'), root,
                             BUILD.BuildTimer(started=time.monotonic() - 1000))
             self.assertEqual(reports[0]['status'], 'running')
             self.assertEqual(reports[0]['active_stage']['name'], 'dual_architecture_build')
@@ -280,12 +303,12 @@ time.sleep(30)
     def test_agents_use_one_dual_target_cargo_graph_and_feed_console_overrides(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            state = root / 'target/brocade-release'
+            state = root / 'target/brocade-release/base'
             state.mkdir(parents=True)
             commands = []
             def command(args, cwd, env, timer, log=None):
                 commands.append((args, env.copy()))
-                target = root / 'target/brocade-agent-build'
+                target = root / 'target/brocade-agent-build/base'
                 for triple in ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl']:
                     binary = target / triple / 'release/brocade-agent'
                     binary.parent.mkdir(parents=True, exist_ok=True)
@@ -300,6 +323,10 @@ time.sleep(30)
             self.assertEqual(targets, ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl'])
             self.assertIn('CC_x86_64_unknown_linux_musl', child_env)
             self.assertIn('CC_aarch64_unknown_linux_musl', child_env)
+            for triple in ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl']:
+                flags = child_env[f'CARGO_TARGET_{triple.upper().replace("-", "_")}_RUSTFLAGS']
+                self.assertIn(f'--remap-path-prefix={root}=.', flags)
+            self.assertIn('-C linker=rust-lld', child_env['CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS'])
             self.assertTrue(env['BROCADE_AGENT_BIN_X86_64'].endswith('/x86_64-unknown-linux-musl/release/brocade-agent'))
             self.assertTrue(env['BROCADE_AGENT_BIN_AARCH64'].endswith('/aarch64-unknown-linux-musl/release/brocade-agent'))
 

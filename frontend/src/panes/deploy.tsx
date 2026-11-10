@@ -1,3 +1,4 @@
+import { TitleActions } from '../ui/title-actions';
 import {
   Fragment,
   useEffect,
@@ -496,6 +497,8 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
     queryKey: ['deployment-verify', current],
     queryFn: () => verifyDeployment({ revision_id: current! }),
     enabled: current != null,
+    staleTime: 5_000,
+    refetchInterval: query => (query.state.data?.summary.changed_targets ? 5_000 : false),
   });
   const agent = useAgentRelease();
   const xray = useXrayRelease();
@@ -504,7 +507,6 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
   if (
     all.isPending ||
     revisions.isPending ||
-    (current != null && verify.isPending) ||
     agent.releases.isPending ||
     agent.nodes.isPending ||
     xray.releases.isPending
@@ -539,15 +541,17 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
     agent.counts.behind > 0 ||
     xray.counts.behind > 0;
   const running = liveDeployments.length > 0 || !!agent.active || !!xray.active;
-  const lamp = verify.error
-    ? { tone: 'err', why: '配置发布状态读取失败' }
-    : failing || agent.active?.status === 'halted' || xray.active?.status === 'halted'
-      ? { tone: 'err', why: '有发布失败或已暂停，需要处理' }
-      : attention
-        ? { tone: 'warn', why: '有待处理的发布' }
-        : running
-          ? { tone: 'run', why: '发布进行中' }
-          : { tone: 'ok', why: '配置与软件版本均已收敛' };
+  const lamp = verify.isPending
+    ? { tone: 'run', why: '正在核验配置发布状态' }
+    : verify.error
+      ? { tone: 'err', why: '配置发布状态读取失败' }
+      : failing || agent.active?.status === 'halted' || xray.active?.status === 'halted'
+        ? { tone: 'err', why: '有发布失败或已暂停，需要处理' }
+        : attention
+          ? { tone: 'warn', why: '有待处理的发布' }
+          : running
+            ? { tone: 'run', why: '发布进行中' }
+            : { tone: 'ok', why: '配置与软件版本均已收敛' };
   const badges: Record<DeployTab, TabBadge> = {
     config: hasPendingConfig ? { tone: 'gold', text: String(changedConfigTargets) } : null,
     agent: agentBadge(agent),
@@ -687,11 +691,7 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
               })}
             </div>
           </div>
-          {action && (
-            <div className="nd-tools">
-              <div className="nd-acts">{action}</div>
-            </div>
-          )}
+          {action && <TitleActions primary={action} />}
         </header>
         <div className="nd-paper-body">
           <div className="usage-cockpit cgc-cockpit" role="tabpanel" id={panelId} aria-labelledby={tabId(tab)}>
@@ -2913,16 +2913,21 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
                 <span>{initialization ? '初始化完成' : '生效'}</span>
               </li>
             </ol>
-            <div className="nd-acts">
-              {openStep && awaiting && (
-                <button
-                  className="btn primary"
-                  disabled={!publisher || confirm.isPending || confirmedWave === openStep.wave}
-                  onClick={() => setAsk({ kind: 'wave', wave: openStep.wave })}
-                >
-                  {confirmedWave === openStep.wave ? '已确认' : openAction}
-                </button>
-              )}
+            <TitleActions
+              className="nd-acts"
+              primary={
+                openStep &&
+                awaiting && (
+                  <button
+                    className="btn primary"
+                    disabled={!publisher || confirm.isPending || confirmedWave === openStep.wave}
+                    onClick={() => setAsk({ kind: 'wave', wave: openStep.wave })}
+                  >
+                    {confirmedWave === openStep.wave ? '已确认' : openAction}
+                  </button>
+                )
+              }
+            >
               {OPEN_STATES.has(d.status) && (
                 <button
                   className="btn danger"
@@ -2959,7 +2964,7 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
                   </div>
                 </details>
               )}
-            </div>
+            </TitleActions>
           </header>
 
           <div className="nd-paper-body cg-body">

@@ -197,6 +197,13 @@ async fn user_cycle_upgrade_is_opt_in_atomic_and_preserves_existing_billing() {
         return;
     };
     install(&db, false, true).await;
+    sqlx::query("UPDATE control_state SET unlock_detection_interval_hours=12,unlock_detection_next_run_at=now()+interval '12 hours' WHERE id=TRUE")
+        .execute(db.pool()).await.unwrap();
+    let schedule_sql = "SELECT jsonb_build_array(unlock_detection_interval_hours,unlock_detection_next_run_at) FROM control_state WHERE id=TRUE";
+    let schedule: serde_json::Value = sqlx::query_scalar(schedule_sql)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
     assert!(!db.store.check_database_upgrade().await.unwrap().compatible);
     let before = receipts(&db).await;
     for _ in 0..2 {
@@ -222,6 +229,17 @@ async fn user_cycle_upgrade_is_opt_in_atomic_and_preserves_existing_billing() {
         .await
         .unwrap();
     db.store.migrate_user_cycle_reset_schema().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, serde_json::Value>(schedule_sql)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        schedule,
+        "default changes preserve an explicitly saved 12-hour schedule"
+    );
+    let default: String = sqlx::query_scalar("SELECT column_default FROM information_schema.columns WHERE table_schema='public' AND table_name='control_state' AND column_name='unlock_detection_interval_hours'")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(default, "4");
     let after = receipts(&db).await;
     assert_eq!(before[1], after[1]);
     let state = billing(&db).await;

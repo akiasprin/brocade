@@ -94,7 +94,7 @@ for (const scope of ['node','chain']) for (const width of [1440,390]) test(`IPv6
  await panel.getByRole('button',{name:'IPv6',exact:true}).click();
  const youtube=panel.getByRole('article',{name:'YouTube',exact:true});
  const footer=panel.locator('.unlock-footer');await expect(footer.getByRole('group',{name:'解锁地址族'})).toBeVisible();
- const choice=await footer.getByRole('group',{name:'解锁地址族'}).boundingBox();const footerBox=await footer.boundingBox();expect(choice!.x-footerBox!.x).toBeLessThanOrEqual(17);expect(choice!.y).toBeGreaterThanOrEqual(footerBox!.y);
+ await expect.poll(()=>footer.evaluate(el=>{const choice=el.querySelector('[role="group"]')!.getBoundingClientRect();const box=el.getBoundingClientRect();return choice.x-box.x<=17&&choice.y>=box.y;})).toBe(true);
  await expect(youtube).toContainText('视频 CDN NRT');await expect(youtube).toContainText('JP');await expect(youtube).not.toContainText('HKG');
  await expectPremiumTitle(panel);expect(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth)).toBe(false);
  await expect(page).toHaveScreenshot(`b-${scope}-ipv6-${width}.png`);

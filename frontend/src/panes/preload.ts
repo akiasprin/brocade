@@ -1,3 +1,5 @@
+import { CVM_ENABLED } from '../product';
+
 /**
  * Start fetching the routed page before the authenticated shell mounts.
  *
@@ -7,6 +9,7 @@
  */
 const PANE_LOADERS = {
   nodes: () => import('./nodes'),
+  cvm: CVM_ENABLED ? () => import('./cvm') : () => import('./nodes'),
   chains: () => import('./chains'),
   tunnels: () => import('./tunnels'),
   users: () => import('./users'),
@@ -23,6 +26,7 @@ export type PreloadablePane = keyof typeof PANE_LOADERS;
 /** Invalid and empty hashes follow the router's default and open the machine list. */
 export function initialPaneFromHash(hash: string): PreloadablePane {
   const candidate = hash.replace(/^#\/?/, '').split('/', 1)[0];
+  if (candidate === 'cvm' && !CVM_ENABLED) return 'nodes';
   return Object.hasOwn(PANE_LOADERS, candidate) ? (candidate as PreloadablePane) : 'nodes';
 }
 

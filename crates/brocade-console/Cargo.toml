@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+cvm = ["brocade-store/cvm", "brocade-deployment/cvm"]
+
 [dependencies]
 axum = "0.8.9"
 yawc = { version = "=0.5.0", default-features = false, features = ["axum"] }

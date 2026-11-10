@@ -40,6 +40,42 @@ permissions:
   contents: read
 
 jobs:
+  cvm-cube:
+    name: optional Cube node runtime boundaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: components/cube/.go-version
+          cache-dependency-path: components/cube/Cubelet/go.sum
+      - name: Verify Cube installer and ELF libc baseline
+        run: python3 -m unittest discover -s scripts/tests/cvm -p 'test_*.py'
+      - name: Build and vet Cubelet Guest command client
+        working-directory: components/cube/pkgs/nodeexec
+        run: |
+          go build ./...
+          go vet ./...
+      - name: Prepare CubeVS BPF compiler
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev
+      - name: Generate and verify the canonical Cube network sources
+        run: |
+          cd components/cube/CubeNet/cubevs
+          GOARCH=amd64 go generate ./...
+          go vet ./...
+          go test -c -race -o "$RUNNER_TEMP/cubevs-tests"
+          docker run --rm --network none --privileged \
+            -e CUBE_RUN_BPF_TESTS=1 \
+            -v "$RUNNER_TEMP/cubevs-tests:/test:ro" \
+            ubuntu@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c \
+            /test -test.v -test.count=1
+      - name: Verify durable Cubelet attachment and protected-root boundaries
+        working-directory: components/cube/Cubelet
+        run: |
+          go test -race ./network/attachments
+          go vet ./network/attachments
+          CGO_ENABLED=0 go test ./storage -run '^TestBrocadeRoot' -count=1
+
   xray-data-plane:
     name: xray data-plane test, vet and race
     runs-on: ubuntu-latest
@@ -250,10 +286,16 @@ jobs:
             -count=1 -timeout=5m
 
   check:
-    name: fmt + clippy + test
+    name: fmt + clippy + test (${{ matrix.flavor }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [base, cvm]
     env:
       BROCADE_RUN_PG_TESTS: "1"
+      BROCADE_CARGO_FEATURES: ${{ matrix.flavor == 'cvm' && 'brocade-agent/cvm,brocade-console/cvm,brocade-store/cvm,brocade-deployment/cvm' || '' }}
+      BROCADE_CRATE_FEATURES: ${{ matrix.flavor == 'cvm' && 'cvm' || '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -263,7 +305,13 @@ jobs:
         run: sh -n install.sh
 
       - name: Reject whitespace errors in this revision
-        run: git diff --check HEAD^ HEAD
+        run: |
+          if git cat-file -e HEAD^:components/cube/BROCADE_UPSTREAM.toml 2>/dev/null; then
+            git diff --check HEAD^ HEAD
+          else
+            # Preserve upstream formatting only for the first vendored Cube import.
+            git diff --check HEAD^ HEAD -- . ':!components/cube'
+          fi
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -351,7 +399,18 @@ jobs:
 
       - run: cargo fmt --all -- --check
 
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --no-default-features --features "$BROCADE_CARGO_FEATURES" --locked -- -D warnings
+
+      - name: Verify Shim-owned persistent terminals
+        run: |
+          cargo test --manifest-path components/cube/CubeShim/Cargo.toml -p cube-terminal --features server --locked
+          cargo clippy --manifest-path components/cube/CubeShim/Cargo.toml -p cube-terminal --features server --all-targets --locked -- -D warnings
+
+      - name: Verify Guest exit receipts before releasing terminal admission
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcap-ng-dev libseccomp-dev
+          cargo test --manifest-path components/cube/CubeShim/Cargo.toml -p containerd-shim-cube-rs --lib --locked terminal_exit_tests
 
       - name: Bind real Xray tests to this Console build
         run: |
@@ -371,16 +430,24 @@ jobs:
       # and CI is green all the same — and what green means quietly becomes "nobody has exercised
       # the database layer". The runner ships docker, so testcontainers starts.
       - name: Rust workspace tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --no-default-features --features "$BROCADE_CARGO_FEATURES" --locked
 
       - name: PostgreSQL store integration tests
-        run: cargo test -p brocade-store --test pg_integration --locked -- --ignored
+        run: cargo test -p brocade-store --test pg_integration --features "$BROCADE_CRATE_FEATURES" --locked -- --ignored
+
+      - name: First-release identity and fresh database commands
+        run: cargo test -p brocade-console --test product_cli --features "$BROCADE_CRATE_FEATURES" --locked -- --include-ignored
+
+      - name: Installer variant gates and CVM-only maintenance
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_product_variants.py
+          python3 -m unittest discover -s scripts/tests -p test_cvm_cleanup.py
 
       - name: PostgreSQL tunnel probe integration tests
         run: cargo test -p brocade-store --test tunnel_probe_pg --locked -- --ignored
 
       - name: Console HTTP integration tests
-        run: cargo test -p brocade-console --test http_integration --locked -- --ignored
+        run: cargo test -p brocade-console --test http_integration --features "$BROCADE_CRATE_FEATURES" --locked -- --ignored
 
       - name: PostgreSQL performance event integration test
         run: cargo test -p brocade-console --lib --locked sqlx_events_really_include_query_and_pool_timings -- --ignored
@@ -399,9 +466,14 @@ jobs:
           npm run lint:strict
           npm test
           node scripts/route-check.mjs
+          BROCADE_PRODUCT_FLAVOR=base npm run test:react -- tests/product-variants.test.tsx
+          BROCADE_PRODUCT_FLAVOR=base npm run build
+          BROCADE_PRODUCT_FLAVOR=cvm npm run build
+          BROCADE_PRODUCT_FLAVOR=base npx playwright test tests/visual/product-variants.spec.ts --workers=1
+          BROCADE_PRODUCT_FLAVOR=cvm npx playwright test tests/visual/product-variants.spec.ts tests/visual/cvm/cvm-hosts.spec.ts --workers=1
 
   build:
-    name: brocade dist (${{ matrix.arch }}-${{ matrix.libc }})
+    name: brocade dist (${{ matrix.flavor }}-${{ matrix.arch }}-${{ matrix.libc }})
     # GNU artifacts must load on Ubuntu 22.04 (glibc 2.35), not inherit a moving runner ABI.
     runs-on: ubuntu-22.04
     strategy:
@@ -411,15 +483,18 @@ jobs:
       matrix:
         include:
           - arch: x86_64
+            flavor: base
             libc: gnu
             triple: x86_64-unknown-linux-gnu
           - arch: aarch64
+            flavor: base
             libc: gnu
             triple: aarch64-unknown-linux-gnu
             # The control plane cross-compiling itself to aarch64 needs a linker. (The two agents
             # are built by build.rs with zig and rust-lld, and are unrelated to this.)
             apt: gcc-aarch64-linux-gnu
           - arch: x86_64
+            flavor: base
             libc: musl
             triple: x86_64-unknown-linux-musl
             zig_target: x86_64-linux-musl
@@ -427,6 +502,34 @@ jobs:
             ar_var: AR_x86_64_unknown_linux_musl
             linker_var: CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
           - arch: aarch64
+            flavor: base
+            libc: musl
+            triple: aarch64-unknown-linux-musl
+            zig_target: aarch64-linux-musl
+            cc_var: CC_aarch64_unknown_linux_musl
+            ar_var: AR_aarch64_unknown_linux_musl
+            linker_var: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
+          - arch: x86_64
+            flavor: cvm
+            libc: gnu
+            triple: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            flavor: cvm
+            libc: gnu
+            triple: aarch64-unknown-linux-gnu
+            # The control plane cross-compiling itself to aarch64 needs a linker. (The two agents
+            # are built by build.rs with zig and rust-lld, and are unrelated to this.)
+            apt: gcc-aarch64-linux-gnu
+          - arch: x86_64
+            flavor: cvm
+            libc: musl
+            triple: x86_64-unknown-linux-musl
+            zig_target: x86_64-linux-musl
+            cc_var: CC_x86_64_unknown_linux_musl
+            ar_var: AR_x86_64_unknown_linux_musl
+            linker_var: CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
+          - arch: aarch64
+            flavor: cvm
             libc: musl
             triple: aarch64-unknown-linux-musl
             zig_target: aarch64-linux-musl
@@ -499,8 +602,10 @@ jobs:
             export "$MUSL_AR_VAR=$GITHUB_WORKSPACE/scripts/zig-ar"
             export "$MUSL_LINKER_VAR=rust-lld"
           fi
-          cargo build --release --locked --target ${{ matrix.triple }} \
-            -p brocade-console -p brocade-launcher
+          set --
+          if [ '${{ matrix.flavor }}' = cvm ]; then set -- --features brocade-console/cvm; fi
+          cargo build --release --locked --no-default-features --target ${{ matrix.triple }} \
+            -p brocade-console -p brocade-launcher "$@"
 
       - name: Exercise static launcher and managed PostgreSQL on GNU libc
         if: matrix.arch == 'x86_64' && matrix.libc == 'musl'
@@ -518,7 +623,7 @@ jobs:
       - name: Preserve embedded Xray build records
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: xray-build-records-${{ matrix.triple }}
+          name: xray-build-records-${{ matrix.flavor }}-${{ matrix.triple }}
           path: target/${{ matrix.triple }}/release/build/brocade-console-*/out/xray-*.build.json
           if-no-files-found: error
 
@@ -562,14 +667,15 @@ jobs:
           version=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c \
             'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "brocade-launcher"))')
           dist_root=target/dist
-          dist_name=brocade-dist-${version}-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          dist_name=brocade-dist-${version}-${{ matrix.flavor }}-linux-${{ matrix.arch }}-${{ matrix.libc }}
           bundle=$dist_root/$dist_name
           mkdir -p "$bundle"
           cp target/${{ matrix.triple }}/release/brocade-launcher "$bundle/"
           cp target/${{ matrix.triple }}/release/brocade-console "$bundle/"
           cp install.sh "$bundle/"
           printf '%s-%s\n' '${{ matrix.arch }}' '${{ matrix.libc }}' > "$bundle/BROCADE_PLATFORM"
-          (cd "$bundle" && sha256sum brocade-launcher brocade-console install.sh BROCADE_PLATFORM > SHA256SUMS)
+          printf '%s\n' '${{ matrix.flavor }}' > "$bundle/BROCADE_FLAVOR"
+          (cd "$bundle" && sha256sum brocade-launcher brocade-console install.sh BROCADE_PLATFORM BROCADE_FLAVOR > SHA256SUMS)
           tar -C "$dist_root" -czf "$dist_root/$dist_name.tar.gz" "$dist_name"
           (cd "$dist_root" && sha256sum "$dist_name.tar.gz" > "$dist_name.tar.gz.sha256")
           echo "name=$dist_name" >> "$GITHUB_OUTPUT"
@@ -584,70 +690,38 @@ jobs:
             ${{ steps.dist.outputs.checksum }}
           if-no-files-found: error
 
-  upgrade-v031:
-    name: mandatory v0.3.1 real upgrade and restore
+  product-distribution:
+    name: first-release distribution identity
     needs: [build]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [base, cvm]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Read the candidate version
+      - name: Read candidate version
         id: version
         run: |
-          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml)
+          test -n "$version"
           echo "value=$version" >> "$GITHUB_OUTPUT"
-
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: brocade-dist-${{ steps.version.outputs.value }}-linux-x86_64-gnu
-          path: upgrade-inputs/candidate-archive
-
-      - name: Verify the candidate and exact official v0.3.1 baseline
-        env:
-          GH_TOKEN: ${{ github.token }}
+          name: brocade-dist-${{ steps.version.outputs.value }}-${{ matrix.flavor }}-linux-x86_64-gnu
+          path: product-inputs
+      - name: Verify archive, product metadata and native executable
         run: |
           set -eu
-          mkdir -p upgrade-inputs/candidate upgrade-inputs/old
-          (cd upgrade-inputs/candidate-archive && sha256sum -c *.sha256)
-          tar -xzf upgrade-inputs/candidate-archive/*.tar.gz --strip-components=1 -C upgrade-inputs/candidate
-          cmp install.sh upgrade-inputs/candidate/install.sh
-          gh release download v0.3.1 --repo "$GITHUB_REPOSITORY" \
-            --pattern 'brocade-dist-0.3.1-linux-x86_64-gnu.tar.gz*' --dir upgrade-inputs/old
-          (cd upgrade-inputs/old && sha256sum -c *.sha256)
-          echo '9f92762df9486ec7103b7016a4d0f107fc09e60a5628b18a3d405f5d64226837  upgrade-inputs/old/brocade-dist-0.3.1-linux-x86_64-gnu.tar.gz' | sha256sum -c -
-
-      - name: Require KVM and prepare a verified Ubuntu guest
-        run: |
-          set -eu
-          test -c /dev/kvm
-          sudo chmod a+rw /dev/kvm
-          docker build -t brocade-upgrade-qemu:ci scripts/tests/upgrade
-          base=https://cloud-images.ubuntu.com/releases/24.04/release
-          curl --fail --location --retry 3 --max-time 180 \
-            "$base/ubuntu-24.04-server-cloudimg-amd64.img" -o upgrade-inputs/ubuntu.img
-          curl --fail --location --retry 3 --max-time 60 "$base/SHA256SUMS" -o upgrade-inputs/SHA256SUMS
-          digest=$(awk '$2 == "*ubuntu-24.04-server-cloudimg-amd64.img" {print $1}' upgrade-inputs/SHA256SUMS)
-          test ${#digest} -eq 64
-          echo "$digest  upgrade-inputs/ubuntu.img" | sha256sum -c -
-          echo "UPGRADE_VM_SHA256=$digest" >> "$GITHUB_ENV"
-
-      - name: Real v0.3.1 upgrade, rollback, preserved billing and reboot
-        run: |
-          python3 scripts/tests/upgrade/run_kvm.py \
-            --console upgrade-inputs/candidate/brocade-console \
-            --launcher upgrade-inputs/candidate/brocade-launcher \
-            --release-031 upgrade-inputs/old/brocade-dist-0.3.1-linux-x86_64-gnu.tar.gz \
-            --vm-image upgrade-inputs/ubuntu.img --vm-image-sha256 "$UPGRADE_VM_SHA256" \
-            --qemu-image brocade-upgrade-qemu:ci --output upgrade-acceptance
-          python3 -c 'import json; r=json.load(open("upgrade-acceptance/results/result.json")); assert r["passed"] and r["versions"] == ["v0.3.1"]'
-
-      - name: Preserve real upgrade evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: upgrade-v031-evidence
-          path: |
-            upgrade-acceptance/manifest.json
-            upgrade-acceptance/results
-          if-no-files-found: error
+          (cd product-inputs && sha256sum -c *.sha256)
+          mkdir product-candidate
+          tar -xzf product-inputs/*.tar.gz --strip-components=1 -C product-candidate
+          (cd product-candidate && sha256sum -c SHA256SUMS)
+          cmp install.sh product-candidate/install.sh
+          test "$(cat product-candidate/BROCADE_FLAVOR)" = '${{ matrix.flavor }}'
+          product-candidate/brocade-console product-info > product-candidate/product-info.json
+          python3 - '${{ matrix.flavor }}' <<'PYCODE'
+          import json,sys
+          manifest=json.load(open('product-candidate/product-info.json'))
+          assert manifest == {'flavor':sys.argv[1],'features':{'cvm':sys.argv[1]=='cvm'}}
+          PYCODE

@@ -269,6 +269,7 @@ fn observe_versions(
     let installed = crate::installed_xray_sha256();
     let running = crate::running_xray_sha256();
     NodeVersions {
+        agent_flavor: Some(crate::identity::self_flavor()),
         unlock_connection_trace: Some(
             !xray_upgrade_in_progress
                 && crate::probe_identity::ready(

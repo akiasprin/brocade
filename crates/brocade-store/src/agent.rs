@@ -101,11 +101,15 @@ async fn issue_node_token_inner(
     .fetch_one(&mut *tx)
     .await?;
     if reconcile_environment {
+        // Keep acknowledged stops when resetting observations. Legacy narrow targets may have
+        // no artifact record for them, and a repeated re-sign must retain the same evidence.
         sqlx::query(
             "UPDATE node_applied_state
                 SET phantun_state = 'unknown',
                     phantun_sha256 = NULL,
                     phantun_observed = jsonb_build_object(
+                        'previous_state', CASE WHEN phantun_state = 'unknown'
+                            THEN phantun_observed->>'previous_state' ELSE phantun_state END,
                         'state', 'unknown',
                         'reason', 'node token re-signed; environment must converge again',
                         'reconcile', 'node-token-resigned'
@@ -113,6 +117,8 @@ async fn issue_node_token_inner(
                     wireguard_state = 'unknown',
                     wireguard_sha256 = NULL,
                     wireguard_observed = jsonb_build_object(
+                        'previous_state', CASE WHEN wireguard_state = 'unknown'
+                            THEN wireguard_observed->>'previous_state' ELSE wireguard_state END,
                         'state', 'unknown',
                         'reason', 'node token re-signed; environment must converge again',
                         'reconcile', 'node-token-resigned'
@@ -120,6 +126,8 @@ async fn issue_node_token_inner(
                     xray_state = 'unknown',
                     xray_sha256 = NULL,
                     xray_observed = jsonb_build_object(
+                        'previous_state', CASE WHEN xray_state = 'unknown'
+                            THEN xray_observed->>'previous_state' ELSE xray_state END,
                         'state', 'unknown',
                         'reason', 'node token re-signed; environment must converge again',
                         'reconcile', 'node-token-resigned'
@@ -127,12 +135,16 @@ async fn issue_node_token_inner(
                     hy2_port_hop_state = 'unknown',
                     hy2_port_hop_sha256 = NULL,
                     hy2_port_hop_observed = jsonb_build_object(
+                        'previous_state', CASE WHEN hy2_port_hop_state = 'unknown'
+                            THEN hy2_port_hop_observed->>'previous_state' ELSE hy2_port_hop_state END,
                         'state', 'unknown',
                         'reason', 'node token re-signed; environment must converge again',
                         'reconcile', 'node-token-resigned'
                     ),
                     grants_state = 'unknown',
                     grants_observed = jsonb_build_object(
+                        'previous_state', CASE WHEN grants_state = 'unknown'
+                            THEN grants_observed->>'previous_state' ELSE grants_state END,
                         'state', 'unknown',
                         'reason', 'node token re-signed; environment must converge again',
                         'reconcile', 'node-token-resigned'

@@ -61,13 +61,43 @@ Brocade 只支持仓库内维护的 Xray fork（[`components/xray-core`](compone
 
 ## 试用
 
-从 [Releases](https://github.com/akiasprin/brocade/releases/latest) 下载与服务器匹配的安装包，校验后运行：
+在 Linux 服务器上复制执行以下命令，自动下载最新正式版中适合 CPU 架构的静态安装包，校验 SHA-256 后启动交互安装：
 
 ```sh
-sudo sh brocade-dist-<版本>-linux-<arch>-<libc>/install.sh
+(
+  set -eu
+  case "$(uname -s):$(uname -m)" in
+    Linux:x86_64|Linux:amd64) arch=x86_64 ;;
+    Linux:aarch64|Linux:arm64) arch=aarch64 ;;
+    *) echo '仅支持 Linux x86_64 / aarch64' >&2; exit 1 ;;
+  esac
+  repo=https://github.com/akiasprin/brocade
+  release=$(curl -fsSL --connect-timeout 15 --max-time 60 -o /dev/null -w '%{url_effective}' "$repo/releases/latest")
+  version=${release##*/v}
+  printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+  case $version in
+    0.3.[1-5]) bundle=brocade-dist-$version-linux-$arch-musl ;;
+    *) bundle=brocade-dist-$version-base-linux-$arch-musl ;;
+  esac
+  work_dir=$(mktemp -d)
+  trap 'rm -rf "$work_dir"' 0
+  trap 'exit 130' INT
+  trap 'exit 143' HUP TERM
+  cd "$work_dir"
+  url=$repo/releases/download/v$version/$bundle.tar.gz
+  curl -fL --retry 2 --connect-timeout 15 --max-time 600 -o "$bundle.tar.gz" "$url"
+  curl -fL --retry 2 --connect-timeout 15 --max-time 60 -o "$bundle.tar.gz.sha256" "$url.sha256"
+  sha256sum -c "$bundle.tar.gz.sha256"
+  tar -xzf "$bundle.tar.gz"
+  if [ "$(id -u)" -eq 0 ]; then
+    sh "$bundle/install.sh"
+  else
+    sudo sh "$bundle/install.sh"
+  fi
+)
 ```
 
-安装器可托管 PostgreSQL，启动后输出初始化链接，入门向导带你纳管第一台机器。完整步骤见[安装与升级](docs/install.md)。
+需要 `curl`、`tar` 和 `sha256sum`。默认安装基础版，静态 musl 包兼容同架构 GNU 与 musl 系统。安装器可托管 PostgreSQL，启动后输出初始化链接，入门向导带你纳管第一台机器。容器版、升级及手动下载见[安装与升级](docs/install.md)。
 
 > [!IMPORTANT]
 > Agent 以 root 身份修改机器的网络与系统配置。用于生产前，请先审查生成的配置、访问控制和部署边界。
@@ -82,6 +112,7 @@ sudo sh brocade-dist-<版本>-linux-<arch>-<libc>/install.sh
 - [VPN Gate](docs/vpngate.md)：目录采集、候选资格、IP 情报、主备切换
 - [用户、访问与订阅](docs/users.md)：会话与访客、订阅、接入配额、在线设备
 - [端口转发](docs/forwarding.md)：地址防护、用量与配额
+- [CVM](docs/cvm.md)：轻量实例、规格、网卡挂载、执行适配器与能力边界
 - [用量与实时流量](docs/traffic.md)：用量账本、实时速率、机器流量统计
 - [出流量统计](docs/site-usage.md)：站点分类、其他站点与嗅探失败目标
 - [机器观测与通知](docs/observability.md)：指标、Ping、公网 IP、通知、日志、性能诊断

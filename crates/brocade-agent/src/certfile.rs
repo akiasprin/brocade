@@ -223,9 +223,7 @@ pub(crate) fn observe(state_dir: &Path) -> CertificateObservation {
 }
 
 fn digest_file(path: &Path) -> Option<String> {
-    std::fs::read(path)
-        .ok()
-        .map(|bytes| crate::sha256_hex(&bytes))
+    crate::fsutil::file_sha256(path).ok()
 }
 
 fn observe_self_signed(dir: &Path) -> CertificatePairObservation {

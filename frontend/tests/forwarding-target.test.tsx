@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   blockedAddress,
   endpointText,
+  isLinkLocalAddress,
   parseTarget,
   submittedHost,
   type ParsedTarget,
@@ -72,4 +73,11 @@ describe('转发目标地址', () => {
     }
     expect(parsed('192.168.1.10:22').blocked).toBe(true);
   });
+});
+
+it('recognizes link-local address families without treating private networks as link-local', () => {
+  for (const address of ['169.254.1.2', 'fe80::1', '[FE9F::2]', 'febf::1', '::ffff:169.254.1.2'])
+    expect(isLinkLocalAddress(address), address).toBe(true);
+  for (const address of ['10.60.0.2', '192.168.0.21', 'fd60::2', '2001:db8::1', 'fec0::1', 'example.com'])
+    expect(isLinkLocalAddress(address), address).toBe(false);
 });

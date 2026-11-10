@@ -35,6 +35,53 @@ fn serve_request(conn: &mut ServerConnection, tcp: &mut TcpStream) -> bool {
         }
     }
 }
+
+#[tokio::test]
+async fn asynchronous_control_uses_authenticated_tls_and_protocol_headers() {
+    crate::identity::self_identity();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("https://{}", listener.local_addr().unwrap());
+    let config = configuration(&rustls::version::TLS13);
+    let server = thread::spawn(move || {
+        let (tcp, _) = accept(&listener);
+        tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let conn = ServerConnection::new(config).unwrap();
+        let mut stream = StreamOwned::new(conn, tcp);
+        let mut reader = BufReader::new(&mut stream);
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            headers.push_str(&line.to_ascii_lowercase());
+        }
+        let mut body = [0; 2];
+        reader.read_exact(&mut body).unwrap();
+        assert_eq!(body, *b"{}");
+        assert!(headers.contains("authorization: bearer synthetic-tls-budget\r\n"));
+        assert!(headers.contains("x-brocade-protocol-version:"));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .unwrap();
+    });
+    let client = asynchronous::control_client(4).unwrap();
+    let response = HttpClient::new(&origin)
+        .unwrap()
+        .post_json(
+            &client,
+            "/budget",
+            "synthetic-tls-budget",
+            "{}".into(),
+            Instant::now() + Duration::from_secs(2),
+            4096,
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.body, "{}");
+    server.join().unwrap();
+}
 #[test]
 fn public_diagnostics_advertise_http1_without_changing_control_tls() {
     warm_control_client();

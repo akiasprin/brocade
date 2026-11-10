@@ -254,6 +254,17 @@ impl TrafficLimitDesired {
     }
 }
 
+/// UTC calendar month boundaries, shared with NIC offline quota enforcement.
+pub fn utc_month_period(now: i64) -> (i64, i64) {
+    let (year, month, _) = civil_from_days(now.div_euclid(86_400));
+    let (end_year, end_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    (reset_at(year, month, 1), reset_at(end_year, end_month, 1))
+}
+
 fn previous_month(year: i64, month: i64, cycle: NodeTrafficCycleKind) -> (i64, i64) {
     match cycle {
         NodeTrafficCycleKind::Yearly => (year - 1, month),

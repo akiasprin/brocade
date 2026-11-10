@@ -19,7 +19,7 @@ pub use brocade_core::model::IpFamily;
 pub const UNLOCK_PROBE_PROTOCOL_VERSION: u32 = 46;
 pub const CHAIN_UNLOCK_PROBE_PROTOCOL_VERSION: u32 = 47;
 pub const YOUTUBE_UNLOCK_DETAILS_PROTOCOL_VERSION: u32 = 49;
-pub const UNLOCK_PROBE_INTERVAL_SECS: u64 = 86_400;
+pub const UNLOCK_PROBE_INTERVAL_SECS: u64 = 14_400;
 
 /// Digest the loaded DNS and Freedom configuration, excluding credentials and unrelated
 /// certificate/runtime details. Agent and Console share this exact canonical projection.

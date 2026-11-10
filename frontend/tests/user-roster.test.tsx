@@ -503,7 +503,7 @@ describe('user roster rows', () => {
     fireEvent.click(view.getByRole('tab', { name: '转发' }));
     const forwardingCard = view.container.querySelector<HTMLElement>('.user-forwarding-usage')!;
     const forwardingAccounting = await within(forwardingCard).findByRole('group', { name: '用户流量计量口径' });
-    expect(forwardingAccounting.closest('.fwd-ledger')).toBeTruthy();
+    expect(forwardingAccounting.closest('.user-usage-ledger')).toBeTruthy();
     expect(within(forwardingAccounting).getByRole('button', { name: '双向', pressed: true })).toBeTruthy();
     expect(within(forwardingCard).getByText(doubleDescription).parentElement?.hidden).toBe(true);
     fireEvent.click(within(forwardingAccounting).getByRole('button', { name: '单向' }));
@@ -513,12 +513,13 @@ describe('user roster rows', () => {
 
   it.each([
     ['接入', '.user-usage-ledger'],
-    ['转发', '.fwd-ledger'],
+    ['转发', '.user-usage-ledger'],
   ])('在%s读数栏的计量口径之后显示账期与有效期，并从这里打开编辑', async (tab, ledger) => {
     const { view } = mount();
     fireEvent.click(view.getByRole('tab', { name: tab }));
     const control = await view.findByRole('group', { name: '用户流量计量口径' });
     const terms = view.getByRole('button', { name: /^重置日/ });
+    expect(terms.closest(ledger)).toBeTruthy();
     expect(terms.closest(ledger)).toBe(control.closest(ledger));
     const accounting = control.closest('.user-usage-accounting')!;
     expect(accounting.nextElementSibling?.classList.contains('user-usage-accounting-note')).toBe(true);
@@ -637,7 +638,7 @@ describe('user roster rows', () => {
     fireEvent.click(view.getByRole('button', { name: '订阅' }));
     const dialog = await view.findByRole('dialog', { name: 'alice 的订阅与节点' });
     expect(within(dialog).getByRole('tab', { name: '订阅' }).getAttribute('aria-selected')).toBe('true');
-    expect(await within(dialog).findByText('Clash 订阅')).toBeTruthy();
+    expect(await within(dialog).findByRole('region', { name: 'Clash 订阅' })).toBeTruthy();
     expect(reads()).toContain(`/users/${tenant}/alice/clash-subscription`);
 
     // 「节点」页签并入网络拨测：页签内读取本机拨测能力。

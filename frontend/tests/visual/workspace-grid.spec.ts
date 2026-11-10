@@ -172,6 +172,15 @@ for (const engine of ['chromium', 'webkit'] as const) {
           enter();
           await expect(page.locator('.fg-view')).toBeVisible();
           expect(await page.locator('.fg-top').evaluate(el => getComputedStyle(el).borderBottomWidth)).toBe('0px');
+          if (!device.touch) {
+            const header = page.locator('.fg-top');
+            await expect(header).toHaveCSS('position', 'relative');
+            await expect(header).toHaveCSS(
+              'background-color',
+              await page.locator('html').evaluate(el => getComputedStyle(el).backgroundColor),
+            );
+            expect(await header.evaluate(el => el.closest('.fg-desk') !== null)).toBe(true);
+          }
           await expect(page.locator('.fg-view .loading-boundary-guard')).toBeAttached();
           await expectOrigin(page, origin);
           expect((await gridPixels(page)).equals(startup), 'grid jumped when the shell mounted').toBe(true);
@@ -198,7 +207,14 @@ for (const engine of ['chromium', 'webkit'] as const) {
           const before = await gridPixels(page);
           await test.info().attach('loaded-grid', { body: before, contentType: 'image/png' });
           expect(before.equals(startup), 'grid jumped when data finished loading').toBe(true);
+          const headerClip = { x: 720, y: 8, width: 48, height: 24 };
+          const headerPixels = device.touch ? null : await page.screenshot({ clip: headerClip });
           await page.locator('body').evaluate(el => el.style.setProperty('--grid-image', 'none'));
+          if (headerPixels)
+            expect(
+              (await page.screenshot({ clip: headerClip })).equals(headerPixels),
+              'grid never paints through the desktop navigation',
+            ).toBe(true);
           const absent = await gridPixels(page);
           expect(absent.equals(before), 'grid is visible in the gutter').toBe(false);
           await page.locator('body').evaluate(el => el.style.removeProperty('--grid-image'));

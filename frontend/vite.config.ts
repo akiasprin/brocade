@@ -159,10 +159,43 @@ function pingMockPlugin(): Plugin {
   };
 }
 
+const PRODUCT_FLAVOR = process.env.BROCADE_PRODUCT_FLAVOR ?? 'base';
+if (!['base', 'cvm'].includes(PRODUCT_FLAVOR)) throw new Error('BROCADE_PRODUCT_FLAVOR must be base or cvm');
+
 export default defineConfig({
-  plugins: [pingMockPlugin(), react()],
+  define: { __BROCADE_CVM__: PRODUCT_FLAVOR === 'cvm' },
+  plugins: [
+    pingMockPlugin(),
+    react(),
+    {
+      name: 'brocade-product',
+      generateBundle(_options, bundle) {
+        if (PRODUCT_FLAVOR === 'base') {
+          for (const output of Object.values(bundle)) {
+            if (output.type !== 'chunk') continue;
+            for (const [id, module] of Object.entries(output.modules)) {
+              if (module.renderedLength > 0 && /(?:\/panes\/cvm\/|\/api\/cvm(?:[.-])|\/@xterm\/)/.test(id)) {
+                throw new Error(`Base product retained a CVM module: ${id}`);
+              }
+            }
+          }
+        }
+        this.emitFile({
+          type: 'asset',
+          fileName: 'brocade-product.json',
+          source:
+            JSON.stringify({
+              flavor: PRODUCT_FLAVOR,
+              features: { cvm: PRODUCT_FLAVOR === 'cvm' },
+            }) + '\n',
+        });
+      },
+    },
+  ],
   server: {
     proxy: {
+      // Terminal tickets and upgrades validate the browser Origin against Host.
+      '^/cvm/[^/]+/terminal(?:/|$)': { target: ADMIN_ORIGIN, changeOrigin: false, ws: true },
       [TO_BACKEND]: {
         target: ADMIN_ORIGIN,
         changeOrigin: true,

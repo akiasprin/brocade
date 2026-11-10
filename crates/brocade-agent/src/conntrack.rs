@@ -36,6 +36,10 @@
 //!
 //! # What must not be matched
 //!
+//! - **Guest traffic.** CVM routing and NAT require conntrack. Bridge ingress returns
+//!   before exemptions, including traffic to another local host address. Other prerouting
+//!   exemptions require a host-local destination, so forwarded traffic stays tracked even
+//!   when it uses the same port or source endpoint as this machine's Xray listeners.
 //! - **UDP.** Hysteria 2's hop range is folded onto the listener by a `redirect`, which is NAT,
 //!   and NAT is implemented *in* conntrack. Those flows are the ones that cannot be exempted, and
 //!   they are also the ones that churn hardest. Nothing to do about it.
@@ -59,6 +63,8 @@ use crate::{
 
 /// The nft table name. Distinct from phantun's and from port hopping's — see the module docs.
 const TABLE: &str = "brocade_conntrack";
+// CVM can refresh NAT exclusions while Xray converges its own listeners.
+static POLICY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct TcpPeer {
@@ -68,6 +74,8 @@ struct TcpPeer {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Exemptions {
+    delivery_addresses: BTreeSet<IpAddr>,
+    delivery_ports: BTreeSet<(IpAddr, u16)>,
     inbound_ports: BTreeSet<u16>,
     mux_peers: BTreeSet<TcpPeer>,
 }
@@ -79,6 +87,7 @@ impl Exemptions {
 }
 
 type Rules = BTreeSet<(String, String)>;
+const TRACK_BRIDGE_INGRESS: &str = "meta iifkind \"bridge\" return";
 
 /// Apply for this desired xray artifact, or take the table down when there is no xray.
 pub(crate) fn apply(desired: &DesiredArtifact) -> Result<(), String> {
@@ -119,6 +128,8 @@ fn exemptions(content: &str) -> Result<Exemptions, String> {
     }
     let mut exemptions = Exemptions {
         inbound_ports: ports(content),
+        delivery_addresses: crate::network_tracking::addresses()?,
+        delivery_ports: crate::network_tracking::ports()?,
         ..Exemptions::default()
     };
     for outbound in config["outbounds"].as_array().into_iter().flatten() {
@@ -209,10 +220,22 @@ fn is_loopback(listen: &str) -> bool {
 /// rules in `hy2_port_hop.rs` document.
 fn rules_for(exemptions: &Exemptions) -> Rules {
     let mut rules = Rules::new();
+    if !exemptions.is_empty() {
+        // This sorts before every TCP exemption in this chain. A bridge may
+        // deliver a Guest packet to another local host address as well as forward
+        // it; both paths need conntrack for CVM routing and reply isolation.
+        rules.insert(("prerouting_raw".to_owned(), TRACK_BRIDGE_INGRESS.to_owned()));
+        for ip in &exemptions.delivery_addresses {
+            add_delivery_guards(&mut rules, *ip);
+        }
+        for (ip, port) in &exemptions.delivery_ports {
+            add_delivery_port_guards(&mut rules, *ip, *port);
+        }
+    }
     for port in &exemptions.inbound_ports {
         rules.insert((
             "prerouting_raw".to_owned(),
-            format!("tcp dport {port} notrack"),
+            format!("tcp dport {port} fib daddr type local notrack"),
         ));
         rules.insert(("output_raw".to_owned(), format!("tcp sport {port} notrack")));
     }
@@ -228,8 +251,8 @@ fn rules_for(exemptions: &Exemptions) -> Rules {
         rules.insert((
             "prerouting_raw".to_owned(),
             format!(
-                "{family} saddr {} tcp sport {} notrack",
-                peer.address, peer.port
+                "tcp sport {} {family} saddr {} fib daddr type local notrack",
+                peer.port, peer.address
             ),
         ));
     }
@@ -237,14 +260,91 @@ fn rules_for(exemptions: &Exemptions) -> Rules {
 }
 
 fn rule_lines(exemptions: &Exemptions) -> Vec<String> {
-    rules_for(exemptions)
+    ordered_rules(rules_for(exemptions))
         .into_iter()
         .map(|(chain, rule)| format!("add rule inet {TABLE} {chain} {rule}"))
         .collect()
 }
+fn add_delivery_guards(rules: &mut Rules, ip: IpAddr) {
+    let family = if ip.is_ipv4() { "ip" } else { "ip6" };
+    for chain in ["prerouting_raw", "output_raw"] {
+        rules.insert((chain.into(), format!("{family} daddr {ip} return")));
+        rules.insert((chain.into(), format!("{family} saddr {ip} return")));
+    }
+}
+fn add_delivery_port_guards(rules: &mut Rules, ip: IpAddr, port: u16) {
+    let family = if ip.is_ipv4() { "ip" } else { "ip6" };
+    for chain in ["prerouting_raw", "output_raw"] {
+        rules.insert((
+            chain.into(),
+            format!("{family} daddr {ip} tcp dport {port} return"),
+        ));
+        rules.insert((
+            chain.into(),
+            format!("{family} saddr {ip} tcp sport {port} return"),
+        ));
+    }
+}
+fn ordered_rules(rules: Rules) -> Vec<(String, String)> {
+    let mut rules: Vec<_> = rules.into_iter().collect();
+    rules.sort_by_key(|(chain, rule)| {
+        (
+            chain.clone(),
+            if rule == TRACK_BRIDGE_INGRESS {
+                0
+            } else if rule.ends_with(" return") {
+                1
+            } else {
+                2
+            },
+            rule.clone(),
+        )
+    });
+    rules
+}
+/// Preserve the NAT requirement even before the next Xray configuration round.
+#[cfg(feature = "cvm")]
+pub(crate) fn track_delivery_scopes(
+    addresses: &BTreeSet<IpAddr>,
+    ports: &BTreeSet<(IpAddr, u16)>,
+) -> Result<(), String> {
+    let _policy = POLICY_LOCK
+        .lock()
+        .map_err(|_| "conntrack policy lock unavailable")?;
+    let Some(mut rules) = installed() else {
+        if crate::command::command_success("nft", &["list", "table", "inet", TABLE]) {
+            return Err("cannot verify existing NOTRACK policy for CVM delivery".into());
+        }
+        return Ok(());
+    };
+    // This table is owned by this module: its only return rules are the bridge
+    // prerequisite and delivery guards. Replace the delivery guards with the current scopes.
+    rules.retain(|(_, rule)| !rule.ends_with(" return") || rule == TRACK_BRIDGE_INGRESS);
+    for ip in addresses {
+        add_delivery_guards(&mut rules, *ip);
+    }
+    for (ip, port) in ports {
+        add_delivery_port_guards(&mut rules, *ip, *port);
+    }
+    let lines = ordered_rules(rules)
+        .into_iter()
+        .map(|(chain, rule)| format!("add rule inet {TABLE} {chain} {rule}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    run_shell(&format!("set -eu\nnft -f - <<'CVM_TRACK'\nflush chain inet {TABLE} prerouting_raw\nflush chain inet {TABLE} output_raw\n{lines}\nCVM_TRACK\n")).map(|_|())
+}
 
 fn install(exemptions: &Exemptions) -> Result<(), String> {
-    let rules = rule_lines(exemptions).join("\n");
+    let _policy = POLICY_LOCK
+        .lock()
+        .map_err(|_| "conntrack policy lock unavailable")?;
+    let current = Exemptions {
+        delivery_addresses: crate::network_tracking::addresses()?,
+        delivery_ports: crate::network_tracking::ports()?,
+        inbound_ports: exemptions.inbound_ports.clone(),
+        mux_peers: exemptions.mux_peers.clone(),
+    };
+    let rules = rule_lines(&current).join("\n");
     // Add/delete/recreate in one transaction works for an absent or existing table. Never
     // expose a gap in NOTRACK while replacing policy, or briefly tracked flows can survive it.
     run_shell(&format!(
@@ -264,6 +364,9 @@ NFT\n"
 }
 
 pub(crate) fn disable() -> Result<(), String> {
+    let _policy = POLICY_LOCK
+        .lock()
+        .map_err(|_| "conntrack policy lock unavailable")?;
     // Absent table is success: this runs on every convergence of a machine that has no public TCP
     // inbound, and `nft delete` on a missing table exits non-zero.
     run_shell(&format!(
@@ -294,6 +397,7 @@ fn parse_installed(text: &str) -> Option<Rules> {
     let mut chain = None;
     let mut raw_hooks = BTreeSet::new();
     let mut rules = Rules::new();
+    let mut bridge_guard = false;
     for line in text.lines().map(str::trim) {
         if let Some(name) = line
             .strip_prefix("chain ")
@@ -316,16 +420,44 @@ fn parse_installed(text: &str) -> Option<Rules> {
                     raw_hooks.insert(name);
                 }
             } else if !line.is_empty() {
-                rules.insert((name.to_owned(), line.to_owned()));
+                if name == "prerouting_raw" {
+                    if line == TRACK_BRIDGE_INGRESS {
+                        if bridge_guard {
+                            return None;
+                        }
+                        bridge_guard = true;
+                    } else if !bridge_guard {
+                        return None;
+                    }
+                }
+                // `nft -n` prints RTN_LOCAL numerically on some versions.
+                let normalized =
+                    line.replace("fib daddr type 2 notrack", "fib daddr type local notrack");
+                rules.insert((name.to_owned(), normalized));
             }
         }
     }
-    (raw_hooks.len() == 2).then_some(rules)
+    (raw_hooks.len() == 2 && bridge_guard).then_some(rules)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_delivery_tracks_only_its_tcp_tuple_and_preserves_other_exemptions() {
+        let rules = rule_lines(&Exemptions {
+            inbound_ports: BTreeSet::from([443, 30222]),
+            delivery_ports: BTreeSet::from([("198.51.100.20".parse().unwrap(), 30222)]),
+            ..Exemptions::default()
+        })
+        .join("\n");
+        assert!(rules.contains("ip daddr 198.51.100.20 tcp dport 30222 return"));
+        assert!(rules.contains("ip saddr 198.51.100.20 tcp sport 30222 return"));
+        assert!(rules.contains("tcp dport 443 fib daddr type local notrack"));
+        assert!(!rules.contains("ip daddr 198.51.100.20 return"));
+        assert!(!rules.contains("ip saddr 198.51.100.20 return"));
+    }
 
     const CONFIG: &str = r#"{"inbounds":[
         {"tag":"api","listen":"127.0.0.1","port":10085,"protocol":"dokodemo-door"},
@@ -355,8 +487,9 @@ mod tests {
             vec![
                 "add rule inet brocade_conntrack output_raw tcp sport 444 notrack",
                 "add rule inet brocade_conntrack output_raw tcp sport 8443 notrack",
-                "add rule inet brocade_conntrack prerouting_raw tcp dport 444 notrack",
-                "add rule inet brocade_conntrack prerouting_raw tcp dport 8443 notrack",
+                "add rule inet brocade_conntrack prerouting_raw meta iifkind \"bridge\" return",
+                "add rule inet brocade_conntrack prerouting_raw tcp dport 444 fib daddr type local notrack",
+                "add rule inet brocade_conntrack prerouting_raw tcp dport 8443 fib daddr type local notrack",
             ]
         );
     }
@@ -365,20 +498,19 @@ mod tests {
     /// rebuilds a table that already matches on every single round.
     #[test]
     fn what_nft_prints_parses_back_to_what_was_written() {
-        let printed = "\
-table inet brocade_conntrack {
-	chain prerouting_raw {
-		type filter hook prerouting priority raw; policy accept;
-		tcp dport 444 notrack
-		tcp dport 8443 notrack
-	}
-
-	chain output_raw {
-		type filter hook output priority raw; policy accept;
-		tcp sport 444 notrack
-		tcp sport 8443 notrack
-	}
-}";
+        let printed = r#"table inet brocade_conntrack {
+ chain prerouting_raw {
+  type filter hook prerouting priority raw; policy accept;
+  meta iifkind "bridge" return
+  tcp dport 444 fib daddr type local notrack
+  tcp dport 8443 fib daddr type local notrack
+ }
+ chain output_raw {
+  type filter hook output priority raw; policy accept;
+  tcp sport 444 notrack
+  tcp sport 8443 notrack
+ }
+}"#;
         assert_eq!(
             parse_installed(printed),
             Some(rules_for(&Exemptions {
@@ -390,7 +522,21 @@ table inet brocade_conntrack {
             parse_installed(&printed.replace("tcp sport 8443 notrack", "")),
             parse_installed(printed)
         );
+        assert_eq!(
+            parse_installed(&printed.replace("fib daddr type local", "fib daddr type 2")),
+            parse_installed(printed)
+        );
         assert!(parse_installed(&printed.replace("priority raw", "priority filter")).is_none());
+        let reordered = printed
+            .replace("  meta iifkind \"bridge\" return\n", "")
+            .replace(
+                "  tcp dport 8443 fib daddr type local notrack",
+                "  tcp dport 8443 fib daddr type local notrack\n  meta iifkind \"bridge\" return",
+            );
+        assert!(
+            parse_installed(&reordered).is_none(),
+            "bridge guard must precede exemptions"
+        );
     }
 
     /// An xray with no public TCP inbound must take the table down rather than leave a stale one:
@@ -442,12 +588,16 @@ table inet brocade_conntrack {
         let exemptions = exemptions(&config.to_string()).unwrap();
         assert!(exemptions.inbound_ports.is_empty());
         assert_eq!(exemptions.mux_peers.len(), 2);
-        assert_eq!(rule_lines(&exemptions), vec![
-            "add rule inet brocade_conntrack output_raw ip daddr 192.0.2.17 tcp dport 20001 notrack",
-            "add rule inet brocade_conntrack output_raw ip6 daddr 2001:db8::17 tcp dport 20002 notrack",
-            "add rule inet brocade_conntrack prerouting_raw ip saddr 192.0.2.17 tcp sport 20001 notrack",
-            "add rule inet brocade_conntrack prerouting_raw ip6 saddr 2001:db8::17 tcp sport 20002 notrack",
-        ]);
+        assert_eq!(
+            rule_lines(&exemptions),
+            vec![
+                "add rule inet brocade_conntrack output_raw ip daddr 192.0.2.17 tcp dport 20001 notrack",
+                "add rule inet brocade_conntrack output_raw ip6 daddr 2001:db8::17 tcp dport 20002 notrack",
+                "add rule inet brocade_conntrack prerouting_raw meta iifkind \"bridge\" return",
+                "add rule inet brocade_conntrack prerouting_raw tcp sport 20001 ip saddr 192.0.2.17 fib daddr type local notrack",
+                "add rule inet brocade_conntrack prerouting_raw tcp sport 20002 ip6 saddr 2001:db8::17 fib daddr type local notrack",
+            ]
+        );
     }
 
     #[test]
@@ -539,7 +689,7 @@ table inet brocade_conntrack {
             std::env::var("BROCADE_TEST_CONNTRACK_PEER").as_deref(),
             Ok("ready")
         );
-        let config = serde_json::json!({"outbounds": [
+        let config = serde_json::json!({"inbounds": [{"tag": "in:vless", "listen": "::", "port": 23001, "protocol": "vless"}], "outbounds": [
             health_mux("vless", serde_json::json!({"vnext": [
                 {"address": "192.0.2.17", "port": 20001},
                 {"address": "2001:db8:1::17", "port": 20003}
@@ -550,7 +700,11 @@ table inet brocade_conntrack {
         // must not make the NOTRACK assertions pass on an otherwise untracked namespace.
         run_shell("nft -f - <<'NFT'\nadd table inet conntrack_test\nadd chain inet conntrack_test output { type filter hook output priority filter; policy accept; }\nadd rule inet conntrack_test output ct state established counter\nNFT\n").unwrap();
         apply_content(&config).unwrap();
-        assert!(matches_content(&config));
+        assert!(
+            matches_content(&config),
+            "installed rules: {:?}",
+            installed()
+        );
         apply_content(&config).unwrap();
         assert!(
             matches_content(&config),
@@ -619,6 +773,7 @@ table inet brocade_conntrack {
             udp.local_addr().unwrap(),
             udp.peer_addr().unwrap()
         ));
+        crate::command::run_command("python3", &[&fixture, "--bridge-check"]).unwrap();
         run_shell("nft flush chain inet brocade_conntrack prerouting_raw").unwrap();
         assert!(
             !matches_content(&config),

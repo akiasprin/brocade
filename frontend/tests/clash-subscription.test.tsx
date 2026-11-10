@@ -197,10 +197,11 @@ describe('subscription and node dialog', () => {
     vi.stubGlobal('fetch', fetchMock);
     const view = renderViewer('clash');
 
+    fireEvent.click(await view.findByText('koipy 测速订阅'));
     expect(await view.findByText('尚未生成')).toBeTruthy();
     expect(view.getByText(/风险提示：测速订阅包含用户 UUID/)).toBeTruthy();
     expect(view.getByText(/更换用户 UUID 并发布授权/)).toBeTruthy();
-    expect(view.getByText('模板 SubBoost 标准版 · 适用 Mihomo / Clash Meta')).toBeTruthy();
+    expect(view.getByTitle('模板 SubBoost 标准版')).toBeTruthy();
     fireEvent.click(view.getByRole('button', { name: '生成 koipy 测速地址' }));
     await view.findByRole('button', { name: '撤销 koipy 测速地址' });
     expect(view.getByText('可用')).toBeTruthy();
@@ -246,7 +247,7 @@ describe('subscription and node dialog', () => {
       vi.fn(async () => jsonResponse({ ...subscriptionInfo(), haitun: null })),
     );
     const view = renderViewer('clash', selfService);
-    await view.findByText('Clash 订阅');
+    await view.findByRole('region', { name: 'Clash 订阅' });
     expect(view.queryByText('koipy 测速订阅')).toBeNull();
     expect(view.queryByRole('button', { name: /koipy/ })).toBeNull();
   });
@@ -257,7 +258,7 @@ describe('subscription and node dialog', () => {
       vi.fn(async () => jsonResponse(subscriptionInfo())),
     );
     const view = renderViewer('clash', true);
-    await view.findByText('Clash 订阅');
+    await view.findByRole('region', { name: 'Clash 订阅' });
     expect(view.queryByText('koipy 测速订阅')).toBeNull();
   });
 
@@ -275,6 +276,7 @@ describe('subscription and node dialog', () => {
       }),
     );
     const view = renderViewer('clash');
+    fireEvent.click(await view.findByText('koipy 测速订阅'));
     fireEvent.click(await view.findByRole('button', { name: '显示 koipy 测速地址' }));
     fireEvent.click(view.getByRole('button', { name: '撤销 koipy 测速地址' }));
     await view.findByText(/revocation failed/);
@@ -306,6 +308,7 @@ describe('subscription and node dialog', () => {
     vi.stubGlobal('fetch', fetchMock);
     vi.spyOn(window, 'confirm').mockReturnValue(true);
     const view = renderViewer('clash');
+    fireEvent.click(await view.findByText('koipy 测速订阅'));
     const revoke = await view.findByRole('button', { name: '撤销 koipy 测速地址' });
     const refreshing = view.client.refetchQueries({ queryKey: ['clash-subscription'] });
     await waitFor(() => expect(reads).toBe(2));
@@ -344,6 +347,58 @@ describe('subscription and node dialog', () => {
     expect(view.getByTitle('按 UTC+8 计').textContent).toBe('9/1 00:00');
   });
 
+  it.each([false, true])(
+    'shows the QR code by default without revealing the text token (self-service: %s)',
+    async selfService => {
+      const fetchMock = vi.fn(async () => jsonResponse(subscriptionInfo()));
+      vi.stubGlobal('fetch', fetchMock);
+      const view = renderViewer('clash', selfService);
+      expect(await view.findByRole('img', { name: 'Clash 订阅地址二维码' })).toBeTruthy();
+      expect(view.queryByRole('button', { name: /(?:显示|收起).*二维码/ })).toBeNull();
+      expect(view.queryByRole('button', { name: /标准配色|跟随主题/ })).toBeNull();
+      expect(view.queryByRole('button', { name: 'MTProxy' })).toBeNull();
+      expect(view.baseElement.querySelector('.sub-url-mask')).not.toBeNull();
+      expect(view.queryByText(standardUrl)).toBeNull();
+      expect(view.getByRole('button', { name: '下载二维码' })).toBeTruthy();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('keeps the QR code visible and masks the address again when either filter changes', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse(subscriptionInfo())),
+    );
+    const view = renderViewer('clash');
+    const qr = await view.findByRole('img', { name: 'Clash 订阅地址二维码' });
+    for (const filter of ['Hysteria 2', 'IPv6']) {
+      fireEvent.click(view.getByRole('button', { name: '显示 Clash 订阅地址' }));
+      fireEvent.click(view.getByRole('button', { name: filter }));
+      expect(view.getByRole('img', { name: 'Clash 订阅地址二维码' })).toBe(qr);
+      expect(view.baseElement.querySelector('.sub-url-mask')).not.toBeNull();
+    }
+  });
+
+  it('keeps MTProxy in node filters and clears it when switching to the subscription', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === '/revisions?limit=50') return jsonResponse({ current_revision: 9, revisions: [] });
+        if (path === '/grant-probes/capability') return probeOff();
+        if (path.endsWith('/clash-subscription')) return jsonResponse(subscriptionInfo());
+        return artifact(mtproxyText);
+      }),
+    );
+    const view = renderViewer('uri');
+    fireEvent.click(await view.findByRole('button', { name: 'MTProxy' }));
+    fireEvent.click(view.getByRole('tab', { name: '订阅' }));
+    await view.findByRole('img', { name: 'Clash 订阅地址二维码' });
+    expect(view.queryByRole('button', { name: 'MTProxy' })).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: '显示 Clash 订阅地址' }));
+    expect(view.getByText(standardUrl)).toBeTruthy();
+  });
+
   it('switches the filters to two dropdowns on narrow screens', async () => {
     stubViewport(true);
     vi.stubGlobal(
@@ -352,7 +407,7 @@ describe('subscription and node dialog', () => {
     );
     const view = renderViewer('clash');
 
-    await view.findByText('Clash 订阅');
+    await view.findByRole('region', { name: 'Clash 订阅' });
     expect(view.queryByRole('button', { name: 'Hysteria 2' })).toBeNull();
     fireEvent.change(view.getByRole('combobox', { name: '协议' }), { target: { value: 'hysteria2' } });
     fireEvent.change(view.getByRole('combobox', { name: '地址族' }), { target: { value: 'v4' } });
@@ -446,7 +501,7 @@ describe('subscription and node dialog', () => {
     expect(view.baseElement.querySelector('.node-raw .cd')?.textContent).toContain('# 以下条目带前置代理');
 
     fireEvent.click(view.getByRole('button', { name: '改用订阅' }));
-    expect(await view.findByText('Clash 订阅')).toBeTruthy();
+    expect(await view.findByRole('region', { name: 'Clash 订阅' })).toBeTruthy();
   });
 
   it('shows Hysteria 2 port-hopping endpoints in both address-family columns', async () => {

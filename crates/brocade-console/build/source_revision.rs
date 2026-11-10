@@ -15,6 +15,9 @@ use std::{path::Path, process::Command};
 /// authoritative machine identity.
 pub const AGENT_SOURCE_PATHS: &[&str] = &[
     "crates/brocade-agent",
+    "crates/brocade-cube",
+    "components/cube/CubeShim/terminal",
+    "components/cube/pkgs/proto",
     "crates/brocade-probe",
     "crates/brocade-deployment",
     "crates/brocade-core",
@@ -22,6 +25,22 @@ pub const AGENT_SOURCE_PATHS: &[&str] = &[
 
 /// The vendored Xray fork is one source tree, independent of the Console and Agent crates.
 pub const XRAY_SOURCE_PATHS: &[&str] = &["components/xray-core"];
+
+pub fn base_agent_source_revision(workspace: &Path) -> String {
+    describe_paths(
+        workspace,
+        &[
+            "crates/brocade-agent",
+            "crates/brocade-probe",
+            "crates/brocade-deployment",
+            "crates/brocade-core",
+            ":(exclude)crates/brocade-agent/src/cvm.rs",
+            ":(exclude)crates/brocade-agent/src/cvm",
+            ":(exclude)crates/brocade-deployment/src/cvm.rs",
+            ":(exclude)crates/brocade-deployment/src/cvm",
+        ],
+    )
+}
 
 pub fn agent_source_revision(workspace: &Path) -> String {
     describe_paths(workspace, AGENT_SOURCE_PATHS)

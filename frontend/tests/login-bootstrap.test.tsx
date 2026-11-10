@@ -55,7 +55,7 @@ describe('系统初始化默认身份', () => {
         return jsonResponse({ admin: { operator_id: 'root', role: 'system-admin' } }, 201);
       }
       if (path === '/bootstrap') {
-        return jsonResponse({ who: { operator_id: 'root', role: 'system-admin' }, initial: {} });
+        return jsonResponse({ features: { cvm: true }, who: { operator_id: 'root', role: 'system-admin' }, initial: {} });
       }
       throw new Error(`unexpected request ${path}`);
     });
@@ -141,6 +141,7 @@ describe('系统初始化默认身份', () => {
       }
       if (path === '/bootstrap') {
         return jsonResponse({
+          features: { cvm: true },
           who: { operator_id: 'root', role: 'system-admin', tenant_scope: null, token_prefix: null },
           initial: { node_count: 0, chain_group_count: [], onboarding: 'active' },
         });
@@ -180,6 +181,7 @@ describe('系统初始化默认身份', () => {
     expect(view.queryByText(/zero.*密码/)).toBeNull();
     expect(view.queryByText(/租户/)).toBeNull();
     expect(onInitialized).toHaveBeenCalledWith({
+      features: { cvm: true },
       who: { operator_id: 'root', role: 'system-admin', tenant_scope: null, token_prefix: null },
       initial: { node_count: 0, chain_group_count: [], onboarding: 'active' },
     });
@@ -234,6 +236,7 @@ describe('用户直达登录', () => {
         }
         if (path === '/bootstrap') {
           return jsonResponse({
+            features: { cvm: true },
             who: {
               operator_id: 'platform/alice',
               role: 'user',

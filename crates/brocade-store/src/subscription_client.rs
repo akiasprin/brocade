@@ -124,19 +124,34 @@ pub(crate) async fn advance_from_committed_tx(
     tx: &mut Transaction<'_, Postgres>,
     revision_id: u64,
 ) -> Result<()> {
-    ensure_state_row_tx(tx).await?;
-    let head_id = lock_head_id_tx(tx).await?;
-    let serving = lock_serving_tx(tx).await?;
-    let desired = crate::materialize::load_immutable_snapshot_tx(tx, revision_id).await?;
+    let (head_id, serving) = crate::model_timing::measure("client_locks", async {
+        ensure_state_row_tx(tx).await?;
+        let head_id = lock_head_id_tx(tx).await?;
+        let serving = lock_serving_tx(tx).await?;
+        Ok::<_, StoreError>((head_id, serving))
+    })
+    .await?;
+    let desired = crate::model_timing::measure(
+        "client_load_model",
+        crate::materialize::load_immutable_snapshot_tx(tx, revision_id),
+    )
+    .await?;
     let previous = match head_id {
-        Some(id) => Some(load_client_snapshot_tx(tx, id).await?),
+        Some(id) => Some(
+            crate::model_timing::measure("client_load_previous", load_client_snapshot_tx(tx, id))
+                .await?,
+        ),
         None => None,
     };
-    let config = SubscriptionClientConfig::advance(
-        previous.as_ref().map(|snapshot| &snapshot.config),
-        &desired,
-    );
-    let (document, content_sha256) = encode_document(&config, previous.as_ref())?;
+    let (config, document, content_sha256) =
+        crate::model_timing::measure_sync("client_encode", || {
+            let config = SubscriptionClientConfig::advance(
+                previous.as_ref().map(|snapshot| &snapshot.config),
+                &desired,
+            );
+            let (document, content_sha256) = encode_document(&config, previous.as_ref())?;
+            Ok::<_, StoreError>((config, document, content_sha256))
+        })?;
     if previous
         .as_ref()
         .is_some_and(|snapshot| snapshot.content_sha256 == content_sha256)
@@ -145,25 +160,34 @@ pub(crate) async fn advance_from_committed_tx(
     }
 
     if let Some((topology_revision, permissions_revision, _)) = serving {
-        validate_revision_combination_tx(
-            tx,
-            topology_revision,
-            permissions_revision,
-            &config,
-            "current serving state",
+        crate::model_timing::measure(
+            "client_validate_serving",
+            validate_revision_combination_tx(
+                tx,
+                topology_revision,
+                permissions_revision,
+                &config,
+                "current serving state",
+            ),
         )
         .await?;
     }
-    validate_open_topologies_tx(tx, serving.map(|(_, permissions, _)| permissions), &config)
-        .await?;
+    crate::model_timing::measure(
+        "client_validate_open",
+        validate_open_topologies_tx(tx, serving.map(|(_, permissions, _)| permissions), &config),
+    )
+    .await?;
 
-    let snapshot = insert_encoded_snapshot_tx(
-        tx,
-        revision_id,
-        config,
-        document,
-        content_sha256,
-        "model-commit",
+    let snapshot = crate::model_timing::measure(
+        "client_persist",
+        insert_encoded_snapshot_tx(
+            tx,
+            revision_id,
+            config,
+            document,
+            content_sha256,
+            "model-commit",
+        ),
     )
     .await?;
     update_head_tx(tx, snapshot.id).await?;
@@ -257,29 +281,40 @@ pub(crate) async fn validate_revision_combination_tx(
     client: &SubscriptionClientConfig,
     context: &str,
 ) -> Result<()> {
-    let topology = crate::materialize::load_immutable_snapshot_tx(tx, topology_revision).await?;
-    let permissions =
-        crate::materialize::load_immutable_snapshot_tx(tx, permissions_revision).await?;
-    let composed = compose(topology, &permissions, client)?;
-    crate::compile_cache::compile_incremental(&composed)
-        .ensure_publishable()
-        .map_err(|blocked| {
-            let errors = blocked
-                .diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.level == brocade_core::Level::Error)
-                .map(|diagnostic| {
-                    format!(
-                        "{} [{}]: {}",
-                        diagnostic.location, diagnostic.code, diagnostic.message
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            StoreError::InvalidData(format!(
-                "subscription client config is invalid with {context}: {errors}"
-            ))
-        })?;
+    let topology = crate::model_timing::measure(
+        "client_validate_load_topology",
+        crate::materialize::load_immutable_snapshot_tx(tx, topology_revision),
+    )
+    .await?;
+    let permissions = crate::model_timing::measure(
+        "client_validate_load_permissions",
+        crate::materialize::load_immutable_snapshot_tx(tx, permissions_revision),
+    )
+    .await?;
+    let composed = crate::model_timing::measure_sync("client_compose", || {
+        compose(topology, &permissions, client)
+    })?;
+    crate::model_timing::measure_sync("client_compile", || {
+        crate::compile_cache::compile_incremental(&composed)
+            .ensure_publishable()
+            .map_err(|blocked| {
+                let errors = blocked
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.level == brocade_core::Level::Error)
+                    .map(|diagnostic| {
+                        format!(
+                            "{} [{}]: {}",
+                            diagnostic.location, diagnostic.code, diagnostic.message
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                StoreError::InvalidData(format!(
+                    "subscription client config is invalid with {context}: {errors}"
+                ))
+            })
+    })?;
     Ok(())
 }
 

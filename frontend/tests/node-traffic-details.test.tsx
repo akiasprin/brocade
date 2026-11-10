@@ -510,6 +510,7 @@ it('includes forwarding in outflow totals and its own chart layer and expands it
   expect(within(ranking).getAllByRole('button')[0]).toBe(forwarding);
   expect(container.querySelector('.site-usage-total')?.textContent).toBe('200B');
   expect(container.querySelector('.site-usage-label')?.textContent).toContain('1 类站点 · 端口转发');
+  expect(screen.queryByText('站点采集可能有缺口')).toBeNull();
   expect(screen.queryByRole('button', { name: /其余.*类站点/ })).toBeNull();
   const expected = render(<Icon of="forwarding" size={18} />).container.querySelector('svg')!.innerHTML;
   expect(forwarding.querySelector('svg')?.innerHTML).toBe(expected);

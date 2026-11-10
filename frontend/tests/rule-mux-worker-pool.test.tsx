@@ -115,8 +115,8 @@ function renderEditor(pool: HopPool = { t: 'none' }, readOnly = false) {
 
 function connectionSelect(view: ReturnType<typeof renderEditor>) {
   const field = view.getByText('连接复用').closest('.hopfld');
-  const select = field?.querySelector('[role=combobox]');
-  if (!(select instanceof HTMLButtonElement)) throw new Error('没有找到出站连接选择器');
+  const select = field?.querySelector('select');
+  if (!(select instanceof HTMLSelectElement)) throw new Error('没有找到出站连接选择器');
   return select;
 }
 
@@ -230,10 +230,9 @@ describe('规则页 Mux Worker 池', () => {
 
     const panel = view.container.querySelector('.hop-target-panel');
     expect(panel).not.toBeNull();
-    expect(panel?.querySelectorAll('.rule-connection-path')).toHaveLength(1);
-    expect(panel?.textContent?.replace(/\s+/g, '')).toContain(
-      '端口开在新加坡中继，连接由香港入口发起；目标端口必须唯一。',
-    );
+    // 拨号跟在规则的目标后面；「下一跳」只放目标一侧的端口、承载、复用，不再附说明段落。
+    expect(view.container.querySelectorAll('.rule-table .rule-dial-select')).toHaveLength(2);
+    expect(panel?.querySelector('p')).toBeNull();
 
     expect(connectionSelect(view).value).toBe('none');
     changeControl(connectionSelect(view), { target: { value: 'mux' } });
@@ -242,7 +241,7 @@ describe('规则页 Mux Worker 池', () => {
     const muxSummary = view.getByText('Mux 参数').closest('.hop-target-mux');
     expect(muxSummary?.classList.contains('hopfld')).toBe(true);
     expect(muxSummary?.textContent).toContain('Mux 参数跟随全局配置参数');
-    expect(panel?.textContent).toContain('“跟随全局”只继承参数，不与其他边共池。');
+    expect(panel?.querySelector('p')).toBeNull();
     expect(panel?.textContent).not.toContain('发布会重启受影响的 Xray');
     expect(view.container.querySelector('.mux-drawer-grid')).toBeNull();
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));

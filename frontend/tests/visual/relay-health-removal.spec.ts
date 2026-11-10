@@ -13,9 +13,7 @@ for (const [width, theme] of [
       page.on('pageerror', error => errors.push(error.message));
       await page.clock.setFixedTime(new Date('2026-10-31T06:00:00Z'));
       await page.setViewportSize({ width, height: 900 });
-      await page.goto(
-        `/tests/fixtures/node-list-preview.html?scene=typical&theme=${theme}#/nodes/node/${nodeId}`,
-      );
+      await page.goto(`/tests/fixtures/node-list-preview.html?scene=typical&theme=${theme}#/nodes/node/${nodeId}`);
       const tab = page.getByRole('tab', { name: /^观测/ });
       await expect(tab).toBeVisible();
       await expect(tab.locator('.nd-tab-badge')).toHaveCount(badge ? 1 : 0);
@@ -23,6 +21,12 @@ for (const [width, theme] of [
       await page.evaluate(() => document.fonts.ready);
       await expect(page.locator('.nd-tabs')).toHaveScreenshot(`observation-tabs-${width}-${theme}-${badge}.png`);
       const runtime = page.locator('.nd-runtime');
+      const cube = runtime.getByText(nodeId === 'hk-hkix' ? 'CUBE[KVM]' : 'CUBE', { exact: true });
+      await expect(cube).toBeVisible();
+      await expect(cube).toHaveAttribute(
+        'title',
+        nodeId === 'hk-hkix' ? 'CUBE[KVM] 扩展 · 已启用' : 'CUBE 扩展 · 未启用',
+      );
       await runtime.scrollIntoViewIfNeeded();
       await expect(runtime.locator(':scope > header')).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
       await expect(runtime.locator(':scope > header')).toHaveCSS('border-bottom-width', '0px');
@@ -31,4 +35,55 @@ for (const [width, theme] of [
       expect(errors).toEqual([]);
     });
   }
+}
+
+for (const [width, theme] of [
+  [1440, 'dark'],
+  [390, 'light'],
+] as const) {
+  for (const cubeState of ['unmanaged', 'error'] as const) {
+    test(`optional CUBE ${cubeState} at ${width}px ${theme}`, async ({ page }) => {
+      await page.clock.setFixedTime(new Date('2026-10-31T06:00:00Z'));
+      await page.setViewportSize({ width, height: 900 });
+      await page.goto(
+        `/tests/fixtures/node-list-preview.html?scene=typical&theme=${theme}&cube=${cubeState}#/nodes/node/hk-hkix`,
+      );
+      const extensions = page
+        .locator('.nd-runtime .nd-rt-c')
+        .filter({ has: page.getByText('扩展应用', { exact: true }) });
+      const cube = extensions.getByText(cubeState === 'unmanaged' ? 'CUBE' : 'CUBE[KVM]', { exact: true });
+      await expect(cube).toHaveAttribute(
+        'title',
+        cubeState === 'unmanaged'
+          ? 'CUBE 扩展 · 未启用'
+          : 'CUBE[KVM] 扩展 · 执行能力异常：CVM Rust executor configuration is unavailable',
+      );
+      await expect(cube).toHaveClass(new RegExp(cubeState === 'unmanaged' ? 'st-skipped' : 'st-halted'));
+      await expect(extensions.getByText('OPENVPN', { exact: true })).toBeVisible();
+      await expect(cube).toHaveCSS('font-family', /sans-serif/);
+      await expect(cube).not.toHaveCSS('font-family', /monospace/);
+      await page.evaluate(() => document.fonts.ready);
+      await expect(extensions).toHaveScreenshot(`extensions-${cubeState}-${width}-${theme}.png`);
+    });
+  }
+}
+
+for (const [width, theme] of [
+  [1440, 'dark'],
+  [390, 'light'],
+] as const) {
+  test(`CUBE reports PVM at ${width}px ${theme}`, async ({ page }) => {
+    await page.clock.setFixedTime(new Date('2026-10-31T06:00:00Z'));
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto(`/tests/fixtures/node-list-preview.html?scene=typical&theme=${theme}&cube=pvm#/nodes/node/hk-hkix`);
+    const extensions = page
+      .locator('.nd-runtime .nd-rt-c')
+      .filter({ has: page.getByText('扩展应用', { exact: true }) });
+    await expect(extensions.getByText('CUBE[PVM]', { exact: true })).toHaveAttribute(
+      'title',
+      'CUBE[PVM] 扩展 · 已启用',
+    );
+    await page.evaluate(() => document.fonts.ready);
+    await expect(extensions).toHaveScreenshot(`extensions-pvm-${width}-${theme}.png`);
+  });
 }

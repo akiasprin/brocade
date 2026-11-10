@@ -57,7 +57,7 @@ test('所有页面只能复用机器、线路和用户页的三种面板骨架',
   const nodes = readFileSync(new URL('../src/panes/nodes.tsx', import.meta.url), 'utf8');
   assert.match(
     nodes,
-    /<header className="nd-page-head">[\s\S]*?<span className="cg-plate">[\s\S]*?<h1 className="nd-id nd-name">机器<\/h1>/,
+    /<header className="nd-page-head"[^>]*>[\s\S]*?<span className="cg-plate">[\s\S]*?<h1 className="nd-id nd-name">机器<\/h1>/,
   );
   assert.match(nodes, /className="fg-sheet nd-paper node-list-panel"/);
   const chains = panes.get('chains.tsx');

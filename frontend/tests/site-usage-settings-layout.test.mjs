@@ -17,6 +17,7 @@ before(async () => {
   cacheDirectory = await mkdtemp(join(tmpdir(), 'brocade-outflow-settings-'));
   server = await createServer({
     configFile: false,
+  define: { __BROCADE_CVM__: process.env.BROCADE_PRODUCT_FLAVOR !== 'base' },
     root: fileURLToPath(new URL('..', import.meta.url)),
     plugins: [react()],
     cacheDir: join(cacheDirectory, 'node_modules/.vite'),

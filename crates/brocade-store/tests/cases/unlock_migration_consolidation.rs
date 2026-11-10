@@ -129,7 +129,17 @@ async fn assert_channel_notifications_work(pool: &PgPool) {
             .await
             .unwrap();
     let xray_switch: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='nodes'::regclass AND attname='xray_enabled' AND NOT attisdropped)").fetch_one(pool).await.unwrap();
-    assert_eq!(triggers, 13 + i64::from(base) + i64::from(xray_switch));
+    let cvm: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM unnest(ARRAY['cvm_instances','cvm_nic_nodes','cvm_entry_nodes','cvm_user_host_network_quotas']) AS relation
+         WHERE to_regclass('public.' || relation) IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        triggers,
+        13 + i64::from(base) + i64::from(xray_switch) + cvm
+    );
     let mut listener = sqlx::postgres::PgListener::connect_with(pool)
         .await
         .unwrap();

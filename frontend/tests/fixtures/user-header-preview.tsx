@@ -1,6 +1,8 @@
 // Visual acceptance fixture: the production users pane with synthetic users only; no network access.
 // ?user=alice|carol|erin chooses the detail, ?role=system-admin|readonly|user the viewer, ?theme=dark|light,
 // ?presence=sources gives alice online and recent sources (one of them banned) instead of an empty presence.
+// ?subscription=deferred holds subscription/node responses until released; &subscriptionError returns an error.
+// ?haitun=active includes a synthetic administrator-only speed-test subscription.
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { AdminRole, ConsoleSnapshot, SnapshotIngress, UserListItem, UserOnlineSource } from '../../src/api';
@@ -12,6 +14,7 @@ import '../../src/styles.css';
 
 const params = new URLSearchParams(location.search);
 if (theme.snapshot() !== (params.get('theme') === 'light' ? 'light' : 'dark')) theme.toggle();
+Object.defineProperty(window, '__userPreviewToggleTheme', { value: () => theme.toggle() });
 document.documentElement.dataset.palette = params.get('palette') === 'jinzi' ? 'jinzi' : 'dailan';
 const role = (params.get('role') ?? 'system-admin') as AdminRole;
 const selected = params.get('user') ?? 'alice';
@@ -94,8 +97,9 @@ const presenceSource = (
   online: boolean,
   gib: number,
 ): UserOnlineSource => {
-  const last = new Date(Date.now() - (online ? 0.3 : minutesAgo) * MINUTE).toISOString();
-  const since = new Date(Date.now() - minutesAgo * MINUTE - (online ? 0 : 50 * MINUTE)).toISOString();
+  const now = Date.now();
+  const last = new Date(now - (online ? 0.3 : minutesAgo) * MINUTE).toISOString();
+  const since = new Date(now - minutesAgo * MINUTE - (online ? 0 : 50 * MINUTE)).toISOString();
   const access = {
     node_id: 'n1',
     ingress_id: `in-${chain}`,
@@ -236,7 +240,19 @@ client.setQueryData(['user-cycles'], {
     starts_at: '2026-09-30T16:00:00Z',
     ends_at: '2026-10-31T16:00:00Z',
   })),
-  forwarding: [],
+  forwarding: params.has('forwardingUsage')
+    ? [
+        {
+          tenant_id: tenant,
+          user_id: selected,
+          node_id: 'n1',
+          rule_id: 1,
+          uplink_bytes: GiB,
+          downlink_bytes: 4 * GiB,
+          has_gap: false,
+        },
+      ]
+    : [],
   traffic_policies: users.flatMap(user =>
     snapshot.snapshot.apps.map(app => ({
       tenant_id: tenant,
@@ -263,8 +279,74 @@ client.setQueryData(['user-cycles'], {
 });
 if (role === 'user') client.setQueryData(['me-user'], users[0]);
 const empty = { rows: [], series: [], sources: [], entitlements: [], rules: [], nodes: [] };
+const subscriptionUrl = 'https://sub.example.test/sub/v1/00000000-0000-4000-8000-000000000000/clash.yaml';
+const pendingSubscriptions: (() => void)[] = [];
+Object.defineProperty(window, '__userPreviewResolveSubscriptions', {
+  value: () => {
+    const pending = pendingSubscriptions.splice(0);
+    pending.forEach(resolve => resolve());
+    return pending.length;
+  },
+});
+const subscriptionResponse = (body: unknown) => {
+  const response = () =>
+    params.has('subscriptionError')
+      ? Response.json({ error: '订阅暂时不可用，请稍后重试' }, { status: 503 })
+      : Response.json(body);
+  return params.get('subscription') === 'deferred'
+    ? new Promise<Response>(resolve => pendingSubscriptions.push(() => resolve(response())))
+    : response();
+};
 globalThis.fetch = async (input, init) => {
   const path = String(input);
+  const url = new URL(path, location.origin);
+  if (url.pathname === '/revisions') return Response.json({ current_revision: 1, revisions: [] });
+  if (url.pathname.endsWith('/clash-subscription'))
+    return subscriptionResponse({
+      url: subscriptionUrl,
+      urls: { both: subscriptionUrl, v4: `${subscriptionUrl}?family=v4`, v6: `${subscriptionUrl}?family=v6` },
+      template: 'SubBoost 标准版',
+      haitun:
+        params.get('haitun') === 'active'
+          ? {
+              template: 'koipy 测速',
+              status: 'active',
+              urls: {
+                both: subscriptionUrl.replace('/sub/v1/', '/sub/v1/haitun/'),
+                v4: subscriptionUrl.replace('/sub/v1/', '/sub/v1/haitun/') + '?family=v4',
+                v6: subscriptionUrl.replace('/sub/v1/', '/sub/v1/haitun/') + '?family=v6',
+              },
+              created_at: '2026-10-01T00:00:00Z',
+              revoked_at: null,
+            }
+          : null,
+      remaining_bytes: 379 * GiB,
+      reset_at: '2026-10-31T16:00:00Z',
+      expires_at: null,
+      usage_has_gap: false,
+    });
+  if (url.pathname.startsWith('/artifacts/content/user/') || url.pathname === '/me/artifact') {
+    const family = url.searchParams.get('family');
+    const protocol = url.searchParams.get('protocol');
+    const content = Array.from({ length: 18 }, (_, index) => {
+      const name = encodeURIComponent(`示例节点 ${String(index + 1).padStart(2, '0')}`);
+      const host = family === 'v6' ? `[2001:db8::${index + 1}]` : `192.0.2.${index + 1}`;
+      return protocol === 'anytls'
+        ? `anytls://fixture@${host}:8443?sni=node.example.test#${name}`
+        : `vless://00000000-0000-4000-8000-000000000000@${host}:443?encryption=none&type=tcp&security=reality&sni=node.example.test&fp=chrome&pbk=fixture&sid=01#${name}`;
+    }).join('\n');
+    return subscriptionResponse({
+      revision: 1,
+      target_kind: 'user',
+      target_id: `${tenant}:${selected}`,
+      artifact_kind: 'uri',
+      state: 'present',
+      sha256: 'a'.repeat(64),
+      byte_len: content.length,
+      content,
+      redacted: false,
+    });
+  }
   if (path.endsWith('/source-access') && (!init?.method || init.method === 'GET'))
     return Response.json(client.getQueryData(['source-access', path]));
   if (path.endsWith('/traffic-policy'))

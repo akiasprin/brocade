@@ -447,6 +447,16 @@ pub fn plan_deployment(
     applied: &[NodeAppliedState],
 ) -> Result<DeploymentPlan, PlanError> {
     let output = compile::compile(snapshot);
+    plan_compiled_deployment(snapshot, &output, applied)
+}
+
+/// Plan against fresh observations while reusing the compilation of this exact snapshot.
+/// Callers must compile `output` from `snapshot`; runtime applied state is never cached here.
+pub fn plan_compiled_deployment(
+    snapshot: &ModelSnapshot,
+    output: &compile::CompileOutput,
+    applied: &[NodeAppliedState],
+) -> Result<DeploymentPlan, PlanError> {
     output
         .ensure_publishable()
         .map_err(PlanError::PublishBlocked)?;

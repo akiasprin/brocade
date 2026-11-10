@@ -1,6 +1,7 @@
 import { cleanup, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { NodeAgentStateItem } from '../src/api';
+import { cvmWorkspace } from './fixtures/cvm/data';
 
 let runtimeFindings: typeof import('../src/panes/nodes').runtimeFindings;
 let runtimeFindingAttentionCount: typeof import('../src/panes/nodes').runtimeFindingAttentionCount;
@@ -274,4 +275,94 @@ describe('OpenVPN runtime status', () => {
     expect(chip.classList.contains('nd-rt-chip')).toBe(true);
     expect(chip.getAttribute('title')).toBe(title);
   });
+});
+
+describe('CUBE extension display', () => {
+  it.each(['ready', 'stale', 'error', 'missing', 'unmanaged'] as const)(
+    'uses the actual Cube inventory (%s)',
+    state => {
+      const value = node(false);
+      const host = cvmWorkspace('detail').hosts[0];
+      if (state === 'stale') host.fresh = false;
+      if (state === 'error') host.error = 'Cubelet 无法连接';
+      if (state === 'unmanaged') {
+        host.capabilities.backend = '';
+        host.error = 'CVM Rust executor configuration is unavailable';
+        host.fresh = false;
+      }
+      render(
+        <AppliedCard
+          node={value}
+          revisionOf={() => undefined}
+          cubeHost={state === 'missing' ? undefined : host}
+          cubeStatus="ready"
+        />,
+      );
+      const chip = screen.getByText(state === 'missing' || state === 'unmanaged' ? 'CUBE' : 'CUBE[KVM]');
+      expect(chip.classList.contains('nd-rt-chip')).toBe(true);
+      expect(chip.getAttribute('title')).toBe(
+        {
+          ready: 'CUBE[KVM] 扩展 · 已启用',
+          stale: 'CUBE[KVM] 扩展 · 能力报告已过期',
+          error: 'CUBE[KVM] 扩展 · 执行能力异常：Cubelet 无法连接',
+          missing: 'CUBE 扩展 · 未启用',
+          unmanaged: 'CUBE 扩展 · 未启用',
+        }[state],
+      );
+      expect(screen.getByText('OPENVPN')).toBeTruthy();
+      if (state === 'unmanaged' || state === 'missing') {
+        expect(chip.classList.contains('st-skipped')).toBe(true);
+        expect(chip.querySelector('svg circle')).toBeNull();
+      }
+    },
+  );
+
+  it.each([
+    ['cube-kvm', 'CUBE[KVM]'],
+    ['cube-kvm-v1', 'CUBE[KVM]'],
+    ['cube-kvm-v2', 'CUBE[KVM]'],
+    ['cube-pvm', 'CUBE[PVM]'],
+    ['cube-pvm-v1', 'CUBE[PVM]'],
+    ['cube-qemu', 'CUBE[QEMU]'],
+    ['cube-custom-v2', 'CUBE[CUSTOM-V2]'],
+    ['cube', 'CUBE'],
+  ])('displays the reported backend %s as %s', (backend, label) => {
+    const host = cvmWorkspace('detail').hosts[0];
+    host.capabilities.backend = backend;
+    render(<AppliedCard node={node(false)} revisionOf={() => undefined} cubeHost={host} cubeStatus="ready" />);
+    const chip = screen.getByText(label);
+    expect(chip.getAttribute('title')).toBe(`${label} 扩展 · 已启用`);
+  });
+
+  it('keeps a reserved instance in scope when its Cube capabilities are unavailable', () => {
+    const host = cvmWorkspace('detail').hosts[0];
+    host.capabilities.backend = '';
+    host.error = 'Cubelet 无法连接';
+    host.fresh = false;
+    render(
+      <AppliedCard node={node(false)} revisionOf={() => undefined} cubeHost={host} cubeStatus="ready" cubeExpected />,
+    );
+    const chip = screen.getByText('CUBE');
+    expect(chip.getAttribute('title')).toBe('CUBE 扩展 · 执行能力异常：Cubelet 无法连接');
+    expect(chip.classList.contains('st-halted')).toBe(true);
+  });
+
+  it('does not infer a running Cube backend from a reserved instance alone', () => {
+    const host = cvmWorkspace('detail').hosts[0];
+    host.capabilities.backend = '';
+    render(
+      <AppliedCard node={node(false)} revisionOf={() => undefined} cubeHost={host} cubeStatus="ready" cubeExpected />,
+    );
+    const chip = screen.getByText('CUBE');
+    expect(chip.getAttribute('title')).toBe('CUBE 扩展 · 尚未确认运行栈');
+    expect(chip.classList.contains('st-pending')).toBe(true);
+  });
+
+  it.each(['pending', 'error'] as const)(
+    'does not infer an installation state while the capability query is %s',
+    status => {
+      render(<AppliedCard node={node(false)} revisionOf={() => undefined} cubeStatus={status} />);
+      expect(screen.getByText('CUBE').classList.contains('st-pending')).toBe(true);
+    },
+  );
 });

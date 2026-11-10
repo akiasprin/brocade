@@ -1,4 +1,4 @@
-import { useId, useState, type CSSProperties, type FormEvent } from 'react';
+import { useId, useState, type FormEvent } from 'react';
 import { InlineField } from '../ui/inline-field';
 import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import {
@@ -12,7 +12,7 @@ import {
 import { ErrorBox, SegmentedControl } from '../ui/bits';
 import { useSession, isPublic } from '../session';
 import { useUnsavedChanges } from '../ui/navigation-guard';
-import './user-traffic-policy.css';
+import { UserQuotaMeter } from './user-usage';
 
 export const userTrafficPolicyKey = (user: Pick<UserListItem, 'tenant_id' | 'id'>) =>
   ['user-traffic-policy', user.tenant_id, user.id] as const;
@@ -105,28 +105,7 @@ export function UserTrafficQuotaMeter({
       )}
     </span>
   );
-  if (limit === null || used === null) return status ? <span className="qta-policy-only">{status}</span> : null;
-  const pct = (used / limit) * 100;
-  const overflow = used > limit;
-  const share = overflow ? limit / used : 1;
-  const fill = overflow ? 100 : Math.min(100, Math.max(used > 0 ? 1 : 0, pct));
-  return (
-    <span className="qta-meter qta-quota-meter">
-      <span
-        className={`qta-meter-run${status ? ' has-policy' : ''} ${tone}`}
-        style={{ '--at': `${share * 100}%`, '--at-cqi': `${share * 100}cqi` } as CSSProperties}
-      >
-        <span className="qta-meter-track" aria-hidden="true">
-          <span className="qta-t" style={{ flexGrow: share }}>
-            <i style={{ width: `${fill}%` }} />
-          </span>
-          {overflow && <span className="qta-overflow" style={{ flexGrow: 1 - share }} />}
-        </span>
-        {status}
-      </span>
-      <span className="qta-pct">{pct.toFixed(0)}%</span>
-    </span>
-  );
+  return <UserQuotaMeter used={used} limit={limit} status={status} tone={tone} />;
 }
 export function UserAppTrafficPolicyEditor({
   user,

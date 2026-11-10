@@ -3,10 +3,10 @@ import { test, expect } from '@playwright/test';
 const scenes = [
   {
     key: 'configuration',
-    route: 'node-source-access-preview.html?scene=mixed',
+    route: 'node-source-access-preview.html?scene=typical',
     card: '.source-access-panel',
-    header: 'summary',
-    statistic: '.config-disclosure-summary',
+    header: 'header',
+    statistic: '.header-stat',
     title: '来源 IP 封禁',
   },
   {
@@ -77,9 +77,10 @@ for (const [browserName, width] of [
         else await expect(statistic).toBeVisible();
         if (scene.title) await expect(header.getByRole('heading', { name: scene.title, exact: true })).toBeVisible();
         if (scene.key === 'configuration') {
-          await header.click();
-          await expect(card.getByRole('heading', { name: '用户级封禁 · 3 条' })).toBeVisible();
-          await expect(header.getByText('收起', { exact: true })).toBeVisible();
+          const users = card.locator('.source-access-userbar-toggle');
+          await users.click();
+          await expect(users).toHaveAttribute('aria-expanded', 'true');
+          await expect(card.getByRole('list', { name: '用户封禁', exact: true })).toBeVisible();
         } else if (scene.key === 'rules') {
           await expect(header.getByRole('button', { name: '从节点导入', exact: true })).toBeVisible();
           await expect(header.getByRole('button', { name: /添加/ })).toBeVisible();

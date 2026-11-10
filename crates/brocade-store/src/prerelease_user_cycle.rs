@@ -6,6 +6,7 @@ use sqlx::{Postgres, Transaction};
 const PUBLISHED_SECOND: &str = "54300599c9b4cce71f9e574b3f43141fee2fbd50279f829feda08f537bcde441a725ff1af4e0fbbf96fb9d80966552f1";
 const MISPLACED_SECOND: &str = "a28f8fca174df0c854d77581b7cf3f73e85e9df99dbf65e54eed7d8536420a3dc43389948cfdfbfd2d5f003fb32ec7db";
 const PRE_RESET_THIRD: &str = "0c8f0c30cb8cfc07fead32837a7090b13f4ef5bd8e812c9a6c4818db370bfcc8e937ea7562209955aa96c94eb3a12347";
+const TARGET_PRE_RESET_THIRD: &str = "79acc89d22c5994458adfb4236a85e5bcf387575e3439ea2065d1d54b0fa440165a2155d2168932ebea38b824ff0e06d";
 const BOUNDARY: &str = "\n-- BEGIN USER CYCLE RESET\n";
 // Exact catalog shapes of the same reviewed DDL: PostgreSQL 18 additionally records NOT NULL
 // constraints in pg_constraint. Keep their validation metadata in the check. Both shapes exclude
@@ -72,7 +73,7 @@ fn conversion() -> Result<(&'static str, String)> {
         .split_once(BOUNDARY)
         .ok_or_else(|| StoreError::InvalidData("0003 缺少本期归零边界".into()))?;
     if format!("{:x}", Sha384::digest(second.sql.as_bytes())) != PUBLISHED_SECOND
-        || format!("{:x}", Sha384::digest(prefix.as_bytes())) != PRE_RESET_THIRD
+        || format!("{:x}", Sha384::digest(prefix.as_bytes())) != TARGET_PRE_RESET_THIRD
         || format!(
             "{:x}",
             Sha384::digest(format!("{}{BOUNDARY}{suffix}", second.sql))
@@ -226,6 +227,7 @@ impl PgStore {
                 "归零结构验证失败，未更新迁移回执".into(),
             ));
         }
+        crate::settings::migrate_unlock_detection_defaults(&mut tx).await?;
         for migration in MIGRATOR.iter().filter(|m| matches!(m.version, 2 | 3)) {
             sqlx::query("UPDATE _sqlx_migrations SET checksum=$1 WHERE version=$2")
                 .bind(migration.checksum.as_ref())

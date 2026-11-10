@@ -13,11 +13,12 @@ use brocade_core::model::{
     RealitySettings, RealitySite, Transport,
 };
 use brocade_deployment::plan::{
-    grants_match, narrow_to_kind, plan_deployment as plan_snapshot_deployment,
-    plan_desired_deployment, plan_forced_deployment as plan_forced_snapshot_deployment,
-    AppliedArtifactState, AppliedGrantsState, ConfigArtifact, DeploymentKind, DeploymentPlan,
-    DesiredArtifact, DesiredGrants, NodeAppliedState, NodeDesiredState, ObservedInbound,
-    PlanDiagnostic, PlannedAction, PlannedTarget, PlannedTargetStatus,
+    grants_match, narrow_to_kind, plan_compiled_deployment,
+    plan_deployment as plan_snapshot_deployment, plan_desired_deployment,
+    plan_forced_deployment as plan_forced_snapshot_deployment, AppliedArtifactState,
+    AppliedGrantsState, ConfigArtifact, DeploymentKind, DeploymentPlan, DesiredArtifact,
+    DesiredGrants, NodeAppliedState, NodeDesiredState, ObservedInbound, PlanDiagnostic,
+    PlannedAction, PlannedTarget, PlannedTargetStatus,
 };
 use brocade_deployment::protocol::{
     ConfigXrayForceRetirementResult, CreateDeploymentRequest, CreateDeploymentResult,
@@ -109,10 +110,39 @@ pub(crate) async fn plan_full_deployment(
 }
 
 async fn plan_deployment_unscoped(pool: &PgPool, revision_id: u64) -> Result<DeploymentPlan> {
-    let snapshot = load_snapshot_for_deployment(pool, revision_id).await?;
-    let mut applied = load_applied_states(pool).await?;
-    attach_running_xray(pool, &mut applied).await?;
-    let mut plan = plan_snapshot_deployment(&snapshot, &applied).map_err(plan_error)?;
+    let snapshot = crate::model_timing::measure(
+        "deployment_load_snapshot",
+        load_snapshot_for_deployment(pool, revision_id),
+    )
+    .await?;
+    let mut applied =
+        crate::model_timing::measure("deployment_load_applied", load_applied_states(pool)).await?;
+    crate::model_timing::measure(
+        "deployment_attach_running",
+        attach_running_xray(pool, &mut applied),
+    )
+    .await?;
+    let output = crate::model_timing::measure(
+        "deployment_compile_model",
+        crate::compile_cache::compile_snapshot(&snapshot),
+    )
+    .await?;
+    static PLAN_CPU: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let permit = crate::model_timing::measure("deployment_cpu_permit", PLAN_CPU.acquire())
+        .await
+        .map_err(|_| StoreError::Unavailable("deployment CPU worker is closed".to_owned()))?;
+    let plan_snapshot = snapshot.clone();
+    let mut plan = crate::model_timing::measure("deployment_compile_plan", async move {
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            plan_compiled_deployment(&plan_snapshot, &output, &applied).map_err(plan_error)
+        })
+        .await
+        .map_err(|error| {
+            StoreError::Unavailable(format!("deployment planning task failed: {error}"))
+        })?
+    })
+    .await?;
     let serving_revision = sqlx::query_scalar::<_, i64>(
         "SELECT topology_revision_id FROM subscription_serving_state WHERE id = TRUE",
     )
@@ -478,7 +508,11 @@ pub async fn create_deployment(
         scope_plan(
             pool,
             actor,
-            plan_deployment_unscoped(pool, request.revision_id).await?,
+            crate::model_timing::measure(
+                "deployment_plan",
+                plan_deployment_unscoped(pool, request.revision_id),
+            )
+            .await?,
         )
         .await?,
         request.kind,
@@ -497,9 +531,13 @@ pub async fn create_deployment(
         ));
     }
 
-    let mut tx = pool.begin().await?;
-    let result = create_from_plan_tx(&mut tx, request, plan).await?;
-    tx.commit().await?;
+    let mut tx = crate::model_timing::measure("pool_begin", pool.begin()).await?;
+    let result = crate::model_timing::measure(
+        "deployment_persist",
+        create_from_plan_tx(&mut tx, request, plan),
+    )
+    .await?;
+    crate::model_timing::measure("commit_tx", tx.commit()).await?;
     Ok(result)
 }
 
@@ -4410,6 +4448,7 @@ async fn restore_model_snapshot_tx(
     revision_id: u64,
     snapshot: &ModelSnapshot,
 ) -> Result<()> {
+    crate::resource_coordination::lock(tx).await?;
     // Provider control tokens are operational state and intentionally absent from model
     // snapshots. Preserve one when the target restores the exact same Cloudflare device.
     let warp_binding_tokens = load_warp_binding_tokens_tx(tx).await?;
@@ -5924,7 +5963,7 @@ async fn load_snapshot_for_deployment(
     pool: &PgPool,
     revision_id: u64,
 ) -> Result<brocade_core::model::ModelSnapshot> {
-    materialize::load_snapshot(pool, Some(revision_id)).await
+    materialize::load_deployment_snapshot(pool, revision_id).await
 }
 
 async fn load_applied_states<'e, E>(executor: E) -> Result<Vec<NodeAppliedState>>
@@ -6168,11 +6207,20 @@ async fn load_resigned_environment_desired_connection(
     connection: &mut PgConnection,
     node_id: &str,
 ) -> Result<Option<NodeDesiredDeployment>> {
-    let claim_generation = sqlx::query_scalar::<_, i64>(
+    let recovery = sqlx::query(
         "SELECT GREATEST(
                     1,
                     floor(extract(epoch FROM agent.token_created_at) * 1000000)::bigint
-                )
+                ) AS claim_generation,
+                agent.usage_generation_id,
+                applied.source_deployment_id,
+                jsonb_build_object(
+                    'phantun', applied.phantun_observed->'previous_state',
+                    'wireguard', applied.wireguard_observed->'previous_state',
+                    'xray', applied.xray_observed->'previous_state',
+                    'hy2_port_hop', applied.hy2_port_hop_observed->'previous_state',
+                    'grants', applied.grants_observed->'previous_state'
+                ) AS previous_states
            FROM node_agent_state agent
            JOIN node_lifecycle_state lifecycle
              ON lifecycle.node_id = agent.node_id
@@ -6185,9 +6233,14 @@ async fn load_resigned_environment_desired_connection(
     .bind(node_id)
     .fetch_optional(&mut *connection)
     .await?;
-    let Some(claim_generation) = claim_generation else {
+    let Some(recovery) = recovery else {
         return Ok(None);
     };
+    let claim_generation: i64 = recovery.try_get("claim_generation")?;
+    let previous_states: Value = recovery.try_get("previous_states")?;
+    let previously_disabled =
+        |field| previous_states.get(field).and_then(Value::as_str) == Some("disabled");
+    let disabled_reason = "重签恢复此前已确认的停用状态";
 
     let unmanaged = || DesiredArtifact::Unmanaged {
         reason: "该产物没有成功落地记录，重签对齐不猜测草稿状态".to_owned(),
@@ -6204,19 +6257,38 @@ async fn load_resigned_environment_desired_connection(
     let mut source_deployments = Vec::new();
     let mut xray_source = None;
     for artifact in ConfigArtifact::ALL {
-        let Some((deployment_id, artifact_desired)) =
-            load_last_successful_artifact(connection, node_id, artifact).await?
-        else {
-            continue;
+        let (source, mut artifact_desired) =
+            match load_last_successful_artifact(connection, node_id, artifact).await? {
+                Some((deployment_id, desired)) => (Some(deployment_id), desired),
+                None if previously_disabled(artifact.field()) => (
+                    None,
+                    DesiredArtifact::Disabled {
+                        reason: disabled_reason.to_owned(),
+                    },
+                ),
+                None => continue,
+            };
+        // An acknowledged stop is authoritative even if legacy narrow targets omitted it.
+        // Unknown dimensions stay unmanaged; the editable model is never a recovery source.
+        if previously_disabled(artifact.field())
+            && !matches!(artifact_desired, DesiredArtifact::Disabled { .. })
+        {
+            artifact_desired = DesiredArtifact::Disabled {
+                reason: disabled_reason.to_owned(),
+            };
+        }
+        if let Some(deployment_id) = source {
+            source_deployments.push(deployment_id);
+            if artifact == ConfigArtifact::Xray {
+                xray_source = Some(deployment_id);
+            }
         };
-        source_deployments.push(deployment_id);
         match artifact {
             ConfigArtifact::Phantun => desired.phantun = artifact_desired,
             ConfigArtifact::Hy2PortHop => desired.hy2_port_hop = artifact_desired,
             ConfigArtifact::WireGuard => desired.wireguard = artifact_desired,
             ConfigArtifact::Xray => {
                 desired.xray = artifact_desired;
-                xray_source = Some(deployment_id);
             }
         }
     }
@@ -6224,7 +6296,15 @@ async fn load_resigned_environment_desired_connection(
         source_deployments.push(deployment_id);
         desired.grants = grants;
     }
-    let Some(deployment_id) = xray_source.or_else(|| source_deployments.into_iter().max()) else {
+    if previously_disabled("grants") && !matches!(desired.grants, DesiredGrants::Disabled { .. }) {
+        desired.grants = DesiredGrants::Disabled {
+            reason: disabled_reason.to_owned(),
+        };
+    }
+    let Some(deployment_id) = xray_source
+        .or_else(|| source_deployments.into_iter().max())
+        .or(recovery.try_get("source_deployment_id")?)
+    else {
         return Ok(None);
     };
     let xray_config_update_policy = if let Some(source_id) = xray_source {
@@ -6284,7 +6364,9 @@ async fn load_resigned_environment_desired_connection(
         wave: 0,
         actions,
         xray_config_update_policy,
-        usage_generation_id: None,
+        // The active namespace may belong to a newer grants-only release than the Xray source.
+        // Reuse its acknowledged ownership map; rebuilding one would risk relabeling traffic.
+        usage_generation_id: recovery.try_get("usage_generation_id")?,
         phantun_binary: None,
         desired,
     }))

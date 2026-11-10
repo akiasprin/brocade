@@ -71,8 +71,8 @@
     padding: 12px;
   }
   .node-usage-actions > .node-usage-close {
-    width: 44px;
-    min-height: 44px;
+    width: var(--mobile-control-h);
+    min-height: var(--mobile-control-h);
   }
 }
 @media (max-width: 620px) {
@@ -543,8 +543,8 @@
 }
 @media (pointer: coarse) {
   .node-inflow-dialog .node-usage-close {
-    width: 44px;
-    min-height: 44px;
+    width: var(--mobile-control-h);
+    min-height: var(--mobile-control-h);
   }
 }
 .nt-details > .panel {

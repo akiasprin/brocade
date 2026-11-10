@@ -278,7 +278,7 @@ export default function SiteUsageChart({
               bucket + 1 <= unobservedTo
                 ? '未观测'
                 : uncertainBeforeUnixSecs !== null && startUnixSecs + bucket * bucketSecs < uncertainBeforeUnixSecs
-                  ? '无记录 · 采集可能不完整'
+                  ? '无记录'
                   : '无流量';
             return `<div style="color:${ink4};font-size:9.5px;margin-bottom:4px">${head}</div>${rows || empty}`;
           },

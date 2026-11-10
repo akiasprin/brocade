@@ -70,6 +70,15 @@ Console 执行慢。派发响应丢失后的重领与新旧版本兼容行为见
 
 可重复 Docker 注入入口及覆盖边界见[交接故障验证](../../scripts/tests/xray-faults/README.md)。
 
+### SS2022 中转配置启动后回滚
+
+配置切换为 SS2022 后报 `handoff listener group is incomplete, unsupported or closed`，
+先对照候选 `xray.next.json` 的 `settings.network` 和失败代际 `manifest.json` 的监听清单。
+SS2022 中转使用 `tcp,udp`，即使 `streamSettings.network` 为 `tcp`，也会在同一端口开启
+原生 UDP 监听。旧 Agent 只按传输层识别 TCP，漏登 UDP，导致 Xray 拒绝 seal 并恢复旧配置。
+更新包含此修复的 Agent 后重试原配置发布；此问题不需要修改密钥、模型修订或升级 Xray。
+验收须确认清单和运行状态同时包含该端口的 TCP、UDP，且代际已 ready、accepting。
+
 ### 机器尖峰流量归属
 
 从「用量 → 实时 → 机器弹层」定位所选区间内的尖峰，拖选图表或在「统计 → 自定义」输入 UTC+8
@@ -87,6 +96,14 @@ Console 执行慢。派发响应丢失后的重领与新旧版本兼容行为见
 流出目标仍按小时保存，自选区间会扩大到覆盖所选时段的小时并标明实际范围；域名/IP 明细还受
 其独立保留期和 Top-N 限制。当前不能把来源 IP 与目标排行认定为同一条连接；中继和落地机器
 也不提供最终用户身份，应回到链头入口排查。生产升级前参考 `console-deployment.md` 的来源观测表兼容步骤。
+
+### 草稿预览或提交卡住
+
+先区分连接池等待、事务锁等待与编译计算。若 PostgreSQL 的死锁图同时出现
+`pg_advisory_xact_lock(1112687438,65)` 和 `control_state ... FOR UPDATE`，检查模型写入口
+是否统一先取得网络资源锁、再取得模型行锁。预览最终回滚也会在执行期间持锁，不能把它当作
+普通只读查询。公共模型取锁入口覆盖预览、提交、直接编辑、回滚及纳管；底层操作再次取得
+同一事务锁不改变此顺序。不要用增加连接池或无限重试代替修复反向取锁。
 
 ## 4. 控制影响
 

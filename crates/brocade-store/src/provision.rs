@@ -108,12 +108,12 @@ pub async fn provision_node(
     let input = NormalizedProvisionInput::from_request(request)?;
     let mut tx = pool.begin().await?;
     crate::deployment::initialization::lock_tx(&mut tx).await?;
+    crate::console::lock_control_state(&mut tx).await?;
 
     let state = sqlx::query(
         "SELECT overlay_cidr::text AS overlay_cidr
          FROM control_state
-         WHERE id = TRUE
-         FOR UPDATE",
+         WHERE id = TRUE",
     )
     .fetch_one(&mut *tx)
     .await?;

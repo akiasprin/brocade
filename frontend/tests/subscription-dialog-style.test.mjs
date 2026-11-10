@@ -40,20 +40,29 @@ test('订阅弹窗：拨测状态灯沿用 .cg-lamp，失败原因写在地址�
   assert.match(desktop, /\.sub-dialog-foot > span\.node-probe-tally::before\s*\{[^}]*content:\s*none;/);
 });
 
-test('订阅弹窗：窄屏与 useNarrow 同一断点，贴底成为面板，触屏目标放大', () => {
+test('订阅弹窗：窄屏与 useNarrow 同一断点，贴底面板使用紧凑控件', () => {
   assert.ok(narrowMax, 'ui/viewport.ts 定义 NARROW_MAX');
   assert.ok(narrow, `窄屏规则写在 @media (max-width: ${narrowMax}px)`);
-  assert.match(narrow, /\.dialog-layer\.modal:has\(> \.sub-dialog\)\s*\{[^}]*place-items:\s*end stretch;/);
+  assert.match(
+    styles,
+    /\.dialog-layer\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;[^}]*justify-content:\s*center;/,
+  );
+  assert.match(
+    narrow,
+    /\.dialog-layer\.modal:has\(> \.sub-dialog\)\s*\{[^}]*align-items:\s*stretch;[^}]*justify-content:\s*flex-end;/,
+  );
+  assert.match(styles, /--mobile-control-h:\s*36px;/);
+  assert.match(styles, /\.dialog-layer\s*\{[^}]*--ctl-h:\s*var\(--mobile-control-h\);/);
   assert.match(narrow, /\.dialog-surface\.sub-dialog\s*\{[^}]*border-radius:\s*16px 16px 0 0;/);
   assert.match(
     narrow,
     /\[data-motion-state='entering'\] > \.dialog-surface\.sub-dialog\s*\{\s*animation-name:\s*sub-sheet-in;/,
   );
   assert.match(narrow, /\.sub-dialog-foot\s*\{[^}]*var\(--safe-bottom\)/);
-  assert.match(narrow, /\.sub-url > button,\s*\.sub-url > \.sub-url-copy\s*\{[^}]*height:\s*44px;/);
-  assert.match(narrow, /\.node-copy\s*\{[^}]*height:\s*40px;/);
-  assert.match(narrow, /\.node-copy-all,\s*\.node-probe-all,\s*\.node-probe-retry\s*\{[^}]*height:\s*44px;/);
-  assert.match(narrow, /\.btn\.node-group-run\s*\{[^}]*min-height:\s*40px;/);
+  assert.match(narrow, /\.sub-url > button,\s*\.sub-url > \.sub-url-copy\s*\{[^}]*height:\s*var\(--ctl-h\);/);
+  assert.match(narrow, /\.node-copy\s*\{[^}]*height:\s*var\(--ctl-h\);/);
+  assert.match(narrow, /\.node-copy-all,\s*\.node-probe-all,\s*\.node-probe-retry\s*\{[^}]*height:\s*var\(--ctl-h\);/);
+  assert.match(narrow, /\.btn\.node-group-run\s*\{[^}]*min-height:\s*var\(--ctl-h\);/);
   // iOS 聚焦字号小于 16px 的表单控件会放大页面。
   assert.match(dialog, /\.sub-pick > select\s*\{[^}]*font-size:\s*16px;/);
 });

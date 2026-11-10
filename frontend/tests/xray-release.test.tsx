@@ -281,6 +281,8 @@ describe('Xray 升级', () => {
 
   it('进行中保持逐台状态，历史通过独立入口按需读取', async () => {
     const release: BinaryRelease = {
+  agent_flavor: null,
+  allow_flavor_change: false,
       id: 7,
       component: 'xray',
       build_id: RELEASE_ID,
@@ -359,6 +361,8 @@ describe('Xray 升级', () => {
 
   it('仅在当前发布中展示经过身份校验的双进程状态', () => {
     const release: BinaryRelease = {
+  agent_flavor: null,
+  allow_flavor_change: false,
       id: 17,
       component: 'xray',
       build_id: RELEASE_ID,
@@ -444,6 +448,8 @@ describe('Xray 升级', () => {
 
   it('一小时后把仍在执行的 handoff 标为整体超时但不伪造终态', () => {
     const release: BinaryRelease = {
+  agent_flavor: null,
+  allow_flavor_change: false,
       id: 18,
       component: 'xray',
       build_id: RELEASE_ID,
@@ -492,6 +498,8 @@ describe('Xray 升级', () => {
 
   it('同一次 handoff 仍上报双进程时不允许从页面重试', () => {
     const release: BinaryRelease = {
+  agent_flavor: null,
+  allow_flavor_change: false,
       id: 19,
       component: 'xray',
       build_id: RELEASE_ID,
@@ -576,6 +584,8 @@ describe('Xray 升级', () => {
     [true, true],
   ])('强制退役=%s、恢复=%s 的成功统一显示绿色已升级，真实异常恢复仍保留说明', (forced, recovered) => {
     const release: BinaryRelease = {
+  agent_flavor: null,
+  allow_flavor_change: false,
       id: 20,
       component: 'xray',
       build_id: RELEASE_ID,

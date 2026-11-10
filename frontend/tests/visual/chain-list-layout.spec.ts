@@ -174,9 +174,13 @@ test('a two-chain group keeps the common card width after a cross-group drop', a
   await page.mouse.move(to!.x + 160, to!.y + 20, { steps: 12 });
   await page.mouse.up();
   await expect(target.locator('.chain-card')).toHaveCount(2);
-  const reference = await page.locator('.chain-card-grid').first().locator('.chain-card').first().boundingBox();
-  for (const card of await target.locator('.chain-card').all()) {
-    const box = await card.boundingBox();
-    expect(box!.width).toBeCloseTo(reference!.width, 0);
-  }
+  // Cross-group FLIP animation can still be running when the second card mounts.
+  await expect
+    .poll(async () => {
+      const reference = await page.locator('.chain-card-grid').first().locator('.chain-card').first().boundingBox();
+      const cards = await target.locator('.chain-card').all();
+      const widths = await Promise.all(cards.map(card => card.boundingBox()));
+      return Math.max(...widths.map(box => Math.abs(box!.width - reference!.width)));
+    })
+    .toBeLessThan(0.5);
 });

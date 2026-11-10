@@ -26,7 +26,7 @@ import {
 } from '../api';
 import { Confirm, EmptyState, ErrorBox, SegmentedControl } from '../ui/bits';
 import { CopyButton, copyStateIcon } from '../ui/copy-button';
-import { bytes, shareOf } from '../ui/format';
+import { bytes } from '../ui/format';
 import { blockedAddress, endpointText, parseTarget, submittedHost, type ParsedTarget } from '../ui/forwarding-target';
 import { Icon, PanelTitle, type IconName } from '../ui/icons';
 import { FieldLoading } from '../ui/loading';
@@ -34,7 +34,7 @@ import { observeBpsReading } from '../ui/observe-chart';
 import { RegionFlag } from '../ui/region-flag';
 import { useUnsavedChanges } from '../ui/navigation-guard';
 import { forwardingRuleRates, useUserTrafficSource } from '../user-traffic-source';
-import { UserTrafficAccountingSetting } from '../user-traffic-accounting';
+import { UserQuotaMeter, UserQuotaReading, UserUsageLedger } from './user-usage';
 import {
   ForwardingQuotaHistory,
   forwardingQuotaJobsKey,
@@ -573,13 +573,11 @@ export function UserForwardingCard({
       byRule.set(row.rule_id, { down: current.down + down, up: current.up + up });
     }
     const live = new Set(rules.map(rule => rule.id));
-    const down = rows.reduce((sum, row) => sum + row.downlink_bytes, 0) * accountingMultiplier;
-    const up = rows.reduce((sum, row) => sum + row.uplink_bytes, 0) * accountingMultiplier;
     const deleted =
       rows.filter(row => !live.has(row.rule_id)).reduce((sum, row) => sum + row.downlink_bytes + row.uplink_bytes, 0) *
       accountingMultiplier;
     const period = cycle.data.periods?.find(p => p.tenant_id === user.tenant_id && p.user_id === user.id);
-    return { byRule, byNode, down, up, deleted, start: period?.starts_at, end: period?.ends_at };
+    return { rows, byRule, byNode, deleted, end: period?.ends_at };
   }, [accountingMultiplier, cycle.data, rules, user.tenant_id, user.id]);
   const cycleOf = (rule: ForwardingRule): Traffic | null =>
     cycleTraffic ? (cycleTraffic.byRule.get(rule.id) ?? { down: 0, up: 0 }) : null;
@@ -837,7 +835,6 @@ export function UserForwardingCard({
   const sortedEntries = [...entries].sort(
     (a, b) => Number(b.enabled) - Number(a.enabled) || a.node_name.localeCompare(b.node_name, 'zh-CN'),
   );
-  const [figure, unit] = cycleTraffic ? bytes(cycleTraffic.down + cycleTraffic.up).split(' ') : ['', ''];
   const deletionSummary = (rule: ForwardingRule) => {
     const entry = entryOf(rule.node_id);
     const usage = cycleOf(rule);
@@ -851,10 +848,6 @@ export function UserForwardingCard({
     };
   };
   const deletingView = deleting ? deletionSummary(deleting) : null;
-  const cycleDate = (text: string) => {
-    const date = new Date(Date.parse(text) + 8 * 3_600_000);
-    return `${date.getUTCMonth() + 1} 月 ${date.getUTCDate()} 日`;
-  };
 
   return (
     <>
@@ -872,61 +865,22 @@ export function UserForwardingCard({
             <ErrorBox error={overview.error} />
           ) : (
             <div className="user-usage panel-full-bleed-body">
-              <aside className="fwd-ledger user-usage-ledger" aria-label="本期转发">
-                <div className="user-usage-hero">
-                  <span className="user-usage-hero-label">本期转发</span>
-                  {cycleReset}
-                  {cycleTraffic ? (
-                    <strong className="user-usage-hero-value">
-                      {figure} <small>{unit}</small>
-                    </strong>
-                  ) : (
-                    <strong className="user-usage-hero-value none">{cycle.isPending ? '读取中' : '—'}</strong>
-                  )}
-                  {cycleTraffic?.start && cycleTraffic.end && (
-                    <span className="user-usage-reset">
-                      {cycleDate(cycleTraffic.start)}起<span className="usage-dot">·</span>
-                      {cycleDate(cycleTraffic.end)}重置
-                    </span>
-                  )}
-                  {cycleTraffic && cycleTraffic.down + cycleTraffic.up > 0 && (
-                    <div className="usage-split" aria-hidden="true">
-                      <i className="down" style={{ flexGrow: cycleTraffic.down }} />
-                      <i className="up" style={{ flexGrow: cycleTraffic.up }} />
-                    </div>
-                  )}
-                  {cycleTraffic && (
-                    <dl className="usage-io">
-                      <div className="down">
-                        <dt>
-                          <i aria-hidden="true" />
-                          下行
-                        </dt>
-                        <dd>{bytes(cycleTraffic.down)}</dd>
-                        <dd className="usage-share">
-                          {shareOf(cycleTraffic.down, cycleTraffic.down + cycleTraffic.up)}
-                        </dd>
-                      </div>
-                      <div className="up">
-                        <dt>
-                          <i aria-hidden="true" />
-                          上行
-                        </dt>
-                        <dd>{bytes(cycleTraffic.up)}</dd>
-                        <dd className="usage-share">{shareOf(cycleTraffic.up, cycleTraffic.down + cycleTraffic.up)}</dd>
-                      </div>
-                    </dl>
-                  )}
-                  {cycleTraffic && cycleTraffic.deleted > 0 && (
+              <UserUsageLedger
+                label="本期转发"
+                state={cycle.data ? 'ready' : cycle.isPending ? 'pending' : 'failed'}
+                rows={cycleTraffic?.rows ?? []}
+                periodEnd={cycleTraffic?.end ?? null}
+                accountingMode={user.traffic_accounting_mode ?? 'single'}
+                accountingDisabled={accountingDisabled}
+                onAccountingModeChange={onAccountingModeChange}
+                cycleReset={cycleReset}
+                servicePolicy={servicePolicy}
+                note={
+                  cycleTraffic && cycleTraffic.deleted > 0 ? (
                     <span className="fwd-deleted">其中 {bytes(cycleTraffic.deleted)} 来自已删除的规则</span>
-                  )}
-                </div>
-                <UserTrafficAccountingSetting
-                  mode={user.traffic_accounting_mode ?? 'single'}
-                  disabled={accountingDisabled}
-                  onChange={onAccountingModeChange}
-                />
-                {servicePolicy}
+                  ) : undefined
+                }
+              >
                 {canViewRealtime && (
                   <div className="fwd-live">
                     <span>当前</span>
@@ -934,7 +888,7 @@ export function UserForwardingCard({
                     {liveSum && <small>{liveSum.active} 条在转发</small>}
                   </div>
                 )}
-              </aside>
+              </UserUsageLedger>
               {entries.length === 0 && policy?.mode !== 'grant' ? (
                 <EmptyState
                   icon="forwarding"
@@ -957,12 +911,34 @@ export function UserForwardingCard({
                     : '管理员授权机器后，用户才可以创建端口转发规则。'}
                 </EmptyState>
               ) : (
-                <div className="qta fwd-quotas fwe-aligned" role="list" aria-label="各转发入口的用量与规则额度">
+                <div className="qta fwd-quotas fwe-aligned" role="list" aria-label="各转发入口的用量与额度">
                   {sortedEntries.map(entry => {
                     const state = entryState(entry, rules);
                     const count = rules.filter(rule => rule.node_id === entry.node_id).length;
                     const traffic = cycleTraffic?.byNode.get(entry.node_id);
-                    const percent = entry.max_rules > 0 ? (count / entry.max_rules) * 100 : 0;
+                    const used =
+                      entry.cycle_used_bytes ?? (cycleTraffic ? (traffic ? traffic.down + traffic.up : 0) : null);
+                    const limit = entry.cycle_limit_bytes ?? null;
+                    const percent = limit !== null && used !== null ? (used / limit) * 100 : null;
+                    const over = percent !== null && percent >= 100;
+                    const tone =
+                      used === null
+                        ? 'unknown'
+                        : limit === null
+                          ? 'unlimited'
+                          : over
+                            ? 'over'
+                            : percent !== null && percent >= 80
+                              ? 'warn'
+                              : 'ok';
+                    const quotaLabel = !entry.enabled
+                      ? '已停用'
+                      : entry.quota_suspended
+                        ? '额度已用满 · 已停用'
+                        : limit !== null
+                          ? '用满后停用'
+                          : '';
+                    const quotaTone = !entry.enabled ? 'idle' : over ? 'err' : '';
                     const editing = canAuthorize && policy?.mode === 'edit' && policy.draft.nodeId === entry.node_id;
                     const resuming =
                       lifecycle.isPending &&
@@ -972,12 +948,12 @@ export function UserForwardingCard({
                       <div
                         key={entry.node_id}
                         role="listitem"
-                        className={`qta-r fwd-quota-row fwe-row ${percent >= 100 ? 'over' : percent >= 95 ? 'warn' : 'ok'}${editing ? ' fwe-open' : ''}`}
+                        className={`qta-r fwd-quota-row fwe-row ${tone}${!entry.enabled ? ' paused' : ''}${editing ? ' fwe-open' : ''}`}
                       >
                         <span className="qta-name fwe-entry-name">
                           <span className="qta-app">
-                            <RegionFlag code={countryOf(entry.node_id)} />
                             <b>{entry.node_name || entry.node_id}</b>
+                            <RegionFlag code={countryOf(entry.node_id)} />
                           </span>
                           <span className="qta-sub">
                             {state.tone === 'ok' ? (
@@ -986,29 +962,25 @@ export function UserForwardingCard({
                               <span className={`fwd-st ${state.tone}`}>{state.text}</span>
                             )}
                           </span>
-                        </span>
-                        <span className="qta-figs">
-                          {entry.cycle_used_bytes !== undefined
-                            ? bytes(entry.cycle_used_bytes)
-                            : cycleTraffic
-                              ? bytes(traffic ? traffic.down + traffic.up : 0)
-                              : '—'}
-                          {entry.cycle_limit_bytes != null && (
-                            <small className="dim"> / {bytes(entry.cycle_limit_bytes)}</small>
-                          )}
-                        </span>
-                        <span className="qta-left">
-                          规则
-                          <b>
-                            {count} / {entry.max_rules}
-                          </b>
-                        </span>
-                        <span className="qta-meter">
-                          <span className="qta-t" aria-hidden="true">
-                            <i style={{ width: `${Math.min(100, percent)}%` }} />
+                          <span className="qta-sub fwd-rule-count">
+                            规则 {count} / {entry.max_rules}
                           </span>
-                          <span className="qta-pct">{Math.round(percent)}%</span>
                         </span>
+                        <UserQuotaReading
+                          used={used}
+                          limit={limit}
+                          state={used !== null ? 'ready' : cycle.isPending ? 'pending' : 'failed'}
+                        />
+                        <UserQuotaMeter
+                          used={used}
+                          limit={limit}
+                          tone={quotaTone}
+                          status={
+                            quotaLabel ? (
+                              <span className={`qta-policy-flag ${quotaTone}`}>{quotaLabel}</span>
+                            ) : undefined
+                          }
+                        />
                         <span className="qta-acts">
                           {canAuthorize && (
                             <>
@@ -1025,7 +997,7 @@ export function UserForwardingCard({
                               )}
                               <button
                                 type="button"
-                                className="fwd-ib"
+                                className="btn qta-pencil"
                                 aria-label={`编辑 ${entry.node_name} 的转发授权`}
                                 title="编辑授权"
                                 aria-expanded={editing}

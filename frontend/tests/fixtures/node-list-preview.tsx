@@ -6,6 +6,7 @@ import type { AdminRole, ConsoleSnapshot, Whoami } from '../../src/api';
 import { App } from '../../src/app';
 import { theme } from '../../src/forge/theme';
 import type { Session } from '../../src/session';
+import { cvmWorkspace } from './cvm/data';
 import {
   loadOverview,
   loadListView,
@@ -83,6 +84,20 @@ Object.defineProperty(window, '__nodePreviewRequests', { value: requestLog });
 globalThis.fetch = async (input, init) => {
   const url = new URL(String(input instanceof Request ? input.url : input), location.origin);
   const path = url.pathname;
+  if (path === '/cvm' && (!init?.method || init.method === 'GET')) {
+    const workspace = cvmWorkspace('list', role);
+    const cube = params.get('cube');
+    if (cube === 'pvm') workspace.hosts[0].capabilities.backend = 'cube-pvm-v1';
+    if (cube === 'error' || cube === 'unmanaged') {
+      workspace.hosts[0].error = 'CVM Rust executor configuration is unavailable';
+      workspace.hosts[0].fresh = false;
+      if (cube === 'unmanaged') {
+        workspace.hosts[0].capabilities.backend = '';
+        workspace.instances = [];
+      }
+    }
+    return Response.json(workspace);
+  }
   requestLog.push(path + url.search);
   const method = (init?.method ?? 'GET').toUpperCase();
   const now = nowSecs();

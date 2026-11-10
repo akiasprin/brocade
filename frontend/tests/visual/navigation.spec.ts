@@ -6,7 +6,10 @@ async function open(page: Page, path = '/nodes/node/jp-iij', query = '') {
   await expect(page.locator('.fg-top')).toBeVisible();
   await expect(page.locator('.fg-top .ft-now')).toHaveCount((await page.viewportSize())!.width > 820 ? 1 : 0);
   await expect(page.locator('.fg-top .fg-blast')).toHaveCount(
-    query.includes('state=') && !query.includes('role=public') ? 1 : 0,
+    ['pending', 'deploying', 'grant'].includes(new URLSearchParams(query).get('state') ?? '') &&
+      !query.includes('role=public')
+      ? 1
+      : 0,
   );
 }
 
@@ -20,6 +23,41 @@ async function fits(page: Page) {
     )
     .toBe(true);
 }
+
+test('ordinary pages avoid full deployment checks; the publish page still verifies', async ({ page }) => {
+  const reads: string[] = [];
+  await page.clock.install({ time: new Date('2026-11-02T10:00:00Z') });
+  page.on('console', message => {
+    if (message.text() === '[fixture] deployment-verification-read') reads.push(message.text());
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await open(page, '/nodes/node/jp-iij', 'state=pending');
+  await expect(page.locator('.fg-blast')).toHaveText('配置待发布');
+  await page.clock.runFor(11_000);
+  expect(reads).toHaveLength(0);
+  await page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: /发布/ }).click();
+  await expect.poll(() => reads.length).toBeGreaterThan(0);
+});
+
+test('published grants and new users do not advertise a configuration release', async ({ page }) => {
+  const reads: string[] = [];
+  const indexes: string[] = [];
+  page.on('console', message => {
+    if (message.text() === '[fixture] deployment-verification-read') reads.push(message.text());
+    if (message.text().startsWith('[fixture] artifact-index-read ')) indexes.push(message.text());
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await open(page, '/nodes/node/jp-iij', 'state=grants-published&theme=light');
+  await expect(page.locator('.nd-page-head')).toBeVisible();
+  await expect.poll(() => indexes.length).toBe(2);
+  await expect(page.locator('.fg-blast')).toHaveCount(0);
+  await expect(page.locator('.fg-badge.chg')).toHaveCount(0);
+  expect(reads).toHaveLength(0);
+  const flavor = process.env.BROCADE_PRODUCT_FLAVOR === 'base' ? 'base' : 'cvm';
+  await expect(page).toHaveScreenshot(`${flavor}-published-grants-navigation.png`, {
+    clip: { x: 0, y: 0, width: 1440, height: 190 },
+  });
+});
 
 for (const theme of ['light', 'dark']) {
   for (const width of [1440, 1180, 840, 390, 320]) {
@@ -53,7 +91,7 @@ for (const state of ['pending', 'deploying', 'grant']) {
     await page.setViewportSize({ width: 1440, height: 900 });
     await open(page, '/nodes/node/jp-iij', `state=${state}&theme=light&account=administrator-with-a-long-account-name`);
     await expect(page.locator('.fg-blast')).toHaveText(
-      state === 'pending' ? '待发布 3 台' : state === 'deploying' ? '发布 #42 · 进行中' : '权限失败 2',
+      state === 'pending' ? '配置待发布' : state === 'deploying' ? '发布 #42 · 进行中' : '权限失败 2',
     );
     await fits(page);
     await expect(page).toHaveScreenshot(`runtime-${state}.png`, { clip: { x: 0, y: 0, width: 1440, height: 80 } });
@@ -122,3 +160,22 @@ for (const role of ['readonly', 'public']) {
     await fits(page);
   });
 }
+
+test('phone keeps containers visible and usage reachable from More for signed-in viewers and guests', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 320, height: 900 });
+  await open(page, '/nodes', 'theme=light');
+  await fits(page);
+  const main = page.getByRole('navigation', { name: '主导航' });
+  await expect(main.getByRole('button', { name: '容器', exact: true })).toBeVisible();
+  await expect(main.getByRole('button', { name: '用量', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: /账户与更多功能/ }).click();
+  await expect(page.getByRole('menuitem', { name: '用量', exact: true })).toBeVisible();
+  await open(page, '/nodes', 'role=public');
+  await fits(page);
+  await expect(main.getByRole('button', { name: '容器', exact: true })).toBeVisible();
+  await expect(main.getByRole('button', { name: '用量', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: '登录与更多功能', exact: true }).click();
+  await expect(page.getByRole('menuitem', { name: '用量', exact: true })).toBeVisible();
+});

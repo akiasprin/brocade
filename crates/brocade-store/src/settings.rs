@@ -12,7 +12,7 @@ use brocade_core::{
     },
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::{AdminContext, Result, StoreError};
 
@@ -68,6 +68,20 @@ pub async fn load_deployment_settings(pool: &PgPool) -> Result<DeploymentSetting
         )
         .map_err(|_| StoreError::InvalidData("invalid unlock detection interval".into()))?,
     })
+}
+
+/// Align known prerelease schemas with the current defaults without overwriting saved policy.
+pub(crate) async fn migrate_unlock_detection_defaults(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<()> {
+    sqlx::query(
+        "ALTER TABLE control_state
+        ALTER COLUMN unlock_detection_interval_hours SET DEFAULT 4,
+        ALTER COLUMN unlock_detection_next_run_at SET DEFAULT now() + interval '4 hours'",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 pub async fn update_deployment_settings(

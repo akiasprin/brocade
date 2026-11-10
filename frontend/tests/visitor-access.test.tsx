@@ -22,6 +22,7 @@ describe('访客路由权限', () => {
     [{ nav: 'deploy' as const, drill: { p: 'plan' } }, { nav: 'nodes' as const }],
     [{ nav: 'password' as const }, { nav: 'nodes' as const }],
     [{ nav: 'capacity' as const }, { nav: 'nodes' as const }],
+    [{ nav: 'cvm' as const, drill: { p: 'new' } }, { nav: 'cvm' as const }],
     [{ nav: 'nodes' as const, drill: { p: 'provision' } }, { nav: 'nodes' as const }],
     [{ nav: 'nodes' as const, drill: { p: 'install', node: 'hk' } }, { nav: 'nodes' as const }],
     [{ nav: 'nodes' as const, drill: { p: 'chain', id: 'hk' } }, { nav: 'nodes' as const }],
@@ -30,9 +31,11 @@ describe('访客路由权限', () => {
     expect(routeForViewer(location, guest)).toEqual(expected);
   });
 
-  it('保留访客可读取的机器、线路和用户详情', () => {
+  it('保留访客可读取的机器、容器、线路和用户详情', () => {
     for (const location of [
       { nav: 'nodes' as const, drill: { p: 'node', id: 'hk' } },
+      { nav: 'cvm' as const },
+      { nav: 'cvm' as const, drill: { p: 'instance', id: 'cvm-one' } },
       { nav: 'chains' as const, drill: { p: 'chain', app: 'main', chain: 'hk-jp' } },
       { nav: 'users' as const, drill: { p: 'user', id: 'alice' } },
       { nav: 'tunnels' as const, drill: { p: 'warp', id: 'warp-1111-2222' } },

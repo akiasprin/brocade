@@ -1,3 +1,4 @@
+import { CVM_ENABLED } from '../product';
 import { lazy } from '../ui/lazy';
 // 编译台外壳：一条顶栏、一块工作区，以及贯通到顶的产物栏。
 // 页面自身负责对象下钻；顶栏负责主导航与诊断入口。
@@ -20,7 +21,6 @@ import {
   fetchNodes,
   fetchRevisions,
   fetchSnapshot,
-  verifyDeployment,
   type AdminRole,
   type BrandingSettings,
   type DiagNames,
@@ -37,7 +37,7 @@ import { WinLayer } from '../ui/windows';
 import { wm, type CrumbSeg } from '../wm/store';
 import { draft } from '../draft';
 import { DraftBar } from './draft-bar';
-import { ArtifactRail, blastRadius, useChangedArtifacts } from './artifacts';
+import { ArtifactRail, blastRadius, useChangedArtifacts, useRevisionDiff } from './artifacts';
 import { navigate, returnTo, startRouting } from './route';
 import { can, isPublic, isVisitor, type Session } from '../session';
 import { forge, useForge, type NavKey } from './state';
@@ -72,16 +72,17 @@ interface Face {
 // 顶栏只显示当前主工作流。规则负责选择转发目标；隧道资源本身的生命周期统一在隧道页管理。
 const NAV: Face[] = [
   { key: 'nodes', label: '机器', icon: 'nodes' },
+  { key: 'cvm', label: '容器', icon: 'servers' },
   { key: 'chains', label: '线路', icon: 'chains' },
   { key: 'users', label: '用户', icon: 'users' },
   { key: 'deploy', label: '发布', icon: 'deploy', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
   { key: 'usage', label: '用量', icon: 'usage' },
 ];
 
-/* 手机端保留机器、线路、用户和用量。发布仍使用同一份 Face 定义，只是移动到账户牌菜单，
-   避免两套角色权限和名称逐渐分叉。 */
-const MOBILE_NAV = NAV.filter(f => f.key === 'nodes' || f.key === 'chains' || f.key === 'users' || f.key === 'usage');
-const MOBILE_MORE = NAV.filter(f => f.key === 'deploy');
+/* 手机端保留四个主要入口，用量和发布移入账户菜单。
+   全部从同一份 Face 定义派生，避免角色权限和名称分叉。 */
+const MOBILE_NAV = NAV.filter(f => ['nodes', 'cvm', 'chains', 'users'].includes(f.key));
+const MOBILE_MORE = NAV.filter(f => f.key === 'deploy' || f.key === 'usage');
 
 // 收入账户牌菜单的项：都是低频访问的页面，占用顶栏位置的收益较低。
 // 窄屏同理：该行只放 NAV 的主工作流，这些低频页面仍从账户牌菜单进入。
@@ -113,7 +114,12 @@ function accountOf(who: Whoami) {
 }
 
 const visible = (faces: Face[], who: Whoami) =>
-  faces.filter(f => (!f.roles || f.roles.includes(who.role)) && (!f.hideFromPublic || !isPublic(who)));
+  faces.filter(
+    f =>
+      (f.key !== 'cvm' || CVM_ENABLED) &&
+      (!f.roles || f.roles.includes(who.role)) &&
+      (!f.hideFromPublic || !isPublic(who)),
+  );
 
 export function ForgeShell({
   branding,
@@ -195,12 +201,6 @@ export function ForgeShell({
     queryFn: () => fetchSnapshot(),
     enabled: !pub && (st.diag || railPresence.present),
   });
-  const verify = useQuery({
-    queryKey: ['deployment-verify', current],
-    queryFn: () => verifyDeployment({ revision_id: current! }),
-    enabled: !pub && current != null && draft.isEmpty(),
-    refetchInterval: q => ((q.state.data?.summary.changed_targets ?? 0) > 0 ? 5_000 : false),
-  });
   // 顶栏只关心仍占用 single-flight 锁的发布。与历史页分开缓存，避免每个页面每五秒
   // 下载并聚合 50 条历史；所有发布 mutation 对 ['deployments'] 的前缀失效会同时刷新两者。
   const deployments = useQuery({
@@ -230,7 +230,23 @@ export function ForgeShell({
     error: artifactsError,
   } = useChangedArtifacts(current, prev, { enabled: artifacts && draftDirty });
   const draftBlast = useMemo(() => blastRadius(list, changed), [list, changed]);
-  const pendingTargets = dirty ? undefined : verify.data?.summary.changed_targets;
+  // Revision changes may contain only grants. Compare immutable configuration-file indexes;
+  // live convergence and release planning remain on the deployment page.
+  const released = revisions.data?.last_config_revision_id;
+  const compareConfiguration =
+    !pub && artifacts && !dirty && current != null && released !== undefined && current !== released;
+  const configurationDiff = useRevisionDiff(
+    compareConfiguration ? current : undefined,
+    compareConfiguration ? released : undefined,
+  );
+  const pendingChanges =
+    dirty || current == null || released === undefined
+      ? undefined
+      : current === released
+        ? false
+        : configurationDiff.configurationNodes == null
+          ? undefined
+          : configurationDiff.configurationNodes.size > 0;
   const diagnostics = visibleDiagnostics(compile.data?.diagnostics);
   // 诊断的 location 中全部是 id，而面板需要显示名称。这两份数据在其他位置已在读取，
   // 此处只是将 id 到名称的转换集中处理（见 formatLocation）。
@@ -246,9 +262,9 @@ export function ForgeShell({
   const grantRuntime = compactGrantAutomation(grantAutomation.data, grantAutomation.isPending, !!grantAutomation.error);
   // 顶栏只留一段需要关注的短状态；健康且空闲时不显示常驻文案。
   // 修订号只跟随活动发布出现，避免把当前修订误读成需要处理的状态。
-  const runtimeReadError = revisions.error ?? compile.error;
+  const runtimeReadError = revisions.error ?? compile.error ?? configurationDiff.error;
   const crumbRuntime: RuntimeCrumbState = runtimeReadError
-    ? { text: revisions.error ? '修订状态未知' : '编译状态未知', tone: 'bad' }
+    ? { text: revisions.error ? '修订状态未知' : compile.error ? '编译状态未知' : '配置状态未知', tone: 'bad' }
     : dirty
       ? artifactsError
         ? { text: '草稿 · 影响范围未知', tone: 'bad' }
@@ -263,14 +279,14 @@ export function ForgeShell({
         ? { text: `发布 #${awaitingDeploy.id} · 待确认`, tone: 'bad' }
         : activeDeploy
           ? { text: `发布 #${activeDeploy.id} · 进行中`, tone: 'hot' }
-          : verify.isPending
+          : revisions.isPending || configurationDiff.pending
             ? { text: '检查中', tone: 'normal' }
-            : verify.error
-              ? { text: '发布状态未知', tone: 'bad' }
+            : pendingChanges === undefined
+              ? { text: '发布状态待检查', tone: 'normal' }
               : grantRuntime.tone === 'bad'
                 ? grantRuntime
-                : pendingTargets
-                  ? { text: `待发布 ${pendingTargets} 台`, tone: 'hot' }
+                : pendingChanges
+                  ? { text: '配置待发布', tone: 'normal' }
                   : grantRuntime;
 
   return (
@@ -286,7 +302,7 @@ export function ForgeShell({
             diagNames={diagNames}
             diagnosticsPending={revisions.isPending || (current != null && compile.isPending)}
             diagnosticsError={runtimeReadError}
-            pendingTargets={pendingTargets}
+            pendingChanges={pendingChanges}
             activeDeploy={activeDeploy}
             awaitingDeploy={awaitingDeploy}
             runtime={pub ? undefined : crumbRuntime}
@@ -299,7 +315,6 @@ export function ForgeShell({
             }
             onLogout={() => confirmDiscardChanges() && onLogout()}
           />
-
           <DraftBar current={current} />
 
           {nav === 'topo' ? (
@@ -320,7 +335,7 @@ export function ForgeShell({
         <ArtifactRail
           revision={current}
           prev={prev}
-          compareClean={(pendingTargets ?? 0) > 0}
+          compareClean={pendingChanges === true}
           apps={snapshot.data?.snapshot.apps ?? []}
           onClose={() => artifactPanel.close()}
           motionState={railPresence.phase}
@@ -358,7 +373,7 @@ function MainNav({
   faces,
   who,
   nav,
-  pendingTargets,
+  pendingChanges,
   activeDeploy,
   awaitingDeploy,
   returning,
@@ -367,7 +382,7 @@ function MainNav({
   faces: Face[];
   who: Whoami;
   nav: NavKey;
-  pendingTargets: number | undefined;
+  pendingChanges: boolean | undefined;
   activeDeploy: { id: number } | undefined;
   awaitingDeploy: { id: number } | undefined;
   returning: boolean;
@@ -403,8 +418,10 @@ function MainNav({
               {awaitingDeploy ? '等确认' : `#${activeDeploy.id}`}
             </span>
           )}
-          {f.key === 'deploy' && !activeDeploy && (pendingTargets ?? 0) > 0 && (
-            <span className="fg-badge chg">{pendingTargets}</span>
+          {f.key === 'deploy' && !activeDeploy && pendingChanges === true && (
+            <span className="fg-badge chg" title="节点配置有变化，进入发布页核验">
+              待发布
+            </span>
           )}
         </button>
       ))}
@@ -442,7 +459,7 @@ function TopBar({
   diagNames,
   diagnosticsPending,
   diagnosticsError,
-  pendingTargets,
+  pendingChanges,
   activeDeploy,
   awaitingDeploy,
   runtime,
@@ -461,7 +478,7 @@ function TopBar({
   diagNames: DiagNames;
   diagnosticsPending: boolean;
   diagnosticsError: unknown;
-  pendingTargets: number | undefined;
+  pendingChanges: boolean | undefined;
   /* 存在 active 的发布（限流锁被占用，含 halted 未收尾）时显示红色状态 */
   activeDeploy: { id: number } | undefined;
   // 含破坏性动作的波次停在等待确认状态的那条发布。它同时存在于 activeDeploy 中，
@@ -540,8 +557,8 @@ function TopBar({
     ? `发布 #${awaitingDeploy.id} 等待确认`
     : activeDeploy
       ? `发布 #${activeDeploy.id} 进行中`
-      : (pendingTargets ?? 0) > 0
-        ? `${pendingTargets} 台待发布`
+      : pendingChanges === true
+        ? '节点配置有变化，进入发布页核验'
         : undefined;
 
   const focusMenuEdge = (edge: 'first' | 'last') => {
@@ -812,7 +829,7 @@ function TopBar({
   );
 
   if (narrow) {
-    /* 窄屏只有这一行：品牌 + 机器 / 线路 / 用户 / 用量 + 通知 + 账户牌。其他页面、产物和诊断
+    /* 窄屏只有这一行：品牌 + 四个主要入口 + 通知 + 账户牌。其他页面、产物和诊断
        收入账户菜单。下钻时只更换选中格的图标，不增加第二行。 */
     return (
       <div className="fg-top fg-navrow">
@@ -822,7 +839,7 @@ function TopBar({
           faces={MOBILE_NAV}
           who={who}
           nav={nav}
-          pendingTargets={pendingTargets}
+          pendingChanges={pendingChanges}
           activeDeploy={activeDeploy}
           awaitingDeploy={awaitingDeploy}
           returning={returning}
@@ -862,7 +879,7 @@ function TopBar({
         faces={NAV}
         who={who}
         nav={nav}
-        pendingTargets={pendingTargets}
+        pendingChanges={pendingChanges}
         activeDeploy={activeDeploy}
         awaitingDeploy={awaitingDeploy}
         returning={returning}

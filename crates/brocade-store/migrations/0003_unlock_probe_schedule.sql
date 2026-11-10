@@ -100,10 +100,10 @@ ALTER TABLE unlock_probe_jobs ADD COLUMN dns_fingerprint TEXT;
 ALTER TABLE control_state
     ADD COLUMN unlock_detection_mode TEXT NOT NULL DEFAULT 'scheduled'
         CHECK (unlock_detection_mode IN ('manual','scheduled')),
-    ADD COLUMN unlock_detection_interval_hours INTEGER NOT NULL DEFAULT 24
+    ADD COLUMN unlock_detection_interval_hours INTEGER NOT NULL DEFAULT 4
         CHECK (unlock_detection_interval_hours BETWEEN 1 AND 720),
     ADD COLUMN unlock_detection_requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    ADD COLUMN unlock_detection_next_run_at TIMESTAMPTZ DEFAULT now() + interval '24 hours';
+    ADD COLUMN unlock_detection_next_run_at TIMESTAMPTZ DEFAULT now() + interval '4 hours';
 
 -- Consolidated online source session history.
 -- Each completed ingress/IP epoch survives reconnects. Only the live epoch is upserted.

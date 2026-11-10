@@ -1,8 +1,35 @@
+import { CVM_ENABLED } from './product';
+import { api } from './api/client';
+export { api, ApiError } from './api/client';
+export * from './api/cvm';
+export * from './api/cvm-nics';
+export * from './api/cvm-entries';
+
 // admin 面的数据获取入口。浏览器默认使用 HttpOnly session cookie；Bearer token 用于
 // API/自动化调用，以及创建首个管理员时的一次性初始化凭据。类型定义与服务端逐字段对应。
 
 import { draft, type ModelOp } from './draft';
 import { newRealityFallbackLimits } from './reality-fallback';
+
+// Share only outstanding reads. A completed plan/verification must never survive a change in
+// Agent observations or certificate state merely because its model revision stayed the same.
+const deploymentReadFlights = new Map<string, Promise<unknown>>();
+export function invalidateDeploymentReads() {
+  deploymentReadFlights.clear();
+}
+function deploymentRead<T>(path: string, body: unknown, token = ''): Promise<T> {
+  if (token) return post<T>(path, body, token);
+  const key = JSON.stringify([draft.operatorScope(), path, body]);
+  const existing = deploymentReadFlights.get(key) as Promise<T> | undefined;
+  if (existing) return existing;
+  const request = post<T>(path, body);
+  if (deploymentReadFlights.size < 16) deploymentReadFlights.set(key, request);
+  const release = () => {
+    if (deploymentReadFlights.get(key) === request) deploymentReadFlights.delete(key);
+  };
+  void request.then(release, release);
+  return request;
+}
 
 export type AdminRole = 'user' | 'readonly' | 'editor' | 'publisher' | 'tenant-admin' | 'system-admin';
 
@@ -60,45 +87,9 @@ export type OnboardingCheckpoint =
   | { step: 'deployment'; deployment_id: number };
 
 export interface ConsoleBootstrap {
+  features: { cvm: boolean };
   who: Whoami;
   initial: ConsoleInitialData;
-}
-
-export class ApiError extends Error {
-  constructor(
-    public status: number,
-    message: string,
-  ) {
-    super(message);
-  }
-}
-
-export async function api<T>(path: string, token = '', init?: RequestInit): Promise<T> {
-  const headers: Record<string, string> = {
-    ...(init?.body ? { 'content-type': 'application/json' } : {}),
-    ...((init?.headers as Record<string, string> | undefined) ?? {}),
-  };
-  const bearer = token.trim();
-  if (bearer) headers.authorization = `Bearer ${bearer}`;
-
-  const res = await fetch(path, {
-    ...init,
-    credentials: 'same-origin',
-    headers,
-  });
-  if (!res.ok) {
-    /* 错误响应体格式为 {"error": "..."}（http.rs 的 ErrorBody），解析失败时回退到状态行 */
-    let message = `${res.status} ${res.statusText}`;
-    try {
-      const body = (await res.json()) as { error?: string };
-      if (body.error) message = body.error;
-    } catch {
-      /* 非 JSON 响应，保留状态行 */
-    }
-    throw new ApiError(res.status, message);
-  }
-  if (res.status === 204) return undefined as T;
-  return res.json() as Promise<T>;
 }
 
 const req = <T>(path: string, init: RequestInit) => api<T>(path, '', init);
@@ -155,6 +146,7 @@ draft.subscribe(() => {
   // changes do change this exact wire document and cancel every stale preview lane.
   if (content === observedDraftContent) return;
   observedDraftContent = content;
+  invalidateDeploymentReads();
   abortDraftPreviews();
   previewCache = null;
 });
@@ -207,6 +199,7 @@ export function draftPreview(): Promise<DraftPreview> {
 /** Write state outside the browser draft and invalidate projections based on the old committed state. */
 async function immediateModelWrite<T>(write: () => Promise<T>): Promise<T> {
   const result = await write();
+  invalidateDeploymentReads();
   abortDraftPreviews();
   previewCache = null;
   return result;
@@ -330,6 +323,16 @@ const post = <T>(path: string, body?: unknown, token = '') =>
   api<T>(path, token, {
     method: 'POST',
     body: body === undefined ? undefined : JSON.stringify(body),
+  }).then(value => {
+    const route = path.split('?')[0];
+    if (
+      route === '/model/apply' ||
+      (route.startsWith('/deployments') &&
+        !['/deployments/verify', '/deployments/plan', '/deployments/plan/artifacts'].includes(route))
+    ) {
+      invalidateDeploymentReads();
+    }
+    return value;
   });
 
 export const fetchWhoami = (token = '') => api<Whoami>('/whoami', token);
@@ -360,7 +363,12 @@ export const fetchAuthState = () => api<AuthState>('/auth/state');
 export const setVisitorAccess = (enabled: boolean) =>
   api<AuthState>('/visitor-access', '', { method: 'PUT', body: JSON.stringify({ enabled }) });
 export const fetchSessionWhoami = () => api<Whoami>('/whoami', '', { cache: 'no-store' });
-export const fetchConsoleBootstrap = () => api<ConsoleBootstrap>('/bootstrap');
+export const fetchConsoleBootstrap = async () => {
+  const bootstrap = await api<ConsoleBootstrap>('/bootstrap');
+  if (typeof bootstrap.features?.cvm !== 'boolean' || bootstrap.features.cvm !== CVM_ENABLED)
+    throw new Error('Console 与前端产品变体不匹配，请刷新或检查部署资源。');
+  return bootstrap;
+};
 export const fetchOnboarding = () => api<OnboardingState>('/onboarding');
 export const checkpointOnboarding = (body: OnboardingCheckpoint) =>
   api<OnboardingState>('/onboarding', '', { method: 'PUT', body: JSON.stringify(body) });
@@ -371,10 +379,20 @@ export const initAdmin = (
   body: { operator_id: string; display_name: string; password: string; root_tenant: string },
 ) => api<InitAdminResponse>('/auth/init', bootstrapToken, { method: 'POST', body: JSON.stringify(body) });
 export const loginAdmin = (body: { operator_id: string; password: string }) =>
-  api<LoginAdminResponse>('/auth/login', '', { method: 'POST', body: JSON.stringify(body) });
+  api<LoginAdminResponse>('/auth/login', '', { method: 'POST', body: JSON.stringify(body) }).then(result => {
+    invalidateDeploymentReads();
+    return result;
+  });
 export const loginUserDirect = (body: { uuid: string; token: string }) =>
-  api<LoginAdminResponse>('/auth/direct-login', '', { method: 'POST', body: JSON.stringify(body) });
-export const logoutAdmin = () => api<{ revoked: boolean }>('/auth/logout', '', { method: 'POST' });
+  api<LoginAdminResponse>('/auth/direct-login', '', { method: 'POST', body: JSON.stringify(body) }).then(result => {
+    invalidateDeploymentReads();
+    return result;
+  });
+export const logoutAdmin = () =>
+  api<{ revoked: boolean }>('/auth/logout', '', { method: 'POST' }).then(result => {
+    invalidateDeploymentReads();
+    return result;
+  });
 
 /* ── 修订与编译 ── */
 
@@ -389,6 +407,8 @@ export interface RevisionListItem {
 }
 export interface RevisionList {
   current_revision: number;
+  /** Coverage of the last successful configuration release; this does not assert convergence. */
+  last_config_revision_id?: number | null;
   revisions: RevisionListItem[];
 }
 
@@ -466,7 +486,7 @@ export const fetchCompileView = (revision: number): Promise<CompileView> =>
 /* ── 节点 ── */
 
 /* 与 brocade_deployment::protocol 中的同名结构逐字段对应 */
-export const AGENT_PROTOCOL_VERSION = 57;
+export const AGENT_PROTOCOL_VERSION = 67;
 export const FORWARDING_TARGET_POLICY_PROTOCOL_VERSION = 43;
 export const MIN_AGENT_PROTOCOL_VERSION = 20;
 export const REALTIME_USER_TRAFFIC_PROTOCOL_VERSION = 27;
@@ -479,6 +499,7 @@ export const VPNGATE_DEFAULT_PROBE_WORKERS = 16;
 export const VPNGATE_MAX_PROBE_WORKERS = 128;
 
 export interface NodeVersions {
+  agent_flavor?: 'base' | 'cvm' | null;
   unlock_ip_families?: boolean | null;
   unlock_connection_trace?: boolean | null;
   agent: string;
@@ -990,11 +1011,11 @@ export interface DeploymentCommandResult {
 }
 
 export const planDeployment = (revision_id: number, token = '') =>
-  post<DeploymentPlan>('/deployments/plan', { revision_id }, token);
+  deploymentRead<DeploymentPlan>('/deployments/plan', { revision_id }, token);
 
 /** Actual acknowledged artifacts → planned bytes; historical revisions are not recompiled as the baseline. */
 export const fetchPlanArtifacts = (revision_id: number, includeContent = false, token = '') =>
-  post<{ revision: number; targets: DeploymentTargetDetail[] }>(
+  deploymentRead<{ revision: number; targets: DeploymentTargetDetail[] }>(
     `/deployments/plan/artifacts${includeContent ? '?include=content' : ''}`,
     { revision_id },
     token,
@@ -1742,8 +1763,8 @@ export interface ClashHaitunSubscriptionInfo {
 }
 
 // The URL is a bearer credential: it is fetched only by the subscription card on the user's
-// access tab, never with the ordinary user-list response. The card renders it with the token
-// masked; the full URL stays in memory until the operator reveals or copies it.
+// access tab, never with the ordinary user-list response. The QR is visible by default;
+// the text address keeps its token masked until the operator reveals it.
 export const fetchClashSubscription = (tenant: string, user: string, signal?: AbortSignal) =>
   api<ClashSubscriptionInfo>(`/users/${tenant}/${user}/clash-subscription`, '', { signal });
 
@@ -4396,6 +4417,8 @@ export interface BinaryReleaseAttempt {
   finished_at: string | null;
 }
 export interface BinaryRelease {
+  agent_flavor: 'base' | 'cvm' | null;
+  allow_flavor_change: boolean;
   id: number;
   component: BinaryComponent;
   build_id: string;
@@ -4432,7 +4455,16 @@ export interface BinaryReleaseSummary {
   succeeded_count: number;
   problem_count: number;
 }
+export interface BinaryCatalog {
+  agent_flavor: 'base' | 'cvm' | null;
+  component: BinaryComponent;
+  build_id: string;
+  version: string;
+  artifacts: BinaryReleaseArtifact[];
+  source: 'embedded';
+}
 export interface BinaryReleaseView {
+  available_variants?: BinaryCatalog[];
   available: {
     component: BinaryComponent;
     build_id: string;
@@ -4457,6 +4489,8 @@ export interface BinaryReleaseHistoryPage {
   next_before_id: number | null;
 }
 export interface CreateBinaryRelease {
+  agent_flavor?: 'base' | 'cvm';
+  allow_flavor_change?: boolean;
   idempotency_key: string;
   build_id: string;
   nodes: string[];
@@ -4883,7 +4917,7 @@ export const revokeNodeToken = (id: string) =>
 
 /* 验证接入：执行一次不做任何修改的空收敛，确认该机器是否已收敛到当前模型 */
 export const verifyDeployment = (body: { revision_id?: number; node_id?: string }) =>
-  post<{
+  deploymentRead<{
     revision_id: number;
     converged: boolean;
     summary: PlanSummary;
@@ -5736,7 +5770,7 @@ export const UNLOCK_DUAL_STACK_PROTOCOL_VERSION = 50;
 export const UNLOCK_PROBE_PROTOCOL_VERSION = 46;
 export const CHAIN_UNLOCK_PROBE_PROTOCOL_VERSION = 47;
 export const YOUTUBE_UNLOCK_DETAILS_PROTOCOL_VERSION = 49;
-export const UNLOCK_PROBE_INTERVAL_SECS = 86_400;
+export const UNLOCK_PROBE_INTERVAL_SECS = 14_400;
 export type UnlockService =
   | 'chatgpt'
   | 'claude'

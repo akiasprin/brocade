@@ -23,7 +23,17 @@ for (const { width, machines, theme } of cases) {
     await expect(board.locator('thead th[data-node]')).toHaveCount(machines);
     await expect(board).not.toHaveAttribute('aria-busy');
     await page.evaluate(() => document.fonts.ready);
-    await expect(page).toHaveScreenshot(`fleet-${machines}-${width}-${theme}.png`);
+    // This static fixture has about 9,000 elements at 48 machines. Finish its
+    // entrance once; disabling animations per screenshot walks the entire tree.
+    await page.evaluate(() =>
+      Promise.all(
+        document
+          .getAnimations()
+          .filter(animation => animation.effect?.getComputedTiming().iterations !== Infinity)
+          .map(animation => animation.finished.catch(() => undefined)),
+      ),
+    );
+    await expect(page).toHaveScreenshot(`fleet-${machines}-${width}-${theme}.png`, { animations: 'allow' });
 
     expect(
       await page.evaluate(() => Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) > innerWidth),

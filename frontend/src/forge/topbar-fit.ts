@@ -2,7 +2,7 @@ import { useLayoutEffect, type RefObject } from 'react';
 
 // Measure actual content so long account names, status changes and the artifact rail obey the same
 // priorities. The top bar must not become a CSS size container: that traps its account menu.
-const FIT_STEPS = ['account', 'traffic', 'brand', 'meta', 'label'];
+const FIT_STEPS = ['account', 'traffic', 'brand', 'meta', 'nav', 'label'];
 const MIN_GAP = 16;
 
 export function useTopbarFit(ref: RefObject<HTMLDivElement | null>, narrow: boolean) {

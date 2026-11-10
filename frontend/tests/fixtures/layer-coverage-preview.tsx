@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Confirm, ErrorBox } from '../../src/ui/bits';
+import { ChoiceSelect } from '../../src/ui/choice-menu';
 import { SourceAccessRollout } from '../../src/panes/user-source-access';
 import type { SourceAccessNode } from '../../src/api';
 import { theme } from '../../src/forge/theme';
@@ -24,6 +25,13 @@ client.setQueryData(['nodes'], {
 function Preview() {
   const [confirm, setConfirm] = useState(false),
     [done, setDone] = useState(false);
+  const [count, setCount] = useState(params.has('dynamic') ? 1 : 80);
+  const [choice, setChoice] = useState('0');
+  useEffect(() => {
+    const expand = () => setCount(80);
+    window.addEventListener('fixture:grow-layer', expand);
+    return () => window.removeEventListener('fixture:grow-layer', expand);
+  }, []);
   return (
     <QueryClientProvider client={client}>
       <main style={{ padding: 16 }}>
@@ -34,6 +42,15 @@ function Preview() {
           <SourceAccessRollout nodes={nodes} />
         </span>
         <p>{done ? '已执行合成动作' : '共享组件夹具；未连接业务写入'}</p>
+        {params.has('dynamic') && (
+          <ChoiceSelect value={choice} onChange={event => setChoice(event.target.value)} aria-label="动态选项">
+            {Array.from({ length: count }, (_, index) => (
+              <option key={index} value={String(index)}>
+                示例来源 {index + 1}
+              </option>
+            ))}
+          </ChoiceSelect>
+        )}
         {params.has('error') && (
           <section className="panel config-panel">
             <header>受控长错误文本</header>
@@ -45,7 +62,7 @@ function Preview() {
             title="确认这批机器的操作？"
             body={
               <ol>
-                {Array.from({ length: 80 }, (_, i) => (
+                {Array.from({ length: count }, (_, i) => (
                   <li key={i}>机器 {i + 1} · 香港 / 东京 / Singapore · 等待确认该机器对应的变更和当前连接处理策略</li>
                 ))}
               </ol>

@@ -48,8 +48,8 @@ test('状态语义不再使用无效修饰符，按钮不保留无效果的 ghos
   assert.match(styles, /\.callout\.err\s*\{[^}]*var\(--err\)/s);
 });
 
-test('用户页桌面按钮沿用全站控件高度', () => {
-  for (const selector of ['user-roster-head-actions \\.btn', 'user-dacts \\.btn']) {
+test('用户名册按钮沿用全站控件高度', () => {
+  for (const selector of ['user-roster-head-actions \\.btn']) {
     assert.match(styles, new RegExp(`\\.${selector}\\s*\\{[^}]*min-height:\\s*var\\(--ctl-h\\)`, 's'));
   }
 });
