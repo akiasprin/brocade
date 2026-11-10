@@ -1,3 +1,17 @@
+-- Keep published migration 0003 unchanged. Apply the new scheduling default here
+-- while preserving configured intervals and deadlines on existing installations.
+ALTER TABLE control_state
+    ALTER COLUMN unlock_detection_interval_hours SET DEFAULT 4,
+    ALTER COLUMN unlock_detection_next_run_at SET DEFAULT now() + interval '4 hours';
+UPDATE control_state
+   SET unlock_detection_interval_hours = 4,
+       unlock_detection_next_run_at = now() + interval '4 hours'
+ WHERE unlock_detection_mode = 'scheduled'
+   AND unlock_detection_interval_hours = 24
+   AND NOT EXISTS (SELECT 1 FROM admin_operators)
+   AND NOT EXISTS (SELECT 1 FROM nodes)
+   AND NOT EXISTS (SELECT 1 FROM users);
+
 -- Keep the Xray service intent in immutable model revisions; historical snapshots default on.
 ALTER TABLE nodes ADD COLUMN xray_enabled BOOLEAN NOT NULL DEFAULT TRUE;
 

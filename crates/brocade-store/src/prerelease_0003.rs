@@ -209,7 +209,6 @@ impl PgStore {
                 "0003 在线来源会话结构未完整创建".into(),
             ));
         }
-        crate::settings::migrate_unlock_detection_defaults(&mut tx).await?;
         sqlx::query("UPDATE _sqlx_migrations SET checksum=$1 WHERE version=3")
             .bind(migration.checksum.as_ref())
             .execute(&mut *tx)
