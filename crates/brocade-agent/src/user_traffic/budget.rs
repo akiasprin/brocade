@@ -1,15 +1,11 @@
 //! One bounded FIFO and one in-flight reservation per Console-derived user/app pool.
 //! HTTP never holds the admission lock; every grant retains its own original expiry.
 use super::*;
-use std::{
-    collections::VecDeque,
-    sync::{
-        mpsc::{self, Receiver, SyncSender, TrySendError},
-        Condvar,
-    },
-};
+#[cfg(test)]
+use std::sync::mpsc as blocking;
+use std::{collections::VecDeque, sync::Condvar};
+use tokio::sync::mpsc::{self, error::TrySendError, Receiver};
 
-const FETCH_WORKERS: usize = 8;
 const TARGET_WINDOW: Duration = Duration::from_millis(500);
 const MIN_PREFETCH: u64 = 8192;
 
@@ -65,7 +61,157 @@ mod tests {
         assert_eq!(state.credits(), 0);
     }
 
-    fn delayed_budget(listener: TcpListener, seen: mpsc::Sender<()>, release: Receiver<()>) {
+    #[test]
+    fn queue_delay_advances_refill_without_extending_the_grant() {
+        let service = super::super::tests::test_service(
+            &std::env::temp_dir(),
+            "http://127.0.0.1:9",
+            0,
+            "127.0.0.1:9".parse().unwrap(),
+        );
+        let source = "queue@tenant#entry";
+        service.known.lock().unwrap().insert(source.into());
+        let pool = source_entry(&service, source).unwrap();
+        let started = Instant::now();
+        complete(
+            FetchJob {
+                service,
+                pool: Arc::clone(&pool),
+                generation: 0,
+                enqueued: started - Duration::from_millis(200),
+                request: UserBudgetRequest {
+                    source: source.into(),
+                    request_id: "a".repeat(32),
+                    bytes: 40_000,
+                },
+            },
+            started,
+            Ok(UserBudgetGrant::Limited {
+                bytes: 40_000,
+                rate_bps: 100_000_000,
+                valid_ms: 2000,
+            }),
+        );
+        let mut state = pool.state.lock().unwrap();
+        assert!(state.roundtrip >= Duration::from_millis(200));
+        assert_eq!(state.leases[0].expires, started + Duration::from_secs(2));
+        state.observed_bytes_per_second = 100_000;
+        state.waiters.push_back(Waiter {
+            ticket: 1,
+            bytes: 16,
+        });
+        assert!(state.needs_fetch(Instant::now()));
+        state.roundtrip = Duration::from_millis(50);
+        assert!(!state.needs_fetch(Instant::now()));
+    }
+
+    #[test]
+    fn independent_refills_start_before_any_slow_response_finishes() {
+        crate::identity::self_identity();
+        const USERS: usize = 32;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = super::super::tests::test_service(
+            &std::env::temp_dir(),
+            &format!("http://{address}"),
+            0,
+            address,
+        );
+        let (seen_tx, seen_rx) = blocking::channel();
+        let (finish_tx, finish_rx) = blocking::channel();
+        let server = thread::spawn(move || {
+            let mut workers = Vec::new();
+            let mut releases = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            for _ in 0..USERS {
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(1))
+                        }
+                        Err(error) => panic!("concurrent budget accept failed: {error}"),
+                    }
+                };
+                let seen = seen_tx.clone();
+                let (release, wait) = blocking::channel();
+                releases.push(release);
+                workers.push(thread::spawn(move || {
+                    let mut stream = stream;
+                    let (_, body) = crate::http::tests::read_request(&mut stream);
+                    let request: UserBudgetRequest = serde_json::from_slice(&body).unwrap();
+                    seen.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(2)).unwrap();
+                    let body = serde_json::to_vec(&UserBudgetGrant::Limited {
+                        bytes: request.bytes,
+                        rate_bps: 100_000_000,
+                        valid_ms: 2000,
+                    })
+                    .unwrap();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&body).unwrap();
+                }));
+            }
+            finish_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            for release in releases {
+                release.send(()).unwrap();
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        let mut pools = Vec::new();
+        for i in 0..USERS {
+            let source = format!("parallel{i}@tenant#entry");
+            service.known.lock().unwrap().insert(source.clone());
+            let pool = source_entry(&service, &source).unwrap();
+            {
+                let mut state = pool.state.lock().unwrap();
+                state.waiters.push_back(Waiter {
+                    ticket: 1,
+                    bytes: 16,
+                });
+                schedule(&service, &pool, &mut state, &source).unwrap();
+            }
+            pools.push(pool);
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        for _ in 0..USERS {
+            seen_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("slow responses must not prevent independent HTTP requests from starting");
+        }
+        finish_tx.send(()).unwrap();
+        server.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        for pool in pools {
+            let mut state = pool.state.lock().unwrap();
+            while state.fetching {
+                assert!(Instant::now() < deadline);
+                state = pool
+                    .changed
+                    .wait_timeout(state, Duration::from_millis(10))
+                    .unwrap()
+                    .0;
+            }
+            assert_eq!(state.credits(), MIN_PREFETCH);
+        }
+    }
+
+    fn delayed_budget(
+        listener: TcpListener,
+        seen: blocking::Sender<()>,
+        release: blocking::Receiver<()>,
+    ) {
         let (mut stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut line = String::new();
@@ -116,8 +262,8 @@ mod tests {
                 expires,
             });
         }
-        let (seen_tx, seen_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
+        let (seen_tx, seen_rx) = blocking::channel();
+        let (release_tx, release_rx) = blocking::channel();
         let server = thread::spawn(move || delayed_budget(listener, seen_tx, release_rx));
         let pair = TcpListener::bind("127.0.0.1:0").unwrap();
         let _client = TcpStream::connect(pair.local_addr().unwrap()).unwrap();
@@ -164,8 +310,8 @@ mod tests {
         let service =
             super::super::tests::test_service(&dir, &format!("http://{address}"), 0, address);
         let pool = source_entry(&service, "alice@tenant#one").unwrap();
-        let (seen_tx, seen_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
+        let (seen_tx, seen_rx) = blocking::channel();
+        let (release_tx, release_rx) = blocking::channel();
         let server = thread::spawn(move || delayed_budget(listener, seen_tx, release_rx));
         {
             let mut state = pool.state.lock().unwrap();
@@ -275,7 +421,11 @@ impl State {
             return false;
         }
         let margin = (self.roundtrip * 2).clamp(Duration::from_millis(100), TARGET_WINDOW);
-        self.credits() <= self.target() / 2
+        let expected_use = (u128::from(self.observed_bytes_per_second) * margin.as_nanos()
+            / 1_000_000_000)
+            .min(u128::from(MAX_BUDGET_BYTES)) as u64;
+        let low_water = (self.target() / 2).max(expected_use).min(self.target());
+        self.credits() <= low_water
             || self
                 .leases
                 .front()
@@ -369,123 +519,144 @@ pub(super) struct FetchJob {
     pool: Arc<Pool>,
     generation: u64,
     request: UserBudgetRequest,
-    deadline: Instant,
+    enqueued: Instant,
 }
 
-pub(super) type FetchSender = SyncSender<FetchJob>;
+pub(super) type FetchSender = mpsc::Sender<FetchJob>;
 
 pub(super) fn start_fetchers() -> Result<FetchSender, String> {
-    let (sender, receiver) = mpsc::sync_channel::<FetchJob>(MAX_CLIENTS);
-    let receiver = Arc::new(Mutex::new(receiver));
-    for index in 0..FETCH_WORKERS {
-        let receiver = Arc::clone(&receiver);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| "user budget HTTP runtime unavailable")?;
-        let client = crate::http::asynchronous::control_client(1)?;
-        thread::Builder::new()
-            .name(format!("user-budget-fetch-{index}"))
-            .spawn(move || fetch_loop(receiver, runtime, client))
-            .map_err(|_| "user budget fetch worker unavailable")?;
-    }
+    let client = crate::http::asynchronous::control_client(MAX_CLIENTS)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(2)
+        .build()
+        .map_err(|_| "user budget runtime unavailable")?;
+    let (sender, receiver) = mpsc::channel(MAX_CLIENTS);
+    thread::Builder::new()
+        .name("user-budget-fetch".into())
+        .spawn(move || runtime.block_on(fetch_loop(receiver, client)))
+        .map_err(|_| "user budget fetch worker unavailable")?;
     Ok(sender)
 }
 
-fn fetch_loop(
-    receiver: Arc<Mutex<Receiver<FetchJob>>>,
-    runtime: tokio::runtime::Runtime,
-    client: reqwest::Client,
-) {
+async fn fetch_loop(mut receiver: Receiver<FetchJob>, client: reqwest::Client) {
+    let mut tasks = tokio::task::JoinSet::new();
     loop {
-        let job = match receiver.lock() {
-            Ok(receiver) => match receiver.recv() {
-                Ok(job) => job,
-                Err(_) => return,
-            },
-            Err(_) => return,
-        };
-        let started = Instant::now();
-        let result = if job.service.generation.load(Ordering::Acquire) != job.generation {
-            Err("user budget policy changed".into())
-        } else {
-            runtime
-                .block_on(fetch(&job.service, &job.request, &client, job.deadline))
-                .and_then(|grant| {
-                    let managed =
-                        !matches!(grant, UserBudgetGrant::Unlimited { managed: false, .. });
-                    if !matches!(grant, UserBudgetGrant::Retry { .. }) {
-                        remember(&job.service, &job.request.source, managed)?;
-                    }
-                    Ok(grant)
-                })
-        };
-        let Ok(mut state) = job.pool.state.lock() else {
-            continue;
-        };
-        if state.generation != job.generation
-            || job.service.generation.load(Ordering::Acquire) != job.generation
-        {
-            job.pool.changed.notify_all();
-            continue;
-        }
-        state.fetching = false;
-        state.roundtrip = (state.roundtrip + started.elapsed()) / 2;
-        match result {
-            Ok(UserBudgetGrant::Limited {
-                bytes,
-                rate_bps,
-                valid_ms,
-            }) => {
-                if bytes == 0
-                    || bytes > job.request.bytes
-                    || bytes > MAX_BUDGET_BYTES
-                    || !(1000..=1_000_000_000_000).contains(&rate_bps)
-                    || valid_ms == 0
-                    || valid_ms > BUDGET_TTL_MS
-                {
-                    state.error = Some("invalid global budget grant".into());
-                    state.retry_at = Instant::now() + Duration::from_millis(250);
-                } else {
-                    state.rate = rate_bps;
-                    state.leases.push_back(Lease {
-                        bytes,
-                        expires: started + Duration::from_millis(valid_ms),
-                    });
-                    state.reservation = None;
-                    state.error = None;
+        tokio::select! {
+            Some(job) = receiver.recv(), if tasks.len() < MAX_CLIENTS => {
+                tasks.spawn(fetch_one(job, client.clone()));
+            }
+            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                if !matches!(result, Ok(Ok(()))) {
+                    eprintln!("user budget completion worker failed");
                 }
             }
-            Ok(UserBudgetGrant::Retry { after_ms }) => {
-                state.retry_at = Instant::now() + Duration::from_millis(after_ms.clamp(1, 1000));
+            else => break,
+        }
+    }
+}
+
+async fn fetch_one(job: FetchJob, client: reqwest::Client) -> Result<(), String> {
+    let started = Instant::now();
+    let result = if job.service.generation.load(Ordering::Acquire) != job.generation {
+        Err("user budget policy changed".into())
+    } else {
+        fetch(
+            &job.service,
+            &job.request,
+            &client,
+            job.enqueued + Duration::from_millis(BUDGET_TTL_MS),
+        )
+        .await
+    };
+    // Rare checkpoint writes must not block the socket reactor. This pool is also bounded.
+    tokio::task::spawn_blocking(move || complete(job, started, result))
+        .await
+        .map_err(|_| "user budget completion worker failed".to_owned())
+}
+
+fn complete(job: FetchJob, started: Instant, result: Result<UserBudgetGrant, String>) {
+    let result = if job.service.generation.load(Ordering::Acquire) != job.generation {
+        Err("user budget policy changed".into())
+    } else {
+        result.and_then(|grant| {
+            if !matches!(grant, UserBudgetGrant::Retry { .. }) {
+                remember(
+                    &job.service,
+                    &job.request.source,
+                    !matches!(grant, UserBudgetGrant::Unlimited { managed: false, .. }),
+                )?;
             }
-            Ok(UserBudgetGrant::Unlimited { valid_ms, managed }) => {
-                state.leases.clear();
-                state.mode = Some((
-                    if managed {
-                        Admission::Open
-                    } else {
-                        Admission::Pass
-                    },
-                    started + Duration::from_millis(valid_ms.min(BUDGET_TTL_MS)),
-                ));
-                state.reservation = None;
-            }
-            Ok(UserBudgetGrant::Suspended { valid_ms }) => {
-                state.leases.clear();
-                state.mode = Some((
-                    Admission::Suspended,
-                    started + Duration::from_millis(valid_ms.min(BUDGET_TTL_MS)),
-                ));
-                state.reservation = None;
-            }
-            Err(error) => {
-                state.error = Some(error);
+            Ok(grant)
+        })
+    };
+    let Ok(mut state) = job.pool.state.lock() else {
+        return;
+    };
+    if state.generation != job.generation
+        || job.service.generation.load(Ordering::Acquire) != job.generation
+    {
+        job.pool.changed.notify_all();
+        return;
+    }
+    state.fetching = false;
+    let elapsed = job.enqueued.elapsed();
+    // React immediately to growing queue delay, and decay conservatively after recovery.
+    state.roundtrip = elapsed.max((state.roundtrip + elapsed) / 2);
+    match result {
+        Ok(UserBudgetGrant::Limited {
+            bytes,
+            rate_bps,
+            valid_ms,
+        }) => {
+            if bytes == 0
+                || bytes > job.request.bytes
+                || bytes > MAX_BUDGET_BYTES
+                || !(1000..=1_000_000_000_000).contains(&rate_bps)
+                || valid_ms == 0
+                || valid_ms > BUDGET_TTL_MS
+            {
+                state.error = Some("invalid global budget grant".into());
                 state.retry_at = Instant::now() + Duration::from_millis(250);
+            } else {
+                state.rate = rate_bps;
+                state.leases.push_back(Lease {
+                    bytes,
+                    expires: started + Duration::from_millis(valid_ms),
+                });
+                state.reservation = None;
+                state.error = None;
             }
         }
-        job.pool.changed.notify_all();
+        Ok(UserBudgetGrant::Retry { after_ms }) => {
+            state.retry_at = Instant::now() + Duration::from_millis(after_ms.clamp(1, 1000));
+        }
+        Ok(UserBudgetGrant::Unlimited { valid_ms, managed }) => {
+            state.leases.clear();
+            state.mode = Some((
+                if managed {
+                    Admission::Open
+                } else {
+                    Admission::Pass
+                },
+                started + Duration::from_millis(valid_ms.min(BUDGET_TTL_MS)),
+            ));
+            state.reservation = None;
+        }
+        Ok(UserBudgetGrant::Suspended { valid_ms }) => {
+            state.leases.clear();
+            state.mode = Some((
+                Admission::Suspended,
+                started + Duration::from_millis(valid_ms.min(BUDGET_TTL_MS)),
+            ));
+            state.reservation = None;
+        }
+        Err(error) => {
+            state.error = Some(error);
+            state.retry_at = Instant::now() + Duration::from_millis(250);
+        }
     }
+    job.pool.changed.notify_all();
 }
 
 fn schedule(
@@ -525,8 +696,7 @@ fn schedule(
         pool: Arc::clone(pool),
         generation: state.generation,
         request,
-        // Queueing consumes the same short budget as the asynchronous request.
-        deadline: now + Duration::from_millis(BUDGET_TTL_MS),
+        enqueued: now,
     };
     match service.fetcher.try_send(job) {
         Ok(()) => {
@@ -536,7 +706,7 @@ fn schedule(
         Err(TrySendError::Full(_)) => {
             state.retry_at = now + Duration::from_millis(5);
         }
-        Err(TrySendError::Disconnected(_)) => return Err("user budget workers unavailable".into()),
+        Err(TrySendError::Closed(_)) => return Err("user budget workers unavailable".into()),
     }
     Ok(())
 }
