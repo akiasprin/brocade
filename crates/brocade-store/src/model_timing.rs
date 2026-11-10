@@ -162,43 +162,51 @@ impl Drop for Stage {
 
 /// Diagnose a complete operation, including errors and cancellation. A process-local numeric
 /// id correlates its stages without exposing the operator, revision, URL or configuration.
-pub async fn observe<T, E>(
+pub fn observe<T, E>(
     operation: Operation,
     operations: usize,
     future: impl Future<Output = Result<T, E>>,
-) -> Result<T, E> {
-    if !permitted() {
-        return future.await;
+) -> impl Future<Output = Result<T, E>> {
+    // Box before constructing the async state so instrumentation never embeds
+    // another copy of a large model-write future on the request stack.
+    let future = Box::pin(future);
+    async move {
+        if !permitted() {
+            return future.await;
+        }
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let context = Arc::new(Context {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            operation,
+            operations,
+            started: Instant::now(),
+            stages: AtomicUsize::new(0),
+            #[cfg(test)]
+            captured: None,
+        });
+        CURRENT
+            .scope(context, measure("request_total", future))
+            .await
     }
-    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-    let context = Arc::new(Context {
-        id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-        operation,
-        operations,
-        started: Instant::now(),
-        stages: AtomicUsize::new(0),
-        #[cfg(test)]
-        captured: None,
-    });
-    CURRENT
-        .scope(context, measure("request_total", future))
-        .await
 }
 
 /// Measure an asynchronous stage. Use only a fixed stage name, never a value from a request.
-pub async fn measure<T, E>(
+pub fn measure<T, E>(
     name: &'static str,
     future: impl Future<Output = Result<T, E>>,
-) -> Result<T, E> {
-    let stage = CURRENT
-        .try_with(|context| Stage::begin(Arc::clone(context), name))
-        .ok()
-        .flatten();
-    let result = future.await;
-    if let Some(stage) = stage {
-        stage.finish(result.is_ok());
+) -> impl Future<Output = Result<T, E>> {
+    let future = Box::pin(future);
+    async move {
+        let stage = CURRENT
+            .try_with(|context| Stage::begin(Arc::clone(context), name))
+            .ok()
+            .flatten();
+        let result = future.await;
+        if let Some(stage) = stage {
+            stage.finish(result.is_ok());
+        }
+        result
     }
-    result
 }
 
 /// Measure synchronous rendering separately from asynchronous compilation and database work.
@@ -217,6 +225,28 @@ pub fn measure_sync<T, E>(name: &'static str, run: impl FnOnce() -> Result<T, E>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wrappers_keep_large_model_futures_off_the_request_stack() {
+        struct LargeFuture([u8; 64 * 1024]);
+        impl Future for LargeFuture {
+            type Output = Result<u8, ()>;
+
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Ready(Ok(self.0[0]))
+            }
+        }
+
+        let measured = measure("write_ops", LargeFuture([7; 64 * 1024]));
+        assert!(std::mem::size_of_val(&measured) < 4096);
+        assert_eq!(measured.await, Ok(7));
+        let observed = observe(Operation::DraftApply, 1, LargeFuture([9; 64 * 1024]));
+        assert!(std::mem::size_of_val(&observed) < 4096);
+        assert_eq!(observed.await, Ok(9));
+    }
 
     fn context(id: u64) -> Arc<Context> {
         Arc::new(Context {
