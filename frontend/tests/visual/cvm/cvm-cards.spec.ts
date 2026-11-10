@@ -21,4 +21,3 @@ for (const width of [1440, 390, 320]) for (const theme of ['light', 'dark']) {
     expect(errors).toEqual([]);
   });
 }
-
