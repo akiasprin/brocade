@@ -2586,7 +2586,7 @@ pub struct NodeTrafficReading {
 /// value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeVersions {
-    /// Missing identity is unknown and cannot authorize a variant switch.
+    /// Legacy Agents omit this identity; release negotiation treats them as base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_flavor: Option<crate::product::ProductFlavor>,
     /// Actual running Xray and its origin environment support connection-bound evidence.

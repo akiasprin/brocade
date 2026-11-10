@@ -21,6 +21,45 @@ afterEach(() => {
 });
 
 describe('二进制发布共用视图', () => {
+  it('未上报变体的旧 Agent 可升级基础版，显式 CVM 保持阻止降级', () => {
+    const qc = client();
+    qc.setQueryData(['nodes'], {
+      nodes: [undefined, null, 'base', 'cvm'].map((flavor, index) => ({
+        node_id: `edge-${index}`,
+        name: `机器 ${index}`,
+        agent_version: `brocade-agent/${'b'.repeat(64)}`,
+        lifecycle_phase: 'active',
+        desired_poll_fresh: true,
+        runtime_versions: flavor === undefined ? {} : { agent_flavor: flavor },
+      })),
+    });
+    qc.setQueryData(['binary-releases', 'agent'], {
+      available: {
+        agent_flavor: 'base',
+        component: 'agent',
+        version: 'test',
+        build_id: digest,
+        source: 'embedded',
+        artifacts: [{ arch: 'x86_64', sha256: digest }],
+      },
+      current: null,
+      legacy_approval: null,
+    });
+    function Harness() {
+      const release = useBinaryRelease('agent');
+      return <BinaryReleaseTab release={release} editable editing onEditingChange={() => {}} />;
+    }
+    render(
+      <QueryClientProvider client={qc}>
+        <Harness />
+      </QueryClientProvider>,
+    );
+    for (const index of [0, 1, 2]) {
+      expect((screen.getByLabelText(`升级 机器 ${index}`) as HTMLInputElement).disabled).toBe(false);
+    }
+    expect((screen.getByLabelText('升级 机器 3') as HTMLInputElement).disabled).toBe(true);
+  });
+
   it('完成回执刷新机器摘要，关闭的历史不额外请求', async () => {
     const qc = client();
     const old = 'b'.repeat(64);

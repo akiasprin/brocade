@@ -72,6 +72,28 @@ const data: [readonly unknown[], unknown][] = [
   [['certs'], { groups: [], nodes: [], domain: null, sealing_available: true }],
 ];
 for (const [key, value] of data) client.setQueryData(key, value);
+if (scene === 'agent-binary') {
+  client.setQueryData(['nodes'], {
+    nodes: [undefined, null, 'base', 'cvm'].map((flavor, index) => ({
+      ...nodes[index],
+      node_id: `agent-${index}`,
+      name: ['旧 Agent（未上报身份）', '旧 Agent（身份为空）', '基础版 Agent', '容器版 Agent'][index],
+      runtime_versions: flavor === undefined ? {} : { agent_flavor: flavor },
+    })),
+  });
+  client.setQueryData(['binary-releases', 'agent'], {
+    available: {
+      agent_flavor: 'base',
+      component: 'agent',
+      version: 'a'.repeat(40),
+      build_id: 'a'.repeat(64),
+      source: 'embedded',
+      artifacts: [{ arch: 'x86_64', sha256: 'a'.repeat(64) }],
+    },
+    current: null,
+    legacy_approval: null,
+  });
+}
 const responses: Record<string, unknown> = {
   '/model/snapshot': snapshot,
   '/nodes/agent-state': { nodes },
@@ -148,7 +170,7 @@ class FixtureSource extends EventTarget {
 }
 window.EventSource = FixtureSource as unknown as typeof EventSource;
 function Binary() {
-  const release = useBinaryRelease('xray');
+  const release = useBinaryRelease(scene === 'agent-binary' ? 'agent' : 'xray');
   return <BinaryReleaseTab release={release} editable editing onEditingChange={() => {}} />;
 }
 const FailingModule = lazy(() => import('./ui-regressions-module'));
@@ -245,7 +267,7 @@ function Preview() {
           </section>
         ) : scene === 'telemetry' ? (
           <LoadCard report={report} />
-        ) : scene === 'binary' ? (
+        ) : scene === 'binary' || scene === 'agent-binary' ? (
           <Binary />
         ) : scene === 'deploy' ? (
           <DeployPane win={win} />

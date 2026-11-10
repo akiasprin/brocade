@@ -6,7 +6,7 @@ use brocade_store::{
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn product_variants_require_reported_identity_and_explicit_release_intent() {
+async fn product_variants_default_legacy_agents_to_base_and_require_explicit_switches() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -29,22 +29,33 @@ async fn product_variants_require_reported_identity_and_explicit_release_intent(
         artifacts: &artifacts,
     };
     let mut request = CreateBinaryReleaseRequest {
-        agent_flavor: Some(ProductFlavor::Cvm),
-        allow_flavor_change: true,
-        idempotency_key: "variant-test".into(),
+        agent_flavor: Some(ProductFlavor::Base),
+        allow_flavor_change: false,
+        idempotency_key: "legacy-base-test".into(),
         build_id: build_id.clone(),
         nodes: vec!["n1".into()],
         note: None,
         xray_strategy: None,
         xray_drain_timeout_secs: None,
     };
-    assert!(
-        matches!(db.store.create_binary_release(&system_admin(), request.clone(), build).await,
-        Err(StoreError::InvalidData(message)) if message.contains("product flavor"))
-    );
-    sqlx::query("UPDATE node_agent_state SET runtime_versions=runtime_versions||'{\"agent_flavor\":\"base\"}'::jsonb WHERE node_id='n1'")
-        .execute(db.pool()).await.unwrap();
-    request.allow_flavor_change = false;
+    let legacy_order = db
+        .store
+        .create_binary_release(&system_admin(), request.clone(), build)
+        .await
+        .unwrap();
+    let legacy_offer = db
+        .store
+        .claim_agent_release("n1", "x86_64", &build_id, true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(legacy_offer.agent_flavor, Some(ProductFlavor::Base));
+    db.store
+        .cancel_binary_release(BinaryComponent::Agent, &system_admin(), legacy_order.id)
+        .await
+        .unwrap();
+    request.idempotency_key = "variant-test".into();
+    request.agent_flavor = Some(ProductFlavor::Cvm);
     assert!(matches!(
         db.store
             .create_binary_release(&system_admin(), request.clone(), build)

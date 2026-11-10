@@ -10307,6 +10307,16 @@ fn observed_grants_from_desired(desired: &Value) -> Value {
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
+    assert_agent_release_is_offered_only_to_nodes_in_scope(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn http_legacy_agent_can_claim_a_base_release_without_flavor_identity() {
+    assert_agent_release_is_offered_only_to_nodes_in_scope(true).await;
+}
+
+async fn assert_agent_release_is_offered_only_to_nodes_in_scope(legacy: bool) {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -10318,16 +10328,23 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
     assert_eq!(issued.0, StatusCode::CREATED);
     let token = issued.1["token"].as_str().unwrap().to_owned();
     let previous = "1".repeat(64);
+    let runtime_versions = if legacy {
+        json!({"agent": previous})
+    } else {
+        json!({"agent": previous, "agent_flavor": "base"})
+    };
     sqlx::query("UPDATE node_agent_state SET agent_version = $1, last_poll_at = now(),
         runtime_reported_at = now(), agent_protocol_version = 24, runtime_versions = $2 WHERE node_id = 'n1'")
-        .bind(format!("brocade-agent/{previous}")).bind(json!({"agent": previous, "agent_flavor": "base"})).execute(db.pool()).await.unwrap();
+        .bind(format!("brocade-agent/{previous}")).bind(runtime_versions).execute(db.pool()).await.unwrap();
     let ask = |arch: Option<&'static str>| {
         let agent = agent.clone();
         let token = token.clone();
         async move {
             let mut request = Request::get("/agent/v1/agent-release")
-                .header("authorization", format!("Bearer {token}"))
-                .header("x-brocade-flavor", "base");
+                .header("authorization", format!("Bearer {token}"));
+            if !legacy {
+                request = request.header("x-brocade-flavor", "base");
+            }
             if let Some(arch) = arch {
                 request = request.header("x-brocade-arch", arch);
             }
@@ -10366,7 +10383,7 @@ async fn http_agent_release_is_offered_only_to_nodes_in_scope() {
     assert_eq!(created.0, StatusCode::OK);
     let id = created.1["current"]["id"].as_i64().unwrap();
     assert_eq!(created.1["current"]["events"], json!([]));
-    // The repair channel needs product identity but no desired-state protocol header.
+    // Legacy repair requests omit flavor identity and the desired-state protocol header.
     let response = ask(Some("x86_64")).await;
     assert_eq!(response.status(), StatusCode::OK);
     let offer: Value =

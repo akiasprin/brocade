@@ -8110,6 +8110,19 @@ async fn agent_base_ready(
     Ok(Json(serde_json::json!({"base_ready":true})).into_response())
 }
 
+fn reported_agent_flavor(
+    headers: &HeaderMap,
+) -> Result<brocade_deployment::product::ProductFlavor, StoreError> {
+    let Some(value) = headers.get("x-brocade-flavor") else {
+        return Ok(brocade_deployment::product::ProductFlavor::Base);
+    };
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| StoreError::InvalidData("invalid Agent flavor".into()))
+}
+
 async fn agent_release(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
     if node.lifecycle_phase != NodeLifecyclePhase::Active {
@@ -8130,12 +8143,7 @@ async fn agent_release(State(state): State<AppState>, headers: HeaderMap) -> Api
     else {
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
-    let running_flavor = headers
-        .get("x-brocade-flavor")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| StoreError::InvalidData("Agent flavor is required".into()))?
-        .parse::<brocade_deployment::product::ProductFlavor>()
-        .map_err(|_| StoreError::InvalidData("invalid Agent flavor".into()))?;
+    let running_flavor = reported_agent_flavor(&headers)?;
     let Some(build_id) = agent_release_id_for(target_flavor) else {
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
@@ -9980,6 +9988,29 @@ const CVM_INSTALLER: &str = include_str!("../../../scripts/cvm_stack.py");
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_agent_flavor_defaults_only_missing_headers_to_base() {
+        use brocade_deployment::product::ProductFlavor;
+
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(
+            super::reported_agent_flavor(&headers).unwrap(),
+            ProductFlavor::Base
+        );
+        for (value, expected) in [("base", ProductFlavor::Base), ("cvm", ProductFlavor::Cvm)] {
+            headers.insert("x-brocade-flavor", value.parse().unwrap());
+            assert_eq!(super::reported_agent_flavor(&headers).unwrap(), expected);
+        }
+        for value in [
+            axum::http::HeaderValue::from_static(""),
+            axum::http::HeaderValue::from_static("unknown"),
+            axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        ] {
+            headers.insert("x-brocade-flavor", value);
+            assert!(super::reported_agent_flavor(&headers).is_err());
+        }
+    }
+
     #[test]
     fn legacy_forwarding_agents_receive_only_public_literal_targets() {
         let desired: brocade_deployment::protocol::ForwardingDesiredState = serde_json::from_value(serde_json::json!({

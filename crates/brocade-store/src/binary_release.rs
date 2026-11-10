@@ -591,11 +591,8 @@ pub async fn create_binary_release(
     for node_id in &nodes {
         let observation = &observations[node_id];
         if component == BinaryComponent::Agent {
-            let running_flavor = observation.agent_flavor.ok_or_else(|| {
-                StoreError::InvalidData(format!(
-                    "node {node_id} has not reported its Agent product flavor"
-                ))
-            })?;
+            // Agents predating product identities belong to the base upgrade path.
+            let running_flavor = observation.agent_flavor.unwrap_or(ProductFlavor::Base);
             if Some(running_flavor) != request.agent_flavor {
                 if !request.allow_flavor_change {
                     return Err(StoreError::Conflict(

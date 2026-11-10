@@ -169,8 +169,10 @@ export function useBinaryRelease(component: BinaryComponent) {
       ? 'current'
       : eligible(node, component, xrayStrategy) &&
           (component !== 'agent' ||
-            node.runtime_versions?.agent_flavor === effectiveFlavor ||
-            (allowFlavorChange && effectiveFlavor === 'cvm' && node.runtime_versions?.agent_flavor === 'base'))
+            (node.runtime_versions?.agent_flavor ?? 'base') === effectiveFlavor ||
+            (allowFlavorChange &&
+              effectiveFlavor === 'cvm' &&
+              (node.runtime_versions?.agent_flavor ?? 'base') === 'base'))
         ? 'behind'
         : 'blocked';
   const targets = new Map((active?.targets ?? []).map(target => [target.node_id, target]));
