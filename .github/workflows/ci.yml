@@ -157,7 +157,7 @@ jobs:
       - name: DNS provenance, cache ownership and blackhole response synchronization
         run: |
           go test -race ./features/probetrace ./app/dispatcher ./proxy/dns ./proxy/blackhole -count=3 -timeout=3m
-          go test -race ./app/dns -run '^Test(SerialTrace|RuleDNS|ParallelRuleGroup|ResponseTTL|UDPDomainResolver|LongDomain)' -count=3 -timeout=3m
+          go test -race ./app/dns -run '^Test(DNSDispatch|SerialTrace|RuleDNS|ParallelRuleGroup|ResponseTTL|UDPDomainResolver|LongDomain)' -count=3 -timeout=3m
           go vet ./features/probetrace ./app/dispatcher ./app/dns ./features/dns ./proxy/dns ./proxy/blackhole
 
       - name: Data-plane deterministic, kTLS and fuzz-seed tests
