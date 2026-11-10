@@ -30,6 +30,23 @@ sha256sum /opt/brocade/brocade-console
 
 同时保存当前发布 ID、修订、目标状态、Agent/运行版本和摘要。数据库调查优先使用只读查询；需要锁表、修复或恢复时另行制定操作步骤。
 
+### Agent 日志与缺失计量代次
+
+使用独立 journal 的 systemd 节点须执行
+`journalctl --namespace=brocade-agent -u brocade-agent -n 50 --no-pager`；
+不带 namespace 可能只看到服务启动、退出记录，漏掉实际收敛错误。旧节点先通过
+`systemctl show brocade-agent -p LogNamespace` 确认；OpenRC 日志入口见
+[可观测性文档](../../docs/observability.md)。
+
+`xray has no active usage generation` 表示运行中的 Xray 缺少本地 `usage-generation`
+检查点，用量采样及配置、授权变更前的最终采样都会因此失败。先保留现场，对照
+`node_agent_state.usage_generation_id`、已激活的 `usage_generation_activations` 和最后成功发布的
+配置摘要、授权及计量归属；不能直接写入最新或失败发布的代次。
+仅当实际运行态与该已激活代次一致时，才在节点收敛锁保护下以私有权限原子恢复检查点，
+同步文件和目录后确认用量上报被接受，再通过正式 API 逐台重试。状态无法证明一致时停止修复，
+不要清空计数器、计量 journal、usage cursor 或跳过最终采样。已取消的历史单保持终态，
+先检查当前配置差异和有效工单，避免重新执行已经被后续操作替代的目标。
+
 ### Agent HTTP 响应超时
 
 Agent 的 HTTP/HTTPS 客户端按 [RFC 9112 §6.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3)
