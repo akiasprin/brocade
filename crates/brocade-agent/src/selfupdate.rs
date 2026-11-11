@@ -71,8 +71,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -83,12 +83,13 @@ use brocade_deployment::protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    ARCH_HEADER,
     command::{capture_command_with_timeout, run_shell_with_timeout},
     file_sha256_hex,
     http::HttpClient,
     identity,
     options::Options,
-    shell_quote, warn, ARCH_HEADER,
+    shell_quote, warn,
 };
 
 /// Where the candidate lands while it is being checked. Inside the state directory, which the
@@ -309,8 +310,7 @@ fn read_pending(path: &Path) -> Result<Option<PendingUpdate>, String> {
     if bytes.len() as u64 > MAX_PENDING_BYTES {
         return Err("Agent 发布回执超出大小限制".to_owned());
     }
-    let pending: PendingUpdate =
-        serde_json::from_slice(&bytes).map_err(|e| format!("Agent 发布回执无效：{e}"))?;
+    let pending = decode_pending(&bytes)?;
     validate_offer(&pending.offer)?;
     if pending.offer.release_id.is_none() || !pending.target.is_absolute() {
         return Err("Agent 发布回执缺少发布身份或安装路径".to_owned());
@@ -322,6 +322,23 @@ fn read_pending(path: &Path) -> Result<Option<PendingUpdate>, String> {
         return Err("Agent 发布回执与批准身份不一致".to_owned());
     }
     Ok(Some(pending))
+}
+
+fn decode_pending(bytes: &[u8]) -> Result<PendingUpdate, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("Agent 发布回执无效：{e}"))?;
+    if let Some(offer) = value
+        .get_mut("offer")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        // Pre-variant executors persisted neither field. This local checkpoint only resumes
+        // digest-bound reporting; newly fetched network offers still require explicit identity.
+        if !offer.contains_key("flavor") && !offer.contains_key("allow_flavor_change") {
+            offer.insert("flavor".into(), identity::self_flavor().as_str().into());
+            offer.insert("allow_flavor_change".into(), false.into());
+        }
+    }
+    serde_json::from_value(value).map_err(|e| format!("Agent 发布回执无效：{e}"))
 }
 
 fn write_pending(options: &Options, pending: &PendingUpdate) -> Result<(), String> {
@@ -660,6 +677,29 @@ mod tests {
         fs::write(&path, vec![0; MAX_PENDING_BYTES as usize + 1]).unwrap();
         assert!(read_pending(&path).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_local_checkpoint_resumes_without_relaxing_network_offers() {
+        let pending = PendingUpdate {
+            offer: tracked_offer(),
+            target: PathBuf::from("/usr/local/bin/brocade-agent"),
+            report: None,
+        };
+        let mut value = serde_json::to_value(&pending).unwrap();
+        let offer = value["offer"].as_object_mut().unwrap();
+        offer.remove("flavor");
+        offer.remove("allow_flavor_change");
+        assert!(serde_json::from_value::<AgentReleaseOffer>(value["offer"].clone()).is_err());
+        let restored = decode_pending(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(restored.offer, pending.offer);
+        assert_eq!(restored.target, pending.target);
+        assert!(restored.report.is_none());
+
+        value["offer"]["allow_flavor_change"] = true.into();
+        assert!(decode_pending(&serde_json::to_vec(&value).unwrap()).is_err());
+        value["offer"]["flavor"] = "unknown".into();
+        assert!(decode_pending(&serde_json::to_vec(&value).unwrap()).is_err());
     }
 
     #[test]
