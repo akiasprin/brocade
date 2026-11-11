@@ -724,10 +724,15 @@ describe('deep host telemetry', () => {
     expect(legend.textContent).not.toContain('接收丢弃');
     expect(legend.textContent).not.toContain('eth0');
 
-    const chart = chartMock.setOption.mock.calls.find(
-      ([option]) =>
-        option.series?.length === 2 && option.series[0]?.name === '接收' && option.series[1]?.name === '发送',
-    )?.[0];
+    // The lazy chart can mount its container before its effects publish the option.
+    const chart = await waitFor(() => {
+      const option = chartMock.setOption.mock.calls.find(
+        ([option]) =>
+          option.series?.length === 2 && option.series[0]?.name === '接收' && option.series[1]?.name === '发送',
+      )?.[0];
+      expect(option).toBeDefined();
+      return option;
+    });
     expect(chart.color).toEqual(['#3e8fb0', '#e99cd3']);
     expect(chart.grid).toMatchObject({ left: 10, containLabel: true });
     expect(chart.xAxis[0].splitLine.show).toBe(true);
