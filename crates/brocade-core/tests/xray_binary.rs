@@ -2103,13 +2103,15 @@ fn valid_reality_traffic_still_passes_with_the_local_cover_enabled() {
         })
     });
     let response = client_ready.then(|| {
+        // Cold REALITY cover discovery can span two five-second polling intervals.
+        // Leave another five seconds for the authenticated SOCKS/HTTP round trip.
         Command::new("curl")
             .args([
                 "--silent",
                 "--show-error",
                 "--include",
                 "--max-time",
-                "5",
+                "15",
                 "--noproxy",
                 "",
                 "--socks5-hostname",
