@@ -136,6 +136,16 @@ jobs:
           go test -race ./common/protocol/quic -count=3 -timeout=2m
           go vet ./common/protocol/quic
 
+      - name: MTProxy real-process budgets, accounting and revocation
+        run: |
+          go test -c -o "$RUNNER_TEMP/mtproto-tests" ./proxy/mtproto
+          sudo unshare --net -- env BROCADE_XRAY_BIN="$RUNNER_TEMP/reality-xray" \
+            bash -euo pipefail -c '
+              ip link set lo up
+              ip addr add 198.51.100.2/32 dev lo
+              exec "$1" -test.v -test.run "^TestBrocadeFrozenMTProxy" -test.count=1 -test.timeout=2m
+            ' -- "$RUNNER_TEMP/mtproto-tests"
+
       - name: QUIC Initial parser fuzz
         run: go test ./common/protocol/quic -run '^$' -fuzz '^FuzzSniffQUIC$' -fuzztime="${BROCADE_FUZZ_LIMIT}" -timeout=2m
 

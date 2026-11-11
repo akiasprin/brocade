@@ -14,6 +14,7 @@ import (
 
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/machinelimit"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
@@ -118,6 +119,11 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	if s.replayed(raw, time.Now()) {
 		return errors.New("mtproto: replayed authentication header")
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if controller := machinelimit.FromContext(ctx); controller != nil {
+		conn = &budgetConnection{Connection: conn, ctx: ctx, cancel: cancel, controller: controller}
+	}
 
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		return errors.New("mtproto: clear handshake deadline").Base(err)
@@ -152,8 +158,6 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	defer stopAccounting()
 	inbound.Conn = conn
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	timer := signal.CancelAfterInactivity(ctx, cancel, userPolicy.Timeouts.ConnectionIdle)
 	defer timer.SetTimeout(0)
 
