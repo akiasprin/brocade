@@ -29,22 +29,7 @@ pub(crate) fn ensure_base_ready(state: &Path) -> Result<(), String> {
         };
         let value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| "CVM 执行记录无效，不能切换为基础版")?;
-        let object = value.as_object().ok_or("CVM 执行记录必须是对象")?;
-        for key in [
-            "bindings",
-            "entries",
-            "tunnels",
-            "deliveries",
-            "fences",
-            "budgets",
-        ] {
-            if let Some(value) = object.get(key) {
-                let items = value.as_array().ok_or("CVM 执行记录的资源清单无效")?;
-                if !items.is_empty() {
-                    return Err("仍有 CVM 网卡、入口或网络预约，不能切换为基础版".into());
-                }
-            }
-        }
+        ensure_empty_resources(&value)?;
     }
     if let Some(bytes) =
         crate::fsutil::read_bounded(Path::new("/opt/brocade/cvm/host.json"), 64 * 1024)?
@@ -115,4 +100,50 @@ pub(crate) fn ensure_base_ready(state: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn ensure_empty_resources(value: &serde_json::Value) -> Result<(), String> {
+    let object = value.as_object().ok_or("CVM 执行记录必须是对象")?;
+    for key in ["bindings", "entries", "tunnels", "deliveries", "fences"] {
+        if let Some(value) = object.get(key) {
+            let items = value.as_array().ok_or("CVM 执行记录的资源清单无效")?;
+            if !items.is_empty() {
+                return Err("仍有 CVM 网卡、入口或网络预约，不能切换为基础版".into());
+            }
+        }
+    }
+    // NicDesired stores budgets by owner ID, including an empty object after cleanup.
+    if let Some(value) = object.get("budgets") {
+        let budgets = value.as_object().ok_or("CVM 执行记录的预算清单无效")?;
+        if !budgets.is_empty() {
+            return Err("仍有 CVM 网卡、入口或网络预约，不能切换为基础版".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn accepts_empty_nic_checkpoint_with_budget_map() {
+        ensure_empty_resources(&json!({"budgets": {}, "bindings": [], "fences": []})).unwrap();
+        ensure_empty_resources(&json!({"deliveries": [], "tunnels": []})).unwrap();
+    }
+
+    #[test]
+    fn rejects_remaining_resources_and_invalid_collection_shapes() {
+        for value in [
+            json!({"budgets": {"owner": {}}}),
+            json!({"bindings": [{}]}),
+            json!({"budgets": []}),
+            json!({"budgets": null}),
+            json!({"bindings": {}}),
+            json!([]),
+        ] {
+            assert!(ensure_empty_resources(&value).is_err(), "{value}");
+        }
+    }
 }
