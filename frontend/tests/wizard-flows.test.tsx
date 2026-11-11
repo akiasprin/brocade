@@ -56,6 +56,11 @@ function entryRules() {
   return within(document.body.querySelector('.chain-rule-tree > .chain-rule-node > .chain-rule-body') as HTMLElement);
 }
 
+function appendHop(id: string) {
+  fireEvent.click(screen.getByRole('button', { name: '＋ 添加下一跳' }));
+  fireEvent.click(screen.getByRole('menuitem', { name: new RegExp(id) }));
+}
+
 function queryClient() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY }, mutations: { retry: false } },
@@ -690,6 +695,41 @@ describe('新建链向导', () => {
     expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(false);
   });
 
+  it('末尾添加菜单支持名称和 ID 搜索、取消回焦，耗尽候选后说明原因', async () => {
+    const view = mount();
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
+      target: { value: 'hk-edge-01' },
+    });
+    const add = view.getByRole('button', { name: '＋ 添加下一跳' });
+    expect(view.container.querySelector('.wzr-addhop')?.textContent).toContain('接在 香港边缘 之后');
+    add.focus();
+    fireEvent.click(add);
+    const search = screen.getByRole('textbox', { name: '搜索可添加的机器' });
+    expect(document.activeElement).toBe(search);
+    expect(screen.getAllByRole('menuitem')).toHaveLength(1);
+    fireEvent.change(search, { target: { value: ' SG-RELAY ' } });
+    expect(screen.getByRole('menuitem', { name: /新加坡中转/ })).toBeTruthy();
+    fireEvent.change(search, { target: { value: '不存在的机器' } });
+    expect(screen.queryByRole('menuitem')).toBeNull();
+    expect(screen.getByText('没有匹配的机器')).toBeTruthy();
+    fireEvent.keyDown(search, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(add));
+
+    fireEvent.click(add);
+    expect((screen.getByRole('textbox', { name: '搜索可添加的机器' }) as HTMLInputElement).value).toBe('');
+    fireEvent.change(screen.getByRole('textbox', { name: '搜索可添加的机器' }), {
+      target: { value: '新加坡' },
+    });
+    fireEvent.click(screen.getByRole('menuitem', { name: /新加坡中转/ }));
+    expect(screen.queryByRole('menu')).toBeNull();
+    expect(add.hasAttribute('disabled')).toBe(true);
+    expect(view.getByText('没有可添加的机器')).toBeTruthy();
+    const heads = view.container.querySelectorAll('.chain-rule-node-head');
+    expect(heads).toHaveLength(2);
+    expect(heads[1].getAttribute('aria-expanded')).toBe('true');
+  });
+
   it('链名称默认留空，选择入口或修改路径不自动填充，手动命名和清空后保留输入', () => {
     const view = mount();
     const name = view.getByRole('textbox', { name: '链名称' }) as HTMLInputElement;
@@ -698,9 +738,7 @@ describe('新建链向导', () => {
       target: { value: 'hk-edge-01' },
     });
     expect(name.value).toBe('');
-    fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), {
-      target: { value: 'sg-relay-01' },
-    });
+    appendHop('sg-relay-01');
     expect(name.value).toBe('');
     fireEvent.click(view.getByRole('button', { name: '把 新加坡中转 移出本链' }));
     expect(name.value).toBe('');
@@ -715,9 +753,7 @@ describe('新建链向导', () => {
     });
 
     fireEvent.change(name, { target: { value: '手动链名' } });
-    fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), {
-      target: { value: 'sg-relay-01' },
-    });
+    appendHop('sg-relay-01');
     expect(name.value).toBe('手动链名');
     fireEvent.change(name, { target: { value: '' } });
     fireEvent.click(view.getByRole('button', { name: '把 新加坡中转 移出本链' }));
@@ -1072,9 +1108,7 @@ describe('新建链向导', () => {
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
       target: { value: 'hk-edge-01' },
     });
-    fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), {
-      target: { value: 'sg-relay-01' },
-    });
+    appendHop('sg-relay-01');
     const name = view.getByRole('textbox', { name: '链名称' });
     const port = view.getByRole('textbox', { name: 'AnyTLS 监听端口' });
     fireEvent.change(name, { target: { value: '刷新中保留的链' } });
@@ -1438,9 +1472,7 @@ describe('新建链向导', () => {
       target: { value: 'hk-edge-01' },
     });
     fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: '反向链' } });
-    fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), {
-      target: { value: 'sg-relay-01' },
-    });
+    appendHop('sg-relay-01');
     changeControl(view.getByRole('combobox', { name: '从 香港边缘 到 新加坡中转 的连接方式' }), {
       target: { value: 'reverse_v4' },
     });
@@ -1456,7 +1488,7 @@ describe('新建链向导', () => {
   it('路径上的机器与链路规则一样各自折叠，支路不提供移除', () => {
     const view = mount();
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
-    fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), { target: { value: 'sg-relay-01' } });
+    appendHop('sg-relay-01');
     const heads = () => [...document.body.querySelectorAll<HTMLElement>('.chain-rule-node-head')];
     // 入口和刚加入的机器默认展开，两张规则表同时可见。
     expect(heads().map(head => head.getAttribute('aria-expanded'))).toEqual(['true', 'true']);
@@ -1563,9 +1595,7 @@ describe('新建链向导', () => {
       target: { value: 'hk-edge-01' },
     });
     fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: '自定义链' } });
-    fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), {
-      target: { value: 'sg-relay-01' },
-    });
+    appendHop('sg-relay-01');
     // 自定义地址就在拨号菜单的最后一项里填写，与链路规则一致。
     const dial = view.getByRole('combobox', { name: '从 香港边缘 到 新加坡中转 的连接方式' });
     fireEvent.click(dial);
@@ -1613,7 +1643,7 @@ describe('新建链向导', () => {
     );
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
     fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: '亚太分流' } });
-    fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), { target: { value: 'sg-relay-01' } });
+    appendHop('sg-relay-01');
     fireEvent.click(entryRules().getByRole('button', { name: '＋ 加一条' }));
     fireEvent.change(view.getByRole('combobox', { name: '香港边缘 第 1 条匹配条件' }), {
       target: { value: 'domain_suffix' },
@@ -1760,9 +1790,7 @@ describe('新建链向导', () => {
     );
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
     fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: 'DNS 测试' } });
-    fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), {
-      target: { value: 'sg-relay-01' },
-    });
+    appendHop('sg-relay-01');
     fireEvent.click(view.getByRole('button', { name: /^alice(?:\s|$)/ }));
     const encryption = view.getByRole('checkbox', { name: 'VLESS · Encryption' });
     fireEvent.click(encryption);

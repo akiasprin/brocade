@@ -17703,18 +17703,53 @@ body.fg-dragging * {
 .pv-chain-fields .wzr-tree {
   margin: 0;
 }
-.pv-chain-fields .wzr-empty,
-.pv-chain-fields .wzr-addhop {
+.pv-chain-fields .wzr-empty {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
   padding: 12px;
 }
-.pv-chain-fields .wzr-empty select.f,
-.pv-chain-fields .wzr-addhop select.f {
+.pv-chain-fields .wzr-empty select.f {
   min-width: 220px;
   max-width: 100%;
+}
+.pv-chain-fields .wzr-addhop {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin: 9px -12px -13px;
+  padding: 12px 10px;
+  border-top: 1px solid var(--line-soft);
+}
+.wzr-addhop-hint {
+  min-width: 0;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+.wzr-addhop-hint b {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.wzr-hop-menu .choice-menu-section {
+  overflow-wrap: anywhere;
+  letter-spacing: normal;
+  text-transform: none;
+}
+.wzr-hop-copy {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+  gap: 2px;
+  overflow-wrap: anywhere;
+}
+.wzr-hop-copy b {
+  font-weight: 500;
+}
+.choice-menu .wzr-hop-copy small {
+  max-width: none;
 }
 /* 不兼容原因与说明分开：说明留在原位，原因另起一行，落在参数之上。 */
 .pv-chain-fields .wzp-card > .wzp-issue {

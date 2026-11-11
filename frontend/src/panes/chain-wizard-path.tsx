@@ -1,4 +1,4 @@
-import { useState, type CSSProperties, type ReactNode } from 'react';
+import { useId, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import type {
   DestMatch,
   EgressDnsResolution,
@@ -11,6 +11,7 @@ import type {
   SnapshotStep,
 } from '../api';
 import { egressDnsIssue } from '../api';
+import { MenuLayer, menuArrowKey } from '../ui/choice-menu';
 import { HOP_WIRE_OPTIONS, hopWireLabel, type HopWireKind } from '../ui/format';
 import { vpngateNodeEligibility } from '../vpngate-capability';
 import { selectVpngatePool } from '../vpngate-selection';
@@ -57,6 +58,7 @@ import {
   useOverlayAddrs,
   type DialKind,
   type EgressDnsPolicy,
+  type ForwardPeer,
   type MuxEditorState,
   type ReusableListener,
 } from './rules';
@@ -1019,24 +1021,7 @@ export function WizardPathEditor(props: WizardPathEditorProps) {
     <>
       <div className="node-chain-use chain-tree wzr-tree">
         <div className="chain-rule-tree">{renderNode(root, '', [])}</div>
-        <div className="wzr-addhop">
-          <select
-            className="f"
-            aria-label="在路径末尾添加机器"
-            value=""
-            disabled={tailPeers.length === 0}
-            onChange={event => {
-              if (event.target.value) appendHop(event.target.value);
-            }}
-          >
-            <option value="">{tailPeers.length ? '＋ 在主干末尾加一跳…' : '没有可添加的主干机器'}</option>
-            {tailPeers.map(peer => (
-              <option key={peer.id} value={peer.id}>
-                {peer.name || peer.id}（{peer.id}）
-              </option>
-            ))}
-          </select>
-        </div>
+        {tail && <AppendHopPicker tailName={nameOf(tail)} peers={tailPeers} onPick={appendHop} />}
       </div>
       {dnsDialog && (
         <DnsPolicyDialog
@@ -1086,5 +1071,90 @@ export function WizardPathEditor(props: WizardPathEditorProps) {
         />
       )}
     </>
+  );
+}
+
+function AppendHopPicker({
+  tailName,
+  peers,
+  onPick,
+}: {
+  tailName: string;
+  peers: Pick<ForwardPeer, 'id' | 'name'>[];
+  onPick: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const anchor = useRef<HTMLButtonElement>(null);
+  const id = useId();
+  const search = query.trim().toLowerCase();
+  const visible = peers.filter(peer => `${peer.name} ${peer.id}`.toLowerCase().includes(search));
+  return (
+    <div className="wzr-addhop">
+      <button
+        ref={anchor}
+        type="button"
+        className="btn"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={open ? id : undefined}
+        aria-describedby={`${id}-hint`}
+        disabled={peers.length === 0}
+        onClick={() => {
+          setQuery('');
+          setOpen(true);
+        }}
+      >
+        ＋ 添加下一跳
+      </button>
+      <span className="wzr-addhop-hint" id={`${id}-hint`}>
+        {peers.length ? (
+          <>
+            接在 <b>{tailName}</b> 之后
+          </>
+        ) : (
+          '没有可添加的机器'
+        )}
+      </span>
+      {open && peers.length > 0 && (
+        <MenuLayer anchor={anchor} label="添加下一跳" onClose={() => setOpen(false)}>
+          <div
+            id={id}
+            className="dialog-surface choice-menu wzr-hop-menu"
+            role="menu"
+            aria-label="添加下一跳"
+            onKeyDown={menuArrowKey}
+          >
+            <div className="choice-menu-section">接在 {tailName} 之后</div>
+            <input
+              autoFocus
+              className="f external-target-search"
+              aria-label="搜索可添加的机器"
+              placeholder="搜索机器名称或 ID"
+              value={query}
+              onChange={event => setQuery(event.target.value)}
+            />
+            {visible.map(peer => (
+              <button
+                key={peer.id}
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setOpen(false);
+                  onPick(peer.id);
+                }}
+              >
+                <span className="wzr-hop-copy">
+                  <b>{peer.name || peer.id}</b>
+                  <small>{peer.id}</small>
+                </span>
+                <span aria-hidden="true">＋</span>
+              </button>
+            ))}
+            {visible.length === 0 && <span className="external-target-empty">没有匹配的机器</span>}
+          </div>
+        </MenuLayer>
+      )}
+    </div>
   );
 }

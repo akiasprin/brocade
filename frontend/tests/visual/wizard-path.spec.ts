@@ -22,9 +22,8 @@ async function build(page: Page) {
   await expect(page.locator('.external-target-menu')).toHaveCount(0);
   await rules.getByRole('button', { name: '＋ 加一条' }).click();
   await rules.getByRole('textbox', { name: /第 2 条匹配取值/ }).fill('netflix');
-  const hop = page.getByRole('combobox', { name: '在路径末尾添加机器' });
-  const candidate = await hop.locator('option').nth(1).getAttribute('value');
-  await hop.selectOption(candidate!);
+  await page.getByRole('button', { name: '＋ 添加下一跳' }).click();
+  await page.getByRole('menu', { name: '添加下一跳' }).getByRole('menuitem').first().click();
 }
 
 async function fits(page: Page) {
@@ -45,6 +44,40 @@ async function fits(page: Page) {
     expect(control.right).toBeLessThanOrEqual(width);
   }
 }
+
+for (const width of [390, 1440])
+  for (const theme of ['light', 'dark']) {
+    test(`wizard append hop picker ${width} ${theme}`, async ({ page }) => {
+      await open(page, width, theme);
+      const add = page.getByRole('button', { name: '＋ 添加下一跳' });
+      await expect(page.locator('.wzr-addhop-hint')).toHaveText('接在 东京 IIJ 之后');
+      await add.focus();
+      await page.keyboard.press('Enter');
+      const menu = page.getByRole('menu', { name: '添加下一跳' });
+      const search = menu.getByRole('textbox', { name: '搜索可添加的机器' });
+      await expect(search).toBeFocused();
+      await expect(menu).toHaveScreenshot(`wizard-add-hop-${width}-${theme}.png`);
+      await search.fill('不存在的机器');
+      await expect(menu.getByRole('menuitem')).toHaveCount(0);
+      await expect(menu).toContainText('没有匹配的机器');
+      await page.keyboard.press('Escape');
+      await expect(menu).toHaveCount(0);
+      await expect(add).toBeFocused();
+
+      await add.click();
+      await expect(search).toHaveValue('');
+      await search.fill('HKIX');
+      await expect(menu.getByRole('menuitem')).toHaveCount(1);
+      await page.keyboard.press('ArrowDown');
+      await expect(menu.getByRole('menuitem')).toBeFocused();
+      await page.keyboard.press('Enter');
+      await expect(menu).toHaveCount(0);
+      await expect(page.locator('.wzr-addhop-hint')).toHaveText('接在 香港 HKIX 之后');
+      await expect(page.locator('.wzr-tree .chain-rule-node-head[aria-expanded="true"]')).toHaveCount(2);
+      await expect(add).toBeFocused();
+      await fits(page);
+    });
+  }
 
 for (const width of [390, 820, 1440])
   for (const theme of ['light', 'dark']) {
