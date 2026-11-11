@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import test from 'node:test';
 import { DEFAULT_TLS_FINGERPRINT } from '../src/reality.ts';
 
@@ -84,12 +84,16 @@ test('chain unlock and default schedule constants agree with the shared wire con
   const uiValue=api.match(new RegExp(`export const ${name} = ([0-9_]+);`))?.[1];
   assert.ok(rustValue);assert.equal(uiValue?.replaceAll('_',''),rustValue.replaceAll('_',''));
  }
- const migration=readFileSync(new URL('../../crates/brocade-store/migrations/0003_unlock_probe_schedule.sql',import.meta.url),'utf8');
- const hours=migration.match(/ADD COLUMN unlock_detection_interval_hours INTEGER NOT NULL DEFAULT (\d+)/)?.[1];
+ const migrations=new URL('../../crates/brocade-store/migrations/',import.meta.url);
+ const defaults=readdirSync(migrations)
+  .filter(name=>/^\d+_.+\.sql$/.test(name))
+  .sort((a,b)=>Number.parseInt(a,10)-Number.parseInt(b,10))
+  .flatMap(name=>[...readFileSync(new URL(name,migrations),'utf8').matchAll(/(?:ADD COLUMN unlock_detection_interval_hours INTEGER NOT NULL DEFAULT|ALTER COLUMN unlock_detection_interval_hours SET DEFAULT) (\d+)/g)].map(match=>Number(match[1])));
+ const hours=defaults.at(-1);
  const seconds=unlock.match(/pub const UNLOCK_PROBE_INTERVAL_SECS: u64 = ([0-9_]+);/)?.[1];
  assert.ok(hours,'database unlock interval default is missing');
  assert.ok(seconds,'shared unlock interval default is missing');
- assert.equal(Number(hours)*3600,Number(seconds.replaceAll('_','')));
+ assert.equal(hours*3600,Number(seconds.replaceAll('_','')));
 });
 
 test('automatic chain diagnostics require the same protocol in Console and frontend',()=>{
