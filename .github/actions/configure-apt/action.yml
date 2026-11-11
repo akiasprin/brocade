@@ -16,6 +16,22 @@ runs:
           echo 'hosted runner APT mirror list is missing' >&2
           exit 1
         }
+        # Some hosted resolvers time out for Ubuntu names even while other DNS
+        # queries work. Change the ephemeral runner link only after a failed probe.
+        if ! timeout 8 getent ahostsv4 archive.ubuntu.com > /dev/null ||
+           ! timeout 8 getent ahostsv4 security.ubuntu.com > /dev/null; then
+          ci_default_link=$(ip -o route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+          [ -n "$ci_default_link" ] || {
+            echo 'no default network link for DNS recovery' >&2
+            exit 1
+          }
+          sudo resolvectl dns "$ci_default_link" 1.1.1.1 8.8.8.8
+          sudo resolvectl domain "$ci_default_link" '~.'
+          sudo resolvectl flush-caches
+        fi
+        timeout 8 getent ahostsv4 archive.ubuntu.com > /dev/null
+        timeout 8 getent ahostsv4 security.ubuntu.com > /dev/null
+        echo 'Ubuntu archive DNS checks passed'
         # The hosted image puts Azure first. A DNS outage there can exhaust setup
         # before tests start; retain the two signed Ubuntu archive mirrors.
         printf '%s\tpriority:%s\n' \
