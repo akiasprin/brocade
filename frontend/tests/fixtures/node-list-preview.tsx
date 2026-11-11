@@ -4,6 +4,7 @@ import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { AdminRole, ConsoleSnapshot, Whoami } from '../../src/api';
 import { App } from '../../src/app';
+import { CVM_ENABLED } from '../../src/product';
 import { theme } from '../../src/forge/theme';
 import type { Session } from '../../src/session';
 import { cvmWorkspace } from './cvm/data';
@@ -114,7 +115,7 @@ globalThis.fetch = async (input, init) => {
   }
   if (path === '/branding') return json({ site_name: 'Brocade', icon_data_url: null });
   if (path === '/auth/state') return json({ initialized: true, public_open: role === 'public' });
-  if (path === '/bootstrap') return json(session);
+  if (path === '/bootstrap') return json({ features: { cvm: CVM_ENABLED }, ...session });
   if (path === '/whoami') return json(who);
   if (path === '/revisions')
     return json({

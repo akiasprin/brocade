@@ -1,5 +1,5 @@
 // Mount the production console on a fresh installation, frozen at one first-run phase.
-// Query: phase=machine|install|chain|user|publish|activate|failed|verify|complete, theme=light|dark.
+// Query: phase=machine|install|chain|user|publish|activate|failed|verify|complete, theme=light|dark, initial=complete.
 // Synthetic data only; the onboarding checklist and every page behind it are production components.
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -67,7 +67,7 @@ const machine = {
 } as unknown as NodeAgentStateItem;
 const machines = registered ? [machine] : [];
 
-const onboarding: OnboardingState = {
+let onboarding: OnboardingState = {
   status: phase === 'complete' ? 'complete' : 'active',
   root_tenant_id: 'platform',
   started_at: iso(STARTED),
@@ -81,6 +81,17 @@ const onboarding: OnboardingState = {
   deployment_id: deployed ? 2 : null,
   completed_at: phase === 'complete' ? iso(NOW - 30_000) : null,
 };
+
+const grantProbeItem = {
+  id: 'hk-01-direct:ipv4:vless',
+  name: '香港直出',
+  app_id: APP,
+  app_name: '默认分组',
+  chain_id: CHAIN,
+  ingress_id: CHAIN,
+  family: 'ipv4',
+  protocol: 'vless',
+} as const;
 
 const snapshot = {
   snapshot: {
@@ -274,10 +285,14 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
         node_count: machines.length,
         chain_group_count: committed ? [[APP, 1]] : [],
         // 「刚刚完成」：本次会话里走完最后一步，清单仍在。
-        onboarding: 'active',
+        onboarding: params.get('initial') === 'complete' ? 'complete' : 'active',
       },
     });
   if (path === '/onboarding') return json(onboarding);
+  if (path === '/onboarding/complete' && init?.method === 'POST') {
+    onboarding = { ...onboarding, status: 'complete', completed_at: iso(NOW) };
+    return json(onboarding);
+  }
   if (path === '/nodes/agent-state') return json({ nodes: machines });
   if (path === '/model/snapshot') return json(snapshot);
   if (path === '/model/preview')
@@ -351,23 +366,27 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   if (path === '/artifacts/index') return json({ revision: Number(url.searchParams.get('revision')), artifacts: [] });
   if (path === '/grant-probes/capability')
     return json({ available: true, version: '26.7.28', reason: null, concurrency: 4 });
-  if (path === '/users/platform/alice/grant-probes' && (init?.method ?? 'GET') === 'GET')
-    return json({
-      serving_revision: 3,
-      serving_generation: 7,
-      items: [
-        {
-          id: 'hk-01-direct:ipv4:vless',
-          name: '香港直出',
-          app_id: APP,
-          app_name: '默认分组',
-          chain_id: CHAIN,
-          ingress_id: CHAIN,
-          family: 'ipv4',
-          protocol: 'vless',
-        },
-      ],
-    });
+  if (path === '/users/platform/alice/grant-probes')
+    return json(
+      init?.method === 'POST'
+        ? {
+            reused: false,
+            job: {
+              id: 'onboarding-probe',
+              kind: 'grant',
+              tenant_id: 'platform',
+              user_id: 'alice',
+              serving_revision: 3,
+              serving_generation: 7,
+              status: 'completed',
+              message: null,
+              created_at_unix_secs: NOW / 1_000,
+              finished_at_unix_secs: NOW / 1_000,
+              items: [{ ...grantProbeItem, status: 'passed', ttfb_ms: 180, detail: null }],
+            },
+          }
+        : { serving_revision: 3, serving_generation: 7, items: [grantProbeItem] },
+    );
   if (path in EMPTY) return json(EMPTY[path]);
   return fleet(input, init);
 };

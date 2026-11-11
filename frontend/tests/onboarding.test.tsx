@@ -777,7 +777,7 @@ describe('first-run onboarding checklist', () => {
     await vi.waitFor(() => expect(dock.style.getPropertyValue('--onb-lift')).toBe('0px'));
   });
 
-  it('keeps a completed guide quiet on login but allows reopening it from the account menu', async () => {
+  it('keeps a completed guide quiet on login and preserves its result when explicitly opened', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL) => {

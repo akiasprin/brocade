@@ -12,6 +12,31 @@ async function open(page: Page, phase: string, theme: string, width: number, has
 
 const checklist = (page: Page) => page.getByRole('region', { name: '首次上线' });
 
+for (const width of [1440, 390])
+  test(`onboarding menu disappears immediately after completion ${width}`, async ({ page }) => {
+    await open(page, 'verify', 'light', width);
+    const account = page.getByRole('button', { name: /账户与更多功能/ });
+    const menu = page.getByRole('menu', { name: '账户与更多功能' });
+    await account.click();
+    await expect(menu.getByRole('menuitem', { name: /入门向导/ })).toBeVisible();
+    await page.keyboard.press('Escape');
+    await checklist(page).getByRole('button', { name: '拨测', exact: true }).click();
+    await expect(checklist(page).getByRole('heading', { name: '第一条线路已经可用' })).toBeVisible();
+    await account.click();
+    await expect(menu).toBeVisible();
+    await expect(menu.getByRole('menuitem', { name: /入门向导/ })).toHaveCount(0);
+    await expect(menu).toHaveScreenshot(`onboarding-menu-complete-${width}.png`);
+  });
+
+test('onboarding menu stays absent when logging into a completed installation', async ({ page }) => {
+  await page.goto('/tests/fixtures/onboarding-preview.html?phase=complete&initial=complete&theme=light');
+  await page.getByRole('button', { name: /账户与更多功能/ }).click();
+  const menu = page.getByRole('menu', { name: '账户与更多功能' });
+  await expect(menu).toBeVisible();
+  await expect(menu.getByRole('menuitem', { name: /入门向导/ })).toHaveCount(0);
+  await expect(page.locator('.onb-dock')).toHaveCount(0);
+});
+
 async function expectFooterGap(page: Page) {
   await expect
     .poll(() =>

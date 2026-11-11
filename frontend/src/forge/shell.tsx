@@ -19,6 +19,7 @@ import {
   fetchActiveDeployments,
   fetchGrantAutomationStatus,
   fetchNodes,
+  fetchOnboarding,
   fetchRevisions,
   fetchSnapshot,
   type AdminRole,
@@ -150,6 +151,10 @@ export function ForgeShell({
   const draftVer = useSyncExternalStore(draft.subscribe, draft.version);
   const draftDirty = !draft.isEmpty();
   const qc = useQueryClient();
+  // 观察清单共享的检查点缓存，完成写回后立即移除继续入口；首次读取前沿用登录状态。
+  const onboarding = useQuery({ queryKey: ['onboarding'], queryFn: fetchOnboarding, enabled: false });
+  const onboardingAvailable =
+    session.who.role === 'system-admin' && (onboarding.data?.status ?? session.initial.onboarding) === 'active';
   useEffect(
     () =>
       draft.subscribe(() => {
@@ -310,11 +315,7 @@ export function ForgeShell({
             runtime={pub ? undefined : crumbRuntime}
             revision={activeDeploy ? current : undefined}
             railOpen={panel.open}
-            onboardingAvailable={
-              session.who.role === 'system-admin' &&
-              session.initial.onboarding !== undefined &&
-              session.initial.onboarding !== 'not-applicable'
-            }
+            onboardingAvailable={onboardingAvailable}
             onLogout={() => confirmDiscardChanges() && onLogout()}
           />
           <DraftBar current={current} />
