@@ -39,6 +39,11 @@ npx vitest run tests/<name>.test.tsx --config vitest.config.ts
 
 涉及视觉呈现时，另运行 `npm run test:visual`，首次使用先执行 `npx playwright install chromium webkit`。当前 `npm test` 不包含该入口；运行环境与报告位置见[视觉测试配置](../../frontend/playwright.config.ts)，验收要求仍由[前端标准](frontend.md#视觉验收)统一维护。
 
+Linux 截图基准使用 Noto Sans/Serif CJK 中文字体和 DejaVu 等宽字体。Ubuntu 环境另安装
+`fonts-noto-cjk fonts-dejavu-core`；Playwright 的 `--with-deps` 不包含这组完整字体依赖。
+CI 的视觉检查固定在 Ubuntu 24.04，复现时可使用与锁定 Playwright 版本对应的 Noble 容器并安装上述字体。
+先核对字体回退与渲染环境，再判断像素差异；不通过放宽阈值或直接覆盖基准消除环境差异。
+
 ```sh
 cd components/xray-core
 go test ./path/to/changed/package

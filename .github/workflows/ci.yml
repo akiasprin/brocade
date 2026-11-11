@@ -287,7 +287,7 @@ jobs:
 
   check:
     name: fmt + clippy + test (${{ matrix.flavor }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -333,6 +333,14 @@ jobs:
       - name: Install the browser used by front-end tests
         working-directory: frontend
         run: npx playwright install --with-deps chromium
+
+      - name: Install fonts used by visual baselines
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk fonts-dejavu-core
+          fc-match 'Noto Sans CJK SC'
+          fc-match 'Noto Serif CJK SC'
+          fc-match monospace
 
       - name: Read Xray minimum compiler
         id: xray-go
@@ -461,6 +469,7 @@ jobs:
           BROCADE_XRAY_BIN="${RUNNER_TEMP}/presence-xray" cargo test -p brocade-agent --locked native_grpc_round_trips_against_xray -- --ignored
 
       - name: Front-end lint, tests and self-checks
+        id: frontend
         working-directory: frontend
         run: |
           npm run lint:strict
@@ -471,6 +480,18 @@ jobs:
           BROCADE_PRODUCT_FLAVOR=cvm npm run build
           BROCADE_PRODUCT_FLAVOR=base npx playwright test tests/visual/product-variants.spec.ts --workers=1
           BROCADE_PRODUCT_FLAVOR=cvm npx playwright test tests/visual/product-variants.spec.ts tests/visual/cvm/cvm-hosts.spec.ts --workers=1
+
+      - name: Preserve failed visual comparisons
+        if: failure() && steps.frontend.conclusion == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: frontend-visual-${{ matrix.flavor }}
+          path: |
+            .tools/frontend-visual/results
+            .tools/frontend-visual/report
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
 
   build:
     name: brocade dist (${{ matrix.flavor }}-${{ matrix.arch }}-${{ matrix.libc }})
