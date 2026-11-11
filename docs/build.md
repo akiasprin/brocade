@@ -45,7 +45,7 @@ python3 scripts/build-release.py
 
 ## 内嵌产物与 Xray 构建身份
 
-当前内置 Xray 基线为 `v26.10.31`（`a4a3dff5b20c2faae567b742c172c7b95e75c083`），Go 最低补丁版本为 `1.27.3`，具体要求见源码中的 `.go-version`。REALITY 依赖通过仓库内相对路径 `third_party/reality` 引入，来源与兼容补丁记录在两级 `BROCADE_UPSTREAM.toml` 中；该依赖的实际编译文件也纳入构建输入指纹。替换成官方 Xray 会失去 Brocade 的协议、计费、交接和指纹兼容能力。
+当前内置 Xray 基线为 `v26.10.31`（`a4a3dff5b20c2faae567b742c172c7b95e75c083`），Go 最低补丁版本为 `1.27.4`，包含标准库安全修复；具体要求见源码中的 `.go-version`。REALITY 依赖通过仓库内相对路径 `third_party/reality` 引入，来源与兼容补丁记录在两级 `BROCADE_UPSTREAM.toml` 中；该依赖的实际编译文件也纳入构建输入指纹。替换成官方 Xray 会失去 Brocade 的协议、计费、交接和指纹兼容能力。
 
 生产构建会把前端资源以及 `x86_64`、`aarch64` 两种架构的静态 Agent 和 Brocade Xray 一并嵌入 `brocade-console`。因此，控制面部署只需分发一个二进制文件，前端、API 与节点发行物也不会因独立部署而发生版本漂移。Xray 的发布身份取自实际内嵌字节；构建时关闭 Go VCS 元数据并使用钉住的上游基线作为 banner build id，避免 README 或前端提交制造一次没有数据面变化的 Xray 发布。
 
