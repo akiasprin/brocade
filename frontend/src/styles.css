@@ -20576,6 +20576,40 @@ h4.sec > .btn {
 .user-dcard-body {
   padding: 0;
 }
+.user-grant-notice {
+  flex: 1;
+  min-width: 0;
+  color: var(--gold);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.user-grant-retry {
+  max-width: 100%;
+  margin-left: 6px;
+  padding: 0;
+  border: 0;
+  color: var(--action);
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.user-grant-retry:hover:not(:disabled) {
+  text-decoration: underline;
+}
+.user-grant-retry:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+}
+.user-grant-notice > .callout {
+  max-width: none;
+  margin: 4px 0 0;
+  padding: 0;
+  border: 0;
+  color: var(--err);
+  background: transparent;
+  font: inherit;
+}
 .user-password-card {
   width: min(430px, calc(100vw - 28px));
   max-height: min(620px, calc(100vh - 28px));
@@ -21709,7 +21743,14 @@ h4.sec > .btn {
   font-weight: 600;
 }
 .grant-editor-actions {
+  flex-wrap: nowrap;
   justify-content: flex-end;
+}
+.grant-editor-buttons {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
 }
 
 /* 用户转发：两张卡共用服务端数据，规则独立筛选并按机器分组；授权与规则在原行下展开。 */

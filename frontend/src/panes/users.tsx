@@ -1531,6 +1531,7 @@ function UserGrantEditor({
   confirmedRevision,
   snapshotUnavailable,
   unconfirmedGrantKeys,
+  confirmationNotice,
   nameOf,
   refresh,
 }: {
@@ -1542,6 +1543,7 @@ function UserGrantEditor({
   confirmedRevision: number;
   snapshotUnavailable: boolean;
   unconfirmedGrantKeys: Set<string>;
+  confirmationNotice: ReactNode;
   nameOf: ReturnType<typeof useNodeNames>;
   refresh: () => Promise<void>;
 }) {
@@ -1692,14 +1694,19 @@ function UserGrantEditor({
           </div>
         )}
       </div>
-      {activeDraftSelection !== null && (
+      {(activeDraftSelection !== null || confirmationNotice) && (
         <footer className="user-dcard-foot grant-editor-actions">
-          <button type="button" className="btn" disabled={waiting} onClick={cancel}>
-            取消
-          </button>
-          <button type="button" className="btn primary" disabled={!dirty || waiting} onClick={() => void submit()}>
-            {waiting ? '保存中…' : '保存'}
-          </button>
+          {confirmationNotice}
+          {activeDraftSelection !== null && (
+            <div className="grant-editor-buttons">
+              <button type="button" className="btn" disabled={waiting} onClick={cancel}>
+                取消
+              </button>
+              <button type="button" className="btn primary" disabled={!dirty || waiting} onClick={() => void submit()}>
+                {waiting ? '保存中…' : '保存'}
+              </button>
+            </div>
+          )}
         </footer>
       )}
     </section>
@@ -2581,6 +2588,21 @@ function UserList({
             confirmedRevision={snapshot.data.snapshot.revision}
             snapshotUnavailable={!!snapshot.error || snapshot.fetchStatus === 'paused'}
             unconfirmedGrantKeys={unconfirmedGrantKeys}
+            confirmationNotice={
+              (snapshot.error || needsGrantRefresh) && (
+                <div className="user-grant-notice" role="status">
+                  <span>授权状态尚未确认，请重新读取后继续操作。</span>
+                  <button
+                    className="user-grant-retry"
+                    disabled={snapshot.isFetching}
+                    onClick={() => void snapshot.refetch()}
+                  >
+                    重试读取授权
+                  </button>
+                  {snapshot.error && <ErrorBox error={snapshot.error} />}
+                </div>
+              )
+            }
             nameOf={nameOf}
             refresh={refresh}
           />
@@ -2734,15 +2756,6 @@ function UserList({
           >
             重新读取用户状态
           </button>
-        </div>
-      )}
-      {(snapshot.error || needsGrantRefresh) && (
-        <div className="toolbar" role="status">
-          <span>授权状态尚未确认，请重新读取后继续操作。</span>
-          <button className="btn" disabled={snapshot.isFetching} onClick={() => void snapshot.refetch()}>
-            重试读取授权
-          </button>
-          {snapshot.error && <ErrorBox error={snapshot.error} />}
         </div>
       )}
       {(grantError ||

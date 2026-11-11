@@ -3,6 +3,7 @@
 // ?presence=sources gives alice online and recent sources (one of them banned) instead of an empty presence.
 // ?subscription=deferred holds subscription/node responses until released; &subscriptionError returns an error.
 // ?haitun=active includes a synthetic administrator-only speed-test subscription.
+// ?grants=stale|error keeps a saved grant awaiting confirmation or fails its snapshot refresh.
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { AdminRole, ConsoleSnapshot, SnapshotIngress, UserListItem, UserOnlineSource } from '../../src/api';
@@ -300,6 +301,12 @@ const subscriptionResponse = (body: unknown) => {
 globalThis.fetch = async (input, init) => {
   const path = String(input);
   const url = new URL(path, location.origin);
+  if (url.pathname === '/users') return Response.json({ users });
+  if (url.pathname === '/grants' && init?.method === 'POST') return Response.json({ revision_id: 2 });
+  if (url.pathname === '/model/snapshot')
+    return params.get('grants') === 'error'
+      ? Response.json({ error: '暂时无法读取最新授权，请检查网络连接后重试。' }, { status: 503 })
+      : Response.json(snapshot);
   if (url.pathname === '/revisions') return Response.json({ current_revision: 1, revisions: [] });
   if (url.pathname.endsWith('/clash-subscription'))
     return subscriptionResponse({

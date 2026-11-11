@@ -113,6 +113,22 @@ function mount(readSnapshot: () => Promise<Response>, write: (body: GrantWrite) 
 }
 
 describe('grant toggles', () => {
+  it('keeps a refresh failure recoverable in the footer without an open edit', async () => {
+    const { client, view, cards } = mount(
+      async () => Response.json({ error: '暂时读取失败' }, { status: 503 }),
+      async () => Response.json({ revision_id: 2 }),
+    );
+    await act(async () => {
+      await client.refetchQueries({ queryKey: ['snapshot'] });
+    });
+    const retry = await view.findByRole('button', { name: '重试读取授权' });
+    expect(retry.closest('.grant-editor-actions')).toBeTruthy();
+    expect(cards()).toHaveLength(2);
+    expect(cards().every(card => card.disabled)).toBe(true);
+    expect(view.queryByRole('button', { name: '取消' })).toBeNull();
+    expect(view.queryByRole('button', { name: '保存' })).toBeNull();
+  });
+
   it('keeps card edits local until save and cancel restores the confirmed selection', async () => {
     const read = vi.fn(async () => Response.json(snapshot(1, ['in-a', 'in-b'])));
     const write = vi.fn(async (_body: GrantWrite) => Response.json({ revision_id: 2 }));
@@ -146,6 +162,7 @@ describe('grant toggles', () => {
     await waitFor(() => expect(cards()[0].disabled).toBe(false));
     expect(cards()[0].getAttribute('aria-pressed')).toBe('false');
     expect(view.queryByRole('button', { name: '保存' })).toBeNull();
+    expect(view.queryByText('授权状态尚未确认，请重新读取后继续操作。')).toBeNull();
     expect(write).toHaveBeenCalledTimes(1);
     expect(write.mock.calls[0][0].enabled).toBe(false);
   });
@@ -189,15 +206,21 @@ describe('grant toggles', () => {
     });
     expect(cards()[0].disabled).toBe(true);
     expect(cards()[0].getAttribute('aria-pressed')).toBe('false');
+    const notice = view.getByText('授权状态尚未确认，请重新读取后继续操作。');
+    expect(notice.closest('.user-grant-editor')).toBe(cards()[0].closest('.user-grant-editor'));
+    expect(notice.closest('.grant-editor-actions')).toBe(view.getByRole('button', { name: '取消' }).closest('footer'));
+    expect(view.container.querySelector('.user-cardpage > [role="status"]')).toBeNull();
     read.mockImplementation(async () => Response.json({ error: '暂时读取失败' }, { status: 503 }));
     await act(async () => {
       await client.refetchQueries({ queryKey: ['snapshot'] });
     });
     expect(cards()).toHaveLength(2);
     expect(cards()[0].disabled).toBe(true);
+    expect(view.getByText('暂时读取失败').closest('.user-grant-notice')).toBe(notice.closest('.user-grant-notice'));
     read.mockImplementation(async () => Response.json(snapshot(2, ['in-b'])));
     fireEvent.click(view.getByRole('button', { name: '重试读取授权' }));
     await waitFor(() => expect(cards()[0].disabled).toBe(false));
     expect(cards()[0].getAttribute('aria-pressed')).toBe('false');
+    expect(view.queryByText('授权状态尚未确认，请重新读取后继续操作。')).toBeNull();
   });
 });
