@@ -71,8 +71,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     time::Duration,
 };
@@ -83,13 +83,12 @@ use brocade_deployment::protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ARCH_HEADER,
     command::{capture_command_with_timeout, run_shell_with_timeout},
     file_sha256_hex,
     http::HttpClient,
     identity,
     options::Options,
-    shell_quote, warn,
+    shell_quote, warn, ARCH_HEADER,
 };
 
 /// Where the candidate lands while it is being checked. Inside the state directory, which the
