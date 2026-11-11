@@ -12,7 +12,6 @@ import {
 import { ErrorBox, SegmentedControl } from '../ui/bits';
 import { useSession, isPublic } from '../session';
 import { useUnsavedChanges } from '../ui/navigation-guard';
-import { UserQuotaMeter } from './user-usage';
 
 export const userTrafficPolicyKey = (user: Pick<UserListItem, 'tenant_id' | 'id'>) =>
   ['user-traffic-policy', user.tenant_id, user.id] as const;
@@ -46,7 +45,7 @@ const baseRateText = (view: UserTrafficPolicyView) =>
   view.policy?.base_rate_bps ? `常态限速 ${rateText(view.policy.base_rate_bps)}` : '';
 export const userTrafficPolicyState = (view?: UserTrafficPolicyView) => {
   if (!view) return '';
-  if (!view.service_available) return '服务已暂停';
+  if (!view.service_available) return '';
   if (!view.policy) return '';
   const action = view.policy.exhausted_action;
   const base = baseRateText(view);
@@ -63,26 +62,18 @@ export const userTrafficPolicyState = (view?: UserTrafficPolicyView) => {
       : '已停用'
     : action.kind === 'throttle'
       ? `用满后限速 ${rateText(action.rate_bps)}`
-      : '用满后停用';
-  return [base, quota].filter(Boolean).join(' · ');
+      : '';
+  return view.exhausted ? quota : [base, quota].filter(Boolean).join(' · ');
 };
 
-/** The quota boundary stays at the allowance when the track expands to include overflow. */
-export function UserTrafficQuotaMeter({
-  used,
-  limit,
-  view,
-}: {
-  used: number | null;
-  limit: number | null;
-  view?: UserTrafficPolicyView;
-}) {
+/** 默认停用策略和用户级暂停不重复写在每张卡片上。 */
+export function UserTrafficQuotaStatus({ view }: { view?: UserTrafficPolicyView }) {
   const paused = view?.service_available === false;
-  const action = view?.policy?.exhausted_action;
   const pending = view?.pending_nodes?.length ?? 0;
-  const label = paused ? '服务暂停' : userTrafficPolicyState(view);
-  const tone = paused ? 'idle' : view?.exhausted ? (action?.kind === 'throttle' ? 'warn' : 'err') : '';
-  const status = (label || pending > 0) && (
+  const label = userTrafficPolicyState(view);
+  const tone = !paused && view?.exhausted ? (view.policy?.exhausted_action.kind === 'throttle' ? 'warn' : 'err') : '';
+  if (!label && pending === 0) return null;
+  return (
     <span className={`qta-policy-flag ${tone}`}>
       {label}
       {pending > 0 && (
@@ -105,7 +96,6 @@ export function UserTrafficQuotaMeter({
       )}
     </span>
   );
-  return <UserQuotaMeter used={used} limit={limit} status={status} tone={tone} />;
 }
 export function UserAppTrafficPolicyEditor({
   user,

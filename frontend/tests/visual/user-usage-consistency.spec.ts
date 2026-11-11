@@ -23,7 +23,7 @@ for (const width of [1440, 820, 760, 600, 390]) {
           return {
             directions: [...ledger.querySelectorAll('.usage-io dt')].map(el => el.textContent),
             compositionBesideTotal: compose.left > hero.left,
-            amountBesideName: amount.left > name.left,
+            amountBelowName: amount.top >= name.bottom,
             overflow: card.scrollWidth > card.clientWidth,
           };
         });
@@ -34,7 +34,7 @@ for (const width of [1440, 820, 760, 600, 390]) {
       await expect(forwarding.locator('.qta-pct')).toHaveText('10%');
       await expect(forwarding.locator('.qta-left')).toHaveText('剩余45.00 GiB');
       await expect(forwarding.locator('.fwd-rule-count')).toHaveText('规则 0 / 100');
-      await expect(forwarding.locator('.qta-cap')).toHaveText('/ 50 GiB');
+      await expect(forwarding.locator('.qta-cap')).toHaveText('额度 50 GiB');
       await expect(forwarding.locator('.user-usage-reset')).toHaveText(reset);
       expect(await layout('.user-forwarding-usage')).toEqual(accessLayout);
       expect(accessLayout.overflow).toBe(false);

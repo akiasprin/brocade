@@ -83,7 +83,6 @@ function mount(data = views(), _kind: 'access' = 'access', editable = true) {
               policy={row}
               used={Number(row.used_bytes)}
               limit={row.policy?.quota_bytes ? Number(row.policy.quota_bytes) : null}
-              over={row.exhausted}
             />
           ))}
       </SessionProvider>
@@ -109,9 +108,9 @@ describe('app access quota presentation', () => {
     ).toThrow('接入额度必须指定 app');
     expect(request).toHaveBeenCalledTimes(1);
   });
-  it('shows the exhaustion rule at the quota boundary without requiring interaction', () => {
+  it('shows exceptional exhaustion rules in the card footer without requiring interaction', () => {
     mount(views({ quota_bytes: '1024', exhausted_action: { kind: 'throttle', rate_bps: 5_000_000 } }), 'access', false);
-    expect(screen.getByText('用满后限速 5 Mbps').closest('.qta-meter-run')).toBeTruthy();
+    expect(screen.getByText('用满后限速 5 Mbps').closest('.qta-foot')).toBeTruthy();
     expect(screen.queryByRole('button')).toBeNull();
     expect(screen.queryByRole('dialog')).toBeNull();
   });
@@ -120,7 +119,7 @@ describe('app access quota presentation', () => {
     {
       policy: { quota_bytes: '1024', exhausted_action: { kind: 'suspend' as const } },
       extra: {},
-      description: '用满后停用',
+      description: null,
       tone: '',
     },
     {
@@ -135,17 +134,17 @@ describe('app access quota presentation', () => {
       description: '已停用',
       tone: 'err',
     },
-    { policy: null, extra: { service_available: false }, description: '服务暂停', tone: 'idle' },
+    { policy: null, extra: { service_available: false }, description: null, tone: 'idle' },
     {
       policy: { quota_bytes: '1024', exhausted_action: { kind: 'throttle' as const, rate_bps: 5_000_000 } },
       extra: { exhausted: true, service_available: false },
-      description: '服务暂停',
+      description: null,
       tone: 'idle',
     },
   ])('shows the current state: $description', ({ policy, extra, description, tone }) => {
     const { container } = mount(views(policy, extra), 'access', false);
     if (description === null) expect(container.querySelector('.qta-policy-flag')).toBeNull();
-    else expect(screen.getByText(description).className).toBe(`qta-policy-flag ${tone}`);
+    else expect(screen.getByText(description).closest('.qta-policy-flag')?.className).toBe(`qta-policy-flag ${tone}`);
     expect(screen.queryByRole('button')).toBeNull();
   });
   it('shows synchronization with one activity indicator and keeps unlimited policies free of a track', () => {
@@ -159,7 +158,7 @@ describe('app access quota presentation', () => {
     );
     expect(screen.getByText('同步中').title).toBe('等待 2 台机器同步');
     expect(container.querySelectorAll('.qta-policy-spin')).toHaveLength(1);
-    expect(container.querySelector('.qta-meter')).toBeNull();
+    expect(container.querySelector('.qta-ring')).toBeNull();
     expect(screen.queryByText(/用满后/)).toBeNull();
   });
   it('saves independent and post-exhaustion speeds only for the selected app', async () => {
@@ -173,7 +172,7 @@ describe('app access quota presentation', () => {
     vi.stubGlobal('fetch', fetcher);
     mount();
     fireEvent.click(screen.getByRole('button', { name: 'Main · 额度与限速' }));
-    expect(screen.getByRole('form', { name: 'Main · 额度与限速' }).closest('.qta-r')).toBeTruthy();
+    expect(screen.getByRole('form', { name: 'Main · 额度与限速' }).closest('.fwe-sheet')).toBeTruthy();
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(screen.queryByLabelText('正常速度上限')).toBeNull();
     expect(screen.queryByLabelText('超额速度上限（Mbps）')).toBeNull();

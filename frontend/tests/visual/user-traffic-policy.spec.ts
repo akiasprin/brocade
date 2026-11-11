@@ -102,7 +102,7 @@ test('pending synchronization is explicit', async ({ page }) => {
   await expect(page.locator('.qta-policy-spin')).toHaveCount(1);
 });
 
-test('quota boundary labels stay inside the track at intermediate widths and extreme overflow', async ({ page }) => {
+test('quota status and readings stay inside tiles at intermediate widths and extreme overflow', async ({ page }) => {
   await page.clock.setFixedTime(new Date('2026-10-23T12:00:00Z'));
   for (const traffic of ['pending', 'extreme']) {
     for (const width of [1440, 1100, 390, 360]) {
@@ -119,13 +119,13 @@ test('quota boundary labels stay inside the track at intermediate widths and ext
           amount: box('.qta-figs'),
           balance: box('.qta-left-value'),
           label: box('.qta-policy-flag'),
-          track: box('.qta-meter-track'),
+          tile: { left: row.getBoundingClientRect().left, right: row.getBoundingClientRect().right },
           overflow: row.scrollWidth > row.clientWidth,
         };
       });
       expect(layout.overflow, JSON.stringify({ traffic, width, layout })).toBe(false);
-      expect(layout.label.left).toBeGreaterThanOrEqual(layout.track.left - 1);
-      expect(layout.label.right).toBeLessThanOrEqual(layout.track.right + 1);
+      expect(layout.label.left).toBeGreaterThanOrEqual(layout.tile.left - 1);
+      expect(layout.label.right).toBeLessThanOrEqual(layout.tile.right + 1);
       expect(layout.balance.left >= layout.amount.right - 1 || layout.balance.top >= layout.amount.bottom - 1).toBe(
         true,
       );
@@ -163,7 +163,7 @@ for (const width of [1280, 390])
       .getByRole('listitem')
       .filter({ has: page.getByRole('button', { name: 'JP Budget · 额度与限速' }) });
     await expect(first.getByText('限速中 · 5 Mbps', { exact: true })).toBeVisible();
-    await expect(second.getByText('用满后停用', { exact: true })).toBeVisible();
+    await expect(second.getByText('用满后停用', { exact: true })).toHaveCount(0);
     await expect(second).toContainText('剩余38.00 GiB');
     await expect(card).toHaveScreenshot(`independent-apps-${width}.png`);
     await second.getByRole('button', { name: 'JP Budget · 额度与限速' }).click();
@@ -194,7 +194,7 @@ for (const width of [1280, 390])
     await page.goto('/tests/fixtures/user-header-preview.html?apps=two&traffic=stopped');
     const card = page.locator('.user-usage-card:not(.user-forwarding-usage)');
     await expect(card.getByText('已停用', { exact: true })).toBeVisible();
-    await expect(card.getByText('用满后停用', { exact: true })).toBeVisible();
+    await expect(card.getByText('用满后停用', { exact: true })).toHaveCount(0);
     await expect(card).toHaveScreenshot(`suspended-apps-${width}.png`);
     expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
   });
@@ -229,22 +229,18 @@ for (const scene of ['all', 'normal', 'single', 'throttled', 'suspended', 'pendi
           await expect(card.locator('.qta-r').first()).toBeVisible();
           if (scene === 'throttled' || scene === 'all') {
             await expect(card.getByText('限速中 · 2 Mbps', { exact: true })).toBeVisible();
-            await expect(card.locator('.throttled .qta-overflow')).toHaveCount(1);
+            await expect(card.locator('.throttled .qta-ring .value')).toHaveAttribute('stroke-dasharray', '100 100');
           }
           if (scene === 'suspended' || scene === 'all')
             await expect(card.getByText('已停用', { exact: true })).toBeVisible();
           if (scene === 'pending') await expect(card.locator('.qta-policy-sync')).toHaveCount(1);
           if (scene === 'paused') {
-            await expect(card.getByText('服务暂停', { exact: true })).toHaveCount(2);
-            const pausedColors = await card.locator('.qta-r.paused').evaluateAll(rows =>
-              rows.map(row => ({
-                fill: getComputedStyle(row.querySelector('.qta-t > i')!).backgroundColor,
-                percent: getComputedStyle(row.querySelector('.qta-pct')!).color,
-                state: getComputedStyle(row.querySelector('.qta-policy-flag')!).color,
-              })),
-            );
-            expect(new Set(pausedColors.map(row => row.fill)).size).toBe(1);
-            expect(pausedColors.every(row => row.percent === row.state)).toBe(true);
+            await expect(card.locator('.qta').getByText('服务暂停', { exact: true })).toHaveCount(0);
+            await expect(card.locator('.qta-r.paused')).toHaveCount(2);
+            const pausedColors = await card
+              .locator('.qta-r.paused')
+              .evaluateAll(rows => rows.map(row => getComputedStyle(row.querySelector('.qta-ring .value')!).stroke));
+            expect(new Set(pausedColors).size).toBe(1);
           }
           if (role === 'readonly') await expect(card.locator('.qta-pencil')).toHaveCount(0);
           expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
@@ -273,7 +269,7 @@ test('production quota editor changes a suspended app into throttling and then c
   const row = page.getByRole('listitem').filter({ has: page.getByRole('button', { name: 'EU Lite · 额度与限速' }) });
   await expect(row.getByText('已停用', { exact: true })).toBeVisible();
   await row.getByRole('button', { name: 'EU Lite · 额度与限速' }).click();
-  const form = row.getByRole('form');
+  const form = page.getByRole('form', { name: 'EU Lite · 额度与限速', exact: true });
   await form.getByRole('button', { name: '限速', exact: true }).click();
   await form.getByLabel('超额速度上限（Mbps）').fill('3');
   await form.getByRole('button', { name: '保存', exact: true }).click();

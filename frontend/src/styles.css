@@ -19346,15 +19346,6 @@ h4.sec > .btn {
   outline-offset: 3px;
   border-radius: var(--r-ctl);
 }
-.qta {
-  --quota-action-width: 25px;
-  --quota-columns: minmax(118px, 0.85fr) minmax(0, 2fr) minmax(96px, auto) var(--quota-action-width);
-
-  display: grid;
-  align-content: start;
-  min-width: 0;
-  padding: 3px var(--panel-content-x);
-}
 .user-access-quotas {
   min-width: 0;
 }
@@ -19364,181 +19355,6 @@ h4.sec > .btn {
 .user-usage > .dim.qta-empty {
   display: block;
   padding: 16px var(--panel-content-x);
-}
-/* 一行两层：名称（线路名 + 地区旗 / 接入链）│ 已用 / 额度 …… 剩余 │ 铅笔；第二层是额度条与百分比，
-   左缘与数值对齐。已用量和额度是同一比值的分子与分母，放在同一行，线路增多后不需要自行配对。
-   未设额度不画额度条：空槽会被理解为用量为零，而实际含义是不限量。 */
-.qta-r {
-  display: grid;
-  grid-template-columns: var(--quota-columns);
-  grid-template-areas:
-    'name figs left acts'
-    'name meter meter acts';
-  align-items: center;
-  column-gap: 18px;
-  row-gap: 8px;
-  padding: 12px 0;
-}
-.qta-r + .qta-r {
-  border-top: 1px solid var(--line-soft);
-}
-.qta-name {
-  display: grid;
-  grid-area: name;
-  gap: 3px;
-  min-width: 0;
-}
-.qta-app {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 7px;
-  color: var(--ink);
-  font: 600 13px/18px var(--sans);
-}
-.qta-app > b {
-  overflow: hidden;
-  font-weight: inherit;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.qta-flags {
-  display: inline-flex;
-  flex: none;
-  gap: 3px;
-}
-.qta-sub {
-  overflow: hidden;
-  min-width: 0;
-  color: var(--ink-4);
-  font-size: 11px;
-  line-height: 15px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.qta-sub.stop {
-  color: var(--err);
-}
-.qta-figs {
-  display: flex;
-  grid-area: figs;
-  min-width: 0;
-  align-items: baseline;
-  gap: 4px;
-  color: var(--ink);
-  font: 600 15px/18px var(--sans);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-.qta-figs small {
-  color: var(--ink-3);
-  font: 500 11.5px var(--sans);
-}
-.qta-cap {
-  margin-left: 5px;
-  color: var(--ink-4);
-  font: 500 12px var(--sans);
-}
-.qta-left {
-  grid-area: left;
-  justify-self: end;
-  color: var(--ink-4);
-  font-size: 12px;
-  line-height: 18px;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-.qta-left b {
-  margin-left: 4px;
-  color: var(--ink-2);
-  font-weight: 500;
-}
-.qta-left-value {
-  white-space: nowrap;
-}
-.qta-meter {
-  display: flex;
-  grid-area: meter;
-  min-width: 0;
-  align-items: center;
-  gap: 12px;
-}
-/* 额度条取数据色：它表示用量，与用量页的上下行同属数据角色。 */
-.qta-t {
-  position: relative;
-  flex: 1;
-  min-width: 0;
-  height: 6px;
-  overflow: hidden;
-  border-radius: 3px;
-  background: color-mix(in srgb, var(--ink) 8%, transparent);
-}
-.qta-t > i {
-  position: absolute;
-  inset: 0 auto 0 0;
-  border-radius: inherit;
-  background: var(--data);
-}
-.qta-pct {
-  flex: none;
-  width: 34px;
-  color: var(--ink-3);
-  font: 500 11.5px var(--sans);
-  font-variant-numeric: tabular-nums;
-  text-align: right;
-}
-.qta-acts {
-  grid-area: acts;
-  justify-self: end;
-}
-/* 注意档（≥80%）给额度条与百分比上色；停用时用告警色，超额限速仍用注意色。 */
-.qta-r.warn .qta-t > i {
-  background: var(--gold);
-}
-.qta-r.warn .qta-pct {
-  color: var(--gold);
-}
-.qta-r.over .qta-t > i {
-  background: var(--err);
-}
-.qta-r.over :is(.qta-pct, .qta-left, .qta-left b) {
-  color: var(--err);
-}
-.qta-r.unknown .qta-figs {
-  color: var(--ink-3);
-  font-weight: 500;
-}
-/* 非编辑态的操作是铅笔图标，悬停整行或键盘聚焦时显出；触屏没有悬停，常显。 */
-.qta-pencil.btn {
-  display: grid;
-  width: 25px;
-  height: 25px;
-  min-height: 25px;
-  padding: 0;
-  border-color: transparent;
-  background: transparent;
-  place-items: center;
-  opacity: 0.48;
-}
-.qta-r:hover .qta-pencil,
-.qta-pencil:focus-visible {
-  opacity: 1;
-}
-.qta-pencil.btn:hover:not(:disabled) {
-  border-color: var(--line);
-  background: var(--hover-2);
-}
-.qta-pencil svg {
-  width: 13px;
-  height: 13px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.6;
-}
-@media (hover: none) {
-  .qta-pencil.btn {
-    opacity: 0.8;
-  }
 }
 /* 卡宽 ≤620px：读数栏移到列表上方（合计与上下行并排），线路行改为三层。 */
 @container user-usage (max-width: 620px) {
@@ -19567,21 +19383,8 @@ h4.sec > .btn {
   .user-usage-compose {
     align-self: end;
   }
-  .qta {
-    --quota-columns: minmax(0, 1fr) auto var(--quota-action-width);
-
-    padding: 0 var(--panel-content-x-compact);
-  }
   .user-usage > .dim.qta-empty {
     padding: 14px var(--panel-content-x-compact);
-  }
-  .qta-r {
-    grid-template-areas:
-      'name name acts'
-      'figs left left'
-      'meter meter meter';
-    column-gap: 10px;
-    row-gap: 7px;
   }
 }
 @container user-usage (max-width: 400px) {
@@ -21867,15 +21670,6 @@ h4.sec > .btn {
 .fwd-rule-count {
   font-variant-numeric: tabular-nums;
 }
-.fwd-quota-row .qta-acts {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-.fwd-quotas > .fwd-add {
-  justify-self: start;
-  margin: 2px 0 6px -8px;
-}
 /* 规则清单独占一张卡。 */
 .fwd-main {
   --fwd-content-x: var(--panel-content-x);
@@ -22462,50 +22256,6 @@ select.f.fwe-select {
   font-style: normal;
 }
 
-/* ══ A 行内展开 ══
-   打开的机器行铺满右栏、垫一层浅底；读数原样留着，表单接在读数下面，从读数那一列起排，
-   左边的机器名就是这块表单的标题。没有边框、没有第二个关闭按钮。 */
-.qta-r.fwe-open {
-  margin-inline: calc(0px - var(--panel-content-x));
-  padding-inline: var(--panel-content-x);
-  background: color-mix(in srgb, var(--ink) 3.5%, transparent);
-}
-.qta-r.fwe-open .fwe-entry-name b {
-  color: var(--ink);
-}
-.fwe-sheet {
-  grid-column: 2 / -1;
-  min-width: 0;
-  margin-top: 4px;
-  padding-top: 10px;
-  border-top: 1px dashed var(--line-soft);
-  animation: fwe-open 0.16s ease-out;
-}
-/* 各行共用同一组列：已停止的行多一个「恢复」，读数列也不跟着左移。 */
-.qta.fwe-aligned {
-  --quota-action-width: minmax(25px, auto);
-
-  grid-template-columns: var(--quota-columns);
-  column-gap: 18px;
-}
-.qta.fwe-aligned > * {
-  grid-column: 1 / -1;
-}
-.qta.fwe-aligned > .qta-r {
-  grid-template-columns: subgrid;
-}
-.qta-r.fwe-grant {
-  padding-block: 14px;
-}
-.qta-r.fwe-grant > .qta-name {
-  align-self: start;
-  padding-top: 5px;
-}
-.qta-r.fwe-grant > .fwe-sheet {
-  margin-top: -6px;
-  padding-top: 0;
-  border-top: 0;
-}
 .btn.fwe-resume {
   min-height: 26px;
   margin-right: 4px;
@@ -22548,22 +22298,6 @@ select.f.fwe-select {
   }
 }
 
-/* ── 窄卡：表单占满整行宽度 ── */
-@container user-usage (max-width: 700px) {
-  .fwe-sheet,
-  .qta-r.fwe-grant > .fwe-sheet {
-    grid-column: 1 / -1;
-  }
-  .qta-r.fwe-grant > .fwe-sheet {
-    margin-top: 2px;
-  }
-}
-@container user-usage (max-width: 620px) {
-  .qta-r.fwe-open {
-    margin-inline: calc(0px - var(--panel-content-x-compact));
-    padding-inline: var(--panel-content-x-compact);
-  }
-}
 @container user-forwarding (max-width: 640px) {
   .fwe-rule-sheet {
     padding-left: 18px;
@@ -22897,9 +22631,6 @@ select.f.fwr-sort {
 }
 .fwe-form > .error {
   margin: 8px 0;
-}
-.qta-r.fwe-open > .error {
-  grid-column: 1 / -1;
 }
 @media (prefers-reduced-motion: reduce) {
   .fwe-sheet,

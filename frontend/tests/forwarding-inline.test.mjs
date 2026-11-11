@@ -17,7 +17,7 @@ before(async () => {
   cacheDirectory = await mkdtemp(join(tmpdir(), 'brocade-forwarding-inline-'));
   server = await createServer({
     configFile: false,
-  define: { __BROCADE_CVM__: process.env.BROCADE_PRODUCT_FLAVOR !== 'base' },
+    define: { __BROCADE_CVM__: process.env.BROCADE_PRODUCT_FLAVOR !== 'base' },
     root: fileURLToPath(new URL('..', import.meta.url)),
     plugins: [react()],
     cacheDir: join(cacheDirectory, 'node_modules/.vite'),
@@ -84,7 +84,7 @@ for (const width of [1180, 900, 620, 390]) {
       await form.getByRole('button', { name: '保存', exact: true }).click();
       await expect(form).toHaveCount(0);
       await expect(opener(page)).toBeFocused();
-      await expect(page.locator('.qta-figs').first()).toContainText('1100 GiB');
+      await expect(page.locator('.qta-cap').first()).toHaveText('额度 1100 GiB');
       await opener(page).click();
       await opener(page, '洛杉矶入口').click();
       await expect(page.getByRole('form')).toHaveCount(1);

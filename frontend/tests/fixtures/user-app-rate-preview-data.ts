@@ -10,6 +10,8 @@ import type {
 import type { Session } from '../../src/session';
 import { userTrafficPolicyKey } from '../../src/panes/user-traffic-policy';
 
+const params = new URLSearchParams(location.search);
+const scene = params.get('quotaScene');
 export const GiB = 1024 ** 3;
 export type Policy = {
   quota: number | null;
@@ -31,7 +33,7 @@ const tenant = 'preview';
 export const users: UserListItem[] = ['alice', 'carol', 'dave', 'erin', 'frank'].map((id, i) => ({
   tenant_id: tenant,
   id,
-  status: 'active',
+  status: scene === 'paused' ? 'disabled' : 'active',
   created_at: '2026-10-01T00:00:00Z',
   created_revision: 1,
   uuid: `00000000-0000-4000-8000-${String(i + 1).padStart(12, '0')}`,
@@ -44,10 +46,17 @@ export const users: UserListItem[] = ['alice', 'carol', 'dave', 'erin', 'frank']
   ...(id === 'carol' ? { account_type: 'test' as const } : {}),
 }));
 export const session: Session = {
-  who: { operator_id: 'rate-demo', role: 'system-admin', tenant_scope: null, token_prefix: null, masked_assets: false },
+  who: {
+    operator_id: 'rate-demo',
+    role: params.get('role') === 'user' ? 'user' : 'system-admin',
+    tenant_scope: null,
+    token_prefix: null,
+    masked_assets: false,
+    ...(params.get('role') === 'user' ? { self_user: { tenant_id: tenant, user_id: 'alice' } } : {}),
+  },
   initial: { node_count: 3, chain_group_count: [] },
 };
-const groups = (): Group[] => [
+const baseGroups = (): Group[] => [
   {
     id: 'apac-premium',
     label: 'APAC Premium',
@@ -112,6 +121,19 @@ const groups = (): Group[] => [
     pending: false,
   },
 ];
+const groups = (): Group[] => {
+  const result = baseGroups();
+  if (scene === 'few') return result.slice(0, 2);
+  if (scene === 'mixed') {
+    result[0].used = 550;
+    result[1].pending = true;
+    result[2].used = 1100;
+    result[3].used = 170;
+    result[5].used = 0.25;
+    result[5].policy.quota = 2000;
+  }
+  return result;
+};
 let world: World = {
   cycle: 0,
   groups: Object.fromEntries(
@@ -157,7 +179,7 @@ export function viewOf(group: Group): UserTrafficPolicyView {
           },
     used_bytes: String(Math.round(group.used * GiB)),
     exhausted: exhausted(group),
-    service_available: true,
+    service_available: scene !== 'paused',
     unsupported_nodes: [],
     pending_nodes: group.pending ? ['香港入口', '东京入口'] : [],
     base_rate_supported: true,
@@ -258,7 +280,7 @@ export const client = new QueryClient({
 });
 function sync() {
   client.setQueryData(['quotas'], quotas());
-  client.setQueryData(['user-cycles'], cycles());
+  if (scene !== 'failed') client.setQueryData(['user-cycles'], cycles());
   users.forEach(user => client.setQueryData(userTrafficPolicyKey(user), world.groups[user.id].map(viewOf)));
   listeners.forEach(listener => listener());
 }
@@ -314,8 +336,10 @@ globalThis.fetch = async (input, init) => {
     return Response.json(world.groups[user].map(viewOf));
   }
   if (path === '/whoami') return Response.json(session.who);
+  if (path === '/me/user') return Response.json(users[0]);
   if (path === '/users') return Response.json({ users });
-  if (path === '/usage/user-cycles') return Response.json(cycles());
+  if (path === '/usage/user-cycles')
+    return scene === 'failed' ? Response.json({ error: '合成用量读取失败' }, { status: 503 }) : Response.json(cycles());
   if (path === '/quotas') return Response.json(quotas());
   if (path === '/model/snapshot') return Response.json(model);
   if (path === '/tenants') return Response.json({ tenants: [{ id: tenant, name: '示例' }] });

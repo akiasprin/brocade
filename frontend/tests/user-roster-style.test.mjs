@@ -20,21 +20,16 @@ test('用户名册选中行使用中性卡面和弱边线且不再绘制高亮�
   assert.doesNotMatch(rosterStyles, /\.user-row\.picked::before/);
 });
 
-test('用量与额度：读数栏沿用用量页写法，线路行不铺底色，窄卡把读数栏移到上方', () => {
+test('用量与额度读数栏在窄卡移到上方', () => {
   const users = readFileSync(new URL('../src/panes/users.tsx', import.meta.url), 'utf8');
   const ledger = readFileSync(new URL('../src/panes/user-usage.tsx', import.meta.url), 'utf8');
   assert.match(ledger, /className="usage-split"/);
   assert.match(ledger, /className="usage-io"/);
   assert.doesNotMatch(users, /留空表示不限。/);
-
-  assert.match(styles, /\.qta-t > i\s*\{[^}]*background:\s*var\(--data\);/);
-  assert.match(styles, /\.qta-r\.warn \.qta-t > i\s*\{[^}]*background:\s*var\(--gold\);/);
-  assert.match(styles, /\.qta-r\.over \.qta-t > i\s*\{[^}]*background:\s*var\(--err\);/);
-  assert.doesNotMatch(styles, /\.qta-r(?:\.over|\.warn)?\s*\{[^}]*background:/);
   assert.match(styles, /\.panel\.config-panel\.user-usage-card\s*\{[^}]*container:\s*user-usage \/ inline-size;/);
   assert.match(
     styles,
-    /@container user-usage \(max-width: 620px\)\s*\{[\s\S]*?\.user-usage\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);[\s\S]*?\.qta-r\s*\{[^}]*grid-template-areas:/,
+    /@container user-usage \(max-width: 620px\)\s*\{[\s\S]*?\.user-usage\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);/,
   );
 });
 
@@ -63,11 +58,4 @@ test('在线接入时间线：IPv6 不截断，入口默认收成摘要，窄卡
     /@container user-presence \(max-width: 760px\)\s*\{[\s\S]*?\.user-presence-access-item\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);/,
   );
   assert.match(styles, /\.user-presence-mark\s*\{[^}]*background:\s*var\(--ok\);/);
-});
-
-test('接入与转发额度复用列宽和 620px 换行规则', () => {
-  assert.match(styles, /\.qta-r\s*\{[^}]*grid-template-columns:\s*var\(--quota-columns\);/);
-  assert.match(styles, /\.qta\.fwe-aligned\s*\{[^}]*grid-template-columns:\s*var\(--quota-columns\);/);
-  assert.match(styles, /@container user-usage \(max-width: 620px\)\s*\{[\s\S]*?\.qta\s*\{[^}]*--quota-columns:/);
-  assert.doesNotMatch(styles, /@container user-usage \(max-width: 700px\)\s*\{\s*\.fwd-quota-row/);
 });

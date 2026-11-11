@@ -35,34 +35,34 @@ describe('用户额度交互', () => {
   });
 
   it('月度汇总仍在读取时只占位用量，不阻塞额度内容', () => {
-    const { container } = render(<QuotaRow app={app} used={null} limit={10 * GiB} over={false} usageState="pending" />);
+    const { container } = render(<QuotaRow app={app} used={null} limit={10 * GiB} usageState="pending" />);
 
     expect(screen.getByText('读取中…')).toBeTruthy();
-    expect(screen.getByText('/ 10 GiB')).toBeTruthy();
+    expect(screen.getByText('额度 10 GiB')).toBeTruthy();
     expect(container.querySelector('.qta-left')).toBeNull();
-    expect(container.querySelector('.qta-t')).toBeNull();
+    expect(container.querySelector('.qta-ring')).toBeNull();
   });
 
-  it('月度汇总失败时明确标为不可用', () => {
-    render(<QuotaRow app={app} used={null} limit={10 * GiB} over={false} usageState="failed" />);
+  it('月度汇总失败时只保留占位，不逐卡重复错误', () => {
+    render(<QuotaRow app={app} used={null} limit={10 * GiB} usageState="failed" />);
 
     expect(screen.getByText('—')).toBeTruthy();
-    expect(screen.getByText('用量暂不可用')).toBeTruthy();
+    expect(screen.queryByText('用量暂不可用')).toBeNull();
   });
 
-  it('用量读取失败时显示未知，不把未知算成 0 或剩余额度', () => {
-    const { container } = render(<QuotaRow app={app} used={null} limit={10 * GiB} over={false} />);
+  it('用量未知时不把未知算成 0 或剩余额度', () => {
+    const { container } = render(<QuotaRow app={app} used={null} limit={10 * GiB} />);
 
     expect(screen.getByText('—')).toBeTruthy();
     expect(screen.getByText('用量未知')).toBeTruthy();
     expect(screen.queryByText(/剩余/)).toBeNull();
     expect(container.querySelector('.qta-r')?.classList.contains('unknown')).toBe(true);
-    expect(container.querySelector('.qta-t')).toBeNull();
+    expect(container.querySelector('.qta-ring')).toBeNull();
   });
 
   it('按额度比例分档：常态、注意（≥80%）、用尽', () => {
     const tone = (used: number, limit: number) => {
-      const { container, unmount } = render(<QuotaRow app={app} used={used} limit={limit} over={used >= limit} />);
+      const { container, unmount } = render(<QuotaRow app={app} used={used} limit={limit} />);
       const row = container.querySelector('.qta-r')!;
       const result = {
         tone: ['ok', 'warn', 'over'].find(name => row.classList.contains(name)),
@@ -81,13 +81,13 @@ describe('用户额度交互', () => {
     expect(tone(103.4 * GiB, 100 * GiB)).toEqual({ tone: 'over', pct: '103%', left: '超出3.40 GiB' });
   });
 
-  it('未设额度时写明不限，不画额度条', () => {
-    const { container } = render(<QuotaRow app={app} used={12.5 * GiB} limit={null} over={false} />);
+  it('未设额度时写明不限，不画额度圆环', () => {
+    const { container } = render(<QuotaRow app={app} used={12.5 * GiB} limit={null} />);
 
     expect(container.querySelector('.qta-r')?.classList.contains('unlimited')).toBe(true);
     expect(container.querySelector('.qta-figs')?.textContent).toBe('12.50GiB');
     expect(screen.getByText('不限额度')).toBeTruthy();
-    expect(container.querySelector('.qta-t')).toBeNull();
+    expect(container.querySelector('.qta-ring')).toBeNull();
   });
 
   it('名称下方列出已授权的链；被系统停用时只写数量，名单进悬停提示', () => {
@@ -96,21 +96,20 @@ describe('用户额度交互', () => {
         app={app}
         used={1 * GiB}
         limit={10 * GiB}
-        over={false}
-        access={{ countries: ['JP', 'HK'], chains: ['东京 IIJ', '香港 HKT'], suspended: [] }}
+        access={{ grantedCount: 3, countries: ['JP', 'HK'], chains: ['东京 IIJ', '香港 HKT'], suspended: [] }}
       />,
     );
 
     expect(container.querySelectorAll('.qta-app .geo-flag')).toHaveLength(2);
-    expect(container.querySelector('.qta-sub')?.textContent).toBe('东京 IIJ、香港 HKT');
+    expect(container.querySelector('.qta-sub')?.textContent).toBe('3 个接入点');
+    expect(container.querySelector('.qta-sub')?.getAttribute('title')).toBe('东京 IIJ、香港 HKT');
 
     rerender(
       <QuotaRow
         app={app}
         used={11 * GiB}
         limit={10 * GiB}
-        over
-        access={{ countries: ['JP'], chains: [], suspended: ['东京 IIJ', '东京 IIJ'] }}
+        access={{ grantedCount: 0, countries: ['JP'], chains: [], suspended: ['东京 IIJ', '东京 IIJ'] }}
       />,
     );
 
@@ -132,12 +131,11 @@ describe('用户额度交互', () => {
     });
     const { container } = render(
       <>
-        <QuotaRow app={app} used={12 * GiB} limit={10 * GiB} over policy={policy(app.id, true)} />
+        <QuotaRow app={app} used={12 * GiB} limit={10 * GiB} policy={policy(app.id, true)} />
         <QuotaRow
           app={{ ...app, id: 'other', label: '其他线路' }}
           used={GiB}
           limit={10 * GiB}
-          over={false}
           policy={policy('other', false)}
         />
       </>,
@@ -149,12 +147,23 @@ describe('用户额度交互', () => {
     expect(rows[0].classList.contains('over')).toBe(false);
     expect(rows[0].querySelector('.qta-left')?.textContent).toBe('超出2.00 GiB');
     expect(rows[1].querySelector('.qta-left')?.textContent).toBe('剩余9.00 GiB');
-    const run = rows[0].querySelector<HTMLElement>('.qta-meter-run')!;
-    expect(parseFloat(run.style.getPropertyValue('--at'))).toBeCloseTo((100 * 10) / 12);
-    expect(rows[0].querySelector('.qta-t > i')?.getAttribute('style')).toContain('width: 100%');
-    expect(rows[0].querySelector('.qta-overflow')).toBeTruthy();
-    expect(rows[1].querySelector('.qta-overflow')).toBeNull();
+    expect(rows[0].querySelector('.qta-ring .value')?.getAttribute('stroke-dasharray')).toBe('100 100');
+    expect(rows[0].querySelector('.qta-pct')?.textContent).toBe('120%');
     expect(screen.queryByRole('button')).toBeNull();
     expect(container.textContent).not.toContain('共享总额度');
+  });
+  it('小于 1% 保留真实的非零含义，接近用尽不提前写成 100%', () => {
+    const { container, rerender } = render(<QuotaRow app={app} used={1.25 * GiB} limit={200 * GiB} />);
+    expect(container.querySelector('.qta-pct')?.textContent).toBe('<1%');
+    rerender(<QuotaRow app={app} used={99.99 * GiB} limit={100 * GiB} />);
+    expect(container.querySelector('.qta-pct')?.textContent).toBe('99%');
+    rerender(<QuotaRow app={app} used={0} limit={100 * GiB} />);
+    expect(container.querySelector('.qta-pct')?.textContent).toBe('0%');
+  });
+  it('已用、额度、余额都不因超过 TiB 而切换单位', () => {
+    const { container } = render(<QuotaRow app={app} used={68.88 * GiB} limit={2000 * GiB} />);
+    expect(container.querySelector('.qta-cap')?.textContent).toBe('额度 2000 GiB');
+    expect(container.querySelector('.qta-left')?.textContent).toBe('剩余1931.12 GiB');
+    expect(container.textContent).not.toContain('TiB');
   });
 });

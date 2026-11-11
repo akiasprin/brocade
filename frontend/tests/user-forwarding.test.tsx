@@ -126,13 +126,18 @@ function show(
     canManageRules?: boolean;
     canViewRealtime?: boolean;
     accountingMode?: UserTrafficAccountingMode;
+    serviceState?: UserListItem['service_state'];
   } = {},
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } } });
   const view = render(
     <QueryClientProvider client={client}>
       <UserForwardingCard
-        user={{ ...user, traffic_accounting_mode: options.accountingMode ?? 'single' }}
+        user={{
+          ...user,
+          traffic_accounting_mode: options.accountingMode ?? 'single',
+          service_state: options.serviceState,
+        }}
         nodes={[
           { id: 'n1', name: '东京入口', api_port: 10085, public_ipv4: '198.51.100.10' },
           { id: 'n2', name: '洛杉矶入口', api_port: 10085 },
@@ -524,6 +529,18 @@ describe('forwarding quota input', () => {
 });
 
 describe('用户转发入口', () => {
+  it('keeps entry failures visible during a user-level service pause without repeating it per tile', async () => {
+    serve({
+      [`GET ${BASE}/forwarding`]: () =>
+        overview([entry()], [rule({ runtime_status: 'service-paused' }), rule({ id: 43, runtime_status: 'error' })]),
+    });
+    const view = show({ serviceState: 'expired' });
+    const quotas = await view.findByRole('list', { name: '各转发入口的用量与额度' });
+    expect(within(quotas).getByText('1 条失败')).toBeTruthy();
+    expect(quotas.textContent).not.toContain('有效期暂停');
+    expect(quotas.querySelector('.qta-r.paused')).toBeTruthy();
+  });
+
   it('switches between inline editors without disabling unrelated actions and retains the readings', async () => {
     serve({ [`GET ${BASE}/forwarding`]: () => overview([entry({ cycle_used_bytes: 5 * 1024 ** 3 })], [rule()]) });
     const view = show({ canAuthorize: true });
@@ -622,7 +639,7 @@ describe('用户转发入口', () => {
     fireEvent.click(await view.findByRole('button', { name: '编辑 东京入口 的转发授权' }));
     const dialog = await view.findByRole('form', { name: '编辑 东京入口 的转发授权' });
     expect(view.queryByRole('dialog')).toBeNull();
-    expect(dialog.closest('.qta-r.fwe-open')).toBeTruthy();
+    expect(dialog.closest('.fwe-sheet')).toBeTruthy();
     fireEvent.click(within(dialog).getByRole('button', { name: /配额工单/ }));
     expect(await within(dialog).findByText(/#91/)).toBeTruthy();
     expect(within(dialog).getByText('等待节点恢复')).toBeTruthy();
@@ -786,7 +803,7 @@ describe('用户转发入口', () => {
     await waitFor(() => expect(view.container.querySelector('.user-usage-hero-value')?.textContent).toBe('暂不可用'));
     expect(quotas.querySelector('.qta-figs')?.textContent).toBe('—');
     expect(quotas.querySelector('.fwd-rule-count')?.textContent).toBe('规则 1 / 4');
-    expect(quotas.querySelector('.qta-left')?.textContent).toBe('用量暂不可用');
+    expect(quotas.querySelector('.qta-left')).toBeNull();
     expect(quotas.querySelector('.qta-pct')).toBeNull();
   });
 
@@ -811,7 +828,7 @@ describe('用户转发入口', () => {
     expect(quotas.querySelector('.qta-pct')?.textContent).toBe('10%');
     expect(quotas.querySelector('.qta-left')?.textContent).toBe('剩余45.0 MiB');
     expect(quotas.querySelector('.fwd-rule-count')?.textContent).toBe('规则 1 / 4');
-    expect(within(quotas).getByText('用满后停用')).toBeTruthy();
+    expect(within(quotas).queryByText('用满后停用')).toBeNull();
 
     current = overview(
       [entry({ cycle_used_bytes: 60 * MiB, cycle_limit_bytes: 50 * MiB, quota_suspended: true })],
@@ -820,7 +837,7 @@ describe('用户转发入口', () => {
     await act(() => view.client.invalidateQueries({ queryKey: ['forwarding', user.tenant_id, user.id] }));
     await waitFor(() => expect(quotas.querySelector('.qta-pct')?.textContent).toBe('120%'));
     expect(quotas.querySelector('.qta-left')?.textContent).toBe('超出10.0 MiB');
-    expect(quotas.querySelector('.qta-overflow')).toBeTruthy();
+    expect(quotas.querySelector('.qta-ring .value')?.getAttribute('stroke-dasharray')).toBe('100 100');
     expect(quotas.querySelector('.qta-r')?.classList.contains('over')).toBe(true);
     expect(within(quotas).getByText('额度已用满 · 已停用')).toBeTruthy();
   });

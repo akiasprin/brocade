@@ -6,59 +6,6 @@
   min-height: 280px;
 }
 
-.qta-meter.qta-quota-meter {
-  align-items: flex-start;
-}
-.qta-r {
-  --quota-warning-text: var(--gold);
-}
-/* Small warning text needs a darker shade than the track on a light card. */
-:root[data-theme='light'] .qta-r {
-  --quota-warning-text: color-mix(in srgb, var(--gold) 80%, var(--ink));
-}
-.qta-meter-run {
-  position: relative;
-  flex: 1;
-  min-width: 0;
-  container-type: inline-size;
-}
-.qta-meter-track {
-  display: flex;
-  gap: 2px;
-  height: 6px;
-}
-.qta-meter-track .qta-t {
-  flex-basis: 0;
-}
-.qta-overflow {
-  --quota-overflow: var(--err);
-  flex-basis: 0;
-  min-width: 4px;
-  border-radius: 3px;
-  background: repeating-linear-gradient(
-    -45deg,
-    var(--quota-overflow) 0 2px,
-    color-mix(in srgb, var(--quota-overflow) 22%, transparent) 2px 4px
-  );
-}
-.qta-r.throttled .qta-overflow {
-  --quota-overflow: var(--gold);
-}
-.qta-r.throttled :is(.qta-left, .qta-left b) {
-  color: var(--quota-warning-text);
-}
-.qta-r.warn:not(.paused) .qta-quota-meter .qta-pct {
-  color: var(--quota-warning-text);
-}
-.qta-r.paused .qta-quota-meter .qta-t > i {
-  background: var(--ink-4);
-}
-.qta-r.paused .qta-overflow {
-  --quota-overflow: var(--ink-4);
-}
-.qta-r.paused .qta-quota-meter .qta-pct {
-  color: var(--ink-3);
-}
 .qta-policy-flag {
   display: flex;
   flex-wrap: wrap;
@@ -68,45 +15,14 @@
   font-size: 11px;
   line-height: 14px;
 }
-.qta-meter-run > .qta-policy-flag {
-  position: relative;
-  left: var(--at);
-  width: max-content;
-  max-width: 100%;
-  box-sizing: border-box;
-  margin-top: 4px;
-  padding-right: 7px;
-  /* Keep the label inside the track even when extreme overflow puts the boundary near its start. */
-  transform: translateX(max(-100%, calc(-1 * var(--at-cqi))));
-}
-.qta-meter-run.has-policy::after {
-  content: '';
-  position: absolute;
-  top: 6px;
-  left: var(--at);
-  width: 1px;
-  height: 12px;
-  background: currentColor;
-  opacity: 0.55;
-}
-.qta-policy-flag.warn,
-.qta-meter-run.warn {
+.qta-policy-flag.warn {
   color: var(--quota-warning-text);
 }
-.qta-policy-flag.err,
-.qta-meter-run.err {
+.qta-policy-flag.err {
   color: var(--err);
 }
-.qta-policy-flag.idle,
-.qta-meter-run.idle {
+.qta-policy-flag.idle {
   color: var(--ink-3);
-}
-.qta-meter-run:not(.warn, .err, .idle) {
-  color: var(--ink-3);
-}
-.qta-policy-only {
-  grid-area: meter;
-  justify-self: end;
 }
 .qta-policy-sync {
   display: inline-flex;
@@ -134,13 +50,6 @@
     animation: none;
   }
 }
-.qta-quota-meter .qta-pct {
-  width: auto;
-  min-width: 34px;
-  margin-top: -6px;
-  line-height: 18px;
-}
-
 /* Reuse the forwarding entry's in-place form and field layout. */
 .user-traffic-policy-editor .fwe-num {
   width: 112px;

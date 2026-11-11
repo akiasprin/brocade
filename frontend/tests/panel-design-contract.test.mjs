@@ -111,11 +111,8 @@ test('用户详情数据卡共用面板留白令牌和满幅正文契约', () =>
     styles,
     /\.fwe-new\s*\{[^}]*margin:\s*8px calc\(0px - var\(--fwd-content-x\)\) 0;[^}]*padding:\s*10px var\(--fwd-content-x\) 14px calc\(var\(--fwd-content-x\) \+ 18px\);/s,
   );
-  assert.match(
-    styles,
-    /\.qta-r\.fwe-open\s*\{[^}]*margin-inline:\s*calc\(0px - var\(--panel-content-x\)\);[^}]*padding-inline:\s*var\(--panel-content-x\);/s,
-  );
-  assert.match(styles, /\.fwe-sheet\s*\{[^}]*grid-column:\s*2 \/ -1;/s);
+  const quotaStyles = source('../src/panes/user-quota.css');
+  assert.match(quotaStyles, /\.qta > \.fwe-sheet,[\s\S]*?grid-column:\s*1 \/ -1;/);
   assert.doesNotMatch(styles, /\.(?:fwd-policy-inline|fwd-edit|fwd-quota-pick|fwd-node-settings)\b/);
   assert.match(
     styles,

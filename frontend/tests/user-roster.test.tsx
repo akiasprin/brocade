@@ -998,6 +998,23 @@ describe('user roster rows', () => {
     expect(quotaInput()).toBeNull();
   });
 
+  it('counts granted ingresses while keeping the chain names distinct', async () => {
+    const { view, client } = mount();
+    const next = structuredClone(snapshot);
+    next.snapshot.apps[0].ingresses.push({
+      id: 'tyo-second',
+      chain: 'jp-iij',
+      node: 'n1',
+      port: 8443,
+    } as SnapshotIngress);
+    next.snapshot.apps[0].grants.push({ tenant, user: 'alice', ingress: 'tyo-second' });
+    await act(async () => {
+      client.setQueryData(['snapshot'], next);
+    });
+    await vi.waitFor(() => expect(view.container.querySelector('.qta-sub')?.textContent).toBe('2 个接入点'));
+    expect(view.container.querySelector('.qta-sub')?.getAttribute('title')).toBe('东京 IIJ');
+  });
+
   it('opens quota handling from the app row without an access total editor', () => {
     const { view } = mount();
     const control = view.getByRole('button', { name: '东京 · 额度与限速' });
@@ -1005,7 +1022,7 @@ describe('user roster rows', () => {
     expect(view.queryByRole('button', { name: '设置接入总额度' })).toBeNull();
     fireEvent.click(control);
     const dialog = view.getByRole('form', { name: '东京 · 额度与限速' });
-    expect(dialog.closest('.qta-r')).toBeTruthy();
+    expect(dialog.closest('.fwe-sheet')).toBeTruthy();
     expect(view.queryByRole('dialog')).toBeNull();
     const input = within(dialog).getByRole('textbox', { name: '本期流量额度（GiB）' }) as HTMLInputElement;
     expect(input.value).toBe('100');
@@ -1044,8 +1061,8 @@ describe('user roster rows', () => {
       'span',
     ]);
     expect(tokyo.querySelector('.qta-app > :last-child')?.classList.contains('qta-flags')).toBe(true);
-    expect(tokyo.querySelector('.qta-sub')?.textContent).toBe('东京 IIJ');
-    expect(tokyo.querySelector('.qta-figs')?.textContent).toBe('54.10GiB/ 100 GiB');
+    expect(tokyo.querySelector('.qta-sub')?.textContent).toBe('1 个接入点');
+    expect(tokyo.querySelector('.qta-figs')?.textContent).toBe('54.10GiB');
     expect(tokyo.querySelector('.qta-left-value')?.textContent).toBe('剩余45.90 GiB');
     expect(card().querySelector('.user-dcard-foot')).toBeNull();
 

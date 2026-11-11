@@ -1,0 +1,314 @@
+/* 接入与转发共用小卡：大字已用、额度与余额、百分比圆环。 */
+.qta {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(clamp(200px, 17.5cqi, 280px), 1fr));
+  grid-auto-flow: row dense;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px var(--panel-content-x) 16px;
+}
+.qta-r {
+  --quota-warning-text: var(--gold);
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: 'name name' 'read ring' 'foot foot';
+  align-items: center;
+  gap: 0 12px;
+  min-width: 0;
+  padding: 13px 14px 12px 16px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--ink) 3.6%, transparent);
+}
+:root[data-theme='light'] .qta-r {
+  --quota-warning-text: color-mix(in srgb, var(--gold) 80%, var(--ink));
+  background: var(--sunk);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ink) 4%, transparent);
+}
+.qta-r.no-ring {
+  grid-template-areas: 'name name' 'read read' 'foot foot';
+}
+.qta .qta-r.fwe-open {
+  box-shadow: inset 0 0 0 1.5px var(--action);
+}
+.qta-name {
+  grid-area: name;
+  min-width: 0;
+  padding-right: 24px;
+}
+.qta-app {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--ink);
+  font: 600 13px/18px var(--sans);
+}
+.qta-app > b {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: inherit;
+}
+.qta-flags {
+  display: inline-flex;
+  flex: none;
+  gap: 3px;
+}
+.qta-reading {
+  display: grid;
+  grid-area: read;
+  align-content: center;
+  min-width: 0;
+  margin-top: 12px;
+}
+.qta-figs {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  color: var(--ink);
+  font: 600 24px/1 var(--sans);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.03em;
+  white-space: nowrap;
+}
+.qta-figs small {
+  color: var(--ink-3);
+  font: 500 12px var(--sans);
+  letter-spacing: 0;
+}
+.qta-r.unknown .qta-figs {
+  color: var(--ink-4);
+  font-size: 19px;
+}
+.qta-cap,
+.qta-left {
+  color: var(--ink-3);
+  font: 500 11.5px/16px var(--sans);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.qta-cap {
+  margin-top: 8px;
+}
+.qta-left {
+  color: var(--ink-4);
+}
+.qta-left b {
+  margin-left: 4px;
+  font-weight: inherit;
+}
+.qta-ring {
+  position: relative;
+  display: grid;
+  grid-area: ring;
+  align-self: end;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  margin-top: 12px;
+}
+.qta-ring > svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.qta-ring circle {
+  fill: none;
+}
+.qta-ring .track {
+  stroke: color-mix(in srgb, var(--ink) 9%, transparent);
+}
+.qta-ring .value {
+  stroke: var(--data);
+  stroke-linecap: round;
+}
+.qta-pct {
+  position: relative;
+  color: var(--ink-2);
+  font: 600 12.5px/1 var(--sans);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+}
+.qta-r.warn .qta-ring .value {
+  stroke: var(--gold);
+}
+.qta-r.warn .qta-pct,
+.qta-r.throttled .qta-left {
+  color: var(--quota-warning-text);
+}
+.qta-r.over .qta-ring .value {
+  stroke: var(--err);
+}
+.qta-r.over :is(.qta-pct, .qta-left) {
+  color: var(--err);
+}
+.qta-r.paused .qta-ring .value {
+  stroke: var(--ink-4);
+}
+.qta-r.paused :is(.qta-pct, .qta-left) {
+  color: var(--ink-3);
+}
+.qta-foot {
+  display: flex;
+  grid-area: foot;
+  align-self: end;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-width: 0;
+  min-height: 18px;
+  margin-top: 12px;
+}
+.qta-sub {
+  overflow: hidden;
+  min-width: 0;
+  color: var(--ink-4);
+  font: 500 11px/16px var(--sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qta-sub.stop {
+  color: var(--err);
+}
+.qta-entry-detail {
+  display: grid;
+  min-width: 0;
+}
+.qta-acts {
+  position: absolute;
+  top: 9px;
+  right: 9px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.qta-pencil.btn {
+  display: grid;
+  place-items: center;
+  width: 25px;
+  height: 25px;
+  min-height: 25px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  opacity: 0.8;
+}
+.qta-pencil svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+}
+.qta-pencil.btn:hover:not(:disabled) {
+  border-color: var(--line);
+  background: var(--hover-2);
+}
+@media (hover: hover) {
+  .qta-r .qta-pencil {
+    opacity: 0;
+  }
+  .qta-r:hover .qta-pencil,
+  .qta-r .qta-pencil:focus-visible {
+    opacity: 1;
+  }
+}
+/* 表单独占整排；dense 让同排的其余卡片仍留在原位。 */
+.qta > .fwe-sheet,
+.qta > .callout,
+.qta > .fwd-add {
+  grid-column: 1 / -1;
+}
+.fwe-sheet {
+  min-width: 0;
+  margin: 0;
+  padding: 12px 16px 14px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--ink) 3.6%, transparent);
+  animation: fwe-open 0.16s ease-out;
+}
+:root[data-theme='light'] .fwe-sheet {
+  background: var(--sunk);
+}
+.qta-sheet-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 2px;
+  color: var(--ink-3);
+  font: 500 11.5px/18px var(--sans);
+}
+.qta-sheet-title > b {
+  color: var(--ink);
+  font: 600 13px/18px var(--sans);
+}
+.qta > .fwd-add {
+  justify-self: start;
+  margin: 2px 0 6px -8px;
+}
+@container user-usage (max-width: 620px) {
+  .qta {
+    grid-template-columns: repeat(auto-fill, minmax(min(148px, 100%), 1fr));
+    gap: 8px;
+    padding: 12px var(--panel-content-x-compact) 14px;
+  }
+  .qta-r,
+  .qta-r.no-ring {
+    grid-template-areas: 'name ring' 'read read' 'foot foot';
+    column-gap: 6px;
+    padding: 11px 10px 9px 12px;
+  }
+  .qta-name {
+    padding-right: 0;
+  }
+  .qta-app {
+    align-items: flex-start;
+    font-size: 13px;
+    line-height: 18px;
+  }
+  .qta-flags,
+  .qta-app > .geo-flag {
+    display: none;
+  }
+  .qta-ring {
+    align-self: start;
+    width: 34px;
+    height: 34px;
+    margin: -2px 0 0;
+  }
+  .qta-pct {
+    font-size: 9.5px;
+  }
+  .qta-reading {
+    margin-top: 6px;
+  }
+  .qta-figs {
+    font-size: 19px;
+  }
+  .qta-figs small {
+    font-size: 11px;
+  }
+  .qta-cap {
+    margin-top: 6px;
+  }
+  .qta-cap,
+  .qta-left {
+    font-size: 11px;
+    line-height: 15px;
+  }
+  .qta-foot {
+    gap: 4px 6px;
+    margin-top: 8px;
+  }
+  .qta-r:has(.qta-acts) .qta-foot {
+    padding-right: 26px;
+  }
+  .qta-acts {
+    top: auto;
+    right: 5px;
+    bottom: 5px;
+  }
+}

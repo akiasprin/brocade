@@ -73,7 +73,13 @@ import { canViewUserRealtimeTraffic } from '../session';
 import { UserRealtimeTrafficCard } from '../user-traffic-realtime';
 import { UserSiteUsageCard } from '../user-site-usage';
 import { UserMachineUsageCard } from '../user-machine-usage';
-import { UserQuotaReading, UserUsageLedger, cycleUsageText, type CycleUsageState } from './user-usage';
+import {
+  UserQuotaTile,
+  UserUsageLedger,
+  cycleUsageText,
+  QUOTA_ATTENTION_PCT,
+  type CycleUsageState,
+} from './user-usage';
 export { cycleUsageText } from './user-usage';
 export type { CycleUsageState } from './user-usage';
 import { UserForwardingCard } from './user-forwarding';
@@ -83,7 +89,7 @@ import {
   UserAppTrafficPolicyEditor,
   useUserTrafficPolicies,
   prefetchUserTrafficPolicies,
-  UserTrafficQuotaMeter,
+  UserTrafficQuotaStatus,
 } from './user-traffic-policy';
 
 // 用户列表：一行一个用户，点击后就地展开。
@@ -1047,9 +1053,6 @@ const compactUsage = (total: number) => {
   return { value: String(Number(Number(value).toFixed(1))), unit };
 };
 
-// 额度用到这一比例即进入注意档：名册从这里开始显示具体百分比，详情的额度条改用注意色。
-const QUOTA_ATTENTION_PCT = 80;
-
 // 名册不暴露低用量的精确百分比；进入注意档后才显示具体数值。
 export function quotaStage(pct: number): string {
   if (pct < QUOTA_ATTENTION_PCT) return '余裕';
@@ -1109,21 +1112,18 @@ export function UsersPane({ win, bare = false }: { win: Win; bare?: boolean }) {
 
 /** 线路在当前用户下的接入情况：地区旗、已授权接入点所在的链、被配额执行器停用的接入点（按链名）。 */
 export interface QuotaRouteAccess {
+  grantedCount: number;
   countries: string[];
   chains: string[];
   suspended: string[];
 }
 
-const NO_ROUTE_ACCESS: QuotaRouteAccess = { countries: [], chains: [], suspended: [] };
+const NO_ROUTE_ACCESS: QuotaRouteAccess = { grantedCount: 0, countries: [], chains: [], suspended: [] };
 
-// 一条线路一行，分两层：名称（线路名 + 地区旗 / 接入链）│ 已用 / 额度 … 剩余；第二层是额度条与百分比。
-// 额度条只在设置了额度且用量已知时绘制：未设额度时不存在用尽的概念，空槽会被理解为用量为零，
-// 而实际含义是不限量。
 export function QuotaRow({
   app,
   used,
   limit,
-  over,
   usageState = 'ready',
   access = NO_ROUTE_ACCESS,
   policy,
@@ -1133,7 +1133,6 @@ export function QuotaRow({
   app: SnapshotApp;
   used: number | null;
   limit: number | null;
-  over: boolean;
   usageState?: CycleUsageState;
   access?: QuotaRouteAccess;
   policy?: UserTrafficPolicyView;
@@ -1155,81 +1154,73 @@ export function QuotaRow({
     setEditing(false);
   };
   const label = app.label || app.id;
-  const pct = limit !== null && used !== null ? (used / limit) * 100 : null;
-
-  const name = (
-    <span className="qta-name">
-      <span className="qta-app">
-        <b>{label}</b>
-        {access.countries.length > 0 && (
-          <span className="qta-flags">
-            {access.countries.slice(0, 3).map(code => (
-              <RegionFlag key={code} code={code} />
-            ))}
-          </span>
-        )}
-      </span>
-      {access.suspended.length > 0 ? (
-        // 行内只写数量；被停用的链与恢复条件放进悬停提示，避免名称列换行。
-        <span
-          className="qta-sub stop"
-          title={`${[...new Set(access.suspended)].join('、')} 已被系统停用；补足额度或账期重置后自动恢复`}
-        >
-          系统已停用 {access.suspended.length} 个接入点
-        </span>
-      ) : (
-        <span className="qta-sub" title={access.chains.length > 0 ? access.chains.join('、') : undefined}>
-          {access.chains.length > 0 ? access.chains.join('、') : '未授权接入点'}
-        </span>
-      )}
-    </span>
-  );
-
-  // 限速仍可用，与名册一致使用注意色；服务暂停时额度轨道退为灰色。
   const paused = policy?.service_available === false;
   const throttled = !paused && policy?.exhausted && policy.policy?.exhausted_action.kind === 'throttle';
-  const tone =
-    used === null
-      ? 'unknown'
-      : limit === null
-        ? 'unlimited'
-        : over
-          ? throttled
-            ? 'warn'
-            : 'over'
-          : pct !== null && pct >= QUOTA_ATTENTION_PCT
-            ? 'warn'
-            : 'ok';
+  const suspended = access.suspended.length > 0;
   return (
-    <div
-      className={`qta-r ${tone}${paused ? ' paused' : throttled ? ' throttled' : ''}${editing ? ' fwe-open' : ''}`}
-      role="listitem"
-    >
-      {name}
-      <UserQuotaReading used={used} limit={limit} state={usageState} />
-      <UserTrafficQuotaMeter used={used} limit={limit} view={policy} />
-      {editable && user && (
-        <span className="qta-acts">
-          <button
-            ref={editButton}
-            type="button"
-            className="btn qta-pencil"
-            disabled={!policy || editing}
-            aria-label={`${label} · 额度与限速`}
-            title="编辑额度与限速"
-            aria-expanded={editing}
-            aria-controls={editing ? editorId : undefined}
-            onClick={() => setEditing(true)}
+    <Fragment>
+      <UserQuotaTile
+        label={label}
+        flags={
+          access.countries.length > 0 && (
+            <span className="qta-flags">
+              {access.countries.slice(0, 3).map(code => (
+                <RegionFlag key={code} code={code} />
+              ))}
+            </span>
+          )
+        }
+        used={used}
+        limit={limit}
+        state={usageState}
+        paused={paused}
+        throttled={throttled}
+        editing={editing}
+        status={<UserTrafficQuotaStatus view={policy} />}
+        detail={
+          <span
+            className={`qta-sub${suspended ? ' stop' : ''}`}
+            title={
+              suspended
+                ? `${[...new Set(access.suspended)].join('、')} 已被系统停用；补足额度或账期重置后自动恢复`
+                : access.chains.join('、') || undefined
+            }
           >
-            <svg viewBox="0 0 16 16" aria-hidden="true">
-              <path d="m3 11.8.6-2.7L10.8 2l2.2 2.2-7.1 7.1-2.9.5Z" />
-              <path d="m9.7 3.1 2.2 2.2" />
-            </svg>
-          </button>
-        </span>
-      )}
+            {suspended
+              ? `系统已停用 ${access.suspended.length} 个接入点`
+              : access.grantedCount > 0
+                ? `${access.grantedCount} 个接入点`
+                : '未授权接入点'}
+          </span>
+        }
+        actions={
+          editable &&
+          user && (
+            <button
+              ref={editButton}
+              type="button"
+              className="btn qta-pencil"
+              disabled={!policy || editing}
+              aria-label={`${label} · 额度与限速`}
+              title="编辑额度与限速"
+              aria-expanded={editing}
+              aria-controls={editing ? editorId : undefined}
+              onClick={() => setEditing(true)}
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path d="m3 11.8.6-2.7L10.8 2l2.2 2.2-7.1 7.1-2.9.5Z" />
+                <path d="m9.7 3.1 2.2 2.2" />
+              </svg>
+            </button>
+          )
+        }
+      />
       {editing && user && policy && (
         <div className="fwe-sheet" id={editorId}>
+          <p className="qta-sheet-title">
+            <b>{label}</b>
+            <span>额度与限速</span>
+          </p>
           <UserAppTrafficPolicyEditor
             key={`${user.tenant_id}/${user.id}/${app.id}`}
             user={user}
@@ -1239,7 +1230,7 @@ export function QuotaRow({
           />
         </div>
       )}
-    </div>
+    </Fragment>
   );
 }
 
@@ -1283,7 +1274,7 @@ function UserAccessQuotaRows({
   policies,
 }: {
   user: UserListItem;
-  rows: Array<Pick<Parameters<typeof QuotaRow>[0], 'app' | 'used' | 'limit' | 'over'>>;
+  rows: Array<Pick<Parameters<typeof QuotaRow>[0], 'app' | 'used' | 'limit'>>;
   usageState: CycleUsageState;
   editable: boolean;
   routeAccessOf: (app: SnapshotApp) => QuotaRouteAccess;
@@ -2213,6 +2204,7 @@ function UserList({
       const distinct = (values: (string | null | undefined)[]) =>
         [...new Set(values)].filter((value): value is string => !!value);
       return {
+        grantedCount: granted.length,
         countries: distinct(shown.map(ingress => chainOf(ingress.chain)?.subscription_country)),
         chains: distinct(granted.map(ingress => chainOf(ingress.chain)?.name || ingress.chain)),
         suspended: held.map(ingress => chainOf(ingress.chain)?.name || ingress.chain),

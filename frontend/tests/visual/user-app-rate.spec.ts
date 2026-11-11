@@ -31,12 +31,14 @@ async function open(page: Page, query = '') {
 async function edit(page: Page, id: string) {
   const row = group(page, id);
   await row.getByRole('button', { name: /额度与限速/ }).click();
-  const form = row.getByRole('form');
+  const form = page.getByRole('form', { name: `${names[id]} · 额度与限速`, exact: true });
   await expect(form).toBeVisible();
   return form;
 }
 for (const [name, width, theme] of [
+  ['wide-dark', 1920, 'dark'],
   ['desktop-dark', 1440, 'dark'],
+  ['narrow-dark', 320, 'dark'],
   ['desktop-light', 1440, 'light'],
   ['mobile-dark', 390, 'dark'],
   ['mobile-light', 390, 'light'],
@@ -45,6 +47,12 @@ for (const [name, width, theme] of [
     await page.setViewportSize({ width, height: 1000 });
     await open(page, `theme=${theme}&controls=0`);
     await expect(page.getByRole('button', { name: '返回机器首页' })).toBeVisible();
+    const tops = await page
+      .locator('.user-access-quotas .qta-r')
+      .evaluateAll(tiles => tiles.map(tile => tile.getBoundingClientRect().top));
+    expect(tops.filter(top => top === tops[0])).toHaveLength(
+      width === 1920 ? 4 : width === 1440 ? 3 : width === 390 ? 2 : 1,
+    );
     await expect(page).toHaveScreenshot(`${name}.png`, { fullPage: true });
     expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
     expect(await group(page, 'apac-premium').evaluate(row => row.scrollWidth > row.clientWidth)).toBe(false);
@@ -90,7 +98,7 @@ test('exhaustion and a new billing cycle retain the base cap', async ({ page }) 
   await open(page);
   await page.getByRole('button', { name: '模拟 APAC Premium 用满', exact: true }).click();
   await expect(flags(page, 'apac-premium')).toContainText('限速中 · 5 Mbps');
-  await expect(flags(page, 'apac-premium')).toContainText('常态限速 100 Mbps');
+  await expect(flags(page, 'apac-premium')).not.toContainText('常态限速');
   await page.getByRole('button', { name: '新账期', exact: true }).click();
   await expect(flags(page, 'apac-premium')).toContainText('用满后限速 5 Mbps');
   await expect(flags(page, 'apac-premium')).toContainText('常态限速 100 Mbps');
@@ -111,7 +119,7 @@ test('removing quota retains speed; removing speed retains the exhaustion action
   await form.getByRole('button', { name: '保存', exact: true }).click();
   await expect(flags(page, 'apac-premium')).toContainText('常态限速 80 Mbps');
   await expect(group(page, 'apac-premium').locator('.qta-left')).toHaveText('不限额度');
-  await expect(group(page, 'apac-premium').locator('.qta-meter')).toHaveCount(0);
+  await expect(group(page, 'apac-premium').locator('.qta-ring')).toHaveCount(0);
 });
 test('validation and Escape keep the saved policy unchanged', async ({ page }) => {
   await open(page);

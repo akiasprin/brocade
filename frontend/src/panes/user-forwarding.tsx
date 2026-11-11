@@ -1,5 +1,15 @@
 import { InlineField } from '../ui/inline-field';
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import {
@@ -34,7 +44,7 @@ import { observeBpsReading } from '../ui/observe-chart';
 import { RegionFlag } from '../ui/region-flag';
 import { useUnsavedChanges } from '../ui/navigation-guard';
 import { forwardingRuleRates, useUserTrafficSource } from '../user-traffic-source';
-import { UserQuotaMeter, UserQuotaReading, UserUsageLedger } from './user-usage';
+import { UserQuotaTile, UserUsageLedger } from './user-usage';
 import {
   ForwardingQuotaHistory,
   forwardingQuotaJobsKey,
@@ -175,7 +185,7 @@ const nextFreePort = (
   return null;
 };
 
-const entryState = (entry: ForwardingEntitlement, rules: ForwardingRule[]) => {
+const entryState = (entry: ForwardingEntitlement, rules: ForwardingRule[], showServicePause = true) => {
   if (!entry.enabled) return { tone: 'off', text: '已停止' };
   if (entry.quota_suspended) return { tone: 'warn', text: '配额暂停' };
   const own = rules.filter(rule => rule.node_id === entry.node_id);
@@ -185,7 +195,7 @@ const entryState = (entry: ForwardingEntitlement, rules: ForwardingRule[]) => {
   const pending = count('pending');
   const failed = count('error');
   const unknown = count('unknown');
-  const servicePaused = count('service-paused');
+  const servicePaused = showServicePause ? count('service-paused') : 0;
   const disabled = count('disabled');
   if (own.length) {
     return {
@@ -911,80 +921,53 @@ export function UserForwardingCard({
                     : '管理员授权机器后，用户才可以创建端口转发规则。'}
                 </EmptyState>
               ) : (
-                <div className="qta fwd-quotas fwe-aligned" role="list" aria-label="各转发入口的用量与额度">
+                <div className="qta fwd-quotas" role="list" aria-label="各转发入口的用量与额度">
                   {sortedEntries.map(entry => {
-                    const state = entryState(entry, rules);
+                    const state = entryState(entry, rules, false);
                     const count = rules.filter(rule => rule.node_id === entry.node_id).length;
                     const traffic = cycleTraffic?.byNode.get(entry.node_id);
                     const used =
                       entry.cycle_used_bytes ?? (cycleTraffic ? (traffic ? traffic.down + traffic.up : 0) : null);
                     const limit = entry.cycle_limit_bytes ?? null;
-                    const percent = limit !== null && used !== null ? (used / limit) * 100 : null;
-                    const over = percent !== null && percent >= 100;
-                    const tone =
-                      used === null
-                        ? 'unknown'
-                        : limit === null
-                          ? 'unlimited'
-                          : over
-                            ? 'over'
-                            : percent !== null && percent >= 80
-                              ? 'warn'
-                              : 'ok';
+                    const servicePaused =
+                      user.status === 'disabled' ||
+                      (user.service_state !== undefined && user.service_state !== 'active');
                     const quotaLabel = !entry.enabled
                       ? '已停用'
-                      : entry.quota_suspended
+                      : !servicePaused && entry.quota_suspended
                         ? '额度已用满 · 已停用'
-                        : limit !== null
-                          ? '用满后停用'
-                          : '';
-                    const quotaTone = !entry.enabled ? 'idle' : over ? 'err' : '';
+                        : '';
+                    const quotaTone = !entry.enabled ? 'idle' : 'err';
                     const editing = canAuthorize && policy?.mode === 'edit' && policy.draft.nodeId === entry.node_id;
                     const resuming =
                       lifecycle.isPending &&
                       lifecycle.variables?.kind === 'resume' &&
                       lifecycle.variables.nodeId === entry.node_id;
                     return (
-                      <div
-                        key={entry.node_id}
-                        role="listitem"
-                        className={`qta-r fwd-quota-row fwe-row ${tone}${!entry.enabled ? ' paused' : ''}${editing ? ' fwe-open' : ''}`}
-                      >
-                        <span className="qta-name fwe-entry-name">
-                          <span className="qta-app">
-                            <b>{entry.node_name || entry.node_id}</b>
-                            <RegionFlag code={countryOf(entry.node_id)} />
-                          </span>
-                          <span className="qta-sub">
-                            {state.tone === 'ok' ? (
-                              `${allowedText(entry)} · ${entry.listen_port_start}–${entry.listen_port_end}`
-                            ) : (
-                              <span className={`fwd-st ${state.tone}`}>{state.text}</span>
-                            )}
-                          </span>
-                          <span className="qta-sub fwd-rule-count">
-                            规则 {count} / {entry.max_rules}
-                          </span>
-                        </span>
-                        <UserQuotaReading
+                      <Fragment key={entry.node_id}>
+                        <UserQuotaTile
+                          label={entry.node_name || entry.node_id}
+                          flags={<RegionFlag code={countryOf(entry.node_id)} />}
                           used={used}
                           limit={limit}
                           state={used !== null ? 'ready' : cycle.isPending ? 'pending' : 'failed'}
-                        />
-                        <UserQuotaMeter
-                          used={used}
-                          limit={limit}
-                          tone={quotaTone}
+                          paused={!entry.enabled || servicePaused}
+                          editing={editing}
                           status={
-                            quotaLabel ? (
-                              <span className={`qta-policy-flag ${quotaTone}`}>{quotaLabel}</span>
-                            ) : undefined
-                          }
-                        />
-                        <span className="qta-acts">
-                          {canAuthorize && (
                             <>
-                              {!entry.enabled && (
+                              {quotaLabel && <span className={`qta-policy-flag ${quotaTone}`}>{quotaLabel}</span>}
+                              {entry.enabled && !entry.quota_suspended && state.tone !== 'ok' && state.text && (
+                                <span
+                                  className={`qta-policy-flag ${state.tone === 'bad' ? 'err' : state.tone === 'warn' ? 'warn' : 'idle'}`}
+                                >
+                                  {state.text}
+                                </span>
+                              )}
+                            </>
+                          }
+                          detail={
+                            <span className="qta-entry-detail">
+                              {canAuthorize && !entry.enabled && (
                                 <button
                                   type="button"
                                   className="btn fwe-resume"
@@ -995,35 +978,56 @@ export function UserForwardingCard({
                                   {resuming ? '恢复中…' : '恢复'}
                                 </button>
                               )}
-                              <button
-                                type="button"
-                                className="btn qta-pencil"
-                                aria-label={`编辑 ${entry.node_name} 的转发授权`}
-                                title="编辑授权"
-                                aria-expanded={editing}
-                                onClick={event => openPolicy(entry, event.currentTarget)}
+                              <span
+                                className="qta-sub"
+                                title={`${allowedText(entry)} · ${entry.listen_port_start}–${entry.listen_port_end}`}
                               >
-                                <Icon of="pencil" size={13} />
-                              </button>
-                            </>
-                          )}
-                        </span>
-                        {editing && <div className="fwe-sheet">{policyForm()}</div>}
+                                {`${allowedText(entry)} · ${entry.listen_port_start}–${entry.listen_port_end}`}
+                              </span>
+                              <span className="qta-sub fwd-rule-count">
+                                规则 {count} / {entry.max_rules}
+                              </span>
+                            </span>
+                          }
+                          actions={
+                            canAuthorize && (
+                              <>
+                                <button
+                                  type="button"
+                                  className="btn qta-pencil"
+                                  aria-label={`编辑 ${entry.node_name} 的转发授权`}
+                                  title="编辑授权"
+                                  aria-expanded={editing}
+                                  onClick={event => openPolicy(entry, event.currentTarget)}
+                                >
+                                  <Icon of="pencil" size={13} />
+                                </button>
+                              </>
+                            )
+                          }
+                        />
+                        {editing && (
+                          <div className="fwe-sheet">
+                            <p className="qta-sheet-title">
+                              <b>{entry.node_name}</b>
+                              <span>转发授权</span>
+                            </p>
+                            {policyForm()}
+                          </div>
+                        )}
                         {lifecycle.error &&
                           lifecycle.variables?.nodeId === entry.node_id &&
                           lifecycle.variables.session === undefined && <ErrorBox error={lifecycle.error} />}
-                      </div>
+                      </Fragment>
                     );
                   })}
                   {canAuthorize && policy?.mode === 'grant' ? (
-                    <div className="qta-r fwd-quota-row fwe-row fwe-open fwe-grant" role="listitem">
-                      <span className="qta-name">
-                        <span className="qta-app">
-                          <b>授权机器</b>
-                        </span>
-                        <span className="qta-sub">转发入口</span>
-                      </span>
-                      <div className="fwe-sheet">{policyForm()}</div>
+                    <div className="fwe-sheet fwe-grant" role="listitem">
+                      <p className="qta-sheet-title">
+                        <b>授权机器</b>
+                        <span>转发入口</span>
+                      </p>
+                      {policyForm()}
                     </div>
                   ) : (
                     canAuthorize &&

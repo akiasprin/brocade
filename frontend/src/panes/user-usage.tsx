@@ -1,9 +1,12 @@
-import type { CSSProperties, ReactNode } from 'react';
+import type { ReactNode } from 'react';
 import type { UserTrafficAccountingMode } from '../api';
 import { UserTrafficAccountingSetting } from '../user-traffic-accounting';
 import { useNow } from '../ui/clock';
 import { bytes, shareOf } from '../ui/format';
 import './user-traffic-policy.css';
+import './user-quota.css';
+
+export const QUOTA_ATTENTION_PCT = 80;
 
 export type CycleUsageState = 'pending' | 'failed' | 'ready';
 
@@ -14,91 +17,133 @@ export const cycleUsageText = (state: CycleUsageState, rowCount: number, total: 
 };
 
 const GiB = 1024 ** 3;
-const quotaBytes = (value: number) => (value % GiB === 0 ? `${value / GiB} GiB` : bytes(value));
+// 卡片读数保持 GiB，不因余额较大而跳成 TiB；小于 GiB 的值仍保留 MiB 等精度。
+const lineBytes = (value: number) => (value >= GiB ? `${(value / GiB).toFixed(2)} GiB` : bytes(value));
+const quotaBytes = (value: number) => (value % GiB === 0 ? `${value / GiB} GiB` : lineBytes(value));
 
-/** 接入与转发共用读数和余额的文案、精度及单位层级。 */
-export function UserQuotaReading({
+/** 接入与转发共用卡片、额度分档、读数与圆环；授权及策略状态由各自的调用方提供。 */
+export function UserQuotaTile({
+  label,
+  flags,
   used,
   limit,
   state = 'ready',
+  paused = false,
+  throttled = false,
+  status,
+  detail,
+  actions,
+  editing = false,
 }: {
+  label: string;
+  flags?: ReactNode;
   used: number | null;
   limit: number | null;
   state?: CycleUsageState;
+  paused?: boolean;
+  throttled?: boolean;
+  status?: ReactNode;
+  detail?: ReactNode;
+  actions?: ReactNode;
+  editing?: boolean;
 }) {
-  const [figure, unit] = used === null ? ['', ''] : bytes(used).split(' ');
-  const balance =
-    state === 'pending' ? null : state === 'failed' ? (
-      '用量暂不可用'
-    ) : used === null ? (
-      '用量未知'
-    ) : limit === null ? (
-      '不限额度'
-    ) : used >= limit ? (
-      <>
-        超出<b>{bytes(used - limit)}</b>
-      </>
-    ) : (
-      <>
-        剩余<b>{bytes(limit - used)}</b>
-      </>
-    );
+  const known = state === 'ready' && used !== null;
+  const pct = known && limit !== null && limit > 0 ? (used / limit) * 100 : null;
+  const over = pct !== null && pct >= 100;
+  const tone = !known
+    ? 'unknown'
+    : limit === null
+      ? 'unlimited'
+      : over
+        ? throttled
+          ? 'warn'
+          : 'over'
+        : pct !== null && pct >= QUOTA_ATTENTION_PCT
+          ? 'warn'
+          : 'ok';
   return (
+    <article
+      className={`qta-r ${tone}${paused ? ' paused' : throttled ? ' throttled' : ''}${editing ? ' fwe-open' : ''}${pct === null ? ' no-ring' : ''}`}
+      role="listitem"
+      aria-label={label}
+    >
+      <header className="qta-name">
+        <span className="qta-app">
+          <b>{label}</b>
+          {flags}
+        </span>
+      </header>
+      <UserQuotaReading used={used} limit={limit} state={state} />
+      {pct !== null && <UserQuotaRing pct={pct} />}
+      <footer className="qta-foot">
+        {status}
+        {detail}
+      </footer>
+      {actions && <span className="qta-acts">{actions}</span>}
+    </article>
+  );
+}
+
+function UserQuotaReading({
+  used,
+  limit,
+  state,
+}: {
+  used: number | null;
+  limit: number | null;
+  state: CycleUsageState;
+}) {
+  const known = state === 'ready' && used !== null;
+  const [figure, unit] = known ? lineBytes(used).split(' ') : [state === 'pending' ? '读取中…' : '—', ''];
+  const balance = !known ? (
+    state === 'ready' ? (
+      '用量未知'
+    ) : null
+  ) : limit === null ? (
+    '不限额度'
+  ) : (
     <>
-      <span className="qta-figs">
-        {state === 'pending' ? (
-          '读取中…'
-        ) : used === null ? (
-          '—'
-        ) : (
-          <>
-            {figure}
-            <small>{unit}</small>
-          </>
-        )}
-        {limit !== null && <span className="qta-cap">/ {quotaBytes(limit)}</span>}
-      </span>
+      {used >= limit ? '超出' : '剩余'}
+      <b>{lineBytes(Math.abs(limit - used))}</b>
+    </>
+  );
+  return (
+    <div className="qta-reading">
+      <strong className="qta-figs" aria-label={`已用 ${figure}${unit ? ` ${unit}` : ''}`}>
+        {figure}
+        {unit && <small>{unit}</small>}
+      </strong>
+      {limit !== null && <span className="qta-cap">额度 {quotaBytes(limit)}</span>}
       {balance !== null && (
         <span className="qta-left">
           <span className="qta-left-value">{balance}</span>
         </span>
       )}
-    </>
+    </div>
   );
 }
 
-/** 流量额度轨道只表达流量占比；规则数量等其它限制单独展示。 */
-export function UserQuotaMeter({
-  used,
-  limit,
-  status,
-  tone = '',
-}: {
-  used: number | null;
-  limit: number | null;
-  status?: ReactNode;
-  tone?: '' | 'idle' | 'warn' | 'err';
-}) {
-  if (limit === null || used === null) return status ? <span className="qta-policy-only">{status}</span> : null;
-  const pct = (used / limit) * 100;
-  const overflow = used > limit;
-  const share = overflow ? limit / used : 1;
-  const fill = overflow ? 100 : Math.min(100, Math.max(used > 0 ? 1 : 0, pct));
+function UserQuotaRing({ pct }: { pct: number }) {
+  const fill = Math.min(100, Math.max(pct > 0 ? 1 : 0, pct));
+  const text = pct > 0 && pct < 1 ? '<1%' : `${pct < 100 ? Math.min(99, Math.round(pct)) : Math.round(pct)}%`;
   return (
-    <span className="qta-meter qta-quota-meter">
-      <span
-        className={`qta-meter-run${status ? ' has-policy' : ''} ${tone}`}
-        style={{ '--at': `${share * 100}%`, '--at-cqi': `${share * 100}cqi` } as CSSProperties}
-      >
-        <span className="qta-meter-track" aria-hidden="true">
-          <span className="qta-t" style={{ flexGrow: share }}>
-            <i style={{ width: `${fill}%` }} />
-          </span>
-          {overflow && <span className="qta-overflow" style={{ flexGrow: 1 - share }} />}
-        </span>
-        {status}
-      </span>
-      <span className="qta-pct">{pct.toFixed(0)}%</span>
+    <span className="qta-ring" role="img" aria-label={`已用额度 ${text}`}>
+      <svg viewBox="0 0 56 56" aria-hidden="true">
+        <circle className="track" cx="28" cy="28" r="25.25" strokeWidth="5.5" />
+        {fill > 0 && (
+          <circle
+            className="value"
+            cx="28"
+            cy="28"
+            r="25.25"
+            strokeWidth="5.5"
+            pathLength="100"
+            strokeDasharray={`${fill} 100`}
+            transform="rotate(-90 28 28)"
+          />
+        )}
+      </svg>
+      <span className="qta-pct">{text}</span>
     </span>
   );
 }
