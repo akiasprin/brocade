@@ -15021,6 +15021,19 @@ body.has-artpanel .topo-deck {
   font: 600 11px var(--sans);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--action) 26%, transparent);
 }
+.fg-who-face {
+  display: grid;
+  flex: none;
+  place-items: center;
+}
+.fg-who-face .user-avatar.mini {
+  width: 22px;
+  height: 22px;
+}
+.fg-menu-id .fg-who-face .user-avatar.mini {
+  width: 30px;
+  height: 30px;
+}
 :is(.fg-who, .fg-menu-id).guest .fg-who-plate {
   background: color-mix(in srgb, var(--ink) 7%, transparent);
   color: var(--ink-3);
@@ -19807,6 +19820,19 @@ h4.sec > .btn {
   background: color-mix(in srgb, var(--ink) 9%, transparent);
   font: 500 10px/16px var(--sans);
 }
+.user-self-chip {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border-radius: 999px;
+  color: var(--action);
+  background: var(--action-wash);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--action) 24%, transparent);
+  font: 600 11px/18px var(--sans);
+  letter-spacing: 0.02em;
+}
 .user-row-chip.test {
   color: var(--gold);
   background: color-mix(in srgb, var(--gold) 14%, transparent);
@@ -20167,6 +20193,21 @@ h4.sec > .btn {
   color: hsl(var(--avatar-hue) 30% 34%);
   background: hsl(var(--avatar-hue) 38% 92%);
   box-shadow: none;
+}
+/* 本人身份只改变头像配色；行尺寸与选中样式仍由名册统一控制。 */
+.user-avatar.user-generated-avatar.is-self,
+.user-dhead .plate.user-generated-avatar.is-self {
+  border-color: color-mix(in srgb, var(--action) 50%, transparent);
+  color: var(--action);
+  background: color-mix(in srgb, var(--action) 18%, var(--block));
+}
+:root[data-theme='light'] .user-avatar.user-generated-avatar.is-self,
+:root[data-theme='light'] .user-dhead .plate.user-generated-avatar.is-self,
+[data-theme='light'] .user-avatar.user-generated-avatar.is-self,
+[data-theme='light'] .user-dhead .plate.user-generated-avatar.is-self {
+  border-color: color-mix(in srgb, var(--action) 38%, transparent);
+  color: var(--action);
+  background: color-mix(in srgb, var(--action) 12%, white);
 }
 .user-dhead .dtitle {
   display: flex;

@@ -419,6 +419,63 @@ function mount(
 }
 
 describe('user roster rows', () => {
+  it('groups the signed-in user without a duplicate row chip and keeps others and disabled users separate', () => {
+    const { view, row, selectUser } = mount('user');
+    expect(within(view.getByRole('group', { name: '我' })).getAllByRole('option')).toEqual([row('alice')]);
+    const others = view.getByRole('group', { name: '其他用户' });
+    expect(within(others).getAllByRole('option')).toHaveLength(2);
+    expect(others.querySelector('.user-roster-group-head')?.textContent).toBe('其他用户2');
+    expect(row('alice').querySelector('.user-row-chip')).toBeNull();
+    expect(row('alice').querySelector('.user-generated-avatar.is-self')).toBeTruthy();
+    expect(row('dave').querySelector('.is-self')).toBeNull();
+    expect(within(view.getByRole('group', { name: '已停用' })).getByRole('option')).toBe(row('erin'));
+    const name = view.container.querySelector('.dname')!;
+    expect([...name.children].slice(0, 3).map(el => el.textContent)).toEqual(['alice', '我', '可用']);
+    selectUser('dave');
+    expect(view.container.querySelector('.user-self-chip')).toBeNull();
+    expect(row('alice').getAttribute('aria-selected')).toBe('false');
+    expect(row('dave').getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('hides the self group when a search or filter excludes the signed-in user', () => {
+    const { view } = mount('user');
+    fireEvent.change(view.getByRole('searchbox', { name: '搜索用户' }), { target: { value: 'dave' } });
+    expect(view.queryByRole('group', { name: '我' })).toBeNull();
+    fireEvent.change(view.getByRole('searchbox', { name: '搜索用户' }), { target: { value: '' } });
+    expect(view.getByRole('group', { name: '我' })).toBeTruthy();
+    fireEvent.click(view.getByRole('button', { name: '测试 1' }));
+    expect(view.queryByRole('group', { name: '我' })).toBeNull();
+    expect(view.getAllByRole('option')).toHaveLength(1);
+  });
+
+  it('matches self by tenant as well as username', async () => {
+    const { view, client } = mount('user');
+    await seedUsers(client, [...users, person('alice', { tenant_id: 'another-tenant' })]);
+    const alices = [...view.container.querySelectorAll('.user-row')].filter(
+      row => row.querySelector('b')?.textContent === 'alice',
+    );
+    expect(alices).toHaveLength(2);
+    expect(alices.filter(row => row.querySelector('.is-self'))).toHaveLength(1);
+    expect(within(view.getByRole('group', { name: '我' })).getAllByRole('option')).toHaveLength(1);
+  });
+
+  it('keeps a disabled self account identifiable without duplicating it in disabled users', async () => {
+    const { view, client } = mount('user');
+    await act(async () => {
+      client.setQueryData(['me-user'], person('alice', { status: 'disabled' }));
+    });
+    const me = within(view.getByRole('group', { name: '我' })).getByRole('option');
+    await vi.waitFor(() => expect(me.classList.contains('off')).toBe(true));
+    expect(me.querySelector('.user-row-state')?.textContent).toBe('已停用');
+    expect(within(view.getByRole('group', { name: '已停用' })).getAllByRole('option')).toHaveLength(1);
+  });
+
+  it('does not mark an administrator as self just because the operator name matches a user', () => {
+    const { view } = mount('system-admin', 'alice');
+    expect(view.queryByRole('group', { name: '我' })).toBeNull();
+    expect(view.container.querySelector('.user-generated-avatar.is-self')).toBeNull();
+  });
+
   it('保留账期编辑输入并在原位展示后台名册刷新错误', async () => {
     const { view, client } = mount();
     const terms = view.getByRole('button', { name: /^重置日/ });

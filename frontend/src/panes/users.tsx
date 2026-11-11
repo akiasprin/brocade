@@ -2221,10 +2221,15 @@ function UserList({
           {/* 身份列不随 UUID 长度伸缩，让页签位置稳定；窄容器把导航独立到下一行。 */}
           <div className="user-dhead-main">
             <div className="user-dhead-identity">
-              <GeneratedUserAvatar id={u.id} variant="plate" />
+              <GeneratedUserAvatar id={u.id} variant="plate" self={isMe} />
               <div className="dtitle">
                 <div className="dname">
                   <b title={u.id}>{u.id}</b>
+                  {isMe && (
+                    <span className="user-self-chip" title="当前登录的账号">
+                      我
+                    </span>
+                  )}
                   <span
                     className="user-account-state"
                     data-tone={tone}
@@ -2234,7 +2239,6 @@ function UserList({
                   >
                     {statusLabel}
                   </span>
-                  {isMe && <span className="user-row-chip">我</span>}
                   {testChip && <span className="user-row-chip test">{testChip}</span>}
                 </div>
                 <p className="dsub">
@@ -2693,10 +2697,9 @@ function UserList({
         }}
         onClick={() => go({ p: 'user', id: u.id })}
       >
-        <GeneratedUserAvatar id={u.id} lamp={lamp} />
+        <GeneratedUserAvatar id={u.id} lamp={lamp} self={key === selfKey} />
         <span className="user-row-name">
           <b>{u.id}</b>
-          {key === selfKey && <span className="user-row-chip">我</span>}
           {testChip && <span className="user-row-chip test">{testChip}</span>}
         </span>
         <span className={`user-row-usage${usage ? '' : ' none'}`}>
@@ -2731,8 +2734,9 @@ function UserList({
       </button>
     );
   };
-  const activeRows = rows.filter(row => row.u.status !== 'disabled');
-  const disabledRows = rows.filter(row => row.u.status === 'disabled');
+  const selfRow = rows.find(row => row.key === selfKey);
+  const activeRows = rows.filter(row => row !== selfRow && row.u.status !== 'disabled');
+  const disabledRows = rows.filter(row => row !== selfRow && row.u.status === 'disabled');
 
   /* 名册与详情是两张同级面板：名册承担搜索和开户入口，详情保留块档背景，
      内部使用机器详情的紧凑横向页头和独立内容卡。 */
@@ -2872,9 +2876,28 @@ function UserList({
             />
             <div className="user-roster-options" role="listbox" aria-label="用户列表">
               {newUserEditor}
-              {activeRows.map(rosterRow)}
+              {selfRow ? (
+                <>
+                  <div className="user-roster-group" role="group" aria-label="我">
+                    <div className="user-roster-group-head" aria-hidden="true">
+                      我
+                    </div>
+                    {rosterRow(selfRow)}
+                  </div>
+                  {activeRows.length > 0 && (
+                    <div className="user-roster-group" role="group" aria-label="其他用户">
+                      <div className="user-roster-group-head" aria-hidden="true">
+                        其他用户<span>{activeRows.length}</span>
+                      </div>
+                      {activeRows.map(rosterRow)}
+                    </div>
+                  )}
+                </>
+              ) : (
+                activeRows.map(rosterRow)
+              )}
               {disabledRows.length > 0 &&
-                (activeRows.length > 0 ? (
+                (activeRows.length > 0 || selfRow ? (
                   <div className="user-roster-group" role="group" aria-label="已停用">
                     <div className="user-roster-group-head" aria-hidden="true">
                       已停用<span>{disabledRows.length}</span>
@@ -2953,7 +2976,13 @@ function UserList({
           user={sub.user.id}
           kind={sub.kind}
           selfService={who.role === 'user' && `${sub.user.tenant_id}/${sub.user.id}` === selfKey}
-          identity={<GeneratedUserAvatar id={sub.user.id} variant="mini" />}
+          identity={
+            <GeneratedUserAvatar
+              id={sub.user.id}
+              variant="mini"
+              self={`${sub.user.tenant_id}/${sub.user.id}` === selfKey}
+            />
+          }
           onClose={() => setSub(null)}
         />
       )}

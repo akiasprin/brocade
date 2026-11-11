@@ -269,10 +269,13 @@ export function GeneratedUserAvatar({
   id,
   variant = 'row',
   lamp = null,
+  self = false,
 }: {
   id: string;
   variant?: 'row' | 'plate' | 'mini' | 'cell';
   lamp?: AvatarLamp | null;
+  /** 调用方按租户与用户一起匹配，避免跨租户的同名账号被标为本人。 */
+  self?: boolean;
 }) {
   const shape =
     variant === 'plate'
@@ -287,7 +290,7 @@ export function GeneratedUserAvatar({
 
   return (
     <span
-      className={`${shape} user-generated-avatar`}
+      className={`${shape} user-generated-avatar${self ? ' is-self' : ''}`}
       style={style}
       data-avatar-mark={identity.mark}
       aria-hidden={variant === 'cell' ? true : undefined}

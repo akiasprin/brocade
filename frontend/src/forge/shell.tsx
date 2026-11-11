@@ -46,6 +46,7 @@ import { theme } from './theme';
 import { palette, PALETTES } from './palette';
 import { Icon, type IconName } from '../ui/icons';
 import { BrandIcon } from '../ui/branding';
+import { GeneratedUserAvatar } from '../ui/user-avatar';
 import { compactGrantAutomation, RuntimeCrumbStatus, type RuntimeCrumbState } from '../ui/grant-automation';
 import { motionOriginFor, runVisualTransition } from '../ui/motion';
 import { usePresence } from '../ui/presence';
@@ -598,7 +599,7 @@ function TopBar({
     items[next]?.focus();
   };
 
-  /* 账户牌替代「⋯」打开同一个菜单：顶栏常驻显示当前账户。窄屏已登录时只留首字母牌；
+  /* 账户牌替代「⋯」打开同一个菜单：顶栏常驻显示当前账户。窄屏已登录时只留身份牌；
      访客没有身份可缩写，直接在同一位置写「登录」，避免把入口藏到菜单底部。 */
   const accountButton = (
     <button
@@ -618,9 +619,15 @@ function TopBar({
         forge.setDiag(false);
       }}
     >
-      <span className="fg-who-plate" aria-hidden="true">
-        {account.guest ? <Icon of="access" size={13} /> : account.initial}
-      </span>
+      {!account.guest && who.self_user ? (
+        <span className="fg-who-face" aria-hidden="true">
+          <GeneratedUserAvatar id={who.self_user.user_id} variant="mini" self />
+        </span>
+      ) : (
+        <span className="fg-who-plate" aria-hidden="true">
+          {account.guest ? <Icon of="access" size={13} /> : account.initial}
+        </span>
+      )}
       {(!narrow || account.guest) && <span className="fg-who-name">{account.guest ? '登录' : account.name}</span>}
       {!narrow && <Icon of="chevronDown" size={12} className="fg-who-caret" />}
     </button>
@@ -672,7 +679,13 @@ function TopBar({
       ) : (
         /* 菜单头重复账户牌的读屏名称，只作视觉呈现；读屏从账户牌读到账户名与角色。 */
         <div className="fg-menu-id" aria-hidden="true">
-          <span className="fg-who-plate">{account.initial}</span>
+          {who.self_user ? (
+            <span className="fg-who-face">
+              <GeneratedUserAvatar id={who.self_user.user_id} variant="mini" self />
+            </span>
+          ) : (
+            <span className="fg-who-plate">{account.initial}</span>
+          )}
           <span className="fg-menu-id-text">
             <span className="fg-menu-id-name">{account.name}</span>
             <span className="fg-menu-id-role">{account.role}</span>
