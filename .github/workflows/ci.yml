@@ -45,6 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/configure-apt
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: components/cube/.go-version
@@ -311,6 +312,8 @@ jobs:
         with:
           fetch-depth: 2
 
+      - uses: ./.github/actions/configure-apt
+
       - name: Check the POSIX installer
         run: sh -n install.sh
 
@@ -344,10 +347,10 @@ jobs:
         working-directory: frontend
         run: npx playwright install --with-deps chromium
 
-      - name: Install fonts used by visual baselines
+      - name: Install fonts and native test libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends fonts-noto-cjk fonts-dejavu-core
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk fonts-dejavu-core libcap-ng-dev libseccomp-dev
           fc-match 'Noto Sans CJK SC'
           fc-match 'Noto Serif CJK SC'
           fc-match monospace
@@ -425,10 +428,7 @@ jobs:
           cargo clippy --manifest-path components/cube/CubeShim/Cargo.toml -p cube-terminal --features server --all-targets --locked -- -D warnings
 
       - name: Verify Guest exit receipts before releasing terminal admission
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libcap-ng-dev libseccomp-dev
-          cargo test --manifest-path components/cube/CubeShim/Cargo.toml -p containerd-shim-cube-rs --lib --locked terminal_exit_tests
+        run: cargo test --manifest-path components/cube/CubeShim/Cargo.toml -p containerd-shim-cube-rs --lib --locked terminal_exit_tests
 
       - name: Bind real Xray tests to this Console build
         run: |
@@ -569,6 +569,9 @@ jobs:
             linker_var: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: ./.github/actions/configure-apt
+        if: matrix.apt
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:

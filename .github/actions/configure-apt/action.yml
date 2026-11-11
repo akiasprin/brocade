@@ -1,0 +1,34 @@
+name: configure-apt
+description: Use the Ubuntu HTTPS archives for hosted amd64 runner dependencies.
+
+runs:
+  using: composite
+  steps:
+    - name: Prefer Ubuntu HTTPS mirrors
+      shell: bash
+      run: |
+        set -euo pipefail
+        [ "$(dpkg --print-architecture)" = amd64 ] || {
+          echo 'configure-apt requires an Ubuntu amd64 hosted runner' >&2
+          exit 1
+        }
+        [ -f /etc/apt/apt-mirrors.txt ] || {
+          echo 'hosted runner APT mirror list is missing' >&2
+          exit 1
+        }
+        # The hosted image puts Azure first. A DNS outage there can exhaust setup
+        # before tests start; retain the two signed Ubuntu archive mirrors.
+        printf '%s\tpriority:%s\n' \
+          'https://archive.ubuntu.com/ubuntu/' 1 \
+          'https://security.ubuntu.com/ubuntu/' 2 |
+          sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+        # Sort after image defaults and bound dependency fetches, not builds/tests.
+        sudo tee /etc/apt/apt.conf.d/zzz-brocade-ci > /dev/null <<'EOF'
+        Acquire::Retries "1";
+        Acquire::http::Timeout "15";
+        Acquire::https::Timeout "15";
+        EOF
+        cat /etc/apt/apt-mirrors.txt
+        apt-config shell CI_APT_RETRIES Acquire::Retries \
+          CI_APT_HTTP_TIMEOUT Acquire::http::Timeout \
+          CI_APT_HTTPS_TIMEOUT Acquire::https::Timeout
