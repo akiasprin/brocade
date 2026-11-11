@@ -49,3 +49,9 @@ jobs:
           if shutil.which('dig'):
               probe('public DNS lookup', ['dig', '+time=2', '+tries=1', '@1.1.1.1', 'archive.ubuntu.com', 'A'], timeout=4)
           PY
+      - name: Verify signed Ubuntu package downloads
+        run: |
+          sudo apt-get update --error-on=any
+          sudo apt-get install -y --download-only --no-install-recommends libcap-ng-dev libseccomp-dev
+          test -n "$(find /var/cache/apt/archives -maxdepth 1 -name 'libcap-ng-dev_*.deb' -print -quit)"
+          test -n "$(find /var/cache/apt/archives -maxdepth 1 -name 'libseccomp-dev_*.deb' -print -quit)"
