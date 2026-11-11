@@ -143,6 +143,31 @@ it('keeps an invalidation received during a read for the next batch', async () =
   expect(invalidate).toHaveBeenCalledTimes(2);
 });
 
+it('bounds full-fleet downloads during continuous reports without delaying faster probe hints', async () => {
+  const reads = { nodes: vi.fn(() => 1), load: vi.fn(() => 1), e2e: vi.fn(() => 1) };
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+  for (const key of ['nodes', 'node-load-list', 'e2e-probes']) client.setQueryData([key], 0);
+  function Reads() {
+    useQuery({ queryKey: ['nodes'], queryFn: reads.nodes });
+    useQuery({ queryKey: ['node-load-list'], queryFn: reads.load });
+    useQuery({ queryKey: ['e2e-probes'], queryFn: reads.e2e });
+    return null;
+  }
+  render(
+    <QueryClientProvider client={client}>
+      <Updates />
+      <Reads />
+    </QueryClientProvider>,
+  );
+  for (let i = 0; i < 31; i++) {
+    act(() => Events.sources[0].send('invalidate', ['nodes', 'load', 'e2e']));
+    await advance(1_000);
+  }
+  expect(reads.nodes).toHaveBeenCalledTimes(4);
+  expect(reads.load).toHaveBeenCalledTimes(2);
+  expect(reads.e2e).toHaveBeenCalledTimes(31);
+});
+
 it('closes hidden-page subscriptions and refreshes missed changes after visibility returns', async () => {
   const client = new QueryClient();
   let visibility = 'visible';

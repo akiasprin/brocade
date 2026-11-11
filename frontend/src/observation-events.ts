@@ -11,6 +11,18 @@ const QUERY_GROUPS: Record<string, readonly string[]> = {
   deployments: ['deployments', 'revisions'],
   tunnel_probes: ['tunnel-probes', 'tunnel-probe'],
 };
+// These are whole-fleet snapshots. A fleet reporting continuously must not turn one-second
+// notification batches into one full HTTP download per second. Faster job hints stay immediate.
+const REFRESH_MIN_MS: Record<string, number> = {
+  nodes: 10_000,
+  'node-load-list': 30_000,
+  'node-nic-list': 30_000,
+  'node-load-history': 30_000,
+  'node-load-metrics': 30_000,
+  'node-traffic': 30_000,
+  'usage-node-series': 30_000,
+  'usage-chain': 30_000,
+};
 
 /** One stream per query cache. Hints refresh active observation reads, never model snapshots or
  * controlled editors. Existing query intervals remain the fallback for old Consoles and proxies. */
@@ -18,17 +30,29 @@ function createSource(client: QueryClient) {
   let users = 0;
   let source: EventSource | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let timerDueAt = 0;
   let reopenTimer: ReturnType<typeof setTimeout> | undefined;
-  let pending = new Set<string>();
+  const pending = new Set<string>();
   let flushing = false;
+  const lastRefreshed = new Map<string, number>();
 
   const schedule = () => {
-    if (!users || timer || flushing || !pending.size) return;
+    if (!users || flushing || !pending.size) return;
     // A batch of reports from many Agents must not cancel reads or fetch the fleet per Agent.
+    const now = Date.now();
+    const dueAt = (key: string) => (lastRefreshed.get(key) ?? -Infinity) + (REFRESH_MIN_MS[key] ?? 0);
+    const delay = Math.max(1_000, Math.min(...[...pending].map(key => dueAt(key) - now)));
+    if (timer && timerDueAt <= now + delay) return;
+    if (timer) clearTimeout(timer);
+    timerDueAt = now + delay;
     timer = setTimeout(() => {
       timer = undefined;
-      const keys = pending;
-      pending = new Set();
+      const now = Date.now();
+      const keys = new Set([...pending].filter(key => dueAt(key) <= now));
+      for (const key of keys) {
+        pending.delete(key);
+        lastRefreshed.set(key, now);
+      }
       flushing = true;
       void client
         .invalidateQueries(
@@ -39,7 +63,7 @@ function createSource(client: QueryClient) {
           flushing = false;
           schedule();
         });
-    }, 1_000);
+    }, delay);
   };
   const enqueue = (domains: unknown) => {
     if (!Array.isArray(domains)) return;
@@ -58,6 +82,7 @@ function createSource(client: QueryClient) {
     timer = undefined;
     reopenTimer = undefined;
     pending.clear();
+    lastRefreshed.clear();
   };
   const open = () => {
     if (!users || source || document.visibilityState === 'hidden' || typeof EventSource === 'undefined') return;

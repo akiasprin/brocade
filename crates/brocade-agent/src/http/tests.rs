@@ -696,6 +696,32 @@ fn diagnostic_family_clients_cannot_connect_using_the_other_address_family() {
 }
 
 #[test]
+fn control_json_negotiates_gzip_and_decodes_the_response() {
+    use flate2::{write::GzEncoder, Compression};
+    warm_control_client();
+    let body = format!(r#"{{"nodes":"{}"}}"#, "fixture".repeat(4096));
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(body.as_bytes()).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = accept(&listener);
+        let (headers, _) = read_request(&mut stream);
+        assert!(headers.contains("accept-encoding: gzip"));
+        assert!(headers.contains("authorization: bearer fixture-token"));
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", compressed.len()).unwrap();
+        stream.write_all(&compressed).unwrap();
+    });
+    let response = HttpClient::new(&origin)
+        .unwrap()
+        .request("GET", "/agent/v1/vpngate/desired", "fixture-token", None)
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(response.body, body);
+}
+
+#[test]
 fn diagnostic_gzip_downloads_complete_html_without_changing_ordinary_http() {
     use flate2::{write::GzEncoder, Compression};
     let html = format!(
@@ -758,11 +784,10 @@ fn diagnostic_gzip_rejects_invalid_trailers_and_excessive_decoded_bodies() {
     let n = corrupt.len();
     corrupt[n - 8] ^= 1;
     for bytes in [truncated, corrupt] {
-        let error =
-            decode_diagnostic_body(bytes, Some(&encoding), deadline, &progress).unwrap_err();
+        let error = decode_gzip_body(bytes, Some(&encoding), deadline, &progress).unwrap_err();
         assert!(error.contains("invalid_gzip"));
     }
     let bomb = compress(&vec![b'x'; MAX_HTTP_RESPONSE_BYTES + 1]);
-    let error = decode_diagnostic_body(bomb, Some(&encoding), deadline, &progress).unwrap_err();
+    let error = decode_gzip_body(bomb, Some(&encoding), deadline, &progress).unwrap_err();
     assert!(error.contains("decoded_body_exceeds_limit"));
 }

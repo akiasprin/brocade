@@ -495,14 +495,15 @@ describe('fleet realtime traffic panel', () => {
   });
 
   it('groups initial user-rate loading as connecting and clears it when reports arrive', async () => {
+    vi.useFakeTimers();
     const payload = snapshot();
     delete payload.nodes[0].samples[0].sample.user_traffic;
     payload.nodes[1].samples[0].sample.user_traffic!.state = 'warming';
     payload.nodes[2].samples = [];
     serve(payload);
     const view = mount();
-
-    const list = await view.findByLabelText('按用户的当前速率');
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    const list = view.getByLabelText('按用户的当前速率');
     expect(view.getByRole('status').textContent).toBe('连接中');
     expect(within(list).getByText('正在等待速率数据')).toBeTruthy();
     expect(list.querySelector('.flt-list-rest')?.textContent).toBe('连接中：香港 HKIX、东京 IIJ、台北 家宽');
@@ -510,9 +511,8 @@ describe('fleet realtime traffic panel', () => {
     expect(view.queryByRole('alert')).toBeNull();
 
     Object.assign(payload, snapshot());
-    await waitFor(() => expect(view.getByRole('status').textContent).toBe('实时 · 每秒更新'), {
-      timeout: 4_000,
-    });
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(view.getByRole('status').textContent).toBe('实时 · 每秒更新');
     expect(within(list).queryByText('连接中：')).toBeNull();
     expect(within(list).getByText('空闲 1 位')).toBeTruthy();
   });

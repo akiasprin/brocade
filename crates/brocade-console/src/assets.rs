@@ -64,28 +64,37 @@ fn lookup(path: &str) -> Option<&'static ConsoleAsset> {
 ///
 /// `q=0` counts as a refusal — that is how a client says "anything but this one", and honouring
 /// `Accept-Encoding: gzip;q=0` costs one line here against an unreadable page there.
-fn accepts_gzip(headers: &HeaderMap) -> bool {
-    let Some(value) = headers
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    value.split(',').any(|entry| {
-        let mut parts = entry.split(';');
-        let coding = parts.next().unwrap_or_default().trim();
-        if !coding.eq_ignore_ascii_case("gzip") && coding != "*" {
-            return false;
+pub(crate) fn accepts_gzip(headers: &HeaderMap) -> bool {
+    let mut gzip = None;
+    let mut wildcard = false;
+    for value in headers.get_all(header::ACCEPT_ENCODING) {
+        let Ok(value) = value.to_str() else { continue };
+        for entry in value.split(',') {
+            let mut parts = entry.split(';');
+            let coding = parts.next().unwrap_or_default().trim();
+            if !coding.eq_ignore_ascii_case("gzip") && coding != "*" {
+                continue;
+            }
+            let accepted = parts.all(|parameter| {
+                let parameter = parameter.trim();
+                parameter
+                    .strip_prefix("q=")
+                    .or_else(|| parameter.strip_prefix("Q="))
+                    .is_none_or(|quality| {
+                        quality
+                            .trim()
+                            .parse::<f32>()
+                            .is_ok_and(|quality| quality > 0.0 && quality <= 1.0)
+                    })
+            });
+            if coding == "*" {
+                wildcard |= accepted;
+            } else {
+                gzip = Some(gzip.unwrap_or(true) && accepted);
+            }
         }
-        !parts.any(|parameter| {
-            let parameter = parameter.trim();
-            parameter
-                .strip_prefix("q=")
-                .or_else(|| parameter.strip_prefix("Q="))
-                .and_then(|quality| quality.trim().parse::<f32>().ok())
-                .is_some_and(|quality| quality <= 0.0)
-        })
-    })
+    }
+    gzip.unwrap_or(wildcard)
 }
 
 /// See the caching section at the top of this file.

@@ -109,6 +109,7 @@ pub(crate) fn run_forever(options: &Options, realtime: crate::realtime::VpngateC
         }
     };
     let mut desired = None;
+    let mut desired_cache = DesiredCache::default();
     let mut next_fetch = Instant::now();
     let mut last_report = None;
     let mut telemetry = TelemetrySupervisor::new();
@@ -118,25 +119,23 @@ pub(crate) fn run_forever(options: &Options, realtime: crate::realtime::VpngateC
             if let Err(error) = resend_pending_reports(&client, options) {
                 eprintln!("vpngate: {error}");
             }
-            match fetch_desired(&client, options) {
-                Ok(Some(next)) => match validate_desired(&next) {
-                    Ok(()) => {
-                        let root = vpngate_root(&options.state_dir);
-                        let stored = create_private_dir(&root).and_then(|()| {
-                            serde_json::to_vec_pretty(&next)
-                                .map_err(|error| error.to_string())
-                                .and_then(|body| {
-                                    write_private_atomic(&root.join("desired.json"), &body)
-                                })
-                        });
-                        if let Err(error) = stored {
-                            eprintln!("vpngate: cannot store desired state: {error}");
-                        } else {
-                            desired = Some(next);
-                        }
+            match fetch_desired(&client, options, &mut desired_cache) {
+                Ok(Some(next)) if desired.as_ref() == Some(next) => {}
+                Ok(Some(next)) => {
+                    let root = vpngate_root(&options.state_dir);
+                    let stored = create_private_dir(&root).and_then(|()| {
+                        serde_json::to_vec_pretty(next)
+                            .map_err(|error| error.to_string())
+                            .and_then(|body| {
+                                write_private_atomic(&root.join("desired.json"), &body)
+                            })
+                    });
+                    if let Err(error) = stored {
+                        eprintln!("vpngate: cannot store desired state: {error}");
+                    } else {
+                        desired = Some(next.clone());
                     }
-                    Err(error) => eprintln!("vpngate: {error}"),
-                },
+                }
                 Ok(None) => {}
                 Err(error) => {
                     // A failed poll is not permission to tear down a working egress. Desired state
@@ -193,18 +192,18 @@ pub(crate) fn run_probe_forever(options: &Options) {
     // would turn an increased worker ceiling into needless process and iptables churn.
     terminate_catalog_probe_processes(&options.state_dir);
     cleanup_catalog_probe_namespaces();
+    let mut desired_cache = DesiredCache::default();
     loop {
         let outcome: Result<bool, String> = (|| {
             resend_pending_probe_reports(&client, options)?;
-            let Some(desired) = fetch_desired(&client, options)? else {
+            let Some(desired) = fetch_desired(&client, options, &mut desired_cache)? else {
                 return Ok(false);
             };
-            validate_desired(&desired)?;
             if desired.probe_assignments.is_empty() {
                 return Ok(false);
             }
             require_linux_runtime()?;
-            let reports = reconcile_probe_assignments(&options.state_dir, &desired)?;
+            let reports = reconcile_probe_assignments(&options.state_dir, desired)?;
             persist_and_send_probe_reports(&client, options, reports)?;
             Ok(true)
         })();
@@ -305,16 +304,63 @@ fn catalogue_cycle(client: &HttpClient, options: &Options) -> Result<bool, Strin
     Ok(true)
 }
 
-fn fetch_desired(
+#[derive(Default)]
+struct DesiredCache {
+    etag: Option<String>,
+    state: Option<VpngateDesiredState>,
+}
+
+fn fetch_desired<'a>(
     client: &HttpClient,
     options: &Options,
-) -> Result<Option<VpngateDesiredState>, String> {
-    let response = client.request("GET", "/agent/v1/vpngate/desired", &options.token, None)?;
+    cache: &'a mut DesiredCache,
+) -> Result<Option<&'a VpngateDesiredState>, String> {
+    let headers = cache
+        .etag
+        .as_ref()
+        .map(|etag| ("If-None-Match", etag.clone()));
+    let response = client.request_with_headers(
+        "GET",
+        "/agent/v1/vpngate/desired",
+        &options.token,
+        None,
+        headers.as_slice(),
+    )?;
     match response.status {
-        204 => Ok(None),
-        200 => serde_json::from_str(&response.body)
-            .map(Some)
-            .map_err(|error| format!("invalid VPN Gate desired state: {error}")),
+        204 => {
+            cache.etag = None;
+            cache.state = None;
+            Ok(None)
+        }
+        304 if cache.etag.is_some() => {
+            cache.state.as_ref().map(Some).ok_or_else(|| {
+                "VPN Gate returned unchanged state without a cached state".to_owned()
+            })
+        }
+        200 => {
+            let state = serde_json::from_str(&response.body)
+                .map_err(|error| format!("invalid VPN Gate desired state: {error}"))?;
+            validate_desired(&state)?;
+            // A malformed validator cannot become a future request header. State remains useful
+            // with older Consoles that do not send an ETag.
+            cache.etag = response
+                .header("etag")
+                .filter(|etag| {
+                    let opaque = etag.strip_prefix("W/").unwrap_or(etag);
+                    etag.len() <= 128
+                        && opaque
+                            .strip_prefix('"')
+                            .and_then(|value| value.strip_suffix('"'))
+                            .is_some_and(|value| {
+                                value
+                                    .bytes()
+                                    .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte))
+                            })
+                })
+                .map(str::to_owned);
+            cache.state = Some(state);
+            Ok(cache.state.as_ref())
+        }
         status => Err(format!("desired request failed: HTTP {status}")),
     }
 }
@@ -4737,6 +4783,102 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn conditional_desired_reuses_validated_state_and_accepts_a_new_generation() {
+        crate::http::tests::warm_control_client();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let worker = thread::spawn(move || {
+            for index in 0..7 {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(1))
+                        }
+                        Err(error) => panic!("desired fixture did not receive request: {error}"),
+                    }
+                };
+                let (headers, _) = crate::http::tests::read_request(&mut stream);
+                assert!(headers.starts_with("get /agent/v1/vpngate/desired "));
+                if index == 0 || index >= 4 {
+                    assert!(!headers.contains("if-none-match:"));
+                } else {
+                    assert!(headers.contains(if index == 3 {
+                        "if-none-match: w/\"two\""
+                    } else {
+                        "if-none-match: w/\"one\""
+                    }));
+                }
+                let (status, etag, body) = match index {
+                    0 => (
+                        "200 OK",
+                        "W/\"one\"",
+                        r#"{"topology_revision":1,"catalog_generation":1,"pools":[]}"#,
+                    ),
+                    1 => ("304 Not Modified", "W/\"one\"", ""),
+                    2 => (
+                        "200 OK",
+                        "W/\"two\"",
+                        r#"{"topology_revision":1,"catalog_generation":2,"pools":[]}"#,
+                    ),
+                    3 => ("204 No Content", "", ""),
+                    4 | 5 => (
+                        "200 OK",
+                        if index == 5 { "*" } else { "" },
+                        r#"{"topology_revision":1,"catalog_generation":3,"pools":[]}"#,
+                    ),
+                    _ => ("304 Not Modified", "", ""),
+                };
+                write!(stream, "HTTP/1.1 {status}\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let options = Options {
+            command: "run".into(),
+            server: server_url,
+            token: "fixture-token".into(),
+            state_dir: PathBuf::new(),
+            apply_mode: ApplyMode::StateDir,
+            vpngate_stats_window: Duration::from_secs(900),
+        };
+        let client = HttpClient::new(&options.server).unwrap();
+        let mut cache = DesiredCache::default();
+        for generation in [1, 1, 2] {
+            assert_eq!(
+                fetch_desired(&client, &options, &mut cache)
+                    .unwrap()
+                    .unwrap()
+                    .catalog_generation,
+                generation
+            );
+        }
+        assert!(fetch_desired(&client, &options, &mut cache)
+            .unwrap()
+            .is_none());
+        assert!(cache.state.is_none());
+        assert!(cache.etag.is_none());
+        for _ in 0..2 {
+            assert_eq!(
+                fetch_desired(&client, &options, &mut cache)
+                    .unwrap()
+                    .unwrap()
+                    .catalog_generation,
+                3
+            );
+            assert!(cache.etag.is_none());
+        }
+        assert!(fetch_desired(&client, &options, &mut cache)
+            .err()
+            .unwrap()
+            .contains("HTTP 304"));
+        worker.join().unwrap();
+    }
 
     #[test]
     #[ignore = "requires hy2-netns/production.py in an owned Docker/KVM network namespace"]

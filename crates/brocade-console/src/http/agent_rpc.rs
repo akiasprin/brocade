@@ -33,6 +33,10 @@ pub(super) async fn dispatch(
         .method(method.as_str())
         .uri(&path);
     for (name, value) in authenticated.iter() {
+        // RPC bodies are JSON inside an already compressed WebSocket, not HTTP encodings.
+        if name == header::ACCEPT_ENCODING {
+            continue;
+        }
         request = request.header(name, value);
     }
     for (name, value) in headers {

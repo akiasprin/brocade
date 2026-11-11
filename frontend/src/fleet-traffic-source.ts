@@ -37,6 +37,7 @@ interface FleetTrafficState {
 }
 
 const EMPTY: FleetTrafficState = { payload: null, failed: false };
+const FALLBACK_POLL_MS = 5_000;
 
 function mergeNodes(previous: FleetTrafficNode[], incoming: FleetTrafficNode[]): FleetTrafficNode[] {
   const before = new Map(previous.map(node => [node.node_id, node]));
@@ -64,11 +65,14 @@ export function useFleetTrafficSource(enabled = true) {
     let stopped = false;
     let source: EventSource | undefined;
     let pollTimer: ReturnType<typeof setTimeout> | undefined;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
     let pollAbort: AbortController | undefined;
     let polling = false;
     let fetching = false;
     let entitlementsKnown = false;
     let snapshotFailures = 0;
+    let reconnectFailures = 0;
+    const visible = () => !stopped && document.visibilityState !== 'hidden';
 
     const acceptSnapshot = (next: FleetTrafficSnapshot) => {
       if (stopped || !Array.isArray(next.nodes)) return;
@@ -80,7 +84,7 @@ export function useFleetTrafficSource(enabled = true) {
     };
 
     const fetchSnapshot = async () => {
-      if (stopped || fetching) return;
+      if (!visible() || fetching) return;
       if (pollTimer) clearTimeout(pollTimer);
       fetching = true;
       const abort = new AbortController();
@@ -101,29 +105,32 @@ export function useFleetTrafficSource(enabled = true) {
         entitlementsKnown = true;
         snapshotFailures = 0;
       } catch {
-        if (!stopped) {
+        if (visible()) {
           snapshotFailures += 1;
           setState(previous => ({ ...previous, failed: true }));
         }
       } finally {
         clearTimeout(timeout);
         fetching = false;
-        if (!stopped && (polling || !entitlementsKnown)) {
-          const delay = polling ? 2_000 : Math.min(2_000 * 2 ** Math.min(snapshotFailures - 1, 4), 30_000);
+        if (visible() && (polling || !entitlementsKnown)) {
+          const delay = snapshotFailures
+            ? Math.min(2_000 * 2 ** Math.min(snapshotFailures - 1, 4), 30_000)
+            : polling
+              ? FALLBACK_POLL_MS
+              : 2_000;
           pollTimer = setTimeout(() => void fetchSnapshot(), delay);
         }
       }
     };
 
     const startPolling = () => {
-      if (polling || stopped) return;
+      if (polling || !visible()) return;
       polling = true;
-      source?.close();
       void fetchSnapshot();
     };
 
     const open = () => {
-      if (stopped) return;
+      if (!visible() || source) return;
       if (typeof EventSource === 'undefined') {
         startPolling();
         return;
@@ -133,7 +140,16 @@ export function useFleetTrafficSource(enabled = true) {
       opened.addEventListener('snapshot', raw => {
         if (stopped || source !== opened) return;
         try {
-          acceptSnapshot(JSON.parse((raw as MessageEvent).data));
+          const next = JSON.parse((raw as MessageEvent).data) as FleetTrafficSnapshot;
+          if (!Array.isArray(next.nodes)) return;
+          acceptSnapshot(next);
+          // A recovered push stream owns readings again; polling remains only for missing grants.
+          polling = false;
+          reconnectFailures = 0;
+          if (entitlementsKnown && pollTimer) {
+            clearTimeout(pollTimer);
+            pollTimer = undefined;
+          }
         } catch {
           /* The last valid per-node readings expire independently. */
         }
@@ -191,23 +207,54 @@ export function useFleetTrafficSource(enabled = true) {
       opened.addEventListener('reset', () => {
         opened.close();
         if (source === opened && !stopped) {
+          source = undefined;
+          entitlementsKnown = false;
           void fetchSnapshot().finally(open);
         }
       });
       opened.onerror = () => {
-        if (source === opened) startPolling();
+        if (source !== opened || !visible()) return;
+        opened.close();
+        source = undefined;
+        startPolling();
+        const delay = Math.min(2_000 * 2 ** Math.min(reconnectFailures++, 4), 30_000);
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = undefined;
+          open();
+        }, delay);
       };
+    };
+
+    const close = () => {
+      source?.close();
+      source = undefined;
+      pollAbort?.abort();
+      if (pollTimer) clearTimeout(pollTimer);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      pollTimer = undefined;
+      reconnectTimer = undefined;
+    };
+    const visibility = () => {
+      if (!visible()) close();
+      else {
+        polling = false;
+        entitlementsKnown = false;
+        snapshotFailures = 0;
+        reconnectFailures = 0;
+        void fetchSnapshot();
+        open();
+      }
     };
 
     // SSE carries no authorization matrix. Retry its HTTP snapshot until grants are known, then
     // let the stream own the readings; an SSE-less proxy continues through bounded polling.
     void fetchSnapshot();
     open();
+    document.addEventListener('visibilitychange', visibility);
     return () => {
       stopped = true;
-      source?.close();
-      pollAbort?.abort();
-      if (pollTimer) clearTimeout(pollTimer);
+      document.removeEventListener('visibilitychange', visibility);
+      close();
     };
   }, [enabled, update]);
 

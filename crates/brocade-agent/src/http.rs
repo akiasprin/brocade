@@ -171,7 +171,10 @@ impl HttpClient {
                 content_type: "application/json",
             },
             extra_headers,
-            RequestTransport::default(),
+            RequestTransport {
+                decode_gzip: true,
+                ..RequestTransport::default()
+            },
         )
     }
 
@@ -369,6 +372,13 @@ impl HttpClient {
                 brocade_deployment::protocol::AGENT_PROTOCOL_VERSION,
             );
         }
+        if transport.decode_gzip
+            && !extra_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+        {
+            request = request.header("Accept-Encoding", "gzip");
+        }
         for (name, value) in extra_headers {
             request = request.header(*name, value);
         }
@@ -416,7 +426,7 @@ impl HttpClient {
             }
         }
         let bytes = if transport.decode_gzip {
-            decode_diagnostic_body(
+            decode_gzip_body(
                 bytes,
                 headers.get("content-encoding").map(Vec::as_slice),
                 deadline,
@@ -514,9 +524,10 @@ fn response_headers(
     Ok(headers)
 }
 
-/// Optional website probes negotiate gzip without changing control/binary HTTP semantics.
+/// Control JSON and optional website probes share bounded negotiated gzip decoding.
+/// Binary transfers keep their original bytes and do not enter this path.
 /// Framing must finish first; a truncated stream or invalid gzip trailer is never evidence.
-fn decode_diagnostic_body(
+fn decode_gzip_body(
     bytes: Vec<u8>,
     encodings: Option<&[String]>,
     deadline: Instant,

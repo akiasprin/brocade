@@ -649,7 +649,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   const nodes = useQuery({
     queryKey: ['nodes'],
     queryFn: () => fetchNodes(),
-    refetchInterval: 10_000,
+    refetchInterval: 30_000,
     refetchOnMount: 'always',
   });
   // 24 个已完成窗口组成 12 分钟走势，不为每台机器请求详情。
@@ -5589,7 +5589,7 @@ export function NodeDetail({
   const qc = useQueryClient();
   // 详情页的状态灯同样依赖 last_poll_at。详情也可能单独挂载；若这里仅命中
   // 缓存，负载查询触发重绘时会拿旧时间与当前时间比较，停留 60 秒后误报「失联」。
-  const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), refetchInterval: 10_000 });
+  const nodes = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), refetchInterval: 30_000 });
   // 访客看不到发布记录，且详情页只在判断退役工单时需要它；不要发一个必然 403 的请求。
   const deployments = useQuery({
     queryKey: ['deployments'],

@@ -3,6 +3,7 @@ mod agent_rpc;
 mod cvm;
 mod observations;
 mod realtime_channel;
+mod traffic;
 use realtime_channel::agent_realtime;
 mod unlock_probe;
 use unlock_probe::*;
@@ -1985,6 +1986,7 @@ fn admin_router_with_state(state: AppState) -> Router {
             admin_auth_context,
         ))
         .layer(axum::middleware::from_fn(crate::performance::middleware))
+        .layer(axum::middleware::from_fn(traffic::compress_json))
         .with_state(state)
 }
 
@@ -2195,6 +2197,7 @@ fn agent_routes(state: AppState) -> Router<AppState> {
             observations::after_report,
         ))
         .layer(axum::middleware::from_fn(crate::performance::middleware))
+        .layer(axum::middleware::from_fn(traffic::compress_json))
 }
 
 async fn performance_diagnostics(
@@ -3693,14 +3696,27 @@ async fn realtime_fleet_traffic_snapshot(
 ) -> ApiResult<Response> {
     let (subscription, mode, expected) =
         realtime_fleet_traffic_subscription(&state, &headers).await?;
+    Ok(fleet_traffic_snapshot_response(
+        subscription,
+        &mode,
+        expected,
+    ))
+}
+
+fn fleet_traffic_snapshot_response(
+    subscription: crate::realtime::RealtimeSubscription,
+    mode: &RealtimeStreamMode,
+    expected: Value,
+) -> Response {
     let mut payload = json!({
         "policy": subscription.policy,
         "nodes": subscription.snapshots,
         "expected": expected,
     });
+    retain_latest_snapshot_samples(&mut payload);
     omit_snapshot_diagnostics(&mut payload);
-    filter_realtime_user_traffic(&mut payload, &mode);
-    Ok(no_store_json(payload))
+    filter_realtime_user_traffic(&mut payload, mode);
+    no_store_json(payload)
 }
 
 async fn realtime_fleet_traffic_subscription(
@@ -8318,7 +8334,7 @@ async fn agent_vpngate_desired(
         .vpngate_agent_desired_with_probe_origins(&node.node_id, &origins)
         .await?
     {
-        Some(desired) => Ok(Json(desired).into_response()),
+        Some(desired) => traffic::conditional_json(&desired, &headers),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
 }
@@ -10406,7 +10422,7 @@ mod tests {
                 .as_millis(),
         )
         .unwrap();
-        for sequence in [1, 2] {
+        for sequence in 1..=120 {
             let sample = serde_json::from_value(serde_json::json!({
                 "sequence": sequence,
                 "sampled_at_unix_millis": sampled_at_unix_millis,
@@ -10422,6 +10438,32 @@ mod tests {
                 .await
                 .unwrap();
         }
+
+        let subscription = realtime.subscribe_nic(["n1".to_owned()]).await;
+        assert_eq!(subscription.snapshots[0].samples.len(), 120);
+        let history_bytes = serde_json::to_vec(&subscription.snapshots).unwrap().len();
+        let expected = serde_json::json!([{"node_id": "n1", "users": []}]);
+        let response = super::fleet_traffic_snapshot_response(
+            subscription,
+            &super::RealtimeStreamMode::Fleet,
+            expected.clone(),
+        );
+        let payload: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["nodes"][0]["samples"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["nodes"][0]["samples"][0]["sample"]["sequence"], 120);
+        assert!(serde_json::to_vec(&payload).unwrap().len() * 20 < history_bytes);
+        assert_eq!(payload["expected"], expected);
+        assert_eq!(
+            realtime.subscribe_nic(["n1".to_owned()]).await.snapshots[0]
+                .samples
+                .len(),
+            120
+        );
 
         let response = super::realtime_stream_response(
             realtime.subscribe_nic(["n1".to_owned()]).await,
@@ -10444,7 +10486,7 @@ mod tests {
         let samples = payload["nodes"][0]["samples"].as_array().unwrap();
 
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0]["sample"]["sequence"], 2);
+        assert_eq!(samples[0]["sample"]["sequence"], 120);
     }
 
     #[test]

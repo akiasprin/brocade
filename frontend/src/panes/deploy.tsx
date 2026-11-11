@@ -2758,7 +2758,11 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
   // 按 deployment_wave_confirmations 计算。与外壳顶栏同一个查询键，直接用它的缓存与轮询。
   // 需要确认的步骤在确认前一台都不会下发，单看「这一步需要确认」会把已确认、正在执行的步骤也算进去。
   const runtime = useQuery({ queryKey: ['deployments', 'runtime'], queryFn: () => fetchActiveDeployments() });
-  const fleet = useQuery({ queryKey: ['nodes'], queryFn: () => fetchNodes(), refetchInterval: 3_000 });
+  const fleet = useQuery({
+    queryKey: ['nodes'],
+    queryFn: () => fetchNodes(),
+    refetchInterval: OPEN_STATES.has(detail.data?.status ?? '') ? 10_000 : 30_000,
+  });
 
   const refresh = () => {
     qc.invalidateQueries({ queryKey: ['deployment', id] });

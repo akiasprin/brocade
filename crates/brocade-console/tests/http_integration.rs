@@ -35,6 +35,129 @@ const BOOTSTRAP_TOKEN: &str = "bootstrap-test-token-with-at-least-32-bytes";
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn traffic_json_negotiates_compression_and_vpngate_validators_require_fresh_auth() {
+    use std::io::Read as _;
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    sqlx::query("UPDATE nodes SET public_ipv4 = '198.51.100.25' WHERE id = 'n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    seed_subscription_serving(&db).await;
+    let admin = admin_token(&db).await;
+    let node = db.store.issue_node_token("n1").await.unwrap().token;
+    let app = merged_router(
+        db.store.clone(),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+        "https://console.example".into(),
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/nodes/agent-state")
+                .header("authorization", format!("Bearer {admin}"))
+                .header("accept-encoding", "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-encoding"], "gzip");
+    let compressed = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(compressed.as_ref())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    let payload: Value = serde_json::from_slice(&decoded).unwrap();
+    assert_eq!(payload["nodes"].as_array().unwrap().len(), 1);
+    assert!(compressed.len() < decoded.len());
+    let created = post_json(
+        &app,
+        &admin,
+        "/admin/operators",
+        json!({
+            "id":"traffic-reader", "display_name":"Traffic reader", "role":"readonly",
+            "tenant_scope":"platform.acme", "password":"traffic-fixture-password-only"
+        }),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    let issued = post_json(
+        &app,
+        &admin,
+        "/admin/operators/traffic-reader/token",
+        json!({}),
+    )
+    .await;
+    assert_eq!(issued.0, StatusCode::CREATED);
+    let reader = issued.1["token"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/nodes/agent-state")
+                .header("authorization", format!("Bearer {reader}"))
+                .header("accept-encoding", "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["content-encoding"], "gzip");
+    let compressed = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(compressed.as_ref())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    let payload: Value = serde_json::from_slice(&decoded).unwrap();
+    assert_eq!(payload["nodes"].as_array().unwrap().len(), 1);
+    assert_ne!(payload["nodes"][0]["public_ipv4"], "198.51.100.25");
+    let request = |token: &str, etag: Option<&str>| {
+        let mut request = Request::get("/agent/v1/vpngate/desired")
+            .header("authorization", format!("Bearer {token}"))
+            .header(
+                "x-brocade-protocol-version",
+                brocade_deployment::protocol::AGENT_PROTOCOL_VERSION,
+            );
+        if let Some(etag) = etag {
+            request = request.header("if-none-match", etag);
+        }
+        request.body(Body::empty()).unwrap()
+    };
+    let response = app.clone().oneshot(request(&node, None)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = response.headers()["etag"].to_str().unwrap().to_owned();
+    let response = app
+        .clone()
+        .oneshot(request(&node, Some(&etag)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert!(to_bytes(response.into_body(), 1).await.unwrap().is_empty());
+    let response = app
+        .clone()
+        .oneshot(request("invalid-fixture-token", Some(&etag)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    sqlx::query("UPDATE control_state SET probe_endpoint_url = 'https://new-probe.example/check' WHERE id = TRUE")
+        .execute(db.pool()).await.unwrap();
+    let response = app.oneshot(request(&node, Some(&etag))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_ne!(response.headers()["etag"], etag);
+    let payload: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(
+        payload["health_probe_url"],
+        "https://new-probe.example/check"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn observation_events_require_read_access_and_follow_committed_agent_reports() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
