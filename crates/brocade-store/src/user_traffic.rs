@@ -372,6 +372,8 @@ pub async fn support(pool: &PgPool, node: &str, supported: bool) -> Result<bool>
       .bind(node).fetch_one(pool).await?)
 }
 
+/// Compatibility endpoint for Agents which still fetch shared byte budgets.
+/// Current Agents execute each ingress policy locally and never call this endpoint.
 pub async fn budget(
     pool: &PgPool,
     node: &str,

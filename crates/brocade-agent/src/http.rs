@@ -23,7 +23,6 @@ pub(crate) fn diagnostic_socks_client(port: u16) -> Result<reqwest::blocking::Cl
     client::socks(port)
 }
 
-pub(crate) mod asynchronous;
 mod client;
 mod diagnostic;
 mod resolver;

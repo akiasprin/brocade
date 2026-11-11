@@ -1,5 +1,5 @@
 //! Bounded loopback admission shared by every Xray generation on this node.
-//! The Console owns global reservations; this service only caches short-lived credits and paces payload.
+//! Each authenticated ingress has its own local rate; confirmed policies survive control-plane outages.
 use crate::{http::HttpClient, options::Options};
 use brocade_deployment::user_traffic::*;
 use serde::{Deserialize, Serialize};
@@ -9,14 +9,14 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
 };
 mod budget;
-use budget::{admit, source_entry, start_fetchers, Pool};
+use budget::{admit, source_entry, Pool};
 const MAX_SOURCES: usize = 4096;
 const MAX_CLIENTS: usize = 256;
 static SERVICE: OnceLock<Arc<Service>> = OnceLock::new();
@@ -35,16 +35,12 @@ struct LocalRequest {
 }
 struct PolicyCache {
     effects: BTreeMap<String, UserTrafficEffect>,
-    groups: BTreeMap<String, String>,
-    updated: Option<Instant>,
+    ready: bool,
 }
 struct Service {
     options: Options,
     token: String,
     entries: Mutex<BTreeMap<String, Arc<Pool>>>,
-    fetcher: budget::FetchSender,
-    known: Mutex<BTreeSet<String>>,
-    unknown_checkpoint: AtomicBool,
     clients: AtomicUsize,
     control: Mutex<Control>,
     generation: AtomicU64,
@@ -64,15 +60,13 @@ pub(crate) fn initialize(options: &Options) -> Result<(), String> {
     if SERVICE.get().is_some() {
         return Ok(());
     }
-    let known = crate::fsutil::read_bounded(&known_path(&options.state_dir), MAX_SOURCES * 1024);
-    let (known, unknown_checkpoint) = match known {
-        Ok(None) => (BTreeSet::new(), false),
-        Ok(Some(bytes)) => match serde_json::from_slice::<BTreeSet<String>>(&bytes) {
-            Ok(keys) if keys.len() <= MAX_SOURCES => (keys, false),
-            _ => (BTreeSet::new(), true),
-        },
-        Err(_) => (BTreeSet::new(), true),
-    };
+    let policies = load_policies(&options.state_dir).unwrap_or_else(|error| {
+        eprintln!("user traffic checkpoint: {error}; waiting for a complete policy snapshot");
+        PolicyCache {
+            effects: BTreeMap::new(),
+            ready: false,
+        }
+    });
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).map_err(|_| "user budget entropy unavailable")?;
     let token: String = random.iter().map(|b| format!("{b:02x}")).collect();
@@ -94,17 +88,10 @@ pub(crate) fn initialize(options: &Options) -> Result<(), String> {
         options: options.clone(),
         token,
         entries: Mutex::new(BTreeMap::new()),
-        fetcher: start_fetchers()?,
-        known: Mutex::new(known),
-        unknown_checkpoint: AtomicBool::new(unknown_checkpoint),
         clients: AtomicUsize::new(0),
         control: Mutex::new(control.clone()),
         generation: AtomicU64::new(0),
-        policies: Mutex::new(PolicyCache {
-            effects: BTreeMap::new(),
-            groups: BTreeMap::new(),
-            updated: None,
-        }),
+        policies: Mutex::new(policies),
     });
     let shared = Arc::clone(&service);
     thread::Builder::new()
@@ -135,30 +122,104 @@ pub(crate) fn initialize(options: &Options) -> Result<(), String> {
         .map_err(|_| "user budget initialized twice")?;
     Ok(())
 }
-fn remember(service: &Service, source: &str, limited: bool) -> Result<(), String> {
-    let mut known = service
-        .known
+fn policy_path(dir: &Path) -> PathBuf {
+    dir.join("user-traffic-policies.json")
+}
+
+fn validate_snapshot(
+    snapshot: &UserTrafficSnapshot,
+) -> Result<BTreeMap<String, UserTrafficEffect>, String> {
+    if snapshot.sha256.len() != 64 || !snapshot.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid user policy snapshot identity".into());
+    }
+    if snapshot.sources.len() > MAX_SOURCES {
+        return Err("user policy assignments exceed capacity".into());
+    }
+    let mut effects = BTreeMap::new();
+    for row in &snapshot.sources {
+        if row.revision == 0
+            || row.source.len() > 512
+            || row.source.is_empty()
+            || matches!(row.effect, UserTrafficEffect::Limited { rate_bps } if !(1000..=1_000_000_000_000).contains(&rate_bps))
+            || effects
+                .insert(row.source.clone(), row.effect.clone())
+                .is_some()
+        {
+            return Err("invalid or duplicate user policy assignment".into());
+        }
+    }
+    // budget_key belongs to the old shared-budget protocol. Local pools always use source.
+    Ok(effects)
+}
+
+fn load_policies(dir: &Path) -> Result<PolicyCache, String> {
+    let Some(bytes) = crate::fsutil::read_bounded(&policy_path(dir), MAX_SOURCES * 1024)? else {
+        return Ok(PolicyCache {
+            effects: BTreeMap::new(),
+            ready: false,
+        });
+    };
+    let snapshot = serde_json::from_slice(&bytes).map_err(|_| "invalid user policy checkpoint")?;
+    Ok(PolicyCache {
+        effects: validate_snapshot(&snapshot)?,
+        ready: true,
+    })
+}
+
+fn install_snapshot(service: &Service, snapshot: &UserTrafficSnapshot) -> Result<(), String> {
+    let effects = validate_snapshot(snapshot)?;
+    let mut policies = service
+        .policies
         .lock()
-        .map_err(|_| "user budget checkpoint lock")?;
-    if limited == known.contains(source) {
-        return Ok(());
+        .map_err(|_| "user policy cache lock")?;
+    let managed: BTreeSet<_> = effects
+        .iter()
+        .filter_map(|(source, effect)| {
+            (!matches!(effect, UserTrafficEffect::Unlimited { managed: false }))
+                .then_some(source.clone())
+        })
+        .collect();
+    // Persist the full policy before publishing it. A restart must never turn a confirmed cap
+    // into an unlimited source, even if the Console is unreachable or the old marker is stale.
+    for (path, bytes) in [
+        (
+            policy_path(&service.options.state_dir),
+            serde_json::to_vec(snapshot),
+        ),
+        (
+            known_path(&service.options.state_dir),
+            serde_json::to_vec(&managed),
+        ),
+    ] {
+        let bytes = bytes.map_err(|_| "user policy checkpoint encoding")?;
+        if !crate::fsutil::read_bounded(&path, MAX_SOURCES * 1024)
+            .is_ok_and(|old| old.as_deref() == Some(bytes.as_slice()))
+        {
+            crate::fsutil::atomic_write_private(&path, &bytes)?;
+        }
     }
-    if limited && known.len() >= MAX_SOURCES {
-        return Err("user budget checkpoint capacity reached".into());
+    if !policies.ready || effects != policies.effects {
+        let mut control = service
+            .control
+            .lock()
+            .map_err(|_| "user policy control lock")?;
+        let mut next = control.clone();
+        next.generation = next
+            .generation
+            .checked_add(1)
+            .ok_or("user policy generation exhausted")?;
+        crate::fsutil::atomic_write_private(
+            &control_path(&service.options.state_dir),
+            &serde_json::to_vec(&next).map_err(|_| "user policy control encoding")?,
+        )?;
+        service.generation.store(next.generation, Ordering::Release);
+        *control = next;
+        policies.effects = effects;
+        policies.ready = true;
     }
-    let mut updated = known.clone();
-    if limited {
-        updated.insert(source.into());
-    } else {
-        updated.remove(source);
-    }
-    crate::fsutil::atomic_write_private(
-        &known_path(&service.options.state_dir),
-        &serde_json::to_vec(&updated).map_err(|_| "user budget checkpoint encoding")?,
-    )?;
-    *known = updated;
     Ok(())
 }
+
 fn required_path(dir: &Path) -> PathBuf {
     dir.join("user-traffic-required.json")
 }
@@ -175,7 +236,14 @@ pub(crate) fn required_at_start(dir: &Path) -> bool {
             .unwrap_or(true),
         Err(_) => true,
     };
-    required || known
+    let policies = match load_policies(dir) {
+        Ok(cache) => cache
+            .effects
+            .values()
+            .any(|effect| !matches!(effect, UserTrafficEffect::Unlimited { managed: false })),
+        Err(_) => true,
+    };
+    required || known || policies
 }
 pub(crate) fn verify_executable(dir: &Path, program: &Path) -> Result<(), String> {
     if !required_at_start(dir) {
@@ -203,17 +271,15 @@ fn assigned(service: &Service, source: &str) -> Result<Option<Admission>, String
         .policies
         .lock()
         .map_err(|_| "user policy cache lock")?;
-    if policies
-        .updated
-        .is_none_or(|at| at.elapsed() >= Duration::from_millis(BUDGET_TTL_MS))
-    {
-        return Ok(None);
+    if !policies.ready {
+        return Err("user traffic policy not synchronized".into());
     }
     Ok(match policies.effects.get(source) {
         Some(UserTrafficEffect::Unlimited { managed: true }) => Some(Admission::Open),
         Some(UserTrafficEffect::Unlimited { managed: false }) => Some(Admission::Pass),
         Some(UserTrafficEffect::Suspended) => Some(Admission::Suspended),
-        _ => None,
+        Some(UserTrafficEffect::Limited { .. }) => None,
+        None => Some(Admission::Pass),
     })
 }
 fn synchronize(service: &Service) -> Result<(), String> {
@@ -222,9 +288,17 @@ fn synchronize(service: &Service) -> Result<(), String> {
         "/agent/v1/user-traffic/policies",
         &service.options.token,
         None,
-        Duration::from_secs(2),
+        Duration::from_secs(15),
     )?;
     if response.status == 404 {
+        if required_at_start(&service.options.state_dir) {
+            return Err("old Console cannot release a previously limited user".into());
+        }
+        service
+            .policies
+            .lock()
+            .map_err(|_| "user policy cache lock")?
+            .ready = true;
         return Ok(());
     }
     if response.status != 200 {
@@ -235,86 +309,7 @@ fn synchronize(service: &Service) -> Result<(), String> {
     }
     let snapshot: UserTrafficSnapshot =
         serde_json::from_str(&response.body).map_err(|_| "invalid user policy assignments")?;
-    if snapshot.sha256.len() != 64 || !snapshot.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("invalid user policy snapshot identity".into());
-    }
-    let rows = snapshot.sources;
-    if rows.len() > MAX_SOURCES {
-        return Err("user policy assignments exceed capacity".into());
-    }
-    let mut effects = BTreeMap::new();
-    let mut groups = BTreeMap::new();
-    let mut grouped_effects = BTreeMap::new();
-    for row in rows {
-        if row.revision == 0
-            || matches!(row.effect,UserTrafficEffect::Limited{rate_bps} if !(1000..=1_000_000_000_000).contains(&rate_bps))
-        {
-            return Err("invalid user policy assignment".into());
-        }
-        if let Some(key) = row.budget_key {
-            if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err("invalid user budget group".into());
-            }
-            if grouped_effects
-                .insert(key.clone(), row.effect.clone())
-                .is_some_and(|effect| effect != row.effect)
-            {
-                return Err("inconsistent user budget group".into());
-            }
-            groups.insert(row.source.clone(), key);
-        }
-        if row.source.len() > 512 || effects.insert(row.source, row.effect).is_some() {
-            return Err("invalid or duplicate user policy source".into());
-        }
-    }
-    let mut policies = service
-        .policies
-        .lock()
-        .map_err(|_| "user policy cache lock")?;
-    // Persist the managed-source requirement before publishing it to live Xray generations.
-    // A crash or failed control-file write must not permit an incompatible binary at restart.
-    let managed: BTreeSet<String> = effects
-        .iter()
-        .filter_map(|(source, effect)| {
-            (!matches!(effect, UserTrafficEffect::Unlimited { managed: false }))
-                .then_some(source.clone())
-        })
-        .collect();
-    let mut known = service
-        .known
-        .lock()
-        .map_err(|_| "user budget checkpoint lock")?;
-    if *known != managed || service.unknown_checkpoint.load(Ordering::Acquire) {
-        crate::fsutil::atomic_write_private(
-            &known_path(&service.options.state_dir),
-            &serde_json::to_vec(&managed).map_err(|_| "user budget checkpoint encoding")?,
-        )?;
-        *known = managed;
-        service.unknown_checkpoint.store(false, Ordering::Release);
-    }
-    if effects != policies.effects || groups != policies.groups {
-        let mut control = service
-            .control
-            .lock()
-            .map_err(|_| "user budget control lock")?;
-        let mut next = control.clone();
-        next.generation = next
-            .generation
-            .checked_add(1)
-            .ok_or("user policy generation exhausted")?;
-        // Publish the durable generation first. A client which observes it waits behind this cache lock.
-        crate::fsutil::atomic_write_private(
-            &control_path(&service.options.state_dir),
-            &serde_json::to_vec(&next).map_err(|_| "user policy control encoding")?,
-        )?;
-        service.generation.store(next.generation, Ordering::Release);
-        *control = next;
-        policies.effects = effects;
-        policies.groups = groups;
-    }
-    policies.updated = Some(Instant::now());
-    drop(known);
-    drop(policies);
+    install_snapshot(service, &snapshot)?;
     let body =
         serde_json::to_string(&snapshot.sha256).map_err(|_| "invalid user policy receipt")?;
     let receipt = HttpClient::new(&service.options.server)?.request_timeout(
@@ -322,7 +317,7 @@ fn synchronize(service: &Service) -> Result<(), String> {
         "/agent/v1/user-traffic/policies/ack",
         &service.options.token,
         Some(&body),
-        Duration::from_secs(2),
+        Duration::from_secs(15),
     )?;
     if receipt.status != 204 {
         return Err(format!("user policy receipt HTTP {}", receipt.status));
@@ -388,46 +383,6 @@ fn progress(stream: &mut TcpStream, last: &mut Instant) -> Result<(), String> {
     }
     Ok(())
 }
-async fn fetch(
-    service: &Service,
-    request: &UserBudgetRequest,
-    client: &reqwest::Client,
-    deadline: Instant,
-) -> Result<UserBudgetGrant, String> {
-    let source = request.source.as_str();
-    let body = serde_json::to_string(&request).map_err(|_| "user budget encoding")?;
-    let response = HttpClient::new(&service.options.server)?
-        .post_json(
-            client,
-            "/agent/v1/user-traffic/budget",
-            &service.options.token,
-            body,
-            deadline,
-            4096,
-        )
-        .await?;
-    if response.status == 404 {
-        let known = service
-            .known
-            .lock()
-            .map_err(|_| "user budget checkpoint lock")?;
-        if service.unknown_checkpoint.load(Ordering::Acquire)
-            || known.contains(source)
-            || required_at_start(&service.options.state_dir)
-        {
-            return Err("old Console cannot release a previously limited user".into());
-        }
-        return Ok(UserBudgetGrant::Unlimited {
-            valid_ms: BUDGET_TTL_MS,
-            managed: false,
-        });
-    }
-    if response.status != 200 {
-        return Err(format!("user budget returned HTTP {}", response.status));
-    }
-    serde_json::from_str(&response.body).map_err(|_| "invalid user budget response".into())
-}
-
 pub(crate) fn spawn(options: Options) -> Result<(), String> {
     if let Err(error) = initialize(&options) {
         eprintln!("user traffic initialization: {error}");
@@ -447,8 +402,7 @@ pub(crate) fn spawn(options: Options) -> Result<(), String> {
                 } else {
                     let _ = initialize(&policy_options);
                 }
-                // These assignments expire with the two-second admission lease. A persistent
-                // socket does not extend that lease; keep refreshing even without a change.
+                // Refresh policy changes independently; forwarding keeps the last durable policy.
                 wake.wait(Duration::from_secs(1));
             }
         })

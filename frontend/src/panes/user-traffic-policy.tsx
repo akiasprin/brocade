@@ -287,7 +287,7 @@ function PolicyEditor({
             {!baseSupported
               ? '请升级 Console，以支持常态限速。'
               : baseValid
-                ? '立即限速，上下行跨机器合计；留空表示不限。'
+                ? '每个接入点独立限速；留空表示不限。'
                 : '速度需在 1 Kbps–1 Tbps 之间，精确到 1 bps。'}
           </small>
         </InlineField>

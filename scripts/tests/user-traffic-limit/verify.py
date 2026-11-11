@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check completed real-process evidence, including warm tails and aggregate throughput."""
+"""Check completed real-process evidence, including local ingress limits and control-plane independence."""
 import argparse
 import hashlib
 import json
@@ -14,7 +14,7 @@ def verify(root):
     expected = ['unlimited_shared_1ms', 'limited_single_1ms', 'limited_shared_1ms',
                 'limited_four_nodes_1ms', 'limited_shared_no_sleep', 'limited_shared_rtt80',
                 'mixed_bulk_small', 'isolated_user_app', 'full_single_tcp', 'full_four_tcp',
-                'full_four_udp', 'outage_recovery', 'hot_policy_existing_connections', 'unlimited_after']
+                'full_four_udp', 'full_same_node_four_tcp', 'budget_latency_2300ms', 'policy_latency_2300ms', 'outage_recovery', 'hot_policy_existing_connections', 'unlimited_after']
     checks = {'all_expected_cases_present': set(expected) == set(cases)}
     inputs = json.loads((root / 'inputs.json').read_text())
     for name in ('agent', 'console', 'xray'):
@@ -25,23 +25,21 @@ def verify(root):
         if row is None:
             continue
         checks[name + '_nonempty'] = row['count'] >= 10
-        if name not in ('outage_recovery', 'hot_policy_existing_connections'):
+        if name != 'hot_policy_existing_connections':
             checks[name + '_no_errors'] = row['errors'] == 0
     for name in ['unlimited_shared_1ms', 'limited_single_1ms', 'limited_shared_1ms',
                  'limited_four_nodes_1ms', 'limited_shared_no_sleep', 'unlimited_after']:
         row = cases[name]
         checks[name + '_warm_tail_under100ms'] = row['warm']['max_ms'] is not None and row['warm']['max_ms'] < 100
-    checks['rtt80_prefetch_warm_tail_under200ms'] = cases['limited_shared_rtt80']['warm']['max_ms'] < 200
+    checks['rtt80_local_warm_tail_under200ms'] = cases['limited_shared_rtt80']['warm']['max_ms'] < 200
     checks['small_request_fairness_under_bulk_load'] = cases['mixed_bulk_small']['warm_per_stream']['5']['max_ms'] < 100
-    checks['small_flow_control_plane_request_rate_bounded'] = all(
-        cases[name]['budget_requests'] / cases[name]['elapsed_s'] / len(cases[name]['nodes']) < 5
-        for name in ('limited_single_1ms', 'limited_shared_1ms', 'limited_four_nodes_1ms', 'limited_shared_no_sleep', 'limited_shared_rtt80'))
+    checks['no_remote_budget_requests'] = all(row['budget_requests'] == 0 for row in cases.values())
     for worker in ('8', '9'):
         checks['independent_worker_' + worker] = cases['isolated_user_app']['warm_per_stream'][worker]['max_ms'] < 100
-    for name in ('full_single_tcp', 'full_four_tcp', 'full_four_udp'):
+    for name in ('full_single_tcp', 'full_same_node_four_tcp', 'full_four_tcp', 'full_four_udp', 'budget_latency_2300ms', 'policy_latency_2300ms'):
         row = cases[name]
-        ratio = row['actual_payload_bps'] / row['rate_bps']
-        checks[name + '_aggregate_ceiling_and_utilization'] = .8 <= ratio <= 1.15
+        ratio = row['actual_payload_bps'] / (row['rate_bps'] * len(row['nodes']))
+        checks[name + '_independent_ingress_ceiling_and_utilization'] = .8 <= ratio <= 1.15
     events = [json.loads(line) for line in (results / 'events.jsonl').read_text().splitlines()]
     samples = []
     for line in (results / 'samples.jsonl').open():
@@ -51,10 +49,10 @@ def verify(root):
     down = next(e for e in events if e['kind'] == 'outage_start')
     up = next(e for e in events if e['kind'] == 'outage_end')
     completed_ns = lambda r: r['mono_ns'] + int(r['latency_ms'] * 1_000_000)
-    checks['outage_fails_closed_after_lease_expiry'] = not any(
+    checks['outage_keeps_local_policy_and_forwarding'] = any(
         r['ok'] and down['mono_ns']+2_500_000_000 < completed_ns(r) < up['mono_ns']
         for r in samples if r['case'] == 'outage_recovery')
-    checks['outage_has_observed_rejections'] = cases['outage_recovery']['errors'] > 0
+    checks['outage_has_no_rejections'] = cases['outage_recovery']['errors'] == 0
     checks['outage_recovers'] = any(r['ok'] and r['mono_ns'] > up['mono_ns']+1_000_000_000
                                   for r in samples if r['case'] == 'outage_recovery')
     paused = next(e for e in events if e['kind'] == 'policy_change' and not e['available'])
@@ -70,7 +68,7 @@ def verify(root):
         finish = end['mono_ns']
         payload = sum(r['bytes'] * 16 for r in hot if r['ok'] and r['mono_ns'] >= start and completed_ns(r) < finish)
         return payload / ((finish - start) / 1_000_000_000)
-    checks['hot_rate_change_applied_to_existing_connections'] = .6e6 <= phase_bps(changes[0], changes[1]) <= 1.15e6
+    checks['hot_rate_change_applied_to_existing_connections'] = .6e6*len(cases['hot_policy_existing_connections']['nodes']) <= phase_bps(changes[0], changes[1]) <= 1.15e6*len(cases['hot_policy_existing_connections']['nodes'])
     checks['hot_limit_removal_restores_throughput'] = phase_bps(changes[1], changes[2]) > 10e6
     names = json.loads((root / 'names.json').read_text())
     checks['containers_removed'] = all(subprocess.run(['docker', 'inspect', names[k]], capture_output=True).returncode != 0

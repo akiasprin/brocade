@@ -165,7 +165,7 @@ def guest():
                     agent.wait()
     candidate = next(r for r in reports if r['version'] == 'candidate')
     checks = dict(all_users_sampled=len(candidate['users'])==users and all(r['warm_count']>=100 for r in candidate['users']),
-                  no_errors=candidate['errors']==0, warm_tail_under200ms=candidate['warm_max_ms']<200,
+                  no_errors=candidate['errors']==0, no_remote_budget_requests=candidate['budget_requests']==0, warm_tail_under200ms=candidate['warm_max_ms']<200,
                   no_half_second_stalls=candidate['over500ms']==0)
     (root/'report.json').write_text(json.dumps(dict(config=config, runs=reports, checks=checks, passed=all(checks.values())), indent=2))
 

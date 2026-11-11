@@ -23,88 +23,62 @@ fn free_port() -> u16 {
         .unwrap()
         .port()
 }
-fn write_reply(stream: &mut TcpStream, status: u16, grant: &UserBudgetGrant) {
-    let body = serde_json::to_vec(grant).unwrap();
-    write!(stream,"HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
-    stream.write_all(&body).unwrap();
-}
 fn console(mode: Arc<AtomicU8>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let budgets = Arc::new(Mutex::new(BTreeMap::<String, Instant>::new()));
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
             let mode = Arc::clone(&mode);
-            let budgets = Arc::clone(&budgets);
             thread::spawn(move || {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let mut length = 0;
-                loop {
-                    line.clear();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        length = value.trim().parse::<usize>().unwrap();
-                    }
-                }
-                assert!(length < 4096);
-                let mut body = vec![0; length];
-                reader.read_exact(&mut body).unwrap();
-                let request: UserBudgetRequest = serde_json::from_slice(&body).unwrap();
+                let (headers, _) = crate::http::tests::read_request(&mut stream);
                 let phase = mode.load(Ordering::SeqCst);
+                assert!(
+                    !headers.contains("/budget"),
+                    "local limiting must never fetch remote credits"
+                );
                 if phase == 4 {
-                    write_reply(&mut stream, 404, &UserBudgetGrant::Retry { after_ms: 100 });
-                    return;
-                }
-                let grant = if phase == 0
-                    || phase == 3
-                    || (phase == 5 && request.source.contains("#other"))
-                {
-                    UserBudgetGrant::Unlimited {
-                        valid_ms: BUDGET_TTL_MS,
-                        managed: phase != 3,
-                    }
-                } else if phase == 2 {
-                    UserBudgetGrant::Suspended {
-                        valid_ms: BUDGET_TTL_MS,
-                    }
+                    stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else if headers.starts_with("post ") {
+                    stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                 } else {
-                    let key = if request.source.starts_with("fwd:") {
-                        "forwarding".to_owned()
-                    } else {
-                        format!(
-                            "access:{}:{}",
-                            request.source.split('@').next().unwrap(),
-                            if request.source.contains("#other") {
-                                "other-app"
-                            } else {
-                                "main-app"
+                    let mut sources = Vec::new();
+                    if phase != 3 {
+                        for node in 0..2 {
+                            for user in ["alice", "bob"] {
+                                for ingress in [format!("in{node}"), format!("other{node}")] {
+                                    let effect = if phase == 0
+                                        || (phase == 5 && ingress.starts_with("other"))
+                                    {
+                                        UserTrafficEffect::Unlimited { managed: true }
+                                    } else if phase == 2 {
+                                        UserTrafficEffect::Suspended
+                                    } else {
+                                        UserTrafficEffect::Limited { rate_bps: 800_000 }
+                                    };
+                                    sources.push(UserTrafficAssignment {
+                                        source: format!("{user}@platform#{ingress}"),
+                                        budget_key: Some("a".repeat(64)),
+                                        effect,
+                                        revision: u64::from(phase) + 1,
+                                    });
+                                }
                             }
-                        )
-                    };
-                    let mut clocks = budgets.lock().unwrap();
-                    let next = clocks.entry(key).or_insert_with(Instant::now);
-                    let now = Instant::now();
-                    if *next > now {
-                        UserBudgetGrant::Retry {
-                            after_ms: next.duration_since(now).as_millis().clamp(1, 1000) as u64,
-                        }
-                    } else {
-                        let bytes = request.bytes.min(100_000);
-                        *next = now + Duration::from_secs_f64(bytes as f64 / 100_000.0);
-                        UserBudgetGrant::Limited {
-                            bytes,
-                            rate_bps: 800_000,
-                            valid_ms: BUDGET_TTL_MS,
                         }
                     }
-                };
-                write_reply(&mut stream, 200, &grant);
+                    let body = serde_json::to_vec(&UserTrafficSnapshot {
+                        sources,
+                        sha256: format!("{phase:064x}"),
+                    })
+                    .unwrap();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&body).unwrap();
+                }
             });
         }
     });
@@ -128,9 +102,6 @@ pub(super) fn test_service(
         },
         token: token.clone(),
         entries: Mutex::new(BTreeMap::new()),
-        fetcher: start_fetchers().unwrap(),
-        known: Mutex::new(BTreeSet::new()),
-        unknown_checkpoint: AtomicBool::new(false),
         clients: AtomicUsize::new(0),
         control: Mutex::new(Control {
             endpoint: address.to_string(),
@@ -138,11 +109,7 @@ pub(super) fn test_service(
             generation: 0,
         }),
         generation: AtomicU64::new(0),
-        policies: Mutex::new(PolicyCache {
-            effects: BTreeMap::new(),
-            groups: BTreeMap::new(),
-            updated: None,
-        }),
+        policies: Mutex::new(load_policies(dir).unwrap()),
     })
 }
 fn local_service(dir: &Path, server: &str, node: usize) -> std::net::SocketAddr {
@@ -150,6 +117,14 @@ fn local_service(dir: &Path, server: &str, node: usize) -> std::net::SocketAddr 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let service = test_service(dir, server, node, address);
+    synchronize(&service).unwrap();
+    let synchronizing = Arc::clone(&service);
+    thread::spawn(move || {
+        while synchronizing.options.state_dir.exists() {
+            let _ = synchronize(&synchronizing);
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
     let token = service.token.clone();
     crate::fsutil::atomic_write_private(
         &control_path(dir),
@@ -214,7 +189,7 @@ fn tcp_roundtrip(mut stream: TcpStream, bytes: usize, vless: bool) {
 }
 #[test]
 #[ignore = "requires an explicitly built BROCADE_XRAY_BIN"]
-fn user_global_native_tcp_udp_forwarding_and_existing_sessions_share_budget() {
+fn user_local_native_tcp_udp_forwarding_and_existing_sessions_use_independent_ingress_limits() {
     let binary =
         std::env::var_os("BROCADE_XRAY_BIN").expect("explicit BROCADE_XRAY_BIN is required");
     let root = std::env::temp_dir().join(format!(
@@ -391,8 +366,8 @@ fn user_global_native_tcp_udp_forwarding_and_existing_sessions_share_budget() {
     });
     let tcp_elapsed = now.elapsed();
     assert!(
-        tcp_elapsed >= Duration::from_millis(1800),
-        "two nodes each received a complete speed allowance: {tcp_elapsed:?}"
+        (Duration::from_millis(1100)..Duration::from_millis(1800)).contains(&tcp_elapsed),
+        "two ingresses must each receive the complete 800 Kbps allowance: {tcp_elapsed:?}"
     );
     let now = Instant::now();
     thread::scope(|scope| {
@@ -408,11 +383,11 @@ fn user_global_native_tcp_udp_forwarding_and_existing_sessions_share_budget() {
     });
     let anytls_elapsed = now.elapsed();
     assert!(
-        anytls_elapsed >= Duration::from_millis(1800),
-        "AnyTLS bypassed the shared user budget: {anytls_elapsed:?}"
+        (Duration::from_millis(1100)..Duration::from_millis(1800)).contains(&anytls_elapsed),
+        "AnyTLS must obey each independent ingress cap: {anytls_elapsed:?}"
     );
     eprintln!(
-        "two-node AnyTLS TCP exact payload 262144 bytes, shared 800 Kbps budget: {anytls_elapsed:?}"
+        "two-node AnyTLS TCP exact payload 262144 bytes, independent 800 Kbps limits: {anytls_elapsed:?}"
     );
     // The same UUID in another app must not inherit this app's exhausted state.
     mode.store(5, Ordering::SeqCst);
@@ -455,8 +430,8 @@ fn user_global_native_tcp_udp_forwarding_and_existing_sessions_share_budget() {
         }
     });
     assert!(
-        now.elapsed() >= Duration::from_millis(1800),
-        "forwarding bypassed the shared user budget"
+        now.elapsed() < Duration::from_secs(2),
+        "forwarding incorrectly inherited an access ingress limit"
     );
     // UDP on the existing VLESS protocol is charged in both directions without breaking datagrams.
     let now = Instant::now();
@@ -486,14 +461,12 @@ fn user_global_native_tcp_udp_forwarding_and_existing_sessions_share_budget() {
     drop(stream);
     mode.store(4, Ordering::SeqCst);
     thread::sleep(Duration::from_millis(BUDGET_TTL_MS + 50));
-    let mut stream = connect_vless(ports[0], target, false);
-    stream.write_all(b"blocked").unwrap();
-    let mut response = [0u8; 9];
+    let now = Instant::now();
+    tcp_roundtrip(connect_vless(ports[0], target, false), 32768, true);
     assert!(
-        stream.read_exact(&mut response).is_err(),
-        "old Console released a previously limited user"
+        now.elapsed() >= Duration::from_millis(500),
+        "Console outage must retain the last local limit"
     );
-    drop(stream);
     mode.store(0, Ordering::SeqCst);
     thread::sleep(Duration::from_millis(BUDGET_TTL_MS + 50));
     let now = Instant::now();
@@ -634,48 +607,44 @@ fn user_global_requirement_survives_corrupt_and_missing_checkpoints() {
 }
 
 #[test]
-fn user_global_sources_share_only_console_confirmed_user_app_pools() {
+fn user_local_pools_are_per_authenticated_ingress_even_with_legacy_shared_keys() {
     let dir = std::env::temp_dir().join(format!("brocade-user-pools-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
     let address = "127.0.0.1:9".parse().unwrap();
     let service = test_service(&dir, "http://127.0.0.1:9", 0, address);
-    {
-        let mut policies = service.policies.lock().unwrap();
-        policies.updated = Some(Instant::now());
-        for source in ["alice@tenant#one", "alice@tenant#two"] {
-            policies.groups.insert(source.into(), "a".repeat(64));
-            policies.effects.insert(
-                source.into(),
-                UserTrafficEffect::Limited {
-                    rate_bps: 100_000_000,
-                },
-            );
-        }
-        policies
-            .groups
-            .insert("alice@tenant#other-app".into(), "b".repeat(64));
-        policies
-            .groups
-            .insert("bob@tenant#one".into(), "c".repeat(64));
-    }
-    let one = source_entry(&service, "alice@tenant#one").unwrap();
+    let sources = [
+        "alice@tenant#one",
+        "alice@tenant#two",
+        "alice@tenant#other-app",
+        "bob@tenant#one",
+    ];
+    install_snapshot(
+        &service,
+        &UserTrafficSnapshot {
+            sources: sources
+                .iter()
+                .map(|source| UserTrafficAssignment {
+                    source: (*source).into(),
+                    budget_key: Some("a".repeat(64)),
+                    effect: UserTrafficEffect::Limited {
+                        rate_bps: 100_000_000,
+                    },
+                    revision: 1,
+                })
+                .collect(),
+            sha256: "a".repeat(64),
+        },
+    )
+    .unwrap();
+    let one = source_entry(&service, sources[0]).unwrap();
     assert!(Arc::ptr_eq(
         &one,
-        &source_entry(&service, "alice@tenant#two").unwrap()
+        &source_entry(&service, sources[0]).unwrap()
     ));
-    assert!(!Arc::ptr_eq(
-        &one,
-        &source_entry(&service, "alice@tenant#other-app").unwrap()
-    ));
-    assert!(!Arc::ptr_eq(
-        &one,
-        &source_entry(&service, "bob@tenant#one").unwrap()
-    ));
-    service.policies.lock().unwrap().updated =
-        Some(Instant::now() - Duration::from_millis(BUDGET_TTL_MS));
-    assert!(!Arc::ptr_eq(
-        &one,
-        &source_entry(&service, "alice@tenant#one").unwrap()
-    ));
+    for source in &sources[1..] {
+        assert!(!Arc::ptr_eq(&one, &source_entry(&service, source).unwrap()));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -761,5 +730,160 @@ fn user_global_policy_sync_switches_existing_sources_and_acknowledges_each_snaps
     assert!(!required_at_start(&dir));
     assert_eq!(service.generation.load(Ordering::Acquire), 4);
     worker.join().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn local_snapshot(source: &str, effect: UserTrafficEffect) -> UserTrafficSnapshot {
+    UserTrafficSnapshot {
+        sources: vec![UserTrafficAssignment {
+            source: source.into(),
+            budget_key: Some("a".repeat(64)),
+            effect,
+            revision: 1,
+        }],
+        sha256: "a".repeat(64),
+    }
+}
+
+fn admission_stream() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    (listener.accept().unwrap().0, client)
+}
+
+#[test]
+fn user_local_policy_survives_offline_restart_and_corrupt_checkpoint_requires_recovery() {
+    let dir = std::env::temp_dir().join(format!("brocade-local-durable-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let address = "127.0.0.1:9".parse().unwrap();
+    let service = test_service(&dir, "http://127.0.0.1:9", 0, address);
+    let source = "alice@tenant#entry";
+    assert!(
+        assigned(&service, source).is_err(),
+        "an unknown initial policy must not bypass a cap"
+    );
+    let snapshot = local_snapshot(source, UserTrafficEffect::Limited { rate_bps: 100_000 });
+    install_snapshot(&service, &snapshot).unwrap();
+    let restarted = test_service(&dir, "http://127.0.0.1:9", 0, address);
+    assert!(synchronize(&restarted).is_err());
+    assert!(assigned(&restarted, source).unwrap().is_none());
+    let pool = source_entry(&restarted, source).unwrap();
+    let (mut stream, _client) = admission_stream();
+    let started = Instant::now();
+    assert!(matches!(
+        admit(&restarted, source, 1000, &pool, &mut stream).unwrap(),
+        Admission::Allowed
+    ));
+    assert!(
+        started.elapsed() >= Duration::from_millis(60),
+        "restart must preserve local pacing"
+    );
+    std::fs::write(policy_path(&dir), b"broken").unwrap();
+    std::fs::write(known_path(&dir), b"[]").unwrap();
+    assert!(load_policies(&dir).is_err());
+    assert!(required_at_start(&dir));
+    // A failed refresh and corrupt disk must not clear the live, confirmed cap.
+    assert!(assigned(&restarted, source).unwrap().is_none());
+    install_snapshot(&restarted, &snapshot).unwrap();
+    assert!(load_policies(&dir).unwrap().ready);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn user_local_connections_share_one_entry_and_bulk_waiters_allow_small_requests() {
+    let dir = std::env::temp_dir().join(format!("brocade-local-fair-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let address = "127.0.0.1:9".parse().unwrap();
+    let service = test_service(&dir, "http://127.0.0.1:9", 0, address);
+    let source = "alice@tenant#entry";
+    install_snapshot(
+        &service,
+        &local_snapshot(source, UserTrafficEffect::Limited { rate_bps: 160_000 }),
+    )
+    .unwrap();
+    let pool = source_entry(&service, source).unwrap();
+    let started = Instant::now();
+    thread::scope(|scope| {
+        for _ in 0..2 {
+            let service = &service;
+            let pool = &pool;
+            scope.spawn(move || {
+                let (mut stream, _client) = admission_stream();
+                assert!(matches!(
+                    admit(service, source, 8000, pool, &mut stream).unwrap(),
+                    Admission::Allowed
+                ));
+            });
+        }
+    });
+    assert!(
+        started.elapsed() >= Duration::from_millis(700),
+        "connections on one entry must share its cap"
+    );
+    install_snapshot(
+        &service,
+        &local_snapshot(source, UserTrafficEffect::Limited { rate_bps: 800_000 }),
+    )
+    .unwrap();
+    thread::scope(|scope| {
+        let bulk = scope.spawn(|| {
+            let (mut stream, _client) = admission_stream();
+            admit(&service, source, 16384, &pool, &mut stream).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while pool.state.lock().unwrap().waiters.is_empty() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let (mut stream, _client) = admission_stream();
+        let started = Instant::now();
+        admit(&service, source, 16, &pool, &mut stream).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "bulk admission must yield to a small request"
+        );
+        bulk.join().unwrap();
+    });
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn user_local_policy_change_interrupts_waiters_without_resetting_unchanged_clocks() {
+    let dir = std::env::temp_dir().join(format!("brocade-local-changes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let address = "127.0.0.1:9".parse().unwrap();
+    let service = test_service(&dir, "http://127.0.0.1:9", 0, address);
+    let source = "alice@tenant#entry";
+    let snapshot = local_snapshot(source, UserTrafficEffect::Limited { rate_bps: 1000 });
+    install_snapshot(&service, &snapshot).unwrap();
+    let generation = service.generation.load(Ordering::Acquire);
+    install_snapshot(&service, &snapshot).unwrap();
+    assert_eq!(service.generation.load(Ordering::Acquire), generation);
+    let pool = source_entry(&service, source).unwrap();
+    thread::scope(|scope| {
+        let waiting = scope.spawn(|| {
+            let (mut stream, _client) = admission_stream();
+            admit(&service, source, 16384, &pool, &mut stream).unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while pool.state.lock().unwrap().waiters.is_empty() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        install_snapshot(
+            &service,
+            &local_snapshot(source, UserTrafficEffect::Suspended),
+        )
+        .unwrap();
+        assert!(matches!(waiting.join().unwrap(), Admission::Suspended));
+    });
+    assert!(pool.state.lock().unwrap().waiters.is_empty());
+    let mut invalid = snapshot;
+    invalid.sources[0].effect = UserTrafficEffect::Limited { rate_bps: 0 };
+    assert!(install_snapshot(&service, &invalid).is_err());
+    assert!(matches!(
+        assigned(&service, source).unwrap(),
+        Some(Admission::Suspended)
+    ));
     std::fs::remove_dir_all(dir).unwrap();
 }

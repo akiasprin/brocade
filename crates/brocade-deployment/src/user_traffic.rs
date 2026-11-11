@@ -176,7 +176,7 @@ pub enum UserTrafficEffect {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserTrafficAssignment {
     pub source: String,
-    /// Console-derived user/app identity. Older peers omit/ignore it; never supplied by Xray.
+    /// Legacy shared-budget key for older Agents; local ingress limiters ignore it. Never supplied by Xray.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_key: Option<String>,
     pub effect: UserTrafficEffect,

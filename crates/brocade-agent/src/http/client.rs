@@ -120,13 +120,6 @@ fn build_with_proxy(
         .map_err(|error| diagnostic::category(&error))
 }
 
-pub(super) fn asynchronous_control(maximum_idle: usize) -> Result<reqwest::Client, String> {
-    configured_builder(TrafficClass::Control, None, tls_config()?, None)?
-        .pool_max_idle_per_host(maximum_idle)
-        .build()
-        .map_err(|error| diagnostic::category(&error))
-}
-
 fn configured_builder(
     class: TrafficClass,
     family: Option<AddressFamily>,

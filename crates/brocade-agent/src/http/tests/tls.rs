@@ -36,8 +36,8 @@ fn serve_request(conn: &mut ServerConnection, tcp: &mut TcpStream) -> bool {
     }
 }
 
-#[tokio::test]
-async fn asynchronous_control_uses_authenticated_tls_and_protocol_headers() {
+#[test]
+fn control_posts_use_authenticated_tls_and_protocol_headers() {
     crate::identity::self_identity();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let origin = format!("https://{}", listener.local_addr().unwrap());
@@ -66,18 +66,15 @@ async fn asynchronous_control_uses_authenticated_tls_and_protocol_headers() {
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
             .unwrap();
     });
-    let client = asynchronous::control_client(4).unwrap();
     let response = HttpClient::new(&origin)
         .unwrap()
-        .post_json(
-            &client,
-            "/budget",
+        .request_timeout(
+            "POST",
+            "/policy",
             "synthetic-tls-budget",
-            "{}".into(),
-            Instant::now() + Duration::from_secs(2),
-            4096,
+            Some("{}"),
+            Duration::from_secs(2),
         )
-        .await
         .unwrap();
     assert_eq!(response.body, "{}");
     server.join().unwrap();

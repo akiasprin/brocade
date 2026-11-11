@@ -202,6 +202,7 @@ def guest():
     record_lock = threading.Lock()
     current_case = ['setup']
     budget_delay = [0]
+    policy_delay = [0]
     offline = [False]
     try:
         private = json.loads((ROOT / 'private.json').read_text())
@@ -235,6 +236,8 @@ def guest():
                 started = time.monotonic_ns()
                 if self.path == '/agent/v1/user-traffic/budget':
                     time.sleep(budget_delay[0])
+                elif self.path.startswith('/agent/v1/user-traffic/policies'):
+                    time.sleep(policy_delay[0])
                 if offline[0] and self.path.startswith('/agent/v1/user-traffic/'):
                     self.send_response(503);self.send_header('Content-Length','0');self.end_headers();return
                 c = http.client.HTTPConnection('127.0.0.1',18080,timeout=10)
@@ -294,14 +297,16 @@ def guest():
         event('services_ready')
         summaries=[]
 
-        def run_case(name,rate,nodes,seconds=20,period=.001,reconnect=False,stagger=0,payload=16,delay=0,outage=False,udp=False,hot=False):
+        def run_case(name,rate,nodes,seconds=20,period=.001,reconnect=False,stagger=0,payload=16,delay=0,outage=False,udp=False,hot=False,policy_latency=0):
             current_case[0]=name
+            policy_delay[0]=0
             budget_delay[0]=delay
             (RESULTS/'policy-ack').unlink(missing_ok=True)
             temp=RESULTS/'policy-request.tmp';temp.write_text(json.dumps(dict(case=name,rate=rate)));temp.replace(RESULTS/'policy-request.json')
             while not (RESULTS/'policy-ack').exists():time.sleep(.05)
             time.sleep(2.3)
-            case_start=event('case_start',case=name,rate_bps=rate,nodes=nodes,seconds=seconds,period_s=period,reconnect=reconnect,payload_bytes=payload)
+            policy_delay[0]=policy_latency
+            case_start=event('case_start',case=name,rate_bps=rate,nodes=nodes,seconds=seconds,period_s=period,reconnect=reconnect,payload_bytes=payload,budget_delay_ms=delay*1000,policy_delay_ms=policy_latency*1000)
             (RESULTS/'status.json').write_text(json.dumps(dict(case=name,at=now())))
             phase_threads=[]
             def faults():
@@ -380,8 +385,11 @@ def guest():
         run_case('mixed_bulk_small',100_000_000,[1,5],20,period={1:0,5:.001},payload={1:16384,5:16})
         run_case('isolated_user_app',1000,[1,8,9],12)
         run_case('full_single_tcp',10_000_000,[1],20,period=0,payload=16384)
+        run_case('full_same_node_four_tcp',10_000_000,[1,5,6,7],12,period=0,payload=16384)
         run_case('full_four_tcp',10_000_000,[1,2,3,4],20,period=0,payload=16384)
         run_case('full_four_udp',1_000_000,[1,2,3,4],20,period=0,payload=1024,udp=True)
+        run_case('budget_latency_2300ms',10_000_000,[1],12,period=0,payload=16384,delay=2.3)
+        run_case('policy_latency_2300ms',10_000_000,[1],12,period=0,payload=16384,policy_latency=2.3)
         run_case('outage_recovery',100_000_000,[1,5,6,7],12,period=.01,outage=True)
         run_case('hot_policy_existing_connections',100_000_000,[1,5],16,period=0,payload=4096,hot=True)
         run_case('unlimited_after',None,[1,5,6,7],8)
