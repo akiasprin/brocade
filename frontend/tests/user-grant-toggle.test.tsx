@@ -214,9 +214,11 @@ describe('grant toggles', () => {
     await act(async () => {
       await client.refetchQueries({ queryKey: ['snapshot'] });
     });
+    // Query completion can precede React's batched observer notification.
+    const error = await view.findByText('暂时读取失败');
     expect(cards()).toHaveLength(2);
     expect(cards()[0].disabled).toBe(true);
-    expect(view.getByText('暂时读取失败').closest('.user-grant-notice')).toBe(notice.closest('.user-grant-notice'));
+    expect(error.closest('.user-grant-notice')).toBe(notice.closest('.user-grant-notice'));
     read.mockImplementation(async () => Response.json(snapshot(2, ['in-b'])));
     fireEvent.click(view.getByRole('button', { name: '重试读取授权' }));
     await waitFor(() => expect(cards()[0].disabled).toBe(false));
