@@ -19,6 +19,7 @@ for (const width of [1440, 390, 320])
         await page.evaluate(() => document.fonts.ready);
         if (scene === 'hosts') {
           await expect(page.locator('.cvm-host-card')).toHaveCount(4);
+          await expect(page.getByRole('button', { name: '移除宿主', exact: true })).toHaveCount(4);
           const header = await page.locator('.cvm-page-head').boundingBox();
           const first = await page.locator('.cvm-host-card').first().boundingBox();
           expect(first!.y).toBeGreaterThanOrEqual(header!.y + header!.height);
@@ -26,7 +27,10 @@ for (const width of [1440, 390, 320])
           await expect(page.getByRole('status').filter({ hasText: '执行能力不可用' })).toHaveCount(1);
           for (const card of await page.locator('.cvm-host-card').all())
             expect(await card.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(false);
-        } else await expect(page.getByText('尚无宿主', { exact: true })).toBeVisible();
+        } else {
+          await expect(page.getByText('尚无宿主', { exact: true })).toBeVisible();
+          await expect(page.getByRole('button', { name: '移除宿主', exact: true })).toHaveCount(0);
+        }
         expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
         await expect(page).toHaveScreenshot(`hosts-${scene}-${width}-${theme}.png`, { fullPage: true });
         await hosts.focus();
