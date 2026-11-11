@@ -6,6 +6,7 @@ import {
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
+  type RefObject,
 } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { QRCodeSVG } from 'qrcode.react';
@@ -26,6 +27,7 @@ import {
   startUserGrantProbe,
   type ArtifactFamily,
   type ArtifactProtocol,
+  type ClashHaitunSubscriptionInfo,
   type ClashSubscriptionInfo,
   type GrantProbeItemStatus,
   type GrantProbeJob,
@@ -34,7 +36,8 @@ import {
 } from '../api';
 import { GRANT_REFRESH_MS, GRANT_REFRESH_WINDOW_MS, useGrantEdits } from '../grant-edits';
 import { ErrorBox, Loading, SegmentedControl } from '../ui/bits';
-import { CopyButton, copyStateIcon } from '../ui/copy-button';
+import { ChoiceSelect } from '../ui/choice-menu';
+import { CopyButton, copyStateIcon, type CopyState } from '../ui/copy-button';
 import { DialogClose, DialogLayer } from '../ui/dialog';
 import { bytes } from '../ui/format';
 import { Icon, type IconName } from '../ui/icons';
@@ -61,6 +64,10 @@ const PROTOCOL_PICKS: { value: ProtocolPick; label: string }[] = [
 
 const NODE_PROTOCOL_PICKS = [...PROTOCOL_PICKS, { value: 'mtproto' as const, label: 'MTProxy' }];
 
+/* 卡券菜单里只给需要解释的取值写一行说明：「全部」「双栈」各包含什么。 */
+const PROTOCOL_DETAIL: Partial<Record<ProtocolPick, string>> = { both: 'VLESS · AnyTLS · Hysteria 2' };
+const FAMILY_DETAIL: Partial<Record<FamilyPick, string>> = { both: 'IPv4 · IPv6' };
+
 const TABS: { value: SubscriptionKind; label: string; icon: IconName }[] = [
   { value: 'clash', label: '订阅', icon: 'subscription' },
   { value: 'uri', label: '节点', icon: 'client' },
@@ -73,10 +80,11 @@ interface TabPanelProps {
   'aria-labelledby': string;
 }
 
-/* 订阅与节点共用一个弹窗：标题栏切换「订阅 / 节点」，协议与地址族筛选两个页签共用。
+/* 订阅与节点共用一个弹窗：标题栏切换「订阅 / 节点」，协议与地址族的取值两个页签共用。
  * 两边的内容都由服务端按筛选条件生成：订阅是带 family / protocol 参数的地址，节点是同一条件下的
  * uri.txt。浏览器只把 uri.txt 解析成列表用于展示，不自行过滤条目。「节点」页签并入人工网络拨测。
- * 窄屏（与 useNarrow 同一断点）弹窗贴底成为面板，筛选换成一行两个下拉。 */
+ * 筛选的画法各随页签：订阅是卡券上的两个栏位，节点是正文上方一行分段（窄屏换成两个下拉）。
+ * 窄屏（与 useNarrow 同一断点）弹窗贴底成为面板。 */
 export function SubscriptionViewer({
   tenant,
   user,
@@ -108,15 +116,6 @@ export function SubscriptionViewer({
     if (next === 'clash' && protocol === 'mtproto') setProtocol('both');
     setTab(next);
   };
-  const filters = (
-    <SubscriptionFilters
-      protocol={protocol}
-      family={family}
-      includeMtproto={tab === 'uri'}
-      onProtocol={setProtocol}
-      onFamily={setFamily}
-    />
-  );
 
   // 与机器详情页签相同：左右方向键、Home / End 在两个页签之间移动并切换。
   const moveTab = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
@@ -163,7 +162,9 @@ export function SubscriptionViewer({
             <Icon of="close" size={14} />
           </DialogClose>
         </header>
-        {tab === 'uri' && filters}
+        {tab === 'uri' && (
+          <SubscriptionFilters protocol={protocol} family={family} onProtocol={setProtocol} onFamily={setFamily} />
+        )}
         {tab === 'clash' ? (
           <ClashSubscription
             tenant={tenant}
@@ -171,8 +172,9 @@ export function SubscriptionViewer({
             selfService={selfService}
             protocol={protocol}
             family={family}
+            onProtocol={setProtocol}
+            onFamily={setFamily}
             panel={panel}
-            filters={filters}
           />
         ) : (
           <NodeLinks
@@ -193,21 +195,20 @@ export function SubscriptionViewer({
   );
 }
 
+/* 节点页签的筛选行；MTProxy 只能以节点链接分享，只在这里出现。 */
 function SubscriptionFilters({
   protocol,
   family,
-  includeMtproto,
   onProtocol,
   onFamily,
 }: {
   protocol: ProtocolPick;
   family: FamilyPick;
-  includeMtproto: boolean;
   onProtocol: (value: ProtocolPick) => void;
   onFamily: (value: FamilyPick) => void;
 }) {
   const narrow = useNarrow();
-  const protocolPicks = includeMtproto ? NODE_PROTOCOL_PICKS : PROTOCOL_PICKS;
+  const protocolPicks = NODE_PROTOCOL_PICKS;
   return (
     <div className="sub-dialog-filter">
       {narrow ? (
@@ -279,7 +280,23 @@ function FilterPick<T extends string>({
 }
 
 /* ── 订阅 ──
- * 扫码优先；二维码、文本复制与下载共用服务端返回的筛选后地址。 */
+ * 订阅画成一张卡券：卡头是名称与重置时间，大字是剩余流量，协议与地址族是卡上的两个栏位，撕线下是二维码与
+ * 遮罩后的地址。二维码一律白底黑码：反色码不是每个扫码器都认，暗色主题下也不反。管理员的 koipy 测速订阅是
+ * 叠在后面的同版式第二张卡，点露出的卡头换到前面；两张卡共用筛选，地址都取服务端返回的筛选后 URL。 */
+
+type PassCard = 'clash' | 'haitun';
+
+const HAITUN_STATUS: Record<ClashHaitunSubscriptionInfo['status'], string> = {
+  active: '可用',
+  revoked: '已撤销',
+  'not-created': '尚未生成',
+};
+
+const CREDENTIAL_NOTE = '订阅地址与二维码包含访问凭据，请勿公开分享；内容按当前授权实时生成。';
+const HAITUN_NOTE =
+  '测速订阅包含用户 UUID 等真实节点凭据，持有地址的人无需登录即可获取并使用节点，请仅交给可信测速服务。' +
+  '撤销仅停止测速地址的后续拉取，不会自动生成新地址，不影响普通订阅，也不会使已下载的节点配置失效。' +
+  '若凭据泄露，需撤销测速地址、更换用户 UUID 并发布授权，待节点生效后旧凭据才失效。';
 
 function ClashSubscription({
   tenant,
@@ -287,18 +304,23 @@ function ClashSubscription({
   selfService,
   protocol,
   family,
+  onProtocol,
+  onFamily,
   panel,
-  filters,
 }: {
   tenant: string;
   user: string;
   selfService: boolean;
   protocol: ProtocolPick;
   family: FamilyPick;
+  onProtocol: (value: ProtocolPick) => void;
+  onFamily: (value: FamilyPick) => void;
   panel: TabPanelProps;
-  filters: ReactNode;
 }) {
   const qrRef = useRef<SVGSVGElement>(null);
+  const [front, setFront] = useState<PassCard>('clash');
+  // 换过卡之后新卡才播滑入动效；首次打开时弹窗自己已有进场动效。
+  const [swapped, setSwapped] = useState(false);
   const qc = useQueryClient();
   const queryKey = ['clash-subscription', tenant, user, selfService ? 'self' : 'admin'] as const;
   // 地址本身是访问凭据：只在打开「订阅」页签时读取，不随用户列表下发。
@@ -333,207 +355,388 @@ function ClashSubscription({
   const value = subscription.data;
   const standardUrl = withSubscriptionProtocol(value.urls[family], protocol);
   const haitun = selfService ? null : value.haitun;
-  const haitunUrls = haitun?.status === 'active' ? haitun.urls : null;
-  const haitunUrl = haitunUrls ? withSubscriptionProtocol(haitunUrls[family], protocol) : '';
+  const haitunUrl =
+    haitun?.status === 'active' && haitun.urls ? withSubscriptionProtocol(haitun.urls[family], protocol) : null;
   const actionError = issueHaitun.error ?? revokeHaitun.error;
   const haitunPending = issueHaitun.isPending || revokeHaitun.isPending;
-
-  return (
+  const back: PassCard = front === 'clash' ? 'haitun' : 'clash';
+  const fields = <PassFields protocol={protocol} family={family} onProtocol={onProtocol} onFamily={onFamily} />;
+  const copyContent = (state: CopyState, label: string) => (
     <>
-      <div className="sub-dialog-body sub-subscription-body" {...panel}>
-        <section className="sub-subscription" aria-label="Clash 订阅">
-          <h2 className="sub-subscription-title">扫码添加订阅</h2>
-          <p className="sub-subscription-caption" title={`模板 ${value.template}`}>
-            Clash · Mihomo / Clash Meta
-          </p>
-          <figure className="sub-qr">
-            <QRCodeSVG
-              ref={qrRef}
-              value={standardUrl}
-              size={216}
-              level="M"
-              marginSize={4}
-              bgColor="#fff"
-              fgColor="#101112"
-              title="Clash 订阅地址二维码"
-            />
-          </figure>
-          {filters}
-          <SubscriptionUrl
-            key={standardUrl}
-            url={standardUrl}
-            name="Clash 订阅地址"
-            primary
-            onDownload={() => {
-              if (qrRef.current) downloadSubscriptionQr(qrRef.current);
-            }}
-          />
-          <dl className="sub-readings">
-            <div>
-              <dt>剩余流量</dt>
-              <dd className={value.remaining_bytes === 0 ? 'bad' : undefined}>
-                {value.remaining_bytes === null ? '不限量' : bytes(value.remaining_bytes)}
-              </dd>
-            </div>
-            <div>
-              <dt>重置时间</dt>
-              <dd title="按 UTC+8 计">{formatResetAt(value.reset_at)}</dd>
-            </div>
-          </dl>
-        </section>
-        {haitun && (
-          <details className="sub-haitun">
-            <summary>
-              <Icon of="observe" size={14} />
-              <b>koipy 测速订阅</b>
-              <span className="sub-admin-badge">仅管理员</span>
-              <Icon of="chevronDown" size={13} />
-            </summary>
-            <section className="sub-item" aria-label="koipy 测速订阅">
-              <div className="sub-item-head">
-                <div className="sub-item-title">
-                  <div className="sub-item-name">
-                    <b>测速地址</b>
-                    <span className={`sub-live${haitunUrls ? ' ok' : haitun.status === 'revoked' ? ' warn' : ''}`}>
-                      {haitunUrls ? '可用' : haitun.status === 'revoked' ? '已撤销' : '尚未生成'}
-                    </span>
-                  </div>
-                </div>
-                {haitunUrls ? (
-                  <button
-                    type="button"
-                    className="btn sub-item-action"
-                    aria-label="撤销 koipy 测速地址"
-                    disabled={haitunPending}
-                    onClick={() => {
-                      if (
-                        !window.confirm(
-                          '撤销后，旧测速地址将无法继续拉取，不会自动生成新地址。但已下载的 UUID 和节点配置仍然有效；此操作不更换 UUID，也不发布授权。确定撤销？',
-                        )
-                      )
-                        return;
-                      issueHaitun.reset();
-                      revokeHaitun.mutate();
-                    }}
-                  >
-                    {revokeHaitun.isPending ? '撤销中…' : '撤销'}
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="btn sub-item-action"
-                    aria-label={haitun.status === 'revoked' ? '重新生成 koipy 测速地址' : '生成 koipy 测速地址'}
-                    disabled={haitunPending}
-                    onClick={() => {
-                      revokeHaitun.reset();
-                      issueHaitun.mutate();
-                    }}
-                  >
-                    {issueHaitun.isPending ? '生成中…' : haitun.status === 'revoked' ? '重新生成' : '生成'}
-                  </button>
-                )}
-              </div>
-              <div className="sub-item-body">
-                {haitunUrls && <SubscriptionUrl key={haitunUrl} url={haitunUrl} name="koipy 测速地址" />}
-                <p className="sub-item-note">
-                  风险提示：测速订阅包含用户 UUID
-                  等真实节点凭据，持有地址的人无需登录即可获取并使用节点，请仅交给可信测速服务。
-                  撤销仅停止测速地址的后续拉取，不会自动生成新地址，不影响普通订阅，也不会使已下载的节点配置失效。
-                  若凭据泄露，需撤销测速地址、更换用户 UUID 并发布授权，待节点生效后旧凭据才失效。
-                </p>
-                {actionError && <ErrorBox error={actionError} />}
-              </div>
-            </section>
-          </details>
-        )}
-      </div>
-      <footer className="sub-dialog-foot">
-        <span>订阅与二维码包含访问凭据，请勿公开分享</span>
-        <span>按当前授权实时生成</span>
-      </footer>
+      <Icon of={copyStateIcon(state)} size={14} />
+      {label}
     </>
   );
-}
 
-/* 二维码与复制地址共用筛选后的 URL，文本地址在筛选变化后重新遮罩。 */
-function SubscriptionUrl({
-  url,
-  name,
-  primary = false,
-  onDownload,
-}: {
-  url: string;
-  name: string;
-  primary?: boolean;
-  onDownload?: () => void;
-}) {
-  const [revealed, setRevealed] = useState(false);
-  const masked = revealed ? null : maskSubscriptionUrl(url);
-  const address = (
-    <code title={revealed ? url : undefined}>
-      {masked ? (
+  return (
+    <div className="sub-dialog-body sub-subscription-body" {...panel}>
+      <div className={`sub-pass-stack${haitun ? ' has-back' : ''}${swapped ? ' swapped' : ''}`}>
+        {haitun && (
+          // 后面那张卡只露出卡头：名称和一个读数，点一下换到前面。
+          <button
+            type="button"
+            className="sub-pass-peek"
+            aria-label={
+              back === 'haitun' ? `切换到 koipy 测速订阅（${HAITUN_STATUS[haitun.status]}）` : '切换到 Clash 订阅'
+            }
+            onClick={() => {
+              setFront(back);
+              setSwapped(true);
+            }}
+          >
+            <PassLogo card={back} small />
+            <b>{back === 'haitun' ? 'koipy 测速订阅' : 'Clash 订阅'}</b>
+            <span className="sub-pass-peek-end">
+              {back === 'haitun' ? (
+                <span className="sub-pass-status" data-status={haitun.status}>
+                  {HAITUN_STATUS[haitun.status]}
+                </span>
+              ) : (
+                `剩余 ${remainingText(value.remaining_bytes)}`
+              )}
+            </span>
+          </button>
+        )}
+        {haitun && front === 'haitun' ? (
+          <HaitunPass haitun={haitun} url={haitunUrl} fields={fields} />
+        ) : (
+          <ClashPass value={value} url={standardUrl} qrRef={qrRef} fields={fields} />
+        )}
+      </div>
+      {haitun && front === 'haitun' ? (
         <>
-          {masked.head}
-          <span className="sub-url-mask">{TOKEN_MASK}</span>
-          {masked.tail}
+          <div className="sub-pass-actions">
+            {haitunUrl ? (
+              <>
+                <CopyButton className="btn primary sub-pass-main" text={haitunUrl} label="复制测速地址">
+                  {copyContent}
+                </CopyButton>
+                <RevokeButton
+                  pending={revokeHaitun.isPending}
+                  disabled={haitunPending}
+                  onRevoke={() => {
+                    issueHaitun.reset();
+                    revokeHaitun.mutate();
+                  }}
+                />
+              </>
+            ) : (
+              <button
+                type="button"
+                className="btn primary sub-pass-main"
+                disabled={haitunPending}
+                onClick={() => {
+                  revokeHaitun.reset();
+                  issueHaitun.mutate();
+                }}
+              >
+                {issueHaitun.isPending ? '生成中…' : haitun.status === 'revoked' ? '重新生成测速地址' : '生成测速地址'}
+              </button>
+            )}
+          </div>
+          {actionError && <ErrorBox error={actionError} />}
         </>
       ) : (
-        url
+        <div className="sub-pass-actions">
+          <CopyButton className="btn primary sub-pass-main" text={standardUrl} label="复制订阅地址">
+            {copyContent}
+          </CopyButton>
+          <button
+            type="button"
+            className="btn sub-pass-side"
+            aria-label="下载二维码"
+            title="下载二维码"
+            onClick={() => {
+              if (qrRef.current) downloadSubscriptionQr(qrRef.current);
+            }}
+          >
+            <Icon of="download" size={14} />
+            下载
+          </button>
+        </div>
       )}
-    </code>
-  );
-  const reveal = (
-    <button
-      type="button"
-      className={primary ? 'sub-text-action sub-url-reveal' : 'sub-url-reveal'}
-      aria-label={`${revealed ? '隐藏' : '显示'} ${name}`}
-      aria-pressed={revealed}
-      onClick={() => setRevealed(current => !current)}
-    >
-      {revealed ? '隐藏' : '显示'}
-    </button>
-  );
-  const copy = (
-    <CopyButton
-      className={primary ? 'btn primary sub-subscription-copy' : 'sub-url-copy'}
-      text={url}
-      label={primary ? '复制订阅地址' : '复制'}
-    >
-      {(state, label) => (
-        <>
-          <Icon of={copyStateIcon(state)} size={13} />
-          {label}
-        </>
-      )}
-    </CopyButton>
-  );
-  if (!primary)
-    return (
-      <div className="sub-url">
-        {address}
-        {reveal}
-        {copy}
-      </div>
-    );
-  return (
-    <div className="sub-subscription-url">
-      <div className="sub-subscription-label">
-        <span>订阅地址</span>
-        {reveal}
-      </div>
-      <div className="sub-url">{address}</div>
-      <div className="sub-subscription-actions">
-        {copy}
-        <button type="button" className="btn" onClick={onDownload}>
-          <Icon of="download" size={14} />
-          下载二维码
-        </button>
-      </div>
     </div>
   );
 }
 
-/** Export resolved colors so the downloaded SVG matches the current theme without external CSS. */
+const remainingText = (remaining: number | null) => (remaining === null ? '不限量' : bytes(remaining));
+
+function PassLogo({ card, small = false }: { card: PassCard; small?: boolean }) {
+  return (
+    <span className={`sub-pass-logo${card === 'haitun' ? ' haitun' : ''}${small ? ' small' : ''}`} aria-hidden="true">
+      <Icon of={card === 'haitun' ? 'observe' : 'subscription'} size={small ? 11 : 15} />
+    </span>
+  );
+}
+
+/* 卡头名称后的 (!)：与「计量口径」同一画法，点开是卡头下方一段暗色小字。 */
+function usePassNote(label: string, text: string) {
+  const [open, setOpen] = useState(false);
+  const id = useId();
+  return {
+    button: (
+      <button
+        type="button"
+        className="sub-pass-info"
+        aria-label={`${label}说明`}
+        aria-expanded={open}
+        aria-controls={id}
+        onClick={() => setOpen(shown => !shown)}
+      >
+        <Icon of="info" size={13} />
+      </button>
+    ),
+    note: (
+      <p id={id} className="sub-pass-note" hidden={!open}>
+        {text}
+      </p>
+    ),
+  };
+}
+
+function ClashPass({
+  value,
+  url,
+  qrRef,
+  fields,
+}: {
+  value: ClashSubscriptionInfo;
+  url: string;
+  qrRef: RefObject<SVGSVGElement | null>;
+  fields: ReactNode;
+}) {
+  const note = usePassNote('订阅凭据', CREDENTIAL_NOTE);
+  const [amount, unit] = remainingText(value.remaining_bytes).split(' ');
+  const expires = formatDay(value.expires_at);
+  return (
+    <section className="sub-pass" aria-label="Clash 订阅">
+      <div className="sub-pass-top">
+        <header className="sub-pass-head">
+          <PassLogo card="clash" />
+          <span className="sub-pass-name">
+            <b>
+              Clash 订阅
+              {note.button}
+            </b>
+            <small title={`模板 ${value.template}`}>Mihomo / Clash Meta</small>
+          </span>
+          <span className="sub-pass-field end">
+            <small>重置</small>
+            <b title="按 UTC+8 计">{formatResetAt(value.reset_at)}</b>
+          </span>
+        </header>
+        {note.note}
+        <div className="sub-pass-primary">
+          <small>剩余流量</small>
+          <b className={value.remaining_bytes === 0 ? 'bad' : undefined}>
+            {amount}
+            {unit && <span>{unit}</span>}
+          </b>
+        </div>
+        <div className="sub-pass-fields">
+          {fields}
+          {expires && (
+            <span className="sub-pass-field">
+              <small>到期</small>
+              <b>{expires}</b>
+            </span>
+          )}
+        </div>
+      </div>
+      <div className="sub-pass-code">
+        <figure className="sub-qr">
+          <QRCodeSVG
+            ref={qrRef}
+            value={url}
+            size={216}
+            level="M"
+            marginSize={4}
+            bgColor="#fff"
+            fgColor="#101112"
+            title="Clash 订阅地址二维码"
+          />
+        </figure>
+        <PassAddress key={url} url={url} name="Clash 订阅地址" />
+      </div>
+    </section>
+  );
+}
+
+/* 测速订阅卡与订阅卡同一版式：大字是状态，没有地址时条码区留一个同尺寸的空框，换卡时弹窗不跳。 */
+function HaitunPass({
+  haitun,
+  url,
+  fields,
+}: {
+  haitun: ClashHaitunSubscriptionInfo;
+  url: string | null;
+  fields: ReactNode;
+}) {
+  const note = usePassNote('测速订阅', HAITUN_NOTE);
+  const revoked = haitun.status === 'revoked';
+  const date = formatDay(revoked ? haitun.revoked_at : haitun.created_at);
+  return (
+    <section className="sub-pass" aria-label="koipy 测速订阅">
+      <div className="sub-pass-top">
+        <header className="sub-pass-head">
+          <PassLogo card="haitun" />
+          <span className="sub-pass-name">
+            <b>
+              koipy 测速订阅
+              {note.button}
+            </b>
+            <small>仅管理员可见</small>
+          </span>
+          {date && (
+            <span className="sub-pass-field end">
+              <small>{revoked ? '撤销于' : '生成于'}</small>
+              <b>{date}</b>
+            </span>
+          )}
+        </header>
+        {note.note}
+        <div className="sub-pass-primary">
+          <small>状态</small>
+          <b className="sub-pass-status" data-status={haitun.status}>
+            {HAITUN_STATUS[haitun.status]}
+          </b>
+        </div>
+        <div className="sub-pass-fields">{fields}</div>
+      </div>
+      <div className="sub-pass-code">
+        {url ? (
+          <>
+            <figure className="sub-qr">
+              <QRCodeSVG
+                value={url}
+                size={216}
+                level="M"
+                marginSize={4}
+                bgColor="#fff"
+                fgColor="#101112"
+                title="koipy 测速地址二维码"
+              />
+            </figure>
+            <PassAddress key={url} url={url} name="koipy 测速地址" />
+          </>
+        ) : (
+          <div className="sub-pass-empty">暂无地址</div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+/* 协议与地址族是卡上的两个栏位：小字标签由样式取 data-label，取值后是弹出标记，点开是共用的首版菜单。 */
+function PassFields({
+  protocol,
+  family,
+  onProtocol,
+  onFamily,
+}: {
+  protocol: ProtocolPick;
+  family: FamilyPick;
+  onProtocol: (value: ProtocolPick) => void;
+  onFamily: (value: FamilyPick) => void;
+}) {
+  return (
+    <>
+      <ChoiceSelect
+        className="sub-pass-pick"
+        aria-label="协议"
+        data-label="协议"
+        menuAlign="below"
+        value={protocol}
+        onChange={event => {
+          const next = PROTOCOL_PICKS.find(pick => pick.value === event.target.value);
+          if (next) onProtocol(next.value);
+        }}
+      >
+        {PROTOCOL_PICKS.map(pick => (
+          <option key={pick.value} value={pick.value} data-detail={PROTOCOL_DETAIL[pick.value]}>
+            {pick.label}
+          </option>
+        ))}
+      </ChoiceSelect>
+      <ChoiceSelect
+        className="sub-pass-pick"
+        aria-label="地址族"
+        data-label="地址族"
+        menuAlign="below"
+        value={family}
+        onChange={event => {
+          const next = FAMILY_PICKS.find(pick => pick.value === event.target.value);
+          if (next) onFamily(next.value);
+        }}
+      >
+        {FAMILY_PICKS.map(pick => (
+          <option key={pick.value} value={pick.value} data-detail={FAMILY_DETAIL[pick.value]}>
+            {pick.label}
+          </option>
+        ))}
+      </ChoiceSelect>
+    </>
+  );
+}
+
+/* 条码下方一行：只露主机名与 Token 末四位，点一下显示完整地址。调用方以地址作 key，筛选一变就重新遮罩。 */
+function PassAddress({ url, name }: { url: string; name: string }) {
+  const [revealed, setRevealed] = useState(false);
+  const masked = revealed ? null : maskSubscriptionUrl(url);
+  return (
+    <button
+      type="button"
+      className="sub-pass-address"
+      aria-pressed={revealed}
+      aria-label={`${revealed ? '隐藏' : '显示'} ${name}`}
+      onClick={() => setRevealed(shown => !shown)}
+    >
+      <code>
+        {masked ? (
+          <>
+            {masked.head}
+            <span className="sub-url-mask">{TOKEN_MASK}</span>
+            {masked.tail}
+          </>
+        ) : (
+          url
+        )}
+      </code>
+      <Icon of={revealed ? 'eyeOff' : 'eye'} size={13} />
+    </button>
+  );
+}
+
+/* 撤销就地两步确认：第一次点击变成「确认撤销」，再点才执行；焦点移开或 5 秒内不确认就复原。 */
+function RevokeButton({ pending, disabled, onRevoke }: { pending: boolean; disabled: boolean; onRevoke: () => void }) {
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    if (!armed) return;
+    const timer = window.setTimeout(() => setArmed(false), 5_000);
+    return () => window.clearTimeout(timer);
+  }, [armed]);
+  return (
+    <button
+      type="button"
+      className={`btn danger sub-pass-side sub-pass-revoke${armed ? ' armed' : ''}`}
+      aria-label={pending ? undefined : armed ? '确认撤销测速地址' : '撤销测速地址'}
+      disabled={disabled}
+      onBlur={() => setArmed(false)}
+      onClick={() => {
+        if (!armed) {
+          setArmed(true);
+          return;
+        }
+        setArmed(false);
+        onRevoke();
+      }}
+    >
+      {pending ? '撤销中…' : armed ? '确认撤销' : '撤销'}
+    </button>
+  );
+}
+
+/** Export resolved colors so the downloaded SVG is self-contained, without external CSS. */
 function downloadSubscriptionQr(svg: SVGSVGElement) {
   const image = svg.cloneNode(true) as SVGSVGElement;
   const paths = svg.querySelectorAll('path');
@@ -1383,15 +1586,18 @@ export function groupNodeLinks(links: NodeLink[]): NodeGroup[] {
   return groups;
 }
 
-const TOKEN_MASK = '••••••••-••••-••••-••••-••••••••';
+const TOKEN_MASK = '••••';
 
-/* 订阅地址里的 Token 换成与 UUID 同形的圆点，只留末四位。地址不是预期形状时原样返回 null。 */
+/* 订阅地址在一行里只露主机名与 Token 末四位：路径收成「…/」，Token 换成四个圆点，clash.yaml 与筛选参数原样保留。
+ * 地址不是预期形状时返回 null，原样显示。 */
 function maskSubscriptionUrl(url: string): { head: string; tail: string } | null {
-  const match = /(\/sub\/v1\/(?:haitun\/)?)([^/]+)(\/clash\.yaml)/.exec(url);
+  const match = /\/sub\/v1\/(?:haitun\/)?([^/?#]+)(\/clash\.yaml.*)$/.exec(url);
   if (!match) return null;
-  const start = match.index + match[1].length;
-  const end = start + match[2].length;
-  return { head: url.slice(0, start), tail: `${match[2].slice(-4)}${url.slice(end)}` };
+  try {
+    return { head: `${new URL(url).host}/…/`, tail: `${match[1].slice(-4)}${match[2]}` };
+  } catch {
+    return null;
+  }
 }
 
 function withSubscriptionProtocol(url: string, protocol: ProtocolPick): string {
@@ -1413,4 +1619,25 @@ function formatResetAt(value: string): string {
     minute: '2-digit',
     hour12: false,
   }).format(date)}`;
+}
+
+/* 日期按 UTC+8 显示，跨年时带年份。测速链接的时间是 PostgreSQL 的 timestamptz::text
+ * （「2026-08-28 12:00:00.123456+00」）：Safari 不认空格分隔、六位小数与两位时区，先规整成 ISO 8601。 */
+function formatDay(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const iso = value
+    .trim()
+    .replace(' ', 'T')
+    .replace(/(\.\d{3})\d+/, '$1')
+    .replace(/([+-]\d{2})$/, '$1:00');
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  const yearOf = (at: Date) =>
+    new Intl.DateTimeFormat('en', { timeZone: 'Asia/Hong_Kong', year: 'numeric' }).format(at);
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Hong_Kong',
+    ...(yearOf(date) === yearOf(new Date()) ? {} : { year: 'numeric' as const }),
+    month: 'numeric',
+    day: 'numeric',
+  }).format(date);
 }

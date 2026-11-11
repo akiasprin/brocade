@@ -74,17 +74,20 @@ export function MenuLayer({
   children,
   onClose,
   action = false,
+  align = 'end',
 }: {
   anchor: RefObject<HTMLElement | null>;
   label: string;
   children: ReactNode;
   onClose: () => void;
   action?: boolean;
+  /** 桌面弹出位置：行尾触发器右缘对齐（默认），行首触发器用 `below` 左缘对齐。手机一律从底部升起。 */
+  align?: 'end' | 'below';
 }) {
   const phone = useNarrow();
   return (
     <DialogLayer
-      {...(phone ? { mode: 'drawer' as const } : { mode: 'popover' as const, anchor, align: 'end' as const })}
+      {...(phone ? { mode: 'drawer' as const } : { mode: 'popover' as const, anchor, align })}
       label={label}
       className={`choice-layer${action ? ' action-layer' : ''}`}
       onClose={onClose}
@@ -100,11 +103,13 @@ export function ChoiceSelect({
   value,
   onChange,
   className,
+  menuAlign,
   ...props
 }: Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'onChange' | 'value'> & {
   children: ReactNode;
   value: string | number;
   onChange: (event: { target: { value: string } }) => void;
+  menuAlign?: 'end' | 'below';
 }) {
   const [open, setOpen] = useState(false);
   const anchor = useRef<HTMLButtonElement>(null);
@@ -139,7 +144,7 @@ export function ChoiceSelect({
         </span>
       </button>
       {open && (
-        <MenuLayer anchor={anchor} label={label} onClose={() => setOpen(false)}>
+        <MenuLayer anchor={anchor} label={label} align={menuAlign} onClose={() => setOpen(false)}>
           <div
             id={id}
             className="dialog-surface choice-menu"

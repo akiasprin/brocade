@@ -19,12 +19,14 @@ type DialogMode = 'modal' | 'drawer' | 'popover';
 const POPOVER_MARGIN = 8;
 const POPOVER_GAP = 8;
 
-type PopoverAlign = 'start' | 'end';
+type PopoverAlign = 'start' | 'end' | 'below';
 
 /**
  * `start`: right of the anchor, top-aligned; below it when the right side is too narrow, above when below is too short.
  * `end`: for a trigger at the right end of a row, below it (or above) with the right edges aligned, so the panel
  * stays over the card instead of hanging past its edge.
+ * `below`: for a trigger at the start of a row, below it (or above) with the left edges aligned — the same fallback
+ * `start` uses, without first trying the right side, so a dropdown never opens sideways.
  */
 function popoverPlace(
   anchor: DOMRect,

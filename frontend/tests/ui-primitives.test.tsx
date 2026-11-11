@@ -242,7 +242,7 @@ it('弹层在退出动画前检查未保存保护，拒绝时保持可交互', a
   expect(document.body.querySelector('.dialog-layer')).toBeNull();
 });
 
-function PopoverHarness({ align }: { align?: 'start' | 'end' }) {
+function PopoverHarness({ align }: { align?: 'start' | 'end' | 'below' }) {
   const anchor = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
   return (
@@ -317,6 +317,26 @@ it('行尾的弹层放在锚点下方并与它右缘对齐，下方放不下时�
   box = new DOMRect(40, 700, 100, 24);
   act(() => void window.dispatchEvent(new Event('resize')));
   expect(place()).toEqual(['8px', '492px']);
+});
+
+it('行首的弹层放在锚点下方并与它左缘对齐，不先试右侧，下方放不下时换到上方', () => {
+  vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(300);
+  vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(200);
+  vi.stubGlobal('innerWidth', 1200);
+  vi.stubGlobal('innerHeight', 800);
+  const view = render(<PopoverHarness align="below" />);
+  const opener = view.getByRole('button', { name: '账期' });
+  // 右侧本来放得下，也不放到右侧：面板左缘对齐锚点左缘，放在下方。
+  let box = new DOMRect(100, 100, 100, 24);
+  opener.getBoundingClientRect = () => box;
+  fireEvent.click(opener);
+  const layer = document.body.querySelector<HTMLElement>('.dialog-layer.popover')!;
+  const place = () => [layer.style.getPropertyValue('--popover-left'), layer.style.getPropertyValue('--popover-top')];
+  expect(place()).toEqual(['100px', '132px']);
+  // 锚点靠右下：换到上方，右缘不越过视口留白（1200 - 8 - 300）。
+  box = new DOMRect(1100, 700, 80, 24);
+  act(() => void window.dispatchEvent(new Event('resize')));
+  expect(place()).toEqual(['892px', '492px']);
 });
 
 it('流量和文件大小共用 IEC 单位名称', () => {

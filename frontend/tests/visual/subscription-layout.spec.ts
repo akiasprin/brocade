@@ -79,18 +79,28 @@ async function placed(page: Page, dialog: Locator, bottomSheet = true) {
   await expect(dialog.locator('.sub-dialog-close')).toBeInViewport({ ratio: 1 });
 }
 
-async function compactControls(dialog: Locator) {
+async function compactControls(dialog: Locator, tab: 'clash' | 'uri') {
   const sizes = await dialog
     .locator(
-      '.sub-dialog-tabs button, .sub-dialog-close, .sub-pick, .sub-url > button, .sub-subscription-actions > button, .node-view, .node-copy-all, .node-probe-all, .node-copy',
+      tab === 'clash'
+        ? '.sub-dialog-tabs button, .sub-dialog-close, .sub-pass-actions > .btn'
+        : '.sub-dialog-tabs button, .sub-dialog-close, .sub-pick, .node-view, .node-copy-all, .node-probe-all, .node-copy',
     )
     .evaluateAll(elements => elements.map(element => element.getBoundingClientRect().height));
-  expect(sizes.length).toBeGreaterThan(4);
+  expect(sizes.length).toBeGreaterThan(tab === 'clash' ? 3 : 4);
   for (const height of sizes) expect(height).toBe(36);
+  if (tab === 'clash') return;
   const selectFonts = await dialog
     .locator('.sub-pick select')
     .evaluateAll(elements => elements.map(element => getComputedStyle(element).fontSize));
   expect(selectFonts).toEqual(['16px', '16px']);
+}
+
+// 地址行随筛选参数变长时只截断自己：二维码始终在卡面正中。
+async function qrCentered(dialog: Locator) {
+  const pass = (await dialog.locator('.sub-pass').boundingBox())!;
+  const qr = (await dialog.locator('.sub-qr').boundingBox())!;
+  expect(Math.abs(qr.x + qr.width / 2 - (pass.x + pass.width / 2))).toBeLessThan(1);
 }
 
 async function panelTypography(page: Page, dialog: Locator, tab: 'clash' | 'uri') {
@@ -109,9 +119,9 @@ async function panelTypography(page: Page, dialog: Locator, tab: 'clash' | 'uri'
   expect(await dialog.locator('.sub-dialog-tabs [aria-selected="true"]').evaluate(font)).toEqual(tabs);
   const title = await page.locator('.qta-app').first().evaluate(font);
   if (tab === 'uri') expect(await dialog.locator('.node-group-head > b').first().evaluate(font)).toEqual(title);
-  else expect((await dialog.locator('.sub-subscription-title').evaluate(font)).family).toBe(body.family);
+  else expect((await dialog.locator('.sub-pass-name > b').evaluate(font)).family).toBe(body.family);
   const address = await dialog
-    .locator(tab === 'clash' ? '.sub-url code' : '.node-copy')
+    .locator(tab === 'clash' ? '.sub-pass-address code' : '.node-copy')
     .first()
     .evaluate(font);
   expect(address.family).toContain('monospace');
@@ -154,7 +164,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
           else await expect(dialog.locator('.node-count')).toHaveText('18 个节点');
           await placed(page, dialog);
           expect((await dialog.locator('.sub-dialog').boundingBox())!.height).toBeGreaterThan(loading.height);
-          await compactControls(dialog);
+          await compactControls(dialog, tab);
           await panelTypography(page, dialog, tab);
           if (tab === 'uri' && width >= 390) {
             const copy = (await dialog.locator('.node-copy-all').boundingBox())!;
@@ -254,38 +264,34 @@ for (const engine of ['chromium', 'webkit'] as const) {
     [1440, 900],
     [390, 844],
   ] as const) {
-    test(`Subscription administrator disclosure ${engine} ${width}x${height}`, async ({ page }) => {
+    test(`Subscription administrator second card ${engine} ${width}x${height}`, async ({ page }) => {
       const errors = await preview(page, width, height, 'dark', '&haitun=active');
       await page.getByRole('button', { name: '订阅', exact: true }).click();
       const dialog = page.getByRole('dialog', { name: 'alice 的订阅与节点' });
       await reply(page);
-      const disclosure = dialog.locator('.sub-haitun');
-      await expect(disclosure).not.toHaveAttribute('open');
-      // Scroller edges can round by less than one pixel; the label itself must remain fully visible.
-      await expect(disclosure.locator('summary')).toBeInViewport({ ratio: 0.99 });
-      await expect(disclosure.locator('summary > b')).toBeInViewport({ ratio: 1 });
-      await expect(disclosure.getByRole('button', { name: '撤销 koipy 测速地址' })).toBeHidden();
-      await expect(page).toHaveScreenshot(`subscription-${engine}-admin-${width}-collapsed.png`, SCREENSHOT_OPTIONS);
-      await disclosure.locator('summary').click();
-      await expect(disclosure.getByRole('button', { name: '撤销 koipy 测速地址' })).toBeVisible();
-      await disclosure.evaluate(element =>
-        Promise.all(element.getAnimations({ subtree: true }).map(animation => animation.finished)),
-      );
-      const copy = disclosure.getByRole('button', { name: '复制', exact: true });
-      // Wait for the native details layout before reading its scroller's final height.
-      await copy.scrollIntoViewIfNeeded();
-      // Use a fixed scroll destination: nearest-element scrolling can round differently by one pixel.
-      const body = dialog.locator('.sub-dialog-body');
-      await body.evaluate(element => {
-        element.scrollTop = Math.round(element.scrollHeight - element.clientHeight);
-      });
-      await expect(copy).toBeVisible();
-      const bodyRect = (await body.boundingBox())!;
-      const copyRect = (await copy.boundingBox())!;
-      expect(copyRect.y).toBeGreaterThanOrEqual(bodyRect.y - 1);
-      expect(copyRect.y + copyRect.height).toBeLessThanOrEqual(bodyRect.y + bodyRect.height + 1);
+      // 测速订阅是后面那张卡：只露出卡头，撤销按钮还不在页面上。
+      const peek = dialog.getByRole('button', { name: '切换到 koipy 测速订阅（可用）' });
+      await expect(peek).toBeInViewport();
+      await expect(peek.getByText('koipy 测速订阅', { exact: true })).toBeInViewport({ ratio: 1 });
+      await expect(dialog.getByRole('button', { name: '撤销测速地址' })).toHaveCount(0);
       await placed(page, dialog, width <= 820);
-      await expect(page).toHaveScreenshot(`subscription-${engine}-admin-${width}-expanded.png`, SCREENSHOT_OPTIONS);
+      const before = (await dialog.locator('.sub-dialog').boundingBox())!;
+      await expect(page).toHaveScreenshot(`subscription-${engine}-admin-${width}-clash.png`, SCREENSHOT_OPTIONS);
+      // 卡头露出的部分才可点：从露出的那条上沿点。
+      await peek.click({ position: { x: 40, y: 12 } });
+      await expect(dialog.getByRole('region', { name: 'koipy 测速订阅' })).toBeVisible();
+      await expect(dialog.getByRole('button', { name: '切换到 Clash 订阅' })).toBeVisible();
+      // 两张卡同一版式、同一高度：换卡时弹窗不跳。
+      const after = (await dialog.locator('.sub-dialog').boundingBox())!;
+      expect(Math.abs(after.height - before.height)).toBeLessThan(1);
+      expect(Math.abs(after.y - before.y)).toBeLessThan(1);
+      await qrCentered(dialog);
+      const revoke = dialog.getByRole('button', { name: '撤销测速地址' });
+      await revoke.scrollIntoViewIfNeeded();
+      await expect(revoke).toBeInViewport({ ratio: 1 });
+      await expect(dialog.getByRole('button', { name: '复制测速地址' })).toBeInViewport({ ratio: 1 });
+      await placed(page, dialog, width <= 820);
+      await expect(page).toHaveScreenshot(`subscription-${engine}-admin-${width}-koipy.png`, SCREENSHOT_OPTIONS);
       expect(errors).toEqual([]);
     });
   }
@@ -316,17 +322,21 @@ for (const engine of ['chromium', 'webkit'] as const) {
         SCREENSHOT_OPTIONS,
       );
 
-      const select = async (name: string, value: string, label: string) => {
-        if (width <= 820) await dialog.getByRole('combobox', { name }).selectOption(value);
-        else await dialog.getByRole('button', { name: label, exact: true }).click();
+      // 卡上的两个栏位是共用菜单：桌面贴着栏位弹出，手机从底部升起；选项在弹窗之外的图层里。
+      const select = async (name: string, label: string) => {
+        await dialog.getByRole('combobox', { name }).click();
+        await page.getByRole('option', { name: label, exact: true }).click();
+        await expect(page.getByRole('listbox', { name })).toHaveCount(0);
         await expect(qr).toBeVisible();
+        await qrCentered(dialog);
       };
-      await select('协议', 'hysteria2', 'Hysteria 2');
+      await qrCentered(dialog);
+      await select('协议', 'Hysteria 2');
       expect(await decodeQr(qr)).toBe(`${url}?protocol=hysteria2`);
-      await select('地址族', 'v6', 'IPv6');
+      await select('地址族', 'IPv6');
       expect(await decodeQr(qr)).toBe(`${url}?family=v6&protocol=hysteria2`);
       if (height < 600) {
-        const actions = dialog.locator('.sub-subscription-actions');
+        const actions = dialog.locator('.sub-pass-actions');
         await actions.scrollIntoViewIfNeeded();
         await expect(actions.getByRole('button', { name: '复制订阅地址' })).toBeInViewport({ ratio: 1 });
         await expect(actions.getByRole('button', { name: '下载二维码' })).toBeInViewport({ ratio: 1 });
@@ -345,19 +355,22 @@ for (const engine of ['chromium', 'webkit'] as const) {
         expect(await decodeImage(page, 'data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64'))).toBe(
           `${url}?family=v6&protocol=hysteria2`,
         );
+        // 白底黑码：任何主题都不反色，导出的文件也一样。
         const fills = () => qr.locator('path').evaluateAll(paths => paths.map(path => getComputedStyle(path).fill));
-        const originalColors = await fills();
+        const paper = ['rgb(255, 255, 255)', 'rgb(16, 17, 18)'];
+        expect(await fills()).toEqual(paper);
+        for (const fill of paper) expect(svg).toContain(fill);
         await page.evaluate(() =>
           (window as unknown as { __userPreviewToggleTheme: () => void }).__userPreviewToggleTheme(),
         );
         await expect(page.locator('html')).toHaveAttribute('data-theme', theme === 'dark' ? 'light' : 'dark');
-        await expect.poll(fills).not.toEqual(originalColors);
+        expect(await fills()).toEqual(paper);
         expect(await decodeQr(qr)).toBe(`${url}?family=v6&protocol=hysteria2`);
         const switchedDownloadEvent = page.waitForEvent('download');
         await dialog.getByRole('button', { name: '下载二维码' }).click();
         const switchedSvg = await readFile((await (await switchedDownloadEvent).path())!, 'utf8');
         expect(switchedSvg).not.toContain('var(');
-        for (const fill of await fills()) expect(switchedSvg).toContain(fill);
+        for (const fill of paper) expect(switchedSvg).toContain(fill);
         expect(
           await decodeImage(page, 'data:image/svg+xml;base64,' + Buffer.from(switchedSvg).toString('base64')),
         ).toBe(`${url}?family=v6&protocol=hysteria2`);

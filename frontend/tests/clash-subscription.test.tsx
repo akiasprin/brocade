@@ -106,6 +106,12 @@ const renderViewer = (kind: 'uri' | 'clash', selfService = false) => {
 const stubViewport = (narrow: boolean) =>
   vi.stubGlobal('matchMedia', () => ({ matches: narrow, addEventListener() {}, removeEventListener() {} }));
 
+// 订阅卡上的协议与地址族是共用菜单：点栏位打开，再点选项。菜单在弹窗之外的图层里，从整页查找。
+const pick = async (view: ReturnType<typeof renderViewer>, field: string, option: string) => {
+  fireEvent.click(await view.findByRole('combobox', { name: field }));
+  fireEvent.click(await view.findByRole('option', { name: option }));
+};
+
 beforeEach(() => stubViewport(false));
 
 afterEach(() => {
@@ -175,9 +181,8 @@ describe('node link listing', () => {
 });
 
 describe('subscription and node dialog', () => {
-  it('revokes without replacing the URL, and generates a new one only on a separate action', async () => {
+  it('keeps koipy on a second card, revokes in two steps and generates only on a separate action', async () => {
     const replacementUrl = haitunUrl.replace('f98b74ba', 'a98b74ba');
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
     let generations = 0;
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       if (init?.method === 'POST') {
@@ -197,14 +202,28 @@ describe('subscription and node dialog', () => {
     vi.stubGlobal('fetch', fetchMock);
     const view = renderViewer('clash');
 
-    fireEvent.click(await view.findByText('koipy 测速订阅'));
-    expect(await view.findByText('尚未生成')).toBeTruthy();
-    expect(view.getByText(/风险提示：测速订阅包含用户 UUID/)).toBeTruthy();
-    expect(view.getByText(/更换用户 UUID 并发布授权/)).toBeTruthy();
+    // 测速订阅是后面那张卡：只露出卡头的名称与状态，点一下换到前面。
+    const peek = await view.findByRole('button', { name: '切换到 koipy 测速订阅（尚未生成）' });
     expect(view.getByTitle('模板 SubBoost 标准版')).toBeTruthy();
-    fireEvent.click(view.getByRole('button', { name: '生成 koipy 测速地址' }));
-    await view.findByRole('button', { name: '撤销 koipy 测速地址' });
+    fireEvent.click(peek);
+    expect(view.getByRole('region', { name: 'koipy 测速订阅' })).toBeTruthy();
+    expect(view.queryByRole('region', { name: 'Clash 订阅' })).toBeNull();
+    expect(view.getByText('尚未生成')).toBeTruthy();
+    expect(view.getByText('暂无地址')).toBeTruthy();
+    // 风险说明收在 (!) 里，展开后才显示。
+    const note = view.getByText(/测速订阅包含用户 UUID/);
+    expect(note.hidden).toBe(true);
+    fireEvent.click(view.getByRole('button', { name: '测速订阅说明' }));
+    expect(note.hidden).toBe(false);
+    expect(note.textContent).toMatch(/更换用户 UUID 并发布授权/);
+
+    fireEvent.click(view.getByRole('button', { name: '生成测速地址' }));
+    await view.findByRole('button', { name: '撤销测速地址' });
     expect(view.getByText('可用')).toBeTruthy();
+    // 生成时间是 PostgreSQL 的 timestamptz::text，按 UTC+8 只写日期。
+    expect(view.getByText('生成于')).toBeTruthy();
+    expect(view.getByText(/^(?:2026\/)?8\/28$/)).toBeTruthy();
+    expect(view.getByRole('img', { name: 'koipy 测速地址二维码' })).toBeTruthy();
     expect(view.queryByText(haitunUrl)).toBeNull();
     fireEvent.click(view.getByRole('button', { name: '显示 koipy 测速地址' }));
     expect(view.getByText(haitunUrl)).toBeTruthy();
@@ -213,13 +232,12 @@ describe('subscription and node dialog', () => {
       expect.objectContaining({ method: 'POST' }),
     );
 
-    expect(view.queryByRole('button', { name: '重新生成 koipy 测速地址' })).toBeNull();
-    fireEvent.click(view.getByRole('button', { name: '撤销 koipy 测速地址' }));
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('已下载的 UUID 和节点配置仍然有效'));
+    // 撤销就地两步：第一次只变成「确认撤销」，不发请求。
+    expect(view.queryByRole('button', { name: '重新生成测速地址' })).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: '撤销测速地址' }));
     expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'DELETE')).toBe(false);
     expect(view.getByText(haitunUrl)).toBeTruthy();
-    confirm.mockReturnValue(true);
-    fireEvent.click(view.getByRole('button', { name: '撤销 koipy 测速地址' }));
+    fireEvent.click(view.getByRole('button', { name: '确认撤销测速地址' }));
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
         '/users/platform.acme/alice/clash-subscription/haitun',
@@ -228,17 +246,40 @@ describe('subscription and node dialog', () => {
     );
     await waitFor(() => expect(view.queryByText(haitunUrl)).toBeNull());
     await view.findByText('已撤销');
+    expect(view.getByText('撤销于')).toBeTruthy();
     expect(view.queryByRole('button', { name: '显示 koipy 测速地址' })).toBeNull();
     expect(generations).toBe(1);
-    fireEvent.click(view.getByRole('button', { name: '重新生成 koipy 测速地址' }));
-    await view.findByRole('button', { name: '撤销 koipy 测速地址' });
+    fireEvent.click(view.getByRole('button', { name: '重新生成测速地址' }));
+    await view.findByRole('button', { name: '撤销测速地址' });
     expect(view.queryByText(replacementUrl)).toBeNull();
     fireEvent.click(view.getByRole('button', { name: '显示 koipy 测速地址' }));
     expect(view.getByText(replacementUrl)).toBeTruthy();
+    // 换回订阅卡：订阅地址没有被测速订阅的生成与撤销改动。
+    fireEvent.click(view.getByRole('button', { name: '切换到 Clash 订阅' }));
     fireEvent.click(view.getByRole('button', { name: '显示 Clash 订阅地址' }));
     expect(view.getByText(standardUrl)).toBeTruthy();
     expect(generations).toBe(2);
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/regenerate'))).toBe(false);
+  });
+
+  it('disarms the revoke confirmation when focus leaves the button', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === 'DELETE') throw new Error('should not revoke');
+        return jsonResponse({
+          ...subscriptionInfo(),
+          haitun: { ...subscriptionInfo().haitun, status: 'active', urls: urls(haitunUrl) },
+        });
+      }),
+    );
+    const view = renderViewer('clash');
+    fireEvent.click(await view.findByRole('button', { name: '切换到 koipy 测速订阅（可用）' }));
+    fireEvent.click(view.getByRole('button', { name: '撤销测速地址' }));
+    const armed = view.getByRole('button', { name: '确认撤销测速地址' });
+    expect(armed.textContent).toBe('确认撤销');
+    fireEvent.blur(armed);
+    expect(view.getByRole('button', { name: '撤销测速地址' }).textContent).toBe('撤销');
   });
 
   it.each([false, true])('hides koipy when the server denies access (self-service: %s)', async selfService => {
@@ -263,7 +304,6 @@ describe('subscription and node dialog', () => {
   });
 
   it('keeps the previous address and permits retry if revocation fails', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     vi.stubGlobal(
       'fetch',
       vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
@@ -276,12 +316,13 @@ describe('subscription and node dialog', () => {
       }),
     );
     const view = renderViewer('clash');
-    fireEvent.click(await view.findByText('koipy 测速订阅'));
-    fireEvent.click(await view.findByRole('button', { name: '显示 koipy 测速地址' }));
-    fireEvent.click(view.getByRole('button', { name: '撤销 koipy 测速地址' }));
+    fireEvent.click(await view.findByRole('button', { name: '切换到 koipy 测速订阅（可用）' }));
+    fireEvent.click(view.getByRole('button', { name: '显示 koipy 测速地址' }));
+    fireEvent.click(view.getByRole('button', { name: '撤销测速地址' }));
+    fireEvent.click(view.getByRole('button', { name: '确认撤销测速地址' }));
     await view.findByText(/revocation failed/);
     expect(view.getByText(haitunUrl)).toBeTruthy();
-    expect((view.getByRole('button', { name: '撤销 koipy 测速地址' }) as HTMLButtonElement).disabled).toBe(false);
+    expect((view.getByRole('button', { name: '撤销测速地址' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('blocks duplicate revocation and prevents an older in-flight read from restoring the old URL', async () => {
@@ -306,14 +347,15 @@ describe('subscription and node dialog', () => {
       return oldRead;
     });
     vi.stubGlobal('fetch', fetchMock);
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     const view = renderViewer('clash');
-    fireEvent.click(await view.findByText('koipy 测速订阅'));
-    const revoke = await view.findByRole('button', { name: '撤销 koipy 测速地址' });
+    fireEvent.click(await view.findByRole('button', { name: '切换到 koipy 测速订阅（可用）' }));
+    const revoke = await view.findByRole('button', { name: '撤销测速地址' });
     const refreshing = view.client.refetchQueries({ queryKey: ['clash-subscription'] });
     await waitFor(() => expect(reads).toBe(2));
     fireEvent.click(revoke);
+    fireEvent.click(revoke);
     await waitFor(() => expect((revoke as HTMLButtonElement).disabled).toBe(true));
+    fireEvent.click(revoke);
     fireEvent.click(revoke);
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'DELETE')).toHaveLength(1);
     completeRevocation(
@@ -334,17 +376,57 @@ describe('subscription and node dialog', () => {
     );
     const view = renderViewer('clash');
 
-    fireEvent.click(await view.findByRole('button', { name: 'Hysteria 2' }));
-    fireEvent.click(view.getByRole('button', { name: 'IPv4' }));
-    // 遮罩只遮 Token，主机、路径与筛选参数保持可读。
-    expect(view.baseElement.querySelector('.sub-url-mask')?.textContent).toBe('••••••••-••••-••••-••••-••••••••');
-    expect(view.baseElement.querySelector('.sub-url code')?.textContent).toBe(
-      'https://sub.example/sub/v1/••••••••-••••-••••-••••-••••••••db5c/clash.yaml?family=v4&protocol=hysteria2',
+    await pick(view, '协议', 'Hysteria 2');
+    await pick(view, '地址族', 'IPv4');
+    expect(view.getByRole('combobox', { name: '协议' }).textContent).toContain('Hysteria 2');
+    expect(view.getByRole('combobox', { name: '地址族' }).textContent).toContain('IPv4');
+    // 一行里只露主机名与 Token 末四位：路径收成「…/」，筛选参数保持可读。
+    expect(view.baseElement.querySelector('.sub-url-mask')?.textContent).toBe('••••');
+    expect(view.baseElement.querySelector('.sub-pass-address code')?.textContent).toBe(
+      'sub.example/…/••••db5c/clash.yaml?family=v4&protocol=hysteria2',
     );
     fireEvent.click(view.getByRole('button', { name: '显示 Clash 订阅地址' }));
 
     expect(view.getByText(`${standardUrl}?family=v4&protocol=hysteria2`)).toBeTruthy();
     expect(view.getByTitle('按 UTC+8 计').textContent).toBe('9/1 00:00');
+  });
+
+  it('reads remaining traffic as the card figure and adds the expiry only when the service has one', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse(subscriptionInfo())),
+    );
+    const view = renderViewer('clash', true);
+    const card = await view.findByRole('region', { name: 'Clash 订阅' });
+    expect(card.querySelector('.sub-pass-primary b')?.textContent).toBe('1KiB');
+    expect(view.queryByText('到期')).toBeNull();
+    // 凭据提醒收在卡头的 (!) 里。
+    const note = view.getByText(/订阅地址与二维码包含访问凭据/);
+    expect(note.hidden).toBe(true);
+    fireEvent.click(view.getByRole('button', { name: '订阅凭据说明' }));
+    expect(note.hidden).toBe(false);
+    cleanup();
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        jsonResponse({ ...subscriptionInfo(), remaining_bytes: 0, expires_at: '2099-01-31T16:00:00Z' }),
+      ),
+    );
+    const exhausted = renderViewer('clash', true);
+    const figure = (await exhausted.findByRole('region', { name: 'Clash 订阅' })).querySelector('.sub-pass-primary b');
+    expect(figure?.className).toBe('bad');
+    expect(exhausted.getByText('到期')).toBeTruthy();
+    expect(exhausted.getByText('2099/2/1')).toBeTruthy();
+    cleanup();
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse({ ...subscriptionInfo(), remaining_bytes: null })),
+    );
+    const unlimited = renderViewer('clash', true);
+    const unlimitedCard = await unlimited.findByRole('region', { name: 'Clash 订阅' });
+    expect(unlimitedCard.querySelector('.sub-pass-primary b')?.textContent).toBe('不限量');
   });
 
   it.each([false, true])(
@@ -371,9 +453,13 @@ describe('subscription and node dialog', () => {
     );
     const view = renderViewer('clash');
     const qr = await view.findByRole('img', { name: 'Clash 订阅地址二维码' });
-    for (const filter of ['Hysteria 2', 'IPv6']) {
+    for (const [field, option] of [
+      ['协议', 'Hysteria 2'],
+      ['地址族', 'IPv6'],
+    ]) {
       fireEvent.click(view.getByRole('button', { name: '显示 Clash 订阅地址' }));
-      fireEvent.click(view.getByRole('button', { name: filter }));
+      expect(view.baseElement.querySelector('.sub-url-mask')).toBeNull();
+      await pick(view, field, option);
       expect(view.getByRole('img', { name: 'Clash 订阅地址二维码' })).toBe(qr);
       expect(view.baseElement.querySelector('.sub-url-mask')).not.toBeNull();
     }
@@ -395,26 +481,40 @@ describe('subscription and node dialog', () => {
     fireEvent.click(view.getByRole('tab', { name: '订阅' }));
     await view.findByRole('img', { name: 'Clash 订阅地址二维码' });
     expect(view.queryByRole('button', { name: 'MTProxy' })).toBeNull();
+    expect(view.getByRole('combobox', { name: '协议' }).textContent).toContain('全部');
     fireEvent.click(view.getByRole('button', { name: '显示 Clash 订阅地址' }));
     expect(view.getByText(standardUrl)).toBeTruthy();
   });
 
-  it('switches the filters to two dropdowns on narrow screens', async () => {
+  it('uses dropdowns for node filters and a bottom sheet for the card fields on narrow screens', async () => {
     stubViewport(true);
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => jsonResponse(subscriptionInfo())),
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === '/revisions?limit=50') return jsonResponse({ current_revision: 9, revisions: [] });
+        if (path === '/grant-probes/capability') return probeOff();
+        if (path.endsWith('/clash-subscription')) return jsonResponse(subscriptionInfo());
+        return artifact(uriText);
+      }),
     );
-    const view = renderViewer('clash');
+    const view = renderViewer('uri');
 
-    await view.findByRole('region', { name: 'Clash 订阅' });
+    await view.findByRole('region', { name: '东京 IIJ' });
     expect(view.queryByRole('button', { name: 'Hysteria 2' })).toBeNull();
     fireEvent.change(view.getByRole('combobox', { name: '协议' }), { target: { value: 'hysteria2' } });
     fireEvent.change(view.getByRole('combobox', { name: '地址族' }), { target: { value: 'v4' } });
+    expect(view.baseElement.querySelector('.sub-pick-value')?.textContent).toBe('Hysteria 2');
+
+    fireEvent.click(view.getByRole('tab', { name: '订阅' }));
+    const protocol = await view.findByRole('combobox', { name: '协议' });
+    expect(protocol.textContent).toContain('Hysteria 2');
+    fireEvent.click(protocol);
+    expect(document.body.querySelector('.choice-layer.drawer')).not.toBeNull();
+    fireEvent.click(view.getByRole('option', { name: 'AnyTLS' }));
     fireEvent.click(view.getByRole('button', { name: '显示 Clash 订阅地址' }));
 
-    expect(view.getByText(`${standardUrl}?family=v4&protocol=hysteria2`)).toBeTruthy();
-    expect(view.baseElement.querySelector('.sub-pick-value')?.textContent).toBe('Hysteria 2');
+    expect(view.getByText(`${standardUrl}?family=v4&protocol=anytls`)).toBeTruthy();
   });
 
   it('moves between the two tabs with the arrow keys like the node detail tabs', async () => {
@@ -454,8 +554,8 @@ describe('subscription and node dialog', () => {
     vi.stubGlobal('fetch', fetchMock);
     const view = renderViewer('clash');
 
-    fireEvent.click(await view.findByRole('button', { name: 'Hysteria 2' }));
-    fireEvent.click(view.getByRole('button', { name: 'IPv4' }));
+    await pick(view, '协议', 'Hysteria 2');
+    await pick(view, '地址族', 'IPv4');
     fireEvent.click(view.getByRole('tab', { name: '节点' }));
 
     await waitFor(() =>

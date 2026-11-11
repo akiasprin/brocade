@@ -13114,10 +13114,10 @@ select.f.words {
   color: var(--ink-2);
   font-weight: 600;
 }
-/* 订阅与节点：同一个弹窗，标题栏切换页签（沿用机器详情页签 .nd-tabs），共用协议与地址族筛选。
-   订阅以二维码为主，筛选、地址和读数向下排列；管理员测速订阅收进可展开区域。
-   节点页签是「协议 │ IPv4 │ IPv6」行列表，地址本身是复制按钮，网络拨测合并在同一页签。
-   超过视口时只有正文滚动，标题栏与底栏保持可见；节点筛选留在正文上方。
+/* 订阅与节点：同一个弹窗，标题栏切换页签（沿用机器详情页签 .nd-tabs），两个页签共用协议与地址族的取值。
+   订阅是一张卡券（见下方「订阅：卡券」），协议与地址族是卡上的栏位；管理员测速订阅是叠在后面的第二张卡。
+   节点页签是「协议 │ IPv4 │ IPv6」行列表，地址本身是复制按钮，网络拨测合并在同一页签，筛选行在正文上方。
+   超过视口时只有正文滚动，标题栏与底栏保持可见。
    窄屏见本节末尾：贴底成为面板。 */
 .sub-dialog {
   display: flex;
@@ -13198,14 +13198,12 @@ select.f.words {
 /* Icon 的外层 span 与 svg 都按块排，避免行盒基线把图标顶偏。 */
 .sub-dialog-label > span,
 .sub-pick-label > span,
-.sub-url-copy > span,
 .node-copy-all > span,
 .node-probe-all > span,
 .node-copy-icon,
 .sub-pick-chevron,
 .sub-dialog-label svg,
 .sub-pick-label svg,
-.sub-url-copy svg,
 .node-copy-all svg,
 .node-probe-all svg,
 .node-copy-icon svg,
@@ -13313,105 +13311,6 @@ select.f.words {
   outline-offset: 1px;
 }
 
-/* 管理员测速订阅保留状态、地址和生成／撤销操作，放在可展开区域内。 */
-.sub-item-head {
-  display: flex;
-  min-width: 0;
-  align-items: flex-start;
-  gap: 16px;
-}
-.sub-item-title {
-  display: grid;
-  flex: 1;
-  min-width: 0;
-  gap: 4px;
-}
-.sub-item-name {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 10px;
-}
-.sub-item-name > b {
-  color: var(--ink);
-  font: 600 13px/18px var(--sans);
-}
-.sub-item-action {
-  flex: none;
-  min-height: 26px;
-  height: 26px;
-  margin-top: -3px;
-  padding: 0 10px;
-  font-size: 12.5px;
-}
-.sub-item-body {
-  min-width: 0;
-  margin-top: 12px;
-}
-.sub-item-body > .callout {
-  margin-top: 8px;
-}
-.sub-item-note {
-  margin: 8px 0 0;
-  color: var(--ink-4);
-  font-size: 11.5px;
-  line-height: 1.55;
-}
-/* 剩余流量与重置时间共用紧凑读数。 */
-.sub-readings {
-  display: flex;
-  flex: none;
-  gap: 24px;
-  margin: 0;
-}
-.sub-readings > div {
-  display: grid;
-  justify-items: end;
-  gap: 3px;
-}
-.sub-readings dt {
-  color: var(--ink-4);
-  font-size: 12px;
-  line-height: 18px;
-}
-.sub-readings dd {
-  margin: 0;
-  color: var(--ink);
-  font: 500 12.5px/18px var(--sans);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-.sub-readings dd.bad {
-  color: var(--err);
-}
-/* 状态：字中性，颜色只在圆点上；尚未生成为空心点 */
-.sub-live {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--ink-3);
-  font-size: 11.5px;
-  white-space: nowrap;
-}
-.sub-live::before {
-  content: '';
-  width: 6px;
-  height: 6px;
-  flex: none;
-  border-radius: 50%;
-  box-shadow: inset 0 0 0 1.5px var(--ink-4);
-}
-.sub-live.ok::before {
-  background: var(--ok);
-  box-shadow: none;
-}
-.sub-live.warn {
-  color: var(--gold);
-}
-.sub-live.warn::before {
-  background: var(--gold);
-  box-shadow: none;
-}
 .sub-text-action {
   flex: none;
   padding: 3px 7px;
@@ -13430,258 +13329,478 @@ select.f.words {
   cursor: wait;
   opacity: 0.6;
 }
-/* 地址框：遮住的 Token 降一档墨色；「显示」是幽灵按钮，「复制」带边框 */
-.sub-url {
-  display: flex;
-  height: 38px;
-  box-sizing: border-box;
-  align-items: center;
-  gap: 2px;
-  padding: 0 4px 0 12px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--sunk);
-}
-.sub-url code {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  color: var(--ink-2);
-  font: 11.5px var(--mono);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.sub-url-mask {
-  color: var(--ink-4);
-  letter-spacing: -0.06em;
-}
-.sub-url > button {
-  display: inline-flex;
-  height: 28px;
-  flex: none;
-  align-items: center;
-  gap: 6px;
-  padding: 0 9px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  background: none;
-  color: var(--ink-3);
-  font: 12.5px/1 var(--sans);
-  white-space: nowrap;
-  cursor: pointer;
-}
-.sub-url > .sub-url-copy {
-  margin-left: 2px;
-  padding: 0 10px 0 9px;
-  border-color: var(--line);
-  background: var(--btn);
-  color: var(--ink-2);
-}
-.sub-url > .sub-url-copy.done {
-  color: var(--ok);
-}
-.sub-url > .sub-url-copy.failed {
-  color: var(--err);
-}
+
+/* 订阅：卡券。卡头（标志、名称、重置）→ 大字剩余流量 → 协议 / 地址族栏位 → 撕线 → 白底二维码与遮罩地址；
+   管理员的测速订阅是后面那张同版式的卡，只露出卡头。卡面分上下两块，各用遮罩在撕线两端挖四分之一圆，
+   拼起来是两个半圆缺口；描边画在内阴影上，缺口处一并断开。投影用 drop-shadow，才能沿缺口走。
+   暗色是纸上一块更亮的卡，浅色是灰底上的白卡。 */
 .sub-dialog-subscription {
-  width: min(480px, calc(100vw - 32px));
-  max-height: min(780px, calc(100dvh - 48px));
+  --sub-pass-card: var(--card);
+  --sub-pass-back: color-mix(in srgb, var(--block) 50%, var(--sheet));
+  --sub-pass-edge: color-mix(in srgb, var(--ink) 7%, transparent);
+  width: min(404px, calc(100vw - 32px));
+  max-height: min(820px, calc(100dvh - 48px));
   /* Keep subscription controls readable when a browser cannot composite the floating blur. */
   background: var(--sheet);
   backdrop-filter: none;
 }
+[data-theme='light'] .sub-dialog-subscription {
+  --sub-pass-back: var(--surface);
+  --sub-pass-edge: rgb(0 0 0 / 0.06);
+  background: var(--sunk);
+}
 .sub-subscription-body {
-  padding: 18px 28px;
+  padding: 6px 22px 22px;
 }
-.sub-subscription-title {
-  margin: 0;
-  color: var(--ink);
-  font: 600 20px/1.4 var(--sans);
-  text-align: center;
+.sub-pass-stack {
+  position: relative;
+  filter: drop-shadow(0 1px 1.5px rgb(0 0 0 / 0.28)) drop-shadow(0 8px 18px rgb(0 0 0 / 0.22));
 }
-.sub-subscription-caption {
-  margin: 5px 0 0;
+[data-theme='light'] .sub-pass-stack {
+  filter: drop-shadow(0 1px 1.5px rgb(0 0 0 / 0.07)) drop-shadow(0 8px 20px rgb(0 0 0 / 0.08));
+}
+.sub-pass-stack.has-back {
+  padding-top: 32px;
+}
+.sub-pass-peek {
+  position: absolute;
+  top: 0;
+  right: 12px;
+  left: 12px;
+  display: flex;
+  height: 64px;
+  box-sizing: border-box;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 14px 0;
+  border: 0;
+  border-radius: 14px 14px 0 0;
+  background: var(--sub-pass-back);
+  box-shadow: inset 0 0 0 1px var(--sub-pass-edge);
+  color: var(--ink-2);
+  font: 12px/16px var(--sans);
+  text-align: left;
+  cursor: pointer;
+  transition: transform 180ms ease;
+}
+.sub-pass-peek > b {
+  font-weight: 600;
+}
+.sub-pass-peek-end {
+  margin-left: auto;
   color: var(--ink-3);
-  font-size: 12px;
-  text-align: center;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
 }
-.sub-qr {
-  --sub-qr-bg: var(--sunk);
-  --sub-qr-fg: var(--ink);
-  width: min(200px, 100%);
-  margin: 18px auto 0;
+.sub-pass-peek:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+}
+@media (hover: hover) {
+  .sub-pass-peek:hover {
+    transform: translateY(-3px);
+  }
+}
+.sub-pass {
+  --sub-pass-notch: 10px;
+  /* 缺口的两个色标：半径内透明、半径外不透明，留半像素过渡免得边缘发毛。 */
+  --sub-pass-hole: #0000 calc(var(--sub-pass-notch) - 0.5px), #000 var(--sub-pass-notch);
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+/* 换卡时新卡从后面那张的位置滑上来；首次打开不播，弹窗自己已有进场动效。 */
+.sub-pass-stack.swapped > .sub-pass {
+  animation: sub-pass-in 240ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+@keyframes sub-pass-in {
+  from {
+    opacity: 0.4;
+    transform: translateY(-14px) scale(0.97);
+  }
+}
+/* 两块都锁住列宽：地址行随筛选参数变长时只截断自己，不撑宽这一列，居中的二维码才不会跟着移位。 */
+.sub-pass-top,
+.sub-pass-code {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  background: var(--sub-pass-card);
+}
+.sub-pass-top {
+  padding: 16px 18px 18px;
+  border-radius: 16px 16px 0 0;
+  box-shadow:
+    inset 0 1px 0 var(--sub-pass-edge),
+    inset 1px 0 0 var(--sub-pass-edge),
+    inset -1px 0 0 var(--sub-pass-edge);
+  -webkit-mask:
+    radial-gradient(circle var(--sub-pass-notch) at 0 100%, var(--sub-pass-hole)) left / 51% 100% no-repeat,
+    radial-gradient(circle var(--sub-pass-notch) at 100% 100%, var(--sub-pass-hole)) right / 51% 100% no-repeat;
+  mask:
+    radial-gradient(circle var(--sub-pass-notch) at 0 100%, var(--sub-pass-hole)) left / 51% 100% no-repeat,
+    radial-gradient(circle var(--sub-pass-notch) at 100% 100%, var(--sub-pass-hole)) right / 51% 100% no-repeat;
+}
+.sub-pass-code {
+  position: relative;
+  justify-items: center;
+  gap: 8px;
+  padding: 18px 18px 16px;
+  border-radius: 0 0 16px 16px;
+  box-shadow:
+    inset 0 -1px 0 var(--sub-pass-edge),
+    inset 1px 0 0 var(--sub-pass-edge),
+    inset -1px 0 0 var(--sub-pass-edge);
+  -webkit-mask:
+    radial-gradient(circle var(--sub-pass-notch) at 0 0, var(--sub-pass-hole)) left / 51% 100% no-repeat,
+    radial-gradient(circle var(--sub-pass-notch) at 100% 0, var(--sub-pass-hole)) right / 51% 100% no-repeat;
+  mask:
+    radial-gradient(circle var(--sub-pass-notch) at 0 0, var(--sub-pass-hole)) left / 51% 100% no-repeat,
+    radial-gradient(circle var(--sub-pass-notch) at 100% 0, var(--sub-pass-hole)) right / 51% 100% no-repeat;
+}
+/* 撕线：两端各让开缺口 4px。 */
+.sub-pass-code::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: calc(var(--sub-pass-notch) + 4px);
+  left: calc(var(--sub-pass-notch) + 4px);
+  border-top: 1.5px dashed color-mix(in srgb, var(--ink-4) 42%, transparent);
+}
+.sub-pass-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+.sub-pass-logo {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  place-items: center;
   border-radius: 9px;
+  background: var(--action);
+  color: var(--action-on);
+}
+.sub-pass-logo.haitun {
+  background: color-mix(in srgb, var(--ink) 13%, transparent);
+  color: var(--ink);
+}
+.sub-pass-logo.small {
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+}
+.sub-pass-name {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+.sub-pass-name > b {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--ink);
+  font: 600 14px/20px var(--sans);
+}
+.sub-pass-name > small {
   overflow: hidden;
-  background: var(--sub-qr-bg);
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* (!)：与「计量口径」同一画法，灰色 info 图标，悬停或展开时变深。 */
+.sub-pass-info {
+  display: inline-grid;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: var(--ink-4);
+  cursor: pointer;
+}
+.sub-pass-info[aria-expanded='true'] {
+  color: var(--ink);
+}
+@media (hover: hover) {
+  .sub-pass-info:hover {
+    color: var(--ink);
+  }
+}
+.sub-pass-info:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 1px;
+}
+.sub-pass-note {
+  margin: 10px 0 0;
+  color: var(--ink-3);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+.sub-pass-field {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 3px;
+}
+.sub-pass-field.end {
+  justify-items: end;
+  text-align: right;
+}
+.sub-pass-field > small,
+.sub-pass-pick::before {
+  color: var(--ink-4);
+  font: 500 10.5px/13px var(--sans);
+  letter-spacing: 0.04em;
+}
+.sub-pass-field > b {
+  color: var(--ink);
+  font: 500 13.5px/18px var(--sans);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.sub-pass-primary {
+  display: grid;
+  gap: 4px;
+  margin-top: 20px;
+}
+.sub-pass-primary > small {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 15px;
+}
+.sub-pass-primary > b {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  color: var(--ink);
+  font: 600 36px/1 var(--sans);
+  letter-spacing: -0.035em;
+  font-variant-numeric: tabular-nums;
+}
+.sub-pass-primary > b > span {
+  color: var(--ink-3);
+  font: 500 15px/1 var(--sans);
+  letter-spacing: 0;
+}
+.sub-pass-primary > b.bad {
+  color: var(--err);
+}
+.sub-pass-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 30px;
+  margin-top: 18px;
+}
+/* 可点的栏位：标签由 data-label 画在取值上方，平时与普通栏位一样，悬停或展开时浮出浅底。 */
+button.sub-pass-pick {
+  display: inline-grid;
+  grid-template-columns: auto auto;
+  justify-content: start;
+  align-items: center;
+  gap: 3px 4px;
+  margin: -5px -8px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--ink);
+  font: 500 13.5px/18px var(--sans);
+  text-align: left;
+  cursor: pointer;
+}
+.sub-pass-pick::before {
+  content: attr(data-label);
+  grid-column: 1 / -1;
+}
+.sub-pass-pick[aria-expanded='true'] {
+  background: var(--hover-2);
+}
+@media (hover: hover) {
+  .sub-pass-pick:hover {
+    background: var(--hover-2);
+  }
+}
+/* 二维码一律白底黑码；暗色下加一圈细边，免得白块边缘发虚。 */
+.sub-qr {
+  width: 180px;
+  margin: 0;
+  overflow: hidden;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 0.06);
 }
 [data-theme='light'] .sub-qr {
-  --sub-qr-bg: #fff;
-  --sub-qr-fg: #101112;
+  box-shadow: none;
 }
 .sub-qr > svg {
   display: block;
   width: 100%;
   height: auto;
 }
-/* qrcode.react emits the background path before the modules. Stylesheet fills let WebKit
-   paint theme colors on the first frame, without CSS variables in SVG presentation attributes. */
-.sub-qr > svg > path:first-of-type {
-  fill: var(--sub-qr-bg);
-}
-.sub-qr > svg > path:last-of-type {
-  fill: var(--sub-qr-fg);
-}
-.sub-subscription .sub-dialog-filter {
-  flex-direction: column;
-  align-items: stretch;
-  gap: 8px;
-  margin: 16px 0 18px;
-  padding: 10px 0;
-}
-.sub-subscription .sub-dialog-label {
-  width: 54px;
-  flex: none;
-}
-.sub-subscription .sub-dialog-filter .segsw button {
-  padding: 0 8px;
-  font-size: 12px;
-}
-.sub-subscription-label {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 7px;
-  color: var(--ink-3);
-  font-size: 11.5px;
-}
-.sub-subscription-label > button {
-  min-height: 24px;
-}
-.sub-subscription-url .sub-url {
-  display: block;
-  height: auto;
-  padding: 10px 12px;
-}
-.sub-subscription-url .sub-url code {
-  display: block;
-  padding: 0;
-  overflow: visible;
-  font-size: 11px;
-  line-height: 1.7;
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
-.sub-subscription-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 10px;
-}
-.sub-subscription-actions > button {
+.sub-pass-address {
   display: inline-flex;
-  min-height: 34px;
-  justify-content: center;
-  gap: 7px;
-  font-size: 12px;
-  white-space: nowrap;
-}
-.sub-subscription-actions .ui-icon,
-.sub-subscription-actions svg {
-  display: block;
-}
-.sub-subscription-actions > .sub-subscription-copy {
-  flex: 1;
-}
-.sub-subscription .sub-readings {
-  justify-content: center;
-  gap: 40px;
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid var(--line);
-}
-.sub-subscription .sub-readings > div {
-  justify-items: start;
-}
-.sub-haitun {
-  margin: 16px -28px -18px;
-  padding: 0 28px;
-  border-top: 1px solid var(--line);
-}
-.sub-haitun > summary {
-  display: flex;
-  min-height: 42px;
+  max-width: 100%;
+  box-sizing: border-box;
   align-items: center;
-  gap: 7px;
-  list-style: none;
-  color: var(--ink-3);
-  font-size: 11.5px;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-4);
   cursor: pointer;
 }
-.sub-haitun > summary::-webkit-details-marker {
-  display: none;
+.sub-pass-address > code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font: 10.5px/1.6 var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.sub-haitun > summary > b {
-  font-weight: 500;
+.sub-pass-address[aria-pressed='true'] > code {
+  overflow-wrap: anywhere;
+  text-align: center;
+  white-space: normal;
 }
-.sub-haitun > summary > .ui-icon:last-child {
-  margin-left: auto;
-}
-.sub-haitun[open] > summary > .ui-icon:last-child {
-  transform: rotate(180deg);
-}
-.sub-admin-badge {
-  padding: 1px 5px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  color: var(--ink-4);
-  font-size: 9px;
-}
-.sub-haitun > .sub-item {
-  display: block;
-  padding: 4px 0 18px;
-}
-@media (prefers-reduced-motion: reduce) {
-  .sub-haitun::details-content {
-    transition: none;
-  }
-}
-@media (min-width: 821px) and (max-height: 780px) {
-  .sub-dialog-subscription .sub-subscription-body {
-    padding-top: 16px;
-  }
-  .sub-subscription-title {
-    font-size: 19px;
-  }
-  .sub-qr {
-    width: 168px;
-    margin-top: 12px;
-  }
-  .sub-subscription .sub-dialog-filter {
-    margin: 10px 0 12px;
-    padding: 8px 0;
-  }
-  .sub-subscription .sub-readings {
-    gap: 24px;
-    margin-top: 15px;
-    padding-top: 0;
-    border: 0;
-  }
-  .sub-subscription .sub-readings > div {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-  }
-  .sub-subscription .sub-readings dd {
-    font-size: 12px;
-  }
+.sub-pass-address:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 1px;
 }
 @media (hover: hover) {
-  .sub-url > button:hover:not(:disabled) {
-    color: var(--ink);
+  .sub-pass-address:hover {
     background: var(--hover-2);
+    color: var(--ink-2);
   }
-  .sub-url > .sub-url-copy:hover:not(:disabled) {
-    background: var(--btn-h);
+}
+.sub-url-mask {
+  color: var(--ink-4);
+  letter-spacing: -0.06em;
+}
+/* 测速卡没有地址时，条码区留一个同尺寸的空框，并补上地址行的高度，两张卡等高。 */
+.sub-pass-empty {
+  display: grid;
+  width: 180px;
+  aspect-ratio: 1;
+  box-sizing: border-box;
+  place-items: center;
+  margin-bottom: 31px;
+  border: 1.5px dashed color-mix(in srgb, var(--ink-4) 45%, transparent);
+  border-radius: 10px;
+  color: var(--ink-4);
+  font-size: 12px;
+}
+/* 测速订阅状态：字中性，颜色只在圆点上（已撤销连字一起用金色）；尚未生成为空心点。卡上大字只放大圆点。 */
+.sub-pass-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+.sub-pass-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px var(--ink-4);
+}
+.sub-pass-status[data-status='active']::before {
+  background: var(--ok);
+  box-shadow: none;
+}
+.sub-pass-status[data-status='revoked'] {
+  color: var(--gold);
+}
+.sub-pass-status[data-status='revoked']::before {
+  background: var(--gold);
+  box-shadow: none;
+}
+.sub-pass-primary > b.sub-pass-status {
+  align-items: center;
+  gap: 10px;
+  color: var(--ink);
+  letter-spacing: -0.01em;
+}
+.sub-pass-primary > b.sub-pass-status::before {
+  width: 11px;
+  height: 11px;
+}
+.sub-pass-primary > b.sub-pass-status[data-status='not-created']::before {
+  box-shadow: inset 0 0 0 2px var(--ink-4);
+}
+.sub-pass-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+}
+.sub-pass-actions > .btn {
+  min-height: 38px;
+  gap: 7px;
+  border-radius: 10px;
+  font-size: 13px;
+}
+.sub-pass-main {
+  flex: 1;
+}
+.sub-pass-side {
+  flex: none;
+  padding: 0 16px;
+}
+/* 撤销就地两步确认：待确认时加深红色洗底。 */
+.btn.sub-pass-revoke.armed {
+  border-color: var(--err);
+  background: color-mix(in srgb, var(--err) 18%, transparent);
+}
+@media (hover: hover) {
+  .btn.sub-pass-revoke.armed:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--err) 24%, transparent);
+  }
+}
+.sub-pass-actions + .callout {
+  margin-top: 10px;
+}
+.sub-pass-logo > span,
+.sub-pass-logo svg,
+.sub-pass-info > span,
+.sub-pass-info svg,
+.sub-pass-address > span,
+.sub-pass-address svg,
+.sub-pass-actions > .btn > span,
+.sub-pass-actions > .btn svg {
+  display: block;
+  flex: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sub-pass-peek {
+    transition: none;
+  }
+  .sub-pass-stack.swapped > .sub-pass {
+    animation: none;
+  }
+}
+/* 矮屏桌面：二维码与大字收一档，管理员两张卡时仍不必滚动。 */
+@media (min-width: 821px) and (max-height: 760px) {
+  .sub-qr,
+  .sub-pass-empty {
+    width: 152px;
+  }
+  .sub-pass-primary {
+    margin-top: 14px;
+  }
+  .sub-pass-primary > b {
+    font-size: 32px;
+  }
+  .sub-pass-fields {
+    margin-top: 14px;
   }
 }
 
@@ -14040,63 +14159,6 @@ select.f.words {
   .sub-dialog-foot > span + span::before {
     content: none;
   }
-  .sub-item-head {
-    flex-wrap: wrap;
-  }
-  .sub-readings {
-    order: 3;
-    width: 100%;
-  }
-  .sub-readings > div {
-    justify-items: start;
-  }
-  .sub-item-action {
-    min-height: var(--ctl-h);
-    height: var(--ctl-h);
-    margin-top: -6px;
-    padding: 0 10px;
-  }
-  .sub-url {
-    display: grid;
-    height: auto;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    grid-template-areas:
-      'code code'
-      'reveal copy';
-    gap: 0;
-    padding: 0;
-    overflow: hidden;
-    border-radius: 10px;
-  }
-  .sub-url code {
-    grid-area: code;
-    padding: 11px 12px;
-    overflow: visible;
-    font-size: 12px;
-    line-height: 1.6;
-    white-space: normal;
-    word-break: break-all;
-  }
-  .sub-url > button,
-  .sub-url > .sub-url-copy {
-    height: var(--ctl-h);
-    justify-content: center;
-    margin: 0;
-    padding: 0;
-    border: 0;
-    border-top: 1px solid var(--line);
-    border-radius: 0;
-    background: var(--btn);
-  }
-  .sub-url > .sub-url-reveal {
-    grid-area: reveal;
-  }
-  .sub-url > .sub-url-copy {
-    grid-area: copy;
-    border-left: 1px solid var(--line);
-    color: var(--ink);
-    font-weight: 500;
-  }
   .node-count {
     margin-right: auto;
     font-size: 12px;
@@ -14177,39 +14239,23 @@ select.f.words {
 }
 @media (max-width: 820px) {
   .sub-dialog-subscription .sub-subscription-body {
-    padding: 20px;
+    padding: 4px 16px calc(18px + var(--safe-bottom));
   }
-  .sub-subscription .sub-dialog-filter {
-    display: grid;
-    margin: 16px 0 18px;
-    padding: 12px 0;
-    gap: 10px;
+  .sub-qr,
+  .sub-pass-empty {
+    width: min(180px, max(132px, calc(100dvh - 560px)));
   }
-  .sub-qr {
-    width: min(208px, max(144px, calc(100dvh - 600px)));
-  }
-  .sub-subscription-actions > button {
+  .sub-pass-actions > .btn {
     min-height: var(--ctl-h);
-  }
-  .sub-subscription .sub-readings {
-    width: auto;
-    gap: 32px;
-  }
-  .sub-haitun {
-    margin: 20px -20px -20px;
-    padding: 0 20px;
+    font-size: 13.5px;
   }
 }
 @media (max-width: 820px) and (max-height: 480px) {
-  .sub-dialog-subscription .sub-subscription-body {
-    padding-top: 14px;
+  .sub-pass-primary {
+    margin-top: 14px;
   }
-  .sub-subscription-title {
-    font-size: 18px;
-  }
-  .sub-qr {
-    width: 168px;
-    margin-top: 12px;
+  .sub-pass-primary > b {
+    font-size: 30px;
   }
 }
 

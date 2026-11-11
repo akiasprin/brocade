@@ -22,6 +22,21 @@ test('订阅弹窗：筛选行上下各一条分隔线，正文不再另画上�
   assert.doesNotMatch(desktop, /\.sub-dialog-head\s*\{[^}]*background/, '标题行不再画底色条');
 });
 
+test('订阅卡券：二维码白底不反色，撕线缺口用遮罩，地址行变长不撑宽列', () => {
+  assert.match(desktop, /\.sub-qr\s*\{[^}]*background:\s*#fff;/);
+  assert.doesNotMatch(dialog, /--sub-qr-(?:bg|fg)/, '二维码不再随主题换色');
+  assert.match(desktop, /\.sub-pass-top\s*\{[^}]*\bmask:[^}]*at 0 100%[^}]*at 100% 100%/);
+  assert.match(desktop, /\.sub-pass-code\s*\{[^}]*\bmask:[^}]*at 0 0,[^}]*at 100% 0,/);
+  assert.match(desktop, /\.sub-pass-stack\s*\{[^}]*filter:\s*drop-shadow/, '投影沿缺口走，不用会被遮罩裁掉的 box-shadow');
+  // 筛选参数让地址行变长时，网格列若按内容撑宽，居中的二维码会跟着右移。
+  assert.match(desktop, /\.sub-pass-top,\s*\.sub-pass-code\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);/);
+  assert.match(desktop, /\.sub-pass-address > code\s*\{[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/);
+  assert.match(
+    desktop,
+    /@media \(prefers-reduced-motion: reduce\)\s*\{[^@]*\.sub-pass-stack\.swapped > \.sub-pass\s*\{\s*animation:\s*none;/,
+  );
+});
+
 test('订阅弹窗：节点地址是复制按钮，长 IPv6 只截主机、端口保留', () => {
   assert.match(desktop, /\.node-copy-host\s*\{[^}]*text-overflow:\s*ellipsis;/);
   assert.match(desktop, /\.node-copy-port\s*\{[^}]*flex:\s*none;/);
@@ -59,7 +74,9 @@ test('订阅弹窗：窄屏与 useNarrow 同一断点，贴底面板使用紧凑
     /\[data-motion-state='entering'\] > \.dialog-surface\.sub-dialog\s*\{\s*animation-name:\s*sub-sheet-in;/,
   );
   assert.match(narrow, /\.sub-dialog-foot\s*\{[^}]*var\(--safe-bottom\)/);
-  assert.match(narrow, /\.sub-url > button,\s*\.sub-url > \.sub-url-copy\s*\{[^}]*height:\s*var\(--ctl-h\);/);
+  // 订阅页签没有底栏：卡券正文自己让出底部安全区，操作按钮用紧凑控件高度。
+  assert.match(narrow, /\.sub-dialog-subscription \.sub-subscription-body\s*\{[^}]*var\(--safe-bottom\)/);
+  assert.match(narrow, /\.sub-pass-actions > \.btn\s*\{[^}]*min-height:\s*var\(--ctl-h\);/);
   assert.match(narrow, /\.node-copy\s*\{[^}]*height:\s*var\(--ctl-h\);/);
   assert.match(narrow, /\.node-copy-all,\s*\.node-probe-all,\s*\.node-probe-retry\s*\{[^}]*height:\s*var\(--ctl-h\);/);
   assert.match(narrow, /\.btn\.node-group-run\s*\{[^}]*min-height:\s*var\(--ctl-h\);/);
