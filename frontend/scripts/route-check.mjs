@@ -64,6 +64,11 @@ function reads(name, hash, expected) {
 }
 
 console.log('— 往返 —');
+trip('CVM 首页', { nav: 'cvm' }, '#/cvm');
+trip('创建 CVM', { nav: 'cvm', drill: { p: 'new' } }, '#/cvm/new');
+reads('旧的用户转发入口回到 CVM 首页', '#/cvm/connect', { nav: 'cvm' });
+trip('CVM 实例', { nav: 'cvm', drill: { p: 'instance', id: 'cvm-one' } }, '#/cvm/instance/cvm-one');
+
 trip('面的根', { nav: 'nodes' }, '#/nodes');
 trip('列表等于根', { nav: 'nodes', drill: { p: 'list' } }, '#/nodes', { nav: 'nodes' });
 trip('机器详情', { nav: 'nodes', drill: { p: 'node', id: 'hk-01' } }, '#/nodes/node/hk-01');

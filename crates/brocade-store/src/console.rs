@@ -2339,6 +2339,7 @@ pub(crate) async fn upsert_ingress_tx(
     app_id: &str,
     request: CreateIngressRequest,
 ) -> Result<(Ingress, bool)> {
+    crate::resource_coordination::lock(tx).await?;
     let app_id = required_text(app_id, "app_id")?;
     let id = required_slug(request.id, "ingress id")?;
     let chain_id = required_text(request.chain_id, "chain_id")?;
@@ -3009,6 +3010,7 @@ pub(crate) async fn create_ingress_tx(
     app_id: &str,
     request: CreateIngressRequest,
 ) -> Result<(Ingress, bool)> {
+    crate::resource_coordination::lock(tx).await?;
     let id = required_slug(request.id.clone(), "ingress id")?;
     let exists =
         sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM ingresses WHERE id = $1)")
@@ -3782,12 +3784,20 @@ fn push_disabled_artifact(
     });
 }
 
-/// Take the write lock, returning the current revision number along the way — a commit that
-/// changed nothing returns it (see `commit_revision`), and this row is read anyway.
+/// Acquire shared model-write locks in network-resource, then model-row order, returning the
+/// current revision so a commit which changes nothing can return it (see `commit_revision`).
+///
+/// Draft replay and direct writers can acquire the network lock again in their low-level
+/// operations. Taking it here first prevents a preview holding the model row from waiting on a
+/// concurrent commit which already owns the network lock.
 pub(crate) async fn lock_control_state(tx: &mut Transaction<'_, Postgres>) -> Result<u64> {
-    let row = sqlx::query("SELECT current_revision FROM control_state WHERE id = TRUE FOR UPDATE")
-        .fetch_one(&mut **tx)
-        .await?;
+    crate::model_timing::measure("network_lock", crate::resource_coordination::lock(tx)).await?;
+    let row = crate::model_timing::measure(
+        "model_lock",
+        sqlx::query("SELECT current_revision FROM control_state WHERE id = TRUE FOR UPDATE")
+            .fetch_one(&mut **tx),
+    )
+    .await?;
     i64_to_u64(row.try_get("current_revision")?, "current_revision")
 }
 
@@ -3836,9 +3846,22 @@ async fn commit_revision_inner(
     automate_grants: bool,
 ) -> Result<u64> {
     if changed {
-        set_current_revision(tx, revision_id).await?;
+        crate::model_timing::measure(
+            "static_port_conflicts",
+            crate::port_reservations::check_static_nic_conflicts(tx),
+        )
+        .await?;
+        crate::model_timing::measure(
+            "set_current_revision",
+            set_current_revision(tx, revision_id),
+        )
+        .await?;
         if automate_grants {
-            crate::grant_automation::enqueue_if_changed_tx(tx, previous, revision_id).await?;
+            crate::model_timing::measure(
+                "grant_compare",
+                crate::grant_automation::enqueue_if_changed_tx(tx, previous, revision_id),
+            )
+            .await?;
         }
         return Ok(revision_id);
     }
@@ -3899,8 +3922,16 @@ async fn set_current_revision(tx: &mut Transaction<'_, Postgres>, revision_id: u
         .bind(u64_to_i64(revision_id, "revision_id")?)
         .execute(&mut **tx)
         .await?;
-    crate::materialize::store_current_snapshot_tx(tx, revision_id).await?;
-    crate::subscription_client::advance_from_committed_tx(tx, revision_id).await?;
+    crate::model_timing::measure(
+        "freeze_snapshot",
+        crate::materialize::store_current_snapshot_tx(tx, revision_id),
+    )
+    .await?;
+    crate::model_timing::measure(
+        "subscription_client",
+        crate::subscription_client::advance_from_committed_tx(tx, revision_id),
+    )
+    .await?;
     Ok(())
 }
 

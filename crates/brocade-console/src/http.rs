@@ -1,4 +1,6 @@
 mod agent_rpc;
+#[cfg(feature = "cvm")]
+mod cvm;
 mod observations;
 mod realtime_channel;
 use realtime_channel::agent_realtime;
@@ -6,6 +8,8 @@ mod unlock_probe;
 use unlock_probe::*;
 mod source_access;
 use source_access::*;
+#[cfg(feature = "cvm")]
+use std::collections::BTreeMap;
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
@@ -47,6 +51,7 @@ use brocade_deployment::protocol::{
     VpngatePoolReport, VpngateProbeReport, VpngateReconcileReport, XrayReleaseOffer,
     XrayReleaseReport,
 };
+use brocade_store::model_timing::{self, Operation as TimedOperation};
 use brocade_store::{
     AbandonNodeRequest, AdminContext, AdminLoginRequest, AdminRole, AgentRelease,
     AuthenticatedAdmin, AuthenticatedNode, BinarySource, BrandingSettings,
@@ -180,14 +185,57 @@ pub const EMBEDDED_AGENTS: &[(&str, &[u8], &str)] = &[
     ),
 ];
 
-pub use crate::embedded_xray::{BROCADE_XRAY_VERSION, EMBEDDED_XRAYS};
+#[cfg(feature = "cvm")]
+const EMBEDDED_CVM_AGENTS: &[(&str, &[u8], &str)] = &[
+    (
+        "x86_64",
+        include_bytes!(concat!(env!("OUT_DIR"), "/brocade-agent-cvm-x86_64")),
+        env!("BROCADE_EMBEDDED_CVM_AGENT_SHA256_X86_64"),
+    ),
+    (
+        "aarch64",
+        include_bytes!(concat!(env!("OUT_DIR"), "/brocade-agent-cvm-aarch64")),
+        env!("BROCADE_EMBEDDED_CVM_AGENT_SHA256_AARCH64"),
+    ),
+];
 
-fn embedded_agent(arch: &str) -> Option<(&'static [u8], &'static str)> {
-    EMBEDDED_AGENTS
-        .iter()
-        .find(|(name, ..)| *name == arch)
-        .map(|(_, bytes, sha)| (*bytes, *sha))
+fn agents_for(
+    flavor: brocade_deployment::product::ProductFlavor,
+) -> Option<&'static [(&'static str, &'static [u8], &'static str)]> {
+    use brocade_deployment::product::ProductFlavor;
+    match flavor {
+        ProductFlavor::Base => Some(EMBEDDED_AGENTS),
+        #[cfg(feature = "cvm")]
+        ProductFlavor::Cvm => Some(EMBEDDED_CVM_AGENTS),
+        #[cfg(not(feature = "cvm"))]
+        ProductFlavor::Cvm => None,
+    }
 }
+
+fn agent_release_id_for(
+    flavor: brocade_deployment::product::ProductFlavor,
+) -> Option<&'static str> {
+    use brocade_deployment::product::ProductFlavor;
+    if flavor == ProductFlavor::Base {
+        return Some(embedded_release_id());
+    }
+    let agents = agents_for(flavor)?;
+    static ID: OnceLock<String> = OnceLock::new();
+    Some(
+        ID.get_or_init(|| {
+            let mut hasher = Sha256::new();
+            hasher.update(flavor.as_str().as_bytes());
+            for (arch, _, sha) in agents {
+                hasher.update(arch.as_bytes());
+                hasher.update(sha.as_bytes());
+            }
+            hex_lower(&hasher.finalize())
+        })
+        .as_str(),
+    )
+}
+
+pub use crate::embedded_xray::{BROCADE_XRAY_VERSION, EMBEDDED_XRAYS};
 
 fn embedded_xray(arch: &str) -> Option<(&'static [u8], &'static str)> {
     EMBEDDED_XRAYS
@@ -264,6 +312,8 @@ pub struct AgentDistribution {
     phantun_server_sha256: Option<String>,
     phantun_client_url: Option<String>,
     phantun_client_sha256: Option<String>,
+    #[cfg(feature = "cvm")]
+    cvm_bundles: BTreeMap<String, (String, String)>,
 }
 
 impl AgentDistribution {
@@ -317,6 +367,8 @@ pub struct AppState {
     // One process-local live channel shared by the admin and Agent route trees. It contains no
     // durable samples; persistence is limited to the policy stored by PgStore.
     realtime: crate::realtime::RealtimeService,
+    #[cfg(feature = "cvm")]
+    terminals: crate::cvm::terminal::Service,
     // Long-lived HTTP bodies and upgraded connections must end when the process begins draining.
     // The listener lifecycle still owns a hard deadline, so forgetting to observe this signal in
     // a future endpoint cannot make shutdown unbounded.
@@ -341,6 +393,8 @@ pub struct ConsoleServices {
     geoip: crate::geoip::GeoIpLookup,
     realtime: crate::realtime::RealtimeService,
     forwarding_probes: crate::forwarding_probe::Service,
+    #[cfg(feature = "cvm")]
+    terminals: crate::cvm::terminal::Service,
     bootstrap_credential: Option<BootstrapCredential>,
     shutdown: crate::lifecycle::ShutdownSignal,
 }
@@ -360,6 +414,8 @@ impl ConsoleServices {
             geoip,
             realtime,
             forwarding_probes: Default::default(),
+            #[cfg(feature = "cvm")]
+            terminals: Default::default(),
             bootstrap_credential: None,
             shutdown: crate::lifecycle::ShutdownSignal::new(),
         }
@@ -381,6 +437,10 @@ impl ConsoleServices {
             .and_realtime(self.realtime)
             .and_shutdown(self.shutdown);
         state.forwarding_probes = self.forwarding_probes;
+        #[cfg(feature = "cvm")]
+        {
+            state.terminals = self.terminals;
+        }
         agent_routes(state.clone())
             .route("/healthz", get(healthz))
             .with_state(state)
@@ -505,6 +565,8 @@ impl AppState {
             grant_probes: crate::grant_probe::GrantProbeService::from_env(),
             forwarding_probes: crate::forwarding_probe::Service::default(),
             realtime: crate::realtime::RealtimeService::new(Default::default()),
+            #[cfg(feature = "cvm")]
+            terminals: Default::default(),
             shutdown: crate::lifecycle::ShutdownSignal::new(),
             dist: AgentDistribution {
                 agent_public_url,
@@ -533,6 +595,8 @@ impl AppState {
                 phantun_client_sha256: env::var("BROCADE_PHANTUN_CLIENT_SHA256")
                     .ok()
                     .and_then(normalize_token),
+                #[cfg(feature = "cvm")]
+                cvm_bundles: cvm_bundles_from_env(),
             },
         }
     }
@@ -560,7 +624,7 @@ struct ProvisionEnrollmentHttpResponse {
 impl ProvisionNodeHttpResponse {
     fn new(result: ProvisionNodeResult, dist: &AgentDistribution) -> Self {
         let script_url = format!("{}/enroll/install.sh", dist.agent_public_url);
-        let script_sha256 = install_script_sha256();
+        let script_sha256 = install_script_sha256(dist);
         let install_command = install_command(
             dist,
             &script_url,
@@ -705,6 +769,10 @@ pub fn admin_router_with_services(store: PgStore, services: ConsoleServices) -> 
         .and_shutdown(services.shutdown)
         .and_bootstrap_credential(services.bootstrap_credential);
     state.forwarding_probes = forwarding_probes;
+    #[cfg(feature = "cvm")]
+    {
+        state.terminals = services.terminals;
+    }
     admin_router_with_state(state)
 }
 
@@ -736,6 +804,10 @@ pub fn merged_router_with_wakes_and_realtime(
         .and_shutdown(services.shutdown)
         .and_bootstrap_credential(services.bootstrap_credential);
     state.forwarding_probes = services.forwarding_probes;
+    #[cfg(feature = "cvm")]
+    {
+        state.terminals = services.terminals;
+    }
     admin_router_with_state(state.clone()).merge(agent_routes(state.clone()).with_state(state))
 }
 
@@ -768,6 +840,8 @@ async fn mask_assets(request: Request, next: Next) -> Response {
     let self_response = request_admin().is_some_and(|admin| {
         admin.role == AdminRole::User
             && (self_route_may_hold_secrets(request.method(), request.uri().path())
+                || (admin.self_user.is_some()
+                    && is_user_cvm_path(request.method(), request.uri().path()))
                 || forwarding_route_is_for_self(&admin, request.method(), request.uri().path()))
     });
     let response = next.run(request).await;
@@ -893,6 +967,7 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         || is_user_forwarding_overview_path(path)
         || is_tunnel_probe_view_path(path)
         || is_unlock_probe_view_path(path)
+        || is_cvm_view_path(path)
 }
 
 fn is_unlock_probe_view_path(path: &str) -> bool {
@@ -952,6 +1027,74 @@ fn user_may(method: &axum::http::Method, path: &str) -> bool {
             && is_grant_probe_job_path(path))
         || (method == axum::http::Method::GET && is_grant_probe_events_path(path))
         || is_user_forwarding_path(method, path)
+        || is_user_cvm_path(method, path)
+}
+
+#[cfg(feature = "cvm")]
+fn is_cvm_view_path(path: &str) -> bool {
+    let parts: Vec<_> = path.trim_start_matches('/').split('/').collect();
+    match parts.as_slice() {
+        ["cvm"] | ["cvm", "networks" | "readings" | "entries"] => true,
+        ["cvm", id] | ["cvm", id, "monitoring" | "network" | "entries"] => {
+            !matches!(*id, "quota" | "readings" | "entries" | "entry-publications")
+                && brocade_deployment::cvm::valid_id(id)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "cvm")]
+fn is_user_cvm_path(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    if *method == Method::GET && is_cvm_view_path(path) {
+        return true;
+    }
+    let parts: Vec<_> = path.trim_start_matches('/').split('/').collect();
+    match parts.as_slice() {
+        ["cvm"] | ["cvm", "entries"] => *method == Method::POST,
+        ["cvm", "entries", id] if brocade_deployment::cvm::valid_id(id) => {
+            *method == Method::DELETE
+        }
+        ["cvm", "entries", id, "target"] if brocade_deployment::cvm::valid_id(id) => {
+            *method == Method::PUT
+        }
+        ["cvm", id, "operations"]
+            if !matches!(*id, "quota" | "readings") && brocade_deployment::cvm::valid_id(id) =>
+        {
+            *method == Method::POST
+        }
+        ["cvm", id, "terminal"] if brocade_deployment::cvm::valid_id(id) => *method == Method::POST,
+        ["cvm", id, "terminal", session, "stream"]
+            if brocade_deployment::cvm::valid_id(id)
+                && brocade_deployment::cvm::terminal::valid_session(session) =>
+        {
+            *method == Method::GET
+        }
+        ["cvm", id, "routes" | "interface-versions"] if brocade_deployment::cvm::valid_id(id) => {
+            *method == Method::PUT
+        }
+        ["cvm", id, "interfaces"] if brocade_deployment::cvm::valid_id(id) => {
+            *method == Method::POST
+        }
+        ["cvm", id, "interfaces", nic, "transport" | "version"]
+            if brocade_deployment::cvm::valid_id(id) && brocade_deployment::cvm::valid_id(nic) =>
+        {
+            *method == Method::PUT
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(feature = "cvm"))]
+fn is_cvm_view_path(path: &str) -> bool {
+    let _ = path;
+    false
+}
+
+#[cfg(not(feature = "cvm"))]
+fn is_user_cvm_path(method: &axum::http::Method, path: &str) -> bool {
+    let _ = (method, path);
+    false
 }
 
 // The handler/store checks the authenticated self_user before returning any policy.
@@ -1159,8 +1302,118 @@ fn masking_failed(detail: &str) -> Response {
         .into_response()
 }
 
+#[cfg(feature = "cvm")]
+fn cvm_admin_routes() -> Router<AppState> {
+    Router::new()
+        .route("/cvm", get(cvm::workspace).post(cvm::create))
+        .route("/cvm/quota", put(cvm::quota))
+        .route(
+            "/cvm/quota/network/preview",
+            post(cvm::network_quota_preview),
+        )
+        .route("/cvm/readings", get(cvm::readings))
+        .route("/cvm/{id}", get(cvm::instance))
+        .route("/cvm/{id}/monitoring", get(cvm::monitoring))
+        .route("/cvm/{id}/terminal", post(cvm::terminal::create))
+        .route("/cvm/hosts/{node}/terminal", put(cvm::terminal::policy))
+        .route("/cvm/hosts/{node}", put(cvm::host_policy))
+        .route(
+            "/cvm/networks",
+            get(cvm::nics::catalog).post(cvm::nics::create_publication),
+        )
+        .route(
+            "/cvm/networks/{id}",
+            put(cvm::nics::update_publication).delete(cvm::nics::delete_publication),
+        )
+        .route("/cvm/networks/{id}/admission", put(cvm::nics::admission))
+        .route("/cvm/{id}/network", get(cvm::nics::instance_network))
+        .route(
+            "/cvm/entries",
+            get(cvm::entries::board).post(cvm::entries::create),
+        )
+        .route("/cvm/entries/{id}", delete(cvm::entries::release))
+        .route("/cvm/entries/{id}/target", put(cvm::entries::repoint))
+        .route("/cvm/{id}/entries", get(cvm::entries::instance_entries))
+        .route(
+            "/cvm/entry-publications",
+            post(cvm::entries::create_publication),
+        )
+        .route(
+            "/cvm/entry-publications/{id}",
+            put(cvm::entries::update_publication).delete(cvm::entries::delete_publication),
+        )
+        .route(
+            "/cvm/entry-publications/{id}/admission",
+            put(cvm::entries::admission),
+        )
+        .route("/cvm/{id}/interfaces", post(cvm::nics::mount))
+        .route("/cvm/{id}/routes", put(cvm::nics::routes))
+        .route("/cvm/{id}/interface-versions", put(cvm::nics::versions))
+        .route(
+            "/cvm/{id}/interfaces/{nic}/transport",
+            put(cvm::nics::transport),
+        )
+        .route(
+            "/cvm/{id}/interfaces/{nic}/version",
+            put(cvm::nics::version),
+        )
+        .route(
+            "/cvm/{id}/terminal/{session}/stream",
+            get(cvm::terminal::browser),
+        )
+        .route("/cvm/{id}/operations", post(cvm::command))
+}
+#[cfg(not(feature = "cvm"))]
+fn cvm_admin_routes() -> Router<AppState> {
+    Router::new()
+}
+
+#[cfg(feature = "cvm")]
+fn cvm_agent_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/agent/v1/cvm/terminal/control",
+            get(cvm::terminal::control),
+        )
+        .route(
+            "/agent/v1/cvm/terminal/policy",
+            get(cvm::terminal::node_policy),
+        )
+        .route(
+            "/agent/v1/cvm/terminal/{session}/stream",
+            get(cvm::terminal::agent_stream),
+        )
+        .route("/agent/v1/cvm/inventory", post(cvm::inventory))
+        .route("/agent/v1/cvm/nics/inventory", post(cvm::nics::inventory))
+        .route("/agent/v1/cvm/nics/desired", get(cvm::nics::desired))
+        .route("/agent/v1/cvm/nics/report", post(cvm::nics::report))
+        .route("/agent/v1/cvm/entries/desired", get(cvm::entries::desired))
+        .route("/agent/v1/cvm/entries/report", post(cvm::entries::report))
+        .route("/agent/v1/cvm/desired", get(cvm::desired))
+        .route(
+            "/agent/v1/cvm/network-quotas/desired",
+            get(cvm::network_quota_desired),
+        )
+        .route(
+            "/agent/v1/cvm/network-quotas/report",
+            post(cvm::network_quota_report),
+        )
+        .route("/agent/v1/cvm/report", post(cvm::report))
+        .route(
+            "/agent/v1/cvm/observation-targets",
+            get(cvm::observation_targets),
+        )
+        .route("/agent/v1/cvm/observations", post(cvm::observations))
+        .route("/enroll/cvm-stack.py", get(cvm_install_script))
+}
+#[cfg(not(feature = "cvm"))]
+fn cvm_agent_routes() -> Router<AppState> {
+    Router::new()
+}
+
 fn admin_router_with_state(state: AppState) -> Router {
     Router::new()
+        .merge(cvm_admin_routes())
         .route("/healthz", get(healthz))
         .route("/console/version", get(console_version))
         .route("/diagnostics/performance", get(performance_diagnostics))
@@ -1796,6 +2049,7 @@ pub fn merged_router(store: PgStore, quota_wake: Arc<Notify>, agent_origin: Stri
 /// The agent-facing routes, without `/healthz`. See `merged_router`.
 fn agent_routes(state: AppState) -> Router<AppState> {
     Router::new()
+        .merge(cvm_agent_routes())
         .route("/enroll/install.sh", get(install_script))
         .route("/enroll/dist", get(install_dist))
         .route("/brocade-agent/{arch}", get(agent_binary))
@@ -1875,6 +2129,7 @@ fn agent_routes(state: AppState) -> Router<AppState> {
             "/agent/v1/xray-handoff/force",
             post(agent_config_xray_force_retirement),
         )
+        .route("/agent/v1/product/base-ready", get(agent_base_ready))
         .route("/agent/v1/agent-release", get(agent_release))
         .route("/agent/v1/agent-release/report", post(agent_release_report))
         .route("/agent/v1/xray-release", get(agent_xray_release))
@@ -1952,6 +2207,7 @@ async fn performance_diagnostics(
         .map_err(|message| StoreError::Unavailable(message.to_owned()))?;
     let database = state.store.performance_database_state().await?;
     let pool = state.store.pool();
+    let listener_pool = state.store.listener_pool();
     let mut response = Json(json!({
         "performance": snapshot,
         "database": database,
@@ -1959,6 +2215,11 @@ async fn performance_diagnostics(
             "size": pool.size(),
             "idle": pool.num_idle(),
             "max_connections": pool.options().get_max_connections(),
+        },
+        "listener_pool": {
+            "size": listener_pool.size(),
+            "idle": listener_pool.num_idle(),
+            "max_connections": listener_pool.options().get_max_connections(),
         },
     }))
     .into_response();
@@ -2481,6 +2742,7 @@ async fn whoami(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<
 struct BootstrapHttpResponse {
     who: WhoamiHttpResponse,
     initial: ConsoleInitialData,
+    features: brocade_deployment::product::ProductFeatures,
 }
 
 async fn bootstrap(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
@@ -2493,6 +2755,9 @@ async fn bootstrap(State(state): State<AppState>, headers: HeaderMap) -> ApiResu
             admin,
         },
         initial,
+        features: brocade_deployment::product::ProductFeatures {
+            cvm: cfg!(feature = "cvm"),
+        },
     })
     .into_response();
     response
@@ -2656,9 +2921,16 @@ async fn preview_draft(
     headers: HeaderMap,
     Json(request): Json<DraftRequest>,
 ) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
-    let preview = state.store.preview_draft(&admin, request.ops).await?;
-    Ok(Json(preview).into_response())
+    model_timing::observe(TimedOperation::DraftPreview, request.ops.len(), async {
+        let admin = model_timing::measure(
+            "authenticate",
+            require_admin_context(&state, &headers, AdminPermission::Edit),
+        )
+        .await?;
+        let preview = state.store.preview_draft(&admin, request.ops).await?;
+        model_timing::measure_sync("response_serialize", || Ok(Json(preview).into_response()))
+    })
+    .await
 }
 
 /// The contents of one artifact within a draft. The selector matches the three segments of
@@ -2696,16 +2968,21 @@ async fn apply_draft(
     headers: HeaderMap,
     Json(request): Json<DraftRequest>,
 ) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
-    let result = state
-        .store
-        .apply_draft(&admin, request.ops, request.note)
+    model_timing::observe(TimedOperation::DraftApply, request.ops.len(), async {
+        let admin = model_timing::measure(
+            "authenticate",
+            require_admin_context(&state, &headers, AdminPermission::Edit),
+        )
         .await?;
-    // Waking on every committed draft is intentionally cheap.  The durable queue decides whether
-    // the draft actually changed grants; duplicating that classification in the HTTP layer would
-    // eventually drift from ModelOp.
-    state.grants_wake.notify_one();
-    Ok(Json(result).into_response())
+        let result = state
+            .store
+            .apply_draft(&admin, request.ops, request.note)
+            .await?;
+        // The durable queue decides whether the draft actually changed grants.
+        state.grants_wake.notify_one();
+        model_timing::measure_sync("response_serialize", || Ok(Json(result).into_response()))
+    })
+    .await
 }
 
 async fn compile_revision(
@@ -4641,6 +4918,7 @@ async fn scan_certs(State(state): State<AppState>, headers: HeaderMap) -> ApiRes
 /// provider's current selection; immutable work orders only retain the manifest.
 #[derive(Serialize)]
 struct BinaryCatalog {
+    agent_flavor: Option<brocade_deployment::product::ProductFlavor>,
     component: brocade_store::BinaryComponent,
     build_id: &'static str,
     version: &'static str,
@@ -4669,6 +4947,8 @@ fn binary_catalog(component: brocade_store::BinaryComponent) -> BinaryCatalog {
         ),
     };
     BinaryCatalog {
+        agent_flavor: (component == BinaryComponent::Agent)
+            .then_some(brocade_deployment::product::ProductFlavor::Base),
         component,
         build_id,
         version,
@@ -4679,10 +4959,40 @@ fn binary_catalog(component: brocade_store::BinaryComponent) -> BinaryCatalog {
 
 #[derive(Serialize)]
 struct BinaryReleaseView {
+    available_variants: Vec<BinaryCatalog>,
     available: BinaryCatalog,
     current: Option<brocade_store::BinaryRelease>,
     /// Pre-ledger approval is a baseline, never an invented completed release or live policy.
     legacy_approval: Option<AgentRelease>,
+}
+
+fn binary_catalog_for_flavor(
+    component: brocade_store::BinaryComponent,
+    flavor: Option<brocade_deployment::product::ProductFlavor>,
+) -> Result<BinaryCatalog, StoreError> {
+    let mut catalog = binary_catalog(component);
+    if component == brocade_store::BinaryComponent::Agent {
+        let flavor = flavor
+            .ok_or_else(|| StoreError::InvalidData("Agent flavor must be explicit".into()))?;
+        let agents = agents_for(flavor)
+            .ok_or_else(|| StoreError::Unsupported("当前 Console 未安装容器扩展".into()))?;
+        catalog.agent_flavor = Some(flavor);
+        if flavor == brocade_deployment::product::ProductFlavor::Cvm {
+            catalog.version = env!("BROCADE_CVM_AGENT_SOURCE_REVISION");
+        }
+        catalog.build_id =
+            agent_release_id_for(flavor).expect("catalog existence proves release identity");
+        catalog.artifacts = agents
+            .iter()
+            .map(|(arch, _, sha)| brocade_store::BinaryReleaseArtifact {
+                arch: (*arch).into(),
+                sha256: (*sha).into(),
+            })
+            .collect();
+    } else if flavor.is_some() {
+        return Err(StoreError::InvalidData("Xray has no Agent flavor".into()));
+    }
+    Ok(catalog)
 }
 
 async fn binary_release_view(
@@ -4707,7 +5017,20 @@ async fn binary_release_view(
     } else {
         None
     };
+    let available_variants = if component == brocade_store::BinaryComponent::Agent {
+        [
+            brocade_deployment::product::ProductFlavor::Base,
+            brocade_deployment::product::ProductFlavor::Cvm,
+        ]
+        .into_iter()
+        .filter(|flavor| agents_for(*flavor).is_some())
+        .map(|flavor| binary_catalog_for_flavor(component, Some(flavor)))
+        .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
     Ok(BinaryReleaseView {
+        available_variants,
         available: binary_catalog(component),
         current,
         legacy_approval,
@@ -4730,7 +5053,7 @@ async fn create_binary_release(
     Json(request): Json<brocade_store::CreateBinaryReleaseRequest>,
 ) -> ApiResult<Response> {
     let actor = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
-    let catalog = binary_catalog(component);
+    let catalog = binary_catalog_for_flavor(component, request.agent_flavor)?;
     state
         .store
         .create_binary_release(
@@ -4847,7 +5170,15 @@ async fn retry_binary_release(
             &actor,
             id,
             &node,
-            binary_catalog(component).build_id,
+            binary_catalog_for_flavor(
+                component,
+                state
+                    .store
+                    .binary_release(component, id, false)
+                    .await?
+                    .agent_flavor,
+            )?
+            .build_id,
         )
         .await?;
     Ok(Json(binary_release_view(&state, component).await?).into_response())
@@ -5026,6 +5357,7 @@ fn require_complete_settings(value: &serde_json::Value) -> ApiResult<()> {
 /// and `Exec format error` is several layers removed from the cause.
 #[derive(Default, Deserialize)]
 struct BinaryDownloadQuery {
+    flavor: Option<brocade_deployment::product::ProductFlavor>,
     sha256: Option<String>,
 }
 
@@ -5033,7 +5365,12 @@ async fn agent_binary(
     Path(arch): Path<String>,
     Query(query): Query<BinaryDownloadQuery>,
 ) -> Response {
-    let Some((bytes, sha)) = embedded_agent(&arch) else {
+    let flavor = query
+        .flavor
+        .unwrap_or(brocade_deployment::product::ProductFlavor::Base);
+    let Some((_, bytes, sha)) =
+        agents_for(flavor).and_then(|agents| agents.iter().find(|(name, _, _)| *name == arch))
+    else {
         return (
             StatusCode::NOT_FOUND,
             format!(
@@ -5049,6 +5386,7 @@ async fn agent_binary(
         )
             .into_response();
     };
+    let (bytes, sha) = (*bytes, *sha);
     if query.sha256.as_deref().is_some_and(|wanted| wanted != sha) {
         return (
             StatusCode::CONFLICT,
@@ -5148,13 +5486,45 @@ fn dist_json(d: &AgentDistribution) -> serde_json::Value {
             json!(format!("{}/brocade-xray/{arch}", d.agent_public_url));
         dist[format!("xray_bin_sha256_{arch}")] = json!(sha256);
     }
+    for flavor in [
+        brocade_deployment::product::ProductFlavor::Base,
+        brocade_deployment::product::ProductFlavor::Cvm,
+    ] {
+        if let Some(agents) = agents_for(flavor) {
+            for (arch, _, sha) in agents {
+                dist[format!("agent_bin_url_{flavor}_{arch}")] = json!(format!(
+                    "{}/brocade-agent/{arch}?flavor={flavor}",
+                    d.agent_public_url
+                ));
+                dist[format!("agent_bin_sha256_{flavor}_{arch}")] = json!(sha);
+            }
+        }
+    }
+    #[cfg(feature = "cvm")]
+    {
+    dist["cvm_installer_url"] = json!(format!("{}/enroll/cvm-stack.py", d.agent_public_url));
+    dist["cvm_installer_sha256"] = json!(sha256_hex(CVM_INSTALLER.as_bytes()));
+    for (arch, (url, sha)) in &d.cvm_bundles {
+        dist[format!("cvm_bundle_url_{arch}")] = json!(url);
+        dist[format!("cvm_bundle_sha256_{arch}")] = json!(sha);
+    }
+    }
     dist
 }
 
-async fn install_script() -> Response {
+#[cfg(feature = "cvm")]
+async fn cvm_install_script() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/x-python; charset=utf-8")],
+        CVM_INSTALLER,
+    )
+        .into_response()
+}
+
+async fn install_script(State(state): State<AppState>) -> Response {
     (
         [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
-        INSTALL_SCRIPT,
+        rendered_install_script(&state.dist),
     )
         .into_response()
 }
@@ -5169,12 +5539,20 @@ async fn plan_deployment(
     headers: HeaderMap,
     Json(request): Json<PlanDeploymentRequest>,
 ) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
-    let plan = state
-        .store
-        .plan_deployment(&admin, request.revision_id)
+    model_timing::observe(TimedOperation::DeploymentPlan, 1, async {
+        let admin = model_timing::measure(
+            "authenticate",
+            require_admin_context(&state, &headers, AdminPermission::Edit),
+        )
         .await?;
-    Ok(Json(plan).into_response())
+        let plan = model_timing::measure(
+            "deployment_plan",
+            state.store.plan_deployment(&admin, request.revision_id),
+        )
+        .await?;
+        model_timing::measure_sync("response_serialize", || Ok(Json(plan).into_response()))
+    })
+    .await
 }
 
 async fn plan_deployment_artifacts(
@@ -5183,17 +5561,31 @@ async fn plan_deployment_artifacts(
     headers: HeaderMap,
     Json(request): Json<PlanDeploymentRequest>,
 ) -> ApiResult<Response> {
-    let permission = if query.include_content() {
-        AdminPermission::SystemAdmin
-    } else {
-        AdminPermission::Edit
-    };
-    let admin = require_admin_context(&state, &headers, permission).await?;
-    let targets = state
-        .store
-        .plan_deployment_artifacts(&admin, request.revision_id, query.include_content())
+    model_timing::observe(TimedOperation::DeploymentArtifacts, 1, async {
+        let permission = if query.include_content() {
+            AdminPermission::SystemAdmin
+        } else {
+            AdminPermission::Edit
+        };
+        let admin = model_timing::measure(
+            "authenticate",
+            require_admin_context(&state, &headers, permission),
+        )
         .await?;
-    Ok(Json(json!({"revision": request.revision_id, "targets": targets})).into_response())
+        let targets = model_timing::measure(
+            "deployment_artifacts",
+            state.store.plan_deployment_artifacts(
+                &admin,
+                request.revision_id,
+                query.include_content(),
+            ),
+        )
+        .await?;
+        model_timing::measure_sync("response_serialize", || {
+            Ok(Json(json!({"revision": request.revision_id, "targets": targets})).into_response())
+        })
+    })
+    .await
 }
 
 async fn verify_deployment(
@@ -5201,9 +5593,20 @@ async fn verify_deployment(
     headers: HeaderMap,
     Json(request): Json<VerifyDeploymentRequest>,
 ) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::Read).await?;
-    let result = state.store.verify_deployment(&admin, request).await?;
-    Ok(Json(result).into_response())
+    model_timing::observe(TimedOperation::DeploymentVerify, 1, async {
+        let admin = model_timing::measure(
+            "authenticate",
+            require_admin_context(&state, &headers, AdminPermission::Read),
+        )
+        .await?;
+        let result = model_timing::measure(
+            "deployment_verify",
+            state.store.verify_deployment(&admin, request),
+        )
+        .await?;
+        model_timing::measure_sync("response_serialize", || Ok(Json(result).into_response()))
+    })
+    .await
 }
 
 async fn create_deployment(
@@ -5211,10 +5614,19 @@ async fn create_deployment(
     headers: HeaderMap,
     Json(mut request): Json<CreateDeploymentRequest>,
 ) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::Publish).await?;
-    request.actor = Some(admin.operator_id().to_owned());
-    let result = state.store.create_deployment(&admin, request).await?;
-    Ok((StatusCode::CREATED, Json(result)).into_response())
+    model_timing::observe(TimedOperation::DeploymentCreate, 1, async {
+        let admin = model_timing::measure(
+            "authenticate",
+            require_admin_context(&state, &headers, AdminPermission::Publish),
+        )
+        .await?;
+        request.actor = Some(admin.operator_id().to_owned());
+        let result = state.store.create_deployment(&admin, request).await?;
+        model_timing::measure_sync("response_serialize", || {
+            Ok((StatusCode::CREATED, Json(result)).into_response())
+        })
+    })
+    .await
 }
 
 async fn create_rollback_deployment(
@@ -5490,7 +5902,7 @@ async fn issue_node_token(
     let result = state.store.reissue_node_token(&node_id).await?;
     let dist = state.distribution().await?;
     let script_url = format!("{}/enroll/install.sh", dist.agent_public_url);
-    let script_sha256 = install_script_sha256();
+    let script_sha256 = install_script_sha256(&dist);
     let install_command = install_command(
         &dist,
         &script_url,
@@ -7284,10 +7696,21 @@ async fn upsert_chain(
     headers: HeaderMap,
     Json(request): Json<CreateChainRequest>,
 ) -> ApiResult<Response> {
-    let admin = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
-    let result = state.store.upsert_chain(&admin, &app_id, request).await?;
-    state.grants_wake.notify_one();
-    Ok(Json(result).into_response())
+    model_timing::observe(TimedOperation::ChainSave, 1, async {
+        let admin = model_timing::measure(
+            "authenticate",
+            require_admin_context(&state, &headers, AdminPermission::Edit),
+        )
+        .await?;
+        let result = model_timing::measure(
+            "chain_write",
+            state.store.upsert_chain(&admin, &app_id, request),
+        )
+        .await?;
+        state.grants_wake.notify_one();
+        model_timing::measure_sync("response_serialize", || Ok(Json(result).into_response()))
+    })
+    .await
 }
 
 async fn reorder_chains(
@@ -7678,6 +8101,25 @@ fn with_host_network_tuning(mut response: Response, settings: HostNetworkTuning)
 /// release id is also computed from the *embedded* shas, so serving other bytes under it would
 /// make the console report a build the fleet is not running. Machines outside the embedded
 /// architectures therefore upgrade the way they were installed, through `install.sh`.
+async fn agent_base_ready(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+    let node = authenticate_agent(&state.store, &headers).await?;
+    state.store.ensure_node_cvm_released(&node.node_id).await?;
+    Ok(Json(serde_json::json!({"base_ready":true})).into_response())
+}
+
+fn reported_agent_flavor(
+    headers: &HeaderMap,
+) -> Result<brocade_deployment::product::ProductFlavor, StoreError> {
+    let Some(value) = headers.get("x-brocade-flavor") else {
+        return Ok(brocade_deployment::product::ProductFlavor::Base);
+    };
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| StoreError::InvalidData("invalid Agent flavor".into()))
+}
+
 async fn agent_release(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
     let node = authenticate_agent(&state.store, &headers).await?;
     if node.lifecycle_phase != NodeLifecyclePhase::Active {
@@ -7691,21 +8133,30 @@ async fn agent_release(State(state): State<AppState>, headers: HeaderMap) -> Api
     else {
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
-    let receipt_capable = headers
-        .get("x-brocade-agent-release-receipt")
-        .and_then(|h| h.to_str().ok())
-        == Some("1");
+    let Some(target_flavor) = state
+        .store
+        .agent_release_target_flavor(&node.node_id)
+        .await?
+    else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    let running_flavor = reported_agent_flavor(&headers)?;
+    let Some(build_id) = agent_release_id_for(target_flavor) else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
     let Some(assignment) = state
         .store
-        .claim_agent_release(&node.node_id, arch, embedded_release_id(), receipt_capable)
+        .claim_agent_release_for_flavor(&node.node_id, arch, build_id, running_flavor)
         .await?
     else {
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
     let dist = state.distribution().await?;
     Ok(Json(brocade_deployment::protocol::AgentReleaseOffer {
+        flavor: target_flavor,
+        allow_flavor_change: running_flavor != target_flavor,
         url: format!(
-            "{}/brocade-agent/{arch}?sha256={}",
+            "{}/brocade-agent/{arch}?flavor={target_flavor}&sha256={}",
             dist.agent_public_url, assignment.sha256
         ),
         sha256: assignment.sha256,
@@ -9285,6 +9736,35 @@ fn normalize_url(url: String) -> Option<String> {
     }
 }
 
+#[cfg(feature = "cvm")]
+fn cvm_bundle_source(url: &str, sha: &str) -> Option<(String, String)> {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    let sha = sha.trim().to_ascii_lowercase();
+    (matches!(parsed.scheme(), "http" | "https")
+        && parsed.host_str().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && url.len() <= 4096
+        && sha.len() == 64
+        && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| (parsed.to_string(), sha))
+}
+
+#[cfg(feature = "cvm")]
+fn cvm_bundles_from_env() -> BTreeMap<String, (String, String)> {
+    ["x86_64", "aarch64"].into_iter().filter_map(|arch| {
+        let suffix = arch.to_ascii_uppercase();
+        let url = env::var(format!("BROCADE_CVM_BUNDLE_URL_{suffix}")).ok();
+        let sha = env::var(format!("BROCADE_CVM_BUNDLE_SHA256_{suffix}")).ok();
+        if url.is_none() && sha.is_none() { return None; }
+        if let Some(source) = url.as_deref().zip(sha.as_deref()).and_then(|(url, sha)| cvm_bundle_source(url, sha)) {
+            return Some((arch.to_owned(), source));
+        }
+        eprintln!("CVM {arch} 分发未启用：BROCADE_CVM_BUNDLE_URL_{suffix} 与 BROCADE_CVM_BUNDLE_SHA256_{suffix} 需要有效 HTTP 地址和 SHA-256");
+        None
+    }).collect()
+}
+
 fn resolve_agent_public_url(configured: String, stored: Option<String>) -> String {
     stored.and_then(normalize_url).unwrap_or(configured)
 }
@@ -9363,8 +9843,35 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn install_script_sha256() -> String {
-    sha256_hex(INSTALL_SCRIPT.as_bytes())
+fn install_script_sha256(distribution: &AgentDistribution) -> String {
+    sha256_hex(rendered_install_script(distribution).as_bytes())
+}
+
+fn rendered_install_script(distribution: &AgentDistribution) -> String {
+    #[cfg(feature = "cvm")]
+    let (installer, bundles) = {
+        let mut bundles = serde_json::Map::new();
+        for (arch, (url, sha)) in &distribution.cvm_bundles {
+            bundles.insert(format!("cvm_bundle_url_{arch}"), json!(url));
+            bundles.insert(format!("cvm_bundle_sha256_{arch}"), json!(sha));
+        }
+        (
+            sha256_hex(CVM_INSTALLER.as_bytes()),
+            serde_json::Value::Object(bundles).to_string(),
+        )
+    };
+    #[cfg(not(feature = "cvm"))]
+    let (installer, bundles) = {
+        let _ = distribution;
+        (String::new(), "{}".to_owned())
+    };
+    INSTALL_SCRIPT
+        .replace("__BROCADE_CVM_INSTALLER_SHA256__", &installer)
+        .replace("__BROCADE_CVM_APPROVED_BUNDLES__", &shell_quote(&bundles))
+        .replace(
+            "__BROCADE_CVM_SUPPORTED__",
+            if cfg!(feature = "cvm") { "1" } else { "0" },
+        )
 }
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -9473,9 +9980,34 @@ struct ErrorBody {
 /// Split out, `templates/install.sh` is an ordinary script that `sh -n` and `shellcheck` read
 /// directly.
 const INSTALL_SCRIPT: &str = include_str!("../templates/install.sh");
+#[cfg(feature = "cvm")]
+const CVM_INSTALLER: &str = include_str!("../../../scripts/cvm_stack.py");
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_agent_flavor_defaults_only_missing_headers_to_base() {
+        use brocade_deployment::product::ProductFlavor;
+
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(
+            super::reported_agent_flavor(&headers).unwrap(),
+            ProductFlavor::Base
+        );
+        for (value, expected) in [("base", ProductFlavor::Base), ("cvm", ProductFlavor::Cvm)] {
+            headers.insert("x-brocade-flavor", value.parse().unwrap());
+            assert_eq!(super::reported_agent_flavor(&headers).unwrap(), expected);
+        }
+        for value in [
+            axum::http::HeaderValue::from_static(""),
+            axum::http::HeaderValue::from_static("unknown"),
+            axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        ] {
+            headers.insert("x-brocade-flavor", value);
+            assert!(super::reported_agent_flavor(&headers).is_err());
+        }
+    }
+
     #[test]
     fn legacy_forwarding_agents_receive_only_public_literal_targets() {
         let desired: brocade_deployment::protocol::ForwardingDesiredState = serde_json::from_value(serde_json::json!({
@@ -9539,6 +10071,7 @@ mod tests {
     fn xray_offer_preflights_the_executable_version_not_the_source_revision() {
         let offer = super::xray_release_offer(
             brocade_store::BinaryReleaseAssignment {
+                agent_flavor: None,
                 release_id: 7,
                 attempt: 2,
                 version: "fork-source-revision-dirty".to_owned(),
@@ -10676,6 +11209,53 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cvm")]
+    fn user_cvm_monitoring_is_readable_without_opening_writes_or_subpaths() {
+        use axum::http::Method;
+        assert!(user_may(&Method::GET, "/cvm/cvm-owned/monitoring"));
+        assert!(user_may(&Method::GET, "/cvm/readings"));
+        for method in [Method::POST, Method::PUT, Method::DELETE] {
+            assert!(!user_may(&method, "/cvm/cvm-owned/monitoring"));
+        }
+        assert!(!user_may(&Method::GET, "/cvm/cvm-owned/monitoring/extra"));
+        assert!(public_may(&Method::GET, "/cvm/cvm-owned/monitoring"));
+    }
+
+    #[test]
+    #[cfg(feature = "cvm")]
+    fn public_cvm_reads_exclude_mutations_terminals_and_extra_subpaths() {
+        use axum::http::Method;
+        for path in [
+            "/cvm",
+            "/cvm/readings",
+            "/cvm/cvm-owned",
+            "/cvm/cvm-owned/monitoring",
+            "/cvm/cvm-owned/network",
+        ] {
+            assert!(public_may(&Method::GET, path), "should allow GET {path}");
+            for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+                assert!(!public_may(&method, path), "should refuse {method} {path}");
+            }
+        }
+        for path in [
+            "/cvm/quota",
+            "/cvm/quota/monitoring",
+            "/cvm/",
+            "/cvm//monitoring",
+            "/cvm/cvm-owned/operations",
+            "/cvm/cvm-owned/monitoring/extra",
+            "/cvm/cvm-owned/network/extra",
+            "/cvm/cvm-owned/terminal",
+            "/cvm/hosts/n1/terminal",
+            "/cvm/cvm-owned/terminal/0123456789abcdef0123456789abcdef/stream",
+        ] {
+            for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+                assert!(!public_may(&method, path), "should refuse {method} {path}");
+            }
+        }
+    }
+
+    #[test]
     fn user_cycle_usage_is_readable_without_opening_writes_or_subpaths() {
         use axum::http::Method;
 
@@ -10995,11 +11575,11 @@ mod tests {
     }
 
     #[test]
-    fn installer_agent_self_test_supports_current_and_localized_legacy_executables() {
+    fn installer_agent_self_test_requires_the_selected_product_flavor() {
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
         let start = INSTALL_SCRIPT
-            .find("probe_agent() {")
+            .find("verify_agent_candidate() {")
             .expect("Agent probe exists");
         let end = start
             + INSTALL_SCRIPT[start..]
@@ -11007,19 +11587,24 @@ mod tests {
                 .expect("Agent probe ends")
             + 3;
         assert!(end > start);
-        let script = format!("{}\nprobe_agent", &INSTALL_SCRIPT[start..end]);
+        let script = format!(
+            "{}\nverify_agent_candidate \"$AGENT_BIN\"",
+            &INSTALL_SCRIPT[start..end]
+        );
         let root = tempfile::tempdir().unwrap();
         let candidate = root.path().join("agent");
         let marker = brocade_deployment::protocol::AGENT_SELF_TEST_RESPONSE;
         assert!(INSTALL_SCRIPT.contains(marker));
         for (body, expected) in [
             (
-                format!("#!/bin/sh\n[ \"$1\" = self-test ] || exit 9\nprintf '%s\\n' '{marker}'\n"),
+                format!(
+                    "#!/bin/sh\n[ \"$1\" = self-test ] || exit 9\nprintf '%s\\n' '{marker}' 'brocade-agent-product:base:v1'\n"
+                ),
                 true,
             ),
             (
                 "#!/bin/sh\nprintf '支持命令：run、health\\n' >&2\nexit 1\n".into(),
-                true,
+                false,
             ),
             ("#!/bin/sh\nprintf 'runner run-once\\n'\n".into(), false),
             ("#!/bin/sh\nexit 0\n".into(), false),
@@ -11031,6 +11616,7 @@ mod tests {
             let result = Command::new("sh")
                 .args(["-c", &script])
                 .env("AGENT_BIN", &candidate)
+                .env("AGENT_FLAVOR", "base")
                 .output()
                 .unwrap();
             assert_eq!(result.status.success(), expected, "{result:?}");
@@ -11269,6 +11855,57 @@ mod tests {
         // selecting by architecture
         assert!(dist["agent_bin_url"].is_null());
         assert!(dist["agent_bin_sha256"].is_null());
+    }
+
+    #[test]
+    #[cfg(feature = "cvm")]
+    fn cvm_installer_and_approved_bundles_are_bound_to_the_enrollment_script() {
+        let mut distribution = AgentDistribution::default();
+        let before = super::install_script_sha256(&distribution);
+        let url = "https://distribution.invalid/cvm,a'b.tar.gz";
+        distribution
+            .cvm_bundles
+            .insert("x86_64".into(), (url.into(), "a".repeat(64)));
+        let script = super::rendered_install_script(&distribution);
+        assert!(!script.contains("__BROCADE_CVM_"));
+        assert!(script.contains(&super::sha256_hex(super::CVM_INSTALLER.as_bytes())));
+        assert_ne!(before, super::install_script_sha256(&distribution));
+        assert_eq!(
+            super::sha256_hex(script.as_bytes()),
+            super::install_script_sha256(&distribution)
+        );
+        let assignment = script
+            .lines()
+            .find(|line| line.starts_with("CVM_APPROVED_BUNDLES="))
+            .unwrap();
+        let probe = format!("{assignment}\nprintf '%s' \"$CVM_APPROVED_BUNDLES\" | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"cvm_bundle_url_x86_64\"])'\n");
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(probe)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), url);
+    }
+
+    #[test]
+    #[cfg(feature = "cvm")]
+    fn cvm_bundle_sources_require_a_credential_free_http_url_and_digest() {
+        assert!(super::cvm_bundle_source("file:///tmp/bundle", &"a".repeat(64)).is_none());
+        assert!(super::cvm_bundle_source(
+            "https://operator:example@distribution.invalid/bundle",
+            &"a".repeat(64)
+        )
+        .is_none());
+        assert!(
+            super::cvm_bundle_source("https://distribution.invalid/bundle", "missing").is_none()
+        );
+        assert_eq!(
+            super::cvm_bundle_source("https://distribution.invalid/bundle", &"A".repeat(64))
+                .unwrap()
+                .1,
+            "a".repeat(64)
+        );
     }
 
     /// Parse it with `install.sh`'s own `dist_field`, verbatim.
@@ -11552,6 +12189,42 @@ mod tests {
             .connect_lazy("postgres://brocade:unused@127.0.0.1:1/brocade")
             .unwrap();
         brocade_store::PgStore::from_pool(pool)
+    }
+
+    #[cfg(not(feature = "cvm"))]
+    #[tokio::test]
+    async fn base_product_has_no_cvm_http_or_distribution_routes() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+        let router = super::with_console_static(super::merged_router(
+            offline_store(),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            "https://console.example".into(),
+        ));
+        for path in [
+            "/cvm",
+            "/cvm/instances",
+            "/agent/v1/cvm/desired",
+            "/enroll/cvm-stack.py",
+            "/brocade-agent/x86_64?flavor=cvm",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_ne!(
+                response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|h| h.to_str().ok()),
+                Some("text/html; charset=utf-8")
+            );
+        }
     }
 
     #[tokio::test]

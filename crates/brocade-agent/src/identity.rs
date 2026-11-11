@@ -35,7 +35,18 @@
 
 use std::sync::OnceLock;
 
-use brocade_core::hash::sha256_hex;
+pub(crate) const fn self_flavor() -> brocade_deployment::product::ProductFlavor {
+    brocade_deployment::product::ProductFlavor::from_cvm(cfg!(feature = "cvm"))
+}
+
+/// This marker is also checked when cross-compiled Agents are embedded into Console.
+pub(crate) const fn product_marker() -> &'static str {
+    if cfg!(feature = "cvm") {
+        "brocade-agent-product:cvm:v1"
+    } else {
+        "brocade-agent-product:base:v1"
+    }
+}
 
 /// What is reported when the binary cannot be hashed. Not a version, and deliberately not
 /// shaped like one — anything parseable would eventually be read as one.
@@ -46,14 +57,13 @@ pub(crate) const UNKNOWN: &str = "unknown";
 pub(crate) fn self_sha256() -> Option<&'static str> {
     static SELF: OnceLock<Option<String>> = OnceLock::new();
     SELF.get_or_init(|| {
-        std::fs::read("/proc/self/exe")
+        crate::fsutil::file_sha256(std::path::Path::new("/proc/self/exe"))
             .map_err(|error| {
                 // Said once, at startup, rather than at every use: this is a fact about the
                 // machine, and repeating it every cycle would bury the rounds that matter.
                 eprintln!("identity: 读不了 /proc/self/exe（{error}）；自更新不会启动，版本会报 {UNKNOWN}");
             })
             .ok()
-            .map(|bytes| sha256_hex(&bytes))
     })
     .as_deref()
 }
@@ -80,6 +90,7 @@ pub(crate) fn self_arch() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brocade_core::hash::sha256_hex;
 
     /// The test binary is a binary too, so this exercises the real path rather than a stub.
     #[test]

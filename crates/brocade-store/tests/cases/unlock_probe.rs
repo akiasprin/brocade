@@ -358,7 +358,7 @@ async fn unlock_extended_services_negotiate_by_agent_protocol_and_preserve_legac
 }
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn unlock_schedule_runs_without_browser_persists_and_manual_resets_one_day() {
+async fn unlock_schedule_runs_without_browser_persists_and_manual_resets_default_interval() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -393,8 +393,8 @@ async fn unlock_schedule_runs_without_browser_persists_and_manual_resets_one_day
         .unwrap()
         .unwrap();
     assert_eq!(view.trigger, UnlockProbeTrigger::Scheduled);
-    assert_eq!(view.interval_secs, 86_400);
-    assert!((86_399..=86_401).contains(&(view.next_run_at - view.completed_at.unwrap())));
+    assert_eq!(view.interval_secs, 14_400);
+    assert!((14_399..=14_401).contains(&(view.next_run_at - view.completed_at.unwrap())));
     assert_eq!(
         view.results
             .iter()
@@ -450,7 +450,7 @@ async fn unlock_schedule_runs_without_browser_persists_and_manual_resets_one_day
         .await
         .unwrap()
         .unwrap();
-    assert!((86_399..=86_401).contains(&(done.next_run_at - done.completed_at.unwrap())));
+    assert!((14_399..=14_401).contains(&(done.next_run_at - done.completed_at.unwrap())));
     sqlx::query("UPDATE control_state SET unlock_detection_next_run_at=now()-interval '1 second' WHERE id=TRUE")
         .execute(db.pool())
         .await
@@ -1210,7 +1210,7 @@ async fn unlock_automatic_chain_isolated_from_family_jobs_requires_v52_and_keeps
         .unwrap();
     assert!(done.automatic);
     assert_eq!(done.state, UnlockProbeState::Complete);
-    assert_eq!(done.interval_secs, 86_400);
+    assert_eq!(done.interval_secs, 14_400);
     let other = AdminContext::new("other", AdminRole::Editor, Some("other".into()));
     assert!(matches!(
         db.store
@@ -1746,14 +1746,19 @@ async fn unlock_manual_mode_refreshes_changed_dns_and_full_sweeps_include_fresh_
     };
     setup(&db).await;
     seed_subscription_serving(&db).await;
+    let defaults = db.store.deployment_settings().await.unwrap();
     assert_eq!(
-        db.store
-            .deployment_settings()
-            .await
-            .unwrap()
-            .unlock_detection_mode,
+        defaults.unlock_detection_mode,
         UnlockDetectionMode::Scheduled
     );
+    assert_eq!(defaults.unlock_detection_interval_hours, 4);
+    let initial_cycle: i64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM unlock_detection_next_run_at-unlock_detection_requested_at)::bigint FROM control_state WHERE id=TRUE",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(initial_cycle, 4 * 60 * 60);
     let manual = UpdateDeploymentSettings {
         unlock_detection_mode: Some(UnlockDetectionMode::Manual),
         unlock_detection_interval_hours: Some(6),
@@ -1931,7 +1936,10 @@ async fn unlock_not_ready_retries_are_bounded_and_preserve_previous_service_fact
     let previous = serde_json::to_value(report(&first.id).results).unwrap();
     sqlx::query("UPDATE unlock_probe_jobs SET previous_results=$1,previous_completed_at=now()-interval '5 minutes' WHERE job_id=$2").bind(&previous).bind(&first.id).execute(db.pool()).await.unwrap();
     let mut stale_id: Option<String> = None;
-    for (attempt, delay) in [60_i64, 120, 240, 480, 900, 86400].into_iter().enumerate() {
+    for (attempt, delay) in [60_i64, 120, 240, 480, 900, 4 * 60 * 60]
+        .into_iter()
+        .enumerate()
+    {
         // Exclude other independent periodic tasks from this fixture's claim selection.
         sqlx::query(
             "DELETE FROM unlock_probe_jobs WHERE scope_key<>'chain:app-main/chn-a1b2-c3d4:v6'",
@@ -2003,8 +2011,8 @@ async fn unlock_not_ready_retries_are_bounded_and_preserve_previous_service_fact
             sqlx::query("UPDATE unlock_probe_jobs SET next_run_at=now()-interval '1 second' WHERE scope_key='chain:app-main/chn-a1b2-c3d4:v6'").execute(db.pool()).await.unwrap();
         }
     }
-    // Exhaustion returns to the daily schedule instead of retrying indefinitely each minute.
-    let due:bool=sqlx::query_scalar("SELECT next_run_at>now()+interval '23 hours' FROM unlock_probe_jobs WHERE scope_key='chain:app-main/chn-a1b2-c3d4:v6'").fetch_one(db.pool()).await.unwrap();
+    // Exhaustion returns to the configured schedule instead of retrying indefinitely each minute.
+    let due:bool=sqlx::query_scalar("SELECT next_run_at>now()+interval '3 hours' FROM unlock_probe_jobs WHERE scope_key='chain:app-main/chn-a1b2-c3d4:v6'").fetch_one(db.pool()).await.unwrap();
     assert!(due);
     sqlx::query("UPDATE unlock_probe_jobs SET created_at=now()-interval '61 seconds' WHERE scope_key='chain:app-main/chn-a1b2-c3d4:v6'").execute(db.pool()).await.unwrap();
     db.store

@@ -30,6 +30,23 @@ sha256sum /opt/brocade/brocade-console
 
 同时保存当前发布 ID、修订、目标状态、Agent/运行版本和摘要。数据库调查优先使用只读查询；需要锁表、修复或恢复时另行制定操作步骤。
 
+### Agent 日志与缺失计量代次
+
+使用独立 journal 的 systemd 节点须执行
+`journalctl --namespace=brocade-agent -u brocade-agent -n 50 --no-pager`；
+不带 namespace 可能只看到服务启动、退出记录，漏掉实际收敛错误。旧节点先通过
+`systemctl show brocade-agent -p LogNamespace` 确认；OpenRC 日志入口见
+[可观测性文档](../../docs/observability.md)。
+
+`xray has no active usage generation` 表示运行中的 Xray 缺少本地 `usage-generation`
+检查点，用量采样及配置、授权变更前的最终采样都会因此失败。先保留现场，对照
+`node_agent_state.usage_generation_id`、已激活的 `usage_generation_activations` 和最后成功发布的
+配置摘要、授权及计量归属；不能直接写入最新或失败发布的代次。
+仅当实际运行态与该已激活代次一致时，才在节点收敛锁保护下以私有权限原子恢复检查点，
+同步文件和目录后确认用量上报被接受，再通过正式 API 逐台重试。状态无法证明一致时停止修复，
+不要清空计数器、计量 journal、usage cursor 或跳过最终采样。已取消的历史单保持终态，
+先检查当前配置差异和有效工单，避免重新执行已经被后续操作替代的目标。
+
 ### Agent HTTP 响应超时
 
 Agent 的 HTTP/HTTPS 客户端按 [RFC 9112 §6.3](https://www.rfc-editor.org/rfc/rfc9112.html#section-6.3)
@@ -70,6 +87,15 @@ Console 执行慢。派发响应丢失后的重领与新旧版本兼容行为见
 
 可重复 Docker 注入入口及覆盖边界见[交接故障验证](../../scripts/tests/xray-faults/README.md)。
 
+### SS2022 中转配置启动后回滚
+
+配置切换为 SS2022 后报 `handoff listener group is incomplete, unsupported or closed`，
+先对照候选 `xray.next.json` 的 `settings.network` 和失败代际 `manifest.json` 的监听清单。
+SS2022 中转使用 `tcp,udp`，即使 `streamSettings.network` 为 `tcp`，也会在同一端口开启
+原生 UDP 监听。旧 Agent 只按传输层识别 TCP，漏登 UDP，导致 Xray 拒绝 seal 并恢复旧配置。
+更新包含此修复的 Agent 后重试原配置发布；此问题不需要修改密钥、模型修订或升级 Xray。
+验收须确认清单和运行状态同时包含该端口的 TCP、UDP，且代际已 ready、accepting。
+
 ### 机器尖峰流量归属
 
 从「用量 → 实时 → 机器弹层」定位所选区间内的尖峰，拖选图表或在「统计 → 自定义」输入 UTC+8
@@ -87,6 +113,14 @@ Console 执行慢。派发响应丢失后的重领与新旧版本兼容行为见
 流出目标仍按小时保存，自选区间会扩大到覆盖所选时段的小时并标明实际范围；域名/IP 明细还受
 其独立保留期和 Top-N 限制。当前不能把来源 IP 与目标排行认定为同一条连接；中继和落地机器
 也不提供最终用户身份，应回到链头入口排查。生产升级前参考 `console-deployment.md` 的来源观测表兼容步骤。
+
+### 草稿预览或提交卡住
+
+先区分连接池等待、事务锁等待与编译计算。若 PostgreSQL 的死锁图同时出现
+`pg_advisory_xact_lock(1112687438,65)` 和 `control_state ... FOR UPDATE`，检查模型写入口
+是否统一先取得网络资源锁、再取得模型行锁。预览最终回滚也会在执行期间持锁，不能把它当作
+普通只读查询。公共模型取锁入口覆盖预览、提交、直接编辑、回滚及纳管；底层操作再次取得
+同一事务锁不改变此顺序。不要用增加连接池或无限重试代替修复反向取锁。
 
 ## 4. 控制影响
 

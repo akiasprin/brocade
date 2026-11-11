@@ -23,6 +23,7 @@ pub(crate) fn diagnostic_socks_client(port: u16) -> Result<reqwest::blocking::Cl
     client::socks(port)
 }
 
+pub(crate) mod asynchronous;
 mod client;
 mod diagnostic;
 mod resolver;
@@ -390,32 +391,7 @@ impl HttpClient {
         {
             return Err(progress.message("headers", "body_exceeds_limit"));
         }
-        let mut headers: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut header_bytes = 0usize;
-        for (name, value) in response.headers() {
-            header_bytes = header_bytes
-                .saturating_add(name.as_str().len())
-                .saturating_add(value.len())
-                .saturating_add(4);
-            if header_bytes > MAX_HTTP_HEADER_BYTES {
-                return Err(progress.message("headers", "headers_exceed_limit"));
-            }
-            let value = std::str::from_utf8(value.as_bytes())
-                .map_err(|_| progress.message("headers", "invalid_header_encoding"))?;
-            headers
-                .entry(name.as_str().to_owned())
-                .or_default()
-                .push(value.to_owned());
-        }
-        // Hyper owns framing. The application only supports the identity/chunked transfer coding;
-        // do not accidentally accept a gzip transfer-coding as an uncompressed JSON response.
-        if headers.get("transfer-encoding").is_some_and(|values| {
-            values
-                .iter()
-                .any(|value| !value.trim().eq_ignore_ascii_case("chunked"))
-        }) {
-            return Err(progress.message("headers", "unsupported_transfer_encoding"));
-        }
+        let headers = response_headers(response.headers(), &progress)?;
         let mut bytes = Vec::new();
         let mut buffer = [0; 8192];
         loop {
@@ -504,6 +480,38 @@ impl HttpClient {
             last_error.unwrap_or_else(|| "no_addresses".to_owned())
         ))
     }
+}
+
+fn response_headers(
+    source: &reqwest::header::HeaderMap,
+    progress: &diagnostic::Progress,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let mut headers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut header_bytes = 0usize;
+    for (name, value) in source {
+        header_bytes = header_bytes
+            .saturating_add(name.as_str().len())
+            .saturating_add(value.len())
+            .saturating_add(4);
+        if header_bytes > MAX_HTTP_HEADER_BYTES {
+            return Err(progress.message("headers", "headers_exceed_limit"));
+        }
+        let value = std::str::from_utf8(value.as_bytes())
+            .map_err(|_| progress.message("headers", "invalid_header_encoding"))?;
+        headers
+            .entry(name.as_str().to_owned())
+            .or_default()
+            .push(value.to_owned());
+    }
+    // Hyper owns framing. Only identity/chunked transfer coding is supported.
+    if headers.get("transfer-encoding").is_some_and(|values| {
+        values
+            .iter()
+            .any(|value| !value.trim().eq_ignore_ascii_case("chunked"))
+    }) {
+        return Err(progress.message("headers", "unsupported_transfer_encoding"));
+    }
+    Ok(headers)
 }
 
 /// Optional website probes negotiate gzip without changing control/binary HTTP semantics.

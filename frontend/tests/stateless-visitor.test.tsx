@@ -19,7 +19,8 @@ vi.mock('../src/panes/preload', () => ({
 
 const { App } = await import('../src/app');
 const { suppressAutoPublic } = await import('../src/session');
-const visitor: Session = {
+const visitor: Session & { features: { cvm: boolean } } = {
+  features: { cvm: true },
   who: {
     operator_id: 'public',
     role: 'readonly',

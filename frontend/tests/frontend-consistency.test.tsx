@@ -508,6 +508,7 @@ function agentNodes(nodeIds: string[]) {
       node_id,
       name: node_id,
       agent_version: 'b'.repeat(64),
+      runtime_versions: { agent_flavor: 'base' },
       lifecycle_phase: 'active',
       desired_poll_fresh: true,
     })),

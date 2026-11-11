@@ -234,16 +234,20 @@ function Preview() {
           <ProvisionInstall node={nodes[0].node_id} go={drill => setNavigation(JSON.stringify(drill))} />
         ) : scene === 'mux' || scene === 'proxy' ? (
           <section className="panel config-panel rule-sheet-card node-chain-sheet">
-            <RuleEditor
-              appId={appId}
-              chainId={pairs[0].chainId}
-              nodeId={nodes[0].node_id}
-              initial={rules}
-              accept={null}
-              peers={peers}
-              isForwardTarget={false}
-              fallback={{ rules: [], pending: false }}
-            />
+            <div className="chain-rule-tree">
+              <div className="chain-rule-body">
+                <RuleEditor
+                  appId={appId}
+                  chainId={pairs[0].chainId}
+                  nodeId={nodes[0].node_id}
+                  initial={rules}
+                  accept={null}
+                  peers={peers}
+                  isForwardTarget={false}
+                  fallback={{ rules: [], pending: false }}
+                />
+              </div>
+            </div>
           </section>
         ) : scene === 'catalog' ? (
           <VpngatePage />

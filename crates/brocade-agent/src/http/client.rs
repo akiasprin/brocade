@@ -114,6 +114,25 @@ fn build_with_proxy(
     tls: Arc<rustls::ClientConfig>,
     socks_proxy: Option<u16>,
 ) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::ClientBuilder::from(configured_builder(class, family, tls, socks_proxy)?)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| diagnostic::category(&error))
+}
+
+pub(super) fn asynchronous_control(maximum_idle: usize) -> Result<reqwest::Client, String> {
+    configured_builder(TrafficClass::Control, None, tls_config()?, None)?
+        .pool_max_idle_per_host(maximum_idle)
+        .build()
+        .map_err(|error| diagnostic::category(&error))
+}
+
+fn configured_builder(
+    class: TrafficClass,
+    family: Option<AddressFamily>,
+    tls: Arc<rustls::ClientConfig>,
+    socks_proxy: Option<u16>,
+) -> Result<reqwest::ClientBuilder, String> {
     // reqwest keeps ALPN unchanged for preconfigured rustls clients. Advertise the
     // HTTP/1.1 transport we actually support; some public edges reject absent ALPN.
     // Clone first so control and WebSocket TLS retain their existing configuration.
@@ -138,7 +157,7 @@ fn build_with_proxy(
         TrafficClass::Control => resolver::control(),
         TrafficClass::Public => resolver::public(),
     };
-    let mut builder = reqwest::blocking::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .use_preconfigured_tls((*tls).clone())
         .dns_resolver(Arc::new(resolver.with_family(family)))
         .no_proxy()
@@ -174,9 +193,7 @@ fn build_with_proxy(
             AddressFamily::V6 => std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
         });
     }
-    builder
-        .build()
-        .map_err(|error| diagnostic::category(&error))
+    Ok(builder)
 }
 
 #[cfg(test)]

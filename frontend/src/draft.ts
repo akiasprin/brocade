@@ -394,6 +394,8 @@ export class DraftStore {
   /* 服务端预览同时受操作者权限和草稿操作影响。提交状态等纯 UI 通知不应改变此键。 */
   previewKey = (): string => JSON.stringify([this.owner, this.ops()]);
 
+  operatorScope = (): string | null => this.owner;
+
   /* Restore and share the operator's draft. Concurrent branch heads are never overwritten. */
   init(operator: string) {
     if (this.owner === operator) return;

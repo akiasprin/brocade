@@ -15,8 +15,10 @@ import type {
   RevisionList,
 } from '../../src/api';
 import type { NodeRealtimeEvent, RealtimeUserTrafficRate } from '../../src/node-realtime';
+import { CVM_ENABLED } from '../../src/product';
 import { agentNodes, MACHINES, USERS } from './console-model-data';
 import { CHAIN_APPS, chainSnapshot } from './chain-model-data';
+import { cvmReadings, cvmWorkspace } from './cvm/data';
 
 const NOW = Date.now();
 const NOW_S = Math.floor(NOW / 1000);
@@ -455,7 +457,7 @@ function grantsByNode() {
   return result;
 }
 
-class FixtureEventSource {
+export class FixtureEventSource {
   onerror: (() => void) | null = null;
   onopen: (() => void) | null = null;
   private listeners = new Map<string, ((event: MessageEvent) => void)[]>();
@@ -566,6 +568,7 @@ function e2eProbes(): { chains: E2eProbeItem[] } {
 /* ══ 外壳 ══ */
 
 const BOOTSTRAP: ConsoleBootstrap = {
+  features: { cvm: CVM_ENABLED },
   who: { operator_id: 'admin', role: 'system-admin', tenant_scope: null, token_prefix: null, masked_assets: false },
   initial: { node_count: ACTIVE.length, chain_group_count: [], onboarding: 'complete' },
 };
@@ -586,6 +589,7 @@ const ONBOARDING: OnboardingState = {
 
 const REVISIONS: RevisionList = {
   current_revision: 41,
+  last_config_revision_id: 41,
   revisions: [41, 40, 39, 38].map((id, index) => ({
     id,
     created_at: iso(NOW_S - index * 2 * DAY - 3 * HOUR),
@@ -1099,6 +1103,8 @@ const range = (url: URL, fallback = DAY) => {
 };
 
 const ROUTES: [RegExp, Handler][] = [
+  [/^\/cvm$/, () => cvmWorkspace('list')],
+  [/^\/cvm\/readings$/, () => cvmReadings(cvmWorkspace('list'))],
   [/^\/branding$/, () => ({ site_name: 'Brocade', icon_data_url: null })],
   [/^\/auth\/state$/, () => ({ initialized: true, public_open: false })],
   [/^\/bootstrap$/, () => BOOTSTRAP],

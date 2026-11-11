@@ -23,6 +23,22 @@ async function scale(card: Locator) {
   return card.evaluate(element => new DOMMatrixReadOnly(getComputedStyle(element).transform).a);
 }
 
+async function settle(card: Locator) {
+  await card.evaluate(async element => {
+    await Promise.all(
+      element
+        .getAnimations({ subtree: true })
+        .filter(animation => animation.effect?.getComputedTiming().iterations !== Infinity)
+        .map(animation => animation.finished.catch(() => undefined)),
+    );
+  });
+}
+
+async function hoverSurface(card: Locator) {
+  await card.hover({ position: { x: 150, y: 18 } });
+  await settle(card);
+}
+
 for (const engine of ['chromium', 'webkit'] as const) {
   const test = base.extend({
     browser: [
@@ -44,11 +60,12 @@ for (const engine of ['chromium', 'webkit'] as const) {
           // Finish entrance animations before measuring the resting card.
           await expect.poll(() => scale(card)).toBe(1);
           await page.mouse.move(0, 0);
+          await settle(card);
           const resting = await card.evaluate(element => {
             const style = getComputedStyle(element);
             return { shadow: style.boxShadow, width: element.getBoundingClientRect().width };
           });
-          await card.hover();
+          await hoverSurface(card);
           await expect
             .poll(() =>
               card.evaluate(element => {
@@ -101,8 +118,9 @@ base('machine hover preserves the stronger selected ring', async ({ page }) => {
   await card.getByRole('checkbox').check();
   await expect(card).toHaveClass(/picked/);
   await page.mouse.move(0, 0);
+  await settle(card);
   const selected = await card.evaluate(element => getComputedStyle(element).boxShadow);
-  await card.hover();
+  await hoverSurface(card);
   expect(await card.evaluate(element => getComputedStyle(element).boxShadow)).toBe(selected);
 });
 
@@ -147,11 +165,12 @@ for (const kind of ['machine', 'chain'] as const) {
     await checkbox.check();
     await expect(card).toHaveClass(/picked/);
     await page.mouse.move(0, 0);
+    await settle(card);
     const selected = await card.evaluate(element => {
       const style = getComputedStyle(element);
       return { shadow: style.boxShadow, background: style.backgroundColor, image: style.backgroundImage };
     });
-    await card.hover();
+    await hoverSurface(card);
     expect(await card.evaluate(element => getComputedStyle(element).backgroundColor)).toBe(selected.background);
     await page.mouse.down();
     await expect.poll(() => scale(card)).toBeCloseTo(0.985, 3);

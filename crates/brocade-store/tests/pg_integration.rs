@@ -74,6 +74,9 @@ fn anytls_probe_settings(target: &E2eProbeTarget) -> &E2eProbeAnyTls {
     }
 }
 
+#[path = "cases/product_variants.rs"]
+mod product_variants_tests;
+
 struct TestPg {
     _container: testcontainers::ContainerAsync<Postgres>,
     store: PgStore,
@@ -84,6 +87,9 @@ struct TestPg {
 
 #[path = "cases/node_initialization.rs"]
 mod node_initialization_tests;
+
+#[path = "cases/node_reinstall.rs"]
+mod node_reinstall_tests;
 
 #[path = "cases/online_source_defaults.rs"]
 mod online_source_defaults_tests;
@@ -112,6 +118,8 @@ mod isolated_stale_grants_tests;
 #[path = "cases/xray_handoff_beta.rs"]
 mod xray_handoff_beta_tests;
 
+#[path = "cases/deployment_snapshot_reads.rs"]
+mod deployment_snapshot_read_tests;
 #[path = "cases/forwarding_authorization.rs"]
 mod forwarding_authorization_tests;
 #[path = "cases/forwarding_lock_order.rs"]
@@ -124,6 +132,8 @@ mod forwarding_rule_results_tests;
 mod forwarding_target_policy_tests;
 #[path = "cases/forwarding_total_removal.rs"]
 mod forwarding_total_removal_tests;
+#[path = "cases/model_lock_order.rs"]
+mod model_lock_order_tests;
 
 #[path = "cases/validation_limits.rs"]
 mod validation_limits_tests;
@@ -244,6 +254,28 @@ fn system_admin() -> AdminContext {
 async fn seed_subscription_serving(db: &TestPg) -> u64 {
     let snapshot = db.store.materialize_snapshot(None).await.unwrap();
     seed_subscription_serving_snapshot(db, snapshot).await
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn manual_grant_probes_allow_thirty_seconds_and_preserve_longer_settings() {
+    for (configured, expected) in [(10, 30), (75, 75)] {
+        let Some(db) = TestPg::start_if_enabled().await else {
+            return;
+        };
+        db.store.migrate().await.unwrap();
+        insert_minimal_fixture(db.pool()).await;
+        let mut snapshot = db.store.materialize_snapshot(None).await.unwrap();
+        snapshot.settings.probe.timeout_secs = configured;
+        seed_subscription_serving_snapshot(&db, snapshot.clone()).await;
+        let plan = db
+            .store
+            .user_grant_probe_plan(&system_admin(), "platform.acme", "alice")
+            .await
+            .unwrap();
+        assert!(!plan.items.is_empty());
+        assert_eq!(plan.timeout_secs, expected);
+    }
 }
 
 async fn seed_subscription_serving_snapshot(
@@ -553,14 +585,18 @@ async fn certificate_scan_lock_is_shared_by_console_instances() {
         "a second worker must skip while issuance is active"
     );
     drop(first);
-    assert!(
-        db.store
-            .try_certificate_scan_lock()
-            .await
-            .unwrap()
-            .is_some(),
-        "dropping the transaction releases the lock"
-    );
+    // SQLx queues rollback on drop; another pooled connection can reach PostgreSQL first.
+    // Assert eventual release while retaining the acquired lock for the rest of the test.
+    let _next = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(lock) = db.store.try_certificate_scan_lock().await.unwrap() {
+                break lock;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dropping the transaction releases the lock after asynchronous rollback");
 }
 
 #[tokio::test]
@@ -5119,6 +5155,7 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
     db.store.issue_node_token("n1").await.unwrap();
 
     let versions = NodeVersions {
+        agent_flavor: Some(brocade_deployment::product::ProductFlavor::Base),
         unlock_ip_families: None,
         unlock_connection_trace: None,
         agent: "0.1.0".to_owned(),
@@ -5272,6 +5309,7 @@ async fn node_runtime_report_round_trips_and_keeps_the_last_local_reconcile() {
                 observed_at_unix_secs: usage_report_base_unix() + 1,
                 certificate: Default::default(),
                 versions: NodeVersions {
+                    agent_flavor: Some(brocade_deployment::product::ProductFlavor::Base),
                     unlock_ip_families: None,
                     unlock_connection_trace: None,
                     xray: Some("Xray 26.7.28".to_owned()),
@@ -6382,7 +6420,7 @@ async fn binary_agent_release_requires_post_restart_evidence_and_preserves_attem
     // Agent release remains safe because authenticated contact and runtime identity continue.
     sqlx::query("INSERT INTO node_agent_state (node_id, token_last_used_at, agent_version, agent_protocol_version, last_poll_at, runtime_reported_at, runtime_versions)
         VALUES ('n1', now(), $1, 24, now() - interval '10 minutes', now(), $2)")
-        .bind(format!("brocade-agent/{before}")).bind(json!({"agent": before})).execute(db.pool()).await.unwrap();
+        .bind(format!("brocade-agent/{before}")).bind(json!({"agent": before, "agent_flavor":"base"})).execute(db.pool()).await.unwrap();
     let artifacts = [BinaryReleaseArtifact {
         arch: "x86_64".to_owned(),
         sha256: wanted.clone(),
@@ -6394,6 +6432,8 @@ async fn binary_agent_release_requires_post_restart_evidence_and_preserves_attem
         artifacts: &artifacts,
     };
     let request = CreateBinaryReleaseRequest {
+        agent_flavor: Some(brocade_deployment::product::ProductFlavor::Base),
+        allow_flavor_change: false,
         idempotency_key: "agent-order-1".to_owned(),
         build_id: build_id.clone(),
         nodes: vec!["n1".to_owned()],
@@ -6503,12 +6543,14 @@ async fn binary_agent_release_requires_post_restart_evidence_and_preserves_attem
     // A new order targeting a legacy Agent can be proven by fresh observations, explicitly
     // without pretending the old process wrote a receipt.
     sqlx::query("UPDATE node_agent_state SET agent_version = $1, runtime_versions = $2 WHERE node_id = 'n1'")
-        .bind(format!("brocade-agent/{before}")).bind(json!({"agent": before})).execute(db.pool()).await.unwrap();
+        .bind(format!("brocade-agent/{before}")).bind(json!({"agent": before, "agent_flavor":"base"})).execute(db.pool()).await.unwrap();
     let order2 = db
         .store
         .create_binary_release(
             &system_admin(),
             CreateBinaryReleaseRequest {
+                agent_flavor: Some(brocade_deployment::product::ProductFlavor::Base),
+                allow_flavor_change: false,
                 idempotency_key: "agent-order-2".to_owned(),
                 build_id: build_id.clone(),
                 nodes: vec!["n1".to_owned()],
@@ -6556,12 +6598,14 @@ async fn binary_agent_release_requires_post_restart_evidence_and_preserves_attem
 
     // Each retry keeps the previous failure, fences late reports and remains cancelable.
     sqlx::query("UPDATE node_agent_state SET agent_version = $1, runtime_versions = $2 WHERE node_id = 'n1'")
-        .bind(format!("brocade-agent/{before}")).bind(json!({"agent": before})).execute(db.pool()).await.unwrap();
+        .bind(format!("brocade-agent/{before}")).bind(json!({"agent": before, "agent_flavor":"base"})).execute(db.pool()).await.unwrap();
     let order3 = db
         .store
         .create_binary_release(
             &system_admin(),
             CreateBinaryReleaseRequest {
+                agent_flavor: Some(brocade_deployment::product::ProductFlavor::Base),
+                allow_flavor_change: false,
                 idempotency_key: "agent-order-3".to_owned(),
                 build_id: build_id.clone(),
                 nodes: vec!["n1".to_owned()],
@@ -6633,6 +6677,86 @@ async fn binary_agent_release_requires_post_restart_evidence_and_preserves_attem
         .events
         .iter()
         .any(|e| e.kind == "target-reported-after-cancel"));
+
+    // A manual reinstall may reach the approved bytes before the new Agent claims the order.
+    // Preserve the missing-receipt result without offering retries that cannot recreate it.
+    let order4 = db
+        .store
+        .create_binary_release(
+            &system_admin(),
+            CreateBinaryReleaseRequest {
+                agent_flavor: Some(brocade_deployment::product::ProductFlavor::Base),
+                allow_flavor_change: false,
+                idempotency_key: "agent-order-4".to_owned(),
+                build_id: build_id.clone(),
+                nodes: vec!["n1".to_owned()],
+                note: None,
+                xray_strategy: None,
+                xray_drain_timeout_secs: None,
+            },
+            build,
+        )
+        .await
+        .unwrap();
+    let offer = db
+        .store
+        .claim_agent_release("n1", "x86_64", &build_id, true)
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query(
+        "UPDATE node_agent_state SET runtime_versions = $1, runtime_reported_at = now()
+         WHERE node_id = 'n1'",
+    )
+    .bind(json!({"agent": wanted}))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    report.release_id = order4.id;
+    report.attempt = offer.attempt;
+    report.outcome = AgentReleaseOutcome::Running;
+    report.performed_update = false;
+    report.installed_sha256 = Some(wanted.clone());
+    report.running_sha256 = Some(wanted.clone());
+    report.error = None;
+    assert!(db.store.report_agent_release("n1", &report).await.unwrap());
+    let missing_receipt = db
+        .store
+        .binary_release(BinaryComponent::Agent, order4.id, true)
+        .await
+        .unwrap();
+    assert_eq!(missing_receipt.status, BinaryReleaseStatus::Halted);
+    assert_eq!(
+        missing_receipt.targets[0].status,
+        BinaryReleaseTargetStatus::Unverified
+    );
+    assert!(!missing_receipt.targets[0].retryable);
+    assert!(matches!(
+        db.store
+            .retry_binary_release_target(
+                BinaryComponent::Agent,
+                &system_admin(),
+                order4.id,
+                "n1",
+                &build_id,
+            )
+            .await,
+        Err(StoreError::Conflict(message)) if message.contains("重试无法补建本次替换回执")
+    ));
+    let attempts = db
+        .store
+        .binary_release_attempts(BinaryComponent::Agent, order4.id, "n1")
+        .await
+        .unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].evidence["report"]["performed_update"], false);
+    let stopped = db
+        .store
+        .cancel_binary_release(BinaryComponent::Agent, &system_admin(), order4.id)
+        .await
+        .unwrap();
+    assert_eq!(stopped.status, BinaryReleaseStatus::Canceled);
+    assert_eq!(stopped.targets[0], missing_receipt.targets[0]);
 }
 
 #[tokio::test]
@@ -6808,6 +6932,7 @@ async fn delayed_runtime_report_cannot_overwrite_a_newer_snapshot() {
         observed_at_unix_secs,
         certificate: Default::default(),
         versions: NodeVersions {
+            agent_flavor: Some(brocade_deployment::product::ProductFlavor::Base),
             unlock_ip_families: None,
             unlock_connection_trace: None,
             agent: agent.to_owned(),
@@ -6990,6 +7115,7 @@ async fn config_xray_force_retirement_is_exact_idempotent_and_settled_by_runtime
                 observed_at_unix_secs: now + 1,
                 certificate: Default::default(),
                 versions: NodeVersions {
+                    agent_flavor: Some(brocade_deployment::product::ProductFlavor::Base),
                     unlock_ip_families: None,
                     unlock_connection_trace: None,
                     agent: "force-retirement-test".to_owned(),
@@ -7152,6 +7278,7 @@ async fn online_sources_store_raw_public_ips_and_follow_latest_snapshot() {
             observed_at_unix_secs,
             certificate: Default::default(),
             versions: NodeVersions {
+                agent_flavor: Some(brocade_deployment::product::ProductFlavor::Base),
                 unlock_ip_families: None,
                 unlock_connection_trace: None,
                 agent: "online-source-test".to_owned(),
@@ -7863,6 +7990,7 @@ async fn node_runtime_report_is_rejected_without_an_active_token() {
         observed_at_unix_secs: usage_report_base_unix(),
         certificate: Default::default(),
         versions: NodeVersions {
+            agent_flavor: Some(brocade_deployment::product::ProductFlavor::Base),
             unlock_ip_families: None,
             unlock_connection_trace: None,
             agent: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
@@ -7923,6 +8051,21 @@ async fn mtproxy_compatibility_matches_fresh_schema_and_preserves_existing_rows(
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
 
+    // The pre-MTProxy schema predates this view; preserve its current definition
+    // so the compatibility fixture also restores the later listener contract.
+    let listener_view: String = sqlx::query_scalar(
+        "SELECT pg_get_viewdef('public.managed_static_listener_ranges'::regclass, true)",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let listeners_sql = "SELECT node_id,protocol,port_start,port_end FROM managed_static_listener_ranges ORDER BY node_id,protocol,port_start,port_end";
+    let listeners_before: Vec<(String, String, i32, i32)> = sqlx::query_as(listeners_sql)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    assert!(!listeners_before.is_empty());
+
     let schema_signature = "SELECT jsonb_build_object(
         'columns', (SELECT jsonb_agg(jsonb_build_object(
             'table', table_name, 'name', column_name, 'type', data_type,
@@ -7953,7 +8096,8 @@ async fn mtproxy_compatibility_matches_fresh_schema_and_preserves_existing_rows(
         .unwrap();
 
     sqlx::raw_sql(
-        "ALTER TABLE user_online_sources DROP CONSTRAINT user_online_sources_protocols_shape;
+        "DROP VIEW managed_static_listener_ranges;
+         ALTER TABLE user_online_sources DROP CONSTRAINT user_online_sources_protocols_shape;
          ALTER TABLE user_online_sources ADD CONSTRAINT user_online_sources_protocols_shape CHECK (
              protocols IS NULL OR CASE WHEN jsonb_typeof(protocols) = 'array' THEN
                  jsonb_array_length(protocols) BETWEEN 1 AND 4
@@ -7985,6 +8129,20 @@ async fn mtproxy_compatibility_matches_fresh_schema_and_preserves_existing_rows(
         .execute(db.pool())
         .await
         .unwrap();
+
+    sqlx::raw_sql(&format!(
+        "CREATE VIEW managed_static_listener_ranges AS {listener_view}"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, i32, i32)>(listeners_sql)
+            .fetch_all(db.pool())
+            .await
+            .unwrap(),
+        listeners_before
+    );
 
     let actual: serde_json::Value = sqlx::query_scalar(schema_signature)
         .fetch_one(db.pool())
@@ -8216,6 +8374,43 @@ async fn node_token_resign_replays_the_complete_successful_environment_until_it_
         .unwrap()
         .is_none());
 
+    let revoked = db
+        .store
+        .upsert_grant(
+            &system_admin(),
+            CreateGrantRequest {
+                app_id: "app-main".to_owned(),
+                tenant_id: "platform.acme".to_owned(),
+                user_id: "alice".to_owned(),
+                ingress_id: "ing-a1b2".to_owned(),
+                enabled: false,
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    db.store
+        .create_deployment(
+            &system_admin(),
+            create_grants_deployment_request(revoked.revision_id, "resign-environment-grants"),
+        )
+        .await
+        .unwrap();
+    let grants_only = db
+        .store
+        .claim_desired_for_node("n1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(grants_only.actions, vec![PlannedAction::SyncGrants]);
+    assert!(grants_only.usage_generation_id.is_some());
+    assert_ne!(grants_only.usage_generation_id, initial.usage_generation_id);
+    expected_environment.grants = grants_only.desired.grants.clone();
+    db.store
+        .report_target_result(applied_report(&grants_only))
+        .await
+        .unwrap();
+
     let new_token = db.store.reissue_node_token("n1").await.unwrap();
     assert!(db
         .store
@@ -8238,6 +8433,8 @@ async fn node_token_resign_replays_the_complete_successful_environment_until_it_
         .expect("a re-signed machine must receive its last applied environment");
     assert_eq!(repair.deployment_id, deployment.deployment_id);
     assert!(repair.claim_generation > 0);
+    assert!(initial.usage_generation_id.is_some());
+    assert_eq!(repair.usage_generation_id, grants_only.usage_generation_id);
     assert_eq!(repair.desired, expected_environment);
     assert!(repair.actions.iter().any(|action| matches!(
         action,
@@ -11496,6 +11693,7 @@ async fn tenant_scoped_plan_filters_outside_warnings() {
             .unwrap();
     }
 
+    freeze_current_fixture_snapshot(db.pool()).await;
     let system_plan = db.store.plan_deployment(&system_admin(), 1).await.unwrap();
     assert!(system_plan
         .warnings
@@ -12514,6 +12712,7 @@ async fn create_deployment_writes_compile_warnings() {
         .await
         .unwrap();
 
+    freeze_current_fixture_snapshot(db.pool()).await;
     let result = db
         .store
         .create_deployment(
@@ -12572,6 +12771,7 @@ async fn create_deployment_blocks_compile_errors_and_empty_target_sets() {
         .await
         .unwrap();
 
+    freeze_current_fixture_snapshot(db.pool()).await;
     let blocked = db
         .store
         .create_deployment(
@@ -13846,6 +14046,7 @@ async fn enable_hy2_port_hopping(pool: &PgPool) {
     .execute(pool)
     .await
     .unwrap();
+    freeze_fixture_if_current_schema(pool).await;
 }
 
 #[tokio::test]
@@ -20508,7 +20709,8 @@ async fn insert_revision(pool: &PgPool, note: &str) -> i64 {
 async fn store_current_model_snapshot(pool: &PgPool, store: &PgStore) {
     let snapshot = store.materialize_snapshot(None).await.unwrap();
     let revision_id = i64::try_from(snapshot.revision).unwrap();
-    let snapshot = serde_json::to_value(snapshot).unwrap();
+    let mut snapshot = serde_json::to_value(snapshot).unwrap();
+    seal_external_credentials_for_fixture(&mut snapshot);
     sqlx::query(
         "INSERT INTO model_snapshots (revision_id, snapshot)
          VALUES ($1, $2)
@@ -20707,6 +20909,7 @@ async fn insert_second_node(pool: &PgPool) {
     .execute(pool)
     .await
     .unwrap();
+    freeze_fixture_if_current_schema(pool).await;
 }
 
 async fn insert_basic_node(
@@ -20739,6 +20942,7 @@ async fn insert_basic_node(
     .execute(pool)
     .await
     .unwrap();
+    freeze_fixture_if_current_schema(pool).await;
 }
 
 #[tokio::test]
@@ -26040,6 +26244,40 @@ async fn insert_minimal_fixture(pool: &PgPool) {
     .execute(pool)
     .await
     .unwrap();
+    freeze_fixture_if_current_schema(pool).await;
+}
+
+/// Raw model fixture construction bypasses a production commit. Freeze the completed initial
+/// fixture explicitly; serving/checkpoint fixtures remain separate and opt-in.
+async fn freeze_current_fixture_snapshot(pool: &PgPool) {
+    store_current_model_snapshot(pool, &PgStore::from_pool(pool.clone())).await;
+}
+
+/// Legacy migration fixtures deliberately lack current model columns. Only a completed current
+/// initial fixture can be frozen here; published revisions must be extended through real writes.
+async fn freeze_fixture_if_current_schema(pool: &PgPool) {
+    let current: bool = sqlx::query_scalar(
+        "SELECT
+        EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema()
+            AND table_name='nodes' AND column_name='xray_enabled') AND
+        EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema()
+            AND table_name='users' AND column_name='service_suspended')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    if current {
+        let published: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM deployments
+            WHERE revision_id=(SELECT current_revision FROM control_state WHERE id=TRUE))",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if !published {
+            freeze_current_fixture_snapshot(pool).await;
+        }
+    }
 }
 
 #[tokio::test]
@@ -27085,6 +27323,7 @@ async fn insert_other_tenant_fixture(pool: &PgPool) {
     .execute(pool)
     .await
     .unwrap();
+    freeze_fixture_if_current_schema(pool).await;
 }
 
 async fn assert_insert_ingress_short_ids_fails(
@@ -27397,6 +27636,7 @@ async fn delete_step_cascades_subtree_and_whole_chain() {
         .execute(db.pool())
         .await
         .unwrap();
+    freeze_current_fixture_snapshot(db.pool()).await;
     let blocked = db
         .store
         .create_deployment(
@@ -30336,3 +30576,7 @@ mod unlock_migration_consolidation_tests;
 
 #[path = "cases/node_xray.rs"]
 mod node_xray_tests;
+
+#[cfg(feature = "cvm")]
+#[path = "cases/cvm.rs"]
+mod cvm_tests;

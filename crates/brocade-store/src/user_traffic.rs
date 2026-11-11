@@ -508,11 +508,11 @@ pub async fn budget(
         });
     }
     let next_node:String=sqlx::query_scalar("SELECT node_id FROM user_traffic_budget_demand WHERE tenant_id=$1 AND user_id=$2 AND kind=$3 AND scope=$4
-        AND seen_at>clock_timestamp()-interval '2 seconds' ORDER BY served_at,node_id LIMIT 1")
+        AND seen_at>served_at AND seen_at>clock_timestamp()-interval '2 seconds' ORDER BY served_at,node_id LIMIT 1")
         .bind(&tenant).bind(&user).bind(kind).bind(&scope).fetch_one(&mut *tx).await?;
     if next_node != node {
         tx.commit().await?;
-        return Ok(UserBudgetGrant::Retry { after_ms: 50 });
+        return Ok(UserBudgetGrant::Retry { after_ms: 5 });
     }
     let active:i64=sqlx::query_scalar("SELECT count(*) FROM user_traffic_budget_demand WHERE tenant_id=$1 AND user_id=$2 AND kind=$3 AND scope=$4 AND seen_at>clock_timestamp()-interval '2 seconds'")
         .bind(&tenant).bind(&user).bind(kind).bind(&scope).fetch_one(&mut *tx).await?;
@@ -579,6 +579,7 @@ pub(crate) async fn check_node_tx(
 }
 
 const ASSIGNMENTS_SQL: &str = "SELECT g.user_id||'@'||g.tenant_id||'#'||g.ingress_id AS source,
+    g.tenant_id,g.user_id,g.app_id,
     u.status='active' AND NOT u.service_suspended AS available,
     p.action,p.rate_bps,p.base_rate_bps,p.quota_bytes,p.exhausted,p.revision
     FROM grants g JOIN ingresses i ON i.app_id=g.app_id AND i.id=g.ingress_id
@@ -603,6 +604,14 @@ pub async fn assignments(pool: &PgPool, node: &str) -> Result<UserTrafficSnapsho
         .map(|row| {
             Ok(UserTrafficAssignment {
                 source: row.try_get("source")?,
+                budget_key: Some(format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(&(
+                        row.try_get::<String, _>("tenant_id")?,
+                        row.try_get::<String, _>("user_id")?,
+                        row.try_get::<String, _>("app_id")?,
+                    ))?)
+                )),
                 revision: u64::try_from(row.try_get::<i64, _>("revision")?)
                     .map_err(|_| StoreError::InvalidData("invalid policy revision".into()))?,
                 effect: policy_from_row(row)?

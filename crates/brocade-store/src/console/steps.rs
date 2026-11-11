@@ -31,6 +31,7 @@ pub(crate) async fn put_step_tx(
     node_id: &str,
     request: PutStepRequest,
 ) -> Result<bool> {
+    crate::resource_coordination::lock(tx).await?;
     let app_id = required_text(app_id, "app_id")?;
     let chain_id = required_text(chain_id, "chain_id")?;
     let node_id = required_text(node_id, "node_id")?;

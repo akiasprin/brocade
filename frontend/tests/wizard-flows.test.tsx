@@ -1,6 +1,6 @@
 import { changeControl } from './choice-helpers';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ChainWizard } from '../src/panes/chain-wizard';
 import { draft } from '../src/draft';
@@ -43,6 +43,18 @@ const agentNodes = [
     retired_at: null,
   },
 ];
+
+// 改成「转发给」时目标菜单会自动打开（与链路规则一致）；已经打开就不再点，否则会把它关上。
+function openTargetMenu(name: string) {
+  const trigger = screen.getByRole('button', { name });
+  if (trigger.getAttribute('aria-expanded') !== 'true') fireEvent.click(trigger);
+  return document.body.querySelector('.external-target-menu') as HTMLElement;
+}
+
+// 路径上几台机器可以同时展开；入口机器的规则表是树里的第一张。
+function entryRules() {
+  return within(document.body.querySelector('.chain-rule-tree > .chain-rule-node > .chain-rule-body') as HTMLElement);
+}
 
 function queryClient() {
   const client = new QueryClient({
@@ -719,7 +731,7 @@ describe('新建链向导', () => {
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
       target: { value: 'hk-edge-01' },
     });
-    fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    fireEvent.click(entryRules().getByRole('button', { name: '＋ 加一条' }));
     const match = view.getByRole('combobox', { name: '香港边缘 第 1 条匹配条件' }) as HTMLSelectElement;
     expect(match.value).toBe('geosite');
     expect([...match.options].map(option => option.value)).toEqual([
@@ -746,7 +758,7 @@ describe('新建链向导', () => {
     expect(values.placeholder).toContain('google');
     expect((view.getByRole('combobox', { name: '香港边缘 第 1 条动作' }) as HTMLSelectElement).value).toBe('egress');
     fireEvent.change(match, { target: { value: 'sniffing_failed' } });
-    fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    fireEvent.click(entryRules().getByRole('button', { name: '＋ 加一条' }));
     const matches = view.getAllByRole('combobox', { name: /香港边缘 第 \d+ 条匹配条件/ }) as HTMLSelectElement[];
     expect(matches.map(select => select.value)).toEqual(['geosite', 'sniffing_failed', 'any']);
     expect(matches[0].querySelector<HTMLOptionElement>('option[value="sniffing_failed"]')?.disabled).toBe(true);
@@ -763,7 +775,7 @@ describe('新建链向导', () => {
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), {
       target: { value: 'hk-edge-01' },
     });
-    fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    fireEvent.click(entryRules().getByRole('button', { name: '＋ 加一条' }));
     const match = view.getByRole('combobox', { name: '香港边缘 第 1 条匹配条件' }) as HTMLSelectElement;
     expect(match.value).toBe('domain_keyword');
     expect([...match.options].map(option => option.value)).toEqual([
@@ -1165,30 +1177,90 @@ describe('新建链向导', () => {
     });
     const view = mount(client);
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
-    fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    fireEvent.click(entryRules().getByRole('button', { name: '＋ 加一条' }));
     fireEvent.change(view.getByRole('combobox', { name: '香港边缘 第 1 条动作' }), {
       target: { value: 'forward' },
     });
-    fireEvent.click(view.getByRole('button', { name: '香港边缘 第 1 条转发目标' }));
-    const menu = document.body.querySelector('.external-target-menu');
-    expect([...menu!.querySelectorAll('.external-target-menu-label')].map(item => item.textContent)).toEqual([
-      '本链已有监听节点',
+    expect(view.getByRole('button', { name: '香港边缘 第 1 条转发目标' }).getAttribute('aria-expanded')).toBe('true');
+    const menu = openTargetMenu('香港边缘 第 1 条转发目标');
+    expect([...menu.querySelectorAll('.external-target-menu-label')].map(item => item.textContent)).toEqual([
+      'BROCADE 节点',
       '在机器上新建本链监听',
-      '代理出站',
+      '外部出站',
     ]);
     expect(within(menu as HTMLElement).getByPlaceholderText('搜索机器或代理出站')).toBeTruthy();
     const warp = within(menu as HTMLElement).getByRole('button', { name: /WARPCloudflare WARP共享资源/ });
     expect(warp.classList.contains('external-target-option-select')).toBe(true);
     expect(warp.parentElement?.classList.contains('external-target-option')).toBe(true);
     expect(within(menu as HTMLElement).getByRole('button', { name: '打开隧道 Cloudflare WARP' })).toBeTruthy();
-    expect(within(menu as HTMLElement).getByRole('button', { name: '管理隧道' })).toBeTruthy();
-    fireEvent.click(within(menu as HTMLElement).getByRole('button', { name: /自定义.*复用已有监听/ }));
-    expect(within(menu as HTMLElement).getByText('自定义 · 复用已有监听')).toBeTruthy();
+    expect(within(menu as HTMLElement).getByRole('button', { name: /自定义.*手动设置 IP、端口和协议/ })).toBeTruthy();
+    fireEvent.click(within(menu as HTMLElement).getByRole('button', { name: /复用其他链的监听/ }));
+    expect(within(menu as HTMLElement).getByText('复用其他链的监听')).toBeTruthy();
     fireEvent.click(within(menu as HTMLElement).getByRole('button', { name: '返回目标列表' }));
     expect(within(menu as HTMLElement).getByPlaceholderText('搜索机器或代理出站')).toBeTruthy();
   });
 
-  it('自定义子菜单复用已有监听并把引用写入新链规则', async () => {
+  it('自定义目标手动设置 IPv6 和端口，与新链规则一起加入草稿', async () => {
+    draft.init(`wizard-custom-${Math.random()}`);
+    draft.clear();
+    const done = vi.fn();
+    const view = render(
+      <QueryClientProvider client={queryClient()}>
+        <SessionProvider value={{ who: operator, initial }}>
+          <ChainWizard defaultApp={{ id: 'global', label: '全球加速' }} onDone={done} />
+        </SessionProvider>
+      </QueryClientProvider>,
+    );
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
+    fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: '自定义目标' } });
+    fireEvent.click(entryRules().getByRole('button', { name: '＋ 加一条' }));
+    fireEvent.change(view.getByRole('combobox', { name: '香港边缘 第 1 条匹配条件' }), {
+      target: { value: 'domain_suffix' },
+    });
+    fireEvent.change(view.getByRole('textbox', { name: '香港边缘 第 1 条匹配取值' }), {
+      target: { value: 'example.com' },
+    });
+    fireEvent.change(view.getByRole('combobox', { name: '香港边缘 第 1 条动作' }), { target: { value: 'forward' } });
+    const openCustom = () => {
+      openTargetMenu('香港边缘 第 1 条转发目标');
+      fireEvent.click(within(document.body).getByRole('button', { name: /自定义.*手动设置 IP、端口和协议/ }));
+    };
+    openCustom();
+    expect(view.getByRole('button', { name: '创建并选中' }).hasAttribute('disabled')).toBe(true);
+    fireEvent.click(within(view.getByRole('dialog', { name: '配置代理出站' })).getByRole('button', { name: '取消' }));
+    await waitFor(() => expect(document.body.querySelector('.external-outbound-drawer')).toBeNull());
+    expect(draft.ops()).toEqual([]);
+    expect(view.getByRole('button', { name: '香港边缘 第 1 条转发目标' }).textContent).toContain('新加坡中转');
+    openCustom();
+    const form = within(view.getByRole('dialog', { name: '配置代理出站' }));
+    expect(form.queryByRole('textbox', { name: '分享链接' })).toBeNull();
+    fireEvent.click(form.getByRole('button', { name: 'SOCKS5' }));
+    fireEvent.change(form.getByRole('textbox', { name: '服务器地址' }), { target: { value: '2001:db8::40' } });
+    fireEvent.change(form.getByRole('spinbutton', { name: '服务器端口' }), { target: { value: '18080' } });
+    fireEvent.change(form.getByRole('combobox', { name: '目标域名解析' }), { target: { value: 'use_ipv6' } });
+    fireEvent.click(form.getByRole('button', { name: '创建并选中' }));
+    await waitFor(() => expect(view.queryByRole('dialog', { name: '配置代理出站' })).toBeNull());
+    expect(view.getByRole('button', { name: '香港边缘 第 1 条转发目标' }).textContent).toContain('新代理出站');
+    expect(draft.ops()).toEqual([]);
+    fireEvent.click(view.getByRole('button', { name: '加入草稿' }));
+    await waitFor(() => expect(done).toHaveBeenCalledOnce());
+    const outbound = draft.ops().find(op => op.op === 'upsert_external_outbound');
+    expect(outbound).toMatchObject({
+      outbound: {
+        tenant_id: 'platform',
+        address: '2001:db8::40',
+        port: 18080,
+        protocol: { t: 'socks5' },
+        target_strategy: 'use_ipv6',
+      },
+    });
+    if (outbound?.op !== 'upsert_external_outbound') throw new Error('没有自定义代理出站');
+    expect(draft.ops().find(op => op.op === 'put_step')).toMatchObject({
+      step: { rules: [{ a: { t: 'proxy', outbound: outbound.outbound.id } }, { a: { t: 'egress' } }] },
+    });
+  });
+
+  it('复用监听子菜单把引用写入新链规则', async () => {
     draft.init(`wizard-listener-${Math.random()}`);
     draft.clear();
     const client = queryClient();
@@ -1248,7 +1320,7 @@ describe('新建链向导', () => {
     );
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
     fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: '复用监听测试' } });
-    fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    fireEvent.click(entryRules().getByRole('button', { name: '＋ 加一条' }));
     fireEvent.change(view.getByRole('combobox', { name: '香港边缘 第 1 条匹配条件' }), {
       target: { value: 'domain_suffix' },
     });
@@ -1256,8 +1328,8 @@ describe('新建链向导', () => {
       target: { value: 'example.com' },
     });
     fireEvent.change(view.getByRole('combobox', { name: '香港边缘 第 1 条动作' }), { target: { value: 'forward' } });
-    fireEvent.click(view.getByRole('button', { name: '香港边缘 第 1 条转发目标' }));
-    fireEvent.click(within(document.body).getByRole('button', { name: /自定义.*复用已有监听/ }));
+    openTargetMenu('香港边缘 第 1 条转发目标');
+    fireEvent.click(within(document.body).getByRole('button', { name: /复用其他链的监听/ }));
     fireEvent.click(within(document.body).getByRole('button', { name: /共享链.*1 个监听端点/ }));
     fireEvent.click(within(document.body).getByRole('button', { name: /本机香港边缘 · TCP 21000.*0 处引用/ }));
     expect(view.getByRole('button', { name: '香港边缘 第 1 条转发目标' }).textContent).toContain('引用');
@@ -1369,13 +1441,120 @@ describe('新建链向导', () => {
     fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), {
       target: { value: 'sg-relay-01' },
     });
-    fireEvent.change(view.getByRole('combobox', { name: '从 香港边缘 到 新加坡中转 的连接方式' }), {
+    changeControl(view.getByRole('combobox', { name: '从 香港边缘 到 新加坡中转 的连接方式' }), {
       target: { value: 'reverse_v4' },
     });
     fireEvent.change(view.getByLabelText('香港边缘 的中转监听端口'), { target: { value: '14443' } });
 
-    expect(view.getAllByText(/与 AnyTLS 接入口 TCP 14443 冲突/)).toHaveLength(2);
+    // 冲突收成端口旁的行内标记，页脚给出同一条原因。
+    expect(view.getByRole('button', { name: /与 AnyTLS 接入口 TCP 14443 冲突/ })).toBeTruthy();
+    expect(view.getByLabelText('香港边缘 的中转监听端口').getAttribute('aria-invalid')).toBe('true');
+    expect(view.getAllByText(/与 AnyTLS 接入口 TCP 14443 冲突/)).toHaveLength(1);
     expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
+  });
+
+  it('路径上的机器与链路规则一样各自折叠，支路不提供移除', () => {
+    const view = mount();
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
+    fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), { target: { value: 'sg-relay-01' } });
+    const heads = () => [...document.body.querySelectorAll<HTMLElement>('.chain-rule-node-head')];
+    // 入口和刚加入的机器默认展开，两张规则表同时可见。
+    expect(heads().map(head => head.getAttribute('aria-expanded'))).toEqual(['true', 'true']);
+    expect(heads()[0].textContent).toContain('入口');
+    expect(heads()[0].querySelector('.m-hop')?.textContent).toBe('—');
+    // 只有入口有角色标签；中转、出口这类角色不再单独标出。
+    expect([...heads()[1].querySelectorAll('.who > .st')]).toHaveLength(0);
+    fireEvent.click(heads()[0]);
+    expect(heads().map(head => head.getAttribute('aria-expanded'))).toEqual(['false', 'true']);
+    expect(view.getByRole('button', { name: '把 新加坡中转 移出本链' })).toBeTruthy();
+  });
+
+  it('条件分流出去的支路由上游规则管理，行头没有移除', () => {
+    const view = mount();
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
+    fireEvent.click(entryRules().getByRole('button', { name: '＋ 加一条' }));
+    fireEvent.change(view.getByRole('textbox', { name: '香港边缘 第 1 条匹配取值' }), { target: { value: 'netflix' } });
+    fireEvent.change(view.getByRole('combobox', { name: '香港边缘 第 1 条动作' }), { target: { value: 'forward' } });
+    const menu = openTargetMenu('香港边缘 第 1 条转发目标');
+    fireEvent.click(within(menu).getByRole('button', { name: /NODE新加坡中转/ }));
+    const branch = [...document.body.querySelectorAll<HTMLElement>('.chain-rule-node-head')].find(
+      head => head.querySelector('.who > b')?.textContent === '新加坡中转',
+    );
+    expect(branch?.textContent).toContain('geosite=netflix');
+    expect(branch?.getAttribute('aria-expanded')).toBe('true');
+    expect(branch?.querySelector('.del-ctl')).toBeNull();
+  });
+
+  it('本机 DNS 解析策略在弹层里调整顺序，提交时写入同一批草稿', async () => {
+    draft.init(`wizard-dns-order-${Math.random()}`);
+    draft.clear();
+    const client = queryClient();
+    const snapshot = client.getQueryData<Record<string, unknown>>(['snapshot']);
+    const resolution = {
+      address: '1.1.1.1',
+      port: 53,
+      transport: 'udp',
+      address_strategy: 'use_ip',
+      fallback: 'machine',
+    };
+    client.setQueryData(['snapshot'], {
+      ...snapshot,
+      node_egress_dns: [
+        { node: 'hk-edge-01', position: 0, selector: { t: 'geosite', v: ['netflix'] }, resolution },
+        { node: 'hk-edge-01', position: 1, selector: { t: 'geosite', v: ['disney'] }, resolution },
+      ],
+    });
+    const done = vi.fn();
+    const view = render(
+      <QueryClientProvider client={client}>
+        <SessionProvider value={{ who: operator, initial }}>
+          <ChainWizard defaultApp={{ id: 'global', label: '全球加速' }} onDone={done} />
+        </SessionProvider>
+      </QueryClientProvider>,
+    );
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
+    fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: 'DNS 顺序' } });
+    fireEvent.click(entryRules().getByRole('button', { name: '查看本机 DNS 解析策略' }));
+    const dns = screen.getByRole('dialog', { name: '香港边缘 的本机 DNS 解析策略' });
+    expect(
+      within(dns)
+        .getAllByRole('row')
+        .map(row => row.textContent),
+    ).toEqual([expect.stringContaining('netflix'), expect.stringContaining('disney')]);
+    fireEvent.click(within(dns).getByRole('button', { name: 'DNS 优先级上移（geosite disney）' }));
+    fireEvent.click(within(dns).getByRole('button', { name: '完成' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /本机 DNS 解析策略/ })).toBeNull());
+    fireEvent.click(view.getByRole('button', { name: '加入草稿' }));
+    await waitFor(() => expect(done).toHaveBeenCalledOnce());
+    expect(draft.ops().find(op => op.op === 'reorder_node_egress_dns')).toEqual({
+      op: 'reorder_node_egress_dns',
+      node_id: 'hk-edge-01',
+      selectors: [
+        { t: 'geosite', v: ['disney'] },
+        { t: 'geosite', v: ['netflix'] },
+      ],
+    });
+  });
+
+  it('域名规则提供嗅探失败兜底，传输层规则可选 TCP 或 UDP', () => {
+    const view = mount();
+    fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
+    expect(entryRules().queryByRole('button', { name: '＋ 嗅探失败兜底' })).toBeNull();
+    fireEvent.click(entryRules().getByRole('button', { name: '＋ 加一条' }));
+    fireEvent.click(entryRules().getByRole('button', { name: '＋ 嗅探失败兜底' }));
+    expect(
+      (view.getAllByRole('combobox', { name: /香港边缘 第 \d+ 条匹配条件/ }) as HTMLSelectElement[]).map(
+        select => select.value,
+      ),
+    ).toEqual(['geosite', 'sniffing_failed', 'any']);
+    expect(entryRules().queryByRole('button', { name: '＋ 嗅探失败兜底' })).toBeNull();
+    fireEvent.change(view.getByRole('combobox', { name: '香港边缘 第 1 条匹配条件' }), {
+      target: { value: 'network' },
+    });
+    const network = view.getByRole('combobox', { name: '香港边缘 第 1 条传输层' }) as HTMLSelectElement;
+    expect(network.value).toBe('tcp');
+    fireEvent.change(network, { target: { value: 'udp' } });
+    expect((view.getByRole('combobox', { name: '香港边缘 第 1 条传输层' }) as HTMLSelectElement).value).toBe('udp');
   });
 
   it('自定义路径必须填写纯主机地址', () => {
@@ -1387,15 +1566,20 @@ describe('新建链向导', () => {
     fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), {
       target: { value: 'sg-relay-01' },
     });
-    fireEvent.change(view.getByRole('combobox', { name: '从 香港边缘 到 新加坡中转 的连接方式' }), {
-      target: { value: 'custom' },
-    });
-
-    expect(view.getAllByText(/填写自定义主机地址/)).toHaveLength(2);
-    expect(view.getByLabelText('到 新加坡中转 的自定义主机地址').getAttribute('aria-invalid')).toBe('true');
-    fireEvent.change(view.getByLabelText('到 新加坡中转 的自定义主机地址'), {
-      target: { value: '10.0.0.8' },
-    });
+    // 自定义地址就在拨号菜单的最后一项里填写，与链路规则一致。
+    const dial = view.getByRole('combobox', { name: '从 香港边缘 到 新加坡中转 的连接方式' });
+    fireEvent.click(dial);
+    const address = within(screen.getByRole('listbox', { name: '从 香港边缘 到 新加坡中转 的连接方式' })).getByRole(
+      'textbox',
+      { name: '自定义地址' },
+    );
+    fireEvent.change(address, { target: { value: '10' } });
+    fireEvent.change(address, { target: { value: '' } });
+    expect(dial.textContent).toBe('自定义');
+    expect(view.container.querySelector('.rule-dial-address.is-problem')?.textContent).toBe('在拨号菜单里填写地址');
+    expect(view.getAllByText(/填写自定义主机地址/)).toHaveLength(1);
+    fireEvent.change(address, { target: { value: '10.0.0.8' } });
+    expect(view.container.querySelector('.rule-dial-address')?.textContent).toBe('10.0.0.8');
     expect(view.queryAllByText(/填写自定义主机地址/)).toHaveLength(0);
   });
 
@@ -1430,7 +1614,7 @@ describe('新建链向导', () => {
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
     fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: '亚太分流' } });
     fireEvent.change(view.getByRole('combobox', { name: '在路径末尾添加机器' }), { target: { value: 'sg-relay-01' } });
-    fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    fireEvent.click(entryRules().getByRole('button', { name: '＋ 加一条' }));
     fireEvent.change(view.getByRole('combobox', { name: '香港边缘 第 1 条匹配条件' }), {
       target: { value: 'domain_suffix' },
     });
@@ -1440,13 +1624,11 @@ describe('新建链向导', () => {
     fireEvent.change(view.getByRole('combobox', { name: '香港边缘 第 1 条动作' }), {
       target: { value: 'forward' },
     });
-    fireEvent.click(view.getByRole('button', { name: '香港边缘 第 1 条转发目标' }));
-    const menu = document.body.querySelector('.external-target-menu');
-    expect(menu?.textContent).toContain('在机器上新建本链监听');
-    expect(menu?.textContent).toContain('代理出站');
-    expect(menu?.textContent).toContain('管理隧道');
+    const menu = openTargetMenu('香港边缘 第 1 条转发目标');
+    expect(menu.textContent).toContain('在机器上新建本链监听');
+    expect(menu.textContent).toContain('外部出站');
     fireEvent.click(within(document.body).getByRole('button', { name: /NODE台湾出口.*加入本链/ }));
-    expect(view.container.querySelector('.wzr-dial-address')?.textContent).toBe('192.0.2.30');
+    expect(view.container.querySelector('.rule-dial-address')?.textContent).toBe('192.0.2.30');
     expect(view.queryByRole('combobox', { name: '订阅地区' })).toBeNull();
     expect(view.queryByLabelText('出口地区标识')).toBeNull();
     fireEvent.click(view.getByRole('button', { name: /^alice(?:\s|$)/ }));
@@ -1542,7 +1724,7 @@ describe('新建链向导', () => {
     );
     fireEvent.change(view.getByRole('combobox', { name: '选择入口节点' }), { target: { value: 'hk-edge-01' } });
     fireEvent.change(view.getByRole('textbox', { name: '链名称' }), { target: { value: 'VPN Gate 测试' } });
-    fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    fireEvent.click(entryRules().getByRole('button', { name: '＋ 加一条' }));
     fireEvent.change(view.getByRole('combobox', { name: '香港边缘 第 1 条匹配条件' }), {
       target: { value: 'domain_suffix' },
     });
@@ -1552,7 +1734,7 @@ describe('新建链向导', () => {
     fireEvent.change(view.getByRole('combobox', { name: '香港边缘 第 1 条动作' }), {
       target: { value: 'forward' },
     });
-    fireEvent.click(view.getByRole('button', { name: '香港边缘 第 1 条转发目标' }));
+    openTargetMenu('香港边缘 第 1 条转发目标');
     const vpnOption = within(document.body).getByRole('button', { name: 'VPN Gate' });
     expect(vpnOption.hasAttribute('disabled')).toBe(false);
     expect(within(document.body).queryByRole('button', { name: /VGVPN Gate · 日本.*共享资源/ })).toBeNull();
@@ -1589,20 +1771,24 @@ describe('新建链向导', () => {
     fireEvent.change(view.getByRole('textbox', { name: 'VLESS Encryption 监听端口' }), {
       target: { value: '25443' },
     });
-    fireEvent.click(view.getByRole('button', { name: '＋ 加一条' }));
+    fireEvent.click(entryRules().getByRole('button', { name: '＋ 加一条' }));
     expect((view.getByRole('combobox', { name: '香港边缘 第 1 条匹配条件' }) as HTMLSelectElement).value).toBe(
       'geosite',
     );
     fireEvent.change(view.getByRole('textbox', { name: '香港边缘 第 1 条匹配取值' }), {
       target: { value: 'netflix' },
     });
-    changeControl(view.getByRole('combobox', { name: /DNS 解析方式.*第 1 条/ }), {
+    changeControl(view.getByRole('combobox', { name: 'DNS 解析方式（新建链：香港边缘 第 1 条）' }), {
       target: { value: 'custom' },
     });
     expect(view.getByRole('button', { name: '加入草稿' }).hasAttribute('disabled')).toBe(true);
-    fireEvent.change(view.getByRole('textbox', { name: /DNS 地址.*第 1 条/ }), {
+    // 选「自定义 DNS 解析」直接打开本机 DNS 解析策略弹层，停在这一条上。
+    const dns = screen.getByRole('dialog', { name: '香港边缘 的本机 DNS 解析策略' });
+    fireEvent.change(within(dns).getByRole('textbox', { name: /^DNS 地址/ }), {
       target: { value: '1.1.1.1' },
     });
+    fireEvent.click(within(dns).getByRole('button', { name: '完成' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /本机 DNS 解析策略/ })).toBeNull());
     fireEvent.click(view.getByRole('button', { name: '加入草稿' }));
     await waitFor(() => expect(done).toHaveBeenCalledOnce());
     const ops = draft.ops();
@@ -1671,7 +1857,16 @@ describe('纳管自动初始化', () => {
         },
       ],
     });
-    const fetchMock = vi.fn();
+    const fetchMock = vi.fn(async (_url?: unknown, _init?: RequestInit) =>
+      Response.json({
+        hosts: [],
+        instances: [],
+        quotas: [],
+        can_manage_quotas: false,
+        can_write: false,
+        redacted: false,
+      }),
+    );
     vi.stubGlobal('fetch', fetchMock);
     const go = vi.fn();
     const view = render(
@@ -1691,7 +1886,9 @@ describe('纳管自动初始化', () => {
       expect(within(view.getByRole('list', { name: '纳管进度' })).getAllByRole('listitem')[2].className).toBe('done');
     }
     if (state === 'manual') expect(view.getByText('已有其他机器的配置待发布')).toBeTruthy();
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(
+      fetchMock.mock.calls.every(([url, init]) => url === '/cvm' && (!init?.method || init.method === 'GET')),
+    ).toBe(true);
   });
 
   it('WireGuard 初始关闭，允许操作者显式开启', () => {

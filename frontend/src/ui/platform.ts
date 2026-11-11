@@ -41,3 +41,9 @@ export async function copyText(text: string): Promise<boolean> {
   area.remove();
   return copied;
 }
+
+/** Clipboard reads require browser permission; callers provide the manual fallback. */
+export async function readClipboardText(): Promise<string> {
+  if (typeof navigator.clipboard?.readText !== 'function') throw new Error('clipboard unavailable');
+  return navigator.clipboard.readText();
+}

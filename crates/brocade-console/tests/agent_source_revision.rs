@@ -124,3 +124,47 @@ fn related_commits_advance_and_only_related_dirt_marks_the_revision() {
         second
     );
 }
+
+#[test]
+fn cube_executor_and_pinned_schemas_belong_to_the_agent_source_closure() {
+    let repo = TestRepo::new();
+    for path in [
+        "crates/brocade-cube/src/lib.rs",
+        "components/cube/CubeShim/terminal/src/lib.rs",
+        "components/cube/pkgs/proto/services/cubebox/v1/cubebox.proto",
+    ] {
+        let file = repo.0.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "original source\n").unwrap();
+        let revision = repo.commit("add executor input");
+        assert_eq!(source_revision::agent_source_revision(&repo.0), revision);
+        fs::write(&file, "changed source\n").unwrap();
+        assert_eq!(
+            source_revision::agent_source_revision(&repo.0),
+            format!("{revision}-dirty")
+        );
+        repo.commit("change executor input");
+    }
+}
+
+#[test]
+fn base_revision_excludes_cube_and_cvm_only_changes() {
+    let repo = TestRepo::new();
+    let main = repo.0.join("crates/brocade-agent/src/main.rs");
+    fs::create_dir_all(main.parent().unwrap()).unwrap();
+    fs::write(&main, "fn main() {}\n").unwrap();
+    let base = repo.commit("base");
+    for path in ["crates/brocade-agent/src/cvm.rs", "crates/brocade-agent/src/cvm/nics.rs",
+        "crates/brocade-deployment/src/cvm.rs", "crates/brocade-cube/src/lib.rs"] {
+        let file = repo.0.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "cvm source\n").unwrap();
+        repo.commit("cvm only");
+        fs::write(&file, "cvm changed\n").unwrap();
+        assert_eq!(source_revision::base_agent_source_revision(&repo.0), base);
+        assert!(source_revision::agent_source_revision(&repo.0).ends_with("-dirty"));
+        repo.commit("cvm changed");
+    }
+    fs::write(main, "fn main() { println!(\"changed\"); }\n").unwrap();
+    assert_eq!(source_revision::base_agent_source_revision(&repo.0), format!("{base}-dirty"));
+}

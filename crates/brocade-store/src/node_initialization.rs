@@ -235,9 +235,7 @@ async fn process_job(pool: &PgPool, id: i64) -> Result<()> {
     lock_tx(&mut tx).await?;
     // Model writers take this same singleton lock; no business edit can enter between the
     // eligibility check and persisting the immutable single-node target.
-    sqlx::query("SELECT current_revision FROM control_state WHERE id=TRUE FOR UPDATE")
-        .fetch_one(&mut *tx)
-        .await?;
+    console::lock_control_state(&mut tx).await?;
     let row = sqlx::query("SELECT payload FROM jobs WHERE id=$1 AND status='queued' FOR UPDATE")
         .bind(id)
         .fetch_optional(&mut *tx)

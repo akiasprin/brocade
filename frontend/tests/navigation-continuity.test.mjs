@@ -37,7 +37,7 @@ test('窄屏不重复显示面包屑，进入新页面后焦点仍落在主内�
   assert.match(shell, /role="main" aria-label=\{`\$\{LABEL\[nav\]\}内容`\} tabIndex=\{-1\}/);
 });
 
-test('桌面普通页面顶栏随唯一的工作区滚动容器滚动', () => {
+test('主导航随工作区滚动，桌面边界不回弹露出背景网格', () => {
   assert.match(shell, /<div className=\{`fg-desk\$\{nav === 'topo' \? ' is-topo' : ''\}`\}>\s*<TopBar/);
   assert.equal((shell.match(/<TopBar/g) ?? []).length, 1);
   assert.match(styles, /\.fg-desk\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;[^}]*overflow:\s*auto;/s);
@@ -54,7 +54,13 @@ test('桌面普通页面顶栏随唯一的工作区滚动容器滚动', () => {
     styles,
     /body:has\(\.forge\)::before\s*\{\s*position:\s*sticky;[^}]*height:\s*100dvh;[^}]*margin-bottom:\s*-100dvh;[^}]*background-color:\s*var\(--ground\);/s,
   );
-  assert.doesNotMatch(styles, /\.fg-top\s*\{[^}]*position:\s*(?:fixed|sticky)/s);
+  assert.match(styles, /\.fg-top\s*\{[^}]*background:\s*var\(--surface\);/s);
+  assert.match(styles, /\.fg-top\s*\{[^}]*position:\s*relative;/s);
+  assert.doesNotMatch(styles, /\.fg-top\s*\{[^}]*position:\s*(?:sticky|fixed);/s);
+  assert.match(
+    styles,
+    /@media \(hover: hover\) and \(pointer: fine\)\s*\{\s*html,\s*\.fg-desk\s*\{\s*overscroll-behavior-y:\s*none;/s,
+  );
   assert.doesNotMatch(styles, /\.fg-top::before/);
 });
 

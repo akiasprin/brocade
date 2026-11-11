@@ -126,7 +126,9 @@ describe('链路规则统一保存', () => {
     fireEvent.click(save);
     await waitFor(() => expect(view.getByRole('alert').textContent).toBe('请填写完整的 DNS 地址，用逗号分隔'));
     const address = view.getByRole('textbox', { name: /DNS 地址/ });
-    expect(view.getByRole('alert').closest('tr')).toBe(address.closest('tr'));
+    // 选择自定义时弹层已经打开；保存失败的提示写在出错的那一条策略下面。
+    expect(address.closest('.rule-dns-row')).not.toBeNull();
+    expect(view.getByRole('alert').closest('.rule-dns-row')).toBe(address.closest('.rule-dns-row'));
     expect(draft.ops()).toHaveLength(0);
     changeControl(address, { target: { value: '192.0.2.53' } });
     await waitFor(() => expect(view.queryByRole('alert')).toBeNull());
@@ -210,7 +212,7 @@ describe('链路规则统一保存', () => {
       [relay],
     );
 
-    fireEvent.click(view.getAllByRole('button', { name: '删' })[0]);
+    fireEvent.click(view.getByRole('button', { name: '删除（规则 1）' }));
 
     await waitFor(() => expect(view.getByText('1 项配置有改动')).toBeTruthy());
     expect(draft.ops()).toEqual([]);
@@ -224,6 +226,27 @@ describe('链路规则统一保存', () => {
     expect(sourceWrite?.op).toBe('put_step');
     if (!sourceWrite || sourceWrite.op !== 'put_step') return;
     expect(sourceWrite.step.rules).toEqual([forward({ t: 'any' }, 'old')]);
+  });
+
+  it('传输层规则可选 TCP 或 UDP，选择随统一保存写入草稿', async () => {
+    const relay = step('old', [egress()], 20000);
+    const view = renderScopedEditor(
+      [forward({ t: 'network', v: 'tcp' }, 'old'), forward({ t: 'any' }, 'old')],
+      [relay],
+    );
+
+    const network = view.getByRole('combobox', { name: '传输层（规则 1）' }) as HTMLSelectElement;
+    expect(network.value).toBe('tcp');
+    fireEvent.change(network, { target: { value: 'udp' } });
+    fireEvent.click(await view.findByRole('button', { name: '保存到草稿' }));
+
+    await waitFor(() =>
+      expect(
+        draft.ops().find(operation => operation.op === 'put_step' && operation.node_id === 'source'),
+      ).toMatchObject({
+        step: { rules: [{ m: { t: 'network', v: 'udp' } }, { m: { t: 'any' } }] },
+      }),
+    );
   });
 
   it('替换转发节点时保留新节点的规则和监听，不再重写旧节点', async () => {

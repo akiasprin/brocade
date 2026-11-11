@@ -594,11 +594,25 @@ pub async fn create_rule(
     user_id: &str,
     write: ForwardingRuleWrite,
 ) -> Result<ForwardingOverview> {
-    require_rule_write_access(actor, tenant_id, user_id)?;
-    validate_rule_shape(&write)?;
     let mut tx = pool.begin().await?;
-    crate::user_traffic::lock_user_tx(&mut tx, tenant_id, user_id).await?;
-    validate_rule_against_entitlement(&mut tx, tenant_id, user_id, &write, None).await?;
+    crate::resource_coordination::lock(&mut tx).await?;
+    create_rule_tx(&mut tx, actor, tenant_id, user_id, &write).await?;
+    tx.commit().await?;
+    overview(pool, actor, tenant_id, user_id).await
+}
+
+/// Reserve a user forwarding rule under its own authorization and quota.
+pub(crate) async fn create_rule_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+    write: &ForwardingRuleWrite,
+) -> Result<i64> {
+    require_rule_write_access(actor, tenant_id, user_id)?;
+    validate_rule_shape(write)?;
+    crate::user_traffic::lock_user_tx(tx, tenant_id, user_id).await?;
+    validate_rule_against_entitlement(tx, tenant_id, user_id, write, None).await?;
     let result = sqlx::query(
         "INSERT INTO forwarding_rules (
              tenant_id, user_id, node_id, name, protocol, listen_port,
@@ -615,13 +629,13 @@ pub async fn create_rule(
     .bind(write.target_host.trim())
     .bind(i32::from(write.target_port))
     .bind(write.enabled)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await;
     let row = map_port_conflict(result)?;
-    remember_rule_node(&mut tx, row.try_get("id")?, &write.node_id).await?;
-    bump_node_generation(&mut tx, &write.node_id).await?;
-    tx.commit().await?;
-    overview(pool, actor, tenant_id, user_id).await
+    let id = row.try_get("id")?;
+    remember_rule_node(tx, id, &write.node_id).await?;
+    bump_node_generation(tx, &write.node_id).await?;
+    Ok(id)
 }
 
 pub async fn update_rule(
@@ -635,6 +649,7 @@ pub async fn update_rule(
     require_rule_write_access(actor, tenant_id, user_id)?;
     validate_rule_shape(&write)?;
     let mut tx = pool.begin().await?;
+    crate::resource_coordination::lock(&mut tx).await?;
     crate::user_traffic::lock_user_tx(&mut tx, tenant_id, user_id).await?;
     // Policy edits and entitlement deletion take the grant before its rules. Acquire the
     // destination grant in the same order; validate its current policy after locking the rule.
@@ -790,6 +805,13 @@ async fn validate_rule_against_entitlement(
             ));
         }
         ensure_static_port_available(tx, &write.node_id, write.protocol, write.listen_port).await?;
+        crate::port_reservations::check_user_listener(
+            tx,
+            &write.node_id,
+            write.protocol,
+            write.listen_port,
+        )
+        .await?;
     }
     let count: i64 = row.try_get("rule_count")?;
     let max: i32 = row.try_get("max_rules")?;
@@ -855,7 +877,7 @@ async fn disable_blocked_rules(
     Ok(())
 }
 
-async fn ensure_static_port_available(
+pub(crate) async fn ensure_static_port_available(
     tx: &mut Transaction<'_, Postgres>,
     node_id: &str,
     protocol: ForwardingProtocol,
@@ -870,34 +892,7 @@ async fn ensure_static_port_available(
         ForwardingProtocol::Udp | ForwardingProtocol::TcpUdp
     );
     let occupied: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-            SELECT 1 FROM nodes n
-             WHERE n.id = $1 AND (
-                ($3 AND (
-                    n.api_port = $2 OR
-                    CASE WHEN n.wg_transport ->> 't' = 'fake_tcp'
-                         THEN (n.wg_transport -> 'v' ->> 'port')::integer = $2
-                         ELSE FALSE END
-                )) OR ($4 AND n.wg_listen_port = $2)
-             )
-            UNION ALL
-            SELECT 1 FROM ingresses i
-             WHERE i.node_id = $1 AND (
-                ($3 AND (
-                    (i.transport_kind IS NOT NULL AND i.port = $2) OR
-                    i.vless_encryption_port = $2 OR
-                    (i.anytls_enabled AND i.anytls_port = $2) OR
-                    i.mtproto_port = $2 OR
-                    i.xhttp_download_v4_origin_port = $2 OR
-                    i.xhttp_download_v6_origin_port = $2
-                )) OR ($4 AND i.hy2_enabled AND
-                    $2 BETWEEN COALESCE(i.hy2_hop_start, i.hy2_port)
-                           AND COALESCE(i.hy2_hop_end, i.hy2_port))
-             )
-            UNION ALL
-            SELECT 1 FROM steps s
-             WHERE s.node_id = $1 AND $3 AND s.hop_in_port = $2
-        )",
+        "SELECT EXISTS(SELECT 1 FROM managed_static_listener_ranges WHERE node_id=$1 AND $2 BETWEEN port_start AND port_end AND (($3 AND protocol='tcp') OR ($4 AND protocol='udp')))"
     )
     .bind(node_id)
     .bind(i32::from(port))

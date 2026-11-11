@@ -13,7 +13,9 @@ pub(crate) async fn plan_deployment_artifacts(
             "artifact source requires system administrator access".to_owned(),
         ));
     }
-    let plan = plan_deployment(pool, actor, revision_id).await?;
+    let plan =
+        crate::model_timing::measure("deployment_plan", plan_deployment(pool, actor, revision_id))
+            .await?;
     let nodes = plan
         .targets
         .iter()
@@ -81,7 +83,11 @@ pub(crate) async fn plan_deployment_artifacts(
         });
     }
     if include_content {
-        attach_known_artifact_content(pool, &mut targets).await?;
+        crate::model_timing::measure(
+            "artifact_load_content",
+            attach_known_artifact_content(pool, &mut targets),
+        )
+        .await?;
     }
     Ok(targets)
 }

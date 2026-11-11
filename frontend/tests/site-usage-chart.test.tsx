@@ -81,7 +81,10 @@ it('keeps retained history visible and distinguishes unknown coverage from obser
   const option = mock.chart.setOption.mock.calls[0][0];
   expect(option.series[0].markArea).toBeUndefined();
   expect(option.series[0].data[2]).toEqual([2.5, 1024]);
-  expect(option.tooltip.formatter([{ seriesIndex: 0, value: [0.5, 0] }])).toContain('无记录 · 采集可能不完整');
+  const empty = option.tooltip.formatter([{ seriesIndex: 0, value: [0.5, 0] }]);
+  expect(empty).toContain('无记录');
+  expect(empty).not.toContain('采集可能不完整');
+  expect(empty).not.toContain('无流量');
   expect(option.tooltip.formatter([{ seriesIndex: 0, value: [0.5, 1024] }])).not.toContain('未观测');
   expect(option.tooltip.formatter([{ seriesIndex: 0, value: [3.5, 0] }])).toContain('无流量');
 });

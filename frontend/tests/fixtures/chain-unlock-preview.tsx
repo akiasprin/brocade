@@ -13,6 +13,7 @@ import type {
 } from '../../src/api';
 import type { ModelOp } from '../../src/draft';
 import { App } from '../../src/app';
+import { preloadPaneForHash } from '../../src/panes/preload';
 import { type Session } from '../../src/session';
 import { MACHINES, TENANT, chainSnapshot, e2eProbes, previewSnapshot } from './chain-data';
 import { agentState, nicView, pingLatest, reports, trafficItem } from './node-roster-data';
@@ -367,6 +368,9 @@ Object.defineProperty(window, 'EventSource', { value: SilentEventSource, configu
 if (!location.hash) history.replaceState(null, '', `${location.search}#/chains`);
 if (params.get('view') !== 'cards') localStorage.setItem('brocade-console:chain-view', 'unlock');
 else localStorage.setItem('brocade-console:chain-view', 'cards');
+// Compile the requested production pane before mounting the synthetic Console.
+// A cold Vite transform is fixture setup, not the interaction under test.
+await preloadPaneForHash(location.hash);
 createRoot(document.getElementById('root')!).render(
   <QueryClientProvider client={client}>
     <App />

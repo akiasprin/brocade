@@ -37,11 +37,28 @@ for (const width of [1440, 390])
       await expect(card).toHaveScreenshot(`chain-picked-${width}-${theme}.png`);
       await page.getByRole('button', { name: '取消', exact: true }).click();
       if (width === 1440) {
-        const bounds = await card.boundingBox();
+        let bounds = await card.boundingBox();
         await page.mouse.move(bounds!.x + 80, bounds!.y + 30);
         await page.mouse.down();
-        await page.mouse.move(bounds!.x + 110, bounds!.y + 30, { steps: 5 });
+        await page.mouse.move(bounds!.x + 86, bounds!.y + 30);
+        await page.mouse.up();
+        await expect(card).not.toHaveClass(/order-drag-active/);
+        await expect(page.locator('.order-ghost')).toHaveCount(0);
+        await expect.poll(() => card.evaluate(el => new DOMMatrixReadOnly(getComputedStyle(el).transform).a)).toBe(1);
+        bounds = await card.boundingBox();
+        await page.mouse.move(bounds!.x + 80, bounds!.y + 30);
+        await page.mouse.down();
+        await expect
+          .poll(() => card.evaluate(el => new DOMMatrixReadOnly(getComputedStyle(el).transform).a))
+          .toBe(0.985);
+        // Cross the threshold in one event. Coalescing stepped pointer moves
+        // otherwise changes the ghost's captured initial offset by a few px.
+        await page.mouse.move(bounds!.x + 86, bounds!.y + 30);
         await expect(card).toHaveClass(/order-drag-active/);
+        const ghost = page.locator('.order-ghost');
+        await expect(ghost).toHaveCount(1);
+        expect(Math.abs((await ghost.boundingBox())!.width - (await card.boundingBox())!.width)).toBeLessThan(0.5);
+        await page.mouse.move(bounds!.x + 110, bounds!.y + 30);
         await expect
           .poll(() => card.evaluate(element => new DOMMatrixReadOnly(getComputedStyle(element).transform).a))
           .toBe(1);

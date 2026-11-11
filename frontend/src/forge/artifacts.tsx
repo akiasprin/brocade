@@ -28,6 +28,25 @@ import { artifactFile, artifactFmt, artifactTargetLabel, countChanges, diffLines
 
 export const entryId = (a: ArtifactIndexEntry) => `${a.target_kind}/${a.target_id}/${a.artifact_kind}`;
 
+/** Configuration files are independent from grants and user subscription artifacts. */
+export function changedConfigurationNodes(here: ArtifactIndexEntry[], there: ArtifactIndexEntry[]): Set<string> {
+  const files = (entries: ArtifactIndexEntry[]) =>
+    new Map(
+      entries
+        .filter(entry => entry.target_kind === 'node' && entry.artifact_kind !== 'grants' && entry.state !== 'disabled')
+        .map(entry => [entryId(entry), entry] as const),
+    );
+  const current = files(here);
+  const previous = files(there);
+  const changed = new Set<string>();
+  for (const key of new Set([...current.keys(), ...previous.keys()])) {
+    const after = current.get(key);
+    const before = previous.get(key);
+    if (after?.state !== before?.state || after?.sha256 !== before?.sha256) changed.add((after ?? before)!.target_id);
+  }
+  return changed;
+}
+
 /** 通过比较 sha256 得出发生变化的产物 id——索引本身包含 sha256，无需拉取内容。 */
 function changedBetween(here: ArtifactIndexEntry[], there: ArtifactIndexEntry[]): Set<string> {
   const before = new Map(there.map(a => [entryId(a), a.sha256]));
@@ -65,6 +84,7 @@ export function useRevisionDiff(revision: number | undefined, base: number | nul
       return {
         list,
         changed: new Set<string>(),
+        configurationNodes: base === null && here.data && !here.error ? changedConfigurationNodes(list, []) : undefined,
         known: false,
         pending: (revision != null && here.isPending) || (base != null && there.isPending),
         error: here.error ?? there.error,
@@ -73,6 +93,8 @@ export function useRevisionDiff(revision: number | undefined, base: number | nul
     return {
       list,
       changed: changedBetween(list, there.data.artifacts),
+      configurationNodes:
+        here.data && !here.error && !there.error ? changedConfigurationNodes(list, there.data.artifacts) : undefined,
       known: true,
       pending: (revision != null && here.isPending) || there.isPending,
       error: here.error ?? there.error,

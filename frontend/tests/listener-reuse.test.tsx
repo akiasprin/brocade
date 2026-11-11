@@ -475,12 +475,12 @@ describe('监听规则子树复用', () => {
     const row = view.container.querySelector('.rule-table tbody tr');
     if (!(row instanceof HTMLTableRowElement)) throw new Error('没有规则行');
     const action = row.querySelector('.rule-action-select');
-    if (!(action instanceof HTMLButtonElement)) throw new Error('没有动作选择器');
+    if (!(action instanceof HTMLSelectElement)) throw new Error('没有动作选择器');
     changeControl(action, { target: { value: 'forward' } });
     expect(view.queryByRole('button', { name: /新加坡共享监听 · TCP 22000/ })).toBeNull();
     expect(view.queryByRole('button', { name: /同链监听 · TCP 21001/ })).toBeNull();
     const custom = await view.findByRole('button', { name: /复用其他链的监听/ });
-    const manage = view.getByRole('button', { name: '新建代理出站' });
+    const manage = view.getByRole('button', { name: /自定义.*手动设置 IP、端口和协议/ });
     expect(custom.textContent).not.toContain('↗');
     expect(manage.textContent).not.toContain('↗');
     expect(custom.querySelector('.external-target-new-icon')).not.toBeNull();
@@ -503,11 +503,12 @@ describe('监听规则子树复用', () => {
     expect(view.queryByRole('button', { name: '打开源规则' })).toBeNull();
     expect(view.queryByText('高亮规则子树')).toBeNull();
     expect(view.queryByRole('button', { name: /高亮 .*规则子树/ })).toBeNull();
-    const referencePanel = [...view.container.querySelectorAll<HTMLElement>('.listener-reference-panel')].find(panel =>
-      panel.querySelector('.panel-title')?.textContent?.includes('引用监听'),
+    // 引用监听和本链监听、代理出站同在「下一跳」一块里，按标记区分。
+    const referencePanel = [...view.container.querySelectorAll<HTMLElement>('.listener-reference-row')].find(row =>
+      row.querySelector('.external-target-kind.listener')?.textContent?.includes('引用'),
     );
-    const referencePool = referencePanel?.querySelector('.listener-inline-facts [role=combobox]');
-    if (!(referencePool instanceof HTMLButtonElement)) throw new Error('没有引用监听的连接复用选择器');
+    const referencePool = referencePanel?.querySelector('.listener-inline-facts select');
+    if (!(referencePool instanceof HTMLSelectElement)) throw new Error('没有引用监听的连接复用选择器');
     changeControl(referencePool, { target: { value: 'mux' } });
     const referenceMux = referencePanel?.querySelector('.listener-reference-mux');
     expect(referenceMux?.textContent).toContain('Mux 参数跟随全局配置参数');

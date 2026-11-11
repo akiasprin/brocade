@@ -886,7 +886,7 @@ function historyObservedPeak(lines: HistoryLine[], threshold?: { value: number }
 
 /** 原始时序曲线。这里不放阈值、状态词或自动结论，只负责把服务端保留的窗口逐点画出。
  * null 与 has_gap 都断线，不用 0 填补；tooltip 显示窗口结束的绝对时间和原始数值。 */
-function HistoryChart({
+export function HistoryChart({
   title,
   samples,
   lines,
@@ -901,9 +901,15 @@ function HistoryChart({
   wide = false,
   loading = false,
   ready = true,
+  rangeStartUnixSecs,
+  rangeEndUnixSecs,
+  events,
 }: {
   title: string;
-  samples: LoadSample[];
+  samples: Pick<LoadSample, 'window_start_unix_secs' | 'window_end_unix_secs'>[];
+  rangeStartUnixSecs?: number;
+  rangeEndUnixSecs?: number;
+  events?: { atUnixSecs: number; label: string }[];
   lines: HistoryLine[];
   group?: string;
   variant?: HistoryChartVariant;
@@ -979,6 +985,9 @@ function HistoryChart({
       unit?.name,
       themeName,
       paletteKey,
+      rangeStartUnixSecs,
+      rangeEndUnixSecs,
+      events,
     ]);
     if (sig === lastSig.current) return;
     lastSig.current = sig;
@@ -1005,8 +1014,8 @@ function HistoryChart({
       if (hasStack) return undefined;
       return observeAreaStyle(colors[index], themeName, { count: overlapCount, paper: cv('--card', '') });
     };
-    const lastMs = (times[times.length - 1] ?? 0) * 1000;
-    const firstMs = (times[0] ?? 0) * 1000;
+    const lastMs = (rangeEndUnixSecs ?? times[times.length - 1] ?? 0) * 1000;
+    const firstMs = (rangeStartUnixSecs ?? times[0] ?? 0) * 1000;
     // 轴起点即首个样本时刻，曲线紧贴 y 轴；不向下取整到整分，以免首点秒数变成左端留白。
     // 刻度落在墙钟整点上（observeTimeAxes），tooltip 到秒。
     const xMin = Math.min(firstMs, lastMs - 30_000);
@@ -1096,20 +1105,28 @@ function HistoryChart({
             itemStyle: { color: colors[index], borderColor: glass, borderWidth: 1.5, ...focus.itemStyle },
             data: observeSeriesData(times, lineSeries.values, { windowStartsUnixSecs: windowStarts }),
             markLine:
-              index === 0 && threshold
+              index === 0 && (threshold || events?.length)
                 ? {
                     silent: true,
                     symbol: ['none', 'none'],
                     label: {
-                      show: true,
+                      show: !!threshold,
                       position: 'insideEndTop',
-                      formatter: threshold.label,
+                      formatter: threshold?.label,
                       color: cv('--err', '#bd4b4b'),
                       fontSize: 8,
                       fontFamily: TP_MONO,
                     },
                     lineStyle: { color: cv('--err', '#bd4b4b'), width: 1, type: 'dashed', opacity: 0.55 },
-                    data: [{ yAxis: threshold.value }],
+                    data: [
+                      ...(threshold ? [{ yAxis: threshold.value }] : []),
+                      ...(events ?? []).map(event => ({
+                        xAxis: event.atUnixSecs * 1000,
+                        name: event.label,
+                        label: { show: false },
+                        lineStyle: { color: ink4, opacity: 0.5 },
+                      })),
+                    ],
                   }
                 : undefined,
           };
@@ -1137,6 +1154,9 @@ function HistoryChart({
     unit?.name,
     valueAxis,
     variant,
+    rangeStartUnixSecs,
+    rangeEndUnixSecs,
+    events,
   ]);
 
   const latest = (values: (number | null)[]) => {

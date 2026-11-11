@@ -324,6 +324,33 @@ describe('machine card readings', () => {
 describe('comet and health-ring cards', () => {
   const machine = SCENES.typical.machines().find(machine => machine.id === 'mo-ctm')!;
   const readings = () => [...document.querySelectorAll('.node-card-resource b')].map(el => el.textContent);
+  it.each([
+    [1.17, 75, 85],
+    [2.5, 50, 65],
+    [5, 5, 20],
+    [10, 5, 20],
+    [100, 5, 20],
+    [500, 5, 20],
+  ])('keeps %s Mbit/s at an appropriate height and expands for high traffic', async (mbps, minTop, maxTop) => {
+    const now = Math.floor(Date.now() / 1000);
+    const view = nicView(machine, now, 24);
+    view.series = view.series.map(sample => ({
+      ...sample,
+      nic_rx_bps: mbps * 1e6 * 0.6,
+      nic_tx_bps: mbps * 1e6 * 0.4,
+    }));
+    mount(fleet([machine]), admin, true, { nic: [view], traffic: [] });
+    await waitFor(() => expect(document.querySelector('.node-card-comet-now')).toBeTruthy());
+    const top = parseFloat(document.querySelector<HTMLElement>('.node-card-comet-now')!.style.top);
+    expect(top).toBeGreaterThan(minTop);
+    expect(top).toBeLessThan(maxTop);
+    const curve = document.querySelector('.node-card-comet .trail')!.getAttribute('d')!;
+    const firstY = Number(/^M0 ([\d.]+)/.exec(curve)![1]);
+    expect((firstY / 46) * 100).toBeCloseTo(top, 1);
+    const rate = document.querySelector('.node-card-rate')!;
+    expect(parseFloat(rate.textContent!)).toBe(mbps);
+    expect(rate.querySelector('small')?.textContent).toBe('Mbit/s');
+  });
   it('keeps zero-traffic curves visible, breaks explicit and absent windows and drops unknown endpoints', async () => {
     const now = Math.floor(Date.now() / 1000);
     const view = nicView(machine, now, 24);

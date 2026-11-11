@@ -59,6 +59,7 @@ interface DrillSpec {
 // 哪些页面的下钻状态写入地址。未列出的页面（settings / topo 等）只有一个位置，
 // 一个 nav 即可表示；未列出的 `p`（provision 的步骤）保留在 wm.data 中不进入地址。
 const DRILL: Partial<Record<NavKey, DrillSpec[]>> = {
+  cvm: [{ seg: 'new' }, { seg: 'instance', fields: [{ name: 'id' }] }],
   nodes: [
     // 观测时间范围进入地址：每次切换是一条浏览器历史，前进后退、刷新、分享链接都保留所选时段。
     // 取值与组合规则见 ui/observe-range.ts；页签不进入地址（见 nodes.tsx 的 NodeDetail）。

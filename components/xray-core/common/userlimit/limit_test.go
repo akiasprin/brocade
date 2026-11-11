@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"net"
@@ -13,6 +14,65 @@ import (
 	"testing"
 	"time"
 )
+
+func TestRetryDialsFreshWhenMultipleIdleConnectionsHaveExpired(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	cfg := control{Endpoint: listener.Addr().String(), Token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	file := filepath.Join(t.TempDir(), "control.json")
+	data, _ := json.Marshal(cfg)
+	if err := os.WriteFile(file, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	client := New(file)
+	client.current, client.refreshed = cfg, time.Now()
+	for range 2 {
+		local, peer := net.Pipe()
+		_ = peer.Close()
+		client.idle = append(client.idle, &connection{Conn: local, reader: bufio.NewReader(local), control: cfg})
+	}
+	defer func() {
+		for _, conn := range client.idle {
+			_ = conn.Close()
+		}
+	}()
+	served := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			served <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(time.Second))
+		line, err := bufio.NewReader(conn).ReadBytes('\n')
+		if err != nil {
+			served <- err
+			return
+		}
+		var request struct {
+			Token, Source string
+			Bytes         int
+		}
+		if json.Unmarshal(line, &request) != nil || request.Token != cfg.Token || request.Source != "alice@tenant#entry" || request.Bytes != 16 {
+			served <- errors.New("retry did not preserve the authenticated admission request")
+			return
+		}
+		_, err = conn.Write([]byte("OK\n"))
+		served <- err
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.wait(ctx, "alice@tenant#entry", 16); err != nil {
+		t.Fatalf("an expired pool must not consume both admission attempts: %v", err)
+	}
+	if err := <-served; err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestAuthenticatedIdentityIsNotTheClientIPOrRelayIdentity(t *testing.T) {
 	for _, item := range []struct{ tag, email, want string }{{"entry", "alice@platform#in1", "alice@platform#in1"}, {"entry", "probe#in1", ""}, {"hop", "hop-entry", ""}, {"fwd:42", "", "fwd:42"}, {"api", "alice@platform#in1", ""}} {

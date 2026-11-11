@@ -1,0 +1,13 @@
+# Canonical Cube source baseline. Preserve upstream module paths and licenses.
+repository = "https://github.com/tencentcloud/CubeSandbox.git"
+commit = "2bbaf74ba7565992ec2a3dbc9928ed5b720639a2"
+imported_at = "2026-11-05"
+license = "Apache-2.0 and component-specific licenses"
+
+[brocade]
+protected_root = "protected-root-v1"
+network_attachments = "cubevs-attachments-v1"
+guest_terminal = "guest-pty-v1"
+
+# The complete baseline is imported from Git. Generated build outputs, running
+# lab state and the source checkout's Git metadata are not source inputs.

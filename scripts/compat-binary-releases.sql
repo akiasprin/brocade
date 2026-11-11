@@ -23,7 +23,8 @@ END $$;
 INSERT INTO binary_releases
     (id, component, idempotency_key, build_id, version, artifacts, status,
      note, created_at, created_by, halted_at, finished_at)
-SELECT id, 'xray', idempotency_key, build_id, version, artifacts, status,
+SELECT id, 'xray', idempotency_key, build_id, version,
+       jsonb_build_object('files', artifacts, 'agent_flavor', NULL, 'allow_flavor_change', false), status,
        note, created_at, created_by, halted_at, finished_at
 FROM xray_releases;
 

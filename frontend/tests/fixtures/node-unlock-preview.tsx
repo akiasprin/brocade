@@ -11,7 +11,11 @@ import type { Win } from '../../src/wm/store';
 import { SCENES, type SceneKey } from './unlock-data';
 import { youtubeSplitResult } from './youtube-unlock-data';
 import { withDialFailure, type DialScenario } from './unlock-dial-data';
+import { FixtureEventSource } from './console-backend';
 import '../../src/styles.css';
+
+// Static fixture supplies the production observation stream transport as well.
+(globalThis as { EventSource: unknown }).EventSource = FixtureEventSource;
 
 const params = new URLSearchParams(location.search);
 if (theme.snapshot() !== (params.get('theme') === 'light' ? 'light' : 'dark')) theme.toggle();
@@ -373,7 +377,7 @@ const win: Win = {
   z: 1,
   min: false,
   home: 'desk',
-  data: { drill: { p: 'node', id: node.node_id, tab: 'unlock' } },
+  data: { drill: { p: 'node', id: node.node_id, tab: params.get('tab') === 'chains' ? 'chains' : 'unlock' } },
 };
 createRoot(document.getElementById('root')!).render(
   <QueryClientProvider client={client}>

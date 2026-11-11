@@ -11,6 +11,7 @@ const output = process.env.BROCADE_TRAFFIC_SCREENSHOTS ?? '/tmp/brocade-node-tra
 await mkdir(output, { recursive: true });
 const server = await createServer({
   configFile: false,
+  define: { __BROCADE_CVM__: process.env.BROCADE_PRODUCT_FLAVOR !== 'base' },
   root,
   plugins: [react()],
   server: { host: '127.0.0.1', port: 0 },

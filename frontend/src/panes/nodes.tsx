@@ -1,3 +1,6 @@
+import { CVM_ENABLED } from '../product';
+import { skipToken } from '@tanstack/react-query';
+import { TitleActions } from '../ui/title-actions';
 import { useCardPressFeedback } from '../ui/card-press';
 import { useObservationUpdates } from '../observation-events';
 import { freshFleetNicSample, useFleetRealtime, type FleetRealtimeNode } from '../fleet-realtime';
@@ -42,6 +45,7 @@ import {
   fetchDeployments,
   fetchLinkMtu,
   fetchNodes,
+  fetchCvm,
   fetchRevisions,
   fetchTenants,
   fetchUsageNodeSeries,
@@ -80,6 +84,7 @@ import {
   type DomainStrategy,
   type GroupCertificate,
   type NodeAgentStateItem,
+  type CvmHost,
   type NodeCertificateState,
   type NodeLoadView,
   type NodeNicView,
@@ -144,7 +149,7 @@ import { cancelVisualTransition } from '../ui/motion';
 import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard';
 import { OBSERVE_MS_UNIT, OBSERVE_SERIES_COLOR_VARS, observeBpsReadingParts } from '../ui/observe-chart';
 import { observeSeriesData } from '../ui/observe-series';
-import { sparklinePaths } from '../ui/sparkline';
+import { CardComet, CardRing as NodeCardRing } from '../ui/card-metrics';
 import { ObserveLegendItem, useObserveFocus } from '../ui/observe-focus';
 import {
   customLoadRange,
@@ -375,6 +380,7 @@ const STATE_CLASS: Record<string, string> = {
   unmanaged: 'st-pending',
   unknown: 'st-pending',
   dirty: 'st-halted',
+  error: 'st-halted',
 };
 
 /* 本版本应下发到机器上的全部产物。需要列全，不能只列常用的两件：控制面判定「待发布」
@@ -403,10 +409,13 @@ function artifactState(node: NodeAgentStateItem, kind: ArtifactKind): string {
 /** 产物状态片。片上写产物名而不是状态词：五件产物排成一条状态带后，五个「ON」并列
  *  无法分辨说的是哪一件；状态由图标和颜色承担，名字才是这一片的标识。
  *  图标不是颜色的重复——ON 与 DIFF 此前只由绿/红区分，形状让它们不依赖颜色也能分辨。 */
-function StateChip({ state, label }: { state: string; label: string }) {
+function StateChip({ state, label, title }: { state: string; label: string; title?: string }) {
   const glyph = STATE_ICON[state];
   return (
-    <span className={`st nd-rt-chip ${STATE_CLASS[state] ?? ''}`} title={`${label} ${STATE_TITLE[state] ?? state}`}>
+    <span
+      className={`st nd-rt-chip ${STATE_CLASS[state] ?? ''}`}
+      title={title ?? `${label} ${STATE_TITLE[state] ?? state}`}
+    >
       {glyph && <Icon of={glyph} size={9} className="nd-rt-chip-ic" />}
       {label}
     </span>
@@ -417,6 +426,7 @@ const STATE_ICON: Record<string, IconName | undefined> = {
   present: 'check',
   disabled: 'dash',
   dirty: 'neq',
+  error: 'warn',
 };
 
 /* 状态词此前显示在片上（ON / OFF / N/A / ? / DIFF），产物名在左侧的标签列。
@@ -428,6 +438,7 @@ const STATE_TITLE: Record<string, string> = {
   unmanaged: '未纳管',
   unknown: '未知',
   dirty: '已变化',
+  error: '异常',
 };
 
 /* ── 字段的两种排列方式。选用依据见 styles.css，此处只提供结构。 ── */
@@ -753,14 +764,28 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
   const trafficOf = new Map((traffic.data?.nodes ?? []).map(item => [item.node_id, item]));
   const system = can(who.role, 'system');
   const renderHeader = () => (
-    <header className="nd-page-head">
+    <header className="nd-page-head" data-selecting={selecting || undefined}>
       <div className="nd-page-identity">
         <span className="cg-plate">
           <Icon of="nodes" size={18} />
         </span>
         <h1 className="nd-id nd-name">机器</h1>
       </div>
-      <div className="nd-tools">
+      <TitleActions
+        primary={
+          !isVisitor(who) &&
+          !selecting && (
+            <button
+              className="btn primary"
+              type="button"
+              disabled={!system}
+              onClick={() => go({ p: 'provision', step: 1 })}
+            >
+              ＋ 纳管机器
+            </button>
+          )
+        }
+      >
         {/* 访客不显示标题栏操作：这些入口全部触发写接口，与机器详情的处理相同。 */}
         {!isVisitor(who) &&
           (selecting ? (
@@ -801,17 +826,9 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
                   多选
                 </button>
               )}
-              <button
-                className="btn primary"
-                type="button"
-                disabled={!system}
-                onClick={() => go({ p: 'provision', step: 1 })}
-              >
-                ＋ 纳管机器
-              </button>
             </>
           ))}
-      </div>
+      </TitleActions>
     </header>
   );
   const emptyMachines = (
@@ -1172,72 +1189,12 @@ function NodeCard({
 
 /** History keeps its contrast through refreshes; freshness only controls the endpoint. */
 function NodeCardComet({ samples, tone, current }: { samples: NodeNicView['series']; tone: string; current: boolean }) {
-  const gradient = `node-card-${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`;
   const values = observeSeriesData(
     samples.map(sample => sample.window_end_unix_secs),
     samples.map(sample => (sample.has_gap ? null : sample.nic_rx_bps + sample.nic_tx_bps)),
     { windowStartsUnixSecs: samples.map(sample => sample.window_start_unix_secs) },
   ).map(([, value]) => value);
-  if (values.filter(value => value !== null).length < 2)
-    return <span className="node-card-comet empty" aria-hidden="true" />;
-  const height = 46;
-  const peak = Math.max(1_000_000, ...values.map(value => value ?? 0)) * 1.08;
-  const paths = sparklinePaths(values, peak, height);
-  const span = values.length - 1;
-  const last = values.at(-1);
-  const top =
-    last == null ? null : ((height - 0.5 - Math.min(1, Math.max(0, last) / peak) * (height - 3)) / height) * 100;
-  return (
-    <span className={`node-card-comet tone-${tone}`} aria-hidden="true">
-      <svg viewBox={`0 0 ${span} ${height}`} preserveAspectRatio="none">
-        <defs>
-          <linearGradient id={`${gradient}-line`} gradientUnits="userSpaceOnUse" x1="0" x2={span} y1="0" y2="0">
-            <stop offset="0" stopColor="currentColor" stopOpacity="0.45" />
-            <stop offset="0.6" stopColor="currentColor" stopOpacity="0.75" />
-            <stop offset="1" stopColor="currentColor" stopOpacity="1" />
-          </linearGradient>
-          <linearGradient id={`${gradient}-fill`} gradientUnits="userSpaceOnUse" x1="0" x2={span} y1="0" y2="0">
-            <stop offset="0" stopColor="currentColor" stopOpacity="0.03" />
-            <stop offset="1" stopColor="currentColor" stopOpacity="0.1" />
-          </linearGradient>
-        </defs>
-        {paths.areas.map((path, index) => (
-          <path key={`area-${index}`} d={path} fill={`url(#${gradient}-fill)`} />
-        ))}
-        {paths.curves.map((path, index) => (
-          <path key={`line-${index}`} className="trail" d={path} stroke={`url(#${gradient}-line)`} />
-        ))}
-      </svg>
-      {current && top !== null && <i className="node-card-comet-now" style={{ top: `${top}%` }} />}
-    </span>
-  );
-}
-
-/** Small resource and quota rings share the existing quota-ring geometry and theme tokens. */
-function NodeCardRing({ share, tone }: { share: number | null; tone: string }) {
-  const percent = Math.min(100, Math.max(0, (share ?? 0) * 100));
-  return (
-    <svg
-      className={`user-quota-ring node-card-ring ${tone}`}
-      width="13"
-      height="13"
-      viewBox="0 0 12 12"
-      aria-hidden="true"
-    >
-      <circle className="track" cx="6" cy="6" r="4.5" />
-      {percent > 0 && (
-        <circle
-          className="value"
-          cx="6"
-          cy="6"
-          r="4.5"
-          pathLength="100"
-          strokeDasharray={`${percent} ${100 - percent}`}
-          transform="rotate(-90 6 6)"
-        />
-      )}
-    </svg>
-  );
+  return <CardComet values={values} tone={tone} current={current} />;
 }
 
 function NodeCardResources({
@@ -4378,6 +4335,12 @@ function openvpnExtensionStatus(node: NodeAgentStateItem) {
   return <StateChip state={installed ? 'present' : 'disabled'} label="OPENVPN" />;
 }
 
+function cubeExtensionLabel(backend: string | undefined) {
+  if (!backend?.startsWith('cube-')) return 'CUBE';
+  const mode = /^cube-(kvm|pvm)(?:-v\d+)?$/.exec(backend)?.[1] ?? backend.slice('cube-'.length);
+  return mode ? `CUBE[${mode.toUpperCase()}]` : 'CUBE';
+}
+
 type ObservationReadState = 'pending' | 'error';
 
 type ObservationChartLoadingComponent = NodeObservationModules['ObservationChartLoading'];
@@ -5110,12 +5073,55 @@ function AgentCard({
 export function AppliedCard({
   node,
   revisionOf,
+  cubeHost,
+  cubeStatus = 'pending',
+  cubeExpected = false,
 }: {
   node: NodeAgentStateItem;
   revisionOf: (d: number) => number | undefined;
+  cubeHost?: CvmHost;
+  cubeStatus?: 'pending' | 'error' | 'ready';
+  cubeExpected?: boolean;
 }) {
   const a = appliedOf(node);
   const openvpn = openvpnExtensionStatus(node);
+  // CUBE 是可选扩展：只有确认过运行栈或仍有保留实例的机器，才有运行健康期望。
+  const hasCubeRuntime = !!cubeHost?.capabilities.backend.startsWith('cube');
+  const cubeLabel = cubeExtensionLabel(cubeHost?.capabilities.backend);
+  const cubeManaged = cubeExpected || hasCubeRuntime;
+  const cubeReady = cubeStatus === 'ready' && hasCubeRuntime && !!cubeHost?.fresh && !cubeHost.error;
+  const cubeTitle =
+    cubeStatus === 'pending'
+      ? '等待能力上报'
+      : cubeStatus === 'error'
+        ? '能力状态未知'
+        : !cubeManaged
+          ? '未启用'
+          : !cubeHost
+            ? '尚无能力报告'
+            : cubeHost.error
+              ? `执行能力异常：${cubeHost.error}`
+              : !cubeHost.fresh
+                ? '能力报告已过期'
+                : cubeReady
+                  ? '已启用'
+                  : '尚未确认运行栈';
+  const cubeState =
+    cubeStatus !== 'ready'
+      ? 'unknown'
+      : !cubeManaged
+        ? 'disabled'
+        : cubeHost?.error
+          ? 'error'
+          : cubeReady
+            ? 'present'
+            : 'unknown';
+  const extensions = (
+    <span className="nd-rt-chips">
+      {openvpn}
+      {CVM_ENABLED && <StateChip label={cubeLabel} state={cubeState} title={`${cubeLabel} 扩展 · ${cubeTitle}`} />}
+    </span>
+  );
   const rev = a?.source_deployment_id != null ? revisionOf(a.source_deployment_id) : undefined;
   const meta = a ? (
     <>
@@ -5130,7 +5136,7 @@ export function AppliedCard({
         <Cells
           items={[
             ['状态', <span className="note">还没收敛过。</span>, 'w3'],
-            ['扩展应用', openvpn],
+            ['扩展应用', extensions],
           ]}
         />
       </Band>
@@ -5159,7 +5165,7 @@ export function AppliedCard({
             </span>,
             'w3',
           ],
-          ['扩展应用', openvpn],
+          ['扩展应用', extensions],
         ]}
       />
       {/* 此处原有 xray 和 wg 的 sha256，已移除：这条带表示的是收敛来源和各产物状态，
@@ -5197,6 +5203,15 @@ function RuntimeCard({
   isolatedNodeIds: ReadonlySet<string>;
   children?: ReactNode;
 }) {
+  const cube = useQuery({
+    queryKey: ['cvm'],
+    queryFn: CVM_ENABLED ? fetchCvm : skipToken,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  });
+  const cubeHost = Array.isArray(cube.data?.hosts)
+    ? cube.data.hosts.find(host => host.node_id === node.node_id)
+    : undefined;
   return (
     <div className="panel nd-runtime" data-draft-panel={nodeDraftPanelKey(node.node_id, 'observed')}>
       <header>
@@ -5205,7 +5220,13 @@ function RuntimeCard({
       <AgentCard node={node} agentStartedAt={agentStartedAt} />
       {/* HOST 的数据来自负载上报（host facts 是其中的低频段），与节点状态是两个通道。 */}
       <HostCard load={load} pending={loadPending} />
-      <AppliedCard node={node} revisionOf={revisionOf} />
+      <AppliedCard
+        node={node}
+        revisionOf={revisionOf}
+        cubeHost={cubeHost}
+        cubeStatus={cube.isPending ? 'pending' : cube.isError ? 'error' : 'ready'}
+        cubeExpected={cube.data?.instances?.some(instance => instance.node_id === node.node_id && instance.reserved)}
+      />
       {/* 判定统一挂在卡底。此前 AGENT 卡按 chip 前缀筛一份、CONFIGURATIONS 卡筛
           `chip !== '自修失败'` 再来一份，两个集合相交——「丢了 …」这类同时命中两个条件，
           在同一屏上渲染两次。合并后不再需要筛选，各条判定只出现一次。
@@ -6033,7 +6054,13 @@ export function NodeDetail({
         </div>
       </div>
       {(tab === 'observed' || !pub) && (
-        <div className="nd-tools">
+        <TitleActions
+          primary={
+            !pub &&
+            tab === 'unlock' &&
+            can(who.role, 'edit') && <span ref={setUnlockActionTarget} className="node-unlock-actions" />
+          }
+        >
           {tab === 'observed' && (
             <ObserveRangeControl
               value={loadRange}
@@ -6044,10 +6071,7 @@ export function NodeDetail({
             />
           )}
           {!pub && (
-            <div className="nd-acts">
-              {tab === 'unlock' && can(who.role, 'edit') && (
-                <span ref={setUnlockActionTarget} className="node-unlock-actions" />
-              )}
+            <>
               <div className="fg-menuwrap">
                 {/* stopPropagation 是必须的：document 级关闭监听在 effect 里绑定，
                 而打开菜单的这次点击绑定发生后仍会冒泡到 document——不拦下，
@@ -6190,9 +6214,9 @@ export function NodeDetail({
                     document.body,
                   )}
               </div>
-            </div>
+            </>
           )}
-        </div>
+        </TitleActions>
       )}
     </>
   );
@@ -7033,6 +7057,7 @@ export function ProvisionInstall({
   const { receipt: reissued, receive: receiveToken } = useNodeTokenReceipt(node);
   const [confirmIssue, setConfirmIssue] = useState(false);
   const [enableOpenvpn, setEnableOpenvpn] = useState(false);
+  const [enableCvm, setEnableCvm] = useState(false);
   const issue = useMutation({
     mutationFn: () => issueNodeToken(node),
     onSuccess: r => {
@@ -7050,6 +7075,14 @@ export function ProvisionInstall({
 
   const probe = useAgentLiveness(nodeRow);
   const online = probe?.state === 'online';
+  const cvm = useQuery({
+    queryKey: ['cvm'],
+    queryFn: CVM_ENABLED ? fetchCvm : skipToken,
+    enabled: CVM_ENABLED && online,
+    refetchInterval: 15_000,
+  });
+  const cvmHosts = Array.isArray(cvm.data?.hosts) ? cvm.data.hosts : undefined;
+  const cvmHost = cvmHosts?.find(item => item.node_id === node);
   const initialization = nodeRow?.initialization;
   const initializationView = nodeInitializationView(initialization);
   const redeemed = probe?.state === 'polling' || online;
@@ -7081,7 +7114,9 @@ export function ProvisionInstall({
   const installCommand =
     command && !enrollmentExpired && (!redeemed || (!!reissued && !nodeReflectsReissuedToken)) ? command : undefined;
   // 仅附加安装器参数，不修改 enrollment token 或登记配置；sudo 只保留 token 环境变量。
-  const commandToCopy = installCommand ? installCommand + (enableOpenvpn ? ' --enable-openvpn' : '') : '';
+  const commandToCopy = installCommand
+    ? installCommand + (enableOpenvpn ? ' --enable-openvpn' : '') + (CVM_ENABLED && enableCvm ? ' --enable-cvm' : '')
+    : '';
   useUnsavedChanges(installCommand !== undefined, `${nodeLabel} 的一次性安装命令`, `node-route:install:${node}`);
 
   // 证书与本屏的另外两步不同：它不经过下发流程，也不需要等待机器上线——控制面签发后入库，
@@ -7181,6 +7216,39 @@ export function ProvisionInstall({
                   : '可选。安装 OpenVPN 与 iptables，供 VPN Gate 按需使用；不改变登记配置。'}
               </span>
             </WizardField>
+            {CVM_ENABLED && (
+              <WizardField label="CVM 扩展">
+                {online ? (
+                  <span className="st" title={cvmHost?.error ?? undefined}>
+                    {cvm.isPending
+                      ? '等待能力上报'
+                      : cvm.error || !cvmHosts
+                        ? '能力状态未知'
+                        : cvmHost?.fresh && cvmHost.capabilities.create
+                          ? '已启用'
+                          : cvmHost
+                            ? cvmHost.fresh
+                              ? '未开放创建'
+                              : '执行能力不可用'
+                            : '尚无能力报告'}
+                  </span>
+                ) : (
+                  <SegSwitch
+                    checked={enableCvm}
+                    disabled={!installCommand || issue.isPending}
+                    onChange={setEnableCvm}
+                    off="不安装"
+                    on="安装"
+                    ariaLabel="是否安装 CVM 扩展"
+                  />
+                )}
+                <span className="sub">
+                  {online
+                    ? '状态来自机器实际能力报告。'
+                    : '可选。安装 CVM 节点运行栈；需要 KVM、systemd 和持久 XFS，磁盘需提前准备。'}
+                </span>
+              </WizardField>
+            )}
           </div>
           {installCommand && !online ? (
             <div className="pv-cmd">
@@ -7202,6 +7270,12 @@ export function ProvisionInstall({
                   <>
                     {' '}
                     <span className="pv-flag">--enable-openvpn</span>
+                  </>
+                )}
+                {CVM_ENABLED && enableCvm && (
+                  <>
+                    {' '}
+                    <span className="pv-flag">--enable-cvm</span>
                   </>
                 )}
               </pre>

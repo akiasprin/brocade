@@ -1,0 +1,93 @@
+/// Callbacks for [`crate::Parser`].
+///
+/// This trait is used by the parser to handle extra escape sequences that
+/// don't have an impact on the terminal screen directly, as well as to emit
+/// other events like [`on_scroll`](Self::on_scroll).
+pub trait Callbacks {
+    /// This callback is called when the terminal requests an audible bell
+    /// (typically with `^G`).
+    fn audible_bell(&mut self, _: &mut crate::Screen) {}
+    /// This callback is called when the terminal requests a visual bell
+    /// (typically with `\eg`).
+    fn visual_bell(&mut self, _: &mut crate::Screen) {}
+    /// This callback is called when the terminal requests a resize
+    /// (typically with `\e[8;<rows>;<cols>t`).
+    fn resize(&mut self, _: &mut crate::Screen, _request: (u16, u16)) {}
+    /// This callback is called when the terminal requests the window title
+    /// to be set (typically with `\e]1;<icon_name>\a`)
+    fn set_window_icon_name(&mut self, _: &mut crate::Screen, _icon_name: &[u8]) {}
+    /// This callback is called when the terminal requests the window title
+    /// to be set (typically with `\e]2;<title>\a`)
+    fn set_window_title(&mut self, _: &mut crate::Screen, _title: &[u8]) {}
+    /// This callback is called when the terminal requests data to be copied
+    /// to the system clipboard (typically with `\e]52;<ty>;<data>\a`). Note
+    /// that `data` will be encoded as base64.
+    fn copy_to_clipboard(&mut self, _: &mut crate::Screen, _ty: &[u8], _data: &[u8]) {}
+    /// This callback is called when the terminal requests data to be pasted
+    /// from the system clipboard (typically with `\e]52;<ty>;?\a`).
+    fn paste_from_clipboard(&mut self, _: &mut crate::Screen, _ty: &[u8]) {}
+    /// This callback is called when the terminal receives an escape sequence
+    /// which is otherwise not implemented.
+    fn unhandled_char(&mut self, _: &mut crate::Screen, _c: char) {}
+    /// This callback is called when the terminal receives a control
+    /// character which is otherwise not implemented.
+    fn unhandled_control(&mut self, _: &mut crate::Screen, _b: u8) {}
+    /// This callback is called when the terminal receives an escape sequence
+    /// which is otherwise not implemented.
+    fn unhandled_escape(
+        &mut self,
+        _: &mut crate::Screen,
+        _i1: Option<u8>,
+        _i2: Option<u8>,
+        _b: u8,
+    ) {
+    }
+    /// This callback is called when the terminal receives a CSI sequence
+    /// (`\e[`) which is otherwise not implemented.
+    fn unhandled_csi(
+        &mut self,
+        _: &mut crate::Screen,
+        _i1: Option<u8>,
+        _i2: Option<u8>,
+        _params: &[&[u16]],
+        _c: char,
+    ) {
+    }
+    /// This callback is called when the terminal receives a OSC sequence
+    /// (`\e]`) which is otherwise not implemented.
+    fn unhandled_osc(&mut self, _: &mut crate::Screen, _params: &[&[u8]]) {}
+    /// Called when the top row of scrollback is discarded because a new row
+    /// was added at the bottom of the screen.
+    ///
+    /// If the parser's `scrollback_capacity` is 0, this will be called when
+    /// the top row of the screen is pushed off instead.
+    ///
+    /// Note that this callback can be called by [`Parser::set_size`]:
+    /// shrinking the terminal's height can cause rows to be pushed off
+    /// scrollback.
+    ///
+    /// Also note that increasing the height of the screen with
+    /// [`Parser::set_size`] or [`Screen::set_size`] can cause the "same" row
+    /// to be emitted twice in this callback. When the theoretical amount of
+    /// scrollback that we "should" have exceeds the actual length of the
+    /// scrollback buffer due to the `scrollback_capacity` limit, we simulate
+    /// pushing the "lost" rows of scrollback by inserting blank rows at the
+    /// top of the screen instead. Like any other row, these blank rows will
+    /// get emitted via this callback (or via the final
+    /// [`Screen::write_contents_formatted_basic`][write]), but the "lost" rows
+    /// they represent have already been emitted via this callback as well, so
+    /// the rows (but not their contents) have been "duplicated". This is a
+    /// trade-off; we err on the side of keeping more data rather than losing
+    /// it.
+    ///
+    /// `alternate_screen` indicates whether the row came from the alternate
+    /// screen.
+    ///
+    /// [`Parser::set_size`]: crate::Parser::set_size
+    /// [`Screen::set_size`]: crate::Screen::set_size
+    /// [write]: crate::Screen::write_contents_formatted_basic
+    #[allow(unused_variables)]
+    fn on_scroll(&mut self, contents: crate::capture::RowContents<'_>, alternate_screen: bool) {}
+}
+
+impl Callbacks for () {}

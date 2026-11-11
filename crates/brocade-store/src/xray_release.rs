@@ -59,6 +59,8 @@ pub async fn create_xray_release(
         pool,
         actor,
         ledger::CreateBinaryReleaseRequest {
+            agent_flavor: None,
+            allow_flavor_change: false,
             idempotency_key: r.idempotency_key,
             build_id: r.release_id,
             nodes: r.nodes,

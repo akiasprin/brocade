@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { useQueryClient, type QueryClient } from '@tanstack/react-query';
+import { invalidateDeploymentReads } from './api';
 
 const QUERY_GROUPS: Record<string, readonly string[]> = {
   nodes: ['nodes'],
@@ -7,7 +8,7 @@ const QUERY_GROUPS: Record<string, readonly string[]> = {
   traffic: ['node-traffic', 'usage-node-series', 'usage-chain'],
   e2e: ['e2e-probes'],
   unlock: ['chain-unlock-probes', 'node-unlock-probe', 'chain-unlock-probe'],
-  deployments: ['deployments'],
+  deployments: ['deployments', 'revisions'],
   tunnel_probes: ['tunnel-probes', 'tunnel-probe'],
 };
 
@@ -44,6 +45,7 @@ function createSource(client: QueryClient) {
     if (!Array.isArray(domains)) return;
     for (const domain of domains) {
       if (typeof domain !== 'string' || !Object.hasOwn(QUERY_GROUPS, domain)) continue;
+      if (domain === 'nodes' || domain === 'deployments') invalidateDeploymentReads();
       for (const key of QUERY_GROUPS[domain]) pending.add(key);
     }
     schedule();

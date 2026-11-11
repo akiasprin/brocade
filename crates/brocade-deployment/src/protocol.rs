@@ -16,7 +16,7 @@ use crate::plan::{
 pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 20;
 
 /// Wire contract spoken by this Agent build.
-pub const AGENT_PROTOCOL_VERSION: u32 = 57;
+pub const AGENT_PROTOCOL_VERSION: u32 = 67;
 
 /// First Agent that can restart when handoff prerequisites are unavailable, and recover
 /// unresponsive generations through a durable checkpoint without waiting for the Console.
@@ -1175,6 +1175,8 @@ pub struct BinarySource {
 /// Missing work-order fields mean an older Console, not a fabricated release attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentReleaseOffer {
+    pub flavor: crate::product::ProductFlavor,
+    pub allow_flavor_change: bool,
     pub url: String,
     pub sha256: String,
     #[serde(default)]
@@ -1236,8 +1238,10 @@ mod agent_release_compat_tests {
         assert!(serde_json::from_value::<NodeDesiredDeployment>(wire).is_err());
     }
     #[test]
-    fn self_update_uses_additive_fields_without_raising_protocol_minimum() {
+    fn self_update_requires_explicit_product_identity_without_raising_protocol_minimum() {
         let offer = AgentReleaseOffer {
+            flavor: crate::product::ProductFlavor::Base,
+            allow_flavor_change: false,
             url: "https://console.example/brocade-agent/x86_64".to_owned(),
             sha256: "a".repeat(64),
             release_id: Some(1),
@@ -1247,12 +1251,15 @@ mod agent_release_compat_tests {
         let old: BinarySource =
             serde_json::from_value(serde_json::to_value(&offer).unwrap()).unwrap();
         assert_eq!(old.sha256, offer.sha256);
-        let new: AgentReleaseOffer =
-            serde_json::from_value(serde_json::to_value(&old).unwrap()).unwrap();
-        assert_eq!(new.release_id, None);
-        assert_eq!(new.attempt, None);
+        assert!(
+            serde_json::from_value::<AgentReleaseOffer>(serde_json::to_value(&old).unwrap())
+                .is_err()
+        );
+        let decoded: AgentReleaseOffer =
+            serde_json::from_value(serde_json::to_value(&offer).unwrap()).unwrap();
+        assert_eq!(decoded, offer);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
-        assert_eq!(AGENT_PROTOCOL_VERSION, 57);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 67);
         assert_eq!(CONFIG_XRAY_UPDATE_POLICY_PROTOCOL_VERSION, 37);
         assert_eq!(CONFIG_XRAY_HANDOFF_ONLY_PROTOCOL_VERSION, 32);
         assert_eq!(CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION, 33);
@@ -2579,6 +2586,9 @@ pub struct NodeTrafficReading {
 /// value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeVersions {
+    /// Legacy Agents omit this identity; release negotiation treats them as base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_flavor: Option<crate::product::ProductFlavor>,
     /// Actual running Xray and its origin environment support connection-bound evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unlock_connection_trace: Option<bool>,
@@ -4032,7 +4042,7 @@ mod tests {
             error: Option<String>,
         }
 
-        assert_eq!(AGENT_PROTOCOL_VERSION, 57);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 67);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
         let report: XrayReleaseReport = serde_json::from_value(serde_json::json!({
             "release_id": 7,

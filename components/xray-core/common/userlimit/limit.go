@@ -150,7 +150,7 @@ func (c *Client) wait(ctx context.Context, source string, n int) error {
 		return nil
 	}
 
-	err = c.request(ctx, source, n)
+	err = c.request(ctx, source, n, false)
 	if err == nil || ctx.Err() != nil {
 		return err
 	}
@@ -159,9 +159,10 @@ func (c *Client) wait(ctx context.Context, source string, n int) error {
 	c.mu.Unlock()
 	// An idle loopback connection may have expired or belong to the preceding Agent process.
 	// A lost admission only wastes bandwidth credits; retrying cannot release unbudgeted payload.
-	return c.request(ctx, source, n)
+	// Bypass the idle pool: another cached socket may have expired at the same time.
+	return c.request(ctx, source, n, true)
 }
-func (c *Client) request(ctx context.Context, source string, n int) error {
+func (c *Client) request(ctx context.Context, source string, n int, fresh bool) error {
 	if len(source) > 512 {
 		return errors.New("invalid user budget source")
 	}
@@ -177,7 +178,7 @@ func (c *Client) request(ctx context.Context, source string, n int) error {
 	}
 	c.mu.Lock()
 	var conn *connection
-	if len(c.idle) > 0 {
+	if !fresh && len(c.idle) > 0 {
 		conn = c.idle[len(c.idle)-1]
 		c.idle = c.idle[:len(c.idle)-1]
 	}

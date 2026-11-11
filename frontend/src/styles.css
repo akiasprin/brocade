@@ -142,6 +142,8 @@
   --r-ctl: 6px;
   --page-title-h: 42px;
   --panel-title-h: 36px;
+  --panel-font-size: 12.5px;
+  --mobile-control-h: 36px;
   /* 配置字段中“控件 / 选项 → 解释文案”的统一垂直间距。6px 足以分开两个层级，
      又小于同一字段的 8px 内部节奏，不会把说明误读成下一项。 */
   --field-note-gap: 6px;
@@ -677,10 +679,6 @@
     grid-row: 1;
     gap: 6px;
     padding-right: 10px;
-  }
-  .tnd-head .nd-acts > .btn {
-    min-height: 28px;
-    padding: 0 10px;
   }
   .tnd-page .cg-sec.tnd-probe > header {
     flex-wrap: wrap;
@@ -7526,7 +7524,7 @@ textarea.f::placeholder {
   box-shadow: var(--sheet-shadow);
   padding: var(--panel-pad-top) var(--panel-pad-x) var(--panel-pad-bottom);
   margin: 10px 0;
-  font-size: 12.5px;
+  font-size: var(--panel-font-size);
   color: var(--ink-2);
 }
 .panel > b:first-child {
@@ -8285,12 +8283,161 @@ textarea.f::placeholder {
 .nd-tools .nd-acts {
   margin-left: 0;
 }
-.nd-page-head .nd-acts .btn {
-  min-height: 30px;
-  height: 30px;
-}
 .nd-sheet .nd-acts {
   margin-left: auto;
+}
+
+/* 页面标题的组合工具条。分隔线属于操作项，菜单和对话框保持可溢出的独立浮层。 */
+.title-actions {
+  --ctl-h: 30px;
+  --title-icon-w: 32px;
+  box-sizing: border-box;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.title-action-group {
+  display: flex;
+  flex: none;
+  align-items: stretch;
+  border-radius: var(--r-ctl);
+  background: var(--btn);
+  outline: 1px solid var(--line);
+  outline-offset: -1px;
+}
+.title-action-item {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+}
+.title-action-item:not(:has(button, summary.btn, select, a[href])),
+.title-action-group:not(:has(button, summary.btn, select, a[href])) {
+  display: none;
+}
+.title-action-item:has(button, summary.btn, select, a[href])
+  ~ .title-action-item:has(button, summary.btn, select, a[href]) {
+  border-left: 1px solid var(--line);
+}
+.title-actions .title-action-item :is(.btn, .rule-machine-more, .segsw > button) {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: var(--ctl-h);
+  min-height: var(--ctl-h);
+  padding: 0 10px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 1;
+}
+.title-action-item:first-child :is(.btn, .rule-machine-more, .segsw > button):first-child {
+  border-top-left-radius: var(--r-ctl);
+  border-bottom-left-radius: var(--r-ctl);
+}
+.title-action-item:last-child :is(.btn, .rule-machine-more, .segsw > button):last-child {
+  border-top-right-radius: var(--r-ctl);
+  border-bottom-right-radius: var(--r-ctl);
+}
+.title-action-item:last-child > .fg-menuwrap > .btn {
+  border-top-right-radius: var(--r-ctl);
+  border-bottom-right-radius: var(--r-ctl);
+}
+.title-actions .title-action-item :is(.fg-more, .user-dact-more, .rule-machine-more, summary[aria-label='更多操作']) {
+  width: var(--title-icon-w);
+  padding: 0;
+}
+.title-actions .title-action-item .btn.danger {
+  color: var(--err);
+}
+.title-actions .title-action-item :is([aria-expanded='true'], [aria-pressed='true']),
+.title-actions .title-action-item details[open] > summary.btn,
+.title-actions .observe-range.open .observe-range-trigger {
+  color: var(--action);
+  background: color-mix(in srgb, var(--action) 10%, var(--btn));
+}
+.title-actions .title-action-item .btn:active:not(:disabled) {
+  transform: none;
+  background: var(--btn-a);
+}
+.title-actions .title-action-item .observe-range-return {
+  width: var(--title-icon-w);
+  padding: 0;
+  border-right: 1px solid var(--line);
+}
+.title-action-item > .segsw {
+  gap: 0;
+  padding: 0;
+  border: 0;
+  border-radius: inherit;
+  background: none;
+}
+.title-action-item > .segsw > button + button {
+  border-left: 1px solid var(--line);
+}
+.title-action-primary {
+  display: flex;
+  flex: none;
+  align-items: center;
+}
+.title-action-primary:not(:has(button, summary.btn, select, a[href])) {
+  display: none;
+}
+.title-actions .title-action-primary .btn {
+  height: var(--ctl-h);
+  min-height: var(--ctl-h);
+  font-size: 12px;
+}
+.title-actions svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+.title-actions :is(button, summary.btn):focus-visible {
+  position: relative;
+  z-index: 1;
+  outline: 2px solid var(--action);
+  outline-offset: 2px;
+}
+@media (hover: hover) {
+  .title-actions .title-action-item :is(.btn, .rule-machine-more, .segsw > button):hover:not(:disabled) {
+    color: var(--ink);
+    background: var(--btn-h);
+  }
+  .title-actions .title-action-item .btn.danger:hover:not(:disabled) {
+    color: var(--err);
+    background: color-mix(in srgb, var(--err) 10%, var(--btn));
+  }
+}
+@media (max-width: 820px) {
+  .title-actions {
+    --ctl-h: 36px;
+    --title-icon-w: 36px;
+  }
+}
+@media (max-width: 560px) {
+  .title-actions .title-action-item .title-action-compact {
+    width: var(--title-icon-w);
+    padding: 0;
+  }
+  .title-action-compact .title-action-label {
+    display: none;
+  }
+}
+@container (max-width: 440px) {
+  .title-actions {
+    --ctl-h: 36px;
+    --title-icon-w: 36px;
+  }
+  .title-actions .title-action-item .title-action-compact {
+    width: var(--title-icon-w);
+    padding: 0;
+  }
+  .title-action-compact .title-action-label {
+    display: none;
+  }
 }
 
 /* ══ 详情页的三页：观测 / 配置 / 规则 ══
@@ -8749,7 +8896,8 @@ textarea.f::placeholder {
   gap: 4px;
   margin-right: 0;
   padding-left: 6px;
-  line-height: 14px;
+  /* 这里写的是组件名称；使用界面字体，避免小号等宽字的 O 与 0 混淆。 */
+  font: 500 10px/14px var(--sans);
   vertical-align: 0;
 }
 /* 同一字段的第二个取值（核数 / 虚拟化 / 架构 / 修订号）。不是单位，因此保留等宽
@@ -9422,10 +9570,27 @@ textarea.f::placeholder {
   padding: 12px;
 }
 .node-chain-use {
-  /* 每条相关链直接从根节点开始；链名已并入根节点标签，不再另画一条标题带。底部保留少量
-     内距，使相邻两棵树仍可分辨。 */
+  /* 链名并入根节点标签；树的负下外距由内距接住，避免收口被裁切。 */
   padding: 0 12px 13px;
   overflow: hidden;
+}
+.node-chain-sheet > .node-chain-use:has(+ .node-chain-use) {
+  /* 规则树以 -9px 下外距收口，其余链间留白交给居中的短线圆点。 */
+  padding-bottom: 9px;
+}
+.node-chain-sheet > .node-chain-use + .node-chain-use::before {
+  content: '';
+  display: block;
+  width: 160px;
+  max-width: 45%;
+  height: 3px;
+  margin: 12px auto;
+  background:
+    radial-gradient(circle, var(--ink-4) 1.5px, transparent 1.5px) center / 3px 3px no-repeat,
+    linear-gradient(to right, transparent, color-mix(in srgb, var(--ink-4) 65%, transparent)) left center /
+      calc(50% - 10.5px) 1px no-repeat,
+    linear-gradient(to left, transparent, color-mix(in srgb, var(--ink-4) 65%, transparent)) right center /
+      calc(50% - 10.5px) 1px no-repeat;
 }
 
 /* 卡片内的小型表格。此前 table.t 没有任何样式，单元格之间没有间距；
@@ -10078,20 +10243,57 @@ details.more b {
 .dialog-layer {
   position: fixed;
   inset: 0;
-  display: grid;
-  place-items: center;
+  /* A surface can grow after an async response; keep alignment tied to its current size. */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
   padding: 20px;
   z-index: 200;
   isolation: isolate;
+  color: var(--ink-2);
+  font-family: var(--sans);
+  font-size: var(--panel-font-size);
+  line-height: 1.5;
+}
+.dialog-layer.modal {
+  box-sizing: border-box;
+  height: 100dvh;
+}
+.dialog-layer:is(.modal, .drawer) > .dialog-surface {
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: 0;
 }
 .dialog-layer.drawer {
-  /* 抽屉占用扣除安全区后的空间，内容不能把隐式网格撑出视口。 */
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr);
+  /* Full-height forms fill the column; compact sheets stay attached to the bottom. */
   height: 100dvh;
   box-sizing: border-box;
-  place-items: stretch end;
+  align-items: flex-end;
+  justify-content: flex-end;
   padding: 0;
+}
+@media (max-width: 820px) {
+  .dialog-layer {
+    --ctl-h: var(--mobile-control-h);
+  }
+  /* Portals live outside .forge, but their ordinary controls use the same compact scale. */
+  :where(.dialog-layer) .btn {
+    min-height: var(--ctl-h);
+    padding: 0 11px;
+    font-size: 12.5px;
+  }
+  :where(.dialog-layer) .segsw {
+    height: var(--ctl-h);
+    min-height: var(--ctl-h);
+    padding: 0;
+  }
+  :where(.dialog-layer) .segsw button {
+    height: calc(var(--ctl-h) - 2px);
+    min-height: calc(var(--ctl-h) - 2px);
+    padding: 0 10px;
+    font-size: 12.5px;
+  }
 }
 .dialog-scrim {
   position: absolute;
@@ -10677,8 +10879,7 @@ input.f {
 }
 /* 单元格保留 table-cell，换行只发生在内部；否则浏览器会补匿名单元格，
    动作格的边框和行高便无法与匹配、操作两列对齐。 */
-.rule-action-fields,
-.rule-dial-fields {
+.rule-action-fields {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -10686,8 +10887,7 @@ input.f {
   min-width: 0;
   white-space: normal;
 }
-.rule-action-cell .rule-action-fields > *,
-.rule-action-cell .rule-dial-fields > * {
+.rule-action-cell .rule-action-fields > * {
   margin-left: 0;
   max-width: 100%;
 }
@@ -10697,18 +10897,7 @@ input.f {
   min-width: 160px;
   max-width: 330px;
 }
-.rule-dial-fields {
-  max-width: 100%;
-}
-.rule-dial-fields > .mono {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.rule-operations-cell {
-  white-space: nowrap;
-}
+
 .rule-action-select {
   width: 112px;
 }
@@ -10737,9 +10926,7 @@ input.f {
   font-size: 11px;
   line-height: 1.45;
 }
-.machine-dns-shared-row > td {
-  color: var(--ink-3);
-}
+
 .egress-dns-editor-row > td {
   width: auto !important;
   padding: 0 !important;
@@ -10867,8 +11054,8 @@ input.f {
 
 /* ═══ 规则表的窄屏适配 ═══
    桌面是一张表：序号 | 匹配 | 动作 | 重排，一行铺开。窄下来单行放不下——动作格里还
-   串着转发目标、走法、推导地址。`.rule-table` 提供机器 DNS 编辑器的共用适配；
-   下方 `.rule-editor-table` 负责链路规则，`.machine-dns-policy-table` 负责机器策略。 */
+   串着转发目标、走法、推导地址。`.rule-table` 提供链路规则与机器 DNS 编辑器的共用适配；
+   链路规则树的专有部分在「链路规则 E1」一节，限定在 `.chain-rule-tree` 之下。 */
 @container rules (max-width: 1440px) {
   .egress-dns-choice {
     width: 136px;
@@ -10949,8 +11136,7 @@ input.f {
     display: block !important;
     margin-top: 7px;
   }
-  .rule-table:not(.rule-editor-table) .rule-action-fields,
-  .rule-table:not(.rule-editor-table) .rule-dial-fields {
+  .rule-table .rule-action-fields {
     flex-basis: auto;
     flex-direction: column;
     align-items: stretch;
@@ -11000,10 +11186,10 @@ input.f {
     gap: 6px;
     width: 100%;
   }
-  .rule-table:not(.rule-editor-table) .rule-action-cell .f,
-  .rule-table:not(.rule-editor-table) .rule-action-cell .rule-action-select,
-  .rule-table:not(.rule-editor-table) .rule-action-cell .rule-readonly-select,
-  .rule-table:not(.rule-editor-table) .egress-dns-choice {
+  .rule-table .rule-action-cell .f,
+  .rule-table .rule-action-cell .rule-action-select,
+  .rule-table .rule-action-cell .rule-readonly-select,
+  .rule-table .egress-dns-choice {
     display: block;
     width: 100% !important;
     box-sizing: border-box;
@@ -11042,10 +11228,7 @@ input.f {
     grid-column: 1 / -1;
   }
   /* 重排 / 优先级 = 卡片脚；空脚（机器 DNS 行占位的 120px 空格）不占位 */
-  .rule-table:not(.rule-editor-table)
-    > tbody
-    > tr
-    > td:last-child:not(:first-child, .rule-match-cell, .rule-action-cell) {
+  .rule-table > tbody > tr > td:last-child:not(:first-child, .rule-match-cell, .rule-action-cell) {
     margin-top: 7px;
     padding-top: 6px !important;
     border-top: 1px dashed var(--line-soft);
@@ -11107,487 +11290,12 @@ input.f {
   }
 }
 
-/* 规则与机器 DNS 分区；匹配类型和内容各自成框，连接档位与地址整体换行。 */
-.rule-editor-table {
-  table-layout: fixed;
-}
-.rule-editor-table .rule-number-column {
-  width: 30px;
-}
-.rule-editor-table .rule-match-column {
-  width: 28%;
-}
-.rule-editor-table .rule-tools-column {
-  width: 96px;
-}
-.rule-editor-table :is(th, td) {
-  padding: 8px;
-  border-inline: 0;
-  border-top: 0;
-  border-bottom: 1px solid var(--line-soft);
-  background: transparent;
-}
-.rule-editor-table thead th {
-  padding-block: 7px;
-  color: var(--ink-4);
-  font: 10px var(--sans);
-}
-.rule-editor-table .rule-tools-heading {
-  text-align: right;
-}
-.rule-editor-table td:first-child {
-  padding-top: 15px;
-  color: var(--ink-4);
-  font-size: 10px;
-}
-.rule-editor-table .rule-match-cell {
-  width: auto;
-  white-space: normal;
-}
 .rule-editor select.f {
   font-family: var(--sans);
-}
-.rule-match-fields {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-.rule-editor-table .rule-match-fields > .f {
-  box-sizing: border-box;
-  height: var(--ctl-h);
-  min-height: var(--ctl-h);
-  margin: 0;
-  font-size: 12px;
-}
-.rule-editor-table .rule-match-fields > :is(select.f, .rule-readonly-select) {
-  flex: 0 0 104px;
-  width: 104px;
-  min-width: 0;
-  padding-inline: 8px 24px;
-}
-.rule-editor-table .rule-match-fields > :is(input.f, .rule-readonly-value) {
-  flex: 1 1 0;
-  width: 0;
-  min-width: 0;
-  padding-inline: 8px;
-}
-.rule-editor-table .rule-action-fields {
-  display: flex;
-  flex-direction: row;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-}
-.rule-editor-table .egress-dns-reference {
-  display: inline-flex;
-  flex: 0 1 auto;
-  flex-direction: row;
-  width: auto;
-}
-.rule-editor-table .egress-dns-choice {
-  width: 136px;
-}
-.rule-editor-table .rule-action-select {
-  flex: 0 0 104px;
-  width: 104px;
-  min-width: 0;
-  height: var(--ctl-h);
-}
-.rule-editor-table .rule-action-fields > .external-target-picker {
-  flex: 1 1 160px;
-  width: auto;
-  min-width: 140px;
-  max-width: 300px;
-}
-.rule-editor-table .external-target-trigger,
-.rule-editor-table .external-target-trigger.node-target,
-.rule-editor-table .external-target-trigger.listener-target {
-  min-height: var(--ctl-h);
-  border-color: var(--line);
-  background: var(--sunk);
-}
-.rule-editor-table .external-target-trigger[aria-expanded='true'] {
-  border-color: var(--action);
-  background: var(--action-wash);
-}
-.rule-editor-table .external-target-trigger .external-target-kind,
-.rule-editor-table .external-target-trigger.node-target .external-target-kind,
-.rule-editor-table .external-target-trigger.listener-target .external-target-kind {
-  min-width: 28px;
-  padding: 1px 4px;
-  border-color: transparent;
-  background: var(--hover);
-  color: var(--ink-3);
-  font-size: 8px;
-}
-.rule-editor-table .rule-dial-fields {
-  display: flex;
-  flex-direction: row;
-  flex: 0 1 auto;
-  flex-wrap: nowrap;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-  max-width: 100%;
-}
-.rule-editor-table .rule-dial-fields > select.f {
-  flex: 0 0 104px;
-  width: 104px;
-}
-.rule-editor-table .rule-dial-fields > input.f {
-  flex: 1 1 160px;
-  width: auto !important;
-  min-width: 0;
-}
-.rule-editor-table .rule-dial-fields > .mono {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--ink-3);
-  font-size: 11.5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.rule-row-actions {
-  display: inline-flex;
-  gap: 1px;
-}
-.rule-editor-table .rule-operations-cell {
-  padding-inline: 0;
-  text-align: right;
-}
-.rule-editor .rule-row-actions .btn {
-  width: 30px;
-  min-width: 0;
-  min-height: var(--ctl-h);
-  margin: 0;
-  padding: 0;
-  border-color: transparent;
-  background: transparent;
-  color: var(--ink-3);
-}
-.rule-editor .rule-row-actions .btn:disabled {
-  opacity: 0.22;
-}
-@media (hover: hover) {
-  .rule-editor-table .external-target-trigger:hover {
-    border-color: var(--action);
-    background: var(--action-wash);
-  }
-  .rule-editor .rule-row-actions .btn:hover:not(:disabled) {
-    color: var(--ink);
-    background: var(--hover);
-  }
-  .rule-editor .rule-row-actions .danger:hover:not(:disabled) {
-    color: var(--err);
-    background: color-mix(in srgb, var(--err) 8%, transparent);
-  }
-}
-.rule-editor-table .rule-fallback-sign {
-  font-size: 9px;
-}
-@container rules (640px < width <= 1050px) {
-  .rule-editor-table .rule-match-column {
-    width: 34%;
-  }
-}
-@container rules (max-width: 640px) {
-  .rule-editor-table > colgroup,
-  .rule-editor-table > thead {
-    display: none;
-  }
-  .rule-editor-table > tbody > tr {
-    display: grid;
-    grid-template-columns: 20px minmax(0, 1fr);
-    gap: 8px;
-    margin: 0;
-    padding: 12px 0;
-    border: 0;
-    border-bottom: 1px solid var(--line-soft);
-    border-radius: 0;
-    background: transparent;
-  }
-  .rule-editor-table.rule-editor-readonly > tbody > tr {
-    grid-template-columns: 18px minmax(0, 1fr);
-  }
-  .rule-editor-table > tbody > tr > td {
-    min-width: 0;
-    margin: 0;
-    border: 0;
-  }
-  .rule-editor-table > tbody > tr > td:first-child {
-    grid-column: 1;
-    grid-row: 1;
-    align-self: center;
-    margin: 0;
-    padding: 0 !important;
-    border: 0;
-  }
-  .rule-editor-table > tbody > tr > td.rule-match-cell {
-    display: block !important;
-    grid-column: 2;
-    grid-row: 1;
-    padding: 0 !important;
-  }
-  .rule-editor-table > tbody > tr > td.rule-action-cell {
-    grid-column: 2 / -1;
-    grid-row: 2;
-    margin: 0;
-    padding: 0 !important;
-  }
-  .rule-editor-table .rule-match-cell::before,
-  .rule-editor-table .rule-action-cell::before {
-    content: none;
-  }
-  .rule-editor-table .rule-match-fields > :is(select.f, .rule-readonly-select) {
-    flex-basis: 96px;
-    width: 96px !important;
-    min-width: 0;
-    font-size: 13px;
-  }
-  .rule-editor-table .rule-action-fields {
-    display: flex;
-  }
-  .rule-editor-table .rule-action-fields > .external-target-picker {
-    display: block;
-  }
-  .rule-editor-table > tbody > tr > td.rule-operations-cell {
-    grid-column: 2 / -1;
-    grid-row: 3;
-    margin: 0;
-    padding: 0 !important;
-    border: 0;
-  }
-  .rule-editor-table .rule-action-fields .rule-action-select {
-    width: 104px !important;
-  }
-  .rule-editor-table .rule-action-fields > .external-target-picker {
-    flex: 1 1 140px;
-    max-width: none;
-  }
-  .rule-editor-table .rule-dial-fields {
-    flex-basis: 100%;
-  }
-  .rule-editor .rule-row-actions .btn {
-    width: 44px;
-    min-height: 44px;
-  }
-  .rule-editor-table .rule-fallback-sign:not(.inline) {
-    grid-column: 2 / -1;
-    grid-row: 3;
-    width: auto !important;
-    padding: 0;
-  }
 }
 
 .egress-dns-options {
   display: contents;
-}
-.rule-add-actions {
-  margin-top: 8px;
-}
-.machine-dns-section {
-  margin-top: 18px;
-  min-width: 0;
-}
-.machine-dns-heading {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 26px;
-  margin-bottom: 2px;
-}
-.machine-dns-heading > b {
-  font: 600 12px var(--sans);
-  color: var(--ink-2);
-}
-.machine-dns-help > summary {
-  list-style: none;
-  color: var(--ink-3);
-  cursor: pointer;
-}
-.machine-dns-help > summary::-webkit-details-marker {
-  display: none;
-}
-.machine-dns-help-text {
-  display: none;
-  position: absolute;
-  top: 100%;
-  left: 0;
-  z-index: 30;
-  box-sizing: border-box;
-  width: 320px;
-  max-width: 100%;
-  margin: 6px 0 0;
-  padding: 8px 10px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-ctl);
-  background: var(--block);
-  box-shadow: var(--shadow);
-  color: var(--ink-2);
-  font: 11.5px/1.5 var(--sans);
-}
-.machine-dns-heading:has(.machine-dns-help[open]) > .machine-dns-help-text {
-  display: block;
-}
-.machine-dns-policy-table,
-.machine-dns-policy-table > :is(thead, tbody) {
-  display: block;
-  width: 100%;
-  min-width: 0;
-}
-.machine-dns-policy-table tr {
-  display: grid;
-  grid-template-columns: 26px minmax(110px, 16%) minmax(200px, 460px) 56px 72px 104px 124px minmax(0, 1fr) 92px;
-  align-items: start;
-  gap: 6px 8px;
-  padding: 7px 0;
-  border-bottom: 1px solid var(--line-soft);
-}
-.machine-dns-policy-table :is(th, td) {
-  min-width: 0;
-  margin: 0;
-  padding: 0;
-  border: 0;
-  background: transparent;
-}
-.machine-dns-policy-table th {
-  color: var(--ink-4);
-  font: 10.5px var(--sans);
-  text-align: left;
-}
-.machine-dns-policy-table tr > :first-child {
-  width: auto !important;
-  padding-left: 2px;
-}
-.machine-dns-policy-table td:first-child {
-  color: var(--ink-4);
-  font: 10.5px/var(--ctl-h) var(--mono);
-}
-.machine-dns-policy-table .machine-dns-controls,
-.machine-dns-policy-table :is(.egress-dns-editor, .egress-dns-endpoint) {
-  display: contents;
-}
-.machine-dns-policy-table .f {
-  box-sizing: border-box;
-  width: 100%;
-  min-width: 0;
-  height: var(--ctl-h);
-  min-height: var(--ctl-h);
-  margin: 0;
-  font-size: 12px;
-}
-.machine-dns-policy-table input.f {
-  padding-inline: 8px;
-}
-.machine-dns-policy-table select.f {
-  padding: 0 24px 0 8px;
-  background-position: right 8px center;
-}
-.machine-dns-policy-table :is(.rule-operations-cell, .rule-tools-heading) {
-  grid-column: -2;
-  text-align: right;
-}
-.machine-dns-match-fields {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-height: var(--ctl-h);
-  min-width: 0;
-}
-.machine-dns-kind {
-  flex: none;
-  color: var(--ink-3);
-  font: 11.5px var(--sans);
-}
-.machine-dns-value {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--ink);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.machine-dns-policy-table :is(.dns-priority, .dns-priority-buttons) {
-  gap: 1px;
-  margin: 0;
-}
-.machine-dns-policy-table .egress-dns-error {
-  grid-column: 3 / -2;
-  grid-row: 2;
-  max-width: 100%;
-}
-@container rules (max-width: 1050px) {
-  .machine-dns-policy-table tr {
-    grid-template-columns: 26px minmax(110px, 22%) minmax(0, 1fr) 92px;
-  }
-  .machine-dns-policy-table th:nth-child(n + 4):not(.rule-tools-heading) {
-    display: none;
-  }
-  .machine-dns-policy-table .egress-dns-endpoint {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) 56px;
-    gap: 6px;
-    grid-column: 3;
-    grid-row: 1;
-  }
-  .machine-dns-policy-table .egress-dns-options {
-    display: grid;
-    grid-template-columns: 72px minmax(0, 1fr) minmax(0, 1.2fr);
-    gap: 6px;
-    grid-column: 3;
-    grid-row: 2;
-  }
-  .machine-dns-policy-table .egress-dns-error {
-    grid-row: 3;
-  }
-  .machine-dns-policy-table .rule-operations-cell {
-    grid-column: 4;
-    grid-row: 1;
-  }
-}
-@container rules (max-width: 640px) {
-  .machine-dns-policy-table > thead {
-    display: none;
-  }
-  .machine-dns-policy-table tr {
-    grid-template-columns: 20px minmax(0, 1fr);
-    gap: 8px 6px;
-    padding: 12px 0;
-  }
-  .machine-dns-policy-table td:first-child {
-    grid-column: 1;
-    grid-row: 1;
-    line-height: 30px;
-  }
-  .machine-dns-policy-table .machine-dns-match {
-    grid-column: 2;
-    grid-row: 1;
-  }
-  .machine-dns-match-fields {
-    min-height: 30px;
-  }
-  .machine-dns-policy-table .egress-dns-endpoint {
-    grid-column: 2;
-    grid-row: 2;
-  }
-  .machine-dns-policy-table .egress-dns-options {
-    grid-column: 2;
-    grid-row: 3;
-    grid-template-columns: 70px minmax(0, 1fr) minmax(0, 1.3fr);
-  }
-  .machine-dns-policy-table .rule-operations-cell {
-    grid-column: 2;
-    grid-row: 4;
-  }
-  .machine-dns-policy-table .egress-dns-error {
-    grid-column: 2;
-    grid-row: 5;
-    white-space: normal;
-  }
-  .rule-add-actions > .btn {
-    flex: 1 1 0;
-  }
 }
 
 /* ═══ 链路页 ═══
@@ -13079,11 +12787,7 @@ select.f.words {
   opacity: 1;
 }
 
-/* 层级：高于产物面板（40）即可，不能高于顶栏的两个浮层——
-   菜单 `.fg-menu` 为 50、诊断气泡 `.fg-pop` 为 55，而它们的定位父元素
-   （`.fg-menuwrap` / `.fg-top`）都没有 z-index，不创建层叠上下文，
-   因此这两个值即为它们在全局的实际层级。该值原为 58，导致画布上的
-   这条工具条遮挡右上角展开的菜单。 */
+/* 高于产物面板（40），低于主导航菜单（50）和诊断气泡（55）。 */
 #viewbar2 {
   position: fixed;
   top: 64px;
@@ -13410,11 +13114,11 @@ select.f.words {
   color: var(--ink-2);
   font-weight: 600;
 }
-/* 订阅与节点：同一个弹窗，标题栏切换页签（沿用机器详情页签 .nd-tabs），协议与地址族筛选两个页签共用。
-   标题行与筛选同在弹窗底色上，筛选行上下各一条分隔线；正文不套边框盒：订阅页签一个订阅一块
-   （图标列 │ 标题与说明 │ 读数），节点页签是「协议 │ IPv4 │ IPv6」的行列表，地址本身是复制按钮，
-   网络拨测并在节点页签里（状态灯在地址前，组头是这一组的结果与「拨测」）。
-   高度随内容，超过视口时只有正文滚动，标题栏、筛选与底栏保持可见。窄屏见本节末尾：贴底成为面板。 */
+/* 订阅与节点：同一个弹窗，标题栏切换页签（沿用机器详情页签 .nd-tabs），共用协议与地址族筛选。
+   订阅以二维码为主，筛选、地址和读数向下排列；管理员测速订阅收进可展开区域。
+   节点页签是「协议 │ IPv4 │ IPv6」行列表，地址本身是复制按钮，网络拨测合并在同一页签。
+   超过视口时只有正文滚动，标题栏与底栏保持可见；节点筛选留在正文上方。
+   窄屏见本节末尾：贴底成为面板。 */
 .sub-dialog {
   display: flex;
   width: min(800px, calc(100vw - 32px));
@@ -13438,6 +13142,9 @@ select.f.words {
   font: 600 14px var(--sans);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.sub-dialog-tabs button[aria-selected='true'] {
+  font-weight: 500;
 }
 .sub-dialog-tabs::before {
   content: '';
@@ -13494,7 +13201,6 @@ select.f.words {
 .sub-url-copy > span,
 .node-copy-all > span,
 .node-probe-all > span,
-.sub-item-icon,
 .node-copy-icon,
 .sub-pick-chevron,
 .sub-dialog-label svg,
@@ -13502,7 +13208,6 @@ select.f.words {
 .sub-url-copy svg,
 .node-copy-all svg,
 .node-probe-all svg,
-.sub-item-icon svg,
 .node-copy-icon svg,
 .sub-pick-chevron svg {
   display: block;
@@ -13516,7 +13221,7 @@ select.f.words {
 }
 .sub-dialog-filter .segsw button {
   padding: 0 10px;
-  font-size: 12px;
+  font-size: 12.5px;
 }
 .sub-dialog-body {
   flex: 1;
@@ -13564,13 +13269,13 @@ select.f.words {
   position: relative;
   display: flex;
   min-width: 0;
-  height: 44px;
+  height: var(--ctl-h);
   box-sizing: border-box;
   align-items: center;
   gap: 8px;
   padding: 0 10px 0 12px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 8px;
   background: var(--btn);
 }
 .sub-pick-label {
@@ -13579,14 +13284,14 @@ select.f.words {
   align-items: center;
   gap: 5px;
   color: var(--ink-4);
-  font-size: 13px;
+  font-size: 12px;
 }
 .sub-pick-value {
   flex: 1;
   min-width: 0;
   overflow: hidden;
   color: var(--ink);
-  font: 500 14px var(--sans);
+  font: 500 12.5px var(--sans);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -13608,21 +13313,7 @@ select.f.words {
   outline-offset: 1px;
 }
 
-/* 订阅：一个订阅一块。图标列让标题之下的内容整体缩进，两块之间一条整宽分隔线。 */
-.sub-item {
-  display: grid;
-  grid-template-columns: 16px minmax(0, 1fr);
-  column-gap: 12px;
-}
-.sub-item + .sub-item {
-  margin-top: 20px;
-  padding-top: 20px;
-  border-top: 1px solid var(--line);
-}
-.sub-item-icon {
-  padding-top: 1px;
-  color: var(--ink-3);
-}
+/* 管理员测速订阅保留状态、地址和生成／撤销操作，放在可展开区域内。 */
 .sub-item-head {
   display: flex;
   min-width: 0;
@@ -13643,12 +13334,7 @@ select.f.words {
 }
 .sub-item-name > b {
   color: var(--ink);
-  font: 600 14px/18px var(--sans);
-}
-.sub-item-sub {
-  color: var(--ink-3);
-  font-size: 12px;
-  line-height: 1.45;
+  font: 600 13px/18px var(--sans);
 }
 .sub-item-action {
   flex: none;
@@ -13656,10 +13342,9 @@ select.f.words {
   height: 26px;
   margin-top: -3px;
   padding: 0 10px;
-  font-size: 12px;
+  font-size: 12.5px;
 }
 .sub-item-body {
-  grid-column: 2;
   min-width: 0;
   margin-top: 12px;
 }
@@ -13672,7 +13357,7 @@ select.f.words {
   font-size: 11.5px;
   line-height: 1.55;
 }
-/* 读数：标签在上、数值在下，右对齐 */
+/* 剩余流量与重置时间共用紧凑读数。 */
 .sub-readings {
   display: flex;
   flex: none;
@@ -13686,13 +13371,13 @@ select.f.words {
 }
 .sub-readings dt {
   color: var(--ink-4);
-  font-size: 11px;
-  line-height: 14px;
+  font-size: 12px;
+  line-height: 18px;
 }
 .sub-readings dd {
   margin: 0;
   color: var(--ink);
-  font: 500 13px/18px var(--sans);
+  font: 500 12.5px/18px var(--sans);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
@@ -13781,7 +13466,7 @@ select.f.words {
   border-radius: 6px;
   background: none;
   color: var(--ink-3);
-  font: 12px var(--sans);
+  font: 12.5px/1 var(--sans);
   white-space: nowrap;
   cursor: pointer;
 }
@@ -13797,6 +13482,198 @@ select.f.words {
 }
 .sub-url > .sub-url-copy.failed {
   color: var(--err);
+}
+.sub-dialog-subscription {
+  width: min(480px, calc(100vw - 32px));
+  max-height: min(780px, calc(100dvh - 48px));
+  /* Keep subscription controls readable when a browser cannot composite the floating blur. */
+  background: var(--sheet);
+  backdrop-filter: none;
+}
+.sub-subscription-body {
+  padding: 18px 28px;
+}
+.sub-subscription-title {
+  margin: 0;
+  color: var(--ink);
+  font: 600 20px/1.4 var(--sans);
+  text-align: center;
+}
+.sub-subscription-caption {
+  margin: 5px 0 0;
+  color: var(--ink-3);
+  font-size: 12px;
+  text-align: center;
+}
+.sub-qr {
+  --sub-qr-bg: var(--sunk);
+  --sub-qr-fg: var(--ink);
+  width: min(200px, 100%);
+  margin: 18px auto 0;
+  border-radius: 9px;
+  overflow: hidden;
+  background: var(--sub-qr-bg);
+}
+[data-theme='light'] .sub-qr {
+  --sub-qr-bg: #fff;
+  --sub-qr-fg: #101112;
+}
+.sub-qr > svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+/* qrcode.react emits the background path before the modules. Stylesheet fills let WebKit
+   paint theme colors on the first frame, without CSS variables in SVG presentation attributes. */
+.sub-qr > svg > path:first-of-type {
+  fill: var(--sub-qr-bg);
+}
+.sub-qr > svg > path:last-of-type {
+  fill: var(--sub-qr-fg);
+}
+.sub-subscription .sub-dialog-filter {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  margin: 16px 0 18px;
+  padding: 10px 0;
+}
+.sub-subscription .sub-dialog-label {
+  width: 54px;
+  flex: none;
+}
+.sub-subscription .sub-dialog-filter .segsw button {
+  padding: 0 8px;
+  font-size: 12px;
+}
+.sub-subscription-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 7px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.sub-subscription-label > button {
+  min-height: 24px;
+}
+.sub-subscription-url .sub-url {
+  display: block;
+  height: auto;
+  padding: 10px 12px;
+}
+.sub-subscription-url .sub-url code {
+  display: block;
+  padding: 0;
+  overflow: visible;
+  font-size: 11px;
+  line-height: 1.7;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.sub-subscription-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+.sub-subscription-actions > button {
+  display: inline-flex;
+  min-height: 34px;
+  justify-content: center;
+  gap: 7px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.sub-subscription-actions .ui-icon,
+.sub-subscription-actions svg {
+  display: block;
+}
+.sub-subscription-actions > .sub-subscription-copy {
+  flex: 1;
+}
+.sub-subscription .sub-readings {
+  justify-content: center;
+  gap: 40px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.sub-subscription .sub-readings > div {
+  justify-items: start;
+}
+.sub-haitun {
+  margin: 16px -28px -18px;
+  padding: 0 28px;
+  border-top: 1px solid var(--line);
+}
+.sub-haitun > summary {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 7px;
+  list-style: none;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.sub-haitun > summary::-webkit-details-marker {
+  display: none;
+}
+.sub-haitun > summary > b {
+  font-weight: 500;
+}
+.sub-haitun > summary > .ui-icon:last-child {
+  margin-left: auto;
+}
+.sub-haitun[open] > summary > .ui-icon:last-child {
+  transform: rotate(180deg);
+}
+.sub-admin-badge {
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--ink-4);
+  font-size: 9px;
+}
+.sub-haitun > .sub-item {
+  display: block;
+  padding: 4px 0 18px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sub-haitun::details-content {
+    transition: none;
+  }
+}
+@media (min-width: 821px) and (max-height: 780px) {
+  .sub-dialog-subscription .sub-subscription-body {
+    padding-top: 16px;
+  }
+  .sub-subscription-title {
+    font-size: 19px;
+  }
+  .sub-qr {
+    width: 168px;
+    margin-top: 12px;
+  }
+  .sub-subscription .sub-dialog-filter {
+    margin: 10px 0 12px;
+    padding: 8px 0;
+  }
+  .sub-subscription .sub-readings {
+    gap: 24px;
+    margin-top: 15px;
+    padding-top: 0;
+    border: 0;
+  }
+  .sub-subscription .sub-readings > div {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .sub-subscription .sub-readings dd {
+    font-size: 12px;
+  }
 }
 @media (hover: hover) {
   .sub-url > button:hover:not(:disabled) {
@@ -13833,7 +13710,7 @@ select.f.words {
 }
 .node-view button {
   padding: 0 9px;
-  font-size: 11.5px;
+  font-size: 12.5px;
 }
 .node-copy-all,
 .node-probe-all,
@@ -13842,7 +13719,7 @@ select.f.words {
   height: 26px;
   gap: 6px;
   padding: 0 10px;
-  font-size: 12px;
+  font-size: 12.5px;
 }
 /* 拨测进度：按钮底色从左往右铺，铺的比例 = 本轮已出结果的项 / 本轮项数（--progress）。
    运行中的按钮去掉主按钮的实底，铺上去的操作色浅底才看得见。 */
@@ -13930,7 +13807,7 @@ select.f.words {
   min-width: 0;
   overflow: hidden;
   color: var(--ink);
-  font: 600 12.5px var(--sans);
+  font: 600 13px/18px var(--sans);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -13953,7 +13830,7 @@ select.f.words {
   min-height: 24px;
   height: 24px;
   padding: 0 9px;
-  font-size: 11.5px;
+  font-size: 12.5px;
 }
 /* 行首缩进 23px（15px 地区旗 + 8px 间距），与组名文字左缘对齐；行间分隔线从同一位置起画。 */
 .node-row {
@@ -14116,7 +13993,8 @@ select.f.words {
    落到框底各占一半；按钮与复制目标放大到触屏尺寸。 */
 @media (max-width: 820px) {
   .dialog-layer.modal:has(> .sub-dialog) {
-    place-items: end stretch;
+    align-items: stretch;
+    justify-content: flex-end;
     padding: max(24px, var(--safe-top)) 0 0;
   }
   .dialog-layer.modal > .dialog-surface.sub-dialog {
@@ -14134,17 +14012,16 @@ select.f.words {
     animation-name: sub-sheet-out;
   }
   .sub-dialog-head {
-    min-height: 58px;
+    min-height: 50px;
     padding: 0 8px 0 14px;
   }
   .sub-dialog-tabs button {
-    height: 40px;
-    padding: 0 12px;
-    font-size: 14px;
+    height: var(--ctl-h);
+    padding: 0 10px;
   }
   .sub-dialog-close {
-    width: 40px;
-    height: 40px;
+    width: var(--ctl-h);
+    height: var(--ctl-h);
   }
   .sub-dialog-filter {
     display: grid;
@@ -14159,20 +14036,12 @@ select.f.words {
     display: grid;
     gap: 2px;
     padding: 10px 14px calc(10px + var(--safe-bottom));
-    font-size: 12px;
   }
   .sub-dialog-foot > span + span::before {
     content: none;
   }
   .sub-item-head {
     flex-wrap: wrap;
-  }
-  .sub-item-name > b {
-    font-size: 15px;
-    line-height: 20px;
-  }
-  .sub-item-sub {
-    font-size: 13px;
   }
   .sub-readings {
     order: 3;
@@ -14181,21 +14050,11 @@ select.f.words {
   .sub-readings > div {
     justify-items: start;
   }
-  .sub-readings dt {
-    font-size: 12px;
-  }
-  .sub-readings dd {
-    font-size: 14px;
-  }
-  .sub-item-note {
-    font-size: 12.5px;
-  }
   .sub-item-action {
-    min-height: 44px;
-    height: 44px;
-    margin-top: -10px;
-    padding: 0 14px;
-    font-size: 14px;
+    min-height: var(--ctl-h);
+    height: var(--ctl-h);
+    margin-top: -6px;
+    padding: 0 10px;
   }
   .sub-url {
     display: grid;
@@ -14220,7 +14079,7 @@ select.f.words {
   }
   .sub-url > button,
   .sub-url > .sub-url-copy {
-    height: 44px;
+    height: var(--ctl-h);
     justify-content: center;
     margin: 0;
     padding: 0;
@@ -14228,7 +14087,6 @@ select.f.words {
     border-top: 1px solid var(--line);
     border-radius: 0;
     background: var(--btn);
-    font-size: 14px;
   }
   .sub-url > .sub-url-reveal {
     grid-area: reveal;
@@ -14240,28 +14098,31 @@ select.f.words {
     font-weight: 500;
   }
   .node-count {
-    font-size: 13px;
+    margin-right: auto;
+    font-size: 12px;
+  }
+  .node-toolbar > .sp {
+    display: none;
+  }
+  .node-view {
+    height: var(--ctl-h);
   }
   .node-view button {
-    padding: 0 14px;
-    font-size: 13.5px;
+    min-height: 0;
+    height: calc(var(--ctl-h) - 2px);
+    padding: 0 10px;
   }
   .node-copy-all,
   .node-probe-all,
   .node-probe-retry {
-    min-height: 44px;
-    height: 44px;
-    padding: 0 14px;
-    font-size: 14px;
+    min-height: var(--ctl-h);
+    height: var(--ctl-h);
+    padding: 0 10px;
   }
   .btn.node-group-run {
-    min-height: 40px;
-    height: 40px;
-    padding: 0 14px;
-    font-size: 13px;
-  }
-  .node-group-result {
-    font-size: 12.5px;
+    min-height: var(--ctl-h);
+    height: var(--ctl-h);
+    padding: 0 10px;
   }
   .sub-dialog-foot > span.node-probe-tally {
     margin: 4px 0 0;
@@ -14283,28 +14144,19 @@ select.f.words {
     height: auto;
     min-height: 44px;
   }
-  .node-group-head > b {
-    font-size: 14px;
-  }
   .node-row {
     grid-template-columns: minmax(0, 1fr);
     gap: 2px;
     padding: 8px 0 8px 23px;
   }
-  .node-protocol > b {
-    font-size: 13px;
-  }
-  .node-protocol > span {
-    font-size: 12px;
-  }
   .node-copy {
-    height: 40px;
+    height: var(--ctl-h);
     margin-left: -9px;
     font-size: 12.5px;
   }
   .node-copy.has-note {
-    min-height: 40px;
-    padding-block: 10px;
+    min-height: var(--ctl-h);
+    padding-block: 8px;
     line-height: 17px;
   }
   .node-copy.has-note > .node-copy-lamp {
@@ -14323,6 +14175,44 @@ select.f.words {
     font-size: 11px;
   }
 }
+@media (max-width: 820px) {
+  .sub-dialog-subscription .sub-subscription-body {
+    padding: 20px;
+  }
+  .sub-subscription .sub-dialog-filter {
+    display: grid;
+    margin: 16px 0 18px;
+    padding: 12px 0;
+    gap: 10px;
+  }
+  .sub-qr {
+    width: min(208px, max(144px, calc(100dvh - 600px)));
+  }
+  .sub-subscription-actions > button {
+    min-height: var(--ctl-h);
+  }
+  .sub-subscription .sub-readings {
+    width: auto;
+    gap: 32px;
+  }
+  .sub-haitun {
+    margin: 20px -20px -20px;
+    padding: 0 20px;
+  }
+}
+@media (max-width: 820px) and (max-height: 480px) {
+  .sub-dialog-subscription .sub-subscription-body {
+    padding-top: 14px;
+  }
+  .sub-subscription-title {
+    font-size: 18px;
+  }
+  .sub-qr {
+    width: 168px;
+    margin-top: 12px;
+  }
+}
+
 @keyframes sub-sheet-in {
   from {
     opacity: 0;
@@ -14697,7 +14587,8 @@ body.has-artpanel .topo-deck {
   .tbl.cards td .btn {
     margin: 2px 6px 2px 0;
   }
-  .tbl:not(.cards, .rule-editor-table, .machine-dns-policy-table) {
+  /* 链路规则表在窄容器里有自己的卡片布局，不跟着横向滚动 */
+  .tbl:not(.cards, .chain-rule-table) {
     display: block;
     overflow-x: auto;
     overscroll-behavior-x: contain;
@@ -14772,7 +14663,15 @@ body.has-artpanel .topo-deck {
   gap: 10px;
   height: var(--shell-nav-h);
   padding: 0 12px 0 18px;
-  background: var(--glass);
+  background: var(--surface);
+}
+/* 主导航随工作区正常滚走。桌面在滚动边界停止，避免 macOS 回弹将导航拉离顶边、
+   露出下层网格；contain 只阻止滚动链，仍会保留造成露底的本地回弹。 */
+@media (hover: hover) and (pointer: fine) {
+  html,
+  .fg-desk {
+    overscroll-behavior-y: none;
+  }
 }
 .fg-home {
   flex: 0 0 auto;
@@ -15880,6 +15779,10 @@ body.has-artpanel .topo-deck {
 .fg-top[data-fit~='traffic'] .fg-topstat > .ft + .fg-blast {
   padding-left: 0;
 }
+.fg-top[data-fit~='nav'] .fg-nv {
+  padding: 0 8px;
+  gap: 5px;
+}
 .fg-top[data-fit~='traffic'] .fg-topstat:not(:has(> .fg-blast, > .fg-meta)) {
   display: none;
 }
@@ -16483,7 +16386,7 @@ body.fg-dragging * {
   /* ─── 页面导航：并入导航行，位于品牌右侧 ───
      flex:1 吃掉品牌与图标之间的全部空间，min-width:0 + overflow-x 用于兜底——
      按钮本身直接复用桌面端 .fg-nv：同样的图标、28px 高度、内距和实心选中态；
-     移动端只负责横向滚动，不再维护第二套按钮视觉。机器、线路、用户和用量保留图标与文字，
+     移动端只负责横向滚动，不再维护第二套按钮视觉。机器、容器、线路和用户保留图标与文字，
      发布和其他低频入口从账户菜单进入。 */
   .fg-facebar {
     flex: 1;
@@ -16502,12 +16405,21 @@ body.fg-dragging * {
   }
   /* 320px 视口也完整显示四项导航，只收紧横向留白，保留图标与字号。 */
   @media (max-width: 375px) {
+    .fg-top {
+      gap: 2px;
+    }
     .fg-facebar {
       gap: 1px;
     }
     .fg-facebar .fg-nv {
-      gap: 3px;
-      padding: 0 2px;
+      gap: 2px;
+      padding: 0;
+    }
+    .fg-who.guest-login {
+      padding: 0 4px;
+    }
+    .fg-who.guest-login .fg-who-plate {
+      display: none;
     }
   }
   /* 气泡和菜单从顶栏下方展开，宽度按屏幕宽度计算。
@@ -16780,7 +16692,7 @@ body.fg-dragging * {
   /* 无表头的明细表（发布详情中波次下方的机器表）已设置 overflow-x:auto，
      但表格宽度仍为 100%，因此不会溢出，只是压缩列宽——「下发于 5 分钟前」
      被折为两行。按内容确定宽度后才能实际触发横向滚动。 */
-  .fg-sheet .tbl:not(.cards, .rule-editor-table, .machine-dns-policy-table) {
+  .fg-sheet .tbl:not(.cards, .chain-rule-table) {
     width: max-content;
     min-width: 100%;
     max-width: 100%;
@@ -17757,40 +17669,6 @@ body.fg-dragging * {
 .pv-chain-fields .wzr-addhop select.f {
   min-width: 220px;
   max-width: 100%;
-}
-.pv-chain-fields .wzr-editor {
-  overflow-x: auto;
-}
-.pv-chain-fields .wzr-table {
-  width: 100%;
-}
-.pv-chain-fields .wzr-table .wzr-target {
-  width: 220px;
-  max-width: 100%;
-}
-.pv-chain-fields .wzr-table .wzr-dial {
-  width: 150px;
-}
-.pv-chain-fields .wzr-table .wzr-custom {
-  width: 155px;
-}
-.pv-chain-fields .wzr-controls {
-  white-space: nowrap;
-}
-.pv-chain-fields .wzr-listener-fields {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px 14px;
-}
-.pv-chain-fields .wzr-listener-fields > label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--ink-3);
-}
-.pv-chain-fields .wzr-listener-fields input.f {
-  width: 86px;
 }
 /* 不兼容原因与说明分开：说明留在原位，原因另起一行，落在参数之上。 */
 .pv-chain-fields .wzp-card > .wzp-issue {
@@ -19388,6 +19266,9 @@ h4.sec > .btn {
   border-radius: var(--r-ctl);
 }
 .qta {
+  --quota-action-width: 25px;
+  --quota-columns: minmax(118px, 0.85fr) minmax(0, 2fr) minmax(96px, auto) var(--quota-action-width);
+
   display: grid;
   align-content: start;
   min-width: 0;
@@ -19408,7 +19289,7 @@ h4.sec > .btn {
    未设额度不画额度条：空槽会被理解为用量为零，而实际含义是不限量。 */
 .qta-r {
   display: grid;
-  grid-template-columns: minmax(118px, 0.85fr) minmax(0, 2fr) minmax(96px, auto) 25px;
+  grid-template-columns: var(--quota-columns);
   grid-template-areas:
     'name figs left acts'
     'name meter meter acts';
@@ -19606,13 +19487,14 @@ h4.sec > .btn {
     align-self: end;
   }
   .qta {
+    --quota-columns: minmax(0, 1fr) auto var(--quota-action-width);
+
     padding: 0 var(--panel-content-x-compact);
   }
   .user-usage > .dim.qta-empty {
     padding: 14px var(--panel-content-x-compact);
   }
   .qta-r {
-    grid-template-columns: minmax(0, 1fr) auto 25px;
     grid-template-areas:
       'name name acts'
       'figs left left'
@@ -20502,49 +20384,11 @@ h4.sec > .btn {
   padding: 0;
   background: transparent;
 }
-/* 身份栏只留两项常用入口；三项都作为横梁上的轻操作，不再各自铺白色按钮面。
-   低频与危险操作仍收进「更多」，展开态用同一档 hover 面提示菜单归属。 */
-.user-dacts {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin: 0;
-}
-.user-dacts .btn {
-  min-height: var(--ctl-h);
-  padding: 0 10px;
-  border-color: transparent;
-  background: transparent;
-  box-shadow: none;
-  color: var(--ink-2);
-  font-size: 12px;
-}
-.user-dhead .user-dacts .btn[aria-expanded='true'] {
-  background: var(--hover);
-  color: var(--ink);
-}
-@media (hover: hover) and (pointer: fine) {
-  .user-dhead .user-dacts .btn:hover:not(:disabled) {
-    border-color: transparent;
-    background: var(--hover);
-    color: var(--ink);
-  }
-}
-.user-dhead .user-dacts .btn:active:not(:disabled) {
-  border-color: transparent;
-  background: var(--hover-2);
-}
 .user-dact {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   white-space: nowrap;
-}
-.btn.user-dact-more {
-  width: 32px;
-  min-height: var(--ctl-h);
-  padding: 0;
-  justify-content: center;
 }
 .user-dact-icon,
 .user-dact-icon svg,
@@ -21835,15 +21679,6 @@ h4.sec > .btn {
   gap: 6px;
   margin-top: 12px;
 }
-.fwd-ledger {
-  gap: 18px;
-}
-.fwd-ledger .usage-split {
-  margin-top: 14px;
-}
-.fwd-ledger .usage-io {
-  margin-top: 10px;
-}
 .fwd-deleted {
   display: block;
   margin-top: 8px;
@@ -21857,6 +21692,11 @@ h4.sec > .btn {
   gap: 8px;
   padding-top: 14px;
   border-top: 1px solid var(--line-soft);
+}
+@container user-usage (max-width: 620px) {
+  .fwd-live {
+    grid-column: 1 / -1;
+  }
 }
 .fwd-live > span {
   color: var(--ink-3);
@@ -21901,24 +21741,14 @@ h4.sec > .btn {
   color: var(--action);
 }
 
-/* 转发额度复用接入额度的布局；机器名称保留筛选规则的操作。 */
-.fwd-quota-row {
-  grid-template-columns: minmax(118px, 0.85fr) minmax(0, 2fr) minmax(64px, auto) auto;
-  column-gap: 14px;
+/* 流量额度沿用接入布局；规则数量留在机器名称下方，避免与流量余额混淆。 */
+.fwd-rule-count {
+  font-variant-numeric: tabular-nums;
 }
 .fwd-quota-row .qta-acts {
   display: flex;
   align-items: center;
   gap: 2px;
-}
-@container user-usage (max-width: 700px) {
-  .fwd-quota-row {
-    grid-template-columns: minmax(0, 1fr) auto auto;
-    grid-template-areas:
-      'name name acts'
-      'figs left left'
-      'meter meter meter';
-  }
 }
 .fwd-quotas > .fwd-add {
   justify-self: start;
@@ -22531,8 +22361,10 @@ select.f.fwe-select {
 }
 /* 各行共用同一组列：已停止的行多一个「恢复」，读数列也不跟着左移。 */
 .qta.fwe-aligned {
-  grid-template-columns: minmax(118px, 0.85fr) minmax(0, 2fr) minmax(64px, auto) auto;
-  column-gap: 14px;
+  --quota-action-width: minmax(25px, auto);
+
+  grid-template-columns: var(--quota-columns);
+  column-gap: 18px;
 }
 .qta.fwe-aligned > * {
   grid-column: 1 / -1;
@@ -22596,9 +22428,6 @@ select.f.fwe-select {
 
 /* ── 窄卡：表单占满整行宽度 ── */
 @container user-usage (max-width: 700px) {
-  .qta.fwe-aligned {
-    grid-template-columns: minmax(0, 1fr) auto auto;
-  }
   .fwe-sheet,
   .qta-r.fwe-grant > .fwe-sheet {
     grid-column: 1 / -1;
@@ -22958,8 +22787,7 @@ select.f.fwr-sort {
     animation: none;
   }
 }
-@container user-usage (max-width: 700px) {
-  .fwe-row .qta-acts .fwd-ib,
+@container user-usage (max-width: 620px) {
   .btn.fwe-resume {
     min-width: 44px;
     min-height: 44px;
@@ -23034,20 +22862,6 @@ select.f.fwr-sort {
   }
   .user-dhead .dname b {
     font-size: 15px;
-  }
-  .user-dhead .user-dacts .btn,
-  .user-dhead .btn.user-dact-more {
-    width: 34px;
-    min-height: 40px;
-    justify-content: center;
-    padding: 0;
-  }
-  .user-dhead .user-dact-label {
-    display: none;
-  }
-  .user-dhead-tools,
-  .user-dhead-tools .user-dacts {
-    gap: 2px;
   }
 }
 
@@ -25892,6 +25706,25 @@ body.observe-brushing .observe-chart-tip {
     min-height: 50px;
   }
 }
+@container (max-width: 350px) {
+  .node-cardpage > .node-list-panel > .nd-page-head[data-selecting='true'] {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: 46px auto;
+    height: auto;
+    min-height: 0;
+  }
+  .node-cardpage > .node-list-panel > .nd-page-head[data-selecting='true'] > .nd-page-identity {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .node-cardpage > .node-list-panel > .nd-page-head[data-selecting='true'] > .title-actions {
+    grid-column: 1;
+    grid-row: 2;
+    width: 100%;
+    margin: 0;
+    padding: 0 12px 10px;
+  }
+}
 @media (max-width: 820px) {
   .node-list-body {
     padding: 12px;
@@ -25902,19 +25735,8 @@ body.observe-brushing .observe-chart-tip {
     grid-template-columns: minmax(0, 1fr);
     gap: 10px;
   }
-  .node-cardpage .nd-tools {
-    gap: 4px;
-  }
-  .node-cardpage .nd-tools .btn {
-    padding-inline: 7px;
-    font-size: 12px;
-  }
 }
 @media (max-width: 360px) {
-  .node-cardpage .nd-tools .btn {
-    padding-inline: 5px;
-    font-size: 11px;
-  }
   .node-card-resources {
     gap: 6px;
     font-size: 12px;
@@ -28923,8 +28745,7 @@ body.observe-brushing .observe-chart-tip {
   letter-spacing: 0.04em;
   white-space: nowrap;
 }
-.external-target-kind.external,
-.external-summary-protocol {
+.external-target-kind.external {
   border-color: color-mix(in srgb, var(--action) 38%, var(--line));
   background: color-mix(in srgb, var(--action) 9%, transparent);
   color: var(--action);
@@ -28979,9 +28800,6 @@ body.observe-brushing .observe-chart-tip {
   box-shadow: var(--shadow);
   transform-origin: bottom center;
   animation: external-target-menu-in 90ms ease-out;
-}
-.external-target-menu.below {
-  transform-origin: top center;
 }
 @keyframes external-target-menu-in {
   from {
@@ -30738,13 +30556,13 @@ body.observe-brushing .observe-chart-tip {
 
 @media (max-width: 820px) {
   .rule-editor {
-    --ctl-h: 44px;
+    --ctl-h: var(--mobile-control-h);
   }
   .rule-editor :is(input.f, select.f) {
     box-sizing: border-box;
     height: var(--ctl-h);
     min-height: var(--ctl-h);
-    font-size: 13px;
+    font-size: 12.5px;
   }
 }
 
@@ -30819,91 +30637,6 @@ body.observe-brushing .observe-chart-tip {
   }
 }
 
-/* 资源摘要紧贴规则表，明确展示它是该规则引用的 outbound，而不是下一跳节点。 */
-.external-outbound-summary {
-  margin: 8px 0 0;
-  overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--action) 24%, var(--line));
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--action) 3%, var(--block));
-}
-.external-outbound-summary > header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 10px;
-  border-bottom: 1px solid var(--line-soft);
-  background: color-mix(in srgb, var(--action) 6%, var(--band));
-}
-.external-outbound-summary > header h4 {
-  margin: 0;
-  color: var(--ink-3);
-  font: 600 9.5px var(--mono);
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-}
-.external-outbound-summary > header b {
-  font-size: 12px;
-}
-.external-summary-protocol {
-  display: inline-flex;
-  padding: 2px 6px;
-  border: 1px solid;
-  border-radius: 4px;
-  font: 600 9px var(--mono);
-}
-.external-outbound-summary > header .note {
-  margin: 0;
-  line-height: normal;
-}
-.external-summary-facts {
-  display: grid;
-  grid-template-columns: 1.45fr 0.8fr 1fr 1fr;
-  gap: 0;
-  padding: 9px 10px;
-}
-.external-summary-capability {
-  margin: 0;
-  padding: 7px 10px;
-  border-bottom: 1px solid color-mix(in srgb, var(--warn) 28%, var(--line-soft));
-  color: var(--warn);
-  background: color-mix(in srgb, var(--warn) 6%, transparent);
-  font-size: 10px;
-}
-.external-summary-facts > span {
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-  padding: 0 10px;
-  border-left: 1px solid var(--line-soft);
-}
-.external-summary-facts > span:first-child {
-  padding-left: 0;
-  border-left: 0;
-}
-.external-summary-facts small {
-  color: var(--ink-4);
-  font: 9px var(--sans);
-}
-.external-summary-facts b {
-  overflow: hidden;
-  color: var(--ink-2);
-  font-size: 10.5px;
-  font-weight: 500;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.external-summary-impact {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  margin: 0;
-  padding: 7px 10px;
-  border-top: 1px solid var(--line-soft);
-  color: var(--ink-3);
-  font-size: 10px;
-  line-height: 1.55;
-}
 @container (max-width: 620px) {
   .warp-registration-action {
     grid-template-columns: minmax(0, 1fr);
@@ -30912,23 +30645,10 @@ body.observe-brushing .observe-chart-tip {
     justify-self: end;
   }
 }
-.external-summary-impact > span:first-child {
-  flex: none;
-  padding: 1px 5px;
-  border: 1px solid color-mix(in srgb, var(--ok) 35%, var(--line));
-  border-radius: 3px;
-  color: var(--ok);
-  font: 600 8px var(--mono);
-}
+
 .external-summary-impact-copy {
   min-width: 0;
   overflow-wrap: anywhere;
-}
-.external-outbound-summary.missing {
-  padding: 9px 10px;
-  border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
-  color: var(--warn);
-  font-size: 11px;
 }
 
 /* External proxy editor: a resource drawer, kept separate from the rule row because protocol and
@@ -31371,14 +31091,6 @@ body.observe-brushing .observe-chart-tip {
   }
   .external-outbound-drawer > footer .note {
     display: none;
-  }
-  .external-summary-facts {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    row-gap: 10px;
-  }
-  .external-summary-facts > span:nth-child(3) {
-    padding-left: 0;
-    border-left: 0;
   }
 }
 
@@ -36146,9 +35858,6 @@ body.fg-dragging .fg-rail {
     padding: 8px 12px 10px;
     border-top: 1px solid var(--line-soft);
   }
-  .cg-head .nd-acts > .btn {
-    flex: 1 1 auto;
-  }
   .cg-steps li {
     font-size: 12px;
   }
@@ -36958,9 +36667,6 @@ details.cg-menu-wrap > summary::-webkit-details-marker {
 .site-usage-meta b {
   color: var(--ink-2);
   font-weight: 500;
-}
-.site-usage-meta .warn {
-  color: var(--gold);
 }
 /* 与右侧排行并排时随行高拉伸，排行展开后图也随之变高 */
 .site-usage-chart {
@@ -37912,186 +37618,399 @@ button.site-usage-row:focus-visible {
 }
 
 /* ── 首次上线引导层 ──
-   引导不拥有业务页面：它只在真实的机器、线路、用户和发布页面上解释下一步。
-   遮罩、焦点与退出动效由 DialogLayer 统一管理。 */
-.onb-guide {
+   清单不拥有业务页面：常驻右下角、跟随页面切换，不加遮罩、不抢焦点。当前步骤所在的生产页面上
+   收成胶囊；页面的贴底操作条与它重叠时，由脚本写入的 --onb-lift 抬到操作条之上。 */
+.onb-dock {
+  --onb-gap: 20px;
+  position: fixed;
+  right: max(var(--onb-gap), var(--safe-right));
+  bottom: calc(max(var(--onb-gap), var(--safe-bottom)) + var(--onb-lift, 0px));
+  z-index: 90;
+  max-width: calc(100vw - 2 * var(--onb-gap));
+  font-family: var(--sans);
+  transition: bottom var(--motion-medium) var(--motion-ease-standard);
+}
+/* 胶囊常驻时给工作区底部留出它的高度，页面滚到底时内容不被盖住。 */
+html[data-onboarding='dock'] .fg-desk > .fg-view {
+  padding-bottom: 72px;
+}
+.onb-pill {
   display: flex;
-  width: min(560px, calc(100vw - 40px));
-  max-height: min(82vh, 720px);
-  flex-direction: column;
-  overflow: hidden;
-}
-.onb-guide-head {
-  flex: none;
-  padding: 24px 26px 18px;
-  border-bottom: 1px solid var(--line-soft);
-}
-.onb-guide-head h2 {
-  margin: 18px 0 0;
+  height: 44px;
+  max-width: 100%;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  backdrop-filter: blur(16px) saturate(1.1);
+  box-shadow: var(--shadow);
   color: var(--ink);
-  font-size: 22px;
-  font-weight: 650;
-  letter-spacing: -0.02em;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
 }
-.onb-guide-progress {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  margin: 14px 0 0;
-  padding: 0;
-  list-style: none;
-}
-.onb-guide-progress li {
-  position: relative;
-  display: grid;
-  justify-items: center;
-  gap: 6px;
+.onb-pill > svg:last-child {
+  flex: none;
+  margin-left: 4px;
   color: var(--ink-4);
-  font-size: 10px;
-  text-align: center;
 }
-.onb-guide-progress li::before {
-  position: absolute;
-  top: 11px;
-  right: 50%;
-  left: -50%;
-  height: 1px;
-  background: var(--line);
-  content: '';
+.onb-pill-copy {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
 }
-.onb-guide-progress li:first-child::before {
+.onb-pill-copy b {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.onb-pill-copy > span {
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.onb-pill-copy .onb-spin {
+  margin-right: 5px;
+}
+.onb-card {
+  display: grid;
+  width: 344px;
+  max-width: 100%;
+  max-height: calc(100dvh - 110px - var(--onb-lift, 0px));
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--sheet);
+  box-shadow: var(--shadow);
+}
+.onb-card[hidden] {
   display: none;
 }
-.onb-guide-progress li > span {
-  z-index: 1;
+.onb-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 10px 8px 18px;
+}
+.onb-head h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 14.5px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+.onb-count {
+  margin-left: auto;
+  color: var(--ink-4);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.onb-fold {
   display: grid;
-  width: 23px;
-  height: 23px;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.onb-head h2 + .onb-fold {
+  margin-left: auto;
+}
+.onb-fold:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+@media (hover: hover) {
+  .onb-fold:hover:not(:disabled) {
+    background: var(--hover-2);
+  }
+}
+.onb-steps {
+  margin: 0;
+  padding: 2px 8px 10px;
+  list-style: none;
+}
+.onb-step {
+  display: grid;
+  min-height: 38px;
+  box-sizing: border-box;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 11px;
+  padding: 0 10px;
+  border-radius: 10px;
+}
+.onb-step.current {
+  margin: 2px 0;
+  padding: 11px 10px 13px;
+  align-items: start;
+  background: color-mix(in srgb, var(--action) 6%, transparent);
+}
+.onb-label {
+  min-width: 0;
+  color: var(--ink-2);
+  font-size: 13px;
+}
+.onb-step.current .onb-label {
+  color: var(--ink);
+  font-weight: 600;
+  line-height: 20px;
+}
+.onb-step.next .onb-label {
+  color: var(--ink-4);
+}
+.onb-fact {
+  max-width: 170px;
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 12px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.onb-body {
+  display: grid;
+  min-width: 0;
+  grid-column: 2 / -1;
+  gap: 10px;
+  margin-top: 4px;
+}
+.onb-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.onb-note.warn {
+  color: var(--gold);
+}
+.onb-note.bad {
+  color: var(--err);
+}
+.onb-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+.onb-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--action);
+  font: 12.5px var(--sans);
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .onb-link:hover {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+}
+.onb-stages {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+}
+.onb-stages i {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line);
+}
+.onb-stages i.done {
+  background: var(--ok);
+}
+.onb-stages i.current {
+  background: var(--action);
+  animation: onb-pulse 1.1s ease-in-out infinite;
+}
+.onb-stages i.warn {
+  background: var(--gold);
+}
+.onb-stages i.bad {
+  background: var(--err);
+}
+.onb-picks {
+  display: grid;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--sheet);
+}
+.onb-pick {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.onb-pick + .onb-pick {
+  border-top: 1px solid var(--line);
+}
+.onb-pick b {
+  font-weight: 500;
+}
+.onb-pick .mono {
+  margin-left: auto;
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+@media (hover: hover) {
+  .onb-pick:hover {
+    background: var(--hover);
+  }
+}
+.onb-user {
+  display: grid;
+  gap: 8px;
+}
+.onb-inline {
+  display: flex;
+  gap: 8px;
+}
+.onb-inline input.f {
+  flex: 1;
+  min-width: 0;
+}
+.onb-inline input.f[aria-invalid='true'] {
+  border-color: var(--err);
+}
+.onb-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 2px 16px 16px;
+}
+.onb-error {
+  display: grid;
+  gap: 10px;
+  padding: 4px 18px 16px;
+}
+/* 步骤标记：完成为实心对勾，进行中为强调色圈（等待外部事件时转动），需要处理时为实心叹号。 */
+.onb-mark {
+  position: relative;
+  display: inline-grid;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  box-sizing: border-box;
   place-items: center;
   border: 1px solid var(--line);
   border-radius: 50%;
-  background: var(--surface);
-  color: var(--ink-3);
+  color: var(--ink-4);
   font: 600 10px/1 var(--mono);
 }
-.onb-guide-progress li.done,
-.onb-guide-progress li.current {
-  color: var(--ink-2);
+.onb-mark.done {
+  border-color: transparent;
+  background: var(--ok);
+  color: #fff;
 }
-.onb-guide-progress li.done::before,
-.onb-guide-progress li.current::before {
-  background: color-mix(in srgb, var(--action) 55%, var(--line));
-}
-.onb-guide-progress li.done > span {
-  border-color: color-mix(in srgb, var(--ok) 55%, var(--line));
-  background: color-mix(in srgb, var(--ok) 12%, var(--surface));
-  color: var(--ok);
-}
-.onb-guide-progress li.current > span {
-  border-color: var(--action);
-  background: color-mix(in srgb, var(--action) 14%, var(--surface));
+.onb-mark.current {
+  border: 1.5px solid var(--action);
+  background: color-mix(in srgb, var(--action) 10%, var(--sheet));
   color: var(--action);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--action) 8%, transparent);
 }
-.onb-guide-body {
-  min-height: 0;
-  padding: 22px 26px;
-  overflow-y: auto;
-  overscroll-behavior: contain;
+.onb-mark.current.busy {
+  border-color: color-mix(in srgb, var(--action) 22%, var(--line));
+  background: var(--sheet);
 }
-.onb-guide-body > p,
-.onb-guide-user > p {
-  margin: 0;
-  color: var(--ink-2);
-  line-height: 1.65;
+.onb-mark.current.busy > i {
+  position: absolute;
+  inset: -1.5px;
+  border: 1.5px solid transparent;
+  border-top-color: var(--action);
+  border-radius: 50%;
+  animation: onb-turn 0.9s linear infinite;
 }
-.onb-guide-body > p + p {
-  margin-top: 10px;
+.onb-mark.current:is(.warn, .bad) {
+  border-color: transparent;
+  color: #fff;
+  font: 600 12px/1 var(--sans);
 }
-.onb-guide-note {
-  color: var(--ink-4) !important;
-  font-size: 12px;
+.onb-mark.current.warn {
+  background: var(--gold);
 }
-.onb-guide-actions {
-  display: flex;
+.onb-mark.current.bad {
+  background: var(--err);
+}
+.onb-ring circle {
+  fill: none;
+  stroke: var(--line);
+  stroke-width: 2.5;
+}
+.onb-ring .onb-ring-value {
+  stroke: var(--action);
+  stroke-linecap: round;
+}
+.onb-spin {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
   flex: none;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 14px 26px 18px;
-  border-top: 1px solid var(--line-soft);
+  box-sizing: border-box;
+  border: 1.5px solid color-mix(in srgb, var(--action) 22%, transparent);
+  border-top-color: var(--action);
+  border-radius: 50%;
+  vertical-align: -1px;
+  animation: onb-turn 0.9s linear infinite;
 }
-.onb-guide-actions:empty {
-  display: none;
+@keyframes onb-turn {
+  to {
+    transform: rotate(360deg);
+  }
 }
-.onb-guide-picks {
-  display: grid;
-  gap: 8px;
-  margin-top: 18px;
+@keyframes onb-pulse {
+  50% {
+    opacity: 0.35;
+  }
 }
-.onb-guide-picks .btn {
-  display: flex;
-  min-height: 46px;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  padding: 0 12px;
-  text-align: left;
+@media (prefers-reduced-motion: reduce) {
+  .onb-dock {
+    transition: none;
+  }
+  .onb-mark.current.busy > i,
+  .onb-spin,
+  .onb-stages i.current {
+    animation: none;
+  }
 }
-.onb-guide-picks .btn span {
-  color: var(--ink-4);
-  font-size: 11px;
-}
-.onb-guide-user {
-  display: grid;
-  gap: 18px;
-}
-.onb-guide-field {
-  display: grid;
-  gap: 7px;
-  color: var(--ink-2);
-  font-size: 12px;
-}
-.onb-guide-field .f {
-  min-height: 42px;
-}
-.onb-guide-field small {
-  color: var(--ink-4);
-}
-.onb-guide-inline-actions {
-  display: flex;
-  justify-content: flex-end;
-}
-.onb-guide-error {
-  width: min(500px, calc(100vw - 40px));
-}
-
-@media (max-width: 620px) {
-  .onb-guide {
+@media (max-width: 640px) {
+  .onb-dock {
+    --onb-gap: 10px;
+    left: max(var(--onb-gap), var(--safe-left));
+    max-width: none;
+  }
+  .onb-pill {
     width: 100%;
-    max-height: calc(100dvh - max(20px, var(--safe-top)) - max(20px, var(--safe-bottom)));
   }
-  .onb-guide-head {
-    padding: 20px 18px 16px;
+  .onb-pill > svg:last-child {
+    margin-left: auto;
   }
-  .onb-guide-head h2 {
-    margin-top: 16px;
-    font-size: 20px;
-  }
-  .onb-guide-progress li {
-    font-size: 9px;
-  }
-  .onb-guide-progress li > span {
-    width: 22px;
-    height: 22px;
-  }
-  .onb-guide-body {
-    padding: 18px;
-  }
-  .onb-guide-actions {
-    flex-wrap: wrap;
-    padding: 12px 18px 16px;
-  }
-  .onb-guide-actions .btn {
-    flex: 1 1 auto;
+  .onb-card {
+    width: auto;
+    max-height: min(72dvh, calc(100dvh - 90px - var(--onb-lift, 0px)));
+    border-radius: 18px;
   }
 }
 
@@ -38108,116 +38027,10 @@ button.site-usage-row:focus-visible {
   height: 46px;
 }
 
-/* 链路规则 B：左侧机器树，右侧只编辑一台机器；配置状态继续由 RuleEditor 持有。 */
-.chain-rule-workspace {
-  display: grid;
-  grid-template-columns: 250px minmax(0, 1fr);
-  margin: 0 -12px -9px;
-  min-width: 0;
-  color: var(--ink);
-  font: 13px/1.45 var(--sans);
-}
-.rule-machine-tree {
-  display: grid;
-  align-content: start;
-  gap: 2px;
-  padding: 10px 8px 14px;
-  border-right: 1px solid var(--line);
-}
-.rule-machine-node {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  width: 100%;
-  min-width: 0;
-  box-sizing: border-box;
-  padding: 7px 10px 7px calc(10px + min(var(--depth), 6) * 16px);
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-@media (hover: hover) {
-  .rule-machine-node:hover {
-    background: var(--hover);
-  }
-}
-.rule-machine-node.is-selected {
-  background: var(--action-wash);
-}
-.rule-machine-name {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-}
-.rule-machine-name b {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 600;
-}
-.rule-machine-via {
-  grid-column: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--ink-3);
-  font-size: 11.5px;
-}
-.rule-machine-go {
-  display: none;
-  grid-column: 2;
-  grid-row: 1 / span 2;
-}
-.rule-dirty-dot {
-  width: 5px;
-  height: 5px;
-  flex: none;
-  border-radius: 50%;
-  background: var(--gold);
-}
-.rule-machine-detail {
-  min-width: 0;
-  padding: 10px 16px 16px 20px;
-}
-.rule-machine-heading {
-  display: flex;
-  justify-content: space-between;
-  align-items: start;
-  gap: 12px;
-}
-.rule-machine-heading > div {
-  min-width: 0;
-}
-.rule-machine-title {
-  font-size: 17px;
-  font-weight: 600;
-  overflow-wrap: anywhere;
-}
-.rule-machine-subtitle {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 10px;
-  align-items: center;
-  margin-top: 5px;
-  color: var(--ink-3);
-  font-size: 12px;
-}
-.rule-machine-subtitle .st {
-  border: 0;
-  background: var(--hover-2);
-  color: var(--ink-3);
-}
-.rule-machine-tabs {
-  margin: 14px 0 10px;
-}
-.rule-machine-tabs .seg {
-  max-width: 100%;
-}
 .rule-machine-more {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex: none;
   width: 30px;
   height: 28px;
@@ -38233,206 +38046,15 @@ button.site-usage-row:focus-visible {
     background: var(--hover);
   }
 }
-.rule-machine-chain {
-  padding: 4px 0 8px;
-  color: var(--ink-2);
-  font-size: 12px;
-}
-.rule-machine-back {
-  border: 0;
-  padding: 0 6px 8px 0;
-  background: none;
-  color: var(--action);
-  font: 15px var(--sans);
-  cursor: pointer;
-}
-.rule-empty-note {
-  margin: 14px 0;
-  color: var(--ink-3);
-  font-size: 13px;
-}
-.chain-rule-workspace [hidden],
+
 .rule-editor [hidden] {
   display: none !important;
 }
-.rule-machine-detail .rule-editor {
-  margin: 0;
-  padding: 0;
-  border: 0;
-  border-radius: 0;
-  background: none;
-  box-shadow: none;
-  min-width: 0;
-}
-.rule-editor:where([data-section]) .rule-editor-table {
-  table-layout: auto;
-}
-.rule-editor:where([data-section]) .rule-editor-table thead {
-  display: none;
-}
-.rule-editor:where([data-section]) .rule-editor-table .rule-match-column {
-  width: 42%;
-}
-.rule-editor:where([data-section]) .rule-editor-table .rule-action-fields {
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.rule-editor:where([data-section]) .rule-editor-table td {
-  padding: 6px;
-  background: var(--hover);
-}
-.rule-editor:where([data-section]) .rule-match-fields {
-  display: flex;
-  gap: 6px;
-  min-width: 0;
-}
-.rule-editor:where([data-section]) .rule-match-fields > input {
-  flex: 1;
-  width: 120px;
-  min-width: 0;
-}
-.rule-editor:where([data-section]) .rule-match-fields > .choice-select {
-  flex: none;
-  width: auto;
-}
-.rule-editor:where([data-section]) .rule-action-fields .external-target-picker {
-  flex: 1;
-  min-width: 110px;
-}
-.rule-editor:where([data-section]) .external-target-trigger {
-  height: 28px;
-  min-width: 0;
-  max-width: 100%;
-  padding: 0 7px;
-  gap: 6px;
-  border: 0;
-  border-radius: 7px;
-  background: var(--hover-2);
-  color: var(--ink);
-}
-.rule-editor:where([data-section]) .external-target-trigger .external-target-kind {
-  display: none;
-}
-.rule-editor:where([data-section]) .external-target-trigger b {
-  font: 13px var(--sans);
-}
-.rule-editor:where([data-section]) .rule-readonly-select,
-.rule-editor:where([data-section]) .rule-readonly-target {
-  border: 0;
-  background: transparent;
-  min-height: 28px;
-}
-.rule-editor:where([data-section]) .rule-row-actions .btn {
-  border: 0;
-  background: none;
-  min-width: 24px;
-  padding: 0 4px;
-}
-.rule-editor:where([data-section]) .rule-add-actions {
-  justify-content: flex-end;
-  margin-top: 10px;
-}
-.rule-editor:where([data-section]) .rule-add-actions .btn {
-  border: 0;
-  background: none;
-  color: var(--action);
-}
+
 .rule-draft-save {
   margin-top: 12px;
   padding-top: 12px;
   border-top: 1px solid var(--line);
-}
-.rule-connection-panel .hint,
-.rule-editor:where([data-section]) .external-summary-impact {
-  display: none;
-}
-.rule-editor:where([data-section]) .rule-connection-panel {
-  border: 0;
-  padding: 0;
-  margin: 0 !important;
-  background: none;
-  box-shadow: none;
-}
-.rule-editor:where([data-section]) .rule-connection-panel > header {
-  display: none;
-}
-.rule-editor:where([data-section]) .listener-reference-list {
-  display: grid;
-  gap: 12px;
-}
-.rule-editor:where([data-section]) .listener-reference-row {
-  padding: 0 14px 10px;
-  border: 0;
-  border-radius: 10px;
-  background: var(--hover);
-}
-.rule-editor:where([data-section]) .listener-reference-main {
-  min-height: 40px;
-  border-bottom: 1px solid var(--line);
-}
-.rule-editor:where([data-section]) .hop-target-facts,
-.rule-editor:where([data-section]) .listener-inline-facts {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 0;
-}
-.rule-editor:where([data-section]) .hop-target-facts > label,
-.rule-editor:where([data-section]) .listener-inline-facts > label,
-.rule-connection-path {
-  display: grid;
-  grid-template-columns: 120px minmax(0, 1fr);
-  align-items: center;
-  gap: 12px;
-  min-height: 40px;
-  border-bottom: 1px solid var(--line);
-}
-.rule-connection-path > span:first-child {
-  color: var(--ink-3);
-  font-size: 12px;
-}
-.rule-editor:where([data-section]) .hop-target-facts .f {
-  width: max-content;
-  max-width: 100%;
-}
-.rule-editor:where([data-section]) .hop-target-facts input {
-  width: 100px;
-}
-.rule-editor:where([data-section]) .hop-target-note {
-  color: var(--ink-3);
-  font-size: 11.5px;
-  line-height: 1.5;
-}
-.rule-editor:where([data-section]) .rule-dial-fields {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px 10px;
-}
-.rule-editor:where([data-section]) .rule-dial-fields > .mono {
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-size: 11.5px;
-}
-.rule-dns-choices {
-  display: grid;
-  gap: 6px;
-  margin-bottom: 10px;
-}
-.rule-dns-choices > label {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 6px;
-}
-.rule-dns-choices .mono {
-  min-width: 0;
-  overflow-wrap: anywhere;
-  color: var(--ink-3);
-  font-size: 12px;
 }
 
 /* 关键选择共用首版实底菜单，触发器保留原型的填充按钮。 */
@@ -38449,7 +38071,7 @@ button.choice-select.f {
   border-radius: 7px;
   background: var(--hover-2);
   color: var(--ink);
-  font: 13px var(--sans);
+  font: 12.5px/1.4 var(--sans);
   text-align: left;
   cursor: pointer;
 }
@@ -38519,7 +38141,7 @@ button.choice-select.f {
   border-radius: 4px;
   background: none;
   color: var(--ink);
-  font: 13px var(--sans);
+  font: 12.5px/1.4 var(--sans);
   text-align: left;
   cursor: pointer;
 }
@@ -38626,7 +38248,7 @@ button.choice-select.f {
   color: inherit;
 }
 .choice-layer.drawer {
-  align-items: end;
+  align-items: stretch;
 }
 .choice-layer.drawer > .dialog-surface.choice-menu,
 .choice-layer.drawer > .dialog-surface.external-target-menu {
@@ -38640,155 +38262,14 @@ button.choice-select.f {
 }
 .choice-layer.drawer .choice-menu button,
 .choice-layer.drawer .external-target-menu button {
-  min-height: 46px;
-  font-size: 15px;
+  min-height: var(--ctl-h);
+  font-size: 12.5px;
 }
 .choice-layer.drawer .choice-menu-section,
 .choice-layer.drawer .external-target-menu-label {
   font-size: 11px;
 }
-.chain-rule-workspace.is-phone {
-  display: block;
-}
-.chain-rule-workspace.is-phone .rule-machine-tree {
-  border: 0;
-  padding: 6px 8px 12px;
-}
-.chain-rule-workspace.is-phone .rule-machine-node {
-  min-height: 56px;
-  padding-block: 9px;
-}
-.chain-rule-workspace.is-phone .rule-machine-name {
-  font-size: 15px;
-}
-.chain-rule-workspace.is-phone .rule-machine-via {
-  font-size: 13px;
-}
-.chain-rule-workspace.is-phone .rule-machine-go {
-  display: block;
-  color: var(--ink-4);
-  font-size: 20px;
-}
-.chain-rule-workspace.is-phone .rule-machine-detail {
-  padding: 8px 13px 16px;
-}
-/* The table reflows at the detail's available width, including a narrow desktop panel. */
-.rule-machine-detail {
-  container-type: inline-size;
-  container-name: rule-detail;
-}
-@container rule-detail (max-width: 640px) {
-  .rule-editor:where([data-section]) .rule-editor-table,
-  .rule-editor:where([data-section]) .rule-editor-table tbody {
-    display: block;
-    width: 100%;
-  }
-  .rule-editor:where([data-section]) .rule-editor-table colgroup {
-    display: none;
-  }
-  .rule-editor:where([data-section]) .rule-editor-table tr {
-    display: grid;
-    grid-template-columns: 22px minmax(0, 1fr) auto;
-    border-bottom: 1px solid var(--line);
-    padding: 6px 0;
-  }
-  .rule-editor:where([data-section]) .rule-editor-table td {
-    display: block;
-    width: auto !important;
-    border: 0;
-  }
-  .rule-editor:where([data-section]) .rule-editor-table td:first-child {
-    grid-column: 1;
-    grid-row: 1 / span 2;
-  }
-  .rule-editor:where([data-section]) .rule-editor-table .rule-match-cell {
-    grid-column: 2 / -1;
-  }
-  .rule-editor:where([data-section]) .rule-editor-table .rule-action-cell {
-    grid-column: 2;
-  }
-  .rule-editor:where([data-section]) .rule-editor-table .rule-operations-cell,
-  .rule-editor:where([data-section]) .rule-fallback-sign {
-    grid-column: 3;
-    grid-row: 2;
-    align-self: center;
-  }
-  .rule-editor:where([data-section]) .rule-editor-table .rule-action-fields {
-    display: flex;
-    flex-direction: row;
-  }
-  .rule-editor:where([data-section]) .rule-editor-table .rule-action-fields .external-target-picker {
-    width: 100%;
-    flex-basis: 100%;
-  }
-  .rule-editor:where([data-section]) .rule-connection-path,
-  .rule-editor:where([data-section]) .hop-target-facts > label {
-    grid-template-columns: 85px minmax(0, 1fr);
-  }
-}
-.rule-editor:where([data-section]) .listener-reference-row {
-  display: block;
-}
-.rule-editor:where([data-section]) .listener-reference-main {
-  display: flex;
-}
-.rule-editor:where([data-section]) .hop-target-note > span,
-.rule-editor:where([data-section]) .hop-target-note:not(:has(strong)),
-.rule-editor:where([data-section]) .listener-reference-row > p:not(.hop-target-note) {
-  display: none;
-}
-.rule-editor:where([data-section]) .rule-match-fields input {
-  font-family: var(--sans);
-}
-.rule-machine-title {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-}
-.rule-machine-detail .rule-editor:where([data-section]) .rule-editor-table td {
-  background: transparent;
-}
-.rule-machine-detail .rule-editor:where([data-section]) .rule-editor-table tr {
-  background: var(--hover);
-}
-.rule-machine-detail .rule-editor:where([data-section]) :is(.hop-target-facts, .listener-inline-facts) > label {
-  display: grid;
-  grid-template-columns: 120px minmax(0, 1fr);
-  align-items: center;
-  gap: 12px;
-}
-.rule-machine-detail .rule-editor:where([data-section]) :is(.hop-target-facts, .listener-inline-facts) > label > small {
-  font-size: 12px;
-}
-@container rule-detail (max-width: 640px) {
-  .rule-machine-detail .rule-editor:where([data-section]) .rule-editor-table tr {
-    grid-template-columns: 22px minmax(0, 1fr);
-  }
-  .rule-machine-detail .rule-editor:where([data-section]) .rule-editor-table td:first-child {
-    grid-row: 1 / span 3;
-    align-self: start;
-  }
-  .rule-machine-detail .rule-editor:where([data-section]) .rule-editor-table .rule-action-cell {
-    grid-column: 2 / -1;
-  }
-  .rule-machine-detail .rule-editor:where([data-section]) .rule-editor-table .rule-operations-cell {
-    grid-column: 2 / -1;
-    grid-row: 3;
-    justify-self: end;
-  }
-  .rule-machine-detail
-    .rule-editor:where([data-section])
-    .rule-editor-table
-    .rule-action-fields
-    .external-target-picker {
-    width: auto;
-    flex: 1;
-    min-width: 90px;
-  }
-  .rule-machine-detail .rule-editor:where([data-section]) :is(.hop-target-facts, .listener-inline-facts) > label {
-    grid-template-columns: 85px minmax(0, 1fr);
-  }
-}
+
 .choice-layer .external-target-menu > button.external-target-new {
   grid-template-columns: minmax(0, 1fr) auto;
   color: var(--action);
@@ -38818,5 +38299,1380 @@ button.choice-select.f {
   to {
     opacity: 0.72;
     transform: translate3d(0, 32px, 0);
+  }
+}
+/* ═══ 链路规则 E1 ═══
+   机器树逐台展开即规则表（v0.3.1 的结构）。树内样式限定在 `.chain-rule-tree` 之下，与机器详情的
+   DNS 策略卡等共用 `.rule-table` 的地方互不影响；弹出层（拨号菜单、提醒、WARP、DNS 弹层）渲染在
+   树外，单独成节。树自己声明 `rules` 容器：机器详情页的外层没有声明，规则表仍要按实际拿到的宽度重排。 */
+.chain-rule-tree {
+  container: rules / inline-size;
+}
+.chain-rule-tree .chain-rule-node-head .m-hop > .toolbar {
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+  gap: 4px;
+  margin: 0;
+}
+.chain-rule-tree .chain-rule-node-head .m-hop > .toolbar input.f {
+  width: 72px !important;
+  padding: 3px 6px;
+  font-size: 11.5px;
+}
+.chain-rule-tree .chain-rule-node-head .m-hop > .toolbar .btn {
+  padding: 3px 6px;
+  font-size: 11px;
+}
+.chain-rule-tree {
+  --indent: 16px;
+  margin: 0 -12px -9px;
+}
+.chain-rule-tree .chain-rule-node {
+  min-width: 0;
+}
+.chain-rule-tree .chain-rule-node-head {
+  display: grid;
+  grid-template-columns: 9px minmax(0, 1fr) 72px 66px 150px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  min-width: 0;
+  width: 100%;
+  padding: 7px 12px 7px calc(12px + var(--depth, 0) * var(--indent));
+  border: 0;
+  border-top: 1px solid var(--line-soft);
+  border-radius: 0;
+  background: transparent;
+}
+.chain-rule-tree .chain-rule-node-head .who {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+}
+.chain-rule-tree .chain-rule-node-head .who > b {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chain-rule-tree .chain-rule-node-head .who > .st {
+  flex: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chain-rule-tree .chain-rule-node-head[role='button'] {
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    box-shadow 0.12s;
+}
+.chain-rule-tree .chain-rule-node-head .disc {
+  flex: none;
+  width: 9px;
+  font-size: 9px;
+  color: var(--ink-4);
+  line-height: 1;
+}
+.chain-rule-tree .chain-rule-node-head > .mono {
+  flex: none;
+  color: var(--ink);
+}
+.chain-rule-tree .chain-rule-node-head .sp {
+  flex: 1;
+}
+.chain-rule-tree .chain-rule-node-head > .note {
+  margin: 0;
+  line-height: inherit;
+  white-space: nowrap;
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+.chain-rule-tree .chain-rule-node-head .st {
+  border-color: transparent;
+  background: var(--hover-2);
+  color: var(--ink-3);
+  padding: 1px 7px;
+  font-size: 10px;
+  margin-right: 0;
+}
+.chain-rule-tree .chain-rule-node-head .st-succeeded {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 13%, transparent);
+}
+.chain-rule-tree .chain-rule-node-head .st-gold,
+.chain-rule-tree .chain-rule-node-head .st-warn {
+  color: var(--gold);
+  background: var(--gold-wash);
+}
+.chain-rule-tree .chain-rule-node.open > .chain-rule-node-head {
+  background: var(--action-wash);
+  box-shadow: inset 2px 0 0 var(--action);
+}
+.chain-rule-tree .chain-rule-node.open > .chain-rule-node-head .disc {
+  color: var(--action);
+}
+/* 悬停一律只在支持悬停的指针下生效：触屏上 :hover 会停在最后点过的元素上。 */
+@media (hover: hover) {
+  .chain-rule-tree .chain-rule-node > .chain-rule-node-head[role='button']:hover {
+    background: var(--action-wash);
+    box-shadow: inset 2px 0 0 var(--action);
+  }
+}
+.chain-rule-tree .chain-rule-body {
+  background: var(--sunk);
+  padding: 0;
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--action) 32%, transparent);
+}
+.chain-rule-tree .chain-rule-orphans {
+  border-top: 1px dashed var(--line);
+}
+.chain-rule-tree .chain-rule-orphans > .chain-rule-node-head {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  flex-wrap: wrap;
+  border-top: 0;
+  color: var(--ink-2);
+}
+.chain-rule-tree .chain-rule-orphans > .chain-rule-node-head > b {
+  font: 600 12.5px var(--sans);
+  flex: none;
+}
+.chain-rule-tree .chain-rule-orphans > .chain-rule-node-head > .note {
+  margin: 0;
+  min-width: 0;
+}
+.chain-rule-tree .tbl .rule-fallback-row > td {
+  color: var(--ink-3);
+}
+.chain-rule-tree .rule-fallback-sign {
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+  text-align: right;
+  white-space: nowrap;
+}
+.chain-rule-tree .rule-fallback-sign::before {
+  width: 5px;
+  height: 5px;
+  display: inline-block;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  content: '';
+  opacity: 0.55;
+  vertical-align: 1px;
+}
+.chain-rule-tree .rule-fallback-sign.inline {
+  margin-left: 12px;
+}
+.chain-rule-tree .rule-readonly-select,
+.chain-rule-tree .rule-readonly-value {
+  display: inline-flex;
+  min-height: var(--ctl-h);
+  box-sizing: border-box;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  color: var(--ink-3);
+  font: 12.5px var(--mono);
+  vertical-align: middle;
+  cursor: default;
+}
+.chain-rule-tree .rule-readonly-select {
+  min-width: 86px;
+  padding: 0 26px 0 9px;
+}
+.chain-rule-tree .rule-readonly-value {
+  width: 190px;
+  padding: 0 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chain-rule-tree .rule-readonly-target {
+  border-color: var(--line);
+  background: var(--sunk);
+  cursor: default;
+}
+.chain-rule-tree .rule-editor {
+  padding: 7px 9px;
+  margin: 0;
+  background: color-mix(in srgb, var(--block) 72%, transparent);
+  border-color: var(--line-soft);
+  font-size: 12px;
+  border-radius: 0;
+}
+.chain-rule-tree .rule-ro {
+  border: 0;
+  margin: 0;
+  min-width: 0;
+}
+.chain-rule-tree .rule-ro[disabled] {
+  opacity: 1;
+}
+.chain-rule-tree .rule-ro[disabled] .f,
+.chain-rule-tree .rule-ro[disabled] input,
+.chain-rule-tree .rule-ro[disabled] select {
+  color: var(--ink-2);
+  background: var(--sunk);
+  cursor: default;
+}
+.chain-rule-tree .rule-match-cell {
+  width: 1%;
+  white-space: nowrap;
+}
+.chain-rule-tree .rule-match-cell > .f {
+  vertical-align: middle;
+}
+.chain-rule-tree .rule-match-cell > .f + .f {
+  margin-left: 6px;
+}
+.chain-rule-tree .rule-table .rule-match-cell > :is(select.f, .rule-readonly-select) {
+  width: 112px;
+}
+.chain-rule-tree .rule-table .rule-match-cell > :is(input.f, .rule-readonly-value) {
+  width: 190px;
+}
+.chain-rule-tree .rule-action-cell {
+  white-space: nowrap;
+}
+.chain-rule-tree .rule-action-select {
+  width: 112px;
+  font-weight: 500;
+}
+.chain-rule-tree .rule-action-select:is(.rule-action-forward, .rule-action-egress),
+.chain-rule-tree .rule-ro[disabled] .rule-action-select:is(.rule-action-forward, .rule-action-egress) {
+  color: var(--ink-2);
+  border-color: color-mix(in srgb, var(--ink-3) 30%, var(--line));
+  background-color: color-mix(in srgb, var(--ink) 3%, var(--sunk));
+}
+.chain-rule-tree .rule-action-select.rule-action-block,
+.chain-rule-tree .rule-ro[disabled] .rule-action-select.rule-action-block {
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 40%, var(--line));
+  background-color: color-mix(in srgb, var(--err) 9%, var(--sunk));
+}
+.chain-rule-tree .egress-dns-choice {
+  width: 154px;
+  vertical-align: middle;
+}
+.chain-rule-tree .egress-dns-reference {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  margin-left: 7px;
+}
+@container rules (max-width: 1050px) {
+  .chain-rule-tree .rule-table .rule-match-cell {
+    width: auto;
+  }
+}
+.chain-rule-tree .rule-table td {
+  padding: 5px 7px;
+}
+.chain-rule-tree .rule-table td:first-child {
+  width: 18px !important;
+}
+.chain-rule-tree .rule-table .btn {
+  padding: 3px 8px;
+  font-size: 12px;
+}
+.chain-rule-tree .rule-table input.f {
+  padding: 4px 7px;
+  font-size: 12px;
+}
+.chain-rule-tree .rule-table select.f {
+  padding: 0 23px 0 7px;
+  font-size: 12px;
+}
+.chain-rule-tree .rule-editor .panel {
+  padding: 7px 9px;
+  margin: 7px 0 0;
+  background: color-mix(in srgb, var(--sunk) 58%, transparent);
+  border-color: var(--line-soft);
+}
+.chain-rule-tree .rule-editor .panel > header {
+  margin: 0 0 5px;
+}
+.chain-rule-tree .rule-editor .panel > header h4 {
+  font-size: 11px;
+}
+.chain-rule-tree .rule-editor .hopfld {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.chain-rule-tree .rule-editor > .toolbar:last-child {
+  margin-top: 7px;
+}
+@container rules (max-width: 1440px) {
+  .chain-rule-tree .egress-dns-choice {
+    width: 136px;
+  }
+}
+@container rules (max-width: 640px) {
+  .chain-rule-tree .rule-table,
+  .chain-rule-tree .rule-table > tbody {
+    display: block;
+  }
+  .chain-rule-tree .rule-table > tbody > tr {
+    display: block;
+    margin: 8px 0;
+    padding: 9px 11px;
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-ctl);
+    background: color-mix(in srgb, var(--block) 42%, transparent);
+  }
+  .chain-rule-tree .rule-table > tbody > tr > td {
+    display: block;
+    width: auto !important;
+    padding: 0 !important;
+    border: 0;
+    white-space: normal;
+  }
+  .chain-rule-tree .rule-table > tbody > tr > td:first-child {
+    width: auto !important;
+    margin-bottom: 7px;
+    padding-bottom: 6px !important;
+    border-bottom: 1px solid var(--line-soft);
+    color: var(--ink-4);
+    font: 600 11px var(--mono);
+    text-align: left;
+  }
+  .chain-rule-tree .rule-table > tbody > tr > td.rule-match-cell,
+  .chain-rule-tree .rule-table > tbody > tr > td.rule-action-cell {
+    position: relative;
+    display: flex !important;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding-left: 38px !important;
+    min-height: 26px;
+  }
+  .chain-rule-tree .rule-table > tbody > tr > td.rule-action-cell {
+    flex-direction: column;
+    align-items: stretch;
+    margin-top: 7px;
+  }
+  .chain-rule-tree .rule-table .rule-match-cell::before,
+  .chain-rule-tree .rule-table .rule-action-cell::before {
+    position: absolute;
+    left: 0;
+    top: 8px;
+    width: 32px;
+    font: 10px var(--mono);
+    letter-spacing: 0.04em;
+    color: var(--ink-4);
+  }
+  .chain-rule-tree .rule-table .rule-match-cell::before {
+    content: '匹配';
+  }
+  .chain-rule-tree .rule-table .rule-action-cell::before {
+    content: '动作';
+  }
+  .chain-rule-tree .rule-table .rule-match-cell > .f {
+    margin-left: 0 !important;
+  }
+  .chain-rule-tree .rule-table .rule-match-cell select.f {
+    flex: 0 0 auto;
+    width: auto !important;
+    min-width: 96px;
+  }
+  .chain-rule-tree .rule-table .rule-match-cell input.f,
+  .chain-rule-tree .rule-table .rule-match-cell .rule-readonly-value {
+    flex: 1 1 120px;
+    width: auto !important;
+    min-width: 0;
+  }
+  /* 卡片里不再是表格，单元格本身排成一列，字段容器让出布局。 */
+  .chain-rule-tree .rule-table .rule-action-fields {
+    display: contents;
+  }
+  .chain-rule-tree .rule-table .rule-action-fields > * {
+    margin-left: 0 !important;
+  }
+  .chain-rule-tree .egress-dns-reference {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+    width: 100%;
+  }
+  .chain-rule-tree .rule-table .rule-action-cell .f,
+  .chain-rule-tree .rule-table .rule-action-cell .rule-action-select,
+  .chain-rule-tree .rule-table .rule-action-cell .rule-readonly-select,
+  .chain-rule-tree .rule-table .egress-dns-choice {
+    display: block;
+    width: 100% !important;
+    box-sizing: border-box;
+  }
+  .chain-rule-tree .rule-table .rule-action-cell .external-target-picker {
+    display: block;
+    width: 100% !important;
+    min-width: 0;
+    margin-left: 0;
+  }
+  .chain-rule-tree .rule-table > tbody > tr > td:last-child:not(:first-child, .rule-match-cell, .rule-action-cell) {
+    margin-top: 7px;
+    padding-top: 6px !important;
+    border-top: 1px dashed var(--line-soft);
+    text-align: right;
+  }
+  .chain-rule-tree .rule-table > tbody > tr > td:last-child:empty {
+    display: none;
+  }
+  .chain-rule-tree .rule-editor .hopfld {
+    justify-content: space-between;
+    width: 100%;
+    min-width: 0;
+  }
+  .chain-rule-tree .rule-editor .hopfld > .f {
+    box-sizing: border-box;
+    min-width: 0;
+    max-width: 62%;
+  }
+  .chain-rule-tree .rule-editor .hopfld > select.f {
+    width: 62%;
+  }
+  .chain-rule-tree .rule-editor .hopfld > .sub {
+    flex: 1 1 100%;
+    margin-left: 0;
+    text-align: right;
+  }
+}
+.chain-rule-tree .chain-rule-node-head > .meta {
+  display: contents;
+}
+.chain-rule-tree .chain-rule-node-head .m-rules {
+  text-align: right;
+  white-space: nowrap;
+}
+.chain-rule-tree .chain-rule-node-head .m-hop {
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chain-rule-tree .chain-rule-node-head .st.b-role,
+.chain-rule-tree .chain-rule-node-head .st.b-chain {
+  color: var(--action);
+  background: var(--action-wash);
+}
+.chain-rule-tree .chain-rule-node-head .hopctl {
+  display: flex;
+  justify-content: flex-end;
+  gap: 3px;
+  margin-right: 10px;
+}
+@container rules (max-width: 820px) {
+  .chain-rule-tree {
+    --indent: 11px;
+  }
+  .chain-rule-tree .chain-rule-node-head {
+    grid-template-columns: 9px minmax(0, 1fr) 26px;
+    grid-template-areas: 'disc who ctl' '.  meta meta';
+    row-gap: 3px;
+    padding-top: 9px;
+    padding-bottom: 9px;
+    padding-right: 12px;
+  }
+  .chain-rule-tree .chain-rule-node-head .disc {
+    grid-area: disc;
+    align-self: start;
+    margin-top: 4px;
+  }
+  .chain-rule-tree .chain-rule-node-head .who {
+    grid-area: who;
+    flex-wrap: wrap;
+    overflow: visible;
+    gap: 5px 6px;
+  }
+  .chain-rule-tree .chain-rule-node-head .who > .st {
+    overflow: visible;
+    text-overflow: clip;
+  }
+  .chain-rule-tree .chain-rule-node-head .hopctl {
+    grid-area: ctl;
+    align-self: start;
+    margin-right: 0;
+  }
+  .chain-rule-tree .chain-rule-node-head > .meta {
+    display: flex;
+    grid-area: meta;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+  }
+  .chain-rule-tree .chain-rule-node-head .m-rules,
+  .chain-rule-tree .chain-rule-node-head .m-hop {
+    text-align: left;
+  }
+  .chain-rule-tree .chain-rule-node-head .m-hop > .toolbar {
+    justify-content: flex-start;
+  }
+}
+.chain-rule-tree .external-target-picker {
+  position: relative;
+  display: inline-block;
+  width: min(330px, 34vw);
+  min-width: 250px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+.chain-rule-tree .external-target-trigger {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  color: var(--ink);
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color 0.12s ease,
+    background-color 0.12s ease;
+}
+.chain-rule-tree .external-target-trigger.node-target {
+  border-color: color-mix(in srgb, var(--action) 42%, var(--line));
+  background: var(--action-wash);
+}
+.chain-rule-tree .external-target-trigger.node-target .external-target-kind,
+.chain-rule-tree .external-target-kind.node {
+  border-color: color-mix(in srgb, var(--action) 42%, var(--line));
+  background: color-mix(in srgb, var(--action) 10%, transparent);
+  color: var(--action);
+}
+.chain-rule-tree .external-target-trigger.listener-target {
+  border-color: color-mix(in srgb, var(--hue-3) 48%, var(--line));
+  background: color-mix(in srgb, var(--hue-3) 8%, var(--sunk));
+}
+.chain-rule-tree .external-target-trigger.listener-target .external-target-kind,
+.chain-rule-tree .external-target-kind.listener {
+  border-color: color-mix(in srgb, var(--hue-3) 46%, var(--line));
+  background: color-mix(in srgb, var(--hue-3) 11%, transparent);
+  color: var(--hue-3);
+}
+.chain-rule-tree .external-target-trigger[aria-expanded='true'] {
+  border-color: color-mix(in srgb, var(--action) 55%, var(--line));
+  background: color-mix(in srgb, var(--action) 6%, var(--sunk));
+}
+@media (hover: hover) {
+  .chain-rule-tree .external-target-trigger:hover {
+    border-color: color-mix(in srgb, var(--action) 55%, var(--line));
+    background: color-mix(in srgb, var(--action) 6%, var(--sunk));
+  }
+  /* 兜底规则行的目标只读，不跟着悬停变色 */
+  .chain-rule-tree .external-target-trigger.rule-readonly-target:hover {
+    border-color: var(--line);
+    background: var(--sunk);
+  }
+}
+.chain-rule-tree .external-target-kind.external {
+  border-color: color-mix(in srgb, var(--action) 38%, var(--line));
+  background: color-mix(in srgb, var(--action) 9%, transparent);
+  color: var(--action);
+}
+.chain-rule-tree .listener-local-route {
+  display: inline-flex;
+  align-items: center;
+  min-height: 27px;
+  margin-left: 6px;
+  padding: 0 8px;
+  border: 1px solid color-mix(in srgb, var(--hue-3) 34%, var(--line));
+  border-radius: var(--r-ctl);
+  background: color-mix(in srgb, var(--hue-3) 7%, var(--sunk));
+  color: var(--hue-3);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.chain-rule-tree .listener-reference-panel {
+  --listener-panel-accent: var(--hue-3);
+  overflow: hidden;
+  border-color: color-mix(in srgb, var(--listener-panel-accent) 28%, var(--line));
+  background: color-mix(in srgb, var(--listener-panel-accent) 3%, var(--block));
+}
+.chain-rule-tree .listener-reference-panel.hop-target-panel {
+  --listener-panel-accent: var(--action);
+}
+.chain-rule-tree .listener-reference-list {
+  display: grid;
+  gap: 8px;
+}
+.chain-rule-tree .listener-reference-row {
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  grid-template-columns: minmax(210px, 1fr) auto;
+  gap: 7px 18px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--listener-panel-accent) 20%, var(--line-soft));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--sunk) 72%, transparent);
+}
+.chain-rule-tree .listener-reference-row.missing {
+  border-color: color-mix(in srgb, var(--err) 36%, var(--line));
+}
+.chain-rule-tree .listener-reference-row.blocked {
+  border-color: color-mix(in srgb, var(--err) 36%, var(--line));
+  background: color-mix(in srgb, var(--err) 5%, var(--sunk));
+}
+.chain-rule-tree .listener-reference-row.blocked .listener-reference-main small {
+  color: var(--err);
+}
+.chain-rule-tree .listener-reference-row.missing > div {
+  display: grid;
+  gap: 3px;
+}
+.chain-rule-tree .listener-reference-row.missing small {
+  color: var(--err);
+  font-size: 10px;
+}
+.chain-rule-tree .listener-reference-main {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+.chain-rule-tree .listener-reference-copy {
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 2px;
+}
+.chain-rule-tree .listener-reference-main b {
+  overflow: hidden;
+  color: var(--ink-2);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chain-rule-tree .listener-reference-main small {
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chain-rule-tree .listener-reference-facts {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+}
+.chain-rule-tree .listener-reference-facts > span,
+.chain-rule-tree .listener-reference-facts > label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+.chain-rule-tree .listener-reference-facts small {
+  color: var(--ink-4);
+  font-size: 8.5px;
+  font-weight: 400;
+}
+.chain-rule-tree .listener-reference-facts b {
+  color: var(--ink-2);
+  font-size: 10.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.chain-rule-tree .listener-reference-facts select.f {
+  min-width: 98px;
+  height: 27px;
+  font-size: 10.5px;
+}
+.chain-rule-tree .listener-reference-mux > button,
+.chain-rule-tree .hop-target-mux > :is(button, .btn) {
+  flex: none;
+}
+.chain-rule-tree .hop-target-facts {
+  flex-wrap: nowrap;
+}
+.chain-rule-tree .hop-target-panel .hop-target-facts > .hopfld {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+.chain-rule-tree .hop-target-panel .hop-target-facts > .hopfld > small {
+  flex: none;
+  white-space: nowrap;
+}
+.chain-rule-tree .hop-target-facts input.f,
+.chain-rule-tree .hop-target-facts select.f {
+  box-sizing: border-box;
+  height: 27px;
+  font-size: 10.5px;
+}
+.chain-rule-tree .hop-target-facts .hop-target-port {
+  min-width: 82px;
+}
+.chain-rule-tree .hop-target-facts .hop-target-port input.f {
+  width: 82px;
+}
+.chain-rule-tree .hop-target-facts .hop-target-wire {
+  min-width: 178px;
+}
+.chain-rule-tree .hop-target-facts .hop-target-wire select.f {
+  width: 178px;
+}
+.chain-rule-tree .hop-target-facts .hop-target-pool select.f {
+  width: 104px;
+}
+.chain-rule-tree .hop-target-security {
+  position: relative;
+  z-index: 1;
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
+  gap: 8px;
+}
+.chain-rule-tree .hop-target-security > label {
+  display: grid;
+  gap: 3px;
+}
+.chain-rule-tree .hop-target-security small {
+  color: var(--ink-4);
+  font-size: 8.5px;
+}
+.chain-rule-tree .hop-target-security input.f {
+  width: 100%;
+  box-sizing: border-box;
+}
+@container rules (max-width: 820px) {
+  .chain-rule-tree .listener-reference-panel > header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .chain-rule-tree .listener-reference-row,
+  .chain-rule-tree .hop-target-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+    padding: 8px;
+  }
+  .chain-rule-tree .listener-reference-main {
+    width: 100%;
+  }
+  .chain-rule-tree .listener-reference-facts,
+  .chain-rule-tree .hop-target-row .hop-target-facts {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    width: 100%;
+    min-width: 0;
+    justify-content: stretch;
+    gap: 6px;
+    overflow: visible;
+  }
+  .chain-rule-tree .listener-reference-facts > span,
+  .chain-rule-tree .listener-reference-facts > label,
+  .chain-rule-tree .hop-target-panel .hop-target-facts > .hopfld {
+    display: grid;
+    grid-template-columns: 68px minmax(0, 1fr) auto;
+    align-items: center;
+    width: 100%;
+    min-width: 0;
+    gap: 6px;
+  }
+  .chain-rule-tree .listener-reference-facts b {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .chain-rule-tree .listener-reference-facts select.f,
+  .chain-rule-tree .hop-target-facts input.f,
+  .chain-rule-tree .hop-target-facts select.f {
+    width: 100%;
+    min-width: 0;
+  }
+  .chain-rule-tree .hop-target-facts .hop-target-port,
+  .chain-rule-tree .hop-target-facts .hop-target-wire {
+    min-width: 0;
+  }
+  .chain-rule-tree .hop-target-facts .hop-target-port input.f {
+    width: 100%;
+    min-width: 0;
+  }
+  .chain-rule-tree .hop-target-facts .hop-target-wire select.f {
+    width: 100%;
+    min-width: 0;
+  }
+  .chain-rule-tree .hop-target-facts .hop-target-pool select.f {
+    width: 100%;
+    min-width: 0;
+  }
+  .chain-rule-tree .hop-target-security {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (max-width: 620px) {
+  .chain-rule-tree .external-target-picker {
+    width: min(330px, 56vw);
+    min-width: 210px;
+  }
+}
+@media (hover: hover) {
+  .chain-rule-tree .external-target-trigger:hover .external-target-chevron {
+    transform: translate3d(2px, 0, 0);
+  }
+}
+.chain-rule-tree {
+  --violet: #7d5fc4;
+}
+/* 换行发生在单元格内的字段容器里：单元格保持 table-cell，边框与行高才能和匹配、操作两列对齐。 */
+.chain-rule-tree .rule-table .rule-action-fields > * {
+  margin-left: 0 !important;
+}
+.chain-rule-tree .rule-dial-address {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chain-rule-tree .rule-dial-address.is-problem {
+  color: var(--gold);
+}
+@container rules (max-width: 640px) {
+  .chain-rule-tree .rule-dial-address {
+    flex: none;
+  }
+}
+.chain-rule-tree .rule-table > tbody > tr > td {
+  vertical-align: middle;
+}
+.chain-rule-tree .rule-table .rule-action-fields > .external-target-picker {
+  flex: 0 1 270px;
+  min-width: 200px;
+}
+@container rules (max-width: 640px) {
+  .chain-rule-tree .rule-table .rule-action-fields > .external-target-picker {
+    flex: none;
+    min-width: 0;
+  }
+}
+.chain-rule-tree .rule-proxy-row .listener-reference-facts > .btn {
+  margin-left: auto;
+}
+.chain-rule-tree .rule-editor {
+  --ctl-h: 28px;
+}
+.chain-rule-tree .chain-rule-node-head {
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+.chain-rule-tree .rule-editor {
+  padding: 4px 9px 7px;
+}
+.chain-rule-tree .rule-table td {
+  padding: 4px 7px;
+}
+.chain-rule-tree .rule-table :is(select.f, input.f) {
+  height: 28px;
+  min-height: 28px;
+}
+.chain-rule-tree .rule-table input.f {
+  padding: 0 7px;
+}
+.chain-rule-tree .rule-table .btn {
+  height: 26px;
+  min-height: 26px;
+  padding: 0 8px;
+}
+.chain-rule-tree .rule-table .external-target-trigger {
+  min-height: 28px;
+  padding: 2px 8px;
+  gap: 7px;
+}
+.chain-rule-tree .external-target-trigger .external-target-copy {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.chain-rule-tree .external-target-trigger .external-target-copy > :is(b, small) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 名称和地址同在一行：先收地址，地址收完才轮到名称省略。 */
+.chain-rule-tree .external-target-trigger .external-target-copy > b {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.chain-rule-tree .external-target-trigger .external-target-copy > small {
+  flex: 0 1000 auto;
+  min-width: 0;
+}
+.chain-rule-tree .rule-editor .panel {
+  padding: 6px 9px;
+}
+.chain-rule-tree .rule-editor .panel > header {
+  margin-bottom: 5px;
+}
+.chain-rule-tree .listener-reference-list {
+  gap: 6px;
+}
+.chain-rule-tree .listener-reference-row {
+  gap: 5px 16px;
+  padding: 5px 9px;
+}
+.chain-rule-tree .listener-reference-row :is(select.f, input.f) {
+  height: 26px;
+  min-height: 26px;
+}
+.chain-rule-tree .rule-editor .btn.sm {
+  min-height: 26px;
+  padding: 0 9px;
+}
+.chain-rule-tree .rule-editor > .toolbar {
+  margin-top: 6px;
+}
+.chain-rule-tree .rule-editor > .toolbar .btn {
+  min-height: 28px;
+}
+.chain-rule-tree select.f.is-exposed {
+  border-color: color-mix(in srgb, var(--gold) 60%, var(--line));
+}
+.chain-rule-tree .rule-mark {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  color: var(--gold);
+  font-size: 12px;
+  line-height: 1;
+  cursor: help;
+}
+.chain-rule-tree .rule-mark:focus-visible {
+  outline: none;
+  background: var(--gold-wash);
+}
+@media (hover: hover) {
+  .chain-rule-tree .rule-mark:hover {
+    background: var(--gold-wash);
+  }
+}
+.chain-rule-tree .rule-editor > .toolbar:last-child {
+  margin-top: 6px;
+}
+.chain-rule-tree .rule-mark-pill {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 7px;
+  border: 1px solid color-mix(in srgb, var(--gold) 45%, transparent);
+  border-radius: 999px;
+  background: var(--gold-wash);
+  color: var(--gold);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.chain-rule-tree .rule-mark-pill:disabled {
+  cursor: default;
+}
+@container rules (min-width: 641px) and (max-width: 1050px) {
+  .chain-rule-tree .rule-table .rule-match-cell > :is(select.f, .rule-readonly-select) {
+    width: 190px;
+  }
+  .chain-rule-tree .rule-table .rule-match-cell > .f + .f {
+    margin-left: 0;
+    margin-top: 6px;
+  }
+}
+.chain-rule-tree .rule-dial-select {
+  box-sizing: border-box;
+  height: 28px;
+  min-height: 28px;
+  padding: 0 23px 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--sunk) var(--caret) no-repeat right 9px center/9px 6px;
+  color: var(--ink);
+  font: 12px var(--sans);
+  white-space: nowrap;
+  cursor: pointer;
+  flex: none;
+}
+.chain-rule-tree .rule-dial-select > span {
+  overflow: visible;
+}
+@media (hover: hover) {
+  .chain-rule-tree .rule-dial-select:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--action) 45%, var(--line));
+  }
+}
+.chain-rule-tree .rule-ro[disabled] .rule-dial-select {
+  background: var(--sunk);
+  color: var(--ink-2);
+  cursor: default;
+}
+@container rules (min-width: 821px) and (max-width: 1180px) {
+  .chain-rule-tree .listener-reference-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .chain-rule-tree .listener-reference-facts {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+}
+.chain-rule-tree .rule-dns-link {
+  margin-left: 8px;
+  color: var(--action);
+  font-size: 12px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+@media (hover: hover) {
+  .chain-rule-tree .rule-dns-link:hover {
+    text-decoration: underline;
+  }
+}
+.chain-rule-tree .rule-dns-invalid {
+  margin-left: 6px;
+  font-size: 11px;
+}
+.chain-rule-tree .rule-editor > .toolbar > .rule-dns-link {
+  margin: 0 4px 0 0;
+}
+.chain-rule-tree .rule-dial-select {
+  text-align: left;
+}
+/* 明文标记跟在承载协议下拉框后面，手机的「标签 | 控件」两列里也不单独占一行 */
+.chain-rule-tree .hop-target-wire:has(> .rule-mark) {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.chain-rule-tree .rule-ops-cell {
+  width: 120px;
+  text-align: right;
+  white-space: nowrap;
+}
+.chain-rule-tree .rule-dns-invalid {
+  color: var(--err);
+}
+
+/* 拨号菜单：各档带实际地址；最后一项「自定义」本身是输入框 */
+.choice-layer .dialog-surface.choice-menu.rule-dial-menu {
+  width: min(480px, calc(100vw - 20px));
+}
+.choice-layer .rule-dial-menu .rule-dial-custom {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--line-soft);
+}
+.choice-layer .rule-dial-menu .rule-dial-custom.on {
+  border: 1px dashed color-mix(in srgb, var(--action) 55%, transparent);
+  border-radius: 8px;
+  background: var(--action-wash);
+}
+.choice-layer .rule-dial-menu .rule-dial-custom input.f {
+  min-width: 0;
+  height: 28px;
+  font-size: 12px;
+}
+
+/* 行内提醒点开后的小弹层 */
+.dialog-surface.rule-mark-note {
+  max-width: min(320px, calc(100vw - 24px));
+  margin: 0;
+  padding: 10px 12px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.dialog-surface.rule-warp-pop {
+  width: min(380px, calc(100vw - 24px));
+  padding: 12px 14px;
+}
+.rule-warp-pop .warp-registration-action {
+  margin: 0;
+  border: 0;
+  padding: 0;
+  background: none;
+}
+
+/* 本机 DNS 解析策略弹层：标题 + × / 列标题对齐的一行一条 / 底部添加与完成 */
+.dialog-surface.rule-dns-dialog {
+  --ctl-h: 28px;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: min(1080px, calc(100vw - 32px));
+  max-height: min(82vh, 760px);
+  padding: 0;
+  overflow: hidden;
+}
+.rule-dns-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 18px 12px;
+}
+.rule-dns-title {
+  display: grid;
+  flex: 1;
+  gap: 3px;
+  min-width: 0;
+}
+.rule-dns-title b {
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 600;
+}
+.rule-dns-title small {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.rule-dns-close {
+  appearance: none;
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  margin: -2px -4px 0 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+  color: var(--ink-3);
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .rule-dns-close:hover {
+    color: var(--ink);
+  }
+}
+.rule-dns-body {
+  container: dnsdlg / inline-size;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  padding: 0 18px;
+  overflow: auto;
+}
+.rule-dns-fields {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.rule-dns-sheet {
+  display: grid;
+}
+.rule-dns-cols,
+.rule-dns-row {
+  display: grid;
+  grid-template-columns: 26px minmax(200px, 1fr) minmax(170px, 1.1fr) 60px 72px 104px 118px 78px;
+  align-items: center;
+  column-gap: 8px;
+}
+.rule-dns-cols {
+  padding: 0 6px 6px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.rule-dns-row {
+  row-gap: 4px;
+  padding: 6px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.rule-dns-row:last-child {
+  border-bottom: 0;
+}
+.rule-dns-row.is-hit {
+  border-radius: 8px;
+  background: var(--action-wash);
+}
+.rule-dns-group {
+  display: contents;
+}
+.rule-dns-no {
+  color: var(--ink-4);
+  font: 11.5px var(--mono);
+}
+.rule-dns-match {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.rule-dns-kind {
+  flex: none;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.rule-dns-value {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rule-dns-match select.f {
+  flex: none;
+  width: 104px;
+}
+.rule-dns-match input.f {
+  flex: 1;
+  min-width: 0;
+}
+.rule-dns-row :is(input.f, select.f) {
+  box-sizing: border-box;
+  height: 28px;
+  min-height: 28px;
+  font-size: 12px;
+}
+.rule-dns-group > :is(input.f, select.f) {
+  width: 100%;
+}
+.rule-dns-row input.f {
+  padding: 0 8px;
+}
+.rule-dns-row select.f {
+  padding: 0 24px 0 8px;
+}
+.rule-dns-row input.f[aria-invalid='true'] {
+  border-color: color-mix(in srgb, var(--err) 70%, transparent);
+  background-color: color-mix(in srgb, var(--err) 6%, var(--sunk));
+}
+.rule-dns-ops {
+  display: inline-flex;
+  justify-content: flex-end;
+  gap: 2px;
+}
+.rule-dns-ops button {
+  appearance: none;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-3);
+  font-size: 13px;
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .rule-dns-ops button:hover:not(:disabled) {
+    background: var(--hover-2);
+    color: var(--ink);
+  }
+  .rule-dns-ops button.danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--err) 12%, transparent);
+    color: var(--err);
+  }
+}
+.rule-dns-ops button:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+.rule-dns-issue {
+  grid-column: 2 / -1;
+  color: var(--err);
+  font-size: 11.5px;
+}
+.rule-dns-add-actions {
+  display: flex;
+  grid-column: 3 / -1;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+.rule-dns-add-actions > .rule-dns-issue {
+  grid-column: auto;
+}
+.rule-dns-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 18px 14px;
+  border-top: 1px solid var(--line-soft);
+}
+.rule-dns-foot .sp {
+  flex: 1;
+}
+.rule-dns-fields[disabled] :is(input.f, select.f) {
+  color: var(--ink-2);
+  background-color: var(--sunk);
+  cursor: default;
+}
+.rule-dns-empty {
+  margin: 8px 0 14px;
+  color: var(--ink-3);
+  font-size: 12.5px;
+}
+/* 窄屏：每条策略一张小卡——序号与操作一行，匹配一行，地址:端口一行，三个选项按内容宽度排一行 */
+@container dnsdlg (max-width: 900px) {
+  .rule-dns-cols {
+    display: none;
+  }
+  .rule-dns-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px;
+    padding: 10px 2px;
+  }
+  .rule-dns-no {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .rule-dns-ops {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .rule-dns-match,
+  .rule-dns-group,
+  .rule-dns-issue,
+  .rule-dns-add-actions {
+    grid-column: 1 / -1;
+  }
+  .rule-dns-group {
+    display: flex;
+    gap: 6px;
+    min-width: 0;
+  }
+  .rule-dns-addr > input.f:first-child {
+    flex: 1;
+    min-width: 0;
+  }
+  .rule-dns-addr > input.f:last-child {
+    flex: none;
+    width: 64px;
+  }
+  .rule-dns-opts > select.f {
+    flex: 0 1 auto;
+    width: auto;
+    min-width: 0;
   }
 }

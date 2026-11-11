@@ -16,7 +16,7 @@ import {
   XRAY_HANDOFF_PROTOCOL_VERSION,
   XRAY_HANDOFF_RESTART_FALLBACK_PROTOCOL_VERSION,
 } from '../api';
-import { Confirm, ErrorBox } from '../ui/bits';
+import { Confirm, ErrorBox, SegSwitch } from '../ui/bits';
 import { randomKey } from '../ui/platform';
 import { BinaryReleaseHistory } from './binary-release-history';
 import { BINARY_TARGET_STATUS } from '../ui/binary-release-status';
@@ -97,6 +97,8 @@ type BinaryState = 'current' | 'behind' | 'blocked';
 /** 二进制发布共用数据、勾选和操作；页头与页签内容读取同一份状态。 */
 export function useBinaryRelease(component: BinaryComponent) {
   const qc = useQueryClient();
+  const [agentFlavor, setAgentFlavor] = useState<'base' | 'cvm'>('base');
+  const [allowFlavorChange, setAllowFlavorChange] = useState(false);
   const releases = useQuery({
     queryKey: ['binary-releases', component],
     queryFn: async () => {
@@ -149,7 +151,12 @@ export function useBinaryRelease(component: BinaryComponent) {
     drainSeconds >= 10 &&
     drainSeconds <= 86_400;
 
-  const view = releases.data;
+  const effectiveFlavor = releases.data?.current?.active
+    ? (releases.data.current.agent_flavor ?? agentFlavor)
+    : agentFlavor;
+  const available =
+    releases.data?.available_variants?.find(item => item.agent_flavor === effectiveFlavor) ?? releases.data?.available;
+  const view = releases.data && available ? { ...releases.data, available } : undefined;
   const fleet = nodes.data?.nodes ?? [];
   const latest = view?.current;
   const active = latest?.active ? latest : undefined;
@@ -158,7 +165,16 @@ export function useBinaryRelease(component: BinaryComponent) {
     baseEligible(node, component) &&
     view.available.artifacts.some(artifact => artifact.sha256 === runningHash(node, component));
   const stateOf = (node: NodeAgentStateItem): BinaryState =>
-    onThisBuild(node) ? 'current' : eligible(node, component, xrayStrategy) ? 'behind' : 'blocked';
+    onThisBuild(node)
+      ? 'current'
+      : eligible(node, component, xrayStrategy) &&
+          (component !== 'agent' ||
+            (node.runtime_versions?.agent_flavor ?? 'base') === effectiveFlavor ||
+            (allowFlavorChange &&
+              effectiveFlavor === 'cvm' &&
+              (node.runtime_versions?.agent_flavor ?? 'base') === 'base'))
+        ? 'behind'
+        : 'blocked';
   const targets = new Map((active?.targets ?? []).map(target => [target.node_id, target]));
   const states = fleet.map(node => ({ node, state: stateOf(node), target: targets.get(node.node_id) }));
   const outside = states.filter(item => !item.target);
@@ -184,7 +200,7 @@ export function useBinaryRelease(component: BinaryComponent) {
         throw new Error('排空等待须为 10–86400 秒的整数。');
       return createBinaryRelease(component, {
         idempotency_key: idempotencyKey,
-        build_id: releases.data!.available.build_id,
+        build_id: view!.available.build_id,
         nodes: selected,
         note: null,
         ...(component === 'xray'
@@ -192,7 +208,7 @@ export function useBinaryRelease(component: BinaryComponent) {
               xray_strategy: xrayStrategy,
               ...(xrayStrategy === 'restart' ? {} : { xray_drain_timeout_secs: drainSeconds }),
             }
-          : {}),
+          : { agent_flavor: effectiveFlavor, allow_flavor_change: allowFlavorChange }),
       });
     },
     onSuccess: async view => {
@@ -217,6 +233,10 @@ export function useBinaryRelease(component: BinaryComponent) {
 
   return {
     component,
+    agentFlavor: effectiveFlavor,
+    setAgentFlavor,
+    allowFlavorChange,
+    setAllowFlavorChange,
     releases,
     nodes,
     ready: !!view && !!nodes.data && (component !== 'xray' || !!settings.data),
@@ -411,6 +431,34 @@ export function BinaryReleaseTab({
 
   return (
     <>
+      {release.component === 'agent' && (view.available_variants?.length ?? 0) > 1 && (
+        <div className="nd-tools">
+          <SegSwitch
+            checked={release.agentFlavor === 'cvm'}
+            disabled={busy || !!active}
+            off="基础版 Agent"
+            on="容器版 Agent"
+            ariaLabel="Agent 产品版本"
+            onChange={cvm => {
+              release.setAgentFlavor(cvm ? 'cvm' : 'base');
+              setSelected([]);
+            }}
+          />
+          <label>
+            <input
+              type="checkbox"
+              checked={release.allowFlavorChange}
+              disabled={busy || !!active}
+              onChange={event => {
+                release.setAllowFlavorChange(event.target.checked);
+                setSelected([]);
+              }}
+            />{' '}
+            允许基础版机器升级为容器版
+          </label>
+        </div>
+      )}
+
       {ledger}
       {unavailableBuild && (
         <section className="cgc-main cgc-span">

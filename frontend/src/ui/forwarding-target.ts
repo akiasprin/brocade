@@ -117,15 +117,29 @@ const NETWORKS = BLOCKED_TARGET_CIDRS.map(cidr => {
   };
 });
 
-/** 与 Rust `target_ip_is_blocked` 相同：IPv4 映射的 IPv6 先还原成 IPv4 再比对。 */
-export function blockedAddress(host: string, allowPrivateTargets = false): boolean {
+function addressBytes(host: string): number[] | null {
   const bare = bareHost(host);
   let bytes = ipv4Bytes(bare) ?? ipv6Bytes(bare);
-  if (!bytes) return false;
+  if (!bytes) return null;
   if (bytes.length === 16 && bytes.slice(0, 10).every(byte => byte === 0) && bytes[10] === 0xff && bytes[11] === 0xff) {
     bytes = bytes.slice(12);
   }
-  const address = bytes;
+  return bytes;
+}
+
+/** 链路本地地址缺少客户端接口作用域，不能直接作为普通 SSH 或发布入口。 */
+export function isLinkLocalAddress(host: string): boolean {
+  const bytes = addressBytes(host);
+  return (
+    !!bytes &&
+    (bytes.length === 4 ? bytes[0] === 169 && bytes[1] === 254 : bytes[0] === 0xfe && (bytes[1] & 0xc0) === 0x80)
+  );
+}
+
+/** 与 Rust `target_ip_is_blocked` 相同：IPv4 映射的 IPv6 先还原成 IPv4 再比对。 */
+export function blockedAddress(host: string, allowPrivateTargets = false): boolean {
+  const address = addressBytes(host);
+  if (!address) return false;
   return NETWORKS.some(
     network =>
       !(allowPrivateTargets && network.private) &&

@@ -214,6 +214,22 @@ const FRONTEND_WATCHED: &[&str] = &[
     "frontend/tsconfig.json",
 ];
 
+fn agent_flavors() -> &'static [&'static str] {
+    if env::var_os("CARGO_FEATURE_CVM").is_some() {
+        &["base", "cvm"]
+    } else {
+        &["base"]
+    }
+}
+
+fn flavor_override_var(arch: &str, flavor: &str) -> String {
+    if flavor == "base" {
+        override_var(arch)
+    } else {
+        format!("BROCADE_CVM_AGENT_BIN_{}", arch.to_ascii_uppercase())
+    }
+}
+
 fn main() {
     let workspace = workspace_root();
     // Changed agent source has to rebuild, and what must be watched is the whole dependency chain
@@ -261,7 +277,16 @@ fn main() {
             xray_override_var(target.arch)
         );
         println!("cargo:rerun-if-env-changed={}", cc_var(target.triple));
-        if env_set(&override_var(target.arch)) {
+        for flavor in agent_flavors() {
+            println!(
+                "cargo:rerun-if-env-changed={}",
+                flavor_override_var(target.arch, flavor)
+            );
+        }
+        if agent_flavors()
+            .iter()
+            .all(|flavor| env_set(&flavor_override_var(target.arch, flavor)))
+        {
             continue;
         }
         // Whether the target is installed is checked first. Without it, what gets reported is a
@@ -345,35 +370,46 @@ fn main() {
         );
     }
 
-    build_agents(&workspace, zig.as_deref());
-
-    for target in TARGETS {
-        let built = match env::var(override_var(target.arch)) {
-            // For cross-compiling with another toolchain, or embedding a file that already
-            // exists. It goes through the sha computation below all the same — which cannot
-            // guarantee the architecture is right, but does guarantee the bytes served and the sha
-            // reported are one and the same.
-            Ok(path) if !path.trim().is_empty() => {
-                let path = PathBuf::from(path.trim());
-                // Watch the file itself, not merely the environment variable's value. Where the
-                // path is unchanged and the file is replaced (rebuilding an agent over it, which
-                // is exactly what an upgrade does), `rerun-if-env-changed` alone notices nothing:
-                // build.rs does not re-run and the embedded bytes are still the previous version.
-                // The same class of failure as missing brocade-core above, and equally silent.
-                println!("cargo:rerun-if-changed={}", path.display());
-                path
-            }
-            _ => agent_build::target_dir(&workspace)
-                .join(target.triple)
-                .join("release/brocade-agent"),
-        };
-        embed_binary(
-            &out_dir,
-            &built,
-            "brocade-agent",
-            target.arch,
-            "BROCADE_EMBEDDED_AGENT_SHA256",
-        );
+    for flavor in agent_flavors() {
+        build_agents(&workspace, zig.as_deref(), flavor);
+        for target in TARGETS {
+            let built = match env::var(flavor_override_var(target.arch, flavor)) {
+                Ok(path) if !path.trim().is_empty() => {
+                    let path = PathBuf::from(path.trim());
+                    println!("cargo:rerun-if-changed={}", path.display());
+                    path
+                }
+                _ => agent_build::flavor_target_dir(&workspace, flavor)
+                    .join(target.triple)
+                    .join("release/brocade-agent"),
+            };
+            let bytes = fs::read(&built).expect("cannot read Agent artifact");
+            let marker = format!("brocade-agent-product:{flavor}:v1");
+            assert!(
+                bytes
+                    .windows(marker.len())
+                    .any(|part| part == marker.as_bytes()),
+                "Agent artifact does not declare the expected product flavor: {}",
+                built.display()
+            );
+            let machine = if target.arch == "aarch64" {
+                183u16
+            } else {
+                62u16
+            };
+            assert!(
+                bytes.starts_with(b"\x7fELF\x02\x01")
+                    && bytes.get(18..20) == Some(&machine.to_le_bytes()),
+                "Agent artifact architecture does not match {}",
+                target.arch
+            );
+            let (name, prefix) = if *flavor == "base" {
+                ("brocade-agent", "BROCADE_EMBEDDED_AGENT_SHA256")
+            } else {
+                ("brocade-agent-cvm", "BROCADE_EMBEDDED_CVM_AGENT_SHA256")
+            };
+            embed_binary(&out_dir, &built, name, target.arch, prefix);
+        }
     }
 }
 
@@ -677,31 +713,29 @@ fn target_installed(triple: &str) -> bool {
         .is_dir()
 }
 
-fn build_agents(workspace: &Path, zig: Option<&Path>) {
+fn build_agents(workspace: &Path, zig: Option<&Path>, flavor: &str) {
     let targets = TARGETS
         .iter()
-        .filter(|target| !env_set(&override_var(target.arch)))
+        .filter(|target| !env_set(&flavor_override_var(target.arch, flavor)))
         .collect::<Vec<_>>();
     if targets.is_empty() {
         return;
     }
-    let cache = agent_build::target_dir(workspace);
+    let cache = agent_build::flavor_target_dir(workspace, flavor);
     fs::create_dir_all(&cache).expect("cannot create persistent Agent build cache");
     let triples = targets
         .iter()
         .map(|target| target.triple)
         .collect::<Vec<_>>();
-    let mut command = agent_build::command(workspace, &cache, &triples);
+    let mut command = agent_build::flavor_command(workspace, &cache, &triples, flavor);
     for target in targets {
-        if let Some(flags) = target.linker {
-            command.env(
-                format!(
-                    "CARGO_TARGET_{}_RUSTFLAGS",
-                    target.triple.to_uppercase().replace('-', "_")
-                ),
-                flags,
-            );
-        }
+        command.env(
+            format!(
+                "CARGO_TARGET_{}_RUSTFLAGS",
+                target.triple.to_uppercase().replace('-', "_")
+            ),
+            agent_build::rustflags(workspace, target.linker),
+        );
         if let (Some(zig), false) = (zig, env_set(&cc_var(target.triple))) {
             let (cc, ar) = zig_wrapper(&cache, target, zig);
             command
@@ -785,6 +819,10 @@ fn describe_build(workspace: &Path) {
     println!("cargo:rustc-env=BROCADE_CONSOLE_COMMIT={described}");
     println!(
         "cargo:rustc-env=BROCADE_AGENT_SOURCE_REVISION={}",
+        source_revision::base_agent_source_revision(workspace)
+    );
+    println!(
+        "cargo:rustc-env=BROCADE_CVM_AGENT_SOURCE_REVISION={}",
         source_revision::agent_source_revision(workspace)
     );
     println!(
@@ -923,6 +961,14 @@ fn build_frontend(out_dir: &Path, npm: &Path) -> PathBuf {
     let dist = out_dir.join("console-dist");
     run(
         Command::new(npm)
+            .env(
+                "BROCADE_PRODUCT_FLAVOR",
+                if env::var_os("CARGO_FEATURE_CVM").is_some() {
+                    "cvm"
+                } else {
+                    "base"
+                },
+            )
             .args(["run", "build", "--", "--outDir"])
             .arg(&dist)
             // vite refuses to clear an outDir outside its root unless told to. Without clearing,
@@ -949,6 +995,26 @@ fn embed_console(out_dir: &Path, npm: Option<&Path>) {
         _ => build_frontend(out_dir, npm.expect("没有 npm 的话前面就 panic 了")),
     };
 
+    let expected_flavor = if env::var_os("CARGO_FEATURE_CVM").is_some() {
+        "cvm"
+    } else {
+        "base"
+    };
+    let product: serde_json::Value = serde_json::from_slice(
+        &fs::read(dist.join("brocade-product.json"))
+            .expect("frontend product manifest is required"),
+    )
+    .expect("frontend product manifest must be valid JSON");
+    assert_eq!(
+        product["flavor"].as_str(),
+        Some(expected_flavor),
+        "frontend and Console product flavors must match"
+    );
+    assert_eq!(
+        product["features"]["cvm"].as_bool(),
+        Some(expected_flavor == "cvm"),
+        "frontend capabilities must match Console"
+    );
     let mut files = Vec::new();
     collect_files(&dist, &dist, &mut files);
     // read_dir's order is whatever the filesystem says, and an embedded table that reorders between

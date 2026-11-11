@@ -1,3 +1,4 @@
+import { TitleActions } from '../ui/title-actions';
 import { lazy } from '../ui/lazy';
 import { Fragment, Suspense, useMemo, useState, useSyncExternalStore } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -201,9 +202,13 @@ function TunnelList({ go }: { go: (drill: Drill) => void }) {
           <ListIcon of="tunnels" />
           <h4>隧道</h4>
           <span className="sp" />
-          <button className="btn primary" disabled={!editable || !tenantId} onClick={() => setCreate('scope')}>
-            ＋ 新建隧道
-          </button>
+          <TitleActions
+            primary={
+              <button className="btn primary" disabled={!editable || !tenantId} onClick={() => setCreate('scope')}>
+                ＋ 新建隧道
+              </button>
+            }
+          />
         </header>
 
         <div className="chain-sections">
@@ -737,19 +742,23 @@ function WarpTunnelDetail({
             </div>
           </div>
 
-          <div className="nd-acts">
-            {primaryAction && (
-              <button className="btn primary" type="button" onClick={primaryAction.onClick}>
-                {primaryAction.label}
-              </button>
-            )}
+          <TitleActions
+            className="nd-acts"
+            primary={
+              primaryAction && (
+                <button className="btn primary" type="button" onClick={primaryAction.onClick}>
+                  {primaryAction.label}
+                </button>
+              )
+            }
+          >
             <button className="btn" type="button" disabled={!editable} onClick={onEdit}>
               编辑
             </button>
             <button className="btn danger" type="button" disabled={!editable} onClick={onDelete}>
               删除
             </button>
-          </div>
+          </TitleActions>
         </header>
 
         <div className="nd-paper-body cg-body">
@@ -1306,14 +1315,14 @@ function TunnelDetail({ tunnelId }: { tunnelId: string }) {
               </span>
             </div>
           </div>
-          <div className="nd-acts">
+          <TitleActions className="nd-acts">
             <button className="btn" type="button" disabled={!editable} onClick={() => setEditing(true)}>
               编辑
             </button>
             <button className="btn danger" type="button" disabled={!editable} onClick={() => setDeleting(true)}>
               删除
             </button>
-          </div>
+          </TitleActions>
         </header>
 
         <div className="nd-paper-body tnd-body">

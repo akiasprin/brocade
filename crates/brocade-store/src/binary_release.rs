@@ -2,6 +2,7 @@
 //! The approval freezes scope and digests. Attempts retain their evidence across retries;
 //! component-specific executors and health checks remain separate. No historical bytes live here.
 
+use brocade_deployment::product::ProductFlavor;
 use std::collections::{BTreeMap, BTreeSet};
 
 use brocade_deployment::protocol::{
@@ -65,6 +66,9 @@ pub struct BinaryBuildInfo<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateBinaryReleaseRequest {
+    pub agent_flavor: Option<ProductFlavor>,
+    #[serde(default)]
+    pub allow_flavor_change: bool,
     pub idempotency_key: String,
     pub build_id: String,
     pub nodes: Vec<String>,
@@ -186,6 +190,8 @@ pub struct BinaryReleaseAttempt {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BinaryRelease {
+    pub agent_flavor: Option<ProductFlavor>,
+    pub allow_flavor_change: bool,
     pub id: i64,
     pub component: BinaryComponent,
     pub build_id: String,
@@ -233,6 +239,7 @@ pub struct BinaryReleaseSummary {
 /// Store-side assignment. Console adds the URL because only it knows the public agent origin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryReleaseAssignment {
+    pub agent_flavor: Option<ProductFlavor>,
     pub release_id: i64,
     pub attempt: u32,
     pub version: String,
@@ -246,6 +253,7 @@ pub struct BinaryReleaseAssignment {
 struct BinaryReleaseObservation {
     installed_sha256: String,
     running_sha256: Option<String>,
+    agent_flavor: Option<ProductFlavor>,
     agent_protocol_version: Option<u32>,
     xray_handoff_ready: bool,
     xray_disabled: bool,
@@ -488,7 +496,18 @@ pub async fn create_binary_release(
             "binary release idempotency_key must contain 1 to 200 characters".to_owned(),
         ));
     }
-    let artifacts = artifacts_json(build.artifacts);
+    if (component == BinaryComponent::Agent) != request.agent_flavor.is_some()
+        || (component != BinaryComponent::Agent && request.allow_flavor_change)
+    {
+        return Err(StoreError::InvalidData(
+            "Agent product flavor must be explicit and applies only to Agent releases".into(),
+        ));
+    }
+    let artifacts = serde_json::json!({
+        "files": artifacts_json(build.artifacts),
+        "agent_flavor": request.agent_flavor,
+        "allow_flavor_change": request.allow_flavor_change,
+    });
 
     let mut tx = pool.begin().await?;
     // The partial unique index is the final invariant; this lock turns a concurrent create into a
@@ -500,7 +519,7 @@ pub async fn create_binary_release(
         .execute(&mut *tx)
         .await?;
     if let Some(existing) = sqlx::query(
-        "SELECT id, build_id, version, note, xray_strategy, xray_drain_timeout_seconds
+        "SELECT id, build_id, version, artifacts, note, xray_strategy, xray_drain_timeout_seconds
            FROM binary_releases WHERE idempotency_key = $1 AND component = $2",
     )
     .bind(&idempotency_key)
@@ -536,6 +555,7 @@ pub async fn create_binary_release(
                 .transpose()?
                 != xray_drain_timeout_secs
             || existing_nodes != nodes
+            || existing.try_get::<serde_json::Value, _>("artifacts")? != artifacts
         {
             return Err(StoreError::Conflict(
                 "binary release idempotency_key already belongs to another request".to_owned(),
@@ -570,6 +590,21 @@ pub async fn create_binary_release(
     let observations = release_observations(&mut tx, component, &nodes).await?;
     for node_id in &nodes {
         let observation = &observations[node_id];
+        if component == BinaryComponent::Agent {
+            // Agents predating product identities belong to the base upgrade path.
+            let running_flavor = observation.agent_flavor.unwrap_or(ProductFlavor::Base);
+            if Some(running_flavor) != request.agent_flavor {
+                if !request.allow_flavor_change {
+                    return Err(StoreError::Conflict(
+                        "Agent release does not authorize a product flavor change".into(),
+                    ));
+                }
+                // Downgrade must inspect the stopped executor's exclusive durable state.
+                if request.agent_flavor == Some(ProductFlavor::Base) {
+                    return Err(StoreError::Conflict("CVM Agent downgrade requires draining the node and using the stopped-node installer".into()));
+                }
+            }
+        }
         if component == BinaryComponent::Xray
             && !observation.xray_disabled
             && xray_strategy != Some(XrayReleaseStrategy::Restart)
@@ -752,6 +787,28 @@ pub async fn retry_binary_release_target(
     let mut tx = pool.begin().await?;
     let row = lock_release(&mut tx, component, release_id).await?;
     ensure_actionable_release(&row, release_id, available_build_id)?;
+    // Reinstalling outside this attempt can leave the desired bytes running without its
+    // replacement receipt. A new attempt cannot recreate that historical evidence.
+    if component == BinaryComponent::Agent
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM binary_release_targets
+                 WHERE release_id = $1 AND node_id = $2 AND status = 'unverified'
+                   AND reported_performed_update IS FALSE
+                   AND reported_installed_sha256 = desired_sha256
+                   AND reported_running_sha256 = desired_sha256
+            )",
+        )
+        .bind(release_id)
+        .bind(node_id)
+        .fetch_one(&mut *tx)
+        .await?
+    {
+        return Err(StoreError::Conflict(
+            "Agent 已运行目标字节，重试无法补建本次替换回执；请保留历史并停止本次发布，后续升级另建发布单"
+                .to_owned(),
+        ));
+    }
     let strategy = release_strategy(
         row.try_get::<Option<String>, _>("xray_strategy")?
             .as_deref(),
@@ -857,6 +914,27 @@ pub async fn claim_binary_release(
     available_build_id: &str,
     receipt_capable: bool,
 ) -> Result<Option<BinaryReleaseAssignment>> {
+    claim_binary_release_for_flavor(
+        pool,
+        component,
+        node_id,
+        arch,
+        available_build_id,
+        receipt_capable,
+        (component == BinaryComponent::Agent).then_some(ProductFlavor::Base),
+    )
+    .await
+}
+
+pub(crate) async fn claim_binary_release_for_flavor(
+    pool: &PgPool,
+    component: BinaryComponent,
+    node_id: &str,
+    arch: &str,
+    available_build_id: &str,
+    receipt_capable: bool,
+    running_flavor: Option<ProductFlavor>,
+) -> Result<Option<BinaryReleaseAssignment>> {
     if arch.is_empty()
         || arch.len() > 32
         || !arch
@@ -896,6 +974,20 @@ pub async fn claim_binary_release(
     if row.try_get::<String, _>("build_id")? != available_build_id {
         tx.commit().await?;
         return Ok(None);
+    }
+    let manifest: serde_json::Value = row.try_get("artifacts")?;
+    let (target_flavor, allow_flavor_change) = manifest_options(&manifest)?;
+    if component == BinaryComponent::Agent && running_flavor != target_flavor {
+        if !allow_flavor_change {
+            return Err(StoreError::Conflict(
+                "Agent release does not authorize a product flavor change".into(),
+            ));
+        }
+        if target_flavor == Some(ProductFlavor::Base) {
+            return Err(StoreError::Conflict(
+                "CVM Agent downgrade requires the stopped-node installer".into(),
+            ));
+        }
     }
     let artifacts = parse_artifacts(row.try_get("artifacts")?)?;
     let Some(artifact) = artifacts.iter().find(|artifact| artifact.arch == arch) else {
@@ -941,6 +1033,7 @@ pub async fn claim_binary_release(
     .execute(&mut *tx)
     .await?;
     let assignment = BinaryReleaseAssignment {
+        agent_flavor: target_flavor,
         release_id,
         attempt: u32::try_from(row.try_get::<i32, _>("attempt")?)
             .map_err(|_| invalid_number("attempt"))?,
@@ -1321,7 +1414,13 @@ async fn load_binary_release(
                 (status = 'dispatched'
                     AND dispatched_at <= now() - make_interval(mins => $2)
                 ) AS execution_timed_out,
-                (target.attempt < 32 AND NOT (
+                (target.attempt < 32 AND NOT COALESCE(
+                    $4 AND target.status = 'unverified'
+                    AND target.reported_performed_update IS FALSE
+                    AND target.reported_installed_sha256 = target.desired_sha256
+                    AND target.reported_running_sha256 = target.desired_sha256,
+                    FALSE
+                ) AND NOT (
                     $3
                     AND EXISTS (
                         SELECT 1 FROM node_agent_state AS state
@@ -1342,6 +1441,7 @@ async fn load_binary_release(
     .bind(id)
     .bind(execution_timeout_minutes)
     .bind(block_active_handoff)
+    .bind(component == BinaryComponent::Agent)
     .fetch_all(pool)
     .await?;
     let event_rows = if include_events {
@@ -1360,7 +1460,11 @@ async fn load_binary_release(
     } else {
         None
     };
+    let (agent_flavor, allow_flavor_change) =
+        manifest_options(&row.try_get::<serde_json::Value, _>("artifacts")?)?;
     Ok(BinaryRelease {
+        agent_flavor,
+        allow_flavor_change,
         id: row.try_get("id")?,
         component,
         build_id: row.try_get("build_id")?,
@@ -1507,6 +1611,7 @@ async fn release_observations(
         "SELECT n.id, lifecycle.phase, state.agent_protocol_version,
                 EXISTS(SELECT 1 FROM node_applied_state applied WHERE applied.node_id=n.id AND applied.xray_state='disabled') AS xray_disabled,
                 state.runtime_versions->>'agent' AS agent_running_sha256,
+                state.runtime_versions->>'agent_flavor' AS agent_flavor,
                 state.runtime_versions->>'xray_installed_sha256' AS xray_installed_sha256,
                 state.runtime_versions->>'xray_running_sha256' AS xray_running_sha256,
                 COALESCE(state.runtime_versions->'xray_handoff'->>'state' = 'ready', FALSE)
@@ -1581,6 +1686,14 @@ async fn release_observations(
             BinaryReleaseObservation {
                 installed_sha256: sha,
                 running_sha256: running,
+                agent_flavor: row
+                    .try_get::<Option<String>, _>("agent_flavor")?
+                    .map(|value| {
+                        value.parse::<ProductFlavor>().map_err(|_| {
+                            StoreError::InvalidData("node reported an invalid Agent flavor".into())
+                        })
+                    })
+                    .transpose()?,
                 agent_protocol_version: row
                     .try_get::<Option<i32>, _>("agent_protocol_version")?
                     .map(|value| {
@@ -1716,8 +1829,20 @@ fn artifacts_json(artifacts: &[BinaryReleaseArtifact]) -> serde_json::Value {
     )
 }
 
+fn manifest_options(value: &serde_json::Value) -> Result<(Option<ProductFlavor>, bool)> {
+    let flavor =
+        serde_json::from_value(value.get("agent_flavor").cloned().ok_or_else(|| {
+            StoreError::InvalidData("release product identity is missing".into())
+        })?)?;
+    let allow = value
+        .get("allow_flavor_change")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| StoreError::InvalidData("release flavor-change intent is missing".into()))?;
+    Ok((flavor, allow))
+}
+
 fn parse_artifacts(value: serde_json::Value) -> Result<Vec<BinaryReleaseArtifact>> {
-    let object = value.as_object().ok_or_else(|| {
+    let object = value.get("files").and_then(serde_json::Value::as_object).ok_or_else(|| {
         StoreError::InvalidData("binary release artifacts are not an object".to_owned())
     })?;
     let mut artifacts = object
@@ -1839,7 +1964,10 @@ mod tests {
             "x86_64": "a".repeat(64),
             "aarch64": "b".repeat(64),
         });
-        let parsed = parse_artifacts(value).unwrap();
+        let parsed = parse_artifacts(
+            serde_json::json!({"files":value,"agent_flavor":"base","allow_flavor_change":false}),
+        )
+        .unwrap();
         assert_eq!(parsed[0].arch, "aarch64");
         assert_eq!(parsed[1].arch, "x86_64");
     }

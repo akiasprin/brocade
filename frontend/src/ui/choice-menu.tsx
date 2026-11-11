@@ -11,6 +11,7 @@ import {
 } from 'react';
 import { DialogLayer } from './dialog';
 import { useNarrow } from './viewport';
+import { Icon } from './icons';
 
 type OptionProps = {
   value?: string | number;
@@ -201,7 +202,7 @@ export function ActionMenu({
         aria-expanded={open}
         onClick={() => setOpen(true)}
       >
-        ⋯
+        <Icon of="more" size={14} />
       </button>
       {open && (
         <MenuLayer anchor={anchor} label={label} action onClose={() => setOpen(false)}>

@@ -177,6 +177,11 @@ pub(crate) fn selfupdate_cycle(options: &Options) -> Result<bool, String> {
         sha256: offer.sha256.clone(),
     };
     let guard = || {
+        if offer.flavor == brocade_deployment::product::ProductFlavor::Base
+            && offer.flavor != identity::self_flavor()
+        {
+            crate::product::ensure_base_ready(&options.state_dir)?;
+        }
         if let Some(previous) = &offer.previous_sha256 {
             if previous != running || file_sha256_hex(&target)? != *previous {
                 return Err("Agent 本地摘要已偏离批准时状态，未替换".to_owned());
@@ -198,7 +203,14 @@ pub(crate) fn selfupdate_cycle(options: &Options) -> Result<bool, String> {
         }
         Ok(())
     };
-    let outcome = install_release(&source, &offer.sha256, &download, &target, guard);
+    let outcome = install_release(
+        &source,
+        &offer.sha256,
+        &download,
+        &target,
+        offer.flavor,
+        guard,
+    );
     let _ = fs::remove_file(&download);
     if let Err(error) = outcome {
         if tracked && file_sha256_hex(&target).ok().as_deref() == Some(&offer.sha256) {
@@ -239,6 +251,7 @@ fn fetch_offer(options: &Options) -> Result<Option<AgentReleaseOffer>, String> {
         None,
         &[
             (ARCH_HEADER, identity::self_arch().to_owned()),
+            ("x-brocade-flavor", identity::self_flavor().to_string()),
             ("x-brocade-agent-release-receipt", "1".to_owned()),
         ],
     )?;
@@ -261,6 +274,9 @@ fn valid_digest(sha: &str) -> bool {
 }
 
 fn validate_offer(offer: &AgentReleaseOffer) -> Result<(), String> {
+    if offer.flavor != identity::self_flavor() && !offer.allow_flavor_change {
+        return Err("Agent 发布未明确允许切换产品变体".into());
+    }
     if !valid_digest(&offer.sha256) {
         return Err("Agent 目标摘要无效".to_owned());
     }
@@ -269,7 +285,7 @@ fn validate_offer(offer: &AgentReleaseOffer) -> Result<(), String> {
         offer.attempt,
         offer.previous_sha256.as_deref(),
     ) {
-        (None, None, None) => Ok(()), // old Console
+        (None, None, None) => Err("Agent 发布缺少工单身份".into()),
         (Some(id), Some(attempt), Some(before))
             if id > 0 && (1..=32).contains(&attempt) && valid_digest(before) =>
         {
@@ -381,6 +397,7 @@ fn install_release(
     wanted: &str,
     download: &Path,
     target: &Path,
+    flavor: brocade_deployment::product::ProductFlavor,
     before_replace: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     fetch(&release.url, download)?;
@@ -398,7 +415,7 @@ fn install_release(
     // installed binary's mode will be — testing it under a different mode tests something else.
     fs::set_permissions(download, permissions(0o755))
         .map_err(|error| format!("给候选 agent 加执行位失败: {error}"))?;
-    probe(download)?;
+    probe_flavor(download, flavor)?;
 
     // Staged beside the target rather than renamed from the state directory: `rename` cannot cross
     // filesystems, and `/var/lib` and `/usr/local/bin` are routinely on different ones.
@@ -455,60 +472,36 @@ fn fetch(url: &str, into: &Path) -> Result<(), String> {
     .map_err(|error| format!("下载 agent 失败：{error}"))
 }
 
-/// Run the candidate once, before it replaces anything.
-///
-/// Prefer the stable, read-only self-test. Older releases predate that command, so the
-/// compatibility probe only requires their usage to name the daemon command, independent of
-/// the prose or language surrounding it. The installer uses the same two-step contract.
-fn probe(candidate: &Path) -> Result<(), String> {
-    let candidate = candidate.to_string_lossy();
-    let output = capture_command_with_timeout(&candidate, &["self-test"], Duration::from_secs(10))
-        .map_err(|error| format!("候选 agent 自检无法执行：{error}"))?;
-    if output.status.success()
-        && String::from_utf8_lossy(&output.stdout)
+/// Run the exact candidate and verify its product and machine identity before replacement.
+fn probe_flavor(
+    candidate: &Path,
+    flavor: brocade_deployment::product::ProductFlavor,
+) -> Result<(), String> {
+    let candidate = candidate
+        .to_str()
+        .ok_or("Agent candidate path is not UTF-8")?;
+    let output = capture_command_with_timeout(candidate, &["self-test"], Duration::from_secs(10))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let identity: Option<serde_json::Value> = stdout
+        .lines()
+        .find_map(|line| serde_json::from_str(line).ok());
+    if !output.status.success()
+        || !stdout
             .lines()
-            .any(|line| line.trim() == brocade_deployment::protocol::AGENT_SELF_TEST_RESPONSE)
+            .any(|line| line == brocade_deployment::protocol::AGENT_SELF_TEST_RESPONSE)
+        || identity.as_ref().and_then(|value| value["flavor"].as_str()) != Some(flavor.as_str())
+        || identity.as_ref().and_then(|value| value["arch"].as_str()) != Some(identity::self_arch())
     {
-        return Ok(());
-    }
-    let out = capture_command_with_timeout(
-        &candidate,
-        &[
-            "--server",
-            "http://127.0.0.1:1",
-            "--token",
-            "probe",
-            "__brocade_probe",
-        ],
-        Duration::from_secs(10),
-    )
-    .map_err(|error| {
-        format!(
-            "候选 agent 跑不起来（{error}）——多半不是本机架构（{}），没有安装",
-            identity::self_arch()
-        )
-    })?;
-    let said = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    if !said
-        .split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_'))
-        .any(|word| word == "run")
-    {
-        return Err("候选 agent 未通过自检，旧版命令列表也没有 run，未安装".to_owned());
+        return Err("候选 Agent 自检、产品变体或架构不匹配".into());
     }
     Ok(())
 }
 
-/// The path of the running binary.
-///
-/// Read through `/proc/self/exe` rather than `argv[0]`, which is whatever the caller chose and is
-/// possibly a relative path under a service manager. A path ending in ` (deleted)` means the file
-/// was already replaced and this process is the old one still running — there is nothing left to
-/// update, and writing to that literal path would create a file with a space and `(deleted)` in its
-/// name.
+#[cfg(test)]
+fn probe(candidate: &Path) -> Result<(), String> {
+    probe_flavor(candidate, identity::self_flavor())
+}
+
 fn self_path() -> Result<PathBuf, String> {
     let path = fs::read_link("/proc/self/exe")
         .map_err(|error| format!("读不了 /proc/self/exe: {error}"))?;
@@ -590,6 +583,8 @@ mod tests {
 
     fn tracked_offer() -> AgentReleaseOffer {
         AgentReleaseOffer {
+            flavor: identity::self_flavor(),
+            allow_flavor_change: false,
             url: "https://console.example/agent".to_owned(),
             sha256: "a".repeat(64),
             release_id: Some(7),
@@ -635,14 +630,14 @@ mod tests {
     }
 
     #[test]
-    fn old_console_offer_is_supported_but_partial_tracking_is_rejected() {
+    fn release_identity_is_required_and_partial_tracking_is_rejected() {
         let mut offer = tracked_offer();
         assert!(validate_offer(&offer).is_ok());
         offer.attempt = None;
         assert!(validate_offer(&offer).is_err());
         offer.release_id = None;
         offer.previous_sha256 = None;
-        assert!(validate_offer(&offer).is_ok());
+        assert!(validate_offer(&offer).is_err());
         offer.sha256 = "A".repeat(64);
         assert!(validate_offer(&offer).is_err());
     }
@@ -699,18 +694,23 @@ mod tests {
             std::env::temp_dir().join(format!("brocade-self-test-contract-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let candidate = root.join("candidate");
-        for body in [
-            format!(
-                "#!/bin/sh\n[ \"$1\" = self-test ] || exit 9\nprintf '%s\\n' '{}'\n",
-                brocade_deployment::protocol::AGENT_SELF_TEST_RESPONSE
+        let valid = format!(
+            "#!/bin/sh\n[ \"$1\" = self-test ] || exit 9\nprintf '%s\\n' '{}' '{}'\n",
+            brocade_deployment::protocol::AGENT_SELF_TEST_RESPONSE,
+            serde_json::json!({"flavor":identity::self_flavor(),"arch":identity::self_arch()})
+        );
+        for (body, accepted) in [
+            (valid, true),
+            (
+                "#!/bin/sh\nprintf '可用命令：run、desired、health\\n' >&2\nexit 1\n".to_owned(),
+                false,
             ),
-            "#!/bin/sh\nprintf '可用命令：run、desired、health\\n' >&2\nexit 1\n".to_owned(),
         ] {
             let staging = root.join("staging");
             fs::write(&staging, body).unwrap();
             fs::set_permissions(&staging, permissions(0o700)).unwrap();
             fs::rename(&staging, &candidate).unwrap();
-            probe(&candidate).unwrap();
+            assert_eq!(probe(&candidate).is_ok(), accepted);
         }
         fs::write(
             root.join("staging"),
@@ -744,8 +744,15 @@ mod tests {
             url: format!("file://{}", source.display()),
             sha256: "f".repeat(64),
         };
-        let error = install_release(&release, &"f".repeat(64), &download, &target, || Ok(()))
-            .expect_err("sha 对不上就不该装");
+        let error = install_release(
+            &release,
+            &"f".repeat(64),
+            &download,
+            &target,
+            identity::self_flavor(),
+            || Ok(()),
+        )
+        .expect_err("sha 对不上就不该装");
         assert!(error.contains("对不上"), "{error}");
 
         assert_eq!(
@@ -763,7 +770,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("brocade-agent-fence-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let source = dir.join("candidate");
-        fs::write(&source, b"#!/bin/sh\nprintf 'expected run\\n'\n").unwrap();
+        let identity =
+            serde_json::json!({"flavor":identity::self_flavor(), "arch":std::env::consts::ARCH});
+        fs::write(
+            &source,
+            format!("#!/bin/sh\nprintf '%s\\n' 'brocade-agent-self-test-v1' '{identity}'\n"),
+        )
+        .unwrap();
         let target = dir.join("brocade-agent");
         fs::write(&target, b"old binary").unwrap();
         let wanted = file_sha256_hex(&source).unwrap();
@@ -771,14 +784,14 @@ mod tests {
             url: format!("file://{}", source.display()),
             sha256: wanted.clone(),
         };
-        let error = install_release(&release, &wanted, &dir.join(DOWNLOAD_FILE), &target, || {
+        let error = install_release(&release, &wanted, &dir.join(DOWNLOAD_FILE), &target, identity::self_flavor(), || {
             Err("assignment canceled".to_owned())
         })
         .unwrap_err();
         assert_eq!(error, "assignment canceled");
         assert_eq!(fs::read(&target).unwrap(), b"old binary");
         assert!(!dir.join(STAGING_FILE).exists());
-        install_release(&release, &wanted, &dir.join(DOWNLOAD_FILE), &target, || {
+        install_release(&release, &wanted, &dir.join(DOWNLOAD_FILE), &target, identity::self_flavor(), || {
             Ok(())
         })
         .unwrap();

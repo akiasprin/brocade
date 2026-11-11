@@ -617,17 +617,6 @@ function SiteUsageCard({
             {periodDates(data)} · {categories.sites.length} 类站点{categories.forwarding ? ' · 端口转发' : ''}
           </span>
           <span className="site-usage-meta">
-            {data.observed_since_unix_secs !== null && data.observed_since_unix_secs > data.range_start_unix_secs && (
-              <>
-                <span
-                  className="warn"
-                  title={`最近连续采集从${moment(data.observed_since_unix_secs, data.range_end_unix_secs)}开始；统计仍覆盖完整所选范围，此前已有记录继续计入。无法仅据此确定具体缺口。`}
-                >
-                  站点采集可能有缺口
-                </span>
-                {' · '}
-              </>
-            )}
             下行 <b>{bytes(categories.down)}</b> · 上行 <b>{bytes(categories.up)}</b>
           </span>
         </>

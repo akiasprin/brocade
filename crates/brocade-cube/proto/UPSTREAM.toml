@@ -1,0 +1,5 @@
+repository = "https://github.com/containerd/containerd.git"
+module = "github.com/containerd/containerd/api"
+version = "v1.10.0"
+license = "Apache-2.0"
+# Original .proto files, including copyright headers; imports preserve upstream paths.

@@ -9,6 +9,27 @@ use std::{
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Hash executables and rule databases with a fixed working set, including
+/// `/proc/self/exe`, whose open inode remains authoritative after replacement.
+pub(crate) fn file_sha256(path: &Path) -> std::io::Result<String> {
+    sha256_reader(fs::File::open(path)?)
+}
+
+fn sha256_reader(mut reader: impl Read) -> std::io::Result<String> {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        context.update(&buffer[..count]);
+    }
+    Ok(brocade_core::hash::hex_lower(context.finish().as_ref()))
+}
+
 /// Read a bounded regular checkpoint without blocking on a FIFO or following a leaf symlink.
 pub(crate) fn read_bounded(path: &Path, maximum: usize) -> Result<Option<Vec<u8>>, String> {
     let file = match fs::OpenOptions::new()
@@ -118,9 +139,45 @@ pub(crate) fn atomic_write_with_mode(
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, os::unix::fs::PermissionsExt};
+    use std::{
+        env, fs,
+        io::{self, Read},
+        os::unix::fs::PermissionsExt,
+    };
 
-    use super::{atomic_write_private, atomic_write_with_mode, read_bounded};
+    use super::{atomic_write_private, atomic_write_with_mode, read_bounded, sha256_reader};
+
+    #[test]
+    fn file_hash_streams_with_fixed_memory_and_retries_interrupted_reads() {
+        struct Source {
+            remaining: usize,
+            interrupted: bool,
+        }
+        impl Read for Source {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                assert!(
+                    buffer.len() <= 64 * 1024,
+                    "hashing must not grow a whole-file buffer"
+                );
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let count = buffer.len().min(self.remaining);
+                buffer[..count].fill(b'Z');
+                self.remaining -= count;
+                Ok(count)
+            }
+        }
+        let source = Source {
+            remaining: 8 * 1024 * 1024 + 17,
+            interrupted: false,
+        };
+        assert_eq!(
+            sha256_reader(source).unwrap(),
+            "049c48c7c56f0a13fba12e64f711a10ff9f29f4573e30789c6e94b3e30dd5473"
+        );
+    }
 
     #[test]
     fn bounded_checkpoint_read_rejects_nonregular_files_and_symlinks() {

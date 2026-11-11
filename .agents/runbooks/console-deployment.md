@@ -10,6 +10,8 @@
 
 使用安装器管理的环境，统一执行 [安装与升级](../../docs/install.md) 的 `install.sh --upgrade`，不以手动替换二进制代替其预检、停写备份与迁移边界。安装器管理 `brocade.service` 和 `brocade.socket`；日常仅重启 service 可保留监听，完整升级为防止自动激活写库会明确停止两者，再恢复。保留原 service/custom drop-in；私有环境配置放在 `/etc/brocade`，通过 service 的 EnvironmentFile 加载并纳入安装备份。
 
+用户明确要求只前向修复时，使用 `install.sh --upgrade --forward-only`。此模式在停服后发生任何失败时都保持停服和现场，不自动恢复旧安装或启动旧服务；备份仍必须完成并验证，后续以修正后的候选继续前进。
+
 已有 `brocade-console.service` 手动部署需要一次性纳管，先备份并隔离演练，再保留原外置库、密封密钥和入口切换；不得添加一个 installer-managed 注释伪装成已纳管。下文手动部署流程继续用于尚未纳管的环境。
 
 ## 前置条件
@@ -41,13 +43,16 @@
 
 本节是本地发布构建的规范入口；使用固定、独占的 Git 工作树。构建过程中不得编辑该工作树；并行任务使用各自长期保留的工作树，不得共用可写源码。
 
-- 统一入口为 `python3 scripts/build-release.py`。禁止在 `target/releases/<时间戳>/source`、`/tmp`、`/var/tmp` 等临时快照中编译。发布归档在构建验证完成后复制产物、来源清单和摘要，不改变下次构建位置。
-- Console 缓存固定在 `target/brocade-release/cargo`，Agent 缓存与 Zig 包装脚本固定在 `target/brocade-agent-build`，Xray 验证账本固定在 `target/brocade-xray-verified`。清理发布备份、临时归档时保留这些构建缓存；缓存失效仍按实际输入重建，不凭旧修改时间认定有效。
+可选 Cube 节点运行栈使用同一入口的 `--cube-runtime-only` 模式，参数与产物见 [Cube 节点运行栈](../../docs/cube-runtime.md)。该模式在 `target/cube/` 使用独立缓存和锁，按明确选择的架构及其 sysroot 准备产物，记录源码、外部库与产物摘要；不会替代下述 Console 双架构构建，也不自动部署。每个架构的 Cube 产物仍须完成其真实 KVM、升级和恢复验收。
+
+- 统一入口为 `python3 scripts/build-release.py --flavor base|cvm`，默认 `base`。禁止在 `target/releases/<时间戳>/source`、`/tmp`、`/var/tmp` 等临时快照中编译。发布归档在构建验证完成后复制产物、来源清单和摘要，不改变下次构建位置。
+- 同一工作树的两种变体共用 `target/brocade-release/lock` 排他锁；构建期间不得切换源码或并行复用前端目录。容器版分别构建 base/cvm Agent，基础版只构建 base Agent。
+- Console 缓存固定在 `target/brocade-release/<flavor>/cargo`，Agent 缓存按 `target/brocade-agent-build/<flavor>` 隔离，Zig 包装脚本保留在 `target/brocade-agent-build`，Xray 验证账本固定在 `target/brocade-xray-verified`。清理发布备份、临时归档时保留这些构建缓存；缓存失效仍按实际输入重建，不凭旧修改时间认定有效。
 - 两个 Console GNU 目标在一次 Cargo 调用中通过重复 `--target` 调度；需要构建的两个 Agent musl 目标也由一次 Cargo 调用调度。不得以两个 Cargo 同时争用同一 target 目录冒充并行；默认 jobs=4，入口允许 2–8，资源争抢时按实测调整。
 - 前端由入口按源码、Node/npm 版本和产物摘要复用或构建一次，再供两个 Console 目标嵌入；不得让两边并发 `npm ci` 改写同一 node_modules。
 - 同一工作树的发布入口使用非阻塞锁，已有构建时立即报忙，不隐藏排队。锁只约束该入口，不能替代禁止其他任务写入工作树的要求；构建前后输入摘要不同，拒绝接纳产物。
 - 构建不设置总时限或阶段超时，内嵌 Xray 的 Go 命令和构建账本锁等待也不因耗时中止。构建和每个阶段开始、结束时输出 UTC ISO 8601 时间，包含结果和单调时钟耗时；运行中每 30 秒报告当前阶段、开始时间、阶段耗时及累计耗时。人工取消或实际错误终止本次进程组，失败记录不得引用此前成功的产物。
-- `target/brocade-release/preparation.json` 随阶段切换和定期报告更新，总体和各阶段均记录 `started_at`、`ended_at`，运行中的结束时间为 null；同时记录累计耗时、当前阶段、各阶段结果与耗时、来源摘要和双架构产物摘要，取消使用 `cancelled` 状态。每次开始先使旧成功记录失效；记录仅代表本轮，重试前归档前次证据。日志有 16 MiB 上限。`build_complete` 只表示本次构建成功，`deployment_ready` 保持 false，影响范围验证和强制升级验收仍须另行完成并核对同一产物摘要。
+- `target/brocade-release/<flavor>/preparation.json` 随阶段切换和定期报告更新，总体和各阶段均记录 `started_at`、`ended_at`，运行中的结束时间为 null；同时记录累计耗时、当前阶段、各阶段结果与耗时、来源摘要和双架构产物摘要，取消使用 `cancelled` 状态。每次开始先使旧成功记录失效；记录仅代表本轮，重试前归档前次证据。日志有 16 MiB 上限。`build_complete` 只表示本次构建成功，`deployment_ready` 保持 false，影响范围验证和首发双变体安装/切换验收仍须另行完成并核对同一产物摘要。
 - 关注冷缓存、增量构建与异常等待的实际耗时，比较时注明缓存状态和验证范围；不以计时阈值判定构建失败，也不省略重试或未运行的门槛。
 
 构建之外的源码固定、发布前检查、升级演练、上传、安装和线上业务验收，执行及对话汇报统一遵循 [Agent 时间汇报规则](../AGENTS.md#执行过程与时间汇报)。脚本记录是步骤时间的依据；不能把构建阶段记录解释成完整部署时间线。
@@ -150,7 +155,7 @@ SQL 从完整目标 `0002` 提取尚未执行的 DDL，验证接入配额和预�
 开发环境 150 曾执行旧 `[1,2,3,4,5]`，直接启动新二进制会被 SQLx 拒绝。使用
 `scripts/prepare-consolidated-0003-compat.py` 从目标 `0003` 生成一次性 SQL。生成器只接受旧
 `0003` 校验值 `7c2aa028…0cc77d9`、旧 `0004` `6e837e2d…f394f6`、旧 `0005`
-`6c03b924…f725e`，以及目标 `0003` `6b9c70bc…f2204e8`，并同时核验 `0001`、`0002`。
+`6c03b924…f725e`，以及目标 `0003` `2dde62d4…27971ea5`，并同时核验 `0001`、`0002`。
 
 先保存数据库与完整迁移回执，并在生产备份的隔离恢复库执行同一份生成 SQL：
 
@@ -1104,3 +1109,7 @@ curl --fail https://console.example.net/healthz
 ## 记录
 
 发布记录至少包含：目标环境、提交、构建目标、二进制摘要、开始/结束时间、操作者、备份位置、验证结果、异常、回滚判据以及是否执行回滚。不得记录秘密值。
+
+### 实验环境首次建立产品身份
+
+双变体按新产品首发，不接管实验 CVM schema 或节点状态。实验环境必须先完成明确授权的 CVM 专项清理，保留普通业务；迁移 checksum 和实际结构仍须与候选一致，不得只改回执。若安装器管理的旧环境缺少产品身份，使用 [安装文档](../../docs/install.md) 中的 `--upgrade --flavor base --initialize-product`。候选普通版预检成功后，沿标准停写、备份、安装与恢复路径首次建立身份；旧程序不预先标记为 base。失败且未开始迁移时恢复旧安装，同时恢复身份文件原先缺失的状态。

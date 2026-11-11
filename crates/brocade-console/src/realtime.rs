@@ -246,7 +246,7 @@ impl RealtimeService {
             loop {
                 let listening = async {
                     let mut listener =
-                        sqlx::postgres::PgListener::connect_with(store.pool()).await?;
+                        sqlx::postgres::PgListener::connect_with(store.listener_pool()).await?;
                     listener.listen("brocade_agent_change").await?;
                     service
                         .wake_agents(&brocade_deployment::agent_channel::WakeDomain::ALL)
@@ -288,11 +288,19 @@ impl RealtimeService {
                     }
                     Ok::<(), sqlx::Error>(())
                 };
-                tokio::select! {
-                    _ = shutdown.requested() => return,
-                    result = listening => if let Err(error) = result { eprintln!("Agent change listener: {error}"); },
+                let stopped = tokio::select! {
+                    _ = shutdown.requested() => true,
+                    result = listening => {
+                        if let Err(error) = result { eprintln!("Agent change listener: {error}"); }
+                        false
+                    },
+                };
+                // `select!` has now dropped its losing future and released the listener.
+                if stopped {
+                    store.listener_pool().close().await;
+                    return;
                 }
-                tokio::select! { _ = shutdown.requested() => return, _ = tokio::time::sleep(backoff) => {} }
+                tokio::select! { _ = shutdown.requested() => { store.listener_pool().close().await; return; }, _ = tokio::time::sleep(backoff) => {} }
                 backoff = (backoff * 2).min(Duration::from_secs(60));
             }
         });

@@ -531,7 +531,9 @@ fn configured_handoff_endpoints(
 
 fn inbound_listener_networks(inbound: &serde_json::Value) -> (bool, bool) {
     let protocol = inbound["protocol"].as_str().unwrap_or_default();
-    if protocol == "dokodemo-door" {
+    // Shadowsocks opens native UDP sockets according to settings.network, even when
+    // streamSettings.network is TCP. The manifest must cover both listener families.
+    if matches!(protocol, "dokodemo-door" | "shadowsocks") {
         let networks = inbound
             .pointer("/settings/network")
             .and_then(serde_json::Value::as_str)
@@ -5953,6 +5955,122 @@ mod tests {
         }
         assert!(bootstrap.manifest_path().is_file());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bootstrap_manifest_covers_shadowsocks_listener_networks() {
+        let dir = temp_dir("shadowsocks-listeners");
+        for (network, expected) in [
+            (None, vec!["tcp"]),
+            (Some("tcp"), vec!["tcp"]),
+            (Some("udp"), vec!["udp"]),
+            (Some("tcp,udp"), vec!["tcp", "udp"]),
+        ] {
+            let mut config = serde_json::json!({
+                "api": {"listen": "127.0.0.1:10085"},
+                "inbounds": [{
+                    "tag": "relay", "listen": "0.0.0.0", "port": 23601,
+                    "protocol": "shadowsocks",
+                    "settings": {"method": "2022-blake3-aes-128-gcm"},
+                    "streamSettings": {"network": "tcp", "security": "none"}
+                }]
+            });
+            if let Some(network) = network {
+                config["inbounds"][0]["settings"]["network"] = network.into();
+            }
+            let endpoints = configured_handoff_endpoints(&dir, &config.to_string()).unwrap();
+            let public: Vec<_> = endpoints
+                .iter()
+                .filter(|endpoint| endpoint.role == "public")
+                .collect();
+            assert_eq!(
+                public
+                    .iter()
+                    .map(|endpoint| endpoint.network.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "settings.network={network:?}"
+            );
+            assert!(public
+                .iter()
+                .all(|endpoint| endpoint.address == "0.0.0.0:23601"));
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[ignore = "requires BROCADE_TEST_XRAY and local TCP/UDP/Unix sockets"]
+    fn native_ss2022_bootstrap_registers_tcp_and_udp() {
+        use std::net::{TcpListener, UdpSocket};
+
+        struct Fixture {
+            child: std::process::Child,
+            root: PathBuf,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+
+        let binary = std::env::var_os("BROCADE_TEST_XRAY").expect("explicit Xray required");
+        // Keep the generated Unix control socket within sockaddr_un's path limit.
+        let root = std::env::temp_dir().join(format!("ss2-{}", std::process::id()));
+        assert!(!root.exists());
+        crate::create_private_dir(&root).unwrap();
+        let api = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = relay.local_addr().unwrap();
+        let udp = UdpSocket::bind(address).unwrap();
+        let content = serde_json::json!({
+            "log": {"loglevel": "error"},
+            "api": {"tag": "api", "listen": api.to_string(), "services": ["HandlerService"]},
+            "inbounds": [{
+                "tag": "relay", "listen": "127.0.0.1", "port": address.port(),
+                "protocol": "shadowsocks",
+                "settings": {
+                    "method": "2022-blake3-aes-128-gcm",
+                    "password": "AAAAAAAAAAAAAAAAAAAAAA==", "network": "tcp,udp",
+                    "clients": [{"email": "relay-test", "password": "AQEBAQEBAQEBAQEBAQEBAQ=="}]
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            }],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+        })
+        .to_string();
+        let config = root.join("xray.json");
+        crate::write_private(&config, &content).unwrap();
+        let bootstrap = prepare_bootstrap_handoff(&root, &content).unwrap();
+        drop((relay, udp));
+        let fixture = Fixture {
+            child: Command::new(binary)
+                .args(["run", "-c"])
+                .arg(&config)
+                .env("XRAY_TCP_HANDOFF_MANIFEST", bootstrap.manifest_path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+            root,
+        };
+        let process = crate::process_ref(fixture.child.id().try_into().unwrap()).unwrap();
+        wait_for_candidate_api(api, &bootstrap.manifest, process).unwrap();
+        activate_bootstrap_handoff(&bootstrap, process.pid).unwrap();
+        let status = handoff_status_rpc(&bootstrap.manifest, process.pid).unwrap();
+        assert!(status.ready && status.accepting && status.retirement_supported);
+        assert!(status.unsupported_reasons.is_empty());
+        for network in ["tcp", "udp"] {
+            assert!(status.listeners.iter().any(|listener| {
+                listener.network == network
+                    && listener.address == address.to_string()
+                    && !listener.closed
+            }));
+        }
     }
 
     #[test]

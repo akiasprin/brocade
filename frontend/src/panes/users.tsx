@@ -1,3 +1,4 @@
+import { TitleActions } from '../ui/title-actions';
 import { useSourceAccess } from './source-access';
 import { SourceAccessRollout, SourceBanAdd, SourceBanButton } from './user-source-access';
 import {
@@ -49,7 +50,7 @@ import {
 import { can, isVisitor, useSession } from '../session';
 import { Ago, Confirm, EmptyState, ErrorBox, Loading, SegmentedControl } from '../ui/bits';
 import { Icon, ListIcon, PanelTitle } from '../ui/icons';
-import { bytes, shareOf } from '../ui/format';
+import { bytes } from '../ui/format';
 import { useNodeNames } from '../ui/node-name';
 import { RegionFlag } from '../ui/region-flag';
 import { SOURCE_LOCATION_TITLE, SourceAddress, sourceNetwork } from '../ui/source-address';
@@ -72,7 +73,9 @@ import { canViewUserRealtimeTraffic } from '../session';
 import { UserRealtimeTrafficCard } from '../user-traffic-realtime';
 import { UserSiteUsageCard } from '../user-site-usage';
 import { UserMachineUsageCard } from '../user-machine-usage';
-import { UserTrafficAccountingSetting } from '../user-traffic-accounting';
+import { UserQuotaReading, UserUsageLedger, cycleUsageText, type CycleUsageState } from './user-usage';
+export { cycleUsageText } from './user-usage';
+export type { CycleUsageState } from './user-usage';
 import { UserForwardingCard } from './user-forwarding';
 import { UserServiceTerms } from './user-service-policy';
 import { UserCycleReset } from './user-cycle-reset';
@@ -117,14 +120,6 @@ export interface UserFacts {
   suspended: number;
   throttledApps?: string[];
 }
-
-export type CycleUsageState = 'pending' | 'failed' | 'ready';
-
-export const cycleUsageText = (state: CycleUsageState, rowCount: number, total: number) => {
-  if (state === 'pending') return '读取中…';
-  if (state === 'failed') return '暂不可用';
-  return rowCount > 0 ? bytes(total) : '—';
-};
 
 const trafficMultiplier = (mode: UserTrafficAccountingMode | undefined) => (mode === 'double' ? 2 : 1);
 
@@ -1112,13 +1107,6 @@ export function UsersPane({ win, bare = false }: { win: Win; bare?: boolean }) {
   return <UserList drill={drill} go={go} sheeted={bare} narrow={narrow} />;
 }
 
-// 额度以 GiB 为单位收发：操作者设定额度时使用的单位是 GiB，不是字节数。
-// 整数 GiB 的往返转换是精确的；通过其他 API 设置的非整值在此会被截断到 KB 级，
-// 这类额度不应在此输入框中修改。
-const GiB = 1024 ** 3;
-// 额度通常按整 GiB 设置，整数时不显示小数位（「100 GiB」）；非整值沿用 bytes() 的精度。
-const quotaBytes = (n: number) => (n % GiB === 0 ? `${n / GiB} GiB` : bytes(n));
-
 /** 线路在当前用户下的接入情况：地区旗、已授权接入点所在的链、被配额执行器停用的接入点（按链名）。 */
 export interface QuotaRouteAccess {
   countries: string[];
@@ -1212,47 +1200,13 @@ export function QuotaRow({
           : pct !== null && pct >= QUOTA_ATTENTION_PCT
             ? 'warn'
             : 'ok';
-  const [figure, unit] = used === null ? ['', ''] : bytes(used).split(' ');
-  const left =
-    usageState === 'pending' ? null : usageState === 'failed' ? (
-      '用量暂不可用'
-    ) : used === null ? (
-      '用量未知'
-    ) : limit === null ? (
-      '不限额度'
-    ) : over ? (
-      <>
-        超出<b>{bytes(used - limit)}</b>
-      </>
-    ) : (
-      <>
-        剩余<b>{bytes(limit - used)}</b>
-      </>
-    );
   return (
     <div
       className={`qta-r ${tone}${paused ? ' paused' : throttled ? ' throttled' : ''}${editing ? ' fwe-open' : ''}`}
       role="listitem"
     >
       {name}
-      <span className="qta-figs">
-        {usageState === 'pending' ? (
-          '读取中…'
-        ) : used === null ? (
-          '—'
-        ) : (
-          <>
-            {figure}
-            <small>{unit}</small>
-          </>
-        )}
-        {limit !== null && <span className="qta-cap">/ {quotaBytes(limit)}</span>}
-      </span>
-      {left !== null && (
-        <span className="qta-left">
-          <span className="qta-left-value">{left}</span>
-        </span>
-      )}
+      <UserQuotaReading used={used} limit={limit} state={usageState} />
       <UserTrafficQuotaMeter used={used} limit={limit} view={policy} />
       {editable && user && (
         <span className="qta-acts">
@@ -1354,111 +1308,6 @@ function UserAccessQuotaRows({
     </div>
   );
 }
-// 详情卡的本期读数栏：与用量页读数栏同一写法（合计 + 上下行组成条与数值），尺寸按子卡缩小一档。
-function UserUsageLedger({
-  state,
-  rows,
-  periodEnd,
-  accountingMode,
-  accountingDisabled,
-  onAccountingModeChange,
-  cycleReset,
-  servicePolicy,
-}: {
-  state: CycleUsageState;
-  rows: UsageMonthlyViewRow[];
-  periodEnd: string | null;
-  accountingMode: UserTrafficAccountingMode;
-  accountingDisabled: boolean;
-  onAccountingModeChange: (mode: UserTrafficAccountingMode) => void;
-  /** 本期用量重置（user-cycle-reset.tsx），在「本期接入」一行右端。 */
-  cycleReset: ReactNode;
-  /** 账期与有效期（user-service-policy.tsx），排在计量口径之后。 */
-  servicePolicy: ReactNode;
-}) {
-  const uplink = rows.reduce((sum, row) => sum + row.uplink_bytes, 0);
-  const downlink = rows.reduce((sum, row) => sum + row.downlink_bytes, 0);
-  const rawTotal = uplink + downlink;
-  const total = rawTotal * trafficMultiplier(accountingMode);
-  const known = state === 'ready' && rows.length > 0;
-  const [figure, unit] = bytes(total).split(' ');
-  const upShare = rawTotal > 0 ? (uplink / rawTotal) * 100 : 0;
-  return (
-    <section className="user-usage-ledger" aria-label="本期接入">
-      <div className="user-usage-hero">
-        <span className="user-usage-hero-label">本期接入</span>
-        {cycleReset}
-        {known ? (
-          <strong className="user-usage-hero-value">
-            {figure} <small>{unit}</small>
-          </strong>
-        ) : (
-          <strong className="user-usage-hero-value none">{cycleUsageText(state, rows.length, total)}</strong>
-        )}
-        {periodEnd && <QuotaReset periodEnd={periodEnd} />}
-      </div>
-      <div className="user-usage-compose">
-        {/* 下方两行写出同样的数值；组成条只表示比例。 */}
-        <div className="usage-split" aria-hidden="true">
-          {known && total > 0 && (
-            <>
-              <i className="up" style={{ flexGrow: upShare }} />
-              <i className="down" style={{ flexGrow: 100 - upShare }} />
-            </>
-          )}
-        </div>
-        <dl className="usage-io">
-          <div className="up">
-            <dt>
-              <i aria-hidden="true" />
-              上行
-            </dt>
-            <dd>{known ? bytes(uplink) : '—'}</dd>
-            <dd className="usage-share">{known ? shareOf(uplink, rawTotal) : ''}</dd>
-          </div>
-          <div className="down">
-            <dt>
-              <i aria-hidden="true" />
-              下行
-            </dt>
-            <dd>{known ? bytes(downlink) : '—'}</dd>
-            <dd className="usage-share">{known ? shareOf(downlink, rawTotal) : ''}</dd>
-          </div>
-        </dl>
-      </div>
-      <UserTrafficAccountingSetting
-        mode={accountingMode}
-        disabled={accountingDisabled}
-        onChange={onAccountingModeChange}
-      />
-      {servicePolicy}
-    </section>
-  );
-}
-
-// 重置边界由服务端按该用户的策略返回，浏览器只显示倒计时。
-
-function QuotaReset({ periodEnd }: { periodEnd: string }) {
-  const now = useNow();
-  const resetAt = Date.parse(periodEnd);
-  if (!Number.isFinite(resetAt) || resetAt <= now) return null;
-  const date = new Date(resetAt + 8 * 3_600_000);
-  const resetDate = `${date.getUTCMonth() + 1} 月 ${date.getUTCDate()} 日`;
-  const days = Math.ceil((resetAt - now) / 86_400_000);
-  return (
-    <span
-      className="user-usage-reset"
-      title={`额度按 UTC+8 账期统计，${resetDate} 00:00 重新计算；仅恢复仍符合有效期和手动开关的接入点`}
-    >
-      {resetDate}重置
-      <span className="usage-dot" aria-hidden="true">
-        ·
-      </span>
-      {days} 天后
-    </span>
-  );
-}
-
 function UserPasswordDialog({ user, onClose }: { user: UserListItem; onClose: () => void }) {
   const [next, setNext] = useState('');
   const [again, setAgain] = useState('');
@@ -2438,31 +2287,30 @@ function UserList({
                 </div>
               </div>
             )}
-            <div className="user-dhead-tools">
-              <div className="user-dacts">
-                <button
-                  type="button"
-                  className="btn user-dact"
-                  aria-label="节点"
-                  disabled={!canOpenSubscription}
-                  title="打开该用户的节点链接：复制分享链接、拨测当前授权，可选择协议与地址族"
-                  onClick={() => setSub({ user: u, kind: 'uri' })}
-                >
-                  <Icon of="client" size={13} className="user-dact-icon" />
-                  <span className="user-dact-label">节点</span>
-                </button>
-                <button
-                  type="button"
-                  className="btn user-dact"
-                  aria-label="订阅"
-                  disabled={!canOpenSubscription}
-                  title="打开 Clash 订阅，可选择协议与地址族"
-                  onClick={() => setSub({ user: u, kind: 'clash' })}
-                >
-                  <Icon of="subscription" size={13} className="user-dact-icon" />
-                  <span className="user-dact-label">订阅</span>
-                </button>
-              </div>
+            <TitleActions className="user-dhead-tools">
+              <button
+                type="button"
+                className="btn user-dact title-action-compact"
+                aria-label="节点"
+                disabled={!canOpenSubscription}
+                title="打开该用户的节点链接：复制分享链接、拨测当前授权，可选择协议与地址族"
+                onClick={() => setSub({ user: u, kind: 'uri' })}
+              >
+                <Icon of="client" size={14} className="user-dact-icon" />
+                <span className="user-dact-label title-action-label">节点</span>
+              </button>
+              <button
+                type="button"
+                className="btn user-dact title-action-compact"
+                aria-label="订阅"
+                disabled={!canOpenSubscription}
+                title="打开 Clash 订阅，可选择协议与地址族"
+                onClick={() => setSub({ user: u, kind: 'clash' })}
+              >
+                <Icon of="subscription" size={14} className="user-dact-icon" />
+                <span className="user-dact-label title-action-label">订阅</span>
+              </button>
+
               <div className="fg-menuwrap user-action-menuwrap">
                 <button
                   className="btn user-dact user-dact-more"
@@ -2487,7 +2335,7 @@ function UserList({
                     });
                   }}
                 >
-                  <Icon of="more" size={13} className="user-dact-icon" />
+                  <Icon of="more" size={14} className="user-dact-icon" />
                 </button>
                 {detailActionsOpen && menuAvailable && (
                   <div
@@ -2651,7 +2499,7 @@ function UserList({
                   </div>
                 )}
               </div>
-            </div>
+            </TitleActions>
           </div>
         </div>
         {/* 未打开的页签不取数据；已打开的页签保留同一用户的表单。 */}
@@ -2674,6 +2522,7 @@ function UserList({
             </header>
             <UserUsageBody pending={usagePending}>
               <UserUsageLedger
+                label="本期接入"
                 key={`ledger:${r.key}`}
                 state={cycleState}
                 rows={use.rows.filter((row): row is UsageMonthlyViewRow => 'app_id' in row)}
@@ -2922,16 +2771,19 @@ function UserList({
           <header>
             <ListIcon of="users" />
             <h4>用户</h4>
-            <span className="user-roster-head-actions">
-              <button
-                className="btn primary"
-                disabled={!editable || tenantOptions.length !== 1 || !!newUser}
-                title={tenantOptions.length !== 1 ? '当前账户无法新增用户，请联系管理员。' : undefined}
-                onClick={() => setNewUser({ id: '', tenant: defaultTenant })}
-              >
-                ＋ 新增用户
-              </button>
-            </span>
+            <TitleActions
+              className="user-roster-head-actions"
+              primary={
+                <button
+                  className="btn primary"
+                  disabled={!editable || tenantOptions.length !== 1 || !!newUser}
+                  title={tenantOptions.length !== 1 ? '当前账户无法新增用户，请联系管理员。' : undefined}
+                  onClick={() => setNewUser({ id: '', tenant: defaultTenant })}
+                >
+                  ＋ 新增用户
+                </button>
+              }
+            />
           </header>
           <div className="user-roster-options">
             {newUserEditor}
@@ -2962,16 +2814,19 @@ function UserList({
             <header>
               <ListIcon of="users" />
               <h4>用户</h4>
-              <span className="user-roster-head-actions">
-                <button
-                  className="btn primary"
-                  disabled={!editable || tenantOptions.length !== 1 || !!newUser}
-                  title={tenantOptions.length !== 1 ? '当前账户无法新增用户，请联系管理员。' : undefined}
-                  onClick={() => setNewUser({ id: '', tenant: defaultTenant })}
-                >
-                  ＋ 新增用户
-                </button>
-              </span>
+              <TitleActions
+                className="user-roster-head-actions"
+                primary={
+                  <button
+                    className="btn primary"
+                    disabled={!editable || tenantOptions.length !== 1 || !!newUser}
+                    title={tenantOptions.length !== 1 ? '当前账户无法新增用户，请联系管理员。' : undefined}
+                    onClick={() => setNewUser({ id: '', tenant: defaultTenant })}
+                  >
+                    ＋ 新增用户
+                  </button>
+                }
+              />
             </header>
             <span className="user-list-search">
               <Icon of="search" size={13} className="user-list-search-icon" />

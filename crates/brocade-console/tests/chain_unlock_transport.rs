@@ -9,6 +9,7 @@ use std::{
     net::{TcpListener, TcpStream},
     os::unix::fs::PermissionsExt,
     process::{Child, Command, Stdio},
+    sync::{Arc, Mutex, Weak},
     thread,
     time::{Duration, Instant},
 };
@@ -25,6 +26,27 @@ fn port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+fn embedded_xray_directory() -> Arc<tempfile::TempDir> {
+    static DIRECTORY: Mutex<Weak<tempfile::TempDir>> = Mutex::new(Weak::new());
+    let mut shared = DIRECTORY.lock().unwrap();
+    if let Some(directory) = shared.upgrade() {
+        return directory;
+    }
+    let (_, bytes, _) = EMBEDDED_XRAYS
+        .iter()
+        .find(|(arch, ..)| *arch == std::env::consts::ARCH)
+        .expect("host Xray must be embedded");
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let binary = directory.path().join("xray");
+    // Finish the only executable write before any test can spawn a process.
+    // A concurrent spawn can otherwise inherit another test's writer until exec,
+    // causing ETXTBSY even after fs::write has closed that writer in this process.
+    fs::write(&binary, bytes).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    *shared = Arc::downgrade(&directory);
+    directory
 }
 #[test]
 fn embedded_xray_chain_client_routes_remote_domains_and_reaps_only_its_own_process() {
@@ -45,14 +67,9 @@ fn connection_evidence_survives_tls_vision_anytls_and_hysteria() {
 
 fn chain_client_reaches_remote_domain(ipv6: bool, traced: Option<&str>) {
     eprintln!("transport={traced:?} ipv6={ipv6}");
-    let (_, bytes, _) = EMBEDDED_XRAYS
-        .iter()
-        .find(|(arch, ..)| *arch == std::env::consts::ARCH)
-        .expect("host Xray must be embedded");
+    let embedded_xray = embedded_xray_directory();
+    let binary = embedded_xray.path().join("xray");
     let dir = tempfile::tempdir().unwrap();
-    let binary = dir.path().join("xray");
-    fs::write(&binary, bytes).unwrap();
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
     let cert = rcgen::generate_simple_self_signed(vec!["chain.test.invalid".into()]).unwrap();
     let cert_path = dir.path().join("cert.pem");
     let key_path = dir.path().join("key.pem");

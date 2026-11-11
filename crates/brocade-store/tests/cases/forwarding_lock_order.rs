@@ -201,8 +201,9 @@ async fn forwarding_opposite_rule_moves_lock_node_generations_in_one_order() {
         .find(|rule| rule.listen_port == 40002)
         .unwrap()
         .id;
-    // The first mover holds its first node state while the opposite mover starts. If each
-    // takes its old node first, they own opposite states and deadlock after this gate opens.
+    // Listener writers now acquire the shared CVM network lock before node state.
+    // Hold the first mover at its generation update and prove the opposite mover
+    // waits at that outer lock, then verify both complete after releasing the gate.
     let gate = generation_gate(db.pool()).await;
     first.node_id = "n2".to_owned();
     let store = db.store.clone();
@@ -219,7 +220,7 @@ async fn forwarding_opposite_rule_moves_lock_node_generations_in_one_order() {
             .update_forwarding_rule(&system_admin(), "platform.acme", "alice", second_id, second)
             .await
     });
-    wait_for_locked_queries(db.pool(), "INSERT INTO forwarding_node_state%", 2).await;
+    wait_for_locked_queries(db.pool(), "SELECT pg_advisory_xact_lock(1112687438,65)%", 1).await;
     gate.commit().await.unwrap();
     let (first_move, second_move) = tokio::time::timeout(Duration::from_secs(5), async {
         (first_move.await.unwrap(), second_move.await.unwrap())
@@ -289,7 +290,9 @@ async fn forwarding_quota_batches_and_rule_moves_lock_node_generations_in_one_or
     wait_for_locked_queries(db.pool(), "INSERT INTO forwarding_node_state%", 1).await;
     let store = db.store.clone();
     let quotas = tokio::spawn(async move { store.enforce_forwarding_quotas().await });
-    wait_for_locked_queries(db.pool(), "INSERT INTO forwarding_node_state%", 2).await;
+    // The quota worker shares the model-write guard, so it waits for the mover's outer
+    // network-resource lock before it can reach either node generation.
+    wait_for_locked_queries(db.pool(), "SELECT pg_advisory_xact_lock(1112687438,65)%", 1).await;
     gate.commit().await.unwrap();
     let (move_rule, quotas) = tokio::time::timeout(Duration::from_secs(5), async {
         (move_rule.await.unwrap(), quotas.await.unwrap())

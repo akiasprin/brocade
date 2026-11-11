@@ -95,8 +95,8 @@ fn console(mode: Arc<AtomicU8>) -> String {
                             after_ms: next.duration_since(now).as_millis().clamp(1, 1000) as u64,
                         }
                     } else {
-                        let bytes = 100_000;
-                        *next = now + Duration::from_secs(1);
+                        let bytes = request.bytes.min(100_000);
+                        *next = now + Duration::from_secs_f64(bytes as f64 / 100_000.0);
                         UserBudgetGrant::Limited {
                             bytes,
                             rate_bps: 800_000,
@@ -110,9 +110,14 @@ fn console(mode: Arc<AtomicU8>) -> String {
     });
     format!("http://{address}")
 }
-fn test_service(dir: &Path, server: &str, node: usize, address: SocketAddr) -> Service {
+pub(super) fn test_service(
+    dir: &Path,
+    server: &str,
+    node: usize,
+    address: SocketAddr,
+) -> Arc<Service> {
     let token = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
-    Service {
+    Arc::new(Service {
         options: Options {
             command: "run".into(),
             server: server.into(),
@@ -123,6 +128,7 @@ fn test_service(dir: &Path, server: &str, node: usize, address: SocketAddr) -> S
         },
         token: token.clone(),
         entries: Mutex::new(BTreeMap::new()),
+        fetcher: start_fetchers().unwrap(),
         known: Mutex::new(BTreeSet::new()),
         unknown_checkpoint: AtomicBool::new(false),
         clients: AtomicUsize::new(0),
@@ -134,15 +140,16 @@ fn test_service(dir: &Path, server: &str, node: usize, address: SocketAddr) -> S
         generation: AtomicU64::new(0),
         policies: Mutex::new(PolicyCache {
             effects: BTreeMap::new(),
+            groups: BTreeMap::new(),
             updated: None,
         }),
-    }
+    })
 }
 fn local_service(dir: &Path, server: &str, node: usize) -> std::net::SocketAddr {
     std::fs::create_dir_all(dir).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let service = Arc::new(test_service(dir, server, node, address));
+    let service = test_service(dir, server, node, address);
     let token = service.token.clone();
     crate::fsutil::atomic_write_private(
         &control_path(dir),
@@ -627,6 +634,51 @@ fn user_global_requirement_survives_corrupt_and_missing_checkpoints() {
 }
 
 #[test]
+fn user_global_sources_share_only_console_confirmed_user_app_pools() {
+    let dir = std::env::temp_dir().join(format!("brocade-user-pools-{}", std::process::id()));
+    let address = "127.0.0.1:9".parse().unwrap();
+    let service = test_service(&dir, "http://127.0.0.1:9", 0, address);
+    {
+        let mut policies = service.policies.lock().unwrap();
+        policies.updated = Some(Instant::now());
+        for source in ["alice@tenant#one", "alice@tenant#two"] {
+            policies.groups.insert(source.into(), "a".repeat(64));
+            policies.effects.insert(
+                source.into(),
+                UserTrafficEffect::Limited {
+                    rate_bps: 100_000_000,
+                },
+            );
+        }
+        policies
+            .groups
+            .insert("alice@tenant#other-app".into(), "b".repeat(64));
+        policies
+            .groups
+            .insert("bob@tenant#one".into(), "c".repeat(64));
+    }
+    let one = source_entry(&service, "alice@tenant#one").unwrap();
+    assert!(Arc::ptr_eq(
+        &one,
+        &source_entry(&service, "alice@tenant#two").unwrap()
+    ));
+    assert!(!Arc::ptr_eq(
+        &one,
+        &source_entry(&service, "alice@tenant#other-app").unwrap()
+    ));
+    assert!(!Arc::ptr_eq(
+        &one,
+        &source_entry(&service, "bob@tenant#one").unwrap()
+    ));
+    service.policies.lock().unwrap().updated =
+        Some(Instant::now() - Duration::from_millis(BUDGET_TTL_MS));
+    assert!(!Arc::ptr_eq(
+        &one,
+        &source_entry(&service, "alice@tenant#one").unwrap()
+    ));
+}
+
+#[test]
 fn user_global_policy_sync_switches_existing_sources_and_acknowledges_each_snapshot() {
     crate::identity::self_identity();
     let dir = std::env::temp_dir().join(format!("brocade-user-sync-{}", std::process::id()));
@@ -648,6 +700,7 @@ fn user_global_policy_sync_switches_existing_sources_and_acknowledges_each_snaps
             let snapshot = UserTrafficSnapshot {
                 sources: vec![UserTrafficAssignment {
                     source: source.into(),
+                    budget_key: None,
                     effect,
                     revision: index as u64 + 1,
                 }],

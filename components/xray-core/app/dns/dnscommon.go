@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"encoding/binary"
+	"maps"
 	"math"
 	"strings"
 	"time"
@@ -271,7 +272,13 @@ func toDnsContext(ctx context.Context, addr string) context.Context {
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		dnsCtx = session.ContextWithInbound(dnsCtx, inbound)
 	}
-	dnsCtx = session.ContextWithContent(dnsCtx, session.ContentFromContext(ctx))
+	if content := session.ContentFromContext(ctx); content != nil {
+		// Resolver streams run concurrently and dispatch updates their sniffing
+		// attributes. Keep those mutations out of the parent and sibling streams.
+		cloned := *content
+		cloned.Attributes = maps.Clone(content.Attributes)
+		dnsCtx = session.ContextWithContent(dnsCtx, &cloned)
+	}
 	dnsCtx = log.ContextWithAccessMessage(dnsCtx, &log.AccessMessage{
 		From:   "DNS",
 		To:     addr,

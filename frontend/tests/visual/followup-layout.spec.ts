@@ -70,26 +70,29 @@ for (const [width, name, theme] of [
   [320, 'ascii', 'light'],
   [1440, 'short', 'light'],
 ] as const) {
-  test(`proxy impact prose fits ${width}px with ${name} machine name`, async ({ page }) => {
+  test(`proxy next hop fits ${width}px with ${name} machine name`, async ({ page }) => {
     await open(page, 'proxy', width, theme, name);
-    const card = page.locator('.external-outbound-summary');
-    const impact = card.locator('.external-summary-impact');
-    await expect(impact).toContainText('修改会重启引用它的内部节点上的 XRAY。');
-    await impact.scrollIntoViewIfNeeded();
-    expect(await impact.evaluate(el => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1);
-    const copy = impact.locator('.external-summary-impact-copy');
-    const rects = await copy.evaluate(el => {
-      const range = document.createRange();
-      range.selectNodeContents(el);
-      return [...range.getClientRects()].map(r => ({ left: r.left, right: r.right, bottom: r.bottom }));
-    });
-    const bounds = await card.boundingBox();
+    const panel = page.locator('.rule-next-hops');
+    const row = panel.locator('.rule-proxy-row');
+    await expect(row).toHaveCount(1);
+    await expect(row).toContainText('发起');
+    await expect(row.getByRole('button', { name: '隧道详情' })).toBeVisible();
+    await row.scrollIntoViewIfNeeded();
+    expect(await row.evaluate(el => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1);
+    const rects = await row.evaluate(el =>
+      [...el.querySelectorAll<HTMLElement>('b, small, button, .external-target-kind')]
+        .filter(child => child.getClientRects().length)
+        .map(child => child.getBoundingClientRect())
+        .map(r => ({ left: r.left, right: r.right, bottom: r.bottom })),
+    );
+    expect(rects.length).toBeGreaterThan(0);
+    const bounds = await panel.boundingBox();
     for (const r of rects) {
       expect(r.left).toBeGreaterThanOrEqual(bounds!.x);
       expect(r.right).toBeLessThanOrEqual(bounds!.x + bounds!.width);
       expect(r.bottom).toBeLessThanOrEqual(bounds!.y + bounds!.height);
     }
-    await expect(card).toHaveScreenshot(`proxy-impact-${width}-${name}.png`);
+    await expect(panel).toHaveScreenshot(`proxy-next-hop-${width}-${name}.png`);
   });
 }
 async function readableHeader(header: Locator) {

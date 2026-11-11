@@ -9,7 +9,9 @@ import {
   createIngress,
   createUser,
   setNodeEgressDns,
+  reorderNodeEgressDns,
   upsertExternalOutbound,
+  DEFAULT_HOP_MUX,
   fetchCompileView,
   fetchNodes,
   fetchRevisions,
@@ -70,7 +72,7 @@ import {
   wizardSpine,
   type WizardRuleTables,
 } from './chain-wizard-graph';
-import { WizardPathEditor, type WizardDnsChange } from './chain-wizard-path';
+import { WizardPathEditor, wizardDnsPolicies, type WizardDnsChange } from './chain-wizard-path';
 
 // 使一台机器运行 xray 的方式：为其创建一条链和一个接入面。
 // 是否运行 xray 由编译器计算得出（physical/node.rs 的 xray_plan），节点上没有也不应有
@@ -380,6 +382,7 @@ export function ChainWizard({
   const [headId, setHeadId] = useState<string | null>(node?.node_id ?? null);
   const [pathRules, setPathRules] = useState<WizardRuleTables>(node ? { [node.node_id]: [wizardEgressRule()] } : {});
   const [dnsChanges, setDnsChanges] = useState<WizardDnsChange[]>([]);
+  const [dnsOrders, setDnsOrders] = useState<Record<string, DestMatch[]>>({});
   const [importedOutbounds, setImportedOutbounds] = useState<ExternalOutbound[]>([]);
   const availableOutbounds = [
     ...(snapshot.data?.snapshot.external_outbounds ?? []),
@@ -682,11 +685,17 @@ export function ChainWizard({
         : [...remaining, { node: nodeId, selector, resolution }];
     });
   };
-  const activeDnsChanges = dnsChanges.filter(change =>
-    (stagedRules[change.node] ?? []).some(
-      rule => rule.a.t === 'egress' && egressDnsSelectorKey(rule.m) === egressDnsSelectorKey(change.selector),
-    ),
-  );
+  // 机器 DNS 策略不归新链所有，与链路规则一样，弹层里改的每一条都写入（包括与规则无关的策略）；
+  // 只有移出路径的机器，界面上已经看不到它的改动，不再写入。
+  const activeDnsChanges = dnsChanges.filter(change => members.includes(change.node));
+  const dnsSelectorsText = (selectors: DestMatch[]) =>
+    selectors.map(selector => egressDnsSelectorKey(selector)).join('\0');
+  const activeDnsOrders = Object.entries(dnsOrders).flatMap(([nodeId, order]) => {
+    if (!members.includes(nodeId)) return [];
+    const selectors = wizardDnsPolicies(nodeId, dnsPolicies, activeDnsChanges, order).map(policy => policy.selector);
+    const baseline = wizardDnsPolicies(nodeId, dnsPolicies, activeDnsChanges, null).map(policy => policy.selector);
+    return dnsSelectorsText(selectors) === dnsSelectorsText(baseline) ? [] : [{ node: nodeId, selectors }];
+  });
   const usedImportedOutbounds = importedOutbounds.filter(outbound =>
     members.some(id => (stagedRules[id] ?? []).some(rule => rule.a.t === 'proxy' && rule.a.outbound === outbound.id)),
   );
@@ -813,6 +822,7 @@ export function ChainWizard({
     headId !== (node?.node_id ?? null) ||
     JSON.stringify(pathRules) !== JSON.stringify(initialPathRules) ||
     activeDnsChanges.length > 0 ||
+    activeDnsOrders.length > 0 ||
     paddingMode !== 'default' ||
     customPadding !== '' ||
     hy2Up !== '' ||
@@ -982,6 +992,12 @@ export function ChainWizard({
         arg: `${nameOf(change.node)}：${change.selector.t}${matchValues(change.selector) ? `=${matchValues(change.selector)}` : ''} → ${change.resolution ? `自定义 DNS ${egressDnsEndpointText(change.resolution)}` : '默认 DNS'}`,
       });
     }
+    for (const order of activeDnsOrders) {
+      list.push({
+        op: 'reorder_node_egress_dns',
+        arg: `${nameOf(order.node)}：${order.selectors.map(selector => `${selector.t}=${matchValues(selector)}`).join(' → ')}`,
+      });
+    }
     /* 授权排在最后：grant 引用接入面，接入面需要先创建。草稿按顺序回放。 */
     for (const u of grantedUsers) {
       list.push({
@@ -1051,12 +1067,14 @@ export function ChainWizard({
           port: outbound.port,
           protocol: outbound.protocol,
           security: outbound.security,
+          target_strategy: outbound.target_strategy,
         });
 
       // 目标凭据、反向监听和规则全部来自同一份 stepBodies；与页脚预览逐项对应。
       for (const step of stepBodies) await putStep(app, chainId.trim(), step.id, step.body);
       // DNS 是机器级策略，与链规则同批草稿，但不归新链所有。
       for (const change of activeDnsChanges) await setNodeEgressDns(change.node, change.selector, change.resolution);
+      for (const order of activeDnsOrders) await reorderNodeEgressDns(order.node, order.selectors);
 
       // 授权最后写入：它引用接入面，前面的 upsert_ingress 需要先进入草稿。
       // 顺序与页脚列出的一致——两处不一致会使预览内容与实际执行不符。
@@ -1725,10 +1743,12 @@ export function ChainWizard({
               }
               globalRealityReady={globalRealityReady}
               realitySite={realitySite}
-              entryProtocolCount={enabledProtocolCount}
               dnsPolicies={dnsPolicies}
               dnsChanges={activeDnsChanges}
               onDnsChange={patchDns}
+              dnsOrders={dnsOrders}
+              onDnsOrderChange={(nodeId, selectors) => setDnsOrders(current => ({ ...current, [nodeId]: selectors }))}
+              globalRelayMux={snapshot.data?.snapshot.settings?.relay_mux ?? DEFAULT_HOP_MUX}
             />
           </WizardCard>
           {showOps && (

@@ -51,8 +51,7 @@ Node 入口中的浏览器用例串行运行，避免多个 Vite/Chromium 测试
 `ERR_NETWORK_CHANGED` 并取消本机模块请求。CI 按顺序执行；本地先结束数据库/容器操作，或将浏览器及其 Vite 服务一起置于独立网络命名空间。
 Linux 支持用户网络命名空间时，可用 `unshare -Urn sh -c 'ip link set lo up && cd frontend && npm test'`，保持全部断言且不依赖宿主机网卡状态。
 
-Console 升级发布必须通过[官方 v0.3.1 强制真实验收](../../scripts/tests/upgrade/README.md)，包括
-外置与受管 PostgreSQL。CI 使用同次发行构建的产物，不允许仅用模拟服务或空匹配结果代替。
+首发双变体按[安装验收](../../scripts/tests/upgrade/README.md)验证干净安装、同库切换和故障恢复，包括外置与受管 PostgreSQL。使用同次发行构建的产物，不以旧正式版本或实验 CVM 为接管基线。模拟安装器测试与真实数据库测试分别记录，不能替代未执行的 systemd/宿主验收。
 
 ## 构建入口变更
 

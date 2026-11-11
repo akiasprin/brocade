@@ -87,9 +87,9 @@ test('papers and panels stay opaque without backdrop blur', () => {
       assert.doesNotMatch(target, /\.(?:fg-sheet|nd-paper|panel|blk)\b/, `${selector.trim()} blurs a content surface`);
     }
   }
-  // 顶栏使用共享半透明底色，按钮文字保持完整不透明，菜单不增加额外包含块。
+  // 顶栏使用与浏览器外沿一致的实色底，菜单不增加额外包含块。
   assert.doesNotMatch(styles, /\.fg-top::before/);
-  assert.match(rule('.fg-top'), /background: var\(--glass\);/);
+  assert.match(rule('.fg-top'), /background: var\(--surface\);/);
 });
 
 test('draft panel links and temporary highlights keep interaction and change-state semantics separate', () => {

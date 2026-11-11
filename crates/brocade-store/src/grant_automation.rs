@@ -148,11 +148,19 @@ pub(crate) async fn enqueue_if_changed_tx(
 ) -> Result<()> {
     // set_current_revision has already frozen the new snapshot; its predecessor is immutable.
     // Rematerializing here repeats every application/table query while holding the write lock.
-    let previous = crate::materialize::load_immutable_snapshot_tx(tx, previous_revision).await?;
-    let current = crate::materialize::load_immutable_snapshot_tx(tx, revision_id).await?;
+    let previous = crate::model_timing::measure(
+        "grant_load_previous",
+        crate::materialize::load_immutable_snapshot_tx(tx, previous_revision),
+    )
+    .await?;
+    let current = crate::model_timing::measure(
+        "grant_load_current",
+        crate::materialize::load_immutable_snapshot_tx(tx, revision_id),
+    )
+    .await?;
     let changed = match (
-        compiled_grants(&previous).await?,
-        compiled_grants(&current).await?,
+        crate::model_timing::measure("grant_compile_previous", compiled_grants(&previous)).await?,
+        crate::model_timing::measure("grant_compile_current", compiled_grants(&current)).await?,
     ) {
         (Some(previous), Some(current)) => previous != current,
         _ => true,

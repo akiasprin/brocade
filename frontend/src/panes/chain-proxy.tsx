@@ -1,3 +1,4 @@
+import { TitleActions } from '../ui/title-actions';
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -80,9 +81,11 @@ export function ChainProxyListSection({
         <h4>链式代理</h4>
         <span className="hint header-stat">{fronts.length} 个前置组</span>
         <span className="rd">客户端订阅 · 无需发布机器</span>
-        <button className="btn" disabled={!editable || apps.length === 0} onClick={onCreate}>
-          ＋ 新建前置组
-        </button>
+        <TitleActions>
+          <button className="btn" disabled={!editable || apps.length === 0} onClick={onCreate}>
+            ＋ 新建前置组
+          </button>
+        </TitleActions>
       </header>
       {fronts.length === 0 ? (
         <div className="chain-proxy-empty">
@@ -414,7 +417,26 @@ function ChainProxyEditor({
             <span>链式代理</span>
             <span>客户端路由</span>
           </div>
-          <div className="nd-acts">
+          <TitleActions
+            className="nd-acts"
+            primary={
+              <button
+                className="btn primary"
+                disabled={!editable || !valid || saving || !routeAnalysisReady || routeBlocked}
+                onClick={() => void save()}
+              >
+                {saving
+                  ? '保存中…'
+                  : routeBlocked
+                    ? '存在阻断，不能保存'
+                    : routeAnalysisFailed
+                      ? '连通性不可用'
+                      : !routeAnalysisReady
+                        ? '正在判定连通性…'
+                        : '保存前置组'}
+              </button>
+            }
+          >
             <button className="btn" onClick={onBack}>
               返回
             </button>
@@ -423,22 +445,7 @@ function ChainProxyEditor({
                 删除
               </button>
             )}
-            <button
-              className="btn primary"
-              disabled={!editable || !valid || saving || !routeAnalysisReady || routeBlocked}
-              onClick={() => void save()}
-            >
-              {saving
-                ? '保存中…'
-                : routeBlocked
-                  ? '存在阻断，不能保存'
-                  : routeAnalysisFailed
-                    ? '连通性不可用'
-                    : !routeAnalysisReady
-                      ? '正在判定连通性…'
-                      : '保存前置组'}
-            </button>
-          </div>
+          </TitleActions>
         </header>
 
         <div className="nd-paper-body chain-proxy-body">

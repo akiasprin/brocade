@@ -67,6 +67,8 @@ function deployment(id: number): DeploymentListItem {
 }
 
 const activeRelease: BinaryRelease = {
+  agent_flavor: null,
+  allow_flavor_change: false,
   id: 7,
   component: 'xray',
   build_id: 'xray-release',
@@ -102,7 +104,7 @@ const activeRelease: BinaryRelease = {
   ],
 };
 
-function mount({ releases = [] as BinaryRelease[], configChanged = false } = {}) {
+function mount({ releases = [] as BinaryRelease[], configChanged = false, verificationPending = false } = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY }, mutations: { retry: false } },
   });
@@ -122,17 +124,18 @@ function mount({ releases = [] as BinaryRelease[], configChanged = false } = {})
       },
     ],
   });
-  client.setQueryData(['deployment-verify', 14], {
-    summary: { changed_targets: configChanged ? 1 : 0 },
-    targets: [
-      {
-        node_id: 'edge',
-        status: configChanged ? 'pending' : 'skipped',
-        disruptive: false,
-        actions: configChanged ? ['apply-xray'] : [],
-      },
-    ],
-  });
+  if (!verificationPending)
+    client.setQueryData(['deployment-verify', 14], {
+      summary: { changed_targets: configChanged ? 1 : 0 },
+      targets: [
+        {
+          node_id: 'edge',
+          status: configChanged ? 'pending' : 'skipped',
+          disruptive: false,
+          actions: configChanged ? ['apply-xray'] : [],
+        },
+      ],
+    });
   client.setQueryData(['nodes'], {
     nodes: [
       {
@@ -195,6 +198,15 @@ afterEach(() => {
 });
 
 describe('发布页', () => {
+  it('keeps the release ledger visible while the full configuration check is pending', () => {
+    vi.stubGlobal('fetch', () => new Promise(() => {}));
+    draft.init('deployment-overview-checking');
+    draft.clear();
+    mount({ verificationPending: true });
+    expect(screen.getByRole('heading', { name: '发布' })).toBeTruthy();
+    expect(screen.getByText('发布记录 14')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '无待发布变更' })).toBeNull();
+  });
   it('照机器详情页分页签，默认是配置页：读数栏 + 发布流水', () => {
     draft.init('deployment-overview');
     draft.clear();

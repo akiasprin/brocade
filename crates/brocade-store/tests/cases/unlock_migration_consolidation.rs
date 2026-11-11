@@ -2,6 +2,49 @@ use super::*;
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn unlock_defaults_change_for_fresh_installs_without_resetting_existing_schedules() {
+    let Some(fresh) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    fresh.store.migrate().await.unwrap();
+    let interval: i32 = sqlx::query_scalar(
+        "SELECT unlock_detection_interval_hours FROM control_state WHERE id=TRUE",
+    )
+    .fetch_one(fresh.pool())
+    .await
+    .unwrap();
+    assert_eq!(interval, 4);
+
+    for configured in [24, 37] {
+        let db = TestPg::start_if_enabled().await.unwrap();
+        let mut old = sqlx::migrate::Migrator::new(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"),
+        )
+        .await
+        .unwrap();
+        old.migrations = std::borrow::Cow::Owned(
+            old.migrations
+                .iter()
+                .filter(|m| m.version <= 4)
+                .cloned()
+                .collect(),
+        );
+        old.run(db.pool()).await.unwrap();
+        insert_minimal_fixture(db.pool()).await;
+        sqlx::query("UPDATE control_state SET unlock_detection_interval_hours=$1, unlock_detection_next_run_at=TIMESTAMPTZ '2030-01-01T00:00:00Z' WHERE id=TRUE")
+            .bind(configured).execute(db.pool()).await.unwrap();
+        db.store.migrate().await.unwrap();
+        let actual: (i32, bool) = sqlx::query_as("SELECT unlock_detection_interval_hours,unlock_detection_next_run_at=TIMESTAMPTZ '2030-01-01T00:00:00Z' FROM control_state WHERE id=TRUE")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(actual, (configured, true));
+        let default: String = sqlx::query_scalar("SELECT column_default FROM information_schema.columns WHERE table_schema='public' AND table_name='control_state' AND column_name='unlock_detection_interval_hours'")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(default, "4");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn exact_deployed_unlock_history_consolidates_without_changing_observations() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -129,7 +172,17 @@ async fn assert_channel_notifications_work(pool: &PgPool) {
             .await
             .unwrap();
     let xray_switch: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='nodes'::regclass AND attname='xray_enabled' AND NOT attisdropped)").fetch_one(pool).await.unwrap();
-    assert_eq!(triggers, 13 + i64::from(base) + i64::from(xray_switch));
+    let cvm: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM unnest(ARRAY['cvm_instances','cvm_nic_nodes','cvm_entry_nodes','cvm_user_host_network_quotas']) AS relation
+         WHERE to_regclass('public.' || relation) IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        triggers,
+        13 + i64::from(base) + i64::from(xray_switch) + cvm
+    );
     let mut listener = sqlx::postgres::PgListener::connect_with(pool)
         .await
         .unwrap();

@@ -31,6 +31,18 @@ APPLY_MODE=${BROCADE_AGENT_APPLY:-}
 if [ -n "$APPLY_MODE" ]; then APPLY_MODE_EXPLICIT=1; else APPLY_MODE_EXPLICIT=; fi
 SERVICE_MODE=${BROCADE_AGENT_SERVICE_MODE:-auto}
 ENABLE_VPNGATE=${BROCADE_ENABLE_VPNGATE:-0}
+AGENT_FLAVOR=${BROCADE_AGENT_FLAVOR:-}
+AGENT_FLAVOR_EXPLICIT=$AGENT_FLAVOR
+ENABLE_CVM=${BROCADE_ENABLE_CVM:-0}
+CVM_SUPPORTED=__BROCADE_CVM_SUPPORTED__
+CVM_MODE=${BROCADE_CVM_MODE:-}
+CVM_REBOOT_PENDING=0
+CVM_BUNDLE_URL=${BROCADE_CVM_BUNDLE_URL:-}
+CVM_BUNDLE_SHA256=${BROCADE_CVM_BUNDLE_SHA256:-}
+CVM_INSTALLER_URL=${BROCADE_CVM_INSTALLER_URL:-}
+# Bound into the SHA-256-pinned enrollment script by this Console build.
+CVM_INSTALLER_SHA256=__BROCADE_CVM_INSTALLER_SHA256__
+CVM_APPROVED_BUNDLES=__BROCADE_CVM_APPROVED_BUNDLES__
 if [ -n "${BROCADE_VPNGATE_STATS_WINDOW_SECS:-}" ]; then
     VPNGATE_STATS_WINDOW_EXPLICIT=1
 else
@@ -66,6 +78,8 @@ usage() {
     echo "         [--apply linux|state-dir]" >&2
     echo "         [--service-mode auto|systemd|openrc|foreground]" >&2
     echo "         [--enable-openvpn]" >&2
+    echo "         [--enable-cvm] [--cvm-bundle-url URL --cvm-bundle-sha256 SHA256]" >&2
+    echo "         [--cvm-mode auto|kvm|pvm]" >&2
     echo "         [--vpngate-stats-window-secs SECONDS]" >&2
     echo "         [--agent-bin-url URL] [--agent-bin-sha256 SHA256]" >&2
     echo "         [--xray-bin-url URL] [--xray-bin-sha256 SHA256] [--xray-version TAG]" >&2
@@ -79,6 +93,9 @@ usage() {
     echo "  --service-mode openrc      强制写 OpenRC service" >&2
     echo "  --service-mode foreground  不写服务，直接 exec agent。preview 容器用" >&2
     echo "  --enable-openvpn            安装 OpenVPN/iptables，加载并持久化 TUN；默认不安装" >&2
+    echo "  --agent-flavor base|cvm     选择 Agent 变体；网络提供节点只需 cvm，不必安装计算栈" >&2
+    echo "  --enable-cvm                安装经过摘要校验的 CVM 节点运行栈；自动选择 KVM/PVM，PVM 换核后等待手动重启" >&2
+    echo "  --cvm-mode auto|kvm|pvm      显式选择 CVM 模式；省略时保留已有选择，首次默认 auto" >&2
     echo "  --vpngate-stats-window-secs 本机 VPN Gate 性能统计窗口；默认 900，范围 60–86400 秒" >&2
 }
 
@@ -205,6 +222,11 @@ fetch_binary() {
             echo "sha256 不匹配：$url（$dest 保持原样）" >&2
             return 1
         fi
+    fi
+    if [ "$dest" = "${AGENT_BIN:-}" ]; then
+        [ -n "$want_sha" ] || { echo "Agent 下载必须提供 SHA-256" >&2; return 1; }
+        chmod 0700 "$tmp"
+        verify_agent_candidate "$tmp" || return 1
     fi
     install_binary_atomic "$tmp" "$dest"
 }
@@ -395,6 +417,30 @@ while [ "$#" -gt 0 ]; do
             ENABLE_VPNGATE=1
             shift
             ;;
+        --agent-flavor)
+            AGENT_FLAVOR=${2:-}
+            AGENT_FLAVOR_EXPLICIT=$AGENT_FLAVOR
+            case "$AGENT_FLAVOR" in base|cvm) ;; *) echo "Agent flavor 必须是 base 或 cvm" >&2; exit 1 ;; esac
+            shift 2
+            ;;
+        --enable-cvm)
+            ENABLE_CVM=1
+            shift
+            ;;
+        --cvm-mode)
+            CVM_MODE=${2:-}
+            case "$CVM_MODE" in auto|kvm|pvm) ;; *) echo "CVM mode 必须是 auto、kvm 或 pvm" >&2; exit 1 ;; esac
+            ENABLE_CVM=1
+            shift 2
+            ;;
+        --cvm-bundle-url)
+            CVM_BUNDLE_URL=${2:-}
+            shift 2
+            ;;
+        --cvm-bundle-sha256)
+            CVM_BUNDLE_SHA256=${2:-}
+            shift 2
+            ;;
         --vpngate-stats-window-secs)
             VPNGATE_STATS_WINDOW_SECS=${2:-}
             VPNGATE_STATS_WINDOW_EXPLICIT=1
@@ -465,6 +511,43 @@ if [ -z "$VPNGATE_STATS_WINDOW_EXPLICIT" ] && [ -r "$CONFIG_DIR/env" ]; then
     fi
 fi
 [ -n "$APPLY_MODE" ] || APPLY_MODE=linux
+# Product identity is required from the first release; experimental Agents are not adopted.
+installed_flavor=
+if [ -x "$INSTALL_DIR/brocade-agent" ]; then
+    installed_probe=$("$INSTALL_DIR/brocade-agent" self-test 2>/dev/null) || { echo "已有 Agent 自检失败，未替换" >&2; exit 1; }
+    installed_flavor=$(printf '%s\n' "$installed_probe" | sed -n 's/^brocade-agent-product:\(base\|cvm\):v1$/\1/p')
+    case "$installed_flavor" in base|cvm) ;; *) echo "已有 Agent 缺少首发产品身份，不接管实验状态" >&2; exit 1 ;; esac
+fi
+if [ "$ENABLE_CVM" = "1" ]; then
+    [ "$AGENT_FLAVOR_EXPLICIT" != "base" ] || { echo "计算扩展需要 CVM Agent" >&2; exit 1; }
+    AGENT_FLAVOR=cvm
+fi
+[ -n "$AGENT_FLAVOR" ] || AGENT_FLAVOR=${installed_flavor:-base}
+case "$AGENT_FLAVOR" in base|cvm) ;; *) echo "Agent flavor 必须是 base 或 cvm" >&2; exit 1 ;; esac
+if [ "$AGENT_FLAVOR" = "cvm" ] && [ "$CVM_SUPPORTED" != "1" ]; then
+    echo "当前 Console 为基础版；请先安装容器版扩展" >&2; exit 1
+fi
+if [ "$installed_flavor" = "cvm" ] && [ "$AGENT_FLAVOR" = "base" ]; then
+    if have systemctl && systemctl is-active --quiet brocade-agent.service; then
+        echo "请先排空容器资源并停止 brocade-agent.service，再切换为基础版" >&2; exit 1
+    fi
+    if have rc-service && rc-service brocade-agent status >/dev/null 2>&1; then
+        echo "请先排空容器资源并停止 brocade-agent，再切换为基础版" >&2; exit 1
+    fi
+    [ -s "$CONFIG_DIR/token" ] || { echo "请先使用原纳管身份确认 CVM 清理，不能离线降级" >&2; exit 1; }
+    "$INSTALL_DIR/brocade-agent" product-check --state-dir "$STATE_DIR" \
+        --server "$SERVER" --token-file "$CONFIG_DIR/token" || exit 1
+fi
+
+verify_agent_candidate() {
+    candidate=$1
+    probe_out=$("$candidate" self-test 2>/dev/null) || { echo "候选 Agent 自检失败，旧文件保持原样" >&2; return 1; }
+    printf '%s\n' "$probe_out" | grep -Fxq "brocade-agent-product:$AGENT_FLAVOR:v1" || {
+        echo "候选 Agent 产品变体不匹配，旧文件保持原样" >&2; return 1;
+    }
+    printf '%s\n' "$probe_out" | grep -Fxq 'brocade-agent-self-test-v1'
+}
+
 # Re-running this script on an already enrolled machine is an upgrade: replace the binaries, fill in
 # the dependencies, refresh the env and the unit, and require no further enrollment token (it is
 # single-use and a second cannot be signed).
@@ -563,6 +646,49 @@ fi
 if [ "$APPLY_MODE" = "linux" ] && [ "$ENABLE_VPNGATE" = "1" ]; then
     ensure_tun_runtime || exit 1
 fi
+if [ "$CVM_SUPPORTED" != "1" ] && { [ "$ENABLE_CVM" = "1" ] || [ -n "$CVM_MODE$CVM_BUNDLE_URL$CVM_BUNDLE_SHA256$CVM_INSTALLER_URL" ]; }; then
+    echo "当前 Console 为基础版；请先安装容器版扩展" >&2
+    exit 1
+fi
+# CVM network providers need host networking tools even without the compute runtime.
+if [ "$AGENT_FLAVOR" = "cvm" ]; then
+    [ "$APPLY_MODE" = "linux" ] || {
+        echo "CVM Agent 需要 --apply linux" >&2; exit 1;
+    }
+    for cvm_dependency in ip tc ss nft conntrack wg findmnt nsenter mount umount; do
+        if ! have "$cvm_dependency"; then
+            case "$cvm_dependency" in
+                ip|ss)
+                    if have dnf || have yum; then cvm_package=iproute; else cvm_package=iproute2; fi ;;
+                tc)
+                    if have apk; then cvm_package=iproute2-tc
+                    elif have dnf || have yum; then cvm_package=iproute-tc
+                    else cvm_package=iproute2; fi ;;
+                conntrack) cvm_package=conntrack ;;
+                wg) cvm_package=wireguard-tools ;;
+                nft) cvm_package=nftables ;;
+                findmnt|nsenter|mount|umount) cvm_package=util-linux ;;
+            esac
+            install_pkg "$cvm_package" || { echo "CVM 缺少 $cvm_dependency" >&2; exit 1; }
+            have "$cvm_dependency" || { echo "CVM 安装后仍缺少 $cvm_dependency" >&2; exit 1; }
+        fi
+    done
+fi
+if [ "$ENABLE_CVM" = "1" ]; then
+    [ "$APPLY_MODE" = "linux" ] && [ "$SERVICE_MODE" = "systemd" ] || {
+        echo "CVM 扩展需要 --apply linux 和 systemd" >&2; exit 1;
+    }
+    for cvm_dependency in python3 modprobe; do
+        if ! have "$cvm_dependency"; then
+            case "$cvm_dependency" in python3) cvm_package=python3 ;; modprobe) cvm_package=kmod ;; esac
+            install_pkg "$cvm_package" || { echo "CVM 缺少 $cvm_dependency" >&2; exit 1; }
+            have "$cvm_dependency" || { echo "CVM 安装后仍缺少 $cvm_dependency" >&2; exit 1; }
+        fi
+    done
+    python3 -c 'import sys; sys.exit(sys.version_info < (3,11))' || {
+        echo "CVM 安装器需要 Python 3.11 或更新版本" >&2; exit 1;
+    }
+fi
 
 install -d -m 0755 "$INSTALL_DIR" "$CONFIG_DIR" "$STATE_DIR"
 AGENT_BIN="$INSTALL_DIR/brocade-agent"
@@ -586,6 +712,40 @@ dist_field() {
     printf '%s' "$DIST_JSON" | tr ',' '\n' \
         | sed -n 's/.*"'"$1"'" *: *"\([^"]*\)".*/\1/p' | head -1
 }
+cvm_approved_field() {
+    printf '%s' "$CVM_APPROVED_BUNDLES" | python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1], ""))' "$1"
+}
+cvm_download() {
+    python3 - "$@" <<'PY'
+import datetime, os, signal, subprocess, sys, time
+label, command = sys.argv[1], sys.argv[2:]
+started = time.monotonic()
+def progress(message):
+    stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+    print(f'[{stamp}] CVM {label}: {message}, elapsed {time.monotonic()-started:.1f}s', file=sys.stderr, flush=True)
+def interrupted(number, _):
+    raise SystemExit(128 + number)
+for number in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(number, interrupted)
+process = subprocess.Popen(command, start_new_session=True)
+try:
+    progress('started')
+    while True:
+        try:
+            code = process.wait(timeout=30)
+            progress(f'completed, exit {code}')
+            raise SystemExit(code)
+        except subprocess.TimeoutExpired:
+            progress('downloading')
+finally:
+    if process.poll() is None:
+        os.killpg(process.pid, signal.SIGTERM)
+        try: process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+PY
+}
 # Command-line values always win and the manifest only fills blanks. A control plane that cannot be
 # asked counts as absent rather than an error: specifying --*-bin-url by hand, or the machine already
 # having them, are both legitimate ways to install.
@@ -608,11 +768,9 @@ if [ -n "$DIST_JSON" ]; then
     # What the operator configured explicitly wins (a CDN, or a fleet holding architectures the
     # embedding does not cover); unconfigured, the control plane's own copy is selected by host
     # architecture.
-    [ -n "$AGENT_BIN_URL" ]              || AGENT_BIN_URL=$(dist_field agent_bin_url)
-    [ -n "$AGENT_BIN_SHA256" ]           || AGENT_BIN_SHA256=$(dist_field agent_bin_sha256)
     if [ -z "$AGENT_BIN_URL" ] && [ -n "$AGENT_ARCH" ]; then
-        AGENT_BIN_URL=$(dist_field "agent_bin_url_$AGENT_ARCH")
-        AGENT_BIN_SHA256=$(dist_field "agent_bin_sha256_$AGENT_ARCH")
+        AGENT_BIN_URL=$(dist_field "agent_bin_url_${AGENT_FLAVOR}_$AGENT_ARCH")
+        AGENT_BIN_SHA256=$(dist_field "agent_bin_sha256_${AGENT_FLAVOR}_$AGENT_ARCH")
     fi
     if [ -z "$XRAY_VERSION_EXPLICIT" ]; then
         XRAY_VERSION=$(dist_field xray_version)
@@ -633,6 +791,7 @@ if [ -n "$DIST_JSON" ]; then
     [ -n "$PHANTUN_CLIENT_URL" ]         || PHANTUN_CLIENT_URL=$(dist_field phantun_client_url)
     [ -n "$PHANTUN_CLIENT_SHA" ]         || PHANTUN_CLIENT_SHA=$(dist_field phantun_client_sha256)
 fi
+
 
 if [ -n "$AGENT_BIN_URL" ]; then
     fetch_binary "$AGENT_BIN_URL" "$AGENT_BIN_SHA256" "$AGENT_BIN" || exit 1
@@ -665,23 +824,49 @@ else
     exit 1
 fi
 
-# Prefer the stable read-only self-test. Existing published Agents without it still use
-# the compatibility usage probe; only the command token matters, not English help prose.
-probe_agent() {
-    if probe_out=$("$AGENT_BIN" self-test 2>/dev/null); then
-        if printf '%s\n' "$probe_out" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-           | grep -Fxq 'brocade-agent-self-test-v1'; then
-            return 0
-        fi
+verify_agent_candidate "$AGENT_BIN" || exit 1
+
+if [ "$ENABLE_CVM" = "1" ]; then
+    [ -n "$CVM_BUNDLE_URL" ] || CVM_BUNDLE_URL=$(cvm_approved_field "cvm_bundle_url_$AGENT_ARCH")
+    [ -n "$CVM_BUNDLE_SHA256" ] || CVM_BUNDLE_SHA256=$(cvm_approved_field "cvm_bundle_sha256_$AGENT_ARCH")
+    [ -n "$CVM_INSTALLER_URL" ] || CVM_INSTALLER_URL="$SERVER/enroll/cvm-stack.py"
+    for cvm_digest in "$CVM_BUNDLE_SHA256" "$CVM_INSTALLER_SHA256"; do
+        case "$cvm_digest" in
+            ''|*[!0-9a-f]*) echo "控制面尚未提供本机架构的已校验 CVM 运行栈或安装器" >&2; exit 1 ;;
+        esac
+        [ "${#cvm_digest}" = 64 ] || { echo "CVM SHA-256 长度不正确" >&2; exit 1; }
+    done
+    [ -n "$CVM_BUNDLE_URL" ] && [ -n "$CVM_INSTALLER_URL" ] || {
+        echo "CVM 分发地址缺失；请配置控制面的对应架构运行栈" >&2; exit 1;
+    }
+    for cvm_url in "$CVM_BUNDLE_URL" "$CVM_INSTALLER_URL"; do
+        case "$cvm_url" in http://*|https://*) ;; *) echo "CVM 分发地址必须使用 HTTP 或 HTTPS" >&2; exit 1 ;; esac
+    done
+    install -d -m 0755 /usr/local/lib/brocade
+    cvm_installer_file=$(mktemp)
+    TMPFILES="$TMPFILES $cvm_installer_file"
+    cvm_download installer curl $CURL_FLAGS --connect-timeout 10 --max-time 120 --max-filesize 1048576 \
+        --proto '=http,https' --proto-redir '=http,https' "$CVM_INSTALLER_URL" -o "$cvm_installer_file" || exit 1
+    printf '%s  %s\n' "$CVM_INSTALLER_SHA256" "$cvm_installer_file" | sha256sum -c - >/dev/null || exit 1
+    install_binary_atomic "$cvm_installer_file" /usr/local/lib/brocade/cvm-stack.py || exit 1
+    cvm_bundle_file=$(mktemp)
+    TMPFILES="$TMPFILES $cvm_bundle_file"
+    echo "downloading verified CVM node runtime ..." >&2
+    cvm_download runtime curl $CURL_FLAGS --connect-timeout 10 --max-time 1800 --max-filesize 4294967296 \
+        --proto '=http,https' --proto-redir '=http,https' "$CVM_BUNDLE_URL" -o "$cvm_bundle_file" || exit 1
+    # No one-time enrollment credential has been consumed at this point.
+    case "$CVM_MODE" in ''|auto|kvm|pvm) ;; *) echo "CVM mode 必须是 auto、kvm 或 pvm" >&2; exit 1 ;; esac
+    set -- install --bundle "$cvm_bundle_file" --sha256 "$CVM_BUNDLE_SHA256"
+    [ -z "$CVM_MODE" ] || set -- "$@" --mode "$CVM_MODE"
+    if BROCADE_CVM_AGENT_BIN="$AGENT_BIN" python3 /usr/local/lib/brocade/cvm-stack.py "$@"; then
+        :
+    else
+        cvm_exit=$?
+        if [ "$cvm_exit" != 75 ]; then exit "$cvm_exit"; fi
+        CVM_REBOOT_PENDING=1
     fi
-    probe_out=$("$AGENT_BIN" --server http://127.0.0.1:1 --token probe __brocade_probe 2>&1 || true)
-    if printf '%s\n' "$probe_out" | grep -qE '(^|[^[:alnum:]_-])run([^[:alnum:]_-]|$)'; then
-        return 0
-    fi
-    echo "「$AGENT_BIN」未通过 Agent 自检，旧版命令列表也没有 run（本机架构 $(uname -m)）。" >&2
-    return 1
-}
-probe_agent || exit 1
+fi
+
 
 # linux mode really touches the system, so the data-plane dependencies are installed here in one go
 # rather than leaving anything to be prepared by hand first.
@@ -782,6 +967,7 @@ cat > "$CONFIG_DIR/env" <<EOF
 BROCADE_AGENT_SERVER=$SERVER
 BROCADE_NODE_TOKEN_FILE=$CONFIG_DIR/token
 BROCADE_AGENT_STATE_DIR=$STATE_DIR
+BROCADE_AGENT_FLAVOR=$AGENT_FLAVOR
 BROCADE_AGENT_APPLY=$APPLY_MODE
 BROCADE_XRAY_BIN=$XRAY_BIN
 BROCADE_VPNGATE_STATS_WINDOW_SECS=$VPNGATE_STATS_WINDOW_SECS
@@ -1216,3 +1402,7 @@ done
     fi
     exit 1
 }
+if [ "$CVM_REBOOT_PENDING" = 1 ]; then
+    echo "CVM 已准备好，等待手动重启宿主；重启后自动继续安装。Agent 已正常纳管，CVM 尚未就绪。" >&2
+    exit 75
+fi

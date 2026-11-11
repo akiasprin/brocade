@@ -9,6 +9,31 @@ pub fn target_dir(workspace: &Path) -> PathBuf {
     workspace.join("target/brocade-agent-build")
 }
 
+pub fn flavor_target_dir(workspace: &Path, flavor: &str) -> PathBuf {
+    assert!(matches!(flavor, "base" | "cvm"));
+    target_dir(workspace).join(flavor)
+}
+
+pub fn flavor_command(workspace: &Path, cache: &Path, triples: &[&str], flavor: &str) -> Command {
+    let mut command = command(workspace, cache, triples);
+    command.arg("--no-default-features");
+    match flavor {
+        "base" => {}
+        "cvm" => {
+            command.args(["--features", "cvm"]);
+        }
+        _ => panic!("unknown Agent product flavor"),
+    }
+    command
+}
+
+/// Generated tonic includes carry absolute OUT_DIR spans even when Cargo runs
+/// from the workspace root. Keep those panic locations independent of checkout.
+pub fn rustflags(workspace: &Path, linker: Option<&str>) -> String {
+    let remap = format!("--remap-path-prefix={}=.", workspace.display());
+    linker.map_or(remap.clone(), |flags| format!("{flags} {remap}"))
+}
+
 pub fn command(workspace: &Path, cache: &Path, triples: &[&str]) -> Command {
     assert!(
         !triples.is_empty(),
@@ -41,6 +66,22 @@ mod tests {
     };
 
     #[test]
+    fn variants_use_separate_caches_and_explicit_features() {
+        let root = Path::new("/workspace");
+        for flavor in ["base", "cvm"] {
+            let cache = flavor_target_dir(root, flavor);
+            assert_eq!(cache, root.join("target/brocade-agent-build").join(flavor));
+            let command = flavor_command(root, &cache, &["x86_64-unknown-linux-musl"], flavor);
+            let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+            assert!(args.contains(&"--no-default-features"));
+            assert_eq!(
+                args.windows(2).any(|a| a == ["--features", "cvm"]),
+                flavor == "cvm"
+            );
+        }
+    }
+
+    #[test]
     fn both_targets_share_one_graph_and_keep_per_target_compiler_settings() {
         let root = Path::new("/workspace");
         let cache = target_dir(root);
@@ -65,6 +106,11 @@ mod tests {
         assert!(args.iter().any(|a| a == "--locked"));
         assert_eq!(command.get_current_dir(), Some(root));
         assert_eq!(cache, root.join("target/brocade-agent-build"));
+        assert_eq!(rustflags(root, None), "--remap-path-prefix=/workspace=.");
+        assert_eq!(
+            rustflags(root, Some("-C linker=rust-lld")),
+            "-C linker=rust-lld --remap-path-prefix=/workspace=."
+        );
         for key in [
             "CARGO_TARGET_DIR",
             "RUSTFLAGS",

@@ -307,6 +307,8 @@ pub struct ArtifactContent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevisionList {
     pub current_revision: u64,
+    /// Coverage metadata, not a claim that the fleet currently matches the model.
+    pub last_config_revision_id: Option<u64>,
     pub revisions: Vec<RevisionListItem>,
 }
 

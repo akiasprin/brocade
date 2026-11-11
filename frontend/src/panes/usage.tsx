@@ -1,3 +1,4 @@
+import { TitleActions } from '../ui/title-actions';
 // 月度台账与实时流量分为同级页签，共用发布页的连续纸与页头。容量预测保留独立页面。
 
 import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
@@ -125,8 +126,9 @@ export function UsagePane() {
             </div>
           </div>
           {tab === 'monthly' && (
-            <div className="nd-tools">
-              {monthly.isFetching && monthly.data && <span className="usage-refreshing">读取中</span>}
+            <TitleActions
+              status={monthly.isFetching && monthly.data && <span className="usage-refreshing">读取中</span>}
+            >
               <div className="segsw usage-month-tabs" role="group" aria-label="用量月份">
                 <button type="button" aria-pressed={monthOffset === 0} onClick={() => setMonthOffset(0)}>
                   本月
@@ -135,7 +137,7 @@ export function UsagePane() {
                   上月
                 </button>
               </div>
-            </div>
+            </TitleActions>
           )}
         </header>
         <div

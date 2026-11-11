@@ -16,6 +16,7 @@ listen_address_path=$config_root/listen-address
 public_url_path=$config_root/agent-public-url
 database_type_path=$config_root/database-type
 database_url_path=$config_root/database-url
+product_flavor_path=$config_root/product-flavor
 service_unit=/etc/systemd/system/brocade.service
 socket_unit=/etc/systemd/system/brocade.socket
 socket_dropin_dir=/etc/systemd/system/brocade.service.d
@@ -35,7 +36,7 @@ usage() {
 Usage: [sudo] sh install.sh [--public-ip IP] [--port PORT]
                               [--managed-db | --database-url postgresql://... | --database-url-file PATH]
                               [--no-start]
-       [sudo] sh install.sh --upgrade
+       [sudo] sh install.sh --upgrade [--forward-only] [--flavor base|cvm] [--initialize-product]
 
 Installs the two binaries from this release bundle, the minimal OS prerequisites, and a dedicated
 non-login `brocade` account. Serves HTTP directly on the server IP, port 8080 by default.
@@ -45,8 +46,12 @@ An interactive terminal lets you confirm the detected IP, port, and database cho
 PostgreSQL is not installed by apt/apk and no project is compiled.
 Starts the managed systemd service and prints the ready URL. Without systemd, the launcher
 continues in the foreground. --no-start installs files without starting the runtime.
---upgrade updates an existing installer-managed service from v0.3.1 or later. It preserves
+--upgrade updates an existing installer-managed service. It preserves
 configuration, checks the database, backs up installation/data, and runs forward migrations.
+--forward-only keeps an incomplete upgrade stopped for forward repair, without automatically
+restoring the old program or restarting the old service. Requires --upgrade.
+--initialize-product explicitly initializes missing experimental product identity; requires
+--upgrade --flavor base and a database accepted by the base Console's preflight.
 EOF
 }
 
@@ -59,6 +64,9 @@ database_url=
 database_url_file=
 start_runtime=true
 upgrade=false
+forward_only=false
+requested_flavor=
+initialize_product=false
 while [ "$#" -gt 0 ]; do
     case $1 in
         -h|--help)
@@ -69,8 +77,22 @@ while [ "$#" -gt 0 ]; do
             start_runtime=false
             shift
             ;;
+        --flavor)
+            [ "$#" -ge 2 ] || die "--flavor 后需要 base 或 cvm"
+            requested_flavor=$2
+            case "$requested_flavor" in base|cvm) ;; *) die "flavor 必须是 base 或 cvm" ;; esac
+            shift 2
+            ;;
         --upgrade)
             upgrade=true
+            shift
+            ;;
+        --initialize-product)
+            initialize_product=true
+            shift
+            ;;
+        --forward-only)
+            forward_only=true
             shift
             ;;
         --public-ip)
@@ -124,6 +146,9 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+[ "$forward_only" = false ] || [ "$upgrade" = true ] || die "--forward-only 需要同时指定 --upgrade"
+[ "$initialize_product" = false ] || { [ "$upgrade" = true ] && [ "$requested_flavor" = base ]; } || die "--initialize-product 需要 --upgrade --flavor base"
 
 [ "$(id -u)" -eq 0 ] || die "需要 root 权限；请用 root 执行（有 sudo 时可执行 sudo sh install.sh）"
 
@@ -272,7 +297,7 @@ else
 fi
 
 script_dir=$(CDPATH='' cd -P "$(dirname "$0")" && pwd)
-for required in brocade-launcher brocade-console BROCADE_PLATFORM SHA256SUMS; do
+for required in brocade-launcher brocade-console BROCADE_PLATFORM BROCADE_FLAVOR SHA256SUMS; do
     [ -f "$script_dir/$required" ] || die "发行包缺少 $required"
 done
 command -v sha256sum >/dev/null 2>&1 || die "系统缺少 sha256sum，无法先验证发行包"
@@ -281,6 +306,26 @@ command -v sha256sum >/dev/null 2>&1 || die "系统缺少 sha256sum，无法先�
 # binaries by CI and names only files in this bundle.
 say "验证发行包…"
 (cd "$script_dir" && sha256sum -c SHA256SUMS) || die "发行包 SHA-256 校验失败"
+
+IFS= read -r bundle_flavor < "$script_dir/BROCADE_FLAVOR" || die "无法读取发行包产品变体"
+case "$bundle_flavor" in base|cvm) ;; *) die "发行包产品变体无效" ;; esac
+[ -z "$requested_flavor" ] || [ "$requested_flavor" = "$bundle_flavor" ] || die "--flavor 与发行包不匹配"
+compiled_info=$("$script_dir/brocade-console" product-info) || die "候选 Console 产品自检失败"
+compiled_flavor=$(printf '%s\n' "$compiled_info" | sed -n 's/.*"flavor"[[:space:]]*:[[:space:]]*"\(base\|cvm\)".*/\1/p')
+[ "$compiled_flavor" = "$bundle_flavor" ] || die "候选 Console 与发行清单不匹配"
+if [ "$upgrade" = true ]; then
+    if [ "$initialize_product" = true ]; then
+        [ ! -e "$product_flavor_path" ] && [ ! -L "$product_flavor_path" ] || die "已有产品身份，不能再次初始化"
+        [ "$bundle_flavor" = base ] && [ "$requested_flavor" = base ] || die "首次产品身份只能显式初始化为 base"
+    else
+        [ -f "$product_flavor_path" ] && [ ! -L "$product_flavor_path" ] || die "原安装缺少产品身份；清理实验 CVM 后须显式 --upgrade --flavor base --initialize-product"
+        IFS= read -r installed_flavor < "$product_flavor_path" || die "无法读取原产品变体"
+        case "$installed_flavor" in base|cvm) ;; *) die "原产品变体无效" ;; esac
+        if [ "$installed_flavor" != "$bundle_flavor" ] && [ -z "$requested_flavor" ]; then
+            die "切换产品变体必须明确指定 --flavor $bundle_flavor"
+        fi
+    fi
+fi
 
 case $(uname -m) in
     x86_64|amd64) machine_arch=x86_64 ;;
@@ -413,6 +458,7 @@ listen_address_stage=$config_root/.listen-address.$$
 public_url_stage=$config_root/.agent-public-url.$$
 database_type_stage=$config_root/.database-type.$$
 database_url_stage=$config_root/.database-url.$$
+product_flavor_stage=$config_root/.product-flavor.$$
 service_stage=$config_root/.brocade.service.$$
 socket_stage=$config_root/.brocade.socket.$$
 socket_dropin_stage=$config_root/.brocade-socket-dropin.$$
@@ -437,9 +483,9 @@ stop_runtime() {
 }
 cleanup_staging() {
     if [ "$upgrade_service_stopped" = true ] && [ "$upgrade_success" = false ]; then
-        if [ -e "$upgrade_backup/database/migration-started" ]; then
+        if [ "$forward_only" = true ] || [ -e "$upgrade_backup/database/migration-started" ]; then
             stop_runtime || true
-            say "升级未完成，数据库迁移可能已开始；服务保持停止，不自动回退旧程序或恢复数据库。" >&2
+            say "升级未完成，已要求前向修复或数据库迁移可能已开始；服务保持停止，不自动回退旧程序或恢复数据库。" >&2
             say "备份与恢复记录：$upgrade_backup" >&2
         else
             if [ "$upgrade_published" = true ]; then
@@ -453,6 +499,7 @@ cleanup_staging() {
                     rm -f "$socket_unit"
                 fi
                 if [ "$socket_dropin_existed" = false ]; then rm -f "$socket_dropin"; fi
+                if [ "$initialize_product" = true ]; then rm -f "$product_flavor_path"; fi
                 systemctl daemon-reload || return
             fi
             # Explicit recovery must not inherit the failed candidate's systemd start counter.
@@ -466,7 +513,7 @@ cleanup_staging() {
     fi
     rm -f "$launcher_stage" "$console_stage" "$command_stage" \
         "$listen_address_stage" "$public_url_stage" \
-        "$database_type_stage" "$database_url_stage" "$service_stage" \
+        "$database_type_stage" "$database_url_stage" "$product_flavor_stage" "$service_stage" \
         "$socket_stage" "$socket_dropin_stage" "$ready_error"
 }
 trap cleanup_staging 0
@@ -549,7 +596,7 @@ if [ "$upgrade" = true ]; then
     mkdir -m 0710 "$upgrade_backup"
     chown root:"$service_group" "$upgrade_backup"
     install -d -o "$service_user" -g "$service_group" -m 0700 "$upgrade_backup/database"
-    say "检查 v0.3.1 起的数据库兼容性…"
+    say "检查产品数据库结构与变体切换前提…"
     run_upgrade_database --check-only
     say "停止原服务并备份安装、配置、密钥和数据…"
     upgrade_service_stopped=true
@@ -683,6 +730,8 @@ exec "$runtime" "$@"
 EOF
 chmod 0755 "$command_stage"
 
+printf '%s\n' "$bundle_flavor" >"$product_flavor_stage"
+chmod 0644 "$product_flavor_stage"
 printf '%s\n' "$listen_address" >"$listen_address_stage"
 chmod 0644 "$listen_address_stage"
 printf '%s\n' "$public_url" >"$public_url_stage"
@@ -704,6 +753,7 @@ mv -f "$console_stage" "$console_path"
 mv -f "$launcher_stage" "$launcher_path"
 install -o root -g root -m 0644 "$script_dir/BROCADE_PLATFORM" "$install_root/BROCADE_PLATFORM"
 install -o root -g root -m 0644 "$script_dir/SHA256SUMS" "$install_root/SHA256SUMS"
+mv -f "$product_flavor_stage" "$product_flavor_path"
 mv -f "$public_url_stage" "$public_url_path"
 mv -f "$listen_address_stage" "$listen_address_path"
 # One-time migration: the new wrapper no longer reads the retired access-mode selector.
