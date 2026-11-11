@@ -11770,22 +11770,19 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn embedded_xray_banner_keeps_upstream_shape_and_names_the_pinned_baseline() {
-        use std::os::unix::fs::PermissionsExt;
-
         let host_arch = std::env::consts::ARCH;
-        let (_, bytes, _) = EMBEDDED_XRAYS
+        let (_, _, digest) = EMBEDDED_XRAYS
             .iter()
             .find(|(arch, _, _)| *arch == host_arch)
             .unwrap_or_else(|| panic!("没有可在当前 {host_arch} 主机执行的内嵌 Xray"));
-        // A deterministic /tmp filename survives a killed test and can collide with another test
-        // process after PID reuse, leaving Linux to reject execution with ETXTBSY. An owned
-        // directory gives every invocation a fresh inode and cleans it on every exit path.
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("xray");
-        std::fs::write(&path, bytes).unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&path, permissions).unwrap();
+        // Execute the immutable build artifact, checking that it is the embedded executable.
+        // Extracting another copy during parallel process spawning can expose a writable file
+        // descriptor to a child and make Linux reject exec with ETXTBSY even after our close.
+        let path = std::path::Path::new(env!("OUT_DIR")).join(format!("xray-{host_arch}"));
+        assert_eq!(
+            brocade_core::hash::sha256_hex(&std::fs::read(&path).unwrap()),
+            *digest
+        );
 
         let output = std::process::Command::new(&path)
             .arg("version")
