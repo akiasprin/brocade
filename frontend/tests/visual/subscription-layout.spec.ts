@@ -4,6 +4,8 @@ import { readFile } from 'node:fs/promises';
 
 // Full-viewport captures include a blurred background with slight color rounding.
 // QR contents are decoded separately from screenshots and exported SVGs.
+// WebKit SVG rasterization depends on OS libraries; use the baseline environment
+// documented in .agents/standards/testing.md when regenerating snapshots.
 const SCREENSHOT_OPTIONS = { threshold: 0.1 };
 
 async function decodeImage(page: Page, source: string) {
