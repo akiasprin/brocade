@@ -5110,10 +5110,17 @@ function ChainList({ go }: { go: (d: Drill) => void }) {
                               </span>
                               <span className="chain-card-title">
                                 <b>{r.chain.name || r.chain.id}</b>
-                                {r.chain.name && r.chain.name !== r.chain.id && <span>{r.chain.id}</span>}
-                                {listenerReferenceCount > 0 && (
-                                  <span title="其它线路正在引用这条链拥有的监听子树">
-                                    {listenerReferenceCount} 处监听引用
+                                {((r.chain.name && r.chain.name !== r.chain.id) || listenerReferenceCount > 0) && (
+                                  <span>
+                                    {r.chain.id}
+                                    {listenerReferenceCount > 0 && (
+                                      <>
+                                        {' | '}
+                                        <span title="其它线路正在引用这条链拥有的监听子树">
+                                          {listenerReferenceCount} 处监听引用
+                                        </span>
+                                      </>
+                                    )}
                                   </span>
                                 )}
                               </span>

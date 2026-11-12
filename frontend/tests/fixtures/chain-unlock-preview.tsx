@@ -15,6 +15,7 @@ import type { ModelOp } from '../../src/draft';
 import { App } from '../../src/app';
 import { preloadPaneForHash } from '../../src/panes/preload';
 import { type Session } from '../../src/session';
+import { CVM_ENABLED } from '../../src/product';
 import { MACHINES, TENANT, chainSnapshot, e2eProbes, previewSnapshot } from './chain-data';
 import { agentState, nicView, pingLatest, reports, trafficItem } from './node-roster-data';
 import { settings } from './unlock-data';
@@ -53,6 +54,23 @@ const numberParam = (url: URL, name: string) => Number(url.searchParams.get(name
 
 /** Add the protocol fields required by production chain details to the synthetic list data. */
 function withDetailFields(view: ConsoleSnapshot): ConsoleSnapshot {
+  if (params.has('listener-references')) {
+    const app = view.snapshot.apps.find(app => app.id === 'apac')!;
+    for (const chain of ['jp-sb', 'tw-hinet']) {
+      const step = app.steps.find(step => step.chain === chain)!;
+      step.rules = [
+        {
+          m: { t: 'any' },
+          a: {
+            t: 'reuse_listener',
+            listener: { chain: 'jp-iij', node: 'jp-iij' },
+            dial: { t: 'overlay' },
+            pool: { t: 'none' },
+          },
+        },
+      ];
+    }
+  }
   for (const app of view.snapshot.apps)
     for (const ingress of app.ingresses) {
       const hy2 = ingress.wires.hysteria2 as Partial<Hysteria2Settings> | null | undefined;
@@ -163,23 +181,41 @@ const jobOf = (chain: string, selection: UnlockProbeSelection) => {
         result.code = 'network_error';
         result.region = null;
         const failure = {
-          status: 'failed' as const, code: 'network_error' as const, http_status: null,
-          page_region: null, topbar_region: null, privacy_region: null,
+          status: 'failed' as const,
+          code: 'network_error' as const,
+          http_status: null,
+          page_region: null,
+          topbar_region: null,
+          privacy_region: null,
         };
         result.youtube!.webpage = { ...failure };
         result.youtube!.premium = { ...failure };
         result.youtube!.cdn = {
-          http_status: null, node: null, airport: null, country: null, error: 'network_error', elapsed_ms: 0,
+          http_status: null,
+          node: null,
+          airport: null,
+          country: null,
+          error: 'network_error',
+          elapsed_ms: 0,
         };
       }
       job = {
-        ...job, state: 'complete', path_error: null, previous_results: [],
-        results: job.results.map(original => original.service === 'youtube_premium' ? result : original),
+        ...job,
+        state: 'complete',
+        path_error: null,
+        previous_results: [],
+        results: job.results.map(original => (original.service === 'youtube_premium' ? result : original)),
       };
     }
     if (job && selection === 'v6' && chain === 'hk-direct' && params.has('dial-error')) {
       const scenario = params.get('dial-error') === 'unreachable' ? 'unreachable' : 'no-egress';
-      job = { ...job, state: 'complete', path_error: null, previous_results: [], results: job.results.map(result => withDialFailure(result, scenario)) };
+      job = {
+        ...job,
+        state: 'complete',
+        path_error: null,
+        previous_results: [],
+        results: job.results.map(result => withDialFailure(result, scenario)),
+      };
     }
     jobs.set(key, job);
   }
@@ -263,7 +299,7 @@ globalThis.fetch = async (input, init) => {
   }
   if (path === '/branding') return json({ site_name: 'Brocade', icon_data_url: null });
   if (path === '/auth/state') return json({ initialized: true, public_open: role === 'public' });
-  if (path === '/bootstrap') return json(session);
+  if (path === '/bootstrap') return json({ features: { cvm: CVM_ENABLED }, ...session });
   if (path === '/whoami') return json(who);
   if (path === '/revisions')
     return json({
