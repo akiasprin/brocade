@@ -103,6 +103,15 @@ for (const engine of ['chromium', 'webkit'] as const) {
       expect(await sidebar.evaluate(element => element.scrollWidth > element.clientWidth)).toBe(true);
       await dialog.getByRole('button', { name: '日本 10', exact: true }).click();
       await expect(dialog.getByRole('button', { name: '复制 10 个', exact: true })).toBeVisible();
+      for (const control of [
+        dialog.getByRole('button', { name: '复制 10 个', exact: true }),
+        dialog.getByRole('button', { name: '拨测 10 个', exact: true }),
+        dialog.locator('.node-copy').first(),
+      ]) {
+        const bounds = await control.boundingBox();
+        expect(bounds).not.toBeNull();
+        expect(bounds!.height).toBeGreaterThanOrEqual(36);
+      }
       await contained(dialog);
       await expect(dialog).toHaveScreenshot(`nodes-${engine}-phone-${width}-${theme}.png`);
       const last = dialog.locator('.node-copy').last();
