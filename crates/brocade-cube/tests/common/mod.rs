@@ -637,6 +637,11 @@ impl Fixture {
         }
     }
     pub fn report(&self, generation: u64) -> Value {
+        // The receipt file becomes visible before the executor publishes its record.
+        // Retrying and observing require the same completed-attempt boundary.
+        self.backend()
+            .wait_idle(Duration::from_secs(10))
+            .expect("fixture execution must settle before reading its receipt");
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok(bytes) = fs::read(self.records.join("cvm-test.json")) {
