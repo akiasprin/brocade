@@ -15,6 +15,7 @@ import type {
 } from '../src/api';
 import type { LoadRange } from '../src/panes/nodes';
 import { loadRangeKey } from '../src/ui/observe-range';
+import { theme } from '../src/forge/theme';
 import {
   observeAreaFill,
   observeBpsReading,
@@ -31,6 +32,28 @@ const chartMock = vi.hoisted(() => ({
   hideLoading: vi.fn(),
   connect: vi.fn(),
 }));
+
+const chartThemes = [
+  {
+    mode: 'light',
+    colors: ['#286983', '#b66fa2', '#5b8e66', '#4d70b2', '#d7827e', '#56949f'],
+    overlayAlphas: [0.4384, 0.2411],
+    bandAlpha: 0.28,
+    firstBand: 'rgba(40,105,131,0.28)',
+  },
+  {
+    mode: 'dark',
+    colors: ['#3e8fb0', '#e99cd3', '#8bbe95', '#7da1e3', '#ea9a97', '#9ccfd8'],
+    overlayAlphas: [0.3889, 0.2139],
+    bandAlpha: 0.34,
+    firstBand: 'rgba(62,143,176,0.34)',
+  },
+] as const;
+let previousTheme: ReturnType<typeof theme.snapshot>;
+
+function setChartTheme(mode: ReturnType<typeof theme.snapshot>) {
+  if (theme.snapshot() !== mode) act(() => theme.toggle());
+}
 
 vi.mock('echarts/core', () => ({
   use: vi.fn(),
@@ -77,11 +100,13 @@ beforeAll(async () => {
 
 afterEach(() => {
   cleanup();
+  setChartTheme(previousTheme);
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
 beforeEach(() => {
+  previousTheme = theme.snapshot();
   chartMock.setOption.mockClear();
   chartMock.showLoading.mockClear();
   chartMock.hideLoading.mockClear();
@@ -709,43 +734,50 @@ describe('deep host telemetry', () => {
     expect(view.getByLabelText('连接与套接字 图例').textContent).toContain('TCP 已建立 0.0820 k');
   });
 
-  it('keeps the network throughput legend and metadata in the dedicated throughput panel', async () => {
-    const value = reportWith(sample => {
-      sample.nic_rx_drop = 15;
-    });
-    const view = renderThroughput(value);
-    const legend = view.getByLabelText('网卡流量图例');
-    const header = view.getByText('网卡流量').parentElement;
+  it.each(chartThemes)(
+    'keeps the network throughput legend and metadata in the dedicated throughput panel ($mode)',
+    async ({ mode, colors, overlayAlphas }) => {
+      setChartTheme(mode);
+      const value = reportWith(sample => {
+        sample.nic_rx_drop = 15;
+      });
+      const view = renderThroughput(value);
+      const legend = view.getByLabelText('网卡流量图例');
+      const header = view.getByText('网卡流量').parentElement;
 
-    expect(legend.tagName).toBe('FOOTER');
-    await waitFor(() => expect(view.container.querySelector('.ndtp-ec')).toBeTruthy());
-    expect(header?.textContent).toContain('接收丢弃 15 · eth0 · MTU 1500');
-    expect(header?.textContent).not.toContain('上报');
-    expect(legend.textContent).not.toContain('接收丢弃');
-    expect(legend.textContent).not.toContain('eth0');
+      expect(legend.tagName).toBe('FOOTER');
+      await waitFor(() => expect(view.container.querySelector('.ndtp-ec')).toBeTruthy());
+      expect(header?.textContent).toContain('接收丢弃 15 · eth0 · MTU 1500');
+      expect(header?.textContent).not.toContain('上报');
+      expect(legend.textContent).not.toContain('接收丢弃');
+      expect(legend.textContent).not.toContain('eth0');
 
-    // The lazy chart can mount its container before its effects publish the option.
-    const chart = await waitFor(() => {
-      const option = chartMock.setOption.mock.calls.find(
-        ([option]) =>
-          option.series?.length === 2 && option.series[0]?.name === '接收' && option.series[1]?.name === '发送',
-      )?.[0];
-      expect(option).toBeDefined();
-      return option;
-    });
-    expect(chart.color).toEqual(['#3e8fb0', '#e99cd3']);
-    expect(chart.grid).toMatchObject({ left: 10, containLabel: true });
-    expect(chart.xAxis[0].splitLine.show).toBe(true);
-    expect(chart.yAxis.splitLine.show).toBe(true);
-    for (const line of chart.series) {
-      expect(line.smooth).toBe(false);
-      expect(line.areaStyle.color.type).toBe('linear');
-      expect(line.areaStyle.color.colorStops[0].color).toMatch(/^rgba\(\d+,\d+,\d+,0\.3889\)$/);
-      expect(line.areaStyle.color.colorStops[1].color).toMatch(/^rgba\(\d+,\d+,\d+,0\.2139\)$/);
-      expect(line.areaStyle.opacity).toBe(1);
-    }
-    expect(chartMock.connect).not.toHaveBeenCalled();
-  });
+      // The lazy chart can mount its container before its effects publish the option.
+      const chart = await waitFor(() => {
+        const option = chartMock.setOption.mock.calls.find(
+          ([option]) =>
+            option.series?.length === 2 && option.series[0]?.name === '接收' && option.series[1]?.name === '发送',
+        )?.[0];
+        expect(option).toBeDefined();
+        return option;
+      });
+      expect(chart.color).toEqual(colors.slice(0, 2));
+      expect(chart.grid).toMatchObject({ left: 10, containLabel: true });
+      expect(chart.xAxis[0].splitLine.show).toBe(true);
+      expect(chart.yAxis.splitLine.show).toBe(true);
+      for (const line of chart.series) {
+        expect(line.smooth).toBe(false);
+        expect(line.areaStyle.color.type).toBe('linear');
+        for (const [index, alpha] of overlayAlphas.entries()) {
+          const color = line.areaStyle.color.colorStops[index].color;
+          expect(color).toMatch(/^rgba\(\d+,\d+,\d+,0\.\d+\)$/);
+          expect(color.endsWith(`,${alpha})`)).toBe(true);
+        }
+        expect(line.areaStyle.opacity).toBe(1);
+      }
+      expect(chartMock.connect).not.toHaveBeenCalled();
+    },
+  );
 
   it('keeps namespace conntrack counts separate from socket inventories', () => {
     const value = reportWith(sample => {
@@ -1697,57 +1729,62 @@ describe('deep host telemetry', () => {
     expect(view.container.querySelector('.core-heat-cells')).toBeNull();
   });
 
-  it('uses the muted, straight, medium-fill history chart visual contract', () => {
-    const view = render(<LoadCard report={report()} />);
+  it.each(chartThemes)(
+    'uses the muted, straight, medium-fill history chart visual contract ($mode)',
+    ({ mode, colors, bandAlpha, firstBand }) => {
+      setChartTheme(mode);
+      const view = render(<LoadCard report={report()} />);
 
-    fireEvent.click(view.getByRole('button', { name: /CPU/ }));
-    const chart = chartMock.setOption.mock.calls.find(([option]) =>
-      option.series?.some((line: { name: string }) => line.name === '用户态'),
-    )?.[0];
-    expect(chart).toBeTruthy();
-    expect(chart.animation).toBe(true);
-    expect(chart.animationThreshold).toBe(10_000);
-    expect(chart.animationDuration).toBe(360);
-    expect(chart.animationEasing).toBe('cubicInOut');
-    expect(chart.animationDurationUpdate).toBe(0);
-    expect(chart.color.slice(0, 6)).toEqual(['#3e8fb0', '#e99cd3', '#8bbe95', '#7da1e3', '#ea9a97', '#9ccfd8']);
-    expect(chart.xAxis[0].splitLine.show).toBe(true);
-    expect(chart.yAxis.splitLine.show).toBe(true);
-    expect(chart.grid).toMatchObject({ left: 10, containLabel: true });
-    expect(chart.xAxis[0].axisLabel.fontSize).toBe(9.5);
-    expect(chart.yAxis.axisLabel.fontSize).toBe(9.5);
-    expect(chart.tooltip.extraCssText).toContain('box-shadow');
+      fireEvent.click(view.getByRole('button', { name: /CPU/ }));
+      const chart = chartMock.setOption.mock.calls.find(([option]) =>
+        option.series?.some((line: { name: string }) => line.name === '用户态'),
+      )?.[0];
+      expect(chart).toBeTruthy();
+      expect(chart.animation).toBe(true);
+      expect(chart.animationThreshold).toBe(10_000);
+      expect(chart.animationDuration).toBe(360);
+      expect(chart.animationEasing).toBe('cubicInOut');
+      expect(chart.animationDurationUpdate).toBe(0);
+      expect(chart.color.slice(0, 6)).toEqual(colors);
+      expect(chart.xAxis[0].splitLine.show).toBe(true);
+      expect(chart.yAxis.splitLine.show).toBe(true);
+      expect(chart.grid).toMatchObject({ left: 10, containLabel: true });
+      expect(chart.xAxis[0].axisLabel.fontSize).toBe(9.5);
+      expect(chart.yAxis.axisLabel.fontSize).toBe(9.5);
+      expect(chart.tooltip.extraCssText).toContain('box-shadow');
 
-    for (const line of chart.series) {
-      expect(line.smooth).toBe(false);
-      expect(line.blendMode).toBeUndefined();
-    }
-    // 五段成分堆叠，互不重叠，取平涂；「窗口峰值」是画在成分之上的包络，只画线不填色。
-    for (const line of chart.series.slice(0, 5)) {
-      expect(line.stack).toBe('cpu');
-      expect(line.areaStyle.opacity).toBe(1);
-      expect(line.areaStyle.color).toMatch(/^rgba\(\d+,\d+,\d+,0\.34\)$/);
-    }
-    expect(chart.series[0].areaStyle.color).toBe('rgba(62,143,176,0.34)');
-    const envelope = chart.series.find((line: { name: string }) => line.name === '窗口峰值');
-    expect(envelope.stack).toBeUndefined();
-    expect(envelope.areaStyle).toBeUndefined();
+      for (const line of chart.series) {
+        expect(line.smooth).toBe(false);
+        expect(line.blendMode).toBeUndefined();
+      }
+      // 五段成分堆叠，互不重叠，取平涂；「窗口峰值」是画在成分之上的包络，只画线不填色。
+      for (const line of chart.series.slice(0, 5)) {
+        expect(line.stack).toBe('cpu');
+        expect(line.areaStyle.opacity).toBe(1);
+        expect(line.areaStyle.color).toMatch(/^rgba\(\d+,\d+,\d+,0\.\d+\)$/);
+        expect(line.areaStyle.color.endsWith(`,${bandAlpha})`)).toBe(true);
+      }
+      expect(chart.series[0].areaStyle.color).toBe(firstBand);
+      const envelope = chart.series.find((line: { name: string }) => line.name === '窗口峰值');
+      expect(envelope.stack).toBeUndefined();
+      expect(envelope.areaStyle).toBeUndefined();
 
-    const tooltip = chart.tooltip.formatter([
-      { seriesName: '低值', color: '#111', value: [130_000, 1], dataIndex: 0 },
-      { seriesName: '高值', color: '#222', value: [130_000, 2], dataIndex: 0 },
-    ]);
-    expect(tooltip.indexOf('高值')).toBeLessThan(tooltip.indexOf('低值'));
+      const tooltip = chart.tooltip.formatter([
+        { seriesName: '低值', color: '#111', value: [130_000, 1], dataIndex: 0 },
+        { seriesName: '高值', color: '#222', value: [130_000, 2], dataIndex: 0 },
+      ]);
+      expect(tooltip.indexOf('高值')).toBeLessThan(tooltip.indexOf('低值'));
 
-    const updated = report();
-    updated.series = updated.series.map(entry => ({ ...entry, cpu_user_pct: entry.cpu_user_pct + 1 }));
-    view.rerender(<LoadCard report={updated} />);
-    const updatedChart = chartMock.setOption.mock.calls
-      .filter(([option]) => option.series?.some((line: { name: string }) => line.name === '用户态'))
-      .at(-1)?.[0];
-    expect(updatedChart.animation).toBe(false);
-    expect(updatedChart.animationDuration).toBe(0);
-  });
+      const updated = report();
+      updated.series = updated.series.map(entry => ({ ...entry, cpu_user_pct: entry.cpu_user_pct + 1 }));
+      view.rerender(<LoadCard report={updated} />);
+      const updatedChart = chartMock.setOption.mock.calls
+        .filter(([option]) => option.series?.some((line: { name: string }) => line.name === '用户态'))
+        .at(-1)?.[0];
+      expect(updatedChart.animation).toBe(false);
+      expect(updatedChart.animationDuration).toBe(0);
+    },
+  );
 
   it('keeps old-agent KPI values but disables unavailable drill-downs', () => {
     const view = render(<LoadCard report={report(false)} />);

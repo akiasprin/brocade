@@ -2445,7 +2445,7 @@
   }
 }
 /* ═══ 亮色 ═══
-   不是暗色的直接反转：角色色需要压深，中性面改用暖白，分隔线降低对比。默认仍为暗色。 */
+   不是暗色的直接反转：角色色需要压深，中性面改用暖白，分隔线降低对比。 */
 :root[data-theme='light'],
 [data-theme='light'] {
   color-scheme: light;
@@ -2502,8 +2502,8 @@
   --glass: rgba(255, 255, 255, 0.88);
   --glass-strong: rgba(255, 255, 255, 0.96);
   --float: color-mix(in srgb, var(--surface) 64%, transparent);
-  /* 对话框底色亮色取 96%：背后是压暗的页面，64% 会把白底染成中灰，输入框与按钮反而比弹窗亮。 */
-  --float-sheet: color-mix(in srgb, var(--sheet) 96%, transparent);
+  /* 亮色对话框保留 16% 透底，让模糊背景可见，同时维持正文与控件的清晰度。 */
+  --float-sheet: color-mix(in srgb, var(--sheet) 84%, transparent);
   --float-filter: blur(20px) saturate(1.8);
   --float-edge: inset 0 1px 0 rgba(255, 255, 255, 0.1);
   --scrim: rgba(30, 30, 45, 0.4);

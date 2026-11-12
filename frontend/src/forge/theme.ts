@@ -1,7 +1,6 @@
 // 明暗主题切换。
 //
-// 原定为默认暗色且不提供主题按钮——现已提供按钮，但默认仍为暗色，
-// 按钮只负责记录用户的选择。
+// 默认亮色；用户通过主题按钮选择后，优先使用本地保存的偏好。
 // 不跟随 `prefers-color-scheme`：本工具用于运维，在同一台设备上因时间不同而切换模式
 // 的成本高于一次选择错误。
 //
@@ -16,9 +15,9 @@ const KEY = 'brocade-console:theme';
 
 const read = (): Theme => {
   try {
-    return localStorage.getItem(KEY) === 'light' ? 'light' : 'dark';
+    return localStorage.getItem(KEY) === 'dark' ? 'dark' : 'light';
   } catch {
-    return 'dark';
+    return 'light';
   }
 };
 

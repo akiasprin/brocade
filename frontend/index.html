@@ -3,16 +3,16 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="light" />
     <meta name="theme-color" />
     <link id="brocade-favicon" rel="icon" href="/favicon.svg" data-default-href="/favicon.svg" />
     <title>控制台</title>
     <script id="appearance-bootstrap">
       (() => {
-        let theme = 'dark';
+        let theme = 'light';
         let palette = 'dailan';
         try {
-          theme = localStorage.getItem('brocade-console:theme') === 'light' ? 'light' : 'dark';
+          theme = localStorage.getItem('brocade-console:theme') === 'dark' ? 'dark' : 'light';
           const saved = localStorage.getItem('brocade-console:palette');
           if (['jinzi', 'dailan', 'songlv', 'oufen', 'xuanmo'].includes(saved)) palette = saved;
         } catch {}

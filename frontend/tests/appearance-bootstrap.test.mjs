@@ -2,9 +2,31 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
+import ts from 'typescript';
 
 const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
 const source = html.match(/<script id="appearance-bootstrap">([\s\S]*?)<\/script>/)?.[1];
+const themeSource = ts.transpileModule(readFileSync(new URL('../src/forge/theme.ts', import.meta.url), 'utf8'), {
+  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+}).outputText;
+
+function restoreAppearance(localStorage, expected) {
+  const root = { dataset: {} };
+  const meta = {};
+  const context = {
+    document: { documentElement: root, querySelector: () => meta },
+    localStorage,
+    exports: {},
+    addEventListener() {},
+  };
+  runInNewContext(source, context);
+  assert.equal(root.dataset.theme, expected);
+  assert.equal(meta.content, expected);
+  runInNewContext(themeSource, context);
+  assert.equal(root.dataset.theme, expected, 'application startup preserves the bootstrap theme');
+  assert.equal(context.exports.theme.snapshot(), expected);
+  return root;
+}
 
 test('browser chrome and the document canvas share the header surface', () => {
   const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
@@ -47,29 +69,28 @@ test('appearance is restored in the document head before the application module'
   assert.ok(html.indexOf('appearance-bootstrap') < html.indexOf('src="/src/main.tsx"'));
   for (const theme of ['light', 'dark']) {
     for (const palette of ['jinzi', 'dailan', 'songlv', 'oufen', 'xuanmo']) {
-      const root = { dataset: {} };
-      const meta = {};
-      runInNewContext(source, {
-        document: { documentElement: root, querySelector: () => meta },
-        localStorage: { getItem: key => (key.endsWith(':theme') ? theme : palette) },
-      });
-      assert.equal(root.dataset.theme, theme);
+      const root = restoreAppearance({ getItem: key => (key.endsWith(':theme') ? theme : palette) }, theme);
       assert.equal(root.dataset.palette, palette);
-      assert.equal(meta.content, theme);
     }
   }
 });
 
-test('unavailable local storage does not prevent startup', () => {
-  const root = { dataset: {} };
-  runInNewContext(source, {
-    document: { documentElement: root, querySelector: () => ({}) },
-    localStorage: {
+test('missing or invalid preferences default to light with the dailan palette', () => {
+  assert.match(html, /<meta name="color-scheme" content="light"\s*\/>/);
+  for (const saved of [null, '', 'invalid']) {
+    const root = restoreAppearance({ getItem: () => saved }, 'light');
+    assert.equal(root.dataset.palette, 'dailan');
+  }
+});
+
+test('unavailable local storage defaults to light without preventing startup', () => {
+  const root = restoreAppearance(
+    {
       getItem() {
         throw new Error('blocked');
       },
     },
-  });
-  assert.equal(root.dataset.theme, 'dark');
+    'light',
+  );
   assert.equal(root.dataset.palette, 'dailan');
 });
