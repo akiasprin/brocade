@@ -13,6 +13,7 @@ import {
 
 const now = Date.UTC(2026, 9, 28, 12);
 const machines = SCENES.typical.machines();
+const cvmEnabled = process.env.BROCADE_PRODUCT_FLAVOR !== 'base';
 
 async function openWorkspace(page: Page, theme: string) {
   let enter!: () => void;
@@ -37,9 +38,13 @@ async function openWorkspace(page: Page, theme: string) {
     const path = url.pathname;
     const body: Record<string, unknown> = {
       '/branding': { site_name: '网格预览', icon_data_url: null },
-      '/bootstrap': { who, initial: { node_count: machines.length, chain_group_count: [] } },
+      '/bootstrap': {
+        features: { cvm: cvmEnabled },
+        who,
+        initial: { node_count: machines.length, chain_group_count: [] },
+      },
       '/auth/state': { initialized: true, public_open: true },
-      '/auth/whoami': who,
+      '/whoami': who,
       '/nodes/agent-state': { nodes: machines.map(machine => agentState(machine, now / 1000)) },
       '/node-traffic': { nodes: machines.map(machine => trafficItem(machine, now / 1000)) },
       '/load/nodes/nic': {

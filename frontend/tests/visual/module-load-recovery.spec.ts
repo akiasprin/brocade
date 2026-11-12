@@ -4,12 +4,14 @@ import react from '@vitejs/plugin-react';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, basename } from 'node:path';
+const cvmEnabled = process.env.BROCADE_PRODUCT_FLAVOR !== 'base';
 let output: string;
 test.beforeAll(async () => {
   output = await mkdtemp(join(tmpdir(), 'brocade-module-recovery-'));
   await build({
     configFile: false,
     root: resolve('.'),
+    define: { __BROCADE_CVM__: cvmEnabled },
     plugins: [react()],
     logLevel: 'silent',
     build: { outDir: output, emptyOutDir: true },
@@ -60,9 +62,9 @@ for (const target of ['shell', 'nodes'] as const)
           return;
         }
         const body: Record<string, unknown> = {
-          '/bootstrap': { who, initial: { node_count: 1, chain_group_count: [] } },
+          '/bootstrap': { features: { cvm: cvmEnabled }, who, initial: { node_count: 1, chain_group_count: [] } },
           '/auth/state': { initialized: true, public_open: false },
-          '/auth/whoami': who,
+          '/whoami': who,
           '/notifications': {
             events: [],
             active: [],
