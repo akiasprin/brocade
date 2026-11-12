@@ -8,10 +8,10 @@ export const resultText: Record<string, string> = {
   running: '执行中',
   retry_wait: '等待重试',
   succeeded: '成功',
-  partial: '部分完成',
+  partial: '失败',
   failed: '失败',
   canceled: '已停止',
-  superseded: '设置已变化',
+  superseded: '已忽略',
   interrupted: '中断',
 };
 export const taskText: Record<SubStoreRun['kind'], string> = {
@@ -20,6 +20,23 @@ export const taskText: Record<SubStoreRun['kind'], string> = {
   inspect: '周期核验',
   cleanup: '清理来源',
 };
+export function reasonText(error?: string | null) {
+  return error === '用户订阅有新版本，请重新同步' ? '核验期间订阅发生变化' : (error ?? '未记录失败原因');
+}
+export function runResultText(run: Pick<SubStoreRun, 'kind' | 'status'>) {
+  if (run.status === 'succeeded') {
+    if (run.kind === 'inspect' || run.kind === 'verify') return '订阅数据核验一致';
+    return run.kind === 'cleanup' ? '清理成功' : '同步成功';
+  }
+  if (run.status === 'failed' || run.status === 'partial') return '失败';
+  return resultText[run.status] ?? run.status;
+}
+export function runSummary(run: Pick<SubStoreRun, 'kind' | 'status' | 'error'>) {
+  const result = runResultText(run);
+  return run.status === 'failed' || run.status === 'partial' || run.status === 'retry_wait'
+    ? `${result}：${reasonText(run.error)}`
+    : result;
+}
 export function syncStatus(view: SubStoreView) {
   const { config: c, active } = view;
   const latest = view.latest?.config_version === c?.version ? view.latest : null;
@@ -32,15 +49,17 @@ export function syncStatus(view: SubStoreView) {
       label: resultText[active.status],
       detail: active.attempts.at(-1)?.events.at(-1)?.name ?? '等待工作线程',
     };
-  if (latest?.status === 'failed')
-    return { kind: 'failed', tone: 'bad' as Tone, label: '同步失败', detail: latest.error ?? '' };
+  if (latest?.status === 'failed' || latest?.status === 'partial')
+    return { kind: 'failed', tone: 'bad' as Tone, label: '失败', detail: reasonText(latest.error) };
   if (c.verified)
     return {
       kind: 'synced',
       tone: 'ok' as Tone,
-      label: '已同步',
+      label: latest ? runResultText(latest) : '订阅数据核验一致',
       detail: latest?.output_count != null ? `${latest.output_count} 个节点` : '',
     };
+  if (latest?.status === 'superseded')
+    return { kind: 'pending', tone: 'muted' as Tone, label: '等待核验', detail: '等待核验最新订阅' };
   if (c.registered)
     return { kind: 'pending', tone: 'warn' as Tone, label: '待验证', detail: latest?.error ?? '等待拉取确认' };
   return { kind: 'unsynced', tone: 'muted' as Tone, label: '未同步', detail: '' };

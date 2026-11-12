@@ -49,9 +49,11 @@ async function ticket(v: ReturnType<typeof mount>) {
 describe('durable connector UI', () => {
   it('maps checkpoint evidence without treating conversion as a client receipt', () => {
     expect(checkpoints(connectorFixture('ready'))).toEqual(['ok', 'ok', 'ok']);
-    expect(checkpoints(connectorFixture('partial'))).toEqual(['ok', 'warn', 'track']);
+    expect(checkpoints(connectorFixture('partial'))).toEqual(['ok', 'bad', 'track']);
     expect(checkpoints(connectorFixture('running'))).toEqual(['ok', 'live', 'track']);
     expect(checkpoints(connectorFixture('empty'))).toEqual(['empty', 'empty', 'empty']);
+    expect(checkpoints(connectorFixture('superseded'))).toEqual(['ok', 'ok', 'track']);
+    expect(syncStatus(connectorFixture('superseded'))).toMatchObject({ label: '等待核验', tone: 'muted' });
     expect(syncStatus(connectorFixture('inactive')).label).toBe('已暂停');
     const changed = connectorFixture('failed');
     changed.config!.version++;
@@ -106,15 +108,46 @@ describe('durable connector UI', () => {
   it('opens persistent task details and retries with the parent identity', async () => {
     const v = mount('partial');
     await ticket(v);
-    fireEvent.click(v.getByRole('button', { name: /待验证：/ }));
-    fireEvent.click(await v.findByRole('button', { name: /登记同步，部分完成/ }));
-    fireEvent.click(await v.findByRole('button', { name: '仅重试拉取验证' }));
+    fireEvent.click(v.getByRole('button', { name: /失败：/ }));
+    fireEvent.click(await v.findByRole('button', { name: /登记同步，失败：Sub-Store 拉取返回错误/ }));
+    expect(await v.findByText('原因：Sub-Store 拉取返回错误')).toBeTruthy();
+    expect(v.queryByText('部分完成')).toBeNull();
+    fireEvent.click(await v.findByRole('button', { name: '重试同步' }));
     await waitFor(() =>
       expect(v.fetch.mock.calls.some(([u, i]) => String(u).endsWith('/runs/1049/retry') && i?.method === 'POST')).toBe(
         true,
       ),
     );
     expect(v.getAllByRole('dialog')).toHaveLength(1);
+  });
+  it('shows the latest automatic success first and puts failures in the second tab', async () => {
+    const v = mount('history');
+    await ticket(v);
+    fireEvent.click(v.getByRole('button', { name: /订阅数据核验一致：/ }));
+    await v.findByRole('button', { name: /周期核验，订阅数据核验一致/ });
+    expect(v.getByRole('button', { name: '最近结果' }).getAttribute('aria-pressed')).toBe('true');
+    expect(v.getByRole('button', { name: /周期核验，已忽略/ })).toBeTruthy();
+    expect(v.getByRole('button', { name: /周期核验，失败：连接 Sub-Store 超时/ })).toBeTruthy();
+    expect(v.queryByText('无变化核验')).toBeNull();
+    expect(v.queryByText('部分完成')).toBeNull();
+    fireEvent.click(v.getByRole('button', { name: '异常' }));
+    expect(await v.findByRole('button', { name: /周期核验，失败：连接 Sub-Store 超时/ })).toBeTruthy();
+    expect(v.queryByRole('button', { name: /周期核验，已忽略/ })).toBeNull();
+    expect(v.queryByRole('button', { name: /周期核验，订阅数据核验一致/ })).toBeNull();
+    expect(v.queryByRole('button', { name: /拉取验证，订阅数据核验一致/ })).toBeNull();
+    fireEvent.click(v.getByRole('button', { name: '忽略' }));
+    expect(await v.findByRole('button', { name: /周期核验，已忽略/ })).toBeTruthy();
+    expect(v.queryByRole('button', { name: /周期核验，失败：/ })).toBeNull();
+  });
+  it('shows a clear empty state when there are no warnings or errors', async () => {
+    const v = mount('ready');
+    await ticket(v);
+    fireEvent.click(v.getByRole('button', { name: /同步成功：/ }));
+    await v.findByRole('button', { name: /登记同步，同步成功/ });
+    fireEvent.click(v.getByRole('button', { name: '异常' }));
+    await v.findByText('暂无异常');
+    fireEvent.click(v.getByRole('button', { name: '忽略' }));
+    await v.findByText('暂无忽略记录');
   });
   it.each(['readonly', 'inactive'])('disables writes for %s and keeps observations visible', async scene => {
     const v = mount(scene);

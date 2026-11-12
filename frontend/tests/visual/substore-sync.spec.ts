@@ -23,7 +23,37 @@ async function open(page: Page, scene: string, theme: string, width = 1440, heig
   return { d, errors };
 }
 for (const theme of ['dark', 'light']) {
-  for (const scene of ['ready', 'empty', 'running', 'partial', 'failed', 'inactive', 'readonly']) {
+  test(`recent results and warnings ${theme}`, async ({ page }) => {
+    const { d, errors } = await open(page, 'history', theme, 390, 844);
+    await d.getByRole('button', { name: /^订阅数据核验一致：/ }).click();
+    await expect(d.getByRole('button', { name: /周期核验，订阅数据核验一致/ })).toBeVisible();
+    const filterRows = await d
+      .getByRole('group', { name: '记录范围' })
+      .getByRole('button')
+      .evaluateAll(elements => elements.map(el => el.getBoundingClientRect().top));
+    expect(filterRows).toHaveLength(3);
+    expect(new Set(filterRows).size, 'all three scopes stay on one row').toBe(1);
+    await expect(d).toHaveScreenshot(`substore-recent-results-${theme}.png`);
+    await d.getByRole('button', { name: '异常', exact: true }).click();
+    await expect(d.getByRole('button', { name: /周期核验，失败：连接 Sub-Store 超时/ })).toBeVisible();
+    await expect(d.getByRole('button', { name: /周期核验，已忽略/ })).toHaveCount(0);
+    await expect(d.getByRole('button', { name: /周期核验，订阅数据核验一致/ })).toHaveCount(0);
+    await expect(d).toHaveScreenshot(`substore-warnings-${theme}.png`);
+    await d.getByRole('button', { name: '忽略', exact: true }).click();
+    await expect(d.getByRole('button', { name: /周期核验，已忽略/ })).toBeVisible();
+    await expect(d.getByRole('button', { name: /周期核验，失败：/ })).toHaveCount(0);
+    await expect(d).toHaveScreenshot(`substore-ignored-${theme}.png`);
+    await d.getByRole('button', { name: /周期核验，已忽略/ }).click();
+    await expect(d.getByText('订阅已更新，本次核验已忽略', { exact: true })).toBeVisible();
+    await expect(d.getByRole('button', { name: '重试同步', exact: true })).toHaveCount(0);
+    await expect(d).toHaveScreenshot(`substore-ignored-detail-${theme}.png`);
+    await d.getByRole('button', { name: '记录', exact: true }).click();
+    await d.getByRole('button', { name: /周期核验，失败：连接 Sub-Store 超时/ }).click();
+    await expect(d.getByText('原因：连接 Sub-Store 超时', { exact: true })).toBeVisible();
+    await expect(d).toHaveScreenshot(`substore-failure-reason-${theme}.png`);
+    expect(errors).toEqual([]);
+  });
+  for (const scene of ['ready', 'empty', 'running', 'partial', 'failed', 'superseded', 'inactive', 'readonly']) {
     test(`C ring ${scene} ${theme}`, async ({ page }) => {
       const { d, errors } = await open(page, scene, theme);
       await expect(d).toHaveScreenshot(`substore-c-${scene}-${theme}.png`);
@@ -46,8 +76,8 @@ for (const theme of ['dark', 'light']) {
       expect((await d.locator('.sub-dialog').boundingBox())!.width).toBeLessThanOrEqual(404);
       await expect(d).toHaveScreenshot(`substore-settings-${width}x${height}-${theme}.png`);
       await d.getByRole('button', { name: '同步记录', exact: true }).click();
-      await expect(d.getByRole('button', { name: /登记同步，成功/ })).toBeVisible();
-      await d.getByRole('button', { name: /登记同步，成功/ }).click();
+      await expect(d.getByRole('button', { name: /登记同步，同步成功/ })).toBeVisible();
+      await d.getByRole('button', { name: /登记同步，同步成功/ }).click();
       await expect(d.getByText('验证转换结果', { exact: true })).toBeVisible();
       await expect(d).toHaveScreenshot(`substore-run-${width}x${height}-${theme}.png`);
       expect(errors).toEqual([]);
@@ -70,11 +100,11 @@ test('configuration, records, automatic maintenance and exit guard are usable by
 });
 
 for (const theme of ['dark', 'light']) {
-  test(`C ring Safari ${theme}`, async () => {
+  test(`C ring Safari ${theme}`, async ({ baseURL }) => {
     const browser = await webkit.launch();
     try {
       const context = await browser.newContext({
-        baseURL: 'http://127.0.0.1:4318',
+        baseURL,
         viewport: { width: 390, height: 844 },
         deviceScaleFactor: 2,
         reducedMotion: 'reduce',

@@ -1,6 +1,10 @@
 use super::*;
 use brocade_console::substore;
 use brocade_store::{subscription_connector as connector, AdminRole};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     GenericImage,
@@ -20,11 +24,38 @@ async fn substore_native_sync_is_user_scoped_durable_and_preserves_remote_rules(
     let actor = AdminContext::system_admin("substore-test");
     let readonly = AdminContext::new("reviewer", AdminRole::Readonly, None);
     let other = AdminContext::new("other", AdminRole::TenantAdmin, Some("other".into()));
+    let pause_next_pull = Arc::new(AtomicBool::new(false));
+    let source_read = Arc::new(tokio::sync::Notify::new());
+    let resume_pull = Arc::new(tokio::sync::Notify::new());
     let app = merged_router(
         db.store.clone(),
         std::sync::Arc::new(tokio::sync::Notify::new()),
         "https://console.example".into(),
-    );
+    )
+    .layer(axum::middleware::from_fn({
+        let pause_next_pull = pause_next_pull.clone();
+        let source_read = source_read.clone();
+        let resume_pull = resume_pull.clone();
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let pause_next_pull = pause_next_pull.clone();
+            let source_read = source_read.clone();
+            let resume_pull = resume_pull.clone();
+            async move {
+                let pause = request.uri().path().starts_with("/sub/v1/")
+                    && request
+                        .uri()
+                        .query()
+                        .is_some_and(|q| q.split('&').any(|p| p.starts_with("brocade_probe=")))
+                    && pause_next_pull.swap(false, Ordering::SeqCst);
+                let response = next.run(request).await;
+                if pause {
+                    source_read.notify_one();
+                    resume_pull.notified().await;
+                }
+                response
+            }
+        }
+    }));
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     // Container reaches this disposable listener through the bridge; nothing is sent to user services.
@@ -168,6 +199,159 @@ async fn substore_native_sync_is_user_scoped_durable_and_preserves_remote_rules(
         .unwrap()
         .error_for_status()
         .unwrap();
+    // The public source changes after Sub-Store has read it, before conversion is confirmed.
+    // The obsolete check is ignored and the newest source remains due for maintenance.
+    let stale_id = connector::enqueue(
+        db.pool(),
+        &actor,
+        "platform.acme",
+        "alice",
+        "inspect",
+        None,
+        "source update",
+    )
+    .await
+    .unwrap();
+    let (_, _, stale_run) = connector::claim(db.pool(), "stale-worker")
+        .await
+        .unwrap()
+        .unwrap();
+    pause_next_pull.store(true, Ordering::SeqCst);
+    let changing_store = db.store.clone();
+    let changing_origin = origin.clone();
+    let stale_job = tokio::spawn(async move {
+        substore::execute(
+            &changing_store,
+            &changing_origin,
+            "stale-worker",
+            "platform.acme",
+            "alice",
+            stale_run,
+        )
+        .await
+        .unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(15), source_read.notified())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET uuid='8a5d5117-bd11-4237-9df9-7b775efb0d92'::uuid WHERE tenant_id='platform.acme' AND id='alice'")
+        .execute(db.pool()).await.unwrap();
+    let latest_revision = seed_subscription_serving(&db).await;
+    resume_pull.notify_one();
+    tokio::time::timeout(Duration::from_secs(20), stale_job)
+        .await
+        .unwrap()
+        .unwrap();
+    let stale = connector::run(db.pool(), &actor, "platform.acme", "alice", stale_id)
+        .await
+        .unwrap();
+    assert_eq!(stale.status, "superseded");
+    assert!(stale.error.is_none());
+    assert_eq!(stale.output_count, Some(1));
+    assert_eq!(stale.attempts.last().unwrap().status, "superseded");
+    assert_eq!(
+        stale.attempts.last().unwrap().events.last().unwrap().state,
+        "skipped"
+    );
+    let raw: (String, Option<String>) =
+        sqlx::query_as("SELECT status,error FROM subscription_connector_runs WHERE id=$1")
+            .bind(stale_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(raw, ("superseded".into(), None));
+    assert!(
+        !connector::view(db.pool(), &actor, "platform.acme", "alice")
+            .await
+            .unwrap()
+            .config
+            .unwrap()
+            .verified
+    );
+    assert!(connector::due(db.pool())
+        .await
+        .unwrap()
+        .contains(&("platform.acme".into(), "alice".into())));
+    assert!(
+        !connector::list(db.pool(), &actor, "platform.acme", "alice", None, true)
+            .await
+            .unwrap()
+            .runs
+            .iter()
+            .any(|r| r.id == stale_id)
+    );
+    let fresh_id = connector::enqueue(
+        db.pool(),
+        &actor,
+        "platform.acme",
+        "alice",
+        "inspect",
+        None,
+        "latest source",
+    )
+    .await
+    .unwrap();
+    let (_, _, fresh_run) = connector::claim(db.pool(), "fresh-worker")
+        .await
+        .unwrap()
+        .unwrap();
+    substore::execute(
+        &db.store,
+        &origin,
+        "fresh-worker",
+        "platform.acme",
+        "alice",
+        fresh_run,
+    )
+    .await
+    .unwrap();
+    let fresh = connector::run(db.pool(), &actor, "platform.acme", "alice", fresh_id)
+        .await
+        .unwrap();
+    assert_eq!(fresh.status, "succeeded", "{:?}", fresh.error);
+    assert_eq!(fresh.source_version, Some(latest_revision as i64));
+
+    let canceled_id = connector::enqueue(
+        db.pool(),
+        &actor,
+        "platform.acme",
+        "alice",
+        "inspect",
+        None,
+        "cancel fence",
+    )
+    .await
+    .unwrap();
+    let (_, _, mut canceled_run) = connector::claim(db.pool(), "canceled-worker")
+        .await
+        .unwrap()
+        .unwrap();
+    connector::cancel(db.pool(), &actor, "platform.acme", "alice", canceled_id)
+        .await
+        .unwrap();
+    connector::supersede_source_run(db.pool(), "canceled-worker", &mut canceled_run)
+        .await
+        .unwrap();
+    assert_eq!(
+        connector::run(db.pool(), &actor, "platform.acme", "alice", canceled_id)
+            .await
+            .unwrap()
+            .status,
+        "canceled"
+    );
+    assert!(
+        connector::view(db.pool(), &actor, "platform.acme", "alice")
+            .await
+            .unwrap()
+            .config
+            .unwrap()
+            .verified
+    );
+    assert!(!connector::due(db.pool())
+        .await
+        .unwrap()
+        .contains(&("platform.acme".into(), "alice".into())));
+
     // A lost worker's lease is reclaimed and the prior attempt remains in the persisted ledger.
     let id = connector::enqueue(
         db.pool(),
@@ -566,4 +750,98 @@ async fn substore_http_never_authorizes_another_users_resource_or_task() {
         .0,
         StatusCode::CONFLICT
     );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and Docker PostgreSQL"]
+async fn substore_history_filters_warnings_before_pagination_and_keeps_recent_successes() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_usage_model(db.pool()).await;
+    sqlx::query("INSERT INTO users(tenant_id,id,uuid) VALUES('platform.acme','bob','4f84aaf8-49ea-4cce-8a93-683ee21ba3c6')")
+        .execute(db.pool()).await.unwrap();
+    let legacy_error = "用户订阅有新版本，请重新同步";
+    let legacy_attempts = json!([{"number":1,"status":"failed","events":[{"name":"验证转换结果","checkpoint":2,"state":"failed","ms":null,"http":null,"detail":legacy_error}]}]);
+    let legacy_id:i64=sqlx::query_scalar("INSERT INTO subscription_connector_runs(tenant_id,user_id,config_version,kind,status,trigger,actor,error,attempts,ended_at)
+        VALUES('platform.acme','alice',1,'inspect','partial','history test','test',$1,$2,now()) RETURNING id")
+        .bind(legacy_error).bind(legacy_attempts).fetch_one(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO subscription_connector_runs(tenant_id,user_id,config_version,kind,status,trigger,actor,error,ended_at)
+        VALUES('platform.acme','alice',1,'inspect','partial','history test','test','用户订阅在核验期间发生变化',now()),
+        ('platform.acme','alice',1,'inspect','superseded','history test','test',NULL,now())")
+        .execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO subscription_connector_runs(tenant_id,user_id,config_version,kind,status,trigger,actor,ended_at)
+        SELECT 'platform.acme','alice',1,CASE WHEN n%2=0 THEN 'sync' ELSE 'inspect' END,
+        CASE WHEN n>40 THEN 'succeeded' WHEN n%2=0 THEN 'failed' ELSE 'partial' END,
+        'history test','test',now() FROM generate_series(1,65) AS n ORDER BY n")
+        .execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO subscription_connector_runs(tenant_id,user_id,config_version,kind,status,trigger,actor)
+        VALUES('platform.acme','alice',1,'inspect','retry_wait','history test','test'),
+        ('platform.acme','bob',1,'inspect','failed','history test','test')")
+        .execute(db.pool()).await.unwrap();
+    let actor = AdminContext::system_admin("history-test");
+    let recent = connector::list(db.pool(), &actor, "platform.acme", "alice", None, false)
+        .await
+        .unwrap();
+    assert_eq!(recent.runs.len(), 20);
+    assert_eq!(recent.runs[0].status, "retry_wait");
+    assert_eq!(recent.runs[1].status, "succeeded");
+    assert!(recent.next.is_some());
+    let mut before = None;
+    let mut warnings = Vec::new();
+    for _ in 0..3 {
+        let page = connector::list(db.pool(), &actor, "platform.acme", "alice", before, true)
+            .await
+            .unwrap();
+        assert!(page
+            .runs
+            .iter()
+            .all(|r| matches!(r.status.as_str(), "failed" | "partial" | "retry_wait")));
+        before = page.next;
+        warnings.extend(page.runs);
+        if before.is_none() {
+            break;
+        }
+    }
+    assert!(before.is_none());
+    assert_eq!(warnings.len(), 42);
+    assert_eq!(warnings[0].status, "retry_wait");
+    assert!(warnings.windows(2).all(|pair| pair[0].id > pair[1].id));
+    assert_eq!(warnings.iter().filter(|r| r.status == "failed").count(), 20);
+    assert_eq!(
+        warnings.iter().filter(|r| r.status == "partial").count(),
+        21
+    );
+    assert!(!warnings.iter().any(|r| r.id == legacy_id));
+    let ignored = connector::list_scoped(
+        db.pool(),
+        &actor,
+        "platform.acme",
+        "alice",
+        None,
+        connector::RunScope::Ignored,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ignored.runs.len(), 2);
+    assert!(ignored.runs.iter().all(|r| r.status == "superseded"));
+    let legacy = connector::run(db.pool(), &actor, "platform.acme", "alice", legacy_id)
+        .await
+        .unwrap();
+    assert_eq!(legacy.status, "superseded");
+    assert!(legacy.error.is_none());
+    assert_eq!(legacy.attempts[0].status, "superseded");
+    assert_eq!(legacy.attempts[0].events[0].state, "skipped");
+    assert_eq!(
+        legacy.attempts[0].events[0].detail.as_deref(),
+        Some(connector::SOURCE_UPDATED_NOTE)
+    );
+    let original: (String, Option<String>) =
+        sqlx::query_as("SELECT status,error FROM subscription_connector_runs WHERE id=$1")
+            .bind(legacy_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(original, ("partial".into(), Some(legacy_error.into())));
 }

@@ -13,6 +13,7 @@ import {
   type SubStoreView,
   type SubStoreRun,
   type SubStoreWrite,
+  type SubStoreRunScope,
   type ClashSubscriptionInfo,
 } from '../api';
 import { bytes } from '../ui/format';
@@ -25,6 +26,9 @@ import {
   checkpoints,
   dayText,
   resultText,
+  reasonText,
+  runResultText,
+  runSummary,
   SUBSTORE_TITLE,
   syncStatus,
   taskText,
@@ -716,12 +720,13 @@ function Settings() {
 }
 function RunRow({ run }: { run: SubStoreRun }) {
   const s = useConnector();
+  const summary = runSummary(run);
   return (
     <button
       type="button"
       className="substore-row substore-run-row"
       onClick={() => s.open({ kind: 'run', id: run.id })}
-      aria-label={`${taskText[run.kind]}，${resultText[run.status]}，${timeText(run.started_at)}`}
+      aria-label={`${taskText[run.kind]}，${summary}，${timeText(run.started_at)}`}
     >
       <Glyph
         tone={
@@ -729,18 +734,14 @@ function RunRow({ run }: { run: SubStoreRun }) {
             ? 'live'
             : run.status === 'succeeded'
               ? 'ok'
-              : run.status === 'partial'
-                ? 'warn'
-                : run.status === 'failed'
-                  ? 'bad'
-                  : 'muted'
+              : run.status === 'partial' || run.status === 'failed'
+                ? 'bad'
+                : 'muted'
         }
       />
       <span className="substore-row-copy">
         <b>{taskText[run.kind]}</b>
-        <small>
-          {run.error ?? (run.kind === 'inspect' && run.status === 'succeeded' ? '无变化核验' : resultText[run.status])}
-        </small>
+        <small title={summary}>{summary}</small>
       </span>
       <span className="substore-row-end">
         <time>{timeText(run.started_at)}</time>
@@ -762,12 +763,12 @@ function Glyph({ tone, size = 28 }: { tone: Tone; size?: number }) {
 }
 function Records() {
   const s = useConnector();
-  const [scope, setScope] = useState('notable');
+  const [scope, setScope] = useState<SubStoreRunScope>('all');
   const [before, setBefore] = useState<number>();
   const [older, setOlder] = useState<SubStoreRun[]>([]);
   const query = useQuery({
     queryKey: ['subscription-connector', s.tenant, s.user, 'runs', scope, before],
-    queryFn: ({ signal }) => fetchSubStoreRuns(s.tenant, s.user, before, scope === 'notable', signal),
+    queryFn: ({ signal }) => fetchSubStoreRuns(s.tenant, s.user, before, scope, signal),
     refetchInterval: s.view.active ? 1000 : 30_000,
   });
   const runs = [...older, ...(query.data?.runs ?? [])];
@@ -825,8 +826,9 @@ function Records() {
         <SegmentedControl
           value={scope}
           options={[
-            { value: 'notable', label: '变更与异常' },
-            { value: 'all', label: '全部' },
+            { value: 'all', label: '最近结果' },
+            { value: 'errors', label: '异常' },
+            { value: 'ignored', label: '忽略' },
           ]}
           onChange={v => {
             setScope(v);
@@ -851,7 +853,7 @@ function Records() {
       ) : (
         <div className="substore-empty">
           <Icon of="clock" size={22} />
-          <b>尚无同步记录</b>
+          <b>{scope === 'errors' ? '暂无异常' : scope === 'ignored' ? '暂无忽略记录' : '尚无同步记录'}</b>
         </div>
       )}
       {query.data?.next && (
@@ -895,11 +897,9 @@ function RunDetails({ id }: { id: number }) {
     ? 'live'
     : r.status === 'succeeded'
       ? 'ok'
-      : r.status === 'partial'
-        ? 'warn'
-        : r.status === 'failed'
-          ? 'bad'
-          : 'muted';
+      : r.status === 'partial' || r.status === 'failed'
+        ? 'bad'
+        : 'muted';
   return (
     <>
       <Nav title={`#${r.id}`} />
@@ -908,7 +908,7 @@ function RunDetails({ id }: { id: number }) {
         <div>
           <b>{taskText[r.kind]}</b>
           <span className="substore-run-result" data-tone={tone}>
-            {resultText[r.status]}
+            {runResultText(r)}
           </span>
         </div>
         <small>
@@ -918,7 +918,7 @@ function RunDetails({ id }: { id: number }) {
       </section>
       {r.error && (
         <p className="substore-run-note" data-tone={tone}>
-          {r.error}
+          原因：{reasonText(r.error)}
         </p>
       )}
       {['failed', 'partial', 'canceled'].includes(r.status) && s.view.writable && (
@@ -931,7 +931,7 @@ function RunDetails({ id }: { id: number }) {
           }
         >
           <Icon of="refresh" size={14} />
-          {r.status === 'partial' ? '仅重试拉取验证' : '重试'}
+          {r.kind === 'cleanup' ? '重试清理' : '重试同步'}
         </button>
       )}
       {r.attempts.length > 1 && (
@@ -968,7 +968,7 @@ function RunDetails({ id }: { id: number }) {
               </span>
               <span className="substore-row-copy">
                 <b>{e.name}</b>
-                {e.detail && <small>{e.detail}</small>}
+                {e.detail && <small>{reasonText(e.detail)}</small>}
               </span>
               <span className="substore-row-end substore-phase-meta">
                 {e.state === 'running'

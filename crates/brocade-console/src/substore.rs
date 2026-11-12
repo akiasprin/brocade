@@ -27,6 +27,10 @@ impl Failure {
         }
     }
 }
+enum Completion {
+    Completed,
+    SourceChanged,
+}
 
 pub fn validate_endpoint(value: &str) -> Result<Url> {
     let url = Url::parse(value).map_err(|_| invalid("请输入完整的 http(s) 后端地址"))?;
@@ -346,11 +350,14 @@ pub async fn execute(
     )
     .await;
     match result {
-        Ok(()) => {
+        Ok(Completion::Completed) => {
             if let Some(a) = run.attempts.last_mut() {
                 a.status = "succeeded".into();
             }
             db::finish(store.pool(), owner, &run, "succeeded", false).await?;
+        }
+        Ok(Completion::SourceChanged) => {
+            db::supersede_source_run(store.pool(), owner, &mut run).await?;
         }
         Err(failure) => {
             let registered = run.attempts.last().is_some_and(|a| {
@@ -399,7 +406,7 @@ async fn perform(
     metadata: &Value,
     credentials: db::Credentials,
     r: &mut db::Run,
-) -> std::result::Result<(), Failure> {
+) -> std::result::Result<Completion, Failure> {
     macro_rules! persist {
         ($e:expr) => {
             $e.map_err(|_| Failure::new("任务已停止或状态保存失败"))?
@@ -428,7 +435,7 @@ async fn perform(
         };
         persist!(done(store, owner, r, start, http).await);
         persist!(sqlx::query("UPDATE subscription_connectors SET registered=false,verified=false,auto=false,metadata=jsonb_set(metadata,'{auto}','false'),last_confirmed=NULL WHERE tenant_id=$1 AND user_id=$2 AND version=$3").bind(tenant).bind(user).bind(r.config_version).execute(store.pool()).await.map_err(StoreError::from));
-        return Ok(());
+        return Ok(Completion::Completed);
     }
     persist!(event(store, owner, r, "核对生效订阅", 0).await);
     let start = Instant::now();
@@ -556,16 +563,16 @@ async fn perform(
     let current = store
         .clash_subscription_for_user(&admin, tenant, user)
         .await
-        .map_err(|_| Failure::new("用户订阅在核验期间发生变化"))?;
+        .map_err(|_| Failure::new("无法读取当前生效订阅"))?;
     if current.revision != subscription.revision
         || current.uuid != subscription.uuid
         || current.content != subscription.content
     {
-        return Err(Failure::new("用户订阅有新版本，请重新同步"));
+        return Ok(Completion::SourceChanged);
     }
     persist!(sqlx::query("UPDATE subscription_connectors SET verified=true,last_confirmed=now(),source_version=$4,source_fingerprint=$5,next_check=now()+interval '5 minutes' WHERE tenant_id=$1 AND user_id=$2 AND version=$3").bind(tenant).bind(user).bind(r.config_version).bind(r.source_version).bind(&expected).execute(store.pool()).await.map_err(StoreError::from));
     persist!(done(store, owner, r, start, None).await);
-    Ok(())
+    Ok(Completion::Completed)
 }
 #[cfg(test)]
 mod tests {

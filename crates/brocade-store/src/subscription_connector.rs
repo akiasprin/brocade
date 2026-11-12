@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{PgPool, Row};
 
+pub const SOURCE_UPDATED_NOTE: &str = "订阅已更新，本次核验已忽略";
+const LEGACY_SOURCE_UPDATED_ERROR: &str = "用户订阅有新版本，请重新同步";
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Credentials {
     pub endpoint: String,
@@ -84,6 +87,13 @@ pub struct View {
 pub struct RunPage {
     pub runs: Vec<Run>,
     pub next: Option<i64>,
+}
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunScope {
+    All,
+    Errors,
+    Ignored,
 }
 
 fn context(tenant: &str, user: &str) -> String {
@@ -331,7 +341,7 @@ pub fn is_active(status: &str) -> bool {
     matches!(status, "queued" | "running" | "retry_wait")
 }
 fn run_row(r: sqlx::postgres::PgRow) -> Result<Run> {
-    Ok(Run {
+    let mut run = Run {
         id: r.try_get("id")?,
         kind: r.try_get("kind")?,
         status: r.try_get("status")?,
@@ -349,7 +359,13 @@ fn run_row(r: sqlx::postgres::PgRow) -> Result<Run> {
         output_count: r
             .try_get::<Option<i32>, _>("output_count")?
             .map(|v| v as usize),
-    })
+    };
+    // Earlier workers classified a positively identified version change as partial failure.
+    // Normalize only that exact outcome; keep the original database ledger unchanged.
+    if run.status == "partial" && run.error.as_deref() == Some(LEGACY_SOURCE_UPDATED_ERROR) {
+        mark_source_updated(&mut run);
+    }
+    Ok(run)
 }
 const RUN_SELECT:&str="SELECT id,kind,status,trigger,actor,config_version,source_version,(to_jsonb(started_at)#>>'{}') AS started_at,(to_jsonb(ended_at)#>>'{}') AS ended_at,CASE WHEN ended_at IS NULL THEN NULL ELSE greatest(0,(extract(epoch FROM ended_at-started_at)*1000)::bigint) END AS duration_ms,parent,attempts,error,output_count FROM subscription_connector_runs";
 pub async fn list(
@@ -360,10 +376,39 @@ pub async fn list(
     before: Option<i64>,
     notable: bool,
 ) -> Result<RunPage> {
+    list_scoped(
+        pool,
+        actor,
+        tenant,
+        user,
+        before,
+        if notable {
+            RunScope::Errors
+        } else {
+            RunScope::All
+        },
+    )
+    .await
+}
+pub async fn list_scoped(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant: &str,
+    user: &str,
+    before: Option<i64>,
+    scope: RunScope,
+) -> Result<RunPage> {
     access(actor, tenant, user, false)?;
     exists(pool, tenant, user).await?;
-    let rows=sqlx::query(&format!("{RUN_SELECT} WHERE tenant_id=$1 AND user_id=$2 AND ($3::bigint IS NULL OR id<$3) AND (NOT $4 OR kind<>'inspect' OR status<>'succeeded') ORDER BY id DESC LIMIT 21"))
-        .bind(tenant).bind(user).bind(before).bind(notable).fetch_all(pool).await?;
+    let scope = match scope {
+        RunScope::All => "all",
+        RunScope::Errors => "errors",
+        RunScope::Ignored => "ignored",
+    };
+    let rows=sqlx::query(&format!("{RUN_SELECT} WHERE tenant_id=$1 AND user_id=$2 AND ($3::bigint IS NULL OR id<$3)
+        AND ($4='all' OR ($4='errors' AND status IN ('failed','partial','retry_wait') AND (status<>'partial' OR error IS DISTINCT FROM $5))
+        OR ($4='ignored' AND (status='superseded' OR (status='partial' AND error=$5)))) ORDER BY id DESC LIMIT 21"))
+        .bind(tenant).bind(user).bind(before).bind(scope).bind(LEGACY_SOURCE_UPDATED_ERROR).fetch_all(pool).await?;
     let mut runs = rows.into_iter().map(run_row).collect::<Result<Vec<_>>>()?;
     let next = if runs.len() > 20 {
         runs.truncate(20);
@@ -470,6 +515,34 @@ pub async fn progress(pool: &PgPool, owner: &str, r: &Run) -> Result<bool> {
 pub async fn finish(pool: &PgPool, owner: &str, r: &Run, status: &str, retry: bool) -> Result<()> {
     sqlx::query("UPDATE subscription_connector_runs SET status=$3,attempts=$4,error=$5,output_count=$6,source_version=$7,ended_at=CASE WHEN $8 THEN NULL ELSE now() END,available_at=now()+interval '10 seconds',lease_until=NULL WHERE id=$1 AND lease_owner=$2 AND status='running'")
         .bind(r.id).bind(owner).bind(status).bind(json!(r.attempts)).bind(&r.error).bind(r.output_count.map(|v|v as i32)).bind(r.source_version).bind(retry).execute(pool).await?;
+    Ok(())
+}
+fn mark_source_updated(run: &mut Run) {
+    run.status = "superseded".into();
+    run.error = None;
+    if let Some(attempt) = run.attempts.last_mut() {
+        attempt.status = "superseded".into();
+        if let Some(event) = attempt.events.last_mut() {
+            if matches!(event.state.as_str(), "running" | "failed") {
+                event.state = "skipped".into();
+                event.detail = Some(SOURCE_UPDATED_NOTE.into());
+            }
+        }
+    }
+}
+/// Discard obsolete evidence and wake the next maintenance check in the same transaction.
+/// A canceled task cannot reschedule work, and a newer connector configuration is never touched.
+pub async fn supersede_source_run(pool: &PgPool, owner: &str, run: &mut Run) -> Result<()> {
+    mark_source_updated(run);
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query("UPDATE subscription_connector_runs SET status='superseded',attempts=$3,error=NULL,output_count=$4,source_version=$5,ended_at=now(),lease_until=NULL WHERE id=$1 AND lease_owner=$2 AND status='running'")
+        .bind(run.id).bind(owner).bind(json!(run.attempts)).bind(run.output_count.map(|n|n as i32)).bind(run.source_version)
+        .execute(&mut *tx).await?.rows_affected();
+    if updated == 1 {
+        sqlx::query("UPDATE subscription_connectors c SET verified=false,next_check=CASE WHEN c.auto THEN least(c.next_check,now()) ELSE c.next_check END FROM subscription_connector_runs r WHERE r.id=$1 AND c.tenant_id=r.tenant_id AND c.user_id=r.user_id AND c.version=r.config_version AND c.sealed IS NOT NULL")
+            .bind(run.id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 pub async fn due(pool: &PgPool) -> Result<Vec<(String, String)>> {

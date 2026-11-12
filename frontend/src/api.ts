@@ -6077,18 +6077,17 @@ export const startSubStore = (tenant: string, user: string, kind: 'sync' | 'veri
     method: 'POST',
     body: '{}',
   });
+export type SubStoreRunScope = 'all' | 'errors' | 'ignored';
 export const fetchSubStoreRuns = (
   tenant: string,
   user: string,
   before?: number,
-  notable = false,
+  scope: SubStoreRunScope = 'all',
   signal?: AbortSignal,
 ) =>
-  api<SubStoreRunPage>(
-    `${subStorePath(tenant, user)}/runs?notable=${notable}${before ? `&before=${before}` : ''}`,
-    '',
-    { signal },
-  );
+  api<SubStoreRunPage>(`${subStorePath(tenant, user)}/runs?scope=${scope}${before ? `&before=${before}` : ''}`, '', {
+    signal,
+  });
 export const fetchSubStoreRun = (tenant: string, user: string, id: number, signal?: AbortSignal) =>
   api<SubStoreRun>(`${subStorePath(tenant, user)}/runs/${id}`, '', { signal });
 export const cancelSubStoreRun = (tenant: string, user: string, id: number) =>

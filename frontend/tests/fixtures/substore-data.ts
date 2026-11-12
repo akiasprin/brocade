@@ -60,6 +60,13 @@ export function connectorFixture(scene = 'empty', writable = true): SubStoreView
     run.attempts[0].events = [{ ...events[0], name: '连接 Sub-Store', state: 'failed' }];
     c.verified = false;
   }
+  if (scene === 'superseded') {
+    run.status = 'superseded';
+    run.attempts[0].status = 'superseded';
+    events[2].state = 'skipped';
+    run.attempts[0].events[2].detail = '订阅已更新，本次核验已忽略';
+    c.verified = false;
+  }
   if (scene === 'stale') c.verified = false;
   return {
     writable: writable && scene !== 'readonly',
@@ -74,6 +81,43 @@ export function connectorFixture(scene = 'empty', writable = true): SubStoreView
 export function subStoreTransport(scene: string, writable: boolean) {
   let view = connectorFixture(scene, writable);
   let runs = view.latest ? [view.latest] : [];
+  if (scene === 'history') {
+    const ignored = connectorFixture('superseded').latest!;
+    ignored.ended_at = '2026-11-06T11:58:08Z';
+    ignored.duration_ms = 8000;
+    const failed = connectorFixture('failed').latest!;
+    runs = [
+      {
+        ...view.latest!,
+        id: 1051,
+        kind: 'inspect',
+        trigger: '定时核验',
+        started_at: '2026-11-06T11:59:38Z',
+        ended_at: '2026-11-06T11:59:40Z',
+        duration_ms: 2000,
+      },
+      {
+        ...view.latest!,
+        id: 1050,
+        kind: 'verify',
+        started_at: '2026-11-06T11:59:00Z',
+        ended_at: '2026-11-06T11:59:02Z',
+        duration_ms: 2000,
+      },
+      { ...ignored, kind: 'inspect', trigger: '定时核验' },
+      {
+        ...failed,
+        id: 1048,
+        kind: 'inspect',
+        trigger: '定时核验',
+        started_at: '2026-11-06T11:57:00Z',
+        ended_at: '2026-11-06T11:57:08Z',
+        duration_ms: 8000,
+      },
+    ];
+    view.latest = runs[0];
+    view.config!.last_confirmed = runs[0].ended_at;
+  }
   return async (url: URL, init?: RequestInit): Promise<Response | null> => {
     if (!url.pathname.includes('/subscription-connectors/sub-store')) return null;
     const method = init?.method ?? 'GET';
@@ -107,10 +151,13 @@ export function subStoreTransport(scene: string, writable: boolean) {
     }
     if (tail === '/test') return Response.json({ ok: true });
     if (tail === '/runs') {
+      const scope = url.searchParams.get('scope');
       const filtered =
-        url.searchParams.get('notable') === 'true'
-          ? runs.filter(r => r.kind !== 'inspect' || r.status !== 'succeeded')
-          : runs;
+        scope === 'ignored'
+          ? runs.filter(r => r.status === 'superseded')
+          : scope === 'errors'
+            ? runs.filter(r => ['failed', 'partial', 'retry_wait'].includes(r.status))
+            : runs;
       return Response.json({ runs: filtered, next: null });
     }
     const id = /^\/runs\/(\d+)$/.exec(tail);

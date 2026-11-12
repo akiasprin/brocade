@@ -140,14 +140,20 @@ pub(super) struct PageQuery {
     before: Option<i64>,
     #[serde(default)]
     notable: bool,
+    scope: Option<connector::RunScope>,
 }
 pub(super) async fn list(
     State(s): State<AppState>,
     Path((t, u)): Path<(String, String)>,
     Query(q): Query<PageQuery>,
 ) -> ApiResult<Response> {
+    let scope = q.scope.unwrap_or(if q.notable {
+        connector::RunScope::Errors
+    } else {
+        connector::RunScope::All
+    });
     Ok(
-        Json(connector::list(s.store.pool(), &context()?, &t, &u, q.before, q.notable).await?)
+        Json(connector::list_scoped(s.store.pool(), &context()?, &t, &u, q.before, scope).await?)
             .into_response(),
     )
 }
