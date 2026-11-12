@@ -16,16 +16,16 @@ jobs:
     name: formatting preflight
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 2
       - name: Install the declared Rust formatter
         run: rustup toolchain install --profile minimal --component rustfmt
       - run: cargo fmt --all -- --check
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: components/xray-core/.go-version
           cache: false
@@ -33,20 +33,29 @@ jobs:
         env:
           FORMAT_BEFORE: ${{ github.event.before }}
           FORMAT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run:
-          "base=\"$FORMAT_BEFORE\"\nif [ -z \"$base\" ] || [ \"$base\" = 0000000000000000000000000000000000000000 ]; then\n\
-          \  branch=\"${FORMAT_DEFAULT_BRANCH:-main}\"\n  ref=\"refs/remotes/origin/$branch\"\n  if git show-ref --verify --quiet\
-          \ \"$ref\"; then\n    base=$(git rev-parse \"$ref\")\n  else\n    git fetch --no-tags --depth=2 origin \"refs/heads/$branch\"\
-          \n    base=$(git rev-parse FETCH_HEAD)\n  fi\nfi\nif [ \"$base\" = \"$(git rev-parse HEAD)\" ]; then base=$(git rev-parse\
-          \ HEAD^); fi\nif ! git cat-file -e \"$base^{commit}\" 2>/dev/null; then\n  git fetch --no-tags --depth=1 origin \"\
-          $base\"\nfi\nprintf 'Formatting changes since %s\\n' \"$base\"\npython3 scripts/format.py --check --base \"$base\"\
-          \ --install\n"
+        run: |
+          base="$FORMAT_BEFORE"
+          if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ]; then
+            branch="${FORMAT_DEFAULT_BRANCH:-main}"
+            ref="refs/remotes/origin/$branch"
+            if git show-ref --verify --quiet "$ref"; then
+              base=$(git rev-parse "$ref")
+            else
+              git fetch --no-tags --depth=2 origin "refs/heads/$branch"
+              base=$(git rev-parse FETCH_HEAD)
+            fi
+          fi
+          if [ "$base" = "$(git rev-parse HEAD)" ]; then base=$(git rev-parse HEAD^); fi
+          if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$base"
+          fi
+          printf 'Formatting changes since %s\n' "$base"
+          python3 scripts/format.py --check --base "$base" --install
       - name: Verify formatter scope and read-only checks
-        run: 'python3 -m unittest discover -s scripts/tests -p test_format.py
-
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_format.py
           python3 -m unittest discover -s scripts/tests -p test_ci_format_base.py
 
-          '
   frontend:
     name: complete frontend validation
     needs:
@@ -72,54 +81,36 @@ jobs:
         run: npm audit --package-lock-only --audit-level=high
       - name: Install the browser used by front-end tests
         working-directory: frontend
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps chromium webkit
       - name: Install fonts and native test libraries
-        run: "sudo apt-get update
-
+        run: |
+          sudo apt-get update
           sudo apt-get install -y --no-install-recommends fonts-noto-cjk fonts-dejavu-core libcap-ng-dev libseccomp-dev
-
           fc-match 'Noto Sans CJK SC'
-
           fc-match 'Noto Serif CJK SC'
-
           fc-match monospace
-
-          "
       - name: Front-end lint, tests and self-checks
         id: frontend
         working-directory: frontend
-        run: 'npm run lint:strict
-
+        run: |
+          npm run lint:strict
           npm test
-
           node scripts/route-check.mjs
-
           BROCADE_PRODUCT_FLAVOR=base npm run test:react -- tests/product-variants.test.tsx
-
           BROCADE_PRODUCT_FLAVOR=base npm run build
-
           BROCADE_PRODUCT_FLAVOR=cvm npm run build
-
           BROCADE_PRODUCT_FLAVOR=base npx playwright test tests/visual/product-variants.spec.ts --workers=1
+          BROCADE_PRODUCT_FLAVOR=cvm npx playwright test tests/visual/product-variants.spec.ts tests/visual/cvm/cvm-hosts.spec.ts --workers=1
 
-          BROCADE_PRODUCT_FLAVOR=cvm npx playwright test tests/visual/product-variants.spec.ts tests/visual/cvm/cvm-hosts.spec.ts
-          --workers=1
-
-
-          BROCADE_PRODUCT_FLAVOR=base npx playwright test tests/visual/node-links.spec.ts tests/visual/substore-sync.spec.ts
-          tests/visual/subscription-layout.spec.ts --workers=1
-
-          '
+          BROCADE_PRODUCT_FLAVOR=base npx playwright test tests/visual/node-links.spec.ts tests/visual/substore-sync.spec.ts tests/visual/subscription-layout.spec.ts --workers=1
       - name: Preserve failed visual comparisons
         if: failure() && steps.frontend.conclusion == 'failure'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: frontend-visual-${{ matrix.flavor }}
-          path: '.tools/frontend-visual/results
-
+          name: frontend-visual-supplement
+          path: |
+            .tools/frontend-visual/results
             .tools/frontend-visual/report
-
-            '
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
