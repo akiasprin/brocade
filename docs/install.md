@@ -4,14 +4,14 @@
 
 ## 下载
 
-自动下载最新正式版基础包的完整命令见 [README「试用」](../README.md#试用)：按 CPU 架构选择兼容 GNU / musl 系统的静态包，校验后运行包内安装器，不需要额外下载脚本。命令兼容 v0.3.1–v0.3.5 没有变体字段的旧包名，临时下载目录在退出时清理。指定版本或容器版时使用下面的手动下载步骤。
+自动下载最新正式版基础包的完整命令见 [README「安装与更新」](../README.md#安装与更新)：按 CPU 架构选择兼容 GNU / musl 系统的静态包，校验后运行包内安装器，不需要额外下载脚本。命令兼容 v0.3.1–v0.3.5 没有变体字段的旧包名，临时下载目录在退出时清理。指定版本或容器版时使用下面的手动下载步骤。
 
 从 [Releases](https://github.com/akiasprin/brocade/releases/latest) 下载与服务器匹配的发行包和同名 `.sha256`。默认选择 `base` 基础版；需要容器控制面时选择 `cvm` 容器扩展版。两者由同一源码构建，容器扩展安装通过切换 Console 完成。
 
 GNU 包支持 glibc 2.35 及以上；Alpine 等 musl 系统选 `musl`。静态 musl 包也可安装到同架构 GNU 系统，launcher 按宿主 libc 选择受管 PostgreSQL。
 
 ```sh
-v=0.3.6 flavor=base p=linux-x86_64-gnu
+v=0.3.7 flavor=base p=linux-x86_64-gnu
 url=https://github.com/akiasprin/brocade/releases/download/v$v/brocade-dist-$v-$flavor-$p.tar.gz
 curl -fLO "$url" && curl -fLO "$url.sha256"
 sha256sum -c brocade-dist-$v-$flavor-$p.tar.gz.sha256
@@ -92,6 +92,8 @@ sudo brocade up
 系统安装器把数据和下载缓存分别放在 `/var/lib/brocade` 与 `/var/cache/brocade`；`sudo brocade` 会先降权到专用账号，PostgreSQL 和 Console 都不会以 root 运行。直接从解压目录执行时，默认仍为 `$XDG_DATA_HOME/brocade`（或 `~/.local/share/brocade`）与 `$XDG_CACHE_HOME/brocade`（或 `~/.cache/brocade`）。完整参数见 `brocade up --help`。
 
 ## 升级
+
+通过官方安装器部署的 v0.3.6 及以后版本，可以直接使用 [README 的自动更新命令](../README.md#更新)，自动解析 GitHub 最新正式版，并按 CPU 架构和原来的 `base` / `cvm` 变体下载、校验后执行升级，无需填写版本号。首次安装与自动更新的下载目录都会在退出时清理。
 
 安装器管理的 systemd 部署，从 **v0.3.1 及以后版本**升级时，下载、校验并解压新发行包，在新包目录执行：
 

@@ -2,7 +2,7 @@
 
 Brocade 是自建多地域 Xray 网络的声明式控制系统：用一份模型描述机器、线路、用户与授权，把模型确定性地编译成每台机器的配置，再由机器上的 Agent 持续收敛。
 
-[设计约束](#设计约束) · [架构](#架构) · [一次变更的路径](#一次变更的路径) · [失联时](#失联时) · [数据面](#数据面) · [试用](#试用) · [文档](#文档) · [仓库](#仓库)
+[设计约束](#设计约束) · [架构](#架构) · [一次变更的路径](#一次变更的路径) · [失联时](#失联时) · [数据面](#数据面) · [安装与更新](#安装与更新) · [文档](#文档) · [仓库](#仓库)
 
 ## 为什么是声明式
 
@@ -53,13 +53,15 @@ Console 是唯一的控制入口：保存草稿、修订与发布记录，编译
 
 Brocade 只支持仓库内维护的 Xray fork（[`components/xray-core`](components/xray-core)，上游基线 v26.4.25）。它在上游之上增加了 AnyTLS、MTProxy、进程间监听交接、按用户撤销会话和站点用量统计等能力。Console 构建时把双架构的 Xray 嵌入自身，并以实际字节的摘要作为发布身份。
 
-| 环节 | 支持 |
-| --- | --- |
+| 环节 | 支持                                                            |
+| ---- | --------------------------------------------------------------- |
 | 接入 | VLESS（REALITY / TLS，TCP / XHTTP）、AnyTLS、Hysteria2、MTProxy |
-| 中转 | VLESS Encryption、REALITY、Shadowsocks 2022、WireGuard |
-| 出口 | 直连、自定义隧道、Cloudflare WARP（MASQUE）、VPN Gate |
+| 中转 | VLESS Encryption、REALITY、Shadowsocks 2022、WireGuard          |
+| 出口 | 直连、自定义隧道、Cloudflare WARP（MASQUE）、VPN Gate           |
 
-## 试用
+## 安装与更新
+
+### 安装
 
 在 Linux 服务器上复制执行以下命令，自动下载最新正式版中适合 CPU 架构的静态安装包，校验 SHA-256 后启动交互安装：
 
@@ -97,7 +99,49 @@ Brocade 只支持仓库内维护的 Xray fork（[`components/xray-core`](compone
 )
 ```
 
-需要 `curl`、`tar` 和 `sha256sum`。默认安装基础版，静态 musl 包兼容同架构 GNU 与 musl 系统。安装器可托管 PostgreSQL，启动后输出初始化链接，入门向导带你纳管第一台机器。容器版、升级及手动下载见[安装与升级](docs/install.md)。
+需要 `curl`、`tar` 和 `sha256sum`。默认安装基础版，静态 musl 包兼容同架构 GNU 与 musl 系统。安装器可托管 PostgreSQL，启动后输出初始化链接，入门向导带你纳管第一台机器。容器版及手动下载见[安装与升级](docs/install.md)。
+
+### 更新
+
+通过官方安装器部署的 v0.3.6 及以后版本，在原 Console 服务器执行以下命令，自动获取最新正式版并保留已安装的 `base` / `cvm` 变体：
+
+```sh
+(
+  set -eu
+  case "$(uname -s):$(uname -m)" in
+    Linux:x86_64|Linux:amd64) arch=x86_64 ;;
+    Linux:aarch64|Linux:arm64) arch=aarch64 ;;
+    *) echo '仅支持 Linux x86_64 / aarch64' >&2; exit 1 ;;
+  esac
+  flavor=$(cat /etc/brocade/product-flavor)
+  case $flavor in
+    base|cvm) ;;
+    *) echo '无法识别已安装的产品变体，请检查原安装' >&2; exit 1 ;;
+  esac
+  repo=https://github.com/akiasprin/brocade
+  release=$(curl -fsSL --connect-timeout 15 --max-time 60 -o /dev/null -w '%{url_effective}' "$repo/releases/latest")
+  version=${release##*/v}
+  printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
+  bundle=brocade-dist-$version-$flavor-linux-$arch-musl
+  work_dir=$(mktemp -d)
+  trap 'rm -rf "$work_dir"' 0
+  trap 'exit 130' INT
+  trap 'exit 143' HUP TERM
+  cd "$work_dir"
+  url=$repo/releases/download/v$version/$bundle.tar.gz
+  curl -fL --retry 2 --connect-timeout 15 --max-time 600 -o "$bundle.tar.gz" "$url"
+  curl -fL --retry 2 --connect-timeout 15 --max-time 60 -o "$bundle.tar.gz.sha256" "$url.sha256"
+  sha256sum -c "$bundle.tar.gz.sha256"
+  tar -xzf "$bundle.tar.gz"
+  if [ "$(id -u)" -eq 0 ]; then
+    sh "$bundle/install.sh" --upgrade
+  else
+    sudo sh "$bundle/install.sh" --upgrade
+  fi
+)
+```
+
+升级保留原配置、数据库和密钥，安装器会停服备份、执行缺少的迁移并检查启动结果。若要求失败后只向前修复，在两处 `--upgrade` 后追加 `--forward-only`；停服后失败会保留现场并保持停服。更早版本、外部数据库客户端要求与备份恢复说明见[安装与升级](docs/install.md#升级)。
 
 > [!IMPORTANT]
 > Agent 以 root 身份修改机器的网络与系统配置。用于生产前，请先审查生成的配置、访问控制和部署边界。
@@ -119,19 +163,19 @@ Brocade 只支持仓库内维护的 Xray fork（[`components/xray-core`](compone
 
 ## 仓库
 
-| 路径 | 职责 |
-| --- | --- |
-| `crates/brocade-core` | 纯函数编译器：模型快照 → IR → 节点产物；Golden 产物在 `tests/golden/` |
-| `crates/brocade-store` | PostgreSQL：草稿、修订、发布、凭据、配额与用量 |
-| `crates/brocade-console` | 管理端与节点端 API、实时通道；内嵌前端、Agent 与 Xray |
-| `crates/brocade-deployment` | 发布计划与 Console / Agent 共享协议 |
-| `crates/brocade-agent` | 机器侧收敛、观测、探测、自更新与离线缓冲 |
-| `crates/brocade-probe` | Console 与 Agent 共用的临时 Xray 拨测 |
-| `crates/brocade-launcher` | `brocade` 命令：启动 Console 与托管 PostgreSQL |
-| `crates/brocade-sqlx` | 只含 PostgreSQL 驱动的 SQLx 门面 |
-| `crates/brocade-preview` | 基于 Docker 的本地集群预览 |
-| `frontend` | React + Vite 控制台 |
-| `components/xray-core` | Brocade Xray fork |
+| 路径                        | 职责                                                                  |
+| --------------------------- | --------------------------------------------------------------------- |
+| `crates/brocade-core`       | 纯函数编译器：模型快照 → IR → 节点产物；Golden 产物在 `tests/golden/` |
+| `crates/brocade-store`      | PostgreSQL：草稿、修订、发布、凭据、配额与用量                        |
+| `crates/brocade-console`    | 管理端与节点端 API、实时通道；内嵌前端、Agent 与 Xray                 |
+| `crates/brocade-deployment` | 发布计划与 Console / Agent 共享协议                                   |
+| `crates/brocade-agent`      | 机器侧收敛、观测、探测、自更新与离线缓冲                              |
+| `crates/brocade-probe`      | Console 与 Agent 共用的临时 Xray 拨测                                 |
+| `crates/brocade-launcher`   | `brocade` 命令：启动 Console 与托管 PostgreSQL                        |
+| `crates/brocade-sqlx`       | 只含 PostgreSQL 驱动的 SQLx 门面                                      |
+| `crates/brocade-preview`    | 基于 Docker 的本地集群预览                                            |
+| `frontend`                  | React + Vite 控制台                                                   |
+| `components/xray-core`      | Brocade Xray fork                                                     |
 
 ```sh
 cargo test --workspace --locked
