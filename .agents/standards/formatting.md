@@ -38,5 +38,6 @@ SVG 显式使用 Prettier 的 HTML parser。
 - 默认只选择 Git 已修改及未跟踪文件，`--base` 同时纳入指定修订以来的改动，不递归遍历整个仓库。每批编辑必须显式传入本任务路径，不格式化无关工作或整个 vendored 子树。
 - 自动格式化后检查 diff，保留其他工作的语义，不覆盖并行编辑。二进制、lockfile、golden、已发布迁移和存档 SQL 夹具不自动重排；需要更新不可变字节时，按对应领域规范另行处理。
 - CI 的 `format` 作业先于其他作业执行。push 检查整个推送范围；首次推送分支以默认分支为基线，tag 或手动运行回退到最近一次提交，避免多提交推送只检查最后一个提交。发行构建在不可变工作树中只读检查，修正必须在冻结和启动构建之前完成。
+- 浅克隆拉取默认分支时保留至少两层历史；默认分支与当前提交相同时解析实际父提交 SHA，不能把本地 `HEAD^` 表达式当作远端 ref 拉取。相同默认分支、tag 和多提交推送范围由真实浅克隆回归测试验证。
 
 工具行为参考 [Ruff formatter](https://docs.astral.sh/ruff/formatter/)、[shfmt](https://github.com/mvdan/sh) 和 [Prettier CLI](https://prettier.io/docs/cli)。

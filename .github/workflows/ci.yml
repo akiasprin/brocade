@@ -69,18 +69,20 @@ jobs:
             if git show-ref --verify --quiet "$ref"; then
               base=$(git rev-parse "$ref")
             else
-              git fetch --no-tags --depth=1 origin "refs/heads/$branch"
+              git fetch --no-tags --depth=2 origin "refs/heads/$branch"
               base=$(git rev-parse FETCH_HEAD)
             fi
           fi
-          if [ "$base" = "$(git rev-parse HEAD)" ]; then base=HEAD^; fi
+          if [ "$base" = "$(git rev-parse HEAD)" ]; then base=$(git rev-parse HEAD^); fi
           if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
             git fetch --no-tags --depth=1 origin "$base"
           fi
           printf 'Formatting changes since %s\n' "$base"
           python3 scripts/format.py --check --base "$base" --install
       - name: Verify formatter scope and read-only checks
-        run: python3 -m unittest discover -s scripts/tests -p test_format.py
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_format.py
+          python3 -m unittest discover -s scripts/tests -p test_ci_format_base.py
 
   cvm-cube:
     name: optional Cube node runtime boundaries
