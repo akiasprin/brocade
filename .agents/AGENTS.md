@@ -19,19 +19,19 @@
 
 面向使用者与运维者的产品文档放在 `docs/`，按主题维护安装、构建、部署与功能行为。`README.md` 只保留概览、架构、试用入口和文档索引；功能细节和升级说明写入 `docs/` 对应主题，不追加到 README。
 
-| 任务 | 继续阅读 |
-| --- | --- |
-| 理解工程理念、深度思考与判断原则 | `.agents/engineering-philosophy.md` |
-| 理解系统边界或跨层数据流 | `.agents/architecture/system-overview.md` |
-| 修改前端视觉、交互或组件 | `.agents/standards/frontend.md` |
-| 修改 Rust、PostgreSQL、协议或 Xray | `.agents/standards/backend.md` |
-| 选择或执行验证 | `.agents/standards/testing.md` |
-| 部署 Console 或变更宿主机服务 | `.agents/runbooks/console-deployment.md` |
-| 发布、回滚 Agent/Xray/配置/授权 | `.agents/runbooks/release-and-rollback.md` |
-| 排查生产异常 | `.agents/runbooks/incident-response.md` |
-| 深入分析设计、疑难修复或复杂实施方案 | `.agents/standards/design-planning.md` |
-| 记录长期架构决策 | `.agents/adr/README.md` |
-| 执行较长、跨层或需交接的改造 | `.agents/plans/TEMPLATE.md` |
+| 任务                                 | 继续阅读                                   |
+| ------------------------------------ | ------------------------------------------ |
+| 理解工程理念、深度思考与判断原则     | `.agents/engineering-philosophy.md`        |
+| 理解系统边界或跨层数据流             | `.agents/architecture/system-overview.md`  |
+| 修改前端视觉、交互或组件             | `.agents/standards/frontend.md`            |
+| 修改 Rust、PostgreSQL、协议或 Xray   | `.agents/standards/backend.md`             |
+| 选择或执行验证                       | `.agents/standards/testing.md`             |
+| 部署 Console 或变更宿主机服务        | `.agents/runbooks/console-deployment.md`   |
+| 发布、回滚 Agent/Xray/配置/授权      | `.agents/runbooks/release-and-rollback.md` |
+| 排查生产异常                         | `.agents/runbooks/incident-response.md`    |
+| 深入分析设计、疑难修复或复杂实施方案 | `.agents/standards/design-planning.md`     |
+| 记录长期架构决策                     | `.agents/adr/README.md`                    |
+| 执行较长、跨层或需交接的改造         | `.agents/plans/TEMPLATE.md`                |
 
 ## 项目不变量
 
@@ -52,26 +52,26 @@ ModelSnapshot -> IR -> 节点产物 -> 期望状态 -> Agent 收敛
 
 ## 仓库导航
 
-| 路径 | 职责与常用入口 |
-| --- | --- |
-| `crates/brocade-core` | 纯模型编译器。入口见 `src/model.rs`、`src/compile.rs`、`src/ir/`、`src/artifacts/`；确定性产物在 `tests/golden/`。 |
-| `crates/brocade-store` | PostgreSQL 持久化、草稿、修订、发布、凭据、配额与用量；schema 在 `migrations/`。 |
-| `crates/brocade-console` | 管理端和节点端 HTTP API、实时通道、证书与内嵌资源；主要路由在 `src/http.rs`，构建嵌入逻辑在 `build.rs`。 |
-| `crates/brocade-deployment` | 发布计划、热切换和 Console/Agent 共享协议；协议入口为 `src/protocol.rs`。 |
-| `crates/brocade-agent` | 节点侧收敛、系统配置、观测、探测、自更新与离线缓冲。 |
-| `crates/brocade-cube` | Agent 内的 Rust Cube 客户端、原盘收敛、网卡对接、Guest I/O、观测和终端；直接调用固定 Cube／containerd 协议。 |
-| `crates/brocade-probe` | Console 与 Agent 共用的临时 Xray 客户端和端到端拨测。 |
-| `crates/brocade-launcher` | Console 和可选受管 PostgreSQL 的本机编排；默认 HTTP IP 入口端口 8080。 |
-| `crates/brocade-preview` | 基于 Docker 的本地集群预览环境。 |
-| `frontend/src/api.ts` | 前端 API 类型与请求入口；后端响应变化时从这里检查调用方。 |
-| `frontend/src/panes/` | 页面级功能；`ui/` 是复用界面组件，`forge/` 是草稿/产物工作区，`topo/` 是拓扑，`wm/` 是窗口与导航状态。 |
-| `frontend/tests/` | Node 契约测试和 Vitest/Testing Library 组件测试。 |
-| `docs/` | 面向使用者与运维者的产品文档：安装、构建、手动部署与各功能的行为和升级说明；`README.md` 是概览与索引。 |
-| `components/xray-core` | Brocade 维护的 Xray fork；上游基线记录在 `BROCADE_UPSTREAM.toml`。只做明确需要的数据面改动。 |
-| `components/cube` | Brocade 维护的可选 Cube 节点栈；基线见 `BROCADE_UPSTREAM.toml`，Cubelet 管理原盘和网卡状态，CubeVS 执行双栈 LAN 策略；构建与安装边界见 `docs/cube-runtime.md`。 |
-| `.github/workflows/ci.yml` | CI 的最终检查定义；本地命令与 CI 有冲突时以这里为准。 |
-| `scripts/`、`install.sh` | 构建辅助脚本、资源准备和 POSIX 安装器。 |
-| `console.env.example` | Console 配置的公开清单和部署示例，新增/修改环境变量时同步更新。 |
+| 路径                        | 职责与常用入口                                                                                                                                                  |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/brocade-core`       | 纯模型编译器。入口见 `src/model.rs`、`src/compile.rs`、`src/ir/`、`src/artifacts/`；确定性产物在 `tests/golden/`。                                              |
+| `crates/brocade-store`      | PostgreSQL 持久化、草稿、修订、发布、凭据、配额与用量；schema 在 `migrations/`。                                                                                |
+| `crates/brocade-console`    | 管理端和节点端 HTTP API、实时通道、证书与内嵌资源；主要路由在 `src/http.rs`，构建嵌入逻辑在 `build.rs`。                                                        |
+| `crates/brocade-deployment` | 发布计划、热切换和 Console/Agent 共享协议；协议入口为 `src/protocol.rs`。                                                                                       |
+| `crates/brocade-agent`      | 节点侧收敛、系统配置、观测、探测、自更新与离线缓冲。                                                                                                            |
+| `crates/brocade-cube`       | Agent 内的 Rust Cube 客户端、原盘收敛、网卡对接、Guest I/O、观测和终端；直接调用固定 Cube／containerd 协议。                                                    |
+| `crates/brocade-probe`      | Console 与 Agent 共用的临时 Xray 客户端和端到端拨测。                                                                                                           |
+| `crates/brocade-launcher`   | Console 和可选受管 PostgreSQL 的本机编排；默认 HTTP IP 入口端口 8080。                                                                                          |
+| `crates/brocade-preview`    | 基于 Docker 的本地集群预览环境。                                                                                                                                |
+| `frontend/src/api.ts`       | 前端 API 类型与请求入口；后端响应变化时从这里检查调用方。                                                                                                       |
+| `frontend/src/panes/`       | 页面级功能；`ui/` 是复用界面组件，`forge/` 是草稿/产物工作区，`topo/` 是拓扑，`wm/` 是窗口与导航状态。                                                          |
+| `frontend/tests/`           | Node 契约测试和 Vitest/Testing Library 组件测试。                                                                                                               |
+| `docs/`                     | 面向使用者与运维者的产品文档：安装、构建、手动部署与各功能的行为和升级说明；`README.md` 是概览与索引。                                                          |
+| `components/xray-core`      | Brocade 维护的 Xray fork；上游基线记录在 `BROCADE_UPSTREAM.toml`。只做明确需要的数据面改动。                                                                    |
+| `components/cube`           | Brocade 维护的可选 Cube 节点栈；基线见 `BROCADE_UPSTREAM.toml`，Cubelet 管理原盘和网卡状态，CubeVS 执行双栈 LAN 策略；构建与安装边界见 `docs/cube-runtime.md`。 |
+| `.github/workflows/ci.yml`  | CI 的最终检查定义；本地命令与 CI 有冲突时以这里为准。                                                                                                           |
+| `scripts/`、`install.sh`    | 构建辅助脚本、资源准备和 POSIX 安装器。                                                                                                                         |
+| `console.env.example`       | Console 配置的公开清单和部署示例，新增/修改环境变量时同步更新。                                                                                                 |
 
 跨层功能通常按以下方向排查：
 
@@ -84,6 +84,7 @@ brocade-core -> artifacts -> embedded Brocade Xray
 ## 通用编码规范
 
 - 遵循 `.editorconfig`：UTF-8、LF、文件末尾换行、无行尾空格；Rust 使用 4 空格，其余项目文件通常使用 2 空格。
+- 所有语言和文本配置的格式化都是每批编辑后、任务收尾及启动 CI／构建前的强制步骤，统一入口、工具和边界见[格式化标准](standards/formatting.md)。
 - 命名表达领域含义，不使用无信息量缩写。函数只承担一个清晰职责；优先提前返回，避免深层嵌套。
 - 复用现有模块和类型，不复制协议结构、校验逻辑或状态来源。一个事实只保留一个权威来源。
 - 注释解释“为什么”、不变量和非显然约束，不逐行翻译代码。公共 API 或复杂状态机使用文档注释。

@@ -37,7 +37,7 @@ BROCADE_CONSOLE_ASSETS_DIR=/absolute/path/to/frontend/dist \
 python3 scripts/build-release.py
 ```
 
-该入口面向 x86_64 Linux 构建机，检查精确 Go 版本、Zig、Rust targets 和 ARM GNU 链接器，以一次 Cargo 调用调度 x86_64 / aarch64 Console 与 launcher；嵌入 Agent 也以双目标 Cargo 图调度。默认 jobs=4，可用 `--jobs 2` 至 `--jobs 8` 调整。
+该入口面向 x86_64 Linux 构建机，先执行只读 Rust 格式检查及本次变更的各语言格式检查；未通过时在前端准备和编译之前退出。首次使用前在编辑工作树执行 `python3 scripts/format.py --install`，按变更范围准备固定版本格式化器并完成格式修正，再冻结构建源码。随后入口检查精确 Go 版本、Zig、Rust targets 和 ARM GNU 链接器，以一次 Cargo 调用调度 x86_64 / aarch64 Console 与 launcher；嵌入 Agent 也以双目标 Cargo 图调度。默认 jobs=4，可用 `--jobs 2` 至 `--jobs 8` 调整。
 
 编译输入位置和缓存保持稳定，归档目录只保存完成后的交付物。前端按源码、工具版本和产物摘要校验缓存，仅在需要时构建一次，避免双目标重复安装依赖。构建没有总时限或阶段超时；构建和各阶段在开始、结束时输出带时区的 UTC 时间、结果与耗时，每 30 秒报告进度。`target/brocade-release/preparation.json` 同步记录总体与各阶段的 `started_at`、`ended_at`、结果、耗时以及来源和产物摘要，运行中的结束时间为 null。耗时使用单调时钟，不受系统时间调整影响。构建日志在同目录的 `cargo.log`。输入变化或实际错误仍使构建失败，人工取消会清理本次进程组并记录 `cancelled`；发布须完成与本次产物对应的验收。
 

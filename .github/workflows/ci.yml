@@ -40,8 +40,51 @@ permissions:
   contents: read
 
 jobs:
+  format:
+    name: formatting preflight
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 2
+      - name: Install the declared Rust formatter
+        run: rustup toolchain install --profile minimal --component rustfmt
+      - run: cargo fmt --all -- --check
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: components/xray-core/.go-version
+          cache: false
+      - name: Check all changed languages and configuration
+        env:
+          FORMAT_BEFORE: ${{ github.event.before }}
+          FORMAT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          base="$FORMAT_BEFORE"
+          if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ]; then
+            branch="${FORMAT_DEFAULT_BRANCH:-main}"
+            ref="refs/remotes/origin/$branch"
+            if git show-ref --verify --quiet "$ref"; then
+              base=$(git rev-parse "$ref")
+            else
+              git fetch --no-tags --depth=1 origin "refs/heads/$branch"
+              base=$(git rev-parse FETCH_HEAD)
+            fi
+          fi
+          if [ "$base" = "$(git rev-parse HEAD)" ]; then base=HEAD^; fi
+          if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$base"
+          fi
+          printf 'Formatting changes since %s\n' "$base"
+          python3 scripts/format.py --check --base "$base" --install
+      - name: Verify formatter scope and read-only checks
+        run: python3 -m unittest discover -s scripts/tests -p test_format.py
+
   cvm-cube:
     name: optional Cube node runtime boundaries
+    needs: [format]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -79,6 +122,7 @@ jobs:
 
   xray-data-plane:
     name: xray data-plane test, vet and race
+    needs: [format]
     runs-on: ubuntu-latest
     # Fixed work avoids Go's fuzztime deadline race (go.dev/issue/75804).
     # 300k covers the observed work from the former 10s budgets; each test keeps its 2m limit.
@@ -200,6 +244,11 @@ jobs:
           go test -race ./proxy/shadowsocks_2022 -count=3 -timeout=2m
           go vet ./proxy/shadowsocks_2022
 
+      - name: Listener handoff descriptor boundaries and races
+        run: |
+          go test -race ./transport/internet/tcp -count=1 -timeout=3m
+          go vet ./transport/internet/tcp
+
       - name: Quota revocation sessions and user isolation
         run: |
           go test -race ./common/protocol ./proxy/vless/... ./proxy/hysteria/... ./transport/internet/hysteria -count=3 -timeout=3m
@@ -298,13 +347,14 @@ jobs:
 
   check:
     name: fmt + clippy + test (${{ matrix.flavor }})
+    needs: [format]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         flavor: [base, cvm]
     env:
-      BROCADE_RUN_PG_TESTS: "1"
+      BROCADE_RUN_PG_TESTS: '1'
       BROCADE_CARGO_FEATURES: ${{ matrix.flavor == 'cvm' && 'brocade-agent/cvm,brocade-console/cvm,brocade-store/cvm,brocade-deployment/cvm' || '' }}
       BROCADE_CRATE_FEATURES: ${{ matrix.flavor == 'cvm' && 'cvm' || '' }}
     steps:
@@ -418,8 +468,6 @@ jobs:
             exit 1
           fi
 
-      - run: cargo fmt --all -- --check
-
       - run: cargo clippy --workspace --all-targets --no-default-features --features "$BROCADE_CARGO_FEATURES" --locked -- -D warnings
 
       - name: Verify Shim-owned persistent terminals
@@ -478,6 +526,11 @@ jobs:
           CGO_ENABLED=0 go -C components/xray-core build -buildvcs=false -trimpath -o "${RUNNER_TEMP}/presence-xray" ./main
           BROCADE_XRAY_BIN="${RUNNER_TEMP}/presence-xray" cargo test -p brocade-agent --locked native_grpc_round_trips_against_xray -- --ignored
 
+      - name: Full listener-group handoff with the current Xray
+        run: |
+          ulimit -n 1024
+          BROCADE_TEST_XRAY="${RUNNER_TEMP}/presence-xray" cargo test -p brocade-agent --locked native_agent_handoff_exports_full_listener_group -- --ignored --test-threads=1
+
       - name: Front-end lint, tests and self-checks
         id: frontend
         working-directory: frontend
@@ -505,6 +558,7 @@ jobs:
 
   build:
     name: brocade dist (${{ matrix.flavor }}-${{ matrix.arch }}-${{ matrix.libc }})
+    needs: [format]
     # GNU artifacts must load on Ubuntu 22.04 (glibc 2.35), not inherit a moving runner ABI.
     runs-on: ubuntu-22.04
     strategy:
@@ -644,7 +698,7 @@ jobs:
       - name: Exercise static launcher and managed PostgreSQL on GNU libc
         if: matrix.arch == 'x86_64' && matrix.libc == 'musl'
         env:
-          BROCADE_RUN_LAUNCHER_PG_TESTS: "1"
+          BROCADE_RUN_LAUNCHER_PG_TESTS: '1'
           BROCADE_UPGRADE_CONSOLE_BIN: ${{ github.workspace }}/target/${{ matrix.triple }}/release/brocade-console
           BROCADE_ZIG_TARGET: x86_64-linux-musl
           CC_x86_64_unknown_linux_musl: ${{ github.workspace }}/scripts/zig-cc

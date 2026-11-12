@@ -14,6 +14,10 @@
 - Agent 接收期望状态并收敛，不引入只能执行一次、无法重试的命令脚本模型。
 - 单元测试靠近实现；跨模块、数据库和协议行为放在 crate 的 `tests/`。缺陷修复补最小回归测试。
 
+### Rust 格式化强制门槛
+
+执行时机、自动化入口和工具版本统一遵循[格式化标准](formatting.md)。Rust 根工作区收尾仍须执行 `cargo fmt --all` 和 `cargo fmt --all -- --check`；独立 Rust 工作区在对应目录执行，或传入其 `--manifest-path`。单文件格式化不得递归改动其他模块。
+
 ## PostgreSQL
 
 - **创建新迁移文件的强制门槛**：创建前必须同时确认 `git status --porcelain=v1 --untracked-files=all` 输出为空，且 `git tag --points-at HEAD` 非空（当前 HEAD 有对应 tag）。任一条件不满足，禁止新增迁移文件，变更必须合入当前已有迁移。不得通过自动提交、创建 tag、暂存、stash、清理或回退用户工作来绕过此门槛。已经运行过旧预发布字节的环境，必须精确校验旧 checksum 和结构，并通过已验证的原子兼容转换升级；不能只改数据库回执。

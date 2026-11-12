@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Timed dual-architecture GNU build from a stable, exclusively owned checkout."""
+
 import argparse
 import contextlib
 from datetime import datetime, timezone
@@ -44,10 +45,13 @@ class BuildTimer:
 
     def report(self, status='running'):
         now = time.monotonic()
-        print(f'[{timestamp()}] release build: {self.stage or "preflight"} {status}, '
-              f'started {self.stage_started_at}, '
-              f'stage {now - self.stage_started:.1f}s, total {now - self.started:.1f}s',
-              file=sys.stderr, flush=True)
+        print(
+            f'[{timestamp()}] release build: {self.stage or "preflight"} {status}, '
+            f'started {self.stage_started_at}, '
+            f'stage {now - self.stage_started:.1f}s, total {now - self.started:.1f}s',
+            file=sys.stderr,
+            flush=True,
+        )
         if self.on_progress:
             self.on_progress()
         self.next_report = now + PROGRESS_INTERVAL_SECONDS
@@ -66,8 +70,9 @@ def stable_root(root):
 
 def run(args, root, env, timer, log=None):
     timer.tick()
-    with subprocess.Popen(args, cwd=root, env=env, start_new_session=True,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+    with subprocess.Popen(
+        args, cwd=root, env=env, start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    ) as process:
         output = bytearray()
         received = 0
         try:
@@ -115,13 +120,21 @@ def digest(path, timer):
 
 
 def inputs(root, env, timer, frontend_only=False):
-    files = run(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
-                root, env, timer).split('\0')
+    files = run(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], root, env, timer).split('\0')
     h = hashlib.sha256()
     for name in sorted(set(filter(None, files))):
-        if frontend_only and not any(name == prefix or name.startswith(prefix + '/') for prefix in [
-                'frontend/src', 'frontend/public', 'frontend/index.html', 'frontend/package.json',
-                'frontend/package-lock.json', 'frontend/vite.config.ts', 'frontend/tsconfig.json']):
+        if frontend_only and not any(
+            name == prefix or name.startswith(prefix + '/')
+            for prefix in [
+                'frontend/src',
+                'frontend/public',
+                'frontend/index.html',
+                'frontend/package.json',
+                'frontend/package-lock.json',
+                'frontend/vite.config.ts',
+                'frontend/tsconfig.json',
+            ]
+        ):
             continue
         path = root / name
         if path.is_symlink():
@@ -154,9 +167,13 @@ def frontend(root, state, env, timer):
     stamp = state / 'frontend.json'
     dist = state / 'frontend-dist'
     previous = json.loads(stamp.read_text()) if stamp.exists() else {}
-    if (previous.get('source') == source and previous.get('flavor') == flavor and previous.get('tools') == tools
-            and (dist / 'index.html').is_file()
-            and previous.get('assets') == assets_digest(dist, timer)):
+    if (
+        previous.get('source') == source
+        and previous.get('flavor') == flavor
+        and previous.get('tools') == tools
+        and (dist / 'index.html').is_file()
+        and previous.get('assets') == assets_digest(dist, timer)
+    ):
         return dist
     # Prepare once before the two Console build scripts; concurrent npm ci would race
     # while replacing their shared node_modules directory.
@@ -213,8 +230,19 @@ def agents(root, state, env, timer, jobs, zig, flavor='base'):
     target, wrappers = agent_wrappers(root / 'target/brocade-release', zig)
     target = target / flavor
     triples = [('x86_64', 'x86_64-unknown-linux-musl'), ('aarch64', 'aarch64-unknown-linux-musl')]
-    command = ['cargo', 'build', '--release', '--locked', '--jobs', str(jobs),
-               '-p', 'brocade-agent', '--no-default-features', '--target-dir', str(target)]
+    command = [
+        'cargo',
+        'build',
+        '--release',
+        '--locked',
+        '--jobs',
+        str(jobs),
+        '-p',
+        'brocade-agent',
+        '--no-default-features',
+        '--target-dir',
+        str(target),
+    ]
     if flavor == 'cvm':
         command += ['--features', 'cvm']
     for _, triple in triples:
@@ -240,10 +268,14 @@ def go_binary(root, env, timer):
     version = (root / 'components/xray-core/.go-version').read_text().strip()
     explicit = env.get('BROCADE_GO')
     machine = {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(os.uname().machine)
-    candidates = [explicit] if explicit else [
-        shutil.which('go'),
-        str(Path.home() / f'go/pkg/mod/golang.org/toolchain@v0.0.1-go{version}.linux-{machine}/bin/go'),
-    ]
+    candidates = (
+        [explicit]
+        if explicit
+        else [
+            shutil.which('go'),
+            str(Path.home() / f'go/pkg/mod/golang.org/toolchain@v0.0.1-go{version}.linux-{machine}/bin/go'),
+        ]
+    )
     for candidate in filter(None, candidates):
         if not Path(candidate).is_file():
             continue
@@ -253,26 +285,43 @@ def go_binary(root, env, timer):
     raise BuildError(f'Go {version} is required; set BROCADE_GO to the installed compiler')
 
 
+def check_format(root, env, timer):
+    run(['cargo', 'fmt', '--all', '--', '--check'], root, env, timer)
+    run([sys.executable, 'scripts/format.py', '--check', '--base', 'HEAD^'], root, env, timer)
+
+
 def build(args, root, timer):
     print(f'[{timer.started_at}] release build started', file=sys.stderr, flush=True)
     stable_root(root)
     state = root / 'target/brocade-release' / args.flavor
     state.mkdir(parents=True, exist_ok=True)
-    record = {'status': 'running', 'build_complete': False, 'deployment_ready': False,
-              'started_at': timer.started_at, 'ended_at': None, 'stages': [], 'artifacts': {}, 'flavor': args.flavor}
+    record = {
+        'status': 'running',
+        'build_complete': False,
+        'deployment_ready': False,
+        'started_at': timer.started_at,
+        'ended_at': None,
+        'stages': [],
+        'artifacts': {},
+        'flavor': args.flavor,
+    }
     with (root / 'target/brocade-release/lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise BuildError('another release build owns this checkout; no hidden lock queue') from None
+
         def save_record():
             if record['ended_at'] is None:
                 record['elapsed_seconds'] = time.monotonic() - timer.started
             if timer.stage:
-                record['active_stage'] = {'name': timer.stage,
-                                          'started_at': timer.stage_started_at, 'ended_at': None,
-                                          'status': 'running',
-                                          'seconds': time.monotonic() - timer.stage_started}
+                record['active_stage'] = {
+                    'name': timer.stage,
+                    'started_at': timer.stage_started_at,
+                    'ended_at': None,
+                    'status': 'running',
+                    'seconds': time.monotonic() - timer.stage_started,
+                }
             else:
                 record.pop('active_stage', None)
             temporary = state / 'preparation.json.tmp'
@@ -295,13 +344,24 @@ def build(args, root, timer):
             finally:
                 seconds = time.monotonic() - timer.stage_started
                 ended_at = timestamp()
-                record['stages'].append({'name': name, 'seconds': seconds, 'status': status,
-                                         'started_at': timer.stage_started_at, 'ended_at': ended_at})
+                record['stages'].append(
+                    {
+                        'name': name,
+                        'seconds': seconds,
+                        'status': status,
+                        'started_at': timer.stage_started_at,
+                        'ended_at': ended_at,
+                    }
+                )
                 timer.stage = None
                 save_record()
-                print(f'[{ended_at}] release build: {name} {status}, '
-                      f'started {timer.stage_started_at}, ended {ended_at}, stage {seconds:.1f}s, '
-                      f'total {record["elapsed_seconds"]:.1f}s', file=sys.stderr, flush=True)
+                print(
+                    f'[{ended_at}] release build: {name} {status}, '
+                    f'started {timer.stage_started_at}, ended {ended_at}, stage {seconds:.1f}s, '
+                    f'total {record["elapsed_seconds"]:.1f}s',
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         timer.on_progress = save_record
         # Never expose the previous successful record while a new build is in progress.
@@ -309,14 +369,24 @@ def build(args, root, timer):
         try:
             with stage('preflight'):
                 env = os.environ.copy()
-                for key in ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
-                            'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']:
+                for key in [
+                    'GIT_DIR',
+                    'GIT_WORK_TREE',
+                    'GIT_INDEX_FILE',
+                    'GIT_COMMON_DIR',
+                    'GIT_OBJECT_DIRECTORY',
+                    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+                ]:
                     env.pop(key, None)
                 actual = run(['git', 'rev-parse', '--show-toplevel'], root, env, timer)
                 if Path(actual).resolve() != root:
                     raise BuildError('the stable checkout must have its own Git metadata')
-                if any(env.get(prefix + arch) for prefix in ['BROCADE_AGENT_BIN_', 'BROCADE_CVM_AGENT_BIN_']
-                       for arch in ['X86_64', 'AARCH64']):
+                check_format(root, env, timer)
+                if any(
+                    env.get(prefix + arch)
+                    for prefix in ['BROCADE_AGENT_BIN_', 'BROCADE_CVM_AGENT_BIN_']
+                    for arch in ['X86_64', 'AARCH64']
+                ):
                     raise BuildError('this entry builds current Agents; remove external Agent overrides')
                 env.pop('BROCADE_CONSOLE_ASSETS_DIR', None)
                 env['BROCADE_PRODUCT_FLAVOR'] = args.flavor
@@ -348,10 +418,23 @@ def build(args, root, timer):
             with stage('frontend'):
                 env['BROCADE_CONSOLE_ASSETS_DIR'] = str(frontend(root, state, env, timer))
             with stage('dual_architecture_agent'):
-                record['agent_commands'] = [agents(root, state, env, timer, args.jobs, zig, flavor)
-                                            for flavor in (['base', 'cvm'] if args.flavor == 'cvm' else ['base'])]
-            command = ['cargo', 'build', '--release', '--locked', '--jobs', str(args.jobs),
-                       '-p', 'brocade-console', '-p', 'brocade-launcher', '--no-default-features']
+                record['agent_commands'] = [
+                    agents(root, state, env, timer, args.jobs, zig, flavor)
+                    for flavor in (['base', 'cvm'] if args.flavor == 'cvm' else ['base'])
+                ]
+            command = [
+                'cargo',
+                'build',
+                '--release',
+                '--locked',
+                '--jobs',
+                str(args.jobs),
+                '-p',
+                'brocade-console',
+                '-p',
+                'brocade-launcher',
+                '--no-default-features',
+            ]
             if args.flavor == 'cvm':
                 command += ['--features', 'brocade-console/cvm']
             for triple in triples:
@@ -367,11 +450,16 @@ def build(args, root, timer):
                     for name in ['brocade-console', 'brocade-launcher']:
                         path = state / 'cargo' / triple / 'release' / name
                         record['artifacts'][f'{triple}/{name}'] = {'path': str(path), 'sha256': digest(path, timer)}
-            record.update(status='built', build_complete=True,
-                          remaining_gates=['impact-scoped validation', 'first-release variant installation acceptance'])
+            record.update(
+                status='built',
+                build_complete=True,
+                remaining_gates=['impact-scoped validation', 'first-release variant installation acceptance'],
+            )
         except BaseException as error:
-            record.update(status='cancelled' if isinstance(error, KeyboardInterrupt) else 'failed',
-                          error=str(error) or 'interrupted')
+            record.update(
+                status='cancelled' if isinstance(error, KeyboardInterrupt) else 'failed',
+                error=str(error) or 'interrupted',
+            )
             raise
         finally:
             record['elapsed_seconds'] = time.monotonic() - timer.started
@@ -379,9 +467,13 @@ def build(args, root, timer):
             record['ended_at'] = timer.ended_at
             timer.on_progress = None
             save_record()
-            print(f'[{record["ended_at"]}] release build {record["status"]}, '
-                  f'started {record["started_at"]}, ended {record["ended_at"]}, '
-                  f'total {record["elapsed_seconds"]:.1f}s', file=sys.stderr, flush=True)
+            print(
+                f'[{record["ended_at"]}] release build {record["status"]}, '
+                f'started {record["started_at"]}, ended {record["ended_at"]}, '
+                f'total {record["elapsed_seconds"]:.1f}s',
+                file=sys.stderr,
+                flush=True,
+            )
             print(json.dumps(record), flush=True)
 
 
@@ -391,14 +483,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--flavor', choices=['base', 'cvm'], default='base')
     parser.add_argument('--jobs', type=int, choices=range(2, 9), default=4)
-    parser.add_argument('--cube-runtime-only', action='store_true',
-                        help='prepare the optional Cube node stack in its fixed cache')
+    parser.add_argument(
+        '--cube-runtime-only', action='store_true', help='prepare the optional Cube node stack in its fixed cache'
+    )
     parser.add_argument('--cube-arch', choices=['x86_64', 'aarch64'])
     parser.add_argument('--cube-sysroot-libs', type=Path)
     parser.add_argument('--cube-bpf-include', type=Path, default=Path('/usr/include'))
     parser.add_argument('--cube-glibc', default=DEFAULT_GLIBC)
-    parser.add_argument('--cvm-package-assets', type=Path,
-                        help='fixed Guest assets plus their SHA-256 manifest; assemble a node-only CVM install bundle')
+    parser.add_argument(
+        '--cvm-package-assets',
+        type=Path,
+        help='fixed Guest assets plus their SHA-256 manifest; assemble a node-only CVM install bundle',
+    )
     args = parser.parse_args()
     if args.cvm_package_assets and not args.cube_runtime_only:
         parser.error('--cvm-package-assets requires --cube-runtime-only')
@@ -407,16 +503,29 @@ def main():
     status = 'failed'
     try:
         if args.cube_runtime_only:
-            root=Path(__file__).resolve().parents[1]
+            root = Path(__file__).resolve().parents[1]
             stable_root(root)
-            command=[sys.executable,str(root/'scripts/build-cube.py'),'--arch',args.cube_arch,
-                     '--sysroot-libs',str(args.cube_sysroot_libs.resolve()),
-                     '--bpf-include',str(args.cube_bpf_include.resolve()),'--glibc',args.cube_glibc,
-                     '--jobs',str(args.jobs),
-                     '--go',go_binary(root,os.environ.copy(),timer)]
-            outcome=subprocess.run(command,cwd=root)
+            check_format(root, os.environ.copy(), timer)
+            command = [
+                sys.executable,
+                str(root / 'scripts/build-cube.py'),
+                '--arch',
+                args.cube_arch,
+                '--sysroot-libs',
+                str(args.cube_sysroot_libs.resolve()),
+                '--bpf-include',
+                str(args.cube_bpf_include.resolve()),
+                '--glibc',
+                args.cube_glibc,
+                '--jobs',
+                str(args.jobs),
+                '--go',
+                go_binary(root, os.environ.copy(), timer),
+            ]
+            outcome = subprocess.run(command, cwd=root)
             if outcome.returncode == 0 and args.cvm_package_assets:
                 import cvm_package
+
                 package_dir = root / 'target/cube/artifacts' / args.cube_arch
                 with tempfile.TemporaryDirectory(prefix='bundle-', dir=package_dir) as temporary:
                     bundle = Path(temporary) / 'bundle.tar.gz'
@@ -428,12 +537,18 @@ def main():
                     if digest(final, timer) != sha:
                         raise BuildError('CVM install bundle differs from its content-addressed identity')
                     final.chmod(0o644)
-                    receipt = {'bundle': str(final), 'sha256': sha, 'architecture': args.cube_arch,
-                               'started_at': timer.started_at, 'completed_at': timestamp(),
-                               'duration_seconds': round(time.monotonic()-timer.started, 3), 'deployment_ready': False}
+                    receipt = {
+                        'bundle': str(final),
+                        'sha256': sha,
+                        'architecture': args.cube_arch,
+                        'started_at': timer.started_at,
+                        'completed_at': timestamp(),
+                        'duration_seconds': round(time.monotonic() - timer.started, 3),
+                        'deployment_ready': False,
+                    }
                     (package_dir / 'bundle.json').write_text(json.dumps(receipt, indent=2) + '\n')
                     print(json.dumps(receipt), flush=True)
-            status='built' if outcome.returncode==0 else 'failed'
+            status = 'built' if outcome.returncode == 0 else 'failed'
             return outcome.returncode
         build(args, Path(__file__).resolve().parents[1], timer)
     except KeyboardInterrupt:
@@ -448,9 +563,12 @@ def main():
         if timer.ended_at is None:
             elapsed = time.monotonic() - timer.started
             timer.ended_at = timestamp()
-            print(f'[{timer.ended_at}] release build {status}, '
-                  f'started {timer.started_at}, ended {timer.ended_at}, total {elapsed:.1f}s',
-                  file=sys.stderr, flush=True)
+            print(
+                f'[{timer.ended_at}] release build {status}, '
+                f'started {timer.started_at}, ended {timer.ended_at}, total {elapsed:.1f}s',
+                file=sys.stderr,
+                flush=True,
+            )
     return 0
 
 

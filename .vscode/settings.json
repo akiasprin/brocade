@@ -1,0 +1,23 @@
+{
+  "editor.formatOnSave": true,
+  "files.eol": "\n",
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+  "[javascript][javascriptreact][typescript][typescriptreact][json][jsonc][yaml][markdown][html][css][scss][less][vue]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "ruff.path": ["${workspaceFolder}/.tools/format-tools/ruff/bin/ruff"],
+  "shellformat.path": "${workspaceFolder}/.tools/format-tools/bin/shfmt",
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+  "[go]": {
+    "editor.defaultFormatter": "golang.go"
+  },
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff"
+  },
+  "[shellscript]": {
+    "editor.defaultFormatter": "foxundermoon.shell-format"
+  }
+}

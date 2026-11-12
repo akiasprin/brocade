@@ -24,25 +24,42 @@ SPEC.loader.exec_module(BUILD)
 
 class ReleaseBuildTests(unittest.TestCase):
     def test_cube_runtime_dispatch_does_not_start_the_console_pipeline(self):
-        argv=['build-release.py','--cube-runtime-only','--cube-arch','x86_64',
-              '--cube-sysroot-libs','/target/sysroot','--cube-bpf-include','/target/include']
-        with patch.object(sys,'argv',argv), patch.object(BUILD,'build') as console, \
-                patch.object(BUILD,'stable_root'), patch.object(BUILD,'go_binary',return_value='/tools/go'), \
-                patch.object(BUILD.subprocess,'run',return_value=argparse.Namespace(returncode=0)) as runtime:
-            self.assertEqual(BUILD.main(),0)
+        argv = [
+            'build-release.py',
+            '--cube-runtime-only',
+            '--cube-arch',
+            'x86_64',
+            '--cube-sysroot-libs',
+            '/target/sysroot',
+            '--cube-bpf-include',
+            '/target/include',
+        ]
+        with (
+            patch.object(sys, 'argv', argv),
+            patch.object(BUILD, 'build') as console,
+            patch.object(BUILD, 'stable_root'),
+            patch.object(BUILD, 'check_format') as formatting,
+            patch.object(BUILD, 'go_binary', return_value='/tools/go'),
+            patch.object(BUILD.subprocess, 'run', return_value=argparse.Namespace(returncode=0)) as runtime,
+        ):
+            self.assertEqual(BUILD.main(), 0)
+            formatting.assert_called_once()
             console.assert_not_called()
-            command=runtime.call_args.args[0]
-            self.assertIn('--sysroot-libs',command)
-            self.assertIn('--arch',command)
-            self.assertIn('x86_64',command)
+            command = runtime.call_args.args[0]
+            self.assertIn('--sysroot-libs', command)
+            self.assertIn('--arch', command)
+            self.assertIn('x86_64', command)
             self.assertEqual(command[command.index('--glibc') + 1], '2.35')
 
     def test_cube_runtime_requires_architecture_and_matching_sysroot(self):
-        with patch.object(sys,'argv',['build-release.py','--cube-runtime-only']), \
-                contextlib.redirect_stderr(io.StringIO()), patch.object(BUILD,'build') as console:
+        with (
+            patch.object(sys, 'argv', ['build-release.py', '--cube-runtime-only']),
+            contextlib.redirect_stderr(io.StringIO()),
+            patch.object(BUILD, 'build') as console,
+        ):
             with self.assertRaises(SystemExit) as raised:
                 BUILD.main()
-            self.assertEqual(raised.exception.code,2)
+            self.assertEqual(raised.exception.code, 2)
             console.assert_not_called()
 
     def assert_utc_timestamp(self, value):
@@ -59,22 +76,32 @@ class ReleaseBuildTests(unittest.TestCase):
     def test_elapsed_time_beyond_the_former_budget_does_not_stop_a_build(self):
         with tempfile.TemporaryDirectory() as directory:
             timer = BUILD.BuildTimer(started=time.monotonic() - 1000)
-            result = BUILD.run([sys.executable, '-c', 'import time; time.sleep(0.15); print("complete")'],
-                               Path(directory), os.environ.copy(), timer)
+            result = BUILD.run(
+                [sys.executable, '-c', 'import time; time.sleep(0.15); print("complete")'],
+                Path(directory),
+                os.environ.copy(),
+                timer,
+            )
             self.assertEqual(result, 'complete')
 
     def test_quiet_process_reports_elapsed_time_even_after_closing_its_output(self):
         for close_output in ['', 'os.close(1); os.close(2);']:
-            with self.subTest(close_output=close_output), tempfile.TemporaryDirectory() as directory, \
-                    patch.object(BUILD, 'PROGRESS_INTERVAL_SECONDS', 0.02), \
-                    contextlib.redirect_stderr(io.StringIO()) as messages:
+            with (
+                self.subTest(close_output=close_output),
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(BUILD, 'PROGRESS_INTERVAL_SECONDS', 0.02),
+                contextlib.redirect_stderr(io.StringIO()) as messages,
+            ):
                 timer = BUILD.BuildTimer()
                 timer.stage = 'dual_architecture_build'
                 reports = []
                 timer.on_progress = lambda: reports.append(time.monotonic() - timer.started)
-                BUILD.run([sys.executable, '-c',
-                           f'import os, time; {close_output} time.sleep(0.15)'],
-                          Path(directory), os.environ.copy(), timer)
+                BUILD.run(
+                    [sys.executable, '-c', f'import os, time; {close_output} time.sleep(0.15)'],
+                    Path(directory),
+                    os.environ.copy(),
+                    timer,
+                )
                 self.assertTrue(reports)
                 self.assertIn('dual_architecture_build running, started ', messages.getvalue())
                 self.assertIn('stage ', messages.getvalue())
@@ -87,20 +114,23 @@ class ReleaseBuildTests(unittest.TestCase):
             marker = root / 'pids.json'
             timer = BUILD.BuildTimer()
             started = time.monotonic()
+
             def cancel_when_ready():
                 if marker.exists():
                     raise KeyboardInterrupt()
                 if time.monotonic() - started > 5:
                     self.fail('child did not start the cancellation fixture')
-            command = '''import json, os, subprocess, sys, time
+
+            command = """import json, os, subprocess, sys, time
 from pathlib import Path
 child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
 marker = Path(sys.argv[1] + '.tmp')
 marker.write_text(json.dumps([os.getpid(), child.pid]))
 marker.replace(sys.argv[1])
 time.sleep(30)
-'''
+"""
             pids = []
+
             def running(pid):
                 try:
                     # A reaped zombie can briefly become X (dead) before /proc disappears.
@@ -109,11 +139,11 @@ time.sleep(30)
                     return state not in ('Z', 'X', 'x')
                 except (FileNotFoundError, ProcessLookupError):
                     return False
+
             try:
                 with patch.object(timer, 'tick', side_effect=cancel_when_ready):
                     with self.assertRaises(KeyboardInterrupt):
-                        BUILD.run([sys.executable, '-c', command, str(marker)], root,
-                                  os.environ.copy(), timer)
+                        BUILD.run([sys.executable, '-c', command, str(marker)], root, os.environ.copy(), timer)
                 pids = json.loads(marker.read_text())
                 until = time.monotonic() + 1
                 while any(running(pid) for pid in pids) and time.monotonic() < until:
@@ -130,8 +160,12 @@ time.sleep(30)
     def test_build_output_is_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(BUILD.BuildError, 'output exceeds'):
-                BUILD.run([sys.executable, '-c', 'import sys; sys.stdout.write("x" * 20000000)'],
-                          Path(directory), os.environ.copy(), BUILD.BuildTimer())
+                BUILD.run(
+                    [sys.executable, '-c', 'import sys; sys.stdout.write("x" * 20000000)'],
+                    Path(directory),
+                    os.environ.copy(),
+                    BUILD.BuildTimer(),
+                )
 
     def test_failed_preflight_replaces_previous_success_without_admitting_old_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -140,9 +174,13 @@ time.sleep(30)
             state.mkdir(parents=True)
             result = state / 'preparation.json'
             result.write_text('{"build_complete":true}')
-            with patch.object(BUILD, 'stable_root'), patch.object(BUILD, 'run', return_value=str(root)), \
-                    patch.object(BUILD, 'go_binary', side_effect=BUILD.BuildError('toolchain unavailable')), \
-                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with (
+                patch.object(BUILD, 'stable_root'),
+                patch.object(BUILD, 'run', return_value=str(root)),
+                patch.object(BUILD, 'go_binary', side_effect=BUILD.BuildError('toolchain unavailable')),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
                 with self.assertRaisesRegex(BUILD.BuildError, 'toolchain unavailable'):
                     BUILD.build(argparse.Namespace(jobs=4, flavor='base'), root, BUILD.BuildTimer())
             record = json.loads(result.read_text())
@@ -159,19 +197,64 @@ time.sleep(30)
                 self.assert_utc_timestamp(event['started_at'])
                 self.assert_utc_timestamp(event['ended_at'])
 
+    def test_format_failures_stop_before_toolchain_probes_and_build_work(self):
+        for gate in ['rust', 'other languages']:
+            with self.subTest(gate=gate), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                commands = []
+
+                def command(args, *unused):
+                    commands.append(args)
+                    if args[0] == 'git':
+                        return str(root)
+                    if gate != 'rust' and args[0] == 'cargo':
+                        return ''
+                    raise BUILD.BuildError('formatting check failed')
+
+                with (
+                    patch.object(BUILD, 'stable_root'),
+                    patch.object(BUILD, 'run', command),
+                    patch.object(BUILD, 'go_binary') as go,
+                    patch.object(BUILD, 'frontend') as frontend,
+                    patch.object(BUILD, 'agents') as agents,
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    with self.assertRaisesRegex(BUILD.BuildError, 'formatting check failed'):
+                        BUILD.build(argparse.Namespace(jobs=4, flavor='base'), root, BUILD.BuildTimer())
+                self.assertEqual(
+                    commands[-1],
+                    ['cargo', 'fmt', '--all', '--', '--check']
+                    if gate == 'rust'
+                    else [sys.executable, 'scripts/format.py', '--check', '--base', 'HEAD^'],
+                )
+                go.assert_not_called()
+                frontend.assert_not_called()
+                agents.assert_not_called()
+                record = json.loads((root / 'target/brocade-release/base/preparation.json').read_text())
+                self.assertEqual(record['status'], 'failed')
+                self.assertFalse(record['build_complete'])
+                self.assertEqual(record['artifacts'], {})
+                self.assertEqual([stage['name'] for stage in record['stages']], ['preflight'])
+
     def test_cancellation_keeps_finish_times_and_monotonic_duration_when_wall_clock_moves_back(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             wall_start = '2026-10-29T01:00:00.000+00:00'
             wall_end = '2026-10-29T00:59:00.000+00:00'
-            with patch.object(BUILD, 'timestamp', return_value=wall_start) as wall, \
-                    patch.object(BUILD, 'stable_root'), patch.object(BUILD, 'run', return_value=str(root)), \
-                    contextlib.redirect_stdout(io.StringIO()), \
-                    contextlib.redirect_stderr(io.StringIO()) as messages:
+            with (
+                patch.object(BUILD, 'timestamp', return_value=wall_start) as wall,
+                patch.object(BUILD, 'stable_root'),
+                patch.object(BUILD, 'run', return_value=str(root)),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()) as messages,
+            ):
                 timer = BUILD.BuildTimer(started=time.monotonic() - 1000)
+
                 def cancel(*args):
                     wall.return_value = wall_end
                     raise KeyboardInterrupt()
+
                 with patch.object(BUILD, 'go_binary', side_effect=cancel):
                     with self.assertRaises(KeyboardInterrupt):
                         BUILD.build(argparse.Namespace(jobs=4, flavor='base'), root, timer)
@@ -205,10 +288,12 @@ time.sleep(30)
             self.assertEqual(json.loads(result.read_text()), {'owner': 'first'})
 
     def test_rejected_checkout_still_reports_the_attempt_start_and_finish(self):
-        with patch.object(sys, 'argv', [str(PATH)]), \
-                patch.object(BUILD.os, 'umask'), \
-                patch.object(BUILD, 'stable_root', side_effect=BUILD.BuildError('checkout rejected')), \
-                contextlib.redirect_stderr(io.StringIO()) as messages:
+        with (
+            patch.object(sys, 'argv', [str(PATH)]),
+            patch.object(BUILD.os, 'umask'),
+            patch.object(BUILD, 'stable_root', side_effect=BUILD.BuildError('checkout rejected')),
+            contextlib.redirect_stderr(io.StringIO()) as messages,
+        ):
             self.assertEqual(BUILD.main(), 1)
         lines = messages.getvalue().splitlines()
         self.assertIn('release build started', lines[0])
@@ -227,11 +312,14 @@ time.sleep(30)
             for triple in triples + ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl']:
                 (sysroot / 'lib/rustlib' / triple / 'lib').mkdir(parents=True)
             reports = []
+
             def command(args, cwd, env, timer, log=None):
                 if args[0] == 'git':
                     return str(root)
                 if args[0] == 'rustc':
                     return str(sysroot)
+                if args[:2] == ['cargo', 'fmt']:
+                    return ''
                 if args[0] == 'cargo':
                     timer.next_report = 0
                     timer.tick()
@@ -243,17 +331,23 @@ time.sleep(30)
                             path.write_bytes(f'{triple}/{name}'.encode())
                     return ''
                 return '0.16.0'
-            with patch.dict(os.environ, {}, clear=True), patch.object(BUILD, 'stable_root'), \
-                    patch.object(BUILD, 'run', command), patch.object(BUILD, 'go_binary', return_value='/tool/go'), \
-                    patch.object(BUILD.shutil, 'which', side_effect=lambda tool: f'/tool/{tool}'), \
-                    patch.object(BUILD.os, 'uname', return_value=argparse.Namespace(machine='x86_64')), \
-                    patch.object(BUILD, 'inputs', return_value='unchanged-source'), \
-                    patch.object(BUILD, 'frontend', return_value=root / 'dist'), \
-                    patch.object(BUILD, 'agents', return_value=['cargo', 'build']), \
-                    contextlib.redirect_stdout(io.StringIO()), \
-                    contextlib.redirect_stderr(io.StringIO()) as messages:
-                BUILD.build(argparse.Namespace(jobs=4, flavor='base'), root,
-                            BUILD.BuildTimer(started=time.monotonic() - 1000))
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch.object(BUILD, 'stable_root'),
+                patch.object(BUILD, 'run', command),
+                patch.object(BUILD, 'go_binary', return_value='/tool/go'),
+                patch.object(BUILD.shutil, 'which', side_effect=lambda tool: f'/tool/{tool}'),
+                patch.object(BUILD.os, 'uname', return_value=argparse.Namespace(machine='x86_64')),
+                patch.object(BUILD, 'inputs', return_value='unchanged-source'),
+                patch.object(BUILD, 'frontend', return_value=root / 'dist'),
+                patch.object(BUILD, 'agents', return_value=['cargo', 'build']),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()) as messages,
+            ):
+                BUILD.build(
+                    argparse.Namespace(jobs=4, flavor='base'), root, BUILD.BuildTimer(started=time.monotonic() - 1000)
+                )
             self.assertEqual(reports[0]['status'], 'running')
             self.assertEqual(reports[0]['active_stage']['name'], 'dual_architecture_build')
             self.assertGreaterEqual(reports[0]['elapsed_seconds'], 1000)
@@ -266,16 +360,16 @@ time.sleep(30)
             self.assertTrue(record['build_complete'])
             self.assertFalse(record['deployment_ready'])
             self.assertEqual(len(record['artifacts']), 4)
-            self.assertEqual([stage['name'] for stage in record['stages']],
-                             ['preflight', 'frontend', 'dual_architecture_agent',
-                              'dual_architecture_build', 'verification'])
+            self.assertEqual(
+                [stage['name'] for stage in record['stages']],
+                ['preflight', 'frontend', 'dual_architecture_agent', 'dual_architecture_build', 'verification'],
+            )
             self.assertTrue(all(stage['status'] == 'complete' for stage in record['stages']))
             self.assertNotIn('active_stage', record)
             for event in [record, *record['stages']]:
                 self.assert_utc_timestamp(event['started_at'])
                 self.assert_utc_timestamp(event['ended_at'])
-                self.assertIn(f'started {event["started_at"]}, ended {event["ended_at"]}',
-                              messages.getvalue())
+                self.assertIn(f'started {event["started_at"]}, ended {event["ended_at"]}', messages.getvalue())
 
     def test_verified_frontend_cache_is_reused_but_tampering_forces_a_rebuild(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -284,6 +378,7 @@ time.sleep(30)
             state = root / 'state'
             state.mkdir()
             calls = []
+
             def command(args, cwd, env, timer, log=None):
                 calls.append(args)
                 if args[:3] == ['npm', 'run', 'build']:
@@ -291,6 +386,7 @@ time.sleep(30)
                     dist.mkdir(exist_ok=True)
                     (dist / 'index.html').write_text('verified')
                 return 'version'
+
             with patch.object(BUILD, 'inputs', return_value='source'), patch.object(BUILD, 'run', command):
                 BUILD.frontend(root, state, {}, BUILD.BuildTimer())
                 self.assertEqual(sum(c[:2] == ['npm', 'ci'] for c in calls), 1)
@@ -306,6 +402,7 @@ time.sleep(30)
             state = root / 'target/brocade-release/base'
             state.mkdir(parents=True)
             commands = []
+
             def command(args, cwd, env, timer, log=None):
                 commands.append((args, env.copy()))
                 target = root / 'target/brocade-agent-build/base'
@@ -314,6 +411,7 @@ time.sleep(30)
                     binary.parent.mkdir(parents=True, exist_ok=True)
                     binary.write_bytes(b'agent')
                 return ''
+
             env = {}
             with patch.object(BUILD, 'run', command):
                 BUILD.agents(root, state, env, BUILD.BuildTimer(), 4, '/tool/zig')
@@ -327,8 +425,12 @@ time.sleep(30)
                 flags = child_env[f'CARGO_TARGET_{triple.upper().replace("-", "_")}_RUSTFLAGS']
                 self.assertIn(f'--remap-path-prefix={root}=.', flags)
             self.assertIn('-C linker=rust-lld', child_env['CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS'])
-            self.assertTrue(env['BROCADE_AGENT_BIN_X86_64'].endswith('/x86_64-unknown-linux-musl/release/brocade-agent'))
-            self.assertTrue(env['BROCADE_AGENT_BIN_AARCH64'].endswith('/aarch64-unknown-linux-musl/release/brocade-agent'))
+            self.assertTrue(
+                env['BROCADE_AGENT_BIN_X86_64'].endswith('/x86_64-unknown-linux-musl/release/brocade-agent')
+            )
+            self.assertTrue(
+                env['BROCADE_AGENT_BIN_AARCH64'].endswith('/aarch64-unknown-linux-musl/release/brocade-agent')
+            )
 
 
 if __name__ == '__main__':

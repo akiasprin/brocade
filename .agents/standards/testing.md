@@ -4,6 +4,7 @@
 
 ## 选择原则
 
+- 开始任何 CI、构建或较长验证之前，先执行[强制格式化门槛](formatting.md)；本地先自动格式化并检查，CI 的独立 `format` 作业通过后才启动其余作业。
 - 文档或配置：语法检查、链接/路径检查、`git diff --check`。
 - 单一 Rust crate：定向测试，再运行该 crate 的 Clippy。
 - 协议、公共类型或跨 crate 行为：相关 crate 测试加 workspace 检查。

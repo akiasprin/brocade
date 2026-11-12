@@ -33,14 +33,12 @@ for (const engine of ['chromium', 'webkit'] as const) {
             await expect(avatar).toHaveClass(/is-self/);
             await expect(avatar).toHaveCSS('width', '34px');
             await expect(me.locator('.user-row-name b')).toHaveCSS('font-size', '13.5px');
-            const rowHeights = await roster
-              .getByRole('option')
-              .evaluateAll(rows =>
-                rows.map(row => ({
-                  name: row.querySelector('.user-row-name b')?.textContent,
-                  height: row.getBoundingClientRect().height,
-                })),
-              );
+            const rowHeights = await roster.getByRole('option').evaluateAll(rows =>
+              rows.map(row => ({
+                name: row.querySelector('.user-row-name b')?.textContent,
+                height: row.getBoundingClientRect().height,
+              })),
+            );
             expect(rowHeights.find(row => row.name === 'grace')?.height, JSON.stringify(rowHeights)).toBe(
               rowHeights.find(row => row.name === 'alice')?.height,
             );
