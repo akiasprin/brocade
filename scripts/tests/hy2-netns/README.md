@@ -1,5 +1,36 @@
 # HY2 单 IP、端口段与独立 conntrack 验证
 
+## 时间戳过滤器的内核回归
+
+在具备 BPF、网络管理和网络空间权限且安装 iproute2 的隔离 Linux 环境执行实际 Agent 测试程序：
+
+```sh
+/绝对路径/brocade_agent-test hy2_network::timestamp::tests:: --ignored --nocapture --test-threads=1 \
+  --skip kernel_legacy_filter_survives_agent_upgrade_without_replacement
+```
+
+三项测试分别实际加载并执行生产程序，验证清除零值及非零时间戳后报文、mark、priority 和
+`TC_ACT_OK` 保持正确；在测试自建的网络空间安装过滤器，核验幂等安装、其他 chain 共存，
+以及入口或 qdisc 丢失后的补齐；补齐入口时其他 chain 的规则保持不变。
+同名但未知指纹的程序必须被拒绝，且原过滤器 ID 和规则保持不变。
+内核兼容验收包含 Debian 12 的 Linux 6.1，不能只在新内核运行：旧校验器拒绝向上下文执行
+`BPF_ST` 立即数存储，必须使用寄存器存储。测试无需 Xray，但不能替代下方完整业务验收。
+
+在支持旧 `BPF_ST` 上下文存储的内核另执行真实旧规则升级回归：
+
+```sh
+/绝对路径/brocade_agent-test --exact \
+  hy2_network::timestamp::tests::kernel_legacy_filter_survives_agent_upgrade_without_replacement \
+  --ignored --nocapture --test-threads=1
+```
+
+该用例实际执行旧程序，验证相同的时间戳清除与报文保留行为，再用旧版的确切指令安装过滤器，
+经新版巡检反复收敛后要求原程序 ID 和规则保持不变。
+参考指纹由当前内核加载新旧程序取得，不能用固定 tag 替代该内核回归。
+
+普通单元回归另外覆盖新旧指纹复用、名称与 handle 标签差异、默认 chain 与数字形式、
+无关 chain 的不同输出顺序、协议覆盖不足、软件执行状态、缺少指纹和参考程序不可用。
+
 ## 正式 Agent/Xray 路径
 
 使用 `--agent-tests` 时运行仓库实际 Agent 的启动、重启、恢复和收敛入口，Xray 使用正式 CLI，

@@ -196,7 +196,7 @@ def inside(output):
                     with connection:
                         connection.settimeout(2)
                         connection.sendall(connection.recv(32))
-                except TimeoutError:
+                except socket.timeout:
                     pass
 
         worker = threading.Thread(target=control_server)
