@@ -34,6 +34,7 @@ use crate::{
     ApplyMode, Options, WorkloadRuntime, ARCH_HEADER,
 };
 
+mod control;
 mod crash_recovery;
 mod startup;
 
@@ -66,6 +67,7 @@ const XRAY_HANDOFF_CAPABILITY: &str = "tcp-handoff-udp-reset-v1";
 const XRAY_HANDOFF_MANIFEST_ENV: &[u8] = b"XRAY_TCP_HANDOFF_MANIFEST=";
 const MAX_UPGRADE_RUNTIME_BYTES: u64 = 64 * 1024;
 const MAX_HANDOFF_MESSAGE_BYTES: usize = 256 * 1024;
+const MAX_HANDOFF_LISTENERS: usize = 512;
 const HANDOFF_DIR: &str = "xray-handoff";
 
 #[derive(Debug, Clone)]
@@ -182,6 +184,12 @@ pub(crate) fn observe_handoff_capability(
     }
     match observe_serving_handoff(state_dir) {
         Ok(status) if status.retirement_supported && status.ready && status.accepting => {
+            if let Err(reason) = control::preflight(&status) {
+                return XrayHandoffCapability {
+                    state: XrayHandoffState::Unsupported,
+                    reason: Some(reason),
+                };
+            }
             XrayHandoffCapability {
                 state: XrayHandoffState::Ready,
                 reason: None,
@@ -226,6 +234,7 @@ pub(crate) fn config_handoff_unavailable_reason(state_dir: &Path, desired: &str)
                 return Err(format!("运行中的 Xray 缺少 {capability} 能力"));
             }
         }
+        control::preflight(&status)?;
         let config: serde_json::Value =
             serde_json::from_str(desired).map_err(|error| error.to_string())?;
         if ["/api/listen", "/metrics/listen"].iter().any(|pointer| {
@@ -294,6 +303,8 @@ impl BootstrapHandoff {
 #[derive(Debug, Clone, Deserialize)]
 struct HandoffRuntimeStatus {
     scope: String,
+    #[serde(default)]
+    fd_export_batches: bool,
     retirement_supported: bool,
     generation_id: String,
     pid: i32,
@@ -342,13 +353,6 @@ struct HandoffListenerStatus {
     _in_accept: bool,
     #[serde(default)]
     closed: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct HandoffRuntimeResponse {
-    #[serde(default)]
-    error: String,
-    status: Option<HandoffRuntimeStatus>,
 }
 
 pub(crate) fn prepare_bootstrap_handoff(
@@ -830,8 +834,10 @@ fn handoff_export_rpc(
     expected_pid: i32,
     epoch: u64,
     intent: &str,
+    batched: bool,
 ) -> Result<(HandoffRuntimeStatus, Vec<OwnedFd>), String> {
-    handoff_rpc_inner(manifest, Some(expected_pid), "export", epoch, intent, true)
+    let operation = if batched { "export_batched" } else { "export" };
+    handoff_rpc_inner(manifest, Some(expected_pid), operation, epoch, intent, true)
 }
 
 fn drop_generation_udp(
@@ -968,159 +974,7 @@ fn handoff_rpc_inner(
             io::Error::last_os_error()
         ));
     }
-    let mut response = vec![0u8; MAX_HANDOFF_MESSAGE_BYTES + 1];
-    let mut iovec = libc::iovec {
-        iov_base: response.as_mut_ptr().cast(),
-        iov_len: response.len(),
-    };
-    let rights_bytes = std::mem::size_of::<i32>() * 512;
-    let mut control = if receive_fds {
-        vec![0_u8; unsafe { libc::CMSG_SPACE(rights_bytes as u32) } as usize]
-    } else {
-        Vec::new()
-    };
-    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_iov = &mut iovec;
-    message.msg_iovlen = 1;
-    if receive_fds {
-        message.msg_control = control.as_mut_ptr().cast();
-        // libc models this field as usize on glibc and socklen_t/u32 on musl. The checked
-        // conversion is intentionally retained even though it is an identity conversion on
-        // the development host.
-        #[allow(clippy::useless_conversion)]
-        let control_bytes = control
-            .len()
-            .try_into()
-            .map_err(|_| "代际控制辅助数据缓冲区长度超出平台上限".to_owned())?;
-        message.msg_controllen = control_bytes;
-    }
-    let receive_deadline = Instant::now() + Duration::from_secs(2);
-    let control_capacity = message.msg_controllen;
-    let received = loop {
-        // SAFETY: fd is owned and message references the live response/iovec and
-        // optional ancillary buffers; recvmsg cannot outlive this call.
-        let received = unsafe {
-            libc::recvmsg(
-                fd.as_raw_fd(),
-                &mut message,
-                if receive_fds {
-                    libc::MSG_CMSG_CLOEXEC
-                } else {
-                    0
-                },
-            )
-        };
-        if received >= 0 {
-            break Ok(received);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            break Err(error);
-        }
-        // A signal did not consume the seqpacket. Resume this same receive,
-        // preserving ancillary capacity and the original response deadline;
-        // never resend the already delivered control operation.
-        let remaining = receive_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "control response deadline elapsed",
-            ));
-        }
-        let timeout = libc::timeval {
-            tv_sec: remaining.as_secs() as _,
-            tv_usec: remaining.subsec_micros().max(1) as _,
-        };
-        // SAFETY: the owned socket and initialized timeval remain valid for
-        // setsockopt, and the supplied length exactly matches the value.
-        if unsafe {
-            libc::setsockopt(
-                fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                &timeout as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&timeout) as libc::socklen_t,
-            )
-        } != 0
-        {
-            break Err(io::Error::last_os_error());
-        }
-        message.msg_controllen = control_capacity;
-        message.msg_flags = 0;
-    }
-    .map_err(|error| {
-        format!(
-            "代际控制 {operation} 等待响应失败（PID {}，超时上限 2 秒）：{}",
-            peer.pid, error
-        )
-    })?;
-    if received == 0 {
-        return Err(format!(
-            "代际控制 {operation} 响应提前关闭（PID {}）",
-            peer.pid
-        ));
-    }
-    if received as usize > MAX_HANDOFF_MESSAGE_BYTES {
-        return Err(format!(
-            "代际控制 {operation} 响应超出大小上限（PID {}）",
-            peer.pid
-        ));
-    }
-    if message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
-        return Err("代际控制响应或监听 FD 被截断".to_owned());
-    }
-    let mut received_fds = Vec::new();
-    if receive_fds {
-        let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
-        while !header.is_null() {
-            let header_ref = unsafe { &*header };
-            if header_ref.cmsg_level != libc::SOL_SOCKET || header_ref.cmsg_type != libc::SCM_RIGHTS
-            {
-                return Err("代际控制端返回了非 SCM_RIGHTS 辅助数据".to_owned());
-            }
-            // glibc exposes cmsg_len as usize, while musl exposes it as socklen_t/u32. Convert
-            // once at the trust boundary so the length checks are identical on both release
-            // targets and no narrowing arithmetic happens below.
-            #[allow(clippy::useless_conversion)]
-            let message_bytes = usize::try_from(header_ref.cmsg_len)
-                .map_err(|_| "代际控制端返回的 SCM_RIGHTS 长度超出平台上限".to_owned())?;
-            let header_bytes = unsafe { libc::CMSG_LEN(0) } as usize;
-            if message_bytes < header_bytes
-                || !(message_bytes - header_bytes).is_multiple_of(std::mem::size_of::<i32>())
-            {
-                return Err("代际控制端返回的 SCM_RIGHTS 长度无效".to_owned());
-            }
-            let count = (message_bytes - header_bytes) / std::mem::size_of::<i32>();
-            let values =
-                unsafe { std::slice::from_raw_parts(libc::CMSG_DATA(header).cast::<i32>(), count) };
-            for raw in values {
-                if *raw < 3 || received_fds.len() >= 512 {
-                    return Err("代际控制端返回的监听 FD 无效或过多".to_owned());
-                }
-                received_fds.push(unsafe { OwnedFd::from_raw_fd(*raw) });
-            }
-            header = unsafe { libc::CMSG_NXTHDR(&message, header) };
-        }
-    }
-    response.truncate(received as usize);
-    let response: HandoffRuntimeResponse =
-        serde_json::from_slice(&response).map_err(|error| format!("解析代际状态失败：{error}"))?;
-    if !response.error.is_empty() {
-        return Err(format!("代际控制端拒绝状态请求：{}", response.error));
-    }
-    let status = response
-        .status
-        .ok_or_else(|| "代际状态响应为空".to_owned())?;
-    if status.pid != peer.pid {
-        return Err("代际状态响应 PID 与控制端 peer 不一致".to_owned());
-    }
-    if receive_fds && received_fds.is_empty() {
-        return Err("代际 export 没有返回监听 FD".to_owned());
-    }
-    if !receive_fds && !received_fds.is_empty() {
-        return Err("非 export 代际响应携带了监听 FD".to_owned());
-    }
-    Ok((status, received_fds))
+    control::receive(&fd, peer.pid, operation, receive_fds)
 }
 
 pub(crate) fn activate_bootstrap_handoff(
@@ -1216,14 +1070,12 @@ struct CandidateHandoff {
 
 const HANDOFF_CHILD_FD_MIN: i32 = 64;
 
-fn relocate_handoff_descriptors(exported: &[OwnedFd]) -> Result<Vec<OwnedFd>, String> {
+fn relocate_handoff_descriptors(exported: Vec<OwnedFd>) -> Result<Vec<OwnedFd>, String> {
     let mut relocated = Vec::with_capacity(exported.len());
     for descriptor in exported {
-        // The candidate is launched through a small shell pipeline so its stderr can use the
-        // bounded log sink. Shells are allowed to allocate low-numbered descriptors while
-        // constructing that pipeline; an SCM_RIGHTS result at fd 9/10 can otherwise be silently
-        // replaced before exec. Duplicating the same open file description into a reserved high
-        // range preserves the listener inode/cookie while keeping it away from shell plumbing.
+        // Keep listener descriptors out of low-numbered child/log plumbing without
+        // changing their open file descriptions. Consume each source immediately:
+        // retaining two complete copies can exceed RLIMIT_NOFILE=1024 for a full group.
         let raw = unsafe {
             libc::fcntl(
                 descriptor.as_raw_fd(),
@@ -3392,6 +3244,7 @@ pub(crate) fn begin_config_handoff(
                 Err(handoff_blocked_reason(&generation.2))
             }
         })?;
+    control::preflight(&old_status)?;
     let old_executable = PathBuf::from(format!("/proc/{}/exe", old_process.pid));
     let old_executable_arg = old_executable.to_string_lossy().into_owned();
     let version =
@@ -3508,6 +3361,7 @@ pub(crate) fn begin_config_handoff(
         old_process.pid,
         export_epoch,
         &format!("config-{deployment_id}-{claim_generation}-export"),
+        paused.fd_export_batches,
     ) {
         Ok(exported) => exported,
         Err(error) => {
@@ -3522,7 +3376,7 @@ pub(crate) fn begin_config_handoff(
             );
         }
     };
-    let exported = match relocate_handoff_descriptors(&exported) {
+    let exported = match relocate_handoff_descriptors(exported) {
         Ok(exported) => exported,
         Err(error) => {
             return rollback_config_handoff_before_switch(
@@ -3986,6 +3840,11 @@ fn perform_handoff_update_at_target(
                 ));
             }
         };
+    if let Err(reason) = control::preflight(&old_status) {
+        return Some(restart_handoff_fallback(
+            options, meter, offer, candidate, target, &reason,
+        ));
+    }
     let old_sha = match file_sha256_hex(&PathBuf::from(format!("/proc/{}/exe", old_process.pid))) {
         Ok(sha) if sha == offer.previous_sha256 => sha,
         Ok(sha) => {
@@ -4136,6 +3995,7 @@ fn perform_handoff_update_at_target(
         old_process.pid,
         export_epoch,
         &format!("release-{}-export", offer.release_id),
+        paused.fd_export_batches,
     ) {
         Ok(exported) => exported,
         Err(error) => {
@@ -4152,7 +4012,7 @@ fn perform_handoff_update_at_target(
             ));
         }
     };
-    let exported = match relocate_handoff_descriptors(&exported) {
+    let exported = match relocate_handoff_descriptors(exported) {
         Ok(relocated) => relocated,
         Err(error) => {
             return Some(rollback_handoff_before_switch(
@@ -5594,7 +5454,7 @@ mod tests {
         let exported = unsafe { OwnedFd::from_raw_fd(pair[0]) };
         let peer = unsafe { OwnedFd::from_raw_fd(pair[1]) };
 
-        let relocated = relocate_handoff_descriptors(&[exported]).unwrap();
+        let relocated = relocate_handoff_descriptors(vec![exported]).unwrap();
         assert_eq!(relocated.len(), 1);
         assert!(relocated[0].as_raw_fd() >= HANDOFF_CHILD_FD_MIN);
         let payload = b"listener-open-file-description";
@@ -6166,6 +6026,7 @@ mod tests {
         fs::write(&candidate, b"candidate-bytes").unwrap();
         let descriptor: OwnedFd = File::open("/dev/null").unwrap().into();
         let old = HandoffRuntimeStatus {
+            fd_export_batches: false,
             scope: "whole-generation".to_owned(),
             retirement_supported: true,
             generation_id: "source-generation-0001".to_owned(),
@@ -6310,6 +6171,7 @@ mod tests {
         };
         let status =
             |generation_id: &str, pid: i32, accepting: bool, closed: bool| HandoffRuntimeStatus {
+                fd_export_batches: false,
                 scope: "whole-generation".to_owned(),
                 retirement_supported: true,
                 generation_id: generation_id.to_owned(),
@@ -7166,7 +7028,20 @@ mod tests {
         assert!(crate::wait_for_process_exit(&[process], Duration::from_secs(3)).is_empty());
     }
 
+    #[test]
+    #[ignore = "requires BROCADE_TEST_XRAY and isolated local TCP/UDP/Unix sockets; run serially"]
+    fn native_agent_handoff_exports_full_listener_group() {
+        native_agent_handoff_case_with_large_group(NativeInterruption::None, true);
+    }
+
     fn native_agent_handoff_case(interruption: NativeInterruption) {
+        native_agent_handoff_case_with_large_group(interruption, false);
+    }
+
+    fn native_agent_handoff_case_with_large_group(
+        interruption: NativeInterruption,
+        large_group: bool,
+    ) {
         use std::{
             io::{Read, Write},
             net::{Shutdown, TcpListener, TcpStream, UdpSocket},
@@ -7222,16 +7097,51 @@ mod tests {
         let _ = fs::remove_dir_all(&binaries);
         crate::create_private_dir(&root).unwrap();
         crate::create_private_dir(&binaries).unwrap();
+        crate::source_access::initialize(&root).unwrap();
         let target = binaries.join("xray");
         copy_atomic(&source, &target, 0o755).unwrap();
         let candidate = binaries.join("candidate-xray");
-        copy_atomic(&source, &candidate, 0o755).unwrap();
+        let candidate_source = std::env::var_os("BROCADE_TEST_HANDOFF_CANDIDATE_XRAY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| source.clone());
+        copy_atomic(&candidate_source, &candidate, 0o755).unwrap();
+        let reservations = std::cell::RefCell::new(Vec::new());
+        let next_port = std::cell::Cell::new(1024_u32);
+        let ephemeral = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+            .unwrap()
+            .split_whitespace()
+            .map(|value| value.parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
         let port = || {
-            TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port()
+            if !large_group {
+                return TcpListener::bind("127.0.0.1:0")
+                    .unwrap()
+                    .local_addr()
+                    .unwrap()
+                    .port();
+            }
+            // A large released ephemeral-port set can be reused by the Agent's
+            // own API dial before Xray finishes binding. Keep fixture listeners
+            // outside the actual ephemeral range, without changing host sysctls.
+            loop {
+                let port = next_port.get();
+                assert!(
+                    port <= u32::from(u16::MAX),
+                    "isolated fixture has insufficient non-ephemeral TCP ports"
+                );
+                next_port.set(port + 1);
+                if (ephemeral[0]..=ephemeral[1]).contains(&port) {
+                    continue;
+                }
+                match TcpListener::bind(("127.0.0.1", port as u16)) {
+                    Ok(listener) => {
+                        reservations.borrow_mut().push(listener);
+                        return port as u16;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AddrInUse => continue,
+                    Err(error) => panic!("reserve fixture listener: {error}"),
+                }
+            }
         };
         let api_address = std::net::SocketAddr::from(([127, 0, 0, 1], port()));
         let public_port = port();
@@ -7240,7 +7150,7 @@ mod tests {
         drop(public_udp);
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let upstream_port = upstream.local_addr().unwrap().port();
-        let upstream_connections = if interruption == NativeInterruption::None {
+        let upstream_connections = if interruption == NativeInterruption::None && !large_group {
             5
         } else if matches!(
             interruption,
@@ -7301,9 +7211,7 @@ mod tests {
         } else {
             "public"
         };
-        crate::fsutil::atomic_write_private(
-            &config,
-            &serde_json::to_vec(&serde_json::json!({
+        let mut content = serde_json::json!({
                 "log": {"loglevel": "warning"}, "stats": {},
                 "api": {"tag": "api", "services": ["HandlerService", "StatsService"]},
                 "policy": {"system": {"statsInboundUplink": true, "statsInboundDownlink": true}},
@@ -7314,18 +7222,43 @@ mod tests {
                 ],
                 "outbounds": [{"tag": "direct", "protocol": "freedom"}],
                 "routing": {"rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        });
+        if large_group {
+            for index in 0..MAX_HANDOFF_LISTENERS - 3 {
+                content["inbounds"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({
+                        "tag":format!("extra-{index}"), "listen":"127.0.0.1", "port":port(),
+                        "protocol":"dokodemo-door",
+                        "settings":{"address":"127.0.0.1", "port":upstream_port, "network":"tcp"}
+                    }));
+            }
+        }
+        crate::fsutil::atomic_write_private(&config, &serde_json::to_vec(&content).unwrap())
+            .unwrap();
         crate::fsutil::atomic_write_private(&root.join("usage-generation"), b"1").unwrap();
         let _guard = RuntimeGuard {
             config: config.clone(),
         };
         std::env::set_var("BROCADE_XRAY_BIN", &target);
         std::env::set_var("BROCADE_TEST_LOG_SINK", "cat >/dev/null");
+        reservations.borrow_mut().clear();
         crate::apply_xray(&config, api_address).unwrap();
         let old = crate::serving_xray_process_in(&root).unwrap();
+        if large_group {
+            let (_, _, status) = observe_serving_handoff_generation(&root).unwrap();
+            assert!(status.fd_export_batches);
+            assert_eq!(status.listeners.len(), MAX_HANDOFF_LISTENERS);
+            assert_eq!(
+                status
+                    .listeners
+                    .iter()
+                    .filter(|l| l.network == "tcp")
+                    .count(),
+                MAX_HANDOFF_LISTENERS - 1
+            );
+        }
 
         let mut old_client = TcpStream::connect(("127.0.0.1", public_port)).unwrap();
         old_client
@@ -7337,12 +7270,19 @@ mod tests {
         assert_eq!(&echoed, b"before");
 
         let sha = file_sha256_hex(&target).unwrap();
+        let candidate_version = crate::run_command(candidate.to_str().unwrap(), &["version"])
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .expect("Xray version banner has a version field")
+            .trim_start_matches('v')
+            .to_owned();
         let offer = XrayReleaseOffer {
             release_id: 91,
             attempt: 1,
-            version: "26.4.25".to_owned(),
+            version: candidate_version,
             url: "https://console.invalid/xray".to_owned(),
-            sha256: sha.clone(),
+            sha256: file_sha256_hex(&candidate).unwrap(),
             previous_sha256: sha,
             strategy: XrayReleaseStrategy::Handoff,
             // Directly exercising the executor bypasses offer validation so this case can prove
@@ -7759,7 +7699,7 @@ mod tests {
         } else {
             assert!(!root.join(REPORT_FILE).exists());
         }
-        if interruption == NativeInterruption::None {
+        if interruption == NativeInterruption::None && !large_group {
             let release_report_before_config = fs::read(root.join(REPORT_FILE)).ok();
             let mut old_config_client = TcpStream::connect(("127.0.0.1", public_port)).unwrap();
             old_config_client

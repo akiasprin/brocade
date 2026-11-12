@@ -19,13 +19,17 @@ import (
 	"sync"
 	"time"
 
+	xerrors "github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/transport/internet"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	handoffMaxMessage = 256 * 1024
-	handoffTimeout    = 3 * time.Second
+	handoffMaxMessage   = 256 * 1024
+	handoffTimeout      = 3 * time.Second
+	handoffMaxListeners = 512
+	// Linux SCM_MAX_FD limits one SCM_RIGHTS message, independently of RLIMIT_NOFILE.
+	handoffMaxFDsPerMessage = 253
 )
 
 type handoffEndpoint struct {
@@ -73,6 +77,7 @@ type handoffListenerStatus struct {
 type handoffStatus struct {
 	Scope               string                  `json:"scope"`
 	RetirementSupported bool                    `json:"retirement_supported"`
+	FDExportBatches     bool                    `json:"fd_export_batches"`
 	GenerationID        string                  `json:"generation_id"`
 	PID                 int                     `json:"pid"`
 	BootID              string                  `json:"boot_id"`
@@ -105,8 +110,14 @@ type handoffRequest struct {
 }
 
 type handoffResponse struct {
-	Error  string         `json:"error,omitempty"`
-	Status *handoffStatus `json:"status,omitempty"`
+	Error    string           `json:"error,omitempty"`
+	Status   *handoffStatus   `json:"status,omitempty"`
+	FDExport *handoffFDExport `json:"fd_export,omitempty"`
+}
+
+type handoffFDExport struct {
+	Offset int `json:"offset"`
+	Total  int `json:"total"`
 }
 
 type tcpHandoffBinding struct {
@@ -314,7 +325,7 @@ func readHandoffManifest(path string) (handoffManifest, error) {
 }
 
 func validateHandoffManifest(manifest handoffManifest) error {
-	if (manifest.Version != 1 && manifest.Version != 2) || !validHandoffToken(manifest.GenerationID) || len(manifest.Listeners) < 1 || len(manifest.Listeners) > 512 {
+	if (manifest.Version != 1 && manifest.Version != 2) || !validHandoffToken(manifest.GenerationID) || len(manifest.Listeners) < 1 || len(manifest.Listeners) > handoffMaxListeners {
 		return fmt.Errorf("invalid TCP handoff manifest version, generation or listener count")
 	}
 	if manifest.Version == 1 && manifest.Scope != "" {
@@ -505,7 +516,7 @@ func (c *tcpHandoff) open(address string, unsupported bool, config *internet.Soc
 	endpoint, found := c.expected[key]
 	runtimeAddition := !found && !unsupported && c.runtimeMutationAllowedLocked()
 	if runtimeAddition {
-		if len(c.expected) >= 512 {
+		if len(c.expected) >= handoffMaxListeners {
 			return nil, nil, fmt.Errorf("runtime handoff listener limit reached")
 		}
 		endpoint = handoffEndpoint{Address: address, BindAddress: address, Network: "tcp", Role: "public"}
@@ -604,7 +615,7 @@ func (c *tcpHandoff) openPacket(logicalAddress string, config *internet.SocketCo
 	endpoint, found := c.expected[key]
 	runtimeAddition := !found && c.runtimeMutationAllowedLocked()
 	if runtimeAddition {
-		if len(c.expected) >= 512 {
+		if len(c.expected) >= handoffMaxListeners {
 			return nil, nil, fmt.Errorf("runtime handoff listener limit reached")
 		}
 		endpoint = handoffEndpoint{Address: logicalAddress, BindAddress: logicalAddress, Network: "udp", Role: "public", Protocol: unix.IPPROTO_UDP}
@@ -747,7 +758,7 @@ func (c *tcpHandoff) status() handoffStatus {
 	if c.manifest.Version >= 2 {
 		scope = c.manifest.Scope
 	}
-	s := handoffStatus{Scope: scope, RetirementSupported: retirementSupported, GenerationID: c.manifest.GenerationID, PID: os.Getpid(), BootID: c.bootID, PIDStartTicks: c.pidStartTicks, Ready: c.ready && !c.closed, PauseRequested: pauseRequested, Paused: pauseRequested, Accepting: !pauseRequested, Epoch: c.epoch, Intent: c.intent, Operation: c.operation, DrainRequested: c.drainRequested, UDPDropped: c.udpDropped, Listeners: make([]handoffListenerStatus, 0, len(c.bindings)+len(c.packets))}
+	s := handoffStatus{Scope: scope, RetirementSupported: retirementSupported, FDExportBatches: true, GenerationID: c.manifest.GenerationID, PID: os.Getpid(), BootID: c.bootID, PIDStartTicks: c.pidStartTicks, Ready: c.ready && !c.closed, PauseRequested: pauseRequested, Paused: pauseRequested, Accepting: !pauseRequested, Epoch: c.epoch, Intent: c.intent, Operation: c.operation, DrainRequested: c.drainRequested, UDPDropped: c.udpDropped, Listeners: make([]handoffListenerStatus, 0, len(c.bindings)+len(c.packets))}
 	for _, b := range c.bindings {
 		// A requested pause is not a completed barrier while Accept can still
 		// return a connection. Report that possibility even after a timeout.
@@ -1276,15 +1287,20 @@ func (c *tcpHandoff) serveConnection(conn *net.UnixConn) {
 	if err != nil {
 		response = handoffResponse{Error: err.Error()}
 	}
-	body, err := json.Marshal(response)
-	if err != nil {
-		return
+	var writeErr error
+	if request.Operation == "export_batched" && response.Error == "" {
+		writeErr = c.writeHandoffExport(conn, response)
+	} else {
+		writeErr = writeHandoffPacket(conn, response, fds)
 	}
-	var rights []byte
-	if len(fds) > 0 {
-		rights = unix.UnixRights(fds...)
+	if err := writeErr; err != nil {
+		xerrors.LogWarning(context.Background(), "write handoff response: ", err)
+		// A rejected ancillary message (for example EMSGSIZE) has not consumed
+		// the seqpacket. Return a bounded error without FDs if the peer is live.
+		if replyErr := writeHandoffPacket(conn, handoffResponse{Error: fmt.Sprintf("write handoff response: %v", err)}, nil); replyErr != nil {
+			xerrors.LogWarning(context.Background(), "write handoff error response: ", replyErr)
+		}
 	}
-	_, _, _ = conn.WriteMsgUnix(body, rights, nil)
 }
 
 func (c *tcpHandoff) execute(request handoffRequest) (handoffResponse, []int, error) {
@@ -1295,7 +1311,7 @@ func (c *tcpHandoff) execute(request handoffRequest) (handoffResponse, []int, er
 	}
 	switch request.Operation {
 	case "status":
-	case "seal", "pause", "resume", "export", "drain", "drop_udp", "drop_tcp":
+	case "seal", "pause", "resume", "export", "export_batched", "drain", "drop_udp", "drop_tcp":
 		c.mu.Lock()
 		valid := !c.closed && request.Epoch > 0 && validHandoffIntent(request.Intent) && request.Epoch >= c.epoch
 		if request.Epoch == c.epoch {
@@ -1331,7 +1347,17 @@ func (c *tcpHandoff) execute(request handoffRequest) (handoffResponse, []int, er
 	case "drop_tcp":
 		err = c.dropTCP()
 	case "export":
+		c.mu.Lock()
+		count := len(c.bindings)
+		c.mu.Unlock()
+		if count > handoffMaxFDsPerMessage {
+			return handoffResponse{}, nil, fmt.Errorf("TCP handoff export of %d descriptors requires export_batched (per-message limit %d)", count, handoffMaxFDsPerMessage)
+		}
 		fds, err = c.exportListeners()
+	case "export_batched":
+		// Validate the frozen group now. Duplicate only one batch at a time
+		// while writing, so a full group does not need twice as many open FDs.
+		_, err = c.exportListenerBatch(0, 0)
 	}
 	if err != nil {
 		return handoffResponse{}, nil, err
@@ -1341,6 +1367,10 @@ func (c *tcpHandoff) execute(request handoffRequest) (handoffResponse, []int, er
 }
 
 func (c *tcpHandoff) exportListeners() ([]int, error) {
+	return c.exportListenerBatch(0, handoffMaxListeners)
+}
+
+func (c *tcpHandoff) exportListenerBatch(offset, limit int) ([]int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed || !c.ready || !c.paused || len(c.bindings)+len(c.packets) != len(c.expected) {
@@ -1351,8 +1381,12 @@ func (c *tcpHandoff) exportListeners() ([]int, error) {
 		addresses = append(addresses, address)
 	}
 	sort.Strings(addresses)
-	fds := make([]int, 0, len(addresses))
-	for _, address := range addresses {
+	if offset < 0 || offset > len(addresses) || limit < 0 {
+		return nil, fmt.Errorf("invalid TCP handoff export range")
+	}
+	end := min(offset+limit, len(addresses))
+	fds := make([]int, 0, end-offset)
+	for _, address := range addresses[offset:end] {
 		b := c.bindings[address]
 		// The first pause barrier deliberately leaves REALITY cover admission running
 		// until the candidate has restored its dynamic state. Duplicating the listening
