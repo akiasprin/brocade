@@ -1,4 +1,5 @@
 import { subStoreTransport } from './substore-data';
+import { nodeLinksFixture } from './node-links-data';
 // Visual acceptance fixture: the production users pane with synthetic users only; no network access.
 // ?user=alice|carol|erin chooses the detail, ?role=system-admin|readonly|user the viewer, ?theme=dark|light,
 // ?presence=sources gives alice online and recent sources (one of them banned) instead of an empty presence.
@@ -66,7 +67,7 @@ if (params.get('apps') === 'two')
   snapshot.snapshot.apps.push({
     id: 'budget',
     label: 'JP Budget',
-    chains: [{ id: 'jp-budget', name: 'JP Budget', subscription_country: 'JP' }],
+    chains: [{ id: 'jp-budget', tenant, name: 'JP Budget', subscription_country: 'JP' }],
     steps: [],
     fronts: [],
     ingresses: [{ id: 'in-budget', chain: 'jp-budget', node: 'n1', port: 8555 } as SnapshotIngress],
@@ -303,9 +304,19 @@ const connectorTransport = subStoreTransport(
   params.get('substore') ?? 'empty',
   !['readonly', 'publisher'].includes(role),
 );
+const nodes =
+  params.get('nodes') === 'regional' ? nodeLinksFixture(tenant, selected, params.get('nodeProbe') ?? 'idle') : null;
+if (nodes) {
+  if (nodes.job) client.setQueryData(['user-grant-probe-job', tenant, selected], nodes.job);
+  globalThis.EventSource = class extends EventTarget {
+    close() {}
+  } as unknown as typeof EventSource;
+}
 globalThis.fetch = async (input, init) => {
   const path = String(input);
   const url = new URL(path, location.origin);
+  const nodeResponse = nodes?.transport(url, init);
+  if (nodeResponse) return nodeResponse;
   const connectorResponse = await connectorTransport(url, init);
   if (connectorResponse) return connectorResponse;
   if (url.pathname === '/users') return Response.json({ users });
@@ -342,13 +353,15 @@ globalThis.fetch = async (input, init) => {
   if (url.pathname.startsWith('/artifacts/content/user/') || url.pathname === '/me/artifact') {
     const family = url.searchParams.get('family');
     const protocol = url.searchParams.get('protocol');
-    const content = Array.from({ length: 18 }, (_, index) => {
-      const name = encodeURIComponent(`示例节点 ${String(index + 1).padStart(2, '0')}`);
-      const host = family === 'v6' ? `[2001:db8::${index + 1}]` : `192.0.2.${index + 1}`;
-      return protocol === 'anytls'
-        ? `anytls://fixture@${host}:8443?sni=node.example.test#${name}`
-        : `vless://00000000-0000-4000-8000-000000000000@${host}:443?encryption=none&type=tcp&security=reality&sni=node.example.test&fp=chrome&pbk=fixture&sid=01#${name}`;
-    }).join('\n');
+    const content =
+      nodes?.content(url.searchParams) ??
+      Array.from({ length: 18 }, (_, index) => {
+        const name = encodeURIComponent(`示例节点 ${String(index + 1).padStart(2, '0')}`);
+        const host = family === 'v6' ? `[2001:db8::${index + 1}]` : `192.0.2.${index + 1}`;
+        return protocol === 'anytls'
+          ? `anytls://fixture@${host}:8443?sni=node.example.test#${name}`
+          : `vless://00000000-0000-4000-8000-000000000000@${host}:443?encryption=none&type=tcp&security=reality&sni=node.example.test&fp=chrome&pbk=fixture&sid=01#${name}`;
+      }).join('\n');
     return subscriptionResponse({
       revision: 1,
       target_kind: 'user',

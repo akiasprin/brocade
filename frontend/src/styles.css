@@ -13116,8 +13116,8 @@ select.f.words {
 }
 /* 订阅与节点：同一个弹窗，标题栏切换页签（沿用机器详情页签 .nd-tabs），两个页签共用协议与地址族的取值。
    订阅是一张卡券（见下方「订阅：卡券」），协议与地址族是卡上的栏位；管理员测速订阅是叠在后面的第二张卡。
-   节点页签是「协议 │ IPv4 │ IPv6」行列表，地址本身是复制按钮，网络拨测合并在同一页签，筛选行在正文上方。
-   超过视口时只有正文滚动，标题栏与底栏保持可见。
+   节点页签以灰色地区边栏和白色内容区组织紧凑列表，筛选与操作在内容区顶部。
+   超过视口时边栏与列表独立滚动，标题栏保持可见。
    窄屏见本节末尾：贴底成为面板。 */
 .sub-dialog {
   display: flex;
@@ -13172,54 +13172,14 @@ select.f.words {
   color: var(--ink);
   background: var(--hover-2);
 }
-.sub-dialog-filter {
-  display: flex;
-  flex: none;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 22px;
-  padding: 10px 16px;
-  border-top: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
-}
-.sub-dialog-field {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-.sub-dialog-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--ink-4);
-  font-size: 11.5px;
-  white-space: nowrap;
-}
-/* Icon 的外层 span 与 svg 都按块排，避免行盒基线把图标顶偏。 */
-.sub-dialog-label > span,
-.sub-pick-label > span,
+/* 图标按块排，避免行盒基线偏移。 */
 .node-copy-all > span,
 .node-probe-all > span,
 .node-copy-icon,
-.sub-pick-chevron,
-.sub-dialog-label svg,
-.sub-pick-label svg,
 .node-copy-all svg,
 .node-probe-all svg,
-.node-copy-icon svg,
-.sub-pick-chevron svg {
+.node-copy-icon svg {
   display: block;
-}
-.sub-dialog-label > span,
-.sub-pick-label > span {
-  color: var(--ink-3);
-}
-.sub-dialog-filter .segsw {
-  min-height: 26px;
-}
-.sub-dialog-filter .segsw button {
-  padding: 0 10px;
-  font-size: 12.5px;
 }
 .sub-dialog-body {
   flex: 1;
@@ -13228,89 +13188,6 @@ select.f.words {
   overflow-y: auto;
   overscroll-behavior: contain;
 }
-.sub-dialog-foot {
-  display: flex;
-  min-height: 36px;
-  box-sizing: border-box;
-  flex: none;
-  flex-wrap: wrap;
-  align-items: center;
-  padding: 7px 16px;
-  border-top: 1px solid var(--line);
-  color: var(--ink-4);
-  font-size: 11px;
-}
-.sub-dialog-foot > span + span::before {
-  content: '·';
-  margin: 0 7px;
-  opacity: 0.6;
-}
-/* 本轮拨测的计数；取消或作废时先写原因。 */
-.sub-dialog-foot > span.node-probe-tally {
-  margin-left: auto;
-  padding-left: 12px;
-  font: 10.5px var(--mono);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-.sub-dialog-foot > span.node-probe-tally::before {
-  content: none;
-}
-.node-probe-tally > b {
-  margin-right: 8px;
-  color: var(--gold);
-  font: 500 11px var(--sans);
-}
-
-/* 窄屏筛选的下拉：显示层 + 透明原生 select（16px，避免 iOS 聚焦放大）。 */
-.sub-pick {
-  position: relative;
-  display: flex;
-  min-width: 0;
-  height: var(--ctl-h);
-  box-sizing: border-box;
-  align-items: center;
-  gap: 8px;
-  padding: 0 10px 0 12px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--btn);
-}
-.sub-pick-label {
-  display: inline-flex;
-  flex: none;
-  align-items: center;
-  gap: 5px;
-  color: var(--ink-4);
-  font-size: 12px;
-}
-.sub-pick-value {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  color: var(--ink);
-  font: 500 12.5px var(--sans);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.sub-pick-chevron {
-  flex: none;
-  color: var(--ink-3);
-}
-.sub-pick > select {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  opacity: 0;
-  font-size: 16px;
-  cursor: pointer;
-}
-.sub-pick:focus-within {
-  outline: 2px solid var(--action);
-  outline-offset: 1px;
-}
-
 .sub-text-action {
   flex: none;
   padding: 3px 7px;
@@ -13802,41 +13679,172 @@ button.sub-pass-pick {
   }
 }
 
-/* 节点：工具行 → 说明 → 「协议 │ IPv4 │ IPv6」行列表。未列出的条目与自签节点写在列表之前。 */
+/* 节点：灰色地区边栏与白色内容区；列表保持组头 + 紧凑协议行。 */
+.sub-dialog-nodes {
+  --node-sep: color-mix(in srgb, var(--ink) 8%, transparent);
+  width: min(860px, calc(100vw - 32px));
+  background: var(--sheet);
+  backdrop-filter: none;
+}
+[data-theme='light'] .sub-dialog-nodes {
+  --node-sep: rgb(0 0 0 / 0.07);
+  background: var(--sunk);
+}
+.sub-dialog-body.node-browser {
+  display: grid;
+  grid-template-columns: 178px minmax(0, 1fr);
+  min-height: min(560px, calc(100dvh - 160px));
+  padding: 0;
+  overflow: hidden;
+  border-top: 1px solid var(--line);
+}
+.node-sidebar {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 1px;
+  overflow-y: auto;
+  padding: 10px 8px 16px;
+  overscroll-behavior: contain;
+}
+.node-scope {
+  display: flex;
+  height: 30px;
+  flex: none;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 9px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--ink-2);
+  font: 12.5px var(--sans);
+  text-align: left;
+  cursor: pointer;
+}
+.node-scope-icon {
+  display: inline-flex;
+  width: 16px;
+  flex: none;
+  justify-content: center;
+  color: var(--ink-3);
+}
+.node-scope-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-scope-count {
+  color: var(--ink-4);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+.node-scope.bad :is(.node-scope-icon, .node-scope-count) {
+  color: var(--err);
+}
+.node-scope[aria-current='true'] {
+  background: var(--action-wash);
+  color: var(--action);
+  font-weight: 500;
+}
+.node-scope[aria-current='true'] :is(.node-scope-icon, .node-scope-count) {
+  color: var(--action);
+}
+.node-scope:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -2px;
+}
+.node-sidebar-heading {
+  padding: 14px 10px 5px;
+  color: var(--ink-4);
+  font: 600 10.5px var(--sans);
+  letter-spacing: 0.06em;
+}
+.node-main {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  border-left: 1px solid var(--line);
+  background: var(--card);
+}
 .node-toolbar {
   display: flex;
+  flex: none;
   flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin: 0 0 10px;
+  align-items: flex-end;
+  gap: 10px 8px;
+  padding: 12px 14px 12px 18px;
+  border-bottom: 1px solid var(--node-sep);
+}
+.node-toolbar > .sub-pass-pick + .sub-pass-pick {
+  margin-left: 16px;
 }
 .node-toolbar > .sp {
   flex: 1;
 }
-.node-count {
-  color: var(--ink-3);
-  font-size: 12px;
-}
-.node-count b {
-  color: var(--ink);
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-.node-view {
-  min-height: 26px;
-}
-.node-view button {
-  padding: 0 9px;
-  font-size: 12.5px;
-}
 .node-copy-all,
 .node-probe-all,
 .node-probe-retry {
-  min-height: 26px;
-  height: 26px;
+  min-height: 30px;
+  height: 30px;
   gap: 6px;
-  padding: 0 10px;
+  padding: 0 12px;
+  border-radius: 8px;
   font-size: 12.5px;
+}
+.node-list {
+  --node-cols: 168px minmax(0, 222px) minmax(0, 1fr);
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 0 14px;
+  overscroll-behavior: contain;
+}
+.node-list.single {
+  --node-cols: 196px minmax(0, 1fr);
+}
+.node-region-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  height: 30px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px 0 18px;
+  border-bottom: 1px solid var(--node-sep);
+  background: color-mix(in srgb, var(--card) 88%, transparent);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+  backdrop-filter: blur(12px) saturate(1.4);
+}
+.node-region-head > b {
+  color: var(--ink-2);
+  font: 600 12px var(--sans);
+}
+.node-region-head > small {
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.node-browser :is(.node-scope, .node-region-head, .node-group-head) .geo-flag {
+  width: 16px;
+  height: 11px;
+  border-radius: 2px;
+  box-shadow: 0 0 0 0.5px color-mix(in srgb, var(--ink) 22%, transparent);
+}
+.node-probe-tally {
+  margin: 10px 16px 6px 18px;
+  color: var(--ink-3);
+  font: 11px/1.5 var(--sans);
+  font-variant-numeric: tabular-nums;
+}
+.node-probe-tally > b {
+  display: block;
+  color: var(--gold);
+  font-weight: 500;
 }
 /* 拨测进度：按钮底色从左往右铺，铺的比例 = 本轮已出结果的项 / 本轮项数（--progress）。
    运行中的按钮去掉主按钮的实底，铺上去的操作色浅底才看得见。 */
@@ -13852,7 +13860,7 @@ button.sub-pass-pick {
 .node-notes {
   display: grid;
   gap: 6px;
-  margin: 0 0 12px;
+  margin: 10px 16px 4px 18px;
 }
 .node-notes > p {
   display: flex;
@@ -13884,41 +13892,36 @@ button.sub-pass-pick {
 .node-notes > p.bad .node-note-icon {
   color: var(--err);
 }
-.node-matrix {
-  --node-cols: 172px 176px minmax(0, 1fr);
-}
-.node-matrix.single {
-  --node-cols: 172px minmax(0, 1fr);
-}
 .node-matrix-head,
 .node-row {
   display: grid;
   grid-template-columns: var(--node-cols);
+  min-height: 30px;
   align-items: center;
-  gap: 6px;
+  gap: 0 6px;
   padding-left: 23px;
 }
 .node-matrix-head {
-  height: 20px;
+  min-height: 26px;
+  padding: 4px 12px 0 41px;
   color: var(--ink-4);
   font: 10.5px var(--mono);
 }
 .node-matrix-head > span + span {
-  padding-left: 9px;
+  padding-left: 23px;
+}
+.node-group {
+  padding: 2px 12px 6px 18px;
 }
 .node-group + .node-group {
-  margin-top: 6px;
+  border-top: 1px solid var(--node-sep);
 }
 .node-group-head {
   display: flex;
   min-width: 0;
-  height: 30px;
+  height: 32px;
   align-items: center;
   gap: 8px;
-}
-.node-group-head .geo-flag {
-  border-radius: 2px;
-  box-shadow: 0 0 0 0.5px color-mix(in srgb, var(--ink) 22%, transparent);
 }
 .node-group-head > b {
   min-width: 0;
@@ -13936,9 +13939,25 @@ button.sub-pass-pick {
   margin-left: auto;
 }
 .node-group-result {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   color: var(--ink-3);
   font-size: 11.5px;
   white-space: nowrap;
+}
+.node-group-result > i {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--ok);
+}
+.node-group-result[data-tone='err'] > i {
+  background: var(--err);
+}
+.node-group-result[data-tone='run'] > i {
+  background: var(--action);
 }
 .node-group-result.bad {
   color: var(--err);
@@ -13946,29 +13965,26 @@ button.sub-pass-pick {
 .btn.node-group-run {
   min-height: 24px;
   height: 24px;
-  padding: 0 9px;
-  font-size: 12.5px;
-}
-/* 行首缩进 23px（15px 地区旗 + 8px 间距），与组名文字左缘对齐；行间分隔线从同一位置起画。 */
-.node-row {
-  position: relative;
-  min-height: 36px;
-}
-.node-row + .node-row::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  right: 0;
-  left: 23px;
-  border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+  padding: 0 4px;
+  border: 0;
+  background: none;
+  box-shadow: none;
+  color: var(--action);
+  font-size: 12px;
 }
 .node-protocol {
   display: flex;
   min-width: 0;
-  align-items: baseline;
-  gap: 8px;
+  align-items: center;
+  gap: 7px;
   overflow: hidden;
   white-space: nowrap;
+}
+.node-protocol > .ui-icon {
+  display: inline-flex;
+  width: 13px;
+  flex: none;
+  color: var(--ink-3);
 }
 .node-protocol > b {
   flex: none;
@@ -13994,12 +14010,14 @@ button.sub-pass-pick {
 .node-copy {
   display: flex;
   min-width: 0;
-  height: 28px;
+  min-height: 28px;
+  max-width: 100%;
+  justify-self: start;
   box-sizing: border-box;
   align-items: center;
   gap: 8px;
-  padding: 0 8px 0 9px;
-  border: 1px solid transparent;
+  padding: 3px 8px;
+  border: 0;
   border-radius: var(--r-ctl);
   background: none;
   color: var(--ink-2);
@@ -14023,12 +14041,13 @@ button.sub-pass-pick {
 .node-copy-address {
   display: flex;
   min-width: 0;
-  white-space: nowrap;
+  flex-wrap: wrap;
+  align-items: baseline;
+  line-height: 16px;
 }
 .node-copy-host {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
 }
 .node-copy-port {
   flex: none;
@@ -14037,7 +14056,7 @@ button.sub-pass-pick {
   flex: none;
   color: var(--ink-4);
 }
-/* 状态灯沿用 .cg-lamp；这一页有拨测时每格都留同宽的位置，不是拨测项的格子（MTProxy 等）留空，同列地址对齐。 */
+/* 有拨测计划时预留灯位；尚未拨测与不支持拨测的地址不画空心灯。 */
 .node-copy-lamp {
   display: inline-block;
   width: 7px;
@@ -14067,9 +14086,23 @@ button.sub-pass-pick {
   margin-top: 1px;
 }
 @media (hover: hover) {
+  .node-scope:not([aria-current='true']):hover {
+    background: var(--hover);
+  }
+  .node-copy-icon,
+  .node-group-run:not(:focus-visible, .node-probe-progress) {
+    opacity: 0;
+  }
+  .node-group:hover .node-group-run,
+  .node-group:focus-within .node-group-run,
+  .node-group:has(.node-group-result.bad) .node-group-run,
+  .node-copy:hover .node-copy-icon,
+  .node-copy:focus-visible .node-copy-icon,
+  .node-copy:is(.done, .failed) .node-copy-icon {
+    opacity: 1;
+  }
   .node-copy:hover:not(:disabled) {
-    border-color: var(--line);
-    background: var(--btn);
+    background: var(--hover);
     color: var(--ink);
   }
   .node-copy:hover:not(:disabled) .node-copy-icon {
@@ -14089,25 +14122,16 @@ button.sub-pass-pick {
   color: var(--err);
 }
 .node-copy-gap {
-  padding-left: 9px;
-  color: var(--ink-4);
-  font: 11.5px var(--mono);
+  min-height: 1px;
 }
 .node-empty {
-  padding: 36px 0;
+  padding: 36px 14px;
   color: var(--ink-4);
   font-size: 12px;
   text-align: center;
 }
-.node-raw {
-  max-height: 340px;
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
-  font-size: 11.5px;
-}
 /* 窄屏（≤820px，与 ui/viewport.ts 的 NARROW_MAX 一致）：弹窗贴底成为面板，宽度铺满、上方两角圆角，
-   高度随内容、最高留出顶部安全区；筛选由组件换成一行两个下拉；地址框整段换行显示，「显示」「复制」
-   落到框底各占一半；按钮与复制目标放大到触屏尺寸。 */
+   高度随内容、最高留出顶部安全区；地区边栏变成横向胶囊，内容与完整地址可换行，操作保持触屏尺寸。 */
 @media (max-width: 820px) {
   .dialog-layer.modal:has(> .sub-dialog) {
     align-items: stretch;
@@ -14140,53 +14164,65 @@ button.sub-pass-pick {
     width: var(--ctl-h);
     height: var(--ctl-h);
   }
-  .sub-dialog-filter {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    gap: 10px;
-    padding: 10px 14px;
-  }
   .sub-dialog-body {
     padding: 16px 14px 20px;
   }
-  .sub-dialog-foot {
-    display: grid;
-    gap: 2px;
-    padding: 10px 14px calc(10px + var(--safe-bottom));
+  .sub-dialog-body.node-browser {
+    display: flex;
+    min-height: 0;
+    flex-direction: column;
+    overflow-y: auto;
   }
-  .sub-dialog-foot > span + span::before {
-    content: none;
+  .node-sidebar {
+    flex: none;
+    flex-direction: row;
+    gap: 6px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 10px 14px;
+    scrollbar-width: none;
   }
-  .node-count {
-    margin-right: auto;
-    font-size: 12px;
-  }
-  .node-toolbar > .sp {
+  .node-sidebar-heading {
     display: none;
   }
-  .node-view {
+  .node-scope {
     height: var(--ctl-h);
+    padding: 0 12px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--ink) 6%, transparent);
+    white-space: nowrap;
   }
-  .node-view button {
-    min-height: 0;
-    height: calc(var(--ctl-h) - 2px);
-    padding: 0 10px;
+  .node-scope-name {
+    flex: none;
+  }
+  .node-main {
+    min-height: auto;
+    flex: none;
+    border-top: 1px solid var(--line);
+    border-left: 0;
+  }
+  .node-toolbar {
+    padding: 12px 14px;
+  }
+  .node-toolbar > .sp {
+    flex-basis: 100%;
+  }
+  .node-list {
+    overflow: visible;
+    padding-bottom: calc(14px + var(--safe-bottom));
   }
   .node-copy-all,
   .node-probe-all,
   .node-probe-retry {
     min-height: var(--ctl-h);
     height: var(--ctl-h);
+    flex: 1;
     padding: 0 10px;
   }
   .btn.node-group-run {
     min-height: var(--ctl-h);
     height: var(--ctl-h);
     padding: 0 10px;
-  }
-  .sub-dialog-foot > span.node-probe-tally {
-    margin: 4px 0 0;
-    padding-left: 0;
   }
   .node-notes > p {
     font-size: 12.5px;
@@ -14210,8 +14246,8 @@ button.sub-pass-pick {
     padding: 8px 0 8px 23px;
   }
   .node-copy {
-    height: var(--ctl-h);
-    margin-left: -9px;
+    min-height: var(--ctl-h);
+    margin-left: -8px;
     font-size: 12.5px;
   }
   .node-copy.has-note {
@@ -14229,7 +14265,7 @@ button.sub-pass-pick {
     font-size: 12px;
     line-height: 18px;
   }
-  .node-copy-family {
+  .node-list:not(.single) .node-copy-family {
     display: inline;
     width: 36px;
     font-size: 11px;

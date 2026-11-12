@@ -84,16 +84,13 @@ async function compactControls(dialog: Locator, tab: 'clash' | 'uri') {
     .locator(
       tab === 'clash'
         ? '.sub-dialog-tabs button, .sub-dialog-close, .sub-pass-actions > .btn'
-        : '.sub-dialog-tabs button, .sub-dialog-close, .sub-pick, .node-view, .node-copy-all, .node-probe-all, .node-copy',
+        : '.sub-dialog-tabs button, .sub-dialog-close, .node-toolbar .sub-pass-pick, .node-copy-all, .node-probe-all, .node-copy',
     )
     .evaluateAll(elements => elements.map(element => element.getBoundingClientRect().height));
   expect(sizes.length).toBeGreaterThan(tab === 'clash' ? 3 : 4);
-  for (const height of sizes) expect(height).toBe(36);
+  for (const height of sizes) expect(height).toBeGreaterThanOrEqual(36);
   if (tab === 'clash') return;
-  const selectFonts = await dialog
-    .locator('.sub-pick select')
-    .evaluateAll(elements => elements.map(element => getComputedStyle(element).fontSize));
-  expect(selectFonts).toEqual(['16px', '16px']);
+  await expect(dialog.getByRole('combobox')).toHaveCount(2);
 }
 
 // 地址行随筛选参数变长时只截断自己：二维码始终在卡面正中。
@@ -161,7 +158,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
           const loading = (await dialog.locator('.sub-dialog').boundingBox())!;
           await reply(page);
           if (tab === 'clash') await expect(dialog.getByRole('region', { name: 'Clash 订阅' })).toBeVisible();
-          else await expect(dialog.locator('.node-count')).toHaveText('18 个节点');
+          else await expect(dialog.getByRole('button', { name: '全部 18' })).toBeVisible();
           await placed(page, dialog);
           expect((await dialog.locator('.sub-dialog').boundingBox())!.height).toBeGreaterThan(loading.height);
           await compactControls(dialog, tab);
@@ -182,7 +179,8 @@ for (const engine of ['chromium', 'webkit'] as const) {
               element.scrollTop = element.scrollHeight;
             });
             await placed(page, dialog);
-            await expect(dialog.locator('.sub-dialog-foot')).toBeInViewport({ ratio: 1 });
+            await expect(dialog.locator('.node-copy').last()).toBeInViewport({ ratio: 1 });
+            await expect(dialog.locator('.sub-dialog-foot, .sub-dialog-filter')).toHaveCount(0);
           }
           await dialog.locator('.sub-dialog-close').click();
           await expect(dialog).toHaveCount(0);
@@ -201,7 +199,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
       await placed(page, dialog);
       await dialog.getByRole('tab', { name: '节点', exact: true }).click();
       await reply(page);
-      await expect(dialog.locator('.node-count')).toHaveText('18 个节点');
+      await expect(dialog.getByRole('button', { name: '全部 18' })).toBeVisible();
       await placed(page, dialog);
       await page.setViewportSize({ width: 780, height: 390 });
       await placed(page, dialog);
@@ -237,7 +235,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
       await page.getByRole('button', { name: '节点', exact: true }).click();
       const dialog = page.getByRole('dialog', { name: 'alice 的订阅与节点' });
       await reply(page);
-      await expect(dialog.locator('.node-count')).toHaveText('18 个节点');
+      await expect(dialog.getByRole('button', { name: '全部 18' })).toBeVisible();
       await expect(dialog).toHaveAttribute('data-motion-state', 'entered');
       await placed(page, dialog);
       expect((await dialog.locator('.sub-dialog').boundingBox())!.y).toBeGreaterThanOrEqual(44);

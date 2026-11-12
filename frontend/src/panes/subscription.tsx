@@ -45,14 +45,13 @@ import {
   type GrantProbePlanItem,
 } from '../api';
 import { GRANT_REFRESH_MS, GRANT_REFRESH_WINDOW_MS, useGrantEdits } from '../grant-edits';
-import { ErrorBox, Loading, SegmentedControl } from '../ui/bits';
+import { ErrorBox, Loading } from '../ui/bits';
 import { ChoiceSelect } from '../ui/choice-menu';
 import { CopyButton, copyStateIcon, type CopyState } from '../ui/copy-button';
 import { DialogClose, DialogLayer } from '../ui/dialog';
 import { bytes } from '../ui/format';
 import { Icon, type IconName } from '../ui/icons';
 import { RegionFlag } from '../ui/region-flag';
-import { useNarrow } from '../ui/viewport';
 
 export type SubscriptionKind = 'uri' | 'clash';
 
@@ -92,9 +91,8 @@ interface TabPanelProps {
 
 /* 订阅与节点共用一个弹窗：标题栏切换「订阅 / 节点」，协议与地址族的取值两个页签共用。
  * 两边的内容都由服务端按筛选条件生成：订阅是带 family / protocol 参数的地址，节点是同一条件下的
- * uri.txt。浏览器只把 uri.txt 解析成列表用于展示，不自行过滤条目。「节点」页签并入人工网络拨测。
- * 筛选的画法各随页签：订阅是卡券上的两个栏位，节点是正文上方一行分段（窄屏换成两个下拉）。
- * 窄屏（与 useNarrow 同一断点）弹窗贴底成为面板。 */
+ * uri.txt。浏览器解析后按地区或拨测失败筛选，复制与拨测都作用于当前可见节点。
+ * 订阅的筛选在卡券上，节点的筛选在白色内容区顶部，灰色边栏选择地区。窄屏弹窗贴底成为面板。 */
 export function SubscriptionViewer({
   tenant,
   user,
@@ -155,7 +153,9 @@ export function SubscriptionViewer({
       onClose={onClose}
       canClose={() => navigationGuard.current?.(onClose) ?? true}
     >
-      <section className={`dialog-surface sub-dialog${tab === 'clash' ? ' sub-dialog-subscription' : ''}`}>
+      <section
+        className={`dialog-surface sub-dialog${tab === 'clash' ? ' sub-dialog-subscription' : ' sub-dialog-nodes'}`}
+      >
         <header className="sub-dialog-head">
           {identity}
           <b className="sub-dialog-user">{user}</b>
@@ -183,9 +183,6 @@ export function SubscriptionViewer({
             <Icon of="close" size={14} />
           </DialogClose>
         </header>
-        {tab === 'uri' && (
-          <SubscriptionFilters protocol={protocol} family={family} onProtocol={setProtocol} onFamily={setFamily} />
-        )}
         {tab === 'clash' ? (
           <ClashSubscription
             tenant={tenant}
@@ -209,95 +206,13 @@ export function SubscriptionViewer({
             onAllowInsecure={setAllowInsecure}
             onUseSubscription={() => changeTab('clash')}
             onProbePassed={onProbePassed}
+            onProtocol={setProtocol}
+            onFamily={setFamily}
             panel={panel}
           />
         )}
       </section>
     </DialogLayer>
-  );
-}
-
-/* 节点页签的筛选行；MTProxy 只能以节点链接分享，只在这里出现。 */
-function SubscriptionFilters({
-  protocol,
-  family,
-  onProtocol,
-  onFamily,
-}: {
-  protocol: ProtocolPick;
-  family: FamilyPick;
-  onProtocol: (value: ProtocolPick) => void;
-  onFamily: (value: FamilyPick) => void;
-}) {
-  const narrow = useNarrow();
-  const protocolPicks = NODE_PROTOCOL_PICKS;
-  return (
-    <div className="sub-dialog-filter">
-      {narrow ? (
-        <>
-          <FilterPick icon="protocol" label="协议" value={protocol} options={protocolPicks} onChange={onProtocol} />
-          <FilterPick icon="family" label="地址族" value={family} options={FAMILY_PICKS} onChange={onFamily} />
-        </>
-      ) : (
-        <>
-          <span className="sub-dialog-field">
-            <span className="sub-dialog-label">
-              <Icon of="protocol" size={13} />
-              协议
-            </span>
-            <SegmentedControl ariaLabel="订阅协议" value={protocol} options={protocolPicks} onChange={onProtocol} />
-          </span>
-          <span className="sub-dialog-field">
-            <span className="sub-dialog-label">
-              <Icon of="family" size={13} />
-              地址族
-            </span>
-            <SegmentedControl ariaLabel="地址族" value={family} options={FAMILY_PICKS} onChange={onFamily} />
-          </span>
-        </>
-      )}
-    </div>
-  );
-}
-
-/* 窄屏筛选：显示层是图标、名称、当前值与箭头，透明的原生 select 覆盖在上面，点开即系统选择器。
- * select 自身用 16px：iOS 聚焦字号小于 16px 的表单控件会放大页面。 */
-function FilterPick<T extends string>({
-  icon,
-  label,
-  value,
-  options,
-  onChange,
-}: {
-  icon: IconName;
-  label: string;
-  value: T;
-  options: readonly { value: T; label: string }[];
-  onChange: (value: T) => void;
-}) {
-  return (
-    <label className="sub-pick">
-      <span className="sub-pick-label">
-        <Icon of={icon} size={14} />
-        {label}
-      </span>
-      <b className="sub-pick-value">{options.find(option => option.value === value)?.label}</b>
-      <Icon of="chevronDown" size={14} className="sub-pick-chevron" />
-      <select
-        aria-label={label}
-        value={value}
-        onChange={event => {
-          const next = options.find(option => option.value === event.target.value);
-          if (next) onChange(next.value);
-        }}
-      >
-        {options.map(option => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
-    </label>
   );
 }
 
@@ -775,6 +690,15 @@ const NODE_PROTOCOL_LABEL: Record<NodeProtocol, string> = {
   other: '其他',
 };
 
+const NODE_PROTOCOL_ICON: Record<NodeProtocol, IconName> = {
+  vless: 'xray',
+  'vless-encryption': 'xray',
+  anytls: 'bolt',
+  hysteria2: 'hysteria',
+  mtproto: 'telegram',
+  other: 'protocol',
+};
+
 const NODE_FAMILY_LABEL: Record<NodeFamily, string> = { ipv4: 'IPv4', ipv6: 'IPv6' };
 
 type CssVars = CSSProperties & Record<`--${string}`, string>;
@@ -789,6 +713,8 @@ function NodeLinks({
   onAllowInsecure,
   onUseSubscription,
   onProbePassed,
+  onProtocol,
+  onFamily,
   panel,
 }: {
   tenant: string;
@@ -800,9 +726,15 @@ function NodeLinks({
   onAllowInsecure: (allow: boolean) => void;
   onUseSubscription: () => void;
   onProbePassed?: (result: { probeId: string; itemId: string }) => void;
+  onProtocol: (value: ProtocolPick) => void;
+  onFamily: (value: FamilyPick) => void;
   panel: TabPanelProps;
 }) {
-  const [view, setView] = useState<'list' | 'raw'>('list');
+  const [scope, setScope] = useState('all');
+  const listRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (listRef.current) listRef.current.scrollTop = 0;
+  }, [scope, protocol, family, allowInsecure]);
   const revisions = useQuery({ queryKey: ['revisions'], queryFn: () => fetchRevisions(), refetchInterval: 10_000 });
   const revision = revisions.data?.current_revision;
   const content = useQuery({
@@ -849,30 +781,41 @@ function NodeLinks({
   const text = content.data.content ?? '';
   const listing = parseNodeListing(text);
   const groups = groupNodeLinks(listing.links);
-  const slots: NodeFamily[] = family === 'both' ? ['ipv4', 'ipv6'] : [family === 'v4' ? 'ipv4' : 'ipv6'];
   const insecureCount = allowInsecure ? listing.links.filter(link => link.insecure).length : 0;
-  const lines = text ? text.replace(/\n$/, '').split('\n') : [];
 
   // 拨测、进度与重试只作用于列出的节点：没有分享链接的条目（带前置代理、VLESS 自签，见说明）
   // 与筛选掉的条目都不在其中，所见即所测。
   const probeOf = probe.ready ? pairProbeItems(listing.links, probe.items) : new Map<NodeLink, ProbeItem>();
-  const listed = listing.links.flatMap(link => probeOf.get(link) ?? []);
-  const listedIds = new Set(listed.map(item => item.id));
   const job = probe.job;
   const running = job?.status === 'running';
+  const regions = Array.from(new Set(groups.map(group => group.region)));
+  const failedLinks = listing.links.filter(link => probeOf.get(link)?.status === 'failed');
+  const knownScope =
+    scope === 'all' ||
+    (scope === 'failed' && failedLinks.length > 0) ||
+    regions.some(region => nodeRegionKey(region) === scope);
+  const current = knownScope ? scope : 'all';
+  const visibleLinks =
+    current === 'failed'
+      ? failedLinks
+      : current === 'all'
+        ? listing.links
+        : listing.links.filter(link => nodeRegionKey(link.region) === current);
+  const slots = NODE_FAMILIES.filter(slot => visibleLinks.some(link => link.family === slot));
+  const visibleGroups = groupNodeLinks(visibleLinks);
+  const listed = visibleLinks.flatMap(link => probeOf.get(link) ?? []);
+  const listedIds = new Set(listed.map(item => item.id));
   const jobItems = job?.items.filter(item => listedIds.has(item.id)) ?? [];
-  const failedIds = jobItems.filter(item => item.status === 'failed').map(item => item.id);
+  const failedIds = listed.filter(item => item.status === 'failed').map(item => item.id);
   const count = (status: GrantProbeItemStatus) => jobItems.filter(item => item.status === status).length;
   const complete = jobItems.length - count('waiting') - count('running');
   const progress: CssVars = {
     '--progress': `${jobItems.length ? Math.round((complete / jobItems.length) * 100) : 0}%`,
   };
-  // 空列表表示服务端计划中的全部项；列出的少于计划时改为显式列出。
-  const allIds = listed.length < probe.items.length ? listed.map(item => item.id) : [];
-  // 单组拨测：本轮只含这一组的条目时，这一组的按钮也铺进度。
+  // 空数组是服务端的「全部」，只允许在当前可见节点覆盖整个计划时使用。
+  const allIds = listed.length === probe.items.length ? [] : listed.map(item => item.id);
   const groupRunning = (ids: string[]) =>
     job?.status === 'running' && job.items.length === ids.length && job.items.every(item => ids.includes(item.id));
-  // 取消与作废（Serving 已变化）要说明原因；正常结束的总结与计数重复，只放在提示里。
   const jobNote = job && (job.status === 'canceled' || job.status === 'superseded') ? job.message : null;
   const probeIssue = probe.unavailable
     ? { text: `拨测不可用：${probe.unavailable}`, bad: false }
@@ -896,7 +839,15 @@ function NodeLinks({
     const active = groupRunning(ids);
     return (
       <span className="node-group-probe">
-        {result && <span className={`node-group-result${result.bad ? ' bad' : ''}`}>{result.text}</span>}
+        {result && (
+          <span
+            className={`node-group-result${result.bad ? ' bad' : ''}`}
+            data-tone={result.bad ? 'err' : result.text === '拨测中' ? 'run' : 'ok'}
+          >
+            <i aria-hidden="true" />
+            {result.text === '全部通过' ? '通过' : result.text}
+          </span>
+        )}
         <button
           type="button"
           className={`btn node-group-run${active ? ' node-probe-progress' : ''}`}
@@ -911,28 +862,89 @@ function NodeLinks({
     );
   };
 
+  const sections =
+    current === 'all'
+      ? regions.map(region => ({ region, groups: visibleGroups.filter(group => group.region === region) }))
+      : [{ region: null, groups: visibleGroups }];
+  const scoped = current !== 'all';
   return (
-    <>
-      <div className="sub-dialog-body" {...panel}>
-        <div className="node-toolbar">
-          <span className="node-count">
-            <b>{listing.links.length}</b> 个节点
-          </span>
-          <span className="sp" />
-          <SegmentedControl
-            className="node-view"
-            ariaLabel="显示方式"
-            value={view}
-            onChange={setView}
-            options={[
-              { value: 'list', label: '列表' },
-              { value: 'raw', label: '原文' },
-            ]}
+    <div className="sub-dialog-body node-browser" {...panel}>
+      <nav className="node-sidebar" aria-label="按地区筛选">
+        <NodeScope
+          active={current === 'all'}
+          label="全部"
+          count={listing.links.length}
+          icon="nodeLinks"
+          onClick={() => setScope('all')}
+        />
+        {failedLinks.length > 0 && (
+          <NodeScope
+            active={current === 'failed'}
+            label="失败"
+            count={failedLinks.length}
+            icon="warn"
+            onClick={() => setScope('failed')}
           />
+        )}
+        <small className="node-sidebar-heading">地区</small>
+        {regions.map(region => (
+          <NodeScope
+            key={nodeRegionKey(region)}
+            active={current === nodeRegionKey(region)}
+            label={nodeRegionName(region)}
+            count={listing.links.filter(link => link.region === region).length}
+            region={region}
+            onClick={() => setScope(nodeRegionKey(region))}
+          />
+        ))}
+      </nav>
+      <div className="node-main">
+        <div className="node-toolbar">
+          <ChoiceSelect
+            className="sub-pass-pick"
+            aria-label="协议"
+            data-label="协议"
+            menuAlign="below"
+            value={protocol}
+            onChange={event => {
+              const next = NODE_PROTOCOL_PICKS.find(pick => pick.value === event.target.value);
+              if (next) onProtocol(next.value);
+            }}
+          >
+            {NODE_PROTOCOL_PICKS.map(pick => (
+              <option
+                key={pick.value}
+                value={pick.value}
+                data-detail={pick.value === 'both' ? 'VLESS · AnyTLS · Hysteria 2 · MTProxy' : undefined}
+              >
+                {pick.label}
+              </option>
+            ))}
+          </ChoiceSelect>
+          <ChoiceSelect
+            className="sub-pass-pick"
+            aria-label="地址族"
+            data-label="地址族"
+            menuAlign="below"
+            value={family}
+            onChange={event => {
+              const next = FAMILY_PICKS.find(pick => pick.value === event.target.value);
+              if (next) onFamily(next.value);
+            }}
+          >
+            {FAMILY_PICKS.map(pick => (
+              <option key={pick.value} value={pick.value} data-detail={FAMILY_DETAIL[pick.value]}>
+                {pick.label}
+              </option>
+            ))}
+          </ChoiceSelect>
+          <span className="sp" />
           <CopyButton
+            key={`copy-${current}-${protocol}-${family}`}
             className="btn node-copy-all"
-            text={listing.links.map(link => link.uri).join('\n')}
-            label="复制全部"
+            text={visibleLinks.map(link => link.uri).join('\n')}
+            label={scoped ? `复制 ${visibleLinks.length} 个` : '复制全部'}
+            title={`节点链接含 ${user} 的凭据，更换 UUID 后全部失效`}
           >
             {(state, label) => (
               <>
@@ -941,7 +953,7 @@ function NodeLinks({
               </>
             )}
           </CopyButton>
-          {failedIds.length > 0 && (
+          {failedIds.length > 0 && !running && current !== 'failed' && (
             <button
               type="button"
               className="btn node-probe-retry"
@@ -955,49 +967,98 @@ function NodeLinks({
             type="button"
             className={`btn node-probe-all${running ? ' node-probe-progress' : ' primary'}`}
             style={running ? progress : undefined}
-            title={`使用 ${user} 当前生效的真实用户凭据从公网验证列出的节点；只检查本次授权是否可用，不代替周期健康观测`}
+            title={`使用 ${user} 当前生效的真实用户凭据从公网验证当前筛选的节点；拨测流量计入该用户用量；只检查本次授权是否可用，不代替周期健康观测`}
             disabled={running ? probe.cancelling : !probe.ready || probe.busy || listed.length === 0}
             onClick={() => (running ? probe.cancel() : probe.start(allIds))}
           >
             <Icon of="diag" size={13} />
-            {running ? '取消拨测' : probe.starting ? '创建中…' : '拨测全部'}
+            {running ? '取消拨测' : probe.starting ? '创建中…' : scoped ? `拨测 ${listed.length} 个` : '拨测全部'}
           </button>
         </div>
-        <NodeNotes
-          notes={listing.notes}
-          insecureCount={insecureCount}
-          probeIssue={probeIssue}
-          onAllowInsecure={onAllowInsecure}
-          onUseSubscription={onUseSubscription}
-        />
-        {view === 'raw' ? (
-          <div className="cfg-code node-raw">
-            <div className="lnum">{lines.map((_, index) => index + 1).join('\n')}</div>
-            <pre className="cd">{lines.join('\n')}</pre>
-          </div>
-        ) : groups.length === 0 ? (
-          <div className="node-empty">没有符合当前协议与地址族的节点</div>
-        ) : (
-          <NodeMatrix
-            groups={groups}
-            slots={slots}
-            probeOf={probeOf.size > 0 ? probeOf : null}
-            groupProbe={probeOf.size > 0 ? groupProbe : undefined}
+        <div className={`node-list${slots.length < 2 ? ' single' : ''}`} ref={listRef}>
+          <NodeNotes
+            notes={listing.notes}
+            insecureCount={insecureCount}
+            probeIssue={probeIssue}
+            onAllowInsecure={onAllowInsecure}
+            onUseSubscription={onUseSubscription}
           />
-        )}
+          {job && (jobItems.length > 0 || jobNote) && (
+            <p className="node-probe-tally" role="status" title={job.message ?? undefined}>
+              {jobNote && <b>{jobNote}</b>}
+              {`通过 ${count('passed')} · 运行 ${count('running')} · 等待 ${count('waiting')} · 失败 ${failedIds.length}`}
+            </p>
+          )}
+          {slots.length > 1 && (
+            <div className="node-matrix-head" aria-hidden="true">
+              <span />
+              {slots.map(slot => (
+                <span key={slot}>{NODE_FAMILY_LABEL[slot]}</span>
+              ))}
+            </div>
+          )}
+          {visibleGroups.length === 0 ? (
+            <div className="node-empty">没有符合当前协议与地址族的节点</div>
+          ) : (
+            sections.map(section => (
+              <section key={current === 'all' ? nodeRegionKey(section.region) : 'scope'} className="node-region">
+                {current === 'all' && (
+                  <header className="node-region-head">
+                    <RegionFlag code={section.region} />
+                    <b>{nodeRegionName(section.region)}</b>
+                    <small>{section.groups.length} 条线路</small>
+                  </header>
+                )}
+                <NodeMatrix
+                  groups={section.groups}
+                  slots={slots}
+                  probeOf={probeOf.size > 0 ? probeOf : null}
+                  groupProbe={probeOf.size > 0 ? groupProbe : undefined}
+                />
+              </section>
+            ))
+          )}
+        </div>
       </div>
-      <footer className="sub-dialog-foot">
-        <span>修订 {content.data.revision}</span>
-        <span>更换 UUID 后全部节点链接失效</span>
-        {probe.ready && <span title="每项拨测会产生极小真实流量">拨测使用真实凭据，流量计入该用户用量</span>}
-        {job && jobItems.length > 0 && (
-          <span className="node-probe-tally" title={job.message ?? undefined}>
-            {jobNote && <b>{jobNote}</b>}
-            {`通过 ${count('passed')} · 运行 ${count('running')} · 等待 ${count('waiting')} · 失败 ${failedIds.length}`}
-          </span>
-        )}
-      </footer>
-    </>
+    </div>
+  );
+}
+
+const NODE_FAMILIES: NodeFamily[] = ['ipv4', 'ipv6'];
+const NODE_REGION_NAMES = new Intl.DisplayNames(['zh-Hans'], { type: 'region', style: 'short' });
+const nodeRegionKey = (region: string | null) => region ?? 'other';
+const nodeRegionName = (region: string | null) =>
+  region === 'CN' ? '中国大陆' : region ? (NODE_REGION_NAMES.of(region) ?? region) : '其他';
+
+function NodeScope({
+  active,
+  label,
+  count,
+  icon,
+  region,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  count: number;
+  icon?: IconName;
+  region?: string | null;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`node-scope${icon === 'warn' ? ' bad' : ''}`}
+      aria-current={active || undefined}
+      aria-label={`${label} ${count}`}
+      onClick={onClick}
+    >
+      <span className="node-scope-icon" aria-hidden="true">
+        {icon ? <Icon of={icon} size={14} /> : <RegionFlag code={region} />}
+      </span>
+      <span className="node-scope-name">{label}</span>
+      <span className="node-scope-count">{count}</span>
+    </button>
   );
 }
 
@@ -1063,8 +1124,7 @@ function NodeNotes({
   );
 }
 
-/* 一条链一组；一种协议一行，IPv4 / IPv6 各一列，地址本身就是复制按钮，缺少的地址族画「—」。
- * 只选一个地址族时只剩一列。有拨测计划时组头右侧是这一组的结果与「拨测」，地址前是状态灯。 */
+/* 一条线路一组，一种协议一行；仅为实际存在的地址族留列，完整地址就是复制按钮。 */
 function NodeMatrix({
   groups,
   slots,
@@ -1077,13 +1137,7 @@ function NodeMatrix({
   groupProbe?: (group: NodeGroup) => ReactNode;
 }) {
   return (
-    <div className={`node-matrix${slots.length === 1 ? ' single' : ''}`}>
-      <div className="node-matrix-head" aria-hidden="true">
-        <span />
-        {slots.map(slot => (
-          <span key={slot}>{NODE_FAMILY_LABEL[slot]}</span>
-        ))}
-      </div>
+    <div className="node-matrix">
       {groups.map(group => (
         <section className="node-group" key={group.key} aria-label={group.name}>
           <div className="node-group-head">
@@ -1094,6 +1148,7 @@ function NodeMatrix({
           {group.rows.map(row => (
             <div className="node-row" key={row.key}>
               <span className="node-protocol">
+                <Icon of={NODE_PROTOCOL_ICON[row.protocol]} size={13} />
                 <b>{NODE_PROTOCOL_LABEL[row.protocol]}</b>
                 <span>{row.stack}</span>
                 {row.insecure && <em>insecure</em>}
@@ -1117,8 +1172,7 @@ function NodeMatrix({
   );
 }
 
-const PROBE_LAMP: Record<GrantProbeItemStatus | 'idle', string> = {
-  idle: 'idle',
+const PROBE_LAMP: Record<GrantProbeItemStatus, string> = {
   waiting: 'defer',
   running: 'run',
   passed: 'ok',
@@ -1137,15 +1191,9 @@ function NodeAddress({
   family: NodeFamily;
   probe?: ProbeItem | null;
 }) {
-  if (!link) {
-    return (
-      <span className="node-copy-gap" aria-hidden="true">
-        —
-      </span>
-    );
-  }
+  if (!link) return <span className="node-copy-gap" aria-hidden="true" />;
   const familyLabel = NODE_FAMILY_LABEL[family];
-  // 主机与端口分开排：长 IPv6 只截主机部分，端口始终可见。
+  // 主机允许换行，端口保持完整；长 IPv6 与端口段也不会被截断。
   const [, host, port = ''] = /^(.*?)(:\d+(?:-\d+)?)?$/.exec(link.endpoint) ?? [link.endpoint, link.endpoint];
   const status = probe ? probeStatusText(probe) : '';
   const failure = probe?.status === 'failed' ? probe.detail || '失败' : null;
@@ -1162,7 +1210,7 @@ function NodeAddress({
           <i className="node-copy-family">{familyLabel}</i>
           {probe !== undefined && (
             <span
-              className={`node-copy-lamp${probe ? ` cg-lamp ${PROBE_LAMP[probe.status ?? 'idle']}` : ''}`}
+              className={`node-copy-lamp${probe?.status ? ` cg-lamp ${PROBE_LAMP[probe.status]}` : ''}`}
               aria-hidden="true"
             />
           )}

@@ -380,7 +380,7 @@ describe('subscription and node dialog', () => {
 
     await pick(view, '协议', 'Hysteria 2');
     await pick(view, '地址族', 'IPv4');
-    expect(view.getByRole('combobox', { name: '协议' }).textContent).toContain('Hysteria 2');
+    expect((await view.findByRole('combobox', { name: '协议' })).textContent).toContain('Hysteria 2');
     expect(view.getByRole('combobox', { name: '地址族' }).textContent).toContain('IPv4');
     // 一行里只露主机名与 Token 末四位：路径收成「…/」，筛选参数保持可读。
     expect(view.baseElement.querySelector('.sub-url-mask')?.textContent).toBe('••••');
@@ -479,7 +479,7 @@ describe('subscription and node dialog', () => {
       }),
     );
     const view = renderViewer('uri');
-    fireEvent.click(await view.findByRole('button', { name: 'MTProxy' }));
+    await pick(view, '协议', 'MTProxy');
     fireEvent.click(view.getByRole('tab', { name: '订阅' }));
     await view.findByRole('img', { name: 'Clash 订阅地址二维码' });
     expect(view.queryByRole('button', { name: 'MTProxy' })).toBeNull();
@@ -488,7 +488,7 @@ describe('subscription and node dialog', () => {
     expect(view.getByText(standardUrl)).toBeTruthy();
   });
 
-  it('uses dropdowns for node filters and a bottom sheet for the card fields on narrow screens', async () => {
+  it('uses shared bottom-sheet menus for node and subscription filters on narrow screens', async () => {
     stubViewport(true);
     vi.stubGlobal(
       'fetch',
@@ -504,9 +504,9 @@ describe('subscription and node dialog', () => {
 
     await view.findByRole('region', { name: '东京 IIJ' });
     expect(view.queryByRole('button', { name: 'Hysteria 2' })).toBeNull();
-    fireEvent.change(view.getByRole('combobox', { name: '协议' }), { target: { value: 'hysteria2' } });
-    fireEvent.change(view.getByRole('combobox', { name: '地址族' }), { target: { value: 'v4' } });
-    expect(view.baseElement.querySelector('.sub-pick-value')?.textContent).toBe('Hysteria 2');
+    await pick(view, '协议', 'Hysteria 2');
+    await pick(view, '地址族', 'IPv4');
+    expect((await view.findByRole('combobox', { name: '协议' })).textContent).toContain('Hysteria 2');
 
     fireEvent.click(view.getByRole('tab', { name: '订阅' }));
     const protocol = await view.findByRole('combobox', { name: '协议' });
@@ -569,9 +569,7 @@ describe('subscription and node dialog', () => {
         ),
       ).toBe(true),
     );
-    expect((view.getByRole('button', { name: 'Hysteria 2' }) as HTMLButtonElement).getAttribute('aria-pressed')).toBe(
-      'true',
-    );
+    expect((await view.findByRole('combobox', { name: '协议' })).textContent).toContain('Hysteria 2');
   });
 
   it('lists nodes per wire with one copy target per family and explains skipped entries first', async () => {
@@ -592,15 +590,21 @@ describe('subscription and node dialog', () => {
     const group = await view.findByRole('region', { name: '东京 IIJ' });
     expect(group.querySelectorAll('.node-row')).toHaveLength(3);
     expect(group.querySelector('.geo-flag')?.getAttribute('aria-label')).toBe('JP 地区旗');
-    expect(view.getByText('4')).toBeTruthy();
+    expect(view.getByRole('button', { name: '全部 4' })).toBeTruthy();
     expect(view.getByText(/已跳过：香港 CMI 换 Clash 目标即可/)).toBeTruthy();
 
     fireEvent.click(view.getByRole('button', { name: '复制 东京 IIJ | v6（IPv6）' }));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith(parseNodeListing(uriText).links[1].uri));
 
-    fireEvent.click(view.getByRole('button', { name: '原文' }));
-    // 弹窗经 portal 挂在 document.body 下，不在 view.container 之内。
-    expect(view.baseElement.querySelector('.node-raw .cd')?.textContent).toContain('# 以下条目带前置代理');
+    fireEvent.click(view.getByRole('button', { name: '复制全部' }));
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith(
+        parseNodeListing(uriText)
+          .links.map(link => link.uri)
+          .join('\n'),
+      ),
+    );
+    expect(view.baseElement.querySelector('.sub-dialog-foot, .sub-dialog-filter, .node-raw')).toBeNull();
 
     fireEvent.click(view.getByRole('button', { name: '改用订阅' }));
     expect(await view.findByRole('region', { name: 'Clash 订阅' })).toBeTruthy();
@@ -666,7 +670,7 @@ describe('subscription and node dialog', () => {
     await view.findByRole('region', { name: '东京 NTT' });
 
     // 切到 VLESS 不收回：VLESS 自签入口在服务端一律跳过，请求仍带 insecure。
-    fireEvent.click(view.getByRole('button', { name: 'VLESS' }));
+    await pick(view, '协议', 'VLESS');
     await waitFor(() =>
       expect(
         fetchMock.mock.calls.some(([input]) =>

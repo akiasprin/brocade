@@ -194,7 +194,7 @@ describe('network probe in the node tab', () => {
     await view.findByRole('region', { name: '伦敦入口' });
     const vless = address(view, '复制 伦敦入口（IPv4）');
     const hy2 = address(view, '复制 伦敦入口 | QUIC | v6（IPv6）');
-    expect(lampOf(vless)?.className).toBe('node-copy-lamp cg-lamp idle');
+    expect(lampOf(vless)?.className).toBe('node-copy-lamp');
     expect(vless.getAttribute('aria-description')).toBe('拨测：尚未验证');
     expect(vless.title).toBe('lon.example:443 · 复制分享链接\n拨测：尚未验证');
     // MTProxy 不是拨测项：留出同宽的空位，不画灯，也没有拨测描述。
@@ -203,7 +203,7 @@ describe('network probe in the node tab', () => {
     expect(mtproxy.hasAttribute('aria-description')).toBe(false);
     // 没有分享链接的条目只在说明里列出，不进列表。
     expect(view.getByText(/已跳过：香港 CMI 换 Clash 目标即可/)).toBeTruthy();
-    expect(view.getByText('拨测使用真实凭据，流量计入该用户用量').closest('footer')).toBeTruthy();
+    expect(view.getByRole('button', { name: '拨测全部' }).title).toContain('拨测流量计入该用户用量');
     expect(view.queryByText(/通过 \d+ · 运行/)).toBeNull();
 
     fireEvent.click(view.getByRole('button', { name: '拨测全部' }));
@@ -212,9 +212,9 @@ describe('network probe in the node tab', () => {
     expect(lampOf(hy2)?.className).toBe('node-copy-lamp cg-lamp ok');
     expect(vless.getAttribute('aria-description')).toBe('拨测：通过');
     expect(view.getByRole('region', { name: '伦敦入口' }).querySelector('.node-group-result')?.textContent).toBe(
-      '全部通过',
+      '通过',
     );
-    expect(view.getByText('通过 2 · 运行 0 · 等待 0 · 失败 0').closest('footer')).toBeTruthy();
+    expect(view.getByText('通过 2 · 运行 0 · 等待 0 · 失败 0').closest('[role="status"]')).toBeTruthy();
     // 拨测从控制台发起，首字节时延反映的是控制台到节点的距离，不显示。
     expect(view.baseElement.querySelector('.sub-dialog')?.textContent).not.toMatch(/\d\s*ms/);
     // 列出的条目就是计划的全部：空列表交给服务端表示全部，不在请求里带连接材料。
@@ -236,12 +236,100 @@ describe('network probe in the node tab', () => {
     const view = renderDialog();
 
     await view.findByRole('region', { name: '伦敦入口' });
-    fireEvent.click(view.getByRole('button', { name: 'Hysteria 2' }));
+    fireEvent.click(view.getByRole('combobox', { name: '协议' }));
+    fireEvent.click(view.getByRole('option', { name: 'Hysteria 2' }));
     await waitFor(() => expect(view.queryByRole('button', { name: '复制 伦敦入口（IPv4）' })).toBeNull());
     fireEvent.click(await view.findByRole('button', { name: '拨测全部' }));
 
     await waitFor(() => expect(posts(fetchMock)).toEqual([{ item_ids: ['g-friendly:ipv6:hysteria2'] }]));
     await view.findByText('通过 1 · 运行 0 · 等待 0 · 失败 0');
+  });
+
+  it('copies and probes only the selected region, including non-probe links in copying', async () => {
+    const writeText = vi.fn(async () => undefined);
+    vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
+    const fetchMock = probeFetch((path, init) => {
+      if (path === planPath && init?.method === 'POST')
+        return jsonResponse({
+          job: { ...finishedJob, items: [{ ...tokyo, status: 'passed', detail: null, ttfb_ms: null }] },
+          reused: false,
+        });
+      if (path === planPath) return jsonResponse({ ...plan, items: [...plan.items, tokyo] });
+      if (path === linkPath) return artifact(`${uriText}\n${tokyoLink}\n`);
+      return undefined;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const view = renderDialog();
+    await view.findByRole('region', { name: '东京入口' });
+    expect(view.getByRole('button', { name: '全部 4' }).getAttribute('aria-current')).toBe('true');
+    fireEvent.click(view.getByRole('button', { name: '英国 3' }));
+    expect(view.queryByRole('region', { name: '东京入口' })).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: '复制 3 个' }));
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith([vlessLink, hy2Link, mtproxyLink].join('\n')));
+    expect(view.getByRole('button', { name: '拨测 2 个' })).toBeTruthy();
+    fireEvent.click(view.getByRole('button', { name: '日本 1' }));
+    expect(view.queryByRole('region', { name: '伦敦入口' })).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: '复制 1 个' }));
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(tokyoLink));
+    fireEvent.click(view.getByRole('button', { name: '拨测 1 个' }));
+    await waitFor(() => expect(posts(fetchMock)).toEqual([{ item_ids: [tokyo.id] }]));
+    fireEvent.click(view.getByRole('button', { name: '全部 4' }));
+    expect(view.getByRole('region', { name: '伦敦入口' })).toBeTruthy();
+  });
+
+  it('shows only failed addresses and scopes failure copying and probing to those addresses', async () => {
+    const writeText = vi.fn(async () => undefined);
+    vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } });
+    const failedJob: GrantProbeJob = {
+      ...finishedJob,
+      items: [
+        { ...finishedJob.items[0], status: 'failed', detail: '握手超时' },
+        finishedJob.items[1],
+        { ...tokyo, status: 'failed', detail: '连接被拒绝', ttfb_ms: null },
+      ],
+    };
+    const fetchMock = probeFetch((path, init) => {
+      if (path === planPath && init?.method === 'POST') return jsonResponse({ job: failedJob, reused: false });
+      if (path === planPath) return jsonResponse({ ...plan, items: [...plan.items, tokyo] });
+      if (path === linkPath) return artifact(`${uriText}\n${tokyoLink}\n`);
+      return undefined;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const view = renderDialog();
+    await view.findByRole('region', { name: '东京入口' });
+    expect(view.queryByRole('button', { name: /^失败 \d/ })).toBeNull();
+    fireEvent.click(view.getByRole('button', { name: '拨测全部' }));
+    fireEvent.click(await view.findByRole('button', { name: '失败 2' }));
+    expect(view.queryByRole('button', { name: '复制 伦敦入口 | QUIC | v6（IPv6）' })).toBeNull();
+    expect(view.queryByRole('button', { name: '复制 伦敦入口 | MTProxy（IPv4）' })).toBeNull();
+    expect(view.getByText('握手超时')).toBeTruthy();
+    expect(view.getByText('连接被拒绝')).toBeTruthy();
+    fireEvent.click(view.getByRole('button', { name: '复制 2 个' }));
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith([vlessLink, tokyoLink].join('\n')));
+    fireEvent.click(view.getByRole('button', { name: '拨测 2 个' }));
+    await waitFor(() =>
+      expect(posts(fetchMock)).toEqual([{ item_ids: [] }, { item_ids: [plan.items[0].id, tokyo.id] }]),
+    );
+    fireEvent.click(view.getByRole('button', { name: '日本 1' }));
+    fireEvent.click(view.getByRole('button', { name: '重试失败项' }));
+    await waitFor(() => expect(posts(fetchMock).at(-1)).toEqual({ item_ids: [tokyo.id] }));
+  });
+
+  it('returns to all when a server filter removes the selected region', async () => {
+    const fetchMock = probeFetch(path => {
+      if (path.includes('protocol=hysteria2')) return artifact(`${hy2Link}\n`);
+      if (path === planPath) return jsonResponse({ ...plan, items: [...plan.items, tokyo] });
+      if (path === linkPath) return artifact(`${uriText}\n${tokyoLink}\n`);
+      return undefined;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const view = renderDialog();
+    fireEvent.click(await view.findByRole('button', { name: '日本 1' }));
+    fireEvent.click(view.getByRole('combobox', { name: '协议' }));
+    fireEvent.click(view.getByRole('option', { name: 'Hysteria 2' }));
+    await waitFor(() => expect(view.getByRole('button', { name: '全部 1' }).getAttribute('aria-current')).toBe('true'));
+    expect(view.queryByRole('button', { name: '日本 1' })).toBeNull();
+    expect(view.getByRole('region', { name: '伦敦入口' })).toBeTruthy();
   });
 
   it('probes one access point from its group head and keeps every other node on screen', async () => {
@@ -263,12 +351,12 @@ describe('network probe in the node tab', () => {
     await waitFor(() => expect(lampOf(address(view, '复制 伦敦入口（IPv4）'))?.className).toContain('ok'));
     expect(posts(fetchMock)).toEqual([{ item_ids: ['g-friendly:ipv4:vless', 'g-friendly:ipv6:hysteria2'] }]);
     const tokyoCell = address(view, '复制 东京入口（IPv4）');
-    expect(lampOf(tokyoCell)?.className).toBe('node-copy-lamp cg-lamp idle');
+    expect(lampOf(tokyoCell)?.className).toBe('node-copy-lamp');
     expect(tokyoCell.getAttribute('aria-description')).toBe('拨测：尚未验证');
     expect(view.getByRole('region', { name: '东京入口' }).querySelector('.node-group-result')).toBeNull();
   });
 
-  it('shows progress on the probe button, the failure reason under the address and the tally in the footer', async () => {
+  it('shows progress on the probe button, the failure reason under the address and the tally in the content pane', async () => {
     let emit: ((job: GrantProbeJob) => void) | null = null;
     let latest: GrantProbeJob | null = null;
     class ManualEventSource {
@@ -358,7 +446,7 @@ describe('network probe in the node tab', () => {
     expect(result?.classList.contains('bad')).toBe(true);
     expect(view.getByRole('button', { name: '拨测 伦敦入口' }).textContent).toBe('重试');
     expect(view.getByRole('button', { name: '拨测全部' }).classList.contains('node-probe-progress')).toBe(false);
-    expect(view.getByText('通过 1 · 运行 0 · 等待 0 · 失败 1').closest('footer')).toBeTruthy();
+    expect(view.getByText('通过 1 · 运行 0 · 等待 0 · 失败 1').closest('[role="status"]')).toBeTruthy();
     expect(view.baseElement.textContent).not.toContain('88ms');
 
     fireEvent.click(view.getByRole('button', { name: '重试失败项' }));
@@ -399,7 +487,7 @@ describe('network probe in the node tab', () => {
     expect(fetchMock.mock.calls.some(([input]) => String(input) === '/grant-probes/p-live')).toBe(true);
   });
 
-  it('explains a superseded round in the footer tally', async () => {
+  it('explains a superseded round in the content tally', async () => {
     const supersededJob: GrantProbeJob = {
       ...finishedJob,
       status: 'superseded',
@@ -561,7 +649,7 @@ describe('network probe in the node tab', () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(3_010);
       });
-      expect(lampOf(address(view, '复制 东京入口（IPv4）'))?.className).toBe('node-copy-lamp cg-lamp idle');
+      expect(lampOf(address(view, '复制 东京入口（IPv4）'))?.className).toBe('node-copy-lamp');
       await act(async () => {
         await vi.advanceTimersByTimeAsync(60_000);
       });
@@ -600,7 +688,7 @@ describe('probe items paired with node links', () => {
 
     await view.findByRole('region', { name: '伦敦入口' });
     expect(lampOf(address(view, '复制 伦敦入口（IPv4）'))?.className).toBe('node-copy-lamp');
-    expect(lampOf(address(view, '复制 伦敦入口 | QUIC | v6（IPv6）'))?.className).toBe('node-copy-lamp cg-lamp idle');
+    expect(lampOf(address(view, '复制 伦敦入口 | QUIC | v6（IPv6）'))?.className).toBe('node-copy-lamp');
   });
 
   it('pairs duplicate names in order when every entry has a link', async () => {
@@ -655,9 +743,7 @@ describe('probe items paired with node links', () => {
     const view = renderDialog();
 
     await view.findByRole('region', { name: '伦敦入口' });
-    expect(lampOf(address(view, '复制 伦敦入口 | VLESS Encryption（IPv4）'))?.className).toBe(
-      'node-copy-lamp cg-lamp idle',
-    );
+    expect(lampOf(address(view, '复制 伦敦入口 | VLESS Encryption（IPv4）'))?.className).toBe('node-copy-lamp');
     fireEvent.click(view.getByRole('button', { name: '拨测全部' }));
     await waitFor(() => expect(posts(fetchMock)).toEqual([{ item_ids: [] }]));
   });
