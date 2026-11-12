@@ -1,3 +1,4 @@
+import { subStoreTransport } from './substore-data';
 // Visual acceptance fixture: the production users pane with synthetic users only; no network access.
 // ?user=alice|carol|erin chooses the detail, ?role=system-admin|readonly|user the viewer, ?theme=dark|light,
 // ?presence=sources gives alice online and recent sources (one of them banned) instead of an empty presence.
@@ -298,9 +299,15 @@ const subscriptionResponse = (body: unknown) => {
     ? new Promise<Response>(resolve => pendingSubscriptions.push(() => resolve(response())))
     : response();
 };
+const connectorTransport = subStoreTransport(
+  params.get('substore') ?? 'empty',
+  !['readonly', 'publisher'].includes(role),
+);
 globalThis.fetch = async (input, init) => {
   const path = String(input);
   const url = new URL(path, location.origin);
+  const connectorResponse = await connectorTransport(url, init);
+  if (connectorResponse) return connectorResponse;
   if (url.pathname === '/users') return Response.json({ users });
   if (url.pathname === '/grants' && init?.method === 'POST') return Response.json({ revision_id: 2 });
   if (url.pathname === '/model/snapshot')

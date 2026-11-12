@@ -5996,3 +5996,100 @@ export async function fetchChainUnlockProbes(after?: string, signal?: AbortSigna
   }
   return page;
 }
+
+// User-scoped Sub-Store connector. Secret inputs are write-only; tasks live on the server.
+export interface SubStoreConfig {
+  version: number;
+  host: string;
+  title: string;
+  auth: boolean;
+  login: string;
+  has_password: boolean;
+  auto: boolean;
+  registered: boolean;
+  verified: boolean;
+  last_confirmed: string | null;
+  next_check: string | null;
+  source_version: number | null;
+}
+export interface SubStoreWrite {
+  version: number;
+  endpoint?: string;
+  title: string;
+  auth: boolean;
+  login: string;
+  password?: string;
+  auto: boolean;
+}
+export interface SubStoreEvent {
+  name: string;
+  checkpoint: number;
+  state: string;
+  ms: number | null;
+  http: number | null;
+  detail: string | null;
+}
+export interface SubStoreAttempt {
+  number: number;
+  status: string;
+  events: SubStoreEvent[];
+}
+export interface SubStoreRun {
+  id: number;
+  kind: 'sync' | 'verify' | 'inspect' | 'cleanup';
+  status: string;
+  trigger: string;
+  actor: string;
+  config_version: number;
+  source_version: number | null;
+  started_at: string;
+  ended_at: string | null;
+  duration_ms: number | null;
+  parent: number | null;
+  attempts: SubStoreAttempt[];
+  error: string | null;
+  output_count: number | null;
+}
+export interface SubStoreView {
+  writable: boolean;
+  version: number;
+  config: SubStoreConfig | null;
+  inactive: boolean;
+  active: SubStoreRun | null;
+  latest: SubStoreRun | null;
+}
+export interface SubStoreRunPage {
+  runs: SubStoreRun[];
+  next: number | null;
+}
+const subStorePath = (tenant: string, user: string) =>
+  `/users/${encodeURIComponent(tenant)}/${encodeURIComponent(user)}/subscription-connectors/sub-store`;
+export const fetchSubStore = (tenant: string, user: string, signal?: AbortSignal) =>
+  api<SubStoreView>(subStorePath(tenant, user), '', { signal });
+export const saveSubStore = (tenant: string, user: string, body: SubStoreWrite) =>
+  req<SubStoreView>(subStorePath(tenant, user), { method: 'PUT', body: JSON.stringify(body) });
+export const removeSubStore = (tenant: string, user: string) =>
+  req<SubStoreView>(subStorePath(tenant, user), { method: 'DELETE' });
+export const testSubStore = (tenant: string, user: string, body: SubStoreWrite) =>
+  req<{ ok: boolean }>(`${subStorePath(tenant, user)}/test`, { method: 'POST', body: JSON.stringify(body) });
+export const startSubStore = (tenant: string, user: string, kind: 'sync' | 'verify' | 'cleanup', parent?: number) =>
+  req<{ id: number }>(`${subStorePath(tenant, user)}/${parent ? `runs/${parent}/retry` : kind}`, {
+    method: 'POST',
+    body: '{}',
+  });
+export const fetchSubStoreRuns = (
+  tenant: string,
+  user: string,
+  before?: number,
+  notable = false,
+  signal?: AbortSignal,
+) =>
+  api<SubStoreRunPage>(
+    `${subStorePath(tenant, user)}/runs?notable=${notable}${before ? `&before=${before}` : ''}`,
+    '',
+    { signal },
+  );
+export const fetchSubStoreRun = (tenant: string, user: string, id: number, signal?: AbortSignal) =>
+  api<SubStoreRun>(`${subStorePath(tenant, user)}/runs/${id}`, '', { signal });
+export const cancelSubStoreRun = (tenant: string, user: string, id: number) =>
+  req<SubStoreRun>(`${subStorePath(tenant, user)}/runs/${id}`, { method: 'DELETE' });

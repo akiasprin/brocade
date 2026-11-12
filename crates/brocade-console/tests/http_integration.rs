@@ -11833,3 +11833,6 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
 #[cfg(feature = "cvm")]
 #[path = "cases/cvm_terminal.rs"]
 mod cvm_terminal_cases;
+
+#[path = "cases/substore.rs"]
+mod substore_cases;

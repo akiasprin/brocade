@@ -392,6 +392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // durable in PostgreSQL; this process is only a leased executor, so restart and multi-instance
     // deployments cannot duplicate a check.
     brocade_console::tunnel_probe::spawn(store.clone());
+    brocade_console::substore::spawn(store.clone(), agent_origin.clone(), shutdown.clone());
 
     // Which of the two sources the front end comes from is the same decision on both listener
     // layouts, so it is made once here rather than at each of the two call sites — where the two

@@ -78,6 +78,12 @@ async fn offline_upgrade_rejects_empty_databases_and_checks_initialized_schema()
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(identities.len(), 5);
+    assert_eq!(
+        identities
+            .iter()
+            .map(|(version, _)| *version)
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6]
+    );
     pool.close().await;
 }

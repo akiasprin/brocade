@@ -2294,17 +2294,6 @@ function UserList({
               <button
                 type="button"
                 className="btn user-dact title-action-compact"
-                aria-label="节点"
-                disabled={!canOpenSubscription}
-                title="打开该用户的节点链接：复制分享链接、拨测当前授权，可选择协议与地址族"
-                onClick={() => setSub({ user: u, kind: 'uri' })}
-              >
-                <Icon of="client" size={14} className="user-dact-icon" />
-                <span className="user-dact-label title-action-label">节点</span>
-              </button>
-              <button
-                type="button"
-                className="btn user-dact title-action-compact"
                 aria-label="订阅"
                 disabled={!canOpenSubscription}
                 title="打开 Clash 订阅，可选择协议与地址族"
@@ -2312,6 +2301,17 @@ function UserList({
               >
                 <Icon of="subscription" size={14} className="user-dact-icon" />
                 <span className="user-dact-label title-action-label">订阅</span>
+              </button>
+              <button
+                type="button"
+                className="btn user-dact title-action-compact"
+                aria-label="节点"
+                disabled={!canOpenSubscription}
+                title="打开该用户的节点链接：复制分享链接、拨测当前授权，可选择协议与地址族"
+                onClick={() => setSub({ user: u, kind: 'uri' })}
+              >
+                <Icon of="nodeLinks" size={14} className="user-dact-icon" />
+                <span className="user-dact-label title-action-label">节点</span>
               </button>
 
               <div className="fg-menuwrap user-action-menuwrap">
