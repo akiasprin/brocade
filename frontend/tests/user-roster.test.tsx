@@ -733,7 +733,7 @@ describe('user roster rows', () => {
       [...header().querySelectorAll('.user-dhead-tools button')].map(
         button => button.getAttribute('aria-label') ?? button.textContent,
       ),
-    ).toEqual(['节点', '订阅', '更多操作']);
+    ).toEqual(['订阅', '节点', '更多操作']);
     const status = within(header()).getByRole('status', { name: /可用/ });
     expect(status.textContent).toBe('可用');
     expect(status.getAttribute('title')).toContain('个接入点');

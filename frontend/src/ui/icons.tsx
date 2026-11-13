@@ -203,12 +203,26 @@ const PATHS = {
       <path d="M5.7 8 H10.3" />
     </>
   ),
-  /* 订阅源：圆点和两级扩散弧沿用 feed 的通用语义。 */
+  /* 订阅二维码：三个定位角和数据点，对应扫码导入订阅。 */
   subscription: (
     <>
-      <circle cx="3.5" cy="12.5" r="1" fill="currentColor" stroke="none" />
-      <path d="M3 7.5 A5.5 5.5 0 0 1 8.5 13" />
-      <path d="M3 3 A10 10 0 0 1 13 13" />
+      <rect x="2.4" y="2.4" width="4.2" height="4.2" rx="1.1" />
+      <rect x="9.4" y="2.4" width="4.2" height="4.2" rx="1.1" />
+      <rect x="2.4" y="9.4" width="4.2" height="4.2" rx="1.1" />
+      <circle cx="9.7" cy="9.7" r="0.9" fill="currentColor" stroke="none" />
+      <circle cx="13.3" cy="9.7" r="0.9" fill="currentColor" stroke="none" />
+      <circle cx="11.5" cy="11.5" r="0.9" fill="currentColor" stroke="none" />
+      <circle cx="9.7" cy="13.3" r="0.9" fill="currentColor" stroke="none" />
+      <circle cx="13.3" cy="13.3" r="0.9" fill="currentColor" stroke="none" />
+    </>
+  ),
+  /* 节点地址清单：每行由状态灯和地址组成，与客户端屏幕 client 区分。 */
+  nodeLinks: (
+    <>
+      <circle cx="3.1" cy="3.9" r="1.1" fill="currentColor" stroke="none" />
+      <circle cx="3.1" cy="8" r="1.1" fill="currentColor" stroke="none" />
+      <circle cx="3.1" cy="12.1" r="1.1" fill="currentColor" stroke="none" />
+      <path d="M6.2 3.9 H13.5 M6.2 8 H13.5 M6.2 12.1 H13.5" />
     </>
   ),
   /* 顶栏功能菜单：短而细的错落横线，保持菜单语义，同时不在紧凑按钮里形成粗重色块。 */

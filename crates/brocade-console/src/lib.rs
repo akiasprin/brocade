@@ -22,3 +22,5 @@ mod warp;
 mod cvm;
 
 pub mod product;
+
+pub mod substore;

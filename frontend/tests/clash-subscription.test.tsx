@@ -17,7 +17,7 @@ const subscriptionInfo = () => ({
   urls: urls(standardUrl),
   template: 'SubBoost 标准版',
   haitun: {
-    template: 'koipy 测速',
+    template: 'Koipy 测速',
     status: 'not-created',
     urls: null,
     created_at: null,
@@ -181,13 +181,13 @@ describe('node link listing', () => {
 });
 
 describe('subscription and node dialog', () => {
-  it('keeps koipy on a second card, revokes in two steps and generates only on a separate action', async () => {
+  it('keeps Koipy on a second card, revokes in two steps and generates only on a separate action', async () => {
     const replacementUrl = haitunUrl.replace('f98b74ba', 'a98b74ba');
     let generations = 0;
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       if (init?.method === 'POST') {
         return jsonResponse({
-          template: 'koipy 测速',
+          template: 'Koipy 测速',
           status: 'active',
           urls: urls(++generations === 1 ? haitunUrl : replacementUrl),
           created_at: '2026-08-28 12:00:00+00',
@@ -203,10 +203,10 @@ describe('subscription and node dialog', () => {
     const view = renderViewer('clash');
 
     // 测速订阅是后面那张卡：只露出卡头的名称与状态，点一下换到前面。
-    const peek = await view.findByRole('button', { name: '切换到 koipy 测速订阅（尚未生成）' });
+    const peek = await view.findByRole('button', { name: '切换到 Koipy 测速订阅（尚未生成）' });
     expect(view.getByTitle('模板 SubBoost 标准版')).toBeTruthy();
     fireEvent.click(peek);
-    expect(view.getByRole('region', { name: 'koipy 测速订阅' })).toBeTruthy();
+    expect(view.getByRole('region', { name: 'Koipy 测速订阅' })).toBeTruthy();
     expect(view.queryByRole('region', { name: 'Clash 订阅' })).toBeNull();
     expect(view.getByText('尚未生成')).toBeTruthy();
     expect(view.getByText('暂无地址')).toBeTruthy();
@@ -223,9 +223,9 @@ describe('subscription and node dialog', () => {
     // 生成时间是 PostgreSQL 的 timestamptz::text，按 UTC+8 只写日期。
     expect(view.getByText('生成于')).toBeTruthy();
     expect(view.getByText(/^(?:2026\/)?8\/28$/)).toBeTruthy();
-    expect(view.getByRole('img', { name: 'koipy 测速地址二维码' })).toBeTruthy();
+    expect(view.getByRole('img', { name: 'Koipy 测速地址二维码' })).toBeTruthy();
     expect(view.queryByText(haitunUrl)).toBeNull();
-    fireEvent.click(view.getByRole('button', { name: '显示 koipy 测速地址' }));
+    fireEvent.click(view.getByRole('button', { name: '显示 Koipy 测速地址' }));
     expect(view.getByText(haitunUrl)).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledWith(
       '/users/platform.acme/alice/clash-subscription/haitun',
@@ -247,12 +247,12 @@ describe('subscription and node dialog', () => {
     await waitFor(() => expect(view.queryByText(haitunUrl)).toBeNull());
     await view.findByText('已撤销');
     expect(view.getByText('撤销于')).toBeTruthy();
-    expect(view.queryByRole('button', { name: '显示 koipy 测速地址' })).toBeNull();
+    expect(view.queryByRole('button', { name: '显示 Koipy 测速地址' })).toBeNull();
     expect(generations).toBe(1);
     fireEvent.click(view.getByRole('button', { name: '重新生成测速地址' }));
     await view.findByRole('button', { name: '撤销测速地址' });
     expect(view.queryByText(replacementUrl)).toBeNull();
-    fireEvent.click(view.getByRole('button', { name: '显示 koipy 测速地址' }));
+    fireEvent.click(view.getByRole('button', { name: '显示 Koipy 测速地址' }));
     expect(view.getByText(replacementUrl)).toBeTruthy();
     // 换回订阅卡：订阅地址没有被测速订阅的生成与撤销改动。
     fireEvent.click(view.getByRole('button', { name: '切换到 Clash 订阅' }));
@@ -274,7 +274,7 @@ describe('subscription and node dialog', () => {
       }),
     );
     const view = renderViewer('clash');
-    fireEvent.click(await view.findByRole('button', { name: '切换到 koipy 测速订阅（可用）' }));
+    fireEvent.click(await view.findByRole('button', { name: '切换到 Koipy 测速订阅（可用）' }));
     fireEvent.click(view.getByRole('button', { name: '撤销测速地址' }));
     const armed = view.getByRole('button', { name: '确认撤销测速地址' });
     expect(armed.textContent).toBe('确认撤销');
@@ -282,25 +282,25 @@ describe('subscription and node dialog', () => {
     expect(view.getByRole('button', { name: '撤销测速地址' }).textContent).toBe('撤销');
   });
 
-  it.each([false, true])('hides koipy when the server denies access (self-service: %s)', async selfService => {
+  it.each([false, true])('hides Koipy when the server denies access (self-service: %s)', async selfService => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => jsonResponse({ ...subscriptionInfo(), haitun: null })),
     );
     const view = renderViewer('clash', selfService);
     await view.findByRole('region', { name: 'Clash 订阅' });
-    expect(view.queryByText('koipy 测速订阅')).toBeNull();
-    expect(view.queryByRole('button', { name: /koipy/ })).toBeNull();
+    expect(view.queryByText('Koipy 测速订阅')).toBeNull();
+    expect(view.queryByRole('button', { name: /Koipy/ })).toBeNull();
   });
 
-  it('does not expose cached administrator koipy data in the self-service dialog', async () => {
+  it('does not expose cached administrator Koipy data in the self-service dialog', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => jsonResponse(subscriptionInfo())),
     );
     const view = renderViewer('clash', true);
     await view.findByRole('region', { name: 'Clash 订阅' });
-    expect(view.queryByText('koipy 测速订阅')).toBeNull();
+    expect(view.queryByText('Koipy 测速订阅')).toBeNull();
   });
 
   it('keeps the previous address and permits retry if revocation fails', async () => {
@@ -316,8 +316,8 @@ describe('subscription and node dialog', () => {
       }),
     );
     const view = renderViewer('clash');
-    fireEvent.click(await view.findByRole('button', { name: '切换到 koipy 测速订阅（可用）' }));
-    fireEvent.click(view.getByRole('button', { name: '显示 koipy 测速地址' }));
+    fireEvent.click(await view.findByRole('button', { name: '切换到 Koipy 测速订阅（可用）' }));
+    fireEvent.click(view.getByRole('button', { name: '显示 Koipy 测速地址' }));
     fireEvent.click(view.getByRole('button', { name: '撤销测速地址' }));
     fireEvent.click(view.getByRole('button', { name: '确认撤销测速地址' }));
     await view.findByText(/revocation failed/);
@@ -341,6 +341,8 @@ describe('subscription and node dialog', () => {
     let reads = 0;
     let readSignal: AbortSignal | null | undefined;
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(_input).includes('/subscription-connectors/'))
+        return jsonResponse({ writable: true, version: 0, config: null, inactive: false, active: null, latest: null });
       if (init?.method === 'DELETE') return revocation;
       if (++reads === 1) return jsonResponse(info);
       readSignal = init?.signal;
@@ -348,7 +350,7 @@ describe('subscription and node dialog', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
     const view = renderViewer('clash');
-    fireEvent.click(await view.findByRole('button', { name: '切换到 koipy 测速订阅（可用）' }));
+    fireEvent.click(await view.findByRole('button', { name: '切换到 Koipy 测速订阅（可用）' }));
     const revoke = await view.findByRole('button', { name: '撤销测速地址' });
     const refreshing = view.client.refetchQueries({ queryKey: ['clash-subscription'] });
     await waitFor(() => expect(reads).toBe(2));
@@ -365,7 +367,7 @@ describe('subscription and node dialog', () => {
     completeRead(jsonResponse(info));
     await refreshing;
     await view.findByText('已撤销');
-    expect(view.queryByRole('button', { name: '显示 koipy 测速地址' })).toBeNull();
+    expect(view.queryByRole('button', { name: '显示 Koipy 测速地址' })).toBeNull();
     expect(view.queryByText(haitunUrl)).toBeNull();
   });
 
@@ -442,7 +444,7 @@ describe('subscription and node dialog', () => {
       expect(view.baseElement.querySelector('.sub-url-mask')).not.toBeNull();
       expect(view.queryByText(standardUrl)).toBeNull();
       expect(view.getByRole('button', { name: '下载二维码' })).toBeTruthy();
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     },
   );
 

@@ -1106,7 +1106,7 @@ async fn constant_app_speed_new_migration_preserves_restored_existing_database_a
             .await
             .unwrap()
             .pending_versions,
-        [4, 5]
+        [4, 5, 6]
     );
     sqlx::query("CREATE TABLE user_app_rate_limits(conflict TEXT)")
         .execute(db.pool())

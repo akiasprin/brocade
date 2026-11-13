@@ -1,5 +1,15 @@
+import { SubscriptionLogo } from './subscription-logo';
+import {
+  SubStoreShell,
+  SubStoreContent,
+  SubStoreTicket,
+  SubStoreActions,
+  SubscriptionTicketPeeks,
+  type SubStoreNavigationGuard,
+} from './subscription-substore';
 import {
   useEffect,
+  useCallback,
   useId,
   useRef,
   useState,
@@ -70,7 +80,7 @@ const FAMILY_DETAIL: Partial<Record<FamilyPick, string>> = { both: 'IPv4 · IPv6
 
 const TABS: { value: SubscriptionKind; label: string; icon: IconName }[] = [
   { value: 'clash', label: '订阅', icon: 'subscription' },
-  { value: 'uri', label: '节点', icon: 'client' },
+  { value: 'uri', label: '节点', icon: 'nodeLinks' },
 ];
 
 /* 两个页签各自渲染正文；正文元素是当前页签对应的 tabpanel。 */
@@ -103,6 +113,10 @@ export function SubscriptionViewer({
   onClose: () => void;
 }) {
   const [tab, setTab] = useState<SubscriptionKind>(kind);
+  const navigationGuard = useRef<SubStoreNavigationGuard | null>(null);
+  const registerGuard = useCallback((guard: SubStoreNavigationGuard | null) => {
+    navigationGuard.current = guard;
+  }, []);
   const [protocol, setProtocol] = useState<ProtocolPick>('both');
   const [family, setFamily] = useState<FamilyPick>('both');
   // 默认列出自签证书节点（带 insecure 标记），节点页签的说明行里可以改为不列出。切到 VLESS 不收回：
@@ -113,8 +127,11 @@ export function SubscriptionViewer({
   const panel: TabPanelProps = { role: 'tabpanel', id: `${ids}-panel`, 'aria-labelledby': tabId(tab) };
 
   const changeTab = (next: SubscriptionKind) => {
-    if (next === 'clash' && protocol === 'mtproto') setProtocol('both');
-    setTab(next);
+    const go = () => {
+      if (next === 'clash' && protocol === 'mtproto') setProtocol('both');
+      setTab(next);
+    };
+    if (!navigationGuard.current || navigationGuard.current(go)) go();
   };
 
   // 与机器详情页签相同：左右方向键、Home / End 在两个页签之间移动并切换。
@@ -133,7 +150,11 @@ export function SubscriptionViewer({
   };
 
   return (
-    <DialogLayer label={`${user} 的订阅与节点`} onClose={onClose}>
+    <DialogLayer
+      label={`${user} 的订阅与节点`}
+      onClose={onClose}
+      canClose={() => navigationGuard.current?.(onClose) ?? true}
+    >
       <section className={`dialog-surface sub-dialog${tab === 'clash' ? ' sub-dialog-subscription' : ''}`}>
         <header className="sub-dialog-head">
           {identity}
@@ -170,6 +191,7 @@ export function SubscriptionViewer({
             tenant={tenant}
             user={user}
             selfService={selfService}
+            onGuard={registerGuard}
             protocol={protocol}
             family={family}
             onProtocol={setProtocol}
@@ -281,10 +303,10 @@ function FilterPick<T extends string>({
 
 /* ── 订阅 ──
  * 订阅画成一张卡券：卡头是名称与重置时间，大字是剩余流量，协议与地址族是卡上的两个栏位，撕线下是二维码与
- * 遮罩后的地址。二维码一律白底黑码：反色码不是每个扫码器都认，暗色主题下也不反。管理员的 koipy 测速订阅是
+ * 遮罩后的地址。二维码一律白底黑码：反色码不是每个扫码器都认，暗色主题下也不反。管理员的 Koipy 测速订阅是
  * 叠在后面的同版式第二张卡，点露出的卡头换到前面；两张卡共用筛选，地址都取服务端返回的筛选后 URL。 */
 
-type PassCard = 'clash' | 'haitun';
+type PassCard = 'clash' | 'haitun' | 'substore';
 
 const HAITUN_STATUS: Record<ClashHaitunSubscriptionInfo['status'], string> = {
   active: '可用',
@@ -302,6 +324,7 @@ function ClashSubscription({
   tenant,
   user,
   selfService,
+  onGuard,
   protocol,
   family,
   onProtocol,
@@ -311,6 +334,7 @@ function ClashSubscription({
   tenant: string;
   user: string;
   selfService: boolean;
+  onGuard: (guard: SubStoreNavigationGuard | null) => void;
   protocol: ProtocolPick;
   family: FamilyPick;
   onProtocol: (value: ProtocolPick) => void;
@@ -344,22 +368,13 @@ function ClashSubscription({
     onSuccess: updateHaitun,
   });
 
-  if (subscription.isPending || subscription.error) {
-    return (
-      <div className="sub-dialog-body" {...panel}>
-        {subscription.error ? <ErrorBox error={subscription.error} /> : <Loading variant="code" />}
-      </div>
-    );
-  }
-
   const value = subscription.data;
-  const standardUrl = withSubscriptionProtocol(value.urls[family], protocol);
-  const haitun = selfService ? null : value.haitun;
+  const standardUrl = value ? withSubscriptionProtocol(value.urls[family], protocol) : null;
+  const haitun = selfService ? null : (value?.haitun ?? null);
   const haitunUrl =
     haitun?.status === 'active' && haitun.urls ? withSubscriptionProtocol(haitun.urls[family], protocol) : null;
   const actionError = issueHaitun.error ?? revokeHaitun.error;
   const haitunPending = issueHaitun.isPending || revokeHaitun.isPending;
-  const back: PassCard = front === 'clash' ? 'haitun' : 'clash';
   const fields = <PassFields protocol={protocol} family={family} onProtocol={onProtocol} onFamily={onFamily} />;
   const copyContent = (state: CopyState, label: string) => (
     <>
@@ -369,105 +384,100 @@ function ClashSubscription({
   );
 
   return (
-    <div className="sub-dialog-body sub-subscription-body" {...panel}>
-      <div className={`sub-pass-stack${haitun ? ' has-back' : ''}${swapped ? ' swapped' : ''}`}>
-        {haitun && (
-          // 后面那张卡只露出卡头：名称和一个读数，点一下换到前面。
-          <button
-            type="button"
-            className="sub-pass-peek"
-            aria-label={
-              back === 'haitun' ? `切换到 koipy 测速订阅（${HAITUN_STATUS[haitun.status]}）` : '切换到 Clash 订阅'
-            }
-            onClick={() => {
-              setFront(back);
-              setSwapped(true);
-            }}
-          >
-            <PassLogo card={back} small />
-            <b>{back === 'haitun' ? 'koipy 测速订阅' : 'Clash 订阅'}</b>
-            <span className="sub-pass-peek-end">
-              {back === 'haitun' ? (
-                <span className="sub-pass-status" data-status={haitun.status}>
-                  {HAITUN_STATUS[haitun.status]}
-                </span>
+    <SubStoreShell tenant={tenant} user={user} onGuard={onGuard} panel={panel}>
+      <SubStoreContent>
+        {available => (
+          <div className="sub-dialog-body sub-subscription-body" {...panel}>
+            <div
+              className={`sub-pass-stack${haitun || available ? ' has-back' : ''}${haitun && available ? ' substore-two-backs' : ''}${swapped ? ' swapped' : ''}`}
+            >
+              <SubscriptionTicketPeeks
+                front={front}
+                haitun={haitun}
+                value={value}
+                onSelect={next => {
+                  setFront(next);
+                  setSwapped(true);
+                }}
+              />
+              {front === 'substore' ? (
+                <SubStoreTicket />
+              ) : haitun && front === 'haitun' ? (
+                <HaitunPass haitun={haitun} url={haitunUrl} fields={fields} />
+              ) : value && standardUrl ? (
+                <ClashPass value={value} url={standardUrl} qrRef={qrRef} fields={fields} />
               ) : (
-                `剩余 ${remainingText(value.remaining_bytes)}`
+                <div className="sub-pass substore-unavailable">
+                  {subscription.error ? <ErrorBox error={subscription.error} /> : <Loading variant="code" />}
+                </div>
               )}
-            </span>
-          </button>
-        )}
-        {haitun && front === 'haitun' ? (
-          <HaitunPass haitun={haitun} url={haitunUrl} fields={fields} />
-        ) : (
-          <ClashPass value={value} url={standardUrl} qrRef={qrRef} fields={fields} />
-        )}
-      </div>
-      {haitun && front === 'haitun' ? (
-        <>
-          <div className="sub-pass-actions">
-            {haitunUrl ? (
+            </div>
+            {front === 'substore' ? (
+              <SubStoreActions />
+            ) : haitun && front === 'haitun' ? (
               <>
-                <CopyButton className="btn primary sub-pass-main" text={haitunUrl} label="复制测速地址">
+                <div className="sub-pass-actions">
+                  {haitunUrl ? (
+                    <>
+                      <CopyButton className="btn primary sub-pass-main" text={haitunUrl} label="复制测速地址">
+                        {copyContent}
+                      </CopyButton>
+                      <RevokeButton
+                        pending={revokeHaitun.isPending}
+                        disabled={haitunPending}
+                        onRevoke={() => {
+                          issueHaitun.reset();
+                          revokeHaitun.mutate();
+                        }}
+                      />
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn primary sub-pass-main"
+                      disabled={haitunPending}
+                      onClick={() => {
+                        revokeHaitun.reset();
+                        issueHaitun.mutate();
+                      }}
+                    >
+                      {issueHaitun.isPending
+                        ? '生成中…'
+                        : haitun.status === 'revoked'
+                          ? '重新生成测速地址'
+                          : '生成测速地址'}
+                    </button>
+                  )}
+                </div>
+                {actionError && <ErrorBox error={actionError} />}
+              </>
+            ) : standardUrl ? (
+              <div className="sub-pass-actions">
+                <CopyButton className="btn primary sub-pass-main" text={standardUrl} label="复制订阅地址">
                   {copyContent}
                 </CopyButton>
-                <RevokeButton
-                  pending={revokeHaitun.isPending}
-                  disabled={haitunPending}
-                  onRevoke={() => {
-                    issueHaitun.reset();
-                    revokeHaitun.mutate();
+                <button
+                  type="button"
+                  className="btn sub-pass-side"
+                  aria-label="下载二维码"
+                  title="下载二维码"
+                  onClick={() => {
+                    if (qrRef.current) downloadSubscriptionQr(qrRef.current);
                   }}
-                />
-              </>
-            ) : (
-              <button
-                type="button"
-                className="btn primary sub-pass-main"
-                disabled={haitunPending}
-                onClick={() => {
-                  revokeHaitun.reset();
-                  issueHaitun.mutate();
-                }}
-              >
-                {issueHaitun.isPending ? '生成中…' : haitun.status === 'revoked' ? '重新生成测速地址' : '生成测速地址'}
-              </button>
-            )}
+                >
+                  <Icon of="download" size={14} />
+                  下载
+                </button>
+              </div>
+            ) : null}
           </div>
-          {actionError && <ErrorBox error={actionError} />}
-        </>
-      ) : (
-        <div className="sub-pass-actions">
-          <CopyButton className="btn primary sub-pass-main" text={standardUrl} label="复制订阅地址">
-            {copyContent}
-          </CopyButton>
-          <button
-            type="button"
-            className="btn sub-pass-side"
-            aria-label="下载二维码"
-            title="下载二维码"
-            onClick={() => {
-              if (qrRef.current) downloadSubscriptionQr(qrRef.current);
-            }}
-          >
-            <Icon of="download" size={14} />
-            下载
-          </button>
-        </div>
-      )}
-    </div>
+        )}
+      </SubStoreContent>
+    </SubStoreShell>
   );
 }
 
 const remainingText = (remaining: number | null) => (remaining === null ? '不限量' : bytes(remaining));
-
-function PassLogo({ card, small = false }: { card: PassCard; small?: boolean }) {
-  return (
-    <span className={`sub-pass-logo${card === 'haitun' ? ' haitun' : ''}${small ? ' small' : ''}`} aria-hidden="true">
-      <Icon of={card === 'haitun' ? 'observe' : 'subscription'} size={small ? 11 : 15} />
-    </span>
-  );
-}
 
 /* 卡头名称后的 (!)：与「计量口径」同一画法，点开是卡头下方一段暗色小字。 */
 function usePassNote(label: string, text: string) {
@@ -512,7 +522,7 @@ function ClashPass({
     <section className="sub-pass" aria-label="Clash 订阅">
       <div className="sub-pass-top">
         <header className="sub-pass-head">
-          <PassLogo card="clash" />
+          <SubscriptionLogo card="clash" />
           <span className="sub-pass-name">
             <b>
               Clash 订阅
@@ -576,13 +586,13 @@ function HaitunPass({
   const revoked = haitun.status === 'revoked';
   const date = formatDay(revoked ? haitun.revoked_at : haitun.created_at);
   return (
-    <section className="sub-pass" aria-label="koipy 测速订阅">
+    <section className="sub-pass" aria-label="Koipy 测速订阅">
       <div className="sub-pass-top">
         <header className="sub-pass-head">
-          <PassLogo card="haitun" />
+          <SubscriptionLogo card="haitun" />
           <span className="sub-pass-name">
             <b>
-              koipy 测速订阅
+              Koipy 测速订阅
               {note.button}
             </b>
             <small>仅管理员可见</small>
@@ -614,10 +624,10 @@ function HaitunPass({
                 marginSize={4}
                 bgColor="#fff"
                 fgColor="#101112"
-                title="koipy 测速地址二维码"
+                title="Koipy 测速地址二维码"
               />
             </figure>
-            <PassAddress key={url} url={url} name="koipy 测速地址" />
+            <PassAddress key={url} url={url} name="Koipy 测速地址" />
           </>
         ) : (
           <div className="sub-pass-empty">暂无地址</div>

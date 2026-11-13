@@ -270,16 +270,16 @@ for (const engine of ['chromium', 'webkit'] as const) {
       const dialog = page.getByRole('dialog', { name: 'alice 的订阅与节点' });
       await reply(page);
       // 测速订阅是后面那张卡：只露出卡头，撤销按钮还不在页面上。
-      const peek = dialog.getByRole('button', { name: '切换到 koipy 测速订阅（可用）' });
+      const peek = dialog.getByRole('button', { name: '切换到 Koipy 测速订阅（可用）' });
       await expect(peek).toBeInViewport();
-      await expect(peek.getByText('koipy 测速订阅', { exact: true })).toBeInViewport({ ratio: 1 });
+      await expect(peek.getByText('Koipy 测速订阅', { exact: true })).toBeInViewport({ ratio: 1 });
       await expect(dialog.getByRole('button', { name: '撤销测速地址' })).toHaveCount(0);
       await placed(page, dialog, width <= 820);
       const before = (await dialog.locator('.sub-dialog').boundingBox())!;
       await expect(page).toHaveScreenshot(`subscription-${engine}-admin-${width}-clash.png`, SCREENSHOT_OPTIONS);
       // 卡头露出的部分才可点：从露出的那条上沿点。
       await peek.click({ position: { x: 40, y: 12 } });
-      await expect(dialog.getByRole('region', { name: 'koipy 测速订阅' })).toBeVisible();
+      await expect(dialog.getByRole('region', { name: 'Koipy 测速订阅' })).toBeVisible();
       await expect(dialog.getByRole('button', { name: '切换到 Clash 订阅' })).toBeVisible();
       // 两张卡同一版式、同一高度：换卡时弹窗不跳。
       const after = (await dialog.locator('.sub-dialog').boundingBox())!;

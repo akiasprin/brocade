@@ -37,19 +37,23 @@ impl Drop for TestDirectory {
 fn repository_preserves_all_published_migrations() {
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     let sources = migrations::sources(&directory).unwrap();
+    let published_versions = [1, 2, 3, 4, 5];
     assert_eq!(
         sources
             .iter()
+            .take(published_versions.len())
             .map(|source| source.version)
             .collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5]
+        published_versions,
+        "new migrations may follow the immutable published chain"
     );
-    // v0.3.5 shipped this complete chain; all four SQLx checksums are immutable.
+    // v0.3.6 shipped this prefix; every published SQLx checksum is immutable.
     let published_checksums = [
         "794044a4f1b7ead02b8102e21bc7f94d3c01f309216a5e15ada747c61de528c04b494a46e993f683a7d256aa37cd0947",
         "54300599c9b4cce71f9e574b3f43141fee2fbd50279f829feda08f537bcde441a725ff1af4e0fbbf96fb9d80966552f1",
         "6b9c70bc99b3ecd499b33fea34c0a927d8dcaa604d90e09937899bfee2415b20a21d81d2c599de4c18222ace1f2204e8",
         "a2b744d7d340033156e92b9e2d7baaf15c174a6a72c22de9bb34c619e7c4270b62c77c56ecbafec6e9a73fea5fa99737",
+        "6bd38a25566685110b4d657e372632691ce018885b00fe82f4448930c957c059a9899c6a5ea0b662d09ce0389db1da81",
     ];
     for (source, checksum) in sources.iter().zip(published_checksums) {
         assert_eq!(

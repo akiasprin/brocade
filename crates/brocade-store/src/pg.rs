@@ -1133,6 +1133,16 @@ impl PgStore {
         console::clash_subscription_for_user(&self.pool, actor, tenant_id, user_id).await
     }
 
+    pub async fn clash_subscription_for_user_with_generation(
+        &self,
+        actor: &AdminContext,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<(DynamicClashSubscription, u64)> {
+        console::clash_subscription_for_user_with_generation(&self.pool, actor, tenant_id, user_id)
+            .await
+    }
+
     pub async fn user_grant_probe_plan(
         &self,
         actor: &AdminContext,

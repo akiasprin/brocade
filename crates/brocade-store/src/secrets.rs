@@ -235,6 +235,26 @@ pub fn open(context: &str, sealed: &str) -> Result<String> {
         .map_err(|_| StoreError::InvalidData("sealed value is not text".to_owned()))
 }
 
+/// Non-reversible correlation of a user subscription body. Never expose a plain credential hash.
+pub fn subscription_fingerprint(
+    tenant: &str,
+    user: &str,
+    uuid: &str,
+    content: &str,
+) -> Result<String> {
+    let key = key_material()?.ok_or_else(|| {
+        StoreError::InvalidData("subscription verification requires BROCADE_SECRET_KEY".into())
+    })?;
+    let key = hmac::Key::new(hmac::HMAC_SHA256, &key);
+    let mut input = hmac::Context::with_key(&key);
+    input.update(b"subscription-connector-content\0");
+    for part in [tenant, user, uuid, content] {
+        input.update(part.as_bytes());
+        input.update(b"\0");
+    }
+    Ok(hex_lower(input.sign().as_ref()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +286,33 @@ mod tests {
     }
 
     const KEY: &str = "8fVQ0k1sJp3xQ2mLr7bN5tW9cZ4yA6dE1hG8jK0lM2o";
+
+    #[test]
+    fn subscription_receipts_are_bound_to_the_user_and_exact_content() {
+        with_key(Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), || {
+            let a = subscription_fingerprint("tenant", "alice", "fixture-uuid", "fixture body")
+                .unwrap();
+            assert_eq!(
+                a,
+                subscription_fingerprint("tenant", "alice", "fixture-uuid", "fixture body")
+                    .unwrap()
+            );
+            assert_ne!(
+                a,
+                subscription_fingerprint("tenant", "bob", "fixture-uuid", "fixture body").unwrap()
+            );
+            assert_ne!(
+                a,
+                subscription_fingerprint("tenant", "alice", "changed-uuid", "fixture body")
+                    .unwrap()
+            );
+            assert_ne!(
+                a,
+                subscription_fingerprint("tenant", "alice", "fixture-uuid", "changed body")
+                    .unwrap()
+            );
+        });
+    }
 
     #[test]
     fn sealed_value_round_trips_under_the_same_context() {

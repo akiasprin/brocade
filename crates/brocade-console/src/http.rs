@@ -3,6 +3,7 @@ mod agent_rpc;
 mod cvm;
 mod observations;
 mod realtime_channel;
+mod substore;
 mod traffic;
 use realtime_channel::agent_realtime;
 mod unlock_probe;
@@ -841,6 +842,7 @@ async fn mask_assets(request: Request, next: Next) -> Response {
     let self_response = request_admin().is_some_and(|admin| {
         admin.role == AdminRole::User
             && (self_route_may_hold_secrets(request.method(), request.uri().path())
+                || substore::is_for_self(&admin, request.method(), request.uri().path())
                 || (admin.self_user.is_some()
                     && is_user_cvm_path(request.method(), request.uri().path()))
                 || forwarding_route_is_for_self(&admin, request.method(), request.uri().path()))
@@ -1027,6 +1029,7 @@ fn user_may(method: &axum::http::Method, path: &str) -> bool {
         || ((method == axum::http::Method::GET || method == axum::http::Method::DELETE)
             && is_grant_probe_job_path(path))
         || (method == axum::http::Method::GET && is_grant_probe_events_path(path))
+        || substore::is_connector_path(method, path)
         || is_user_forwarding_path(method, path)
         || is_user_cvm_path(method, path)
 }
@@ -1774,6 +1777,40 @@ fn admin_router_with_state(state: AppState) -> Router {
             post(issue_user_direct_login).delete(revoke_user_direct_login),
         )
         .route(
+            "/users/{tenant_id}/{user_id}/subscription-connectors/sub-store",
+            get(substore::info)
+                .put(substore::save)
+                .delete(substore::remove),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/subscription-connectors/sub-store/test",
+            post(substore::test),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/subscription-connectors/sub-store/sync",
+            post(substore::sync),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/subscription-connectors/sub-store/verify",
+            post(substore::verify),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/subscription-connectors/sub-store/cleanup",
+            post(substore::cleanup),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/subscription-connectors/sub-store/runs",
+            get(substore::list),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/subscription-connectors/sub-store/runs/{run}",
+            get(substore::run).delete(substore::cancel),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/subscription-connectors/sub-store/runs/{run}/retry",
+            post(substore::retry),
+        )
+        .route(
             "/users/{tenant_id}/{user_id}/clash-subscription",
             get(clash_subscription_info),
         )
@@ -2300,6 +2337,16 @@ async fn public_clash_subscription(
         Err(error) => return subscription_no_store(ApiError::Store(error).into_response()),
     };
 
+    if let Some(probe) = query
+        .brocade_probe
+        .filter(|p| p.len() == 32 && p.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        // A bounded non-secret correlation receipt proves this exact serving revision was pulled.
+        if let Err(_error)=sqlx::query("UPDATE subscription_connector_runs SET observed_revision=$4,observed_fingerprint=$5 WHERE probe_token=$1 AND tenant_id=$2 AND user_id=$3 AND status='running' AND lease_until>now()")
+            .bind(probe).bind(&subscription.tenant_id).bind(&subscription.user_id).bind(subscription.revision as i64).bind(brocade_store::secrets::subscription_fingerprint(&subscription.tenant_id,&subscription.user_id,&subscription.uuid,&subscription.content).ok()).execute(state.store.pool()).await {
+            return public_subscription_unavailable();
+        }
+    }
     public_clash_subscription_response(subscription)
 }
 
@@ -2488,6 +2535,7 @@ fn readable_subscription_bytes(bytes: u64) -> String {
 
 #[derive(Debug, Default, Deserialize)]
 struct PublicClashSubscriptionQuery {
+    brocade_probe: Option<String>,
     family: Option<String>,
     protocol: Option<String>,
 }

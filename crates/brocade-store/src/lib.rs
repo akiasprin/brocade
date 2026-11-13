@@ -47,6 +47,7 @@ mod settings;
 mod site_usage;
 mod source_traffic;
 mod subscription_client;
+pub mod subscription_connector;
 mod traffic;
 mod traffic_limit;
 mod unlock_probe;

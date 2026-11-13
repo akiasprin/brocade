@@ -172,7 +172,7 @@ async fn official_v033_upgrade_preserves_published_0002_without_opt_in() {
     let before = receipts(&db).await;
     let check = db.store.check_database_upgrade().await.unwrap();
     assert!(check.compatible);
-    assert_eq!(check.pending_versions, [3, 4, 5]);
+    assert_eq!(check.pending_versions, [3, 4, 5, 6]);
     db.store.migrate_database_schema().await.unwrap();
     let after = receipts(&db).await;
     assert_eq!(before[1], after[1]);
@@ -209,7 +209,7 @@ async fn user_cycle_upgrade_is_opt_in_atomic_and_preserves_existing_billing() {
     for _ in 0..2 {
         let check = db.store.check_user_cycle_reset_upgrade().await.unwrap();
         assert!(check.compatible);
-        assert_eq!(check.pending_versions, [3, 4, 5]);
+        assert_eq!(check.pending_versions, [3, 4, 5, 6]);
         assert_eq!(receipts(&db).await, before);
     }
     // Reject actual DDL after the new tables were created: both DDL and receipts must roll back.
@@ -281,7 +281,7 @@ async fn assert_misplaced_reset_roundtrip(mut db: TestPg) {
     assert!(!db.store.check_database_upgrade().await.unwrap().compatible);
     let check = db.store.check_user_cycle_reset_upgrade().await.unwrap();
     assert!(check.compatible);
-    assert_eq!(check.pending_versions, [3, 4, 5]);
+    assert_eq!(check.pending_versions, [3, 4, 5, 6]);
     assert_eq!(receipts(&db).await, history);
     sqlx::raw_sql("CREATE FUNCTION reject_cycle_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture blocked function'; END; $$;
         CREATE EVENT TRIGGER reject_cycle_function ON ddl_command_start WHEN TAG IN ('CREATE FUNCTION') EXECUTE FUNCTION reject_cycle_ddl();")

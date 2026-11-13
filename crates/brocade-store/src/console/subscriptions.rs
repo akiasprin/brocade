@@ -171,6 +171,19 @@ pub async fn clash_subscription_for_user(
     tenant_id: &str,
     user_id: &str,
 ) -> Result<DynamicClashSubscription> {
+    clash_subscription_for_user_with_generation(pool, actor, tenant_id, user_id)
+        .await
+        .map(|(subscription, _)| subscription)
+}
+
+/// Build a user's subscription and return the serving generation from the same projection.
+/// Background integrations use the generation to reject stale external verification receipts.
+pub async fn clash_subscription_for_user_with_generation(
+    pool: &PgPool,
+    actor: &AdminContext,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<(DynamicClashSubscription, u64)> {
     let tenant_id = required_text(tenant_id, "tenant_id")?;
     let user_id = required_text(user_id, "user id")?;
     actor.require_tenant_access(&tenant_id, "Clash subscription")?;
@@ -184,7 +197,8 @@ pub async fn clash_subscription_for_user(
         return Err(StoreError::NotFound(format!("user {tenant_id}/{user_id}")));
     }
     serving.ensure_available()?;
-    build_dynamic_clash(
+    let generation = serving.generation();
+    let subscription = build_dynamic_clash(
         pool,
         &serving.snapshot,
         &tenant_id,
@@ -193,7 +207,8 @@ pub async fn clash_subscription_for_user(
         DynamicClashTemplate::Standard,
         false,
     )
-    .await
+    .await?;
+    Ok((subscription, generation))
 }
 
 /// Read the durable link separately from the generated subscription. A missing row means the
