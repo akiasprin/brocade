@@ -82,7 +82,16 @@ for (const browserName of ['chromium', 'webkit'] as const) {
       await expect(records.locator('.care-record-count')).not.toHaveText('—');
       await expect(records.locator('.care-records-usage')).toContainText('1,500 次');
       await expect(records.locator('.care-round-geo .geo-flag').first()).toBeVisible();
-      await expect(records.locator('.care-round-result').filter({ hasText: '冷却' })).toHaveText('冷却：限流');
+      const paused = records.locator('.care-round-title .care-round-result').filter({ hasText: '限流暂停' });
+      await expect(paused).toHaveText('限流暂停');
+      await expect(paused.locator('..')).not.toContainText('个动作');
+      await expect(records.locator('.care-rounds button > .care-round-result')).toHaveCount(0);
+      const inlineOffset = await paused.evaluate(element => {
+        const name = document.createRange();
+        name.selectNodeContents(element.parentElement!.firstChild!);
+        return Math.abs(name.getBoundingClientRect().top - element.getBoundingClientRect().top);
+      });
+      expect(inlineOffset).toBeLessThanOrEqual(3);
       for (const content of await records.locator('.care-sheet-body, .care-records-chart, .care-rounds button').all()) {
         expect(await content.evaluate(element => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
       }
@@ -194,7 +203,7 @@ for (const [scene, status] of [
   ['worker-stale', '执行器无回执'],
   ['legacy', '需要升级 Agent'],
   ['budget', '今日额度已用完'],
-  ['cooldown', '异常冷却'],
+  ['cooldown', '限流暂停'],
   ['initial-legacy', '需要升级 Agent'],
 ] as const) {
   test(`F preserves availability and receipt state ${scene}`, async ({ page }) => {
@@ -215,7 +224,7 @@ test('F first manual execution saves defaults without enabling automatic mainten
 
 test('F session reset retains policy and clears records without flashing an error', async ({ page }) => {
   const card = await open(page, 'scene=failed&theme=light&resetDelay');
-  await expect(card.getByRole('status')).toHaveText('执行失败');
+  await expect(card.getByRole('status')).toContainText('下一轮');
   await card.getByRole('button', { name: '策略', exact: true }).click();
   const policy = page.getByRole('dialog', { name: '养护策略' });
   await policy.getByRole('button', { name: '重置养护会话', exact: true }).click();
@@ -243,3 +252,25 @@ test('retained maintenance window state opens the configuration card', async ({ 
   const card = await open(page, 'legacyTab=care&theme=light');
   await expect(card.getByRole('heading', { name: 'IP 养护' })).toBeVisible();
 });
+
+for (const [width, theme] of [
+  [1440, 'light'],
+  [390, 'dark'],
+] as const) {
+  test(`IPv6 sites without addresses are neutral skips ${width} ${theme}`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 1000 });
+    const card = await open(page, `scene=partial&issues=ipv6&theme=${theme}`);
+    await expect(card.getByRole('status')).not.toContainText(/成功|失败/);
+    await card.getByRole('button', { name: '记录', exact: true }).click();
+    const records = page.getByRole('dialog', { name: '养护记录' });
+    await expect(records).not.toContainText(/成功|失败|轮未完成/);
+    await records.getByRole('button', { name: /地区站点.*3 个动作/ }).click();
+    const round = page.getByRole('dialog', { name: '养护轮次' });
+    await expect(round.locator('.care-round-result')).toHaveText(/^用时 /);
+    await expect(round.getByText('无 IPv6 解析，已跳过', { exact: true })).toHaveCount(2);
+    await expect(round.locator('.care-steps li[data-state="skip"]')).toHaveCount(2);
+    await expect(round.locator('.care-steps li[data-state="fail"]')).toHaveCount(0);
+    await expect(round.getByText('200 · 16 KB', { exact: true })).toBeVisible();
+    await expect(round.locator('.care-sheet')).toHaveScreenshot(`ipv6-skips-${width}-${theme}.png`);
+  });
+}

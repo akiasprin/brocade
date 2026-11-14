@@ -290,8 +290,8 @@ describe('machine maintenance production page', () => {
   });
   it.each([
     ['idle', '空闲'],
-    ['partial', '部分成功'],
-    ['failed', '执行失败'],
+    ['partial', '空闲'],
+    ['failed', '空闲'],
     ['running', '正在养护'],
   ])('aggregates dual-stack %s without separate family status rows', async (scene, status) => {
     view.desired.policy.family = 'dual';
@@ -705,16 +705,18 @@ it('starts automatic maintenance after a reset and keeps it on before the first 
   expect(commands).toEqual([]);
 });
 
-it('shows partial success and skipped actions while preserving later successful actions', async () => {
+it('keeps mixed action details without evaluating the round result', async () => {
   view.report = maintenancePartialReport();
   history = [structuredClone(view.report)];
   mount();
-  await screen.findAllByText('部分成功');
-  expect(document.querySelector('.care-config-state')?.textContent).toContain('部分成功');
+  await ready();
+  expect(screen.getByRole('status').textContent).toMatch(/^下一轮/);
+  expect(screen.queryByText('部分成功')).toBeNull();
   expect(screen.queryByText('执行失败')).toBeNull();
   await records();
   fireEvent.click(screen.getByRole('button', { name: /Google.*4 个动作/ }));
   const sheet = await screen.findByRole('dialog', { name: '养护轮次' });
+  expect(sheet.querySelector('.care-round-result')?.textContent).toMatch(/^用时 /);
   await within(sheet).findByText('页面过大，已跳过');
   expect(sheet.querySelectorAll('.care-steps li[data-state="skip"]')).toHaveLength(1);
   expect(sheet.querySelectorAll('.care-steps li[data-state="done"]')).toHaveLength(2);
@@ -722,26 +724,38 @@ it('shows partial success and skipped actions while preserving later successful 
   expect(document.querySelector('.care-rhythm-col[title*="Google 2"]')).toBeTruthy();
 });
 
-it('shows a failed result when every action failed', async () => {
+it('keeps the next schedule and request details when every action failed', async () => {
   view.report = maintenancePartialReport();
   view.report.phase = 'failed';
   view.report.reason = 'all_actions_failed';
   view.report.actions = view.report.actions.map(action => ({ ...action, status: null, error: 'network_timeout' }));
   history = [structuredClone(view.report)];
   mount();
-  await screen.findByText('执行失败');
+  await ready();
+  expect(screen.getByRole('status').textContent).toMatch(/^下一轮/);
+  expect(screen.queryByText('执行失败')).toBeNull();
   expect(screen.queryByText('部分成功')).toBeNull();
-  await screen.findAllByText('本轮没有成功动作');
+  expect(screen.queryByText('本轮没有成功动作')).toBeNull();
+  await records();
+  expect(document.querySelector('.care-round-result')).toBeNull();
+  expect(screen.queryByText(/轮未完成/)).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: /Google.*4 个动作/ }));
+  const sheet = await screen.findByRole('dialog', { name: '养护轮次' });
+  expect(sheet.querySelector('.care-round-result')?.textContent).toMatch(/^用时 /);
+  expect(within(sheet).getAllByText('请求超时')).toHaveLength(4);
 });
 
-it('keeps rate-limit cooldown text short even after a successful action', async () => {
+it('places the rate-limit pause in the action-count slot without a separate status row', async () => {
   view.report = maintenancePartialReport();
   view.report.phase = 'cooldown';
   view.report.reason = 'service_restricted';
   history = [structuredClone(view.report)];
   mount();
   await records();
-  expect(document.querySelector('.care-round-result')?.textContent).toBe('冷却：限流');
+  expect(document.querySelector('.care-round-title .care-round-result')?.textContent).toBe('限流暂停');
+  expect(document.querySelector('.care-rounds button > .care-round-result')).toBeNull();
+  expect(document.querySelector('.care-round-title')?.textContent).not.toContain('个动作');
+  expect(screen.getByRole('status').textContent).toBe('限流暂停');
 });
 
 it('explains historical blocked and empty pages while keeping a later successful visit', async () => {
@@ -755,7 +769,7 @@ it('explains historical blocked and empty pages while keeping a later successful
   view.report.action_index = 5;
   history = [structuredClone(view.report)];
   mount();
-  await screen.findAllByText('部分成功');
+  await ready();
   await records();
   fireEvent.click(screen.getByRole('button', { name: /Google.*5 个动作/ }));
   const sheet = await screen.findByRole('dialog', { name: '养护轮次' });
@@ -766,12 +780,39 @@ it('explains historical blocked and empty pages while keeping a later successful
   expect(screen.queryByText('执行失败')).toBeNull();
 });
 
-it('preserves partial success when public masking blanks action error text', async () => {
+it('keeps public masked action results neutral and read-only', async () => {
   view.report = maintenancePartialReport();
   view.report.actions = view.report.actions.map(action => ({ ...action, error: action.error === null ? null : '' }));
   history = [structuredClone(view.report)];
   mount(node(), true);
-  await screen.findAllByText('部分成功');
-  expect(document.querySelector('.care-config-state')?.textContent).toContain('部分成功');
+  await ready();
+  expect(screen.getByRole('status').textContent).toMatch(/^下一轮/);
+  expect(screen.queryByText('部分成功')).toBeNull();
   expect(automatic(true).matches(':disabled')).toBe(true);
+});
+
+it.each([
+  ['v4', 'no_ipv4_address', '无 IPv4 解析，已跳过'],
+  ['v6', 'no_ipv6_address', '无 IPv6 解析，已跳过'],
+] as const)('shows unavailable %s sites as skipped and preserves later visits', async (family, error, message) => {
+  view.desired.policy.family = family;
+  view.report = maintenancePartialReport();
+  view.report.family = family;
+  view.report.actions = view.report.actions.map((action, index) => ({
+    ...action,
+    error: index < 3 ? error : null,
+    status: index < 3 ? null : 200,
+  }));
+  history = [structuredClone(view.report)];
+  mount();
+  await ready();
+  expect(screen.queryByText(/部分成功|执行失败|未成功/)).toBeNull();
+  await records();
+  fireEvent.click(screen.getByRole('button', { name: /Google.*4 个动作/ }));
+  const sheet = await screen.findByRole('dialog', { name: '养护轮次' });
+  expect(within(sheet).getAllByText(message)).toHaveLength(3);
+  expect(sheet.querySelectorAll('.care-steps li[data-state="skip"]')).toHaveLength(3);
+  expect(sheet.querySelectorAll('.care-steps li[data-state="fail"]')).toHaveLength(0);
+  expect(sheet.querySelectorAll('.care-steps li[data-state="done"]')).toHaveLength(1);
+  expect(sheet.querySelector('.care-round-result')?.textContent).toMatch(/^用时 /);
 });

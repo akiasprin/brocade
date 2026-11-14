@@ -143,7 +143,12 @@ async fn ip_maintenance_real_http_source_cookie_redirect_gzip_and_cancellation()
                     options(),
                 )
                 .await;
-                assert!(matches!(result, Err(ref error) if error == "non_public_target"));
+                let expected = if host == "opposite-family.maintenance.test" {
+                    "no_ipv6_address"
+                } else {
+                    "non_public_target"
+                };
+                assert!(matches!(result, Err(ref error) if error == expected));
             }
         }
     }
@@ -206,8 +211,103 @@ async fn ip_maintenance_real_http_source_cookie_redirect_gzip_and_cancellation()
     );
     dual_stack_real_requests_are_parallel_and_fail_independently().await;
     bounded_pages_retry_and_continue_to_the_next_action().await;
+    missing_family_addresses_are_skipped_without_fallback().await;
     javascript_prompt_is_an_ordinary_success().await;
     probe_requests_retry_twice_and_respect_rate_limits().await;
+}
+
+async fn missing_family_addresses_are_skipped_without_fallback() {
+    for (family, source, target, missing_host, error) in [
+        (
+            MaintenanceFamily::V4,
+            "11.0.0.1",
+            "11.0.0.2",
+            "ipv6-only.maintenance.test",
+            "no_ipv4_address",
+        ),
+        (
+            MaintenanceFamily::V6,
+            "2001:470:ffff:abcd::1",
+            "2001:470:ffff:abcd::2",
+            "opposite-family.maintenance.test",
+            "no_ipv6_address",
+        ),
+    ] {
+        for all_skipped in [false, true] {
+            let listener = TcpListener::bind((target.parse::<IpAddr>().unwrap(), 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                if all_skipped {
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                            .await
+                            .is_err()
+                    );
+                } else {
+                    let (mut stream, peer) = listener.accept().await.unwrap();
+                    assert_eq!(peer.ip(), source.parse::<IpAddr>().unwrap());
+                    assert!(headers(&mut stream).await.starts_with("GET /available "));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await
+                        .unwrap();
+                }
+            });
+            let (context, _directory) = context();
+            let desired = IpMaintenanceDesired {
+                generation: 1,
+                policy: IpMaintenancePolicy {
+                    family,
+                    source_ip: Some(source.parse().unwrap()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            context.apply(&desired).unwrap();
+            context
+                .begin_round(&desired, MaintenanceModule::Trust, 2)
+                .unwrap();
+            let session = Session::open(&context.directory, "missing-family-fixture", 14).unwrap();
+            execute_actions(
+                &context,
+                &desired.policy,
+                MaintenanceModule::Trust,
+                "fixture-device",
+                &session,
+                2,
+                |index, _| {
+                    Ok(behavior::Action {
+                        kind: "local_site",
+                        url: Url::parse(&if index == 0 || all_skipped {
+                            format!("http://{missing_host}:{}/", address.port())
+                        } else {
+                            format!("http://{address}/available")
+                        })
+                        .unwrap(),
+                        dwell_secs: 0,
+                    })
+                },
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+            let state = context.locked().unwrap();
+            assert_eq!(state.daily_requests, u32::from(!all_skipped));
+            assert_eq!(state.daily_bytes, if all_skipped { 0 } else { 2 });
+            let report = state.current.as_ref().unwrap();
+            assert_eq!(report.actions.len(), 2);
+            assert_eq!(report.actions[0].error.as_deref(), Some(error));
+            assert_eq!(
+                report.actions[1].error.as_deref(),
+                all_skipped.then_some(error)
+            );
+            assert_eq!(report.actions[1].status, (!all_skipped).then_some(200));
+        }
+    }
 }
 
 async fn javascript_prompt_is_an_ordinary_success() {

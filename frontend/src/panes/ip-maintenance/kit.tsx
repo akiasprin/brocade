@@ -27,6 +27,7 @@ import {
   useCare,
   roundResult,
   successfulActions,
+  actionWasSkipped,
   type Tone,
 } from './state';
 import { countryName, isoOf } from './regions-zh';
@@ -146,7 +147,7 @@ export function RoundTrack({ report, fill }: { report: IpMaintenanceReport; fill
       {Array.from({ length: total }, (_, n) => {
         const index = n + 1;
         const action = report.actions.find(a => a.index === index);
-        const skipped = action?.error === 'response_size_skipped';
+        const skipped = actionWasSkipped(action?.error);
         const failed = !!action && !skipped && (action.error != null || (action.status ?? 0) >= 400);
         const state = skipped
           ? 'skip'
@@ -457,11 +458,8 @@ export function RhythmLegend() {
 export function useDayStats() {
   const day = useDayRuns();
   const runs = day.data ?? [];
-  const complete = runs.filter(r => r.phase === 'complete').length;
   return {
     rounds: day.data ? runs.length : null,
-    complete,
-    issues: runs.filter(r => r.phase !== 'complete' && !ACTIVE.includes(r.phase)).length,
   };
 }
 
@@ -494,30 +492,18 @@ export function RoundRows({
         const startedAt = run.last_started_at_unix_secs ?? run.observed_at_unix_secs;
         return (
           <li key={run.round_id}>
-            <button
-              type="button"
-              data-partial={result.text.startsWith('部分成功') || undefined}
-              onClick={() => onOpen(run)}
-            >
+            <button type="button" onClick={() => onOpen(run)}>
               <time>{dayClock(startedAt, care.now)}</time>
               <ModuleTile module={run.module} />
               <span className="care-round-title">
                 {run.module === 'trust' ? '地区站点' : 'Google'}
                 {run.family && <small>{run.family === 'v6' ? 'IPv6' : 'IPv4'}</small>}
-                <small>
-                  {run.action_index === run.actions_total
-                    ? `${run.actions_total} 个动作`
-                    : `${run.action_index} / ${run.actions_total} 个动作`}
+                <small className={result.text ? 'care-round-result' : undefined} data-tone={result.tone}>
+                  {result.text ||
+                    (run.action_index === run.actions_total
+                      ? `${run.actions_total} 个动作`
+                      : `${run.action_index} / ${run.actions_total} 个动作`)}
                 </small>
-              </span>
-              {/* 完成是常态，不写；只有中断、冷却、失败才出字。 */}
-              <span className="care-round-result" data-tone={result.tone} title={result.text}>
-                {result.tone !== 'idle' && (
-                  <>
-                    <StatusDot tone={result.tone} />
-                    <span>{result.text}</span>
-                  </>
-                )}
               </span>
               <span className="care-round-geo">
                 {run.evidence.map(e => (
@@ -578,7 +564,7 @@ export function RoundSheet({ run: initial, onClose }: { run: IpMaintenanceReport
             </h2>
             <span className="care-round-result" data-tone={result.tone}>
               {result.tone !== 'idle' && <StatusDot tone={result.tone} />}
-              {result.text} · 用时 {span(run.observed_at_unix_secs - startedAt)}
+              {result.text && `${result.text} · `}用时 {span(run.observed_at_unix_secs - startedAt)}
             </span>
           </div>
           <DialogClose className="care-sheet-close" aria-label="关闭">
@@ -590,7 +576,7 @@ export function RoundSheet({ run: initial, onClose }: { run: IpMaintenanceReport
           <ol className="care-steps">
             {Array.from({ length: run.actions_total }, (_, n) => {
               const action = run.actions.find(a => a.index === n + 1);
-              const skipped = action?.error === 'response_size_skipped';
+              const skipped = actionWasSkipped(action?.error);
               const failed = !!action && !skipped && (action.error != null || (action.status ?? 0) >= 400);
               return (
                 <li

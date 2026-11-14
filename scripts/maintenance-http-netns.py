@@ -33,7 +33,7 @@ elif len(sys.argv) == 3 and sys.argv[1] == '--inside':
         '127.0.0.1 localhost mixed.maintenance.test\n'
         '::1 localhost mixed.maintenance.test\n'
         '11.0.0.2 dualstack.maintenance.test mixed.maintenance.test opposite-family.maintenance.test\n'
-        '2001:470:ffff:abcd::2 dualstack.maintenance.test mixed.maintenance.test\n'
+        '2001:470:ffff:abcd::2 dualstack.maintenance.test mixed.maintenance.test ipv6-only.maintenance.test\n'
         '11.0.0.2 www.youtube.com music.youtube.com www.google.com\n'
         '2001:470:ffff:abcd::2 www.youtube.com music.youtube.com www.google.com\n'
     )

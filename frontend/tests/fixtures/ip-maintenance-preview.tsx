@@ -179,6 +179,24 @@ if (params.get('scene') === 'partial') {
       error: ['consent_required', 'javascript_required', 'empty_response', null][index],
     }));
   }
+  if (params.get('issues') === 'ipv6') {
+    view.desired.policy.family = 'v6';
+    view.report.family = 'v6';
+    view.report.actual_exit_ip = '2001:db8::25';
+    view.report.module = 'trust';
+    view.report.evidence = [];
+    view.report.evidence_observed_at_unix_secs = null;
+    view.report.actions_total = 3;
+    view.report.action_index = 3;
+    view.report.actions = ['www.rakuten.co.jp', 'www.yahoo.co.jp', 'www.mhlw.go.jp'].map((host, index) => ({
+      index: index + 1,
+      kind: 'local_site',
+      host,
+      error: index < 2 ? 'no_ipv6_address' : null,
+      status: index < 2 ? null : 200,
+      response_bytes: index < 2 ? 0 : 16 * 1024,
+    }));
+  }
   runs.splice(0, runs.length, structuredClone(view.report));
 }
 class MaintenanceEvents extends FixtureEventSource {

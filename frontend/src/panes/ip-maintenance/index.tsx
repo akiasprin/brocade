@@ -5,7 +5,7 @@ import { DialogClose, DialogLayer } from '../../ui/dialog';
 import { Icon, PanelTitle } from '../../ui/icons';
 import { RhythmLegend, Rhythm, RoundRows, useDayRuns, useDayStats, useRoundSheet } from './kit';
 import { PolicyGroups, SaveBar } from './policy';
-import { ACTION_NAME, CareProvider, dayClock, fmtMiB, mmss, successfulActions, useCare, useRuns } from './state';
+import { ACTION_NAME, CareProvider, dayClock, fmtMiB, mmss, useCare, useRuns } from './state';
 import { countryName } from './regions-zh';
 import './styles.css';
 
@@ -35,7 +35,6 @@ function RecordsDialog({ onClose }: { onClose: () => void }) {
               <h2>养护记录</h2>
               <span className="care-muted">
                 24 小时 <b className="care-record-count">{stats.rounds ?? '—'}</b> 轮
-                {stats.issues > 0 && ` · ${stats.issues} 轮未完成`}
               </span>
             </div>
             <DialogClose className="care-sheet-close" aria-label="关闭">
@@ -132,13 +131,7 @@ function MaintenanceSummary() {
         tone: 'run',
       } as const;
     const issue = states.find(state => state.live.tone === 'err' || state.live.tone === 'warn');
-    if (issue) {
-      const partial =
-        issue.live.tone === 'err' && states.some(state => state.report && successfulActions(state.report) > 0);
-      return partial
-        ? ({ status: '部分成功', detail: '部分动作未完成，请查看记录', tone: 'warn' } as const)
-        : show(issue);
-    }
+    if (issue) return show(issue);
     if (states.every(state => state.first)) return show(current);
     if (!care.enabled && care.confirmed) return { status: '空闲', detail: null, tone: 'off' } as const;
     const next = states

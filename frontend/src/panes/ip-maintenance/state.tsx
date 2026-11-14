@@ -41,6 +41,8 @@ export const REASON: Record<string, string> = {
   policy_lease_expired: '策略连接超时',
   maintenance_receipt_buffer_full: '回执缓冲已满',
   non_public_target: '目标地址不是公网',
+  no_ipv4_address: '无 IPv4 解析，已跳过',
+  no_ipv6_address: '无 IPv6 解析，已跳过',
   network_timeout: '请求超时',
   network_request: '连接失败',
   response_size_limit: '页面超过大小上限',
@@ -120,18 +122,16 @@ export function successfulActions(run: IpMaintenanceReport) {
     action => action.error == null && action.status !== null && action.status >= 200 && action.status < 400,
   ).length;
 }
+export const actionWasSkipped = (error: string | null | undefined) =>
+  error === 'response_size_skipped' || error === 'no_ipv4_address' || error === 'no_ipv6_address';
+
 export function roundResult(run: IpMaintenanceReport): { tone: Tone; text: string } {
-  const unsuccessful = run.actions.some(action => action.error != null || (action.status ?? 0) >= 400);
-  const partial = successfulActions(run) > 0 && unsuccessful;
   const reason = REASON[run.reason ?? ''] ?? null;
-  if (run.phase === 'complete')
-    return unsuccessful
-      ? { tone: partial ? 'warn' : 'err', text: partial ? '部分成功' : '未成功' }
-      : { tone: 'idle', text: '完成' };
-  if (run.phase === 'cooldown') return { tone: 'warn', text: `冷却：${reason ?? '服务异常'}` };
-  if (partial && !ACTIVE.includes(run.phase)) return { tone: 'warn', text: `部分成功${reason ? ` · ${reason}` : ''}` };
+  if (run.phase === 'complete' || run.phase === 'failed') return { tone: 'idle', text: '' };
+  if (run.phase === 'cooldown')
+    return { tone: 'warn', text: run.reason === 'service_restricted' ? '限流暂停' : `冷却：${reason ?? '服务异常'}` };
   if (run.phase === 'interrupted') return { tone: 'off', text: `中断 · ${reason ?? '原因未知'}` };
-  if (run.phase === 'failed' || run.phase === 'blocked_egress') return { tone: 'err', text: reason ?? '执行失败' };
+  if (run.phase === 'blocked_egress') return { tone: 'err', text: reason ?? '出口不可用' };
   return { tone: 'run', text: '进行中' };
 }
 
@@ -422,8 +422,10 @@ function useCareState(node: NodeAgentStateItem, readOnly: boolean) {
         case 'cooldown':
           return {
             tone: 'warn',
-            title: '异常冷却',
-            detail: `${REASON[report.reason ?? ''] ?? '服务异常'}${cooling ? ` · ${span(report.cooldown_until_unix_secs! - nowSecs)}后恢复` : ''}`,
+            title: report.reason === 'service_restricted' ? '限流暂停' : '异常冷却',
+            detail: cooling
+              ? `${span(report.cooldown_until_unix_secs! - nowSecs)}后恢复`
+              : (REASON[report.reason ?? ''] ?? '服务异常'),
             ring: null,
             countdown: null,
           };
@@ -443,10 +445,6 @@ function useCareState(node: NodeAgentStateItem, readOnly: boolean) {
             ring: null,
             countdown: null,
           };
-        case 'failed':
-          return successfulActions(report) > 0
-            ? off('部分成功', REASON[report.reason ?? ''] ?? null, 'warn')
-            : off('执行失败', REASON[report.reason ?? ''] ?? null, 'err');
         case 'interrupted':
           if (enabled && report.next_run_unix_secs && report.next_run_unix_secs > nowSecs)
             return {
@@ -460,13 +458,6 @@ function useCareState(node: NodeAgentStateItem, readOnly: boolean) {
         case 'disabled':
           return off('自动养护已关闭', '可以手动执行一轮', 'off');
         default: {
-          const result = roundResult(report);
-          if (report.phase === 'complete' && result.tone !== 'idle')
-            return off(
-              result.text,
-              enabled && report.next_run_unix_secs ? `下一轮 ${clock(report.next_run_unix_secs)}` : '可以手动执行一轮',
-              result.tone,
-            );
           if (enabled && report.next_run_unix_secs) {
             const left = report.next_run_unix_secs - nowSecs;
             const interval = (baseline?.policy.interval_minutes ?? 45) * 60;
@@ -478,7 +469,7 @@ function useCareState(node: NodeAgentStateItem, readOnly: boolean) {
               countdown: left,
             };
           }
-          return off(report.phase === 'complete' ? '本轮完成' : '自动养护已关闭', '可以手动执行一轮', 'off');
+          return off('空闲', '可以手动执行一轮', 'off');
         }
       }
     })();

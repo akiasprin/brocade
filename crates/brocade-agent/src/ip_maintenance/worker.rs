@@ -95,7 +95,6 @@ async fn fetch(
     let work =
         async {
             for _ in 0..=50 {
-                context.reserve_request(policy)?;
                 let consent_cookie = consent_cookie_header(&url, &jar)?;
                 let client = maintenance_client(
                     &url,
@@ -106,6 +105,7 @@ async fn fetch(
                     module == MaintenanceModule::Trust,
                 )
                 .await?;
+                context.reserve_request(policy)?;
                 let mut request = client.get(url.clone());
                 if youtube_probe {
                     for (name, value) in crate::http::public_diagnostic_headers() {
@@ -265,6 +265,8 @@ where
                     | "round_download_limit"
                     | "service_restricted"
                     | "non_public_target"
+                    | "no_ipv4_address"
+                    | "no_ipv6_address"
                     | "verification_required"
                     | "article_redirect_unresolved"
             ),
@@ -290,6 +292,7 @@ async fn execute_actions(
     let mut referers = BTreeMap::<&str, String>::new();
     let platform = behavior::platform(ua);
     let mut succeeded = 0;
+    let mut skipped = 0;
     for index in 0..total {
         let action = action_for(index, &mut random)?;
         let tracks_referer = module == MaintenanceModule::Google
@@ -358,7 +361,10 @@ async fn execute_actions(
             }
             Ok(())
         })?;
-        if oversized {
+        if oversized
+            || matches!(&page, Err(error) if matches!(error.as_str(), "no_ipv4_address" | "no_ipv6_address"))
+        {
+            skipped += 1;
             referers.remove(action.kind);
             continue;
         }
@@ -390,7 +396,7 @@ async fn execute_actions(
             tokio::time::sleep(Duration::from_secs(u64::from(action.dwell_secs))).await;
         }
     }
-    if succeeded == 0 {
+    if succeeded == 0 && skipped < total {
         return Err("all_actions_failed".into());
     }
     Ok(())
@@ -886,6 +892,20 @@ pub(super) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_address_family_does_not_retry() {
+        for error in ["no_ipv4_address", "no_ipv6_address"] {
+            let mut attempts = 0;
+            let result = retry_request(|| {
+                attempts += 1;
+                std::future::ready(Err(error.to_owned()))
+            })
+            .await;
+            assert!(matches!(result, Err(ref actual) if actual == error));
+            assert_eq!(attempts, 1);
+        }
+    }
 
     #[test]
     fn consent_preference_preserves_session_cookies_and_cannot_escape_the_service() {

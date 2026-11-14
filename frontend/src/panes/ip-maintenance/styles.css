@@ -661,7 +661,7 @@
 }
 .care-rounds button {
   display: grid;
-  grid-template-columns: 68px 24px minmax(0, 1fr) auto 52px 12px;
+  grid-template-columns: 68px 24px minmax(0, 1fr) 52px 12px;
   align-items: center;
   gap: 10px;
   width: 100%;
@@ -1343,11 +1343,6 @@
   padding: 0 12px;
 }
 
-.care-rounds button[data-partial] .care-round-title {
-  flex-wrap: wrap;
-  row-gap: 1px;
-}
-
 /* ── 窄屏 ── */
 @media (max-width: 820px) {
   .care-card-head,
@@ -1388,7 +1383,7 @@
     row-gap: 2px;
   }
   .care-rounds button {
-    grid-template-columns: 46px 20px minmax(0, 1fr) auto 45px 12px;
+    grid-template-columns: 46px 20px minmax(0, 1fr) 45px 12px;
     gap: 6px;
   }
   .care-round-geo {
@@ -1588,14 +1583,21 @@
   }
 }
 
+@container (max-width: 360px) {
+  .care-config-state[data-tone='warn'] {
+    gap: 4px;
+  }
+  .care-config-state[data-tone='warn'] .care-config-trail {
+    padding-left: 0;
+  }
+}
+
 @media (max-width: 820px) {
   .care-records-sheet .care-rounds button {
-    grid-template-columns: 46px 20px minmax(0, 1fr) 45px 12px;
-    grid-template-areas:
-      'time module title flags arrow'
-      'time module result flags arrow';
-    gap: 4px 6px;
-    padding-block: 8px;
+    grid-template-columns: 38px 20px minmax(0, 1fr) 45px 12px;
+    grid-template-areas: 'time module title flags arrow';
+    gap: 4px;
+    padding: 8px 6px;
   }
   .care-records-sheet .care-rounds time {
     grid-area: time;
@@ -1608,14 +1610,6 @@
     flex-wrap: wrap;
     white-space: normal;
     row-gap: 2px;
-  }
-  .care-records-sheet .care-round-result {
-    grid-area: result;
-    min-width: 0;
-    white-space: normal;
-  }
-  .care-records-sheet .care-round-result:empty {
-    display: none;
   }
   .care-records-sheet .care-round-geo {
     grid-area: flags;

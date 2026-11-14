@@ -42,11 +42,16 @@ pub(crate) async fn maintenance_client(
     // resolve_blocking returns both families. Only addresses we can connect to belong
     // in the pinned set; an ordinary dual-stack answer is not an unsafe target.
     addresses.retain(|address| family.accepts(address));
-    if addresses.is_empty()
-        || addresses.iter().any(|address| {
-            brocade_core::forwarding::target_ip_is_blocked_by_policy(address.ip(), false)
-        })
-    {
+    if addresses.is_empty() {
+        return Err(match family {
+            AddressFamily::V4 => "no_ipv4_address",
+            AddressFamily::V6 => "no_ipv6_address",
+        }
+        .into());
+    }
+    if addresses.iter().any(|address| {
+        brocade_core::forwarding::target_ip_is_blocked_by_policy(address.ip(), false)
+    }) {
         return Err("non_public_target".into());
     }
     let mut tls = (*tls_config()?).clone();
