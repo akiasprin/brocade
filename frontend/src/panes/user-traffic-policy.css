@@ -19,7 +19,7 @@
   color: var(--quota-warning-text);
 }
 .qta-policy-flag.err {
-  color: var(--err);
+  color: var(--quota-error-text);
 }
 .qta-policy-flag.idle {
   color: var(--ink-3);
