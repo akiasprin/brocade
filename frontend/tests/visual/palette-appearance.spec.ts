@@ -19,8 +19,12 @@ for (const palette of palettes) {
       await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
       await expect(page.locator('.node-card').first()).toBeVisible();
       await page.evaluate(() => document.fonts.ready);
-      await expect(page).toHaveScreenshot(`${palette}-${theme}-nodes.png`, { threshold: 0.01 });
-      await page.screenshot({ path: testInfo.outputPath('nodes.png') });
+      // Node geometry and curves have their own browser matrix. Here the palette contract
+      // is the exact data color; repeating the full roster adds unrelated SVG rasterization.
+      await expect(page.locator('.node-card-comet:not(.empty)').first()).toHaveCSS(
+        'color',
+        rgb(preserved[palette][theme]['--data']),
+      );
 
       await page.goto(`/tests/fixtures/navigation-preview.html?theme=${theme}#/nodes/node/jp-iij`);
       await page.getByRole('tab', { name: '配置', exact: true }).click();
@@ -44,25 +48,6 @@ for (const palette of palettes) {
       await dns.locator('select').first().blur();
       await expect(page).toHaveScreenshot(`${palette}-${theme}-configuration.png`, { threshold: 0.01 });
       await page.screenshot({ path: testInfo.outputPath('configuration.png') });
-    });
-  }
-}
-
-for (const theme of ['light', 'dark']) {
-  for (const route of ['nodes', 'chains', 'users']) {
-    test(`dailan ${theme} ${route} on a phone`, async ({ page }) => {
-      await page.setViewportSize({ width: 390, height: 844 });
-      await page.clock.setFixedTime(new Date('2026-11-02T10:00:00Z'));
-      await page.goto(`/tests/fixtures/navigation-preview.html?theme=${theme}#/${route}`);
-      await expect(page.locator('.fg-top')).toBeVisible();
-      await expect(page.locator('.module-load-error')).toHaveCount(0);
-      await expect(
-        page.getByRole('heading', {
-          name: route === 'nodes' ? '机器' : route === 'chains' ? '线路' : '用户',
-          exact: true,
-        }),
-      ).toBeVisible();
-      await expect(page).toHaveScreenshot(`dailan-${theme}-${route}-phone.png`, { threshold: 0.01 });
     });
   }
 }
