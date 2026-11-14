@@ -145,7 +145,10 @@ test('机器详情把快照等待限制在依赖模型的配置，养护和规�
   assert.match(nodes, /snapshot\.data \? \([\s\S]*<NodeConfigState error=\{snapshot\.error\}/);
   assert.match(nodes, /function NodeRuleCardState\(/);
   assert.match(nodes, /tab === 'config'[\s\S]*<CertGroupCard[\s\S]*<LogRetentionCard/);
-  assert.match(nodes, /<NodeConfigState[\s\S]*<IpMaintenanceCard/);
+  assert.match(
+    nodes,
+    /tab === 'care'[\s\S]*?<Suspense fallback=\{<Loading variant="form" \/>\}>[\s\S]*?<IpMaintenanceCard/,
+  );
   assert.doesNotMatch(nodes, /<Suspense fallback=\{null\}>/);
   assert.match(
     nodes,
