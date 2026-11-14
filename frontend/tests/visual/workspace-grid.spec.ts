@@ -102,16 +102,39 @@ async function expectOrigin(page: Page, origin: string) {
 }
 
 async function gridPixels(page: Page) {
-  // Loaded cards cast shadows into the narrow gutter. Hide their paint without changing layout
-  // while comparing the grid itself; the full page screenshots below retain the actual content.
-  const hidden = await page.addStyleTag({ content: '.fg-view, .fg-view * { visibility: hidden !important; }' });
+  // Hide the content layer without changing layout. WebKit needs its paint boundary to settle
+  // before a raw capture; the full page snapshots below retain the real content and shadows.
+  const hidden = await page.addStyleTag({
+    content: '.fg-view { opacity: 0 !important; transition: none !important; }',
+  });
   try {
-    // A raw screenshot does not wait for stable frames as toHaveScreenshot does. Let the
-    // temporary visibility rule and WebKit's sticky scroll layer paint before sampling pixels.
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-    return await page.screenshot({ clip: { x: 2, y: 160, width: 8, height: 96 } });
+    const png = await page.screenshot({ clip: { x: 2, y: 160, width: 8, height: 96 } });
+    // Scrolling can change WebKit's compositing by one color channel. Compare the exact lattice
+    // positions here; loading/ready screenshots independently check its colors and appearance.
+    const pattern = await page.evaluate(async base64 => {
+      const image = new Image();
+      image.src = `data:image/png;base64,${base64}`;
+      await image.decode();
+      const canvas = document.createElement('canvas');
+      canvas.width = image.width;
+      canvas.height = image.height;
+      const context = canvas.getContext('2d')!;
+      context.drawImage(image, 0, 0);
+      const rgba = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      const colors: string[] = [];
+      const counts = new Map<string, number>();
+      for (let index = 0; index < rgba.length; index += 4) {
+        const color = Array.from(rgba.slice(index, index + 4)).join(',');
+        colors.push(color);
+        counts.set(color, (counts.get(color) ?? 0) + 1);
+      }
+      const background = [...counts].sort((a, b) => b[1] - a[1])[0][0];
+      return colors.map(color => (color === background ? '0' : '1')).join('');
+    }, png.toString('base64'));
+    return { png, pattern };
   } finally {
-    await hidden.evaluate(el => el.parentNode?.removeChild(el));
+    await hidden.evaluate(el => el.remove());
   }
 }
 
@@ -174,7 +197,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
         const { enter, release } = await openWorkspace(page, theme);
         const origin = await gridOrigin(page, '#stage');
         const startup = await gridPixels(page);
-        await test.info().attach('startup-grid', { body: startup, contentType: 'image/png' });
+        await test.info().attach('startup-grid', { body: startup.png, contentType: 'image/png' });
         enter();
         await expect(page.locator('.fg-view')).toBeVisible();
         expect(await page.locator('.fg-top').evaluate(el => getComputedStyle(el).borderBottomWidth)).toBe('0px');
@@ -189,7 +212,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
         }
         await expect(page.locator('.fg-view .loading-boundary-guard')).toBeAttached();
         await expectOrigin(page, origin);
-        expect((await gridPixels(page)).equals(startup), 'grid jumped when the shell mounted').toBe(true);
+        expect((await gridPixels(page)).pattern === startup.pattern, 'grid jumped when the shell mounted').toBe(true);
         await expectAligned(page);
         const name = `${engine}-${device.name}-${theme}`;
         // This gap is already aligned before either the pane module or its data has settled.
@@ -209,8 +232,8 @@ for (const engine of ['chromium', 'webkit'] as const) {
         });
 
         const before = await gridPixels(page);
-        await test.info().attach('loaded-grid', { body: before, contentType: 'image/png' });
-        expect(before.equals(startup), 'grid jumped when data finished loading').toBe(true);
+        await test.info().attach('loaded-grid', { body: before.png, contentType: 'image/png' });
+        expect(before.pattern === startup.pattern, 'grid jumped when data finished loading').toBe(true);
         const headerClip = { x: 720, y: 8, width: 48, height: 24 };
         const headerPixels = device.touch ? null : await page.screenshot({ clip: headerClip });
         await page.locator('body').evaluate(el => el.style.setProperty('--grid-image', 'none'));
@@ -220,7 +243,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
             'grid never paints through the desktop navigation',
           ).toBe(true);
         const absent = await gridPixels(page);
-        expect(absent.equals(before), 'grid is visible in the gutter').toBe(false);
+        expect(absent.pattern === before.pattern, 'grid is visible in the gutter').toBe(false);
         await page.locator('body').evaluate(el => el.style.removeProperty('--grid-image'));
         const maxScroll = await page.evaluate(touch => {
           const scroller = touch ? document.scrollingElement! : document.querySelector('.fg-desk')!;
@@ -231,12 +254,12 @@ for (const engine of ['chromium', 'webkit'] as const) {
           await scroll(page, offset, device.touch);
           await expectAligned(page);
           const immediate = await gridPixels(page);
-          if (!immediate.equals(before)) {
-            await test.info().attach(`grid-${offset}-immediate`, { body: immediate, contentType: 'image/png' });
-            await test.info().attach(`grid-${offset}-expected`, { body: before, contentType: 'image/png' });
+          if (immediate.pattern !== before.pattern) {
+            await test.info().attach(`grid-${offset}-immediate`, { body: immediate.png, contentType: 'image/png' });
+            await test.info().attach(`grid-${offset}-expected`, { body: before.png, contentType: 'image/png' });
             await test.info().attach(`grid-${offset}-state`, {
               body: JSON.stringify({
-                wasBlank: immediate.equals(absent),
+                wasBlank: immediate.pattern === absent.pattern,
                 dom: await page.evaluate(() => ({
                   scrollY,
                   origin: getComputedStyle(document.body, '::before').backgroundPosition,
@@ -245,7 +268,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
               contentType: 'application/json',
             });
           }
-          expect(immediate.equals(before), `grid moved at ${offset}px`).toBe(true);
+          expect(immediate.pattern === before.pattern, `grid moved at ${offset}px`).toBe(true);
         }
 
         // Content/chrome changes must never relocate a background that has already been painted.
