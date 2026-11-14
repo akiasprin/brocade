@@ -30,6 +30,7 @@
 | 发布、回滚 Agent/Xray/配置/授权      | `.agents/runbooks/release-and-rollback.md` |
 | 排查生产异常                         | `.agents/runbooks/incident-response.md`    |
 | 深入分析设计、疑难修复或复杂实施方案 | `.agents/standards/design-planning.md`     |
+| 维护工程知识库或 Agent 工作流        | `.agents/README.md`                        |
 | 记录长期架构决策                     | `.agents/adr/README.md`                    |
 | 执行较长、跨层或需交接的改造         | `.agents/plans/TEMPLATE.md`                |
 

@@ -10,18 +10,18 @@ ModelSnapshot -> IR -> 节点产物 -> 期望状态 -> Agent 收敛
 
 ## 层次与所有权
 
-| 层 | 权威状态 | 不应承担的职责 |
-| --- | --- | --- |
-| `brocade-core` | 模型、IR、确定性节点产物 | 数据库、文件系统、网络或外部服务访问 |
-| `brocade-store` | 草稿、修订、发布、授权、凭据、配额和用量 | HTTP 表示和节点侧执行 |
-| `brocade-console` | 管理端与节点端 API、实时通道、证书、内嵌资源 | 本机系统配置收敛 |
-| `brocade-deployment` | 发布计划、热切换、Console/Agent 共享协议 | 数据库持久化和 UI 状态 |
-| `brocade-agent` | 本机期望状态、实际状态、收敛结果、离线缓冲 | 编辑模型或重写发布历史 |
-| `brocade-cube` | Agent 内的 Cube RPC、持久执行记录、Guest I/O 与恢复 | 用户、额度、Console 业务状态和独立 HTTP 控制面 |
-| `brocade-probe` | Console/Agent 共用的临时 Xray 拨测 | 长期运行的数据面服务 |
-| `frontend` | 操作者交互、草稿工作区、发布与观测呈现 | 建立第二份服务端权威状态 |
-| `components/xray-core` | Brocade 数据面 fork | 控制面业务规则 |
-| `components/cube` | 固定源码的可选 Cube 节点运行栈、原盘与网卡执行状态、CubeVS | 用户、额度和 Console 业务状态 |
+| 层                     | 权威状态                                                   | 不应承担的职责                                 |
+| ---------------------- | ---------------------------------------------------------- | ---------------------------------------------- |
+| `brocade-core`         | 模型、IR、确定性节点产物                                   | 数据库、文件系统、网络或外部服务访问           |
+| `brocade-store`        | 草稿、修订、发布、授权、凭据、配额和用量                   | HTTP 表示和节点侧执行                          |
+| `brocade-console`      | 管理端与节点端 API、实时通道、证书、内嵌资源               | 本机系统配置收敛                               |
+| `brocade-deployment`   | 发布计划、热切换、Console/Agent 共享协议                   | 数据库持久化和 UI 状态                         |
+| `brocade-agent`        | 本机期望状态、实际状态、收敛结果、离线缓冲                 | 编辑模型或重写发布历史                         |
+| `brocade-cube`         | Agent 内的 Cube RPC、持久执行记录、Guest I/O 与恢复        | 用户、额度、Console 业务状态和独立 HTTP 控制面 |
+| `brocade-probe`        | Console/Agent 共用的临时 Xray 拨测                         | 长期运行的数据面服务                           |
+| `frontend`             | 操作者交互、草稿工作区、发布与观测呈现                     | 建立第二份服务端权威状态                       |
+| `components/xray-core` | Brocade 数据面 fork                                        | 控制面业务规则                                 |
+| `components/cube`      | 固定源码的可选 Cube 节点运行栈、原盘与网卡执行状态、CubeVS | 用户、额度和 Console 业务状态                  |
 
 ## 跨层数据流
 
@@ -50,6 +50,8 @@ Brocade 有多个不能混为一谈的发布域：
 6. CVM 运行栈：可选的 Cubelet／CubeVS、Shim／Hypervisor、CoW 和系统制品；独立安装、校验与回退，不由普通 Agent 升级隐式替换。
 
 各域的操作与回滚规则见 `../runbooks/release-and-rollback.md`。
+
+基础版与容器版的编译、依赖、状态保护和分发边界见[容器扩展边界](cvm-feature-boundaries.md)。它们共用源码和迁移链，不能用单个环境是否安装 Cube 来判断产品构建能力。
 
 ## 核心不变量
 

@@ -19,7 +19,7 @@
 
 ## 3. 只读采证
 
-Console 主机的常用入口：
+以下命令以[手动部署](../../docs/manual-deployment.md)的 unit 名和安装路径为例。安装器管理的环境使用 `brocade.service` / `brocade.socket`，按[安装文档](../../docs/install.md)核对实际二进制位置后再替换示例：
 
 ```sh
 sudo systemctl status brocade-console
