@@ -13,10 +13,23 @@ for (const theme of ['dark', 'light']) {
       await expect(page.getByRole('tab', { name: /^规则/ })).toHaveAttribute('aria-selected', 'true');
       const card = page.locator('.node-chain-sheet');
       await expect(card.locator(':scope > .node-chain-use')).toHaveCount(2);
-      await expect(card.locator('.chain-rule-tree')).toHaveCount(2);
-      for (const tree of await card.locator('.chain-rule-tree').all()) {
-        await tree.locator('.chain-rule-node-head[role="button"]').first().click();
+      await expect(card.getByRole('switch', { name: /：链路可视化$/, checked: true })).toHaveCount(2);
+      for (const flow of await card.locator('.rule-flow').all()) {
+        await expect(flow).toBeVisible();
+        const input = flow.locator('.flow-well').getByRole('combobox', { name: '追踪域名或 IP' });
+        await expect(input).toBeVisible();
+        await input.fill('google.com');
+        expect((await input.boundingBox())!.width).toBeGreaterThanOrEqual(24);
+        await input.press('Escape');
       }
+      await card.getByRole('heading', { name: '链路规则', exact: true }).click();
+      const titlesFit = await card.locator('.flow-machine-head').evaluateAll(heads =>
+        heads.every(head => {
+          const facts = head.querySelector('.flow-machine-facts')!.getBoundingClientRect();
+          return facts.right <= head.getBoundingClientRect().right - 4;
+        }),
+      );
+      expect(titlesFit).toBe(true);
       const groups = await card.locator(':scope > .node-chain-use').evaluateAll(elements =>
         elements.map(element => {
           const separator = getComputedStyle(element, '::before');
@@ -24,6 +37,7 @@ for (const theme of ['dark', 'light']) {
           return {
             content: separator.content,
             width: parseFloat(separator.width),
+            height: separator.height,
             availableWidth: element.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
             marginLeft: parseFloat(separator.marginLeft),
             marginRight: parseFloat(separator.marginRight),
@@ -35,14 +49,17 @@ for (const theme of ['dark', 'light']) {
       expect(groups[0].content).toBe('none');
       const separator = groups[1];
       expect(separator.content).toBe('""');
-      expect(separator.width).toBeCloseTo(Math.min(160, separator.availableWidth * 0.45), 1);
-      expect(separator.marginLeft).toBeCloseTo(separator.marginRight, 1);
+      expect(separator.width).toBeCloseTo(separator.availableWidth, 1);
+      expect(separator.height).toBe('1px');
+      expect(separator.marginLeft).toBe(0);
+      expect(separator.marginRight).toBe(0);
       expect(separator.marginTop).toBe('12px');
-      expect(separator.marginBottom).toBe('12px');
+      expect(separator.marginBottom).toBe('0px');
       expect(await card.evaluate(element => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
       await page.evaluate(() => document.fonts.ready);
+      await card.locator(':scope > .node-chain-use').last().scrollIntoViewIfNeeded();
       await page.mouse.move(0, 0);
-      await expect(card).toHaveScreenshot(`chain-separator-${width}-${theme}.png`);
+      await expect(page).toHaveScreenshot(`chain-separator-${width}-${theme}.png`);
       expect(errors).toEqual([]);
     });
   }

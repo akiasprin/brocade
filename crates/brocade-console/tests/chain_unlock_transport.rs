@@ -6,7 +6,7 @@ use serde_json::json;
 use std::{
     fs,
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     os::unix::fs::PermissionsExt,
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex, Weak},
@@ -107,7 +107,17 @@ fn chain_client_reaches_remote_domain(ipv6: bool, traced: Option<&str>) {
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nloc=JP\n")
             .unwrap();
     });
-    let ingress_port = port();
+    // TCP and UDP have independent port namespaces. A TCP-free port can already belong to an
+    // unrelated UDP service, which would also make the Hysteria readiness probe pass too early.
+    let ingress_port = if traced == Some("hysteria") {
+        UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    } else {
+        port()
+    };
     let uuid = "1bd59ca0-a8f4-4f86-9c0e-23b4f9b08a24";
     let server_log = dir.path().join("server.log");
     let mut config = json!({"log":{"loglevel":"debug","error":server_log,"access":"none"},"dns":{"hosts":{"service.chain.invalid":if ipv6 { "::1" } else { "127.0.0.1" }}},"inbounds":[{"listen":"127.0.0.1","port":ingress_port,"protocol":"vless","settings":{"clients":[{"id":uuid}],"decryption":"none"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"certificates":[{"certificateFile":cert_path,"keyFile":key_path}]}}}],"outbounds":[{"protocol":"freedom","settings":{"domainStrategy":if ipv6 { "ForceIPv6" } else { "ForceIPv4" }}}]});
@@ -147,7 +157,8 @@ fn chain_client_reaches_remote_domain(ipv6: bool, traced: Option<&str>) {
     fs::set_permissions(&identity, fs::Permissions::from_mode(0o600)).unwrap();
     let config_path = dir.path().join("server.json");
     fs::write(&config_path, config.to_string()).unwrap();
-    let _server = Process(
+    let server_stderr = dir.path().join("server-stderr.log");
+    let mut server = Process(
         Command::new(&binary)
             .arg("-config")
             .arg(&config_path)
@@ -162,14 +173,19 @@ fn chain_client_reaches_remote_domain(ipv6: bool, traced: Option<&str>) {
             )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(fs::File::create(&server_stderr).unwrap()))
             .spawn()
             .unwrap(),
     );
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "serving Xray exited before the ingress became ready: {}",
+            fs::read_to_string(&server_stderr).unwrap_or_default()
+        );
         if if traced == Some("hysteria") {
-            std::net::UdpSocket::bind(("127.0.0.1", ingress_port)).is_err()
+            UdpSocket::bind(("127.0.0.1", ingress_port)).is_err()
         } else {
             TcpStream::connect(("127.0.0.1", ingress_port)).is_ok()
         } {
@@ -273,10 +289,11 @@ fn chain_client_reaches_remote_domain(ipv6: bool, traced: Option<&str>) {
     }
     drop(client);
     http.join().unwrap();
+    assert!(server.0.try_wait().unwrap().is_none());
     assert!(TcpStream::connect(("127.0.0.1", socks)).is_err());
     assert!(
         if traced == Some("hysteria") {
-            std::net::UdpSocket::bind(("127.0.0.1", ingress_port)).is_err()
+            UdpSocket::bind(("127.0.0.1", ingress_port)).is_err()
         } else {
             TcpStream::connect(("127.0.0.1", ingress_port)).is_ok()
         },

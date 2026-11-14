@@ -17,6 +17,7 @@ import { userTrafficPolicyKey } from '../src/panes/user-traffic-policy';
 import { SessionProvider } from '../src/session';
 import { Icon } from '../src/ui/icons';
 import type { Win } from '../src/wm/store';
+import { connectorFixture } from './fixtures/substore-data';
 
 const GiB = 1024 ** 3;
 const tenant = 'platform.acme';
@@ -104,6 +105,7 @@ beforeEach(() => {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/subscription-connectors/sub-store')) return Response.json(connectorFixture('ready'));
       if (String(input).endsWith('/source-access')) return Response.json({ revision: 0, ips: [], nodes: [] });
       if (String(input) === '/grant-probes/capability') {
         return Response.json({ available: false, reason: '测试中不发起拨测' });
@@ -714,6 +716,15 @@ describe('user roster rows', () => {
     const reviewer = mount('readonly');
     expect((reviewer.view.getByRole('button', { name: '节点' }) as HTMLButtonElement).disabled).toBe(true);
     expect((reviewer.view.getByRole('button', { name: '订阅' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((reviewer.view.getByRole('button', { name: 'Sub-Store' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('opens Sub-Store directly from the detail header without first opening the subscription card', async () => {
+    const { view } = mount();
+    fireEvent.click(view.getByRole('button', { name: 'Sub-Store' }));
+    const dialog = await view.findByRole('dialog', { name: 'alice 的订阅与节点' });
+    expect(await within(dialog).findByRole('region', { name: 'Sub-Store 后端同步' })).toBeTruthy();
+    expect(within(dialog).queryByRole('region', { name: 'Clash 订阅' })).toBeNull();
   });
 
   it('keeps availability and a compact UUID in the header while usage stays in the ledger', async () => {
@@ -733,7 +744,7 @@ describe('user roster rows', () => {
       [...header().querySelectorAll('.user-dhead-tools button')].map(
         button => button.getAttribute('aria-label') ?? button.textContent,
       ),
-    ).toEqual(['订阅', '节点', '更多操作']);
+    ).toEqual(['订阅', '节点', 'Sub-Store', '更多操作']);
     const status = within(header()).getByRole('status', { name: /可用/ });
     expect(status.textContent).toBe('可用');
     expect(status.getAttribute('title')).toContain('个接入点');

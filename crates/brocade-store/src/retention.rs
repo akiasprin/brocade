@@ -144,6 +144,12 @@ const fn detail_heads(table_name: &'static str, title: &'static str) -> Definiti
 /// Only tables whose rows can be deleted by age without changing model, billing or release truth.
 const DEFINITIONS: &[Definition] = &[
     history(
+        "ip_maintenance_runs",
+        "IP 养护执行记录",
+        "本机出口养护的轮次与动作回执",
+        30 * 24,
+    ),
+    history(
         "source_traffic_windows",
         "来源流量窗口",
         "用户、接入点与来源 IP 的 30 秒诊断观测；不参与计费。",

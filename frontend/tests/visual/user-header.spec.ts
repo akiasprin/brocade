@@ -42,7 +42,11 @@ for (const [name, width, height, query] of [
     expect(layout.overflow).toBe(false);
     expect(layout.name.width).toBeGreaterThan(0);
     expect(layout.name.right).toBeLessThanOrEqual(layout.identity.right);
-    expect(layout.identity.right).toBeLessThanOrEqual(layout.tools.left);
+    if (layout.header.width <= 440) {
+      expect(layout.tools.top).toBeGreaterThanOrEqual(layout.identity.bottom);
+    } else {
+      expect(layout.identity.right).toBeLessThanOrEqual(layout.tools.left);
+    }
     expect(layout.tools.right).toBeLessThanOrEqual(layout.header.right);
     if (layout.header.width <= 760) {
       expect(layout.tabs.top).toBeGreaterThanOrEqual(layout.identity.bottom);

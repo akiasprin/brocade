@@ -43,6 +43,7 @@ for (const [width, theme] of [
 }
 test('deep machine names remain reachable in the rule tree', async ({ page }) => {
   await open(page, 'rules', 320, 844);
+  await page.getByRole('switch', { name: /：链路可视化$/, checked: true }).click();
   const heads = page.locator('.chain-rule-node-head');
   await expect(heads).toHaveCount(12);
   const last = heads.last();

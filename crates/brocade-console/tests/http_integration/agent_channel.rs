@@ -234,3 +234,74 @@ async fn agent_channel_rpc_reuses_authentication_and_commit_notifications_and_re
     shutdown.request();
     server.abort();
 }
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn ip_maintenance_rpc_keeps_data_on_http_and_reuses_node_authentication() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_node(db.pool()).await;
+    let token = db.store.issue_node_token("n1").await.unwrap().token;
+    let shutdown = ShutdownSignal::new();
+    let app = agent_router_with_origin_realtime_and_shutdown(
+        db.store.clone(),
+        "http://127.0.0.1:8080".into(),
+        RealtimeService::new(Default::default()),
+        shutdown,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut socket = connect(address, &token).await;
+    ready(&mut socket).await;
+    let desired = rpc(
+        &mut socket,
+        1,
+        "GET",
+        "/agent/v1/ip-maintenance/desired",
+        Value::Null,
+        vec![],
+    )
+    .await;
+    assert_eq!(desired["status"], 200);
+    let desired: Value = serde_json::from_str(desired["body"].as_str().unwrap()).unwrap();
+    assert_eq!(desired["generation"], 0);
+    assert_eq!(desired["policy"]["enabled"], false);
+    let report = json!({"generation":0,"run_generation":0,"sequence":1,"agent_instance_id":"rpc-fixture","applied_control_sequence":0,"applied_stop_sequence":0,"applied_session_generation":0,"worker_observed_at_unix_secs":2000000000,"last_started_at_unix_secs":null,"cooldown_until_unix_secs":null,"phase":"disabled","round_id":null,"module":null,"actual_exit_ip":null,"actions_total":0,"action_index":0,"phase_deadline_unix_secs":null,"next_run_unix_secs":null,"daily_requests":0,"daily_response_bytes":0,"actions":[],"evidence":[],"reason":null,"observed_at_unix_secs":2000000000});
+    assert_eq!(
+        rpc(
+            &mut socket,
+            2,
+            "POST",
+            "/agent/v1/ip-maintenance/report",
+            report,
+            vec![]
+        )
+        .await["status"],
+        204
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ip_maintenance_state WHERE node_id='n1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+    assert_ne!(
+        rpc(
+            &mut socket,
+            3,
+            "GET",
+            "/agent/v1/ip-maintenance/data",
+            Value::Null,
+            vec![]
+        )
+        .await["status"],
+        200
+    );
+    server.abort();
+    let _ = server.await;
+}

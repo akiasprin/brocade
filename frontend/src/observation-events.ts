@@ -10,6 +10,12 @@ const QUERY_GROUPS: Record<string, readonly string[]> = {
   unlock: ['chain-unlock-probes', 'node-unlock-probe', 'chain-unlock-probe'],
   deployments: ['deployments', 'revisions'],
   tunnel_probes: ['tunnel-probes', 'tunnel-probe'],
+  ip_maintenance: [
+    'node-ip-maintenance',
+    'node-ip-maintenance-runs',
+    'node-ip-maintenance-run',
+    'node-ip-maintenance-day',
+  ],
 };
 // These are whole-fleet snapshots. A fleet reporting continuously must not turn one-second
 // notification batches into one full HTTP download per second. Faster job hints stay immediate.

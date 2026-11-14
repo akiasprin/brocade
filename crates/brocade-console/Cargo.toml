@@ -39,6 +39,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 # control plane reads only its country CIDRs, so node flags do not depend on a third-party lookup
 # API and do not leak the fleet's addresses one request at a time.
 prost = "0.14"
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
 # JWS 的 ES256 签名。跟工作区其他地方一样用 ring，不引第二套密码学栈。
 ring = "0.17"
 # 生成证书密钥和 CSR。默认特性就是 crypto+pem+ring，不带 aws-lc-rs——已在两个 musl

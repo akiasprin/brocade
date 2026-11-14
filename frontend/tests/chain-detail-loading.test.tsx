@@ -330,7 +330,10 @@ describe('链详情统一等待首屏依赖', () => {
     expect(view.getByRole('checkbox', { name: 'VLESS · TLS / REALITY（TCP / XHTTP）' })).toBeTruthy();
     expect(view.getByRole('option', { name: '全局站点 site.example' })).toBeTruthy();
     expect(view.getByText('链路规则')).toBeTruthy();
-    // 机器树逐台展开即规则表：不用先选机器，编辑器已经在页面上。
+    const mode = view.getByRole('switch', { name: /：链路可视化$/, checked: true });
+    expect(view.getByRole('combobox', { name: '追踪域名或 IP' })).toBeTruthy();
+    fireEvent.click(mode);
+    // 列表编辑逐台展开机器规则表。
     expect(view.getByRole('button', { name: /entry.*入口/ }).getAttribute('aria-expanded')).toBe('true');
     expect(view.container.querySelector('.chain-rule-body:not([hidden]) .rule-editor')).toBeTruthy();
     expect(view.queryByRole('status')).toBeNull();
@@ -458,6 +461,7 @@ describe('链详情统一等待首屏依赖', () => {
     const input = view.getByRole('textbox', { name: '链名' }) as HTMLInputElement;
     fireEvent.change(input, { target: { value: '继续编辑的名称' } });
     const page = view.container.querySelector('.chain-detailpage');
+    fireEvent.click(view.getByRole('switch', { name: /：链路可视化$/, checked: true }));
     const editor = view.container.querySelector('.rule-editor')!;
     fireEvent.click(within(editor as HTMLElement).getByRole('button', { name: '＋ 加一条' }));
     const saveRules = view.getByRole('button', { name: '保存到草稿' }) as HTMLButtonElement;

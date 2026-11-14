@@ -392,6 +392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // durable in PostgreSQL; this process is only a leased executor, so restart and multi-instance
     // deployments cannot duplicate a check.
     brocade_console::tunnel_probe::spawn(store.clone());
+    brocade_console::ip_maintenance::spawn(store.clone(), shutdown.clone());
     brocade_console::substore::spawn(store.clone(), agent_origin.clone(), shutdown.clone());
 
     // Which of the two sources the front end comes from is the same decision on both listener
@@ -468,19 +469,29 @@ async fn database_command() -> Result<bool, Box<dyn std::error::Error>> {
     let store = PgStore::connect(&url)
         .await
         .map_err(|_| "数据库连接失败；请检查原有数据库配置，不会创建新库")?;
-    let check = store
-        .check_database_upgrade()
-        .await
-        .map_err(|_| "无法读取数据库迁移历史")?;
+    // Maintenance-only opt-in; HTTP startup retains the strict ordinary migration path.
+    let ip_compat = match env::var("BROCADE_PRERELEASE_IP_MAINTENANCE_COMPAT") {
+        Err(env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        _ => return Err("BROCADE_PRERELEASE_IP_MAINTENANCE_COMPAT 仅接受临时值 1".into()),
+    };
+    let check = if ip_compat {
+        store.check_ip_maintenance_upgrade().await
+    } else {
+        store.check_database_upgrade().await
+    }
+    .map_err(|_| "无法读取数据库迁移历史")?;
     println!("{}", serde_json::to_string(&check)?);
     if !check.compatible {
         return Err("数据库不在支持的升级路径中，未执行迁移".into());
     }
     if migrate {
-        store
-            .migrate_database_schema()
-            .await
-            .map_err(|_| "数据库迁移失败；保留备份和迁移历史，请检查后重试")?;
+        let result = if ip_compat {
+            store.migrate_ip_maintenance_schema().await
+        } else {
+            store.migrate_database_schema().await
+        };
+        result.map_err(|_| "数据库迁移失败；保留备份和迁移历史，请检查后重试")?;
     }
     #[cfg(not(feature = "cvm"))]
     store.ensure_cvm_released().await?;

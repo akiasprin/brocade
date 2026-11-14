@@ -3,6 +3,7 @@ pub mod agent_channel;
 pub mod cvm;
 pub mod forwarding_probe;
 pub mod hotswap;
+pub mod ip_maintenance;
 pub mod other_domain;
 pub mod plan;
 pub mod protocol;

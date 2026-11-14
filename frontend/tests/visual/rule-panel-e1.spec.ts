@@ -3,8 +3,9 @@ import { expect, test, type Page } from '@playwright/test';
 async function open(page: Page, width: number, theme = 'light', extra = '') {
   await page.setViewportSize({ width, height: 900 });
   await page.goto(`/tests/fixtures/rule-layout-preview.html?theme=${theme}${extra}`);
+  await page.getByRole('switch', { checked: true }).click();
   await expect(page.locator('.chain-rule-node-head')).not.toHaveCount(0);
-  // 链路规则默认只展开当前机器；这组截图要看整棵树，逐台展开。
+  // 列表编辑默认只展开当前机器；这组截图要看整棵树，逐台展开。
   await expect(page.locator('.chain-rule-node-head[aria-expanded="true"]')).toHaveCount(1);
   const collapsed = page.locator('.chain-rule-node-head[aria-expanded="false"]');
   while ((await collapsed.count()) > 0) await collapsed.first().click();

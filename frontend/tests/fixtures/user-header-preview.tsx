@@ -1,3 +1,5 @@
+import { clashRulesTransport } from './clash-rules-data';
+import { rulesKey } from '../../src/panes/clash-rules/editor';
 import { subStoreTransport } from './substore-data';
 import { nodeLinksFixture } from './node-links-data';
 // Visual acceptance fixture: the production users pane with synthetic users only; no network access.
@@ -312,9 +314,22 @@ if (nodes) {
     close() {}
   } as unknown as typeof EventSource;
 }
+const rulesTransport = clashRulesTransport(!['readonly', 'publisher'].includes(role));
+Object.defineProperty(window, '__userPreviewRefreshClashRules', {
+  value: () => client.invalidateQueries({ queryKey: rulesKey(tenant, selected) }),
+});
+const fixtureRequests: { path: string; method: string; body: string | null }[] = [];
+Object.defineProperty(window, '__userPreviewRequests', { value: fixtureRequests });
 globalThis.fetch = async (input, init) => {
+  fixtureRequests.push({
+    path: String(input),
+    method: init?.method ?? 'GET',
+    body: init?.body ? String(init.body) : null,
+  });
   const path = String(input);
   const url = new URL(path, location.origin);
+  const rulesResponse = rulesTransport(url, init);
+  if (rulesResponse) return rulesResponse;
   const nodeResponse = nodes?.transport(url, init);
   if (nodeResponse) return nodeResponse;
   const connectorResponse = await connectorTransport(url, init);

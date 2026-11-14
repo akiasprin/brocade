@@ -333,7 +333,7 @@ for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
     }
   });
 
-  test(`${engine}: observation panel titles retain the shared background in every theme`, async () => {
+  test(`${engine}: observation panel titles retain shared bands and the continuous runtime surface`, async () => {
     const browser = await launcher.launch();
     try {
       for (const width of [390, 1440]) {
@@ -359,6 +359,8 @@ for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
                 title: element.textContent,
                 background: getComputedStyle(element).backgroundColor,
                 cardBackground: getComputedStyle(element.parentElement).backgroundColor,
+                continuous: element.parentElement.classList.contains('nd-runtime'),
+                border: getComputedStyle(element).borderBottomWidth,
                 height: element.getBoundingClientRect().height,
               })),
             }));
@@ -366,8 +368,13 @@ for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
             assert.notEqual(expected, 'rgba(0, 0, 0, 0)');
             for (const header of headers) {
               const context = `${theme}/${palette} ${width}px ${header.title}`;
-              assert.equal(header.background, expected, `${context}: retain the shared title band`);
-              assert.notEqual(header.background, header.cardBackground, `${context}: distinguish title from content`);
+              if (header.continuous) {
+                assert.equal(header.background, 'rgba(0, 0, 0, 0)', `${context}: retain the continuous card surface`);
+                assert.equal(header.border, '0px', `${context}: do not divide the continuous card`);
+              } else {
+                assert.equal(header.background, expected, `${context}: retain the shared title band`);
+                assert.notEqual(header.background, header.cardBackground, `${context}: distinguish title from content`);
+              }
               assert.equal(header.height, 36, `${context}: retain the content-panel title height`);
             }
             await page.close();

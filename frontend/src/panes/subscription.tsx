@@ -1,3 +1,5 @@
+import { ClashRulesEditor, rulesKey } from './clash-rules/editor';
+import { isStandardRules } from './clash-rules/context';
 import { SubscriptionLogo } from './subscription-logo';
 import {
   SubStoreShell,
@@ -10,6 +12,7 @@ import {
 import {
   useEffect,
   useCallback,
+  useLayoutEffect,
   useId,
   useRef,
   useState,
@@ -25,6 +28,7 @@ import {
   cancelGrantProbe,
   fetchArtifactContent,
   fetchClashSubscription,
+  fetchClashRules,
   fetchGrantProbeCapability,
   fetchGrantProbeJob,
   fetchMyArtifact,
@@ -53,7 +57,8 @@ import { bytes } from '../ui/format';
 import { Icon, type IconName } from '../ui/icons';
 import { RegionFlag } from '../ui/region-flag';
 
-export type SubscriptionKind = 'uri' | 'clash';
+type SubscriptionTab = 'uri' | 'clash';
+export type SubscriptionKind = SubscriptionTab | 'substore';
 
 type FamilyPick = 'both' | ArtifactFamily;
 type ProtocolPick = 'both' | ArtifactProtocol;
@@ -77,7 +82,7 @@ const NODE_PROTOCOL_PICKS = [...PROTOCOL_PICKS, { value: 'mtproto' as const, lab
 const PROTOCOL_DETAIL: Partial<Record<ProtocolPick, string>> = { both: 'VLESS · AnyTLS · Hysteria 2' };
 const FAMILY_DETAIL: Partial<Record<FamilyPick, string>> = { both: 'IPv4 · IPv6' };
 
-const TABS: { value: SubscriptionKind; label: string; icon: IconName }[] = [
+const TABS: { value: SubscriptionTab; label: string; icon: IconName }[] = [
   { value: 'clash', label: '订阅', icon: 'subscription' },
   { value: 'uri', label: '节点', icon: 'nodeLinks' },
 ];
@@ -110,7 +115,7 @@ export function SubscriptionViewer({
   onProbePassed?: (result: { probeId: string; itemId: string }) => void;
   onClose: () => void;
 }) {
-  const [tab, setTab] = useState<SubscriptionKind>(kind);
+  const [tab, setTab] = useState<SubscriptionTab>(kind === 'substore' ? 'clash' : kind);
   const navigationGuard = useRef<SubStoreNavigationGuard | null>(null);
   const registerGuard = useCallback((guard: SubStoreNavigationGuard | null) => {
     navigationGuard.current = guard;
@@ -121,10 +126,10 @@ export function SubscriptionViewer({
   // VLESS 自签入口没有可互通的链接写法，服务端无论是否允许 insecure 都会跳过并给出说明。
   const [allowInsecure, setAllowInsecure] = useState(true);
   const ids = useId();
-  const tabId = (value: SubscriptionKind) => `${ids}-tab-${value}`;
+  const tabId = (value: SubscriptionTab) => `${ids}-tab-${value}`;
   const panel: TabPanelProps = { role: 'tabpanel', id: `${ids}-panel`, 'aria-labelledby': tabId(tab) };
 
-  const changeTab = (next: SubscriptionKind) => {
+  const changeTab = (next: SubscriptionTab) => {
     const go = () => {
       if (next === 'clash' && protocol === 'mtproto') setProtocol('both');
       setTab(next);
@@ -187,6 +192,7 @@ export function SubscriptionViewer({
           <ClashSubscription
             tenant={tenant}
             user={user}
+            initialCard={kind === 'substore' ? 'substore' : 'clash'}
             selfService={selfService}
             onGuard={registerGuard}
             protocol={protocol}
@@ -238,6 +244,7 @@ const HAITUN_NOTE =
 function ClashSubscription({
   tenant,
   user,
+  initialCard,
   selfService,
   onGuard,
   protocol,
@@ -248,6 +255,7 @@ function ClashSubscription({
 }: {
   tenant: string;
   user: string;
+  initialCard: PassCard;
   selfService: boolean;
   onGuard: (guard: SubStoreNavigationGuard | null) => void;
   protocol: ProtocolPick;
@@ -257,7 +265,33 @@ function ClashSubscription({
   panel: TabPanelProps;
 }) {
   const qrRef = useRef<SVGSVGElement>(null);
-  const [front, setFront] = useState<PassCard>('clash');
+  const [rulesOpen, setRulesOpen] = useState(false);
+  const rulesGuard = useRef<SubStoreNavigationGuard | null>(null);
+  const shellGuard = useRef<SubStoreNavigationGuard | null>(null);
+  const registerRulesGuard = useCallback((guard: SubStoreNavigationGuard | null) => {
+    rulesGuard.current = guard;
+  }, []);
+  const registerShellGuard = useCallback((guard: SubStoreNavigationGuard | null) => {
+    shellGuard.current = guard;
+  }, []);
+  const mayLeave = useCallback((next: () => void) => {
+    if (rulesGuard.current && !rulesGuard.current(next)) return false;
+    if (shellGuard.current && !shellGuard.current(next)) return false;
+    return true;
+  }, []);
+  useLayoutEffect(() => {
+    onGuard(mayLeave);
+    return () => onGuard(null);
+  }, [onGuard, mayLeave]);
+  const go = (next: () => void) => {
+    if (mayLeave(next)) next();
+  };
+  const routing = useQuery({
+    queryKey: rulesKey(tenant, user),
+    queryFn: ({ signal }) => fetchClashRules(tenant, user, signal),
+    retry: false,
+  });
+  const [front, setFront] = useState<PassCard>(initialCard);
   // 换过卡之后新卡才播滑入动效；首次打开时弹窗自己已有进场动效。
   const [swapped, setSwapped] = useState(false);
   const qc = useQueryClient();
@@ -299,92 +333,141 @@ function ClashSubscription({
   );
 
   return (
-    <SubStoreShell tenant={tenant} user={user} onGuard={onGuard} panel={panel}>
+    <SubStoreShell
+      tenant={tenant}
+      user={user}
+      onGuard={registerShellGuard}
+      panel={panel}
+      waitForConnector={front === 'substore'}
+    >
       <SubStoreContent>
         {available => (
-          <div className="sub-dialog-body sub-subscription-body" {...panel}>
-            <div
-              className={`sub-pass-stack${haitun || available ? ' has-back' : ''}${haitun && available ? ' substore-two-backs' : ''}${swapped ? ' swapped' : ''}`}
-            >
-              <SubscriptionTicketPeeks
-                front={front}
-                haitun={haitun}
-                value={value}
-                onSelect={next => {
-                  setFront(next);
-                  setSwapped(true);
-                }}
-              />
-              {front === 'substore' ? (
-                <SubStoreTicket />
-              ) : haitun && front === 'haitun' ? (
-                <HaitunPass haitun={haitun} url={haitunUrl} fields={fields} />
-              ) : value && standardUrl ? (
-                <ClashPass value={value} url={standardUrl} qrRef={qrRef} fields={fields} />
-              ) : (
-                <div className="sub-pass substore-unavailable">
-                  {subscription.error ? <ErrorBox error={subscription.error} /> : <Loading variant="code" />}
-                </div>
-              )}
-            </div>
-            {front === 'substore' ? (
-              <SubStoreActions />
-            ) : haitun && front === 'haitun' ? (
-              <>
-                <div className="sub-pass-actions">
-                  {haitunUrl ? (
-                    <>
-                      <CopyButton className="btn primary sub-pass-main" text={haitunUrl} label="复制测速地址">
-                        {copyContent}
-                      </CopyButton>
-                      <RevokeButton
-                        pending={revokeHaitun.isPending}
-                        disabled={haitunPending}
-                        onRevoke={() => {
-                          issueHaitun.reset();
-                          revokeHaitun.mutate();
-                        }}
-                      />
-                    </>
+          <div className={`clash-editor-split${rulesOpen && front === 'clash' ? ' open' : ''}`} {...panel}>
+            <div className="clash-editor-left">
+              <div className="sub-dialog-body sub-subscription-body">
+                <div
+                  className={`sub-pass-stack${haitun || available ? ' has-back' : ''}${haitun && available ? ' substore-two-backs' : ''}${swapped ? ' swapped' : ''}`}
+                >
+                  <SubscriptionTicketPeeks
+                    front={front}
+                    haitun={haitun}
+                    value={value}
+                    onSelect={next => {
+                      go(() => {
+                        setRulesOpen(false);
+                        setFront(next);
+                        setSwapped(true);
+                      });
+                    }}
+                  />
+                  {front === 'substore' ? (
+                    <SubStoreTicket />
+                  ) : haitun && front === 'haitun' ? (
+                    <HaitunPass haitun={haitun} url={haitunUrl} fields={fields} />
+                  ) : value && standardUrl ? (
+                    <ClashPass
+                      value={value}
+                      url={standardUrl}
+                      qrRef={qrRef}
+                      fields={
+                        <>
+                          {fields}
+                          <button
+                            type="button"
+                            className="sub-pass-pick clash-rule-field"
+                            data-label="规则"
+                            aria-label="规则"
+                            aria-expanded={rulesOpen}
+                            onClick={() => (rulesOpen ? go(() => setRulesOpen(false)) : setRulesOpen(true))}
+                          >
+                            <span>
+                              {routing.data
+                                ? isStandardRules(routing.data.rules, routing.data.catalog)
+                                  ? '标准'
+                                  : '自定义'
+                                : routing.error
+                                  ? '重试'
+                                  : '…'}
+                            </span>
+                            <Icon of="chevronLeft" size={12} className="clash-rule-chevron" />
+                          </button>
+                        </>
+                      }
+                    />
                   ) : (
-                    <button
-                      type="button"
-                      className="btn primary sub-pass-main"
-                      disabled={haitunPending}
-                      onClick={() => {
-                        revokeHaitun.reset();
-                        issueHaitun.mutate();
-                      }}
-                    >
-                      {issueHaitun.isPending
-                        ? '生成中…'
-                        : haitun.status === 'revoked'
-                          ? '重新生成测速地址'
-                          : '生成测速地址'}
-                    </button>
+                    <div className="sub-pass substore-unavailable">
+                      {subscription.error ? <ErrorBox error={subscription.error} /> : <Loading variant="code" />}
+                    </div>
                   )}
                 </div>
-                {actionError && <ErrorBox error={actionError} />}
-              </>
-            ) : standardUrl ? (
-              <div className="sub-pass-actions">
-                <CopyButton className="btn primary sub-pass-main" text={standardUrl} label="复制订阅地址">
-                  {copyContent}
-                </CopyButton>
-                <button
-                  type="button"
-                  className="btn sub-pass-side"
-                  aria-label="下载二维码"
-                  title="下载二维码"
-                  onClick={() => {
-                    if (qrRef.current) downloadSubscriptionQr(qrRef.current);
-                  }}
-                >
-                  <Icon of="download" size={14} />
-                  下载
-                </button>
+                {front === 'substore' ? (
+                  <SubStoreActions />
+                ) : haitun && front === 'haitun' ? (
+                  <>
+                    <div className="sub-pass-actions">
+                      {haitunUrl ? (
+                        <>
+                          <CopyButton className="btn primary sub-pass-main" text={haitunUrl} label="复制测速地址">
+                            {copyContent}
+                          </CopyButton>
+                          <RevokeButton
+                            pending={revokeHaitun.isPending}
+                            disabled={haitunPending}
+                            onRevoke={() => {
+                              issueHaitun.reset();
+                              revokeHaitun.mutate();
+                            }}
+                          />
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          className="btn primary sub-pass-main"
+                          disabled={haitunPending}
+                          onClick={() => {
+                            revokeHaitun.reset();
+                            issueHaitun.mutate();
+                          }}
+                        >
+                          {issueHaitun.isPending
+                            ? '生成中…'
+                            : haitun.status === 'revoked'
+                              ? '重新生成测速地址'
+                              : '生成测速地址'}
+                        </button>
+                      )}
+                    </div>
+                    {actionError && <ErrorBox error={actionError} />}
+                  </>
+                ) : standardUrl ? (
+                  <div className="sub-pass-actions">
+                    <CopyButton className="btn primary sub-pass-main" text={standardUrl} label="复制订阅地址">
+                      {copyContent}
+                    </CopyButton>
+                    <button
+                      type="button"
+                      className="btn sub-pass-side"
+                      aria-label="下载二维码"
+                      title="下载二维码"
+                      onClick={() => {
+                        if (qrRef.current) downloadSubscriptionQr(qrRef.current);
+                      }}
+                    >
+                      <Icon of="download" size={14} />
+                      下载
+                    </button>
+                  </div>
+                ) : null}
               </div>
-            ) : null}
+            </div>
+            {rulesOpen && front === 'clash' && (
+              <ClashRulesEditor
+                tenant={tenant}
+                user={user}
+                onClose={() => go(() => setRulesOpen(false))}
+                onGuard={registerRulesGuard}
+              />
+            )}
           </div>
         )}
       </SubStoreContent>

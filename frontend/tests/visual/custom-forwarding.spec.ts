@@ -18,7 +18,8 @@ for (const [width, theme] of [
       await page.setViewportSize({ width, height: 900 });
       if (surface === 'rules') {
         await page.goto(`/tests/fixtures/rule-layout-preview.html?theme=${theme}`);
-        // 链路规则默认只展开入口机器。
+        await page.getByRole('switch', { checked: true }).click();
+        // 列表编辑默认只展开入口机器。
         if ((await akileHead(page).getAttribute('aria-expanded')) !== 'true') await akileHead(page).click();
         await akileTarget(page).click();
       } else {

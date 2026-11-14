@@ -1,5 +1,33 @@
 import { test, expect, webkit, type Page } from '@playwright/test';
 test.use({ deviceScaleFactor: 2 });
+for (const theme of ['dark', 'light']) {
+  for (const width of [1440, 390, 320]) {
+    test(`direct header entry ${width} ${theme}`, async ({ page }) => {
+      const errors: string[] = [];
+      page.on('pageerror', error => errors.push(error.message));
+      await page.clock.setFixedTime(new Date('2026-11-06T12:00:00Z'));
+      await page.setViewportSize({ width, height: 900 });
+      await page.goto(`/tests/fixtures/user-header-preview.html?theme=${theme}&substore=ready&haitun=active`);
+      const entry = page.getByRole('button', { name: 'Sub-Store', exact: true });
+      await expect(entry.getByText('Sub-Store', { exact: true })).toBeVisible();
+      await expect(entry).toBeInViewport({ ratio: 1 });
+      const bounds = await entry.evaluate(element => {
+        const button = element.getBoundingClientRect();
+        const label = element.querySelector('.user-dact-label')!.getBoundingClientRect();
+        return { buttonRight: button.right, labelRight: label.right };
+      });
+      expect(bounds.labelRight).toBeLessThanOrEqual(bounds.buttonRight);
+      await page.evaluate(() => document.fonts.ready);
+      await expect(page.locator('.user-dhead')).toHaveScreenshot(`substore-entry-${width}-${theme}.png`);
+      await entry.click();
+      const dialog = page.getByRole('dialog', { name: 'alice 的订阅与节点' });
+      await expect(dialog.getByRole('region', { name: 'Sub-Store 后端同步', exact: true })).toBeVisible();
+      await expect(dialog.getByRole('region', { name: 'Clash 订阅', exact: true })).toHaveCount(0);
+      expect(errors).toEqual([]);
+    });
+  }
+}
+
 async function open(page: Page, scene: string, theme: string, width = 1440, height = 900) {
   const errors: string[] = [];
   page.on('pageerror', e => errors.push(e.message));

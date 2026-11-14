@@ -29,7 +29,8 @@
     "qrcode.react": "^4.2.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "tldts": "7.4.11"
+    "tldts": "7.4.11",
+    "yaml": "2.9.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

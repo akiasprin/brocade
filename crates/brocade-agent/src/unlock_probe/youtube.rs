@@ -7,6 +7,9 @@ use brocade_deployment::unlock_probe::{
 };
 use std::time::Instant;
 
+pub(crate) const PREMIUM_TARGET: &str = "https://www.youtube.com/premium?hl=en";
+pub(crate) const MUSIC_TARGET: &str = "https://music.youtube.com/?hl=en";
+
 fn privacy_region<'a>(cookies: impl IntoIterator<Item = &'a str>) -> Option<String> {
     cookies
         .into_iter()
@@ -39,7 +42,13 @@ fn premium_result(page: &Page) -> UnlockResult {
         &page.response.body,
         page.url.as_str(),
     );
-    outcome.region = privacy_region(page.response.header_values("set-cookie")).or(outcome.region);
+    outcome.region = response_country(
+        &page.response.body,
+        &page
+            .response
+            .header_values("set-cookie")
+            .collect::<Vec<_>>(),
+    );
     outcome.apply_youtube_premium_region_policy();
     outcome
 }
@@ -248,7 +257,7 @@ fn detect_with(mut request: impl FnMut(&str) -> Result<Page, UnlockCode>) -> Unl
     // Independent facts, one path and one service deadline. A failed homepage, Premium
     // response or CDN mapping never substitutes its state or country for another item.
     let webpage = page_result(request("https://www.youtube.com/"), true);
-    let premium = page_result(request("https://www.youtube.com/premium?hl=en"), false);
+    let premium = page_result(request(PREMIUM_TARGET), false);
     let started = Instant::now();
     let mapping = request("https://redirector.googlevideo.com/report_mapping");
     let elapsed_ms = started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
@@ -265,6 +274,10 @@ fn detect_with(mut request: impl FnMut(&str) -> Result<Page, UnlockCode>) -> Unl
         cdn,
     });
     outcome
+}
+
+pub(super) fn response_country(body: &str, cookies: &[&str]) -> Option<String> {
+    privacy_region(cookies.iter().copied()).or_else(|| topbar_region(body))
 }
 
 #[cfg(test)]

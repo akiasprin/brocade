@@ -16,3 +16,4 @@ brocade-core = { path = "../brocade-core" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22.1"
+url = "2"

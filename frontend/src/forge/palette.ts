@@ -22,31 +22,31 @@ export const PALETTES: PaletteOption[] = [
     key: 'jinzi',
     name: '堇紫',
     description: '深紫操作 · 同色系数据',
-    action: '#9167da',
+    action: '#c1a7ee',
   },
   {
     key: 'dailan',
     name: '黛蓝',
     description: '柔蓝操作 · 同色系数据',
-    action: '#7698d6',
+    action: '#91b8f2',
   },
   {
     key: 'songlv',
     name: '松绿',
     description: '松绿操作 · 同色系数据',
-    action: '#658f3e',
+    action: '#b5ce98',
   },
   {
     key: 'oufen',
     name: '藕粉',
     description: '蔷薇操作 · 同色系数据',
-    action: '#b5628f',
+    action: '#e0a7c4',
   },
   {
     key: 'xuanmo',
     name: '玄墨',
     description: '灰白操作 · 钢青数据',
-    action: '#d1d1cd',
+    action: '#c1c8d2',
   },
 ];
 

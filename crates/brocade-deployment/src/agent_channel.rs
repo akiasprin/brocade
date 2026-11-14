@@ -88,6 +88,7 @@ pub fn rpc_allowed(method: &str, path: &str) -> bool {
         "GET" => matches!(
             path,
             "/agent/v1/desired"
+                | "/agent/v1/ip-maintenance/desired"
                 | "/agent/v1/agent-release"
                 | "/agent/v1/xray-release"
                 | "/agent/v1/source-access"
@@ -102,7 +103,8 @@ pub fn rpc_allowed(method: &str, path: &str) -> bool {
         ),
         "POST" => matches!(
             path,
-            "/agent/v1/agent-release/report"
+            "/agent/v1/ip-maintenance/report"
+                | "/agent/v1/agent-release/report"
                 | "/agent/v1/xray-release/report"
                 | "/agent/v1/source-access"
                 | "/agent/v1/traffic-limit"

@@ -2,34 +2,25 @@
 
 不使用安装器、以 systemd 与 Nginx 部署 Console 的完整示例。构建前置条件见[从源码构建](build.md)。
 
-以下示例假定：构建主机为 `x86_64` Linux，目标服务器为 `aarch64` Ubuntu，并使用 PostgreSQL、systemd 与 Nginx。域名、账号和密码均为占位符，部署时必须替换。若目标架构与构建主机一致，可省略交叉编译相关设置。
+以下示例假定：构建主机为 `x86_64` Linux，目标服务器为 `aarch64` Ubuntu，并使用 PostgreSQL、systemd 与 Nginx。域名、账号和密码均为占位符，部署时必须替换。目标为其他受支持架构或选择容器版时，按本轮产物记录替换示例中的架构与变体。
 
-## 1. 交叉编译控制面
+## 1. 构建控制面
 
-在构建主机安装目标标准库与交叉链接器：
-
-```sh
-rustup target add aarch64-unknown-linux-gnu
-sudo apt-get update
-sudo apt-get install gcc-aarch64-linux-gnu
-```
-
-随后构建控制面：
+按[构建前置条件](build.md)准备工具链，在固定、独占且构建期间不再编辑的工作树中执行统一发行入口。以下以基础版为例：
 
 ```sh
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-  cargo build --release --locked \
-  --target aarch64-unknown-linux-gnu \
-  -p brocade-console
+python3 scripts/build-release.py --flavor base
 ```
 
-产物位于：
+入口准备 x86_64 与 aarch64 的 Console、Launcher、内嵌静态 Agent 和 Xray，按变体隔离缓存并记录来源与摘要。容器版使用 `--flavor cvm`，目标服务器的架构不改变双架构发行要求。具体调度、缓存与耗时记录见[发行构建规范](../.agents/runbooks/console-deployment.md#固定位置双架构与耗时记录)。
+
+本例部署到 aarch64，基础版产物位于：
 
 ```text
-target/aarch64-unknown-linux-gnu/release/brocade-console
+target/brocade-release/base/cargo/aarch64-unknown-linux-gnu/release/brocade-console
 ```
 
-`brocade-console` 的构建脚本还会生成两种架构的静态 agent。对构建目录执行清理后，这些内嵌产物需要重新编译，因此完整构建所需时间通常明显长于普通 Rust crate。
+以本轮 `target/brocade-release/base/preparation.json` 记录的实际路径、源码身份和 SHA-256 为准。目标为 x86_64 或选择容器版时，相应替换目标三元组和路径中的变体；构建成功后仍须完成与改动相称的验证。
 
 ## 2. 准备系统账号与 PostgreSQL
 
@@ -56,7 +47,7 @@ sudo -u postgres createdb --owner=brocade brocade
 先将构建产物上传至目标服务器的临时目录，再安装到 `/opt/brocade`：
 
 ```sh
-scp target/aarch64-unknown-linux-gnu/release/brocade-console \
+scp target/brocade-release/base/cargo/aarch64-unknown-linux-gnu/release/brocade-console \
   deploy@console.example.net:/tmp/brocade-console
 
 ssh deploy@console.example.net \
@@ -229,7 +220,7 @@ sha256sum /opt/brocade/brocade-console
 新二进制应先上传到临时路径，再原子替换并重启服务。上传阶段不会中断现有进程：
 
 ```sh
-scp target/aarch64-unknown-linux-gnu/release/brocade-console \
+scp target/brocade-release/base/cargo/aarch64-unknown-linux-gnu/release/brocade-console \
   deploy@console.example.net:/tmp/brocade-console.new
 
 ssh deploy@console.example.net '

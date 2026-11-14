@@ -1,6 +1,9 @@
 mod agent_rpc;
+mod clash_rules;
 #[cfg(feature = "cvm")]
 mod cvm;
+mod geosite;
+mod ip_maintenance;
 mod observations;
 mod realtime_channel;
 mod substore;
@@ -341,6 +344,7 @@ pub struct AppState {
     store: PgStore,
     bootstrap_credential: Option<BootstrapCredential>,
     geoip: crate::geoip::GeoIpLookup,
+    geosite: crate::geosite::Lookup,
     dist: AgentDistribution,
     // Optional dedicated subscription origin. When absent, subscriptions follow the effective
     // Agent public URL, including a value changed live from the settings page.
@@ -556,6 +560,7 @@ impl AppState {
             store,
             bootstrap_credential: None,
             geoip: crate::geoip::GeoIpLookup::default(),
+            geosite: crate::geosite::Lookup::default(),
             subscription_public_url_override,
             subscription_rate: Arc::new(Mutex::new(HashMap::new())),
             quota_wake,
@@ -843,6 +848,7 @@ async fn mask_assets(request: Request, next: Next) -> Response {
         admin.role == AdminRole::User
             && (self_route_may_hold_secrets(request.method(), request.uri().path())
                 || substore::is_for_self(&admin, request.method(), request.uri().path())
+                || clash_rules::is_for_self(&admin, request.method(), request.uri().path())
                 || (admin.self_user.is_some()
                     && is_user_cvm_path(request.method(), request.uri().path()))
                 || forwarding_route_is_for_self(&admin, request.method(), request.uri().path()))
@@ -921,6 +927,8 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         return false;
     }
     const PUBLIC_PATHS: &[&str] = &[
+        "/routing/geosite",
+        "/ip-maintenance/regions",
         "/healthz",
         "/auth/state",
         "/agent-log-policy",
@@ -970,7 +978,19 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         || is_user_forwarding_overview_path(path)
         || is_tunnel_probe_view_path(path)
         || is_unlock_probe_view_path(path)
+        || is_ip_maintenance_view_path(path)
         || is_cvm_view_path(path)
+}
+
+fn is_ip_maintenance_view_path(path: &str) -> bool {
+    let parts = path.split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["", "nodes", node, "ip-maintenance"] | ["", "nodes", node, "ip-maintenance", "runs"] => {
+            !node.is_empty()
+        }
+        ["", "nodes", node, "ip-maintenance", "runs", run] => !node.is_empty() && !run.is_empty(),
+        _ => false,
+    }
 }
 
 fn is_unlock_probe_view_path(path: &str) -> bool {
@@ -1030,6 +1050,7 @@ fn user_may(method: &axum::http::Method, path: &str) -> bool {
             && is_grant_probe_job_path(path))
         || (method == axum::http::Method::GET && is_grant_probe_events_path(path))
         || substore::is_connector_path(method, path)
+        || clash_rules::allowed(method, path)
         || is_user_forwarding_path(method, path)
         || is_user_cvm_path(method, path)
 }
@@ -1420,6 +1441,7 @@ fn admin_router_with_state(state: AppState) -> Router {
         .merge(cvm_admin_routes())
         .route("/healthz", get(healthz))
         .route("/console/version", get(console_version))
+        .route("/routing/geosite", get(geosite::matches))
         .route("/diagnostics/performance", get(performance_diagnostics))
         .route("/auth/state", get(auth_state))
         .route("/auth/init", post(auth_init))
@@ -1601,6 +1623,31 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/model/apply", post(apply_draft))
         .route("/model/preview/artifact", post(preview_draft_artifact))
         .route("/compile/{revision_id}", get(compile_revision))
+        .route("/ip-maintenance/regions", get(ip_maintenance::catalog))
+        .route(
+            "/nodes/{node_id}/ip-maintenance",
+            get(ip_maintenance::view).put(ip_maintenance::update),
+        )
+        .route(
+            "/nodes/{node_id}/ip-maintenance/run",
+            post(ip_maintenance::run),
+        )
+        .route(
+            "/nodes/{node_id}/ip-maintenance/stop",
+            post(ip_maintenance::stop),
+        )
+        .route(
+            "/nodes/{node_id}/ip-maintenance/session-reset",
+            post(ip_maintenance::reset),
+        )
+        .route(
+            "/nodes/{node_id}/ip-maintenance/runs",
+            get(ip_maintenance::runs),
+        )
+        .route(
+            "/nodes/{node_id}/ip-maintenance/runs/{run_id}",
+            get(ip_maintenance::run_detail),
+        )
         .route("/nodes/agent-state", get(node_agent_state))
         .route(
             "/apps/{app_id}/chains/{chain_id}/unlock-probe",
@@ -1809,6 +1856,18 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route(
             "/users/{tenant_id}/{user_id}/subscription-connectors/sub-store/runs/{run}/retry",
             post(substore::retry),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/clash-rules",
+            get(clash_rules::info).put(clash_rules::save),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/clash-rules/probe",
+            post(clash_rules::probe),
+        )
+        .route(
+            "/users/{tenant_id}/{user_id}/clash-rules/preview",
+            post(clash_rules::preview),
         )
         .route(
             "/users/{tenant_id}/{user_id}/clash-subscription",
@@ -2099,6 +2158,15 @@ fn agent_routes(state: AppState) -> Router<AppState> {
             get(public_haitun_clash_subscription),
         )
         .route("/agent/v1/enroll", post(agent_enroll))
+        .route(
+            "/agent/v1/ip-maintenance/desired",
+            get(ip_maintenance::desired),
+        )
+        .route("/agent/v1/ip-maintenance/data", get(ip_maintenance::data))
+        .route(
+            "/agent/v1/ip-maintenance/report",
+            post(ip_maintenance::report).layer(DefaultBodyLimit::max(128 * 1024)),
+        )
         .route("/agent/v1/desired", get(agent_desired))
         .route(
             "/agent/v1/user-traffic/policies",
@@ -11137,6 +11205,10 @@ mod tests {
         use axum::http::Method;
         for path in [
             "/branding",
+            "/ip-maintenance/regions",
+            "/nodes/n1/ip-maintenance",
+            "/nodes/n1/ip-maintenance/runs",
+            "/nodes/n1/ip-maintenance/runs/round-1",
             "/agent-log-policy",
             "/node-traffic",
             "/certs",
@@ -11180,6 +11252,12 @@ mod tests {
         }
         for path in [
             "/deployments",
+            "/nodes//ip-maintenance",
+            "/nodes/n1/ip-maintenance/run",
+            "/nodes/n1/ip-maintenance/stop",
+            "/nodes/n1/ip-maintenance/session-reset",
+            "/nodes/n1/ip-maintenance/runs/round-1/extra",
+            "/ip-maintenance/regions/extra",
             "/settings",
             "/ping-probe/settings",
             "/realtime/settings",
@@ -11215,6 +11293,13 @@ mod tests {
         assert!(public_may(&Method::POST, "/auth/logout"));
         // Every other write, including on a path whose GET is allowed.
         assert!(!public_may(&Method::POST, "/model/apply"));
+        assert!(!public_may(&Method::PUT, "/nodes/n1/ip-maintenance"));
+        assert!(!public_may(&Method::POST, "/nodes/n1/ip-maintenance/run"));
+        assert!(!public_may(&Method::POST, "/nodes/n1/ip-maintenance/stop"));
+        assert!(!public_may(
+            &Method::POST,
+            "/nodes/n1/ip-maintenance/session-reset"
+        ));
         assert!(!public_may(&Method::POST, "/notifications/read"));
         assert!(!public_may(&Method::POST, "/notifications/clear"));
         for method in [Method::POST, Method::PUT, Method::DELETE] {

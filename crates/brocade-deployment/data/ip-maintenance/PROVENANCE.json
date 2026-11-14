@@ -1,0 +1,11 @@
+{
+  "source": "https://github.com/hotyue/IP-Sentinel",
+  "commit": "0d477e5f9939f037d0481f4e9a1f26f05810c545",
+  "version": "4.3.5",
+  "license": "AGPL-3.0",
+  "scope": "Upstream region, keyword, site and User-Agent data only. Rust implementation is maintained in Brocade.",
+  "files": {
+    "regions.json": "0c6b11a61c999e25863f3b756f274079026180f8f9812dfd17bc5dd7e6df84ba",
+    "user-agents.txt": "419347ab5901cb359931c926cbd776643ab6723fed0c14759dc66327cc141d04"
+  }
+}

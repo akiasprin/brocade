@@ -14,6 +14,67 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Shared browser headers for anonymous public diagnostics. No account or region is selected.
+pub(crate) fn public_diagnostic_headers() -> Vec<(&'static str, String)> {
+    vec![
+                ("Accept-Encoding", "gzip".into()),
+                ("Accept", "text/html,application/json;q=0.9,*/*;q=0.8".into()),
+                ("Accept-Language", "en-US,en;q=0.9".into()),
+                ("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36".into()),
+        ]
+}
+
+/// Anonymous preference shared by unlock probes and maintenance. Exact host matching
+/// keeps the preference scoped through redirects; it contains no account or country.
+pub(crate) fn anonymous_consent_cookie(url: &reqwest::Url) -> Option<&'static str> {
+    matches!(
+        url.host_str(),
+        Some(
+            "www.youtube.com"
+                | "music.youtube.com"
+                | "www.google.com"
+                | "news.google.com"
+                | "maps.google.com"
+        )
+    )
+    .then_some("SOCS=CAI")
+}
+
+pub(crate) fn is_consent_page(url: &reqwest::Url, body: &str) -> bool {
+    if matches!(
+        url.host_str(),
+        Some("consent.google.com" | "consent.youtube.com")
+    ) {
+        return true;
+    }
+    // A normal page may contain an unobtrusive consent banner. Only explicit
+    // interstitial titles or a consent-only document count as a blocked action.
+    let lower = body.to_ascii_lowercase();
+    let title = lower
+        .split_once("<title")
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .and_then(|(_, rest)| rest.split_once("</title>"))
+        .map(|(title, _)| title.trim());
+    title.is_some_and(|title| {
+        [
+            "before you continue to google",
+            "before you continue to youtube",
+            "bevor sie zu google weitergehen",
+            "bevor sie zu youtube weitergehen",
+            "consent required",
+            "privacy consent required",
+        ]
+        .contains(&title)
+    })
+}
+
+pub(crate) fn requires_search_javascript(url: &reqwest::Url, body: &str) -> bool {
+    url.host_str() == Some("www.google.com")
+        && url.path() == "/search"
+        && body.contains("<title>Google Search</title>")
+        && body.contains("/httpservice/retry/enablejs")
+}
+
 pub(crate) fn diagnostic_family_client(
     family: AddressFamily,
 ) -> Result<reqwest::blocking::Client, String> {
@@ -23,6 +84,8 @@ pub(crate) fn diagnostic_socks_client(port: u16) -> Result<reqwest::blocking::Cl
     client::socks(port)
 }
 
+mod maintenance;
+pub(crate) use maintenance::maintenance_client;
 mod client;
 mod diagnostic;
 mod resolver;
@@ -284,12 +347,7 @@ impl HttpClient {
         extra_headers: &[(&str, String)],
         timeout: Duration,
     ) -> Result<HttpResponse, String> {
-        let mut headers = vec![
-                ("Accept-Encoding", "gzip".into()),
-                ("Accept", "text/html,application/json;q=0.9,*/*;q=0.8".into()),
-                ("Accept-Language", "en-US,en;q=0.9".into()),
-                ("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36".into()),
-        ];
+        let mut headers = public_diagnostic_headers();
         headers.extend_from_slice(extra_headers);
         self.request_inner(
             method,

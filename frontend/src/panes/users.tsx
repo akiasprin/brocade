@@ -2313,6 +2313,17 @@ function UserList({
                 <Icon of="nodeLinks" size={14} className="user-dact-icon" />
                 <span className="user-dact-label title-action-label">节点</span>
               </button>
+              <button
+                type="button"
+                className="btn user-dact"
+                aria-label="Sub-Store"
+                disabled={!canOpenSubscription}
+                title="打开该用户的 Sub-Store 后端同步与自动维护"
+                onClick={() => setSub({ user: u, kind: 'substore' })}
+              >
+                <Icon of="refresh" size={14} className="user-dact-icon" />
+                <span className="user-dact-label">Sub-Store</span>
+              </button>
 
               <div className="fg-menuwrap user-action-menuwrap">
                 <button

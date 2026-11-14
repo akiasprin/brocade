@@ -1,0 +1,477 @@
+.flow-trace-field {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  box-sizing: border-box;
+  color: var(--ink-4);
+  cursor: text;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s,
+    background 0.15s,
+    width 0.22s ease;
+}
+.flow-trace-field:focus-within {
+  color: var(--ink-3);
+}
+.flow-trace-field input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: none;
+  color: var(--ink);
+  font: 13px/1 var(--sans);
+}
+.flow-trace-field input::placeholder {
+  color: var(--ink-4);
+}
+.flow-trace-glass {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+/* 系统搜索框的清除：实心灰圆，白色叉。 */
+.flow-trace-clear {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--ink) 26%, transparent);
+  color: var(--card);
+  cursor: pointer;
+}
+.flow-trace-clear:hover {
+  background: color-mix(in srgb, var(--ink) 42%, transparent);
+}
+.flow-trace-clear svg {
+  width: 10px;
+  height: 10px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+}
+
+/* 传输层：分段控件，滑块浮在槽里，与标题行「列表编辑 / 链路可视化」同一手法。 */
+.flow-trace-seg {
+  --h: 34px;
+  --r: 10px;
+  position: relative;
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  flex: none;
+  height: var(--h);
+  padding: 2px;
+  box-sizing: border-box;
+  border-radius: var(--r);
+  background: color-mix(in srgb, var(--ink) 7%, transparent);
+}
+.flow-trace-seg-thumb {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 2px;
+  width: calc(50% - 2px);
+  border-radius: calc(var(--r) - 2px);
+  background: var(--card);
+  box-shadow:
+    0 1px 2px rgb(20 30 70 / 14%),
+    0 0 0 0.5px color-mix(in srgb, var(--ink) 10%, transparent);
+  transition: transform 0.26s cubic-bezier(0.3, 1.25, 0.5, 1);
+}
+.flow-trace-seg.is-second .flow-trace-seg-thumb {
+  transform: translateX(100%);
+}
+.flow-trace-seg button {
+  position: relative;
+  min-width: 46px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: calc(var(--r) - 2px);
+  background: none;
+  color: var(--ink-3);
+  font: 500 11.5px/1 var(--sans);
+  letter-spacing: 0.03em;
+  cursor: pointer;
+}
+.flow-trace-seg button[aria-checked='true'] {
+  color: var(--ink);
+  font-weight: 600;
+}
+.flow-trace-seg button:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: 0;
+}
+
+/* 路线：经过的机器（旗帜 + 名字），终点动作是一枚小标签；待确认用金色。 */
+.flow-trace-route {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  color: var(--ink-2);
+  font: 12.5px/1.4 var(--sans);
+  white-space: nowrap;
+}
+.flow-trace-stop {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.flow-trace-stop .geo-flag {
+  flex: none;
+  width: 15px;
+  height: 10px;
+  border-radius: 2px;
+  box-shadow: 0 0 0 0.5px color-mix(in srgb, var(--ink) 20%, transparent);
+}
+.flow-trace-stop b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ink);
+  font-weight: 500;
+}
+.flow-trace-chev {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  fill: none;
+  stroke: var(--ink-4);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.flow-trace-tag {
+  flex: none;
+  margin-left: 2px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font: 600 11.5px/20px var(--sans);
+}
+.flow-trace-tag.is-egress,
+.flow-trace-tag.is-proxy {
+  background: var(--action-wash);
+  color: var(--action);
+}
+.flow-trace-tag.is-block {
+  background: color-mix(in srgb, var(--err) 12%, transparent);
+  color: var(--err);
+}
+.flow-trace-tag.is-gold {
+  background: var(--gold-wash);
+  color: var(--gold);
+}
+.flow-trace-why {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ink-3);
+}
+.flow-trace-msg {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ink-3);
+}
+.flow-trace-msg.is-err {
+  color: var(--err);
+}
+.flow-trace-msg.is-gold {
+  color: var(--gold);
+}
+.flow-trace-spin {
+  flex: none;
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid color-mix(in srgb, var(--ink) 18%, transparent);
+  border-top-color: var(--ink-3);
+  border-radius: 50%;
+  animation: flow-trace-spin 0.8s linear infinite;
+}
+@keyframes flow-trace-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.flow-trace {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: center;
+  gap: 12px;
+  margin-bottom: 26px;
+}
+.flow-trace-capsule {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: min(540px, 100%);
+  height: 44px;
+  padding: 0 5px 0 16px;
+  box-sizing: border-box;
+  border: 1px solid var(--flow-trace-capsule-line, var(--line));
+  border-radius: 22px;
+  background: var(--card);
+  box-shadow:
+    0 1px 2px color-mix(in srgb, var(--ink) 5%, transparent),
+    0 8px 24px color-mix(in srgb, var(--ink) 6%, transparent);
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.flow-trace .flow-trace-field {
+  flex: 1;
+  height: 100%;
+  gap: 9px;
+}
+.flow-trace .flow-trace-field input {
+  font-size: 14px;
+}
+.flow-trace .flow-trace-glass {
+  width: 16px;
+  height: 16px;
+}
+.flow-trace-sep {
+  flex: none;
+  width: 1px;
+  height: 20px;
+  background: var(--line);
+}
+.flow-trace .flow-trace-seg {
+  --h: 34px;
+  --r: 17px;
+}
+.flow-trace-under {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  min-height: 30px;
+  max-width: 100%;
+}
+.flow-trace-pill {
+  height: 30px;
+  padding: 0 5px 0 12px;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: var(--card);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--ink) 5%, transparent);
+}
+.flow-trace-pill:is(.is-invalid, .is-pending, .is-stop) {
+  padding-right: 12px;
+}
+.flow-trace-pill.is-uncertain {
+  padding-right: 12px;
+}
+
+/* 下拉：首版目标菜单的材质（实底、细线、7px 圆角、等宽小节标签）；实底避免底下的规则字透出来。 */
+.flow-trace-suggest {
+  position: fixed;
+  z-index: 70;
+  display: grid;
+  box-sizing: border-box;
+  padding: 5px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--sheet);
+  box-shadow: var(--shadow);
+  animation: flow-trace-menu-in 90ms ease-out;
+}
+@keyframes flow-trace-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+}
+.flow-trace-suggest h6 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 7px 4px;
+  color: var(--ink-4);
+  font: 500 9px/16px var(--mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.flow-trace-suggest h6::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+.flow-trace-suggest [role='option'] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 30px;
+  padding: 0 8px;
+  border-radius: 5px;
+  color: var(--ink);
+  font: 12.5px var(--sans);
+  cursor: pointer;
+}
+.flow-trace-suggest-domain {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+.flow-trace-suggest-domain > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.flow-trace-domain-icon {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--ink-2);
+}
+.flow-trace-domain-icon .site-brand-icon,
+.flow-trace-domain-icon svg {
+  width: 16px;
+  height: 16px;
+  color: inherit;
+}
+.flow-trace-domain-icon [data-site-icon='google'] svg {
+  width: 13px;
+  height: 13px;
+}
+.flow-trace-suggest [role='option'] small {
+  color: var(--ink-4);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.flow-trace-suggest [role='option']:hover,
+.flow-trace-suggest [role='option'][aria-selected='true'] {
+  background: var(--hover);
+}
+
+.flow-trace-capsule:focus-within {
+  border-color: var(--action);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--action) 45%, transparent),
+    0 8px 24px color-mix(in srgb, var(--ink) 6%, transparent);
+}
+.flow-trace-capsule[data-invalid] {
+  border-color: var(--err);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--err) 35%, transparent);
+}
+.flow-trace-suggest {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+:root[data-theme='dark'] .flow-trace {
+  --flow-trace-capsule-line: color-mix(in srgb, var(--ink-3) 35%, var(--line));
+}
+:root[data-theme='dark'] .flow-trace-seg-thumb {
+  background: color-mix(in srgb, var(--ink) 14%, var(--card));
+}
+:root[data-theme='dark'] .flow-trace-clear {
+  color: var(--sheet);
+}
+:root[data-theme='dark'] .flow-trace-capsule,
+:root[data-theme='dark'] .flow-trace-pill {
+  box-shadow: none;
+}
+@container rule-flow (max-width:820px) {
+  .flow-trace-route:not(.is-invalid) {
+    flex-wrap: wrap;
+    row-gap: 4px;
+    white-space: normal;
+  }
+  .flow-trace-pill {
+    height: auto;
+    min-height: 30px;
+    padding-top: 4px;
+    padding-bottom: 4px;
+    border-radius: 12px;
+  }
+  .flow-trace {
+    margin-bottom: 14px;
+  }
+  .flow-trace-under {
+    justify-content: flex-start;
+    flex-wrap: nowrap;
+    width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .flow-trace-under:empty {
+    display: none;
+  }
+}
+@media (max-width: 820px) {
+  .flow-trace-capsule {
+    height: 50px;
+    border-radius: 25px;
+  }
+  .flow-trace .flow-trace-seg {
+    --h: 40px;
+    --r: 20px;
+  }
+  .flow-trace .flow-trace-field input {
+    font-size: 16px;
+  }
+  .flow-trace-suggest [role='option'] {
+    min-height: 44px;
+  }
+  .flow-trace-clear {
+    width: 20px;
+    height: 20px;
+  }
+}
+@container rule-flow (max-width: 280px) {
+  .flow-trace-capsule {
+    gap: 6px;
+    padding-right: 4px;
+    padding-left: 10px;
+  }
+  .flow-trace .flow-trace-glass,
+  .flow-trace-sep {
+    display: none;
+  }
+  .flow-trace .flow-trace-field {
+    gap: 6px;
+  }
+  .flow-trace-seg button {
+    min-width: 40px;
+    padding: 0 6px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .flow-trace-field,
+  .flow-trace-capsule,
+  .flow-trace-seg-thumb {
+    transition: none;
+  }
+  .flow-trace-spin,
+  .flow-trace-suggest {
+    animation: none;
+  }
+}

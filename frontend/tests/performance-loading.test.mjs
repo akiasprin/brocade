@@ -140,11 +140,12 @@ test('机器详情首屏剥离深度对象，深度图立即挂载并按十项�
   assert.doesNotMatch(telemetry, /data: downsample|data: sampledSeries|sampling:/);
 });
 
-test('机器详情的配置与规则页保留框架，并把快照等待限制在当前页签', () => {
-  assert.match(nodes, /function NodeDetailTabState\(/);
-  assert.match(nodes, /tab === 'config' && !snapshot\.data[\s\S]*<NodeDetailTabState/);
+test('机器详情把快照等待限制在依赖模型的配置，养护和规则卡保留独立边界', () => {
+  assert.match(nodes, /function NodeConfigState\(/);
+  assert.match(nodes, /snapshot\.data \? \([\s\S]*<NodeConfigState error=\{snapshot\.error\}/);
   assert.match(nodes, /function NodeRuleCardState\(/);
   assert.match(nodes, /tab === 'config'[\s\S]*<CertGroupCard[\s\S]*<LogRetentionCard/);
+  assert.match(nodes, /<NodeConfigState[\s\S]*<IpMaintenanceCard/);
   assert.doesNotMatch(nodes, /<Suspense fallback=\{null\}>/);
   assert.match(
     nodes,

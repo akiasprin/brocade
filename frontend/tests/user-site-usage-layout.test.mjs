@@ -38,6 +38,6 @@ test('detail rows keep the main domain whole and every control has a visible foc
   for (const control of ['button\\.site-usage-row', '\\.site-usage-detail-head', '\\.site-usage-more']) {
     assert.match(styles, new RegExp(`${control}:focus-visible\\s*\\{[^}]*outline:\\s*2px solid var\\(--action\\)`));
   }
-  // 悬停样式只在支持悬停的指针下生效
-  assert.doesNotMatch(styles.replace(/@media \(hover: hover\)\s*\{[\s\S]*?\n\}/g, ''), /:hover\s*\{/);
+  // 只检查本组件；后续追加的其他面板样式不属于站点流量的契约。
+  assert.doesNotMatch(styles.replace(/@media \(hover: hover\)\s*\{[\s\S]*?\n\}/g, ''), /\.site-usage[^{}]*:hover\s*\{/);
 });

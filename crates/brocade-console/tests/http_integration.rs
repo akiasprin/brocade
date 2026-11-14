@@ -1,3 +1,6 @@
+#[path = "cases/clash_rules.rs"]
+mod clash_rules_tests;
+
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
@@ -539,7 +542,10 @@ async fn data_retention_api_lists_only_bounded_tables_and_updates_without_a_revi
     let (status, initial) = get_json(&app, &token, "/data-retention").await;
     assert_eq!(status, StatusCode::OK);
     let policies = initial["policies"].as_array().unwrap();
-    assert_eq!(policies.len(), 28);
+    assert_eq!(policies.len(), 29);
+    assert!(policies
+        .iter()
+        .any(|policy| policy["table_name"] == "ip_maintenance_runs"));
     assert!(policies
         .iter()
         .any(|policy| policy["table_name"] == "vpngate_probe_samples"));
@@ -11836,3 +11842,6 @@ mod cvm_terminal_cases;
 
 #[path = "cases/substore.rs"]
 mod substore_cases;
+
+#[path = "cases/ip_maintenance.rs"]
+mod ip_maintenance_tests;

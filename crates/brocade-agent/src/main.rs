@@ -23,6 +23,7 @@ mod hy2_port_hop;
 mod icmp;
 mod identity;
 mod inetdiag;
+mod ip_maintenance;
 mod load;
 mod logcap;
 mod options;
@@ -2330,12 +2331,17 @@ fn run_forever(options: Options) -> Result<(), String> {
     xrayupdate::spawn_xray_updates(&options, &xray_updates);
     selfupdate::spawn_selfupdate(&options, &wants_exit);
 
+    let maintenance_worker = ip_maintenance::spawn(options.clone())?;
     let mut apply_wake = wake::Cursor::new(brocade_deployment::agent_channel::WakeDomain::Desired);
     let mut apply_tick = Instant::now();
     loop {
         if TERMINATION_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            maintenance_worker.request_stop();
             let traffic_result = traffic_worker.finish();
             prepare_load_handoff_for_exit(&options);
+            if let Err(error) = maintenance_worker.finish() {
+                eprintln!("ip-maintenance shutdown: {error}");
+            }
             traffic_result?;
             println!("收到退出信号，最终流量样本已落盘");
             return Ok(());
@@ -2356,15 +2362,23 @@ fn run_forever(options: Options) -> Result<(), String> {
         // interface and is unaffected; convergence is idempotent and re-runs every 15 seconds; and
         // anything owed to the control plane is already on disk in the spool.
         if TERMINATION_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            maintenance_worker.request_stop();
             let traffic_result = traffic_worker.finish();
             prepare_load_handoff_for_exit(&options);
+            if let Err(error) = maintenance_worker.finish() {
+                eprintln!("ip-maintenance shutdown: {error}");
+            }
             traffic_result?;
             println!("这一轮收敛做完了，最终流量样本已落盘，退出服务");
             return Ok(());
         }
         if wants_exit.load(std::sync::atomic::Ordering::SeqCst) {
+            maintenance_worker.request_stop();
             let traffic_result = traffic_worker.finish();
             prepare_load_handoff_for_exit(&options);
+            if let Err(error) = maintenance_worker.finish() {
+                eprintln!("ip-maintenance shutdown: {error}");
+            }
             traffic_result?;
             println!("selfupdate: 这一轮收敛做完了，退出让服务管理器用新二进制拉起来");
             return Ok(());

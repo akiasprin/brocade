@@ -16,7 +16,10 @@ async fn retention_tracks_locked_backlog_isolates_failures_and_recovers() {
         .await
         .unwrap();
     let results = db.store.run_data_retention().await.unwrap();
-    assert_eq!(results.len(), 28);
+    assert_eq!(results.len(), 29);
+    assert!(results
+        .iter()
+        .any(|result| result.table_name == "ip_maintenance_runs"));
     assert!(
         results.iter().all(|r| r.error_code.is_none()),
         "{results:?}"
@@ -27,7 +30,7 @@ async fn retention_tracks_locked_backlog_isolates_failures_and_recovers() {
             .iter()
             .filter(|p| p.category == brocade_store::DataRetentionCategory::History)
             .count(),
-        24
+        25
     );
     assert_eq!(
         view.policies
@@ -121,7 +124,7 @@ async fn retention_tracks_locked_backlog_isolates_failures_and_recovers() {
             .fetch_one(db.pool())
             .await
             .unwrap(),
-        28
+        29
     );
 
     // A changed TTL must be checked even if the previous policy was not due yet.

@@ -1,3 +1,6 @@
+mod preferences;
+pub use preferences::*;
+
 use std::collections::BTreeSet;
 
 use crate::artifacts::subscription::{
@@ -518,6 +521,19 @@ fn standard_name<'a>(names: &'a [String], id: &str) -> &'a str {
 }
 
 fn push_standard_groups(lines: &mut Vec<String>, subscription: &Subscription, names: &[String]) {
+    push_standard_groups_with_defaults(
+        lines,
+        subscription,
+        names,
+        &std::collections::BTreeMap::new(),
+    );
+}
+fn push_standard_groups_with_defaults(
+    lines: &mut Vec<String>,
+    subscription: &Subscription,
+    names: &[String],
+    defaults: &std::collections::BTreeMap<String, String>,
+) {
     let node_names = subscription
         .entries
         .iter()
@@ -551,6 +567,10 @@ fn push_standard_groups(lines: &mut Vec<String>, subscription: &Subscription, na
         };
         if !matches!(module.kind, StandardGroupKind::RejectFirst) {
             members.extend(node_names.iter().cloned());
+        }
+        if let Some(target) = defaults.get(module.id) {
+            members.retain(|member| member != target);
+            members.insert(0, target.clone());
         }
         deduplicate(&mut members);
         // A url-test with no candidates is rejected by Mihomo. Empty user subscriptions are not

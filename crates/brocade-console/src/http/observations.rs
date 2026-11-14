@@ -97,6 +97,7 @@ fn changed_domains(method: &axum::http::Method, path: &str) -> &'static [Observa
     match path {
         "/agent/v1/load" => &[Load],
         "/agent/v1/e2e-probe" => &[E2e],
+        "/agent/v1/ip-maintenance/report" => &[IpMaintenance],
         "/agent/v1/unlock-probe/report" => &[Unlock],
         "/agent/v1/usage" | "/agent/v1/forwarding/usage" => &[Traffic],
         "/agent/v1/runtime" | "/agent/v1/observation" => &[Nodes, Traffic],
@@ -105,6 +106,7 @@ fn changed_domains(method: &axum::http::Method, path: &str) -> &'static [Observa
         _ if path.ends_with("/unlock-probe") => &[Unlock],
         _ if path.contains("/tunnel-probe") => &[TunnelProbes],
         _ if path.starts_with("/deployments") => &[Nodes, Deployments],
+        _ if path.contains("/ip-maintenance") => &[IpMaintenance],
         _ if path == "/nodes" || path.starts_with("/nodes/") => &[Nodes, Traffic],
         _ => &[],
     }
@@ -117,6 +119,15 @@ mod tests {
     use futures_util::StreamExt;
     use tower::ServiceExt;
 
+    #[test]
+    fn maintenance_reads_do_not_invalidate_themselves_and_controls_only_refresh_maintenance() {
+        assert!(changed_domains(&Method::GET, "/nodes/n1/ip-maintenance").is_empty());
+        assert!(changed_domains(&Method::GET, "/agent/v1/ip-maintenance/desired").is_empty());
+        assert_eq!(
+            changed_domains(&Method::POST, "/nodes/n1/ip-maintenance/stop"),
+            &[ObservationDomain::IpMaintenance]
+        );
+    }
     #[tokio::test]
     async fn successful_reports_invalidate_but_failed_reports_and_reads_do_not() {
         let state = AppState::new(PgStore::from_pool(

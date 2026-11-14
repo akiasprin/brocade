@@ -91,6 +91,7 @@ const params = new URLSearchParams(location.search);
 if (theme.snapshot() !== (params.get('theme') === 'light' ? 'light' : 'dark')) theme.toggle();
 installBackend();
 const backend = globalThis.fetch;
+let initializationChecks = 0;
 globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
   const state = params.get('state') ?? 'idle';
@@ -141,13 +142,25 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
               },
             ]
           : []),
+        ...(current && ['initialized', 'initializing'].includes(state)
+          ? [
+              {
+                target_kind: 'node',
+                target_id: 'sg-dp',
+                artifact_kind: 'xray',
+                state: 'present',
+                sha256: 'b'.repeat(64),
+                byte_len: 1200,
+              },
+            ]
+          : []),
       ],
     });
   }
   const response = await backend(input, init);
   if (url.pathname === '/revisions') {
     const value = await response.json();
-    value.last_config_revision_id = ['pending', 'grants-published'].includes(state)
+    value.last_config_revision_id = ['pending', 'grants-published', 'initialized', 'initializing'].includes(state)
       ? value.current_revision - 1
       : value.current_revision;
     return Response.json(value);
@@ -160,9 +173,12 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     value.snapshot.external_outbounds[1].security = { t: 'none' };
     return Response.json(value);
   }
-  if (url.pathname === '/deployments/verify' && state === 'pending') {
+  if (url.pathname === '/deployments/verify' && ['pending', 'initializing'].includes(state)) {
     const value = await response.json();
-    value.summary.changed_targets = 3;
+    const changed = state === 'pending' ? 3 : ++initializationChecks === 1 ? 1 : 0;
+    value.summary.changed_targets = changed;
+    value.summary.skipped_targets = value.summary.total_targets - changed;
+    value.converged = changed === 0;
     return Response.json(value);
   }
   if (url.pathname === '/grants/automation' && state === 'grant') {

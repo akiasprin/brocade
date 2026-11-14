@@ -1,3 +1,4 @@
+export * from './api/ip-maintenance';
 import { CVM_ENABLED } from './product';
 import { api } from './api/client';
 export { api, ApiError } from './api/client';
@@ -486,7 +487,7 @@ export const fetchCompileView = (revision: number): Promise<CompileView> =>
 /* ── 节点 ── */
 
 /* 与 brocade_deployment::protocol 中的同名结构逐字段对应 */
-export const AGENT_PROTOCOL_VERSION = 67;
+export const AGENT_PROTOCOL_VERSION = 70;
 export const FORWARDING_TARGET_POLICY_PROTOCOL_VERSION = 43;
 export const MIN_AGENT_PROTOCOL_VERSION = 20;
 export const REALTIME_USER_TRAFFIC_PROTOCOL_VERSION = 27;
@@ -6092,3 +6093,40 @@ export const fetchSubStoreRun = (tenant: string, user: string, id: number, signa
   api<SubStoreRun>(`${subStorePath(tenant, user)}/runs/${id}`, '', { signal });
 export const cancelSubStoreRun = (tenant: string, user: string, id: number) =>
   req<SubStoreRun>(`${subStorePath(tenant, user)}/runs/${id}`, { method: 'DELETE' });
+
+export interface ClashRulesView {
+  version: number;
+  rules: import('./clash-rules').Rules;
+  catalog: import('./clash-rules').RoutingCatalog;
+  writable: boolean;
+}
+const clashRulesPath = (tenant: string, user: string) =>
+  `/users/${encodeURIComponent(tenant)}/${encodeURIComponent(user)}/clash-rules`;
+export const fetchClashRules = (tenant: string, user: string, signal?: AbortSignal) =>
+  api<ClashRulesView>(clashRulesPath(tenant, user), '', { signal });
+export const saveClashRules = (tenant: string, user: string, version: number, rules: ClashRulesView['rules']) =>
+  api<ClashRulesView>(clashRulesPath(tenant, user), '', { method: 'PUT', body: JSON.stringify({ version, rules }) });
+export const previewClashRules = (tenant: string, user: string, rules: ClashRulesView['rules'], signal?: AbortSignal) =>
+  api<{ yaml: string }>(`${clashRulesPath(tenant, user)}/preview`, '', {
+    method: 'POST',
+    body: JSON.stringify(rules),
+    signal,
+  });
+
+export interface ClashRuleHit {
+  layer: 'custom' | 'module' | 'final';
+  id: string;
+  target: import('./clash-rules').Target;
+  via: string;
+}
+export const probeClashRules = (
+  tenant: string,
+  user: string,
+  rules: ClashRulesView['rules'],
+  kind: 'domain' | 'ip' | 'process',
+  value: string,
+) =>
+  api<ClashRuleHit>(`${clashRulesPath(tenant, user)}/probe`, '', {
+    method: 'POST',
+    body: JSON.stringify({ rules, kind, value }),
+  });

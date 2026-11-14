@@ -79,12 +79,23 @@ export function useRevisionDiff(revision: number | undefined, base: number | nul
 
   return useMemo(() => {
     const list = here.data?.artifacts ?? [];
+    const previous = there.data?.artifacts ?? [];
+    const configurationNodes =
+      here.data && !here.error && (base === null || (base != null && there.data && !there.error))
+        ? changedConfigurationNodes(list, base === null ? [] : previous)
+        : undefined;
+    const previousNodes = new Set(previous.filter(entry => entry.target_kind === 'node').map(entry => entry.target_id));
+    const configurationOnlyNewNodes =
+      configurationNodes != null &&
+      configurationNodes.size > 0 &&
+      [...configurationNodes].every(node => base === null || !previousNodes.has(node));
     /* 没有基线时不判定为已变更：将全部产物标为变更不提供信息。 */
     if (base == null || !there.data) {
       return {
         list,
         changed: new Set<string>(),
-        configurationNodes: base === null && here.data && !here.error ? changedConfigurationNodes(list, []) : undefined,
+        configurationNodes,
+        configurationOnlyNewNodes,
         known: false,
         pending: (revision != null && here.isPending) || (base != null && there.isPending),
         error: here.error ?? there.error,
@@ -93,8 +104,8 @@ export function useRevisionDiff(revision: number | undefined, base: number | nul
     return {
       list,
       changed: changedBetween(list, there.data.artifacts),
-      configurationNodes:
-        here.data && !here.error && !there.error ? changedConfigurationNodes(list, there.data.artifacts) : undefined,
+      configurationNodes,
+      configurationOnlyNewNodes,
       known: true,
       pending: (revision != null && here.isPending) || there.isPending,
       error: here.error ?? there.error,

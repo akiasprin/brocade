@@ -121,7 +121,6 @@ createRoot(document.getElementById('root')!).render(
       <section className="panel config-panel rule-sheet-card node-chain-sheet">
         <header>
           <PanelTitle of="chains">链路规则</PanelTitle>
-          <span className="rule-sheet-meta header-stat">1 跳</span>
         </header>
         <RuleDraftScope>
           <div className="node-chain-use chain-tree">

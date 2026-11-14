@@ -6,7 +6,7 @@ async function open(page: Page, path = '/nodes/node/jp-iij', query = '') {
   await expect(page.locator('.fg-top')).toBeVisible();
   await expect(page.locator('.fg-top .ft-now')).toHaveCount((await page.viewportSize())!.width > 820 ? 1 : 0);
   await expect(page.locator('.fg-top .fg-blast')).toHaveCount(
-    ['pending', 'deploying', 'grant'].includes(new URLSearchParams(query).get('state') ?? '') &&
+    ['pending', 'deploying', 'grant', 'initializing'].includes(new URLSearchParams(query).get('state') ?? '') &&
       !query.includes('role=public')
       ? 1
       : 0,
@@ -24,7 +24,7 @@ async function fits(page: Page) {
     .toBe(true);
 }
 
-test('ordinary pages avoid full deployment checks; the publish page still verifies', async ({ page }) => {
+test('ordinary edits avoid full deployment checks; the publish page still verifies', async ({ page }) => {
   const reads: string[] = [];
   await page.clock.install({ time: new Date('2026-11-02T10:00:00Z') });
   page.on('console', message => {
@@ -57,6 +57,51 @@ test('published grants and new users do not advertise a configuration release', 
   await expect(page).toHaveScreenshot(`${flavor}-published-grants-navigation.png`, {
     clip: { x: 0, y: 0, width: 1440, height: 190 },
   });
+});
+
+test('completed single-machine initialization keeps healthy navigation and shares the publish page check', async ({
+  page,
+}, testInfo) => {
+  const reads: string[] = [];
+  page.on('console', message => {
+    if (message.text() === '[fixture] deployment-verification-read') reads.push(message.text());
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await open(page, '/nodes/node/jp-iij', 'state=initialized&theme=light');
+  await expect(page.locator('.nd-page-head')).toBeVisible();
+  await expect.poll(() => reads.length).toBe(1);
+  await expect(page.locator('.fg-blast')).toHaveCount(0);
+  await expect(page.locator('.fg-badge.chg')).toHaveCount(0);
+  // Initialization should look exactly like the existing healthy, published-grants state.
+  const flavor = process.env.BROCADE_PRODUCT_FLAVOR === 'base' ? 'base' : 'cvm';
+  await expect(page).toHaveScreenshot(`${flavor}-published-grants-navigation.png`, {
+    clip: { x: 0, y: 0, width: 1440, height: 190 },
+  });
+  await page.screenshot({
+    path: testInfo.outputPath('initialized-navigation.png'),
+    clip: { x: 0, y: 0, width: 1440, height: 190 },
+  });
+  await page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: /发布/ }).click();
+  await expect(page.getByRole('button', { name: '无待发布变更', exact: true })).toBeDisabled();
+  expect(reads).toHaveLength(1);
+});
+
+test('initialization clears the pending hint on completion without advancing the business baseline', async ({
+  page,
+}) => {
+  const baselines: number[] = [];
+  page.on('console', message => {
+    if (message.text().startsWith('[fixture] artifact-index-read '))
+      baselines.push(Number(message.text().split(' ').at(-1)));
+  });
+  await page.clock.install({ time: new Date('2026-11-02T10:00:00Z') });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await open(page, '/nodes/node/jp-iij', 'state=initializing&theme=light');
+  await expect(page.locator('.fg-blast')).toHaveText('配置待发布');
+  await page.clock.runFor(5_100);
+  await expect(page.locator('.fg-blast')).toHaveCount(0);
+  await expect(page.locator('.fg-badge.chg')).toHaveCount(0);
+  expect(baselines.sort()).toEqual([40, 41]);
 });
 
 for (const theme of ['light', 'dark']) {

@@ -4,6 +4,9 @@ import test from 'node:test';
 
 const styles = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
 const paletteSource = readFileSync(new URL('../src/forge/palette.ts', import.meta.url), 'utf8');
+const preserved = JSON.parse(
+  readFileSync(new URL('./fixtures/palette-preserved-colors.json', import.meta.url), 'utf8'),
+);
 const PALETTES = ['jinzi', 'dailan', 'songlv', 'oufen', 'xuanmo'];
 
 const tokens = (selector, last = false) => {
@@ -55,21 +58,70 @@ for (const [theme, palette] of [
     for (const [name, value] of palette) {
       if (/^--(?:action|data|primary)(?:-|$)/.test(name)) assert.equal(fallback.get(name), value, name);
     }
-    // 宝蓝（0.15）在暗色下发亮，灰雾蓝（0.041）把整页读成灰阶；柔和蓝落在两者之间。
-    const { chroma } = oklch(palette.get('--action'));
-    assert.ok(chroma >= 0.08 && chroma <= 0.13, `soft-blue interactions have a visible but restrained hue (${chroma})`);
   });
 
-test('light dailan secondary text remains readable across its surfaces', () => {
-  const t = light.dailan;
-  for (const name of ['--ink-3', '--ink-4']) {
-    for (const surface of ['--sheet', '--block', '--band', '--surface', '--sunk']) {
-      assert.ok(contrast(t.get(name), t.get(surface)) >= 4.5, `${name} on ${surface}`);
+test('all palettes keep body and secondary text readable across their surfaces', () => {
+  for (const [theme, palettes] of Object.entries({ dark, light })) {
+    for (const [key, t] of Object.entries(palettes)) {
+      for (const name of ['--ink', '--ink-2', '--ink-3', '--ink-4']) {
+        for (const surface of ['--ground', '--sheet', '--block', '--band', '--surface', '--sunk']) {
+          assert.ok(contrast(t.get(name), t.get(surface)) >= 4.5, `${theme} ${key}: ${name} on ${surface}`);
+        }
+      }
     }
   }
 });
 
-test('dark data colors are in-family tints of the theme color', () => {
+// These independent roles were deliberately excluded from the surface/action refresh.
+test('curves, heading text, light title bands, interface edges and grids retain their approved colors', () => {
+  for (const key of PALETTES) {
+    for (const theme of ['dark', 'light']) {
+      const t = new Map((theme === 'dark' ? dark : light)[key]);
+      if (theme === 'dark') {
+        for (const [name, value] of tokens(`:root[data-palette='${key}']:not([data-theme='light'])`))
+          t.set(name, value);
+      }
+      for (const [name, value] of Object.entries(preserved[key][theme])) {
+        assert.equal(t.get(name), value, `${theme} ${key}: ${name}`);
+      }
+    }
+  }
+});
+
+test('dark panel title bands sit between the workspace and card while retaining readable heading text', () => {
+  for (const key of PALETTES) {
+    const t = dark[key];
+    const declared = t.get('--panel-heading-bg');
+    const background = declared === 'var(--band)' ? t.get('--band') : declared;
+    assert.ok(luminance(background) > luminance(t.get('--ground')), `${key} title band is above the workspace`);
+    assert.ok(luminance(background) < luminance(t.get('--block')), `${key} title band is below the card`);
+    assert.ok(contrast(t.get('--panel-heading-ink'), background) >= 4.5, `${key} heading remains readable`);
+  }
+});
+
+test('shared panel shadows, radii, floating materials and status colors are unchanged', () => {
+  for (const theme of ['dark', 'light']) {
+    const t = tokens(`[data-theme='${theme}']`);
+    for (const [name, value] of Object.entries(preserved.foundation[theme])) {
+      assert.equal(t.get(name), value, `${theme}: ${name}`);
+    }
+  }
+});
+
+test('legacy trend and idle traces are independent of refreshed action and text colors', () => {
+  assert.match(
+    styles,
+    /\.vpngate-collection-spark \.area \{\s*fill: color-mix\(in srgb, var\(--data-accent\) 11%, transparent\);/,
+  );
+  assert.match(
+    styles,
+    /\.vpngate-collection-spark \.line \{[^}]*stroke: color-mix\(in srgb, var\(--data-accent\) 72%, var\(--data-quiet\)\);/,
+  );
+  assert.match(styles, /\.spark i \{[^}]*background: color-mix\(in srgb, var\(--data-accent\) 55%, transparent\);/);
+  assert.match(styles, /\.node-card-comet\.tone-idle \{\s*color: var\(--data-muted\);/);
+});
+
+test('dark data colors keep their established lightness and readable contrast', () => {
   for (const key of PALETTES) {
     const t = dark[key];
     const data = oklch(t.get('--data'));
@@ -77,15 +129,6 @@ test('dark data colors are in-family tints of the theme color', () => {
     assert.ok(Math.abs(data.lightness - 0.72) < 0.005, `${key} data lightness`);
     for (const background of ['--sheet', '--block']) {
       assert.ok(contrast(t.get('--data'), t.get(background)) >= 4.5, `${key} data on ${background}`);
-    }
-    const action = oklch(t.get('--action'));
-    if (action.chroma > 0.05) {
-      // 同族：色相比操作色低 12°，彩度为操作色的 75%（上限 0.13）。
-      assert.ok(hueGap(data.hue, action.hue - 12) < 3, `${key} data hue sits 12° below its action`);
-      assert.ok(Math.abs(data.chroma - Math.min(action.chroma * 0.75, 0.13)) < 0.008, `${key} data chroma`);
-    } else {
-      // 灰白操作色没有可用的色相，数据色锚在低彩度的钢青。
-      assert.ok(data.chroma < 0.05, `${key} achromatic palette keeps a muted data color`);
     }
     const rgb = channels(t.get('--data')).map(c => Math.round(c * 255));
     assert.equal(t.get('--data-wash'), `rgba(${rgb.join(', ')}, 0.13)`, `${key} data wash`);
@@ -147,11 +190,12 @@ test('light chart colors remain readable on white cards and palette surfaces', (
   }
 });
 
-test('light dailan interactions keep readable text in every action state', () => {
-  const t = light.dailan;
-  for (const name of ['--action', '--action-hover', '--action-active']) {
-    assert.ok(contrast(t.get(name), t.get('--sheet')) >= 4.5, `${name} text on paper`);
-    assert.ok(contrast(t.get('--action-on'), t.get(name)) >= 4.5, `white label on ${name}`);
+test('light interactions keep readable text in every action state', () => {
+  for (const t of Object.values(light)) {
+    for (const name of ['--action', '--action-hover', '--action-active']) {
+      assert.ok(contrast(t.get(name), t.get('--sheet')) >= 4.5, `${name} text on paper`);
+      assert.ok(contrast(t.get('--action-on'), t.get(name)) >= 4.5, `white label on ${name}`);
+    }
   }
 });
 
@@ -171,33 +215,18 @@ test('jinzi describes its in-family data colors in the palette menu', () => {
   assert.match(paletteSource, /key: 'jinzi',\s*name: '堇紫',\s*description: '深紫操作 · 同色系数据'/);
 });
 
-test('dark palettes share one tinted-gray ladder', () => {
-  const lstar = hex => {
-    const y = luminance(hex);
-    return y > 0.008856 ? 116 * Math.cbrt(y) - 16 : 903.3 * y;
-  };
-  // 台面 L* 1.5，其余各档沿用纯黑色阶的层间距；每档取不低于目标的第一个 8 位色。
-  const ladder = {
-    '--ground': 0,
-    '--sunk': 1.91,
-    '--surface': 3.32,
-    '--band': 3.96,
-    '--sheet': 4.31,
-    '--block': 8.24,
-    '--line': 12.24,
-  };
-  // 底调取主题色相；玄墨的灰白主题色没有色相，取数据色的钢青。
-  const hues = { jinzi: 298, dailan: 262, songlv: 132, oufen: 348, xuanmo: 225 };
+test('dark palettes separate the workspace, input wells, paper and cards', () => {
   for (const key of PALETTES) {
-    for (const [name, step] of Object.entries(ladder)) {
-      const value = dark[key].get(name);
-      const target = 1.5 + step;
-      assert.ok(lstar(value) >= target && lstar(value) < target + 0.4, `${key} ${name} ${value} sits at L* ${target}`);
-      const color = oklch(value);
-      // 彩度 0.008 左右：能看出底调，又不会让面板读成彩色卡纸。
-      assert.ok(color.chroma >= 0.004 && color.chroma <= 0.012, `${key} ${name} ${value} is a low-chroma gray`);
-      // 低明度下 8 位量化会让色相偏离设定值，20° 以内仍属于同一色系。
-      assert.ok(hueGap(color.hue, hues[key]) < 20, `${key} ${name} ${value} leans toward ${hues[key]}°`);
+    const t = dark[key];
+    const surfaces = ['--ground', '--sunk', '--surface', '--sheet', '--block'];
+    for (let index = 1; index < surfaces.length; index += 1) {
+      assert.ok(
+        luminance(t.get(surfaces[index])) > luminance(t.get(surfaces[index - 1])),
+        `${key} ${surfaces[index]} is raised`,
+      );
+    }
+    for (const name of [...surfaces, '--band']) {
+      assert.ok(oklch(t.get(name)).chroma < 0.04, `${key} ${name} stays a quiet neutral surface`);
     }
   }
 });
@@ -223,7 +252,7 @@ test('primary buttons and the selected navigation item read the primary token se
   assert.match(styles, /^\.fg-nv\[aria-current='true'\] \.mark \{\s*background: var\(--primary-on\);/m);
 });
 
-test('dark primary buttons are washes with readable labels', () => {
+test('dark primary buttons use deeper fills with readable labels', () => {
   for (const key of PALETTES) {
     const t = dark[key];
     assert.notEqual(t.get('--primary'), t.get('--action'), key);
@@ -251,14 +280,11 @@ test('palette menu swatches show the dark action colors', () => {
   }
 });
 
-test('interface edges stay independent of and softer than the background grid', () => {
+test('light interface edges stay independent of and softer than the background grid', () => {
   const cases = [
     ['default dark', tokens("[data-theme='dark']")],
     ['default light', tokens("[data-theme='light']")],
-    ...PALETTES.flatMap(key => [
-      [`dark ${key}`, dark[key]],
-      [`light ${key}`, light[key]],
-    ]),
+    ...PALETTES.flatMap(key => [[`light ${key}`, light[key]]]),
   ];
   for (const [name, t] of cases) {
     assert.match(t.get('--grid-line'), /^#[0-9a-f]{6}$/, `${name} grid has its own color`);
@@ -278,10 +304,10 @@ test('dark grid lines follow muted palette hues at a consistent low lightness', 
   for (const [index, key] of PALETTES.entries()) {
     const color = oklch(dark[key].get('--grid-line'));
     const neutral = key === 'xuanmo';
-    const reference = oklch(dark[key].get(neutral ? '--data' : '--action'));
+    const referenceHue = { jinzi: 298, dailan: 262, songlv: 132, oufen: 348, xuanmo: 225 }[key];
     assert.ok(Math.abs(color.lightness - 0.278) < 0.004, `${key} grid does not brighten the canvas`);
     assert.ok(Math.abs(color.chroma - (neutral ? 0.009 : 0.02)) < 0.004, `${key} grid remains muted`);
-    assert.ok(hueGap(color.hue, reference.hue) < 12, `${key} grid follows its palette hue`);
+    assert.ok(hueGap(color.hue, referenceHue) < 12, `${key} grid follows its palette hue`);
     assert.equal(light[key].get('--grid-line'), previousLightLines[index], `${key} light grid is unchanged`);
   }
 });

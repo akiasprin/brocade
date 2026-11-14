@@ -1,4 +1,6 @@
 import { TitleActions } from '../ui/title-actions';
+import { buildFlowModel, type FlowCompiledApp, type FlowMachine, type FlowRule } from './rule-flow/model';
+import { FlowModeToggle, RuleFlow } from './rule-flow/view';
 import { useCardPressFeedback } from '../ui/card-press';
 import { useObservationUpdates } from '../observation-events';
 import { ChainUnlockTable } from './chain-unlock-table';
@@ -5980,9 +5982,6 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
             <section className="panel config-panel rule-sheet-card node-chain-sheet">
               <header>
                 <PanelTitle of="chains">链路规则</PanelTitle>
-                <span className="rule-sheet-meta header-stat">
-                  {spine.length === 1 ? '直出' : `${spine.length - 1} 跳`}
-                </span>
               </header>
               {/* 此处不提供「追加一跳」和「改顺序」。这两项操作都在下方的规则表中完成：
             转发目标的候选是全部机器，链外的机器标注为「链外」——选中后该机器即成为该链的
@@ -6417,8 +6416,7 @@ function ChainRulesPanelContent({
   showHeader = true,
   onClose,
   onRemove,
-  rootLabel,
-  rootLabelTitle,
+  machineRole,
   readOnly = false,
   settingsReadable = true,
   loadingFallback,
@@ -6446,8 +6444,8 @@ function ChainRulesPanelContent({
   // 只有链详情页传入该参数——机器详情页中的对应区块表示该机器参与的链，
   // 在该上下文中删除其他机器不合适。不传入时不渲染该组控件。
   onRemove?: (node: string) => void;
-  rootLabel?: string;
-  rootLabelTitle?: string;
+  /** Machine detail adds its local role and a link to the owning chain. */
+  machineRole?: string;
   // readonly 角色看到的是同一棵树和同一张表，只是全部禁用（见 RuleEditor 的 readOnly）。
   // 此前整块被替换为「修改规则需要 editor 及以上」——该提示回答的是权限问题，
   // 而进入链详情页需要了解的是当前配置，两者不同。
@@ -6464,6 +6462,10 @@ function ChainRulesPanelContent({
   const [draftHops, setDraftHops] = useState<Record<string, HopsDraft>>({});
   const [draftDns, setDraftDns] = useState<Record<string, EgressDnsDraft>>({});
   const [draftDnsOrder, setDraftDnsOrder] = useState<Record<string, EgressDnsOrderDraft>>({});
+  const [visual, setVisual] = useState(true);
+  const section = useRef<HTMLElement>(null);
+  const sectionId = useId();
+  const [revealTarget, setRevealTarget] = useState<{ node: string; index?: number } | null>(null);
   const effectiveSteps = useMemo(
     () => effectiveChainRuleSteps(chain.id, steps, draftRules),
     [chain.id, draftRules, steps],
@@ -6605,6 +6607,75 @@ function ChainRulesPanelContent({
   const [expansion, setExpansion] = useState<ReadonlyMap<string, boolean>>(() => new Map());
 
   const rootNodes = spine[0] ? [spine[0]] : rows.slice(0, 1).map(row => row.node);
+  const flowModel = useMemo(
+    () =>
+      buildFlowModel({
+        chain,
+        root: spine[0] ?? effectiveSteps[0]?.node,
+        steps,
+        snapshot: snapshotForPorts.data,
+        nodes,
+        compiled: (compiledForPorts.data?.apps as FlowCompiledApp[] | undefined) ?? [],
+        localRules: draftRules,
+        uncompiledNodes: new Set(Object.keys(draftHops)),
+        pendingDnsNodes: new Set([...Object.keys(draftDns), ...Object.keys(draftDnsOrder)]),
+        pendingListeners: new Set(Object.values(draftHops).flatMap(hops => Object.keys(hops))),
+      }),
+    [
+      chain,
+      spine,
+      effectiveSteps,
+      steps,
+      snapshotForPorts.data,
+      nodes,
+      compiledForPorts.data,
+      draftRules,
+      draftHops,
+      draftDns,
+      draftDnsOrder,
+    ],
+  );
+  const revealRule = (machine: FlowMachine, rule?: FlowRule) => {
+    if (machine.chain !== chain.id) {
+      const owner = snapshotForPorts.data?.snapshot.apps.find(app =>
+        app.chains.some(chain => chain.id === machine.chain),
+      );
+      if (owner) navigate('chains', { p: 'chain', app: owner.id, chain: machine.chain });
+      return;
+    }
+    const node = [...(section.current?.querySelectorAll<HTMLElement>('[data-rule-node]') ?? [])].find(
+      element => element.dataset.ruleNode === machine.node,
+    );
+    const occurrence = node?.dataset.ruleOccurrence;
+    if (occurrence) setExpansion(previous => new Map(previous).set(occurrence, true));
+    setVisual(false);
+    setRevealTarget({ node: machine.node, index: rule?.index });
+  };
+  useLayoutEffect(() => {
+    if (visual || !revealTarget) return;
+    const node = [...(section.current?.querySelectorAll<HTMLElement>('[data-rule-node]') ?? [])].find(
+      element => element.dataset.ruleNode === revealTarget.node,
+    );
+    const body = node?.querySelector(':scope > .chain-rule-body');
+    const target =
+      (revealTarget.index === undefined
+        ? null
+        : body?.querySelectorAll<HTMLElement>('.chain-rule-table > tbody > tr')[revealTarget.index]) ??
+      node?.querySelector<HTMLElement>('.chain-rule-node-head');
+    if (!target) return;
+    target.scrollIntoView?.({
+      block: 'center',
+      behavior: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth',
+    });
+    target.tabIndex = -1;
+    target.focus({ preventScroll: true });
+    target.classList.add('chain-rule-row-flash');
+    const timer = window.setTimeout(() => target.classList.remove('chain-rule-row-flash'), 1800);
+    return () => {
+      window.clearTimeout(timer);
+      target.classList.remove('chain-rule-row-flash');
+    };
+  }, [visual, revealTarget]);
   const initiallyExpanded = selected ?? rootNodes[0];
   // 先统计每台机器在树中出现的次数，出现两次以上的每一处都标「共享配置」——包括第一处：只标后续位置时，
   // 第一处会被误认为独占这份配置。遍历规则必须与下面的 renderNode 一致（相同的防环和防重复展开）。
@@ -6652,6 +6723,8 @@ function ChainRulesPanelContent({
         className={`chain-rule-node${expanded ? ' open' : ''}`}
         style={{ '--depth': path.length } as CSSProperties}
         key={occurrence}
+        data-rule-node={node}
+        data-rule-occurrence={occurrence}
       >
         <div
           role="button"
@@ -6672,11 +6745,6 @@ function ChainRulesPanelContent({
           </span>
           <span className="who">
             <b title={node}>{nameOf(node)}</b>
-            {path.length === 0 && rootLabel && (
-              <span className="st b-chain" title={rootLabelTitle}>
-                {rootLabel}
-              </span>
-            )}
             {(occurrences.get(node) ?? 0) > 1 && (
               <span className="st" title="这台机器在这条链上出现多次，共用同一张规则表">
                 共享配置
@@ -6687,7 +6755,7 @@ function ChainRulesPanelContent({
                 {label}
               </span>
             ))}
-            {rootLabel && selected === node && <span className="st st-succeeded">当前节点</span>}
+            {machineRole && selected === node && <span className="st st-succeeded">本机</span>}
             {blockingReferences.length > 0 && (
               <span
                 className="st st-gold"
@@ -6794,7 +6862,7 @@ function ChainRulesPanelContent({
   const tree = rootNodes.map(root => renderNode(root, ['入口'], []));
   const orphanTree = rows.flatMap(row => (rendered.has(row.node) ? [] : [renderNode(row.node, ['孤立'], [])]));
   return (
-    <>
+    <section className="chain-rule-section" ref={section} aria-label={`${chain.name || chain.id}规则`}>
       {portDependenciesError && <ErrorBox error={portDependenciesError} />}
       {showHeader && (
         <div className="toolbar">
@@ -6807,18 +6875,67 @@ function ChainRulesPanelContent({
           )}
         </div>
       )}
-      <div className="chain-rule-tree" aria-busy={portDependenciesPending}>
-        {tree}
-        {orphanTree.length > 0 && (
-          <div className="chain-rule-orphans">
-            <div className="chain-rule-node-head">
-              <b>未从入口展开</b>
-            </div>
-            {orphanTree}
-          </div>
-        )}
+      <div className="chain-rule-section-head">
+        <span className="chain-rule-section-title">
+          {chain.subscription_country && <RegionFlag code={chain.subscription_country} />}
+          {machineRole ? (
+            <button
+              type="button"
+              className="chain-rule-section-name"
+              title="打开线路详情"
+              onClick={() => navigate('chains', { p: 'chain', app: appId, chain: chain.id })}
+            >
+              {chain.name || chain.id}
+            </button>
+          ) : (
+            <b className="chain-rule-section-name">{chain.name || chain.id}</b>
+          )}
+          <span className="chain-rule-section-meta">
+            {machineRole ? (
+              <>
+                {machineRole}
+                <span className="header-stat">
+                  {' '}
+                  · 本机 {(selected ? (draftRules[selected] ?? stepOf(selected)?.rules) : [])?.length ?? 0} 条规则
+                </span>
+              </>
+            ) : (
+              <span className="header-stat">
+                {spine.length <= 1 ? '直出' : `${spine.length - 1} 跳`} ·{' '}
+                {new Set(flowModel.machines.map(machine => machine.node)).size} 台机器
+              </span>
+            )}
+          </span>
+        </span>
+        <FlowModeToggle
+          visual={visual}
+          name={chain.name || chain.id}
+          controls={sectionId}
+          onChange={() => {
+            setRevealTarget(null);
+            setVisual(value => !value);
+          }}
+        />
       </div>
-    </>
+      <div id={sectionId}>
+        <div hidden={!visual}>
+          <RuleFlow model={flowModel} focusNode={machineRole ? selected : undefined} onReveal={revealRule} />
+        </div>
+        <div className="chain-rule-section-list" hidden={visual}>
+          <div className="chain-rule-tree" aria-busy={portDependenciesPending}>
+            {tree}
+            {orphanTree.length > 0 && (
+              <div className="chain-rule-orphans">
+                <div className="chain-rule-node-head">
+                  <b>未从入口展开</b>
+                </div>
+                {orphanTree}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 

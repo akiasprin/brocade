@@ -1,4 +1,9 @@
 //! Optional fixed-target web diagnostics, independent of convergence and accounting.
+pub(crate) fn youtube_response_country(body: &str, cookies: &[&str]) -> Option<String> {
+    youtube::response_country(body, cookies)
+}
+pub(crate) use youtube::{MUSIC_TARGET, PREMIUM_TARGET};
+
 use crate::{
     http::{HttpClient, HttpResponse},
     options::Options,
@@ -412,11 +417,8 @@ struct Page {
     url: reqwest::Url,
 }
 fn page_headers(url: &reqwest::Url) -> Vec<(&'static str, String)> {
-    // A fresh EU/UK Premium request otherwise redirects to the consent interstitial.
-    // This stateless preference contains no account or region and is sent only to YouTube;
-    // availability and country must still come from the actual page and fresh response.
-    if url.host_str() == Some("www.youtube.com") {
-        vec![("Cookie", "SOCS=CAI".into())]
+    if let Some(preference) = crate::http::anonymous_consent_cookie(url) {
+        vec![("Cookie", preference.into())]
     } else if url.host_str() == Some("www.reddit.com") {
         // Reddit may strip X-Served-By; Fastly's public diagnostics expose the same
         // delivery cache in Fastly-Debug-Path without a second request or cookies.
@@ -558,6 +560,12 @@ fn get(url: &str, deadline: Instant, proxy: Option<&ProbeContext>) -> Result<Pag
                 .join(location)
                 .map_err(|_| UnlockCode::UnrecognizedResponse)?;
             continue;
+        }
+        if crate::http::is_consent_page(&url, &response.body) {
+            return Err(UnlockCode::UnrecognizedResponse);
+        }
+        if crate::http::requires_search_javascript(&url, &response.body) {
+            return Err(UnlockCode::UnrecognizedResponse);
         }
         return Ok(Page { response, url });
     }
@@ -917,7 +925,7 @@ fn html_tags<'a>(body: &'a str, tag: &'a str) -> impl Iterator<Item = &'a str> {
     })
 }
 
-fn html_attribute<'a>(mut attributes: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn html_attribute<'a>(mut attributes: &'a str, name: &str) -> Option<&'a str> {
     while !attributes.is_empty() {
         attributes = attributes.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '/');
         let end = attributes
@@ -3065,6 +3073,7 @@ mod youtube_consent_tests {
         for url in [
             "https://www.youtube.com/",
             "https://www.youtube.com/premium?hl=en",
+            "https://music.youtube.com/?hl=en",
         ] {
             assert_eq!(
                 page_headers(&reqwest::Url::parse(url).unwrap()),
@@ -3076,6 +3085,8 @@ mod youtube_consent_tests {
             "www.netflix.com",
             "claude.ai",
             "consent.youtube.com",
+            "www.youtube.com.example.org",
+            "youtube.com.example.org",
         ] {
             assert!(
                 page_headers(&reqwest::Url::parse(&format!("https://{host}/")).unwrap()).is_empty()

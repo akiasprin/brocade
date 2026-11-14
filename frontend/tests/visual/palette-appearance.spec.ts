@@ -1,0 +1,68 @@
+import { expect, test } from '@playwright/test';
+import { readFileSync } from 'node:fs';
+
+const preserved = JSON.parse(
+  readFileSync(new URL('../fixtures/palette-preserved-colors.json', import.meta.url), 'utf8'),
+);
+const rgb = (hex: string) => `rgb(${[1, 3, 5].map(index => parseInt(hex.slice(index, index + 2), 16)).join(', ')})`;
+
+const palettes = ['dailan', 'jinzi', 'songlv', 'oufen', 'xuanmo'];
+
+for (const palette of palettes) {
+  for (const theme of ['light', 'dark']) {
+    test(`${palette} ${theme} surfaces and controls`, async ({ page }, testInfo) => {
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await page.clock.setFixedTime(new Date('2026-11-02T10:00:00Z'));
+      await page.addInitScript(key => localStorage.setItem('brocade-console:palette', key), palette);
+      await page.goto(`/tests/fixtures/navigation-preview.html?theme=${theme}#/nodes`);
+      await expect(page.locator('html')).toHaveAttribute('data-palette', palette);
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+      await expect(page.locator('.node-card').first()).toBeVisible();
+      await page.evaluate(() => document.fonts.ready);
+      await expect(page).toHaveScreenshot(`${palette}-${theme}-nodes.png`, { threshold: 0.01 });
+      await page.screenshot({ path: testInfo.outputPath('nodes.png') });
+
+      await page.goto(`/tests/fixtures/navigation-preview.html?theme=${theme}#/nodes/node/jp-iij`);
+      await page.getByRole('tab', { name: '配置', exact: true }).click();
+      await expect(page.locator('.nd-tab-config')).toBeVisible();
+      await expect(page.locator('.module-load-error')).toHaveCount(0);
+      const dns = page
+        .locator('.panel.config-panel')
+        .filter({ has: page.getByRole('heading', { name: 'DNS', exact: true }) });
+      const titleBackground = await page.locator('html').evaluate(root => {
+        const style = getComputedStyle(root);
+        return style.getPropertyValue('--panel-heading-bg').trim();
+      });
+      if (theme === 'light') expect(titleBackground).toBe(preserved[palette][theme]['--panel-heading-bg']);
+      await expect(dns.locator('header')).toHaveCSS('background-color', rgb(titleBackground));
+      await expect(dns.getByRole('heading')).toHaveCSS('color', rgb(preserved[palette][theme]['--panel-heading-ink']));
+      await expect(dns).toHaveCSS('border-top-color', rgb(preserved[palette][theme]['--line']));
+      await expect(dns).toHaveCSS('border-top-width', '1px');
+      await expect(dns).toHaveCSS('border-radius', '10px');
+      await dns.locator('select').first().focus();
+      await expect(dns.locator('select').first()).toBeFocused();
+      await dns.locator('select').first().blur();
+      await expect(page).toHaveScreenshot(`${palette}-${theme}-configuration.png`, { threshold: 0.01 });
+      await page.screenshot({ path: testInfo.outputPath('configuration.png') });
+    });
+  }
+}
+
+for (const theme of ['light', 'dark']) {
+  for (const route of ['nodes', 'chains', 'users']) {
+    test(`dailan ${theme} ${route} on a phone`, async ({ page }) => {
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.clock.setFixedTime(new Date('2026-11-02T10:00:00Z'));
+      await page.goto(`/tests/fixtures/navigation-preview.html?theme=${theme}#/${route}`);
+      await expect(page.locator('.fg-top')).toBeVisible();
+      await expect(page.locator('.module-load-error')).toHaveCount(0);
+      await expect(
+        page.getByRole('heading', {
+          name: route === 'nodes' ? '机器' : route === 'chains' ? '线路' : '用户',
+          exact: true,
+        }),
+      ).toBeVisible();
+      await expect(page).toHaveScreenshot(`dailan-${theme}-${route}-phone.png`, { threshold: 0.01 });
+    });
+  }
+}

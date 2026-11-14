@@ -50,7 +50,7 @@ test('machine action menu escapes the sticky header backdrop root', () => {
 test('machine config keeps traffic below identity and DNS above certificates', () => {
   assert.match(
     nodes,
-    /<PanelTitle of="identity">身份<\/PanelTitle>[\s\S]*?<TrafficAccountingCard node=\{n\} canEdit=\{system\} \/>[\s\S]*?<WgCard[\s\S]*?<div>\s*<DnsCard node=\{n\} canEdit=\{system\} onSaved=\{onSaved\} \/>[\s\S]*?<CertGroupCard node=\{n\}/,
+    /<PanelTitle of="identity">身份<\/PanelTitle>[\s\S]*?<TrafficAccountingCard node=\{n\} canEdit=\{system\} \/>[\s\S]*?<WgCard[\s\S]*?<div>\s*\{snapshot\.data && <DnsCard node=\{n\} canEdit=\{system\} onSaved=\{onSaved\} \/>\}[\s\S]*?\{snapshot\.data && <CertGroupCard node=\{n\}/,
   );
 
   const trafficCard = nodes.slice(

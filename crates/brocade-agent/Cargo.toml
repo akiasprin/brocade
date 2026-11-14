@@ -25,7 +25,9 @@ flate2 = "1.1"
 libc = "0.2"
 # HTTP framing and deadlines use the same reqwest/rustls stack as the Console.
 # Keep native TLS, OpenSSL and AWS-LC out of static musl builds.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots", "socks"] }
+reqwest_cookie_store = "0.9"
+httpdate = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-webpki-roots", "socks", "cookies"] }
 # The live channel has its own single-thread runtime; HTTP and collection retain their independent schedules.
 tokio = { version = "1", features = ["sync", "rt", "net", "time", "macros", "io-util"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
@@ -47,5 +49,6 @@ ring = "0.17"
 rcgen = "0.14"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 # Exercise rolling upgrades against a peer without compression support.
 tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }

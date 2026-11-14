@@ -12,10 +12,11 @@ pub(crate) enum ObservationDomain {
     Unlock,
     Deployments,
     TunnelProbes,
+    IpMaintenance,
 }
 
 impl ObservationDomain {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Nodes,
         Self::Load,
         Self::Traffic,
@@ -23,20 +24,21 @@ impl ObservationDomain {
         Self::Unlock,
         Self::Deployments,
         Self::TunnelProbes,
+        Self::IpMaintenance,
     ];
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ObservationEvents(watch::Sender<[u64; 7]>);
+pub(crate) struct ObservationEvents(watch::Sender<[u64; 8]>);
 
 impl Default for ObservationEvents {
     fn default() -> Self {
-        Self(watch::channel([0; 7]).0)
+        Self(watch::channel([0; 8]).0)
     }
 }
 
 impl ObservationEvents {
-    pub fn subscribe(&self) -> watch::Receiver<[u64; 7]> {
+    pub fn subscribe(&self) -> watch::Receiver<[u64; 8]> {
         self.0.subscribe()
     }
 

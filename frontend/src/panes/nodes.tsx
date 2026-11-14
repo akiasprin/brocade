@@ -180,6 +180,9 @@ import { ReverseHealthCard } from '../reverse-health';
 import type { AppIr } from '../topo/model';
 
 const ChainWizard = lazy(() => import('./chain-wizard').then(module => ({ default: module.ChainWizard })));
+const IpMaintenanceCard = lazy(() =>
+  import('./ip-maintenance').then(module => ({ default: module.IpMaintenanceCard })),
+);
 const ChainRulesPanel = lazy(() => import('./chains').then(module => ({ default: module.ChainRulesPanel })));
 const LazyMachineEgressDnsRules = lazy(() =>
   import('./rules').then(module => ({ default: module.MachineEgressDnsRules })),
@@ -5365,8 +5368,7 @@ function NodeChainRuleTree({
         nodes={nodes}
         selected={nodeId}
         showHeader={false}
-        rootLabel={use.chain.name || use.chain.id}
-        rootLabelTitle={`${use.appId} / ${use.chain.id}`}
+        machineRole={use.role}
         readOnly={readOnly}
         settingsReadable={settingsReadable}
         loadingFallback={null}
@@ -5479,7 +5481,7 @@ function NodeChainsSection({
 const IDENT_FIELD = { width: 220 };
 
 /** 机器详情保留运行观测、机器配置与规则关系；用户流量在用量页查看。 */
-type NodeTab = 'observed' | 'config' | 'chains' | 'unlock';
+type NodeTab = 'observed' | 'config' | 'chains' | 'unlock' | 'care';
 
 function NodeDetailLayout({
   sheeted,
@@ -5534,28 +5536,11 @@ function NodeDetailLayout({
   );
 }
 
-function NodeDetailTabState({
-  tab,
-  tabId,
-  panelId,
-  error,
-}: {
-  tab: NodeTab;
-  tabId: string;
-  panelId: string;
-  error?: unknown;
-}) {
+function NodeConfigState({ error }: { error?: unknown }) {
   return (
-    <section
-      id={panelId}
-      className={`nd-tab-panel node-detail-tab-state node-detail-tab-state-${tab}`}
-      role="tabpanel"
-      aria-labelledby={tabId}
-      aria-busy={!error}
-      tabIndex={0}
-    >
+    <div className="node-detail-tab-state node-detail-tab-state-config" aria-busy={!error}>
       {error ? <ErrorBox error={error} /> : <ObservationReading />}
-    </section>
+    </div>
   );
 }
 
@@ -5729,9 +5714,10 @@ export function NodeDetail({
 
   /* 页签是一次浏览中的位置，不进地址栏。安装页可定向打开配置，但不改变既有详情 URL。
      换机器时使用新入口指定的位置，不继承上一台的阅读位置。 */
+  const entryTab: NodeTab = initialTab;
   const [tabState, setTabState] = useState<{ id: string; tab: NodeTab }>({
     id,
-    tab: initialTab,
+    tab: entryTab,
   });
   const draftFocus = useNodeDraftFocus(id);
   const [lastDraftFocus, setLastDraftFocus] = useState(0);
@@ -5740,7 +5726,7 @@ export function NodeDetail({
     setTabState({ id, tab: NODE_DRAFT_PANELS[draftFocus.panel].tab });
   }
   const tabIdBase = useId();
-  const activeTab: NodeTab = tabState.id !== id ? initialTab : tabState.tab;
+  const activeTab: NodeTab = tabState.id !== id ? entryTab : tabState.tab;
   const setTab = (next: NodeTab) => {
     if (next === activeTab) return true;
     if (!confirmDiscardChanges(`node-tab:${id}:${activeTab}`)) return false;
@@ -5750,7 +5736,7 @@ export function NodeDetail({
     setTabState({ id, tab: next });
     return true;
   };
-  const tabs: NodeTab[] = ['observed', 'unlock', 'config', 'chains'];
+  const tabs: NodeTab[] = ['observed', 'unlock', 'care', 'config', 'chains'];
   const tabId = (value: NodeTab) => `${tabIdBase}-${value}-tab`;
   const panelId = (value: NodeTab) => `${tabIdBase}-${value}-panel`;
   const moveTab = (event: ReactKeyboardEvent<HTMLButtonElement>, currentTab: NodeTab) => {
@@ -5926,7 +5912,7 @@ export function NodeDetail({
 
   // 规则页同时承载机器 DNS 策略和链路规则，所以没有加入链路的机器也保留这一页；两块
   // 各自显示空状态，不能再把“无链路”等同于“没有规则页面”。
-  const tab = activeTab;
+  const tab: NodeTab = activeTab;
   const activeLoadRangeTransition = loadRangeTransition?.id === id ? loadRangeTransition : null;
   /** 返回 false 表示没有发起切换（与当前显示的范围相同）。 */
   const changeLoadRange = (range: LoadRange): boolean => {
@@ -6019,6 +6005,19 @@ export function NodeDetail({
           >
             <Icon of="unlock" size={14} />
             解锁
+          </button>
+          <button
+            type="button"
+            id={tabId('care')}
+            role="tab"
+            aria-selected={tab === 'care'}
+            aria-controls={panelId('care')}
+            tabIndex={tab === 'care' ? 0 : -1}
+            onKeyDown={event => moveTab(event, 'care')}
+            onClick={() => setTab('care')}
+          >
+            <Icon of="maintenance" size={14} className="nd-tab-ic" />
+            养护
           </button>
           <button
             type="button"
@@ -6431,6 +6430,22 @@ export function NodeDetail({
         </section>
       )}
 
+      {tab === 'care' && (
+        <section
+          id={panelId('care')}
+          className="nd-tab-config nd-tab-care nd-tab-panel"
+          role="tabpanel"
+          aria-labelledby={tabId('care')}
+          tabIndex={0}
+        >
+          <div>
+            <Suspense fallback={<Loading variant="form" />}>
+              <IpMaintenanceCard key={id} node={n} canEdit={system} />
+            </Suspense>
+          </div>
+        </section>
+      )}
+
       {/* ── 写入控制面模型的配置。 ──
             两列而不是铺满：表单行是一条标签栏加 220px 输入，整幅宽度只会让标签和值之间
             空出一大片。分栏依据是「改这一项影响谁」：
@@ -6438,10 +6453,7 @@ export function NodeDetail({
               右栏 —— DNS、证书等外部关系，以及它与机队默认值的差异。
             右栏末尾的「本机覆盖」把设置页里按机器分列的两段（连接策略、日志保留）收在
             这台机器名下：那两段在设置页是一张机队表，逐台调一项要先在表里找到这一行。 */}
-      {tab === 'config' && !snapshot.data && (
-        <NodeDetailTabState tab="config" tabId={tabId('config')} panelId={panelId('config')} error={snapshot.error} />
-      )}
-      {tab === 'config' && snapshot.data && (
+      {tab === 'config' && (
         <section
           id={panelId('config')}
           data-draft-panel={nodeDraftPanelKey(id, 'config')}
@@ -6451,103 +6463,112 @@ export function NodeDetail({
           tabIndex={0}
         >
           <div>
-            <div className="panel config-panel" data-draft-panel={nodeDraftPanelKey(id, 'identity')}>
-              <header>
-                <PanelTitle of="identity">身份</PanelTitle>
-              </header>
-              <div className="fgrid one">
-                <Row k="名称">
-                  <input
-                    className="f"
-                    style={IDENT_FIELD}
-                    value={cur.name}
-                    disabled={!system}
-                    onChange={e => setForm({ ...cur, name: e.target.value })}
-                  />
-                </Row>
-                {/* NAT 独占一行，位于其对应的 IP 之上。行标签已标明是哪条 IP 的 NAT，
+            {snapshot.data ? (
+              <>
+                <div className="panel config-panel" data-draft-panel={nodeDraftPanelKey(id, 'identity')}>
+                  <header>
+                    <PanelTitle of="identity">身份</PanelTitle>
+                  </header>
+                  <div className="fgrid one">
+                    <Row k="名称">
+                      <input
+                        className="f"
+                        style={IDENT_FIELD}
+                        value={cur.name}
+                        disabled={!system}
+                        onChange={e => setForm({ ...cur, name: e.target.value })}
+                      />
+                    </Row>
+                    {/* NAT 独占一行，位于其对应的 IP 之上。行标签已标明是哪条 IP 的 NAT，
                   开关不再附带文字。两条 NAT 的说明相同，只写一次——重复显示不增加信息，
                   只增加行数。 */}
-                <Row k="IPv4 NAT">
-                  <SegSwitch
-                    checked={cur.public_ipv4_nat}
-                    disabled={!system}
-                    onChange={checked => setForm({ ...cur, public_ipv4_nat: checked })}
-                    off="直连"
-                    on="经 NAT"
-                  />
-                  <span className="sub">经 NAT 的地址不会被当作可直连的落点。</span>
-                </Row>
-                <Row k="公网 IPv4">
-                  <input
-                    className="f"
-                    style={IDENT_FIELD}
-                    value={cur.public_ipv4}
-                    disabled={!system}
-                    onChange={e => setForm({ ...cur, public_ipv4: e.target.value })}
-                  />
-                  <EgressMirror configured={n.public_ipv4} observed={n.route_ipv4} nat={n.public_ipv4_nat} />
-                </Row>
-                <Row k="IPv6 NAT">
-                  <SegSwitch
-                    checked={cur.public_ipv6_nat}
-                    disabled={!system}
-                    onChange={checked => setForm({ ...cur, public_ipv6_nat: checked })}
-                    off="直连"
-                    on="经 NAT"
-                  />
-                </Row>
-                <Row k="公网 IPv6">
-                  <input
-                    className="f"
-                    style={IDENT_FIELD}
-                    value={cur.public_ipv6}
-                    disabled={!system}
-                    onChange={e => setForm({ ...cur, public_ipv6: e.target.value })}
-                  />
-                  <EgressMirror configured={n.public_ipv6} observed={n.route_ipv6} nat={n.public_ipv6_nat} />
-                </Row>
-                {/* 位于地址之后：上面几行表示外部如何访问该机器，该行表示流量能否从该机器出网——
+                    <Row k="IPv4 NAT">
+                      <SegSwitch
+                        checked={cur.public_ipv4_nat}
+                        disabled={!system}
+                        onChange={checked => setForm({ ...cur, public_ipv4_nat: checked })}
+                        off="直连"
+                        on="经 NAT"
+                      />
+                      <span className="sub">经 NAT 的地址不会被当作可直连的落点。</span>
+                    </Row>
+                    <Row k="公网 IPv4">
+                      <input
+                        className="f"
+                        style={IDENT_FIELD}
+                        value={cur.public_ipv4}
+                        disabled={!system}
+                        onChange={e => setForm({ ...cur, public_ipv4: e.target.value })}
+                      />
+                      <EgressMirror configured={n.public_ipv4} observed={n.route_ipv4} nat={n.public_ipv4_nat} />
+                    </Row>
+                    <Row k="IPv6 NAT">
+                      <SegSwitch
+                        checked={cur.public_ipv6_nat}
+                        disabled={!system}
+                        onChange={checked => setForm({ ...cur, public_ipv6_nat: checked })}
+                        off="直连"
+                        on="经 NAT"
+                      />
+                    </Row>
+                    <Row k="公网 IPv6">
+                      <input
+                        className="f"
+                        style={IDENT_FIELD}
+                        value={cur.public_ipv6}
+                        disabled={!system}
+                        onChange={e => setForm({ ...cur, public_ipv6: e.target.value })}
+                      />
+                      <EgressMirror configured={n.public_ipv6} observed={n.route_ipv6} nat={n.public_ipv6_nat} />
+                    </Row>
+                    {/* 位于地址之后：上面几行表示外部如何访问该机器，该行表示流量能否从该机器出网——
                   两者都属于该机器的对外属性，但方向相反。 */}
-                <EgressRow node={n} canEdit={system} onSaved={onSaved} />
-              </div>
-              {dirty && (
-                <>
-                  {save.error && <ErrorBox error={save.error} />}
-                  <div className="toolbar">
-                    <span className="sp" />
-                    <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate()}>
-                      {save.isPending ? '保存中…' : '保存到草稿'}
-                    </button>
-                    <button className="btn" disabled={save.isPending} onClick={() => setForm(null)}>
-                      还原
-                    </button>
+                    <EgressRow node={n} canEdit={system} onSaved={onSaved} />
                   </div>
-                </>
-              )}
-            </div>
+                  {dirty && (
+                    <>
+                      {save.error && <ErrorBox error={save.error} />}
+                      <div className="toolbar">
+                        <span className="sp" />
+                        <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate()}>
+                          {save.isPending ? '保存中…' : '保存到草稿'}
+                        </button>
+                        <button className="btn" disabled={save.isPending} onClick={() => setForm(null)}>
+                          还原
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
 
-            <TrafficAccountingCard node={n} canEdit={system} />
-            <XrayCard node={n} canEdit={system} onSaved={onSaved} />
-            <WgCard
-              node={n}
-              listenPort={wgListenPort}
-              peers={nodes.data?.nodes ?? []}
-              disabledLinks={snapshot.data?.snapshot.settings?.overlay.disabled_links ?? []}
-              enabled={wireguardEnabled}
-              canEdit={system}
-              onSaved={onSaved}
-            />
-            {system && <SourceAccessPanel key={`source-access:${id}`} nodeId={id} editable={system} />}
+                <TrafficAccountingCard node={n} canEdit={system} />
+                <XrayCard node={n} canEdit={system} onSaved={onSaved} />
+                <WgCard
+                  node={n}
+                  listenPort={wgListenPort}
+                  peers={nodes.data?.nodes ?? []}
+                  disabledLinks={snapshot.data?.snapshot.settings?.overlay.disabled_links ?? []}
+                  enabled={wireguardEnabled}
+                  canEdit={system}
+                  onSaved={onSaved}
+                />
+                {system && <SourceAccessPanel key={`source-access:${id}`} nodeId={id} editable={system} />}
+              </>
+            ) : (
+              <NodeConfigState error={snapshot.error} />
+            )}
           </div>
 
           <div>
-            <DnsCard node={n} canEdit={system} onSaved={onSaved} />
-            {/* 证书组决定这台机器出示的 SNI，与身份里的公网地址一样是它的对外属性；
-                与它们不同的是改动不经过发布，所以卡里自己就保存了。 */}
-            <CertGroupCard node={n} canEdit={system} />
-            <ConnectionCard node={n} canEdit={system} onSaved={onSaved} />
-            <LogRetentionCard node={n} canEdit={system} />
+            {snapshot.data && <DnsCard node={n} canEdit={system} onSaved={onSaved} />}
+            {snapshot.data && <CertGroupCard node={n} canEdit={system} />}
+
+            {snapshot.data && (
+              <>
+                <ConnectionCard node={n} canEdit={system} onSaved={onSaved} />
+                <LogRetentionCard node={n} canEdit={system} />
+              </>
+            )}
           </div>
         </section>
       )}

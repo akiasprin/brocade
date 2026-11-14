@@ -1,3 +1,6 @@
+#[path = "cases/clash_rules.rs"]
+mod clash_rules_tests;
+
 use brocade_core::{
     client_config::{SubscriptionClientConfig, SUBSCRIPTION_CLIENT_CONFIG_SCHEMA},
     compile::compile,
@@ -30580,3 +30583,6 @@ mod node_xray_tests;
 #[cfg(feature = "cvm")]
 #[path = "cases/cvm.rs"]
 mod cvm_tests;
+
+#[path = "cases/ip_maintenance.rs"]
+mod ip_maintenance_tests;

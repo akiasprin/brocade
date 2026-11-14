@@ -1,3 +1,4 @@
+import { maintenancePolicy, maintenanceRegions } from './ip-maintenance-data';
 // Synthetic backend for the palette fixture. Never imported by the app.
 // One fleet backs every page: the chain-wizard machines and users, the test-node fixture's chains, and
 // deterministic load / traffic / latency curves that end at the real current time.
@@ -1103,6 +1104,30 @@ const range = (url: URL, fallback = DAY) => {
 };
 
 const ROUTES: [RegExp, Handler][] = [
+  [/^\/ip-maintenance\/regions$/, () => maintenanceRegions],
+  [
+    /^\/nodes\/[^/]+\/ip-maintenance$/,
+    () => ({
+      default_policy: { ...maintenancePolicy(), enabled: false },
+      desired: {
+        generation: 0,
+        policy: { ...maintenancePolicy(), enabled: false },
+        control_sequence: 0,
+        manual_request_id: null,
+        stop_sequence: 0,
+        target_round_id: null,
+        manual_sequence: 0,
+        manual_expires_at: null,
+        session_generation: 0,
+        report_sequence_floor: 0,
+        data_digest: null,
+      },
+      supported: false,
+      lifecycle_active: true,
+      report: null,
+      received_at_unix_secs: null,
+    }),
+  ],
   [/^\/cvm$/, () => cvmWorkspace('list')],
   [/^\/cvm\/readings$/, () => cvmReadings(cvmWorkspace('list'))],
   [/^\/branding$/, () => ({ site_name: 'Brocade', icon_data_url: null })],

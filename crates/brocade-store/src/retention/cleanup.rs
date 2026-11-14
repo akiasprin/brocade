@@ -11,6 +11,7 @@ enum Clock {
 }
 
 struct Specification {
+    table: &'static str,
     column: &'static str,
     clock: Clock,
     batch_rows: i64,
@@ -34,7 +35,8 @@ fn specification(item: &Definition) -> Specification {
         | "forwarding_usage_windows" => ("window_end", Clock::Timestamp),
         "node_ping_probe_samples" | "e2e_probe_samples" => ("probed_at", Clock::Timestamp),
         "usage_readings" | "forwarding_usage_samples" => ("read_at", Clock::Timestamp),
-        "vpngate_candidate_probe_samples"
+        "ip_maintenance_runs"
+        | "vpngate_candidate_probe_samples"
         | "vpngate_probe_samples"
         | "usage_report_receipts"
         | "forwarding_usage_report_receipts" => ("received_at", Clock::Timestamp),
@@ -59,6 +61,7 @@ fn specification(item: &Definition) -> Specification {
         _ => 10_000,
     };
     Specification {
+        table: item.table_name,
         column,
         clock,
         batch_rows,
@@ -78,7 +81,19 @@ fn predicate(spec: &Specification) -> String {
             "((now() - make_interval(secs => $1::double precision)) AT TIME ZONE 'UTC')::date"
         }
     };
-    format!("{} < {cutoff}{}", spec.column, spec.filter)
+    let expired = format!("{} < {cutoff}{}", spec.column, spec.filter);
+    if spec.table == "ip_maintenance_runs" {
+        // Apply the smaller cap to existing histories too, even when a machine stays offline.
+        // The node/id index bounds each cutoff lookup to at most 101 entries.
+        format!(
+            "({expired} OR id <= (SELECT cutoff.id FROM ip_maintenance_runs cutoff \
+             WHERE cutoff.node_id = ip_maintenance_runs.node_id \
+             ORDER BY cutoff.id DESC OFFSET {} LIMIT 1))",
+            crate::ip_maintenance::MAX_RETAINED_RUNS
+        )
+    } else {
+        expired
+    }
 }
 
 async fn limits(tx: &mut Transaction<'_, Postgres>) -> Result<()> {

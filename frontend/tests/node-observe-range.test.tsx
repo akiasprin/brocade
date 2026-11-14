@@ -168,12 +168,18 @@ describe('machine detail observation range in the address', () => {
     expect(screen.getByText(/异常项没有入账/)).toBeTruthy();
   });
 
-  it('keeps machine detail focused on observation, configuration, rules and unlock diagnostics', () => {
+  it('keeps maintenance discoverable alongside observation, configuration, rules and unlock diagnostics', () => {
     mount({ p: 'node', id: 'n1' });
 
     const observed = screen.getByRole('tabpanel', { name: /观测/ });
     expect(within(observed).queryByRole('region', { name: '实时流量' })).toBeNull();
-    expect(screen.getAllByRole('tab').map(tab => tab.textContent?.trim())).toEqual(['观测', '解锁', '配置', '规则']);
+    expect(screen.getAllByRole('tab').map(tab => tab.textContent?.trim())).toEqual([
+      '观测',
+      '解锁',
+      '养护',
+      '配置',
+      '规则',
+    ]);
     expect(screen.queryByRole('tab', { name: '流量' })).toBeNull();
     expect(screen.queryByRole('region', { name: '流入统计' })).toBeNull();
     expect(screen.queryByRole('region', { name: '流出统计' })).toBeNull();

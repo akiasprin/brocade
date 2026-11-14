@@ -1,0 +1,2 @@
+# Keep the version-pinned upstream seed bytes equal to PROVENANCE.json.
+crates/brocade-deployment/data/ip-maintenance/regions.json

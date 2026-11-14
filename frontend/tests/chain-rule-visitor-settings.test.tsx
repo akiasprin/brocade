@@ -64,7 +64,7 @@ function machineHop(view: ReturnType<typeof render>, node: string) {
 }
 
 describe('访客查看链路规则', () => {
-  it.each([undefined, 'target'])('默认只展开入口或当前机器（当前机器：%s）', async selected => {
+  it.each([undefined, 'target'])('默认显示可视化，切换列表后只展开入口或当前机器（当前机器：%s）', async selected => {
     const client = await visitorClientWithCachedForbidden();
     const steps: SnapshotStep[] = [
       {
@@ -88,6 +88,11 @@ describe('访客查看链路规则', () => {
         />
       </QueryClientProvider>,
     );
+    const toggle = view.getByRole('switch', { name: `${chain.name}：链路可视化`, checked: true });
+    expect(view.getByRole('combobox', { name: '追踪域名或 IP' })).toBeTruthy();
+    expect(view.container.querySelector<HTMLElement>('.chain-rule-section-list')?.hidden).toBe(true);
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-checked')).toBe('false');
     expect(view.getByRole('button', { name: /^entry/ }).getAttribute('aria-expanded')).toBe(
       String(selected !== 'target'),
     );
@@ -117,6 +122,7 @@ describe('访客查看链路规则', () => {
         <ChainRulesPanel appId="app-1" chain={chain} spine={['entry', 'target']} steps={steps} nodes={[]} />
       </QueryClientProvider>,
     );
+    fireEvent.click(view.getByRole('switch', { name: `${chain.name}：链路可视化`, checked: true }));
     const head = await view.findByRole('button', { name: /^target/ });
     expect(head.getAttribute('aria-expanded')).toBe('false');
     fireEvent.keyDown(head, { key: 'Enter' });
@@ -132,7 +138,7 @@ describe('访客查看链路规则', () => {
     expect(view.getByDisplayValue('unsaved.example')).toBe(input);
   });
 
-  it.each([undefined, chain.name])('只读规则树沿用机器行头并忽略设置 403（根标签：%s）', async rootLabel => {
+  it.each([undefined, '入口节点'])('只读规则树沿用机器行头并忽略设置 403（本机角色：%s）', async machineRole => {
     const client = await visitorClientWithCachedForbidden();
     const fetcher = vi.fn(async () => {
       throw new Error('访客视角不应再发请求');
@@ -147,7 +153,7 @@ describe('访客查看链路规则', () => {
           spine={['entry']}
           steps={[step]}
           nodes={[]}
-          rootLabel={rootLabel}
+          machineRole={machineRole}
           readOnly
           settingsReadable={false}
         />
@@ -158,7 +164,8 @@ describe('访客查看链路规则', () => {
     expect(view.getAllByText('entry').length).toBeGreaterThan(0);
     await waitFor(() => expect(view.container.querySelector('.rule-editor')).toBeTruthy());
     expect(view.container.querySelector('.rule-editor-title')).toBeNull();
-    if (rootLabel) expect(view.getByText(rootLabel)).toBeTruthy();
+    expect(view.getByText(chain.name)).toBeTruthy();
+    expect(view.container.querySelector('.chain-rule-node-head .b-chain')).toBeNull();
     await waitFor(() => expect(fetcher).not.toHaveBeenCalled());
   });
 

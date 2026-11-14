@@ -299,3 +299,29 @@ it('updates a production chain card after a probe hint without waiting for its m
   expect(fetcher.mock.calls[0][0]).toBe('/probes/e2e?format=columnar-v1');
   expect(client.getQueryData(['snapshot'])).toEqual(model);
 });
+
+it('maintenance control receipts keep refreshing when wall time is fixed', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+  const read = vi.fn(() => 1);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+  client.setQueryData(['node-ip-maintenance', 'n1'], 0);
+  function Read() {
+    useQuery({ queryKey: ['node-ip-maintenance', 'n1'], queryFn: read });
+    useObservationUpdates();
+    return null;
+  }
+  const page = render(
+    <QueryClientProvider client={client}>
+      <Read />
+    </QueryClientProvider>,
+  );
+  const source = Events.sources[0];
+  act(() => source.send('invalidate', ['ip_maintenance']));
+  await advance(1100);
+  expect(read).toHaveBeenCalledTimes(1);
+  act(() => source.send('invalidate', ['ip_maintenance']));
+  await advance(1100);
+  expect(read).toHaveBeenCalledTimes(2);
+  page.unmount();
+  client.clear();
+});

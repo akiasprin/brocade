@@ -63,12 +63,14 @@ export function SubStoreShell({
   children,
   onGuard,
   panel,
+  waitForConnector = false,
 }: {
   tenant: string;
   user: string;
   children: ReactNode;
   onGuard: (g: SubStoreNavigationGuard | null) => void;
   panel: { role: 'tabpanel'; id: string; 'aria-labelledby': string };
+  waitForConnector?: boolean;
 }) {
   const client = useQueryClient();
   const [stack, setStack] = useState<Page[]>([]);
@@ -145,6 +147,10 @@ export function SubStoreShell({
         {top && view ? (
           <div className="substore-page" {...panel} style={bodyHeight ? { minHeight: bodyHeight } : undefined}>
             {top.kind === 'settings' ? <Settings /> : top.kind === 'records' ? <Records /> : <RunDetails id={top.id} />}
+          </div>
+        ) : waitForConnector && !view ? (
+          <div className="substore-page" {...panel}>
+            {query.isPending && <Loading variant="form" />}
           </div>
         ) : (
           children

@@ -612,7 +612,7 @@ async fn substore_upgrade_from_released_0005_preserves_receipts_and_rolls_back_f
             .unwrap();
     let check = db.store.check_database_upgrade().await.unwrap();
     assert!(check.compatible);
-    assert_eq!(check.pending_versions, vec![6]);
+    assert_eq!(check.pending_versions, vec![6, 7]);
     // Conflicting existing shape fails atomically: no partial connector table or receipt remains.
     sqlx::query("CREATE TABLE subscription_connector_runs(id integer)")
         .execute(db.pool())

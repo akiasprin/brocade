@@ -401,7 +401,12 @@ async fn build_dynamic_clash(
     let uuid = plan.uuid.clone();
     let mut artifact = subscription::build(&plan);
     artifact.mark_self_signed(&crate::cert::self_signed_certificate_pins(pool).await?);
-    let (content, format) = render_subscription(&artifact, template);
+    let (mut content, format) = render_subscription(&artifact, template);
+    // Koipy and native URI subscriptions retain their independent behavior.
+    if matches!(template, DynamicClashTemplate::Standard) {
+        let (_, preferences) = crate::clash_rules::load(pool, tenant_id, user_id).await?;
+        content = yaml::clash_subscription_with_rules_for_plan(&artifact, &plan, &preferences);
+    }
     let usage = subscription_usage(pool, tenant_id, user_id, &app_ids).await?;
     Ok(DynamicClashSubscription {
         tenant_id: tenant_id.to_owned(),

@@ -187,3 +187,5 @@ cd frontend && npm ci && npm test
 ## 许可证
 
 Brocade 自有代码采用 [Apache License 2.0](LICENSE)。`components/xray-core` 是 [Xray-core](https://github.com/XTLS/Xray-core) 的 fork，遵循 [MPL-2.0](components/xray-core/LICENSE)，固定的上游基线见 [BROCADE_UPSTREAM.toml](components/xray-core/BROCADE_UPSTREAM.toml)。
+
+机器自身出口的 IP 养护、控制语义与验证入口见 [IP 养护](docs/ip-maintenance.md)。

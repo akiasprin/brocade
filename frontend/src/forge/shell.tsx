@@ -38,7 +38,8 @@ import { WinLayer } from '../ui/windows';
 import { wm, type CrumbSeg } from '../wm/store';
 import { draft } from '../draft';
 import { DraftBar } from './draft-bar';
-import { ArtifactRail, blastRadius, useChangedArtifacts, useRevisionDiff } from './artifacts';
+import { ArtifactRail, blastRadius, useChangedArtifacts } from './artifacts';
+import { useConfigurationStatus } from './configuration-status';
 import { navigate, returnTo, startRouting } from './route';
 import { can, isPublic, isVisitor, type Session } from '../session';
 import { forge, useForge, type NavKey } from './state';
@@ -238,23 +239,11 @@ export function ForgeShell({
     error: artifactsError,
   } = useChangedArtifacts(current, prev, { enabled: artifacts && draftDirty });
   const draftBlast = useMemo(() => blastRadius(list, changed), [list, changed]);
-  // Revision changes may contain only grants. Compare immutable configuration-file indexes;
-  // live convergence and release planning remain on the deployment page.
-  const released = revisions.data?.last_config_revision_id;
-  const compareConfiguration =
-    !pub && artifacts && !dirty && current != null && released !== undefined && current !== released;
-  const configurationDiff = useRevisionDiff(
-    compareConfiguration ? current : undefined,
-    compareConfiguration ? released : undefined,
+  const configurationStatus = useConfigurationStatus(
+    !pub && artifacts && !dirty ? current : undefined,
+    revisions.data?.last_config_revision_id,
   );
-  const pendingChanges =
-    dirty || current == null || released === undefined
-      ? undefined
-      : current === released
-        ? false
-        : configurationDiff.configurationNodes == null
-          ? undefined
-          : configurationDiff.configurationNodes.size > 0;
+  const { pendingChanges } = configurationStatus;
   const diagnostics = visibleDiagnostics(compile.data?.diagnostics);
   // 诊断的 location 中全部是 id，而面板需要显示名称。这两份数据在其他位置已在读取，
   // 此处只是将 id 到名称的转换集中处理（见 formatLocation）。
@@ -270,7 +259,7 @@ export function ForgeShell({
   const grantRuntime = compactGrantAutomation(grantAutomation.data, grantAutomation.isPending, !!grantAutomation.error);
   // 顶栏只留一段需要关注的短状态；健康且空闲时不显示常驻文案。
   // 修订号只跟随活动发布出现，避免把当前修订误读成需要处理的状态。
-  const runtimeReadError = revisions.error ?? compile.error ?? configurationDiff.error;
+  const runtimeReadError = revisions.error ?? compile.error ?? configurationStatus.error;
   const crumbRuntime: RuntimeCrumbState = runtimeReadError
     ? { text: revisions.error ? '修订状态未知' : compile.error ? '编译状态未知' : '配置状态未知', tone: 'bad' }
     : dirty
@@ -287,7 +276,7 @@ export function ForgeShell({
         ? { text: `发布 #${awaitingDeploy.id} · 待确认`, tone: 'bad' }
         : activeDeploy
           ? { text: `发布 #${activeDeploy.id} · 进行中`, tone: 'hot' }
-          : revisions.isPending || configurationDiff.pending
+          : revisions.isPending || configurationStatus.pending
             ? { text: '检查中', tone: 'normal' }
             : pendingChanges === undefined
               ? { text: '发布状态待检查', tone: 'normal' }

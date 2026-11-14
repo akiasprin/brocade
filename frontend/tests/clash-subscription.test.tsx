@@ -1,3 +1,4 @@
+import { clashRulesTransport } from './fixtures/clash-rules-data';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -87,6 +88,12 @@ const artifact = (content: string) =>
 const probeOff = () => jsonResponse({ available: false, version: null, reason: '测试中不发起拨测', concurrency: 30 });
 
 const renderViewer = (kind: 'uri' | 'clash', selfService = false) => {
+  const previousFetch = globalThis.fetch;
+  const rules = clashRulesTransport();
+  vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) => {
+    const response = rules(new URL(String(input), 'https://fixture.invalid'), init);
+    return response ? Promise.resolve(response) : previousFetch(input, init);
+  });
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   const view = render(
     <QueryClientProvider client={client}>

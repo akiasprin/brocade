@@ -10,28 +10,10 @@
    data-theme 写在任何元素上都生效：:root 管全局，子树写一份就局部换肤。
    --warn / --focus 是兼容别名，过渡完就删。
 
-   底色分七档，按「离读者正在读的那张纸有多远」排列，两套主题方向一致：
-
-     --sunk  <  --ground  <  --surface  <  --sheet  <  --block
-     输入格     台面         外框         纸         块 / 控件
-
-   --band 不在这条线上，它按「比它所落的块深 4.0 L*」定义，两套主题同一个差值。从前它取
-   块之上一档（暗 #26282e、亮 #eff1f4），于是暗色的标题条是凸起的、亮色的是凹陷的——同一个
-   令牌在两套主题里是两种东西。压深之后方向统一，标题条一律是压进去的。代价记在这里：暗色
-   的纸、外框、块三档只占 4.43 L*，压深 4.0 后 --band 只比纸亮 0.40 L*，两者近乎同色。
-
-   --block 曾是 --surface 的别名，因此纸上的面板与顶栏、产物栏取同一档灰：三个层级
-   一个取值，深浅只能靠边框表达。--surface 现已下移到纸之下——外框不应比它框住的内容
-   更亮——面板随之只需清过纸一档，不必再清过外框，这是步长能压到 1.05~1.07 的前提。
-
-   块与带是两种东西，不能共用一档：块是纸上的一块面（.panel / .blk），
-   带是块内或纸上的一条横条。落在块上的一档才是 --band（.blk-hd / .panel>header /
-   .node-chain-use>.toolbar）；落在纸上的带向上一档正好是 --block（.tbl th / .prj-cols）。
-   档位取决于它落在什么面上，不是固定的。
-
-   两套主题的中性阶都不是无色灰。暗色五套共用同一组 L* 色阶，各带主题色相、OKLCH 彩度约 0.008
-   的底调（玄墨取钢青，见调色盘一节）；亮色的堇紫、黛蓝、松绿、藕粉、玄墨分别带极轻的紫、蓝、绿、
-   粉、中性底调。偏色只用于把角色色纳入同一环境，不能高到让整块面板读成彩色卡纸。
+   --ground 是台面，--surface 是外框，--sheet 是纸面，--block 是内容块，--sunk 是输入格。
+   明暗色分别组织这些面的层次，五套配色保留各自轻微的底调；正文与次要文字适配所有这些底色。
+   --band 用于表头等横条，面板标题另用 --panel-heading-bg / --panel-heading-ink，
+   普通面板标题使用 --panel-title-ink，避免调整正文时改变已确认的标题颜色。
 
    段色与语义色必须分属不同色族：装饰色与状态色使用同一色相时，阅读者需要先判断该颜色
    是否表示某种状态。因此 hue-* 全部避开绿、金、红。
@@ -57,6 +39,9 @@
   --ink-2: #c2c5c9;
   --ink-3: #8d9196;
   --ink-4: #676b71;
+  --panel-title-ink: var(--ink);
+  --panel-heading-ink: var(--ink-3);
+  --panel-heading-bg: var(--band);
   /* 观测图使用相邻高对比的柔和分类盘。ECharts canvas 与 HTML 图例共读这些直接色值，
      避免 canvas 无法解析嵌套 var()/color-mix()。明暗五套调色盘各覆盖一份，槽 1 与该调色盘的
      --data 同色；亮色保留暗色的色相与次序，压低明度以适配白底。这里与下方 Dawn 的取值
@@ -2468,6 +2453,9 @@
   --ink-2: #3b3e42;
   --ink-3: #5c6165;
   --ink-4: #7e8286;
+  --panel-title-ink: var(--ink);
+  --panel-heading-ink: var(--ink-3);
+  --panel-heading-bg: var(--band);
   /* Rosé Pine Dawn，与暗色的 Moon 同源同色相同次序。Dawn 本是为 #faf4ed 那张暖白纸配的，
      落到纯白卡片上 gold 只有 2.24、rose 只有 2.84 的对比度——改深了就不再是 Rosé Pine，
      所以原样保留，改由槽位次序处理：两者都排在第 5 档之后。 */
@@ -2533,84 +2521,61 @@
    这里与默认色板保持一致，避免首屏执行 JavaScript 前短暂闪回旧配色。 */
 :root,
 [data-theme='dark'] {
-  --action: #7698d6;
-  --action-hover: #8aabe7;
-  --action-active: #6586c3;
-  --action-wash: rgba(118, 152, 214, 0.15);
-  --action-on: #080f1c;
+  --action: #91b8f2;
+  --action-hover: #b0cdf8;
+  --action-active: #79a4e5;
+  --action-wash: rgba(145, 184, 242, 0.15);
+  --action-on: #101319;
   --data: #81a9d2;
   --data-secondary: #758196;
   --data-wash: rgba(129, 169, 210, 0.13);
-  --primary: #1e2a40;
-  --primary-hover: #23334f;
-  --primary-active: #283a5b;
-  --primary-on: #b4c8ec;
-  --primary-line: #314770;
+  --primary: #315f9f;
+  --primary-hover: #396db6;
+  --primary-active: #29528b;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --data-accent: #7698d6;
+  --data-quiet: #8d9196;
+  --data-muted: #676b71;
 }
 :root[data-theme='light'],
 [data-theme='light'] {
-  --action: #3c61a7;
-  --action-hover: #4b71b9;
-  --action-active: #2e5297;
-  --action-wash: rgba(60, 97, 167, 0.09);
+  --action: #2563b9;
+  --action-hover: #1d56a3;
+  --action-active: #174989;
+  --action-wash: rgba(37, 99, 185, 0.09);
   --action-on: #ffffff;
   --data: #316ca5;
   --data-secondary: #6a5f90;
   --data-wash: rgba(49, 108, 165, 0.09);
+  --data-accent: #3c61a7;
+  --data-quiet: #4f5968;
+  --data-muted: #576373;
 }
 
-/* ── 调色盘候选（更多菜单里的色板，`forge/palette.ts` 写入 data-palette） ──
-   每款覆盖 action / data 两种角色色和完整的中性色族。
-   暗色块要覆盖整族（ground / sheet / surface / block / band / sunk / line /
-   line-soft），一个都不能漏；否则全屏面积最大的纸面会残留上一套底调。
+/* ── 五套配色（`forge/palette.ts` 写入 data-palette） ──
+   中性面统一拉开台面、纸面和输入格的层次；暗色操作文字较浅，主按钮另取较深实底，
+   亮色主按钮与操作色共用白字实底。正文与操作色的各状态均保持可读对比度。
+   面板标题文字、边框、网格和图表保留既有取值；深色标题底色适配新的卡面，
+   亮色标题底色保持原值。标题使用独立语义令牌，避免跟随正文改色。
+   每个暗色色板声明的令牌都必须在对应亮色色板重新声明，避免亮色继承暗色值。 */
 
-   不变式：裸 `:root[data-palette='…']` 块里出现的每个令牌，对应的
-   `:root[data-theme='light'][data-palette='…']` 块必须也出现。裸块与基础主题块
-   特异度相同而位置在后，亮色块缺一项时该项在亮色模式下吃到暗色值——
-   --sheet 就会把亮色纸面染黑。暗色块在前、亮色块在后。
-
-   暗色五套共用一组灰调中性阶和同一种主按钮画法：
-   - 中性面按 CIELAB L* 排档：台面 1.5、输入格 3.4、外框 4.8、带 5.5、纸 5.8、块 9.7、
-     界面边框 13.7。层间距沿用此前台面为 0 的纯黑色阶，整体上移 1.5，台面因此也能带出色相。
-     各档取主题色相、OKLCH 彩度 0.008（块 ×1.1、边框 ×1.25）；玄墨的灰白主题色没有色相，
-     改取数据色的钢青 225°。低明度下 8 位量化使实际色相偏离 20° 以内。网格线取 OKLCH 明度
-     27.8%（L* 约 16，随台面上移约 1.5）、彩度约 0.02。亮色保留原有底调，边框向纸色收浅。
-   - 主题色明度约 60%（黛蓝为 68%，见其色板注释），操作色文字对纸不低于 4.5，实底上的深色
-     文字对操作色不低于 4.5。纸比纯黑色阶亮 1.5 L*，堇紫与藕粉的操作色三档 OKLCH 明度
-     因此分别提高 0.010 与 0.0075。
-     洗色随操作色加深提到 17%，否则选中行与选中页签的底色在暗色底上无法辨认。黛蓝的操作色
-     更浅，洗色取 15%，铺底明度与其它方案持平。
-   - 主按钮与导航选中项取洗色（--primary 一组）：主题色的 oklch(43.5% C H) 按 22% 混入块色
-     作底、55% 作边框，悬停与按下为 32%、40%，文字取 oklch(82% 0.6C H)。操作色实底对标题条
-     的对比度在 4.5 以上，是整屏最醒目的彩色块；洗色底降到 1.2 左右。
-   - 数据色取同族：主题色色相 −12°、明度 72%、彩度为主题色的 75%（上限 0.13）。曲线按 72%
-     不透明度绘制，明度 56.5% 的旧取值在暗色底上发暗发浑，且与主题色几乎同色；色相偏移让曲线
-     与操作色可区分，也让松绿、藕粉离状态绿、错误红更远。
-   - 图表分类色（--observe-1..10）按调色盘各取一套，见本节末「暗色图表分类色」。
-   - 亮色沿用对应暗色分类盘的色相与槽位，主数据色明度降到 52%，其它彩色槽降到 54%，
-     中性槽降到 55%；超出 sRGB 时只收缩彩度。线条对白底及块色的对比度均不低于 4.5。
-     槽 1 与 --data 同色，ECharts、KPI、SVG 和图例共用这一事实，不另外维护 JS 主题色表。 */
-
-/* 堇紫：操作色 oklch(61% 0.17 298)，文字对纸 4.55，实底上的深色文字 4.72；明度降低会使
-   页签与链接文字低于 4.5。主按钮文字 oklch(82% 0.10 298) 对洗色底 8.52。
-   数据色取同族薰衣草 oklch(72% 0.128 286)，曲线对纸 7.24；次要数据沿用低彩度灰紫，
-   与主曲线分层。
-   亮色仍使用更深的紫色保证白底可读性。 */
+/* 堇紫：紫灰底调与柔和紫色操作，图表沿用既有分类盘。 */
 :root[data-palette='jinzi'] {
-  --action: #9167da;
-  --action-hover: #a27cea;
-  --action-active: #8055c6;
-  --action-wash: rgba(145, 103, 218, 0.17);
-  --action-on: #110c1b;
+  --action: #c1a7ee;
+  --action-hover: #d8c2fa;
+  --action-active: #a88ad9;
+  --action-wash: rgba(193, 167, 238, 0.15);
+  --action-on: #17151d;
   --data: #9e98f1;
   --data-secondary: #827c93;
   --data-wash: rgba(158, 152, 241, 0.13);
-  --ground: #060608;
-  --sheet: #141316;
-  --surface: #111013;
-  --block: #1c1b1f;
-  --band: #131215;
-  --sunk: #0d0c0f;
+  --ground: #17151d;
+  --sheet: #201d27;
+  --surface: #1d1b24;
+  --block: #2c2834;
+  --band: #24202c;
+  --sunk: #1a1721;
   --line: #242328;
   /* 暗色网格线取 OKLCH 明度 27.8%、彩度 0.02，色相随调色盘；明度随台面上移约 1.5 L*。 */
   --grid-line: #292631;
@@ -2619,17 +2584,27 @@
   --hue-2: #8e8bc1;
   --hue-3: #ba92b8;
   --hue-4: #768ba4;
-  --primary: #2b203b;
-  --primary-hover: #312248;
-  --primary-active: #372453;
-  --primary-on: #ccb6fe;
-  --primary-line: #412766;
+  --primary: #6f5197;
+  --primary-hover: #8060ab;
+  --primary-active: #614585;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --ink: #f1edf7;
+  --ink-2: #d2cbdc;
+  --ink-3: #b4a9c3;
+  --ink-4: #a397b2;
+  --panel-title-ink: #e2e4e7;
+  --panel-heading-bg: var(--band);
+  --panel-heading-ink: #8d9196;
+  --data-accent: #9167da;
+  --data-quiet: #8d9196;
+  --data-muted: #676b71;
 }
 :root[data-theme='light'][data-palette='jinzi'] {
-  --action: #6a53b8;
-  --action-hover: #7e68c8;
-  --action-active: #513f96;
-  --action-wash: rgba(106, 83, 184, 0.1);
+  --action: #7251ad;
+  --action-hover: #634398;
+  --action-active: #553783;
+  --action-wash: rgba(114, 81, 173, 0.09);
   --action-on: #ffffff;
   --data: #645bae;
   --data-secondary: #66546f;
@@ -2644,12 +2619,12 @@
   --observe-8: #836b39;
   --observe-9: #955c61;
   --observe-10: #737079;
-  --ground: #f4f3f6;
-  --sheet: #fefefe;
-  --surface: #ebe9ef;
-  --block: #fbfafc;
-  --band: #f1f0f4;
-  --sunk: #f6f5f8;
+  --ground: #eeedf3;
+  --sheet: #ffffff;
+  --surface: #f5f3f8;
+  --block: #faf9fc;
+  --band: #f4f2f7;
+  --sunk: #f0edf5;
   --line: #e9e8ed;
   --grid-line: #dedce4;
   --line-soft: rgba(45, 35, 70, 0.04);
@@ -2663,31 +2638,34 @@
   --primary-active: var(--action-active);
   --primary-on: var(--action-on);
   --primary-line: transparent;
+  --ink: #292332;
+  --ink-2: #494052;
+  --ink-3: #685d74;
+  --ink-4: #71657d;
+  --panel-title-ink: #1c1e21;
+  --panel-heading-bg: #f1f0f4;
+  --panel-heading-ink: #5c6165;
+  --data-accent: #6a53b8;
+  --data-quiet: #5c6165;
+  --data-muted: #7e8286;
 }
 
-/* 黛蓝：柔和蓝，操作色 oklch(68% 0.10 262)，文字对纸 6.40。彩度介于此前的宝蓝（0.15，暗色下
-   导航、按钮文字与曲线发亮）与灰雾蓝（0.041，整页读成灰阶）之间，明度比其它方案的 60% 高。
-   数据色按同族规则取 oklch(72% 0.075 250)，曲线对纸 7.56。主按钮洗色不按通用配方：按配方
-   取值时底色彩度只有 0.033，导航选中项偏灰；底色改取 oklch(28.5% 0.045 262)，悬停、按下与
-   边框依次提亮，文字 oklch(83% 0.055 262) 对洗色底 8.50、按下底 6.72。
-   亮色操作色 oklch(50% 0.12 262)，对白底 6.07，悬停时白字 4.81。0.075 的数据蓝落到白底上
-   发灰，亮色数据色彩度提到 0.11，对白底 5.50。
-   代码数字色需要与关键字（蓝）区分，随主色改用灰紫粉。 */
+/* 黛蓝：浅灰蓝台面与白色纸面，蓝色实底建立操作层次。 */
 :root[data-palette='dailan'] {
-  --action: #7698d6;
-  --action-hover: #8aabe7;
-  --action-active: #6586c3;
-  --action-wash: rgba(118, 152, 214, 0.15);
-  --action-on: #080f1c;
+  --action: #91b8f2;
+  --action-hover: #b0cdf8;
+  --action-active: #79a4e5;
+  --action-wash: rgba(145, 184, 242, 0.15);
+  --action-on: #101319;
   --data: #81a9d2;
   --data-secondary: #758196;
   --data-wash: rgba(129, 169, 210, 0.13);
-  --ground: #040608;
-  --sheet: #111317;
-  --surface: #0f1114;
-  --block: #191b20;
-  --band: #101316;
-  --sunk: #0b0d10;
+  --ground: #101319;
+  --sheet: #191d25;
+  --surface: #171b22;
+  --block: #222731;
+  --band: #1b2029;
+  --sunk: #141820;
   --line: #212428;
   --grid-line: #232833;
   --line-soft: rgba(226, 228, 231, 0.035);
@@ -2696,20 +2674,30 @@
   --hue-3: #7fa8b0;
   --hue-4: #9890b0;
   --code-n: #c99fc8;
-  --primary: #1e2a40;
-  --primary-hover: #23334f;
-  --primary-active: #283a5b;
-  --primary-on: #b4c8ec;
-  --primary-line: #314770;
+  --primary: #315f9f;
+  --primary-hover: #396db6;
+  --primary-active: #29528b;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --ink: #edf0f5;
+  --ink-2: #c9d0db;
+  --ink-3: #a4afbf;
+  --ink-4: #939fb0;
+  --panel-title-ink: #e2e4e7;
+  --panel-heading-bg: var(--band);
+  --panel-heading-ink: #8d9196;
+  --data-accent: #7698d6;
+  --data-quiet: #8d9196;
+  --data-muted: #676b71;
 }
 :root[data-theme='light'][data-palette='dailan'] {
   /* 小字在标题带、名册与卡片上均需可读，不能把说明文字当作装饰灰。 */
-  --ink-3: #4f5968;
-  --ink-4: #576373;
-  --action: #3c61a7;
-  --action-hover: #4b71b9;
-  --action-active: #2e5297;
-  --action-wash: rgba(60, 97, 167, 0.09);
+  --ink-3: #566475;
+  --ink-4: #616e7f;
+  --action: #2563b9;
+  --action-hover: #1d56a3;
+  --action-active: #174989;
+  --action-wash: rgba(37, 99, 185, 0.09);
   --action-on: #ffffff;
   --data: #316ca5;
   --data-secondary: #6a5f90;
@@ -2724,12 +2712,12 @@
   --observe-8: #836b39;
   --observe-9: #955c61;
   --observe-10: #6d727b;
-  --ground: #f2f4f7;
-  --sheet: #fefefe;
-  --surface: #e8ebf1;
-  --block: #fafafb;
-  --band: #eef0f5;
-  --sunk: #f5f6f9;
+  --ground: #edf0f5;
+  --sheet: #ffffff;
+  --surface: #f6f7f9;
+  --block: #f8f9fb;
+  --band: #f5f6f8;
+  --sunk: #f1f3f7;
   --line: #dfe3eb;
   --grid-line: #d9dde6;
   --line-soft: rgba(20, 35, 70, 0.07);
@@ -2744,26 +2732,32 @@
   --primary-active: var(--action-active);
   --primary-on: var(--action-on);
   --primary-line: transparent;
+  --ink: #1d2633;
+  --ink-2: #394656;
+  --panel-title-ink: #1c1e21;
+  --panel-heading-bg: #eef0f5;
+  --panel-heading-ink: #4f5968;
+  --data-accent: #3c61a7;
+  --data-quiet: #4f5968;
+  --data-muted: #576373;
 }
 
-/* 松绿：操作色为松针黄绿 oklch(60% 0.12 132)，文字对纸 5.07。OKLCH 色相与状态绿（163°）
-   相距 31°；保持黄绿取向是不与状态语义混淆的前提。数据色取同族黄绿 oklch(72% 0.09 120)，
-   曲线对纸 7.63。主按钮文字对洗色底 8.65。 */
+/* 松绿：保留松针黄绿取向，灰绿底调与状态绿保持区分。 */
 :root[data-palette='songlv'] {
-  --action: #658f3e;
-  --action-hover: #78a155;
-  --action-active: #547d2b;
-  --action-wash: rgba(101, 143, 62, 0.17);
-  --action-on: #0a1205;
+  --action: #b5ce98;
+  --action-hover: #cde0b7;
+  --action-active: #9dbb7b;
+  --action-wash: rgba(181, 206, 152, 0.15);
+  --action-on: #131710;
   --data: #9dad6c;
   --data-secondary: #79856f;
   --data-wash: rgba(157, 173, 108, 0.13);
-  --ground: #050604;
-  --sheet: #111410;
-  --surface: #0f110e;
-  --block: #191c17;
-  --band: #10130f;
-  --sunk: #0b0d09;
+  --ground: #131710;
+  --sheet: #1c2218;
+  --surface: #191f16;
+  --block: #252d20;
+  --band: #1e251a;
+  --sunk: #171c13;
   --line: #22241f;
   --grid-line: #252a20;
   --line-soft: rgba(226, 228, 231, 0.035);
@@ -2772,17 +2766,27 @@
   --hue-3: #9c94a8;
   --hue-4: #94a49c;
   --code-n: #d0a0b8;
-  --primary: #202b12;
-  --primary-hover: #233110;
-  --primary-active: #25360e;
-  --primary-on: #b3ce9e;
-  --primary-line: #2a400b;
+  --primary: #496434;
+  --primary-hover: #55763d;
+  --primary-active: #3e552c;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --ink: #eff3ec;
+  --ink-2: #cdd7c5;
+  --ink-3: #adbda2;
+  --ink-4: #9bad8f;
+  --panel-title-ink: #e2e4e7;
+  --panel-heading-bg: var(--band);
+  --panel-heading-ink: #8d9196;
+  --data-accent: #658f3e;
+  --data-quiet: #8d9196;
+  --data-muted: #676b71;
 }
 :root[data-theme='light'][data-palette='songlv'] {
-  --action: #4d7a38;
-  --action-hover: #5f8e48;
-  --action-active: #3a5f2a;
-  --action-wash: rgba(77, 122, 56, 0.1);
+  --action: #4b712e;
+  --action-hover: #3f6224;
+  --action-active: #34531c;
+  --action-wash: rgba(75, 113, 46, 0.09);
   --action-on: #ffffff;
   --data: #627031;
   --data-secondary: #6f5f7e;
@@ -2797,12 +2801,12 @@
   --observe-8: #8c598f;
   --observe-9: #836b39;
   --observe-10: #6f736b;
-  --ground: #f3f4f1;
-  --sheet: #fefefe;
-  --surface: #e9eae5;
-  --block: #fbfbf8;
-  --band: #f0f1ed;
-  --sunk: #f6f6f3;
+  --ground: #edf0ea;
+  --sheet: #ffffff;
+  --surface: #f5f8f3;
+  --block: #fafbf9;
+  --band: #f1f5ed;
+  --sunk: #f0f3ed;
   --line: #e8eae4;
   --grid-line: #dcded6;
   --line-soft: rgba(35, 45, 25, 0.04);
@@ -2817,27 +2821,34 @@
   --primary-active: var(--action-active);
   --primary-on: var(--action-on);
   --primary-line: transparent;
+  --ink: #252d22;
+  --ink-2: #434f3d;
+  --ink-3: #5b6a53;
+  --ink-4: #63705b;
+  --panel-title-ink: #1c1e21;
+  --panel-heading-bg: #f0f1ed;
+  --panel-heading-ink: #5c6165;
+  --data-accent: #4d7a38;
+  --data-quiet: #5c6165;
+  --data-muted: #7e8286;
 }
 
-/* 藕粉：操作色为蔷薇粉 oklch(60.6% 0.12 348)，文字对纸 4.52，补暖槽。彩度提高后色相从 351°
-   移到 348°，与错误红（18°）保持 30°，主按钮与链接不会读成错误。数据色取同族兰粉
-   oklch(72% 0.09 336)，曲线对纸 7.19。主按钮文字对洗色底 8.52。
-   关键字随主色变粉后，代码数字色改用灰蓝维持区分。 */
+/* 藕粉：淡粉灰底调与蔷薇操作，代码数字继续与关键字区分。 */
 :root[data-palette='oufen'] {
-  --action: #b5628f;
-  --action-hover: #c776a0;
-  --action-active: #a2517d;
-  --action-wash: rgba(181, 98, 143, 0.17);
-  --action-on: #190a12;
+  --action: #e0a7c4;
+  --action-hover: #efc2d9;
+  --action-active: #ca8dad;
+  --action-wash: rgba(224, 167, 196, 0.15);
+  --action-on: #1a1317;
   --data: #c98fba;
   --data-secondary: #917884;
   --data-wash: rgba(201, 143, 186, 0.13);
-  --ground: #070506;
-  --sheet: #161213;
-  --surface: #141011;
-  --block: #1e1a1c;
-  --band: #151113;
-  --sunk: #100b0d;
+  --ground: #1a1317;
+  --sheet: #241c21;
+  --surface: #21191e;
+  --block: #2e242a;
+  --band: #261e23;
+  --sunk: #1e161b;
   --line: #272224;
   --grid-line: #30242a;
   --line-soft: rgba(226, 228, 231, 0.035);
@@ -2846,17 +2857,27 @@
   --hue-3: #b08c9c;
   --hue-4: #8ca0a0;
   --code-n: #a8b8d8;
-  --primary: #331f2a;
-  --primary-hover: #3d2131;
-  --primary-active: #442336;
-  --primary-on: #e8b2cc;
-  --primary-line: #532640;
+  --primary: #8a4e6b;
+  --primary-hover: #9d5a7b;
+  --primary-active: #77425c;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --ink: #f7edf2;
+  --ink-2: #dfcbd5;
+  --ink-3: #c3aab7;
+  --ink-4: #b59ba8;
+  --panel-title-ink: #e2e4e7;
+  --panel-heading-bg: var(--band);
+  --panel-heading-ink: #8d9196;
+  --data-accent: #b5628f;
+  --data-quiet: #8d9196;
+  --data-muted: #676b71;
 }
 :root[data-theme='light'][data-palette='oufen'] {
-  --action: #a04a72;
-  --action-hover: #b45e86;
-  --action-active: #803858;
-  --action-wash: rgba(160, 74, 114, 0.1);
+  --action: #a04a75;
+  --action-hover: #8d3e66;
+  --action-active: #783455;
+  --action-wash: rgba(160, 74, 117, 0.09);
   --action-on: #ffffff;
   --data: #89547c;
   --data-secondary: #4f7a80;
@@ -2871,12 +2892,12 @@
   --observe-8: #836b39;
   --observe-9: #955c61;
   --observe-10: #796e73;
-  --ground: #f5f3f4;
-  --sheet: #fffefe;
-  --surface: #ede9eb;
+  --ground: #f3ecef;
+  --sheet: #ffffff;
+  --surface: #fbf5f7;
   --block: #fcfafb;
-  --band: #f2eff1;
-  --sunk: #f7f5f6;
+  --band: #f7f0f3;
+  --sunk: #f5edf1;
   --line: #ece8eb;
   --grid-line: #e2dce0;
   --line-soft: rgba(55, 30, 45, 0.04);
@@ -2891,50 +2912,65 @@
   --primary-active: var(--action-active);
   --primary-on: var(--action-on);
   --primary-line: transparent;
+  --ink: #32252d;
+  --ink-2: #57424f;
+  --ink-3: #745d6a;
+  --ink-4: #765f6d;
+  --panel-title-ink: #1c1e21;
+  --panel-heading-bg: #f2eff1;
+  --panel-heading-ink: #5c6165;
+  --data-accent: #a04a72;
+  --data-quiet: #5c6165;
+  --data-muted: #7e8286;
 }
 
-/* 玄墨：钢青灰调界面与灰白操作色 oklch(86% 0.005 107)，文字对纸 12.12。灰白没有可用的色相，
-   中性阶、数据色与图表分类色一起锚在钢青：数据色 oklch(72% 0.038 218)，曲线对纸 7.59。
-   主按钮为灰色洗色，文字对底 8.54。 */
+/* 玄墨：银灰底调与中性操作，图表继续使用钢青分类盘。 */
 :root[data-palette='xuanmo'] {
-  --action: #d1d1cd;
-  --action-hover: #e5e5e1;
-  --action-active: #bebeba;
-  --action-wash: rgba(209, 209, 205, 0.12);
-  --action-on: #111002;
+  --action: #c1c8d2;
+  --action-hover: #d9dee6;
+  --action-active: #a8b1bd;
+  --action-wash: rgba(193, 200, 210, 0.15);
+  --action-on: #191a1d;
   --data: #8babb4;
   --data-secondary: #80807d;
   --data-wash: rgba(139, 171, 180, 0.13);
-  --ground: #030608;
-  --sheet: #0f1415;
-  --surface: #0d1213;
-  --block: #161c1e;
-  --band: #0e1314;
-  --sunk: #090d0f;
+  --ground: #191a1d;
+  --sheet: #222327;
+  --surface: #202125;
+  --block: #2c2d32;
+  --band: #24252a;
+  --sunk: #1c1d21;
   --line: #1e2527;
   /* 玄墨网格线同取钢青，彩度约 0.008，与中性阶同一浓度。 */
   --grid-line: #24292b;
   --line-soft: rgba(205, 205, 202, 0.035);
-  --ink: #cdcdca;
-  --ink-2: #b2b2af;
-  --ink-3: #858583;
-  --ink-4: #646462;
+  --ink: #f0f1f5;
+  --ink-2: #d0d2da;
+  --ink-3: #b0b3c0;
+  --ink-4: #9ca2b1;
   --hue-1: #969e9b;
   --hue-2: #899f99;
   --hue-3: #9b8fa0;
   --hue-4: #8c9693;
-  --primary: #232829;
-  --primary-hover: #292d2d;
-  --primary-active: #2e3131;
-  --primary-on: #c4c4c2;
-  --primary-line: #363938;
+  --primary: #4d596a;
+  --primary-hover: #5b687a;
+  --primary-active: #414c5b;
+  --primary-on: #ffffff;
+  --primary-line: transparent;
+  --panel-title-ink: #cdcdca;
+  /* 保留既有灰色标题字，底色略低于 band，维持至少 4.5:1 的文字对比度。 */
+  --panel-heading-bg: #1b1c20;
+  --panel-heading-ink: #858583;
+  --data-accent: #d1d1cd;
+  --data-quiet: #858583;
+  --data-muted: #646462;
 }
 :root[data-theme='light'][data-palette='xuanmo'] {
-  --action: #17191d;
-  --action-hover: #2e3136;
-  --action-active: #000000;
-  --action-wash: rgba(23, 25, 29, 0.08);
-  --action-on: #fafafa;
+  --action: #52606e;
+  --action-hover: #43515e;
+  --action-active: #35424e;
+  --action-wash: rgba(82, 96, 110, 0.09);
+  --action-on: #ffffff;
   --data: #506f77;
   --data-secondary: #725b74;
   --data-wash: rgba(80, 111, 119, 0.09);
@@ -2948,19 +2984,19 @@
   --observe-8: #7b6d51;
   --observe-9: #876466;
   --observe-10: #6d7276;
-  --ground: #f2f2f1;
+  --ground: #e9eaec;
   --sheet: #ffffff;
-  --surface: #e9e9e8;
-  --block: #fafaf9;
-  --band: #f0f0ef;
-  --sunk: #f5f5f4;
+  --surface: #f1f2f4;
+  --block: #fafafb;
+  --band: #f2f3f5;
+  --sunk: #eeeff2;
   --line: #e8e8e6;
   --grid-line: #dbdcda;
   --line-soft: rgba(20, 20, 25, 0.04);
-  --ink: #1c1e21;
-  --ink-2: #3b3e42;
-  --ink-3: #5c6165;
-  --ink-4: #7e8286;
+  --ink: #202329;
+  --ink-2: #424751;
+  --ink-3: #606775;
+  --ink-4: #616a78;
   --hue-1: #626967;
   --hue-2: #5a726c;
   --hue-3: #706274;
@@ -2971,6 +3007,12 @@
   --primary-active: var(--action-active);
   --primary-on: var(--action-on);
   --primary-line: transparent;
+  --panel-title-ink: #1c1e21;
+  --panel-heading-bg: #f0f0ef;
+  --panel-heading-ink: #5c6165;
+  --data-accent: #17191d;
+  --data-quiet: #5c6165;
+  --data-muted: #7e8286;
 }
 
 /* 玄墨的操作色与正文同族，链接额外依靠下划线辨认。 */
@@ -6837,11 +6879,11 @@ textarea.f::placeholder {
   overflow: visible;
 }
 .vpngate-collection-spark .area {
-  fill: color-mix(in srgb, var(--action) 11%, transparent);
+  fill: color-mix(in srgb, var(--data-accent) 11%, transparent);
 }
 .vpngate-collection-spark .line {
   fill: none;
-  stroke: color-mix(in srgb, var(--action) 72%, var(--ink-3));
+  stroke: color-mix(in srgb, var(--data-accent) 72%, var(--data-quiet));
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-width: 1.6;
@@ -6849,7 +6891,7 @@ textarea.f::placeholder {
 }
 .vpngate-collection-spark .point {
   fill: var(--card);
-  stroke: var(--action);
+  stroke: var(--data-accent);
   stroke-width: 1.8;
   vector-effect: non-scaling-stroke;
 }
@@ -7541,15 +7583,14 @@ textarea.f::placeholder {
 }
 /* 卡片标题统一大写。若依靠各处手动输入「AGENT」而非样式规则，最终会出现 `Agent`
    这类写法，该处会比周围矮一档，表现为另一个层级。中文标题不受 text-transform 影响。 */
-/* 面板标题与段标题使用同一套着色。此处用 --action-hover 而非 hue-*：面板可嵌套在任意段内，
-   若跟随段色，同一张卡在不同页面会呈现不同颜色，而它并不属于该分区。 */
+/* 面板标题独立于正文层次和操作色，切换页面不会改变其标题角色。 */
 .panel > :is(header, summary) h4 {
   margin: 0;
   /* 标题统一为无衬线深墨：脱离等宽+主色蓝的「代号」观感，与卡面一起走清爽方向。
      保留 uppercase——本页多为 AGENT/RUNTIME 这类缩写代号，字号压到 12.5 不喧闹。 */
   font: 600 12.5px var(--sans);
   letter-spacing: 0.04em;
-  color: var(--ink);
+  color: var(--panel-title-ink);
   text-transform: uppercase;
 }
 .panel > :is(header, summary) .hint {
@@ -8649,6 +8690,10 @@ textarea.f::placeholder {
   gap: 12px;
   min-width: 0;
 }
+.nd-tab-config.nd-tab-care {
+  grid-template-columns: minmax(0, 1fr);
+  max-width: 620px;
+}
 /* 控件线上的元素间距一律由 `.nd-ctl-line` 的 gap 给，元素自带的外边距在这里清零，
    否则两者叠加：出口读数（`.fgrid .v .egress`）自带 10px 左外边距，那是它紧跟输入框时
    的间距，落在控件线上会让开关与读数之间空出 18px。 */
@@ -9267,7 +9312,7 @@ textarea.f::placeholder {
 .panel.titled {
   box-shadow: var(--sheet-shadow);
 }
-/* 标题条保持中性，底色一律 --band。曾把本段的段色按 10% 混进底色、26% 混进下边线、
+/* 标题条使用独立的 --panel-heading-bg，深色随卡面保留柔和层次，亮色沿用既有底色。曾把本段的段色按 10% 混进底色、26% 混进下边线、
    68% 混进标题字色，让分区结构在标题条上直接读出来；实测不成立——标题条横贯整张卡片，
    是一屏里面积最大的着色面，一页九段排下来是九条各自着色的横带，读起来是九种状态而不是
    九个子系统。段色仍然只落在编号那一个小元素上，理由见下文 `.no` 那条。 */
@@ -9283,7 +9328,7 @@ textarea.f::placeholder {
   min-height: var(--panel-title-h);
   box-sizing: border-box;
   border-bottom: 1px solid var(--line-soft);
-  background: var(--band);
+  background: var(--panel-heading-bg);
 }
 /* 运行状态与上方流量卡共用连续卡面，标题不再单独铺色带或分隔线。 */
 .nd-tab-observed > .nd-runtime > header {
@@ -9345,7 +9390,7 @@ textarea.f::placeholder {
   /* normal 会被中文回退字体撑高，文字基线下移；显式行盒与 14px 图标共用中心。 */
   line-height: 14px;
   letter-spacing: 0.11em;
-  color: var(--ink-3);
+  color: var(--panel-heading-ink);
 }
 /* Icon 的 span 若保留普通行内盒，SVG 会按文字基线预留 descender：即便外层方钮使用
    place-items:center，图形仍会向上偏 1.5–2px。共享原语在这里消除行盒，并让所有调用方
@@ -9570,27 +9615,19 @@ textarea.f::placeholder {
   padding: 12px;
 }
 .node-chain-use {
-  /* 链名并入根节点标签；树的负下外距由内距接住，避免收口被裁切。 */
+  /* 每条链自己的标题行与切换；内距接住规则树的负下外距。 */
   padding: 0 12px 13px;
   overflow: hidden;
 }
 .node-chain-sheet > .node-chain-use:has(+ .node-chain-use) {
-  /* 规则树以 -9px 下外距收口，其余链间留白交给居中的短线圆点。 */
   padding-bottom: 9px;
 }
 .node-chain-sheet > .node-chain-use + .node-chain-use::before {
   content: '';
   display: block;
-  width: 160px;
-  max-width: 45%;
-  height: 3px;
-  margin: 12px auto;
-  background:
-    radial-gradient(circle, var(--ink-4) 1.5px, transparent 1.5px) center / 3px 3px no-repeat,
-    linear-gradient(to right, transparent, color-mix(in srgb, var(--ink-4) 65%, transparent)) left center /
-      calc(50% - 10.5px) 1px no-repeat,
-    linear-gradient(to left, transparent, color-mix(in srgb, var(--ink-4) 65%, transparent)) right center /
-      calc(50% - 10.5px) 1px no-repeat;
+  height: 1px;
+  margin: 12px 0 0;
+  background: var(--line);
 }
 
 /* 卡片内的小型表格。此前 table.t 没有任何样式，单元格之间没有间距；
@@ -22733,7 +22770,7 @@ select.f.fwr-sort {
   text-align: center;
 }
 
-/* 窄详情保留身份与操作，导航独立一行；UUID 留在身份内部，不增加第三层。 */
+/* 窄详情的导航独立一行；更窄时操作再单列，保留用户名、UUID 与带文字的功能入口。 */
 @container user-header (max-width: 760px) {
   .user-dhead-main {
     grid-template-columns: minmax(0, 1fr) max-content;
@@ -22775,10 +22812,43 @@ select.f.fwr-sort {
 
 @container user-header (max-width: 440px) {
   .user-dhead-main {
+    grid-template-rows: 64px 42px;
     column-gap: 8px;
   }
+  .user-dhead-main:has(> .user-detail-tabs) {
+    grid-template-rows: 64px 42px 42px;
+  }
   .user-dhead-identity {
+    grid-column: 1 / -1;
     gap: 9px;
+  }
+  .user-dhead-tools {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-self: stretch;
+    padding-bottom: 8px;
+  }
+  .user-dhead-tools .title-action-group {
+    width: 100%;
+  }
+  .user-dhead-tools .title-action-item {
+    flex: 1 1 0;
+  }
+  .user-dhead-tools .title-action-item:has([aria-label='Sub-Store']) {
+    flex: 1.5 1 0;
+  }
+  .user-dhead-tools .title-action-item:has(.user-dact-more) {
+    flex: none;
+  }
+  .user-dhead-tools .title-action-item > .btn {
+    width: 100%;
+    padding: 0 8px;
+  }
+  .user-dhead-tools .title-action-compact .title-action-label {
+    display: inline;
+  }
+  .user-dhead .user-detail-tabs {
+    grid-row: 3;
   }
   .user-dhead .plate {
     width: 32px;
@@ -23401,7 +23471,7 @@ select.f.fwr-sort {
   width: 4px;
   border-radius: 1px;
   flex: none;
-  background: color-mix(in srgb, var(--action) 55%, transparent);
+  background: color-mix(in srgb, var(--data-accent) 55%, transparent);
 }
 .spark i.down {
   background: color-mix(in srgb, var(--err) 70%, transparent);
@@ -25526,7 +25596,7 @@ body.observe-brushing .observe-chart-tip {
   color: var(--err);
 }
 .node-card-comet.tone-idle {
-  color: var(--ink-4);
+  color: var(--data-muted);
 }
 .node-card-comet-now {
   position: absolute;
@@ -25716,7 +25786,7 @@ body.observe-brushing .observe-chart-tip {
   flex: none;
   overflow: hidden;
   border-radius: 1.5px;
-  background-image: url('./ui/flags.png');
+  background-image: url('./ui/flags.svg'), var(--flag-preview);
   background-repeat: no-repeat;
 }
 /* 流量统计：一行本期读数、一根额度条、接收与发送，下面是计量设置与自动限速。卡片常驻在身份下方，
@@ -40532,4 +40602,917 @@ button.choice-select.substore-row-pick {
   .substore-ring g[data-s='live'] .substore-ring-fill {
     transition: none;
   }
+}
+
+/* Clash subscription routing editor. User preferences have no publication step. */
+/* ── 图形：彩色、透明底；浅色主题只沿色相压暗 ── */
+.clash-rule-glyph {
+  --clash-rule-tint: var(--ink-2);
+  display: inline-grid;
+  width: var(--clash-rule-glyph);
+  height: var(--clash-rule-glyph);
+  flex: none;
+  place-items: center;
+  color: var(--clash-rule-tint);
+}
+.clash-rule-glyph > svg,
+.clash-rule-glyph .ui-icon,
+.clash-rule-glyph .ui-icon svg,
+.clash-rule-glyph .site-brand-icon,
+.clash-rule-glyph .site-brand-icon svg {
+  display: block;
+  width: var(--clash-rule-glyph);
+  height: var(--clash-rule-glyph);
+  color: inherit;
+}
+.clash-rule-glyph .site-brand-icon svg {
+  width: calc(var(--clash-rule-glyph) - 2px);
+  height: calc(var(--clash-rule-glyph) - 2px);
+  margin: 1px;
+}
+.clash-rule-glyph .geo-flag.square {
+  width: calc(var(--clash-rule-glyph) - 2px);
+  height: calc(var(--clash-rule-glyph) - 2px);
+  border-radius: 4px;
+}
+.clash-rule-flag .geo-flag {
+  width: var(--clash-rule-glyph);
+  height: calc(var(--clash-rule-glyph) * 2 / 3);
+  border-radius: 2px;
+  box-shadow: 0 0 0 0.5px rgb(0 0 0 / 0.14);
+}
+.clash-rule-glyph[data-glyph='rocket'] {
+  --clash-rule-tint: #7a78f0;
+}
+.clash-rule-glyph[data-glyph='bolt'] {
+  --clash-rule-tint: #ffd60a;
+}
+.clash-rule-glyph[data-glyph='fish'] {
+  --clash-rule-tint: #40c8e0;
+}
+.clash-rule-glyph[data-glyph='sparkle'] {
+  --clash-rule-tint: #bf5af2;
+}
+.clash-rule-glyph[data-glyph='house'] {
+  --clash-rule-tint: #ff9f0a;
+}
+.clash-rule-glyph[data-glyph='ban'] {
+  --clash-rule-tint: #ff453a;
+}
+.clash-rule-glyph[data-glyph='globe'] {
+  --clash-rule-tint: #30d158;
+}
+.clash-rule-glyph[data-glyph='direct'] {
+  --clash-rule-tint: var(--ink-2);
+}
+.clash-rule-glyph[data-glyph='youtube'] {
+  --clash-rule-tint: #ff3030;
+}
+.clash-rule-glyph[data-glyph='google'] {
+  --clash-rule-tint: #5b9bff;
+}
+.clash-rule-glyph[data-glyph='telegram'] {
+  --clash-rule-tint: #3cb4f0;
+}
+.clash-rule-glyph[data-glyph='netflix'] {
+  --clash-rule-tint: #f0303a;
+}
+.clash-rule-glyph[data-glyph='disney'] {
+  --clash-rule-tint: #6f8cff;
+}
+.clash-rule-glyph[data-glyph='spotify'] {
+  --clash-rule-tint: #1ed760;
+}
+.clash-rule-glyph[data-glyph='discord'] {
+  --clash-rule-tint: #7983f5;
+}
+.clash-rule-glyph[data-glyph='instagram'] {
+  --clash-rule-tint: #f05a78;
+}
+.clash-rule-glyph[data-glyph='reddit'] {
+  --clash-rule-tint: #ff5a1f;
+}
+.clash-rule-glyph[data-glyph='twitch'] {
+  --clash-rule-tint: #a970ff;
+}
+.clash-rule-glyph[data-glyph='whatsapp'] {
+  --clash-rule-tint: #25d366;
+}
+.clash-rule-glyph:is(
+  [data-glyph='github'],
+  [data-glyph='apple'],
+  [data-glyph='tiktok'],
+  [data-glyph='twitter'],
+  [data-glyph='steam']
+) {
+  --clash-rule-tint: var(--ink);
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='rocket'] {
+  --clash-rule-tint: #5856d6;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='bolt'] {
+  --clash-rule-tint: #e0a100;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='fish'] {
+  --clash-rule-tint: #24a2b9;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='sparkle'] {
+  --clash-rule-tint: #af52de;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='house'] {
+  --clash-rule-tint: #f08c00;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='ban'] {
+  --clash-rule-tint: #ff3b30;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='globe'] {
+  --clash-rule-tint: #28b24d;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='youtube'] {
+  --clash-rule-tint: #ff0000;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='google'] {
+  --clash-rule-tint: #4285f4;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='telegram'] {
+  --clash-rule-tint: #2aabee;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='netflix'] {
+  --clash-rule-tint: #e50914;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='disney'] {
+  --clash-rule-tint: #113ccf;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='spotify'] {
+  --clash-rule-tint: #1aa34a;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='discord'] {
+  --clash-rule-tint: #5865f2;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='instagram'] {
+  --clash-rule-tint: #e4405f;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='reddit'] {
+  --clash-rule-tint: #ff4500;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='twitch'] {
+  --clash-rule-tint: #9146ff;
+}
+[data-theme='light'] .clash-rule-glyph[data-glyph='whatsapp'] {
+  --clash-rule-tint: #1faf54;
+}
+
+/* ── 共用小件 ── */
+.clash-rule-kind {
+  flex: none;
+  min-width: 40px;
+  box-sizing: border-box;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+  color: var(--ink-3);
+  font: 500 10px/15px var(--sans);
+  text-align: center;
+  white-space: nowrap;
+}
+.clash-rule-target {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+.clash-rule-target.off {
+  color: var(--ink-4);
+}
+/* D 并排：面板展开时，卡上「规则」的箭头转向左，表示再点一下收起。 */
+
+/* 卡上的「规则」栏位：与协议 / 地址族同一画法。 */
+
+/* 行：规则、分流、添加 */
+.substore-row.clash-rule-rule-row,
+.substore-row.clash-rule-module-row {
+  min-height: 42px;
+  gap: 10px;
+}
+.clash-rule-rule-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font: 12.5px/18px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.clash-rule-module-row .substore-row-copy > b {
+  font-weight: 500;
+}
+.clash-rule-module-row .substore-row-copy > small {
+  font: 10.5px/14px var(--mono);
+}
+.clash-rule-module-row[data-off] .clash-rule-glyph {
+  opacity: 0.38;
+  filter: grayscale(1);
+}
+.clash-rule-module-row[data-off] .substore-row-copy > b {
+  color: var(--ink-4);
+}
+button.choice-select.substore-row-pick {
+  max-width: 52%;
+}
+button.choice-select.substore-row-pick.clash-rule-changed {
+  color: var(--ink);
+}
+.substore-row.clash-rule-add-row {
+  min-height: 42px;
+  gap: 10px;
+  padding-right: 8px;
+}
+.clash-rule-add-plus {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--action);
+  color: var(--action-on);
+}
+.clash-rule-add-plus svg,
+.clash-rule-add-plus .ui-icon {
+  display: block;
+  stroke-width: 2;
+}
+.clash-rule-add-input {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: none;
+  color: var(--ink);
+  font: 12.5px var(--mono);
+}
+.clash-rule-add-input::placeholder {
+  color: var(--ink-4);
+  font: 13px var(--sans);
+}
+.clash-rule-add-input[aria-invalid] {
+  color: var(--err);
+}
+.clash-rule-add-go {
+  flex: none;
+  padding: 5px 7px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--action);
+  font: 500 12.5px var(--sans);
+  cursor: pointer;
+}
+.clash-rule-add-go:disabled {
+  color: var(--ink-4);
+  cursor: default;
+}
+@media (hover: hover) {
+  .clash-rule-add-go:hover:not(:disabled) {
+    background: var(--action-wash);
+  }
+}
+button.choice-select.clash-rule-kind-pick {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 5px 1px 6px;
+  border: 0;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--action) 15%, transparent);
+  color: var(--action);
+  font: 500 10px/15px var(--sans);
+  cursor: pointer;
+}
+button.choice-select.clash-rule-kind-pick .choice-chevron {
+  color: inherit;
+  font-size: 7px;
+  line-height: 4px;
+}
+.substore-row.clash-rule-service-add .substore-row-copy > b {
+  color: var(--action);
+  font-weight: 500;
+}
+
+/* 首版菜单的补充：标题行、操作节、服务图形对齐小标栏 */
+.clash-rule-menu-title {
+  overflow: hidden;
+  padding: 6px 8px 0;
+  color: var(--ink);
+  font: 600 12px/18px var(--sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.choice-menu button.clash-rule-menu-action.danger {
+  color: var(--err);
+}
+.choice-menu button > .clash-rule-glyph {
+  width: 35px;
+}
+
+/* 生成结果 */
+.clash-rule-yaml {
+  margin: 10px 0 0;
+  padding: 12px 14px;
+  overflow-x: auto;
+  border-radius: 12px;
+  background: var(--substore-fill);
+  box-shadow: inset 0 0 0 1px var(--substore-edge);
+  color: var(--ink-2);
+  font: 10.5px/1.8 var(--mono);
+  white-space: pre;
+}
+
+.clash-chain-local-badge {
+  flex: none;
+  padding: 3px 6px;
+  border-radius: 5px;
+  background: var(--substore-frame);
+  color: var(--ink-3);
+  font: 500 10px/14px var(--sans);
+  white-space: nowrap;
+}
+.clash-chain-top {
+  padding-bottom: 12px;
+}
+.clash-chain-top .sub-pass-name {
+  min-width: 0;
+  flex: 1;
+}
+.clash-chain-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin: 18px 0 0 -4px;
+  padding: 3px 4px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--action);
+  font: 500 11.5px var(--sans);
+  cursor: pointer;
+}
+.clash-chain-note {
+  margin: 9px 0 12px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+.clash-chain-scope-note {
+  margin: 7px 0 0;
+  color: var(--ink-3);
+  font-size: 10.5px;
+  line-height: 1.65;
+}
+.clash-chain-add:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.clash-chain-route {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  border-radius: 10px;
+  background: var(--substore-frame);
+}
+.clash-chain-route > span:not(.clash-chain-route-arrow) {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.clash-chain-route small {
+  color: var(--ink-3);
+  font-size: 10px;
+}
+.clash-chain-route b {
+  overflow: hidden;
+  color: var(--ink);
+  font: 500 12px/17px var(--sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.clash-chain-route-arrow {
+  color: var(--ink-4);
+}
+.clash-chain-picks {
+  margin-top: 8px;
+}
+.clash-chain-picks .substore-row {
+  justify-content: space-between;
+  min-height: 36px;
+  padding: 6px 0;
+  font-size: 12px;
+}
+.clash-chain-picks .substore-row-pick {
+  font-size: 12px;
+}
+.clash-chain-input-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.clash-chain-input-head label {
+  font-size: 12px;
+  font-weight: 500;
+}
+.clash-chain-input-wrap {
+  position: relative;
+}
+.clash-chain-input-wrap textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 78px;
+  max-height: 240px;
+  resize: vertical;
+  padding: 9px 48px 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline-offset: 2px;
+  background: var(--substore-frame);
+  color: var(--ink);
+  font: 11.5px/18px var(--mono);
+  overflow-wrap: anywhere;
+}
+.clash-chain-input-wrap textarea[data-masked] {
+  -webkit-text-security: disc;
+}
+.clash-chain-input-wrap textarea[aria-invalid='true'] {
+  border-color: var(--err);
+}
+.clash-chain-input-wrap textarea::placeholder {
+  color: var(--ink-4);
+  font-family: var(--sans);
+  -webkit-text-security: none;
+}
+.clash-chain-import-formats {
+  margin: 0 0 10px;
+  color: var(--ink-3);
+  font-size: 10.5px;
+  line-height: 1.65;
+}
+.clash-chain-import-formats summary {
+  color: var(--action);
+  cursor: pointer;
+}
+.clash-chain-import-formats p {
+  margin: 6px 0;
+}
+.clash-chain-reveal {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  height: 28px;
+  padding: 0 5px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink-3);
+  font: 11px var(--sans);
+  cursor: pointer;
+}
+.clash-chain-hint,
+.clash-chain-install > p {
+  margin: 7px 0 10px;
+  color: var(--ink-3);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+.clash-chain-parse {
+  justify-self: start;
+  font-size: 11.5px;
+}
+.clash-chain-import-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.clash-chain-error,
+.clash-chain-warning,
+.clash-chain-success {
+  margin: 10px 0 0;
+  font-size: 11.5px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+.clash-chain-error {
+  color: var(--err);
+}
+.clash-chain-warning {
+  color: var(--ink-2);
+}
+.clash-chain-success {
+  color: var(--action);
+}
+.clash-chain-node {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 5px 7px;
+  margin-top: 13px;
+  padding: 10px;
+  border: 1px solid var(--substore-sep);
+  border-radius: 9px;
+}
+.clash-chain-node-list {
+  margin-top: 13px;
+}
+.clash-chain-list-title {
+  color: var(--ink-3);
+  font-size: 10.5px;
+}
+.clash-chain-node-list ul {
+  display: grid;
+  gap: 7px;
+  max-height: 192px;
+  overflow-y: auto;
+  margin: 7px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.clash-chain-node-list .clash-chain-node {
+  margin-top: 0;
+}
+.clash-chain-remove {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  margin: -4px -4px -4px 0;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.clash-chain-remove:hover {
+  background: var(--substore-frame);
+  color: var(--err);
+}
+.clash-chain-node b {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  font-weight: 500;
+}
+.clash-chain-node code,
+.clash-chain-node > small {
+  grid-column: 1 / -1;
+  color: var(--ink-3);
+  font: 10.5px/16px var(--mono);
+  overflow-wrap: anywhere;
+}
+.clash-chain-node > small {
+  font-family: var(--sans);
+}
+.clash-chain-export {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+.clash-chain-export > .primary {
+  flex: 1;
+}
+.clash-chain-export > .btn {
+  font-size: 12px;
+}
+.clash-chain-install {
+  margin-top: 17px;
+  padding-top: 13px;
+  border-top: 1px solid var(--substore-sep);
+  color: var(--ink-3);
+  font-size: 10.5px;
+  line-height: 1.7;
+}
+.clash-chain-install summary {
+  font-weight: 500;
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.clash-chain-install summary span {
+  margin-left: 6px;
+  color: var(--action);
+}
+.clash-chain-install ol {
+  margin: 6px 0;
+  padding-left: 17px;
+}
+.clash-chain-install code {
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+.clash-chain-install > p {
+  margin-bottom: 0;
+}
+.clash-chain-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin: -4px -7px -4px 0;
+  padding: 3px 7px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--action);
+  font: 500 11.5px var(--sans);
+  cursor: pointer;
+}
+.clash-chain-add svg,
+.clash-chain-add .ui-icon {
+  display: block;
+  stroke-width: 1.8;
+}
+@media (hover: hover) {
+  .clash-chain-add:hover {
+    background: var(--action-wash);
+  }
+}
+.clash-chain-panel {
+  min-width: 0;
+  color: var(--ink);
+}
+.clash-editor-body.clash-editor-private-body {
+  padding: 0;
+}
+.clash-editor-scope-note {
+  margin: 8px 18px 4px;
+  color: var(--ink-3);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+.clash-editor-foot-status {
+  margin-right: auto;
+  color: var(--ink-3);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+.clash-editor-foot-status small {
+  display: block;
+  font-size: 10px;
+}
+/* 两栏常驻：开合只改弹窗宽度（居中向两侧展开），右栏按展开后的宽度排好，只被裁切、不重新换行。 */
+.sub-dialog-subscription:has(.clash-editor-split) {
+  transition: width 340ms var(--motion-ease-emphasized);
+}
+.sub-dialog-subscription:has(.clash-editor-split.open) {
+  width: min(940px, calc(100vw - 32px));
+}
+.clash-editor-split {
+  --clash-editor-left: min(404px, 100%);
+  display: grid;
+  grid-template-columns: var(--clash-editor-left) minmax(0, 1fr);
+}
+.clash-editor-left {
+  min-width: 0;
+}
+/* 面板不参与行高：高度跟左栏卡券走，内容在面板里滚动。 */
+.clash-editor-pane {
+  min-width: 0;
+  overflow: hidden;
+  contain: size;
+  background: var(--card);
+  box-shadow: inset 1px 0 0 var(--substore-edge);
+}
+.clash-editor-pane-inner {
+  display: flex;
+  width: calc(min(940px, 100vw - 32px) - 404px);
+  height: 100%;
+  flex-direction: column;
+  opacity: 0;
+  transform: translateX(-28px);
+  transition:
+    opacity 220ms ease,
+    transform 340ms var(--motion-ease-emphasized);
+}
+.clash-editor-split.open .clash-editor-pane-inner {
+  opacity: 1;
+  transform: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sub-dialog-subscription:has(.clash-editor-split),
+  .clash-editor-pane-inner {
+    transition: none;
+  }
+}
+.clash-editor-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 50px;
+  padding: 0 18px;
+}
+.clash-editor-head > b {
+  color: var(--ink);
+  font: 600 14px var(--sans);
+}
+.clash-editor-seg {
+  margin-left: auto;
+}
+.clash-editor-close.sub-dialog-close {
+  margin-left: 0;
+}
+.clash-editor-test {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 8px;
+  margin: 0 18px 4px;
+  padding: 0 10px;
+  border-radius: 9px;
+  background: var(--substore-frame);
+  color: var(--ink-4);
+}
+.clash-editor-test .ui-icon,
+.clash-editor-test svg {
+  display: block;
+  flex: none;
+}
+.clash-editor-test input {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: none;
+  color: var(--ink);
+  font: 12.5px var(--mono);
+}
+.clash-editor-test input::placeholder {
+  color: var(--ink-4);
+  font: 12.5px var(--sans);
+}
+.clash-editor-test:focus-within {
+  box-shadow: inset 0 0 0 1.5px var(--action);
+}
+.clash-editor-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 18px 16px;
+}
+.clash-editor-sec {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 16px 0 6px 4px;
+}
+.clash-editor-sec > b {
+  color: var(--ink-3);
+  font: 500 11.5px var(--sans);
+}
+.clash-editor-sec > small {
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.substore-group.clash-editor-table {
+  border-radius: 0;
+  background: none;
+  box-shadow:
+    inset 0 1px 0 var(--substore-sep),
+    inset 0 -1px 0 var(--substore-sep);
+}
+.substore-group.clash-editor-table > * {
+  border-radius: 0;
+}
+.clash-editor-table > * + * {
+  --substore-sep-inset: 4px;
+}
+.clash-editor-table .substore-row {
+  min-height: 38px;
+  padding-left: 4px;
+}
+.clash-rule-ord {
+  width: 16px;
+  flex: none;
+  color: var(--ink-4);
+  font: 11px var(--mono);
+  text-align: right;
+}
+.clash-editor-table [data-hit] {
+  background: var(--action-wash);
+}
+.clash-editor-table [data-hit] .substore-row-copy > b,
+.clash-editor-table [data-hit] .clash-rule-rule-value {
+  color: var(--action);
+}
+.clash-editor-yaml.clash-rule-yaml {
+  margin-top: 12px;
+  background: var(--sunk);
+  box-shadow: none;
+}
+.clash-editor-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 18px 14px;
+  box-shadow: inset 0 1px 0 var(--substore-sep);
+}
+.clash-editor-foot .btn {
+  min-height: 32px;
+  padding: 0 18px;
+  border-radius: 8px;
+}
+@media (max-width: 820px) {
+  .sub-dialog-subscription:has(.clash-editor-split.open) {
+    width: 100%;
+  }
+  .clash-editor-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .clash-editor-split.open > .clash-editor-left,
+  .clash-editor-split:not(.open) > .clash-editor-pane {
+    display: none;
+  }
+  .clash-editor-split.open > .clash-editor-pane {
+    height: min(720px, calc(100dvh - 120px));
+    contain: none;
+  }
+  .clash-editor-pane-inner {
+    width: 100%;
+  }
+}
+
+.clash-chain-top {
+  padding: 16px 18px 12px;
+}
+.clash-chain-body {
+  display: grid;
+  gap: 10px;
+  padding: 14px 18px 16px;
+  border-top: 1px solid var(--substore-sep);
+}
+.clash-chain-panel {
+  color: var(--ink);
+  min-width: 0;
+}
+.clash-rule-fields {
+  padding: 0;
+  margin: 0;
+  border: 0;
+  min-width: 0;
+}
+.clash-rule-probe-go {
+  padding: 4px;
+  border: 0;
+  color: var(--action);
+  background: none;
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.clash-rule-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.clash-rule-chevron {
+  transform: rotate(180deg);
+}
+.clash-editor-split:not(.open) {
+  display: block;
+}
+.clash-editor-foot {
+  align-items: center;
+}
+.clash-editor-foot .btn {
+  flex-shrink: 0;
+}
+@media (max-width: 820px) {
+  .clash-editor-foot .btn {
+    min-height: 36px;
+    padding: 0 12px;
+  }
+  .clash-editor-head {
+    gap: 6px;
+    padding: 0 12px;
+  }
+  .clash-editor-test {
+    margin-left: 12px;
+    margin-right: 12px;
+  }
+}
+
+.clash-rule-probe-kind {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 0;
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  font: inherit;
+  white-space: nowrap;
 }
