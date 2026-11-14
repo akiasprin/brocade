@@ -1114,7 +1114,7 @@ function NodeCard({
             title={maintenanceText}
             data-enabled={node.ip_maintenance?.configured && node.ip_maintenance.enabled}
           >
-            <Icon of="maintenance" size={12} />
+            <Icon of="maintenance" size={14} />
           </span>
         </span>
         <b className={`node-card-name${node.name ? '' : ' mono'}`} title={nodeLabel(node)}>

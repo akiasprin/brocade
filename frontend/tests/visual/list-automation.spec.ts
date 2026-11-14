@@ -8,15 +8,27 @@ for (const theme of ['light', 'dark']) {
       await page.goto(`/tests/fixtures/navigation-preview.html?theme=${theme}#/users`);
       const roster = page.getByRole('listbox', { name: '用户列表' });
       await expect(roster).toBeVisible();
-      const connected = roster.locator('.user-row-observation > .user-row-substore');
+      const connected = roster.locator('.user-row-avatar > .user-row-substore');
       await expect(connected).toHaveCount(2);
       for (const status of await connected.all()) {
-        await expect(status).toHaveText('· 已连接 Sub-Store');
+        await expect(status).toHaveAccessibleName('已连接 SubStore');
         await expect(status).toBeVisible();
-        expect(await status.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+        const placement = await status.evaluate(element => {
+          const badge = element.getBoundingClientRect();
+          const avatar = element.parentElement!.querySelector('.user-avatar')!.getBoundingClientRect();
+          return {
+            badgeLeft: badge.left,
+            badgeBottom: badge.bottom,
+            avatarLeft: avatar.left,
+            avatarBottom: avatar.bottom,
+          };
+        });
+        expect(Math.abs(placement.badgeLeft - placement.avatarLeft)).toBeLessThanOrEqual(3);
+        expect(placement.badgeBottom).toBeGreaterThan(placement.avatarBottom);
       }
       await expect(roster.getByRole('option').filter({ hasText: 'bob' }).locator('.user-row-substore')).toHaveCount(0);
       await expect(roster.getByText('未连接', { exact: true })).toHaveCount(0);
+      await expect(roster).not.toContainText('SubStore');
       await expect(page.getByRole('dialog')).toHaveCount(0);
       await page.evaluate(() => document.fonts.ready);
       expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
@@ -35,19 +47,28 @@ for (const theme of ['light', 'dark']) {
         const positions = await icon.evaluate(element => {
           const bounds = element.getBoundingClientRect();
           const flag = element.parentElement!.querySelector('.node-card-flag')!.getBoundingClientRect();
-          const comet = element.closest('.node-card')!.querySelector('.node-card-comet')!.getBoundingClientRect();
+          const name = element.closest('.node-card')!.querySelector('.node-card-name')!.getBoundingClientRect();
           return {
-            center: bounds.x + bounds.width / 2,
+            centerX: bounds.x + bounds.width / 2,
+            centerY: bounds.y + bounds.height / 2,
+            left: bounds.left,
+            right: bounds.right,
             top: bounds.top,
             bottom: bounds.bottom,
-            flagCenter: flag.x + flag.width / 2,
+            flagLeft: flag.left,
+            flagRight: flag.right,
+            flagTop: flag.top,
             flagBottom: flag.bottom,
-            cometTop: comet.top,
+            nameLeft: name.left,
           };
         });
-        expect(positions.center).toBeCloseTo(positions.flagCenter, 1);
-        expect(positions.top).toBeGreaterThan(positions.flagBottom);
-        expect(positions.bottom).toBeLessThanOrEqual(positions.cometTop);
+        expect(Math.abs(positions.centerX - positions.flagRight)).toBeLessThanOrEqual(2);
+        expect(Math.abs(positions.centerY - positions.flagBottom)).toBeLessThanOrEqual(2);
+        expect(positions.left).toBeGreaterThan(positions.flagLeft);
+        expect(positions.top).toBeGreaterThan(positions.flagTop);
+        expect(positions.right).toBeGreaterThan(positions.flagRight);
+        expect(positions.bottom).toBeGreaterThan(positions.flagBottom);
+        expect(positions.right).toBeLessThan(positions.nameLeft);
       }
       await expect(page.getByRole('tablist', { name: /详情页签/ })).toHaveCount(0);
       await page.evaluate(() => document.fonts.ready);

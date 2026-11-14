@@ -55,6 +55,7 @@ import { useNodeNames } from '../ui/node-name';
 import { RegionFlag } from '../ui/region-flag';
 import { SOURCE_LOCATION_TITLE, SourceAddress, sourceNetwork } from '../ui/source-address';
 import { GeneratedUserAvatar, type AvatarLamp } from '../ui/user-avatar';
+import subStoreLogo from '../ui/brands/substore-logo.svg';
 import { FieldLoading, PanelLoading } from '../ui/loading';
 import { useNow } from '../ui/clock';
 import { type CrumbSeg, type Win } from '../wm/store';
@@ -2649,11 +2650,11 @@ function UserList({
     );
   };
 
-  // 名册项：身份牌 │ 用户名与观测 │ 右列（本期用量 / 额度）；已连接 Sub-Store 接在观测文字后。
+  // 名册项：身份牌 │ 用户名与观测 │ 右列（本期用量 / 额度）；SubStore 角标不占用右下角的告警灯。
   // 常态不画状态灯：流量用尽与系统停用为红点，未授权为空心灰点，已停用整行降一档、不再叠灯。
   // 管理员第二行放在线来源，普通用户只看接入点数量；异常、未授权和停用状态优先于观测值，
   // 避免把诊断信息盖住权限事实。
-  // 用量与额度右缘逐行对齐；第二行按观测文字和额度分配空间，环形按有限额度线路的合计用量 / 合计额度。
+  // 右列定宽，用量读数与额度百分比的右缘逐行对齐；环形按有限额度线路的合计用量 / 合计额度。
   const rosterRow = (row: (typeof allRows)[number]) => {
     const { u, key, mine, suspended, use, quotaRows, facts, tone } = row;
     const disabled = u.status === 'disabled';
@@ -2697,7 +2698,12 @@ function UserList({
         }}
         onClick={() => go({ p: 'user', id: u.id })}
       >
-        <GeneratedUserAvatar id={u.id} lamp={lamp} self={key === selfKey} />
+        <span className="user-row-avatar">
+          <GeneratedUserAvatar id={u.id} lamp={lamp} self={key === selfKey} />
+          {!isVisitor(who) && (who.role !== 'user' || key === selfKey) && u.substore?.configured && (
+            <img className="user-row-substore" src={subStoreLogo} alt="已连接 SubStore" title="已连接 SubStore" />
+          )}
+        </span>
         <span className="user-row-name">
           <b>{u.id}</b>
           {testChip && <span className="user-row-chip test">{testChip}</span>}
@@ -2713,31 +2719,23 @@ function UserList({
           )}
         </span>
         <span className="user-row-meta">
-          <span className="user-row-observation">
-            {state ? (
-              <span className={`user-row-state${state.bad ? ' bad' : ''}`}>{state.text}</span>
-            ) : mine.length > 0 ? (
-              <span
-                className={`user-row-presence${userPresence?.sources.length ? ' online' : ''}`}
-                title={presenceTitle}
-              >
-                {presenceText}
-              </span>
-            ) : (
-              <span className="user-row-state">{mine.length} 个接入点</span>
-            )}
-            {!isVisitor(who) && (who.role !== 'user' || key === selfKey) && u.substore?.configured && (
-              <span className="user-row-substore">· 已连接 Sub-Store</span>
-            )}
-          </span>
-          <span className="user-row-quota" title={quotaPct === null ? undefined : `总额度 ${quotaStage(quotaPct)}`}>
-            {quotaPct !== null && (
-              <>
-                <QuotaRing pct={quotaPct} over={quotaOver} />
-                <span className={quotaOver ? 'over' : undefined}>{quotaStage(quotaPct)}</span>
-              </>
-            )}
-          </span>
+          {state ? (
+            <span className={`user-row-state${state.bad ? ' bad' : ''}`}>{state.text}</span>
+          ) : mine.length > 0 ? (
+            <span className={`user-row-presence${userPresence?.sources.length ? ' online' : ''}`} title={presenceTitle}>
+              {presenceText}
+            </span>
+          ) : (
+            <span className="user-row-state">{mine.length} 个接入点</span>
+          )}
+        </span>
+        <span className="user-row-quota" title={quotaPct === null ? undefined : `总额度 ${quotaStage(quotaPct)}`}>
+          {quotaPct !== null && (
+            <>
+              <QuotaRing pct={quotaPct} over={quotaOver} />
+              <span className={quotaOver ? 'over' : undefined}>{quotaStage(quotaPct)}</span>
+            </>
+          )}
         </span>
       </button>
     );

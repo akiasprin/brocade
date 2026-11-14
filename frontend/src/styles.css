@@ -19811,7 +19811,7 @@ h4.sec > .btn {
 
 /* 名册项：身份牌 │ 用户名 + 第二行 │ 右列（本月用量 / 额度）。行间不画分隔线，靠 2px 间隔、
    悬停底色和选中卡面区分；选中态用中性材质和一圈极弱的操作色边线，不再铺整块主题色或
-   另画高亮竖条。用量列定宽 72px，第二行按观测文字与额度分配空间，右缘逐行对齐。
+   另画高亮竖条。右列定宽 72px，用量读数与额度百分比的右缘逐行对齐。
    --user-row-ring 是状态灯描边色，跟随行底色变化，灯与身份牌之间留出一圈间隙。 */
 .user-row {
   --user-row-ring: var(--block);
@@ -19820,7 +19820,7 @@ h4.sec > .btn {
   grid-template-columns: 34px minmax(0, 1fr) 72px;
   grid-template-areas:
     'face name usage'
-    'face meta meta';
+    'face meta quota';
   align-items: center;
   gap: 4px 12px;
   width: 100%;
@@ -19857,8 +19857,18 @@ h4.sec > .btn {
   outline: 2px solid color-mix(in srgb, var(--action) 55%, transparent);
   outline-offset: -2px;
 }
-.user-row > .user-avatar {
+.user-row-avatar {
+  position: relative;
+  display: inline-flex;
   grid-area: face;
+}
+.user-row-substore {
+  position: absolute;
+  bottom: -2px;
+  left: -2px;
+  width: 14px;
+  height: 14px;
+  object-fit: contain;
 }
 .user-row-name {
   display: flex;
@@ -19926,23 +19936,9 @@ h4.sec > .btn {
 .user-row-meta {
   display: flex;
   min-width: 0;
-  min-height: 16px;
+  height: 16px;
   align-items: center;
-  gap: 8px;
   grid-area: meta;
-}
-.user-row-observation {
-  display: flex;
-  min-width: 0;
-  flex: 1;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 2px 4px;
-}
-.user-row-substore {
-  color: var(--ink-3);
-  font: 11.5px/16px var(--sans);
-  white-space: nowrap;
 }
 .user-row-state {
   min-width: 0;
@@ -19985,9 +19981,10 @@ h4.sec > .btn {
 .user-row-quota {
   display: inline-flex;
   height: 16px;
-  flex: none;
   align-items: center;
+  justify-self: end;
   gap: 5px;
+  grid-area: quota;
   color: var(--ink-3);
   font: 500 11px var(--sans);
   font-variant-numeric: tabular-nums;
@@ -25604,10 +25601,11 @@ body.observe-brushing .observe-chart-tip {
 }
 .node-card-maintenance {
   position: absolute;
-  top: calc(100% + 5px);
-  left: 0;
+  right: -6px;
+  bottom: -6px;
   display: inline-flex;
-  width: 18px;
+  width: 14px;
+  height: 14px;
   align-items: center;
   justify-content: center;
   color: var(--ink-4);
