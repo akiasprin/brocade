@@ -1227,7 +1227,10 @@ mod tests {
     }
     #[test]
     fn scheduling_skips_old_slots_and_never_replays_a_missed_cycle() {
-        let mut p = IpMaintenancePolicy::default();
+        let mut p = IpMaintenancePolicy {
+            interval_minutes: 20,
+            ..IpMaintenancePolicy::default()
+        };
         p.behavior.timer_jitter_secs = 0;
         p.behavior.runner_jitter_secs = 0;
         assert_eq!(schedule(1260, &p, 0, &mut Random).unwrap(), 2400);
