@@ -1016,7 +1016,6 @@ function NodeCard({
   const pressCard = useCardPressFeedback();
   const statusId = useId();
   const healthId = useId();
-  const maintenanceId = useId();
   const retired = node.lifecycle_phase !== 'active';
   const live = snapshotFresh ? pollTone(node) : 'idle';
   const lamp = snapshotFresh
@@ -1046,15 +1045,6 @@ function NodeCard({
     prepareTimer.current = 0;
   };
   const status = nodeLifecycleLabel(node) ?? (lamp.tone === 'ok' ? null : lamp.why);
-  const maintenanceText = `自动养护：${
-    !node.ip_maintenance
-      ? '状态未知'
-      : !node.ip_maintenance.configured
-        ? '未设置'
-        : node.ip_maintenance.enabled
-          ? '开启'
-          : '关闭'
-  }`;
   const samples = (load?.series ?? [])
     .filter(sample => sample.window_end_unix_secs >= now / 1000 - 12 * 60)
     .slice(-LIST_NIC_WINDOWS);
@@ -1098,24 +1088,12 @@ function NodeCard({
             checked={checked}
             disabled={!selectable}
             aria-label={`选中 ${nodeLabel(node)}`}
-            aria-describedby={[status ? statusId : null, healthId, maintenanceId].filter(Boolean).join(' ')}
+            aria-describedby={[status ? statusId : null, healthId].filter(Boolean).join(' ')}
             onChange={onPick}
           />
         )}
-        <span className="node-card-markers">
-          <span className="node-card-flag" title={node.public_ipv4_country ?? '未识别地区'}>
-            {node.public_ipv4_country ? <RegionFlag code={node.public_ipv4_country} /> : <i />}
-          </span>
-          <span
-            id={maintenanceId}
-            className="node-card-maintenance"
-            role="img"
-            aria-label={maintenanceText}
-            title={maintenanceText}
-            data-enabled={node.ip_maintenance?.configured && node.ip_maintenance.enabled}
-          >
-            <Icon of="maintenance" size={14} />
-          </span>
+        <span className="node-card-flag" title={node.public_ipv4_country ?? '未识别地区'}>
+          {node.public_ipv4_country ? <RegionFlag code={node.public_ipv4_country} /> : <i />}
         </span>
         <b className={`node-card-name${node.name ? '' : ' mono'}`} title={nodeLabel(node)}>
           {nodeLabel(node)}
@@ -1193,7 +1171,7 @@ function NodeCard({
       type="button"
       className={className}
       aria-label={`查看 ${nodeLabel(node)} 的机器详情`}
-      aria-describedby={[status ? statusId : null, healthId, maintenanceId].filter(Boolean).join(' ')}
+      aria-describedby={[status ? statusId : null, healthId].filter(Boolean).join(' ')}
       data-route-focus={`node:${node.node_id}`}
       onMouseEnter={schedulePrepare}
       onMouseLeave={cancelPrepare}

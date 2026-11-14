@@ -19857,18 +19857,8 @@ h4.sec > .btn {
   outline: 2px solid color-mix(in srgb, var(--action) 55%, transparent);
   outline-offset: -2px;
 }
-.user-row-avatar {
-  position: relative;
-  display: inline-flex;
+.user-row > .user-avatar {
   grid-area: face;
-}
-.user-row-substore {
-  position: absolute;
-  bottom: -2px;
-  left: -2px;
-  width: 14px;
-  height: 14px;
-  object-fit: contain;
 }
 .user-row-name {
   display: flex;
@@ -25453,13 +25443,9 @@ body.observe-brushing .observe-chart-tip {
   margin: 0;
   accent-color: var(--action);
 }
-.node-card-markers {
-  position: relative;
-  display: inline-flex;
-  flex: none;
-}
 .node-card-flag {
   display: inline-flex;
+  flex: none;
   align-items: center;
 }
 .node-card-flag .geo-flag {
@@ -25598,20 +25584,6 @@ body.observe-brushing .observe-chart-tip {
   font-size: 12.5px;
   line-height: 18px;
   white-space: nowrap;
-}
-.node-card-maintenance {
-  position: absolute;
-  right: -6px;
-  bottom: -6px;
-  display: inline-flex;
-  width: 14px;
-  height: 14px;
-  align-items: center;
-  justify-content: center;
-  color: var(--ink-4);
-}
-.node-card-maintenance[data-enabled='true'] {
-  color: var(--action);
 }
 .node-card-now {
   flex: none;

@@ -55,7 +55,6 @@ import { useNodeNames } from '../ui/node-name';
 import { RegionFlag } from '../ui/region-flag';
 import { SOURCE_LOCATION_TITLE, SourceAddress, sourceNetwork } from '../ui/source-address';
 import { GeneratedUserAvatar, type AvatarLamp } from '../ui/user-avatar';
-import subStoreLogo from '../ui/brands/substore-logo.svg';
 import { FieldLoading, PanelLoading } from '../ui/loading';
 import { useNow } from '../ui/clock';
 import { type CrumbSeg, type Win } from '../wm/store';
@@ -2650,7 +2649,7 @@ function UserList({
     );
   };
 
-  // 名册项：身份牌 │ 用户名与观测 │ 右列（本期用量 / 额度）；SubStore 角标不占用右下角的告警灯。
+  // 名册项：身份牌 │ 用户名与观测 │ 右列（本期用量 / 额度）。
   // 常态不画状态灯：流量用尽与系统停用为红点，未授权为空心灰点，已停用整行降一档、不再叠灯。
   // 管理员第二行放在线来源，普通用户只看接入点数量；异常、未授权和停用状态优先于观测值，
   // 避免把诊断信息盖住权限事实。
@@ -2698,12 +2697,7 @@ function UserList({
         }}
         onClick={() => go({ p: 'user', id: u.id })}
       >
-        <span className="user-row-avatar">
-          <GeneratedUserAvatar id={u.id} lamp={lamp} self={key === selfKey} />
-          {!isVisitor(who) && (who.role !== 'user' || key === selfKey) && u.substore?.configured && (
-            <img className="user-row-substore" src={subStoreLogo} alt="已连接 SubStore" title="已连接 SubStore" />
-          )}
-        </span>
+        <GeneratedUserAvatar id={u.id} lamp={lamp} self={key === selfKey} />
         <span className="user-row-name">
           <b>{u.id}</b>
           {testChip && <span className="user-row-chip test">{testChip}</span>}

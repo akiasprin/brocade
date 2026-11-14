@@ -704,7 +704,7 @@ describe('user roster rows', () => {
     await vi.waitFor(() => expect(reads()).toContain('/grant-probes/capability'));
   });
 
-  it('shows the SubStore brand on connected avatars without roster copy or per-user requests', async () => {
+  it('keeps connected avatars free of SubStore badges and per-user requests', async () => {
     const { view, client } = mount();
     await seedUsers(
       client,
@@ -714,14 +714,9 @@ describe('user roster rows', () => {
       })),
     );
     const rows = view.getAllByRole('option');
-    expect(rows.map(row => row.querySelector('.user-row-avatar > .user-row-substore')?.getAttribute('alt'))).toEqual([
-      '已连接 SubStore',
-      '已连接 SubStore',
-      undefined,
-      undefined,
-    ]);
+    expect(view.queryByRole('img', { name: '已连接 SubStore' })).toBeNull();
     expect(rows[0].querySelector('.user-row-meta > .user-row-presence')).not.toBeNull();
-    expect(rows[1].querySelector('.user-row-avatar .node-lamp')).not.toBeNull();
+    expect(rows[1].querySelector('.user-avatar .node-lamp')).not.toBeNull();
     expect(rows.every(row => !row.textContent?.includes('SubStore'))).toBe(true);
     expect(view.queryByRole('dialog')).toBeNull();
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/subscription-connectors/'))).toBe(

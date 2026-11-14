@@ -136,21 +136,17 @@ const button = (name: string | RegExp) => screen.getByRole('button', { name }) a
 const checkbox = (name: string) => screen.getByRole('checkbox', { name }) as HTMLInputElement;
 
 describe('machine list title bar', () => {
-  it('places named maintenance icons beside flags without fetching per-machine maintenance views', () => {
+  it('keeps machine flags free of maintenance badges without fetching per-machine maintenance views', () => {
     const nodes = fleet().slice(0, 4);
     nodes[0].ip_maintenance = { configured: true, enabled: true };
     nodes[1].ip_maintenance = { configured: true, enabled: false };
     nodes[2].ip_maintenance = { configured: false, enabled: false };
     delete nodes[3].ip_maintenance;
     const { fetcher } = mount(nodes);
-    for (const [index, node] of nodes.entries()) {
+    for (const node of nodes) {
       const card = screen.getByRole('button', { name: `查看 ${node.name || node.node_id} 的机器详情` });
-      const icon = within(card).getByRole('img', {
-        name: ['自动养护：开启', '自动养护：关闭', '自动养护：未设置', '自动养护：状态未知'][index],
-      });
-      expect(icon.parentElement?.querySelector('.node-card-flag')).not.toBeNull();
-      expect(icon.getAttribute('data-enabled') === 'true').toBe(index === 0);
-      expect(card.getAttribute('aria-describedby')?.split(' ')).toContain(icon.id);
+      expect(card.querySelector('.node-card-flag')).not.toBeNull();
+      expect(within(card).queryByRole('img', { name: /自动养护/ })).toBeNull();
     }
     expect(fetcher.mock.calls.some(([path]) => path.includes('/ip-maintenance'))).toBe(false);
   });
