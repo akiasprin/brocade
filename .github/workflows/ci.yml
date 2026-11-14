@@ -362,7 +362,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          fetch-depth: 2
+          # Embedded component versions use the last change in their source closure.
+          fetch-depth: 0
 
       - uses: ./.github/actions/configure-apt
 
@@ -625,6 +626,9 @@ jobs:
             linker_var: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Keep release provenance identical to a full-history local build.
+          fetch-depth: 0
 
       - uses: ./.github/actions/configure-apt
         if: matrix.apt
