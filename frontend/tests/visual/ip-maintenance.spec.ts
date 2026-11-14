@@ -6,14 +6,8 @@ const fixture = '/tests/fixtures/ip-maintenance-preview.html';
 async function open(page: Page, query = '') {
   await page.clock.setFixedTime(new Date('2026-11-14T00:00:00Z'));
   await page.goto(`${fixture}?${query}`);
-  const careTab = page.getByRole('tab', { name: '养护', exact: true });
-  await expect(careTab).toBeVisible();
-  if ((await careTab.getAttribute('aria-selected')) !== 'true') {
-    await expect(page.getByRole('tab', { name: '配置', exact: true })).toHaveAttribute('aria-selected', 'true');
-    await expect(page.locator('.care-config')).toHaveCount(0);
-    await careTab.click();
-  }
-  await expect(page.getByRole('tab', { name: '养护', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('tab', { name: '配置', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('tab', { name: '养护', exact: true })).toHaveCount(0);
   const card = page.locator('.care-config');
   await expect(card).toHaveAttribute('aria-busy', 'false');
   await card.scrollIntoViewIfNeeded();
@@ -67,7 +61,7 @@ for (const browserName of ['chromium', 'webkit'] as const) {
         await expect(card.locator(':scope > header')).not.toContainText(/记录|策略/);
         await expect(card.locator('.care-location-progress, .care-identity')).toHaveCount(0);
         await expect(card.locator('.row > .k')).toHaveText(['自动养护', '状态']);
-        await expect(page.getByRole('tabpanel', { name: '养护', exact: true })).toContainText('IP 养护');
+        await expect(card.locator('xpath=following-sibling::*[1]')).toContainText('证书组');
         await expect(card.getByRole('status')).toContainText(scene === 'waiting' ? '下一轮' : '正在养护');
         await fits(page, card);
         await expect(card).toHaveScreenshot(`f-trail-${browserName}-${width}-${theme}-${scene}.png`);
@@ -130,7 +124,7 @@ for (const browserName of ['chromium', 'webkit'] as const) {
     await expect(card.getByRole('button', { name: '停止', exact: true })).toBeDisabled();
     await page.getByRole('tab', { name: '解锁', exact: true }).focus();
     await page.keyboard.press('ArrowRight');
-    await expect(page.getByRole('tab', { name: '养护', exact: true })).toBeFocused();
+    await expect(page.getByRole('tab', { name: '配置', exact: true })).toBeFocused();
     await card.getByRole('button', { name: '策略', exact: true }).click();
     const policy = page.getByRole('dialog', { name: '养护策略' });
     await expect(policy.getByRole('spinbutton', { name: '每日请求上限' })).toBeDisabled();
@@ -167,6 +161,9 @@ for (const browserName of ['chromium', 'webkit'] as const) {
         await fits(page, card);
         const styles = await page.evaluate(() => {
           const button = document.querySelector('.care-config-state > .btn')!;
+          const calibration = [...document.querySelectorAll('button.btn')].find(
+            button => button.textContent?.trim() === '校准',
+          )!;
           const read = (element: Element) => {
             const css = getComputedStyle(element);
             return Object.fromEntries(
@@ -183,18 +180,9 @@ for (const browserName of ['chromium', 'webkit'] as const) {
               ].map(key => [key, css.getPropertyValue(key)]),
             );
           };
-          return read(button);
+          return { maintenance: read(button), calibration: read(calibration) };
         });
-        await page.getByRole('tab', { name: '配置', exact: true }).click();
-        const calibrationStyle = await page
-          .getByRole('button', { name: '校准', exact: true })
-          .evaluate((element, keys) => {
-            const css = getComputedStyle(element);
-            return Object.fromEntries(keys.map(key => [key, css.getPropertyValue(key)]));
-          }, Object.keys(styles));
-        expect(styles).toEqual(calibrationStyle);
-        await page.getByRole('tab', { name: '养护', exact: true }).click();
-        await expect(card).toHaveAttribute('aria-busy', 'false');
+        expect(styles.maintenance).toEqual(styles.calibration);
         await expect(card).toHaveScreenshot(`overall-${browserName}-${width}-${theme}-${scene}.png`);
       });
     }
@@ -251,7 +239,7 @@ test('F stop remains independent of a failed model snapshot', async ({ page }) =
   await expect(card).toContainText('本轮已中断');
 });
 
-test('retained maintenance window state opens the standalone maintenance tab', async ({ page }) => {
+test('retained maintenance window state opens the configuration card', async ({ page }) => {
   const card = await open(page, 'legacyTab=care&theme=light');
   await expect(card.getByRole('heading', { name: 'IP 养护' })).toBeVisible();
 });

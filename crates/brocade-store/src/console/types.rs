@@ -113,6 +113,8 @@ pub(crate) fn non_empty_json(value: serde_json::Value) -> Option<serde_json::Val
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeAgentStateItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_maintenance: Option<IpMaintenanceListStatus>,
     #[serde(default)]
     pub initialization: Option<crate::NodeInitialization>,
     pub node_id: String,
@@ -330,6 +332,8 @@ pub struct UserList {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserListItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub substore: Option<SubStoreListStatus>,
     pub tenant_id: String,
     pub id: String,
     pub uuid: String,
@@ -344,6 +348,19 @@ pub struct UserListItem {
     pub direct_login_enabled: bool,
     pub created_at: String,
     pub created_revision: Option<u64>,
+}
+
+/// Configuration facts for list scanning; neither summary implies a task is running.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubStoreListStatus {
+    pub configured: bool,
+    pub auto: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpMaintenanceListStatus {
+    pub configured: bool,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

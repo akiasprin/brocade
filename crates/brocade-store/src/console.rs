@@ -440,7 +440,9 @@ pub async fn self_user_profile(pool: &PgPool, actor: &AdminContext) -> Result<Us
     let user = actor
         .self_user()
         .ok_or_else(|| StoreError::Forbidden("operator is not bound to a user".to_owned()))?;
-    load_user_item(pool, &user.tenant_id, &user.user_id).await
+    let mut item = load_user_item(pool, &user.tenant_id, &user.user_id).await?;
+    lists::attach_substore_list_status(pool, actor, std::slice::from_mut(&mut item)).await?;
+    Ok(item)
 }
 
 /// Account type is operational identity data, not compiled network state, so it changes no
@@ -3510,6 +3512,7 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
     let service_reentry_ready = operationally_isolated && service_reentry_blockers.is_empty();
 
     Ok(NodeAgentStateItem {
+        ip_maintenance: None,
         initialization: None,
         node_id: row.try_get("node_id")?,
         tenant_id: row.try_get("tenant_id")?,
@@ -3653,6 +3656,7 @@ fn revision_item_from_row(
 
 fn user_item_from_row(row: &sqlx::postgres::PgRow) -> Result<UserListItem> {
     Ok(UserListItem {
+        substore: None,
         tenant_id: row.try_get("tenant_id")?,
         id: row.try_get("id")?,
         uuid: row.try_get("uuid")?,

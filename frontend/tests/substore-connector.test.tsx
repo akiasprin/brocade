@@ -2,7 +2,7 @@ import { clashRulesTransport } from './fixtures/clash-rules-data';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { SubscriptionViewer, type SubscriptionKind } from '../src/panes/subscription';
+import { SubscriptionViewer } from '../src/panes/subscription';
 import { connectorFixture, subStoreTransport } from './fixtures/substore-data';
 import { checkpoints, syncStatus } from '../src/panes/subscription-substore-state';
 
@@ -13,13 +13,7 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
-function mount(
-  scene = 'ready',
-  writable = true,
-  failSave = false,
-  clashFails = false,
-  kind: SubscriptionKind = 'clash',
-) {
+function mount(scene = 'ready', writable = true, failSave = false, clashFails = false) {
   const transport = subStoreTransport(scene, writable);
   const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'https://console.example.test');
@@ -47,7 +41,7 @@ function mount(
   const onClose = vi.fn();
   const v = render(
     <QueryClientProvider client={client}>
-      <SubscriptionViewer tenant="platform.acme" user="alice" kind={kind} onClose={onClose} />
+      <SubscriptionViewer tenant="platform.acme" user="alice" kind="clash" onClose={onClose} />
     </QueryClientProvider>,
   );
   return { ...v, fetch, client, onClose };
@@ -58,13 +52,6 @@ async function ticket(v: ReturnType<typeof mount>) {
 }
 
 describe('durable connector UI', () => {
-  it.each(['ready', 'empty'])('opens the direct entry without switching a stacked card: %s', async scene => {
-    const v = mount(scene, true, false, false, 'substore');
-    await v.findByRole('region', { name: 'Sub-Store 后端同步' });
-    expect(v.queryByRole('region', { name: 'Clash 订阅' })).toBeNull();
-    expect(v.fetch.mock.calls.every(([, init]) => !init?.method || init.method === 'GET')).toBe(true);
-  });
-
   it('maps checkpoint evidence without treating conversion as a client receipt', () => {
     expect(checkpoints(connectorFixture('ready'))).toEqual(['ok', 'ok', 'ok']);
     expect(checkpoints(connectorFixture('partial'))).toEqual(['ok', 'bad', 'track']);

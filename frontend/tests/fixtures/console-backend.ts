@@ -725,6 +725,7 @@ function userList(includeDisabled: boolean) {
       service_state: EXPIRED_USERS.has(user.id) ? 'expired' : 'active',
       login_enabled: true,
       direct_login_enabled: user.id === 'alice',
+      substore: { configured: ['alice', 'carol'].includes(user.id), auto: user.id === 'alice' },
       created_at: iso(NOW_S - 80 * DAY),
       created_revision: 3,
     })),
@@ -761,6 +762,29 @@ function userCycles() {
     ),
     forwarding: [],
   };
+}
+
+function userTrafficPolicies(tenant: string, user: string) {
+  const usage = userCycles().views.filter(row => row.tenant_id === tenant && row.user_id === user);
+  return userApps(user).map(app => {
+    const quota = quotas().quotas.find(row => row.tenant_id === tenant && row.user_id === user && row.app_id === app);
+    const used = usage
+      .filter(row => row.app_id === app)
+      .reduce((total, row) => total + row.uplink_bytes + row.downlink_bytes, 0);
+    return {
+      kind: 'access',
+      app_id: app,
+      base_rate_supported: true,
+      policy:
+        quota?.limit_bytes == null
+          ? null
+          : { quota_bytes: String(quota.limit_bytes), exhausted_action: { kind: 'suspend' } },
+      used_bytes: String(used),
+      exhausted: quota?.limit_bytes != null && used >= quota.limit_bytes,
+      service_available: true,
+      unsupported_nodes: [],
+    };
+  });
 }
 
 function quotas() {
@@ -1231,6 +1255,11 @@ const ROUTES: [RegExp, Handler][] = [
   [/^\/realtime\/fleet-traffic\/snapshot$/, fleetTrafficSnapshot],
   [/^\/users$/, url => userList(url.searchParams.get('include_disabled') !== 'false')],
   [/^\/users\/presence$/, presence],
+  [
+    /^\/users\/[^/]+\/[^/]+\/traffic-policy$/,
+    url => userTrafficPolicies(url.pathname.split('/')[2], url.pathname.split('/')[3]),
+  ],
+  [/^\/users\/[^/]+\/[^/]+\/source-access$/, () => ({ revision: 0, ips: [], nodes: [] })],
   [
     /^\/tenants$/,
     () => ({

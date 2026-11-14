@@ -1,6 +1,7 @@
 //! List queries: tenants, machines, revisions, users, quotas. All read-only, each mapping rows
 //! into a response type.
 use sqlx::{PgPool, Row};
+use std::collections::BTreeMap;
 
 use super::*;
 use crate::{AdminContext, Result, StoreError};
@@ -199,8 +200,27 @@ pub async fn list_node_agent_states(
         .map(|node| node.node_id.clone())
         .collect::<Vec<_>>();
     let mut initialization = crate::deployment::initialization::statuses(pool, &ids).await?;
+    let maintenance_rows = sqlx::query(
+        "SELECT node_id, generation > 0 AS configured, (policy->>'enabled')::boolean AS enabled
+           FROM ip_maintenance_policies WHERE node_id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+    let mut maintenance = BTreeMap::new();
+    for row in maintenance_rows {
+        maintenance.insert(
+            row.try_get::<String, _>("node_id")?,
+            IpMaintenanceListStatus {
+                configured: row.try_get("configured")?,
+                enabled: row.try_get("enabled")?,
+            },
+        );
+    }
     for node in &mut nodes {
         node.initialization = initialization.remove(&node.node_id);
+        // No saved policy means unconfigured. An absent API field remains distinguishable.
+        node.ip_maintenance = Some(maintenance.remove(&node.node_id).unwrap_or_default());
     }
     Ok(NodeAgentStateList { nodes })
 }
@@ -349,12 +369,66 @@ pub async fn list_users(
         .await?
     };
 
-    Ok(UserList {
-        users: rows
-            .iter()
-            .map(user_item_from_row)
-            .collect::<Result<Vec<_>>>()?,
-    })
+    let mut users = rows
+        .iter()
+        .map(user_item_from_row)
+        .collect::<Result<Vec<_>>>()?;
+    attach_substore_list_status(pool, actor, &mut users).await?;
+    Ok(UserList { users })
+}
+
+pub(super) async fn attach_substore_list_status(
+    pool: &PgPool,
+    actor: &AdminContext,
+    users: &mut [UserListItem],
+) -> Result<()> {
+    let mut tenants = Vec::new();
+    let mut ids = Vec::new();
+    for user in users.iter_mut() {
+        if crate::subscription_connector::access(actor, &user.tenant_id, &user.id, false).is_ok() {
+            user.substore = Some(SubStoreListStatus::default());
+            tenants.push(user.tenant_id.clone());
+            ids.push(user.id.clone());
+        }
+    }
+    if ids.is_empty() {
+        return Ok(());
+    }
+    // Pair identities instead of independently matching tenant and username arrays. Query only
+    // flags: sealed credentials, private endpoints and proxy identities never enter list data.
+    let rows = sqlx::query(
+        "SELECT tenant_id, user_id, sealed IS NOT NULL AS configured,
+                (sealed IS NOT NULL AND auto) AS automatic
+           FROM subscription_connectors
+          WHERE (tenant_id, user_id) IN (SELECT * FROM unnest($1::text[], $2::text[]))",
+    )
+    .bind(&tenants)
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+    let mut summaries = BTreeMap::new();
+    for row in rows {
+        summaries.insert(
+            (
+                row.try_get::<String, _>("tenant_id")?,
+                row.try_get::<String, _>("user_id")?,
+            ),
+            SubStoreListStatus {
+                configured: row.try_get("configured")?,
+                auto: row.try_get("automatic")?,
+            },
+        );
+    }
+    for user in users {
+        if user.substore.is_some() {
+            user.substore = Some(
+                summaries
+                    .remove(&(user.tenant_id.clone(), user.id.clone()))
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    Ok(())
 }
 
 // The quota list. Tenant scoping uses the same two-parameter form as usage (usage.rs) — a

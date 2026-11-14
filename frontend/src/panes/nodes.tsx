@@ -253,7 +253,7 @@ function useNodeObservationModules(): NodeObservationModuleState {
 export type Drill =
   | { p: 'list' }
   // range / from / to 是地址栏里的观测时间范围（ui/observe-range.ts 的 LoadRangeQuery）。
-  | ({ p: 'node'; id: string; tab?: NodeTab } & LoadRangeQuery)
+  | ({ p: 'node'; id: string; tab?: NodeTabEntry } & LoadRangeQuery)
   | { p: 'provision'; step: number }
   | { p: 'install'; node: string; step: number; result?: ProvisionNodeResult }
   | { p: 'chain'; id: string };
@@ -1016,6 +1016,7 @@ function NodeCard({
   const pressCard = useCardPressFeedback();
   const statusId = useId();
   const healthId = useId();
+  const maintenanceId = useId();
   const retired = node.lifecycle_phase !== 'active';
   const live = snapshotFresh ? pollTone(node) : 'idle';
   const lamp = snapshotFresh
@@ -1045,6 +1046,15 @@ function NodeCard({
     prepareTimer.current = 0;
   };
   const status = nodeLifecycleLabel(node) ?? (lamp.tone === 'ok' ? null : lamp.why);
+  const maintenanceText = `自动养护：${
+    !node.ip_maintenance
+      ? '状态未知'
+      : !node.ip_maintenance.configured
+        ? '未设置'
+        : node.ip_maintenance.enabled
+          ? '开启'
+          : '关闭'
+  }`;
   const samples = (load?.series ?? [])
     .filter(sample => sample.window_end_unix_secs >= now / 1000 - 12 * 60)
     .slice(-LIST_NIC_WINDOWS);
@@ -1088,12 +1098,24 @@ function NodeCard({
             checked={checked}
             disabled={!selectable}
             aria-label={`选中 ${nodeLabel(node)}`}
-            aria-describedby={[status ? statusId : null, healthId].filter(Boolean).join(' ')}
+            aria-describedby={[status ? statusId : null, healthId, maintenanceId].filter(Boolean).join(' ')}
             onChange={onPick}
           />
         )}
-        <span className="node-card-flag" title={node.public_ipv4_country ?? '未识别地区'}>
-          {node.public_ipv4_country ? <RegionFlag code={node.public_ipv4_country} /> : <i />}
+        <span className="node-card-markers">
+          <span className="node-card-flag" title={node.public_ipv4_country ?? '未识别地区'}>
+            {node.public_ipv4_country ? <RegionFlag code={node.public_ipv4_country} /> : <i />}
+          </span>
+          <span
+            id={maintenanceId}
+            className="node-card-maintenance"
+            role="img"
+            aria-label={maintenanceText}
+            title={maintenanceText}
+            data-enabled={node.ip_maintenance?.configured && node.ip_maintenance.enabled}
+          >
+            <Icon of="maintenance" size={12} />
+          </span>
         </span>
         <b className={`node-card-name${node.name ? '' : ' mono'}`} title={nodeLabel(node)}>
           {nodeLabel(node)}
@@ -1171,7 +1193,7 @@ function NodeCard({
       type="button"
       className={className}
       aria-label={`查看 ${nodeLabel(node)} 的机器详情`}
-      aria-describedby={[status ? statusId : null, healthId].filter(Boolean).join(' ')}
+      aria-describedby={[status ? statusId : null, healthId, maintenanceId].filter(Boolean).join(' ')}
       data-route-focus={`node:${node.node_id}`}
       onMouseEnter={schedulePrepare}
       onMouseLeave={cancelPrepare}
@@ -5481,7 +5503,9 @@ function NodeChainsSection({
 const IDENT_FIELD = { width: 220 };
 
 /** 机器详情保留运行观测、机器配置与规则关系；用户流量在用量页查看。 */
-type NodeTab = 'observed' | 'config' | 'chains' | 'unlock' | 'care';
+type NodeTab = 'observed' | 'config' | 'chains' | 'unlock';
+// Existing open windows may retain the former standalone maintenance tab in their local data.
+type NodeTabEntry = NodeTab | 'care';
 
 function NodeDetailLayout({
   sheeted,
@@ -5566,7 +5590,7 @@ export function NodeDetail({
   id: string;
   go: (d: Drill) => void;
   sheeted?: boolean;
-  initialTab?: NodeTab;
+  initialTab?: NodeTabEntry;
   /** 地址栏里的观测时间范围。 */
   rangeQuery: LoadRangeQuery;
 }) {
@@ -5714,7 +5738,7 @@ export function NodeDetail({
 
   /* 页签是一次浏览中的位置，不进地址栏。安装页可定向打开配置，但不改变既有详情 URL。
      换机器时使用新入口指定的位置，不继承上一台的阅读位置。 */
-  const entryTab: NodeTab = initialTab;
+  const entryTab: NodeTab = initialTab === 'care' ? 'config' : initialTab;
   const [tabState, setTabState] = useState<{ id: string; tab: NodeTab }>({
     id,
     tab: entryTab,
@@ -5736,7 +5760,7 @@ export function NodeDetail({
     setTabState({ id, tab: next });
     return true;
   };
-  const tabs: NodeTab[] = ['observed', 'unlock', 'care', 'config', 'chains'];
+  const tabs: NodeTab[] = ['observed', 'unlock', 'config', 'chains'];
   const tabId = (value: NodeTab) => `${tabIdBase}-${value}-tab`;
   const panelId = (value: NodeTab) => `${tabIdBase}-${value}-panel`;
   const moveTab = (event: ReactKeyboardEvent<HTMLButtonElement>, currentTab: NodeTab) => {
@@ -6005,19 +6029,6 @@ export function NodeDetail({
           >
             <Icon of="unlock" size={14} />
             解锁
-          </button>
-          <button
-            type="button"
-            id={tabId('care')}
-            role="tab"
-            aria-selected={tab === 'care'}
-            aria-controls={panelId('care')}
-            tabIndex={tab === 'care' ? 0 : -1}
-            onKeyDown={event => moveTab(event, 'care')}
-            onClick={() => setTab('care')}
-          >
-            <Icon of="maintenance" size={14} className="nd-tab-ic" />
-            养护
           </button>
           <button
             type="button"
@@ -6430,22 +6441,6 @@ export function NodeDetail({
         </section>
       )}
 
-      {tab === 'care' && (
-        <section
-          id={panelId('care')}
-          className="nd-tab-config nd-tab-care nd-tab-panel"
-          role="tabpanel"
-          aria-labelledby={tabId('care')}
-          tabIndex={0}
-        >
-          <div>
-            <Suspense fallback={<Loading variant="form" />}>
-              <IpMaintenanceCard key={id} node={n} canEdit={system} />
-            </Suspense>
-          </div>
-        </section>
-      )}
-
       {/* ── 写入控制面模型的配置。 ──
             两列而不是铺满：表单行是一条标签栏加 220px 输入，整幅宽度只会让标签和值之间
             空出一大片。分栏依据是「改这一项影响谁」：
@@ -6561,6 +6556,10 @@ export function NodeDetail({
 
           <div>
             {snapshot.data && <DnsCard node={n} canEdit={system} onSaved={onSaved} />}
+            {/* Maintenance owns an independent API, including stop while the model is unavailable. */}
+            <Suspense fallback={<Loading variant="form" />}>
+              <IpMaintenanceCard key={id} node={n} canEdit={system} />
+            </Suspense>
             {snapshot.data && <CertGroupCard node={n} canEdit={system} />}
 
             {snapshot.data && (

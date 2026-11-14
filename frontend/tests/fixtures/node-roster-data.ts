@@ -256,6 +256,10 @@ export function agentState(machine: Machine, nowSecs: number): NodeAgentStateIte
     wg_fake_tcp_port: null,
     initialization:
       machine.state === 'never' ? { state: 'waiting-agent', revision_id: 41, deployment_id: null, reason: null } : null,
+    ip_maintenance: {
+      configured: !retired && machine.state !== 'never' && machine.id !== 'us-gia',
+      enabled: !retired && machine.id === 'jp-iij',
+    },
     applied: polled
       ? {
           phantun: { state: 'disabled' },

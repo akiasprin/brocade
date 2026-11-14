@@ -236,7 +236,11 @@ function useCareState(node: NodeAgentStateItem, readOnly: boolean) {
   const dwell4 = useDwellFraction(reports.find(item => item.family === 'v4')?.report ?? null, now);
   const dwell6 = useDwellFraction(reports.find(item => item.family === 'v6')?.report ?? null, now);
 
-  const invalidate = () => qc.invalidateQueries({ queryKey: ['node-ip-maintenance', node.node_id] });
+  const invalidate = () =>
+    Promise.all([
+      qc.invalidateQueries({ queryKey: ['node-ip-maintenance', node.node_id] }),
+      qc.invalidateQueries({ queryKey: ['nodes'] }),
+    ]);
   const save = useMutation({
     mutationFn: async (next?: IpMaintenancePolicy) => {
       if (!editable) throw new Error('当前身份仅可查看养护信息');

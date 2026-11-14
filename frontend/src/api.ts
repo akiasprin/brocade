@@ -574,6 +574,8 @@ export interface NodeInitialization {
 }
 
 export interface NodeAgentStateItem {
+  /** Missing on older Consoles; these flags describe automatic policy, not a running round. */
+  ip_maintenance?: { configured: boolean; enabled: boolean } | null;
   initialization?: NodeInitialization | null;
   node_id: string;
   tenant_id: string;
@@ -1139,6 +1141,8 @@ export const retryTarget = (id: number, nodeId: string, token = '') =>
 /* ── 用户与授权 ── */
 
 export interface UserListItem {
+  /** Only returned within connector read permissions; no backend address or credentials. */
+  substore?: { configured: boolean; auto: boolean } | null;
   tenant_id: string;
   id: string;
   // Readonly responses remove usable credentials at the server boundary.

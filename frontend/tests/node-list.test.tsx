@@ -136,6 +136,25 @@ const button = (name: string | RegExp) => screen.getByRole('button', { name }) a
 const checkbox = (name: string) => screen.getByRole('checkbox', { name }) as HTMLInputElement;
 
 describe('machine list title bar', () => {
+  it('places named maintenance icons beside flags without fetching per-machine maintenance views', () => {
+    const nodes = fleet().slice(0, 4);
+    nodes[0].ip_maintenance = { configured: true, enabled: true };
+    nodes[1].ip_maintenance = { configured: true, enabled: false };
+    nodes[2].ip_maintenance = { configured: false, enabled: false };
+    delete nodes[3].ip_maintenance;
+    const { fetcher } = mount(nodes);
+    for (const [index, node] of nodes.entries()) {
+      const card = screen.getByRole('button', { name: `查看 ${node.name || node.node_id} 的机器详情` });
+      const icon = within(card).getByRole('img', {
+        name: ['自动养护：开启', '自动养护：关闭', '自动养护：未设置', '自动养护：状态未知'][index],
+      });
+      expect(icon.parentElement?.querySelector('.node-card-flag')).not.toBeNull();
+      expect(icon.getAttribute('data-enabled') === 'true').toBe(index === 0);
+      expect(card.getAttribute('aria-describedby')?.split(' ')).toContain(icon.id);
+    }
+    expect(fetcher.mock.calls.some(([path]) => path.includes('/ip-maintenance'))).toBe(false);
+  });
+
   it('uses the icon title bar shared with the usage page', () => {
     mount(fleet());
 
@@ -388,7 +407,7 @@ describe('comet and health-ring cards', () => {
     await waitFor(() => expect(readings()).toEqual(['80%', '85%', '97%']));
     expect(document.querySelectorAll('.node-card-resource.warn')).toHaveLength(2);
     expect(document.querySelectorAll('.node-card-resource.bad')).toHaveLength(1);
-    expect(button(`查看 ${machine.name} 的机器详情`).getAttribute('aria-describedby')).toBe(
+    expect(button(`查看 ${machine.name} 的机器详情`).getAttribute('aria-describedby')?.split(' ')).toContain(
       document.querySelector('.node-card-resources')!.id,
     );
     expect(page.fetcher.mock.calls.filter(([path]) => path === '/load/nodes?windows=6')).toHaveLength(1);

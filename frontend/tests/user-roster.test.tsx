@@ -17,7 +17,6 @@ import { userTrafficPolicyKey } from '../src/panes/user-traffic-policy';
 import { SessionProvider } from '../src/session';
 import { Icon } from '../src/ui/icons';
 import type { Win } from '../src/wm/store';
-import { connectorFixture } from './fixtures/substore-data';
 
 const GiB = 1024 ** 3;
 const tenant = 'platform.acme';
@@ -105,7 +104,6 @@ beforeEach(() => {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL) => {
-      if (String(input).endsWith('/subscription-connectors/sub-store')) return Response.json(connectorFixture('ready'));
       if (String(input).endsWith('/source-access')) return Response.json({ revision: 0, ips: [], nodes: [] });
       if (String(input) === '/grant-probes/capability') {
         return Response.json({ available: false, reason: '测试中不发起拨测' });
@@ -706,6 +704,31 @@ describe('user roster rows', () => {
     await vi.waitFor(() => expect(reads()).toContain('/grant-probes/capability'));
   });
 
+  it('appends connected Sub-Store status to roster metadata and omits unconnected users', async () => {
+    const { view, client } = mount();
+    await seedUsers(
+      client,
+      users.map((user, index) => ({
+        ...user,
+        substore: { configured: index < 2, auto: index === 0 },
+      })),
+    );
+    const rows = view.getAllByRole('option');
+    expect(rows.map(row => row.querySelector('.user-row-observation > .user-row-substore')?.textContent)).toEqual([
+      '· 已连接 Sub-Store',
+      '· 已连接 Sub-Store',
+      undefined,
+      undefined,
+    ]);
+    expect(
+      rows[0].querySelector('.user-row-observation')?.firstElementChild?.classList.contains('user-row-presence'),
+    ).toBe(true);
+    expect(view.queryByRole('dialog')).toBeNull();
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/subscription-connectors/'))).toBe(
+      false,
+    );
+  });
+
   it('opens the node tab directly and keeps the entries disabled for roles that cannot read artifacts', async () => {
     const admin = mount();
     fireEvent.click(admin.view.getByRole('button', { name: '节点' }));
@@ -716,15 +739,6 @@ describe('user roster rows', () => {
     const reviewer = mount('readonly');
     expect((reviewer.view.getByRole('button', { name: '节点' }) as HTMLButtonElement).disabled).toBe(true);
     expect((reviewer.view.getByRole('button', { name: '订阅' }) as HTMLButtonElement).disabled).toBe(true);
-    expect((reviewer.view.getByRole('button', { name: 'Sub-Store' }) as HTMLButtonElement).disabled).toBe(true);
-  });
-
-  it('opens Sub-Store directly from the detail header without first opening the subscription card', async () => {
-    const { view } = mount();
-    fireEvent.click(view.getByRole('button', { name: 'Sub-Store' }));
-    const dialog = await view.findByRole('dialog', { name: 'alice 的订阅与节点' });
-    expect(await within(dialog).findByRole('region', { name: 'Sub-Store 后端同步' })).toBeTruthy();
-    expect(within(dialog).queryByRole('region', { name: 'Clash 订阅' })).toBeNull();
   });
 
   it('keeps availability and a compact UUID in the header while usage stays in the ledger', async () => {
@@ -744,7 +758,7 @@ describe('user roster rows', () => {
       [...header().querySelectorAll('.user-dhead-tools button')].map(
         button => button.getAttribute('aria-label') ?? button.textContent,
       ),
-    ).toEqual(['订阅', '节点', 'Sub-Store', '更多操作']);
+    ).toEqual(['订阅', '节点', '更多操作']);
     const status = within(header()).getByRole('status', { name: /可用/ });
     expect(status.textContent).toBe('可用');
     expect(status.getAttribute('title')).toContain('个接入点');

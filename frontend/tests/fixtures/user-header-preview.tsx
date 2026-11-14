@@ -34,6 +34,8 @@ const person = (id: string, extra: Partial<UserListItem> = {}): UserListItem => 
   created_revision: 1,
   uuid: '00000000-0000-4000-8000-000000000000',
   login_enabled: true,
+  substore:
+    role === 'user' && id !== 'alice' ? null : { configured: ['alice', 'carol'].includes(id), auto: id === 'alice' },
   ...extra,
 });
 const users = [
@@ -450,7 +452,7 @@ const win: Win = {
   z: 1,
   min: false,
   home: 'desk',
-  data: { drill: { p: 'user', id: selected } },
+  data: { drill: params.has('list') ? { p: 'list' } : { p: 'user', id: selected } },
 };
 createRoot(document.getElementById('root')!).render(
   <QueryClientProvider client={client}>

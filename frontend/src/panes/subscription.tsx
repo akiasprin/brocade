@@ -57,8 +57,7 @@ import { bytes } from '../ui/format';
 import { Icon, type IconName } from '../ui/icons';
 import { RegionFlag } from '../ui/region-flag';
 
-type SubscriptionTab = 'uri' | 'clash';
-export type SubscriptionKind = SubscriptionTab | 'substore';
+export type SubscriptionKind = 'uri' | 'clash';
 
 type FamilyPick = 'both' | ArtifactFamily;
 type ProtocolPick = 'both' | ArtifactProtocol;
@@ -82,7 +81,7 @@ const NODE_PROTOCOL_PICKS = [...PROTOCOL_PICKS, { value: 'mtproto' as const, lab
 const PROTOCOL_DETAIL: Partial<Record<ProtocolPick, string>> = { both: 'VLESS · AnyTLS · Hysteria 2' };
 const FAMILY_DETAIL: Partial<Record<FamilyPick, string>> = { both: 'IPv4 · IPv6' };
 
-const TABS: { value: SubscriptionTab; label: string; icon: IconName }[] = [
+const TABS: { value: SubscriptionKind; label: string; icon: IconName }[] = [
   { value: 'clash', label: '订阅', icon: 'subscription' },
   { value: 'uri', label: '节点', icon: 'nodeLinks' },
 ];
@@ -115,7 +114,7 @@ export function SubscriptionViewer({
   onProbePassed?: (result: { probeId: string; itemId: string }) => void;
   onClose: () => void;
 }) {
-  const [tab, setTab] = useState<SubscriptionTab>(kind === 'substore' ? 'clash' : kind);
+  const [tab, setTab] = useState<SubscriptionKind>(kind);
   const navigationGuard = useRef<SubStoreNavigationGuard | null>(null);
   const registerGuard = useCallback((guard: SubStoreNavigationGuard | null) => {
     navigationGuard.current = guard;
@@ -126,10 +125,10 @@ export function SubscriptionViewer({
   // VLESS 自签入口没有可互通的链接写法，服务端无论是否允许 insecure 都会跳过并给出说明。
   const [allowInsecure, setAllowInsecure] = useState(true);
   const ids = useId();
-  const tabId = (value: SubscriptionTab) => `${ids}-tab-${value}`;
+  const tabId = (value: SubscriptionKind) => `${ids}-tab-${value}`;
   const panel: TabPanelProps = { role: 'tabpanel', id: `${ids}-panel`, 'aria-labelledby': tabId(tab) };
 
-  const changeTab = (next: SubscriptionTab) => {
+  const changeTab = (next: SubscriptionKind) => {
     const go = () => {
       if (next === 'clash' && protocol === 'mtproto') setProtocol('both');
       setTab(next);
@@ -192,7 +191,6 @@ export function SubscriptionViewer({
           <ClashSubscription
             tenant={tenant}
             user={user}
-            initialCard={kind === 'substore' ? 'substore' : 'clash'}
             selfService={selfService}
             onGuard={registerGuard}
             protocol={protocol}
@@ -244,7 +242,6 @@ const HAITUN_NOTE =
 function ClashSubscription({
   tenant,
   user,
-  initialCard,
   selfService,
   onGuard,
   protocol,
@@ -255,7 +252,6 @@ function ClashSubscription({
 }: {
   tenant: string;
   user: string;
-  initialCard: PassCard;
   selfService: boolean;
   onGuard: (guard: SubStoreNavigationGuard | null) => void;
   protocol: ProtocolPick;
@@ -291,7 +287,7 @@ function ClashSubscription({
     queryFn: ({ signal }) => fetchClashRules(tenant, user, signal),
     retry: false,
   });
-  const [front, setFront] = useState<PassCard>(initialCard);
+  const [front, setFront] = useState<PassCard>('clash');
   // 换过卡之后新卡才播滑入动效；首次打开时弹窗自己已有进场动效。
   const [swapped, setSwapped] = useState(false);
   const qc = useQueryClient();
@@ -333,13 +329,7 @@ function ClashSubscription({
   );
 
   return (
-    <SubStoreShell
-      tenant={tenant}
-      user={user}
-      onGuard={registerShellGuard}
-      panel={panel}
-      waitForConnector={front === 'substore'}
-    >
+    <SubStoreShell tenant={tenant} user={user} onGuard={registerShellGuard} panel={panel}>
       <SubStoreContent>
         {available => (
           <div className={`clash-editor-split${rulesOpen && front === 'clash' ? ' open' : ''}`} {...panel}>

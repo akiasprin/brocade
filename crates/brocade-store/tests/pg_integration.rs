@@ -30586,3 +30586,6 @@ mod cvm_tests;
 
 #[path = "cases/ip_maintenance.rs"]
 mod ip_maintenance_tests;
+
+#[path = "cases/list_automation_status.rs"]
+mod list_automation_status_tests;
