@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-agent"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "base64 0.22.1",
  "brocade-core",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-console"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "async-stream",
  "axum",
@@ -472,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-core"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "base64 0.22.1",
  "ipnet",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-cube"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "base64 0.22.1",
  "brocade-core",
@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-deployment"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "base64 0.22.1",
  "brocade-core",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-launcher"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-preview"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "axum",
  "reqwest 0.12.28",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-probe"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "brocade-core",
  "brocade-deployment",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-sqlx"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "sqlx-core 0.8.6",
  "sqlx-postgres 0.8.6",
@@ -578,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "brocade-store"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "argon2",
  "base64 0.22.1",
