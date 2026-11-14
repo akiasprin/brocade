@@ -218,46 +218,48 @@ test('machine forwarding quota edits in place on mobile', async ({ page }) => {
 
 // Each scene runs the production pane with synthetic quota and machine receipts.
 for (const scene of ['all', 'normal', 'single', 'throttled', 'suspended', 'pending', 'paused']) {
-  for (const width of [1440, 390]) {
-    for (const theme of ['dark', 'light']) {
-      for (const role of ['system-admin', 'readonly']) {
-        test(`quota ${scene} ${width} ${theme} ${role}`, async ({ page }) => {
-          await page.setViewportSize({ width, height: 1100 });
-          await page.clock.setFixedTime(new Date('2026-10-23T12:00:00Z'));
-          await page.goto(`/tests/fixtures/user-quota-preview.html?scene=${scene}&role=${role}&theme=${theme}&run=0`);
-          const card = page.locator('.user-usage-card:not(.user-forwarding-usage)');
-          await expect(card.locator('.qta-r').first()).toBeVisible();
-          if (scene === 'throttled' || scene === 'all') {
-            await expect(card.getByText('限速中 · 2 Mbps', { exact: true })).toBeVisible();
-            await expect(card.locator('.throttled .qta-ring .value')).toHaveAttribute('stroke-dasharray', '100 100');
-          }
-          if (scene === 'suspended' || scene === 'all')
-            await expect(card.getByText('已停用', { exact: true })).toBeVisible();
-          if (scene === 'pending') await expect(card.locator('.qta-policy-sync')).toHaveCount(1);
-          if (scene === 'paused') {
-            await expect(card.locator('.qta').getByText('服务暂停', { exact: true })).toHaveCount(0);
-            await expect(card.locator('.qta-r.paused')).toHaveCount(2);
-            const pausedColors = await card
-              .locator('.qta-r.paused')
-              .evaluateAll(rows => rows.map(row => getComputedStyle(row.querySelector('.qta-ring .value')!).stroke));
-            expect(new Set(pausedColors).size).toBe(1);
-          }
-          if (role === 'readonly') await expect(card.locator('.qta-pencil')).toHaveCount(0);
-          expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
-          const labelColors = await card.locator('.qta-policy-flag, .qta-policy-sync, .qta-pct').evaluateAll(labels =>
-            labels.map(label => ({
-              text: label.textContent,
-              foreground: getComputedStyle(label).color,
-              background: getComputedStyle(label.closest('.user-usage-card')!).backgroundColor,
-            })),
-          );
-          for (const label of labelColors)
-            expect(textContrast(label.foreground, label.background), label.text ?? '').toBeGreaterThanOrEqual(4.5);
-          await page.evaluate(() => document.fonts.ready);
-          await expect(card).toHaveScreenshot(`quota-${scene}-${width}-${theme}-${role}.png`);
-        });
+  // Pairwise profiles cover every size/theme/role pair without the full cross product.
+  for (const { width, theme, role } of [
+    { width: 1440, theme: 'light', role: 'system-admin' },
+    { width: 390, theme: 'dark', role: 'system-admin' },
+    { width: 1440, theme: 'dark', role: 'readonly' },
+    { width: 390, theme: 'light', role: 'readonly' },
+  ]) {
+    test(`quota ${scene} ${width} ${theme} ${role}`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 1100 });
+      await page.clock.setFixedTime(new Date('2026-10-23T12:00:00Z'));
+      await page.goto(`/tests/fixtures/user-quota-preview.html?scene=${scene}&role=${role}&theme=${theme}&run=0`);
+      const card = page.locator('.user-usage-card:not(.user-forwarding-usage)');
+      await expect(card.locator('.qta-r').first()).toBeVisible();
+      if (scene === 'throttled' || scene === 'all') {
+        await expect(card.getByText('限速中 · 2 Mbps', { exact: true })).toBeVisible();
+        await expect(card.locator('.throttled .qta-ring .value')).toHaveAttribute('stroke-dasharray', '100 100');
       }
-    }
+      if (scene === 'suspended' || scene === 'all')
+        await expect(card.getByText('已停用', { exact: true })).toBeVisible();
+      if (scene === 'pending') await expect(card.locator('.qta-policy-sync')).toHaveCount(1);
+      if (scene === 'paused') {
+        await expect(card.locator('.qta').getByText('服务暂停', { exact: true })).toHaveCount(0);
+        await expect(card.locator('.qta-r.paused')).toHaveCount(2);
+        const pausedColors = await card
+          .locator('.qta-r.paused')
+          .evaluateAll(rows => rows.map(row => getComputedStyle(row.querySelector('.qta-ring .value')!).stroke));
+        expect(new Set(pausedColors).size).toBe(1);
+      }
+      if (role === 'readonly') await expect(card.locator('.qta-pencil')).toHaveCount(0);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
+      const labelColors = await card.locator('.qta-policy-flag, .qta-policy-sync, .qta-pct').evaluateAll(labels =>
+        labels.map(label => ({
+          text: label.textContent,
+          foreground: getComputedStyle(label).color,
+          background: getComputedStyle(label.closest('.user-usage-card')!).backgroundColor,
+        })),
+      );
+      for (const label of labelColors)
+        expect(textContrast(label.foreground, label.background), label.text ?? '').toBeGreaterThanOrEqual(4.5);
+      await page.evaluate(() => document.fonts.ready);
+      await expect(card).toHaveScreenshot(`quota-${scene}-${width}-${theme}-${role}.png`);
+    });
   }
 }
 

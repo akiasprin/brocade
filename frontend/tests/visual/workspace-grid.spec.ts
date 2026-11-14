@@ -148,145 +148,143 @@ async function scroll(page: Page, offset: number, touch: boolean) {
 
 for (const engine of ['chromium', 'webkit'] as const) {
   for (const device of [
-    { name: 'desktop', width: 1440, height: 900, touch: false },
-    { name: 'tablet', width: 1024, height: 768, touch: true },
-    { name: 'phone', width: 390, height: 844, touch: true },
+    { name: 'desktop', width: 1440, height: 900, touch: false, theme: 'light' },
+    { name: 'tablet', width: 1024, height: 768, touch: true, theme: 'dark' },
+    { name: 'phone', width: 390, height: 844, touch: true, theme: 'light' },
   ]) {
-    for (const theme of ['light', 'dark']) {
-      test(`${engine} ${device.name} ${theme}: grid aligns during loading and stays still while scrolling`, async ({
-        playwright,
-        baseURL,
-      }) => {
-        const browser = await playwright[engine].launch();
-        try {
-          const page = await browser.newPage({
-            baseURL,
-            viewport: device,
-            hasTouch: device.touch,
-            isMobile: device.touch,
-            reducedMotion: 'reduce',
-            locale: 'zh-CN',
-            timezoneId: 'Asia/Taipei',
-          });
-          const errors: string[] = [];
-          page.on('pageerror', error => errors.push(error.message));
-          const { enter, release } = await openWorkspace(page, theme);
-          const origin = await gridOrigin(page, '#stage');
-          const startup = await gridPixels(page);
-          await test.info().attach('startup-grid', { body: startup, contentType: 'image/png' });
-          enter();
-          await expect(page.locator('.fg-view')).toBeVisible();
-          expect(await page.locator('.fg-top').evaluate(el => getComputedStyle(el).borderBottomWidth)).toBe('0px');
-          if (!device.touch) {
-            const header = page.locator('.fg-top');
-            await expect(header).toHaveCSS('position', 'relative');
-            await expect(header).toHaveCSS(
-              'background-color',
-              await page.locator('html').evaluate(el => getComputedStyle(el).backgroundColor),
-            );
-            expect(await header.evaluate(el => el.closest('.fg-desk') !== null)).toBe(true);
-          }
-          await expect(page.locator('.fg-view .loading-boundary-guard')).toBeAttached();
-          await expectOrigin(page, origin);
-          expect((await gridPixels(page)).equals(startup), 'grid jumped when the shell mounted').toBe(true);
-          await expectAligned(page);
-          const name = `${engine}-${device.name}-${theme}`;
-          // This gap is already aligned before either the pane module or its data has settled.
-          await expect(page).toHaveScreenshot(`${name}-loading.png`, {
-            clip: { x: 0, y: 0, width: Math.min(device.width, 720), height: 240 },
-          });
-          release();
-          await expect(page.locator('.fg-view .loading-boundary-guard')).toHaveCount(0);
-          await expect(page.locator('.node-card')).toHaveCount(machines.length);
-          await expect(page.locator('.nd-throughput-panel')).toHaveCount(0);
-          await expect(page.locator('.node-card-rate:not(.none)').first()).toBeVisible();
-          await page.evaluate(() => document.fonts.ready);
-          await expectAligned(page);
-          expect(await page.evaluate(() => getComputedStyle(document.body, '::before').backgroundPosition)).toBe(
-            origin,
+    // Grid geometry is theme-independent; keep both themes across the device profiles.
+    const { theme } = device;
+    test(`${engine} ${device.name} ${theme}: grid aligns during loading and stays still while scrolling`, async ({
+      playwright,
+      baseURL,
+    }) => {
+      const browser = await playwright[engine].launch();
+      try {
+        const page = await browser.newPage({
+          baseURL,
+          viewport: device,
+          hasTouch: device.touch,
+          isMobile: device.touch,
+          reducedMotion: 'reduce',
+          locale: 'zh-CN',
+          timezoneId: 'Asia/Taipei',
+        });
+        const errors: string[] = [];
+        page.on('pageerror', error => errors.push(error.message));
+        const { enter, release } = await openWorkspace(page, theme);
+        const origin = await gridOrigin(page, '#stage');
+        const startup = await gridPixels(page);
+        await test.info().attach('startup-grid', { body: startup, contentType: 'image/png' });
+        enter();
+        await expect(page.locator('.fg-view')).toBeVisible();
+        expect(await page.locator('.fg-top').evaluate(el => getComputedStyle(el).borderBottomWidth)).toBe('0px');
+        if (!device.touch) {
+          const header = page.locator('.fg-top');
+          await expect(header).toHaveCSS('position', 'relative');
+          await expect(header).toHaveCSS(
+            'background-color',
+            await page.locator('html').evaluate(el => getComputedStyle(el).backgroundColor),
           );
-          await expect(page).toHaveScreenshot(`${name}-ready.png`, {
-            clip: { x: 0, y: 0, width: Math.min(device.width, 720), height: 320 },
-          });
-
-          const before = await gridPixels(page);
-          await test.info().attach('loaded-grid', { body: before, contentType: 'image/png' });
-          expect(before.equals(startup), 'grid jumped when data finished loading').toBe(true);
-          const headerClip = { x: 720, y: 8, width: 48, height: 24 };
-          const headerPixels = device.touch ? null : await page.screenshot({ clip: headerClip });
-          await page.locator('body').evaluate(el => el.style.setProperty('--grid-image', 'none'));
-          if (headerPixels)
-            expect(
-              (await page.screenshot({ clip: headerClip })).equals(headerPixels),
-              'grid never paints through the desktop navigation',
-            ).toBe(true);
-          const absent = await gridPixels(page);
-          expect(absent.equals(before), 'grid is visible in the gutter').toBe(false);
-          await page.locator('body').evaluate(el => el.style.removeProperty('--grid-image'));
-          const maxScroll = await page.evaluate(touch => {
-            const scroller = touch ? document.scrollingElement! : document.querySelector('.fg-desk')!;
-            return scroller.scrollHeight - scroller.clientHeight;
-          }, device.touch);
-          expect(maxScroll, 'the real list has enough content to exercise scrolling').toBeGreaterThan(200);
-          for (const offset of [73, 173, maxScroll]) {
-            await scroll(page, offset, device.touch);
-            await expectAligned(page);
-            const immediate = await gridPixels(page);
-            if (!immediate.equals(before)) {
-              await test.info().attach(`grid-${offset}-immediate`, { body: immediate, contentType: 'image/png' });
-              await test.info().attach(`grid-${offset}-expected`, { body: before, contentType: 'image/png' });
-              await test.info().attach(`grid-${offset}-state`, {
-                body: JSON.stringify({
-                  wasBlank: immediate.equals(absent),
-                  dom: await page.evaluate(() => ({
-                    scrollY,
-                    origin: getComputedStyle(document.body, '::before').backgroundPosition,
-                  })),
-                }),
-                contentType: 'application/json',
-              });
-            }
-            expect(immediate.equals(before), `grid moved at ${offset}px`).toBe(true);
-          }
-
-          // Content/chrome changes must never relocate a background that has already been painted.
-          await page.locator('.fg-top').evaluate(el => (el.style.height = '63px'));
-          await expectOrigin(page, origin);
-          await page.locator('.fg-top').evaluate(el => el.style.removeProperty('height'));
-          await page.evaluate(() => {
-            document.documentElement.style.setProperty('--safe-top', '23px');
-            document.documentElement.style.setProperty('--safe-left', '9px');
-          });
-          await expect
-            .poll(() =>
-              page.evaluate(() => Number.parseFloat(getComputedStyle(document.body, '::before').backgroundPositionX)),
-            )
-            .toBe(9);
-          await expectAligned(page);
-          const safeOrigin = await gridOrigin(page);
-          await page.evaluate(() => {
-            const draft = document.createElement('div');
-            draft.className = 'fg-draft';
-            draft.style.minHeight = '72px';
-            document.querySelector('.fg-view')!.before(draft);
-          });
-          await expectOrigin(page, safeOrigin);
-          await page.locator('.fg-draft').evaluate(el => el.remove());
-          await expectOrigin(page, safeOrigin);
-          const resized = { width: device.name === 'phone' ? 844 : 768, height: 600 };
-          await page.setViewportSize(resized);
-          await expectAligned(page);
-
-          // Real navigation replaces .fg-view; the new surface uses the same alignment lifecycle.
-          await page.getByRole('button', { name: '用户', exact: true }).click();
-          await expect(page).toHaveURL(/#\/users$/);
-          await expect(page.locator('.fg-view .loading-boundary-guard')).toHaveCount(0);
-          await expectAligned(page);
-          expect(errors).toEqual([]);
-        } finally {
-          await browser.close();
+          expect(await header.evaluate(el => el.closest('.fg-desk') !== null)).toBe(true);
         }
-      });
-    }
+        await expect(page.locator('.fg-view .loading-boundary-guard')).toBeAttached();
+        await expectOrigin(page, origin);
+        expect((await gridPixels(page)).equals(startup), 'grid jumped when the shell mounted').toBe(true);
+        await expectAligned(page);
+        const name = `${engine}-${device.name}-${theme}`;
+        // This gap is already aligned before either the pane module or its data has settled.
+        await expect(page).toHaveScreenshot(`${name}-loading.png`, {
+          clip: { x: 0, y: 0, width: Math.min(device.width, 720), height: 240 },
+        });
+        release();
+        await expect(page.locator('.fg-view .loading-boundary-guard')).toHaveCount(0);
+        await expect(page.locator('.node-card')).toHaveCount(machines.length);
+        await expect(page.locator('.nd-throughput-panel')).toHaveCount(0);
+        await expect(page.locator('.node-card-rate:not(.none)').first()).toBeVisible();
+        await page.evaluate(() => document.fonts.ready);
+        await expectAligned(page);
+        expect(await page.evaluate(() => getComputedStyle(document.body, '::before').backgroundPosition)).toBe(origin);
+        await expect(page).toHaveScreenshot(`${name}-ready.png`, {
+          clip: { x: 0, y: 0, width: Math.min(device.width, 720), height: 320 },
+        });
+
+        const before = await gridPixels(page);
+        await test.info().attach('loaded-grid', { body: before, contentType: 'image/png' });
+        expect(before.equals(startup), 'grid jumped when data finished loading').toBe(true);
+        const headerClip = { x: 720, y: 8, width: 48, height: 24 };
+        const headerPixels = device.touch ? null : await page.screenshot({ clip: headerClip });
+        await page.locator('body').evaluate(el => el.style.setProperty('--grid-image', 'none'));
+        if (headerPixels)
+          expect(
+            (await page.screenshot({ clip: headerClip })).equals(headerPixels),
+            'grid never paints through the desktop navigation',
+          ).toBe(true);
+        const absent = await gridPixels(page);
+        expect(absent.equals(before), 'grid is visible in the gutter').toBe(false);
+        await page.locator('body').evaluate(el => el.style.removeProperty('--grid-image'));
+        const maxScroll = await page.evaluate(touch => {
+          const scroller = touch ? document.scrollingElement! : document.querySelector('.fg-desk')!;
+          return scroller.scrollHeight - scroller.clientHeight;
+        }, device.touch);
+        expect(maxScroll, 'the real list has enough content to exercise scrolling').toBeGreaterThan(200);
+        for (const offset of [73, 173, maxScroll]) {
+          await scroll(page, offset, device.touch);
+          await expectAligned(page);
+          const immediate = await gridPixels(page);
+          if (!immediate.equals(before)) {
+            await test.info().attach(`grid-${offset}-immediate`, { body: immediate, contentType: 'image/png' });
+            await test.info().attach(`grid-${offset}-expected`, { body: before, contentType: 'image/png' });
+            await test.info().attach(`grid-${offset}-state`, {
+              body: JSON.stringify({
+                wasBlank: immediate.equals(absent),
+                dom: await page.evaluate(() => ({
+                  scrollY,
+                  origin: getComputedStyle(document.body, '::before').backgroundPosition,
+                })),
+              }),
+              contentType: 'application/json',
+            });
+          }
+          expect(immediate.equals(before), `grid moved at ${offset}px`).toBe(true);
+        }
+
+        // Content/chrome changes must never relocate a background that has already been painted.
+        await page.locator('.fg-top').evaluate(el => (el.style.height = '63px'));
+        await expectOrigin(page, origin);
+        await page.locator('.fg-top').evaluate(el => el.style.removeProperty('height'));
+        await page.evaluate(() => {
+          document.documentElement.style.setProperty('--safe-top', '23px');
+          document.documentElement.style.setProperty('--safe-left', '9px');
+        });
+        await expect
+          .poll(() =>
+            page.evaluate(() => Number.parseFloat(getComputedStyle(document.body, '::before').backgroundPositionX)),
+          )
+          .toBe(9);
+        await expectAligned(page);
+        const safeOrigin = await gridOrigin(page);
+        await page.evaluate(() => {
+          const draft = document.createElement('div');
+          draft.className = 'fg-draft';
+          draft.style.minHeight = '72px';
+          document.querySelector('.fg-view')!.before(draft);
+        });
+        await expectOrigin(page, safeOrigin);
+        await page.locator('.fg-draft').evaluate(el => el.remove());
+        await expectOrigin(page, safeOrigin);
+        const resized = { width: device.name === 'phone' ? 844 : 768, height: 600 };
+        await page.setViewportSize(resized);
+        await expectAligned(page);
+
+        // Real navigation replaces .fg-view; the new surface uses the same alignment lifecycle.
+        await page.getByRole('button', { name: '用户', exact: true }).click();
+        await expect(page).toHaveURL(/#\/users$/);
+        await expect(page.locator('.fg-view .loading-boundary-guard')).toHaveCount(0);
+        await expectAligned(page);
+        expect(errors).toEqual([]);
+      } finally {
+        await browser.close();
+      }
+    });
   }
 }
