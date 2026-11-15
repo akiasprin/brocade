@@ -655,6 +655,73 @@ async fn ip_maintenance_receipts_reject_future_and_stale_control_and_history_is_
 }
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn ip_maintenance_run_pages_keep_round_actions_and_evidence() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    let admin = system_admin();
+    db.store
+        .update_ip_maintenance(
+            &admin,
+            "n1",
+            UpdateIpMaintenance {
+                expected_generation: 0,
+                policy: IpMaintenancePolicy::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut round = receipt(1, 1);
+    round.phase = MaintenancePhase::Complete;
+    round.round_id = Some("charted-round".into());
+    round.actions_total = 2;
+    round.action_index = 2;
+    round.actions = vec![
+        MaintenanceAction {
+            index: 1,
+            kind: "google_search".into(),
+            host: "www.google.com".into(),
+            status: Some(200),
+            error: None,
+            response_bytes: 4096,
+        },
+        MaintenanceAction {
+            index: 2,
+            kind: "google_news".into(),
+            host: "news.google.com".into(),
+            status: None,
+            error: Some("network_timeout".into()),
+            response_bytes: 0,
+        },
+    ];
+    round.evidence = vec![MaintenanceEvidence {
+        source: "youtube_premium".into(),
+        country: Some("JP".into()),
+        status: Some(200),
+    }];
+    round.evidence_observed_at_unix_secs = Some(2_000_000_010);
+    db.store
+        .report_ip_maintenance("n1", round.clone())
+        .await
+        .unwrap();
+    let page = db
+        .store
+        .ip_maintenance_runs(&admin, "n1", None)
+        .await
+        .unwrap();
+    let detail = db
+        .store
+        .ip_maintenance_run(&admin, "n1", "charted-round")
+        .await
+        .unwrap();
+    assert_eq!(detail.actions, round.actions);
+    assert_eq!(detail.evidence, round.evidence);
+    assert_eq!(page.runs, vec![detail]);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn ip_maintenance_data_atomic_publication_and_offline_retention() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;

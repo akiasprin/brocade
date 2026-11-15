@@ -23,6 +23,7 @@ let viewGate: Promise<void> | null;
 let resetAcknowledged: boolean;
 let reads: number;
 let missingRoundReads: number;
+let detailReads: number;
 const node = () =>
   ({
     node_id: 'n1',
@@ -47,6 +48,7 @@ beforeEach(() => {
   resetAcknowledged = true;
   reads = 0;
   missingRoundReads = 0;
+  detailReads = 0;
   client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity }, mutations: { retry: false } },
   });
@@ -82,6 +84,7 @@ beforeEach(() => {
         return Response.json({ runs: history, next_cursor: null });
       }
       if (path.startsWith('/nodes/n1/ip-maintenance/runs/')) {
+        detailReads++;
         if (!history.length) {
           missingRoundReads++;
           return Response.json({ error: '养护轮次不存在' }, { status: 404 });
@@ -669,6 +672,54 @@ it('keeps a real missing-round error visible when the session has not changed', 
   const detail = await screen.findByRole('dialog', { name: '养护轮次' });
   await within(detail).findByText('养护轮次不存在');
   expect(missingRoundReads).toBe(1);
+});
+
+it('refreshes an open active round without event hints and stops polling after completion', async () => {
+  history = [structuredClone(view.report!)];
+  history[0].actions[0].status = null;
+  vi.useFakeTimers();
+  try {
+    mount();
+    await act(() => vi.advanceTimersByTimeAsync(10));
+    fireEvent.click(screen.getByRole('button', { name: '记录' }));
+    await act(() => vi.advanceTimersByTimeAsync(10));
+    const recordsSheet = screen.getByRole('dialog', { name: '养护记录' });
+    fireEvent.click(within(recordsSheet).getByRole('button', { name: /Google.*进行中/ }));
+    await act(() => vi.advanceTimersByTimeAsync(10));
+    const detail = screen.getByRole('dialog', { name: '养护轮次' });
+    expect(within(detail).getByText('结果待确认')).toBeTruthy();
+    expect(detailReads).toBe(1);
+    history[0].phase = 'dwelling';
+    history[0].sequence++;
+    history[0].actions[0].status = 200;
+    history[0].actions[0].response_bytes = 4096;
+    await act(() => vi.advanceTimersByTimeAsync(15_000));
+    expect(within(detail).getByText('200 · 4 KB')).toBeTruthy();
+    expect(detailReads).toBe(2);
+    history[0].phase = 'complete';
+    history[0].sequence++;
+    await act(() => vi.advanceTimersByTimeAsync(15_000));
+    expect(detail.querySelector('.care-round-result')?.textContent).toMatch(/^用时 /);
+    expect(detailReads).toBe(3);
+    await act(() => vi.advanceTimersByTimeAsync(30_000));
+    expect(detailReads).toBe(3);
+    expect(commands).toEqual([]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('shows an exhausted budget as paused in history and round details', async () => {
+  history[0].phase = 'budget_wait';
+  history[0].reason = 'daily_budget';
+  mount();
+  const recordsSheet = await records();
+  expect(within(recordsSheet).queryByText('进行中')).toBeNull();
+  fireEvent.click(within(recordsSheet).getByRole('button', { name: /Google.*今日额度已用完/ }));
+  const detail = await screen.findByRole('dialog', { name: '养护轮次' });
+  await within(detail).findByText(/^今日额度已用完 · 用时 /);
+  expect(within(detail).queryByText(/进行中/)).toBeNull();
+  expect(commands).toEqual([]);
 });
 
 it('starts automatic maintenance after a reset and keeps it on before the first round begins', async () => {

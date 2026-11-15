@@ -257,6 +257,21 @@ for (const [width, theme] of [
   [1440, 'light'],
   [390, 'dark'],
 ] as const) {
+  test(`exhausted budget stays paused in history and details ${width} ${theme}`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 1000 });
+    const card = await open(page, `scene=budget&theme=${theme}`);
+    await card.getByRole('button', { name: '记录', exact: true }).click();
+    const records = page.getByRole('dialog', { name: '养护记录' });
+    const row = records.getByRole('button', { name: /Google.*今日额度已用完/ });
+    await expect(row).toBeVisible();
+    await expect(records.getByText('进行中', { exact: true })).toHaveCount(0);
+    await expect(records.locator('.care-all')).toHaveScreenshot(`budget-records-${width}-${theme}.png`);
+    await row.click();
+    const round = page.getByRole('dialog', { name: '养护轮次' });
+    await expect(round.locator('.care-round-result')).toContainText('今日额度已用完');
+    await expect(round.locator('.care-sheet')).toHaveScreenshot(`budget-detail-${width}-${theme}.png`);
+  });
+
   test(`IPv6 sites without addresses are neutral skips ${width} ${theme}`, async ({ page }) => {
     await page.setViewportSize({ width, height: 1000 });
     const card = await open(page, `scene=partial&issues=ipv6&theme=${theme}`);

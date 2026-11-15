@@ -152,7 +152,11 @@ if (['legacy', 'initial-legacy'].includes(params.get('scene') ?? '')) {
   view.report = null;
   view.received_at_unix_secs = null;
 }
-if (params.get('scene') === 'budget') view.report!.phase = 'budget_wait';
+if (params.get('scene') === 'budget') {
+  view.report!.phase = 'budget_wait';
+  view.report!.reason = 'daily_budget';
+  runs.unshift(structuredClone(view.report!));
+}
 if (params.get('scene') === 'cooldown') {
   view.report!.phase = 'cooldown';
   view.report!.cooldown_until_unix_secs = Math.floor(Date.now() / 1000) + 3600;

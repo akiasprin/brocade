@@ -130,6 +130,7 @@ export function roundResult(run: IpMaintenanceReport): { tone: Tone; text: strin
   if (run.phase === 'complete' || run.phase === 'failed') return { tone: 'idle', text: '' };
   if (run.phase === 'cooldown')
     return { tone: 'warn', text: run.reason === 'service_restricted' ? '限流暂停' : `冷却：${reason ?? '服务异常'}` };
+  if (run.phase === 'budget_wait') return { tone: 'wait', text: '今日额度已用完' };
   if (run.phase === 'interrupted') return { tone: 'off', text: `中断 · ${reason ?? '原因未知'}` };
   if (run.phase === 'blocked_egress') return { tone: 'err', text: reason ?? '出口不可用' };
   return { tone: 'run', text: '进行中' };

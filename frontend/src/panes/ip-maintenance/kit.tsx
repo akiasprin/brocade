@@ -548,6 +548,8 @@ export function RoundSheet({ run: initial, onClose }: { run: IpMaintenanceReport
       }
     },
     enabled: !!initial.round_id,
+    // Event hints normally refresh this query; polling covers a disconnected event stream.
+    refetchInterval: query => (ACTIVE.includes((query.state.data ?? initial).phase) ? 15_000 : false),
   });
   const run = detail.data ?? initial;
   const result = roundResult(run);

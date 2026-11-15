@@ -155,6 +155,10 @@ async fn ip_maintenance_http_negotiates_auth_and_invalidates_committed_reports()
     round["round_id"] = json!("public-round");
     round["module"] = json!("google");
     round["actual_exit_ip"] = json!("1.1.1.1");
+    round["actions_total"] = json!(1);
+    round["action_index"] = json!(1);
+    round["actions"] = json!([{"index":1,"kind":"local_site","host":"www.mhlw.go.jp","status":200,"error":null,"response_bytes":2048}]);
+    round["evidence"] = json!([{"source":"google_jump","country":"JP","status":200}]);
     db.store
         .report_ip_maintenance("n1", serde_json::from_value(round).unwrap())
         .await
@@ -167,11 +171,15 @@ async fn ip_maintenance_http_negotiates_auth_and_invalidates_committed_reports()
     ] {
         let (status, body) = get_json_without_credentials(&app, route).await;
         assert_eq!(status, StatusCode::OK, "{route}: {body}");
+        let text = body.to_string();
         assert!(
-            !body.to_string().contains("1.1.1.1"),
+            !text.contains("1.1.1.1") && !text.contains("www.mhlw.go.jp"),
             "addresses must be masked: {route}"
         );
     }
+    let (_, history) = get_json_without_credentials(&app, "/nodes/n1/ip-maintenance/runs").await;
+    assert_eq!(history["runs"][0]["actions"][0]["status"], 200);
+    assert_eq!(history["runs"][0]["evidence"][0]["country"], "JP");
     for (method, route) in [
         (Method::PUT, path),
         (Method::POST, "/nodes/n1/ip-maintenance/run"),

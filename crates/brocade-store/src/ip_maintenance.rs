@@ -519,9 +519,8 @@ impl PgStore {
         let mut runs = Vec::new();
         let mut next_cursor = None;
         for row in rows.into_iter().take(20) {
-            let mut report: IpMaintenanceReport = serde_json::from_value(row.try_get("report")?)?;
-            report.actions.clear();
-            report.evidence.clear();
+            // The record sheet derives its chart and region flags from these pages.
+            let report: IpMaintenanceReport = serde_json::from_value(row.try_get("report")?)?;
             if more {
                 next_cursor = Some(
                     u64::try_from(row.try_get::<i64, _>("id")?)
