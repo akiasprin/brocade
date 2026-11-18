@@ -42,6 +42,19 @@ pub(super) fn clear(directory: &Path) -> Result<(), String> {
     Ok(())
 }
 impl Session {
+    pub fn for_service(
+        &self,
+        directory: &Path,
+        service: &str,
+        idle_days: u32,
+    ) -> Result<Self, String> {
+        let identity = self
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or("cookie_identity")?;
+        Self::open(directory, &format!("{identity}|{service}"), idle_days)
+    }
     pub fn open(directory: &Path, identity: &str, idle_days: u32) -> Result<Self, String> {
         let folder = directory.join("cookies");
         fs::create_dir_all(&folder).map_err(|_| "cookie_directory")?;

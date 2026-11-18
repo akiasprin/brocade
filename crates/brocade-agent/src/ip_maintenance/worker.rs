@@ -1,3 +1,4 @@
+mod gemini;
 mod google;
 
 use super::{
@@ -80,8 +81,18 @@ fn consent_cookie_header(url: &Url, jar: &CookieStoreMutex) -> Result<Option<Hea
 async fn fetch(
     context: &Context,
     policy: &IpMaintenancePolicy,
+    url: Url,
+    options: FetchOptions<'_>,
+) -> Result<Page, String> {
+    fetch_request(context, policy, url, options, None).await
+}
+
+async fn fetch_request(
+    context: &Context,
+    policy: &IpMaintenancePolicy,
     mut url: Url,
     options: FetchOptions<'_>,
+    form_body: Option<&str>,
 ) -> Result<Page, String> {
     let FetchOptions {
         ua,
@@ -106,7 +117,15 @@ async fn fetch(
                 )
                 .await?;
                 context.reserve_request(policy)?;
-                let mut request = client.get(url.clone());
+                let mut request = if let Some(body) = form_body {
+                    client
+                        .post(url.clone())
+                        .form(&[("f.req", body)])
+                        .header("origin", "https://gemini.google.com")
+                        .header("x-same-domain", "1")
+                } else {
+                    client.get(url.clone())
+                };
                 if youtube_probe {
                     for (name, value) in crate::http::public_diagnostic_headers() {
                         request = request.header(name, value);
@@ -202,6 +221,11 @@ async fn fetch(
                     return Err("verification_required".into());
                 }
                 if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                    // A location submission is restricted to its original endpoint.
+                    // Never replay it or follow its cookies to another origin.
+                    if form_body.is_some() {
+                        return Err("gemini_location_redirect".into());
+                    }
                     let target = headers
                         .get(LOCATION)
                         .and_then(|v| v.to_str().ok())
@@ -269,6 +293,10 @@ where
                     | "no_ipv6_address"
                     | "verification_required"
                     | "article_redirect_unresolved"
+                    | "gemini_location_unconfirmed"
+                    | "gemini_location_response_invalid"
+                    | "gemini_location_redirect"
+                    | "gemini_location_invalid_coordinates"
             ),
         };
         if !retryable || attempt == 3 {
@@ -319,21 +347,49 @@ async fn execute_actions(
         })?;
         context.emit(MaintenancePhase::Requesting, None, None)?;
         let before = context.locked()?.daily_bytes;
+        let isolated = match action.request {
+            behavior::ActionRequest::GeminiLocation { .. } => Some(session.for_service(
+                &context.directory,
+                "gemini",
+                p.behavior.cookie_idle_days,
+            )?),
+            behavior::ActionRequest::Get => None,
+        };
+        let session = isolated.as_ref().unwrap_or(session);
         let page = retry_request(|| async {
-            let result = fetch(
-                context,
-                p,
-                action.url.clone(),
-                FetchOptions {
-                    ua,
-                    jar: Arc::clone(&session.jar),
-                    referer: referer.as_deref(),
-                    module,
-                    timeout_secs: p.behavior.request_timeout_secs,
-                    youtube_probe: false,
-                },
-            )
-            .await
+            let result = match action.request {
+                behavior::ActionRequest::GeminiLocation {
+                    latitude,
+                    longitude,
+                } => {
+                    gemini::update(
+                        context,
+                        p,
+                        ua,
+                        Arc::clone(&session.jar),
+                        &action.url,
+                        latitude,
+                        longitude,
+                    )
+                    .await
+                }
+                behavior::ActionRequest::Get => {
+                    fetch(
+                        context,
+                        p,
+                        action.url.clone(),
+                        FetchOptions {
+                            ua,
+                            jar: Arc::clone(&session.jar),
+                            referer: referer.as_deref(),
+                            module,
+                            timeout_secs: p.behavior.request_timeout_secs,
+                            youtube_probe: false,
+                        },
+                    )
+                    .await
+                }
+            }
             .and_then(|page| validate_action_page(&action, &page).map(|()| page));
             session.save()?;
             result
@@ -512,7 +568,7 @@ async fn execute(context: Arc<Context>, desired: IpMaintenanceDesired) -> Result
         longitude,
     };
     execute_actions(&context, p, module, ua, &session, total, |index, random| {
-        behavior::action(module, &device, index + 1 == total, random)
+        behavior::scheduled_action(module, &device, index, total, random)
     })
     .await?;
     if module == MaintenanceModule::Google {
@@ -969,6 +1025,7 @@ mod tests {
             kind: "local_site",
             url: Url::parse("https://www.amazon.de/").unwrap(),
             dwell_secs: 0,
+            request: behavior::ActionRequest::Get,
         };
         let mut page = Page {
             status: 202,
@@ -994,6 +1051,7 @@ mod tests {
             kind: "platform_page",
             url: Url::parse("https://connectivitycheck.gstatic.com/generate_204").unwrap(),
             dwell_secs: 0,
+            request: behavior::ActionRequest::Get,
         };
         page.url = probe.url.clone();
         page.status = 204;

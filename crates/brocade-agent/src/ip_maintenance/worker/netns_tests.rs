@@ -214,6 +214,321 @@ async fn ip_maintenance_real_http_source_cookie_redirect_gzip_and_cancellation()
     missing_family_addresses_are_skipped_without_fallback().await;
     javascript_prompt_is_an_ordinary_success().await;
     probe_requests_retry_twice_and_respect_rate_limits().await;
+    gemini_location_isolated_dual_stack_requests().await;
+    gemini_location_transport_boundaries().await;
+}
+
+async fn request_body(stream: &mut tokio::net::TcpStream, head: &str) -> String {
+    let length = head
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().parse::<usize>().unwrap())
+        })
+        .unwrap();
+    assert!(length < 16384);
+    let mut body = vec![0; length];
+    stream.read_exact(&mut body).await.unwrap();
+    String::from_utf8(body).unwrap()
+}
+
+async fn gemini_location_isolated_dual_stack_requests() {
+    use base64::Engine as _;
+    for failed_family in [MaintenanceFamily::V4, MaintenanceFamily::V6] {
+        let (root, _directory) = context();
+        let mut desired = IpMaintenanceDesired {
+            generation: 1,
+            ..Default::default()
+        };
+        desired.policy.family = MaintenanceFamily::Dual;
+        desired.policy.source_ip = Some("11.0.0.1".parse().unwrap());
+        desired.policy.source_ipv6 = Some("2001:470:ffff:abcd::1".parse().unwrap());
+        root.apply(&desired).unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut jobs = Vec::new();
+        for (family, target, latitude, longitude) in [
+            (MaintenanceFamily::V4, "11.0.0.2", 35.681236, 139.767125),
+            (
+                MaintenanceFamily::V6,
+                "2001:470:ffff:abcd::2",
+                -33.8688,
+                151.2093,
+            ),
+        ] {
+            let context = root.for_family(family);
+            context
+                .begin_round(&desired, MaintenanceModule::Google, 2)
+                .unwrap();
+            let policy = desired.policy.for_family(family).unwrap();
+            let source = policy.source_ip.unwrap();
+            let listener = TcpListener::bind((target.parse::<IpAddr>().unwrap(), 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let origin = format!("http://gemini.google.com:{port}");
+            let accepted = family != failed_family;
+            let barrier = Arc::clone(&barrier);
+            let marker = format!("family={family:?}");
+            let expected_marker = marker.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, peer) = listener.accept().await.unwrap();
+                assert_eq!(peer.ip(), source);
+                let head = headers(&mut stream).await;
+                assert!(head.starts_with("POST /_/BardChatUi/data/batchexecute?"));
+                assert!(head
+                    .to_ascii_lowercase()
+                    .contains("application/x-www-form-urlencoded"));
+                let cookies = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("cookie: "))
+                    .unwrap();
+                assert!(cookies.contains(&expected_marker));
+                assert!(!cookies.contains("activity="));
+                let value = cookies
+                    .split(';')
+                    .map(str::trim)
+                    .find_map(|c| c.strip_prefix("UULE=j+"))
+                    .unwrap();
+                let location: serde_json::Value = serde_json::from_slice(
+                    &base64::engine::general_purpose::STANDARD
+                        .decode(value)
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    location[4],
+                    serde_json::json!([
+                        (latitude * 1e7_f64).round() as i32,
+                        (longitude * 1e7_f64).round() as i32
+                    ])
+                );
+                let body = request_body(&mut stream, &head).await;
+                let mut form = Url::parse("http://fixture/").unwrap();
+                form.set_query(Some(&body));
+                let encoded = form
+                    .query_pairs()
+                    .find(|(key, _)| key == "f.req")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                let rpc: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                assert_eq!(rpc[0][0][0], "K4WWud");
+                barrier.wait().await; // Both families must reach the server before either returns.
+                let source = if accepted {
+                    "SWML_DESCRIPTION_FROM_YOUR_DEVICE"
+                } else {
+                    "SWML_DESCRIPTION_FROM_YOUR_INTERNET_ADDRESS"
+                };
+                let payload = serde_json::json!([["fixture city", source, accepted]]).to_string();
+                let reply = format!(
+                    ")]}}'\n\n{}\n",
+                    serde_json::json!([["wrb.fr", "K4WWud", payload, null, null, null, "generic"]])
+                );
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes()).await.unwrap();
+                drop(stream);
+                let (mut stream, peer) = listener.accept().await.unwrap();
+                assert_eq!(peer.ip(), source_ip_for_fixture(family));
+                let head = headers(&mut stream).await;
+                assert!(head.starts_with("GET /available "));
+                assert!(!head.contains("UULE=") && !head.contains("family="));
+                assert!(head.contains("activity="));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            });
+            jobs.push(tokio::spawn(async move {
+                let session =
+                    Session::open(&context.directory, &format!("gemini-{family:?}"), 14).unwrap();
+                session
+                    .jar
+                    .lock()
+                    .unwrap()
+                    .parse(
+                        &format!("activity={family:?}; Path=/"),
+                        &Url::parse(&format!("http://www.google.com:{port}/")).unwrap(),
+                    )
+                    .unwrap();
+                let service_session = session
+                    .for_service(&context.directory, "gemini", 14)
+                    .unwrap();
+                service_session
+                    .jar
+                    .lock()
+                    .unwrap()
+                    .parse(&format!("{marker}; Path=/"), &Url::parse(&origin).unwrap())
+                    .unwrap();
+                service_session.save().unwrap();
+                execute_actions(
+                    &context,
+                    &policy,
+                    MaintenanceModule::Google,
+                    "fixture-device",
+                    &session,
+                    2,
+                    |index, _| {
+                        Ok(behavior::Action {
+                            kind: if index == 0 {
+                                "gemini_location"
+                            } else {
+                                "google_search"
+                            },
+                            url: Url::parse(&if index == 0 {
+                                format!("{origin}/_/BardChatUi/data/batchexecute?rpcids=K4WWud")
+                            } else {
+                                format!("http://www.google.com:{port}/available")
+                            })
+                            .unwrap(),
+                            dwell_secs: 0,
+                            request: if index == 0 {
+                                behavior::ActionRequest::GeminiLocation {
+                                    latitude,
+                                    longitude,
+                                }
+                            } else {
+                                behavior::ActionRequest::Get
+                            },
+                        })
+                    },
+                )
+                .await
+                .unwrap();
+                server.await.unwrap();
+                let state = context.locked().unwrap();
+                let actions = &state.current.as_ref().unwrap().actions;
+                assert_eq!(actions.len(), 2);
+                assert_eq!(actions[0].status, accepted.then_some(200));
+                assert_eq!(
+                    actions[0].error.as_deref(),
+                    (!accepted).then_some("gemini_location_unconfirmed")
+                );
+                assert_eq!(actions[1].status, Some(200));
+                assert!(actions[1].error.is_none());
+            }));
+        }
+        for job in jobs {
+            tokio::time::timeout(Duration::from_secs(10), job)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            root.locked().unwrap().daily_requests,
+            4,
+            "unconfirmed locations must not retry, and both families share the budget"
+        );
+    }
+}
+
+fn source_ip_for_fixture(family: MaintenanceFamily) -> IpAddr {
+    match family {
+        MaintenanceFamily::V4 => "11.0.0.1".parse().unwrap(),
+        MaintenanceFamily::V6 => "2001:470:ffff:abcd::1".parse().unwrap(),
+        MaintenanceFamily::Dual => panic!("fixture must select one family"),
+    }
+}
+
+async fn gemini_location_transport_boundaries() {
+    for (family, target) in [
+        (MaintenanceFamily::V4, "11.0.0.2"),
+        (MaintenanceFamily::V6, "2001:470:ffff:abcd::2"),
+    ] {
+        let policy = IpMaintenancePolicy {
+            family,
+            source_ip: Some(source_ip_for_fixture(family)),
+            ..Default::default()
+        };
+        for scenario in ["redirect", "rate-limit", "cancel", "budget"] {
+            let (context, _directory) = context();
+            let listener = TcpListener::bind((target.parse::<IpAddr>().unwrap(), 0))
+                .await
+                .unwrap();
+            let url = Url::parse(&format!(
+                "http://gemini.google.com:{}/_/BardChatUi/data/batchexecute?rpcids=K4WWud",
+                listener.local_addr().unwrap().port()
+            ))
+            .unwrap();
+            if scenario == "budget" {
+                context
+                    .mutate(|state| {
+                        state.day = now()?.div_euclid(86400);
+                        state.daily_requests = policy.daily_requests;
+                        Ok(())
+                    })
+                    .unwrap();
+                let result = gemini::update(
+                    &context,
+                    &policy,
+                    "fixture",
+                    Arc::new(CookieStoreMutex::default()),
+                    &url,
+                    35.68,
+                    139.76,
+                )
+                .await;
+                assert!(matches!(result,Err(ref error) if error=="daily_budget"));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+                continue;
+            }
+            let (accepted, ready) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, peer) = listener.accept().await.unwrap();
+                assert_eq!(peer.ip(), source_ip_for_fixture(family));
+                let head = headers(&mut stream).await;
+                request_body(&mut stream, &head).await;
+                accepted.send(()).unwrap();
+                if scenario == "cancel" {
+                    let mut byte = [0];
+                    assert_eq!(
+                        tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        0
+                    );
+                } else {
+                    let reply = if scenario == "redirect" {
+                        "HTTP/1.1 302 Found\r\nLocation: http://www.google.com/should-not-follow\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7200\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    stream.write_all(reply.as_bytes()).await.unwrap();
+                }
+            });
+            {
+                let request = gemini::update(
+                    &context,
+                    &policy,
+                    "fixture",
+                    Arc::new(CookieStoreMutex::default()),
+                    &url,
+                    35.68,
+                    139.76,
+                );
+                tokio::pin!(request);
+                if scenario == "cancel" {
+                    tokio::select! {result=&mut request=>panic!("unexpected completion: {}",result.is_ok()),_=ready=>{}}
+                } else {
+                    let result = request.await;
+                    assert!(
+                        matches!(result,Err(ref error) if error==if scenario=="redirect" {"gemini_location_redirect"} else {"service_restricted"})
+                    );
+                }
+            }
+            server.await.unwrap();
+            assert_eq!(context.locked().unwrap().daily_requests, 1);
+            if scenario == "rate-limit" {
+                assert!(context.locked().unwrap().cooldown_until >= now().unwrap() + 7190);
+            }
+        }
+    }
 }
 
 async fn missing_family_addresses_are_skipped_without_fallback() {
@@ -289,6 +604,7 @@ async fn missing_family_addresses_are_skipped_without_fallback() {
                         })
                         .unwrap(),
                         dwell_secs: 0,
+                        request: behavior::ActionRequest::Get,
                     })
                 },
             )
@@ -359,6 +675,7 @@ async fn javascript_prompt_is_an_ordinary_success() {
                 ))
                 .unwrap(),
                 dwell_secs: 0,
+                request: behavior::ActionRequest::Get,
             })
         },
     )
@@ -514,6 +831,7 @@ async fn shared_youtube_headers_and_local_consent_failures(
                 ))
                 .unwrap(),
                 dwell_secs: 0,
+                request: behavior::ActionRequest::Get,
             })
         },
     )
@@ -599,6 +917,7 @@ async fn bounded_pages_retry_and_continue_to_the_next_action() {
                     kind: "local_site",
                     url: Url::parse(&format!("http://{address}/{index}")).unwrap(),
                     dwell_secs: 0,
+                    request: behavior::ActionRequest::Get,
                 })
             },
         )
@@ -697,6 +1016,7 @@ async fn dual_stack_real_requests_are_parallel_and_fail_independently() {
                     kind: "local_site",
                     url: Url::parse(&format!("http://{address}/")).unwrap(),
                     dwell_secs: 0,
+                    request: behavior::ActionRequest::Get,
                 })
             },
         )

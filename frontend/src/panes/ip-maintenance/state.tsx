@@ -26,6 +26,7 @@ export const ACTION_NAME: Record<string, string> = {
   google_search: 'Google 搜索',
   google_news: 'Google 新闻',
   google_maps: 'Google 地图',
+  gemini_location: 'Gemini 定位更新',
   platform_page: 'Google 生态页',
   local_site: '地区站点',
 };
@@ -54,6 +55,10 @@ export const REASON: Record<string, string> = {
   empty_response: '网站未返回页面内容',
   unexpected_response_status: '网站响应状态不完整',
   all_actions_failed: '本轮没有成功动作',
+  gemini_location_unconfirmed: 'Gemini 未确认设备位置',
+  gemini_location_response_invalid: 'Gemini 位置响应无法识别',
+  gemini_location_redirect: 'Gemini 定位接口发生跳转，已跳过',
+  gemini_location_invalid_coordinates: '养护目标坐标无效',
   stop_requested: '手动停止',
   agent_stopping: 'Agent 退出',
   worker_recovering: '执行器恢复中',

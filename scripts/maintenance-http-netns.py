@@ -34,8 +34,8 @@ elif len(sys.argv) == 3 and sys.argv[1] == '--inside':
         '::1 localhost mixed.maintenance.test\n'
         '11.0.0.2 dualstack.maintenance.test mixed.maintenance.test opposite-family.maintenance.test\n'
         '2001:470:ffff:abcd::2 dualstack.maintenance.test mixed.maintenance.test ipv6-only.maintenance.test\n'
-        '11.0.0.2 www.youtube.com music.youtube.com www.google.com\n'
-        '2001:470:ffff:abcd::2 www.youtube.com music.youtube.com www.google.com\n'
+        '11.0.0.2 www.youtube.com music.youtube.com www.google.com gemini.google.com\n'
+        '2001:470:ffff:abcd::2 www.youtube.com music.youtube.com www.google.com gemini.google.com\n'
     )
     subprocess.run(['mount', '--bind', str(hosts_file), '/etc/hosts'], check=True)
     for command in [

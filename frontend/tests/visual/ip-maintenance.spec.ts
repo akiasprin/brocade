@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect, type Locator, type Page } from '@playwright/test';
 
 test.use({ screenshot: 'only-on-failure' });
@@ -11,7 +12,7 @@ async function open(page: Page, query = '') {
   const card = page.locator('.care-config');
   await expect(card).toHaveAttribute('aria-busy', 'false');
   await card.scrollIntoViewIfNeeded();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   return card;
 }
 
@@ -46,6 +47,27 @@ async function fits(page: Page, card: Locator) {
 
 for (const browserName of ['chromium', 'webkit'] as const) {
   const browserTest = test.extend({ browserName });
+  for (const [width, theme] of [
+    [1440, 'light'],
+    [390, 'dark'],
+  ] as const) {
+    browserTest(`Gemini location records ${browserName} ${width} ${theme}`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 1000 });
+      const card = await open(page, `theme=${theme}&scene=partial&issues=gemini`);
+      await card.getByRole('button', { name: '记录', exact: true }).click();
+      const records = page.getByRole('dialog', { name: '养护记录' });
+      await records.locator('.care-rounds button').first().click();
+      const round = page.getByRole('dialog', { name: '养护轮次' });
+      await expect(round.locator('.care-step-name').filter({ hasText: 'Gemini 定位更新' })).toHaveCount(2);
+      await expect(round.getByText('Gemini 未确认设备位置', { exact: true })).toBeVisible();
+      await expect(round.locator('.care-sheet-evidence .care-evidence li')).toHaveCount(3);
+      for (const row of await round.locator('.care-steps li').all()) {
+        expect(await row.evaluate(element => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
+      }
+      expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBeLessThanOrEqual(1);
+      await expect(round).toHaveScreenshot(`gemini-location-${browserName}-${width}-${theme}.png`);
+    });
+  }
   for (const [width, theme] of [
     [1440, 'light'],
     [1000, 'dark'],

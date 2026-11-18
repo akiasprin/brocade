@@ -66,10 +66,16 @@ pub(super) fn weighted(weights: &[u8], roll: u32) -> usize {
     }
     weights.len() - 1
 }
+#[derive(Clone, Copy)]
+pub(super) enum ActionRequest {
+    Get,
+    GeminiLocation { latitude: f64, longitude: f64 },
+}
 pub(super) struct Action {
     pub kind: &'static str,
     pub url: Url,
     pub dwell_secs: u32,
+    pub request: ActionRequest,
 }
 pub(super) struct DeviceSession<'a> {
     pub region: &'a MaintenanceRegion,
@@ -77,6 +83,30 @@ pub(super) struct DeviceSession<'a> {
     pub device: &'a str,
     pub latitude: f64,
     pub longitude: f64,
+}
+pub(super) fn scheduled_action(
+    module: MaintenanceModule,
+    session: &DeviceSession<'_>,
+    index: u32,
+    total: u32,
+    random: &mut Random,
+) -> Result<Action, String> {
+    if index >= total {
+        return Err("invalid_action_index".into());
+    }
+    if module == MaintenanceModule::Google && index == 0 {
+        return Ok(Action {
+            kind: "gemini_location",
+            url: Url::parse("https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=K4WWud&source-path=%2Fapp&hl=en&rt=c")
+                .map_err(|_| "static_url")?,
+            dwell_secs: 0,
+            request: ActionRequest::GeminiLocation {
+                latitude: session.latitude,
+                longitude: session.longitude,
+            },
+        });
+    }
+    action(module, session, index + 1 == total, random)
 }
 pub(super) fn action(
     module: MaintenanceModule,
@@ -194,6 +224,7 @@ pub(super) fn action(
         kind,
         url,
         dwell_secs,
+        request: ActionRequest::Get,
     })
 }
 
@@ -205,6 +236,51 @@ pub(super) fn is_news_redirect(url: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_round_reserves_one_existing_slot_for_gemini_and_trust_never_submits_location() {
+        let region = brocade_deployment::ip_maintenance::data::region("JP/Default/Tokyo").unwrap();
+        let behavior = MaintenanceBehavior::default();
+        let session = DeviceSession {
+            region,
+            behavior: &behavior,
+            device: "linux",
+            latitude: 35.681236,
+            longitude: 139.767125,
+        };
+        for total in [1, 5, 20] {
+            let planned = (0..total)
+                .map(|index| {
+                    scheduled_action(
+                        MaintenanceModule::Google,
+                        &session,
+                        index,
+                        total,
+                        &mut Random,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(planned.len(), total as usize);
+            assert_eq!(planned[0].kind, "gemini_location");
+            assert_eq!(planned[0].url.host_str(), Some("gemini.google.com"));
+            assert_eq!(planned[0].dwell_secs, 0);
+            assert!(
+                matches!(planned[0].request, ActionRequest::GeminiLocation { latitude, longitude } if latitude == session.latitude && longitude == session.longitude)
+            );
+            assert!(planned[1..]
+                .iter()
+                .all(|a| matches!(a.request, ActionRequest::Get)));
+            assert_eq!(planned.last().unwrap().dwell_secs, 0);
+        }
+        assert!(matches!(
+            scheduled_action(MaintenanceModule::Trust, &session, 0, 1, &mut Random)
+                .unwrap()
+                .request,
+            ActionRequest::Get
+        ));
+        assert!(scheduled_action(MaintenanceModule::Google, &session, 1, 1, &mut Random).is_err());
+    }
 
     #[test]
     fn regional_http_visits_use_direct_catalog_sites_instead_of_javascript_rss_hops() {

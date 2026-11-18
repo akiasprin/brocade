@@ -183,6 +183,24 @@ if (params.get('scene') === 'partial') {
       error: ['consent_required', 'javascript_required', 'empty_response', null][index],
     }));
   }
+  if (params.get('issues') === 'gemini') {
+    view.report.actions[0] = {
+      index: 1,
+      kind: 'gemini_location',
+      host: 'gemini.google.com',
+      status: 200,
+      error: null,
+      response_bytes: 479,
+    };
+    view.report.actions[1] = {
+      index: 2,
+      kind: 'gemini_location',
+      host: 'gemini.google.com',
+      status: null,
+      error: 'gemini_location_unconfirmed',
+      response_bytes: 451,
+    };
+  }
   if (params.get('issues') === 'ipv6') {
     view.desired.policy.family = 'v6';
     view.report.family = 'v6';

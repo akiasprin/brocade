@@ -775,6 +775,29 @@ it('keeps mixed action details without evaluating the round result', async () =>
   expect(document.querySelector('.care-rhythm-col[title*="Google 2"]')).toBeTruthy();
 });
 
+it.each([null, 'gemini_location_unconfirmed'] as const)(
+  'shows Gemini location updates separately from IP country evidence (%s)',
+  async error => {
+    view.report = maintenancePartialReport();
+    view.report.actions[0] = {
+      index: 1,
+      kind: 'gemini_location',
+      host: 'gemini.google.com',
+      status: error ? null : 200,
+      error,
+      response_bytes: 479,
+    };
+    history = [structuredClone(view.report)];
+    mount();
+    await records();
+    fireEvent.click(screen.getByRole('button', { name: /Google.*4 个动作/ }));
+    const sheet = await screen.findByRole('dialog', { name: '养护轮次' });
+    expect(within(sheet).getByText('Gemini 定位更新')).toBeTruthy();
+    if (error) await within(sheet).findByText('Gemini 未确认设备位置');
+    expect(within(sheet).queryByText('gemini_location')).toBeNull();
+  },
+);
+
 it('keeps the next schedule and request details when every action failed', async () => {
   view.report = maintenancePartialReport();
   view.report.phase = 'failed';
