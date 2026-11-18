@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const width of [390, 1440])
@@ -12,7 +13,7 @@ for (const width of [390, 1440])
       );
       const card = page.locator('.chain-card[data-order-id="jp-iij"]');
       await expect(card.getByText('2 处监听引用', { exact: true })).toBeVisible();
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       const metadata = card.locator('.chain-card-title > span');
       await expect(metadata).toHaveText('jp-iij | 2 处监听引用');
       const placement = await metadata.evaluate(element => {

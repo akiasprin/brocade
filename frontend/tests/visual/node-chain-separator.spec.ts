@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 for (const theme of ['dark', 'light']) {
@@ -56,7 +57,7 @@ for (const theme of ['dark', 'light']) {
       expect(separator.marginTop).toBe('12px');
       expect(separator.marginBottom).toBe('0px');
       expect(await card.evaluate(element => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await card.locator(':scope > .node-chain-use').last().scrollIntoViewIfNeeded();
       await page.mouse.move(0, 0);
       await expect(page).toHaveScreenshot(`chain-separator-${width}-${theme}.png`);

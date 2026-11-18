@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
 async function open(page: Page, width: number, theme: string, extra = '') {
   await page.setViewportSize({ width, height: 1000 });
@@ -9,7 +10,7 @@ async function open(page: Page, width: number, theme: string, extra = '') {
   await expect(
     page.locator('[data-rule-location$="/hk-akile"]').getByRole('button', { name: '＋ 加 AI 组合' }),
   ).toBeEnabled();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
 }
 for (const width of [390, 1440])
   for (const theme of ['light', 'dark']) {

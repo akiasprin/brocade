@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const [name, width, theme] of [
@@ -16,7 +17,7 @@ for (const [name, width, theme] of [
     await expect(card).toContainText('香港 01 @ FxT');
     await expect(card).toContainText('接入链 deleted');
     expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(card).toHaveScreenshot(`${name}-moved-chain.png`);
     await card.getByRole('button', { name: /alice ·/ }).click();
     const dialog = page.getByRole('dialog', { name: 'alice · 流入明细' });

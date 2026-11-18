@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect, type Page } from '@playwright/test';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
@@ -43,7 +44,7 @@ async function preview(page: Page, query = '') {
   await page.clock.setFixedTime(new Date('2026-10-23T12:00:00Z'));
   await page.goto(`/tests/fixtures/user-header-preview.html?user=alice${query}`);
   await expect(page.locator('.qta-cap').first()).toContainText('500 GiB');
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
 }
 
 for (const [name, width, theme] of [
@@ -257,7 +258,7 @@ for (const scene of ['all', 'normal', 'single', 'throttled', 'suspended', 'pendi
       );
       for (const label of labelColors)
         expect(textContrast(label.foreground, label.background), label.text ?? '').toBeGreaterThanOrEqual(4.5);
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(card).toHaveScreenshot(`quota-${scene}-${width}-${theme}-${role}.png`);
     });
   }

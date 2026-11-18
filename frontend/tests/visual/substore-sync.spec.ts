@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect, webkit, type Page } from '@playwright/test';
 test.use({ deviceScaleFactor: 2 });
 async function open(page: Page, scene: string, theme: string, width = 1440, height = 900) {
@@ -9,7 +10,7 @@ async function open(page: Page, scene: string, theme: string, width = 1440, heig
   await page.getByRole('button', { name: '订阅', exact: true }).click();
   const d = page.getByRole('dialog', { name: 'alice 的订阅与节点' });
   await expect(d.getByRole('button', { name: /切换到 Sub-Store 后端同步/ })).toBeVisible();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   await expect(d.locator('.sub-pass-stack')).toHaveClass(/substore-two-backs/);
   await expect(d).toHaveAttribute('data-motion-state', 'entered');
   const before = (await d.locator('.sub-dialog').boundingBox())!;

@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const [width, theme] of [
@@ -24,7 +25,7 @@ for (const [width, theme] of [
     await expect(card.locator('details')).toHaveCount(0);
     await expect(timeline.locator('.user-presence-day')).toHaveText(['在线', '今天', '昨天', '7 天内']);
     await card.scrollIntoViewIfNeeded();
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(card).toHaveScreenshot(`presence-history-${width}-${theme}-timeline.png`);
 
     // The existing timeline-wide preview limit still applies to all history rows together.

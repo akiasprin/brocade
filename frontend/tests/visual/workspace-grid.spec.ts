@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
 import {
   SCENES,
@@ -224,7 +225,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
         await expect(page.locator('.node-card')).toHaveCount(machines.length);
         await expect(page.locator('.nd-throughput-panel')).toHaveCount(0);
         await expect(page.locator('.node-card-rate:not(.none)').first()).toBeVisible();
-        await page.evaluate(() => document.fonts.ready);
+        await waitForVisualAssets(page);
         await expectAligned(page);
         expect(await page.evaluate(() => getComputedStyle(document.body, '::before').backgroundPosition)).toBe(origin);
         await expect(page).toHaveScreenshot(`${name}-ready.png`, {

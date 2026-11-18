@@ -1,9 +1,22 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
 
 async function expectDnsOrder(page: Page, values: string[]) {
-  const inputs = page.locator('.node-egress-rules-table .rule-new-dns-value');
-  await expect(inputs).toHaveCount(values.length);
-  for (let index = 0; index < values.length; index++) await expect(inputs.nth(index)).toHaveValue(values[index]);
+  const rows = page.locator('.node-egress-rules-table tbody tr');
+  await expect(rows).toHaveCount(values.length);
+  for (let index = 0; index < values.length; index++)
+    await expect(rows.nth(index).getByRole('button', { name: `预览 ${values[index]}`, exact: true })).toBeVisible();
+}
+
+async function pickGeosite(page: Page, row: ReturnType<Page['locator']>, value: string) {
+  for (const selected of await row.getByRole('button', { name: /^移除 / }).all()) await selected.click();
+  await row.getByRole('combobox', { name: /DNS 匹配内容/ }).click();
+  const menu = page.getByRole('dialog', { name: 'geosite 选项', exact: true });
+  await menu.getByRole('textbox', { name: '搜索 geosite', exact: true }).fill(value);
+  await menu.getByRole('option', { name: value, exact: true }).click();
+  await page.keyboard.press('Escape');
+  await expect(menu).toHaveCount(0);
+  await expect(row.getByRole('button', { name: `预览 ${value}`, exact: true })).toBeVisible();
 }
 
 for (const width of [1440, 390])
@@ -13,7 +26,7 @@ for (const width of [1440, 390])
       await page.goto(`/tests/fixtures/dns-groups-preview.html?theme=${theme}`);
       const address = page.getByRole('textbox', { name: /DNS 地址/ });
       await expect(address).toHaveValue('192.0.2.53, 198.51.100.53, 2001:db8::53');
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
       await expect(page).toHaveScreenshot(`dns-group-${width}-${theme}.png`);
       await address.fill('192.0.2.1, 192.0.2.2, 192.0.2.3, 192.0.2.4');
@@ -44,9 +57,9 @@ for (const theme of ['light', 'dark']) {
     const row = page.locator('.node-egress-dns-new-row');
     await expect(row.getByRole('combobox', { name: /DNS 匹配类型/ })).toHaveAttribute('value', 'geosite');
     await expect(page.getByRole('alert')).toHaveCount(0);
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(page).toHaveScreenshot(`dns-new-${theme}.png`);
-    await row.getByRole('textbox', { name: /DNS 匹配内容/ }).fill('netflix');
+    await pickGeosite(page, row, 'netflix');
     await page.getByRole('button', { name: '保存到草稿' }).click();
     const error = row.getByRole('alert');
     await expect(error).toHaveText('请填写完整的 DNS 地址，用逗号分隔');
@@ -66,7 +79,7 @@ for (const width of [1440, 390])
       await page.goto(`/tests/fixtures/dns-groups-preview.html?theme=${theme}&scene=editing`);
       await expect(page.getByRole('button', { name: /复制 DNS 策略/ })).toHaveCount(3);
       await expect(page.getByRole('button', { name: /拖动排序 DNS 策略/ })).toHaveCount(3);
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
       await expect(page).toHaveScreenshot(`dns-editing-${width}-${theme}.png`, { fullPage: true });
 
@@ -92,7 +105,7 @@ test('copies local edits, drags the copy to D1 and preserves all resolver fields
     .fill('203.0.113.53, 2001:db8::53');
   await page.getByRole('button', { name: '复制 DNS 策略（geosite disney）', exact: true }).click();
   const copy = page.locator('.node-egress-dns-new-row');
-  await copy.getByRole('textbox', { name: /DNS 匹配内容/ }).fill('dazn');
+  await pickGeosite(page, copy, 'dazn');
   await expect(copy.getByRole('textbox', { name: /DNS 地址/ })).toHaveValue('203.0.113.53, 2001:db8::53');
   await expect(copy.getByRole('combobox', { name: /传输/ })).toHaveAttribute('value', 'udp');
   await expect(copy.getByRole('combobox', { name: /地址策略/ })).toHaveAttribute('value', 'use_ip');

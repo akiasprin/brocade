@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 for (const [width, theme] of [
@@ -8,7 +9,7 @@ for (const [width, theme] of [
     await page.clock.setFixedTime(new Date('2026-10-28T08:00:00Z'));
     await page.setViewportSize({ width, height: 1000 });
     await page.goto(`/tests/fixtures/observe-focus-preview.html?theme=${theme}`);
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     for (const [category, title] of [
       ['内存', '容量构成'],
       ['磁盘', '块设备吞吐'],

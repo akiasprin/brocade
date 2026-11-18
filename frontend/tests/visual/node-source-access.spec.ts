@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect, type Page, type Locator } from '@playwright/test';
 
 const scenes = ['typical', 'useronly', 'empty', 'many', 'pending', 'error', 'unsupported', 'legacy'] as const;
@@ -14,7 +15,7 @@ async function load(page: Page, width: number, theme: string, scene = 'typical')
   await page.goto(`/tests/fixtures/node-source-access-preview.html?scene=${scene}&theme=${theme}`);
   const panel = page.getByRole('region', { name: '来源 IP 封禁', exact: true });
   await expect(panel.getByRole('button', { name: '封禁 IP', exact: true })).toBeVisible();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   return panel;
 }
 async function checkOverflow(page: Page, panel: Locator) {

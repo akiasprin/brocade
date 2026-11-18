@@ -7,6 +7,7 @@ import { SessionProvider } from '../src/session';
 import { draft } from '../src/draft';
 import type { Win } from '../src/wm/store';
 import { cacheEntries, responses, nodeId, snapshot } from './fixtures/node-detail-loading-data';
+import { geodataFixture } from './fixtures/geodata-data';
 
 const clients: QueryClient[] = [];
 const deferred = () => {
@@ -39,8 +40,10 @@ function setup(path: string, tab = 'chains', readonly = false) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
   clients.push(client);
   for (const [url, key, value] of cacheEntries) if (url !== path) client.setQueryData(key, value);
-  const fetcher = vi.fn((input: string) =>
-    input === path ? gate.promise : Promise.resolve(Response.json(responses[input] ?? {})),
+  const response = (input: string, init?: RequestInit) =>
+    geodataFixture(input, init) ?? Response.json(responses[input] ?? {});
+  const fetcher = vi.fn((input: string, init?: RequestInit) =>
+    input === path ? gate.promise : Promise.resolve(response(input, init)),
   );
   vi.stubGlobal('fetch', fetcher);
   const win: Win = {
@@ -81,7 +84,7 @@ function setup(path: string, tab = 'chains', readonly = false) {
       gate.resolve(Response.json(fail ? { error: '读取暂时失败' } : responses[path], { status: fail ? 503 : 200 }));
     });
   };
-  return { ...view, client, fetcher, finish };
+  return { ...view, client, fetcher, finish, response };
 }
 
 describe('machine detail asynchronous content', () => {
@@ -103,7 +106,10 @@ describe('machine detail asynchronous content', () => {
       ).toBe(true);
       await waitFor(() => expect(view.fetcher.mock.calls.some(([url]) => url === path)).toBe(true));
       await view.finish();
-      await waitFor(() => expect(panel.querySelector('.flow-well-loading')).toBeNull());
+      await waitFor(() => {
+        expect(panel.querySelector('.flow-machine')).toBeTruthy();
+        expect(panel.querySelector('.flow-well-loading')).toBeNull();
+      });
       expect(panel.querySelector('.chain-rule-section-head')).toBe(head);
       expect(panel.querySelector('.flow-machine')).toBeTruthy();
       await waitFor(() => expect(within(panel).getByRole('button', { name: '保存到草稿' })).toBeTruthy());
@@ -111,8 +117,8 @@ describe('machine detail asynchronous content', () => {
       // A refetch must not replace already usable content with the initial loading surface.
       const firstMachine = panel.querySelector('.flow-machine');
       const refresh = deferred();
-      view.fetcher.mockImplementation(input =>
-        input === path ? refresh.promise : Promise.resolve(Response.json(responses[input] ?? {})),
+      view.fetcher.mockImplementation((input, init) =>
+        input === path ? refresh.promise : Promise.resolve(view.response(input, init)),
       );
       const key = cacheEntries.find(([url]) => url === path)![1];
       act(() => {
@@ -173,8 +179,8 @@ describe('machine detail asynchronous content', () => {
     await view.findByRole('article', { name: 'ChatGPT' });
     expect(panel()?.getAttribute('aria-busy')).toBe('false');
     const v6 = deferred();
-    view.fetcher.mockImplementation(input =>
-      input.endsWith('family=v6') ? v6.promise : Promise.resolve(Response.json(responses[input] ?? {})),
+    view.fetcher.mockImplementation((input, init) =>
+      input.endsWith('family=v6') ? v6.promise : Promise.resolve(view.response(input, init)),
     );
     fireEvent.click(view.getByRole('button', { name: 'IPv6' }));
     await waitFor(() => expect(panel()?.getAttribute('aria-busy')).toBe('true'));

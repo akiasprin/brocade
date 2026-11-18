@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from '../helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 for (const [width, theme] of [
@@ -18,7 +19,7 @@ for (const [width, theme] of [
     const flow = page.getByRole('region', { name: '入口、网卡与出口' });
     await expect(flow.locator('.cvm-flow-exit-sub')).toContainText('GreenVPS · 香港网络');
     await expect(flow).not.toContainText('remote-ingress');
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(flow).toHaveScreenshot(`ordinary-user-names-${width}-${theme}.png`);
   });
 }
@@ -40,7 +41,7 @@ for (const [width, theme, role] of [
     const header = page.locator('.cvm-page-head');
     // 运行状态是标题图标角上的状态灯，与机器详情一致。
     await expect(header.getByRole('img', { name: '运行中', exact: true })).toBeVisible();
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     const title = (await header.getByRole('heading', { level: 1 }).boundingBox())!;
     expect(title.width).toBeGreaterThanOrEqual(40);
     const tabs = (await header.getByRole('tablist').boundingBox())!;
@@ -110,7 +111,7 @@ test('dashboard fits a narrow desktop workspace', async ({ page }) => {
   await expect(workspace.getByRole('list', { name: '访问入口' }).getByRole('listitem')).toHaveCount(3);
   await expect(workspace.locator('.cvm-flow-exit-sub').first()).toContainText('GreenVPS · 香港网络');
   await expect(workspace.getByRole('region', { name: '容器 监控' }).getByText(/持续采样/)).toBeVisible();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   expect(await workspace.evaluate(el => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1);
   for (const text of await workspace.locator('.cvm-flow-nic-name, .cvm-flow-ip').all())
     expect(await text.evaluate(el => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1);

@@ -22,7 +22,7 @@ export function HostList({ workspace }: { workspace: CvmWorkspace }) {
     <section className="cvm-host-list" aria-label="宿主清单">
       <header className="cvm-lane-head">
         <h2>宿主</h2>
-        <small>{hosts.length} 台 · 逻辑已分配 / 宿主基准 · 允许超售</small>
+        <small>{hosts.length} 台 · 已分配 / 宿主容量</small>
       </header>
       <div className="cvm-host-grid" role="list" aria-label="宿主">
         {hosts.map(host => {

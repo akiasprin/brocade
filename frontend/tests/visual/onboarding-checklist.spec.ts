@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
 
 // 首次上线清单：右下角常驻、不加遮罩。展开时列出五步与当前一步的操作；到了当前一步的生产页面收成
@@ -7,7 +8,7 @@ async function open(page: Page, phase: string, theme: string, width: number, has
   await page.setViewportSize({ width, height: width < 600 ? 844 : 900 });
   await page.goto(`/tests/fixtures/onboarding-preview.html?phase=${phase}&theme=${theme}${hash}`);
   await expect(page.locator('.onb-dock')).toBeVisible();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
 }
 
 const checklist = (page: Page) => page.getByRole('region', { name: '首次上线' });

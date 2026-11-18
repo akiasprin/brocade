@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from '../helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
 
 async function openTerminal(
@@ -44,7 +45,7 @@ async function openTerminal(
   const dialog = page.getByRole('dialog', { name: '终端 · home-workspace' });
   await expect(dialog.getByRole('status')).toHaveText('已连接');
   await expect.poll(() => input.includes('ack')).toBe(true);
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   return { dialog, input, disconnected: () => disconnected };
 }
 
@@ -240,7 +241,7 @@ for (const width of [1440, 390, 320])
       await expect(dialog.getByText('已关闭', { exact: false }).first()).toBeVisible();
       await expect(dialog.getByRole('switch')).toHaveCount(2);
       await expect(dialog.getByText(/运行栈待升级/)).toBeVisible();
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(dialog).toHaveScreenshot(`terminal-management-${width}-${theme}.png`);
       expect(await dialog.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(false);
       await toggle.focus();

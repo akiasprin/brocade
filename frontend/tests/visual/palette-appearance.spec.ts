@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 
@@ -18,7 +19,7 @@ for (const palette of palettes) {
       await expect(page.locator('html')).toHaveAttribute('data-palette', palette);
       await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
       await expect(page.locator('.node-card').first()).toBeVisible();
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       // Node geometry and curves have their own browser matrix. Here the palette contract
       // is the exact data color; repeating the full roster adds unrelated SVG rasterization.
       await expect(page.locator('.node-card-comet:not(.empty)').first()).toHaveCSS(

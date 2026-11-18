@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test as base, expect, chromium, webkit, type Page } from '@playwright/test';
 import { SCENES, type SceneKey } from '../fixtures/node-roster-data';
 
@@ -18,7 +19,7 @@ async function preview(page: Page, width = 1440, theme = 'dark', scene: SceneKey
     await expect(page.locator('.node-card-month > b:not(.none)').first()).toBeVisible();
     await expect(page.locator('.node-card-resources[data-state="ready"]').first()).toBeVisible();
   }
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   return errors;
 }
 const card = (page: Page, name: string) => page.getByRole('button', { name: `查看 ${name} 的机器详情`, exact: true });

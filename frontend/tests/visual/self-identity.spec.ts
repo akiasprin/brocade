@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test as base, expect, chromium, webkit } from '@playwright/test';
 
 const route = '/tests/fixtures/self-identity-preview.html';
@@ -44,7 +45,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
             );
             const identity = await avatar.getAttribute('data-avatar-mark');
             const color = await avatar.evaluate(el => getComputedStyle(el).color);
-            await page.evaluate(() => document.fonts.ready);
+            await waitForVisualAssets(page);
             if (width > 820) {
               if (target === 'bob') {
                 await expect(me).toHaveAttribute('aria-selected', 'false');

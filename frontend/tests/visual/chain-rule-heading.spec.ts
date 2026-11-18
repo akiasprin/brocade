@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 for (const [width, theme] of [
@@ -19,7 +20,7 @@ for (const [width, theme] of [
       await expect(tree.locator('.chain-rule-node-head .who > b')).toHaveText('香港 HKIX');
       await expect(tree.locator('.rule-editor-title')).toHaveCount(0);
       await expect(tree).not.toContainText('hk-direct / hk-hkix');
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(tree).toHaveScreenshot(`chain-${role}-${width}.png`);
       expect(errors).toEqual([]);
     });
@@ -39,7 +40,7 @@ for (const width of [390, 1440]) {
     await expect(tree.locator('.chain-rule-body:not([hidden])')).toHaveCount(1);
     await expect(tree.locator('.chain-rule-node-head[role="button"]').nth(0)).toHaveAttribute('aria-expanded', 'true');
     await expect(tree.locator('.chain-rule-node-head[role="button"]').nth(1)).toHaveAttribute('aria-expanded', 'false');
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(tree).toHaveScreenshot(`chain-folding-${width}.png`);
   });
 }

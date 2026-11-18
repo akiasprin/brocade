@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
 
 const cases = [
@@ -44,7 +45,7 @@ async function open(page: Page, scene: string, width: number, theme: string, win
     });
     await expect(page.locator('.tnd-head')).toBeInViewport({ ratio: 1 });
   }
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
 }
 
 for (const engine of ['chromium', 'webkit'] as const) {

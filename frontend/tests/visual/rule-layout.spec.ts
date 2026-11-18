@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Locator } from '@playwright/test';
 
 async function expectRuleLayout(table: Locator) {
@@ -72,7 +73,7 @@ for (const width of [390, 820, 1280]) {
     await page.goto('/tests/fixtures/rule-coverage-preview.html?layout');
     const table = page.locator('.rule-table');
     await expect(table.locator('tbody > tr')).toHaveCount(5);
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expectRuleLayout(table);
     await expect(table).toHaveScreenshot(`webkit-rules-${width}.png`);
   });
@@ -85,7 +86,7 @@ for (const width of [320, 390, 670, 820, 1050, 1280, 1440, 1920]) {
       await page.goto(`/tests/fixtures/rule-coverage-preview.html?layout&theme=${theme}`);
       const table = page.locator('.rule-table');
       await expect(table.locator('tbody > tr')).toHaveCount(5);
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expectRuleLayout(table);
       await expect(table).toHaveScreenshot(`rules-${width}-${theme}.png`);
     });
@@ -96,7 +97,7 @@ test('chain rules adapt to a narrow panel inside a desktop viewport', async ({ p
   await page.setViewportSize({ width: 1920, height: 1000 });
   await page.goto('/tests/fixtures/rule-coverage-preview.html?layout&container=860&longName');
   await expect(page.locator('.rule-table tbody > tr')).toHaveCount(5);
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   await expectRuleLayout(page.locator('.rule-table'));
   await expect(page.locator('.rule-table')).toHaveScreenshot('rules-desktop-narrow-panel.png');
 });
@@ -107,7 +108,7 @@ for (const width of [390, 670, 820, 1050]) {
     await page.goto('/tests/fixtures/dns-groups-preview.html?theme=dark&scene=editing');
     const table = page.locator('.rule-table');
     await expect(table.locator('tbody > tr')).toHaveCount(3);
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expectRuleLayout(table);
     await expect(table).toHaveScreenshot(`dns-rules-${width}.png`);
   });
@@ -122,7 +123,7 @@ for (const width of [640, 641, 1050, 1051, 1440, 1441]) {
     expect(await tree.evaluate(el => el.clientWidth)).toBe(width);
     const table = tree.locator('.rule-table');
     await expect(table.locator('tbody > tr')).toHaveCount(5);
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expectRuleLayout(table);
     await expect(table.locator('tbody > tr').first()).toHaveCSS('display', width <= 640 ? 'block' : 'table-row');
     await expect(table.locator('.rule-action-cell').first()).toHaveCSS('display', width <= 640 ? 'flex' : 'table-cell');
@@ -136,7 +137,7 @@ for (const width of [390, 820, 1440]) {
     await page.goto('/tests/fixtures/rule-coverage-preview.html?layout&role=readonly&theme=light');
     const table = page.locator('.rule-table');
     await expect(table.locator('tbody > tr')).toHaveCount(5);
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expectRuleLayout(table);
     await expect(table).toHaveScreenshot(`readonly-rules-${width}.png`);
   });
@@ -148,7 +149,7 @@ for (const width of [390, 820, 1440]) {
     await page.goto('/tests/fixtures/rule-coverage-preview.html?layout&dns');
     const table = page.locator('.rule-table');
     await expect(table.locator('tbody > tr')).toHaveCount(5);
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expectRuleLayout(table);
     await expect(page.locator('.rule-editor')).toHaveScreenshot(`chain-dns-rules-${width}.png`);
     await table.getByRole('button', { name: '查看本机 DNS 解析策略' }).first().click();

@@ -1,9 +1,10 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
 async function open(page: Page, scene: string, width = 390, height = 844, theme = 'light') {
   await page.clock.install({ time: new Date('2026-10-25T12:00:00Z') });
   await page.setViewportSize({ width, height });
   await page.goto(`/tests/fixtures/ui-regressions.html?scene=${scene}&theme=${theme}`);
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
 }
 for (const [width, theme] of [
   [320, 'light'],

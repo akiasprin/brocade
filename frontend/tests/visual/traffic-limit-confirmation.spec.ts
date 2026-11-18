@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 for (const { width, theme } of [
@@ -13,7 +14,7 @@ for (const { width, theme } of [
       await page.goto(`/tests/fixtures/traffic-limit-preview.html?scene=${scene}&theme=${theme}`);
       const card = page.locator('.node-traffic-accounting');
       await expect(card).toBeVisible();
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       if (scene === 'handoff') {
         await expect(card.getByRole('status')).toHaveText('等待应用确认');
         await expect(card.getByLabel('限速执行结果')).toContainText('等待旧代排空后再确认应用层上限');

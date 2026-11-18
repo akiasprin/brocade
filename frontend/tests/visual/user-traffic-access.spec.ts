@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const [name, width] of [
@@ -31,7 +32,7 @@ for (const [name, width] of [
       expect(bounds.overflow).toBe(false);
       if (name === 'desktop') expect(bounds.quota.left).toBeGreaterThanOrEqual(bounds.ledger.right - 1);
       else expect(bounds.quota.top).toBeGreaterThanOrEqual(bounds.ledger.bottom - 1);
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(card).toHaveScreenshot(`${name}-user-quota-${failed ? 'failure' : 'read'}.png`);
     });
   }

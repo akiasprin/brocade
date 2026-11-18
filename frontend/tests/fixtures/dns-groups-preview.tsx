@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MachineEgressDnsRules } from '../../src/panes/rules';
 import { UnlockDnsDetails } from '../../src/panes/unlock-dns';
 import { unlockReport } from '../../src/panes/unlock-report';
+import { geodataFixture } from './geodata-data';
 import { theme } from '../../src/forge/theme';
 import type { ConsoleSnapshot, EgressDnsResolution, NodeUnlockProbe } from '../../src/api';
 import '../../src/styles.css';
@@ -114,7 +115,10 @@ const job: NodeUnlockProbe = {
   ],
 };
 const row = unlockReport(job).rows[0];
-globalThis.fetch = async () => {
+globalThis.fetch = async (input, init) => {
+  const path = input instanceof Request ? input.url : String(input);
+  const response = geodataFixture(path, init);
+  if (response) return response;
   throw new Error('Unexpected DNS preview request');
 };
 const preview = (

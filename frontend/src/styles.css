@@ -15107,6 +15107,57 @@ body.has-artpanel .topo-deck {
 .fg-nv[aria-current='true'] .mark {
   background: var(--primary-on);
 }
+/* 容器版「编排」：线路与容器合成一个入口。不在组内时与其它入口一样只是一枚按钮；
+   进入后整组取选中实底，组名之后接「线路 容器」子页切换，当前子页再叠一层浅底。
+   子页颜色都由 --primary-on 混出，亮暗调色盘下与选中实底保持同一组对比。 */
+.fg-nv-group {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+.fg-nv-group.is-open {
+  height: 28px;
+  padding-right: 3px;
+  border-radius: var(--r-ctl);
+  background: var(--primary);
+  box-shadow: inset 0 0 0 1px var(--primary-line);
+}
+.fg-nv-group.is-open > .fg-nv {
+  padding-right: 9px;
+  background: none;
+  box-shadow: none;
+}
+.fg-nv-sub {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-left: 4px;
+  border-left: 1px solid color-mix(in srgb, var(--primary-on) 28%, transparent);
+}
+.fg-nv-sub > button {
+  height: 22px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: color-mix(in srgb, var(--primary-on) 74%, transparent);
+  font: inherit;
+  font-size: 12.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.fg-nv-sub > button[aria-current='true'] {
+  background: color-mix(in srgb, var(--primary-on) 22%, transparent);
+  color: var(--primary-on);
+  font-weight: 600;
+}
+@media (hover: hover) {
+  .fg-nv-group.is-open > .fg-nv:hover,
+  .fg-nv-sub > button:not([aria-current='true']):hover {
+    background: color-mix(in srgb, var(--primary-on) 12%, transparent);
+    color: var(--primary-on);
+  }
+}
 
 /* 顶栏通知开关只显示图标，名称放在悬停提示和读屏文字里；计数压在图标右上角。
    样式与主导航同一套无框写法：悬停出底色，展开或按下取操作色洗色。 */
@@ -16105,7 +16156,7 @@ body.has-artpanel .topo-deck {
 .fg-top[data-fit~='traffic'] .fg-topstat > .ft + .fg-blast::before,
 .fg-top[data-fit~='brand'] .fg-brand,
 .fg-top[data-fit~='meta'] .fg-topstat .fg-meta,
-.fg-top[data-fit~='label'] .fg-nv-context .fg-nv-label {
+.fg-top[data-fit~='label'] :is(.fg-nv-context, .fg-nv-group.is-open > .fg-nv) .fg-nv-label {
   display: none;
 }
 .fg-top[data-fit~='traffic'] .fg-topstat > .ft + .fg-blast {
@@ -16718,8 +16769,8 @@ body.fg-dragging * {
   /* ─── 页面导航：并入导航行，位于品牌右侧 ───
      flex:1 吃掉品牌与图标之间的全部空间，min-width:0 + overflow-x 用于兜底——
      按钮本身直接复用桌面端 .fg-nv：同样的图标、28px 高度、内距和实心选中态；
-     移动端只负责横向滚动，不再维护第二套按钮视觉。机器、容器、线路和用户保留图标与文字，
-     发布和其他低频入口从账户菜单进入。 */
+     移动端只负责横向滚动，不再维护第二套按钮视觉。四个主要入口保留图标与文字（容器版的
+     「编排」组按一个入口计），发布和其他低频入口从账户菜单进入。 */
   .fg-facebar {
     flex: 1;
     min-width: 0;
@@ -16753,6 +16804,39 @@ body.fg-dragging * {
     .fg-who.guest-login .fg-who-plate {
       display: none;
     }
+  }
+  /* 编排展开后比单个入口宽。useTopbarFit 量出溢出时按序让位，四个入口与子页切换始终完整：
+     brand 收起字标 → tight 收紧内距（≤375px 已为 0，不再放宽）→ icons 去掉其它入口的图标，
+     纯文字之间留出间隔 → name 组按钮只留图标 → bare 只剩「线路 容器」，实底仍表明这是一组。 */
+  .fg-facebar .fg-nv-group.is-open {
+    margin: 0 4px;
+  }
+  .fg-facebar .fg-nv-group.is-open > .fg-nv {
+    padding: 0 6px 0 7px;
+  }
+  .fg-facebar .fg-nv-sub > button {
+    padding: 0 7px;
+  }
+  @media (min-width: 376px) {
+    .fg-navrow[data-fit~='tight'] .fg-facebar .fg-nv {
+      gap: 3px;
+      padding: 0 4px;
+    }
+  }
+  .fg-navrow[data-fit~='tight'] .fg-facebar .fg-nv-sub > button {
+    padding: 0 5px;
+  }
+  .fg-navrow[data-fit~='icons'] .fg-facebar > .fg-nv {
+    padding: 0 5px;
+  }
+  .fg-navrow[data-fit~='icons'] .fg-facebar > .fg-nv .fg-nv-ic,
+  .fg-navrow[data-fit~='name'] .fg-nv-group.is-open > .fg-nv .fg-nv-label,
+  .fg-navrow[data-fit~='bare'] .fg-nv-group.is-open > .fg-nv {
+    display: none;
+  }
+  .fg-navrow[data-fit~='bare'] .fg-nv-sub {
+    padding-left: 3px;
+    border-left: 0;
   }
   /* 气泡和菜单从顶栏下方展开，宽度按屏幕宽度计算。
      气泡改为相对视口定位（fixed + 左右各 10px），不再相对诊断按钮定位：按钮右侧还有
@@ -19885,7 +19969,7 @@ h4.sec > .btn {
   font-size: 11.5px;
 }
 .user-split-roster > .user-list-search input::placeholder {
-  color: color-mix(in srgb, var(--ink-4) 90%, transparent);
+  color: var(--ink-3);
 }
 .user-split-roster > .user-list-search > button {
   width: 20px;
@@ -19968,7 +20052,7 @@ h4.sec > .btn {
   place-items: center;
   padding: 0 3px;
   border-radius: 4px;
-  color: var(--ink-4);
+  color: var(--ink-3);
   background: color-mix(in srgb, var(--ink) 5%, transparent);
   font: 10.5px var(--mono);
   font-style: normal;
@@ -28156,7 +28240,7 @@ body.observe-brushing .observe-chart-tip {
   font: 11.5px var(--sans);
 }
 .user-list-search input::placeholder {
-  color: var(--ink-4);
+  color: var(--ink-3);
 }
 .user-list-search input::-webkit-search-cancel-button {
   display: none;

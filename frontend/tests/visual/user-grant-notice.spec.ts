@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const width of [320, 390, 820, 1440])
@@ -19,7 +20,7 @@ for (const width of [320, 390, 820, 1440])
         await expect(page.locator('.user-cardpage > [role="status"]')).toHaveCount(0);
         if (state === 'error') await expect(notice).toContainText('暂时无法读取最新授权');
         await expect(page.locator('.grant-card').first()).toBeDisabled();
-        await page.evaluate(() => document.fonts.ready);
+        await waitForVisualAssets(page);
         const layout = await notice.evaluate(element => {
           const text = element.querySelector('span')!.getBoundingClientRect();
           const footer = element.closest('footer')!;

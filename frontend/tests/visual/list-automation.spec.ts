@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const theme of ['light', 'dark']) {
@@ -12,7 +13,7 @@ for (const theme of ['light', 'dark']) {
       await expect(roster.getByText('未连接', { exact: true })).toHaveCount(0);
       await expect(roster).not.toContainText('SubStore');
       await expect(page.getByRole('dialog')).toHaveCount(0);
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
       await expect(page).toHaveScreenshot(`user-list-${width}-${theme}.png`);
     });
@@ -26,7 +27,7 @@ for (const theme of ['light', 'dark']) {
       await expect(list.locator('.node-card-flag')).toHaveCount(3);
       await expect(list.getByRole('img', { name: /自动养护/ })).toHaveCount(0);
       await expect(page.getByRole('tablist', { name: /详情页签/ })).toHaveCount(0);
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
       await expect(page).toHaveScreenshot(`machine-list-${width}-${theme}.png`);
     });

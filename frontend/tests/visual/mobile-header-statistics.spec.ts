@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 const scenes = [
@@ -94,7 +95,7 @@ for (const [browserName, width] of [
           await expect(card.locator('.cap-row')).toHaveCount(1);
           await expect(card.locator('.cap-row')).toContainText('跨区域高流量机器');
         }
-        await page.evaluate(() => document.fonts.ready);
+        await waitForVisualAssets(page);
         await header.scrollIntoViewIfNeeded();
         await page.mouse.move(0, 0);
         expect(await header.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(false);

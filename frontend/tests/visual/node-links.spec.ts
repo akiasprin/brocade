@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test as base, expect, chromium, webkit, type Locator, type Page } from '@playwright/test';
 
 async function open(page: Page, width: number, height: number, theme: string, scene = 'idle') {
@@ -17,7 +18,7 @@ async function open(page: Page, width: number, height: number, theme: string, sc
   await page.getByRole('button', { name: '节点', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: 'alice 的订阅与节点' });
   await expect(dialog.getByRole('button', { name: '全部 31', exact: true })).toBeVisible();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   return { dialog, errors };
 }
 

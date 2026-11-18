@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 const flavor = process.env.BROCADE_PRODUCT_FLAVOR === 'base' ? 'base' : 'cvm';
@@ -27,12 +28,14 @@ for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: 900 });
     await page.goto('/tests/fixtures/navigation-preview.html?theme=light#/nodes/node/jp-iij');
     await expect(page.locator('.nd-page-head')).toBeVisible();
-    const cvm = page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: '容器', exact: true });
-    await expect(cvm).toHaveCount(flavor === 'cvm' ? 1 : 0);
     const primary = page.getByRole('navigation', { name: '主导航' });
+    // 容器版把线路与容器合成「编排」；不在组内时两项都不单独出现，基础版仍是独立的「线路」。
+    await expect(primary.getByRole('button', { name: '编排', exact: true })).toHaveCount(flavor === 'cvm' ? 1 : 0);
+    await expect(primary.getByRole('button', { name: '容器', exact: true })).toHaveCount(0);
+    await expect(primary.getByRole('button', { name: '线路', exact: true })).toHaveCount(flavor === 'cvm' ? 0 : 1);
     if (width === 390) {
       await expect(primary.locator('.fg-nv-label')).toHaveText(
-        flavor === 'base' ? ['机器', '线路', '用户', '用量'] : ['机器', '容器', '线路', '用户'],
+        flavor === 'base' ? ['机器', '线路', '用户', '用量'] : ['机器', '编排', '用户', '用量'],
       );
     }
     if (flavor === 'base') {
@@ -44,20 +47,16 @@ for (const width of [1440, 390]) {
         ),
       ).toEqual([]);
     }
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(page).toHaveScreenshot(`${flavor}-machine-${width}.png`, { clip: { x: 0, y: 0, width, height: 190 } });
     if (width === 390) {
       await page.getByRole('button', { name: /账户与更多功能/ }).click();
       const menu = page.getByRole('menu', { name: '账户与更多功能' });
       await expect(menu).toBeVisible();
-      await expect(menu.getByRole('menuitem', { name: '用量', exact: true })).toHaveCount(flavor === 'cvm' ? 1 : 0);
+      await expect(menu.getByRole('menuitem', { name: '用量', exact: true })).toHaveCount(0);
       await expect(menu).toHaveScreenshot(`${flavor}-mobile-menu.png`);
-      if (flavor === 'cvm') {
-        await menu.getByRole('menuitem', { name: '用量', exact: true }).click();
-      } else {
-        await page.keyboard.press('Escape');
-        await primary.getByRole('button', { name: '用量', exact: true }).click();
-      }
+      await page.keyboard.press('Escape');
+      await primary.getByRole('button', { name: '用量', exact: true }).click();
       await expect(page).toHaveURL(/#\/usage$/);
     }
     await page.evaluate(() => {
@@ -68,6 +67,7 @@ for (const width of [1440, 390]) {
       await expect(page.locator('.nd-page-head')).toBeVisible();
     } else {
       await expect(page.getByRole('tab', { name: '组合台', exact: true })).toBeVisible();
+      await expect(primary.getByRole('button', { name: '容器', exact: true })).toHaveAttribute('aria-current', 'true');
     }
   });
 }

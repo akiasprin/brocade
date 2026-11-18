@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test as base, expect, chromium, webkit, type Page, type Locator } from '@playwright/test';
 
 type Kind = 'machine' | 'chain';
@@ -13,7 +14,7 @@ async function open(page: Page, kind: Kind, theme = 'light') {
   await expect(card).toBeVisible();
   if (kind === 'machine') await expect(card.locator('.node-card-resources')).toHaveAttribute('data-state', 'ready');
   else await expect(card.locator('.chain-card-latency b')).toHaveText(/^\d+$/);
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   // Keep the card clear of the sticky page header during locator screenshots.
   await card.evaluate(element => element.scrollIntoView({ block: 'center', behavior: 'instant' }));
   return card;

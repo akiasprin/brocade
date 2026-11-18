@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 for (const width of [1440, 390])
   for (const theme of ['dark', 'light']) {
@@ -9,7 +10,7 @@ for (const width of [1440, 390])
         'aria-pressed',
         'true',
       );
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(page).toHaveScreenshot(`unlock-scheduled-${width}-${theme}.png`);
       await panel.getByRole('button', { name: '手动', exact: true }).click();
       await expect(panel.getByRole('button', { name: '手动', exact: true })).toHaveAttribute('aria-pressed', 'true');

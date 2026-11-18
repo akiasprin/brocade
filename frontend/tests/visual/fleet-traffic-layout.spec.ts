@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Locator } from '@playwright/test';
 
 const cases = [
@@ -22,7 +23,7 @@ for (const { width, machines, theme } of cases) {
     await expect(ledger).toBeVisible();
     await expect(board.locator('thead th[data-node]')).toHaveCount(machines);
     await expect(board).not.toHaveAttribute('aria-busy');
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     // This static fixture has about 9,000 elements at 48 machines. Finish its
     // entrance once; disabling animations per screenshot walks the entire tree.
     await page.evaluate(() =>
@@ -111,7 +112,7 @@ test('monthly ledger sizing and matrix spacing stay fixed when the paper resizes
   const board = page.getByRole('region', { name: '用户与机器的当前速率' });
   await expect(ledger).toBeVisible();
   await expect(board.locator('thead th[data-node]')).toHaveCount(24);
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
 
   const readings = [];
   const matrices = [];

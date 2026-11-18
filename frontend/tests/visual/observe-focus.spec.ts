@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Locator } from '@playwright/test';
 
 async function chartState(plot: Locator) {
@@ -40,7 +41,7 @@ for (const [width, theme] of [
     await page.clock.setFixedTime(new Date('2026-10-28T08:00:00Z'));
     await page.setViewportSize({ width, height: 1000 });
     await page.goto(`/tests/fixtures/observe-focus-preview.html?theme=${theme}`);
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     const throughput = page.getByRole('region', { name: '吞吐', exact: true });
     await throughput.scrollIntoViewIfNeeded();
     await expect.poll(() => chartState(throughput.locator('.ndtp-ec').first())).not.toBeNull();

@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from '../helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
 async function open(page: Page, width: number, theme: string, scene = 'chain-board') {
   await page.clock.setFixedTime(new Date('2026-11-04T10:30:00Z'));
@@ -6,7 +7,7 @@ async function open(page: Page, width: number, theme: string, scene = 'chain-boa
   await page.setViewportSize({ width, height: scene === 'chain-board' && width > 820 ? 2000 : 1050 });
   await page.goto(`/tests/fixtures/cvm/preview.html?scene=${scene}&theme=${theme}`);
   await expect(page.locator('.cvm-page')).toBeVisible({ timeout: 15_000 });
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
 }
 for (const theme of ['light', 'dark']) {
   test(`chain board B, owner proposal and unauthorized drag ${theme}`, async ({ page }) => {

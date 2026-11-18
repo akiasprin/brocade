@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
 
 async function open(page: Page, width: number, theme = 'light', extra = '') {
@@ -9,7 +10,7 @@ async function open(page: Page, width: number, theme = 'light', extra = '') {
   await expect(page.locator('.chain-rule-node-head[aria-expanded="true"]')).toHaveCount(1);
   const collapsed = page.locator('.chain-rule-node-head[aria-expanded="false"]');
   while ((await collapsed.count()) > 0) await collapsed.first().click();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
 }
 
 function head(page: Page, name: string) {

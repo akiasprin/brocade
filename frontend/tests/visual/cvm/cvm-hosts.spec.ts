@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from '../helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const width of [1440, 390, 320])
@@ -16,7 +17,7 @@ for (const width of [1440, 390, 320])
         await expect(page.getByText('能力报告新鲜', { exact: true })).toHaveCount(0);
         await expect(page.getByText('等待新的能力报告', { exact: true })).toHaveCount(0);
         await expect(page.getByRole('button', { name: /查看.*实例/ })).toHaveCount(0);
-        await page.evaluate(() => document.fonts.ready);
+        await waitForVisualAssets(page);
         if (scene === 'hosts') {
           await expect(page.locator('.cvm-host-card')).toHaveCount(4);
           // 移除宿主收进每张卡的 ⋯ 菜单。

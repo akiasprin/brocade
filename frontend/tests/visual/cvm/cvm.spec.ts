@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from '../helpers/visual-ready';
 import { test, expect, type Page } from '@playwright/test';
 
 async function load(page: Page, width: number, theme: string, scene: string, role = 'system-admin') {
@@ -6,7 +7,7 @@ async function load(page: Page, width: number, theme: string, scene: string, rol
   await page.setViewportSize({ width, height: 1000 });
   await page.goto(`/tests/fixtures/cvm/preview.html?scene=${scene}&theme=${theme}&role=${role}`);
   await expect(page.locator('.cvm-page')).toBeVisible();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
 }
 async function noOverflow(page: Page) {
   expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
@@ -40,7 +41,7 @@ for (const width of [1440, 390, 320])
       await load(page, width, theme, 'detail');
       await page.getByRole('tab', { name: '网络', exact: true }).click();
       await expect(page.getByText('两端已连接', { exact: true })).toBeVisible();
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       const mount = page.getByRole('button', { name: '＋ 挂载网卡', exact: true });
       // The slot sits below the NICs on phones; pin the backdrop scroll after all card data is ready.
       await mount.evaluate(button => button.scrollIntoView({ block: 'center', behavior: 'instant' }));
@@ -48,7 +49,11 @@ for (const width of [1440, 390, 320])
       const dialog = page.getByRole('dialog', { name: '挂载网卡' });
       await expect(dialog).toBeVisible();
       await expect(dialog).toHaveScreenshot(`cvm-attach-${width}-${theme}.png`);
-      await dialog.getByRole('button', { name: '挂载并分配地址' }).click();
+      const save = dialog.getByRole('button', { name: '挂载并分配地址' });
+      await expect(save).toBeDisabled();
+      await dialog.getByRole('button', { name: '预览产物差异', exact: true }).click();
+      await expect(save).toBeEnabled();
+      await save.click();
       await expect(dialog).toBeHidden();
       await expect(page.locator('.cvm-attached')).toHaveCount(3);
       await expect(page.getByRole('status').filter({ hasText: '待执行' })).toBeVisible();

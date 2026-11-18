@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const [width, theme] of [
@@ -14,7 +15,7 @@ for (const [width, theme] of [
     await expect(row.locator('xpath=following-sibling::*[1]')).toContainText('出网权限');
     const identity = row.locator('..');
     await identity.scrollIntoViewIfNeeded();
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(identity).toHaveScreenshot(`ip-notifications-${width}-${theme}.png`);
     await toggle.getByRole('button', { name: '关闭' }).click();
     await expect(toggle.getByRole('button', { name: '关闭' })).toHaveAttribute('aria-pressed', 'true');

@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 for (const width of [390, 1440]) {
@@ -5,7 +6,7 @@ for (const width of [390, 1440]) {
     await page.clock.install({ time: new Date('2026-10-25T12:00:00Z') });
     await page.setViewportSize({ width, height: 900 });
     await page.goto('/tests/fixtures/ui-regressions.html?scene=agent-binary&theme=light');
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     for (const name of ['旧 Agent（未上报身份）', '旧 Agent（身份为空）', '基础版 Agent']) {
       await expect(page.getByRole('checkbox', { name: `升级 ${name}` })).toBeEnabled();
     }

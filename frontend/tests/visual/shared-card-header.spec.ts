@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 const scenes = [
@@ -24,7 +25,7 @@ async function openCard(page: Page, scene: (typeof scenes)[number], theme: strin
     .locator('.cg-sec > :is(header, summary)')
     .filter({ has: page.getByRole('heading', { name: scene.title, exact: true }) });
   await expect(header).toContainText(scene.statistic);
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   return header;
 }
 

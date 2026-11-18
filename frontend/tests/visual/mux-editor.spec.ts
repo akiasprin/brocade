@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const [name, width, height, theme, safe, longName] of [
@@ -21,7 +22,7 @@ for (const [name, width, height, theme, safe, longName] of [
       await configure.click();
       const drawer = page.locator('.mux-config-drawer');
       const apply = drawer.getByRole('button', { name: '应用', exact: true });
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(page.getByRole('dialog')).toHaveScreenshot(`${name}.png`);
       await expect(apply).toBeInViewport({ ratio: 1 });
       const bounds = await drawer.evaluate(element => {

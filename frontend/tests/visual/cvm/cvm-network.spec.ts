@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from '../helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
 async function open(page: Page, width: number, theme: string, detail = true) {
   page.on('pageerror', error => console.error('preview page error:', error.message));
@@ -10,13 +11,13 @@ async function open(page: Page, width: number, theme: string, detail = true) {
   await page.setViewportSize({ width, height: 1000 });
   await page.goto(`/tests/fixtures/cvm/preview.html?scene=${detail ? 'detail' : 'list'}&theme=${theme}`);
   await expect(page.locator('.cvm-page')).toBeVisible();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   if (detail) {
     await page.getByRole('tab', { name: '网络', exact: true }).click();
     await expect(page.getByText('两端已连接', { exact: true })).toBeVisible();
     // The entry list above the NICs loads separately; wait so the layout is final.
     await expect(page.getByRole('list', { name: '访问入口' }).getByRole('listitem')).toHaveCount(3);
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
   }
 }
 async function fits(page: Page) {

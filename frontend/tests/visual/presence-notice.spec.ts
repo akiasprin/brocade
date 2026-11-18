@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 const cases = [
@@ -24,7 +25,7 @@ for (const { width, theme, state, long } of cases) {
     await expect(note).toContainText('在线来源统计不完整：3 台入口机器中');
     await expect(note).toContainText(/上次更新 13\s*分钟前/);
     await expect(note).toContainText('尚未上报节点（尚未收到统计）');
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(note).toHaveScreenshot(`${state}-${width}-${theme}${long ? '-long' : ''}.png`);
     const layout = await note.evaluate(element => {
       const ago = element.querySelector('.ago')!;

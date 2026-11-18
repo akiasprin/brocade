@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const [name, width, height, theme, strategy] of [
@@ -15,7 +16,7 @@ for (const [name, width, height, theme, strategy] of [
     await expect(strategyInput).toHaveValue('as_is');
     await strategyInput.selectOption(strategy);
     await strategyInput.scrollIntoViewIfNeeded();
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     const dialog = page.getByRole('dialog', { name: '编辑隧道' });
     expect(await dialog.evaluate(element => element.scrollWidth > element.clientWidth)).toBe(false);
     await expect(dialog).toHaveScreenshot(`${name}.png`);

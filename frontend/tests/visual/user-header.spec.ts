@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect, type Page } from '@playwright/test';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
@@ -8,7 +9,7 @@ async function preview(page: Page, query = '') {
   await page.clock.install({ time: new Date('2026-10-23T08:00:00Z') });
   await page.goto(`/tests/fixtures/user-header-preview.html?palette=jinzi${query}`);
   await expect(page.locator('.user-account-state')).toBeVisible();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
 }
 
 for (const [name, width, height, query] of [

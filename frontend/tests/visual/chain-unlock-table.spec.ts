@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect, type Page } from '@playwright/test';
 
 async function preview(page: Page, width: number, theme = 'dark', query = '') {
@@ -9,7 +10,7 @@ async function preview(page: Page, width: number, theme = 'dark', query = '') {
   await expect(page.getByRole('table', { name: /线路服务解锁/ })).toBeVisible();
   await expect(page.locator('.cut-row')).toHaveCount(16);
   if (!query.includes('error')) await expect(page.locator('td[data-service="chatgpt"]').first()).toBeVisible();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   return errors;
 }
 

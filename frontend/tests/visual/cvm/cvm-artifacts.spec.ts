@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from '../helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 for (const width of [1440, 390, 320])
   for (const theme of ['light', 'dark']) {
@@ -8,7 +9,7 @@ for (const width of [1440, 390, 320])
       await page.getByRole('tab', { name: '产物', exact: true }).click();
       await expect(page.getByText(/影子比对一致/)).toBeVisible();
       await expect(page.locator('.cvm-monitoring')).toHaveCount(0);
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(page.locator('.cvm-artifacts')).toHaveScreenshot(`artifacts-${width}-${theme}.png`);
       await page.getByRole('button', { name: /网卡附件/ }).click();
       await expect(page.getByLabel('产物差异')).toContainText('nic-business');
@@ -36,6 +37,6 @@ test('artifact pending restart does not show the previous operation evidence', a
   await expect(page.getByText('尚无已确认的生效摘要')).toBeVisible();
   await expect(page.getByText('e'.repeat(64), { exact: true })).toHaveCount(0);
   await expect(page.getByText('执行绑定值')).toHaveCount(0);
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   await expect(page.locator('.cvm-artifacts')).toHaveScreenshot('artifacts-pending-390-light.png');
 });

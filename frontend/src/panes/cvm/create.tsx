@@ -303,7 +303,7 @@ export function CreateForm({ workspace }: { workspace: CvmWorkspace }) {
                   min={limits.min_vcpus}
                   max={limits.max_vcpus}
                   step={1}
-                  hint={host ? `宿主基准 ${host.capabilities.allocatable_vcpus} 核 · 允许超售` : undefined}
+                  hint={host ? `宿主容量 ${host.capabilities.allocatable_vcpus} 核` : undefined}
                   onChange={value => {
                     setChanged(true);
                     setResourceInputs(old => ({ ...old, vcpus: value }));
@@ -315,9 +315,7 @@ export function CreateForm({ workspace }: { workspace: CvmWorkspace }) {
                   min={limits.min_memory_bytes / MIB}
                   max={limits.max_memory_bytes / MIB}
                   step={limits.memory_step_bytes / MIB}
-                  hint={
-                    host ? `宿主基准 ${capacity(host.capabilities.allocatable_memory_bytes)} · 允许超售` : undefined
-                  }
+                  hint={host ? `宿主容量 ${capacity(host.capabilities.allocatable_memory_bytes)}` : undefined}
                   onChange={value => {
                     setChanged(true);
                     setResourceInputs(old => ({ ...old, memoryMiB: value }));
@@ -329,7 +327,7 @@ export function CreateForm({ workspace }: { workspace: CvmWorkspace }) {
                   min={limits.min_root_disk_bytes / GIB}
                   max={limits.max_root_disk_bytes / GIB}
                   step={limits.root_disk_step_bytes / GIB}
-                  hint={host ? `宿主基准 ${capacity(host.capabilities.allocatable_disk_bytes)} · 允许超售` : undefined}
+                  hint={host ? `宿主容量 ${capacity(host.capabilities.allocatable_disk_bytes)}` : undefined}
                   onChange={value => {
                     setChanged(true);
                     setResourceInputs(old => ({ ...old, diskGiB: value }));

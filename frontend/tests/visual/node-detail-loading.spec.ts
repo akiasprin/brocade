@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect, type Page } from '@playwright/test';
 
 type GateWindow = Window & {
@@ -15,7 +16,7 @@ async function open(page: Page, tab: string, holds: string[], width = 1440, them
   for (const path of holds) params.append('hold', path);
   if (readonly) params.set('readonly', '1');
   await page.goto(`/tests/fixtures/node-detail-loading.html?${params}`);
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   if (width < 820) {
     const tabs = page.getByRole('tablist');
     await expect(tabs).toBeVisible();

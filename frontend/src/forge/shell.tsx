@@ -57,6 +57,13 @@ import { MachineNotifications } from '../ui/machine-notifications';
 import { routeForViewer } from './access';
 import { ROLE_LABEL } from '../ui/role-label';
 import { useTopbarFit } from './topbar-fit';
+import {
+  ORCHESTRATE_LABEL,
+  ORCHESTRATE_MEMBERS,
+  isOrchestrateMember,
+  lastOrchestrateView,
+  rememberOrchestrateView,
+} from './orchestrate';
 
 const TopoCanvas = lazy(() => import('../topo/canvas').then(module => ({ default: module.TopoCanvas })));
 const OnboardingGuide = lazy(() => import('../panes/onboarding').then(module => ({ default: module.OnboardingGuide })));
@@ -73,21 +80,22 @@ interface Face {
 }
 
 // 顶栏只显示当前主工作流。规则负责选择转发目标；隧道资源本身的生命周期统一在隧道页管理。
+// 容器版的线路与容器相邻排列，由 MainNav 合成一个「编排」组（见 ./orchestrate）。
 const NAV: Face[] = [
   { key: 'nodes', label: '机器', icon: 'nodes' },
-  { key: 'cvm', label: '容器', icon: 'servers' },
   { key: 'chains', label: '线路', icon: 'chains' },
+  { key: 'cvm', label: '容器', icon: 'servers' },
   { key: 'users', label: '用户', icon: 'users' },
   { key: 'deploy', label: '发布', icon: 'deploy', roles: ['editor', 'publisher', 'tenant-admin', 'system-admin'] },
   { key: 'usage', label: '用量', icon: 'usage' },
 ];
 
-/* 手机端保留四个主要入口：基础版常驻用量，容器版在机器右侧放容器、用量收入菜单。
+/* 手机端保留四个主要入口：机器、线路（容器版为「编排」组，含线路与容器）、用户、用量。
    全部从同一份 Face 定义派生，避免角色权限和名称分叉。 */
 const MOBILE_NAV = NAV.filter(f =>
-  (CVM_ENABLED ? ['nodes', 'cvm', 'chains', 'users'] : ['nodes', 'chains', 'users', 'usage']).includes(f.key),
+  (CVM_ENABLED ? ['nodes', 'chains', 'cvm', 'users', 'usage'] : ['nodes', 'chains', 'users', 'usage']).includes(f.key),
 );
-const MOBILE_MORE = NAV.filter(f => f.key === 'deploy' || (CVM_ENABLED && f.key === 'usage'));
+const MOBILE_MORE = NAV.filter(f => f.key === 'deploy');
 
 // 收入账户牌菜单的项：都是低频访问的页面，占用顶栏位置的收益较低。
 // 窄屏同理：该行只放 NAV 的主工作流，这些低频页面仍从账户牌菜单进入。
@@ -143,6 +151,10 @@ export function ForgeShell({
      而它们提供的读数（待发布机器数、发布中状态）在该视角下不显示。 */
   const pub = isVisitor(session.who);
   const nav = st.nav;
+  // 深链接、浏览器前进后退进入的子页也算停留过，从别处点「编排」时回到这里。
+  useEffect(() => {
+    if (CVM_ENABLED && isOrchestrateMember(nav)) rememberOrchestrateView(nav);
+  }, [nav]);
   const panel = useSyncExternalStore(artifactPanel.subscribe, artifactPanel.snapshot);
   const railPresence = usePresence(panel.open && artifacts, 300);
   // 草稿版本进入该层的查询键，同时统一失效所有页面的读取缓存。
@@ -384,41 +396,89 @@ function MainNav({
   // 菜单页在桌面导航末尾临时占一格；不复制名称、图标或角色约束。
   const current = className === 'fg-nav' && visible([...MORE, ...OFF_NAV], who).find(f => f.key === nav);
   if (current) items.push(current);
+  // 容器版两项都可见时合成一组，占第一项的位置；基础版没有容器，线路仍是独立入口。
+  const members = CVM_ENABLED ? items.filter(f => isOrchestrateMember(f.key)) : [];
+  const grouped = members.length === ORCHESTRATE_MEMBERS.length;
 
   return (
     <nav className={className} aria-label="主导航">
-      {items.map(f => (
-        <button
-          key={f.key}
-          type="button"
-          className={`fg-nv${current && f.key === current.key ? ' fg-nv-context' : ''}${returning && nav === f.key ? ' is-back' : ''}`}
-          aria-current={nav === f.key ? 'true' : 'false'}
-          aria-label={returning && nav === f.key ? `返回${f.label}` : f.label}
-          title={returning && nav === f.key ? `返回${f.label}` : f.label}
-          onClick={() => (returning && nav === f.key ? returnTo(f.key) : navigate(f.key))}
-        >
-          {f.icon && <Icon of={returning && nav === f.key ? 'chevronLeft' : f.icon} size={14} className="fg-nv-ic" />}
-          <span className="fg-nv-label">{f.label}</span>
-          {f.key === 'deploy' && activeDeploy && (
-            <span
-              className={`fg-badge ${awaitingDeploy ? 'chg' : 'err'}`}
-              title={
-                awaitingDeploy
-                  ? `发布 #${awaitingDeploy.id} 的破坏性波次在等人确认——不点它不会自己往下发`
-                  : `发布 #${activeDeploy.id} 进行中`
-              }
-            >
-              {awaitingDeploy ? '等确认' : `#${activeDeploy.id}`}
-            </span>
-          )}
-          {f.key === 'deploy' && !activeDeploy && pendingChanges === true && (
-            <span className="fg-badge chg" title="节点配置有变化，进入发布页核验">
-              待发布
-            </span>
-          )}
-        </button>
-      ))}
+      {items.map(f => {
+        if (grouped && isOrchestrateMember(f.key)) {
+          return f.key === members[0]!.key ? (
+            <OrchestrateGroup key="orchestrate" members={members} nav={nav} returning={returning} />
+          ) : null;
+        }
+        return (
+          <button
+            key={f.key}
+            type="button"
+            className={`fg-nv${current && f.key === current.key ? ' fg-nv-context' : ''}${returning && nav === f.key ? ' is-back' : ''}`}
+            aria-current={nav === f.key ? 'true' : 'false'}
+            aria-label={returning && nav === f.key ? `返回${f.label}` : f.label}
+            title={returning && nav === f.key ? `返回${f.label}` : f.label}
+            onClick={() => (returning && nav === f.key ? returnTo(f.key) : navigate(f.key))}
+          >
+            {f.icon && <Icon of={returning && nav === f.key ? 'chevronLeft' : f.icon} size={14} className="fg-nv-ic" />}
+            <span className="fg-nv-label">{f.label}</span>
+            {f.key === 'deploy' && activeDeploy && (
+              <span
+                className={`fg-badge ${awaitingDeploy ? 'chg' : 'err'}`}
+                title={
+                  awaitingDeploy
+                    ? `发布 #${awaitingDeploy.id} 的破坏性波次在等人确认——不点它不会自己往下发`
+                    : `发布 #${activeDeploy.id} 进行中`
+                }
+              >
+                {awaitingDeploy ? '等确认' : `#${activeDeploy.id}`}
+              </span>
+            )}
+            {f.key === 'deploy' && !activeDeploy && pendingChanges === true && (
+              <span className="fg-badge chg" title="节点配置有变化，进入发布页核验">
+                待发布
+              </span>
+            )}
+          </button>
+        );
+      })}
     </nav>
+  );
+}
+
+/* 「编排」组：不在组内时只是一枚按钮，点它回到上次停留的子页（首次为线路）。进入后整组取选中
+   实底并展开「线路 容器」切换。下钻时沿用单项入口的约定：组按钮图标换成返回箭头，点它或当前
+   子页都回到该子页首页。 */
+function OrchestrateGroup({ members, nav, returning }: { members: Face[]; nav: NavKey; returning: boolean }) {
+  const current = members.find(f => f.key === nav);
+  const back = !!current && returning;
+  const headLabel = back ? `返回${current.label}` : ORCHESTRATE_LABEL;
+  return (
+    <span className={`fg-nv-group${current ? ' is-open' : ''}`} role="group" aria-label={ORCHESTRATE_LABEL}>
+      <button
+        type="button"
+        className={`fg-nv${back ? ' is-back' : ''}`}
+        aria-current={current ? 'true' : 'false'}
+        aria-label={headLabel}
+        title={headLabel}
+        onClick={() => (back ? returnTo(nav) : navigate(current ? nav : lastOrchestrateView()))}
+      >
+        <Icon of={back ? 'chevronLeft' : 'orchestrate'} size={14} className="fg-nv-ic" />
+        <span className="fg-nv-label">{ORCHESTRATE_LABEL}</span>
+      </button>
+      {current && (
+        <span className="fg-nv-sub">
+          {members.map(f => (
+            <button
+              key={f.key}
+              type="button"
+              aria-current={f.key === nav ? 'true' : 'false'}
+              onClick={() => (back && f.key === nav ? returnTo(f.key) : navigate(f.key))}
+            >
+              {f.label}
+            </button>
+          ))}
+        </span>
+      )}
+    </span>
   );
 }
 
@@ -835,9 +895,10 @@ function TopBar({
 
   if (narrow) {
     /* 窄屏只有这一行：品牌 + 四个主要入口 + 通知 + 账户牌。其他页面、产物和诊断
-       收入账户菜单。下钻时只更换选中格的图标，不增加第二行。 */
+       收入账户菜单。下钻时只更换选中格的图标，不增加第二行。编排展开后放不下时由
+       useTopbarFit 逐级让位。 */
     return (
-      <div className="fg-top fg-navrow">
+      <div className="fg-top fg-navrow" ref={topRef}>
         <BrandHome branding={branding} />
         <MainNav
           className="fg-facebar"

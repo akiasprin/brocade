@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect, type Locator, type Page } from '@playwright/test';
 
 async function bounded(page: Page, surface: Locator) {
@@ -41,7 +42,7 @@ for (const [width, height] of [
         el.scrollTop = el.scrollHeight;
       });
       await expect(dialog.getByRole('button', { name: '保存额度' })).toBeInViewport();
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(dialog).toHaveScreenshot(`quota-short-${width}-${theme}.png`);
       await dialog
         .getByRole('button', { name: '关闭', exact: true })
@@ -59,7 +60,7 @@ for (const [width, height] of [
       const surface = page.locator('.dialog-layer.modal > .confirm-card');
       await bounded(page, surface);
       await expect(surface.locator('.confirm-actions button').last()).toBeInViewport();
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(surface).toHaveScreenshot(`deployment-short-${width}-${theme}.png`);
     });
   }

@@ -69,13 +69,13 @@ test('流量预测是管理员独立页面，桌面与手机都从账户菜单�
   const mobileNav = shell.match(/const MOBILE_NAV = ([^;]+);/)?.[1] ?? '';
   const mobileMore = shell.match(/const MOBILE_MORE = ([\s\S]*?);\n/)?.[1] ?? '';
   const routable = state.match(/export const NAV_KEYS = \[([\s\S]*?)\n\]/)?.[1] ?? '';
-  assert.match(mobileNav, /CVM_ENABLED \? \['nodes', 'cvm', 'chains', 'users'\]/);
+  // 容器版的线路与容器在主导航里合成一个「编排」组，手机仍是四个入口，用量常驻。
+  assert.match(mobileNav, /CVM_ENABLED \? \['nodes', 'chains', 'cvm', 'users', 'usage'\]/);
   assert.match(mobileNav, /: \['nodes', 'chains', 'users', 'usage'\]/);
   assert.match(shell, /faces=\{MOBILE_NAV\}/);
   assert.doesNotMatch(mobileNav, /tunnels|deploy|capacity/);
   assert.match(mobileMore, /f\.key === 'deploy'/);
-  assert.match(mobileMore, /f\.key === 'usage'/);
-  assert.doesNotMatch(mobileMore, /users|capacity/);
+  assert.doesNotMatch(mobileMore, /users|usage|capacity/);
   assert.match(nav, /key: 'nodes'/);
   assert.doesNotMatch(nav, /key: 'capacity'/);
   assert.match(more, /key: 'capacity'[\s\S]*?label: '预测'[\s\S]*?hideFromPublic: true/);

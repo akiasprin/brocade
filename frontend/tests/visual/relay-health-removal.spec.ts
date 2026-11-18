@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 for (const [width, theme] of [
@@ -18,7 +19,7 @@ for (const [width, theme] of [
       await expect(tab).toBeVisible();
       await expect(tab.locator('.nd-tab-badge')).toHaveCount(badge ? 1 : 0);
       await expect(page.getByRole('heading', { name: '运行状态', exact: true })).toBeAttached();
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(page.locator('.nd-tabs')).toHaveScreenshot(`observation-tabs-${width}-${theme}-${badge}.png`);
       const runtime = page.locator('.nd-runtime');
       const cube = runtime.getByText(nodeId === 'hk-hkix' ? 'CUBE[KVM]' : 'CUBE', { exact: true });
@@ -62,7 +63,7 @@ for (const [width, theme] of [
       await expect(extensions.getByText('OPENVPN', { exact: true })).toBeVisible();
       await expect(cube).toHaveCSS('font-family', /sans-serif/);
       await expect(cube).not.toHaveCSS('font-family', /monospace/);
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(extensions).toHaveScreenshot(`extensions-${cubeState}-${width}-${theme}.png`);
     });
   }
@@ -83,7 +84,7 @@ for (const [width, theme] of [
       'title',
       'CUBE[PVM] 扩展 · 已启用',
     );
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(extensions).toHaveScreenshot(`extensions-pvm-${width}-${theme}.png`);
   });
 }

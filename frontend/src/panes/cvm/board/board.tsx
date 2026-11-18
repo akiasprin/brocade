@@ -391,7 +391,7 @@ export function CompositionBoard({
                   />
                 </div>
                 {caps && (
-                  <div className="cz-cap" title="逻辑已分配 / 宿主基准 · 允许超售">
+                  <div className="cz-cap" title="已分配 / 宿主容量">
                     {[
                       {
                         label: 'vCPU',
@@ -408,10 +408,7 @@ export function CompositionBoard({
                     ].map(row => (
                       <span key={row.label}>
                         <small>{row.label}</small>
-                        <b>
-                          {row.text}
-                          {row.used > row.total ? ' · 超售' : ''}
-                        </b>
+                        <b>{row.text}</b>
                         <i className="cz-meter" aria-hidden="true">
                           <i style={{ width: `${row.total > 0 ? Math.min(100, (row.used / row.total) * 100) : 0}%` }} />
                         </i>

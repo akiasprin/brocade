@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 for (const [width, theme] of [
@@ -25,7 +26,7 @@ for (const [width, theme] of [
     await expect(ledger.locator('.rut-hero-sub')).toHaveText('0 位活跃 · — 位已授权');
     await expect(page.getByText('用户授权信息尚未取得', { exact: true })).toHaveCount(0);
     await expect(page.getByText('尚无用户授权到这些机器')).toHaveCount(0);
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(page).toHaveScreenshot(`authorization-unknown-${width}.png`);
 
     await page.clock.runFor(10_000);
@@ -43,6 +44,6 @@ test('confirmed empty grants have a separate empty state', async ({ page }) => {
   await page.goto('/tests/fixtures/fleet-traffic-preview.html?scene=empty&theme=light&nav=0&run=0');
   await expect(page.getByText('尚无用户授权到这些机器', { exact: true })).toBeVisible();
   await expect(page.locator('.rut-hero-sub')).toHaveText('0 位活跃 · 0 位已授权');
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   await expect(page).toHaveScreenshot('authorization-empty.png');
 });

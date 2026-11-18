@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect, chromium, webkit } from '@playwright/test';
 
 const route = '/tests/fixtures/user-app-rate-preview.html';
@@ -28,7 +29,7 @@ for (const width of [1440, 390]) {
         await expect(card.locator('.qta-left')).toHaveCount(0);
         await expect(card.locator('.qta-figs')).toHaveText(Array(7).fill('—'));
       }
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       expect(await card.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(false);
       await expect(card).toHaveScreenshot(`${scene}-${width}.png`);
       expect(errors).toEqual([]);

@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 const scenes = [
@@ -77,7 +78,7 @@ for (const engine of ['chromium', 'webkit'] as const)
             }
             expect(await header.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(false);
             expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
-            await page.evaluate(() => document.fonts.ready);
+            await waitForVisualAssets(page);
             await expect(header).toHaveScreenshot(`${engine}-${scene.name}-${width}-${theme}.png`);
 
             if (scene.name === 'machine') {

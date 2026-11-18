@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect, type Page } from '@playwright/test';
 
 async function preview(page: Page, width: number, height: number, theme = 'dark') {
@@ -5,7 +6,7 @@ async function preview(page: Page, width: number, height: number, theme = 'dark'
   await page.setViewportSize({ width, height });
   await page.goto(`/tests/fixtures/tunnel-layout-preview.html?theme=${theme}`);
   await expect(page.locator('.tunnel-row.manual-row')).toHaveCount(60);
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
 }
 
 async function openEditor(page: Page, protocol: string) {

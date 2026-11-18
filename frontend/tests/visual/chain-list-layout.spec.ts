@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect, type Page } from '@playwright/test';
 
 async function openCards(page: Page, width: number, theme = 'dark', role = 'system-admin') {
@@ -9,7 +10,7 @@ async function openCards(page: Page, width: number, theme = 'dark', role = 'syst
     `/tests/fixtures/chain-unlock-preview.html?view=cards&scene=calm&theme=${theme}&role=${role}#/chains`,
   );
   await expect(page.locator('.chain-card')).toHaveCount(16);
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   return errors;
 }
 

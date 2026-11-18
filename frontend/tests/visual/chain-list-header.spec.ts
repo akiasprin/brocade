@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect, type Page } from '@playwright/test';
 
 async function expectHeaderLayout(page: Page, selecting = false) {
@@ -30,7 +31,7 @@ for (const width of [320, 390, 482, 760, 1440])
       await page.setViewportSize({ width, height: 1000 });
       await page.goto(`/tests/fixtures/chain-unlock-preview.html?view=cards&scene=calm&theme=${theme}#/chains`);
       await expect(page.locator('.chain-card')).toHaveCount(16);
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expectHeaderLayout(page);
       const header = page.locator('.chain-list-panel > header');
       await expect(header).toHaveScreenshot(`chain-header-${width}-${theme}.png`);

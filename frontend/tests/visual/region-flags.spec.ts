@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 for (const browserName of ['chromium', 'webkit'] as const) {
@@ -8,14 +9,7 @@ for (const browserName of ['chromium', 'webkit'] as const) {
         await page.setViewportSize({ width: 640, height: 800 });
         await page.goto(`/tests/fixtures/region-flags-preview.html?theme=${theme}`);
         await expect(page.locator('.flag-preview .geo-flag')).toHaveCount(30);
-        await page.evaluate(async () => {
-          await document.fonts.ready;
-          const image = new Image();
-          image.src = getComputedStyle(document.querySelector('.geo-flag')!).backgroundImage.match(
-            /url\("([^"]+)"\)/,
-          )![1];
-          await image.decode();
-        });
+        await waitForVisualAssets(page);
 
         // These flat-color edges must never contain pixels from the adjoining sprite rows.
         for (const [code, edge, color] of [
@@ -86,13 +80,7 @@ for (const browserName of ['chromium', 'webkit'] as const) {
       const preview = await flags.screenshot();
       await expect(flags).toHaveScreenshot(`${browserName}-pending-vector.png`);
       release();
-      await page.evaluate(async () => {
-        const image = new Image();
-        image.src = getComputedStyle(document.querySelector('.geo-flag')!).backgroundImage.match(
-          /url\("([^"]+)"\)/,
-        )![1];
-        await image.decode();
-      });
+      await waitForVisualAssets(page);
       await expect(flags).toHaveScreenshot(`${browserName}-ready-vector.png`);
       expect((await flags.screenshot()).equals(preview)).toBe(false);
     } finally {

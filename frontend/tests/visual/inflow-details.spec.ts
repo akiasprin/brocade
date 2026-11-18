@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect, type Page } from '@playwright/test';
 
 async function open(page: Page, query: string, width: number) {
@@ -8,7 +9,7 @@ async function open(page: Page, query: string, width: number) {
   await page.goto(`/tests/fixtures/inflow-details-preview.html?${query}`);
   const dialog = page.getByRole('dialog', { name: 'alice · 流入明细' });
   await expect(dialog.locator('.nid-body')).toBeVisible();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   return { dialog, surface: dialog.locator('.dialog-surface'), errors };
 }
 

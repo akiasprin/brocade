@@ -1,4 +1,5 @@
 import { expect, type Page } from '@playwright/test';
+import { waitForVisualAssets } from './visual-ready';
 
 export interface LayerCase {
   id: string;
@@ -145,7 +146,7 @@ export const layerCases: LayerCase[] = [
     mode: 'modal',
     open: async page => {
       await page.getByRole('button', { name: '解锁', exact: true }).click();
-      await expect(page.getByRole('article')).toHaveCount(13);
+      await expect(page.getByRole('dialog', { name: /解锁/ }).getByRole('article')).toHaveCount(13);
     },
   },
   {
@@ -154,7 +155,20 @@ export const layerCases: LayerCase[] = [
     mode: 'popover',
     open: async page => {
       await page.getByRole('button', { name: '解锁', exact: true }).click();
-      await page.getByRole('button', { name: 'YouTube 分项', exact: true }).click();
+      await waitForVisualAssets(page);
+      // Center the trigger only after the opening transform settles, so the scroll
+      // position does not depend on which animation frame the browser measured.
+      await page.getByRole('dialog', { name: /解锁/ }).evaluate(async dialog => {
+        await Promise.all(
+          dialog
+            .getAnimations({ subtree: true })
+            .filter(animation => animation.effect?.getComputedTiming().iterations !== Infinity)
+            .map(animation => animation.finished.catch(() => {})),
+        );
+      });
+      const detail = page.getByRole('button', { name: 'YouTube 分项', exact: true });
+      await detail.evaluate(button => button.scrollIntoView({ block: 'center', behavior: 'instant' }));
+      await detail.click();
     },
   },
   {

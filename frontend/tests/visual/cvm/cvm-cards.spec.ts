@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from '../helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const width of [1440, 390, 320])
@@ -11,7 +12,7 @@ for (const width of [1440, 390, 320])
       await page.goto(`/tests/fixtures/cvm/preview.html?scene=fleet&theme=${theme}`);
       // The container home is the composition board; phones get the grouped list.
       await expect(page.locator(width > 820 ? '.cz-pill' : '.cz-phone-row')).toHaveCount(7);
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(page).toHaveScreenshot(`fleet-${width}-${theme}.png`);
       await page.getByRole('tab', { name: '额度', exact: true }).click();
       await expect(page.getByRole('table', { name: '用户额度' })).toBeVisible();

@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 for (const { width, theme } of [
@@ -13,7 +14,7 @@ for (const { width, theme } of [
     await card.getByLabel('机器流量额度单位').selectOption('GiB');
     await card.getByLabel('机器流量额度', { exact: true }).fill('2000.5');
     await expect(card.locator('.node-traffic-used')).toContainText('/ 2000.5 GiB');
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(card).toHaveScreenshot(`machine-gib-${width}-${theme}.png`, { animations: 'disabled' });
     expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
   });
@@ -25,7 +26,7 @@ for (const { width, theme } of [
     await page.getByRole('button', { name: '修改', exact: true }).click();
     await page.getByLabel('跨区域高流量机器 机器配额单位').selectOption('GiB');
     await page.getByLabel('跨区域高流量机器 机器配额', { exact: true }).fill('250.5');
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(page.locator('.cap-d-foot')).toHaveScreenshot(`forecast-gib-${width}-${theme}.png`, {
       animations: 'disabled',
     });

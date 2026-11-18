@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 for (const theme of ['dark', 'light']) {
@@ -11,7 +12,7 @@ for (const theme of ['dark', 'light']) {
         'data-state',
         'ready',
       );
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await page.getByRole('button', { name: /账户与更多功能/ }).click();
       const menu = page.getByRole('menu', { name: '账户与更多功能' });
       await expect(menu).toBeVisible();

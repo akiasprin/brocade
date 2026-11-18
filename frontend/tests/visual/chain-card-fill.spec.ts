@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const width of [1440, 390])
@@ -10,7 +11,7 @@ for (const width of [1440, 390])
       await page.goto(`/tests/fixtures/chain-unlock-preview.html?view=cards&scene=calm&theme=${theme}#/chains`);
       const card = page.locator('.chain-card').first();
       await expect(card).toBeVisible();
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       const fill = await card.evaluate(el => getComputedStyle(el).backgroundColor);
       await expect(page).toHaveScreenshot(`chain-fill-${width}-${theme}.png`);
       await page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: '机器', exact: true }).click();

@@ -67,7 +67,6 @@ export function CapacityRows({
           <CapacityMeter used={row.used} total={row.total} allowOversell={allowOversell} />
           <b>
             {row.format(row.used)} / {row.format(row.total)}
-            {allowOversell && row.used > row.total && <small> · 已超售</small>}
           </b>
         </div>
       ))}

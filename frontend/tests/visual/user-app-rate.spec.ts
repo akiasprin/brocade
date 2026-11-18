@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect, type Page } from '@playwright/test';
 const route = '/tests/fixtures/user-app-rate-preview.html';
 const errors = new WeakMap<Page, string[]>();
@@ -26,7 +27,7 @@ async function open(page: Page, query = '') {
     await expect(page.getByRole('listbox', { name: '用户列表' })).toBeVisible();
     await expect(page.getByRole('listbox', { name: '用户列表' })).not.toContainText('额度已用满');
   }
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
 }
 async function edit(page: Page, id: string) {
   const row = group(page, id);
@@ -64,7 +65,7 @@ test('production page exposes the quota editor for each synthetic group', async 
   await expect(page.getByRole('heading', { name: '用量与额度', exact: true })).toBeVisible();
   await expect(page.locator('.user-access-quotas .qta-r')).toHaveCount(7);
   await expect(page.getByRole('button', { name: 'APAC Promising · 额度与限速', exact: true })).toBeVisible();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   await expect(page).toHaveScreenshot('production-reference-desktop.png', { fullPage: true });
 });
 for (const [name, width, theme, id] of [

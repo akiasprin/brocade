@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from '../helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 for (const width of [1440, 390, 320])
   for (const theme of ['light', 'dark']) {
@@ -11,10 +12,10 @@ for (const width of [1440, 390, 320])
       await expect(page.getByText('3 / 1', { exact: false })).toBeVisible();
       await expect(page.getByText('可创建', { exact: true })).toBeVisible();
       await expect(page.locator('.cvm-host-card .cvm-meter.bad')).toHaveCount(0);
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(page).toHaveScreenshot(`oversold-host-${width}-${theme}.png`, { fullPage: true });
       await page.getByRole('tab', { name: '额度', exact: true }).click();
-      await expect(page.getByText(/额度可高于宿主资源基准/)).toBeVisible();
+      await expect(page.getByText('CPU、内存和系统盘按分配规格计入用户额度。', { exact: true })).toBeVisible();
       await expect(page).toHaveScreenshot(`oversold-quota-${width}-${theme}.png`, { fullPage: true });
       await page.getByRole('button', { name: '编辑额度', exact: true }).click();
       await expect(page.getByRole('dialog')).toHaveScreenshot(`oversold-quota-editor-${width}-${theme}.png`);
@@ -22,7 +23,7 @@ for (const width of [1440, 390, 320])
       await page.getByRole('tab', { name: '组合台', exact: true }).click();
       await page.getByRole('button', { name: '＋ 创建容器', exact: true }).click();
       await expect(page.getByRole('spinbutton', { name: 'CPU（核）' })).toBeVisible();
-      await expect(page.getByText(/宿主基准 1 核/)).toBeVisible();
+      await expect(page.getByText(/宿主容量 1 核/)).toBeVisible();
       expect(
         await page.locator('.cvm-host-pick .cz-cap b').evaluateAll(values =>
           values.every(value => {

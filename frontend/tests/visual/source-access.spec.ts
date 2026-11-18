@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const [name, width, theme] of [
@@ -20,7 +21,7 @@ for (const [name, width, theme] of [
     await expect(card.locator('.user-presence-row', { hasText: '203.0.113.17' })).toHaveCount(1);
     await expect(page.getByRole('group', { name: '来源 IP 封禁' })).toHaveCount(0);
     await card.scrollIntoViewIfNeeded();
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     expect(await card.evaluate(element => element.scrollWidth > element.clientWidth)).toBe(false);
     expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
     await expect(card).toHaveScreenshot(`${name}-source-access.png`);

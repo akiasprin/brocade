@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const [name, width, height] of [
@@ -9,7 +10,7 @@ for (const [name, width, height] of [
     await page.setViewportSize({ width, height });
     await page.goto('/tests/fixtures/user-header-preview.html?palette=dailan&theme=light&presence=sources&apps=two');
     await expect(page.locator('.user-usage-ledger')).toBeVisible();
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(page).toHaveScreenshot(`light-blue-${name}.png`, { threshold: 0.05 });
 
     const measurements = await page.evaluate(() => {

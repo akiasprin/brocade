@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
 const fixture = '/tests/fixtures/rule-flow-preview.html';
@@ -68,7 +69,7 @@ for (const browserName of ['chromium', 'webkit'] as const) {
         expect(Math.min(...cardTops)).toBeGreaterThan(searchBounds.y + searchBounds.height);
         await expect(page.locator('.flow-machine')).toHaveCount(5);
         await expect(page.locator('.flow-wires path')).toHaveCount(10);
-        await page.evaluate(() => document.fonts.ready);
+        await waitForVisualAssets(page);
         const headings = await page.locator('.flow-machine-head').evaluateAll(heads =>
           heads.map(head => {
             const port = head.querySelector('.flow-listen')!.getBoundingClientRect();
@@ -125,7 +126,7 @@ for (const browserName of ['chromium', 'webkit'] as const) {
         page.on('pageerror', error => errors.push(error.message));
         await page.setViewportSize({ width, height: 1100 });
         await page.goto(`${fixture}?theme=${theme}`);
-        await page.evaluate(() => document.fonts.ready);
+        await waitForVisualAssets(page);
         const opener = page.locator('.flow-machine').first().locator('li button').first();
         await opener.click();
         const inspector = page.getByRole('dialog', { name: '链路检视' });
@@ -241,7 +242,7 @@ for (const browserName of ['chromium', 'webkit'] as const) {
     const wire = page.locator('.flow-wires path').first();
     const outlet = source.locator('[data-flow-outlet]').first();
     await expect(wire).toBeAttached();
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     const rules = await source.locator('.flow-match').allTextContents();
     const before = (await head.boundingBox())!;
     const beforeWire = await wire.getAttribute('d');
@@ -271,7 +272,7 @@ for (const browserName of ['chromium', 'webkit'] as const) {
       await page.goto(`${fixture}?theme=light`);
       const head = page.locator('.flow-machine-head').first();
       await expect(page.locator('.flow-wires path').first()).toBeAttached();
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       const before = (await head.boundingBox())!;
       await dragMachine(page, head, 50, 32, false);
       await page.keyboard.press('Escape');
@@ -413,7 +414,7 @@ test('machine chain headings and separators match the adopted design', async ({ 
   await page.setViewportSize({ width: 1440, height: 1100 });
   await page.goto(`${fixture}?node&theme=dark`);
   const sections = page.locator('.chain-rule-section');
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   await expect(sections.first()).toHaveScreenshot('machine-flow-first-chain-dark.png');
   await expect(sections.nth(3)).toHaveScreenshot('machine-flow-simple-chain-dark.png');
   const separator = await page

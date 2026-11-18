@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const [width, theme] of [
@@ -15,7 +16,7 @@ for (const [width, theme] of [
     const targets = page.getByRole('region', { name: '嗅探失败明细' });
     await expect(domains).toContainText('最早记录：今天 02:00');
     await expect(targets).toContainText('最早记录：今天 02:00');
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(domains).toHaveScreenshot(`day-${width}-${theme}.png`);
 
     await page.getByRole('button', { name: '当周', exact: true }).click();

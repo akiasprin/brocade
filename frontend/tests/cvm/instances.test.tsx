@@ -719,7 +719,7 @@ it('permits logical CPU memory and disk above the host baseline while keeping us
   fireEvent.change(screen.getByRole('spinbutton', { name: 'CPU（核）' }), { target: { value: '2' } });
   fireEvent.change(screen.getByRole('spinbutton', { name: '内存（MiB）' }), { target: { value: '512' } });
   fireEvent.change(screen.getByRole('spinbutton', { name: '系统盘（GiB）' }), { target: { value: '8' } });
-  expect(screen.getAllByText(/允许超售/).length).toBeGreaterThan(0);
+  expect(screen.queryByText(/超售/)).toBeNull();
   const create = screen.getByRole('button', { name: '创建实例' });
   expect((create as HTMLButtonElement).disabled).toBe(false);
   fireEvent.click(create);

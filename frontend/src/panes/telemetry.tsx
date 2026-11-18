@@ -2620,10 +2620,7 @@ const LoadDashboard = memo(function LoadDashboard({
             {/* steal 只在可读到时挂后缀：>= 0.1% 才显示——裸金属恒为 0，
                 常显的「STEAL 0.0%」是不携带信息的噪声 */}
             {last.cpu_steal_pct >= 0.1 && (
-              <span
-                className="kpi-sub"
-                title="steal：虚拟机想要 CPU 但宿主机分给了其他虚拟机的时长占比。超售的 VPS 上该值持续非零"
-              >
+              <span className="kpi-sub" title="steal：虚拟机等待宿主机分配 CPU 的时长占比。">
                 STEAL {pct(last.cpu_steal_pct, 1)}
               </span>
             )}

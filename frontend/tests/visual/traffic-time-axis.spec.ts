@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
 
 async function inspect(page: Page) {
@@ -69,7 +70,7 @@ for (const [width, theme] of [
       const history = page.getByRole('region', { name: '所选区间历史流量' });
       await expect(history).toContainText(`${period} ·`);
       await expect.poll(() => inspect(page)).not.toBeNull();
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(history).toHaveScreenshot(`traffic-${period}-${width}-${theme}.png`);
       const value = (await inspect(page))!;
       expect(value.labels.length).toBeGreaterThan(2);
@@ -111,7 +112,7 @@ for (const [width, theme] of [
     expect(value.labels.every((label: string) => /^10-\d{2}\n\d{2}:\d{2}$/.test(label))).toBe(true);
     expect(new Set(value.labels).size).toBe(value.labels.length);
     expect(value.visibleLabels).toEqual(value.labels);
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     // The custom-range banner can place HTML title glyphs on a fractional pixel. Metadata is
     // asserted above; compare the plotted dates directly, independently of that title placement.
     await expect(history.locator('.ndtp-bars')).toHaveScreenshot(`traffic-custom-${width}-${theme}.png`);
@@ -145,7 +146,7 @@ test.describe('fixed calendar ranges in a UTC browser', () => {
       expect(new Set(value.labels).size).toBe(value.labels.length);
       expect(value.tooltip).toContain('10-18 17:00 – 10-18 18:00');
       expect(value.tooltip).not.toContain('现在');
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       await expect(sites).toHaveScreenshot(`sites-custom-${width}-${theme}.png`);
       expect(errors).toEqual([]);
     });

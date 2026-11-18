@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test as base, expect, chromium, webkit, type Locator, type Page } from '@playwright/test';
 import jsQR from 'jsqr';
 import { readFile } from 'node:fs/promises';
@@ -40,7 +41,7 @@ async function preview(page: Page, width: number, height: number, theme: string,
   await page.setViewportSize({ width, height });
   await page.goto(`/tests/fixtures/user-header-preview.html?theme=${theme}&subscription=deferred${extra}`);
   await expect(page.locator('.user-account-state')).toBeVisible();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   return errors;
 }
 

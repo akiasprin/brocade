@@ -206,21 +206,18 @@ for (const role of ['readonly', 'public']) {
   });
 }
 
-test('phone keeps containers visible and usage reachable from More for signed-in viewers and guests', async ({
+test('phone keeps the orchestrate entry and usage in the main row for signed-in viewers and guests', async ({
   page,
 }) => {
   await page.setViewportSize({ width: 320, height: 900 });
-  await open(page, '/nodes', 'theme=light');
-  await fits(page);
   const main = page.getByRole('navigation', { name: '主导航' });
-  await expect(main.getByRole('button', { name: '容器', exact: true })).toBeVisible();
-  await expect(main.getByRole('button', { name: '用量', exact: true })).toHaveCount(0);
-  await page.getByRole('button', { name: /账户与更多功能/ }).click();
-  await expect(page.getByRole('menuitem', { name: '用量', exact: true })).toBeVisible();
-  await open(page, '/nodes', 'role=public');
-  await fits(page);
-  await expect(main.getByRole('button', { name: '容器', exact: true })).toBeVisible();
-  await expect(main.getByRole('button', { name: '用量', exact: true })).toHaveCount(0);
-  await page.getByRole('button', { name: '登录与更多功能', exact: true }).click();
-  await expect(page.getByRole('menuitem', { name: '用量', exact: true })).toBeVisible();
+  for (const query of ['theme=light', 'role=public']) {
+    await open(page, '/nodes', query);
+    await fits(page);
+    await expect(main.getByRole('button', { name: '编排', exact: true })).toBeVisible();
+    await expect(main.getByRole('button', { name: '用量', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: /(账户|登录)与更多功能/ }).click();
+    await expect(page.getByRole('menuitem', { name: '用量', exact: true })).toHaveCount(0);
+    await page.keyboard.press('Escape');
+  }
 });

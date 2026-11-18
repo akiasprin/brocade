@@ -25,9 +25,7 @@ export function QuotaList({ workspace }: { workspace: CvmWorkspace }) {
           {owners.length} 位用户 · {granted} 位已授权 · 已分配 / 用户上限
         </small>
       </header>
-      <p className="note">
-        CPU、内存和系统盘按逻辑分配计入用户额度，额度可高于宿主资源基准。创建和改配仍须满足用户上限。
-      </p>
+      <p className="note">CPU、内存和系统盘按分配规格计入用户额度。</p>
       {!owners.length ? (
         <EmptyState icon="users" title="尚无可授权用户">
           创建用户后可在此分配额度。
@@ -202,7 +200,6 @@ function QuotaDialog({
         </header>
         <div className="tunnel-dialog-body cvm-dialog-body">
           <fieldset disabled={save.isPending} className="cvm-form-fieldset">
-            <p className="note">用户总额可高于宿主物理容量；超售不会被宿主容量拦截。网络连接额度使用独立预算。</p>
             <div className="cvm-form-grid">
               <label>
                 使用用户

@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 const links =
@@ -10,7 +11,7 @@ async function open(page: import('@playwright/test').Page, width: number, height
   const dialog = page.getByRole('dialog', { name: 'alice 的订阅与节点' });
   await dialog.getByRole('button', { name: '规则', exact: true }).click();
   await expect(dialog.getByRole('button', { name: '保存规则', exact: true })).toBeVisible();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   return dialog;
 }
 for (const [width, height, theme] of [

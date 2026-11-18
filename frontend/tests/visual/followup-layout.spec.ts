@@ -1,9 +1,10 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Page, type Locator } from '@playwright/test';
 async function open(page: Page, scene: string, width: number, theme = 'light', name = 'long') {
   await page.clock.install({ time: new Date('2026-10-25T12:00:00Z') });
   await page.setViewportSize({ width, height: width === 1440 ? 1000 : 568 });
   await page.goto(`/tests/fixtures/followup-layout-preview.html?scene=${scene}&theme=${theme}&name=${name}`);
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
 }
 for (const [width, name, theme] of [
   [320, 'long', 'light'],

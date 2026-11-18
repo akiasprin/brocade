@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from '../helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 import { openBoardInstance } from '../helpers/cvm-board';
 
@@ -16,7 +17,7 @@ for (const [width, theme] of [
     await expect(navigation.getByRole('button', { name: '容器', exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: '＋ 创建容器', exact: true })).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'WebShell 管理', exact: true })).toHaveCount(0);
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(page).toHaveScreenshot(`guest-list-${width}-${theme}.png`);
     await page.getByRole('tab', { name: '宿主', exact: true }).click();
     await expect(page.locator('.cvm-host-card')).toHaveCount(1);

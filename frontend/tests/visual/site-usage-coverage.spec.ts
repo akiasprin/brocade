@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const [width, theme] of [
@@ -16,7 +17,7 @@ for (const [width, theme] of [
     await expect(plot.locator('.site-usage-meta')).toHaveText(/下行.*上行/);
     await expect(plot.locator('.site-usage-meta .warn')).toHaveCount(0);
     await expect(plot.getByRole('img', { name: '站点流量随时间分布' }).locator('canvas')).toBeVisible();
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(plot).toHaveScreenshot(`retained-${width}-${theme}.png`);
     expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
     expect(errors).toEqual([]);

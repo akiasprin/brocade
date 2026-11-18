@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 for (const width of [1440, 390]) {
@@ -15,7 +16,7 @@ for (const width of [1440, 390]) {
       await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
       await expect(page.locator('html')).toHaveAttribute('data-palette', 'dailan');
       await expect(page.locator('meta[name="color-scheme"]')).toHaveAttribute('content', 'light');
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       // The new default must render exactly like an explicit light preference.
       await expect(page).toHaveScreenshot(`login-${width}-light.png`);
     });

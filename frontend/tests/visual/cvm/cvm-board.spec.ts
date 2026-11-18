@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from '../helpers/visual-ready';
 import { test, expect, type Page } from '@playwright/test';
 
 async function open(page: Page, width: number, theme: string) {
@@ -7,7 +8,7 @@ async function open(page: Page, width: number, theme: string) {
   const errors: string[] = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.goto(`/tests/fixtures/cvm/preview.html?scene=board&theme=${theme}`);
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   return errors;
 }
 

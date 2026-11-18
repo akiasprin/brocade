@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
 
 // 新建链的「路径」与链路规则渲染同一套部件：规则表、目标菜单、拨号菜单、下一跳与 DNS 弹层。
@@ -7,7 +8,7 @@ async function open(page: Page, width: number, theme: string, height = 900) {
   await page.setViewportSize({ width, height });
   await page.goto(`/tests/fixtures/navigation-preview.html?theme=${theme}#/nodes/chain/jp-iij`);
   await expect(page.getByRole('heading', { name: '新建链', exact: true })).toBeVisible();
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
 }
 
 const entry = (page: Page) => page.locator('.wzr-tree .chain-rule-tree > .chain-rule-node > .chain-rule-body');

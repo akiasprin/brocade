@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const width of [1440, 390]) {
@@ -15,7 +16,7 @@ for (const width of [1440, 390]) {
     await expect(dialog.getByText('检测未就绪，稍后重试', { exact: true })).toBeVisible();
     await expect(dialog.getByText('机器无 IPv6 地址', { exact: true })).toHaveCount(0);
     await expect(dialog.getByText('需要更新线路配置', { exact: true })).toHaveCount(0);
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await expect(page).toHaveScreenshot(`path-readiness-${width}.png`);
   });
 }

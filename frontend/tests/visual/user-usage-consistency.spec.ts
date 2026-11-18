@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const width of [1440, 820, 760, 600, 390]) {
@@ -10,7 +11,7 @@ for (const width of [1440, 820, 760, 600, 390]) {
       await page.goto(`/tests/fixtures/user-header-preview.html?forwarding=quota&forwardingUsage=1&theme=${theme}`);
       const access = page.locator('.user-usage-card:not(.user-forwarding-usage)');
       await expect(access.locator('.qta-policy-flag')).toHaveText('用满后限速 5 Mbps');
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       const reset = await access.locator('.user-usage-reset').innerText();
       const layout = async (selector: string) =>
         page.locator(selector).evaluate(card => {

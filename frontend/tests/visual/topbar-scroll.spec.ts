@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 for (const engine of ['chromium', 'webkit'] as const) {
@@ -42,7 +43,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
               const title = (await page.locator('.nd-page-head').boundingBox())!;
               expect(title.y).toBeGreaterThanOrEqual(0);
             }
-            await page.evaluate(() => document.fonts.ready);
+            await waitForVisualAssets(page);
             await expect(page).toHaveScreenshot(`${engine}-${width}-${theme}-scrolled.png`, {
               clip: { x: 0, y: 0, width, height: 210 },
             });

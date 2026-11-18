@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const width of [320, 390, 820, 1440]) {
@@ -13,7 +14,7 @@ for (const width of [320, 390, 820, 1440]) {
       const authorization = page.getByRole('status', { name: '读取转发授权' });
       await expect(rules).toBeVisible();
       await expect(authorization).toBeVisible();
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       const card = page.locator('.fwr-panel');
       const layouts = await page.locator('.user-forwarding-usage,.fwr-panel').evaluateAll(cards =>
         cards.map(card => {
@@ -51,7 +52,7 @@ for (const width of [390, 1440]) {
       const card = page.locator('.fwr-panel');
       await expect(card.locator('.fwr-item').first()).toBeVisible();
       expect(await card.locator('.fwr-item').count()).toBeGreaterThanOrEqual(5);
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       const layout = await card.evaluate(card => {
         const bounds = card.getBoundingClientRect();
         const header = card.querySelector(':scope > header')!.getBoundingClientRect();

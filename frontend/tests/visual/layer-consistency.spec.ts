@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test as base, chromium, webkit, type Page } from '@playwright/test';
 import { writeFile } from 'node:fs/promises';
 import { layerCases, layerMetrics, themedUrl } from './helpers/layer-cases';
@@ -24,7 +25,7 @@ const webkitDesktopCases = new Set([
 const shortDesktopCases = new Set(['dynamic-confirmation', 'dns-import', 'node-inflow', 'cvm-quota']);
 
 async function ready(page: Page) {
-  await page.evaluate(() => document.fonts.ready);
+  await waitForVisualAssets(page);
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 }
 

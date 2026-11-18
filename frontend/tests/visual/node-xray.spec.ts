@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 for (const [width, theme] of [
   [1440, 'light'],
@@ -30,7 +31,7 @@ for (const [width, theme] of [
     await expect(connection.locator('input').first()).toBeEnabled();
     await connection.locator('input').first().fill('600');
     await expect(connection.locator('input').first()).toHaveValue('600');
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
     await panel
       .locator('.panel')
       .filter({ has: page.getByRole('heading', { name: 'XRAY', exact: true }) })

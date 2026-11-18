@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
 
 // 香港 AKILE II 第一条规则的目标是这组截图一直使用的入口。
@@ -31,7 +32,7 @@ for (const [width, theme] of [
         // 与链路规则一致：改成转发后目标菜单直接打开。
         await expect(page.getByRole('button', { name: /第 1 条转发目标/ })).toHaveAttribute('aria-expanded', 'true');
       }
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
       const menu = page.locator('.external-target-menu');
       const custom = menu.getByRole('button', { name: /自定义.*手动设置 IP、端口和协议/ });
       await expect(custom).toBeVisible();

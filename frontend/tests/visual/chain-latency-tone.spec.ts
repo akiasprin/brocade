@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { test, expect } from '@playwright/test';
 
 for (const width of [390, 1440])
@@ -7,7 +8,7 @@ for (const width of [390, 1440])
       await page.setViewportSize({ width, height: 1000 });
       await page.goto(`/tests/fixtures/chain-unlock-preview.html?view=cards&scene=calm&theme=${theme}#/chains`);
       await expect(page.locator('.chain-card')).toHaveCount(16);
-      await page.evaluate(() => document.fonts.ready);
+      await waitForVisualAssets(page);
 
       const card = page.locator('.chain-card[data-order-id="us-cmin2"]');
       await expect(card.locator('.chain-card-latency b')).toHaveText(/^\d+$/);

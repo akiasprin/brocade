@@ -1,3 +1,4 @@
+import { waitForVisualAssets } from './helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 
 for (const [width, theme] of [
@@ -16,7 +17,7 @@ for (const [width, theme] of [
     await page.getByRole('checkbox', { name: '允许基础版机器升级为容器版' }).check();
     await page.getByRole('button', { name: '升级 Agent', exact: true }).click();
     for (const checkbox of await page.getByRole('checkbox', { name: /^升级 / }).all()) await checkbox.check();
-    await page.evaluate(() => document.fonts.ready);
+    await waitForVisualAssets(page);
 
     const cockpit = page.getByRole('tabpanel');
     const ledger = cockpit.getByRole('region', { name: '已一致' });
