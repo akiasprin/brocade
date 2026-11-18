@@ -70,14 +70,14 @@ export interface CvmRouteService {
   port_start: number;
   port_end: number;
 }
-export interface CvmContainerRoute {
+export type CvmRouteTarget = { interface_id: string; chain_id?: never } | { chain_id: string; interface_id?: never };
+export type CvmContainerRoute = CvmRouteTarget & {
   destination: string;
-  interface_id: string;
   service?: CvmRouteService | null;
-}
+};
 export interface CvmContainerRoutes {
   revision: number;
-  priorities: { interface_id: string; ipv4: number | null; ipv6: number | null }[];
+  priorities: (CvmRouteTarget & { ipv4: number | null; ipv6: number | null })[];
   routes: CvmContainerRoute[];
   dns: string[];
 }
@@ -94,6 +94,10 @@ export interface CvmNicNodeCapabilities {
   entries?: boolean;
   /** Agent 能在宿主侧执行按协议端口选择的出口。 */
   route_service?: boolean;
+  /** 支持机器自身 IP 的 L3 转发。 */
+  entry_host_l3?: boolean;
+  entry_xray?: boolean;
+  entry_phantun?: boolean;
 }
 export interface CvmNicAttachment {
   allocation_id: string;
@@ -111,6 +115,8 @@ export interface CvmNicCatalog {
   attachments: CvmNicAttachment[];
   publications: CvmNicPublication[];
   providers: { node_id: string; name: string; fresh: boolean; capabilities: CvmNicNodeCapabilities }[];
+  /** Scoped names do not expose the administrator-only capability inventory. Older Consoles omit this field. */
+  provider_names?: Record<string, string>;
   can_manage: boolean;
 }
 export type CvmBindingPhase = 'preparing' | 'active' | 'standby' | 'withdrawing';
@@ -183,11 +189,23 @@ export const mountCvmNic = (
     transport: CvmNicTransport;
     use_dns_suggestions?: boolean;
   },
-) => api<CvmInstance>(`/cvm/${encodeURIComponent(id)}/interfaces`, '', { method: 'POST', body: JSON.stringify(body) });
+  inputSha256?: string,
+) =>
+  api<CvmInstance>(`/cvm/${encodeURIComponent(id)}/interfaces`, '', {
+    method: 'POST',
+    body: JSON.stringify(body),
+    ...(inputSha256 ? { headers: { 'x-brocade-cvm-input-sha256': inputSha256 } } : {}),
+  });
 export const setCvmRoutes = (
   id: string,
   body: { request_id: string; expected_generation: number; expected_revision: number; routes: CvmContainerRoutes },
-) => api<CvmInstance>(`/cvm/${encodeURIComponent(id)}/routes`, '', { method: 'PUT', body: JSON.stringify(body) });
+  inputSha256?: string,
+) =>
+  api<CvmInstance>(`/cvm/${encodeURIComponent(id)}/routes`, '', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+    ...(inputSha256 ? { headers: { 'x-brocade-cvm-input-sha256': inputSha256 } } : {}),
+  });
 export const changeCvmNicTransport = (
   id: string,
   nic: string,

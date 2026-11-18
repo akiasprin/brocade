@@ -22,6 +22,7 @@ import { DialogClose, DialogLayer } from './ui/dialog';
 import { Icon, PanelTitle } from './ui/icons';
 import { confirmDiscardChanges, useUnsavedChanges } from './ui/navigation-guard';
 import { RegionFlag } from './ui/region-flag';
+import { ActionMenu } from './ui/choice-menu';
 
 const INTERVALS = [
   { value: 60, label: '每分钟' },
@@ -260,13 +261,18 @@ function Verdict({ status, view }: { status: TunnelProbeStatus; view: TunnelProb
       : lastAny?.finished_at_unix_secs
         ? `上次 ${probeClock(lastAny.finished_at_unix_secs)}`
         : '';
+  const healthy = status.key === 'healthy';
   return (
-    <div className={`tnd-verdict tone-${status.tone}`}>
-      <span className={`cg-lamp ${status.tone}`} aria-hidden />
-      <b>{status.word}</b>
-      <span className="tnd-why" title={status.why}>
-        {status.why}
-      </span>
+    <div className={`tnd-verdict tone-${status.tone}${healthy ? ' is-quiet' : ''}`}>
+      <span className={`cg-lamp ${status.tone}`} role="img" aria-label={status.word} title={status.word} />
+      {!healthy && (
+        <>
+          <b>{status.word}</b>
+          <span className="tnd-why" title={status.why}>
+            {status.why}
+          </span>
+        </>
+      )}
       {timing && <span className="tnd-when">{timing}</span>}
     </div>
   );
@@ -410,78 +416,243 @@ function Metrics({
   );
 }
 
-function RunRows({ runs }: { runs: TunnelProbeRun[] }) {
+export interface TunnelProbeRunGroup {
+  runs: TunnelProbeRun[];
+  key: string | null;
+}
+
+/** Only consecutive scheduled runs of the same published configuration and observable outcome
+ * may collapse. Filtering happens afterwards, so a success still separates two failures. */
+export function groupTunnelProbeRuns(
+  runs: readonly TunnelProbeRun[],
+  intervalSecs: number | null,
+  slowMs: number,
+): TunnelProbeRunGroup[] {
+  const groups: TunnelProbeRunGroup[] = [];
+  for (const run of runs) {
+    const eligible =
+      run.source === 'serving' &&
+      run.trigger === 'scheduled' &&
+      run.finished_at_unix_secs !== null &&
+      run.result !== null &&
+      (COUNTED_RESULTS.has(run.result) || run.result === 'interrupted');
+    const key = eligible
+      ? JSON.stringify([
+          run.result,
+          run.ttfb_ms === null ? null : run.ttfb_ms > slowMs,
+          run.serving_generation,
+          run.topology_revision,
+          run.settings_revision,
+          run.http_status,
+          run.exit_ip,
+          run.exit_loc,
+          run.error_code,
+          run.error_detail,
+        ])
+      : null;
+    const last = groups.at(-1);
+    const previous = last?.runs.at(-1);
+    const spacing =
+      previous?.finished_at_unix_secs !== null &&
+      previous?.finished_at_unix_secs !== undefined &&
+      run.finished_at_unix_secs !== null
+        ? previous.finished_at_unix_secs - run.finished_at_unix_secs
+        : Infinity;
+    if (
+      key !== null &&
+      last?.key === key &&
+      intervalSecs !== null &&
+      spacing >= 0 &&
+      spacing <= intervalSecs * 1.5 + run.timeout_secs
+    )
+      last.runs.push(run);
+    else groups.push({ key, runs: [run] });
+  }
+  return groups;
+}
+
+function RunRow({ run, slowMs }: { run: TunnelProbeRun; slowMs: number }) {
+  const failed = run.result !== null && FAILED_RESULTS.has(run.result);
+  const tone =
+    run.result === 'ok'
+      ? run.ttfb_ms !== null && run.ttfb_ms > slowMs
+        ? 'slow'
+        : 'ok'
+      : failed
+        ? 'fail'
+        : isActive(run)
+          ? 'run'
+          : 'muted';
+  const revision =
+    run.source === 'draft'
+      ? `点击时冻结的草稿，基于修订 r${run.topology_revision}`
+      : `Serving G${run.serving_generation ?? '—'} · r${run.topology_revision}`;
+  return (
+    <article className={`tnd-run is-${tone}`} key={run.id} title={revision}>
+      <span className="tnd-run-when">{probeClock(run.finished_at_unix_secs ?? run.queued_at_unix_secs)}</span>
+      <span className="tnd-run-ic" aria-hidden>
+        {tone === 'ok' || tone === 'slow' ? (
+          <Icon of="check" size={11} />
+        ) : tone === 'fail' ? (
+          <Icon of="close" size={11} />
+        ) : (
+          <Icon of="clock" size={11} />
+        )}
+      </span>
+      <b className="tnd-run-val">
+        {run.result === 'ok' && run.ttfb_ms !== null ? (
+          <>
+            {run.ttfb_ms}
+            <span className="u">ms</span>
+          </>
+        ) : run.result ? (
+          resultText[run.result]
+        ) : run.status === 'running' ? (
+          '运行中'
+        ) : (
+          '等待执行'
+        )}
+      </b>
+      <span className="tnd-run-detail">
+        {run.result === 'ok' ? (
+          <>
+            {run.http_status !== null && <span>HTTP {run.http_status}</span>}
+            {run.exit_ip && (
+              <>
+                <RegionFlag code={run.exit_loc} />
+                <span className="tnd-ip">{run.exit_ip}</span>
+              </>
+            )}
+          </>
+        ) : (
+          <span className="tnd-run-error" title={run.error_detail ?? undefined}>
+            {run.error_detail ?? ''}
+          </span>
+        )}
+      </span>
+      <span className="tnd-run-tags">
+        {run.trigger === 'manual' && <span className="tnd-tag">手动</span>}
+        {run.source === 'draft' && <span className="tnd-tag draft">草稿 {run.draft_sha256?.slice(0, 8) ?? '—'}</span>}
+      </span>
+    </article>
+  );
+}
+
+function RunRows({
+  runs,
+  intervalSecs,
+  slowMs,
+  retentionDays,
+}: {
+  runs: TunnelProbeRun[];
+  intervalSecs: number | null;
+  slowMs: number;
+  retentionDays: number;
+}) {
   const [all, setAll] = useState(false);
-  if (runs.length === 0) return <p className="tnd-none">还没有拨测记录。</p>;
-  const shown = all ? runs : runs.slice(0, RUNS_SHOWN);
+  const [filter, setFilter] = useState<'all' | 'fail'>('all');
+  const groups = groupTunnelProbeRuns(runs, intervalSecs, slowMs).filter(
+    group => filter === 'all' || group.runs.some(run => run.result !== null && FAILED_RESULTS.has(run.result)),
+  );
+  const shown = all ? groups : groups.slice(0, RUNS_SHOWN);
   return (
     <>
-      <div className="tnd-runs">
-        {shown.map(run => {
-          const failed = run.result !== null && FAILED_RESULTS.has(run.result);
-          const tone = run.result === 'ok' ? 'ok' : failed ? 'fail' : isActive(run) ? 'run' : 'muted';
-          const revision =
-            run.source === 'draft'
-              ? `点击时冻结的草稿，基于修订 r${run.topology_revision}`
-              : `Serving G${run.serving_generation ?? '—'} · r${run.topology_revision}`;
-          return (
-            <article className={`tnd-run is-${tone}`} key={run.id} title={revision}>
-              <span className="tnd-run-when">{probeClock(run.finished_at_unix_secs ?? run.queued_at_unix_secs)}</span>
-              <span className="tnd-run-ic" aria-hidden>
-                {tone === 'ok' ? (
-                  <Icon of="check" size={11} />
-                ) : tone === 'fail' ? (
-                  <Icon of="close" size={11} />
-                ) : (
-                  <Icon of="clock" size={11} />
-                )}
-              </span>
-              <b className="tnd-run-val">
-                {run.result === 'ok' && run.ttfb_ms !== null ? (
-                  <>
-                    {run.ttfb_ms}
-                    <span className="u">ms</span>
-                  </>
-                ) : run.result ? (
-                  resultText[run.result]
-                ) : run.status === 'running' ? (
-                  '运行中'
-                ) : (
-                  '等待执行'
-                )}
-              </b>
-              <span className="tnd-run-detail">
-                {run.result === 'ok' ? (
-                  <>
-                    {run.http_status !== null && <span>HTTP {run.http_status}</span>}
-                    {run.exit_ip && (
+      <div className="tnd-subhead">
+        <b>拨测记录</b>
+      </div>
+      <div className="tnd-record-controls">
+        <span className="tnd-record-scope">
+          最近 {runs.length} 次 · 保留 {retentionDays} 天 · 含手动与草稿
+        </span>
+        <span className="sp" />
+        <SegmentedControl
+          value={filter}
+          options={[
+            { value: 'all', label: '全部' },
+            { value: 'fail', label: '只看失败' },
+          ]}
+          onChange={value => {
+            setFilter(value);
+            setAll(false);
+          }}
+          ariaLabel="拨测记录筛选"
+        />
+      </div>
+      {groups.length === 0 ? (
+        <p className="tnd-none">{filter === 'fail' ? `最近 ${runs.length} 次记录中没有失败。` : '还没有拨测记录。'}</p>
+      ) : (
+        <div className="tnd-runs">
+          {shown.map(group => {
+            const first = group.runs[0];
+            if (group.runs.length === 1) return <RunRow key={first.id} run={first} slowMs={slowMs} />;
+            const failed = first.result !== null && FAILED_RESULTS.has(first.result);
+            const slow = first.result === 'ok' && (first.ttfb_ms ?? 0) > slowMs;
+            const values = group.runs.flatMap(run => (run.ttfb_ms === null ? [] : [run.ttfb_ms]));
+            const oldest = group.runs.at(-1)!;
+            return (
+              <details className="tnd-run-group" key={first.id}>
+                <summary className={`tnd-run is-group is-${failed ? 'fail' : slow ? 'slow' : 'ok'}`}>
+                  <span className="tnd-run-when">
+                    {probeClock(oldest.finished_at_unix_secs!)}–{probeClock(first.finished_at_unix_secs!)}
+                  </span>
+                  <span className="tnd-run-ic" aria-hidden>
+                    <Icon of={failed ? 'close' : 'check'} size={11} />
+                  </span>
+                  <b className="tnd-run-val">
+                    {group.runs.length} 次{failed ? resultText[first.result!] : slow ? '变慢' : '成功'}
+                  </b>
+                  <span className="tnd-run-detail">
+                    {failed ? (
+                      <span className="tnd-run-error" title={first.error_detail ?? undefined}>
+                        {first.error_detail}
+                      </span>
+                    ) : (
                       <>
-                        <RegionFlag code={run.exit_loc} />
-                        <span className="tnd-ip">{run.exit_ip}</span>
+                        {values.length > 0 && (
+                          <span>
+                            {Math.min(...values)}–{Math.max(...values)} ms
+                          </span>
+                        )}
+                        {first.http_status !== null && <span>HTTP {first.http_status}</span>}
+                        {first.exit_ip && (
+                          <>
+                            <RegionFlag code={first.exit_loc} />
+                            <span className="tnd-ip">{first.exit_ip}</span>
+                          </>
+                        )}
                       </>
                     )}
-                  </>
-                ) : (
-                  <span className="tnd-run-error">{run.error_detail ?? ''}</span>
-                )}
-              </span>
-              <span className="tnd-run-tags">
-                {run.trigger === 'manual' && <span className="tnd-tag">手动</span>}
-                {run.source === 'draft' && (
-                  <span className="tnd-tag draft">草稿 {run.draft_sha256?.slice(0, 8) ?? '—'}</span>
-                )}
-              </span>
-            </article>
-          );
-        })}
-      </div>
-      {runs.length > RUNS_SHOWN && (
+                  </span>
+                  <span className="tnd-run-tags tnd-group-toggle">
+                    明细<span aria-hidden>⌄</span>
+                  </span>
+                </summary>
+                <div className="tnd-group-detail">
+                  {group.runs.map(run => (
+                    <RunRow key={run.id} run={run} slowMs={slowMs} />
+                  ))}
+                </div>
+              </details>
+            );
+          })}
+        </div>
+      )}
+      {groups.length > RUNS_SHOWN && (
         <button className="tnd-more" type="button" onClick={() => setAll(value => !value)}>
-          {all ? '收起' : `显示最近 ${runs.length} 次`}
+          {all ? '收起记录' : `显示其余记录 · 最近 ${runs.length} 次`}
         </button>
       )}
     </>
   );
+}
+
+/** Console's view is one probe path, not evidence of failure on every referencing node. */
+export function tunnelProbeImpact(view: TunnelProbeView | null): string | null {
+  if (view?.item.health === 'down') return 'Console 连续拨测失败；以下线路引用此隧道，可能受影响。';
+  if (view?.item.health !== 'degraded') return null;
+  return view.item.health_reason?.kind === 'slow'
+    ? 'Console 拨测首字节偏慢；以下线路引用此隧道，可能受影响。'
+    : 'Console 近期拨测出现失败；以下线路引用此隧道，可能受影响。';
 }
 
 const endpointText = (url: string) => url.replace(/^https?:\/\//, '');
@@ -639,43 +810,33 @@ export function TunnelProbePolicyDialog({
   );
 }
 
-export function TunnelProbePanel({
+export function useTunnelProbeControls({
   tenantId,
   outboundId,
   draftSupported,
   editable,
   windowSecs,
-  onWindowChange,
+  enabled = true,
 }: {
   tenantId: string;
   outboundId: string;
   draftSupported: boolean;
   editable: boolean;
   windowSecs: number;
-  onWindowChange: (windowSecs: number) => void;
+  enabled?: boolean;
 }) {
   const qc = useQueryClient();
   const draftEntries = useSyncExternalStore(draft.subscribe, draft.snapshot);
-  const [policyOpen, setPolicyOpen] = useState(false);
   const capability = useQuery({
     queryKey: ['tunnel-probe-capability'],
     queryFn: fetchTunnelProbeCapability,
     staleTime: 60_000,
-    enabled: editable,
+    enabled: editable && enabled,
     retry: false,
     retryOnMount: false,
     refetchOnMount: false,
   });
-  // The probe target is Console configuration; only operators who may change policies read it.
-  const inventory = useQuery({
-    queryKey: ['tunnel-probes'],
-    queryFn: fetchTunnelProbes,
-    staleTime: 60_000,
-    enabled: editable,
-    retry: false,
-  });
-  const probe = useTunnelProbeView(tenantId, outboundId, windowSecs);
-  const chart = useTunnelProbeChart();
+  const probe = useTunnelProbeView(tenantId, outboundId, windowSecs, enabled);
   const refresh = () => qc.invalidateQueries({ queryKey: ['tunnel-probe', tenantId, outboundId] });
   const start = useMutation({
     mutationFn: (source: TunnelProbeSource) => startTunnelProbe(tenantId, outboundId, source),
@@ -684,9 +845,7 @@ export function TunnelProbePanel({
   const cancel = useMutation({ mutationFn: (id: number) => cancelTunnelProbe(id), onSuccess: refresh });
   const available = capability.data?.available ?? false;
 
-  if (probe.isPending) return <Loading variant="panel" />;
   const missing = probe.error instanceof ApiError && probe.error.status === 404;
-  if (probe.error && !missing) return <ErrorBox error={probe.error} />;
   const view = missing ? null : (probe.data ?? null);
   const status = tunnelProbeStatus(view);
   const published = status.key !== 'unpublished';
@@ -705,55 +864,104 @@ export function TunnelProbePanel({
       ? (capability.data?.reason ?? 'Console 拨测组件不可用')
       : undefined;
 
+  return {
+    probe,
+    capability,
+    view,
+    status,
+    published,
+    active,
+    draftChanged,
+    blocked,
+    blockedReason,
+    start,
+    cancel,
+    available,
+    editable,
+    draftSupported,
+  };
+}
+
+type TunnelProbeControls = ReturnType<typeof useTunnelProbeControls>;
+
+export function TunnelProbeActions({ controls }: { controls: TunnelProbeControls }) {
+  const { probe, active, published, draftSupported, blocked, blockedReason, start, cancel, editable } = controls;
+  if (probe.isPending || (probe.error && !(probe.error instanceof ApiError && probe.error.status === 404))) return null;
+  return (
+    <div className="tnd-probe-actions" role="group" aria-label="拨测操作">
+      {active ? (
+        <button
+          className="btn"
+          type="button"
+          disabled={!editable || cancel.isPending || active.cancel_requested}
+          onClick={() => cancel.mutate(active.id)}
+        >
+          {active.cancel_requested || cancel.isPending ? '取消中…' : '取消'}
+        </button>
+      ) : (
+        <>
+          {(published || draftSupported) && (
+            <button
+              className="btn primary"
+              type="button"
+              disabled={blocked}
+              title={blockedReason}
+              onClick={() => start.mutate(published ? 'serving' : 'draft')}
+            >
+              {start.isPending ? '排队中…' : published ? '立即拨测' : '拨测草稿'}
+            </button>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+export function TunnelProbeDraftAction({ controls }: { controls: TunnelProbeControls }) {
+  const { active, published, draftChanged, draftSupported, blocked, blockedReason, start } = controls;
+  if (active || !published || !draftChanged || !draftSupported) return null;
+  return (
+    <ActionMenu
+      label="更多拨测操作"
+      items={[
+        {
+          label: '拨测草稿',
+          note: '拨测点击时冻结的未发布修改',
+          disabled: blockedReason || blocked,
+          onSelect: () => start.mutate('draft'),
+        },
+      ]}
+    />
+  );
+}
+
+export function TunnelProbePanel({
+  controls,
+  windowSecs,
+  onWindowChange,
+}: {
+  controls: TunnelProbeControls;
+  windowSecs: number;
+  onWindowChange: (windowSecs: number) => void;
+}) {
+  const { probe, capability, view, status, published, active, start, cancel, available, editable } = controls;
+  const [policyOpen, setPolicyOpen] = useState(false);
+  // The probe target is Console configuration; only operators who may change policies read it.
+  const inventory = useQuery({
+    queryKey: ['tunnel-probes'],
+    queryFn: fetchTunnelProbes,
+    staleTime: 60_000,
+    enabled: editable,
+    retry: false,
+  });
+  const chart = useTunnelProbeChart();
+  if (probe.isPending) return <Loading variant="panel" />;
+  const missing = probe.error instanceof ApiError && probe.error.status === 404;
+  if (probe.error && !missing) return <ErrorBox error={probe.error} />;
   return (
     <section className="panel config-panel cg-sec tnd-probe">
       <header>
         <PanelTitle of="observe">拨测</PanelTitle>
-        <span className="sp" />
-        {published && (
-          <SegmentedControl
-            className="tnd-seg"
-            value={windowSecs}
-            options={WINDOWS}
-            onChange={onWindowChange}
-            ariaLabel="拨测统计范围"
-          />
-        )}
-        {active ? (
-          <button
-            className="btn"
-            type="button"
-            disabled={!editable || cancel.isPending || active.cancel_requested}
-            onClick={() => cancel.mutate(active.id)}
-          >
-            {active.cancel_requested || cancel.isPending ? '取消中…' : '取消'}
-          </button>
-        ) : (
-          <>
-            {published && draftChanged && draftSupported && (
-              <button
-                className="btn"
-                type="button"
-                disabled={blocked}
-                title={blockedReason ?? '草稿修改了这条隧道；拨测点击时冻结的草稿'}
-                onClick={() => start.mutate('draft')}
-              >
-                拨测草稿
-              </button>
-            )}
-            {(published || draftSupported) && (
-              <button
-                className="btn primary"
-                type="button"
-                disabled={blocked}
-                title={blockedReason}
-                onClick={() => start.mutate(published ? 'serving' : 'draft')}
-              >
-                {start.isPending ? '排队中…' : published ? '立即拨测' : '拨测草稿'}
-              </button>
-            )}
-          </>
-        )}
       </header>
       {active ? <ProbeProgress run={active} source={active.source} /> : <Verdict status={status} view={view} />}
       {editable && capability.data && !available && (
@@ -761,17 +969,30 @@ export function TunnelProbePanel({
       )}
       {capability.error && <ErrorBox error={capability.error} />}
       {(start.error || cancel.error) && <ErrorBox error={start.error ?? cancel.error} />}
-      <Metrics view={view} status={status} windowSecs={windowSecs} />
+      {published && (
+        <div className="tnd-window-controls">
+          <span>统计范围</span>
+          <SegmentedControl
+            className="tnd-seg"
+            value={windowSecs}
+            options={WINDOWS}
+            onChange={onWindowChange}
+            ariaLabel="拨测统计范围"
+          />
+        </div>
+      )}
+      <Metrics view={view} status={status} windowSecs={view?.summary.window_secs ?? windowSecs} />
       {!published ? (
         <p className="tnd-chart-note">发布后开始定时拨测</p>
       ) : chart.status === 'ready' ? (
         <chart.Chart
           points={view!.points}
-          windowSecs={windowSecs}
+          windowSecs={view!.summary.window_secs}
           endUnixSecs={Math.floor(probe.dataUpdatedAt / 1000)}
           bucketSecs={view!.bucket_secs}
           intervalSecs={view!.item.policy?.interval_secs ?? null}
           p50Ms={view!.summary.p50_ms}
+          p95Ms={view!.summary.p95_ms}
           slowMs={view!.slow_ttfb_ms}
         />
       ) : chart.status === 'error' ? (
@@ -779,11 +1000,12 @@ export function TunnelProbePanel({
       ) : (
         <div className="tnd-chart" aria-hidden />
       )}
-      <div className="tnd-subhead">
-        <b>拨测记录</b>
-        <span>保留 {view?.retention_days ?? 7} 天 · 含手动与草稿</span>
-      </div>
-      <RunRows runs={view?.recent_runs ?? []} />
+      <RunRows
+        runs={view?.recent_runs ?? []}
+        intervalSecs={view?.item.policy?.interval_secs ?? null}
+        slowMs={view?.slow_ttfb_ms ?? 300}
+        retentionDays={view?.retention_days ?? 7}
+      />
       <PolicyLine
         item={view?.item ?? null}
         published={published}

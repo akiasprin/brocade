@@ -49,12 +49,41 @@ impl Inner {
     }
 
     pub(crate) fn volume(&self, record: &mut Record, desired: &InstanceDesired) -> Result<String> {
-        let base = self
-            .images
-            .get(&desired.spec.image.id)
-            .ok_or("Cube system image identity unavailable")?;
-        let root = root_name(base)?;
-        if let Err(error) = self.capture_volumes(record) {
+        let captured = self.capture_volumes(record);
+        let root = if desired.power != brocade_deployment::cvm::PowerState::Running {
+            // Cleanup uses the owned native disk identities, never a creation
+            // manifest that may have been retired or damaged after creation.
+            if record.objects.len() != 1 || record.objects[0].role.is_empty() {
+                return Err(OWNERSHIP_UNKNOWN.into());
+            }
+            record.objects[0].role.clone()
+        } else {
+            let pinned = desired
+                .artifacts
+                .as_ref()
+                .filter(|bundle| {
+                    desired.artifact_mode == brocade_deployment::cvm::CvmArtifactMode::Enforce
+                        && desired
+                            .spec
+                            .image
+                            .as_ref()
+                            .is_some_and(|image| image.sha256 == bundle.input.image_manifest.sha256)
+                })
+                .map(|bundle| brocade_cvm_compile::normalize_image(&bundle.input.image_manifest))
+                .transpose()?;
+            let base = pinned
+                .as_ref()
+                .or_else(|| {
+                    desired
+                        .spec
+                        .image
+                        .as_ref()
+                        .and_then(|image| self.images.get(&image.id))
+                })
+                .ok_or("Cube system image identity unavailable")?;
+            root_name(base)?.to_owned()
+        };
+        if let Err(error) = captured {
             if error != OWNERSHIP_UNKNOWN
                 || !self.cfg.capabilities.stable_storage
                 || record.volume.is_empty()

@@ -1,5 +1,9 @@
 #[path = "cases/clash_rules.rs"]
 mod clash_rules_tests;
+#[path = "cases/geodata.rs"]
+mod geodata_tests;
+#[path = "cases/node_notifications.rs"]
+mod node_notifications_tests;
 
 use axum::{
     body::{to_bytes, Body},
@@ -11836,6 +11840,9 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
     );
 }
 
+#[cfg(feature = "cvm")]
+#[path = "cases/cvm_artifacts.rs"]
+mod cvm_artifact_cases;
 #[cfg(feature = "cvm")]
 #[path = "cases/cvm_terminal.rs"]
 mod cvm_terminal_cases;

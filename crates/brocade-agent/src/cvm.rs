@@ -1,6 +1,9 @@
 //! CVM workers share one Rust Cube backend; execution and observation stay independent.
 mod backend;
+mod chain_egress;
+pub(super) mod diagnostics;
 mod entries;
+pub(super) mod host;
 mod network_quota;
 pub(crate) mod nics;
 mod observer;
@@ -8,12 +11,24 @@ mod reconcile;
 mod terminal;
 
 pub(crate) fn check(args: &[String]) -> Result<(), String> {
+    if args == ["--baremetal-contract"] {
+        println!("brocade-host-native-v1");
+        return Ok(());
+    }
+
     if args == ["--network-contract"] {
         println!("cubevs-attachments-v2");
         return Ok(());
     }
     if args == ["--version"] {
-        println!("brocade-cube-rust-v1");
+        println!(
+            "{}",
+            if backend::native()? {
+                "brocade-host-native-v1"
+            } else {
+                "brocade-cube-rust-v1"
+            }
+        );
         return Ok(());
     }
     if args == ["--maintenance-contract"] {
@@ -22,18 +37,18 @@ pub(crate) fn check(args: &[String]) -> Result<(), String> {
     }
     if let [empty, flag, path] = args {
         if empty == "--empty" && flag == "--config" {
-            let state = std::env::var_os("BROCADE_CVM_STATE_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/brocade/cvm-cube"));
-            brocade_cube::Backend::inspect_empty(std::path::Path::new(path), &state)?;
+            let state = backend::state_path()?;
+            if backend::native()? {
+                host::Backend::inspect_empty(std::path::Path::new(path), &state)?;
+            } else {
+                brocade_cube::Backend::inspect_empty(std::path::Path::new(path), &state)?;
+            }
             println!("brocade-cvm-empty-v1");
             return Ok(());
         }
     }
     let config = match args {
-        [] => std::env::var_os("BROCADE_CVM_CONFIG")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/etc/brocade/cvm-cube.json")),
+        [] => backend::config_path()?,
         [flag, path] if flag == "--config" => std::path::PathBuf::from(path),
         _ => {
             return Err(
@@ -42,11 +57,11 @@ pub(crate) fn check(args: &[String]) -> Result<(), String> {
             )
         }
     };
-    let capabilities = brocade_cube::Backend::inspect(&config)?;
+    let capabilities = backend::inspect(&config)?;
     println!(
         "{}",
         serde_json::to_string(
-            &serde_json::json!({"executor":"brocade-cube-rust-v1","capabilities":capabilities})
+            &serde_json::json!({"executor":if backend::native()? {"brocade-host-native-v1"} else {"brocade-cube-rust-v1"},"capabilities":capabilities})
         )
         .map_err(|_| "CVM capabilities serialization failed")?
     );
@@ -73,12 +88,29 @@ fn maintenance_at(path: &std::path::Path) -> Result<bool, String> {
 }
 
 pub(crate) fn spawn(options: crate::options::Options) -> Result<(), String> {
+    host::initialize(&options);
+    nics::initialize(&options);
     network_quota::spawn(options.clone())?;
     nics::spawn(options.clone())?;
     entries::spawn(options.clone())?;
     reconcile::spawn(options.clone())?;
     observer::spawn(options.clone())?;
     terminal::spawn(options)
+}
+
+pub(crate) fn inspect_empty(
+    config: &std::path::Path,
+    state: &std::path::Path,
+) -> Result<(), String> {
+    if backend::native()? {
+        host::Backend::inspect_empty(config, state)
+    } else {
+        brocade_cube::Backend::inspect_empty(config, state)
+    }
+}
+
+pub(crate) fn native_selected() -> Result<bool, String> {
+    backend::native()
 }
 
 #[cfg(test)]

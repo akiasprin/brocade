@@ -47,7 +47,7 @@ async fn upgrade_v031_preflight_is_read_only_and_forward_migration_preserves_dat
         let check = db.store.check_database_upgrade().await.unwrap();
         assert!(check.compatible);
         assert_eq!(check.installed_versions, [1]);
-        assert_eq!(check.pending_versions, [2, 3, 4, 5, 6, 7]);
+        assert_eq!(check.pending_versions, [2, 3, 4, 5, 6, 7, 8]);
         let added: bool =
             sqlx::query_scalar("SELECT to_regclass('node_traffic_limit') IS NOT NULL")
                 .fetch_one(db.pool())
@@ -58,7 +58,7 @@ async fn upgrade_v031_preflight_is_read_only_and_forward_migration_preserves_dat
     db.store.migrate_database_schema().await.unwrap();
     let check = db.store.check_database_upgrade().await.unwrap();
     assert!(check.compatible && check.pending_versions.is_empty());
-    assert_eq!(check.installed_versions, [1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(check.installed_versions, [1, 2, 3, 4, 5, 6, 7, 8]);
     db.store.migrate_database_schema().await.unwrap();
     let preserved: (String, Vec<u8>) = sqlx::query_as(
         "SELECT site_name, checksum FROM control_state CROSS JOIN _sqlx_migrations WHERE version=1",
@@ -160,7 +160,7 @@ async fn rejected_upgrade_releases_its_session_lock_before_a_repaired_retry() {
             .await
             .unwrap()
             .installed_versions,
-        [1, 2, 3, 4, 5, 6, 7]
+        [1, 2, 3, 4, 5, 6, 7, 8]
     );
 }
 
@@ -197,4 +197,90 @@ async fn cancelled_upgrade_does_not_leave_a_session_lock_for_the_next_attempt() 
     .await
     .unwrap();
     assert_eq!(held, 0, "a cancelled migration retained a session lock");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn upgrade_v038_applies_0008_atomically_without_rewriting_published_receipts() {
+    use sha2::{Digest, Sha384};
+    use sqlx::migrate::MigrationSource;
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations")
+        .resolve()
+        .await
+        .unwrap();
+    let mut published = sqlx::migrate::Migrator::DEFAULT;
+    published.migrations =
+        std::borrow::Cow::Owned(source.into_iter().filter(|m| m.version <= 7).collect());
+    assert_eq!(published.iter().count(), 7);
+    assert_eq!(format!("{:x}", Sha384::digest(published.iter().last().unwrap().sql.as_bytes())),
+        "9e6eeccade5a7799d6392df0afe9982aa022965d280c46e49b2d83a1f4fbf734d590ae26e5e5408295543052446db9b8");
+    published.run(db.pool()).await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query("INSERT INTO node_notification_preferences(node_id,public_ip_changes,changed_by) VALUES('n1',FALSE,'existing-operator')")
+        .execute(db.pool()).await.unwrap();
+    let preference_sql =
+        "SELECT to_jsonb(p) FROM node_notification_preferences p WHERE node_id='n1'";
+    let preference: serde_json::Value = sqlx::query_scalar(preference_sql)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let before_model = db.store.materialize_snapshot(None).await.unwrap();
+    let receipts =
+        "SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM _sqlx_migrations m WHERE version<=7";
+    let before: serde_json::Value = sqlx::query_scalar(receipts)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let check = db.store.check_database_upgrade().await.unwrap();
+    assert!(check.compatible);
+    assert_eq!(check.pending_versions, [8]);
+    sqlx::raw_sql("CREATE FUNCTION reject_artifact_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF to_regclass('public.cvm_spec_artifacts') IS NOT NULL THEN RAISE EXCEPTION 'injected late 0008 DDL failure'; END IF;
+      END $$; CREATE EVENT TRIGGER reject_artifact_ddl ON ddl_command_end EXECUTE FUNCTION reject_artifact_ddl();")
+      .execute(db.pool()).await.unwrap();
+    assert!(db.store.migrate_database_schema().await.is_err());
+    let absent: bool = sqlx::query_scalar("SELECT to_regclass('node_notification_preferences') IS NOT NULL AND to_regclass('cvm_image_manifests') IS NULL AND to_regclass('cvm_spec_artifact_sets') IS NULL AND to_regclass('cvm_spec_artifacts') IS NULL")
+        .fetch_one(db.pool()).await.unwrap();
+    assert!(absent, "late failure must roll back all 0008 objects");
+    let failed: serde_json::Value = sqlx::query_scalar(receipts)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(failed, before);
+    assert_eq!(
+        sqlx::query_scalar::<_, serde_json::Value>(preference_sql)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        preference
+    );
+    sqlx::raw_sql("DROP EVENT TRIGGER reject_artifact_ddl; DROP FUNCTION reject_artifact_ddl();")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.store.migrate_database_schema().await.unwrap();
+    let check = db.store.check_database_upgrade().await.unwrap();
+    assert!(check.compatible && check.pending_versions.is_empty());
+    assert_eq!(check.installed_versions, [1, 2, 3, 4, 5, 6, 7, 8]);
+    let after: serde_json::Value = sqlx::query_scalar(receipts)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(
+        sqlx::query_scalar::<_, serde_json::Value>(preference_sql)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        preference
+    );
+    assert_eq!(
+        db.store.materialize_snapshot(None).await.unwrap(),
+        before_model
+    );
+    db.store.migrate_database_schema().await.unwrap();
 }

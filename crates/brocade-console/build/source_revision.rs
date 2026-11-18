@@ -16,6 +16,7 @@ use std::{path::Path, process::Command};
 pub const AGENT_SOURCE_PATHS: &[&str] = &[
     "crates/brocade-agent",
     "crates/brocade-cube",
+    "crates/brocade-cvm-compile",
     "components/cube/CubeShim/terminal",
     "components/cube/pkgs/proto",
     "crates/brocade-probe",

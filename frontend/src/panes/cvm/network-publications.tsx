@@ -14,6 +14,8 @@ import {
 import { navigate } from '../../forge/route';
 import { BulkNicVersionDialog } from './network-bulk';
 import { EmptyState, ErrorBox, Loading } from '../../ui/bits';
+import { ActionMenu } from '../../ui/choice-menu';
+import { CapacityMeter } from './cards';
 import { useUnsavedChanges } from '../../ui/navigation-guard';
 import {
   NIC_CATALOG,
@@ -24,6 +26,7 @@ import {
   transportName,
   useNicRequestId,
 } from './network-common';
+import { networkProviderName } from './network-names';
 import { ownerKey, requestId } from './queries';
 
 export function NetworkPublications({ workspace }: { workspace: CvmWorkspace }) {
@@ -47,19 +50,23 @@ export function NetworkPublications({ workspace }: { workspace: CvmWorkspace }) 
   if (catalog.error && !catalog.data) return <ErrorBox error={catalog.error} />;
   const data = catalog.data;
   if (!data) return null;
+  const attachedTo = (p: CvmNicPublication) => data.attachments.filter(n => n.publication_id === p.id && n.attached);
   return (
-    <div className="cvm-network-publications">
-      <div className="cvm-network-heading">
-        <div>
-          <b>网络</b>
-          <p className="note">由机器提供网络能力，容器挂载后获得独立网卡和地址。路由在容器侧配置。</p>
-        </div>
+    <section className="cvm-network-lane cvm-network-publications" aria-label="出口网络">
+      <header className="cvm-lane-head">
+        <h2>出口网络</h2>
+        <small>
+          {data.publications.length} 个网络 · {data.attachments.filter(n => n.attached).length} 张网卡
+        </small>
         {data.can_manage && (
-          <button className="btn primary" onClick={() => setEditing(null)}>
-            ＋ 创建网络
-          </button>
+          <span className="cvm-lane-aside">
+            <button className="btn small" onClick={() => setEditing(null)}>
+              ＋ 创建网络
+            </button>
+          </span>
         )}
-      </div>
+      </header>
+      <p className="cvm-lane-note">组合台右栏的去处：容器挂载后获得独立网卡和地址，路由在容器侧配置。</p>
       {catalog.error && <ErrorBox error={catalog.error} />}
       {admission.error && <ErrorBox error={admission.error} />}
       {!data.publications.length ? (
@@ -69,91 +76,104 @@ export function NetworkPublications({ workspace }: { workspace: CvmWorkspace }) 
             : '管理员创建网络并授权后，就可以在容器内挂载。'}
         </EmptyState>
       ) : (
-        <div className="node-card-grid cvm-publication-grid">
-          {data.publications.map(p => (
-            <article className="node-card cvm-publication-card tone-ok" key={p.id}>
-              <header>
-                <div>
+        <div className="cvm-network-cards">
+          {data.publications.map(p => {
+            const attached = attachedTo(p);
+            const outdated = attached.filter(n => n.publication_revision < p.revision);
+            const shared = p.spec.address_mode === 'shared_nat' ? [p.spec.shared_ipv4, p.spec.shared_ipv6] : [];
+            return (
+              <article className="cvm-tile cvm-publication-card" key={p.id} aria-label={p.spec.name}>
+                <div className="cvm-pub-head">
                   <h3>{p.spec.name}</h3>
-                  <small>
-                    {data.providers.find(provider => provider.node_id === p.spec.provider_node)?.name ??
-                      p.spec.provider_node}{' '}
-                    · {addressModeName[p.spec.address_mode]} · 规格版本 {p.revision}
-                  </small>
+                  <span className="cz-kind">{addressModeName[p.spec.address_mode]}</span>
+                  {!p.admitting && <span className="st st-pending">已停止新挂载</span>}
                 </div>
-                <span className={`st ${p.admitting ? 'st-succeeded' : 'st-pending'}`}>
-                  {p.admitting ? '接受新挂载' : '已停止新挂载'}
-                </span>
-              </header>
-              <dl className="cvm-facts">
-                <div>
-                  <dt>地址模式</dt>
-                  <dd>{addressModeName[p.spec.address_mode]}</dd>
-                </div>
-                <div>
-                  <dt>可访问网络</dt>
-                  <dd>{p.spec.destinations.join('、') || '仅主动入站及回包'}</dd>
-                </div>
-                <div>
-                  <dt>承载</dt>
-                  <dd>{p.spec.transports.map(t => transportName[t.kind]).join(' / ')}</dd>
-                </div>
-              </dl>
-              <div className="cvm-network-figures">
-                <span>
-                  <b>{data.attachments.filter(n => n.publication_id === p.id && n.attached).length}</b> /{' '}
-                  {p.spec.limits.max_attachments} 张网卡
-                </span>
-                <span className="cvm-mode">v{p.revision}</span>
-              </div>
-              <div className="cvm-network-chips">
-                {data.attachments
-                  .filter(n => n.publication_id === p.id && n.attached)
-                  .map(n => (
-                    <button
-                      type="button"
-                      key={n.interface_id}
-                      onClick={() => navigate('cvm', { p: 'instance', id: n.instance_id })}
-                    >
-                      {n.instance_name}
-                      {n.publication_revision < p.revision && <small>旧规格</small>}
-                    </button>
-                  ))}
-              </div>
-              {data.can_manage && (
-                <footer>
-                  <button className="btn small" disabled={admission.isPending} onClick={() => setEditing(p)}>
-                    修改规格
-                  </button>
-                  <label className="switch cvm-admission-switch">
-                    <span className="switch-label">接受新挂载</span>
-                    <input
-                      type="checkbox"
-                      role="switch"
-                      checked={p.admitting}
-                      aria-checked={p.admitting}
-                      aria-label={`${p.spec.name} 接受新挂载`}
-                      disabled={admission.isPending}
-                      onChange={() => admission.mutate(p)}
-                    />
-                    <span className="switch-ui" aria-hidden="true">
-                      <span />
-                    </span>
-                  </label>
-                  <button className="btn small" disabled={admission.isPending} onClick={() => setDeleting(p)}>
-                    删除网络
-                  </button>
-                  {data.attachments.some(
-                    n => n.publication_id === p.id && n.attached && n.publication_revision < p.revision,
-                  ) && (
-                    <button className="btn small" onClick={() => setUpdating(p)}>
-                      批量应用新规格
-                    </button>
+                <p className="cvm-pub-sub">
+                  {networkProviderName(data, p.spec.provider_node, workspace.hosts)} · 规格 v{p.revision}
+                </p>
+                <dl className="cvm-pub-facts">
+                  <dt>可访问</dt>
+                  <dd>
+                    {p.spec.destinations.length
+                      ? p.spec.destinations.map(net => <code key={net}>{net}</code>)
+                      : '仅主动入站及回包'}
+                  </dd>
+                  {shared.some(Boolean) && (
+                    <>
+                      <dt>对外地址</dt>
+                      <dd>
+                        {shared.filter(Boolean).map(address => (
+                          <code key={address}>{address}</code>
+                        ))}
+                      </dd>
+                    </>
                   )}
-                </footer>
-              )}
-            </article>
-          ))}
+                  <dt>承载</dt>
+                  <dd>{p.spec.transports.map(t => transportName[t.kind]).join(' · ')}</dd>
+                </dl>
+                <div className="cvm-pub-figure">
+                  <span>网卡</span>
+                  <CapacityMeter used={attached.length} total={p.spec.limits.max_attachments} />
+                  <span>
+                    <b>{attached.length}</b> / {p.spec.limits.max_attachments}
+                  </span>
+                </div>
+                {attached.length > 0 && (
+                  <div className="cvm-pub-pills">
+                    {attached.map(n => (
+                      <button
+                        type="button"
+                        key={n.interface_id}
+                        onClick={() => navigate('cvm', { p: 'instance', id: n.instance_id })}
+                      >
+                        <b>{n.instance_name}</b>
+                        {n.publication_revision < p.revision && <small>v{n.publication_revision} · 旧规格</small>}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {data.can_manage && (
+                  <footer className="cvm-pub-foot">
+                    <button className="btn small" disabled={admission.isPending} onClick={() => setEditing(p)}>
+                      修改规格
+                    </button>
+                    {outdated.length > 0 && (
+                      <button className="btn small" onClick={() => setUpdating(p)}>
+                        批量应用新规格 · {outdated.length}
+                      </button>
+                    )}
+                    <label className="switch cvm-admission-switch">
+                      <span className="switch-label">接受新挂载</span>
+                      <input
+                        type="checkbox"
+                        role="switch"
+                        checked={p.admitting}
+                        aria-checked={p.admitting}
+                        aria-label={`${p.spec.name} 接受新挂载`}
+                        disabled={admission.isPending}
+                        onChange={() => admission.mutate(p)}
+                      />
+                      <span className="switch-ui" aria-hidden="true">
+                        <span />
+                      </span>
+                    </label>
+                    <ActionMenu
+                      label={`${p.spec.name} 更多操作`}
+                      items={[
+                        {
+                          label: '删除网络',
+                          note: attached.length ? '仍有网卡挂载，删除前会列出依赖' : '删除这份网络规格',
+                          danger: true,
+                          disabled: admission.isPending,
+                          onSelect: () => setDeleting(p),
+                        },
+                      ]}
+                    />
+                  </footer>
+                )}
+              </article>
+            );
+          })}
         </div>
       )}
       {editing !== undefined && (
@@ -179,7 +199,7 @@ export function NetworkPublications({ workspace }: { workspace: CvmWorkspace }) 
           onClose={() => setDeleting(null)}
         />
       )}
-    </div>
+    </section>
   );
 }
 

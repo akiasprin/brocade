@@ -1110,15 +1110,14 @@ export function UsersPane({ win, bare = false }: { win: Win; bare?: boolean }) {
   return <UserList drill={drill} go={go} sheeted={bare} narrow={narrow} />;
 }
 
-/** 线路在当前用户下的接入情况：地区旗、已授权接入点所在的链、被配额执行器停用的接入点（按链名）。 */
+/** 线路在当前用户下的接入情况：已授权接入点所在的链、被配额执行器停用的接入点（按链名）。 */
 export interface QuotaRouteAccess {
   grantedCount: number;
-  countries: string[];
   chains: string[];
   suspended: string[];
 }
 
-const NO_ROUTE_ACCESS: QuotaRouteAccess = { grantedCount: 0, countries: [], chains: [], suspended: [] };
+const NO_ROUTE_ACCESS: QuotaRouteAccess = { grantedCount: 0, chains: [], suspended: [] };
 
 export function QuotaRow({
   app,
@@ -1161,15 +1160,6 @@ export function QuotaRow({
     <Fragment>
       <UserQuotaTile
         label={label}
-        flags={
-          access.countries.length > 0 && (
-            <span className="qta-flags">
-              {access.countries.slice(0, 3).map(code => (
-                <RegionFlag key={code} code={code} />
-              ))}
-            </span>
-          )
-        }
         used={used}
         limit={limit}
         state={usageState}
@@ -2194,18 +2184,16 @@ function UserList({
       setAccountingChange({ user: u, mode: trafficMode });
     };
     // 用量行名称下方的接入情况。被配额执行器停用的接入点与已授权的分开：撤销后 grants 里
-    // 已没有这些记录，与授权卡的 held 判定相同。地区旗依次取已授权、被停用、线路全部的链。
+    // 已没有这些记录，与授权卡的 held 判定相同。
     const routeAccessOf = (app: SnapshotApp): QuotaRouteAccess => {
       const chainOf = (id: string) => (app.chains ?? []).find(chain => chain.id === id);
       const granted = mine.filter(column => column.app.id === app.id).map(column => column.ingress);
       const grantedIds = new Set(granted.map(ingress => ingress.id));
       const held = app.ingresses.filter(ingress => !grantedIds.has(ingress.id) && suspended.has(ingress.id));
-      const shown = granted.length > 0 ? granted : held.length > 0 ? held : app.ingresses;
       const distinct = (values: (string | null | undefined)[]) =>
         [...new Set(values)].filter((value): value is string => !!value);
       return {
         grantedCount: granted.length,
-        countries: distinct(shown.map(ingress => chainOf(ingress.chain)?.subscription_country)),
         chains: distinct(granted.map(ingress => chainOf(ingress.chain)?.name || ingress.chain)),
         suspended: held.map(ingress => chainOf(ingress.chain)?.name || ingress.chain),
       };

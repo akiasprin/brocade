@@ -108,6 +108,20 @@ test('aggregates both families, no-AAAA and regions without a family switch; det
   expect(errors).toEqual([]);
 });
 
+test('wide screens cap service columns instead of spreading whitespace between them', async ({ page }) => {
+  const errors = await preview(page, 1920);
+  const widths = await page
+    .locator('.cut-heads th[scope="col"]:not(.cut-corner, .cut-when)')
+    .evaluateAll(cells => cells.map(cell => cell.getBoundingClientRect().width));
+  expect(widths).toHaveLength(13);
+  for (const width of widths) expect(width).toBeLessThanOrEqual(88.5);
+  const table = await page.getByRole('table', { name: /线路服务解锁/ }).boundingBox();
+  const body = await page.locator('.chain-list-body').boundingBox();
+  // The surplus stays to the right of the table rather than inside every column.
+  expect(table!.x + table!.width).toBeLessThan(body!.x + body!.width - 200);
+  expect(errors).toEqual([]);
+});
+
 for (const role of ['readonly', 'public'])
   test(`readable ${role} and errors remain explicit`, async ({ page }) => {
     const errors = await preview(page, 390, 'light', `role=${role}&error=1`);

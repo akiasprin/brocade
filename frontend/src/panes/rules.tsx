@@ -1,3 +1,9 @@
+import { currentRuleIssues } from '../rule-validation-focus';
+import { draft } from '../draft';
+import { GeoSelector, useGeoCatalog, useGeoRelations } from './geodata';
+import { rulesProblems, matchProblem } from '../rule-validation';
+import { validateDraft, type RuleIssue } from '../api/geodata';
+import { ApiError } from '../api/client';
 import {
   Fragment,
   createContext,
@@ -240,6 +246,8 @@ interface RuleDraftHandle {
   version: string;
   dirty: boolean;
   disabled: boolean;
+  /* Invalid matches can be preserved locally, but an unavailable baseline cannot be staged. */
+  preserveDisabled: boolean;
   issue?: string | null;
   /* 机器 DNS 单独保存，不应因为它变更而追加任何链路清理操作。 */
   structuralDirty: boolean;
@@ -281,6 +289,36 @@ class EgressDnsValidationError extends Error {
 }
 
 /** The draft APIs persist during the call and return an already-resolved promise. */
+async function validateRuleStage(serialized: string) {
+  const stage = JSON.parse(serialized) as RuleDraftStage;
+  const ops: import('../draft').ModelOp[] = [
+    ...stage.outbounds.map(outbound => ({ op: 'upsert_external_outbound' as const, outbound })),
+    ...stage.steps.map(step => ({
+      op: 'put_step' as const,
+      app_id: step.appId,
+      chain_id: step.chainId,
+      node_id: step.nodeId,
+      step: step.body,
+    })),
+    ...stage.dns.map(change => ({
+      op: 'set_node_egress_dns' as const,
+      node_id: change.nodeId,
+      selector: change.selector,
+      resolution: change.resolution,
+    })),
+    ...(stage.dnsOrder
+      ? [
+          {
+            op: 'reorder_node_egress_dns' as const,
+            node_id: stage.dnsOrder.nodeId,
+            selectors: stage.dnsOrder.selectors,
+          },
+        ]
+      : []),
+  ];
+  return validateDraft([...draft.ops(), ...ops]);
+}
+
 function stageRuleDraft(serialized: string): { revision_id: number } {
   const stage = JSON.parse(serialized) as RuleDraftStage;
   for (const change of stage.dns) {
@@ -301,6 +339,7 @@ interface RuleDraftBus {
 }
 
 const RuleDraftCtx = createContext<RuleDraftBus | null>(null);
+const RuleDraftSavingCtx = createContext(false);
 
 function DraftSaveToolbar({
   hint,
@@ -380,7 +419,7 @@ export function RuleDraftScope({
   const issue = handles.map(handle => handle.issue).find(Boolean);
   const blocked = handles.some(h => h.disabled);
   const stagePending = () => {
-    if (blocked || issue) throw new Error(issue || '配置正在更新或读取失败，请等待更新完成后再保存');
+    if (handles.some(h => h.preserveDisabled)) throw new Error('配置正在更新或读取失败，请等待更新完成后再保存');
     for (const h of pending) stageRuleDraft(h.stage);
     // 与显式保存保持相同的操作顺序：所有规则先写入，最后再按完整链图清理。
     for (const key of new Set(pending.filter(h => h.structuralDirty).map(h => `${h.appId}\u0000${h.chainId}`))) {
@@ -485,7 +524,7 @@ export function RuleDraftScope({
 
   return (
     <RuleDraftCtx.Provider value={bus}>
-      {children}
+      <RuleDraftSavingCtx.Provider value={saving}>{children}</RuleDraftSavingCtx.Provider>
       {error != null && <ErrorBox error={error} />}
       {(strandedNames.length > 0 || droppingNames.length > 0) && (
         // 明确列出将被移除的机器，不做无提示删除。此处此前不显示任何内容，保存时按单张表的
@@ -507,23 +546,27 @@ export function RuleDraftScope({
           )}
         </div>
       )}
-      <DraftSaveToolbar
-        hint={hint}
-        status={
-          blocked
-            ? '配置更新完成后可保存'
-            : pending.length === 0
-              ? '没有待保存的改动'
-              : `${pending.length} 项配置有改动`
-        }
-        saving={saving}
-        canSave={pending.length > 0 && !blocked}
-        onReset={() => {
-          for (const handle of pending) handle.reset();
-          setError(null);
-        }}
-        onSave={() => void saveAll()}
-      />
+      {handles.length > 0 && (
+        <DraftSaveToolbar
+          hint={hint}
+          status={
+            issue
+              ? issue
+              : blocked
+                ? '配置更新完成后可保存'
+                : pending.length === 0
+                  ? '没有待保存的改动'
+                  : `${pending.length} 项配置有改动`
+          }
+          saving={saving}
+          canSave={pending.length > 0 && !blocked}
+          onReset={() => {
+            for (const handle of pending) handle.reset();
+            setError(null);
+          }}
+          onSave={() => void saveAll()}
+        />
+      )}
     </RuleDraftCtx.Provider>
   );
 }
@@ -790,6 +833,15 @@ export function MachineEgressDnsRules({
   const activeRows = displayedRows.filter(
     (row): row is MachineDnsDraftRow & { resolution: EgressDnsResolution } => row.resolution !== null,
   );
+  const dnsCatalog = useGeoCatalog(
+    'geosite',
+    activeRows.some(r => r.selector.t === 'geosite'),
+  );
+  const dnsMatchIssues = rulesProblems(
+    activeRows.map(r => ({ m: r.selector, a: { t: 'block' } })),
+    { geosite: dnsCatalog.data },
+    policies.map(p => ({ m: p.selector, a: { t: 'block' } })),
+  );
   const selectorCounts = new Map<string, number>();
   for (const row of activeRows) {
     const key = egressDnsSelectorKey(row.selector);
@@ -892,6 +944,30 @@ export function MachineEgressDnsRules({
               (selectorCounts.get(egressDnsSelectorKey(row.selector)) !== 1 ? '已有相同策略' : null);
           if (issue) throw new Error(issue);
         }
+        const dnsOps: import('../draft').ModelOp[] = [
+          ...rows.flatMap(row =>
+            row.originalSelector &&
+            (row.resolution === null ||
+              egressDnsSelectorKey(row.originalSelector) !== egressDnsSelectorKey(row.selector))
+              ? [
+                  {
+                    op: 'set_node_egress_dns' as const,
+                    node_id: nodeId,
+                    selector: row.originalSelector,
+                    resolution: null,
+                  },
+                ]
+              : [],
+          ),
+          ...activeRows.map(row => ({
+            op: 'set_node_egress_dns' as const,
+            node_id: nodeId,
+            selector: row.selector,
+            resolution: row.resolution,
+          })),
+          { op: 'reorder_node_egress_dns', node_id: nodeId, selectors: activeRows.map(row => row.selector) },
+        ];
+        await validateDraft([...draft.ops(), ...dnsOps]);
         for (const row of rows) {
           savingRowId = row.id;
           if (
@@ -948,7 +1024,7 @@ export function MachineEgressDnsRules({
       item => item.dataset.reorderId === pending.id,
     );
     const control = row?.querySelector<HTMLInputElement | HTMLButtonElement>(
-      pending.field === 'match' ? '.rule-new-dns-value' : '.order-grip',
+      pending.field === 'match' ? '.rule-new-dns-value, .geo-select input' : '.order-grip',
     );
     control?.focus({ preventScroll: true });
     if (control instanceof HTMLInputElement) control.select();
@@ -1076,20 +1152,33 @@ export function MachineEgressDnsRules({
                               ),
                             )}
                           </ChoiceSelect>
-                          <input
-                            className="f rule-new-dns-value"
-                            aria-label={`DNS 匹配内容${suffix}`}
-                            disabled={row.resolution === null}
-                            value={value}
-                            placeholder={kind?.hint}
-                            spellCheck={false}
-                            onChange={event =>
-                              updateRow(row.id, current => ({
-                                ...current,
-                                selector: buildMatch(current.selector.t, event.target.value),
-                              }))
-                            }
-                          />
+                          {row.selector.t === 'geosite' ? (
+                            <GeoSelector
+                              kind="geosite"
+                              values={row.selector.v}
+                              label={`DNS 匹配内容${suffix}`}
+                              disabled={row.resolution === null}
+                              onChange={v =>
+                                updateRow(row.id, current => ({ ...current, selector: { t: 'geosite', v } }))
+                              }
+                              issue={dnsMatchIssues.get(activeRows.findIndex(r => r.id === row.id))?.message}
+                            />
+                          ) : (
+                            <RawMatchInput
+                              className="f rule-new-dns-value"
+                              aria-label={`DNS 匹配内容${suffix}`}
+                              disabled={row.resolution === null}
+                              value={value}
+                              placeholder={kind?.hint}
+                              spellCheck={false}
+                              onChange={event =>
+                                updateRow(row.id, current => ({
+                                  ...current,
+                                  selector: buildMatch(current.selector.t, event.target.value),
+                                }))
+                              }
+                            />
+                          )}
                         </>
                       )}
                     </td>
@@ -1155,7 +1244,7 @@ export function MachineEgressDnsRules({
                   : `${changedRows || 1} 项配置有改动${orderDirty ? '，DNS 优先级已调整' : ''}`
               }
               saving={save.isPending}
-              canSave={dirty}
+              canSave={dirty && dnsMatchIssues.size === 0}
               onSave={() => save.mutate()}
             />
           </>
@@ -1201,9 +1290,36 @@ export function MachineEgressDnsRules({
   );
 }
 
+function RawMatchInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
+  const [raw, setRaw] = useState(String(props.value ?? ''));
+  const focused = useRef(false);
+  useEffect(() => {
+    if (!focused.current) setRaw(String(props.value ?? ''));
+  }, [props.value]);
+  return (
+    <input
+      {...props}
+      value={raw}
+      onFocus={event => {
+        focused.current = true;
+        props.onFocus?.(event);
+      }}
+      onBlur={event => {
+        focused.current = false;
+        setRaw(String(props.value ?? ''));
+        props.onBlur?.(event);
+      }}
+      onChange={event => {
+        setRaw(event.target.value);
+        props.onChange?.(event);
+      }}
+    />
+  );
+}
+
 export function buildMatch(t: DestMatch['t'], raw: string): DestMatch {
   const list = raw
-    .split(/[,\s]+/)
+    .split(/[,，、\s]+/)
     .map(v => v.trim())
     .filter(Boolean);
   switch (t) {
@@ -2001,6 +2117,7 @@ function RuleEditorReady({
   editorDisabled,
 }: RuleEditorProps & { editorDisabled: boolean }) {
   const qc = useQueryClient();
+  const savingAll = useContext(RuleDraftSavingCtx);
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
   const app = snapshot.data?.snapshot.apps.find(candidate => candidate.id === appId);
   const chainTenant = app?.chains.find(chain => chain.id === chainId)?.tenant ?? '';
@@ -2027,6 +2144,72 @@ function RuleEditorReady({
   // 快照经 serde_json::Value 返回，字段顺序可能与本地对象不同；只比较内容，
   // 否则保存后仍会判定为未保存，后续丢弃草稿也无法跟随基线恢复。
   const initialRulesKey = stableJson(initial);
+  const siteCatalog = useGeoCatalog('geosite', !readOnly || rules.some(r => r.m.t === 'geosite'));
+  const ipCatalog = useGeoCatalog(
+    'geoip',
+    rules.some(r => r.m.t === 'geoip'),
+  );
+  const matchIssues = rulesProblems(rules, { geosite: siteCatalog.data, geoip: ipCatalog.data }, initial);
+  const siteRelations = useGeoRelations(
+    'geosite',
+    rules.flatMap(r => (r.m.t === 'geosite' ? r.m.v : [])),
+    !readOnly,
+  );
+  const ipRelations = useGeoRelations(
+    'geoip',
+    rules.flatMap(r => (r.m.t === 'geoip' ? r.m.v : [])),
+    !readOnly,
+  );
+  for (const [i, rule] of rules.entries()) {
+    const match = rule.m;
+    if (match.t !== 'geosite' && match.t !== 'geoip') continue;
+    const relations = (match.t === 'geosite' ? siteRelations : ipRelations).data?.covers ?? [];
+    for (const [at, value] of match.v.entries()) {
+      const cover = relations.find(
+        pair =>
+          pair.narrower === value &&
+          rules
+            .slice(0, i)
+            .some(r => r.m.t === match.t && 'v' in r.m && Array.isArray(r.m.v) && r.m.v.includes(pair.wider as never)),
+      );
+      const local = relations.find(
+        pair =>
+          pair.narrower === value &&
+          match.v.includes(pair.wider) &&
+          (!relations.some(p => p.narrower === pair.wider && p.wider === value) || match.v.indexOf(pair.wider) < at),
+      );
+      if (cover || local) {
+        const earlier =
+          cover &&
+          rules.findIndex(
+            r => r.m.t === match.t && 'v' in r.m && Array.isArray(r.m.v) && r.m.v.includes(cover.wider as never),
+          );
+        matchIssues.set(i, {
+          value,
+          message: cover ? `${value} 规则 ${Number(earlier) + 1} 已包含` : `${value} 本条已包含`,
+        });
+      }
+    }
+  }
+  const currentRulesKey = stableJson([rules, siteCatalog.dataUpdatedAt, ipCatalog.dataUpdatedAt]);
+  const [serverIssues, setServerIssues] = useState<{ key: string; issues: RuleIssue[] } | null>(() => {
+    const issues = currentRuleIssues().filter(i => i.location === `${appId}/${chainId}/${nodeId}`);
+    return issues.length ? { key: currentRulesKey, issues } : null;
+  });
+  useEffect(() => {
+    const receive = (event: Event) => {
+      const issues = (event as CustomEvent<RuleIssue[]>).detail.filter(
+        i => i.location === `${appId}/${chainId}/${nodeId}`,
+      );
+      setServerIssues(issues.length ? { key: currentRulesKey, issues } : null);
+    };
+    window.addEventListener('rule-validation-error', receive);
+    return () => window.removeEventListener('rule-validation-error', receive);
+  }, [appId, chainId, nodeId, currentRulesKey]);
+  if (serverIssues?.key === currentRulesKey)
+    for (const issue of serverIssues.issues)
+      if (issue.rule !== null) matchIssues.set(issue.rule, { value: issue.value, message: issue.message });
+  const matchIssue = [...matchIssues.values()][0]?.message;
   const rulesKey = stableJson(rules);
   const syncedRulesKey = useRef(initialRulesKey);
   useEffect(() => {
@@ -2062,6 +2245,7 @@ function RuleEditorReady({
     return override ? override.resolution : storedDnsFor(selector);
   };
   const patchMachineDns = (selector: DestMatch, resolution: EgressDnsResolution | null) => {
+    if (editDisabled) return;
     save.reset();
     const key = egressDnsSelectorKey(selector);
     const next = { ...dnsOverrides };
@@ -2091,6 +2275,7 @@ function RuleEditorReady({
       policy => egressDnsSelectorKey(policy.selector) === egressDnsSelectorKey(selector),
     );
   const moveMachineDns = (selector: DestMatch, delta: number) => {
+    if (editDisabled) return;
     const index = dnsPolicyIndex(selector);
     const target = index + delta;
     if (index < 0 || target < 0 || target >= orderedNodeDnsPolicies.length) return;
@@ -2231,7 +2416,7 @@ function RuleEditorReady({
               v: {
                 dest: h.dest.trim(),
                 server_names: h.names
-                  .split(/[,\s]+/)
+                  .split(/[,，、\s]+/)
                   .map(v => v.trim())
                   .filter(Boolean),
               },
@@ -2345,13 +2530,38 @@ function RuleEditorReady({
     dnsOrder: dnsOrderDirty ? { nodeId, selectors: [...orderedSelectors, ...appendedSelectors] } : null,
   };
   const stagePlanKey = JSON.stringify(stagePlan);
-  const stageCurrent = () => {
-    if (editorDisabled) throw new Error('配置正在更新或读取失败，请等待更新完成后再保存');
+  const preserveCurrent = () => {
+    if (editorDisabled) throw new Error('配置正在更新或读取失败');
+    // Local navigation preserves unfinished input; explicit save still validates it below.
     return stageRuleDraft(stagePlanKey);
   };
-  useUnsavedChanges(!readOnly && dirty && bus === null, `${nodeId} 的规则表`, undefined, stageCurrent);
+  const stageCurrent = async () => {
+    if (editorDisabled) throw new Error('配置正在更新或读取失败');
+    if (matchIssue) throw new Error(matchIssue);
+    await validateRuleStage(stagePlanKey);
+    return preserveCurrent();
+  };
+  useUnsavedChanges(!readOnly && dirty && bus === null, `${nodeId} 的规则表`, undefined, preserveCurrent);
   const save = useMutation({
-    mutationFn: async (_opts?: { keepOpen?: boolean }) => stageCurrent(),
+    mutationFn: async (_opts?: { keepOpen?: boolean }) => {
+      try {
+        return await stageCurrent();
+      } catch (error) {
+        if (error instanceof ApiError && error.issues.length) {
+          setServerIssues({ key: currentRulesKey, issues: error.issues });
+          const row = error.issues.find(i => i.location === `${appId}/${chainId}/${nodeId}`)?.rule;
+          if (row != null)
+            requestAnimationFrame(() =>
+              document
+                .querySelector<HTMLElement>(
+                  `[data-rule-location="${appId}/${chainId}/${nodeId}"] [data-rule-index="${row}"]`,
+                )
+                ?.scrollIntoView({ block: 'center', behavior: 'smooth' }),
+            );
+        }
+        throw error;
+      }
+    },
     onSuccess: (_data, opts) => {
       // Every DNS override in this editor has just been copied into the global browser draft.
       // Keeping a second local copy makes "discard draft" reveal it again against the committed
@@ -2365,6 +2575,8 @@ function RuleEditorReady({
       if (!opts?.keepOpen) onClose?.();
     },
   });
+  // Lock the whole tree, including portal dialogs and tables whose save has not started yet.
+  const editDisabled = readOnly || editorDisabled || savingAll || save.isPending;
 
   const reset = useCallback(() => {
     if (shared?.reset) {
@@ -2390,6 +2602,7 @@ function RuleEditorReady({
     dirty,
     editorDisabled,
     dnsIssue,
+    matchIssue,
     structuralDirty,
     stagePlanKey,
     root,
@@ -2407,8 +2620,9 @@ function RuleEditorReady({
       id: handleId,
       version: handleVersion,
       dirty,
-      disabled: editorDisabled,
-      issue: dnsIssue || null,
+      disabled: editorDisabled || !!matchIssue,
+      preserveDisabled: editorDisabled,
+      issue: matchIssue || dnsIssue || null,
       structuralDirty,
       stage: stagePlanKey,
       save: () => saveAsync({}),
@@ -2427,6 +2641,7 @@ function RuleEditorReady({
     dirty,
     editorDisabled,
     dnsIssue,
+    matchIssue,
     handleId,
     handleVersion,
     nodeId,
@@ -2583,6 +2798,28 @@ function RuleEditorReady({
     setRules(pinTerminalRules(updated));
   };
 
+  const addAiRules = () => {
+    if (
+      !siteCatalog.data?.entries.some(e => e.code === 'category-ai-!cn') ||
+      !siteCatalog.data.entries.some(e => e.code === 'huggingface')
+    )
+      return;
+    const has = (rule: Rule, value: string) => rule.m.t === 'geosite' && rule.m.v.includes(value);
+    const next = [...rules];
+    let ai = next.findIndex(r => has(r, 'category-ai-!cn'));
+    if (ai < 0) {
+      ai = next.findIndex(isPinnedTerminalRule);
+      if (ai < 0) ai = next.length;
+      next.splice(ai, 0, { m: { t: 'geosite', v: ['category-ai-!cn'] }, a: defaultRuleAction() });
+    }
+    const hf = next.findIndex(r => has(r, 'huggingface'));
+    if (hf < 0) next.splice(ai, 0, { m: { t: 'geosite', v: ['huggingface'] }, a: { t: 'egress', send_through: null } });
+    else if (hf > ai) {
+      const [row] = next.splice(hf, 1);
+      next.splice(ai, 0, row);
+    }
+    setRules(pinTerminalRules(next));
+  };
   const hasSniffingDependentRule = rules.some(rule => matchDependsOnSniffing(rule.m));
   const hasSniffingFallback = rules.some(isSniffingFallbackRule);
   const addSniffingFallback = () =>
@@ -2641,7 +2878,11 @@ function RuleEditorReady({
     <>
       {/* 使用 `fieldset` 仅为其 disabled 属性（它是 HTML 中唯一能一次禁用整棵子树
           表单控件的元素），因此样式上重置为无视觉效果的一层，见 styles.css 的 .rule-ro。 */}
-      <fieldset className="panel rule-editor rule-ro" disabled={readOnly}>
+      <fieldset
+        className="panel rule-editor rule-ro"
+        data-rule-location={`${appId}/${chainId}/${nodeId}`}
+        disabled={editDisabled}
+      >
         {showHeader && !bus && (
           <div className="toolbar rule-editor-title">
             <b className="mono">
@@ -2663,7 +2904,7 @@ function RuleEditorReady({
               const dnsSupported = supportsEgressDns(r.m) && matchValues(r.m).trim() !== '';
               const dnsResolution = r.a.t === 'egress' ? effectiveDnsFor(r.m) : null;
               return (
-                <tr key={i}>
+                <tr data-rule-index={i} key={i}>
                   <td className="mono dim" style={{ width: 24 }}>
                     {i + 1}
                   </td>
@@ -2689,16 +2930,43 @@ function RuleEditorReady({
                         </option>
                       ))}
                     </select>
-                    {kind?.list !== false && r.m.t !== 'any' && (
-                      <input
-                        className="f mono"
-                        placeholder={kind?.hint}
-                        aria-label={`匹配内容（规则 ${i + 1}）`}
-                        value={matchValues(r.m)}
-                        spellCheck={false}
-                        onChange={e => patchMatch(i, r, buildMatch(r.m.t, e.target.value))}
-                      />
-                    )}
+                    {kind?.list !== false &&
+                      r.m.t !== 'any' &&
+                      (r.m.t === 'geosite' || r.m.t === 'geoip' ? (
+                        <GeoSelector
+                          kind={r.m.t}
+                          disabled={editDisabled}
+                          values={r.m.v}
+                          label={`匹配内容（规则 ${i + 1}）`}
+                          onChange={v => patchMatch(i, r, { t: r.m.t as 'geosite' | 'geoip', v })}
+                          issue={matchIssues.get(i)?.message}
+                          issueValue={matchIssues.get(i)?.value}
+                          blockedValues={rules
+                            .slice(0, i)
+                            .flatMap(other =>
+                              other.m.t === r.m.t && (other.m.t === 'geosite' || other.m.t === 'geoip')
+                                ? other.m.v
+                                : [],
+                            )}
+                        />
+                      ) : (
+                        <div className="geo-field">
+                          <RawMatchInput
+                            className="f mono"
+                            placeholder={kind?.hint}
+                            aria-label={`匹配内容（规则 ${i + 1}）`}
+                            value={matchValues(r.m)}
+                            spellCheck={false}
+                            aria-invalid={matchIssues.has(i)}
+                            onChange={e => patchMatch(i, r, buildMatch(r.m.t, e.target.value))}
+                          />
+                          {matchIssues.has(i) && (
+                            <div className="geo-message error" title={matchIssues.get(i)!.message}>
+                              <span>{matchIssues.get(i)!.message}</span>
+                            </div>
+                          )}
+                        </div>
+                      ))}
                     {r.m.t === 'network' && (
                       <NetworkMatchSelect
                         label={`传输层（规则 ${i + 1}）`}
@@ -2740,7 +3008,7 @@ function RuleEditorReady({
                           action={r.a}
                           open={targetPickerRule === i}
                           onOpenChange={open => setTargetPickerRule(open ? i : null)}
-                          disabled={editorDisabled}
+                          disabled={editDisabled}
                           peers={peers}
                           outbounds={externalOutbounds}
                           outboundUnavailable={externalUnavailableReason}
@@ -2752,7 +3020,7 @@ function RuleEditorReady({
                           onNode={id => selectForwardTarget(i, r, id)}
                           onOutbound={id => selectExternalTarget(i, r, id)}
                           onVpngate={(country, serverIds) => {
-                            if (editorDisabled || !vpngateEligibility.eligible || !chainTenant) return;
+                            if (editDisabled || !vpngateEligibility.eligible || !chainTenant) return;
                             const pool = selectVpngatePool(externalOutbounds, chainTenant, country, serverIds);
                             if (!externalOutbounds.some(outbound => outbound.id === pool.id)) {
                               setPendingOutbounds([...pendingOutbounds, pool]);
@@ -3019,7 +3287,7 @@ function RuleEditorReady({
                   nodeId={nodeId}
                   nodeName={selfNode?.name || nodeId}
                   unavailable={outbound ? externalUnavailableReason(outbound) : null}
-                  editable={!readOnly && !editorDisabled}
+                  editable={!editDisabled}
                 />
               );
             })}
@@ -3034,6 +3302,17 @@ function RuleEditorReady({
           <button className="btn" onClick={addRule}>
             ＋ 加一条
           </button>
+          <button
+            className="btn"
+            onClick={addAiRules}
+            disabled={
+              !siteCatalog.data?.entries.some(e => e.code === 'category-ai-!cn') ||
+              !siteCatalog.data.entries.some(e => e.code === 'huggingface')
+            }
+          >
+            ＋ 加 AI 组合
+          </button>
+          {matchIssues.size > 0 && <span className="geo-message error">{matchIssues.size} 处错误</span>}
           {hasSniffingDependentRule && !hasSniffingFallback && (
             <button
               className="btn"
@@ -3060,7 +3339,11 @@ function RuleEditorReady({
               >
                 还原
               </button>
-              <button className="btn primary" disabled={save.isPending || !dirty} onClick={() => save.mutate({})}>
+              <button
+                className="btn primary"
+                disabled={save.isPending || !dirty || !!matchIssue}
+                onClick={() => save.mutate({})}
+              >
                 {save.isPending ? '保存中…' : '保存到草稿'}
               </button>
             </>
@@ -3082,7 +3365,7 @@ function RuleEditorReady({
           }
           focus={dnsDialogShown.focus}
           readOnly={readOnly}
-          disabled={editorDisabled}
+          disabled={editDisabled}
           onClose={() => {
             setDnsDialog(null);
             setDismissedDnsError(dnsError);
@@ -3099,7 +3382,7 @@ function RuleEditorReady({
           onClose={() => setCreatingFor(null)}
           onSaved={outbound => {
             const rule = rules[creatingFor];
-            if (!rule || editorDisabled || readOnly) return;
+            if (!rule || editDisabled) return;
             setPendingOutbounds([...pendingOutbounds, outbound]);
             patch(creatingFor, { ...rule, a: { t: 'proxy', outbound: outbound.id } });
             setCreatingFor(null);
@@ -3111,7 +3394,7 @@ function RuleEditorReady({
           targetName={muxEditor.targetName || peerOf(muxEditor.to)?.name || muxEditor.to}
           globalValue={globalRelayMux}
           state={muxEditor}
-          readOnly={readOnly}
+          readOnly={editDisabled}
           onChange={setMuxEditor}
           onClose={() => setMuxEditor(null)}
           onApply={() => {
@@ -4463,7 +4746,9 @@ export function DnsPolicyDialog({
       ? '填写匹配内容'
       : policies.some(policy => egressDnsSelectorKey(policy.selector) === addKey)
         ? '已有相同策略'
-        : null;
+        : addSelector
+          ? (matchProblem(addSelector)?.message ?? null)
+          : null;
   const editable = !readOnly && !disabled;
   const hit = added ?? focus;
   const add = () => {
@@ -4535,20 +4820,29 @@ export function DnsPolicyDialog({
                           </option>
                         ))}
                       </select>
-                      <input
-                        className="f mono"
-                        aria-label="新策略的匹配内容"
-                        placeholder={DNS_SELECTOR_KINDS.find(kind => kind.t === adding.kind)?.hint}
-                        spellCheck={false}
-                        autoFocus
-                        value={adding.value}
-                        onChange={event => setAdding({ ...adding, value: event.target.value })}
-                        onKeyDown={event => {
-                          if (event.key !== 'Enter') return;
-                          event.preventDefault();
-                          add();
-                        }}
-                      />
+                      {adding.kind === 'geosite' ? (
+                        <GeoSelector
+                          kind="geosite"
+                          values={adding.value.split(/[,，\s]+/).filter(Boolean)}
+                          label="新策略的匹配内容"
+                          onChange={v => setAdding({ ...adding, value: v.join(', ') })}
+                        />
+                      ) : (
+                        <RawMatchInput
+                          className="f mono"
+                          aria-label="新策略的匹配内容"
+                          placeholder={DNS_SELECTOR_KINDS.find(kind => kind.t === adding.kind)?.hint}
+                          spellCheck={false}
+                          autoFocus
+                          value={adding.value}
+                          onChange={event => setAdding({ ...adding, value: event.target.value })}
+                          onKeyDown={event => {
+                            if (event.key !== 'Enter') return;
+                            event.preventDefault();
+                            add();
+                          }}
+                        />
+                      )}
                     </span>
                     <span className="rule-dns-add-actions">
                       <button type="button" className="btn sm primary" disabled={!!addIssue} onClick={add}>

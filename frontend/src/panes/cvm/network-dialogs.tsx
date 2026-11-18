@@ -1,7 +1,8 @@
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import {
   mountCvmNic,
+  fetchCvmChainCatalog,
   setCvmRoutes,
   changeCvmNicTransport,
   updateCvmNicVersion,
@@ -16,6 +17,8 @@ import { EmptyState, ErrorBox } from '../../ui/bits';
 import { useUnsavedChanges } from '../../ui/navigation-guard';
 import { NIC_STATE, NicDialog, networkLines, transportName, useNicRequestId } from './network-common';
 import { QUERY } from './queries';
+import { CompilePreview, useCompilePreview } from './compile-preview';
+import { routeTarget, retarget, targetKey } from './route-target';
 
 function useNetworkSaved(onClose: () => void) {
   const client = useQueryClient();
@@ -49,15 +52,17 @@ export function MountNicDialog({
   const selected = catalog.publications.find(p => p.id === publication);
   const operationId = useNicRequestId();
   const onSaved = useNetworkSaved(onClose);
+  const mountBody = {
+    expected_generation: generation,
+    publication_id: publication,
+    transport: kind,
+    use_dns_suggestions: useDns,
+  };
+  const mountRequest = { ...mountBody, request_id: operationId(mountBody) };
+  const preview = useCompilePreview(instance.desired.id, { kind: 'mount', request: mountRequest });
   const save = useMutation({
     mutationFn: () => {
-      const body = {
-        expected_generation: generation,
-        publication_id: publication,
-        transport: kind,
-        use_dns_suggestions: useDns,
-      };
-      return mountCvmNic(instance.desired.id, { ...body, request_id: operationId(body) });
+      return mountCvmNic(instance.desired.id, mountRequest, preview.inputSha256);
     },
     onSuccess: onSaved,
   });
@@ -68,7 +73,7 @@ export function MountNicDialog({
       onClose={onClose}
       onSubmit={() => save.mutate()}
       submit="挂载并分配地址"
-      disabled={!selected || !kinds.includes(kind)}
+      disabled={!selected || !kinds.includes(kind) || !preview.ready}
     >
       {!catalog.publications.length ? (
         <EmptyState icon="forwarding" title="没有已授权的网络">
@@ -130,7 +135,7 @@ export function MountNicDialog({
                   ))}
                 </select>
               </label>
-              {!!selected.spec.dns_suggestions.length && (
+              {!!selected.spec.dns_suggestions.length && instance.desired.spec.execution?.kind !== 'baremetal' && (
                 <label className="cvm-check">
                   <input type="checkbox" checked={useDns} onChange={e => setUseDns(e.target.checked)} />
                   将容器 DNS 设置为此网络建议：{selected.spec.dns_suggestions.join('、')}（替换当前设置）
@@ -144,6 +149,7 @@ export function MountNicDialog({
           )}
         </>
       )}
+      <CompilePreview preview={preview} />
       {save.error && <ErrorBox error={save.error} />}
     </NicDialog>
   );
@@ -165,8 +171,28 @@ export function RoutesDialog({
   const [routing, setRouting] = useState<CvmContainerRoutes>(() => structuredClone(instance.desired.spec.routing));
   const [dns, setDns] = useState(routing.dns.join('\n'));
   const [localError, setLocalError] = useState<string | null>(null);
-  const nics = instance.desired.spec.interfaces.filter(nic => nic.allocated);
-  const outbound = nics;
+  const chains = useQuery({
+    queryKey: ['cvm-chain-egress', instance.desired.id],
+    queryFn: () => fetchCvmChainCatalog(instance.desired.id),
+    refetchInterval: 15_000,
+  });
+  const nics = instance.desired.spec.interfaces.filter(n => n.allocated);
+  const options = [
+    ...nics.map(n => ({
+      key: n.id,
+      name: nicName(n, catalog),
+      ipv4: !!n.allocated?.ipv4,
+      ipv6: !!n.allocated?.ipv6,
+      available: true,
+    })),
+    ...(chains.data?.chains ?? []).map(c => ({
+      key: `chain:${c.id}`,
+      name: c.unavailable_reason ? `${c.name} · ${c.unavailable_reason}` : c.name,
+      ipv4: true,
+      ipv6: c.ipv6,
+      available: !!chains.data?.supported && c.authorized && !c.unavailable_reason,
+    })),
+  ];
   const operationId = useNicRequestId();
   const onSaved = useNetworkSaved(onClose);
   useUnsavedChanges(
@@ -174,39 +200,42 @@ export function RoutesDialog({
       dns !== instance.desired.spec.routing.dns.join('\n'),
     '容器路由表',
   );
+  const routeBody = {
+    expected_generation: base.generation,
+    expected_revision: base.revision,
+    routes: { ...routing, dns: networkLines(dns) },
+  };
+  const routeRequest = { ...routeBody, request_id: operationId(routeBody) };
+  const preview = useCompilePreview(instance.desired.id, { kind: 'routes', request: routeRequest });
   const save = useMutation({
     mutationFn: () => {
-      const body = {
-        expected_generation: base.generation,
-        expected_revision: base.revision,
-        routes: { ...routing, dns: networkLines(dns) },
-      };
-      return setCvmRoutes(instance.desired.id, { ...body, request_id: operationId(body) });
+      return setCvmRoutes(instance.desired.id, routeRequest, preview.inputSha256);
     },
     onSuccess: onSaved,
   });
-  const ensurePriority = (next: CvmContainerRoutes, id: string) => {
-    if (next.priorities.some(p => p.interface_id === id)) return next;
-    const nic = nics.find(nic => nic.id === id)?.allocated;
-    const priority = Math.min(65535, Math.max(0, ...next.priorities.flatMap(p => [p.ipv4 ?? 0, p.ipv6 ?? 0])) + 10);
+  const ensurePriority = (next: CvmContainerRoutes, key: string) => {
+    if (next.priorities.some(p => targetKey(p) === key)) return next;
+    const option = options.find(o => o.key === key);
+    const value = Math.min(65535, Math.max(0, ...next.priorities.flatMap(p => [p.ipv4 ?? 0, p.ipv6 ?? 0])) + 10);
     return {
       ...next,
       priorities: [
         ...next.priorities,
-        { interface_id: id, ipv4: nic?.ipv4 ? priority : null, ipv6: nic?.ipv6 ? priority : null },
+        { ...routeTarget(key), ipv4: option?.ipv4 ? value : null, ipv6: option?.ipv6 ? value : null },
       ],
     };
   };
-  const addRoute = () => {
-    const id = outbound[0]?.id;
-    if (id)
-      setRouting(old => ensurePriority({ ...old, routes: [...old.routes, { destination: '', interface_id: id }] }, id));
-  };
   const submit = () => {
     if (
-      routing.routes.some(route => !route.destination.trim() || !route.interface_id) ||
+      routing.routes.some(
+        r =>
+          !r.destination.trim() ||
+          !targetKey(r) ||
+          (r.service &&
+            (r.service.port_start < 1 || r.service.port_end > 65535 || r.service.port_end < r.service.port_start)),
+      ) ||
       routing.priorities.some(p =>
-        [p.ipv4, p.ipv6].some(value => value !== null && (!Number.isInteger(value) || value < 0 || value > 65535)),
+        [p.ipv4, p.ipv6].some(v => v !== null && (!Number.isInteger(v) || v < 0 || v > 65535)),
       )
     ) {
       setLocalError('请填写目标 IP／网段，并将优先级设为 0–65535 的整数。');
@@ -217,8 +246,14 @@ export function RoutesDialog({
   };
   const stale = base.generation !== instance.desired.generation;
   return (
-    <NicDialog title="容器路由表" pending={save.isPending} onClose={onClose} onSubmit={submit} disabled={stale}>
-      <p className="note">先比较网段具体程度，同网段再比较网卡优先级；数值越小越优先。选中的网卡故障时保持不可达。</p>
+    <NicDialog
+      title="容器路由表"
+      pending={save.isPending}
+      onClose={onClose}
+      onSubmit={submit}
+      disabled={stale || !preview.ready}
+    >
+      <p className="note">先比网段长短，再比协议端口，最后比较出口优先级；数值越小越优先。所选出口故障时保持不可达。</p>
       {stale && (
         <div className="cvm-notice" role="alert">
           <p>容器设置已变化，当前输入仍保留。</p>
@@ -236,29 +271,33 @@ export function RoutesDialog({
         </div>
       )}
       <fieldset className="cvm-form-fieldset">
-        <legend>网卡优先级</legend>
-        {routing.priorities.map(priority => {
-          const nic = nics.find(nic => nic.id === priority.interface_id);
+        <legend>出口优先级</legend>
+        {routing.priorities.map(p => {
+          const key = targetKey(p);
+          const option = options.find(o => o.key === key);
           return (
-            <div className="cvm-route-priority" key={priority.interface_id}>
-              <b>{nic ? nicName(nic, catalog) : '已失效的网卡引用'}</b>
-              {(['ipv4', 'ipv6'] as const).map(family => (
-                <label className="cvm-field" key={family}>
-                  {family === 'ipv4' ? 'IPv4 优先级' : 'IPv6 优先级'}
+            <div className="cvm-route-priority" key={key}>
+              <b>
+                {p.chain_id ? '线路 · ' : ''}
+                {option?.name ?? '已失效的出口引用'}
+              </b>
+              {(['ipv4', 'ipv6'] as const).map(f => (
+                <label className="cvm-field" key={f}>
+                  {f === 'ipv4' ? 'IPv4 优先级' : 'IPv6 优先级'}
                   <input
                     className="f"
                     type="number"
                     min={0}
                     max={65535}
-                    disabled={!nic?.allocated?.[family]}
-                    value={priority[family] ?? ''}
+                    disabled={!option?.[f]}
+                    value={p[f] ?? ''}
                     onChange={e =>
                       setRouting(old => ({
                         ...old,
-                        priorities: old.priorities.map(p =>
-                          p.interface_id === priority.interface_id
-                            ? { ...p, [family]: e.target.value === '' ? null : Number(e.target.value) }
-                            : p,
+                        priorities: old.priorities.map(x =>
+                          targetKey(x) === key
+                            ? { ...x, [f]: e.target.value === '' ? null : Number(e.target.value) }
+                            : x,
                         ),
                       }))
                     }
@@ -270,91 +309,183 @@ export function RoutesDialog({
                 onClick={() =>
                   setRouting(old => ({
                     ...old,
-                    priorities: old.priorities.filter(p => p.interface_id !== priority.interface_id),
-                    routes: old.routes.filter(route => route.interface_id !== priority.interface_id),
+                    priorities: old.priorities.filter(x => targetKey(x) !== key),
+                    routes: old.routes.filter(x => targetKey(x) !== key),
                   }))
                 }
               >
-                移除此卡的路由引用
+                移除此出口的路由引用
               </button>
             </div>
           );
         })}
-        {!routing.priorities.length && <p className="note">尚无网卡优先级；添加路由时会生成，可继续调整。</p>}
+        {!routing.priorities.length && <p className="note">添加路由时自动生成出口优先级，可继续调整。</p>}
       </fieldset>
       <fieldset className="cvm-form-fieldset">
         <legend>目标路由</legend>
-        {routing.routes.map((route, index) => (
-          <div className="cvm-route-row" key={index}>
+        {routing.routes.map((r, i) => (
+          <div className="cvm-route-row" key={i}>
             <label className="cvm-field">
               目标 IP／网段
-              {route.service && (
-                <small className="cvm-route-service" title="协议端口规则在组合台中编辑">
-                  {route.service.protocol}/{route.service.port_start}
-                  {route.service.port_end !== route.service.port_start ? `-${route.service.port_end}` : ''}
-                </small>
-              )}
               <input
                 className="f"
                 placeholder="0.0.0.0/0、::/0 或指定网段"
-                value={route.destination}
+                value={r.destination}
                 onChange={e =>
                   setRouting(old => ({
                     ...old,
-                    routes: old.routes.map((r, i) => (i === index ? { ...r, destination: e.target.value } : r)),
+                    routes: old.routes.map((x, j) => (j === i ? { ...x, destination: e.target.value } : x)),
                   }))
                 }
               />
             </label>
+            <div className="cvm-field">
+              <label className="cvm-check">
+                <input
+                  type="checkbox"
+                  checked={!!r.service}
+                  onChange={e =>
+                    setRouting(old => ({
+                      ...old,
+                      routes: old.routes.map((x, j) =>
+                        j === i
+                          ? {
+                              ...x,
+                              service: e.target.checked ? { protocol: 'tcp', port_start: 443, port_end: 443 } : null,
+                            }
+                          : x,
+                      ),
+                    }))
+                  }
+                />
+                按协议端口（L4）
+              </label>
+              {r.service && (
+                <div className="cvm-route-service-fields">
+                  <select
+                    className="f"
+                    aria-label="协议"
+                    value={r.service.protocol}
+                    onChange={e =>
+                      setRouting(old => ({
+                        ...old,
+                        routes: old.routes.map((x, j) =>
+                          j === i && x.service
+                            ? { ...x, service: { ...x.service, protocol: e.target.value as 'tcp' | 'udp' } }
+                            : x,
+                        ),
+                      }))
+                    }
+                  >
+                    <option value="tcp">TCP</option>
+                    <option value="udp">UDP</option>
+                  </select>
+                  {(['port_start', 'port_end'] as const).map(field => (
+                    <input
+                      className="f"
+                      key={field}
+                      type="number"
+                      min={1}
+                      max={65535}
+                      aria-label={field === 'port_start' ? '目的起始端口' : '目的结束端口'}
+                      value={r.service?.[field] ?? ''}
+                      onChange={e =>
+                        setRouting(old => ({
+                          ...old,
+                          routes: old.routes.map((x, j) =>
+                            j === i && x.service
+                              ? { ...x, service: { ...x.service, [field]: Number(e.target.value) } }
+                              : x,
+                          ),
+                        }))
+                      }
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
             <label className="cvm-field">
-              使用网卡
+              经由
               <select
                 className="f"
-                value={route.interface_id}
+                value={targetKey(r)}
                 onChange={e =>
                   setRouting(old =>
                     ensurePriority(
-                      {
-                        ...old,
-                        routes: old.routes.map((r, i) => (i === index ? { ...r, interface_id: e.target.value } : r)),
-                      },
+                      { ...old, routes: old.routes.map((x, j) => (j === i ? retarget(x, e.target.value) : x)) },
                       e.target.value,
                     ),
                   )
                 }
               >
-                {outbound.map(nic => (
-                  <option value={nic.id} key={nic.id}>
-                    {nicName(nic, catalog)}
-                  </option>
-                ))}
+                {!options.some(o => o.key === targetKey(r)) && <option value={targetKey(r)}>已失效的出口引用</option>}
+                <optgroup label="网卡">
+                  {options
+                    .filter(o => !o.key.startsWith('chain:'))
+                    .map(o => (
+                      <option key={o.key} value={o.key}>
+                        {o.name}
+                      </option>
+                    ))}
+                </optgroup>
+                <optgroup label="线路">
+                  {options
+                    .filter(o => o.key.startsWith('chain:'))
+                    .map(o => (
+                      <option key={o.key} value={o.key} disabled={!o.available}>
+                        {o.name}
+                        {!o.available ? ' · 不可选（授权或宿主能力）' : !o.ipv6 ? ' · IPv4' : ''}
+                      </option>
+                    ))}
+                </optgroup>
               </select>
             </label>
             <button
               className="btn small"
-              onClick={() => setRouting(old => ({ ...old, routes: old.routes.filter((_, i) => i !== index) }))}
+              onClick={() => setRouting(old => ({ ...old, routes: old.routes.filter((_, j) => j !== i) }))}
             >
               移除路由
             </button>
           </div>
         ))}
-        <button className="btn" disabled={!outbound.length || routing.routes.length >= 256} onClick={addRoute}>
+        <button
+          className="btn"
+          disabled={!options.some(o => o.available) || routing.routes.length >= 256}
+          onClick={() => {
+            const key = options.find(o => o.available)?.key;
+            if (key)
+              setRouting(old =>
+                ensurePriority({ ...old, routes: [...old.routes, { destination: '', ...routeTarget(key) }] }, key),
+              );
+          }}
+        >
           ＋ 添加路由
         </button>
       </fieldset>
+      {chains.error && <ErrorBox error={chains.error} />}
+      {chains.data?.reason && <p className="cvm-notice">{chains.data.reason}</p>}
       <p className="note">
-        无匹配业务路由时使用优先级最低的主网卡，通过宿主机 NAT 出网。卸载网卡前，请先移除它的路由和优先级引用。
+        线路使用 {chains.data?.owner?.name ?? '容器使用者'} 的接入授权、额度和限速；只转发 TCP/UDP，ping
+        不通。经主网卡接入，不占业务网卡槽位；出网地址由线路落地决定。所选线路不通时不会回落宿主
+        NAT。线路内分流和入口防护继续生效。
+      </p>
+      <p className="note">
+        无匹配业务路由时
+        {instance.desired.spec.execution?.kind === 'baremetal' ? '沿用宿主路由。' : '通过主网卡使用宿主 NAT。'}
+        卸载网卡前先移除其路由与优先级引用。
       </p>
       <label className="cvm-field">
         容器 DNS（可选）
         <textarea
           className="f"
           rows={2}
+          disabled={instance.desired.spec.execution?.kind === 'baremetal'}
           value={dns}
           onChange={e => setDns(e.target.value)}
           placeholder="每行一个解析服务器 IP；留空保留系统默认"
         />
       </label>
+      <CompilePreview preview={preview} />
       {localError && (
         <p className="cvm-notice error" role="alert">
           {localError}
@@ -497,7 +628,9 @@ export function NicVersionDialog({
       )}
       <label className="cvm-check">
         <input type="checkbox" checked={reallocate} onChange={e => setReallocate(e.target.checked)} />
-        如需改变地址，明确允许重新分配（需先关机）
+        {instance.desired.spec.execution?.kind === 'baremetal'
+          ? '明确允许运行中重新分配业务地址（现有业务连接会中断，管理联络保留）'
+          : '如需改变地址，明确允许重新分配（需先关机）'}
       </label>
       {save.error && <ErrorBox error={save.error} />}
     </NicDialog>

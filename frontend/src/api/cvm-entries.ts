@@ -14,6 +14,7 @@ export interface CvmEntryPublicationSpec {
   provider_node: string;
   addresses: CvmEntryAddressOffer[];
   transports: CvmTransportOffer[];
+  wireguard_transport?: 'udp' | 'phantun';
   grants: { tenant_id: string; user_id: string }[];
   max_entries: number;
 }
@@ -57,6 +58,8 @@ export interface CvmEntry {
   remote: boolean;
   state: CvmEntryState;
   error: string | null;
+  can_read_logs?: boolean;
+  tunnel_id?: string | null;
 }
 export interface CvmEntryBoard {
   publications: CvmEntryPublicationView[];
@@ -115,3 +118,31 @@ export const entryStateText: Record<CvmEntryState, string> = {
   no_target: '容器未运行',
   releasing: '撤销中',
 };
+
+export interface CvmNetworkLogEvent {
+  at: number;
+  resource_id: string | null;
+  source: 'agent' | 'xray' | 'phantun';
+  level: 'info' | 'warning' | 'error';
+  message: string;
+}
+export interface CvmNetworkNodeLogs {
+  node_id: string;
+  name: string;
+  fresh: boolean;
+  domains: { domain: string; desired_generation: number; reported_generation: number | null; error: string | null }[];
+  diagnostics: {
+    collected_at: number;
+    dropped_events: number;
+    events: CvmNetworkLogEvent[];
+    resources: {
+      id: string;
+      phase: 'preparing' | 'waiting' | 'connected' | 'failed';
+      since: number;
+      waiting_seconds: number;
+      message: string;
+    }[];
+  } | null;
+}
+export const fetchCvmNetworkLogs = (nodes: string[]) =>
+  api<{ nodes: CvmNetworkNodeLogs[] }>(`/cvm/network-logs?nodes=${encodeURIComponent(nodes.join(','))}`);

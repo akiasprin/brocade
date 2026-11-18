@@ -40,7 +40,7 @@ pub(super) async fn admission(
         return Err(StoreError::Forbidden("未授权在这台机器上使用 CVM".into()));
     }
     let usage=sqlx::query("SELECT count(*)::bigint AS instances,coalesce(sum((desired#>>'{spec,resources,vcpus}')::bigint),0)::bigint AS cpu,coalesce(sum((desired#>>'{spec,resources,memory_bytes}')::bigint),0)::bigint AS memory FROM cvm_instances WHERE tenant_id=$1 AND user_id=$2 AND reserved").bind(&quota.tenant_id).bind(&quota.user_id).fetch_one(&mut **tx).await?;
-    let disks:i64=sqlx::query_scalar("SELECT coalesce(sum(bytes),0)::bigint FROM cvm_volumes WHERE tenant_id=$1 AND user_id=$2 AND state<>'released'").bind(&quota.tenant_id).bind(&quota.user_id).fetch_one(&mut **tx).await?;
+    let disks:i64=sqlx::query_scalar("SELECT (SELECT coalesce(sum(bytes),0)::bigint FROM cvm_volumes WHERE tenant_id=$1 AND user_id=$2 AND state<>'released') + (SELECT coalesce(sum((desired#>>'{spec,resources,root_disk_bytes}')::bigint),0)::bigint FROM cvm_instances WHERE tenant_id=$1 AND user_id=$2 AND reserved AND desired#>>'{spec,execution,kind}'='baremetal')").bind(&quota.tenant_id).bind(&quota.user_id).fetch_one(&mut **tx).await?;
     let nics:i64=sqlx::query_scalar("SELECT count(*) FROM cvm_interfaces nic JOIN cvm_instances i ON i.id=nic.instance_id WHERE i.tenant_id=$1 AND i.user_id=$2 AND (NOT nic.detached_confirmed OR EXISTS(SELECT 1 FROM cvm_nic_allocations a WHERE a.interface_id=nic.id AND NOT a.released AND NOT a.retired))").bind(&quota.tenant_id).bind(&quota.user_id).fetch_one(&mut **tx).await?;
     let add = |a: i64, b: u64, limit: u64| {
         a >= 0 && (a as u64).checked_add(b).is_some_and(|v| v <= limit)
@@ -140,7 +140,7 @@ impl PgStore {
                 return Err(invalid("授权机器不存在或已退役"));
             }
         }
-        let active_nodes:Vec<String>=sqlx::query_scalar("SELECT DISTINCT i.node_id FROM cvm_instances i JOIN cvm_volumes v ON v.instance_id=i.id WHERE i.tenant_id=$1 AND i.user_id=$2 AND (i.reserved OR v.state<>'released')").bind(&request.tenant_id).bind(&request.user_id).fetch_all(&mut *tx).await?;
+        let active_nodes:Vec<String>=sqlx::query_scalar("SELECT DISTINCT i.node_id FROM cvm_instances i LEFT JOIN cvm_volumes v ON v.instance_id=i.id WHERE i.tenant_id=$1 AND i.user_id=$2 AND (i.reserved OR v.state<>'released')").bind(&request.tenant_id).bind(&request.user_id).fetch_all(&mut *tx).await?;
         let network_nodes:Vec<String>=sqlx::query_scalar("SELECT q.node_id FROM cvm_user_host_network_quotas q JOIN nodes n ON n.id=q.node_id WHERE q.tenant_id=$1 AND q.user_id=$2 AND q.held_states>0 AND n.retired_at IS NULL")
             .bind(&request.tenant_id).bind(&request.user_id).fetch_all(&mut *tx).await?;
         if network_nodes
@@ -160,7 +160,7 @@ impl PgStore {
         if let Some(node) = active_nodes.first() {
             admission(&mut tx, &request, node, None, 0).await?;
         }
-        let held_disks:i64=sqlx::query_scalar("SELECT coalesce(sum(bytes),0)::bigint FROM cvm_volumes WHERE tenant_id=$1 AND user_id=$2 AND state<>'released'").bind(&request.tenant_id).bind(&request.user_id).fetch_one(&mut *tx).await?;
+        let held_disks:i64=sqlx::query_scalar("SELECT (SELECT coalesce(sum(bytes),0)::bigint FROM cvm_volumes WHERE tenant_id=$1 AND user_id=$2 AND state<>'released') + (SELECT coalesce(sum((desired#>>'{spec,resources,root_disk_bytes}')::bigint),0)::bigint FROM cvm_instances WHERE tenant_id=$1 AND user_id=$2 AND reserved AND desired#>>'{spec,execution,kind}'='baremetal')").bind(&request.tenant_id).bind(&request.user_id).fetch_one(&mut *tx).await?;
         if held_disks as u64 > request.max_disk_bytes {
             return Err(invalid("磁盘额度不能小于已保留的系统盘"));
         }

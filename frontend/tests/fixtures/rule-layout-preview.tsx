@@ -1,3 +1,4 @@
+import { geodataFixture } from './geodata-data';
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ChainRulesPanel } from '../../src/panes/chains';
@@ -54,6 +55,11 @@ if (params.has('listener')) {
   });
   app.steps = app.steps.filter(step => step.chain !== app.chains[0].id || step.node !== 'tw-hinet');
 }
+if (params.has('invalid'))
+  app.steps[1].rules.splice(1, 0, {
+    m: { t: 'geosite', v: ['openai', 'netflix'] },
+    a: { t: 'egress', send_through: null },
+  });
 const STEPS = app.steps.filter(step => step.chain === app.chains[0].id);
 if (theme.snapshot() !== (params.get('theme') === 'light' ? 'light' : 'dark')) theme.toggle();
 draft.init('rule-layout-acceptance');
@@ -65,6 +71,8 @@ client.setQueryData(['settings'], SETTINGS);
 client.setQueryData(['revisions'], REVISIONS);
 globalThis.fetch = async (input, init) => {
   const path = String(input);
+  const geo = geodataFixture(path, init);
+  if (geo) return geo;
   if (path.endsWith('/model/preview')) {
     const next = structuredClone(SNAPSHOT);
     const ops = init?.body ? (JSON.parse(String(init.body)).ops as ReturnType<typeof draft.ops>) : draft.ops();

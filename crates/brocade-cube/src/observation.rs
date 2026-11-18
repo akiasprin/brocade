@@ -260,7 +260,7 @@ impl Inner {
             .access_address_with_timeout(&observed.runtime, Duration::from_millis(500))
             .ok();
         if let Some(address) = &address {
-            out.ssh_state = probe(address, 22).0;
+            out.ssh_state = probe_tcp(address, 22).0;
         }
         for service in &target.services {
             let allowed = observed.interfaces.iter().any(|nic| {
@@ -272,7 +272,7 @@ impl Inner {
                         || (nic.device == "eth0" && address.as_ref() == Some(&service.host)))
             });
             let (state, latency_millis) = if allowed {
-                probe(&service.host, service.port)
+                probe_tcp(&service.host, service.port)
             } else {
                 (Reachability::Unknown, None)
             };
@@ -305,7 +305,8 @@ fn empty_observation(target: &ObservationTarget, error: &str) -> Result<Instance
     })
 }
 
-fn probe(host: &str, port: u16) -> (Reachability, Option<u32>) {
+/// Probe a literal endpoint with a fixed deadline; callers authorize its scope.
+pub fn probe_tcp(host: &str, port: u16) -> (Reachability, Option<u32>) {
     let Ok(ip) = host.parse::<std::net::IpAddr>() else {
         return (Reachability::Unknown, None);
     };

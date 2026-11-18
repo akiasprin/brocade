@@ -3164,6 +3164,8 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 n.overlay,
                 n.xray_enabled,
                 n.egress_allowed,
+                COALESCE((SELECT public_ip_changes FROM node_notification_preferences
+                          WHERE node_id=n.id), TRUE) AS public_ip_change_notifications,
                 n.dns_kind,
                 n.dns_servers,
                 n.domain_strategy,
@@ -3282,6 +3284,8 @@ fn node_agent_state_sql(scoped: bool) -> &'static str {
                 n.overlay,
                 n.xray_enabled,
                 n.egress_allowed,
+                COALESCE((SELECT public_ip_changes FROM node_notification_preferences
+                          WHERE node_id=n.id), TRUE) AS public_ip_change_notifications,
                 n.dns_kind,
                 n.dns_servers,
                 n.domain_strategy,
@@ -3558,6 +3562,7 @@ fn node_agent_state_from_row(row: &sqlx::postgres::PgRow) -> Result<NodeAgentSta
         overlay: row.try_get("overlay")?,
         xray_enabled: row.try_get("xray_enabled")?,
         egress_allowed: row.try_get("egress_allowed")?,
+        public_ip_change_notifications: row.try_get("public_ip_change_notifications")?,
         mtu: row
             .try_get::<Option<i32>, _>("mtu")?
             .map(|value| u16::try_from(value).unwrap_or_default()),
@@ -3936,6 +3941,8 @@ async fn set_current_revision(tx: &mut Transaction<'_, Postgres>, revision_id: u
         crate::subscription_client::advance_from_committed_tx(tx, revision_id),
     )
     .await?;
+    #[cfg(feature = "cvm")]
+    crate::cvm::releases::freeze_chain_dependents(tx, revision_id).await?;
     Ok(())
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::cvm::releases::Scope;
 
 pub(super) fn spec_digest(spec: &InstanceSpec) -> Result<String> {
     Ok(sha256_hex(&serde_json::to_vec(spec)?))
@@ -73,8 +74,44 @@ pub(super) async fn save_version(
     .bind(&desired.spec_sha256)
     .execute(&mut **tx)
     .await?;
+    artifacts::freeze(tx, desired).await?;
     sqlx::query("INSERT INTO cvm_operations(id,instance_id,generation,kind,actor_id,request_id,request_sha256) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(&desired.operation_id).bind(&desired.id).bind(desired.generation as i64).bind(kind).bind(actor.operator_id()).bind(request).bind(digest).execute(&mut **tx).await?;
     sqlx::query("UPDATE cvm_instances SET generation=$2,desired=$3,name=$4,status='pending',updated_at=now() WHERE id=$1").bind(&desired.id).bind(desired.generation as i64).bind(serde_json::to_value(desired)?).bind(&desired.spec.name).execute(&mut **tx).await?;
+    Ok(())
+}
+
+/// Runtime-only generations can belong to the serving lineage while a newer user intent is
+/// staged. Freeze either branch without replacing the other branch's authoritative desired.
+pub(super) async fn save_system_version(
+    tx: &mut Transaction<'_, Postgres>,
+    desired: &mut InstanceDesired,
+    kind: &str,
+    update_current: bool,
+) -> Result<()> {
+    desired.generation = desired
+        .generation
+        .checked_add(1)
+        .filter(|g| *g <= i64::MAX as u64)
+        .ok_or_else(|| invalid("CVM execution generation exhausted"))?;
+    desired.operation_id = new_id("op")?;
+    desired.spec_sha256 = spec_digest(&desired.spec)?;
+    let request = new_id("network-system")?;
+    sqlx::query(
+        "INSERT INTO cvm_spec_versions(instance_id,generation,spec,sha256) VALUES($1,$2,$3,$4)",
+    )
+    .bind(&desired.id)
+    .bind(desired.generation as i64)
+    .bind(serde_json::to_value(&desired.spec)?)
+    .bind(&desired.spec_sha256)
+    .execute(&mut **tx)
+    .await?;
+    artifacts::freeze(tx, desired).await?;
+    sqlx::query("INSERT INTO cvm_operations(id,instance_id,generation,kind,actor_id,request_id,request_sha256) VALUES($1,$2,$3,$4,'system-network',$5,$6)")
+        .bind(&desired.operation_id).bind(&desired.id).bind(desired.generation as i64).bind(kind).bind(&request).bind(request_digest(desired)?).execute(&mut **tx).await?;
+    if update_current {
+        sqlx::query("UPDATE cvm_instances SET generation=$2,desired=$3,status='pending',updated_at=now() WHERE id=$1")
+            .bind(&desired.id).bind(desired.generation as i64).bind(serde_json::to_value(&*desired)?).execute(&mut **tx).await?;
+    }
     Ok(())
 }
 
@@ -95,7 +132,9 @@ impl PgStore {
         }
         let digest = request_digest(&request)?;
         let mut tx = self.pool.begin().await?;
-        crate::resource_coordination::lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before =
+            crate::cvm::releases::begin(&mut tx, Scope::node(&request.node_id)).await?;
         if let Some(instance) =
             operation_replay(&mut tx, actor, &request.request_id, &digest).await?
         {
@@ -123,6 +162,13 @@ impl PgStore {
             &caps,
         )
         .await?;
+        let native_occupied: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_instances i WHERE node_id=$1 AND desired#>>'{spec,execution,kind}'='baremetal' AND (reserved OR EXISTS(SELECT 1 FROM cvm_interfaces n WHERE n.instance_id=i.id AND NOT n.detached_confirmed) OR EXISTS(SELECT 1 FROM cvm_entries e WHERE e.instance_id=i.id AND NOT e.cleaned)))")
+            .bind(&request.node_id).fetch_one(&mut *tx).await?;
+        if native_occupied {
+            return Err(StoreError::Conflict(
+                "该机器已由裸机实例独占或尚未清理".into(),
+            ));
+        }
         if !caps.create || !caps.managed_networks {
             return Err(StoreError::Unsupported("机器尚未支持创建 CVM".into()));
         }
@@ -165,22 +211,15 @@ impl PgStore {
         if count >= MAX_INSTANCES_PER_MACHINE as i64 {
             return Err(invalid("机器实例数量已达上限"));
         }
-        let held_host_disks:i64=sqlx::query_scalar("SELECT coalesce(sum(v.bytes),0)::bigint FROM cvm_volumes v JOIN cvm_instances i ON i.id=v.instance_id WHERE i.node_id=$1 AND v.state<>'released'").bind(&request.node_id).fetch_one(&mut *tx).await?;
-        let host_usage=sqlx::query("SELECT coalesce(sum((desired#>>'{spec,resources,vcpus}')::bigint),0)::bigint AS cpu,coalesce(sum((desired#>>'{spec,resources,memory_bytes}')::bigint),0)::bigint AS memory,coalesce(sum((desired#>>'{spec,resources,root_disk_bytes}')::bigint),0)::bigint AS disk FROM cvm_instances WHERE node_id=$1 AND reserved").bind(&request.node_id).fetch_one(&mut *tx).await?;
-        if host_usage.try_get::<i64, _>("cpu")? as u64 + u64::from(resources.vcpus)
-            > u64::from(caps.allocatable_vcpus)
-            || host_usage.try_get::<i64, _>("memory")? as u64 + resources.memory_bytes
-                > caps.allocatable_memory_bytes
-            || held_host_disks as u64 + resources.root_disk_bytes > caps.allocatable_disk_bytes
-        {
-            return Err(invalid("承载机器的可预约容量不足"));
-        }
+        // User quota accounts logical resources. Host inventory is an observed
+        // baseline, not a second admission ceiling: compute and disks may oversell.
         let id = new_id("cvm")?;
         let operation_id = new_id("op")?;
         let spec = InstanceSpec {
+            execution: ExecutionTarget::Cube,
             routing: ContainerRoutes::default(),
             name: request.name.trim().into(),
-            image,
+            image: Some(image),
             resources,
             ssh_public_key: request.ssh_public_key.trim().into(),
             interfaces: request
@@ -196,6 +235,8 @@ impl PgStore {
                 .collect::<Result<Vec<_>>>()?,
         };
         let desired = InstanceDesired {
+            artifacts: None,
+            artifact_mode: Default::default(),
             detached_interfaces: Vec::new(),
             id: id.clone(),
             operation_id,
@@ -229,6 +270,7 @@ impl PgStore {
             &desired,
         )
         .await?;
+        crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
         tx.commit().await?;
         self.cvm_instance(actor, &id).await
     }
@@ -241,18 +283,39 @@ impl PgStore {
         id: &str,
         request: CvmCommand,
     ) -> Result<CvmInstance> {
+        Ok(self
+            .command_cvm_reviewed(actor, id, request, CvmMutationReview::default())
+            .await?
+            .instance)
+    }
+    pub async fn command_cvm_reviewed(
+        &self,
+        actor: &AdminContext,
+        id: &str,
+        request: CvmCommand,
+        review: CvmMutationReview,
+    ) -> Result<CvmMutationResult> {
+        if review.preview
+            && !matches!(
+                request.change,
+                CvmChange::Configure { .. } | CvmChange::Detach { .. }
+            )
+        {
+            return Err(invalid("该操作不支持配置编译预览"));
+        }
         let before = self.cvm_instance(actor, id).await?;
         require_owner(actor, &before.tenant_id, &before.user_id, true)?;
 
         request_id(&request.request_id)?;
         let digest = request_digest(&(id, &request))?;
         let mut tx = self.pool.begin().await?;
-        crate::resource_coordination::lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before = crate::cvm::releases::begin(&mut tx, Scope::instance(id)).await?;
         if let Some(instance) =
             operation_replay(&mut tx, actor, &request.request_id, &digest).await?
         {
             tx.commit().await?;
-            return Ok(instance);
+            return Ok(CvmMutationResult::existing(instance));
         }
         sqlx::query("SELECT id FROM users WHERE tenant_id=$1 AND id=$2 FOR UPDATE")
             .bind(&before.tenant_id)
@@ -260,7 +323,10 @@ impl PgStore {
             .fetch_one(&mut *tx)
             .await?;
         let quota = quota_locked(&mut tx, &before.tenant_id, &before.user_id).await?;
-        let recovery = matches!(request.change, CvmChange::Delete { .. } | CvmChange::Retry);
+        let recovery = matches!(
+            request.change,
+            CvmChange::Delete { .. } | CvmChange::ReleaseHost | CvmChange::Retry
+        );
         let caps = host_locked(&mut tx, &before.node_id, recovery).await?;
         let row = sqlx::query(&format!("{INSTANCE_SELECT} WHERE id=$1 FOR UPDATE"))
             .bind(id)
@@ -276,13 +342,29 @@ impl PgStore {
             sqlx::query("UPDATE cvm_instances SET status='pending',updated_at=now() WHERE id=$1 AND status IN ('failed','unknown','restart_required')").bind(id).execute(&mut *tx).await?;
             sqlx::query("UPDATE cvm_operations SET status='pending',updated_at=now() WHERE id=$1 AND status IN ('failed','unknown','restart_required')").bind(&instance.desired.operation_id).execute(&mut *tx).await?;
             tx.commit().await?;
-            return self.cvm_instance(actor, id).await;
+            return Ok(CvmMutationResult::existing(
+                self.cvm_instance(actor, id).await?,
+            ));
         }
         if instance.desired.power == PowerState::Deleted {
             return Err(invalid("已进入删除流程的实例不能重新创建或重放"));
         }
         if instance.desired.generation >= 10_000 {
             return Err(invalid("实例规格历史达到本版本上限"));
+        }
+        let baremetal = !instance.desired.spec.execution.is_cube();
+        if baremetal
+            && !matches!(
+                request.change,
+                CvmChange::ReleaseHost | CvmChange::Detach { .. }
+            )
+        {
+            return Err(StoreError::Unsupported(
+                "裸机不支持容器启停、改配、重装或清盘删除；请使用解除纳管".into(),
+            ));
+        }
+        if !baremetal && matches!(request.change, CvmChange::ReleaseHost) {
+            return Err(invalid("只有裸机实例可以解除纳管"));
         }
         let mut desired = instance.desired.clone();
         let kind = match request.change {
@@ -303,12 +385,13 @@ impl PgStore {
                 if !valid_public_key(&ssh_public_key) {
                     return Err(invalid("SSH 公钥无效"));
                 }
-                desired.spec.image = caps
-                    .images
-                    .iter()
-                    .find(|image| image.id == image_id)
-                    .ok_or_else(|| invalid("系统镜像不可用"))?
-                    .clone();
+                desired.spec.image = Some(
+                    caps.images
+                        .iter()
+                        .find(|image| image.id == image_id)
+                        .ok_or_else(|| invalid("系统镜像不可用"))?
+                        .clone(),
+                );
                 desired.spec.ssh_public_key = ssh_public_key.trim().into();
                 desired.reinstall_epoch += 1;
                 desired.power = PowerState::Running;
@@ -338,16 +421,10 @@ impl PgStore {
                 let old = &desired.spec.resources;
                 let user_usage = sqlx::query("SELECT coalesce(sum((desired#>>'{spec,resources,vcpus}')::bigint),0)::bigint AS cpu,coalesce(sum((desired#>>'{spec,resources,memory_bytes}')::bigint),0)::bigint AS memory FROM cvm_instances WHERE tenant_id=$1 AND user_id=$2 AND reserved AND id<>$3")
                     .bind(&instance.tenant_id).bind(&instance.user_id).bind(id).fetch_one(&mut *tx).await?;
-                let host_usage = sqlx::query("SELECT coalesce(sum((desired#>>'{spec,resources,vcpus}')::bigint),0)::bigint AS cpu,coalesce(sum((desired#>>'{spec,resources,memory_bytes}')::bigint),0)::bigint AS memory FROM cvm_instances WHERE node_id=$1 AND reserved AND id<>$2")
-                    .bind(&instance.node_id).bind(id).fetch_one(&mut *tx).await?;
                 if user_usage.try_get::<i64, _>("cpu")? as u64 + u64::from(resources.vcpus)
                     > quota.max_vcpus
                     || user_usage.try_get::<i64, _>("memory")? as u64 + resources.memory_bytes
                         > quota.max_memory_bytes
-                    || host_usage.try_get::<i64, _>("cpu")? as u64 + u64::from(resources.vcpus)
-                        > u64::from(caps.allocatable_vcpus)
-                    || host_usage.try_get::<i64, _>("memory")? as u64 + resources.memory_bytes
-                        > caps.allocatable_memory_bytes
                 {
                     return Err(invalid("修改后的 CPU 或内存超过可用额度"));
                 }
@@ -384,6 +461,16 @@ impl PgStore {
                 }
                 desired.power = PowerState::Stopped;
                 "stop"
+            }
+            CvmChange::ReleaseHost => {
+                desired.power = PowerState::Deleted;
+                desired.delete_data = false;
+                desired.spec.routing.routes.clear();
+                desired.spec.routing.priorities.clear();
+                desired.spec.routing.revision += 1;
+                nics::withdraw(&mut tx, id, None).await?;
+                nics::entries::release_instance(&mut tx, id).await?;
+                "release_host"
             }
             CvmChange::Delete { delete_data } => {
                 if !caps.delete
@@ -444,8 +531,11 @@ impl PgStore {
                 unreachable!("retry returned before changing the immutable specification")
             }
         };
-        if !matches!(kind, "delete") && instance.status != ApplyStatus::Applied {
+        if !matches!(kind, "delete" | "release_host") && instance.status != ApplyStatus::Applied {
             return Err(invalid("请先核查或重试当前操作"));
+        }
+        if desired == instance.desired {
+            return self.finish_cvm_review(tx, actor, id, review, true).await;
         }
         desired.generation += 1;
         desired.operation_id = new_id("op")?;
@@ -455,7 +545,10 @@ impl PgStore {
         desired.detached_interfaces = sqlx::query_scalar("SELECT id FROM cvm_interfaces WHERE instance_id=$1 AND NOT desired_attached AND NOT detached_confirmed ORDER BY id")
             .bind(id).fetch_all(&mut *tx).await?;
         save_version(&mut tx, actor, &request.request_id, &digest, kind, &desired).await?;
-        tx.commit().await?;
-        self.cvm_instance(actor, id).await
+        artifacts::check_review(&mut tx, id, &review).await?;
+        if !review.preview {
+            crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
+        }
+        self.finish_cvm_review(tx, actor, id, review, false).await
     }
 }

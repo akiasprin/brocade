@@ -15,19 +15,13 @@ use std::{
 /// Enforcing their prefixes in CubeVS also prevents binding the primary source
 /// address from bypassing a selected business NIC or its failure policy.
 pub(crate) fn primary_network_policy(routing: &ContainerRoutes) -> Value {
-    let mut denied = routing
-        .routes
-        .iter()
-        .filter(|route| route.destination.is_ipv4())
-        .map(|route| route.destination.to_string())
-        .collect::<Vec<_>>();
-    denied.sort();
-    denied.dedup();
-    json!({"allow_internet_access":true,"allow_out":[],"deny_out":denied,"rules":[]})
+    brocade_cvm_compile::primary_network_policy(routing)
 }
 
 #[derive(Clone, Deserialize)]
 pub(crate) struct Config {
+    #[serde(skip)]
+    pub(crate) manifests: BTreeMap<String, brocade_deployment::cvm::CvmImageManifest>,
     #[serde(default)]
     virtualization_mode: VirtualizationMode,
     pub(crate) cubelet_socket: PathBuf,
@@ -133,6 +127,14 @@ impl Config {
             if sha256_hex(&bytes) != image.sha256 {
                 return Err("Cube image manifest digest does not match".into());
             }
+            cfg.manifests.insert(
+                image.id.clone(),
+                brocade_deployment::cvm::CvmImageManifest {
+                    sha256: image.sha256.clone(),
+                    content: String::from_utf8(bytes.clone())
+                        .map_err(|_| "Cube image manifest is not UTF-8")?,
+                },
+            );
             let raw =
                 serde_json::from_slice(&bytes).map_err(|_| "invalid Cube system manifest JSON")?;
             let message: rpc::cb::RunCubeSandboxRequest =
@@ -148,6 +150,9 @@ impl Config {
     pub(crate) fn configured_capabilities(&self) -> Capabilities {
         let cfg = &self.capabilities;
         Capabilities {
+            artifact_compiler: Some(brocade_deployment::cvm::CVM_ARTIFACT_COMPILER.into()),
+            cube_storage_backend: Some(self.storage_backend.clone()),
+            baremetal: None,
             network_quota: None,
             managed_networks: false,
             backend: match self.virtualization_mode {
@@ -159,6 +164,7 @@ impl Config {
             guest_terminal_persistent: true,
             configure_network: true,
             route_services: false,
+            chain_egress: false,
             primary_ip_delivery: false,
             create: cfg.create,
             stop: cfg.stop,
@@ -187,6 +193,35 @@ impl Config {
         desired: &InstanceDesired,
     ) -> Result<Value> {
         let spec = &desired.spec;
+        if desired.artifact_mode == brocade_deployment::cvm::CvmArtifactMode::Enforce {
+            let bundle = desired
+                .artifacts
+                .as_ref()
+                .ok_or("enforced Cube artifacts missing")?;
+            brocade_cvm_compile::verify(bundle, desired)?;
+            if spec
+                .image
+                .as_ref()
+                .is_none_or(|image| image.architecture != std::env::consts::ARCH)
+            {
+                return Err("frozen Cube image architecture does not match this host".into());
+            }
+            self.capabilities
+                .resource_limits
+                .as_ref()
+                .ok_or("independent Cube resources unavailable")?
+                .validate_resources(&spec.resources)?;
+            return brocade_cvm_compile::bind(
+                desired
+                    .artifacts
+                    .as_ref()
+                    .ok_or("enforced Cube artifacts missing")?,
+                brocade_deployment::cvm::CvmArtifactKind::Sandbox,
+                desired,
+                &Default::default(),
+            );
+        }
+
         let image = serde_json::to_value(&spec.image).map_err(|_| "invalid frozen system image")?;
         if !self
             .capabilities
@@ -202,35 +237,16 @@ impl Config {
             .as_ref()
             .ok_or("independent Cube resources unavailable")?
             .validate_resources(resources)?;
-        let mut request = images
-            .get(&spec.image.id)
-            .ok_or("Cube system image unavailable")?
-            .clone();
-        request["requestID"] = json!(format!("brocade-create-{}", desired.id));
-        request["namespace"] = json!("default");
-        request["backend"] = json!(self.storage_backend);
-        request["exposed_ports"] = json!([]);
-        request["cube_network_config"] = primary_network_policy(&spec.routing);
-        request["annotations"]["cube.master.desired.sandbox.id"] = json!(desired.id);
-        request["labels"] = json!({"brocade.cvm.instance":desired.id,"brocade.cvm.spec_sha256":desired.spec_sha256});
-        request["containers"][0]["resources"] = json!({"cpu":format!("{}m", u64::from(resources.vcpus)*1000),"mem":format!("{}Mi",resources.memory_bytes/(1024*1024))});
-        let root = root_name(&request)?.to_owned();
-        let mut found = false;
-        for volume in request["volumes"]
-            .as_array_mut()
-            .ok_or("Cube system image volumes missing")?
-        {
-            if crate::text(volume, "name") == root
-                && volume["volume_source"]["empty_dir"].is_object()
-            {
-                volume["volume_source"]["empty_dir"]["SizeLimit"] =
-                    json!(resources.root_disk_bytes.to_string());
-                found = true;
-            }
-        }
-        if !found {
-            return Err("system image lacks a capacity-independent writable root mount".into());
-        }
+        let normalized = images
+            .get(&spec.image.as_ref().ok_or("Cube image is missing")?.id)
+            .ok_or("Cube system image unavailable")?;
+        let mut request = brocade_cvm_compile::sandbox_request(
+            &desired.id,
+            spec,
+            normalized,
+            &self.storage_backend,
+        )?;
+        request["labels"]["brocade.cvm.spec_sha256"] = json!(desired.spec_sha256);
         Ok(request)
     }
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"sort"
 	"strings"
@@ -20,7 +21,8 @@ const serviceBandStart = 30200
 const serviceBandEnd = 30500
 
 type assignedPriority struct {
-	InterfaceID string  `json:"interface_id"`
+	InterfaceID string  `json:"interface_id,omitempty"`
+	ChainID     string  `json:"chain_id,omitempty"`
 	IPv4        *uint16 `json:"ipv4"`
 	IPv6        *uint16 `json:"ipv6"`
 }
@@ -31,9 +33,32 @@ type assignedService struct {
 }
 type assignedRoute struct {
 	Destination string           `json:"destination"`
-	InterfaceID string           `json:"interface_id"`
+	InterfaceID string           `json:"interface_id,omitempty"`
+	ChainID     string           `json:"chain_id,omitempty"`
 	Service     *assignedService `json:"service,omitempty"`
 }
+
+func (r assignedRoute) key() string {
+	if r.ChainID != "" {
+		return "chain:" + r.ChainID
+	}
+	return r.InterfaceID
+}
+func (p assignedPriority) key() string {
+	if p.ChainID != "" {
+		return "chain:" + p.ChainID
+	}
+	return p.InterfaceID
+}
+func (r *record) hasChain(id string) bool {
+	for _, c := range r.ChainEgress {
+		if c.ChainID == id {
+			return true
+		}
+	}
+	return false
+}
+
 type assignedRouting struct {
 	Revision   uint64             `json:"revision"`
 	Priorities []assignedPriority `json:"priorities"`
@@ -52,31 +77,31 @@ func selectedRoutes(raw object, r *record) (assignedRouting, []chosenRoute, erro
 		return assignedRouting{}, nil, err
 	}
 	var routing assignedRouting
-	if json.Unmarshal(data, &routing) != nil || len(routing.Routes) > 256 || len(routing.Priorities) > 16 || len(routing.DNS) > 4 {
+	if json.Unmarshal(data, &routing) != nil || len(routing.Routes) > 256 || len(routing.Priorities) > 256 || len(routing.DNS) > 4 {
 		return routing, nil, errors.New("invalid managed container route configuration")
 	}
 	priorities := map[string]assignedPriority{}
 	for _, priority := range routing.Priorities {
-		if r.NICs[priority.InterfaceID] == nil || priorities[priority.InterfaceID].InterfaceID != "" {
+		if (priority.ChainID != "" && (priority.InterfaceID != "" || !r.hasChain(priority.ChainID))) || (priority.ChainID == "" && r.NICs[priority.InterfaceID] == nil) || priorities[priority.key()].key() != "" {
 			return routing, nil, errors.New("priority references an unknown or repeated NIC")
 		}
-		priorities[priority.InterfaceID] = priority
+		priorities[priority.key()] = priority
 	}
 	winners := map[netip.Prefix]chosenRoute{}
 	for _, route := range routing.Routes {
 		prefix, err := netip.ParsePrefix(route.Destination)
 		nic := r.NICs[route.InterfaceID]
-		priority := priorities[route.InterfaceID]
-		if err != nil || prefix != prefix.Masked() || nic == nil || nic.Allocated == nil {
+		priority := priorities[route.key()]
+		if err != nil || prefix != prefix.Masked() || (route.ChainID != "" && (route.InterfaceID != "" || !r.hasChain(route.ChainID))) || (route.ChainID == "" && (nic == nil || nic.Allocated == nil)) {
 			return routing, nil, errors.New("route references an invalid prefix or unallocated NIC")
 		}
 		selected := priority.IPv6
 		if prefix.Addr().Is4() {
 			selected = priority.IPv4
-			if nic.IPv4 == "" {
+			if route.ChainID == "" && nic.IPv4 == "" {
 				return routing, nil, errors.New("route requires unallocated IPv4")
 			}
-		} else if nic.IPv6 == "" {
+		} else if route.ChainID == "" && nic.IPv6 == "" {
 			return routing, nil, errors.New("route requires unallocated IPv6")
 		}
 		if selected == nil {
@@ -90,17 +115,22 @@ func selectedRoutes(raw object, r *record) (assignedRouting, []chosenRoute, erro
 			continue
 		}
 		if previous, ok := winners[prefix]; ok {
-			if previous.priority == *selected && previous.id != route.InterfaceID {
+			if previous.priority == *selected && previous.id != route.key() {
 				return routing, nil, errors.New("same prefix and priority select different NICs")
 			}
 			if previous.priority <= *selected {
 				continue
 			}
 		}
-		winners[prefix] = chosenRoute{prefix, route.InterfaceID, *selected}
+		winners[prefix] = chosenRoute{prefix, route.key(), *selected}
 	}
 	routes := make([]chosenRoute, 0, len(winners))
 	for _, route := range winners {
+		// A chain wins the same whole-prefix contest as a NIC. Its Guest policy
+		// selector uses the primary table; do not install or report a losing NIC route.
+		if strings.HasPrefix(route.id, "chain:") {
+			continue
+		}
 		routes = append(routes, route)
 	}
 	sort.Slice(routes, func(i, j int) bool {
@@ -119,61 +149,66 @@ func selectedRoutes(raw object, r *record) (assignedRouting, []chosenRoute, erro
 // specific prefix first, port rules before whole-prefix rules at the same prefix, then
 // NIC priority, then the narrower range. Every route ranked up to the last port rule
 // becomes a selector in that order; the rest is the business table's longest match.
-func serviceRules(routing assignedRouting, r *record) ([]policyRule, error) {
-	type ranked struct {
-		prefix   netip.Prefix
-		route    assignedRoute
-		priority uint16
-		width    uint32
-	}
+type rankedRoute struct {
+	prefix   netip.Prefix
+	route    assignedRoute
+	priority uint16
+	width    uint32
+}
+
+func orderedAssignedRoutes(routing assignedRouting, v4 bool) []rankedRoute {
 	priorities := map[string]assignedPriority{}
-	for _, priority := range routing.Priorities {
-		priorities[priority.InterfaceID] = priority
+	for _, p := range routing.Priorities {
+		priorities[p.key()] = p
 	}
+	list := []rankedRoute{}
+	for _, route := range routing.Routes {
+		prefix, e := netip.ParsePrefix(route.Destination)
+		if e != nil || prefix.Addr().Is4() != v4 {
+			continue
+		}
+		selected := priorities[route.key()].IPv6
+		if v4 {
+			selected = priorities[route.key()].IPv4
+		}
+		if selected == nil {
+			continue
+		}
+		width := uint32(1 << 31)
+		if route.Service != nil {
+			width = uint32(route.Service.PortEnd) - uint32(route.Service.PortStart)
+		}
+		list = append(list, rankedRoute{prefix, route, *selected, width})
+	}
+	sort.SliceStable(list, func(i, j int) bool {
+		a, b := list[i], list[j]
+		if a.prefix.Bits() != b.prefix.Bits() {
+			return a.prefix.Bits() > b.prefix.Bits()
+		}
+		if (a.route.Service == nil) != (b.route.Service == nil) {
+			return a.route.Service != nil
+		}
+		if a.priority != b.priority {
+			return a.priority < b.priority
+		}
+		if a.width != b.width {
+			return a.width < b.width
+		}
+		if a.prefix != b.prefix {
+			return a.prefix.String() < b.prefix.String()
+		}
+		return a.route.key() < b.route.key()
+	})
+	return list
+}
+func serviceRules(routing assignedRouting, r *record) ([]policyRule, error) {
 	out := []policyRule{}
 	for _, v4 := range []bool{true, false} {
-		list := []ranked{}
-		for _, route := range routing.Routes {
-			prefix, err := netip.ParsePrefix(route.Destination)
-			if err != nil || prefix.Addr().Is4() != v4 {
-				continue
-			}
-			selected := priorities[route.InterfaceID].IPv6
-			if v4 {
-				selected = priorities[route.InterfaceID].IPv4
-			}
-			if selected == nil {
-				continue
-			}
-			width := uint32(1 << 31)
-			if route.Service != nil {
-				width = uint32(route.Service.PortEnd) - uint32(route.Service.PortStart)
-			}
-			list = append(list, ranked{prefix, route, *selected, width})
-		}
-		sort.SliceStable(list, func(i, j int) bool {
-			a, b := list[i], list[j]
-			if a.prefix.Bits() != b.prefix.Bits() {
-				return a.prefix.Bits() > b.prefix.Bits()
-			}
-			if (a.route.Service == nil) != (b.route.Service == nil) {
-				return a.route.Service != nil
-			}
-			if a.priority != b.priority {
-				return a.priority < b.priority
-			}
-			if a.width != b.width {
-				return a.width < b.width
-			}
-			if a.prefix != b.prefix {
-				return a.prefix.String() < b.prefix.String()
-			}
-			return a.route.InterfaceID < b.route.InterfaceID
-		})
+		list := orderedAssignedRoutes(routing, v4)
 		last := -1
-		for index, item := range list {
-			if item.route.Service != nil {
-				last = index
+		for i, item := range list {
+			if item.route.Service != nil || item.route.ChainID != "" {
+				last = i
 			}
 		}
 		family := "-6"
@@ -181,15 +216,19 @@ func serviceRules(routing assignedRouting, r *record) ([]policyRule, error) {
 			family = "-4"
 		}
 		for _, item := range list[:last+1] {
-			a := r.NICs[item.route.InterfaceID]
-			if a == nil {
-				return nil, errors.New("port-selected route references an unknown NIC")
+			table := contactTable
+			if item.route.ChainID == "" {
+				a := r.NICs[item.route.InterfaceID]
+				if a == nil {
+					return nil, errors.New("exit selector references an unknown NIC")
+				}
+				table = 30200 + a.Slot
 			}
 			dest := item.prefix.String()
 			if item.prefix.Bits() == 0 {
 				dest = "all"
 			}
-			rule := policyRule{family, serviceBandStart + len(out), "all", dest, 30200 + a.Slot, "", 0, 0}
+			rule := policyRule{family, serviceBandStart + len(out), "all", dest, table, "", 0, 0}
 			if service := item.route.Service; service != nil {
 				rule.ipproto, rule.portStart, rule.portEnd = service.Protocol, service.PortStart, service.PortEnd
 			}
@@ -333,13 +372,18 @@ func (s *server) configureAllocatedGuest(r *record, d object, observed []any, st
 		commands = append(commands, fmt.Sprintf("ip %s route replace unreachable default metric 42760 proto 186 table %d", family, managedGuardTable))
 		rules = append(rules, policyRule{family, managedBusinessPriority + 1, "all", "all", managedGuardTable, "", 0, 0}, policyRule{family, managedBusinessPriority, "all", "all", businessTable, "", 0, 0})
 	}
-	for index, raw := range array(contact, "addresses") {
-		prefix, err := netip.ParsePrefix(raw.(string))
-		if err != nil {
-			return nil, err
-		}
+	contactAddresses, err := originalContactPrefixes(array(contact, "addresses"), r.PrimaryIPv6)
+	if err != nil {
+		return nil, err
+	}
+	for index, prefix := range contactAddresses {
 		family := familyOf(prefix.Addr())
-		rules = append(rules, policyRule{family, 30010 + index, prefix.Addr().String(), "all", contactTable, "", 0, 0})
+		rules = append(rules,
+			policyRule{family, 30010 + index, prefix.Addr().String(), "all", contactTable, "", 0, 0},
+			// Wildcard UDP replies choose their source after policy lookup. Protect the
+			// contact destination too, so they cannot acquire a business-NIC source.
+			policyRule{family, 30050 + index, "all", prefix.Masked().String(), contactTable, "", 0, 0},
+		)
 		commands = append(commands, fmt.Sprintf("ip %s route replace %s dev %s src %s table %d", family, shellWord(prefix.Masked().String()), shellWord(devices[r.ContactID]), shellWord(prefix.Addr().String()), contactTable))
 	}
 	contactDefault := false
@@ -366,6 +410,19 @@ func (s *server) configureAllocatedGuest(r *record, d object, observed []any, st
 	}
 	if !contactDefault {
 		return nil, errors.New("original contact default route is unavailable")
+	}
+
+	if r.PrimaryIPv6 != "" {
+		address, e := netip.ParseAddr(r.PrimaryIPv6)
+		if e != nil || !address.Is6() {
+			return nil, errors.New("invalid primary IPv6 assignment")
+		}
+		if _, e = net.ParseMAC(r.PrimaryGatewayMAC); e != nil {
+			return nil, e
+		}
+		device := devices[r.ContactID]
+		commands = append(commands, "printf 0 > /proc/sys/net/ipv6/conf/"+device+"/disable_ipv6", fmt.Sprintf("ip -6 address replace %s/128 dev %s nodad", shellWord(r.PrimaryIPv6), shellWord(device)), fmt.Sprintf("ip -6 neigh replace fe80::68 lladdr %s nud permanent dev %s", shellWord(r.PrimaryGatewayMAC), shellWord(device)), fmt.Sprintf("ip -6 route replace default via fe80::68 dev %s onlink src %s table %d", shellWord(device), shellWord(r.PrimaryIPv6), contactTable))
+		rules = append(rules, policyRule{"-6", 30030, r.PrimaryIPv6, "all", contactTable, "", 0, 0}, policyRule{"-6", 30070, "all", r.PrimaryIPv6, contactTable, "", 0, 0})
 	}
 	for _, id := range sortedAttachments(r) {
 		a := r.NICs[id]
@@ -509,23 +566,22 @@ func (s *server) configureAllocatedGuest(r *record, d object, observed []any, st
 			}
 		}
 	}
-	if len(routing.DNS) > 0 {
-		dns := []string{}
-		for _, server := range routing.DNS {
-			ip, err := netip.ParseAddr(server)
-			if err != nil || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLoopback() {
-				return nil, errors.New("invalid container DNS server")
-			}
-			dns = append(dns, "nameserver "+ip.String())
-		}
-		commands = append(commands, "umask 077; mkdir -p /etc/brocade; if [ ! -e /etc/brocade/network-dns-original ]; then cp -pL /etc/resolv.conf /etc/brocade/network-dns-original; fi", "printf %s "+shellWord(strings.Join(dns, "\n")+"\n")+" > /etc/resolv.conf")
-	} else {
-		commands = append(commands, "if [ -f /etc/brocade/network-dns-original ]; then cat /etc/brocade/network-dns-original > /etc/resolv.conf; rm /etc/brocade/network-dns-original; fi")
+	dns, err := dnsCommands(routing.DNS)
+	if err != nil {
+		return nil, err
 	}
+	commands = append(commands, dns...)
 	commands = append(commands, primaryFallbackCommands(default4 != "", default6 != "")...)
 	commands = append(commands, serviceDeletes...)
-	if _, err = s.guest(r.Runtime, false, "/bin/sh", "-c", strings.Join(commands, "; ")); err != nil {
-		return nil, err
+	output, err := s.guest(r.Runtime, false, "/bin/sh", "-c", strings.Join(commands, "; "))
+	if err != nil {
+		// This fixed network command contains addresses/routes, never credentials.
+		// Retain a bounded native error so failed convergence is diagnosable.
+		detail := strings.TrimSpace(string(output))
+		if len(detail) > 512 {
+			detail = detail[len(detail)-512:]
+		}
+		return nil, fmt.Errorf("Guest network apply: %w: %s", err, detail)
 	}
 	after, err := s.guestNetwork(r, devices[r.ContactID])
 	if err != nil {
@@ -604,7 +660,7 @@ func (s *server) configureAllocatedGuest(r *record, d object, observed []any, st
 		a.PreviousIPv4 = ""
 		a.PreviousIPv6 = ""
 	}
-	result := object{"routing_revision": routing.Revision, "contact_route_preserved": true, "business_fallback_blocked": true, "default_ipv4_interface": nil, "default_ipv6_interface": nil}
+	result := object{"routing_revision": routing.Revision, "contact_route_preserved": true, "business_fallback_blocked": true, "chain_egress_configured": len(r.ChainEgress) > 0, "default_ipv4_interface": nil, "default_ipv6_interface": nil}
 	if default4 != "" {
 		result["default_ipv4_interface"] = default4
 	}
@@ -612,4 +668,24 @@ func (s *server) configureAllocatedGuest(r *record, d object, observed []any, st
 		result["default_ipv6_interface"] = default6
 	}
 	return result, nil
+}
+
+// Keep selector identities stable when the managed primary IPv6 address appears
+// between original addresses in a later kernel inventory.
+func originalContactPrefixes(addresses []any, primaryIPv6 string) ([]netip.Prefix, error) {
+	prefixes := []netip.Prefix{}
+	for _, raw := range addresses {
+		value, ok := raw.(string)
+		if !ok {
+			return nil, errors.New("invalid contact address")
+		}
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil {
+			return nil, err
+		}
+		if prefix.Addr().String() != primaryIPv6 {
+			prefixes = append(prefixes, prefix)
+		}
+	}
+	return prefixes, nil
 }

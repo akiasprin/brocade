@@ -203,6 +203,7 @@ function stubFetch() {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/model/validate') return Response.json({ valid: true });
       if (path === '/unlock-probes/refresh' && init?.method === 'POST')
         return Response.json({
           mode: deploymentSettings.unlock_detection_mode,

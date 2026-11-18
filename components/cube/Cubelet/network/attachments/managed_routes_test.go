@@ -5,6 +5,7 @@ package attachments
 import (
 	"encoding/json"
 	"fmt"
+	wire "github.com/tencentcloud/CubeSandbox/pkgs/proto/networkattachments"
 	"os"
 	"os/exec"
 	"strings"
@@ -197,5 +198,45 @@ ip -j -4 rule show
 	}
 	if adds, deletes := serviceRuleChanges(actual, nil, rules); len(adds) != 0 || len(deletes) != 0 {
 		t.Fatalf("applied band does not settle on readback: %v %v\n%s", adds, deletes, out)
+	}
+}
+
+func TestPrimaryIPv6InventoryCannotRenumberContactRules(t *testing.T) {
+	before := []any{"169.254.68.6/30", "fe80::2290:6fff:fefc:fcfc/64"}
+	after := []any{before[0], "fd68:bcad:0:1::c0a8:3/128", before[1]}
+	original, err := originalContactPrefixes(before, "fd68:bcad:0:1::c0a8:3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := originalContactPrefixes(after, "fd68:bcad:0:1::c0a8:3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(original) != fmt.Sprint(observed) {
+		t.Fatalf("managed primary address changed durable contact selectors: %v -> %v", original, observed)
+	}
+	for index, prefix := range observed {
+		expected := policyRule{familyOf(prefix.Addr()), 30010 + index, prefix.Addr().String(), "all", contactTable, "", 0, 0}
+		if !expected.matches(object{"priority": 30010 + index, "src": prefix.Addr().String(), "table": "30000"}) {
+			t.Fatal("original contact selector no longer recognized")
+		}
+	}
+}
+
+func TestChainAndNICDefaultShareOnePriorityContest(t *testing.T) {
+	r := &record{ChainEgress: []wire.ChainEgressBinding{{ChainID: "chain-one"}}, NICs: map[string]*attachment{"home": {ID: "home", IPv4: "10.120.0.2/32", Allocated: &wire.AllocatedNIC{IPv4: "10.120.0.2"}}}}
+	raw := object{"revision": 1, "routes": []any{object{"destination": "0.0.0.0/0", "interface_id": "home"}, object{"destination": "0.0.0.0/0", "chain_id": "chain-one"}}, "priorities": []any{object{"interface_id": "home", "ipv4": 20}, object{"chain_id": "chain-one", "ipv4": 10}}}
+	routing, routes, err := selectedRoutes(raw, r)
+	if err != nil || len(routes) != 0 {
+		t.Fatalf("losing NIC remained a default route: %v %v", routes, err)
+	}
+	rules, err := serviceRules(routing, r)
+	if err != nil || len(rules) != 1 || rules[0].table != contactTable {
+		t.Fatalf("chain default did not use primary selector: %v %v", rules, err)
+	}
+	array(raw, "priorities")[0].(map[string]any)["ipv4"] = 5
+	_, routes, err = selectedRoutes(raw, r)
+	if err != nil || len(routes) != 1 || routes[0].id != "home" {
+		t.Fatalf("higher-priority NIC was not selected: %v %v", routes, err)
 	}
 }

@@ -120,6 +120,81 @@ a.chain-rule-section-name:hover {
   background-size: 20px 20px;
   background-attachment: local;
 }
+.flow-mode:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+.flow-well-loading {
+  display: grid;
+  place-items: center;
+  height: var(--flow-loading-height);
+  overflow: hidden;
+}
+/* Illuminate the real dot grid; no placeholder machines or rules can be mistaken for data. */
+.flow-well-loading::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: radial-gradient(circle, var(--action) 1.2px, transparent 1.5px);
+  background-size: 20px 20px;
+  background-position: inherit;
+  -webkit-mask-image: linear-gradient(100deg, transparent 40%, #000 50%, transparent 60%);
+  mask-image: linear-gradient(100deg, transparent 40%, #000 50%, transparent 60%);
+  -webkit-mask-size: 250% 100%;
+  mask-size: 250% 100%;
+  animation: flow-loading-sweep 1.6s var(--motion-ease-standard) infinite;
+}
+.flow-loading-label {
+  position: relative;
+  z-index: 1;
+  color: var(--ink-3);
+  font: 11px var(--sans);
+}
+@keyframes flow-loading-sweep {
+  from {
+    -webkit-mask-position: 110% 0;
+    mask-position: 110% 0;
+  }
+  to {
+    -webkit-mask-position: -10% 0;
+    mask-position: -10% 0;
+  }
+}
+@keyframes flow-content-reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .node-rule-flow-ready :is(.flow-trace, .flow-column),
+  .node-chain-sheet .rule-draft-save {
+    animation: flow-content-reveal 240ms var(--motion-ease-out) backwards;
+  }
+  .node-rule-flow-ready .flow-column {
+    animation-delay: 60ms;
+  }
+  .node-rule-flow-ready .flow-column:nth-child(2) {
+    animation-delay: 110ms;
+  }
+  .node-rule-flow-ready .flow-column:nth-child(n + 3) {
+    animation-delay: 150ms;
+  }
+  .node-rule-flow-ready .flow-wires {
+    animation: flow-content-reveal 200ms var(--motion-ease-out) 180ms backwards;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .flow-well-loading::after {
+    animation: none;
+    -webkit-mask-image: none;
+    mask-image: none;
+    opacity: 0.2;
+  }
+}
 .flow-wires {
   position: absolute;
   inset: 0 auto auto 0;
@@ -541,6 +616,9 @@ a.chain-rule-section-name:hover {
   }
 }
 @container rule-flow (max-width: 820px) {
+  .flow-well-loading {
+    height: var(--flow-loading-phone-height);
+  }
   .flow-well {
     padding: 12px;
     overflow: hidden;

@@ -1,0 +1,18 @@
+{
+  "contract": "cubevs-attachments-v2",
+  "instance_id": "cvm-test",
+  "interfaces": [
+    {
+      "default_ipv4": false,
+      "default_ipv6": false,
+      "id": "nic-contact",
+      "purpose": "contact",
+      "source_id": "contact"
+    }
+  ],
+  "routing": {
+    "dns": [],
+    "priorities": [],
+    "routes": []
+  }
+}

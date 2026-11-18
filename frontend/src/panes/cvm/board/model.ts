@@ -2,6 +2,7 @@
 // 这里只做纯计算，状态与权限以服务端返回为准。
 import type {
   CvmContainerRoute,
+  CvmChainOption,
   CvmContainerRoutes,
   CvmEntry,
   CvmEntryAddressOffer,
@@ -17,6 +18,8 @@ import type {
   CvmRouteService,
 } from '../../../api';
 import { entryProtocolText } from '../../../api';
+import { networkProviderName } from '../network-names';
+import { retarget, targetKey } from '../route-target';
 
 export type Layer = 'L3' | 'L4';
 
@@ -89,10 +92,7 @@ export function exitTiles(catalog: CvmNicCatalog | undefined, hosts: CvmHost[]):
     .filter(publication => !publication.retired)
     .map(publication => {
       const spec = publication.spec;
-      const provider =
-        catalog?.providers.find(provider => provider.node_id === spec.provider_node)?.name ??
-        hosts.find(host => host.node_id === spec.provider_node)?.name ??
-        spec.provider_node;
+      const provider = networkProviderName(catalog, spec.provider_node, hosts);
       const kind: ExitTile['kind'] = !spec.destinations.some(isDefault)
         ? 'private'
         : spec.address_mode === 'shared_nat'
@@ -121,8 +121,8 @@ export function ruleLinks(instances: CvmInstance[]): RuleLink[] {
         instance: instance.desired.id,
         index,
         route,
-        nic: route.interface_id,
-        exit: nic?.allocated?.publication_id ?? null,
+        nic: route.interface_id ?? '',
+        exit: route.chain_id ? `chain:${route.chain_id}` : (nic?.allocated?.publication_id ?? null),
         layer: route.service ? 'L4' : 'L3',
       };
     }),
@@ -174,7 +174,21 @@ export function withoutRoute(routing: CvmContainerRoutes, index: number): CvmCon
 }
 export function repointRoute(routing: CvmContainerRoutes, index: number, nic: CvmInterface): CvmContainerRoutes {
   const route = routing.routes[index];
-  return withRoute(withoutRoute(routing, index), { ...route, interface_id: nic.id }, nic);
+  return withRoute(withoutRoute(routing, index), retarget(route, nic.id), nic);
+}
+
+export function withChainRoute(
+  routing: CvmContainerRoutes,
+  route: CvmContainerRoute,
+  chain: CvmChainOption,
+): CvmContainerRoutes {
+  const next = structuredClone(routing);
+  next.routes.push(retarget(route, `chain:${chain.id}`));
+  if (!next.priorities.some(p => targetKey(p) === `chain:${chain.id}`)) {
+    const priority = Math.min(65535, Math.max(0, ...next.priorities.flatMap(p => [p.ipv4 ?? 0, p.ipv6 ?? 0])) + 10);
+    next.priorities.push({ chain_id: chain.id, ipv4: priority, ipv6: chain.ipv6 ? priority : null });
+  }
+  return next;
 }
 
 const protocols = (protocol: CvmEntryProtocol): ('tcp' | 'udp')[] =>

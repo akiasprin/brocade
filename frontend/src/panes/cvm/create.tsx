@@ -6,10 +6,12 @@ import { useSession } from '../../session';
 import { ErrorBox } from '../../ui/bits';
 import { useUnsavedChanges } from '../../ui/navigation-guard';
 
-import { CapacityMeter, quotaRows } from './cards';
+import { CapacityMeter, quotaRows, reservationUsage, reservedInstances } from './cards';
 import { initialInterfaces, interfaceProblem } from './interfaces';
 import { Section } from './presentation';
 import { capacity, GIB, MIB, ownerKey, QUERY, requestId, stackHosts, supportsCreate } from './queries';
+
+const short = (bytes: number) => capacity(bytes).replace(' MiB', 'M').replace(' GiB', 'G');
 
 export function CreateForm({ workspace }: { workspace: CvmWorkspace }) {
   const qc = useQueryClient();
@@ -42,6 +44,9 @@ export function CreateForm({ workspace }: { workspace: CvmWorkspace }) {
   const clearUnsaved = useUnsavedChanges(changed || !!name || !!publicKey, '新建 容器', 'cvm:new');
   const image = host?.capabilities.images.find(item => item.id === imageId);
   const limits = host?.capabilities.resource_limits;
+  const reserved = reservedInstances(workspace);
+  const hostUsed = reservationUsage(reserved.filter(instance => instance.node_id === hostId));
+  const neighbours = reserved.filter(instance => instance.node_id === hostId && instance.desired.power !== 'deleted');
   const create = useMutation({
     mutationFn: createCvm,
     onSuccess: result => {
@@ -155,7 +160,7 @@ export function CreateForm({ workspace }: { workspace: CvmWorkspace }) {
     >
       <div className="cvm-config-layout">
         <fieldset disabled={create.isPending || !workspace.can_write} className="cvm-form-fieldset">
-          <Section title="基本信息">
+          <Section title="名称与使用者" step={1}>
             <div className="cvm-form-grid">
               <label>
                 实例名称
@@ -184,25 +189,28 @@ export function CreateForm({ workspace }: { workspace: CvmWorkspace }) {
               </label>
               <div className="cvm-field-note">
                 {quota?.enabled
-                  ? `额度上限：${quota.max_instances} 个实例 · ${capacity(quota.max_memory_bytes)} 内存`
+                  ? `额度上限：${quota.max_instances} 个实例 · ${quota.max_vcpus} vCPU · ${capacity(quota.max_memory_bytes)} 内存 · ${capacity(quota.max_disk_bytes)} 系统盘`
                   : '尚未分配 容器 创建额度'}
               </div>
             </div>
           </Section>
-          <Section title="宿主">
-            <div className="cvm-pick-grid">
+          <Section title="宿主" step={2} meta="容器运行在这台机器上，创建后不迁移" bare>
+            <div className="cvm-host-picks">
               {stackHosts(workspace).map(item => {
                 const blocked = !supportsCreate(item)
                   ? !item.fresh
-                    ? '报告过期'
+                    ? '能力已过期 · 暂不能创建'
                     : '未开放创建'
                   : !quota?.enabled || !quota.allowed_nodes.includes(item.node_id)
                     ? '当前用户未获授权'
                     : null;
+                const caps = item.capabilities;
+                const used = reservationUsage(reserved.filter(instance => instance.node_id === item.node_id));
+                const share = (value: number, total: number) => (total > 0 ? Math.min(100, (value / total) * 100) : 0);
                 return (
                   <button
                     type="button"
-                    className={`cvm-pick ${hostId === item.node_id ? 'on' : ''}`}
+                    className={`cvm-tile cvm-host-pick ${hostId === item.node_id ? 'on' : ''}`}
                     key={item.node_id}
                     aria-pressed={hostId === item.node_id}
                     disabled={!!blocked}
@@ -211,22 +219,54 @@ export function CreateForm({ workspace }: { workspace: CvmWorkspace }) {
                       changeHost(item.node_id);
                     }}
                   >
-                    <b>{item.name}</b>
-                    <small>
-                      {blocked ??
-                        `${item.capabilities.allocatable_vcpus} vCPU · ${capacity(item.capabilities.allocatable_memory_bytes)} · ${capacity(item.capabilities.allocatable_disk_bytes)}`}
+                    <span className="cvm-host-pick-head">
+                      <b>{item.name}</b>
+                    </span>
+                    <span className="cz-cap">
+                      <span>
+                        <small>vCPU</small>
+                        <b>{blocked && !item.fresh ? '—' : `分配 ${used.vcpus} / 基准 ${caps.allocatable_vcpus} 核`}</b>
+                        <i className="cz-meter" aria-hidden="true">
+                          <i style={{ width: `${share(used.vcpus, caps.allocatable_vcpus)}%` }} />
+                        </i>
+                      </span>
+                      <span>
+                        <small>内存</small>
+                        <b>
+                          {blocked && !item.fresh
+                            ? '—'
+                            : `分配 ${capacity(used.memory)} / 基准 ${capacity(caps.allocatable_memory_bytes)}`}
+                        </b>
+                        <i className="cz-meter" aria-hidden="true">
+                          <i style={{ width: `${share(used.memory, caps.allocatable_memory_bytes)}%` }} />
+                        </i>
+                      </span>
+                    </span>
+                    <small className={blocked ? 'cvm-host-pick-why' : undefined}>
+                      {blocked ?? `${used.instances} 个容器 · 最多 ${caps.max_interfaces} 张网卡`}
                     </small>
                   </button>
                 );
               })}
             </div>
           </Section>
-          <Section title="系统镜像">
+          <Section
+            title="系统"
+            step={3}
+            meta={
+              image
+                ? image.boot_mode === 'cube-oci'
+                  ? '独立 Guest 内核运行 OCI 系统环境，系统版本已固定'
+                  : `启动方式：${image.boot_mode} · 系统版本已固定`
+                : undefined
+            }
+            bare
+          >
             <div className="cvm-pick-grid">
               {host?.capabilities.images.map(item => (
                 <button
                   type="button"
-                  className={`cvm-pick image ${imageId === item.id ? 'on' : ''}`}
+                  className={`cvm-tile cvm-pick image ${imageId === item.id ? 'on' : ''}`}
                   key={item.id}
                   aria-label={`${item.name} ${item.version} · ${item.architecture}`}
                   aria-pressed={imageId === item.id}
@@ -245,22 +285,25 @@ export function CreateForm({ workspace }: { workspace: CvmWorkspace }) {
                 </button>
               ))}
             </div>
-            {image && (
-              <p className="note">
-                {image.boot_mode === 'cube-oci' ? '独立 Guest 内核运行 OCI 系统环境。' : `启动方式：${image.boot_mode}`}{' '}
-                系统版本已固定。
-              </p>
-            )}
           </Section>
-          <Section title="实例规格">
+          <Section
+            title="规格"
+            step={4}
+            meta={
+              host?.capabilities.stable_storage
+                ? '系统盘独立分配，支持原盘恢复'
+                : '系统盘独立分配；当前机器尚未启用原盘恢复'
+            }
+          >
             {limits ? (
-              <div className="cvm-form-grid">
+              <div className="cvm-spec-grid">
                 <ResourceField
                   label="CPU（核）"
                   value={resourceInputs.vcpus}
                   min={limits.min_vcpus}
                   max={limits.max_vcpus}
                   step={1}
+                  hint={host ? `宿主基准 ${host.capabilities.allocatable_vcpus} 核 · 允许超售` : undefined}
                   onChange={value => {
                     setChanged(true);
                     setResourceInputs(old => ({ ...old, vcpus: value }));
@@ -272,9 +315,24 @@ export function CreateForm({ workspace }: { workspace: CvmWorkspace }) {
                   min={limits.min_memory_bytes / MIB}
                   max={limits.max_memory_bytes / MIB}
                   step={limits.memory_step_bytes / MIB}
+                  hint={
+                    host ? `宿主基准 ${capacity(host.capabilities.allocatable_memory_bytes)} · 允许超售` : undefined
+                  }
                   onChange={value => {
                     setChanged(true);
                     setResourceInputs(old => ({ ...old, memoryMiB: value }));
+                  }}
+                />
+                <ResourceField
+                  label="系统盘（GiB）"
+                  value={resourceInputs.diskGiB}
+                  min={limits.min_root_disk_bytes / GIB}
+                  max={limits.max_root_disk_bytes / GIB}
+                  step={limits.root_disk_step_bytes / GIB}
+                  hint={host ? `宿主基准 ${capacity(host.capabilities.allocatable_disk_bytes)} · 允许超售` : undefined}
+                  onChange={value => {
+                    setChanged(true);
+                    setResourceInputs(old => ({ ...old, diskGiB: value }));
                   }}
                 />
               </div>
@@ -282,32 +340,19 @@ export function CreateForm({ workspace }: { workspace: CvmWorkspace }) {
               <p className="note">机器尚未上报独立配置能力，请更新执行适配器。</p>
             )}
           </Section>
-          <Section title="系统盘">
-            {limits && (
-              <ResourceField
-                label="容量（GiB）"
-                value={resourceInputs.diskGiB}
-                min={limits.min_root_disk_bytes / GIB}
-                max={limits.max_root_disk_bytes / GIB}
-                step={limits.root_disk_step_bytes / GIB}
-                onChange={value => {
-                  setChanged(true);
-                  setResourceInputs(old => ({ ...old, diskGiB: value }));
-                }}
-              />
-            )}
+          <Section title="网络与访问" step={5}>
+            <div className="cvm-create-nic">
+              <span className="cvm-flow-dev">主网卡</span>
+              <span>
+                <b>管理主网卡</b>
+                <small>创建时生成 · 宿主 NAT 出网 · 优先级最低</small>
+              </span>
+              <span className="cz-kind">自动</span>
+            </div>
             <p className="note">
-              系统盘独立分配。
-              {host?.capabilities.stable_storage ? '支持原盘恢复。' : '当前机器尚未启用原盘恢复。'}
+              当前宿主开放 {host?.capabilities.max_interfaces ?? 0}{' '}
+              张网卡，含管理主网卡。创建后在组合台接入访问入口和出口网络，业务网卡与路由在容器详情的「网络」中管理。
             </p>
-          </Section>
-          <Section title="网络">
-            <p>
-              创建时生成主网卡，通过宿主机 NAT 访问公网，优先级最低。创建后可挂载已授权的业务网卡，并单独配置优先路由。
-            </p>
-            <p className="note">当前宿主开放 {host?.capabilities.max_interfaces ?? 0} 张网卡，含管理主网卡。</p>
-          </Section>
-          <Section title="访问与确认">
             <label className="cvm-field">
               SSH 公钥
               <textarea
@@ -327,37 +372,62 @@ export function CreateForm({ workspace }: { workspace: CvmWorkspace }) {
             )}
           </Section>
         </fieldset>
-        <aside className="cvm-config-summary" aria-label="创建汇总">
-          <h2>{name || '新实例'}</h2>
-          <p>
-            {host?.name ?? '未选择宿主'} · {image ? `${image.name} ${image.version}` : '未选择系统'}
-          </p>
-          <div className="cvm-summary-figures">
-            <span>
-              <b>{resourceInputs.vcpus || '—'}</b>
-              <small>vCPU</small>
-            </span>
-            <span>
-              <b>{resourceInputs.memoryMiB || '—'}</b>
-              <small>MiB 内存</small>
-            </span>
-            <span>
-              <b>{resourceInputs.diskGiB || '—'}</b>
-              <small>GiB 系统盘</small>
-            </span>
-          </div>
-          <h3>创建后的额度占用</h3>
-          {rows.map(row => (
-            <div className={`cvm-capacity-row ${row.used + row.add > row.total ? 'error' : ''}`} key={row.label}>
-              <span>{row.label}</span>
-              <CapacityMeter used={row.used} total={row.total} add={row.add} />
-              <b>
-                {Number.isFinite(row.add) ? row.format(row.used + row.add) : '—'} / {row.format(row.total)}
-              </b>
+        <aside className="cvm-tile cvm-config-summary" aria-label="创建汇总">
+          <header className="cvm-lane-head">
+            <h2>预览</h2>
+            <small>新容器放进所选宿主</small>
+          </header>
+          <div className="cvm-summary-host">
+            <div className="cvm-summary-host-head">
+              <b>{host?.name ?? '未选择宿主'}</b>
+              {host && (
+                <small>
+                  {hostUsed.vcpus + (Number(resourceInputs.vcpus) || 0)} / {host.capabilities.allocatable_vcpus} 核
+                </small>
+              )}
             </div>
-          ))}
-          {!usageReady && <p className="note">额度占用尚未就绪，请刷新后重试。</p>}
-          {!quota?.enabled && <p className="note">尚未分配创建额度</p>}
+            <div className="cvm-summary-pills">
+              {neighbours.map(instance => (
+                <span className="cvm-host-pill" key={instance.desired.id}>
+                  <span className={`cz-dot ${instance.status} ${instance.desired.power}`} />
+                  <b>{instance.desired.spec.name}</b>
+                  <small>
+                    {instance.desired.spec.resources.vcpus}C·{short(instance.desired.spec.resources.memory_bytes)}
+                  </small>
+                </span>
+              ))}
+              <span className="cvm-host-pill new">
+                <span className="cz-dot pending" />
+                <b>{name.trim() || '新实例'}</b>
+                <small>
+                  {resourceInputs.vcpus || '—'}C·
+                  {resourceInputs.memoryMiB ? short(Number(resourceInputs.memoryMiB) * MIB) : '—'}
+                </small>
+                <em>新</em>
+              </span>
+            </div>
+            <p className="note">
+              {image ? `${image.name} ${image.version}` : '未选择系统'} · {resourceInputs.diskGiB || '—'} GiB 系统盘 ·
+              主网卡宿主 NAT
+            </p>
+          </div>
+          <div className="cvm-summary-quota">
+            <header className="cvm-lane-head">
+              <h2>创建后的额度</h2>
+              <small>实色已用 · 斜纹本次</small>
+            </header>
+            {rows.map(row => (
+              <div className={`cvm-capacity-row ${row.used + row.add > row.total ? 'error' : ''}`} key={row.label}>
+                <span>{row.label}</span>
+                <CapacityMeter used={row.used} total={row.total} add={row.add} />
+                <b>
+                  {Number.isFinite(row.add) ? row.format(row.used + row.add) : '—'} / {row.format(row.total)}
+                </b>
+              </div>
+            ))}
+            {!usageReady && <p className="note">额度占用尚未就绪，请刷新后重试。</p>}
+            {!quota?.enabled && <p className="note">尚未分配创建额度</p>}
+          </div>
           {overQuota && (
             <p className="error" role="alert">
               创建后的资源占用超出用户额度。
@@ -391,6 +461,7 @@ function ResourceField({
   min,
   max,
   step,
+  hint,
   onChange,
 }: {
   label: string;
@@ -398,6 +469,7 @@ function ResourceField({
   min: number;
   max: number;
   step: number;
+  hint?: string;
   onChange: (value: string) => void;
 }) {
   const id = useId();
@@ -442,6 +514,7 @@ function ResourceField({
           ＋
         </button>
       </div>
+      {hint && <small className="cvm-resource-hint">{hint}</small>}
     </div>
   );
 }

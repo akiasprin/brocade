@@ -1,0 +1,6 @@
+{
+  "allow_internet_access": true,
+  "allow_out": [],
+  "deny_out": [],
+  "rules": []
+}

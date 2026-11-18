@@ -698,6 +698,8 @@ fn run() -> Result<(), String> {
         Some("health") => return health(&health_state_dir(&args)),
         #[cfg(feature = "cvm")]
         Some("cvm-check") => return cvm::check(&args[1..]),
+        #[cfg(feature = "cvm")]
+        Some("cvm-host-terminal") => return cvm::host::terminal::run(&args[1..]),
         Some("repair") => return reconcile_local(&health_state_dir(&args), Drift::Always),
         // Internal stdin consumer used by the Xray/Phantun launch pipelines. It must not require
         // a control-plane URL or token: doing so would put a secret on every child command line.
@@ -3546,22 +3548,28 @@ fn converge_linux_wireguard(state_dir: &Path, desired: &DesiredArtifact) -> Resu
 
 fn apply_wireguard(path: &Path) -> Result<(), String> {
     let conf = shell_quote(&path.display().to_string());
-    let stripped_path = Path::new("/tmp/brocade-agent-wg0.stripped");
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read WireGuard configuration: {error}"))?;
+    let stripped = wg::kernel_config(&content)?;
     let existed = command_success("ip", &["link", "show", "wg0"]);
-    let configure = if existed {
-        "wg syncconf wg0 /tmp/brocade-agent-wg0.stripped"
+    if !existed {
+        run_command("ip", &["link", "add", "wg0", "type", "wireguard"])?;
+    }
+    let new_phantun_clients = if existed {
+        wg::new_phantun_clients(&content)?
     } else {
-        "ip link add wg0 type wireguard\n\
-         wg setconf wg0 /tmp/brocade-agent-wg0.stripped"
+        Vec::new()
     };
-    run_shell(&format!(
-        "set -eu\n\
-         CONF={conf}\n\
-         wg-quick strip \"$CONF\" > /tmp/brocade-agent-wg0.stripped\n\
-         {configure}"
-    ))?;
+    wg::apply_kernel_config(&stripped, existed)?;
     if existed {
-        let reset = reset_stale_phantun_passive_peers(path, stripped_path)?;
+        wg::rekey_phantun_clients(&new_phantun_clients, &stripped)?;
+        if !new_phantun_clients.is_empty() {
+            println!(
+                "wireguard: 已更新 {} 个新 Phantun 客户端的握手会话",
+                new_phantun_clients.len()
+            );
+        }
+        let reset = reset_stale_phantun_passive_peers(path, &stripped)?;
         if reset > 0 {
             println!("wireguard: 已清理 {reset} 个 phantun 被动 peer 的旧运行态");
         }

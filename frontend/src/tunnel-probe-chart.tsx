@@ -1,9 +1,8 @@
-import { useEffect, useRef, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import * as echarts from 'echarts/core';
-import { CustomChart, LineChart } from 'echarts/charts';
+import { CustomChart, LineChart, ScatterChart } from 'echarts/charts';
 import { GridComponent, MarkAreaComponent, MarkLineComponent, TooltipComponent } from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
-import type { TunnelProbeView } from './api';
 import { palette } from './forge/palette';
 import { theme } from './forge/theme';
 import { echartsEntranceAnimation, useEchartsViewportEntry } from './ui/echarts-motion';
@@ -18,20 +17,25 @@ import {
   observeTimeAxes,
   observeValueAxis,
 } from './ui/observe-chart';
-import { observeSeriesData } from './ui/observe-series';
+import {
+  tunnelProbeBuckets,
+  tunnelProbeMissingPeriods,
+  tunnelProbeFailurePeriods,
+  tunnelProbeLineData,
+  type TunnelProbeChartPoint,
+} from './tunnel-probe-series';
 
 // The tunnel detail loads this module on demand, so the tunnel list never downloads ECharts.
 echarts.use([
   LineChart,
   CustomChart,
+  ScatterChart,
   GridComponent,
   TooltipComponent,
   MarkLineComponent,
   MarkAreaComponent,
   CanvasRenderer,
 ]);
-
-export type TunnelProbeChartPoint = TunnelProbeView['points'][number];
 
 const MONO = 'ui-monospace, SFMono-Regular, Menlo, monospace';
 const FAILURE_TEXT: Record<TunnelProbeChartPoint['result'], string> = {
@@ -43,7 +47,6 @@ const FAILURE_TEXT: Record<TunnelProbeChartPoint['result'], string> = {
   canceled: '已取消',
   interrupted: '执行中断',
 };
-
 const two = (value: number) => String(value).padStart(2, '0');
 const clock = (ms: number) => {
   const date = new Date(ms);
@@ -53,62 +56,6 @@ const clock = (ms: number) => {
     : `${two(date.getMonth() + 1)}-${two(date.getDate())} ${time}`;
 };
 
-/** Longest spacing between the runs of two neighbouring buckets when no scheduled run is missing:
- * one bucket plus one probe interval. Anything longer is a period without runs. */
-export const tunnelProbeGapSecs = (bucketSecs: number, intervalSecs: number | null) => {
-  const cadence = intervalSecs ?? bucketSecs;
-  return Math.max(bucketSecs, cadence) + Math.min(bucketSecs, cadence);
-};
-
-/** Failed runs as [start, end] milliseconds, half a bucket on either side, overlaps merged.
- * The same reading as the Ping chart's loss lane: the curve breaks where a run failed, and the lane
- * under the axis tells a failure apart from a period without any run. */
-export function tunnelProbeFailurePeriods(
-  points: readonly TunnelProbeChartPoint[],
-  bucketSecs: number,
-): Array<[number, number]> {
-  const half = (bucketSecs * 1000) / 2;
-  const merged: Array<[number, number]> = [];
-  for (const point of points) {
-    if (point.result === 'ok') continue;
-    const at = point.finished_at_unix_secs * 1000;
-    const last = merged.at(-1);
-    if (last && at - half <= last[1]) last[1] = Math.max(last[1], at + half);
-    else merged.push([at - half, at + half]);
-  }
-  return merged;
-}
-
-function failureLane(periods: Array<[number, number]>, color: string): Record<string, unknown> {
-  type Coord = { x: number; y: number; width: number; height: number };
-  return {
-    type: 'custom',
-    silent: true,
-    animation: false,
-    clip: false,
-    z: 6,
-    tooltip: { show: false },
-    data: periods,
-    encode: { x: [0, 1] },
-    renderItem: (
-      params: { coordSys: unknown },
-      api: { value: (dimension: number) => number; coord: (value: number[]) => number[] },
-    ) => {
-      const area = params.coordSys as Coord;
-      const left = Math.max(area.x, api.coord([api.value(0), 0])[0]);
-      const right = Math.min(area.x + area.width, api.coord([api.value(1), 0])[0]);
-      // One failed run in a week-long window is still a visible mark.
-      const width = Math.max(2, right - left);
-      const x = right - left < 2 ? (left + right) / 2 - 1 : left;
-      return {
-        type: 'rect',
-        shape: { x, y: area.y + area.height + 2, width, height: 3, r: 1 },
-        style: { fill: color, opacity: 0.85 },
-      };
-    },
-  };
-}
-
 /** First-byte time of each sampled Serving run across the selected window. */
 export function TunnelProbeChart({
   points,
@@ -117,6 +64,7 @@ export function TunnelProbeChart({
   bucketSecs,
   intervalSecs,
   p50Ms,
+  p95Ms,
   slowMs,
 }: {
   points: readonly TunnelProbeChartPoint[];
@@ -126,8 +74,14 @@ export function TunnelProbeChart({
   /** The scheduled cadence; null when only manual runs exist. */
   intervalSecs: number | null;
   p50Ms: number | null;
+  p95Ms: number | null;
   slowMs: number;
 }) {
+  const [fullScale, setFullScale] = useState(false);
+  const capAxis = observeValueAxis(Math.max(slowMs * 1.2, (p95Ms ?? 0) * 1.3));
+  const overflow = points.filter(
+    point => point.result === 'ok' && point.ttfb_ms !== null && point.ttfb_ms > capAxis.max,
+  );
   const elRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
   const themeName = useSyncExternalStore(theme.subscribe, theme.snapshot);
@@ -162,6 +116,8 @@ export function TunnelProbeChart({
       bucketSecs,
       intervalSecs,
       p50Ms,
+      p95Ms,
+      fullScale,
       slowMs,
       themeName,
       paletteKey,
@@ -181,15 +137,13 @@ export function TunnelProbeChart({
 
     const endMs = endUnixSecs * 1000;
     const startMs = endMs - windowSecs * 1000;
-    const times = points.map(point => point.finished_at_unix_secs);
-    const gapSecs = tunnelProbeGapSecs(bucketSecs, intervalSecs);
-    const values = points.map(point => (point.result === 'ok' ? point.ttfb_ms : null));
-    const peak = Math.max(slowMs * 1.05, ...values.map(value => value ?? 0));
-    const valueAxis = observeValueAxis(peak);
+    const buckets = tunnelProbeBuckets(points, bucketSecs, startMs, endMs);
+    const missing = tunnelProbeMissingPeriods(buckets, intervalSecs);
+    const valueAxis = fullScale
+      ? observeValueAxis(Math.max(slowMs * 1.2, ...points.map(point => point.ttfb_ms ?? 0)))
+      : observeValueAxis(Math.max(slowMs * 1.2, (p95Ms ?? 0) * 1.3));
     const axes = observeTimeAxes(startMs, endMs, ink3, lineSoft);
-    // Without any run before it, the left part of the window is unobserved, not zero.
     const firstMs = points.length > 0 ? points[0].finished_at_unix_secs * 1000 : endMs;
-    const unobserved = firstMs - startMs > gapSecs * 1000;
     const markLines: Array<Record<string, unknown> | Array<Record<string, unknown>>> = [
       {
         yAxis: slowMs,
@@ -228,32 +182,94 @@ export function TunnelProbeChart({
         areaStyle: observeAreaStyle(color, themeName, { count: 1, paper: cv('--card') }),
         itemStyle: { color, borderColor: glass, borderWidth: 1.5 },
         emphasis: { disabled: true },
-        // observeSeriesData breaks the line past 1.5 steps; one step is two thirds of the gap.
-        data: observeSeriesData(times, values, { sampleStepSecs: gapSecs / 1.5 }),
+        data: tunnelProbeLineData(buckets, missing, valueAxis.max),
         markLine: { silent: true, symbol: 'none', animation: false, data: markLines },
-        markArea: unobserved
-          ? {
-              silent: true,
-              animation: false,
-              itemStyle: { color: ink, opacity: 0.04 },
-              label: {
-                position: 'inside',
-                color: ink4,
-                fontSize: 11,
-                formatter: points.length > 0 ? `${clock(firstMs)} 之前没有拨测` : '这段时间没有 Serving 拨测',
+        markArea: {
+          silent: true,
+          animation: false,
+          data: [
+            ...missing.map(([start, end]) => [
+              {
+                xAxis: start,
+                itemStyle: { color: ink, opacity: 0.045 },
+                label: {
+                  show: end - start > (windowSecs * 1000) / 35,
+                  position: 'insideTop',
+                  color: ink4,
+                  fontSize: 9.5,
+                  formatter: points.length ? '无已完成拨测' : '暂无 Serving 拨测',
+                },
               },
-              data: [[{ xAxis: startMs }, { xAxis: firstMs }]],
-            }
-          : undefined,
+              { xAxis: end },
+            ]),
+            ...tunnelProbeFailurePeriods(buckets).map(([start, end]) => [
+              { xAxis: start, itemStyle: { color: err, opacity: 0.1 } },
+              { xAxis: end },
+            ]),
+          ],
+        },
+      },
+      {
+        name: '超出纵轴',
+        type: 'scatter',
+        data: points
+          .filter(point => point.result === 'ok' && point.ttfb_ms !== null && point.ttfb_ms > valueAxis.max)
+          .map(point => [point.finished_at_unix_secs * 1000, valueAxis.max]),
+        symbol: 'triangle',
+        symbolSize: 7,
+        symbolOffset: [0, 4],
+        clip: false,
+        z: 6,
+        itemStyle: { color: gold },
+      },
+      {
+        name: '时段状态',
+        type: 'custom',
+        encode: { x: [1, 2] },
+        xAxisIndex: 2,
+        yAxisIndex: 1,
+        animation: false,
+        data: buckets.map(bucket => [(bucket.start + bucket.end) / 2, bucket.start, bucket.end]),
+        renderItem: (
+          params: { dataIndex: number; coordSys: unknown },
+          api: { value: (dimension: number) => number; coord: (value: number[]) => number[] },
+        ) => {
+          const area = params.coordSys as { x: number; y: number; width: number; height: number };
+          const left = Math.max(area.x, api.coord([api.value(1), 0])[0]);
+          const right = Math.min(area.x + area.width, api.coord([api.value(2), 0])[0]);
+          const point = buckets[params.dataIndex].point;
+          const fill = !point
+            ? ink
+            : point.result !== 'ok'
+              ? err
+              : point.ttfb_ms !== null && point.ttfb_ms > slowMs
+                ? gold
+                : cv('--ok');
+          return {
+            type: 'rect',
+            shape: {
+              x: left,
+              y: area.y,
+              width: Math.max(0, right - left - (right - left > 3 ? 1 : 0)),
+              height: area.height,
+            },
+            style: {
+              fill,
+              opacity: !point ? 0.07 : point.result === 'ok' && (point.ttfb_ms ?? 0) <= slowMs ? 0.5 : 0.9,
+            },
+          };
+        },
       },
     ];
-    const failures = tunnelProbeFailurePeriods(points, bucketSecs);
-    if (failures.length > 0) series.push(failureLane(failures, err));
 
     chart.setOption(
       {
         ...echartsEntranceAnimation(!hasRenderedData.current),
-        grid: { left: 10, right: 14, top: 14, bottom: 10, containLabel: true },
+        axisPointer: { link: [{ xAxisIndex: [0, 2] }] },
+        grid: [
+          { left: 42, right: 14, top: 14, bottom: 54 },
+          { left: 42, right: 14, bottom: 35, height: 10 },
+        ],
         textStyle: { fontFamily: MONO },
         tooltip: {
           trigger: 'axis',
@@ -268,34 +284,42 @@ export function TunnelProbeChart({
           axisPointer: { type: 'line', lineStyle: { color: ink4, width: 1, type: 'dashed' }, z: 0 },
           formatter: (params: unknown) => {
             const atMs = Number((params as { axisValue: number }[])[0]?.axisValue ?? 0);
-            // Gap separators sit between runs; the reading belongs to the nearest real run.
-            const nearest = points.reduce<TunnelProbeChartPoint | null>(
-              (best, point) =>
-                !best ||
-                Math.abs(point.finished_at_unix_secs * 1000 - atMs) < Math.abs(best.finished_at_unix_secs * 1000 - atMs)
-                  ? point
-                  : best,
-              null,
-            );
-            if (!nearest) return '';
-            const reading =
-              nearest.result === 'ok'
-                ? `<b style="color:${ink};font-weight:600">${nearest.ttfb_ms} ms</b>`
-                : `<b style="color:${err};font-weight:600">${FAILURE_TEXT[nearest.result]}</b>`;
-            return `<div style="color:${ink4};font-size:9px;margin-bottom:3px;letter-spacing:.04em">${clock(nearest.finished_at_unix_secs * 1000)} · 首字节</div>${reading}`;
+            const bucket = buckets.find(bucket => atMs >= bucket.start && atMs < bucket.end);
+            if (!bucket) return '';
+            const point = bucket.point;
+            const heading = `${clock(bucket.start)}–${clock(bucket.end)}`;
+            const reading = !point
+              ? '无已完成的 Serving 拨测'
+              : point.result !== 'ok'
+                ? `本时段有失败 · ${FAILURE_TEXT[point.result]}`
+                : point.ttfb_ms === null
+                  ? '成功 · 首字节未知'
+                  : `抽样首字节 ${point.ttfb_ms} ms${point.ttfb_ms > slowMs ? ' · 变慢' : ''}`;
+            const detail = point
+              ? `<br><span>${clock(point.finished_at_unix_secs * 1000)} · ${point.result === 'ok' ? '该时段最近一次成功' : '该时段最近一次失败'}</span>`
+              : '';
+            return `<div style="color:${ink4};font-size:9px;margin-bottom:3px">${heading}</div><b style="color:${point && point.result !== 'ok' ? err : ink};font-weight:600">${reading}</b>${detail}`;
           },
         },
-        xAxis: axes,
-        yAxis: {
-          type: 'value',
-          min: 0,
-          max: valueAxis.max,
-          interval: valueAxis.interval,
-          axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: observeMsUnit(valueAxis.interval).text },
-          axisLine: observeAxisLine(ink3),
-          axisTick: observeAxisTick(ink3),
-          splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
-        },
+        xAxis: [
+          { ...axes[0], gridIndex: 0, axisLabel: { show: false } },
+          { ...axes[1], gridIndex: 0 },
+          { ...axes[0], gridIndex: 1, splitLine: { show: false }, axisLine: { show: false } },
+          { ...axes[1], gridIndex: 1 },
+        ],
+        yAxis: [
+          {
+            type: 'value',
+            min: 0,
+            max: valueAxis.max,
+            interval: valueAxis.interval,
+            axisLabel: { color: ink3, fontSize: 9.5, margin: 8, formatter: observeMsUnit(valueAxis.interval).text },
+            axisLine: observeAxisLine(ink3),
+            axisTick: observeAxisTick(ink3),
+            splitLine: { show: true, lineStyle: { color: lineSoft, width: 1 } },
+          },
+          { type: 'value', gridIndex: 1, min: 0, max: 1, show: false },
+        ],
         series,
       },
       true,
@@ -309,11 +333,46 @@ export function TunnelProbeChart({
     bucketSecs,
     intervalSecs,
     p50Ms,
+    p95Ms,
+    fullScale,
     slowMs,
     themeName,
     paletteKey,
     enteredViewport,
   ]);
 
-  return <div ref={elRef} className="tnd-chart" role="img" aria-label="首字节走势" />;
+  return (
+    <>
+      <div ref={elRef} className="tnd-chart" role="img" aria-label="首字节走势与拨测时段状态" />
+      <div className="tnd-chart-legend" aria-label="图表说明">
+        <span>
+          <i className="ok" />
+          成功样本
+        </span>
+        <span>
+          <i className="warn" />
+          变慢样本
+        </span>
+        <span>
+          <i className="err" />
+          时段有失败
+        </span>
+        <span>
+          <i className="idle" />
+          无已完成拨测
+        </span>
+        {overflow.length > 0 && (
+          <button
+            type="button"
+            className="tnd-scale"
+            aria-pressed={fullScale}
+            onClick={() => setFullScale(value => !value)}
+          >
+            {fullScale ? '收起纵轴' : `▲ ${overflow.length} 个尖峰 · 完整纵轴`}
+          </button>
+        )}
+        <span className="tnd-chart-sampling">每格 {bucketSecs / 60} 分钟；有失败时标红，其余显示最近一次成功样本</span>
+      </div>
+    </>
+  );
 }

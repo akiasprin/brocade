@@ -1,4 +1,6 @@
 use super::*;
+use crate::cvm::releases::Scope;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CvmNetworkProvider {
@@ -25,6 +27,9 @@ pub struct CvmNicCatalog {
     pub publications: Vec<NicPublication>,
     pub attachments: Vec<CvmNicAttachment>,
     pub providers: Vec<CvmNetworkProvider>,
+    /// Display names for visible publications and held allocations, without provider capabilities.
+    #[serde(default)]
+    pub provider_names: BTreeMap<String, String>,
     pub can_manage: bool,
 }
 impl PgStore {
@@ -71,7 +76,7 @@ impl PgStore {
                     .routing
                     .routes
                     .iter()
-                    .filter(|route| route.interface_id == id)
+                    .filter(|route| route.target.interface_id() == Some(id.as_str()))
                     .count()
                     + usize::from(
                         desired
@@ -79,7 +84,7 @@ impl PgStore {
                             .routing
                             .priorities
                             .iter()
-                            .any(|p| p.interface_id == id),
+                            .any(|p| p.target.interface_id() == Some(id.as_str())),
                     );
                 attachments.push(CvmNicAttachment {
                     allocation_id: allocation,
@@ -95,10 +100,34 @@ impl PgStore {
                 });
             }
         }
+        let mut visible_providers: BTreeSet<String> = publications
+            .iter()
+            .map(|p| p.spec.provider_node.clone())
+            .collect();
+        let (tenant, pattern, user) = read_scope(actor)?;
+        // Withdrawn publications disappear before held NICs are cleaned up. Their provider
+        // stays visible through the owned allocation, without revealing other users' networks.
+        let allocated_providers = sqlx::query_scalar::<_, String>(&format!(
+            "SELECT DISTINCT a.provider_node FROM cvm_nic_allocations a JOIN (SELECT id FROM cvm_instances WHERE {READ_SCOPE}) visible ON visible.id=a.instance_id WHERE NOT a.released ORDER BY a.provider_node LIMIT 16385"
+        )).bind(&tenant).bind(&pattern).bind(&user).fetch_all(&self.pool).await?;
+        if allocated_providers.len() > 16384 {
+            return Err(invalid("network provider name view exceeds capacity"));
+        }
+        visible_providers.extend(allocated_providers);
+        let visible_providers: Vec<_> = visible_providers.into_iter().collect();
+        let mut provider_names = BTreeMap::new();
+        for row in sqlx::query("SELECT id,name FROM nodes WHERE id=ANY($1::text[]) ORDER BY id")
+            .bind(&visible_providers)
+            .fetch_all(&self.pool)
+            .await?
+        {
+            provider_names.insert(row.try_get("id")?, row.try_get("name")?);
+        }
         Ok(CvmNicCatalog {
             attachments,
             publications,
             providers,
+            provider_names,
             can_manage: actor.is_system_admin(),
         })
     }
@@ -112,7 +141,16 @@ impl PgStore {
         request.spec.validate().map_err(invalid)?;
         let digest = request_digest(&(id, &request))?;
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before = crate::cvm::releases::begin(
+            &mut tx,
+            Scope {
+                nodes: vec![&request.spec.provider_node],
+                nic_publications: id.into_iter().collect(),
+                ..Scope::default()
+            },
+        )
+        .await?;
         if let Some(value) = replay(&mut tx, actor, &request.request_id, &digest).await? {
             return Ok(serde_json::from_value(value)?);
         }
@@ -138,15 +176,6 @@ impl PgStore {
                 return Err(StoreError::Unsupported(
                     "提供机器不支持网络的承载类型".into(),
                 ));
-            }
-            if let Some(shared) = request.spec.shared_ipv4 {
-                let whole:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_entry_publications p CROSS JOIN LATERAL jsonb_array_elements(p.spec->'addresses') a WHERE p.provider_node=$1 AND NOT p.deleted AND a->>'kind'='dedicated' AND a->>'address'=$2)")
-                    .bind(&request.spec.provider_node).bind(shared.to_string()).fetch_one(&mut *tx).await?;
-                if whole {
-                    return Err(StoreError::Conflict(
-                        "共享出网地址已作为整 IP 入口发布".into(),
-                    ));
-                }
             }
         }
         let count: i64 =
@@ -194,6 +223,7 @@ impl PgStore {
         // Authorization is live even when a device deliberately stays on an older service revision.
         apply_grants(&mut tx, &p).await?;
         remember(&mut tx, actor, &request.request_id, &digest, Some(&id), &p).await?;
+        crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
         tx.commit().await?;
         Ok(p)
     }
@@ -206,7 +236,15 @@ impl PgStore {
         admin(actor)?;
         let digest = request_digest(&(id, &request))?;
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before = crate::cvm::releases::begin(
+            &mut tx,
+            Scope {
+                nic_publications: vec![id],
+                ..Scope::default()
+            },
+        )
+        .await?;
         if let Some(value) = replay(&mut tx, actor, &request.request_id, &digest).await? {
             return Ok(serde_json::from_value(value)?);
         }
@@ -224,6 +262,7 @@ impl PgStore {
         .execute(&mut *tx)
         .await?;
         remember(&mut tx, actor, &request.request_id, &digest, Some(id), &p).await?;
+        crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
         tx.commit().await?;
         Ok(p)
     }
@@ -236,7 +275,15 @@ impl PgStore {
         admin(actor)?;
         let digest = request_digest(&("delete", id, &request))?;
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before = crate::cvm::releases::begin(
+            &mut tx,
+            Scope {
+                nic_publications: vec![id],
+                ..Scope::default()
+            },
+        )
+        .await?;
         if let Some(value) = replay(&mut tx, actor, &request.request_id, &digest).await? {
             return Ok(serde_json::from_value(value)?);
         }
@@ -254,6 +301,7 @@ impl PgStore {
         p.admitting = false;
         sqlx::query("UPDATE cvm_nic_publications SET deleted=true,admitting=false,actor_id=$2,updated_at=now() WHERE id=$1").bind(id).bind(actor.operator_id()).execute(&mut *tx).await?;
         remember(&mut tx, actor, &request.request_id, &digest, Some(id), &p).await?;
+        crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
         tx.commit().await?;
         Ok(p)
     }
@@ -313,20 +361,5 @@ pub(crate) async fn system_network_version(
     kind: &str,
 ) -> Result<()> {
     bindings::sync_routes(tx, desired).await?;
-    desired.generation += 1;
-    desired.operation_id = new_id("op")?;
-    desired.spec_sha256 = spec_digest(&desired.spec)?;
-    let request = new_id("network-system")?;
-    sqlx::query(
-        "INSERT INTO cvm_spec_versions(instance_id,generation,spec,sha256) VALUES($1,$2,$3,$4)",
-    )
-    .bind(&desired.id)
-    .bind(desired.generation as i64)
-    .bind(serde_json::to_value(&desired.spec)?)
-    .bind(&desired.spec_sha256)
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query("INSERT INTO cvm_operations(id,instance_id,generation,kind,actor_id,request_id,request_sha256) VALUES($1,$2,$3,$4,'system-network',$5,$6)").bind(&desired.operation_id).bind(&desired.id).bind(desired.generation as i64).bind(kind).bind(&request).bind(request_digest(desired)?).execute(&mut **tx).await?;
-    sqlx::query("UPDATE cvm_instances SET generation=$2,desired=$3,status='pending',updated_at=now() WHERE id=$1").bind(&desired.id).bind(desired.generation as i64).bind(serde_json::to_value(&*desired)?).execute(&mut **tx).await?;
-    Ok(())
+    super::super::operations::save_system_version(tx, desired, kind, true).await
 }

@@ -49,7 +49,7 @@ impl Check {
 }
 
 impl Lookup {
-    async fn database(&self, source: &str) -> Result<Arc<Database>, String> {
+    pub(crate) async fn database(&self, source: &str) -> Result<Arc<Database>, String> {
         // One in-flight download and one source per Console. A cancelled request releases the
         // lock without recording a failed attempt, so the next request can retry immediately.
         let mut cache = self.cache.lock().await;
@@ -95,6 +95,13 @@ impl Lookup {
 }
 
 async fn download(source: &str) -> Result<Arc<Database>, String> {
+    let bytes = download_bytes(source).await?;
+    tokio::task::spawn_blocking(move || Database::decode(&bytes).map(Arc::new))
+        .await
+        .map_err(|_| "规则集解析任务失败".to_owned())?
+}
+
+pub(crate) async fn download_bytes(source: &str) -> Result<Vec<u8>, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(5))
@@ -117,12 +124,10 @@ async fn download(source: &str) -> Result<Arc<Database>, String> {
         }
         bytes.extend_from_slice(&chunk);
     }
-    tokio::task::spawn_blocking(move || Database::decode(&bytes).map(Arc::new))
-        .await
-        .map_err(|_| "统一 geosite 规则集解析任务失败".to_owned())?
+    Ok(bytes)
 }
 
-struct Database(BTreeMap<String, Site>);
+pub(crate) struct Database(pub BTreeMap<String, Site>, pub u64);
 
 impl Database {
     fn decode(bytes: &[u8]) -> Result<Self, String> {
@@ -135,10 +140,14 @@ impl Database {
                 .into_iter()
                 .map(|site| (site.code.to_ascii_uppercase(), site))
                 .collect(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         ))
     }
 
-    fn check(&self, selector: &str, domain: &str) -> Check {
+    pub(crate) fn check(&self, selector: &str, domain: &str) -> Check {
         let mut parts = selector.split('@');
         let code = parts.next().unwrap_or_default().to_ascii_uppercase();
         let attrs: Vec<_> = parts.map(str::to_ascii_lowercase).collect();
@@ -204,25 +213,25 @@ struct SiteList {
     entry: Vec<Site>,
 }
 #[derive(Clone, PartialEq, Message)]
-struct Site {
+pub(crate) struct Site {
     #[prost(string, tag = "1")]
-    code: String,
+    pub code: String,
     #[prost(message, repeated, tag = "2")]
-    domain: Vec<Domain>,
+    pub domain: Vec<Domain>,
 }
 #[derive(Clone, PartialEq, Message)]
-struct Domain {
+pub(crate) struct Domain {
     #[prost(int32, tag = "1")]
-    kind: i32,
+    pub kind: i32,
     #[prost(string, tag = "2")]
-    value: String,
+    pub value: String,
     #[prost(message, repeated, tag = "3")]
-    attribute: Vec<Attribute>,
+    pub attribute: Vec<Attribute>,
 }
 #[derive(Clone, PartialEq, Message)]
-struct Attribute {
+pub(crate) struct Attribute {
     #[prost(string, tag = "1")]
-    key: String,
+    pub key: String,
 }
 
 #[cfg(test)]

@@ -45,6 +45,9 @@ pub struct BackendConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlainConfig {
+    /// Sparse logical volumes. Existing standalone users retain thick allocation.
+    #[serde(default)]
+    pub thin_provision: bool,
     #[serde(default = "default_plain_root_dir")]
     pub root_dir: PathBuf,
     /// Physical headroom retained on the filesystem in addition to each volume.
@@ -55,6 +58,7 @@ pub struct PlainConfig {
 impl Default for PlainConfig {
     fn default() -> Self {
         Self {
+            thin_provision: false,
             root_dir: default_plain_root_dir(),
             reserve_bytes: default_plain_reserve_bytes(),
         }

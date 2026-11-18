@@ -43,7 +43,13 @@ pub(crate) fn ensure_base_ready(state: &Path) -> Result<(), String> {
     // Base retains only neutral checkpoint inspection, never Cube execution.
     let execution = std::env::var_os("BROCADE_CVM_STATE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| "/var/lib/brocade/cvm-cube".into());
+        .unwrap_or_else(|| {
+            if std::env::var("BROCADE_CVM_BACKEND").as_deref() == Ok("baremetal") {
+                "/var/lib/brocade/cvm-host".into()
+            } else {
+                "/var/lib/brocade/cvm-cube".into()
+            }
+        });
     if execution
         .try_exists()
         .map_err(|_| "无法检查 CVM 执行状态")?
@@ -59,8 +65,8 @@ pub(crate) fn ensure_base_ready(state: &Path) -> Result<(), String> {
             if path.extension().is_none_or(|suffix| suffix != "json") {
                 continue;
             }
-            let bytes =
-                crate::fsutil::read_bounded(&path, 32 * 1024)?.ok_or("CVM 执行记录检查期间变化")?;
+            let bytes = crate::fsutil::read_bounded(&path, 256 * 1024)?
+                .ok_or("CVM 执行记录检查期间变化")?;
             let record: serde_json::Value =
                 serde_json::from_slice(&bytes).map_err(|_| "CVM 执行记录无效")?;
             if record.get("deleted").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -77,7 +83,13 @@ pub(crate) fn ensure_base_ready(state: &Path) -> Result<(), String> {
         }
         let mut config = std::env::var_os("BROCADE_CVM_CONFIG")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "/etc/brocade/cvm-cube.json".into());
+            .unwrap_or_else(|| {
+                if std::env::var("BROCADE_CVM_BACKEND").as_deref() == Ok("baremetal") {
+                    "/etc/brocade/cvm-host.json".into()
+                } else {
+                    "/etc/brocade/cvm-cube.json".into()
+                }
+            });
         if std::env::var_os("BROCADE_CVM_CONFIG").is_none()
             && !config.try_exists().map_err(|_| "无法检查 CVM 配置")?
         {
@@ -88,9 +100,15 @@ pub(crate) fn ensure_base_ready(state: &Path) -> Result<(), String> {
         }
         let execution = std::env::var_os("BROCADE_CVM_STATE_DIR")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "/var/lib/brocade/cvm-cube".into());
+            .unwrap_or_else(|| {
+                if std::env::var("BROCADE_CVM_BACKEND").as_deref() == Ok("baremetal") {
+                    "/var/lib/brocade/cvm-host".into()
+                } else {
+                    "/var/lib/brocade/cvm-cube".into()
+                }
+            });
         if config.try_exists().map_err(|_| "无法检查 CVM 配置")? {
-            brocade_cube::Backend::inspect_empty(&config, &execution)?;
+            crate::cvm::inspect_empty(&config, &execution)?;
         } else if std::env::var_os("BROCADE_CVM_CONFIG").is_some()
             || execution
                 .try_exists()

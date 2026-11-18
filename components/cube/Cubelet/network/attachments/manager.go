@@ -35,17 +35,20 @@ type config struct {
 	Capabilities object
 }
 type record struct {
-	Instance          string                 `json:"instance"`
-	Runtime           string                 `json:"runtime"`
-	Generation        uint64                 `json:"generation"`
-	SpecSHA256        string                 `json:"spec_sha256"`
-	ContactID         string                 `json:"contact_id"`
-	ContactMAC        string                 `json:"contact_mac"`
-	Deleted           bool                   `json:"deleted"`
-	Releasing         bool                   `json:"releasing,omitempty"`
-	ReleaseForget     bool                   `json:"release_forget,omitempty"`
-	ReleaseSpecSHA256 string                 `json:"release_spec_sha256,omitempty"`
-	NICs              map[string]*attachment `json:"nics"`
+	PrimaryGatewayMAC string                    `json:"primary_gateway_mac,omitempty"`
+	ChainEgress       []wire.ChainEgressBinding `json:"chain_egress,omitempty"`
+	PrimaryIPv6       string                    `json:"primary_ipv6,omitempty"`
+	Instance          string                    `json:"instance"`
+	Runtime           string                    `json:"runtime"`
+	Generation        uint64                    `json:"generation"`
+	SpecSHA256        string                    `json:"spec_sha256"`
+	ContactID         string                    `json:"contact_id"`
+	ContactMAC        string                    `json:"contact_mac"`
+	Deleted           bool                      `json:"deleted"`
+	Releasing         bool                      `json:"releasing,omitempty"`
+	ReleaseForget     bool                      `json:"release_forget,omitempty"`
+	ReleaseSpecSHA256 string                    `json:"release_spec_sha256,omitempty"`
+	NICs              map[string]*attachment    `json:"nics"`
 }
 type server struct {
 	ctx     context.Context
@@ -151,6 +154,7 @@ func (m *Manager) Catalogue(ctx context.Context) (wire.Catalogue, error) {
 	result.ShimVersion = m.shimVersion
 	result.PrimaryIPDelivery = cubevs.PrimaryIPDeliveryReady()
 	result.RouteServices = true
+	result.ChainEgress = cubevs.PrimaryChainReady()
 	if err := m.verifyShim(); err != nil {
 		return result, err
 	}
@@ -327,6 +331,7 @@ func (m *Manager) Reconcile(ctx context.Context, req wire.Request) (wire.Result,
 	if r.Generation == req.Generation && r.SpecSHA256 != "" && r.SpecSHA256 != digest {
 		return result, errors.New("Cube attachment desired state changed within one generation")
 	}
+	r.ChainEgress = req.ChainEgress
 	r.ContactID = primaryID
 	if r.Generation != req.Generation {
 		r.ReleaseSpecSHA256 = ""
@@ -422,12 +427,31 @@ func (m *Manager) desired(req wire.Request) (object, string, string, error) {
 	if routing == nil {
 		routing = object{}
 	}
-	d := object{"generation": req.Generation, "spec": object{"interfaces": interfaces, "routing": routing}}
+	var assigned assignedRouting
+	routingBytes, err := json.Marshal(routing)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if err = json.Unmarshal(routingBytes, &assigned); err != nil {
+		return nil, "", "", err
+	}
+	if err = validateChainBindings(req, assigned); err != nil {
+		return nil, "", "", err
+	}
+	bindings := []any{}
+	for _, b := range req.ChainEgress {
+		bindings = append(bindings, object{"chain_id": b.ChainID, "mark": b.Mark, "device": b.Device})
+	}
+	d := object{"generation": req.Generation, "chain_egress": bindings, "spec": object{"interfaces": interfaces, "routing": routing}}
 	temp := &server{cfg: config{Capabilities: object{"max_interfaces": uint64(m.maxInterfaces), "network_sources": []any{object{"id": primarySource, "kind": "public"}}}}}
 	if _, err := temp.validateNICs(d); err != nil {
 		return nil, "", "", err
 	}
-	identity, err := json.Marshal(object{"interfaces": req.Interfaces, "routing": routing})
+	identityValue := object{"interfaces": req.Interfaces, "routing": routing}
+	if len(req.ChainEgress) > 0 {
+		identityValue["chain_egress"] = req.ChainEgress
+	}
+	identity, err := json.Marshal(identityValue)
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -470,6 +494,7 @@ func (m *Manager) Prepare(ctx context.Context, req wire.Request) (wire.Result, e
 		r.ReleaseSpecSHA256 = ""
 	}
 	r.Generation = req.Generation
+	r.ChainEgress = req.ChainEgress
 	r.SpecSHA256 = digest
 	if err := s.prepareNICs(r, d); err != nil {
 		return result, err

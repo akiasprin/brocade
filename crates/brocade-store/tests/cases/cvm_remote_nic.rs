@@ -40,6 +40,9 @@ async fn setup(db: &TestPg) {
                     error: None,
                     entries: false,
                     route_service: false,
+                    entry_host_l3: false,
+                    entry_xray: false,
+                    entry_phantun: false,
                 },
             )
             .await
@@ -90,35 +93,87 @@ fn publication_spec() -> NicPublicationSpec {
     }
 }
 async fn publish(db: &TestPg) -> NicPublication {
-    db.store
-        .write_cvm_nic_publication(
-            &system_admin(),
-            None,
-            PublicationWrite {
-                request_id: "network-publication-request-0001".into(),
-                expected_revision: 0,
-                spec: publication_spec(),
-            },
-        )
-        .await
-        .unwrap()
+    ({
+        supersede_cvm_fixture(db).await;
+        &db.store
+    })
+    .write_cvm_nic_publication(
+        &system_admin(),
+        None,
+        PublicationWrite {
+            request_id: "network-publication-request-0001".into(),
+            expected_revision: 0,
+            spec: publication_spec(),
+        },
+    )
+    .await
+    .unwrap()
 }
 async fn create(db: &TestPg, key: &str) -> CvmInstance {
     let mut request = create_request(key);
     request.interfaces = vec![contact()];
-    let instance = db
-        .store
-        .create_cvm(&actor_user("alice"), request)
+    let instance = ({
+        supersede_cvm_fixture(db).await;
+        &db.store
+    })
+    .create_cvm(&actor_user("alice"), request)
+    .await
+    .unwrap();
+    acknowledge_guest(db, &instance).await;
+    acknowledge_network(db, "n1").await;
+    publish_cvm_intent(db).await;
+    db.store
+        .cvm_instance(&actor_user("alice"), &instance.desired.id)
+        .await
+        .unwrap()
+}
+async fn create_native(db: &TestPg, key: &str) -> CvmInstance {
+    let mut capabilities = super::baremetal_tests::native_catalogue();
+    capabilities.managed_networks = true;
+    capabilities.configure_network = true;
+    capabilities.hot_attach = true;
+    capabilities.hot_detach = true;
+    let identity = capabilities.baremetal.as_ref().unwrap().identity.clone();
+    db.store
+        .cvm_record_inventory(
+            "n1",
+            InventoryReport {
+                capabilities,
+                error: None,
+            },
+        )
         .await
         .unwrap();
+    let instance = ({
+        supersede_cvm_fixture(db).await;
+        &db.store
+    })
+    .adopt_cvm_host(
+        &system_admin(),
+        CvmAdopt {
+            request_id: key.into(),
+            tenant_id: "platform.acme".into(),
+            user_id: "alice".into(),
+            node_id: "n1".into(),
+            name: "Running host".into(),
+            identity,
+        },
+    )
+    .await
+    .unwrap();
     acknowledge_guest(db, &instance).await;
     db.store
         .cvm_instance(&actor_user("alice"), &instance.desired.id)
         .await
         .unwrap()
 }
+
 fn guest_evidence(instance: &CvmInstance) -> InstanceReport {
-    let mut report = evidence(instance);
+    let mut report = if instance.desired.spec.execution.is_cube() {
+        evidence(instance)
+    } else {
+        super::baremetal_tests::native_evidence(instance)
+    };
     if let Some(network) = report.network.as_mut() {
         network.default_ipv4_interface = instance
             .desired
@@ -162,17 +217,27 @@ fn guest_evidence(instance: &CvmInstance) -> InstanceReport {
     report
 }
 async fn acknowledge_guest(db: &TestPg, instance: &CvmInstance) {
-    db.store
-        .cvm_record_report("n1", guest_evidence(instance))
-        .await
-        .unwrap();
+    ({
+        publish_cvm_intent(db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", guest_evidence(instance))
+    .await
+    .unwrap();
 }
 async fn acknowledge_network(db: &TestPg, node: &str) {
-    let desired = db.store.cvm_nic_desired(node).await.unwrap();
+    let desired = ({
+        publish_cvm_intent(db).await;
+        &db.store
+    })
+    .cvm_nic_desired(node)
+    .await
+    .unwrap();
     db.store
         .cvm_record_nic_report(
             node,
             NicNodeReport {
+                diagnostics: None,
                 generation: desired.generation,
                 bindings: desired
                     .bindings
@@ -208,6 +273,144 @@ fn mount_request(instance: &CvmInstance, p: &NicPublication, key: &str) -> NicMo
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_remote_nic_provider_names_follow_publications_and_owned_allocations() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    sqlx::query("INSERT INTO users(tenant_id,id,uuid) VALUES('platform.acme','bob','22222222-2222-4222-8222-222222222222')").execute(db.pool()).await.unwrap();
+    let p = publish(&db).await;
+    let mut other = publication_spec();
+    other.provider_node = "n1".into();
+    other.resource_domain = "bob-only-network".into();
+    other.grants[0].user_id = "bob".into();
+    ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .write_cvm_nic_publication(
+        &system_admin(),
+        None,
+        PublicationWrite {
+            request_id: "bob-network-names-0001".into(),
+            expected_revision: 0,
+            spec: other,
+        },
+    )
+    .await
+    .unwrap();
+    for actor in [
+        actor_user("alice"),
+        AdminContext::new("reader", AdminRole::Readonly, Some("platform.acme".into())),
+        AdminContext::new(
+            "tenant",
+            AdminRole::TenantAdmin,
+            Some("platform.acme".into()),
+        ),
+    ] {
+        let catalog = db.store.cvm_nic_catalog(&actor).await.unwrap();
+        assert_eq!(
+            catalog.provider_names.get("n2").map(String::as_str),
+            Some("Network provider")
+        );
+        assert!(catalog.providers.is_empty());
+        assert!(catalog.attachments.is_empty());
+        assert!(!catalog.can_manage);
+        let json = serde_json::to_value(&catalog).unwrap();
+        assert!(json["provider_names"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(serde_json::Value::is_string));
+    }
+    assert!(!db
+        .store
+        .cvm_nic_catalog(&actor_user("alice"))
+        .await
+        .unwrap()
+        .provider_names
+        .contains_key("n1"));
+    assert!(!db
+        .store
+        .cvm_nic_catalog(&actor_user("bob"))
+        .await
+        .unwrap()
+        .provider_names
+        .contains_key("n2"));
+    let outsider = AdminContext::new(
+        "outside",
+        AdminRole::TenantAdmin,
+        Some("platform.outside".into()),
+    );
+    assert!(db
+        .store
+        .cvm_nic_catalog(&outsider)
+        .await
+        .unwrap()
+        .provider_names
+        .is_empty());
+    let instance = create(&db, "provider-name-container-0001").await;
+    ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .mount_cvm_nic(
+        &actor_user("alice"),
+        &instance.desired.id,
+        mount_request(&instance, &p, "provider-name-mount-0001"),
+    )
+    .await
+    .unwrap();
+    let mut revoked = p.spec.clone();
+    revoked.grants.clear();
+    ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .write_cvm_nic_publication(
+        &system_admin(),
+        Some(&p.id),
+        PublicationWrite {
+            request_id: "provider-name-revoke-0001".into(),
+            expected_revision: p.revision,
+            spec: revoked,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE nodes SET name='Renamed network provider' WHERE id='n2'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let alice = db
+        .store
+        .cvm_nic_catalog(&actor_user("alice"))
+        .await
+        .unwrap();
+    assert!(alice.publications.is_empty());
+    assert_eq!(
+        alice.provider_names.get("n2").map(String::as_str),
+        Some("Renamed network provider")
+    );
+    assert!(alice.providers.is_empty());
+    assert!(!db
+        .store
+        .cvm_nic_catalog(&actor_user("bob"))
+        .await
+        .unwrap()
+        .provider_names
+        .contains_key("n2"));
+    assert!(db
+        .store
+        .cvm_nic_catalog(&outsider)
+        .await
+        .unwrap()
+        .provider_names
+        .is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn cvm_remote_nic_reuse_concurrent_allocations_replay_and_scope() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -222,17 +425,20 @@ async fn cvm_remote_nic_reuse_concurrent_allocations_replay_and_scope() {
         .publications
         .is_empty());
     assert!(matches!(
-        db.store
-            .write_cvm_nic_publication(
-                &actor_user("alice"),
-                None,
-                PublicationWrite {
-                    request_id: "unauthorized-publish-0001".into(),
-                    expected_revision: 0,
-                    spec: publication_spec()
-                }
-            )
-            .await,
+        ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
+        .write_cvm_nic_publication(
+            &actor_user("alice"),
+            None,
+            PublicationWrite {
+                request_id: "unauthorized-publish-0001".into(),
+                expected_revision: 0,
+                spec: publication_spec()
+            }
+        )
+        .await,
         Err(StoreError::Forbidden(_))
     ));
     let a = create(&db, "container-network-a-0001").await;
@@ -241,8 +447,16 @@ async fn cvm_remote_nic_reuse_concurrent_allocations_replay_and_scope() {
     let second = mount_request(&b, &p, "mount-network-b-0001");
     let actor = actor_user("alice");
     let (a, b) = tokio::join!(
-        db.store.mount_cvm_nic(&actor, &a.desired.id, first.clone()),
-        db.store.mount_cvm_nic(&actor, &b.desired.id, second)
+        ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
+        .mount_cvm_nic(&actor, &a.desired.id, first.clone()),
+        ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
+        .mount_cvm_nic(&actor, &b.desired.id, second)
     );
     let a = a.unwrap();
     let b = b.unwrap();
@@ -257,11 +471,13 @@ async fn cvm_remote_nic_reuse_concurrent_allocations_replay_and_scope() {
         nic_a.allocated.as_ref().unwrap().mac,
         nic_b.allocated.as_ref().unwrap().mac
     );
-    let replay = db
-        .store
-        .mount_cvm_nic(&actor, &a.desired.id, first)
-        .await
-        .unwrap();
+    let replay = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .mount_cvm_nic(&actor, &a.desired.id, first)
+    .await
+    .unwrap();
     assert_eq!(replay.desired.spec.interfaces, a.desired.spec.interfaces);
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM cvm_nic_allocations")
         .fetch_one(db.pool())
@@ -292,94 +508,108 @@ async fn cvm_remote_nic_dependencies_two_sided_cleanup_and_admission() {
     setup(&db).await;
     let p = publish(&db).await;
     let a = create(&db, "container-dependencies-0001").await;
-    let a = db
-        .store
-        .mount_cvm_nic(
-            &actor_user("alice"),
-            &a.desired.id,
-            mount_request(&a, &p, "mount-dependencies-0001"),
-        )
-        .await
-        .unwrap();
+    let a = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .mount_cvm_nic(
+        &actor_user("alice"),
+        &a.desired.id,
+        mount_request(&a, &p, "mount-dependencies-0001"),
+    )
+    .await
+    .unwrap();
     acknowledge_guest(&db, &a).await;
     let nic = a.desired.spec.interfaces[1].id.clone();
     assert!(matches!(
-        db.store
-            .command_cvm(
-                &actor_user("alice"),
-                &a.desired.id,
-                CvmCommand {
-                    request_id: "dependent-detach-0001".into(),
-                    expected_generation: a.desired.generation,
-                    change: CvmChange::Detach {
-                        interface_id: nic.clone()
-                    }
+        ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
+        .command_cvm(
+            &actor_user("alice"),
+            &a.desired.id,
+            CvmCommand {
+                request_id: "dependent-detach-0001".into(),
+                expected_generation: a.desired.generation,
+                change: CvmChange::Detach {
+                    interface_id: nic.clone()
                 }
-            )
-            .await,
+            }
+        )
+        .await,
         Err(StoreError::Conflict(_))
     ));
-    db.store
-        .set_cvm_nic_admission(
-            &system_admin(),
-            &p.id,
-            PublicationAdmission {
-                request_id: "stop-admission-00001".into(),
-                expected_revision: p.revision,
-                admitting: false,
-            },
-        )
-        .await
-        .unwrap();
+    ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .set_cvm_nic_admission(
+        &system_admin(),
+        &p.id,
+        PublicationAdmission {
+            request_id: "stop-admission-00001".into(),
+            expected_revision: p.revision,
+            admitting: false,
+        },
+    )
+    .await
+    .unwrap();
     let current = db
         .store
         .cvm_instance(&actor_user("alice"), &a.desired.id)
         .await
         .unwrap();
     assert_eq!(current.desired.spec, a.desired.spec);
-    assert!(db
-        .store
-        .mount_cvm_nic(
-            &actor_user("alice"),
-            &a.desired.id,
-            mount_request(&current, &p, "mount-stopped-00001")
-        )
-        .await
-        .is_err());
+    assert!(({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .mount_cvm_nic(
+        &actor_user("alice"),
+        &a.desired.id,
+        mount_request(&current, &p, "mount-stopped-00001")
+    )
+    .await
+    .is_err());
     acknowledge_network(&db, "n1").await;
     acknowledge_network(&db, "n2").await;
     acknowledge_network(&db, "n1").await;
     acknowledge_network(&db, "n2").await;
     let mut routes = current.desired.spec.routing.clone();
     routes.remove(&nic);
-    let current = db
-        .store
-        .set_cvm_routes(
-            &actor_user("alice"),
-            &a.desired.id,
-            RoutesWrite {
-                request_id: "remove-route-reference-0001".into(),
-                expected_generation: current.desired.generation,
-                expected_revision: routes.revision,
-                routes,
-            },
-        )
-        .await
-        .unwrap();
+    let current = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .set_cvm_routes(
+        &actor_user("alice"),
+        &a.desired.id,
+        RoutesWrite {
+            request_id: "remove-route-reference-0001".into(),
+            expected_generation: current.desired.generation,
+            expected_revision: routes.revision,
+            routes,
+        },
+    )
+    .await
+    .unwrap();
     acknowledge_guest(&db, &current).await;
-    let detached = db
-        .store
-        .command_cvm(
-            &actor_user("alice"),
-            &a.desired.id,
-            CvmCommand {
-                request_id: "detach-network-after-routes-0001".into(),
-                expected_generation: current.desired.generation,
-                change: CvmChange::Detach { interface_id: nic },
-            },
-        )
-        .await
-        .unwrap();
+    let detached = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .command_cvm(
+        &actor_user("alice"),
+        &a.desired.id,
+        CvmCommand {
+            request_id: "detach-network-after-routes-0001".into(),
+            expected_generation: current.desired.generation,
+            change: CvmChange::Detach { interface_id: nic },
+        },
+    )
+    .await
+    .unwrap();
     acknowledge_guest(&db, &detached).await;
     acknowledge_network(&db, "n1").await;
     let held: bool = sqlx::query_scalar("SELECT NOT released FROM cvm_nic_allocations LIMIT 1")
@@ -393,18 +623,21 @@ async fn cvm_remote_nic_dependencies_two_sided_cleanup_and_admission() {
         .await
         .unwrap();
     assert!(released);
-    db.store
-        .delete_cvm_nic_publication(
-            &system_admin(),
-            &p.id,
-            PublicationAdmission {
-                request_id: "delete-publication-cleaned-0001".into(),
-                expected_revision: p.revision,
-                admitting: false,
-            },
-        )
-        .await
-        .unwrap();
+    ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .delete_cvm_nic_publication(
+        &system_admin(),
+        &p.id,
+        PublicationAdmission {
+            request_id: "delete-publication-cleaned-0001".into(),
+            expected_revision: p.revision,
+            admitting: false,
+        },
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -416,38 +649,48 @@ async fn cvm_remote_nic_switch_failure_preserves_identity_allocation_and_routes(
     setup(&db).await;
     let p = publish(&db).await;
     let a = create(&db, "container-switch-00001").await;
-    let a = db
-        .store
-        .mount_cvm_nic(
-            &actor_user("alice"),
-            &a.desired.id,
-            mount_request(&a, &p, "mount-switch-00001"),
-        )
-        .await
-        .unwrap();
+    let a = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .mount_cvm_nic(
+        &actor_user("alice"),
+        &a.desired.id,
+        mount_request(&a, &p, "mount-switch-00001"),
+    )
+    .await
+    .unwrap();
     acknowledge_guest(&db, &a).await;
     for node in ["n1", "n2", "n1", "n2"] {
         acknowledge_network(&db, node).await;
     }
     let nic = a.desired.spec.interfaces[1].clone();
     let allocation = nic.allocated.as_ref().unwrap();
-    let changed = db
-        .store
-        .change_cvm_nic_transport(
-            &actor_user("alice"),
-            &a.desired.id,
-            &nic.id,
-            NicTransportChange {
-                rebuild: false,
-                request_id: "switch-to-xray-00001".into(),
-                expected_generation: a.desired.generation,
-                transport: TransportKind::Xray,
-            },
-        )
-        .await
-        .unwrap();
+    let changed = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .change_cvm_nic_transport(
+        &actor_user("alice"),
+        &a.desired.id,
+        &nic.id,
+        NicTransportChange {
+            rebuild: false,
+            request_id: "switch-to-xray-00001".into(),
+            expected_generation: a.desired.generation,
+            transport: TransportKind::Xray,
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(changed.desired.spec.routing, a.desired.spec.routing);
-    let desired = db.store.cvm_nic_desired("n1").await.unwrap();
+    let desired = ({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_nic_desired("n1")
+    .await
+    .unwrap();
     let new = desired
         .bindings
         .iter()
@@ -470,6 +713,7 @@ async fn cvm_remote_nic_switch_failure_preserves_identity_allocation_and_routes(
         .cvm_record_nic_report(
             "n1",
             NicNodeReport {
+                diagnostics: None,
                 generation: desired.generation,
                 bindings: vec![failed.clone()],
             },
@@ -495,6 +739,7 @@ async fn cvm_remote_nic_switch_failure_preserves_identity_allocation_and_routes(
             .cvm_record_nic_report(
                 "n1",
                 NicNodeReport {
+                    diagnostics: None,
                     generation: desired.generation,
                     bindings: vec![failed]
                 }
@@ -514,15 +759,17 @@ async fn cvm_remote_nic_revocation_blocks_but_retirement_removes_references() {
     setup(&db).await;
     let p = publish(&db).await;
     let a = create(&db, "container-retirement-0001").await;
-    let a = db
-        .store
-        .mount_cvm_nic(
-            &actor_user("alice"),
-            &a.desired.id,
-            mount_request(&a, &p, "mount-retirement-0001"),
-        )
-        .await
-        .unwrap();
+    let a = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .mount_cvm_nic(
+        &actor_user("alice"),
+        &a.desired.id,
+        mount_request(&a, &p, "mount-retirement-0001"),
+    )
+    .await
+    .unwrap();
     acknowledge_guest(&db, &a).await;
     sqlx::query(
         "UPDATE cvm_nic_nodes SET observed_at=now()-interval '5 minutes' WHERE node_id='n2'",
@@ -532,18 +779,21 @@ async fn cvm_remote_nic_revocation_blocks_but_retirement_removes_references() {
     .unwrap();
     let mut updated = p.spec.clone();
     updated.grants.clear();
-    db.store
-        .write_cvm_nic_publication(
-            &system_admin(),
-            Some(&p.id),
-            PublicationWrite {
-                request_id: "revoke-network-grant-0001".into(),
-                expected_revision: p.revision,
-                spec: updated,
-            },
-        )
-        .await
-        .unwrap();
+    ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .write_cvm_nic_publication(
+        &system_admin(),
+        Some(&p.id),
+        PublicationWrite {
+            request_id: "revoke-network-grant-0001".into(),
+            expected_revision: p.revision,
+            spec: updated,
+        },
+    )
+    .await
+    .unwrap();
     let blocked = db
         .store
         .cvm_instance(&actor_user("alice"), &a.desired.id)
@@ -597,31 +847,41 @@ async fn cvm_remote_nic_monthly_usage_counts_consumer_once_and_blocks_without_lo
     setup(&db).await;
     let mut spec = publication_spec();
     spec.limits.monthly_bytes = Some(1000);
-    let p = db
-        .store
-        .write_cvm_nic_publication(
-            &system_admin(),
-            None,
-            PublicationWrite {
-                request_id: "meter-publication-0001".into(),
-                expected_revision: 0,
-                spec,
-            },
-        )
-        .await
-        .unwrap();
+    let p = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .write_cvm_nic_publication(
+        &system_admin(),
+        None,
+        PublicationWrite {
+            request_id: "meter-publication-0001".into(),
+            expected_revision: 0,
+            spec,
+        },
+    )
+    .await
+    .unwrap();
     let a = create(&db, "meter-container-0001").await;
-    let a = db
-        .store
-        .mount_cvm_nic(
-            &actor_user("alice"),
-            &a.desired.id,
-            mount_request(&a, &p, "meter-mount-0001"),
-        )
-        .await
-        .unwrap();
+    let a = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .mount_cvm_nic(
+        &actor_user("alice"),
+        &a.desired.id,
+        mount_request(&a, &p, "meter-mount-0001"),
+    )
+    .await
+    .unwrap();
     acknowledge_guest(&db, &a).await;
-    let target = db.store.cvm_nic_desired("n1").await.unwrap();
+    let target = ({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_nic_desired("n1")
+    .await
+    .unwrap();
     let b = &target.bindings[0];
     let sample = NicTrafficSample {
         epoch: "a".repeat(64),
@@ -646,6 +906,7 @@ async fn cvm_remote_nic_monthly_usage_counts_consumer_once_and_blocks_without_lo
         error: None,
     };
     let report = NicNodeReport {
+        diagnostics: None,
         generation: target.generation,
         bindings: vec![evidence.clone()],
     };
@@ -694,13 +955,20 @@ async fn cvm_remote_nic_monthly_usage_counts_consumer_once_and_blocks_without_lo
         .instances
         .is_empty());
     // A sample with the same epoch is not counted again by a staged binding.
-    let target = db.store.cvm_nic_desired("n1").await.unwrap();
+    let target = ({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_nic_desired("n1")
+    .await
+    .unwrap();
     let mut duplicate = evidence;
     duplicate.generation = target.bindings[0].generation;
     db.store
         .cvm_record_nic_report(
             "n1",
             NicNodeReport {
+                diagnostics: None,
                 generation: target.generation,
                 bindings: vec![duplicate],
             },
@@ -718,7 +986,13 @@ async fn cvm_remote_nic_monthly_usage_counts_consumer_once_and_blocks_without_lo
         .execute(db.pool())
         .await
         .unwrap();
-    db.store.cvm_nic_desired("n1").await.unwrap();
+    ({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_nic_desired("n1")
+    .await
+    .unwrap();
     let reset = db
         .store
         .cvm_instance(&actor_user("alice"), &a.desired.id)
@@ -736,14 +1010,21 @@ async fn cvm_remote_nic_monthly_usage_counts_consumer_once_and_blocks_without_lo
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn cvm_remote_nic_version_reallocation_is_explicit_and_retains_old_resources_until_cleanup() {
-    let Some(db) = TestPg::start_if_enabled().await else {
-        return;
-    };
-    setup(&db).await;
-    let p = publish(&db).await;
-    let a = create(&db, "version-container-0001").await;
-    let a = db
-        .store
+    for native in [false, true] {
+        let Some(db) = TestPg::start_if_enabled().await else {
+            return;
+        };
+        setup(&db).await;
+        let p = publish(&db).await;
+        let a = if native {
+            create_native(&db, "version-native-0001").await
+        } else {
+            create(&db, "version-container-0001").await
+        };
+        let a = ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
         .mount_cvm_nic(
             &actor_user("alice"),
             &a.desired.id,
@@ -751,16 +1032,18 @@ async fn cvm_remote_nic_version_reallocation_is_explicit_and_retains_old_resourc
         )
         .await
         .unwrap();
-    acknowledge_guest(&db, &a).await;
-    for _ in 0..2 {
-        acknowledge_network(&db, "n1").await;
-        acknowledge_network(&db, "n2").await;
-    }
-    let mut spec = p.spec;
-    spec.ipv4_pool = Some("10.121.0.0/24".parse().unwrap());
-    spec.dns_suggestions = vec!["1.1.1.1".parse().unwrap()];
-    let p = db
-        .store
+        acknowledge_guest(&db, &a).await;
+        for _ in 0..2 {
+            acknowledge_network(&db, "n1").await;
+            acknowledge_network(&db, "n2").await;
+        }
+        let mut spec = p.spec;
+        spec.ipv4_pool = Some("10.121.0.0/24".parse().unwrap());
+        spec.dns_suggestions = vec!["1.1.1.1".parse().unwrap()];
+        let p = ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
         .write_cvm_nic_publication(
             &system_admin(),
             Some(&p.id),
@@ -772,49 +1055,82 @@ async fn cvm_remote_nic_version_reallocation_is_explicit_and_retains_old_resourc
         )
         .await
         .unwrap();
-    let a = db
-        .store
-        .cvm_instance(&actor_user("alice"), &a.desired.id)
-        .await
-        .unwrap();
-    let nic_id = a.desired.spec.interfaces[1].id.clone();
-    assert_eq!(
-        a.desired.spec.interfaces[1]
-            .allocated
-            .as_ref()
-            .unwrap()
-            .publication_revision,
-        1
-    );
-    let denied = NicVersionChange {
-        request_id: "version-change-denied-0001".into(),
-        expected_generation: a.desired.generation,
-        publication_revision: p.revision,
-        reallocate: false,
-        transport: None,
-    };
-    assert!(matches!(
-        db.store
+        let a = db
+            .store
+            .cvm_instance(&actor_user("alice"), &a.desired.id)
+            .await
+            .unwrap();
+        let nic_id = a.desired.spec.interfaces[1].id.clone();
+        assert_eq!(
+            a.desired.spec.interfaces[1]
+                .allocated
+                .as_ref()
+                .unwrap()
+                .publication_revision,
+            1
+        );
+        let denied = NicVersionChange {
+            request_id: "version-change-denied-0001".into(),
+            expected_generation: a.desired.generation,
+            publication_revision: p.revision,
+            reallocate: false,
+            transport: None,
+        };
+        assert!(matches!(
+            ({
+                supersede_cvm_fixture(&db).await;
+                &db.store
+            })
             .update_cvm_nic_version(&actor_user("alice"), &a.desired.id, &nic_id, denied)
             .await,
-        Err(StoreError::Conflict(_))
-    ));
-    let stopped = db
-        .store
-        .command_cvm(
-            &actor_user("alice"),
-            &a.desired.id,
-            CvmCommand {
-                request_id: "version-stop-0001".into(),
-                expected_generation: a.desired.generation,
-                change: CvmChange::Stop,
-            },
-        )
-        .await
-        .unwrap();
-    acknowledge_guest(&db, &stopped).await;
-    let updated = db
-        .store
+            Err(StoreError::Conflict(_))
+        ));
+        if !native {
+            assert!(matches!(
+                ({
+                    supersede_cvm_fixture(&db).await;
+                    &db.store
+                })
+                .update_cvm_nic_version(
+                    &actor_user("alice"),
+                    &a.desired.id,
+                    &nic_id,
+                    NicVersionChange {
+                        request_id: "version-running-cube-denied".into(),
+                        expected_generation: a.desired.generation,
+                        publication_revision: p.revision,
+                        reallocate: true,
+                        transport: None
+                    }
+                )
+                .await,
+                Err(StoreError::Conflict(_))
+            ));
+        }
+        let stopped = if native {
+            a.clone()
+        } else {
+            ({
+                supersede_cvm_fixture(&db).await;
+                &db.store
+            })
+            .command_cvm(
+                &actor_user("alice"),
+                &a.desired.id,
+                CvmCommand {
+                    request_id: "version-stop-0001".into(),
+                    expected_generation: a.desired.generation,
+                    change: CvmChange::Stop,
+                },
+            )
+            .await
+            .unwrap()
+        };
+        acknowledge_guest(&db, &stopped).await;
+        let updated = ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
         .update_cvm_nic_version(
             &actor_user("alice"),
             &a.desired.id,
@@ -829,45 +1145,56 @@ async fn cvm_remote_nic_version_reallocation_is_explicit_and_retains_old_resourc
         )
         .await
         .unwrap();
-    let old = a.desired.spec.interfaces[1].allocated.as_ref().unwrap();
-    let next = updated.desired.spec.interfaces[1]
-        .allocated
-        .as_ref()
-        .unwrap();
-    assert_eq!(old.mac, next.mac);
-    assert_eq!(a.desired.spec.routing, updated.desired.spec.routing);
-    assert_ne!(old.allocation_id, next.allocation_id);
-    assert_ne!(old.ipv4, next.ipv4);
-    let held: bool = sqlx::query_scalar("SELECT NOT released FROM cvm_nic_allocations WHERE id=$1")
-        .bind(&old.allocation_id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    assert!(held);
-    acknowledge_guest(&db, &updated).await;
-    for _ in 0..4 {
-        acknowledge_network(&db, "n1").await;
-        acknowledge_network(&db, "n2").await;
-    }
-    let released: bool = sqlx::query_scalar("SELECT released FROM cvm_nic_allocations WHERE id=$1")
-        .bind(&old.allocation_id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    assert!(released);
-    let current = db
-        .store
-        .cvm_instance(&actor_user("alice"), &a.desired.id)
-        .await
-        .unwrap();
-    assert_eq!(
-        current.desired.spec.interfaces[1]
+        assert_eq!(
+            updated.desired.power,
+            if native {
+                PowerState::Running
+            } else {
+                PowerState::Stopped
+            }
+        );
+        let old = a.desired.spec.interfaces[1].allocated.as_ref().unwrap();
+        let next = updated.desired.spec.interfaces[1]
             .allocated
             .as_ref()
-            .unwrap()
-            .allocation_id,
-        next.allocation_id
-    );
+            .unwrap();
+        assert_eq!(old.mac, next.mac);
+        assert_eq!(a.desired.spec.routing, updated.desired.spec.routing);
+        assert_ne!(old.allocation_id, next.allocation_id);
+        assert_ne!(old.ipv4, next.ipv4);
+        let held: bool =
+            sqlx::query_scalar("SELECT NOT released FROM cvm_nic_allocations WHERE id=$1")
+                .bind(&old.allocation_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(held);
+        acknowledge_guest(&db, &updated).await;
+        for _ in 0..4 {
+            acknowledge_network(&db, "n1").await;
+            acknowledge_network(&db, "n2").await;
+        }
+        let released: bool =
+            sqlx::query_scalar("SELECT released FROM cvm_nic_allocations WHERE id=$1")
+                .bind(&old.allocation_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(released);
+        let current = db
+            .store
+            .cvm_instance(&actor_user("alice"), &a.desired.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            current.desired.spec.interfaces[1]
+                .allocated
+                .as_ref()
+                .unwrap()
+                .allocation_id,
+            next.allocation_id
+        );
+    }
 }
 
 #[tokio::test]
@@ -879,29 +1206,33 @@ async fn cvm_remote_nic_bulk_versions_are_atomic_within_one_container() {
     setup(&db).await;
     let p = publish(&db).await;
     let a = create(&db, "bulk-container-0001").await;
-    let a = db
-        .store
-        .mount_cvm_nic(
-            &actor_user("alice"),
-            &a.desired.id,
-            mount_request(&a, &p, "bulk-mount-first-0001"),
-        )
-        .await
-        .unwrap();
+    let a = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .mount_cvm_nic(
+        &actor_user("alice"),
+        &a.desired.id,
+        mount_request(&a, &p, "bulk-mount-first-0001"),
+    )
+    .await
+    .unwrap();
     acknowledge_guest(&db, &a).await;
     for _ in 0..2 {
         acknowledge_network(&db, "n1").await;
         acknowledge_network(&db, "n2").await;
     }
-    let a = db
-        .store
-        .mount_cvm_nic(
-            &actor_user("alice"),
-            &a.desired.id,
-            mount_request(&a, &p, "bulk-mount-second-0001"),
-        )
-        .await
-        .unwrap();
+    let a = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .mount_cvm_nic(
+        &actor_user("alice"),
+        &a.desired.id,
+        mount_request(&a, &p, "bulk-mount-second-0001"),
+    )
+    .await
+    .unwrap();
     acknowledge_guest(&db, &a).await;
     for _ in 0..2 {
         acknowledge_network(&db, "n1").await;
@@ -909,19 +1240,21 @@ async fn cvm_remote_nic_bulk_versions_are_atomic_within_one_container() {
     }
     let mut spec = p.spec;
     spec.name = "Updated reusable network".into();
-    let next = db
-        .store
-        .write_cvm_nic_publication(
-            &system_admin(),
-            Some(&p.id),
-            PublicationWrite {
-                request_id: "bulk-publish-0002".into(),
-                expected_revision: p.revision,
-                spec,
-            },
-        )
-        .await
-        .unwrap();
+    let next = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .write_cvm_nic_publication(
+        &system_admin(),
+        Some(&p.id),
+        PublicationWrite {
+            request_id: "bulk-publish-0002".into(),
+            expected_revision: p.revision,
+            spec,
+        },
+    )
+    .await
+    .unwrap();
     let updates = a
         .desired
         .spec
@@ -941,19 +1274,21 @@ async fn cvm_remote_nic_bulk_versions_are_atomic_within_one_container() {
         .unwrap();
     let mut wrong = updates.clone();
     wrong[1].interface_id = "nic-outside-container".into();
-    assert!(db
-        .store
-        .update_cvm_nic_versions(
-            &actor_user("alice"),
-            &a.desired.id,
-            NicVersionsChange {
-                request_id: "bulk-invalid-0001".into(),
-                expected_generation: a.desired.generation,
-                updates: wrong
-            }
-        )
-        .await
-        .is_err());
+    assert!(({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .update_cvm_nic_versions(
+        &actor_user("alice"),
+        &a.desired.id,
+        NicVersionsChange {
+            request_id: "bulk-invalid-0001".into(),
+            expected_generation: a.desired.generation,
+            updates: wrong
+        }
+    )
+    .await
+    .is_err());
     assert_eq!(
         count,
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM cvm_nic_bindings")
@@ -966,11 +1301,13 @@ async fn cvm_remote_nic_bulk_versions_are_atomic_within_one_container() {
         expected_generation: a.desired.generation,
         updates,
     };
-    let updated = db
-        .store
-        .update_cvm_nic_versions(&actor_user("alice"), &a.desired.id, request.clone())
-        .await
-        .unwrap();
+    let updated = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .update_cvm_nic_versions(&actor_user("alice"), &a.desired.id, request.clone())
+    .await
+    .unwrap();
     assert_eq!(updated.desired.generation, a.desired.generation + 1);
     assert_eq!(updated.desired.spec.routing, a.desired.spec.routing);
     for (before, after) in a
@@ -986,11 +1323,13 @@ async fn cvm_remote_nic_bulk_versions_are_atomic_within_one_container() {
             assert_eq!(after.publication_revision, next.revision);
         }
     }
-    let replay = db
-        .store
-        .update_cvm_nic_versions(&actor_user("alice"), &a.desired.id, request)
-        .await
-        .unwrap();
+    let replay = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .update_cvm_nic_versions(&actor_user("alice"), &a.desired.id, request)
+    .await
+    .unwrap();
     assert_eq!(replay.desired.generation, updated.desired.generation);
     let catalog = db.store.cvm_nic_catalog(&system_admin()).await.unwrap();
     assert_eq!(catalog.attachments.iter().filter(|n| n.attached).count(), 2);
@@ -1015,41 +1354,54 @@ async fn cvm_remote_nic_ports_conflict_with_static_services_in_both_write_direct
         .retain(|t| t.kind == TransportKind::Wireguard);
     spec.transports[0].port_start = 51821;
     spec.transports[0].port_end = 51821;
-    let unavailable = db
-        .store
-        .write_cvm_nic_publication(
-            &system_admin(),
-            None,
-            PublicationWrite {
-                request_id: "static-conflict-publication-0001".into(),
-                expected_revision: 0,
-                spec,
-            },
-        )
-        .await
-        .unwrap();
+    let unavailable = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .write_cvm_nic_publication(
+        &system_admin(),
+        None,
+        PublicationWrite {
+            request_id: "static-conflict-publication-0001".into(),
+            expected_revision: 0,
+            spec,
+        },
+    )
+    .await
+    .unwrap();
     let a = create(&db, "port-conflict-container-0001").await;
     assert!(matches!(
-        db.store
-            .mount_cvm_nic(
-                &actor_user("alice"),
-                &a.desired.id,
-                mount_request(&a, &unavailable, "port-conflict-mount-0001")
-            )
-            .await,
-        Err(StoreError::Conflict(_))
-    ));
-    let p = publish(&db).await;
-    let a = db
-        .store
+        ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
         .mount_cvm_nic(
             &actor_user("alice"),
             &a.desired.id,
-            mount_request(&a, &p, "port-valid-mount-0001"),
+            mount_request(&a, &unavailable, "port-conflict-mount-0001")
         )
-        .await
-        .unwrap();
-    let desired = db.store.cvm_nic_desired("n2").await.unwrap();
+        .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let p = publish(&db).await;
+    let a = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .mount_cvm_nic(
+        &actor_user("alice"),
+        &a.desired.id,
+        mount_request(&a, &p, "port-valid-mount-0001"),
+    )
+    .await
+    .unwrap();
+    let desired = ({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_nic_desired("n2")
+    .await
+    .unwrap();
     let port = desired.bindings[0].port;
     let request: brocade_store::UpdateNodeRequest =
         serde_json::from_value(json!({"wg_listen_port":port})).unwrap();
@@ -1068,4 +1420,787 @@ async fn cvm_remote_nic_ports_conflict_with_static_services_in_both_write_direct
         .await
         .unwrap();
     assert_eq!(unchanged.desired.generation, a.desired.generation);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_mixed_release_groups_carrier_peers_and_fences_provider_and_consumer() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    let instance = create(&db, "release-carrier-create-01").await;
+    let p = publish(&db).await;
+    let mounted = db
+        .store
+        .mount_cvm_nic(
+            &actor_user("alice"),
+            &instance.desired.id,
+            NicMountRequest {
+                request_id: "release-carrier-mount-01".into(),
+                expected_generation: instance.desired.generation,
+                publication_id: p.id,
+                use_dns_suggestions: false,
+                transport: TransportKind::Wireguard,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(db
+        .store
+        .cvm_nic_desired("n1")
+        .await
+        .unwrap()
+        .bindings
+        .is_empty());
+    assert!(db
+        .store
+        .cvm_nic_desired("n2")
+        .await
+        .unwrap()
+        .bindings
+        .is_empty());
+    assert_eq!(
+        db.store.cvm_desired("n1").await.unwrap().instances[0].generation,
+        instance.desired.generation
+    );
+    let r = mounted.revision_id.unwrap();
+    let plan = db.store.plan_deployment(&system_admin(), r).await.unwrap();
+    let a = plan.targets.iter().find(|t| t.node_id == "n1").unwrap();
+    let b = plan.targets.iter().find(|t| t.node_id == "n2").unwrap();
+    assert_eq!(
+        a.wave, b.wave,
+        "both halves must be in the same executable wave"
+    );
+    assert!(
+        a.prerequisites.contains(&"n2".to_owned()) && b.prerequisites.contains(&"n1".to_owned())
+    );
+    publish_cvm_intent(&db).await;
+    assert_eq!(
+        db.store.cvm_nic_desired("n1").await.unwrap().bindings.len(),
+        1
+    );
+    assert_eq!(
+        db.store.cvm_nic_desired("n2").await.unwrap().bindings.len(),
+        1
+    );
+    acknowledge_guest(&db, &mounted).await;
+    acknowledge_network(&db, "n1").await;
+    acknowledge_network(&db, "n2").await;
+    acknowledge_network(&db, "n1").await;
+    acknowledge_network(&db, "n2").await;
+    let status:String=sqlx::query_scalar("SELECT status FROM deployments WHERE revision_id=$1 AND kind='config' ORDER BY id DESC LIMIT 1").bind(r as i64).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(status, "succeeded");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_mixed_pending_instance_does_not_freeze_or_rewind_another_instances_runtime_quota() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    let b = create(&db, "runtime-quota-running-01").await;
+    let baseline:Vec<serde_json::Value>=sqlx::query_scalar("SELECT jsonb_build_object('node',t.node_id,'status',t.status,'cvm',s.cvm_revision_id,'ready',s.cvm_machine_ready) FROM deployment_targets t JOIN deployment_target_state s ON s.deployment_id=t.deployment_id AND s.node_id=t.node_id JOIN deployments d ON d.id=t.deployment_id WHERE d.active=TRUE").fetch_all(db.pool()).await.unwrap();
+    assert!(
+        baseline.is_empty(),
+        "initial worker rounds must settle: {baseline:?}"
+    );
+    let mut spec = publication_spec();
+    spec.limits.monthly_bytes = Some(1000);
+    let p = db
+        .store
+        .write_cvm_nic_publication(
+            &system_admin(),
+            None,
+            PublicationWrite {
+                request_id: "runtime-quota-publish-01".into(),
+                expected_revision: 0,
+                spec,
+            },
+        )
+        .await
+        .unwrap();
+    let b = db
+        .store
+        .mount_cvm_nic(
+            &actor_user("alice"),
+            &b.desired.id,
+            mount_request(&b, &p, "runtime-quota-mount-01"),
+        )
+        .await
+        .unwrap();
+    acknowledge_guest(&db, &b).await;
+    for node in ["n1", "n2", "n1", "n2"] {
+        acknowledge_network(&db, node).await;
+    }
+    let pending = db
+        .store
+        .create_cvm(
+            &actor_user("alice"),
+            create_request("runtime-quota-pending-01"),
+        )
+        .await
+        .unwrap();
+    let revision = pending.revision_id.unwrap();
+    let desired = db.store.cvm_nic_desired("n1").await.unwrap();
+    let binding = &desired.bindings[0];
+    db.store
+        .cvm_record_nic_report(
+            "n1",
+            NicNodeReport {
+                generation: desired.generation,
+                diagnostics: None,
+                bindings: vec![NicBindingReport {
+                    id: binding.id.clone(),
+                    side: binding.side,
+                    generation: binding.generation,
+                    phase: binding.phase,
+                    configured: true,
+                    reachable: Some(true),
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    error: None,
+                    local_block: None,
+                    traffic: Some(NicTrafficSample {
+                        epoch: "f".repeat(64),
+                        observed_at: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64,
+                        uploaded_bytes: 600,
+                        downloaded_bytes: 500,
+                    }),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let serving = db.store.cvm_desired("n1").await.unwrap();
+    assert!(!serving.instances.iter().any(|i| i.id == pending.desired.id));
+    let current = serving
+        .instances
+        .iter()
+        .find(|i| i.id == b.desired.id)
+        .unwrap();
+    assert!(current.generation > b.desired.generation);
+    assert!(
+        current.spec.interfaces[1]
+            .allocated
+            .as_ref()
+            .unwrap()
+            .quota_exceeded
+    );
+    let generation = current.generation;
+    assert_eq!(
+        db.store
+            .cvm_instance(&actor_user("alice"), &b.desired.id)
+            .await
+            .unwrap()
+            .revision_id,
+        b.revision_id
+    );
+    let actual: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id=TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        actual as u64, revision,
+        "operational quota does not create an unrelated global revision"
+    );
+    publish_cvm_intent(&db).await;
+    let serving = db.store.cvm_desired("n1").await.unwrap();
+    assert_eq!(
+        serving
+            .instances
+            .iter()
+            .find(|i| i.id == b.desired.id)
+            .unwrap()
+            .generation,
+        generation,
+        "approving the inherited snapshot cannot rewind an approved runtime generation"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_mixed_transport_fallback_does_not_complete_the_requested_release() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    let item = create(&db, "release-fallback-instance-01").await;
+    let mut spec = publication_spec();
+    spec.limits.monthly_bytes = Some(1000);
+    let p = db
+        .store
+        .write_cvm_nic_publication(
+            &system_admin(),
+            None,
+            PublicationWrite {
+                request_id: "fallback-metered-publication-01".into(),
+                expected_revision: 0,
+                spec,
+            },
+        )
+        .await
+        .unwrap();
+    let item = db
+        .store
+        .mount_cvm_nic(
+            &actor_user("alice"),
+            &item.desired.id,
+            mount_request(&item, &p, "release-fallback-mount-01"),
+        )
+        .await
+        .unwrap();
+    acknowledge_guest(&db, &item).await;
+    for node in ["n1", "n2", "n1", "n2"] {
+        acknowledge_network(&db, node).await;
+    }
+    let nic = item.desired.spec.interfaces[1].id.clone();
+    let switch = db
+        .store
+        .change_cvm_nic_transport(
+            &actor_user("alice"),
+            &item.desired.id,
+            &nic,
+            NicTransportChange {
+                request_id: "release-fallback-switch-01".into(),
+                expected_generation: item.desired.generation,
+                transport: TransportKind::Xray,
+                rebuild: false,
+            },
+        )
+        .await
+        .unwrap();
+    acknowledge_guest(&db, &switch).await;
+    let desired = db.store.cvm_nic_desired("n2").await.unwrap();
+    let failed = desired
+        .bindings
+        .iter()
+        .find(|b| b.offer.kind == TransportKind::Xray)
+        .unwrap();
+    db.store
+        .cvm_record_nic_report(
+            "n2",
+            NicNodeReport {
+                generation: desired.generation,
+                diagnostics: None,
+                bindings: vec![NicBindingReport {
+                    id: failed.id.clone(),
+                    side: failed.side,
+                    generation: failed.generation,
+                    phase: failed.phase,
+                    configured: false,
+                    reachable: Some(false),
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    error: Some("test transport cannot connect".into()),
+                    local_block: None,
+                    traffic: None,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let order:i64=sqlx::query_scalar("SELECT id FROM deployments WHERE revision_id=$1 AND kind='config' ORDER BY id DESC LIMIT 1").bind(switch.revision_id.unwrap() as i64).fetch_one(db.pool()).await.unwrap();
+    let detail = db
+        .store
+        .deployment_detail(&system_admin(), order, false)
+        .await
+        .unwrap();
+    assert_eq!(detail.status, "halted");
+    assert_eq!(target_status(db.pool(), order, "n1").await, "failed-dirty");
+    assert!(
+        matches!(
+            db.store.retry_target(&system_admin(), order, "n1").await,
+            Err(StoreError::Unsupported(_))
+        ),
+        "a fallback cannot be reported as successful application of the failed transport"
+    );
+    let desired = db.store.cvm_nic_desired("n1").await.unwrap();
+    db.store
+        .cvm_record_nic_report("n1", cvm_published_report(desired, true))
+        .await
+        .unwrap();
+    let operation:String=sqlx::query_scalar("SELECT o.kind FROM cvm_instances i JOIN cvm_operations o ON o.id=i.desired->>'operation_id' WHERE i.id=$1").bind(&item.desired.id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(operation, "network_traffic_quota");
+    assert!(
+        matches!(
+            db.store.retry_target(&system_admin(), order, "n1").await,
+            Err(StoreError::Unsupported(_))
+        ),
+        "quota generations must not erase the prior transport fallback"
+    );
+    db.store
+        .cancel_deployment(&system_admin(), order)
+        .await
+        .unwrap();
+    let recovered = db
+        .store
+        .cvm_instance(&actor_user("alice"), &item.desired.id)
+        .await
+        .unwrap();
+    acknowledge_guest(&db, &recovered).await;
+    for node in ["n1", "n2", "n1", "n2", "n1", "n2"] {
+        acknowledge_network(&db, node).await;
+    }
+    let stopped = db
+        .store
+        .command_cvm(
+            &actor_user("alice"),
+            &item.desired.id,
+            CvmCommand {
+                request_id: "fallback-compensating-stop-01".into(),
+                expected_generation: recovered.desired.generation,
+                change: CvmChange::Stop,
+            },
+        )
+        .await
+        .unwrap();
+    acknowledge_guest(&db, &stopped).await;
+    for node in ["n1", "n2", "n1", "n2"] {
+        acknowledge_network(&db, node).await;
+    }
+    let status:String=sqlx::query_scalar("SELECT status FROM deployments WHERE revision_id=$1 AND kind='config' ORDER BY id DESC LIMIT 1").bind(stopped.revision_id.unwrap() as i64).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        status, "succeeded",
+        "a new compensating revision must remain publishable"
+    );
+}
+
+async fn cvm_published_mounted(db: &TestPg) -> CvmInstance {
+    setup(db).await;
+    let input: CvmArtifactInput = serde_json::from_str(include_str!(
+        "../../../brocade-cvm-compile/tests/golden/input.json"
+    ))
+    .unwrap();
+    let mut capabilities = catalogue();
+    capabilities.artifact_compiler = Some(CVM_ARTIFACT_COMPILER.into());
+    capabilities.cube_storage_backend = Some("plain".into());
+    capabilities.images[0].sha256 = input.image_manifest.sha256.clone();
+    db.store
+        .cvm_record_inventory(
+            "n1",
+            InventoryReport {
+                capabilities,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    db.store
+        .cvm_record_image_manifest("n1", input.image_manifest)
+        .await
+        .unwrap();
+    let b = create(db, "review-metering-create-01").await;
+    let mut spec = publication_spec();
+    spec.limits.monthly_bytes = Some(1000);
+    let p = db
+        .store
+        .write_cvm_nic_publication(
+            &system_admin(),
+            None,
+            PublicationWrite {
+                request_id: "review-metering-publication-01".into(),
+                expected_revision: 0,
+                spec,
+            },
+        )
+        .await
+        .unwrap();
+    let b = db
+        .store
+        .mount_cvm_nic(
+            &actor_user("alice"),
+            &b.desired.id,
+            mount_request(&b, &p, "review-metering-mount-01"),
+        )
+        .await
+        .unwrap();
+    acknowledge_guest(db, &b).await;
+    for n in ["n1", "n2", "n1", "n2"] {
+        acknowledge_network(db, n).await;
+    }
+    b
+}
+fn cvm_published_report(desired: NicDesired, sample: bool) -> NicNodeReport {
+    NicNodeReport {
+        generation: desired.generation,
+        diagnostics: None,
+        bindings: desired
+            .bindings
+            .into_iter()
+            .map(|b| NicBindingReport {
+                id: b.id,
+                side: b.side,
+                generation: b.generation,
+                phase: b.phase,
+                configured: true,
+                reachable: Some(true),
+                rx_bytes: 0,
+                tx_bytes: 0,
+                error: None,
+                local_block: None,
+                traffic: sample.then(|| NicTrafficSample {
+                    epoch: "f".repeat(64),
+                    observed_at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64,
+                    uploaded_bytes: 600,
+                    downloaded_bytes: 500,
+                }),
+            })
+            .collect(),
+    }
+}
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_published_pending_delete_keeps_metering_serving_binding() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    let b = cvm_published_mounted(&db).await;
+    db.store
+        .command_cvm(
+            &actor_user("alice"),
+            &b.desired.id,
+            CvmCommand {
+                request_id: "review-pending-delete-01".into(),
+                expected_generation: b.desired.generation,
+                change: CvmChange::Delete { delete_data: false },
+            },
+        )
+        .await
+        .unwrap();
+    let serving = db.store.cvm_desired("n1").await.unwrap();
+    assert_eq!(serving.instances[0].power, PowerState::Running);
+    let desired = db.store.cvm_nic_desired("n1").await.unwrap();
+    assert_eq!(desired.bindings[0].phase, BindingPhase::Active);
+    db.store
+        .cvm_record_nic_report("n1", cvm_published_report(desired, true))
+        .await
+        .unwrap();
+    let total: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(uploaded+downloaded),0)::bigint FROM cvm_nic_monthly_usage",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        total, 1100,
+        "an unapproved deletion must not stop accounting for the active data plane"
+    );
+    let serving = db.store.cvm_desired_page("n1", Some(0)).await.unwrap();
+    let running = &serving.instances[0];
+    assert_eq!(running.power, PowerState::Running);
+    assert!(
+        running.spec.interfaces[1]
+            .allocated
+            .as_ref()
+            .unwrap()
+            .quota_exceeded
+    );
+    brocade_cvm_compile::verify(running.artifacts.as_ref().unwrap(), running).unwrap();
+    let network = db.store.cvm_nic_desired("n1").await.unwrap();
+    assert_eq!(network.bindings[0].phase, BindingPhase::Active);
+    assert!(network.bindings[0].nic.quota_exceeded);
+}
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_published_pending_stop_does_not_freeze_monthly_quota_reset() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    let b = cvm_published_mounted(&db).await;
+    let desired = db.store.cvm_nic_desired("n1").await.unwrap();
+    db.store
+        .cvm_record_nic_report("n1", cvm_published_report(desired, true))
+        .await
+        .unwrap();
+    let blocked = db
+        .store
+        .cvm_instance(&actor_user("alice"), &b.desired.id)
+        .await
+        .unwrap();
+    assert!(
+        blocked.desired.spec.interfaces[1]
+            .allocated
+            .as_ref()
+            .unwrap()
+            .quota_exceeded
+    );
+    acknowledge_guest(&db, &blocked).await;
+    for n in ["n1", "n2", "n1", "n2"] {
+        acknowledge_network(&db, n).await;
+    }
+    db.store
+        .command_cvm(
+            &actor_user("alice"),
+            &b.desired.id,
+            CvmCommand {
+                request_id: "review-pending-stop-01".into(),
+                expected_generation: blocked.desired.generation,
+                change: CvmChange::Stop,
+            },
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE cvm_nic_monthly_usage SET period=(date_trunc('month',now() AT TIME ZONE 'UTC')-interval '1 month')::date").execute(db.pool()).await.unwrap();
+    let desired = db.store.cvm_nic_desired("n1").await.unwrap();
+    db.store
+        .cvm_record_nic_report("n1", cvm_published_report(desired, false))
+        .await
+        .unwrap();
+    let latest = db
+        .store
+        .cvm_instance(&actor_user("alice"), &b.desired.id)
+        .await
+        .unwrap();
+    assert!(
+        !latest.desired.spec.interfaces[1]
+            .allocated
+            .as_ref()
+            .unwrap()
+            .quota_exceeded,
+        "live ledger reset must have happened"
+    );
+    let serving = db.store.cvm_desired("n1").await.unwrap();
+    assert_eq!(
+        serving.instances[0].power,
+        PowerState::Running,
+        "draft stop stays unpublished"
+    );
+    assert!(
+        !serving.instances[0].spec.interfaces[1]
+            .allocated
+            .as_ref()
+            .unwrap()
+            .quota_exceeded,
+        "serving guest policy must receive the new month without publishing the stop"
+    );
+    let published_generation = serving.instances[0].generation;
+    assert!(
+        latest.desired.generation > published_generation,
+        "pending intent must stay ahead of the execution already sent to Agent"
+    );
+    let page = db.store.cvm_desired_page("n1", Some(0)).await.unwrap();
+    brocade_cvm_compile::verify(
+        page.instances[0].artifacts.as_ref().unwrap(),
+        &page.instances[0],
+    )
+    .unwrap();
+    publish_cvm_intent(&db).await;
+    let approved = db.store.cvm_desired_page("n1", Some(0)).await.unwrap();
+    assert_eq!(approved.instances[0].power, PowerState::Stopped);
+    assert_eq!(approved.instances[0].generation, latest.desired.generation);
+    brocade_cvm_compile::verify(
+        approved.instances[0].artifacts.as_ref().unwrap(),
+        &approved.instances[0],
+    )
+    .unwrap();
+    acknowledge_guest(&db, &latest).await;
+    for node in ["n1", "n2", "n1", "n2"] {
+        acknowledge_network(&db, node).await;
+    }
+    let status:String=sqlx::query_scalar("SELECT status FROM deployments WHERE revision_id=$1 AND kind='config' ORDER BY id DESC LIMIT 1").bind(latest.revision_id.unwrap() as i64).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(status, "succeeded");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_published_empty_network_receipt_unblocks_next_container_release() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    let b = cvm_published_mounted(&db).await;
+    let deleted = db
+        .store
+        .command_cvm(
+            &actor_user("alice"),
+            &b.desired.id,
+            CvmCommand {
+                request_id: "empty-network-delete-01".into(),
+                expected_generation: b.desired.generation,
+                change: CvmChange::Delete { delete_data: true },
+            },
+        )
+        .await
+        .unwrap();
+    publish_cvm_intent(&db).await;
+    let mut report = guest_evidence(&deleted);
+    report.runtime_id = None;
+    report.network_absent = true;
+    report.volume_deleted = true;
+    report.volume_retained = false;
+    for nic in &mut report.interfaces {
+        nic.attached = false;
+    }
+    db.store.cvm_record_report("n1", report).await.unwrap();
+    let final_network = db.store.cvm_nic_desired("n1").await.unwrap();
+    db.store
+        .cvm_record_nic_report("n1", cvm_published_report(final_network, true))
+        .await
+        .unwrap();
+    let terminal = db
+        .store
+        .cvm_instance(&actor_user("alice"), &deleted.desired.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal.status,
+        ApplyStatus::Applied,
+        "a final traffic sample must not reopen an already deleted instance"
+    );
+    assert_eq!(terminal.desired.generation, deleted.desired.generation);
+    for node in ["n1", "n2", "n1", "n2", "n1", "n2"] {
+        acknowledge_network(&db, node).await;
+    }
+    let evidence:serde_json::Value=sqlx::query_scalar("SELECT observed_after->'cvm' FROM deployment_target_state s JOIN deployments d ON d.id=s.deployment_id WHERE d.revision_id=$1 AND s.node_id='n1' AND d.kind='config'").bind(deleted.revision_id.unwrap() as i64).fetch_one(db.pool()).await.unwrap();
+    assert!(
+        evidence["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == deleted.desired.id),
+        "network cleanup must retain the earlier terminal deletion receipt"
+    );
+    let instance = db
+        .store
+        .create_cvm(
+            &actor_user("alice"),
+            create_request("empty-network-next-create-01"),
+        )
+        .await
+        .unwrap();
+    acknowledge_guest(&db, &instance).await;
+    let desired = db.store.cvm_nic_desired("n1").await.unwrap();
+    assert!(desired.bindings.is_empty() && desired.fences.is_empty());
+    assert!(desired.generation > 0);
+    let id: i64 =
+        sqlx::query_scalar("SELECT id FROM deployments WHERE revision_id=$1 AND kind='config'")
+            .bind(instance.revision_id.unwrap() as i64)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(target_status(db.pool(), id, "n1").await, "converging");
+    db.store
+        .cvm_record_nic_report("n1", cvm_published_report(desired, false))
+        .await
+        .unwrap();
+    assert_eq!(target_status(db.pool(), id, "n1").await, "succeeded");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_published_quota_uses_approved_limit_until_new_nic_version_is_published() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    let b = cvm_published_mounted(&db).await;
+    let interface = &b.desired.spec.interfaces[1];
+    let id = &interface.allocated.as_ref().unwrap().publication_id;
+    let p = db
+        .store
+        .cvm_nic_catalog(&system_admin())
+        .await
+        .unwrap()
+        .publications
+        .into_iter()
+        .find(|p| &p.id == id)
+        .unwrap();
+    let mut spec = p.spec;
+    spec.limits.monthly_bytes = Some(2000);
+    let next = db
+        .store
+        .write_cvm_nic_publication(
+            &system_admin(),
+            Some(&p.id),
+            PublicationWrite {
+                request_id: "quota-pending-limit-publish-01".into(),
+                expected_revision: p.revision,
+                spec,
+            },
+        )
+        .await
+        .unwrap();
+    db.store
+        .update_cvm_nic_versions(
+            &actor_user("alice"),
+            &b.desired.id,
+            NicVersionsChange {
+                request_id: "quota-pending-limit-apply-01".into(),
+                expected_generation: b.desired.generation,
+                updates: vec![NicVersionUpdate {
+                    interface_id: interface.id.clone(),
+                    publication_revision: next.revision,
+                    reallocate: false,
+                    transport: None,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let desired = db.store.cvm_nic_desired("n1").await.unwrap();
+    db.store
+        .cvm_record_nic_report("n1", cvm_published_report(desired, true))
+        .await
+        .unwrap();
+    let serving = db.store.cvm_desired_page("n1", Some(0)).await.unwrap();
+    let approved = serving.instances[0].spec.interfaces[1]
+        .allocated
+        .as_ref()
+        .unwrap();
+    assert_eq!(approved.limits.monthly_bytes, Some(1000));
+    assert!(approved.quota_exceeded);
+    brocade_cvm_compile::verify(
+        serving.instances[0].artifacts.as_ref().unwrap(),
+        &serving.instances[0],
+    )
+    .unwrap();
+    let draft = db
+        .store
+        .cvm_instance(&actor_user("alice"), &b.desired.id)
+        .await
+        .unwrap();
+    let pending = draft.desired.spec.interfaces[1].allocated.as_ref().unwrap();
+    assert_eq!(pending.limits.monthly_bytes, Some(2000));
+    assert!(!pending.quota_exceeded);
+    assert!(
+        db.store.cvm_nic_desired("n1").await.unwrap().bindings[0]
+            .nic
+            .quota_exceeded
+    );
+    publish_cvm_intent(&db).await;
+    let desired = db.store.cvm_desired_page("n1", Some(0)).await.unwrap();
+    assert_eq!(desired.instances[0].generation, draft.desired.generation);
+    assert!(
+        !desired.instances[0].spec.interfaces[1]
+            .allocated
+            .as_ref()
+            .unwrap()
+            .quota_exceeded
+    );
+    let network = db.store.cvm_nic_desired("n1").await.unwrap();
+    let next_binding = network
+        .bindings
+        .iter()
+        .find(|b| b.nic.publication_revision == next.revision)
+        .unwrap();
+    assert!(
+        !next_binding.nic.quota_exceeded,
+        "the newly approved limit applies to the replacement binding"
+    );
+    acknowledge_guest(&db, &draft).await;
+    for node in ["n1", "n2", "n1", "n2", "n1", "n2"] {
+        acknowledge_network(&db, node).await;
+    }
+    let network = db.store.cvm_nic_desired("n1").await.unwrap();
+    assert!(network
+        .bindings
+        .iter()
+        .all(|b| b.nic.publication_revision == next.revision && !b.nic.quota_exceeded));
 }

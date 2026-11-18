@@ -6,67 +6,140 @@ import { DialogClose, DialogLayer } from '../../ui/dialog';
 import { Icon } from '../../ui/icons';
 
 import { GIB, MIB, hasStack, ownerKey, QUERY } from './queries';
-import { CapacityRows, quotaRows } from './cards';
+import { CapacityMeter, quotaRows } from './cards';
 import { NetworkQuotaEditor, networkQuotaStatus } from './network-quota';
 
+const QUOTA_COLUMNS = ['实例', 'vCPU', '内存', '系统盘', '网卡'] as const;
+
+/** 用户多时需要横向比较，按表格排列：每格「已用 / 上限」加细条，接近上限变金色。 */
 export function QuotaList({ workspace }: { workspace: CvmWorkspace }) {
   const [editing, setEditing] = useState<string | null>(null);
   if (!workspace.can_manage_quotas) return null;
   const owners = workspace.owners;
+  const granted = workspace.quotas.filter(quota => quota.enabled).length;
   return (
-    <>
-      {!owners.length && (
+    <section className="cvm-quota-list" aria-label="用户额度清单">
+      <header className="cvm-lane-head">
+        <h2>用户额度</h2>
+        <small>
+          {owners.length} 位用户 · {granted} 位已授权 · 已分配 / 用户上限
+        </small>
+      </header>
+      <p className="note">
+        CPU、内存和系统盘按逻辑分配计入用户额度，额度可高于宿主资源基准。创建和改配仍须满足用户上限。
+      </p>
+      {!owners.length ? (
         <EmptyState icon="users" title="尚无可授权用户">
           创建用户后可在此分配额度。
         </EmptyState>
-      )}
-      <div className="node-card-grid cvm-quota-grid" role="list" aria-label="用户额度">
-        {owners.map(owner => {
-          const key = ownerKey(owner.tenant_id, owner.user_id);
-          const quota = workspace.quotas.find(q => ownerKey(q.tenant_id, q.user_id) === key);
-          return (
-            <article
-              className={`node-card cvm-quota-card tone-${quota?.enabled ? 'ok' : 'idle'}`}
-              role="listitem"
-              key={key}
-            >
-              <div className="node-card-head">
-                <Icon of="users" size={15} />
-                <b className="node-card-name" title={owner.name}>
-                  {owner.name}
-                </b>
-                <span className="cvm-mode">{quota?.enabled ? '已授权' : '未授权'}</span>
-              </div>
-              <p
-                className="cvm-card-sub"
-                title={quota?.allowed_nodes
-                  .map(id => workspace.hosts.find(h => h.node_id === id)?.name ?? id)
-                  .join('、')}
-              >
-                {owner.tenant_id} · {quota?.enabled ? `可用 ${quota.allowed_nodes.length} 台宿主` : '尚未开放创建'}
-              </p>
-              {quota && <CapacityRows rows={quotaRows(workspace, quota)} />}
-              {(workspace.network_quotas ?? [])
-                .filter(q => q.tenant_id === owner.tenant_id && q.user_id === owner.user_id)
-                .map(q => (
-                  <p className="note" key={q.node_id}>
-                    {workspace.hosts.find(host => host.node_id === q.node_id)?.name ?? q.node_id} · 网络{' '}
-                    {q.limits.max_states.toLocaleString('zh-CN')} 条 · {networkQuotaStatus(q)}
-                  </p>
+      ) : (
+        <div className="cvm-tile cvm-quota-roster">
+          <table className="cvm-quota-table" aria-label="用户额度">
+            <thead>
+              <tr>
+                <th>用户</th>
+                <th>可用宿主</th>
+                {QUOTA_COLUMNS.map(label => (
+                  <th key={label}>{label}</th>
                 ))}
-              <footer className="cvm-card-footer">
-                <button className="btn small" onClick={() => setEditing(key)}>
-                  {quota ? '编辑额度' : '授权使用容器'}
-                </button>
-              </footer>
-            </article>
-          );
-        })}
-      </div>
+                <th>网络额度</th>
+                <th>
+                  <span className="cvm-sr">操作</span>
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {owners.map(owner => {
+                const key = ownerKey(owner.tenant_id, owner.user_id);
+                const quota = workspace.quotas.find(q => ownerKey(q.tenant_id, q.user_id) === key);
+                const rows = quota ? quotaRows(workspace, quota) : [];
+                const networks = (workspace.network_quotas ?? []).filter(
+                  q => q.tenant_id === owner.tenant_id && q.user_id === owner.user_id,
+                );
+                return (
+                  <tr key={key} className={`cvm-quota-card${quota?.enabled ? '' : ' off'}`}>
+                    <td>
+                      <span className="cvm-quota-user">
+                        <i aria-hidden="true">{owner.name.slice(0, 1).toUpperCase()}</i>
+                        <span>
+                          <b title={owner.name}>{owner.name}</b>
+                          <small>
+                            {owner.tenant_id}
+                            {quota && !quota.enabled ? ' · 已停用' : ''}
+                          </small>
+                        </span>
+                      </span>
+                    </td>
+                    <td data-label="可用宿主" className="wide">
+                      {quota?.allowed_nodes.length ? (
+                        <span className="cvm-quota-hosts">
+                          {quota.allowed_nodes.map(id => (
+                            <span className="cz-kind" key={id}>
+                              {workspace.hosts.find(h => h.node_id === id)?.name ?? id}
+                            </span>
+                          ))}
+                        </span>
+                      ) : (
+                        <span className="cvm-quota-none">{quota ? '未选择宿主' : '未授权'}</span>
+                      )}
+                    </td>
+                    {QUOTA_COLUMNS.map((label, index) => {
+                      const row = rows[index];
+                      const share = row && row.total > 0 ? row.used / row.total : 0;
+                      return (
+                        <td data-label={label} key={label}>
+                          {row ? (
+                            <span className={`cvm-quota-cell${share >= 0.85 ? ' warn' : ''}`}>
+                              <span>
+                                <b>{row.format(row.used)}</b> / {row.format(row.total)}
+                              </span>
+                              <CapacityMeter used={row.used} total={row.total} />
+                            </span>
+                          ) : (
+                            <span className="cvm-quota-none">—</span>
+                          )}
+                        </td>
+                      );
+                    })}
+                    <td data-label="网络额度" className="wide">
+                      {networks.length ? (
+                        networks.map(q => {
+                          const status = networkQuotaStatus(q);
+                          return (
+                            <span className="cvm-quota-net" key={q.node_id}>
+                              <b
+                                className={
+                                  status.startsWith('已生效') ? 'ok' : status.startsWith('执行失败') ? 'bad' : 'warn'
+                                }
+                              >
+                                {q.limits.max_states.toLocaleString('zh-CN')} 条 · {status}
+                              </b>
+                              <small>
+                                {workspace.hosts.find(host => host.node_id === q.node_id)?.name ?? q.node_id}
+                              </small>
+                            </span>
+                          );
+                        })
+                      ) : (
+                        <span className="cvm-quota-none">—</span>
+                      )}
+                    </td>
+                    <td className="cvm-quota-action">
+                      <button className="btn small" onClick={() => setEditing(key)}>
+                        {quota ? '编辑额度' : '授权使用容器'}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
       {editing !== null && (
         <QuotaDialog key={editing} workspace={workspace} initialOwner={editing} onClose={() => setEditing(null)} />
       )}
-    </>
+    </section>
   );
 }
 
@@ -129,6 +202,7 @@ function QuotaDialog({
         </header>
         <div className="tunnel-dialog-body cvm-dialog-body">
           <fieldset disabled={save.isPending} className="cvm-form-fieldset">
+            <p className="note">用户总额可高于宿主物理容量；超售不会被宿主容量拦截。网络连接额度使用独立预算。</p>
             <div className="cvm-form-grid">
               <label>
                 使用用户

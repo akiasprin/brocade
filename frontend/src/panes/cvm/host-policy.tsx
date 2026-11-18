@@ -1,7 +1,9 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useState } from 'react';
 import { setCvmHostPolicy, type CvmHost, type CvmWorkspace } from '../../api';
 import { ErrorBox } from '../../ui/bits';
-import { Icon } from '../../ui/icons';
+import { ActionMenu } from '../../ui/choice-menu';
+import { NetworkLogsDialog } from './network-logs';
 import { QUERY } from './queries';
 
 function useHostPolicy() {
@@ -35,23 +37,41 @@ function useHostPolicy() {
   });
 }
 
-export function RemoveHost({ host }: { host: CvmHost }) {
+/** 宿主卡的 ⋯ 菜单：查看宿主网络配置日志、移除宿主身份（保留机器的其他功能）。 */
+export function HostMenu({ host, workspace }: { host: CvmHost; workspace: CvmWorkspace }) {
   const change = useHostPolicy();
-  if (!host.can_manage_host) return null;
+  const [logs, setLogs] = useState(false);
+  const items = [
+    ...(workspace.can_manage_network
+      ? [{ label: '网络配置日志', note: 'Agent、Xray 与 Phantun 记录', onSelect: () => setLogs(true) }]
+      : []),
+    ...(host.can_manage_host
+      ? [
+          {
+            label: change.isPending ? '移除中…' : '移除宿主',
+            note: '取消容器宿主身份，保留机器的代理、组网及其他功能',
+            danger: true,
+            disabled: change.isPending,
+            onSelect: () => change.mutate({ host, enabled: false }),
+          },
+        ]
+      : []),
+  ];
   return (
     <>
-      <div className="cvm-card-footer">
-        <button
-          className="btn danger"
-          title="取消容器宿主身份，保留机器的代理、组网及其他功能"
-          disabled={change.isPending}
-          onClick={() => change.mutate({ host, enabled: false })}
-        >
-          <Icon of="trash" size={13} />
-          {change.isPending ? '移除中…' : '移除宿主'}
-        </button>
-      </div>
-      {change.error && <ErrorBox error={change.error} />}
+      {items.length > 0 && <ActionMenu label={`${host.name} 更多操作`} items={items} />}
+      {logs && (
+        <NetworkLogsDialog
+          title="宿主网络配置日志"
+          machines={[{ node_id: host.node_id, name: host.name, role: '计算' }]}
+          onClose={() => setLogs(false)}
+        />
+      )}
+      {change.error && (
+        <div className="cvm-host-foot-error">
+          <ErrorBox error={change.error} />
+        </div>
+      )}
     </>
   );
 }

@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, Row, Transaction};
 
 mod access;
+mod artifacts;
+mod chain_egress;
+pub use artifacts::{CvmArtifactHistory, CvmMutationResult, CvmMutationReview};
+pub use chain_egress::{CvmChainCatalog, CvmChainOption};
+mod baremetal;
 mod host_policy;
 mod instances;
 mod interfaces;
@@ -16,10 +21,12 @@ mod node_state;
 mod operations;
 mod quota;
 mod readings;
+pub(crate) mod releases;
 mod terminal;
 mod types;
 
 use access::*;
+pub use baremetal::CvmAdopt;
 pub use host_policy::HostPolicyUpdate;
 use instances::*;
 use interfaces::*;
@@ -30,7 +37,8 @@ pub use network_quota::{
 };
 pub use nics::{
     CvmEntryAddressUse, CvmEntryBoard, CvmEntryPortUse, CvmEntryPublicationView, CvmEntryState,
-    CvmEntryView, CvmNetworkProvider, CvmNicBindingView, CvmNicCatalog, CvmNicState,
+    CvmEntryView, CvmNetworkLogDomain, CvmNetworkLogs, CvmNetworkNodeLogs, CvmNetworkProvider,
+    CvmNicBindingView, CvmNicCatalog, CvmNicState,
 };
 use operations::*;
 use quota::*;

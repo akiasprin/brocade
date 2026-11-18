@@ -79,3 +79,12 @@ CREATE TABLE ip_maintenance_commands (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY(node_id,request_id)
 );
+
+-- Consolidated per-node public-IP bell preferences.
+-- An absent row inherits the enabled default. This is live presentation policy, never model intent.
+CREATE TABLE node_notification_preferences (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    public_ip_changes BOOLEAN NOT NULL DEFAULT TRUE,
+    changed_by TEXT NOT NULL CHECK (length(btrim(changed_by)) BETWEEN 1 AND 256),
+    changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

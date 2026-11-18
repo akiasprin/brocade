@@ -1,4 +1,4 @@
-//! WireGuard machine-pair tunnels in the root namespace. Devices carry an ownership
+//! WireGuard and Xray machine-pair tunnels in the root namespace. Devices carry an ownership
 //! alias; anything without it is never modified, and owned devices that the desired
 //! state no longer lists are removed together with their policy route.
 use super::*;
@@ -34,66 +34,21 @@ pub(super) fn ensure(
     root: &Path,
     tunnel: &EntryTunnel,
     targets: &BTreeSet<Ipv4Addr>,
+    reply_source: Option<Ipv4Addr>,
     inventory: &[serde_json::Value],
-) -> Result<bool> {
-    for key in [&tunnel.credential, &tunnel.peer_credential] {
-        if STANDARD.decode(key).map_or(true, |key| key.len() != 32) {
-            return Err("invalid WireGuard entry tunnel credentials".into());
-        }
-    }
+) -> Result<(bool, bool)> {
     let dev = plan::device(tunnel);
     let (local, _) = plan::addresses(tunnel).ok_or("invalid entry tunnel slot")?;
-    match inventory.iter().find(|link| link["ifname"] == dev.as_str()) {
-        Some(link) if owned(link) == Some(tunnel.id.as_str()) => {}
-        Some(_) => return Err("入口通道设备名已被其他网卡占用，未修改".into()),
-        None => {
-            ip(&["link", "add", &dev, "type", "wireguard"])?;
-            ip(&[
-                "link",
-                "set",
-                "dev",
-                &dev,
-                "alias",
-                &format!("{ALIAS}{}", tunnel.id),
-            ])?;
+    let connected = if tunnel.offer.kind == TransportKind::Xray {
+        let (configured, connected) = super::super::nics::xray::apply_entry(root, tunnel, targets)?;
+        if !configured {
+            return Ok((false, false));
         }
-    }
-    let directory = root.join("cvm-entries");
-    let config = directory.join(format!("{dev}.conf"));
-    let mut text = format!("[Interface]\nPrivateKey = {}\n", tunnel.credential);
-    // The dialing side keeps the port the kernel chose for it: a configuration without
-    // one would move it on every round and strand the peer's learned endpoint.
-    let port = if tunnel.listens() {
-        Some(tunnel.port.to_string())
+        connected
     } else {
-        run_command("wg", &["show", &dev, "listen-port"])
-            .ok()
-            .map(|port| port.trim().to_owned())
-            .filter(|port| port.parse::<u16>().is_ok_and(|port| port != 0))
+        wireguard(root, tunnel, inventory)?;
+        false
     };
-    if let Some(port) = port {
-        text.push_str(&format!("ListenPort = {port}\n"));
-    }
-    text.push_str(&format!(
-        "\n[Peer]\nPublicKey = {}\nAllowedIPs = 0.0.0.0/0\n",
-        tunnel.peer_credential
-    ));
-    if !tunnel.listens() {
-        text.push_str(&format!(
-            "Endpoint = {}\nPersistentKeepalive = 25\n",
-            std::net::SocketAddr::new(tunnel.offer.endpoint, tunnel.port)
-        ));
-    }
-    atomic_write_private(&config, text.as_bytes())?;
-    run_command(
-        "wg",
-        &[
-            "syncconf",
-            &dev,
-            config.to_str().ok_or("invalid entry tunnel path")?,
-        ],
-    )
-    .map_err(|_| "WireGuard entry tunnel configuration failed")?;
     ip(&["address", "replace", &format!("{local}/30"), "dev", &dev])?;
     ip(&[
         "link",
@@ -104,6 +59,37 @@ pub(super) fn ensure(
         &tunnel.offer.mtu.to_string(),
         "up",
     ])?;
+    if tunnel.side == EntryTunnelSide::Target {
+        let (_, peer) = plan::addresses(tunnel).ok_or("invalid entry tunnel slot")?;
+        let prefix = format!("{peer}/32");
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&ip(&["-4", "-N", "-j", "route", "show", "exact", &prefix])?)
+                .map_err(|_| "invalid native entry reply route inventory")?;
+        if rows
+            .iter()
+            .any(|r| r["dev"] != dev || !(r["protocol"] == "186" || r["protocol"] == 186))
+        {
+            return Err("native entry reply route belongs to another owner".into());
+        }
+        if let Some(source) = reply_source {
+            ip(&[
+                "-4",
+                "route",
+                "replace",
+                &prefix,
+                "dev",
+                &dev,
+                "src",
+                &source.to_string(),
+                "proto",
+                "186",
+            ])?;
+        } else if !rows.is_empty() {
+            ip(&[
+                "-4", "route", "delete", &prefix, "dev", &dev, "proto", "186",
+            ])?;
+        }
+    }
     if tunnel.side == EntryTunnelSide::Entry {
         // Replies come from container addresses the main table does not route here;
         // with src_valid_mark the marked reply validates against this tunnel's table.
@@ -160,16 +146,142 @@ pub(super) fn ensure(
             ])?;
         }
     }
-    let handshakes = run_command("wg", &["show", &dev, "latest-handshakes"])
-        .map_err(|_| "cannot read WireGuard entry tunnel state")?;
+    if tunnel.offer.kind == TransportKind::Xray {
+        return Ok((true, connected));
+    }
+    let handshakes = run_command("wg", &["show", &dev, "latest-handshakes"]).map_err(|error| {
+        super::super::diagnostics::wireguard_error("WireGuard 入口通道状态读取", &error)
+    })?;
+    let transport_connected =
+        tunnel.wireguard_transport.is_udp() || super::phantun::connected(tunnel)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "invalid host clock")?
         .as_secs();
-    Ok(handshakes
-        .lines()
-        .filter_map(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .any(|at| at > 0 && now.saturating_sub(at) < 180))
+    Ok((
+        true,
+        transport_connected
+            && handshakes
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
+                .any(|at| at > 0 && now.saturating_sub(at) < 180),
+    ))
+}
+
+fn wireguard(root: &Path, tunnel: &EntryTunnel, inventory: &[serde_json::Value]) -> Result<()> {
+    for key in [&tunnel.credential, &tunnel.peer_credential] {
+        if STANDARD.decode(key).map_or(true, |key| key.len() != 32) {
+            return Err("invalid WireGuard entry tunnel credentials".into());
+        }
+    }
+    let dev = plan::device(tunnel);
+    match inventory.iter().find(|link| link["ifname"] == dev.as_str()) {
+        Some(link) if owned(link) == Some(tunnel.id.as_str()) => {}
+        Some(_) => return Err("入口通道设备名已被其他网卡占用，未修改".into()),
+        None => {
+            ip(&["link", "add", &dev, "type", "wireguard"])?;
+            ip(&[
+                "link",
+                "set",
+                "dev",
+                &dev,
+                "alias",
+                &format!("{ALIAS}{}", tunnel.id),
+            ])?;
+        }
+    }
+    let adapter = if !tunnel.wireguard_transport.is_udp() && !tunnel.listens() {
+        Some(super::phantun::ensure(root, tunnel, None)?)
+    } else {
+        None
+    };
+    if adapter.as_ref().is_some_and(|adapter| adapter.restarted) {
+        reset_peer(&dev, tunnel)?;
+    }
+    let directory = root.join("cvm-entries");
+    let config = directory.join(format!("{dev}.conf"));
+    let mut text = format!("[Interface]\nPrivateKey = {}\n", tunnel.credential);
+    // The dialing side keeps the port the kernel chose for it: a configuration without
+    // one would move it on every round and strand the peer's learned endpoint.
+    let port = if tunnel.listens() && tunnel.wireguard_transport.is_udp() {
+        Some(tunnel.port.to_string())
+    } else {
+        let port = run_command("wg", &["show", &dev, "listen-port"])
+            .map_err(|error| {
+                super::super::diagnostics::wireguard_error("WireGuard 入口监听端口读取", &error)
+            })?
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| "invalid entry WireGuard socket")?;
+        (port != 0).then(|| port.to_string())
+    };
+    if let Some(port) = port {
+        text.push_str(&format!("ListenPort = {port}\n"));
+    }
+    text.push_str(&format!(
+        "\n[Peer]\nPublicKey = {}\nAllowedIPs = 0.0.0.0/0\n",
+        tunnel.peer_credential
+    ));
+    if !tunnel.listens() {
+        text.push_str(&format!(
+            "Endpoint = {}\nPersistentKeepalive = 25\n",
+            if tunnel.wireguard_transport.is_udp() {
+                std::net::SocketAddr::new(tunnel.offer.endpoint, tunnel.port)
+            } else {
+                adapter
+                    .as_ref()
+                    .ok_or("missing entry Phantun adapter")?
+                    .endpoint
+            }
+        ));
+    }
+    atomic_write_private(&config, text.as_bytes())?;
+    crate::command::run_command_with_input(
+        "wg",
+        &["syncconf", &dev, "/dev/stdin"],
+        text.as_bytes(),
+    )
+    .map_err(|error| {
+        super::super::diagnostics::wireguard_error("WireGuard 入口通道配置", &error)
+    })?;
+    if tunnel.wireguard_transport == EntryWireguardTransport::Phantun && tunnel.listens() {
+        ip(&["link", "set", "dev", &dev, "up"])?;
+        let port: u16 = run_command("wg", &["show", &dev, "listen-port"])
+            .map_err(|error| {
+                super::super::diagnostics::wireguard_error("WireGuard 入口监听端口读取", &error)
+            })?
+            .trim()
+            .parse()
+            .map_err(|_| "invalid entry WireGuard socket")?;
+        if super::phantun::ensure(root, tunnel, Some(port))?.restarted {
+            reset_peer(&dev, tunnel)?;
+            run_command(
+                "wg",
+                &[
+                    "set",
+                    &dev,
+                    "peer",
+                    &tunnel.peer_credential,
+                    "allowed-ips",
+                    "0.0.0.0/0",
+                ],
+            )
+            .map_err(|error| {
+                super::super::diagnostics::wireguard_error("WireGuard 入口对端更新", &error)
+            })?;
+        }
+    }
+    Ok(())
+}
+/// A replacement Phantun adapter has a new UDP socket. Reset this peer exactly once
+/// so stale crypto/loopback state cannot masquerade as a working replacement path.
+fn reset_peer(dev: &str, tunnel: &EntryTunnel) -> Result<()> {
+    run_command(
+        "wg",
+        &["set", dev, "peer", &tunnel.peer_credential, "remove"],
+    )
+    .map(|_| ())
+    .map_err(|error| super::super::diagnostics::wireguard_error("WireGuard 入口对端重置", &error))
 }
 
 /// Removes owned tunnel devices and policy rules the desired state no longer lists.

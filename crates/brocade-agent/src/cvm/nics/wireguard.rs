@@ -47,9 +47,7 @@ pub(super) fn apply(root: &Path, binding: &NicBinding) -> Result<LinkObservation
         "set".into(),
         device.clone(),
         "private-key".into(),
-        path.to_str()
-            .ok_or("invalid private WireGuard key path")?
-            .into(),
+        "/dev/stdin".into(),
         "listen-port".into(),
         binding.port.to_string(),
         "fwmark".into(),
@@ -67,7 +65,10 @@ pub(super) fn apply(root: &Path, binding: &NicBinding) -> Result<LinkObservation
             "25".into(),
         ]);
     }
-    host::ns_command(&ns, &args).map_err(|_| "WireGuard binding configuration failed")?;
+    host::ns_command_with_input(&ns, &args, format!("{}\n", binding.credential).as_bytes())
+        .map_err(|error| {
+            super::super::diagnostics::wireguard_error("WireGuard 出口网卡配置", &error)
+        })?;
     host::ns_ip(
         &ns,
         &[
@@ -89,7 +90,10 @@ pub(super) fn apply(root: &Path, binding: &NicBinding) -> Result<LinkObservation
             device.clone(),
             "latest-handshakes".into(),
         ],
-    )?;
+    )
+    .map_err(|error| {
+        super::super::diagnostics::wireguard_error("WireGuard 出口网卡状态读取", &error)
+    })?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "invalid host clock")?

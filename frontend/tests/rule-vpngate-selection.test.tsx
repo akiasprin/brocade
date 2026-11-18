@@ -18,6 +18,12 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+// These tests isolate forwarding and tunnel edits; validation has its own HTTP/DB suite.
+vi.mock('../src/api/geodata', async importOriginal => ({
+  ...(await importOriginal<typeof import('../src/api/geodata')>()),
+  validateDraft: vi.fn(async () => ({ valid: true })),
+}));
+
 const countries = [
   {
     country_code: 'JP',

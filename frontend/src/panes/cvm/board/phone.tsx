@@ -1,17 +1,21 @@
 // 手机：拖线不适合触屏，按宿主分组列出每个容器的入口与出口芯片；点容器打开实例详情。
-import type { CvmEntryBoard, CvmInstance, CvmWorkspace } from '../../../api';
+import type { CvmChainCatalog, CvmEntryBoard, CvmInstance, CvmWorkspace } from '../../../api';
+import { RegionFlag } from '../../../ui/region-flag';
 import { navigate } from '../../../forge/route';
+import { NetworkLogsButton } from '../network-logs';
 import { stackHosts } from '../queries';
 import { entryText, isDefault, type ExitTile, type RuleLink } from './model';
 
 export function PhoneBoard({
   workspace,
+  chains,
   instances,
   entries,
   exits,
   rules,
 }: {
   workspace: CvmWorkspace;
+  chains: CvmChainCatalog | undefined;
   instances: CvmInstance[];
   entries: CvmEntryBoard;
   exits: ExitTile[];
@@ -26,6 +30,34 @@ export function PhoneBoard({
           <section key={host.node_id} className="cz-phone-host" aria-label={host.name}>
             <header>
               <b>{host.name}</b>
+              <NetworkLogsButton
+                iconOnly
+                title="网络配置日志"
+                allowed={workspace.can_manage_network}
+                machines={[
+                  { node_id: host.node_id, name: host.name, role: '计算' },
+                  ...entries.entries
+                    .filter(e => here.some(i => i.desired.id === e.instance_id))
+                    .map(e => ({
+                      node_id: e.provider_node,
+                      name: workspace.hosts.find(h => h.node_id === e.provider_node)?.name,
+                      role: '入口',
+                    })),
+                  ...here.flatMap(i =>
+                    i.desired.spec.interfaces.flatMap(n =>
+                      n.allocated
+                        ? [
+                            {
+                              node_id: n.allocated.provider_node,
+                              name: workspace.hosts.find(h => h.node_id === n.allocated?.provider_node)?.name,
+                              role: '出口',
+                            },
+                          ]
+                        : [],
+                    ),
+                  ),
+                ]}
+              />
               {!host.fresh && <small>离线</small>}
             </header>
             {here.map(instance => {
@@ -61,18 +93,25 @@ export function PhoneBoard({
                     {[
                       ...new Map(
                         links.map(link => {
-                          const text = `${exits.find(item => item.id === link.exit)?.provider ?? '网卡'} · ${
+                          const text = `${(link.route.chain_id && chains?.chains.find(c => c.id === link.route.chain_id)?.name) || exits.find(item => item.id === link.exit)?.provider || '网卡'} · ${
                             link.route.service
                               ? `${link.route.service.protocol}/${link.route.service.port_start}`
                               : isDefault(link.route.destination)
                                 ? '默认'
                                 : '网段'
                           }`;
-                          return [text, link.layer] as const;
+                          return [
+                            text,
+                            {
+                              layer: link.layer,
+                              country: chains?.chains.find(c => c.id === link.route.chain_id)?.country,
+                            },
+                          ] as const;
                         }),
                       ),
-                    ].map(([text, layer]) => (
+                    ].map(([text, { layer, country }]) => (
                       <span key={text} className={`cz-chip ${layer}`}>
+                        <RegionFlag code={country} />
                         {text}
                       </span>
                     ))}

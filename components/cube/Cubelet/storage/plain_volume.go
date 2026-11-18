@@ -51,14 +51,10 @@ func commitPlainInitialization(path, name string, size uint64) error {
 		return err
 	}
 	defer file.Close()
-	// mkfs must not turn a promised physical allocation into sparse holes.
-	if err := unix.Fallocate(int(file.Fd()), 0, 0, int64(size)); err != nil {
-		return err
-	}
 	if err := file.Sync(); err != nil {
 		return err
 	}
-	data, err := json.Marshal(plainInitialization{Format: "brocade-plain-initialized-v1", Name: name, Size: size, Inode: stat.Ino})
+	data, err := json.Marshal(plainInitialization{Format: "brocade-plain-initialized-v2", Name: name, Size: size, Inode: stat.Ino})
 	if err != nil {
 		return err
 	}
@@ -94,9 +90,6 @@ func checkPlainInitialization(path, name string, size uint64) error {
 		return err
 	}
 	defer file.Close()
-	if uint64(stat.Blocks)*512 < size {
-		return fmt.Errorf("plain volume physical reservation is incomplete")
-	}
 	receipt := filepath.Join(filepath.Dir(path), ".initialized")
 	f, err := os.OpenFile(receipt, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
@@ -116,8 +109,13 @@ func checkPlainInitialization(path, name string, size uint64) error {
 		return fmt.Errorf("invalid plain volume initialization receipt")
 	}
 	var r plainInitialization
-	if json.Unmarshal(data, &r) != nil || r.Format != "brocade-plain-initialized-v1" || r.Name != name || r.Size != size || r.Inode != stat.Ino {
+	if json.Unmarshal(data, &r) != nil || (r.Format != "brocade-plain-initialized-v1" && r.Format != "brocade-plain-initialized-v2") || r.Name != name || r.Size != size || r.Inode != stat.Ino {
 		return fmt.Errorf("plain volume initialization receipt does not match the original disk")
+	}
+	// A v1 receipt promised full physical allocation; retain that check for old
+	// disks. A v2 receipt proves formatting and identity, with sparse capacity.
+	if r.Format == "brocade-plain-initialized-v1" && uint64(stat.Blocks)*512 < size {
+		return fmt.Errorf("plain volume physical reservation is incomplete")
 	}
 	return nil
 }

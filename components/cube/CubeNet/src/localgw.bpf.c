@@ -13,6 +13,7 @@
 #include "tcp.h"
 #include "tcp_reset.h"
 #include "primary_delivery.h"
+#include "primary_chain_reply.h"
 
 /* Update a CubeEgress TCP session from the original reply tuple before DNAT
  * rewrites the sandbox-assigned destination address to mvm_inner_ip. A missing
@@ -73,6 +74,8 @@ int from_envoy(struct __sk_buff *skb)
 	struct iphdr *l3;
 	long err;
 	int ret;
+	if (skb->protocol == bpf_htons(ETH_P_IPV6))
+		return primary_chain_reply6(skb);
 
 	if (skb->protocol != bpf_htons(ETH_P_IP))
 		return TC_ACT_OK;

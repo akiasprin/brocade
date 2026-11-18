@@ -49,6 +49,18 @@ pub(crate) async fn set_policy_tx(
     if node_id.is_empty() {
         return Err(StoreError::InvalidData("node id 不能为空".to_owned()));
     }
+    if resolution.is_some() {
+        let issues = brocade_core::rule_validation::validate_rules(
+            &[brocade_core::model::Rule {
+                dest_match: selector.clone(),
+                action: brocade_core::model::Action::Block,
+            }],
+            &format!("dns/{node_id}"),
+        );
+        if !issues.is_empty() {
+            return Err(StoreError::RuleValidation(issues));
+        }
+    }
     let selector = canonical_selector(&selector).ok_or_else(|| {
         StoreError::InvalidData(
             "机器 DNS 策略只支持域名后缀、域名关键词、域名正则和 Geosite".to_owned(),

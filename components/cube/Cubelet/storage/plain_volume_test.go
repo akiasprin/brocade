@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,7 +20,7 @@ import (
 
 func plainTestEngine(t *testing.T, root string) *cubecow.Engine {
 	t.Helper()
-	data, _ := json.Marshal(map[string]any{"log": map[string]any{}, "backend": map[string]any{"kind": "plain", "plain": map[string]any{"root_dir": root, "reserve_bytes": 0}}})
+	data, _ := json.Marshal(map[string]any{"log": map[string]any{}, "backend": map[string]any{"kind": "plain", "plain": map[string]any{"root_dir": root, "reserve_bytes": 0, "thin_provision": true}}})
 	engine, err := cubecow.InitWithoutLoggingFromJSON(string(data))
 	if err != nil {
 		t.Fatal(err)
@@ -36,7 +37,8 @@ func TestPlainInitializationAndOriginalDiskBinding(t *testing.T) {
 	old := initPlainMediumDevice
 	defer func() { initPlainMediumDevice = old }()
 	formats := 0
-	// Simulate mkfs changing the physical extent layout; commit restores the full reservation.
+	// Formatting may discard unused blocks. A confirmed sparse disk must retain
+	// its content and inode instead of forcing a physical reservation afterward.
 	initPlainMediumDevice = func(path string) error {
 		formats++
 		f, err := os.OpenFile(path, os.O_WRONLY, 0)
@@ -55,6 +57,30 @@ func TestPlainInitializationAndOriginalDiskBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err = checkPlainInitialization(volume.FilePath, volume.VolumeName, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := os.Stat(volume.FilePath)
+	if err != nil || metadata.Sys().(*syscall.Stat_t).Blocks*512 >= 1<<20 {
+		t.Fatal("thin initialization reserved the whole logical disk")
+	}
+	receiptPath := filepath.Join(filepath.Dir(volume.FilePath), ".initialized")
+	receipt, err := os.ReadFile(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy plainInitialization
+	if err = json.Unmarshal(receipt, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacy.Format = "brocade-plain-initialized-v1"
+	legacyData, _ := json.Marshal(legacy)
+	if err = os.WriteFile(receiptPath, legacyData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = checkPlainInitialization(volume.FilePath, volume.VolumeName, 1<<20); err == nil {
+		t.Fatal("legacy physical promise was ignored")
+	}
+	if err = os.WriteFile(receiptPath, receipt, 0600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = manager.CreateDefaultMediumVolume(ctx, "test", "root", 1<<20); err != nil || formats != 1 {
@@ -129,6 +155,9 @@ func TestPlainConfigurationSelectsIndependentPool(t *testing.T) {
 	backend := data["backend"].(map[string]any)
 	if backend["kind"] != "plain" || backend["plain"].(map[string]any)["reserve_bytes"] != float64(12345) {
 		t.Fatalf("wrong engine configuration: %s", payload)
+	}
+	if backend["plain"].(map[string]any)["thin_provision"] != true {
+		t.Fatal("managed plain pool is not thin provisioned")
 	}
 	local := &local{config: cfg, cowManager: &XfsCow{backend: cow.BackendPlain}}
 	if _, err = local.storeForBackend(cow.BackendXFS); err == nil {

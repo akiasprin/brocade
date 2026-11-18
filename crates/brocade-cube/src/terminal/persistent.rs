@@ -9,36 +9,26 @@ use tokio::{
     net::UnixStream,
 };
 
+pub trait TerminalTarget: Send + Sync + 'static {
+    fn validate(&self, target: &wire::Target, opening: bool) -> Result<()>;
+}
+impl TerminalTarget for Inner {
+    fn validate(&self, target: &wire::Target, opening: bool) -> Result<()> {
+        let launch = self.terminal_identity(target, opening)?;
+        if opening {
+            Ok(())
+        } else {
+            self.terminal_runtime(target, &launch)
+        }
+    }
+}
 impl Backend {
     pub fn persistent_terminal(&self, offer: wire::Offer) -> Result<TerminalSession> {
-        if !wire::valid_session(&offer.session_id)
-            || !wire::valid_session(&offer.owner)
-            || offer
-                .terminal_id
-                .as_deref()
-                .is_some_and(|id| !wire::valid_session(id))
-        {
-            return Err("invalid persistent terminal identity".into());
-        }
-        let inner = self.inner().clone();
-        inner.terminal_identity(&offer.target, true)?;
-        let (input, commands) = tokio::sync::mpsc::channel(4);
-        let (events, output) = tokio::sync::mpsc::channel(2);
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let stop = cancelled.clone();
-        let worker = inner.clone();
-        inner.runtime.spawn(async move {
-            if let Err(error) = run(worker, offer, commands, &events, stop).await {
-                let _ = events.try_send(TerminalEvent::Output(wire::Output::Error {
-                    message: error,
-                }));
-            }
-        });
-        Ok(TerminalSession {
-            input,
-            output,
-            cancelled,
-        })
+        connect_terminal(
+            self.inner().runtime.handle().clone(),
+            self.inner().clone(),
+            offer,
+        )
     }
 
     /// Revokes only Shim-managed terminals; unrelated Guest programs are not selected.
@@ -90,8 +80,64 @@ impl Backend {
     }
 }
 
+pub fn connect_terminal(
+    runtime: tokio::runtime::Handle,
+    target: Arc<dyn TerminalTarget>,
+    offer: wire::Offer,
+) -> Result<TerminalSession> {
+    if !wire::valid_session(&offer.session_id)
+        || !wire::valid_session(&offer.owner)
+        || offer
+            .terminal_id
+            .as_deref()
+            .is_some_and(|id| !wire::valid_session(id))
+    {
+        return Err("invalid persistent terminal identity".into());
+    }
+    target.validate(&offer.target, true)?;
+    let (input, commands) = tokio::sync::mpsc::channel(4);
+    let (events, output) = tokio::sync::mpsc::channel(2);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let stop = cancelled.clone();
+    runtime.spawn(async move {
+        if let Err(error) = run(target, offer, commands, &events, stop).await {
+            let _ = events.try_send(TerminalEvent::Output(wire::Output::Error {
+                message: error,
+            }));
+        }
+    });
+    Ok(TerminalSession {
+        input,
+        output,
+        cancelled,
+    })
+}
+
+pub async fn revoke_terminal(runtime_id: &str, through_revision: u64) -> Result<()> {
+    let path = Path::new(cube_terminal::ROOT).join(cube_terminal::socket_name(runtime_id));
+    if !path
+        .try_exists()
+        .map_err(|_| "cannot inspect terminal endpoint")?
+    {
+        return Ok(());
+    }
+    accepted(
+        call(
+            &path,
+            &Request {
+                version: cube_terminal::VERSION,
+                owner: "0".repeat(64),
+                incarnation: "0".repeat(64),
+                policy_revision: 0,
+                operation: Operation::Revoke { through_revision },
+            },
+        )
+        .await?,
+    )
+}
+
 async fn run(
-    inner: Arc<Inner>,
+    inner: Arc<dyn TerminalTarget>,
     offer: wire::Offer,
     mut commands: tokio::sync::mpsc::Receiver<TerminalCommand>,
     events: &tokio::sync::mpsc::Sender<TerminalEvent>,
@@ -183,8 +229,7 @@ async fn run(
                 _ = validate.tick() => {
                     let worker = inner.clone(); let target = offer.target.clone();
                     tokio::task::spawn_blocking(move || {
-                        let launch = worker.terminal_identity(&target, false)?;
-                        worker.terminal_runtime(&target, &launch)
+                        worker.validate(&target, false)
                     }).await.map_err(|_| "terminal validation task failed")??;
                 }
                 command = commands.recv() => {

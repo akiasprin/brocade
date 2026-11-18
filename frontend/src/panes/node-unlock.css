@@ -4,6 +4,21 @@
   flex-direction: column;
   gap: 16px;
   margin: 2px 0 6px;
+  animation: motion-surface-mount 240ms var(--motion-ease-out) backwards;
+}
+.unlock-bar,
+.unlock-nothing,
+.unlock-body .unlock-b-row {
+  animation: motion-surface-mount 240ms var(--motion-ease-out) backwards;
+}
+.unlock-body .unlock-b-row:nth-child(2) {
+  animation-delay: 40ms;
+}
+.unlock-body .unlock-b-row:nth-child(3) {
+  animation-delay: 80ms;
+}
+.unlock-body .unlock-b-row:nth-child(n + 4) {
+  animation-delay: 120ms;
 }
 .unlock-bar {
   display: flex;

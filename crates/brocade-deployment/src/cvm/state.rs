@@ -20,6 +20,10 @@ pub enum ApplyStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceDesired {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<CvmArtifactBundle>,
+    #[serde(default, skip_serializing_if = "is_shadow")]
+    pub artifact_mode: CvmArtifactMode,
     /// Instance-scoped cleanup assignments; not part of the immutable specification.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detached_interfaces: Vec<String>,
@@ -38,6 +42,12 @@ pub struct InstanceDesired {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesiredState {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chain_clients: Vec<ChainClientArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
     pub instances: Vec<InstanceDesired>,
 }
 
@@ -53,6 +63,8 @@ pub struct InterfaceObservation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkObservation {
     #[serde(default)]
+    pub chain_egress_configured: bool,
+    #[serde(default)]
     pub routing_revision: u64,
     pub contact_route_preserved: bool,
     pub business_fallback_blocked: bool,
@@ -62,6 +74,12 @@ pub struct NetworkObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceReport {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chain_egress: Vec<ChainClientReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<CvmArtifactReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostEvidence>,
     pub restart_epoch: u64,
     pub reinstall_epoch: u64,
     pub id: String,
@@ -105,11 +123,22 @@ impl InstanceReport {
             return Err("CVM detached interface evidence is invalid".into());
         }
         if self.interfaces.len() > MAX_INTERFACES
+            || self.chain_egress.len() > 256
             || self.error.as_ref().is_some_and(|e| e.len() > 500)
             || self.runtime_id.as_ref().is_some_and(|x| x.len() > 150)
             || self.volume_id.as_ref().is_some_and(|x| x.len() > 150)
         {
             return Err("CVM report exceeds its limits".into());
+        }
+        let mut chains = BTreeSet::new();
+        if self.chain_egress.iter().any(|c| {
+            !valid_id(&c.chain_id)
+                || !valid_digest(&c.sha256)
+                || !valid_digest(&c.guard_sha256)
+                || !chains.insert(&c.chain_id)
+                || c.error.as_ref().is_some_and(|e| e.len() > 500)
+        }) {
+            return Err("CVM chain client evidence is invalid".into());
         }
         if self
             .access_address
@@ -141,6 +170,56 @@ impl InstanceReport {
         if self.error.is_some() || self.power != Some(desired.power) {
             return Err("Applied CVM report has an error or wrong power state".into());
         }
+        if let Some(identity) = desired.spec.execution.host_identity() {
+            let evidence = self
+                .host
+                .as_ref()
+                .ok_or("bare-metal report lacks host evidence")?;
+            evidence.validate()?;
+            if &evidence.identity != identity
+                || desired.spec.image.is_some()
+                || desired.delete_data
+                || desired.restart_epoch != 0
+                || desired.reinstall_epoch != 0
+                || self.volume_id.is_some()
+                || self.volume_retained
+                || self.volume_deleted
+            {
+                return Err("bare-metal report has wrong host or VM storage evidence".into());
+            }
+            return match desired.power {
+                PowerState::Running
+                    if self.runtime_id.as_deref()
+                        == Some(
+                            format!(
+                                "host-{}-{}",
+                                &brocade_core::hash::sha256_hex(desired.id.as_bytes())[..16],
+                                evidence.boot_id
+                            )
+                            .as_str(),
+                        )
+                        && desired.spec.interfaces.iter().all(|n| {
+                            self.interfaces.iter().any(|a| a.id == n.id && a.attached)
+                        }) =>
+                {
+                    self.validate_running_network(desired)
+                }
+                PowerState::Deleted
+                    if self.network_absent
+                        && self.runtime_id.is_none()
+                        && self.access_address.is_none()
+                        && self.interfaces.is_empty() =>
+                {
+                    Ok(())
+                }
+                _ => Err(
+                    "bare-metal binding is not proven or requests unsupported power control".into(),
+                ),
+            };
+        }
+        if self.host.is_some() {
+            return Err("Cube report contains bare-metal evidence".into());
+        }
         if self.volume_deleted && self.volume_retained {
             return Err("CVM volume cannot be both retained and deleted".into());
         }
@@ -168,78 +247,93 @@ impl InstanceReport {
                 return Err("CVM stop lacks runtime, network or retained volume evidence".into());
             }
             if desired.power == PowerState::Running {
-                if self.runtime_id.as_ref().is_none_or(|x| x.is_empty())
-                    || self.interfaces.len() != desired.spec.interfaces.len()
-                    || desired.spec.interfaces.iter().any(|x| {
-                        !self.interfaces.iter().any(|a| {
-                            a.id == x.id
-                                && a.attached
-                                && !a.device.is_empty()
-                                && !a.addresses.is_empty()
-                        })
-                    })
-                {
-                    return Err("CVM running report lacks actual Guest interface evidence".into());
-                }
-                if desired
-                    .spec
-                    .interfaces
-                    .iter()
-                    .any(|nic| nic.connection.purpose == InterfacePurpose::Business)
-                {
-                    let network = self.network.as_ref().ok_or("业务网卡缺少路由隔离回执")?;
-                    let default_v4 = desired.spec.routing.default_interface(true);
-                    let default_v6 = desired.spec.routing.default_interface(false);
-                    if !network.contact_route_preserved
-                        || !network.business_fallback_blocked
-                        || network.routing_revision != desired.spec.routing.revision
-                        || network.default_ipv4_interface.as_deref() != default_v4
-                        || network.default_ipv6_interface.as_deref() != default_v6
-                    {
-                        return Err("业务出口或联络路由隔离尚未确认".into());
-                    }
-                    for nic in &desired.spec.interfaces {
-                        if let Some(assigned) = &nic.allocated {
-                            let observed = self
-                                .interfaces
-                                .iter()
-                                .find(|n| n.id == nic.id)
-                                .ok_or("allocated NIC is missing")?;
-                            if !observed.mac.eq_ignore_ascii_case(&assigned.mac)
-                                || [assigned.ipv4, assigned.ipv6]
-                                    .into_iter()
-                                    .flatten()
-                                    .any(|ip| {
-                                        !observed.addresses.iter().any(|a| {
-                                            a.split('/').next().is_some_and(|a| {
-                                                a.parse::<std::net::IpAddr>().ok() == Some(ip)
-                                            })
-                                        })
+                self.validate_running_network(desired)?;
+            }
+        }
+        Ok(())
+    }
+    fn validate_running_network(&self, desired: &InstanceDesired) -> Result<(), String> {
+        if self.runtime_id.as_ref().is_none_or(|x| x.is_empty())
+            || self.interfaces.len() != desired.spec.interfaces.len()
+            || desired.spec.interfaces.iter().any(|x| {
+                !self.interfaces.iter().any(|a| {
+                    a.id == x.id && a.attached && !a.device.is_empty() && !a.addresses.is_empty()
+                })
+            })
+        {
+            return Err("CVM running report lacks actual Guest interface evidence".into());
+        }
+        if !desired.spec.routing.chain_ids().is_empty()
+            && self.network.as_ref().is_none_or(|n| {
+                !n.chain_egress_configured || n.routing_revision != desired.spec.routing.revision
+            })
+        {
+            return Err("主网卡线路出口尚无对应版本的阻断与选路回执".into());
+        }
+        if desired
+            .spec
+            .interfaces
+            .iter()
+            .any(|nic| nic.connection.purpose == InterfacePurpose::Business)
+        {
+            let network = self.network.as_ref().ok_or("业务网卡缺少路由隔离回执")?;
+            let default_v4 = desired.spec.routing.default_interface(true);
+            let default_v6 = desired.spec.routing.default_interface(false);
+            if !network.contact_route_preserved
+                || !network.business_fallback_blocked
+                || network.routing_revision != desired.spec.routing.revision
+                || network.default_ipv4_interface.as_deref() != default_v4
+                || network.default_ipv6_interface.as_deref() != default_v6
+            {
+                return Err("业务出口或联络路由隔离尚未确认".into());
+            }
+            for nic in &desired.spec.interfaces {
+                if let Some(assigned) = &nic.allocated {
+                    let observed = self
+                        .interfaces
+                        .iter()
+                        .find(|n| n.id == nic.id)
+                        .ok_or("allocated NIC is missing")?;
+                    if !observed.mac.eq_ignore_ascii_case(&assigned.mac)
+                        || [assigned.ipv4, assigned.ipv6]
+                            .into_iter()
+                            .flatten()
+                            .any(|ip| {
+                                !observed.addresses.iter().any(|a| {
+                                    a.split('/').next().is_some_and(|a| {
+                                        a.parse::<std::net::IpAddr>().ok() == Some(ip)
                                     })
-                            {
-                                return Err("Guest NIC does not match Store allocation".into());
-                            }
-                            for address in &observed.addresses {
-                                let ip = address
-                                    .split('/')
-                                    .next()
-                                    .and_then(|value| value.parse::<std::net::IpAddr>().ok())
-                                    .ok_or("invalid allocated NIC observation")?;
-                                if matches!(ip,std::net::IpAddr::V6(ip) if ip.is_unicast_link_local())
-                                {
-                                    continue;
-                                }
-                                if ![assigned.ipv4, assigned.ipv6].contains(&Some(ip)) {
-                                    return Err("Guest NIC retains an address outside its current allocation".into());
-                                }
-                            }
+                                })
+                            })
+                    {
+                        return Err("Guest NIC does not match Store allocation".into());
+                    }
+                    for address in &observed.addresses {
+                        let ip = address
+                            .split('/')
+                            .next()
+                            .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+                            .ok_or("invalid allocated NIC observation")?;
+                        if matches!(ip,std::net::IpAddr::V6(ip) if ip.is_unicast_link_local()) {
+                            continue;
+                        }
+                        if ![assigned.ipv4, assigned.ipv6].contains(&Some(ip)) {
+                            return Err(
+                                "Guest NIC retains an address outside its current allocation"
+                                    .into(),
+                            );
                         }
                     }
                 }
             }
         }
+
         Ok(())
     }
+}
+
+fn is_shadow(value: &CvmArtifactMode) -> bool {
+    *value == CvmArtifactMode::Shadow
 }
 
 #[cfg(test)]

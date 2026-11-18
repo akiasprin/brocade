@@ -18,6 +18,7 @@ use std::{
 };
 
 mod chatgpt;
+mod claude;
 mod connections;
 mod ipv6;
 mod media;
@@ -450,6 +451,23 @@ fn request_deadline(deadline: Instant, proxy: Option<&ProbeContext>) -> Instant 
 }
 
 fn get(url: &str, deadline: Instant, proxy: Option<&ProbeContext>) -> Result<Page, UnlockCode> {
+    get_with_redirects(url, deadline, proxy, true)
+}
+
+fn get_without_redirects(
+    url: &str,
+    deadline: Instant,
+    proxy: Option<&ProbeContext>,
+) -> Result<Page, UnlockCode> {
+    get_with_redirects(url, deadline, proxy, false)
+}
+
+fn get_with_redirects(
+    url: &str,
+    deadline: Instant,
+    proxy: Option<&ProbeContext>,
+    follow_redirects: bool,
+) -> Result<Page, UnlockCode> {
     // DNS/evidence, redirects, TLS and the complete body share the bounded request
     // budget. All chains get ten seconds; direct checks keep three seconds.
     let deadline = request_deadline(deadline, proxy);
@@ -552,7 +570,7 @@ fn get(url: &str, deadline: Instant, proxy: Option<&ProbeContext>) -> Result<Pag
                     request_error_code(&error, proxy)
                 }
             })?;
-        if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+        if follow_redirects && matches!(response.status, 301 | 302 | 303 | 307 | 308) {
             let location = response
                 .header("location")
                 .ok_or(UnlockCode::UnrecognizedResponse)?;
@@ -1106,6 +1124,9 @@ fn check(
     if service == UnlockService::Chatgpt {
         return Ok(chatgpt::once(deadline, proxy));
     }
+    if service == UnlockService::Claude {
+        return claude::detect(deadline, proxy);
+    }
     if service == UnlockService::Tiktok {
         return tiktok(deadline, proxy);
     }
@@ -1113,13 +1134,13 @@ fn check(
         return outcome;
     }
     let url = match service {
-        UnlockService::Claude => "https://claude.ai/",
         UnlockService::Gemini => "https://gemini.google.com/",
         UnlockService::DisneyPlus => "https://www.disneyplus.com/",
         UnlockService::Tiktok => "https://www.tiktok.com/",
         UnlockService::PrimeVideo => "https://www.primevideo.com/",
         UnlockService::Reddit => "https://www.reddit.com/",
         UnlockService::Chatgpt
+        | UnlockService::Claude
         | UnlockService::Netflix
         | UnlockService::YoutubePremium
         | UnlockService::Spotify
@@ -1130,7 +1151,7 @@ fn check(
         | UnlockService::ParamountPlus => unreachable!(),
     };
     let page = get(url, deadline, proxy)?;
-    let mut outcome = if service == UnlockService::Reddit {
+    let outcome = if service == UnlockService::Reddit {
         reddit(&page)
     } else {
         parse(
@@ -1140,13 +1161,6 @@ fn check(
             page.url.as_str(),
         )
     };
-    let trace = match service {
-        UnlockService::Claude => Some("https://claude.ai/cdn-cgi/trace"),
-        _ => None,
-    };
-    if let Some(trace) = trace {
-        outcome.region = trace_region(trace, deadline, proxy);
-    }
     Ok(outcome)
 }
 
@@ -1207,6 +1221,9 @@ fn parse(service: UnlockService, status: u16, body: &str, url: &str) -> UnlockRe
     use UnlockCode as C;
     use UnlockService as S;
     use UnlockStatus as U;
+    if service == S::Claude {
+        return claude::parse(status, body);
+    }
     let original_body = body;
     let body = body.replace("\\\"", "\"").replace("&quot;", "\"");
     let lower = body.to_ascii_lowercase();
@@ -1331,12 +1348,6 @@ fn parse(service: UnlockService, status: u16, body: &str, url: &str) -> UnlockRe
                     .iter()
                     .any(|key| v.get(key).and_then(|v| v.as_bool()).is_some())
                 }),
-            S::Claude => {
-                lower.contains("claude")
-                    && (lower.contains("log in")
-                        || lower.contains("login")
-                        || lower.contains("continue with"))
-            }
             S::Gemini => {
                 // Use Google's request-specific country, as other unlock checkers do.
                 // The 45631641 bootstrap switch is false on supported DE/GB responses.
@@ -1357,7 +1368,7 @@ fn parse(service: UnlockService, status: u16, body: &str, url: &str) -> UnlockRe
                     && (html_tags(&reddit_html, "shreddit-app").next().is_some()
                         || reddit_js_continuation)
             }
-            S::Netflix => false,
+            S::Claude | S::Netflix => false,
             S::Spotify
             | S::HboMax
             | S::Dazn
@@ -1957,12 +1968,12 @@ mod tests {
         }
     }
     #[test]
-    fn current_claude_region_redirect_stays_within_fixed_service_hosts() {
+    fn claude_region_queries_do_not_use_legacy_redirect_hosts() {
         let url = "https://claude.com/app-unavailable-in-region";
-        assert!(safe_url(&reqwest::Url::parse(url).unwrap()));
+        assert!(!safe_url(&reqwest::Url::parse(url).unwrap()));
         assert_eq!(
             parse(UnlockService::Claude, 200, "App unavailable in region", url).status,
-            UnlockStatus::UnsupportedRegion
+            UnlockStatus::Failed
         );
         assert!(!safe_url(
             &reqwest::Url::parse("https://claude.com.evil.test/app-unavailable-in-region").unwrap()
@@ -1971,21 +1982,15 @@ mod tests {
 
     #[test]
     fn actual_browser_challenges_are_access_restrictions_even_with_http_200() {
-        for (service, body) in [
-            (
-                UnlockService::Claude,
-                "<title>Just a moment...</title><script src=\"/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1\"></script>",
-            ),
-            (
-                UnlockService::Tiktok,
-                r#"<script id="slardar-config" type="application/json">{"slardarClient":"SlardarWAF"}</script><body>Please wait...</body>"#,
-            ),
-        ] {
-            let outcome = parse(service, 200, body, "");
-            assert_eq!(outcome.status, UnlockStatus::Restricted, "{service:?}");
-            assert_eq!(outcome.code, UnlockCode::AccessDenied);
-            assert!(outcome.region.is_none());
-        }
+        let outcome = parse(
+            UnlockService::Tiktok,
+            200,
+            r#"<script id="slardar-config" type="application/json">{"slardarClient":"SlardarWAF"}</script><body>Please wait...</body>"#,
+            "",
+        );
+        assert_eq!(outcome.status, UnlockStatus::Restricted);
+        assert_eq!(outcome.code, UnlockCode::AccessDenied);
+        assert!(outcome.region.is_none());
     }
 
     #[test]
@@ -2038,8 +2043,8 @@ mod tests {
             parse(
                 UnlockService::Claude,
                 200,
-                "Claude",
-                "https://www.anthropic.com/app-unavailable-in-region"
+                "h=claude.ai\nip=203.0.113.1\nloc=CN\n",
+                "https://claude.ai/cdn-cgi/trace"
             )
             .status,
             UnlockStatus::UnsupportedRegion
@@ -2295,12 +2300,12 @@ mod tests {
     }
 
     #[test]
-    fn passive_cloudflare_javascript_does_not_reject_a_real_login_page() {
+    fn claude_region_queries_do_not_accept_login_pages_or_challenges() {
         let page = r#"<title>Claude</title>Log in to Claude. Continue with email.
             <script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>"#;
         assert_eq!(
             parse(UnlockService::Claude, 200, page, "https://claude.ai/login").status,
-            UnlockStatus::Available
+            UnlockStatus::Failed
         );
         let challenge = r#"<script>window._cf_chl_opt={};</script>Claude login"#;
         assert_eq!(
@@ -2311,7 +2316,7 @@ mod tests {
                 "https://claude.ai/login"
             )
             .status,
-            UnlockStatus::Restricted
+            UnlockStatus::Failed
         );
     }
 
@@ -2382,7 +2387,6 @@ mod tests {
     #[ignore = "contacts public services; prints only sanitized response metadata"]
     fn live_response_metadata_for_diagnostic_failures() {
         for (service, url) in [
-            (UnlockService::Claude, "https://claude.ai/"),
             (UnlockService::Tiktok, "https://www.tiktok.com/"),
             (UnlockService::Tiktok, "https://www.tiktok.com/foryou"),
             (UnlockService::Tiktok, "https://www.tiktok.com/explore"),
@@ -2407,7 +2411,6 @@ mod tests {
                             "slardar_waf":field(&page.response.body,"slardarClient").is_some_and(|v|v.as_str()==Some("SlardarWAF")),
                             "cloudflare_passive_js":page.response.body.contains("/scripts/jsd/"),
                             "cloudflare_active_challenge":page.response.body.contains("window._cf_chl_opt") || page.response.body.to_ascii_lowercase().contains("<title>just a moment"),
-                            "claude_login_evidence":service==UnlockService::Claude && page.response.body.to_ascii_lowercase().contains("claude") && (page.response.body.to_ascii_lowercase().contains("login") || page.response.body.to_ascii_lowercase().contains("continue with")),
                             "has_waf_challenge":page.response.body.contains("_wafchallengeid"),
                             "has_universal_data":page.response.body.contains("__UNIVERSAL_DATA_FOR_REHYDRATION__"),
                             "has_sigi_state":page.response.body.contains("SIGI_STATE"),

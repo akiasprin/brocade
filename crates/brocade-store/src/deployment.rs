@@ -155,6 +155,8 @@ async fn plan_deployment_unscoped(pool: &PgPool, revision_id: u64) -> Result<Dep
         None => None,
     };
     mark_vpngate_policy_changes(&mut plan, serving_snapshot.as_ref(), &snapshot);
+    #[cfg(feature = "cvm")]
+    crate::cvm::releases::augment_plan(pool, &mut plan).await?;
     let terminal = terminal_lifecycle_nodes(pool).await?;
     let mut plan = without_terminal_lifecycle_targets(plan, &terminal);
     annotate_vpngate_node_eligibility(pool, &mut plan, serving_snapshot.as_ref(), &snapshot)
@@ -370,7 +372,7 @@ fn mark_isolated_targets(plan: &mut DeploymentPlan, isolated: &BTreeSet<String>)
     plan.summary = brocade_deployment::plan::summarize_targets(&plan.targets);
 }
 
-async fn lock_deployment_isolation_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+pub(crate) async fn lock_deployment_isolation_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(DEPLOYMENT_ISOLATION_LOCK_KEY)
         .execute(&mut **tx)
@@ -614,6 +616,15 @@ async fn create_from_plan_tx(
     let active = Some(true);
     let warnings = serde_json::to_value(&plan.warnings)?;
     let revision_id = revision_to_i64(request.revision_id)?;
+    if plan.targets.iter().any(|target| {
+        target.status == PlannedTargetStatus::Deferred
+            && target.actions.contains(&PlannedAction::SyncCvm)
+    }) {
+        return Err(StoreError::Unsupported(
+            "容器发布涉及隔离或作用域外的关联机器；请先恢复相关机器服务并使用完整发布范围".into(),
+        ));
+    }
+
     let base_revision_id = last_succeeded_revision(&mut **tx, request.kind).await?;
     let note = match request.note.as_deref().map(str::trim) {
         Some(written) if !written.is_empty() => written.to_owned(),
@@ -1046,7 +1057,7 @@ async fn create_automatic_grants_deployment_locked(
          JOIN deployment_targets dt
            ON dt.deployment_id = dts.deployment_id
           AND dt.node_id = dts.node_id
-          AND dt.status = 'succeeded'
+          AND (dt.status = 'succeeded' OR dts.cvm_machine_ready)
          JOIN node_lifecycle_state lifecycle
            ON lifecycle.node_id = s.node_id
           AND lifecycle.lifecycle_epoch = dts.lifecycle_epoch
@@ -1080,7 +1091,8 @@ async fn create_automatic_grants_deployment_locked(
                 dts.wave,
                 dts.desired_structure,
                 dts.desired_grants,
-                dts.dispatched_grants
+                dts.dispatched_grants,
+                dts.cvm_machine_ready
          FROM deployments d
          JOIN deployment_targets dt ON dt.deployment_id = d.id
          JOIN deployment_target_state dts
@@ -1301,6 +1313,9 @@ async fn create_automatic_grants_deployment_locked(
         let node_id: String = row.try_get("node_id")?;
         let target_status: String = row.try_get("target_status")?;
         let structure: Value = row.try_get("desired_structure")?;
+        if row.try_get::<bool, _>("cvm_machine_ready")? {
+            continue;
+        }
         if !config_manages_xray(&structure) {
             // A WireGuard/phantun-only target cannot overwrite the runtime xray list.
             continue;
@@ -1666,6 +1681,12 @@ pub async fn create_rollback_deployment(
 
     let target_snapshot = rollback_target_snapshot(&mut tx, request.target_deployment_id).await?;
     let target_revision = target_snapshot.revision;
+    crate::extension_state::ensure_model_rollback_safe(
+        &mut tx,
+        request.target_deployment_id,
+        target_revision,
+    )
+    .await?;
     let previous_revision = console::lock_control_state(&mut tx).await?;
     let current_snapshot = materialize::load_current_snapshot_tx(&mut tx).await?;
     let client_config =
@@ -2109,6 +2130,7 @@ pub async fn deployment_detail(
     })
     .collect::<Result<Vec<_>>>()?;
 
+    crate::extension_state::present_cvm_artifacts(actor, &mut targets);
     if include_content {
         attach_known_artifact_content(pool, &mut targets).await?;
     }
@@ -2327,6 +2349,7 @@ pub async fn load_desired_for_node(
             WHERE d.active = TRUE
               AND d.status IN ('planned', 'running')
               AND dt.node_id = $1
+              AND (dts.cvm_revision_id IS NULL OR NOT dts.cvm_machine_ready)
               AND dt.status IN ('pending', 'dispatched', 'converging')
               AND dts.lifecycle_epoch = lifecycle.lifecycle_epoch
               AND lifecycle.phase IN ('active', 'retiring')
@@ -2455,6 +2478,8 @@ pub async fn claim_desired_for_node_with_protocol(
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *tx)
         .await?;
+    #[cfg(feature = "cvm")]
+    crate::cvm::releases::lock(&mut tx).await?;
     let isolated = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (
              SELECT 1
@@ -2595,6 +2620,7 @@ pub async fn claim_desired_for_node_with_protocol(
             WHERE d.active = TRUE
               AND d.status IN ('planned', 'running')
               AND dt.node_id = $1
+              AND (dts.cvm_revision_id IS NULL OR NOT dts.cvm_machine_ready)
               AND dt.status IN ('pending', 'dispatched', 'converging')
               AND dts.lifecycle_epoch = lifecycle.lifecycle_epoch
               AND lifecycle.phase IN ('active', 'retiring')
@@ -2716,6 +2742,11 @@ pub async fn claim_desired_for_node_with_protocol(
         grants.clone(),
     )
     .await?;
+    #[cfg(feature = "cvm")]
+    if !crate::cvm::releases::can_claim(&mut tx, deployment_id, &node_id, protocol).await? {
+        tx.commit().await?;
+        return Ok(None);
+    }
     let dispatched_grants = serde_json::to_value(&grants)?;
     if !supports_config_policy(&desired, protocol) {
         tx.commit().await?;
@@ -2778,6 +2809,8 @@ pub async fn report_target_result(
     report: TargetConvergenceReport,
 ) -> Result<ReportTargetResult> {
     let mut tx = pool.begin().await?;
+    #[cfg(feature = "cvm")]
+    crate::cvm::releases::lock(&mut tx).await?;
 
     // Not found is a 404, not a 500. The difference is not one of wording: the agent's retry
     // spool routes on 4xx versus 5xx, discarding 4xx as "the control plane says outright this is
@@ -2855,7 +2888,17 @@ pub async fn report_target_result(
         let desired_structure: Value = obligation.try_get("desired_structure")?;
         let desired_grants: DesiredGrants =
             serde_json::from_value(obligation.try_get("desired_grants")?)?;
-        let final_status = target_status_from_report(&report, &desired_structure, &desired_grants)?;
+        let machine_status =
+            target_status_from_report(&report, &desired_structure, &desired_grants)?;
+        let final_status = machine_status;
+        #[cfg(feature = "cvm")]
+        let final_status = crate::cvm::releases::machine_result(
+            &mut tx,
+            report.deployment_id,
+            &report.node_id,
+            final_status,
+        )
+        .await?;
         let observed_before = reported_node_state_json(&report.observed_before)?;
         let observed_after = reported_node_state_json(&report.observed_after)?;
         let verdict = json!({
@@ -3142,14 +3185,28 @@ pub async fn report_target_result(
             ))
         })
         .and_then(|value| serde_json::from_value(value).map_err(StoreError::from))?;
-    let final_status = target_status_from_report(&report, &desired_structure, &desired_grants)?;
+    let machine_status = target_status_from_report(&report, &desired_structure, &desired_grants)?;
+    let final_status = machine_status;
+    #[cfg(feature = "cvm")]
+    let final_status = crate::cvm::releases::machine_result(
+        &mut tx,
+        report.deployment_id,
+        &report.node_id,
+        final_status,
+    )
+    .await?;
+    let target_error = report.error.as_deref().or_else(|| {
+        (machine_status == "succeeded" && final_status == "failed-dirty")
+            .then_some("容器或关联网络执行失败，请查看容器回执与网络日志")
+    });
     let observed_before = reported_node_state_json(&report.observed_before)?;
     let observed_after = reported_node_state_json(&report.observed_after)?;
     let verdict = json!({
         "reported_result": target_apply_result_name(report.result),
         "target_status": final_status,
-        "error": report.error,
-        "desired_matched": final_status == "succeeded",
+        "error": target_error,
+        "desired_matched": machine_status == "succeeded",
+        "cvm_pending": final_status == "converging",
         "baseline_matched": baseline_matched,
     });
 
@@ -3178,10 +3235,20 @@ pub async fn report_target_result(
     .bind(report.deployment_id)
     .bind(&report.node_id)
     .bind(final_status)
-    .bind(&report.error)
+    .bind(target_error)
     .execute(&mut *tx)
     .await?;
 
+    #[cfg(feature = "cvm")]
+    if machine_status == "succeeded" && final_status != "converging" {
+        crate::cvm::releases::record_evidence(
+            &mut tx,
+            report.deployment_id,
+            &report.node_id,
+            final_status,
+        )
+        .await?;
+    }
     // In a grants deployment phantun, wireguard, and xray are all Unmanaged, and the agent
     // faithfully reports Unmanaged (observe_linux_* returns it unchanged). Overwriting the applied
     // state with that would have the control plane believe this machine's configuration is
@@ -3202,7 +3269,7 @@ pub async fn report_target_result(
     )
     .await?;
 
-    if final_status == "succeeded" {
+    if machine_status == "succeeded" {
         if let Some(generation_id) = target.try_get::<Option<i64>, _>("usage_generation_id")? {
             crate::usage::activate_usage_generation(
                 &mut tx,
@@ -3786,6 +3853,12 @@ pub async fn cancel_deployment_and_rollback(
 
     let target = latest_succeeded_deployment_before_tx(&mut tx, deployment_id).await?;
     let target_snapshot = materialize::load_snapshot_tx(&mut tx, Some(target.revision_id)).await?;
+    crate::extension_state::ensure_model_rollback_safe(
+        &mut tx,
+        deployment_id,
+        target_snapshot.revision,
+    )
+    .await?;
     let canceled = cancel_deployment_tx(&mut tx, deployment_id).await?;
     let previous_revision = console::lock_control_state(&mut tx).await?;
     let current_snapshot = materialize::load_current_snapshot_tx(&mut tx).await?;
@@ -3863,6 +3936,8 @@ pub async fn retry_target(
     ensure_node_access(pool, actor, node_id).await?;
     ensure_deployment_write_access(pool, actor, deployment_id).await?;
     let mut tx = pool.begin().await?;
+    #[cfg(feature = "cvm")]
+    crate::cvm::releases::lock(&mut tx).await?;
     let deployment = sqlx::query(
         "SELECT status, active
          FROM deployments
@@ -3938,7 +4013,7 @@ pub async fn retry_target(
     }
 
     let target = sqlx::query(
-        "SELECT dt.status,
+        "SELECT dt.status,dts.cvm_revision_id,dts.cvm_machine_ready,
                 dts.lifecycle_epoch AS target_lifecycle_epoch,
                 lifecycle.lifecycle_epoch AS current_lifecycle_epoch,
                 lifecycle.phase AS lifecycle_phase
@@ -3968,25 +4043,36 @@ pub async fn retry_target(
         )));
     }
 
+    let cvm_only = target
+        .try_get::<Option<i64>, _>("cvm_revision_id")?
+        .is_some()
+        && target.try_get::<bool, _>("cvm_machine_ready")?;
+    #[cfg(feature = "cvm")]
+    if cvm_only {
+        crate::cvm::releases::prepare_retry(&mut tx, deployment_id, node_id).await?;
+    }
     sqlx::query(
         "UPDATE deployment_targets
-         SET status = 'pending',
+         SET status = $3,
              error = NULL
          WHERE deployment_id = $1 AND node_id = $2",
     )
     .bind(deployment_id)
     .bind(node_id)
+    .bind(if cvm_only { "converging" } else { "pending" })
     .execute(&mut *tx)
     .await?;
 
     sqlx::query(
         "UPDATE deployment_target_state
-         SET dispatched_at = NULL,
+         SET dispatched_at = CASE WHEN $3 THEN now() ELSE NULL END,
+             cvm_machine_ready = $3,
              dispatched_grants = NULL
          WHERE deployment_id = $1 AND node_id = $2",
     )
     .bind(deployment_id)
     .bind(node_id)
+    .bind(cvm_only)
     .execute(&mut *tx)
     .await?;
 
@@ -4007,7 +4093,7 @@ pub async fn retry_target(
     Ok(ReportTargetResult {
         deployment_id,
         node_id: node_id.to_owned(),
-        target_status: "pending".to_owned(),
+        target_status: if cvm_only { "converging" } else { "pending" }.to_owned(),
         deployment_status: "running".to_owned(),
     })
 }
@@ -6151,10 +6237,11 @@ async fn desired_deployment_from_structure_connection(
     let hy2_port_hop = take(ConfigArtifact::Hy2PortHop);
     let wireguard = take(ConfigArtifact::WireGuard);
     let xray = take(ConfigArtifact::Xray);
-    let actions =
+    let mut actions: Vec<PlannedAction> =
         serde_json::from_value(desired_structure.get("actions").cloned().ok_or_else(|| {
             StoreError::InvalidData("desired_structure.actions is missing".to_owned())
         })?)?;
+    actions.retain(|action| *action != PlannedAction::SyncCvm);
     let usage_generation_id: Option<i64> = sqlx::query_scalar(
         "SELECT usage_generation_id FROM deployment_target_state
          WHERE deployment_id = $1 AND node_id = $2",
@@ -6388,7 +6475,7 @@ async fn load_last_successful_artifact(
              ON d.id = dts.deployment_id
             AND d.kind = 'config'
           WHERE dts.node_id = $1
-            AND dt.status = 'succeeded'
+            AND (dt.status = 'succeeded' OR dts.cvm_machine_ready)
             AND (dts.desired_structure -> CAST($2 AS text))->>'state'
                 IN ('present', 'disabled')
           ORDER BY d.id DESC
@@ -6419,7 +6506,7 @@ async fn load_last_successful_grants(
             AND dt.node_id = dts.node_id
            JOIN deployments d ON d.id = dts.deployment_id
           WHERE dts.node_id = $1
-            AND dt.status = 'succeeded'
+            AND (dt.status = 'succeeded' OR dts.cvm_machine_ready)
             AND dts.desired_grants->>'state' IN ('present', 'disabled')
           ORDER BY d.id DESC
           LIMIT 1",
@@ -6489,6 +6576,15 @@ async fn insert_target(
             .fetch_one(&mut **tx)
             .await?;
     let mut structure = desired_structure_json(target)?;
+    #[cfg(feature = "cvm")]
+    if target.actions.contains(&PlannedAction::SyncCvm) {
+        let revision: i64 = sqlx::query_scalar("SELECT revision_id FROM deployments WHERE id=$1")
+            .bind(deployment_id)
+            .fetch_one(&mut **tx)
+            .await?;
+        structure["cvm"] =
+            crate::cvm::releases::artifact_metadata(tx, &target.node_id, revision).await?;
+    }
     structure["xray_config_update_policy"] =
         serde_json::to_value(XrayConfigUpdatePolicy::from_handoff_beta(beta))?;
     sqlx::query(
@@ -6524,6 +6620,11 @@ async fn insert_target(
         .bind(deployment_id)
         .fetch_one(&mut **tx)
         .await?;
+    #[cfg(feature = "cvm")]
+    if target.actions.contains(&PlannedAction::SyncCvm) {
+        crate::cvm::releases::freeze_target(tx, deployment_id, &target.node_id, revision_id)
+            .await?;
+    }
     let snapshot =
         crate::materialize::load_snapshot_tx(tx, Some(revision_to_u64(revision_id)?)).await?;
     let usage_generation_id = crate::usage::create_usage_generation_for_target(
@@ -7182,7 +7283,7 @@ async fn record_current_wave_entered_tx(
 /// Settle one report without turning an operator- or failure-halted release back into `running`.
 /// If this was the last unresolved target and every target succeeded, normal completion is still
 /// correct: there is no remaining work for a later resume action to expose.
-async fn refresh_deployment_status_after_report(
+pub(crate) async fn refresh_deployment_status_after_report(
     tx: &mut Transaction<'_, Postgres>,
     deployment_id: i64,
     target_status: &str,
@@ -7585,6 +7686,20 @@ pub async fn discard_pending_changes(
         )
     })?;
     let base_revision = revision_to_u64(base.try_get("revision_id")?)?;
+    #[cfg(feature = "cvm")]
+    if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM cvm_revision_nodes WHERE revision_id>$1 AND revision_id<=$2)",
+    )
+    .bind(base_revision as i64)
+    .bind(revision_id as i64)
+    .fetch_one(pool)
+    .await?
+    {
+        return Err(StoreError::Unsupported(
+            "待发布变更包含容器资源，不能只丢弃机器模型；请通过容器配置创建补偿修订".into(),
+        ));
+    }
+
     if base_revision >= revision_id {
         return Err(StoreError::Unsupported(format!(
             "revision {revision_id} is not newer than the last published revision {base_revision}; nothing to discard"

@@ -1,3 +1,4 @@
+import { CVM_ENABLED } from '../product';
 import { TitleActions } from '../ui/title-actions';
 import {
   Fragment,
@@ -24,6 +25,7 @@ import {
   fetchNodes,
   fetchPlanArtifacts,
   fetchRevisions,
+  getCvmArtifacts,
   haltDeployment,
   forceConfigXrayRetirement,
   isolateDeploymentTarget,
@@ -91,6 +93,7 @@ const ACTION_LABEL: Record<PlannedAction, string> = {
   'apply-phantun': '更新 Phantun',
   'apply-hy2-port-hop': '更新端口跳跃',
   'sync-grants': '同步授权',
+  'sync-cvm': '更新容器与网络',
   'apply-wire-guard': '更新 WireGuard',
   'apply-xray': '更新 Xray',
   'disable-phantun': '停用 Phantun',
@@ -103,6 +106,7 @@ const ACTION_NOTE: Record<Exclude<PlannedAction, 'apply-xray'>, string> = {
   'apply-phantun': '同步 fake TCP 封装进程',
   'apply-hy2-port-hop': '只调整 nft，进程不停',
   'sync-grants': '热更新访问名单，连接不中断',
+  'sync-cvm': '执行本次批准的容器和关联网络配置；等待实际回执后推进',
   'apply-wire-guard': '同步隧道配置，已有链路不中断',
   'disable-phantun': '依赖 fake TCP 的链路会中断',
   'disable-hy2-port-hop': '客户端将只能连接固定落点端口',
@@ -1666,7 +1670,7 @@ export function ArtifactChanges({
 
   const mine = new Set(targets.map(t => t.node_id));
   const machines = recordedMachines(preview.data.targets.filter(t => mine.has(t.node_id)));
-  const files = machines.flatMap(machine => machine.files);
+  const files = machines.flatMap(machine => machine.files).filter(file => !file.metadata);
   // 订阅不通过发布下发，但发生变化时需要提示。按用户数统计而非文件数：
   // 一个用户对应 clash 和 uri 两份，显示为「2 份变更」会被理解为涉及两个用户。
   const subscriptionChanges = list.filter(a => a.target_kind === 'user' && (base == null || changed.has(entryId(a))));
@@ -1971,7 +1975,14 @@ function recordedGrantChanges(target: DeploymentTargetDetail): RecordedGrantChan
     });
 }
 
-type RecordedFile = { key: string; kind: string; before: RecordedArtifact | undefined; after: RecordedArtifact };
+type RecordedFile = {
+  key: string;
+  kind: string;
+  before: RecordedArtifact | undefined;
+  after: RecordedArtifact;
+  metadata?: boolean;
+  cvm?: { id: string; generation: number; previous?: number; kind: string };
+};
 interface RecordedMachine {
   id: string;
   files: RecordedFile[];
@@ -1982,19 +1993,131 @@ type RecordedItem = { key: string; file: RecordedFile } | { key: string; grants:
 
 const RECORDED_KINDS = ['phantun', 'wireguard', 'xray', 'hy2_port_hop'];
 
+export function cvmRecordedFiles(target: DeploymentTargetDetail): RecordedFile[] {
+  const value = (target.desired_structure as { cvm?: unknown } | null)?.cvm;
+  if (!value || typeof value !== 'object') return [];
+  const cvm = value as {
+    revision_id?: number;
+    instances?: {
+      id: string;
+      name: string;
+      generation: number;
+      previous_generation?: number;
+      power: string;
+      impact?: string;
+      files: {
+        kind: string;
+        sha256: string;
+        content?: string;
+        before_sha256?: string;
+        before_content?: string;
+        before_absent?: boolean;
+      }[];
+    }[];
+    host_products?: {
+      kind: string;
+      sha256?: string;
+      content?: string;
+      absent?: boolean;
+      before_sha256?: string;
+      before_content?: string;
+      before_absent?: boolean;
+      redacted?: boolean;
+      apply?: string;
+      bindings?: string[];
+    }[];
+    network_bindings?: number;
+    entries?: number;
+  };
+  if (!Array.isArray(cvm.instances)) return [];
+  return cvm.instances
+    .flatMap<RecordedFile>(instance => {
+      const prefix = `容器 ${instance.name}`;
+      return [
+        {
+          key: `${target.node_id}:${instance.id}:operation`,
+          metadata: true,
+          kind: `${prefix} · 执行目标`,
+          before: undefined,
+          after: {
+            state: 'present',
+            content: JSON.stringify(
+              {
+                revision: cvm.revision_id,
+                instance_id: instance.id,
+                generation: instance.generation,
+                power: instance.power,
+                impact: instance.impact,
+              },
+              null,
+              2,
+            ),
+          },
+        },
+        ...instance.files.map(file => ({
+          key: `${target.node_id}:${instance.id}:${file.kind}`,
+          cvm: {
+            id: instance.id,
+            generation: instance.generation,
+            previous: instance.previous_generation,
+            kind: file.kind,
+          },
+          kind: `${prefix} · ${file.kind}`,
+          before: file.before_absent
+            ? { state: 'absent' }
+            : file.before_sha256
+              ? { state: 'present', sha256: file.before_sha256, content: file.before_content }
+              : undefined,
+          after: { state: 'present', sha256: file.sha256, content: file.content },
+        })),
+      ];
+    })
+    .concat(
+      (cvm.host_products ?? []).map(file => ({
+        key: `${target.node_id}:cvm-host:${file.kind}`,
+        kind: `${file.kind}${file.redacted ? ' · 凭据已隐藏' : ''}`,
+        before: file.before_absent
+          ? { state: 'absent' }
+          : file.before_sha256
+            ? { state: 'present', sha256: file.before_sha256, content: file.before_content }
+            : undefined,
+        after: file.absent ? { state: 'absent' } : { state: 'present', sha256: file.sha256, content: file.content },
+      })),
+    )
+    .concat([
+      {
+        key: `${target.node_id}:cvm-network`,
+        metadata: true,
+        kind: '容器网络 · 执行目标',
+        before: undefined,
+        after: {
+          state: 'present',
+          content: JSON.stringify(
+            { revision: cvm.revision_id, network_bindings: cvm.network_bindings, entries: cvm.entries },
+            null,
+            2,
+          ),
+        },
+      },
+    ]);
+}
+
 function recordedMachines(targets: DeploymentTargetDetail[]): RecordedMachine[] {
   return targets.map(target => ({
     id: target.node_id,
     grants: recordedGrantChanges(target),
-    files: RECORDED_KINDS.flatMap(kind => {
-      const after = artifactRecord(target.desired_structure, kind);
-      const before = artifactRecord(target.observed_before, kind);
-      if (!after || after.state === 'unmanaged') return [];
-      if (before && after.state === 'present' && before.state === 'present' && after.sha256 === before.sha256)
-        return [];
-      if (before?.state === 'absent' && after.state === 'disabled') return [];
-      return [{ key: `${target.node_id}:${kind}`, kind, before, after }];
-    }),
+    files: [
+      ...cvmRecordedFiles(target),
+      ...RECORDED_KINDS.flatMap(kind => {
+        const after = artifactRecord(target.desired_structure, kind);
+        const before = artifactRecord(target.observed_before, kind);
+        if (!after || after.state === 'unmanaged') return [];
+        if (before && after.state === 'present' && before.state === 'present' && after.sha256 === before.sha256)
+          return [];
+        if (before?.state === 'absent' && after.state === 'disabled') return [];
+        return [{ key: `${target.node_id}:${kind}`, kind, before, after }];
+      }),
+    ],
   }));
 }
 
@@ -2080,7 +2203,7 @@ export function RecordedArtifacts({ targets, range }: { targets: DeploymentTarge
       : [];
   });
 
-  const files = machines.flatMap(machine => machine.files);
+  const files = machines.flatMap(machine => machine.files).filter(file => !file.metadata);
   const diffs = files.flatMap(file => recordedDiff(file, foldRuleTags) ?? []);
   const added = diffs.reduce((sum, diff) => sum + diff.counts.add, 0);
   const deleted = diffs.reduce((sum, diff) => sum + diff.counts.del, 0);
@@ -2236,6 +2359,7 @@ function ArtifactList<Item>({
 }
 
 function RecordedFileChip({ file, foldRuleTags }: { file: RecordedFile; foldRuleTags: boolean }) {
+  if (file.metadata) return <span className="nm cga-sans">{file.kind}</span>;
   const state = recordedFileState(file);
   const diff = recordedDiff(file, foldRuleTags);
   return (
@@ -2275,11 +2399,82 @@ function RuleTagNote({ diff, folded, onToggle }: { diff: ReviewDiff; folded: boo
   );
 }
 
+function CvmRecordedFileDetail({ file, foldRuleTags }: { file: RecordedFile; foldRuleTags: boolean }) {
+  const source = file.cvm!;
+  const current = useQuery({
+    queryKey: ['cvm-artifacts', source.id, source.generation],
+    queryFn: () => getCvmArtifacts(source.id, source.generation),
+    staleTime: Infinity,
+  });
+  const previous = useQuery({
+    queryKey: ['cvm-artifacts', source.id, source.previous],
+    queryFn: () => getCvmArtifacts(source.id, source.previous),
+    enabled: source.previous != null && file.before?.sha256 != null,
+    staleTime: Infinity,
+  });
+  const find = (bundle: typeof current.data) => bundle?.current?.files.find(f => f.kind === source.kind);
+  const after = find(current.data),
+    before = find(previous.data);
+  const error = current.error ?? previous.error;
+  if (current.isPending || previous.isFetching) return <p role="status">正在读取这次发布的冻结产物…</p>;
+  const materialized: RecordedFile = {
+    ...file,
+    cvm: undefined,
+    after: { ...file.after, content: after && after.sha256 === file.after.sha256 ? after.content : undefined },
+    before: file.before
+      ? { ...file.before, content: before && before.sha256 === file.before.sha256 ? before.content : undefined }
+      : undefined,
+  };
+  return (
+    <>
+      {error && <ErrorBox error={error} />}
+      <RecordedFileDetail file={materialized} foldRuleTags={foldRuleTags} />
+    </>
+  );
+}
+
 function RecordedFileDetail({ file, foldRuleTags }: { file: RecordedFile; foldRuleTags: boolean }) {
   const [expanded, setExpanded] = useState<ReadonlySet<number>>(() => new Set());
   const [showWritten, setShowWritten] = useState(false);
   const diff = recordedDiff(file, foldRuleTags);
   const fmt = artifactFmt(file.kind);
+
+  if (CVM_ENABLED && file.cvm) return <CvmRecordedFileDetail file={file} foldRuleTags={foldRuleTags} />;
+  if (file.metadata) {
+    const value = JSON.parse(file.after.content ?? '{}') as Record<string, string | number>;
+    const labels: Record<string, string> = {
+      instance_id: '实例',
+      generation: '执行代',
+      power: '期望状态',
+      network_bindings: '网卡承载',
+      entries: '入口与投递',
+      impact: '执行影响',
+    };
+    const states: Record<string, string> = {
+      running: '运行',
+      stopped: '停止',
+      deleted: '移除',
+      hot: '运行中热更新',
+      boot_identity: '下次启动身份',
+      create: '首次创建',
+      power: '电源或重装操作',
+    };
+    return (
+      <div className="cga-na">
+        <p>全局 R{value.revision} 的执行目标</p>
+        <dl>
+          {Object.entries(value)
+            .filter(([key]) => key !== 'revision')
+            .map(([key, item]) => (
+              <Fragment key={key}>
+                <dt>{labels[key] ?? key}</dt>
+                <dd>{key === 'power' || key === 'impact' ? (states[String(item)] ?? item) : item}</dd>
+              </Fragment>
+            ))}
+        </dl>
+      </div>
+    );
+  }
 
   if (!diff) {
     const written = file.after.content;

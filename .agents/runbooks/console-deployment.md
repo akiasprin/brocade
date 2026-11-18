@@ -1021,14 +1021,14 @@ psql -X -v ON_ERROR_STOP=1 -d brocade -v app_role=brocade \
 
 ### IP 养护与旧预发布 Clash-only 0007
 
-当前未发布 `0007_user_clash_rules.sql` 合入 IP 养护结构；0001–0006 保持原字节。
+线上已发布 `0007_user_clash_rules.sql` 包含 IP 养护和节点通知偏好；0001–0007 均保持发布字节。CVM 编译产物结构放入尚未发布的 `0008_node_notifications_and_cvm_artifacts.sql`。
 已有精确 Clash-only 0007（SHA-384 `d166d16c…c3af3f6a`）的环境，先在完整生产备份的隔离恢复库演练，
 再仅在本次安装进程临时设置 `BROCADE_PRERELEASE_IP_MAINTENANCE_COMPAT=1` 执行
 `sh install.sh --upgrade --flavor base`。不得写入常驻环境，不直接替换程序或单独更改回执。
 
 此变量仅作用于离线 `database-check` / `database-migrate`。只读检查必须精确匹配全部七条回执、
 Clash 表的列、默认值、约束、索引、owner 与触发器，且不存在任何养护对象。目录指纹分别验证
-PostgreSQL 16/17 和 18（含非空约束记录）。预检报告待执行 `[7]`，使安装器先停写、备份并建立
+PostgreSQL 16/17 和 18（含非空约束记录）。预检报告待执行 `[7, 8]`，使安装器先停写、备份并建立
 `migration-started` 标记。转换锁内再次核验，在同一有界事务执行目标迁移的养护后缀，验证完整目标
 目录指纹后才更新 0007 checksum；其它回执元数据、Clash 规则和业务行保持不变。未知历史、结构漂移、
 部分执行与任一 DDL 失败均拒绝或整体回滚。普通启动保持严格 checksum 校验。
@@ -1037,6 +1037,21 @@ PostgreSQL 16/17 和 18（含非空约束记录）。预检报告待执行 `[7]`
 不能直接启动旧程序回退。恢复构建必须认识完整 0007，并保留养护控制、记录及其它新增业务写入；
 优先前向修复。整库恢复仍需单独授权数据损失边界。部署 Console 不等于发布新 Agent：养护需要协议 68，
 旧 Agent 显式显示待升级，自动养护默认关闭。
+
+### 已发布 0007 与 CVM 产物（0008 正向迁移）
+
+`0007` 已包含 `node_notification_preferences`，升级保留其偏好数据与原始迁移字节；`0008_node_notifications_and_cvm_artifacts.sql` 只新增 CVM 编译产物和全局修订关联结构。
+铃铛偏好缺少行时默认开启，公网观测、历史和 Webhook 保持原样；这些结构不创建模型修订或节点发布。
+
+正式 `v0.3.8` 数据库的 `0007` SHA-384 是 `9e6eecca…46db9b8`，走普通离线检查及正向迁移，
+只报告待执行 `[8]`。升级保留前七条迁移的全部回执，不设置兼容变量、不改历史 checksum。
+`0008` 的全部 DDL 在单个 SQLx 事务中执行；后段失败会回滚前面创建的产物表；已发布的偏好表和数据保持不变。
+
+上节精确 Clash-only 旧预发布库仍可临时设置 `BROCADE_PRERELEASE_IP_MAINTENANCE_COMPAT=1`，
+或兼容别名 `BROCADE_PRERELEASE_0007_COMPAT=1`。只读检查报告 `[7, 8]`；经备份和停写后，
+先按已验证的历史及结构将旧预发布回执转换为已发布的 `0007`，再由 SQLx 正常执行 `0008`。
+两个变量都不得写入常驻环境。未知回执、结构漂移与不认识的已修改预发布字节继续拒绝，不能只改回执绕过。
+迁移后的失败遵循上一节停服、保留备份及前向修复边界。
 
 ## 上传与原子替换
 

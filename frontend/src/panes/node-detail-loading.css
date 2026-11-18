@@ -1,0 +1,18 @@
+/* Reserve the same card slots while independent model/runtime requests settle. */
+.node-config-card-wait {
+  display: grid;
+  place-items: center;
+  min-height: 100px;
+  padding: 16px;
+}
+.node-config-card-state[data-kind='usage'] .node-config-card-wait {
+  min-height: 314px;
+}
+@container (max-width: 430px) {
+  .node-config-card-state[data-kind='usage'] .node-config-card-wait {
+    min-height: 367px;
+  }
+}
+.care-config-ready {
+  animation: motion-surface-mount 240ms var(--motion-ease-out) backwards;
+}

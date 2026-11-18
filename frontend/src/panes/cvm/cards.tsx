@@ -32,11 +32,21 @@ export function quotaRows(workspace: CvmWorkspace, quota: CvmQuota) {
     { label: '网卡', used: used.interfaces, total: quota.max_interfaces, format: String },
   ];
 }
-export function CapacityMeter({ used, total, add = 0 }: { used: number; total: number; add?: number }) {
+export function CapacityMeter({
+  used,
+  total,
+  add = 0,
+  allowOversell = false,
+}: {
+  used: number;
+  total: number;
+  add?: number;
+  allowOversell?: boolean;
+}) {
   const base = total > 0 ? Math.min(1, Math.max(0, used / total)) : used > 0 ? 1 : 0;
   const ghost = total > 0 ? Math.min(1 - base, Math.max(0, add / total)) : add > 0 ? 1 : 0;
   return (
-    <span className={`cvm-meter ${used + add > total ? 'bad' : ''}`} aria-hidden="true">
+    <span className={`cvm-meter ${used + add > total ? (allowOversell ? 'oversold' : 'bad') : ''}`} aria-hidden="true">
       <i style={{ width: `${base * 100}%` }} />
       <b style={{ left: `${base * 100}%`, width: `${ghost * 100}%` }} />
     </span>
@@ -44,17 +54,20 @@ export function CapacityMeter({ used, total, add = 0 }: { used: number; total: n
 }
 export function CapacityRows({
   rows,
+  allowOversell = false,
 }: {
   rows: { label: string; used: number; total: number; format: (value: number) => string }[];
+  allowOversell?: boolean;
 }) {
   return (
     <div className="cvm-capacity-rows">
       {rows.map(row => (
         <div className="cvm-capacity-row" key={row.label}>
           <span>{row.label}</span>
-          <CapacityMeter used={row.used} total={row.total} />
+          <CapacityMeter used={row.used} total={row.total} allowOversell={allowOversell} />
           <b>
             {row.format(row.used)} / {row.format(row.total)}
+            {allowOversell && row.used > row.total && <small> · 已超售</small>}
           </b>
         </div>
       ))}

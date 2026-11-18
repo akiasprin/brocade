@@ -20,6 +20,25 @@ pub(crate) async fn instance_entries(
         state.store.cvm_instance_entries(&actor, &id).await?,
     )))
 }
+#[derive(Deserialize)]
+pub(crate) struct NetworkLogQuery {
+    nodes: String,
+}
+pub(crate) async fn diagnostics(
+    State(state): State<AppState>,
+    Query(query): Query<NetworkLogQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let actor = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let nodes = query
+        .nodes
+        .split(',')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    Ok(private(Json(
+        state.store.cvm_network_logs(&actor, &nodes).await?,
+    )))
+}
 /// Ownership and write scope are enforced by Store against the target container.
 pub(crate) async fn create(
     State(state): State<AppState>,

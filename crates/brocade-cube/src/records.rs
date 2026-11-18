@@ -5,6 +5,12 @@ use std::{collections::BTreeMap, path::Path};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct Record {
+    #[serde(default)]
+    pub(crate) sandbox_sha256: String,
+    #[serde(default)]
+    pub(crate) sandbox_effective_sha256: String,
+    #[serde(default)]
+    pub(crate) sandbox_bindings: serde_json::Value,
     pub(crate) instance: String,
     pub(crate) runtime: String,
     pub(crate) volume: String,

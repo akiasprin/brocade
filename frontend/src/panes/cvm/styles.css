@@ -53,25 +53,23 @@
 }
 .cvm-host-list {
   display: grid;
-  gap: 18px;
+  gap: 0;
 }
 .cvm-host-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
   cursor: default;
-  min-height: 200px;
 }
 .cvm-host-card-head {
   display: flex;
-  align-items: center;
-  gap: 9px;
+  align-items: flex-start;
+  gap: 10px;
   min-width: 0;
-}
-.cvm-host-card-head > .ui-icon {
-  flex: none;
-  color: var(--ink-3);
 }
 .cvm-host-identity {
   display: grid;
-  gap: 6px;
+  gap: 1px;
   min-width: 0;
   flex: 1;
 }
@@ -79,22 +77,21 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 13px;
-  font-weight: 500;
+  font-size: 13.5px;
+  font-weight: 600;
 }
 .cvm-host-identity small {
-  color: var(--ink-4);
-  font-size: 10px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.cvm-host-identity small.stale {
+  color: var(--gold);
 }
 .cvm-host-card-head > .st {
   flex: none;
-  font-size: 10px;
 }
 .cvm-host-error {
   overflow-wrap: anywhere;
-}
-.cvm-host-summary {
-  margin: 0;
 }
 .cvm-archive {
   font-size: 12px;
@@ -328,6 +325,8 @@
   justify-content: flex-end;
 }
 .cvm-dialog-body {
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
   display: grid;
   gap: 14px;
   font-size: 12px;
@@ -383,28 +382,6 @@
 .cvm-monitoring > header {
   justify-content: space-between;
 }
-.cvm-monitoring-kpis {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(240px, 1.2fr);
-  gap: 16px;
-}
-.cvm-monitoring-kpis > div {
-  display: grid;
-  align-content: start;
-  gap: 7px;
-  min-width: 0;
-}
-.cvm-monitoring-kpis > div > span,
-.cvm-monitoring-kpis small {
-  color: var(--ink-3);
-  font-size: 11px;
-  overflow-wrap: anywhere;
-}
-.cvm-monitoring-kpis strong {
-  color: var(--ink);
-  font: 500 17px var(--mono);
-  overflow-wrap: anywhere;
-}
 .cvm-rate-pair {
   display: flex;
   flex-wrap: wrap;
@@ -449,20 +426,6 @@
   width: auto;
   max-width: 100%;
 }
-.cvm-health-facts {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 16px;
-  border-top: 1px solid var(--line);
-  padding-top: 16px;
-}
-.cvm-health-facts small {
-  display: block;
-  color: var(--ink-3);
-  font-size: 11px;
-  font-weight: 400;
-  margin-top: 6px;
-}
 .cvm-monitoring-issues {
   display: grid;
   gap: 8px;
@@ -478,7 +441,6 @@
   display: grid;
   gap: 16px;
 }
-.cvm-health-facts > div,
 .cvm-diag-facts > div {
   grid-template-columns: minmax(0, 1fr);
   gap: 6px;
@@ -528,47 +490,41 @@
   color: var(--ink-3);
   font-size: 11px;
 }
+/* 事件：状态灯 · 名称 · 时间，第二行是说明；与组合台检查器的两行条目一致。 */
 .cvm-monitoring-events {
-  list-style: none;
+  display: grid;
   margin: 0;
   padding: 0;
-  display: grid;
-  gap: 12px;
+  list-style: none;
 }
 .cvm-monitoring-events li {
   display: grid;
-  grid-template-columns: 150px 115px minmax(0, 1fr);
-  gap: 12px;
+  grid-template-columns: 7px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 10px;
+  padding: 7px 0;
   font-size: 12px;
   overflow-wrap: anywhere;
 }
-.cvm-monitoring-events time,
+.cvm-monitoring-events li + li {
+  border-top: 1px dashed var(--line-soft);
+}
+.cvm-monitoring-events time {
+  color: var(--ink-4);
+  font: 11px var(--mono);
+  white-space: nowrap;
+}
 .cvm-monitoring-events span {
+  grid-column: 2 / -1;
   color: var(--ink-3);
+  font-size: 11.5px;
 }
 .cvm-monitoring-events strong {
   font-weight: 500;
 }
 @container (max-width: 820px) {
-  .cvm-monitoring-kpis,
-  .cvm-health-facts {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
   .cvm-diagnostic-grid {
     grid-template-columns: minmax(0, 1fr);
-  }
-  .cvm-monitoring-events li {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    gap: 6px;
-  }
-  .cvm-monitoring-events li > span {
-    grid-column: 1/-1;
-  }
-  .cvm-rate-pair {
-    flex-direction: column;
-  }
-  .cvm-rate-pair > [aria-hidden] {
-    display: none;
   }
 }
 
@@ -1089,17 +1045,6 @@
 .cvm-design .cvm-instance-card {
   min-height: 210px;
 }
-.cvm-card-sub {
-  display: block;
-  overflow: hidden;
-  margin: 0;
-  padding: 0 0 12px;
-  color: var(--ink-3);
-  font-size: 12.5px;
-  line-height: 18px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .cvm-card-reason {
   display: -webkit-box;
   height: 46px;
@@ -1112,15 +1057,6 @@
   font-size: 12.5px;
   line-height: 20px;
   text-align: left;
-}
-.cvm-mode {
-  flex: none;
-  padding: 1px 6px;
-  border: 1px solid var(--node-card-hair);
-  border-radius: 5px;
-  color: var(--ink-3);
-  font-size: 11px;
-  line-height: 16px;
 }
 .cvm-capacity-rows {
   display: grid;
@@ -1146,20 +1082,20 @@
 .cvm-meter {
   position: relative;
   display: block;
-  height: 6px;
+  height: 4px;
   overflow: hidden;
-  border-radius: 3px;
+  border-radius: 2px;
   background: var(--cvm-track);
 }
 .cvm-meter > i,
 .cvm-meter > b {
   position: absolute;
   inset: 0 auto 0 0;
-  border-radius: 3px;
+  border-radius: 2px;
   background: var(--data);
 }
 .cvm-meter > b {
-  border-radius: 0 3px 3px 0;
+  border-radius: 0 2px 2px 0;
   background: repeating-linear-gradient(
     -45deg,
     color-mix(in srgb, var(--action) 55%, transparent) 0 3px,
@@ -1168,6 +1104,9 @@
 }
 .cvm-meter.bad > i {
   background: var(--err);
+}
+.cvm-meter.oversold > i {
+  background: var(--warn);
 }
 .cvm-card-footer {
   display: flex;
@@ -1193,87 +1132,8 @@
   cursor: default;
 }
 .cvm-host-terminal {
-  margin-top: auto;
-}
-.cvm-design .cvm-host-card-head {
-  margin-bottom: 4px;
-}
-.cvm-design .cvm-host-identity small {
-  font-size: 11px;
-}
-.cvm-design .cvm-quota-grid {
-  grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr));
-}
-.cvm-design .cvm-publication-grid,
-.cvm-design .cvm-entry-grid {
-  grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr));
-}
-.cvm-publication-card > header,
-.cvm-entry-card > header {
-  display: flex;
-  justify-content: space-between;
-  align-items: start;
-  gap: 10px;
-}
-.cvm-publication-card h3,
-.cvm-entry-card h3 {
-  margin: 0 0 4px;
-  font-size: 15px;
-}
-.cvm-publication-card header > div,
-.cvm-entry-card header > div {
+  flex: 1;
   min-width: 0;
-}
-.cvm-publication-card header small,
-.cvm-entry-card header small {
-  color: var(--ink-3);
-  font-size: 12px;
-}
-.cvm-publication-card .cvm-facts,
-.cvm-entry-card .cvm-facts {
-  margin: 12px 0;
-}
-.cvm-publication-card footer,
-.cvm-entry-card footer {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 1px solid var(--node-card-hair);
-}
-.cvm-network-figures {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  color: var(--ink-3);
-  font-size: 12px;
-}
-.cvm-network-figures b {
-  color: var(--ink);
-  font-size: 22px;
-}
-.cvm-network-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 10px;
-}
-.cvm-network-chips button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 9px;
-  border: 0;
-  border-radius: 13px;
-  background: var(--hover-2);
-  color: var(--ink-2);
-  font: 12px var(--sans);
-  cursor: pointer;
-}
-.cvm-network-chips small {
-  color: var(--gold);
 }
 .cvm-admission-switch {
   margin-left: auto;
@@ -1284,106 +1144,8 @@
   min-width: 0;
   margin: 0;
 }
-.cvm-design .cvm-section > header,
-.cvm-design .cvm-monitoring > header,
-.cvm-design .cvm-monitoring-view > .panel > header {
-  justify-content: space-between;
-}
 .cvm-design .cvm-detail {
   display: block;
-}
-.cvm-dashboard {
-  display: grid;
-  grid-template-columns: repeat(12, minmax(0, 1fr));
-  align-items: start;
-  gap: 12px;
-}
-.cvm-dashboard > .cvm-monitoring-view {
-  grid-column: span 7;
-}
-.cvm-dashboard > .cvm-widget-5 {
-  grid-column: span 5;
-}
-.cvm-dashboard > .cvm-widget-7 {
-  grid-column: span 7;
-}
-.cvm-dashboard > .cvm-widget-12 {
-  grid-column: span 12;
-}
-.cvm-dashboard > .cvm-section,
-.cvm-dashboard > .cvm-monitoring-view {
-  align-self: stretch;
-}
-.cvm-dashboard .cvm-monitoring {
-  height: 100%;
-  box-sizing: border-box;
-}
-.cvm-design .cvm-monitoring-kpis {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(0, 1.15fr);
-  gap: 14px;
-}
-.cvm-design .cvm-monitoring-kpis > div {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-  padding: 0;
-  border: 0;
-  background: none;
-}
-.cvm-gauge {
-  position: relative;
-  width: 58px;
-  height: 58px;
-  flex: none;
-}
-.cvm-gauge > b {
-  position: absolute;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  color: var(--ink);
-  font-size: 13px;
-}
-.cvm-gauge > .node-card-ring {
-  width: 58px;
-  height: 58px;
-}
-.cvm-gauge > .node-card-ring circle {
-  stroke-width: 1.1;
-}
-.cvm-reading-text {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
-  color: var(--ink-2);
-  font-size: 12px;
-}
-.cvm-reading-text > small {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--ink-3);
-  font-size: 11px;
-}
-.cvm-design .cvm-monitoring-kpis strong {
-  font-size: 13px;
-}
-.cvm-monitoring.compact .cvm-section-body {
-  gap: 12px;
-}
-.cvm-monitoring.compact .cvm-trend-caption {
-  display: flex;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 4px 12px;
-  margin: 0;
-  font-size: 11px;
-}
-.cvm-monitoring.compact .cvm-trend-caption > span:last-child {
-  margin-left: auto;
 }
 .cvm-design .cvm-ssh-command {
   display: block;
@@ -1428,17 +1190,6 @@
 .cvm-spec-widget .cvm-operation-detail[open] > .cvm-facts {
   margin-top: 14px;
 }
-.cvm-design .cvm-rate-pair {
-  flex-direction: column;
-  align-items: start;
-}
-.cvm-design .cvm-rate-pair > [aria-hidden] {
-  display: none;
-}
-.cvm-monitoring.compact .node-card-comet {
-  display: block;
-  margin: 6px 0 0;
-}
 .cvm-text-link {
   padding: 3px 4px;
   border: 0;
@@ -1448,76 +1199,40 @@
   font: 12.5px var(--sans);
   cursor: pointer;
 }
-.cvm-nic-summary {
-  display: grid;
-  gap: 12px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-.cvm-nic-summary > li {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-.cvm-nic-summary > li > span {
-  min-width: 0;
-}
-.cvm-nic-summary b {
-  font-size: 13px;
-}
-.cvm-nic-summary small {
-  display: block;
-  margin-top: 3px;
-  overflow-wrap: anywhere;
-  color: var(--ink-3);
-  font-size: 12px;
-}
-.cvm-nic-summary > li > span:last-child {
-  display: grid;
-  gap: 5px;
-  min-width: 100px;
-  text-align: right;
-  flex: none;
-  color: var(--ink-3);
-  font-size: 12px;
-}
 .cvm-design .cvm-attached-list {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
+  align-items: start;
+  gap: 14px;
+  margin: 0;
 }
 .cvm-design .cvm-attached {
   min-width: 0;
-  padding: 16px 18px 18px;
+  padding: 13px 14px 12px;
   border: 0;
-  border-radius: 18px;
+  border-radius: 14px;
   background: var(--cvm-card);
   box-shadow: var(--sheet-shadow);
 }
 .cvm-design .cvm-attached h3 {
-  font: 600 15px/22px var(--sans);
+  margin: 0;
+  font: 600 13.5px/20px var(--sans);
 }
-.cvm-design .cvm-network-workspace {
-  padding: 0;
-  background: transparent;
-  box-shadow: none;
+.cvm-design .cvm-attached > header {
+  margin-bottom: 6px;
+}
+.cvm-design .cvm-attached > footer {
+  margin: 12px -14px -12px;
+  padding: 9px 14px 10px;
+  border-top: 1px solid var(--line-soft);
 }
 .cvm-network-workspace > .cvm-section-body {
   display: grid;
   gap: 12px;
 }
-.cvm-network-workspace > header {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip-path: inset(50%);
-}
 .cvm-nic-device {
-  margin: 6px 0 12px;
+  margin: 0 0 6px;
+  font-family: var(--mono);
 }
 .cvm-nic-facts {
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1526,9 +1241,13 @@
 .cvm-nic-facts > div {
   grid-template-columns: 76px minmax(0, 1fr);
   align-items: start;
-  min-height: 35px;
-  padding: 8px 0;
-  border-bottom: 1px solid var(--line-soft);
+  min-height: 30px;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--line-soft);
+}
+.cvm-nic-usage {
+  display: grid;
+  gap: 5px;
 }
 .cvm-nic-facts dd > small {
   display: block;
@@ -1539,40 +1258,33 @@
   margin: 10px 0 0;
   font-size: 11px;
 }
+/* 挂载空位与网卡行同高，像组合台里「＋ 端口」那样排在列表末尾。 */
 .cvm-mount-slot {
   display: flex;
+  width: 100%;
   min-width: 0;
-  min-height: 150px;
-  flex-direction: column;
+  min-height: 34px;
   align-items: center;
-  justify-content: center;
-  gap: 7px;
-  border: 1px dashed var(--line);
-  border-radius: 18px;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px dashed color-mix(in srgb, var(--action) 40%, var(--line));
+  border-radius: 9px;
   background: transparent;
   color: var(--action);
-  font: 13px var(--sans);
+  font: 12.5px var(--sans);
   cursor: pointer;
 }
-.cvm-mount-slot > span {
-  font-size: 20px;
+.cvm-mount-slot > b {
+  font-weight: 500;
 }
 .cvm-mount-slot > small {
-  color: var(--ink-3);
-  font-size: 12px;
+  color: var(--ink-4);
+  font-size: 11px;
 }
 .cvm-mount-slot:disabled {
   opacity: 0.5;
   cursor: default;
-}
-.cvm-route-summary {
-  margin: 0;
-}
-.cvm-design .cvm-monitoring:not(.compact) {
-  padding: 0;
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
 }
 .cvm-monitor-bar {
   display: flex;
@@ -1580,25 +1292,6 @@
   justify-content: space-between;
   flex-wrap: wrap;
   gap: 12px;
-}
-.cvm-monitoring:not(.compact) .cvm-health-facts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding-top: 0;
-  border: 0;
-}
-.cvm-monitoring:not(.compact) .cvm-health-facts > div {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 6px 10px;
-  border-radius: 14px;
-  background: var(--cvm-card);
-}
-.cvm-monitoring:not(.compact) .cvm-health-facts :is(dt, dd) {
-  font-size: 12px;
 }
 .cvm-health-scopes {
   margin-top: 14px;
@@ -1641,22 +1334,6 @@
   border: 0;
   padding-inline: 0;
 }
-.cvm-route-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12px;
-}
-.cvm-route-table th,
-.cvm-route-table td {
-  padding: 10px 8px;
-  border-bottom: 1px solid var(--line);
-  text-align: left;
-  overflow-wrap: anywhere;
-}
-.cvm-route-table th {
-  color: var(--ink-3);
-  font-weight: 500;
-}
 .cvm-config-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 340px;
@@ -1666,7 +1343,7 @@
 .cvm-design .cvm-create > .cvm-config-layout > .cvm-form-fieldset {
   display: grid;
   min-width: 0;
-  gap: 12px;
+  gap: 20px;
 }
 .cvm-pick-grid {
   display: grid;
@@ -1679,9 +1356,9 @@
   flex-direction: column;
   gap: 6px;
   padding: 12px 14px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: transparent;
+  border: 1.5px solid transparent;
+  border-radius: 14px;
+  background: var(--cvm-card);
   color: var(--ink-2);
   font: 13px var(--sans);
   text-align: left;
@@ -1698,7 +1375,6 @@
 }
 .cvm-pick.on {
   border-color: var(--action);
-  background: var(--action-wash);
 }
 .cvm-pick:disabled {
   opacity: 0.5;
@@ -1724,69 +1400,25 @@
 .cvm-config-summary {
   position: sticky;
   top: 20px;
-  min-width: 0;
-  padding: 20px;
-  border-radius: 18px;
-  background: var(--cvm-card);
-  box-shadow: var(--sheet-shadow);
-}
-.cvm-config-summary h2 {
-  margin: 0;
-  overflow-wrap: anywhere;
-  font-size: 20px;
-  font-weight: 600;
-}
-.cvm-config-summary > p {
-  color: var(--ink-3);
-  font-size: 12.5px;
-}
-.cvm-config-summary h3 {
-  margin: 20px 0 12px;
-  font-size: 13px;
-  font-weight: 600;
+  display: grid;
+  gap: 14px;
+  padding: 14px;
 }
 .cvm-config-summary .cvm-capacity-row {
-  margin-top: 10px;
+  margin-top: 8px;
   grid-template-columns: 40px minmax(12px, 1fr) auto;
-  gap: 7px;
+  gap: 8px;
   font-size: 12px;
-}
-.cvm-summary-figures {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-  padding: 20px 0;
-  border-block: 1px solid var(--line);
-}
-.cvm-summary-figures span {
-  min-width: 0;
-}
-.cvm-summary-figures b {
-  display: block;
-  overflow-wrap: anywhere;
-  font-size: 22px;
-  font-weight: 600;
-}
-.cvm-summary-figures small {
-  display: block;
-  color: var(--ink-3);
-  font-size: 11.5px;
 }
 .cvm-design .cvm-submit {
   display: grid;
-  margin-top: 20px;
+  gap: 8px;
   padding: 0;
 }
 .cvm-design .cvm-submit > button {
   width: 100%;
 }
 @container (max-width: 1080px) {
-  .cvm-dashboard > .cvm-monitoring-view,
-  .cvm-dashboard > .cvm-widget-5,
-  .cvm-dashboard > .cvm-widget-7,
-  .cvm-dashboard > .cvm-widget-12 {
-    grid-column: span 12;
-  }
   .cvm-config-layout {
     grid-template-columns: minmax(0, 1fr) 300px;
     gap: 12px;
@@ -1802,9 +1434,6 @@
   .cvm-design .cvm-attached-list,
   .cvm-nic-facts {
     grid-template-columns: minmax(0, 1fr);
-  }
-  .cvm-design .cvm-monitoring-kpis {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 @media (max-width: 820px) {
@@ -1834,10 +1463,6 @@
   }
   .cvm-design .cvm-page-head .nd-tools .btn {
     min-height: 32px;
-  }
-  .cvm-design .cvm-section,
-  .cvm-design .cvm-monitoring {
-    padding: 14px;
   }
   .cvm-design .cvm-detail .cvm-page-heading {
     min-width: 0;
@@ -1873,20 +1498,26 @@
   color: var(--ink-3);
 }
 .cvm-resource-field {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 12px;
+  display: grid;
+  align-content: start;
+  gap: 8px;
   min-width: 0;
 }
 .cvm-resource-field > label {
-  display: grid;
-  gap: 5px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
   color: var(--ink-2);
   font-size: 13px;
+  font-weight: 600;
 }
 .cvm-resource-field > label > small {
+  color: var(--ink-3);
+  font-size: 11px;
+  font-weight: 400;
+}
+.cvm-resource-hint {
   color: var(--ink-3);
   font-size: 11.5px;
 }
@@ -1913,6 +1544,7 @@
   cursor: default;
 }
 .cvm-stepper > .f {
+  flex: 1;
   width: 84px;
   min-width: 0;
   height: 34px;
@@ -1924,9 +1556,6 @@
 }
 .cvm-stepper > .f::-webkit-inner-spin-button {
   appearance: none;
-}
-.cvm-create .cvm-form-grid:has(> .cvm-resource-field) {
-  grid-template-columns: minmax(0, 1fr);
 }
 .cvm-page.cvm-design > .nd-paper > .cvm-page-head {
   display: flex;
@@ -2027,8 +1656,9 @@
 .cz-board {
   position: relative;
   display: grid;
+  /* 走线带固定在 64–96px：太窄时出口线标签会压住两侧卡片，按比例放宽又会把计算栏挤窄、截断容器名。 */
   grid-template-columns:
-    minmax(250px, 1.05fr) minmax(56px, 0.32fr) minmax(220px, 0.92fr) minmax(56px, 0.32fr)
+    minmax(250px, 1.05fr) minmax(64px, 96px) minmax(240px, 1fr) minmax(64px, 96px)
     minmax(210px, 0.86fr);
   align-items: start;
 }
@@ -2221,7 +1851,8 @@
   font: 400 11px var(--mono);
 }
 
-/* 插座：入口行在机器条右缘、出口在左缘、容器左右各一个端口 */
+/* 插座统一落在卡片边缘：入口行在机器卡右缘、出口在左缘、容器端口在宿主卡左右边缘。
+   连线画在卡片下层，只在走线带里可见，不会从卡片内边距里穿过。 */
 .cz-socket,
 .cz-port {
   position: absolute;
@@ -2248,25 +1879,49 @@
   border-color: var(--ink-3);
 }
 .cz-port.in {
-  left: -6px;
+  left: -18.5px;
 }
 .cz-port.out {
-  right: -6px;
+  right: -18.5px;
   cursor: crosshair;
 }
 
 .cz-host {
   padding: 12px;
 }
-.cz-host-free {
-  margin-left: auto;
+/* 宿主读数：vCPU 与内存各一格「标签 · 数值 / 细条」，已预留 / 可分配。 */
+.cz-cap {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin: 8px 0 10px;
+}
+.cz-cap > span {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 4px 6px;
+  min-width: 0;
+}
+.cz-cap small {
   color: var(--ink-3);
-  font-size: 11.5px;
+  font-size: 11px;
+}
+.cz-cap b {
+  justify-self: end;
+  overflow: hidden;
+  color: var(--ink-2);
+  font-size: 11px;
+  font-weight: 500;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
+.cz-cap .cz-meter {
+  grid-column: 1 / -1;
+}
 .cz-meter {
+  display: block;
   height: 3px;
-  margin: 9px 0 10px;
   overflow: hidden;
   border-radius: 2px;
   background: color-mix(in srgb, var(--ink) 10%, transparent);
@@ -2426,9 +2081,13 @@
   position: absolute;
   top: 0;
   left: 0;
-  z-index: 2;
+  z-index: 0;
   overflow: visible;
   pointer-events: none;
+}
+/* 标签、把手、待确认与拖动中的线浮在卡片之上。 */
+.cz-wires-over {
+  z-index: 3;
 }
 .cz-wire path {
   fill: none;
@@ -2468,13 +2127,13 @@
 .cz-wire.live circle {
   fill: var(--action);
 }
-.cz-wire text {
+.cz-wire-label rect {
+  fill: var(--node-card-fill);
+  stroke: color-mix(in srgb, var(--action) 40%, var(--line));
+}
+.cz-wire-label text {
   fill: var(--ink-2);
-  font: 10.5px var(--mono);
-  paint-order: stroke;
-  stroke: var(--sheet);
-  stroke-width: 4px;
-  stroke-linejoin: round;
+  font: 10px var(--mono);
 }
 .cz-handle {
   fill: var(--action);
@@ -2500,10 +2159,49 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  min-height: 46px;
+  min-height: 28px;
   box-sizing: border-box;
-  padding: 0 0 10px;
-  border-bottom: 1px solid var(--line);
+}
+.cz-insp-head > small {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.cz-insp-sub {
+  margin: 2px 0 0;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+/* 选中容器的三格读数：与宿主卡同一种细条，未知时显示 — 且条为空。 */
+.cz-readings {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 12px 0 2px;
+}
+.cz-reading {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 4px 6px;
+}
+.cz-reading > small {
+  color: var(--ink-3);
+  font-size: 11px;
+}
+.cz-reading > b {
+  justify-self: end;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.cz-reading > .cz-meter {
+  grid-column: 1 / -1;
+}
+.cz-reading.tone-warn .cz-meter > i {
+  background: var(--gold);
+}
+.cz-reading.tone-bad .cz-meter > i {
+  background: var(--err);
 }
 .cz-insp-head > b {
   min-width: 0;
@@ -2514,8 +2212,8 @@
 }
 .cz-insp-body {
   display: grid;
-  gap: 4px;
-  padding: 10px 0 0;
+  gap: 0;
+  margin-top: 12px;
 }
 .cz-insp-body > .note {
   margin: 0 0 4px;
@@ -2525,32 +2223,59 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  margin-top: 8px;
-}
-.cz-insp-section:first-child {
-  margin-top: 0;
+  margin-top: 12px;
+  padding-top: 11px;
+  border-top: 1px solid var(--line-soft);
 }
 .cz-insp-label {
-  color: var(--ink-4);
+  color: var(--ink-3);
   font-size: 11.5px;
+  font-weight: 500;
+}
+.cz-insp-label > small {
+  margin-left: 4px;
+  color: var(--ink-4);
+  font-size: 11px;
+  font-weight: 400;
 }
 .cz-row-action {
   font-size: 12px;
 }
+/* 检查器的入口与出口两行一组：第一行完整显示地址，第二行是目标、来源与操作。 */
 .cz-row {
-  display: flex;
-  min-width: 0;
-  min-height: 28px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  gap: 7px;
+  column-gap: 8px;
+  min-width: 0;
+  padding: 5px 0;
   font-size: 13px;
 }
-.cz-row > b {
+.cz-row + .cz-row {
+  border-top: 1px dashed var(--line-soft);
+}
+.cz-row-sub {
+  display: flex;
+  grid-column: 2 / -1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 22px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.cz-row-sub > span:first-child {
   min-width: 0;
   overflow: hidden;
-  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.cz-row-acts {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
 }
 .cz-row-text {
   min-width: 0;
@@ -2568,35 +2293,14 @@
 .cz-row.local .cz-row-text {
   color: var(--ink-2);
 }
-.cz-row > .btn.icon {
+.cz-row .btn.icon {
   width: 22px;
   min-width: 22px;
   height: 22px;
   padding: 0;
 }
-.cz-rtt {
-  margin-left: auto;
-  color: var(--ink-3);
-  font-size: 11.5px;
-  white-space: nowrap;
-}
-.cz-rtt.mono {
-  font: 11px var(--mono);
-}
 .cz-none {
   margin: 0;
-}
-.cz-rings {
-  margin-top: 8px;
-}
-.cz-now {
-  margin: 0;
-  color: var(--ink-3);
-  font-size: 12.5px;
-}
-.cz-now > b {
-  color: var(--ink-2);
-  font-weight: 600;
 }
 .cz-insp-foot {
   display: flex;
@@ -2609,16 +2313,50 @@
   margin-left: auto;
 }
 .cz-figures {
-  margin: 2px 0 6px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.cz-figures > span {
+  display: grid;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: var(--sunk);
+}
+.cz-figures b {
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+.cz-figures small {
+  color: var(--ink-3);
+  font-size: 11px;
 }
 .cz-split {
-  margin: 0 0 6px;
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  gap: 6px 10px;
+  margin: 12px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-soft);
+  font-size: 12px;
+}
+.cz-split dt {
+  color: var(--ink-3);
+}
+.cz-split dd {
+  margin: 0;
+  color: var(--ink-2);
+}
+.cz-split-warn {
+  color: var(--gold);
 }
 .cz-legend {
   display: grid;
   gap: 8px;
-  margin: 4px 0 2px;
-  padding: 0;
+  margin: 12px 0 0;
+  padding: 12px 0 0;
+  border-top: 1px solid var(--line-soft);
   list-style: none;
 }
 .cz-legend > li {
@@ -2639,6 +2377,33 @@
 .cz-legend i.private {
   border-top-color: var(--ink-3);
 }
+.cz-legend i.pending {
+  border-top: 2px dotted var(--gold);
+}
+.cz-tips {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 12px 0 0;
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink-3);
+  font-size: 12px;
+  list-style: none;
+}
+.cz-tips > li {
+  display: grid;
+  grid-template-columns: 11px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+.cz-tip-socket {
+  width: 11px;
+  height: 11px;
+  box-sizing: border-box;
+  margin-top: 4px;
+  border: 2px solid var(--action);
+  border-radius: 50%;
+}
 .cz-field {
   display: grid;
   gap: 6px;
@@ -2648,6 +2413,8 @@
 
 /* ── 拟定变更 ── */
 .cz-proposal {
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
   display: grid;
   gap: 6px;
   margin: 10px 0 0;
@@ -2656,10 +2423,15 @@
   border-radius: 10px;
   background: var(--action-wash);
 }
+.cz-proposal > * {
+  min-width: 0;
+}
 .cz-proposal > b {
+  overflow-wrap: anywhere;
   font-size: 13.5px;
 }
 .cz-proposal > ul {
+  overflow-wrap: anywhere;
   margin: 0;
   padding-left: 16px;
   color: var(--ink-2);
@@ -2674,7 +2446,7 @@
 }
 .cz-prop-fields {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   margin-top: 2px;
 }
@@ -2698,6 +2470,7 @@
 /* ── 手机：按机器分组的清单 ── */
 .cz-phone {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
 }
 .cz-phone-host > header {
@@ -2715,6 +2488,8 @@
 }
 .cz-phone-row {
   display: grid;
+  /* 单列也要允许收缩：auto 列会按不换行的长名称撑宽整行。 */
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
   width: 100%;
   box-sizing: border-box;
@@ -2785,6 +2560,44 @@
 }
 
 /* 生产补充：入口状态、占用与只读。 */
+.cz-state-dot {
+  display: inline-block;
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--gold);
+  vertical-align: 1px;
+}
+.cz-state-dot.failed,
+.cz-state-dot.unauthorized {
+  background: var(--err);
+}
+.cz-state-dot.releasing {
+  background: var(--ink-4);
+}
+.cz-net-sub {
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-log-button.icon {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  margin-left: auto;
+  padding: 0;
+  color: var(--ink-4);
+}
+.cvm-log-button.icon:hover {
+  background: var(--hover);
+  color: var(--ink-2);
+}
 .cz-addr-group {
   display: contents;
 }
@@ -2868,35 +2681,1419 @@
     border-color: var(--line);
   }
 }
-.cvm-entry-list {
+
+/* Shared read-only network configuration logs for entry, compute and egress. */
+.cvm-log-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.cvm-network-log-dialog {
+  width: min(960px, calc(100vw - 32px));
+}
+.cvm-network-log-body {
   display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+.cvm-log-machines,
+.cvm-log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cvm-log-machines .on {
+  color: var(--action);
+  border-color: currentColor;
+}
+.cvm-log-toolbar label {
+  display: inline-flex;
+  align-items: center;
   gap: 6px;
+  font-size: 12px;
+}
+.cvm-log-toolbar select {
+  width: auto;
+  min-width: 120px;
+  color: var(--ink);
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  padding: 5px 8px;
+  font: inherit;
+}
+.cvm-log-toolbar .cvm-log-history {
+  margin-right: auto;
+}
+.cvm-log-freshness {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.cvm-log-freshness span {
+  display: block;
+  margin-top: 3px;
+}
+.cvm-log-domains {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  font-size: 12px;
+}
+.cvm-log-domains strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.cvm-log-progress {
+  display: grid;
+  gap: 8px;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+.cvm-log-progress li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: baseline;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.cvm-network-log-events {
+  max-height: 52vh;
+  min-height: 120px;
+  overflow: auto;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.cvm-network-log-events li {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.cvm-network-log-events li:last-child {
+  border-bottom: 0;
+}
+.cvm-network-log-events li > div {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 10px;
+  color: var(--ink-3);
+  font-size: 11px;
+}
+.cvm-network-log-events pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 5px 0 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.65;
+}
+.cvm-network-log-events .error b,
+.cvm-log-domains strong,
+.cvm-log-freshness strong {
+  color: var(--err);
+}
+@media (max-width: 820px) {
+  .cvm-network-log-dialog {
+    width: calc(100vw - 16px);
+  }
+  .cvm-network-log-events pre {
+    font-size: 11px;
+  }
+}
+
+/* ══ 容器页的设计语言：取自组合台 ══
+   栏头是粗体标题加灰色计数，操作靠右；内容落在无边框卡片上；地址等宽并带 L3/L4 标记；
+   读数用细条；状态用圆点。二级页签、实例详情与创建页都按这套语言排布。 */
+.cvm-lane-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 24px;
+  padding: 0 4px 8px;
+}
+.cvm-lane-head > h2 {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.cvm-lane-head > small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-lane-aside {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.cvm-step-no {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--action-wash);
+  color: var(--action);
+  font: 600 11px var(--mono);
+}
+.cvm-lane-note {
+  margin: 0 4px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.cvm-tile {
+  position: relative;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 12px 14px;
+  /* 与共享 .panel 的正文字号一致。 */
+  font-size: 12.5px;
+  border-radius: 14px;
+  background: var(--node-card-fill);
+  box-shadow: var(--sheet-shadow);
+}
+.cvm-section {
+  display: flex;
+  flex-direction: column;
+}
+.cvm-section > .cvm-section-body {
+  flex: 1;
+}
+
+/* 标题图标右下角的状态灯，与机器详情一致。 */
+.cvm-plate > .node-lamp {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  width: 9px;
+  height: 9px;
+  box-shadow: 0 0 0 2px var(--sheet);
+}
+.cvm-ident-meta {
+  font: 11.5px var(--sans);
+  letter-spacing: 0;
+}
+
+/* ── 实例详情 ── */
+.cvm-detail-tab {
+  display: grid;
+  gap: 22px;
+  min-width: 0;
+}
+.cvm-overview-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr) minmax(0, 1.15fr);
+  align-items: stretch;
+  gap: 14px;
+}
+
+/* 小组合台：入口 → 网卡 → 出口。插座落在卡片边缘，线走在卡片下层。 */
+.cvm-flow {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(56px, 88px) minmax(0, 1.05fr) minmax(56px, 88px) minmax(0, 1fr);
+  align-items: start;
+}
+.cvm-flow-col {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+}
+.cvm-flow-col.in {
+  grid-column: 1;
+}
+.cvm-flow-col.mid {
+  grid-column: 3;
+}
+.cvm-flow-col.out {
+  grid-column: 5;
+}
+.cvm-flow-col > .cvm-lane-head {
+  padding-bottom: 0;
+}
+.cvm-flow .cz-socket.idle,
+.cvm-flow .cz-port.idle {
+  opacity: 1;
+}
+.cvm-flow-list {
+  padding: 6px 12px;
+}
+.cvm-flow-list > ul {
   margin: 0;
   padding: 0;
   list-style: none;
 }
-.cvm-entry-list > li {
+.cvm-flow-entry {
+  position: relative;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 8px;
+  min-height: 32px;
+  padding: 4px 6px;
+}
+.cvm-flow-entry + .cvm-flow-entry {
+  border-top: 1px dashed var(--line-soft);
+}
+.cvm-flow-entry > code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font: 11.5px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-flow-entry > .cz-socket {
+  right: -17.5px;
+}
+.cvm-flow-target {
+  display: inline-flex;
+  align-items: center;
+  color: var(--ink-3);
+  font: 11px var(--mono);
+  white-space: nowrap;
+}
+.cvm-flow-sub {
+  display: flex;
+  grid-column: 2 / -1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 26px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.cvm-flow-sub > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-flow-acts {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+.cvm-flow-entry > .cvm-notice {
+  grid-column: 1 / -1;
+  margin: 4px 0;
+}
+.cvm-flow-empty {
+  margin: 6px;
+}
+.cvm-flow-box {
+  padding: 13px 14px 12px;
+}
+.cvm-flow-box-head {
+  display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
 }
-.cvm-entry-address {
+.cvm-flow-box-head > b {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-flow-box-head > small {
+  flex: none;
+  margin-left: auto;
+  color: var(--ink-3);
+  font: 11.5px var(--mono);
+}
+.cvm-flow-box-sub {
+  margin: 2px 0 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-flow-nics {
+  display: grid;
+  gap: 6px;
+  margin: 11px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.cvm-flow-nic {
+  position: relative;
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  box-sizing: border-box;
+  padding: 5px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--ink) 3%, var(--node-card-fill));
+  font-size: 12px;
+}
+.cvm-flow-dev {
+  overflow: hidden;
+  color: var(--ink-3);
+  font: 11px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-flow-nic-name {
+  display: grid;
+  min-width: 0;
+  color: var(--ink);
+  font-weight: 500;
+}
+.cvm-flow-nic-name,
+.cvm-flow-nic-name > small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-flow-nic-name > small {
+  color: var(--ink-3);
+  font-size: 11px;
+  font-weight: 400;
+}
+.cvm-flow-ip {
+  max-width: 15em;
+  overflow: hidden;
+  color: var(--ink-2);
+  font: 11.5px var(--mono);
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-flow-nic > .cz-port.in {
+  left: -19.5px;
+}
+.cvm-flow-nic > .cz-port.out {
+  right: -19.5px;
+  cursor: default;
+}
+.cvm-flow-exit {
+  padding: 11px 14px 10px 16px;
+}
+.cvm-flow-exit > .cz-socket {
+  left: -5.5px;
+  border-color: var(--ink-3);
+}
+.cvm-flow-exit-head {
   display: flex;
-  flex-wrap: wrap;
-  column-gap: 8px;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
 }
-.cvm-entry-address > code {
+.cvm-flow-exit-head > b {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-flow-exit-sub {
+  margin: 2px 0 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-flow-routes {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.cvm-flow-routes > li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.cvm-flow-routes > li + li {
+  border-top: 1px dashed var(--line-soft);
+}
+.cvm-flow-routes code {
+  overflow: hidden;
+  color: var(--ink);
+  font: 11.5px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-flow-routes > li > span:last-child {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.cvm-flow-routes > li.cvm-flow-unused {
+  display: block;
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.cvm-flow-usage {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  margin-top: 9px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.cvm-flow-usage b {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+
+/* 运行读数：四格，数值 + 近一小时曲线。 */
+.cvm-monitoring-view.compact {
+  gap: 0;
+}
+.cvm-stat-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+.cvm-stat {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  padding: 12px 14px 10px;
+}
+.cvm-stat-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.cvm-stat-head > small {
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-stat-value {
+  display: flex;
+  align-items: baseline;
+  gap: 3px;
+  min-width: 0;
+  white-space: nowrap;
+}
+.cvm-stat-value b {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+.cvm-stat-value u {
+  margin-right: 6px;
+  color: var(--ink-3);
+  font-size: 12px;
+  text-decoration: none;
+}
+.cvm-stat-value > small {
+  margin-left: auto;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.cvm-stat-value.cvm-rate-pair {
+  gap: 4px;
+}
+.cvm-stat-value.cvm-rate-pair > span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+}
+.cvm-stat .node-card-comet {
+  display: block;
+  margin-top: 4px;
+}
+
+/* 监控工具栏：范围、网卡与健康状态同一行，状态用圆点。 */
+.cvm-monitoring-view:not(.compact) {
+  gap: 16px;
+}
+.cvm-health {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 16px;
+  margin: 0;
+  padding: 0;
+  color: var(--ink-3);
+  font-size: 12px;
+  list-style: none;
+}
+.cvm-health > li {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+.cvm-health b {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.cvm-health-sampling {
+  color: var(--ink-2);
+}
+
+/* ── 网络页签：入口地址在左、出口网络在右，与组合台一致 ── */
+.cvm-network-lanes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 22px 28px;
+}
+.cvm-network-lane {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  min-width: 0;
+}
+.cvm-network-lane > .cvm-lane-head {
+  padding-bottom: 0;
+}
+.cvm-network-lane > .cvm-lane-note {
+  margin-top: -6px;
+}
+.cvm-network-cards {
+  display: grid;
+  gap: 12px;
+}
+.cvm-publication-card,
+.cvm-entry-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.cvm-pub-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.cvm-pub-head > h3 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: 13.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-pub-sub {
+  margin: -8px 0 0;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.cvm-pub-facts {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px 12px;
+  margin: 0;
+  font-size: 12px;
+}
+.cvm-pub-facts dt {
+  color: var(--ink-3);
+}
+.cvm-pub-facts dd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  min-width: 0;
+  margin: 0;
+  color: var(--ink-2);
+}
+.cvm-pub-facts code {
+  padding: 1px 7px;
+  border-radius: 5px;
+  background: var(--sunk);
+  color: var(--ink-2);
+  font: 11.5px var(--mono);
+}
+.cvm-pub-rows {
+  display: grid;
+  gap: 4px;
+}
+.cvm-pub-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 8px;
+  border-radius: 7px;
+  background: var(--sunk);
+  font-size: 12px;
+}
+.cvm-pub-row > code {
+  color: var(--ink);
+  font: 11.5px var(--mono);
+}
+.cvm-pub-range {
+  color: var(--ink-3);
+  font: 11px var(--mono);
+}
+.cvm-pub-use {
+  margin-left: auto;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+.cvm-pub-figure {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.cvm-pub-figure b {
+  color: var(--ink);
+  font-weight: 600;
+}
+.cvm-pub-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.cvm-pub-pills > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--ink) 3%, var(--node-card-fill));
+  color: var(--ink);
+  font: 12px var(--sans);
+  cursor: pointer;
+}
+.cvm-pub-pills b {
+  font-weight: 600;
+}
+.cvm-pub-pills small {
+  color: var(--gold);
+  font-size: 11px;
+}
+.cvm-pub-foot,
+.cvm-host-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: auto -14px -12px;
+  padding: 9px 14px 10px;
+  border-top: 1px solid var(--line-soft);
+}
+
+/* ── 宿主页签 ── */
+.cvm-host-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(380px, 100%), 1fr));
+  gap: 14px;
+}
+.cvm-host-mark {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--sunk);
+  color: var(--ink-3);
+}
+/* 数值列定宽，三行细条与相邻卡片的细条对齐。 */
+.cvm-host-card .cvm-capacity-row {
+  grid-template-columns: 52px minmax(20px, 1fr) 10.5em;
+}
+.cvm-host-muted .cvm-meter > i {
+  background: var(--ink-4);
+}
+.cvm-host-sub {
+  margin: 0;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.cvm-host-error {
+  margin: 0;
+}
+.cvm-host-pills {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+.cvm-host-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  height: 30px;
+  box-sizing: border-box;
+  padding: 0 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--ink) 3%, var(--node-card-fill));
+  color: var(--ink);
+  font: 12px var(--sans);
+  text-align: left;
+}
+button.cvm-host-pill {
+  cursor: pointer;
+}
+.cvm-host-pill > b {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-host-pill > small {
+  flex: none;
+  color: var(--ink-3);
+  font: 11px var(--mono);
+}
+.cvm-host-pill > em {
+  margin-left: auto;
+  color: var(--action);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 600;
+}
+.cvm-host-pill.new {
+  border: 1.5px dashed var(--action);
+  background: var(--action-wash);
+}
+.cvm-host-empty {
+  display: grid;
+  height: 30px;
+  margin: 0;
+  place-items: center;
+  border: 1px dashed var(--line);
+  border-radius: 9px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.cvm-host-foot .cvm-card-footer {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.cvm-host-foot-error {
+  flex-basis: 100%;
+}
+
+/* ── 额度页签：多位用户横向比较 ── */
+.cvm-quota-roster {
+  padding: 10px 6px 4px;
+  overflow-x: auto;
+}
+.cvm-quota-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 12px;
+}
+.cvm-quota-table th {
+  padding: 0 12px 9px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-3);
+  font-size: 11.5px;
+  font-weight: 500;
+  text-align: left;
+  white-space: nowrap;
+}
+.cvm-quota-table td {
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  vertical-align: middle;
+}
+.cvm-quota-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+@media (hover: hover) {
+  .cvm-quota-table tbody tr:hover td {
+    background: var(--hover);
+  }
+}
+.cvm-quota-user {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.cvm-quota-user > i {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--action-wash);
+  color: var(--action);
+  font-style: normal;
+  font-weight: 600;
+}
+.cvm-quota-user > span {
+  display: grid;
+  min-width: 0;
+}
+.cvm-quota-user b {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-quota-user small {
+  color: var(--ink-3);
+  font-size: 11px;
+}
+.cvm-quota-hosts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.cvm-quota-cell {
+  display: grid;
+  gap: 5px;
+  min-width: 84px;
+}
+.cvm-quota-cell > span {
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+.cvm-quota-cell b {
+  color: var(--ink);
+  font-weight: 600;
+}
+.cvm-quota-cell.warn .cvm-meter > i {
+  background: var(--gold);
+}
+.cvm-quota-none {
+  color: var(--ink-4);
+}
+.cvm-quota-net {
+  display: grid;
+  gap: 1px;
+  white-space: nowrap;
+}
+.cvm-quota-net b {
+  font-weight: 500;
+}
+.cvm-quota-net b.ok {
+  color: var(--ok);
+}
+.cvm-quota-net b.warn {
+  color: var(--gold);
+}
+.cvm-quota-net b.bad {
+  color: var(--err);
+}
+.cvm-quota-net small {
+  color: var(--ink-3);
+  font-size: 11px;
+}
+.cvm-quota-card.off .cvm-quota-user > i {
+  background: var(--sunk);
+  color: var(--ink-4);
+}
+.cvm-quota-action {
+  text-align: right;
+  white-space: nowrap;
+}
+.cvm-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ── 创建容器 ── */
+.cvm-host-picks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(230px, 100%), 1fr));
+  gap: 12px;
+}
+.cvm-host-pick {
+  display: grid;
+  gap: 2px;
+  border: 1.5px solid transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.cvm-host-pick.on {
+  border-color: var(--action);
+}
+.cvm-host-pick:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.cvm-host-pick-head > b {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.cvm-host-pick > .cz-cap {
+  margin: 8px 0 4px;
+}
+.cvm-host-pick .cz-cap > span {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto 1fr auto;
+}
+.cvm-host-pick .cz-cap b {
+  min-width: 0;
+  justify-self: stretch;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.cvm-host-pick > small {
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.cvm-host-pick > small.cvm-host-pick-why {
+  color: var(--gold);
+}
+.cvm-spec-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px 20px;
+}
+.cvm-create-nic {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  max-width: 560px;
+  min-height: 40px;
+  box-sizing: border-box;
+  margin-bottom: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--ink) 3%, var(--node-card-fill));
+}
+.cvm-create-nic > span:nth-child(2) {
+  display: grid;
+  min-width: 0;
+}
+.cvm-create-nic b {
+  font-weight: 500;
+}
+.cvm-create-nic small {
+  color: var(--ink-3);
+  font-size: 11px;
+}
+.cvm-config-summary > .cvm-lane-head,
+.cvm-summary-quota > .cvm-lane-head {
+  padding: 0;
+}
+.cvm-summary-host {
+  padding: 10px 12px 12px;
+  border-radius: 11px;
+  background: var(--sunk);
+}
+.cvm-summary-host-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.cvm-summary-host-head > b {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-summary-host-head > small {
+  margin-left: auto;
+  color: var(--ink-3);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.cvm-summary-pills {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+.cvm-summary-pills > .cvm-host-pill:not(.new) {
+  background: var(--node-card-fill);
+}
+.cvm-summary-host > .note {
+  margin: 8px 0 0;
+}
+
+/* ── 窄屏 ── */
+@container (max-width: 1080px) {
+  .cvm-overview-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .cvm-overview-row > .cvm-recent-events {
+    grid-column: 1 / -1;
+  }
+  .cvm-stat-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@container (max-width: 820px) {
+  .cvm-flow {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+  .cvm-flow-col.in,
+  .cvm-flow-col.mid,
+  .cvm-flow-col.out {
+    grid-column: 1;
+  }
+  .cvm-flow-col.mid {
+    order: -1;
+  }
+  .cvm-flow-box-head {
+    display: grid;
+    grid-template-columns: 6px minmax(0, 1fr);
+    gap: 4px 8px;
+  }
+  .cvm-flow-box-head > b {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .cvm-flow-box-head > small {
+    grid-column: 2;
+    margin-left: 0;
+  }
+  .cvm-flow-nic {
+    grid-template-columns: 52px minmax(0, 1fr);
+    gap: 4px 8px;
+  }
+  .cvm-flow-nic-name,
+  .cvm-flow-nic-name > small {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .cvm-flow-ip {
+    grid-column: 2;
+    max-width: none;
+    text-align: left;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .cvm-flow > .cz-wires,
+  .cvm-flow .cz-socket,
+  .cvm-flow .cz-port {
+    display: none;
+  }
+  .cvm-network-lanes,
+  .cvm-overview-row,
+  .cvm-spec-grid,
+  .cvm-host-pills {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .cvm-stat-row {
+    gap: 10px;
+  }
+  .cvm-stat-value b {
+    font-size: 19px;
+  }
+  .cvm-quota-roster {
+    padding: 4px 0;
+  }
+  .cvm-quota-table,
+  .cvm-quota-table tbody,
+  .cvm-quota-table tr,
+  .cvm-quota-table td {
+    display: block;
+  }
+  .cvm-quota-table thead {
+    display: none;
+  }
+  .cvm-quota-table tr {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px 12px;
+    padding: 12px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .cvm-quota-table tbody tr:last-child {
+    border-bottom: 0;
+  }
+  .cvm-quota-table td {
+    padding: 0;
+    border: 0;
+  }
+  .cvm-quota-table td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 2px;
+    color: var(--ink-4);
+    font-size: 11px;
+  }
+  .cvm-quota-table td.wide {
+    grid-column: 1 / -1;
+  }
+  .cvm-quota-table td:first-child {
+    grid-column: 1 / 3;
+  }
+  .cvm-quota-table td.cvm-quota-action {
+    grid-row: 1;
+    grid-column: 3;
+    align-self: center;
+  }
+  .cvm-quota-cell {
+    min-width: 0;
+  }
+}
+
+.cvm-artifacts {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.cvm-artifact-files {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.cvm-artifact-file {
+  display: grid;
+  gap: 6px;
+  padding: 14px;
+  text-align: left;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  cursor: pointer;
+  min-width: 0;
+}
+.cvm-artifact-file code {
+  overflow-wrap: anywhere;
+  font-size: 11px;
+}
+.cvm-artifact-file span {
+  color: var(--ink-3);
+  font-size: 11px;
+}
+.cvm-artifact-file.active {
+  border-color: var(--action);
+  background: color-mix(in srgb, var(--action) 10%, transparent);
+}
+.cvm-artifact-status {
+  padding: 10px 12px;
+  border-left: 3px solid var(--action);
+  background: color-mix(in srgb, var(--action) 10%, transparent);
+  margin: 12px 0;
+  overflow-wrap: anywhere;
+}
+.cvm-artifact-meta {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+}
+.cvm-artifact-meta > div {
+  display: grid;
+  grid-template-columns: 145px minmax(0, 1fr);
+  gap: 10px;
+}
+.cvm-artifact-meta dt {
+  color: var(--ink-3);
+}
+.cvm-artifact-meta dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.cvm-artifact-tools {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.cvm-artifact-content {
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  max-height: 560px;
+  overflow: auto;
+  padding: 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.65;
+}
+.cvm-artifact-content span {
+  display: block;
+  white-space: pre;
+}
+.cvm-artifact-content .added {
+  background: color-mix(in srgb, var(--action) 12%, transparent);
+}
+.cvm-artifact-content .removed {
+  background: color-mix(in srgb, var(--err) 12%, transparent);
+}
+@media (max-width: 820px) {
+  .cvm-artifact-files {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .cvm-artifact-meta > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 3px;
+  }
+}
+
+/* Chain exits share the existing board card, socket and status vocabulary. */
+.cz-chains .cz-net-head {
+  margin-bottom: 8px;
+}
+.cz-chain-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  padding: 10px 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+.cz-chain-row > .cz-socket {
+  left: -23px;
+}
+.cz-chain-name {
+  flex: 1;
+  min-width: 50px;
+  overflow-wrap: anywhere;
+}
+.cz-chain-row > small {
+  color: var(--ink-3);
+}
+.cz-chain-row.failed > small {
+  color: var(--err);
+}
+.cz-chain-row.drop-no {
+  outline: 2px solid var(--err);
+}
+.cz-chain-row.drop-ok {
+  outline: 2px solid var(--action);
+}
+.cz-chain-row .cz-reason {
+  flex-basis: 100%;
+  color: var(--err);
+}
+.cvm-route-row {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+.cvm-route-service-fields {
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+}
+.cvm-route-service-fields > .f {
+  min-width: 0;
+  width: 33%;
+}
+@media (max-width: 640px) {
+  .cvm-route-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+/* A rejection must never move the next drop target under a stationary pointer. */
+.cz-chain-row {
+  min-height: 62px;
+  padding-bottom: 24px;
+}
+.cz-chain-row .cz-reason {
+  position: absolute;
+  bottom: 4px;
+  left: 0;
+  max-width: 100%;
+  overflow: hidden;
+  margin: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* The release strip has two cells, unlike the shared three-cell status row. */
+.cvm-design .cvm-release-notice {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.cvm-release-notice > span {
   min-width: 0;
   overflow-wrap: anywhere;
 }
-.cvm-entry-target {
-  color: var(--ink-3);
-  font-family: var(--mono);
+.cvm-design .cvm-release-notice > .btn {
+  grid-column: auto;
 }
-.cvm-entry-list > li > .cvm-notice {
-  grid-column: 1 / -1;
-  margin: 0;
+.cvm-compile-preview {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  gap: 10px;
+}
+.cvm-compile-preview > header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.cvm-compile-preview > .cvm-artifact-files {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.cvm-compile-preview > details {
+  min-width: 0;
+}
+@media (max-width: 820px) {
+  .cvm-design .cvm-release-notice {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 6px;
+  }
+  .cvm-design .cvm-release-notice > .btn {
+    justify-self: start;
+    margin-top: 0;
+  }
 }

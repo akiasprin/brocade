@@ -368,7 +368,7 @@ impl PgStore {
                     || m.observed_at_unix_millis != o.observed_at_unix_millis
             }) {
                 o.metrics = None;
-                o.error = Some("Guest 监控读数无效，等待重新采样".into());
+                o.error = Some("系统监控读数无效，等待重新采样".into());
             }
             sqlx::query("INSERT INTO cvm_observation_state(instance_id,observed_at,observation) VALUES($1,1,'{}') ON CONFLICT DO NOTHING").bind(&o.id).execute(&mut *tx).await?;
             let old =
@@ -423,7 +423,7 @@ impl PgStore {
                         &o.id,
                         o.observed_at_unix_millis,
                         "reboot",
-                        "检测到 Guest 启动身份变化",
+                        "检测到系统启动身份变化",
                     )
                     .await?;
                 }

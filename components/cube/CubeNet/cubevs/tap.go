@@ -235,6 +235,16 @@ func DeleteTAPDeviceMetadata(ifindex uint32, ip net.IP) error {
 	}
 	defer ipMap.Close()
 
+	// The primary selector is keyed by TAP incarnation. Reclaim it while the
+	// native owner metadata still exists; never remove a selector for a reused TAP.
+	var meta mvmMetadata
+	if err := ifindexMap.Lookup(&ifindex, &meta); err == nil && meta.IP == mvmIP {
+		if err := removePrimaryRoutes(ifindex, meta.Version); err != nil {
+			return err
+		}
+	} else if err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return err
+	}
 	return deleteTAPDeviceMetadataEntries(ifindexMap, ipMap, ifindex, mvmIP)
 }
 

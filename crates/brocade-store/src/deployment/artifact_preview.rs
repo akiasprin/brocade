@@ -57,6 +57,17 @@ pub(crate) async fn plan_deployment_artifacts(
             StoreError::InvalidData("artifact preview target disappeared".to_owned())
         })?;
         let mut desired_structure = desired_structure_json(&target)?;
+        #[cfg(feature = "cvm")]
+        if target.actions.contains(&PlannedAction::SyncCvm) {
+            let mut tx = pool.begin().await?;
+            desired_structure["cvm"] = crate::cvm::releases::artifact_metadata(
+                &mut tx,
+                &target.node_id,
+                revision_id as i64,
+            )
+            .await?;
+            tx.commit().await?;
+        }
         if include_content {
             for (kind, artifact) in target.desired.artifacts() {
                 if let DesiredArtifact::Present { content, .. } = artifact {
@@ -82,6 +93,7 @@ pub(crate) async fn plan_deployment_artifacts(
             dispatched_at: None,
         });
     }
+    crate::extension_state::present_cvm_artifacts(actor, &mut targets);
     if include_content {
         crate::model_timing::measure(
             "artifact_load_content",

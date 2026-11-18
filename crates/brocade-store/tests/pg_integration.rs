@@ -1,5 +1,7 @@
 #[path = "cases/clash_rules.rs"]
 mod clash_rules_tests;
+#[path = "cases/node_notifications.rs"]
+mod node_notifications_tests;
 
 use brocade_core::{
     client_config::{SubscriptionClientConfig, SUBSCRIPTION_CLIENT_CONFIG_SCHEMA},

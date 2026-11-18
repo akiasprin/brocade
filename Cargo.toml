@@ -6,6 +6,7 @@ members = [
     "crates/brocade-deployment",
     "crates/brocade-agent",
     "crates/brocade-cube",
+    "crates/brocade-cvm-compile",
     "crates/brocade-probe",
     "crates/brocade-preview",
     "crates/brocade-sqlx",

@@ -10,9 +10,9 @@ export function cvmNetworkRate(
   return nics.reduce((sum, nic) => sum + nic[direction]!, 0);
 }
 
-export const cvmEventLabel = (kind: string) =>
+export const cvmEventLabel = (kind: string, native = false) =>
   ({
-    reboot: 'Guest 重启',
+    reboot: native ? '宿主重启' : 'Guest 重启',
     oom: 'OOM 终止',
     guest_unreachable: '采样通道无响应',
     guest_recovered: '采样通道恢复',
@@ -29,4 +29,6 @@ export const cvmEventLabel = (kind: string) =>
     reinstall: '重装',
     delete: '删除',
     retry: '核查重试',
+    adopt_host: '纳管裸机',
+    release_host: '解除纳管',
   })[kind] ?? '实例操作';

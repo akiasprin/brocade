@@ -1131,13 +1131,7 @@ describe('user roster rows', () => {
     const tokyo = card().querySelector<HTMLElement>('.qta-r')!;
     expect(tokyo.classList.contains('ok')).toBe(true);
     expect(tokyo.querySelector('.qta-app')?.textContent).toBe('东京');
-    expect(tokyo.querySelectorAll('.qta-app .geo-flag')).toHaveLength(1);
-    // 线路名在前，地区旗跟在名字后面。
-    expect([...tokyo.querySelector('.qta-app')!.children].map(child => child.tagName.toLowerCase())).toEqual([
-      'b',
-      'span',
-    ]);
-    expect(tokyo.querySelector('.qta-app > :last-child')?.classList.contains('qta-flags')).toBe(true);
+    expect(tokyo.querySelector('.qta-app .geo-flag')).toBeNull();
     expect(tokyo.querySelector('.qta-sub')?.textContent).toBe('1 个接入点');
     expect(tokyo.querySelector('.qta-figs')?.textContent).toBe('54.10GiB');
     expect(tokyo.querySelector('.qta-left-value')?.textContent).toBe('剩余45.90 GiB');

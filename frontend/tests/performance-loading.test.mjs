@@ -159,8 +159,8 @@ test('机器详情把快照等待限制在依赖模型的配置，养护和规�
     nodes,
     /tab === 'chains'[\s\S]*<MachineEgressDnsRules[\s\S]*snapshotReady=\{!!snapshot\.data\}[\s\S]*<NodeChainsSection[\s\S]*snapshotReady=\{!!snapshot\.data\}/,
   );
-  assert.match(nodes, /<ChainRulesPanel[\s\S]*loadingFallback=\{null\}/);
-  assert.match(chains, /loadingFallback === undefined \? <Loading variant="editor" \/> : loadingFallback/);
+  // The rule editor must not turn its second loading phase into a blank card.
+  assert.doesNotMatch(nodes, /loadingFallback=\{null\}/);
 });
 
 test('机器列表先返回基础数据，再加载有界的轻量遥测', () => {

@@ -1,5 +1,154 @@
 use super::*;
 
+async fn retire_for_removal(db: &TestPg, node: &str) {
+    db.store
+        .update_node_status(
+            &system_admin(),
+            node,
+            brocade_store::UpdateNodeStatusRequest {
+                status: "retired".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let desired = db
+        .store
+        .claim_desired_for_node(node)
+        .await
+        .unwrap()
+        .unwrap();
+    db.store
+        .report_target_result(applied_report(&desired))
+        .await
+        .unwrap();
+}
+
+async fn cvm_node_snapshots(db: &TestPg) {
+    for statement in [
+        "INSERT INTO cvm_hosts(node_id,capabilities) VALUES ($1,'{}')",
+        "INSERT INTO cvm_nic_nodes(node_id,capabilities) VALUES ($1,'{}')",
+        "INSERT INTO cvm_entry_nodes(node_id) VALUES ($1)",
+        "INSERT INTO cvm_network_quota_hosts(node_id,capacity) VALUES ($1,'{}')",
+    ] {
+        for node in ["n1", "n-other"] {
+            sqlx::query(statement)
+                .bind(node)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+    }
+}
+
+async fn assert_cvm_snapshots(db: &TestPg, removed: i64) {
+    for table in [
+        "cvm_hosts",
+        "cvm_nic_nodes",
+        "cvm_entry_nodes",
+        "cvm_network_quota_hosts",
+    ] {
+        let counts = sqlx::query(&format!(
+            "SELECT count(*) FILTER (WHERE node_id='n1') AS removed,
+                    count(*) FILTER (WHERE node_id='n-other') AS preserved FROM {table}"
+        ))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts.get::<i64, _>("removed"), removed, "{table}");
+        assert_eq!(counts.get::<i64, _>("preserved"), 1, "{table}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn node_removal_cleans_cvm_snapshots_and_preserves_other_nodes() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    insert_other_tenant_fixture(db.pool()).await;
+    retire_for_removal(&db, "n1").await;
+    cvm_node_snapshots(&db).await;
+
+    let mixed = db
+        .store
+        .remove_retired_nodes(
+            &system_admin(),
+            RemoveRetiredNodesRequest {
+                node_ids: vec!["n1".to_owned(), "n-other".to_owned()],
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(mixed, StoreError::Conflict(_)));
+    assert_cvm_snapshots(&db, 1).await;
+
+    let result = db
+        .store
+        .remove_retired_nodes(
+            &system_admin(),
+            RemoveRetiredNodesRequest {
+                node_ids: vec!["n1".to_owned()],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.removed_nodes, ["n1"]);
+    assert_cvm_snapshots(&db, 0).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nodes WHERE id='n-other'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn node_removal_preserves_cvm_publication_history() {
+    for table in ["cvm_nic_publications", "cvm_entry_publications"] {
+        let Some(db) = TestPg::start_if_enabled().await else {
+            return;
+        };
+        db.store.migrate().await.unwrap();
+        insert_minimal_fixture(db.pool()).await;
+        insert_other_tenant_fixture(db.pool()).await;
+        retire_for_removal(&db, "n1").await;
+        cvm_node_snapshots(&db).await;
+        sqlx::query(&format!(
+            "INSERT INTO {table}(id,provider_node,revision,admitting,deleted,spec,actor_id)
+             VALUES ('history','n1',1,FALSE,TRUE,'{{}}','test-system')"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let error = db
+            .store
+            .remove_retired_nodes(
+                &system_admin(),
+                RemoveRetiredNodesRequest {
+                    node_ids: vec!["n1".to_owned()],
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Conflict(_)), "{table}: {error}");
+        assert_cvm_snapshots(&db, 1).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(&format!(
+                "SELECT count(*) FROM {table} WHERE id='history' AND deleted"
+            ))
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            1
+        );
+    }
+}
+
 async fn forwarding_history(db: &TestPg, node: &str, tenant: &str, user: &str) -> i64 {
     sqlx::query(
         "INSERT INTO forwarding_entitlements (tenant_id,user_id,node_id,updated_by)

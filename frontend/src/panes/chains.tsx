@@ -6419,7 +6419,6 @@ function ChainRulesPanelContent({
   machineRole,
   readOnly = false,
   settingsReadable = true,
-  loadingFallback,
 }: {
   appId: string;
   chain: SnapshotChain;
@@ -6452,8 +6451,6 @@ function ChainRulesPanelContent({
   readOnly?: boolean;
   /** False for visitor roles, whose route allow-list excludes settings. */
   settingsReadable?: boolean;
-  /** Machine detail coordinates both rule cards under one empty boundary instead of showing a nested skeleton. */
-  loadingFallback?: ReactNode;
 }) {
   // 同一机器可能在树中出现多次，编辑态必须由 panel 持有；同时以这份草稿驱动树，
   // 否则删除或新增下一跳后要等到保存、重新请求快照才会改变层级。
@@ -6696,9 +6693,10 @@ function ChainRulesPanelContent({
 
   // 可编辑态首次必须等端口起点和占用表完整后再构造 RuleEditor 的共享草稿。否则这里先用
   // 20000/空占用表 seed，子组件随后即使拿到真实设置也只会收到已经冻结的默认值。
-  if (!revealed && !readOnly) {
+  const initiallyPending = !revealed && !readOnly;
+  if (initiallyPending && !machineRole) {
     if (portDependenciesError) return <ErrorBox error={portDependenciesError} />;
-    return loadingFallback === undefined ? <Loading variant="editor" /> : loadingFallback;
+    return <Loading variant="editor" />;
   }
 
   const rendered = new Set<string>();
@@ -6909,6 +6907,7 @@ function ChainRulesPanelContent({
         </span>
         <FlowModeToggle
           visual={visual}
+          disabled={initiallyPending}
           name={chain.name || chain.id}
           controls={sectionId}
           onChange={() => {
@@ -6918,13 +6917,20 @@ function ChainRulesPanelContent({
         />
       </div>
       <div id={sectionId}>
-        <div hidden={!visual}>
-          <RuleFlow model={flowModel} focusNode={machineRole ? selected : undefined} onReveal={revealRule} />
+        <div hidden={!visual} className={machineRole ? 'node-rule-flow-ready' : undefined}>
+          {(!initiallyPending || !portDependenciesError) && (
+            <RuleFlow
+              model={flowModel}
+              loading={initiallyPending}
+              focusNode={machineRole ? selected : undefined}
+              onReveal={revealRule}
+            />
+          )}
         </div>
-        <div className="chain-rule-section-list" hidden={visual}>
+        <div className="chain-rule-section-list" hidden={visual || initiallyPending}>
           <div className="chain-rule-tree" aria-busy={portDependenciesPending}>
-            {tree}
-            {orphanTree.length > 0 && (
+            {!initiallyPending && tree}
+            {!initiallyPending && orphanTree.length > 0 && (
               <div className="chain-rule-orphans">
                 <div className="chain-rule-node-head">
                   <b>未从入口展开</b>

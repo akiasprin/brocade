@@ -47,8 +47,14 @@ type Interface struct {
 	DefaultIPv6 bool          `json:"default_ipv6"`
 }
 
+type ChainEgressBinding struct {
+	ChainID string `json:"chain_id"`
+	Mark    uint32 `json:"mark"`
+	Device  string `json:"device"`
+}
 type Request struct {
-	Routing json.RawMessage `json:"routing"`
+	ChainEgress []ChainEgressBinding `json:"chain_egress,omitempty"`
+	Routing     json.RawMessage      `json:"routing"`
 	// Detach lists Console-assigned cleanup identities absent from Interfaces.
 	// A stopped release confirms these only after physical network absence.
 	Detach     []string    `json:"detach,omitempty"`
@@ -68,6 +74,7 @@ type Observation struct {
 	Attached  bool     `json:"attached"`
 }
 type PolicyObservation struct {
+	ChainEgressConfigured   bool    `json:"chain_egress_configured,omitempty"`
 	RoutingRevision         uint64  `json:"routing_revision"`
 	ContactRoutePreserved   bool    `json:"contact_route_preserved"`
 	BusinessFallbackBlocked bool    `json:"business_fallback_blocked"`
@@ -86,6 +93,7 @@ type Result struct {
 	RestartRequired   bool               `json:"restart_required,omitempty"`
 }
 type Catalogue struct {
+	ChainEgress       bool              `json:"chain_egress,omitempty"`
 	NetworkQuota      bool              `json:"network_quota"`
 	ManagedNICs       bool              `json:"managed_nics"`
 	PrimaryIPDelivery bool              `json:"primary_ip_delivery,omitempty"`

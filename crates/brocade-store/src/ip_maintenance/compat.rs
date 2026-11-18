@@ -4,7 +4,7 @@ use sha2::{Digest, Sha384};
 use sqlx::{Postgres, Transaction};
 
 const OLD_CHECKSUM: &str = "d166d16cce814340fb2c9c30df6aed5d6bb2577b148043b76d2548b9b9fbaf180607a7f5ad1751e6c12ca6e9c3af3f6a";
-const TARGET_CHECKSUM: &str = "f3d2016a0ce40fcb920794d6e587dd291347c5c89c4435915c17be001a438875fb29b0608fe86a396ce534e9aff1d0b3";
+const TARGET_CHECKSUM: &str = "9e6eeccade5a7799d6392df0afe9982aa022965d280c46e49b2d83a1f4fbf734d590ae26e5e5408295543052446db9b8";
 const BOUNDARY: &str = "\n-- Optional host-egress maintenance;";
 // PostgreSQL 16/17 and 18 have distinct catalog shapes (18 records NOT NULL constraints).
 const OLD_SHAPES: &[&str] = &["45931525632fb99f6caeb689b57c2d55c3fe41e5274a1f30b2b8c3e5eb34ad09d166da83e56994e7b30f84701d2ed1d1", "f587b69510588df3d7c00e6856a59fde8074bff993c6c77c90955eb9f8c1a710340ebd0261472e8fe89a5638e31ab44f"];
@@ -46,7 +46,7 @@ async fn exact_previous(tx: &mut Transaction<'_, Postgres>) -> Result<bool> {
             .await?;
     let source: Vec<_> = MIGRATOR.iter().collect();
     if rows.len() != 7
-        || source.len() != 7
+        || source.len() < 7
         || rows.iter().enumerate().any(|(i, r)| {
             r.0 != i as i64 + 1
                 || !r.1
@@ -66,6 +66,14 @@ async fn exact_previous(tx: &mut Transaction<'_, Postgres>) -> Result<bool> {
 }
 
 impl PgStore {
+    pub async fn check_prerelease_0007_upgrade(&self) -> Result<DatabaseUpgradeCheck> {
+        self.check_ip_maintenance_upgrade().await
+    }
+
+    pub async fn migrate_prerelease_0007_schema(&self) -> Result<()> {
+        self.migrate_ip_maintenance_schema().await
+    }
+
     /// Read-only; pending 7 makes the installer back up and mark migration-started before DDL.
     pub async fn check_ip_maintenance_upgrade(&self) -> Result<DatabaseUpgradeCheck> {
         let mut check = self.check_database_upgrade().await?;
@@ -81,7 +89,7 @@ impl PgStore {
             .await?;
         if exact_previous(&mut tx).await? {
             check.compatible = true;
-            check.pending_versions = vec![7];
+            check.pending_versions.insert(0, 7);
             check.reason = None;
         }
         tx.commit().await?;

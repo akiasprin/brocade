@@ -26,14 +26,14 @@ test('手机端菜单留在视口内并允许纵向滚动', () => {
   );
 });
 
-test('隧道连接表的长值单行省略，窄详情页头只留一层', () => {
+test('隧道连接表的长值单行省略，窄详情标题栏保留单层布局', () => {
   const value = styles.match(/\.tnd-kv-value\s*\{[^}]+\}/)?.[0] ?? '';
   assert.match(value, /min-width:\s*0/);
   assert.match(value, /text-overflow:\s*ellipsis/);
   assert.match(value, /white-space:\s*nowrap/);
   assert.match(
     styles,
-    /@container \(max-width: 700px\)[\s\S]*?\.tnd-page\.nd-sheet > \.nd-paper > \.tnd-head\s*\{\s*grid-template-rows:\s*minmax\(58px, auto\);[\s\S]*?\.tnd-page\.nd-sheet > \.nd-paper > \.tnd-head > \.nd-acts\s*\{\s*grid-column:\s*2;\s*grid-row:\s*1;/,
+    /@container \(max-width: 700px\)[\s\S]*?\.tnd-page\.nd-sheet > \.nd-paper > \.tnd-head\s*\{\s*grid-template-rows:\s*minmax\(58px, auto\);/,
   );
 });
 

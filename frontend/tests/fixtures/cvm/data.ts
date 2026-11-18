@@ -85,18 +85,35 @@ export function cvmInstance(id = 'cvm-alice'): CvmInstance {
       restart_epoch: 0,
       reinstall_epoch: 0,
       spec: {
-        routing: { revision: 1, priorities: [{ interface_id: 'nic-business', ipv4: 10, ipv6: 10 }], routes: [{ destination: '0.0.0.0/0', interface_id: 'nic-business' }, { destination: '::/0', interface_id: 'nic-business' }], dns: [] },
+        routing: {
+          revision: 1,
+          priorities: [{ interface_id: 'nic-business', ipv4: 10, ipv6: 10 }],
+          routes: [
+            { destination: '0.0.0.0/0', interface_id: 'nic-business' },
+            { destination: '::/0', interface_id: 'nic-business' },
+          ],
+          dns: [],
+        },
         name: 'home-workspace',
         image: cvmCapabilities.images[0],
         resources: { vcpus: 1, memory_bytes: 512 * MiB, root_disk_bytes: 3_000_000_000 },
         ssh_public_key: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEiBcpQEzqzjADp8VXvOigHnqLh5L5xP76cwoCD8YMK5 fixture',
         interfaces: [
           { id: 'nic-public', source_id: 'public', purpose: 'contact', default_ipv4: false, default_ipv6: false },
-          { id: 'nic-business', source_id: 'network-hk', allocated: allocatedNic(), purpose: 'business', default_ipv4: true, default_ipv6: false },
+          {
+            id: 'nic-business',
+            source_id: 'network-hk',
+            allocated: allocatedNic(),
+            purpose: 'business',
+            default_ipv4: true,
+            default_ipv6: false,
+          },
         ],
       },
     },
     report: {
+      generation: 1,
+      operation_id: 'op-first',
       status: 'applied',
       power: 'running',
       runtime_id: 'runtime-fixture',
@@ -200,7 +217,21 @@ export function cvmWorkspace(scene = 'list', role = 'system-admin'): CvmWorkspac
         max_interfaces: 12,
       },
     ],
-    usage: [{ tenant_id: 'platform', user_id: 'alice', instances: ['empty', 'new', 'experimental'].includes(scene) ? 0 : 1, vcpus: ['empty', 'new', 'experimental'].includes(scene) ? 0 : instance.desired.spec.resources.vcpus, memory_bytes: ['empty', 'new', 'experimental'].includes(scene) ? 0 : instance.desired.spec.resources.memory_bytes, disk_bytes: ['empty', 'new', 'experimental'].includes(scene) ? 0 : instance.desired.spec.resources.root_disk_bytes, interfaces: ['empty', 'new', 'experimental'].includes(scene) ? 0 : instance.desired.spec.interfaces.length }],
+    usage: [
+      {
+        tenant_id: 'platform',
+        user_id: 'alice',
+        instances: ['empty', 'new', 'experimental'].includes(scene) ? 0 : 1,
+        vcpus: ['empty', 'new', 'experimental'].includes(scene) ? 0 : instance.desired.spec.resources.vcpus,
+        memory_bytes: ['empty', 'new', 'experimental'].includes(scene)
+          ? 0
+          : instance.desired.spec.resources.memory_bytes,
+        disk_bytes: ['empty', 'new', 'experimental'].includes(scene)
+          ? 0
+          : instance.desired.spec.resources.root_disk_bytes,
+        interfaces: ['empty', 'new', 'experimental'].includes(scene) ? 0 : instance.desired.spec.interfaces.length,
+      },
+    ],
     can_manage_quotas: role === 'system-admin',
     can_write: !redacted,
     redacted,
@@ -288,21 +319,88 @@ export function cvmMonitoring(scene = 'detail', now = Date.now()): import('../..
       error: null,
     },
     issues: [],
-    events: [{ at_unix_millis: end - 1800000, kind: 'reboot', detail: '检测到 Guest 启动身份变化' }],
+    events: [
+      {
+        at_unix_millis: end - 1800000,
+        kind: 'reboot',
+        detail: scene.startsWith('baremetal-') ? '检测到系统启动身份变化' : '检测到 Guest 启动身份变化',
+      },
+    ],
     range_start_unix_millis: now - 3600000,
     range_end_unix_millis: now,
     samples,
   };
 }
 
-
 export function cvmReadings(workspace: CvmWorkspace, scene = 'list'): import('../../../src/api').CvmReadings {
   const data = cvmMonitoring(scene);
   const cardSample = (sample: import('../../../src/api').CvmMonitoringSample) => ({
-    observed_at_unix_millis: sample.observed_at_unix_millis, window_start_unix_millis: sample.window_start_unix_millis, has_gap: sample.has_gap,
-    cpu_usage_basis_points: sample.cpu_usage_basis_points, memory_total_bytes: sample.memory_total_bytes, memory_used_bytes: sample.memory_used_bytes, root_total_bytes: sample.root_total_bytes, root_used_bytes: sample.root_used_bytes,
-    rx_bps: sample.interfaces.every(n => n.rx_bps !== null) ? sample.interfaces.reduce((sum, n) => sum + n.rx_bps!, 0) : null,
-    tx_bps: sample.interfaces.every(n => n.tx_bps !== null) ? sample.interfaces.reduce((sum, n) => sum + n.tx_bps!, 0) : null,
+    observed_at_unix_millis: sample.observed_at_unix_millis,
+    window_start_unix_millis: sample.window_start_unix_millis,
+    has_gap: sample.has_gap,
+    cpu_usage_basis_points: sample.cpu_usage_basis_points,
+    memory_total_bytes: sample.memory_total_bytes,
+    memory_used_bytes: sample.memory_used_bytes,
+    root_total_bytes: sample.root_total_bytes,
+    root_used_bytes: sample.root_used_bytes,
+    rx_bps: sample.interfaces.every(n => n.rx_bps !== null)
+      ? sample.interfaces.reduce((sum, n) => sum + n.rx_bps!, 0)
+      : null,
+    tx_bps: sample.interfaces.every(n => n.tx_bps !== null)
+      ? sample.interfaces.reduce((sum, n) => sum + n.tx_bps!, 0)
+      : null,
   });
-  return { observed_at_unix_millis: Date.now(), instances: workspace.instances.map(item => ({ id: item.desired.id, state: item.report?.power === 'stopped' ? 'stopped' : data.state, latest: data.latest ? cardSample(data.latest) : null, samples: data.samples.map(cardSample), month_used_bytes: 22 * 1024 ** 3, month_limit_bytes: 100 * 1024 ** 3, month_coverage_gap: false, month_observed_at_unix_millis: Date.now() - 5000 })) };
+  return {
+    observed_at_unix_millis: Date.now(),
+    instances: workspace.instances.map(item => ({
+      id: item.desired.id,
+      state: item.report?.power === 'stopped' ? 'stopped' : data.state,
+      latest: data.latest ? cardSample(data.latest) : null,
+      samples: data.samples.map(cardSample),
+      month_used_bytes: 22 * 1024 ** 3,
+      month_limit_bytes: 100 * 1024 ** 3,
+      month_coverage_gap: false,
+      month_observed_at_unix_millis: Date.now() - 5000,
+    })),
+  };
+}
+
+export function baremetalWorkspace(scene = 'baremetal-detail', role = 'system-admin'): CvmWorkspace {
+  const data = cvmWorkspace('list', role);
+  const host = data.hosts[0];
+  host.capabilities = {
+    ...host.capabilities,
+    backend: 'baremetal-v1',
+    images: [],
+    resource_limits: null,
+    create: false,
+    start: false,
+    stop: false,
+    restart: false,
+    reinstall: false,
+    configure: false,
+    delete: false,
+    stable_storage: false,
+    retain_on_delete: false,
+    baremetal: {
+      identity: { machine: 'a'.repeat(64), root_filesystem: 'b'.repeat(64) },
+      os: 'Debian GNU/Linux 13',
+      terminal_user: 'operator',
+      primary_device: 'eth0',
+    },
+  };
+  const instance = data.instances[0];
+  instance.desired.spec.execution = { kind: 'baremetal', identity: host.capabilities.baremetal!.identity };
+  delete instance.desired.spec.image;
+  instance.desired.spec.ssh_public_key = '';
+  instance.desired.spec.name = 'baremetal-workspace';
+  instance.desired.spec.resources = {
+    vcpus: host.capabilities.allocatable_vcpus,
+    memory_bytes: host.capabilities.allocatable_memory_bytes,
+    root_disk_bytes: host.capabilities.allocatable_disk_bytes,
+  };
+  instance.report!.volume_id = null;
+  instance.report!.runtime_id = 'host-fixture-12345678-1234-1234-1234-123456789abc';
+  if (scene === 'baremetal-hosts') data.instances = [];
+  return data;
 }

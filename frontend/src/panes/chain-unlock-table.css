@@ -1,3 +1,11 @@
+/* 服务列最宽 88px：一格只有“符号 + 两三位地区码”，宽屏下多出的宽度留在表格右侧，
+   不再摊进每两列之间。服务列数由组件以 --cut-services 传入，与 SERVICES 同源。 */
+.chain-unlock {
+  --cut-corner-w: 196px;
+  --cut-when-w: 96px;
+  --cut-service-max: 88px;
+  max-width: calc(var(--cut-corner-w) + var(--cut-when-w) + var(--cut-services, 13) * var(--cut-service-max));
+}
 .chain-unlock-scroll {
   overflow-x: auto;
   overscroll-behavior-x: contain;
@@ -15,10 +23,10 @@
   font-weight: inherit;
 }
 .chain-unlock-table .cut-corner {
-  width: 188px;
+  width: var(--cut-corner-w);
 }
 .chain-unlock-table .cut-when {
-  width: 84px;
+  width: var(--cut-when-w);
 }
 .cut-cats th {
   padding: 2px 8px 6px;
@@ -48,7 +56,7 @@
 .cut-heads th .unlock-mark {
   display: grid;
   width: max-content;
-  margin: 0 auto 6px;
+  margin: 0 auto 7px;
 }
 .cut-heads th > span:last-child {
   display: block;
@@ -66,32 +74,32 @@
   text-align: right;
 }
 .cut-group th {
-  padding: 16px 4px 6px;
+  padding: 24px 6px 8px;
   text-align: left;
   white-space: nowrap;
 }
 .chain-unlock-table tbody:first-of-type .cut-group th {
-  padding-top: 12px;
+  padding-top: 14px;
 }
 .cut-group .no {
   margin-right: 10px;
-  color: var(--ink-4);
+  color: var(--hue-1);
   font: 500 11px var(--mono);
 }
 .cut-group b {
   color: var(--ink);
-  font: 600 13px var(--sans);
+  font: 600 13.5px var(--sans);
 }
 .cut-group .count {
   margin-left: 10px;
   color: var(--ink-4);
-  font-size: 11.5px;
+  font-size: 11px;
 }
 .cut-row {
   cursor: pointer;
 }
 .cut-row > * {
-  height: 40px;
+  height: 42px;
   border-top: 1px solid var(--line-soft);
   transition: background-color 0.12s ease;
 }
@@ -100,35 +108,42 @@
 }
 @media (hover: hover) and (pointer: fine) {
   .cut-row:hover > * {
-    background-color: var(--hover-2);
+    background-color: var(--hover);
   }
   .cut-row:hover > .cut-chain {
-    background: linear-gradient(var(--hover-2), var(--hover-2)), var(--block);
+    background: linear-gradient(var(--hover), var(--hover)), var(--nd-paper-surface, var(--sheet));
   }
 }
 .cut-row[data-off] > td,
 .cut-row[data-off] .cut-chain-in {
   opacity: 0.55;
 }
+/* 固定首列与纸面同底，用一条分隔线代替旧的浅色带。 */
 .cut-chain,
 .chain-unlock-table .cut-corner {
   position: sticky;
   left: 0;
   z-index: 1;
-  background: var(--block);
+  background: var(--nd-paper-surface, var(--sheet));
+}
+.cut-chain,
+.cut-heads .cut-corner {
+  box-shadow: inset -1px 0 0 var(--line);
 }
 .cut-chain-in {
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 8px;
-  padding: 0 10px 0 4px;
+  gap: 9px;
+  padding: 0 10px 0 6px;
 }
 .cut-chain .geo-flag {
   width: 18px;
   height: 12px;
   flex: none;
   border-radius: 2px;
+  /* 白底旗（日本、韩国）在亮色下会与底色融在一起。 */
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ink) 12%, transparent);
 }
 .cut-name {
   overflow: hidden;
@@ -159,18 +174,20 @@
 .cut-row td {
   text-align: center;
 }
+/* 地区码列宽固定，符号在同一列中落在同一条竖线上；较长的读数仍可向右展开。 */
 .cut-cell {
   position: relative;
-  display: inline-flex;
+  display: inline-grid;
+  grid-template-columns: 13px minmax(3.1ch, max-content);
+  column-gap: 5px;
   align-items: center;
-  gap: 4px;
   color: var(--ink-2);
   font: 500 10.5px var(--mono);
   letter-spacing: 0.01em;
 }
 .cut-cell .unlock-glyph {
-  width: 12px;
-  height: 12px;
+  width: 13px;
+  height: 13px;
 }
 .chain-unlock-table td:is([data-tone='no'], [data-tone='unknown'], [data-tone='info']) .cut-cell {
   color: var(--ink-4);
@@ -179,9 +196,12 @@
   opacity: 0.42;
 }
 .cut-cell .cut-dot {
-  top: -4px;
+  top: -3px;
   right: auto;
-  left: 9px;
+  left: 10px;
+  width: 5px;
+  height: 5px;
+  box-shadow: 0 0 0 1.5px var(--nd-paper-surface, var(--sheet));
 }
 .chain-unlock-table .cut-blank {
   padding-left: 14px;
@@ -197,22 +217,34 @@
   text-align: right;
   white-space: nowrap;
 }
-.cut-row .cut-when[data-tone='obsolete'] {
+/* 同一类状态同一种颜色：检测中用操作色并转圈，过期与已变更用金色，未检测退为淡灰。 */
+.cut-row .cut-when:is([data-tone='obsolete'], [data-tone='stale']) {
   color: var(--gold);
 }
 .cut-row .cut-when[data-tone='running'] {
-  color: var(--ink-2);
+  color: var(--action);
+}
+.cut-row .cut-when[data-tone='never'] {
+  color: var(--ink-4);
+}
+.cut-when-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.cut-when-state .unlock-glyph {
+  width: 11px;
+  height: 11px;
+  color: inherit;
 }
 
 @media (max-width: 760px) {
+  .chain-unlock {
+    --cut-corner-w: 124px;
+    --cut-when-w: 72px;
+  }
   .chain-unlock-table {
     min-width: 920px;
-  }
-  .chain-unlock-table .cut-corner {
-    width: 124px;
-  }
-  .chain-unlock-table .cut-when {
-    width: 72px;
   }
   .cut-chain .geo-flag {
     display: none;
@@ -224,7 +256,7 @@
 }
 .chain-unlock-table .cut-chain-in {
   width: 100%;
-  min-height: 40px;
+  min-height: 42px;
   border: 0;
   background: transparent;
   cursor: pointer;
@@ -260,16 +292,25 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 5px 8px;
-  margin: 12px 4px 0;
+  gap: 6px 16px;
+  margin: 14px 6px 0;
   color: var(--ink-3);
   font-size: 11px;
+}
+.chain-unlock-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
 }
 .chain-unlock-legend .unlock-glyph {
   width: 12px;
   height: 12px;
 }
-.chain-unlock-legend > span {
+.chain-unlock-legend .cut-dot {
+  width: 5px;
+  height: 5px;
+}
+.chain-unlock-legend > .chain-unlock-legend-note {
   margin-left: auto;
   color: var(--ink-4);
 }
@@ -284,7 +325,7 @@
   left: 0;
   display: inline-flex;
   align-items: baseline;
-  background: var(--block);
+  background: var(--nd-paper-surface, var(--sheet));
 }
 
 .cut-regions {
@@ -298,7 +339,7 @@
   position: absolute;
   top: 100%;
   left: 0;
-  color: var(--ink-3);
+  color: var(--ink-4);
   font: 500 9.5px / 12px var(--mono);
   white-space: nowrap;
 }

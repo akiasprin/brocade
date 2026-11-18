@@ -1,5 +1,5 @@
-// 访问入口地址：管理员按机器发布可以投递到容器主网卡的地址。共享地址按协议端口分给多个容器，
-// 独立地址整 IP 交给一个容器；跨宿主的入口经 WireGuard 机器对通道送到容器所在宿主。
+// 访问入口地址：管理员按机器发布可以投递到容器主网卡的地址。地址按 L4 协议端口或 L3 整 IP 转发给容器，
+// IP 保留在入口机器上；跨宿主的入口经受管 IP 机器对通道送到容器所在宿主。
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import {
@@ -17,7 +17,9 @@ import {
 import { Confirm, EmptyState, ErrorBox, Loading } from '../../ui/bits';
 import { useUnsavedChanges } from '../../ui/navigation-guard';
 import { ENTRY_BOARD } from './board/inspector';
-import { NIC_CATALOG, NicDialog, useNicRequestId } from './network-common';
+import { NIC_CATALOG, NicDialog, transportName, useNicRequestId } from './network-common';
+import { ActionMenu } from '../../ui/choice-menu';
+import { CapacityMeter } from './cards';
 import { ownerKey } from './queries';
 
 const visible = (offer: CvmEntryAddressOffer) => offer.public_address ?? offer.address;
@@ -50,19 +52,23 @@ export function EntryPublications({ workspace }: { workspace: CvmWorkspace }) {
   if (board.isPending) return <Loading />;
   if (!board.data) return <ErrorBox error={board.error} />;
   const data = board.data;
+  const addresses = data.publications.reduce((sum, p) => sum + p.spec.addresses.length, 0);
   return (
-    <div className="cvm-entry-publications">
-      <div className="cvm-network-heading">
-        <div>
-          <b>访问入口地址</b>
-          <p className="note">发布机器上的地址，容器在组合台按整 IP 或协议端口接入，不占网卡槽位。</p>
-        </div>
+    <section className="cvm-network-lane cvm-entry-publications" aria-label="访问入口地址">
+      <header className="cvm-lane-head">
+        <h2>访问入口地址</h2>
+        <small>
+          {data.publications.length} 份发布 · {addresses} 个地址
+        </small>
         {data.can_manage && (
-          <button className="btn primary" onClick={() => setEditing(null)}>
-            ＋ 发布入口地址
-          </button>
+          <span className="cvm-lane-aside">
+            <button className="btn small" onClick={() => setEditing(null)}>
+              ＋ 发布入口地址
+            </button>
+          </span>
         )}
-      </div>
+      </header>
+      <p className="cvm-lane-note">组合台左栏的来源：容器按整 IP 或协议端口接入，入口投递到主网卡，不占网卡槽位。</p>
       {board.error && <ErrorBox error={board.error} />}
       {admission.error && <ErrorBox error={admission.error} />}
       {!data.publications.length ? (
@@ -72,61 +78,89 @@ export function EntryPublications({ workspace }: { workspace: CvmWorkspace }) {
             : '管理员发布入口地址并授权后，就可以在组合台为容器接入。'}
         </EmptyState>
       ) : (
-        <div className="node-card-grid cvm-entry-grid">
-          {data.publications.map(p => (
-            <article className="node-card cvm-entry-card tone-ok" key={p.id}>
-              <header>
-                <div>
+        <div className="cvm-network-cards">
+          {data.publications.map(p => {
+            const kinds = new Set(p.spec.addresses.map(offer => offer.kind));
+            return (
+              <article className="cvm-tile cvm-entry-card" key={p.id} aria-label={p.spec.name}>
+                <div className="cvm-pub-head">
                   <h3>{p.spec.name}</h3>
-                  <small>
-                    {p.provider_name} · 规格版本 {p.revision}
-                  </small>
+                  <span className="cz-kind">
+                    {kinds.size > 1 ? '端口段与整 IP' : kinds.has('shared') ? '共享端口段' : '整 IP'}
+                  </span>
+                  {!p.admitting && <span className="st st-pending">已停止新增</span>}
                 </div>
-                <span className={`st ${p.admitting ? 'st-succeeded' : 'st-pending'}`}>
-                  {p.admitting ? '接受新入口' : '已停止新增'}
-                </span>
-              </header>
-              <dl className="cvm-facts">
-                {p.spec.addresses.map((offer, index) => (
-                  <div key={offer.address}>
-                    <dt className="mono">{visible(offer)}</dt>
-                    <dd>
-                      {offer.kind === 'shared'
-                        ? `共享 · ${offer.port_start}–${offer.port_end} · ${p.usage[index]?.ports.length ?? 0} 段占用`
-                        : p.usage[index]?.whole_taken
-                          ? '独立 · 已分配'
-                          : '独立 · 空闲'}
-                    </dd>
-                  </div>
-                ))}
-              </dl>
-              <div className="cvm-network-figures">
-                <span>
-                  <b>{p.active_entries}</b> / {p.spec.max_entries} 个入口
-                </span>
-              </div>
-              {data.can_manage && (
-                <footer>
-                  <button className="btn small" disabled={admission.isPending} onClick={() => setEditing(p)}>
-                    修改
-                  </button>
-                  <label className="switch cvm-admission-switch">
-                    <span className="switch-label">接受新入口</span>
-                    <input
-                      type="checkbox"
-                      role="switch"
-                      checked={p.admitting}
-                      disabled={admission.isPending}
-                      onChange={() => admission.mutate(p)}
+                <p className="cvm-pub-sub">
+                  {p.provider_name} · 规格 v{p.revision}
+                  {p.spec.transports.length
+                    ? ` · ${[...new Set(p.spec.transports.map(t => transportName[t.kind]))].join(' / ')} 承载`
+                    : ' · 本机投递'}
+                </p>
+                <div className="cvm-pub-rows">
+                  {p.spec.addresses.map((offer, index) => (
+                    <div className="cvm-pub-row" key={offer.address}>
+                      <span className={`cz-layer ${offer.kind === 'shared' ? 'L4' : 'L3'}`}>
+                        {offer.kind === 'shared' ? 'L4' : 'L3'}
+                      </span>
+                      <code>{visible(offer)}</code>
+                      {offer.kind === 'shared' && (
+                        <span className="cvm-pub-range">
+                          {offer.port_start}–{offer.port_end}
+                        </span>
+                      )}
+                      <span className="cvm-pub-use">
+                        {offer.kind === 'shared'
+                          ? `${p.usage[index]?.ports.length ?? 0} 段占用`
+                          : p.usage[index]?.whole_taken
+                            ? '已分配'
+                            : '空闲'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <div className="cvm-pub-figure">
+                  <span>入口</span>
+                  <CapacityMeter used={p.active_entries} total={p.spec.max_entries} />
+                  <span>
+                    <b>{p.active_entries}</b> / {p.spec.max_entries}
+                  </span>
+                </div>
+                {data.can_manage && (
+                  <footer className="cvm-pub-foot">
+                    <button className="btn small" disabled={admission.isPending} onClick={() => setEditing(p)}>
+                      修改
+                    </button>
+                    <label className="switch cvm-admission-switch">
+                      <span className="switch-label">接受新入口</span>
+                      <input
+                        type="checkbox"
+                        role="switch"
+                        checked={p.admitting}
+                        aria-checked={p.admitting}
+                        aria-label={`${p.spec.name} 接受新入口`}
+                        disabled={admission.isPending}
+                        onChange={() => admission.mutate(p)}
+                      />
+                      <span className="switch-ui" aria-hidden="true">
+                        <span />
+                      </span>
+                    </label>
+                    <ActionMenu
+                      label={`${p.spec.name} 更多操作`}
+                      items={[
+                        {
+                          label: '删除',
+                          note: p.active_entries ? '仍有入口在用，需先在组合台撤销' : '删除这份入口地址发布',
+                          danger: true,
+                          onSelect: () => setDeleting(p),
+                        },
+                      ]}
                     />
-                  </label>
-                  <button className="btn small danger" onClick={() => setDeleting(p)}>
-                    删除
-                  </button>
-                </footer>
-              )}
-            </article>
-          ))}
+                  </footer>
+                )}
+              </article>
+            );
+          })}
         </div>
       )}
       {editing !== undefined && (
@@ -154,7 +188,7 @@ export function EntryPublications({ workspace }: { workspace: CvmWorkspace }) {
           }
         />
       )}
-    </div>
+    </section>
   );
 }
 
@@ -166,7 +200,14 @@ function blankSpec(catalog: CvmNicCatalog | undefined): CvmEntryPublicationSpec 
     provider_node: provider?.node_id ?? '',
     addresses: address ? [{ address, kind: 'shared', port_start: 30000, port_end: 30999 }] : [],
     transports: [
-      { kind: 'wireguard', listen_side: 'provider', endpoint: address, port_start: 44000, port_end: 44099, mtu: 1420 },
+      {
+        kind: provider?.capabilities.transports.includes('wireguard') ? 'wireguard' : 'xray',
+        listen_side: 'provider',
+        endpoint: address,
+        port_start: 44000,
+        port_end: 44099,
+        mtu: 1420,
+      },
     ],
     grants: [],
     max_entries: 64,
@@ -210,8 +251,8 @@ function EntryPublicationDialog({
     });
   const transport = spec.transports[0];
   const submit = () => {
-    if (!spec.name.trim() || !spec.provider_node || !spec.addresses.length || !transport) {
-      setLocalError('请填写名称、入口机器、至少一个地址和通道。');
+    if (!spec.name.trim() || !spec.provider_node || !spec.addresses.length) {
+      setLocalError('请填写名称、入口机器和至少一个地址。');
       return;
     }
     setLocalError(null);
@@ -311,8 +352,8 @@ function EntryPublicationDialog({
                   })
                 }
               >
-                <option value="shared">共享 · 按协议端口</option>
-                <option value="dedicated">独立 · 整 IP</option>
+                <option value="shared">按端口 · L4 转发</option>
+                <option value="dedicated">整 IP · L3 转发</option>
               </select>
             </label>
             {offer.kind === 'shared' && (
@@ -361,14 +402,79 @@ function EntryPublicationDialog({
           ＋ 添加地址
         </button>
         <p className="note">
-          共享地址须是机器网卡上的实际地址；宿主正在监听、代理与组网保留的端口不会分配。独立地址整 IP
-          交给一个容器，不能是机器的管理地址。
+          L4 按协议端口转发；L3 将该 IP 的新入站流量转发给一个实例，可以使用机器自身 IP，包含 SSH 等服务端口。 IP
+          保留在入口机器上；机器主动连接的回包和通道自身使用的端口不参与转发。
         </p>
       </fieldset>
+      <label className="cvm-check">
+        <input
+          type="checkbox"
+          checked={!!transport}
+          onChange={e =>
+            patch({
+              wireguard_transport: 'udp',
+              transports: e.target.checked
+                ? [
+                    {
+                      kind: provider?.capabilities.transports.includes('wireguard') ? 'wireguard' : 'xray',
+                      listen_side: 'provider',
+                      endpoint: provider?.capabilities.addresses.find(ip => !ip.includes(':')) ?? '',
+                      port_start: 44000,
+                      port_end: 44099,
+                      mtu: 1420,
+                    },
+                  ]
+                : [],
+            })
+          }
+        />
+        允许转发到其他机器
+      </label>
+      {!transport && <p className="note">仅转发到入口机器上的实例，不建立跨机器通道。</p>}
       {transport && (
         <fieldset className="cvm-form-fieldset">
-          <legend>跨宿主通道 · WireGuard</legend>
+          <legend>跨机器传输</legend>
           <div className="cvm-form-grid">
+            <label>
+              传输方式
+              <select
+                className="f"
+                value={transport.kind}
+                onChange={e =>
+                  patch({
+                    wireguard_transport: 'udp',
+                    transports: [{ ...transport, kind: e.target.value as 'xray' | 'wireguard', mtu: 1420 }],
+                  })
+                }
+              >
+                <option value="wireguard" disabled={!provider?.capabilities.transports.includes('wireguard')}>
+                  WireGuard
+                </option>
+                <option value="xray" disabled={!provider?.capabilities.entry_xray}>
+                  Xray
+                </option>
+              </select>
+            </label>
+            {transport.kind === 'wireguard' && (
+              <label>
+                WireGuard 传输
+                <select
+                  className="f"
+                  value={spec.wireguard_transport ?? 'udp'}
+                  onChange={e =>
+                    patch({
+                      wireguard_transport: e.target.value as 'udp' | 'phantun',
+                      transports: [{ ...transport, mtu: e.target.value === 'phantun' ? 1380 : 1420 }],
+                    })
+                  }
+                >
+                  <option value="udp">UDP 直连</option>
+                  <option value="phantun" disabled={!provider?.capabilities.entry_phantun}>
+                    Phantun / FakeTCP
+                  </option>
+                </select>
+              </label>
+            )}
             <label>
               入口机器端点 IP
               <input
@@ -402,7 +508,18 @@ function EntryPublicationDialog({
               </div>
             </label>
           </div>
-          <p className="note">容器在别的宿主时，宿主主动连接入口机器的这个端点；每对机器共用一条通道。</p>
+          <p className="note">
+            目标在另一台机器时，使用所选方式传输 L3／L4 转发流量，每对机器共用一条通道；目标在本机时不经过通道。
+            {transport.kind === 'xray'
+              ? 'Xray 使用加密连接传输原始 IP 包。'
+              : spec.wireguard_transport === 'phantun'
+                ? 'Phantun 将 WireGuard 的 UDP 包封装为 FakeTCP。'
+                : 'WireGuard 直接通过 UDP 连接。'}
+            通道实际使用的端口不参与整 IP 转发，两端机器均须支持所选方式。
+          </p>
+          {!!publication?.active_entries && (
+            <p className="note">更换传输方式前，请先撤销正在使用的跨机器入口并等待清理。</p>
+          )}
         </fieldset>
       )}
       <fieldset className="cvm-network-grants">

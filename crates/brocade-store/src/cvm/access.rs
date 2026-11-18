@@ -59,6 +59,7 @@ pub(super) fn redact(actor: &AdminContext, item: &mut CvmInstance) {
     if actor.role() != AdminRole::Readonly {
         return;
     }
+    item.desired.artifacts = None;
     item.desired.spec.ssh_public_key.clear();
     for nic in &mut item.desired.spec.interfaces {
         if let Some(allocated) = &mut nic.allocated {
@@ -71,6 +72,7 @@ pub(super) fn redact(actor: &AdminContext, item: &mut CvmInstance) {
         }
     }
     if let Some(report) = &mut item.report {
+        report.artifacts = None;
         report.runtime_id = None;
         report.volume_id = None;
         report.access_address = None;

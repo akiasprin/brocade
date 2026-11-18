@@ -247,6 +247,15 @@ pub(super) fn ns_command(ns: &str, args: &[String]) -> Result<String> {
     command.extend_from_slice(args);
     root_ip(&command)
 }
+pub(super) fn ns_command_with_input(ns: &str, args: &[String], input: &[u8]) -> Result<String> {
+    let mut command = vec!["netns".into(), "exec".into(), ns.into()];
+    command.extend_from_slice(args);
+    crate::command::run_command_with_input(
+        "ip",
+        &command.iter().map(String::as_str).collect::<Vec<_>>(),
+        input,
+    )
+}
 pub(super) fn ns_ip(ns: &str, args: &[String]) -> Result<String> {
     let mut command = vec!["-n".into(), ns.into()];
     command.extend_from_slice(args);
@@ -1216,7 +1225,7 @@ pub(super) fn route_rules(routing: &ContainerRoutes, interface: &str, v4: bool) 
             let priority = routing
                 .priorities
                 .iter()
-                .find(|p| p.interface_id == route.interface_id)
+                .find(|p| p.target == route.target)
                 .and_then(|p| if v4 { p.ipv4 } else { p.ipv6 })?;
             let width = route.service.map_or(u32::MAX, |s| {
                 u32::from(s.port_end) - u32::from(s.port_start)
@@ -1238,7 +1247,7 @@ pub(super) fn route_rules(routing: &ContainerRoutes, interface: &str, v4: bool) 
             a.3,
             &a.4.destination,
             a.4.service,
-            &a.4.interface_id,
+            &a.4.target,
         )
             .cmp(&(
                 b.0,
@@ -1247,13 +1256,13 @@ pub(super) fn route_rules(routing: &ContainerRoutes, interface: &str, v4: bool) 
                 b.3,
                 &b.4.destination,
                 b.4.service,
-                &b.4.interface_id,
+                &b.4.target,
             ))
     });
     ordered
         .into_iter()
         .map(|(_, _, _, _, route)| {
-            let action = if route.interface_id == interface {
+            let action = if route.target.interface_id() == Some(interface) {
                 "accept"
             } else {
                 "drop"
@@ -1517,7 +1526,9 @@ pub(super) fn counters(ns: &str, device: &str) -> Result<(u64, u64)> {
             .ok_or("NIC send counter is unavailable")?,
     ))
 }
-pub(super) fn withdraw(root: &Path, b: &NicBinding, retain: bool) -> Result<()> {
+/// False means the owned bridge still has a Guest device. Keep its ownership and reservations
+/// while compute detaches it; this normal cross-worker ordering is not an execution failure.
+pub(super) fn withdraw(root: &Path, b: &NicBinding, retain: bool) -> Result<bool> {
     if let Some(bytes) = read_bounded(&anchor_path(root, b), 8192)? {
         let saved: Layout =
             serde_json::from_slice(&bytes).map_err(|_| "invalid NIC anchor ownership")?;
@@ -1546,7 +1557,7 @@ pub(super) fn withdraw(root: &Path, b: &NicBinding, retain: bool) -> Result<()> 
             .iter()
             .find(|peer| peer.phase == BindingPhase::Active)
             .copied();
-        return configure_root(root, active.unwrap_or(b), &peers);
+        return configure_root(root, active.unwrap_or(b), &peers).map(|()| true);
     }
     let l = layout(b);
     if read_bounded(&anchor_path(root, b), 8192)?.is_none() {
@@ -1556,7 +1567,7 @@ pub(super) fn withdraw(root: &Path, b: &NicBinding, retain: bool) -> Result<()> 
         {
             return Err("NIC cleanup lacks ownership evidence; allocation retained".into());
         }
-        return configure_root(root, b, &[]);
+        return configure_root(root, b, &[]).map(|()| true);
     }
     configure_root(root, b, &[])?;
     super::flows::addresses([IpAddr::V4(l.namespace_v4), IpAddr::V6(l.namespace_v6)])?;
@@ -1577,7 +1588,7 @@ pub(super) fn withdraw(root: &Path, b: &NicBinding, retain: bool) -> Result<()> 
                 if entry["ifname"].as_str() != Some(&lan)
                     || entry["ifalias"].as_str() != Some(&owner(b))
                 {
-                    return Err("等待容器实际网卡卸载，资源继续保留".into());
+                    return Ok(false);
                 }
             }
         }
@@ -1600,12 +1611,14 @@ pub(super) fn withdraw(root: &Path, b: &NicBinding, retain: bool) -> Result<()> 
             l.bridge.clone(),
         ])?;
     }
-    Ok(())
+    Ok(true)
 }
 pub(super) fn forget(root: &Path, b: &NicBinding) -> Result<()> {
     let mut withdrawn = b.clone();
     withdrawn.phase = BindingPhase::Withdrawing;
-    withdraw(root, &withdrawn, false)?;
+    if !withdraw(root, &withdrawn, false)? {
+        return Err("等待容器实际网卡卸载，资源继续保留".into());
+    }
     let scope = table(b);
     if nft_owned(None, &scope, &owner(b))? {
         run_command("nft", &["delete", "table", "inet", &scope])

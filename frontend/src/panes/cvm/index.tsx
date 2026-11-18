@@ -12,6 +12,7 @@ import { InstanceDetail } from './detail';
 import { BoardPane } from './board';
 import { HostList } from './hosts';
 import { AddHost } from './host-policy';
+import { AdoptHostAction } from './adopt';
 import { QUERY, supportsCreate } from './queries';
 import { QuotaList } from './quotas';
 import { CvmPageHeader, CvmTabs } from './presentation';
@@ -53,6 +54,14 @@ export function CvmPane({ win }: { win: Win; bare?: boolean }) {
     <div className="cvm-page nd-page nd-sheet node-cardpage cvm-design">
       <div className="fg-sheet nd-paper">
         {query.error && <ErrorBox error={query.error} />}
+        {data.pending_revision_id != null && !drill?.p && (
+          <div className="cgr-notice cvm-release-notice" role="status">
+            <span>容器与网络变更已保存至全局 R{data.pending_revision_id}，等待发布。</span>
+            <button className="btn" disabled={!data.can_publish} onClick={() => navigate('deploy', { p: 'plan' })}>
+              查看混合发布计划
+            </button>
+          </div>
+        )}
         {drill?.p === 'instance' && item ? (
           <InstanceDetail key={item.desired.id} instance={item} workspace={data} />
         ) : (
@@ -74,9 +83,13 @@ export function CvmPane({ win }: { win: Win; bare?: boolean }) {
                         ＋ 创建容器
                       </button>
                     }
-                  />
+                  >
+                    <AdoptHostAction workspace={data} onViewHosts={() => setTab('hosts')} />
+                  </TitleActions>
                 ) : !drill?.p && active === 'hosts' ? (
-                  <TitleActions primary={<AddHost workspace={data} />} />
+                  <TitleActions primary={<AddHost workspace={data} />}>
+                    <AdoptHostAction workspace={data} onViewHosts={() => setTab('hosts')} />
+                  </TitleActions>
                 ) : undefined
               }
             />
@@ -99,10 +112,11 @@ export function CvmPane({ win }: { win: Win; bare?: boolean }) {
                   实例不存在或不在当前账号的可见范围内。
                 </EmptyState>
               ) : active === 'networks' ? (
-                <>
-                  <NetworkPublications workspace={data} />
+                // 与组合台的位置一致：入口地址在左，出口网络在右。
+                <div className="cvm-network-lanes">
                   <EntryPublications workspace={data} />
-                </>
+                  <NetworkPublications workspace={data} />
+                </div>
               ) : active === 'hosts' ? (
                 <HostList workspace={data} />
               ) : active === 'quotas' ? (

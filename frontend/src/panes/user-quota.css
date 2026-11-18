@@ -51,11 +51,6 @@
   overflow-wrap: anywhere;
   font-weight: inherit;
 }
-.qta-flags {
-  display: inline-flex;
-  flex: none;
-  gap: 3px;
-}
 .qta-reading {
   display: grid;
   grid-area: read;
@@ -271,7 +266,6 @@
     font-size: 13px;
     line-height: 18px;
   }
-  .qta-flags,
   .qta-app > .geo-flag {
     display: none;
   }

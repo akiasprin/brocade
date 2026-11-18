@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const contactTable = 30000
@@ -231,9 +232,53 @@ func (s *server) configureGuestNetwork(r *record, d object, observed []any) (obj
 	if contact == nil {
 		return nil, errors.New("contact observation missing")
 	}
-	state, e := s.guestNetwork(r, devices[r.ContactID])
-	if e != nil {
-		return nil, e
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		state, e := s.guestNetwork(r, devices[r.ContactID])
+		if e != nil {
+			return nil, e
+		}
+		ready, e := contactAddressesReady(state.Addresses, devices[r.ContactID])
+		if e != nil {
+			return nil, e
+		}
+		if ready {
+			return s.configureAllocatedGuest(r, d, observed, state)
+		}
+		if !time.Now().Before(deadline) {
+			return nil, errors.New("Guest contact addresses did not finish duplicate address detection")
+		}
+		select {
+		case <-s.ctx.Done():
+			return nil, s.ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
-	return s.configureAllocatedGuest(r, d, observed, state)
+}
+
+// iproute2 lists tentative IPv6 addresses before Linux accepts them as route
+// sources. Do not install contact routes until DAD finishes; failed DAD is an
+// explicit error rather than an IPv4-only fallback.
+func contactAddressesReady(devices []object, name string) (bool, error) {
+	for _, device := range devices {
+		if str(device, "ifname") != name {
+			continue
+		}
+		addresses := array(device, "addr_info")
+		ready := len(addresses) > 0
+		for _, raw := range addresses {
+			a := raw.(map[string]any)
+			tentative, failed := a["tentative"] == true, a["dadfailed"] == true
+			for _, flag := range array(a, "flags") {
+				tentative = tentative || flag == "tentative"
+				failed = failed || flag == "dadfailed"
+			}
+			if failed {
+				return false, errors.New("Guest contact address duplicate address detection failed")
+			}
+			ready = ready && !tentative
+		}
+		return ready, nil
+	}
+	return false, errors.New("Guest contact interface missing during address readiness")
 }

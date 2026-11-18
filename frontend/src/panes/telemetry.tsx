@@ -931,11 +931,15 @@ export function HistoryChart({
   // 拖选按最近一次写入的坐标范围换算像素。
   const extentRef = useRef<ObserveBrushExtent | null>(null);
   const observedPeak = historyObservedPeak(lines, threshold);
-  const valueAxis = max === undefined ? observeValueAxis(observedPeak) : null;
-  // 显式 max 的容量/连接图仍需要一个完整轴描述来选整卡单位；这只决定显示档位，实际轴上界
-  // 继续服从调用方传入的 max，不额外抬高容量上限。
-  const unitAxis = valueAxis ?? observeValueAxis(max ?? observedPeak);
+  const unitAxis = observeValueAxis(max ?? observedPeak);
   const unit = valueUnit?.(unitAxis);
+  // 字节轴先换到整卡的 KiB/MiB/GiB 档位挑刻度，再还原为原始字节；不能只把十进制
+  // 字节刻度格式化成 MiB，否则会出现 238.42 这样的轴标签。显式容量上限仍服从 max。
+  const valueAxis = unit?.axisDivisor
+    ? observeValueAxis(max ?? observedPeak, 4, unit.axisDivisor)
+    : max === undefined
+      ? unitAxis
+      : null;
   const axisText = unit?.text ?? formatValue!;
   const readValue = unit?.read ?? formatValue!;
   const { focusedLine, onFocusLine } = useObserveFocus(lines.map(line => line.name));
@@ -1075,7 +1079,7 @@ export function HistoryChart({
           type: 'value',
           min: 0,
           max: yMax,
-          interval: max === undefined ? valueAxis?.interval : undefined,
+          interval: valueAxis?.interval,
           scale: true,
           axisLine: observeAxisLine(ink3),
           axisTick: observeAxisTick(ink3),

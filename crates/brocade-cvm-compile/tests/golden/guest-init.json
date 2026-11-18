@@ -1,0 +1,6 @@
+{
+  "contract": "brocade-guest-init-v1",
+  "regenerate_host_keys_once": true,
+  "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICoqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioq",
+  "user": "cube"
+}

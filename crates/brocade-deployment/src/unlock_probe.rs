@@ -160,7 +160,7 @@ impl UnlockService {
                 "api.openai.com",
                 "ios.chat.openai.com",
             ],
-            Self::Claude => &["claude.ai", "claude.com", "www.anthropic.com"],
+            Self::Claude => &["claude.ai"],
             Self::Gemini => &["gemini.google.com"],
             Self::Netflix => &["www.netflix.com"],
             Self::DisneyPlus => &[

@@ -72,6 +72,7 @@ vi.mock('echarts/components', () => ({ GridComponent: {}, MarkLineComponent: {},
 vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }));
 
 let LoadCard: typeof import('../src/panes/telemetry').LoadCard;
+let HistoryChart: typeof import('../src/panes/telemetry').HistoryChart;
 let ThroughputChart: typeof import('../src/panes/telemetry').ThroughputChart;
 let downsampleKpiSeries: typeof import('../src/panes/telemetry').downsampleKpiSeries;
 let loadFindings: typeof import('../src/panes/telemetry').loadFindings;
@@ -93,7 +94,8 @@ beforeAll(async () => {
       disconnect() {}
     },
   );
-  ({ LoadCard, ThroughputChart, downsampleKpiSeries, loadFindings } = await import('../src/panes/telemetry'));
+  ({ LoadCard, HistoryChart, ThroughputChart, downsampleKpiSeries, loadFindings } =
+    await import('../src/panes/telemetry'));
   ({ HostCard, ThroughputPanel, PingProbePanel } = await import('../src/panes/nodes'));
   ({ PingLatencyChart, ObservationChartLoading } = await import('../src/panes/node-observation-charts'));
 });
@@ -426,6 +428,41 @@ describe('deep host telemetry', () => {
     expect(countUnit.name).toBe('k');
     expect(countUnit.text(50_000)).toBe('50');
     expect(countUnit.read(82)).toBe('0.0820 k');
+  });
+
+  it.each([286.1, 238.42])('uses readable MiB ticks for a %s MiB history peak', peak => {
+    render(
+      <HistoryChart
+        title="实例内存"
+        samples={[{ window_start_unix_secs: 100, window_end_unix_secs: 160 }]}
+        lines={[{ name: '已用', values: [peak * 1024 ** 2] }]}
+        valueUnit={observeBytesUnit}
+      />,
+    );
+    const chart = chartMock.setOption.mock.calls.at(-1)?.[0];
+    expect(chart.yAxis.interval).toBe(50 * 1024 ** 2);
+    expect(chart.yAxis.max).toBe((peak > 250 ? 300 : 250) * 1024 ** 2);
+    expect(chart.yAxis.axisLabel.formatter(chart.yAxis.interval)).toBe('50');
+  });
+
+  it('keeps an explicit memory capacity while aligning byte ticks to the displayed unit', () => {
+    render(
+      <HistoryChart
+        title="实例内存"
+        samples={[{ window_start_unix_secs: 100, window_end_unix_secs: 160 }]}
+        lines={[{ name: '已用', values: [238.42 * 1024 ** 2] }]}
+        valueUnit={observeBytesUnit}
+        max={512 * 1024 ** 2}
+      />,
+    );
+    const chart = chartMock.setOption.mock.calls.at(-1)?.[0];
+    expect(chart.yAxis.max).toBe(512 * 1024 ** 2);
+    expect(chart.yAxis.interval).toBe(100 * 1024 ** 2);
+    expect(chart.yAxis.axisLabel.formatter(200 * 1024 ** 2)).toBe('200');
+    const tooltip = chart.tooltip.formatter([
+      { seriesName: '已用', color: '#111', value: [160_000, 238.42 * 1024 ** 2] },
+    ]);
+    expect(tooltip).toContain('238 MiB');
   });
 
   it('spells network bit-rate units explicitly', () => {

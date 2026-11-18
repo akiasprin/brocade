@@ -84,7 +84,13 @@ pub(crate) async fn mount(
     let actor = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     Ok(private((
         StatusCode::ACCEPTED,
-        Json(state.store.mount_cvm_nic(&actor, &id, request).await?),
+        Json(
+            state
+                .store
+                .mount_cvm_nic_reviewed(&actor, &id, request, mutation_review(&headers)?)
+                .await?
+                .instance,
+        ),
     )))
 }
 pub(crate) async fn routes(
@@ -96,7 +102,13 @@ pub(crate) async fn routes(
     let actor = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     Ok(private((
         StatusCode::ACCEPTED,
-        Json(state.store.set_cvm_routes(&actor, &id, request).await?),
+        Json(
+            state
+                .store
+                .set_cvm_routes_reviewed(&actor, &id, request, mutation_review(&headers)?)
+                .await?
+                .instance,
+        ),
     )))
 }
 pub(crate) async fn transport(

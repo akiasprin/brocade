@@ -41,7 +41,9 @@ pub(super) fn read(b: &NicBinding) -> Result<NicTrafficSample> {
             "nft".into(),
             "-j".into(),
             "list".into(),
-            "counters".into(),
+            // Listing a named table works on nftables 1.0 as well as newer
+            // releases; `list counters` accepts a family, not a table name.
+            "table".into(),
             "inet".into(),
             TABLE.into(),
         ],

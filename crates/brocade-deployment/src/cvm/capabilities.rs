@@ -3,6 +3,12 @@ use super::*;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_compiler: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cube_storage_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baremetal: Option<HostInventory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_quota: Option<NetworkQuotaCapacity>,
     #[serde(default)]
     pub managed_networks: bool,
@@ -29,6 +35,9 @@ pub struct Capabilities {
     /// Cubelet 能在 Guest 中按协议端口写策略路由（出口 L4 规则）。旧运行栈不上报即为不支持。
     #[serde(default)]
     pub route_services: bool,
+    /// Primary-NIC transparent chain egress with terminal failure semantics.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub chain_egress: bool,
     pub hot_attach: bool,
     pub hot_detach: bool,
     pub max_interfaces: u16,
@@ -42,6 +51,24 @@ pub struct Capabilities {
 
 impl Capabilities {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(host) = &self.baremetal {
+            host.validate()?;
+            if self.backend != "baremetal-v1"
+                || self.create
+                || self.start
+                || self.stop
+                || self.delete
+                || self.reinstall
+                || self.configure
+                || self.restart
+                || self.stable_storage
+                || self.retain_on_delete
+                || !self.images.is_empty()
+                || self.network_quota.is_some()
+            {
+                return Err("bare-metal inventory cannot advertise VM lifecycle or storage".into());
+            }
+        }
         if let Some(capacity) = &self.network_quota {
             capacity.validate()?;
         }
@@ -55,12 +82,6 @@ impl Capabilities {
         }
         if let Some(limits) = &self.resource_limits {
             limits.validate()?;
-            if limits.max_vcpus > self.allocatable_vcpus
-                || limits.max_memory_bytes > self.allocatable_memory_bytes
-                || limits.max_root_disk_bytes > self.allocatable_disk_bytes
-            {
-                return Err("CVM per-instance limits exceed machine capacity".into());
-            }
         }
         if self.backend.len() > 80
             || self.max_interfaces as usize > MAX_INTERFACES

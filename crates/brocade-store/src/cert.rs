@@ -1678,10 +1678,13 @@ pub(crate) async fn overlay_serving_certificate_preferences(
     Ok(())
 }
 
-pub(crate) async fn serving_certificate_profile_for_node(
-    pool: &PgPool,
+pub(crate) async fn serving_certificate_profile_for_node<'e, E>(
+    executor: E,
     node_id: &str,
-) -> Result<Option<ServingCertificateProfile>> {
+) -> Result<Option<ServingCertificateProfile>>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
     let row = sqlx::query(
         "SELECT l.label, COALESCE(c.certificate_name, l.certificate_name) AS certificate_name,
                 d.domain, c.acme_directory = 'self-signed' AS requires_pinning,
@@ -1707,7 +1710,7 @@ pub(crate) async fn serving_certificate_profile_for_node(
           WHERE m.node_id = $1",
     )
     .bind(node_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     row.map(|row| {
         Ok(ServingCertificateProfile {

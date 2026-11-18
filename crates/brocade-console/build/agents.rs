@@ -14,6 +14,22 @@ pub fn flavor_target_dir(workspace: &Path, flavor: &str) -> PathBuf {
     target_dir(workspace).join(flavor)
 }
 
+/// rustc embeds different standard-library paths when this optional component is absent.
+/// Check the compiler's sysroot, including when RUSTUP_TOOLCHAIN bypasses the repository file.
+pub fn rust_source_root(sysroot: &Path) -> Result<PathBuf, String> {
+    let source = sysroot.join("lib/rustlib/src/rust");
+    for library in ["core", "alloc", "std"] {
+        let entry = source.join("library").join(library).join("src/lib.rs");
+        if !entry.is_file() {
+            return Err(format!(
+                "rust-src is required in the selected Rust sysroot (missing {}); run rustup component add rust-src for that toolchain",
+                entry.display()
+            ));
+        }
+    }
+    Ok(source)
+}
+
 pub fn flavor_command(workspace: &Path, cache: &Path, triples: &[&str], flavor: &str) -> Command {
     let mut command = command(workspace, cache, triples);
     command.arg("--no-default-features");
@@ -29,8 +45,14 @@ pub fn flavor_command(workspace: &Path, cache: &Path, triples: &[&str], flavor: 
 
 /// Generated tonic includes carry absolute OUT_DIR spans even when Cargo runs
 /// from the workspace root. Keep those panic locations independent of checkout.
-pub fn rustflags(workspace: &Path, linker: Option<&str>) -> String {
-    let remap = format!("--remap-path-prefix={}=.", workspace.display());
+pub fn rustflags(workspace: &Path, linker: Option<&str>, rust_source: &Path) -> String {
+    // This also invalidates dependencies cached before rust-src became mandatory: Cargo does
+    // not otherwise notice component installation. Keep the sysroot location out of new bytes.
+    let remap = format!(
+        "--remap-path-prefix={}=. --remap-path-prefix={}=/rust-src",
+        workspace.display(),
+        rust_source.display()
+    );
     linker.map_or(remap.clone(), |flags| format!("{flags} {remap}"))
 }
 
@@ -106,10 +128,14 @@ mod tests {
         assert!(args.iter().any(|a| a == "--locked"));
         assert_eq!(command.get_current_dir(), Some(root));
         assert_eq!(cache, root.join("target/brocade-agent-build"));
-        assert_eq!(rustflags(root, None), "--remap-path-prefix=/workspace=.");
+        let rust_source = Path::new("/toolchain/lib/rustlib/src/rust");
         assert_eq!(
-            rustflags(root, Some("-C linker=rust-lld")),
-            "-C linker=rust-lld --remap-path-prefix=/workspace=."
+            rustflags(root, None, rust_source),
+            "--remap-path-prefix=/workspace=. --remap-path-prefix=/toolchain/lib/rustlib/src/rust=/rust-src"
+        );
+        assert_eq!(
+            rustflags(root, Some("-C linker=rust-lld"), rust_source),
+            "-C linker=rust-lld --remap-path-prefix=/workspace=. --remap-path-prefix=/toolchain/lib/rustlib/src/rust=/rust-src"
         );
         for key in [
             "CARGO_TARGET_DIR",
@@ -119,6 +145,41 @@ mod tests {
         ] {
             assert!(command.get_envs().any(|(k, v)| k == key && v.is_none()));
         }
+    }
+
+    #[test]
+    fn rust_source_requires_all_three_libraries_in_the_selected_sysroot() {
+        let root = env::temp_dir().join(format!(
+            "brocade-rust-src-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        for library in ["core", "alloc", "std"] {
+            let error = rust_source_root(&root).unwrap_err();
+            assert!(error.contains("rust-src is required"), "{error}");
+            assert!(error.contains(&format!("{library}/src/lib.rs")), "{error}");
+            let entry = root
+                .join("lib/rustlib/src/rust/library")
+                .join(library)
+                .join("src/lib.rs");
+            fs::create_dir_all(entry.parent().unwrap()).unwrap();
+            fs::write(entry, b"// source").unwrap();
+        }
+        assert_eq!(
+            rust_source_root(&root).unwrap(),
+            root.join("lib/rustlib/src/rust")
+        );
     }
 
     #[test]

@@ -2,18 +2,33 @@ use super::*;
 use brocade_deployment::cvm::*;
 use brocade_store::cvm::*;
 
+#[path = "cvm_artifacts.rs"]
+mod artifact_tests;
+#[path = "cvm_baremetal.rs"]
+mod baremetal_tests;
+#[path = "cvm_chain.rs"]
+mod chain_tests;
+#[path = "cvm_releases.rs"]
+mod release_tests;
+
 #[path = "cvm_host_policy.rs"]
 mod host_policy_tests;
 #[path = "cvm_network_quota.rs"]
 mod network_quota_tests;
+#[path = "cvm_oversubscription.rs"]
+mod oversubscription_tests;
 #[path = "cvm_remote_nic.rs"]
 mod remote_nic_tests;
 
 fn catalogue() -> Capabilities {
     Capabilities {
+        artifact_compiler: None,
+        cube_storage_backend: None,
+        baremetal: None,
         managed_networks: true,
         network_quota: None,
         route_services: false,
+        chain_egress: false,
         primary_ip_delivery: false,
         guest_terminal: true,
         guest_terminal_persistent: true,
@@ -91,7 +106,7 @@ async fn cvm_first_release_initializes_shared_schema() {
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(count, 33);
+    assert_eq!(count, 40);
 }
 
 #[tokio::test]
@@ -102,39 +117,57 @@ async fn cvm_lifecycle_epochs_and_shutdown_configuration_preserve_boundaries() {
     };
     prepare(&db).await;
     let actor = actor_user("alice");
-    let mut item = db
-        .store
-        .create_cvm(&actor, create_request("lifecycle-create-0001"))
-        .await
-        .unwrap();
-    db.store
-        .cvm_record_report("n1", evidence(&item))
-        .await
-        .unwrap();
+    let mut item = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .create_cvm(&actor, create_request("lifecycle-create-0001"))
+    .await
+    .unwrap();
+    ({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", evidence(&item))
+    .await
+    .unwrap();
     let restart = CvmCommand {
         request_id: "lifecycle-restart-0001".into(),
         expected_generation: item.desired.generation,
         change: CvmChange::Restart,
     };
-    item = db
-        .store
-        .command_cvm(&actor, &item.desired.id, restart.clone())
-        .await
-        .unwrap();
+    item = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .command_cvm(&actor, &item.desired.id, restart.clone())
+    .await
+    .unwrap();
     assert_eq!(item.desired.restart_epoch, 1);
-    let replay = db
-        .store
-        .command_cvm(&actor, &item.desired.id, restart)
-        .await
-        .unwrap();
+    let replay = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .command_cvm(&actor, &item.desired.id, restart)
+    .await
+    .unwrap();
     assert_eq!(replay.desired, item.desired);
     let mut stale = evidence(&item);
     stale.restart_epoch = 0;
-    assert!(db.store.cvm_record_report("n1", stale).await.is_err());
-    db.store
-        .cvm_record_report("n1", evidence(&item))
-        .await
-        .unwrap();
+    assert!(({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", stale)
+    .await
+    .is_err());
+    ({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", evidence(&item))
+    .await
+    .unwrap();
     let configure = |generation, cpu| CvmCommand {
         request_id: format!("lifecycle-configure-{generation}-{cpu}"),
         expected_generation: generation,
@@ -144,63 +177,83 @@ async fn cvm_lifecycle_epochs_and_shutdown_configuration_preserve_boundaries() {
             memory_bytes: 256 * 1024 * 1024,
         },
     };
-    assert!(db
-        .store
-        .command_cvm(
-            &actor,
-            &item.desired.id,
-            configure(item.desired.generation, 2)
-        )
-        .await
-        .is_err());
-    item = db
-        .store
-        .command_cvm(
-            &actor,
-            &item.desired.id,
-            CvmCommand {
-                request_id: "lifecycle-stop-00001".into(),
-                expected_generation: item.desired.generation,
-                change: CvmChange::Stop,
-            },
-        )
-        .await
-        .unwrap();
+    assert!(({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .command_cvm(
+        &actor,
+        &item.desired.id,
+        configure(item.desired.generation, 2)
+    )
+    .await
+    .is_err());
+    item = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .command_cvm(
+        &actor,
+        &item.desired.id,
+        CvmCommand {
+            request_id: "lifecycle-stop-00001".into(),
+            expected_generation: item.desired.generation,
+            change: CvmChange::Stop,
+        },
+    )
+    .await
+    .unwrap();
     let mut stopped = evidence(&item);
     stopped.runtime_id = None;
     stopped.interfaces.clear();
     stopped.network = None;
     stopped.network_absent = true;
     stopped.volume_retained = true;
-    db.store.cvm_record_report("n1", stopped).await.unwrap();
-    assert!(db
-        .store
-        .command_cvm(
-            &actor,
-            &item.desired.id,
-            configure(item.desired.generation, 3)
-        )
-        .await
-        .is_err());
-    item = db
-        .store
-        .command_cvm(
-            &actor,
-            &item.desired.id,
-            configure(item.desired.generation, 2),
-        )
-        .await
-        .unwrap();
+    ({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", stopped)
+    .await
+    .unwrap();
+    assert!(({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .command_cvm(
+        &actor,
+        &item.desired.id,
+        configure(item.desired.generation, 3)
+    )
+    .await
+    .is_err());
+    item = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .command_cvm(
+        &actor,
+        &item.desired.id,
+        configure(item.desired.generation, 2),
+    )
+    .await
+    .unwrap();
     assert_eq!(item.desired.spec.resources.vcpus, 2);
     assert_eq!(item.desired.power, PowerState::Stopped);
-    assert_eq!(item.desired.spec.image.id, "debian13");
+    assert_eq!(item.desired.spec.image.as_ref().unwrap().id, "debian13");
     let mut stopped = evidence(&item);
     stopped.runtime_id = None;
     stopped.interfaces.clear();
     stopped.network = None;
     stopped.network_absent = true;
     stopped.volume_retained = true;
-    db.store.cvm_record_report("n1", stopped).await.unwrap();
+    ({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", stopped)
+    .await
+    .unwrap();
     let reinstall = CvmCommand {
         request_id: "lifecycle-reinstall-0001".into(),
         expected_generation: item.desired.generation,
@@ -210,22 +263,33 @@ async fn cvm_lifecycle_epochs_and_shutdown_configuration_preserve_boundaries() {
         },
     };
     assert!(matches!(
-        db.store
-            .command_cvm(&actor_user("bob"), &item.desired.id, reinstall.clone())
-            .await,
+        ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
+        .command_cvm(&actor_user("bob"), &item.desired.id, reinstall.clone())
+        .await,
         Err(StoreError::Forbidden(_))
     ));
-    let reset = db
-        .store
-        .command_cvm(&actor, &item.desired.id, reinstall)
-        .await
-        .unwrap();
+    let reset = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .command_cvm(&actor, &item.desired.id, reinstall)
+    .await
+    .unwrap();
     assert_eq!(reset.desired.reinstall_epoch, 1);
     assert_eq!(reset.desired.spec.resources, item.desired.spec.resources);
     assert_eq!(reset.desired.spec.interfaces, item.desired.spec.interfaces);
     let mut wrong = evidence(&reset);
     wrong.reinstall_epoch = 0;
-    assert!(db.store.cvm_record_report("n1", wrong).await.is_err());
+    assert!(({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", wrong)
+    .await
+    .is_err());
 }
 fn quota() -> CvmQuota {
     CvmQuota {
@@ -280,6 +344,9 @@ fn actor_user(user: &str) -> AdminContext {
 fn evidence(instance: &CvmInstance) -> InstanceReport {
     let d = &instance.desired;
     InstanceReport {
+        chain_egress: Vec::new(),
+        artifacts: None,
+        host: None,
         restart_epoch: d.restart_epoch,
         reinstall_epoch: d.reinstall_epoch,
         id: d.id.clone(),
@@ -292,6 +359,7 @@ fn evidence(instance: &CvmInstance) -> InstanceReport {
         volume_id: Some("cube-volume-01".into()),
         access_address: (d.power == PowerState::Running).then(|| "192.0.2.10".into()),
         network: Some(NetworkObservation {
+            chain_egress_configured: false,
             routing_revision: d.spec.routing.revision,
             contact_route_preserved: true,
             business_fallback_blocked: true,
@@ -355,34 +423,43 @@ async fn cvm_idempotency_capacity_and_owner_boundaries() {
     };
     prepare(&db).await;
     let request = create_request("request-create-00000001");
-    let a = db
-        .store
-        .create_cvm(&actor_user("alice"), request.clone())
-        .await
-        .unwrap();
-    let replay = db
-        .store
-        .create_cvm(&actor_user("alice"), request)
-        .await
-        .unwrap();
+    let a = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .create_cvm(&actor_user("alice"), request.clone())
+    .await
+    .unwrap();
+    let replay = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .create_cvm(&actor_user("alice"), request)
+    .await
+    .unwrap();
     assert_eq!(a.desired.id, replay.desired.id);
     assert!(matches!(
-        db.store
-            .create_cvm(
-                &actor_user("bob"),
-                create_request("request-crossuser-00001")
-            )
-            .await,
+        ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
+        .create_cvm(
+            &actor_user("bob"),
+            create_request("request-crossuser-00001")
+        )
+        .await,
         Err(StoreError::Forbidden(_))
     ));
-    assert!(db
-        .store
-        .create_cvm(
-            &actor_user("alice"),
-            create_request("request-create-00000002")
-        )
-        .await
-        .is_err());
+    assert!(({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .create_cvm(
+        &actor_user("alice"),
+        create_request("request-create-00000002")
+    )
+    .await
+    .is_err());
     assert!(db
         .store
         .cvm_instance(&actor_user("bob"), &a.desired.id)
@@ -420,10 +497,16 @@ async fn cvm_concurrent_requests_only_reserve_the_last_slot_once() {
     prepare(&db).await;
     let actor = actor_user("alice");
     let (a, b) = tokio::join!(
-        db.store
-            .create_cvm(&actor, create_request("concurrent-request-000001")),
-        db.store
-            .create_cvm(&actor, create_request("concurrent-request-000002"))
+        ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
+        .create_cvm(&actor, create_request("concurrent-request-000001")),
+        ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
+        .create_cvm(&actor, create_request("concurrent-request-000002"))
     );
     assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
     let volumes: i64 = sqlx::query_scalar("SELECT count(*) FROM cvm_volumes")
@@ -439,24 +522,36 @@ async fn cvm_requires_real_interface_and_version_evidence_and_retains_reservatio
         return;
     };
     prepare(&db).await;
-    let item = db
-        .store
-        .create_cvm(&system_admin(), create_request("evidence-request-000001"))
-        .await
-        .unwrap();
+    let item = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .create_cvm(&system_admin(), create_request("evidence-request-000001"))
+    .await
+    .unwrap();
     let mut bad = evidence(&item);
     bad.interfaces.clear();
-    assert!(db.store.cvm_record_report("n1", bad).await.is_err());
-    assert!(db
-        .store
-        .cvm_record_report("other-machine", evidence(&item))
-        .await
-        .is_err());
-    assert!(db
-        .store
-        .cvm_record_report("n1", evidence(&item))
-        .await
-        .unwrap());
+    assert!(({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", bad)
+    .await
+    .is_err());
+    assert!(({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("other-machine", evidence(&item))
+    .await
+    .is_err());
+    assert!(({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", evidence(&item))
+    .await
+    .unwrap());
     let mut q = quota();
     q.enabled = false;
     assert!(db.store.set_cvm_quota(&system_admin(), q).await.is_err());
@@ -465,47 +560,55 @@ async fn cvm_requires_real_interface_and_version_evidence_and_retains_reservatio
         .cvm_instance(&system_admin(), &item.desired.id)
         .await
         .unwrap();
-    let attached = db
-        .store
-        .command_cvm(
-            &system_admin(),
-            &item.desired.id,
-            CvmCommand {
-                request_id: "attach-request-0000001".into(),
-                expected_generation: 1,
-                change: CvmChange::Restart,
-            },
-        )
-        .await
-        .unwrap();
+    let attached = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .command_cvm(
+        &system_admin(),
+        &item.desired.id,
+        CvmCommand {
+            request_id: "attach-request-0000001".into(),
+            expected_generation: 1,
+            change: CvmChange::Restart,
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(attached.desired.spec.interfaces.len(), 1);
     assert_eq!(attached.desired.generation, 2);
-    assert!(!db
-        .store
-        .cvm_record_report("n1", evidence(&before))
-        .await
-        .unwrap());
-    assert!(db
-        .store
-        .cvm_record_report("n1", evidence(&attached))
-        .await
-        .unwrap());
+    assert!(!({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", evidence(&before))
+    .await
+    .unwrap());
+    assert!(({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", evidence(&attached))
+    .await
+    .unwrap());
     // A managed contact interface can never be detached.
-    assert!(db
-        .store
-        .command_cvm(
-            &system_admin(),
-            &item.desired.id,
-            CvmCommand {
-                request_id: "contact-detach-denied-0001".into(),
-                expected_generation: attached.desired.generation,
-                change: CvmChange::Detach {
-                    interface_id: attached.desired.spec.interfaces[0].id.clone()
-                }
+    assert!(({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .command_cvm(
+        &system_admin(),
+        &item.desired.id,
+        CvmCommand {
+            request_id: "contact-detach-denied-0001".into(),
+            expected_generation: attached.desired.generation,
+            change: CvmChange::Detach {
+                interface_id: attached.desired.spec.interfaces[0].id.clone()
             }
-        )
-        .await
-        .is_err());
+        }
+    )
+    .await
+    .is_err());
 }
 
 #[tokio::test]
@@ -515,49 +618,66 @@ async fn cvm_delete_needs_cleanup_proof_and_keeps_retained_disk_charged() {
         return;
     };
     prepare(&db).await;
-    let item = db
-        .store
-        .create_cvm(&system_admin(), create_request("delete-create-0000001"))
-        .await
-        .unwrap();
-    db.store
-        .cvm_record_report("n1", evidence(&item))
-        .await
-        .unwrap();
-    let deleted = db
-        .store
-        .command_cvm(
-            &system_admin(),
-            &item.desired.id,
-            CvmCommand {
-                request_id: "delete-request-000001".into(),
-                expected_generation: 1,
-                change: CvmChange::Delete { delete_data: false },
-            },
-        )
-        .await
-        .unwrap();
-    assert!(db
-        .store
-        .cvm_record_report("n1", evidence(&deleted))
-        .await
-        .is_err());
+    let item = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .create_cvm(&system_admin(), create_request("delete-create-0000001"))
+    .await
+    .unwrap();
+    ({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", evidence(&item))
+    .await
+    .unwrap();
+    let deleted = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .command_cvm(
+        &system_admin(),
+        &item.desired.id,
+        CvmCommand {
+            request_id: "delete-request-000001".into(),
+            expected_generation: 1,
+            change: CvmChange::Delete { delete_data: false },
+        },
+    )
+    .await
+    .unwrap();
+    assert!(({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", evidence(&deleted))
+    .await
+    .is_err());
     let mut report = evidence(&deleted);
     report.runtime_id = None;
     report.interfaces.clear();
     report.network_absent = true;
     report.volume_retained = true;
-    db.store.cvm_record_report("n1", report).await.unwrap();
+    ({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", report)
+    .await
+    .unwrap();
     let mut q = quota();
     q.max_disk_bytes = 0;
     assert!(db.store.set_cvm_quota(&system_admin(), q).await.is_err());
-    assert!(db
-        .store
-        .cvm_desired("n1")
-        .await
-        .unwrap()
-        .instances
-        .is_empty());
+    assert!(({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_desired("n1")
+    .await
+    .unwrap()
+    .instances
+    .is_empty());
 }
 
 #[tokio::test]
@@ -573,25 +693,29 @@ async fn cvm_one_image_is_independent_of_cpu_memory_and_disk_resources() {
     q.max_memory_bytes = 1024 * 1024 * 1024;
     q.max_disk_bytes = 20 * 1024 * 1024 * 1024;
     db.store.set_cvm_quota(&system_admin(), q).await.unwrap();
-    let small = db
-        .store
-        .create_cvm(
-            &actor_user("alice"),
-            create_request("independent-image-small-01"),
-        )
-        .await
-        .unwrap();
+    let small = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .create_cvm(
+        &actor_user("alice"),
+        create_request("independent-image-small-01"),
+    )
+    .await
+    .unwrap();
     let mut request = create_request("independent-image-large-01");
     request.resources = Resources {
         vcpus: 3,
         memory_bytes: 256 * 1024 * 1024,
         root_disk_bytes: 8 * 1024 * 1024 * 1024,
     };
-    let large = db
-        .store
-        .create_cvm(&actor_user("alice"), request)
-        .await
-        .unwrap();
+    let large = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .create_cvm(&actor_user("alice"), request)
+    .await
+    .unwrap();
     assert_eq!(small.desired.spec.image, large.desired.spec.image);
     assert_eq!(large.desired.spec.resources.vcpus, 3);
     assert_eq!(large.desired.spec.resources.memory_bytes, 256 * 1024 * 1024);
@@ -628,18 +752,23 @@ async fn cvm_tenant_admin_sees_explicitly_granted_shared_pool_and_readonly_detai
     );
     let workspace = db.store.cvm_workspace(&admin).await.unwrap();
     assert_eq!(workspace.hosts.len(), 1);
-    let item = db
-        .store
-        .create_cvm(
-            &actor_user("alice"),
-            create_request("shared-pool-create-00001"),
-        )
-        .await
-        .unwrap();
-    db.store
-        .cvm_record_report("n1", evidence(&item))
-        .await
-        .unwrap();
+    let item = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .create_cvm(
+        &actor_user("alice"),
+        create_request("shared-pool-create-00001"),
+    )
+    .await
+    .unwrap();
+    ({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", evidence(&item))
+    .await
+    .unwrap();
     let reader = AdminContext::new("reader", AdminRole::Readonly, Some("platform.acme".into()));
     let detail = db
         .store
@@ -666,19 +795,23 @@ async fn cvm_guest_reads_are_scoped_redacted_and_cannot_write() {
         return;
     };
     prepare(&db).await;
-    let item = db
-        .store
-        .create_cvm(
-            &actor_user("alice"),
-            create_request("guest-create-00000001"),
-        )
-        .await
-        .unwrap();
-    assert!(db
-        .store
-        .cvm_record_report("n1", evidence(&item))
-        .await
-        .unwrap());
+    let item = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .create_cvm(
+        &actor_user("alice"),
+        create_request("guest-create-00000001"),
+    )
+    .await
+    .unwrap();
+    assert!(({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", evidence(&item))
+    .await
+    .unwrap());
     let guest = AdminContext::new(
         brocade_store::PUBLIC_OPERATOR_ID,
         AdminRole::Readonly,
@@ -761,23 +894,29 @@ async fn cvm_guest_reads_are_scoped_redacted_and_cannot_write() {
         .await
         .is_ok());
     assert!(matches!(
-        db.store
-            .create_cvm(&guest, create_request("guest-denied-00000001"))
-            .await,
+        ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
+        .create_cvm(&guest, create_request("guest-denied-00000001"))
+        .await,
         Err(StoreError::Forbidden(_))
     ));
     assert!(matches!(
-        db.store
-            .command_cvm(
-                &guest,
-                &item.desired.id,
-                CvmCommand {
-                    request_id: "guest-command-0000001".into(),
-                    expected_generation: item.desired.generation,
-                    change: CvmChange::Stop,
-                }
-            )
-            .await,
+        ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
+        .command_cvm(
+            &guest,
+            &item.desired.id,
+            CvmCommand {
+                request_id: "guest-command-0000001".into(),
+                expected_generation: item.desired.generation,
+                change: CvmChange::Stop,
+            }
+        )
+        .await,
         Err(StoreError::Forbidden(_))
     ));
     assert!(matches!(
@@ -851,18 +990,23 @@ async fn cvm_cleanup_survives_inventory_failure_and_expiry_without_new_allocatio
         .await
         .unwrap();
     for (index, failure) in [true, false].into_iter().enumerate() {
-        let item = db
-            .store
-            .create_cvm(
-                &actor,
-                create_request(&format!("cleanup-create-{index:08}")),
-            )
-            .await
-            .unwrap();
-        db.store
-            .cvm_record_report("n1", evidence(&item))
-            .await
-            .unwrap();
+        let item = ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
+        .create_cvm(
+            &actor,
+            create_request(&format!("cleanup-create-{index:08}")),
+        )
+        .await
+        .unwrap();
+        ({
+            publish_cvm_intent(&db).await;
+            &db.store
+        })
+        .cvm_record_report("n1", evidence(&item))
+        .await
+        .unwrap();
         if failure {
             db.store
                 .cvm_record_inventory(
@@ -885,47 +1029,57 @@ async fn cvm_cleanup_survives_inventory_failure_and_expiry_without_new_allocatio
         let workspace = db.store.cvm_workspace(&actor).await.unwrap();
         assert!(!workspace.hosts[0].fresh);
         assert!(workspace.hosts[0].capabilities.delete);
-        let error = db
-            .store
-            .create_cvm(
-                &actor,
-                create_request(&format!("cleanup-denied-{index:08}")),
-            )
-            .await
-            .unwrap_err();
+        let error = ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
+        .create_cvm(
+            &actor,
+            create_request(&format!("cleanup-denied-{index:08}")),
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("机器能力已过期"));
         assert!(
-            db.store
-                .command_cvm(
-                    &actor,
-                    &item.desired.id,
-                    CvmCommand {
-                        request_id: format!("cleanup-retain-{index:08}"),
-                        expected_generation: 1,
-                        change: CvmChange::Delete { delete_data: false },
-                    }
-                )
-                .await
-                .is_err(),
-            "the last verified retention policy must remain enforced"
-        );
-        let deleted = db
-            .store
+            ({
+                supersede_cvm_fixture(&db).await;
+                &db.store
+            })
             .command_cvm(
                 &actor,
                 &item.desired.id,
                 CvmCommand {
-                    request_id: format!("cleanup-delete-{index:08}"),
+                    request_id: format!("cleanup-retain-{index:08}"),
                     expected_generation: 1,
-                    change: CvmChange::Delete { delete_data: true },
-                },
+                    change: CvmChange::Delete { delete_data: false },
+                }
             )
             .await
-            .unwrap();
-        db.store
-            .cvm_record_report("n1", deleted_evidence(&deleted))
-            .await
-            .unwrap();
+            .is_err(),
+            "the last verified retention policy must remain enforced"
+        );
+        let deleted = ({
+            supersede_cvm_fixture(&db).await;
+            &db.store
+        })
+        .command_cvm(
+            &actor,
+            &item.desired.id,
+            CvmCommand {
+                request_id: format!("cleanup-delete-{index:08}"),
+                expected_generation: 1,
+                change: CvmChange::Delete { delete_data: true },
+            },
+        )
+        .await
+        .unwrap();
+        ({
+            publish_cvm_intent(&db).await;
+            &db.store
+        })
+        .cvm_record_report("n1", deleted_evidence(&deleted))
+        .await
+        .unwrap();
         db.store
             .cvm_record_inventory(
                 "n1",
@@ -957,25 +1111,29 @@ async fn cvm_terminal_requires_write_scope_and_current_running_incarnation() {
         )
         .await
         .unwrap();
-    let instance = db
-        .store
-        .create_cvm(
-            &actor_user("alice"),
-            create_request("terminal-create-00001"),
-        )
-        .await
-        .unwrap();
+    let instance = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .create_cvm(
+        &actor_user("alice"),
+        create_request("terminal-create-00001"),
+    )
+    .await
+    .unwrap();
     let id = &instance.desired.id;
     assert!(db
         .store
         .cvm_terminal_target(&actor_user("alice"), id)
         .await
         .is_err());
-    assert!(db
-        .store
-        .cvm_record_report("n1", evidence(&instance))
-        .await
-        .unwrap());
+    assert!(({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", evidence(&instance))
+    .await
+    .unwrap());
     let (node, target) = db
         .store
         .cvm_terminal_target(&actor_user("alice"), id)
@@ -1070,18 +1228,26 @@ async fn cvm_independent_observations_survive_failed_inventory_and_preserve_inte
         return;
     };
     prepare(&db).await;
-    let item = db
-        .store
-        .create_cvm(
-            &actor_user("alice"),
-            create_request("independent-monitor-001"),
-        )
-        .await
-        .unwrap();
+    let item = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .create_cvm(
+        &actor_user("alice"),
+        create_request("independent-monitor-001"),
+    )
+    .await
+    .unwrap();
     let mut report = evidence(&item);
     report.status = ApplyStatus::Unknown;
     report.error = Some("network configuration failed".into());
-    db.store.cvm_record_report("n1", report).await.unwrap();
+    ({
+        publish_cvm_intent(&db).await;
+        &db.store
+    })
+    .cvm_record_report("n1", report)
+    .await
+    .unwrap();
     db.store
         .cvm_record_inventory(
             "n1",
@@ -1459,11 +1625,13 @@ async fn cvm_quota_usage_keeps_storage_and_interfaces_until_cleanup() {
         return;
     };
     prepare(&db).await;
-    let item = db
-        .store
-        .create_cvm(&actor_user("alice"), create_request("quota-ledger-00001"))
-        .await
-        .unwrap();
+    let item = ({
+        supersede_cvm_fixture(&db).await;
+        &db.store
+    })
+    .create_cvm(&actor_user("alice"), create_request("quota-ledger-00001"))
+    .await
+    .unwrap();
     // Compute and resource cleanup have separate durable ledgers. A released
     // compute reservation must not imply that disk or NIC cleanup succeeded.
     sqlx::query("UPDATE cvm_instances SET reserved=false WHERE id=$1")
@@ -1501,4 +1669,89 @@ async fn cvm_quota_usage_keeps_storage_and_interfaces_until_cleanup() {
     let workspace = db.store.cvm_workspace(&actor_user("alice")).await.unwrap();
     assert_eq!(workspace.usage[0].disk_bytes, 0);
     assert_eq!(workspace.usage[0].interfaces, 0);
+}
+
+/// Legacy lifecycle/network cases exercise execution rather than approval UI. Their simulated
+/// worker explicitly approves pending global intent before a poll/report. Publication tests keep
+/// this helper out and verify the unapproved state directly. A newer intent supersedes the old
+/// fixture work order through the real cancellation API, never by changing serving pointers.
+async fn publish_cvm_intent(db: &TestPg) {
+    let r = sqlx::query_scalar::<_, i64>("SELECT current_revision FROM control_state WHERE id=TRUE")
+        .fetch_one(db.pool())
+        .await
+        .unwrap() as u64;
+    let plan = db.store.plan_deployment(&system_admin(), r).await.unwrap();
+    if plan.targets.iter().any(|t| {
+        t.actions
+            .contains(&brocade_deployment::plan::PlannedAction::SyncCvm)
+    }) {
+        let active: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT id,revision_id FROM deployments WHERE kind='config' AND active=TRUE",
+        )
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+        if let Some((id, previous)) = active {
+            if previous != r as i64 {
+                db.store
+                    .cancel_deployment(&system_admin(), id)
+                    .await
+                    .unwrap();
+            }
+        }
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM deployments WHERE kind='config' AND active=TRUE)",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        if !active {
+            db.store
+                .create_deployment(
+                    &system_admin(),
+                    create_deployment_request(r, &format!("cvm-execution-fixture-{r}")),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let active:Option<i64>=sqlx::query_scalar("SELECT id FROM deployments WHERE kind='config' AND active=TRUE AND status IN ('planned','running')").fetch_optional(db.pool()).await.unwrap();
+    let Some(id) = active else { return };
+    let targets = db
+        .store
+        .deployment_detail(&system_admin(), id, false)
+        .await
+        .unwrap()
+        .targets;
+    for target in &targets {
+        if target.disruptive && target.wave > 1 {
+            let _ = db
+                .store
+                .confirm_deployment_wave(&system_admin(), id, target.wave, None)
+                .await;
+        }
+        if let Some(desired) = db
+            .store
+            .claim_desired_for_node(&target.node_id)
+            .await
+            .unwrap()
+        {
+            db.store
+                .report_target_result(applied_report(&desired))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// Execution fixtures supersede an unfinished work order explicitly before editing its mutable
+/// resources. The publishing cases separately assert that the product requires this boundary.
+async fn supersede_cvm_fixture(db: &TestPg) {
+    let ids:Vec<i64>=sqlx::query_scalar("SELECT DISTINCT d.id FROM deployments d JOIN deployment_target_state s ON s.deployment_id=d.id WHERE d.kind='config' AND d.active=TRUE AND s.cvm_revision_id IS NOT NULL").fetch_all(db.pool()).await.unwrap();
+    for id in ids {
+        db.store
+            .cancel_deployment(&system_admin(), id)
+            .await
+            .unwrap();
+    }
 }

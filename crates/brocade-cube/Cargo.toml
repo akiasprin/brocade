@@ -7,6 +7,7 @@ license.workspace = true
 description = "Node-local Cube execution, durable recovery and Guest I/O for Brocade Agent"
 
 [dependencies]
+brocade-cvm-compile = { path = "../brocade-cvm-compile" }
 cube-terminal = { path = "../../components/cube/CubeShim/terminal" }
 brocade-core = { path = "../brocade-core" }
 brocade-deployment = { path = "../brocade-deployment", features = ["cvm"] }

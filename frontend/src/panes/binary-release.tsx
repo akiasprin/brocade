@@ -431,34 +431,6 @@ export function BinaryReleaseTab({
 
   return (
     <>
-      {release.component === 'agent' && (view.available_variants?.length ?? 0) > 1 && (
-        <div className="nd-tools">
-          <SegSwitch
-            checked={release.agentFlavor === 'cvm'}
-            disabled={busy || !!active}
-            off="基础版 Agent"
-            on="容器版 Agent"
-            ariaLabel="Agent 产品版本"
-            onChange={cvm => {
-              release.setAgentFlavor(cvm ? 'cvm' : 'base');
-              setSelected([]);
-            }}
-          />
-          <label>
-            <input
-              type="checkbox"
-              checked={release.allowFlavorChange}
-              disabled={busy || !!active}
-              onChange={event => {
-                release.setAllowFlavorChange(event.target.checked);
-                setSelected([]);
-              }}
-            />{' '}
-            允许基础版机器升级为容器版
-          </label>
-        </div>
-      )}
-
       {ledger}
       {unavailableBuild && (
         <section className="cgc-main cgc-span">
@@ -466,6 +438,33 @@ export function BinaryReleaseTab({
         </section>
       )}
       <section className="cgc-main">
+        {release.component === 'agent' && (view.available_variants?.length ?? 0) > 1 && (
+          <div className="cgc-agent-options" role="group" aria-label="Agent 升级选项">
+            <SegSwitch
+              checked={release.agentFlavor === 'cvm'}
+              disabled={busy || !!active}
+              off="基础版 Agent"
+              on="容器版 Agent"
+              ariaLabel="Agent 产品版本"
+              onChange={cvm => {
+                release.setAgentFlavor(cvm ? 'cvm' : 'base');
+                setSelected([]);
+              }}
+            />
+            <label>
+              <input
+                type="checkbox"
+                checked={release.allowFlavorChange}
+                disabled={busy || !!active}
+                onChange={event => {
+                  release.setAllowFlavorChange(event.target.checked);
+                  setSelected([]);
+                }}
+              />
+              允许基础版机器升级为容器版
+            </label>
+          </div>
+        )}
         {!picking && mutationError && <ErrorBox error={mutationError} />}
         <MachineTable
           label={`逐台 ${label} 升级状态`}

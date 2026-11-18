@@ -94,6 +94,32 @@ if (scene === 'agent-binary') {
     legacy_approval: null,
   });
 }
+if (scene === 'agent-variants') {
+  client.setQueryData(['nodes'], {
+    nodes: nodes.slice(0, 2).map(node => ({
+      ...node,
+      runtime_versions: { ...node.runtime_versions, agent_flavor: 'base' },
+    })),
+  });
+  const variants = (['base', 'cvm'] as const).map((flavor, index) => ({
+    agent_flavor: flavor,
+    component: 'agent',
+    version: 'v0.3.8',
+    build_id: (index ? 'c' : 'a').repeat(64),
+    source: 'embedded',
+    artifacts: [
+      { arch: 'x86_64', sha256: (index ? 'c' : 'a').repeat(64) },
+      { arch: 'aarch64', sha256: (index ? 'd' : 'e').repeat(64) },
+    ],
+  }));
+  client.setQueryData(['binary-releases', 'agent'], {
+    available: variants[0],
+    available_variants: variants,
+    current: null,
+    legacy_approval: null,
+  });
+  client.setQueryData(['deployment-verify', 7], { summary: { changed_targets: 0 }, targets: [] });
+}
 const responses: Record<string, unknown> = {
   '/model/snapshot': snapshot,
   '/nodes/agent-state': { nodes },
@@ -104,9 +130,24 @@ const responses: Record<string, unknown> = {
   '/deployments?limit=50': { deployments: [] },
   '/certs': { groups: [], nodes: [] },
 };
+const nodeNotificationSettings = new Map<string, boolean>();
 // Every request stays inside this deterministic fixture; mutations are synthetic and never reach a Console.
 window.fetch = async (input, init) => {
   const path = String(input);
+  const notificationNode = path.match(/^\/nodes\/([^/]+)\/notifications$/);
+  if (notificationNode && init?.method === 'PUT') {
+    const nodeId = decodeURIComponent(notificationNode[1]);
+    const enabled = JSON.parse(String(init.body)).public_ip_changes;
+    nodeNotificationSettings.set(nodeId, enabled);
+    return Response.json({ node_id: nodeId, public_ip_changes: enabled });
+  }
+  if (scene === 'nodes' && path === '/nodes/agent-state')
+    return Response.json({
+      nodes: nodes.map(node => ({
+        ...node,
+        public_ip_change_notifications: nodeNotificationSettings.get(node.node_id) ?? true,
+      })),
+    });
   if (init?.method && init.method !== 'GET')
     return Response.json({
       node_id: decodeURIComponent(path.split('/')[2]),
@@ -122,6 +163,9 @@ window.fetch = async (input, init) => {
   if (path.startsWith('/deployments/100')) return Response.json(deployment);
   if (path === '/deployments/active') return Response.json({ deployments: [] });
   if (path.startsWith('/binary-releases/xray')) return Response.json(client.getQueryData(['binary-releases', 'xray']));
+  if (scene === 'agent-variants' && path === '/binary-releases/agent')
+    return Response.json(client.getQueryData(['binary-releases', 'agent']));
+  if (scene === 'agent-variants' && path === '/nodes/agent-state') return Response.json(client.getQueryData(['nodes']));
   if (path.includes('probe-capability')) return Response.json({});
   if (path in responses) return Response.json(responses[path]);
   return Response.json({ error: `Unexpected fixture request: ${path}` }, { status: 404 });
@@ -222,7 +266,9 @@ function Preview() {
               ? { p: 'warp', id: warps[index].id }
               : scene === 'deploy'
                 ? { p: 'detail', id: 100 }
-                : { p: 'chain', app: appId, chain: pairs[index].chainId },
+                : scene === 'agent-variants'
+                  ? { p: 'list' }
+                  : { p: 'chain', app: appId, chain: pairs[index].chainId },
     },
   };
   return (
@@ -269,7 +315,7 @@ function Preview() {
           <LoadCard report={report} />
         ) : scene === 'binary' || scene === 'agent-binary' ? (
           <Binary />
-        ) : scene === 'deploy' ? (
+        ) : scene === 'deploy' || scene === 'agent-variants' ? (
           <DeployPane win={win} />
         ) : scene === 'nodes' || scene === 'install' ? (
           <NodesPane win={win} bare />

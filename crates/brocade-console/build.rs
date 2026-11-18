@@ -232,6 +232,36 @@ fn flavor_override_var(arch: &str, flavor: &str) -> String {
 
 fn main() {
     let workspace = workspace_root();
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("cannot query the selected Rust sysroot");
+    assert!(
+        output.status.success(),
+        "cannot query the selected Rust sysroot"
+    );
+    let sysroot = PathBuf::from(
+        String::from_utf8(output.stdout)
+            .expect("Rust sysroot is not UTF-8")
+            .trim(),
+    );
+    let rust_source =
+        agent_build::rust_source_root(&sysroot).unwrap_or_else(|error| panic!("{error}"));
+    for library in ["core", "alloc", "std"] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            rust_source
+                .join("library")
+                .join(library)
+                .join("src/lib.rs")
+                .display()
+        );
+    }
+    println!(
+        "cargo:rerun-if-changed={}",
+        workspace.join("rust-toolchain.toml").display()
+    );
     // Changed agent source has to rebuild, and what must be watched is the whole dependency chain
     // `agent -> deployment -> core`, not merely its own directory. The symptom of missing one has
     // been observed: change only core with not one word of agent source altered, build.rs does not
@@ -371,7 +401,7 @@ fn main() {
     }
 
     for flavor in agent_flavors() {
-        build_agents(&workspace, zig.as_deref(), flavor);
+        build_agents(&workspace, zig.as_deref(), flavor, &rust_source);
         for target in TARGETS {
             let built = match env::var(flavor_override_var(target.arch, flavor)) {
                 Ok(path) if !path.trim().is_empty() => {
@@ -713,7 +743,7 @@ fn target_installed(triple: &str) -> bool {
         .is_dir()
 }
 
-fn build_agents(workspace: &Path, zig: Option<&Path>, flavor: &str) {
+fn build_agents(workspace: &Path, zig: Option<&Path>, flavor: &str, rust_source: &Path) {
     let targets = TARGETS
         .iter()
         .filter(|target| !env_set(&flavor_override_var(target.arch, flavor)))
@@ -734,7 +764,7 @@ fn build_agents(workspace: &Path, zig: Option<&Path>, flavor: &str) {
                 "CARGO_TARGET_{}_RUSTFLAGS",
                 target.triple.to_uppercase().replace('-', "_")
             ),
-            agent_build::rustflags(workspace, target.linker),
+            agent_build::rustflags(workspace, target.linker, rust_source),
         );
         if let (Some(zig), false) = (zig, env_set(&cc_var(target.triple))) {
             let (cc, ar) = zig_wrapper(&cache, target, zig);

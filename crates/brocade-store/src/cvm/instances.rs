@@ -12,6 +12,12 @@ pub(super) fn state_text(state: ApplyStatus) -> &'static str {
 
 pub(super) fn from_row(row: &sqlx::postgres::PgRow) -> Result<CvmInstance> {
     Ok(CvmInstance {
+        revision_id: row
+            .try_get::<Option<i64>, _>("revision_id")?
+            .map(|r| r as u64),
+        published_revision_id: row
+            .try_get::<Option<i64>, _>("published_revision_id")?
+            .map(|r| r as u64),
         tenant_id: row.try_get("tenant_id")?,
         user_id: row.try_get("user_id")?,
         node_id: row.try_get("node_id")?,
@@ -28,7 +34,7 @@ pub(super) fn from_row(row: &sqlx::postgres::PgRow) -> Result<CvmInstance> {
 }
 
 // History is fetched for one authorized detail, never multiplied across the list.
-pub(super) const INSTANCE_SELECT: &str="SELECT id,tenant_id,user_id,node_id,desired,status,reserved,report,to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated,to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created FROM cvm_instances";
+pub(super) const INSTANCE_SELECT: &str="SELECT id,tenant_id,user_id,node_id,desired,status,reserved,report,(SELECT r.revision_id FROM cvm_revision_instances r WHERE r.instance_id=cvm_instances.id AND r.generation<=cvm_instances.generation ORDER BY r.generation DESC LIMIT 1) AS revision_id,(SELECT s.revision_id FROM cvm_serving_nodes s WHERE s.node_id=cvm_instances.node_id) AS published_revision_id,to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated,to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created FROM cvm_instances";
 
 impl PgStore {
     pub async fn cvm_workspace(&self, actor: &AdminContext) -> Result<CvmWorkspace> {
@@ -100,7 +106,7 @@ impl PgStore {
                (SELECT count(*) FROM cvm_instances i WHERE i.tenant_id=q.tenant_id AND i.user_id=q.user_id AND i.reserved) AS instances,
                (SELECT coalesce(sum((desired#>>'{{spec,resources,vcpus}}')::bigint),0)::bigint FROM cvm_instances i WHERE i.tenant_id=q.tenant_id AND i.user_id=q.user_id AND i.reserved) AS vcpus,
                (SELECT coalesce(sum((desired#>>'{{spec,resources,memory_bytes}}')::bigint),0)::bigint FROM cvm_instances i WHERE i.tenant_id=q.tenant_id AND i.user_id=q.user_id AND i.reserved) AS memory,
-               (SELECT coalesce(sum(bytes),0)::bigint FROM cvm_volumes v WHERE v.tenant_id=q.tenant_id AND v.user_id=q.user_id AND v.state<>'released') AS disk,
+               ((SELECT coalesce(sum(bytes),0)::bigint FROM cvm_volumes v WHERE v.tenant_id=q.tenant_id AND v.user_id=q.user_id AND v.state<>'released') + (SELECT coalesce(sum((desired#>>'{{spec,resources,root_disk_bytes}}')::bigint),0)::bigint FROM cvm_instances i WHERE i.tenant_id=q.tenant_id AND i.user_id=q.user_id AND i.reserved AND desired#>>'{{spec,execution,kind}}'='baremetal')) AS disk,
                (SELECT count(*) FROM cvm_interfaces nic JOIN cvm_instances i ON i.id=nic.instance_id WHERE i.tenant_id=q.tenant_id AND i.user_id=q.user_id AND (NOT nic.detached_confirmed OR EXISTS(SELECT 1 FROM cvm_nic_allocations a WHERE a.interface_id=nic.id AND NOT a.released AND NOT a.retired))) AS interfaces
              FROM owners q"
         ))
@@ -113,7 +119,13 @@ impl PgStore {
             disk_bytes: row.try_get::<i64, _>("disk")? as u64,
             interfaces: row.try_get::<i64, _>("interfaces")? as u64,
         })).collect::<Result<Vec<_>>>()?;
+        let pending_revision:Option<i64>=sqlx::query_scalar("SELECT max(r.revision_id) FROM cvm_revision_nodes r LEFT JOIN cvm_serving_nodes s ON s.node_id=r.node_id WHERE r.node_id=ANY($1) AND (s.revision_id IS NULL OR r.revision_id>s.revision_id)").bind(&node_ids).fetch_one(&self.pool).await?;
         Ok(CvmWorkspace {
+            can_publish: matches!(
+                actor.role(),
+                AdminRole::Publisher | AdminRole::TenantAdmin | AdminRole::SystemAdmin
+            ),
+            pending_revision_id: pending_revision.map(|r| r as u64),
             available_hosts,
             network_quotas: self.cvm_host_network_quotas(actor).await?,
             usage,

@@ -13,6 +13,7 @@ use std::{
     time::Duration,
 };
 mod persistent;
+pub use persistent::{connect_terminal, revoke_terminal, TerminalTarget};
 
 pub enum TerminalCommand {
     Data(Vec<u8>),

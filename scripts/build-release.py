@@ -226,7 +226,19 @@ exec "{zig}" ar "$@"
     return directory, paths
 
 
-def agents(root, state, env, timer, jobs, zig, flavor='base'):
+def rust_source_root(sysroot):
+    source = sysroot / 'lib/rustlib/src/rust'
+    for library in ['core', 'alloc', 'std']:
+        entry = source / 'library' / library / 'src/lib.rs'
+        if not entry.is_file():
+            raise BuildError(
+                f'rust-src is required in the selected Rust sysroot (missing {entry}); '
+                'run rustup component add rust-src for that toolchain'
+            )
+    return source
+
+
+def agents(root, state, env, timer, jobs, zig, rust_source, flavor='base'):
     target, wrappers = agent_wrappers(root / 'target/brocade-release', zig)
     target = target / flavor
     triples = [('x86_64', 'x86_64-unknown-linux-musl'), ('aarch64', 'aarch64-unknown-linux-musl')]
@@ -248,13 +260,19 @@ def agents(root, state, env, timer, jobs, zig, flavor='base'):
     for _, triple in triples:
         command += ['--target', triple]
     agent_env = env.copy()
+    # Global Rust flags take precedence over per-target flags. Match the Cargo build script:
+    # inherited flags must not bypass the source-path mapping or the ARM linker selection.
+    for key in ['CARGO_TARGET_DIR', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_BUILD_TARGET']:
+        agent_env.pop(key, None)
     for arch, triple in triples:
         key = triple.upper().replace('-', '_')
         cc, ar = wrappers[arch]
         agent_env[f'CC_{triple.replace("-", "_")}'] = str(cc)
         agent_env[f'AR_{triple.replace("-", "_")}'] = str(ar)
         linker = '-C linker=rust-lld ' if arch == 'aarch64' else ''
-        agent_env[f'CARGO_TARGET_{key}_RUSTFLAGS'] = f'{linker}--remap-path-prefix={root}=.'
+        agent_env[f'CARGO_TARGET_{key}_RUSTFLAGS'] = (
+            f'{linker}--remap-path-prefix={root}=. --remap-path-prefix={rust_source}=/rust-src'
+        )
     with (state / f'agent-{flavor}.log').open('w') as log:
         run(command, root, agent_env, timer, log)
     for arch, triple in triples:
@@ -264,8 +282,8 @@ def agents(root, state, env, timer, jobs, zig, flavor='base'):
     return command
 
 
-def go_binary(root, env, timer):
-    version = (root / 'components/xray-core/.go-version').read_text().strip()
+def go_binary(root, env, timer, component='xray-core'):
+    version = (root / 'components' / component / '.go-version').read_text().strip()
     explicit = env.get('BROCADE_GO')
     machine = {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(os.uname().machine)
     candidates = (
@@ -400,7 +418,10 @@ def build(args, root, timer):
                 env['BROCADE_ZIG'] = zig
                 if not run([zig, 'version'], root, env, timer).startswith('0.16.'):
                     raise BuildError('Zig 0.16 is required')
-                sysroot = Path(run(['rustc', '--print', 'sysroot'], root, env, timer))
+                sysroot = Path(run([env.get('RUSTC', 'rustc'), '--print', 'sysroot'], root, env, timer))
+                rust_source = rust_source_root(sysroot)
+                record['rust_source_root'] = str(rust_source)
+                record['agent_rust_source_prefix'] = '/rust-src'
                 triples = ['x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu']
                 for triple in triples + ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl']:
                     if not (sysroot / 'lib/rustlib' / triple / 'lib').is_dir():
@@ -419,7 +440,7 @@ def build(args, root, timer):
                 env['BROCADE_CONSOLE_ASSETS_DIR'] = str(frontend(root, state, env, timer))
             with stage('dual_architecture_agent'):
                 record['agent_commands'] = [
-                    agents(root, state, env, timer, args.jobs, zig, flavor)
+                    agents(root, state, env, timer, args.jobs, zig, rust_source, flavor)
                     for flavor in (['base', 'cvm'] if args.flavor == 'cvm' else ['base'])
                 ]
             command = [
@@ -520,7 +541,7 @@ def main():
                 '--jobs',
                 str(args.jobs),
                 '--go',
-                go_binary(root, os.environ.copy(), timer),
+                go_binary(root, os.environ.copy(), timer, component='cube'),
             ]
             outcome = subprocess.run(command, cwd=root)
             if outcome.returncode == 0 and args.cvm_package_assets:

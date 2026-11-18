@@ -473,7 +473,7 @@ function UnlockContents({
 }) {
   return (
     <>
-      {(u.job || u.query.isPending) && (
+      {u.job && (
         <div className="unlock-bar">
           {u.hasResults && (
             <span
@@ -519,9 +519,11 @@ function UnlockFooter({ u, variant }: { u: Unlock; variant: 'tab' | 'dialog' }) 
         ariaLabel="解锁地址族"
         onChange={u.setFamily}
       />
-      <span role="status" aria-live="polite">
-        <Meta u={u} />
-      </span>
+      {!u.query.isPending && (
+        <span role="status" aria-live="polite">
+          <Meta u={u} />
+        </span>
+      )}
     </div>
   );
 }
@@ -539,7 +541,7 @@ export function NodeUnlockPanel({
   return (
     <>
       {actionTarget && createPortal(<RunButton u={u} />, actionTarget)}
-      <div className="node-unlock unlock-page">
+      <div className="node-unlock unlock-page" aria-busy={u.query.isPending}>
         <UnlockContents u={u} variant="tab" showRunButton={actionTarget === undefined} />
       </div>
     </>

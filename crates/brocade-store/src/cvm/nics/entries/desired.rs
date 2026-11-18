@@ -2,10 +2,11 @@
 use super::*;
 
 /// Joined facts for an entry, read in the caller's snapshot.
-const FACTS_SELECT: &str = "SELECT e.id,e.publication_id,e.provider_node,e.instance_id,e.address,e.mode,e.revision,e.released,i.node_id AS host,i.tenant_id,i.user_id,i.reserved,i.report->>'power' AS power,i.report->>'access_address' AS target,p.spec,(SELECT t.id FROM cvm_entry_tunnels t WHERE t.entry_node=e.provider_node AND t.target_node=i.node_id AND NOT t.withdrawn) AS tunnel FROM cvm_entries e JOIN cvm_instances i ON i.id=e.instance_id JOIN cvm_entry_publications p ON p.id=e.publication_id";
+const FACTS_SELECT: &str = "SELECT e.id,e.publication_id,e.provider_node,e.instance_id,e.address,e.mode,e.revision,e.released,i.node_id AS host,i.tenant_id,i.user_id,i.reserved,i.report->>'power' AS power,i.report->>'access_address' AS target,i.desired#>>'{spec,execution,kind}' AS execution_kind,p.spec,(SELECT t.id FROM cvm_entry_tunnels t WHERE t.entry_node=e.provider_node AND t.target_node=i.node_id AND NOT t.withdrawn) AS tunnel FROM cvm_entries e JOIN cvm_instances i ON i.id=e.instance_id JOIN cvm_entry_publications p ON p.id=e.publication_id";
 
 struct Facts {
     entry: StoredEntry,
+    host_local: bool,
     granted: bool,
     /// The container's host-side primary NIC address while it runs. Cube reports an
     /// IPv4 delivery address; anything else cannot receive an entry.
@@ -37,6 +38,10 @@ fn facts(row: &sqlx::postgres::PgRow) -> Result<Facts> {
         .offer(entry.address)
         .map_or(entry.address, EntryAddressOffer::visible_address);
     Ok(Facts {
+        host_local: row
+            .try_get::<Option<String>, _>("execution_kind")?
+            .as_deref()
+            == Some("baremetal"),
         entry,
         granted,
         target,
@@ -101,15 +106,21 @@ fn evidence(
     if !receipt.fresh {
         return Err((CvmEntryState::Offline, None));
     }
-    let Some(report) = receipt
-        .report
-        .as_ref()
-        .filter(|_| receipt.applied >= receipt.desired)
-    else {
+    let Some(report) = receipt.report.as_ref().filter(|report| {
+        report.generation >= receipt.desired
+            && (receipt.applied >= receipt.desired || report.error.is_some())
+    }) else {
         return Err((CvmEntryState::Pending, None));
     };
     if let Some(error) = &report.error {
         return Err((CvmEntryState::Failed, Some(error.clone())));
+    }
+    if let Some(tunnel) = tunnel {
+        if let Some(t) = report.tunnels.iter().find(|t| t.id == tunnel) {
+            if t.error.is_some() {
+                return Err((CvmEntryState::Failed, t.error.clone()));
+            }
+        }
     }
     let items = match item {
         Item::Rule => &report.rules,
@@ -122,7 +133,6 @@ fn evidence(
     }
     if let Some(tunnel) = tunnel {
         match report.tunnels.iter().find(|t| t.id == tunnel) {
-            Some(t) if t.error.is_some() => return Err((CvmEntryState::Failed, t.error.clone())),
             Some(t) if t.connected => {}
             _ => return Err((CvmEntryState::Pending, None)),
         }
@@ -151,10 +161,19 @@ fn state(facts: &Facts, receipts: &BTreeMap<String, Receipt>) -> (CvmEntryState,
         (facts.entry.provider_node.as_str(), Item::Rule),
         (facts.entry.host.as_str(), Item::Delivery),
     ];
+    let mut pending = None;
     for (node, item) in checks.into_iter().take(if facts.remote() { 2 } else { 1 }) {
         if let Err(state) = evidence(receipts.get(node), item, &facts.entry.id, tunnel) {
-            return state;
+            if state.0 == CvmEntryState::Failed {
+                return state;
+            }
+            if pending.is_none() || state.0 == CvmEntryState::Offline {
+                pending = Some(state);
+            }
         }
+    }
+    if let Some(state) = pending {
+        return state;
     }
     (CvmEntryState::Active, None)
 }
@@ -191,6 +210,8 @@ async fn render(
             remote,
             state,
             error,
+            can_read_logs: actor.is_system_admin(),
+            tunnel_id: if readonly { None } else { f.tunnel.clone() },
         });
     }
     Ok(out)
@@ -229,7 +250,7 @@ pub(super) async fn views_by_id(
 
 /// Releases claims of entries and tunnels whose cleanup the nodes have proven.
 pub(super) async fn cleanup(tx: &mut Transaction<'_, Postgres>, node: &str) -> Result<()> {
-    let entries: Vec<String> = sqlx::query_scalar("UPDATE cvm_entries e SET cleaned=true FROM cvm_entry_nodes n WHERE n.node_id=e.provider_node AND e.provider_node=$1 AND e.released AND NOT e.cleaned AND e.cleanup_generation<=n.applied_generation RETURNING e.id")
+    let entries: Vec<String> = sqlx::query_scalar("UPDATE cvm_entries e SET cleaned=true FROM cvm_entry_nodes n WHERE n.node_id=e.provider_node AND e.provider_node=$1 AND e.released AND NOT e.cleaned AND e.cleanup_generation<=n.applied_generation AND NOT EXISTS (SELECT 1 FROM cvm_serving_nodes s WHERE s.node_id=e.provider_node AND e.id=ANY(s.entry_ids)) RETURNING e.id")
         .bind(node)
         .fetch_all(&mut **tx)
         .await?;
@@ -237,7 +258,7 @@ pub(super) async fn cleanup(tx: &mut Transaction<'_, Postgres>, node: &str) -> R
         .bind(&entries)
         .execute(&mut **tx)
         .await?;
-    let tunnels: Vec<String> = sqlx::query_scalar("UPDATE cvm_entry_tunnels t SET cleaned=true FROM cvm_entry_nodes a,cvm_entry_nodes b WHERE a.node_id=t.entry_node AND b.node_id=t.target_node AND (t.entry_node=$1 OR t.target_node=$1) AND t.withdrawn AND NOT t.cleaned AND a.applied_generation>=t.entry_cleanup_generation AND b.applied_generation>=t.target_cleanup_generation RETURNING t.id")
+    let tunnels: Vec<String> = sqlx::query_scalar("UPDATE cvm_entry_tunnels t SET cleaned=true FROM cvm_entry_nodes a,cvm_entry_nodes b WHERE a.node_id=t.entry_node AND b.node_id=t.target_node AND (t.entry_node=$1 OR t.target_node=$1) AND t.withdrawn AND NOT t.cleaned AND a.applied_generation>=t.entry_cleanup_generation AND b.applied_generation>=t.target_cleanup_generation AND NOT EXISTS (SELECT 1 FROM cvm_serving_nodes s WHERE s.node_id IN (t.entry_node,t.target_node) AND t.id=ANY(s.tunnel_ids)) RETURNING t.id")
         .bind(node)
         .fetch_all(&mut **tx)
         .await?;
@@ -251,66 +272,10 @@ pub(super) async fn cleanup(tx: &mut Transaction<'_, Postgres>, node: &str) -> R
 impl PgStore {
     pub async fn cvm_entry_desired(&self, node: &str) -> Result<EntryDesired> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *tx)
-            .await?;
-        let generation: Option<i64> =
-            sqlx::query_scalar("SELECT desired_generation FROM cvm_entry_nodes WHERE node_id=$1")
-                .bind(node)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let tunnels = tunnels::desired(&mut tx, node).await?;
-        let limit = MAX_ENTRIES_PER_NODE as i64 + 1;
-        let rules = sqlx::query(&format!(
-            "{FACTS_SELECT} WHERE e.provider_node=$1 AND NOT e.released ORDER BY e.id LIMIT $2"
-        ))
-        .bind(node)
-        .bind(limit)
-        .fetch_all(&mut *tx)
-        .await?;
-        let deliveries = sqlx::query(&format!("{FACTS_SELECT} WHERE i.node_id=$1 AND e.provider_node<>$1 AND NOT e.released ORDER BY e.id LIMIT $2"))
-            .bind(node)
-            .bind(limit)
-            .fetch_all(&mut *tx)
-            .await?;
+        let desired = super::super::super::releases::entry_desired_tx(&mut tx, node).await?;
         tx.commit().await?;
-        let mut desired = EntryDesired {
-            node_id: node.into(),
-            generation: generation.unwrap_or(0) as u64,
-            tunnels,
-            ..Default::default()
-        };
-        for row in &rules {
-            let f = facts(row)?;
-            let tunnel = if f.remote() { f.tunnel.clone() } else { None };
-            // Without an authorized, running target (or its tunnel) the entry machine
-            // still owns the address and ports but drops the traffic.
-            let deliverable = f.granted && (!f.remote() || tunnel.is_some());
-            desired.rules.push(EntryRule {
-                id: f.entry.id,
-                address: f.entry.address,
-                mode: f.entry.mode,
-                target: f.target.filter(|_| deliverable),
-                tunnel,
-            });
-        }
-        for row in &deliveries {
-            let f = facts(row)?;
-            let (true, Some(target), Some(tunnel)) = (f.granted, f.target, f.tunnel) else {
-                continue;
-            };
-            desired.deliveries.push(EntryDelivery {
-                id: f.entry.id,
-                instance_id: f.entry.instance_id,
-                mode: f.entry.mode,
-                target,
-                tunnel,
-            });
-        }
-        desired.validate().map_err(invalid)?;
         Ok(desired)
     }
-
     /// Records a node's entry receipt. A report without a global error proves that the
     /// node converged to its generation, including the removal of everything withdrawn.
     pub async fn cvm_record_entry_report(
@@ -320,7 +285,19 @@ impl PgStore {
     ) -> Result<bool> {
         report.validate().map_err(invalid)?;
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        if crate::cvm::releases::serving_tx(&mut tx, node)
+            .await?
+            .is_some()
+        {
+            let expected = crate::cvm::releases::entry_desired_tx(&mut tx, node).await?;
+            if report.generation > expected.generation {
+                return Err(invalid("入口回报版本超出已发布期望状态"));
+            }
+            if report.generation < expected.generation {
+                return Ok(false);
+            }
+        }
         let row: Option<(i64, i64)> = sqlx::query_as("SELECT desired_generation,applied_generation FROM cvm_entry_nodes WHERE node_id=$1 FOR UPDATE")
             .bind(node)
             .fetch_optional(&mut *tx)
@@ -328,7 +305,11 @@ impl PgStore {
         let Some((desired, applied)) = row else {
             return Ok(false);
         };
-        if report.generation > desired as u64 {
+        if crate::cvm::releases::serving_tx(&mut tx, node)
+            .await?
+            .is_none()
+            && report.generation > desired as u64
+        {
             return Err(invalid("入口回报版本超出期望状态"));
         }
         if report.generation < applied as u64 {
@@ -344,7 +325,138 @@ impl PgStore {
         if report.error.is_none() {
             cleanup(&mut tx, node).await?;
         }
+        crate::cvm::releases::settle(&mut tx, node).await?;
         tx.commit().await?;
         Ok(true)
+    }
+}
+
+pub(crate) async fn desired_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    node: &str,
+    freeze: bool,
+) -> Result<EntryDesired> {
+    let generation: Option<i64> =
+        sqlx::query_scalar("SELECT desired_generation FROM cvm_entry_nodes WHERE node_id=$1")
+            .bind(node)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let tunnels = tunnels::desired(tx, node, !freeze).await?;
+    let limit = MAX_ENTRIES_PER_NODE as i64 + 1;
+    let rules = sqlx::query(&format!(
+        "{FACTS_SELECT} WHERE e.provider_node=$1 AND NOT e.released ORDER BY e.id LIMIT $2"
+    ))
+    .bind(node)
+    .bind(limit)
+    .fetch_all(&mut **tx)
+    .await?;
+    let deliveries = sqlx::query(&format!("{FACTS_SELECT} WHERE i.node_id=$1 AND e.provider_node<>$1 AND NOT e.released ORDER BY e.id LIMIT $2"))
+            .bind(node)
+            .bind(limit)
+            .fetch_all(&mut **tx)
+            .await?;
+    if !freeze
+        && rules.iter().any(|row| {
+            row.try_get::<serde_json::Value, _>("mode")
+                .is_ok_and(|m| m["kind"] == "l3")
+        })
+    {
+        let caps = capability(tx, node).await?;
+        for row in &rules {
+            let mut f = facts(row)?;
+            if freeze && f.granted {
+                f.target = Some(Ipv4Addr::UNSPECIFIED);
+            }
+            if f.entry.mode == EntryMode::L3 {
+                require_host_l3(tx, node, f.entry.address, &caps).await?;
+            }
+        }
+    }
+    let mut desired = EntryDesired {
+        node_id: node.into(),
+        generation: generation.unwrap_or(0) as u64,
+        tunnels,
+        ..Default::default()
+    };
+    for row in &rules {
+        let mut f = facts(row)?;
+        if freeze && f.granted {
+            f.target = Some(Ipv4Addr::UNSPECIFIED);
+        }
+        let tunnel = if f.remote() { f.tunnel.clone() } else { None };
+        // Without an authorized, running target (or its tunnel) the entry machine
+        // still owns the address and ports but drops the traffic.
+        let deliverable = f.granted && (!f.remote() || tunnel.is_some());
+        desired.rules.push(EntryRule {
+            host_local: f.host_local && !f.remote(),
+            id: f.entry.id,
+            address: f.entry.address,
+            mode: f.entry.mode,
+            target: f.target.filter(|_| deliverable),
+            tunnel,
+        });
+    }
+    for row in &deliveries {
+        let mut f = facts(row)?;
+        if freeze && f.granted {
+            f.target = Some(Ipv4Addr::UNSPECIFIED);
+        }
+        let (true, Some(target), Some(tunnel)) = (f.granted, f.target, f.tunnel) else {
+            continue;
+        };
+        desired.deliveries.push(EntryDelivery {
+            host_local: f.host_local,
+            id: f.entry.id,
+            instance_id: f.entry.instance_id,
+            mode: f.entry.mode,
+            target,
+            tunnel,
+        });
+    }
+    if !freeze {
+        desired.validate().map_err(invalid)?;
+    }
+    Ok(desired)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn current_generation_error_is_visible_before_application_succeeds() {
+        let receipt = Receipt {
+            desired: 2,
+            applied: 1,
+            fresh: true,
+            reported: true,
+            report: Some(EntryNodeReport {
+                generation: 2,
+                error: Some("Phantun 防火墙规则应用失败".into()),
+                ..Default::default()
+            }),
+        };
+        let error = evidence(Some(&receipt), Item::Rule, "entry-test", None).unwrap_err();
+        assert_eq!(error.0, CvmEntryState::Failed);
+        assert!(error.1.unwrap().contains("防火墙"));
+    }
+    #[test]
+    fn prior_generation_error_does_not_claim_the_current_generation_failed() {
+        let receipt = Receipt {
+            desired: 2,
+            applied: 1,
+            fresh: true,
+            reported: true,
+            report: Some(EntryNodeReport {
+                generation: 1,
+                error: Some("old failure".into()),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            evidence(Some(&receipt), Item::Rule, "entry-test", None)
+                .unwrap_err()
+                .0,
+            CvmEntryState::Pending
+        );
     }
 }

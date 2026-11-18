@@ -7,7 +7,6 @@ import {
   fetchDeployments,
   fetchNodes,
   fetchSnapshot,
-  fetchTunnelProbeCapability,
   removeWarpBinding,
   updateWarpBinding,
   upsertExternalOutbound,
@@ -34,10 +33,13 @@ import { confirmDiscardChanges, useUnsavedChanges } from '../ui/navigation-guard
 import { WarpRegistrationAction, useWarpRegistrationAvailability } from '../warp-registration';
 import {
   TunnelProbePanel,
+  TunnelProbeActions,
+  TunnelProbeDraftAction,
   tunnelExitRun,
   tunnelProbeStatus,
+  tunnelProbeImpact,
   useTunnelProbeChart,
-  useTunnelProbeView,
+  useTunnelProbeControls,
   type TunnelProbeStatus,
   type TunnelProbeTone,
 } from '../tunnel-probe';
@@ -1191,14 +1193,15 @@ function TunnelDetail({ tunnelId }: { tunnelId: string }) {
   const [windowSecs, setWindowSecs] = useState(86_400);
   const tunnel = (snapshot.data?.snapshot.external_outbounds ?? []).find(candidate => candidate.id === tunnelId);
   const probeEnabled = tunnel != null && !isVpngateOutbound(tunnel) && tunnel.protocol.t !== 'warp';
-  const probe = useTunnelProbeView(tunnel?.tenant ?? '', tunnel?.id ?? '', windowSecs, probeEnabled);
-  const probeCapability = useQuery({
-    queryKey: ['tunnel-probe-capability'],
-    queryFn: fetchTunnelProbeCapability,
-    enabled: probeEnabled && editable,
-    staleTime: 60_000,
-    retry: false,
+  const probeControls = useTunnelProbeControls({
+    tenantId: tunnel?.tenant ?? '',
+    outboundId: tunnel?.id ?? '',
+    windowSecs,
+    editable,
+    draftSupported: true,
+    enabled: probeEnabled,
   });
+  const { probe, capability: probeCapability } = probeControls;
   const chart = useTunnelProbeChart(probeEnabled);
   const apps = snapshot.data?.snapshot.apps ?? [];
   const nodeList = (nodes.data?.nodes ?? []).filter(node => node.tenant_id === tunnel?.tenant && !node.retired_at);
@@ -1282,8 +1285,18 @@ function TunnelDetail({ tunnelId }: { tunnelId: string }) {
       entry.op.outbound.tenant_id === tunnel.tenant &&
       entry.op.outbound.id === tunnel.id,
   );
+  const impact = status ? tunnelProbeImpact(missing ? null : view) : null;
+  const hasDraftProbe = probeControls.published && draftChanged && !probeControls.active;
   const referencedChains = new Set(references.map(reference => `${reference.app}\u0000${reference.chainId}`)).size;
   const referencedNodes = new Set(references.map(reference => reference.node)).size;
+  const referenceGroups = new Map<string, Omit<TunnelReference, 'node'> & { nodes: string[] }>();
+  for (const { node, ...reference } of references) {
+    const key = `${reference.app}\u0000${reference.chainId}`;
+    const group = referenceGroups.get(key);
+    if (group) {
+      if (!group.nodes.includes(node)) group.nodes.push(node);
+    } else referenceGroups.set(key, { ...reference, nodes: [node] });
+  }
 
   return (
     <div className="nd-sheet nd-page tnd-page">
@@ -1315,76 +1328,36 @@ function TunnelDetail({ tunnelId }: { tunnelId: string }) {
               </span>
             </div>
           </div>
-          <TitleActions className="nd-acts">
-            <button className="btn" type="button" disabled={!editable} onClick={() => setEditing(true)}>
-              编辑
+          <TitleActions primary={<TunnelProbeActions controls={probeControls} />}>
+            <button
+              className={`btn${hasDraftProbe ? ' title-action-compact' : ''}`}
+              type="button"
+              aria-label="编辑"
+              title="编辑"
+              disabled={!editable}
+              onClick={() => setEditing(true)}
+            >
+              {hasDraftProbe && <Icon of="pencil" size={14} />}
+              <span className="title-action-label">编辑</span>
             </button>
-            <button className="btn danger" type="button" disabled={!editable} onClick={() => setDeleting(true)}>
-              删除
+            <button
+              className={`btn danger${hasDraftProbe ? ' title-action-compact' : ''}`}
+              type="button"
+              aria-label="删除"
+              title="删除"
+              disabled={!editable}
+              onClick={() => setDeleting(true)}
+            >
+              {hasDraftProbe && <Icon of="trash" size={14} />}
+              <span className="title-action-label">删除</span>
             </button>
+            <TunnelProbeDraftAction controls={probeControls} />
           </TitleActions>
         </header>
 
         <div className="nd-paper-body tnd-body">
           <div className="tnd-main">
-            <TunnelProbePanel
-              tenantId={tunnel.tenant}
-              outboundId={tunnel.id}
-              draftSupported
-              editable={editable}
-              windowSecs={windowSecs}
-              onWindowChange={setWindowSecs}
-            />
-
-            {/* 规则引用：每项跳转到对应线路 */}
-            <section className="panel config-panel cg-sec tnd-refs">
-              <header>
-                <PanelTitle of="chains">规则引用</PanelTitle>
-                {references.length > 0 && (
-                  <span className="cg-meta">
-                    {status?.key === 'down' ? (
-                      <span>
-                        <b className="err">{referencedChains}</b> 条线路受影响 · <b>{referencedNodes}</b> 台机器
-                      </span>
-                    ) : (
-                      <span>
-                        <b>{referencedChains}</b> 条线路 · <b>{referencedNodes}</b> 台机器
-                      </span>
-                    )}
-                  </span>
-                )}
-              </header>
-              {references.length === 0 ? (
-                <p className="tnd-none">尚未被任何规则使用；不会下发到机器。</p>
-              ) : (
-                <div className="tnd-refrows">
-                  {references.map(reference => {
-                    const node = nodeById.get(reference.node);
-                    return (
-                      <button
-                        key={`${reference.app}/${reference.chainId}/${reference.node}`}
-                        className="tnd-ref"
-                        type="button"
-                        onClick={() => openChain(reference.app, reference.chainId)}
-                      >
-                        <span className="cgo-main">
-                          <b>{reference.chain}</b>
-                          <small>{reference.project}</small>
-                        </span>
-                        <span className="tnd-refnode">
-                          <RegionFlag code={node?.public_ipv4_country} />
-                          <span>{node?.name || reference.node}</span>
-                          <span className="mono">{reference.node}</span>
-                        </span>
-                        <span className="tnd-go" aria-hidden>
-                          ›
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-            </section>
+            <TunnelProbePanel controls={probeControls} windowSecs={windowSecs} onWindowChange={setWindowSecs} />
           </div>
 
           <aside className="tnd-aside">
@@ -1414,6 +1387,64 @@ function TunnelDetail({ tunnelId }: { tunnelId: string }) {
                   </Fragment>
                 ))}
               </dl>
+            </section>
+            {/* 规则引用按线路合并，置于连接参数之后。 */}
+            <section className="panel config-panel cg-sec tnd-refs">
+              <header>
+                <PanelTitle of="chains">规则引用</PanelTitle>
+              </header>
+              <div className="tnd-refs-body">
+                {references.length > 0 && (
+                  <p className="tnd-ref-source">
+                    <span>当前配置{draftEntries.length > 0 ? ' · 含未发布草稿' : ''}</span>
+                    <span>
+                      {referencedChains} 条线路 · {referencedNodes} 台机器
+                    </span>
+                  </p>
+                )}
+                {impact && references.length > 0 && (
+                  <p className={`tnd-impact ${status?.tone === 'warn' ? 'warn' : ''}`}>{impact}</p>
+                )}
+                {references.length === 0 ? (
+                  <p className="tnd-none">当前配置中尚无规则引用。</p>
+                ) : (
+                  <div className="tnd-refrows">
+                    {[...referenceGroups.values()].map(reference => (
+                      <button
+                        key={`${reference.app}/${reference.chainId}`}
+                        className="tnd-ref"
+                        type="button"
+                        onClick={() => openChain(reference.app, reference.chainId)}
+                      >
+                        <span className="tnd-ref-main">
+                          <span className="tnd-ref-heading">
+                            <b title={reference.chain}>{reference.chain}</b>
+                            <small title={reference.project}>{reference.project}</small>
+                          </span>
+                          <span className="tnd-refnodes">
+                            {reference.nodes.map(nodeId => {
+                              const node = nodeById.get(nodeId);
+                              return (
+                                <span
+                                  className="tnd-refnode"
+                                  key={nodeId}
+                                  title={`${node?.name || nodeId} · ${nodeId}`}
+                                >
+                                  <RegionFlag code={node?.public_ipv4_country} />
+                                  <span>{node?.name || nodeId}</span>
+                                </span>
+                              );
+                            })}
+                          </span>
+                        </span>
+                        <span className="tnd-go" aria-hidden>
+                          ›
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             </section>
           </aside>
         </div>

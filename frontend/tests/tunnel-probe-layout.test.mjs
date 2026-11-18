@@ -11,10 +11,7 @@ test('the tunnel detail probe panel collapses instead of overflowing narrow scre
     styles,
     /\.tnd-body\.nd-paper-body\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\) 320px;[\s\S]*?@container \(max-width: 1080px\)\s*\{\s*\.tnd-body\.nd-paper-body\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\);/,
   );
-  assert.match(
-    styles,
-    /\.tnd-run\s*\{[\s\S]*?grid-template-columns:\s*78px 16px 64px minmax\(0, 1fr\) auto;[\s\S]*?@container \(max-width: 700px\)[\s\S]*?\.tnd-run\s*\{\s*grid-template-columns:\s*40px 16px minmax\(0, 1fr\) auto;/,
-  );
+
   assert.match(
     styles,
     /@container \(max-width: 700px\)[\s\S]*?\.tnd-metrics,\s*\.tnd-metrics\.is-3\s*\{\s*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);[\s\S]*?\.tnd-route\s*\{\s*flex-basis:\s*100%;/,

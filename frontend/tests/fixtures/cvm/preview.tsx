@@ -4,9 +4,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { App } from '../../../src/app';
 import { theme } from '../../../src/forge/theme';
 import { installBackend } from '../console-backend';
-import { cvmReadings, cvmWorkspace } from './data';
+import { baremetalWorkspace, cvmReadings, cvmWorkspace } from './data';
 import { allocatedNic, nicCatalog, nicState } from './network-data';
+import { networkLogs } from './log-data';
 import { entryBoard } from './entry-data';
+import { artifactHistory, artifactReceipt } from './artifact-data';
+import { chainCatalog } from './chain-data';
 import type { CvmChange, CvmCreate, CvmNetworkQuotaLimits } from '../../../src/api';
 import '../../../src/styles.css';
 
@@ -17,7 +20,15 @@ if (theme.snapshot() !== (params.get('theme') === 'light' ? 'light' : 'dark')) t
 document.documentElement.dataset.palette = 'dailan';
 installBackend();
 const fallback = globalThis.fetch;
-const workspace = cvmWorkspace(scene, role);
+const workspace = scene.startsWith('baremetal-') ? baremetalWorkspace(scene, role) : cvmWorkspace(scene, role);
+if (scene === 'oversold') {
+  const caps = workspace.hosts[0].capabilities;
+  caps.allocatable_vcpus = 1;
+  caps.allocatable_memory_bytes = 128 * 1024 ** 2;
+  caps.allocatable_disk_bytes = 1024 ** 3;
+  workspace.instances[0].desired.spec.resources.vcpus = 3;
+  workspace.usage![0].vcpus = 3;
+}
 if (scene.startsWith('quota-network')) {
   workspace.hosts[0].capabilities.network_quota = {
     physical_memory_bytes: 958 * 1024 ** 2,
@@ -124,7 +135,7 @@ if (scene === 'fleet') {
     return item;
   });
 }
-if (scene === 'board') {
+if (scene === 'board' || scene === 'chain-board') {
   const host = workspace.hosts[0];
   workspace.hosts.push({ ...structuredClone(host), node_id: 'tokyo', name: '东京 · 开发宿主' });
   const base = workspace.instances[0];
@@ -142,10 +153,15 @@ if (scene === 'board') {
     item.status = status;
     item.desired.power = power;
     item.report!.power = power;
+    if (scene === 'chain-board' && index === 1) item.user_id = 'bob';
     if (index === 1) {
       // Port-selected egress: SSH via the HK NIC, everything else stays local.
       item.desired.spec.routing.routes = [
-        { destination: '0.0.0.0/0', interface_id: 'nic-business', service: { protocol: 'tcp', port_start: 22, port_end: 22 } },
+        {
+          destination: '0.0.0.0/0',
+          interface_id: 'nic-business',
+          service: { protocol: 'tcp', port_start: 22, port_end: 22 },
+        },
       ];
     }
     if (index > 1) {
@@ -155,6 +171,25 @@ if (scene === 'board') {
     return item;
   });
 }
+if (scene.startsWith('artifacts')) {
+  workspace.instances[0].desired.generation = 2;
+  artifactReceipt(workspace.instances[0], scene === 'artifacts-mismatch');
+  if (scene === 'artifacts-pending') {
+    const instance = workspace.instances[0];
+    instance.report!.artifacts!.files[0].effective_sha256 = 'e'.repeat(64);
+    instance.desired.generation += 1;
+    instance.desired.operation_id = 'pending-restart';
+    instance.desired.restart_epoch += 1;
+    instance.status = 'pending';
+  }
+}
+if (scene.startsWith('chain-')) {
+  workspace.pending_revision_id = 25;
+  for (const host of workspace.hosts) host.capabilities.chain_egress = true;
+  const instance = workspace.instances[0];
+  instance.desired.spec.routing.priorities.push({ chain_id: 'chain-us', ipv4: 200, ipv6: 200 });
+  instance.desired.spec.routing.routes.push({ destination: '203.0.113.0/24', chain_id: 'chain-us' });
+}
 const mutations: unknown[] = [];
 const entries = entryBoard(workspace, scene);
 const catalog = nicCatalog(role === 'system-admin', workspace.instances[0]);
@@ -163,6 +198,23 @@ Object.defineProperty(window, '__cvmMutations', { value: mutations });
 globalThis.fetch = async (input, init) => {
   const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
   const method = init?.method ?? 'GET';
+  if (url.pathname === '/cvm/chain-egress' && method === 'GET') {
+    const value = chainCatalog(workspace, url.searchParams.get('instance_id'));
+    return Response.json(
+      scene.startsWith('chain-')
+        ? value
+        : {
+            ...value,
+            supported: false,
+            reason: '宿主尚未提供线路出口能力',
+            chains: [],
+            hidden_unauthorized: 0,
+            traffic: [],
+          },
+    );
+  }
+  if (url.pathname.endsWith('/artifacts/preview') && method === 'POST')
+    return Response.json({ instance: workspace.instances[0], artifacts: artifactHistory(), no_op: false });
   if (url.pathname === '/cvm/quota/network/preview' && method === 'POST') {
     const body = JSON.parse(String(init?.body)) as { limits: CvmNetworkQuotaLimits };
     const own = workspace.network_quotas?.[0];
@@ -180,7 +232,15 @@ globalThis.fetch = async (input, init) => {
       fits: body.limits.max_states <= 106976,
     });
   }
+  if (url.pathname.endsWith('/artifacts'))
+    return Response.json(
+      scene === 'artifacts-legacy'
+        ? { generation: 1, current: null, previous: null }
+        : { ...artifactHistory(), generation: workspace.instances[0].desired.generation },
+    );
   if (url.pathname === '/cvm' && method === 'GET') return Response.json(workspace);
+  if (url.pathname === '/cvm/network-logs' && method === 'GET')
+    return Response.json(networkLogs(url.searchParams.get('nodes')?.split(',')[0]));
   if (url.pathname === '/cvm/entries' && method === 'GET') return Response.json(entries);
   if (url.pathname.startsWith('/cvm/') && url.pathname.endsWith('/entries') && method === 'GET') {
     const id = decodeURIComponent(url.pathname.split('/')[2]);
@@ -282,7 +342,10 @@ globalThis.fetch = async (input, init) => {
       return Response.json({ error: '请先删除该宿主上的实例，并等待系统盘和网络资源清理完成' }, { status: 409 });
     host.host_revision += 1;
     workspace.hosts = [...workspace.hosts.filter(item => item.node_id !== node), ...(request.enabled ? [host] : [])];
-    workspace.available_hosts = [...(workspace.available_hosts ?? []).filter(item => item.node_id !== node), ...(!request.enabled ? [host] : [])];
+    workspace.available_hosts = [
+      ...(workspace.available_hosts ?? []).filter(item => item.node_id !== node),
+      ...(!request.enabled ? [host] : []),
+    ];
     return Response.json(workspace);
   }
   if (url.pathname.endsWith('/terminal') && method === 'POST') {
@@ -350,6 +413,12 @@ location.hash =
     ? '#/cvm/new'
     : [
           'detail',
+          'chain-detail',
+          'artifacts',
+          'artifacts-mismatch',
+          'artifacts-legacy',
+          'artifacts-pending',
+          'baremetal-detail',
           'pending',
           'unknown',
           'stale',

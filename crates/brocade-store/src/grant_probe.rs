@@ -34,6 +34,9 @@ pub struct UserGrantProbePlan {
 
 #[derive(Debug, Clone)]
 pub struct UserGrantProbeTarget {
+    /// Probes may deliberately test one advertised leg; a transparent chain client must never
+    /// silently discard a mandatory Front or a separately advertised download leg.
+    pub chain_egress_reason: Option<String>,
     /// Stable inside a Serving generation and free of credentials. It is returned to the browser
     /// and may come back only as a selection key; the target itself always stays server-side.
     pub id: String,
@@ -109,8 +112,30 @@ pub async fn user_grant_probe_plan(
         return Err(StoreError::NotFound(format!("user {tenant_id}/{user_id}")));
     }
 
-    let output = crate::compile_cache::compile_incremental(&serving.snapshot);
-    let user = crate::compile_cache::project_user(&output, &tenant_id, &user_id)?
+    let mut connection = pool.acquire().await?;
+    let items =
+        user_grant_targets(&mut connection, &serving.snapshot, &tenant_id, &user_id).await?;
+
+    Ok(UserGrantProbePlan {
+        serving_generation: serving.generation(),
+        serving_revision: serving.snapshot.revision,
+        endpoint_url: serving.snapshot.settings.probe.endpoint_url.clone(),
+        timeout_secs: u64::from(serving.snapshot.settings.probe.timeout_secs)
+            .max(MIN_MANUAL_PROBE_TIMEOUT_SECS),
+        items,
+    })
+}
+
+/// Project exactly the subscriber credentials and transport from a caller-pinned snapshot.
+/// The connection is borrowed so configuration writers never acquire a second pool connection.
+pub(crate) async fn user_grant_targets(
+    connection: &mut sqlx::PgConnection,
+    snapshot: &brocade_core::model::ModelSnapshot,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<Vec<UserGrantProbeTarget>> {
+    let output = crate::compile_cache::compile_incremental(snapshot);
+    let user = crate::compile_cache::project_user(&output, tenant_id, user_id)?
         .as_ref()
         .clone();
     if user.entries.is_empty() {
@@ -122,8 +147,7 @@ pub async fn user_grant_probe_plan(
     let mut items = Vec::with_capacity(user.entries.len());
     let mut self_signed_pins = BTreeMap::<String, Option<String>>::new();
     for entry in user.entries {
-        let (app, ingress) = serving
-            .snapshot
+        let (app, ingress) = snapshot
             .apps
             .iter()
             .find_map(|app| {
@@ -141,7 +165,7 @@ pub async fn user_grant_probe_plan(
         let pinned_peer_cert_sha256 = match self_signed_pins.get(&ingress.node) {
             Some(value) => value.clone(),
             None => {
-                let value = self_signed_certificate_pin(pool, &ingress.node).await?;
+                let value = self_signed_certificate_pin(&mut *connection, &ingress.node).await?;
                 self_signed_pins.insert(ingress.node.clone(), value.clone());
                 value
             }
@@ -246,6 +270,13 @@ pub async fn user_grant_probe_plan(
         };
         let item_id = format!("{}:{family}:{protocol}", entry.grant_id);
         items.push(UserGrantProbeTarget {
+            chain_egress_reason: if entry.front_id.is_some() {
+                Some("此入口使用前置代理，当前主网卡线路客户端尚不支持该组合".into())
+            } else if entry.download.is_some() {
+                Some("此入口使用独立下载链路，当前主网卡线路客户端尚不支持该组合".into())
+            } else {
+                None
+            },
             id: item_id,
             name: entry.name,
             app_id: app.id.clone(),
@@ -302,14 +333,7 @@ pub async fn user_grant_probe_plan(
         });
     }
 
-    Ok(UserGrantProbePlan {
-        serving_generation: serving.generation(),
-        serving_revision: serving.snapshot.revision,
-        endpoint_url: serving.snapshot.settings.probe.endpoint_url.clone(),
-        timeout_secs: u64::from(serving.snapshot.settings.probe.timeout_secs)
-            .max(MIN_MANUAL_PROBE_TIMEOUT_SECS),
-        items,
-    })
+    Ok(items)
 }
 
 /// Freeze a real, subscriber-visible probe plan for one member × target Front cell.
@@ -509,8 +533,12 @@ fn external_protocol_name(protocol: &ExternalOutboundProtocol) -> &'static str {
     }
 }
 
-async fn self_signed_certificate_pin(pool: &PgPool, node_id: &str) -> Result<Option<String>> {
-    let Some(profile) = crate::cert::serving_certificate_profile_for_node(pool, node_id).await?
+async fn self_signed_certificate_pin<'e, E>(executor: E, node_id: &str) -> Result<Option<String>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let Some(profile) =
+        crate::cert::serving_certificate_profile_for_node(executor, node_id).await?
     else {
         return Ok(None);
     };

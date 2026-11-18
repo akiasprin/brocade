@@ -1,5 +1,6 @@
 import { api } from './client';
 import type { CvmAllocatedNic, CvmContainerRoutes } from './cvm-nics';
+import type { UserTrafficPolicyView } from '../api';
 
 // CVM: system image, resources and network attachments are independent contracts.
 export interface CvmImage {
@@ -18,7 +19,28 @@ export interface CvmNetworkSource {
   kind: 'public' | 'internal';
   description: string;
 }
+export interface CvmHostIdentity {
+  machine: string;
+  root_filesystem: string;
+}
+export interface CvmHostInventory {
+  identity: CvmHostIdentity;
+  os: string;
+  terminal_user: string;
+  primary_device: string;
+}
+export interface CvmAdopt {
+  request_id: string;
+  tenant_id: string;
+  user_id: string;
+  node_id: string;
+  name: string;
+  identity: CvmHostIdentity;
+}
+export const adoptCvmHost = (request: CvmAdopt) =>
+  api<CvmInstance>('/cvm/adopt', '', { method: 'POST', body: JSON.stringify(request) });
 export interface CvmCapabilities {
+  baremetal?: CvmHostInventory;
   network_quota?: CvmNetworkQuotaCapacity | null;
   managed_networks: boolean;
   guest_terminal: boolean;
@@ -36,6 +58,7 @@ export interface CvmCapabilities {
   reinstall: boolean;
   configure: boolean;
   configure_network: boolean;
+  chain_egress?: boolean;
   hot_attach: boolean;
   hot_detach: boolean;
   max_interfaces: number;
@@ -45,6 +68,30 @@ export interface CvmCapabilities {
   images: CvmImage[];
   network_sources: CvmNetworkSource[];
 }
+export interface CvmChainOption {
+  id: string;
+  app_id: string;
+  app_name: string;
+  name: string;
+  country: string | null;
+  machines: string[];
+  authorized: boolean;
+  unavailable_reason?: string | null;
+  used_by: string[];
+  ipv6: boolean;
+  reachable: boolean | null;
+  rtt_ms: number | null;
+}
+export interface CvmChainCatalog {
+  owner: { tenant_id: string; user_id: string; name: string } | null;
+  supported: boolean;
+  reason: string | null;
+  chains: CvmChainOption[];
+  hidden_unauthorized: number;
+  traffic: UserTrafficPolicyView[];
+}
+export const fetchCvmChainCatalog = (instance?: string) =>
+  api<CvmChainCatalog>(`/cvm/chain-egress${instance ? `?instance_id=${encodeURIComponent(instance)}` : ''}`);
 export interface CvmResources {
   vcpus: number;
   memory_bytes: number;
@@ -86,6 +133,8 @@ export interface CvmInterface extends CvmInterfaceRequest {
 export type CvmStatus = 'pending' | 'applied' | 'failed' | 'unknown' | 'restart_required';
 export type CvmPower = 'running' | 'stopped' | 'deleted';
 export interface CvmInstance {
+  revision_id?: number | null;
+  published_revision_id?: number | null;
   tenant_id: string;
   user_id: string;
   node_id: string;
@@ -103,7 +152,8 @@ export interface CvmInstance {
     spec: {
       routing: CvmContainerRoutes;
       name: string;
-      image: CvmImage;
+      image?: CvmImage;
+      execution?: { kind: 'cube' } | { kind: 'baremetal'; identity: CvmHostIdentity };
       resources: CvmResources;
       ssh_public_key: string;
       interfaces: CvmInterface[];
@@ -111,6 +161,9 @@ export interface CvmInstance {
   };
   status: CvmStatus;
   report: null | {
+    generation: number;
+    operation_id: string;
+    artifacts?: CvmArtifactReceipt;
     status: CvmStatus;
     power: CvmPower | null;
     runtime_id: string | null;
@@ -138,6 +191,8 @@ export interface CvmQuota {
   max_interfaces: number;
 }
 export interface CvmWorkspace {
+  can_publish?: boolean;
+  pending_revision_id?: number | null;
   available_hosts?: CvmHost[];
   network_quotas?: CvmHostNetworkQuota[];
   usage?: {
@@ -170,7 +225,7 @@ export interface CvmCreate {
   interfaces: CvmInterfaceRequest[];
 }
 export type CvmChange =
-  | { action: 'start' | 'stop' | 'restart' | 'retry' }
+  | { action: 'start' | 'stop' | 'restart' | 'retry' | 'release_host' }
   | { action: 'reinstall'; image_id: string; ssh_public_key: string }
   | { action: 'configure'; name: string; vcpus: number; memory_bytes: number }
   | { action: 'delete'; delete_data: boolean }
@@ -290,10 +345,17 @@ export const fetchCvmMonitoring = (id: string, seconds = 3600) =>
   api<CvmMonitoring>(`/cvm/${encodeURIComponent(id)}/monitoring${seconds === 3600 ? '' : `?window_secs=${seconds}`}`);
 export const createCvm = (body: CvmCreate) =>
   api<CvmInstance>('/cvm', '', { method: 'POST', body: JSON.stringify(body) });
-export const commandCvm = (id: string, expectedGeneration: number, change: CvmChange, requestId: string) =>
+export const commandCvm = (
+  id: string,
+  expectedGeneration: number,
+  change: CvmChange,
+  requestId: string,
+  inputSha256?: string,
+) =>
   api<CvmInstance>(`/cvm/${encodeURIComponent(id)}/operations`, '', {
     method: 'POST',
     body: JSON.stringify({ request_id: requestId, expected_generation: expectedGeneration, ...change }),
+    ...(inputSha256 ? { headers: { 'x-brocade-cvm-input-sha256': inputSha256 } } : {}),
   });
 export const setCvmQuota = (body: CvmQuota) =>
   api<void>('/cvm/quota', '', { method: 'PUT', body: JSON.stringify(body) });
@@ -394,4 +456,54 @@ export const setCvmHostPolicy = (node: string, enabled: boolean, expectedRevisio
   api<CvmWorkspace>(`/cvm/hosts/${encodeURIComponent(node)}`, '', {
     method: 'PUT',
     body: JSON.stringify({ enabled, expected_revision: expectedRevision }),
+  });
+
+export type CvmArtifactKind = 'cube/sandbox.json' | 'cube/egress.json' | 'cube/attachments.json' | 'guest/init.json';
+export interface CvmArtifact {
+  kind: CvmArtifactKind;
+  sha256: string;
+  content: string;
+}
+export interface CvmArtifactBundle {
+  input?: {
+    instance_id: string;
+    spec: CvmInstance['desired']['spec'];
+    image_manifest: { sha256: string; content: string };
+    capabilities: CvmCapabilities;
+  };
+  compiler: string;
+  input_sha256: string;
+  spec_sha256: string;
+  files: CvmArtifact[];
+}
+export interface CvmArtifactReceipt {
+  compiler: string;
+  input_sha256: string;
+  mode: 'shadow' | 'enforce';
+  mismatches: CvmArtifactKind[];
+  files: { kind: CvmArtifactKind; compiled_sha256: string; effective_sha256: string | null; bindings: unknown }[];
+}
+export interface CvmArtifactHistory {
+  generation: number;
+  current: CvmArtifactBundle | null;
+  previous: CvmArtifactBundle | null;
+}
+export const getCvmArtifacts = (id: string, generation?: number) =>
+  api<CvmArtifactHistory>(`/cvm/${encodeURIComponent(id)}/artifacts${generation ? `?generation=${generation}` : ''}`);
+
+export const CVM_ARTIFACT_PROTOCOL_VERSION = 75;
+
+export type CvmCompilePreviewRequest =
+  | { kind: 'command'; request: { request_id: string; expected_generation: number } & CvmChange }
+  | { kind: 'mount'; request: Parameters<typeof import('./cvm-nics').mountCvmNic>[1] }
+  | { kind: 'routes'; request: Parameters<typeof import('./cvm-nics').setCvmRoutes>[1] };
+export interface CvmCompilePreview {
+  instance: CvmInstance;
+  artifacts: CvmArtifactHistory | null;
+  no_op: boolean;
+}
+export const previewCvmCompile = (id: string, request: CvmCompilePreviewRequest) =>
+  api<CvmCompilePreview>(`/cvm/${encodeURIComponent(id)}/artifacts/preview`, '', {
+    method: 'POST',
+    body: JSON.stringify(request),
   });

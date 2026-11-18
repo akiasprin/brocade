@@ -204,7 +204,7 @@ pub use node_inflow_usage::{NodeInflowRow, NodeInflowSource, NodeInflowUsage, No
 pub use node_traffic_history::NodeTrafficHistory;
 pub use notifications::{
     ActiveMachineIncidentView, ClaimedNotificationDelivery, MachineEventList, MachineEventView,
-    MACHINE_EVENT_RETENTION_DAYS,
+    NodeNotificationSettings, UpdateNodeNotificationSettings, MACHINE_EVENT_RETENTION_DAYS,
 };
 pub use onboarding::{
     OnboardingCheckpointRequest, OnboardingProbeEvidence, OnboardingState, OnboardingStatus,
@@ -293,6 +293,7 @@ pub enum StoreError {
     Conflict(String),
     Unavailable(String),
     InvalidData(String),
+    RuleValidation(Vec<brocade_core::rule_validation::RuleIssue>),
     Unsupported(String),
     PublishBlocked(brocade_core::compile::PublishBlocked),
 }
@@ -309,6 +310,14 @@ impl std::fmt::Display for StoreError {
             StoreError::Forbidden(message) => write!(f, "forbidden: {message}"),
             StoreError::Conflict(message) => write!(f, "conflict: {message}"),
             StoreError::Unavailable(message) => write!(f, "unavailable: {message}"),
+            StoreError::RuleValidation(issues) => write!(
+                f,
+                "rule validation: {}",
+                issues
+                    .first()
+                    .map(|i| i.message.as_str())
+                    .unwrap_or("invalid rule")
+            ),
             StoreError::InvalidData(message) => write!(f, "invalid store data: {message}"),
             StoreError::Unsupported(message) => write!(f, "unsupported store operation: {message}"),
             StoreError::PublishBlocked(blocked) => write!(

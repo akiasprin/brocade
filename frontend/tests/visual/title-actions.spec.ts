@@ -44,14 +44,25 @@ for (const engine of ['chromium', 'webkit'] as const)
               expect(title.width, 'the page identity keeps readable space').toBeGreaterThanOrEqual(24);
             }
             const actions = header.locator('.title-actions');
+            if (scene.name === 'tunnel') {
+              await expect(header.locator('button')).toHaveCount(3);
+              await expect(page.locator('.tnd-page-actions')).toHaveCount(0);
+              await expect(page.locator('.tnd-connection-actions')).toHaveCount(0);
+              await expect(actions.getByRole('button', { name: '编辑', exact: true })).toBeVisible();
+              await expect(actions.getByRole('button', { name: '删除', exact: true })).toBeVisible();
+              await expect(
+                actions.locator('.title-action-primary').getByRole('button', { name: '拨测草稿', exact: true }),
+              ).toBeVisible();
+            }
             await expect(actions).toHaveCount(1);
+            await expect(actions.locator('.title-action-group')).toBeVisible();
+            await expect(actions.locator('.title-action-group .btn.primary')).toHaveCount(0);
+            await expect(actions.locator('.title-action-group')).toHaveCSS('outline-style', 'solid');
             if (scene.name === 'containers') {
-              await expect(actions.locator('.title-action-group')).toHaveCount(0);
-              await expect(actions.locator('.title-action-primary')).toBeVisible();
-            } else {
-              await expect(actions.locator('.title-action-group')).toBeVisible();
-              await expect(actions.locator('.title-action-group .btn.primary')).toHaveCount(0);
-              await expect(actions.locator('.title-action-group')).toHaveCSS('outline-style', 'solid');
+              await expect(actions.getByRole('button', { name: '纳管裸机', exact: true })).toBeVisible();
+              await expect(
+                actions.locator('.title-action-primary').getByRole('button', { name: '＋ 创建容器', exact: true }),
+              ).toBeVisible();
             }
             const height = width <= 820 ? 36 : 30;
             for (const button of await actions
@@ -81,7 +92,7 @@ for (const engine of ['chromium', 'webkit'] as const)
             if (scene.name === 'containers') {
               await expect(header.getByRole('button', { name: '容器 更多操作', exact: true })).toHaveCount(0);
               await header.getByRole('tab', { name: '额度', exact: true }).click();
-              await expect(page.getByRole('list', { name: '用户额度' })).toBeVisible();
+              await expect(page.getByRole('region', { name: '用户额度清单' })).toBeVisible();
             }
             if (scene.name === 'user') {
               await header.getByRole('button', { name: '更多操作', exact: true }).click();

@@ -35,6 +35,7 @@ use super::{
 
 pub fn validate_model_snapshot(snapshot: &ModelSnapshot, diagnostics: &mut Vec<Diagnostic>) {
     validate_settings(snapshot, diagnostics);
+    diagnostics.extend(crate::rule_validation::diagnostics(snapshot));
     for policy in &snapshot.settings.reverse_health_overrides {
         let matches=snapshot.apps.iter().flat_map(|app| &app.steps).filter(|step|step.chain==policy.chain && step.node==policy.from).any(|step|step.rules.iter().any(|rule|matches!(&rule.action, Action::Forward {to,dial:HopDial::Reverse(_),..} if to==&policy.to)));
         if !matches {

@@ -47,7 +47,8 @@ pub(super) async fn matches(
     let sets = selectors(&query)?;
     let settings = state.store.settings().await?;
     let matches = state
-        .geosite
+        .geodata
+        .site
         .matches(&settings.geodata.geosite_url, &query.domain, &sets)
         .await
         .map_err(StoreError::Unavailable)?;

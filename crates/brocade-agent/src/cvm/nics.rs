@@ -22,7 +22,7 @@ mod host;
 mod meter;
 mod probe;
 mod wireguard;
-mod xray;
+pub(super) mod xray;
 pub(crate) use host::enable_forwarding;
 pub(crate) use probe::service as probe_service;
 mod public_addresses;
@@ -37,7 +37,7 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn private_dir(path: &Path) -> Result<()> {
+pub(super) fn private_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).map_err(|_| "cannot create private NIC state directory")?;
     let metadata =
         std::fs::symlink_metadata(path).map_err(|_| "cannot inspect NIC state directory")?;
@@ -146,12 +146,14 @@ fn validate(desired: &NicDesired) -> Result<()> {
 }
 
 pub(crate) fn tracking_addresses() -> Result<BTreeSet<IpAddr>> {
+    let mut addresses = super::host::tracking_addresses()?;
+    addresses.extend(super::entries::tracking_addresses()?);
     let Some(root) = ROOT.get() else {
-        return Ok(BTreeSet::new());
+        return Ok(addresses);
     };
     let desired = snapshot(root)?;
-    let mut addresses = BTreeSet::new();
     for binding in &desired.bindings {
+        addresses.extend([binding.nic.ipv4, binding.nic.ipv6].into_iter().flatten());
         addresses.extend(
             [binding.nic.public_ipv4, binding.nic.public_ipv6]
                 .into_iter()
@@ -166,11 +168,11 @@ pub(crate) fn tracking_addresses() -> Result<BTreeSet<IpAddr>> {
     Ok(addresses)
 }
 pub(crate) fn tracking_ports() -> Result<BTreeSet<(IpAddr, u16)>> {
+    let mut ports = super::entries::tracking_ports()?;
     let Some(root) = ROOT.get() else {
-        return Ok(BTreeSet::new());
+        return Ok(ports);
     };
     let desired = snapshot(root)?;
-    let mut ports = BTreeSet::new();
     for b in desired.bindings {
         if b.offer.kind == TransportKind::Xray {
             ports.insert((b.offer.endpoint, b.port));
@@ -179,16 +181,36 @@ pub(crate) fn tracking_ports() -> Result<BTreeSet<(IpAddr, u16)>> {
     Ok(ports)
 }
 
+pub(crate) fn transport_listeners() -> Result<BTreeSet<(L4Protocol, u16)>> {
+    let Some(root) = ROOT.get() else {
+        return Ok(BTreeSet::new());
+    };
+    Ok(snapshot(root)?
+        .bindings
+        .into_iter()
+        .filter(|b| b.offer.listen_side.resolved().ok() == Some(b.side))
+        .map(|b| {
+            (
+                if b.offer.kind == TransportKind::Wireguard {
+                    L4Protocol::Udp
+                } else {
+                    L4Protocol::Tcp
+                },
+                b.port,
+            )
+        })
+        .collect())
+}
+
 fn local_management_networks(desired: &mut NicDesired) -> Result<()> {
     let raw = run_command("ip", &["-j", "address", "show"])
         .map_err(|_| "cannot verify local NIC management isolation")?;
     let links: Vec<serde_json::Value> =
         serde_json::from_str(&raw).map_err(|_| "invalid local management address inventory")?;
     for link in links {
-        if link["ifalias"]
-            .as_str()
-            .is_some_and(|alias| alias.starts_with("brocade-nic:"))
-        {
+        if link["ifalias"].as_str().is_some_and(|alias| {
+            alias.starts_with("brocade-nic:") || alias.starts_with("brocade-host:")
+        }) {
             continue;
         }
         for item in link["addr_info"].as_array().into_iter().flatten() {
@@ -257,7 +279,7 @@ fn inventory(options: &Options) -> NicNodeCapabilities {
             let config = std::env::var_os("BROCADE_CVM_CONFIG")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/etc/brocade/cvm-cube.json"));
-            brocade_cube::Backend::inspect(&config)
+            super::backend::inspect(&config)
         })
         .is_ok_and(|caps| caps.managed_networks);
     if capture_command_with_timeout("wg", &["--version"], Duration::from_secs(5))
@@ -284,10 +306,20 @@ fn inventory(options: &Options) -> NicNodeCapabilities {
         caps.transports.push(TransportKind::Xray);
         caps.xray_certificate_pem = Some(certificate);
     }
-    // Entry machine-pair tunnels are WireGuard devices; port-selected egress is enforced
+    // Entry carriers are independently gated; port-selected egress is enforced
     // by the host forward rules of each NIC (see host::route_rules).
-    caps.entries = caps.transports.contains(&TransportKind::Wireguard);
+    caps.entries = !caps.transports.is_empty();
+    caps.entry_xray = caps.transports.contains(&TransportKind::Xray);
+    caps.entry_phantun = Path::new("/dev/net/tun").exists()
+        && caps.transports.contains(&TransportKind::Wireguard)
+        && ["phantun-server", "phantun-client"]
+            .into_iter()
+            .all(|program| {
+                capture_command_with_timeout(program, &["--version"], Duration::from_secs(5))
+                    .is_ok_and(|o| o.status.success())
+            });
     caps.route_service = true;
+    caps.entry_host_l3 = true;
     if let Ok(raw) = run_command("ip", &["-j", "address", "show"]) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
             caps.addresses = value
@@ -295,9 +327,11 @@ fn inventory(options: &Options) -> NicNodeCapabilities {
                 .into_iter()
                 .flatten()
                 .filter(|entry| {
-                    !entry["ifalias"]
-                        .as_str()
-                        .is_some_and(|alias| alias.starts_with("brocade-nic:"))
+                    !entry["ifalias"].as_str().is_some_and(|alias| {
+                        alias.starts_with("brocade-nic:")
+                            || alias.starts_with("brocade-host:")
+                            || alias.starts_with("brocade-entry")
+                    })
                 })
                 .flat_map(|entry| entry["addr_info"].as_array().into_iter().flatten())
                 .filter_map(|entry| entry["local"].as_str()?.parse::<IpAddr>().ok())
@@ -471,7 +505,23 @@ fn round(options: &Options) -> Result<()> {
             &desired_path(&options.state_dir),
             &serde_json::to_vec(&desired).map_err(|_| "cannot encode empty NIC intent")?,
         )?;
-        return inventory_result;
+        // Empty configurations still carry a release barrier. A new generation must be
+        // acknowledged even after the last NIC and resource fence were already removed.
+        let reported = if desired.generation > 0 {
+            upload(
+                &client,
+                options,
+                "/agent/v1/cvm/nics/report",
+                &NicNodeReport {
+                    generation: desired.generation,
+                    bindings: Vec::new(),
+                    diagnostics: super::diagnostics::snapshot(&options.state_dir),
+                },
+            )
+        } else {
+            Ok(())
+        };
+        return inventory_result.and(reported);
     }
     local_management_networks(&mut desired)?;
 
@@ -547,6 +597,7 @@ fn round(options: &Options) -> Result<()> {
             }
         },
         |bindings| {
+            super::diagnostics::bindings(&options.state_dir, &effective.bindings, &bindings);
             upload(
                 &client,
                 options,
@@ -554,6 +605,7 @@ fn round(options: &Options) -> Result<()> {
                 &NicNodeReport {
                     generation: desired.generation,
                     bindings,
+                    diagnostics: super::diagnostics::snapshot(&options.state_dir),
                 },
             )
         },
@@ -589,7 +641,7 @@ fn reconcile_reports(
         }
         Ok(())
     });
-    let flushed = if reports.is_empty() {
+    let flushed = if reports.is_empty() && !bindings.is_empty() {
         Ok(())
     } else {
         publish(reports)
@@ -675,9 +727,9 @@ fn apply(root: &Path, binding: &NicBinding, desired: &NicDesired) -> Result<Link
                 && other.id != binding.id
                 && other.phase != BindingPhase::Withdrawing
         });
-        host::withdraw(root, binding, retain)?;
+        let configured = host::withdraw(root, binding, retain)?;
         return Ok(LinkObservation {
-            configured: true,
+            configured,
             ..Default::default()
         });
     }
@@ -692,4 +744,15 @@ fn apply(root: &Path, binding: &NicBinding, desired: &NicDesired) -> Result<Link
     configured?;
     connectivity(binding, &observed)?;
     Ok(observed)
+}
+
+pub(super) fn native_snapshot() -> Result<NicDesired> {
+    snapshot(
+        ROOT.get()
+            .ok_or("native network controller has not initialized")?,
+    )
+}
+
+pub(super) fn native_clear_flows(addresses: impl IntoIterator<Item = IpAddr>) -> Result<()> {
+    flows::addresses(addresses)
 }

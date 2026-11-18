@@ -7,7 +7,7 @@ use crate::{
 use brocade_deployment::cvm::*;
 use serde_json::json;
 
-const INIT_SCRIPT: &str = r#"set -eu; id cube >/dev/null; install -d -m 0700 -o cube -g cube /home/cube/.ssh; printf '%s\n' "$1" > /home/cube/.ssh/authorized_keys; chown cube:cube /home/cube/.ssh/authorized_keys; chmod 0600 /home/cube/.ssh/authorized_keys; install -d -m 0700 /root/.ssh; if [ ! -e /root/.ssh/brocade-initialized ]; then rm -f /etc/ssh/ssh_host_*; ssh-keygen -A; touch /root/.ssh/brocade-initialized; if [ -s /run/sshd.pid ]; then kill -HUP "$(cat /run/sshd.pid)"; fi; fi"#;
+use brocade_cvm_compile::INIT_SCRIPT;
 
 impl Inner {
     pub(crate) fn reconcile(
@@ -145,6 +145,7 @@ impl Inner {
                 request["annotations"]["cube.master.components.cube-shim.version"] =
                     json!(record.native_shim_version);
             }
+            crate::artifacts::record_sandbox(record, desired, &request)?;
             record.attempted = true;
             record.save(&self.root)?;
             let response = self.cube("Create", request)?;
@@ -160,16 +161,16 @@ impl Inner {
             return Err("运行时身份无效".into());
         }
         if !record.initialized {
+            let guest =
+                self.artifact_value(desired, CvmArtifactKind::GuestInit, &Default::default())?;
+            let ssh_key = match guest.as_ref() {
+                Some(value) => brocade_cvm_compile::guest_key(value)?,
+                None => &desired.spec.ssh_public_key,
+            };
             self.guest_exec(
                 &record.runtime,
                 false,
-                &[
-                    "/bin/sh",
-                    "-c",
-                    INIT_SCRIPT,
-                    "brocade-init",
-                    &desired.spec.ssh_public_key,
-                ],
+                &["/bin/sh", "-c", INIT_SCRIPT, "brocade-init", ssh_key],
                 std::time::Duration::from_secs(20),
             )?;
             record.initialized = true;

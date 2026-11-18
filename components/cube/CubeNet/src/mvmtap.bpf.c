@@ -18,6 +18,7 @@
 #include "tcp_reset.h"
 #include "udp.h"
 #include "dns_query.h"
+#include "primary_chain.h"
 
 /*
  * Handle ARP request and send ARP reply
@@ -972,6 +973,13 @@ int from_cube(struct __sk_buff *skb)
 	int ret;
 
 	skb->queue_mapping = 0;
+	if (skb->protocol == bpf_htons(ETH_P_IPV6)) {
+		ifindex = skb->ingress_ifindex;
+		mvm_meta = bpf_map_lookup_elem(&ifindex_to_mvmmeta, &ifindex);
+		if (!mvm_meta) return TC_ACT_SHOT;
+		ret = primary_chain_packet(skb,ifindex,mvm_meta,true);
+		return ret < 0 ? TC_ACT_SHOT : ret;
+	}
 
 	/* We handle ETH_P_IP/ETH_P_ARP protocols ONLY */
 	if (skb->protocol != bpf_htons(ETH_P_IP)) {
@@ -1009,6 +1017,10 @@ int from_cube(struct __sk_buff *skb)
 	ret = pull_headers(skb, &l2, &l3);
 	if (ret != TC_ACT_OK)
 		return TC_ACT_SHOT;
+	ret = primary_chain_packet(skb,ifindex,mvm_meta,false);
+	if (ret >= 0) return ret;
+	ret = pull_headers(skb, &l2, &l3);
+	if (ret != TC_ACT_OK) return TC_ACT_SHOT;
 	err = snat(skb, l3, mvm_meta->ip);
 	if (err)
 		return TC_ACT_SHOT;

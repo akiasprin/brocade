@@ -374,8 +374,9 @@ export type ObserveValueAxis = { max: number; interval: number };
  * exactly on a tick. That keeps the trace away from the card edge and prevents raw sample maxima
  * such as 873.41 Mbps or 67.2 ms from becoming axis labels.
  */
-export function observeValueAxis(peak: number, targetIntervals = 4): ObserveValueAxis {
-  const safePeak = Number.isFinite(peak) && peak > 0 ? peak : 1;
+export function observeValueAxis(peak: number, targetIntervals = 4, unitScale = 1): ObserveValueAxis {
+  const scale = Number.isFinite(unitScale) && unitScale > 0 ? unitScale : 1;
+  const safePeak = (Number.isFinite(peak) && peak > 0 ? peak : 1) / scale;
   const intervals = Math.max(2, Math.floor(targetIntervals));
   const rawStep = safePeak / intervals;
   const magnitude = 10 ** Math.floor(Math.log10(rawStep));
@@ -386,7 +387,7 @@ export function observeValueAxis(peak: number, targetIntervals = 4): ObserveValu
   // by one full interval as required.
   const completedTicks = Math.floor(safePeak / interval + Number.EPSILON * 8);
   const max = Number(((completedTicks + 1) * interval).toPrecision(12));
-  return { max, interval };
+  return { max: max * scale, interval: interval * scale };
 }
 
 /**
@@ -399,6 +400,8 @@ export function observeValueAxis(peak: number, targetIntervals = 4): ObserveValu
  * is bought with significant digits instead: `3.42 Mbit/s`, never a rung change.
  */
 export type ObserveAxisUnit = {
+  /** Raw units per displayed unit; choose binary-byte ticks on this scale before formatting. */
+  axisDivisor?: number;
   /** What the title bar prints, as in `网卡流量 (Mbit/s)`. */
   name: string;
   /** One tick, bare — no unit, since the title bar already carries it. */
@@ -534,6 +537,7 @@ export function observeBytesUnit(axis: ObserveValueAxis, suffix = ''): ObserveAx
   const name = `${base}${suffix}`;
   return {
     name,
+    axisDivisor: divisor,
     text: value => String(Number((value / divisor).toFixed(2))),
     read: value => `${significantText(value / divisor)} ${name}`,
   };

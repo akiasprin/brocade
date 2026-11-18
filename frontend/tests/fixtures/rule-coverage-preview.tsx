@@ -1,3 +1,4 @@
+import { geodataFixture } from './geodata-data';
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { DEFAULT_HOP_MUX, type ConsoleSnapshot, type Rule, type SnapshotStep } from '../../src/api';
@@ -167,6 +168,8 @@ client.setQueryData(['settings'], settings);
 client.setQueryData(['revisions'], revisions);
 globalThis.fetch = async (input, init) => {
   const path = String(input);
+  const geo = geodataFixture(path, init);
+  if (geo) return geo;
   if (path.endsWith('/model/preview')) {
     const next = structuredClone(model);
     const ops = init?.body ? JSON.parse(String(init.body)).ops : draft.ops();

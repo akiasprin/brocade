@@ -149,6 +149,10 @@ impl Backend {
         })))
     }
 
+    pub fn image_manifests(&self) -> Vec<CvmImageManifest> {
+        self.0.inner.cfg.manifests.values().cloned().collect()
+    }
+
     pub fn inventory(&self) -> Result<Capabilities> {
         let inner = &self.0.inner;
         inner.cube_timeout("List", json!({}), Duration::from_secs(10))?;
@@ -361,9 +365,27 @@ impl Inner {
                     return;
                 }
             };
-            let result = self
-                .reconcile(&mut record, &desired)
-                .unwrap_or_else(|error| report(&desired, ApplyStatus::Unknown, Some(&error)));
+            let result = match self.artifact_receipt(&desired) {
+                Ok(receipt) => {
+                    let mut result = if desired.artifact_mode == CvmArtifactMode::Enforce
+                        && receipt.as_ref().is_some_and(|r| !r.mismatches.is_empty())
+                    {
+                        report(&desired, ApplyStatus::Failed, Some("Cube artifacts differ from verified local executor inputs; no changes applied"))
+                    } else {
+                        self.reconcile(&mut record, &desired)
+                            .unwrap_or_else(|error| {
+                                report(&desired, ApplyStatus::Unknown, Some(&error))
+                            })
+                    };
+                    if let Err(error) =
+                        self.complete_artifact_receipt(&record, &desired, &mut result, receipt)
+                    {
+                        result = report(&desired, ApplyStatus::Unknown, Some(&error));
+                    }
+                    result
+                }
+                Err(error) => report(&desired, ApplyStatus::Failed, Some(&error)),
+            };
             if result.status == ApplyStatus::Applied && result.power == Some(PowerState::Running) {
                 record.last_interfaces = result.interfaces.clone();
             }
@@ -440,6 +462,9 @@ pub fn report(
     error: Option<&str>,
 ) -> InstanceReport {
     InstanceReport {
+        chain_egress: Vec::new(),
+        artifacts: None,
+        host: None,
         id: desired.id.clone(),
         operation_id: desired.operation_id.clone(),
         generation: desired.generation,

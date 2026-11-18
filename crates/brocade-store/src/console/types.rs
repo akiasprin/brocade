@@ -232,6 +232,8 @@ pub struct NodeAgentStateItem {
     /// console reads the compiled view when editing this value (the one that goes through draft
     /// preview), and this copy is the fallback while compilation has not returned.
     pub egress_allowed: bool,
+    /// Live bell visibility; absent preferences inherit enabled. Not a desired-state field.
+    pub public_ip_change_notifications: bool,
     /// This machine's resolver, and what it does with the answers. Both are model fields
     /// rather than agent observations, carried here so the detail view can show and edit
     /// them — until now neither was exposed anywhere but the provisioning form, which is

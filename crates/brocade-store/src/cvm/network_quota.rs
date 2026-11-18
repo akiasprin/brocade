@@ -97,9 +97,8 @@ async fn preview_tx(
     if frozen != capacity {
         return Err(invalid("宿主网络容量已变化，请重新试算"));
     }
-    let guest:i64=sqlx::query_scalar("SELECT coalesce(sum((desired#>>'{spec,resources,memory_bytes}')::bigint),0)::bigint FROM cvm_instances WHERE node_id=$1 AND reserved")
-        .bind(&request.node_id).fetch_one(&mut **tx).await?;
-    capacity.memory_budget_bytes = capacity.memory_budget_bytes.saturating_sub(guest as u64);
+    // Logical Guest allocations may oversell. Network states retain their own
+    // measured physical table budget rather than sharing a logical RAM ledger.
     let memory_states = capacity
         .memory_budget_bytes
         .saturating_sub(capacity.fixed_memory_bytes)
@@ -240,17 +239,6 @@ pub(super) fn limit_compute_memory(caps: &mut Capabilities, held_states: u64) {
     );
     let remaining = network.memory_budget_bytes.saturating_sub(network_memory);
     caps.allocatable_memory_bytes = caps.allocatable_memory_bytes.min(remaining);
-    if let Some(limits) = &mut caps.resource_limits {
-        let maximum =
-            caps.allocatable_memory_bytes / limits.memory_step_bytes * limits.memory_step_bytes;
-        if maximum < limits.min_memory_bytes {
-            caps.resource_limits = None;
-            caps.create = false;
-            caps.configure = false;
-        } else {
-            limits.max_memory_bytes = limits.max_memory_bytes.min(maximum)
-        }
-    }
 }
 
 pub(super) async fn compute_memory_budget(

@@ -1,4 +1,5 @@
 use super::*;
+use crate::cvm::releases::Scope;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CvmNicBindingView {
@@ -104,11 +105,25 @@ pub(super) async fn transport_port(
     offer: &TransportOffer,
     server_caps: &NicNodeCapabilities,
 ) -> Result<(String, &'static str, u16)> {
-    let scope = format!("port:{server}");
     let protocol = if offer.kind == TransportKind::Wireguard {
-        "udp"
+        L4Protocol::Udp
     } else {
+        L4Protocol::Tcp
+    };
+    transport_port_for_protocol(tx, server, offer, server_caps, protocol).await
+}
+pub(super) async fn transport_port_for_protocol(
+    tx: &mut Transaction<'_, Postgres>,
+    server: &str,
+    offer: &TransportOffer,
+    server_caps: &NicNodeCapabilities,
+    wire_protocol: L4Protocol,
+) -> Result<(String, &'static str, u16)> {
+    let scope = format!("port:{server}");
+    let protocol = if wire_protocol == L4Protocol::Tcp {
         "tcp"
+    } else {
+        "udp"
     };
     let used = allocated_values(tx, &scope, protocol).await?;
     let forwarding:Vec<i32>=sqlx::query_scalar("SELECT listen_port FROM forwarding_rules WHERE node_id=$1 AND deleted_at IS NULL AND enabled AND (protocol=$2 OR protocol='tcp_udp')") .bind(server).bind(protocol).fetch_all(&mut **tx).await?;
@@ -124,14 +139,10 @@ pub(super) async fn transport_port(
                         .is_some_and(|(_, p)| p == port.to_string())
                 })
                 && !forwarding.contains(&i32::from(*port))
-                && !server_caps.host_ports.iter().any(|p| {
-                    p.port == *port
-                        && matches!(
-                            (p.protocol, offer.kind),
-                            (L4Protocol::Tcp, TransportKind::Xray)
-                                | (L4Protocol::Udp, TransportKind::Wireguard)
-                        )
-                })
+                && !server_caps
+                    .host_ports
+                    .iter()
+                    .any(|p| p.port == *port && p.protocol == wire_protocol)
         })
         .ok_or_else(|| StoreError::Conflict("承载端口已分配完毕或被宿主服务占用".into()))?;
     Ok((scope, protocol, port))
@@ -350,77 +361,32 @@ impl PgStore {
     pub async fn cvm_nic_desired(&self, node: &str) -> Result<NicDesired> {
         self.reset_cvm_nic_period(node).await?;
         let mut tx = self.pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *tx)
-            .await?;
-        let generation: Option<i64> =
-            sqlx::query_scalar("SELECT desired_generation FROM cvm_nic_nodes WHERE node_id=$1")
-                .bind(node)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let mut bindings = Vec::new();
-        for row in sqlx::query("SELECT target,sealed FROM cvm_nic_bindings WHERE (provider_node=$1 OR consumer_node=$1) AND NOT cleaned ORDER BY id LIMIT 2048").bind(node).fetch_all(&mut *tx).await? {
-            let mut binding:NicBinding=serde_json::from_value(row.try_get("target")?)?;
-            let (consumer,provider,consumer_peer,provider_peer):(String,String,String,String)=serde_json::from_str(&crate::secrets::open(&credential_context(&binding.id),&row.try_get::<String,_>("sealed")?)?)?;
-            if binding.provider_node==node {let mut side=binding.clone();side.side=BindingSide::Provider;side.credential=provider;side.peer_credential=provider_peer;bindings.push(side);}
-            if binding.consumer_node==node {binding.side=BindingSide::Consumer;binding.credential=consumer;binding.peer_credential=consumer_peer;bindings.push(binding);}
-        }
-        if bindings.len() > MAX_NETWORK_BINDINGS * 2 {
-            return Err(invalid("承载过渡数量超出执行上限"));
-        }
-        // Dedicated public addresses stay fenced until their allocation is released, so
-        // nothing on the provider can answer for an address it no longer routes.
-        let mut fences = Vec::new();
-        for row in sqlx::query("SELECT a.interface_id,r.value FROM cvm_nic_resources r JOIN cvm_nic_allocations a ON a.id=r.allocation_id WHERE NOT r.released AND r.scope=$1 AND r.kind IN ('ipv4','ipv6') ORDER BY a.interface_id,r.kind,r.value LIMIT 32769").bind(format!("public:{node}")).fetch_all(&mut *tx).await? {
-            let value: String = row.try_get("value")?;
-            fences.push(NicResourceFence {
-                interface_id: row.try_get("interface_id")?,
-                address: value
-                    .parse()
-                    .map_err(|_| invalid("invalid allocated public address"))?,
-                protocol: None,
-                port_start: 0,
-                port_end: 0,
-            });
-        }
-        if fences.len() > 32768 {
-            return Err(invalid("network resource fence capacity exceeded"));
-        }
-        let mut management_networks = BTreeSet::new();
-        for value in sqlx::query_scalar::<_,String>("SELECT host(overlay_addr) FROM nodes WHERE retired_at IS NULL AND overlay AND overlay_addr IS NOT NULL UNION SELECT public_ipv4 FROM nodes WHERE retired_at IS NULL AND public_ipv4 IS NOT NULL UNION SELECT public_ipv6 FROM nodes WHERE retired_at IS NULL AND public_ipv6 IS NOT NULL UNION SELECT report->>'access_address' FROM cvm_instances WHERE node_id=$1 AND reserved AND report->>'access_address' IS NOT NULL LIMIT 2048").bind(node).fetch_all(&mut *tx).await?{if let Ok(ip)=value.parse::<IpAddr>(){management_networks.insert(format!("{ip}/{}",if ip.is_ipv4(){32}else{128}).parse::<IpPrefix>().map_err(invalid)?);}}
-        let period:i64=sqlx::query_scalar("SELECT (extract(epoch FROM (date_trunc('month',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'))*1000)::bigint").fetch_one(&mut *tx).await?;
-        let mut budgets = BTreeMap::new();
-        for binding in &bindings {
-            if binding.nic.limits.monthly_bytes.is_none()
-                || budgets.contains_key(&binding.interface_id)
+        let live = desired_tx(&mut tx, node).await?;
+        let mut desired =
+            if let Some(snapshot) = super::super::releases::serving_tx(&mut tx, node).await? {
+                snapshot.nic
+            } else {
+                live.clone()
+            };
+        for binding in &mut desired.bindings {
+            if let Some(current) = live
+                .bindings
+                .iter()
+                .find(|b| b.id == binding.id && b.side == binding.side)
             {
-                continue;
+                binding.nic.blocked |= current.nic.blocked;
             }
-            let used:i64=sqlx::query_scalar("SELECT least(9223372036854775807::numeric,coalesce(sum(uploaded::numeric+downloaded::numeric),0))::bigint FROM cvm_nic_monthly_usage WHERE interface_id=$1 AND period=date_trunc('month',now() AT TIME ZONE 'UTC')::date").bind(&binding.interface_id).fetch_one(&mut *tx).await?;
-            let cursor:Option<(String,i64,i64,i64)>=sqlx::query_as("SELECT epoch,observed_at,uploaded,downloaded FROM cvm_nic_meter_cursors WHERE interface_id=$1 ORDER BY observed_at DESC LIMIT 1").bind(&binding.interface_id).fetch_optional(&mut *tx).await?;
-            budgets.insert(
-                binding.interface_id.clone(),
-                NicTrafficBudget {
-                    period_start: period as u64,
-                    used_bytes: used as u64,
-                    sample: cursor.map(|(epoch, at, uploaded, downloaded)| NicTrafficSample {
-                        epoch,
-                        observed_at: at as u64,
-                        uploaded_bytes: uploaded as u64,
-                        downloaded_bytes: downloaded as u64,
-                    }),
-                },
-            );
+            binding.nic.quota_exceeded = metering::quota_exceeded(
+                &mut tx,
+                &binding.interface_id,
+                binding.nic.limits.monthly_bytes,
+            )
+            .await?;
         }
+        desired.budgets = live.budgets;
+        desired.management_networks = live.management_networks;
         tx.commit().await?;
-        Ok(NicDesired {
-            node_id: node.into(),
-            budgets,
-            generation: generation.unwrap_or(0) as u64,
-            bindings,
-            fences,
-            management_networks: management_networks.into_iter().collect(),
-        })
+        Ok(desired)
     }
     pub async fn change_cvm_nic_transport(
         &self,
@@ -431,7 +397,8 @@ impl PgStore {
     ) -> Result<CvmInstance> {
         let digest = request_digest(&(instance_id, nic_id, &request))?;
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before = crate::cvm::releases::begin(&mut tx, Scope::instance(instance_id)).await?;
         if let Some(instance) =
             operation_replay(&mut tx, actor, &request.request_id, &digest).await?
         {
@@ -519,15 +486,26 @@ impl PgStore {
             desired,
         )
         .await?;
+        crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
         tx.commit().await?;
         self.cvm_instance(actor, instance_id).await
     }
     pub async fn cvm_record_nic_report(&self, node: &str, report: NicNodeReport) -> Result<bool> {
+        if let Some(diagnostics) = &report.diagnostics {
+            diagnostics.validate().map_err(invalid)?;
+        }
         if report.bindings.len() > MAX_NETWORK_BINDINGS * 2 {
             return Err(invalid("网卡回报超出数量上限"));
         }
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let published = crate::cvm::releases::serving_tx(&mut tx, node).await?;
+        if published
+            .as_ref()
+            .is_some_and(|p| p.nic.generation != report.generation)
+        {
+            return Ok(false);
+        }
         let mut seen = BTreeSet::new();
         let mut accepted = false;
         for evidence in &report.bindings {
@@ -545,13 +523,35 @@ impl PgStore {
             } {
                 return Err(StoreError::Forbidden("回报角色不属于该机器".into()));
             }
+            let approved = if let Some(published) = &published {
+                let Some(binding) = published.nic.bindings.iter().find(|b| {
+                    b.id == evidence.id
+                        && b.side == evidence.side
+                        && b.generation == evidence.generation
+                        && b.phase == evidence.phase
+                }) else {
+                    continue;
+                };
+                binding
+            } else {
+                if row.try_get::<bool, _>("cleaned")? || evidence.generation < target.generation {
+                    continue;
+                }
+                if evidence.generation != target.generation || evidence.phase != target.phase {
+                    return Err(invalid("回报不匹配当前承载版本"));
+                }
+                &target
+            };
+            // An unapproved withdrawal/transport edit must not stop metering the data plane
+            // that is still serving. Its receipt cannot advance the staged lifecycle.
+            metering::record(&mut tx, approved, evidence).await?;
+            accepted = true;
             if row.try_get::<bool, _>("cleaned")? || evidence.generation < target.generation {
                 continue;
             }
             if evidence.generation != target.generation || evidence.phase != target.phase {
                 return Err(invalid("回报不匹配当前承载版本"));
             }
-            metering::record(&mut tx, &target, evidence).await?;
             let current: i64 =
                 sqlx::query_scalar("SELECT generation FROM cvm_nic_bindings WHERE id=$1")
                     .bind(&target.id)
@@ -627,11 +627,18 @@ impl PgStore {
                 BindingPhase::Standby => {}
             }
         }
-        sqlx::query("UPDATE cvm_nic_nodes SET report=$2 WHERE node_id=$1")
+        sqlx::query("UPDATE cvm_nic_nodes SET report=$2,report_received_at=now() WHERE node_id=$1")
             .bind(node)
             .bind(serde_json::to_value(&report)?)
             .execute(&mut *tx)
             .await?;
+        let participants:Vec<String>=sqlx::query_scalar("SELECT provider_node FROM cvm_nic_bindings WHERE provider_node=$1 OR consumer_node=$1 UNION SELECT consumer_node FROM cvm_nic_bindings WHERE provider_node=$1 OR consumer_node=$1 UNION SELECT $1::text").bind(node).fetch_all(&mut *tx).await?;
+        for participant in &participants {
+            crate::cvm::releases::refresh_runtime(&mut tx, participant).await?;
+        }
+        for participant in &participants {
+            crate::cvm::releases::settle(&mut tx, participant).await?;
+        }
         tx.commit().await?;
         Ok(accepted)
     }
@@ -788,4 +795,76 @@ pub(crate) async fn retire_provider(tx: &mut Transaction<'_, Postgres>, node: &s
         system_network_version(tx, &mut desired, "network_provider_retired").await?;
     }
     Ok(())
+}
+
+pub(crate) async fn desired_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    node: &str,
+) -> Result<NicDesired> {
+    let generation: Option<i64> =
+        sqlx::query_scalar("SELECT desired_generation FROM cvm_nic_nodes WHERE node_id=$1")
+            .bind(node)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let mut bindings = Vec::new();
+    for row in sqlx::query("SELECT target,sealed FROM cvm_nic_bindings WHERE (provider_node=$1 OR consumer_node=$1) AND NOT cleaned ORDER BY id LIMIT 2048").bind(node).fetch_all(&mut **tx).await? {
+            let mut binding:NicBinding=serde_json::from_value(row.try_get("target")?)?;
+            let (consumer,provider,consumer_peer,provider_peer):(String,String,String,String)=serde_json::from_str(&crate::secrets::open(&credential_context(&binding.id),&row.try_get::<String,_>("sealed")?)?)?;
+            if binding.provider_node==node {let mut side=binding.clone();side.side=BindingSide::Provider;side.credential=provider;side.peer_credential=provider_peer;bindings.push(side);}
+            if binding.consumer_node==node {binding.side=BindingSide::Consumer;binding.credential=consumer;binding.peer_credential=consumer_peer;bindings.push(binding);}
+        }
+    if bindings.len() > MAX_NETWORK_BINDINGS * 2 {
+        return Err(invalid("承载过渡数量超出执行上限"));
+    }
+    // Dedicated public addresses stay fenced until their allocation is released, so
+    // nothing on the provider can answer for an address it no longer routes.
+    let mut fences = Vec::new();
+    for row in sqlx::query("SELECT a.interface_id,r.value FROM cvm_nic_resources r JOIN cvm_nic_allocations a ON a.id=r.allocation_id WHERE NOT r.released AND r.scope=$1 AND r.kind IN ('ipv4','ipv6') ORDER BY a.interface_id,r.kind,r.value LIMIT 32769").bind(format!("public:{node}")).fetch_all(&mut **tx).await? {
+            let value: String = row.try_get("value")?;
+            fences.push(NicResourceFence {
+                interface_id: row.try_get("interface_id")?,
+                address: value
+                    .parse()
+                    .map_err(|_| invalid("invalid allocated public address"))?,
+                protocol: None,
+                port_start: 0,
+                port_end: 0,
+            });
+        }
+    if fences.len() > 32768 {
+        return Err(invalid("network resource fence capacity exceeded"));
+    }
+    let mut management_networks = BTreeSet::new();
+    for value in sqlx::query_scalar::<_,String>("SELECT host(overlay_addr) FROM nodes WHERE retired_at IS NULL AND overlay AND overlay_addr IS NOT NULL UNION SELECT public_ipv4 FROM nodes WHERE retired_at IS NULL AND public_ipv4 IS NOT NULL UNION SELECT public_ipv6 FROM nodes WHERE retired_at IS NULL AND public_ipv6 IS NOT NULL UNION SELECT report->>'access_address' FROM cvm_instances WHERE node_id=$1 AND reserved AND report->>'access_address' IS NOT NULL LIMIT 2048").bind(node).fetch_all(&mut **tx).await?{if let Ok(ip)=value.parse::<IpAddr>(){management_networks.insert(format!("{ip}/{}",if ip.is_ipv4(){32}else{128}).parse::<IpPrefix>().map_err(invalid)?);}}
+    let period:i64=sqlx::query_scalar("SELECT (extract(epoch FROM (date_trunc('month',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'))*1000)::bigint").fetch_one(&mut **tx).await?;
+    let mut budgets = BTreeMap::new();
+    for binding in &bindings {
+        if binding.nic.limits.monthly_bytes.is_none() || budgets.contains_key(&binding.interface_id)
+        {
+            continue;
+        }
+        let used:i64=sqlx::query_scalar("SELECT least(9223372036854775807::numeric,coalesce(sum(uploaded::numeric+downloaded::numeric),0))::bigint FROM cvm_nic_monthly_usage WHERE interface_id=$1 AND period=date_trunc('month',now() AT TIME ZONE 'UTC')::date").bind(&binding.interface_id).fetch_one(&mut **tx).await?;
+        let cursor:Option<(String,i64,i64,i64)>=sqlx::query_as("SELECT epoch,observed_at,uploaded,downloaded FROM cvm_nic_meter_cursors WHERE interface_id=$1 ORDER BY observed_at DESC LIMIT 1").bind(&binding.interface_id).fetch_optional(&mut **tx).await?;
+        budgets.insert(
+            binding.interface_id.clone(),
+            NicTrafficBudget {
+                period_start: period as u64,
+                used_bytes: used as u64,
+                sample: cursor.map(|(epoch, at, uploaded, downloaded)| NicTrafficSample {
+                    epoch,
+                    observed_at: at as u64,
+                    uploaded_bytes: uploaded as u64,
+                    downloaded_bytes: downloaded as u64,
+                }),
+            },
+        );
+    }
+    Ok(NicDesired {
+        node_id: node.into(),
+        budgets,
+        generation: generation.unwrap_or(0) as u64,
+        bindings,
+        fences,
+        management_networks: management_networks.into_iter().collect(),
+    })
 }

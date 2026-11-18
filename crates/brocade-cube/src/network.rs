@@ -34,7 +34,8 @@ impl Inner {
                 // Cubelet has one mutation lock for attachments and quotas. Keep
                 // both workers in the same queue; waiting consumes the RPC budget.
                 // Read-only capability checks need not wait for Guest convergence.
-                let _guard = if matches!(action, "prepare" | "reconcile" | "quota") {
+                let _guard = if matches!(action, "prepare" | "reconcile" | "quota" | "guard_routes")
+                {
                     Some(self.network_mutation.lock().await)
                 } else {
                     None
@@ -71,6 +72,7 @@ impl Inner {
         caps.managed_networks = catalogue["managed_nics"] == true;
         caps.primary_ip_delivery = catalogue["primary_ip_delivery"] == true;
         caps.route_services = catalogue["route_services"] == true;
+        caps.chain_egress = catalogue["chain_egress"] == true;
         caps.max_interfaces = caps.max_interfaces.min(max as u16);
         let labels = caps.network_sources.clone();
         caps.network_sources
@@ -144,9 +146,28 @@ impl Inner {
         record: &Record,
         desired: &InstanceDesired,
     ) -> Result<Value> {
+        if let Some(value) = self.artifact_value(
+            desired,
+            CvmArtifactKind::Attachments,
+            &brocade_cvm_compile::LocalBindings {
+                runtime_id: Some(if record.runtime.is_empty() {
+                    record.instance.clone()
+                } else {
+                    record.runtime.clone()
+                }),
+                ..Default::default()
+            },
+        )? {
+            return Ok(value);
+        }
         let value = json!({"contract":CONTRACT,"instance_id":record.instance,
             "runtime_id":if record.runtime.is_empty(){&record.instance}else{&record.runtime},
             "generation":desired.generation,"interfaces":desired.spec.interfaces,"routing":desired.spec.routing,"detach":desired.detached_interfaces,"release":false,"forget":false});
+        let mut value = value;
+        let bindings = brocade_cvm_compile::chain_bindings(&desired.id, &desired.spec.routing);
+        if !bindings.is_empty() {
+            value["chain_egress"] = json!(bindings);
+        }
         Ok(value)
     }
 
@@ -170,13 +191,26 @@ impl Inner {
         record: &mut Record,
         desired: &InstanceDesired,
     ) -> Result<(Vec<InterfaceObservation>, NetworkObservation, Vec<String>)> {
+        // Fence new chain-selected flows before relaxing the original NAT policy.
+        // On removal the guard RPC still installs the remaining NIC selectors first.
+        if self.native_capabilities()?.chain_egress {
+            let request = self.network_desired(record, desired)?;
+            self.network_rpc(
+                "guard_routes",
+                crate::text(&request, "runtime_id"),
+                Some(request.clone()),
+            )?;
+        }
+        let primary_policy = self
+            .artifact_value(desired, CvmArtifactKind::Egress, &Default::default())?
+            .unwrap_or_else(|| crate::config::primary_network_policy(&desired.spec.routing));
         let policy = self.cube(
             "Update",
             json!({
                 "requestID":format!("brocade-primary-network-{}",record.instance),
                 "sandboxID":record.runtime,
                 "annotations":{"cube.master.update_action":"network"},
-                "cube_network_config":crate::config::primary_network_policy(&desired.spec.routing)
+                "cube_network_config":primary_policy
             }),
         )?;
         crate::successful(&policy)?;

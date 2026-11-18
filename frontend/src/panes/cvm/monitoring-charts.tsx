@@ -36,7 +36,7 @@ function Card({
     <Section title={title} className="cvm-diagnostic-card" aside={<span className="cvm-chart-reading">{reading}</span>}>
       {children}
       <details className="cvm-diagnostic-more">
-        <summary>展开{title}诊断</summary>
+        <summary>{title} 诊断</summary>
         {more}
       </details>
     </Section>
@@ -315,7 +315,7 @@ export default function CvmMonitoringCharts({
                 ['窗口 UDP 接收错误', num(diagnostics?.tcp.UdpInErrors)],
               ]}
             />
-            <p className="note">TCP／UDP 统计来自整个 Guest，按网卡选择不会改变这些全局计数。</p>
+            <p className="note">TCP／UDP 统计来自整个系统，按网卡选择不会改变这些全局计数。</p>
           </>
         }
       >

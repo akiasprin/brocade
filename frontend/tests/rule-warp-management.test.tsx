@@ -24,6 +24,12 @@ window.matchMedia = ((query: string) => ({
   dispatchEvent: () => false,
 })) as unknown as typeof window.matchMedia;
 
+// These tests isolate forwarding and tunnel edits; validation has its own HTTP/DB suite.
+vi.mock('../src/api/geodata', async importOriginal => ({
+  ...(await importOriginal<typeof import('../src/api/geodata')>()),
+  validateDraft: vi.fn(async () => ({ valid: true })),
+}));
+
 const warp: ExternalOutbound = {
   id: 'warp-8f3a-2d71',
   tenant: 'platform',

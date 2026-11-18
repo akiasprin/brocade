@@ -72,7 +72,7 @@ async fn offline_upgrade_rejects_empty_databases_and_checks_initialized_schema()
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(count, 33);
+    assert_eq!(count, 36);
     let identities: Vec<(i64, Vec<u8>)> =
         sqlx::query_as("SELECT version,checksum FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
@@ -83,7 +83,7 @@ async fn offline_upgrade_rejects_empty_databases_and_checks_initialized_schema()
             .iter()
             .map(|(version, _)| *version)
             .collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5, 6, 7]
+        [1, 2, 3, 4, 5, 6, 7, 8]
     );
     pool.close().await;
 }
@@ -106,7 +106,7 @@ async fn offline_ip_maintenance_compat_is_explicit_read_only_then_migrates() {
     .unwrap()
     {
         let file = file.unwrap();
-        if !file.file_name().to_string_lossy().starts_with("0007_") {
+        if file.file_name().to_string_lossy().as_ref() < "0007_" {
             std::fs::copy(file.path(), dir.join(file.file_name())).unwrap();
         }
     }
@@ -143,7 +143,7 @@ async fn offline_ip_maintenance_compat_is_explicit_read_only_then_migrates() {
         String::from_utf8_lossy(&opted.stderr)
     );
     let report: Value = serde_json::from_slice(&opted.stdout).unwrap();
-    assert_eq!(report["pending_versions"], json!([7]));
+    assert_eq!(report["pending_versions"], json!([7, 8]));
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('ip_maintenance_policies') IS NULL")
         .fetch_one(store.pool())
         .await

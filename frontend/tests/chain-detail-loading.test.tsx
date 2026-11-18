@@ -108,6 +108,11 @@ function setup({
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity }, mutations: { retry: false } },
   });
+  client.setQueryData(['geodata', 'geosite', undefined], {
+    source: 'https://fixture/geosite.dat',
+    loaded_at: 1,
+    entries: [],
+  });
   clients.push(client);
   // Entering from the list already has these two responses, but not the detail's editor dependencies.
   client.setQueryData(['snapshot'], snapshot);

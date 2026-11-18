@@ -24,7 +24,7 @@ for (const width of [1440, 390, 320])
         if (scene === 'new') {
           const interfaces = page
             .locator('.cvm-section')
-            .filter({ has: page.getByRole('heading', { name: '网络', exact: true }) });
+            .filter({ has: page.getByRole('heading', { name: '网络与访问', exact: true }) });
           await expect(interfaces).toHaveScreenshot(`cvm-create-interfaces-${width}-${theme}.png`);
         }
         expect(errors).toEqual([]);
@@ -83,11 +83,8 @@ test('create keeps images separate and initializes only the independent manageme
   await page
     .getByLabel('SSH 公钥', { exact: true })
     .fill('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEiBcpQEzqzjADp8VXvOigHnqLh5L5xP76cwoCD8YMK5 fixture');
-  await expect(
-    page.getByText(
-      '创建时生成主网卡，通过宿主机 NAT 访问公网，优先级最低。创建后可挂载已授权的业务网卡，并单独配置优先路由。',
-    ),
-  ).toBeVisible();
+  await expect(page.getByText('创建时生成 · 宿主 NAT 出网 · 优先级最低', { exact: true })).toBeVisible();
+  await expect(page.getByText(/创建后在组合台接入访问入口和出口网络/)).toBeVisible();
   await expect(page.getByRole('button', { name: /Debian 13/ })).not.toContainText('MiB');
   await page.getByRole('button', { name: '创建实例', exact: true }).click();
   await expect(page).toHaveURL(/#\/cvm\/instance\/cvm-created/);
@@ -119,7 +116,7 @@ test('read only and expired capability cannot mutate, final contact cannot detac
   await expect(page.getByRole('button', { name: '删除', exact: true })).toHaveCount(0);
   await expect(page.locator('.cvm-attached').first().getByText('已脱敏', { exact: true })).toHaveCount(1);
   await expect(page.locator('.cvm-attached').nth(1).getByText('已脱敏', { exact: true })).toHaveCount(2);
-  await expect(page.locator('.cvm-route-table code')).toHaveText(['已脱敏', '已脱敏']);
+  await expect(page.locator('.cvm-flow-routes code')).toHaveText(['已脱敏', '已脱敏']);
   await expect(page.locator('.cvm-detail')).not.toContainText(/192\.0\.2\.21|10\.60\.0\.2|203\.0\.113\.20/);
   await expect(page.locator('.cvm-attached').first().getByRole('button', { name: '卸载' })).toHaveCount(0);
 });
@@ -148,7 +145,7 @@ for (const width of [1440, 390, 320])
       await load(page, width, theme, 'detail');
       await page.setViewportSize({ width, height: 1400 });
       const panel = page.getByRole('region', { name: '容器 监控' });
-      await expect(panel.getByText('持续采样', { exact: true })).toBeVisible();
+      await expect(panel.getByText(/持续采样/)).toBeVisible();
       await page.getByRole('tab', { name: '监控与诊断' }).click();
       await expect(panel.locator('.cvm-diagnostic-card')).toHaveCount(4);
       for (const chart of await panel.locator('.cvm-diagnostic-card > .cvm-section-body > .history-chart-card').all()) {
@@ -170,7 +167,7 @@ test('monitoring keeps stale values explicitly historical', async ({ page }) => 
   await load(page, 390, 'light', 'stale');
   await page.setViewportSize({ width: 390, height: 1400 });
   const panel = page.getByRole('region', { name: '容器 监控' });
-  await expect(panel.getByText('读数已过期', { exact: true })).toBeVisible();
+  await expect(panel.getByText(/读数已过期/)).toBeVisible();
   await expect(panel.getByLabel('最后实例读数')).toBeVisible();
   await expect(panel).toHaveScreenshot('cvm-monitoring-stale-390-light.png');
 });
@@ -179,8 +176,7 @@ test('diagnostic details keep real scope and unsupported readings on mobile', as
   await load(page, 390, 'dark', 'detail');
   await page.getByRole('tab', { name: '监控与诊断' }).click();
   const panel = page.getByRole('region', { name: '容器 监控' });
-  for (const name of ['CPU', '内存', '系统盘', '网络'])
-    await panel.getByText(`展开${name}诊断`, { exact: true }).click();
+  for (const name of ['CPU', '内存', '系统盘', '网络']) await panel.getByText(`${name} 诊断`, { exact: true }).click();
   await expect(panel.getByText('TCP 已建立连接', { exact: true })).toBeVisible();
   await expect(panel.getByText('CPU 0', { exact: true })).toBeVisible();
   await noOverflow(page);

@@ -1,5 +1,5 @@
 //! Reusable IP network services, their allocated container devices and independent routes.
-use super::{valid_id, MAX_INTERFACES};
+use super::{valid_id, NetworkDiagnostics, RouteTarget};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -427,7 +427,8 @@ impl AllocatedNic {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfacePriority {
-    pub interface_id: String,
+    #[serde(flatten)]
+    pub target: RouteTarget,
     pub ipv4: Option<u16>,
     pub ipv6: Option<u16>,
 }
@@ -454,7 +455,8 @@ impl RouteService {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ContainerRoute {
     pub destination: IpPrefix,
-    pub interface_id: String,
+    #[serde(flatten)]
+    pub target: RouteTarget,
     /// 只有 Agent 与 Cubelet 都上报 [`ROUTE_SERVICE_CONTRACT`] 时才下发带端口的规则：
     /// 旧执行端会忽略这个字段，把它当成整段路由执行。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -471,67 +473,82 @@ impl ContainerRoutes {
     pub fn normalize(&mut self) {
         self.routes.sort();
         self.routes.dedup();
-        self.priorities
-            .sort_by(|a, b| a.interface_id.cmp(&b.interface_id));
+        self.priorities.sort_by(|a, b| a.target.cmp(&b.target));
         self.dns.dedup();
     }
     pub fn priority(&self, id: &str, ipv4: bool) -> Option<u16> {
+        self.exit_priority(&RouteTarget::interface(id), ipv4)
+    }
+    pub fn exit_priority(&self, target: &RouteTarget, ipv4: bool) -> Option<u16> {
         self.priorities
             .iter()
-            .find(|p| p.interface_id == id)
+            .find(|p| &p.target == target)
             .and_then(|p| if ipv4 { p.ipv4 } else { p.ipv6 })
+    }
+    pub fn chain_ids(&self) -> BTreeSet<&str> {
+        self.routes
+            .iter()
+            .filter_map(|r| r.target.chain_id())
+            .collect()
     }
     pub fn validate(&self, devices: &BTreeMap<String, AllocatedNic>) -> Result<(), String> {
         if self.routes.len() > MAX_NETWORK_ROUTES
-            || self.priorities.len() > MAX_INTERFACES
+            || self.priorities.len() > MAX_NETWORK_ROUTES
             || self.dns.len() > 4
         {
             return Err("container routing configuration exceeds its limits".into());
         }
         let mut ids = BTreeSet::new();
         for priority in &self.priorities {
-            let nic = devices
-                .get(&priority.interface_id)
-                .ok_or("priority references an unmounted NIC")?;
-            if !ids.insert(&priority.interface_id)
-                || priority.ipv4.is_some() && nic.ipv4.is_none()
-                || priority.ipv6.is_some() && nic.ipv6.is_none()
-            {
-                return Err("invalid NIC priority or address family".into());
+            if !valid_id(priority.target.id()) || !ids.insert(&priority.target) {
+                return Err("invalid or duplicate exit priority".into());
+            }
+            if let Some(id) = priority.target.interface_id() {
+                let nic = devices
+                    .get(id)
+                    .ok_or("priority references an unmounted NIC")?;
+                if priority.ipv4.is_some() && nic.ipv4.is_none()
+                    || priority.ipv6.is_some() && nic.ipv6.is_none()
+                {
+                    return Err("invalid NIC priority address family".into());
+                }
             }
         }
         let mut selections = BTreeMap::new();
-        let mut services: Vec<(&IpPrefix, u16, RouteService, &String)> = Vec::new();
+        let mut services: Vec<(&IpPrefix, u16, RouteService, &RouteTarget)> = Vec::new();
         for route in &self.routes {
-            let nic = devices
-                .get(&route.interface_id)
-                .ok_or("route references an unmounted NIC")?;
-            if !nic.supports(&route.destination) {
-                return Err("route exceeds NIC network access or address family".into());
+            if !valid_id(route.target.id()) {
+                return Err("invalid exit identifier".into());
+            }
+            if let Some(id) = route.target.interface_id() {
+                let nic = devices.get(id).ok_or("route references an unmounted NIC")?;
+                if !nic.supports(&route.destination) {
+                    return Err("route exceeds NIC network access or address family".into());
+                }
             }
             let priority = self
-                .priority(&route.interface_id, route.destination.is_ipv4())
-                .ok_or("route requires a NIC priority for its address family")?;
+                .exit_priority(&route.target, route.destination.is_ipv4())
+                .ok_or("route requires an exit priority for its address family")?;
             if let Some(service) = route.service {
                 if !service.valid() {
                     return Err("invalid route protocol or port range".into());
                 }
-                if services.iter().any(|(prefix, other_priority, other, id)| {
+                if services.iter().any(|(prefix, p, other, target)| {
                     *prefix == &route.destination
-                        && *other_priority == priority
+                        && *p == priority
                         && other.overlaps(&service)
-                        && *id != &route.interface_id
+                        && *target != &route.target
                 }) {
                     return Err(
-                        "the same prefix, priority and ports cannot select different NICs".into(),
+                        "the same prefix, priority and ports cannot select different exits".into(),
                     );
                 }
-                services.push((&route.destination, priority, service, &route.interface_id));
+                services.push((&route.destination, priority, service, &route.target));
             } else if let Some(previous) =
-                selections.insert((&route.destination, priority), &route.interface_id)
+                selections.insert((&route.destination, priority), &route.target)
             {
-                if previous != &route.interface_id {
-                    return Err("the same prefix and priority cannot select different NICs".into());
+                if previous != &route.target {
+                    return Err("the same prefix and priority cannot select different exits".into());
                 }
             }
         }
@@ -544,23 +561,22 @@ impl ContainerRoutes {
         }
         Ok(())
     }
-    /// Health is intentionally absent: an unavailable selected NIC cannot cause fallback.
-    pub fn select(&self, address: IpAddr) -> Option<&str> {
-        self.select_flow(address, None)
-    }
-    /// 目的网段越具体越优先；同一网段下，匹配协议端口的规则先于不带端口的规则；再按网卡优先级，
-    /// 最后取端口段更窄的规则。不知道协议端口的流量（`flow` 为 `None`）只看不带端口的规则。
-    pub fn select_flow(&self, address: IpAddr, flow: Option<(L4Protocol, u16)>) -> Option<&str> {
+    /// Health never participates in selection: an unavailable selected exit cannot cause fallback.
+    pub fn select_target_flow(
+        &self,
+        address: IpAddr,
+        flow: Option<(L4Protocol, u16)>,
+    ) -> Option<&RouteTarget> {
         self.routes
             .iter()
             .filter(|r| r.destination.contains(address))
             .filter(|r| match (r.service, flow) {
                 (None, _) => true,
-                (Some(service), Some((protocol, port))) => service.matches(protocol, port),
+                (Some(s), Some((protocol, port))) => s.matches(protocol, port),
                 (Some(_), None) => false,
             })
             .filter_map(|r| {
-                self.priority(&r.interface_id, address.is_ipv4())
+                self.exit_priority(&r.target, address.is_ipv4())
                     .map(|p| (r, p))
             })
             .min_by_key(|(r, p)| {
@@ -571,29 +587,49 @@ impl ContainerRoutes {
                     r.service.map(|s| s.port_end - s.port_start),
                 )
             })
-            .map(|(r, _)| r.interface_id.as_str())
+            .map(|(r, _)| &r.target)
+    }
+    pub fn select(&self, address: IpAddr) -> Option<&str> {
+        self.select_flow(address, None)
+    }
+    pub fn select_flow(&self, address: IpAddr, flow: Option<(L4Protocol, u16)>) -> Option<&str> {
+        self.select_target_flow(address, flow)
+            .and_then(RouteTarget::interface_id)
     }
     pub fn references(&self, id: &str) -> bool {
-        self.routes.iter().any(|r| r.interface_id == id)
-            || self.priorities.iter().any(|p| p.interface_id == id)
+        self.routes
+            .iter()
+            .any(|r| r.target.interface_id() == Some(id))
+            || self
+                .priorities
+                .iter()
+                .any(|p| p.target.interface_id() == Some(id))
     }
     pub fn default_interface(&self, ipv4: bool) -> Option<&str> {
+        let address: IpAddr = if ipv4 { "0.0.0.0" } else { "::" }
+            .parse()
+            .expect("constant address");
         self.routes
             .iter()
             .filter(|r| {
-                r.service.is_none()
-                    && r.destination.length() == 0
+                r.destination.length() == 0
                     && r.destination.is_ipv4() == ipv4
+                    && r.service.is_none()
             })
-            .filter_map(|r| self.priority(&r.interface_id, ipv4).map(|p| (r, p)))
+            .filter_map(|r| {
+                self.exit_priority(&r.target, address.is_ipv4())
+                    .map(|p| (r, p))
+            })
             .min_by_key(|(_, p)| *p)
-            .map(|(r, _)| r.interface_id.as_str())
+            .and_then(|(r, _)| r.target.interface_id())
     }
     pub fn remove(&mut self, id: &str) {
-        self.routes.retain(|r| r.interface_id != id);
-        self.priorities.retain(|p| p.interface_id != id);
+        self.routes.retain(|r| r.target.interface_id() != Some(id));
+        self.priorities
+            .retain(|p| p.target.interface_id() != Some(id));
     }
 }
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutesWrite {
     pub request_id: String,
@@ -619,6 +655,14 @@ pub struct NicNodeCapabilities {
     /// Agent 能在宿主侧按协议端口执行出口规则（[`ROUTE_SERVICE_CONTRACT`]）。
     #[serde(default)]
     pub route_service: bool,
+    /// L3 forwarding of a host address preserves host replies and transport sockets.
+    #[serde(default)]
+    pub entry_host_l3: bool,
+    /// Entry IP transport, independently gated from the existing egress NIC transport.
+    #[serde(default)]
+    pub entry_xray: bool,
+    #[serde(default)]
+    pub entry_phantun: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -720,6 +764,8 @@ pub struct NicBindingReport {
 pub struct NicNodeReport {
     pub generation: u64,
     pub bindings: Vec<NicBindingReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<NetworkDiagnostics>,
 }
 
 #[cfg(test)]
@@ -749,12 +795,12 @@ mod tests {
             revision: 1,
             priorities: vec![
                 InterfacePriority {
-                    interface_id: "nic-a".into(),
+                    target: RouteTarget::interface("nic-a"),
                     ipv4: Some(20),
                     ipv6: Some(1),
                 },
                 InterfacePriority {
-                    interface_id: "nic-b".into(),
+                    target: RouteTarget::interface("nic-b"),
                     ipv4: Some(10),
                     ipv6: Some(2),
                 },
@@ -762,22 +808,22 @@ mod tests {
             routes: vec![
                 ContainerRoute {
                     destination: "0.0.0.0/0".parse().unwrap(),
-                    interface_id: "nic-a".into(),
+                    target: RouteTarget::interface("nic-a"),
                     service: None,
                 },
                 ContainerRoute {
                     destination: "10.0.0.0/8".parse().unwrap(),
-                    interface_id: "nic-b".into(),
+                    target: RouteTarget::interface("nic-b"),
                     service: None,
                 },
                 ContainerRoute {
                     destination: "10.1.0.0/16".parse().unwrap(),
-                    interface_id: "nic-a".into(),
+                    target: RouteTarget::interface("nic-a"),
                     service: None,
                 },
                 ContainerRoute {
                     destination: "::/0".parse().unwrap(),
-                    interface_id: "nic-b".into(),
+                    target: RouteTarget::interface("nic-b"),
                     service: None,
                 },
             ],
@@ -794,7 +840,7 @@ mod tests {
     fn port_rules_refine_the_same_prefix_but_never_beat_a_more_specific_prefix() {
         let route = |destination: &str, id: &str, service: Option<RouteService>| ContainerRoute {
             destination: destination.parse().unwrap(),
-            interface_id: id.into(),
+            target: RouteTarget::interface(id),
             service,
         };
         let ssh = RouteService {
@@ -807,7 +853,7 @@ mod tests {
             priorities: ["home", "ntt", "office"]
                 .iter()
                 .map(|id| InterfacePriority {
-                    interface_id: (*id).into(),
+                    target: RouteTarget::interface(*id),
                     ipv4: Some(10),
                     ipv6: None,
                 })

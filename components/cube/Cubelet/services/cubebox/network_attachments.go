@@ -64,7 +64,7 @@ func (s *service) networkAttachmentsUpdate(ctx context.Context, req *cb.UpdateCu
 		rsp.ExtInfo[wire.ResultKey] = data
 		return rsp, true
 	}
-	if action != "reconcile" && action != "prepare" {
+	if action != "reconcile" && action != "prepare" && action != "guard_routes" {
 		return fail(errors.New("unsupported Cube network attachment action"))
 	}
 	payload := req.GetAnnotations()[wire.PayloadKey]
@@ -109,7 +109,12 @@ func (s *service) networkAttachmentsUpdate(ctx context.Context, req *cb.UpdateCu
 			return fail(errors.New("Cube network runtime ownership proof does not match"))
 		}
 	}
-	evidence, err := manager.Reconcile(ctx, desired)
+	var evidence wire.Result
+	if action == "guard_routes" {
+		evidence, err = manager.GuardPrimaryRoutes(ctx, desired)
+	} else {
+		evidence, err = manager.Reconcile(ctx, desired)
+	}
 	if err != nil {
 		if errors.Is(err, attachments.ErrRuntimeUpgradeRequired) {
 			data, _ := json.Marshal(wire.Result{Contract: wire.Contract, RestartRequired: true})

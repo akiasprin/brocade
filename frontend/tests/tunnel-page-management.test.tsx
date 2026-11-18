@@ -12,7 +12,7 @@ vi.mock('echarts/core', () => ({
   use: vi.fn(),
   init: vi.fn(() => ({ setOption: vi.fn(), resize: vi.fn(), dispose: vi.fn() })),
 }));
-vi.mock('echarts/charts', () => ({ CustomChart: {}, LineChart: {} }));
+vi.mock('echarts/charts', () => ({ CustomChart: {}, LineChart: {}, ScatterChart: {} }));
 vi.mock('echarts/components', () => ({
   GridComponent: {},
   MarkAreaComponent: {},

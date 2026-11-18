@@ -120,10 +120,13 @@ pub struct InterfaceSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceSpec {
+    #[serde(default, skip_serializing_if = "ExecutionTarget::is_cube")]
+    pub execution: ExecutionTarget,
     #[serde(default)]
     pub routing: ContainerRoutes,
     pub name: String,
-    pub image: Image,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<Image>,
     pub resources: Resources,
     pub ssh_public_key: String,
     pub interfaces: Vec<InterfaceSpec>,

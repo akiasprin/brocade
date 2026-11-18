@@ -1,6 +1,7 @@
 //! Cube-specific node execution. Console ownership and quotas remain in Store.
 //! RPC types are generated from the pinned Cube and containerd protocol sources.
 
+mod artifacts;
 mod backend;
 mod config;
 mod files;
@@ -18,7 +19,11 @@ mod storage;
 mod terminal;
 
 pub use backend::{report, Backend};
-pub use terminal::{TerminalCommand, TerminalEvent, TerminalSession};
+pub use observation::probe_tcp;
+pub use terminal::{
+    connect_terminal, revoke_terminal, TerminalCommand, TerminalEvent, TerminalSession,
+    TerminalTarget,
+};
 
 pub type Result<T> = std::result::Result<T, String>;
 

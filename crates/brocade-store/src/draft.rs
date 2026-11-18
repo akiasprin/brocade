@@ -429,6 +429,37 @@ fn selector_summary(selector: &DestMatch) -> String {
     }
 }
 
+fn validation_locations(ops: &[ModelOp]) -> std::collections::BTreeSet<String> {
+    ops.iter()
+        .filter_map(|op| match op {
+            ModelOp::PutStep {
+                app_id,
+                chain_id,
+                node_id,
+                ..
+            } => Some(format!("{app_id}/{chain_id}/{node_id}")),
+            ModelOp::SetNodeEgressDns { node_id, .. }
+            | ModelOp::ReorderNodeEgressDns { node_id, .. } => Some(format!("dns/{node_id}")),
+            ModelOp::UpdateSettings { .. } => Some("settings".into()),
+            _ => None,
+        })
+        .collect()
+}
+fn validate_written_selectors(
+    snapshot: &brocade_core::model::ModelSnapshot,
+    locations: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let issues = brocade_core::rule_validation::validate_snapshot(snapshot)
+        .into_iter()
+        .filter(|i| locations.contains(&i.location))
+        .collect::<Vec<_>>();
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(StoreError::RuleValidation(issues))
+    }
+}
+
 /// Commit a draft: a run of operations completing in one transaction, stamping one revision.
 ///
 /// Any one of them failing rolls the batch back — half a rule table landing in the database is
@@ -440,6 +471,23 @@ pub async fn apply_ops(
     ops: Vec<ModelOp>,
     note: Option<String>,
 ) -> Result<ApplyDraftResult> {
+    apply_ops_checked(pool, actor, ops, note, |_, _| async { Ok(()) }).await
+}
+
+/// The validator runs against the locked transaction's actual before/after state. Returning an
+/// error rolls back the whole batch, including its revision and subscription side effects.
+pub async fn apply_ops_checked<F, Fut>(
+    pool: &PgPool,
+    actor: &AdminContext,
+    ops: Vec<ModelOp>,
+    note: Option<String>,
+    validate: F,
+) -> Result<ApplyDraftResult>
+where
+    F: FnOnce(brocade_core::model::ModelSnapshot, brocade_core::model::ModelSnapshot) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let locations = validation_locations(&ops);
     let note = crate::console::note_or(note.as_deref(), || match ops.len() {
         0 => "空提交".to_owned(),
         1 => format!("提交：{}", ops[0].describe()),
@@ -448,6 +496,7 @@ pub async fn apply_ops(
 
     let mut tx = timing::measure("pool_begin", pool.begin()).await?;
     let previous = crate::console::lock_control_state(&mut tx).await?;
+    let before = crate::materialize::load_current_snapshot_tx(&mut tx).await?;
     let revision_id = timing::measure(
         "insert_revision",
         crate::console::insert_revision(&mut tx, actor.operator_id(), &note),
@@ -471,6 +520,13 @@ pub async fn apply_ops(
     {
         changed += 1;
     }
+    let after = crate::materialize::load_current_snapshot_tx(&mut tx).await?;
+    validate_written_selectors(&after, &locations)?;
+    validate(
+        crate::console::scope_snapshot(actor, before),
+        crate::console::scope_snapshot(actor, after),
+    )
+    .await?;
     let revision_id = timing::measure(
         "commit_revision",
         crate::console::commit_revision(&mut tx, revision_id, previous, changed > 0),
@@ -523,6 +579,7 @@ pub(crate) async fn draft_snapshot(
     actor: &AdminContext,
     ops: Vec<ModelOp>,
 ) -> Result<brocade_core::model::ModelSnapshot> {
+    let locations = validation_locations(&ops);
     let mut tx = timing::measure("pool_begin", pool.begin()).await?;
     // Borrow the current revision number rather than opening a new one. Every table's
     // `created_revision` has a foreign key into revisions, so this run needs a number that
@@ -549,6 +606,7 @@ pub(crate) async fn draft_snapshot(
         crate::materialize::load_current_snapshot_tx(&mut tx),
     )
     .await?;
+    validate_written_selectors(&snapshot, &locations)?;
     // Read and discard. Not a commit — a preview is read-only in meaning, whatever write
     // permissions the caller holds.
     timing::measure("rollback_preview", tx.rollback()).await?;

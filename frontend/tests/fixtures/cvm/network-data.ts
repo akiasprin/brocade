@@ -71,6 +71,7 @@ export function nicCatalog(manage = true, instance?: CvmInstance): CvmNicCatalog
             }))
         : [],
     can_manage: manage,
+    provider_names: { [spec.provider_node]: 'GreenVPS · 香港网络' },
     publications: [{ id: 'network-hk', revision: 2, admitting: true, retired: false, spec: structuredClone(spec) }],
     providers: manage
       ? [
@@ -89,6 +90,9 @@ export function nicCatalog(manage = true, instance?: CvmInstance): CvmNicCatalog
               error: null,
               entries: true,
               route_service: true,
+              entry_host_l3: true,
+              entry_xray: true,
+              entry_phantun: true,
             },
           },
         ]

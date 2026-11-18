@@ -11,8 +11,9 @@ import (
 	"errors"
 	"fmt"
 	tasks "github.com/containerd/containerd/api/services/tasks/v1"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"golang.org/x/sys/unix"
-	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
 	"os"
 	"path/filepath"
@@ -30,7 +31,9 @@ type Client struct {
 func (s *Client) Exec(parent context.Context, runtime string, readJSON bool, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
 	defer cancel()
-	ctx = metadata.AppendToOutgoingContext(ctx, "containerd-namespace", "default")
+	// Cubelet uses an in-memory task client: outgoing gRPC metadata alone does not
+	// carry its namespace. The standard context helper also covers the remote client.
+	ctx = namespaces.WithNamespace(ctx, "default")
 	dir, err := os.MkdirTemp(s.StateDir, ".guest-io-")
 	if err != nil {
 		return nil, errors.New("Guest output directory unavailable")
@@ -137,12 +140,12 @@ func (s *Client) Exec(parent context.Context, runtime string, readJSON bool, arg
 	defer func() {
 		cleanup, done := context.WithTimeout(context.Background(), 5*time.Second)
 		defer done()
-		cleanup = metadata.AppendToOutgoingContext(cleanup, "containerd-namespace", "default")
+		cleanup = namespaces.WithNamespace(cleanup, "default")
 		_, _ = s.Tasks.Kill(cleanup, &tasks.KillRequest{ContainerID: runtime, ExecID: execID, Signal: uint32(syscall.SIGKILL)})
 		_, _ = s.Tasks.DeleteProcess(cleanup, &tasks.DeleteProcessRequest{ContainerID: runtime, ExecID: execID})
 	}()
 	if _, err = s.Tasks.Exec(ctx, &tasks.ExecProcessRequest{ContainerID: runtime, ExecID: execID, Terminal: true, Stdin: stdinPath, Stdout: path, Spec: &anypb.Any{TypeUrl: "types.containerd.io/opencontainers/runtime-spec/1/Process", Value: spec}}); err != nil {
-		return nil, errors.New("Guest execution setup failed")
+		return nil, fmt.Errorf("Guest execution setup failed (%s, cancelled=%t)", status.Code(err), ctx.Err() != nil)
 	}
 	if _, err = s.Tasks.Start(ctx, &tasks.StartRequest{ContainerID: runtime, ExecID: execID}); err != nil {
 		return nil, errors.New("Guest execution start failed")

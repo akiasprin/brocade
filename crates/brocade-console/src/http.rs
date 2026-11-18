@@ -2,6 +2,7 @@ mod agent_rpc;
 mod clash_rules;
 #[cfg(feature = "cvm")]
 mod cvm;
+mod geodata;
 mod geosite;
 mod ip_maintenance;
 mod observations;
@@ -344,7 +345,7 @@ pub struct AppState {
     store: PgStore,
     bootstrap_credential: Option<BootstrapCredential>,
     geoip: crate::geoip::GeoIpLookup,
-    geosite: crate::geosite::Lookup,
+    geodata: crate::geodata::Lookup,
     dist: AgentDistribution,
     // Optional dedicated subscription origin. When absent, subscriptions follow the effective
     // Agent public URL, including a value changed live from the settings page.
@@ -560,7 +561,7 @@ impl AppState {
             store,
             bootstrap_credential: None,
             geoip: crate::geoip::GeoIpLookup::default(),
-            geosite: crate::geosite::Lookup::default(),
+            geodata: crate::geodata::Lookup::default(),
             subscription_public_url_override,
             subscription_rate: Arc::new(Mutex::new(HashMap::new())),
             quota_wake,
@@ -928,6 +929,7 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
     }
     const PUBLIC_PATHS: &[&str] = &[
         "/routing/geosite",
+        "/routing/geodata",
         "/ip-maintenance/regions",
         "/healthz",
         "/auth/state",
@@ -963,6 +965,7 @@ fn public_may(method: &axum::http::Method, path: &str) -> bool {
         "/vpngate/runtimes",
     ];
     PUBLIC_PATHS.contains(&path)
+        || path.starts_with("/routing/geodata/")
         // `/compile/{revision}` and `/load/nodes/{node_id}`: the id is a path segment, so these
         // two cannot be written as exact strings.
         || path.starts_with("/compile/")
@@ -1076,6 +1079,11 @@ fn is_user_cvm_path(method: &axum::http::Method, path: &str) -> bool {
     }
     let parts: Vec<_> = path.trim_start_matches('/').split('/').collect();
     match parts.as_slice() {
+        ["cvm", "chain-egress"] => *method == Method::GET,
+        ["cvm", id, "artifacts", "preview"] if brocade_deployment::cvm::valid_id(id) => {
+            *method == Method::POST
+        }
+        ["cvm", id, "artifacts"] if brocade_deployment::cvm::valid_id(id) => *method == Method::GET,
         ["cvm"] | ["cvm", "entries"] => *method == Method::POST,
         ["cvm", "entries", id] if brocade_deployment::cvm::valid_id(id) => {
             *method == Method::DELETE
@@ -1331,13 +1339,17 @@ fn masking_failed(detail: &str) -> Response {
 fn cvm_admin_routes() -> Router<AppState> {
     Router::new()
         .route("/cvm", get(cvm::workspace).post(cvm::create))
+        .route("/cvm/adopt", post(cvm::adopt))
         .route("/cvm/quota", put(cvm::quota))
         .route(
             "/cvm/quota/network/preview",
             post(cvm::network_quota_preview),
         )
         .route("/cvm/readings", get(cvm::readings))
+        .route("/cvm/chain-egress", get(cvm::chain_catalog))
         .route("/cvm/{id}", get(cvm::instance))
+        .route("/cvm/{id}/artifacts", get(cvm::artifacts))
+        .route("/cvm/{id}/artifacts/preview", post(cvm::compile_preview))
         .route("/cvm/{id}/monitoring", get(cvm::monitoring))
         .route("/cvm/{id}/terminal", post(cvm::terminal::create))
         .route("/cvm/hosts/{node}/terminal", put(cvm::terminal::policy))
@@ -1357,6 +1369,7 @@ fn cvm_admin_routes() -> Router<AppState> {
             get(cvm::entries::board).post(cvm::entries::create),
         )
         .route("/cvm/entries/{id}", delete(cvm::entries::release))
+        .route("/cvm/network-logs", get(cvm::entries::diagnostics))
         .route("/cvm/entries/{id}/target", put(cvm::entries::repoint))
         .route("/cvm/{id}/entries", get(cvm::entries::instance_entries))
         .route(
@@ -1409,6 +1422,10 @@ fn cvm_agent_routes() -> Router<AppState> {
             get(cvm::terminal::agent_stream),
         )
         .route("/agent/v1/cvm/inventory", post(cvm::inventory))
+        .route(
+            "/agent/v1/cvm/image-manifests",
+            post(cvm::image_manifest).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
         .route("/agent/v1/cvm/nics/inventory", post(cvm::nics::inventory))
         .route("/agent/v1/cvm/nics/desired", get(cvm::nics::desired))
         .route("/agent/v1/cvm/nics/report", post(cvm::nics::report))
@@ -1442,6 +1459,9 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/console/version", get(console_version))
         .route("/routing/geosite", get(geosite::matches))
+        .route("/routing/geodata/catalog", get(geodata::catalog))
+        .route("/routing/geodata/relations", post(geodata::relations))
+        .route("/routing/geodata/{kind}/{code}", get(geodata::preview))
         .route("/diagnostics/performance", get(performance_diagnostics))
         .route("/auth/state", get(auth_state))
         .route("/auth/init", post(auth_init))
@@ -1621,6 +1641,7 @@ fn admin_router_with_state(state: AppState) -> Router {
         // the real write path and authorization follows the write.
         .route("/model/preview", post(preview_draft))
         .route("/model/apply", post(apply_draft))
+        .route("/model/validate", post(geodata::validate_draft))
         .route("/model/preview/artifact", post(preview_draft_artifact))
         .route("/compile/{revision_id}", get(compile_revision))
         .route("/ip-maintenance/regions", get(ip_maintenance::catalog))
@@ -1725,6 +1746,10 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/nodes", delete(remove_retired_nodes))
         .route("/nodes/{node_id}", put(update_node))
         .route("/nodes/{node_id}/region", put(update_node_region))
+        .route(
+            "/nodes/{node_id}/notifications",
+            put(update_node_notifications),
+        )
         .route("/nodes/{node_id}/status", put(update_node_status))
         .route("/nodes/{node_id}/isolate", post(isolate_node))
         .route("/nodes/{node_id}/lifecycle/abandon", post(abandon_node))
@@ -3093,9 +3118,12 @@ async fn apply_draft(
             require_admin_context(&state, &headers, AdminPermission::Edit),
         )
         .await?;
+        let touched = geodata::touched(&request.ops);
         let result = state
             .store
-            .apply_draft(&admin, request.ops, request.note)
+            .apply_draft_checked(&admin, request.ops, request.note, |before, after| {
+                geodata::validate(&state, before, after, touched)
+            })
             .await?;
         // The durable queue decides whether the draft actually changed grants.
         state.grants_wake.notify_one();
@@ -5371,6 +5399,10 @@ async fn update_settings(
     require_complete_settings(&value)?;
     let settings: ModelSettings = serde_json::from_value(value)
         .map_err(|error| StoreError::InvalidData(format!("invalid settings: {error}")))?;
+    let before = state.store.materialize_snapshot(None).await?;
+    let mut after = before.clone();
+    after.settings = settings.clone();
+    geodata::validate(&state, before, after, Default::default()).await?;
     let result = state
         .store
         .update_settings_at_revision(&admin, settings, expected_revision)
@@ -6009,6 +6041,22 @@ async fn update_node_region(
         state
             .store
             .update_node_region_override(&admin, &node_id, request)
+            .await?,
+    )
+    .into_response())
+}
+
+async fn update_node_notifications(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<brocade_store::UpdateNodeNotificationSettings>,
+) -> ApiResult<Response> {
+    let admin = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    Ok(Json(
+        state
+            .store
+            .update_node_notification_settings(&admin, &node_id, request)
             .await?,
     )
     .into_response())
@@ -10029,6 +10077,9 @@ impl From<StoreError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let ApiError::Store(StoreError::RuleValidation(ref issues)) = self {
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": issues.first().map(|i| i.message.as_str()).unwrap_or("规则无效"), "issues": issues}))).into_response();
+        }
         let (status, message, reference) = match self {
             ApiError::Provider(message) => (StatusCode::BAD_GATEWAY, message, None),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_owned(), None),
@@ -11397,6 +11448,18 @@ mod tests {
         }
         assert!(!user_may(&Method::GET, "/cvm/cvm-owned/monitoring/extra"));
         assert!(public_may(&Method::GET, "/cvm/cvm-owned/monitoring"));
+    }
+
+    #[test]
+    #[cfg(feature = "cvm")]
+    fn user_cvm_artifacts_reach_owner_checks_without_becoming_a_public_route() {
+        use axum::http::Method;
+        assert!(user_may(&Method::GET, "/cvm/cvm-owned/artifacts"));
+        assert!(!public_may(&Method::GET, "/cvm/cvm-owned/artifacts"));
+        assert!(!user_may(&Method::GET, "/cvm/cvm-owned/artifacts/extra"));
+        for method in [Method::POST, Method::PUT, Method::DELETE] {
+            assert!(!user_may(&method, "/cvm/cvm-owned/artifacts"));
+        }
     }
 
     #[test]

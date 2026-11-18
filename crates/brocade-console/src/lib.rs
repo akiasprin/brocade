@@ -4,6 +4,7 @@ pub mod certs;
 pub mod dns;
 mod embedded_xray;
 mod forwarding_probe;
+mod geodata;
 pub mod geoip;
 mod geosite;
 mod grant_probe;

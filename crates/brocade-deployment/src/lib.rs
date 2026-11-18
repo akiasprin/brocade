@@ -18,3 +18,5 @@ pub mod source_access;
 pub mod unlock_probe;
 
 pub mod product;
+
+pub mod client_proxy;

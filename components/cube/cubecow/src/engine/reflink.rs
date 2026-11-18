@@ -116,6 +116,7 @@ pub(super) enum NameKind {
 pub struct ReflinkEngine {
     // Historical public type name; plain mode shares volume operations only.
     plain: bool,
+    thin_provision: bool,
     reserve_bytes: u64,
     _plain_lock: Option<File>,
     /// `<root_dir>/volumes/`. The engine never touches anything outside
@@ -175,6 +176,7 @@ impl ReflinkEngine {
                 name_index: RwLock::new(name_index),
                 metrics,
                 plain: true,
+                thin_provision: config.backend.plain.thin_provision,
                 reserve_bytes: config.backend.plain.reserve_bytes,
                 _plain_lock: Some(lock),
             });
@@ -227,6 +229,7 @@ impl ReflinkEngine {
 
         Ok(Self {
             plain: false,
+            thin_provision: false,
             reserve_bytes: 0,
             _plain_lock: None,
             volumes_dir,
@@ -303,7 +306,7 @@ impl ReflinkEngine {
             ));
         }
         let meta = if self.plain {
-            super::plain::volume_metadata(&main)?
+            super::plain::volume_metadata(&main, self.thin_provision)?
         } else {
             std::fs::metadata(&main).map_err(|e| {
                 if e.kind() == ErrorKind::NotFound {
@@ -415,8 +418,13 @@ impl Engine for ReflinkEngine {
                     "plain volume count reached its limit".into(),
                 ));
             }
-            let result =
-                super::plain::create(&self.volumes_dir, name, size_bytes, self.reserve_bytes);
+            let result = super::plain::create(
+                &self.volumes_dir,
+                name,
+                size_bytes,
+                self.reserve_bytes,
+                self.thin_provision,
+            );
             // A post-rename fsync failure is uncertain creation, not absence.
             // Keep the binding visible for inspection rather than allowing a
             // failed create to release a reservation for an existing disk.
@@ -1489,6 +1497,7 @@ mod tests {
         std::fs::create_dir_all(&volumes_dir).unwrap();
         ReflinkEngine {
             plain: false,
+            thin_provision: false,
             reserve_bytes: 0,
             _plain_lock: None,
             volumes_dir,

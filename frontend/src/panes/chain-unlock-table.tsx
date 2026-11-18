@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, type CSSProperties } from 'react';
 import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
 import { fetchChainUnlockProbes, type SnapshotApp, type SnapshotChain } from '../api';
 import { ErrorBox } from '../ui/bits';
@@ -16,6 +16,8 @@ const categories = CATEGORIES.map(category => ({
 }));
 const services = categories.flatMap(category => category.services);
 const shortNames = { youtube_premium: 'Premium', prime_video: 'Prime' };
+/** 列宽封顶按服务列数计算，与上面的 SERVICES 同源。 */
+const layout = { '--cut-services': services.length } as CSSProperties;
 export interface ChainUnlockGroup {
   app: SnapshotApp;
   chains: { chain: SnapshotChain; disabled: boolean; tone: string; title: string }[];
@@ -72,7 +74,7 @@ export function ChainUnlockTable({
     query.data?.pages.flatMap(page => page.chains.map(item => [`${item.app_id}/${item.chain_id}`, item] as const)),
   );
   return (
-    <>
+    <div className="chain-unlock" style={layout}>
       {query.error && (
         <div className="chain-unlock-error">
           <ErrorBox error={query.error} />
@@ -180,6 +182,7 @@ export function ChainUnlockTable({
                   onOpen(group.app.id, chain.id);
                 };
                 const detail = summary?.detail;
+                const checking = testable && !query.isError && summary?.tone === 'running';
                 return (
                   <tr key={chain.id} className="cut-row" data-off={row.disabled || undefined} onClick={open}>
                     <th scope="row" className="cut-chain">
@@ -233,11 +236,14 @@ export function ChainUnlockTable({
                     )}
                     <td className="cut-when" data-tone={summary?.tone} title={detail} aria-label={detail || undefined}>
                       {summary?.automatic && <small className="cut-auto">不分族</small>}
-                      {query.isError && summary?.hasResults
-                        ? '刷新失败'
-                        : !testable
-                          ? '—'
-                          : (state ?? (summary?.at != null ? <Ago at={summary.at} /> : '—'))}
+                      <span className="cut-when-state">
+                        {checking && <Glyph tone="wait" />}
+                        {query.isError && summary?.hasResults
+                          ? '刷新失败'
+                          : !testable
+                            ? '—'
+                            : (state ?? (summary?.at != null ? <Ago at={summary.at} /> : '—'))}
+                      </span>
                     </td>
                   </tr>
                 );
@@ -247,16 +253,30 @@ export function ChainUnlockTable({
         </table>
       </div>
       <p className="chain-unlock-legend">
-        <Glyph tone="ok" />
-        可用 <Glyph tone="part" />
-        一族受限或异常 <Glyph tone="no" />
-        不可用 <Glyph tone="unknown" />
-        未取得结果 <i className="cut-dot" />
-        较上次变化
         <span>
+          <Glyph tone="ok" />
+          可用
+        </span>
+        <span>
+          <Glyph tone="part" />
+          一族受限或异常
+        </span>
+        <span>
+          <Glyph tone="no" />
+          不可用
+        </span>
+        <span>
+          <Glyph tone="unknown" />
+          未取得结果
+        </span>
+        <span>
+          <i className="cut-dot" />
+          较上次变化
+        </span>
+        <span className="chain-unlock-legend-note">
           地区以 IPv4 为主；不同时另列 v6 地区。IPv6 无解析地址或无可用出站时采用 IPv4 结果。Reddit 显示 CDN 节点代码。
         </span>
       </p>
-    </>
+    </div>
   );
 }

@@ -6,8 +6,22 @@ import { ManagedNetworking, ContainerAccessPanel } from '../../src/panes/cvm/net
 import { MountNicDialog, RoutesDialog, TransportDialog } from '../../src/panes/cvm/network-dialogs';
 import { cvmInstance, cvmWorkspace } from '../fixtures/cvm/data';
 import { nicCatalog, nicState } from '../fixtures/cvm/network-data';
+import { artifactHistory } from '../fixtures/cvm/artifact-data';
+import { chainCatalog } from '../fixtures/cvm/chain-data';
 import { entryBoard } from '../fixtures/cvm/entry-data';
 import type { CvmEntry } from '../../src/api';
+import { networkProviderName } from '../../src/panes/cvm/network-names';
+
+it('uses scoped display names without capabilities and preserves old Console fallbacks', () => {
+  const catalog = nicCatalog(false);
+  expect(catalog.providers).toEqual([]);
+  expect(networkProviderName(catalog, 'remote-ingress')).toBe('GreenVPS · 香港网络');
+  const legacy = nicCatalog();
+  delete legacy.provider_names;
+  expect(networkProviderName(legacy, 'remote-ingress')).toBe('GreenVPS · 香港网络');
+  expect(networkProviderName(legacy, 'hk-hkix', cvmWorkspace('list').hosts)).toBe('香港 HKIX');
+  expect(networkProviderName(catalog, 'toString')).toBe('toString');
+});
 
 let entries: CvmEntry[] = [];
 const clients: QueryClient[] = [];
@@ -18,14 +32,21 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 function mount(children: ReactNode, status = 503) {
-  const writes: { url: string; body: Record<string, unknown> }[] = [];
+  const writes: { url: string; body: Record<string, unknown>; inputSha: string | null }[] = [];
   const instance = cvmInstance();
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input, init) => {
       const url = String(input);
+      if (url.endsWith('/artifacts/preview'))
+        return Response.json({ instance, artifacts: artifactHistory(), no_op: false });
+      if (url.startsWith('/cvm/chain-egress')) return Response.json(chainCatalog(cvmWorkspace(), instance.desired.id));
       if (init?.method && init.method !== 'GET') {
-        writes.push({ url, body: JSON.parse(String(init.body)) });
+        writes.push({
+          url,
+          body: JSON.parse(String(init.body)),
+          inputSha: new Headers(init.headers).get('x-brocade-cvm-input-sha256'),
+        });
         return Response.json({ error: '服务端设置已变化，请核查后重试' }, { status });
       }
       if (url === '/cvm/networks') return Response.json(nicCatalog());
@@ -49,6 +70,8 @@ it('mounts a reusable publication using the real intersection and retains reques
   expect((dns as HTMLInputElement).checked).toBe(false);
   fireEvent.click(dns);
   const save = screen.getByRole('button', { name: '挂载并分配地址' });
+  fireEvent.click(screen.getByRole('button', { name: '预览产物差异' }));
+  await waitFor(() => expect((save as HTMLButtonElement).disabled).toBe(false));
   fireEvent.click(save);
   await screen.findByText(/服务端设置已变化/);
   fireEvent.click(save);
@@ -75,6 +98,8 @@ it('keeps edited routes after a conflict and saves the routing object independen
   const { writes } = mount(<RoutesDialog instance={instance} catalog={nicCatalog()} onClose={() => {}} />, 409);
   const priority = screen.getByRole('spinbutton', { name: 'IPv4 优先级' });
   fireEvent.change(priority, { target: { value: '7' } });
+  fireEvent.click(screen.getByRole('button', { name: '预览产物差异' }));
+  await waitFor(() => expect((screen.getByRole('button', { name: '保存' }) as HTMLButtonElement).disabled).toBe(false));
   fireEvent.click(screen.getByRole('button', { name: '保存' }));
   await screen.findByText(/服务端设置已变化/);
   expect((priority as HTMLInputElement).value).toBe('7');
@@ -116,12 +141,23 @@ it('recommends only active entries to SSH and keeps the management address as an
   const instance = cvmInstance();
   entries = entryBoard(cvmWorkspace('detail'), 'detail').entries;
   // A pending SSH entry is not offered; the UDP entry never is.
-  entries.push({ ...entries[0], id: 'entry-pending', state: 'pending', mode: { kind: 'l4', protocol: 'tcp', listen_port: 30023, target_port: 22 } });
+  entries.push({
+    ...entries[0],
+    id: 'entry-pending',
+    state: 'pending',
+    mode: { kind: 'l4', protocol: 'tcp', listen_port: 30023, target_port: 22 },
+  });
   mount(<ContainerAccessPanel instance={instance} redacted={false} />);
   const panel = await screen.findByRole('region', { name: 'SSH 登录' });
   await waitFor(() => expect(panel.textContent).toContain('ssh -l cube -p 30022 -- 203.0.113.20'));
-  const options = within(panel).getAllByRole('option').map(option => option.textContent);
-  expect(options).toEqual(['TCP 入口 · 203.0.113.20:30022', '整 IP 入口 · 198.51.100.30:22', '宿主内管理地址 · 192.168.0.21:22']);
+  const options = within(panel)
+    .getAllByRole('option')
+    .map(option => option.textContent);
+  expect(options).toEqual([
+    'TCP 入口 · 203.0.113.20:30022',
+    '整 IP 入口 · 198.51.100.30:22',
+    '宿主内管理地址 · 192.168.0.21:22',
+  ]);
   expect(panel.textContent).not.toContain('30023');
   entries = [];
 });
@@ -154,4 +190,30 @@ it('bulk compatible updates keep one stable request per container across an unce
     expected_generation: 1,
     updates: [{ interface_id: 'nic-business', publication_revision: 2, reallocate: false }],
   });
+});
+
+it('retargets a NIC route to a chain without retaining NIC identity and invalidates the reviewed input on edits', async () => {
+  const instance = cvmInstance();
+  const { writes } = mount(<RoutesDialog instance={instance} catalog={nicCatalog()} onClose={() => {}} />);
+  await screen.findAllByRole('option', { name: '洛杉矶 · 三跳线路' });
+  const via = screen.getAllByRole('combobox', { name: '经由' })[0];
+  expect(via.querySelectorAll('optgroup')).toHaveLength(2);
+  fireEvent.change(via, { target: { value: 'chain:chain-us' } });
+  const save = screen.getByRole('button', { name: '保存' }) as HTMLButtonElement;
+  expect(save.disabled).toBe(true);
+  fireEvent.click(screen.getByRole('button', { name: '预览产物差异' }));
+  await waitFor(() => expect(save.disabled).toBe(false));
+  fireEvent.change(screen.getAllByRole('textbox', { name: '目标 IP／网段' })[0], {
+    target: { value: '203.0.113.0/24' },
+  });
+  expect(save.disabled).toBe(true);
+  fireEvent.click(screen.getByRole('button', { name: '预览产物差异' }));
+  await waitFor(() => expect(save.disabled).toBe(false));
+  fireEvent.click(save);
+  await waitFor(() => expect(writes).toHaveLength(1));
+  const routes = writes[0].body.routes as { routes: Record<string, unknown>[] };
+  expect(routes.routes[0]).toMatchObject({ destination: '203.0.113.0/24', chain_id: 'chain-us' });
+  expect(routes.routes[0]).not.toHaveProperty('interface_id');
+  expect(writes[0].body).not.toHaveProperty('interfaces');
+  expect(writes[0].inputSha).toBe(artifactHistory().current!.input_sha256);
 });

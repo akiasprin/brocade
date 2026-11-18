@@ -3,6 +3,7 @@ import type { NodeAgentStateItem } from '../../api';
 import { ErrorBox, SegSwitch } from '../../ui/bits';
 import { DialogClose, DialogLayer } from '../../ui/dialog';
 import { Icon, PanelTitle } from '../../ui/icons';
+import { FieldLoading, PanelLoading } from '../../ui/loading';
 import { RhythmLegend, Rhythm, RoundRows, useDayRuns, useDayStats, useRoundSheet } from './kit';
 import { PolicyGroups, SaveBar } from './policy';
 import { ACTION_NAME, CareProvider, dayClock, fmtMiB, mmss, useCare, useRuns } from './state';
@@ -58,7 +59,9 @@ function RecordsDialog({ onClose }: { onClose: () => void }) {
             {runs.error ? (
               <ErrorBox error={runs.error} />
             ) : runs.isPending ? (
-              <p className="care-empty">正在读取记录…</p>
+              <div className="care-empty">
+                <PanelLoading label="正在读取记录…" />
+              </div>
             ) : (
               <RoundRows runs={list} onOpen={sheet.open} />
             )}
@@ -160,7 +163,7 @@ function MaintenanceSummary() {
       {(care.error || care.actions.error || care.edit.error) && (
         <ErrorBox error={care.error ?? care.actions.error ?? care.edit.error} />
       )}
-      <div className="fgrid one">
+      <div className={`fgrid one${care.view ? ' care-config-ready' : ''}`}>
         <div className="row">
           <span className="k">自动养护</span>
           <span className="v">
@@ -195,7 +198,9 @@ function MaintenanceSummary() {
               ) : (
                 runButton
               )}
-              <b role="status">{status}</b>
+              <b role="status">
+                {!care.view && !care.error ? <FieldLoading label={status} announce={false} /> : status}
+              </b>
               <span className="sp" />
               <Trail onClick={() => setRecords(true)}>记录</Trail>
             </span>

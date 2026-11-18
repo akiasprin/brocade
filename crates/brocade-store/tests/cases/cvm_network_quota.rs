@@ -175,8 +175,8 @@ async fn cvm_network_quota_serializes_grants_holds_shrinks_and_protects_memory()
         .await
         .unwrap()
         .is_empty());
-    // A committed network grant constrains subsequent Guest memory, and a
-    // committed Guest allocation invalidates an earlier network preview.
+    // Logical Guest RAM does not consume the independent network table budget.
+    // Stale actual network changes must still roll back the entire quota update.
     grant(&db, "alice", 100000).await;
     let desired = db.store.cvm_network_quota_desired("n1").await.unwrap();
     db.store
@@ -208,7 +208,7 @@ async fn cvm_network_quota_serializes_grants_holds_shrinks_and_protects_memory()
             .unwrap()
             .max_instances,
         1,
-        "global quota changes must roll back with stale network budget"
+        "instance topology changes still fence stale quota previews atomically"
     );
     let desired = db.store.cvm_network_quota_desired("n1").await.unwrap();
     assert!(desired
@@ -216,7 +216,38 @@ async fn cvm_network_quota_serializes_grants_holds_shrinks_and_protects_memory()
         .iter()
         .any(|a| a.instances.contains(&vm.desired.id)));
     let after = preview(&db, "alice", 100001).await;
-    assert!(after.maximum < stale.maximum);
+    assert_eq!(after.maximum, stale.maximum);
+    let mut stale_quota = quota();
+    stale_quota.max_instances = 3;
+    stale_quota.host_network_quotas = vec![change(&after)];
+    grant(&db, "alice", 100002).await;
+    assert!(db
+        .store
+        .set_cvm_quota(&system_admin(), stale_quota)
+        .await
+        .is_err());
+    assert_eq!(
+        db.store
+            .cvm_workspace(&system_admin())
+            .await
+            .unwrap()
+            .quotas
+            .into_iter()
+            .find(|q| q.user_id == "alice")
+            .unwrap()
+            .max_instances,
+        1
+    );
+    assert!(saved.hosts[0].capabilities.create);
+    assert_eq!(
+        saved.hosts[0]
+            .capabilities
+            .resource_limits
+            .as_ref()
+            .unwrap()
+            .max_memory_bytes,
+        4 * 1024 * 1024 * 1024
+    );
     let memory = saved.hosts[0].capabilities.allocatable_memory_bytes;
     assert!(
         memory < capacity().memory_budget_bytes,

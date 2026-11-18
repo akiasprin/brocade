@@ -3,6 +3,7 @@
 Called by scripts/build-release.py. This does not compile a second control plane,
 fetch mutable images, or import a developer machine's running Cube installation.
 """
+
 import importlib.util
 import json
 from pathlib import Path
@@ -32,7 +33,9 @@ def prepare(root, build_manifest, assets, output):
     if architecture == 'x86_64' and pvm is None:
         raise stack.StackError('new x86_64 CVM bundles require paired PVM host/Guest assets for automatic fallback')
     extra_assets = ('vmlinux-pvm', 'pvm-host.deb') if pvm is not None else ()
-    if asset_manifest.get('architecture') != architecture or set(asset_manifest.get('files', {})) != set(ASSETS + extra_assets):
+    if asset_manifest.get('architecture') != architecture or set(asset_manifest.get('files', {})) != set(
+        ASSETS + extra_assets
+    ):
         raise stack.StackError('fixed Guest assets must match the runtime architecture and complete asset inventory')
     for name in ASSETS + extra_assets:
         source = assets / name
@@ -40,12 +43,14 @@ def prepare(root, build_manifest, assets, output):
             raise stack.StackError('Guest asset SHA-256 mismatch')
     with tempfile.TemporaryDirectory(prefix='package-', dir=build_manifest.parent) as temporary:
         tree = Path(temporary)
+
         def copy(source, name):
             target = tree / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
             target.chmod(0o755 if '/bin/' in name else 0o644)
             return target
+
         for script in ('cvm-stack.py', 'cvm-host.py'):
             copy(root / 'scripts' / script.replace('-', '_'), 'runtime/bin/' + script)
         for name, target in {
@@ -81,7 +86,9 @@ def prepare(root, build_manifest, assets, output):
         for component, version in versions.items():
             (tree / 'runtime' / component / 'version').write_text(version + '\n')
         (tree / 'runtime/cube-shim/conf').mkdir()
-        (tree / 'runtime/cube-shim/conf/config-cube.toml').write_text('# Brocade managed runtime; boot assets are pinned per image.\n')
+        (tree / 'runtime/cube-shim/conf/config-cube.toml').write_text(
+            '# Brocade managed runtime; boot assets are pinned per image.\n'
+        )
         root_sha = stack.digest(assets / 'root.ext4')
         root_id = 'cvm-root-' + root_sha[:32]
         copy(assets / 'root.ext4', f'runtime/cubebox_os_image/{root_id}/{root_id}.ext4')
@@ -99,7 +106,10 @@ def prepare(root, build_manifest, assets, output):
                 if key.startswith('cube.master.rootfs.artifact.'):
                     del annotations[key]
                     continue
-                if any(part in key.lower() for part in ('appsnapshot', 'token', 'password', 'secret', 'credential', 'username')):
+                if any(
+                    part in key.lower()
+                    for part in ('appsnapshot', 'token', 'password', 'secret', 'credential', 'username')
+                ):
                     if annotations[key]:
                         raise stack.StackError('system manifest contains a snapshot binding or credential')
                     del annotations[key]
@@ -109,8 +119,7 @@ def prepare(root, build_manifest, assets, output):
         for key in list(annotations):
             if key.startswith('cube.master.rootfs.artifact.'):
                 del annotations[key]
-        annotations.update({'cube.master.rootfs.artifact.sha256': root_sha,
-                            'cube.master.rootfs.artifact.id': root_id})
+        annotations.update({'cube.master.rootfs.artifact.sha256': root_sha, 'cube.master.rootfs.artifact.id': root_id})
         annotations = system.setdefault('annotations', {})
         for component, version in versions.items():
             key = f'cube.master.components.{component}.version'
@@ -124,35 +133,77 @@ def prepare(root, build_manifest, assets, output):
         (config / 'system.json').write_text(json.dumps(system, sort_keys=True) + '\n')
         source = (root / 'components/cube/Cubelet/config/config.toml').read_text()
         for before, after in [
-            ('address = ":9998"', 'address = "127.0.0.1:8080"'),
+            ('address = ":9998"', f'address = "{stack.INSPECTION_ADDRESS}"'),
             ('address = "/data/cubelet/cubelet.sock"', 'address = "/run/cubelet/cubelet.sock"'),
             ('tcp_address = ":9999"', 'tcp_address = ""'),
             ('address = ":9966"', 'address = "127.0.0.1:9966"'),
             ('eth_name = "eth0"', 'eth_name = "@CVM_UPLINK@"'),
             ('cube_egress_admin_url = "http://127.0.0.1:9091"', 'cube_egress_admin_url = ""'),
-            ('vm_snapshot_specs_config = "/usr/local/services/cubetoolbox/cube-snapshot/spec.json"', 'vm_snapshot_specs_config = ""'),
+            (
+                'vm_snapshot_specs_config = "/usr/local/services/cubetoolbox/cube-snapshot/spec.json"',
+                'vm_snapshot_specs_config = ""',
+            ),
             ('no_sync = true', 'no_sync = false'),
         ]:
             if source.count(before) != 1:
                 raise stack.StackError('Cubelet config template changed; review the node packaging adaptation')
             source = source.replace(before, after)
-        source = source.replace('[plugins."io.cubelet.internal.v1.images"]',
-            '[plugins."io.cubelet.internal.v1.images"]\n    image_base_path = "/data/cubelet/system-images"')
+        source = source.replace(
+            '[plugins."io.cubelet.internal.v1.images"]',
+            '[plugins."io.cubelet.internal.v1.images"]\n    image_base_path = "/data/cubelet/system-images"',
+        )
         (config / 'cubelet.toml').write_text(source)
         (config / 'dynamic.yaml').write_bytes((root / 'components/cube/Cubelet/dynamicconf/conf.yaml').read_bytes())
-        capabilities = dict(create=True, delete=True, start=True, stop=True,
-            restart=True, reinstall=True, configure=True, stable_storage=True, retain_on_delete=False,
-            max_interfaces=3, hot_attach=True, hot_detach=True,
-            allocatable_vcpus=0, allocatable_memory_bytes=0, allocatable_disk_bytes=0,
+        capabilities = dict(
+            create=True,
+            delete=True,
+            start=True,
+            stop=True,
+            restart=True,
+            reinstall=True,
+            configure=True,
+            stable_storage=True,
+            retain_on_delete=False,
+            max_interfaces=3,
+            hot_attach=True,
+            hot_detach=True,
+            allocatable_vcpus=0,
+            allocatable_memory_bytes=0,
+            allocatable_disk_bytes=0,
             resource_limits=None,
-            images=[dict(id=system_id, name=asset_manifest['name'], version=asset_manifest['version'],
-                architecture=architecture, boot_mode='cube-oci', sha256='0'*64)],
-            network_sources=[dict(id='cube-contact', name='主网卡网络', kind='public', description='公网访问需授权端口映射')])
-        (config / 'cube.json').write_text(json.dumps(dict(storage_backend='xfs',
-            cubelet_socket='/run/cubelet/cubelet.sock', network_inspection_url='http://127.0.0.1:8080/v1/network/taps',
-            capabilities=capabilities, image_files={system_id: '@CVM_RELEASE@/generated/system.json'}), sort_keys=True) + '\n')
+            images=[
+                dict(
+                    id=system_id,
+                    name=asset_manifest['name'],
+                    version=asset_manifest['version'],
+                    architecture=architecture,
+                    boot_mode='cube-oci',
+                    sha256='0' * 64,
+                )
+            ],
+            network_sources=[
+                dict(id='cube-contact', name='主网卡网络', kind='public', description='公网访问需授权端口映射')
+            ],
+        )
+        (config / 'cube.json').write_text(
+            json.dumps(
+                dict(
+                    storage_backend='xfs',
+                    cubelet_socket='/run/cubelet/cubelet.sock',
+                    network_inspection_url=stack.INSPECTION_URL,
+                    capabilities=capabilities,
+                    image_files={system_id: '@CVM_RELEASE@/generated/system.json'},
+                ),
+                sort_keys=True,
+            )
+            + '\n'
+        )
         if pvm is not None:
-            if architecture != 'x86_64' or not isinstance(pvm, dict) or set(pvm) != {'host_kernel_release', 'boot_args'}:
+            if (
+                architecture != 'x86_64'
+                or not isinstance(pvm, dict)
+                or set(pvm) != {'host_kernel_release', 'boot_args'}
+            ):
                 raise stack.StackError('PVM assets require an explicit x86_64 host kernel release and boot arguments')
             copy(assets / 'pvm-host.deb', 'runtime/pvm/host.deb')
             copy(assets / 'vmlinux-pvm', 'runtime/cube-kernel-pvm/vmlinux')
@@ -167,15 +218,35 @@ def prepare(root, build_manifest, assets, output):
             pvm_cfg['image_files'] = {pvm_id: '@CVM_RELEASE@/generated/system-pvm.json'}
             (config / 'cube-pvm.json').write_text(json.dumps(pvm_cfg, sort_keys=True) + '\n')
             pvm = {**pvm, 'host_package': 'runtime/pvm/host.deb', 'guest_kernel': 'runtime/cube-kernel-pvm/vmlinux'}
-        (config / 'network.json').write_text(json.dumps(dict(state_dir='/data/cubelet/network-attachments-v2',
-            vmm_root='/run/vc/vm', max_interfaces=3, shim_version=build['shimVersion'],
-            shim_sha256=build['artifacts']['containerd-shim-cube-rs']['sha256']), sort_keys=True) + '\n')
+        (config / 'network.json').write_text(
+            json.dumps(
+                dict(
+                    state_dir='/data/cubelet/network-attachments-v2',
+                    vmm_root='/run/vc/vm',
+                    max_interfaces=3,
+                    shim_version=build['shimVersion'],
+                    shim_sha256=build['artifacts']['containerd-shim-cube-rs']['sha256'],
+                ),
+                sort_keys=True,
+            )
+            + '\n'
+        )
         if builder.source_digest(root) != build['sourceSHA256']:
             raise stack.StackError('CVM source changed while assembling the node bundle')
-        stack.pack(tree, output, architecture, build['sourceSHA256'], build['tools']['gnuLibcBaseline'],
-            {'guest_assets_manifest_sha256': stack.digest(assets / 'manifest.json'),
-             'package_recipe_sha256': stack.digest(root / 'scripts/cvm_package.py'),
-             'installer_sha256': stack.digest(root / 'scripts/cvm_stack.py'),
-             'runtime_build_manifest_sha256': stack.digest(build_manifest),
-             'host_transition_sha256': stack.digest(root / 'scripts/cvm_host.py'),
-             'shim_version': build['shimVersion']}, storage_backends=['xfs', 'plain'], pvm=pvm)
+        stack.pack(
+            tree,
+            output,
+            architecture,
+            build['sourceSHA256'],
+            build['tools']['gnuLibcBaseline'],
+            {
+                'guest_assets_manifest_sha256': stack.digest(assets / 'manifest.json'),
+                'package_recipe_sha256': stack.digest(root / 'scripts/cvm_package.py'),
+                'installer_sha256': stack.digest(root / 'scripts/cvm_stack.py'),
+                'runtime_build_manifest_sha256': stack.digest(build_manifest),
+                'host_transition_sha256': stack.digest(root / 'scripts/cvm_host.py'),
+                'shim_version': build['shimVersion'],
+            },
+            storage_backends=['xfs', 'plain'],
+            pvm=pvm,
+        )

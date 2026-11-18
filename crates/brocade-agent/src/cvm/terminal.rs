@@ -202,9 +202,11 @@ async fn bridge(
     socket: &mut WebSocket<crate::http::Stream>,
     offer: &wire::Offer,
 ) -> Result<(), String> {
-    let mut terminal = super::backend::current()
-        .ok_or("CVM executor is not initialized")?
-        .persistent_terminal(offer.clone())?;
+    let backend = super::backend::current().ok_or("CVM executor is not initialized")?;
+    let offer = offer.clone();
+    let mut terminal = tokio::task::spawn_blocking(move || backend.persistent_terminal(offer))
+        .await
+        .map_err(|_| "terminal initialization worker failed")??;
     bridge_io(socket, &terminal.input, &mut terminal.output).await
 }
 

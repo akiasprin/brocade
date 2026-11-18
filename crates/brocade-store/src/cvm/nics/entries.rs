@@ -4,10 +4,13 @@
 //! services see the same conflicts. Releasing an entry keeps the claims until the entry
 //! machine reports a generation without it.
 use super::*;
+use crate::cvm::releases::Scope;
 use std::net::Ipv4Addr;
 
-mod desired;
+pub(crate) mod desired;
+mod diagnostics;
 mod tunnels;
+pub use diagnostics::{CvmNetworkLogDomain, CvmNetworkLogs, CvmNetworkNodeLogs};
 
 const PUBLICATION_SELECT: &str =
     "SELECT id,revision,admitting,deleted,spec FROM cvm_entry_publications";
@@ -46,6 +49,10 @@ pub struct CvmEntryView {
     pub remote: bool,
     pub state: CvmEntryState,
     pub error: Option<String>,
+    #[serde(default)]
+    pub can_read_logs: bool,
+    #[serde(default)]
+    pub tunnel_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,14 +296,55 @@ async fn port_available(
     Ok(())
 }
 
-/// Dedicated entry addresses must not be the machine's own management addresses or
-/// the shared egress address of a NIC network.
+/// The backbone identity remains reserved. Public host addresses and shared NAT
+/// egress may also receive L3 forwarding: only new inbound flows are redirected.
 async fn reserved_addresses(
     tx: &mut Transaction<'_, Postgres>,
     node: &str,
 ) -> Result<BTreeSet<String>> {
-    Ok(sqlx::query_scalar::<_,String>("SELECT public_ipv4 FROM nodes WHERE id=$1 AND public_ipv4 IS NOT NULL UNION SELECT host(overlay_addr) FROM nodes WHERE id=$1 AND overlay_addr IS NOT NULL UNION SELECT spec->>'shared_ipv4' FROM cvm_nic_publications WHERE provider_node=$1 AND NOT deleted AND spec->>'shared_ipv4' IS NOT NULL")
-        .bind(node).fetch_all(&mut **tx).await?.into_iter().collect())
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT host(overlay_addr) FROM nodes WHERE id=$1 AND overlay_addr IS NOT NULL",
+    )
+    .bind(node)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .collect())
+}
+
+async fn require_host_l3(
+    tx: &mut Transaction<'_, Postgres>,
+    node: &str,
+    address: Ipv4Addr,
+    caps: &NicNodeCapabilities,
+) -> Result<()> {
+    let primary:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM nodes WHERE id=$1 AND public_ipv4=$2) OR EXISTS(SELECT 1 FROM cvm_nic_publications WHERE provider_node=$1 AND NOT deleted AND spec->>'shared_ipv4'=$2)").bind(node).bind(address.to_string()).fetch_one(&mut **tx).await?;
+    if !caps.entry_host_l3 && (primary || caps.addresses.contains(&address.into())) {
+        return Err(StoreError::Unsupported(
+            "入口机器尚不支持自身 IP 的 L3 转发，请升级 Agent".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn require_native_reply_source(
+    tx: &mut Transaction<'_, Postgres>,
+    instance: &CvmInstance,
+    provider: &str,
+    mode: EntryMode,
+) -> Result<()> {
+    let udp = matches!(mode, EntryMode::L3)
+        || matches!(mode, EntryMode::L4 { protocol, .. } if protocol.covers(L4Protocol::Udp));
+    if provider != instance.node_id
+        && !instance.desired.spec.execution.is_cube()
+        && udp
+        && !capability(tx, &instance.node_id).await?.entry_host_l3
+    {
+        return Err(StoreError::Unsupported(
+            "裸机 L3／UDP 转发需要正确的回包选源，请升级裸机 Agent".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Symmetric egress: the IPv4 source a NAT NIC on `nic.provider_node` uses for this
@@ -434,7 +482,16 @@ impl PgStore {
         request.spec.validate().map_err(invalid)?;
         let digest = request_digest(&("entry-publication", id, &request))?;
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before = crate::cvm::releases::begin(
+            &mut tx,
+            Scope {
+                nodes: vec![&request.spec.provider_node],
+                entry_publications: id.into_iter().collect(),
+                ..Scope::default()
+            },
+        )
+        .await?;
         if let Some(value) = replay(&mut tx, actor, &request.request_id, &digest).await? {
             return Ok(serde_json::from_value(value)?);
         }
@@ -443,6 +500,18 @@ impl PgStore {
             Some(id) => Some(entry_publication(&mut tx, id).await?),
             None => None,
         };
+        if let Some(old) = &old {
+            if old.spec.transports != spec.transports
+                || old.spec.wireguard_transport != spec.wireguard_transport
+            {
+                let in_use: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_entries e JOIN cvm_instances i ON i.id=e.instance_id WHERE e.publication_id=$1 AND NOT e.cleaned AND e.provider_node<>i.node_id)").bind(&old.id).fetch_one(&mut *tx).await?;
+                if in_use {
+                    return Err(StoreError::Conflict(
+                        "仍有跨机器入口在用，请先撤销并等待清理后更换传输方式".into(),
+                    ));
+                }
+            }
+        }
         let (id, revision, admitting) = match &old {
             Some(old) => {
                 if old.retired || old.revision != request.expected_revision {
@@ -490,7 +559,7 @@ impl PgStore {
             if spec
                 .transports
                 .iter()
-                .any(|t| !provider.transports.contains(&t.kind))
+                .any(|t| !provider.supports_entry_transport(t.kind, spec.wireguard_transport))
             {
                 return Err(StoreError::Unsupported(
                     "入口机器不支持所选的通道承载".into(),
@@ -508,9 +577,11 @@ impl PgStore {
                         }
                     }
                     EntryAddressKind::Dedicated => {
+                        require_host_l3(&mut tx, &spec.provider_node, offer.address, &provider)
+                            .await?;
                         if reserved.contains(&offer.address.to_string()) {
                             return Err(invalid(format!(
-                                "{} 是机器自身或网卡网络使用的地址，不能整 IP 交给容器",
+                                "{} 是组网通道地址，不能作为 L3 转发入口",
                                 offer.address
                             )));
                         }
@@ -576,6 +647,7 @@ impl PgStore {
         )
         .await?;
         remember(&mut tx, actor, &request.request_id, &digest, Some(&id), &p).await?;
+        crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
         tx.commit().await?;
         Ok(p)
     }
@@ -588,7 +660,15 @@ impl PgStore {
         admin(actor)?;
         let digest = request_digest(&("entry-admission", id, &request))?;
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before = crate::cvm::releases::begin(
+            &mut tx,
+            Scope {
+                entry_publications: vec![id],
+                ..Scope::default()
+            },
+        )
+        .await?;
         if let Some(value) = replay(&mut tx, actor, &request.request_id, &digest).await? {
             return Ok(serde_json::from_value(value)?);
         }
@@ -600,6 +680,7 @@ impl PgStore {
         sqlx::query("UPDATE cvm_entry_publications SET admitting=$2,actor_id=$3,updated_at=now() WHERE id=$1")
             .bind(id).bind(p.admitting).bind(actor.operator_id()).execute(&mut *tx).await?;
         remember(&mut tx, actor, &request.request_id, &digest, Some(id), &p).await?;
+        crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
         tx.commit().await?;
         Ok(p)
     }
@@ -612,7 +693,15 @@ impl PgStore {
         admin(actor)?;
         let digest = request_digest(&("entry-delete", id, &request))?;
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before = crate::cvm::releases::begin(
+            &mut tx,
+            Scope {
+                entry_publications: vec![id],
+                ..Scope::default()
+            },
+        )
+        .await?;
         if let Some(value) = replay(&mut tx, actor, &request.request_id, &digest).await? {
             return Ok(serde_json::from_value(value)?);
         }
@@ -636,6 +725,7 @@ impl PgStore {
         sqlx::query("UPDATE cvm_entry_publications SET deleted=true,admitting=false,actor_id=$2,updated_at=now() WHERE id=$1")
             .bind(id).bind(actor.operator_id()).execute(&mut *tx).await?;
         remember(&mut tx, actor, &request.request_id, &digest, Some(id), &p).await?;
+        crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
         tx.commit().await?;
         Ok(p)
     }
@@ -648,7 +738,16 @@ impl PgStore {
         request_id(&request.request_id)?;
         let digest = request_digest(&("entry-create", &request))?;
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before = crate::cvm::releases::begin(
+            &mut tx,
+            Scope {
+                instances: vec![&request.instance_id],
+                entry_publications: vec![&request.publication_id],
+                ..Scope::default()
+            },
+        )
+        .await?;
         if let Some(value) = replay(&mut tx, actor, &request.request_id, &digest).await? {
             tx.commit().await?;
             return Ok(serde_json::from_value(value)?);
@@ -687,18 +786,20 @@ impl PgStore {
             ));
         }
         require_delivery(&mut tx, &instance.node_id, &node).await?;
+        require_native_reply_source(&mut tx, &instance, &node, request.mode).await?;
         let id = new_id("entry")?;
         sqlx::query("INSERT INTO cvm_entries(id,publication_id,provider_node,instance_id,address,mode,actor_id) VALUES($1,$2,$3,$4,$5,$6,$7)")
             .bind(&id).bind(&p.id).bind(&node).bind(&instance.desired.id).bind(request.address.to_string()).bind(serde_json::to_value(request.mode)?).bind(actor.operator_id()).execute(&mut *tx).await?;
         match request.mode {
             EntryMode::L3 => {
+                require_host_l3(&mut tx, &node, request.address, &provider).await?;
                 if reserved_addresses(&mut tx, &node)
                     .await?
                     .contains(&request.address.to_string())
                 {
-                    return Err(invalid("该地址由机器自身或网卡网络使用"));
+                    return Err(invalid("该地址由组网通道使用，不能作为 L3 转发入口"));
                 }
-                let ports:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_nic_resources WHERE scope=$1 AND NOT released AND value LIKE $2)")
+                let ports:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_nic_resources WHERE scope=$1 AND NOT released AND entry_id IS NOT NULL AND value LIKE $2)")
                     .bind(format!("port:{node}")).bind(format!("{}:%", request.address)).fetch_one(&mut *tx).await?;
                 if ports {
                     return Err(StoreError::Conflict("该地址上仍有端口占用".into()));
@@ -755,6 +856,7 @@ impl PgStore {
             &view,
         )
         .await?;
+        crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
         tx.commit().await?;
         Ok(view)
     }
@@ -770,7 +872,16 @@ impl PgStore {
         request_id(&request.request_id)?;
         let digest = request_digest(&("entry-repoint", id, &request))?;
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before = crate::cvm::releases::begin(
+            &mut tx,
+            Scope {
+                instances: vec![&request.instance_id],
+                entries: vec![id],
+                ..Scope::default()
+            },
+        )
+        .await?;
         if let Some(value) = replay(&mut tx, actor, &request.request_id, &digest).await? {
             tx.commit().await?;
             return Ok(serde_json::from_value(value)?);
@@ -809,6 +920,7 @@ impl PgStore {
             ));
         }
         require_delivery(&mut tx, &target.node_id, &entry.provider_node).await?;
+        require_native_reply_source(&mut tx, &target, &entry.provider_node, entry.mode).await?;
         let p = entry_publication(&mut tx, &entry.publication_id).await?;
         if target.node_id != entry.provider_node {
             tunnels::ensure(&mut tx, &entry.provider_node, &target.node_id, &p).await?;
@@ -833,6 +945,7 @@ impl PgStore {
             &view,
         )
         .await?;
+        crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
         tx.commit().await?;
         Ok(view)
     }
@@ -846,7 +959,15 @@ impl PgStore {
         request_id(&request.request_id)?;
         let digest = request_digest(&("entry-release", id, &request))?;
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before = crate::cvm::releases::begin(
+            &mut tx,
+            Scope {
+                entries: vec![id],
+                ..Scope::default()
+            },
+        )
+        .await?;
         if let Some(value) = replay(&mut tx, actor, &request.request_id, &digest).await? {
             tx.commit().await?;
             return Ok(serde_json::from_value(value)?);
@@ -873,6 +994,7 @@ impl PgStore {
             &view,
         )
         .await?;
+        crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
         tx.commit().await?;
         Ok(view)
     }
@@ -1043,4 +1165,32 @@ async fn address_use(
             );
     }
     Ok(usage)
+}
+
+/// Approval freezes topology, while executing it still requires the current machine capability.
+/// A downgraded executor must not receive a previously valid transport it can no longer apply.
+pub(crate) async fn validate_serving(
+    tx: &mut Transaction<'_, Postgres>,
+    desired: &EntryDesired,
+) -> Result<()> {
+    if desired.rules.iter().any(|r| r.mode == EntryMode::L3) {
+        let caps = capability(tx, &desired.node_id).await?;
+        for rule in &desired.rules {
+            if rule.mode == EntryMode::L3 {
+                require_host_l3(tx, &desired.node_id, rule.address, &caps).await?;
+            }
+        }
+    }
+    for tunnel in &desired.tunnels {
+        if (tunnel.offer.kind == TransportKind::Xray || !tunnel.wireguard_transport.is_udp())
+            && !capability(tx, &desired.node_id)
+                .await?
+                .supports_entry_transport(tunnel.offer.kind, tunnel.wireguard_transport)
+        {
+            return Err(StoreError::Unsupported(
+                "本机 Agent 尚不支持此入口传输，请升级 Agent 后重试".into(),
+            ));
+        }
+    }
+    Ok(())
 }

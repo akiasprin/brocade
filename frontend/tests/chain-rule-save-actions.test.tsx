@@ -1,3 +1,4 @@
+import { geodataFixture } from './fixtures/geodata-data';
 import { changeControl } from './choice-helpers';
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
@@ -6,6 +7,7 @@ import { fetchSnapshot } from '../src/api';
 import type { ConsoleSnapshot, NodeAgentStateItem, Rule, SnapshotStep } from '../src/api';
 import { draft } from '../src/draft';
 import { RuleDraftScope, RuleEditor, type ForwardPeer } from '../src/panes/rules';
+import { confirmDiscardChanges } from '../src/ui/navigation-guard';
 
 const forward = (match: Rule['m'], to: string): Rule => ({
   m: match,
@@ -106,6 +108,11 @@ function renderScopedEditor(sourceRules: Rule[], relaySteps: SnapshotStep[]) {
 }
 
 beforeEach(() => {
+  vi.stubGlobal(
+    'fetch',
+    async (path: string, init?: RequestInit) =>
+      geodataFixture(path, init) ?? Response.json({ error: 'missing fixture' }, { status: 404 }),
+  );
   draft.init(`chain-rule-save-${Math.random()}`);
   draft.clear();
 });
@@ -117,6 +124,87 @@ afterEach(() => {
 });
 
 describe('链路规则统一保存', () => {
+  it('preserves invalid match input when leaving a rule tree', () => {
+    const view = renderScopedEditor([egress({ t: 'domain_suffix', v: ['before.example'] })], []);
+    changeControl(view.getByRole('textbox', { name: '匹配内容（规则 1）' }), {
+      target: { value: 'https://bad.example/path' },
+    });
+    expect((view.getByRole('button', { name: '保存到草稿' }) as HTMLButtonElement).disabled).toBe(true);
+
+    expect(confirmDiscardChanges()).toBe(true);
+    view.unmount();
+
+    expect(draft.ops()).toContainEqual(
+      expect.objectContaining({
+        op: 'put_step',
+        step: { rules: [egress({ t: 'domain_suffix', v: ['https://bad.example/path'] })] },
+      }),
+    );
+  });
+
+  it('locks every table and its DNS dialog during tree save validation', async () => {
+    let finish!: () => void;
+    const validation = new Promise<void>(resolve => {
+      finish = resolve;
+    });
+    const source = step('source', [egress({ t: 'domain_suffix', v: ['before.example'] })]);
+    const other = step('old', [egress({ t: 'domain_suffix', v: ['other.example'] })]);
+    const steps = [source, other];
+    const client = clientFor(steps);
+    const fetcher = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/model/validate') {
+        await validation;
+        return Response.json({ valid: true });
+      }
+      if (path === '/model/preview') return Response.json({ snapshot: client.getQueryData(['snapshot']) });
+      if (path === '/revisions?limit=50') return Response.json({ current_revision: null, revisions: [] });
+      return geodataFixture(path, init) ?? Response.json({}, { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const view = render(
+      <QueryClientProvider client={client}>
+        <RuleDraftScope>
+          {steps.map(item => (
+            <RuleEditor
+              key={item.node}
+              appId="video"
+              chainId="stream"
+              nodeId={item.node}
+              initial={item.rules}
+              accept={item.accept}
+              peers={[]}
+              isForwardTarget={false}
+              steps={steps}
+              root="source"
+              fallback={{ rules: [], pending: false }}
+            />
+          ))}
+        </RuleDraftScope>
+      </QueryClientProvider>,
+    );
+    const matches = view.getAllByRole('textbox', { name: '匹配内容（规则 1）' });
+    changeControl(matches[0], { target: { value: 'after.example' } });
+    // The second table and its open portal must be locked while the first table is validated.
+    changeControl(view.getAllByRole('combobox', { name: /DNS 解析方式/ })[1], { target: { value: 'custom' } });
+    const dns = within(view.getByRole('dialog', { name: /本机 DNS 解析策略/ }));
+    const address = dns.getByRole('textbox', { name: /DNS 地址/ }) as HTMLInputElement;
+    changeControl(address, { target: { value: '8.8.8.8' } });
+    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+    await waitFor(() => expect(fetcher.mock.calls.some(([path]) => path === '/model/validate')).toBe(true));
+    expect(matches.every(input => input.matches(':disabled'))).toBe(true);
+    expect(address.matches(':disabled')).toBe(true);
+
+    finish();
+    await waitFor(() => expect(matches.every(input => !input.matches(':disabled'))).toBe(true));
+    expect(draft.ops()).toContainEqual(
+      expect.objectContaining({
+        op: 'set_node_egress_dns',
+        node_id: 'old',
+        resolution: expect.objectContaining({ address: '8.8.8.8' }),
+      }),
+    );
+  });
+
   it('reports incomplete DNS only on save and leaves the draft untouched', async () => {
     const view = renderScopedEditor([egress({ t: 'geosite', v: ['netflix'] })], []);
     changeControl(view.getByRole('combobox', { name: /DNS 解析方式/ }), { target: { value: 'custom' } });
@@ -150,7 +238,9 @@ describe('链路规则统一保存', () => {
         apps: [{ ...committed.snapshot.apps[0], steps: [{ ...source, rules: staged }] }],
       },
     };
-    vi.stubGlobal('fetch', async (path: string) => {
+    vi.stubGlobal('fetch', async (path: string, init?: RequestInit) => {
+      const geo = geodataFixture(path, init);
+      if (geo) return geo;
       if (path === '/model/preview') return Response.json({ snapshot: preview });
       if (path === '/revisions?limit=50') return Response.json({ current_revision: null, revisions: [] });
       throw new Error(`Unexpected request: ${path}`);

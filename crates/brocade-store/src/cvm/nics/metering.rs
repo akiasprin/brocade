@@ -70,17 +70,18 @@ pub(super) async fn enforce(tx: &mut Transaction<'_, Postgres>, instance: &str) 
         .bind(instance)
         .fetch_one(&mut **tx)
         .await?;
+    // Final cumulative counters can arrive with network cleanup after the VM is gone.
+    // Account for them, but never create another execution for a released instance.
+    if !row.try_get::<bool, _>("reserved")? {
+        return Ok(());
+    }
     let mut desired = from_row(&row)?.desired;
     let mut changed = false;
     for device in &mut desired.spec.interfaces {
         let Some(nic) = device.allocated.as_mut() else {
             continue;
         };
-        let used:i64=sqlx::query_scalar("SELECT least(9223372036854775807::numeric,coalesce(sum(uploaded::numeric+downloaded::numeric),0))::bigint FROM cvm_nic_monthly_usage WHERE interface_id=$1 AND period=date_trunc('month',now() AT TIME ZONE 'UTC')::date").bind(&device.id).fetch_one(&mut **tx).await?;
-        let blocked = nic
-            .limits
-            .monthly_bytes
-            .is_some_and(|limit| used as u64 >= limit);
+        let blocked = quota_exceeded(tx, &device.id, nic.limits.monthly_bytes).await?;
         if nic.quota_exceeded == blocked {
             continue;
         }
@@ -109,13 +110,32 @@ pub(super) async fn enforce(tx: &mut Transaction<'_, Postgres>, instance: &str) 
     }
     Ok(())
 }
+
+pub(crate) async fn quota_exceeded(
+    tx: &mut Transaction<'_, Postgres>,
+    interface: &str,
+    limit: Option<u64>,
+) -> Result<bool> {
+    let Some(limit) = limit else {
+        return Ok(false);
+    };
+    let used:i64=sqlx::query_scalar("SELECT least(9223372036854775807::numeric,coalesce(sum(uploaded::numeric+downloaded::numeric),0))::bigint FROM cvm_nic_monthly_usage WHERE interface_id=$1 AND period=date_trunc('month',now() AT TIME ZONE 'UTC')::date").bind(interface).fetch_one(&mut **tx).await?;
+    Ok(used as u64 >= limit)
+}
 impl PgStore {
     pub(super) async fn reset_cvm_nic_period(&self, node: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
         let instances:Vec<String>=sqlx::query_scalar("SELECT DISTINCT a.instance_id FROM cvm_nic_allocations a JOIN cvm_instances i ON i.id=a.instance_id CROSS JOIN LATERAL jsonb_array_elements(i.desired#>'{spec,interfaces}') n WHERE (a.consumer_node=$1 OR a.provider_node=$1) AND NOT a.released AND n#>>'{allocated,quota_exceeded}'='true' ORDER BY a.instance_id LIMIT 256").bind(node).fetch_all(&mut *tx).await?;
+        let refresh = !instances.is_empty();
         for instance in instances {
             enforce(&mut tx, &instance).await?;
+        }
+        if refresh {
+            let participants:Vec<String>=sqlx::query_scalar("SELECT provider_node FROM cvm_nic_bindings WHERE provider_node=$1 OR consumer_node=$1 UNION SELECT consumer_node FROM cvm_nic_bindings WHERE provider_node=$1 OR consumer_node=$1 UNION SELECT $1::text").bind(node).fetch_all(&mut *tx).await?;
+            for participant in participants {
+                crate::cvm::releases::refresh_runtime(&mut tx, &participant).await?;
+            }
         }
         tx.commit().await?;
         Ok(())

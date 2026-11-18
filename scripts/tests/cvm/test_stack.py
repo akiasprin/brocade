@@ -1,4 +1,5 @@
 """Archive trust and recoverable activation tests; never touch host services or disks."""
+
 from contextlib import redirect_stdout
 import io
 import json
@@ -71,14 +72,18 @@ class StackTests(unittest.TestCase):
             self.assertEqual((tree / name).read_bytes(), (destination / name).read_bytes())
 
     def test_new_host_boot_removes_only_dead_transports_and_preserves_databases(self):
-        metadata = stack.STATE / 'state'; metadata.mkdir(parents=True)
-        boot = self.root / 'boot-id'; boot.write_text('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
+        metadata = stack.STATE / 'state'
+        metadata.mkdir(parents=True)
+        boot = self.root / 'boot-id'
+        boot.write_text('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
         runtime = metadata / 'io.containerd.runtime.v2.task'
         database = metadata / 'io.cubelet.internal.v1.cubebox/db/meta.db'
-        database.parent.mkdir(parents=True); database.write_bytes(b'original metadata')
+        database.parent.mkdir(parents=True)
+        database.write_bytes(b'original metadata')
         with patch.object(stack, 'HOST_BOOT_ID', boot), patch.object(stack, 'run', return_value=''):
             stack.prepare_boot_runtime_state()
-            runtime.mkdir(mode=0o700); (runtime / 'shim-address').write_text('old socket')
+            runtime.mkdir(mode=0o700)
+            (runtime / 'shim-address').write_text('old socket')
             stack.prepare_boot_runtime_state()
             self.assertTrue((runtime / 'shim-address').exists(), 'daemon upgrades must preserve live transports')
             boot.write_text('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb')
@@ -87,20 +92,29 @@ class StackTests(unittest.TestCase):
             self.assertEqual(database.read_bytes(), b'original metadata')
 
     def test_unknown_or_still_mounted_runtime_state_is_never_removed(self):
-        metadata = stack.STATE / 'state'; metadata.mkdir(parents=True)
-        boot = self.root / 'boot-id'; boot.write_text('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
-        runtime = metadata / 'io.containerd.runtime.v2.task'; runtime.mkdir(mode=0o700)
+        metadata = stack.STATE / 'state'
+        metadata.mkdir(parents=True)
+        boot = self.root / 'boot-id'
+        boot.write_text('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')
+        runtime = metadata / 'io.containerd.runtime.v2.task'
+        runtime.mkdir(mode=0o700)
         (runtime / 'owned-data').write_text('keep')
         with patch.object(stack, 'HOST_BOOT_ID', boot):
-            with self.assertRaises(stack.StackError): stack.prepare_boot_runtime_state()
-            stack.atomic_json(metadata / '.brocade-runtime-boot.json', {'host_boot_id':'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'})
+            with self.assertRaises(stack.StackError):
+                stack.prepare_boot_runtime_state()
+            stack.atomic_json(
+                metadata / '.brocade-runtime-boot.json', {'host_boot_id': 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'}
+            )
             with patch.object(stack, 'run', return_value=str(runtime / 'default/guest/rootfs')):
-                with self.assertRaises(stack.StackError): stack.prepare_boot_runtime_state()
+                with self.assertRaises(stack.StackError):
+                    stack.prepare_boot_runtime_state()
         self.assertEqual((runtime / 'owned-data').read_text(), 'keep')
 
     def test_release_receipt_skips_unchanged_images_but_rechecks_same_size_rewrites(self):
         import os
-        tree = self.tree(); archive, identity = self.bundle(tree)
+
+        tree = self.tree()
+        archive, identity = self.bundle(tree)
         release = self.stage(archive, identity, self.installation())
         original = stack.digest
         with patch.object(stack, 'digest', wraps=original) as hashes:
@@ -110,17 +124,22 @@ class StackTests(unittest.TestCase):
             stack.verify_release(release)
             self.assertEqual(hashes.call_count, first + 1, 'restart should only hash the small manifest')
         image = release / 'runtime/cube-agent/cube-agent.ext4'
-        before = image.stat(); content = image.read_bytes()
+        before = image.stat()
+        content = image.read_bytes()
         image.write_bytes(b'X' * len(content))
         os.utime(image, ns=(before.st_atime_ns, before.st_mtime_ns))
-        with self.assertRaises(stack.StackError): stack.verify_release(release)
+        with self.assertRaises(stack.StackError):
+            stack.verify_release(release)
         image.write_bytes(content)
         stack.verify_release(release)
         receipt = release / '.verified-files-v1.json'
         receipt.chmod(0o666)
-        with self.assertRaises(stack.StackError): stack.verify_release(release)
-        receipt.unlink(); receipt.symlink_to(release / 'manifest.json')
-        with self.assertRaises(stack.StackError): stack.verify_release(release)
+        with self.assertRaises(stack.StackError):
+            stack.verify_release(release)
+        receipt.unlink()
+        receipt.symlink_to(release / 'manifest.json')
+        with self.assertRaises(stack.StackError):
+            stack.verify_release(release)
 
     def test_bad_digest_or_writable_archive_is_refused(self):
         archive, sha = self.bundle(self.tree())
@@ -143,7 +162,9 @@ class StackTests(unittest.TestCase):
             with tarfile.open(original, 'r:gz') as source, tarfile.open(archive, 'w:gz') as output:
                 for member in source:
                     output.addfile(member, source.extractfile(member))
-                member = tarfile.TarInfo({'traversal': '../outside', 'duplicate': stack.REQUIRED[0]}.get(scenario, 'runtime/unlisted'))
+                member = tarfile.TarInfo(
+                    {'traversal': '../outside', 'duplicate': stack.REQUIRED[0]}.get(scenario, 'runtime/unlisted')
+                )
                 if scenario == 'link':
                     member.type, member.linkname = tarfile.SYMTYPE, '/etc/shadow'
                     output.addfile(member)
@@ -186,24 +207,36 @@ class StackTests(unittest.TestCase):
         dropin = install.units / 'brocade-agent.service.d/brocade-cvm.conf'
         dropin.parent.mkdir(parents=True)
         dropin.write_text('administrator configuration\n')
-        with patch.object(stack, 'run', side_effect=['brocade-cube-rust-v1','cubevs-attachments-v2']), patch.object(stack, 'verify_release') as verify:
+        with (
+            patch.object(stack, 'run', side_effect=['brocade-cube-rust-v1', 'cubevs-attachments-v2']),
+            patch.object(stack, 'verify_release') as verify,
+        ):
             with self.assertRaisesRegex(stack.StackError, 'not installer-owned'):
                 install.activate('a' * 64)
         verify.assert_not_called()
         self.assertEqual(dropin.read_text(), 'administrator configuration\n')
 
-
     def test_readiness_requires_actual_rust_agent_capabilities(self):
         config = self.root / 'config.json'
         from subprocess import CompletedProcess
-        response = CompletedProcess([], 0, json.dumps({'executor': 'brocade-cube-rust-v1', 'capabilities': {'create': True, 'stable_storage': True}}).encode(), b'')
+
+        response = CompletedProcess(
+            [],
+            0,
+            json.dumps(
+                {'executor': 'brocade-cube-rust-v1', 'capabilities': {'create': True, 'stable_storage': True}}
+            ).encode(),
+            b'',
+        )
         with patch.object(stack.subprocess, 'run', return_value=response) as run:
             stack.ready(timeout=1, config=config)
         self.assertEqual(run.call_args.args[0], [str(stack.AGENT_BIN), 'cvm-check', '--config', str(config)])
         self.assertGreater(run.call_args.kwargs['timeout'], 0)
-        response.stdout = json.dumps({'executor': 'legacy', 'capabilities': {'create': True, 'stable_storage': True}}).encode()
+        response.stdout = json.dumps(
+            {'executor': 'legacy', 'capabilities': {'create': True, 'stable_storage': True}}
+        ).encode()
         with patch.object(stack.subprocess, 'run', return_value=response), self.assertRaises(stack.StackError):
-            stack.ready(timeout=.01, config=config)
+            stack.ready(timeout=0.01, config=config)
 
     def test_unmanaged_persistent_cube_state_cannot_be_implicitly_adopted(self):
         (stack.STATE / 'root').mkdir(parents=True)
@@ -222,11 +255,13 @@ class StackTests(unittest.TestCase):
         stack.atomic_json(install.state_path, {'current': old, 'previous': None})
         stack.point(install.toolbox, install.release(old) / 'runtime')
         calls = []
+
         def activate(identity):
             calls.append(identity)
             stack.point(install.toolbox, install.release(identity) / 'runtime')
             if identity == candidate:
                 raise stack.StackError('injected readiness failure')
+
         with patch.object(install, 'activate', side_effect=activate), self.assertRaises(stack.StackError):
             install.change(candidate, 'install')
         self.assertEqual(calls, [candidate, old])
@@ -269,10 +304,10 @@ class StackTests(unittest.TestCase):
         archive, identity = self.bundle(self.tree())
         install = self.installation()
         self.stage(archive, identity, install)
-        stack.atomic_json(install.state_path, {'current': identity, 'previous': 'b'*64, 'pending': identity})
+        stack.atomic_json(install.state_path, {'current': identity, 'previous': 'b' * 64, 'pending': identity})
         with patch.object(install, 'activate'):
             install.change(identity, 'virtualization', force=True)
-        self.assertEqual(install.state()['previous'], 'b'*64)
+        self.assertEqual(install.state()['previous'], 'b' * 64)
         self.assertNotIn('pending', install.state())
 
     def configured_tree(self, name, variant):
@@ -284,36 +319,83 @@ class StackTests(unittest.TestCase):
             versions[component] = version
         config = tree / 'config'
         (config / 'system.json').write_text(json.dumps({'system': variant}))
-        capabilities = json.loads((SCRIPTS.parent / 'crates/brocade-cube/examples/cvm-cube.example.json').read_text())['capabilities']
+        capabilities = json.loads((SCRIPTS.parent / 'crates/brocade-cube/examples/cvm-cube.example.json').read_text())[
+            'capabilities'
+        ]
         capabilities['images'] = [{'id': variant, 'sha256': '0' * 64}]
-        (config / 'cube.json').write_text(json.dumps({
-            'cubelet_socket': '/run/cubelet/cubelet.sock',
-            'image_files': {variant: '@CVM_RELEASE@/generated/system.json'},
-            'capabilities': capabilities}))
-        (config / 'network.json').write_text(json.dumps({'shim_version': versions['cube-shim'],
-            'shim_sha256': stack.digest(tree / 'runtime/cube-shim/bin/containerd-shim-cube-rs'),
-            'max_interfaces': 1, 'bridge_sources': {}}))
-        (config / 'cubelet.toml').write_text(f'root = "{stack.STATE / "root"}"\nstate = "{stack.STATE / "state"}"\n'
+        (config / 'cube.json').write_text(
+            json.dumps(
+                {
+                    'cubelet_socket': '/run/cubelet/cubelet.sock',
+                    'image_files': {variant: '@CVM_RELEASE@/generated/system.json'},
+                    'capabilities': capabilities,
+                }
+            )
+        )
+        (config / 'network.json').write_text(
+            json.dumps(
+                {
+                    'shim_version': versions['cube-shim'],
+                    'shim_sha256': stack.digest(tree / 'runtime/cube-shim/bin/containerd-shim-cube-rs'),
+                    'max_interfaces': 1,
+                    'bridge_sources': {},
+                }
+            )
+        )
+        (config / 'cubelet.toml').write_text(
+            f'root = "{stack.STATE / "root"}"\nstate = "{stack.STATE / "state"}"\n'
             '[grpc]\naddress = "/run/cubelet/cubelet.sock"\ntcp_address = ""\n'
             '[http]\naddress = "127.0.0.1:8080"\n[debug]\naddress = "127.0.0.1:9966"\n'
             '[plugins."io.cubelet.internal.v1.images"]\n'
-            '[plugins."io.cubelet.internal.v1.storage"]\nstorage_backend = "cubecow"\n')
+            '[plugins."io.cubelet.internal.v1.storage"]\nstorage_backend = "cubecow"\n'
+        )
         stack.atomic_json(tree / 'manifest.json', {'storage_backends': ['xfs', 'plain']})
         return tree
 
+    def test_console_cohost_migrates_legacy_inspection_listener_and_client_together(self):
+        import tomllib
+
+        with patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'):
+            (stack.STATE / 'storage').mkdir(parents=True)
+            tree = self.configured_tree('cohost', 'one')
+            stack.render_configuration(tree)
+            generated = tree / 'generated'
+            configuration = tomllib.loads((generated / 'cubelet.toml').read_text())
+            self.assertEqual(configuration['http']['address'], stack.INSPECTION_ADDRESS)
+            self.assertEqual(stack.read_json(generated / 'cube.json')['network_inspection_url'], stack.INSPECTION_URL)
+            # A retained pre-upgrade configuration must move off Console's port too.
+            text = (generated / 'cubelet.toml').read_text().replace(stack.INSPECTION_ADDRESS, '127.0.0.1:8080')
+            (generated / 'cubelet.toml').write_text(text)
+            config = stack.read_json(generated / 'cube.json')
+            config['network_inspection_url'] = 'http://127.0.0.1:8080/v1/network/taps'
+            stack.atomic_json(generated / 'cube.json', config)
+            stack.render_configuration(tree, previous=tree)
+            configuration = tomllib.loads((generated / 'cubelet.toml').read_text())
+            self.assertEqual(configuration['http']['address'], stack.INSPECTION_ADDRESS)
+            self.assertEqual(stack.read_json(generated / 'cube.json')['network_inspection_url'], stack.INSPECTION_URL)
+
     def test_one_gib_host_reserves_runtime_memory_and_keeps_cpu_capacity(self):
         gib = 1024**3
-        with patch.object(stack, 'STATE', self.root / 'persistent'), patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'), \
-                patch.object(stack.os, 'sysconf', side_effect=lambda name: gib // 4096 if name == 'SC_PHYS_PAGES' else 4096), \
-                patch.object(stack.os, 'cpu_count', return_value=2):
+        with (
+            patch.object(stack, 'STATE', self.root / 'persistent'),
+            patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'),
+            patch.object(
+                stack.os, 'sysconf', side_effect=lambda name: gib // 4096 if name == 'SC_PHYS_PAGES' else 4096
+            ),
+            patch.object(stack.os, 'cpu_count', return_value=2),
+        ):
             (stack.STATE / 'storage').mkdir(parents=True)
             tree = self.configured_tree('full-capacity', 'one')
             stack.render_configuration(tree)
             caps = stack.read_json(tree / 'generated/cube.json')['capabilities']
             self.assertEqual(caps['allocatable_vcpus'], 2)
-            self.assertEqual(caps['allocatable_memory_bytes'], 640*1024**2)
-            self.assertEqual(caps['resource_limits']['max_memory_bytes'], 640*1024**2)
-            self.assertEqual(caps['allocatable_disk_bytes'], stack.shutil.disk_usage(stack.STATE / 'storage').free // gib * gib)
+            self.assertEqual(caps['allocatable_memory_bytes'], 640 * 1024**2)
+            self.assertEqual(caps['resource_limits']['max_memory_bytes'], 4 * gib)
+            self.assertEqual(caps['resource_limits']['max_vcpus'], 8)
+            self.assertEqual(caps['resource_limits']['max_root_disk_bytes'], 64 * gib)
+            self.assertEqual(
+                caps['allocatable_disk_bytes'], stack.shutil.disk_usage(stack.STATE / 'storage').free // gib * gib
+            )
 
     def test_managed_resource_upgrade_preserves_network_storage_and_custom_sections(self):
         reference = (SCRIPTS.parent / 'components/cube/Cubelet/config/config.toml').read_text()
@@ -331,8 +413,12 @@ class StackTests(unittest.TestCase):
 
     def test_upgrade_clamps_retained_capacity_to_one_gib_host_budget(self):
         gib = 1024**3
-        with patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'), \
-                patch.object(stack.os, 'sysconf', side_effect=lambda name: gib // 4096 if name == 'SC_PHYS_PAGES' else 4096):
+        with (
+            patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'),
+            patch.object(
+                stack.os, 'sysconf', side_effect=lambda name: gib // 4096 if name == 'SC_PHYS_PAGES' else 4096
+            ),
+        ):
             (stack.STATE / 'storage').mkdir(parents=True)
             old, new = self.configured_tree('large-budget', 'old'), self.configured_tree('small-budget', 'new')
             stack.render_configuration(old)
@@ -342,11 +428,14 @@ class StackTests(unittest.TestCase):
             stack.atomic_json(old / 'generated/cube.json', cfg)
             stack.render_configuration(new, old)
             caps = stack.read_json(new / 'generated/cube.json')['capabilities']
-            self.assertEqual(caps['allocatable_memory_bytes'], 640*1024**2)
-            self.assertEqual(caps['resource_limits']['max_memory_bytes'], 640*1024**2)
+            self.assertEqual(caps['allocatable_memory_bytes'], 640 * 1024**2)
+            self.assertEqual(caps['resource_limits']['max_memory_bytes'], gib)
 
     def test_upgrade_retains_images_and_replaces_the_local_network_catalogue(self):
-        with patch.object(stack, 'STATE', self.root / 'persistent'), patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'):
+        with (
+            patch.object(stack, 'STATE', self.root / 'persistent'),
+            patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'),
+        ):
             (stack.STATE / 'storage').mkdir(parents=True)
             old, new = self.configured_tree('old', 'old'), self.configured_tree('next', 'new')
             stack.render_configuration(old)
@@ -362,7 +451,9 @@ class StackTests(unittest.TestCase):
             self.assertTrue(new_cfg['capabilities']['stable_storage'])
             self.assertEqual(set(new_cfg['image_files']), {'old', 'new'})
             self.assertNotIn('bridge_sources', stack.read_json(new / 'generated/network.json'))
-            self.assertEqual(stack.read_json(new / 'generated/network.json')['state_dir'], '/data/cubelet/network-attachments-v2')
+            self.assertEqual(
+                stack.read_json(new / 'generated/network.json')['state_dir'], '/data/cubelet/network-attachments-v2'
+            )
             stack.render_configuration(old, new)
             self.assertEqual(set(stack.read_json(old / 'generated/cube.json')['image_files']), {'old', 'new'})
             # Rendered host paths do not rewrite or invalidate the immutable payload.
@@ -370,20 +461,33 @@ class StackTests(unittest.TestCase):
 
     def test_plain_selection_capacity_and_upgrade_identity(self):
         self.backend.return_value = 'plain'
-        with patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'), patch.object(stack.shutil, 'disk_usage', return_value=stack.shutil._ntuple_diskusage(100*1024**3, 80*1024**3, 20*1024**3)):
+        with (
+            patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'),
+            patch.object(
+                stack.shutil,
+                'disk_usage',
+                return_value=stack.shutil._ntuple_diskusage(100 * 1024**3, 80 * 1024**3, 20 * 1024**3),
+            ),
+        ):
             old, new = self.configured_tree('old-plain', 'old'), self.configured_tree('new-plain', 'new')
             stack.render_configuration(old)
             cfg = stack.read_json(old / 'generated/cube.json')
             self.assertEqual(cfg['storage_backend'], 'plain')
-            self.assertEqual(cfg['capabilities']['allocatable_disk_bytes'], 20*1024**3)
+            self.assertEqual(cfg['capabilities']['allocatable_disk_bytes'], 20 * 1024**3)
             import tomllib
-            storage = tomllib.loads((old / 'generated/cubelet.toml').read_text())['plugins']['io.cubelet.internal.v1.storage']
+
+            storage = tomllib.loads((old / 'generated/cubelet.toml').read_text())['plugins'][
+                'io.cubelet.internal.v1.storage'
+            ]
             self.assertEqual(storage['local_backend'], 'plain')
             self.assertEqual(storage['plain_reserve_bytes'], 0)
             stack.render_configuration(new, old)
-            self.assertEqual(stack.read_json(new / 'generated/cube.json')['capabilities']['allocatable_disk_bytes'], 20*1024**3)
+            self.assertEqual(
+                stack.read_json(new / 'generated/cube.json')['capabilities']['allocatable_disk_bytes'], 20 * 1024**3
+            )
             self.filesystem.return_value = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
-            with self.assertRaises(stack.StackError): stack.render_configuration(old, new)
+            with self.assertRaises(stack.StackError):
+                stack.render_configuration(old, new)
             with patch.object(stack.subprocess, 'Popen') as process, self.assertRaises(stack.StackError):
                 stack.start_cubelet(new)
             process.assert_not_called()
@@ -391,7 +495,8 @@ class StackTests(unittest.TestCase):
             with patch.object(stack.subprocess, 'Popen') as process, self.assertRaises(stack.StackError):
                 stack.start_cubelet(new)
             process.assert_not_called()
-            with self.assertRaises(stack.StackError): stack.render_configuration(old, new)
+            with self.assertRaises(stack.StackError):
+                stack.render_configuration(old, new)
 
     def test_plain_rollback_to_xfs_only_release_is_rejected_before_activation(self):
         archive, identity = self.bundle(self.tree())
@@ -414,31 +519,43 @@ class StackTests(unittest.TestCase):
         with patch.object(stack, 'run', return_value=''), self.assertRaises(stack.StackError):
             self.detect_uuid()
         stack.require_storage_support({'storage_backends': ['xfs', 'plain']}, 'plain')
-        with self.assertRaises(stack.StackError): stack.require_storage_support({}, 'plain')
+        with self.assertRaises(stack.StackError):
+            stack.require_storage_support({}, 'plain')
         archive, sha = self.bundle(self.tree())
         manifest = stack.inspect_archive(archive, sha)
         for inventory in [[{}], ['plain', 'plain'], []]:
-            with self.assertRaises(stack.StackError): stack.validate_manifest(dict(manifest, storage_backends=inventory))
+            with self.assertRaises(stack.StackError):
+                stack.validate_manifest(dict(manifest, storage_backends=inventory))
 
     def test_pvm_archive_binds_both_kernels_and_the_exact_resume_program(self):
         tree = self.tree()
-        sources = {'runtime/bin/cvm-host.py': SCRIPTS / 'cvm_host.py',
-                   'runtime/bin/cvm-stack.py': SCRIPTS / 'cvm_stack.py'}
+        sources = {
+            'runtime/bin/cvm-host.py': SCRIPTS / 'cvm_host.py',
+            'runtime/bin/cvm-stack.py': SCRIPTS / 'cvm_stack.py',
+        }
         for name, source in sources.items():
             path = tree / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(source.read_bytes())
-        for name in ('runtime/pvm/host.deb', 'runtime/cube-kernel-pvm/vmlinux',
-                     'runtime/cube-kernel-pvm/version', 'config/cube-pvm.json', 'config/system-pvm.json'):
+        for name in (
+            'runtime/pvm/host.deb',
+            'runtime/cube-kernel-pvm/vmlinux',
+            'runtime/cube-kernel-pvm/version',
+            'config/cube-pvm.json',
+            'config/system-pvm.json',
+        ):
             path = tree / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text('fixed test asset')
-        pvm = {'host_kernel_release': '6.6.117-opencloudos9.cubesandbox.pvm.host',
-               'host_package': 'runtime/pvm/host.deb', 'guest_kernel': 'runtime/cube-kernel-pvm/vmlinux',
-               'boot_args': ['nopti', 'pti=off']}
+        pvm = {
+            'host_kernel_release': '6.6.117-opencloudos9.cubesandbox.pvm.host',
+            'host_package': 'runtime/pvm/host.deb',
+            'guest_kernel': 'runtime/cube-kernel-pvm/vmlinux',
+            'boot_args': ['nopti', 'pti=off'],
+        }
         archive = self.root / 'pvm.tar.gz'
         with redirect_stdout(io.StringIO()):
-            stack.pack(tree, archive, 'x86_64', 'a'*64, '2.35', pvm=pvm)
+            stack.pack(tree, archive, 'x86_64', 'a' * 64, '2.35', pvm=pvm)
         install = self.installation()
         release = self.stage(archive, stack.digest(archive), install)
         manager = stack.host_manager(install, release)
@@ -450,9 +567,12 @@ class StackTests(unittest.TestCase):
         self.assertEqual(manifest['contract'], stack.CONTRACT)
         with self.assertRaisesRegex(stack.StackError, 'unsupported CVM'):
             stack.validate_manifest({**manifest, 'contract': 'brocade-cvm-stack-v1'})
-        for mutation in ({'guest_kernel': 'runtime/cube-kernel-scf/vmlinux'},
-                         {'host_package': '../outside.deb'}, {'boot_args': ['ipv6.disable=1']},
-                         {'boot_args': [{}]}):
+        for mutation in (
+            {'guest_kernel': 'runtime/cube-kernel-scf/vmlinux'},
+            {'host_package': '../outside.deb'},
+            {'boot_args': ['ipv6.disable=1']},
+            {'boot_args': [{}]},
+        ):
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 cvm_host.validate({**pvm, **mutation}, manifest['files'])
 
@@ -469,20 +589,32 @@ class StackTests(unittest.TestCase):
         (tree / 'runtime/cube-kernel-pvm/vmlinux').write_bytes(b'PVM Guest kernel')
         with patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'):
             stack.render_configuration(tree)
-            original = (stack.STATE / 'root/component_versions/cube-kernel-scf/native-cube-kernel-scf/vmlinux').read_bytes()
+            original = (
+                stack.STATE / 'root/component_versions/cube-kernel-scf/native-cube-kernel-scf/vmlinux'
+            ).read_bytes()
             stack.render_configuration(tree, tree, mode='pvm')
             current = stack.read_json(tree / 'generated/cube.json')
             self.assertEqual(current['virtualization_mode'], 'pvm')
-            images = stack.tomllib.loads((tree / 'generated/cubelet.toml').read_text())['plugins']['io.cubelet.internal.v1.images']
+            images = stack.tomllib.loads((tree / 'generated/cubelet.toml').read_text())['plugins'][
+                'io.cubelet.internal.v1.images'
+            ]
             self.assertEqual(images['shared_kernel_path'], str(tree / 'runtime/cube-kernel-pvm/vmlinux'))
             self.assertEqual(images['image_base_path'], str(stack.STATE / 'system-images/pvm'))
             self.assertEqual([image['id'] for image in current['capabilities']['images']], ['pvm-system'])
-            self.assertEqual((stack.STATE / 'root/component_versions/cube-kernel-scf/pvm-version/vmlinux').read_bytes(), b'PVM Guest kernel')
-            self.assertEqual((stack.STATE / 'root/component_versions/cube-kernel-scf/native-cube-kernel-scf/vmlinux').read_bytes(), original)
+            self.assertEqual(
+                (stack.STATE / 'root/component_versions/cube-kernel-scf/pvm-version/vmlinux').read_bytes(),
+                b'PVM Guest kernel',
+            )
+            self.assertEqual(
+                (stack.STATE / 'root/component_versions/cube-kernel-scf/native-cube-kernel-scf/vmlinux').read_bytes(),
+                original,
+            )
             stack.render_configuration(tree, tree, mode='kvm')
             current = stack.read_json(tree / 'generated/cube.json')
             self.assertEqual([image['id'] for image in current['capabilities']['images']], ['native'])
-            images = stack.tomllib.loads((tree / 'generated/cubelet.toml').read_text())['plugins']['io.cubelet.internal.v1.images']
+            images = stack.tomllib.loads((tree / 'generated/cubelet.toml').read_text())['plugins'][
+                'io.cubelet.internal.v1.images'
+            ]
             self.assertEqual(images['shared_kernel_path'], str(tree / 'runtime/cube-kernel-scf/vmlinux'))
             self.assertEqual(images['image_base_path'], str(stack.STATE / 'system-images'))
 

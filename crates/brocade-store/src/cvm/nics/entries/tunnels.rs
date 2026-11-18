@@ -14,15 +14,38 @@ pub(super) async fn ensure(
     target_node: &str,
     publication: &EntryPublication,
 ) -> Result<String> {
-    let existing: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM cvm_entry_tunnels WHERE entry_node=$1 AND target_node=$2 AND NOT withdrawn",
+    let entry_caps = capability(tx, entry_node).await?;
+    let target_caps = capability(tx, target_node).await?;
+    let existing: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT target FROM cvm_entry_tunnels WHERE entry_node=$1 AND target_node=$2 AND NOT withdrawn",
     )
     .bind(entry_node)
     .bind(target_node)
     .fetch_optional(&mut **tx)
     .await?;
-    if let Some(id) = existing {
-        return Ok(id);
+    if let Some(existing) = existing {
+        let existing: EntryTunnel = serde_json::from_value(existing)?;
+        if !publication
+            .spec
+            .transports
+            .iter()
+            .any(|offer| offer.kind == existing.offer.kind)
+            || (existing.offer.kind == TransportKind::Wireguard
+                && existing.wireguard_transport != publication.spec.wireguard_transport)
+        {
+            return Err(StoreError::Conflict(
+                "这对机器已有其他承载的入口通道，请先撤销相关跨机器入口再更换传输方式".into(),
+            ));
+        }
+        if !entry_caps.supports_entry_transport(existing.offer.kind, existing.wireguard_transport)
+            || !target_caps
+                .supports_entry_transport(existing.offer.kind, existing.wireguard_transport)
+        {
+            return Err(StoreError::Unsupported(
+                "这对机器的 Agent 尚不支持当前入口通道，请先升级".into(),
+            ));
+        }
+        return Ok(existing.id);
     }
     for node in [entry_node, target_node] {
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM cvm_entry_tunnels WHERE (entry_node=$1 OR target_node=$1) AND NOT cleaned")
@@ -33,19 +56,19 @@ pub(super) async fn ensure(
             return Err(invalid("机器的入口通道数量已达上限"));
         }
     }
-    let entry_caps = capability(tx, entry_node).await?;
-    let target_caps = capability(tx, target_node).await?;
-    // Entry tunnels are WireGuard (validated in the publication spec).
     let template = publication
         .spec
         .transports
         .iter()
         .find(|offer| {
-            entry_caps.transports.contains(&offer.kind)
-                && target_caps.transports.contains(&offer.kind)
+            entry_caps.supports_entry_transport(offer.kind, publication.spec.wireguard_transport)
+                && target_caps
+                    .supports_entry_transport(offer.kind, publication.spec.wireguard_transport)
         })
         .ok_or_else(|| {
-            StoreError::Unsupported("入口机器与容器宿主没有共同支持的 WireGuard 通道".into())
+            StoreError::Unsupported(
+                "入口机器与计算宿主没有共同支持的入口传输，请检查两端 Agent 的能力".into(),
+            )
         })?;
     let offer = bindings::resolve_offer(tx, target_node, template).await?;
     let (server, server_caps) = if offer.listen_side == TransportListenSide::Consumer {
@@ -53,7 +76,15 @@ pub(super) async fn ensure(
     } else {
         (entry_node, &entry_caps)
     };
-    let (scope, protocol, port) = bindings::transport_port(tx, server, &offer, server_caps).await?;
+    let protocol = if offer.kind == TransportKind::Xray
+        || publication.spec.wireguard_transport == EntryWireguardTransport::Phantun
+    {
+        L4Protocol::Tcp
+    } else {
+        L4Protocol::Udp
+    };
+    let (scope, protocol, port) =
+        bindings::transport_port_for_protocol(tx, server, &offer, server_caps, protocol).await?;
     let used = allocated_values(tx, "global", "entry-tunnel").await?;
     let slot = (0..ENTRY_TUNNEL_SLOTS)
         .find(|slot| !used.contains(&slot.to_string()))
@@ -69,6 +100,11 @@ pub(super) async fn ensure(
         entry_node: entry_node.into(),
         target_node: target_node.into(),
         offer: offer.clone(),
+        wireguard_transport: if offer.kind == TransportKind::Wireguard {
+            publication.spec.wireguard_transport
+        } else {
+            EntryWireguardTransport::Udp
+        },
         port,
         slot,
         credential: String::new(),
@@ -135,6 +171,7 @@ pub(super) async fn withdraw_unused(tx: &mut Transaction<'_, Postgres>) -> Resul
 pub(super) async fn desired(
     tx: &mut Transaction<'_, Postgres>,
     node: &str,
+    check_capabilities: bool,
 ) -> Result<Vec<EntryTunnel>> {
     let rows = sqlx::query("SELECT target,sealed FROM cvm_entry_tunnels WHERE (entry_node=$1 OR target_node=$1) AND NOT withdrawn ORDER BY id LIMIT $2")
         .bind(node)
@@ -147,6 +184,16 @@ pub(super) async fn desired(
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let mut tunnel: EntryTunnel = serde_json::from_value(row.try_get("target")?)?;
+        if check_capabilities
+            && (tunnel.offer.kind == TransportKind::Xray || !tunnel.wireguard_transport.is_udp())
+            && !capability(tx, node)
+                .await?
+                .supports_entry_transport(tunnel.offer.kind, tunnel.wireguard_transport)
+        {
+            return Err(StoreError::Unsupported(
+                "本机 Agent 尚不支持此入口传输，请升级 Agent 后重试".into(),
+            ));
+        }
         // The entry machine takes the provider side of the transport, the host the consumer side.
         let (consumer, provider, consumer_peer, provider_peer): (String, String, String, String) =
             serde_json::from_str(&crate::secrets::open(

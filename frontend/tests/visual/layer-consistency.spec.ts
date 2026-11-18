@@ -157,7 +157,8 @@ for (const engine of ['chromium', 'webkit'] as const) {
         await expect(main.locator('.cardpage, .nd-page').first()).toBeVisible();
         await expect(main.locator('.callout.err')).toHaveCount(0);
         await ready(page);
-        const panels = await page.locator('.fg-view .panel').evaluateAll(elements =>
+        // 容器页的内容卡片（.cvm-tile）与 .panel 遵守同一套正文排版。
+        const panels = await page.locator('.fg-view .panel, .fg-view .cvm-tile').evaluateAll(elements =>
           elements
             .filter(element => element.getBoundingClientRect().width > 0)
             .map(element => ({

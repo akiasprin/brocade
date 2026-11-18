@@ -15,6 +15,12 @@ import { draft } from '../src/draft';
 import { ListenerDecisionTree } from '../src/panes/chains';
 import { RuleEditor, forwardPeers, listenerRefKey, reusableListeners } from '../src/panes/rules';
 
+// These tests isolate forwarding and tunnel edits; validation has its own HTTP/DB suite.
+vi.mock('../src/api/geodata', async importOriginal => ({
+  ...(await importOriginal<typeof import('../src/api/geodata')>()),
+  validateDraft: vi.fn(async () => ({ valid: true })),
+}));
+
 const chain = (id: string, name: string, tenant = 'platform.acme'): SnapshotChain => ({ id, name, tenant });
 
 const ingress = (id: string, owner: string, node: string): SnapshotIngress => ({

@@ -4,7 +4,7 @@
 
 ## 前置条件
 
-仓库通过 [`rust-toolchain.toml`](../rust-toolchain.toml) 固定 Rust 工具链和 agent 所需的 musl targets。完整构建还需要：
+仓库通过 [`rust-toolchain.toml`](../rust-toolchain.toml) 固定 Rust 工具链、必需的 `rust-src` 组件和 agent 所需的 musl targets。完整构建还需要：
 
 - Node.js 22 与 npm，用于构建前端；
 - [`components/xray-core/.go-version`](../components/xray-core/.go-version) 指定的精确 Go 版本，用于构建或校验 Brocade Xray；
@@ -44,6 +44,12 @@ python3 scripts/build-release.py
 缓存布局、独占、失败处理和耗时记录见[部署规范](../.agents/runbooks/console-deployment.md#固定位置双架构与耗时记录)。比较构建耗时时注明缓存状态和验证范围；本次失败不能用上一轮产物替代。
 
 ## 内嵌产物与 Xray 构建身份
+
+`rust-src` 是强制前置条件。本地发行入口及 Console 的 Cargo 构建均检查实际所选编译器的 sysroot，缺少 `core`、`alloc` 或 `std` 源码立即失败，即使使用 `RUSTUP_TOOLCHAIN` 绕过仓库工具链声明也不例外。为所选工具链执行 `rustup component add rust-src` 后重试。
+
+两种入口使用相同的 Agent Rust 参数，把标准库源码根目录映射到 `/rust-src`，避免本机 sysroot 路径进入新编译的标准库源码位置。新增参数也会让 Cargo 重编此前缓存的目标依赖，防止安装组件后继续复用缺少组件时的依赖。首次采用此配方会改变 Agent 摘要，需核对实际嵌入字节；这不表示节点已升级，也不等同于所有构建输入均已实现跨机器复现。
+
+嵌入 Agent 的 Cargo 子进程会清除继承的全局 Rust flags、默认 target 和 target 目录，由固定配方指定目标、路径映射及 ARM 链接器，避免环境变量覆盖这些参数。
 
 当前内置 Xray 基线为 `v26.10.31`（`a4a3dff5b20c2faae567b742c172c7b95e75c083`），Go 最低补丁版本为 `1.27.4`，包含标准库安全修复；具体要求见源码中的 `.go-version`。REALITY 依赖通过仓库内相对路径 `third_party/reality` 引入，来源与兼容补丁记录在两级 `BROCADE_UPSTREAM.toml` 中；该依赖的实际编译文件也纳入构建输入指纹。替换成官方 Xray 会失去 Brocade 的协议、计费、交接和指纹兼容能力。
 

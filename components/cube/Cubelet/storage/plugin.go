@@ -376,7 +376,7 @@ func (c CowBackendConfig) toMap() map[string]any {
 		m["kind"] = c.Kind
 	}
 	if c.Plain.RootDir != nil {
-		m["plain"] = map[string]any{"root_dir": *c.Plain.RootDir, "reserve_bytes": c.Plain.ReserveBytes}
+		m["plain"] = map[string]any{"root_dir": *c.Plain.RootDir, "reserve_bytes": c.Plain.ReserveBytes, "thin_provision": true}
 	}
 	if sub := c.Reflink.toMap(); len(sub) > 0 {
 		m["reflink"] = sub

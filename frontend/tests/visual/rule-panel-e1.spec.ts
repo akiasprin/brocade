@@ -114,8 +114,16 @@ test('E1 keeps edits while a machine is collapsed and restores all editor state'
   await open(page, 1440);
   const akileHead = head(page, '香港 AKILE II');
   const akile = machine(page, '香港 AKILE II');
-  const match = akile.getByRole('textbox', { name: '匹配内容（规则 1）' });
-  await match.fill('netflix');
+  const match = akile.getByRole('combobox', { name: '匹配内容（规则 1）' });
+  await match.click();
+  const menu = page.getByRole('dialog', { name: 'geosite 选项' });
+  await menu
+    .getByRole('option', { name: /category-ai-!cn/ })
+    .first()
+    .click();
+  await menu.getByRole('textbox', { name: '搜索 geosite' }).fill('netflix');
+  await menu.getByRole('option', { name: 'netflix', exact: true }).click();
+  await menu.press('Escape');
   const port = akile.locator('.hop-target-port input');
   await port.fill('24000');
   await akileHead.click();
@@ -124,10 +132,10 @@ test('E1 keeps edits while a machine is collapsed and restores all editor state'
   await expect(head(page, '台湾 AKILE HiNET')).toBeVisible();
   await akileHead.press('Enter');
   await expect(akileHead).toHaveAttribute('aria-expanded', 'true');
-  await expect(match).toHaveValue('netflix');
+  await expect(akile.getByRole('button', { name: '预览 netflix' })).toBeVisible();
   await expect(port).toHaveValue('24000');
   await page.getByRole('button', { name: '还原', exact: true }).click();
-  await expect(match).toHaveValue('category-ai-!cn');
+  await expect(akile.getByRole('button', { name: '预览 category-ai-!cn' })).toBeVisible();
   await expect(port).toHaveValue('20002');
   await expect(page.getByRole('button', { name: '保存到草稿' })).toBeDisabled();
 });

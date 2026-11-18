@@ -1,6 +1,6 @@
 //! 容器访问入口：任意机器的地址按 L3（整 IP）或 L4（协议 + 端口）投递到容器主网卡。
 //!
-//! 入口独立于业务网卡，不占用容器网卡槽位。入口机器与计算宿主不同时，两端经受管的 WireGuard
+//! 入口独立于业务网卡，不占用容器网卡槽位。入口机器与计算宿主不同时，两端经受管的 Xray／WireGuard
 //! 机器对通道传递原始 IP 包：入口机器把目的地址换成容器的宿主内地址、把来源换成本端通道地址，按通道
 //! 槽位的包标记送入通道；计算宿主再把来源换成 Cube 网关地址，经 CubeVS `primary_delivery` 交给容器
 //! 主网卡，回包沿原路返回。通道地址由槽位派生（见 [`tunnel_addresses`]），两端的连接跟踪元组因此
@@ -9,8 +9,8 @@
 //!
 //! 入口属于容器：删除容器即释放；同一用户的容器之间可以改派，地址与端口不变。
 use super::{
-    valid_id, L4Protocol, NetworkOwner, TransportKind, TransportListenSide, TransportOffer,
-    MAX_CATALOG_ITEMS,
+    valid_id, L4Protocol, NetworkDiagnostics, NetworkOwner, TransportKind, TransportListenSide,
+    TransportOffer, MAX_CATALOG_ITEMS,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, net::Ipv4Addr};
@@ -32,6 +32,35 @@ pub const ENTRY_TUNNEL_SLOTS: u16 = 32768;
 pub const ENTRY_TUNNEL_NETWORK: Ipv4Addr = Ipv4Addr::new(240, 0, 0, 0);
 /// 入口机器为每条通道使用的包标记与路由表基数：`ENTRY_TUNNEL_MARK + slot`。
 pub const ENTRY_TUNNEL_MARK: u32 = 0x00b6_0000;
+
+/// WireGuard remains the IP tunnel; Phantun optionally carries its UDP packets as fake TCP.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryWireguardTransport {
+    #[default]
+    Udp,
+    Phantun,
+}
+impl EntryWireguardTransport {
+    pub fn is_udp(&self) -> bool {
+        *self == Self::Udp
+    }
+}
+impl super::NicNodeCapabilities {
+    /// Existing UDP entry Agents remain usable; new carriers require explicit evidence.
+    pub fn supports_entry_transport(
+        &self,
+        kind: TransportKind,
+        wireguard: EntryWireguardTransport,
+    ) -> bool {
+        self.entries
+            && self.transports.contains(&kind)
+            && match kind {
+                TransportKind::Xray => self.entry_xray,
+                TransportKind::Wireguard => wireguard.is_udp() || self.entry_phantun,
+            }
+    }
+}
 
 /// 入口按协议分配端口；`TcpUdp` 同时占用两种协议的同一端口。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -65,7 +94,7 @@ impl EntryProtocol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EntryMode {
-    /// 整个地址一对一交给容器，包含全部协议与 ICMP。
+    /// 整 IP 的新入站流量做 L3 转发，包含全部协议与 ICMP；保留机器自身连接的回包与传输端口。
     L3,
     /// 只转发所选协议的一个入口端口到容器端口。
     L4 {
@@ -89,7 +118,7 @@ impl EntryMode {
 pub enum EntryAddressKind {
     /// 机器自己的地址：按协议端口分给多个容器；宿主正在监听的端口不能分配。
     Shared { port_start: u16, port_end: u16 },
-    /// 独立地址：整 IP 交给一个容器。
+    /// 整 IP 的入站流量转发给一个实例；地址仍由入口机器持有。
     Dedicated,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -130,6 +159,8 @@ pub struct EntryPublicationSpec {
     pub addresses: Vec<EntryAddressOffer>,
     /// 计算宿主不是这台机器时，机器对通道使用的承载报价。
     pub transports: Vec<TransportOffer>,
+    #[serde(default, skip_serializing_if = "EntryWireguardTransport::is_udp")]
+    pub wireguard_transport: EntryWireguardTransport,
     pub grants: Vec<NetworkOwner>,
     /// 这份发布最多同时承接的入口数。
     pub max_entries: u16,
@@ -169,10 +200,6 @@ impl EntryPublicationSpec {
         }
         let mut kinds = BTreeSet::new();
         for offer in &self.transports {
-            // 机器对通道首版只用 WireGuard：内核设备可以按标记路由，不需要用户态转发。
-            if offer.kind != TransportKind::Wireguard {
-                return Err("CVM entry tunnels currently use WireGuard only".into());
-            }
             if !kinds.insert(offer.kind)
                 || offer.port_start == 0
                 || offer.port_end < offer.port_start
@@ -183,6 +210,11 @@ impl EntryPublicationSpec {
             {
                 return Err("CVM entry transport offer is invalid".into());
             }
+        }
+        if self.wireguard_transport == EntryWireguardTransport::Phantun
+            && !kinds.contains(&TransportKind::Wireguard)
+        {
+            return Err("Phantun requires a WireGuard entry transport".into());
         }
         let mut owners = BTreeSet::new();
         if self.grants.iter().any(|owner| {
@@ -307,6 +339,8 @@ pub fn tunnel_addresses(slot: u16) -> Option<(Ipv4Addr, Ipv4Addr)> {
 /// 已确认的地址（例如已关机），入口仍占用地址与端口并丢弃流量，不能落到宿主服务。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryRule {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_local: bool,
     pub id: String,
     pub address: Ipv4Addr,
     pub mode: EntryMode,
@@ -316,6 +350,8 @@ pub struct EntryRule {
 /// 计算宿主上的一条投递：从机器对通道收到的包交给容器主网卡，回包沿通道返回。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryDelivery {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_local: bool,
     pub id: String,
     pub instance_id: String,
     pub mode: EntryMode,
@@ -339,6 +375,8 @@ pub struct EntryTunnel {
     pub entry_node: String,
     pub target_node: String,
     pub offer: TransportOffer,
+    #[serde(default, skip_serializing_if = "EntryWireguardTransport::is_udp")]
+    pub wireguard_transport: EntryWireguardTransport,
     pub port: u16,
     /// 全局唯一的槽位，见 [`ENTRY_TUNNEL_SLOTS`]。
     pub slot: u16,
@@ -363,11 +401,13 @@ impl EntryTunnel {
             || !valid_id(&self.target_node)
             || self.entry_node == self.target_node
             || self.offer.listen_side == TransportListenSide::Auto
-            || self.offer.kind != TransportKind::Wireguard
+            || (self.offer.kind != TransportKind::Wireguard && !self.wireguard_transport.is_udp())
             || self.port == 0
             || !(self.offer.port_start..=self.offer.port_end).contains(&self.port)
             || !(1280..=9000).contains(&self.offer.mtu)
             || self.offer.endpoint.is_unspecified()
+            || self.offer.endpoint.is_loopback()
+            || self.offer.endpoint.is_multicast()
             || self.slot >= ENTRY_TUNNEL_SLOTS
             || self.credential.is_empty()
             || self.peer_credential.is_empty()
@@ -390,6 +430,15 @@ impl EntryTunnel {
         match self.side {
             EntryTunnelSide::Entry => &self.target_node,
             EntryTunnelSide::Target => &self.entry_node,
+        }
+    }
+    pub fn protocol(&self) -> L4Protocol {
+        if self.offer.kind == TransportKind::Xray
+            || self.wireguard_transport == EntryWireguardTransport::Phantun
+        {
+            L4Protocol::Tcp
+        } else {
+            L4Protocol::Udp
         }
     }
 }
@@ -490,9 +539,14 @@ pub struct EntryNodeReport {
     pub deliveries: Vec<EntryItemReport>,
     pub tunnels: Vec<EntryTunnelReport>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<NetworkDiagnostics>,
 }
 impl EntryNodeReport {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.validate()?;
+        }
         let text = |value: &Option<String>| value.as_ref().is_some_and(|e| e.len() > 500);
         if self.rules.len() > MAX_ENTRIES_PER_NODE
             || self.deliveries.len() > MAX_ENTRIES_PER_NODE
@@ -610,6 +664,7 @@ mod tests {
                 port_end: 51829,
                 mtu: 1420,
             },
+            wireguard_transport: EntryWireguardTransport::Udp,
             port: 51820,
             slot: 7,
             credential: "a".repeat(44),
@@ -619,6 +674,7 @@ mod tests {
         assert!(tunnel.listens());
         assert_eq!(tunnel.peer_node(), "jp-iij");
         let rule = |id: &str, mode: EntryMode, tunnel: Option<&str>| EntryRule {
+            host_local: false,
             id: id.into(),
             address: "203.0.113.12".parse().unwrap(),
             mode,
@@ -648,6 +704,7 @@ mod tests {
         desired.rules.pop();
         // 计算宿主一端的通道不能承接入口规则，也不能出现在别的节点的期望状态里。
         desired.deliveries.push(EntryDelivery {
+            host_local: false,
             id: "d".into(),
             instance_id: "web".into(),
             mode: EntryMode::L3,
@@ -658,5 +715,22 @@ mod tests {
         desired.deliveries.clear();
         desired.node_id = "jp-iij".into();
         assert!(desired.validate().is_err());
+    }
+    #[test]
+    fn old_entry_capabilities_keep_udp_and_gate_new_carriers() {
+        let mut caps:super::super::NicNodeCapabilities=serde_json::from_value(serde_json::json!({"contract":67,"transports":["wireguard","xray"],"consume":true,"provide":true,"max_bindings":64,"addresses":[],"host_ports":[],"xray_certificate_pem":null,"error":null,"entries":true})).unwrap();
+        assert!(
+            caps.supports_entry_transport(TransportKind::Wireguard, EntryWireguardTransport::Udp)
+        );
+        assert!(!caps
+            .supports_entry_transport(TransportKind::Wireguard, EntryWireguardTransport::Phantun));
+        assert!(!caps.supports_entry_transport(TransportKind::Xray, EntryWireguardTransport::Udp));
+        caps.entry_phantun = true;
+        caps.entry_xray = true;
+        assert!(caps
+            .supports_entry_transport(TransportKind::Wireguard, EntryWireguardTransport::Phantun));
+        assert!(caps.supports_entry_transport(TransportKind::Xray, EntryWireguardTransport::Udp));
+        caps.entries = false;
+        assert!(!caps.supports_entry_transport(TransportKind::Xray, EntryWireguardTransport::Udp));
     }
 }

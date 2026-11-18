@@ -24,17 +24,68 @@ impl PgStore {
 
 impl PgStore {
     pub async fn cvm_desired(&self, node: &str) -> Result<DesiredState> {
-        let rows: Vec<serde_json::Value> = sqlx::query_scalar(
-            "SELECT desired FROM cvm_instances WHERE node_id=$1 AND reserved ORDER BY id LIMIT 256",
-        )
-        .bind(node)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(DesiredState {
-            instances: rows
+        self.cvm_desired_page(node, None).await
+    }
+    pub async fn cvm_desired_page(
+        &self,
+        node: &str,
+        offset: Option<usize>,
+    ) -> Result<DesiredState> {
+        let start = offset.unwrap_or(0);
+        if start > MAX_INSTANCES_PER_MACHINE {
+            return Err(invalid("CVM page cursor exceeds limits"));
+        }
+        let mut tx = self.pool.begin().await?;
+        let serving = releases::serving_tx(&mut tx, node).await?;
+        let chain_clients = serving
+            .as_ref()
+            .map(|s| s.chain_clients.clone())
+            .unwrap_or_default();
+        let rows: Vec<serde_json::Value> = if let Some(config) = serving {
+            config
+                .instances
                 .into_iter()
-                .map(serde_json::from_value)
-                .collect::<std::result::Result<_, _>>()?,
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<_, _>>()?
+        } else {
+            sqlx::query_scalar("SELECT desired FROM cvm_instances WHERE node_id=$1 AND reserved ORDER BY id LIMIT 256").bind(node).fetch_all(&mut *tx).await?
+        };
+        let total = rows.len();
+        let mut instances = Vec::new();
+        let mut bytes = 0usize;
+        for raw in rows.into_iter().skip(start).take(if offset.is_some() {
+            8
+        } else {
+            MAX_INSTANCES_PER_MACHINE
+        }) {
+            let mut desired: InstanceDesired = serde_json::from_value(raw)?;
+            if offset.is_some() {
+                desired.artifacts =
+                    artifacts::load(&mut tx, &desired.id, desired.generation).await?;
+            }
+            let size = serde_json::to_vec(&desired)?.len();
+            if size > 12 * 1024 * 1024 {
+                return Err(invalid(
+                    "CVM single-instance artifact response exceeds limits",
+                ));
+            }
+            if offset.is_some() && bytes + size > 12 * 1024 * 1024 {
+                break;
+            }
+            bytes += size;
+            instances.push(desired);
+        }
+        tx.commit().await?;
+        let next = start + instances.len();
+        Ok(DesiredState {
+            chain_clients,
+            instances,
+            page_offset: offset,
+            next_offset: if offset.is_some() && next < total {
+                Some(next)
+            } else {
+                None
+            },
         })
     }
 }
@@ -42,7 +93,7 @@ impl PgStore {
 impl PgStore {
     pub async fn cvm_record_report(&self, node: &str, report: InstanceReport) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
-        crate::resource_coordination::lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
         let row = sqlx::query(
             "SELECT desired,reserved,report FROM cvm_instances WHERE id=$1 AND node_id=$2 FOR UPDATE",
         )
@@ -51,11 +102,61 @@ impl PgStore {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| StoreError::NotFound("CVM assignment".into()))?;
-        let desired: InstanceDesired = serde_json::from_value(row.try_get("desired")?)?;
+        let latest: InstanceDesired = serde_json::from_value(row.try_get("desired")?)?;
+        let desired = match releases::serving_tx(&mut tx, node).await? {
+            Some(config) => match config.instances.into_iter().find(|i| i.id == report.id) {
+                Some(desired) => desired,
+                None => return Ok(false),
+            },
+            None => latest.clone(),
+        };
         if report.generation < desired.generation {
             return Ok(false);
         }
         report.validate_for(&desired).map_err(invalid)?;
+        if let Some(receipt) = &report.artifacts {
+            let bundle = artifacts::load(&mut tx, &desired.id, desired.generation)
+                .await?
+                .ok_or_else(|| invalid("没有可核对的冻结产物"))?;
+            if receipt.compiler != bundle.compiler
+                || receipt.input_sha256 != bundle.input_sha256
+                || receipt.files.len() != 4
+                || receipt.mismatches.len() > 4
+                || receipt
+                    .files
+                    .iter()
+                    .map(|f| f.kind)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != 4
+                || receipt.files.iter().any(|f| {
+                    bundle
+                        .file(f.kind)
+                        .map_or(true, |file| file.sha256 != f.compiled_sha256)
+                        || f.effective_sha256
+                            .as_ref()
+                            .is_some_and(|sha| !valid_digest(sha))
+                        || serde_json::to_vec(&f.bindings).map_or(true, |b| b.len() > 4096)
+                })
+                || (report.status == ApplyStatus::Applied
+                    && receipt.mode == CvmArtifactMode::Enforce
+                    && !receipt.mismatches.is_empty())
+            {
+                return Err(invalid("CVM 产物回执与冻结内容不一致"));
+            }
+        }
+        if desired.generation != latest.generation {
+            sqlx::query("UPDATE cvm_operations SET status=$2,updated_at=now() WHERE id=$1 AND instance_id=$3 AND generation=$4").bind(&report.operation_id).bind(state_text(report.status)).bind(&report.id).bind(report.generation as i64).execute(&mut *tx).await?;
+            sqlx::query("UPDATE cvm_instances SET report=$2 WHERE id=$1")
+                .bind(&report.id)
+                .bind(serde_json::to_value(&report)?)
+                .execute(&mut *tx)
+                .await?;
+            releases::refresh_runtime(&mut tx, node).await?;
+            releases::settle(&mut tx, node).await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
         if !row.try_get::<bool, _>("reserved")? && report.status != ApplyStatus::Applied {
             return Ok(false);
         }
@@ -119,6 +220,8 @@ impl PgStore {
         if report.status == ApplyStatus::Applied {
             nics::release_confirmed(&mut tx, &report.id).await?;
         }
+        releases::refresh_runtime(&mut tx, node).await?;
+        releases::settle(&mut tx, node).await?;
         tx.commit().await?;
         Ok(true)
     }

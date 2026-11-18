@@ -6,6 +6,7 @@ async function openTerminal(
   theme = 'dark',
   role = 'system-admin',
   output = 'root@cvm:~# printf "你好，CVM"\r\n你好，CVM\r\nroot@cvm:~# ',
+  scene = 'detail',
 ) {
   const input: string[] = [];
   let disconnected = false;
@@ -37,7 +38,8 @@ async function openTerminal(
     });
   });
   await page.setViewportSize({ width, height: 900 });
-  await page.goto(`/tests/fixtures/cvm/preview.html?scene=detail&theme=${theme}&role=${role}`);
+  await page.goto(`/tests/fixtures/cvm/preview.html?scene=${scene}&theme=${theme}&role=${role}`);
+  if (scene === 'board') await page.locator('[data-pill="cvm-alice"]').click();
   await page.getByRole('button', { name: '终端', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '终端 · home-workspace' });
   await expect(dialog.getByRole('status')).toHaveText('已连接');
@@ -45,6 +47,19 @@ async function openTerminal(
   await page.evaluate(() => document.fonts.ready);
   return { dialog, input, disconnected: () => disconnected };
 }
+
+test('the board inspector connects to its selected instance and detaches when selection changes', async ({ page }) => {
+  const { dialog, disconnected } = await openTerminal(page, 1440, 'dark', 'system-admin', undefined, 'board');
+  await expect(dialog).toBeVisible();
+  await dialog.locator('.cvm-terminal-tools').getByRole('button', { name: '关闭', exact: true }).click();
+  await expect.poll(disconnected).toBe(true);
+  await page.getByRole('button', { name: '终端', exact: true }).click();
+  await expect(dialog.getByRole('status')).toHaveText('已连接');
+  // The terminal layer covers the board; a workspace update can still change its selected instance.
+  await page.locator('[data-pill="cvm-board-1"]').evaluate(el => (el as HTMLButtonElement).click());
+  await expect(dialog).toBeHidden();
+  await expect(page.getByRole('complementary', { name: 'build-runner' })).toBeVisible();
+});
 
 test('closing the layer detaches and reopening resumes while ending is explicit', async ({ page }) => {
   const requests = () =>

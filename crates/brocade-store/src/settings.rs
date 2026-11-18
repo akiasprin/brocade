@@ -1026,13 +1026,12 @@ fn conn_in_range(location: &str, value: Option<u32>, range: &RangeInclusive<u32>
     }
 }
 
-/// Xray's cron parser owns the expression syntax, including descriptors such as @daily.
-/// Counting fields here rejects valid schedules without proving a five-field expression valid.
+/// Structural grammar is shared with core; Console also resolves it with the embedded Xray.
 fn validate_geodata(settings: &GeodataSettings) -> Result<()> {
-    if settings.cron.trim().is_empty() {
-        return Err(StoreError::InvalidData(
-            "settings.geodata.cron 不能为空".to_owned(),
-        ));
+    if !brocade_core::cron_syntax::valid_cron(&settings.cron) {
+        let mut issue = brocade_core::rule_validation::issue("settings", None, "", "cron 无效");
+        issue.field = "geodata.cron".into();
+        return Err(StoreError::RuleValidation(vec![issue]));
     }
     for (location, url) in [
         ("settings.geodata.geoip_url", &settings.geoip_url),

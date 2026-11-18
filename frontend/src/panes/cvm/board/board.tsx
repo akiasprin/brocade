@@ -4,16 +4,19 @@
 // - 计算：提供算力的宿主，容器是其中的条目。首版不迁移计算，容器不能拖到别的宿主。
 // - 出口：出口网络（网卡发布）。容器按目标网段（L3）或协议端口（L4）选择出网的机器，未匹配的流量走所在机器本机。
 // 拖线头或在检查器点「＋ 入口 / ＋ 出口」再点目标，改动先画成虚线，在检查器确认后提交。
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-  type PointerEvent as ReactPointerEvent,
-} from 'react';
-import type { CvmEntry, CvmEntryBoard, CvmInstance, CvmNicCatalog, CvmWorkspace } from '../../../api';
-import { stackHosts, statusText } from '../queries';
+  entryStateText,
+  type CvmChainCatalog,
+  type CvmEntry,
+  type CvmEntryBoard,
+  type CvmInstance,
+  type CvmNicCatalog,
+  type CvmWorkspace,
+} from '../../../api';
+import { RegionFlag } from '../../../ui/region-flag';
+import { NetworkLogsButton } from '../network-logs';
+import { capacity, stackHosts, statusText } from '../queries';
 import { Inspector, type Proposal, type Pick } from './inspector';
 import {
   entryMachines,
@@ -26,8 +29,8 @@ import {
   type AddressRow,
   type RuleLink,
 } from './model';
+import { along, curve, useAnchorGeometry, WireLabel, type Point } from './wires';
 
-type Point = { x: number; y: number };
 /** 入口的来源：已有入口（改派），或共享地址的空闲端口、空闲的独立地址（新增）。 */
 export type EntrySource = { type: 'entry'; entry: string } | { type: 'port' | 'whole'; row: string };
 type Drag =
@@ -42,12 +45,14 @@ export function CompositionBoard({
   workspace,
   entries,
   catalog,
+  chains,
   selected,
   onSelect,
 }: {
   workspace: CvmWorkspace;
   entries: CvmEntryBoard;
   catalog: CvmNicCatalog | undefined;
+  chains: CvmChainCatalog | undefined;
   selected: string | null;
   onSelect: (id: string | null) => void;
 }) {
@@ -56,43 +61,12 @@ export function CompositionBoard({
   const exits = exitTiles(catalog, workspace.hosts);
   const rules = ruleLinks(instances);
   const writable = workspace.can_write;
-  const board = useRef<HTMLDivElement>(null);
-  const [geo, setGeo] = useState<{ anchors: Record<string, Point>; width: number; height: number }>({
-    anchors: {},
-    width: 0,
-    height: 0,
-  });
+  const { root: board, geo } = useAnchorGeometry<HTMLDivElement>();
   const [hover, setHover] = useState<string | null>(null);
   const [drag, setDrag] = useState<Drag | null>(null);
   const [target, setTarget] = useState<Verdict | null>(null);
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [pick, setPick] = useState<Pick | null>(null);
-
-  const measure = useCallback(() => {
-    const root = board.current;
-    if (!root) return;
-    const box = root.getBoundingClientRect();
-    const anchors: Record<string, Point> = {};
-    root.querySelectorAll<HTMLElement>('[data-anchor]').forEach(element => {
-      const rect = element.getBoundingClientRect();
-      anchors[element.dataset.anchor!] = {
-        x: rect.left + rect.width / 2 - box.left,
-        y: rect.top + rect.height / 2 - box.top,
-      };
-    });
-    setGeo(old => {
-      const next = { anchors, width: box.width, height: box.height };
-      return JSON.stringify(old) === JSON.stringify(next) ? old : next;
-    });
-  }, []);
-  useLayoutEffect(measure);
-  useEffect(() => {
-    const root = board.current;
-    if (!root || typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(measure);
-    observer.observe(root);
-    return () => observer.disconnect();
-  }, [measure]);
 
   const local = (event: { clientX: number; clientY: number }): Point => {
     const box = board.current!.getBoundingClientRect();
@@ -126,6 +100,20 @@ export function CompositionBoard({
   const judgeExit = (rule: string | null, exit: string, instanceId: string): Verdict => {
     const link = rule ? rules.find(item => item.key === rule) : null;
     const instance = instanceOf(instanceId);
+    if (exit.startsWith('chain:')) {
+      const chain = chains?.chains.find(c => `chain:${c.id}` === exit);
+      if (!instance || !chain) return { id: exit, ok: false, reason: '线路目录读取中或已失效' };
+      if (link?.exit === exit) return { id: exit, ok: false, reason: '当前就是这里' };
+      const owner = chains?.owner;
+      if (!owner || owner.tenant_id !== instance.tenant_id || owner.user_id !== instance.user_id)
+        return { id: exit, ok: false, reason: '正在检查容器使用者授权' };
+      if (!chain.authorized) return { id: exit, ok: false, reason: `${owner.name} 未获授权` };
+      if (chain.unavailable_reason) return { id: exit, ok: false, reason: chain.unavailable_reason };
+      if (!chains?.supported) return { id: exit, ok: false, reason: chains?.reason ?? '宿主尚不支持线路出口' };
+      if (link?.route.destination.includes(':') && !chain.ipv6)
+        return { id: exit, ok: false, reason: '线路未确认 IPv6 落地' };
+      return { id: exit, ok: true, reason: null };
+    }
     const tile = exits.find(item => item.id === exit);
     if (!instance || !tile) return { id: exit, ok: false, reason: '不可用' };
     if (link?.exit === exit) return { id: exit, ok: false, reason: '当前就是这里' };
@@ -229,21 +217,6 @@ export function CompositionBoard({
   const litEntry = (entry: CvmEntry) => (focusExit ? false : focus ? entry.instance_id === focus : true);
   const litRule = (rule: RuleLink) => (focusExit ? rule.exit === focusExit : focus ? rule.instance === focus : true);
   const quiet = !!drag || !!pick;
-  const curve = (a: Point, b: Point) => {
-    const dx = Math.max(36, Math.abs(b.x - a.x) * 0.5);
-    return `M${a.x} ${a.y} C${a.x + dx} ${a.y}, ${b.x - dx} ${b.y}, ${b.x} ${b.y}`;
-  };
-  const along = (a: Point, b: Point, t: number): Point => {
-    const dx = Math.max(36, Math.abs(b.x - a.x) * 0.5);
-    const p1 = { x: a.x + dx, y: a.y };
-    const p2 = { x: b.x - dx, y: b.y };
-    const u = 1 - t;
-    return {
-      x: u * u * u * a.x + 3 * u * u * t * p1.x + 3 * u * t * t * p2.x + t * t * t * b.x,
-      y: u * u * u * a.y + 3 * u * u * t * p1.y + 3 * u * t * t * p2.y + t * t * t * b.y,
-    };
-  };
-
   const selectedInstance = instances.find(item => item.desired.id === selected) ?? null;
   const proposalFor = proposal && proposal.instance === selectedInstance?.desired.id ? proposal : null;
   const proposedEntry = proposal?.kind === 'entry-move' ? proposal.entry : null;
@@ -272,6 +245,9 @@ export function CompositionBoard({
           {entry.mode.kind === 'l3' ? entry.visible_address : entry.mode.listen_port}
         </span>
         <span className="cz-map-to">
+          {entry.state !== 'active' && (
+            <i className={`cz-state-dot ${entry.state}`} role="img" aria-label={entryStateText[entry.state]} />
+          )}
           {owner?.desired.spec.name ?? '其他容器'}
           {entry.mode.kind === 'l4' && <span className="mono">:{entry.mode.target_port}</span>}
         </span>
@@ -341,7 +317,13 @@ export function CompositionBoard({
             <div className="cz-addr" key={machine.node}>
               <div className="cz-addr-head">
                 <b>{machine.name}</b>
-                {hostIds.has(machine.node) && <span className="cz-kind">也提供计算</span>}
+                {hostIds.has(machine.node) && <span className="cz-kind">兼计算</span>}
+                <NetworkLogsButton
+                  iconOnly
+                  title="入口机器网络日志"
+                  allowed={workspace.can_manage_network}
+                  machines={[{ node_id: machine.node, name: machine.name, role: '入口' }]}
+                />
               </div>
               {machine.addresses.map(row => {
                 const visible = row.offer.public_address ?? row.offer.address;
@@ -395,20 +377,46 @@ export function CompositionBoard({
             const here = instances.filter(item => item.node_id === id);
             const caps = host?.capabilities;
             const used = here.reduce((sum, item) => sum + item.desired.spec.resources.vcpus, 0);
+            const memory = here.reduce((sum, item) => sum + item.desired.spec.resources.memory_bytes, 0);
             return (
               <div key={id} className="cz-host">
                 <div className="cz-host-head">
                   <b>{name}</b>
                   {host && !host.fresh && <span className="cz-kind warn">离线</span>}
-                  {caps && (
-                    <span className="cz-host-free" title="已分配 / 可分配">
-                      {used}/{caps.allocatable_vcpus} 核
-                    </span>
-                  )}
+                  <NetworkLogsButton
+                    iconOnly
+                    title="宿主网络配置日志"
+                    allowed={workspace.can_manage_network}
+                    machines={[{ node_id: id, name, role: '计算' }]}
+                  />
                 </div>
-                {caps && caps.allocatable_vcpus > 0 && (
-                  <div className="cz-meter" aria-hidden="true">
-                    <i style={{ width: `${Math.min(100, (used / caps.allocatable_vcpus) * 100)}%` }} />
+                {caps && (
+                  <div className="cz-cap" title="逻辑已分配 / 宿主基准 · 允许超售">
+                    {[
+                      {
+                        label: 'vCPU',
+                        used,
+                        total: caps.allocatable_vcpus,
+                        text: `${used} / ${caps.allocatable_vcpus}`,
+                      },
+                      {
+                        label: '内存',
+                        used: memory,
+                        total: caps.allocatable_memory_bytes,
+                        text: `${capacity(memory)} / ${capacity(caps.allocatable_memory_bytes)}`,
+                      },
+                    ].map(row => (
+                      <span key={row.label}>
+                        <small>{row.label}</small>
+                        <b>
+                          {row.text}
+                          {row.used > row.total ? ' · 超售' : ''}
+                        </b>
+                        <i className="cz-meter" aria-hidden="true">
+                          <i style={{ width: `${row.total > 0 ? Math.min(100, (row.used / row.total) * 100) : 0}%` }} />
+                        </i>
+                      </span>
+                    ))}
                   </div>
                 )}
                 <div className="cz-pills">
@@ -486,25 +494,94 @@ export function CompositionBoard({
               >
                 <span className="cz-socket" data-anchor={`exit:${exit.id}`} />
                 <div className="cz-net-head">
-                  <b>{exit.provider}</b>
-                  <span className="cz-kind">{exit.publication.spec.name}</span>
+                  <b>{exit.publication.spec.name}</b>
+                  <span className="cz-kind">
+                    {exit.kind === 'private' ? '内网' : exit.kind === 'shared' ? '共享 NAT' : '独立地址'}
+                  </span>
+                  <NetworkLogsButton
+                    iconOnly
+                    title="出口网络日志"
+                    allowed={workspace.can_manage_network}
+                    machines={[{ node_id: exit.publication.spec.provider_node, name: exit.provider, role: '出口' }]}
+                  />
                 </div>
+                <div className="cz-net-sub">{exit.provider}</div>
                 <div className="cz-net-meta">
                   <span className="mono">
                     {exit.kind === 'private'
                       ? exit.publication.spec.destinations.join(' ')
                       : (exit.address ?? (exit.kind === 'dedicated' ? '独立地址' : '共享出口'))}
                   </span>
-                  <span>{links.length ? `${links.length} 条` : ''}</span>
+                  <span>{links.length ? `${links.length} 条规则` : '未使用'}</span>
                 </div>
                 {verdict && !verdict.ok && <div className="cz-reason">{verdict.reason}</div>}
               </div>
             );
           })}
           {!exits.length && <p className="note cz-col-empty">还没有可用的出口网络</p>}
+          <div className="cz-net cz-chains" aria-label="线路出口">
+            <div className="cz-net-head">
+              <b>线路</b>
+              <span className="cz-kind">主网卡 · TCP/UDP</span>
+            </div>
+            {(chains?.chains ?? []).map(chain => {
+              const id = `chain:${chain.id}`;
+              const verdict = (drag?.kind === 'rule' || pick?.kind === 'rule') && target?.id === id ? target : null;
+              const links = rules.filter(r => r.exit === id);
+              const proposed =
+                (proposal?.kind === 'rule-new' || proposal?.kind === 'rule-move') && proposal.exit === id;
+              return (
+                <button
+                  type="button"
+                  key={id}
+                  data-exit={id}
+                  title={
+                    chain.unavailable_reason ??
+                    (chain.authorized
+                      ? `${chains?.owner?.name ?? '使用者'} 已获授权`
+                      : chains?.owner
+                        ? `${chains.owner.name} 未获授权`
+                        : '选择容器检查授权')
+                  }
+                  className={`cz-chain-row ${chain.reachable === false ? 'failed' : ''} ${verdict ? (verdict.ok ? 'drop-ok' : 'drop-no') : ''} ${proposed ? 'drop-ok' : ''}`}
+                  onPointerEnter={() => setHover(`exit:${id}`)}
+                  onPointerLeave={() => setHover(null)}
+                  onClick={() => {
+                    if (pick?.kind !== 'rule') return;
+                    const result = judgeExit(null, id, pick.instance);
+                    setTarget(result);
+                    if (result.ok) {
+                      setProposal({ kind: 'rule-new', instance: pick.instance, exit: id });
+                      setPick(null);
+                    }
+                  }}
+                >
+                  <span className="cz-socket" data-anchor={`exit:${id}`} />
+                  <RegionFlag code={chain.country} />
+                  <span className="cz-chain-name">{chain.name}</span>
+                  <small>
+                    {chain.reachable === false ? '不通' : chain.rtt_ms !== null ? `${chain.rtt_ms} ms` : '未拨测'}
+                  </small>
+                  <small>
+                    {links.length
+                      ? `${links.length} 条`
+                      : chain.unavailable_reason
+                        ? '不支持'
+                        : chain.authorized
+                          ? '可用'
+                          : '未授权'}
+                  </small>
+                  {verdict && !verdict.ok && <span className="cz-reason">{verdict.reason}</span>}
+                </button>
+              );
+            })}
+            {!chains?.chains.length && <p className="note">选择容器后显示其使用者有授权的线路。</p>}
+            {!!chains?.hidden_unauthorized && <p className="note">另有 {chains.hidden_unauthorized} 条未授权线路</p>}
+            {chains?.reason && selected && <p className="note">{chains.reason}</p>}
+          </div>
         </section>
 
-        {/* ── 连线 ── */}
+        {/* ── 连线：线在卡片下层，标签、把手、待确认与拖动中的线浮在卡片之上 ── */}
         <svg className="cz-wires" width={geo.width} height={geo.height} aria-hidden="true">
           {entries.entries.map(entry => {
             const from = geo.anchors[`entry:${entry.id}`];
@@ -526,27 +603,38 @@ export function CompositionBoard({
             const from = geo.anchors[`out:${rule.instance}`];
             const to = rule.exit ? geo.anchors[`exit:${rule.exit}`] : undefined;
             if (!from || !to) return null;
-            const on = litRule(rule);
             const exit = exits.find(item => item.id === rule.exit);
-            const pair = pairs.get(`${rule.instance}>${rule.exit}`) ?? [rule];
-            const showLabel = on && !drag && pair[0] === rule && (focus === rule.instance || focusExit === rule.exit);
-            const label = along(from, to, 0.5);
-            const handle = along(from, to, 0.94);
             const lifted = proposedRule === rule.key || (drag?.kind === 'rule' && drag.rule === rule.key);
             const status = instanceOf(rule.instance)?.status ?? '';
             return (
               <g
                 key={rule.key}
-                className={`cz-wire out ${rule.layer} ${exit?.kind === 'private' ? 'private' : ''} ${on ? 'on' : 'off'} ${
-                  lifted ? 'lifted' : ''
-                } ${status}`}
+                className={`cz-wire out ${rule.layer} ${exit?.kind === 'private' ? 'private' : ''} ${
+                  litRule(rule) ? 'on' : 'off'
+                } ${lifted ? 'lifted' : ''} ${status}`}
               >
                 <path d={curve(from, to)} />
+              </g>
+            );
+          })}
+        </svg>
+        <svg className="cz-wires cz-wires-over" width={geo.width} height={geo.height} aria-hidden="true">
+          {rules.map(rule => {
+            const from = geo.anchors[`out:${rule.instance}`];
+            const to = rule.exit ? geo.anchors[`exit:${rule.exit}`] : undefined;
+            if (!from || !to) return null;
+            const on = litRule(rule);
+            const pair = pairs.get(`${rule.instance}>${rule.exit}`) ?? [rule];
+            const showLabel = on && !drag && pair[0] === rule && (focus === rule.instance || focusExit === rule.exit);
+            const lifted = proposedRule === rule.key || (drag?.kind === 'rule' && drag.rule === rule.key);
+            const handle = along(from, to, 0.86);
+            return (
+              <g key={rule.key}>
                 {showLabel && (
-                  <text x={label.x} y={label.y - 7} textAnchor="middle">
-                    {routeLabel(rule.route)}
-                    {pair.length > 1 ? ` +${pair.length - 1}` : ''}
-                  </text>
+                  <WireLabel
+                    at={along(from, to, 0.5)}
+                    text={`${routeLabel(rule.route)}${pair.length > 1 ? ` +${pair.length - 1}` : ''}`}
+                  />
                 )}
                 {writable && selected === rule.instance && !drag && !lifted && (
                   <circle
@@ -564,7 +652,7 @@ export function CompositionBoard({
           })}
           {proposal &&
             (() => {
-              const ends: [string, string] | null =
+              const ends: [string, string] =
                 proposal.kind === 'entry-move'
                   ? [`entry:${proposal.entry}`, `in:${proposal.instance}`]
                   : proposal.kind === 'entry-new'
@@ -592,6 +680,7 @@ export function CompositionBoard({
         instances={instances}
         entries={entries}
         catalog={catalog}
+        chains={chains}
         machines={machines}
         exits={exits}
         rules={rules}
@@ -654,7 +743,7 @@ function Pill({
       {reason ? (
         <em className="bad">{reason}</em>
       ) : local ? (
-        <em title="未匹配出口规则的流量走所在机器本机">本机出口</em>
+        <em title="未匹配出口规则的流量走所在机器本机">本机</em>
       ) : null}
       <span
         className={`cz-port out ${writable ? '' : 'idle'}`}

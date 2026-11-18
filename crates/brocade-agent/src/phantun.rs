@@ -50,14 +50,14 @@ pub(crate) struct PhantunInstance {
 }
 
 impl PhantunInstance {
-    fn program(&self) -> &'static str {
+    pub(crate) fn program(&self) -> &'static str {
         match &self.kind {
             PhantunInstanceKind::Server { .. } => "phantun-server",
             PhantunInstanceKind::Client { .. } => "phantun-client",
         }
     }
 
-    fn args(&self) -> Vec<String> {
+    pub(crate) fn args(&self) -> Vec<String> {
         let (local, remote) = match &self.kind {
             PhantunInstanceKind::Server {
                 tcp_port,
@@ -87,6 +87,34 @@ impl PhantunInstance {
             "--tun-peer".to_owned(),
             self.tun.peer.clone(),
         ]
+    }
+
+    #[cfg(feature = "cvm")]
+    pub(crate) fn server(port: u16, udp: u16, name: String, local: String, peer: String) -> Self {
+        Self {
+            kind: PhantunInstanceKind::Server {
+                tcp_port: port,
+                forward_to_udp_port: udp,
+            },
+            tun: PhantunTun { name, local, peer },
+        }
+    }
+    #[cfg(feature = "cvm")]
+    pub(crate) fn client(
+        udp: u16,
+        remote: String,
+        name: String,
+        local: String,
+        peer: String,
+    ) -> Self {
+        Self {
+            kind: PhantunInstanceKind::Client {
+                peer: remote.clone(),
+                listen_udp_port: udp,
+                remote_tcp_endpoint: remote,
+            },
+            tun: PhantunTun { name, local, peer },
+        }
     }
 
     fn label(&self) -> String {
@@ -426,14 +454,81 @@ fn stop_phantun() {
            | grep 'comment \"brocade\"' | grep -o 'handle [0-9]*' | awk '{print $2}' \
            | while read -r h; do nft delete rule ip filter DOCKER-USER handle \"$h\" || true; done",
     );
-    let _ = run_shell(
-        "pkill -x phantun-server 2>/dev/null || true\n\
-         pkill -x phantun-client 2>/dev/null || true\n\
-         for _ in $(seq 1 20); do\n\
-           pgrep -x phantun-server >/dev/null 2>&1 || pgrep -x phantun-client >/dev/null 2>&1 || break\n\
-           sleep 0.25\n\
-         done",
-    );
+    // Entry tunnels share the binaries, not this component's process lifetime.
+    let mut stopping = Vec::new();
+    for (pid, path) in backbone_processes() {
+        // SAFETY: only positive procfs PIDs with the verified backbone TUN arguments match.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        stopping.push(path);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while stopping
+        .iter()
+        .any(|path| fs::read(path.join("cmdline")).is_ok_and(|bytes| !bytes.is_empty()))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn backbone_process(argv: &[String]) -> bool {
+    argv.first()
+        .and_then(|s| Path::new(s).file_name())
+        .is_some_and(|name| name == "phantun-client" || name == "phantun-server")
+        && argv.windows(2).any(|args| {
+            args[0] == "--tun"
+                && args[1].starts_with(TUN_PREFIX)
+                && args[1].len() <= 15
+                && args[1]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+}
+
+fn backbone_processes() -> Vec<(i32, std::path::PathBuf)> {
+    let Ok(processes) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    processes
+        .flatten()
+        .filter_map(|process| {
+            let pid = process
+                .file_name()
+                .to_str()?
+                .parse::<i32>()
+                .ok()
+                .filter(|pid| *pid > 0)?;
+            let bytes = fs::read(process.path().join("cmdline")).ok()?;
+            let argv = bytes
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect::<Vec<_>>();
+            backbone_process(&argv).then(|| (pid, process.path()))
+        })
+        .collect()
+}
+
+#[cfg(feature = "cvm")]
+pub(crate) fn transport_listeners(state_dir: &Path) -> Result<BTreeSet<u16>, String> {
+    if state_dir.join("phantun.disabled").exists() {
+        return Ok(BTreeSet::new());
+    }
+    let Some(bytes) = crate::fsutil::read_bounded(&state_dir.join("phantun.json"), 1024 * 1024)?
+    else {
+        return Ok(BTreeSet::new());
+    };
+    let plan =
+        serde_json::from_slice(&bytes).map_err(|_| "invalid managed Phantun listener plan")?;
+    Ok(phantun_instances_from_plan(&plan)?
+        .into_iter()
+        .filter_map(|instance| match instance.kind {
+            PhantunInstanceKind::Server { tcp_port, .. } => Some(tcp_port),
+            _ => None,
+        })
+        .collect())
 }
 
 pub(crate) fn observe_linux_phantun(
@@ -665,8 +760,7 @@ pub(crate) fn phantun_wanted(path: &Path) -> bool {
 }
 
 pub(crate) fn phantun_running() -> bool {
-    command_success("pgrep", &["-x", "phantun-server"])
-        || command_success("pgrep", &["-x", "phantun-client"])
+    !backbone_processes().is_empty()
 }
 
 /// Whether the kernel state installed beside the processes is still standing.
@@ -1040,5 +1134,28 @@ mod tests {
         assert!(!logs.join("phantun-client-retired.log").exists());
         assert!(logs.join("notes.log").exists());
         let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    #[test]
+    fn backbone_stop_preserves_entry_and_foreign_phantun_processes() {
+        let args = |name: &str| {
+            vec![
+                "/usr/local/bin/phantun-client".into(),
+                "--tun".into(),
+                name.into(),
+            ]
+        };
+        assert!(backbone_process(&args("bt12345")));
+        assert!(!backbone_process(&args("bep12345")));
+        assert!(!backbone_process(&args("tun0")));
+        assert!(!backbone_process(&[
+            "other".into(),
+            "--tun".into(),
+            "bt12345".into()
+        ]));
     }
 }

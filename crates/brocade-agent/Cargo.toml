@@ -8,11 +8,14 @@ license.workspace = true
 
 [features]
 default = []
-cvm = ["dep:brocade-cube", "brocade-deployment/cvm"]
+cvm = ["dep:brocade-cube", "dep:brocade-cvm-compile", "brocade-deployment/cvm", "dep:cube-terminal", "dep:async-trait"]
 
 [dependencies]
+cube-terminal = { path = "../../components/cube/CubeShim/terminal", optional = true, features = ["server"] }
+async-trait = { version = "0.1", optional = true }
 brocade-core = { path = "../brocade-core" }
 brocade-cube = { path = "../brocade-cube", optional = true }
+brocade-cvm-compile = { path = "../brocade-cvm-compile", optional = true }
 brocade-deployment = { path = "../brocade-deployment" }
 brocade-probe = { path = "../brocade-probe" }
 serde = { version = "1.0.229", features = ["derive"] }

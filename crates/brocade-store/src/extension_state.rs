@@ -1,5 +1,5 @@
 //! Read-only guards remain available when the CVM business module is not compiled.
-use crate::{PgStore, Result, StoreError};
+use crate::{AdminContext, PgStore, Result, StoreError};
 use sqlx::{Postgres, Transaction};
 
 pub(crate) async fn ensure_node_released(
@@ -25,6 +25,7 @@ pub(crate) async fn ensure_node_released(
     .bind(node)
     .fetch_one(&mut **tx)
     .await?;
+    ensure_no_cvm_release(tx, Some(node)).await?;
     if occupied {
         return Err(StoreError::Conflict(
             "机器仍有容器网络或访问入口，请使用容器版完成清理".into(),
@@ -70,6 +71,7 @@ impl PgStore {
         )
         .fetch_one(&mut *tx)
         .await?;
+        ensure_no_cvm_release(&mut tx, None).await?;
         if occupied {
             return Err(StoreError::Conflict(
                 "CVM 资源仍在使用或等待清理，不能切换为基础版".into(),
@@ -77,5 +79,113 @@ impl PgStore {
         }
         tx.commit().await?;
         Ok(())
+    }
+}
+
+async fn ensure_no_cvm_release(
+    tx: &mut Transaction<'_, Postgres>,
+    node: Option<&str>,
+) -> Result<()> {
+    // Preflight also runs against published schema 0007 before migration 0008 is applied.
+    let present: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.cvm_revision_nodes') IS NOT NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    if !present {
+        return Ok(());
+    }
+    let busy:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM deployments d JOIN deployment_targets t ON t.deployment_id=d.id JOIN deployment_target_state s ON s.deployment_id=t.deployment_id AND s.node_id=t.node_id WHERE d.active=TRUE AND s.cvm_revision_id IS NOT NULL AND ($1::text IS NULL OR t.node_id=$1) AND t.status IN ('pending','dispatched','converging','failed-recovered','failed-dirty'))").bind(node).fetch_one(&mut **tx).await?;
+    let pending:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_revision_nodes r LEFT JOIN cvm_serving_nodes s ON s.node_id=r.node_id WHERE ($1::text IS NULL OR r.node_id=$1) AND r.revision_id>COALESCE(s.revision_id,0))").bind(node).fetch_one(&mut **tx).await?;
+    if busy || pending {
+        return Err(StoreError::Conflict(
+            "容器配置尚未发布或发布尚未结束，不能切换为基础版".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Model-only rollback cannot rewind an independent resource ledger or its serving pointer.
+pub(crate) async fn ensure_model_rollback_safe(
+    tx: &mut Transaction<'_, Postgres>,
+    deployment: i64,
+    revision: u64,
+) -> Result<()> {
+    let present: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.cvm_revision_nodes') IS NOT NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    if !present {
+        return Ok(());
+    }
+    let incompatible:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM deployment_target_state WHERE deployment_id=$1 AND cvm_revision_id IS NOT NULL) OR EXISTS(SELECT 1 FROM cvm_revision_nodes WHERE revision_id>$2)")
+        .bind(deployment).bind(i64::try_from(revision).map_err(|_| StoreError::InvalidData("revision exceeds i64".into()))?).fetch_one(&mut **tx).await?;
+    if incompatible {
+        return Err(StoreError::Unsupported("混合发布包含容器或网络资源，不能只回滚机器模型；请单独取消发布，并通过容器配置创建新的补偿修订后发布".into()));
+    }
+    Ok(())
+}
+
+// Historical mixed releases remain scoped even in a base Console.
+pub(crate) fn present_cvm_artifacts(
+    actor: &AdminContext,
+    targets: &mut [brocade_deployment::protocol::DeploymentTargetDetail],
+) {
+    for target in targets {
+        let Some(instances) = target
+            .desired_structure
+            .get_mut("cvm")
+            .and_then(|c| c.get_mut("instances"))
+            .and_then(|v| v.as_array_mut())
+        else {
+            continue;
+        };
+        instances.retain(|instance| {
+            actor.is_system_admin()
+                || match (instance["tenant_id"].as_str(), instance["user_id"].as_str()) {
+                    (Some(t), Some(u)) => {
+                        if actor.role() == crate::AdminRole::User {
+                            actor
+                                .self_user()
+                                .is_some_and(|me| me.tenant_id == t && me.user_id == u)
+                        } else {
+                            actor.is_global_scope() || actor.can_access_tenant(t)
+                        }
+                    }
+                    _ => false,
+                }
+        });
+        let visible: std::collections::BTreeSet<String> = instances
+            .iter()
+            .filter_map(|i| i["id"].as_str().map(str::to_owned))
+            .collect();
+        if let Some(cvm) = target.desired_structure.get_mut("cvm") {
+            if let Some(clients) = cvm.get_mut("chain_clients").and_then(|v| v.as_array_mut()) {
+                clients.retain(|client| {
+                    actor.is_system_admin()
+                        || match (client["tenant_id"].as_str(), client["user_id"].as_str()) {
+                            (Some(t), Some(u)) if actor.role() == crate::AdminRole::User => actor
+                                .self_user()
+                                .is_some_and(|me| me.tenant_id == t && me.user_id == u),
+                            (Some(t), Some(_)) => {
+                                actor.is_global_scope() || actor.can_access_tenant(t)
+                            }
+                            _ => false,
+                        }
+                });
+            }
+            // Host tables span owners. Instance owners retain their own four-file products.
+            if !actor.is_system_admin() {
+                cvm.as_object_mut().map(|o| o.remove("host_products"));
+            }
+        }
+        if let Some(receipts) = target
+            .observed_after
+            .as_mut()
+            .and_then(|v| v.get_mut("cvm"))
+            .and_then(|v| v.get_mut("instances"))
+            .and_then(|v| v.as_array_mut())
+        {
+            receipts.retain(|r| r["id"].as_str().is_some_and(|id| visible.contains(id)));
+        }
     }
 }

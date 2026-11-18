@@ -398,6 +398,9 @@ func (s *server) ensureNICs(r *record, d object) ([]any, object, []any, error) {
 	if info.State != "Running" {
 		return nil, nil, nil, errors.New("VMM is not running")
 	}
+	if e = s.ensurePrimaryRoutes(r, d, info); e != nil {
+		return nil, nil, nil, e
+	}
 	if r.ContactMAC == "" {
 		for _, nic := range info.Config.Net {
 			if !strings.HasPrefix(nic.ID, "cvm-") {

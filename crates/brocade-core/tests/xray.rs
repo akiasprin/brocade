@@ -3266,7 +3266,8 @@ fn machine_egress_dns_is_global_without_replacing_default_dns() {
         routes
             .iter()
             .find(|rule| {
-                rule["domain"] == serde_json::json!(["disney"]) && rule.get("user").is_none()
+                rule["domain"] == serde_json::json!(["keyword:disney"])
+                    && rule.get("user").is_none()
             })
             .unwrap()["outboundTag"],
         v6_outbound_tag

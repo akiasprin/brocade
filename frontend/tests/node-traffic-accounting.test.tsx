@@ -218,7 +218,8 @@ describe('node traffic accounting values', () => {
       </QueryClientProvider>,
     );
 
-    const title = await screen.findByText('流量统计');
+    await screen.findByRole('combobox', { name: '机器流量计量口径' });
+    const title = screen.getByText('流量统计');
     const panel = title.closest('.node-traffic-accounting');
     expect(panel?.tagName).toBe('DIV');
     expect(panel?.querySelector('summary')).toBeNull();

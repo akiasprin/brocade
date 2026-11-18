@@ -96,11 +96,11 @@ describe('用户额度交互', () => {
         app={app}
         used={1 * GiB}
         limit={10 * GiB}
-        access={{ grantedCount: 3, countries: ['JP', 'HK'], chains: ['东京 IIJ', '香港 HKT'], suspended: [] }}
+        access={{ grantedCount: 3, chains: ['东京 IIJ', '香港 HKT'], suspended: [] }}
       />,
     );
 
-    expect(container.querySelectorAll('.qta-app .geo-flag')).toHaveLength(2);
+    expect(container.querySelector('.qta-app .geo-flag')).toBeNull();
     expect(container.querySelector('.qta-sub')?.textContent).toBe('3 个接入点');
     expect(container.querySelector('.qta-sub')?.getAttribute('title')).toBe('东京 IIJ、香港 HKT');
 
@@ -109,7 +109,7 @@ describe('用户额度交互', () => {
         app={app}
         used={11 * GiB}
         limit={10 * GiB}
-        access={{ grantedCount: 0, countries: ['JP'], chains: [], suspended: ['东京 IIJ', '东京 IIJ'] }}
+        access={{ grantedCount: 0, chains: [], suspended: ['东京 IIJ', '东京 IIJ'] }}
       />,
     );
 

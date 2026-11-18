@@ -6,6 +6,7 @@ import { useObservationUpdates } from '../observation-events';
 import { freshFleetNicSample, useFleetRealtime, type FleetRealtimeNode } from '../fleet-realtime';
 import { lazy } from '../ui/lazy';
 import { NodeUnlockPanel } from './node-unlock';
+import './node-detail-loading.css';
 import { SourceAccessPanel } from './source-access';
 import {
   TrafficLimitChip,
@@ -67,6 +68,7 @@ import {
   restoreNodeService,
   saveNodeLogPolicy,
   saveNodeRegion,
+  saveNodeNotifications,
   saveNodeTraffic,
   saveNodeTrafficLimit,
   setNodeCertGroup,
@@ -2526,6 +2528,42 @@ function OverlayRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canE
 // 当前值取自编译结果而非 `node.egress_allowed`——原因与相邻的 overlay 开关一致：
 // 直连接口不经过草稿预览，以它为数据源会导致切换并写入草稿后开关显示回退。
 // 编译结果尚未返回时回退到模型值，避免该行为空。
+export function IpChangeNotificationRow({ node, canEdit }: { node: NodeAgentStateItem; canEdit: boolean }) {
+  const qc = useQueryClient();
+  const save = useMutation({
+    mutationFn: (enabled: boolean) => saveNodeNotifications(node.node_id, enabled),
+    onSuccess: result => {
+      qc.setQueryData<{ nodes: NodeAgentStateItem[] }>(
+        ['nodes'],
+        previous =>
+          previous && {
+            ...previous,
+            nodes: previous.nodes.map(item =>
+              item.node_id === result.node_id
+                ? { ...item, public_ip_change_notifications: result.public_ip_changes }
+                : item,
+            ),
+          },
+      );
+      qc.invalidateQueries({ queryKey: ['nodes'] });
+      qc.invalidateQueries({ queryKey: ['machine-notifications'] });
+    },
+  });
+  return (
+    <Row k="IP 变更通知">
+      <SegSwitch
+        checked={node.public_ip_change_notifications ?? true}
+        disabled={!canEdit || save.isPending}
+        ariaLabel="IP 变更通知"
+        off="关闭"
+        on="开启"
+        onChange={enabled => save.mutate(enabled)}
+      />
+      {save.error && <ErrorBox error={save.error} />}
+    </Row>
+  );
+}
+
 function EgressRow({ node, canEdit, onSaved }: { node: NodeAgentStateItem; canEdit: boolean; onSaved: () => void }) {
   const qc = useQueryClient();
   const [staged, setStaged] = useState<boolean | null>(null);
@@ -3421,7 +3459,9 @@ export function TrafficAccountingCard({ node, canEdit }: { node: NodeAgentStateI
     },
   });
 
-  if (!mine) return null;
+  if (!mine) {
+    return traffic.isPending || traffic.error ? <NodeConfigCardState kind="usage" error={traffic.error} /> : null;
+  }
 
   const reported = mine.last_reported_at_unix_secs;
   return (
@@ -4339,6 +4379,7 @@ function openvpnExtensionStatus(node: NodeAgentStateItem) {
 }
 
 function cubeExtensionLabel(backend: string | undefined) {
+  if (backend === 'baremetal-v1') return '裸机';
   if (!backend?.startsWith('cube-')) return 'CUBE';
   const mode = /^cube-(kvm|pvm)(?:-v\d+)?$/.exec(backend)?.[1] ?? backend.slice('cube-'.length);
   return mode ? `CUBE[${mode.toUpperCase()}]` : 'CUBE';
@@ -5089,7 +5130,8 @@ export function AppliedCard({
   const a = appliedOf(node);
   const openvpn = openvpnExtensionStatus(node);
   // CUBE 是可选扩展：只有确认过运行栈或仍有保留实例的机器，才有运行健康期望。
-  const hasCubeRuntime = !!cubeHost?.capabilities.backend.startsWith('cube');
+  const hasCubeRuntime =
+    !!cubeHost?.capabilities.backend.startsWith('cube') || cubeHost?.capabilities.backend === 'baremetal-v1';
   const cubeLabel = cubeExtensionLabel(cubeHost?.capabilities.backend);
   const cubeManaged = cubeExpected || hasCubeRuntime;
   const cubeReady = cubeStatus === 'ready' && hasCubeRuntime && !!cubeHost?.fresh && !cubeHost.error;
@@ -5371,7 +5413,6 @@ function NodeChainRuleTree({
         machineRole={use.role}
         readOnly={readOnly}
         settingsReadable={settingsReadable}
-        loadingFallback={null}
       />
     </div>
   );
@@ -5543,6 +5584,20 @@ function NodeConfigState({ error }: { error?: unknown }) {
     <div className="node-detail-tab-state node-detail-tab-state-config" aria-busy={!error}>
       {error ? <ErrorBox error={error} /> : <ObservationReading />}
     </div>
+  );
+}
+
+function NodeConfigCardState({ kind, error }: { kind: 'dns' | 'usage' | 'maintenance'; error?: unknown }) {
+  const title = kind === 'dns' ? 'DNS' : kind === 'usage' ? '流量统计' : 'IP 养护';
+  return (
+    <section className="panel config-panel node-config-card-state" data-kind={kind} aria-busy={!error}>
+      <header>
+        <PanelTitle of={kind}>{title}</PanelTitle>
+      </header>
+      <div className="node-config-card-wait">
+        {error ? <ErrorBox error={error} /> : <PanelLoading label={`读取${title}…`} />}
+      </div>
+    </section>
   );
 }
 
@@ -6496,6 +6551,7 @@ export function NodeDetail({
                     </Row>
                     {/* 位于地址之后：上面几行表示外部如何访问该机器，该行表示流量能否从该机器出网——
                   两者都属于该机器的对外属性，但方向相反。 */}
+                    <IpChangeNotificationRow key={n.node_id} node={n} canEdit={system} />
                     <EgressRow node={n} canEdit={system} onSaved={onSaved} />
                   </div>
                   {dirty && (
@@ -6533,9 +6589,13 @@ export function NodeDetail({
           </div>
 
           <div>
-            {snapshot.data && <DnsCard node={n} canEdit={system} onSaved={onSaved} />}
+            {snapshot.data ? (
+              <DnsCard node={n} canEdit={system} onSaved={onSaved} />
+            ) : (
+              <NodeConfigCardState kind="dns" error={snapshot.error} />
+            )}
             {/* Maintenance owns an independent API, including stop while the model is unavailable. */}
-            <Suspense fallback={<Loading variant="form" />}>
+            <Suspense fallback={<NodeConfigCardState kind="maintenance" />}>
               <IpMaintenanceCard key={id} node={n} canEdit={system} />
             </Suspense>
             {snapshot.data && <CertGroupCard node={n} canEdit={system} />}

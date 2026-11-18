@@ -188,19 +188,25 @@ pub(super) fn initialize(root: &Path) -> CubecowResult<(File, HashMap<String, Na
     Ok((lock, index))
 }
 
-pub(super) fn volume_metadata(path: &Path) -> CubecowResult<fs::Metadata> {
+pub(super) fn volume_metadata(path: &Path, thin: bool) -> CubecowResult<fs::Metadata> {
     check_dir(
         path.parent()
             .ok_or_else(|| bad("plain volume directory is missing"))?,
     )?;
     let m = owned_file(path)?;
-    if m.len() == 0 || m.blocks().saturating_mul(512) < m.len() {
+    if m.len() == 0 || !thin && m.blocks().saturating_mul(512) < m.len() {
         return Err(bad("plain volume is missing its physical allocation"));
     }
     Ok(m)
 }
 
-pub(super) fn create(volumes: &Path, name: &str, size: u64, reserve: u64) -> CubecowResult<()> {
+pub(super) fn create(
+    volumes: &Path,
+    name: &str,
+    size: u64,
+    reserve: u64,
+    thin: bool,
+) -> CubecowResult<()> {
     if !safe_name(name) || size == 0 || size > i64::MAX as u64 {
         return Err(CubecowError::InvalidArg(
             "invalid plain volume name or size".into(),
@@ -225,14 +231,18 @@ pub(super) fn create(volumes: &Path, name: &str, size: u64, reserve: u64) -> Cub
             return Err(std::io::Error::last_os_error().into());
         }
         let free = (stat.f_bavail as u128) * (stat.f_frsize as u128);
-        if free < u128::from(size) + u128::from(reserve) {
+        if free <= u128::from(reserve) || !thin && free < u128::from(size) + u128::from(reserve) {
             return Err(bad(
                 "plain volume would consume the filesystem safety reserve",
             ));
         }
-        // SAFETY: size is checked to fit off_t; the descriptor is writable.
-        if unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, size as libc::off_t) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
+        if thin {
+            f.set_len(size)?;
+        } else {
+            // SAFETY: size is checked to fit off_t; the descriptor is writable.
+            if unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, size as libc::off_t) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
         }
         f.sync_all()?;
         sync(&staging)?;
@@ -356,6 +366,44 @@ mod tests {
         engine.delete_volume("a").unwrap();
         engine.delete_volume("b").unwrap();
         assert_eq!(engine.list_volumes(0, None).2, 0);
+    }
+
+    #[test]
+    fn thin_volume_can_exceed_free_space_and_survives_reopen() {
+        let pool = Pool::new();
+        let config = || {
+            serde_json::from_value::<AppConfig>(serde_json::json!({"log":{},"backend":{"kind":"plain","plain":{"root_dir":pool.0,"reserve_bytes":0,"thin_provision":true}}})).unwrap()
+        };
+        let engine = ReflinkEngine::initialize_without_logging(config()).unwrap();
+        let root = File::open(&pool.0).unwrap();
+        // SAFETY: fstatvfs receives a live descriptor and valid output storage.
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstatvfs(root.as_raw_fd(), &mut stat) }, 0);
+        let logical = (stat.f_bavail as u64)
+            .checked_mul(stat.f_frsize as u64)
+            .unwrap()
+            .checked_add(1 << 20)
+            .unwrap();
+        let volume = engine.create_volume("thin", logical).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&volume.device_path)
+            .unwrap();
+        assert_eq!(file.metadata().unwrap().len(), logical);
+        assert_eq!(file.metadata().unwrap().blocks(), 0);
+        file.write_all(b"persistent sparse data").unwrap();
+        file.sync_all().unwrap();
+        let inode = file.metadata().unwrap().ino();
+        drop(engine);
+        let engine = ReflinkEngine::initialize_without_logging(config()).unwrap();
+        assert_eq!(engine.get_volume_info("thin").unwrap().size_bytes, logical);
+        assert_eq!(file.metadata().unwrap().ino(), inode);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut data = [0; 22];
+        file.read_exact(&mut data).unwrap();
+        assert_eq!(&data, b"persistent sparse data");
+        engine.delete_volume("thin").unwrap();
     }
 
     #[test]

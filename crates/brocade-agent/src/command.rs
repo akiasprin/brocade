@@ -5,7 +5,7 @@
 //! commands get their own process group so a timeout also reaches grandchildren
 //! such as `curl`, not merely the outer `sh`.
 use std::{
-    io::Read,
+    io::{Read, Write},
     os::unix::process::CommandExt,
     process::{Child, Command, ExitStatus, Stdio},
     thread,
@@ -40,6 +40,22 @@ pub(crate) fn run_command_with_timeout(
     timeout: Duration,
 ) -> Result<String, String> {
     let output = capture_command_with_timeout(program, args, timeout)?;
+    command_result(program, args, output)
+}
+
+/// Send bounded private configuration through an anonymous pipe. A confined tool can
+/// consume `/dev/stdin` without opening the Agent's private state directory.
+pub(crate) fn run_command_with_input(
+    program: &str,
+    args: &[&str],
+    input: &[u8],
+) -> Result<String, String> {
+    let output =
+        capture_configured_command(program, args, DEFAULT_COMMAND_TIMEOUT, false, Some(input))?;
+    command_result(program, args, output)
+}
+
+fn command_result(program: &str, args: &[&str], output: CapturedOutput) -> Result<String, String> {
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).to_string());
     }
@@ -67,13 +83,13 @@ pub(crate) fn capture_command_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Result<CapturedOutput, String> {
-    capture_configured_command(program, args, timeout, false)
+    capture_configured_command(program, args, timeout, false, None)
 }
 
 /// Probe kernel networking in an anonymous child namespace. No persistent netns
 /// names or host interfaces survive cancellation or an Agent process restart.
 pub(crate) fn run_shell_in_private_network(script: &str, timeout: Duration) -> Result<(), String> {
-    let output = capture_configured_command("sh", &["-c", script], timeout, true)?;
+    let output = capture_configured_command("sh", &["-c", script], timeout, true, None)?;
     if output.status.success() {
         return Ok(());
     }
@@ -89,11 +105,19 @@ fn capture_configured_command(
     args: &[&str],
     timeout: Duration,
     private_network: bool,
+    input: Option<&[u8]>,
 ) -> Result<CapturedOutput, String> {
+    if input.is_some_and(|bytes| bytes.len() as u64 > crate::MAX_CONFIG_CONVERGENCE_BYTES) {
+        return Err("private command input exceeds 16 MiB".into());
+    }
     let mut command = Command::new(program);
     command
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // `0` makes the child the leader of a fresh process group.  Killing only
@@ -136,10 +160,26 @@ fn capture_configured_command(
     let stdout_reader = thread::spawn(move || read_all(stdout));
     let stderr_reader = thread::spawn(move || read_all(stderr));
 
+    // Write concurrently as well: a child can stop reading, or fail before it
+    // consumes stdin. The same process-group timeout closes the pipe in both cases.
+    let stdin_writer = input.map(|bytes| {
+        let mut stdin = child.stdin.take().expect("piped private stdin");
+        let bytes = bytes.to_vec();
+        thread::spawn(move || stdin.write_all(&bytes))
+    });
+
     let waited = wait_bounded(&mut child, timeout);
+    let written = stdin_writer.map(|writer| writer.join());
     let stdout = join_reader(stdout_reader, program, "stdout")?;
     let stderr = join_reader(stderr_reader, program, "stderr")?;
     let status = waited.map_err(|error| format!("{} {}: {error}", program, args.join(" ")))?;
+    if status.success() {
+        if let Some(written) = written {
+            written
+                .map_err(|_| format!("{program}: private stdin writer panicked"))?
+                .map_err(|error| format!("{program}: failed to write private stdin: {error}"))?;
+        }
+    }
 
     Ok(CapturedOutput {
         status,
@@ -226,7 +266,62 @@ fn terminate_process_group(child: &mut Child) {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{run_command, run_shell_with_timeout};
+    use super::{
+        capture_configured_command, run_command, run_command_with_input, run_shell_with_timeout,
+    };
+
+    #[test]
+    fn private_stdin_is_a_pipe_and_closes_after_the_complete_configuration() {
+        // A normal fleet configuration can exceed the former CVM-only 64 KiB bound.
+        let input = vec![b'x'; 256 * 1024];
+        let output = run_command_with_input(
+            "sh",
+            &["-c", "test -p /dev/stdin && cat /dev/stdin"],
+            &input,
+        )
+        .unwrap();
+        assert_eq!(output.as_bytes(), input);
+        assert_eq!(run_command("cat", &["/dev/stdin"]).unwrap(), "");
+    }
+
+    #[test]
+    fn unread_private_stdin_does_not_bypass_the_process_group_timeout() {
+        let started = Instant::now();
+        let error = capture_configured_command(
+            "sh",
+            &["-c", "trap '' TERM; sleep 30 & wait"],
+            Duration::from_millis(50),
+            false,
+            Some(&vec![b'x'; 64 * 1024]),
+        )
+        .err()
+        .expect("non-reading child must time out");
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn private_stdin_failure_preserves_the_tools_permission_error() {
+        let error = run_command_with_input(
+            "sh",
+            &["-c", "echo 'fopen: Permission denied' >&2; exit 13"],
+            &vec![b'x'; 64 * 1024],
+        )
+        .unwrap_err();
+        assert!(error.contains("fopen: Permission denied"));
+        assert!(!error.contains("private stdin"));
+    }
+
+    #[test]
+    fn oversized_private_stdin_is_rejected_before_execution() {
+        let error = run_command_with_input(
+            "nonexistent-private-input-test",
+            &[],
+            &vec![b'x'; crate::MAX_CONFIG_CONVERGENCE_BYTES as usize + 1],
+        )
+        .unwrap_err();
+        assert_eq!(error, "private command input exceeds 16 MiB");
+    }
 
     #[test]
     fn captures_stdout_without_waiting_for_a_pipe_to_fill() {

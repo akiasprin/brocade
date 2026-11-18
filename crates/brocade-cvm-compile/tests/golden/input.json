@@ -1,0 +1,90 @@
+{
+  "instance_id": "cvm-test",
+  "spec": {
+    "name": "Build box",
+    "image": {
+      "id": "debian",
+      "name": "Debian",
+      "version": "13",
+      "architecture": "x86_64",
+      "sha256": "8b10dd5e29c39f609c1508478da013196883277d131f3a098ea06dc0ade3a1f3",
+      "boot_mode": "cube-oci"
+    },
+    "resources": {
+      "vcpus": 1,
+      "memory_bytes": 134217728,
+      "root_disk_bytes": 3221225472
+    },
+    "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICoqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioq",
+    "interfaces": [
+      {
+        "id": "nic-contact",
+        "source_id": "contact",
+        "purpose": "contact",
+        "default_ipv4": false,
+        "default_ipv6": false
+      }
+    ],
+    "routing": {
+      "revision": 1,
+      "routes": [],
+      "priorities": [],
+      "dns": []
+    }
+  },
+  "image_manifest": {
+    "sha256": "8b10dd5e29c39f609c1508478da013196883277d131f3a098ea06dc0ade3a1f3",
+    "content": "{\"volumes\":[{\"name\":\"root\",\"volume_source\":{\"empty_dir\":{}}}],\"containers\":[{\"volume_mounts\":[{\"name\":\"root\",\"container_path\":\"/\"}]}]}"
+  },
+  "capabilities": {
+    "artifact_compiler": "cube-artifacts-v1",
+    "cube_storage_backend": "plain",
+    "create": true,
+    "start": true,
+    "stop": true,
+    "delete": true,
+    "stable_storage": true,
+    "retain_on_delete": false,
+    "restart": true,
+    "reinstall": true,
+    "configure": true,
+    "configure_network": true,
+    "guest_terminal": true,
+    "primary_ip_delivery": true,
+    "hot_attach": true,
+    "hot_detach": true,
+    "max_interfaces": 3,
+    "backend": "cube-kvm-v1",
+    "allocatable_vcpus": 8,
+    "allocatable_memory_bytes": 8589934592,
+    "allocatable_disk_bytes": 68719476736,
+    "images": [
+      {
+        "id": "debian",
+        "name": "Debian",
+        "version": "13",
+        "architecture": "x86_64",
+        "sha256": "8b10dd5e29c39f609c1508478da013196883277d131f3a098ea06dc0ade3a1f3",
+        "boot_mode": "cube-oci"
+      }
+    ],
+    "network_sources": [
+      {
+        "id": "contact",
+        "name": "Primary",
+        "kind": "public",
+        "description": ""
+      }
+    ],
+    "resource_limits": {
+      "min_vcpus": 1,
+      "max_vcpus": 8,
+      "min_memory_bytes": 134217728,
+      "max_memory_bytes": 4294967296,
+      "memory_step_bytes": 67108864,
+      "min_root_disk_bytes": 3221225472,
+      "max_root_disk_bytes": 34359738368,
+      "root_disk_step_bytes": 1073741824
+    }
+  }
+}

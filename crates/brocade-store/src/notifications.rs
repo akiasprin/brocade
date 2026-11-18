@@ -7,6 +7,50 @@ pub const MACHINE_EVENT_RETENTION_DAYS: u32 = 7;
 const OFFLINE_AFTER_SECS: i32 = 90;
 const DELIVERY_LEASE_SECS: i32 = 30;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeNotificationSettings {
+    pub node_id: String,
+    pub public_ip_changes: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct UpdateNodeNotificationSettings {
+    pub public_ip_changes: bool,
+}
+
+/// Bell visibility is operational metadata. Neither model revisions nor webhook delivery change.
+pub async fn update_node_settings(
+    pool: &PgPool,
+    actor: &AdminContext,
+    node_id: &str,
+    request: UpdateNodeNotificationSettings,
+) -> Result<NodeNotificationSettings> {
+    if !actor.is_system_admin() {
+        return Err(StoreError::Forbidden(
+            "only system-admin can update node notifications".into(),
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    let exists = sqlx::query_scalar::<_, String>("SELECT id FROM nodes WHERE id=$1 FOR UPDATE")
+        .bind(node_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+    if !exists {
+        return Err(StoreError::NotFound(format!("node {node_id}")));
+    }
+    sqlx::query("INSERT INTO node_notification_preferences(node_id,public_ip_changes,changed_by)
+        VALUES($1,$2,$3) ON CONFLICT(node_id) DO UPDATE
+        SET public_ip_changes=EXCLUDED.public_ip_changes,changed_by=EXCLUDED.changed_by,changed_at=now()")
+        .bind(node_id).bind(request.public_ip_changes).bind(actor.operator_id())
+        .execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(NodeNotificationSettings {
+        node_id: node_id.to_owned(),
+        public_ip_changes: request.public_ip_changes,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MachineEventView {
     pub id: i64,
@@ -630,6 +674,10 @@ async fn inbox_events(
              SELECT event.id, event.node_id, event.event_kind, event.previous_value
                FROM machine_events event JOIN nodes node ON node.id = event.node_id
               WHERE (event.id > $2 OR event.event_kind = 'public_ip_changed')
+                AND (event.event_kind <> 'public_ip_changed' OR NOT EXISTS (
+                    SELECT 1 FROM node_notification_preferences preference
+                     WHERE preference.node_id = event.node_id AND NOT preference.public_ip_changes
+                ))
                 AND ($3 OR node.tenant_id = $4 OR node.tenant_id LIKE $5 ESCAPE '\\')
               ORDER BY event.occurred_at DESC, event.id DESC
               LIMIT $1

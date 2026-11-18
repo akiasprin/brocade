@@ -1,7 +1,8 @@
+import { geodataFixture } from './fixtures/geodata-data';
 import { changeControl, choiceOptions } from './choice-helpers';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ConsoleSnapshot, NodeAgentStateItem, Rule } from '../src/api';
 import * as api from '../src/api';
 import { draft } from '../src/draft';
@@ -23,10 +24,18 @@ const resolution = {
   fallback: 'stop' as const,
 };
 
+beforeEach(() =>
+  vi.stubGlobal(
+    'fetch',
+    async (path: string, init?: RequestInit) =>
+      geodataFixture(path, init) ?? Response.json({ error: 'missing fixture' }, { status: 404 }),
+  ),
+);
 afterEach(() => {
   cleanup();
   draft.clear();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 function renderEditor(
@@ -102,7 +111,7 @@ function renderEditor(
     ],
   });
 
-  return render(
+  const view = render(
     <QueryClientProvider client={client}>
       <RuleEditor
         appId="video"
@@ -117,8 +126,26 @@ function renderEditor(
       />
     </QueryClientProvider>,
   );
+  return { ...view, client };
 }
 
+function matchValue(row: Element) {
+  return row.querySelector('.geo-chip-name')?.textContent ?? row.querySelector<HTMLInputElement>('input')?.value ?? '';
+}
+async function pickGeo(view: ReturnType<typeof render>, input: HTMLElement, value: string) {
+  fireEvent.click(input);
+  const menu = await view.findByRole('dialog', { name: 'geosite 选项' });
+  await within(menu).findByRole('listbox', { name: 'geosite' });
+  for (const chosen of menu.querySelectorAll<HTMLButtonElement>(
+    '.geo-options > button[aria-selected="true"]:not(:disabled)',
+  ))
+    fireEvent.click(chosen);
+  const search = within(menu).getByRole('textbox', { name: '搜索 geosite' });
+  fireEvent.change(search, { target: { value } });
+  fireEvent.click(await within(menu).findByRole('option', { name: value }));
+  fireEvent.keyDown(menu, { key: 'Escape' });
+  await waitFor(() => expect(view.queryByRole('dialog', { name: 'geosite 选项' })).toBeNull());
+}
 /** 链路规则里的本机 DNS 解析策略在弹层中，从出网规则旁的「查看」打开。 */
 function openMachineDns(view: ReturnType<typeof render>) {
   fireEvent.click(view.getAllByRole('button', { name: '查看本机 DNS 解析策略' })[0]);
@@ -297,6 +324,71 @@ describe('machine-scoped egress DNS', () => {
     ]);
   });
 
+  it('preserves invalid match input in the browser draft when leaving the editor', () => {
+    draft.init('invalid-rule-navigation-test');
+    draft.clear();
+    const view = renderEditor(false, initial, false, []);
+    changeControl(view.getByRole('textbox', { name: '匹配内容（规则 1）' }), {
+      target: { value: 'https://bad.example/path' },
+    });
+    expect((view.getByRole('button', { name: '保存到草稿' }) as HTMLButtonElement).disabled).toBe(true);
+
+    expect(confirmDiscardChanges()).toBe(true);
+    view.unmount();
+
+    expect(draft.ops()).toContainEqual(
+      expect.objectContaining({
+        op: 'put_step',
+        step: { rules: [{ ...initial[0], m: { t: 'domain_suffix', v: ['https://bad.example/path'] } }] },
+      }),
+    );
+  });
+
+  it('locks the rule editor and DNS dialog until save validation finishes', async () => {
+    draft.init('rule-save-validation-lock-test');
+    draft.clear();
+    let finish!: () => void;
+    const validation = new Promise<void>(resolve => {
+      finish = resolve;
+    });
+    const view = renderEditor();
+    const fetcher = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/model/validate') {
+        await validation;
+        return Response.json({ valid: true });
+      }
+      if (path === '/model/preview') return Response.json({ snapshot: view.client.getQueryData(['snapshot']) });
+      if (path === '/revisions?limit=50') return Response.json({ current_revision: null, revisions: [] });
+      return geodataFixture(path, init) ?? Response.json({}, { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetcher);
+    const match = view.getByRole('textbox', { name: '匹配内容（规则 1）' }) as HTMLInputElement;
+    changeControl(match, { target: { value: 'disneyplus.com' } });
+    const dns = openMachineDns(view);
+    const address = () => dns.getByRole('textbox', { name: /DNS 地址.*netflix\.com/ }) as HTMLInputElement;
+
+    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+    await waitFor(() => expect(fetcher.mock.calls.some(([path]) => path === '/model/validate')).toBe(true));
+    expect(match.matches(':disabled')).toBe(true);
+    expect(address().matches(':disabled')).toBe(true);
+
+    finish();
+    await waitFor(() => expect(match.matches(':disabled')).toBe(false));
+    expect(address().matches(':disabled')).toBe(false);
+    expect(draft.ops().some(op => op.op === 'put_step')).toBe(true);
+    changeControl(address(), { target: { value: '8.8.8.8' } });
+    fireEvent.click(dns.getByRole('button', { name: '完成' }));
+    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+    await waitFor(() =>
+      expect(draft.ops()).toContainEqual(
+        expect.objectContaining({
+          op: 'set_node_egress_dns',
+          resolution: expect.objectContaining({ address: '8.8.8.8' }),
+        }),
+      ),
+    );
+  });
+
   it('offers a safe sniffing fallback and pins it immediately before Any', () => {
     const view = renderEditor(
       false,
@@ -353,7 +445,7 @@ describe('machine-scoped egress DNS', () => {
     expect(footer?.textContent).toContain('1 项配置有改动');
     expect(view.queryByRole('alert')).toBeNull();
     expect((view.getByLabelText('DNS 匹配类型（geosite）') as HTMLSelectElement).value).toBe('geosite');
-    changeControl(view.getByLabelText('DNS 匹配内容（geosite）'), { target: { value: 'netflix' } });
+    await pickGeo(view, view.getByLabelText('DNS 匹配内容（geosite）'), 'netflix');
     fireEvent.click(save);
     await waitFor(() => expect(view.getByRole('alert').textContent).toBe('请填写完整的 DNS 地址，用逗号分隔'));
     expect(draft.ops()).toHaveLength(0);
@@ -395,9 +487,9 @@ describe('machine-scoped egress DNS', () => {
 
     const contents = view.getAllByLabelText(/DNS 匹配内容/);
     const addresses = view.getAllByLabelText(/DNS 地址/);
-    changeControl(contents[0], { target: { value: 'one.example' } });
+    await pickGeo(view, contents[0], 'one.example');
     changeControl(addresses[0], { target: { value: '1.1.1.1' } });
-    changeControl(contents[1], { target: { value: 'two.example' } });
+    await pickGeo(view, contents[1], 'two.example');
     changeControl(addresses[1], { target: { value: '8.8.8.8' } });
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
 
@@ -480,8 +572,8 @@ describe('machine-scoped egress DNS', () => {
 
     fireEvent.click(view.getByRole('button', { name: 'DNS 优先级下移（域名后缀 netflix.com）' }));
     const rows = view.container.querySelectorAll('.node-egress-rules-table tbody tr');
-    expect((rows[0].querySelector('input') as HTMLInputElement).value).toBe('media');
-    expect((rows[1].querySelector('input') as HTMLInputElement).value).toBe('netflix.com');
+    expect(matchValue(rows[0])).toBe('media');
+    expect(matchValue(rows[1])).toBe('netflix.com');
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
 
     await waitFor(() => expect(draft.ops()).toHaveLength(1));
@@ -525,7 +617,7 @@ describe('machine-scoped egress DNS', () => {
     expect((copy.getByLabelText('地址策略（geosite disney）') as HTMLSelectElement).value).toBe('use_ipv6');
     expect((copy.getByLabelText('失败处理（geosite disney）') as HTMLSelectElement).value).toBe('machine');
     expect(view.queryByRole('alert')).toBeNull();
-    changeControl(match, { target: { value: 'dazn' } });
+    await pickGeo(view, match, 'dazn');
     changeControl(copy.getByLabelText('DNS 地址（geosite dazn）'), { target: { value: '198.51.100.53' } });
     expect((view.getByLabelText('DNS 地址（geosite disney）') as HTMLInputElement).value).toBe(
       '192.0.2.53, 2001:db8::53',
@@ -551,7 +643,7 @@ describe('machine-scoped egress DNS', () => {
     });
   });
 
-  it('appends imported rows in source order without checking overlapping selectors or replacing local edits', () => {
+  it('keeps imported rows in source order and blocks duplicate selectors at save', () => {
     draft.init('machine-dns-import-overlap-test');
     draft.clear();
     const view = renderMachineRules(false, true, [
@@ -569,11 +661,7 @@ describe('machine-scoped egress DNS', () => {
     fireEvent.click(dialog.getByRole('button', { name: '追加导入' }));
 
     const rows = [...view.container.querySelectorAll('.node-egress-rules-table tbody tr')];
-    expect(rows.map(row => row.querySelector<HTMLInputElement>('.rule-new-dns-value')!.value)).toEqual([
-      'disney',
-      'disney',
-      'netflix',
-    ]);
+    expect(rows.map(row => matchValue(row))).toEqual(['disney', 'disney', 'netflix']);
     expect(
       view.getAllByLabelText('DNS 地址（geosite disney）').map(input => (input as HTMLInputElement).value),
     ).toEqual(['203.0.113.53', '192.0.2.53']);
@@ -594,6 +682,9 @@ describe('machine-scoped egress DNS', () => {
     fireEvent.click(view.getByRole('button', { name: '从节点导入' }));
     changeControl(view.getByLabelText('来源节点'), { target: { value: 'sg' } });
     fireEvent.click(view.getByRole('button', { name: '追加导入' }));
+    await waitFor(() =>
+      expect((view.getByRole('button', { name: '保存到草稿' }) as HTMLButtonElement).disabled).toBe(false),
+    );
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
 
     await waitFor(() => expect(draft.ops()).toHaveLength(3));
@@ -631,9 +722,10 @@ describe('machine-scoped egress DNS', () => {
     const handle = view.getByRole('button', { name: '拖动排序 DNS 策略（geosite media）' });
     fireEvent.keyDown(handle, { key: 'ArrowUp' });
     expect(document.activeElement).toBe(handle);
-    expect(
-      [...view.container.querySelectorAll<HTMLInputElement>('.rule-new-dns-value')].map(input => input.value),
-    ).toEqual(['media', 'netflix.com']);
+    expect([...view.container.querySelectorAll('.node-egress-rules-table tbody tr')].map(matchValue)).toEqual([
+      'media',
+      'netflix.com',
+    ]);
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
     await waitFor(() => expect(draft.ops()).toHaveLength(1));
     expect(draft.ops()[0]).toEqual({
@@ -723,7 +815,7 @@ describe('machine-scoped egress DNS', () => {
     expect(rows).toHaveLength(2);
     // 机器策略不进规则表：规则表下面直接是工具栏，策略在「查看」打开的弹层里按顺序一行一条。
     expect(view.container.querySelector('.rule-dns-row')).toBeNull();
-    expect((rows[0].querySelector('input') as HTMLInputElement).value).toBe('netflix.com');
+    expect(matchValue(rows[0])).toBe('netflix.com');
     expect(rows[1].classList.contains('rule-fallback-row')).toBe(true);
     const add = view.getByRole('button', { name: '＋ 加一条' });
     expect(view.container.querySelector('.rule-editor > .rule-table')?.nextElementSibling).toBe(add.parentElement);
@@ -787,7 +879,7 @@ describe('machine-scoped egress DNS', () => {
     const rows = Array.from(view.container.querySelectorAll('.rule-editor > .tbl > tbody > tr'));
 
     expect((rows[0].querySelector('select') as HTMLSelectElement).value).toBe('geosite');
-    expect((rows[0].querySelector('input') as HTMLInputElement).value).toBe('media');
+    expect(matchValue(rows[0])).toBe('media');
     expect((rows[1].querySelector('select') as HTMLSelectElement).value).toBe('any');
   });
 

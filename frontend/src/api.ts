@@ -487,7 +487,7 @@ export const fetchCompileView = (revision: number): Promise<CompileView> =>
 /* ── 节点 ── */
 
 /* 与 brocade_deployment::protocol 中的同名结构逐字段对应 */
-export const AGENT_PROTOCOL_VERSION = 70;
+export const AGENT_PROTOCOL_VERSION = 76;
 export const FORWARDING_TARGET_POLICY_PROTOCOL_VERSION = 43;
 export const MIN_AGENT_PROTOCOL_VERSION = 20;
 export const REALTIME_USER_TRAFFIC_PROTOCOL_VERSION = 27;
@@ -652,6 +652,8 @@ export interface NodeAgentStateItem {
   // 是否显式写有 Egress，允许出网的中继同样可能只做转发。与 overlay 一致：修改时当前值
   // 读取编译视图（经过草稿预览的那一份），此字段是编译结果尚未返回时的回退值。
   egress_allowed: boolean;
+  /** Live per-node bell preference; older responses inherit enabled. */
+  public_ip_change_notifications?: boolean;
   xray_enabled?: boolean;
   // 该机器的 DNS 解析器及其解析结果的使用方式。两者都是模型字段而非 agent 观测值，
   // 在此返回是为了详情页能够显示和修改——此前它们只出现在建机器表单中。
@@ -804,6 +806,12 @@ export const saveNodeRegion = (nodeId: string, countryCode: string | null) =>
     body: JSON.stringify({ country_code: countryCode }),
   });
 
+export const saveNodeNotifications = (nodeId: string, publicIpChanges: boolean) =>
+  api<{ node_id: string; public_ip_changes: boolean }>(`/nodes/${encodeURIComponent(nodeId)}/notifications`, '', {
+    method: 'PUT',
+    body: JSON.stringify({ public_ip_changes: publicIpChanges }),
+  });
+
 export const fetchNodePublicIpHistory = (nodeId: string, days = 14) =>
   api<NodePublicIpHistory>(
     `/nodes/${encodeURIComponent(nodeId)}/public-ip-history?days=${encodeURIComponent(String(days))}`,
@@ -893,6 +901,7 @@ export const fetchTenants = (token = '') => api<{ tenants: TenantListItem[] }>('
 
 /* 服务端使用 PlannedAction 的 kebab-case 形式：ApplyWireGuard → apply-wire-guard（WireGuard 被拆为两段） */
 export type PlannedAction =
+  | 'sync-cvm'
   | 'apply-phantun'
   | 'apply-hy2-port-hop'
   | 'apply-wire-guard'

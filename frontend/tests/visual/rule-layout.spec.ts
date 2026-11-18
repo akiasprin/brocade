@@ -13,7 +13,7 @@ async function expectRuleLayout(table: Locator) {
         const cells = [...row.cells];
         const action = row.querySelector('.rule-action-cell')!;
         const operations = [...row.querySelectorAll('.rule-ops-cell button')];
-        const matchFields = [...row.querySelectorAll('.rule-match-cell > .f')];
+        const matchFields = [...row.querySelectorAll('.rule-match-cell > :is(.f, .geo-field)')];
         const actionSelect = row.querySelector('select.rule-action-select');
         const dialSelect = row.querySelector('.rule-dial-select');
         return {

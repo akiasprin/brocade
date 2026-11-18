@@ -17,6 +17,8 @@ pub struct CvmHost {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CvmInstance {
+    pub revision_id: Option<u64>,
+    pub published_revision_id: Option<u64>,
     pub tenant_id: String,
     pub user_id: String,
     pub node_id: String,
@@ -63,6 +65,9 @@ pub struct CvmQuotaUsage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CvmWorkspace {
+    #[serde(default)]
+    pub can_publish: bool,
+    pub pending_revision_id: Option<u64>,
     /// Removed identities offered only to administrators for explicit re-enrollment.
     pub available_hosts: Vec<CvmHost>,
     pub network_quotas: Vec<CvmHostNetworkQuota>,
@@ -95,6 +100,7 @@ pub struct CvmCreate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum CvmChange {
+    ReleaseHost,
     Start,
     Stop,
     Restart,

@@ -952,6 +952,29 @@ impl PgStore {
         crate::draft::apply_ops(&self.pool, actor, ops, note).await
     }
 
+    pub async fn apply_draft_checked<F, Fut>(
+        &self,
+        actor: &AdminContext,
+        ops: Vec<crate::ModelOp>,
+        note: Option<String>,
+        validate: F,
+    ) -> Result<crate::ApplyDraftResult>
+    where
+        F: FnOnce(brocade_core::model::ModelSnapshot, brocade_core::model::ModelSnapshot) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        crate::draft::apply_ops_checked(&self.pool, actor, ops, note, validate).await
+    }
+
+    /// Internal typed view for validation; callers must not serialize secrets to HTTP.
+    pub async fn draft_validation_snapshot(
+        &self,
+        actor: &AdminContext,
+        ops: Vec<crate::ModelOp>,
+    ) -> Result<brocade_core::model::ModelSnapshot> {
+        crate::draft::draft_snapshot(&self.pool, actor, ops).await
+    }
+
     /// Preview a draft: execute as usual then roll back, returning what it would look like
     /// afterwards, the diagnostics, and the artifact index. Nothing remains in the
     /// database.
@@ -1532,6 +1555,15 @@ impl PgStore {
         limit: u32,
     ) -> Result<crate::MachineEventList> {
         notifications::list(&self.pool, actor, limit).await
+    }
+
+    pub async fn update_node_notification_settings(
+        &self,
+        actor: &AdminContext,
+        node_id: &str,
+        request: crate::UpdateNodeNotificationSettings,
+    ) -> Result<crate::NodeNotificationSettings> {
+        notifications::update_node_settings(&self.pool, actor, node_id, request).await
     }
 
     pub async fn mark_machine_events_read(
@@ -2971,6 +3003,12 @@ mod tests {
         let source_checksum = Sha384::digest(include_bytes!("../migrations/0001_init.sql"));
 
         assert_eq!(migration.checksum.as_ref(), source_checksum.as_slice());
+    }
+
+    #[test]
+    fn published_v038_migration_0007_is_immutable() {
+        assert_eq!(format!("{:x}", Sha384::digest(include_bytes!("../migrations/0007_user_clash_rules.sql"))),
+            "9e6eeccade5a7799d6392df0afe9982aa022965d280c46e49b2d83a1f4fbf734d590ae26e5e5408295543052446db9b8");
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ vi.mock('echarts/core', () => ({
     dispose: vi.fn(),
   })),
 }));
-vi.mock('echarts/charts', () => ({ CustomChart: {}, LineChart: {} }));
+vi.mock('echarts/charts', () => ({ CustomChart: {}, LineChart: {}, ScatterChart: {} }));
 vi.mock('echarts/components', () => ({
   GridComponent: {},
   MarkAreaComponent: {},
@@ -27,8 +27,11 @@ vi.mock('echarts/components', () => ({
 vi.mock('echarts/renderers', () => ({ CanvasRenderer: {} }));
 
 let TunnelProbePanel: typeof import('../src/tunnel-probe').TunnelProbePanel;
-let tunnelProbeFailurePeriods: typeof import('../src/tunnel-probe-chart').tunnelProbeFailurePeriods;
-let tunnelProbeGapSecs: typeof import('../src/tunnel-probe-chart').tunnelProbeGapSecs;
+let TunnelProbeActions: typeof import('../src/tunnel-probe').TunnelProbeActions;
+let TunnelProbeDraftAction: typeof import('../src/tunnel-probe').TunnelProbeDraftAction;
+let useTunnelProbeControls: typeof import('../src/tunnel-probe').useTunnelProbeControls;
+let groupTunnelProbeRuns: typeof import('../src/tunnel-probe').groupTunnelProbeRuns;
+let tunnelProbeImpact: typeof import('../src/tunnel-probe').tunnelProbeImpact;
 let draft: typeof import('../src/draft').draft;
 
 beforeAll(async () => {
@@ -39,8 +42,14 @@ beforeAll(async () => {
       disconnect() {}
     },
   );
-  ({ TunnelProbePanel } = await import('../src/tunnel-probe'));
-  ({ tunnelProbeFailurePeriods, tunnelProbeGapSecs } = await import('../src/tunnel-probe-chart'));
+  ({
+    TunnelProbePanel,
+    TunnelProbeActions,
+    TunnelProbeDraftAction,
+    useTunnelProbeControls,
+    groupTunnelProbeRuns,
+    tunnelProbeImpact,
+  } = await import('../src/tunnel-probe'));
   ({ draft } = await import('../src/draft'));
 });
 
@@ -159,15 +168,21 @@ function Panel({
   editable?: boolean;
 }) {
   const [windowSecs, setWindowSecs] = useState(86_400);
+  const controls = useTunnelProbeControls({
+    tenantId: run.tenant_id,
+    outboundId,
+    draftSupported,
+    editable,
+    windowSecs,
+  });
   return (
-    <TunnelProbePanel
-      tenantId={run.tenant_id}
-      outboundId={outboundId}
-      draftSupported={draftSupported}
-      editable={editable}
-      windowSecs={windowSecs}
-      onWindowChange={setWindowSecs}
-    />
+    <>
+      <header>
+        <TunnelProbeDraftAction controls={controls} />
+        <TunnelProbeActions controls={controls} />
+      </header>
+      <TunnelProbePanel controls={controls} windowSecs={windowSecs} onWindowChange={setWindowSecs} />
+    </>
   );
 }
 
@@ -211,7 +226,8 @@ describe('Console tunnel probes', () => {
     expect(screen.getByText('每 5 分钟 · 超时 10 秒')).toBeTruthy();
   });
 
-  it('draws failures as line breaks with a lane below the axis, and the slow threshold beside them', async () => {
+  it('draws failure buckets as line breaks, full-height shading and an aligned status lane', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_300_000);
     vi.stubGlobal('fetch', vi.fn(routes(() => jsonResponse(view))));
     render(<Panel />, { wrapper: wrapper() });
 
@@ -219,17 +235,19 @@ describe('Console tunnel probes', () => {
     const option = chartMock.options.at(-1) as {
       series: Array<{ type: string; data: unknown[]; markLine?: { data: unknown[] } }>;
     };
-    const [line, lane] = option.series;
+    const [line, , lane] = option.series;
     expect(line.data).toContainEqual([1_699_999_500_000, null]);
     const [slow, median] = line.markLine?.data ?? [];
     expect(slow).toMatchObject({ yAxis: 300 });
     // The median covers the observed runs only: from the first point to the window end.
     expect(median).toMatchObject([{ coord: [1_699_999_000_000, 88] }, {}]);
     expect(lane.type).toBe('custom');
-    expect(lane.data).toEqual([[1_699_999_320_000, 1_699_999_680_000]]);
-    expect(tunnelProbeFailurePeriods(view.points, 360)).toEqual([[1_699_999_320_000, 1_699_999_680_000]]);
-    expect(tunnelProbeGapSecs(360, 300)).toBe(660);
-    expect(tunnelProbeGapSecs(360, 3600)).toBe(3960);
+    const bucketStart = Math.floor(1_699_999_500 / 360) * 360_000;
+    expect(lane.data).toContainEqual([bucketStart + 180_000, bucketStart, bucketStart + 360_000]);
+    expect((line as unknown as { markArea: { data: unknown[] } }).markArea.data).toContainEqual([
+      expect.objectContaining({ xAxis: bucketStart, itemStyle: expect.objectContaining({ opacity: 0.1 }) }),
+      { xAxis: bucketStart + 360_000 },
+    ]);
   });
 
   it('shows the execution phase and sends durable cancellation for an active run', async () => {
@@ -327,7 +345,8 @@ describe('Console tunnel probes', () => {
     const screen = render(<Panel />, { wrapper: wrapper() });
 
     expect(await screen.findByText('草稿 12345678')).toBeTruthy();
-    const button = screen.getByRole('button', { name: '拨测草稿' }) as HTMLButtonElement;
+    fireEvent.click(screen.getByRole('button', { name: '更多拨测操作' }));
+    const button = screen.getByRole('menuitem', { name: /拨测草稿/ }) as HTMLButtonElement;
     await vi.waitFor(() => expect(button.disabled).toBe(false));
     fireEvent.click(button);
     await vi.waitFor(() => {
@@ -413,5 +432,98 @@ describe('Console tunnel probes', () => {
         expect.objectContaining({ method: 'POST', body: '{"source":"draft","ops":[]}' }),
       ),
     );
+  });
+});
+
+describe('probe history grouping', () => {
+  const scheduled = (id: number, changes: Partial<TunnelProbeRun> = {}): TunnelProbeRun => ({
+    ...run,
+    id,
+    finished_at_unix_secs: 1_700_000_000 - id * 300,
+    ...changes,
+  });
+
+  it('keeps failures separated after filtering out the intervening success', async () => {
+    const recent = [
+      scheduled(1, { ...timeoutRun, id: 1, finished_at_unix_secs: 1_700_000_000 }),
+      scheduled(2),
+      scheduled(3, { ...timeoutRun, id: 3, finished_at_unix_secs: 1_699_999_100 }),
+    ];
+    vi.stubGlobal('fetch', vi.fn(routes(() => jsonResponse({ ...view, recent_runs: recent }))));
+    const screen = render(<Panel />, { wrapper: wrapper() });
+    await screen.findByRole('group', { name: '拨测记录筛选' });
+    fireEvent.click(screen.getByRole('button', { name: '只看失败' }));
+    expect(screen.getAllByText('超时')).toHaveLength(2);
+    expect(screen.queryByText('2 次超时')).toBeNull();
+  });
+
+  it('groups matching records and exposes the original HTTP status and configuration', async () => {
+    const recent = [scheduled(1), scheduled(2)];
+    vi.stubGlobal('fetch', vi.fn(routes(() => jsonResponse({ ...view, recent_runs: recent }))));
+    const screen = render(<Panel />, { wrapper: wrapper() });
+    const label = await screen.findByText('2 次成功');
+    const group = label.closest('details')!;
+    expect(within(group.querySelector('summary')!).getByText('HTTP 200')).toBeTruthy();
+    expect(within(group).queryByText('HTTP 204')).toBeNull();
+    fireEvent.click(group.querySelector('summary')!);
+    expect(group.querySelectorAll('article')).toHaveLength(2);
+    expect(group.querySelector('article')?.title).toBe('Serving G7 · r12');
+  });
+
+  it('splits version, HTTP, exit, manual, draft and scheduling-gap boundaries', () => {
+    for (const change of [
+      { serving_generation: 8 },
+      { topology_revision: 13 },
+      { settings_revision: 13 },
+      { http_status: 201 },
+      { ttfb_ms: null },
+      { exit_ip: '203.0.113.9' },
+      { trigger: 'manual' as const },
+      { source: 'draft' as const },
+      { finished_at_unix_secs: 1_699_990_000 },
+    ]) {
+      expect(groupTunnelProbeRuns([scheduled(1), scheduled(2, change)], 300, 300)).toHaveLength(2);
+    }
+  });
+
+  it('keeps canceled and unsupported records out of the failure filter', async () => {
+    const recent = [scheduled(1, { result: 'canceled', status: 'canceled' }), scheduled(2, { result: 'unsupported' })];
+    vi.stubGlobal('fetch', vi.fn(routes(() => jsonResponse({ ...view, recent_runs: recent }))));
+    const screen = render(<Panel />, { wrapper: wrapper() });
+    await screen.findByRole('group', { name: '拨测记录筛选' });
+    fireEvent.click(screen.getByRole('button', { name: '只看失败' }));
+    expect(screen.getByText('最近 2 次记录中没有失败。')).toBeTruthy();
+  });
+
+  it('renders an empty history without inventing readings', async () => {
+    const empty: TunnelProbeView = {
+      ...view,
+      item: { ...view.item, health: 'unknown', health_reason: { kind: 'no-samples' }, latest_run: null, policy: null },
+      points: [],
+      recent_runs: [],
+      summary: {
+        ...view.summary,
+        total: 0,
+        succeeded: 0,
+        success_rate: null,
+        p50_ms: null,
+        p95_ms: null,
+        failures: 0,
+        exit_ips: 0,
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn(routes(() => jsonResponse(empty))));
+    const screen = render(<Panel />, { wrapper: wrapper() });
+    expect(await screen.findByText('暂无结论')).toBeTruthy();
+    expect(screen.getByText('还没有拨测记录。')).toBeTruthy();
+    expect(screen.container.querySelector('.tnd-metrics')?.textContent).not.toContain('null');
+    expect(screen.container.querySelector('.tnd-metrics')?.textContent).not.toContain('0%');
+  });
+
+  it('does not turn reliability failures into a claim about latency or all business traffic', () => {
+    expect(tunnelProbeImpact(view)).toContain('出现失败');
+    expect(tunnelProbeImpact(view)).not.toContain('首字节偏慢');
+    expect(tunnelProbeImpact({ ...view, item: { ...view.item, health: 'down' } })).toContain('可能受影响');
+    expect(tunnelProbeImpact({ ...view, item: { ...view.item, health: 'paused' } })).toBeNull();
   });
 });

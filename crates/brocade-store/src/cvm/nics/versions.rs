@@ -1,4 +1,5 @@
 use super::*;
+use crate::cvm::releases::Scope;
 
 fn address_fits(pool: Option<&IpPrefix>, address: Option<IpAddr>) -> bool {
     match (pool, address) {
@@ -52,7 +53,8 @@ impl PgStore {
         }
         let digest = request_digest(&(instance_id, &request))?;
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before = crate::cvm::releases::begin(&mut tx, Scope::instance(instance_id)).await?;
         if let Some(instance) =
             operation_replay(&mut tx, actor, &request.request_id, &digest).await?
         {
@@ -83,6 +85,7 @@ impl PgStore {
             desired,
         )
         .await?;
+        crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
         tx.commit().await?;
         self.cvm_instance(actor, instance_id).await
     }
@@ -155,10 +158,11 @@ async fn apply_version(
         };
     if needs_addresses && !request.reallocate {
         return Err(StoreError::Conflict(
-            "新规格会改变地址，请先关机并明确允许重新分配".into(),
+            "新规格会改变地址，请明确允许重新分配".into(),
         ));
     }
     if needs_addresses
+        && desired.spec.execution.is_cube()
         && (desired.power != PowerState::Stopped
             || instance.report.as_ref().and_then(|r| r.power) != Some(PowerState::Stopped))
     {

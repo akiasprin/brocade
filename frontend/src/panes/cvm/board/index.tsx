@@ -2,7 +2,7 @@
 import { stackHosts } from '../queries';
 import { useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
-import { fetchCvmEntries, fetchCvmNicCatalog, type CvmWorkspace } from '../../../api';
+import { fetchCvmEntries, fetchCvmNicCatalog, fetchCvmChainCatalog, type CvmWorkspace } from '../../../api';
 import { EmptyState, ErrorBox, Loading } from '../../../ui/bits';
 import { useNarrow } from '../../../ui/viewport';
 import { NIC_CATALOG } from '../network-common';
@@ -16,6 +16,11 @@ export function BoardPane({ workspace }: { workspace: CvmWorkspace }) {
   const entries = useQuery({ queryKey: ENTRY_BOARD, queryFn: fetchCvmEntries, refetchInterval: 15_000 });
   const catalog = useQuery({ queryKey: NIC_CATALOG, queryFn: fetchCvmNicCatalog, refetchInterval: 60_000 });
   const [selected, setSelected] = useState<string | null>(null);
+  const chains = useQuery({
+    queryKey: ['cvm-chain-egress', selected],
+    queryFn: () => fetchCvmChainCatalog(selected ?? undefined),
+    refetchInterval: 15_000,
+  });
   if (entries.isPending) return <Loading />;
   if (!entries.data) return <ErrorBox error={entries.error} />;
   const instances = workspace.instances.filter(instance => instance.reserved && instance.desired.power !== 'deleted');
@@ -29,8 +34,10 @@ export function BoardPane({ workspace }: { workspace: CvmWorkspace }) {
     <>
       {entries.error && <ErrorBox error={entries.error} />}
       {catalog.error && <ErrorBox error={catalog.error} />}
+      {chains.error && <ErrorBox error={chains.error} />}
       {narrow ? (
         <PhoneBoard
+          chains={chains.data}
           workspace={workspace}
           instances={instances}
           entries={entries.data}
@@ -39,6 +46,7 @@ export function BoardPane({ workspace }: { workspace: CvmWorkspace }) {
         />
       ) : (
         <CompositionBoard
+          chains={chains.data}
           workspace={workspace}
           entries={entries.data}
           catalog={catalog.data}

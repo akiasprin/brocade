@@ -101,6 +101,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -405,11 +411,14 @@ dependencies = [
 name = "brocade-agent"
 version = "0.3.8"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "brocade-core",
  "brocade-cube",
+ "brocade-cvm-compile",
  "brocade-deployment",
  "brocade-probe",
+ "cube-terminal",
  "flate2",
  "futures-util",
  "getrandom 0.3.4",
@@ -488,6 +497,7 @@ version = "0.3.8"
 dependencies = [
  "base64 0.22.1",
  "brocade-core",
+ "brocade-cvm-compile",
  "brocade-deployment",
  "cube-terminal",
  "getrandom 0.3.4",
@@ -507,6 +517,19 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tower",
+]
+
+[[package]]
+name = "brocade-cvm-compile"
+version = "0.3.8"
+dependencies = [
+ "brocade-core",
+ "brocade-deployment",
+ "prost",
+ "prost-reflect",
+ "protox",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -583,6 +606,7 @@ dependencies = [
  "argon2",
  "base64 0.22.1",
  "brocade-core",
+ "brocade-cvm-compile",
  "brocade-deployment",
  "brocade-sqlx",
  "getrandom 0.3.4",
@@ -889,8 +913,13 @@ dependencies = [
 name = "cube-terminal"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "libc",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
+ "tokio",
+ "vt100",
 ]
 
 [[package]]
@@ -2079,7 +2108,7 @@ checksum = "5f98efec8807c63c752b5bd61f862c165c115b0a35685bdcfd9238c7aeb592b7"
 dependencies = [
  "cfg-if",
  "miette-derive",
- "unicode-width",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -4230,6 +4259,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
+name = "unicode-width"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4298,6 +4333,25 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vt100"
+version = "0.18.1"
+dependencies = [
+ "itoa",
+ "unicode-width 0.2.3",
+ "vte",
+]
+
+[[package]]
+name = "vte"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+dependencies = [
+ "arrayvec",
+ "memchr",
+]
 
 [[package]]
 name = "walkdir"

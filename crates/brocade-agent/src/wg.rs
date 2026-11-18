@@ -22,6 +22,131 @@ use crate::{
     apply_phantun, apply_wireguard, current_unix_secs, icmp, run_command, run_shell, warn,
 };
 
+/// Remove wg-quick's interface-only options before passing the kernel configuration
+/// over stdin. Running `wg-quick strip <state>/wireguard.conf` itself is confined by
+/// Ubuntu's wg-quick profile, even if the later wg invocation uses an anonymous pipe.
+/// Unknown kernel options and peer sections remain for wg to validate; hooks never run.
+pub(crate) fn kernel_config(content: &str) -> Result<String, String> {
+    let mut interface = false;
+    let mut output = String::with_capacity(content.len());
+    for line in content.lines() {
+        let settings = line.split('#').next().unwrap_or_default();
+        let key = settings.split('=').next().unwrap_or_default().trim();
+        if key.starts_with('[') {
+            interface = key.eq_ignore_ascii_case("[Interface]");
+        }
+        if interface
+            && [
+                "Address",
+                "MTU",
+                "DNS",
+                "Table",
+                "PreUp",
+                "PostUp",
+                "PreDown",
+                "PostDown",
+                "SaveConfig",
+            ]
+            .iter()
+            .any(|option| key.eq_ignore_ascii_case(option))
+        {
+            if key.eq_ignore_ascii_case("SaveConfig")
+                && !settings.split_once('=').is_some_and(|(_, value)| {
+                    value.trim().eq_ignore_ascii_case("true")
+                        || value.trim().eq_ignore_ascii_case("false")
+                })
+            {
+                return Err("WireGuard SaveConfig must be true or false".into());
+            }
+            continue;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+/// The same private input path serves initial configuration, hot updates and peer recovery.
+pub(crate) fn apply_kernel_config(config: &str, existed: bool) -> Result<(), String> {
+    let operation = if existed { "syncconf" } else { "setconf" };
+    crate::command::run_command_with_input(
+        "wg",
+        &[operation, "wg0", "/dev/stdin"],
+        config.as_bytes(),
+    )
+    .map(|_| ())
+    // wg can echo a malformed key in stderr; preserve useful failure classes, not key material.
+    .map_err(|error| {
+        let reason =
+            if error.contains("Permission denied") || error.contains("Operation not permitted") {
+                "permission denied; check AppArmor and network capabilities"
+            } else if error.contains("timed out") {
+                "command timed out"
+            } else if error.contains("No such file or directory") {
+                "wg executable is unavailable"
+            } else if error.contains("private command input exceeds") {
+                "configuration exceeds the 16 MiB limit"
+            } else {
+                "configuration rejected by wg"
+            };
+        format!("WireGuard {operation} failed: {reason}")
+    })
+}
+
+/// A public UDP session cannot be reused after its passive Phantun peer was
+/// recreated: that peer has lost the session keys. Renew only clients entering
+/// the local transport, so they immediately establish a fresh handshake instead
+/// of sending unusable data until WireGuard's periodic rekey.
+pub(crate) fn new_phantun_clients(config: &str) -> Result<Vec<String>, String> {
+    let peers = parse_wireguard_conf_peers(config);
+    if !peers
+        .iter()
+        .any(|peer| peer.endpoint.as_deref().is_some_and(endpoint_is_local))
+    {
+        return Ok(Vec::new());
+    }
+    let live = parse_wg_dump(&run_command("wg", &["show", "wg0", "dump"])?);
+    Ok(phantun_client_changes(&peers, &live))
+}
+
+fn phantun_client_changes(peers: &[ConfPeer], live: &[LivePeer]) -> Vec<String> {
+    peers
+        .iter()
+        .filter(|peer| {
+            peer.endpoint.as_deref().is_some_and(endpoint_is_local)
+                && live
+                    .iter()
+                    .find(|seen| seen.public_key == peer.public_key)
+                    .and_then(|seen| seen.endpoint.as_deref())
+                    .is_some_and(|endpoint| !endpoint_is_local(endpoint))
+        })
+        .map(|peer| peer.public_key.clone())
+        .collect()
+}
+
+pub(crate) fn rekey_phantun_clients(peers: &[String], config: &str) -> Result<(), String> {
+    let mut removed = 0;
+    let mut errors = Vec::new();
+    for peer in peers {
+        match run_command("wg", &["set", "wg0", "peer", peer, "remove"]) {
+            Ok(_) => removed += 1,
+            Err(error) => errors.push(format!("Phantun client session reset failed: {error}")),
+        }
+    }
+    // Validate/apply the full configuration before this function is called, and
+    // restore every successfully removed peer even when another removal fails.
+    if removed > 0 {
+        if let Err(error) = apply_kernel_config(config, true) {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 /// Every peer's overlay address.
 pub(crate) fn peer_overlay_ips() -> Vec<String> {
     let Ok(output) = run_command("wg", &["show", "wg0", "dump"]) else {
@@ -464,7 +589,7 @@ fn phantun_passive_drift(
 /// peer can be cleared in place without interrupting the healthy learned Endpoint.
 pub(crate) fn reset_stale_phantun_passive_peers(
     conf: &Path,
-    stripped_conf: &Path,
+    stripped_conf: &str,
 ) -> Result<usize, String> {
     let via_phantun = conf
         .parent()
@@ -516,8 +641,7 @@ pub(crate) fn reset_stale_phantun_passive_peers(
     }
 
     if removed > 0 {
-        let stripped = stripped_conf.to_string_lossy();
-        if let Err(error) = run_command("wg", &["syncconf", "wg0", stripped.as_ref()]) {
+        if let Err(error) = apply_kernel_config(stripped_conf, true) {
             errors.push(format!(
                 "摘掉 {removed} 个 stale peer 后，完整配置同步不回来：{error}"
             ));
@@ -1243,6 +1367,10 @@ fn poke(peers: &[&PeerCheck]) {
 }
 
 #[cfg(test)]
+#[path = "wg/kvm_tests.rs"]
+mod kvm_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{env, fs, path::PathBuf};
 
@@ -1260,6 +1388,51 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn kernel_config_strips_only_interface_extensions_and_never_executes_hooks() {
+        let config = "# interface options\n[Interface]\nPrivateKey = private-fixture\nAddress = 10.0.0.1/24\nMTU = 1400\nDNS = 1.1.1.1\nTable = off\nPreUp = false\nPostUp = false\nPreDown = false\nPostDown = false\nSaveConfig = true\n\n[Peer]\nPublicKey = public-fixture\nAllowedIPs = 10.0.0.2/32\nAddress = invalid-peer-option\nFutureOption = kept";
+        let result = super::kernel_config(config).unwrap();
+        assert_eq!(result, "# interface options\n[Interface]\nPrivateKey = private-fixture\n\n[Peer]\nPublicKey = public-fixture\nAllowedIPs = 10.0.0.2/32\nAddress = invalid-peer-option\nFutureOption = kept\n");
+    }
+
+    #[test]
+    fn kernel_config_recognizes_case_whitespace_comments_and_sections() {
+        let config = "  [interface] # comment\n\tmtu = 1400 # comment\nPrivateKey = value\n[peer]\nMTU = invalid-in-peer\n";
+        assert_eq!(
+            super::kernel_config(config).unwrap(),
+            "  [interface] # comment\nPrivateKey = value\n[peer]\nMTU = invalid-in-peer\n"
+        );
+        let error =
+            super::kernel_config("[Interface]\nSaveConfig = private-invalid-sentinel").unwrap_err();
+        assert!(!error.contains("private-invalid-sentinel"));
+    }
+
+    #[test]
+    fn only_clients_entering_phantun_renew_their_session() {
+        let peer = |endpoint: Option<&str>| super::ConfPeer {
+            name: "remote".into(),
+            public_key: "public-fixture".into(),
+            endpoint: endpoint.map(str::to_owned),
+            overlay_ip: None,
+        };
+        let live = |endpoint: Option<&str>| super::LivePeer {
+            public_key: "public-fixture".into(),
+            endpoint: endpoint.map(str::to_owned),
+            overlay_ip: None,
+            latest_handshake: 1,
+            persistent_keepalive: 10,
+        };
+        let changes = |want, seen| super::phantun_client_changes(&[peer(want)], &[live(seen)]);
+        assert_eq!(
+            changes(Some("127.0.0.1:29000"), Some("198.51.100.2:51820")),
+            vec!["public-fixture"]
+        );
+        assert!(changes(Some("198.51.100.2:51820"), Some("198.51.100.2:51999")).is_empty());
+        assert!(changes(None, Some("198.51.100.2:51820")).is_empty());
+        assert!(changes(Some("127.0.0.1:29000"), Some("127.0.0.1:29001")).is_empty());
+        assert!(changes(Some("127.0.0.1:29000"), None).is_empty());
     }
 
     #[test]

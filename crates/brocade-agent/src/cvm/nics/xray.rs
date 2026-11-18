@@ -18,6 +18,136 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
+/// The packet engine is shared by egress NICs and ingress machine-pair tunnels.
+#[derive(Clone, Serialize)]
+enum Scope {
+    Nic(Box<NicBinding>),
+    Entry {
+        tunnel: Box<EntryTunnel>,
+        targets: BTreeSet<std::net::Ipv4Addr>,
+    },
+}
+#[derive(Clone)]
+struct Channel {
+    id: String,
+    side: BindingSide,
+    offer: TransportOffer,
+    port: u16,
+    credential: String,
+    peer_credential: String,
+    scope: Scope,
+}
+impl Channel {
+    fn nic(b: &NicBinding) -> Self {
+        Self {
+            id: b.id.clone(),
+            side: b.side,
+            offer: b.offer.clone(),
+            port: b.port,
+            credential: b.credential.clone(),
+            peer_credential: b.peer_credential.clone(),
+            scope: Scope::Nic(Box::new(b.clone())),
+        }
+    }
+    fn entry(t: &EntryTunnel, targets: &BTreeSet<std::net::Ipv4Addr>) -> Self {
+        Self {
+            id: t.id.clone(),
+            side: if t.side == EntryTunnelSide::Entry {
+                BindingSide::Provider
+            } else {
+                BindingSide::Consumer
+            },
+            offer: t.offer.clone(),
+            port: t.port,
+            credential: t.credential.clone(),
+            peer_credential: t.peer_credential.clone(),
+            scope: Scope::Entry {
+                tunnel: Box::new(t.clone()),
+                targets: targets.clone(),
+            },
+        }
+    }
+    fn is_entry(&self) -> bool {
+        matches!(self.scope, Scope::Entry { .. })
+    }
+    fn device(&self) -> String {
+        match &self.scope {
+            Scope::Nic(b) => host::tunnel(b),
+            Scope::Entry { tunnel, .. } => super::super::entries::plan::device(tunnel),
+        }
+    }
+    fn alias(&self) -> String {
+        format!(
+            "{}:{}",
+            if self.is_entry() {
+                "brocade-entry"
+            } else {
+                "brocade-binding"
+            },
+            self.id
+        )
+    }
+    fn mtu(&self) -> u16 {
+        match &self.scope {
+            Scope::Nic(b) => b.nic.mtu,
+            Scope::Entry { tunnel, .. } => tunnel.offer.mtu,
+        }
+    }
+}
+pub(super) fn apply(root: &Path, b: &NicBinding) -> Result<LinkObservation> {
+    apply_channel(root, &Channel::nic(b))
+}
+pub(super) fn stop(b: &NicBinding) -> Result<()> {
+    stop_channel(&Channel::nic(b))
+}
+pub(in crate::cvm) fn apply_entry(
+    root: &Path,
+    t: &EntryTunnel,
+    targets: &BTreeSet<std::net::Ipv4Addr>,
+) -> Result<(bool, bool)> {
+    apply_channel(root, &Channel::entry(t, targets)).map(|observation| {
+        (
+            observation.configured,
+            observation.reachable.unwrap_or(false),
+        )
+    })
+}
+pub(in crate::cvm) fn retain_entries(desired: &BTreeSet<&str>) -> Result<()> {
+    if let Some(workers) = WORKERS.get() {
+        workers
+            .lock()
+            .map_err(|_| "Xray entry worker registry unavailable")?
+            .retain(|_, worker| !worker.entry || desired.contains(worker.id.as_str()));
+    }
+    Ok(())
+}
+fn entry_scoped(
+    packet: &[u8],
+    t: &EntryTunnel,
+    targets: &BTreeSet<std::net::Ipv4Addr>,
+    send: bool,
+) -> bool {
+    use std::net::Ipv4Addr;
+    if packet.len() < 20
+        || packet[0] >> 4 != 4
+        || packet[0] & 15 < 5
+        || usize::from(packet[0] & 15) * 4 > packet.len()
+        || usize::from(u16::from_be_bytes([packet[2], packet[3]])) != packet.len()
+    {
+        return false;
+    }
+    let Some((entry, target)) = tunnel_addresses(t.slot) else {
+        return false;
+    };
+    let source = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+    let destination = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    if (t.side == EntryTunnelSide::Entry) == send {
+        source == entry && (destination == target || targets.contains(&destination))
+    } else {
+        destination == entry && (source == target || targets.contains(&source))
+    }
+}
+
 const TLS_NAME: &str = "cvm-nic.brocade.internal";
 const MAGIC: &[u8] = b"BCNIC\0\0\x01";
 const DATA_PORT: u16 = 47172;
@@ -50,7 +180,7 @@ fn identity(root: &Path) -> Result<Identity> {
     )?;
     Ok(value)
 }
-pub(super) fn certificate(root: &Path) -> Result<String> {
+pub(in crate::cvm) fn certificate(root: &Path) -> Result<String> {
     let executable = crate::options::xray_binary_path();
     let checked = capture_command_with_timeout(
         executable.to_str().ok_or("invalid Xray executable path")?,
@@ -70,6 +200,8 @@ struct Status {
     error: Option<String>,
 }
 struct Worker {
+    id: String,
+    entry: bool,
     fingerprint: String,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<Status>>,
@@ -85,7 +217,7 @@ impl Drop for Worker {
     }
 }
 static WORKERS: OnceLock<Mutex<BTreeMap<String, Worker>>> = OnceLock::new();
-fn worker_id(b: &NicBinding) -> String {
+fn worker_id(b: &Channel) -> String {
     format!(
         "{}-{}",
         b.id,
@@ -96,7 +228,7 @@ fn worker_id(b: &NicBinding) -> String {
         }
     )
 }
-fn fingerprint(b: &NicBinding) -> Result<String> {
+fn fingerprint(b: &Channel) -> Result<String> {
     Ok(brocade_core::hash::sha256_hex(
         &serde_json::to_vec(&(
             &b.id,
@@ -105,14 +237,12 @@ fn fingerprint(b: &NicBinding) -> Result<String> {
             &b.peer_credential,
             &b.offer,
             b.port,
-            b.nic.ipv4,
-            b.nic.ipv6,
-            b.nic.mtu,
+            &b.scope,
         ))
         .map_err(|_| "invalid NIC Xray configuration")?,
     ))
 }
-pub(super) fn apply(root: &Path, b: &NicBinding) -> Result<LinkObservation> {
+fn apply_channel(root: &Path, b: &Channel) -> Result<LinkObservation> {
     let key = worker_id(b);
     let fingerprint = fingerprint(b)?;
     let mut workers = WORKERS
@@ -134,7 +264,7 @@ pub(super) fn apply(root: &Path, b: &NicBinding) -> Result<LinkObservation> {
         workers.remove(&key);
     }
     if !workers.contains_key(&key) {
-        if workers.len() >= NODE_BINDINGS * 4 {
+        if workers.len() >= NODE_BINDINGS * 4 + MAX_ENTRY_TUNNELS {
             return Err("NIC Xray worker capacity exceeded".into());
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -171,6 +301,8 @@ pub(super) fn apply(root: &Path, b: &NicBinding) -> Result<LinkObservation> {
         workers.insert(
             key.clone(),
             Worker {
+                id: b.id.clone(),
+                entry: b.is_entry(),
                 fingerprint,
                 stop,
                 status,
@@ -197,9 +329,17 @@ pub(super) fn apply(root: &Path, b: &NicBinding) -> Result<LinkObservation> {
         });
     }
     if !state.connected && worker.started.elapsed() > Duration::from_secs(120) {
-        return Err("Xray IP 承载连接尚未建立，保留原网卡与分配".into());
+        return Err(if b.is_entry() {
+            "Xray 入口通道连接尚未建立"
+        } else {
+            "Xray IP 承载连接尚未建立，保留原网卡与分配"
+        }
+        .into());
     }
-    let (rx, tx) = host::counters(&host::namespace(b), &host::tunnel(b))?;
+    let (rx, tx) = match &b.scope {
+        Scope::Nic(binding) => host::counters(&host::namespace(binding), &host::tunnel(binding))?,
+        Scope::Entry { .. } => (0, 0),
+    };
     Ok(LinkObservation {
         configured: true,
         reachable: Some(state.connected),
@@ -207,7 +347,7 @@ pub(super) fn apply(root: &Path, b: &NicBinding) -> Result<LinkObservation> {
         tx,
     })
 }
-pub(super) fn stop(b: &NicBinding) -> Result<()> {
+fn stop_channel(b: &Channel) -> Result<()> {
     if let Some(workers) = WORKERS.get() {
         workers
             .lock()
@@ -216,8 +356,11 @@ pub(super) fn stop(b: &NicBinding) -> Result<()> {
     }
     Ok(())
 }
-fn enter(b: &NicBinding) -> Result<()> {
-    let file = File::open(Path::new("/run/netns").join(host::namespace(b)))
+fn enter(b: &Channel) -> Result<()> {
+    let Scope::Nic(binding) = &b.scope else {
+        return Ok(());
+    };
+    let file = File::open(Path::new("/run/netns").join(host::namespace(binding)))
         .map_err(|_| "NIC namespace is unavailable")?;
     // SAFETY: the ownership-checked namespace descriptor stays open for setns.
     // This dedicated worker thread has no runtime before entering its namespace.
@@ -226,10 +369,14 @@ fn enter(b: &NicBinding) -> Result<()> {
     }
     Ok(())
 }
-fn adapter(b: &NicBinding) -> std::net::Ipv4Addr {
-    std::net::Ipv4Addr::new(127, 64, (b.port >> 8) as u8, b.port as u8)
+fn adapter(b: &Channel) -> std::net::Ipv4Addr {
+    let (block, index) = match &b.scope {
+        Scope::Nic(_) => (64, b.port),
+        Scope::Entry { tunnel, .. } => (65, tunnel.slot),
+    };
+    std::net::Ipv4Addr::new(127, block, (index >> 8) as u8, index as u8)
 }
-fn config(b: &NicBinding, directory: &Path) -> serde_json::Value {
+fn config(b: &Channel, directory: &Path) -> serde_json::Value {
     use serde_json::json;
     let address = adapter(b).to_string();
     let reverse = format!("nic-reverse-{}", b.id);
@@ -240,13 +387,13 @@ fn config(b: &NicBinding, directory: &Path) -> serde_json::Value {
             .expect("validated binding listener")
     {
         let tls = json!({"minVersion":"1.3","certificates":[{"certificateFile":directory.join("certificate.pem"),"keyFile":directory.join("key.pem")}]});
-        json!({"log":{"loglevel":"none"},"inbounds":[{"listen":if b.offer.endpoint.is_ipv4(){"0.0.0.0"}else{"::"},"port":b.port,"protocol":"vless","tag":"nic-control","settings":{"decryption":"none","clients":[{"id":b.credential,"reverse":{"tag":reverse}}]},"streamSettings":{"network":"tcp","sockopt":{"mark":186},"security":"tls","tlsSettings":tls}},{"listen":address,"port":DIAL_PORT,"protocol":"dokodemo-door","tag":"nic-frames","settings":{"address":address,"port":DATA_PORT,"network":"tcp"}}],"outbounds":[{"protocol":"blackhole","tag":"deny"}],"routing":{"rules":[{"type":"field","inboundTag":["nic-frames"],"outboundTag":reverse}]},"policy":{"levels":{"0":{"connIdle":120}}}})
+        json!({"log":{"loglevel":"warning"},"inbounds":[{"listen":if b.offer.endpoint.is_ipv4(){"0.0.0.0"}else{"::"},"port":b.port,"protocol":"vless","tag":"nic-control","settings":{"decryption":"none","clients":[{"id":b.credential,"reverse":{"tag":reverse}}]},"streamSettings":{"network":"tcp","sockopt":{"mark":186},"security":"tls","tlsSettings":tls}},{"listen":address,"port":DIAL_PORT,"protocol":"dokodemo-door","tag":"nic-frames","settings":{"address":address,"port":DATA_PORT,"network":"tcp"}}],"outbounds":[{"protocol":"blackhole","tag":"deny"}],"routing":{"rules":[{"type":"field","inboundTag":["nic-frames"],"outboundTag":reverse}]},"policy":{"levels":{"0":{"connIdle":120}}}})
     } else {
-        json!({"log":{"loglevel":"none"},"outbounds":[{"protocol":"freedom","tag":"local-adapter"},{"protocol":"vless","tag":"nic-dial","settings":{"address":b.offer.endpoint,"port":b.port,"id":b.credential,"encryption":"none","reverse":{"tag":reverse}},"streamSettings":{"network":"tcp","sockopt":{"mark":186},"security":"tls","tlsSettings":{"serverName":TLS_NAME,"minVersion":"1.3","disableSystemRoot":true,"certificates":[{"certificateFile":directory.join("certificate.pem"),"usage":"verify"}]}}},{"protocol":"blackhole","tag":"deny"}],"routing":{"rules":[{"type":"field","inboundTag":[reverse],"ip":[format!("{address}/32")],"port":DATA_PORT.to_string(),"outboundTag":"local-adapter"},{"type":"field","inboundTag":[reverse],"outboundTag":"deny"}]},"policy":{"levels":{"0":{"connIdle":120}}}})
+        json!({"log":{"loglevel":"warning"},"outbounds":[{"protocol":"freedom","tag":"local-adapter"},{"protocol":"vless","tag":"nic-dial","settings":{"address":b.offer.endpoint,"port":b.port,"id":b.credential,"encryption":"none","reverse":{"tag":reverse}},"streamSettings":{"network":"tcp","sockopt":{"mark":186},"security":"tls","tlsSettings":{"serverName":TLS_NAME,"minVersion":"1.3","disableSystemRoot":true,"certificates":[{"certificateFile":directory.join("certificate.pem"),"usage":"verify"}]}}},{"protocol":"blackhole","tag":"deny"}],"routing":{"rules":[{"type":"field","inboundTag":[reverse],"ip":[format!("{address}/32")],"port":DATA_PORT.to_string(),"outboundTag":"local-adapter"},{"type":"field","inboundTag":[reverse],"outboundTag":"deny"}]},"policy":{"levels":{"0":{"connIdle":120}}}})
     }
 }
-fn open_tun(b: &NicBinding) -> Result<AsyncFd<File>> {
-    let name = host::tunnel(b);
+fn open_tun(b: &Channel) -> Result<AsyncFd<File>> {
+    let name = b.device();
     #[repr(C)]
     struct Request {
         name: [u8; 16],
@@ -277,9 +424,9 @@ fn open_tun(b: &NicBinding) -> Result<AsyncFd<File>> {
             "dev",
             &name,
             "alias",
-            &format!("brocade-binding:{}", b.id),
+            &b.alias(),
             "mtu",
-            &b.nic.mtu.to_string(),
+            &b.mtu().to_string(),
             "up",
         ],
     )
@@ -319,7 +466,14 @@ impl Drop for Process {
         let _ = self.stop();
     }
 }
-fn start(path: &Path) -> Result<Process> {
+fn log_secrets(b: &Channel, directory: &Path) -> Vec<String> {
+    let mut values = vec![b.credential.clone(), b.peer_credential.clone()];
+    if let Ok(Some(bytes)) = crate::fsutil::read_bounded(&directory.join("key.pem"), 65536) {
+        values.push(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    super::super::diagnostics::secrets(&values)
+}
+fn start(root: &Path, b: &Channel, path: &Path) -> Result<Process> {
     let mut command = Command::new(crate::options::xray_binary_path());
     command
         .arg("run")
@@ -328,6 +482,13 @@ fn start(path: &Path) -> Result<Process> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    super::super::diagnostics::capture(
+        &mut command,
+        root,
+        &b.id,
+        NetworkLogSource::Xray,
+        log_secrets(b, path.parent().unwrap_or(root)),
+    );
     // SAFETY: only async-signal-safe libc operations run between fork and exec.
     unsafe {
         command.pre_exec(|| {
@@ -353,12 +514,7 @@ async fn stopped(stop: &AtomicBool) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
-async fn worker(
-    root: &Path,
-    b: &NicBinding,
-    stop: &AtomicBool,
-    status: &Mutex<Status>,
-) -> Result<()> {
+async fn worker(root: &Path, b: &Channel, stop: &AtomicBool, status: &Mutex<Status>) -> Result<()> {
     let peer: Peer =
         serde_json::from_str(&b.peer_credential).map_err(|_| "invalid NIC Xray peer identity")?;
     if peer.packet_key.len() != 64
@@ -367,7 +523,13 @@ async fn worker(
     {
         return Err("invalid NIC packet authentication identity".into());
     }
-    let directory = root.join("cvm-nics").join(worker_id(b));
+    let directory = root
+        .join(if b.is_entry() {
+            "cvm-entries/xray"
+        } else {
+            "cvm-nics"
+        })
+        .join(worker_id(b));
     private_dir(&directory)?;
     if b.side == b.offer.listen_side.resolved()? {
         let identity = identity(root)?;
@@ -399,10 +561,30 @@ async fn worker(
     )
     .map_err(|_| "NIC Xray configuration validation failed")?;
     if !checked.status.success() {
-        return Err("NIC Xray configuration rejected".into());
+        let error = super::super::diagnostics::redact(
+            &format!(
+                "{} {}",
+                String::from_utf8_lossy(&checked.stderr),
+                String::from_utf8_lossy(&checked.stdout)
+            ),
+            &log_secrets(b, &directory),
+        );
+        super::super::diagnostics::record(
+            root,
+            Some(&b.id),
+            NetworkLogSource::Agent,
+            NetworkLogLevel::Error,
+            &format!("Xray 配置校验失败：{error}"),
+        );
+        return Err(super::super::diagnostics::clip(
+            &format!("Xray 配置校验失败：{error}"),
+            480,
+        ));
     }
     let tun = open_tun(b)?;
-    host::limits(b)?;
+    if let Scope::Nic(binding) = &b.scope {
+        host::limits(binding)?;
+    }
     let listener = if b.side != b.offer.listen_side.resolved()? {
         Some(
             TcpListener::bind((adapter(b), DATA_PORT))
@@ -412,7 +594,7 @@ async fn worker(
     } else {
         None
     };
-    let mut process = start(&path)?;
+    let mut process = start(root, b, &path)?;
     if let Ok(mut state) = status.lock() {
         state.prepared = true;
     }
@@ -427,9 +609,21 @@ async fn worker(
     let outcome=async{loop{
         let connect=async{if let Some(listener)=&listener{listener.accept().await.map(|(stream,_)|stream)}else{TcpStream::connect((adapter(b),DIAL_PORT)).await}};
         let connection=tokio::select!{_=stopped(stop)=>return Ok(()),connection=tokio::time::timeout(Duration::from_secs(5),connect)=>connection};
+        match &connection {
+            Ok(Err(error)) => super::super::diagnostics::record(root, Some(&b.id), NetworkLogSource::Agent,
+                NetworkLogLevel::Warning, &format!("Xray 适配器连接失败，正在重试：{error}")),
+            Err(_) => super::super::diagnostics::record(root, Some(&b.id), NetworkLogSource::Agent,
+                NetworkLogLevel::Info, "等待 Xray 对端连接；本轮等待超时，继续重试"),
+            _ => {}
+        }
         if let Ok(Ok(mut stream))=connection{
             let session=async{stream.set_nodelay(true).map_err(|_|"NIC stream setup failed")?;tokio::time::timeout(Duration::from_secs(10),authenticate(&mut stream,b,&key)).await.map_err(|_|"NIC packet authentication timed out")??;if let Ok(mut state)=status.lock(){state.connected=true;state.error=None;}pump(&tun,stream,b).await};
-            tokio::select!{_=stopped(stop)=>return Ok(()),_=session=>{}};
+            tokio::select!{_=stopped(stop)=>return Ok(()),result=session=>{
+                if let Err(error) = result {
+                    super::super::diagnostics::record(root, Some(&b.id), NetworkLogSource::Agent,
+                        NetworkLogLevel::Warning, &format!("Xray 会话断开，正在重试：{error}"));
+                }
+            }};
             if let Ok(mut state)=status.lock(){state.connected=false;}delay=1;
         }
         if process.0.try_wait().map_err(|_|"cannot observe NIC Xray process")?.is_some(){return Err("NIC Xray process exited".into());}
@@ -437,7 +631,7 @@ async fn worker(
     }}.await;
     outcome.and(process.stop())
 }
-async fn authenticate(stream: &mut TcpStream, b: &NicBinding, key: &hmac::Key) -> Result<()> {
+async fn authenticate(stream: &mut TcpStream, b: &Channel, key: &hmac::Key) -> Result<()> {
     let mut challenge = vec![0; MAGIC.len() + 32];
     challenge[..MAGIC.len()].copy_from_slice(MAGIC);
     let consumer = b.side == BindingSide::Consumer;
@@ -486,7 +680,13 @@ async fn authenticate(stream: &mut TcpStream, b: &NicBinding, key: &hmac::Key) -
     }
     Ok(())
 }
-fn scoped(packet: &[u8], b: &NicBinding, send: bool) -> bool {
+fn scoped(packet: &[u8], b: &Channel, send: bool) -> bool {
+    if let Scope::Entry { tunnel, targets } = &b.scope {
+        return entry_scoped(packet, tunnel, targets, send);
+    }
+    let Scope::Nic(binding) = &b.scope else {
+        return false;
+    };
     let source = (b.side == BindingSide::Consumer) == send;
     match packet.first().map(|byte| byte >> 4) {
         Some(4)
@@ -496,7 +696,7 @@ fn scoped(packet: &[u8], b: &NicBinding, send: bool) -> bool {
                 && usize::from(u16::from_be_bytes([packet[2], packet[3]])) == packet.len() =>
         {
             let offset = if source { 12 } else { 16 };
-            b.nic.ipv4.is_some_and(
+            binding.nic.ipv4.is_some_and(
                 |ip| matches!(ip,IpAddr::V4(ip) if packet[offset..offset+4]==ip.octets()),
             )
         }
@@ -505,7 +705,7 @@ fn scoped(packet: &[u8], b: &NicBinding, send: bool) -> bool {
                 && usize::from(u16::from_be_bytes([packet[4], packet[5]])) + 40 == packet.len() =>
         {
             let offset = if source { 8 } else { 24 };
-            b.nic.ipv6.is_some_and(
+            binding.nic.ipv6.is_some_and(
                 |ip| matches!(ip,IpAddr::V6(ip) if packet[offset..offset+16]==ip.octets()),
             )
         }
@@ -553,7 +753,7 @@ async fn write_packet(tun: &AsyncFd<File>, packet: &[u8]) -> io::Result<()> {
         }
     }
 }
-async fn pump(tun: &AsyncFd<File>, stream: TcpStream, b: &NicBinding) -> Result<()> {
+async fn pump(tun: &AsyncFd<File>, stream: TcpStream, b: &Channel) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let send = async {
         let mut packet = vec![0; 65535];
@@ -600,4 +800,32 @@ async fn pump(tun: &AsyncFd<File>, stream: TcpStream, b: &NicBinding) -> Result<
         Ok::<(), String>(())
     };
     tokio::select! {result=send=>result,result=receive=>result}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn entry_framing_binds_both_directions_to_the_pair_and_delivery() {
+        let desired:EntryDesired=serde_json::from_value(serde_json::json!({"node_id":"edge","generation":1,"rules":[],"deliveries":[],"tunnels":[{"id":"entry-test","side":"entry","entry_node":"edge","target_node":"host","offer":{"kind":"xray","listen_side":"provider","endpoint":"203.0.113.2","port_start":40000,"port_end":40000,"mtu":1420},"port":40000,"slot":0,"credential":"test-identity","peer_credential":"private"}]})).unwrap();
+        let mut tunnel = desired.tunnels[0].clone();
+        let targets = BTreeSet::from(["192.0.2.10".parse().unwrap()]);
+        let mut packet = vec![0; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&20u16.to_be_bytes());
+        packet[12..16].copy_from_slice(&[240, 0, 0, 1]);
+        packet[16..20].copy_from_slice(&[192, 0, 2, 10]);
+        assert!(entry_scoped(&packet, &tunnel, &targets, true));
+        assert!(!entry_scoped(&packet, &tunnel, &targets, false));
+        tunnel.side = EntryTunnelSide::Target;
+        assert!(entry_scoped(&packet, &tunnel, &targets, false));
+        packet[12] = 241;
+        assert!(!entry_scoped(&packet, &tunnel, &targets, false));
+        packet[12] = 240;
+        packet[19] = 11;
+        assert!(!entry_scoped(&packet, &tunnel, &targets, false));
+        packet[19] = 10;
+        packet[3] = 19;
+        assert!(!entry_scoped(&packet, &tunnel, &targets, false));
+    }
 }

@@ -1,3 +1,4 @@
+import { reportRuleIssues } from '../rule-validation-focus';
 import { useState, useSyncExternalStore } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { applyDraft, ApiError, fetchNodes, type ModelSettings } from '../api';
@@ -50,6 +51,8 @@ export function DraftBar({ current }: { current: number | undefined }) {
     qc.invalidateQueries({ queryKey: ['certs'] });
     qc.invalidateQueries({ queryKey: ['users'] });
     qc.invalidateQueries({ queryKey: ['settings'] });
+    qc.invalidateQueries({ queryKey: ['geodata'] });
+    qc.invalidateQueries({ queryKey: ['geodata-relations'] });
     qc.invalidateQueries({ queryKey: ['deployment-verify'] });
   };
 
@@ -62,6 +65,7 @@ export function DraftBar({ current }: { current: number | undefined }) {
       batch = draft.beginSubmission();
       await applyDraft(batch.entries.map(entry => entry.op));
       succeeded = true;
+      reportRuleIssues([]);
       // Seed the committed settings before removing their draft baseline. Cancel an older GET
       // first, so clearing the batch cannot briefly rebase the form onto the old cached value.
       const settings = batch.entries.find(entry => entry.op.op === 'update_settings')?.op;
@@ -76,6 +80,13 @@ export function DraftBar({ current }: { current: number | undefined }) {
       refresh();
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
+      if (e instanceof ApiError && e.issues[0]) {
+        const issue = e.issues[0];
+        const parts = issue.location.split('/');
+        const node = parts[0] === 'dns' ? parts[1] : parts[2];
+        if (node) focusNodeDraftPanel(node, parts[0] === 'dns' ? 'egress-dns' : 'chains');
+        reportRuleIssues(e.issues);
+      }
     } finally {
       if (batch) draft.finishSubmission(batch, succeeded);
       setBusy(false);

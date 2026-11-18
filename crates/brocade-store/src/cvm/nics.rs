@@ -1,20 +1,21 @@
 //! Store is the allocation authority; remote execution never happens inside these transactions.
 use super::*;
+use crate::cvm::releases::Scope;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::IpAddr,
 };
 
-mod bindings;
+pub(crate) mod bindings;
 pub(crate) mod entries;
-mod metering;
+pub(super) mod metering;
 mod publications;
 mod versions;
 pub use bindings::*;
 pub use entries::{
     CvmEntryAddressUse, CvmEntryBoard, CvmEntryPortUse, CvmEntryPublicationView, CvmEntryState,
-    CvmEntryView,
+    CvmEntryView, CvmNetworkLogDomain, CvmNetworkLogs, CvmNetworkNodeLogs,
 };
 pub use metering::CvmNicUsage;
 pub use publications::*;
@@ -113,6 +114,15 @@ async fn instance_locked(
     id: &str,
     generation: u64,
 ) -> Result<CvmInstance> {
+    instance_locked_for_change(tx, actor, id, generation, false).await
+}
+async fn instance_locked_for_change(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    id: &str,
+    generation: u64,
+    recover_routes: bool,
+) -> Result<CvmInstance> {
     let row = sqlx::query(&format!("{INSTANCE_SELECT} WHERE id=$1 FOR UPDATE"))
         .bind(id)
         .fetch_optional(&mut **tx)
@@ -126,7 +136,13 @@ async fn instance_locked(
     if instance.desired.power == PowerState::Deleted {
         return Err(invalid("容器已进入删除流程"));
     }
-    if instance.status != ApplyStatus::Applied {
+    // A failed network intent must remain editable after cancelling its work order. Route-only
+    // compensation neither reallocates devices nor assumes that an unobserved Guest stopped.
+    // releases::commit still fences active work orders and every edit keeps generation checks.
+    if instance.status != ApplyStatus::Applied
+        && !(recover_routes
+            && matches!(instance.status, ApplyStatus::Failed | ApplyStatus::Unknown))
+    {
         return Err(StoreError::Conflict("请先完成或核查当前容器操作".into()));
     }
     Ok(instance)
@@ -247,15 +263,36 @@ impl PgStore {
         id: &str,
         request: NicMountRequest,
     ) -> Result<CvmInstance> {
+        Ok(self
+            .mount_cvm_nic_reviewed(actor, id, request, CvmMutationReview::default())
+            .await?
+            .instance)
+    }
+    pub async fn mount_cvm_nic_reviewed(
+        &self,
+        actor: &AdminContext,
+        id: &str,
+        request: NicMountRequest,
+        review: CvmMutationReview,
+    ) -> Result<CvmMutationResult> {
         request_id(&request.request_id)?;
         let digest = request_digest(&(id, &request))?;
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before = crate::cvm::releases::begin(
+            &mut tx,
+            Scope {
+                instances: vec![id],
+                nic_publications: vec![&request.publication_id],
+                ..Scope::default()
+            },
+        )
+        .await?;
         if let Some(instance) =
             operation_replay(&mut tx, actor, &request.request_id, &digest).await?
         {
             tx.commit().await?;
-            return Ok(instance);
+            return Ok(CvmMutationResult::existing(instance));
         }
         let instance = instance_locked(&mut tx, actor, id, request.expected_generation).await?;
         let p = publication(&mut tx, &request.publication_id).await?;
@@ -373,8 +410,30 @@ impl PgStore {
                 .await?
             }
         };
-        let nic_id = new_id("nic")?;
-        let allocation_id = new_id("allocation")?;
+        let nic_id = format!(
+            "nic-{}",
+            &sha256_hex(
+                format!(
+                    "cvm-mount:{}:{}:{}",
+                    actor.operator_id(),
+                    id,
+                    request.request_id
+                )
+                .as_bytes()
+            )[..32]
+        );
+        let allocation_id = format!(
+            "allocation-{}",
+            &sha256_hex(
+                format!(
+                    "cvm-allocation:{}:{}:{}",
+                    actor.operator_id(),
+                    id,
+                    request.request_id
+                )
+                .as_bytes()
+            )[..32]
+        );
         let allocated = AllocatedNic {
             slot,
             publication_id: p.id.clone(),
@@ -468,18 +527,21 @@ impl PgStore {
             .checked_add(10)
             .ok_or_else(|| invalid("请先调整网卡优先级"))?;
         desired.spec.routing.priorities.push(InterfacePriority {
-            interface_id: nic_id.clone(),
+            target: RouteTarget::interface(nic_id.clone()),
             ipv4: ipv4.map(|_| priority),
             ipv6: ipv6.map(|_| priority),
         });
         for destination in &p.spec.route_presets {
             desired.spec.routing.routes.push(ContainerRoute {
                 destination: destination.clone(),
-                interface_id: nic_id.clone(),
+                target: RouteTarget::interface(nic_id.clone()),
                 service: None,
             });
         }
         if request.use_dns_suggestions {
+            if !desired.spec.execution.is_cube() {
+                return Err(StoreError::Unsupported("裸机 DNS 由操作系统管理".into()));
+            }
             desired.spec.routing.dns = p.spec.dns_suggestions.clone();
         }
         desired.spec.routing.revision += 1;
@@ -499,8 +561,11 @@ impl PgStore {
             desired,
         )
         .await?;
-        tx.commit().await?;
-        self.cvm_instance(actor, id).await
+        artifacts::check_review(&mut tx, id, &review).await?;
+        if !review.preview {
+            crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
+        }
+        self.finish_cvm_review(tx, actor, id, review, false).await
     }
     pub async fn set_cvm_routes(
         &self,
@@ -508,28 +573,51 @@ impl PgStore {
         id: &str,
         request: RoutesWrite,
     ) -> Result<CvmInstance> {
+        Ok(self
+            .set_cvm_routes_reviewed(actor, id, request, CvmMutationReview::default())
+            .await?
+            .instance)
+    }
+    pub async fn set_cvm_routes_reviewed(
+        &self,
+        actor: &AdminContext,
+        id: &str,
+        request: RoutesWrite,
+        review: CvmMutationReview,
+    ) -> Result<CvmMutationResult> {
         let digest = request_digest(&(id, &request))?;
         let mut tx = self.pool.begin().await?;
-        lock(&mut tx).await?;
+        crate::cvm::releases::lock(&mut tx).await?;
+        let cvm_before = crate::cvm::releases::begin(&mut tx, Scope::instance(id)).await?;
         if let Some(instance) =
             operation_replay(&mut tx, actor, &request.request_id, &digest).await?
         {
             tx.commit().await?;
-            return Ok(instance);
+            return Ok(CvmMutationResult::existing(instance));
         }
-        let mut desired = instance_locked(&mut tx, actor, id, request.expected_generation)
-            .await?
-            .desired;
+        let mut desired =
+            instance_locked_for_change(&mut tx, actor, id, request.expected_generation, true)
+                .await?
+                .desired;
         if desired.spec.routing.revision != request.expected_revision {
             return Err(StoreError::Conflict("路由表已变化，请刷新后操作".into()));
         }
         let mut routes = request.routes;
+        if !desired.spec.execution.is_cube() && !routes.dns.is_empty() {
+            return Err(StoreError::Unsupported("裸机 DNS 由操作系统管理".into()));
+        }
+        routes.revision = desired.spec.routing.revision;
+        routes.normalize();
+        if routes == desired.spec.routing {
+            return self.finish_cvm_review(tx, actor, id, review, true).await;
+        }
         routes.revision = request
             .expected_revision
             .checked_add(1)
             .ok_or_else(|| invalid("路由版本已满"))?;
         routes.normalize();
         routes.validate(&devices(&desired)).map_err(invalid)?;
+        super::chain_egress::validate_selection(&mut tx, id, &routes).await?;
         // Port rules need both the host Agent (host firewall) and Cubelet (Guest policy
         // routing); an older executor would apply them as whole-prefix routes.
         if routes.routes.iter().any(|route| route.service.is_some()) {
@@ -557,8 +645,11 @@ impl PgStore {
             desired,
         )
         .await?;
-        tx.commit().await?;
-        self.cvm_instance(actor, id).await
+        artifacts::check_review(&mut tx, id, &review).await?;
+        if !review.preview {
+            crate::cvm::releases::commit(&mut tx, actor, cvm_before).await?;
+        }
+        self.finish_cvm_review(tx, actor, id, review, false).await
     }
 }
 async fn persist_routes(

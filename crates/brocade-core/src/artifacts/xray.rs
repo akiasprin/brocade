@@ -1537,7 +1537,10 @@ fn put_match(dest_match: &DestMatch, condition: &mut XrayMatchCondition) {
             values.iter().map(|value| format!("domain:{value}")),
             condition,
         ),
-        DestMatch::DomainKeyword(values) => put_domains(values.iter().cloned(), condition),
+        DestMatch::DomainKeyword(values) => put_domains(
+            values.iter().map(|value| format!("keyword:{value}")),
+            condition,
+        ),
         DestMatch::DomainRegex(value) => put_domains([format!("regexp:{value}")], condition),
         DestMatch::Geosite(values) => put_domains(
             values.iter().map(|value| format!("geosite:{value}")),

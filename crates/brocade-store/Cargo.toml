@@ -8,9 +8,10 @@ license.workspace = true
 
 [features]
 default = []
-cvm = ["brocade-deployment/cvm"]
+cvm = ["brocade-deployment/cvm", "dep:brocade-cvm-compile"]
 
 [dependencies]
+brocade-cvm-compile = { path = "../brocade-cvm-compile", optional = true }
 argon2 = { version = "0.5", features = ["std"] }
 base64 = "0.22"
 brocade-core = { path = "../brocade-core" }

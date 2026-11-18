@@ -5,6 +5,8 @@ import { DialogClose, DialogLayer } from '../../ui/dialog';
 import { Icon } from '../../ui/icons';
 
 import { capacity, MIB } from './queries';
+import { useNicRequestId } from './network-common';
+import { CompilePreview, useCompilePreview } from './compile-preview';
 
 export function CommandDialog({
   instance,
@@ -24,14 +26,14 @@ export function CommandDialog({
   pending: boolean;
   error: Error | null;
   onClose: () => void;
-  onApply: (change: CvmChange) => void;
+  onApply: (change: CvmChange, inputSha256?: string) => void;
 }) {
   const [name, setName] = useState('');
   const [deleteData, setDeleteData] = useState(false);
   const [configName, setConfigName] = useState(instance.desired.spec.name);
   const [vcpus, setVcpus] = useState(String(instance.desired.spec.resources.vcpus));
   const [memoryMiB, setMemoryMiB] = useState(String(instance.desired.spec.resources.memory_bytes / MIB));
-  const [imageId, setImageId] = useState(instance.desired.spec.image.id);
+  const [imageId, setImageId] = useState(instance.desired.spec.image?.id ?? '');
   const [publicKey, setPublicKey] = useState(
     instance.desired.spec.ssh_public_key.trim().split(/\s+/).slice(0, 2).join(' '),
   );
@@ -45,6 +47,19 @@ export function CommandDialog({
     configure: '修改配置',
     detach: '卸载网卡',
   }[dialog.action];
+  const operationId = useNicRequestId();
+  const previewChange: CvmChange | null =
+    dialog.action === 'configure'
+      ? { action: 'configure', name: configName.trim(), vcpus: Number(vcpus), memory_bytes: Number(memoryMiB) * MIB }
+      : dialog.action === 'detach' && dialog.interfaceId
+        ? { action: 'detach', interface_id: dialog.interfaceId }
+        : null;
+  const previewBody = previewChange ? { expected_generation: instance.desired.generation, ...previewChange } : null;
+  const preview = useCompilePreview(
+    instance.desired.id,
+    previewBody ? { kind: 'command', request: { ...previewBody, request_id: operationId(previewBody) } } : null,
+  );
+  const requiresPreview = dialog.action === 'configure' || dialog.action === 'detach';
   const submit = () => {
     setLocalError(null);
     if (dialog.action === 'configure') {
@@ -62,12 +77,15 @@ export function CommandDialog({
         setLocalError('请按机器支持的范围填写名称、CPU 和内存。');
         return;
       }
-      onApply({
-        action: 'configure',
-        name: configName.trim(),
-        vcpus: Number(vcpus),
-        memory_bytes: Number(memoryMiB) * MIB,
-      });
+      onApply(
+        {
+          action: 'configure',
+          name: configName.trim(),
+          vcpus: Number(vcpus),
+          memory_bytes: Number(memoryMiB) * MIB,
+        },
+        preview.inputSha256,
+      );
     } else if (dialog.action === 'reinstall') {
       if (name !== instance.desired.spec.name || !deleteData) {
         setLocalError('请填写完整实例名称，并确认清除系统盘数据。');
@@ -79,7 +97,7 @@ export function CommandDialog({
       }
       onApply({ action: 'reinstall', image_id: imageId, ssh_public_key: publicKey.trim() });
     } else if (dialog.action === 'detach' && dialog.interfaceId)
-      onApply({ action: 'detach', interface_id: dialog.interfaceId });
+      onApply({ action: 'detach', interface_id: dialog.interfaceId }, preview.inputSha256);
     else if (dialog.action === 'start' || dialog.action === 'stop' || dialog.action === 'restart')
       onApply({ action: dialog.action });
   };
@@ -187,6 +205,7 @@ export function CommandDialog({
                     : '使用原系统盘和当前挂载配置启动，不创建新的实例身份。'}
             </p>
           )}
+          {requiresPreview && <CompilePreview preview={preview} />}
           {localError && (
             <p className="error" role="alert">
               {localError}
@@ -198,7 +217,7 @@ export function CommandDialog({
           <button className="btn" disabled={pending} onClick={onClose}>
             取消
           </button>
-          <button className="btn primary" disabled={pending} onClick={submit}>
+          <button className="btn primary" disabled={pending || (requiresPreview && !preview.ready)} onClick={submit}>
             {pending ? '提交中…' : `确认${title}`}
           </button>
         </footer>

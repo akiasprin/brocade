@@ -39,7 +39,7 @@ class ReleaseBuildTests(unittest.TestCase):
             patch.object(BUILD, 'build') as console,
             patch.object(BUILD, 'stable_root'),
             patch.object(BUILD, 'check_format') as formatting,
-            patch.object(BUILD, 'go_binary', return_value='/tools/go'),
+            patch.object(BUILD, 'go_binary', return_value='/tools/go') as compiler,
             patch.object(BUILD.subprocess, 'run', return_value=argparse.Namespace(returncode=0)) as runtime,
         ):
             self.assertEqual(BUILD.main(), 0)
@@ -50,6 +50,23 @@ class ReleaseBuildTests(unittest.TestCase):
             self.assertIn('--arch', command)
             self.assertIn('x86_64', command)
             self.assertEqual(command[command.index('--glibc') + 1], '2.35')
+            self.assertEqual(command[command.index('--go') + 1], '/tools/go')
+            self.assertEqual(compiler.call_args.kwargs, {'component': 'cube'})
+
+    def test_cube_compiler_selection_uses_its_own_pin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for component, version in [('cube', '1.27.3'), ('xray-core', '1.27.4')]:
+                pin = root / 'components' / component / '.go-version'
+                pin.parent.mkdir(parents=True)
+                pin.write_text(version + '\n')
+            compiler = root / 'go'
+            compiler.touch()
+            env = {'BROCADE_GO': str(compiler)}
+            with patch.object(BUILD, 'run', return_value='go version go1.27.3 linux/amd64'):
+                self.assertEqual(BUILD.go_binary(root, env, BUILD.BuildTimer(), component='cube'), str(compiler))
+                with self.assertRaisesRegex(BUILD.BuildError, 'Go 1.27.4 is required'):
+                    BUILD.go_binary(root, env, BUILD.BuildTimer())
 
     def test_cube_runtime_requires_architecture_and_matching_sysroot(self):
         with (
@@ -311,6 +328,10 @@ time.sleep(30)
             sysroot = root / 'sysroot'
             for triple in triples + ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl']:
                 (sysroot / 'lib/rustlib' / triple / 'lib').mkdir(parents=True)
+            for library in ['core', 'alloc', 'std']:
+                entry = sysroot / 'lib/rustlib/src/rust/library' / library / 'src/lib.rs'
+                entry.parent.mkdir(parents=True)
+                entry.touch()
             reports = []
 
             def command(args, cwd, env, timer, log=None):
@@ -412,11 +433,18 @@ time.sleep(30)
                     binary.write_bytes(b'agent')
                 return ''
 
-            env = {}
+            env = {
+                'CARGO_TARGET_DIR': '/wrong/cache',
+                'RUSTFLAGS': '--cfg inherited_override',
+                'CARGO_ENCODED_RUSTFLAGS': '--cfg\x1finherited_override',
+                'CARGO_BUILD_TARGET': 'wrong-target',
+            }
             with patch.object(BUILD, 'run', command):
-                BUILD.agents(root, state, env, BUILD.BuildTimer(), 4, '/tool/zig')
+                BUILD.agents(root, state, env, BUILD.BuildTimer(), 4, '/tool/zig', Path('/tool/rust-src'))
             self.assertEqual(len(commands), 1)
             args, child_env = commands[0]
+            for key in ['CARGO_TARGET_DIR', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_BUILD_TARGET']:
+                self.assertNotIn(key, child_env)
             targets = [args[i + 1] for i, value in enumerate(args) if value == '--target']
             self.assertEqual(targets, ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl'])
             self.assertIn('CC_x86_64_unknown_linux_musl', child_env)
@@ -424,6 +452,7 @@ time.sleep(30)
             for triple in ['x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl']:
                 flags = child_env[f'CARGO_TARGET_{triple.upper().replace("-", "_")}_RUSTFLAGS']
                 self.assertIn(f'--remap-path-prefix={root}=.', flags)
+                self.assertIn('--remap-path-prefix=/tool/rust-src=/rust-src', flags)
             self.assertIn('-C linker=rust-lld', child_env['CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS'])
             self.assertTrue(
                 env['BROCADE_AGENT_BIN_X86_64'].endswith('/x86_64-unknown-linux-musl/release/brocade-agent')
@@ -431,6 +460,45 @@ time.sleep(30)
             self.assertTrue(
                 env['BROCADE_AGENT_BIN_AARCH64'].endswith('/aarch64-unknown-linux-musl/release/brocade-agent')
             )
+
+    def test_rust_source_is_required_in_the_selected_sysroot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sysroot = Path(directory)
+            for library in ['core', 'alloc', 'std']:
+                with self.assertRaisesRegex(BUILD.BuildError, f'rust-src is required.*{library}/src/lib.rs'):
+                    BUILD.rust_source_root(sysroot)
+                entry = sysroot / 'lib/rustlib/src/rust/library' / library / 'src/lib.rs'
+                entry.parent.mkdir(parents=True)
+                entry.touch()
+            self.assertEqual(BUILD.rust_source_root(sysroot), sysroot / 'lib/rustlib/src/rust')
+
+    def test_missing_rust_source_stops_before_preparing_any_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def command(args, *unused):
+                return '0.16.0' if args[-1] == 'version' else str(root)
+
+            with (
+                patch.dict(os.environ, {'RUSTUP_TOOLCHAIN': 'explicit-toolchain'}, clear=True),
+                patch.object(BUILD, 'stable_root'),
+                patch.object(BUILD, 'check_format'),
+                patch.object(BUILD, 'run', command),
+                patch.object(BUILD, 'go_binary', return_value='/tool/go'),
+                patch.object(BUILD.shutil, 'which', side_effect=lambda tool: f'/tool/{tool}'),
+                patch.object(BUILD, 'frontend') as frontend,
+                patch.object(BUILD, 'agents') as agents,
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                with self.assertRaisesRegex(BUILD.BuildError, 'rust-src is required'):
+                    BUILD.build(argparse.Namespace(jobs=4, flavor='base'), root, BUILD.BuildTimer())
+            frontend.assert_not_called()
+            agents.assert_not_called()
+            record = json.loads((root / 'target/brocade-release/base/preparation.json').read_text())
+            self.assertEqual(record['status'], 'failed')
+            self.assertFalse(record['build_complete'])
+            self.assertEqual(record['artifacts'], {})
 
 
 if __name__ == '__main__':

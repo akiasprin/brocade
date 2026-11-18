@@ -17,3 +17,50 @@ PVM 使用 `--host-virtualization pvm`，在本轮外层 VM 中隐藏 VMX／SVM�
 旧本地 LAN、主网卡交付、旧交付 API 和旧容器接管验收已移除。本版只接受 `cubevs-attachments-v2`；网络模型与发布／挂载步骤见 [CVM](../../../docs/cvm.md)。
 
 普通快速检查为本目录的 `test_*.py`、Rust Cube 客户端测试、Store PostgreSQL CVM 测试和 Cubelet `network/attachments` 测试。数据面隔离测试使用 Agent 中显式 ignored 的 `real_ip_backend`，仅在独立 user／mount／network namespace 中运行；需要 ip、nft、tc、conntrack、wg 和匹配 Xray，不能在宿主网络直接执行。
+
+`entry_transports.py` 验证独立访问入口的跨机器承载。显式提供三个一次性 KVM 的 SSH 清单（`b` 入口、`h1` 裸机目标、`h2` 外部客户端）、测试私钥、同源 Agent 测试程序、Xray 与 Phantun 运行包。`prepare` 创建受限测试目录、校验上传摘要并启动持久测试执行器，导出两端公开证书；不修改物理宿主网络。
+
+随后将两个公开证书路径分别传入 `BROCADE_ENTRY_CERTIFICATE_N1` / `_N2`，指定 `BROCADE_ENTRY_ASSIGNMENTS` 为权限 0700 的空目录，并按实验 LAN 设置 `BROCADE_ENTRY_ENDPOINT_V4` / `_V6`、`BROCADE_ENTRY_TARGET_V4` / `_V6`。执行 `BROCADE_RUN_PG_TESTS=1 cargo test -p brocade-store --features cvm --test pg_integration cvm_entry_xray_and_phantun_assignments_and_capability_gates -- --ignored`。它通过生产 Store 生成 WireGuard UDP、Xray、WireGuard Phantun 的双监听方向、双外层地址族共 12 组私有期望，验证端口占用、旧 Agent 拒绝、新旧能力与错误状态显示。私有期望包含通道密钥，不能放入日志或提交。
+
+最后以相同参数执行 `run`：真实验证 L3／L4 TCP、SSH、分片 UDP、ICMP、宿主自身回包、进程故障恢复、与原组网 Phantun 并存及重复重载、撤销后恢复原服务和清理所有入口设备。结果写入受限输出目录；`stop` 等待测试执行器退出，调用方继续负责关闭自己创建的 KVM。上述 IP、角色与命令只用于隔离测试，不得把生产节点作为该故障注入入口。
+
+入口通道验收的默认 `run` 包含真实 120 秒 Phantun 阻断、明确超时日志和解除阻断后的自动恢复验证。对只影响启动状态文案的后续改动，可用 `--skip-timeout-test` 重跑完整数据面矩阵；须保留此前的完整阻断验收证据，并在报告中记录本轮未执行该注入。两端进程日志、凭据隐藏与可用性仍应分别验证。
+
+`crates/brocade-cube/tests/artifacts_kvm.rs` 验证实例产物与真实 Cube 执行器的边界。
+在明确选择的一次性 KVM 内执行该测试二进制，设置 `BROCADE_CVM_ARTIFACT_KVM_CONFIG` 指向该测试宿主的已校验配置，
+并显式选择 ignored 用例 `cube_artifact_real_guest_lifecycle`。它使用独立的私有执行记录和临时 SSH 身份，
+验证四份产物的确认、真实 SSH、DNS 覆盖与恢复、保盘停机／改配／开机、数据及 SSH 主机身份保持、篡改拒绝和物理清理。
+默认 Guest 内存为 512 MiB，可用 `BROCADE_CVM_ARTIFACT_KVM_MEMORY_MIB` 显式选择合法档位；
+`BROCADE_CVM_ARTIFACT_KVM_BASELINE=legacy` 仅运行原规格路径的创建／删除对照，不算产物验收通过。
+测试失败或清理不明时保留私有目录并打印位置，不自动重建或猜测磁盘归属。
+该用例不替代 Console/Store 的 HTTP 与 PostgreSQL 验证，也不验证运行栈发行安装或入口／隧道承载。
+
+## 发行路径与线路出口
+
+`release_kvm_lab.py`、`release_kvm_services.py`、`release_kvm_deploy.py` 和
+`release_kvm_acceptance.py` 共同使用本轮独占的三个外层 KVM（计算、网络提供者、独立客户端），
+安装固定构建入口生成的真实 Console、Agent 和 Cube 运行包，通过正式 API 发布配置并核对实际回执。
+OS 镜像和运行包须显式提供摘要；具体参数见各脚本。受限输出目录包含节点令牌、会话和测试密钥，不能提交或公开。
+
+`release_chain_acceptance.py` 在该实验状态上逐阶段执行：`prepare` 校验并上传 `chain_probe.go`
+构建的独立端点，`configure` 发布真实线路、授权与普通 WireGuard 下一跳，`primary` 为仅有主网卡的
+实例选择线路。`traffic`、`mixed_routes`、`source_guard`、`faults`、`quotas`、`grant_revocation`
+分别核对双栈 TCP／UDP、线路内部域名／IP／协议／端口分流、网卡和线路的共同优先级、绑定业务源地址的绕过尝试、
+进程和上游故障、真实用量／限速／额度及撤销授权。阻断验收同时检查独立目的地的新 SYN／UDP 计数，不能仅以客户端超时当作不回落的证明。
+`ingress_guards` 保留 DNS 正向对照，验证现有 SMTP、UDP 放大端口和私网防护；`chain_icmp` 验证线路不会伪造 ICMP 支持。
+`unauthorized_selection` 在真实 Console 中核对未授权线路不可见，编译预览与直接提交均返回 403，且不改变实例、分配或修订。
+`nic_ipv6_pmtu` 在独立客户端清空 IPv6 路径缓存，抓取普通 WG／1400 路径的真实 Packet Too Big，
+验证随后显式发送的 4096 字节数据报完整返回。冷路径的首个大 UDP 数据报可能丢失，不能把应用重传当作隐式保证；
+混合选路用小于该 MTU 的 IPv6 UDP 数据报单独验收，主网卡线路 TUN 的大数据报另由 `traffic` 验证。
+
+`preview_lifecycle` 通过真实编译预览验收挂载、卸载、停机改配和无变化保存：预览事务回滚、摘要校验、
+保存与发布的产物一致；卸载等待期间实际设备仍在，不能提前释放分配或误报发布失败。
+`entry_existing` 验证原有跨宿主入口的双向大块 SSH、分片 UDP 和整 IP ICMP。
+`period` **仅推进本轮三个一次性 KVM 的系统时钟**，验证真实跨月账期及线路恢复，不改宿主时钟或用 SQL 重写账本。
+最后运行 `cleanup_owned`，确认 Guest、TAP、线路设备／防火墙和两端分配均清理，再关闭本轮外层 KVM。
+Cube 的无主 `Ready` TAP 复用池会保留；验收要求没有活动所有者、端口映射、VMM 描述符或 BPF 实例身份，
+而非强制销毁复用池。
+这些阶段依赖输出目录中明确记录的实验资源，不得对生产服务或未经本轮创建的虚拟机执行。
+
+`release_chain_ui.mjs` 在实际 KVM Console 上检查组合台提案、路由编译预览和输入清单，覆盖桌面及窄屏，
+不拦截 API 响应；`release_kvm_ui.mjs` 检查混合发布与原生产物。它们补充前端组件和截图比较，不能替代真实网络流量验收。

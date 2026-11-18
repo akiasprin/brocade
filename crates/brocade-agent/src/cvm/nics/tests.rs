@@ -4,6 +4,108 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
+#[test]
+fn empty_network_sweep_still_publishes_one_completion_receipt() {
+    let mut receipts = Vec::new();
+    reconcile_reports(
+        &[],
+        |_| panic!("no bindings to execute"),
+        |batch| {
+            receipts.push(batch);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(receipts, vec![Vec::<NicBindingReport>::new()]);
+}
+
+#[test]
+fn empty_network_round_acknowledges_a_new_generation_over_http() {
+    use std::{io::Read, net::TcpListener, sync::mpsc, thread, time::Instant};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sent, received) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while requests.len() < 3 && Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(e) => panic!("{e}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let mut size = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(s) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    size = s.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; size];
+            reader.read_exact(&mut body).unwrap();
+            let response = if first.starts_with("GET ") {
+                serde_json::to_string(&NicDesired {
+                    node_id: "n1".into(),
+                    generation: 7,
+                    ..Default::default()
+                })
+                .unwrap()
+            } else {
+                "{}".into()
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+            requests.push((first, body));
+        }
+        sent.send(requests).unwrap();
+    });
+    let root =
+        std::env::temp_dir().join(format!("brocade-empty-network-http-{}", std::process::id()));
+    assert!(!root.exists());
+    private_dir(&root).unwrap();
+    let options = Options {
+        command: "run".into(),
+        server: format!("http://{address}"),
+        token: "test-only".into(),
+        state_dir: root.clone(),
+        apply_mode: ApplyMode::StateDir,
+        vpngate_stats_window: Duration::from_secs(900),
+    };
+    let result = round(&options);
+    server.join().unwrap();
+    let requests = received.recv().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    result.unwrap();
+    assert_eq!(
+        requests.len(),
+        3,
+        "new empty generation must upload a report"
+    );
+    assert!(requests[2].0.starts_with("POST /agent/v1/cvm/nics/report "));
+    let report: NicNodeReport = serde_json::from_slice(&requests[2].1).unwrap();
+    assert_eq!(report.generation, 7);
+    assert!(report.bindings.is_empty());
+}
+
 struct Server(Child);
 impl Drop for Server {
     fn drop(&mut self) {
@@ -225,12 +327,16 @@ fn complete_capacity_sweep_reports_every_endpoint_in_bounded_batches() {
     ] {
         let bindings = scheduling_bindings(count);
         let mut published = Vec::new();
+        let mut batches = 0;
         reconcile_reports(&bindings, observed, |reports| {
-            assert!(!reports.is_empty() && reports.len() <= REPORT_BATCH_SIZE);
+            assert_eq!(reports.is_empty(), count == 0);
+            assert!(reports.len() <= REPORT_BATCH_SIZE);
+            batches += 1;
             published.extend(reports.into_iter().map(|r| (r.id, r.side)));
             Ok(())
         })
         .unwrap();
+        assert_eq!(batches, count.div_ceil(REPORT_BATCH_SIZE).max(1));
         assert_eq!(
             published,
             bindings
@@ -393,19 +499,19 @@ fn fixture(root: &Path, kind: TransportKind) -> NicDesired {
         routing: ContainerRoutes {
             revision: 1,
             priorities: vec![InterfacePriority {
-                interface_id: "nic-acceptance".into(),
+                target: RouteTarget::interface("nic-acceptance"),
                 ipv4: Some(10),
                 ipv6: Some(10),
             }],
             routes: vec![
                 ContainerRoute {
                     destination: "0.0.0.0/0".parse().unwrap(),
-                    interface_id: "nic-acceptance".into(),
+                    target: RouteTarget::interface("nic-acceptance"),
                     service: None,
                 },
                 ContainerRoute {
                     destination: "::/0".parse().unwrap(),
-                    interface_id: "nic-acceptance".into(),
+                    target: RouteTarget::interface("nic-acceptance"),
                     service: None,
                 },
             ],
@@ -872,13 +978,13 @@ fn real_ip_backend() {
     for binding in &mut desired.bindings {
         binding.routing = routing.clone();
         binding.routing.priorities.push(InterfacePriority {
-            interface_id: "nic-elsewhere".into(),
+            target: RouteTarget::interface("nic-elsewhere"),
             ipv4: Some(20),
             ipv6: None,
         });
         binding.routing.routes.push(ContainerRoute {
             destination: "203.0.113.10/32".parse().unwrap(),
-            interface_id: "nic-elsewhere".into(),
+            target: RouteTarget::interface("nic-elsewhere"),
             service: Some(RouteService {
                 protocol: L4Protocol::Udp,
                 port_start: 9091,
@@ -1080,7 +1186,7 @@ fn consumer_forward_rules_follow_route_selection_order() {
     let route = |destination: &str, interface: &str, service: Option<(L4Protocol, u16, u16)>| {
         ContainerRoute {
             destination: destination.parse().unwrap(),
-            interface_id: interface.into(),
+            target: RouteTarget::interface(interface),
             service: service.map(|(protocol, port_start, port_end)| RouteService {
                 protocol,
                 port_start,
@@ -1092,12 +1198,12 @@ fn consumer_forward_rules_follow_route_selection_order() {
         revision: 1,
         priorities: vec![
             InterfacePriority {
-                interface_id: "home".into(),
+                target: RouteTarget::interface("home"),
                 ipv4: Some(10),
                 ipv6: None,
             },
             InterfacePriority {
-                interface_id: "ntt".into(),
+                target: RouteTarget::interface("ntt"),
                 ipv4: Some(20),
                 ipv6: None,
             },

@@ -13,10 +13,10 @@ for (const [width, theme] of [
     await expect(page.locator(width <= 820 ? '.cz-phone-row' : '.cz-pill')).toBeVisible();
     await expect(page).toHaveScreenshot(`webkit-list-${width}-${theme}.png`);
     await openBoardInstance(page, width);
-    await expect(page.locator('.cvm-gauge')).toHaveCount(3);
+    await expect(page.locator('.cvm-stat')).toHaveCount(4);
     await expect(page).toHaveScreenshot(`webkit-detail-${width}-${theme}.png`);
     await page.getByRole('tab', { name: '网络', exact: true }).click();
-    await expect(page.locator('.cvm-route-table')).toBeVisible();
+    await expect(page.locator('.cvm-flow-routes').first()).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
   });
 }

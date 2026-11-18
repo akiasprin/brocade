@@ -7,8 +7,9 @@ import { routeForViewer } from '../../src/forge/access';
 import type { CvmWorkspace, CvmMonitoring, Whoami } from '../../src/api';
 import { nicCatalog, nicState } from '../fixtures/cvm/network-data';
 import type { Win } from '../../src/wm/store';
-import { cvmReadings, cvmWorkspace } from '../fixtures/cvm/data';
+import { baremetalWorkspace, cvmReadings, cvmWorkspace } from '../fixtures/cvm/data';
 import { entryBoard } from '../fixtures/cvm/entry-data';
+import { artifactHistory } from '../fixtures/cvm/artifact-data';
 
 vi.mock('../../src/panes/cvm/monitoring-charts', () => ({ default: () => <div>监控曲线</div> }));
 vi.mock('../../src/forge/route', () => ({ navigate: vi.fn() }));
@@ -47,6 +48,8 @@ function mount(
     'fetch',
     vi.fn(async (input, init) => {
       const url = String(input);
+      if (url.endsWith('/artifacts/preview'))
+        return Response.json({ instance: data.instances[0], artifacts: artifactHistory(), no_op: false });
       if (init?.method === 'PUT' && /^\/cvm\/hosts\/[^/]+$/.test(url)) {
         const body = JSON.parse(String(init.body));
         writes.push({ url, body });
@@ -59,7 +62,10 @@ function mount(
           return Response.json({ error: '请先删除该宿主上的实例，并等待系统盘和网络资源清理完成' }, { status: 409 });
         host.host_revision += 1;
         next.hosts = [...next.hosts.filter(item => item.node_id !== node), ...(body.enabled ? [host] : [])];
-        next.available_hosts = [...(next.available_hosts ?? []).filter(item => item.node_id !== node), ...(!body.enabled ? [host] : [])];
+        next.available_hosts = [
+          ...(next.available_hosts ?? []).filter(item => item.node_id !== node),
+          ...(!body.enabled ? [host] : []),
+        ];
         Object.assign(data, next);
         return Response.json(next);
       }
@@ -75,7 +81,10 @@ function mount(
         Object.assign(data, next);
         return Response.json(next);
       }
-      if (url === '/cvm/quota' && init?.method === 'PUT') { writes.push({ url, body: JSON.parse(String(init.body)) }); return new Response(null, { status: 204 }); }
+      if (url === '/cvm/quota' && init?.method === 'PUT') {
+        writes.push({ url, body: JSON.parse(String(init.body)) });
+        return new Response(null, { status: 204 });
+      }
       if (init?.method === 'POST') {
         writes.push({ url, body: JSON.parse(String(init.body)) });
         return Response.json({ error: '执行结果尚未确认' }, { status: failure ?? 503 });
@@ -85,7 +94,7 @@ function mount(
       if (url === '/cvm/networks') return Response.json(nicCatalog(data.can_manage_network));
       if (url === '/cvm/entries') return Response.json(entryBoard(data, 'list'));
       if (url.endsWith('/entries')) return Response.json(entryBoard(data, 'list').entries);
-      if (url.endsWith('/network')) return Response.json(nicState(data.instances[0],data.redacted));
+      if (url.endsWith('/network')) return Response.json(nicState(data.instances[0], data.redacted));
       if (url.endsWith('/tcp-pings')) return Response.json([]);
       if (url.split('?')[0].endsWith('/monitoring'))
         return Response.json(
@@ -146,7 +155,7 @@ it('separates instance and host pages without removing creation and terminal man
   expect(within(hosts).getByRole('listitem', { name: data.hosts[0].name })).toBeTruthy();
   expect(screen.queryByRole('list', { name: '容器实例' })).toBeNull();
   expect(screen.getByText('1 / 8')).toBeTruthy();
-  expect(screen.getByText(/1 个可见实例/)).toBeTruthy();
+  expect(screen.getByText(/容器 1 · 网卡上限/)).toBeTruthy();
   expect(screen.queryByText('cube-kvm-v1')).toBeNull();
   expect(screen.getByRole('switch', { name: `${data.hosts[0].name} WebShell` })).toBeTruthy();
   fireEvent.click(instances);
@@ -159,7 +168,9 @@ it('removes only the host identity and lets an administrator explicitly add it b
   const name = data.hosts[0].name;
   const { writes, client } = mount(data);
   fireEvent.click(await screen.findByRole('tab', { name: '宿主' }));
-  fireEvent.click(screen.getByRole('button', { name: '移除宿主' }));
+  // 移除宿主是低频操作，收在宿主卡的 ⋯ 菜单里。
+  fireEvent.click(screen.getByRole('button', { name: `${name} 更多操作` }));
+  fireEvent.click(screen.getByRole('menuitem', { name: /^移除宿主/ }));
   await screen.findByText('尚无宿主');
   expect(screen.queryByRole('dialog')).toBeNull();
   expect(client.getQueryData<CvmWorkspace>(['cvm'])?.hosts).toHaveLength(0);
@@ -177,7 +188,8 @@ it('keeps an occupied host visible and shows the server cleanup requirement', as
   const data = cvmWorkspace('list');
   mount(data);
   fireEvent.click(await screen.findByRole('tab', { name: '宿主' }));
-  fireEvent.click(screen.getByRole('button', { name: '移除宿主' }));
+  fireEvent.click(screen.getByRole('button', { name: `${data.hosts[0].name} 更多操作` }));
+  fireEvent.click(screen.getByRole('menuitem', { name: /^移除宿主/ }));
   await screen.findByText('请先删除该宿主上的实例，并等待系统盘和网络资源清理完成');
   expect(screen.getByRole('listitem', { name: data.hosts[0].name })).toBeTruthy();
   expect(screen.queryByRole('combobox', { name: '添加宿主' })).toBeNull();
@@ -187,7 +199,9 @@ it('does not offer host identity management to an ordinary user', async () => {
   const data = cvmWorkspace('list', 'user');
   mount(data, {}, { ...who, role: 'user' });
   fireEvent.click(await screen.findByRole('tab', { name: '宿主' }));
-  expect(screen.queryByRole('button', { name: '移除宿主' })).toBeNull();
+  const menu = screen.queryByRole('button', { name: `${data.hosts[0].name} 更多操作` });
+  if (menu) fireEvent.click(menu);
+  expect(screen.queryByRole('menuitem', { name: /^移除宿主/ })).toBeNull();
   expect(screen.queryByRole('combobox', { name: '添加宿主' })).toBeNull();
 });
 
@@ -196,7 +210,7 @@ it('moves between page tabs with arrow and boundary keys', async () => {
   const instances = await screen.findByRole('tab', { name: '组合台' });
   const hosts = screen.getByRole('tab', { name: '宿主' });
   fireEvent.keyDown(instances, { key: 'End' });
-  const networks=screen.getByRole('tab',{name:'额度'});
+  const networks = screen.getByRole('tab', { name: '额度' });
   expect(networks.getAttribute('aria-selected')).toBe('true');
   fireEvent.keyDown(networks, { key: 'Home' });
   expect(instances.getAttribute('aria-selected')).toBe('true');
@@ -219,11 +233,11 @@ it('counts only the host’s visible instances and excludes confirmed deletions'
   data.instances.push(removed);
   mount(data);
   fireEvent.click(await screen.findByRole('tab', { name: '宿主' }));
-  expect(screen.getByText(/1 个可见实例/)).toBeTruthy();
+  expect(screen.getByText(/容器 1 · 网卡上限/)).toBeTruthy();
   expect(screen.queryByRole('button', { name: /查看.*实例/ })).toBeNull();
   expect(screen.queryByText('能力报告新鲜')).toBeNull();
   expect(screen.queryByText('等待新的能力报告')).toBeNull();
-  expect(within(screen.getByRole('listitem', { name: data.hosts[0].name })).getByText('上报')).toBeTruthy();
+  expect(within(screen.getByRole('listitem', { name: data.hosts[0].name })).getByText(/^Cube · 上报$/)).toBeTruthy();
 });
 
 it.each(['stale', 'error'] as const)('does not advertise creation from a %s host report', async state => {
@@ -260,18 +274,6 @@ it('keeps an empty host tab available without claiming an instance exists', asyn
   expect(screen.queryByRole('list', { name: '容器实例' })).toBeNull();
 });
 
-
-
-
-
-
-
-
-
-
-
-
-
 it('keeps a stable creation identity across an uncertain response and refuses a changed payload', async () => {
   const { writes } = mount(cvmWorkspace('new'), { p: 'new' });
   await fillCreate();
@@ -285,7 +287,6 @@ it('keeps a stable creation identity across an uncertain response and refuses a 
   await screen.findByText(/上次创建结果尚未确认/);
   expect(writes).toHaveLength(2);
 });
-
 
 it('does not render stale actual power as successful, and preserves the final contact', async () => {
   const data = cvmWorkspace('unknown');
@@ -372,7 +373,8 @@ it('CPU and memory are independent choices and survive a system image change', a
 
 it('shows actual running state and requires confirmation before a durable restart', async () => {
   const { writes } = mount(cvmWorkspace('detail'), { p: 'instance', id: 'cvm-alice' });
-  await screen.findByText('运行中');
+  // 运行状态是标题图标角上的状态灯，与机器详情一致。
+  await screen.findByRole('img', { name: '运行中' });
   expect(screen.queryByText(/期望运行/)).toBeNull();
   fireEvent.click(screen.getByRole('button', { name: '重启' }));
   const dialog = screen.getByRole('dialog', { name: '重启实例' });
@@ -389,7 +391,12 @@ it('offers independent CPU and memory editing only after shutdown', async () => 
   const dialog = screen.getByRole('dialog', { name: '修改配置' });
   fireEvent.change(within(dialog).getByRole('spinbutton', { name: 'CPU（核）' }), { target: { value: '3' } });
   fireEvent.change(within(dialog).getByRole('spinbutton', { name: '内存（MiB）' }), { target: { value: '768' } });
-  fireEvent.click(within(dialog).getByRole('button', { name: '确认修改配置' }));
+  const save = within(dialog).getByRole('button', { name: '确认修改配置' }) as HTMLButtonElement;
+  expect(save.disabled).toBe(true);
+  fireEvent.click(within(dialog).getByRole('button', { name: '预览产物差异' }));
+  await waitFor(() => expect(save.disabled).toBe(false));
+  expect(writes).toHaveLength(0);
+  fireEvent.click(save);
   await waitFor(() => expect(writes).toHaveLength(1));
   expect(writes[0].body).toMatchObject({ action: 'configure', vcpus: 3, memory_bytes: 768 * 1024 ** 2 });
   expect(writes[0].body.image_id).toBeUndefined();
@@ -420,15 +427,15 @@ it.each([false, true])('deletes the entire instance directly with retain_on_dele
   await waitFor(() => expect(writes).toHaveLength(1));
   expect(writes[0].url).toBe('/cvm/cvm-alice/operations');
   expect(writes[0].body).toMatchObject({
-    action: 'delete', delete_data: true, expected_generation: data.instances[0].desired.generation,
+    action: 'delete',
+    delete_data: true,
+    expected_generation: data.instances[0].desired.generation,
   });
   await screen.findByText('执行结果尚未确认');
   fireEvent.click(screen.getByRole('button', { name: '删除' }));
   await waitFor(() => expect(writes).toHaveLength(2));
   expect(writes[1].body).toEqual(writes[0].body);
 });
-
-
 
 it('the shared shell list drill retains creation and quota actions without user forwarding', async () => {
   mount(cvmWorkspace('list'), { p: 'list' });
@@ -437,10 +444,6 @@ it('the shared shell list drill retains creation and quota actions without user 
   expect(screen.queryByRole('menuitem', { name: /连接已有机器/ })).toBeNull();
   expect(screen.queryByRole('button', { name: '返回列表' })).toBeNull();
 });
-
-
-
-
 
 it('allows clearing a capacity input without substituting zero or changing another field', async () => {
   mount(cvmWorkspace('new'), { p: 'new' });
@@ -459,9 +462,9 @@ it('shows measured Guest capacity and per-NIC rates, not configured memory as us
   const data = cvmMonitoring();
   mount(cvmWorkspace('detail'), { p: 'instance', id: 'cvm-alice' }, who, undefined, data);
   const monitoring = await screen.findByRole('region', { name: '容器 监控' });
-  await within(monitoring).findByText('持续采样');
-  expect(within(monitoring).getByText('/ 475.0 MiB 可见内存')).toBeTruthy();
-  fireEvent.click(screen.getByRole('button', { name: '查看监控与诊断' }));
+  await within(monitoring).findByText(/持续采样/);
+  expect(within(monitoring).getByText('475.0 MiB 可见')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: '监控与诊断 →' }));
   expect(within(monitoring).getByRole('option', { name: 'enp0s2 · 副网卡' })).toBeTruthy();
   fireEvent.change(within(monitoring).getByLabelText('监控网卡'), { target: { value: 'nic-business' } });
   expect((within(monitoring).getByLabelText('监控网卡') as HTMLSelectElement).value).toBe('nic-business');
@@ -470,10 +473,10 @@ it('marks expired samples and never shows their CPU or network rates as live', a
   const { cvmMonitoring } = await import('../fixtures/cvm/data');
   mount(cvmWorkspace('detail'), { p: 'instance', id: 'cvm-alice' }, who, undefined, cvmMonitoring('stale'));
   const monitoring = await screen.findByRole('region', { name: '容器 监控' });
-  await within(monitoring).findByText('读数已过期');
+  await within(monitoring).findByText(/读数已过期/);
   expect(within(monitoring).getByLabelText('最后实例读数')).toBeTruthy();
-  expect(within(monitoring).queryByText('持续采样')).toBeNull();
-  expect(within(monitoring).getByLabelText('最后实例读数').textContent).toContain('— / —');
+  expect(within(monitoring).queryByText(/持续采样/)).toBeNull();
+  expect(within(monitoring).getByLabelText('最后实例读数').textContent).toContain('—↓ —↑');
 });
 
 it('waits for independent health instead of treating a lifecycle receipt as a shutdown observation', async () => {
@@ -534,7 +537,7 @@ it('opens diagnostics while retaining overview state and requests real history r
   };
   data.issues = [{ kind: 'ssh', severity: 'warn', message: '宿主无法连接实例 SSH 端口' }];
   mount(cvmWorkspace('unknown'), { p: 'instance', id: 'cvm-alice' }, who, undefined, data);
-  await screen.findByText('持续采样');
+  await screen.findByText(/持续采样/);
   expect(screen.queryByText('监控曲线')).toBeNull();
   fireEvent.click(screen.getByRole('tab', { name: '监控与诊断' }));
   await screen.findByText('监控曲线');
@@ -574,7 +577,6 @@ it.each([true, false])('uses explicitly reported Guest terminal capability (%s)'
   mount(data, { p: 'instance', id: data.instances[0].desired.id });
   const button = await screen.findByRole('button', { name: '终端' });
   expect((button as HTMLButtonElement).disabled).toBe(capability === false);
-
 });
 
 it('keeps the policy unchanged and shows a concurrent update error', async () => {
@@ -615,17 +617,45 @@ it('closes the terminal when host policy is disabled and does not reopen after e
   expect(screen.queryByRole('dialog', { name: '实例终端会话' })).toBeNull();
 });
 
+it('opens the inspector terminal and closes it when host access is revoked', async () => {
+  const data = cvmWorkspace('list');
+  const { client } = mount(data);
+  fireEvent.click(await screen.findByRole('button', { name: /home-workspace/ }));
+  const inspector = await screen.findByRole('complementary', { name: 'home-workspace' });
+  const terminal = within(inspector).getByRole('button', { name: '终端' }) as HTMLButtonElement;
+  expect(terminal.disabled).toBe(false);
+  fireEvent.click(terminal);
+  await screen.findByRole('dialog', { name: '实例终端会话' });
+  const revoked = structuredClone(data);
+  revoked.hosts[0].terminal_enabled = false;
+  await act(async () => client.setQueryData(['cvm'], revoked));
+  await waitFor(() => expect(screen.queryByRole('dialog', { name: '实例终端会话' })).toBeNull());
+  expect((within(inspector).getByRole('button', { name: '终端' }) as HTMLButtonElement).disabled).toBe(true);
+  expect(within(inspector).getByRole('button', { name: '终端' }).title).toContain('WebShell 已关闭');
+  await act(async () => client.setQueryData(['cvm'], { ...data, can_write: false }));
+  await waitFor(() => expect(within(inspector).queryByRole('button', { name: '终端' })).toBeNull());
+});
 
+it('labels a bare-metal local exit as the existing host network', async () => {
+  mount(baremetalWorkspace());
+  fireEvent.click(await screen.findByRole('button', { name: /baremetal-workspace/ }));
+  const inspector = await screen.findByRole('complementary', { name: 'baremetal-workspace' });
+  expect(within(inspector).getByText(/宿主原有网络/)).toBeTruthy();
+  expect(within(inspector).queryByText(/宿主 NAT/)).toBeNull();
+});
 
-
-
-
-
-
-
-
-
-
+it.each(['system-admin', 'user', 'readonly'])(
+  'resolves network-only provider names for %s without capability access',
+  async role => {
+    const data = cvmWorkspace('detail', role);
+    expect(data.hosts.some(host => host.node_id === 'remote-ingress')).toBe(false);
+    if (role !== 'system-admin') expect(nicCatalog(false).providers).toEqual([]);
+    mount(data, { p: 'instance', id: data.instances[0].desired.id }, { ...who, role: role as Whoami['role'] });
+    const flow = await screen.findByRole('region', { name: '入口、网卡与出口' });
+    await waitFor(() => expect(within(flow).getAllByText(/GreenVPS · 香港网络/).length).toBeGreaterThan(0));
+    expect(flow.textContent).not.toContain('remote-ingress');
+  },
+);
 
 it('loads fleet readings in one batch and keeps missing or expired metrics unknown', async () => {
   const data = cvmWorkspace('list');
@@ -633,17 +663,21 @@ it('loads fleet readings in one batch and keeps missing or expired metrics unkno
   // The board lists containers as pills; the inspector shows the selected one's readings.
   fireEvent.click(await screen.findByRole('button', { name: /home-workspace/ }));
   const inspector = await screen.findByRole('complementary', { name: 'home-workspace' });
-  const resources = inspector.querySelector('.node-card-resources')!;
+  const resources = inspector.querySelector('.cz-readings')!;
   await waitFor(() => expect(resources.textContent).toContain('CPU9%'));
   expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes('/monitoring'))).toHaveLength(0);
   const readings = cvmReadings(data);
   readings.instances[0].state = 'stale';
-  await act(async () => { client.setQueryData(['cvm-readings'], readings); });
+  await act(async () => {
+    client.setQueryData(['cvm-readings'], readings);
+  });
   await waitFor(() => expect(resources.textContent).toBe('CPU—内存—磁盘—'));
   const expired = structuredClone(readings);
   expired.instances[0].state = 'live';
   expired.instances[0].latest!.observed_at_unix_millis -= 180_000;
-  await act(async () => { client.setQueryData(['cvm-readings'], expired); });
+  await act(async () => {
+    client.setQueryData(['cvm-readings'], expired);
+  });
   await waitFor(() => expect(resources.textContent).toBe('CPU—内存—磁盘—'));
 });
 
@@ -668,7 +702,33 @@ it('edits quota from its tab and submits the selected owner and limits', async (
   fireEvent.change(within(dialog).getByRole('spinbutton', { name: 'vCPU 总额' }), { target: { value: '6' } });
   fireEvent.click(within(dialog).getByRole('button', { name: '保存额度' }));
   await waitFor(() => expect(writes).toHaveLength(1));
-  expect(writes[0]).toMatchObject({ url: '/cvm/quota', body: { tenant_id: 'platform', user_id: 'alice', max_vcpus: 6 } });
+  expect(writes[0]).toMatchObject({
+    url: '/cvm/quota',
+    body: { tenant_id: 'platform', user_id: 'alice', max_vcpus: 6 },
+  });
+});
+
+it('permits logical CPU memory and disk above the host baseline while keeping user quota checks', async () => {
+  const data = cvmWorkspace('list');
+  const caps = data.hosts[0].capabilities;
+  caps.allocatable_vcpus = 1;
+  caps.allocatable_memory_bytes = 128 * 1024 ** 2;
+  caps.allocatable_disk_bytes = 3 * 1024 ** 3;
+  const { writes } = mount(data, { p: 'new' });
+  await fillCreate();
+  fireEvent.change(screen.getByRole('spinbutton', { name: 'CPU（核）' }), { target: { value: '2' } });
+  fireEvent.change(screen.getByRole('spinbutton', { name: '内存（MiB）' }), { target: { value: '512' } });
+  fireEvent.change(screen.getByRole('spinbutton', { name: '系统盘（GiB）' }), { target: { value: '8' } });
+  expect(screen.getAllByText(/允许超售/).length).toBeGreaterThan(0);
+  const create = screen.getByRole('button', { name: '创建实例' });
+  expect((create as HTMLButtonElement).disabled).toBe(false);
+  fireEvent.click(create);
+  await waitFor(() => expect(writes).toHaveLength(1));
+  expect(writes[0].body.resources).toMatchObject({
+    vcpus: 2,
+    memory_bytes: 512 * 1024 ** 2,
+    root_disk_bytes: 8 * 1024 ** 3,
+  });
 });
 
 it('keeps host policy management reachable when creation and quota grants are unavailable', async () => {
@@ -689,9 +749,13 @@ it('merges concurrent host policy replies without replacing another host or newe
   fireEvent.click(await screen.findByRole('tab', { name: '宿主' }));
   const oldFetch = vi.mocked(fetch).getMockImplementation()!;
   const replies = new Map<string, (response: Response) => void>();
-  vi.mocked(fetch).mockImplementation((input, init) => init?.method === 'PUT'
-    ? new Promise<Response>(resolve => replies.set(String(input), resolve))
-    : String(input) === '/cvm' ? new Promise<Response>(() => {}) : oldFetch(input, init));
+  vi.mocked(fetch).mockImplementation((input, init) =>
+    init?.method === 'PUT'
+      ? new Promise<Response>(resolve => replies.set(String(input), resolve))
+      : String(input) === '/cvm'
+        ? new Promise<Response>(() => {})
+        : oldFetch(input, init),
+  );
   const first = screen.getByRole('switch', { name: `${data.hosts[0].name} WebShell` });
   const second = screen.getByRole('switch', { name: '宿主 B WebShell' });
   fireEvent.click(first);
@@ -701,17 +765,116 @@ it('merges concurrent host policy replies without replacing another host or newe
   const current = structuredClone(data);
   current.instances[0].desired.generation = 7;
   current.instances[0].status = 'pending';
-  current.hosts.forEach(host => { host.terminal_enabled = false; host.terminal_revision = 2; });
+  current.hosts.forEach(host => {
+    host.terminal_enabled = false;
+    host.terminal_revision = 2;
+  });
   Object.assign(data, structuredClone(current));
-  await act(async () => { client.setQueryData(['cvm'], current); });
+  await act(async () => {
+    client.setQueryData(['cvm'], current);
+  });
   const staleReply = structuredClone(data);
   staleReply.instances[0].desired.generation = 1;
   staleReply.hosts[0].terminal_enabled = true;
   staleReply.hosts[0].terminal_revision = 1;
-  await act(async () => { replies.get(`/cvm/hosts/${data.hosts[0].node_id}/terminal`)!(Response.json(data)); });
-  await act(async () => { replies.get('/cvm/hosts/second/terminal')!(Response.json(staleReply)); });
+  await act(async () => {
+    replies.get(`/cvm/hosts/${data.hosts[0].node_id}/terminal`)!(Response.json(data));
+  });
+  await act(async () => {
+    replies.get('/cvm/hosts/second/terminal')!(Response.json(staleReply));
+  });
   await waitFor(() => expect((second as HTMLInputElement).disabled).toBe(false));
   const result = client.getQueryData<CvmWorkspace>(['cvm'])!;
   expect(result.hosts.map(host => host.terminal_enabled)).toEqual([false, false]);
   expect(result.instances[0].desired.generation).toBe(7);
+});
+
+it('adopts the existing OS without an image, SSH key or editable virtual resources', async () => {
+  const data = baremetalWorkspace('baremetal-hosts');
+  const { writes } = mount(data);
+  fireEvent.click(await screen.findByRole('button', { name: /^纳管裸机$/ }));
+  const picker = await screen.findByRole('dialog', { name: '选择裸机' });
+  fireEvent.click(within(picker).getByRole('button', { name: '下一步' }));
+  const dialog = await screen.findByRole('dialog', { name: '纳管裸机' });
+  expect(within(dialog).queryByLabelText('SSH 公钥')).toBeNull();
+  fireEvent.click(within(dialog).getByRole('checkbox'));
+  fireEvent.click(within(dialog).getByRole('button', { name: '确认纳管' }));
+  await waitFor(() => expect(writes.length).toBe(1));
+  expect(writes[0].url).toBe('/cvm/adopt');
+  expect(writes[0].body).toMatchObject({
+    node_id: data.hosts[0].node_id,
+    identity: data.hosts[0].capabilities.baremetal!.identity,
+  });
+  expect(writes[0].body).not.toHaveProperty('image_id');
+  expect(writes[0].body).not.toHaveProperty('resources');
+});
+
+it.each(['empty', 'list'])('keeps bare-metal adoption discoverable with %s Cube hosts', async scene => {
+  const { writes } = mount(cvmWorkspace(scene));
+  fireEvent.click(await screen.findByRole('button', { name: /^纳管裸机$/ }));
+  const dialog = await screen.findByRole('dialog', { name: '选择裸机' });
+  expect(within(dialog).getByText('尚无可纳管的裸机')).toBeTruthy();
+  expect(within(dialog).queryByRole('button', { name: '下一步' })).toBeNull();
+  expect(within(dialog).queryByRole('combobox')).toBeNull();
+  if (scene === 'list') expect(within(dialog).getByText(/当前宿主以容器模式运行/)).toBeTruthy();
+  fireEvent.click(within(dialog).getByRole('button', { name: '查看宿主' }));
+  expect(screen.getByRole('tab', { name: '宿主' }).getAttribute('aria-selected')).toBe('true');
+  expect(screen.queryByRole('dialog')).toBeNull();
+  expect(screen.getByRole('button', { name: /^纳管裸机$/ })).toBeTruthy();
+  expect(writes).toEqual([]);
+});
+
+it.each(['stale', 'error', 'occupied'] as const)(
+  'explains a %s bare-metal host without submitting adoption',
+  async state => {
+    const data = baremetalWorkspace('baremetal-hosts');
+    if (state === 'stale') data.hosts[0].fresh = false;
+    else if (state === 'error') data.hosts[0].error = 'host configuration is unavailable';
+    else data.instances = baremetalWorkspace().instances;
+    const { writes } = mount(data);
+    fireEvent.click(await screen.findByRole('button', { name: /^纳管裸机$/ }));
+    const dialog = await screen.findByRole('dialog', { name: '选择裸机' });
+    expect((within(dialog).getByRole('button', { name: '下一步' }) as HTMLButtonElement).disabled).toBe(true);
+    const option = within(dialog).getByRole('option', { name: new RegExp(data.hosts[0].name) });
+    expect((option as HTMLOptionElement).disabled).toBe(true);
+    expect(option.textContent).toContain(
+      state === 'occupied' ? '裸机已纳管' : state === 'stale' ? '等待机器重新上报' : '执行能力不可用',
+    );
+    expect(writes).toEqual([]);
+  },
+);
+
+it('offers only native hosts when Cube and bare-metal hosts coexist', async () => {
+  const data = baremetalWorkspace('baremetal-hosts');
+  const cube = cvmWorkspace('list').hosts[0];
+  cube.node_id = 'cube-only';
+  cube.name = '仅容器模式';
+  data.hosts.push(cube);
+  mount(data);
+  fireEvent.click(await screen.findByRole('button', { name: /^纳管裸机$/ }));
+  const dialog = await screen.findByRole('dialog', { name: '选择裸机' });
+  expect(within(dialog).queryByRole('option', { name: cube.name })).toBeNull();
+  expect((within(dialog).getByRole('combobox', { name: '选择裸机' }) as HTMLSelectElement).value).toBe(
+    data.hosts[0].node_id,
+  );
+});
+
+it('does not offer bare-metal adoption to an ordinary user', async () => {
+  mount(baremetalWorkspace('baremetal-hosts', 'user'), {}, { ...who, role: 'user' });
+  await screen.findByRole('tab', { name: '宿主' });
+  expect(screen.queryByRole('button', { name: /^纳管裸机$/ })).toBeNull();
+  fireEvent.click(screen.getByRole('tab', { name: '宿主' }));
+  expect(screen.queryByRole('button', { name: /^纳管裸机$/ })).toBeNull();
+});
+it('releases bare metal using a separate operation and never offers VM power or erase actions', async () => {
+  const data = baremetalWorkspace();
+  const { writes } = mount(data, { p: 'instance', id: data.instances[0].desired.id });
+  const release = await screen.findByRole('button', { name: /^解除纳管$/ });
+  expect(screen.queryByRole('button', { name: /^删除$/ })).toBeNull();
+  expect(screen.queryByRole('button', { name: /^关机$/ })).toBeNull();
+  expect(screen.queryByRole('button', { name: /^重启$/ })).toBeNull();
+  fireEvent.click(release);
+  await waitFor(() => expect(writes.length).toBe(1));
+  expect(writes[0].body.action).toBe('release_host');
+  expect(writes[0].body).not.toHaveProperty('delete_data');
 });

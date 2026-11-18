@@ -12,6 +12,8 @@ import {
   repointCvmEntry,
   setCvmRoutes,
   type CvmContainerRoutes,
+  type CvmCompilePreviewRequest,
+  type CvmChainCatalog,
   type CvmEntryBoard,
   type CvmEntryMode,
   type CvmEntryProtocol,
@@ -21,14 +23,16 @@ import {
 } from '../../../api';
 import { navigate } from '../../../forge/route';
 import { ErrorBox, SegmentedControl } from '../../../ui/bits';
-import { CardRing } from '../../../ui/card-metrics';
 import { useNow } from '../../../ui/clock';
 import { Icon } from '../../../ui/icons';
 import { useMetricQuery } from '../../../ui/metric-cadence';
 import { percent, resourceTone, shareOf } from '../cards';
+import { CompilePreview, useCompilePreview } from '../compile-preview';
 import { NIC_CATALOG, NIC_STATE, transportName, useNicRequestId } from '../network-common';
+import { NetworkLogsButton } from '../network-logs';
 import { AppliedState } from '../presentation';
-import { QUERY } from '../queries';
+import { capacity, guestTerminalAccess, QUERY } from '../queries';
+import { CvmTerminalAccess } from '../terminal-access';
 import {
   entryText,
   isDefault,
@@ -38,6 +42,7 @@ import {
   repointRoute,
   routeLabel,
   withRoute,
+  withChainRoute,
   withoutRoute,
   type EntryMachine,
   type ExitTile,
@@ -67,6 +72,7 @@ export function Inspector({
   instances,
   entries,
   catalog,
+  chains,
   machines,
   exits,
   rules,
@@ -80,6 +86,7 @@ export function Inspector({
   instances: CvmInstance[];
   entries: CvmEntryBoard;
   catalog: CvmNicCatalog | undefined;
+  chains: CvmChainCatalog | undefined;
   machines: EntryMachine[];
   exits: ExitTile[];
   rules: RuleLink[];
@@ -120,15 +127,18 @@ export function Inspector({
   });
   if (!instance) {
     const l3 = entries.entries.filter(item => item.mode.kind === 'l3').length;
+    const waiting = entries.entries.filter(item => item.state !== 'active').length;
     const l4Rules = rules.filter(item => item.layer === 'L4').length;
+    const running = instances.filter(item => item.report?.power === 'running').length;
     return (
       <div className="cz-inspector idle">
         <aside className="panel" aria-label="组合">
           <header className="cz-insp-head">
-            <b>组合</b>
+            <b>组合概览</b>
+            <small>点选容器查看与编辑</small>
           </header>
           <div className="cz-insp-body">
-            <div className="cvm-spec-figures cz-figures">
+            <div className="cz-figures">
               <span>
                 <b>{entries.entries.length}</b>
                 <small>入口</small>
@@ -142,19 +152,20 @@ export function Inspector({
                 <small>出口规则</small>
               </span>
             </div>
-            <dl className="cvm-facts cz-split">
-              <div>
-                <dt>入口</dt>
-                <dd>
-                  L3 {l3} · L4 {entries.entries.length - l3}
-                </dd>
-              </div>
-              <div>
-                <dt>出口</dt>
-                <dd>
-                  L3 {rules.length - l4Rules} · L4 {l4Rules}
-                </dd>
-              </div>
+            <dl className="cz-split">
+              <dt>入口</dt>
+              <dd>
+                L3 {l3} · L4 {entries.entries.length - l3}
+                {waiting > 0 && <span className="cz-split-warn"> · 未生效 {waiting}</span>}
+              </dd>
+              <dt>容器</dt>
+              <dd>
+                运行 {running} · 未运行 {instances.length - running}
+              </dd>
+              <dt>出口</dt>
+              <dd>
+                L3 {rules.length - l4Rules} · L4 {l4Rules} · 其余走本机
+              </dd>
             </dl>
             <ul className="cz-legend">
               <li>
@@ -167,9 +178,25 @@ export function Inspector({
               </li>
               <li>
                 <i className="private" />
-                内网
+                内网出口
+              </li>
+              <li>
+                <i className="pending" />
+                生效中
               </li>
             </ul>
+            {workspace.can_write && (
+              <ul className="cz-tips">
+                <li>
+                  <span className="cz-tip-socket" aria-hidden="true" />
+                  拖入口右侧的线头到容器：新增或改派入口
+                </li>
+                <li>
+                  <span className="cz-tip-socket" aria-hidden="true" />
+                  拖容器右侧的端口到出口：新增出口规则
+                </li>
+              </ul>
+            )}
           </div>
         </aside>
       </div>
@@ -177,6 +204,7 @@ export function Inspector({
   }
   const id = instance.desired.id;
   const host = workspace.hosts.find(item => item.node_id === instance.node_id);
+  const terminal = guestTerminalAccess(instance, host, workspace.can_write);
   const mine = entries.entries.filter(item => item.instance_id === id);
   const links = rules.filter(item => item.instance === id);
   const writable = workspace.can_write;
@@ -209,6 +237,8 @@ export function Inspector({
       bad: 0.97,
     },
   ];
+  const machineName = (node: string) =>
+    machines.find(m => m.node === node)?.name ?? workspace.hosts.find(h => h.node_id === node)?.name ?? node;
   return (
     <div className="cz-inspector">
       <aside className="panel" aria-label={instance.desired.spec.name}>
@@ -216,6 +246,21 @@ export function Inspector({
           <b>{instance.desired.spec.name}</b>
           <AppliedState instance={instance} />
         </header>
+        <p className="cz-insp-sub">
+          {host?.name ?? instance.node_id} · {instance.desired.spec.resources.vcpus} vCPU ·{' '}
+          {capacity(instance.desired.spec.resources.memory_bytes)}
+        </p>
+        <div className="cz-readings" aria-label={current ? '当前读数' : '读数暂不可用'}>
+          {rings.map(ring => (
+            <span key={ring.label} className={`cz-reading tone-${resourceTone(ring.share, ring.warn, ring.bad)}`}>
+              <small>{ring.label}</small>
+              <b>{percent(ring.share)}</b>
+              <i className="cz-meter" aria-hidden="true">
+                <i style={{ width: `${Math.round((ring.share ?? 0) * 100)}%` }} />
+              </i>
+            </span>
+          ))}
+        </div>
         {proposal && (
           <ProposalBlock
             key={JSON.stringify(proposal)}
@@ -224,6 +269,7 @@ export function Inspector({
             instances={instances}
             entries={entries}
             catalog={catalog}
+            chains={chains}
             machines={machines}
             exits={exits}
             rules={rules}
@@ -232,7 +278,9 @@ export function Inspector({
         )}
         <div className="cz-insp-body">
           <div className="cz-insp-section">
-            <span className="cz-insp-label">访问入口</span>
+            <span className="cz-insp-label">
+              访问入口 <small>{mine.length}</small>
+            </span>
             {writable && (
               <button
                 className={`cvm-text-link cz-row-action ${pick?.kind === 'entry' ? 'on' : ''}`}
@@ -251,21 +299,37 @@ export function Inspector({
                   <span className="mono cz-row-text" title={text.text}>
                     {text.text}
                   </span>
-                  <span className="cz-rtt mono">{text.target}</span>
                   <span className={`cz-state ${entry.state}`} title={entry.error ?? undefined}>
                     {entryStateText[entry.state]}
                   </span>
-                  {writable && entry.state !== 'releasing' && (
-                    <button
-                      className="btn icon"
-                      aria-label="撤销入口"
-                      title="撤销这个入口"
-                      disabled={release.isPending}
-                      onClick={() => release.mutate(entry)}
-                    >
-                      <Icon of="close" size={12} />
-                    </button>
-                  )}
+                  <span className="cz-row-sub">
+                    <span>
+                      {text.target} · {machineName(entry.provider_node)}
+                    </span>
+                    <span className="cz-row-acts">
+                      <NetworkLogsButton
+                        iconOnly
+                        title="入口网络日志"
+                        allowed={entry.can_read_logs ?? entries.can_manage}
+                        machines={[
+                          { node_id: entry.provider_node, name: machineName(entry.provider_node), role: '入口' },
+                          { node_id: instance.node_id, name: host?.name, role: '计算' },
+                        ]}
+                        resources={[entry.id, ...(entry.tunnel_id ? [entry.tunnel_id] : [])]}
+                      />
+                      {writable && entry.state !== 'releasing' && (
+                        <button
+                          className="btn icon"
+                          aria-label="撤销入口"
+                          title="撤销这个入口"
+                          disabled={release.isPending}
+                          onClick={() => release.mutate(entry)}
+                        >
+                          <Icon of="close" size={12} />
+                        </button>
+                      )}
+                    </span>
+                  </span>
                 </div>
               );
             })
@@ -274,7 +338,9 @@ export function Inspector({
           )}
           {release.error && <ErrorBox error={release.error} />}
           <div className="cz-insp-section">
-            <span className="cz-insp-label">出口</span>
+            <span className="cz-insp-label">
+              出口 <small>{links.length ? `${links.length} + 本机` : '本机'}</small>
+            </span>
             {writable && (
               <button
                 className={`cvm-text-link cz-row-action ${pick?.kind === 'rule' ? 'on' : ''}`}
@@ -292,8 +358,7 @@ export function Inspector({
                 <span className="mono cz-row-text" title={routeLabel(link.route)}>
                   {routeLabel(link.route)}
                 </span>
-                <span className="cz-rtt">{exit?.provider ?? '已卸载的网卡'}</span>
-                {writable && (
+                {writable ? (
                   <button
                     className="btn icon"
                     aria-label="撤销出口规则"
@@ -305,39 +370,46 @@ export function Inspector({
                   >
                     <Icon of="close" size={12} />
                   </button>
+                ) : (
+                  <span />
                 )}
+                <span className="cz-row-sub">
+                  <span>
+                    {link.route.chain_id
+                      ? `线路 · ${chains?.chains.find(c => c.id === link.route.chain_id)?.name ?? link.route.chain_id}`
+                      : exit
+                        ? `${exit.publication.spec.name} · ${exit.provider}`
+                        : '已卸载的网卡'}
+                  </span>
+                </span>
               </div>
             );
           })}
           <div className="cz-row local">
             <span className="cz-layer">{hasDefault || links.length ? '其余' : '全部'}</span>
             <span className="cz-row-text">本机</span>
-            <span className="cz-rtt">{host?.name ?? instance.node_id}</span>
-          </div>
-          {routes.error && <ErrorBox error={routes.error} />}
-          <div className="cz-insp-section">
-            <span className="cz-insp-label">计算</span>
-          </div>
-          <div className="cz-row">
-            <b>{host?.name ?? instance.node_id}</b>
-            <span className="cz-rtt">
-              {instance.desired.spec.resources.vcpus} 核 ·{' '}
-              {Math.round(instance.desired.spec.resources.memory_bytes / 1024 ** 2)} MiB
+            <span />
+            <span className="cz-row-sub">
+              <span>
+                {host?.name ?? instance.node_id} ·{' '}
+                {instance.desired.spec.execution?.kind === 'baremetal' ? '宿主原有网络' : '宿主 NAT'}
+              </span>
             </span>
           </div>
-          <span className="node-card-resources cz-rings">
-            {rings.map(ring => (
-              <span className="node-card-resource" key={ring.label}>
-                <CardRing share={ring.share} tone={resourceTone(ring.share, ring.warn, ring.bad)} />
-                {ring.label}
-                <b>{percent(ring.share)}</b>
-              </span>
-            ))}
-          </span>
+          {routes.error && <ErrorBox error={routes.error} />}
         </div>
         <footer className="cz-insp-foot">
+          {workspace.can_write && (
+            <CvmTerminalAccess
+              key={`${id}:${instance.desired.restart_epoch}:${instance.desired.reinstall_epoch}:${terminal.enabled}`}
+              id={id}
+              name={instance.desired.spec.name}
+              enabled={terminal.enabled}
+              reason={terminal.reason}
+            />
+          )}
           <button className="btn" onClick={() => navigate('cvm', { p: 'instance', id })}>
-            详情
+            打开详情
           </button>
         </footer>
       </aside>
@@ -353,6 +425,7 @@ function ProposalBlock({
   instances,
   entries,
   catalog,
+  chains,
   machines,
   exits,
   rules,
@@ -363,6 +436,7 @@ function ProposalBlock({
   instances: CvmInstance[];
   entries: CvmEntryBoard;
   catalog: CvmNicCatalog | undefined;
+  chains: CvmChainCatalog | undefined;
   machines: EntryMachine[];
   exits: ExitTile[];
   rules: RuleLink[];
@@ -386,11 +460,16 @@ function ProposalBlock({
     proposal.kind === 'rule-new' || proposal.kind === 'rule-move'
       ? exits.find(item => item.id === proposal.exit)
       : null;
+  const chain =
+    proposal.kind === 'rule-new' || proposal.kind === 'rule-move'
+      ? chains?.chains.find(c => `chain:${c.id}` === proposal.exit)
+      : undefined;
+  const exitLabel = chain?.name ?? exit?.provider ?? '出口';
   const nic = exit ? nicFor(instance, exit.id) : undefined;
   const network = useQuery({
     queryKey: [...NIC_STATE, instance.desired.id],
     queryFn: () => fetchCvmNicState(instance.desired.id),
-    enabled: proposal.kind === 'rule-new' && !nic,
+    enabled: proposal.kind === 'rule-new' && !nic && !chain,
   });
   const hasDefault = rules.some(
     rule => rule.instance === instance.desired.id && isDefault(rule.route.destination) && !rule.route.service,
@@ -403,6 +482,61 @@ function ProposalBlock({
     exit?.kind === 'private' ? (exit.publication.spec.destinations[0] ?? '0.0.0.0/0') : '0.0.0.0/0',
   );
   const [localError, setLocalError] = useState<string | null>(null);
+
+  let request: CvmCompilePreviewRequest | null = null;
+  let requestError: string | null = null;
+  if (proposal.kind === 'rule-new' || proposal.kind === 'rule-move') {
+    try {
+      request = (() => {
+        const routing = instance.desired.spec.routing;
+        const write = (next: CvmContainerRoutes): CvmCompilePreviewRequest => {
+          const body = {
+            expected_generation: instance.desired.generation,
+            expected_revision: routing.revision,
+            routes: next,
+          };
+          return { kind: 'routes', request: { ...body, request_id: operationId(body) } };
+        };
+        if (proposal.kind === 'rule-move') {
+          const link = rules.find(item => item.key === proposal.rule);
+          if (!link || (!nic && !chain)) throw new Error('出口已变化，请刷新');
+          if (chain) return write(withChainRoute(withoutRoute(routing, link.index), link.route, chain));
+          return write(repointRoute(routing, link.index, nic!));
+        }
+        if (!exit && !chain) throw new Error('出口已变化，请刷新');
+        if (chain) {
+          if (
+            !chain.authorized ||
+            !chains?.supported ||
+            chains.owner?.tenant_id !== instance.tenant_id ||
+            chains.owner?.user_id !== instance.user_id
+          )
+            throw new Error('容器使用者授权或宿主能力已变化，请重新选择');
+          const route = {
+            destination: layer === 'L3' ? match.trim() : prefix.trim(),
+            chain_id: chain.id,
+            ...(layer === 'L4' ? { service: parseService(match) } : {}),
+          };
+          return write(withChainRoute(routing, route, chain));
+        }
+        if (!exit) throw new Error('出口已变化，请刷新');
+        if (!nic) {
+          const transport = network.data?.mount_options[exit.id]?.transports[0];
+          if (!transport) throw new Error(network.data?.mount_options[exit.id]?.error ?? '双方没有共同支持的承载');
+          const body = { expected_generation: instance.desired.generation, publication_id: exit.id, transport };
+          return { kind: 'mount', request: { ...body, request_id: operationId(body) } };
+        }
+        const route =
+          layer === 'L3'
+            ? { destination: match.trim(), interface_id: nic.id }
+            : { destination: prefix.trim(), interface_id: nic.id, service: parseService(match) };
+        return write(withRoute(routing, route, nic));
+      })();
+    } catch (error) {
+      requestError = error instanceof Error ? error.message : '出口配置无效';
+    }
+  }
+  const preview = useCompilePreview(instance.desired.id, request);
 
   const apply = useMutation({
     mutationFn: async () => {
@@ -425,32 +559,10 @@ function ProposalBlock({
         const body = { expected_revision: entry.revision, instance_id: instance.desired.id };
         return repointCvmEntry(entry.id, { ...body, request_id: operationId({ entry: entry.id, ...body }) });
       }
-      const routing = instance.desired.spec.routing;
-      const write = (next: CvmContainerRoutes) => {
-        const body = {
-          expected_generation: instance.desired.generation,
-          expected_revision: routing.revision,
-          routes: next,
-        };
-        return setCvmRoutes(instance.desired.id, { ...body, request_id: operationId(body) });
-      };
-      if (proposal.kind === 'rule-move') {
-        const link = rules.find(item => item.key === proposal.rule);
-        if (!link || !nic) throw new Error('出口已变化，请刷新');
-        return write(repointRoute(routing, link.index, nic));
-      }
-      if (!exit) throw new Error('出口已变化，请刷新');
-      if (!nic) {
-        const transport = network.data?.mount_options[exit.id]?.transports[0];
-        if (!transport) throw new Error(network.data?.mount_options[exit.id]?.error ?? '双方没有共同支持的承载');
-        const body = { expected_generation: instance.desired.generation, publication_id: exit.id, transport };
-        return mountCvmNic(instance.desired.id, { ...body, request_id: operationId(body) });
-      }
-      const route =
-        layer === 'L3'
-          ? { destination: match.trim(), interface_id: nic.id }
-          : { destination: prefix.trim(), interface_id: nic.id, service: parseService(match) };
-      return write(withRoute(routing, route, nic));
+      if (!request || !preview.ready) throw new Error(requestError ?? '请先预览当前变更');
+      if (request.kind === 'routes') return setCvmRoutes(instance.desired.id, request.request, preview.inputSha256);
+      if (request.kind === 'mount') return mountCvmNic(instance.desired.id, request.request, preview.inputSha256);
+      throw new Error('出口配置类型无效');
     },
     onSuccess: onClose,
     onSettled: settled,
@@ -525,13 +637,13 @@ function ProposalBlock({
   } else if (proposal.kind === 'rule-move') {
     const link = rules.find(item => item.key === proposal.rule);
     const from = exits.find(item => item.id === link?.exit);
-    if (!link || !exit) return null;
-    title = `改由 ${exit.provider} 出网`;
-    lines = [`${routeLabel(link.route)}：${from?.provider ?? '原网卡'} → ${exit.provider}`];
+    if (!link || (!exit && !chain)) return null;
+    title = `改由 ${exitLabel} 出网`;
+    lines = [`${routeLabel(link.route)}：${from?.provider ?? '原出口'} → ${exitLabel}`];
     action = '更换';
   } else {
-    if (!exit) return null;
-    if (!nic) {
+    if (!exit && !chain) return null;
+    if (!nic && !chain && exit) {
       const option = network.data?.mount_options[exit.id];
       title = `接入出口 · ${exit.provider}`;
       lines = [
@@ -545,11 +657,9 @@ function ProposalBlock({
       if (option?.error) lines.push(option.error);
       action = '接入';
     } else {
-      title = `新增出口 · ${exit.provider}`;
+      title = `新增出口 · ${exitLabel}`;
       lines = [
-        layer === 'L3'
-          ? `${match} → ${exit.provider}`
-          : `${match}${isDefault(prefix) ? '' : ` ${prefix}`} → ${exit.provider}`,
+        layer === 'L3' ? `${match} → ${exitLabel}` : `${match}${isDefault(prefix) ? '' : ` ${prefix}`} → ${exitLabel}`,
       ];
       ready = layer === 'L3' ? match.trim().length > 0 : !!parseService(match);
       fields = (
@@ -587,6 +697,18 @@ function ProposalBlock({
       action = '新增';
     }
   }
+  if (chain) {
+    const usage = chains?.traffic.find(t => t.kind === 'access' && t.app_id === chain.app_id);
+    const used = usage ? `${BigInt(usage.used_bytes).toLocaleString()} B` : '尚无用量';
+    lines.push(
+      `使用 ${chains?.owner?.name ?? instance.user_id} 的线路授权；本期 ${used}`,
+      '经主网卡接入，不占业务网卡槽位。只转发 TCP/UDP，ping 不通。',
+      '出网地址是线路落地；线路自己的分流、入口防护、使用者额度和限速继续生效。',
+      '线路不通时保持不可达，不回落到宿主 NAT。',
+    );
+    ready = ready && chain.authorized && !!chains?.supported;
+    if (usage?.exhausted) lines.push('本期额度已用尽：按使用者当前策略暂停或限速。');
+  }
   return (
     <section className="cz-proposal" aria-label="待确认的组合变更">
       <b>{title}</b>
@@ -596,6 +718,8 @@ function ProposalBlock({
         ))}
       </ul>
       {fields}
+      {(proposal.kind === 'rule-new' || proposal.kind === 'rule-move') &&
+        (request ? <CompilePreview preview={preview} /> : <p className="cvm-notice">{requestError}</p>)}
       {localError && <p className="cvm-notice">{localError}</p>}
       {apply.error && <ErrorBox error={apply.error} />}
       {network.error && <ErrorBox error={network.error} />}
@@ -603,7 +727,16 @@ function ProposalBlock({
         <button className="btn" onClick={onClose} disabled={apply.isPending}>
           取消
         </button>
-        <button className="btn primary" disabled={!ready || apply.isPending || !catalog} onClick={() => apply.mutate()}>
+        <button
+          className="btn primary"
+          disabled={
+            !ready ||
+            apply.isPending ||
+            (!catalog && !chain) ||
+            ((proposal.kind === 'rule-new' || proposal.kind === 'rule-move') && (!request || !preview.ready))
+          }
+          onClick={() => apply.mutate()}
+        >
           {apply.isPending ? '正在提交…' : action}
         </button>
       </footer>

@@ -49,6 +49,10 @@ export function entryBoard(workspace: CvmWorkspace, scene: string): CvmEntryBoar
         },
       ]
     : [];
+  for (const entry of entries) {
+    entry.can_read_logs = workspace.can_manage_network;
+    entry.tunnel_id = entry.remote ? 'entry-tunnel-fixture' : null;
+  }
   const publications: CvmEntryPublicationView[] = [
     {
       id: 'entrypub-hk',

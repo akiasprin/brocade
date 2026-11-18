@@ -27,16 +27,19 @@ for (const width of [1440, 390, 320])
     test(`NICs and independent routes ${width} ${theme}`, async ({ page }) => {
       await open(page, width, theme);
       await expect(page.getByText('两端已连接')).toBeVisible();
+      await expect(page.locator('.cvm-flow')).toHaveScreenshot(`network-flow-${width}-${theme}.png`);
       const network = page
         .locator('.cvm-section')
-        .filter({ has: page.getByRole('heading', { name: '网卡与路由', exact: true }) });
+        .filter({ has: page.getByRole('heading', { name: '网卡详情', exact: true }) });
       await expect(network).toHaveScreenshot(`allocated-nics-${width}-${theme}.png`);
       await page.getByRole('button', { name: '路由表', exact: true }).click();
       const dialog = page.getByRole('dialog', { name: '容器路由表' });
       await expect(dialog).toHaveScreenshot(`route-table-${width}-${theme}.png`);
       await fits(page);
-      await dialog.getByRole('button', { name: '移除此卡的路由引用' }).click();
+      await dialog.getByRole('button', { name: '移除此出口的路由引用' }).click();
       await expect(dialog.getByRole('textbox', { name: '目标 IP／网段' })).toHaveCount(0);
+      await dialog.getByRole('button', { name: '预览产物差异' }).click();
+      await expect(dialog.getByRole('button', { name: '保存', exact: true })).toBeEnabled();
       await dialog.getByRole('button', { name: '保存', exact: true }).click();
       await expect(dialog).toBeHidden();
       // NICs carry egress only: once no route references the NIC it can be detached.
@@ -45,7 +48,9 @@ for (const width of [1440, 390, 320])
     test(`publication and revisions ${width} ${theme}`, async ({ page }) => {
       await open(page, width, theme, false);
       await page.getByRole('tab', { name: '网络' }).click();
-      await expect(page.locator('.cvm-network-publications').getByText('网络', { exact: true })).toBeVisible();
+      await expect(
+        page.locator('.cvm-network-publications').getByRole('heading', { name: '出口网络', exact: true }),
+      ).toBeVisible();
       await expect(page.locator('.cvm-network-publications')).toHaveScreenshot(`publications-${width}-${theme}.png`);
       await page.getByRole('button', { name: '＋ 创建网络' }).click();
       const dialog = page.getByRole('dialog', { name: '创建网络' });
@@ -75,13 +80,19 @@ for (const width of [1440, 390, 320])
     test(`publication dependencies and bulk update ${width} ${theme}`, async ({ page }) => {
       await open(page, width, theme, false);
       await page.getByRole('tab', { name: '网络' }).click();
-      await page.getByRole('button', { name: '删除网络', exact: true }).click();
+      // 删除收在网络卡片的 ⋯ 菜单里。
+      await page
+        .locator('.cvm-publication-card')
+        .first()
+        .getByRole('button', { name: /更多操作$/ })
+        .click();
+      await page.getByRole('menuitem', { name: /^删除网络/ }).click();
       const remove = page.getByRole('dialog', { name: '删除网络', exact: true });
       await expect(remove.getByText('home-workspace')).toBeVisible();
       await expect(remove.getByRole('button', { name: '删除网络', exact: true })).toBeDisabled();
       await expect(remove).toHaveScreenshot(`publication-dependencies-${width}-${theme}.png`);
       await remove.getByRole('button', { name: '取消', exact: true }).click();
-      await page.getByRole('button', { name: '批量应用新规格', exact: true }).click();
+      await page.getByRole('button', { name: /^批量应用新规格/ }).click();
       const bulk = page.getByRole('dialog', { name: '批量应用网卡规格' });
       await bulk.getByRole('checkbox').check();
       await expect(bulk.getByRole('button', { name: '应用所选兼容规格' })).toBeEnabled();

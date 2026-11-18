@@ -1,3 +1,5 @@
+import { GeodataBrowser } from './geodata';
+import { validateDraft, type GeodataKind } from '../api/geodata';
 import { useServerForm } from '../ui/server-form';
 import { useNow } from '../ui/clock';
 import { ReverseHealthSettings, reversePoliciesError } from '../reverse-health-settings';
@@ -3518,8 +3520,9 @@ export function SettingsPane() {
     setForm(next);
   }
 
+  const [geoPreview, setGeoPreview] = useState<GeodataKind | null>(null);
   const save = useMutation({
-    mutationFn: (key: SectionKey) => {
+    mutationFn: async (key: SectionKey) => {
       // 当前段取表单中的值，其他段取已保存的值——而非表单中已修改但未保存的值。
       // 分段保存的作用即在于此：修改 XRAY 后又修改探测配置，点击 XRAY 的保存按钮时，
       // 探测部分的改动必须保持未提交状态，等待其自身的保存操作。
@@ -3590,6 +3593,11 @@ export function SettingsPane() {
         },
         stats_user_online: v('statsOnline') === 'true',
       };
+      if (key !== 'ports' && key !== 'probe')
+        await validateDraft([
+          ...draft.ops().filter(op => op.op !== 'update_settings'),
+          { op: 'update_settings', settings: body },
+        ]);
       const request: Promise<{ revision_id: number; settings?: ModelSettings }> =
         key === 'ports'
           ? savePortSettings(body.ports)
@@ -3781,7 +3789,17 @@ export function SettingsPane() {
                     22:30 UTC，比上游发布晚半小时。
                   </span>
                 </Fld>
+                {geoPreview && (
+                  <GeodataBrowser
+                    kind={geoPreview}
+                    source={geoPreview === 'geosite' ? form.geodataGeosite : form.geodataGeoip}
+                    onClose={() => setGeoPreview(null)}
+                  />
+                )}
                 <Fld label="geoip.dat">
+                  <button type="button" className="btn" onClick={() => setGeoPreview('geoip')}>
+                    预览
+                  </button>
                   <input
                     className={chg('geodataGeoip')}
                     style={{ width: 430 }}
@@ -3791,6 +3809,9 @@ export function SettingsPane() {
                   />
                 </Fld>
                 <Fld label="geosite.dat">
+                  <button type="button" className="btn" onClick={() => setGeoPreview('geosite')}>
+                    预览
+                  </button>
                   <input
                     className={chg('geodataGeosite')}
                     style={{ width: 430 }}

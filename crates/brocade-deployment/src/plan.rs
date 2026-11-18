@@ -83,6 +83,8 @@ pub enum PlannedAction {
     /// configuration release. Profiles and probe results remain operational state fetched by the
     /// independent runtime worker; this action is only the release fence for stable model intent.
     SyncVpngate,
+    /// Controller-side barrier: completion also requires the approved CVM receipts.
+    SyncCvm,
     SyncGrants,
     DisablePhantun,
     DisableHy2PortHop,
@@ -149,7 +151,7 @@ impl PlannedAction {
                 Some(ConfigArtifact::WireGuard)
             }
             PlannedAction::ApplyXray | PlannedAction::DisableXray => Some(ConfigArtifact::Xray),
-            PlannedAction::SyncVpngate | PlannedAction::SyncGrants => None,
+            PlannedAction::SyncCvm | PlannedAction::SyncVpngate | PlannedAction::SyncGrants => None,
         }
     }
 }
@@ -375,6 +377,7 @@ pub fn narrow_to_kind(mut plan: DeploymentPlan, kind: DeploymentKind) -> Deploym
         DeploymentKind::Grants => {
             plan.targets.retain(can_sync_grants_now);
             for target in &mut plan.targets {
+                target.actions.retain(|a| *a != PlannedAction::SyncCvm);
                 target.prerequisites.clear();
                 target.wave = 0;
                 target.desired.phantun = untouched("权限单不碰 phantun");
@@ -1048,9 +1051,10 @@ fn is_disruptive(
             was_ours_and_running(applied.map(|state| &state.hy2_port_hop))
         }
         PlannedAction::DisablePhantun => was_ours_and_running(applied.map(|state| &state.phantun)),
-        PlannedAction::ApplyWireGuard | PlannedAction::SyncVpngate | PlannedAction::SyncGrants => {
-            false
-        }
+        PlannedAction::ApplyWireGuard
+        | PlannedAction::SyncCvm
+        | PlannedAction::SyncVpngate
+        | PlannedAction::SyncGrants => false,
     }
 }
 
@@ -1253,7 +1257,8 @@ fn assign_waves(targets: &mut [PlannedTarget]) {
         .iter()
         .enumerate()
         .filter_map(|(index, target)| {
-            (target.actions.contains(&PlannedAction::ApplyXray)
+            ((target.actions.contains(&PlannedAction::ApplyXray)
+                || target.actions.contains(&PlannedAction::SyncCvm))
                 && !target.actions.contains(&PlannedAction::DisableXray))
             .then_some(index)
         })

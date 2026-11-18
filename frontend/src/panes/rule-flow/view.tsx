@@ -16,15 +16,18 @@ export function FlowModeToggle({
   onChange,
   name,
   controls,
+  disabled = false,
 }: {
   visual: boolean;
   onChange: () => void;
   name: string;
   controls: string;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
+      disabled={disabled}
       className={`flow-mode${visual ? ' is-visual' : ''}`}
       role="switch"
       aria-checked={visual}
@@ -244,10 +247,12 @@ function FlowInspector({
 
 export function RuleFlow({
   model,
+  loading = false,
   focusNode,
   onReveal,
 }: {
   model: FlowModel;
+  loading?: boolean;
   focusNode?: string;
   onReveal: (machine: FlowMachine, rule?: FlowRule) => void;
 }) {
@@ -256,6 +261,39 @@ export function RuleFlow({
   const [selection, setSelection] = useState<Selection | null>(null);
   const anchor = useRef<HTMLElement | null>(null);
   const well = useRef<HTMLDivElement>(null);
+  const pendingHeight = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    const root = well.current;
+    if (!root) return;
+    if (loading) {
+      const rememberHeight = () => {
+        pendingHeight.current = Number.parseFloat(getComputedStyle(root).height);
+      };
+      rememberHeight();
+      if (typeof ResizeObserver === 'undefined') return;
+      const observer = new ResizeObserver(rememberHeight);
+      observer.observe(root);
+      return () => observer.disconnect();
+    }
+    const from = pendingHeight.current;
+    pendingHeight.current = null;
+    if (
+      from === null ||
+      root.offsetWidth === 0 ||
+      !root.animate ||
+      window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+    )
+      return;
+    // Animate CSS heights: offsetHeight would count padding/borders twice with content-box.
+    const style = getComputedStyle(root);
+    const to = Number.parseFloat(style.height);
+    if (Math.abs(from - to) < 1) return;
+    const animation = root.animate([{ height: `${from}px` }, { height: `${to}px` }], {
+      duration: 260,
+      easing: style.getPropertyValue('--motion-ease-out').trim(),
+    });
+    return () => animation.cancel();
+  }, [loading]);
   const [geometry, setGeometry] = useState<{ width: number; height: number; wires: Wire[]; compact: boolean }>({
     width: 0,
     height: 0,
@@ -365,147 +403,186 @@ export function RuleFlow({
   const chips = [
     ...new Map(geometry.wires.filter(wire => wire.rule.hop).map(wire => [wire.rule.hop!.id, wire])).values(),
   ];
+  // Reserve layout using known machines/rules, never placeholder routing facts. On phones the
+  // same machines form a single vertical column, so reserve their combined height instead.
+  const columnHeights = loading
+    ? columns.map(
+        machines =>
+          machines.reduce((height, machine) => height + 60 + Math.max(1, machine.rules.length) * 32, 0) +
+          Math.max(0, machines.length - 1) * 18,
+      )
+    : [];
+  const phoneHeight = loading
+    ? model.machines.reduce((height, machine) => height + 60 + Math.max(1, machine.rules.length) * 40, 0) +
+      Math.max(0, model.machines.length - 1) * 12 +
+      94
+    : 0;
   return (
     <div className="rule-flow">
-      <div className="flow-well" ref={well}>
-        <FlowTraceBar
-          model={model}
-          query={query}
-          onQueryChange={setQuery}
-          network={network}
-          onNetworkChange={setNetwork}
-          target={target}
-          trace={trace}
-        />
-        <svg className="flow-wires" width={geometry.width} height={geometry.height} aria-hidden="true">
-          {geometry.wires.map(wire => (
-            <path
-              key={wire.rule.id}
-              d={wire.d}
-              className={`${trace?.rules.has(wire.rule.id) ? 'is-hit' : ''} ${selection?.id === wire.rule.id ? 'is-selected' : ''} ${wire.rule.shadowedBy ? 'is-shadowed' : ''}`}
-              onClick={() => {
-                const button = [...(well.current?.querySelectorAll<HTMLElement>('[data-flow-row]') ?? [])].find(
-                  element => element.dataset.flowRow === wire.rule.id,
-                );
-                if (button) {
-                  button.focus();
-                  open({ kind: 'hop', id: wire.rule.id }, button);
-                }
-              }}
+      <div
+        className={`flow-well${loading ? ' flow-well-loading' : ''}`}
+        ref={well}
+        aria-busy={loading || undefined}
+        style={
+          loading
+            ? ({
+                '--flow-loading-height': `${Math.max(220, 124 + Math.max(0, ...columnHeights))}px`,
+                '--flow-loading-phone-height': `${Math.max(220, phoneHeight)}px`,
+              } as CSSProperties)
+            : undefined
+        }
+      >
+        {loading ? (
+          <span className="flow-loading-label" role="status">
+            加载中…
+          </span>
+        ) : (
+          <>
+            <FlowTraceBar
+              model={model}
+              query={query}
+              onQueryChange={setQuery}
+              network={network}
+              onNetworkChange={setNetwork}
+              target={target}
+              trace={trace}
             />
-          ))}
-        </svg>
-        <div className="flow-columns">
-          {columns.map((machines, index) => (
-            <div className="flow-column" key={index}>
-              {machines.map(machine => (
-                <article
-                  className={`flow-machine${machine.id === model.entry ? ' is-entry' : ''}${machine.node === focusNode ? ' is-self' : ''}${trace?.machines.has(machine.id) ? ' is-lit' : ''}${cardDrag.dragging === machine.id ? ' is-dragging' : ''}`}
-                  data-flow-machine={machine.id}
-                  key={machine.id}
-                  style={
-                    {
-                      '--flow-node-x': `${cardDrag.offsets[machine.id]?.x ?? 0}px`,
-                      '--flow-node-y': `${cardDrag.offsets[machine.id]?.y ?? 0}px`,
-                    } as CSSProperties
-                  }
-                >
-                  <button
-                    type="button"
-                    className="flow-machine-head"
-                    data-flow-inlet={machine.id}
-                    title={geometry.compact ? '检视机器' : '拖动移动；方向键微调，Home 恢复位置；点击检视'}
-                    aria-description={geometry.compact ? undefined : '可拖动调整位置，也可用方向键微调，Home 恢复位置'}
-                    onPointerDown={event => cardDrag.start(machine.id, event)}
-                    onPointerMove={cardDrag.move}
-                    onPointerUp={cardDrag.end}
-                    onPointerCancel={cardDrag.cancel}
-                    onLostPointerCapture={cardDrag.cancel}
-                    onKeyDown={event => cardDrag.keyDown(machine.id, event)}
-                    onClick={event => {
-                      if (!cardDrag.consumeClick(event)) open({ kind: 'machine', id: machine.id }, event.currentTarget);
-                    }}
-                  >
-                    <span>
-                      {machine.country && <RegionFlag code={machine.country} />}
-                      <b>{machine.name}</b>
-                      {machine.node === focusNode && <i className="flow-self">本机</i>}
-                      <small className="flow-machine-facts">
-                        <span className="flow-listen" title={machine.listen}>
-                          {machine.listenPorts.length
-                            ? `${machine.id === model.entry ? '' : '中转 '}${machine.listenPorts.map(port => `:${port}`).join(' / ')}`
-                            : machine.listen}
-                        </span>
-                        {machine.id !== model.entry && <span aria-hidden="true">/</span>}
-                        <span className="flow-machine-role">
-                          {machine.id === model.entry
-                            ? '入口'
-                            : machine.reference
-                              ? '引用'
-                              : machine.rules.some(row => row.target)
-                                ? '中转'
-                                : '出口'}
-                        </span>
-                      </small>
-                    </span>
-                    {machine.reference && <span className="flow-reference">引用 · {machine.reference}</span>}
-                    {!machine.reachable && <span className="flow-reference">未从入口连接</span>}
-                  </button>
-                  <ol>
-                    {machine.rules.map(row => (
-                      <li
-                        key={row.id}
-                        className={`${trace?.rules.has(row.id) ? 'is-hit' : ''}${trace?.uncertain === row.id ? ' is-uncertain' : ''}${row.shadowedBy ? ' is-shadowed' : ''}`}
+            <svg className="flow-wires" width={geometry.width} height={geometry.height} aria-hidden="true">
+              {geometry.wires.map(wire => (
+                <path
+                  key={wire.rule.id}
+                  d={wire.d}
+                  className={`${trace?.rules.has(wire.rule.id) ? 'is-hit' : ''} ${selection?.id === wire.rule.id ? 'is-selected' : ''} ${wire.rule.shadowedBy ? 'is-shadowed' : ''}`}
+                  onClick={() => {
+                    const button = [...(well.current?.querySelectorAll<HTMLElement>('[data-flow-row]') ?? [])].find(
+                      element => element.dataset.flowRow === wire.rule.id,
+                    );
+                    if (button) {
+                      button.focus();
+                      open({ kind: 'hop', id: wire.rule.id }, button);
+                    }
+                  }}
+                />
+              ))}
+            </svg>
+            <div className="flow-columns">
+              {columns.map((machines, index) => (
+                <div className="flow-column" key={index}>
+                  {machines.map(machine => (
+                    <article
+                      className={`flow-machine${machine.id === model.entry ? ' is-entry' : ''}${machine.node === focusNode ? ' is-self' : ''}${trace?.machines.has(machine.id) ? ' is-lit' : ''}${cardDrag.dragging === machine.id ? ' is-dragging' : ''}`}
+                      data-flow-machine={machine.id}
+                      key={machine.id}
+                      style={
+                        {
+                          '--flow-node-x': `${cardDrag.offsets[machine.id]?.x ?? 0}px`,
+                          '--flow-node-y': `${cardDrag.offsets[machine.id]?.y ?? 0}px`,
+                        } as CSSProperties
+                      }
+                    >
+                      <button
+                        type="button"
+                        className="flow-machine-head"
+                        data-flow-inlet={machine.id}
+                        title={geometry.compact ? '检视机器' : '拖动移动；方向键微调，Home 恢复位置；点击检视'}
+                        aria-description={
+                          geometry.compact ? undefined : '可拖动调整位置，也可用方向键微调，Home 恢复位置'
+                        }
+                        onPointerDown={event => cardDrag.start(machine.id, event)}
+                        onPointerMove={cardDrag.move}
+                        onPointerUp={cardDrag.end}
+                        onPointerCancel={cardDrag.cancel}
+                        onLostPointerCapture={cardDrag.cancel}
+                        onKeyDown={event => cardDrag.keyDown(machine.id, event)}
+                        onClick={event => {
+                          if (!cardDrag.consumeClick(event))
+                            open({ kind: 'machine', id: machine.id }, event.currentTarget);
+                        }}
                       >
-                        <button
-                          type="button"
-                          data-flow-row={row.id}
-                          onClick={event => open({ kind: 'rule', id: row.id }, event.currentTarget)}
-                          title={`${flowMatch(row.rule.m)} → ${actionLabel(row, model)}${row.shadowedBy ? `；被规则 ${row.shadowedBy} 覆盖` : ''}`}
-                        >
-                          <span className="flow-index">{row.generated ? '+' : row.index + 1}</span>
-                          <span className="flow-match">{flowMatch(row.rule.m)}</span>
-                          <span className={`flow-action is-${row.rule.a.t}`}>
-                            {row.generated && <i title="编译器补齐">补齐</i>}
-                            {row.shadowedBy && <i>不会命中</i>}
-                            {row.target ? (
-                              <>
-                                <span className="flow-goto">
-                                  {actionLabel(row, model)}
-                                  <small>
-                                    {row.hop?.label}
-                                    {row.hop?.plaintext && ' · 明文'}
-                                  </small>
-                                </span>
-                                <span className="flow-outlet" data-flow-outlet={row.id} />
-                              </>
-                            ) : (
-                              actionLabel(row, model)
-                            )}
-                          </span>
-                        </button>
-                      </li>
-                    ))}
-                    {machine.rules.length === 0 && <li className="flow-empty">暂无规则，保存到草稿后查看编译补齐</li>}
-                  </ol>
-                </article>
+                        <span>
+                          {machine.country && <RegionFlag code={machine.country} />}
+                          <b>{machine.name}</b>
+                          {machine.node === focusNode && <i className="flow-self">本机</i>}
+                          <small className="flow-machine-facts">
+                            <span className="flow-listen" title={machine.listen}>
+                              {machine.listenPorts.length
+                                ? `${machine.id === model.entry ? '' : '中转 '}${machine.listenPorts.map(port => `:${port}`).join(' / ')}`
+                                : machine.listen}
+                            </span>
+                            {machine.id !== model.entry && <span aria-hidden="true">/</span>}
+                            <span className="flow-machine-role">
+                              {machine.id === model.entry
+                                ? '入口'
+                                : machine.reference
+                                  ? '引用'
+                                  : machine.rules.some(row => row.target)
+                                    ? '中转'
+                                    : '出口'}
+                            </span>
+                          </small>
+                        </span>
+                        {machine.reference && <span className="flow-reference">引用 · {machine.reference}</span>}
+                        {!machine.reachable && <span className="flow-reference">未从入口连接</span>}
+                      </button>
+                      <ol>
+                        {machine.rules.map(row => (
+                          <li
+                            key={row.id}
+                            className={`${trace?.rules.has(row.id) ? 'is-hit' : ''}${trace?.uncertain === row.id ? ' is-uncertain' : ''}${row.shadowedBy ? ' is-shadowed' : ''}`}
+                          >
+                            <button
+                              type="button"
+                              data-flow-row={row.id}
+                              onClick={event => open({ kind: 'rule', id: row.id }, event.currentTarget)}
+                              title={`${flowMatch(row.rule.m)} → ${actionLabel(row, model)}${row.shadowedBy ? `；被规则 ${row.shadowedBy} 覆盖` : ''}`}
+                            >
+                              <span className="flow-index">{row.generated ? '+' : row.index + 1}</span>
+                              <span className="flow-match">{flowMatch(row.rule.m)}</span>
+                              <span className={`flow-action is-${row.rule.a.t}`}>
+                                {row.generated && <i title="编译器补齐">补齐</i>}
+                                {row.shadowedBy && <i>不会命中</i>}
+                                {row.target ? (
+                                  <>
+                                    <span className="flow-goto">
+                                      {actionLabel(row, model)}
+                                      <small>
+                                        {row.hop?.label}
+                                        {row.hop?.plaintext && ' · 明文'}
+                                      </small>
+                                    </span>
+                                    <span className="flow-outlet" data-flow-outlet={row.id} />
+                                  </>
+                                ) : (
+                                  actionLabel(row, model)
+                                )}
+                              </span>
+                            </button>
+                          </li>
+                        ))}
+                        {machine.rules.length === 0 && (
+                          <li className="flow-empty">暂无规则，保存到草稿后查看编译补齐</li>
+                        )}
+                      </ol>
+                    </article>
+                  ))}
+                </div>
               ))}
             </div>
-          ))}
-        </div>
-        {chips.map(wire => (
-          <button
-            type="button"
-            key={wire.rule.hop!.id}
-            className={`flow-hop${wire.rule.hop!.plaintext ? ' is-plain' : ''}${trace?.hops.has(wire.rule.hop!.id) ? ' is-hit' : ''}`}
-            style={{ left: wire.x, top: wire.y }}
-            title={`${wire.rule.hop!.label} · ${wire.rule.hop!.wire ?? '待编译'}`}
-            onClick={event => open({ kind: 'hop', id: wire.rule.id }, event.currentTarget)}
-          >
-            {wire.rule.hop!.label}
-            {wire.rule.hop!.plaintext && <span>明文</span>}
-          </button>
-        ))}
+            {chips.map(wire => (
+              <button
+                type="button"
+                key={wire.rule.hop!.id}
+                className={`flow-hop${wire.rule.hop!.plaintext ? ' is-plain' : ''}${trace?.hops.has(wire.rule.hop!.id) ? ' is-hit' : ''}`}
+                style={{ left: wire.x, top: wire.y }}
+                title={`${wire.rule.hop!.label} · ${wire.rule.hop!.wire ?? '待编译'}`}
+                onClick={event => open({ kind: 'hop', id: wire.rule.id }, event.currentTarget)}
+              >
+                {wire.rule.hop!.label}
+                {wire.rule.hop!.plaintext && <span>明文</span>}
+              </button>
+            ))}
+          </>
+        )}
       </div>
       {selection && (
         <FlowInspector

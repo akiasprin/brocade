@@ -603,6 +603,7 @@ impl Fixture {
     pub fn desired(&self) -> InstanceDesired {
         let config: Value = serde_json::from_slice(&fs::read(&self.config).unwrap()).unwrap();
         let spec = InstanceSpec {
+            execution: ExecutionTarget::Cube,
             routing: ContainerRoutes::default(),
             name: "Test".into(),
             image: serde_json::from_value(config["capabilities"]["images"][0].clone()).unwrap(),
@@ -624,6 +625,8 @@ impl Fixture {
             }],
         };
         InstanceDesired {
+            artifacts: None,
+            artifact_mode: Default::default(),
             detached_interfaces: Vec::new(),
             id: "cvm-test".into(),
             operation_id: "op-1".into(),

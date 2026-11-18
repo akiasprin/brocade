@@ -5,6 +5,7 @@ The archive contains immutable runtime bytes and public configuration templates.
 Disks, Cubelet metadata, execution records and administrator network settings stay
 outside releases. A failed or interrupted activation restores the previous release.
 """
+
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -30,6 +31,8 @@ import threading
 
 
 CONTRACT = 'brocade-cvm-stack-v2'
+INSPECTION_ADDRESS = '127.0.0.1:18080'
+INSPECTION_URL = f'http://{INSPECTION_ADDRESS}/v1/network/taps'
 STATE_ABI = 'protected-root-v1+cubevs-attachments-v2'
 BASE = Path('/opt/brocade/cvm')
 TOOLBOX = Path('/usr/local/services/cubetoolbox')
@@ -45,11 +48,16 @@ REQUIRED = (
     'runtime/cube-kernel-scf/vmlinux',
     'runtime/cube-image/cube-guest-image-cpu.img',
     'runtime/cube-agent/cube-agent.ext4',
-    'runtime/cube-shim/version', 'runtime/cube-kernel-scf/version',
-    'runtime/cube-image/version', 'runtime/cube-agent/version',
-    'config/cubelet.toml', 'config/dynamic.yaml',
-    'config/cube.json', 'config/network.json',
-    'runtime/bin/cvm-host.py', 'runtime/bin/cvm-stack.py',
+    'runtime/cube-shim/version',
+    'runtime/cube-kernel-scf/version',
+    'runtime/cube-image/version',
+    'runtime/cube-agent/version',
+    'config/cubelet.toml',
+    'config/dynamic.yaml',
+    'config/cube.json',
+    'config/network.json',
+    'runtime/bin/cvm-host.py',
+    'runtime/bin/cvm-stack.py',
 )
 MAX_FILES = 4096
 MAX_TOTAL = 16 * 1024**3
@@ -72,7 +80,7 @@ class ProgressReporter:
         self.report()
 
     def report(self):
-        print(f'[{timestamp()}] CVM {self.stage}: {time.monotonic()-self.started:.1f}s', file=sys.stderr, flush=True)
+        print(f'[{timestamp()}] CVM {self.stage}: {time.monotonic() - self.started:.1f}s', file=sys.stderr, flush=True)
 
     def report_periodically(self):
         while not self.stop.wait(30):
@@ -81,7 +89,9 @@ class ProgressReporter:
     def finish(self, status):
         self.stop.set()
         self.worker.join(timeout=1)
-        print(f'[{timestamp()}] CVM {status}, elapsed {time.monotonic()-self.started:.3f}s', file=sys.stderr, flush=True)
+        print(
+            f'[{timestamp()}] CVM {status}, elapsed {time.monotonic() - self.started:.3f}s', file=sys.stderr, flush=True
+        )
 
 
 def report_stage(label):
@@ -101,7 +111,9 @@ def progress_task(label):
                 raise
             reporter.finish('completed')
             return value
+
         return wrapped
+
     return decorate
 
 
@@ -119,9 +131,12 @@ def digest(path):
 
 def safe_name(name):
     p = PurePosixPath(name)
-    return bool(name) and not p.is_absolute() and str(p) == name and all(
-        part not in ('', '.', '..') and re.fullmatch(r'[A-Za-z0-9_.+-]+', part)
-        for part in p.parts)
+    return (
+        bool(name)
+        and not p.is_absolute()
+        and str(p) == name
+        and all(part not in ('', '.', '..') and re.fullmatch(r'[A-Za-z0-9_.+-]+', part) for part in p.parts)
+    )
 
 
 def read_json(path):
@@ -186,7 +201,12 @@ def validate_manifest(value):
     if value.get('architecture') not in ('x86_64', 'aarch64'):
         raise StackError('unsupported CVM architecture')
     backends = value.get('storage_backends')
-    if not isinstance(backends, list) or not backends or any(not isinstance(b, str) or b not in ('xfs', 'plain') for b in backends) or len(backends) != len(set(backends)):
+    if (
+        not isinstance(backends, list)
+        or not backends
+        or any(not isinstance(b, str) or b not in ('xfs', 'plain') for b in backends)
+        or len(backends) != len(set(backends))
+    ):
         raise StackError('invalid CVM storage backend inventory')
     files = value.get('files', {})
     if not isinstance(files, dict) or not 1 <= len(files) <= MAX_FILES:
@@ -299,7 +319,9 @@ def verify_storage_binding(release, backend):
     if not path.exists() and backend != 'plain':
         return
     binding = read_json(path)
-    if binding.get('backend') != backend or (backend == 'plain' and binding.get('filesystem_uuid') != local_storage_uuid()):
+    if binding.get('backend') != backend or (
+        backend == 'plain' and binding.get('filesystem_uuid') != local_storage_uuid()
+    ):
         raise StackError('CVM storage filesystem changed or is not mounted; refusing a replacement pool')
 
 
@@ -350,12 +372,14 @@ def preflight(manifest, check_virtualization=True):
         if backend == 'xfs':
             with source.open('rb') as src, target.open('wb') as dst:
                 fcntl.ioctl(dst.fileno(), 0x40049409, src.fileno())
-                dst.flush(); os.fsync(dst.fileno())
+                dst.flush()
+                os.fsync(dst.fileno())
         else:
             with target.open('wb') as dst:
                 os.posix_fallocate(dst.fileno(), 0, 1024**2)
                 dst.write(b'CVM plain allocation preflight\n')
-                dst.flush(); os.fsync(dst.fileno())
+                dst.flush()
+                os.fsync(dst.fileno())
                 if os.fstat(dst.fileno()).st_blocks * 512 < 1024**2:
                     raise StackError('ext4 storage did not retain the requested physical allocation')
 
@@ -373,8 +397,14 @@ def persist_boot_modules():
 
 
 def prepare_runtime_directories():
-    for name in ('/data/log/Cubelet', '/data/log/CubeShim', '/data/log/CubeVmm',
-                 '/data/cube-shim/disks', '/data/snapshot_pack/disks', '/data/cube-shared/volume'):
+    for name in (
+        '/data/log/Cubelet',
+        '/data/log/CubeShim',
+        '/data/log/CubeVmm',
+        '/data/cube-shim/disks',
+        '/data/snapshot_pack/disks',
+        '/data/cube-shared/volume',
+    ):
         path = Path(name)
         durable_mkdir(path)
         info = path.lstat()
@@ -387,13 +417,20 @@ def ready(timeout=60, config=None):
     config = config or BASE / 'current/generated/cube.json'
     while time.monotonic() < deadline:
         try:
-            result = subprocess.run([str(AGENT_BIN), 'cvm-check', '--config', str(config)],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    timeout=min(35, max(.1, deadline - time.monotonic())))
+            result = subprocess.run(
+                [str(AGENT_BIN), 'cvm-check', '--config', str(config)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=min(35, max(0.1, deadline - time.monotonic())),
+            )
             if result.returncode == 0 and len(result.stdout) <= MAX_JSON:
                 report = json.loads(result.stdout)
                 caps = report.get('capabilities', {})
-                if report.get('executor') == 'brocade-cube-rust-v1' and caps.get('create') and caps.get('stable_storage'):
+                if (
+                    report.get('executor') == 'brocade-cube-rust-v1'
+                    and caps.get('create')
+                    and caps.get('stable_storage')
+                ):
                     return
         except (OSError, ValueError, subprocess.TimeoutExpired):
             pass
@@ -409,14 +446,25 @@ def verify_release(release):
     directory = release.lstat()
     if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid() or directory.st_mode & 0o022:
         raise StackError('runtime release directory is not private and owned')
+
     def fingerprint(path, mode=None):
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
             raise StackError('runtime inventory contains an unsafe file')
         if mode is not None and stat.S_IMODE(info.st_mode) != mode:
             raise StackError('runtime file permissions differ from its inventory')
-        return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
-                info.st_mode, info.st_uid, info.st_gid, info.st_nlink]
+        return [
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+            info.st_mode,
+            info.st_uid,
+            info.st_gid,
+            info.st_nlink,
+        ]
+
     manifest_path = release / 'manifest.json'
     before_manifest = fingerprint(manifest_path)
     manifest = validate_manifest(read_json(manifest_path))
@@ -432,7 +480,11 @@ def verify_release(release):
             return manifest
     for name, item in manifest['files'].items():
         path = release / name
-        if files[name][2] != item['bytes'] or digest(path) != item['sha256'] or fingerprint(path, item['mode']) != files[name]:
+        if (
+            files[name][2] != item['bytes']
+            or digest(path) != item['sha256']
+            or fingerprint(path, item['mode']) != files[name]
+        ):
             raise StackError('retained CVM runtime does not match its immutable inventory')
     if fingerprint(manifest_path) != before_manifest:
         raise StackError('runtime manifest changed during verification')
@@ -525,8 +577,8 @@ def host_memory_budget():
     mib = 1024**2
     physical = os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
     # Guest memory excludes the Agent, Cubelet, kernel/BPF and per-VM overhead.
-    reserve = max(384*mib, physical // 8)
-    return max(0, physical - reserve) // (64*mib) * (64*mib)
+    reserve = max(384 * mib, physical // 8)
+    return max(0, physical - reserve) // (64 * mib) * (64 * mib)
 
 
 def render_configuration(release, previous=None, mode='kvm'):
@@ -544,7 +596,11 @@ def render_configuration(release, previous=None, mode='kvm'):
         raise StackError('CVM requires an explicit usable IPv4 uplink')
     for source in sorted((release / 'config').rglob('*')):
         if source.is_file():
-            data = source.read_bytes().replace(b'@CVM_RELEASE@', str(release).encode()).replace(b'@CVM_UPLINK@', uplink.encode())
+            data = (
+                source.read_bytes()
+                .replace(b'@CVM_RELEASE@', str(release).encode())
+                .replace(b'@CVM_UPLINK@', uplink.encode())
+            )
             atomic(generated / source.relative_to(release / 'config'), data)
     if mode not in ('kvm', 'pvm'):
         raise StackError('invalid effective virtualization mode')
@@ -579,23 +635,29 @@ def render_configuration(release, previous=None, mode='kvm'):
         disk = shutil.disk_usage(STATE / 'storage')
         disk_budget = disk.free // gib * gib
         cpu = os.cpu_count() or 1
-        if memory < 128*mib or disk_budget < 3*gib:
+        if memory < 128 * mib or disk_budget < 3 * gib:
             raise StackError('host capacity is below the minimum instance requirements')
         caps.update(allocatable_vcpus=cpu, allocatable_memory_bytes=memory, allocatable_disk_bytes=disk_budget)
-        caps['resource_limits'] = dict(min_vcpus=1, max_vcpus=min(cpu, 8), min_memory_bytes=128*mib,
-            max_memory_bytes=min(memory, 4*gib), memory_step_bytes=64*mib,
-            min_root_disk_bytes=3*gib, max_root_disk_bytes=min(disk_budget, 64*gib), root_disk_step_bytes=gib)
+        caps['resource_limits'] = dict(
+            min_vcpus=1,
+            max_vcpus=8,
+            min_memory_bytes=128 * mib,
+            max_memory_bytes=4 * gib,
+            memory_step_bytes=64 * mib,
+            min_root_disk_bytes=3 * gib,
+            max_root_disk_bytes=64 * gib,
+            root_disk_step_bytes=gib,
+        )
     memory_budget = host_memory_budget()
-    if memory_budget < 128*1024**2:
+    if memory_budget < 128 * 1024**2:
         raise StackError('host has insufficient memory after the runtime reserve')
     caps['allocatable_memory_bytes'] = min(caps['allocatable_memory_bytes'], memory_budget)
-    if caps.get('resource_limits'):
-        limits = caps['resource_limits']
-        limits['max_memory_bytes'] = min(limits['max_memory_bytes'], caps['allocatable_memory_bytes'])
-        if limits['min_memory_bytes'] > limits['max_memory_bytes']:
-            raise StackError('retained instance limits exceed the host memory budget')
     config_path = generated / 'cubelet.toml'
-    atomic(config_path, apply_resource_defaults(config_path.read_text(), (release / 'config/cubelet.toml').read_text()).encode())
+    source = apply_resource_defaults(config_path.read_text(), (release / 'config/cubelet.toml').read_text())
+    # Older managed bundles used Console's port; migrate both ends together.
+    source = set_toml_values(source, 'http', {'address': INSPECTION_ADDRESS})
+    cfg['network_inspection_url'] = INSPECTION_URL
+    atomic(config_path, source.encode())
     dynamic_path = generated / 'dynamic.yaml'
     dynamic = dynamic_path.read_text()
     for key, value in [('creation_concurrent_num', 1), ('node_status_max_images', 256)]:
@@ -648,17 +710,20 @@ def render_configuration(release, previous=None, mode='kvm'):
         raise StackError('Cubelet image configuration is ambiguous')
     before, content = source.split(section)
     body, separator, after = content.partition('\n[')
-    body = '\n'.join(line for line in body.splitlines()
-                     if not re.match(r'^\s*(image_base_path|shared_kernel_path)\s*=', line))
+    body = '\n'.join(
+        line for line in body.splitlines() if not re.match(r'^\s*(image_base_path|shared_kernel_path)\s*=', line)
+    )
     kernel = release / 'runtime' / ('cube-kernel-pvm' if mode == 'pvm' else 'cube-kernel-scf') / 'vmlinux'
-    settings = f'\n    image_base_path = {json.dumps(str(image_base))}\n    shared_kernel_path = {json.dumps(str(kernel))}\n'
+    settings = (
+        f'\n    image_base_path = {json.dumps(str(image_base))}\n    shared_kernel_path = {json.dumps(str(kernel))}\n'
+    )
     atomic(config_path, (before + section + settings + body + separator + after).encode())
     configuration = tomllib.loads(config_path.read_text())
     if configuration.get('root') != str(STATE / 'root') or configuration.get('state') != str(STATE / 'state'):
         raise StackError('Cubelet metadata must use the persistent CVM data paths')
     if configuration['grpc']['address'] != cfg['cubelet_socket'] or configuration['grpc'].get('tcp_address'):
         raise StackError('Cubelet RPC must use the private configured Unix socket')
-    if configuration['http']['address'] != '127.0.0.1:8080' or configuration['debug']['address'] != '127.0.0.1:9966':
+    if configuration['http']['address'] != INSPECTION_ADDRESS or configuration['debug']['address'] != '127.0.0.1:9966':
         raise StackError('Cubelet inspection and debug listeners must stay on loopback')
     shim = release / 'runtime/cube-shim/bin/containerd-shim-cube-rs'
     if not re.fullmatch(r'[A-Za-z0-9_.-]{1,96}', native['shim_version']) or native['shim_sha256'] != digest(shim):
@@ -692,13 +757,16 @@ def prepare_boot_runtime_state():
     receipt = metadata / '.brocade-runtime-boot.json'
     runtime = metadata / 'io.containerd.runtime.v2.task'
     previous = read_json(receipt).get('host_boot_id') if receipt.exists() else None
-    if receipt.exists() and (receipt.is_symlink() or not isinstance(previous, str) or not re.fullmatch(
-        r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', previous
-    )):
+    if receipt.exists() and (
+        receipt.is_symlink()
+        or not isinstance(previous, str)
+        or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', previous)
+    ):
         raise StackError('runtime boot receipt is invalid')
-    if runtime.is_symlink() or (runtime.exists() and (
-        not runtime.is_dir() or runtime.stat().st_uid != os.geteuid() or runtime.stat().st_mode & 0o022
-    )):
+    if runtime.is_symlink() or (
+        runtime.exists()
+        and (not runtime.is_dir() or runtime.stat().st_uid != os.geteuid() or runtime.stat().st_mode & 0o022)
+    ):
         raise StackError('runtime transport directory is not owned and private')
     if previous == boot:
         return
@@ -734,20 +802,32 @@ def start_cubelet(release):
         run(['mount', '--bind', metadata, metadata])
     prepare_boot_runtime_state()
     binary = release / 'runtime/Cubelet/bin/cubelet'
-    process = subprocess.Popen([str(binary), '--config', str(release / 'generated/cubelet.toml'),
-                                '--dynamic-conf-path', str(release / 'generated/dynamic.yaml')], start_new_session=True)
+    process = subprocess.Popen(
+        [
+            str(binary),
+            '--config',
+            str(release / 'generated/cubelet.toml'),
+            '--dynamic-conf-path',
+            str(release / 'generated/dynamic.yaml'),
+        ],
+        start_new_session=True,
+    )
     deadline = time.monotonic() + 40
     while time.monotonic() < deadline:
         try:
             pid = int(Path('/run/cube-let.pid').read_text().strip())
-            if pid > 1 and Path(f'/proc/{pid}/exe').resolve() == binary and Path('/run/cubelet/cubelet.sock').is_socket():
+            if (
+                pid > 1
+                and Path(f'/proc/{pid}/exe').resolve() == binary
+                and Path('/run/cubelet/cubelet.sock').is_socket()
+            ):
                 return
         except (OSError, ValueError):
             pass
         # Cubelet intentionally kills its launcher parent after entering its mount namespace.
         if process.poll() not in (None, 0, -9):
             raise StackError('Cubelet launcher failed before daemon readiness')
-        time.sleep(.2)
+        time.sleep(0.2)
     raise StackError('Cubelet did not publish its actual daemon PID and Unix socket')
 
 
@@ -776,7 +856,11 @@ class Installation:
 
     def check_ownership(self, state):
         if self.toolbox.exists() or self.toolbox.is_symlink():
-            owned = {self.release(identity) / 'runtime' for identity in (state.get('current'), state.get('pending')) if identity}
+            owned = {
+                self.release(identity) / 'runtime'
+                for identity in (state.get('current'), state.get('pending'))
+                if identity
+            }
             if not self.toolbox.is_symlink() or self.toolbox.readlink() not in owned:
                 raise StackError('existing Cube installation is not managed by this CVM installer')
         for name in UNITS:
@@ -785,7 +869,10 @@ class Installation:
                 raise StackError('existing CVM service unit is not installer-owned')
         if not state.get('current') and not state.get('pending'):
             for directory in (STATE / 'root', STATE / 'state', STATE / 'storage'):
-                if directory.exists() and any(item.name != 'lost+found' or not item.is_dir() or any(item.iterdir()) for item in directory.iterdir()):
+                if directory.exists() and any(
+                    item.name != 'lost+found' or not item.is_dir() or any(item.iterdir())
+                    for item in directory.iterdir()
+                ):
                     raise StackError('existing Cubelet state has no managed CVM installation receipt')
 
     def activate(self, identity):
@@ -814,7 +901,9 @@ class Installation:
         point(self.base / 'current', release)
         self.units.mkdir(parents=True, exist_ok=True)
         common = '# Managed by Brocade CVM\n'
-        cubelet = common + f'''[Unit]
+        cubelet = (
+            common
+            + f"""[Unit]
 Description=Brocade CVM Cubelet
 After=network-online.target
 Wants=network-online.target
@@ -840,15 +929,19 @@ LimitMEMLOCK=infinity
 LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
-'''
+"""
+        )
         dropin.parent.mkdir(parents=True, exist_ok=True)
-        settings = common + f'''[Unit]
+        settings = (
+            common
+            + f"""[Unit]
 After=brocade-cvm-cubelet.service
 Wants=brocade-cvm-cubelet.service
 [Service]
 Environment=BROCADE_CVM_CONFIG={self.base}/current/generated/cube.json
 Environment=BROCADE_CVM_STATE_DIR=/var/lib/brocade/cvm-cube
-'''
+"""
+        )
         atomic(dropin, settings.encode(), 0o644)
         atomic(self.units / UNITS[0], cubelet.encode(), 0o644)
         run(['systemctl', 'daemon-reload'])
@@ -858,7 +951,10 @@ Environment=BROCADE_CVM_STATE_DIR=/var/lib/brocade/cvm-cube
         binary = release / 'runtime/Cubelet/bin/cubelet'
         if not pid.isdigit() or int(pid) < 2 or digest(Path('/proc') / pid / 'exe') != digest(binary):
             raise StackError('running Cubelet does not match the activated artifact')
-        if run(['nsenter', '-t', pid, '-m', 'findmnt', '-n', '-o', 'FSTYPE', '-T', str(STATE / 'state')]) in ('tmpfs', 'ramfs'):
+        if run(['nsenter', '-t', pid, '-m', 'findmnt', '-n', '-o', 'FSTYPE', '-T', str(STATE / 'state')]) in (
+            'tmpfs',
+            'ramfs',
+        ):
             raise StackError('running Cubelet metadata is not persistent')
         # Fresh enrollment writes and starts the Agent unit after this optional
         # stack step. Existing installations reload the new configuration now.
@@ -904,7 +1000,10 @@ Environment=BROCADE_CVM_STATE_DIR=/var/lib/brocade/cvm-cube
             # and files for explicit recovery; it must not be reported as installed.
             raise
         retained_previous = state.get('previous') if previous == identity else previous
-        atomic_json(self.state_path, {'current': identity, 'previous': retained_previous, 'action': action, 'completed_at': timestamp()})
+        atomic_json(
+            self.state_path,
+            {'current': identity, 'previous': retained_previous, 'action': action, 'completed_at': timestamp()},
+        )
 
     def install(self, archive, expected, mode=None):
         report_stage('verify bundle')
@@ -919,7 +1018,9 @@ Environment=BROCADE_CVM_STATE_DIR=/var/lib/brocade/cvm-cube
                 report_stage('stage immutable release')
                 durable_mkdir(target.parent)
                 if len(list(target.parent.iterdir())) >= MAX_RELEASES:
-                    raise StackError('CVM retained release limit reached; audit image and instance references before removing old releases')
+                    raise StackError(
+                        'CVM retained release limit reached; audit image and instance references before removing old releases'
+                    )
                 required = sum(item['bytes'] for item in manifest['files'].values())
                 if shutil.disk_usage(target.parent).free < required:
                     raise StackError('insufficient space for a staged CVM release; the active release is unchanged')
@@ -946,7 +1047,11 @@ Environment=BROCADE_CVM_STATE_DIR=/var/lib/brocade/cvm-cube
             preflight(verify_release(release), check_virtualization=False)
             host = host_manager(self, release)
             pending = host.state().get('pending')
-            if pending and HOST_BOOT_ID.read_text().strip() != pending['boot_id'] and platform.release() != pending['kernel']:
+            if (
+                pending
+                and HOST_BOOT_ID.read_text().strip() != pending['boot_id']
+                and platform.release() != pending['kernel']
+            ):
                 host.cancel()
                 state = self.state()
                 if state.get('current'):
@@ -992,18 +1097,31 @@ def pack(tree, output, architecture, source_sha256, min_glibc, provenance=None, 
             raise StackError('node runtime tree exceeds package limits')
     if pvm is not None:
         import cvm_host
+
         cvm_host.validate(pvm, files)
         if architecture != 'x86_64':
             raise StackError('PVM host kernels currently require x86_64')
-    manifest = validate_manifest({'contract': CONTRACT, 'state_abi': STATE_ABI, 'architecture': architecture,
-                                  'source_sha256': source_sha256, 'min_glibc': min_glibc, 'files': files,
-                                  'storage_backends': ['xfs'] if storage_backends is None else storage_backends,
-                                  'provenance': provenance})
+    manifest = validate_manifest(
+        {
+            'contract': CONTRACT,
+            'state_abi': STATE_ABI,
+            'architecture': architecture,
+            'source_sha256': source_sha256,
+            'min_glibc': min_glibc,
+            'files': files,
+            'storage_backends': ['xfs'] if storage_backends is None else storage_backends,
+            'provenance': provenance,
+        }
+    )
     if pvm is not None:
         manifest['pvm'] = pvm
     output.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, 'wb') as raw, gzip.GzipFile(fileobj=raw, mode='wb', mtime=0, filename='') as compressed, tarfile.open(fileobj=compressed, mode='w') as archive:
+    with (
+        os.fdopen(fd, 'wb') as raw,
+        gzip.GzipFile(fileobj=raw, mode='wb', mtime=0, filename='') as compressed,
+        tarfile.open(fileobj=compressed, mode='w') as archive,
+    ):
         data = (json.dumps(manifest, sort_keys=True) + '\n').encode()
         member = tarfile.TarInfo('manifest.json')
         member.size, member.mode = len(data), 0o644
@@ -1055,8 +1173,9 @@ def main():
         if install.install(args.bundle, args.sha256, args.mode):
             pending_reboot()
     elif args.command in ('mode', 'resume'):
-        if install.set_mode(args.selection if args.command == 'mode' else None,
-                            args.release if args.command == 'resume' else None):
+        if install.set_mode(
+            args.selection if args.command == 'mode' else None, args.release if args.command == 'resume' else None
+        ):
             pending_reboot()
     elif args.command == 'cancel-mode':
         with install.locked():
@@ -1094,7 +1213,10 @@ def main():
 
 
 def pending_reboot():
-    print('CVM virtualization is prepared; reboot the host manually. Installation will resume automatically after boot.', file=sys.stderr)
+    print(
+        'CVM virtualization is prepared; reboot the host manually. Installation will resume automatically after boot.',
+        file=sys.stderr,
+    )
     if REPORTER is not None:
         REPORTER.finish('awaiting_reboot')
     sys.exit(75)

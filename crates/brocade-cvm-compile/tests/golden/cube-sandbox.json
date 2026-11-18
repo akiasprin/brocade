@@ -1,0 +1,62 @@
+{
+  "annotations": {
+    "brocade.cvm.protected_root": "true",
+    "cube.master.desired.sandbox.id": "cvm-test"
+  },
+  "backend": "plain",
+  "containers": [
+    {
+      "annotations": {},
+      "args": [],
+      "command": [],
+      "envs": [],
+      "hostAliases": [],
+      "id": "",
+      "name": "",
+      "resources": {
+        "cpu": "1000m",
+        "mem": "128Mi"
+      },
+      "syscalls": [],
+      "sysctls": {},
+      "volume_mounts": [
+        {
+          "container_path": "/",
+          "exec": false,
+          "gid": "",
+          "gidMappings": [],
+          "host_path": "",
+          "name": "root",
+          "propagation": 0,
+          "readonly": false,
+          "recursive_read_only": false,
+          "selinux_relabel": false,
+          "sub_path": "",
+          "uid": "",
+          "uidMappings": []
+        }
+      ],
+      "working_dir": ""
+    }
+  ],
+  "exposed_ports": [],
+  "instance_type": "",
+  "labels": {
+    "brocade.cvm.instance": "cvm-test"
+  },
+  "namespace": "default",
+  "network_type": "",
+  "requestID": "brocade-create-cvm-test",
+  "runtime_handler": "",
+  "volumes": [
+    {
+      "name": "root",
+      "volume_source": {
+        "empty_dir": {
+          "Medium": 0,
+          "SizeLimit": "3221225472"
+        }
+      }
+    }
+  ]
+}
