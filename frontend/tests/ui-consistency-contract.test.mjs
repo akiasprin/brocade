@@ -23,6 +23,7 @@ test('分段选择、复制和弹层各自只有一个实现边界', () => {
   for (const [file, contents] of files) {
     if (file !== 'ui/bits.tsx') assert.doesNotMatch(contents, /className=["'`]segsw["'`]/, `${file} 重写了分段选择`);
     if (file !== 'ui/platform.ts') assert.doesNotMatch(contents, /navigator\.clipboard/, `${file} 绕过复制适配层`);
+    if (file !== 'ui/platform.ts') assert.doesNotMatch(contents, /crypto\.randomUUID/, `${file} 绕过 HTTP 兼容层`);
     if (!['ui/platform.ts', 'ui/copy-button.tsx'].includes(file)) {
       assert.doesNotMatch(contents, /\bcopyText\s*\(/, `${file} 绕过 CopyButton`);
     }

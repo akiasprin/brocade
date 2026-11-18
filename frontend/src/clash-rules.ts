@@ -1,3 +1,5 @@
+import { randomKey } from './ui/platform';
+
 export type RuleKind = 'domain' | 'keyword' | 'ip' | 'process';
 export type Target = 'select' | 'auto' | 'direct' | 'reject' | `line:${string}`;
 export type GlyphId =
@@ -113,7 +115,7 @@ export function validFor(kind: RuleKind, value: string): boolean {
 }
 
 export const sameRules = (a: Rules, b: Rules) => JSON.stringify(a) === JSON.stringify(b);
-export const nextId = () => crypto.randomUUID();
+export const nextId = () => randomKey();
 export const moduleOrder = (rules: Rules, modules: ModuleDef[]) => {
   const standard = modules.filter(module => !module.catalog);
   return [

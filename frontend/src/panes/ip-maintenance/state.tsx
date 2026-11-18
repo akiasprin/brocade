@@ -18,6 +18,7 @@ import {
 import { useAgentLiveness } from '../../ui/agent-alive';
 import { useNow } from '../../ui/clock';
 import { useUnsavedChanges } from '../../ui/navigation-guard';
+import { randomKey } from '../../ui/platform';
 import { placeName } from './regions-zh';
 import { maintenanceDefaults } from './defaults';
 
@@ -181,7 +182,7 @@ async function stopReportedRounds(
     )
       throw new Error('养护策略或会话已变化，请重新确认状态');
     if (!current || current.round_id !== target.report!.round_id || !ACTIVE.includes(current.phase)) continue;
-    await stopIpMaintenance(nodeId, baseline.generation, current.round_id!, crypto.randomUUID(), requestSignal());
+    await stopIpMaintenance(nodeId, baseline.generation, current.round_id!, randomKey(), requestSignal());
     if (index === targets.length - 1) break;
     // The server serializes stop intents. Wait for the first receipt before targeting the other family.
     while (true) {
@@ -285,7 +286,7 @@ function useCareState(node: NodeAgentStateItem, readOnly: boolean) {
         await saveIpMaintenance(node.node_id, 0, { ...baseline.policy, enabled: false });
         generation = 1;
       }
-      return commandIpMaintenance(node.node_id, generation, kind, crypto.randomUUID());
+      return commandIpMaintenance(node.node_id, generation, kind, randomKey());
     },
     onSettled: async (_data, error, kind) => {
       const obsoleteHistory = ['node-ip-maintenance-runs', 'node-ip-maintenance-day', 'node-ip-maintenance-run'].map(

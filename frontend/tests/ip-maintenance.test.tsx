@@ -149,6 +149,32 @@ async function policy() {
 }
 
 describe('machine maintenance production page', () => {
+  it.each(['run', 'stop', 'session-reset'] as const)(
+    'submits %s with a valid request id when HTTP access has no randomUUID',
+    async kind => {
+      vi.stubGlobal('crypto', { getRandomValues: crypto.getRandomValues.bind(crypto) });
+      view.report!.phase = kind === 'stop' ? 'dwelling' : 'complete';
+      const generation = view.desired.generation;
+      mount();
+      await ready();
+      if (kind === 'session-reset') {
+        const sheet = await policy();
+        fireEvent.click(within(sheet).getByRole('button', { name: '重置养护会话' }));
+        const confirmation = await screen.findByRole('dialog', { name: '重置养护会话' });
+        fireEvent.click(within(confirmation).getByRole('button', { name: '确认重置' }));
+      } else {
+        fireEvent.click(screen.getByRole('button', { name: kind === 'run' ? '立即执行' : '停止' }));
+      }
+      await waitFor(() => expect(commands).toHaveLength(1));
+      expect(commands[0].kind).toBe(kind);
+      expect(commands[0].body.expected_generation).toBe(generation);
+      expect(commands[0].body.request_id).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+      expect(writes).toEqual([]);
+    },
+  );
+
   it('lets a read-only visitor inspect status, policy, behavior and history without writes', async () => {
     mount(node(), true);
     await ready();
