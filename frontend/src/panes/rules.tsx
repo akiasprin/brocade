@@ -30,6 +30,7 @@ import {
   fetchSnapshot,
   egressDnsAddressText,
   egressDnsIssue,
+  normalizedEgressDns,
   hopMuxError,
   pruneChain,
   putStep,
@@ -291,6 +292,10 @@ class EgressDnsValidationError extends Error {
 /** The draft APIs persist during the call and return an already-resolved promise. */
 async function validateRuleStage(serialized: string) {
   const stage = JSON.parse(serialized) as RuleDraftStage;
+  for (const change of stage.dns) {
+    const issue = change.resolution && egressDnsIssue(change.resolution);
+    if (issue) throw new EgressDnsValidationError(change.selector, issue);
+  }
   const ops: import('../draft').ModelOp[] = [
     ...stage.outbounds.map(outbound => ({ op: 'upsert_external_outbound' as const, outbound })),
     ...stage.steps.map(step => ({
@@ -304,7 +309,7 @@ async function validateRuleStage(serialized: string) {
       op: 'set_node_egress_dns' as const,
       node_id: change.nodeId,
       selector: change.selector,
-      resolution: change.resolution,
+      resolution: change.resolution && normalizedEgressDns(change.resolution),
     })),
     ...(stage.dnsOrder
       ? [
@@ -963,7 +968,7 @@ export function MachineEgressDnsRules({
             op: 'set_node_egress_dns' as const,
             node_id: nodeId,
             selector: row.selector,
-            resolution: row.resolution,
+            resolution: normalizedEgressDns(row.resolution),
           })),
           { op: 'reorder_node_egress_dns', node_id: nodeId, selectors: activeRows.map(row => row.selector) },
         ];

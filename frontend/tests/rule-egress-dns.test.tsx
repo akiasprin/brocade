@@ -1,11 +1,12 @@
 import { geodataFixture } from './fixtures/geodata-data';
+import { isIP } from 'node:net';
 import { changeControl, choiceOptions } from './choice-helpers';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ConsoleSnapshot, NodeAgentStateItem, Rule } from '../src/api';
 import * as api from '../src/api';
-import { draft } from '../src/draft';
+import { draft, type ModelOp } from '../src/draft';
 import { MachineEgressDnsRules, RuleEditor, type ForwardPeer } from '../src/panes/rules';
 import { confirmDiscardChanges } from '../src/ui/navigation-guard';
 
@@ -23,6 +24,45 @@ const resolution = {
   address_strategy: 'use_ip' as const,
   fallback: 'stop' as const,
 };
+
+const resolverGroups = [
+  {
+    name: 'reported IPv4 group',
+    text: '166.0.199.207, 45.207.157.146, 139.180.133.239',
+    addresses: ['166.0.199.207', '45.207.157.146', '139.180.133.239'],
+  },
+  {
+    name: 'mixed IPv4 and IPv6 group',
+    text: '192.0.2.53, 2001:0db8::0053, 198.51.100.53',
+    addresses: ['192.0.2.53', '2001:db8::53', '198.51.100.53'],
+  },
+  {
+    name: 'Chinese commas and duplicate addresses',
+    text: ' 192.0.2.53，2001:db8::53 ， 192.0.2.53 ',
+    addresses: ['192.0.2.53', '2001:db8::53'],
+  },
+];
+
+/** Match the server's independent IP-address contract instead of accepting every preview. */
+function captureDnsValidation() {
+  const requests: ModelOp[][] = [];
+  vi.stubGlobal('fetch', async (path: string, init?: RequestInit) => {
+    if (path === '/model/validate') {
+      const { ops } = JSON.parse(String(init?.body)) as { ops: ModelOp[] };
+      requests.push(ops);
+      const invalid = ops.some(op => {
+        if (op.op !== 'set_node_egress_dns' || !op.resolution) return false;
+        const addresses = Array.isArray(op.resolution.address) ? op.resolution.address : [op.resolution.address];
+        return !addresses.length || addresses.length > 16 || addresses.some(address => !isIP(address.trim()));
+      });
+      return invalid
+        ? Response.json({ error: '指定 DNS 须包含 1–16 个 IPv4 或 IPv6 地址，不能填写域名' }, { status: 400 })
+        : Response.json({ valid: true });
+    }
+    return geodataFixture(path, init) ?? Response.json({ error: 'missing fixture' }, { status: 404 });
+  });
+  return requests;
+}
 
 beforeEach(() =>
   vi.stubGlobal(
@@ -207,17 +247,34 @@ function renderMachineRules(
 }
 
 describe('machine-scoped egress DNS', () => {
-  it('stages a comma-separated group using one protocol and structured addresses', async () => {
+  it.each(resolverGroups)('prevalidates and stages machine DNS: $name', async ({ text, addresses }) => {
+    const requests = captureDnsValidation();
     const view = renderMachineRules();
     const address = view.getByLabelText('DNS 地址（域名后缀 netflix.com）');
-    changeControl(address, { target: { value: '192.0.2.53, 2001:db8::53, 198.51.100.53' } });
-    expect((address as HTMLInputElement).value).toBe('192.0.2.53, 2001:db8::53, 198.51.100.53');
+    changeControl(address, { target: { value: text } });
+    expect((address as HTMLInputElement).value).toBe(text);
     fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
     await waitFor(() => expect(draft.ops().some(op => op.op === 'set_node_egress_dns')).toBe(true));
     const op = draft.ops().find(op => op.op === 'set_node_egress_dns');
     expect(op).toMatchObject({
-      resolution: { ...resolution, address: ['192.0.2.53', '2001:db8::53', '198.51.100.53'] },
+      resolution: { ...resolution, address: addresses },
     });
+    expect(requests.flat()).toContainEqual(op);
+  });
+
+  it.each(resolverGroups)('prevalidates and stages chain DNS: $name', async ({ text, addresses }) => {
+    draft.init('chain-dns-validation');
+    draft.clear();
+    const requests = captureDnsValidation();
+    const view = renderEditor();
+    const dns = openMachineDns(view);
+    changeControl(dns.getByRole('textbox', { name: /DNS 地址.*netflix\.com/ }), { target: { value: text } });
+    fireEvent.click(dns.getByRole('button', { name: '完成' }));
+    fireEvent.click(view.getByRole('button', { name: '保存到草稿' }));
+    await waitFor(() => expect(draft.ops().some(op => op.op === 'set_node_egress_dns')).toBe(true));
+    const op = draft.ops().find(op => op.op === 'set_node_egress_dns');
+    expect(op).toMatchObject({ resolution: { ...resolution, address: addresses } });
+    expect(requests.flat()).toContainEqual(op);
   });
 
   it('keeps typed addresses and reports an invalid group only after saving', async () => {
