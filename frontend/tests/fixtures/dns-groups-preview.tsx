@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MachineEgressDnsRules } from '../../src/panes/rules';
 import { UnlockDnsDetails } from '../../src/panes/unlock-dns';
 import { unlockReport } from '../../src/panes/unlock-report';
-import { geodataFixture } from './geodata-data';
+import { geoCatalog, geodataFixture } from './geodata-data';
 import { theme } from '../../src/forge/theme';
 import type { ConsoleSnapshot, EgressDnsResolution, NodeUnlockProbe } from '../../src/api';
 import '../../src/styles.css';
@@ -117,6 +117,20 @@ const job: NodeUnlockProbe = {
 const row = unlockReport(job).rows[0];
 globalThis.fetch = async (input, init) => {
   const path = input instanceof Request ? input.url : String(input);
+  if (params.get('catalog') === 'long' && new URL(path, location.href).pathname === '/routing/geodata/catalog') {
+    const catalog = geoCatalog('geosite');
+    return Response.json({
+      ...catalog,
+      entries: [
+        ...catalog.entries,
+        ...Array.from({ length: 1564 - catalog.entries.length }, (_, index) => ({
+          code: `site-${String(index).padStart(4, '0')}`,
+          count: 3,
+          attrs: [],
+        })),
+      ],
+    });
+  }
   const response = geodataFixture(path, init);
   if (response) return response;
   throw new Error('Unexpected DNS preview request');

@@ -302,8 +302,8 @@ export function GeoSelector({
                   }}
                 >
                   <Icon of="search" />
-                  更多…
-                  <span>
+                  <span className="geo-browse-label">更多…</span>
+                  <span className="geo-browse-summary">
                     浏览 {kind}.dat · {catalog.data.entries.length.toLocaleString()} 类
                   </span>
                   <Icon of="chevronDown" size={12} />

@@ -103,16 +103,19 @@
   width: min(440px, calc(100vw - 24px));
   padding: 0 !important;
   background: var(--sheet);
-  overflow: hidden;
   display: flex;
   flex-direction: column;
-  max-height: min(480px, 70vh);
+}
+.geo-menu-layer.popover > .dialog-surface.geo-menu {
+  max-height: min(480px, 70dvh);
+  overflow: hidden;
 }
 .geo-menu-search {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 10px;
+  flex: none;
 }
 .geo-menu-search > .f {
   min-width: 0;
@@ -181,10 +184,22 @@
   flex: none;
   cursor: pointer;
 }
-.geo-browse span {
+.geo-browse > .ui-icon,
+.geo-browse-label {
+  flex: none;
+}
+.geo-browse-label {
+  white-space: nowrap;
+}
+.geo-browse-summary {
   flex: 1;
+  min-width: 0;
   color: var(--ink-3);
   font-size: 11px;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .geo-menu-state {
   padding: 12px;
@@ -414,8 +429,8 @@
     display: inline-flex !important;
     margin-bottom: 14px;
   }
-  .geo-menu {
-    max-height: 65dvh;
+  .geo-menu-layer.popover > .dialog-surface.geo-menu {
+    max-height: min(480px, 65dvh);
   }
   .geo-browser footer {
     padding-bottom: max(12px, env(safe-area-inset-bottom));
