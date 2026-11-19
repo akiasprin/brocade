@@ -1,5 +1,6 @@
 import { waitForVisualAssets } from '../helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
+import { HTTP_ORIGIN, serveHttpFixtures, expectInsecureHttp } from '../helpers/http-origin';
 
 async function openTerminal(
   page: Page,
@@ -8,10 +9,13 @@ async function openTerminal(
   role = 'system-admin',
   output = 'root@cvm:~# printf "你好，CVM"\r\n你好，CVM\r\nroot@cvm:~# ',
   scene = 'detail',
+  origin = '',
 ) {
   const input: string[] = [];
+  const socketUrls: string[] = [];
   let disconnected = false;
   await page.routeWebSocket('**/cvm/*/terminal/*/stream', ws => {
+    socketUrls.push(ws.url());
     ws.onMessage(message => {
       if (typeof message === 'string') {
         const command = JSON.parse(message);
@@ -39,15 +43,47 @@ async function openTerminal(
     });
   });
   await page.setViewportSize({ width, height: 900 });
-  await page.goto(`/tests/fixtures/cvm/preview.html?scene=${scene}&theme=${theme}&role=${role}`);
+  await page.goto(`${origin}/tests/fixtures/cvm/preview.html?scene=${scene}&theme=${theme}&role=${role}`);
   if (scene === 'board') await page.locator('[data-pill="cvm-alice"]').click();
   await page.getByRole('button', { name: '终端', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '终端 · home-workspace' });
   await expect(dialog.getByRole('status')).toHaveText('已连接');
   await expect.poll(() => input.includes('ack')).toBe(true);
   await waitForVisualAssets(page);
-  return { dialog, input, disconnected: () => disconnected };
+  return { dialog, input, socketUrls, disconnected: () => disconnected };
 }
+
+test('insecure HTTP terminal uses ws and manual clipboard paste', async ({ page }) => {
+  await serveHttpFixtures(page);
+  const { dialog, input, socketUrls } = await openTerminal(
+    page,
+    390,
+    'light',
+    'system-admin',
+    undefined,
+    'detail',
+    HTTP_ORIGIN,
+  );
+  await expectInsecureHttp(page);
+  await dialog.getByRole('button', { name: '粘贴', exact: true }).click();
+  const paste = page.getByRole('dialog', { name: '粘贴到终端' });
+  await expect(paste.getByRole('textbox', { name: '粘贴内容' })).toBeFocused();
+  await paste.getByRole('textbox', { name: '粘贴内容' }).fill('printf "HTTP 终端"\n');
+  await paste.getByRole('button', { name: '粘贴到终端', exact: true }).click();
+  await expect.poll(() => input.join('').includes('HTTP 终端')).toBe(true);
+  await expect(paste).toHaveCount(0);
+  await expect(dialog.getByRole('status')).toHaveText('已连接');
+  await dialog.getByRole('button', { name: '新建会话', exact: true }).click();
+  await expect(dialog.getByRole('status')).toHaveText('已连接');
+  const requests = await page.evaluate(
+    () => (window as unknown as { __cvmMutations: { terminal_id?: string; new_session?: boolean }[] }).__cvmMutations,
+  );
+  expect(requests).toHaveLength(2);
+  expect(requests[1].new_session).toBe(true);
+  expect(requests[1].terminal_id).toMatch(/^[a-f0-9]{64}$/);
+  expect(socketUrls).toHaveLength(2);
+  for (const url of socketUrls) expect(url).toMatch(/^ws:\/\/brocade-http\.test\//);
+});
 
 test('the board inspector connects to its selected instance and detaches when selection changes', async ({ page }) => {
   const { dialog, disconnected } = await openTerminal(page, 1440, 'dark', 'system-admin', undefined, 'board');

@@ -544,8 +544,9 @@ jobs:
           BROCADE_PRODUCT_FLAVOR=base npm run test:react -- tests/product-variants.test.tsx
           BROCADE_PRODUCT_FLAVOR=base npm run build
           BROCADE_PRODUCT_FLAVOR=cvm npm run build
-          BROCADE_PRODUCT_FLAVOR=base npx playwright test tests/visual/product-variants.spec.ts tests/visual/ip-maintenance-http.spec.ts --workers=1
-          BROCADE_PRODUCT_FLAVOR=cvm npx playwright test tests/visual/product-variants.spec.ts tests/visual/cvm/cvm-hosts.spec.ts tests/visual/ip-maintenance-http.spec.ts --workers=1
+          BROCADE_PRODUCT_FLAVOR=base npx playwright test tests/visual/product-variants.spec.ts tests/visual/ip-maintenance-http.spec.ts tests/visual/http-platform.spec.ts --workers=1
+          BROCADE_PRODUCT_FLAVOR=cvm npx playwright test tests/visual/product-variants.spec.ts tests/visual/cvm/cvm-hosts.spec.ts tests/visual/ip-maintenance-http.spec.ts tests/visual/http-platform.spec.ts --workers=1
+          BROCADE_PRODUCT_FLAVOR=cvm npx playwright test tests/visual/cvm/cvm-terminal.spec.ts --grep 'insecure HTTP' --workers=1
 
       - name: Preserve failed visual comparisons
         if: failure() && steps.frontend.conclusion == 'failure'

@@ -30,6 +30,7 @@ export async function copyText(text: string): Promise<boolean> {
   area.style.position = 'fixed';
   area.style.top = '0';
   area.style.opacity = '0';
+  const focused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   document.body.appendChild(area);
   area.select();
   let copied = false;
@@ -38,7 +39,10 @@ export async function copyText(text: string): Promise<boolean> {
   } catch {
     // 初始值即为 false，catch 中无需重新赋值
   }
+  const restoreFocus = document.activeElement === area;
   area.remove();
+  // Removing the selected textarea otherwise leaves HTTP keyboard users on <body>.
+  if (restoreFocus && focused?.isConnected) focused.focus({ preventScroll: true });
   return copied;
 }
 

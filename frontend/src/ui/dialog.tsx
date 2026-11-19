@@ -151,8 +151,12 @@ export function DialogLayer({
     }
     scrollLocks += 1;
 
+    // React autoFocus focuses during commit without retaining an autofocus attribute.
+    // Keep that descendant's focus instead of moving to the first close button.
+    const active = document.activeElement;
     const focusTarget =
-      dialog?.querySelector<HTMLElement>('[autofocus]') ?? (dialog ? focusableElements(dialog)[0] : null);
+      dialog.querySelector<HTMLElement>('[autofocus]') ??
+      (active instanceof HTMLElement && dialog.contains(active) ? active : focusableElements(dialog)[0]);
     focusTarget?.focus();
 
     return () => {

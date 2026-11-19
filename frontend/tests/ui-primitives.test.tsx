@@ -8,6 +8,7 @@ import { bytes, fileBytes } from '../src/ui/format';
 import { Icon } from '../src/ui/icons';
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+const execCommandDescriptor = Object.getOwnPropertyDescriptor(document, 'execCommand');
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -32,6 +33,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
   if (clipboardDescriptor) Object.defineProperty(navigator, 'clipboard', clipboardDescriptor);
   else Reflect.deleteProperty(navigator, 'clipboard');
+  if (execCommandDescriptor) Object.defineProperty(document, 'execCommand', execCommandDescriptor);
+  else Reflect.deleteProperty(document, 'execCommand');
   document.body.style.overflow = '';
 });
 
@@ -70,6 +73,24 @@ it('共享复制按钮明确反馈成功并自动复位', async () => {
   act(() => vi.advanceTimersByTime(1_600));
   expect(button.dataset.copyState).toBe('idle');
   expect(button.textContent).toBe('复制');
+});
+
+it.each([true, false, 'throws'] as const)('HTTP 复制结果为 %s 时保留键盘焦点并清理临时控件', async result => {
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+  Object.defineProperty(document, 'execCommand', {
+    configurable: true,
+    value: () => {
+      if (result === 'throws') throw new DOMException('copy denied', 'NotAllowedError');
+      return result;
+    },
+  });
+  const view = render(<CopyButton text="http-copy" />);
+  const button = view.getByRole('button', { name: '复制' });
+  button.focus();
+  await act(async () => fireEvent.click(button));
+  expect(button.dataset.copyState).toBe(result === true ? 'done' : 'failed');
+  expect(document.activeElement).toBe(button);
+  expect(document.querySelector('textarea')).toBeNull();
 });
 
 it('图标复制按钮用可访问名称反馈 UUID 复制结果', async () => {
@@ -143,6 +164,18 @@ function DialogHarness() {
     </>
   );
 }
+
+it('弹层保留后置输入框的 React autoFocus，而不是跳到前面的关闭按钮', () => {
+  const view = render(
+    <DialogLayer label="初始编辑焦点" onClose={() => {}}>
+      <section className="dialog-surface">
+        <DialogClose>关闭编辑焦点</DialogClose>
+        <textarea aria-label="编辑内容" autoFocus />
+      </section>
+    </DialogLayer>,
+  );
+  expect(document.activeElement).toBe(view.getByRole('textbox', { name: '编辑内容' }));
+});
 
 function ChainedDialogHarness() {
   const [stage, setStage] = useState<'choice' | 'editor' | null>(null);

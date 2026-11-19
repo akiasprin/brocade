@@ -68,6 +68,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
           const layer = page.locator('.dialog-layer').last();
           await expect(layer).toBeVisible();
           await ready(page);
+          if (scenario.id === 'user-password') await expect(layer.getByLabel('新密码', { exact: true })).toBeFocused();
           const metrics = await layerMetrics(page);
           await writeFile(testInfo.outputPath('metrics.json'), JSON.stringify(metrics, null, 2));
           expect(metrics.layerFont.size).toBe('12.5px');

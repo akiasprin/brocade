@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { HTTP_ORIGIN, serveHttpFixtures, expectInsecureHttp } from './helpers/http-origin';
 
 test('maintenance commands work on an actual insecure HTTP origin', async ({ page }) => {
   const errors: string[] = [];
@@ -6,17 +7,11 @@ test('maintenance commands work on an actual insecure HTTP origin', async ({ pag
   page.on('pageerror', error => errors.push(error.message));
   // Fetch fixture assets through loopback while the document keeps a non-localhost
   // HTTP origin. The browser itself withholds randomUUID; no Crypto API is mocked.
-  await page.route('http://brocade-http.test/**', async route => {
-    const url = new URL(route.request().url());
-    url.host = '127.0.0.1:4318';
-    const response = await route.fetch({ url: url.toString() });
-    await route.fulfill({ response });
-  });
-  await page.goto('http://brocade-http.test/tests/fixtures/ip-maintenance-preview.html?scene=waiting');
+  await serveHttpFixtures(page);
+  await page.goto(`${HTTP_ORIGIN}/tests/fixtures/ip-maintenance-preview.html?scene=waiting`);
   const card = page.locator('.care-config');
   await expect(card).toHaveAttribute('aria-busy', 'false');
-  expect(await page.evaluate(() => isSecureContext)).toBe(false);
-  expect(await page.evaluate(() => typeof crypto.randomUUID)).toBe('undefined');
+  await expectInsecureHttp(page);
   expect(await page.evaluate(() => typeof crypto.getRandomValues)).toBe('function');
   await page.exposeFunction('recordMaintenanceCommand', (kind: string, body: { request_id: string }) => {
     commands.push({ kind, body });
