@@ -624,6 +624,35 @@ export const newEgressDns = (): EgressDnsResolution => ({
   fallback: 'stop',
 });
 
+const DNS_OPTION_FIELDS = [
+  { key: 'transport', label: '传输', className: 'egress-dns-transport', options: { tcp: 'TCP', udp: 'UDP' } },
+  {
+    key: 'address_strategy',
+    label: '地址策略',
+    className: 'egress-dns-family',
+    options: {
+      use_ip: 'UseIP',
+      use_ipv4v6: 'UseIPv4v6',
+      use_ipv6v4: 'UseIPv6v4',
+      use_ipv4: 'UseIPv4',
+      use_ipv6: 'UseIPv6',
+    },
+  },
+  {
+    key: 'fallback',
+    label: '失败处理',
+    className: 'egress-dns-fallback',
+    options: { stop: '停止连接', machine: '回退机器 DNS' },
+  },
+] as const satisfies readonly {
+  [Key in 'transport' | 'address_strategy' | 'fallback']: {
+    key: Key;
+    label: string;
+    className: string;
+    options: Record<EgressDnsResolution[Key], string>;
+  };
+}['transport' | 'address_strategy' | 'fallback'][];
+
 export function MachineEgressDnsControls({
   resolution,
   supported,
@@ -654,63 +683,32 @@ export function MachineEgressDnsControls({
     if (resolution) previousCustom.current = resolution;
   }, [resolution]);
   const label = (name: string) => `${name}${accessibleSuffix}`;
-  const options = resolution && (
-    <>
+  // 访客与只读账号看到与编辑态相同的控件，由外层只读 fieldset 统一禁用。
+  const options =
+    resolution &&
+    DNS_OPTION_FIELDS.map(({ key, label: name, className, options }) => (
       <ChoiceSelect
-        className="f words egress-dns-transport"
-        aria-label={label('传输')}
-        title="传输"
-        value={resolution.transport}
-        onChange={event =>
-          onChange({
-            ...resolution,
-            transport: event.target.value as EgressDnsResolution['transport'],
-          })
-        }
+        key={key}
+        className={`f words ${className}`}
+        singleChevron
+        aria-label={label(name)}
+        title={name}
+        value={resolution[key]}
+        onChange={event => onChange({ ...resolution, [key]: event.target.value })}
       >
-        <option value="tcp">TCP</option>
-        <option value="udp">UDP</option>
+        {Object.entries(options).map(([value, text]) => (
+          <option key={value} value={value}>
+            {text}
+          </option>
+        ))}
       </ChoiceSelect>
-      <ChoiceSelect
-        className="f words egress-dns-family"
-        aria-label={label('地址策略')}
-        title="地址策略"
-        value={resolution.address_strategy}
-        onChange={event =>
-          onChange({
-            ...resolution,
-            address_strategy: event.target.value as EgressDnsResolution['address_strategy'],
-          })
-        }
-      >
-        <option value="use_ip">UseIP</option>
-        <option value="use_ipv4v6">UseIPv4v6</option>
-        <option value="use_ipv6v4">UseIPv6v4</option>
-        <option value="use_ipv4">UseIPv4</option>
-        <option value="use_ipv6">UseIPv6</option>
-      </ChoiceSelect>
-      <ChoiceSelect
-        className="f words egress-dns-fallback"
-        aria-label={label('失败处理')}
-        title="失败处理"
-        value={resolution.fallback}
-        onChange={event =>
-          onChange({
-            ...resolution,
-            fallback: event.target.value as EgressDnsResolution['fallback'],
-          })
-        }
-      >
-        <option value="stop">停止连接</option>
-        <option value="machine">回退机器 DNS</option>
-      </ChoiceSelect>
-    </>
-  );
+    ));
   return (
     <>
       {showChoice && (
         <ChoiceSelect
           className="f words egress-dns-choice"
+          singleChevron
           aria-label={label('DNS 解析方式')}
           value={resolution ? 'custom' : 'machine'}
           title={supported ? `修改 ${nodeName} 的机器 DNS 策略` : '自定义 DNS 只支持域名类规则'}
@@ -743,6 +741,7 @@ export function MachineEgressDnsControls({
               className="f mono egress-dns-port"
               aria-label={label('端口')}
               title="端口"
+              // 访客快照中的端口会被打码为 ***，数字输入框无法显示。
               type={readOnly ? 'text' : 'number'}
               min={readOnly ? undefined : 1}
               max={readOnly ? undefined : 65535}
@@ -803,6 +802,8 @@ type MachineDnsDraftRow = {
   originalSelector: DestMatch | null;
   selector: DestMatch;
   resolution: EgressDnsResolution | null;
+  /** 用删除按钮移除的已保存策略：删除前的解析设置，供「撤销」原样恢复。 */
+  removed?: EgressDnsResolution;
 };
 
 /** 机器详情页中的机器级 DNS 策略。它不属于任何一条链，所以单独读取并写入
@@ -833,7 +834,7 @@ export function MachineEgressDnsRules({
   const [importing, setImporting] = useState(false);
   const [sourceNode, setSourceNode] = useState('');
   const nextRowId = useRef(1);
-  const focusRow = useRef<{ id: string; field: 'match' | 'handle' } | null>(null);
+  const focusRow = useRef<{ id: string; field: 'match' | 'handle' | 'remove' | 'restore' } | null>(null);
   const displayedRows = rows ?? rowsFromPolicies();
   const activeRows = displayedRows.filter(
     (row): row is MachineDnsDraftRow & { resolution: EgressDnsResolution } => row.resolution !== null,
@@ -891,6 +892,20 @@ export function MachineEgressDnsRules({
   const removeNewRow = (id: string) => {
     save.reset();
     setRows(current => (current ?? rowsFromPolicies()).filter(row => row.id !== id));
+  };
+  // 已保存的策略标为「保存后移除」，保存到草稿前可撤销；尚未保存的新行直接去掉。
+  const removePolicy = (row: MachineDnsDraftRow) => {
+    if (!row.originalSelector) return removeNewRow(row.id);
+    if (row.resolution === null) return;
+    updateRow(row.id, current => ({ ...current, resolution: null, removed: current.resolution ?? undefined }));
+  };
+  const restorePolicy = (row: MachineDnsDraftRow) => {
+    const stored = policies.find(
+      policy =>
+        row.originalSelector && egressDnsSelectorKey(policy.selector) === egressDnsSelectorKey(row.originalSelector),
+    );
+    const resolution = row.removed ?? stored?.resolution;
+    if (resolution) updateRow(row.id, current => ({ ...current, resolution, removed: undefined }));
   };
   const movePolicyTo = (id: string, targetId: string) => {
     save.reset();
@@ -1029,7 +1044,12 @@ export function MachineEgressDnsRules({
       item => item.dataset.reorderId === pending.id,
     );
     const control = row?.querySelector<HTMLInputElement | HTMLButtonElement>(
-      pending.field === 'match' ? '.rule-new-dns-value, .geo-select input' : '.order-grip',
+      {
+        match: '.rule-new-dns-value, .geo-select input',
+        handle: '.order-grip',
+        remove: '.dns-policy-remove',
+        restore: '.dns-policy-restore',
+      }[pending.field],
     );
     control?.focus({ preventScroll: true });
     if (control instanceof HTMLInputElement) control.select();
@@ -1095,6 +1115,7 @@ export function MachineEgressDnsRules({
                     data-reorder-id={row.id}
                     className={[
                       !row.originalSelector && 'node-egress-dns-new-row',
+                      row.originalSelector && row.resolution === null && 'node-egress-dns-removed',
                       dnsDrag?.source === row.id && 'dns-order-active',
                       dnsDrag?.source !== dnsDrag?.target &&
                         dnsDrag?.target === row.id &&
@@ -1130,62 +1151,57 @@ export function MachineEgressDnsRules({
                       </span>
                     </td>
                     <td className="rule-match-cell">
-                      {readOnly ? (
-                        <>
-                          <span className="f rule-readonly-select">{kind?.label ?? row.selector.t}</span>
-                          {value && <span className="f rule-readonly-value">{value}</span>}
-                        </>
-                      ) : (
-                        <>
-                          <ChoiceSelect
-                            className="f"
-                            aria-label={`DNS 匹配类型${suffix}`}
+                      <>
+                        <ChoiceSelect
+                          className="f"
+                          singleChevron
+                          aria-label={`DNS 匹配类型${suffix}`}
+                          disabled={row.resolution === null}
+                          value={row.selector.t}
+                          onChange={event =>
+                            updateRow(row.id, current => ({
+                              ...current,
+                              selector: buildMatch(event.target.value as DestMatch['t'], ''),
+                            }))
+                          }
+                        >
+                          {MATCH_KINDS.filter(candidate => supportsEgressDns(buildMatch(candidate.t, 'value'))).map(
+                            candidate => (
+                              <option key={candidate.t} value={candidate.t}>
+                                {candidate.label}
+                              </option>
+                            ),
+                          )}
+                        </ChoiceSelect>
+                        {row.selector.t === 'geosite' ? (
+                          <GeoSelector
+                            kind="geosite"
+                            values={row.selector.v}
+                            label={`DNS 匹配内容${suffix}`}
+                            scope={`D${index + 1}`}
                             disabled={row.resolution === null}
-                            value={row.selector.t}
+                            onChange={v =>
+                              updateRow(row.id, current => ({ ...current, selector: { t: 'geosite', v } }))
+                            }
+                            issue={dnsMatchIssues.get(activeRows.findIndex(r => r.id === row.id))?.message}
+                          />
+                        ) : (
+                          <RawMatchInput
+                            className="f rule-new-dns-value"
+                            aria-label={`DNS 匹配内容${suffix}`}
+                            disabled={row.resolution === null}
+                            value={value}
+                            placeholder={kind?.hint}
+                            spellCheck={false}
                             onChange={event =>
                               updateRow(row.id, current => ({
                                 ...current,
-                                selector: buildMatch(event.target.value as DestMatch['t'], ''),
+                                selector: buildMatch(current.selector.t, event.target.value),
                               }))
                             }
-                          >
-                            {MATCH_KINDS.filter(candidate => supportsEgressDns(buildMatch(candidate.t, 'value'))).map(
-                              candidate => (
-                                <option key={candidate.t} value={candidate.t}>
-                                  {candidate.label}
-                                </option>
-                              ),
-                            )}
-                          </ChoiceSelect>
-                          {row.selector.t === 'geosite' ? (
-                            <GeoSelector
-                              kind="geosite"
-                              values={row.selector.v}
-                              label={`DNS 匹配内容${suffix}`}
-                              disabled={row.resolution === null}
-                              onChange={v =>
-                                updateRow(row.id, current => ({ ...current, selector: { t: 'geosite', v } }))
-                              }
-                              issue={dnsMatchIssues.get(activeRows.findIndex(r => r.id === row.id))?.message}
-                            />
-                          ) : (
-                            <RawMatchInput
-                              className="f rule-new-dns-value"
-                              aria-label={`DNS 匹配内容${suffix}`}
-                              disabled={row.resolution === null}
-                              value={value}
-                              placeholder={kind?.hint}
-                              spellCheck={false}
-                              onChange={event =>
-                                updateRow(row.id, current => ({
-                                  ...current,
-                                  selector: buildMatch(current.selector.t, event.target.value),
-                                }))
-                              }
-                            />
-                          )}
-                        </>
-                      )}
+                          />
+                        )}
+                      </>
                     </td>
                     <td className="rule-action-cell">
                       <div className="rule-action-fields">
@@ -1196,7 +1212,7 @@ export function MachineEgressDnsRules({
                           onChange={next =>
                             next === null && row.originalSelector === null
                               ? removeNewRow(row.id)
-                              : updateRow(row.id, current => ({ ...current, resolution: next }))
+                              : updateRow(row.id, current => ({ ...current, resolution: next, removed: undefined }))
                           }
                           readOnly={readOnly}
                           nodeName={nodeName}
@@ -1207,30 +1223,58 @@ export function MachineEgressDnsRules({
                       </div>
                     </td>
                     <td className="dns-priority-cell">
-                      {!readOnly && (
+                      {!readOnly && row.originalSelector && row.resolution === null ? (
+                        // 待移除的行只留撤销：复制和排序对它没有意义。
                         <button
                           type="button"
-                          className="btn icon"
-                          aria-label={`复制 DNS 策略${suffix}`}
-                          title="复制这条 DNS 策略"
-                          disabled={row.resolution === null}
-                          onClick={() => copyPolicy(row.id)}
+                          className="btn dns-policy-restore"
+                          aria-label={`撤销删除 DNS 策略${suffix}`}
+                          onClick={() => {
+                            focusRow.current = { id: row.id, field: 'remove' };
+                            restorePolicy(row);
+                          }}
                         >
-                          <Icon of="copy" />
+                          撤销
                         </button>
-                      )}
-                      <DnsPriorityControl
-                        index={index}
-                        count={displayedRows.length}
-                        label={`${kind?.label ?? row.selector.t} ${value}`.trim()}
-                        readOnly={readOnly}
-                        showLabel={false}
-                        onMove={delta => movePolicy(row.id, delta)}
-                      />
-                      {!row.originalSelector && !readOnly && (
-                        <button type="button" className="btn danger" onClick={() => removeNewRow(row.id)}>
-                          取消
-                        </button>
+                      ) : (
+                        <div className="dns-row-actions">
+                          {!readOnly && (
+                            <button
+                              type="button"
+                              className="btn icon"
+                              aria-label={`复制 DNS 策略${suffix}`}
+                              title="复制这条 DNS 策略"
+                              disabled={row.resolution === null}
+                              onClick={() => copyPolicy(row.id)}
+                            >
+                              <Icon of="copy" />
+                            </button>
+                          )}
+                          <DnsPriorityControl
+                            index={index}
+                            count={displayedRows.length}
+                            label={`${kind?.label ?? row.selector.t} ${value}`.trim()}
+                            readOnly={readOnly}
+                            showLabel={false}
+                            onMove={delta => movePolicy(row.id, delta)}
+                          />
+                          {!readOnly && (
+                            <button
+                              type="button"
+                              className="btn icon dns-policy-remove"
+                              aria-label={`删除 DNS 策略${suffix}`}
+                              title={
+                                row.originalSelector ? '删除这条 DNS 策略，保存到草稿后生效' : '删除这条未保存的策略'
+                              }
+                              onClick={() => {
+                                focusRow.current = { id: row.id, field: 'restore' };
+                                removePolicy(row);
+                              }}
+                            >
+                              <Icon of="trash" />
+                            </button>
+                          )}
+                        </div>
                       )}
                     </td>
                   </tr>
@@ -2054,6 +2098,8 @@ type RuleEditorProps = {
   // 禁用通过 `<fieldset disabled>` 实现：逐个控件添加 disabled 时，遗漏某个不会报错，
   // 表现为 readonly 角色可以修改，点击保存后才返回 403。
   readOnly?: boolean;
+  /** Anonymous visitors can inspect the rules, but do not see inactive edit controls. */
+  hideEditControls?: boolean;
 };
 
 // 将依赖门放在持有表单 state 的组件之外：只有端口起点、占用表和编译结果都就绪后才挂载
@@ -2101,6 +2147,101 @@ export function RuleEditor(props: RuleEditorProps) {
   );
 }
 
+/** Keep every row in one editor on the same width-driven layout. */
+function useAdaptiveRuleLayout(editorRef: { current: HTMLFieldSetElement | null }) {
+  useLayoutEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || typeof ResizeObserver === 'undefined' || typeof MutationObserver === 'undefined') return;
+    let active = true;
+    let raf = 0;
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d');
+    const measure = () => {
+      if (!editor.isConnected || !editor.getBoundingClientRect().width) return;
+      const fields = [...editor.querySelectorAll<HTMLElement>('.rule-action-fields')].filter(
+        element => element.getBoundingClientRect().width,
+      );
+      if (!fields.length) return;
+      const available = Math.min(...fields.map(element => element.getBoundingClientRect().width));
+      const targets = fields.some(element => element.querySelector('.external-target-picker'));
+      let route = 0;
+      for (const element of editor.querySelectorAll<HTMLElement>('.rule-connection')) {
+        const address = element.querySelector<HTMLElement>('.rule-dial-address');
+        if (element.querySelector('.listener-local-route')) {
+          route = Math.max(route, 180);
+          continue;
+        }
+        if (!address) continue;
+        const style = getComputedStyle(address);
+        if (context) context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+        const textWidth = context
+          ? context.measureText(address.textContent || '').width
+          : (address.textContent || '').length * 7;
+        const horizontalInsets =
+          (parseFloat(style.paddingLeft) || 0) +
+          (parseFloat(style.paddingRight) || 0) +
+          (parseFloat(style.borderLeftWidth) || 0) +
+          (parseFloat(style.borderRightWidth) || 0);
+        const width =
+          (address.classList.contains('is-problem') ? Math.min(textWidth, 140) : textWidth) + horizontalInsets;
+        const dial = element.querySelector<HTMLElement>('.rule-dial-select');
+        const gap = parseFloat(getComputedStyle(element).columnGap) || 6;
+        route = Math.max(
+          route,
+          (dial?.getBoundingClientRect().width || 154) +
+            gap +
+            Math.ceil(width) +
+            (element.querySelector('.rule-mark') ? 18 + gap : 0),
+        );
+      }
+      const fieldStyle = getComputedStyle(fields[0]);
+      const actionWidth = parseFloat(fieldStyle.getPropertyValue('--action-width')) || 112;
+      const fieldGap = parseFloat(fieldStyle.columnGap) || 6;
+      const dnsChoiceWidth = parseFloat(fieldStyle.getPropertyValue('--dns-choice-width')) || 154;
+      let dnsWidth = 0;
+      for (const reference of editor.querySelectorAll('.egress-dns-reference')) {
+        const link = reference.querySelector('.rule-dns-link');
+        if (!link) continue;
+        const gap = parseFloat(getComputedStyle(reference).columnGap) || 0;
+        // The link keeps its intrinsic width even when the controls wrap; measure the whole group for pairs.
+        dnsWidth = Math.max(dnsWidth, dnsChoiceWidth + gap + link.getBoundingClientRect().width);
+      }
+      const actionPairNeed = actionWidth + fieldGap + Math.max(targets ? 180 : 0, dnsWidth);
+      const inlineNeed = actionPairNeed + (route ? route + fieldGap : 0);
+      const pairsNeed = Math.max(actionPairNeed, route);
+      const allowInline = fieldStyle.getPropertyValue('--rule-inline-layout').trim() !== '0';
+      editor.dataset.ruleFlow =
+        allowInline && available >= inlineNeed + 2 ? 'inline' : available >= pairsNeed + 2 ? 'pairs' : 'stacked';
+      editor.style.setProperty('--connection-width', Math.max(route, 180) + 'px');
+    };
+    const update = () => {
+      if (!active) return;
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(measure);
+    };
+    const resize = new ResizeObserver(update);
+    resize.observe(editor);
+    const observeFields = () => {
+      editor.querySelectorAll<HTMLElement>('.rule-action-fields').forEach(element => resize.observe(element));
+    };
+    const mutations = new MutationObserver(() => {
+      observeFields();
+      update();
+    });
+    mutations.observe(editor, { childList: true, subtree: true, characterData: true });
+    observeFields();
+    // 首次布局必须在绘制前完成，避免宽表先按默认三列溢出，再在下一帧跳动。
+    measure();
+    document.fonts?.ready.then(update);
+    return () => {
+      active = false;
+      cancelAnimationFrame(raf);
+      resize.disconnect();
+      mutations.disconnect();
+    };
+  }, [editorRef]);
+}
+
 function RuleEditorReady({
   appId,
   chainId,
@@ -2119,8 +2260,11 @@ function RuleEditorReady({
   ruleDrafts,
   saves = true,
   readOnly = false,
+  hideEditControls = false,
   editorDisabled,
 }: RuleEditorProps & { editorDisabled: boolean }) {
+  const editorRef = useRef<HTMLFieldSetElement>(null);
+  useAdaptiveRuleLayout(editorRef);
   const qc = useQueryClient();
   const savingAll = useContext(RuleDraftSavingCtx);
   const snapshot = useQuery({ queryKey: ['snapshot'], queryFn: () => fetchSnapshot() });
@@ -2848,7 +2992,7 @@ function RuleEditorReady({
     if (!isRelayAction(r.a)) return null;
     const referenced = r.a.t === 'reuse_listener' ? listenerOf(r.a.listener) : null;
     if (r.a.t === 'reuse_listener' && referenced?.local)
-      return <span className="listener-local-route mono">本机内部 · 回环:{referenced.step.hop_in?.port}</span>;
+      return <span className="listener-local-route mono">本机回环:{referenced.step.hop_in?.port}</span>;
     const to = r.a.t === 'forward' ? r.a.to : r.a.listener.node;
     const listener = r.a.t === 'reuse_listener' ? r.a.listener : null;
     return (
@@ -2884,6 +3028,7 @@ function RuleEditorReady({
       {/* 使用 `fieldset` 仅为其 disabled 属性（它是 HTML 中唯一能一次禁用整棵子树
           表单控件的元素），因此样式上重置为无视觉效果的一层，见 styles.css 的 .rule-ro。 */}
       <fieldset
+        ref={editorRef}
         className="panel rule-editor rule-ro"
         data-rule-location={`${appId}/${chainId}/${nodeId}`}
         disabled={editDisabled}
@@ -2914,27 +3059,30 @@ function RuleEditorReady({
                     {i + 1}
                   </td>
                   <td className="rule-match-cell">
-                    <select
-                      className="f"
-                      aria-label={`匹配类型（规则 ${i + 1}）`}
-                      value={r.m.t}
-                      onChange={e => patchMatch(i, r, buildMatch(e.target.value as DestMatch['t'], ''))}
-                    >
-                      {MATCH_KINDS.map(k => (
-                        <option
-                          key={k.t}
-                          value={k.t}
-                          disabled={
-                            (k.t === 'any' && r.m.t !== 'any' && rules.some(isAnyRule)) ||
-                            (k.t === 'sniffing_failed' &&
-                              r.m.t !== 'sniffing_failed' &&
-                              rules.some(isSniffingFallbackRule))
-                          }
-                        >
-                          {k.label}
-                        </option>
-                      ))}
-                    </select>
+                    <span className="rule-match-kind">
+                      <select
+                        className="f"
+                        aria-label={`匹配类型（规则 ${i + 1}）`}
+                        value={r.m.t}
+                        onChange={e => patchMatch(i, r, buildMatch(e.target.value as DestMatch['t'], ''))}
+                      >
+                        {MATCH_KINDS.map(k => (
+                          <option
+                            key={k.t}
+                            value={k.t}
+                            disabled={
+                              (k.t === 'any' && r.m.t !== 'any' && rules.some(isAnyRule)) ||
+                              (k.t === 'sniffing_failed' &&
+                                r.m.t !== 'sniffing_failed' &&
+                                rules.some(isSniffingFallbackRule))
+                            }
+                          >
+                            {k.label}
+                          </option>
+                        ))}
+                      </select>
+                      <Icon of="chevronDown" size={14} className="rule-match-kind-chevron" />
+                    </span>
                     {kind?.list !== false &&
                       r.m.t !== 'any' &&
                       (r.m.t === 'geosite' || r.m.t === 'geoip' ? (
@@ -2943,6 +3091,7 @@ function RuleEditorReady({
                           disabled={editDisabled}
                           values={r.m.v}
                           label={`匹配内容（规则 ${i + 1}）`}
+                          scope={`规则 ${i + 1}`}
                           onChange={v => patchMatch(i, r, { t: r.m.t as 'geosite' | 'geoip', v })}
                           issue={matchIssues.get(i)?.message}
                           issueValue={matchIssues.get(i)?.value}
@@ -3036,7 +3185,7 @@ function RuleEditorReady({
                           onCustom={() => setCreatingFor(i)}
                         />
                       )}
-                      {renderDial(r, i)}
+                      {isRelayAction(r.a) && <div className="rule-connection">{renderDial(r, i)}</div>}
                       {r.a.t === 'egress' && (
                         <EgressDnsChoice
                           custom={!!dnsResolution}
@@ -3301,59 +3450,64 @@ function RuleEditorReady({
 
         {save.error && !(save.error instanceof EgressDnsValidationError) && <ErrorBox error={save.error} />}
 
-        {/* 整块常驻，只读时由外层 `fieldset disabled` 一并禁用：按角色隐藏会使只读视角
-            看不到这张表可以增行和保存，页面读起来像是一份静态清单。 */}
-        <div className="toolbar rule-editor-toolbar">
-          <button className="btn" onClick={addRule}>
-            ＋ 加一条
-          </button>
-          <button
-            className="btn"
-            onClick={addAiRules}
-            disabled={
-              !siteCatalog.data?.entries.some(e => e.code === 'category-ai-!cn') ||
-              !siteCatalog.data.entries.some(e => e.code === 'huggingface')
-            }
-          >
-            ＋ 加 AI 组合
-          </button>
-          {matchIssues.size > 0 && <span className="geo-message error">{matchIssues.size} 处错误</span>}
-          {hasSniffingDependentRule && !hasSniffingFallback && (
-            <button
-              className="btn"
-              onClick={addSniffingFallback}
-              title="域名/Geosite 规则依赖嗅探；匹配条件与转发、从本机出网或拒绝动作独立配置。"
-            >
-              ＋ 嗅探失败兜底
-            </button>
-          )}
-          <span className="sp" />
-          {dnsEntryInToolbar && <DnsViewLink invalid={!!dnsError} onOpen={() => openDnsDialog(null)} />}
-          {/* 位于规则树中时保存按钮统一收敛到末尾，此处只保留该表已修改的标记 */}
-          {bus ? (
-            dirty && <span className="st st-warn">有改动，未落草稿</span>
-          ) : (
-            <>
+        {(!hideEditControls || dnsEntryInToolbar || matchIssues.size > 0) && (
+          <div className="toolbar rule-editor-toolbar">
+            {!hideEditControls && (
+              <>
+                <button className="btn" onClick={addRule}>
+                  ＋ 加一条
+                </button>
+                <button
+                  className="btn"
+                  onClick={addAiRules}
+                  disabled={
+                    !siteCatalog.data?.entries.some(e => e.code === 'category-ai-!cn') ||
+                    !siteCatalog.data.entries.some(e => e.code === 'huggingface')
+                  }
+                >
+                  ＋ 加 AI 组合
+                </button>
+              </>
+            )}
+            {matchIssues.size > 0 && <span className="geo-message error">{matchIssues.size} 处错误</span>}
+            {!hideEditControls && hasSniffingDependentRule && !hasSniffingFallback && (
               <button
                 className="btn"
-                disabled={!dirty || save.isPending}
-                onClick={() => {
-                  reset();
-                  save.reset();
-                }}
+                onClick={addSniffingFallback}
+                title="域名/Geosite 规则依赖嗅探；匹配条件与转发、从本机出网或拒绝动作独立配置。"
               >
-                还原
+                ＋ 嗅探失败兜底
               </button>
-              <button
-                className="btn primary"
-                disabled={save.isPending || !dirty || !!matchIssue}
-                onClick={() => save.mutate({})}
-              >
-                {save.isPending ? '保存中…' : '保存到草稿'}
-              </button>
-            </>
-          )}
-        </div>
+            )}
+            {!hideEditControls && <span className="sp" />}
+            {dnsEntryInToolbar && <DnsViewLink invalid={!!dnsError} onOpen={() => openDnsDialog(null)} />}
+            {/* 位于规则树中时保存按钮统一收敛到末尾，此处只保留该表已修改的标记 */}
+            {!hideEditControls &&
+              (bus ? (
+                dirty && <span className="st st-warn">有改动，未落草稿</span>
+              ) : (
+                <>
+                  <button
+                    className="btn"
+                    disabled={!dirty || save.isPending}
+                    onClick={() => {
+                      reset();
+                      save.reset();
+                    }}
+                  >
+                    还原
+                  </button>
+                  <button
+                    className="btn primary"
+                    disabled={save.isPending || !dirty || !!matchIssue}
+                    onClick={() => save.mutate({})}
+                  >
+                    {save.isPending ? '保存中…' : '保存到草稿'}
+                  </button>
+                </>
+              ))}
+          </div>
+        )}
       </fieldset>
       {dnsDialogShown && (
         <DnsPolicyDialog
@@ -3617,6 +3771,12 @@ export function RuleTargetPicker(props: RuleTargetPickerProps) {
         <span className={`external-target-kind${external ? ' external' : ''}`}>{badge}</span>
         <span className="external-target-copy">
           <b>{text || '选择内部节点或代理出站'}</b>
+          {action.t === 'reuse_listener' && referenced && (
+            <b className="listener-compact-label">
+              <span className="listener-compact-name">{referenced.nodeName}</span>
+              <span className="listener-compact-port">:{referenced.step.hop_in?.port}</span>
+            </b>
+          )}
           {referenced && (
             <small>
               {referenced.blocked
@@ -3625,7 +3785,7 @@ export function RuleTargetPicker(props: RuleTargetPickerProps) {
             </small>
           )}
         </span>
-        <span className="external-target-chevron">⌄</span>
+        <Icon of="chevronDown" size={14} className="external-target-chevron" />
       </button>
       {open && typeof document !== 'undefined' && (
         <MenuLayer anchor={anchor} label="转发目标" onClose={() => onOpenChange(false)}>
@@ -4204,6 +4364,7 @@ export function HopTargetRow({
   readOnly: boolean;
   security?: ReactNode;
 }) {
+  const WireField = readOnly ? 'div' : 'label';
   return (
     <div className="listener-reference-row hop-target-row">
       <div className="listener-reference-main">
@@ -4229,22 +4390,28 @@ export function HopTargetRow({
           />
           {portIssue && <RuleMark text={portIssue} />}
         </label>
-        <label className="hopfld hop-target-wire">
+        <WireField className="hopfld hop-target-wire">
           <small>承载协议</small>
-          <select
-            className={`f${wireMark ? ' is-exposed' : ''}`}
-            aria-label={wireAriaLabel}
-            value={wire}
-            onChange={event => onWire(event.target.value as HopWireKind)}
-          >
-            {wireOptions.map(option => (
-              <option key={option.kind} value={option.kind} disabled={option.disabled}>
-                {option.label}
-              </option>
-            ))}
-          </select>
+          {readOnly ? (
+            <span className="hop-target-wire-value">
+              {wireOptions.find(option => option.kind === wire)?.label ?? wire}
+            </span>
+          ) : (
+            <select
+              className={`f${wireMark ? ' is-exposed' : ''}`}
+              aria-label={wireAriaLabel}
+              value={wire}
+              onChange={event => onWire(event.target.value as HopWireKind)}
+            >
+              {wireOptions.map(option => (
+                <option key={option.kind} value={option.kind} disabled={option.disabled}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          )}
           {wireMark && <RuleMark text={wireMark} />}
-        </label>
+        </WireField>
         {pool && onPool && (
           <label className="hopfld hop-target-pool">
             <small>连接复用</small>
@@ -4592,6 +4759,7 @@ function DnsPolicyRow({
   hit,
   error,
   editable,
+  readOnly,
   onChange,
   onMove,
 }: {
@@ -4602,6 +4770,7 @@ function DnsPolicyRow({
   hit: boolean;
   error: string | null;
   editable: boolean;
+  readOnly: boolean;
   onChange: (resolution: EgressDnsResolution | null) => void;
   onMove: (delta: number) => void;
 }) {
@@ -4629,7 +4798,7 @@ function DnsPolicyRow({
           aria-invalid={!!error}
           aria-describedby={error ? errorId : undefined}
           spellCheck={false}
-          autoFocus={hit && !address}
+          autoFocus={!readOnly && hit && !address}
           onChange={event => set({ address: event.target.value })}
         />
         <input
@@ -4641,36 +4810,21 @@ function DnsPolicyRow({
         />
       </span>
       <span className="rule-dns-group rule-dns-opts">
-        <select
-          className="f"
-          aria-label={`传输${suffix}`}
-          value={resolution.transport}
-          onChange={event => set({ transport: event.target.value as EgressDnsResolution['transport'] })}
-        >
-          <option value="tcp">TCP</option>
-          <option value="udp">UDP</option>
-        </select>
-        <select
-          className="f"
-          aria-label={`地址策略${suffix}`}
-          value={resolution.address_strategy}
-          onChange={event => set({ address_strategy: event.target.value as EgressDnsResolution['address_strategy'] })}
-        >
-          <option value="use_ip">UseIP</option>
-          <option value="use_ipv4v6">UseIPv4v6</option>
-          <option value="use_ipv6v4">UseIPv6v4</option>
-          <option value="use_ipv4">UseIPv4</option>
-          <option value="use_ipv6">UseIPv6</option>
-        </select>
-        <select
-          className="f"
-          aria-label={`失败处理${suffix}`}
-          value={resolution.fallback}
-          onChange={event => set({ fallback: event.target.value as EgressDnsResolution['fallback'] })}
-        >
-          <option value="stop">停止连接</option>
-          <option value="machine">回退机器 DNS</option>
-        </select>
+        {DNS_OPTION_FIELDS.map(({ key, label: name, options }) => (
+          <select
+            key={key}
+            className="f"
+            aria-label={`${name}${suffix}`}
+            value={resolution[key]}
+            onChange={event => set({ [key]: event.target.value })}
+          >
+            {Object.entries(options).map(([value, text]) => (
+              <option key={value} value={value}>
+                {text}
+              </option>
+            ))}
+          </select>
+        ))}
       </span>
       <span className="rule-dns-ops">
         {editable && (
@@ -4804,6 +4958,7 @@ export function DnsPolicyDialog({
                       hit={key === hit}
                       error={errorFor(policy.selector)}
                       editable={editable}
+                      readOnly={readOnly}
                       onChange={next => onChange(policy.selector, next)}
                       onMove={delta => onMove(policy.selector, delta)}
                     />
@@ -4830,6 +4985,7 @@ export function DnsPolicyDialog({
                           kind="geosite"
                           values={adding.value.split(/[,，\s]+/).filter(Boolean)}
                           label="新策略的匹配内容"
+                          scope="新策略"
                           onChange={v => setAdding({ ...adding, value: v.join(', ') })}
                         />
                       ) : (

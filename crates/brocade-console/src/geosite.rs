@@ -1,7 +1,7 @@
 //! Configuration previews use the same global geosite source as the managed nodes.
 use std::{
-    collections::BTreeMap,
-    sync::Arc,
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -127,7 +127,64 @@ pub(crate) async fn download_bytes(source: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-pub(crate) struct Database(pub BTreeMap<String, Site>, pub u64);
+/// Sites keyed by upper-case code, the load time, and containment computed on first use.
+pub(crate) struct Database(
+    pub BTreeMap<String, Site>,
+    pub u64,
+    OnceLock<BTreeMap<String, Vec<String>>>,
+);
+
+/// A category that contains the looked-up domain, with the first entry that matched it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct Hit {
+    pub code: String,
+    pub count: usize,
+    pub kind: &'static str,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DomainLookup {
+    pub domain: String,
+    /// Narrowest first, so the most specific category leads.
+    pub hits: Vec<Hit>,
+    /// Categories with entries this preview cannot evaluate and no confirmed hit.
+    pub unknown: Vec<String>,
+}
+
+pub(crate) fn kind_name(kind: i32) -> &'static str {
+    match kind {
+        0 => "keyword",
+        1 => "regexp",
+        2 => "domain",
+        3 => "full",
+        _ => "unknown",
+    }
+}
+
+/// `None` when the entry needs the Xray engine to decide. `domain` must be lower-case ASCII.
+pub(crate) fn entry_matches(entry: &Domain, domain: &str) -> Option<bool> {
+    let value = entry.value.to_ascii_lowercase();
+    match entry.kind {
+        0 => Some(domain.contains(&value)),
+        // Go's Perl character classes and word boundaries are ASCII. Targets are normalized
+        // ASCII hostnames; unsupported regex syntax remains unknown.
+        1 => RegexBuilder::new(&entry.value)
+            .unicode(false)
+            .size_limit(256 * 1024)
+            .build()
+            .ok()
+            .map(|regex| regex.is_match(domain.as_bytes())),
+        2 => Some(
+            domain == value
+                || domain
+                    .strip_suffix(&value)
+                    .is_some_and(|prefix| prefix.ends_with('.')),
+        ),
+        3 => Some(domain == value),
+        _ => None,
+    }
+}
 
 impl Database {
     fn decode(bytes: &[u8]) -> Result<Self, String> {
@@ -144,7 +201,106 @@ impl Database {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            OnceLock::new(),
         ))
+    }
+
+    /// For each lower-case code, the other codes whose entries include all of its entries,
+    /// narrowest first. Entries compare like rule validation does: by kind and value, with
+    /// non-regex values case-folded. Computed once per loaded file; call off the async runtime.
+    pub(crate) fn within(&self) -> &BTreeMap<String, Vec<String>> {
+        self.2.get_or_init(|| {
+            let mut ids = HashMap::<(i32, String), u32>::new();
+            let mut sets: Vec<(String, Vec<u32>)> = Vec::with_capacity(self.0.len());
+            for site in self.0.values() {
+                let mut set: Vec<u32> = site
+                    .domain
+                    .iter()
+                    .map(|d| {
+                        let value = if d.kind == 1 {
+                            d.value.clone()
+                        } else {
+                            d.value.to_ascii_lowercase()
+                        };
+                        let next = u32::try_from(ids.len()).expect("dat is bounded to 64 MiB");
+                        *ids.entry((d.kind, value)).or_insert(next)
+                    })
+                    .collect();
+                set.sort_unstable();
+                set.dedup();
+                sets.push((site.code.to_ascii_lowercase(), set));
+            }
+            let mut postings = vec![Vec::<u32>::new(); ids.len()];
+            for (index, (_, set)) in sets.iter().enumerate() {
+                let index = u32::try_from(index).expect("site count fits u32");
+                for id in set {
+                    postings[*id as usize].push(index);
+                }
+            }
+            let mut within = BTreeMap::new();
+            for (index, (code, set)) in sets.iter().enumerate() {
+                // Only sets holding the rarest entry can contain this one.
+                let Some(rarest) = set.iter().min_by_key(|id| postings[**id as usize].len()) else {
+                    continue;
+                };
+                let mut wider: Vec<_> = postings[*rarest as usize]
+                    .iter()
+                    .map(|other| *other as usize)
+                    .filter(|other| *other != index)
+                    .filter(|other| {
+                        let wide = &sets[*other].1;
+                        wide.len() >= set.len()
+                            && set.iter().all(|id| wide.binary_search(id).is_ok())
+                    })
+                    .map(|other| (sets[other].1.len(), sets[other].0.clone()))
+                    .collect();
+                if wider.is_empty() {
+                    continue;
+                }
+                wider.sort();
+                within.insert(
+                    code.clone(),
+                    wider.into_iter().map(|(_, code)| code).collect(),
+                );
+            }
+            within
+        })
+    }
+
+    /// Every category containing `domain` (lower-case ASCII, validated by the caller).
+    pub(crate) fn lookup(&self, domain: &str) -> DomainLookup {
+        let mut hits = vec![];
+        let mut unknown = vec![];
+        for site in self.0.values() {
+            let mut undecided = false;
+            let hit = site
+                .domain
+                .iter()
+                .find(|entry| match entry_matches(entry, domain) {
+                    Some(hit) => hit,
+                    None => {
+                        undecided = true;
+                        false
+                    }
+                });
+            let code = site.code.to_ascii_lowercase();
+            match hit {
+                Some(entry) => hits.push(Hit {
+                    code,
+                    count: site.domain.len(),
+                    kind: kind_name(entry.kind),
+                    value: entry.value.clone(),
+                }),
+                None if undecided => unknown.push(code),
+                None => {}
+            }
+        }
+        hits.sort_by(|a, b| a.count.cmp(&b.count).then_with(|| a.code.cmp(&b.code)));
+        DomainLookup {
+            domain: domain.to_owned(),
+            hits,
+            unknown,
+        }
     }
 
     pub(crate) fn check(&self, selector: &str, domain: &str) -> Check {
@@ -163,38 +319,10 @@ impl Database {
             {
                 continue;
             }
-            let value = entry.value.to_ascii_lowercase();
-            let hit = match entry.kind {
-                0 => domain.contains(&value),
-                1 => {
-                    // Go's Perl character classes and word boundaries are ASCII. Targets are
-                    // normalized ASCII hostnames; unsupported regex syntax remains unknown.
-                    match RegexBuilder::new(&entry.value)
-                        .unicode(false)
-                        .size_limit(256 * 1024)
-                        .build()
-                    {
-                        Ok(regex) => regex.is_match(domain.as_bytes()),
-                        Err(_) => {
-                            unknown = true;
-                            false
-                        }
-                    }
-                }
-                2 => {
-                    domain == value
-                        || domain
-                            .strip_suffix(&value)
-                            .is_some_and(|prefix| prefix.ends_with('.'))
-                }
-                3 => domain == value,
-                _ => {
-                    unknown = true;
-                    false
-                }
-            };
-            if hit {
-                return Check::known(true);
+            match entry_matches(entry, domain) {
+                Some(true) => return Check::known(true),
+                Some(false) => {}
+                None => unknown = true,
             }
         }
         if unknown {
@@ -271,6 +399,41 @@ mod tests {
     }
 
     #[test]
+    fn preview_pages_follow_kind_order_and_name_the_matching_entries() {
+        let db = crate::geodata::Database::Site(std::sync::Arc::new(database()));
+        fn kinds(page: &crate::geodata::Page) -> Vec<&str> {
+            page.entries.iter().map(|e| e.kind.as_str()).collect()
+        }
+        let page = db.page("test", "", "", "", 0, 10, "").unwrap();
+        assert_eq!(kinds(&page), ["domain", "full", "regexp", "keyword"]);
+        assert_eq!(page.counts.values().sum::<usize>(), 4);
+        assert_eq!((page.hit, page.hits.len()), (None, 0));
+
+        let page = db.page("test", "", "", "", 1, 2, "").unwrap();
+        assert_eq!(kinds(&page), ["full", "regexp"]);
+        assert_eq!((page.total, page.next_offset), (4, Some(3)));
+
+        let page = db.page("test", "", "full", "", 0, 10, "").unwrap();
+        assert_eq!(kinds(&page), ["full"]);
+        assert_eq!(page.counts.len(), 4, "counts ignore the kind filter");
+        assert!(db.page("test", "", "ipv4", "", 0, 10, "").is_err());
+
+        let page = db
+            .page("test", "", "", "", 0, 10, "A.Suffix.Example")
+            .unwrap();
+        assert_eq!(page.hit, Some(true));
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(
+            (page.hits[0].kind.as_str(), page.hits[0].value.as_str()),
+            ("domain", "suffix.example")
+        );
+        let page = db
+            .page("test", "cn", "", "", 0, 10, "full.example")
+            .unwrap();
+        assert_eq!((page.hit, page.hits.len(), page.total), (Some(false), 0, 1));
+    }
+
+    #[test]
     fn evaluates_all_geosite_domain_kinds_and_suffix_boundaries() {
         let db = database();
         for domain in [
@@ -301,6 +464,75 @@ mod tests {
         assert_eq!(db.check("missing", "full.example").hit, None);
         assert!(Database::decode(b"not protobuf").is_err());
         assert!(Database::decode(b"").is_err());
+    }
+
+    fn sites(sites: &[(&str, &[(i32, &str)])]) -> Database {
+        let entry = sites
+            .iter()
+            .map(|(code, domains)| Site {
+                code: (*code).into(),
+                domain: domains
+                    .iter()
+                    .map(|(kind, value)| Domain {
+                        kind: *kind,
+                        value: (*value).into(),
+                        attribute: vec![],
+                    })
+                    .collect(),
+            })
+            .collect();
+        Database::decode(&SiteList { entry }.encode_to_vec()).unwrap()
+    }
+
+    #[test]
+    fn containment_includes_equal_sets_and_orders_narrowest_first() {
+        let db = sites(&[
+            ("NARROW", &[(2, "Example.com"), (1, "^A$")]),
+            ("SAME", &[(2, "example.com"), (1, "^A$")]),
+            (
+                "WIDE",
+                &[(2, "example.com"), (1, "^A$"), (3, "other.example")],
+            ),
+            // Regex values keep their case, so this does not contain NARROW.
+            ("CASED", &[(2, "example.com"), (1, "^a$"), (3, "x.example")]),
+            ("EMPTY", &[]),
+        ]);
+        let within = db.within();
+        assert_eq!(within["narrow"], ["same", "wide"]);
+        assert_eq!(within["same"], ["narrow", "wide"]);
+        assert!(!within.contains_key("wide"));
+        assert!(!within.contains_key("cased"));
+        assert!(!within.contains_key("empty"));
+        assert!(std::ptr::eq(within, db.within()));
+    }
+
+    #[test]
+    fn domain_lookup_lists_every_containing_category_narrowest_first() {
+        let db = sites(&[
+            (
+                "WIDE",
+                &[(3, "x.example"), (2, "example.com"), (3, "y.example")],
+            ),
+            ("SERVICE", &[(2, "chat.example.com")]),
+            ("WORD", &[(0, "chat")]),
+            ("BROKEN", &[(1, "(")]),
+            ("ELSEWHERE", &[(2, "example.org")]),
+        ]);
+        let found = db.lookup("api.chat.example.com");
+        assert_eq!(
+            found
+                .hits
+                .iter()
+                .map(|h| (h.code.as_str(), h.count, h.kind, h.value.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("service", 1, "domain", "chat.example.com"),
+                ("word", 1, "keyword", "chat"),
+                ("wide", 3, "domain", "example.com"),
+            ]
+        );
+        assert_eq!(found.unknown, ["broken"]);
+        assert!(db.lookup("example.net").hits.is_empty());
     }
 
     #[tokio::test]

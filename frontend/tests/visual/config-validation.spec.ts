@@ -29,11 +29,11 @@ for (const width of [390, 1440])
         .click();
       const menu = page.getByRole('dialog', { name: 'geosite 选项' });
       await expect(menu).toBeVisible();
-      await expect(menu.getByRole('button', { name: /更多/ })).toBeVisible();
+      await expect(menu.getByRole('button', { name: '查看条目…' })).toBeVisible();
       await expect(menu.locator('.geo-menu')).toHaveScreenshot(`a-menu-${width}-${theme}.png`, {
         animations: 'disabled',
       });
-      await menu.getByRole('button', { name: /更多/ }).click();
+      await menu.getByRole('button', { name: '查看条目…' }).click();
       const browser = page.getByRole('dialog', { name: '规则集预览' });
       await expect(browser).toBeVisible();
       await browser.getByRole('button', { name: /google 102/ }).click();

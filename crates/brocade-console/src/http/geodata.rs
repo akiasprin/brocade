@@ -15,6 +15,9 @@ pub(super) struct PreviewQuery {
     source: Option<String>,
     #[serde(default)]
     attr: String,
+    /// Entry kind (`domain`, `full`, … or `ipv4`/`ipv6`); empty keeps all kinds.
+    #[serde(default, rename = "type")]
+    entry_kind: String,
     #[serde(default)]
     q: String,
     #[serde(default)]
@@ -100,9 +103,41 @@ pub(super) async fn catalog(
             );
         }
     }
-    let mut value = serde_json::to_value(db.catalog(source)).map_err(StoreError::from)?;
+    let source = source.to_owned();
+    let catalog = tokio::task::spawn_blocking(move || db.catalog(&source))
+        .await
+        .map_err(|_| StoreError::Unavailable("规则集目录生成失败".into()))?;
+    let mut value = serde_json::to_value(catalog).map_err(StoreError::from)?;
     value["references"] = json!(references);
     Ok(Json(value))
+}
+
+#[derive(Deserialize)]
+pub(super) struct LookupQuery {
+    domain: String,
+}
+/// Which geosite categories of the configured source contain a domain.
+pub(super) async fn lookup(
+    State(state): State<AppState>,
+    Query(query): Query<LookupQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let domain = query.domain.trim_end_matches('.').to_ascii_lowercase();
+    if !brocade_core::rule_validation::valid_domain(&domain) {
+        return Err(StoreError::InvalidData("请输入有效域名".into()).into());
+    }
+    let settings = state.store.settings().await?;
+    let db = state
+        .geodata
+        .database("geosite", &settings.geodata.geosite_url)
+        .await
+        .map_err(StoreError::Unavailable)?;
+    let found = tokio::task::spawn_blocking(move || db.lookup(&domain))
+        .await
+        .map_err(|_| StoreError::Unavailable("规则集反查失败".into()))?
+        .map_err(StoreError::InvalidData)?;
+    Ok(Json(serde_json::to_value(found).map_err(StoreError::from)?))
 }
 pub(super) async fn preview(
     State(state): State<AppState>,
@@ -113,6 +148,7 @@ pub(super) async fn preview(
     if query.q.len() > 256
         || query.target.len() > 253
         || query.attr.len() > 128
+        || query.entry_kind.len() > 16
         || query.offset > 1_000_000
     {
         return Err(StoreError::InvalidData("查询范围无效".into()).into());
@@ -136,6 +172,7 @@ pub(super) async fn preview(
         .page(
             &code,
             &query.attr,
+            &query.entry_kind,
             &query.q,
             query.offset,
             query.limit.unwrap_or(100).clamp(1, 200),

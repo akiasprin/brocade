@@ -176,11 +176,8 @@ async function pickGeo(view: ReturnType<typeof render>, input: HTMLElement, valu
   fireEvent.click(input);
   const menu = await view.findByRole('dialog', { name: 'geosite 选项' });
   await within(menu).findByRole('listbox', { name: 'geosite' });
-  for (const chosen of menu.querySelectorAll<HTMLButtonElement>(
-    '.geo-options > button[aria-selected="true"]:not(:disabled)',
-  ))
-    fireEvent.click(chosen);
-  const search = within(menu).getByRole('textbox', { name: '搜索 geosite' });
+  for (const chosen of within(menu).queryAllByRole('button', { name: /^移除 / })) fireEvent.click(chosen);
+  const search = within(menu).getByRole('combobox', { name: '搜索 geosite' });
   fireEvent.change(search, { target: { value } });
   fireEvent.click(await within(menu).findByRole('option', { name: value }));
   fireEvent.keyDown(menu, { key: 'Escape' });
@@ -622,6 +619,40 @@ describe('machine-scoped egress DNS', () => {
     expect(draft.ops().some(op => op.op === 'put_step')).toBe(false);
   });
 
+  it('removes a saved policy only on save, offers undo meanwhile, and drops unsaved rows at once', async () => {
+    draft.init('machine-dns-delete-test');
+    draft.clear();
+    const view = renderMachineRules(false, true);
+    const save = () => view.getByRole('button', { name: '保存到草稿' }) as HTMLButtonElement;
+
+    fireEvent.click(view.getByRole('button', { name: '删除 DNS 策略（域名后缀 netflix.com）' }));
+    expect(view.getByText('保存后移除')).toBeTruthy();
+    const undo = view.getByRole('button', { name: '撤销删除 DNS 策略（域名后缀 netflix.com）' });
+    expect(document.activeElement).toBe(undo);
+    // 待移除的行只留撤销，不能再复制或排序。
+    expect(view.queryByRole('button', { name: '复制 DNS 策略（域名后缀 netflix.com）' })).toBeNull();
+    expect(save().disabled).toBe(false);
+    fireEvent.click(undo);
+    expect(view.queryByText('保存后移除')).toBeNull();
+    expect(document.activeElement).toBe(view.getByRole('button', { name: '删除 DNS 策略（域名后缀 netflix.com）' }));
+    expect(save().disabled).toBe(true);
+
+    fireEvent.click(view.getByRole('button', { name: '添加新策略' }));
+    expect(view.container.querySelectorAll('.node-egress-rules-table tbody tr')).toHaveLength(3);
+    fireEvent.click(view.getByRole('button', { name: '删除 DNS 策略（geosite）' }));
+    expect(view.container.querySelectorAll('.node-egress-rules-table tbody tr')).toHaveLength(2);
+    expect(save().disabled).toBe(true);
+
+    fireEvent.click(view.getByRole('button', { name: '删除 DNS 策略（域名后缀 netflix.com）' }));
+    fireEvent.click(save());
+    await waitFor(() => expect(draft.ops().some(op => op.op === 'set_node_egress_dns')).toBe(true));
+    expect(draft.ops().find(op => op.op === 'set_node_egress_dns')).toMatchObject({
+      node_id: 'hk',
+      selector: { t: 'domain_suffix', v: ['netflix.com'] },
+      resolution: null,
+    });
+  });
+
   it('reorders the machine DNS priority as one machine-wide draft operation', async () => {
     draft.init('machine-detail-dns-order-test');
     draft.clear();
@@ -768,7 +799,7 @@ describe('machine-scoped egress DNS', () => {
     changeControl(view.getByLabelText('来源节点'), { target: { value: 'sg' } });
     fireEvent.click(view.getByRole('button', { name: '追加导入' }));
     expect(view.getByLabelText('DNS 匹配内容（geosite netflix）')).toBeTruthy();
-    fireEvent.click(view.getByRole('button', { name: '取消' }));
+    fireEvent.click(view.getByRole('button', { name: '删除 DNS 策略（geosite netflix）' }));
     expect(view.queryByLabelText('DNS 匹配内容（geosite netflix）')).toBeNull();
   });
 

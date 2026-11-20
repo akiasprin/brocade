@@ -443,6 +443,25 @@ pub fn custom_rule_matches(rule: &CustomRule, kind: &RuleKind, value: &str) -> b
         _ => false,
     }
 }
+/// Domain rule sets of the curated subscription modules, in module order. Rule editors offer
+/// them as the common geosite choices so both surfaces share one list of featured services.
+pub fn featured_geosite_sets() -> Vec<&'static str> {
+    let mut sets = Vec::new();
+    let standard = RULE_MODULE_ORDER.iter().flat_map(|id| {
+        STANDARD_MODULES
+            .iter()
+            .filter(move |module| module.id == *id)
+            .flat_map(|module| module.rules)
+            .filter(|rule| rule.behavior == "domain")
+            .map(|rule| rule.id)
+    });
+    for id in standard.chain(EXTRA_MODULES.iter().map(|(id, _)| *id)) {
+        if !sets.contains(&id) {
+            sets.push(id);
+        }
+    }
+    sets
+}
 /// Fixed source text for the same revision that produces the subscription's MRS providers.
 pub fn rule_source_url(id: &str, ip: bool) -> Option<String> {
     let kind = if ip { "ipcidr" } else { "domain" };
@@ -927,5 +946,18 @@ mod tests {
             "example.com"
         ));
         assert!(rule_source_url("../../secrets", false).is_none());
+    }
+
+    #[test]
+    fn featured_geosite_sets_follow_module_order_without_ip_sets_or_duplicates() {
+        let sets = featured_geosite_sets();
+        assert_eq!(
+            &sets[..4],
+            ["category-ads-all", "private", "openai", "anthropic"]
+        );
+        assert!(sets.contains(&"geolocation-!cn") && sets.contains(&"netflix"));
+        assert!(!sets.iter().any(|id| id.ends_with("-ip")));
+        let unique: BTreeSet<_> = sets.iter().collect();
+        assert_eq!(unique.len(), sets.len());
     }
 }

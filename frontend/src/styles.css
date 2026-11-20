@@ -9710,9 +9710,15 @@ textarea.f::placeholder {
   align-items: center;
   gap: 3px;
 }
-.node-egress-rules-table .dns-priority-cell > .btn + .dns-priority,
-.node-egress-rules-table .dns-priority-cell > .btn.danger {
-  margin-left: 4px;
+/* 行操作：复制、优先级、删除。规则区收窄时排成两行（复制与删除、上移与下移），把宽度留给解析设置。 */
+.node-egress-rules-table .dns-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  vertical-align: middle;
+}
+.node-egress-rules-table .dns-row-actions > .dns-priority {
+  margin-left: 0;
 }
 .node-egress-rules-table.dns-order-dragging,
 .node-egress-rules-table.dns-order-dragging * {
@@ -9806,6 +9812,29 @@ textarea.f::placeholder {
   width: 1%;
   white-space: nowrap;
   text-align: right;
+}
+/* 删除与复制、排序同尺寸，平时中性，悬停才用警示色：每行都有，常亮的红框会盖过行内容。 */
+.dns-priority-cell .dns-policy-remove {
+  color: var(--ink-3);
+}
+@media (hover: hover) {
+  .dns-priority-cell .dns-policy-remove:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--err) 55%, var(--line));
+    background: color-mix(in srgb, var(--err) 9%, transparent);
+    color: var(--err);
+  }
+}
+/* 待移除：匹配条件变淡、序号划线，「保存后移除」用警示色；解析方式仍可改回自定义。 */
+.node-egress-dns-removed > .node-egress-dns-position > span,
+.node-egress-dns-removed > .rule-match-cell > * {
+  opacity: 0.45;
+}
+.node-egress-dns-removed > .node-egress-dns-position > span {
+  text-decoration: line-through;
+}
+.node-egress-dns-removed .egress-dns-usage {
+  color: var(--err);
+  font-size: 11px;
 }
 .dns-priority-index {
   color: var(--violet);
@@ -11096,6 +11125,10 @@ input.f {
   background: var(--sunk);
   cursor: default;
 }
+/* 访客看到与编辑态相同的控件：选择按钮不半透明，只像其他只读字段一样降一档文字。 */
+.rule-ro[disabled] button.choice-select.f {
+  opacity: 1;
+}
 
 /* 终点规则的解析策略由落地机器统一持有，保存后始终进入机器配置。线路规则只提供创建和
    编辑入口，不绑定或隔离 DNS。宽屏时匹配、动作和全部自定义参数共用一行。 */
@@ -11103,14 +11136,35 @@ input.f {
   width: 1%;
   white-space: nowrap;
 }
-.rule-match-cell > :is(.f, .geo-field) + :is(.f, .geo-field) {
+.rule-match-cell > :is(.f, .geo-field, .rule-match-kind) + :is(.f, .geo-field, .rule-match-kind) {
   margin-left: 6px;
 }
-.rule-table .rule-match-cell > :is(select.f, .rule-readonly-select) {
+.rule-table .rule-match-cell > :is(select.f, .rule-readonly-select, .rule-match-kind) {
   width: 112px;
 }
 .rule-table .rule-match-cell > :is(input.f, .geo-field, .rule-readonly-value) {
   width: 190px;
+}
+/* 保留原生选项菜单，箭头单独绘制，避免依赖 iOS 对 select 背景的定位。 */
+.rule-match-kind {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: middle;
+}
+.rule-match-kind > select.f {
+  display: block;
+  width: 100%;
+  background-image: none;
+}
+.rule-match-kind-chevron {
+  position: absolute;
+  inset-block: 0;
+  inset-inline-end: 8px;
+  height: max-content;
+  margin-block: auto;
+  pointer-events: none;
+  color: var(--ink-3);
 }
 .rule-action-cell {
   min-width: 0;
@@ -11249,11 +11303,11 @@ input.f {
     width: 190px;
     white-space: normal;
   }
-  .rule-table .rule-match-cell > :is(.f, .geo-field) {
+  .rule-table .rule-match-cell > :is(.f, .geo-field, .rule-match-kind) {
     display: block;
     max-width: 100%;
   }
-  .rule-table .rule-match-cell > :is(.f, .geo-field) + :is(.f, .geo-field) {
+  .rule-table .rule-match-cell > :is(.f, .geo-field, .rule-match-kind) + :is(.f, .geo-field, .rule-match-kind) {
     margin: 6px 0 0;
   }
 }
@@ -11266,6 +11320,10 @@ input.f {
 .rule-table td {
   padding: 5px 7px;
   vertical-align: top;
+}
+/* 规则与机器 DNS 在中宽共用的类型列宽度：容得下「自定义 DNS 解析」。 */
+.rule-table {
+  --rule-type-width: 132px;
 }
 .rule-table td:first-child {
   width: 18px !important;
@@ -11400,12 +11458,12 @@ input.f {
     content: '动作';
   }
   /* 匹配：类别定宽，值占余下整行 */
-  .rule-table .rule-match-cell > :is(.f, .geo-field),
-  .rule-table .rule-match-cell > :is(.f, .geo-field) + :is(.f, .geo-field) {
+  .rule-table .rule-match-cell > :is(.f, .geo-field, .rule-match-kind),
+  .rule-table .rule-match-cell > :is(.f, .geo-field, .rule-match-kind) + :is(.f, .geo-field, .rule-match-kind) {
     margin-left: 0 !important;
     margin-top: 0;
   }
-  .rule-table .rule-match-cell select.f {
+  .rule-table .rule-match-cell > :is(select.f, .rule-match-kind) {
     flex: 0 0 auto;
     width: auto !important;
     min-width: 96px;
@@ -29026,7 +29084,6 @@ body.observe-brushing .observe-chart-tip {
 }
 .external-target-chevron {
   color: var(--ink-4);
-  font-size: 13px;
 }
 /* 规则卡和规则树都必须裁切自己的圆角，菜单若留在原 DOM 层级会被祖先的 overflow 截断。
    菜单由 React portal 挂到 body，再用视口坐标固定定位；抽屉的 120 层级仍会正常盖住它。 */
@@ -30612,17 +30669,22 @@ body.observe-brushing .observe-chart-tip {
   text-align: center;
 }
 
+.external-target-copy > .listener-compact-label {
+  display: none;
+}
+.rule-connection {
+  display: contents;
+}
 .listener-local-route {
-  display: inline-flex;
-  align-items: center;
-  min-height: 27px;
-  margin-left: 6px;
-  padding: 0 8px;
-  border: 1px solid color-mix(in srgb, var(--hue-3) 34%, var(--line));
-  border-radius: var(--r-ctl);
-  background: color-mix(in srgb, var(--hue-3) 7%, var(--sunk));
-  color: var(--hue-3);
-  font-size: 10.5px;
+  display: inline;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--ink-2);
+  font: 12px var(--mono);
   white-space: nowrap;
 }
 .listener-reference-panel {
@@ -30771,6 +30833,17 @@ body.observe-brushing .observe-chart-tip {
 }
 .hop-target-facts .hop-target-wire select.f {
   width: 178px;
+}
+.hop-target-wire-value {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  min-height: 26px;
+  color: var(--ink-2);
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .hop-target-facts .hop-target-pool select.f {
   width: 104px;
@@ -38359,6 +38432,26 @@ button.choice-select.f {
   font: 9px/5px var(--mono);
   color: var(--ink-3);
 }
+.choice-chevron.single {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  line-height: 1;
+  pointer-events: none;
+}
+.choice-chevron.single svg {
+  display: block;
+  flex: none;
+}
+/* 单箭头比双字符箭头宽；文字与箭头的间距与原生 select 一致（右 8px 箭头 + 4px），窄列文字不被提前截断。 */
+button.choice-select.choice-select-single.f {
+  gap: 4px;
+}
+.rule-table button.choice-select.choice-select-single.f {
+  display: inline-flex;
+}
 .choice-select:disabled {
   cursor: default;
   opacity: 0.55;
@@ -38581,6 +38674,17 @@ button.choice-select.f {
    树外，单独成节。树自己声明 `rules` 容器：机器详情页的外层没有声明，规则表仍要按实际拿到的宽度重排。 */
 .chain-rule-tree {
   container: rules / inline-size;
+  /* 与 Icon chevronDown 同一路径；原生 select 也使用 14px 图标，而非另一套小 caret。 */
+  --caret: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M4.6 6.4 L8 9.8 L11.4 6.4' fill='none' stroke='%238E8E96' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+}
+:root[data-theme='light'] .chain-rule-tree {
+  --caret: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M4.6 6.4 L8 9.8 L11.4 6.4' fill='none' stroke='%237A7A84' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+}
+.chain-rule-tree select.f,
+.chain-rule-tree .rule-dial-select {
+  background-origin: border-box;
+  background-position: right 8px center;
+  background-size: 14px 14px;
 }
 .chain-rule-tree .chain-rule-node-head .m-hop > .toolbar {
   flex-wrap: nowrap;
@@ -38803,13 +38907,13 @@ button.choice-select.f {
   width: 1%;
   white-space: nowrap;
 }
-.chain-rule-tree .rule-match-cell > :is(.f, .geo-field) {
+.chain-rule-tree .rule-match-cell > :is(.f, .geo-field, .rule-match-kind) {
   vertical-align: middle;
 }
-.chain-rule-tree .rule-match-cell > :is(.f, .geo-field) + :is(.f, .geo-field) {
+.chain-rule-tree .rule-match-cell > :is(.f, .geo-field, .rule-match-kind) + :is(.f, .geo-field, .rule-match-kind) {
   margin-left: 6px;
 }
-.chain-rule-tree .rule-table .rule-match-cell > :is(select.f, .rule-readonly-select) {
+.chain-rule-tree .rule-table .rule-match-cell > :is(select.f, .rule-readonly-select, .rule-match-kind) {
   width: 112px;
 }
 .chain-rule-tree .rule-table .rule-match-cell > :is(input.f, .geo-field, .rule-readonly-value) {
@@ -38864,7 +38968,7 @@ button.choice-select.f {
   font-size: 12px;
 }
 .chain-rule-tree .rule-table select.f {
-  padding: 0 23px 0 7px;
+  padding: 0 26px 0 7px;
   font-size: 12px;
 }
 .chain-rule-tree .rule-editor .panel {
@@ -38953,10 +39057,10 @@ button.choice-select.f {
   .chain-rule-tree .rule-table .rule-action-cell::before {
     content: '动作';
   }
-  .chain-rule-tree .rule-table .rule-match-cell > :is(.f, .geo-field) {
+  .chain-rule-tree .rule-table .rule-match-cell > :is(.f, .geo-field, .rule-match-kind) {
     margin-left: 0 !important;
   }
-  .chain-rule-tree .rule-table .rule-match-cell select.f {
+  .chain-rule-tree .rule-table .rule-match-cell > :is(select.f, .rule-match-kind) {
     flex: 0 0 auto;
     width: auto !important;
     min-width: 96px;
@@ -39111,7 +39215,7 @@ button.choice-select.f {
   gap: 8px;
   width: 100%;
   min-height: 30px;
-  padding: 3px 8px;
+  padding: 3px 7px 3px 8px;
   border: 1px solid var(--line);
   border-radius: var(--r-ctl);
   background: var(--sunk);
@@ -39163,16 +39267,15 @@ button.choice-select.f {
   color: var(--action);
 }
 .chain-rule-tree .listener-local-route {
-  display: inline-flex;
-  align-items: center;
-  min-height: 27px;
-  margin-left: 6px;
-  padding: 0 8px;
-  border: 1px solid color-mix(in srgb, var(--hue-3) 34%, var(--line));
-  border-radius: var(--r-ctl);
-  background: color-mix(in srgb, var(--hue-3) 7%, var(--sunk));
-  color: var(--hue-3);
-  font-size: 10.5px;
+  display: inline;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--ink-2);
+  font: 12px var(--mono);
   white-space: nowrap;
 }
 .chain-rule-tree .listener-reference-panel {
@@ -39472,7 +39575,7 @@ button.choice-select.f {
 }
 .chain-rule-tree .rule-table .external-target-trigger {
   min-height: 28px;
-  padding: 2px 8px;
+  padding: 2px 7px 2px 8px;
   gap: 7px;
 }
 .chain-rule-tree .external-target-trigger .external-target-copy {
@@ -39568,10 +39671,14 @@ button.choice-select.f {
   cursor: default;
 }
 @container rules (min-width: 641px) and (max-width: 1050px) {
-  .chain-rule-tree .rule-table .rule-match-cell > :is(select.f, .rule-readonly-select) {
+  .chain-rule-tree .rule-table .rule-match-cell > :is(select.f, .rule-readonly-select, .rule-match-kind) {
     width: 190px;
   }
-  .chain-rule-tree .rule-table .rule-match-cell > :is(.f, .geo-field) + :is(.f, .geo-field) {
+  .chain-rule-tree
+    .rule-table
+    .rule-match-cell
+    > :is(.f, .geo-field, .rule-match-kind)
+    + :is(.f, .geo-field, .rule-match-kind) {
     margin-left: 0;
     margin-top: 6px;
   }
@@ -39580,10 +39687,11 @@ button.choice-select.f {
   box-sizing: border-box;
   height: 28px;
   min-height: 28px;
-  padding: 0 23px 0 7px;
+  padding: 0 26px 0 7px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: var(--sunk) var(--caret) no-repeat right 9px center/9px 6px;
+  background: var(--sunk) var(--caret) no-repeat right 8px center/14px 14px;
+  background-origin: border-box;
   color: var(--ink);
   font: 12px var(--sans);
   white-space: nowrap;
@@ -39647,6 +39755,670 @@ button.choice-select.f {
 }
 .chain-rule-tree .rule-dns-invalid {
   color: var(--err);
+}
+
+/* 链路规则按编辑器内容宽度重排；同一台机器的所有规则共享一种布局。 */
+.chain-rule-tree.chain-rule-responsive {
+  --action-width: 112px;
+  --dns-choice-width: 154px;
+  --ops-width: 120px;
+  --number-width: 18px;
+  --match-width: 308px;
+  --match-reserve: 118px;
+  --dial-width: max-content;
+  --field-gap: 6px;
+  --route-gap: 6px;
+  --outer-gap: 6px;
+  --separator-space: 8px;
+}
+.chain-rule-tree.chain-rule-responsive .rule-editor {
+  container: rule-editor / inline-size;
+}
+.chain-rule-tree.chain-rule-responsive .chain-rule-table {
+  table-layout: fixed;
+  width: 100%;
+}
+.chain-rule-tree.chain-rule-responsive .chain-rule-table td {
+  vertical-align: middle;
+  padding: 4px 7px;
+}
+.chain-rule-tree.chain-rule-responsive .chain-rule-table td:first-child {
+  width: var(--number-width) !important;
+  padding-top: 4px;
+}
+.chain-rule-tree.chain-rule-responsive .chain-rule-table .rule-match-cell {
+  width: var(--match-width);
+  white-space: normal;
+}
+.chain-rule-tree.chain-rule-responsive
+  .chain-rule-table
+  .rule-match-cell
+  > :is(select.f, .rule-readonly-select, .rule-match-kind) {
+  display: inline-block;
+  width: var(--action-width);
+  margin: 0;
+  vertical-align: middle;
+}
+.chain-rule-tree.chain-rule-responsive
+  .chain-rule-table
+  .rule-match-cell
+  > :is(.geo-field, input.f, .rule-readonly-value) {
+  display: inline-block;
+  width: calc(100% - var(--match-reserve));
+  margin: 0 0 0 6px;
+  vertical-align: middle;
+}
+.chain-rule-tree.chain-rule-responsive .rule-match-cell > select.f:not(:first-child) {
+  width: calc(100% - var(--match-reserve));
+  margin: 0 0 0 6px;
+}
+.chain-rule-tree.chain-rule-responsive .chain-rule-table .rule-ops-cell {
+  width: var(--ops-width);
+  white-space: nowrap;
+}
+.chain-rule-tree.chain-rule-responsive .rule-action-fields {
+  --rule-inline-layout: 1;
+  --target-width: clamp(240px, 32cqw, 330px);
+  display: grid;
+  grid-template-columns: var(--action-width) minmax(180px, var(--target-width)) var(--connection-width, 260px);
+  gap: 6px var(--field-gap);
+  align-items: center;
+}
+.chain-rule-tree.chain-rule-responsive .rule-action-fields > .rule-action-select {
+  grid-column: 1;
+  grid-row: 1;
+  width: var(--action-width) !important;
+}
+.chain-rule-tree.chain-rule-responsive .rule-action-fields > .external-target-picker {
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: start;
+  width: 100% !important;
+  min-width: 0;
+  max-width: 100%;
+}
+.chain-rule-tree.chain-rule-responsive .external-target-trigger {
+  width: 100%;
+  min-width: 0;
+}
+.chain-rule-tree.chain-rule-responsive .external-target-trigger.listener-target .external-target-copy {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+.chain-rule-tree.chain-rule-responsive .external-target-trigger.listener-target .external-target-copy > b {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chain-rule-tree.chain-rule-responsive
+  .listener-target
+  .external-target-copy:has(> .listener-compact-label)
+  > b:not(.listener-compact-label) {
+  display: none;
+}
+.chain-rule-tree.chain-rule-responsive .listener-target .external-target-copy > .listener-compact-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.chain-rule-tree.chain-rule-responsive .listener-compact-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chain-rule-tree.chain-rule-responsive .listener-compact-port {
+  flex: none;
+}
+.chain-rule-tree.chain-rule-responsive .external-target-trigger.listener-target .external-target-copy > small {
+  display: none;
+}
+/* 引用不可用时仍保留行内警告。 */
+.chain-rule-tree.chain-rule-responsive .external-target-trigger.listener-target[title] .external-target-copy > small {
+  display: block;
+  flex: 0 1 auto;
+  max-width: 36%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--gold);
+}
+.chain-rule-tree.chain-rule-responsive .rule-connection {
+  display: grid;
+  grid-template-columns: var(--dial-width) minmax(0, max-content);
+  gap: 4px var(--route-gap);
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+  grid-column: 3;
+  grid-row: 1;
+}
+.chain-rule-tree.chain-rule-responsive .rule-connection:has(> .rule-mark) {
+  grid-template-columns: var(--dial-width) minmax(0, max-content) 18px;
+}
+.chain-rule-tree.chain-rule-responsive .rule-connection .rule-dial-select {
+  grid-column: 1;
+  grid-row: 1;
+  width: var(--dial-width);
+  max-width: 100%;
+  min-width: 0;
+}
+.chain-rule-tree.chain-rule-responsive .rule-connection .rule-dial-address {
+  grid-column: 2;
+  grid-row: 1;
+  font-size: 12px;
+  color: var(--ink-2);
+  white-space: nowrap;
+  overflow: visible;
+  min-width: 0;
+  max-width: 100%;
+  align-self: center;
+}
+.chain-rule-tree.chain-rule-responsive .rule-connection .rule-dial-address.is-problem {
+  color: var(--gold);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.chain-rule-tree.chain-rule-responsive .rule-connection .rule-mark {
+  grid-column: 3;
+  grid-row: 1;
+  align-self: center;
+}
+.chain-rule-tree.chain-rule-responsive .rule-connection .listener-local-route {
+  display: block;
+  grid-column: 1/-1;
+  grid-row: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--ink-2);
+  font: 12px var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chain-rule-tree.chain-rule-responsive .rule-action-fields > .egress-dns-reference {
+  grid-column: 2/-1;
+  grid-row: 1;
+  display: flex;
+  align-items: center;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-width: 0;
+  width: auto;
+}
+.chain-rule-tree.chain-rule-responsive .egress-dns-reference .egress-dns-choice {
+  width: var(--dns-choice-width) !important;
+  flex: none;
+  max-width: 100%;
+}
+.chain-rule-tree.chain-rule-responsive .rule-dns-link {
+  flex: none;
+  margin-left: 0;
+}
+.chain-rule-tree.chain-rule-responsive .rule-editor-toolbar {
+  flex-wrap: wrap;
+}
+.chain-rule-tree.chain-rule-responsive .rule-fallback-row td {
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+.chain-rule-tree.chain-rule-responsive .rule-fallback-row td:first-child {
+  padding-top: 4px;
+}
+
+/* 双行：动作与目标同行，拨号与地址占据下一行。 */
+.chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow='pairs'] .rule-action-fields {
+  grid-template-columns: var(--action-width) minmax(0, var(--target-width));
+}
+.chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow='pairs'] .rule-connection {
+  grid-column: 1/-1;
+  grid-row: 2;
+}
+/* 堆叠时拨号与地址仍共享第一行，长地址只在剩余宽度内省略。 */
+.chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow='stacked'] .rule-action-fields {
+  grid-template-columns: minmax(0, 1fr);
+}
+.chain-rule-tree.chain-rule-responsive
+  .rule-editor[data-rule-flow='stacked']
+  .rule-action-fields
+  > :is(.rule-action-select, .external-target-picker, .egress-dns-reference),
+.chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow='stacked'] .rule-connection {
+  grid-column: 1;
+  grid-row: auto;
+}
+.chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow='stacked'] .external-target-picker {
+  max-width: 100%;
+}
+.chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow='stacked'] .rule-connection {
+  grid-template-columns: var(--dial-width) minmax(0, 1fr);
+}
+.chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow='stacked'] .rule-connection:has(> .rule-mark) {
+  grid-template-columns: var(--dial-width) minmax(0, 1fr) 18px;
+}
+.chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow='stacked'] .rule-connection .rule-dial-select {
+  grid-column: 1;
+  grid-row: 1;
+}
+.chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow='stacked'] .rule-connection .rule-dial-address {
+  display: block !important;
+  grid-column: 2;
+  grid-row: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chain-rule-tree.chain-rule-responsive
+  .rule-editor[data-rule-flow='stacked']
+  .rule-connection
+  .rule-dial-address:not(.is-problem) {
+  white-space: nowrap;
+}
+.chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow='stacked'] .rule-connection .rule-mark {
+  grid-column: 3;
+  grid-row: 1;
+}
+@container rule-editor (max-width: 1120px) {
+  /* 匹配条件留在左侧，动作占据中间，操作始终在最右。 */
+  .chain-rule-tree.chain-rule-responsive .rule-action-fields {
+    --rule-inline-layout: 0;
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table,
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody {
+    display: block;
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr {
+    display: grid;
+    grid-template-columns: var(--number-width) minmax(0, 1fr) calc(var(--ops-width) + var(--separator-space));
+    grid-template-areas:
+      'n match ops'
+      '. action ops';
+    gap: var(--outer-gap);
+    margin: 0;
+    padding: 4px 0;
+    border: 0;
+    border-bottom: 1px solid var(--line-soft);
+    border-radius: 0;
+    background: transparent;
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr > td {
+    display: block !important;
+    width: auto !important;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    padding: 0 !important;
+    border: 0 !important;
+    margin: 0;
+  }
+  /* 序号与操作对齐第一行控件，不在多行之间垂直居中。 */
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr > td:first-child {
+    grid-area: n;
+    font: 12px var(--mono);
+    padding-top: 0 !important;
+    align-self: start;
+    line-height: 28px;
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr > .rule-match-cell {
+    grid-area: match;
+    align-self: center;
+    display: grid !important;
+    grid-template-columns: var(--rule-type-width) minmax(0, 1fr);
+    align-items: start;
+    align-content: start;
+    gap: 6px;
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table .rule-match-cell > :is(.f, .geo-field, .rule-match-kind) {
+    width: 100% !important;
+    margin: 0 !important;
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr > .rule-action-cell {
+    grid-area: action;
+    align-self: center;
+  }
+  /* 匹配与动作上下排列，但共享类型列和同一弹性内容列（与机器 DNS 面板同宽）。 */
+  .chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow] .rule-action-fields {
+    grid-template-columns: var(--rule-type-width) minmax(0, 1fr);
+  }
+  .chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow] .rule-action-fields > .rule-action-select {
+    grid-column: 1;
+    grid-row: 1;
+    width: var(--rule-type-width) !important;
+  }
+  .chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow] .rule-action-fields > .external-target-picker {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: stretch;
+    max-width: 100%;
+  }
+  .chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow] .rule-action-fields > .egress-dns-reference {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow] .rule-action-fields > .rule-connection {
+    grid-column: 2;
+    grid-row: 2;
+    grid-template-columns: var(--dial-width) minmax(0, 1fr);
+  }
+  .chain-rule-tree.chain-rule-responsive
+    .rule-editor[data-rule-flow]
+    .rule-action-fields
+    > .rule-connection:has(> .rule-mark) {
+    grid-template-columns: var(--dial-width) minmax(0, 1fr) 18px;
+  }
+  .chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow] .rule-connection .rule-dial-address {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .chain-rule-tree.chain-rule-responsive
+    .rule-editor[data-rule-flow]
+    .rule-connection
+    .rule-dial-address:not(.is-problem) {
+    white-space: nowrap;
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr > .rule-ops-cell {
+    grid-area: ops;
+    align-self: start;
+    text-align: right;
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr > .rule-fallback-sign {
+    grid-area: ops;
+    align-self: start;
+    line-height: 28px;
+    text-align: right;
+  }
+  .chain-rule-tree.chain-rule-responsive :is(.rule-match-cell, .rule-action-cell)::before {
+    content: none;
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr > td:not(:first-child) {
+    border-left: 1px solid var(--line-soft) !important;
+    padding-left: 7px !important;
+  }
+}
+@container rule-editor (max-width: 640px) {
+  /* 窄屏与机器 DNS 面板同一套卡片：卡片头是序号与操作，下面「匹配 / 动作」小标签在左，
+     字段同宽单列。 */
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody {
+    display: grid;
+    gap: 8px;
+    padding: 6px 0;
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      'n'
+      'match'
+      'action';
+    gap: 6px;
+    padding: 0 11px 10px;
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-ctl);
+    background: color-mix(in srgb, var(--block) 42%, transparent);
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr > td:first-child {
+    display: flex !important;
+    align-items: center;
+    min-height: 38px;
+    margin: 0 -11px 2px;
+    padding: 0 11px !important;
+    border-bottom: 1px solid var(--line-soft) !important;
+    color: var(--ink-4);
+    font: 600 11px var(--mono);
+    line-height: normal;
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr > td:is(.rule-ops-cell, .rule-fallback-sign) {
+    grid-area: n;
+    align-self: center;
+    justify-self: end;
+    padding: 0 !important;
+    line-height: normal;
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr > .rule-ops-cell .btn {
+    width: 28px;
+    height: 26px;
+    min-height: 26px;
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr > .rule-match-cell,
+  .chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow] .rule-action-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr > td:is(.rule-match-cell, .rule-action-cell) {
+    position: relative;
+    padding-left: 38px !important;
+  }
+  .chain-rule-tree.chain-rule-responsive :is(.rule-match-cell, .rule-action-cell)::before {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 32px;
+    color: var(--ink-4);
+    font: 10px/28px var(--mono);
+    letter-spacing: 0.04em;
+  }
+  .chain-rule-tree.chain-rule-responsive .rule-match-cell::before {
+    content: '匹配';
+  }
+  .chain-rule-tree.chain-rule-responsive .rule-action-cell::before {
+    content: '动作';
+  }
+  .chain-rule-tree.chain-rule-responsive
+    .chain-rule-table
+    .rule-match-cell
+    > :is(select.f, .rule-match-kind):only-child {
+    grid-column: 1;
+    width: 100% !important;
+  }
+  .chain-rule-tree.chain-rule-responsive
+    .rule-editor[data-rule-flow]
+    .rule-action-fields
+    > :is(.rule-action-select, .external-target-picker, .egress-dns-reference, .rule-connection) {
+    grid-column: 1;
+    grid-row: auto;
+    width: 100% !important;
+    max-width: 100%;
+  }
+  /* DNS 解析方式与「查看」同一行：选择框占满余宽。 */
+  .chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow] .egress-dns-reference {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+  }
+  .chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow] .egress-dns-reference .egress-dns-choice {
+    flex: 1 1 auto;
+    width: auto !important;
+    min-width: 0;
+  }
+  .chain-rule-tree.chain-rule-responsive .rule-editor[data-rule-flow] .egress-dns-reference .rule-dns-link {
+    flex: none;
+  }
+}
+@container rules (max-width: 640px) {
+  .chain-rule-tree.chain-rule-responsive .chain-rule-table > tbody > tr > td:not(:first-child) {
+    border-left: 0 !important;
+  }
+  .chain-rule-tree.chain-rule-responsive
+    .chain-rule-table
+    > tbody
+    > tr
+    > td:not(:first-child, .rule-match-cell, .rule-action-cell) {
+    padding-left: 0 !important;
+  }
+}
+
+/* ═══ 规则与机器 DNS 的统一骨架 ═══
+   两个面板的下拉都用描边材质，与原生 select.f 同高同内距；中宽共用「类型列 + 弹性内容列」，
+   窄屏共用卡片（卡片头放序号与操作）。宽屏的单行表格各自保留。 */
+.rule-table button.choice-select.f {
+  box-sizing: border-box;
+  height: 28px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  font-size: 12px;
+}
+.node-egress-rules-table input.f {
+  height: 28px;
+  min-height: 28px;
+  padding: 0 7px;
+}
+/* 宽屏单行表格的序号列按内容取宽：访客没有拖动柄，补上柄的位置，匹配列才与登录时对齐。 */
+@container rules (min-width: 1051px) {
+  .node-egress-dns-position > span:not(:has(> .dns-order-grip)) {
+    padding-left: 23px;
+  }
+}
+@container rules (min-width: 641px) and (max-width: 1050px) {
+  .node-egress-rules-table,
+  .node-egress-rules-table > tbody {
+    display: block;
+  }
+  .node-egress-rules-table > tbody > tr {
+    display: grid;
+    grid-template-columns: 44px minmax(0, 1fr) auto;
+    grid-template-areas:
+      'n match ops'
+      '. action ops';
+    gap: 6px 8px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .node-egress-rules-table > tbody > tr:last-child {
+    border-bottom: 0;
+  }
+  .node-egress-rules-table > tbody > tr > td {
+    display: block;
+    width: auto !important;
+    min-width: 0;
+    padding: 0 !important;
+    border: 0 !important;
+  }
+  .node-egress-rules-table > tbody > tr > td.node-egress-dns-position {
+    grid-area: n;
+    width: auto !important;
+    line-height: 28px;
+  }
+  .node-egress-rules-table > tbody > tr > td.rule-match-cell {
+    grid-area: match;
+    display: grid;
+    grid-template-columns: var(--rule-type-width) minmax(0, 1fr);
+    gap: 6px 8px;
+    white-space: normal;
+  }
+  .node-egress-rules-table > tbody > tr > td.rule-match-cell > * {
+    width: 100% !important;
+    max-width: 100%;
+    margin: 0 !important;
+  }
+  .node-egress-rules-table > tbody > tr > td.rule-action-cell {
+    grid-area: action;
+  }
+  .node-egress-rules-table .rule-action-fields {
+    display: grid;
+    grid-template-columns: var(--rule-type-width) minmax(0, 1fr);
+    align-items: start;
+    gap: 6px 8px;
+  }
+  .node-egress-rules-table .rule-action-fields > .egress-dns-choice {
+    grid-column: 1;
+    width: 100% !important;
+  }
+  .node-egress-rules-table .rule-action-fields > :is(.egress-dns-editor, .egress-dns-usage, .egress-dns-error) {
+    grid-column: 2;
+  }
+  .node-egress-rules-table .egress-dns-editor {
+    grid-template-columns: 84px minmax(0, 1fr) minmax(0, 1fr);
+    gap: 6px;
+    margin: 0;
+  }
+  .node-egress-rules-table .egress-dns-editor > :is(.egress-dns-endpoint, .egress-dns-error) {
+    grid-column: 1 / -1;
+    grid-row: auto;
+  }
+  .node-egress-rules-table .egress-dns-editor > :is(.egress-dns-transport, .egress-dns-family, .egress-dns-fallback) {
+    grid-column: auto;
+    width: 100% !important;
+  }
+  .node-egress-rules-table .egress-dns-endpoint {
+    grid-template-columns: minmax(0, 1fr) 8px 64px;
+    gap: 0;
+  }
+  .node-egress-rules-table > tbody > tr > td.dns-priority-cell {
+    grid-area: ops;
+    align-self: start;
+  }
+  .node-egress-rules-table .dns-row-actions .btn {
+    width: 28px;
+    min-width: 28px;
+    height: 26px;
+    min-height: 26px;
+    padding: 0;
+  }
+}
+@container rules (max-width: 640px) {
+  /* 卡片头：序号在左、操作在右，省掉卡片底部一整行。 */
+  .node-egress-rules-table.rule-table > tbody > tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      'n'
+      'match'
+      'action';
+    gap: 6px;
+    padding: 0 11px 10px;
+  }
+  .node-egress-rules-table.rule-table > tbody > tr > td.node-egress-dns-position {
+    grid-area: n;
+    display: flex;
+    align-items: center;
+    min-height: 38px;
+    margin: 0 -11px 2px;
+    padding: 0 11px !important;
+  }
+  .node-egress-rules-table.rule-table > tbody > tr > td.dns-priority-cell {
+    grid-area: n;
+    align-self: center;
+    justify-self: end;
+    margin: 0;
+    padding: 0 !important;
+    border: 0;
+  }
+  .node-egress-rules-table.rule-table > tbody > tr > td.rule-action-cell {
+    margin-top: 0;
+  }
+  .node-egress-rules-table .dns-row-actions .btn {
+    width: 28px;
+    min-width: 28px;
+    height: 26px;
+    min-height: 26px;
+    padding: 0;
+  }
+  /* 匹配类型与内容同宽上下排列，与动作字段一致。 */
+  .node-egress-rules-table .rule-match-cell > :is(.f, .geo-field, .rule-match-kind) {
+    flex: 1 1 100% !important;
+    width: 100% !important;
+  }
+  .node-egress-rules-table .egress-dns-editor {
+    grid-template-columns: 84px minmax(0, 1fr);
+    gap: 6px;
+  }
+  .node-egress-rules-table .egress-dns-editor > :is(.egress-dns-endpoint, .egress-dns-fallback, .egress-dns-error) {
+    grid-column: 1 / -1;
+    grid-row: auto;
+  }
+  .node-egress-rules-table .egress-dns-editor > :is(.egress-dns-transport, .egress-dns-family) {
+    grid-column: auto;
+  }
+  .node-egress-rules-table .egress-dns-endpoint {
+    grid-template-columns: minmax(0, 1fr) 8px 64px;
+  }
 }
 
 /* 拨号菜单：各档带实际地址；最后一项「自定义」本身是输入框 */
@@ -39761,6 +40533,7 @@ button.choice-select.f {
 }
 .rule-dns-sheet {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
 }
 .rule-dns-cols,
 .rule-dns-row {
@@ -39807,11 +40580,9 @@ button.choice-select.f {
 }
 .rule-dns-value {
   min-width: 0;
-  overflow: hidden;
   color: var(--ink);
   font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 .rule-dns-match select.f {
   flex: none;
@@ -39908,7 +40679,7 @@ button.choice-select.f {
   color: var(--ink-3);
   font-size: 12.5px;
 }
-/* 窄屏：每条策略一张小卡——序号与操作一行，匹配一行，地址:端口一行，三个选项按内容宽度排一行 */
+/* 窄屏：每条策略一张小卡，解析选项按内容宽度换行。 */
 @container dnsdlg (max-width: 900px) {
   .rule-dns-cols {
     display: none;
@@ -39945,10 +40716,13 @@ button.choice-select.f {
     flex: none;
     width: 64px;
   }
+  .rule-dns-opts {
+    flex-wrap: wrap;
+  }
   .rule-dns-opts > select.f {
-    flex: 0 1 auto;
+    flex: none;
     width: auto;
-    min-width: 0;
+    max-width: 100%;
   }
 }
 

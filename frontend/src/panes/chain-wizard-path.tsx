@@ -675,9 +675,7 @@ export function WizardPathEditor(props: WizardPathEditorProps) {
                       {rule.a.t === 'reuse_listener' &&
                         reference &&
                         (reference.local ? (
-                          <span className="listener-local-route mono">
-                            本机内部 · 回环:{reference.step.hop_in?.port}
-                          </span>
+                          <span className="listener-local-route mono">本机回环:{reference.step.hop_in?.port}</span>
                         ) : (
                           <RuleDialField
                             listener

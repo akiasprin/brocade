@@ -158,6 +158,7 @@ const preview = (
       <MachineEgressDnsRules
         nodeId="preview-exit"
         nodeName="香港落地"
+        readOnly={params.get('role') === 'readonly'}
         showHeader={editing || params.get('scene') === 'create'}
       />
     </section>

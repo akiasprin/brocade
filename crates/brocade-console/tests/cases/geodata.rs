@@ -244,6 +244,44 @@ async fn geodata_validation_rejects_p0_writes_atomically_and_preserves_unknown_o
     let (status, catalog) = get_json(&app, &token, "/routing/geodata/catalog?kind=geosite").await;
     assert_eq!(status, StatusCode::OK, "{catalog}");
     assert_eq!(catalog["entries"].as_array().unwrap().len(), 5);
+    let entry = |code: &str| {
+        catalog["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["code"] == code)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(entry("google")["attr_counts"], json!({"ads":1,"cn":1}));
+    assert_eq!(entry("openai")["within"], json!(["category-ai-!cn"]));
+    assert_eq!(entry("huggingface")["within"], json!(["category-ai-!cn"]));
+    assert!(entry("netflix").get("within").is_none());
+    assert_eq!(catalog["featured"], json!(["openai", "google", "netflix"]));
+    let (status, found) = get_json(
+        &app,
+        &token,
+        "/routing/geodata/lookup?domain=API.OpenAI.com.",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    assert_eq!(found["domain"], "api.openai.com");
+    assert_eq!(
+        found["hits"],
+        json!([
+            {"code":"openai","count":1,"kind":"domain","value":"openai.com"},
+            {"code":"category-ai-!cn","count":2,"kind":"domain","value":"openai.com"}
+        ])
+    );
+    for domain in ["", "-bad.example", "192.0.2.1", "a..b"] {
+        let (status, body) = get_json(
+            &app,
+            &token,
+            &format!("/routing/geodata/lookup?domain={domain}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{domain}: {body}");
+    }
     let (status, page) = get_json(
         &app,
         &token,
@@ -252,6 +290,10 @@ async fn geodata_validation_rejects_p0_writes_atomically_and_preserves_unknown_o
     .await;
     assert_eq!(status, StatusCode::OK, "{page}");
     assert_eq!(page["hit"], true);
+    assert_eq!(
+        page["hits"],
+        json!([{"kind":"domain","value":"google.com","attrs":["cn"]}])
+    );
     assert_eq!(page["entries"].as_array().unwrap().len(), 1);
     let (status, ip_catalog) = get_json(&app, &token, "/routing/geodata/catalog?kind=geoip").await;
     assert_eq!(status, StatusCode::OK, "{ip_catalog}");
@@ -269,6 +311,8 @@ async fn geodata_validation_rejects_p0_writes_atomically_and_preserves_unknown_o
         .await;
         assert_eq!(status, StatusCode::OK, "{page}");
         assert_eq!(page["hit"], hit);
+        // An inverted selector's matching networks explain a miss, so none are named as hits.
+        assert_eq!(page["hits"].as_array().unwrap().is_empty(), code != "cn");
     }
     let mut ip_rules = valid.clone();
     ip_rules.insert(0, rule(json!({"t":"geoip","v":["!cn@ipv4"]})));

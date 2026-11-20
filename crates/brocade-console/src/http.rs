@@ -1461,6 +1461,7 @@ fn admin_router_with_state(state: AppState) -> Router {
         .route("/routing/geosite", get(geosite::matches))
         .route("/routing/geodata/catalog", get(geodata::catalog))
         .route("/routing/geodata/relations", post(geodata::relations))
+        .route("/routing/geodata/lookup", get(geodata::lookup))
         .route("/routing/geodata/{kind}/{code}", get(geodata::preview))
         .route("/diagnostics/performance", get(performance_diagnostics))
         .route("/auth/state", get(auth_state))

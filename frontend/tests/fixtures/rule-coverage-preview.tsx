@@ -132,7 +132,9 @@ const model = {
           position: 0,
           selector: { t: 'geosite', v: ['netflix'] },
           resolution: {
-            address: '192.0.2.53, 2001:db8::53',
+            address: params.has('dnsInspection')
+              ? '192.0.2.53, 198.51.100.53, 2001:db8:1234:5678:90ab:cdef:1234:5678'
+              : '192.0.2.53, 2001:db8::53',
             port: 53,
             transport: 'udp',
             address_strategy: 'use_ip',
@@ -221,7 +223,7 @@ createRoot(document.getElementById('root')!).render(
           <h4>链路规则</h4>
         </header>
       )}
-      <div className="chain-rule-tree">
+      <div className="chain-rule-tree chain-rule-responsive">
         {layout && (
           <div className="chain-rule-node-head">
             <span className="disc">▾</span>

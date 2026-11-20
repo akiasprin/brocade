@@ -118,11 +118,8 @@ test('E1 keeps edits while a machine is collapsed and restores all editor state'
   const match = akile.getByRole('combobox', { name: '匹配内容（规则 1）' });
   await match.click();
   const menu = page.getByRole('dialog', { name: 'geosite 选项' });
-  await menu
-    .getByRole('option', { name: /category-ai-!cn/ })
-    .first()
-    .click();
-  await menu.getByRole('textbox', { name: '搜索 geosite' }).fill('netflix');
+  await menu.getByRole('button', { name: '移除 category-ai-!cn' }).click();
+  await menu.getByRole('combobox', { name: '搜索 geosite' }).fill('netflix');
   await menu.getByRole('option', { name: 'netflix', exact: true }).click();
   await menu.press('Escape');
   const port = akile.locator('.hop-target-port input');

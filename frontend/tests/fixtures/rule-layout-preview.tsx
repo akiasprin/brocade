@@ -6,7 +6,14 @@ import { RuleDraftScope, egressDnsSelectorKey } from '../../src/panes/rules';
 import { PanelTitle } from '../../src/ui/icons';
 import { draft } from '../../src/draft';
 import { theme } from '../../src/forge/theme';
-import { AGENT_NODES as BASE_NODES, APP, REVISIONS, SETTINGS, SNAPSHOT as BASE_SNAPSHOT } from './rule-layout-data';
+import {
+  AGENT_NODES as BASE_NODES,
+  APP,
+  CHAIN,
+  REVISIONS,
+  SETTINGS,
+  SNAPSHOT as BASE_SNAPSHOT,
+} from './rule-layout-data';
 import '../../src/styles.css';
 
 const params = new URLSearchParams(location.search);
@@ -54,6 +61,14 @@ if (params.has('listener')) {
     wires: app.chains[0].wires,
   });
   app.steps = app.steps.filter(step => step.chain !== app.chains[0].id || step.node !== 'tw-hinet');
+}
+if (params.has('local')) {
+  app.steps[1].rules[0].a = {
+    t: 'reuse_listener',
+    listener: { chain: CHAIN, node: 'hk-akile' },
+    dial: { t: 'overlay' },
+    pool: { t: 'mux' },
+  };
 }
 if (params.has('invalid'))
   app.steps[1].rules.splice(1, 0, {

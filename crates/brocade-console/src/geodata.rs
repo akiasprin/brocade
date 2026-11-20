@@ -29,12 +29,20 @@ pub(crate) struct Category {
     pub code: String,
     pub count: usize,
     pub attrs: Vec<String>,
+    /// Entries carrying each attribute (geosite) or address family (geoip); keys equal `attrs`.
+    pub attr_counts: BTreeMap<String, usize>,
+    /// Other geosite categories holding all of this one's entries, narrowest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub within: Vec<String>,
 }
 #[derive(Serialize)]
 pub(crate) struct Catalog {
     pub source: String,
     pub loaded_at: u64,
     pub entries: Vec<Category>,
+    /// Curated common geosite choices present in this file, in product order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub featured: Vec<String>,
 }
 #[derive(Clone, Serialize)]
 pub(crate) struct Entry {
@@ -51,6 +59,8 @@ pub(crate) struct Page {
     pub offset: usize,
     pub next_offset: Option<usize>,
     pub hit: Option<bool>,
+    /// The first entries matching the target (at most `PAGE_HITS`), in file order.
+    pub hits: Vec<Entry>,
 }
 #[derive(Clone)]
 pub(crate) enum Database {
@@ -108,37 +118,64 @@ impl Lookup {
     }
 }
 
+fn category(code: String, count: usize, attr_counts: BTreeMap<String, usize>) -> Category {
+    Category {
+        code,
+        count,
+        attrs: attr_counts.keys().cloned().collect(),
+        attr_counts,
+        within: vec![],
+    }
+}
+
 impl Database {
+    /// The first geosite call computes containment for the whole file; run it off the runtime.
     pub fn catalog(&self, source: &str) -> Catalog {
-        let entries = match self {
+        let (entries, featured) = match self {
             Self::Site(db) => {
-                db.0.values()
-                    .map(|s| Category {
-                        code: s.code.to_ascii_lowercase(),
-                        count: s.domain.len(),
-                        attrs: s
-                            .domain
-                            .iter()
-                            .flat_map(|d| d.attribute.iter().map(|a| a.key.to_ascii_lowercase()))
-                            .collect::<BTreeSet<_>>()
-                            .into_iter()
-                            .collect(),
-                    })
-                    .collect()
+                let within = db.within();
+                let entries: Vec<_> =
+                    db.0.values()
+                        .map(|s| {
+                            let mut attr_counts = BTreeMap::new();
+                            for d in &s.domain {
+                                let keys: BTreeSet<_> = d
+                                    .attribute
+                                    .iter()
+                                    .map(|a| a.key.to_ascii_lowercase())
+                                    .collect();
+                                for key in keys {
+                                    *attr_counts.entry(key).or_insert(0) += 1;
+                                }
+                            }
+                            let code = s.code.to_ascii_lowercase();
+                            Category {
+                                within: within.get(&code).cloned().unwrap_or_default(),
+                                ..category(code, s.domain.len(), attr_counts)
+                            }
+                        })
+                        .collect();
+                let featured = brocade_core::format::yaml::featured_geosite_sets()
+                    .into_iter()
+                    .filter(|code| db.0.contains_key(&code.to_ascii_uppercase()))
+                    .map(str::to_owned)
+                    .collect();
+                (entries, featured)
             }
-            Self::Ip(db, _) => db
-                .entry
-                .iter()
-                .map(|s| Category {
-                    code: s.code.clone(),
-                    count: s.cidr.len(),
-                    attrs: ["ipv4", "ipv6"]
-                        .into_iter()
-                        .filter(|a| s.cidr.iter().any(|c| (c.ip.len() == 4) == (*a == "ipv4")))
-                        .map(str::to_owned)
-                        .collect(),
-                })
-                .collect(),
+            Self::Ip(db, _) => (
+                db.entry
+                    .iter()
+                    .map(|s| {
+                        let mut attr_counts = BTreeMap::new();
+                        for c in &s.cidr {
+                            let family = if c.ip.len() == 4 { "ipv4" } else { "ipv6" };
+                            *attr_counts.entry(family.to_owned()).or_insert(0) += 1;
+                        }
+                        category(s.code.clone(), s.cidr.len(), attr_counts)
+                    })
+                    .collect(),
+                vec![],
+            ),
         };
         Catalog {
             source: display_source(source),
@@ -147,6 +184,15 @@ impl Database {
                 Self::Ip(_, loaded_at) => *loaded_at,
             },
             entries,
+            featured,
+        }
+    }
+
+    /// Reverse lookup is geosite-only: geoip targets are addresses, checked per category.
+    pub fn lookup(&self, domain: &str) -> Result<crate::geosite::DomainLookup, String> {
+        match self {
+            Self::Site(db) => Ok(db.lookup(domain)),
+            Self::Ip(..) => Err("只能按域名反查 geosite".into()),
         }
     }
 
@@ -259,10 +305,18 @@ impl Database {
         serde_json::json!({"covers":covers,"errors":errors})
     }
 
+    /// One page of a category's entries for the browser. Entries are ordered by kind
+    /// (`ENTRY_KINDS` for geosite, IPv4 before IPv6 for geoip) and then by file order, so a
+    /// paged list can be shown in kind sections. `kind` keeps one entry kind; `counts` always
+    /// cover the whole attribute-filtered category. With a `target`, `hits` lists the first
+    /// entries that match it, and stays empty when an inverted geoip selector turns them into
+    /// a miss.
+    #[allow(clippy::too_many_arguments)]
     pub fn page(
         &self,
         code: &str,
         attr: &str,
+        kind: &str,
         query: &str,
         offset: usize,
         limit: usize,
@@ -274,96 +328,54 @@ impl Database {
             format!("{code}@{attr}")
         };
         self.identities(&selector)?;
-        if matches!(self, Self::Site(_))
-            && !target.is_empty()
-            && !brocade_core::rule_validation::valid_domain(target)
-        {
-            return Err("请输入有效域名".into());
+        let order: &[&str] = match self {
+            Self::Site(_) => &ENTRY_KINDS,
+            Self::Ip(..) => &["ipv4", "ipv6"],
+        };
+        if !kind.is_empty() && !order.contains(&kind) {
+            return Err("条目类型无效".into());
         }
         let (_, attrs) = selector_parts(&selector);
-        let mut counts = BTreeMap::new();
-        let mut entries = Vec::new();
-        let mut total = 0;
-        let mut hit = if target.is_empty() { None } else { Some(false) };
         let query = query.to_ascii_lowercase();
-        let target_ip = if target.is_empty() {
-            None
-        } else {
-            target.parse::<IpAddr>().ok()
-        };
-        if matches!(self, Self::Ip(..)) && !target.is_empty() && target_ip.is_none() {
-            return Err("请输入有效 IP".into());
-        }
-        let mut add = |entry: Entry, matched: bool| {
-            *counts.entry(entry.kind.clone()).or_insert(0) += 1;
-            if matched {
-                hit = Some(true);
-            }
-            if !entry.value.to_ascii_lowercase().contains(&query) {
-                return;
-            }
-            if total >= offset && entries.len() < limit {
-                entries.push(entry);
-            }
-            total += 1;
-        };
-        match self {
+        let rows: Vec<PageRow> = match self {
             Self::Site(db) => {
-                let site = &db.0[&code.to_ascii_uppercase()];
-                for d in &site.domain {
-                    if !attrs
-                        .iter()
-                        .all(|a| d.attribute.iter().any(|v| v.key.eq_ignore_ascii_case(a)))
-                    {
-                        continue;
-                    }
-                    let matched = if target.is_empty() {
-                        false
-                    } else {
-                        match d.kind {
-                            0 => target
-                                .to_ascii_lowercase()
-                                .contains(&d.value.to_ascii_lowercase()),
-                            1 => regex::bytes::RegexBuilder::new(&d.value)
-                                .unicode(false)
-                                .build()
-                                .map(|r| r.is_match(target.as_bytes()))
-                                .unwrap_or(false),
-                            2 => {
-                                target.eq_ignore_ascii_case(&d.value)
-                                    || target
-                                        .to_ascii_lowercase()
-                                        .ends_with(&format!(".{}", d.value.to_ascii_lowercase()))
-                            }
-                            3 => target.eq_ignore_ascii_case(&d.value),
-                            _ => false,
-                        }
-                    };
-                    add(
-                        Entry {
-                            kind: match d.kind {
-                                0 => "keyword",
-                                1 => "regexp",
-                                2 => "domain",
-                                3 => "full",
-                                _ => "unknown",
-                            }
-                            .into(),
-                            value: d.value.clone(),
-                            attrs: d.attribute.iter().map(|a| a.key.clone()).collect(),
-                        },
-                        matched,
-                    );
+                if !target.is_empty() && !brocade_core::rule_validation::valid_domain(target) {
+                    return Err("请输入有效域名".into());
                 }
+                let target = target.to_ascii_lowercase();
+                db.0[&code.to_ascii_uppercase()]
+                    .domain
+                    .iter()
+                    .filter(|d| {
+                        attrs
+                            .iter()
+                            .all(|a| d.attribute.iter().any(|v| v.key.eq_ignore_ascii_case(a)))
+                    })
+                    .map(|d| PageRow {
+                        kind: crate::geosite::kind_name(d.kind),
+                        value: d.value.clone(),
+                        attrs: d.attribute.iter().map(|a| a.key.clone()).collect(),
+                        matched: !target.is_empty()
+                            && crate::geosite::entry_matches(d, &target) == Some(true),
+                    })
+                    .collect()
             }
             Self::Ip(db, _) => {
-                let inverted = code.bytes().take_while(|b| *b == b'!').count() % 2 == 1;
-                let code = code.trim_start_matches('!');
+                let target_ip = if target.is_empty() {
+                    None
+                } else {
+                    Some(
+                        target
+                            .parse::<IpAddr>()
+                            .map_err(|_| "请输入有效 IP".to_owned())?,
+                    )
+                };
                 let site = db
                     .entry
                     .iter()
-                    .find(|s| s.code.eq_ignore_ascii_case(code))
+                    .find(|s| s.code.eq_ignore_ascii_case(code.trim_start_matches('!')))
                     .expect("selector checked above");
+                let mut rows = vec![];
                 for c in &site.cidr {
                     if !attrs.iter().all(|a| {
                         (a == "ipv4" && c.ip.len() == 4) || (a == "ipv6" && c.ip.len() == 16)
@@ -371,23 +383,55 @@ impl Database {
                         continue;
                     }
                     let network = c.network()?;
-                    add(
-                        Entry {
-                            kind: if c.ip.len() == 4 { "ipv4" } else { "ipv6" }.into(),
-                            value: network.to_string(),
-                            attrs: vec![],
-                        },
-                        target_ip.is_some_and(|ip| network.contains(&ip)),
-                    );
+                    rows.push(PageRow {
+                        kind: if c.ip.len() == 4 { "ipv4" } else { "ipv6" },
+                        value: network.to_string(),
+                        attrs: vec![],
+                        matched: target_ip.is_some_and(|ip| network.contains(&ip)),
+                    });
                 }
-                if (site.reverse_match ^ inverted) && !target.is_empty() {
-                    hit = hit.map(|v| !v);
-                }
+                rows
+            }
+        };
+        let mut counts = BTreeMap::new();
+        let mut hits = vec![];
+        for row in &rows {
+            *counts.entry(row.kind.to_owned()).or_insert(0) += 1;
+            if row.matched && hits.len() < PAGE_HITS {
+                hits.push(row.entry());
             }
         }
-        if let Self::Site(db) = self {
-            if !target.is_empty() {
-                hit = db.check(&selector, target).hit;
+        let hit = match self {
+            _ if target.is_empty() => None,
+            Self::Site(db) => db.check(&selector, &target.to_ascii_lowercase()).hit,
+            Self::Ip(db, _) => {
+                let inverted = code.bytes().take_while(|b| *b == b'!').count() % 2 == 1;
+                let reversed = db
+                    .entry
+                    .iter()
+                    .find(|s| s.code.eq_ignore_ascii_case(code.trim_start_matches('!')))
+                    .is_some_and(|s| s.reverse_match)
+                    ^ inverted;
+                if reversed {
+                    hits.clear();
+                }
+                Some(rows.iter().any(|row| row.matched) != reversed)
+            }
+        };
+        let mut entries = Vec::new();
+        let mut total = 0;
+        for name in order
+            .iter()
+            .filter(|name| kind.is_empty() || **name == kind)
+        {
+            for row in rows.iter().filter(|row| row.kind == *name) {
+                if !row.value.to_ascii_lowercase().contains(&query) {
+                    continue;
+                }
+                if total >= offset && entries.len() < limit {
+                    entries.push(row.entry());
+                }
+                total += 1;
             }
         }
         Ok(Page {
@@ -398,7 +442,31 @@ impl Database {
             entries,
             offset,
             hit,
+            hits,
         })
+    }
+}
+
+/// Browser order for geosite entry kinds; `unknown` keeps entries of future kinds visible.
+const ENTRY_KINDS: [&str; 5] = ["domain", "full", "regexp", "keyword", "unknown"];
+/// Matching entries a page reports for a target; the browser names them, it does not list all.
+const PAGE_HITS: usize = 8;
+
+/// An attribute-filtered entry with its target match, before query filtering and paging.
+struct PageRow {
+    kind: &'static str,
+    value: String,
+    attrs: Vec<String>,
+    matched: bool,
+}
+
+impl PageRow {
+    fn entry(&self) -> Entry {
+        Entry {
+            kind: self.kind.into(),
+            value: self.value.clone(),
+            attrs: self.attrs.clone(),
+        }
     }
 }
 

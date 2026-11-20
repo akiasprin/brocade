@@ -97,7 +97,7 @@ import {
   realityFingerprintIsValid,
   realityServerNameIsValid,
 } from '../reality';
-import { can, isVisitor, useSession } from '../session';
+import { can, isPublic, isVisitor, useSession } from '../session';
 import { Empty, EmptyState, ErrorBox, Loading, SegmentedControl, SegSwitch } from '../ui/bits';
 import { ConfigSecretInput } from '../ui/config-secret-input';
 import { latencyMean } from '../ui/latency';
@@ -6029,6 +6029,7 @@ function ChainDetail({ app, chain }: { app: string; chain: string }) {
                     settingsReadable={settingsReadable}
                     showHeader={false}
                     readOnly
+                    hideEditControls={isPublic(who)}
                   />
                 </div>
               )}
@@ -6418,6 +6419,7 @@ function ChainRulesPanelContent({
   onRemove,
   machineRole,
   readOnly = false,
+  hideEditControls = false,
   settingsReadable = true,
 }: {
   appId: string;
@@ -6449,6 +6451,7 @@ function ChainRulesPanelContent({
   // 此前整块被替换为「修改规则需要 editor 及以上」——该提示回答的是权限问题，
   // 而进入链详情页需要了解的是当前配置，两者不同。
   readOnly?: boolean;
+  hideEditControls?: boolean;
   /** False for visitor roles, whose route allow-list excludes settings. */
   settingsReadable?: boolean;
 }) {
@@ -6841,6 +6844,7 @@ function ChainRulesPanelContent({
               // 同一台机器的多个位置共用一份草稿，由第一处执行保存即可；两处都登记会把同一内容写两次。
               saves={!repeated}
               readOnly={readOnly}
+              hideEditControls={hideEditControls}
               fallback={{
                 rules: fallbackOf(node),
                 pending: revisionsForPorts.isPending || compiledForPorts.isLoading,
@@ -6928,7 +6932,7 @@ function ChainRulesPanelContent({
           )}
         </div>
         <div className="chain-rule-section-list" hidden={visual || initiallyPending}>
-          <div className="chain-rule-tree" aria-busy={portDependenciesPending}>
+          <div className="chain-rule-tree chain-rule-responsive" aria-busy={portDependenciesPending}>
             {!initiallyPending && tree}
             {!initiallyPending && orphanTree.length > 0 && (
               <div className="chain-rule-orphans">

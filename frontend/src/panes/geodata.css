@@ -5,14 +5,17 @@
   width: 100%;
 }
 .geo-select {
-  display: flex !important;
+  display: grid !important;
+  grid-template-columns: minmax(0, max-content) auto minmax(12px, 1fr) 14px;
   align-items: center;
   gap: 4px;
   min-width: 0;
+  min-height: 28px;
   overflow: hidden;
-  padding: 3px 5px !important;
+  padding: 3px 7px !important;
   height: 28px;
   box-sizing: border-box;
+  line-height: 16px;
   border: 1px solid var(--line);
   border-radius: var(--r-control, 5px);
   background: var(--sunk);
@@ -21,11 +24,15 @@
   border-color: var(--err);
 }
 .geo-select > input {
+  grid-column: 3;
+  grid-row: 1;
+  box-sizing: border-box;
   border: 0;
   background: transparent;
   outline: none;
-  min-width: 24px;
-  width: 24px;
+  min-width: 12px;
+  width: 100%;
+  padding: 1px 0;
   flex: 1;
   color: inherit;
   font: inherit;
@@ -53,6 +60,19 @@
   white-space: nowrap;
   font-family: var(--mono, monospace);
 }
+.geo-select > .geo-chip {
+  grid-column: 1;
+  grid-row: 1;
+  box-sizing: border-box;
+  height: 20px;
+  max-width: 100%;
+  padding: 1px 3px;
+}
+/* 徽章背景自身包含留白，不应再把图标向右缩进一层。用输入框左内距让位而不用负外边距：
+   负外边距会让 max-content 列比徽章本身窄 4px，宽输入框里的分类名也会被截断。 */
+.geo-select:has(> .geo-chip:first-child) {
+  padding-left: 3px !important;
+}
 .geo-chip.invalid {
   color: var(--err);
   border-style: dashed;
@@ -66,13 +86,35 @@
   white-space: nowrap;
 }
 .geo-more-count {
+  grid-column: 2;
+  grid-row: 1;
   flex: none;
   padding: 2px !important;
   background: var(--line, #d2d5d8) !important;
   border-radius: 3px;
 }
 .geo-chevron {
+  grid-column: 4;
+  grid-row: 1;
   flex: none;
+}
+.geo-select:not(:has(> .geo-chip)) {
+  display: flex !important;
+}
+.geo-select:has(> .geo-chip:nth-child(2)) {
+  grid-template-columns: minmax(0, max-content) minmax(0, max-content) auto minmax(12px, 1fr) 14px;
+}
+.geo-select > .geo-chip:nth-child(2) {
+  grid-column: 2;
+}
+.geo-select:has(> .geo-chip:nth-child(2)) > .geo-more-count {
+  grid-column: 3;
+}
+.geo-select:has(> .geo-chip:nth-child(2)) > input {
+  grid-column: 4;
+}
+.geo-select:has(> .geo-chip:nth-child(2)) > .geo-chevron {
+  grid-column: 5;
 }
 .geo-message {
   display: flex;
@@ -81,11 +123,12 @@
   min-width: 0;
   margin-top: 4px;
   font-size: 11px;
-  white-space: nowrap;
+  white-space: normal;
   color: var(--ink-3);
 }
 .geo-message > span {
-  overflow: hidden;
+  overflow: visible;
+  overflow-wrap: anywhere;
   text-overflow: ellipsis;
 }
 .geo-message.error {
@@ -100,14 +143,14 @@
   cursor: pointer;
 }
 .geo-menu {
-  width: min(440px, calc(100vw - 24px));
+  width: min(680px, calc(100vw - 16px));
   padding: 0 !important;
   background: var(--sheet);
   display: flex;
   flex-direction: column;
 }
 .geo-menu-layer.popover > .dialog-surface.geo-menu {
-  max-height: min(480px, 70dvh);
+  height: min(520px, calc(100dvh - 16px));
   overflow: hidden;
 }
 .geo-menu-search {
@@ -121,85 +164,11 @@
   min-width: 0;
   flex: 1;
 }
-.geo-options {
-  min-height: 0;
-  overflow: auto;
-  flex: 1;
-  padding: 4px 10px;
+.geo-menu-search > input.f {
+  font-family: var(--mono);
 }
-.geo-options small {
-  display: block;
-  color: var(--ink-3);
-  font-size: 10px;
-  padding: 6px 4px;
-}
-.geo-options > button,
-.geo-browser nav > button {
-  width: 100%;
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  border: 0;
-  background: none;
-  color: inherit;
-  text-align: left;
-  min-width: 0;
-  padding: 8px;
-  border-radius: 5px;
-  cursor: pointer;
-}
-.geo-options > button code,
-.geo-browser nav code {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.geo-options > button > span:last-child,
-.geo-browser nav > button > span:last-child {
-  margin-left: auto;
-  font-size: 10px;
-  color: var(--ink-3);
-  white-space: nowrap;
-}
-.geo-options > button:hover,
-.geo-browser nav > button:hover,
-.geo-browser nav > button.active {
-  background: var(--action-wash);
-}
-.geo-options button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-.geo-browse {
-  border: 0;
-  border-top: 1px solid var(--line, #d2d5d8);
-  background: none;
-  color: var(--action);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  text-align: left;
-  padding: 12px;
-  flex: none;
-  cursor: pointer;
-}
-.geo-browse > .ui-icon,
-.geo-browse-label {
-  flex: none;
-}
-.geo-browse-label {
-  white-space: nowrap;
-}
-.geo-browse-summary {
-  flex: 1;
-  min-width: 0;
-  color: var(--ink-3);
-  font-size: 11px;
-  text-align: right;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.geo-menu-search > input.f::placeholder {
+  font-family: var(--sans);
 }
 .geo-menu-state {
   padding: 12px;
@@ -208,254 +177,486 @@
   align-items: center;
   gap: 10px;
 }
-.geo-browser {
-  width: min(1000px, calc(100vw - 32px));
-  height: min(740px, calc(100dvh - 40px));
-  max-width: none !important;
+
+/* 本条已选：集中在搜索框下方，列表里只标 ✓，不再重复列出。 */
+.geo-menu-picked {
   display: flex;
-  flex-direction: column;
-  padding: 0 !important;
-  background: var(--sheet);
-  overflow: hidden;
-}
-.geo-browser > header {
-  display: flex;
-  align-items: flex-start;
-  gap: 16px;
-  padding: 18px 20px;
-  border-bottom: 1px solid var(--line, #d2d5d8);
-}
-.geo-browser > header > div {
-  min-width: 0;
-  flex: 1;
-}
-.geo-browser h2 {
-  display: flex;
+  flex: none;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  margin: 0;
-  font-size: 17px;
-}
-.geo-browser h2 code {
-  font-size: 11px;
-  font-weight: 400;
-  color: var(--ink-3);
-  padding: 3px 6px;
-  border: 1px solid var(--line, #d2d5d8);
-  border-radius: 4px;
-}
-.geo-browser header p {
-  margin: 8px 0 0;
+  gap: 4px;
+  max-height: 64px;
+  overflow: auto;
+  padding: 0 12px 8px;
   color: var(--ink-3);
   font-size: 11px;
+}
+.geo-menu-picked > b {
+  margin-right: 4px;
+  font-weight: 500;
+}
+.geo-menu-picked .geo-chip {
+  max-width: 100%;
+}
+.geo-menu-picked .geo-chip-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.geo-menu-picked .geo-chip-name > span:last-child {
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
-.geo-browser header p span {
-  margin-left: 8px;
-}
-.geo-browser-body {
-  display: flex;
-  min-height: 0;
-  flex: 1;
-}
-.geo-browser aside {
-  width: 260px;
-  flex: none;
-  background: var(--surface);
-  border-right: 1px solid var(--line, #d2d5d8);
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-.geo-browser nav {
-  overflow: auto;
-  padding: 6px 10px;
-  flex: 1;
-}
-.geo-references {
-  font-size: 11px;
-  padding: 0 14px 8px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.geo-browser main {
-  min-width: 0;
-  min-height: 0;
-  flex: 1;
-  overflow: auto;
-  padding: 18px 24px;
-}
-.geo-browser h3 {
-  font-size: 20px;
-  margin: 0 0 14px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.geo-browser h3 > span:last-child {
-  font-size: 11px;
-  font-weight: 400;
+.geo-menu-picked .geo-chip button {
+  border: 0;
+  background: none;
   color: var(--ink-3);
-  margin-left: auto;
+  padding: 0 2px;
+  cursor: pointer;
 }
-.geo-attrs {
+.geo-menu-picked .site-brand-icon svg {
+  width: 13px;
+  height: 13px;
+}
+
+.geo-menu-body {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin: 10px 0;
+  flex: 1;
+  min-height: 0;
+  border-top: 1px solid var(--line);
 }
-.geo-attrs button {
-  border: 1px solid var(--line, #d2d5d8);
+.geo-menu-rail {
+  flex: none;
+  width: 172px;
+  overflow: auto;
+  padding: 6px;
+  box-sizing: border-box;
+  border-right: 1px solid var(--line);
+  background: var(--surface);
+}
+.geo-menu-rail small {
+  display: block;
+  padding: 10px 8px 4px;
+  color: var(--ink-4);
+  font-size: 10.5px;
+}
+.geo-menu-rail button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 30px;
+  padding: 0 8px;
+  border: 0;
   border-radius: 5px;
   background: none;
-  color: inherit;
+  color: var(--ink-2);
+  font: 12.5px var(--sans);
+  text-align: left;
   cursor: pointer;
-  padding: 4px 9px;
-  font-size: 11px;
 }
-.geo-attrs button.active {
+.geo-menu-rail button > span {
+  margin-left: auto;
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+}
+.geo-menu-rail button[aria-pressed='true'] {
   background: var(--action-wash);
   color: var(--action);
+  font-weight: 600;
 }
-.geo-composition {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 14px;
-  padding: 10px 0;
-  color: var(--ink-3);
-  font-size: 11px;
+.geo-menu-rail button[aria-pressed='true'] > span {
+  color: var(--action);
+  font-weight: 400;
 }
-.geo-check {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 10px 0;
+.geo-menu-rail button:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
-.geo-check input {
-  flex: 1;
-  min-width: 0;
-}
-.geo-hit {
-  background: var(--action-wash);
-  border-radius: 5px;
-  padding: 8px;
-  font-size: 12px;
-}
-.geo-entry-filter {
-  width: 100%;
-  margin: 8px 0;
-}
-.geo-entries > div {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  padding: 7px 0;
-  border-bottom: 1px solid var(--line, #d2d5d8);
-  font-size: 12px;
-  min-width: 0;
-}
-.geo-entries small {
-  color: var(--ink-3);
-  min-width: 48px;
-  font-size: 10px;
-}
-.geo-entries code {
-  overflow-wrap: anywhere;
-  min-width: 0;
-  flex: 1;
-}
-.geo-entries span {
-  font-size: 10px;
-  color: var(--ink-3);
-}
-.geo-pagination {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  padding: 12px 0;
-  font-size: 11px;
-}
-.geo-pagination > span {
-  margin-right: auto;
-}
-.geo-browser footer {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 20px;
-  border-top: 1px solid var(--line, #d2d5d8);
-  flex: none;
-  min-width: 0;
-}
-.geo-browser footer > span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-}
-.geo-back {
-  display: none !important;
-}
-@media (max-width: 820px) {
-  .geo-browser {
-    width: 100vw;
-    height: 100dvh;
-    border-radius: 0 !important;
-  }
-  .geo-browser > header {
-    padding: 14px;
-  }
-  .geo-browser header p span {
-    display: none;
-  }
-  .geo-browser aside {
-    width: 100%;
-    border: 0;
-  }
-  .geo-browser main {
-    display: none;
-    padding: 14px;
-  }
-  .geo-browser.detail-open aside {
-    display: none;
-  }
-  .geo-browser.detail-open main {
-    display: block;
-  }
-  .geo-back {
-    display: inline-flex !important;
-    margin-bottom: 14px;
-  }
-  .geo-menu-layer.popover > .dialog-surface.geo-menu {
-    max-height: min(480px, 65dvh);
-  }
-  .geo-browser footer {
-    padding-bottom: max(12px, env(safe-area-inset-bottom));
+@media (hover: hover) {
+  .geo-menu-rail button:not(:disabled, [aria-pressed='true']):hover {
+    background: var(--hover-2);
   }
 }
 
-.geo-browser nav .missing {
-  color: var(--err);
+.geo-menu-list {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 0 6px 8px;
 }
-.geo-reference-list {
-  padding-top: 16px;
-  border-top: 1px solid var(--line);
-  margin-top: 14px;
-  font-size: 11px;
+.geo-menu-sec {
+  position: sticky;
+  z-index: 2;
+  top: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 9px 8px 5px;
+  background: var(--sheet);
   color: var(--ink-3);
-  overflow-wrap: anywhere;
+  font-size: 11px;
 }
-.geo-reference-list h4 {
+.geo-menu-sec > b {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-2);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.geo-menu-sec > span {
+  flex: none;
+  margin-left: auto;
+  color: var(--ink-4);
+  font-size: 10.5px;
+}
+.geo-menu-letters {
+  position: sticky;
+  z-index: 3;
+  top: 0;
+  display: flex;
+  gap: 1px;
+  margin: 0 -6px;
+  padding: 6px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--line);
+  background: var(--sheet);
+  scrollbar-width: none;
+}
+.geo-menu-letters + div > .geo-menu-sec {
+  top: 33px;
+}
+.geo-menu-letters button {
+  flex: 1 0 18px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--ink-3);
+  font: 10.5px var(--mono);
+  cursor: pointer;
+}
+.geo-menu-letters button[aria-pressed='true'] {
+  background: var(--action-wash);
+  color: var(--action);
+  font-weight: 700;
+}
+
+/* 一行一个分类：透明按钮铺满整行作为主选项，行内属性按钮浮在其上。 */
+.geo-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 34px;
+  padding: 0 8px;
+  border-radius: 5px;
+}
+.geo-row.tall {
+  min-height: 42px;
+}
+.geo-row.active {
+  background: var(--hover-2);
+}
+.geo-row.selected {
+  background: var(--action-wash);
+}
+.geo-row-hit {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: inherit;
+  background: none;
+  cursor: pointer;
+}
+.geo-row-hit:focus-visible {
+  outline: 2px solid var(--action);
+  outline-offset: -2px;
+}
+.geo-row-hit:disabled {
+  cursor: default;
+}
+.geo-row:has(> .geo-row-hit:disabled) > :not(.geo-row-hit, .geo-row-count) {
+  opacity: 0.45;
+}
+.geo-row > :not(.geo-row-hit) {
+  position: relative;
+  z-index: 1;
+  pointer-events: none;
+}
+.geo-row > .geo-row-attrs,
+.geo-family > .geo-row-attrs {
+  pointer-events: auto;
+}
+.geo-row > .site-brand-icon,
+.geo-row > .region-flag {
+  flex: none;
+  color: var(--ink-2);
+}
+.geo-row .site-brand-icon svg {
+  width: 16px;
+  height: 16px;
+}
+.geo-row-name {
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  min-width: 0;
+}
+.geo-row-name > code {
+  overflow: hidden;
   color: var(--ink);
+  font: 12.5px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.geo-row-name mark {
+  background: none;
+  color: var(--action);
+  font-weight: 700;
+}
+.geo-row-name small {
+  margin-left: 6px;
+  color: var(--ink-3);
+  font: 11px var(--sans);
+}
+.geo-row-attr {
+  color: var(--action);
+}
+.geo-row-name > .geo-row-via {
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.geo-row-tag {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  color: var(--ok);
+  font-size: 10.5px;
+  line-height: 17px;
+  white-space: nowrap;
+}
+.geo-row-tag.wide {
+  background: color-mix(in srgb, var(--gold) 12%, transparent);
+  color: var(--gold);
+}
+.geo-row-attrs {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  gap: 3px;
+  min-width: 0;
+}
+.geo-attr,
+.geo-variant {
+  height: 20px;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--sheet);
+  color: var(--ink-3);
+  font: 10.5px/18px var(--mono);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.geo-variant {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ink-2);
+  font-size: 11px;
+}
+.geo-variant > span {
+  color: var(--ink-4);
+  font-size: 10px;
+}
+.geo-attr.on,
+.geo-variant.on,
+.geo-attr.active,
+.geo-variant.active {
+  border-color: color-mix(in srgb, var(--action) 45%, var(--line));
+  color: var(--action);
+}
+.geo-attr.on,
+.geo-variant.on {
+  background: var(--action-wash);
+}
+@media (hover: hover) {
+  .geo-attr:not(:disabled):hover,
+  .geo-variant:not(:disabled):hover {
+    border-color: color-mix(in srgb, var(--action) 45%, var(--line));
+    color: var(--action);
+  }
+}
+.geo-attr:disabled,
+.geo-variant:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.geo-attr-more {
+  align-self: center;
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+}
+.geo-family .geo-row-attrs {
+  margin-left: 4px;
+}
+.geo-row-count {
+  flex: none;
+  margin-left: auto;
+  color: var(--ink-4);
+  font: 11px var(--mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.geo-row-count.reason {
+  font-family: var(--sans);
+  font-size: 10.5px;
+}
+.geo-row-mark {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 14px;
+  color: var(--action);
+}
+.geo-menu-hint {
+  margin: 6px 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--sunk);
+  color: var(--ink-3);
   font-size: 12px;
-  margin: 0 0 8px;
+  line-height: 1.6;
 }
-.geo-reference-list p {
-  margin: 6px 0;
+.geo-menu-hint code {
+  color: var(--ink-2);
+  font: 11.5px var(--mono);
 }
+.geo-menu-hint button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--action);
+  font: inherit;
+  cursor: pointer;
+}
+.geo-menu-more {
+  display: block;
+  width: calc(100% - 16px);
+  margin: 6px 8px 2px;
+  padding: 7px;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  background: none;
+  color: var(--action);
+  font: 12px var(--sans);
+  cursor: pointer;
+}
+.geo-menu-foot {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 8px 12px;
+  border-top: 1px solid var(--line);
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.geo-menu-foot > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.geo-menu-browse {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--action);
+  font: 12px var(--sans);
+  cursor: pointer;
+}
+
+@media (max-width: 820px) {
+  /* 手机：贴底的面板，侧栏改成可横向滚动的分组胶囊。 */
+  .geo-menu-layer.popover > .dialog-scrim {
+    background: var(--scrim);
+  }
+  .geo-menu-layer.popover > .dialog-surface.geo-menu {
+    top: auto;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: min(86dvh, 720px);
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 14px 14px 0 0;
+    padding-bottom: env(safe-area-inset-bottom) !important;
+  }
+  .geo-menu-body {
+    flex-direction: column;
+  }
+  .geo-menu-rail {
+    display: flex;
+    gap: 4px;
+    width: auto;
+    overflow-x: auto;
+    padding: 8px 10px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    background: var(--sheet);
+    scrollbar-width: none;
+  }
+  .geo-menu-rail small {
+    display: none;
+  }
+  .geo-menu-rail button {
+    flex: none;
+    width: auto;
+    min-height: 30px;
+    padding: 0 10px;
+    border: 1px solid var(--line);
+    border-radius: 15px;
+    white-space: nowrap;
+  }
+  .geo-menu-search > input.f {
+    height: 38px;
+    font-size: 15px;
+  }
+  .geo-row {
+    min-height: 42px;
+  }
+  .geo-attr,
+  .geo-variant {
+    height: 26px;
+    padding: 0 7px;
+    line-height: 24px;
+  }
+}
+
 .geo-field > .f {
   width: 100%;
 }
@@ -492,24 +693,754 @@
   width: 100% !important;
   max-width: 100%;
 }
-.geo-type-bar {
+
+.rule-table .rule-match-cell > :is(.f, .geo-field, .rule-match-kind),
+.chain-rule-tree .rule-table .rule-match-cell > :is(.f, .geo-field, .rule-match-kind) {
+  vertical-align: top;
+}
+
+/* ── 规则集预览：左栏分类，右栏一个分类的条目 ──
+   头部一行（名称、条目数、加入／移除），属性与工具各一行，条目按类型分节、按长度定列宽。
+   表面不透明：节标题吸顶时要盖住滚过的条目，半透明的浮层底色会让它成为一条色带。 */
+.dialog-surface.geo-browser {
+  background: var(--sheet);
+  backdrop-filter: none;
+}
+.geo-browser {
   display: flex;
-  height: 6px;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: min(980px, calc(100vw - 32px));
+  height: min(660px, calc(100dvh - 40px));
+  max-width: none !important;
+  padding: 0 !important;
   overflow: hidden;
-  border-radius: 4px;
-  margin: 12px 0 0;
-  background: var(--line);
+  color: var(--ink-2);
+  font-size: 12.5px;
 }
-.geo-type-bar > i {
-  min-width: 1px;
+.geo-browser-bar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 8px 0 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 12px;
 }
-.geo-browser .geo-entry-filter {
+.geo-browser-bar > .ui-icon {
+  color: var(--ink-3);
+}
+.geo-browser-bar > b {
+  color: var(--ink);
+  font-weight: 600;
+}
+.geo-browser-bar > code {
+  color: var(--ink-2);
+  font: 12px var(--mono);
+}
+.geo-browser-meta {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.geo-browser-meta > i {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--ok);
+  vertical-align: 1px;
+}
+.geo-browser-bar > .geo-close {
+  margin-left: auto;
+  border-radius: 6px;
+}
+.geo-browser-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.geo-browser-body > .geo-menu-state {
+  flex: 1;
+}
+
+/* 左栏 */
+.geo-browser-nav {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  width: 236px;
+  min-height: 0;
+  border-right: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface) 55%, var(--sheet));
+}
+.geo-browser-nav-top {
+  padding: 10px 10px 6px;
+}
+.geo-browser-nav-list {
+  flex: 1;
+  min-height: 0;
+  padding: 0 6px 8px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.geo-browser-nav-head {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 6px 3px;
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.geo-browser-nav-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  height: 26px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--ink-2);
+  font: 12px var(--mono);
+  text-align: left;
+  cursor: pointer;
+}
+.geo-browser-nav-row .site-brand-icon svg {
+  width: 14px;
+  height: 14px;
+}
+.geo-browser-nav-row > code {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.geo-browser-nav-row > small {
+  flex: none;
+  color: var(--ink-4);
+  font: 10.5px var(--sans);
+  font-variant-numeric: tabular-nums;
+}
+.geo-browser-nav-row.missing > small {
+  color: var(--err);
+}
+.geo-browser-dot {
+  flex: none;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--action);
+}
+.geo-browser-nav-row:hover {
+  background: var(--hover);
+}
+.geo-browser-nav-row[aria-current='true'] {
+  background: var(--action-wash);
+  color: var(--action);
+}
+
+/* 输入：左侧图标、右侧清除 */
+.geo-browser-find {
+  position: relative;
+  display: flex;
+  flex: 1;
+  align-items: center;
+  min-width: 0;
+}
+.geo-browser-find > .ui-icon {
+  position: absolute;
+  left: 9px;
+  color: var(--ink-4);
+  pointer-events: none;
+}
+.geo-browser-find > input.f {
   box-sizing: border-box;
   width: 100%;
   max-width: none;
+  height: 28px;
+  min-height: 28px;
+  padding: 0 28px 0 29px;
+  font: 12.5px var(--mono);
+}
+.geo-browser-find > input.f::placeholder {
+  font-family: var(--sans);
+}
+.geo-browser-find > button {
+  position: absolute;
+  right: 3px;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--ink-4);
+  font: 16px/1 var(--sans);
+  cursor: pointer;
+}
+.geo-browser-find > button:hover {
+  background: var(--hover);
+  color: var(--ink);
 }
 
-.rule-table .rule-match-cell > :is(.f, .geo-field),
-.chain-rule-tree .rule-table .rule-match-cell > :is(.f, .geo-field) {
-  vertical-align: top;
+/* 右栏头部 */
+.geo-browser-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.geo-browser-head {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 18px 10px;
+}
+.geo-browser-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 28px;
+}
+.geo-browser-title > :is(.site-brand-icon, .region-flag) {
+  flex: none;
+}
+.geo-browser-title .site-brand-icon svg {
+  width: 18px;
+  height: 18px;
+}
+.geo-browser-name {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font: 600 15px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.geo-browser-name > span {
+  color: var(--action);
+}
+.geo-browser-total {
+  flex: none;
+  color: var(--ink-3);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.geo-browser-grow {
+  flex: 1;
+  min-width: 8px;
+}
+.geo-browser-act {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+}
+.geo-browser-act .btn {
+  --ctl-h: 28px;
+  gap: 5px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+.geo-browser-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ok);
+  font-size: 12px;
+}
+.geo-browser-reason {
+  max-width: 220px;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.geo-browser-back {
+  display: none;
+  flex: none;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  margin-left: -6px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+
+/* 关系：包含于 / 包含 / 引用，单行 */
+.geo-browser-rel {
+  display: flex;
+  align-items: baseline;
+  gap: 6px 14px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.geo-browser-rel > span {
+  display: inline-flex;
+  flex: none;
+  align-items: baseline;
+  gap: 5px;
+}
+.geo-browser-rel > span:first-child {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.geo-browser-rel em {
+  color: var(--ink-4);
+  font-style: normal;
+}
+.geo-browser-rel > span > span {
+  display: inline-flex;
+  gap: 5px;
+}
+.geo-browser-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--action);
+  font: 11.5px var(--mono);
+  cursor: pointer;
+}
+.geo-browser-link.sans {
+  font-family: var(--sans);
+}
+.geo-browser-link:hover {
+  text-decoration: underline;
+}
+.geo-browser-link > b {
+  color: var(--ink-3);
+  font: 400 11px var(--sans);
+}
+
+/* 属性：分段，带条目数 */
+.geo-browser-seg {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.geo-browser-seg > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-2);
+  font: 12px var(--mono);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.geo-browser-seg > button.sans {
+  font-family: var(--sans);
+}
+.geo-browser-seg > button > small {
+  color: var(--ink-4);
+  font: 10.5px var(--sans);
+  font-variant-numeric: tabular-nums;
+}
+.geo-browser-seg > button:hover {
+  background: var(--hover);
+}
+.geo-browser-seg > button[aria-pressed='true'] {
+  border-color: color-mix(in srgb, var(--action) 40%, var(--line));
+  background: var(--action-wash);
+  color: var(--action);
+}
+.geo-browser-seg > button[aria-pressed='true'] > small {
+  color: color-mix(in srgb, var(--action) 70%, var(--ink-3));
+}
+.geo-browser-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* 条目类型：既是构成图例，也是筛选 */
+.geo-browser-kinds {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+}
+.geo-browser-kinds > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-3);
+  font: 11.5px var(--sans);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.geo-browser-kinds > button > b {
+  color: var(--ink-2);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.geo-browser-kinds > button:hover {
+  background: var(--hover);
+}
+.geo-browser-kinds > button[aria-pressed='true'] {
+  background: var(--action-wash);
+  color: var(--action);
+}
+.geo-browser-kinds > button[aria-pressed='true'] > b {
+  color: var(--action);
+}
+.geo-browser-mark {
+  display: inline-block;
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+  background: var(--ink-4);
+}
+.geo-browser-mark:is(.domain, .ipv4) {
+  background: var(--data);
+}
+.geo-browser-mark.full {
+  background: var(--ok);
+}
+.geo-browser-mark.regexp {
+  background: var(--gold);
+}
+.geo-browser-mark:is(.keyword, .ipv6) {
+  background: var(--data-secondary);
+}
+
+/* 命中结论：一行 */
+.geo-browser-verdict {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin: 0 18px 6px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.geo-browser-verdict.miss {
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
+}
+.geo-browser-verdict.error {
+  background: color-mix(in srgb, var(--err) 9%, transparent);
+  color: var(--err);
+}
+.geo-browser-verdict > b {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ok);
+  font-weight: 600;
+}
+.geo-browser-verdict.miss > b {
+  color: var(--ink-2);
+}
+.geo-browser-verdict code {
+  color: var(--ink);
+  font: 12px var(--mono);
+}
+.geo-browser-alts {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+.geo-browser-tag {
+  margin-right: 3px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--data) 14%, transparent);
+  color: var(--data);
+  font: 10px/16px var(--sans);
+}
+.geo-browser-tag.full {
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+  color: var(--ok);
+}
+.geo-browser-tag.regexp {
+  background: color-mix(in srgb, var(--gold) 16%, transparent);
+  color: var(--gold);
+}
+.geo-browser-tag:is(.keyword, .ipv6) {
+  background: color-mix(in srgb, var(--data-secondary) 16%, transparent);
+  color: var(--data-secondary);
+}
+
+/* 条目：按类型分节，每节按长度定列宽 */
+.geo-browser-list {
+  flex: 1;
+  min-height: 0;
+  padding: 0 18px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-top: 1px solid var(--line-soft, var(--line));
+}
+.geo-browser-sec {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  margin-top: 4px;
+  background: var(--sheet);
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.geo-browser-section:first-child > .geo-browser-sec,
+.geo-browser-list > .geo-browser-sec:first-child {
+  margin-top: 0;
+}
+.geo-browser-sec > b {
+  color: var(--ink-2);
+  font-weight: 600;
+}
+.geo-browser-sec > span {
+  font-variant-numeric: tabular-nums;
+}
+.geo-browser-sec > .geo-browser-link {
+  margin-left: auto;
+}
+.geo-browser-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, var(--min, 180px)), 1fr));
+  column-gap: 18px;
+  padding-bottom: 6px;
+}
+.geo-browser-entry {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 24px;
+  margin: 0 -6px;
+  padding: 0 6px;
+  border-radius: 4px;
+  color: var(--ink);
+  font: 12px var(--mono);
+}
+.geo-browser-entry:hover {
+  background: var(--hover);
+}
+.geo-browser-entry > code {
+  min-width: 0;
+  overflow: hidden;
+  font: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.geo-browser-entry > small {
+  flex: none;
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.geo-browser-entry.hit {
+  background: color-mix(in srgb, var(--ok) 13%, transparent);
+  box-shadow: inset 2px 0 0 var(--ok);
+}
+.geo-browser-entry mark,
+.geo-browser-nav-row mark {
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--gold) 28%, transparent);
+  color: inherit;
+}
+.geo-browser-end {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0 14px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.geo-browser-end > button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--action);
+  font: inherit;
+  cursor: pointer;
+}
+.geo-browser-end > button:disabled {
+  color: var(--ink-4);
+  cursor: default;
+}
+.geo-browser-empty {
+  margin: 0;
+  padding: 26px 0;
+  color: var(--ink-3);
+  font-size: 12px;
+  text-align: center;
+}
+.geo-browser-empty.error {
+  color: var(--err);
+}
+.geo-browser-hint {
+  margin: 0;
+  padding: 4px 0 12px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.geo-browser-hint code {
+  font: 11px var(--mono);
+}
+
+/* 包含的分类与引用位置 */
+.geo-browser-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 6px;
+  padding: 6px 0 10px;
+}
+.geo-browser-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: none;
+  color: var(--ink);
+  font: 12px var(--mono);
+  text-align: left;
+  cursor: pointer;
+}
+.geo-browser-card:hover {
+  border-color: color-mix(in srgb, var(--action) 40%, var(--line));
+  background: var(--hover);
+}
+.geo-browser-card .site-brand-icon svg {
+  width: 15px;
+  height: 15px;
+}
+.geo-browser-card > code {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.geo-browser-card > small {
+  color: var(--ink-4);
+  font: 10.5px var(--sans);
+}
+.geo-browser-ref {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  margin: 0;
+  border-bottom: 1px solid var(--line-soft, var(--line));
+  color: var(--ink-3);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.geo-browser-ref > code {
+  color: var(--ink);
+  font: 12px var(--mono);
+}
+.geo-browser-ref > code:last-child {
+  color: var(--ink-3);
+}
+
+/* 手机：与其他模态框相同，留出安全区和 10px 边距后撑满；两级（分类列表 → 条目），返回放在标题行。 */
+@media (max-width: 820px) {
+  .geo-browser {
+    width: 100%;
+    height: calc(100dvh - max(10px, var(--safe-top)) - max(10px, var(--safe-bottom)));
+  }
+  .geo-browser-nav {
+    width: 100%;
+    border-right: 0;
+  }
+  .geo-browser.detail .geo-browser-nav,
+  .geo-browser:not(.detail) .geo-browser-main {
+    display: none;
+  }
+  .geo-browser-back {
+    display: grid;
+  }
+  .geo-browser-head {
+    padding: 10px 14px 8px;
+  }
+  .geo-browser-list {
+    padding: 0 14px max(10px, env(safe-area-inset-bottom));
+  }
+  .geo-browser-verdict {
+    margin: 0 14px 6px;
+  }
+  .geo-browser-title {
+    flex-wrap: wrap;
+  }
+  .geo-browser-rel {
+    flex-wrap: wrap;
+    white-space: normal;
+  }
+  .geo-browser-tools {
+    flex-wrap: wrap;
+  }
+  .geo-browser-tools > .geo-browser-find {
+    flex-basis: 100%;
+  }
+  .geo-browser-seg {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .geo-browser-find > input.f {
+    height: 34px;
+    min-height: 34px;
+    font-size: 14px;
+  }
+  .geo-browser-nav-row {
+    height: 36px;
+    font-size: 13px;
+  }
+  .geo-browser-grid {
+    column-gap: 14px;
+  }
+  .geo-browser-entry {
+    height: 28px;
+  }
+  .geo-browser-reason {
+    display: none;
+  }
 }

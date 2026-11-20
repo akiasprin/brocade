@@ -104,12 +104,15 @@ export function ChoiceSelect({
   onChange,
   className,
   menuAlign,
+  singleChevron = false,
   ...props
 }: Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'onChange' | 'value'> & {
   children: ReactNode;
   value: string | number;
   onChange: (event: { target: { value: string } }) => void;
   menuAlign?: 'end' | 'below';
+  /** DNS 的紧凑控件使用与原生 select 一致的单箭头，避免双字符箭头在窄屏换行。 */
+  singleChevron?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const anchor = useRef<HTMLButtonElement>(null);
@@ -125,7 +128,7 @@ export function ChoiceSelect({
         ref={anchor}
         value={String(value)}
         type="button"
-        className={`choice-select ${className ?? ''}`}
+        className={`choice-select${singleChevron ? ' choice-select-single' : ''} ${className ?? ''}`}
         role="combobox"
         aria-haspopup="listbox"
         aria-expanded={open}
@@ -139,8 +142,14 @@ export function ChoiceSelect({
         }}
       >
         <span>{selected?.text ?? String(value)}</span>
-        <span className="choice-chevron" aria-hidden="true">
-          ⌃<br />⌄
+        <span className={`choice-chevron${singleChevron ? ' single' : ''}`} aria-hidden="true">
+          {singleChevron ? (
+            <Icon of="chevronDown" size={14} />
+          ) : (
+            <>
+              ⌃<br />⌄
+            </>
+          )}
         </span>
       </button>
       {open && (

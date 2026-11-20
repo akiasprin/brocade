@@ -12,7 +12,7 @@ async function pickGeosite(page: Page, row: ReturnType<Page['locator']>, value: 
   for (const selected of await row.getByRole('button', { name: /^移除 / }).all()) await selected.click();
   await row.getByRole('combobox', { name: /DNS 匹配内容/ }).click();
   const menu = page.getByRole('dialog', { name: 'geosite 选项', exact: true });
-  await menu.getByRole('textbox', { name: '搜索 geosite', exact: true }).fill(value);
+  await menu.getByRole('combobox', { name: '搜索 geosite', exact: true }).fill(value);
   await menu.getByRole('option', { name: value, exact: true }).click();
   await page.keyboard.press('Escape');
   await expect(menu).toHaveCount(0);
@@ -188,9 +188,34 @@ test('scrolls the rules container while dragging to a row beyond the viewport', 
   await page.mouse.move(handle!.x + handle!.width / 2, handle!.y + handle!.height / 2);
   await page.mouse.down();
   await page.mouse.move(handle!.x + handle!.width / 2, 790, { steps: 8 });
+  const scroller = page.locator('[data-dns-preview-scroll]');
+  expect(await scroller.evaluate(element => element.scrollHeight - element.clientHeight)).toBeGreaterThan(200);
+  // 拖到视口底部时容器自动滚到最后一条策略。
   await expect
-    .poll(() => page.locator('[data-dns-preview-scroll]').evaluate(element => element.scrollTop))
-    .toBeGreaterThan(400);
+    .poll(() => scroller.evaluate(element => element.scrollHeight - element.clientHeight - element.scrollTop))
+    .toBeLessThanOrEqual(1);
   await page.mouse.up();
   await expectDnsOrder(page, ['disney', 'google', 'category-ai-!cn']);
 });
+
+for (const width of [1440, 390])
+  for (const theme of ['light', 'dark']) {
+    test(`DNS policy removal ${width} ${theme}`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 });
+      await page.goto(`/tests/fixtures/dns-groups-preview.html?theme=${theme}&scene=editing`);
+      await expect(page.getByRole('button', { name: /删除 DNS 策略/ })).toHaveCount(3);
+      await page.getByRole('button', { name: '删除 DNS 策略（geosite disney）', exact: true }).click();
+      const undo = page.getByRole('button', { name: '撤销删除 DNS 策略（geosite disney）', exact: true });
+      await expect(undo).toBeFocused();
+      await expect(page.getByText('保存后移除')).toBeVisible();
+      await expect(page.getByRole('button', { name: '保存到草稿' })).toBeEnabled();
+      await page.getByRole('button', { name: '删除 DNS 策略（geosite google）', exact: true }).hover();
+      await waitForVisualAssets(page);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+      await expect(page).toHaveScreenshot(`dns-removal-${width}-${theme}.png`, { fullPage: true });
+      await undo.click();
+      await expect(page.getByText('保存后移除')).toHaveCount(0);
+      await expect(page.getByRole('button', { name: '删除 DNS 策略（geosite disney）', exact: true })).toBeFocused();
+      await expect(page.getByRole('button', { name: '保存到草稿' })).toBeDisabled();
+    });
+  }

@@ -107,7 +107,7 @@ import { configHandoffForceCandidate, type ConfigHandoffForceCandidate } from '.
 import { useNodeTokenReceipt } from '../ui/node-token-receipt';
 import { fetchPreviewStatus } from '../preview/api';
 import { PreviewProvision, type PreviewWizDrill } from '../preview/provision';
-import { can, isVisitor, useSession } from '../session';
+import { can, isPublic, isVisitor, useSession } from '../session';
 import { Ago, Confirm, Empty, EmptyState, ErrorBox, Loading, SegmentedControl, SegSwitch } from '../ui/bits';
 import { FieldLoading, PanelLoading } from '../ui/loading';
 import { Icon, PanelTitle, type IconName } from '../ui/icons';
@@ -5392,12 +5392,14 @@ function NodeChainRuleTree({
   use,
   nodes,
   readOnly = false,
+  hideEditControls = false,
   settingsReadable = true,
 }: {
   nodeId: string;
   use: NodeChainUse;
   nodes: NodeAgentStateItem[];
   readOnly?: boolean;
+  hideEditControls?: boolean;
   settingsReadable?: boolean;
 }) {
   return (
@@ -5412,6 +5414,7 @@ function NodeChainRuleTree({
         showHeader={false}
         machineRole={use.role}
         readOnly={readOnly}
+        hideEditControls={hideEditControls}
         settingsReadable={settingsReadable}
       />
     </div>
@@ -5462,6 +5465,7 @@ function NodeChainsSection({
   snapshotReady: boolean;
   snapshotError?: unknown;
 }) {
+  const hideEditControls = isPublic(useSession().who);
   if (!snapshotReady) return <NodeRuleCardState kind="chains" error={snapshotError} />;
   return (
     <Suspense fallback={<NodeRuleCardState kind="chains" />}>
@@ -5469,9 +5473,16 @@ function NodeChainsSection({
         <PanelTitle of="chains">链路规则</PanelTitle>
         <span className="rule-sheet-meta header-stat">{inChains.length} 条</span>
         <span className="sp" />
-        <button className="btn" disabled={!canCreate} title="以当前机器作为入口" onClick={() => go({ p: 'chain', id })}>
-          添加新链
-        </button>
+        {!hideEditControls && (
+          <button
+            className="btn"
+            disabled={!canCreate}
+            title="以当前机器作为入口"
+            onClick={() => go({ p: 'chain', id })}
+          >
+            添加新链
+          </button>
+        )}
       </header>
 
       {inChains.length === 0 ? null : canEdit ? (
@@ -5505,6 +5516,7 @@ function NodeChainsSection({
               use={use}
               nodes={nodes}
               readOnly
+              hideEditControls={hideEditControls}
               settingsReadable={settingsReadable}
             />
           ))}

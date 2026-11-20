@@ -1,7 +1,7 @@
 import { StrictMode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NodesPane } from '../src/panes/nodes';
 import { SessionProvider } from '../src/session';
 import { draft } from '../src/draft';
@@ -10,6 +10,11 @@ import { cacheEntries, responses, nodeId, snapshot } from './fixtures/node-detai
 import { geodataFixture } from './fixtures/geodata-data';
 
 const clients: QueryClient[] = [];
+beforeAll(async () => {
+  // These cases gate API responses; module download states have separate browser coverage.
+  // Resolve the lazy modules first so cold transforms cannot consume the pending-state assertion.
+  await Promise.all([import('../src/panes/chains'), import('../src/panes/rules')]);
+});
 const deferred = () => {
   let resolve!: (response: Response) => void;
   const promise = new Promise<Response>(done => {
