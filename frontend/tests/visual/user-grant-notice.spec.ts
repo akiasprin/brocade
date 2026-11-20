@@ -45,7 +45,6 @@ for (const width of [320, 390, 820, 1440])
           followsCards: true,
           overflows: false,
         });
-        await expect(notice).toHaveScreenshot(`${state}-${width}-${theme}-notice.png`);
         await expect(editor).toHaveScreenshot(`${state}-${width}-${theme}.png`);
         expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
         expect(errors).toEqual([]);

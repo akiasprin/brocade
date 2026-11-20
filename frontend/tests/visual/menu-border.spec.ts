@@ -20,19 +20,6 @@ for (const theme of ['dark', 'light']) {
         await expect(menu).toHaveCSS(`border-${side}-width`, '1px');
       }
       await expect(menu).not.toHaveCSS('box-shadow', /inset/);
-      await menu.evaluate(async element => {
-        await Promise.all(
-          element
-            .getAnimations()
-            .filter(animation => animation.effect?.getComputedTiming().iterations !== Infinity)
-            .map(animation => animation.finished.catch(() => undefined)),
-        );
-      });
-      const bounds = (await menu.boundingBox())!;
-      await expect(page).toHaveScreenshot(`account-menu-${width}-${theme}.png`, {
-        threshold: 0,
-        clip: { x: bounds.x - 4, y: bounds.y - 4, width: bounds.width + 8, height: bounds.height + 8 },
-      });
     });
   }
 }

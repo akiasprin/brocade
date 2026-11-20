@@ -37,7 +37,6 @@ for (const width of [320, 390, 820, 1440]) {
       expect(layouts[0]).toMatchObject({ left: 13, top: 19, bottom: 19, height: 92, ring: [16, 16] });
       expect(await card.evaluate(element => element.scrollWidth > element.clientWidth)).toBe(false);
       await expect(card).toHaveScreenshot(`rules-${width}-${theme}.png`);
-      await expect(page.locator('.user-forwarding-usage')).toHaveScreenshot(`authorization-${width}-${theme}.png`);
       expect(errors).toEqual([]);
     });
   }

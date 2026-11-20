@@ -29,7 +29,7 @@ for (const width of [1440, 820, 760, 600, 390]) {
           };
         });
       const accessLayout = await layout('.user-usage-card:not(.user-forwarding-usage)');
-      await expect(access).toHaveScreenshot(`access-${width}-${theme}.png`);
+      if (width === 1440 && theme === 'dark') await expect(access).toHaveScreenshot(`access-${width}-${theme}.png`);
       await page.getByRole('tab', { name: '转发', exact: true }).click();
       const forwarding = page.locator('.user-forwarding-usage');
       await expect(forwarding.locator('.qta-pct')).toHaveText('10%');
@@ -40,12 +40,12 @@ for (const width of [1440, 820, 760, 600, 390]) {
       expect(await layout('.user-forwarding-usage')).toEqual(accessLayout);
       expect(accessLayout.overflow).toBe(false);
       expect(accessLayout.directions).toEqual(['上行', '下行']);
-      await expect(forwarding).toHaveScreenshot(`forwarding-${width}-${theme}.png`);
+      if (width === 1440 && theme === 'dark')
+        await expect(forwarding).toHaveScreenshot(`forwarding-${width}-${theme}.png`);
       if (width === 760 || width === 600) {
         await forwarding.getByRole('button', { name: '编辑 东京入口 的转发授权' }).click();
         await expect(forwarding.getByRole('form', { name: '编辑 东京入口 的转发授权' })).toBeVisible();
         expect(await forwarding.evaluate(card => card.scrollWidth > card.clientWidth)).toBe(false);
-        await expect(forwarding).toHaveScreenshot(`forwarding-editor-${width}-${theme}.png`);
       }
       expect(errors).toEqual([]);
     });

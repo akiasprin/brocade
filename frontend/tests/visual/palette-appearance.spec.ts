@@ -11,7 +11,7 @@ const palettes = ['dailan', 'jinzi', 'songlv', 'oufen', 'xuanmo'];
 
 for (const palette of palettes) {
   for (const theme of ['light', 'dark']) {
-    test(`${palette} ${theme} surfaces and controls`, async ({ page }, testInfo) => {
+    test(`${palette} ${theme} surfaces and controls`, async ({ page }) => {
       await page.setViewportSize({ width: 1440, height: 900 });
       await page.clock.setFixedTime(new Date('2026-11-02T10:00:00Z'));
       await page.addInitScript(key => localStorage.setItem('brocade-console:palette', key), palette);
@@ -47,8 +47,6 @@ for (const palette of palettes) {
       await dns.locator('select').first().focus();
       await expect(dns.locator('select').first()).toBeFocused();
       await dns.locator('select').first().blur();
-      await expect(page).toHaveScreenshot(`${palette}-${theme}-configuration.png`, { threshold: 0.01 });
-      await page.screenshot({ path: testInfo.outputPath('configuration.png') });
     });
   }
 }

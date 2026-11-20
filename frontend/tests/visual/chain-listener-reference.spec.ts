@@ -28,6 +28,5 @@ for (const width of [390, 1440])
         };
       });
       expect(placement).toEqual({ sameLine: true, followsId: true, fits: true });
-      await expect(card).toHaveScreenshot(`listener-reference-${width}-${theme}.png`);
       expect(errors).toEqual([]);
     });

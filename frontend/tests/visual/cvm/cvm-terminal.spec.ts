@@ -266,6 +266,8 @@ test('connection failure offers an explicit retry', async ({ page }) => {
 for (const width of [1440, 390, 320])
   for (const theme of ['dark', 'light']) {
     test(`WebShell management ${width} ${theme}`, async ({ page }) => {
+      // Host reports in this scene are dated Nov 4; keep their relative labels stable.
+      await page.clock.setFixedTime(new Date('2026-11-18T12:00:00Z'));
       await page.setViewportSize({ width, height: 900 });
       await page.goto(`/tests/fixtures/cvm/preview.html?scene=terminal-management&theme=${theme}`);
       await page.getByRole('tab', { name: '宿主', exact: true }).click();

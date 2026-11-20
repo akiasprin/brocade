@@ -18,9 +18,22 @@ for (const engine of ['chromium', 'webkit'] as const) {
             timezoneId: 'Asia/Singapore',
           });
           try {
+            // Start in the requested appearance; this test measures scrolling, not the
+            // boot-time palette transition that WebKit can capture between two paints.
+            await page.addInitScript(theme => {
+              localStorage.setItem('brocade-console:theme', theme);
+              document.documentElement.dataset.theme = theme;
+              document.documentElement.dataset.palette = 'dailan';
+            }, theme);
             await page.clock.setFixedTime(new Date('2026-11-02T10:00:00Z'));
             await page.setViewportSize({ width, height: 900 });
             await page.goto(`/tests/fixtures/navigation-preview.html?theme=${theme}#/nodes/node/jp-iij`);
+            // WebKit can restart reduced-motion transitions between screenshot samples.
+            // Keep this static scroll check motion-free for the whole capture sequence.
+            await page.addStyleTag({
+              content:
+                '@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }',
+            });
             const header = page.locator('.fg-top');
             const desk = page.locator('.fg-desk');
             await expect(header).toBeVisible();
@@ -45,6 +58,7 @@ for (const engine of ['chromium', 'webkit'] as const) {
             }
             await waitForVisualAssets(page);
             await expect(page).toHaveScreenshot(`${engine}-${width}-${theme}-scrolled.png`, {
+              animations: 'allow',
               clip: { x: 0, y: 0, width, height: 210 },
             });
 

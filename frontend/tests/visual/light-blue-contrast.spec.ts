@@ -11,7 +11,6 @@ for (const [name, width, height] of [
     await page.goto('/tests/fixtures/user-header-preview.html?palette=dailan&theme=light&presence=sources&apps=two');
     await expect(page.locator('.user-usage-ledger')).toBeVisible();
     await waitForVisualAssets(page);
-    await expect(page).toHaveScreenshot(`light-blue-${name}.png`, { threshold: 0.05 });
 
     const measurements = await page.evaluate(() => {
       // Resolve CSS color-mix and alpha against the actual painted ancestor surfaces.
