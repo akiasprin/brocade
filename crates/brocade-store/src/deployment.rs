@@ -4550,8 +4550,9 @@ async fn restore_model_snapshot_tx(
     restore_tenants_tx(tx, revision_id, snapshot).await?;
     restore_users_tx(tx, revision_id, snapshot).await?;
     restore_nodes_tx(tx, revision_id, snapshot).await?;
-    clear_app_model_tx(tx).await?;
+    prepare_app_model_restore_tx(tx, snapshot).await?;
     restore_apps_tx(tx, revision_id, snapshot, &warp_binding_tokens).await?;
+    remove_obsolete_app_model_tx(tx, snapshot).await?;
     for grant in suspended_grants {
         sqlx::query(
             "INSERT INTO grants(app_id,tenant_id,user_id,ingress_id,created_revision)
@@ -5051,7 +5052,15 @@ async fn restore_warp_bindings_tx(
                 (outbound_id, node_id, device_id, account_id, access_token_sealed,
                  private_key_sealed, peer_public_key, local_addresses,
                  endpoint_address, endpoint_port, registered_at, created_revision)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::timestamptz, $12)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::timestamptz, $12)
+             ON CONFLICT (outbound_id,node_id) DO UPDATE SET
+                 device_id=EXCLUDED.device_id, account_id=EXCLUDED.account_id,
+                 access_token_sealed=EXCLUDED.access_token_sealed,
+                 private_key_sealed=EXCLUDED.private_key_sealed,
+                 peer_public_key=EXCLUDED.peer_public_key,
+                 local_addresses=EXCLUDED.local_addresses,
+                 endpoint_address=EXCLUDED.endpoint_address, endpoint_port=EXCLUDED.endpoint_port,
+                 registered_at=EXCLUDED.registered_at",
         )
         .bind(&outbound.id)
         .bind(&binding.node)
@@ -5071,19 +5080,117 @@ async fn restore_warp_bindings_tx(
     Ok(())
 }
 
-async fn clear_app_model_tx(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+/// Replace configuration relationships without replacing the stable entities referenced by
+/// operational policies and observations. All intermediate wire shapes remain transaction-local.
+async fn prepare_app_model_restore_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    snapshot: &ModelSnapshot,
+) -> Result<()> {
     for statement in [
         "DELETE FROM front_external_vias",
         "DELETE FROM front_vias",
         "DELETE FROM grants",
         "DELETE FROM steps",
-        "DELETE FROM ingresses",
-        "DELETE FROM fronts",
-        "DELETE FROM chains",
-        "DELETE FROM apps",
-        "DELETE FROM external_outbounds",
     ] {
         sqlx::query(statement).execute(&mut **tx).await?;
+    }
+    // The TCP/UDP port indexes are immediate, so updating rows directly would reject a port
+    // swap. Release only their predicates, retaining every ingress ID and its dependants.
+    // A temporary MTProxy wire satisfies has_a_wire; among 1..3 a port distinct from the two
+    // non-indexed listeners always exists. restore_app_tx writes every original wire column
+    // before the transaction can commit; discarded rows are removed afterwards.
+    sqlx::query(
+        "UPDATE ingresses SET transport_kind = NULL, hy2_enabled = FALSE, hy2_port = NULL,
+             hy2_hop_start = NULL, hy2_hop_end = NULL,
+             mtproto_port = (SELECT p FROM generate_series(1,3) p
+                 WHERE p IS DISTINCT FROM anytls_port
+                   AND p IS DISTINCT FROM vless_encryption_port ORDER BY p LIMIT 1)",
+    )
+    .execute(&mut **tx)
+    .await?;
+
+    // Device IDs are globally unique. Remove only bindings whose identity actually changes,
+    // before restoring devices which may move between binding slots. Keep unchanged bindings.
+    let bindings = snapshot
+        .external_outbounds
+        .iter()
+        .flat_map(|outbound| {
+            outbound
+                .bindings
+                .iter()
+                .map(move |binding| (outbound.id.as_str(), binding))
+        })
+        .collect::<Vec<_>>();
+    sqlx::query(
+        "DELETE FROM external_outbound_bindings b WHERE NOT EXISTS (
+             SELECT FROM unnest($1::text[],$2::text[],$3::text[])
+                 AS target(outbound_id,node_id,device_id)
+             WHERE target.outbound_id=b.outbound_id AND target.node_id=b.node_id
+                 AND target.device_id=b.device_id)",
+    )
+    .bind(bindings.iter().map(|(id, _)| *id).collect::<Vec<_>>())
+    .bind(
+        bindings
+            .iter()
+            .map(|(_, b)| b.node.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        bindings
+            .iter()
+            .map(|(_, b)| b.device_id.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn remove_obsolete_app_model_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    snapshot: &ModelSnapshot,
+) -> Result<()> {
+    // Delete children before parents, after all surviving entities have been upserted. Cascades
+    // now describe real entity removal rather than the implementation of model restoration.
+    for (statement, ids) in [
+        (
+            "DELETE FROM ingresses WHERE NOT (id=ANY($1::text[]))",
+            snapshot
+                .apps
+                .iter()
+                .flat_map(|a| a.ingresses.iter().map(|i| i.id.as_str()))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "DELETE FROM fronts WHERE NOT (id=ANY($1::text[]))",
+            snapshot
+                .apps
+                .iter()
+                .flat_map(|a| a.fronts.iter().map(|f| f.id.as_str()))
+                .collect(),
+        ),
+        (
+            "DELETE FROM chains WHERE NOT (id=ANY($1::text[]))",
+            snapshot
+                .apps
+                .iter()
+                .flat_map(|a| a.chains.iter().map(|c| c.id.as_str()))
+                .collect(),
+        ),
+        (
+            "DELETE FROM apps WHERE NOT (id=ANY($1::text[]))",
+            snapshot.apps.iter().map(|a| a.id.as_str()).collect(),
+        ),
+        (
+            "DELETE FROM external_outbounds WHERE NOT (id=ANY($1::text[]))",
+            snapshot
+                .external_outbounds
+                .iter()
+                .map(|o| o.id.as_str())
+                .collect(),
+        ),
+    ] {
+        sqlx::query(statement).bind(ids).execute(&mut **tx).await?;
     }
     Ok(())
 }
@@ -5146,7 +5253,8 @@ async fn restore_app_tx(
     let revision_id = revision_to_i64(revision_id)?;
     sqlx::query(
         "INSERT INTO apps (id, label, position, created_revision)
-         VALUES ($1, $2, $3, $4)",
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (id) DO UPDATE SET label=EXCLUDED.label, position=EXCLUDED.position",
     )
     .bind(&app.id)
     .bind(&app.label)
@@ -5163,7 +5271,10 @@ async fn restore_app_tx(
         sqlx::query(
             "INSERT INTO chains
                 (id, app_id, tenant_id, name, subscription_country, position, created_revision)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (id) DO UPDATE SET app_id=EXCLUDED.app_id, tenant_id=EXCLUDED.tenant_id,
+                 name=EXCLUDED.name, subscription_country=EXCLUDED.subscription_country,
+                 position=EXCLUDED.position",
         )
         .bind(&chain.id)
         .bind(&app.id)
@@ -5181,7 +5292,9 @@ async fn restore_app_tx(
     for front in &app.fronts {
         sqlx::query(
             "INSERT INTO fronts (id, app_id, tenant_id, name, strategy, created_revision)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (id) DO UPDATE SET app_id=EXCLUDED.app_id, tenant_id=EXCLUDED.tenant_id,
+                 name=EXCLUDED.name, strategy=EXCLUDED.strategy",
         )
         .bind(&front.id)
         .bind(&app.id)
@@ -5194,8 +5307,8 @@ async fn restore_app_tx(
     }
 
     for ingress in &app.ingresses {
-        // Every column the compiler later reads has to be written here, because a rollback
-        // deletes the rows first. Anything left out silently reverts to its default — which is
+        // Every column the compiler later reads has to be written here, including the wire
+        // columns temporarily released before restoration. Anything left out silently reverts to its default — which is
         // how a rollback used to turn an XHTTP ingress back into a TCP one and drop projections
         // on the floor.
         //
@@ -5327,7 +5440,76 @@ async fn restore_app_tx(
                 $49, $50, $51,
                 $52, $53, $54, $55, $56, $57, $58, $59, $60,
                 $61, $62, $63, $64, $65, $66, $67, $68, $69, $70
-             )",
+             )
+             ON CONFLICT (id) DO UPDATE SET
+                app_id = EXCLUDED.app_id,
+                chain_id = EXCLUDED.chain_id,
+                node_id = EXCLUDED.node_id,
+                bind = EXCLUDED.bind,
+                port = EXCLUDED.port,
+                front_id = EXCLUDED.front_id,
+                reality_private_key = EXCLUDED.reality_private_key,
+                reality_public_key = EXCLUDED.reality_public_key,
+                reality_short_ids = EXCLUDED.reality_short_ids,
+                reality_dest = EXCLUDED.reality_dest,
+                reality_server_names = EXCLUDED.reality_server_names,
+                reality_flow = EXCLUDED.reality_flow,
+                reality_fallback_mode = EXCLUDED.reality_fallback_mode,
+                reality_fallback_limits = EXCLUDED.reality_fallback_limits,
+                reality_fallback_guard = EXCLUDED.reality_fallback_guard,
+                transport_kind = EXCLUDED.transport_kind,
+                hy2_enabled = EXCLUDED.hy2_enabled,
+                xhttp_path = EXCLUDED.xhttp_path,
+                xhttp_mode = EXCLUDED.xhttp_mode,
+                hy2_port = EXCLUDED.hy2_port,
+                hy2_hop_start = EXCLUDED.hy2_hop_start,
+                hy2_hop_end = EXCLUDED.hy2_hop_end,
+                hy2_up = EXCLUDED.hy2_up,
+                hy2_down = EXCLUDED.hy2_down,
+                hy2_congestion = EXCLUDED.hy2_congestion,
+                hy2_obfs_password = EXCLUDED.hy2_obfs_password,
+                hy2_masquerade_kind = EXCLUDED.hy2_masquerade_kind,
+                hy2_masquerade_url = EXCLUDED.hy2_masquerade_url,
+                projection_v4_host = EXCLUDED.projection_v4_host,
+                projection_v4_port = EXCLUDED.projection_v4_port,
+                projection_v6_host = EXCLUDED.projection_v6_host,
+                projection_v6_port = EXCLUDED.projection_v6_port,
+                guard_no_private = EXCLUDED.guard_no_private,
+                guard_no_bittorrent = EXCLUDED.guard_no_bittorrent,
+                guard_no_mail = EXCLUDED.guard_no_mail,
+                guard_no_udp_amplification = EXCLUDED.guard_no_udp_amplification,
+                guard_tcp_and_quic_only = EXCLUDED.guard_tcp_and_quic_only,
+                hy2_bbr_profile = EXCLUDED.hy2_bbr_profile,
+                hy2_quic_init_stream_window = EXCLUDED.hy2_quic_init_stream_window,
+                hy2_quic_max_stream_window = EXCLUDED.hy2_quic_max_stream_window,
+                hy2_quic_init_conn_window = EXCLUDED.hy2_quic_init_conn_window,
+                hy2_quic_max_conn_window = EXCLUDED.hy2_quic_max_conn_window,
+                hy2_quic_max_idle_secs = EXCLUDED.hy2_quic_max_idle_secs,
+                hy2_quic_keepalive_secs = EXCLUDED.hy2_quic_keepalive_secs,
+                hy2_quic_max_incoming_streams = EXCLUDED.hy2_quic_max_incoming_streams,
+                hy2_quic_disable_pmtud = EXCLUDED.hy2_quic_disable_pmtud,
+                xhttp_tuning = EXCLUDED.xhttp_tuning,
+                xhttp_download_v4_origin_port = EXCLUDED.xhttp_download_v4_origin_port,
+                xhttp_download_v6_origin_port = EXCLUDED.xhttp_download_v6_origin_port,
+                anytls_enabled = EXCLUDED.anytls_enabled,
+                anytls_port = EXCLUDED.anytls_port,
+                anytls_padding_scheme = EXCLUDED.anytls_padding_scheme,
+                anytls_masquerade_kind = EXCLUDED.anytls_masquerade_kind,
+                anytls_masquerade_content = EXCLUDED.anytls_masquerade_content,
+                anytls_masquerade_headers = EXCLUDED.anytls_masquerade_headers,
+                anytls_masquerade_status_code = EXCLUDED.anytls_masquerade_status_code,
+                anytls_security = EXCLUDED.anytls_security,
+                anytls_reality = EXCLUDED.anytls_reality,
+                anytls_reality_private_key = EXCLUDED.anytls_reality_private_key,
+                anytls_reality_public_key = EXCLUDED.anytls_reality_public_key,
+                anytls_reality_short_ids = EXCLUDED.anytls_reality_short_ids,
+                vless_encryption_port = EXCLUDED.vless_encryption_port,
+                vless_encryption_private_key = EXCLUDED.vless_encryption_private_key,
+                vless_encryption_public_key = EXCLUDED.vless_encryption_public_key,
+                vless_encryption_options = EXCLUDED.vless_encryption_options,
+                protocol_projection = EXCLUDED.protocol_projection,
+                mtproto_port = EXCLUDED.mtproto_port,
+                guard_cn_source_block = EXCLUDED.guard_cn_source_block",
         )
         .bind(&ingress.id)
         .bind(&app.id)
@@ -7598,67 +7780,6 @@ pub struct DiscardPendingResult {
     pub restored_from_revision: u64,
 }
 
-async fn stage_discard_chain_probe_observations_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    retained_chain_ids: &[String],
-) -> Result<()> {
-    // Restoring a model currently replaces every chain row. Both probe tables intentionally
-    // cascade from chains, so keep the observations in transaction-local tables while that
-    // replacement happens. Restrict the copy to chains in the restored model: observations for
-    // a chain created only by the discarded revisions must disappear with that chain.
-    sqlx::query(
-        "CREATE TEMPORARY TABLE discard_pending_e2e_probes
-         ON COMMIT DROP AS
-         SELECT probe.*
-         FROM e2e_probes probe
-         WHERE probe.chain_id = ANY($1)",
-    )
-    .bind(retained_chain_ids)
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(
-        "CREATE TEMPORARY TABLE discard_pending_e2e_probe_samples
-         ON COMMIT DROP AS
-         SELECT sample.*
-         FROM e2e_probe_samples sample
-         WHERE sample.chain_id = ANY($1)",
-    )
-    .bind(retained_chain_ids)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-async fn restore_discarded_chain_probe_observations_tx(
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO e2e_probe_samples (chain_id, probed_at, status, ttfb_ms)
-         SELECT saved.chain_id, saved.probed_at, saved.status, saved.ttfb_ms
-         FROM discard_pending_e2e_probe_samples saved
-         JOIN chains chain ON chain.id = saved.chain_id
-         ON CONFLICT (chain_id, probed_at) DO NOTHING",
-    )
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(
-        "INSERT INTO e2e_probes (
-             chain_id, app_id, node_id, status, ttfb_ms, exit_ip, exit_loc,
-             exit_verdict, detail, probed_at, updated_at
-         )
-         SELECT saved.chain_id, chain.app_id, saved.node_id, saved.status, saved.ttfb_ms,
-                saved.exit_ip, saved.exit_loc, saved.exit_verdict, saved.detail,
-                saved.probed_at, saved.updated_at
-         FROM discard_pending_e2e_probes saved
-         JOIN chains chain ON chain.id = saved.chain_id
-         JOIN nodes node ON node.id = saved.node_id
-         ON CONFLICT (chain_id) DO NOTHING",
-    )
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
 pub async fn discard_pending_changes(
     pool: &PgPool,
     actor: &AdminContext,
@@ -7776,15 +7897,8 @@ pub async fn discard_pending_changes(
         .config;
     let restore_snapshot =
         preserve_immediate_fields(restore_snapshot, &current_snapshot, &client_config);
-    let retained_chain_ids = restore_snapshot
-        .apps
-        .iter()
-        .flat_map(|app| app.chains.iter().map(|chain| chain.id.clone()))
-        .collect::<Vec<_>>();
-    stage_discard_chain_probe_observations_tx(&mut tx, &retained_chain_ids).await?;
     let new_revision = console::insert_revision(&mut tx, &actor_id, &note).await?;
     restore_model_snapshot_tx(&mut tx, new_revision, &restore_snapshot).await?;
-    restore_discarded_chain_probe_observations_tx(&mut tx).await?;
     // Restoring the last published snapshot does not need a new permission release: those are
     // exactly the grants already represented by the published baseline.  The discarded
     // revisions' queued jobs are canceled below under the same automation lock.

@@ -30591,3 +30591,6 @@ mod ip_maintenance_tests;
 
 #[path = "cases/list_automation_status.rs"]
 mod list_automation_status_tests;
+
+#[path = "cases/model_restore_state.rs"]
+mod model_restore_state_tests;
