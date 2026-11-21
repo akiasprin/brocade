@@ -64,44 +64,52 @@ function machineHop(view: ReturnType<typeof render>, node: string) {
 }
 
 describe('访客查看链路规则', () => {
-  it.each([undefined, 'target'])('默认显示可视化，切换列表后只展开入口或当前机器（当前机器：%s）', async selected => {
-    const client = await visitorClientWithCachedForbidden();
-    const steps: SnapshotStep[] = [
-      {
-        ...step,
-        rules: [{ m: { t: 'any' }, a: { t: 'forward', to: 'target', dial: { t: 'overlay' }, pool: { t: 'none' } } }],
-      },
-      { ...step, node: 'target' },
-      { ...step, node: 'orphan' },
-    ];
-    const view = render(
-      <QueryClientProvider client={client}>
-        <ChainRulesPanel
-          appId="app-1"
-          chain={chain}
-          spine={['entry', 'target']}
-          steps={steps}
-          nodes={[]}
-          selected={selected}
-          readOnly
-          settingsReadable={false}
-        />
-      </QueryClientProvider>,
-    );
-    const toggle = view.getByRole('switch', { name: `${chain.name}：链路可视化`, checked: true });
-    expect(view.getByRole('combobox', { name: '追踪域名或 IP' })).toBeTruthy();
-    expect(view.container.querySelector<HTMLElement>('.chain-rule-section-list')?.hidden).toBe(true);
-    fireEvent.click(toggle);
-    expect(toggle.getAttribute('aria-checked')).toBe('false');
-    expect(view.getByRole('button', { name: /^entry/ }).getAttribute('aria-expanded')).toBe(
-      String(selected !== 'target'),
-    );
-    expect(view.getByRole('button', { name: /^target/ }).getAttribute('aria-expanded')).toBe(
-      String(selected === 'target'),
-    );
-    expect(view.getByRole('button', { name: /^orphan/ }).getAttribute('aria-expanded')).toBe('false');
-    expect(view.container.querySelectorAll('.chain-rule-body:not([hidden])')).toHaveLength(1);
-  });
+  it.each([
+    { selected: undefined, machineRole: undefined },
+    { selected: 'target', machineRole: undefined },
+    { selected: 'target', machineRole: '中转节点' },
+  ])(
+    '默认显示可视化，切换列表后默认全部收起（当前机器：$selected，本机角色：$machineRole）',
+    async ({ selected, machineRole }) => {
+      const client = await visitorClientWithCachedForbidden();
+      const steps: SnapshotStep[] = [
+        {
+          ...step,
+          rules: [{ m: { t: 'any' }, a: { t: 'forward', to: 'target', dial: { t: 'overlay' }, pool: { t: 'none' } } }],
+        },
+        { ...step, node: 'target' },
+        { ...step, node: 'orphan' },
+      ];
+      const view = render(
+        <QueryClientProvider client={client}>
+          <ChainRulesPanel
+            appId="app-1"
+            chain={chain}
+            spine={['entry', 'target']}
+            steps={steps}
+            nodes={[]}
+            selected={selected}
+            machineRole={machineRole}
+            readOnly
+            settingsReadable={false}
+          />
+        </QueryClientProvider>,
+      );
+      const toggle = view.getByRole('switch', { name: `${chain.name}：链路可视化`, checked: true });
+      expect(view.getByRole('combobox', { name: '追踪域名或 IP' })).toBeTruthy();
+      expect(view.container.querySelector<HTMLElement>('.chain-rule-section-list')?.hidden).toBe(true);
+      fireEvent.click(toggle);
+      expect(toggle.getAttribute('aria-checked')).toBe('false');
+      const entryHead = view.getByRole('button', { name: /^entry/ });
+      expect(entryHead.getAttribute('aria-expanded')).toBe('false');
+      expect(view.getByRole('button', { name: /^target/ }).getAttribute('aria-expanded')).toBe('false');
+      expect(view.getByRole('button', { name: /^orphan/ }).getAttribute('aria-expanded')).toBe('false');
+      expect(view.container.querySelectorAll('.chain-rule-body:not([hidden])')).toHaveLength(0);
+      fireEvent.click(entryHead);
+      expect(entryHead.getAttribute('aria-expanded')).toBe('true');
+      expect(view.container.querySelectorAll('.chain-rule-body:not([hidden])')).toHaveLength(1);
+    },
+  );
 
   it('按需展开后折叠仍保留未保存输入，并支持键盘展开', async () => {
     const client = await visitorClientWithCachedForbidden();

@@ -328,6 +328,8 @@ test('seven chains keep independent modes, queries, draft inputs and scoped rule
     await expect(section.getByRole('combobox', { name: '追踪域名或 IP' })).toBeVisible();
   }
   await first.getByRole('switch').click();
+  await expect(first.locator('.chain-rule-node-head[aria-expanded="true"]')).toHaveCount(0);
+  await first.locator('.chain-rule-node-head').first().click();
   const input = first.getByRole('textbox', { name: '匹配内容（规则 1）', exact: true });
   await input.fill('unsaved.example');
   await first.getByRole('switch').click();
@@ -368,6 +370,8 @@ test('readonly users can inspect and trace without enabling any rule writes', as
   await page.getByRole('combobox', { name: '追踪域名或 IP' }).fill('192.0.2.1');
   await expect(page.getByRole('status')).toContainText('需节点嗅探结果');
   await page.getByRole('switch').click();
+  await expect(page.locator('.chain-rule-node-head[aria-expanded="true"]')).toHaveCount(0);
+  await page.locator('.chain-rule-node-head').first().click();
   await expect(page.getByRole('textbox', { name: '匹配内容（规则 1）' })).toBeDisabled();
 });
 

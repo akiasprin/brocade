@@ -338,8 +338,12 @@ describe('链详情统一等待首屏依赖', () => {
     const mode = view.getByRole('switch', { name: /：链路可视化$/, checked: true });
     expect(view.getByRole('combobox', { name: '追踪域名或 IP' })).toBeTruthy();
     fireEvent.click(mode);
-    // 列表编辑逐台展开机器规则表。
-    expect(view.getByRole('button', { name: /entry.*入口/ }).getAttribute('aria-expanded')).toBe('true');
+    // 列表编辑默认全部收起，点击机器行头后再按需展开。
+    const entryHead = view.getByRole('button', { name: /entry.*入口/ });
+    expect(entryHead.getAttribute('aria-expanded')).toBe('false');
+    expect(view.container.querySelector('.chain-rule-body:not([hidden])')).toBeNull();
+    fireEvent.click(entryHead);
+    expect(entryHead.getAttribute('aria-expanded')).toBe('true');
     expect(view.container.querySelector('.chain-rule-body:not([hidden]) .rule-editor')).toBeTruthy();
     expect(view.queryByRole('status')).toBeNull();
     expect(fetcher.mock.calls.map(([path]) => path).sort()).toEqual([
@@ -467,6 +471,7 @@ describe('链详情统一等待首屏依赖', () => {
     fireEvent.change(input, { target: { value: '继续编辑的名称' } });
     const page = view.container.querySelector('.chain-detailpage');
     fireEvent.click(view.getByRole('switch', { name: /：链路可视化$/, checked: true }));
+    fireEvent.click(view.getByRole('button', { name: /entry.*入口/ }));
     const editor = view.container.querySelector('.rule-editor')!;
     fireEvent.click(within(editor as HTMLElement).getByRole('button', { name: '＋ 加一条' }));
     const saveRules = view.getByRole('button', { name: '保存到草稿' }) as HTMLButtonElement;

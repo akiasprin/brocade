@@ -16,6 +16,10 @@ for (const [width, theme] of [
       );
       await page.getByRole('switch', { name: /：链路可视化$/, checked: true }).click();
       const tree = page.locator('.chain-rule-tree');
+      const head = tree.locator('.chain-rule-node-head[role="button"]');
+      await expect(head).toHaveAttribute('aria-expanded', 'false');
+      await head.click();
+      await expect(head).toHaveAttribute('aria-expanded', 'true');
       await expect(tree.locator('.rule-editor')).toHaveCount(1);
       await expect(tree.locator('.chain-rule-node-head .who > b')).toHaveText('香港 HKIX');
       await expect(tree.locator('.rule-editor-title')).toHaveCount(0);
@@ -35,7 +39,8 @@ async function openTwoHopRules(page: Page, role: 'public' | 'readonly' = 'public
   await page.getByRole('switch', { name: /：链路可视化$/, checked: true }).click();
   const tree = page.locator('.chain-rule-tree');
   await expect(tree.locator('.chain-rule-node-head[role="button"]')).toHaveCount(2);
-  await tree.locator('.chain-rule-node-head[aria-expanded="false"]').click();
+  const collapsed = tree.locator('.chain-rule-node-head[aria-expanded="false"]');
+  while ((await collapsed.count()) > 0) await collapsed.first().click();
   await expect(tree.locator('.chain-rule-table:visible')).toHaveCount(2);
   await waitForVisualAssets(page);
   return tree;
@@ -144,8 +149,8 @@ for (const width of [390, 1440]) {
     await page.getByRole('switch', { name: /：链路可视化$/, checked: true }).click();
     const tree = page.locator('.chain-rule-tree');
     await expect(tree.locator('.chain-rule-node-head[role="button"]')).toHaveCount(2);
-    await expect(tree.locator('.chain-rule-body:not([hidden])')).toHaveCount(1);
-    await expect(tree.locator('.chain-rule-node-head[role="button"]').nth(0)).toHaveAttribute('aria-expanded', 'true');
+    await expect(tree.locator('.chain-rule-body:not([hidden])')).toHaveCount(0);
+    await expect(tree.locator('.chain-rule-node-head[role="button"]').nth(0)).toHaveAttribute('aria-expanded', 'false');
     await expect(tree.locator('.chain-rule-node-head[role="button"]').nth(1)).toHaveAttribute('aria-expanded', 'false');
     await waitForVisualAssets(page);
     await expect(tree).toHaveScreenshot(`chain-folding-${width}.png`);

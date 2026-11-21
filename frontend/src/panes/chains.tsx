@@ -6602,8 +6602,8 @@ function ChainRulesPanelContent({
     return compilerFallbackRules(written, full);
   };
 
-  // 按出现路径保留手动展开/折叠；默认只展开当前机器（链详情中为入口）。同一张规则表
-  // 再次出现时仍默认折叠，避免把共享配置误认成多份独立配置。
+  // 按出现路径保留手动展开/折叠；链详情和机器详情均默认全部收起，点击机器行头再按需展开。同一张规则表
+  // 再次出现时同样默认折叠，避免把共享配置误认成多份独立配置。
   const [expansion, setExpansion] = useState<ReadonlyMap<string, boolean>>(() => new Map());
 
   const rootNodes = spine[0] ? [spine[0]] : rows.slice(0, 1).map(row => row.node);
@@ -6676,7 +6676,6 @@ function ChainRulesPanelContent({
       target.classList.remove('chain-rule-row-flash');
     };
   }, [visual, revealTarget]);
-  const initiallyExpanded = selected ?? rootNodes[0];
   // 先统计每台机器在树中出现的次数，出现两次以上的每一处都标「共享配置」——包括第一处：只标后续位置时，
   // 第一处会被误认为独占这份配置。遍历规则必须与下面的 renderNode 一致（相同的防环和防重复展开）。
   const occurrences = (() => {
@@ -6708,11 +6707,10 @@ function ChainRulesPanelContent({
     const repeated = rendered.has(node) || path.includes(node);
     if (!repeated) rendered.add(node);
     const occurrence = [...path, node].join('>');
-    // 机器详情中本机规则默认收起，点击机器标题再展开；链详情页仍默认展开入口。
-    const defaultExpanded = !repeated && !machineRole && node === initiallyExpanded;
-    const expanded = expansion.get(occurrence) ?? defaultExpanded;
+    // 链详情与机器详情的列表编辑均默认收起各机器规则表，点击机器行头再按需展开。
+    const expanded = expansion.get(occurrence) ?? false;
     const toggle = () =>
-      setExpansion(previous => new Map(previous).set(occurrence, !(previous.get(occurrence) ?? defaultExpanded)));
+      setExpansion(previous => new Map(previous).set(occurrence, !(previous.get(occurrence) ?? false)));
     const step = stepOf(node);
     const written = (draftRules[node] ?? step?.rules ?? []).length;
     const blockingReferences = referencesBlockingRemoval(node);
