@@ -1,7 +1,9 @@
 use super::*;
 
 async fn wait_for_lock(pool: &PgPool, pattern: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // The full PostgreSQL suite runs hundreds of tests concurrently on CI; lock observation
+    // needs scheduling headroom, while the deadlock assertion below remains separately bounded.
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let waiting: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM pg_stat_activity
