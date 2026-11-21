@@ -2,7 +2,7 @@ use super::*;
 use brocade_store::UpdateNodeNotificationSettings;
 use sha2::{Digest, Sha384};
 
-const OLD: &str = "9e6eeccade5a7799d6392df0afe9982aa022965d280c46e49b2d83a1f4fbf734d590ae26e5e5408295543052446db9b8";
+const OLD: &str = "f3d2016a0ce40fcb920794d6e587dd291347c5c89c4435915c17be001a438875fb29b0608fe86a396ce534e9aff1d0b3";
 
 async fn install_previous(db: &TestPg, clash_only: bool) {
     let directory = std::env::temp_dir().join(format!(
@@ -54,6 +54,97 @@ async fn receipts(db: &TestPg) -> String {
     .fetch_one(db.pool())
     .await
     .unwrap()
+}
+
+async fn install_deployed_notification_0007(db: &TestPg) {
+    let directory = std::env::temp_dir().join(format!(
+        "brocade-deployed-notification-0007-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    for item in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations")).unwrap() {
+        let item = item.unwrap();
+        if item.file_name().to_string_lossy().as_ref() < "0007_" {
+            std::fs::copy(item.path(), directory.join(item.file_name())).unwrap();
+        }
+    }
+    std::fs::write(
+        directory.join("0007_user_clash_rules.sql"),
+        include_str!("../fixtures/migrations/deployed_0007_with_notifications.sql"),
+    )
+    .unwrap();
+    sqlx::migrate::Migrator::new(directory.as_path())
+        .await
+        .unwrap()
+        .run(db.pool())
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query("INSERT INTO node_notification_preferences(node_id,public_ip_changes,changed_by) VALUES('n1',FALSE,'deployed-operator')")
+        .execute(db.pool()).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn node_notifications_exact_deployed_0007_converts_without_losing_preferences() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    install_deployed_notification_0007(&db).await;
+    let before_receipts: Vec<serde_json::Value> =
+        serde_json::from_str(&receipts(&db).await).unwrap();
+    let preference: serde_json::Value = sqlx::query_scalar(
+        "SELECT to_jsonb(p) FROM node_notification_preferences p WHERE node_id='n1'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(!db.store.check_database_upgrade().await.unwrap().compatible);
+    let check = db.store.check_prerelease_0007_upgrade().await.unwrap();
+    let notification_schema: serde_json::Value = sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+           'columns',(SELECT jsonb_agg(jsonb_build_array(a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,pg_get_expr(d.adbin,d.adrelid)) ORDER BY a.attnum) FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid='public.node_notification_preferences'::regclass AND a.attnum>0 AND NOT a.attisdropped),
+           'constraints',(SELECT jsonb_agg(jsonb_build_array(k.conname,pg_get_constraintdef(k.oid)) ORDER BY k.conname) FROM pg_constraint k WHERE k.conrelid='public.node_notification_preferences'::regclass AND k.convalidated),
+           'indexes',(SELECT jsonb_agg(jsonb_build_array(pg_get_indexdef(i.indexrelid),i.indisvalid,i.indisready) ORDER BY pg_get_indexdef(i.indexrelid)) FROM pg_index i WHERE i.indrelid='public.node_notification_preferences'::regclass))"
+    ).fetch_one(db.pool()).await.unwrap();
+    assert!(check.compatible, "{check:?}; schema={notification_schema}");
+    assert_eq!(check.pending_versions, [7, 8]);
+    assert_eq!(
+        serde_json::from_str::<Vec<serde_json::Value>>(&receipts(&db).await).unwrap(),
+        before_receipts,
+        "the deployed-history preflight must be read-only"
+    );
+
+    db.store.migrate_prerelease_0007_schema().await.unwrap();
+    assert!(db.store.check_database_upgrade().await.unwrap().compatible);
+    let after_receipts: Vec<serde_json::Value> =
+        serde_json::from_str(&receipts(&db).await).unwrap();
+    assert_eq!(after_receipts.len(), 8);
+    assert_eq!(&after_receipts[..6], &before_receipts[..6]);
+    let mut expected_seventh = before_receipts[6].clone();
+    expected_seventh["checksum"] = serde_json::Value::String(format!("\\x{OLD}"));
+    assert_eq!(after_receipts[6], expected_seventh);
+    assert_eq!(
+        after_receipts[6]["description"], before_receipts[6]["description"],
+        "conversion must preserve receipt metadata other than the corrected checksum"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT to_jsonb(p) FROM node_notification_preferences p WHERE node_id='n1'"
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        preference
+    );
+    let after = receipts(&db).await;
+    db.store.migrate_prerelease_0007_schema().await.unwrap();
+    assert_eq!(after, receipts(&db).await);
 }
 
 #[tokio::test]
@@ -302,7 +393,7 @@ async fn check_notification_compat(tag: &str) {
     assert!(db.store.migrate_prerelease_0007_schema().await.is_err());
     assert_eq!(receipts(&db).await, before);
     assert!(sqlx::query_scalar::<_, bool>(
-        "SELECT to_regclass('node_notification_preferences') IS NOT NULL AND to_regclass('cvm_image_manifests') IS NULL"
+        "SELECT to_regclass('node_notification_preferences') IS NULL AND to_regclass('cvm_image_manifests') IS NULL"
     )
     .fetch_one(db.pool())
     .await

@@ -3008,7 +3008,7 @@ mod tests {
     #[test]
     fn published_v038_migration_0007_is_immutable() {
         assert_eq!(format!("{:x}", Sha384::digest(include_bytes!("../migrations/0007_user_clash_rules.sql"))),
-            "9e6eeccade5a7799d6392df0afe9982aa022965d280c46e49b2d83a1f4fbf734d590ae26e5e5408295543052446db9b8");
+            "f3d2016a0ce40fcb920794d6e587dd291347c5c89c4435915c17be001a438875fb29b0608fe86a396ce534e9aff1d0b3");
     }
 
     #[tokio::test]

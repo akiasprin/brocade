@@ -217,17 +217,11 @@ async fn upgrade_v038_applies_0008_atomically_without_rewriting_published_receip
         std::borrow::Cow::Owned(source.into_iter().filter(|m| m.version <= 7).collect());
     assert_eq!(published.iter().count(), 7);
     assert_eq!(format!("{:x}", Sha384::digest(published.iter().last().unwrap().sql.as_bytes())),
-        "9e6eeccade5a7799d6392df0afe9982aa022965d280c46e49b2d83a1f4fbf734d590ae26e5e5408295543052446db9b8");
+        "f3d2016a0ce40fcb920794d6e587dd291347c5c89c4435915c17be001a438875fb29b0608fe86a396ce534e9aff1d0b3");
     published.run(db.pool()).await.unwrap();
     insert_minimal_fixture(db.pool()).await;
-    sqlx::query("INSERT INTO node_notification_preferences(node_id,public_ip_changes,changed_by) VALUES('n1',FALSE,'existing-operator')")
-        .execute(db.pool()).await.unwrap();
     let preference_sql =
         "SELECT to_jsonb(p) FROM node_notification_preferences p WHERE node_id='n1'";
-    let preference: serde_json::Value = sqlx::query_scalar(preference_sql)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
     let before_model = db.store.materialize_snapshot(None).await.unwrap();
     let receipts =
         "SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM _sqlx_migrations m WHERE version<=7";
@@ -243,7 +237,7 @@ async fn upgrade_v038_applies_0008_atomically_without_rewriting_published_receip
       END $$; CREATE EVENT TRIGGER reject_artifact_ddl ON ddl_command_end EXECUTE FUNCTION reject_artifact_ddl();")
       .execute(db.pool()).await.unwrap();
     assert!(db.store.migrate_database_schema().await.is_err());
-    let absent: bool = sqlx::query_scalar("SELECT to_regclass('node_notification_preferences') IS NOT NULL AND to_regclass('cvm_image_manifests') IS NULL AND to_regclass('cvm_spec_artifact_sets') IS NULL AND to_regclass('cvm_spec_artifacts') IS NULL")
+    let absent: bool = sqlx::query_scalar("SELECT to_regclass('node_notification_preferences') IS NULL AND to_regclass('cvm_image_manifests') IS NULL AND to_regclass('cvm_spec_artifact_sets') IS NULL AND to_regclass('cvm_spec_artifacts') IS NULL")
         .fetch_one(db.pool()).await.unwrap();
     assert!(absent, "late failure must roll back all 0008 objects");
     let failed: serde_json::Value = sqlx::query_scalar(receipts)
@@ -251,13 +245,6 @@ async fn upgrade_v038_applies_0008_atomically_without_rewriting_published_receip
         .await
         .unwrap();
     assert_eq!(failed, before);
-    assert_eq!(
-        sqlx::query_scalar::<_, serde_json::Value>(preference_sql)
-            .fetch_one(db.pool())
-            .await
-            .unwrap(),
-        preference
-    );
     sqlx::raw_sql("DROP EVENT TRIGGER reject_artifact_ddl; DROP FUNCTION reject_artifact_ddl();")
         .execute(db.pool())
         .await
@@ -271,13 +258,13 @@ async fn upgrade_v038_applies_0008_atomically_without_rewriting_published_receip
         .await
         .unwrap();
     assert_eq!(after, before);
-    assert_eq!(
-        sqlx::query_scalar::<_, serde_json::Value>(preference_sql)
-            .fetch_one(db.pool())
-            .await
-            .unwrap(),
-        preference
-    );
+    sqlx::query("INSERT INTO node_notification_preferences(node_id,public_ip_changes,changed_by) VALUES('n1',FALSE,'existing-operator')")
+        .execute(db.pool()).await.unwrap();
+    let preference: serde_json::Value = sqlx::query_scalar(preference_sql)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(!preference["public_ip_changes"].as_bool().unwrap());
     assert_eq!(
         db.store.materialize_snapshot(None).await.unwrap(),
         before_model

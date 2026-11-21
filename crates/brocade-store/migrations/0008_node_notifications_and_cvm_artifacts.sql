@@ -1,4 +1,28 @@
--- Node notification preferences remain in the immutable published 0007.
+-- Node notification preferences are new in 0008; published 0007 remains unchanged.
+-- IF NOT EXISTS only accommodates the exact, separately verified deployed-0007 conversion.
+CREATE TABLE IF NOT EXISTS node_notification_preferences (
+    node_id TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+    public_ip_changes BOOLEAN NOT NULL DEFAULT TRUE,
+    changed_by TEXT NOT NULL CHECK (length(btrim(changed_by)) BETWEEN 1 AND 256),
+    changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Never silently accept a same-name table with a different shape.
+DO $migration$
+BEGIN
+    IF (SELECT jsonb_agg(jsonb_build_array(a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,pg_get_expr(d.adbin,d.adrelid)) ORDER BY a.attnum)
+        FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+        WHERE a.attrelid='public.node_notification_preferences'::regclass AND a.attnum>0 AND NOT a.attisdropped) IS DISTINCT FROM
+        '[["node_id","text",true,null],["public_ip_changes","boolean",true,"true"],["changed_by","text",true,null],["changed_at","timestamp with time zone",true,"now()"]]'::jsonb
+       OR (SELECT jsonb_agg(jsonb_build_array(k.conname,pg_get_constraintdef(k.oid),k.convalidated) ORDER BY k.conname)
+        FROM pg_constraint k WHERE k.conrelid='public.node_notification_preferences'::regclass AND k.contype IN ('c','f','p')) IS DISTINCT FROM
+        '[["node_notification_preferences_changed_by_check","CHECK (((length(btrim(changed_by)) >= 1) AND (length(btrim(changed_by)) <= 256)))",true],["node_notification_preferences_node_id_fkey","FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE",true],["node_notification_preferences_pkey","PRIMARY KEY (node_id)",true]]'::jsonb
+       OR (SELECT jsonb_agg(jsonb_build_array(pg_get_indexdef(i.indexrelid),i.indisvalid,i.indisready) ORDER BY pg_get_indexdef(i.indexrelid))
+        FROM pg_index i WHERE i.indrelid='public.node_notification_preferences'::regclass) IS DISTINCT FROM
+        '[["CREATE UNIQUE INDEX node_notification_preferences_pkey ON public.node_notification_preferences USING btree (node_id)",true,true]]'::jsonb
+       OR EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgrelid='public.node_notification_preferences'::regclass AND NOT t.tgisinternal) THEN
+        RAISE EXCEPTION 'node_notification_preferences does not match the verified 0008 schema';
+    END IF;
+END $migration$;
 -- Native Cube products are keyed by immutable execution generation, mapped to global revisions below.
 CREATE TABLE cvm_image_manifests (
     sha256 TEXT PRIMARY KEY CHECK (sha256 ~ '^[a-f0-9]{64}$'),
