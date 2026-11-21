@@ -34,7 +34,8 @@ test('分段选择、复制和弹层各自只有一个实现边界', () => {
     );
   }
 
-  assert.match(files.get('ui/dialog.tsx'), /role="dialog"[\s\S]*aria-modal="true"/);
+  assert.match(files.get('ui/dialog.tsx'), /\bmodal = true\b/);
+  assert.match(files.get('ui/dialog.tsx'), /role="dialog"[\s\S]*aria-modal=\{modal \|\| undefined\}/);
   assert.match(files.get('ui/dialog.tsx'), /event\.key === 'Escape'/);
   assert.match(files.get('ui/dialog.tsx'), /focusableElements\(dialog\)/);
   assert.match(files.get('ui/copy-button.tsx'), /data-copy-state=\{state\}/);
