@@ -334,7 +334,18 @@ async fn isolated_config_supersession_waits_for_the_old_report_without_deadlock(
             )
             .await
     });
-    wait_for_lock(db.pool(), "%SELECT deployment.id%FOR UPDATE OF deployment%").await;
+    // In CVM builds, report_target_result acquires the shared deployment-isolation advisory lock
+    // via cvm::releases::lock before blocking on node_applied_state, so create_deployment waits on
+    // that advisory lock rather than reaching the deployment row lock first.
+    wait_for_lock(
+        db.pool(),
+        if cfg!(feature = "cvm") {
+            "%pg_advisory_xact_lock%"
+        } else {
+            "%SELECT deployment.id%FOR UPDATE OF deployment%"
+        },
+    )
+    .await;
     gate.commit().await.unwrap();
     let created = tokio::time::timeout(Duration::from_secs(5), async {
         reporter.await.unwrap().unwrap();

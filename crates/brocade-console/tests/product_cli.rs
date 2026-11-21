@@ -72,7 +72,7 @@ async fn offline_upgrade_rejects_empty_databases_and_checks_initialized_schema()
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(count, 36);
+    assert_eq!(count, 40);
     let identities: Vec<(i64, Vec<u8>)> =
         sqlx::query_as("SELECT version,checksum FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
