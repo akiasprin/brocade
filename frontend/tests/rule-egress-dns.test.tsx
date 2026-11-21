@@ -901,18 +901,18 @@ describe('machine-scoped egress DNS', () => {
     const rows = view.container.querySelectorAll('.rule-editor > .tbl > tbody > tr');
 
     expect(rows).toHaveLength(2);
-    // 机器策略不进规则表：规则表下面直接是工具栏，策略在「查看」打开的弹层里按顺序一行一条。
-    expect(view.container.querySelector('.rule-dns-row')).toBeNull();
+    // 机器策略不进规则表：规则表下面直接是工具栏，策略在「查看」打开的左右分栏弹层里按顺序排列。
+    expect(view.container.querySelector('.rule-dns-nav-row')).toBeNull();
     expect(matchValue(rows[0])).toBe('netflix.com');
     expect(rows[1].classList.contains('rule-fallback-row')).toBe(true);
     const add = view.getByRole('button', { name: '＋ 加一条' });
     expect(view.container.querySelector('.rule-editor > .rule-table')?.nextElementSibling).toBe(add.parentElement);
     const dns = openMachineDns(view);
-    const dnsRows = dns.getAllByRole('row').filter(row => row.classList.contains('rule-dns-row'));
-    expect(dnsRows).toHaveLength(2);
+    const dnsItems = dns.getAllByRole('listitem');
+    expect(dnsItems).toHaveLength(2);
     expect(dns.getByText('media')).toBeTruthy();
-    expect(dnsRows[0].textContent).toContain('D1');
-    expect(dnsRows[1].textContent).toContain('D2');
+    expect(dnsItems[0].textContent).toContain('D1');
+    expect(dnsItems[1].textContent).toContain('D2');
   });
 
   it('inserts a newly added rule before an existing Any egress fallback', () => {
@@ -1071,8 +1071,9 @@ describe('machine-scoped egress DNS', () => {
     expect(choiceOptions(fallback).map(option => option.text)).toEqual(['停止连接', '回退机器 DNS']);
     expect(view.container.textContent).not.toContain('Xray 全局生效');
     fireEvent.click(dns.getByRole('button', { name: '删除策略（域名后缀 netflix.com）' }));
-    expect(dns.getAllByRole('row').filter(row => row.classList.contains('rule-dns-row'))).toHaveLength(1);
+    expect(dns.getAllByRole('listitem')).toHaveLength(1);
     expect(dns.queryByLabelText('DNS 地址（机器策略：域名后缀 netflix.com）')).toBeNull();
+    expect(dns.getByLabelText('DNS 地址（机器策略：geosite media）')).toBeTruthy();
     expect(routeChoice.value).toBe('machine');
   });
 
@@ -1091,7 +1092,39 @@ describe('machine-scoped egress DNS', () => {
 
     expect(address.placeholder).toBe('DNS 1, DNS 2, DNS 3');
     expect(address.title).toBe('最多 3 个 DNS 地址，用逗号分隔；组内竞速');
-    expect(dns.getByText(/香港落地 · 2 条，自上而下匹配/)).toBeTruthy();
+    expect(dns.getByText('香港落地')).toBeTruthy();
+    expect(dns.getByText('2 条 · 自上而下匹配')).toBeTruthy();
+  });
+
+  it('switches, adds, and navigates policies in the two-column DNS dialog', () => {
+    const view = renderEditor();
+    const dns = openMachineDns(view);
+    // 切换左侧导航项，右侧随之切到对应策略的解析器编辑表单。
+    fireEvent.click(dns.getByRole('button', { name: /media/ }));
+    expect(dns.getByLabelText('DNS 地址（机器策略：geosite media）')).toBeTruthy();
+    // 手机端返回按钮切回列表层级，再次点击策略回到详情层级。
+    const surface = document.querySelector('.rule-dns-dialog')!;
+    expect(surface.classList.contains('detail')).toBe(true);
+    fireEvent.click(dns.getByRole('button', { name: '返回策略列表' }));
+    expect(surface.classList.contains('detail')).toBe(false);
+    fireEvent.click(dns.getByRole('button', { name: /netflix\.com/ }));
+    expect(surface.classList.contains('detail')).toBe(true);
+    // 在右栏新建策略后自动选中新项并进入解析器配置。
+    fireEvent.click(dns.getByRole('button', { name: '添加策略' }));
+    changeControl(dns.getByRole('textbox', { name: '新策略的匹配内容' }), { target: { value: 'openai.com' } });
+    fireEvent.click(dns.getByRole('button', { name: '添加并配置解析器' }));
+    expect(dns.getAllByRole('listitem')).toHaveLength(3);
+    expect(dns.getByLabelText('DNS 地址（机器策略：域名后缀 openai.com）')).toBeTruthy();
+  });
+
+  it('lets read-only visitors switch between policies while keeping resolver controls disabled', () => {
+    const view = renderEditor(false, initial, true);
+    const dns = openMachineDns(view);
+    expect(dns.getByText('2 条 · 自上而下匹配 · 只读')).toBeTruthy();
+    expect(dns.getByLabelText('DNS 地址（机器策略：域名后缀 netflix.com）').matches(':disabled')).toBe(true);
+    expect(dns.queryByRole('button', { name: /添加策略/ })).toBeNull();
+    fireEvent.click(dns.getByRole('button', { name: /media/ }));
+    expect(dns.getByLabelText('DNS 地址（机器策略：geosite media）').matches(':disabled')).toBe(true);
   });
 
   it('highlights the NODE target and focuses its searchable menu', () => {

@@ -214,9 +214,11 @@ describe('链路规则统一保存', () => {
     fireEvent.click(save);
     await waitFor(() => expect(view.getByRole('alert').textContent).toBe('请填写完整的 DNS 地址，用逗号分隔'));
     const address = view.getByRole('textbox', { name: /DNS 地址/ });
-    // 选择自定义时弹层已经打开；保存失败的提示写在出错的那一条策略下面。
-    expect(address.closest('.rule-dns-row')).not.toBeNull();
-    expect(view.getByRole('alert').closest('.rule-dns-row')).toBe(address.closest('.rule-dns-row'));
+    // 选择自定义时弹层已经打开；保存失败的提示写在右栏详情区里，并在左栏高亮出错项。
+    expect(address.closest('.rule-dns-main')).not.toBeNull();
+    expect(view.getByRole('alert').closest('.rule-dns-main')).toBe(address.closest('.rule-dns-main'));
+    expect(view.container.querySelector('.rule-dns-nav-row.is-err')).toBeNull();
+    expect(document.querySelector('.rule-dns-nav-row.is-err')).not.toBeNull();
     expect(draft.ops()).toHaveLength(0);
     changeControl(address, { target: { value: '192.0.2.53' } });
     await waitFor(() => expect(view.queryByRole('alert')).toBeNull());

@@ -1,6 +1,7 @@
 import { currentRuleIssues } from '../rule-validation-focus';
 import { draft } from '../draft';
-import { GeoSelector, useGeoCatalog, useGeoRelations } from './geodata';
+import { GeodataBrowser, GeoSelector, useGeoCatalog, useGeoRelations } from './geodata';
+import { GeoGlyph } from './geo-glyph';
 import { rulesProblems, matchProblem } from '../rule-validation';
 import { validateDraft, type RuleIssue } from '../api/geodata';
 import { ApiError } from '../api/client';
@@ -4751,126 +4752,248 @@ const DNS_SELECTOR_KINDS = MATCH_KINDS.filter(kind =>
   ['geosite', 'domain_suffix', 'domain_keyword', 'domain_regex'].includes(kind.t),
 );
 
-function DnsPolicyRow({
-  policy,
+function dnsSelectorValues(selector: DestMatch): string[] {
+  if (selector.t === 'geosite' || selector.t === 'domain_suffix' || selector.t === 'domain_keyword') {
+    return selector.v;
+  }
+  if (selector.t === 'domain_regex') return selector.v ? [selector.v] : [];
+  const text = matchValues(selector);
+  return text ? [text] : [];
+}
+
+function dnsNavSummary(resolution: EgressDnsResolution): string {
+  const parts = egressDnsAddressText(resolution.address)
+    .split(',')
+    .map(part => part.trim())
+    .filter(Boolean);
+  const proto = resolution.transport.toUpperCase();
+  if (!parts.length) return `未填地址 · ${proto}`;
+  return parts.length > 1 ? `${parts[0]} +${parts.length - 1} · ${proto}` : `${parts[0]} · ${proto}`;
+}
+
+function DnsDocumentIcon() {
+  return (
+    <span className="geo-collection-icon document" data-geo-glyph="document" aria-hidden="true">
+      <svg
+        viewBox="0 0 20 20"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.35"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        focusable="false"
+      >
+        <path d="M5 2.5h7l3.5 3.5v11.5H5Z" />
+        <path d="M12 2.5V6h3.5M7.5 11h5M7.5 8h2" />
+      </svg>
+    </span>
+  );
+}
+
+function DnsPolicyGlyph({ selector, code }: { selector: DestMatch; code: string }) {
+  if (selector.t === 'geosite' && code) {
+    return <GeoGlyph kind="geosite" code={code.split('@')[0]} />;
+  }
+  return <DnsDocumentIcon />;
+}
+
+type DnsPolicyItem = {
+  policy: EgressDnsPolicy;
+  key: string;
+  resolution: EgressDnsResolution;
+  error: string | null;
+};
+
+function DnsPolicyDetail({
+  item,
   index,
   count,
-  resolution,
   hit,
-  error,
-  editable,
   readOnly,
+  disabled,
   onChange,
   onMove,
+  onDelete,
+  onBack,
+  onPreviewGeo,
 }: {
-  policy: EgressDnsPolicy;
+  item: DnsPolicyItem;
   index: number;
   count: number;
-  resolution: EgressDnsResolution;
   hit: boolean;
-  error: string | null;
-  editable: boolean;
   readOnly: boolean;
-  onChange: (resolution: EgressDnsResolution | null) => void;
+  disabled: boolean;
+  onChange: (resolution: EgressDnsResolution) => void;
   onMove: (delta: number) => void;
+  onDelete: () => void;
+  onBack: () => void;
+  onPreviewGeo: (value: string) => void;
 }) {
   const errorId = useId();
+  const { policy, resolution, error } = item;
   const kind = MATCH_KINDS.find(candidate => candidate.t === policy.selector.t);
+  const kindLabel = kind?.label ?? policy.selector.t;
+  const values = dnsSelectorValues(policy.selector);
   const value = matchValues(policy.selector);
-  const label = `${kind?.label ?? policy.selector.t}${value ? ` ${value}` : ''}`;
+  const primary = values[0] ?? value;
+  const extraCount = Math.max(0, values.length - 1);
+  const label = `${kindLabel}${value ? ` ${value}` : ''}`;
   const suffix = `（机器策略：${label}）`;
   const address = egressDnsAddressText(resolution.address);
   const set = (patch: Partial<EgressDnsResolution>) => onChange({ ...resolution, ...patch });
+
   return (
-    <div className={`rule-dns-row${hit ? ' is-hit' : ''}`} role="row">
-      <span className="rule-dns-no">D{index + 1}</span>
-      <span className="rule-dns-match" title={`${kind?.label ?? policy.selector.t} ${value}`.trim()}>
-        <span className="rule-dns-kind">{kind?.label ?? policy.selector.t}</span>
-        <span className="rule-dns-value mono">{value}</span>
-      </span>
-      <span className="rule-dns-group rule-dns-addr">
-        <input
-          className="f mono"
-          aria-label={`DNS 地址${suffix}`}
-          title={error ?? '最多 3 个 DNS 地址，用逗号分隔；组内竞速'}
-          value={address}
-          placeholder="DNS 1, DNS 2, DNS 3"
-          aria-invalid={!!error}
-          aria-describedby={error ? errorId : undefined}
-          spellCheck={false}
-          autoFocus={!readOnly && hit && !address}
-          onChange={event => set({ address: event.target.value })}
-        />
-        <input
-          className="f mono"
-          aria-label={`端口${suffix}`}
-          inputMode="numeric"
-          value={resolution.port || ''}
-          onChange={event => set({ port: Number(event.target.value.replace(/\D/g, '')) || 0 })}
-        />
-      </span>
-      <span className="rule-dns-group rule-dns-opts">
-        {DNS_OPTION_FIELDS.map(({ key, label: name, options }) => (
-          <select
-            key={key}
-            className="f"
-            aria-label={`${name}${suffix}`}
-            value={resolution[key]}
-            onChange={event => set({ [key]: event.target.value })}
-          >
-            {Object.entries(options).map(([value, text]) => (
-              <option key={value} value={value}>
-                {text}
-              </option>
-            ))}
-          </select>
-        ))}
-      </span>
-      <span className="rule-dns-ops">
-        {editable && (
-          <>
-            <button
-              type="button"
-              aria-label={`DNS 优先级上移（${label}）`}
-              title="提前"
-              disabled={index === 0}
-              onClick={() => onMove(-1)}
-            >
-              ↑
-            </button>
-            <button
-              type="button"
-              aria-label={`DNS 优先级下移（${label}）`}
-              title="推后"
-              disabled={index === count - 1}
-              onClick={() => onMove(1)}
-            >
-              ↓
-            </button>
-            <button
-              type="button"
-              className="danger"
-              aria-label={`删除策略（${label}）`}
-              title="删除策略"
-              onClick={() => onChange(null)}
-            >
-              ×
-            </button>
-          </>
+    <section className="rule-dns-main" aria-label={`编辑 D${index + 1} ${primary}`}>
+      <div className="rule-dns-main-head">
+        <div className="rule-dns-main-title">
+          <button type="button" className="rule-dns-back" aria-label="返回策略列表" onClick={onBack}>
+            <Icon of="chevronLeft" size={16} />
+          </button>
+          <span className={`rule-dns-main-no${hit ? ' is-hit' : ''}`}>D{index + 1}</span>
+          <DnsPolicyGlyph selector={policy.selector} code={primary} />
+          <h3 className="rule-dns-main-name" title={value}>
+            {primary}
+            {extraCount > 0 ? ` (+${extraCount})` : ''}
+          </h3>
+          <span className="rule-dns-main-grow" />
+          {!readOnly && (
+            <div className="rule-dns-main-act">
+              <button
+                type="button"
+                className="rule-dns-icon-btn"
+                aria-label={`DNS 优先级上移（${label}）`}
+                title="提前"
+                disabled={disabled || index === 0}
+                onClick={() => onMove(-1)}
+              >
+                <Icon of="arrowUp" size={13} />
+              </button>
+              <button
+                type="button"
+                className="rule-dns-icon-btn"
+                aria-label={`DNS 优先级下移（${label}）`}
+                title="推后"
+                disabled={disabled || index === count - 1}
+                onClick={() => onMove(1)}
+              >
+                <Icon of="arrowDown" size={13} />
+              </button>
+              <button
+                type="button"
+                className="rule-dns-del-btn"
+                aria-label={`删除策略（${label}）`}
+                title="删除策略"
+                disabled={disabled}
+                onClick={onDelete}
+              >
+                删除
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="rule-dns-main-sub">
+          <span>{kindLabel} · 匹配条件只读</span>
+          {hit && <span className="rule-dns-hit-inline">当前规则命中</span>}
+        </div>
+        {values.length > 0 && (
+          <div className="rule-dns-chips">
+            {values.map(entry =>
+              policy.selector.t === 'geosite' ? (
+                <button
+                  key={entry}
+                  type="button"
+                  className="rule-dns-chip clickable"
+                  title="点击在规则集浏览器中预览"
+                  onClick={() => onPreviewGeo(entry)}
+                >
+                  <GeoGlyph kind="geosite" code={entry.split('@')[0]} />
+                  <span>{entry}</span>
+                </button>
+              ) : (
+                <span key={entry} className="rule-dns-chip">
+                  <DnsDocumentIcon />
+                  <span>{entry}</span>
+                </span>
+              ),
+            )}
+          </div>
         )}
-      </span>
-      {error && (
-        <small id={errorId} className="rule-dns-issue" role="alert">
-          {error}
-        </small>
-      )}
-    </div>
+      </div>
+
+      <div className="rule-dns-main-body">
+        <fieldset className="rule-dns-fields" disabled={readOnly || disabled}>
+          {error && (
+            <div id={errorId} className="rule-dns-verdict-err" role="alert">
+              <Icon of="warn" size={13} />
+              <span>{error}</span>
+            </div>
+          )}
+          <div className="rule-dns-row-addr">
+            <label className="rule-dns-field">
+              <span className="rule-dns-field-label">
+                <span>DNS 服务器地址</span>
+                <small>最多 3 个 IP，逗号分隔</small>
+              </span>
+              <input
+                className="f mono"
+                aria-label={`DNS 地址${suffix}`}
+                title={error ?? '最多 3 个 DNS 地址，用逗号分隔；组内竞速'}
+                value={address}
+                placeholder="DNS 1, DNS 2, DNS 3"
+                aria-invalid={!!error}
+                aria-describedby={error ? errorId : undefined}
+                spellCheck={false}
+                autoFocus={!readOnly && !disabled && hit && !address}
+                onChange={event => set({ address: event.target.value })}
+              />
+            </label>
+            <label className="rule-dns-field">
+              <span className="rule-dns-field-label">
+                <span>端口</span>
+              </span>
+              <input
+                className="f mono"
+                aria-label={`端口${suffix}`}
+                inputMode="numeric"
+                value={resolution.port || ''}
+                onChange={event => set({ port: Number(event.target.value.replace(/\D/g, '')) || 0 })}
+              />
+            </label>
+          </div>
+          <div className="rule-dns-row-opts">
+            {DNS_OPTION_FIELDS.map(({ key, label: name, options }) => (
+              <label key={key} className={`rule-dns-field${key === 'fallback' ? ' rule-dns-span-mobile' : ''}`}>
+                <span className="rule-dns-field-label">
+                  <span>{key === 'transport' ? '传输协议' : name}</span>
+                </span>
+                <select
+                  className="f"
+                  aria-label={`${name}${suffix}`}
+                  value={resolution[key]}
+                  onChange={event => set({ [key]: event.target.value })}
+                >
+                  {Object.entries(options).map(([optionValue, text]) => (
+                    <option key={optionValue} value={optionValue}>
+                      {text}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ))}
+          </div>
+          <p className="rule-dns-form-note">
+            同组多个地址并行竞速；匹配条件为策略键不可直接改键，如需调整请新建策略并删除旧项。
+          </p>
+        </fieldset>
+      </div>
+    </section>
   );
 }
 
 /**
- * 本机 DNS 解析策略（整机生效，线路只提供编辑入口）。已有策略的匹配条件只读：选择器就是策略的键，
- * 边输入边换键会在中间值撞上另一条策略时把它覆盖掉。新增时在底部先填匹配条件，确认后再填 DNS 地址。
+ * 本机 DNS 解析策略（整机生效，线路只提供编辑入口）。采用与规则集预览一致的左右分栏居中弹层：
+ * 左栏按匹配顺序列出全部策略，右栏专注编辑单条解析器或新建策略；手机端自动切为列表 ↔ 详情两级。
+ * 已有策略的匹配条件只读：选择器就是策略的键，边输入边换键会在中间值撞上另一条策略时把它覆盖掉。
  */
 export function DnsPolicyDialog({
   nodeName,
@@ -4895,144 +5018,322 @@ export function DnsPolicyDialog({
   disabled: boolean;
   onClose: () => void;
 }) {
+  const items: DnsPolicyItem[] = policies.flatMap(policy => {
+    const resolution = resolutionOf(policy.selector);
+    if (!resolution) return [];
+    return [
+      {
+        policy,
+        key: egressDnsSelectorKey(policy.selector),
+        resolution,
+        error: errorFor(policy.selector),
+      },
+    ];
+  });
+  const firstErrorKey = items.find(item => item.error)?.key ?? null;
   const [adding, setAdding] = useState<{ kind: DestMatch['t']; value: string } | null>(null);
   const [added, setAdded] = useState<string | null>(null);
+  const [selectedKey, setSelectedKey] = useState<string | null>(
+    () => (focus && items.some(item => item.key === focus) ? focus : null) ?? firstErrorKey ?? items[0]?.key ?? null,
+  );
+  const [detail, setDetail] = useState(() => Boolean(focus || firstErrorKey || items.length === 1));
+  const [previewGeo, setPreviewGeo] = useState<string | null>(null);
+  const [prevErrorKey, setPrevErrorKey] = useState<string | null>(firstErrorKey);
+  if (firstErrorKey !== prevErrorKey) {
+    setPrevErrorKey(firstErrorKey);
+    if (firstErrorKey) {
+      setSelectedKey(firstErrorKey);
+      setAdding(null);
+      setDetail(true);
+    }
+  }
+
   const addSelector = adding ? buildMatch(adding.kind, adding.value) : null;
   const addKey = addSelector ? egressDnsSelectorKey(addSelector) : '';
   const addIssue = !adding
     ? null
     : !adding.value.trim()
       ? '填写匹配内容'
-      : policies.some(policy => egressDnsSelectorKey(policy.selector) === addKey)
+      : items.some(item => item.key === addKey)
         ? '已有相同策略'
         : addSelector
           ? (matchProblem(addSelector)?.message ?? null)
           : null;
   const editable = !readOnly && !disabled;
   const hit = added ?? focus;
+  const activeIndex = (() => {
+    const bySelected = selectedKey ? items.findIndex(item => item.key === selectedKey) : -1;
+    if (bySelected >= 0) return bySelected;
+    const byHit = hit ? items.findIndex(item => item.key === hit) : -1;
+    if (byHit >= 0) return byHit;
+    return items.length ? 0 : -1;
+  })();
+  const activeItem = activeIndex >= 0 ? items[activeIndex] : null;
+  const activeValues = activeItem ? dnsSelectorValues(activeItem.policy.selector) : [];
+  const showDetail = detail || Boolean(adding);
+  const metaText = items.length ? `${items.length} 条 · 自上而下匹配${readOnly ? ' · 只读' : ''}` : '未配置自定义策略';
+
+  const startAdd = () => {
+    if (!editable) return;
+    setAdding({ kind: 'domain_suffix', value: '' });
+    setDetail(true);
+  };
+  const cancelAdd = () => {
+    setAdding(null);
+    if (!items.length) setDetail(false);
+  };
   const add = () => {
     if (!addSelector || addIssue) return;
     onChange(addSelector, newEgressDns());
     setAdded(addKey);
+    setSelectedKey(addKey);
     setAdding(null);
+    setDetail(true);
   };
+  const handleDelete = (index: number, item: DnsPolicyItem) => {
+    const fallback = items[index + 1]?.key ?? items[index - 1]?.key ?? null;
+    setSelectedKey(fallback);
+    if (!fallback) setDetail(false);
+    onChange(item.policy.selector, null);
+  };
+
+  const addingKindLabel = adding ? (DNS_SELECTOR_KINDS.find(kind => kind.t === adding.kind)?.label ?? adding.kind) : '';
+
   return (
-    <DialogLayer label={`${nodeName} 的本机 DNS 解析策略`} onClose={onClose}>
-      <section className="dialog-surface rule-dns-dialog">
-        <header className="rule-dns-head">
-          <span className="rule-dns-title">
+    <>
+      <DialogLayer label={`${nodeName} 的本机 DNS 解析策略`} onClose={onClose}>
+        <section className={`dialog-surface rule-dns-dialog${showDetail ? ' detail' : ''}`}>
+          <header className="rule-dns-bar">
+            <Icon of="dns" size={15} />
             <b>本机 DNS 解析策略</b>
-            <small>
-              {nodeName} · {policies.length ? `${policies.length} 条，自上而下匹配` : '没有策略'}
-            </small>
-          </span>
-          <DialogClose className="rule-dns-close" aria-label="关闭" title="关闭">
-            <Icon of="close" size={13} />
-          </DialogClose>
-        </header>
-        <div className="rule-dns-body">
-          <fieldset className="rule-dns-fields" disabled={readOnly || disabled}>
-            {policies.length > 0 || adding ? (
-              <div className="rule-dns-sheet" role="table" aria-label="本机 DNS 解析策略">
-                <div className="rule-dns-cols" role="row" aria-hidden="true">
-                  <span />
-                  <span>匹配</span>
-                  <span>DNS 地址</span>
-                  <span>端口</span>
-                  <span>传输</span>
-                  <span>地址策略</span>
-                  <span>失败时</span>
-                  <span />
-                </div>
-                {policies.map((policy, index) => {
-                  const resolution = resolutionOf(policy.selector);
-                  if (!resolution) return null;
-                  const key = egressDnsSelectorKey(policy.selector);
-                  return (
-                    <DnsPolicyRow
-                      key={key}
-                      policy={policy}
-                      index={index}
-                      count={policies.length}
-                      resolution={resolution}
-                      hit={key === hit}
-                      error={errorFor(policy.selector)}
-                      editable={editable}
-                      readOnly={readOnly}
-                      onChange={next => onChange(policy.selector, next)}
-                      onMove={delta => onMove(policy.selector, delta)}
-                    />
-                  );
-                })}
-                {adding && (
-                  <div className="rule-dns-row is-adding" role="row">
-                    <span className="rule-dns-no">新</span>
-                    <span className="rule-dns-match">
-                      <select
-                        className="f"
-                        aria-label="新策略的匹配类型"
-                        value={adding.kind}
-                        onChange={event => setAdding({ ...adding, kind: event.target.value as DestMatch['t'] })}
-                      >
-                        {DNS_SELECTOR_KINDS.map(kind => (
-                          <option key={kind.t} value={kind.t}>
-                            {kind.label}
-                          </option>
-                        ))}
-                      </select>
-                      {adding.kind === 'geosite' ? (
-                        <GeoSelector
-                          kind="geosite"
-                          values={adding.value.split(/[,，\s]+/).filter(Boolean)}
-                          label="新策略的匹配内容"
-                          scope="新策略"
-                          onChange={v => setAdding({ ...adding, value: v.join(', ') })}
-                        />
-                      ) : (
-                        <RawMatchInput
-                          className="f mono"
-                          aria-label="新策略的匹配内容"
-                          placeholder={DNS_SELECTOR_KINDS.find(kind => kind.t === adding.kind)?.hint}
-                          spellCheck={false}
-                          autoFocus
-                          value={adding.value}
-                          onChange={event => setAdding({ ...adding, value: event.target.value })}
-                          onKeyDown={event => {
-                            if (event.key !== 'Enter') return;
-                            event.preventDefault();
-                            add();
-                          }}
-                        />
-                      )}
-                    </span>
-                    <span className="rule-dns-add-actions">
-                      <button type="button" className="btn sm primary" disabled={!!addIssue} onClick={add}>
-                        添加
-                      </button>
-                      <button type="button" className="btn sm" onClick={() => setAdding(null)}>
-                        取消
-                      </button>
-                      {adding.value.trim() && addIssue && <small className="rule-dns-issue">{addIssue}</small>}
-                    </span>
-                  </div>
+            <span className="rule-dns-node">{nodeName}</span>
+            <span className={`rule-dns-bar-meta${items.length ? '' : ' is-empty'}`}>
+              <i aria-hidden="true" />
+              {metaText}
+            </span>
+            <DialogClose className="geo-close" aria-label="关闭" title="关闭">
+              <Icon of="close" size={16} />
+            </DialogClose>
+          </header>
+
+          {items.length === 0 && !adding ? (
+            <div className="rule-dns-body">
+              <div className="rule-dns-empty">
+                <Icon of="dns" size={24} />
+                <b>尚未配置自定义策略</b>
+                <p>当前节点全部流量按机器默认 DNS 解析；可为指定 geosite 分类或域名配置独立上游解析器。</p>
+                {!readOnly && (
+                  <button type="button" className="btn primary" disabled={disabled} onClick={startAdd}>
+                    <Icon of="plus" size={13} />
+                    <span>添加第一条策略</span>
+                  </button>
                 )}
               </div>
-            ) : (
-              <p className="rule-dns-empty">没有自定义策略，全部按默认 DNS 解析。</p>
-            )}
-          </fieldset>
-        </div>
-        <footer className="rule-dns-foot">
-          {editable && !adding && (
-            <button type="button" className="btn" onClick={() => setAdding({ kind: 'domain_suffix', value: '' })}>
-              ＋ 添加策略
-            </button>
+            </div>
+          ) : (
+            <div className="rule-dns-body">
+              <aside className="rule-dns-nav" aria-label="策略优先级列表">
+                <div className="rule-dns-nav-head">
+                  <span>匹配顺序</span>
+                  <span>{items.length} 条</span>
+                </div>
+                <ul className="rule-dns-nav-list">
+                  {items.map((item, index) => {
+                    const values = dnsSelectorValues(item.policy.selector);
+                    const primary = values[0] ?? matchValues(item.policy.selector);
+                    const extra = Math.max(0, values.length - 1);
+                    const isCurrent = !adding && activeItem?.key === item.key;
+                    const isHit = item.key === hit;
+                    return (
+                      <li key={item.key}>
+                        <button
+                          type="button"
+                          className={`rule-dns-nav-row${item.error ? ' is-err' : ''}`}
+                          aria-current={isCurrent ? 'true' : undefined}
+                          onClick={() => {
+                            setAdding(null);
+                            setSelectedKey(item.key);
+                            setDetail(true);
+                          }}
+                        >
+                          <span className="rule-dns-nav-top">
+                            <span className="rule-dns-nav-no">D{index + 1}</span>
+                            <DnsPolicyGlyph selector={item.policy.selector} code={primary} />
+                            <code className="rule-dns-nav-name">{primary}</code>
+                            {extra > 0 && <span className="rule-dns-nav-more">+{extra}</span>}
+                            {item.error ? (
+                              <i className="rule-dns-nav-dot err" title="配置有误" aria-hidden="true" />
+                            ) : isHit ? (
+                              <i className="rule-dns-nav-dot" title="当前规则命中" aria-hidden="true" />
+                            ) : null}
+                          </span>
+                          <span className="rule-dns-nav-sub">{item.error ?? dnsNavSummary(item.resolution)}</span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                  {adding && (
+                    <li>
+                      <button
+                        type="button"
+                        className="rule-dns-nav-row is-adding"
+                        aria-current="true"
+                        onClick={() => setDetail(true)}
+                      >
+                        <span className="rule-dns-nav-top">
+                          <span className="rule-dns-nav-no">新</span>
+                          <code className="rule-dns-nav-name">{adding.value.trim() || '新建策略'}</code>
+                        </span>
+                        <span className="rule-dns-nav-sub">{addingKindLabel} · 待确认</span>
+                      </button>
+                    </li>
+                  )}
+                </ul>
+                {!readOnly && (
+                  <div className="rule-dns-nav-foot">
+                    <button
+                      type="button"
+                      className={`btn${adding ? ' is-active' : ''}`}
+                      disabled={disabled}
+                      onClick={startAdd}
+                    >
+                      <Icon of="plus" size={13} />
+                      <span>添加策略</span>
+                    </button>
+                  </div>
+                )}
+              </aside>
+
+              {adding ? (
+                <section className="rule-dns-main" aria-label="新建本机 DNS 解析策略">
+                  <div className="rule-dns-main-head">
+                    <div className="rule-dns-main-title">
+                      <button
+                        type="button"
+                        className="rule-dns-back"
+                        aria-label="返回策略列表"
+                        onClick={() => setDetail(false)}
+                      >
+                        <Icon of="chevronLeft" size={16} />
+                      </button>
+                      <span className="rule-dns-main-no is-hit">新</span>
+                      <h3 className="rule-dns-main-name sans">新建解析策略</h3>
+                    </div>
+                    <div className="rule-dns-main-sub">
+                      <span>先确定匹配条件，添加后自动切换至该策略的解析器配置；保存后匹配条件不可改键</span>
+                    </div>
+                  </div>
+                  <div className="rule-dns-main-body">
+                    <fieldset className="rule-dns-fields" disabled={readOnly || disabled}>
+                      <div className="rule-dns-add-grid">
+                        <label className="rule-dns-field">
+                          <span className="rule-dns-field-label">
+                            <span>匹配类型</span>
+                          </span>
+                          <select
+                            className="f"
+                            aria-label="新策略的匹配类型"
+                            value={adding.kind}
+                            onChange={event => {
+                              const nextKind = event.target.value as DestMatch['t'];
+                              const resetValue = (adding.kind === 'geosite') !== (nextKind === 'geosite');
+                              setAdding({ kind: nextKind, value: resetValue ? '' : adding.value });
+                            }}
+                          >
+                            {DNS_SELECTOR_KINDS.map(kind => (
+                              <option key={kind.t} value={kind.t}>
+                                {kind.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <div className="rule-dns-field">
+                          <span className="rule-dns-field-label">
+                            <span>匹配内容</span>
+                            <small>{adding.kind === 'geosite' ? '支持多选分类' : '多个用逗号分隔'}</small>
+                          </span>
+                          {adding.kind === 'geosite' ? (
+                            <GeoSelector
+                              kind="geosite"
+                              values={adding.value.split(/[,，\s]+/).filter(Boolean)}
+                              label="新策略的匹配内容"
+                              scope="新策略"
+                              disabled={readOnly || disabled}
+                              onChange={v => setAdding({ ...adding, value: v.join(', ') })}
+                            />
+                          ) : (
+                            <RawMatchInput
+                              className="f mono"
+                              aria-label="新策略的匹配内容"
+                              placeholder={DNS_SELECTOR_KINDS.find(kind => kind.t === adding.kind)?.hint}
+                              spellCheck={false}
+                              autoFocus
+                              value={adding.value}
+                              onChange={event => setAdding({ ...adding, value: event.target.value })}
+                              onKeyDown={event => {
+                                if (event.key !== 'Enter') return;
+                                event.preventDefault();
+                                add();
+                              }}
+                            />
+                          )}
+                        </div>
+                      </div>
+                      {adding.value.trim() && addIssue && (
+                        <div className="rule-dns-verdict-err" role="alert">
+                          <Icon of="warn" size={13} />
+                          <span>{addIssue}</span>
+                        </div>
+                      )}
+                      <div className="rule-dns-add-actions">
+                        <button type="button" className="btn primary" disabled={!!addIssue} onClick={add}>
+                          添加并配置解析器
+                        </button>
+                        <button type="button" className="btn" onClick={cancelAdd}>
+                          取消
+                        </button>
+                      </div>
+                    </fieldset>
+                  </div>
+                </section>
+              ) : activeItem ? (
+                <DnsPolicyDetail
+                  key={activeItem.key}
+                  item={activeItem}
+                  index={activeIndex}
+                  count={items.length}
+                  hit={activeItem.key === hit}
+                  readOnly={readOnly}
+                  disabled={disabled}
+                  onChange={next => onChange(activeItem.policy.selector, next)}
+                  onMove={delta => onMove(activeItem.policy.selector, delta)}
+                  onDelete={() => handleDelete(activeIndex, activeItem)}
+                  onBack={() => setDetail(false)}
+                  onPreviewGeo={setPreviewGeo}
+                />
+              ) : null}
+            </div>
           )}
-          <span className="sp" />
-          <DialogClose className={`btn${readOnly ? '' : ' primary'}`}>{readOnly ? '关闭' : '完成'}</DialogClose>
-        </footer>
-      </section>
-    </DialogLayer>
+
+          <footer className="rule-dns-foot">
+            <span className="rule-dns-foot-note">
+              {readOnly ? '只读模式不可修改' : '整机共享 · Xray 按 D1 起依次匹配，改动随外层草稿保存'}
+            </span>
+            <span className="sp" />
+            <DialogClose className={`btn${readOnly ? '' : ' primary'}`}>{readOnly ? '关闭' : '完成'}</DialogClose>
+          </footer>
+        </section>
+      </DialogLayer>
+      {previewGeo !== null && (
+        <GeodataBrowser
+          kind="geosite"
+          initial={previewGeo}
+          selected={activeValues}
+          scope={activeIndex >= 0 ? `D${activeIndex + 1}` : '本条'}
+          onClose={() => setPreviewGeo(null)}
+        />
+      )}
+    </>
   );
 }
 

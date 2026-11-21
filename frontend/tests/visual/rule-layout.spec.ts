@@ -417,7 +417,7 @@ for (const width of [390, 820, 1440]) {
     await expect(page.locator('.rule-editor')).toHaveScreenshot(`chain-dns-rules-${width}.png`);
     await table.getByRole('button', { name: '查看本机 DNS 解析策略' }).first().click();
     const dns = page.getByRole('dialog', { name: /的本机 DNS 解析策略$/ });
-    await expect(dns.locator('.rule-dns-row')).toHaveCount(1);
+    await expect(dns.locator('.rule-dns-nav-row')).toHaveCount(1);
     await expect(dns.getByRole('textbox', { name: /^DNS 地址/ })).toHaveValue('192.0.2.53, 2001:db8::53');
     await expect(dns.locator('.rule-dns-dialog')).toHaveScreenshot(`chain-dns-policies-${width}.png`);
   });
@@ -429,7 +429,7 @@ async function openDnsInspection(page: Page, readOnly: boolean) {
   );
   await page.getByRole('button', { name: '查看本机 DNS 解析策略' }).first().click();
   const dialog = page.getByRole('dialog', { name: /的本机 DNS 解析策略$/ });
-  await expect(dialog.locator('.rule-dns-row')).toHaveCount(1);
+  await expect(dialog.locator('.rule-dns-nav-row')).toHaveCount(1);
   await waitForVisualAssets(page);
   return dialog;
 }

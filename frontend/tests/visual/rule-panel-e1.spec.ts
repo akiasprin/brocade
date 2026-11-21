@@ -77,7 +77,7 @@ for (const width of [390, 1440])
 
       await akile.getByRole('button', { name: '查看本机 DNS 解析策略' }).click();
       const dns = page.getByRole('dialog', { name: '香港 AKILE II 的本机 DNS 解析策略' });
-      await expect(dns.locator('.rule-dns-row')).toHaveCount(6);
+      await expect(dns.locator('.rule-dns-nav-row')).toHaveCount(6);
       const box = await dns.locator('.rule-dns-dialog').boundingBox();
       expect(box!.x).toBeGreaterThanOrEqual(0);
       expect(box!.x + box!.width).toBeLessThanOrEqual(width);
@@ -186,8 +186,9 @@ test('E1 readonly expands machines with disabled editors and no removal action',
   await expect(page.getByRole('button', { name: /从这条链移除/ })).toHaveCount(0);
   await akile.getByRole('button', { name: '查看本机 DNS 解析策略' }).click();
   const dns = page.getByRole('dialog', { name: '香港 AKILE II 的本机 DNS 解析策略' });
+  await expect(dns.getByRole('button', { name: /添加.*策略/ })).toHaveCount(0);
+  await dns.locator('.rule-dns-nav-row').first().click();
   await expect(dns.getByRole('textbox', { name: /^DNS 地址/ }).first()).toBeDisabled();
-  await expect(dns.getByRole('button', { name: '＋ 添加策略' })).toHaveCount(0);
   await dns.getByRole('button', { name: '关闭', exact: true }).last().click();
   await expect(dns).toHaveCount(0);
 });

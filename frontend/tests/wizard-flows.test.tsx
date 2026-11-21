@@ -1550,9 +1550,10 @@ describe('新建链向导', () => {
     const dns = screen.getByRole('dialog', { name: '香港边缘 的本机 DNS 解析策略' });
     expect(
       within(dns)
-        .getAllByRole('row')
-        .map(row => row.textContent),
+        .getAllByRole('listitem')
+        .map(item => item.textContent),
     ).toEqual([expect.stringContaining('netflix'), expect.stringContaining('disney')]);
+    fireEvent.click(within(dns).getByRole('button', { name: /disney/ }));
     fireEvent.click(within(dns).getByRole('button', { name: 'DNS 优先级上移（geosite disney）' }));
     fireEvent.click(within(dns).getByRole('button', { name: '完成' }));
     await waitFor(() => expect(screen.queryByRole('dialog', { name: /本机 DNS 解析策略/ })).toBeNull());

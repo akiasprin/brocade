@@ -40471,264 +40471,663 @@ button.choice-select.choice-select-single.f {
   background: none;
 }
 
-/* 本机 DNS 解析策略弹层：标题 + × / 列标题对齐的一行一条 / 底部添加与完成 */
+/* 本机 DNS 解析策略弹层：左右分栏居中弹层，顶栏、左导右编材质与移动端两级返回 1:1 对齐规则集预览（.geo-browser） */
 .dialog-surface.rule-dns-dialog {
   --ctl-h: 28px;
   display: flex;
   flex-direction: column;
   box-sizing: border-box;
-  width: min(1080px, calc(100vw - 32px));
-  max-height: min(82vh, 760px);
+  width: min(860px, calc(100vw - 32px));
+  height: min(500px, calc(100dvh - 40px));
+  max-width: none;
   padding: 0;
   overflow: hidden;
+  background: var(--sheet);
+  backdrop-filter: none;
+  color: var(--ink-2);
+  font-size: 12.5px;
 }
-.rule-dns-head {
+.rule-dns-bar {
   display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  padding: 16px 18px 12px;
-}
-.rule-dns-title {
-  display: grid;
-  flex: 1;
-  gap: 3px;
-  min-width: 0;
-}
-.rule-dns-title b {
-  color: var(--ink);
-  font-size: 15px;
-  font-weight: 600;
-}
-.rule-dns-title small {
-  color: var(--ink-3);
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 8px 0 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
   font-size: 12px;
 }
-.rule-dns-close {
-  appearance: none;
-  display: grid;
+.rule-dns-bar > .ui-icon {
   flex: none;
-  place-items: center;
-  width: 26px;
-  height: 26px;
-  margin: -2px -4px 0 0;
-  padding: 0;
-  border: 0;
-  border-radius: 50%;
-  background: color-mix(in srgb, var(--ink) 7%, transparent);
   color: var(--ink-3);
-  cursor: pointer;
+}
+.rule-dns-bar > b {
+  flex: none;
+  color: var(--ink);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.rule-dns-node {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-2);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rule-dns-bar-meta {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rule-dns-bar-meta > i {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--ok);
+  vertical-align: 1px;
+}
+.rule-dns-bar-meta.is-empty > i {
+  background: var(--ink-4);
+}
+.rule-dns-bar > .geo-close {
+  margin-left: auto;
+  border-radius: 6px;
 }
 @media (hover: hover) {
-  .rule-dns-close:hover {
+  .rule-dns-bar > .geo-close:hover {
+    background: var(--hover-2);
     color: var(--ink);
   }
 }
 .rule-dns-body {
-  container: dnsdlg / inline-size;
-  flex: 1 1 auto;
+  display: flex;
+  flex: 1;
   min-width: 0;
   min-height: 0;
-  padding: 0 18px;
-  overflow: auto;
 }
-.rule-dns-fields {
-  min-width: 0;
-  margin: 0;
-  padding: 0;
-  border: 0;
+.rule-dns-nav {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  width: 268px;
+  min-height: 0;
+  border-right: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface) 55%, var(--sheet));
 }
-.rule-dns-sheet {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-}
-.rule-dns-cols,
-.rule-dns-row {
-  display: grid;
-  grid-template-columns: 26px minmax(200px, 1fr) minmax(170px, 1.1fr) 60px 72px 104px 118px 78px;
+.rule-dns-nav-head {
+  display: flex;
+  flex: none;
   align-items: center;
-  column-gap: 8px;
-}
-.rule-dns-cols {
-  padding: 0 6px 6px;
-  border-bottom: 1px solid var(--line);
+  justify-content: space-between;
+  padding: 10px 12px 5px;
   color: var(--ink-4);
   font-size: 11px;
 }
-.rule-dns-row {
-  row-gap: 4px;
-  padding: 6px;
-  border-bottom: 1px solid var(--line-soft);
+.rule-dns-nav-list {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+  margin: 0;
+  padding: 2px 6px 8px;
+  list-style: none;
+  overflow: auto;
+  overscroll-behavior: contain;
 }
-.rule-dns-row:last-child {
-  border-bottom: 0;
+.rule-dns-nav-row {
+  appearance: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink-2);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.1s;
 }
-.rule-dns-row.is-hit {
-  border-radius: 8px;
+@media (hover: hover) {
+  .rule-dns-nav-row:hover {
+    background: var(--hover);
+  }
+}
+.rule-dns-nav-row[aria-current='true'] {
   background: var(--action-wash);
 }
-.rule-dns-group {
-  display: contents;
+.rule-dns-nav-row.is-err[aria-current='true'] {
+  background: color-mix(in srgb, var(--err) 12%, transparent);
 }
-.rule-dns-no {
-  color: var(--ink-4);
-  font: 11.5px var(--mono);
-}
-.rule-dns-match {
+.rule-dns-nav-top {
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
 }
-.rule-dns-kind {
+.rule-dns-nav-top .geo-collection-icon {
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+}
+.rule-dns-nav-top .geo-collection-icon svg {
+  width: 11px;
+  height: 11px;
+}
+.rule-dns-nav-top .geo-ai-text {
+  font-size: 8px;
+}
+.rule-dns-nav-top .site-brand-icon {
+  width: 15px;
+  height: 15px;
+}
+.rule-dns-nav-top .site-brand-icon svg {
+  width: 13px;
+  height: 13px;
+}
+.rule-dns-nav-no {
   flex: none;
-  color: var(--ink-3);
-  font-size: 12px;
+  width: 20px;
+  color: var(--ink-4);
+  font: 600 11px var(--mono);
+  font-variant-numeric: tabular-nums;
 }
-.rule-dns-value {
-  min-width: 0;
-  color: var(--ink);
-  font-size: 12px;
-  overflow-wrap: anywhere;
+.rule-dns-nav-row[aria-current='true'] .rule-dns-nav-no {
+  color: var(--action);
 }
-.rule-dns-match select.f {
-  flex: none;
-  width: 104px;
+.rule-dns-nav-row.is-err .rule-dns-nav-no {
+  color: var(--err);
 }
-.rule-dns-match input.f {
+.rule-dns-nav-name {
   flex: 1;
   min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font: 500 12px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.rule-dns-row :is(input.f, select.f) {
-  box-sizing: border-box;
-  height: 28px;
-  min-height: 28px;
-  font-size: 12px;
+.rule-dns-nav-row[aria-current='true'] .rule-dns-nav-name {
+  color: var(--action);
 }
-.rule-dns-group > :is(input.f, select.f) {
+.rule-dns-nav-row.is-err .rule-dns-nav-name {
+  color: var(--err);
+}
+.rule-dns-nav-more {
+  flex: none;
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+}
+.rule-dns-nav-dot {
+  flex: none;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--action);
+}
+.rule-dns-nav-dot.err {
+  background: var(--err);
+}
+.rule-dns-nav-sub {
+  padding-left: 26px;
+  overflow: hidden;
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rule-dns-nav-row.is-err .rule-dns-nav-sub {
+  color: var(--err);
+  font-family: var(--sans);
+}
+.rule-dns-nav-foot {
+  flex: none;
+  padding: 8px;
+  border-top: 1px solid var(--line);
+}
+.rule-dns-nav-foot .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
   width: 100%;
 }
-.rule-dns-row input.f {
-  padding: 0 8px;
+.rule-dns-nav-foot .btn.is-active {
+  border-color: color-mix(in srgb, var(--action) 42%, var(--line));
+  background: var(--action-wash);
+  color: var(--action);
 }
-.rule-dns-row select.f {
-  padding: 0 24px 0 8px;
+.rule-dns-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--sheet);
 }
-.rule-dns-row input.f[aria-invalid='true'] {
-  border-color: color-mix(in srgb, var(--err) 70%, transparent);
-  background-color: color-mix(in srgb, var(--err) 6%, var(--sunk));
+.rule-dns-main-head {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 7px;
+  padding: 13px 18px 11px;
+  border-bottom: 1px solid var(--line-soft);
 }
-.rule-dns-ops {
-  display: inline-flex;
-  justify-content: flex-end;
-  gap: 2px;
+.rule-dns-main-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 28px;
 }
-.rule-dns-ops button {
+.rule-dns-main-title .geo-collection-icon {
+  width: 22px;
+  height: 22px;
+}
+.rule-dns-main-title .geo-collection-icon svg {
+  width: 15px;
+  height: 15px;
+}
+.rule-dns-main-title .site-brand-icon {
+  width: 20px;
+  height: 20px;
+}
+.rule-dns-main-title .site-brand-icon svg {
+  width: 17px;
+  height: 17px;
+}
+.rule-dns-back {
   appearance: none;
-  display: grid;
+  display: none;
+  flex: none;
   place-items: center;
-  width: 24px;
-  height: 24px;
+  width: 28px;
+  height: 28px;
+  margin-left: -6px;
   padding: 0;
   border: 0;
   border-radius: 6px;
   background: none;
   color: var(--ink-3);
-  font-size: 13px;
   cursor: pointer;
 }
 @media (hover: hover) {
-  .rule-dns-ops button:hover:not(:disabled) {
+  .rule-dns-back:hover {
+    background: var(--hover);
+    color: var(--ink);
+  }
+}
+.rule-dns-main-no {
+  flex: none;
+  color: var(--ink-3);
+  font: 600 12px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.rule-dns-main-no.is-hit {
+  color: var(--action);
+}
+.rule-dns-main-name {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font: 600 14.5px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rule-dns-main-name.sans {
+  font-family: var(--sans);
+  font-size: 14px;
+}
+.rule-dns-main-grow {
+  flex: 1;
+  min-width: 8px;
+}
+.rule-dns-main-act {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+}
+.rule-dns-icon-btn {
+  appearance: none;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .rule-dns-icon-btn:hover:not(:disabled) {
     background: var(--hover-2);
     color: var(--ink);
   }
-  .rule-dns-ops button.danger:hover:not(:disabled) {
+}
+.rule-dns-icon-btn:disabled {
+  opacity: 0.28;
+  cursor: default;
+}
+.rule-dns-del-btn {
+  appearance: none;
+  height: 26px;
+  margin-left: 4px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--ink-3);
+  font-size: 12px;
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .rule-dns-del-btn:hover:not(:disabled) {
     background: color-mix(in srgb, var(--err) 12%, transparent);
     color: var(--err);
   }
 }
-.rule-dns-ops button:disabled {
-  opacity: 0.3;
+.rule-dns-del-btn:disabled {
+  opacity: 0.35;
   cursor: default;
 }
-.rule-dns-issue {
-  grid-column: 2 / -1;
-  color: var(--err);
-  font-size: 11.5px;
-}
-.rule-dns-add-actions {
+.rule-dns-main-sub {
   display: flex;
-  grid-column: 3 / -1;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px 8px;
+  gap: 6px 12px;
+  color: var(--ink-4);
+  font-size: 11.5px;
 }
-.rule-dns-add-actions > .rule-dns-issue {
-  grid-column: auto;
-}
-.rule-dns-foot {
-  display: flex;
+.rule-dns-hit-inline {
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 12px 18px 14px;
-  border-top: 1px solid var(--line-soft);
+  gap: 5px;
+  color: var(--action);
+  font-weight: 500;
 }
-.rule-dns-foot .sp {
+.rule-dns-hit-inline::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.rule-dns-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  margin-top: 2px;
+}
+.rule-dns-chip {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  height: 22px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--sunk);
+  color: var(--ink);
+  font: 11.5px var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rule-dns-chip > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rule-dns-chip .geo-collection-icon {
+  width: 15px;
+  height: 15px;
+  border-radius: 3.5px;
+}
+.rule-dns-chip .geo-collection-icon svg {
+  width: 11px;
+  height: 11px;
+}
+.rule-dns-chip .geo-ai-text {
+  font-size: 7.5px;
+}
+.rule-dns-chip .site-brand-icon {
+  width: 14px;
+  height: 14px;
+}
+.rule-dns-chip .site-brand-icon svg {
+  width: 12px;
+  height: 12px;
+}
+.rule-dns-chip.clickable {
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .rule-dns-chip.clickable:hover {
+    border-color: color-mix(in srgb, var(--action) 45%, var(--line));
+    color: var(--action);
+  }
+}
+.rule-dns-main-body {
   flex: 1;
+  min-height: 0;
+  padding: 16px 18px 18px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.rule-dns-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.rule-dns-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+.rule-dns-field-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.rule-dns-field-label > span {
+  white-space: nowrap;
+}
+.rule-dns-field-label small {
+  color: var(--ink-4);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.rule-dns-row-addr {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 92px;
+  align-items: end;
+  gap: 12px;
+}
+.rule-dns-row-opts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.rule-dns-add-grid {
+  display: grid;
+  grid-template-columns: 124px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+.rule-dns-dialog :is(input.f, select.f) {
+  box-sizing: border-box;
+  width: 100%;
+  height: var(--ctl-h);
+  min-height: var(--ctl-h);
+  font-size: 12.5px;
+}
+.rule-dns-dialog input.f {
+  padding: 0 8px;
+}
+.rule-dns-dialog select.f {
+  padding: 0 24px 0 8px;
+}
+.rule-dns-dialog input.f[aria-invalid='true'] {
+  border-color: color-mix(in srgb, var(--err) 75%, transparent);
+  background-color: color-mix(in srgb, var(--err) 6%, var(--sunk));
 }
 .rule-dns-fields[disabled] :is(input.f, select.f) {
   color: var(--ink-2);
   background-color: var(--sunk);
   cursor: default;
 }
-.rule-dns-empty {
-  margin: 8px 0 14px;
-  color: var(--ink-3);
-  font-size: 12.5px;
+.rule-dns-verdict-err {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--err) 9%, transparent);
+  color: var(--err);
+  font-size: 12px;
 }
-/* 窄屏：每条策略一张小卡，解析选项按内容宽度换行。 */
-@container dnsdlg (max-width: 900px) {
-  .rule-dns-cols {
+.rule-dns-verdict-err > .ui-icon {
+  flex: none;
+}
+.rule-dns-form-note {
+  margin: 0;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+.rule-dns-add-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding-top: 2px;
+}
+.rule-dns-empty {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 36px 24px;
+  color: var(--ink-3);
+  text-align: center;
+}
+.rule-dns-empty > .ui-icon {
+  color: var(--ink-4);
+}
+.rule-dns-empty b {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+.rule-dns-empty p {
+  max-width: 320px;
+  margin: 0;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.rule-dns-empty .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+}
+.rule-dns-foot {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+}
+.rule-dns-foot-note {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rule-dns-foot .sp {
+  flex: 1;
+}
+/* 手机：居中紧凑弹层 + 两级（策略列表 ↔ 单条详情），返回放在右栏标题行，对齐 .geo-browser。 */
+@media (max-width: 820px) {
+  .dialog-surface.rule-dns-dialog {
+    width: 100%;
+    height: min(560px, calc(100dvh - max(10px, var(--safe-top)) - max(10px, var(--safe-bottom))));
+  }
+  .rule-dns-bar-meta,
+  .rule-dns-foot-note {
     display: none;
   }
-  .rule-dns-row {
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 6px;
-    padding: 10px 2px;
+  .rule-dns-nav {
+    width: 100%;
+    border-right: 0;
   }
-  .rule-dns-no {
-    grid-column: 1;
-    grid-row: 1;
+  .rule-dns-dialog.detail .rule-dns-nav,
+  .rule-dns-dialog:not(.detail) .rule-dns-main {
+    display: none;
   }
-  .rule-dns-ops {
-    grid-column: 2;
-    grid-row: 1;
+  .rule-dns-back {
+    display: grid;
   }
-  .rule-dns-match,
-  .rule-dns-group,
-  .rule-dns-issue,
-  .rule-dns-add-actions {
+  .rule-dns-nav-row {
+    padding: 9px 10px;
+  }
+  .rule-dns-main-head {
+    padding: 10px 14px 9px;
+  }
+  .rule-dns-main-body {
+    padding: 13px 14px 14px;
+  }
+  .rule-dns-fields {
+    gap: 12px;
+  }
+  .rule-dns-row-addr {
+    grid-template-columns: minmax(0, 1fr) 74px;
+    gap: 8px;
+  }
+  .rule-dns-row-opts {
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .rule-dns-span-mobile {
     grid-column: 1 / -1;
   }
-  .rule-dns-group {
-    display: flex;
-    gap: 6px;
-    min-width: 0;
+  .rule-dns-add-grid {
+    grid-template-columns: 1fr;
   }
-  .rule-dns-addr > input.f:first-child {
-    flex: 1;
-    min-width: 0;
-  }
-  .rule-dns-addr > input.f:last-child {
-    flex: none;
-    width: 64px;
-  }
-  .rule-dns-opts {
-    flex-wrap: wrap;
-  }
-  .rule-dns-opts > select.f {
-    flex: none;
-    width: auto;
-    max-width: 100%;
+}
+@media (max-width: 360px) {
+  .rule-dns-row-addr .rule-dns-field-label small {
+    display: none;
   }
 }
 

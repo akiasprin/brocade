@@ -127,7 +127,7 @@ for (const width of [390, 1440])
 
       await rules.getByRole('combobox', { name: /DNS 解析方式（新建链：.* 第 2 条）/ }).selectOption('custom');
       const dns = page.getByRole('dialog', { name: /的本机 DNS 解析策略$/ });
-      await expect(dns.locator('.rule-dns-row')).toHaveCount(1);
+      await expect(dns.locator('.rule-dns-nav-row')).toHaveCount(1);
       await dns.getByRole('textbox', { name: /^DNS 地址/ }).fill('1.1.1.1');
       await expect(dns.locator('.rule-dns-dialog')).toHaveScreenshot(`wizard-dns-${width}-${theme}.png`);
       await dns.getByRole('button', { name: '完成' }).click();

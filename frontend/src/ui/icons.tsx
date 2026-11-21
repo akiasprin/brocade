@@ -502,6 +502,19 @@ const PATHS = {
   play: <path d="M5.5 3.8 L12 8 L5.5 12.2 Z" />,
   /* 新建、授权这类「添加一项」的操作。 */
   plus: <path d="M8 3.2 V12.8 M3.2 8 H12.8" />,
+  /* 顺序微调：用于策略优先级上移 / 下移，不复用表示收发的 rx / tx 语义名。 */
+  arrowUp: (
+    <>
+      <path d="M8 12.6 V3.4" />
+      <path d="M4.5 6.9 L8 3.4 L11.5 6.9" />
+    </>
+  ),
+  arrowDown: (
+    <>
+      <path d="M8 3.4 V12.6" />
+      <path d="M4.5 9.1 L8 12.6 L11.5 9.1" />
+    </>
+  ),
 };
 
 export type IconName = keyof typeof PATHS;
