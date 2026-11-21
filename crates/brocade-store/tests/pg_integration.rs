@@ -11868,6 +11868,15 @@ async fn retirement_fences_old_target_and_converges_through_teardown_deployment(
         db.store.revoke_node_token("n1").await,
         Err(StoreError::Unsupported(_))
     ));
+    // Rejected token operations drop transactions which hold the lifecycle row lock. Wait for
+    // their asynchronous rollback before the claim's SKIP LOCKED query examines this node.
+    let mut barrier = db.pool().begin().await.unwrap();
+    sqlx::query("SELECT lifecycle_epoch FROM node_lifecycle_state WHERE node_id=$1 FOR UPDATE")
+        .bind("n1")
+        .fetch_one(&mut *barrier)
+        .await
+        .unwrap();
+    barrier.commit().await.unwrap();
     let authenticated = db
         .store
         .authenticate_node_token(&token.token)
@@ -14956,10 +14965,20 @@ async fn sniffing_failed_usage_is_bounded_idempotent_and_operator_scoped() {
         .await
         .unwrap();
     report.counters.clear();
-    assert!(matches!(
-        db.store.record_sniffing_failed_report("n1", report).await,
-        Err(StoreError::Forbidden(_))
-    ));
+    // The invalid report drops its transaction, whose rollback runs asynchronously. Wait for
+    // its optional-report lock to be released before testing the disabled-policy boundary.
+    let mut barrier = db.pool().begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(1481785690,hashtext($1))")
+        .bind("n1")
+        .execute(&mut *barrier)
+        .await
+        .unwrap();
+    barrier.commit().await.unwrap();
+    let rejected = db.store.record_sniffing_failed_report("n1", report).await;
+    assert!(
+        matches!(rejected, Err(StoreError::Forbidden(_))),
+        "{rejected:?}"
+    );
     let result = db
         .store
         .user_sniffing_failed_targets(
