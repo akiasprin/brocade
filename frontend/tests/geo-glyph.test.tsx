@@ -42,13 +42,17 @@ it('retains brand artwork for known services', () => {
   }
 });
 
-it('keeps region flags and gives special GeoIP ranges neutral icons', () => {
+it('keeps region flags and gives special GeoIP ranges solid collection icons', () => {
   const region = render(<GeoGlyph kind="geoip" code="!cn" />);
   expect(region.container.querySelector('.geo-flag')).not.toBeNull();
   region.unmount();
   const privateIp = render(<GeoGlyph kind="geoip" code="private" />);
-  expect(privateIp.container.querySelector('[data-geo-glyph="private"]')).not.toBeNull();
+  const privateIcon = privateIp.container.querySelector('[data-geo-glyph="private"]');
+  expect(privateIcon).not.toBeNull();
+  expect(privateIcon?.classList.contains('theme')).toBe(true);
   privateIp.unmount();
   const other = render(<GeoGlyph kind="geoip" code="future-range" />);
+  const otherIcon = other.container.querySelector('[data-geo-glyph="ip"]');
+  expect(otherIcon?.classList.contains('theme')).toBe(true);
   expect(other.container.querySelector('.geo-ip-text')?.textContent).toBe('IP');
 });

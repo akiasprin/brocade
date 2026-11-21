@@ -125,7 +125,7 @@ export function GeoGlyph({ kind, code }: { kind: GeodataKind; code: string }) {
   const base = kind === 'geoip' ? code.replace(/^!+/, '') : code;
   if (kind === 'geoip') {
     if (/^[a-z]{2}$/i.test(base)) return <RegionFlag code={base} />;
-    return <CollectionIcon glyph={base === 'private' ? 'private' : 'ip'} theme={false} />;
+    return <CollectionIcon glyph={base === 'private' ? 'private' : 'ip'} theme={true} />;
   }
   if (base.startsWith('category-') || base.startsWith('geolocation-') || base.startsWith('tld-') || base === 'cn') {
     const glyph = collectionFor(base);

@@ -425,12 +425,10 @@
   width: 16px;
   height: 16px;
 }
-.geo-ai-text {
+.geo-ai-text,
+.geo-ip-text {
   font: 700 10px/1 var(--sans);
   letter-spacing: -0.04em;
-}
-.geo-ip-text {
-  font: 600 8px/1 var(--mono);
 }
 .geo-menu-picked .geo-collection-icon,
 .geo-select .geo-collection-icon {
