@@ -3099,7 +3099,7 @@ pub struct Accept {
 pub struct Rule {
     #[serde(rename = "m")]
     pub dest_match: DestMatch,
-    #[serde(rename = "a")]
+    #[serde(rename = "a", alias = "action")]
     pub action: Action,
 }
 
