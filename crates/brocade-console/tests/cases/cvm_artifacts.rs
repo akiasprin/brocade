@@ -130,10 +130,12 @@ async fn cvm_artifacts_http_negotiates_manifests_and_keeps_old_agents_on_specs()
         get_json_without_credentials(&app, &path).await.0,
         StatusCode::UNAUTHORIZED
     );
+    publish_cvm_intent(&db).await;
     let response = agent(&app, &node, "/agent/v1/cvm/desired?offset=0", 74, None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let old = response_json(response).await;
     assert!(old.get("page_offset").is_none());
+    assert_eq!(old["instances"][0]["id"], item.desired.id);
     assert!(old["instances"][0].get("artifacts").is_none());
     let response = agent(&app, &node, "/agent/v1/cvm/desired?offset=0", 75, None).await;
     assert_eq!(response.status(), StatusCode::OK);

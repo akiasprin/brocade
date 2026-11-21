@@ -117,6 +117,7 @@ async fn cvm_terminal_http_websocket_relay_revocation_and_lifecycle() {
         .unwrap();
     let instance=db.store.create_cvm(&actor,CvmCreate{request_id:"terminal-http-create-00001".into(),tenant_id:"platform.acme".into(),user_id:"alice".into(),node_id:"n1".into(),name:"terminal".into(),image_id:"debian".into(),resources:brocade_deployment::cvm::Resources{vcpus:1,memory_bytes:134217728,root_disk_bytes:3000000000},
         ssh_public_key:"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEiBcpQEzqzjADp8VXvOigHnqLh5L5xP76cwoCD8YMK5".into(),interfaces:vec![InterfaceRequest{source_id:"public".into(),purpose:InterfacePurpose::Contact,default_ipv4:false,default_ipv6:false}]}).await.unwrap();
+    publish_cvm_intent(&db).await;
     let d = &instance.desired;
     let id = d.id.clone();
     let report:InstanceReport=serde_json::from_value(json!({"id":id,"operation_id":d.operation_id,"generation":d.generation,"spec_sha256":d.spec_sha256,"status":"applied","power":"running","runtime_id":"owned-runtime","volume_id":"owned-volume","access_address":"192.0.2.1",

@@ -11462,6 +11462,148 @@ mod realtime_compression;
 #[path = "http_integration/agent_channel.rs"]
 mod agent_channel;
 
+#[cfg(feature = "cvm")]
+async fn publish_cvm_intent(db: &TestPg) {
+    use brocade_deployment::plan::{
+        AppliedArtifactState, AppliedGrantsState, DeploymentKind, DesiredArtifact, DesiredGrants,
+        ObservedClient, ObservedInbound, PlannedAction,
+    };
+    use brocade_store::{
+        CreateDeploymentRequest, ReportedNodeState, TargetApplyResult, TargetConvergenceReport,
+    };
+
+    let actor = AdminContext::system_admin("cvm-http-publish-fixture");
+    let revision =
+        sqlx::query_scalar::<_, i64>("SELECT current_revision FROM control_state WHERE id=TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap() as u64;
+    let plan = db.store.plan_deployment(&actor, revision).await.unwrap();
+    if plan
+        .targets
+        .iter()
+        .any(|target| target.actions.contains(&PlannedAction::SyncCvm))
+    {
+        let active: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT id,revision_id FROM deployments WHERE kind='config' AND active=TRUE",
+        )
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+        if let Some((id, previous)) = active {
+            if previous != revision as i64 {
+                db.store.cancel_deployment(&actor, id).await.unwrap();
+            }
+        }
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM deployments WHERE kind='config' AND active=TRUE)",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        if !active {
+            db.store
+                .create_deployment(
+                    &actor,
+                    CreateDeploymentRequest {
+                        revision_id: revision,
+                        idempotency_key: format!("cvm-http-fixture-{revision}"),
+                        actor: Some("cvm-http-publish-fixture".to_owned()),
+                        note: None,
+                        kind: DeploymentKind::Config,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let active: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM deployments WHERE kind='config' AND active=TRUE AND status IN ('planned','running')",
+    )
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    let Some(id) = active else {
+        return;
+    };
+    let targets = db
+        .store
+        .deployment_detail(&actor, id, false)
+        .await
+        .unwrap()
+        .targets;
+    let artifact_state = |artifact: &DesiredArtifact| match artifact {
+        DesiredArtifact::Present { sha256, .. } => AppliedArtifactState::Present {
+            sha256: sha256.clone(),
+        },
+        DesiredArtifact::Disabled { .. } => AppliedArtifactState::Disabled,
+        DesiredArtifact::Unmanaged { .. } => AppliedArtifactState::Unmanaged,
+    };
+    for target in &targets {
+        if target.disruptive && target.wave > 1 {
+            let _ = db
+                .store
+                .confirm_deployment_wave(&actor, id, target.wave, None)
+                .await;
+        }
+        if let Some(desired) = db
+            .store
+            .claim_desired_for_node(&target.node_id)
+            .await
+            .unwrap()
+        {
+            let grants = match &desired.desired.grants {
+                DesiredGrants::Present { inbounds } => AppliedGrantsState::Present {
+                    inbounds: inbounds
+                        .iter()
+                        .map(|inbound| ObservedInbound {
+                            tag: inbound.tag.clone(),
+                            clients: inbound
+                                .clients
+                                .iter()
+                                .map(|client| ObservedClient {
+                                    email: client.email.clone(),
+                                    uuid: client.uuid.clone(),
+                                    flow: client.flow.clone(),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                },
+                DesiredGrants::Disabled { .. } => AppliedGrantsState::Disabled,
+                DesiredGrants::Unmanaged { .. } => AppliedGrantsState::Unmanaged,
+            };
+            let observed_before = ReportedNodeState {
+                hy2_port_hop: AppliedArtifactState::Unmanaged,
+                phantun: AppliedArtifactState::Unmanaged,
+                wireguard: AppliedArtifactState::Unknown,
+                xray: AppliedArtifactState::Unknown,
+                grants: AppliedGrantsState::Unknown,
+            };
+            let observed_after = ReportedNodeState {
+                phantun: artifact_state(&desired.desired.phantun),
+                hy2_port_hop: artifact_state(&desired.desired.hy2_port_hop),
+                wireguard: artifact_state(&desired.desired.wireguard),
+                xray: artifact_state(&desired.desired.xray),
+                grants,
+            };
+            db.store
+                .report_target_result(TargetConvergenceReport {
+                    claim_generation: desired.claim_generation,
+                    deployment_id: desired.deployment_id,
+                    node_id: desired.node_id.clone(),
+                    result: TargetApplyResult::Applied,
+                    observed_before,
+                    observed_after,
+                    error: None,
+                    usage_activated_at_unix_secs: None,
+                })
+                .await
+                .unwrap();
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 #[cfg(feature = "cvm")]
@@ -11694,6 +11836,24 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/agent/v1/cvm/desired")
+                .header("authorization", format!("Bearer {}", node_token.token))
+                .header(
+                    "x-brocade-protocol-version",
+                    brocade_deployment::cvm::CVM_PROTOCOL_VERSION.to_string(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let unapproved = response_json(response).await;
+    assert!(unapproved["instances"].as_array().unwrap().is_empty());
+    publish_cvm_intent(&db).await;
     let response = app
         .clone()
         .oneshot(
