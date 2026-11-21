@@ -275,6 +275,43 @@ it('弹层在退出动画前检查未保存保护，拒绝时保持可交互', a
   expect(document.body.querySelector('.dialog-layer')).toBeNull();
 });
 
+it('非模态浮卡保留字段焦点和页面滚动，焦点离开时关闭且不抢回焦点', async () => {
+  function EditablePopover() {
+    const anchor = useRef<HTMLDivElement>(null);
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <div ref={anchor}>
+          <input aria-label="原字段" onClick={() => setOpen(true)} />
+        </div>
+        <button>下一字段</button>
+        {open && (
+          <DialogLayer mode="popover" modal={false} anchor={anchor} label="选择" onClose={() => setOpen(false)}>
+            <section className="dialog-surface">
+              <button>候选</button>
+            </section>
+          </DialogLayer>
+        )}
+      </>
+    );
+  }
+  const view = render(<EditablePopover />);
+  const input = view.getByRole('textbox', { name: '原字段' });
+  input.focus();
+  fireEvent.click(input);
+  expect(document.activeElement).toBe(input);
+  expect(document.body.style.overflow).toBe('');
+  expect(view.getByRole('dialog').getAttribute('aria-modal')).toBeNull();
+  expect(document.querySelector('.dialog-scrim')).toBeNull();
+  const next = view.getByRole('button', { name: '下一字段' });
+  act(() => next.focus());
+  await act(async () => Promise.resolve());
+  act(() => vi.advanceTimersByTime(180));
+  await act(async () => Promise.resolve());
+  expect(view.queryByRole('dialog')).toBeNull();
+  expect(document.activeElement).toBe(next);
+});
+
 function PopoverHarness({ align }: { align?: 'start' | 'end' | 'below' }) {
   const anchor = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);

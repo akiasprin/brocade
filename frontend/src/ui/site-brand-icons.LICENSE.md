@@ -13,7 +13,9 @@
 
 All marks remain the property of their respective trademark owners. Generic observation categories use Brocade's existing interface icons.
 
-Additional categories: Perplexity, Hugging Face, WhatsApp, Reddit, Twitch, GitLab, Zoom, Slack, LINE, Signal, Speedtest, Bilibili, ByteDance, Baidu, Alibaba.com, Huawei, Xiaomi, Kuaishou and Meituan use Simple Icons 14.15.0 (same CC0 license). Source filenames are their lowercase names without spaces, except Alibaba.com (`alibabadotcom.svg`). Douyin uses the same music-note outline as TikTok. xAI, Cursor, NetEase and JD use locally drawn letter/pointer identifiers; Pinduoduo uses a locally drawn heart identifier. These local identifiers are not reproductions of official brand artwork.
+Additional categories: Perplexity, WhatsApp, Reddit, Twitch, GitLab, Zoom, Slack, LINE, Signal, Speedtest, Bilibili, ByteDance, Baidu, Alibaba.com, Huawei, Xiaomi, Kuaishou and Meituan use Simple Icons 14.15.0 (same CC0 license). Source filenames are their lowercase names without spaces, except Alibaba.com (`alibabadotcom.svg`). Douyin uses the same music-note outline as TikTok. xAI, Cursor, NetEase and JD use locally drawn letter/pointer identifiers; Pinduoduo uses a locally drawn heart identifier. These local identifiers are not reproductions of official brand artwork.
+
+Cloudflare and Amazon use Simple Icons 14.15.0 `cloudflare.svg` and `amazon.svg` (same CC0 license). Hugging Face uses user-provided pirate SVG artwork, adapted to transparent monochrome geometry in `site-huggingface-icon.ts`. The hands are redrawn with broad palms and short thumb outlines for small-size rendering. Original Hugging Face trademark artwork; no CC0 license is asserted.
 
 Gemini’s four-point star and Prime Video’s play/curved-arrow identifiers in `panes/node-unlock.tsx` are locally drawn monochrome identifiers, not official brand artwork. No external asset is loaded.
 

@@ -6708,7 +6708,8 @@ function ChainRulesPanelContent({
     const repeated = rendered.has(node) || path.includes(node);
     if (!repeated) rendered.add(node);
     const occurrence = [...path, node].join('>');
-    const defaultExpanded = !repeated && node === initiallyExpanded;
+    // 机器详情中本机规则默认收起，点击机器标题再展开；链详情页仍默认展开入口。
+    const defaultExpanded = !repeated && !machineRole && node === initiallyExpanded;
     const expanded = expansion.get(occurrence) ?? defaultExpanded;
     const toggle = () =>
       setExpansion(previous => new Map(previous).set(occurrence, !(previous.get(occurrence) ?? defaultExpanded)));

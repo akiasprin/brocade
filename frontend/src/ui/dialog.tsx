@@ -33,16 +33,17 @@ function popoverPlace(
   width: number,
   height: number,
   align: PopoverAlign,
+  gap: number,
 ): { top: number; left: number } {
   const right = window.innerWidth - POPOVER_MARGIN;
   const bottom = window.innerHeight - POPOVER_MARGIN;
   const fitTop = (top: number) => Math.max(POPOVER_MARGIN, Math.min(top, bottom - height));
-  if (align === 'start' && anchor.right + POPOVER_GAP + width <= right)
-    return { top: fitTop(anchor.top), left: anchor.right + POPOVER_GAP };
+  if (align === 'start' && anchor.right + gap + width <= right)
+    return { top: fitTop(anchor.top), left: anchor.right + gap };
   const left = Math.max(POPOVER_MARGIN, Math.min(align === 'end' ? anchor.right - width : anchor.left, right - width));
-  if (anchor.bottom + POPOVER_GAP + height <= bottom) return { top: anchor.bottom + POPOVER_GAP, left };
-  if (anchor.top - POPOVER_GAP - height >= POPOVER_MARGIN) return { top: anchor.top - POPOVER_GAP - height, left };
-  return { top: fitTop(anchor.bottom + POPOVER_GAP), left };
+  if (anchor.bottom + gap + height <= bottom) return { top: anchor.bottom + gap, left };
+  if (anchor.top - gap - height >= POPOVER_MARGIN) return { top: anchor.top - gap - height, left };
+  return { top: fitTop(anchor.bottom + gap), left };
 }
 
 const DialogCloseContext = createContext<(() => void) | null>(null);
@@ -85,7 +86,9 @@ export function DialogLayer({
   mode = 'modal',
   anchor,
   align = 'start',
+  gap = POPOVER_GAP,
   className,
+  modal = true,
   onClose,
   canClose,
   children,
@@ -97,8 +100,16 @@ export function DialogLayer({
   canClose?: () => boolean;
   children: ReactNode;
 } & (
-  | { mode?: Exclude<DialogMode, 'popover'>; anchor?: never; align?: never }
-  | { mode: 'popover'; anchor: RefObject<HTMLElement | null>; align?: PopoverAlign }
+  | { mode?: Exclude<DialogMode, 'popover'>; anchor?: never; align?: never; gap?: never; modal?: never }
+  | {
+      mode: 'popover';
+      anchor: RefObject<HTMLElement | null>;
+      align?: PopoverAlign;
+      /** Space between the anchor and the surface, in CSS pixels. */
+      gap?: number;
+      /** Editable anchor stays interactive; outside clicks and focus dismiss the popover. */
+      modal?: boolean;
+    }
 )) {
   const rootRef = useRef<HTMLDivElement>(null);
   const identity = useRef(Symbol(label));
@@ -145,11 +156,13 @@ export function DialogLayer({
     if (!dialog) return;
     dialogStack.push({ identity: dialogIdentity, root: dialog, returnTargets });
 
-    if (scrollLocks === 0) {
-      savedBodyOverflow = document.body.style.overflow;
-      document.body.style.overflow = 'hidden';
+    if (modal) {
+      if (scrollLocks === 0) {
+        savedBodyOverflow = document.body.style.overflow;
+        document.body.style.overflow = 'hidden';
+      }
+      scrollLocks += 1;
     }
-    scrollLocks += 1;
 
     // React autoFocus focuses during commit without retaining an autofocus attribute.
     // Keep that descendant's focus instead of moving to the first close button.
@@ -157,7 +170,7 @@ export function DialogLayer({
     const focusTarget =
       dialog.querySelector<HTMLElement>('[autofocus]') ??
       (active instanceof HTMLElement && dialog.contains(active) ? active : focusableElements(dialog)[0]);
-    focusTarget?.focus();
+    if (modal) focusTarget?.focus();
 
     return () => {
       let index = -1;
@@ -167,11 +180,15 @@ export function DialogLayer({
         break;
       }
       if (index >= 0) dialogStack.splice(index, 1);
-      scrollLocks = Math.max(0, scrollLocks - 1);
-      if (scrollLocks === 0) document.body.style.overflow = savedBodyOverflow;
+      if (modal) {
+        scrollLocks = Math.max(0, scrollLocks - 1);
+        if (scrollLocks === 0) document.body.style.overflow = savedBodyOverflow;
+      }
+      const restoreFocus = modal || dialog.contains(document.activeElement);
       // React removes an auto-focused child after layout-effect cleanup. Restore on the next
       // microtask so that removal cannot move focus back to <body> after this call.
       queueMicrotask(() => {
+        if (!restoreFocus) return;
         const remainingDialog = dialogStack.at(-1);
         const target = returnTargets.find(
           candidate => candidate.isConnected && (!remainingDialog || remainingDialog.root.contains(candidate)),
@@ -179,7 +196,7 @@ export function DialogLayer({
         target?.focus();
       });
     };
-  }, []);
+  }, [modal]);
 
   // The scrim swallows wheel and touch scrolling, so only a resize or the surface's own content can move the panel.
   useLayoutEffect(() => {
@@ -188,19 +205,60 @@ export function DialogLayer({
       const target = anchor?.current;
       const surface = rootRef.current?.querySelector<HTMLElement>(':scope > .dialog-surface');
       if (!target || !surface) return;
-      const next = popoverPlace(target.getBoundingClientRect(), surface.offsetWidth, surface.offsetHeight, align);
+      const bounds = target.getBoundingClientRect();
+      let next = popoverPlace(bounds, surface.offsetWidth, surface.offsetHeight, align, gap);
+      if (!modal) {
+        const viewport = window.visualViewport;
+        const top = (viewport?.offsetTop ?? 0) + POPOVER_MARGIN;
+        const bottom = (viewport?.offsetTop ?? 0) + (viewport?.height ?? window.innerHeight) - POPOVER_MARGIN;
+        const left = (viewport?.offsetLeft ?? 0) + POPOVER_MARGIN;
+        const right = left + (viewport?.width ?? window.innerWidth) - POPOVER_MARGIN * 2;
+        const below = Math.max(0, bottom - bounds.bottom - gap);
+        const above = Math.max(0, bounds.top - top - gap);
+        const useBelow = below >= 160 || below >= above;
+        surface.style.setProperty('--popover-available-height', `${useBelow ? below : above}px`);
+        next = {
+          top: useBelow ? bounds.bottom + gap : bounds.top - gap - surface.offsetHeight,
+          left: Math.max(left, Math.min(bounds.left, right - surface.offsetWidth)),
+        };
+      }
       setPlace(current => (current?.top === next.top && current.left === next.left ? current : next));
     };
     measure();
     window.addEventListener('resize', measure);
+    if (!modal) {
+      window.addEventListener('scroll', measure, true);
+      window.visualViewport?.addEventListener('resize', measure);
+      window.visualViewport?.addEventListener('scroll', measure);
+    }
     const surface = rootRef.current?.querySelector(':scope > .dialog-surface');
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
     if (surface) observer?.observe(surface);
+    if (anchor?.current) observer?.observe(anchor.current);
     return () => {
       window.removeEventListener('resize', measure);
+      window.removeEventListener('scroll', measure, true);
+      window.visualViewport?.removeEventListener('resize', measure);
+      window.visualViewport?.removeEventListener('scroll', measure);
       observer?.disconnect();
     };
-  }, [align, anchor, mode]);
+  }, [align, anchor, gap, mode, modal]);
+
+  useEffect(() => {
+    if (modal) return;
+    const dismiss = (event: Event) => {
+      if (dialogStack.at(-1)?.identity !== identity.current) return;
+      const target = event.target;
+      if (!(target instanceof Node) || rootRef.current?.contains(target) || anchor?.current?.contains(target)) return;
+      requestClose();
+    };
+    document.addEventListener('pointerdown', dismiss, true);
+    document.addEventListener('focusin', dismiss);
+    return () => {
+      document.removeEventListener('pointerdown', dismiss, true);
+      document.removeEventListener('focusin', dismiss);
+    };
+  }, [anchor, modal, requestClose]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -210,7 +268,7 @@ export function DialogLayer({
         requestClose();
         return;
       }
-      if (event.key !== 'Tab') return;
+      if (!modal || event.key !== 'Tab') return;
 
       const dialog = rootRef.current;
       if (!dialog) return;
@@ -232,7 +290,7 @@ export function DialogLayer({
     };
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
-  }, [requestClose]);
+  }, [modal, requestClose]);
 
   if (!presence.present) return null;
 
@@ -240,10 +298,10 @@ export function DialogLayer({
     <DialogCloseContext.Provider value={requestClose}>
       <div
         ref={rootRef}
-        className={`dialog-layer ${mode}${className ? ` ${className}` : ''}`}
+        className={`dialog-layer ${mode}${modal ? '' : ' nonmodal'}${className ? ` ${className}` : ''}`}
         data-motion-state={presence.phase}
         role="dialog"
-        aria-modal="true"
+        aria-modal={modal || undefined}
         aria-label={label}
         aria-hidden={closing || undefined}
         inert={closing}
@@ -254,7 +312,9 @@ export function DialogLayer({
             : undefined
         }
       >
-        <button className="dialog-scrim" type="button" tabIndex={-1} aria-label="关闭" onClick={requestClose} />
+        {modal && (
+          <button className="dialog-scrim" type="button" tabIndex={-1} aria-label="关闭" onClick={requestClose} />
+        )}
         {children}
       </div>
     </DialogCloseContext.Provider>,

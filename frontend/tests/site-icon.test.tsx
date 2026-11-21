@@ -42,6 +42,15 @@ it('uses local generic icons for unclassified traffic and unknown categories', (
   }
 });
 
+it('renders transparent pirate Hugging Face artwork with simplified palm outlines', () => {
+  const view = render(<SiteIcon siteId="huggingface" />);
+  const icon = view.container.querySelector('[data-site-icon="huggingface"]');
+  expect(icon?.querySelectorAll('svg > path')).toHaveLength(9);
+  expect(icon?.querySelectorAll('svg > path[fill="none"][stroke="currentColor"]')).toHaveLength(2);
+  expect(icon?.querySelector('[fill="white"], [fill="black"], [fill="#FF323D"]')).toBeNull();
+  expect(icon?.querySelector('text, img, image, use, script')).toBeNull();
+});
+
 it.each([
   ['dazn', 1],
   ['hbomax', 6],

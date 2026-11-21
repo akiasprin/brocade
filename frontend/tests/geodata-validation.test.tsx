@@ -188,6 +188,59 @@ it('moves through options with the arrow keys and adds the highlighted one on En
   fireEvent.keyDown(search, { key: 'Enter' });
   expect(changed).toHaveBeenLastCalledWith(['google@ads']);
 });
+it.each(['geosite', 'geoip'] as const)(
+  'keeps %s selections without a status line while the catalogue loads',
+  async kind => {
+    let finish!: (response: Response) => void;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        () =>
+          new Promise<Response>(resolve => {
+            finish = resolve;
+          }),
+      ),
+    );
+    const value = kind === 'geosite' ? 'netflix' : 'cn';
+    const view = mount(<GeoSelector kind={kind} values={[value]} label="匹配内容" onChange={vi.fn()} />);
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    expect(view.getByRole('button', { name: `预览 ${value}` })).toBeTruthy();
+    expect(view.container.querySelector('.geo-message')).toBeNull();
+    expect(view.container.querySelector('.geo-select')?.getAttribute('aria-busy')).toBe('true');
+    finish(Response.json(geoCatalog(kind)));
+    await waitFor(() => expect(view.container.querySelector('.geo-select')?.getAttribute('aria-busy')).toBe('false'));
+    expect(view.container.querySelector('.geo-message')).toBeNull();
+    expect(view.getByRole('button', { name: `预览 ${value}` })).toBeTruthy();
+  },
+);
+it('edits through the original field on narrow screens and expands attributes in place', async () => {
+  vi.stubGlobal('matchMedia', (media: string) => ({
+    matches: media.includes('max-width'),
+    media,
+    addEventListener() {},
+    removeEventListener() {},
+  }));
+  const changed = vi.fn();
+  const view = mount(<GeoField initial={['netflix', 'cn']} onChange={changed} />);
+  const field = view.getByRole('combobox', { name: '匹配内容' });
+  field.focus();
+  const menu = await openMenu(view);
+  expect(menu.queryByRole('combobox')).toBeNull();
+  expect(document.activeElement).toBe(field);
+  expect(document.body.style.overflow).toBe('');
+  fireEvent.change(field, { target: { value: 'google' } });
+  expect(menu.queryByRole('option', { name: 'google@ads' })).toBeNull();
+  fireEvent.click(menu.getByRole('button', { name: 'google 的 2 个属性' }));
+  fireEvent.click(menu.getByRole('option', { name: 'google@ads' }));
+  expect(changed).toHaveBeenLastCalledWith(['netflix', 'cn', 'google@ads']);
+  expect((field as HTMLInputElement).value).toBe('google');
+  fireEvent.change(field, { target: { value: 'goo' } });
+  fireEvent.keyDown(field, { key: 'ArrowDown' });
+  expect(field.getAttribute('aria-activedescendant')).toBeTruthy();
+  fireEvent.click(view.getByRole('button', { name: '完成 geosite 选择' }));
+  expect(view.queryByRole('dialog', { name: 'geosite 选项' })).toBeNull();
+});
+
 it('keeps unconfirmed old selections when the catalogue cannot be loaded', async () => {
   vi.stubGlobal(
     'fetch',

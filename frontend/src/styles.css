@@ -10594,6 +10594,12 @@ details.more b {
   display: block;
   padding: 0;
 }
+.dialog-layer.popover.nonmodal {
+  pointer-events: none;
+}
+.dialog-layer.popover.nonmodal > .dialog-surface {
+  pointer-events: auto;
+}
 .dialog-layer.popover > .dialog-scrim {
   background: transparent;
   backdrop-filter: none;

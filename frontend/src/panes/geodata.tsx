@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { fetchGeoCatalog, fetchGeoRelations, geoValueIssue, geoSuggestions, type GeodataKind } from '../api/geodata';
 import { DialogLayer } from '../ui/dialog';
 import { Icon } from '../ui/icons';
+import { useNarrow } from '../ui/viewport';
 import { GeoBrowser } from './geo-browser';
 import { GeoGlyph, GeoMenu } from './geo-menu';
 import { geoBlockReason, geoIndex } from './geo-menu-model';
@@ -54,11 +55,30 @@ export function GeoSelector({
   const catalog = useGeoCatalog(kind, !unavailable);
   const anchor = useRef<HTMLDivElement>(null);
   const menuInput = useRef<HTMLInputElement>(null);
+  const fieldInput = useRef<HTMLInputElement>(null);
+  const narrow = useNarrow();
+  const [keyboard, setKeyboard] = useState(false);
+  const [selectionRequest, setSelectionRequest] = useState(0);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [preview, setPreview] = useState<string | null>(null);
   const [shown, setShown] = useState(1);
   const id = useId();
+  const compact = narrow && open;
+  const typing = compact && (keyboard || query.length > 0);
+  const visibleValues = compact ? values.slice(typing ? -1 : -4) : values.slice(0, shown);
+  const close = () => {
+    setOpen(false);
+    if (narrow) fieldInput.current?.blur();
+  };
+  useEffect(() => {
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+    const update = () => setKeyboard(window.innerHeight - viewport.height > 100);
+    update();
+    viewport.addEventListener('resize', update);
+    return () => viewport.removeEventListener('resize', update);
+  }, []);
   useEffect(() => {
     const element = anchor.current;
     if (!element) return;
@@ -69,7 +89,7 @@ export function GeoSelector({
   }, []);
   const invalid = values.map(value => geoValueIssue(catalog.data, value)).find(Boolean);
   const error = issue || invalid;
-  const unknown = !catalog.data && values.length > 0;
+  const unknown = !catalog.data && catalog.isError && values.length > 0;
   const candidates = (catalog.data?.entries ?? []).flatMap(entry => [
     entry.code,
     ...entry.attrs.map(a => `${entry.code}@${a}`),
@@ -86,8 +106,8 @@ export function GeoSelector({
     const index = geoIndex(kind, catalog.data, values);
     if (geoBlockReason(index, value, values, blockedValues)) return;
     onChange([...values, value]);
-    setQuery('');
-    menuInput.current?.focus();
+    if (!(narrow && value.includes('@'))) setQuery('');
+    (narrow ? fieldInput : menuInput).current?.focus({ preventScroll: true });
   };
   // 预览中换属性（google → google@cn）：原位替换，同样不能被本条或前面规则包含。
   const replace = (from: string, to: string) => {
@@ -98,13 +118,21 @@ export function GeoSelector({
   };
   return (
     <div className="geo-field">
-      <div ref={anchor} className={`f geo-select${error ? ' invalid' : ''}`} aria-disabled={disabled}>
-        {values.slice(0, shown).map(value => (
+      <div
+        ref={anchor}
+        className={`f geo-select${error ? ' invalid' : ''}${compact ? ' editing' : ''}${typing ? ' typing' : ''}`}
+        aria-disabled={disabled}
+        aria-busy={catalog.isFetching}
+      >
+        {visibleValues.map(value => (
           <span className={`geo-chip${geoValueIssue(catalog.data, value) ? ' invalid' : ''}`} key={value} title={value}>
             <button
               type="button"
               className="geo-chip-name"
-              onClick={() => setPreview(value)}
+              onClick={() => {
+                setOpen(false);
+                setPreview(value);
+              }}
               aria-label={`预览 ${value}`}
             >
               <GeoGlyph kind={kind} code={value.split('@')[0]} />
@@ -115,44 +143,65 @@ export function GeoSelector({
             </button>
           </span>
         ))}
-        {values.length > shown && (
-          <button type="button" className="geo-more-count" onClick={() => setOpen(true)}>
-            +{values.length - shown}
+        {values.length > visibleValues.length && (
+          <button
+            type="button"
+            disabled={disabled}
+            className="geo-more-count"
+            aria-label={`查看全部 ${values.length} 个已选`}
+            onClick={() => {
+              setQuery('');
+              setSelectionRequest(v => v + 1);
+              setOpen(true);
+            }}
+          >
+            +{values.length - visibleValues.length}
           </button>
         )}
-        <input
-          aria-label={label}
-          maxLength={253}
-          role="combobox"
-          aria-expanded={open}
-          aria-controls={open ? id : undefined}
-          aria-autocomplete="list"
-          value={query}
-          disabled={disabled}
-          placeholder={values.length ? '' : kind === 'geosite' ? '如 netflix' : '如 cn'}
-          onClick={() => setOpen(true)}
-          onChange={e => {
-            setQuery(e.target.value);
-            setOpen(true);
-          }}
-          onKeyDown={e => {
-            if (e.key === 'Enter' || e.key === 'ArrowDown') {
-              e.preventDefault();
+        <span className="geo-input-line">
+          <input
+            ref={fieldInput}
+            aria-label={label}
+            maxLength={253}
+            role="combobox"
+            aria-expanded={open}
+            aria-controls={open ? id : undefined}
+            aria-autocomplete="list"
+            value={query}
+            disabled={disabled}
+            autoComplete="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            enterKeyHint="search"
+            placeholder={compact ? '继续添加…' : values.length ? '' : kind === 'geosite' ? '如 netflix' : '如 cn'}
+            onClick={() => setOpen(true)}
+            onChange={e => {
+              setQuery(e.target.value);
               setOpen(true);
-            }
-            if (e.key === 'Backspace' && !query && values.length) onChange(values.slice(0, -1));
-            if (e.key === 'Escape') setOpen(false);
-          }}
-        />
-        <button
-          type="button"
-          disabled={disabled}
-          className="geo-chevron"
-          aria-label={`展开 ${kind}`}
-          onClick={() => setOpen(v => !v)}
-        >
-          <Icon of="chevronDown" size={14} />
-        </button>
+            }}
+            onKeyDown={e => {
+              if (e.nativeEvent.isComposing) return;
+              if (!open && (e.key === 'Enter' || e.key === 'ArrowDown')) {
+                e.preventDefault();
+                setOpen(true);
+              }
+              if (e.key === 'Backspace' && !query && values.length) onChange(values.slice(0, -1));
+              if (e.key === 'Escape') close();
+            }}
+          />
+          <button
+            type="button"
+            disabled={disabled}
+            className={compact ? 'geo-done' : 'geo-chevron'}
+            aria-label={compact ? `完成 ${kind} 选择` : `展开 ${kind}`}
+            onClick={() => {
+              if (open) close();
+              else setOpen(true);
+            }}
+          >
+            {compact ? '完成' : <Icon of="chevronDown" size={14} />}
+          </button>
+        </span>
       </div>
       {(error || unknown) && (
         <div className={`geo-message${error ? ' error' : ''}`} title={error || '规则集未加载，分类未确认'}>
@@ -177,7 +226,9 @@ export function GeoSelector({
           mode="popover"
           anchor={anchor}
           align="below"
-          className="geo-menu-layer"
+          gap={2}
+          modal={!narrow}
+          className={`geo-menu-layer${narrow ? ' geo-menu-compact' : ''}`}
           label={`${kind} 选项`}
           onClose={() => setOpen(false)}
         >
@@ -195,7 +246,9 @@ export function GeoSelector({
               setPreview(value);
               setOpen(false);
             }}
-            inputRef={menuInput}
+            compact={narrow}
+            selectionRequest={selectionRequest}
+            inputRef={narrow ? fieldInput : menuInput}
             listId={id}
           />
         </DialogLayer>

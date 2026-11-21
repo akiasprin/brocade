@@ -2,6 +2,7 @@
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MachineEgressDnsRules } from '../../src/panes/rules';
+import { GeoSelector } from '../../src/panes/geodata';
 import { UnlockDnsDetails } from '../../src/panes/unlock-dns';
 import { unlockReport } from '../../src/panes/unlock-report';
 import { geoCatalog, geodataFixture } from './geodata-data';
@@ -14,7 +15,10 @@ const params = new URLSearchParams(location.search);
 const selectedTheme = params.get('theme') === 'dark' ? 'dark' : 'light';
 const editing = params.get('scene') === 'editing';
 if (theme.snapshot() !== selectedTheme) theme.toggle();
-const selector = { t: 'geosite' as const, v: ['category-ai-!cn'] };
+const selector =
+  params.get('kind') === 'geoip'
+    ? { t: 'geoip' as const, v: ['cn'] }
+    : { t: 'geosite' as const, v: [params.has('invalid-category') ? 'missing-category' : 'category-ai-!cn'] };
 const resolution: EgressDnsResolution = {
   address: params.get('scene') === 'legacy' ? '192.0.2.53' : '192.0.2.53, 198.51.100.53, 2001:db8::53',
   port: 53,
@@ -115,8 +119,11 @@ const job: NodeUnlockProbe = {
   ],
 };
 const row = unlockReport(job).rows[0];
+const nativeFetch = globalThis.fetch;
 globalThis.fetch = async (input, init) => {
   const path = input instanceof Request ? input.url : String(input);
+  if (params.get('catalog') === 'delayed' && new URL(path, location.href).pathname === '/routing/geodata/catalog')
+    return nativeFetch(input, init);
   if (params.get('catalog') === 'long' && new URL(path, location.href).pathname === '/routing/geodata/catalog') {
     const catalog = geoCatalog('geosite');
     return Response.json({
@@ -155,12 +162,18 @@ const preview = (
           <h2>香港落地 · DNS 规则</h2>
         </header>
       )}
-      <MachineEgressDnsRules
-        nodeId="preview-exit"
-        nodeName="香港落地"
-        readOnly={params.get('role') === 'readonly'}
-        showHeader={editing || params.get('scene') === 'create'}
-      />
+      {params.get('kind') === 'geoip' ? (
+        <div style={{ width: 300, padding: 16 }}>
+          <GeoSelector kind="geoip" values={['cn']} label="IP 匹配内容" onChange={() => {}} />
+        </div>
+      ) : (
+        <MachineEgressDnsRules
+          nodeId="preview-exit"
+          nodeName="香港落地"
+          readOnly={params.get('role') === 'readonly'}
+          showHeader={editing || params.get('scene') === 'create'}
+        />
+      )}
     </section>
     {!editing && (
       <section className="cg-sec" style={{ marginTop: 20, padding: 16 }}>

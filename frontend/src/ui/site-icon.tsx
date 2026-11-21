@@ -1,12 +1,21 @@
+import { HUGGING_FACE_MARK } from './site-huggingface-icon';
 import { Icon } from './icons';
 import { ADDITIONAL_BRAND_MARKS } from './site-additional-icons';
 import { STREAMING_BRAND_MARKS } from './site-streaming-icons';
 
 // Local monochrome brand outlines, not remote favicons. Sources and licenses:
 // site-brand-icons.LICENSE.md. Text beside each icon supplies its accessible name.
-const BRAND_MARKS: Readonly<Record<string, { viewBox: string; path: string | readonly string[] }>> = {
+type BrandMark = {
+  viewBox: string;
+  path: string | readonly string[];
+  outlinePath?: string | readonly string[];
+  outlineWidth?: number;
+};
+
+const BRAND_MARKS: Readonly<Record<string, BrandMark>> = {
   ...ADDITIONAL_BRAND_MARKS,
   ...STREAMING_BRAND_MARKS,
+  huggingface: HUGGING_FACE_MARK,
   facebook: {
     viewBox: '0 0 24 24',
     path: 'M24 12.073C24 5.405 18.627 0 12 0S0 5.405 0 12.073C0 18.1 4.388 23.095 10.125 24v-8.437H7.078v-3.49h3.047V9.413c0-3.025 1.792-4.697 4.533-4.697 1.312 0 2.686.236 2.686.236v2.972H15.83c-1.491 0-1.956.931-1.956 1.887v2.262h3.328l-.532 3.49h-2.796V24C19.612 23.095 24 18.1 24 12.073Z',
@@ -81,8 +90,17 @@ const BRAND_MARKS: Readonly<Record<string, { viewBox: string; path: string | rea
   },
 };
 
+export function hasSiteBrand(siteId: string) {
+  return Object.hasOwn(BRAND_MARKS, siteId);
+}
+
 export function SiteIcon({ siteId }: { siteId: string }) {
-  const mark = Object.hasOwn(BRAND_MARKS, siteId) ? BRAND_MARKS[siteId] : undefined;
+  const mark = hasSiteBrand(siteId) ? BRAND_MARKS[siteId] : undefined;
+  const outlinePaths = mark?.outlinePath
+    ? typeof mark.outlinePath === 'string'
+      ? [mark.outlinePath]
+      : mark.outlinePath
+    : [];
   return (
     <span className="site-brand-icon" data-site-icon={siteId} aria-hidden="true">
       {mark ? (
@@ -92,6 +110,17 @@ export function SiteIcon({ siteId }: { siteId: string }) {
           ) : (
             mark.path.map((path, index) => <path key={index} d={path} />)
           )}
+          {outlinePaths.map((path, index) => (
+            <path
+              key={index}
+              d={path}
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={mark.outlineWidth}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          ))}
         </svg>
       ) : (
         <Icon of={siteId === 'sniffing-failed' ? 'search' : siteId === 'unidentified' ? 'info' : 'dns'} size={18} />

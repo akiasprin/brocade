@@ -4,8 +4,9 @@ import { getDomain } from 'tldts';
 import { geoSuggestions, lookupGeosite, type GeoCatalog, type GeodataKind } from '../api/geodata';
 import { DialogClose } from '../ui/dialog';
 import { Icon } from '../ui/icons';
-import { RegionFlag } from '../ui/region-flag';
-import { SiteIcon } from '../ui/site-icon';
+import { GeoGlyph } from './geo-glyph';
+
+export { GeoGlyph } from './geo-glyph';
 import {
   GEO_PAGE,
   GEO_WIDE_COUNT,
@@ -19,11 +20,6 @@ import {
   searchGeo,
   type GeoFamily,
 } from './geo-menu-model';
-
-export function GeoGlyph({ kind, code }: { kind: GeodataKind; code: string }) {
-  const base = kind === 'geoip' ? code.replace(/^!+/, '') : code;
-  return kind === 'geoip' && /^[a-z]{2}$/i.test(base) ? <RegionFlag code={base} /> : <SiteIcon siteId={base} />;
-}
 
 const fmt = (n: number) => n.toLocaleString('en-US');
 
@@ -42,7 +38,7 @@ type Row =
 type Section = { key: string; title: string; note?: string; rows: Row[]; after?: ReactNode };
 
 /**
- * 菜单主体（方案 B）：左侧按常用、已用、地区汇总、主题和 A–Z 浏览，右侧是分组列表；
+ * 按常用、已用、地区汇总、主题和 A–Z 浏览；窄屏用贴附浮卡，直接在原字段输入。
  * 搜索时侧栏显示各组命中数，输入域名时按条目数由少到多列出包含它的分类。
  */
 export function GeoMenu({
@@ -58,6 +54,8 @@ export function GeoMenu({
   onPreview,
   inputRef,
   listId,
+  compact = false,
+  selectionRequest = 0,
 }: {
   kind: GeodataKind;
   catalog: UseQueryResult<GeoCatalog>;
@@ -72,12 +70,16 @@ export function GeoMenu({
   inputRef: RefObject<HTMLInputElement | null>;
   /** 字段输入框的 aria-controls 指向这里。 */
   listId: string;
+  compact?: boolean;
+  selectionRequest?: number;
 }) {
   const listRef = useRef<HTMLDivElement>(null);
   const data = catalog.data;
   const index = useMemo(() => (data ? geoIndex(kind, data, values) : null), [kind, data, values]);
   const parsed = index ? parseGeoQuery(index, query) : ({ mode: 'empty' } as const);
-  const [group, setGroup] = useState<string | null>(null);
+  const [group, setGroup] = useState<string | null>(selectionRequest ? 'used' : null);
+  const [seenSelectionRequest, setSeenSelectionRequest] = useState(selectionRequest);
+  const [expanded, setExpanded] = useState<string | null>(null);
   const [limit, setLimit] = useState(GEO_PAGE);
   const [letter, setLetter] = useState<string | null>(null);
   const [active, setActive] = useState(0);
@@ -92,6 +94,12 @@ export function GeoMenu({
     setLimit(GEO_PAGE);
     setActive(0);
     setNavigated(false);
+  }
+  if (seenSelectionRequest !== selectionRequest) {
+    setSeenSelectionRequest(selectionRequest);
+    setGroup('used');
+    setLimit(GEO_PAGE);
+    setActive(0);
   }
   const domain = parsed.mode === 'domain' ? parsed.domain : '';
   const [settled, setSettled] = useState('');
@@ -109,8 +117,13 @@ export function GeoMenu({
 
   if (!data || !index) {
     return (
-      <section className="dialog-surface geo-menu">
-        <MenuSearch kind={kind} query={query} onQuery={onQuery} inputRef={inputRef} />
+      <section
+        className="dialog-surface geo-menu"
+        onPointerDown={event => {
+          if (compact && event.target instanceof Element && event.target.closest('button')) event.preventDefault();
+        }}
+      >
+        {!compact && <MenuSearch kind={kind} query={query} onQuery={onQuery} inputRef={inputRef} />}
         <div className="geo-menu-state">
           {catalog.isError ? '规则集无法加载' : '规则集加载中…'}
           {catalog.isError && (
@@ -285,7 +298,9 @@ export function GeoMenu({
   }
 
   // 键盘顺序与 DOM 顺序一致：每行先主选项，再行内属性（最多三个）。先收集，再按同样顺序渲染。
-  const PILLS = 3;
+  const PILLS = compact ? Number.MAX_SAFE_INTEGER : 3;
+  const shownAttrs = (row: Extract<Row, { t: 'option' }>) =>
+    !compact || expanded === row.value ? (row.attrs ?? []).slice(0, PILLS) : [];
   const options: { value: string; disabled: boolean }[] = [];
   const collect = (value: string) =>
     options.push({ value, disabled: !isSelected(value) && (disabled || !!reason(value)) });
@@ -295,7 +310,7 @@ export function GeoMenu({
       else {
         collect(row.value);
         const code = row.value.split('@')[0];
-        (row.attrs ?? []).slice(0, PILLS).forEach(a => collect(`${code}@${a}`));
+        shownAttrs(row).forEach(a => collect(`${code}@${a}`));
       }
     }
   const activeIndex = Math.min(active, Math.max(0, options.length - 1));
@@ -310,7 +325,7 @@ export function GeoMenu({
     const selected = isSelected(row.value);
     const why = selected ? null : reason(row.value);
     const extra = (row.attrs ?? []).slice(PILLS);
-    const pills = (row.attrs ?? []).slice(0, PILLS).map(a => ({ value: `${code}@${a}`, attr: a, at: optionFor() }));
+    const pills = shownAttrs(row).map(a => ({ value: `${code}@${a}`, attr: a, at: optionFor() }));
     const count = row.count ?? (attr ? entry?.attr_counts?.[attr] : entry?.count);
     const missing = !entry;
     const region = kind === 'geoip' ? regionName(code.replace(/^!+/, '')) : '';
@@ -341,6 +356,17 @@ export function GeoMenu({
           {row.via && <small className="geo-row-via">{row.via}</small>}
         </span>
         {row.tag && <span className={`geo-row-tag${row.tag.wide ? ' wide' : ''}`}>{row.tag.text}</span>}
+        {compact && !!row.attrs?.length && (
+          <button
+            type="button"
+            className="geo-row-attrs-toggle"
+            aria-label={`${code} 的 ${row.attrs.length} 个属性`}
+            aria-expanded={expanded === row.value}
+            onClick={() => setExpanded(expanded === row.value ? null : row.value)}
+          >
+            {row.attrs.length} 属性 <Icon of="chevronDown" size={11} />
+          </button>
+        )}
         {pills.length > 0 && (
           <span className="geo-row-attrs">
             {pills.map(pill => (
@@ -444,26 +470,41 @@ export function GeoMenu({
   const loaded = new Date(data.loaded_at * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
 
   return (
-    <section className="dialog-surface geo-menu">
-      <MenuSearch
-        kind={kind}
-        query={query}
-        onQuery={onQuery}
-        inputRef={inputRef}
-        listId={listId}
-        activeId={options.length ? optionId(activeIndex) : undefined}
-        onKey={event => {
-          if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-            event.preventDefault();
-            move(event.key === 'ArrowDown' ? 1 : -1);
-          }
-          if (event.key === 'Enter') {
-            event.preventDefault();
-            enter();
-          }
-        }}
-      />
-      {values.length > 0 && (
+    <section
+      className="dialog-surface geo-menu"
+      onPointerDown={event => {
+        if (compact && event.target instanceof Element && event.target.closest('button')) event.preventDefault();
+      }}
+    >
+      {compact ? (
+        <AnchorSearch
+          inputRef={inputRef}
+          activeId={options.length ? optionId(activeIndex) : undefined}
+          onMove={move}
+          onEnter={enter}
+        />
+      ) : (
+        <MenuSearch
+          kind={kind}
+          query={query}
+          onQuery={onQuery}
+          inputRef={inputRef}
+          listId={listId}
+          activeId={options.length ? optionId(activeIndex) : undefined}
+          onKey={event => {
+            if (event.nativeEvent.isComposing) return;
+            if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+              event.preventDefault();
+              move(event.key === 'ArrowDown' ? 1 : -1);
+            }
+            if (event.key === 'Enter') {
+              event.preventDefault();
+              enter();
+            }
+          }}
+        />
+      )}
+      {!compact && values.length > 0 && (
         <div className="geo-menu-picked">
           <b>本条已选 {values.length}</b>
           {values.map(value => (
@@ -516,6 +557,15 @@ export function GeoMenu({
               />
             );
           })}
+          {compact && (
+            <button
+              type="button"
+              className="geo-menu-preview"
+              onClick={() => onPreview(parsed.mode === 'list' && index.byCode.has(parsed.base) ? parsed.base : '')}
+            >
+              <Icon of="search" size={13} /> 查看条目…
+            </button>
+          )}
         </nav>
         <div
           ref={listRef}
@@ -552,19 +602,21 @@ export function GeoMenu({
           )}
         </div>
       </div>
-      <footer className="geo-menu-foot">
-        <span title={data.source}>
-          {file} · {fmt(data.entries.length)} 类 · {loaded} 加载
-        </span>
-        <button
-          type="button"
-          className="geo-menu-browse"
-          onClick={() => onPreview(parsed.mode === 'list' && index.byCode.has(parsed.base) ? parsed.base : '')}
-        >
-          <Icon of="search" size={14} />
-          查看条目…
-        </button>
-      </footer>
+      {!compact && (
+        <footer className="geo-menu-foot">
+          <span title={data.source}>
+            {file} · {fmt(data.entries.length)} 类 · {loaded} 加载
+          </span>
+          <button
+            type="button"
+            className="geo-menu-browse"
+            onClick={() => onPreview(parsed.mode === 'list' && index.byCode.has(parsed.base) ? parsed.base : '')}
+          >
+            <Icon of="search" size={14} />
+            查看条目…
+          </button>
+        </footer>
+      )}
       <ScrollActive id={options.length ? optionId(activeIndex) : ''} keyboardRef={keyboardRef} />
     </section>
   );
@@ -594,6 +646,41 @@ function RailItem({
       </button>
     </>
   );
+}
+
+function AnchorSearch({
+  inputRef,
+  activeId,
+  onMove,
+  onEnter,
+}: {
+  inputRef: RefObject<HTMLInputElement | null>;
+  activeId?: string;
+  onMove: (step: number) => void;
+  onEnter: () => void;
+}) {
+  useEffect(() => {
+    const input = inputRef.current;
+    if (!input) return;
+    if (activeId) input.setAttribute('aria-activedescendant', activeId);
+    else input.removeAttribute('aria-activedescendant');
+    const handleKey = (event: globalThis.KeyboardEvent) => {
+      if (event.isComposing) return;
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        onMove(event.key === 'ArrowDown' ? 1 : -1);
+      } else if (event.key === 'Enter') {
+        event.preventDefault();
+        onEnter();
+      }
+    };
+    input.addEventListener('keydown', handleKey);
+    return () => {
+      input.removeAttribute('aria-activedescendant');
+      input.removeEventListener('keydown', handleKey);
+    };
+  }, [inputRef, activeId, onMove, onEnter]);
+  return null;
 }
 
 function MenuSearch({
