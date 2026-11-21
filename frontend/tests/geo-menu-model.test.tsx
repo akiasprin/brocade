@@ -4,6 +4,8 @@ import {
   geoBlockReason,
   geoFamilies,
   geoIndex,
+  isGeoSiteCollection,
+  letterOf,
   parseGeoQuery,
   searchGeo,
   type GeoQuery,
@@ -53,6 +55,52 @@ describe('geosite menu model', () => {
     expect(groups.media).toEqual(['category-entertainment', 'netflix']);
     expect(groups.other).toContain('google');
     expect(groups.az).toHaveLength(site.entries.length);
+  });
+
+  it('orders geosite collection categories ahead of individual services in groups, A-Z, and search', () => {
+    expect(isGeoSiteCollection('category-ai-!cn')).toBe(true);
+    expect(isGeoSiteCollection('geolocation-cn')).toBe(true);
+    expect(isGeoSiteCollection('tld-!cn')).toBe(true);
+    expect(isGeoSiteCollection('cn')).toBe(true);
+    expect(isGeoSiteCollection('private')).toBe(true);
+    expect(isGeoSiteCollection('google')).toBe(false);
+    expect(isGeoSiteCollection('gfw')).toBe(false);
+
+    const mixed = geoIndex(
+      'geosite',
+      {
+        source: 'https://geodata.example/geosite.dat',
+        loaded_at: 1,
+        entries: [
+          { code: 'gfw', count: 50000, attrs: [] },
+          { code: 'private', count: 10, attrs: [] },
+          { code: 'geolocation-cn', count: 500, attrs: [] },
+          { code: 'openai', count: 9000, attrs: [], within: ['category-ai-!cn'] },
+          { code: 'category-ai-!cn', count: 100, attrs: [] },
+          { code: 'acer', count: 5000, attrs: [] },
+          { code: 'category-companies', count: 10, attrs: [] },
+          { code: 'ai-helper', count: 4000, attrs: [] },
+        ],
+      },
+      [],
+    );
+    const mixedGroups = Object.fromEntries(mixed.groups.map(g => [g.id, g.codes]));
+    expect(mixedGroups.regional).toEqual(['geolocation-cn', 'private', 'gfw']);
+    expect(mixedGroups.ai).toEqual(['category-ai-!cn', 'openai']);
+    expect(mixedGroups.other).toEqual(['category-companies', 'acer', 'ai-helper']);
+    // A-Z 全局列表集合在前，同字母桶内集合也排在单体服务前；提取字母表排序后仍是字母序。
+    expect(mixedGroups.az.slice(0, 4)).toEqual(['category-ai-!cn', 'category-companies', 'geolocation-cn', 'private']);
+    expect(mixedGroups.az.slice(4)).toEqual(['acer', 'ai-helper', 'gfw', 'openai']);
+    expect([...new Set(mixedGroups.az.map(letterOf))].sort((a, b) => a.localeCompare(b))).toEqual([
+      'a',
+      'c',
+      'g',
+      'o',
+      'p',
+    ]);
+    // 检索时精确命中仍居首，其余同档或段前缀命中优先展示集合。
+    const aiSearch = searchGeo(mixed, list(parseGeoQuery(mixed, 'ai'))).map(m => m.entry.code);
+    expect(aiSearch.indexOf('category-ai-!cn')).toBeLessThan(aiSearch.indexOf('ai-helper'));
   });
 
   it('ranks exact names, then whole words, before prefixes and substrings', () => {

@@ -278,7 +278,8 @@ const BrowserNav = memo(function BrowserNav({
       <p className="geo-browser-empty">没有名称包含 “{text}” 的分类</p>
     );
   } else {
-    const all = index.entries.map(e => e.code).sort((a, b) => a.localeCompare(b));
+    const all =
+      index.groups.find(g => g.id === 'az')?.codes ?? index.entries.map(e => e.code).sort((a, b) => a.localeCompare(b));
     body = (
       <>
         {picked.length > 0 && (

@@ -1,18 +1,13 @@
 import { HUGGING_FACE_MARK } from './site-huggingface-icon';
 import { Icon } from './icons';
 import { ADDITIONAL_BRAND_MARKS } from './site-additional-icons';
+import { GEOSITE_BRAND_ALIASES, GEOSITE_BRAND_MARKS, type BrandMark } from './site-geosite-icons';
 import { STREAMING_BRAND_MARKS } from './site-streaming-icons';
 
 // Local monochrome brand outlines, not remote favicons. Sources and licenses:
 // site-brand-icons.LICENSE.md. Text beside each icon supplies its accessible name.
-type BrandMark = {
-  viewBox: string;
-  path: string | readonly string[];
-  outlinePath?: string | readonly string[];
-  outlineWidth?: number;
-};
-
 const BRAND_MARKS: Readonly<Record<string, BrandMark>> = {
+  ...GEOSITE_BRAND_MARKS,
   ...ADDITIONAL_BRAND_MARKS,
   ...STREAMING_BRAND_MARKS,
   huggingface: HUGGING_FACE_MARK,
@@ -74,7 +69,7 @@ const BRAND_MARKS: Readonly<Record<string, BrandMark>> = {
   },
   google: {
     viewBox: '0 0 24 24',
-    path: 'M12.48 10.92v3.28h7.84c-.24 1.84-.853 3.187-1.787 4.133-1.147 1.147-2.933 2.4-6.053 2.4-4.827 0-8.6-3.893-8.6-8.72s3.773-8.72 8.6-8.72c2.6 0 4.507 1.027 5.907 2.347l2.307-2.307C18.747 1.44 16.133 0 12.48 0 5.867 0 .307 5.387.307 12s5.56 12 12.173 12c3.573 0 6.267-1.173 8.373-3.36 2.16-2.16 2.84-5.213 2.84-7.667 0-.76-.053-1.467-.173-2.053H12.48z',
+    path: 'M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09c.87-2.6 3.3-4.53 6.16-4.53 1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07 1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93C3.99 20.53 7.7 23 12 23c2.97 0 5.46-.98 7.28-2.66 2.08-1.92 3.28-4.74 3.28-8.09z',
   },
   apple: {
     viewBox: '0 0 24 24',
@@ -90,12 +85,18 @@ const BRAND_MARKS: Readonly<Record<string, BrandMark>> = {
   },
 };
 
+function resolveBrandId(siteId: string) {
+  return Object.hasOwn(GEOSITE_BRAND_ALIASES, siteId) ? GEOSITE_BRAND_ALIASES[siteId] : siteId;
+}
+
 export function hasSiteBrand(siteId: string) {
-  return Object.hasOwn(BRAND_MARKS, siteId);
+  return Object.hasOwn(BRAND_MARKS, resolveBrandId(siteId));
 }
 
 export function SiteIcon({ siteId }: { siteId: string }) {
-  const mark = hasSiteBrand(siteId) ? BRAND_MARKS[siteId] : undefined;
+  const target = resolveBrandId(siteId);
+  const mark = Object.hasOwn(BRAND_MARKS, target) ? BRAND_MARKS[target] : undefined;
+  const fillPaths = mark?.path ? (typeof mark.path === 'string' ? [mark.path] : mark.path) : [];
   const outlinePaths = mark?.outlinePath
     ? typeof mark.outlinePath === 'string'
       ? [mark.outlinePath]
@@ -104,12 +105,25 @@ export function SiteIcon({ siteId }: { siteId: string }) {
   return (
     <span className="site-brand-icon" data-site-icon={siteId} aria-hidden="true">
       {mark ? (
-        <svg width="18" height="18" viewBox={mark.viewBox} fill="currentColor" focusable="false">
-          {typeof mark.path === 'string' ? (
-            <path d={mark.path} />
-          ) : (
-            mark.path.map((path, index) => <path key={index} d={path} />)
-          )}
+        <svg
+          width="18"
+          height="18"
+          viewBox={mark.viewBox}
+          preserveAspectRatio="xMidYMid meet"
+          fill="currentColor"
+          focusable="false"
+        >
+          {fillPaths.map((path, index) => (
+            <path
+              key={index}
+              d={path}
+              fillRule={mark.fillRule}
+              stroke={mark.fillStrokeWidth ? 'currentColor' : undefined}
+              strokeWidth={mark.fillStrokeWidth}
+              strokeLinecap={mark.fillStrokeWidth ? 'round' : undefined}
+              strokeLinejoin={mark.fillStrokeWidth ? 'round' : undefined}
+            />
+          ))}
           {outlinePaths.map((path, index) => (
             <path
               key={index}

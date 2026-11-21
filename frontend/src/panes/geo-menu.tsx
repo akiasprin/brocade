@@ -257,7 +257,7 @@ export function GeoMenu({
       });
   } else if (current === 'az') {
     const codes = groupOf('az')!.codes;
-    const letters = [...new Set(codes.map(letterOf))];
+    const letters = [...new Set(codes.map(letterOf))].sort((a, b) => a.localeCompare(b));
     const chosen = letter && letters.includes(letter) ? letter : letters[0];
     const inLetter = codes.filter(code => letterOf(code) === chosen);
     more = inLetter.length - limit;
@@ -465,7 +465,10 @@ export function GeoMenu({
     if (navigated && option && !option.disabled) onToggle(option.value);
   };
 
-  const azLetters = current === 'az' && !searching ? [...new Set(groupOf('az')!.codes.map(letterOf))] : [];
+  const azLetters =
+    current === 'az' && !searching
+      ? [...new Set(groupOf('az')!.codes.map(letterOf))].sort((a, b) => a.localeCompare(b))
+      : [];
   const file = data.source.split(/[/?#]/).filter(Boolean).at(-1) ?? `${kind}.dat`;
   const loaded = new Date(data.loaded_at * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
 

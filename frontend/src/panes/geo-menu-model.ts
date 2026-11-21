@@ -36,6 +36,14 @@ export const GEO_TOPICS: { id: string; label: string; pattern: RegExp }[] = [
 const REGIONAL = new Set(['cn', 'private', 'gfw', 'greatfire', 'china-list']);
 const isRegional = (code: string) => REGIONAL.has(code) || /^(geolocation|tld)-/.test(code);
 
+/** GeoSite 中代表集合而非单个服务的分类（category-*、geolocation-*、tld-*、cn、private）。 */
+export const isGeoSiteCollection = (code: string) =>
+  code.startsWith('category-') ||
+  code.startsWith('geolocation-') ||
+  code.startsWith('tld-') ||
+  code === 'cn' ||
+  code === 'private';
+
 export interface GeoGroup {
   id: string;
   label: string;
@@ -90,11 +98,13 @@ export function geoIndex(kind: GeodataKind, catalog: GeoCatalog, selected: strin
   if (kind === 'geosite') {
     for (const entry of entries)
       home.set(entry.code, isRegional(entry.code) ? 'regional' : (topicOf(entry) ?? 'other'));
+    const byGeoSiteOrder = (a: string, b: string) =>
+      Number(isGeoSiteCollection(b)) - Number(isGeoSiteCollection(a)) || byCount(a, b);
     const members = (id: string) =>
       entries
         .map(e => e.code)
         .filter(code => home.get(code) === id)
-        .sort(byCount);
+        .sort(byGeoSiteOrder);
     groups.push({ id: 'regional', label: '地区与汇总', codes: members('regional') });
     GEO_TOPICS.forEach((topic, i) =>
       groups.push({
@@ -132,7 +142,13 @@ export function geoIndex(kind: GeodataKind, catalog: GeoCatalog, selected: strin
     id: 'az',
     label: 'A–Z',
     heading: '全部',
-    codes: entries.map(e => e.code).sort((a, b) => a.localeCompare(b)),
+    codes: entries
+      .map(e => e.code)
+      .sort((a, b) =>
+        kind === 'geosite'
+          ? Number(isGeoSiteCollection(b)) - Number(isGeoSiteCollection(a)) || a.localeCompare(b)
+          : a.localeCompare(b),
+      ),
   });
   return {
     kind,
@@ -200,6 +216,20 @@ export function searchGeo(index: GeoIndex, query: Extract<GeoQuery, { mode: 'lis
     }
     const attrs = entry.attrs.filter(a => a.startsWith(attr));
     if (attrs.length) matches.push({ entry, tier, attrs });
+  }
+  if (index.kind === 'geosite') {
+    return matches.sort((a, b) => {
+      const colA = isGeoSiteCollection(a.entry.code);
+      const colB = isGeoSiteCollection(b.entry.code);
+      return (
+        Number(b.tier === 0) - Number(a.tier === 0) ||
+        Number(colB && b.tier <= 3) - Number(colA && a.tier <= 3) ||
+        a.tier - b.tier ||
+        Number(colB) - Number(colA) ||
+        b.entry.count - a.entry.count ||
+        a.entry.code.localeCompare(b.entry.code)
+      );
+    });
   }
   return matches.sort(
     (a, b) => a.tier - b.tier || b.entry.count - a.entry.count || a.entry.code.localeCompare(b.entry.code),

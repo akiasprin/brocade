@@ -14,9 +14,11 @@ it.each([
   ['category-communication', 'communication', true],
   ['category-ecommerce', 'ecommerce', true],
   ['category-companies', 'category', true],
-  ['geolocation-!cn', 'location', false],
+  ['geolocation-cn', 'tld', false],
+  ['geolocation-!cn', 'tld', false],
   ['tld-cn', 'tld', false],
   ['cn', 'tld', false],
+  ['private', 'private', true],
 ] as const)('maps %s to its semantic collection icon', (code, glyph, theme) => {
   const view = render(<GeoGlyph kind="geosite" code={code} />);
   const icon = view.container.querySelector('.geo-collection-icon');
@@ -25,16 +27,50 @@ it.each([
   expect(icon?.getAttribute('aria-hidden')).toBe('true');
 });
 
-it('uses direct AI lettering and a tall document for unmapped services', () => {
+it('uses direct AI lettering and uppercase 2-3 character initials for unmapped services', () => {
   const ai = render(<GeoGlyph kind="geosite" code="category-ai" />);
   expect(ai.container.querySelector('.geo-ai-text')?.textContent).toBe('AI');
   ai.unmount();
-  const unknown = render(<GeoGlyph kind="geosite" code="future-service" />);
-  expect(unknown.container.querySelector('[data-geo-glyph="document"] path')?.getAttribute('d')).toContain('v11.5H5');
+  for (const [code, text] of [
+    ['future-service', 'FUT'],
+    ['verisign', 'VER'],
+    ['12306', '123'],
+    ['x-y', 'XY'],
+  ] as const) {
+    const unknown = render(<GeoGlyph kind="geosite" code={code} />);
+    const icon = unknown.container.querySelector('[data-geo-glyph="initials"]');
+    expect(icon?.classList.contains('initials')).toBe(true);
+    expect(icon?.classList.contains('theme')).toBe(false);
+    expect(icon?.getAttribute('data-geo-initials')).toBe(text);
+    expect(icon?.textContent).toBe('');
+    unknown.unmount();
+  }
 });
 
-it('retains brand artwork for known services', () => {
-  for (const code of ['openai', 'cloudflare', 'amazon', 'huggingface']) {
+it('retains brand artwork for known services and exact geosite aliases', () => {
+  for (const code of [
+    'openai',
+    'cloudflare',
+    'amazon',
+    'huggingface',
+    'google',
+    'alphabet',
+    'dmm',
+    'abema',
+    'xiaomi',
+    'xiaomi-ai',
+    'xiaomi-iot',
+    'bytedance',
+    'bytedance-ai-!cn',
+    'x',
+    'apple-cn',
+    'google-cn',
+    'bilibili2',
+    'bilibili-cdn',
+    'cloudflare-cn',
+    'aliyun',
+    'ookla-speedtest',
+  ]) {
     const view = render(<GeoGlyph kind="geosite" code={code} />);
     expect(view.container.querySelector(`[data-site-icon="${code}"] > svg`)).not.toBeNull();
     expect(view.container.querySelector('.geo-collection-icon')).toBeNull();

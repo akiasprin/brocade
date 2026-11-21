@@ -40623,7 +40623,8 @@ button.choice-select.choice-select-single.f {
   width: 11px;
   height: 11px;
 }
-.rule-dns-nav-top .geo-ai-text {
+.rule-dns-nav-top .geo-ai-text,
+.rule-dns-nav-top .geo-collection-icon.initials::before {
   font-size: 8px;
 }
 .rule-dns-nav-top .site-brand-icon {
@@ -40903,7 +40904,8 @@ button.choice-select.choice-select-single.f {
   width: 11px;
   height: 11px;
 }
-.rule-dns-chip .geo-ai-text {
+.rule-dns-chip .geo-ai-text,
+.rule-dns-chip .geo-collection-icon.initials::before {
   font-size: 7.5px;
 }
 .rule-dns-chip .site-brand-icon {

@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import type { GeodataKind } from '../api/geodata';
 import { RegionFlag } from '../ui/region-flag';
 import { hasSiteBrand, SiteIcon } from '../ui/site-icon';
+import { isGeoSiteCollection } from './geo-menu-model';
 
 const paths = {
   media: (
@@ -37,12 +38,6 @@ const paths = {
       <circle cx="14" cy="15.5" r="1" />
     </>
   ),
-  location: (
-    <>
-      <path d="M10 17s5-4.8 5-9a5 5 0 0 0-10 0c0 4.2 5 9 5 9Z" />
-      <circle cx="10" cy="8" r="1.7" />
-    </>
-  ),
   tld: (
     <>
       <rect x="3" y="4" width="14" height="12" rx="2" />
@@ -58,12 +53,6 @@ const paths = {
       <rect x="12" y="12" width="5" height="5" rx="1" />
     </>
   ),
-  document: (
-    <>
-      <path d="M5 2.5h7l3.5 3.5v11.5H5Z" />
-      <path d="M12 2.5V6h3.5M7.5 11h5M7.5 8h2" />
-    </>
-  ),
   private: (
     <>
       <rect x="4" y="8" width="12" height="9" rx="2" />
@@ -75,8 +64,8 @@ const paths = {
 type CollectionGlyph = keyof typeof paths | 'ai' | 'ip';
 
 function collectionFor(code: string): CollectionGlyph {
-  if (code.startsWith('geolocation-')) return 'location';
-  if (code.startsWith('tld-') || code === 'cn') return 'tld';
+  if (code === 'private') return 'private';
+  if (code.startsWith('geolocation-') || code.startsWith('tld-') || code === 'cn') return 'tld';
   if (/^category-(ai|ml|llm)/.test(code)) return 'ai';
   if (/^category-(entertainment|media|acg|emby|music|video|news|novel|olympiad)/.test(code)) return 'media';
   if (/^category-(ads|telemetry|consent)/.test(code)) return 'ads';
@@ -95,11 +84,7 @@ function collectionFor(code: string): CollectionGlyph {
 
 function CollectionIcon({ glyph, theme }: { glyph: CollectionGlyph; theme: boolean }) {
   return (
-    <span
-      className={`geo-collection-icon${theme ? ' theme' : ''}${glyph === 'document' ? ' document' : ''}`}
-      data-geo-glyph={glyph}
-      aria-hidden="true"
-    >
+    <span className={`geo-collection-icon${theme ? ' theme' : ''}`} data-geo-glyph={glyph} aria-hidden="true">
       {glyph === 'ai' ? (
         <span className="geo-ai-text">AI</span>
       ) : glyph === 'ip' ? (
@@ -121,16 +106,32 @@ function CollectionIcon({ glyph, theme }: { glyph: CollectionGlyph; theme: boole
   );
 }
 
+function initialsFor(code: string) {
+  const cleaned = code.replace(/[^a-z0-9]/gi, '');
+  return (cleaned || code).slice(0, 3).toUpperCase();
+}
+
+function InitialsIcon({ code }: { code: string }) {
+  return (
+    <span
+      className="geo-collection-icon initials"
+      data-geo-glyph="initials"
+      data-geo-initials={initialsFor(code)}
+      aria-hidden="true"
+    />
+  );
+}
+
 export function GeoGlyph({ kind, code }: { kind: GeodataKind; code: string }) {
   const base = kind === 'geoip' ? code.replace(/^!+/, '') : code;
   if (kind === 'geoip') {
     if (/^[a-z]{2}$/i.test(base)) return <RegionFlag code={base} />;
     return <CollectionIcon glyph={base === 'private' ? 'private' : 'ip'} theme={true} />;
   }
-  if (base.startsWith('category-') || base.startsWith('geolocation-') || base.startsWith('tld-') || base === 'cn') {
+  if (isGeoSiteCollection(base)) {
     const glyph = collectionFor(base);
-    return <CollectionIcon glyph={glyph} theme={!['location', 'tld'].includes(glyph)} />;
+    return <CollectionIcon glyph={glyph} theme={glyph !== 'tld'} />;
   }
   if (hasSiteBrand(base)) return <SiteIcon siteId={base} />;
-  return <CollectionIcon glyph="document" theme={false} />;
+  return <InitialsIcon code={base} />;
 }

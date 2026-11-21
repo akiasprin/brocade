@@ -218,9 +218,14 @@
   padding: 0 2px;
   cursor: pointer;
 }
+.geo-menu-picked .site-brand-icon,
+.geo-select .site-brand-icon {
+  width: 16px;
+  height: 16px;
+}
 .geo-menu-picked .site-brand-icon svg {
-  width: 13px;
-  height: 13px;
+  width: 12px;
+  height: 12px;
 }
 
 .geo-menu-body {
@@ -416,9 +421,14 @@
   background: var(--ink-2);
   color: var(--sheet);
 }
-.geo-collection-icon.document {
+.geo-collection-icon.initials {
   background: transparent;
-  color: var(--ink-3);
+  color: var(--ink-2);
+}
+.geo-collection-icon.initials::before {
+  content: attr(data-geo-initials);
+  font: 650 10px/1 var(--mono);
+  letter-spacing: -0.04em;
 }
 .geo-collection-icon svg {
   display: block;
@@ -432,13 +442,19 @@
 }
 .geo-menu-picked .geo-collection-icon,
 .geo-select .geo-collection-icon {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
 }
 .geo-menu-picked .geo-collection-icon svg,
 .geo-select .geo-collection-icon svg {
   width: 12px;
   height: 12px;
+}
+.geo-menu-picked .geo-collection-icon.initials::before,
+.geo-select .geo-collection-icon.initials::before {
+  font-size: 7.5px;
+  letter-spacing: -0.03em;
 }
 .geo-browser-nav-row .geo-collection-icon,
 .geo-browser-card .geo-collection-icon {
@@ -450,7 +466,12 @@
   width: 14px;
   height: 14px;
 }
-.geo-browser-title .geo-collection-icon {
+.geo-browser-nav-row .geo-collection-icon.initials::before,
+.geo-browser-card .geo-collection-icon.initials::before {
+  font-size: 9px;
+}
+.geo-browser-title .geo-collection-icon,
+.geo-browser-title .site-brand-icon {
   width: 24px;
   height: 24px;
 }
@@ -458,6 +479,10 @@
 .geo-row > .region-flag {
   flex: none;
   color: var(--ink-2);
+}
+.geo-row > .site-brand-icon {
+  width: 22px;
+  height: 22px;
 }
 .geo-row .site-brand-icon svg {
   width: 16px;
@@ -858,8 +883,8 @@
   flex: none;
 }
 .geo-select .site-brand-icon svg {
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
 }
 .rule-table .rule-match-cell > .geo-field > input.f,
 .chain-rule-tree .rule-table .rule-match-cell > .geo-field > input.f {
@@ -985,6 +1010,11 @@
   font: 12px var(--mono);
   text-align: left;
   cursor: pointer;
+}
+.geo-browser-nav-row .site-brand-icon,
+.geo-browser-card .site-brand-icon {
+  width: 20px;
+  height: 20px;
 }
 .geo-browser-nav-row .site-brand-icon svg {
   width: 14px;
@@ -1521,8 +1551,8 @@
   background: var(--hover);
 }
 .geo-browser-card .site-brand-icon svg {
-  width: 15px;
-  height: 15px;
+  width: 14px;
+  height: 14px;
 }
 .geo-browser-card > code {
   flex: 1;

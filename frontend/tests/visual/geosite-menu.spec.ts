@@ -188,7 +188,7 @@ for (const { width, height, theme } of [
   });
 }
 
-test('geosite service brands and unmapped document glyph', async ({ page }) => {
+test('geosite service brands and unmapped initials glyph', async ({ page }) => {
   const { menu } = await openMenu(page, 1440, 900, 'light');
   const search = menu.getByRole('combobox', { name: '搜索 geosite', exact: true });
   for (const code of ['cloudflare', 'amazon', 'verisign']) {
@@ -197,7 +197,7 @@ test('geosite service brands and unmapped document glyph', async ({ page }) => {
     await expect(option).toBeVisible();
     const row = option.locator('xpath=..');
     if (code === 'verisign') {
-      await expect(row.locator('[data-geo-glyph="document"]')).toBeVisible();
+      await expect(row.locator('[data-geo-glyph="initials"]')).toHaveAttribute('data-geo-initials', 'VER');
     } else {
       await expect(row.locator(`[data-site-icon="${code}"] > svg`)).toBeVisible();
     }
