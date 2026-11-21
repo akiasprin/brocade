@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="frontend/public/favicon.svg" width="48" height="48" alt="Brocade" />
-
-# Brocade
+<p>
+  <img src="docs/assets/wordmark.svg" width="176" height="44" alt="Brocade" />
+</p>
 
 **基于确定性编译的声明式控制面，统一编排个人跨地域计算与网络资源。**
 
@@ -18,55 +18,27 @@
 
 </div>
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/console-dark.png" />
-  <source media="(prefers-color-scheme: light)" srcset="docs/assets/console-light.png" />
-  <img src="docs/assets/console-light.png" alt="Brocade Console 多跳线路编排界面" />
-</picture>
+<p align="center">
+  <img src="docs/assets/console-preview.png" alt="Brocade Console 多跳线路编排界面" />
+</p>
 
 ## 核心能力
 
-<table>
-  <tbody>
-    <tr>
-      <td width="33%" valign="top">
-        <strong>声明式编排与多跳路由</strong><br />
-        用同一份模型管理入口、中继与出口；拓扑由规则自动推导，草稿提交形成不可变修订，支持按波次发布与准确回滚。
-      </td>
-      <td width="33%" valign="top">
-        <strong>GeoData 与规则 DNS</strong><br />
-        内置 GeoSite / GeoIP 分组浏览器、域名反查、分类包含关系与品牌图标索引；支持规则 DNS 分组、本机 DNS 策略与出口拨测。
-      </td>
-      <td width="33%" valign="top">
-        <strong>自维护 Xray 数据面</strong><br />
-        基于 Xray <code>v26.10.31</code>，内建 AnyTLS、MTProxy、按用户撤销会话、嗅探失败路由、站点统计与可选进程交接 Beta。
-      </td>
-    </tr>
-    <tr>
-      <td width="33%" valign="top">
-        <strong>用户、订阅与流量账本</strong><br />
-        授权变更走独立通道同步运行中用户，无需重写整机配置；支持多客户端订阅、端口转发、接入配额、在线设备与出流量站点统计。
-      </td>
-      <td width="33%" valign="top">
-        <strong>全机队观测与 IP 养护</strong><br />
-        实时速率、历史指标、Ping 延迟、公网 IP 与下线通知；离线期间本地队列补报并去重；支持机器自身出口 IP 养护与 Gemini 地区养护。
-      </td>
-      <td width="33%" valign="top">
-        <strong>可选 CVM 容器与裸机</strong><br />
-        <code>cvm</code> 变体提供「访问入口 | 计算 | 出口」三栏组合台，统一编排 Cube 轻量容器与无隔离裸机实例。
-      </td>
-    </tr>
-  </tbody>
-</table>
+- **声明式编排与多跳路由** — 用同一份模型管理入口、中继与出口；拓扑由规则自动推导，草稿提交形成不可变修订，支持按波次发布与准确回滚。
+- **GeoData 与规则 DNS** — 内置 GeoSite / GeoIP 分组浏览器、域名反查、分类包含关系与品牌图标索引；支持规则 DNS 分组、本机 DNS 策略与出口拨测。
+- **自维护 Xray 数据面** — 基于 Xray `v26.10.31`，内建 AnyTLS、MTProxy、按用户撤销会话、嗅探失败路由、站点统计与可选进程交接 Beta。
+- **用户、订阅与流量账本** — 授权变更走独立通道同步运行中用户，无需重写整机配置；支持多客户端订阅、端口转发、接入配额、在线设备与出流量站点统计。
+- **全机队观测与 IP 养护** — 实时速率、历史指标、Ping 延迟、公网 IP 与下线通知；离线期间本地队列补报并去重；支持机器自身出口 IP 养护与 Gemini 地区养护。
+- **可选 CVM 容器与裸机** — `cvm` 变体提供「访问入口 | 计算 | 出口」三栏组合台，统一编排 Cube 轻量容器与无隔离裸机实例。
 
 ## 安装与更新
 
 Brocade 提供两种同源码构建的产品变体，覆盖 Linux `x86_64` / `aarch64` 的 GNU 与静态 musl 共 8 组发行包：
 
-| 变体           | 包含范围                                                                               | 适用场景                                   |
-| -------------- | -------------------------------------------------------------------------------------- | ------------------------------------------ |
-| `base`（默认） | 完整代理网络控制面、GeoData 路由、用户订阅、端口转发、观测与 IP 养护；不含 CVM 与 Cube | 绝大多数自建多地域 Xray 网络与机队管理     |
-| `cvm`          | 包含 `base` 全部能力 + 容器/裸机组合台、CVM 网络编译、用户额度管理与双变体 Agent 分发  | 需要在同一控制台同时编排轻量容器或裸机实例 |
+| 变体   | 默认安装 | 包含范围                                                                               | 适用场景                                   |
+| ------ | :------: | -------------------------------------------------------------------------------------- | ------------------------------------------ |
+| `base` |    ✅    | 完整代理网络控制面、GeoData 路由、用户订阅、端口转发、观测与 IP 养护；不含 CVM 与 Cube | 绝大多数自建多地域 Xray 网络与机队管理     |
+| `cvm`  |          | 包含 `base` 全部能力 + 容器/裸机组合台、CVM 网络编译、用户额度管理与双变体 Agent 分发  | 需要在同一控制台同时编排轻量容器或裸机实例 |
 
 ### 安装
 
@@ -112,9 +84,6 @@ Brocade 提供两种同源码构建的产品变体，覆盖 Linux `x86_64` / `aa
 
 通过官方安装器部署的 v0.3.6 及以后版本，在原 Console 服务器执行以下命令，自动获取最新正式版并保留已安装的 `base` / `cvm` 变体：
 
-<details>
-<summary>展开自动更新命令</summary>
-
 ```sh
 (
   set -eu
@@ -150,8 +119,6 @@ Brocade 提供两种同源码构建的产品变体，覆盖 Linux `x86_64` / `aa
   fi
 )
 ```
-
-</details>
 
 升级保留原配置、数据库和密钥，安装器会停服备份、执行缺少的迁移并检查启动结果。若要求失败后只向前修复，在两处 `--upgrade` 后追加 `--forward-only`；停服后失败会保留现场并保持停服。更早版本、变体切换、外部数据库客户端要求与备份恢复说明见[安装与升级](docs/install.md#升级)。
 
@@ -217,38 +184,10 @@ Console 是唯一的控制入口：保存草稿、修订与发布记录，编译
 
 ## 文档
 
-<table>
-  <tbody>
-    <tr>
-      <td width="50%" valign="top">
-        <strong>部署与开发</strong><br />
-        · <a href="docs/install.md">安装与升级</a> — 发行包、变体切换、初始化与备份<br />
-        · <a href="docs/manual-deployment.md">手动部署</a> — systemd 与 Nginx<br />
-        · <a href="docs/build.md">从源码构建</a> — 工具链、发行构建与前端开发
-      </td>
-      <td width="50%" valign="top">
-        <strong>控制面与网络</strong><br />
-        · <a href="docs/concepts.md">模型、修订与发布</a> — 确定性编译、隔离与发布单<br />
-        · <a href="docs/routing.md">接入与出口</a> — GeoData、DNS 组、WARP 与拨测<br />
-        · <a href="docs/vpngate.md">VPN Gate</a> · <a href="docs/forwarding.md">端口转发</a>
-      </td>
-    </tr>
-    <tr>
-      <td width="50%" valign="top">
-        <strong>用户与观测</strong><br />
-        · <a href="docs/users.md">用户、访问与订阅</a> — 访客视图、配额与在线设备<br />
-        · <a href="docs/traffic.md">用量与实时流量</a> · <a href="docs/site-usage.md">出流量统计</a><br />
-        · <a href="docs/observability.md">机器观测与通知</a> · <a href="docs/ip-maintenance.md">机器 IP 养护</a>
-      </td>
-      <td width="50%" valign="top">
-        <strong>容器扩展（CVM）</strong><br />
-        · <a href="docs/cvm.md">CVM</a> — 组合台、宿主、网络与用户额度<br />
-        · <a href="docs/baremetal.md">裸机实例</a> — 无容器隔离的整机纳管<br />
-        · <a href="docs/cube-runtime.md">Cube 节点运行栈</a> — 源码基线与构建入口
-      </td>
-    </tr>
-  </tbody>
-</table>
+- **部署与开发**：[安装与升级](docs/install.md)（发行包、变体切换、初始化与备份） · [手动部署](docs/manual-deployment.md)（systemd 与 Nginx） · [从源码构建](docs/build.md)（工具链、发行构建与前端开发）
+- **控制面与网络**：[模型、修订与发布](docs/concepts.md)（确定性编译、隔离与发布单） · [接入与出口](docs/routing.md)（GeoData、DNS 组、WARP 与拨测） · [VPN Gate](docs/vpngate.md) · [端口转发](docs/forwarding.md)
+- **用户与观测**：[用户、访问与订阅](docs/users.md)（访客视图、配额与在线设备） · [用量与实时流量](docs/traffic.md) · [出流量统计](docs/site-usage.md) · [机器观测与通知](docs/observability.md) · [机器 IP 养护](docs/ip-maintenance.md)
+- **容器扩展（CVM）**：[CVM](docs/cvm.md)（组合台、宿主、网络与用户额度） · [裸机实例](docs/baremetal.md)（无容器隔离的整机纳管） · [Cube 节点运行栈](docs/cube-runtime.md)（源码基线与构建入口）
 
 ## 仓库
 
