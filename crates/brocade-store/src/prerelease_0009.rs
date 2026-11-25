@@ -5,8 +5,10 @@ use sqlx::{Postgres, Transaction};
 
 use crate::{pg::MIGRATOR, upgrade::DatabaseUpgradeCheck, PgStore, Result, StoreError};
 
-const DEPLOYED_0009_CHECKSUM: &str =
+const ATTACHED_0009_CHECKSUM: &str =
     "3955d2e313a1e967cf6602843d774a45698fa5eb7cdc0ed8d5ebff081cbce1ce2ddbd1dcdc69b5d1099b206cd08ba1a4";
+const DETACHED_0009_CHECKSUM: &str =
+    "c9ca869a99860a6565f5ce2f6f490fae2d9b62b4dd9a5b80cca60fbe87ba4b672d3de9e1bb29d23f973f499189c4e579";
 
 const NODE_FOREIGN_KEYS: &[&str] = &[
     "cvm_entries_provider_node_fkey",
@@ -21,7 +23,7 @@ const NODE_FOREIGN_KEYS: &[&str] = &[
     "cvm_nic_publications_provider_node_fkey",
 ];
 
-const DELTA: &str = r#"
+const RESET: &str = r#"
 UPDATE deployment_target_state
 SET cvm_revision_id = NULL,
     cvm_machine_ready = FALSE,
@@ -77,7 +79,9 @@ TRUNCATE TABLE
     cvm_network_quota_hosts,
     cvm_hosts
 RESTART IDENTITY;
+"#;
 
+const DETACH_FOREIGN_KEYS: &str = r#"
 ALTER TABLE cvm_instances DROP CONSTRAINT cvm_instances_node_id_fkey;
 ALTER TABLE cvm_nic_publications DROP CONSTRAINT cvm_nic_publications_provider_node_fkey;
 ALTER TABLE cvm_nic_allocations
@@ -93,6 +97,12 @@ ALTER TABLE cvm_entry_tunnels
 ALTER TABLE cvm_entries DROP CONSTRAINT cvm_entries_provider_node_fkey;
 "#;
 
+#[derive(Clone, Copy)]
+enum Prerelease0009 {
+    Attached,
+    Detached,
+}
+
 async fn node_foreign_key_count(tx: &mut Transaction<'_, Postgres>) -> Result<i64> {
     Ok(sqlx::query_scalar(
         "SELECT count(*)
@@ -105,7 +115,7 @@ async fn node_foreign_key_count(tx: &mut Transaction<'_, Postgres>) -> Result<i6
     .await?)
 }
 
-async fn previous_0009(tx: &mut Transaction<'_, Postgres>) -> Result<bool> {
+async fn previous_0009(tx: &mut Transaction<'_, Postgres>) -> Result<Option<Prerelease0009>> {
     let history: Vec<(i64, bool, Vec<u8>)> =
         sqlx::query_as("SELECT version,success,checksum FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&mut **tx)
@@ -123,20 +133,29 @@ async fn previous_0009(tx: &mut Transaction<'_, Postgres>) -> Result<bool> {
             })
         || history[8].0 != 9
         || !history[8].1
-        || brocade_core::hash::hex_lower(&history[8].2) != DEPLOYED_0009_CHECKSUM
     {
-        return Ok(false);
+        return Ok(None);
     }
+    let checksum = brocade_core::hash::hex_lower(&history[8].2);
     let retired_tables_absent: bool = sqlx::query_scalar(
         "SELECT to_regclass('cvm_user_host_network_quotas') IS NULL
-             AND to_regclass('cvm_quotas') IS NULL",
+             AND to_regclass('cvm_quotas') IS NULL
+             AND to_regclass('cvm_instance_access_events') IS NOT NULL
+             AND to_regclass('cvm_guest_credentials') IS NOT NULL",
     )
     .fetch_one(&mut **tx)
     .await?;
-    Ok(
-        retired_tables_absent
-            && node_foreign_key_count(tx).await? == NODE_FOREIGN_KEYS.len() as i64,
-    )
+    if !retired_tables_absent {
+        return Ok(None);
+    }
+    let foreign_keys = node_foreign_key_count(tx).await?;
+    Ok(match (checksum.as_str(), foreign_keys) {
+        (ATTACHED_0009_CHECKSUM, count) if count == NODE_FOREIGN_KEYS.len() as i64 => {
+            Some(Prerelease0009::Attached)
+        }
+        (DETACHED_0009_CHECKSUM, 0) => Some(Prerelease0009::Detached),
+        _ => None,
+    })
 }
 
 impl PgStore {
@@ -154,7 +173,7 @@ impl PgStore {
         sqlx::query("SET LOCAL search_path=public,pg_catalog")
             .execute(&mut *tx)
             .await?;
-        if previous_0009(&mut tx).await? {
+        if previous_0009(&mut tx).await?.is_some() {
             check.compatible = true;
             check.pending_versions = vec![9];
             check.reason = None;
@@ -188,12 +207,13 @@ impl PgStore {
         )
         .execute(&mut *tx)
         .await?;
-        if !previous_0009(&mut tx).await? {
-            return Err(StoreError::InvalidData(
-                "未匹配已核验的 0009 历史和结构，未转换".into(),
-            ));
+        let source = previous_0009(&mut tx).await?.ok_or_else(|| {
+            StoreError::InvalidData("未匹配已核验的 0009 历史和结构，未转换".into())
+        })?;
+        sqlx::raw_sql(RESET).execute(&mut *tx).await?;
+        if matches!(source, Prerelease0009::Attached) {
+            sqlx::raw_sql(DETACH_FOREIGN_KEYS).execute(&mut *tx).await?;
         }
-        sqlx::raw_sql(DELTA).execute(&mut *tx).await?;
         if node_foreign_key_count(&mut tx).await? != 0 {
             return Err(StoreError::InvalidData(
                 "CVM 历史机器外键转换验证失败，未更新迁移回执".into(),

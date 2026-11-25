@@ -300,6 +300,48 @@ async fn prerelease_0009_upgrade_resets_cvm_data_and_detaches_exact_node_foreign
     assert_eq!(rows, (0, 1, 1));
 }
 
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn prerelease_detached_0009_upgrade_resets_cvm_data() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO cvm_instances(id,tenant_id,node_id,name,generation,desired)
+         VALUES('legacy-cvm','platform.acme','n1','Legacy CVM',1,'{}')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE _sqlx_migrations
+            SET checksum=decode('c9ca869a99860a6565f5ce2f6f490fae2d9b62b4dd9a5b80cca60fbe87ba4b672d3de9e1bb29d23f973f499189c4e579','hex')
+          WHERE version=9",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    assert!(!db.store.check_database_upgrade().await.unwrap().compatible);
+    let compatible = db.store.check_prerelease_0009_upgrade().await.unwrap();
+    assert!(compatible.compatible);
+    assert_eq!(compatible.pending_versions, [9]);
+    db.store.migrate_prerelease_0009_schema().await.unwrap();
+    assert!(db.store.check_database_upgrade().await.unwrap().compatible);
+    let rows: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+             (SELECT count(*) FROM cvm_instances),
+             (SELECT count(*) FROM nodes),
+             (SELECT count(*) FROM users)",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows, (0, 1, 1));
+}
+
 async fn forwarding_history(db: &TestPg, node: &str, tenant: &str, user: &str) -> i64 {
     sqlx::query(
         "INSERT INTO forwarding_entitlements (tenant_id,user_id,node_id,updated_by)
