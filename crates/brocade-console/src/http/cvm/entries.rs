@@ -133,30 +133,21 @@ pub(crate) async fn delete_publication(
     )))
 }
 
-async fn participant(state: &AppState, headers: &HeaderMap) -> ApiResult<AuthenticatedNode> {
-    let node = agent_node(state, headers).await?;
-    if agent_protocol_version(headers).is_none_or(|v| v < ENTRY_PROTOCOL_VERSION) {
-        return Err(ApiError::Store(StoreError::Unsupported(
-            "访问入口需要匹配的新 Agent 协议".into(),
-        )));
-    }
-    Ok(node)
-}
 pub(crate) async fn desired(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let node = participant(&state, &headers).await?;
-    Ok(private(Json(
-        state.store.cvm_entry_desired(&node.node_id).await?,
-    )))
+    let node = agent_node(&state, &headers).await?;
+    let desired = state.store.cvm_entry_desired(&node.node_id).await?;
+    Ok(private(Json(desired)))
 }
+
 pub(crate) async fn report(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<EntryNodeReport>,
 ) -> ApiResult<Response> {
-    let node = participant(&state, &headers).await?;
+    let node = agent_node(&state, &headers).await?;
     Ok(private(Json(
         json!({"accepted":state.store.cvm_record_entry_report(&node.node_id,request).await?}),
     )))

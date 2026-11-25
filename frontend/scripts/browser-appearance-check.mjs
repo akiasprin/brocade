@@ -650,7 +650,11 @@ for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
             ),
           rgb,
         );
-        assert.notEqual(state.color, '#ffffff', 'light palettes are tinted, not pure white');
+        if (theme === 'light') {
+          assert.equal(state.color, '#ffffff', 'light porcelain topbars blend seamlessly with Safari');
+        } else {
+          assert.notEqual(state.color, '#ffffff', 'dark palettes keep distinct charcoal headers');
+        }
         return state.color;
       };
       await check('light');
@@ -666,7 +670,7 @@ for (const [engine, launcher] of Object.entries({ chromium, webkit })) {
           await page.locator('#appearance').click();
           colors.push(await check(theme));
         }
-        if (theme === 'light') assert.equal(new Set(colors).size, 5);
+        if (theme === 'dark') assert.equal(new Set(colors).size, 5);
       }
       await page.evaluate(() => window.stopAppearance());
       const previous = await page.locator('meta[name="theme-color"]').getAttribute('content');

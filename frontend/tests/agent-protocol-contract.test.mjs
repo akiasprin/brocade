@@ -134,11 +134,11 @@ test('automatic chain diagnostics require the same protocol in Console and front
   );
 });
 
-test('CVM artifact compiler support uses the shared negotiated protocol version', () => {
-  const shared = readFileSync(new URL('../../crates/brocade-deployment/src/cvm/artifacts.rs', import.meta.url), 'utf8');
-  const api = readFileSync(new URL('../src/api/cvm.ts', import.meta.url), 'utf8');
-  assert.equal(
-    shared.match(/CVM_ARTIFACT_PROTOCOL_VERSION: u32 = (\d+);/)?.[1],
-    api.match(/CVM_ARTIFACT_PROTOCOL_VERSION = (\d+);/)?.[1],
-  );
+test('CVM entry range input and execution agree on the maximum interval', () => {
+  const shared = readFileSync(new URL('../../crates/brocade-deployment/src/cvm/entry.rs', import.meta.url), 'utf8');
+  const ui = readFileSync(new URL('../src/panes/cvm/entry-ports.ts', import.meta.url), 'utf8');
+  const backendLimit = shared.match(/pub const MAX_ENTRY_RANGE_PORTS: u32 = (\d+);/)?.[1];
+  const frontendLimit = ui.match(/export const MAX_ENTRY_RANGE_PORTS = (\d+);/)?.[1];
+  assert.ok(backendLimit);
+  assert.equal(frontendLimit, backendLimit);
 });

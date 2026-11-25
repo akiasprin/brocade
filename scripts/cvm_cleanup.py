@@ -6,6 +6,7 @@ change migrations or deploy Console. Complete the separate node-resource cleanup
 CVM writers before applying a reviewed inventory. Database credentials are read from a
 private file and passed to psql through its environment, never through command arguments.
 """
+
 import argparse
 from datetime import datetime, timezone
 import hashlib
@@ -20,7 +21,8 @@ import time
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 
-TABLES = frozenset('''
+TABLES = frozenset(
+    """
 cvm_hosts cvm_host_policies cvm_host_policy_events
 cvm_network_quota_hosts cvm_user_host_network_quotas cvm_network_quota_events
 cvm_quotas cvm_quota_changes cvm_instances cvm_volumes cvm_interfaces
@@ -30,9 +32,14 @@ cvm_nic_nodes cvm_nic_publications cvm_nic_publication_versions cvm_nic_requests
 cvm_nic_allocations cvm_nic_bindings cvm_nic_route_versions cvm_nic_resources
 cvm_nic_meter_cursors cvm_nic_monthly_usage cvm_entry_nodes cvm_entry_publications
 cvm_entry_publication_versions cvm_entry_tunnels cvm_entries
-'''.split())
+cvm_image_manifests cvm_spec_artifact_sets cvm_spec_artifacts cvm_revision_nodes
+cvm_serving_nodes cvm_revision_instances cvm_revision_bindings
+cvm_instance_access_events cvm_guest_credentials
+""".split()
+)
 MAX_TABLES = 512
-PROTECTED_FINGERPRINT_TABLES = frozenset('''
+PROTECTED_FINGERPRINT_TABLES = frozenset(
+    """
 _sqlx_migrations admin_operators admin_sessions tenants users nodes apps chains
 fronts front_vias front_external_vias ingresses ingress_client_settings
 external_outbounds external_outbound_bindings forwarding_rules forwarding_rule_nodes
@@ -40,7 +47,8 @@ forwarding_entitlements forwarding_node_quotas node_enrollments node_lifecycle_s
 node_cert_label node_cert_trusted_labels entitlements grants control_state
 user_app_quotas user_app_rate_limits subscriptions cert_labels cert_domains certificates
 notification_channels data_retention_policies first_run_onboarding settings
-'''.split())
+""".split()
+)
 
 
 class CleanupError(RuntimeError):
@@ -78,7 +86,8 @@ def connection_env(url):
     parsed = urlsplit(url)
     fields = {
         'PGDATABASE': unquote(parsed.path.lstrip('/')),
-        'PGCONNECT_TIMEOUT': '10', 'PGTZ': 'UTC',
+        'PGCONNECT_TIMEOUT': '10',
+        'PGTZ': 'UTC',
     }
     if parsed.hostname is not None:
         fields['PGHOST'] = unquote(parsed.hostname)
@@ -89,12 +98,20 @@ def connection_env(url):
     if parsed.password is not None:
         fields['PGPASSWORD'] = unquote(parsed.password)
     parameters = {
-        'host': 'PGHOST', 'hostaddr': 'PGHOSTADDR', 'port': 'PGPORT',
-        'user': 'PGUSER', 'password': 'PGPASSWORD', 'dbname': 'PGDATABASE',
-        'sslmode': 'PGSSLMODE', 'sslrootcert': 'PGSSLROOTCERT',
-        'sslcert': 'PGSSLCERT', 'sslkey': 'PGSSLKEY',
-        'channel_binding': 'PGCHANNELBINDING', 'application_name': 'PGAPPNAME',
-        'options': 'PGOPTIONS', 'connect_timeout': 'PGCONNECT_TIMEOUT',
+        'host': 'PGHOST',
+        'hostaddr': 'PGHOSTADDR',
+        'port': 'PGPORT',
+        'user': 'PGUSER',
+        'password': 'PGPASSWORD',
+        'dbname': 'PGDATABASE',
+        'sslmode': 'PGSSLMODE',
+        'sslrootcert': 'PGSSLROOTCERT',
+        'sslcert': 'PGSSLCERT',
+        'sslkey': 'PGSSLKEY',
+        'channel_binding': 'PGCHANNELBINDING',
+        'application_name': 'PGAPPNAME',
+        'options': 'PGOPTIONS',
+        'connect_timeout': 'PGCONNECT_TIMEOUT',
     }
     for key, value in parse_qsl(parsed.query):
         if key not in parameters:
@@ -110,7 +127,10 @@ def query(url, sql):
         result = subprocess.run(
             ['psql', '-X', '-A', '-t', '-q', '-v', 'ON_ERROR_STOP=1', '-v', 'VERBOSITY=sqlstate'],
             input="SET timezone='UTC';\nSET statement_timeout='120s';\n" + sql,
-            text=True, capture_output=True, env=env, timeout=150,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=150,
         )
     except subprocess.TimeoutExpired:
         raise CleanupError('database operation exceeded its bounded deadline') from None
@@ -132,8 +152,9 @@ def backup(url, tables, path):
     with path.open('xb') as output:
         os.fchmod(output.fileno(), 0o600)
         try:
-            result = subprocess.run(command, stdout=output, stderr=subprocess.PIPE,
-                                    env=connection_env(url), timeout=150)
+            result = subprocess.run(
+                command, stdout=output, stderr=subprocess.PIPE, env=connection_env(url), timeout=150
+            )
         except subprocess.TimeoutExpired:
             raise CleanupError('CVM-only backup timed out; no records were cleared') from None
         output.flush()
@@ -153,20 +174,22 @@ def fingerprint(tables):
     parts = []
     for table in tables:
         parts.append(
-            f"SELECT {literal(table)} AS name, jsonb_build_array(count(*), "
-            f"coalesce(sum(hashtextextended(to_jsonb(t)::text,0)::numeric),0)::text, "
-            f"coalesce(sum(hashtextextended(to_jsonb(t)::text,1)::numeric),0)::text) AS value "
-            f"FROM {identifier(table)} t"
+            f'SELECT {literal(table)} AS name, jsonb_build_array(count(*), '
+            f'coalesce(sum(hashtextextended(to_jsonb(t)::text,0)::numeric),0)::text, '
+            f'coalesce(sum(hashtextextended(to_jsonb(t)::text,1)::numeric),0)::text) AS value '
+            f'FROM {identifier(table)} t'
         )
-    return "(SELECT jsonb_object_agg(name,value) FROM (" + ' UNION ALL '.join(parts) + ') q)'
+    return '(SELECT jsonb_object_agg(name,value) FROM (' + ' UNION ALL '.join(parts) + ') q)'
 
 
 def inventory(url):
-    tables = query(url, """
+    tables = query(
+        url,
+        """
 SELECT jsonb_build_object('database',current_database(),'tables',coalesce(jsonb_agg(c.relname ORDER BY c.relname),'[]'::jsonb))
 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 WHERE n.nspname='public' AND c.relkind IN ('r','p');
-"""
+""",
     )
     names = tables['tables']
     if len(names) > MAX_TABLES:
@@ -181,7 +204,9 @@ WHERE n.nspname='public' AND c.relkind IN ('r','p');
     # fingerprint stable identity/configuration tables without rescanning traffic.
     protected = sorted(PROTECTED_FINGERPRINT_TABLES.intersection(preserved))
     owned_sql = 'ARRAY[' + ','.join(literal(name) for name in owned) + ']::text[]'
-    edges = query(url, f"""
+    edges = query(
+        url,
+        f"""
 SELECT jsonb_build_object(
  'external_references', (SELECT coalesce(jsonb_agg(conrelid::regclass::text),'[]'::jsonb)
    FROM pg_constraint WHERE contype='f' AND confrelid IN
@@ -192,13 +217,24 @@ SELECT jsonb_build_object(
    FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
    WHERE c.relnamespace='public'::regnamespace AND c.relname=ANY({owned_sql})
      AND NOT t.tgisinternal AND (t.tgtype::integer & 32)<>0));
-"""
+""",
     )
-    contents = query(url, 'BEGIN READ ONLY;\nSELECT jsonb_build_object(\'cvm\',' + fingerprint(owned)
-                     + ',\'preserved\',' + fingerprint(protected) + ');\nCOMMIT;')
-    return {'database': tables['database'], 'cvm_tables': owned, 'preserved_tables': preserved,
-            'protected_fingerprint_tables': protected,
-            'fingerprints': contents, 'blockers': edges}
+    contents = query(
+        url,
+        "BEGIN READ ONLY;\nSELECT jsonb_build_object('cvm',"
+        + fingerprint(owned)
+        + ",'preserved',"
+        + fingerprint(protected)
+        + ');\nCOMMIT;',
+    )
+    return {
+        'database': tables['database'],
+        'cvm_tables': owned,
+        'preserved_tables': preserved,
+        'protected_fingerprint_tables': protected,
+        'fingerprints': contents,
+        'blockers': edges,
+    }
 
 
 def apply(url, expected):
@@ -272,12 +308,15 @@ def main():
         record['status'] = 'complete'
     except (CleanupError, OSError, ValueError, KeyError) as error:
         record.update(status='failed', error=str(error))
-    record.update(ended_at=timestamp(), elapsed_seconds=time.monotonic()-started)
+    record.update(ended_at=timestamp(), elapsed_seconds=time.monotonic() - started)
     with args.output.open('w') as output:
         json.dump(record, output, ensure_ascii=False, indent=2)
         output.write('\n')
-    print(json.dumps({'status': record['status'], 'report': str(args.output),
-                      'elapsed_seconds': record['elapsed_seconds']}))
+    print(
+        json.dumps(
+            {'status': record['status'], 'report': str(args.output), 'elapsed_seconds': record['elapsed_seconds']}
+        )
+    )
     return 0 if record['status'] == 'complete' else 1
 
 

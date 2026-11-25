@@ -348,6 +348,8 @@ async fn query_windows(
     sqlx::query("SET LOCAL statement_timeout='10s'")
         .execute(&mut *tx)
         .await?;
+    // A rule's first forwarding reading has no window start; the ledger and the machine outflow
+    // charge it at observation time, so the inflow must not drop it from the same range.
     let records=sqlx::query("WITH entries AS (
         SELECT s.tenant_id,s.user_id,s.app_id,coalesce(g.bindings->s.grant_label->>'chain_id',r.chain_id) AS chain_id,s.ingress_id,s.uplink_bytes,s.downlink_bytes,s.has_gap
         FROM usage_samples s
@@ -359,7 +361,7 @@ async fn query_windows(
         ) SELECT tenant_id,user_id,'chain' AS source,app_id,chain_id,CASE WHEN chain_id IS NULL THEN ingress_id END AS ingress_id,
         sum(uplink_bytes)::bigint AS up,sum(downlink_bytes)::bigint AS down,bool_or(has_gap) AS gap FROM entries GROUP BY 1,2,4,5,6
         UNION ALL SELECT tenant_id,user_id,'forwarding',NULL,NULL,NULL,sum(uplink_bytes)::bigint,sum(downlink_bytes)::bigint,bool_or(has_gap)
-        FROM forwarding_usage_samples WHERE node_id=$1 AND window_start>=to_timestamp($2::bigint) AND window_start<to_timestamp($3::bigint)
+        FROM forwarding_usage_samples WHERE node_id=$1 AND coalesce(window_start,read_at)>=to_timestamp($2::bigint) AND coalesce(window_start,read_at)<to_timestamp($3::bigint)
           AND ($4::text IS NULL OR tenant_id=$4 OR tenant_id LIKE $5 ESCAPE '\\') GROUP BY 1,2")
         .bind(node).bind(bounds.start).bind(bounds.now).bind(actor.tenant_scope()).bind(actor.tenant_scope_like_pattern()).fetch_all(&mut *tx).await?;
     let rows = records

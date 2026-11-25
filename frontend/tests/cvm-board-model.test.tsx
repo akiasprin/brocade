@@ -10,7 +10,7 @@ import {
   ruleLinks,
   withRoute,
   withoutRoute,
-} from '../src/panes/cvm/board/model';
+} from '../src/panes/cvm/network-model';
 
 const entry = (id: string, publication: string, address: string, mode: CvmEntry['mode']): CvmEntry => ({
   id,
@@ -28,7 +28,14 @@ const entry = (id: string, publication: string, address: string, mode: CvmEntry[
 const board: CvmEntryBoard = {
   can_manage: false,
   entries: [
-    entry('ssh', 'pub-hk', '203.0.113.20', { kind: 'l4', protocol: 'tcp', listen_port: 30022, target_port: 22 }),
+    entry('ssh', 'pub-hk', '203.0.113.20', {
+      kind: 'l4_range',
+      protocol: 'tcp',
+      listen_start: 30022,
+      listen_end: 30022,
+      target_start: 22,
+      target_end: 22,
+    }),
     entry('revoked', 'pub-gone', '203.0.113.99', { kind: 'l3' }),
   ],
   publications: [
@@ -42,6 +49,7 @@ const board: CvmEntryBoard = {
       spec: {
         name: '香港',
         provider_node: 'hk',
+        wireguard_transport: 'udp',
         addresses: [
           { address: '203.0.113.20', kind: 'shared', port_start: 30000, port_end: 30003 },
           { address: '10.0.0.30', public_address: '198.51.100.30', kind: 'dedicated' },

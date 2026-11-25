@@ -1,5 +1,5 @@
 //! WireGuard and Xray machine-pair tunnels in the root namespace. Devices carry an ownership
-//! alias; anything without it is never modified, and owned devices that the desired
+//! alias and an atomic creation group; foreign devices are never modified. Devices the desired
 //! state no longer lists are removed together with their policy route.
 use super::*;
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -10,12 +10,33 @@ const RULE_PRIORITY: u64 = 31700;
 
 fn links() -> Result<Vec<serde_json::Value>> {
     serde_json::from_str(
-        &run_command("ip", &["-j", "link", "show"]).map_err(|_| "cannot list host links")?,
+        &run_command("ip", &["-d", "-j", "link", "show"]).map_err(|_| "cannot list host links")?,
     )
     .map_err(|_| "invalid host link inventory".into())
 }
 fn owned(link: &serde_json::Value) -> Option<&str> {
     link["ifalias"].as_str()?.strip_prefix(ALIAS)
+}
+// IFLA_IFALIAS is ignored on link creation. IFLA_GROUP is applied in the
+// creation request, so a crash before setting the human-readable alias still
+// leaves an owned device. Bind that reserved group to the exact device name.
+fn creation_group(name: &str) -> Option<u32> {
+    let suffix = name.strip_prefix("bxe")?;
+    if suffix.len() != 12 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(0x6bc00000 | (u64::from_str_radix(suffix, 16).ok()? as u32 & 0xfffff))
+}
+fn unfinished_creation(link: &serde_json::Value) -> bool {
+    let Some(group) = link["ifname"].as_str().and_then(creation_group) else {
+        return false;
+    };
+    let actual = link["group"]
+        .as_u64()
+        .or_else(|| link["group"].as_str()?.parse().ok());
+    link["ifalias"].as_str().is_none_or(str::is_empty)
+        && link["linkinfo"]["info_kind"] == "wireguard"
+        && actual == Some(u64::from(group))
 }
 fn ip(args: &[&str]) -> Result<String> {
     run_command("ip", args)
@@ -177,19 +198,30 @@ fn wireguard(root: &Path, tunnel: &EntryTunnel, inventory: &[serde_json::Value])
     let dev = plan::device(tunnel);
     match inventory.iter().find(|link| link["ifname"] == dev.as_str()) {
         Some(link) if owned(link) == Some(tunnel.id.as_str()) => {}
+        Some(link) if unfinished_creation(link) => {}
         Some(_) => return Err("入口通道设备名已被其他网卡占用，未修改".into()),
         None => {
-            ip(&["link", "add", &dev, "type", "wireguard"])?;
             ip(&[
                 "link",
-                "set",
-                "dev",
+                "add",
                 &dev,
-                "alias",
-                &format!("{ALIAS}{}", tunnel.id),
+                "group",
+                &creation_group(&dev)
+                    .ok_or("invalid entry device identity")?
+                    .to_string(),
+                "type",
+                "wireguard",
             ])?;
         }
     }
+    ip(&[
+        "link",
+        "set",
+        "dev",
+        &dev,
+        "alias",
+        &format!("{ALIAS}{}", tunnel.id),
+    ])?;
     let adapter = if !tunnel.wireguard_transport.is_udp() && !tunnel.listens() {
         Some(super::phantun::ensure(root, tunnel, None)?)
     } else {
@@ -292,9 +324,12 @@ pub(super) fn prune(
 ) -> Result<()> {
     let keep: BTreeSet<String> = desired.tunnels.iter().map(plan::device).collect();
     for link in inventory {
-        let (Some(name), Some(_)) = (link["ifname"].as_str(), owned(link)) else {
+        let Some(name) = link["ifname"].as_str() else {
             continue;
         };
+        if owned(link).is_none() && !unfinished_creation(link) {
+            continue;
+        }
         if keep.contains(name) {
             continue;
         }
@@ -347,4 +382,24 @@ pub(super) fn prune(
 
 pub(super) fn inventory() -> Result<Vec<serde_json::Value>> {
     links()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unfinished_device_requires_its_creation_group_kind_and_name() {
+        let name = "bxe0123456789ab";
+        let mut link = serde_json::json!({"ifname":name, "group":creation_group(name).unwrap().to_string(), "linkinfo":{"info_kind":"wireguard"}});
+        assert!(unfinished_creation(&link));
+        link["ifalias"] = serde_json::json!("foreign-owner");
+        assert!(!unfinished_creation(&link));
+        link["ifalias"] = serde_json::json!("");
+        link["group"] = serde_json::json!(0);
+        assert!(!unfinished_creation(&link));
+        link["group"] = serde_json::json!(creation_group(name).unwrap());
+        link["linkinfo"]["info_kind"] = serde_json::json!("dummy");
+        assert!(!unfinished_creation(&link));
+    }
 }

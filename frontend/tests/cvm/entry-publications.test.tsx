@@ -30,18 +30,40 @@ it('publishes host IP L3 forwarding and makes cross-machine transport optional',
       <EntryPublications workspace={workspace} />
     </QueryClientProvider>,
   );
-  fireEvent.click(await screen.findByRole('button', { name: '＋ 发布入口地址' }));
+  fireEvent.click(await screen.findByRole('button', { name: '添加入口地址' }));
   fireEvent.change(screen.getByRole('textbox', { name: '名称' }), { target: { value: 'Host L3' } });
   fireEvent.change(screen.getByRole('combobox', { name: '方式' }), { target: { value: 'dedicated' } });
-  expect(screen.getByRole('option', { name: '整 IP · L3 转发' })).toBeTruthy();
-  expect(screen.getByText(/可以使用机器自身 IP/)).toBeTruthy();
+  expect(screen.getByRole('option', { name: '独占地址' })).toBeTruthy();
+  expect(screen.getByText(/SSH 等服务端口应填入保留列表/)).toBeTruthy();
   expect(screen.getByText('跨机器传输')).toBeTruthy();
   fireEvent.click(screen.getByRole('checkbox', { name: '允许转发到其他机器' }));
   expect(screen.queryByText('跨机器传输')).toBeNull();
-  fireEvent.click(screen.getByRole('button', { name: '发布' }));
+  fireEvent.change(screen.getByRole('textbox', { name: '保留 TCP 端口' }), { target: { value: '8000-7000' } });
+  fireEvent.click(screen.getByRole('button', { name: '保存变更' }));
+  expect(writes).toHaveLength(0);
+  expect((screen.getByRole('textbox', { name: '保留 TCP 端口' }) as HTMLInputElement).disabled).toBe(false);
+  fireEvent.change(screen.getByRole('textbox', { name: '保留 TCP 端口' }), { target: { value: '22,2222,8000-8002' } });
+  fireEvent.click(screen.getByRole('button', { name: '保存变更' }));
   await waitFor(() => expect(writes).toHaveLength(1));
   expect(writes[0]).toMatchObject({
-    spec: { name: 'Host L3', addresses: [{ address: '203.0.113.20', kind: 'dedicated' }], transports: [] },
+    spec: {
+      name: 'Host L3',
+      addresses: [
+        {
+          address: '203.0.113.20',
+          kind: 'dedicated',
+          reserved_ports: {
+            tcp: [
+              { start: 22, end: 22 },
+              { start: 2222, end: 2222 },
+              { start: 8000, end: 8002 },
+            ],
+            udp: [],
+          },
+        },
+      ],
+      transports: [],
+    },
   });
 });
 
@@ -64,7 +86,7 @@ it.each(['xray', 'phantun'] as const)('publishes %s as the selected cross-machin
       <EntryPublications workspace={workspace} />
     </QueryClientProvider>,
   );
-  fireEvent.click(await screen.findByRole('button', { name: '＋ 发布入口地址' }));
+  fireEvent.click(await screen.findByRole('button', { name: '添加入口地址' }));
   fireEvent.change(screen.getByRole('textbox', { name: '名称' }), { target: { value: 'Transport entry' } });
   if (carrier === 'xray') {
     fireEvent.change(screen.getByRole('combobox', { name: '传输方式' }), { target: { value: 'xray' } });
@@ -72,7 +94,7 @@ it.each(['xray', 'phantun'] as const)('publishes %s as the selected cross-machin
   } else {
     fireEvent.change(screen.getByRole('combobox', { name: 'WireGuard 传输' }), { target: { value: 'phantun' } });
   }
-  fireEvent.click(screen.getByRole('button', { name: '发布' }));
+  fireEvent.click(screen.getByRole('button', { name: '保存变更' }));
   await waitFor(() => expect(writes).toHaveLength(1));
   expect(writes[0]).toMatchObject({
     spec: {
@@ -97,7 +119,7 @@ it('keeps new carrier options unavailable on an older provider', async () => {
       <EntryPublications workspace={workspace} />
     </QueryClientProvider>,
   );
-  fireEvent.click(await screen.findByRole('button', { name: '＋ 发布入口地址' }));
+  fireEvent.click(await screen.findByRole('button', { name: '添加入口地址' }));
   expect((screen.getByRole('option', { name: 'Xray' }) as HTMLOptionElement).disabled).toBe(true);
   expect((screen.getByRole('option', { name: 'Phantun / FakeTCP' }) as HTMLOptionElement).disabled).toBe(true);
 });

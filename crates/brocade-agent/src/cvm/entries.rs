@@ -23,6 +23,7 @@ use std::{
 };
 
 use super::diagnostics;
+mod flows;
 mod phantun;
 pub(in crate::cvm) mod plan;
 #[cfg(test)]
@@ -103,7 +104,9 @@ pub(super) fn spawn(options: Options) -> Result<()> {
                     // The Console may be unreachable: keep the last proven state applied.
                     if linux(&options) {
                         if let Ok(saved) = snapshot(&options.state_dir) {
-                            if !saved.node_id.is_empty() {
+                            if !saved.node_id.is_empty()
+                                || flows::has_checkpoint(&options.state_dir)
+                            {
                                 converge(&options.state_dir, &saved);
                             }
                         }
@@ -123,7 +126,7 @@ pub(super) fn spawn(options: Options) -> Result<()> {
 }
 
 pub(super) fn round(options: &Options) -> Result<()> {
-    if super::maintenance()? {
+    if options.apply_mode == ApplyMode::Linux && super::maintenance()? {
         return Ok(());
     }
     let client = HttpClient::new(&options.server)?;
@@ -131,6 +134,7 @@ pub(super) fn round(options: &Options) -> Result<()> {
     if matches!(response.status, 401 | 403) {
         // Revoked authority: withdraw everything this worker owns.
         let empty = EntryDesired::default();
+        flows::seed(&options.state_dir, &snapshot(&options.state_dir)?)?;
         persist(&options.state_dir, &empty)?;
         if linux(options) {
             converge(&options.state_dir, &empty);
@@ -150,6 +154,7 @@ pub(super) fn round(options: &Options) -> Result<()> {
         serde_json::from_str(&response.body).map_err(|_| "invalid entry desired response")?;
     desired.validate()?;
     let previous = snapshot(&options.state_dir)?;
+    flows::seed(&options.state_dir, &previous)?;
     if desired.node_id == previous.node_id && desired.generation < previous.generation {
         return Err("stale entry desired generation rejected".into());
     }
@@ -203,6 +208,16 @@ fn apply(root: &Path, desired: &EntryDesired, report: &mut EntryNodeReport) -> R
     if !desired.rules.is_empty() || !desired.deliveries.is_empty() || !desired.tunnels.is_empty() {
         super::nics::enable_forwarding()?;
     }
+    // Fence withdrawn mappings before stopping a carrier or removing its routes.
+    let mut guard_ports = transport_ports(root)?.all;
+    guard_ports.extend(
+        desired
+            .tunnels
+            .iter()
+            .filter(|t| t.listens())
+            .map(|t| (t.protocol(), t.port)),
+    );
+    let cleanup = flows::begin(root, desired, &guard_ports)?;
     if plan::needs_gateway(desired) && gateway()?.is_none() {
         return Err("容器宿主没有 Cube 网关设备，无法投递到主网卡".into());
     }
@@ -265,6 +280,7 @@ fn apply(root: &Path, desired: &EntryDesired, report: &mut EntryNodeReport) -> R
     reconcile_tcp_flows(root, desired, &ports.all)?;
     reconcile_transport_flows(root, &ports.root_wireguard)?;
     tunnels::prune(root, desired, &tunnels::inventory()?)?;
+    flows::finish(root, cleanup)?;
     let item = |id: &String, tunnel: Option<&String>| EntryItemReport {
         id: id.clone(),
         configured: tunnel.is_none_or(|t| ready.contains(t.as_str())),

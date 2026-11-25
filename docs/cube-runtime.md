@@ -87,6 +87,10 @@ python3 scripts/build-release.py --cube-runtime-only \
 3. 按 [Cubelet 网络配置示例](../crates/brocade-cube/examples/cube-networks.example.json)准备私有 JSON，文件由 Cubelet 有效 UID 持有，权限 `0600`。在 Cubelet 服务设置 `CUBE_NETWORK_ATTACHMENTS_CONFIG=/absolute/cube-networks.json`。
 4. 启动匹配的 Cubelet，为 Agent 设置 [私有 Cube 配置](../crates/brocade-cube/examples/cvm-cube.example.json)与原执行记录目录，再启动 Agent。托管安装器写入 `brocade-agent.service.d/brocade-cvm.conf`，通过 `brocade-agent cvm-check` 核对实际能力。
 
+安装器先在独立目录完整生成配置，再原子发布到运行版本的 `generated/`。渲染失败或进程中断后，重试不会读到半份新配置；已有管理员配置继续保留。已有运行版本的激活中断，先执行 `cvm-stack.py recover` 恢复已记录的运行版本；首次安装中断则检查失败证据后重试同一运行包。
+
+`cvm-stack.py rollback` 首次选择保留的上一版本；重复执行保持同一回滚目标。需要主动切换到另一个保留版本时，使用 `cvm-stack.py rollback --release <完整 SHA-256>`。相同目标已经运行时只重新核查能力，不重启 Cubelet。
+
 业务地址由 Store 分配，Cubelet 不读取本地业务网桥或地址池目录。Agent 的 Cube 配置保留镜像、容量和管理主网卡来源；业务桥由 Agent 按 N 身份创建，实际设备槽位和受管网卡契约由 Cubelet 上报。Cubelet 网络配置的 `state_dir` 和 Agent 的 `BROCADE_CVM_STATE_DIR` 必须位于持久存储，不能使用 tmpfs。
 
 主机 Shim 是执行栈组件。创建实例时固定使用 Cubelet 公开且已核对摘要的 Shim 版本；Guest 镜像内容和实例容量不因此改变。只有实际完成设备挂卸、Guest 观测和宿主状态核对后才确认操作。
@@ -101,9 +105,11 @@ R 在 Guest 中配置独立业务表、终止型不可达规则和逐 N 回程�
 
 Brocade 不创建 Cube 原生宿主端口映射（包括 Guest 22），也不从镜像继承 `ExposedPorts`。外部访问通过入站 N；WebShell 使用独立管理通道。
 
-本版移除本地业务网桥和旧交付契约，默认执行目录为 `/data/cubelet/network-attachments-v2`。不导入旧网卡记录，不自动接管旧 bridge、TAP 或数据库资源。运行栈升级前确认旧容器与网络资源已清理；这与保留已验证系统制品和其他宿主服务的边界分别处理。
+本版移除本地业务网桥和旧交付契约，默认执行目录为 `/data/cubelet/network-attachments-v2`。 网络管理配置必须指定固定 Shim 版本及 SHA-256；组件目录默认 `/data/cubelet/root/component_versions`，可通过 `component_root` 指定绝对路径。网卡请求必须携带完整路由对象，不补空策略；运行中的 Shim 摘要不匹配时直接失败。不导入旧网卡记录，不自动接管旧 bridge、TAP 或数据库资源。系统盘必须有当前持久清单，清单缺失时不从裸卷重建；plain 初始化仅接受 v2 回执。运行栈升级前确认旧容器与网络资源已清理；这与保留已验证系统制品和其他宿主服务的边界分别处理。
 
 ## 执行状态与恢复
+
+升级配置只接受当前分配网卡契约。安装器遇到旧 `bridge_sources` 或旧网卡状态目录会直接拒绝，不会删除旧字段后继续安装。清理旧运行栈后使用当前包重新生成配置。
 
 Rust 执行库与 Cubelet 各自持久化所负责的执行状态。重启后核对原物理盘、设备归属和地址预约，再继续同一操作；回执缓存不能代替真实运行证据。运行栈更新后，实例通过保盘关机／开机绑定新的 Shim。验收入口见 [Docker／KVM 流程](../scripts/tests/cvm/README.md)。
 

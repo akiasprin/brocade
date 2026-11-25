@@ -155,16 +155,21 @@ function sites(period: SiteUsagePeriod, from: number | null = null, until: numbe
     })),
   };
   if (from === null || until === null) return report;
+  // Like the Console, hourly destinations cover every hour the custom range touches, up to now.
+  // The synthetic forwarding lane is hourly here as well, so it follows the same cover.
+  const start = Math.floor(from / 3600) * 3600,
+    end = Math.ceil(until / 3600) * 3600,
+    now = Math.min(end, NOW);
   const series = report.series.map(item => ({
     ...item,
-    points: item.points.filter(([at]) => at >= from && at < until),
+    points: item.points.filter(([at]) => at >= start && at < now),
   }));
   return {
     ...report,
-    range_start_unix_secs: from,
-    range_end_unix_secs: until,
-    period_end_unix_secs: until,
-    observed_since_unix_secs: Math.max(from, report.observed_since_unix_secs ?? from),
+    range_start_unix_secs: start,
+    range_end_unix_secs: now,
+    period_end_unix_secs: end,
+    observed_since_unix_secs: Math.max(start, report.observed_since_unix_secs ?? start),
     series,
     rows: report.rows.map(row => {
       const points = series.find(item => item.site_id === row.site_id)?.points ?? [];

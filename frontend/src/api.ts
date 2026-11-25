@@ -487,7 +487,7 @@ export const fetchCompileView = (revision: number): Promise<CompileView> =>
 /* ── 节点 ── */
 
 /* 与 brocade_deployment::protocol 中的同名结构逐字段对应 */
-export const AGENT_PROTOCOL_VERSION = 76;
+export const AGENT_PROTOCOL_VERSION = 79;
 export const FORWARDING_TARGET_POLICY_PROTOCOL_VERSION = 43;
 export const MIN_AGENT_PROTOCOL_VERSION = 20;
 export const REALTIME_USER_TRAFFIC_PROTOCOL_VERSION = 27;
@@ -5831,7 +5831,10 @@ export interface UnlockDnsPartPath {
   kind: 'direct' | 'fallback' | 'partial' | 'unknown';
   paths: UnlockDnsPath[];
   exits: string[];
+  connection_evidence?: Record<string, UnlockConnectionEvidence>;
 }
+export type UnlockConnectionEvidence =
+  'verified' | 'dns_incomplete' | 'trace_incomplete' | 'exit_mismatch' | 'profile_mismatch';
 export interface UnlockConnectionObservation {
   part: UnlockPart;
   version: number;

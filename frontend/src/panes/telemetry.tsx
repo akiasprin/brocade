@@ -904,6 +904,7 @@ export function HistoryChart({
   rangeStartUnixSecs,
   rangeEndUnixSecs,
   events,
+  legendPlacement = 'footer',
 }: {
   title: string;
   samples: Pick<LoadSample, 'window_start_unix_secs' | 'window_end_unix_secs'>[];
@@ -920,6 +921,8 @@ export function HistoryChart({
   wide?: boolean;
   loading?: boolean;
   ready?: boolean;
+  /** 卡内只有一两条线时，图例收进标题栏最右（同机器详情的网卡流量卡），省下页脚一行。 */
+  legendPlacement?: 'footer' | 'cap';
 } & HistoryFormatProps) {
   const elRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<ReturnType<typeof echarts.init> | null>(null);
@@ -1039,7 +1042,6 @@ export function HistoryChart({
           containLabel: true,
         },
         textStyle: { fontFamily: TP_MONO },
-        legend: { show: false },
         tooltip: {
           trigger: 'axis',
           confine: true,
@@ -1173,6 +1175,26 @@ export function HistoryChart({
     typeof reading === 'function' ? reading(readValue) : reading;
   const renderedMeta = ready ? renderHeaderReading(meta) : undefined;
   const renderedCurrent = renderHeaderReading(current);
+  const legend = (
+    <footer className="history-chart-legend" aria-label={`${title} 图例`} data-focused={focusedLine ? '' : undefined}>
+      {lines.map((line, index) => {
+        const value = ready ? latest(line.values) : null;
+        const color = `var(${historyLineColorVar(line, index)})`;
+        return (
+          <ObserveLegendItem
+            key={line.name}
+            className={line.area ? 'area' : line.dashed ? 'dashed' : undefined}
+            aria-label={`${line.name}曲线`}
+            pressed={focusedLine === line.name}
+            onToggle={() => onFocusLine(line.name)}
+          >
+            <i style={{ background: color }} />
+            {line.name} <b>{value === null ? '—' : readValue(value)}</b>
+          </ObserveLegendItem>
+        );
+      })}
+    </footer>
+  );
 
   return (
     <section
@@ -1184,26 +1206,10 @@ export function HistoryChart({
         {unit?.name && <span className="chart-unit">({unit.name})</span>}
         {renderedMeta && <small>{renderedMeta}</small>}
         {renderedCurrent && <strong>{renderedCurrent}</strong>}
+        {legendPlacement === 'cap' && legend}
       </header>
       <ObserveBrushPlot className="history-chart" hostRef={elRef} chartRef={chartRef} extentRef={extentRef} />
-      <footer className="history-chart-legend" aria-label={`${title} 图例`} data-focused={focusedLine ? '' : undefined}>
-        {lines.map((line, index) => {
-          const value = ready ? latest(line.values) : null;
-          const color = `var(${historyLineColorVar(line, index)})`;
-          return (
-            <ObserveLegendItem
-              key={line.name}
-              className={line.area ? 'area' : line.dashed ? 'dashed' : undefined}
-              aria-label={`${line.name}曲线`}
-              pressed={focusedLine === line.name}
-              onToggle={() => onFocusLine(line.name)}
-            >
-              <i style={{ background: color }} />
-              {line.name} <b>{value === null ? '—' : readValue(value)}</b>
-            </ObserveLegendItem>
-          );
-        })}
-      </footer>
+      {legendPlacement === 'footer' && legend}
     </section>
   );
 }

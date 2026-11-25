@@ -7,8 +7,8 @@ use yawc::{Frame, IncomingUpgrade, OpCode, Options, WebSocket};
 
 fn options() -> Options {
     Options::default()
-        .with_max_payload_read(wire::MAX_DATA + 1)
-        .with_max_read_buffer(wire::MAX_DATA + 1)
+        .with_max_payload_read(wire::MAX_SIGNAL + 1)
+        .with_max_read_buffer(wire::MAX_SIGNAL + 1)
         .with_backpressure_boundary(64 * 1024)
 }
 fn unavailable(message: impl Into<String>) -> ApiError {
@@ -121,7 +121,8 @@ pub(in crate::http) async fn create(
     );
     Ok(no_store_json(
         json!({"session_id":session,"ticket":ticket,"expires_in_seconds":30,
-            "max_sessions_per_node":wire::MAX_PER_NODE,"history_bytes":wire::HISTORY_BYTES}),
+            "max_sessions_per_node":wire::MAX_PER_NODE,"history_bytes":wire::HISTORY_BYTES,
+            "webrtc":state.terminals.rtc_settings(&node)}),
     ))
 }
 
@@ -158,6 +159,8 @@ pub(in crate::http) async fn policy(
 #[derive(Deserialize)]
 struct Attach {
     ticket: String,
+    #[serde(default)]
+    rtc_offer: Option<String>,
 }
 
 pub(in crate::http) async fn browser(
@@ -184,24 +187,38 @@ pub(in crate::http) async fn browser(
         else {
             return;
         };
-        if frame.opcode() != OpCode::Text || frame.payload().len() > wire::MAX_CONTROL {
+        if frame.opcode() != OpCode::Text || frame.payload().len() > wire::MAX_SIGNAL {
             return;
         }
         let Ok(attach) = serde_json::from_slice::<Attach>(frame.payload()) else {
             return;
         };
-        let Ok(link) = state
-            .terminals
-            .browser(&session, &attach.ticket, &operator, &node, &target)
-        else {
+        let Ok(link) = state.terminals.browser_with_rtc(
+            &session,
+            &attach.ticket,
+            &operator,
+            &node,
+            &target,
+            attach.rtc_offer.clone(),
+        ) else {
             return;
         };
         let _guard = SessionGuard {
             service: state.terminals.clone(),
             id: session.clone(),
         };
-        let mut validate = tokio::time::interval(Duration::from_secs(2));
+        let mut validate =
+            tokio::time::interval(Duration::from_secs(if attach.rtc_offer.is_some() {
+                1
+            } else {
+                2
+            }));
         let shutdown = state.shutdown.clone();
+        let lease = attach
+            .rtc_offer
+            .is_some()
+            .then(|| (state.terminals.clone(), session.clone()));
+        let authorization_session = session.clone();
         let check = async move {
             loop {
                 validate.tick().await;
@@ -223,10 +240,11 @@ pub(in crate::http) async fn browser(
                 {
                     break;
                 }
+                state.terminals.validated(&authorization_session);
             }
         };
         tokio::select! {
-            _=relay(&mut socket,link,true)=>{},
+            _=relay(&mut socket,link,true,lease)=>{},
             _=check=>{},
             _=shutdown.requested()=>{},
         }
@@ -260,7 +278,7 @@ pub(in crate::http) async fn agent_stream(
         .map_err(unavailable)?;
     let guard = SessionGuard {
         service: state.terminals.clone(),
-        id: session,
+        id: session.clone(),
     };
     let (response, upgrade) = upgrade
         .upgrade(options())
@@ -271,13 +289,21 @@ pub(in crate::http) async fn agent_stream(
         else {
             return;
         };
-        tokio::select! {_=relay(&mut socket,link,false)=>{},_=state.shutdown.requested()=>{}}
+        let lease = state
+            .terminals
+            .uses_rtc(&session)
+            .then(|| (state.terminals.clone(), session));
+        tokio::select! {_=relay(&mut socket,link,false,lease)=>{},_=state.shutdown.requested()=>{}}
     });
     Ok(response.map(Body::new))
 }
 
-async fn relay<S>(socket: &mut WebSocket<S>, mut link: Link, browser: bool)
-where
+async fn relay<S>(
+    socket: &mut WebSocket<S>,
+    mut link: Link,
+    browser: bool,
+    lease: Option<(crate::cvm::terminal::Service, String)>,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let lifetime = tokio::time::sleep(Duration::from_secs(wire::MAX_SECONDS));
@@ -287,7 +313,13 @@ where
     loop {
         tokio::select! {
             _=&mut lifetime=>break,
-            _=link.cancelled.changed()=>break,
+            _=link.cancelled.changed()=>{
+                if !browser && lease.is_some() {
+                    let value=serde_json::to_string(&wire::AgentControl::Revoke);
+                    if let Ok(value)=value {let _=send(socket,Packet::Control(value)).await;}
+                }
+                break
+            },
             _=heartbeat.tick()=>{
                 if seen.elapsed()>Duration::from_secs(60){break}
                 if !matches!(tokio::time::timeout(Duration::from_secs(5),socket.send(Frame::ping(Vec::new()))).await,Ok(Ok(()))){break}
@@ -299,9 +331,27 @@ where
                 let Ok(frame)=frame else{break};seen=tokio::time::Instant::now();
                 let packet=match frame.opcode(){
                     OpCode::Binary if !frame.payload().is_empty()&&frame.payload().len()<=wire::MAX_DATA=>Packet::Data(frame.payload().to_vec()),
-                    OpCode::Text if frame.payload().len()<=wire::MAX_CONTROL=>{
+                    OpCode::Text if browser && lease.is_some() && frame.payload().len()<=wire::MAX_CONTROL && serde_json::from_slice::<wire::BrowserControl>(frame.payload()).is_ok()=>{
+                        let Ok(wire::BrowserControl::ControlProbe{nonce})=serde_json::from_slice(frame.payload()) else {break};
+                        if let Some((service,id))=lease.as_ref() {service.browser_seen(id);}
+                        if lease.as_ref().is_some_and(|(service,id)|service.rtc_lease_allowed(id)) {
+                            let Ok(text)=serde_json::to_string(&wire::BrowserControl::ControlGrant{nonce}) else {break};
+                            if send(socket,Packet::Control(text)).await.is_err(){break}
+                        }
+                        continue;
+                    },
+                    OpCode::Text if !browser && frame.payload().len()<=wire::MAX_CONTROL && serde_json::from_slice::<wire::AgentControl>(frame.payload()).is_ok()=>{
+                        let Ok(wire::AgentControl::LeaseProbe{nonce})=serde_json::from_slice(frame.payload()) else {break};
+                        if lease.as_ref().is_some_and(|(service,id)|service.rtc_lease_allowed(id)) {
+                            let Ok(text)=serde_json::to_string(&wire::AgentControl::LeaseGrant{nonce}) else {break};
+                            if send(socket,Packet::Control(text)).await.is_err(){break}
+                        }
+                        continue;
+                    },
+                    OpCode::Text if frame.payload().len()<=wire::MAX_SIGNAL=>{
                         let valid=if browser {serde_json::from_slice::<wire::Input>(frame.payload()).is_ok_and(|i|i.valid())}
-                            else {serde_json::from_slice::<wire::Output>(frame.payload()).is_ok()};
+                            else {serde_json::from_slice::<wire::Output>(frame.payload()).is_ok_and(|value| match value {wire::Output::RtcAnswer{sdp}=>wire::valid_sdp(&sdp),_=>frame.payload().len()<=wire::MAX_CONTROL})};
+                        if browser && frame.payload().len()>wire::MAX_CONTROL {break}
                         if !valid{break}
                         let Ok(text)=String::from_utf8(frame.payload().to_vec()) else{break};Packet::Control(text)
                     },
@@ -337,7 +387,11 @@ pub(in crate::http) async fn control(
         else {
             return;
         };
-        let Ok((registration, mut offers)) = state.terminals.register(&node.node_id) else {
+        let rtc = headers
+            .get(wire::RTC_HEADER)
+            .is_some_and(|v| v == wire::RTC_VERSION);
+        let Ok((registration, mut offers)) = state.terminals.register_with_rtc(&node.node_id, rtc)
+        else {
             return;
         };
         let mut tick = tokio::time::interval(Duration::from_secs(15));
@@ -394,5 +448,69 @@ mod tests {
             HeaderValue::from_static("https://console.example:8080"),
         );
         assert!(same_origin(&headers));
+    }
+
+    #[tokio::test]
+    async fn rtc_lease_frames_stay_on_their_authenticated_control_lanes() {
+        let service = crate::cvm::terminal::Service::default();
+        let (_, mut offers) = service.register_with_rtc("node", true).unwrap();
+        let target = wire::Target {
+            instance_id: "cvm-one".into(),
+            runtime_id: "runtime-one".into(),
+            restart_epoch: 0,
+            reinstall_epoch: 0,
+        };
+        let (id, ticket) = service
+            .create_attachment("owner", "node", target.clone(), None, false, 0)
+            .unwrap();
+        let mut browser = service
+            .browser_with_rtc(
+                &id,
+                &ticket,
+                "owner",
+                "node",
+                &target,
+                Some("v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n".into()),
+            )
+            .unwrap();
+        let node = service.agent(&id, "node").unwrap();
+        service.browser_seen(&id);
+        assert!(offers.try_recv().unwrap().rtc.is_some());
+        let (a, b) = tokio::io::duplex(128 * 1024);
+        let mut client = WebSocket::from_stream(a, yawc::Role::Client, options()).unwrap();
+        let mut server = WebSocket::from_stream(b, yawc::Role::Server, options()).unwrap();
+        let task = tokio::spawn(async move {
+            relay(&mut server, node, false, Some((service, id))).await;
+        });
+        client
+            .send(Frame::text(r#"{"type":"lease_probe","nonce":42}"#))
+            .await
+            .unwrap();
+        let text = loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), client.next_frame())
+                .await
+                .unwrap()
+                .unwrap();
+            if frame.opcode() == OpCode::Ping {
+                flush(&mut client).await.unwrap();
+                continue;
+            }
+            assert_eq!(frame.opcode(), OpCode::Text);
+            break frame.payload().to_vec();
+        };
+        assert!(matches!(
+            serde_json::from_slice::<wire::AgentControl>(&text).unwrap(),
+            wire::AgentControl::LeaseGrant { nonce: 42 }
+        ));
+        assert!(browser.receive.try_recv().is_err());
+        // Browser-lane controls cannot be smuggled through an Agent stream.
+        client
+            .send(Frame::text(r#"{"type":"control_probe","nonce":42}"#))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

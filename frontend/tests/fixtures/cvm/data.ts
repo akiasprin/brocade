@@ -7,6 +7,8 @@ const MiB = 1024 ** 2;
 const GiB = 1024 ** 3;
 export const cvmCapabilities: CvmCapabilities = {
   managed_networks: true,
+  chain_egress: false,
+  route_services: false,
   backend: 'cube-kvm-v1',
   guest_terminal: true,
   guest_terminal_persistent: true,
@@ -49,20 +51,6 @@ export const cvmCapabilities: CvmCapabilities = {
   ],
   network_sources: [
     { id: 'public', name: '公网连接', kind: 'public', description: '用于实例主网卡连接', max_attachments: 1 },
-    {
-      id: 'internal',
-      name: '自有网络 · 香港到家庭',
-      kind: 'internal',
-      description: '内部业务通路',
-      max_attachments: 1,
-    },
-    {
-      id: 'internal-tokyo',
-      name: '自有网络 · 东京出口',
-      kind: 'internal',
-      description: '独立业务出口',
-      max_attachments: 1,
-    },
   ],
 };
 
@@ -95,9 +83,10 @@ export function cvmInstance(id = 'cvm-alice'): CvmInstance {
           dns: [],
         },
         name: 'home-workspace',
+        execution: { kind: 'cube' },
         image: cvmCapabilities.images[0],
         resources: { vcpus: 1, memory_bytes: 512 * MiB, root_disk_bytes: 3_000_000_000 },
-        ssh_public_key: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEiBcpQEzqzjADp8VXvOigHnqLh5L5xP76cwoCD8YMK5 fixture',
+        login_revision: 1,
         interfaces: [
           { id: 'nic-public', source_id: 'public', purpose: 'contact', default_ipv4: false, default_ipv6: false },
           {
@@ -173,7 +162,6 @@ export function cvmWorkspace(scene = 'list', role = 'system-admin'): CvmWorkspac
   }
   const redacted = role === 'readonly' || role === 'public';
   if (redacted) {
-    instance.desired.spec.ssh_public_key = '';
     instance.report!.runtime_id = null;
     instance.report!.volume_id = null;
     instance.report!.access_address = null;
@@ -204,36 +192,10 @@ export function cvmWorkspace(scene = 'list', role = 'system-admin'): CvmWorkspac
           ],
     instances: ['empty', 'new', 'experimental'].includes(scene) ? [] : [instance],
     owners: [{ tenant_id: 'platform', user_id: 'alice', name: 'alice' }],
-    quotas: [
-      {
-        tenant_id: 'platform',
-        user_id: 'alice',
-        enabled: true,
-        allowed_nodes: ['hk-hkix'],
-        max_instances: 4,
-        max_vcpus: 4,
-        max_memory_bytes: 2 * GiB,
-        max_disk_bytes: 20 * GiB,
-        max_interfaces: 12,
-      },
-    ],
-    usage: [
-      {
-        tenant_id: 'platform',
-        user_id: 'alice',
-        instances: ['empty', 'new', 'experimental'].includes(scene) ? 0 : 1,
-        vcpus: ['empty', 'new', 'experimental'].includes(scene) ? 0 : instance.desired.spec.resources.vcpus,
-        memory_bytes: ['empty', 'new', 'experimental'].includes(scene)
-          ? 0
-          : instance.desired.spec.resources.memory_bytes,
-        disk_bytes: ['empty', 'new', 'experimental'].includes(scene)
-          ? 0
-          : instance.desired.spec.resources.root_disk_bytes,
-        interfaces: ['empty', 'new', 'experimental'].includes(scene) ? 0 : instance.desired.spec.interfaces.length,
-      },
-    ],
-    can_manage_quotas: role === 'system-admin',
-    can_write: !redacted,
+    tenants: [{ tenant_id: 'platform', name: '平台' }],
+    can_use: !redacted,
+    can_write: role === 'system-admin' || role === 'tenant-admin',
+    can_publish: role === 'system-admin',
     redacted,
   };
 }
@@ -368,36 +330,31 @@ export function cvmReadings(workspace: CvmWorkspace, scene = 'list'): import('..
 export function baremetalWorkspace(scene = 'baremetal-detail', role = 'system-admin'): CvmWorkspace {
   const data = cvmWorkspace('list', role);
   const host = data.hosts[0];
-  host.capabilities = {
-    ...host.capabilities,
-    backend: 'baremetal-v1',
-    images: [],
-    resource_limits: null,
-    create: false,
-    start: false,
-    stop: false,
-    restart: false,
-    reinstall: false,
-    configure: false,
-    delete: false,
-    stable_storage: false,
-    retain_on_delete: false,
-    baremetal: {
-      identity: { machine: 'a'.repeat(64), root_filesystem: 'b'.repeat(64) },
-      os: 'Debian GNU/Linux 13',
-      terminal_user: 'operator',
-      primary_device: 'eth0',
+  const hostSystem = {
+    identity: { machine: 'a'.repeat(64), root_filesystem: 'b'.repeat(64) },
+    os: 'Debian GNU/Linux 13',
+    terminal_user: 'operator',
+    terminal_ready: true,
+    primary_device: 'eth0',
+    resources: {
+      vcpus: host.capabilities.allocatable_vcpus,
+      memory_bytes: host.capabilities.allocatable_memory_bytes,
+      root_disk_bytes: host.capabilities.allocatable_disk_bytes,
     },
   };
+  host.capabilities = {
+    ...host.capabilities,
+    backend: 'cube-kvm-v1',
+    host_system: hostSystem,
+  };
   const instance = data.instances[0];
-  instance.desired.spec.execution = { kind: 'baremetal', identity: host.capabilities.baremetal!.identity };
+  instance.desired.spec.execution = { kind: 'baremetal', identity: hostSystem.identity };
   delete instance.desired.spec.image;
-  instance.desired.spec.ssh_public_key = '';
   instance.desired.spec.name = 'baremetal-workspace';
   instance.desired.spec.resources = {
-    vcpus: host.capabilities.allocatable_vcpus,
-    memory_bytes: host.capabilities.allocatable_memory_bytes,
-    root_disk_bytes: host.capabilities.allocatable_disk_bytes,
+    vcpus: hostSystem.resources.vcpus,
+    memory_bytes: hostSystem.resources.memory_bytes,
+    root_disk_bytes: hostSystem.resources.root_disk_bytes,
   };
   instance.report!.volume_id = null;
   instance.report!.runtime_id = 'host-fixture-12345678-1234-1234-1234-123456789abc';

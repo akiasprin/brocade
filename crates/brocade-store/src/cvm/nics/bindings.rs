@@ -128,11 +128,15 @@ pub(super) async fn transport_port_for_protocol(
     let used = allocated_values(tx, &scope, protocol).await?;
     let forwarding:Vec<i32>=sqlx::query_scalar("SELECT listen_port FROM forwarding_rules WHERE node_id=$1 AND deleted_at IS NULL AND enabled AND (protocol=$2 OR protocol='tcp_udp')") .bind(server).bind(protocol).fetch_all(&mut **tx).await?;
     let static_ranges = crate::port_reservations::static_ranges(tx, server, protocol).await?;
+    let entry_reserved = super::entries::policy::protected(tx, server, None, wire_protocol).await?;
     let port = (offer.port_start..=offer.port_end)
         .find(|port| {
-            !static_ranges
+            !entry_reserved
                 .iter()
-                .any(|(start, end)| i32::from(*port) >= *start && i32::from(*port) <= *end)
+                .any(|r| r.start <= *port && *port <= r.end)
+                && !static_ranges
+                    .iter()
+                    .any(|(start, end)| i32::from(*port) >= *start && i32::from(*port) <= *end)
                 && !used.iter().any(|value| {
                     value
                         .rsplit_once(':')
@@ -257,14 +261,14 @@ impl PgStore {
         let mut nodes = BTreeMap::new();
         for row in sqlx::query("SELECT s.node_id,s.capabilities,s.observed_at>now()-interval '150 seconds' AND n.retired_at IS NULL AS fresh FROM cvm_nic_nodes s JOIN nodes n ON n.id=s.node_id ORDER BY s.node_id LIMIT 2048").fetch_all(&self.pool).await? {
             let caps:NicNodeCapabilities=serde_json::from_value(row.try_get("capabilities")?)?;
-            if row.try_get::<bool,_>("fresh")?&&caps.contract==NIC_PROTOCOL_VERSION&&caps.error.is_none(){nodes.insert(row.try_get::<String,_>("node_id")?,caps);}
+            if row.try_get::<bool,_>("fresh")?&&caps.contract==NIC_CONTRACT_VERSION&&caps.error.is_none(){nodes.insert(row.try_get::<String,_>("node_id")?,caps);}
         }
         let catalog = self.cvm_nic_catalog(actor).await?;
         let mut mount_options = BTreeMap::new();
         for p in catalog.publications {
             let consumer = nodes.get(&container.node_id).filter(|caps| caps.consume);
             let provider = nodes.get(&p.spec.provider_node).filter(|caps| caps.provide);
-            let authorized = granted(actor, &container.tenant_id, &container.user_id, &p);
+            let authorized = granted(actor, &container.tenant_id, container.user(), &p);
             let transports = if authorized && p.admitting {
                 p.spec
                     .transports
@@ -419,7 +423,14 @@ impl PgStore {
             return Err(StoreError::Forbidden("网卡授权已撤销".into()));
         }
         let p = publication(&mut tx, &nic.publication_id).await?;
-        if p.retired || !granted(actor, &instance.tenant_id, &instance.user_id, &p) {
+        if p.retired
+            || !granted(
+                actor,
+                &instance.tenant_id,
+                instance.user_id.as_deref().unwrap_or_default(),
+                &p,
+            )
+        {
             return Err(StoreError::Forbidden("网卡授权已撤销".into()));
         }
         let pinned: serde_json::Value = sqlx::query_scalar(
@@ -585,17 +596,34 @@ impl PgStore {
                 row.try_get::<Option<serde_json::Value>, _>("provider_report")?
             };
             let other: Option<NicBindingReport> = other.map(serde_json::from_value).transpose()?;
-            let both = evidence.configured
-                && evidence.error.is_none()
-                && other.as_ref().is_some_and(|r| {
-                    r.generation == target.generation
-                        && r.phase == target.phase
-                        && r.configured
-                        && r.error.is_none()
-                        && (target.phase == BindingPhase::Withdrawing
-                            || (evidence.reachable == Some(true) && r.reachable == Some(true)))
-                });
-            if !both {
+            let other_node = if evidence.side == BindingSide::Provider {
+                &target.consumer_node
+            } else {
+                &target.provider_node
+            };
+            let other_required: bool = sqlx::query_scalar(
+                "SELECT NOT EXISTS(
+                    SELECT 1 FROM nodes n
+                    LEFT JOIN node_lifecycle_state lifecycle ON lifecycle.node_id=n.id
+                    WHERE n.id=$1
+                      AND (n.retired_at IS NOT NULL
+                           OR lifecycle.phase IN ('retired','abandoned'))
+                )",
+            )
+            .bind(other_node)
+            .fetch_one(&mut *tx)
+            .await?;
+            let other_complete = other.as_ref().is_some_and(|r| {
+                r.generation == target.generation
+                    && r.phase == target.phase
+                    && r.configured
+                    && r.error.is_none()
+                    && (target.phase == BindingPhase::Withdrawing
+                        || (evidence.reachable == Some(true) && r.reachable == Some(true)))
+            }) || (target.phase == BindingPhase::Withdrawing
+                && !other_required);
+            let complete = evidence.configured && evidence.error.is_none() && other_complete;
+            if !complete {
                 continue;
             }
             match target.phase {
@@ -683,7 +711,7 @@ async fn restore_previous(tx: &mut Transaction<'_, Postgres>, failed: &NicBindin
     }
     Ok(())
 }
-pub(super) async fn sync_routes(
+pub(in crate::cvm) async fn sync_routes(
     tx: &mut Transaction<'_, Postgres>,
     desired: &InstanceDesired,
 ) -> Result<()> {
@@ -731,7 +759,7 @@ pub(crate) async fn release_confirmed(
     tx: &mut Transaction<'_, Postgres>,
     instance: &str,
 ) -> Result<()> {
-    let allocations:Vec<String>=sqlx::query_scalar("SELECT a.id FROM cvm_nic_allocations a JOIN cvm_interfaces n ON n.id=a.interface_id JOIN cvm_instances i ON i.id=a.instance_id WHERE a.instance_id=$1 AND NOT a.released AND NOT EXISTS(SELECT 1 FROM cvm_nic_bindings b WHERE b.allocation_id=a.id AND NOT b.cleaned) AND ((NOT n.desired_attached AND n.detached_confirmed) OR (i.report->>'status'='applied' AND i.report->>'generation'=i.generation::text AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(i.desired#>'{spec,interfaces}') device WHERE device->>'id'=n.id AND device#>>'{allocated,allocation_id}'=a.id)))").bind(instance).fetch_all(&mut **tx).await?;
+    let allocations:Vec<String>=sqlx::query_scalar("SELECT a.id FROM cvm_nic_allocations a JOIN cvm_interfaces n ON n.id=a.interface_id JOIN cvm_instances i ON i.id=a.instance_id WHERE a.instance_id=$1 AND NOT a.released AND NOT EXISTS(SELECT 1 FROM cvm_nic_bindings b WHERE b.allocation_id=a.id AND NOT b.cleaned) AND ((NOT n.desired_attached AND n.detached_confirmed) OR (NOT i.reserved AND EXISTS(SELECT 1 FROM node_lifecycle_state lifecycle WHERE lifecycle.node_id=i.node_id AND lifecycle.phase IN ('retired','abandoned'))) OR (i.report->>'status'='applied' AND i.report->>'generation'=i.generation::text AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(i.desired#>'{spec,interfaces}') device WHERE device->>'id'=n.id AND device#>>'{allocated,allocation_id}'=a.id)))").bind(instance).fetch_all(&mut **tx).await?;
     for allocation in allocations {
         let endpoints: (String, String) = sqlx::query_as(
             "SELECT provider_node,consumer_node FROM cvm_nic_allocations WHERE id=$1",
@@ -867,4 +895,101 @@ pub(crate) async fn desired_tx(
         fences,
         management_networks: management_networks.into_iter().collect(),
     })
+}
+
+/// Restore only the bindings changed by this unpublished instance operation. Never
+/// revive a released claim or overwrite a later transport transition.
+pub(in crate::cvm) async fn undo_instance_bindings(
+    tx: &mut Transaction<'_, Postgres>,
+    instance: &str,
+    before: &[NicBinding],
+    after: &[NicBinding],
+) -> Result<()> {
+    let old: BTreeMap<_, _> = before
+        .iter()
+        .filter(|b| b.instance_id == instance)
+        .map(|b| (&b.id, b))
+        .collect();
+    let staged: BTreeMap<_, _> = after
+        .iter()
+        .filter(|b| b.instance_id == instance)
+        .map(|b| (&b.id, b))
+        .collect();
+    let ids = old
+        .keys()
+        .chain(staged.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut released = BTreeSet::new();
+    for id in ids {
+        if old.get(&id) == staged.get(&id) {
+            continue;
+        }
+        let Some(next) = staged.get(&id) else {
+            return Err(StoreError::Conflict(
+                "网卡承载已变更，请先核对资源归属".into(),
+            ));
+        };
+        let valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM cvm_nic_bindings b JOIN cvm_nic_allocations a ON a.id=b.allocation_id
+              WHERE b.id=$1 AND b.generation=$2 AND NOT b.cleaned AND NOT a.released AND NOT a.retired)",
+        )
+        .bind(id)
+        .bind(next.generation as i64)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !valid {
+            return Err(StoreError::Conflict(
+                "网卡承载在保存后已变化，请核对网络状态后再恢复".into(),
+            ));
+        }
+        if let Some(prior) = old.get(&id) {
+            let mut binding = binding_value(tx, id).await?;
+            binding.generation += 1;
+            binding.phase = prior.phase;
+            let blocked = binding.nic.blocked;
+            let quota_exceeded = binding.nic.quota_exceeded;
+            binding.nic = prior.nic.clone();
+            binding.nic.blocked = blocked;
+            binding.nic.quota_exceeded = quota_exceeded;
+            binding.entry_source_ipv4 = prior.entry_source_ipv4;
+            persist_binding(tx, &binding).await?;
+            sqlx::query("UPDATE cvm_nic_allocations SET spec=$2 WHERE id=$1")
+                .bind(&binding.nic.allocation_id)
+                .bind(serde_json::to_value(&binding.nic)?)
+                .execute(&mut **tx)
+                .await?;
+        } else {
+            // Neither peer was offered the frozen revision. Release reservation rows
+            // directly without fabricating an Agent cleanup receipt.
+            sqlx::query("UPDATE cvm_nic_resources SET released=true WHERE binding_id=$1")
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query("UPDATE cvm_nic_bindings SET cleaned=true WHERE id=$1")
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
+            wake(tx, &[&next.provider_node, &next.consumer_node]).await?;
+            released.insert(&next.nic.allocation_id);
+        }
+    }
+    for allocation in released {
+        if old
+            .values()
+            .any(|binding| &binding.nic.allocation_id == allocation)
+        {
+            continue;
+        }
+        let released = sqlx::query("UPDATE cvm_nic_allocations a SET released=true WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM cvm_nic_bindings b WHERE b.allocation_id=a.id AND NOT b.cleaned)")
+            .bind(allocation).execute(&mut **tx).await?.rows_affected();
+        if released != 1 {
+            return Err(StoreError::Conflict("网卡地址仍被其他承载引用".into()));
+        }
+        sqlx::query("UPDATE cvm_nic_resources SET released=true WHERE allocation_id=$1")
+            .bind(allocation)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }

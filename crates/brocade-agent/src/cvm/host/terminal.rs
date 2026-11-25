@@ -341,13 +341,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     if !args.is_empty() {
         return Err("usage: brocade-agent cvm-host-terminal".into());
     }
-    if !super::super::backend::native()? {
-        return Err("native terminal requires the baremetal backend".into());
-    }
-    let config = load_config(&super::super::backend::config_path()?)?;
-    let root = std::env::var_os("BROCADE_CVM_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| "/var/lib/brocade/cvm-host".into());
+    let config_path = super::super::backend::host_config_path()?
+        .ok_or("host management configuration is unavailable")?;
+    let config = load_config(&config_path)?;
+    let root = super::super::backend::host_state_path()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

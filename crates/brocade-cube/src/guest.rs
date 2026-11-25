@@ -35,6 +35,20 @@ impl Inner {
         args: &[&str],
         timeout: Duration,
     ) -> Result<Vec<u8>> {
+        self.guest_exec_input(runtime, read_json, args, &[], timeout)
+    }
+
+    pub(crate) fn guest_exec_input(
+        &self,
+        runtime: &str,
+        read_json: bool,
+        args: &[&str],
+        input: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        if input.len() > 4096 {
+            return Err("Guest input exceeds private execution bound".into());
+        }
         let deadline = Instant::now() + timeout;
         let nonce = files::nonce()?;
         let mut io = GuestIo::new(self, runtime, format!("brocade-{nonce}"))?;
@@ -46,6 +60,9 @@ impl Inner {
             return Err("Guest output readiness invalid".into());
         }
         io.write(format!("{nonce}\n").as_bytes(), deadline)?;
+        if !input.is_empty() {
+            io.write(input, deadline)?;
+        }
         let marker = format!("\nBROCADE_DONE:{nonce}:");
         let mut bytes = Vec::new();
         let result = loop {

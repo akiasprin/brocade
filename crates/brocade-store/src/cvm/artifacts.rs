@@ -4,6 +4,7 @@ use super::*;
 pub(super) async fn freeze(
     tx: &mut Transaction<'_, Postgres>,
     desired: &InstanceDesired,
+    operation: &str,
 ) -> Result<()> {
     if !desired.spec.execution.is_cube() {
         return Ok(());
@@ -16,20 +17,23 @@ pub(super) async fn freeze(
                 persist(tx, desired, &bundle).await?;
                 return Ok(());
             }
-            if desired.power != PowerState::Running {
-                return Ok(());
-            }
         }
     }
-    if desired.power == PowerState::Deleted {
+    // A stopped configuration still needs a reviewed, immutable product. Only
+    // cleanup may proceed without one when its image/compiler is unavailable.
+    if desired.power == PowerState::Deleted
+        || (desired.power == PowerState::Stopped
+            && matches!(operation, "stop" | "assign" | "undo_pending"))
+    {
         return Ok(());
     }
     let row=sqlx::query("SELECT h.capabilities FROM cvm_hosts h JOIN cvm_instances i ON i.node_id=h.node_id WHERE i.id=$1")
         .bind(&desired.id).fetch_one(&mut **tx).await?;
     let caps: Capabilities = serde_json::from_value(row.try_get("capabilities")?)?;
-    // Old executors have no verified template. Never fabricate products for them.
     if caps.artifact_compiler.as_deref() != Some(CVM_ARTIFACT_COMPILER) {
-        return Ok(());
+        return Err(StoreError::Conflict(
+            "宿主不支持当前容器编译产物，请升级 Agent 后重试".into(),
+        ));
     }
     let image = desired
         .spec

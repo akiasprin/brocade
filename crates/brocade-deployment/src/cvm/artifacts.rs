@@ -2,7 +2,6 @@
 use super::*;
 use serde_json::Value;
 
-pub const CVM_ARTIFACT_PROTOCOL_VERSION: u32 = 75;
 pub const CVM_ARTIFACT_COMPILER: &str = "cube-artifacts-v1";
 pub const MAX_IMAGE_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
 
@@ -35,13 +34,6 @@ impl CvmArtifactKind {
             Self::Egress | Self::GuestInit => &[],
         }
     }
-}
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CvmArtifactMode {
-    #[default]
-    Shadow,
-    Enforce,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CvmImageManifest {
@@ -84,7 +76,6 @@ impl CvmArtifactBundle {
 pub struct CvmArtifactReceipt {
     pub compiler: String,
     pub input_sha256: String,
-    pub mode: CvmArtifactMode,
     pub mismatches: Vec<CvmArtifactKind>,
     pub files: Vec<CvmArtifactApplied>,
 }

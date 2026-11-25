@@ -2,6 +2,106 @@ use super::*;
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_route_match_reuses_staged_compile_without_persisting_and_scopes_admins() {
+    use brocade_store::cvm::CvmRouteMatchRequest;
+
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    prepare(&db).await;
+    let mut caps = catalogue();
+    caps.chain_egress = true;
+    db.store
+        .cvm_record_inventory(
+            "n1",
+            InventoryReport {
+                capabilities: caps,
+                terminal_sessions_used: None,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    let item = db
+        .store
+        .create_cvm(&system_admin(), create_request("route-match-create-0001"))
+        .await
+        .unwrap();
+    let id = &item.desired.id;
+    let before = db.store.cvm_instance(&system_admin(), id).await.unwrap();
+    let request = |protocol, port, routes| {
+        serde_json::from_value::<CvmRouteMatchRequest>(
+            json!({"destination":"203.0.113.42","protocol":protocol,"port":port,"routes":routes}),
+        )
+        .unwrap()
+    };
+    let admin = AdminContext::new(
+        "tenant-manager",
+        AdminRole::TenantAdmin,
+        Some("platform.acme".into()),
+    );
+    assert_eq!(
+        serde_json::to_value(
+            db.store
+                .match_cvm_route(
+                    &admin,
+                    id,
+                    request("other", None::<u16>, serde_json::Value::Null)
+                )
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        json!({"kind":"default"})
+    );
+    let mut staged = json!({"revision":before.desired.spec.routing.revision,"dns":[],
+        "priorities":[{"chain_id":"chn-a1b2-c3d4","ipv4":7}],
+        "routes":[{"destination":"203.0.113.0/24","chain_id":"chn-a1b2-c3d4"},{"destination":"0.0.0.0/0","chain_id":"chn-a1b2-c3d4"}]});
+    let forbidden = AdminContext::new(
+        "other-manager",
+        AdminRole::TenantAdmin,
+        Some("platform.other".into()),
+    );
+    for actor in [&forbidden, &actor_user("alice")] {
+        assert!(matches!(
+            db.store
+                .match_cvm_route(actor, id, request("tcp", Some(443), staged.clone()))
+                .await,
+            Err(StoreError::Forbidden(_))
+        ));
+    }
+    // An unpublished instance still supports an actual rollback-only compile of its draft table.
+    let result = db
+        .store
+        .match_cvm_route(&admin, id, request("tcp", Some(443), staged.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        json!({"kind":"route","route_index":0,"priority":7,
+        "route":{"destination":"203.0.113.0/24","chain_id":"chn-a1b2-c3d4"}})
+    );
+    staged["revision"] = json!(before.desired.spec.routing.revision + 1);
+    assert!(matches!(
+        db.store
+            .match_cvm_route(&admin, id, request("tcp", Some(443), staged))
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let after = db.store.cvm_instance(&system_admin(), id).await.unwrap();
+    assert_eq!(after.desired, before.desired);
+    assert_eq!(after.revision_id, before.revision_id);
+    let leaked: i64 = sqlx::query_scalar("SELECT count(*) FROM cvm_operations WHERE instance_id=$1 AND request_id LIKE 'route-match-%' AND request_id <> 'route-match-create-0001'")
+        .bind(id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(leaked, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn cvm_chain_uses_owner_grant_requires_capability_and_freezes_native_guard_receipts() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -14,7 +114,7 @@ async fn cvm_chain_uses_owner_grant_requires_capability_and_freezes_native_guard
     let actor = actor_user("alice");
     let item = db
         .store
-        .create_cvm(&actor, create_request("chain-primary-create-0001"))
+        .create_cvm(&system_admin(), create_request("chain-primary-create-0001"))
         .await
         .unwrap();
     publish_cvm_intent(&db).await;
@@ -30,9 +130,19 @@ async fn cvm_chain_uses_owner_grant_requires_capability_and_freezes_native_guard
         expected_revision: 0,
         routes: routing.clone(),
     };
+    let unavailable = db
+        .store
+        .cvm_chain_catalog(&actor, Some(&item.desired.id))
+        .await
+        .unwrap();
+    assert!(!unavailable.supported);
+    assert_eq!(
+        unavailable.reason.as_deref(),
+        Some("此宿主尚不支持线路出口，请管理员检查并更新宿主组件。")
+    );
     assert!(matches!(
         db.store
-            .set_cvm_routes(&actor, &item.desired.id, request.clone())
+            .set_cvm_routes(&system_admin(), &item.desired.id, request.clone())
             .await,
         Err(StoreError::Unsupported(_))
     ));
@@ -43,6 +153,7 @@ async fn cvm_chain_uses_owner_grant_requires_capability_and_freezes_native_guard
             "n1",
             InventoryReport {
                 capabilities: caps,
+                terminal_sessions_used: None,
                 error: None,
             },
         )
@@ -59,6 +170,55 @@ async fn cvm_chain_uses_owner_grant_requires_capability_and_freezes_native_guard
         .await
         .unwrap();
     assert!(catalog.supported);
+    assert!(catalog.reason.is_none());
+    sqlx::query("UPDATE cvm_hosts SET observed_at=now()-interval '151 seconds' WHERE node_id='n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let stale = db
+        .store
+        .cvm_chain_catalog(&actor, Some(&item.desired.id))
+        .await
+        .unwrap();
+    assert!(!stale.supported);
+    assert_eq!(
+        stale.reason.as_deref(),
+        Some("尚未收到宿主的最新状态，请等待恢复连接后重试。")
+    );
+    db.store
+        .cvm_record_inventory(
+            "n1",
+            InventoryReport {
+                capabilities: catalogue(),
+                terminal_sessions_used: None,
+                error: Some("fixture inventory unavailable".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let failed = db
+        .store
+        .cvm_chain_catalog(&actor, Some(&item.desired.id))
+        .await
+        .unwrap();
+    assert!(!failed.supported);
+    assert_eq!(
+        failed.reason.as_deref(),
+        Some("宿主容器服务异常，请管理员在「宿主」中查看并处理。")
+    );
+    let mut caps = catalogue();
+    caps.chain_egress = true;
+    db.store
+        .cvm_record_inventory(
+            "n1",
+            InventoryReport {
+                capabilities: caps,
+                terminal_sessions_used: None,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
     assert!(catalog
         .chains
         .iter()
@@ -68,13 +228,13 @@ async fn cvm_chain_uses_owner_grant_requires_capability_and_freezes_native_guard
     ipv6.routes.routes[0].destination = "::/0".parse().unwrap();
     assert!(matches!(
         db.store
-            .set_cvm_routes(&actor, &item.desired.id, ipv6)
+            .set_cvm_routes(&system_admin(), &item.desired.id, ipv6)
             .await,
         Err(StoreError::Unsupported(_))
     ));
     let saved = db
         .store
-        .set_cvm_routes(&actor, &item.desired.id, request)
+        .set_cvm_routes(&system_admin(), &item.desired.id, request)
         .await
         .unwrap();
     assert_eq!(saved.desired.spec.interfaces, item.desired.spec.interfaces);
@@ -152,7 +312,7 @@ async fn cvm_chain_uses_owner_grant_requires_capability_and_freezes_native_guard
     };
     let repaired = db
         .store
-        .set_cvm_routes(&actor, &saved.desired.id, repair)
+        .set_cvm_routes(&system_admin(), &saved.desired.id, repair)
         .await
         .unwrap();
     assert!(repaired.desired.generation > saved.desired.generation);
@@ -237,6 +397,7 @@ async fn cvm_chain_release_groups_an_ordinary_ingress_without_a_cube_action() {
             "n1",
             InventoryReport {
                 capabilities: caps,
+                terminal_sessions_used: None,
                 error: None,
             },
         )
@@ -244,10 +405,7 @@ async fn cvm_chain_release_groups_an_ordinary_ingress_without_a_cube_action() {
         .unwrap();
     let item = db
         .store
-        .create_cvm(
-            &actor_user("alice"),
-            create_request("chain-wave-create-0001"),
-        )
+        .create_cvm(&system_admin(), create_request("chain-wave-create-0001"))
         .await
         .unwrap();
     publish_cvm_intent(&db).await;
@@ -259,7 +417,7 @@ async fn cvm_chain_release_groups_an_ordinary_ingress_without_a_cube_action() {
     let routes=serde_json::from_value(json!({"revision":0,"routes":[{"destination":"0.0.0.0/0","chain_id":"chn-a1b2-c3d4"}],"priorities":[{"chain_id":"chn-a1b2-c3d4","ipv4":10}],"dns":[]})).unwrap();
     db.store
         .set_cvm_routes(
-            &actor_user("alice"),
+            &system_admin(),
             &item.desired.id,
             RoutesWrite {
                 request_id: "chain-wave-routes-0001".into(),

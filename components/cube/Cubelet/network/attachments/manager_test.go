@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 
 	wire "github.com/tencentcloud/CubeSandbox/pkgs/proto/networkattachments"
@@ -17,11 +18,42 @@ func managerConfig(t *testing.T) Config {
 	if err := os.Chmod(root, 0700); err != nil {
 		t.Fatal(err)
 	}
-	return Config{StateDir: root, VMMRoot: "/run/vc/vm", MaxInterfaces: 3}
+	components := t.TempDir()
+	shim := filepath.Join(components, "cube-shim", "current", "bin", "containerd-shim-cube-rs")
+	if err := os.MkdirAll(filepath.Dir(shim), 0700); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("fixture current shim")
+	if err := os.WriteFile(shim, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return Config{StateDir: root, VMMRoot: "/run/vc/vm", MaxInterfaces: 3, ComponentRoot: components, ShimVersion: "current", ShimSHA256: hash(data)}
 }
 func managerRequest(id string) wire.Request {
 	routing := json.RawMessage(`{"revision":1,"routes":[],"priorities":[],"dns":[]}`)
 	return wire.Request{Routing: routing, Contract: wire.Contract, InstanceID: id, RuntimeID: id, Generation: 1, Interfaces: []wire.Interface{{ID: "nic-primary", SourceID: "public", Purpose: "contact"}, {ID: "nic-private", SourceID: "private", Purpose: "business", Allocated: &wire.AllocatedNIC{AllocationID: "allocation-test", PublicationID: "private", ResourceDomain: "test-domain", MAC: "02:01:02:03:04:05", IPv4: "10.120.0.2", IPv6: "fd12:3456::2", MTU: 1400}, DefaultIPv4: true, DefaultIPv6: true}}}
+}
+
+func TestCurrentContractRejectsIncompleteRoutingAndUnpinnedShim(t *testing.T) {
+	cfg := managerConfig(t)
+	m, err := New(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, routing := range []json.RawMessage{nil, json.RawMessage(`null`), json.RawMessage(`{}`)} {
+		req := managerRequest("vm-incomplete")
+		req.Routing = routing
+		if _, err := m.Prepare(context.Background(), req); err == nil {
+			t.Fatal("incomplete routing was accepted")
+		}
+		if len(m.server.records) != 0 {
+			t.Fatal("invalid declaration reserved a NIC")
+		}
+	}
+	cfg.ShimSHA256 = ""
+	if _, err := New(cfg, nil); err == nil {
+		t.Fatal("unpinned shim was accepted")
+	}
 }
 func TestReservationsAndStoppedLeasesSurviveManagerRestart(t *testing.T) {
 	cfg := managerConfig(t)

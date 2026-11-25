@@ -20,7 +20,7 @@ before(async () => {
   cacheDirectory = await mkdtemp(join(tmpdir(), 'brocade-usage-layout-'));
   server = await createServer({
     configFile: false,
-  define: { __BROCADE_CVM__: process.env.BROCADE_PRODUCT_FLAVOR !== 'base' },
+    define: { __BROCADE_CVM__: process.env.BROCADE_PRODUCT_FLAVOR !== 'base' },
     root: fileURLToPath(new URL('..', import.meta.url)),
     plugins: [react()],
     cacheDir: join(cacheDirectory, 'node_modules/.vite'),
@@ -166,29 +166,28 @@ for (const width of [760, 1024]) {
 
 for (const theme of ['light', 'dark']) {
   for (const width of [320, 390, 640, 680]) {
-    for (const scene of ['public', 'heavy']) {
-      test(`${scene} flow rows stay inside the paper at ${width}px in ${theme} mode`, async t => {
+    for (const scene of ['public', 'heavy', 'few']) {
+      test(`${scene} narrow matrix stays inside the paper at ${width}px in ${theme} mode`, async t => {
         const page = await usagePage(t, width, { scene, theme });
-        const list = page.getByRole('region', { name: '按用户的当前速率' });
-        await list.waitFor();
-        const rows = await list.locator('.flt-flow').evaluateAll(elements =>
-          elements.map(element => {
-            const box = element.getBoundingClientRect();
-            const listBox = element.closest('.flt-list').getBoundingClientRect();
-            const reading = element.querySelector('.flt-flow-total').getBoundingClientRect();
-            return {
-              tag: element.tagName,
-              inside: box.left >= listBox.left - 0.5 && box.right <= listBox.right + 0.5,
-              readingInside: reading.left >= box.left && reading.right <= box.right - 15,
-            };
-          }),
-        );
-        assert.ok(rows.length > 0, 'the flow list contains measured users');
-        for (const row of rows) {
-          assert.equal(row.tag, scene === 'public' ? 'DIV' : 'BUTTON');
-          assert.equal(row.inside, true, 'row width includes its padding in both access modes');
-          assert.equal(row.readingInside, true, 'the rate retains its right inset');
-        }
+        const board = page.getByRole('region', { name: '用户与机器的当前速率' });
+        await board.locator('tbody tr').first().waitFor();
+        const facts = await board.evaluate(element => {
+          const paper = element.closest('.nd-paper').getBoundingClientRect();
+          const box = element.getBoundingClientRect();
+          const rows = [...element.querySelectorAll('tbody tr')];
+          return {
+            compact: element.classList.contains('compact'),
+            inside: box.left >= paper.left - 0.5 && box.right <= paper.right + 0.5,
+            sumColumn: element.querySelector('thead .flt-sum') !== null,
+            totalsUnderNames: rows.every(row => row.querySelector('.flt-uhead .flt-utotal')),
+            rowTag: rows[0].querySelector('.flt-ubtn').tagName,
+          };
+        });
+        assert.equal(facts.compact, true, 'phone widths use the compact matrix, not a separate list');
+        assert.equal(facts.inside, true, 'the board stays inside the paper; wide matrices scroll inside it');
+        assert.equal(facts.sumColumn, false, 'the total moves under each name');
+        assert.equal(facts.totalsUnderNames, true);
+        assert.equal(facts.rowTag, scene === 'public' ? 'SPAN' : 'BUTTON');
         assert.equal(await pageScrollsSideways(page), false);
       });
     }

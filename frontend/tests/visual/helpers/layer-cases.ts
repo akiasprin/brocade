@@ -220,20 +220,33 @@ export const layerCases: LayerCase[] = [
   {
     id: 'cvm-terminal',
     url: '/tests/fixtures/cvm/preview.html?scene=detail',
-    mode: 'modal',
+    mode: 'popover',
     open: async page => {
       await page.routeWebSocket('**/cvm/*/terminal/*/stream', socket => {
         socket.onMessage(message => {
           if (typeof message !== 'string' || !JSON.parse(message).ticket) return;
+          const id = 'd'.repeat(64);
+          socket.send(
+            JSON.stringify({
+              type: 'session',
+              id,
+              cols: 80,
+              rows: 24,
+              sessions: [{ id, running: true, history_bytes: 0, history_truncated: false }],
+            }),
+          );
           socket.send(JSON.stringify({ type: 'ready' }));
+          socket.send(JSON.stringify({ type: 'replay', active: true }));
           socket.send(Buffer.from('root@fixture:~# printf "你好"\r\n你好\r\n'));
+          socket.send(JSON.stringify({ type: 'replay', active: false }));
         });
       });
-      await page.getByRole('button', { name: '终端', exact: true }).click();
-      // This audit covers the connection-state surface; terminal IO has its own transport suite.
-      await expect(
-        page.getByRole('dialog', { name: '终端 · home-workspace' }).locator('.cvm-terminal-screen'),
-      ).toBeVisible();
+      const url = new URL(page.url());
+      url.searchParams.set('webshell', 'cvm-alice');
+      await page.goto(url.href);
+      await expect(page.getByRole('status').first()).toHaveText('已连接');
+      await page.getByRole('button', { name: '更多', exact: true }).click();
+      await page.getByRole('menuitem', { name: '终端设置', exact: true }).click();
     },
   },
 ];

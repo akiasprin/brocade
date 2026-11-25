@@ -126,6 +126,15 @@ fn validate(a: &ChainClientArtifact) -> Result<()> {
     {
         return Err("线路客户端产物含未授权的入口或直接出口".into());
     };
+    if a.host_system
+        && v["outbounds"].as_array().is_none_or(|outbounds| {
+            outbounds.iter().any(|outbound| {
+                outbound["streamSettings"]["sockopt"]["mark"] != CHAIN_CLIENT_SOCKET_MARK
+            })
+        })
+    {
+        return Err("线路客户端缺少宿主连接保护，请更新控制台后重新发布".into());
+    }
     Ok(())
 }
 fn open_tun(a: &ChainClientArtifact, root: &Path) -> Result<File> {
@@ -135,6 +144,7 @@ fn open_tun(a: &ChainClientArtifact, root: &Path) -> Result<File> {
     let expected = json!({"instance_id":a.instance_id,"chain_id":a.chain_id,"device":device,"mark":a.binding.mark});
     let links = command(&["-j", "link", "show"])?;
     let links: Vec<Value> = serde_json::from_str(&links).map_err(|_| "线路出口网卡清单无效")?;
+    let exists = links.iter().any(|l| l["ifname"] == *device);
     if let Some(link) = links.iter().find(|l| l["ifname"] == *device) {
         if old
             .as_ref()
@@ -155,8 +165,6 @@ fn open_tun(a: &ChainClientArtifact, root: &Path) -> Result<File> {
             &checkpoint,
             &serde_json::to_vec(&expected).map_err(|_| "线路所有权编码失败")?,
         )?;
-        command(&["tuntap", "add", "dev", device, "mode", "tun"])?;
-        command(&["link", "set", "dev", device, "alias", &alias(a)])?;
     }
     #[repr(C)]
     struct Request {
@@ -166,7 +174,7 @@ fn open_tun(a: &ChainClientArtifact, root: &Path) -> Result<File> {
     }
     let mut request = Request {
         name: [0; 16],
-        flags: 0x1001,
+        flags: (0x1001u16 | if exists { 0 } else { 0x8000 }) as i16,
         padding: [0; 22],
     };
     request.name[..device.len()].copy_from_slice(device.as_bytes());
@@ -179,6 +187,15 @@ fn open_tun(a: &ChainClientArtifact, root: &Path) -> Result<File> {
     // SAFETY: Request has Linux ifreq layout; the file remains owned for the ioctl and child lifetime.
     if unsafe { libc::ioctl(file.as_raw_fd(), 0x400454ca as _, &mut request) } < 0 {
         return Err("无法绑定已核验的线路 TUN".into());
+    }
+    if !exists {
+        // Keep a new link ephemeral until its owner is attached. Any error or
+        // Agent exit before persistence closes this FD and removes the link.
+        command(&["link", "set", "dev", device, "alias", &alias(a)])?;
+        // SAFETY: this ioctl accepts an integer and operates on our live TUN FD.
+        if unsafe { libc::ioctl(file.as_raw_fd(), 0x400454cb as _, 1 as libc::c_int) } < 0 {
+            return Err("无法持久保存已标记归属的线路 TUN".into());
+        }
     }
     command(&[
         "link",
@@ -199,7 +216,9 @@ fn owned_chain_device(devices: &[Value], name: &Value) -> bool {
     })
 }
 fn network(a: &ChainClientArtifact) -> Result<()> {
-    super::nics::enable_forwarding()?;
+    if !a.host_system {
+        super::nics::enable_forwarding()?;
+    }
     let mark = a.binding.mark.to_string();
     let device = &a.binding.device;
     // Linux rejects reverse-path validation on an unnumbered IPv4 input device even in loose
@@ -230,6 +249,12 @@ fn network(a: &ChainClientArtifact) -> Result<()> {
         "link",
         "noprefixroute",
     ])?;
+    if a.host_system {
+        run_command(
+            "sysctl",
+            &["-qw", &format!("net.ipv4.conf.{device}.src_valid_mark=1")],
+        )?;
+    }
     for family in ["-4", "-6"] {
         let all = command(&["-N", family, "-j", "route", "show", "table", "all"])?;
         let routes: Vec<Value> = serde_json::from_str(&all).map_err(|_| "线路路由表清单无效")?;
@@ -375,6 +400,53 @@ fn start(options: &Options, a: &ChainClientArtifact, root: &Path, tun: &File) ->
     cmd.spawn().map_err(|_| "线路客户端启动失败".into())
 }
 
+fn restore_clients(root: &Path) -> Result<BTreeMap<String, Client>> {
+    let mut restored = BTreeMap::new();
+    if root.exists() {
+        let mut paths = std::fs::read_dir(root)
+            .map_err(|_| "无法读取线路客户端检查点")?
+            .take(1025)
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|_| "无法读取线路客户端检查点")?;
+        if paths.len() > 1024 {
+            return Err("线路客户端检查点数量超出上限".into());
+        }
+        paths.sort_by_key(|entry| entry.file_name());
+        for entry in paths {
+            if !entry
+                .file_type()
+                .map_err(|_| "线路检查点类型无效")?
+                .is_dir()
+            {
+                return Err("线路检查点必须是独立目录".into());
+            }
+            let root = entry.path();
+            let Some(bytes) = read_bounded(&root.join("artifact.json"), 2 * 1024 * 1024)? else {
+                continue;
+            };
+            let a: ChainClientArtifact =
+                serde_json::from_slice(&bytes).map_err(|_| "线路客户端检查点无效")?;
+            validate(&a)?;
+            if root.file_name().and_then(|n| n.to_str()) != Some(&a.binding.device) {
+                return Err("线路客户端检查点归属不一致".into());
+            }
+            let tun = open_tun(&a, &root)?;
+            command(&["link", "set", "dev", &a.binding.device, "down"])?;
+            restored.insert(
+                key(&a),
+                Client {
+                    artifact: a,
+                    tun,
+                    child: None,
+                    root,
+                    error: None,
+                },
+            );
+        }
+    }
+    Ok(restored)
+}
+
 pub(super) fn sync(options: &Options, artifacts: &[ChainClientArtifact]) -> Result<()> {
     if artifacts.len() > 1024 {
         return Err("线路客户端数量超出本机上限".into());
@@ -388,46 +460,9 @@ pub(super) fn sync(options: &Options, artifacts: &[ChainClientArtifact]) -> Resu
     }
     let mut all = manager().lock().map_err(|_| "线路客户端状态不可用")?;
     if !all.restored {
-        let root = options.state_dir.join("cvm-chain-egress");
-        if root.exists() {
-            let paths = std::fs::read_dir(&root).map_err(|_| "无法读取线路客户端检查点")?;
-            for (index, entry) in paths.enumerate() {
-                if index >= 1024 {
-                    return Err("线路客户端检查点数量超出上限".into());
-                }
-                let entry = entry.map_err(|_| "无法读取线路客户端检查点")?;
-                if !entry
-                    .file_type()
-                    .map_err(|_| "线路检查点类型无效")?
-                    .is_dir()
-                {
-                    return Err("线路检查点必须是独立目录".into());
-                }
-                let root = entry.path();
-                let Some(bytes) = read_bounded(&root.join("artifact.json"), 2 * 1024 * 1024)?
-                else {
-                    continue;
-                };
-                let a: ChainClientArtifact =
-                    serde_json::from_slice(&bytes).map_err(|_| "线路客户端检查点无效")?;
-                validate(&a)?;
-                if root.file_name().and_then(|n| n.to_str()) != Some(&a.binding.device) {
-                    return Err("线路客户端检查点归属不一致".into());
-                }
-                let tun = open_tun(&a, &root)?;
-                command(&["link", "set", "dev", &a.binding.device, "down"])?;
-                all.clients.insert(
-                    key(&a),
-                    Client {
-                        artifact: a,
-                        tun,
-                        child: None,
-                        root,
-                        error: None,
-                    },
-                );
-            }
-        }
+        // A failed restore must drop every newly opened single-queue TUN FD.
+        // Publishing a partial map would make the next attempt fail with EBUSY.
+        all.clients = restore_clients(&options.state_dir.join("cvm-chain-egress"))?;
         all.restored = true;
     }
     for a in artifacts {
@@ -586,6 +621,82 @@ pub(super) fn receipts(instance: &str) -> Vec<ChainClientReceipt> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an explicitly selected private KVM network namespace"]
+    fn interrupted_restore_releases_open_tuns_before_retry() {
+        assert_eq!(std::env::var("BROCADE_RUN_CVM_KVM").as_deref(), Ok("1"));
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+            std::fs::read_link("/proc/1/ns/net").unwrap()
+        );
+        let directory = std::env::temp_dir().join(format!(
+            "brocade-chain-restore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let make = |chain: &str| {
+            let binding = brocade_cvm_compile::chain_binding("restore-test", chain);
+            let content = json!({"inbounds":[{"protocol":"tun","settings":{"name":binding.device}}],"outbounds":[{"protocol":"blackhole"}]}).to_string();
+            let mut artifact = ChainClientArtifact {
+                blocked: false,
+                host_system: false,
+                instance_id: "restore-test".into(),
+                chain_id: chain.into(),
+                tenant_id: "tenant".into(),
+                user_id: "user".into(),
+                app_id: "app".into(),
+                ingress_id: "ingress".into(),
+                ingress_node: "node".into(),
+                binding,
+                sha256: brocade_core::hash::sha256_hex(content.as_bytes()),
+                content,
+                guard: String::new(),
+                redacted: String::new(),
+            };
+            artifact.guard = brocade_cvm_compile::host_network::chain_guard(&artifact, false);
+            artifact
+        };
+        let mut artifacts = [make("chain-a"), make("chain-b")];
+        artifacts.sort_by(|a, b| a.binding.device.cmp(&b.binding.device));
+        for artifact in &artifacts {
+            let root = directory.as_path().join(&artifact.binding.device);
+            std::fs::create_dir(&root).unwrap();
+            atomic_write_private(
+                &root.join("artifact.json"),
+                &serde_json::to_vec(artifact).unwrap(),
+            )
+            .unwrap();
+            drop(open_tun(artifact, &root).unwrap());
+        }
+        let corrupt = directory
+            .as_path()
+            .join(&artifacts[1].binding.device)
+            .join("artifact.json");
+        atomic_write_private(&corrupt, b"invalid").unwrap();
+        assert!(restore_clients(directory.as_path()).is_err());
+        // The failed pass already opened the first device. This succeeds only
+        // when that pass released its exclusive, single-queue descriptor.
+        drop(
+            open_tun(
+                &artifacts[0],
+                &directory.as_path().join(&artifacts[0].binding.device),
+            )
+            .unwrap(),
+        );
+        atomic_write_private(&corrupt, &serde_json::to_vec(&artifacts[1]).unwrap()).unwrap();
+        let restored = restore_clients(directory.as_path()).unwrap();
+        assert_eq!(restored.len(), 2);
+        drop(restored);
+        for artifact in artifacts {
+            command(&["link", "delete", "dev", &artifact.binding.device]).unwrap();
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
     #[test]
     fn address_inventory_without_alias_recognizes_other_owned_chain_links() {
         let devices = vec![

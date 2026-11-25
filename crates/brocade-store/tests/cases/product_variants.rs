@@ -119,13 +119,13 @@ async fn product_variants_base_guard_distinguishes_live_resources_from_history()
         .await
         .unwrap();
     db.store.ensure_cvm_released().await.unwrap();
-    sqlx::query("INSERT INTO cvm_user_host_network_quotas (tenant_id,user_id,node_id,id,revision,limits,held_states) VALUES ('platform.acme','alice','n1','1111111111111111',1,'{}',100)")
+    sqlx::query("INSERT INTO cvm_network_quota_hosts (node_id,capacity,report) VALUES ('n1','{}','{\"states\":100}')")
         .execute(db.pool()).await.unwrap();
     assert!(matches!(
         db.store.ensure_cvm_released().await,
         Err(StoreError::Conflict(_))
     ));
-    sqlx::query("UPDATE cvm_user_host_network_quotas SET held_states=0")
+    sqlx::query("UPDATE cvm_network_quota_hosts SET report='{\"states\":0}'")
         .execute(db.pool())
         .await
         .unwrap();

@@ -16,7 +16,14 @@ export function entryBoard(workspace: CvmWorkspace, scene: string): CvmEntryBoar
           instance_id: first,
           address: '203.0.113.20',
           visible_address: '203.0.113.20',
-          mode: { kind: 'l4', protocol: 'tcp', listen_port: 30022, target_port: 22 },
+          mode: {
+            kind: 'l4_range',
+            protocol: 'tcp',
+            listen_start: 30022,
+            listen_end: 30022,
+            target_start: 22,
+            target_end: 22,
+          },
           remote: true,
           state: 'active',
           error: null,
@@ -29,7 +36,14 @@ export function entryBoard(workspace: CvmWorkspace, scene: string): CvmEntryBoar
           instance_id: second,
           address: '203.0.113.20',
           visible_address: '203.0.113.20',
-          mode: { kind: 'l4', protocol: 'udp', listen_port: 30053, target_port: 53 },
+          mode: {
+            kind: 'l4_range',
+            protocol: 'udp',
+            listen_start: 30053,
+            listen_end: 30053,
+            target_start: 53,
+            target_end: 53,
+          },
           remote: true,
           state: scene === 'board' ? 'pending' : 'active',
           error: null,
@@ -64,6 +78,7 @@ export function entryBoard(workspace: CvmWorkspace, scene: string): CvmEntryBoar
       spec: {
         name: '香港共享入口',
         provider_node: 'remote-ingress',
+        wireguard_transport: 'udp',
         addresses: [{ address: '203.0.113.20', kind: 'shared', port_start: 30000, port_end: 30999 }],
         transports: [],
         grants: [{ tenant_id: 'platform', user_id: 'alice' }],
@@ -92,6 +107,7 @@ export function entryBoard(workspace: CvmWorkspace, scene: string): CvmEntryBoar
       spec: {
         name: '香港独立地址',
         provider_node: 'hk-hkix',
+        wireguard_transport: 'udp',
         addresses: [
           { address: '10.8.0.30', public_address: '198.51.100.30', kind: 'dedicated' },
           { address: '10.8.0.31', public_address: '198.51.100.31', kind: 'dedicated' },

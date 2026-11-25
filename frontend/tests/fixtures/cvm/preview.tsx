@@ -10,7 +10,15 @@ import { networkLogs } from './log-data';
 import { entryBoard } from './entry-data';
 import { artifactHistory, artifactReceipt } from './artifact-data';
 import { chainCatalog } from './chain-data';
-import type { CvmChange, CvmCreate, CvmNetworkQuotaLimits } from '../../../src/api';
+import type {
+  CvmChange,
+  CvmCreate,
+  CvmNetworkQuotaLimits,
+  CvmRouteMatchRequest,
+  CvmRouteMatchResult,
+  DeploymentPlan,
+} from '../../../src/api';
+import type { CvmNetworkEditRequest } from '../../../src/api/cvm-network-edit';
 import '../../../src/styles.css';
 
 const params = new URLSearchParams(location.search);
@@ -21,52 +29,33 @@ document.documentElement.dataset.palette = 'dailan';
 installBackend();
 const fallback = globalThis.fetch;
 const workspace = scene.startsWith('baremetal-') ? baremetalWorkspace(scene, role) : cvmWorkspace(scene, role);
+if (scene === 'staged' || scene === 'staged-entry') {
+  workspace.pending_revision_id = 42;
+  Object.assign(workspace.instances[0], {
+    revision_id: 42,
+    published_revision_id: 41,
+    operation_kind: scene === 'staged-entry' ? 'entries' : 'configure',
+    status: scene === 'staged-entry' ? 'applied' : 'pending',
+  });
+}
 if (scene === 'oversold') {
   const caps = workspace.hosts[0].capabilities;
   caps.allocatable_vcpus = 1;
   caps.allocatable_memory_bytes = 128 * 1024 ** 2;
   caps.allocatable_disk_bytes = 1024 ** 3;
   workspace.instances[0].desired.spec.resources.vcpus = 3;
-  workspace.usage![0].vcpus = 3;
 }
-if (scene.startsWith('quota-network')) {
-  workspace.hosts[0].capabilities.network_quota = {
-    physical_memory_bytes: 958 * 1024 ** 2,
-    host_reserved_memory_bytes: 448 * 1024 ** 2,
-    contract: 'cubevs-user-quota-v1',
-    total_states: 131072,
-    system_reserved_states: 4096,
-    memory_budget_bytes: 254 * 1024 ** 2,
-    fixed_memory_bytes: 28 * 1024 ** 2,
-    bytes_per_state: 1536,
-    model: 'network-state-budget-v1',
-  };
-  workspace.network_quotas = [
-    {
-      tenant_id: 'platform',
-      user_id: 'alice',
-      node_id: 'hk-hkix',
-      id: '1122334455667788',
-      revision: 2,
-      limits: { max_states: 80000, new_per_second: 1000, burst: 2000 },
-      held_states: 80000,
-      fresh: true,
-      report: {
-        id: '1122334455667788',
-        revision: 2,
-        applied: true,
-        states: 2500,
-        denied_capacity: 0,
-        denied_rate: 0,
-        allocation_failures: 0,
-        error: null,
-      },
-    },
-  ];
-  if (scene === 'quota-network-stale') workspace.hosts[0].fresh = false;
-}
-if (scene === 'hosts') {
+
+if (scene === 'hosts' || scene === 'new-copy') {
   const host = workspace.hosts[0];
+  if (scene === 'new-copy') {
+    host.capabilities.primary_ip_delivery = true;
+    workspace.instances[0].desired.spec.resources = {
+      vcpus: 2,
+      memory_bytes: 1024 ** 3,
+      root_disk_bytes: 6 * 1024 ** 3,
+    };
+  }
   host.observed_at = '2026-11-04T10:28:00Z';
   workspace.hosts.push(
     {
@@ -94,6 +83,7 @@ if (scene === 'hosts') {
       error: '运行时无法连接，等待节点恢复',
     },
   );
+  if (scene === 'hosts' && role === 'system-admin') host.terminal_sessions = { used: 2, limit: 3 };
 }
 if (scene === 'terminal-management') {
   const host = workspace.hosts[0];
@@ -119,9 +109,11 @@ if (scene === 'fleet') {
     ['legacy-api', 'unknown', 'running'],
     ['ci-cache', 'pending', 'running'],
   ] as const;
+  workspace.hosts.push({ ...structuredClone(workspace.hosts[0]), node_id: 'tokyo', name: '东京 · 开发宿主' });
   workspace.instances = cases.map(([name, status, power], index) => {
     const item = structuredClone(base);
     item.desired.id = `cvm-fleet-${index}`;
+    if ([2, 3, 5].includes(index)) item.node_id = 'tokyo';
     item.desired.spec.name = name;
     item.status = status;
     item.desired.power = power;
@@ -190,16 +182,111 @@ if (scene.startsWith('chain-')) {
   instance.desired.spec.routing.priorities.push({ chain_id: 'chain-us', ipv4: 200, ipv6: 200 });
   instance.desired.spec.routing.routes.push({ destination: '203.0.113.0/24', chain_id: 'chain-us' });
 }
+/** Preview-only route matcher: longest prefix, then service rules, then exit priority. IPv6 only matches `::/0`. */
+function matchRoute(request: CvmRouteMatchRequest): CvmRouteMatchResult {
+  const routing = request.routes ?? request.network_edit?.routes?.routes ?? workspace.instances[0].desired.spec.routing;
+  const v6 = request.destination.includes(':');
+  const ip = v6 ? 0 : request.destination.split('.').reduce((value, octet) => value * 256 + Number(octet), 0);
+  const candidates = routing.routes.flatMap((route, route_index) => {
+    const [network, bits = v6 ? '128' : '32'] = route.destination.split('/');
+    if (network.includes(':') !== v6) return [];
+    const prefix = Number(bits);
+    if (v6 ? prefix !== 0 : prefix > 0) {
+      if (v6) return [];
+      const base = network.split('.').reduce((value, octet) => value * 256 + Number(octet), 0);
+      const size = 2 ** (32 - prefix);
+      if (Math.floor(ip / size) !== Math.floor(base / size)) return [];
+    }
+    const service = route.service;
+    if (service && (service.protocol !== request.protocol || request.port == null)) return [];
+    if (service && (request.port! < service.port_start || request.port! > service.port_end)) return [];
+    const target = route.chain_id ? { chain_id: route.chain_id } : { interface_id: route.interface_id };
+    const priority = routing.priorities.find(
+      p => p.chain_id === target.chain_id && p.interface_id === target.interface_id,
+    )?.[v6 ? 'ipv6' : 'ipv4'];
+    return priority == null ? [] : [{ route_index, route, prefix, service: !!service, priority }];
+  });
+  candidates.sort((a, b) => b.prefix - a.prefix || Number(b.service) - Number(a.service) || a.priority - b.priority);
+  const best = candidates[0];
+  return best
+    ? { kind: 'route', route_index: best.route_index, route: best.route, priority: best.priority }
+    : { kind: 'default' };
+}
+const initialInstance = structuredClone(workspace.instances[0]);
 const mutations: unknown[] = [];
 const entries = entryBoard(workspace, scene);
+if (params.get('policy') === '1') {
+  const offer = entries.publications.flatMap(p => p.spec.addresses).find(o => o.address === '10.8.0.31');
+  if (offer) offer.reserved_ports = { tcp: [{ start: 22, end: 22 }], udp: [] };
+}
+if (params.get('range') === '1' && entries.entries.length) {
+  entries.entries[0].mode = {
+    kind: 'l4_range',
+    protocol: 'tcp',
+    listen_start: 30040,
+    listen_end: 30049,
+    target_start: 20,
+    target_end: 29,
+  };
+  for (const publication of entries.publications)
+    for (const usage of publication.usage)
+      for (const port of usage.ports)
+        if (port.entry_id === entries.entries[0].id) {
+          port.port_start = 30040;
+          port.port_end = 30049;
+        }
+}
+
 const catalog = nicCatalog(role === 'system-admin', workspace.instances[0]);
+if (scene === 'new-copy' && catalog.providers.length) {
+  catalog.providers.push({
+    ...catalog.providers[0],
+    node_id: workspace.hosts[0].node_id,
+    name: workspace.hosts[0].name,
+    capabilities: { ...catalog.providers[0].capabilities, consume: true },
+  });
+}
 let networkState = workspace.instances[0] ? nicState(workspace.instances[0], workspace.redacted) : null;
 Object.defineProperty(window, '__cvmMutations', { value: mutations });
 globalThis.fetch = async (input, init) => {
   const url = new URL(input instanceof Request ? input.url : String(input), location.origin);
   const method = init?.method ?? 'GET';
+  if (scene.startsWith('staged') && url.pathname === '/revisions') {
+    const value = await (await fallback(input, init)).json();
+    return Response.json({ ...value, current_revision: 42 });
+  }
+  if (scene.startsWith('staged') && url.pathname === '/artifacts/index')
+    return Response.json({ revision: Number(url.searchParams.get('revision') ?? 42), artifacts: [] });
+  if (scene.startsWith('staged') && url.pathname === '/deployments/verify')
+    return Response.json({ summary: { changed_targets: 1 } });
+  if (url.pathname === '/deployments/plan' && method === 'POST') {
+    const revision = Number(JSON.parse(String(init?.body)).revision_id);
+    const plan: DeploymentPlan = {
+      revision,
+      base_revision_id: revision - 1,
+      targets: [
+        { node_id: workspace.hosts[0].node_id, status: 'pending', wave: 1, disruptive: false, actions: ['sync-cvm'] },
+      ],
+      summary: {
+        total_targets: 1,
+        changed_targets: 1,
+        skipped_targets: 0,
+        deferred_targets: 0,
+        disruptive_targets: 0,
+        max_wave: 1,
+      },
+      warnings: [],
+    };
+    return Response.json(plan);
+  }
   if (url.pathname === '/cvm/chain-egress' && method === 'GET') {
     const value = chainCatalog(workspace, url.searchParams.get('instance_id'));
+    if (params.get('chain') === 'unavailable')
+      return Response.json({
+        ...value,
+        supported: false,
+        reason: '此宿主尚不支持线路出口，请管理员检查并更新宿主组件。',
+      });
     return Response.json(
       scene.startsWith('chain-')
         ? value
@@ -215,23 +302,7 @@ globalThis.fetch = async (input, init) => {
   }
   if (url.pathname.endsWith('/artifacts/preview') && method === 'POST')
     return Response.json({ instance: workspace.instances[0], artifacts: artifactHistory(), no_op: false });
-  if (url.pathname === '/cvm/quota/network/preview' && method === 'POST') {
-    const body = JSON.parse(String(init?.body)) as { limits: CvmNetworkQuotaLimits };
-    const own = workspace.network_quotas?.[0];
-    return Response.json({
-      node_id: 'hk-hkix',
-      revision: own?.revision ?? 0,
-      budget_revision: 7,
-      capacity: workspace.hosts[0].capabilities.network_quota,
-      held_states: own?.held_states ?? 0,
-      other_allocated: 20000,
-      maximum: 106976,
-      requested: body.limits,
-      additional_states: Math.max(0, body.limits.max_states - (own?.held_states ?? 0)),
-      excess_states: Math.max(0, body.limits.max_states - 106976),
-      fits: body.limits.max_states <= 106976,
-    });
-  }
+
   if (url.pathname.endsWith('/artifacts'))
     return Response.json(
       scene === 'artifacts-legacy'
@@ -285,6 +356,106 @@ globalThis.fetch = async (input, init) => {
     return Response.json(catalog.publications[0]);
   }
   if (url.pathname.endsWith('/network') && method === 'GET') return Response.json(networkState);
+  if (url.pathname.endsWith('/network-edit') && method === 'PUT') {
+    const id = decodeURIComponent(url.pathname.split('/')[2]);
+    const current = workspace.instances.find(item => item.desired.id === id);
+    const body = JSON.parse(String(init?.body)) as CvmNetworkEditRequest;
+    const preview = url.searchParams.has('preview');
+    if (!current) return Response.json({ error: '容器不存在' }, { status: 404 });
+    if (body.expected_generation !== current.desired.generation)
+      return Response.json({ error: '容器已变化，请刷新后操作' }, { status: 409 });
+    const item = structuredClone(current);
+    const mounted = Object.fromEntries(
+      (body.mounts ?? []).map((mount, index) => [mount.draft_id, `nic-added-${index}`]),
+    );
+    for (const mount of body.mounts ?? []) {
+      const id = mounted[mount.draft_id];
+      const allocated = allocatedNic(id);
+      allocated.publication_id = mount.publication_id;
+      allocated.transport = mount.transport;
+      item.desired.spec.interfaces.push({
+        id,
+        source_id: mount.publication_id,
+        purpose: 'business',
+        default_ipv4: false,
+        default_ipv6: false,
+        allocated,
+      });
+    }
+    item.desired.spec.interfaces = item.desired.spec.interfaces.filter(
+      nic => !body.detach_interface_ids?.includes(nic.id),
+    );
+    if (body.routes) {
+      const applyMounted = <T extends { interface_id?: string }>(value: T): T =>
+        value.interface_id && mounted[value.interface_id]
+          ? { ...value, interface_id: mounted[value.interface_id] }
+          : value;
+      item.desired.spec.routing = {
+        ...body.routes.routes,
+        revision: body.routes.expected_revision + 1,
+        routes: body.routes.routes.routes.map(applyMounted),
+        priorities: body.routes.routes.priorities.map(applyMounted),
+      };
+    }
+    const changesDevice = !!(body.mounts?.length || body.detach_interface_ids?.length || body.routes);
+    if (changesDevice) {
+      item.desired.generation++;
+      item.status = 'pending';
+    }
+    item.revision_id = 42;
+    item.published_revision_id ??= 41;
+    item.operation_kind = changesDevice ? 'network_edit' : 'entries';
+    if (!preview) {
+      mutations.push({
+        method,
+        path: url.pathname,
+        ...body,
+        ...(body.routes
+          ? {
+              expected_revision: body.routes.expected_revision,
+              routes: body.routes.routes,
+            }
+          : {}),
+      });
+      for (const entry of body.entry_additions ?? []) {
+        const publication = entries.publications.find(p => p.id === entry.publication_id);
+        entries.entries.push({
+          ...entry,
+          id: `entry-new-${entries.entries.length}`,
+          revision: 1,
+          provider_node: publication?.spec.provider_node ?? '',
+          instance_id: id,
+          visible_address:
+            publication?.spec.addresses.find(o => o.address === entry.address)?.public_address ?? entry.address,
+          state: 'pending',
+          error: null,
+          remote: true,
+        });
+      }
+      for (const release of body.entry_releases ?? []) {
+        const entry = entries.entries.find(entry => entry.id === release.id);
+        if (entry) entry.state = 'releasing';
+      }
+      Object.assign(current, item);
+      workspace.pending_revision_id = 42;
+      networkState = nicState(item);
+    }
+    return Response.json({ instance: item, mounted_interfaces: mounted, input_sha256: 'a'.repeat(64) });
+  }
+  if (url.pathname.endsWith('/pending') && method === 'GET') {
+    const item = workspace.instances.find(item => url.pathname === `/cvm/${item.desired.id}/pending`);
+    if (!item?.revision_id) return Response.json({ error: '容器没有待发布变更' }, { status: 409 });
+    return Response.json({
+      revision: item.revision_id,
+      author: 'admin',
+      saved_at: item.updated_at,
+      fields: item.operation_kind === 'network_edit' ? ['interfaces', 'routes'] : ['resources'],
+      entries_added: Number(item.operation_kind === 'entries'),
+      entries_removed: 0,
+      nics_added: 0,
+      nics_removed: 0,
+    });
+  }
   if (url.pathname.endsWith('/routes') && method === 'PUT') {
     const body = JSON.parse(String(init?.body));
     mutations.push(body);
@@ -311,6 +482,9 @@ globalThis.fetch = async (input, init) => {
     });
     item.desired.generation++;
     item.status = 'pending';
+    item.revision_id = 42;
+    item.published_revision_id = 41;
+    workspace.pending_revision_id = 42;
     networkState = nicState(item);
     return Response.json(item, { status: 202 });
   }
@@ -356,8 +530,11 @@ globalThis.fetch = async (input, init) => {
       expires_in_seconds: 30,
       max_sessions_per_node: 3,
       history_bytes: 4 * 1024 ** 2,
+      webrtc: { supported: params.get('rtc') === '1', stun_servers: ['stun:stun.cloudflare.com:3478'] },
     });
   }
+  if (url.pathname.endsWith('/credential'))
+    return Response.json({ instance_id: workspace.instances[0].desired.id, revision: 1, password: 'F'.repeat(32) });
   if (url.pathname.endsWith('/tcp-pings')) return Response.json([]);
   if (url.pathname.endsWith('/monitoring')) {
     const { cvmMonitoring } = await import('./data');
@@ -369,20 +546,34 @@ globalThis.fetch = async (input, init) => {
     // Server acceptance is pending; the fixture never fabricates a runtime report.
     const { cvmInstance } = await import('./data');
     const item = cvmInstance('cvm-created');
+    item.tenant_id = body.tenant_id;
+    item.user_id = body.user_id;
     item.desired.spec.name = body.name;
     item.desired.spec.resources = body.resources;
     item.desired.spec.interfaces = body.interfaces.map((nic, i) => ({ ...nic, id: `nic-new-${i}` }));
     item.status = 'pending';
+    item.revision_id = 42;
+    item.published_revision_id = null;
+    item.operation_kind = 'create';
+    workspace.pending_revision_id = 42;
     item.report = null;
     workspace.instances.push(item);
     return Response.json(item, { status: 202 });
   }
+  if (url.pathname.endsWith('/routes/match') && method === 'POST')
+    return Response.json(matchRoute(JSON.parse(String(init?.body))));
   if (url.pathname.startsWith('/cvm/') && method === 'POST') {
     const body = JSON.parse(String(init?.body)) as CvmChange;
     mutations.push(body);
     const item = workspace.instances[0];
     item.status = 'pending';
+    item.revision_id = (item.revision_id ?? 2) + 1;
+    item.published_revision_id ??= 1;
+    item.operation_kind = body.action;
     item.desired.generation += 1;
+    if (body.action === 'undo_pending') {
+      item.desired = { ...structuredClone(initialInstance.desired), generation: item.desired.generation };
+    }
     if (body.action === 'delete') {
       item.desired.power = 'deleted';
       item.desired.delete_data = body.delete_data;
@@ -394,10 +585,7 @@ globalThis.fetch = async (input, init) => {
       item.desired.spec.interfaces = item.desired.spec.interfaces.filter(nic => nic.id !== body.interface_id);
     return Response.json(item, { status: 202 });
   }
-  if (url.pathname === '/cvm/quota') {
-    mutations.push(JSON.parse(String(init?.body)));
-    return Response.json({ ok: true });
-  }
+
   const response = await fallback(input, init);
   if (url.pathname === '/bootstrap') {
     const value = await response.json();
@@ -409,10 +597,11 @@ globalThis.fetch = async (input, init) => {
   return response;
 };
 location.hash =
-  scene === 'new' || scene === 'experimental'
+  scene === 'new' || scene === 'new-copy' || scene === 'experimental'
     ? '#/cvm/new'
     : [
           'detail',
+          'staged-entry',
           'chain-detail',
           'artifacts',
           'artifacts-mismatch',

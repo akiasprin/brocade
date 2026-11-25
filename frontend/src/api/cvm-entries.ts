@@ -1,20 +1,49 @@
-// 容器访问入口：任意机器的地址按 L3（整 IP）或 L4（协议 + 端口）投递到容器主网卡，不占网卡槽位。
+// 容器访问入口：机器的 IPv4 地址按所选协议与端口投递到容器主网卡，不占网卡槽位。
 // 入口属于容器：删除容器即释放；同一用户的容器之间可以改派，地址与端口不变。
 import { api } from './client';
 import type { CvmTransportOffer } from './cvm-nics';
 
 export type CvmEntryProtocol = 'tcp' | 'udp' | 'tcp_udp';
+export interface CvmEntryPortRange {
+  start: number;
+  end: number;
+}
+export interface CvmEntryReservedPorts {
+  tcp: CvmEntryPortRange[];
+  udp: CvmEntryPortRange[];
+}
+export type CvmEntryPortSet = { kind: 'all' } | { kind: 'ranges'; ranges: CvmEntryPortRange[] };
+export type CvmEntryTransportSelection =
+  | { kind: 'disabled' }
+  | { kind: 'forward'; ports: CvmEntryPortSet; mappings: { listen: CvmEntryPortRange; target: CvmEntryPortRange }[] };
+export interface CvmEntryTraffic {
+  tcp: CvmEntryTransportSelection;
+  udp: CvmEntryTransportSelection;
+  icmp: boolean;
+  other_ip: boolean;
+}
+
 export type CvmEntryMode =
-  { kind: 'l3' } | { kind: 'l4'; protocol: CvmEntryProtocol; listen_port: number; target_port: number };
-export type CvmEntryAddressOffer =
+  | ({ kind: 'protocols' } & CvmEntryTraffic)
+  | { kind: 'l3' }
+  | {
+      kind: 'l4_range';
+      protocol: CvmEntryProtocol;
+      listen_start: number;
+      listen_end: number;
+      target_start: number;
+      target_end: number;
+    };
+export type CvmEntryAddressOffer = { reserved_ports?: CvmEntryReservedPorts } & (
   | { address: string; public_address?: string | null; kind: 'shared'; port_start: number; port_end: number }
-  | { address: string; public_address?: string | null; kind: 'dedicated' };
+  | { address: string; public_address?: string | null; kind: 'dedicated' }
+);
 export interface CvmEntryPublicationSpec {
   name: string;
   provider_node: string;
   addresses: CvmEntryAddressOffer[];
   transports: CvmTransportOffer[];
-  wireguard_transport?: 'udp' | 'phantun';
+  wireguard_transport: 'udp' | 'phantun';
   grants: { tenant_id: string; user_id: string }[];
   max_entries: number;
 }
@@ -55,6 +84,7 @@ export interface CvmEntry {
   /** 访问者使用的地址（云厂商一对一 NAT 时与 address 不同）。 */
   visible_address: string;
   mode: CvmEntryMode;
+  reserved_ports?: CvmEntryReservedPorts;
   remote: boolean;
   state: CvmEntryState;
   error: string | null;

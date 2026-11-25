@@ -18,9 +18,9 @@ export function artifactHistory(): CvmArtifactHistory {
       },
     },
     'guest/init.json': {
-      contract: 'brocade-guest-init-v1',
+      contract: 'brocade-guest-init-v2',
       user: 'cube',
-      ssh_public_key: 'ssh-ed25519 SYNTHETIC_PUBLIC_KEY',
+      credential_revision: 1,
       regenerate_host_keys_once: true,
     },
   };
@@ -45,10 +45,10 @@ export function artifactReceipt(instance: CvmInstance, mismatch = false) {
   const data = artifactHistory().current!;
   instance.report!.generation = instance.desired.generation;
   instance.report!.operation_id = instance.desired.operation_id;
+  instance.report!.status = mismatch ? 'failed' : 'applied';
   instance.report!.artifacts = {
     compiler: data.compiler,
     input_sha256: data.input_sha256,
-    mode: 'shadow',
     mismatches: mismatch ? ['cube/attachments.json'] : [],
     files: data.files.map(f => ({ kind: f.kind, compiled_sha256: f.sha256, effective_sha256: null, bindings: {} })),
   };

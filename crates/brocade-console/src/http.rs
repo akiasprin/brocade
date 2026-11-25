@@ -407,6 +407,11 @@ pub struct ConsoleServices {
 }
 
 impl ConsoleServices {
+    #[cfg(feature = "cvm")]
+    pub fn and_terminal_stun_servers(self, servers: Vec<String>) -> Result<Self, &'static str> {
+        self.terminals.configure_stun(servers)?;
+        Ok(self)
+    }
     pub fn new(
         quota_wake: Arc<Notify>,
         grants_wake: Arc<Notify>,
@@ -1083,7 +1088,9 @@ fn is_user_cvm_path(method: &axum::http::Method, path: &str) -> bool {
         ["cvm", id, "artifacts", "preview"] if brocade_deployment::cvm::valid_id(id) => {
             *method == Method::POST
         }
-        ["cvm", id, "artifacts"] if brocade_deployment::cvm::valid_id(id) => *method == Method::GET,
+        ["cvm", id, "artifacts" | "credential"] if brocade_deployment::cvm::valid_id(id) => {
+            *method == Method::GET
+        }
         ["cvm"] | ["cvm", "entries"] => *method == Method::POST,
         ["cvm", "entries", id] if brocade_deployment::cvm::valid_id(id) => {
             *method == Method::DELETE
@@ -1340,20 +1347,18 @@ fn cvm_admin_routes() -> Router<AppState> {
     Router::new()
         .route("/cvm", get(cvm::workspace).post(cvm::create))
         .route("/cvm/adopt", post(cvm::adopt))
-        .route("/cvm/quota", put(cvm::quota))
-        .route(
-            "/cvm/quota/network/preview",
-            post(cvm::network_quota_preview),
-        )
         .route("/cvm/readings", get(cvm::readings))
         .route("/cvm/chain-egress", get(cvm::chain_catalog))
         .route("/cvm/{id}", get(cvm::instance))
+        .route("/cvm/{id}/pending", get(cvm::pending_review))
+        .route("/cvm/{id}/credential", get(cvm::login_credential))
         .route("/cvm/{id}/artifacts", get(cvm::artifacts))
         .route("/cvm/{id}/artifacts/preview", post(cvm::compile_preview))
         .route("/cvm/{id}/monitoring", get(cvm::monitoring))
         .route("/cvm/{id}/terminal", post(cvm::terminal::create))
         .route("/cvm/hosts/{node}/terminal", put(cvm::terminal::policy))
         .route("/cvm/hosts/{node}", put(cvm::host_policy))
+        .route("/cvm/host-install-command", get(cvm::host_install_command))
         .route(
             "/cvm/networks",
             get(cvm::nics::catalog).post(cvm::nics::create_publication),
@@ -1363,6 +1368,10 @@ fn cvm_admin_routes() -> Router<AppState> {
             put(cvm::nics::update_publication).delete(cvm::nics::delete_publication),
         )
         .route("/cvm/networks/{id}/admission", put(cvm::nics::admission))
+        .route(
+            "/cvm/{id}/routes/match",
+            post(cvm::nics::route_match).layer(DefaultBodyLimit::max(128 * 1024)),
+        )
         .route("/cvm/{id}/network", get(cvm::nics::instance_network))
         .route(
             "/cvm/entries",
@@ -1386,6 +1395,7 @@ fn cvm_admin_routes() -> Router<AppState> {
         )
         .route("/cvm/{id}/interfaces", post(cvm::nics::mount))
         .route("/cvm/{id}/routes", put(cvm::nics::routes))
+        .route("/cvm/{id}/network-edit", put(cvm::nics::network_edit))
         .route("/cvm/{id}/interface-versions", put(cvm::nics::versions))
         .route(
             "/cvm/{id}/interfaces/{nic}/transport",
@@ -1432,6 +1442,7 @@ fn cvm_agent_routes() -> Router<AppState> {
         .route("/agent/v1/cvm/entries/desired", get(cvm::entries::desired))
         .route("/agent/v1/cvm/entries/report", post(cvm::entries::report))
         .route("/agent/v1/cvm/desired", get(cvm::desired))
+        .route("/agent/v1/cvm/{id}/credential", get(cvm::node_credential))
         .route(
             "/agent/v1/cvm/network-quotas/desired",
             get(cvm::network_quota_desired),
@@ -11484,6 +11495,7 @@ mod tests {
             "/cvm/quota/monitoring",
             "/cvm/",
             "/cvm//monitoring",
+            "/cvm/cvm-owned/credential",
             "/cvm/cvm-owned/operations",
             "/cvm/cvm-owned/monitoring/extra",
             "/cvm/cvm-owned/network/extra",
@@ -11494,6 +11506,18 @@ mod tests {
             for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
                 assert!(!public_may(&method, path), "should refuse {method} {path}");
             }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cvm")]
+    fn cvm_guest_password_requires_authenticated_private_read() {
+        use axum::http::Method;
+        let path = "/cvm/cvm-owned/credential";
+        assert!(user_may(&Method::GET, path));
+        assert!(!public_may(&Method::GET, path));
+        for method in [Method::POST, Method::PUT, Method::DELETE] {
+            assert!(!user_may(&method, path));
         }
     }
 
@@ -11766,6 +11790,38 @@ mod tests {
             output.status.success(),
             "install.sh 语法错误：{}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn install_script_reuses_credentials_only_for_the_existing_console() {
+        let fixture = tempfile::tempdir().unwrap();
+        let token = fixture.path().join("token");
+        let script = fixture.path().join("install.sh");
+        std::fs::write(&token, "fixture-not-a-credential\n").unwrap();
+        std::fs::write(
+            fixture.path().join("env"),
+            "BROCADE_AGENT_SERVER=https://original.invalid\n",
+        )
+        .unwrap();
+        std::fs::write(&script, INSTALL_SCRIPT).unwrap();
+
+        let output = std::process::Command::new("sh")
+            .arg(script)
+            .args([
+                "--server",
+                "https://different.invalid",
+                "--reuse-node-token",
+            ])
+            .env("BROCADE_AGENT_CONFIG_DIR", fixture.path())
+            .env("BROCADE_AGENT_INSTALL_DIR", fixture.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("拒绝转移凭据"));
+        assert_eq!(
+            std::fs::read_to_string(token).unwrap(),
+            "fixture-not-a-credential\n"
         );
     }
 

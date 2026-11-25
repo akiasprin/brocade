@@ -23,6 +23,8 @@ import { Icon, PanelTitle } from './ui/icons';
 import { SiteIcon } from './ui/site-icon';
 import { GeneratedUserAvatar } from './ui/user-avatar';
 import { prefersReducedMotion } from './ui/motion';
+import { observeDurationText } from './ui/observe-range';
+import { trafficRangeText } from './node-traffic-range';
 
 /* 用户详情「站点流量」：固定站点分类、其他站点的域名明细、嗅探失败的目标明细合在一张卡里。
    上半部左侧是按小时（当天、当周）或按天（当月）的堆叠柱，右侧是排行；下半部是两类明细。
@@ -489,6 +491,30 @@ function unsupportedText(data: UserSiteUsage, machine: boolean): string {
   return '尚无站点观测数据。需入口机器的 Agent 与 Xray 都支持站点统计并完成上报。';
 }
 
+/** 自选区间：站点只有小时桶，按触及的整点汇总，写明实际覆盖与多出的时长；端口转发有 30 秒窗口明细，
+    按所选时段计入，与流入统计同一口径。多出不足半分钟（当前小时读到最新上报）时不写时长。 */
+function RangeCoverage({
+  data,
+  range,
+  forwarding,
+}: {
+  data: UserSiteUsage;
+  range: TrafficTimeRange;
+  forwarding: boolean;
+}) {
+  const extra =
+    Math.max(0, range.start_unix_secs - data.range_start_unix_secs) +
+    Math.max(0, data.range_end_unix_secs - range.end_unix_secs);
+  const minutes = Math.round(extra / 60);
+  return (
+    <p className="site-usage-note">
+      站点按整点汇总，实际覆盖 {trafficRangeText(data.range_start_unix_secs, data.range_end_unix_secs)}（UTC+8）
+      {minutes > 0 ? `，比所选时段多 ${observeDurationText(minutes * 60)}` : ''}。
+      {forwarding && '端口转发按所选时段计入，与流入统计一致。'}
+    </p>
+  );
+}
+
 export function UserSiteUsageCard({ tenantId, userId }: { tenantId: string; userId: string }) {
   return <SiteUsageCard scope={{ tenantId, userId }} />;
 }
@@ -771,6 +797,7 @@ function SiteUsageCard({
             <div className="site-usage-main">
               <section className="site-usage-plot" aria-label="流量随时间分布">
                 {head}
+                {range && <RangeCoverage data={data} range={range} forwarding={categories.forwarding !== undefined} />}
                 {categories.total > 0 && (
                   <>
                     <Suspense fallback={<div className="site-usage-chart" />}>
@@ -881,13 +908,6 @@ function SiteUsageCard({
               onToggle={() => setOpen(current => ({ ...current, [kind]: !current[kind] }))}
             />
           ))}
-        {range && data && (
-          <p className="site-usage-note">
-            目标按小时汇总，实际覆盖 {moment(data.range_start_unix_secs, data.range_end_unix_secs)} —{' '}
-            {moment(data.range_end_unix_secs, data.range_end_unix_secs)}
-            （UTC+8）；不按分钟均摊站点流量，转发仅含尚存的窗口明细。
-          </p>
-        )}
       </div>
     </section>
   );

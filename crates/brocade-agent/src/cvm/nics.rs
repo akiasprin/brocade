@@ -26,6 +26,7 @@ pub(super) mod xray;
 pub(crate) use host::enable_forwarding;
 pub(crate) use probe::service as probe_service;
 mod public_addresses;
+pub(super) mod readiness;
 #[cfg(test)]
 mod tests;
 type Result<T> = std::result::Result<T, String>;
@@ -237,7 +238,9 @@ fn local_management_networks(desired: &mut NicDesired) -> Result<()> {
 }
 fn inventory(options: &Options) -> NicNodeCapabilities {
     let mut caps = NicNodeCapabilities {
-        contract: NIC_PROTOCOL_VERSION,
+        entry_protocol_rules: true,
+        ssh_ports: Vec::new(),
+        contract: NIC_CONTRACT_VERSION,
         max_bindings: NODE_BINDINGS as u16,
         ..Default::default()
     };
@@ -356,12 +359,29 @@ fn inventory(options: &Options) -> NicNodeCapabilities {
         caps.host_ports
             .extend(listening_ports(&raw, L4Protocol::Udp));
     }
+    if let Ok(raw) = run_command("ss", &["-H", "-lntp"]) {
+        caps.ssh_ports = ssh_listener_ports(&raw);
+    }
     if caps.transports.is_empty() {
         caps.provide = false;
         caps.consume = false;
         caps.error = Some("机器尚无可用的 Xray／WireGuard IP 承载".into());
     }
     caps
+}
+fn ssh_listener_ports(raw: &str) -> Vec<u16> {
+    let ssh = raw
+        .lines()
+        .filter(|line| line.contains("\"sshd\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut ports: Vec<_> = listening_ports(&ssh, L4Protocol::Tcp)
+        .into_iter()
+        .map(|p| p.port)
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 fn listening_ports(raw: &str, protocol: L4Protocol) -> Vec<NicHostPort> {
     raw.lines()
@@ -472,7 +492,7 @@ fn round(options: &Options) -> Result<()> {
     let inventory_result = upload(&client, options, "/agent/v1/cvm/nics/inventory", &caps);
     // A failed inventory upload must not prevent reading revocation or restoring data.
 
-    if super::maintenance()? {
+    if options.apply_mode == ApplyMode::Linux && super::maintenance()? {
         return Ok(());
     }
     let response = client.request("GET", "/agent/v1/cvm/nics/desired", &options.token, None)?;
@@ -551,6 +571,7 @@ fn round(options: &Options) -> Result<()> {
             .iter()
             .any(|current| current.id == old.id && current.side == old.side)
         {
+            readiness::forget(old)?;
             xray::stop(old)?;
             wireguard::remove(old)?;
             let retained = desired.bindings.iter().any(|current| {
@@ -711,13 +732,20 @@ fn upload(
     Ok(())
 }
 #[derive(Default)]
-struct LinkObservation {
-    configured: bool,
-    reachable: Option<bool>,
-    rx: u64,
-    tx: u64,
+pub(super) struct LinkObservation {
+    pub(super) configured: bool,
+    pub(super) reachable: Option<bool>,
+    pub(super) rx: u64,
+    pub(super) tx: u64,
 }
 fn apply(root: &Path, binding: &NicBinding, desired: &NicDesired) -> Result<LinkObservation> {
+    readiness::apply(binding, desired, || apply_binding(root, binding, desired))
+}
+fn apply_binding(
+    root: &Path,
+    binding: &NicBinding,
+    desired: &NicDesired,
+) -> Result<LinkObservation> {
     if binding.phase == BindingPhase::Withdrawing {
         xray::stop(binding)?;
         wireguard::remove(binding)?;

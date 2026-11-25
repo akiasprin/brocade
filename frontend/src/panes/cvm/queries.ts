@@ -1,16 +1,43 @@
+import type { QueryClient } from '@tanstack/react-query';
 import { randomKey } from '../../ui/platform';
 import { type CvmCapabilities, type CvmHost, type CvmInstance, type CvmStatus, type CvmWorkspace } from '../../api';
 
 export const QUERY = ['cvm'] as const;
+export const ENTRY_BOARD = ['cvm-entries'] as const;
 export const MIB = 1024 ** 2;
 export const GIB = 1024 ** 3;
 export const requestId = randomKey;
+export const hasPendingCvmChange = (instance: CvmInstance) =>
+  instance.reserved && instance.revision_id != null && instance.revision_id > (instance.published_revision_id ?? 0);
+export const operationText: Record<string, string> = {
+  entries: '修改访问入口',
+  create: '创建容器',
+  adopt: '纳管裸机',
+  start: '开机',
+  stop: '关机',
+  restart: '重启',
+  reinstall: '重装系统',
+  configure: '修改配置',
+  assign: '使用授权',
+  delete: '删除容器',
+  release_host: '解除纳管',
+  force_node_retirement: '随机器强制退役',
+  detach: '卸载网卡',
+  routes: '修改路由',
+  mount: '挂载网卡',
+  network_edit: '修改入口、网卡与路由',
+  reset_password: '重置登录密码',
+  nic_version: '更新网卡规格',
+  nic_transport: '更换网卡连接方式',
+  undo_pending: '撤回变更',
+};
 export const supportsGuestTerminal = (caps: CvmCapabilities | undefined) =>
   caps?.guest_terminal === true && caps.guest_terminal_persistent === true;
 
 /** Detail header and board inspector expose the same terminal availability. */
 export function guestTerminalAccess(instance: CvmInstance, host: CvmHost | undefined, canWrite: boolean) {
-  const running = instance.report?.power === 'running' && instance.desired.power === 'running';
+  const running =
+    instance.report?.power === 'running' && (instance.desired.power === 'running' || hasPendingCvmChange(instance));
   const supported = supportsGuestTerminal(host?.capabilities);
   return {
     enabled: canWrite && running && supported && !!host?.terminal_enabled,
@@ -48,6 +75,22 @@ export const statusText: Record<CvmStatus, string> = {
   applied: '已应用',
   failed: '执行失败',
   unknown: '待核查',
-  restart_required: '需停机应用',
 };
 export const powerText = { running: '运行', stopped: '停止', deleted: '删除' };
+
+// Mutations can change both the resource ledger and the global release revision.
+export function invalidateCvmChanges(client: QueryClient) {
+  for (const key of [
+    ['cvm'],
+    ['cvm-nic-state'],
+    ['cvm-nic-catalog'],
+    ['cvm-entries'],
+    ['cvm-instance-entries'],
+    ['cvm-chain-egress'],
+    ['revisions'],
+    ['plan'],
+    ['plan-artifacts'],
+    ['deployment-verify'],
+  ])
+    void client.invalidateQueries({ queryKey: key });
+}

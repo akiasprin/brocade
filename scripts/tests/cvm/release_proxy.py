@@ -51,6 +51,22 @@ def main():
 
         def handle_request(self):
             if self.headers.get('Upgrade', '').lower() == 'websocket':
+                with lock:
+                    control = json.loads((root / 'control.json').read_text())
+                if any(
+                    control.get(option)
+                    for option in (
+                        'hold_desired',
+                        'hold_cvm_desired',
+                        'hold_machine',
+                        'hold_nics',
+                        'hold_entries',
+                        'corrupt_artifact',
+                    )
+                ):
+                    # Fault phases explicitly exercise the production HTTP fallback.
+                    # Channel RPCs would otherwise bypass the HTTP receipt gate.
+                    return self.respond(503, b'owned lab HTTP fault-injection phase')
                 # Pass the real authenticated Agent channel byte-for-byte, including its
                 # handshake. Delays apply only to HTTP claims/receipts, never fake wake data.
                 upstream = socket.create_connection(('127.0.0.1', 8080), timeout=5)

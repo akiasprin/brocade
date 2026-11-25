@@ -1,22 +1,14 @@
 use crate::{files, rpc, Result};
 use brocade_core::hash::sha256_hex;
 use brocade_deployment::cvm::{
-    Capabilities, ContainerRoutes, Image, InstanceDesired, NetworkKind, NetworkSource,
-    ResourceLimits,
+    Capabilities, Image, InstanceDesired, NetworkSource, ResourceLimits,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
-
-/// The primary IPv4 NIC supplies host NAT only outside explicit business routes.
-/// Enforcing their prefixes in CubeVS also prevents binding the primary source
-/// address from bypassing a selected business NIC or its failure policy.
-pub(crate) fn primary_network_policy(routing: &ContainerRoutes) -> Value {
-    brocade_cvm_compile::primary_network_policy(routing)
-}
 
 #[derive(Clone, Deserialize)]
 pub(crate) struct Config {
@@ -63,7 +55,7 @@ enum VirtualizationMode {
 }
 
 impl Config {
-    pub(crate) fn load(path: &Path) -> Result<(Self, BTreeMap<String, Value>)> {
+    pub(crate) fn load(path: &Path) -> Result<Self> {
         if !files::clean_absolute(path) {
             return Err("Cube configuration path must be absolute and clean".into());
         }
@@ -97,19 +89,16 @@ impl Config {
         {
             return Err("invalid Cube interface capacity or protected storage backend".into());
         }
-        let mut public = 0;
-        for source in &mut cfg.capabilities.network_sources {
-            source.max_attachments = Some(1);
-            if source.kind == NetworkKind::Public {
-                source.supports_ipv6 = Some(false);
-                public += 1;
-            }
+        if cfg.capabilities.network_sources.len() != 1 {
+            return Err(
+                "Cube requires its single contact source; business NICs require Store allocations"
+                    .into(),
+            );
         }
-        if public != 1 {
-            return Err("Cube requires exactly one primary network source".into());
-        }
+        let source = &mut cfg.capabilities.network_sources[0];
+        source.max_attachments = Some(1);
+        source.supports_ipv6 = Some(false);
         cfg.configured_capabilities().validate()?;
-        let mut images = BTreeMap::new();
         for image in &cfg.capabilities.images {
             if image.architecture != std::env::consts::ARCH || image.boot_mode != "cube-oci" {
                 return Err(
@@ -142,9 +131,8 @@ impl Config {
             let normalized =
                 rpc::encode("cubelet.services.cubebox.v1.RunCubeSandboxRequest", message)?;
             validate_image(&normalized)?;
-            images.insert(image.id.clone(), normalized);
         }
-        Ok((cfg, images))
+        Ok(cfg)
     }
 
     pub(crate) fn configured_capabilities(&self) -> Capabilities {
@@ -153,6 +141,8 @@ impl Config {
             artifact_compiler: Some(brocade_deployment::cvm::CVM_ARTIFACT_COMPILER.into()),
             cube_storage_backend: Some(self.storage_backend.clone()),
             baremetal: None,
+            host_system: None,
+            host_system_error: None,
             network_quota: None,
             managed_networks: false,
             backend: match self.virtualization_mode {
@@ -187,67 +177,28 @@ impl Config {
         }
     }
 
-    pub(crate) fn create_request(
-        &self,
-        images: &BTreeMap<String, Value>,
-        desired: &InstanceDesired,
-    ) -> Result<Value> {
+    pub(crate) fn create_request(&self, desired: &InstanceDesired) -> Result<Value> {
         let spec = &desired.spec;
-        if desired.artifact_mode == brocade_deployment::cvm::CvmArtifactMode::Enforce {
-            let bundle = desired
-                .artifacts
-                .as_ref()
-                .ok_or("enforced Cube artifacts missing")?;
-            brocade_cvm_compile::verify(bundle, desired)?;
-            if spec
-                .image
-                .as_ref()
-                .is_none_or(|image| image.architecture != std::env::consts::ARCH)
-            {
-                return Err("frozen Cube image architecture does not match this host".into());
-            }
-            self.capabilities
-                .resource_limits
-                .as_ref()
-                .ok_or("independent Cube resources unavailable")?
-                .validate_resources(&spec.resources)?;
-            return brocade_cvm_compile::bind(
-                desired
-                    .artifacts
-                    .as_ref()
-                    .ok_or("enforced Cube artifacts missing")?,
-                brocade_deployment::cvm::CvmArtifactKind::Sandbox,
-                desired,
-                &Default::default(),
-            );
-        }
-
-        let image = serde_json::to_value(&spec.image).map_err(|_| "invalid frozen system image")?;
-        if !self
-            .capabilities
-            .images
-            .iter()
-            .any(|i| serde_json::to_value(i).ok().as_ref() == Some(&image))
+        let bundle = desired.artifacts.as_ref().ok_or("Cube artifacts missing")?;
+        brocade_cvm_compile::verify(bundle, desired)?;
+        if spec
+            .image
+            .as_ref()
+            .is_none_or(|image| image.architecture != std::env::consts::ARCH)
         {
-            return Err("frozen system image is no longer in the verified catalogue".into());
+            return Err("frozen Cube image architecture does not match this host".into());
         }
-        let resources = &spec.resources;
         self.capabilities
             .resource_limits
             .as_ref()
             .ok_or("independent Cube resources unavailable")?
-            .validate_resources(resources)?;
-        let normalized = images
-            .get(&spec.image.as_ref().ok_or("Cube image is missing")?.id)
-            .ok_or("Cube system image unavailable")?;
-        let mut request = brocade_cvm_compile::sandbox_request(
-            &desired.id,
-            spec,
-            normalized,
-            &self.storage_backend,
-        )?;
-        request["labels"]["brocade.cvm.spec_sha256"] = json!(desired.spec_sha256);
-        Ok(request)
+            .validate_resources(&spec.resources)?;
+        brocade_cvm_compile::bind(
+            bundle,
+            brocade_deployment::cvm::CvmArtifactKind::Sandbox,
+            desired,
+            &Default::default(),
+        )
     }
 }
 
@@ -299,7 +250,9 @@ fn validate_image(value: &Value) -> Result<()> {
 
 #[cfg(test)]
 mod primary_policy_tests {
-    use super::*;
+    use brocade_cvm_compile::primary_network_policy;
+    use brocade_deployment::cvm::ContainerRoutes;
+    use serde_json::json;
 
     #[test]
     fn primary_nat_is_available_without_business_routes() {

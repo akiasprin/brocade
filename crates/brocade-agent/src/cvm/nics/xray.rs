@@ -229,6 +229,20 @@ fn worker_id(b: &Channel) -> String {
     )
 }
 fn fingerprint(b: &Channel) -> Result<String> {
+    // Publication generations and Preparing -> Active change the host rules,
+    // not the packet engine. Restarting here destroys the TUN during activation.
+    let scope = match &b.scope {
+        Scope::Nic(binding) => serde_json::json!({
+            "namespace": host::namespace(binding),
+            "device": host::tunnel(binding),
+            "ipv4": binding.nic.ipv4,
+            "ipv6": binding.nic.ipv6,
+            "mtu": binding.nic.mtu,
+        }),
+        Scope::Entry { .. } => {
+            serde_json::to_value(&b.scope).map_err(|_| "invalid entry Xray packet scope")?
+        }
+    };
     Ok(brocade_core::hash::sha256_hex(
         &serde_json::to_vec(&(
             &b.id,
@@ -237,10 +251,32 @@ fn fingerprint(b: &Channel) -> Result<String> {
             &b.peer_credential,
             &b.offer,
             b.port,
-            &b.scope,
+            scope,
         ))
         .map_err(|_| "invalid NIC Xray configuration")?,
     ))
+}
+pub(super) fn is_prepared(binding: &NicBinding) -> Result<bool> {
+    let Some(workers) = WORKERS.get() else {
+        return Ok(false);
+    };
+    let channel = Channel::nic(binding);
+    let workers = workers
+        .lock()
+        .map_err(|_| "NIC Xray worker registry unavailable")?;
+    let Some(worker) = workers.get(&worker_id(&channel)) else {
+        return Ok(false);
+    };
+    if worker.fingerprint != fingerprint(&channel)?
+        || worker.join.as_ref().is_some_and(|join| join.is_finished())
+    {
+        return Ok(false);
+    }
+    let state = worker
+        .status
+        .lock()
+        .map_err(|_| "NIC Xray packet state unavailable")?;
+    Ok(state.prepared && state.error.is_none())
 }
 fn apply_channel(root: &Path, b: &Channel) -> Result<LinkObservation> {
     let key = worker_id(b);
@@ -337,7 +373,10 @@ fn apply_channel(root: &Path, b: &Channel) -> Result<LinkObservation> {
         .into());
     }
     let (rx, tx) = match &b.scope {
-        Scope::Nic(binding) => host::counters(&host::namespace(binding), &host::tunnel(binding))?,
+        Scope::Nic(binding) => {
+            host::limits(binding)?;
+            host::counters(&host::namespace(binding), &host::tunnel(binding))?
+        }
         Scope::Entry { .. } => (0, 0),
     };
     Ok(LinkObservation {
@@ -582,9 +621,6 @@ async fn worker(root: &Path, b: &Channel, stop: &AtomicBool, status: &Mutex<Stat
         ));
     }
     let tun = open_tun(b)?;
-    if let Scope::Nic(binding) = &b.scope {
-        host::limits(binding)?;
-    }
     let listener = if b.side != b.offer.listen_side.resolved()? {
         Some(
             TcpListener::bind((adapter(b), DATA_PORT))
@@ -806,8 +842,40 @@ async fn pump(tun: &AsyncFd<File>, stream: TcpStream, b: &Channel) -> Result<()>
 mod tests {
     use super::*;
     #[test]
+    fn nic_activation_and_host_policy_updates_preserve_packet_engine_identity() {
+        let mut binding = super::super::tests::scheduling_bindings(1).remove(0);
+        binding.nic.transport = TransportKind::Xray;
+        binding.offer.kind = TransportKind::Xray;
+        binding.phase = BindingPhase::Preparing;
+        let original = fingerprint(&Channel::nic(&binding)).unwrap();
+        binding.generation += 1;
+        binding.phase = BindingPhase::Active;
+        binding.routing.revision += 1;
+        binding.routing.dns = vec!["9.9.9.9".parse().unwrap()];
+        binding.nic.limits.upload_bps = Some(128_000);
+        binding.nic.quota_exceeded = true;
+        binding.entry_source_ipv4 = Some("198.51.100.211".parse().unwrap());
+        assert_eq!(original, fingerprint(&Channel::nic(&binding)).unwrap());
+
+        for change in ["credential", "address", "mtu", "namespace"] {
+            let mut changed = binding.clone();
+            match change {
+                "credential" => changed.credential = "rotated-test-credential".into(),
+                "address" => changed.nic.ipv4 = Some("10.240.0.99".parse().unwrap()),
+                "mtu" => changed.nic.mtu = 1360,
+                "namespace" => changed.interface_id = "nic-new-namespace".into(),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                original,
+                fingerprint(&Channel::nic(&changed)).unwrap(),
+                "{change}"
+            );
+        }
+    }
+    #[test]
     fn entry_framing_binds_both_directions_to_the_pair_and_delivery() {
-        let desired:EntryDesired=serde_json::from_value(serde_json::json!({"node_id":"edge","generation":1,"rules":[],"deliveries":[],"tunnels":[{"id":"entry-test","side":"entry","entry_node":"edge","target_node":"host","offer":{"kind":"xray","listen_side":"provider","endpoint":"203.0.113.2","port_start":40000,"port_end":40000,"mtu":1420},"port":40000,"slot":0,"credential":"test-identity","peer_credential":"private"}]})).unwrap();
+        let desired:EntryDesired=serde_json::from_value(serde_json::json!({"node_id":"edge","generation":1,"rules":[],"deliveries":[],"tunnels":[{"id":"entry-test","side":"entry","entry_node":"edge","target_node":"host","wireguard_transport":"udp","offer":{"kind":"xray","listen_side":"provider","endpoint":"203.0.113.2","port_start":40000,"port_end":40000,"mtu":1420},"port":40000,"slot":0,"credential":"test-identity","peer_credential":"private"}]})).unwrap();
         let mut tunnel = desired.tunnels[0].clone();
         let targets = BTreeSet::from(["192.0.2.10".parse().unwrap()]);
         let mut packet = vec![0; 20];

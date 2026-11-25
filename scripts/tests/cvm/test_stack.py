@@ -8,7 +8,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SCRIPTS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SCRIPTS))
@@ -291,6 +291,35 @@ class StackTests(unittest.TestCase):
         self.assertEqual(install.state()['current'], identity)
         self.assertNotIn('pending', install.state())
 
+    def test_rollback_replay_keeps_its_target_and_explicit_release_can_change_it(self):
+        install = self.installation()
+        archive, old = self.bundle(self.tree())
+        candidate_archive, candidate = self.bundle(self.tree('candidate', 'two'), 'candidate.tar.gz')
+        self.stage(archive, old, install)
+        self.stage(candidate_archive, candidate, install)
+        stack.atomic_json(install.state_path, {'current': candidate, 'previous': old})
+        stack.point(install.toolbox, install.release(candidate) / 'runtime')
+
+        def activate(identity):
+            stack.point(install.toolbox, install.release(identity) / 'runtime')
+
+        with (
+            patch.object(stack, 'Installation', return_value=install),
+            patch.object(stack, 'preflight'),
+            patch.object(stack, 'host_manager', return_value=Mock()),
+            patch.object(stack, 'ProgressReporter', return_value=Mock()),
+            patch.object(stack, 'ready'),
+            patch.object(install, 'activate', side_effect=activate) as activated,
+            patch.object(sys, 'argv', ['cvm-stack.py', 'rollback']),
+        ):
+            stack.main()
+            stack.main()
+            self.assertEqual(install.state()['current'], old)
+            activated.assert_called_once_with(old)
+            with patch.object(sys, 'argv', ['cvm-stack.py', 'rollback', '--release', candidate]):
+                stack.main()
+            self.assertEqual(install.state()['current'], candidate)
+
     def test_corrupt_retained_binary_cannot_be_reactivated(self):
         archive, identity = self.bundle(self.tree())
         install = self.installation()
@@ -337,8 +366,9 @@ class StackTests(unittest.TestCase):
                 {
                     'shim_version': versions['cube-shim'],
                     'shim_sha256': stack.digest(tree / 'runtime/cube-shim/bin/containerd-shim-cube-rs'),
-                    'max_interfaces': 1,
-                    'bridge_sources': {},
+                    'max_interfaces': 3,
+                    'state_dir': '/data/cubelet/network-attachments-v2',
+                    'vmm_root': '/run/vc/vm',
                 }
             )
         )
@@ -352,7 +382,35 @@ class StackTests(unittest.TestCase):
         stack.atomic_json(tree / 'manifest.json', {'storage_backends': ['xfs', 'plain']})
         return tree
 
-    def test_console_cohost_migrates_legacy_inspection_listener_and_client_together(self):
+    def test_interrupted_first_render_can_retry_without_adopting_partial_templates(self):
+        (stack.STATE / 'storage').mkdir(parents=True)
+        tree = self.configured_tree('interrupted-render', 'one')
+        with patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'):
+            with patch.object(stack, 'copy_immutable', side_effect=stack.StackError('interrupted')):
+                with self.assertRaisesRegex(stack.StackError, 'interrupted'):
+                    stack.render_configuration(tree)
+            self.assertFalse((tree / 'generated').exists())
+            stack.render_configuration(tree)
+        self.assertEqual(stack.read_json(tree / 'generated/cube.json')['virtualization_mode'], 'kvm')
+
+    def test_same_release_render_keeps_complete_configuration_on_failure(self):
+        (stack.STATE / 'storage').mkdir(parents=True)
+        tree = self.configured_tree('retained-render', 'one')
+        with patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'):
+            stack.render_configuration(tree)
+            configuration = tree / 'generated/cube.json'
+            before = configuration.read_bytes()
+            custom = tree / 'generated/administrator.txt'
+            custom.write_text('retained')
+            with patch.object(stack, 'copy_immutable', side_effect=stack.StackError('interrupted')):
+                with self.assertRaisesRegex(stack.StackError, 'interrupted'):
+                    stack.render_configuration(tree, previous=tree)
+            self.assertEqual(configuration.read_bytes(), before)
+            stack.render_configuration(tree, previous=tree)
+            self.assertEqual(configuration.read_bytes(), before)
+            self.assertEqual(custom.read_text(), 'retained')
+
+    def test_console_cohost_uses_current_inspection_and_rejects_obsolete_configuration(self):
         import tomllib
 
         with patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'):
@@ -363,16 +421,19 @@ class StackTests(unittest.TestCase):
             configuration = tomllib.loads((generated / 'cubelet.toml').read_text())
             self.assertEqual(configuration['http']['address'], stack.INSPECTION_ADDRESS)
             self.assertEqual(stack.read_json(generated / 'cube.json')['network_inspection_url'], stack.INSPECTION_URL)
-            # A retained pre-upgrade configuration must move off Console's port too.
+            # Reject an old managed listener instead of silently converting it.
             text = (generated / 'cubelet.toml').read_text().replace(stack.INSPECTION_ADDRESS, '127.0.0.1:8080')
             (generated / 'cubelet.toml').write_text(text)
             config = stack.read_json(generated / 'cube.json')
             config['network_inspection_url'] = 'http://127.0.0.1:8080/v1/network/taps'
             stack.atomic_json(generated / 'cube.json', config)
-            stack.render_configuration(tree, previous=tree)
+            with self.assertRaisesRegex(stack.StackError, 'obsolete CVM inspection'):
+                stack.render_configuration(tree, previous=tree)
             configuration = tomllib.loads((generated / 'cubelet.toml').read_text())
-            self.assertEqual(configuration['http']['address'], stack.INSPECTION_ADDRESS)
-            self.assertEqual(stack.read_json(generated / 'cube.json')['network_inspection_url'], stack.INSPECTION_URL)
+            self.assertEqual(configuration['http']['address'], '127.0.0.1:8080')
+            self.assertEqual(
+                stack.read_json(generated / 'cube.json')['network_inspection_url'], config['network_inspection_url']
+            )
 
     def test_one_gib_host_reserves_runtime_memory_and_keeps_cpu_capacity(self):
         gib = 1024**3
@@ -431,7 +492,7 @@ class StackTests(unittest.TestCase):
             self.assertEqual(caps['allocatable_memory_bytes'], 640 * 1024**2)
             self.assertEqual(caps['resource_limits']['max_memory_bytes'], gib)
 
-    def test_upgrade_retains_images_and_replaces_the_local_network_catalogue(self):
+    def test_upgrade_retains_images_and_current_network_configuration(self):
         with (
             patch.object(stack, 'STATE', self.root / 'persistent'),
             patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'),
@@ -439,9 +500,6 @@ class StackTests(unittest.TestCase):
             (stack.STATE / 'storage').mkdir(parents=True)
             old, new = self.configured_tree('old', 'old'), self.configured_tree('next', 'new')
             stack.render_configuration(old)
-            configured = stack.read_json(old / 'generated/network.json')
-            configured['bridge_sources'] = {'home': {'bridge': 'br-home'}}
-            stack.atomic_json(old / 'generated/network.json', configured)
             old_config = stack.read_json(old / 'generated/cube.json')
             old_config['capabilities']['unknown_extension'] = True
             stack.atomic_json(old / 'generated/cube.json', old_config)
@@ -458,6 +516,19 @@ class StackTests(unittest.TestCase):
             self.assertEqual(set(stack.read_json(old / 'generated/cube.json')['image_files']), {'old', 'new'})
             # Rendered host paths do not rewrite or invalidate the immutable payload.
             self.assertIn('@CVM_RELEASE@', (old / 'config/cube.json').read_text())
+
+    def test_obsolete_bridge_catalogue_is_rejected_without_conversion(self):
+        with patch.object(stack, 'run', return_value='[{"dev":"eth0"}]'):
+            (stack.STATE / 'storage').mkdir(parents=True)
+            old, new = self.configured_tree('obsolete', 'old'), self.configured_tree('current', 'new')
+            stack.render_configuration(old)
+            configured = stack.read_json(old / 'generated/network.json')
+            configured['bridge_sources'] = {'home': {'bridge': 'br-home'}}
+            stack.atomic_json(old / 'generated/network.json', configured)
+            with self.assertRaisesRegex(stack.StackError, 'obsolete CVM network'):
+                stack.render_configuration(new, old)
+            self.assertIn('bridge_sources', stack.read_json(old / 'generated/network.json'))
+            self.assertFalse((new / 'generated').exists())
 
     def test_plain_selection_capacity_and_upgrade_identity(self):
         self.backend.return_value = 'plain'

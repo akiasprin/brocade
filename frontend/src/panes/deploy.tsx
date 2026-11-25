@@ -470,7 +470,7 @@ function FlowGroup({
 }
 
 /* ══ 发布页：页签 + 驾驶舱 ═════════════════════════════════════════════════════
-   外层照机器详情页：页头是身份（图标板 + 状态灯 + 「发布」+ 线上/当前修订）│ 页签 │ 当前页的主操作。
+   外层照机器详情页：页头是身份（图标板 + 状态灯 + 「发布」）│ 页签 │ 当前页的主操作。
    每个页签照用量页：左侧 300px 读数栏，右侧列表。配置页的列表是发布流水，Agent / Xray 是逐台机器表。
    稿件：mockups/deploy-cockpit.html。 */
 
@@ -662,10 +662,6 @@ function DeployOverview({ go, editable }: { go: (d: Drill) => void; editable: bo
               <div className="nd-ident-row">
                 <h1 className="nd-id nd-name">发布</h1>
               </div>
-              <span className="nd-ident-meta">
-                线上 {publishedBase == null ? '—' : `R${publishedBase}`} · 当前 {current == null ? '—' : `R${current}`}
-                {agent.nodes.data ? ` · ${fleet.length} 台机器` : ''}
-              </span>
             </div>
           </div>
           <div className="nd-tabs" role="tablist" aria-label="发布页签">
@@ -1203,6 +1199,7 @@ function PlanPreview({
     publishedBase != null &&
     publishedBase < target &&
     !blockedByDeployment &&
+    !plan.data?.targets.some(target => target.actions.includes('sync-cvm')) &&
     can(who.role, 'system');
 
   const create = useMutation({
@@ -1414,6 +1411,11 @@ function PlanPreview({
           {stale && (
             <button className="btn" onClick={() => setPicked(revisions.data.current_revision)}>
               重新预览
+            </button>
+          )}
+          {data.targets.some(target => target.actions.includes('sync-cvm')) && (
+            <button className="btn" onClick={() => navigate('cvm', {})}>
+              管理容器待发布变更
             </button>
           )}
           {canAbort && (
@@ -3148,18 +3150,20 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
                         <span>停止本次发布，已完成的机器保持新配置</span>
                       </button>
                     )}
-                    {CANCELABLE.has(d.status) && (
-                      <button type="button" role="menuitem" onClick={() => setAsk({ kind: 'cancelRollback' })}>
-                        <b>取消并回滚</b>
-                        <span>停止本单并强制同步到运行基线</span>
-                      </button>
-                    )}
-                    {d.status === 'succeeded' && (
-                      <button type="button" role="menuitem" onClick={() => setAsk({ kind: 'rollback' })}>
-                        <b>恢复到这次快照</b>
-                        <span>恢复这次发布的模型并创建同步单</span>
-                      </button>
-                    )}
+                    {CANCELABLE.has(d.status) &&
+                      !d.targets.some(target => !!(target.desired_structure as { cvm?: unknown } | null)?.cvm) && (
+                        <button type="button" role="menuitem" onClick={() => setAsk({ kind: 'cancelRollback' })}>
+                          <b>取消并回滚</b>
+                          <span>停止本单并强制同步到运行基线</span>
+                        </button>
+                      )}
+                    {d.status === 'succeeded' &&
+                      !d.targets.some(target => !!(target.desired_structure as { cvm?: unknown } | null)?.cvm) && (
+                        <button type="button" role="menuitem" onClick={() => setAsk({ kind: 'rollback' })}>
+                          <b>恢复到这次快照</b>
+                          <span>恢复这次发布的模型并创建同步单</span>
+                        </button>
+                      )}
                   </div>
                 </details>
               )}
@@ -3325,8 +3329,8 @@ function Detail({ id, go }: { id: number; go: (d: Drill) => void }) {
           title="取消这次发布？"
           body={
             <>
-              只停止这次发布：在途 target 转 canceled。已经 dispatched / converging 但没回报的， 现场会被标成
-              dirty——那台机器现在什么状态没人知道。
+              停止后续机器的发布。已收到配置的机器会继续完成本次操作，实际结果以节点回执为准。
+              容器删除和重装执行清盘后，旧数据无法恢复。
             </>
           }
           confirmLabel="取消发布"

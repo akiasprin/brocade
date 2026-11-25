@@ -74,7 +74,7 @@ type Observation struct {
 	Attached  bool     `json:"attached"`
 }
 type PolicyObservation struct {
-	ChainEgressConfigured   bool    `json:"chain_egress_configured,omitempty"`
+	ChainEgressConfigured   bool    `json:"chain_egress_configured"`
 	RoutingRevision         uint64  `json:"routing_revision"`
 	ContactRoutePreserved   bool    `json:"contact_route_preserved"`
 	BusinessFallbackBlocked bool    `json:"business_fallback_blocked"`
@@ -90,18 +90,16 @@ type Result struct {
 	ActualVCPUs       uint64             `json:"actual_vcpus"`
 	ActualMemoryBytes uint64             `json:"actual_memory_bytes"`
 	ShimVersion       string             `json:"shim_version,omitempty"`
-	RestartRequired   bool               `json:"restart_required,omitempty"`
 }
 type Catalogue struct {
-	ChainEgress       bool              `json:"chain_egress,omitempty"`
-	NetworkQuota      bool              `json:"network_quota"`
-	ManagedNICs       bool              `json:"managed_nics"`
-	PrimaryIPDelivery bool              `json:"primary_ip_delivery,omitempty"`
-	RouteServices     bool              `json:"route_services,omitempty"` // port-selected egress as Guest policy rules
-	Contract          string            `json:"contract"`
-	MaxInterfaces     uint16            `json:"max_interfaces"`
-	Sources           map[string]Source `json:"sources"`
-	ShimVersion       string            `json:"shim_version,omitempty"`
+	ChainEgress       bool   `json:"chain_egress"`
+	NetworkQuota      bool   `json:"network_quota"`
+	ManagedNICs       bool   `json:"managed_nics"`
+	PrimaryIPDelivery bool   `json:"primary_ip_delivery"`
+	RouteServices     bool   `json:"route_services"` // port-selected egress as Guest policy rules
+	Contract          string `json:"contract"`
+	MaxInterfaces     uint16 `json:"max_interfaces"`
+	ShimVersion       string `json:"shim_version,omitempty"`
 }
 
 // AllocatedNIC is a Store assignment, never a request for local address selection.

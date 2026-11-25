@@ -16,7 +16,7 @@ use crate::plan::{
 pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 20;
 
 /// Wire contract spoken by this Agent build.
-pub const AGENT_PROTOCOL_VERSION: u32 = 76;
+pub const AGENT_PROTOCOL_VERSION: u32 = 79;
 
 /// First Agent that can restart when handoff prerequisites are unavailable, and recover
 /// unresponsive generations through a durable checkpoint without waiting for the Console.
@@ -1259,7 +1259,7 @@ mod agent_release_compat_tests {
             serde_json::from_value(serde_json::to_value(&offer).unwrap()).unwrap();
         assert_eq!(decoded, offer);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
-        assert_eq!(AGENT_PROTOCOL_VERSION, 76);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 79);
         assert_eq!(CONFIG_XRAY_UPDATE_POLICY_PROTOCOL_VERSION, 37);
         assert_eq!(CONFIG_XRAY_HANDOFF_ONLY_PROTOCOL_VERSION, 32);
         assert_eq!(CONFIG_XRAY_FORCE_RETIREMENT_PROTOCOL_VERSION, 33);
@@ -4042,7 +4042,7 @@ mod tests {
             error: Option<String>,
         }
 
-        assert_eq!(AGENT_PROTOCOL_VERSION, 76);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 79);
         assert_eq!(MIN_AGENT_PROTOCOL_VERSION, 20);
         let report: XrayReleaseReport = serde_json::from_value(serde_json::json!({
             "release_id": 7,

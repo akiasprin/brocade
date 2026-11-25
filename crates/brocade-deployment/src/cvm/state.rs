@@ -15,15 +15,12 @@ pub enum ApplyStatus {
     Applied,
     Failed,
     Unknown,
-    RestartRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceDesired {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<CvmArtifactBundle>,
-    #[serde(default, skip_serializing_if = "is_shadow")]
-    pub artifact_mode: CvmArtifactMode,
     /// Instance-scoped cleanup assignments; not part of the immutable specification.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detached_interfaces: Vec<String>,
@@ -44,8 +41,7 @@ pub struct InstanceDesired {
 pub struct DesiredState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chain_clients: Vec<ChainClientArtifact>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub page_offset: Option<usize>,
+    pub page_offset: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<usize>,
     pub instances: Vec<InstanceDesired>,
@@ -62,9 +58,7 @@ pub struct InterfaceObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkObservation {
-    #[serde(default)]
     pub chain_egress_configured: bool,
-    #[serde(default)]
     pub routing_revision: u64,
     pub contact_route_preserved: bool,
     pub business_fallback_blocked: bool,
@@ -105,6 +99,8 @@ pub struct InstanceReport {
 pub struct InventoryReport {
     pub capabilities: Capabilities,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_sessions_used: Option<u8>,
 }
 
 impl InstanceReport {
@@ -332,13 +328,30 @@ impl InstanceReport {
     }
 }
 
-fn is_shadow(value: &CvmArtifactMode) -> bool {
-    *value == CvmArtifactMode::Shadow
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_receipts_require_the_current_route_contract() {
+        let current = serde_json::json!({"chain_egress_configured":false,"routing_revision":0,"contact_route_preserved":true,"business_fallback_blocked":true,"default_ipv4_interface":null,"default_ipv6_interface":null});
+        assert!(serde_json::from_value::<NetworkObservation>(current.clone()).is_ok());
+        for field in ["chain_egress_configured", "routing_revision"] {
+            let mut old = current.clone();
+            old.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<NetworkObservation>(old).is_err());
+        }
+    }
+
+    #[test]
+    fn desired_pages_require_an_explicit_cursor() {
+        let page = serde_json::json!({"page_offset":0,"instances":[]});
+        let desired: DesiredState = serde_json::from_value(page).unwrap();
+        assert_eq!(desired.page_offset, 0);
+        assert!(
+            serde_json::from_value::<DesiredState>(serde_json::json!({"instances":[]})).is_err()
+        );
+    }
 
     #[test]
     fn first_release_requires_lifecycle_intent_and_completion_fields() {
@@ -347,7 +360,7 @@ mod tests {
             "spec_sha256":"a".repeat(64), "power":"running", "delete_data":false,
             "restart_epoch":0, "reinstall_epoch":0,
             "spec":{
-                "name":"current", "ssh_public_key":"public-key", "interfaces":[],
+                "name":"current", "login_revision":1,"execution":{"kind":"cube"},"routing":{"revision":0,"routes":[],"priorities":[],"dns":[]},"interfaces":[],
                 "image":{"id":"debian","name":"Debian","version":"13","architecture":"x86_64","sha256":"b".repeat(64),"boot_mode":"cube-oci"},
                 "resources":{"vcpus":1,"memory_bytes":134217728,"root_disk_bytes":3221225472u64}
             }

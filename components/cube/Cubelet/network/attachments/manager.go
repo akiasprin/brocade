@@ -26,8 +26,9 @@ type Config struct {
 	StateDir      string `json:"state_dir"`
 	VMMRoot       string `json:"vmm_root"`
 	MaxInterfaces uint16 `json:"max_interfaces"`
-	ShimVersion   string `json:"shim_version,omitempty"`
-	ShimSHA256    string `json:"shim_sha256,omitempty"`
+	ComponentRoot string `json:"component_root"`
+	ShimVersion   string `json:"shim_version"`
+	ShimSHA256    string `json:"shim_sha256"`
 }
 type config struct {
 	VMMRoot      string
@@ -64,6 +65,7 @@ type Manager struct {
 	maxInterfaces uint16
 	shimVersion   string
 	shimSHA256    string
+	componentRoot string
 }
 
 var nodeManager struct {
@@ -79,20 +81,22 @@ func NodeRuntime(tasks tasks.TasksClient) (*Manager, error) {
 	if nodeManager.manager != nil {
 		return nodeManager.manager, nil
 	}
-	cfg := Config{StateDir: "/data/cubelet/network-attachments-v2", VMMRoot: "/run/vc/vm", MaxInterfaces: 3}
+	cfg := Config{StateDir: "/data/cubelet/network-attachments-v2", VMMRoot: "/run/vc/vm", MaxInterfaces: 3, ComponentRoot: "/data/cubelet/root/component_versions"}
 	path := os.Getenv("CUBE_NETWORK_ATTACHMENTS_CONFIG")
-	if path != "" {
-		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
-			return nil, errors.New("Cube network configuration requires an absolute clean path")
-		}
-		data, err := checkedFile(path, maxMessage, true)
-		if err != nil {
-			return nil, err
-		}
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			return nil, errors.New("invalid Cube network attachment configuration")
-		}
+	if path == "" {
+		return nil, errors.New("Cube network attachment configuration is required")
 	}
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return nil, errors.New("Cube network configuration requires an absolute clean path")
+	}
+	data, err := checkedFile(path, maxMessage, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, errors.New("invalid Cube network attachment configuration")
+	}
+
 	manager, err := New(cfg, tasks)
 	if err != nil {
 		return nil, err
@@ -102,6 +106,9 @@ func NodeRuntime(tasks tasks.TasksClient) (*Manager, error) {
 }
 
 func New(cfg Config, tasks tasks.TasksClient) (*Manager, error) {
+	if !safeID.MatchString(cfg.ShimVersion) || len(cfg.ShimSHA256) != 64 || !filepath.IsAbs(cfg.ComponentRoot) || filepath.Clean(cfg.ComponentRoot) != cfg.ComponentRoot {
+		return nil, errors.New("Cube network requires a pinned shim and absolute component root")
+	}
 	if cfg.MaxInterfaces < 1 || cfg.MaxInterfaces > 3 {
 		return nil, errors.New("unsupported Cube attachment capacity")
 	}
@@ -142,7 +149,7 @@ func New(cfg Config, tasks tasks.TasksClient) (*Manager, error) {
 	if err := validateLeases(s.records); err != nil {
 		return nil, err
 	}
-	m := &Manager{server: s, maxInterfaces: cfg.MaxInterfaces, shimVersion: cfg.ShimVersion, shimSHA256: cfg.ShimSHA256}
+	m := &Manager{server: s, maxInterfaces: cfg.MaxInterfaces, shimVersion: cfg.ShimVersion, shimSHA256: cfg.ShimSHA256, componentRoot: cfg.ComponentRoot}
 	if err := m.restoreQuota(); err != nil {
 		return nil, err
 	}
@@ -150,7 +157,7 @@ func New(cfg Config, tasks tasks.TasksClient) (*Manager, error) {
 }
 
 func (m *Manager) Catalogue(ctx context.Context) (wire.Catalogue, error) {
-	result := wire.Catalogue{Contract: wire.Contract, MaxInterfaces: m.maxInterfaces, Sources: map[string]wire.Source{}, ManagedNICs: true, NetworkQuota: true}
+	result := wire.Catalogue{Contract: wire.Contract, MaxInterfaces: m.maxInterfaces, ManagedNICs: true, NetworkQuota: true}
 	result.ShimVersion = m.shimVersion
 	result.PrimaryIPDelivery = cubevs.PrimaryIPDeliveryReady()
 	result.RouteServices = true
@@ -419,13 +426,13 @@ func (m *Manager) desired(req wire.Request) (object, string, string, error) {
 		return nil, "", "", errors.New("duplicate default attachment")
 	}
 	var routing object
-	if len(req.Routing) > 0 {
-		if err := json.Unmarshal(req.Routing, &routing); err != nil {
-			return nil, "", "", errors.New("invalid container routing configuration")
-		}
+	if json.Unmarshal(req.Routing, &routing) != nil || routing == nil {
+		return nil, "", "", errors.New("container routing configuration is required")
 	}
-	if routing == nil {
-		routing = object{}
+	for _, key := range []string{"revision", "routes", "priorities", "dns"} {
+		if value, present := routing[key]; !present || value == nil {
+			return nil, "", "", errors.New("container routing configuration is incomplete")
+		}
 	}
 	var assigned assignedRouting
 	routingBytes, err := json.Marshal(routing)

@@ -330,6 +330,88 @@ async fn source_traffic_custom_range_uses_retained_windows_and_destinations_use_
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn custom_range_forwarding_matches_inflow_while_sites_cover_whole_hours() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    // A finished hour keeps the destination cover independent of the test clock.
+    let hour = (now / 3600 - 2) * 3600;
+    let range = TrafficTimeRange {
+        start_unix_secs: hour + 600,
+        end_unix_secs: hour + 1500,
+    };
+    let rule:i64=sqlx::query_scalar("INSERT INTO forwarding_rules (tenant_id,user_id,node_id,name,protocol,listen_port,target_host,target_port) VALUES ('platform.acme','alice','n1','Forwarding','tcp',24001,'192.0.2.2',443) RETURNING id").fetch_one(db.pool()).await.unwrap();
+    for (window_start, read_at, down) in [
+        (Some(hour + 300), hour + 330, 1_i64),
+        (Some(hour + 600), hour + 630, 10),
+        // A rule's first reading has no window; the ledger charges it at observation time.
+        (None, hour + 900, 100),
+        (Some(hour + 1470), hour + 1500, 1000),
+        (Some(hour + 1500), hour + 1530, 10_000),
+    ] {
+        sqlx::query("INSERT INTO forwarding_usage_samples (node_id,rule_id,tenant_id,user_id,read_at,window_start,uplink_bytes,downlink_bytes) VALUES ('n1',$1,'platform.acme','alice',to_timestamp($2::bigint),to_timestamp($3::bigint),0,$4)")
+            .bind(rule).bind(read_at).bind(window_start).bind(down).execute(db.pool()).await.unwrap();
+    }
+    sqlx::query("INSERT INTO user_site_usage_hourly (bucket,node_id,tenant_id,user_id,site_id,uplink_bytes,downlink_bytes) VALUES ($1,'n1','platform.acme','alice','youtube',0,5)")
+        .bind(hour).execute(db.pool()).await.unwrap();
+
+    let inflow = db
+        .store
+        .node_inflow_usage_range(&system_admin(), "n1", SiteUsagePeriod::Day, Some(range))
+        .await
+        .unwrap();
+    let inflow_forwarding = inflow
+        .rows
+        .iter()
+        .find(|row| row.source == NodeInflowSource::Forwarding)
+        .unwrap();
+    assert_eq!(inflow_forwarding.downlink_bytes, 1110);
+
+    let sites = db
+        .store
+        .node_site_usage_range(&system_admin(), "n1", SiteUsagePeriod::Day, Some(range))
+        .await
+        .unwrap();
+    let row = |site: &str| {
+        sites
+            .usage
+            .rows
+            .iter()
+            .find(|row| row.site_id == site)
+            .unwrap()
+            .downlink_bytes
+    };
+    assert_eq!(row("forwarding"), inflow_forwarding.downlink_bytes);
+    assert_eq!(
+        sites
+            .usage
+            .series
+            .iter()
+            .find(|series| series.site_id == "forwarding")
+            .unwrap()
+            .points,
+        vec![(hour, 0, 1110)]
+    );
+    let carriers = sites
+        .top_users
+        .iter()
+        .find(|entry| entry.site_id == "forwarding")
+        .unwrap();
+    assert_eq!(carriers.users[0].downlink_bytes, 1110);
+    // Destination categories are stored per hour and report the whole hour they cover.
+    assert_eq!(row("youtube"), 5);
+    assert_eq!(sites.usage.range_start_unix_secs, hour);
+    assert_eq!(sites.usage.range_end_unix_secs, hour + 3600);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn source_traffic_chain_moves_reconcile_across_historical_app_rows_once() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;

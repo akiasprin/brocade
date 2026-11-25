@@ -496,9 +496,6 @@ pub(super) fn instance(root: &Path, desired: &InstanceDesired, report: &Instance
                 ),
             ),
             ApplyStatus::Failed => (NetworkResourcePhase::Failed, "网络配置执行失败".into()),
-            ApplyStatus::RestartRequired => {
-                (NetworkResourcePhase::Waiting, "配置等待重启后应用".into())
-            }
             _ => (
                 NetworkResourcePhase::Preparing,
                 "配置已提交，等待执行器确认".into(),

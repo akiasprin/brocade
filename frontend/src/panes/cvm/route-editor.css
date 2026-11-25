@@ -1,0 +1,362 @@
+/* 路由表：只读行 + 一行新增（就地编辑同一行格式）+ 其余流量；下方依次是出口优先级、
+   提示、容器 DNS 与命中测试。各段之间一条细分隔线，整张卡沿用 .panel.titled。 */
+.cvm-route-panel {
+  container-type: inline-size;
+}
+.cvm-route-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  text-align: left;
+}
+.cvm-route-table th,
+.cvm-route-table td {
+  padding: 0 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-route-table :is(th, td):first-child {
+  width: 30%;
+  padding-left: 12px;
+}
+.cvm-route-table :is(th, td):nth-child(2) {
+  width: 20%;
+}
+.cvm-route-table :is(th, td):last-child {
+  width: 64px;
+  padding-right: 8px;
+}
+.cvm-route-table thead th {
+  height: 28px;
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--band) 55%, var(--card));
+  color: var(--panel-heading-ink);
+  font-size: 11px;
+  font-weight: 500;
+}
+.cvm-route-table tbody td {
+  height: 36px;
+  border-top: 1px solid var(--line-soft);
+}
+.cvm-route-table tbody tr:first-child td {
+  border-top: 0;
+}
+.cvm-route-table td.mono {
+  font: 12px var(--mono);
+}
+.cvm-route-via {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.cvm-route-via > span:not(.st) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cvm-route-via > .ui-icon {
+  flex: none;
+  color: var(--ink-4);
+}
+.cvm-route-hit.st {
+  margin: 0 0 0 auto;
+  border-color: color-mix(in srgb, var(--action) 50%, var(--line));
+  background: var(--action-wash);
+  color: var(--action);
+}
+.cvm-route-table tr[data-hit] td {
+  background: color-mix(in srgb, var(--action) 6%, var(--card));
+}
+.cvm-route-table tr[data-hit] td:first-child {
+  box-shadow: inset 2px 0 0 var(--action);
+}
+.cvm-route-acts {
+  text-align: right;
+}
+.cvm-route-acts > .btn {
+  min-height: 26px;
+}
+.cvm-route-acts > .btn + .btn {
+  margin-left: 2px;
+}
+@media (hover: hover) and (pointer: fine) {
+  .cvm-route-table tbody tr:not(.cvm-route-form) .cvm-route-acts > .btn {
+    opacity: 0;
+  }
+  .cvm-route-table tbody tr:hover .cvm-route-acts > .btn,
+  .cvm-route-table tbody tr:focus-within .cvm-route-acts > .btn {
+    opacity: 1;
+  }
+}
+.cvm-route-rest td {
+  background: color-mix(in srgb, var(--band) 55%, var(--card));
+  color: var(--ink-3);
+}
+
+/* 新增 / 编辑行：与只读行同列宽，控件压到 28px。 */
+.cvm-route-form {
+  --ctl-h: 28px;
+}
+.cvm-route-form td {
+  height: 42px;
+  vertical-align: middle;
+}
+.cvm-route-form .f {
+  width: 100%;
+  min-height: 28px;
+  font-size: 12px;
+}
+.cvm-route-form[data-editing] td {
+  background: color-mix(in srgb, var(--gold) 7%, var(--card));
+}
+.cvm-route-form[data-editing] td:first-child {
+  box-shadow: inset 2px 0 0 var(--gold);
+}
+.cvm-route-form td:nth-child(3) {
+  position: relative;
+  overflow: visible;
+}
+.cvm-route-problem {
+  position: absolute;
+  top: 100%;
+  left: 8px;
+  z-index: 1;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--card);
+  box-shadow: var(--sheet-shadow);
+  color: var(--gold);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.btn.icon.cvm-route-submit {
+  width: 28px;
+  padding: 0;
+}
+
+/* 出口优先级：一条可拖动的出口序列。 */
+.cvm-route-priorities {
+  border-top: 1px solid var(--line-soft);
+}
+.cvm-route-priority-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+}
+.cvm-route-caption {
+  margin-right: 2px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.cvm-route-priority {
+  display: inline-flex;
+  align-items: stretch;
+  height: 26px;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  font-size: 12px;
+}
+.cvm-route-priority[data-open] {
+  border-color: color-mix(in srgb, var(--action) 55%, var(--line));
+}
+.cvm-route-priority[data-drop] {
+  outline: 2px solid color-mix(in srgb, var(--action) 50%, transparent);
+  outline-offset: 1px;
+}
+.cvm-route-grip {
+  display: inline-grid;
+  width: 18px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-right: 1px solid var(--line-soft);
+  background: none;
+  color: var(--ink-4);
+  cursor: grab;
+}
+.cvm-route-grip:active {
+  cursor: grabbing;
+}
+.cvm-route-priority-body {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px 0 7px;
+  border: 0;
+  background: none;
+  color: var(--ink-2);
+  font: inherit;
+  cursor: pointer;
+}
+.cvm-route-priority-body:disabled {
+  cursor: default;
+}
+.cvm-route-priority-body > b {
+  color: var(--action);
+  font: 600 11px var(--mono);
+}
+.cvm-route-priority-values {
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+}
+:is(.cvm-route-grip, .cvm-route-priority-body):focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--action) 44%, transparent);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
+.cvm-route-note {
+  margin: 0;
+  padding: 0 12px 8px;
+  font-size: 11.5px;
+}
+.cvm-route-priority-edit {
+  --ctl-h: 26px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  margin: 0 12px 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-ctl);
+  background: var(--band);
+  font-size: 12px;
+}
+.cvm-route-priority-edit > label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-3);
+}
+.cvm-route-priority-edit input.f {
+  width: 84px;
+  min-height: 26px;
+}
+.cvm-route-priority-edit > .note {
+  flex: 1 1 220px;
+  margin: 0;
+  font-size: 11.5px;
+}
+
+/* 单行信息条：提示、容器 DNS、命中测试。 */
+.cvm-route-line {
+  --ctl-h: 28px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin: 0;
+  padding: 8px 12px;
+  border-top: 1px solid var(--line-soft);
+  font-size: 12px;
+}
+.cvm-route-line > .ui-icon {
+  flex: none;
+  color: var(--ink-4);
+}
+.cvm-route-line > input.f {
+  flex: 0 1 300px;
+  min-height: 28px;
+  font-size: 12px;
+}
+.cvm-route-notice {
+  color: var(--ink-3);
+}
+.cvm-route-probe {
+  background: color-mix(in srgb, var(--action) 4%, var(--band));
+}
+.cvm-route-probe > .ui-icon {
+  color: var(--action);
+}
+.cvm-route-probe > input.f {
+  flex-basis: 200px;
+}
+.cvm-route-probe-result {
+  flex: 1 1 260px;
+  min-width: 0;
+  color: var(--ink-2);
+}
+.cvm-route-probe-result b {
+  font-weight: 500;
+}
+.cvm-route-probe-result .hot {
+  color: var(--gold);
+}
+.cvm-route-probe > .error-box,
+.cvm-route-probe > [role='alert'] {
+  flex: 1 0 100%;
+}
+@container (max-width: 560px) {
+  .cvm-route-table thead {
+    display: none;
+  }
+  .cvm-route-table,
+  .cvm-route-table tbody {
+    display: block;
+  }
+  .cvm-route-table tbody tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr) auto;
+    grid-template-areas:
+      'dst svc acts'
+      'via via acts';
+    align-items: center;
+    gap: 2px 8px;
+    padding: 7px 10px 7px 12px;
+    border-top: 1px solid var(--line-soft);
+  }
+  .cvm-route-table tbody tr:first-child {
+    border-top: 0;
+  }
+  .cvm-route-table tbody td {
+    width: auto !important;
+    height: auto;
+    padding: 0 !important;
+    border: 0;
+    background: none !important;
+    box-shadow: none !important;
+  }
+  .cvm-route-table tbody td:nth-child(1) {
+    grid-area: dst;
+  }
+  .cvm-route-table tbody td:nth-child(2) {
+    grid-area: svc;
+  }
+  .cvm-route-table tbody td:nth-child(3) {
+    grid-area: via;
+  }
+  .cvm-route-table tbody td:nth-child(4) {
+    grid-area: acts;
+  }
+  .cvm-route-table tr.cvm-route-rest {
+    grid-template-areas: 'dst via via';
+  }
+  .cvm-route-table tr.cvm-route-rest td:nth-child(2) {
+    grid-area: via;
+  }
+  .cvm-route-table tr.cvm-route-rest td:nth-child(3) {
+    display: none;
+  }
+  .cvm-route-table tr:is([data-hit], .cvm-route-rest, .cvm-route-form[data-editing]) {
+    background: color-mix(in srgb, var(--band) 55%, var(--card));
+  }
+  .cvm-route-table .cvm-route-acts > .btn {
+    opacity: 1;
+  }
+  .cvm-route-problem {
+    position: static;
+    display: block;
+    margin-top: 3px;
+    padding: 0;
+    box-shadow: none;
+    background: none;
+  }
+}

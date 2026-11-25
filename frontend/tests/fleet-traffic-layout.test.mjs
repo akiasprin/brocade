@@ -8,7 +8,7 @@ const end = css.indexOf('/* ── 首次上线引导层', start);
 assert.ok(start > 0 && end > start, '机队实时流量样式标记存在且顺序有效');
 const styles = css.slice(start, end);
 
-test('实时页签铺满连续纸，矩阵列宽、方格和地区间距固定', () => {
+test('实时页签铺满连续纸，矩阵只有点阵与读数格两种固定尺寸，不随纸面拉伸', () => {
   assert.ok(start > 0 && end > start && styles.length > 0);
   assert.match(css, /\.usage-cockpit,\s*\.flt-cockpit\s*\{[^}]*grid-template-columns:\s*300px minmax\(0, 1fr\);/);
   assert.doesNotMatch(styles, /--flt-ledger-unit/);
@@ -16,9 +16,14 @@ test('实时页签铺满连续纸，矩阵列宽、方格和地区间距固定',
   assert.match(styles, /--flt-cell:\s*calc\(var\(--flt-col\) - 6px\);/);
   assert.match(styles, /--flt-gap:\s*8px;/);
   assert.doesNotMatch(styles, /cqw|--flt-col:\s*clamp|--flt-gap:\s*6px/);
-  // 窄屏不缩小表格，改为按用户的流向列表；用量卡 620px 以下的单列读数栏不被覆盖。
-  assert.match(styles, /@container \(max-width: 680px\)\s*\{\s*\.flt-board\s*\{\s*display:\s*none;/);
-  assert.match(styles, /\.flt-list\s*\{\s*display:\s*block;/);
+  // 读数格固定 104 × 40，整张表放得下才用（组件写入 .reading），宽屏不放大。
+  assert.match(styles, /\.flt-board\.reading\s*\{\s*--flt-col:\s*104px;\s*--flt-row:\s*40px;/);
+  // 表格与其下的读数行、图例共用同一宽度变量，图例不被推到纸面最右侧。
+  assert.match(styles, /\.flt-grid\s*\{\s*width:\s*var\(--flt-table-w\);/);
+  assert.match(styles, /\.flt-under\s*\{[^}]*max-width:\s*max\(var\(--flt-table-w\), 560px\);/);
+  // 手机宽度同样是矩阵，只收窄四周留白；流向列表已移除。
+  assert.match(styles, /@container \(max-width: 680px\)\s*\{\s*\.flt-board\s*\{\s*padding:/);
+  assert.doesNotMatch(css, /\.flt-(?:list|flows?|flow-[a-z]+|cv)\b/);
 });
 
 test('吸附列、准星和空闲格跟随页签纸面取色', () => {
@@ -47,7 +52,7 @@ test('斜排列名整条可点，用户头像保留自身的居中排版', () =>
   // 曾用 `button > span` 给名字块排版，头像也是按钮下的 span，被改成纵向 flex 后线稿贴顶。
   assert.doesNotMatch(styles, /button\s*>\s*span/);
   assert.match(styles, /\.flt-ubtn \.user-avatar\s*\{\s*width:\s*20px;\s*height:\s*20px;\s*\}/);
-  for (const control of ['\\.flt-mlabel', '\\.flt-ubtn', '\\.flt-flow']) {
+  for (const control of ['\\.flt-mlabel', '\\.flt-ubtn']) {
     assert.match(styles, new RegExp(`${control}:focus-visible[^{]*\\{[^}]*outline:\\s*2px solid var\\(--action\\)`));
   }
   assert.doesNotMatch(styles.replace(/@media \(hover: hover\)\s*\{[\s\S]*?\n\}/g, ''), /:hover\s*[,{]/);

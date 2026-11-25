@@ -1,5 +1,8 @@
 import type { CvmMonitoringSample } from '../../api';
 
+export type CvmOverviewMetric = 'cpu' | 'memory' | 'disk' | 'network';
+export const cpuPercent = (basisPoints: number | null | undefined) => (basisPoints == null ? null : basisPoints / 100);
+
 export function cvmNetworkRate(
   sample: CvmMonitoringSample | null | undefined,
   direction: 'rx_bps' | 'tx_bps',

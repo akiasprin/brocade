@@ -157,6 +157,40 @@ async fn plan_deployment_unscoped(pool: &PgPool, revision_id: u64) -> Result<Dep
     mark_vpngate_policy_changes(&mut plan, serving_snapshot.as_ref(), &snapshot);
     #[cfg(feature = "cvm")]
     crate::cvm::releases::augment_plan(pool, &mut plan).await?;
+    #[cfg(feature = "cvm")]
+    {
+        let isolated = isolated_node_ids(pool).await?;
+        if plan.targets.iter().any(|target| {
+            isolated.contains(&target.node_id) && target.actions.contains(&PlannedAction::SyncCvm)
+        }) {
+            // Superseding an in-flight debt invalidates ordinary applied state too. Freeze a
+            // complete machine repair, so an Unmanaged artifact cannot leave re-entry blocked.
+            let full = plan_snapshot_deployment(&snapshot, &[]).map_err(plan_error)?;
+            for target in &mut plan.targets {
+                if isolated.contains(&target.node_id)
+                    && target.actions.contains(&PlannedAction::SyncCvm)
+                {
+                    let machine = full
+                        .targets
+                        .iter()
+                        .find(|item| item.node_id == target.node_id)
+                        .ok_or_else(|| {
+                            StoreError::InvalidData(format!(
+                                "CVM repair node {} has no full machine configuration",
+                                target.node_id
+                            ))
+                        })?;
+                    target.desired = machine.desired.clone();
+                    target.disruptive |= machine.disruptive;
+                    for action in &machine.actions {
+                        if !target.actions.contains(action) {
+                            target.actions.push(*action);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let terminal = terminal_lifecycle_nodes(pool).await?;
     let mut plan = without_terminal_lifecycle_targets(plan, &terminal);
     annotate_vpngate_node_eligibility(pool, &mut plan, serving_snapshot.as_ref(), &snapshot)
@@ -364,7 +398,12 @@ where
 
 fn mark_isolated_targets(plan: &mut DeploymentPlan, isolated: &BTreeSet<String>) {
     for target in &mut plan.targets {
-        if target.status == PlannedTargetStatus::Pending && isolated.contains(&target.node_id) {
+        if target.status == PlannedTargetStatus::Pending
+            && isolated.contains(&target.node_id)
+            // An explicitly approved CVM repair must retain its wave and resource barrier;
+            // deferring it would require clearing the same failed resources before repair.
+            && !(cfg!(feature = "cvm") && target.actions.contains(&PlannedAction::SyncCvm))
+        {
             target.status = PlannedTargetStatus::Deferred;
         }
     }
@@ -621,7 +660,7 @@ async fn create_from_plan_tx(
             && target.actions.contains(&PlannedAction::SyncCvm)
     }) {
         return Err(StoreError::Unsupported(
-            "容器发布涉及隔离或作用域外的关联机器；请先恢复相关机器服务并使用完整发布范围".into(),
+            "容器发布涉及作用域外或延后的关联机器；请使用包含关联两端的完整发布范围".into(),
         ));
     }
 
@@ -824,6 +863,12 @@ pub async fn transition_node_status(
         plan_snapshot_deployment(&snapshot, &applied).map_err(plan_error)?,
         DeploymentKind::Config,
     );
+    #[cfg(feature = "cvm")]
+    let plan = {
+        let mut plan = plan;
+        crate::cvm::releases::augment_plan_tx(&mut tx, &mut plan).await?;
+        plan
+    };
     let terminal = terminal_lifecycle_nodes(&mut *tx).await?;
     let mut plan = without_terminal_lifecycle_targets(plan, &terminal);
     if lifecycle_phase == NodeLifecyclePhase::Active.as_str() {
@@ -918,12 +963,48 @@ pub async fn abandon_node(
     .await?;
     crate::xray_release::cancel_for_node_lifecycle_tx(&mut tx, node_id, actor.operator_id())
         .await?;
-    let lifecycle_epoch = crate::lifecycle::abandon_tx(&mut tx, node_id).await?;
     let mut canceled_deployment_ids = Vec::new();
     for deployment_id in active_ids {
         cancel_deployment_tx(&mut tx, deployment_id).await?;
         canceled_deployment_ids.push(deployment_id);
     }
+
+    // Forced retirement is the terminal override, not a second step which can only run after an
+    // ordinary retirement happened to pass every resource guard. Commit model retirement here
+    // when the machine is still active, then remove live CVM intent without waiting for the
+    // machine which is being abandoned.
+    let retired: bool =
+        sqlx::query_scalar("SELECT retired_at IS NOT NULL FROM nodes WHERE id=$1 FOR UPDATE")
+            .bind(node_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("node {node_id}")))?;
+    if !retired {
+        let previous = console::lock_control_state(&mut tx).await?;
+        let proposed_revision = console::insert_revision(
+            &mut tx,
+            actor.operator_id(),
+            &format!("force-retire node {node_id}"),
+        )
+        .await?;
+        sqlx::query("UPDATE nodes SET retired_at=now() WHERE id=$1 AND retired_at IS NULL")
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?;
+        crate::lifecycle::advance_intent_tx(&mut tx, node_id, true, proposed_revision).await?;
+        console::commit_revision(&mut tx, proposed_revision, previous, true).await?;
+    }
+
+    #[cfg(feature = "cvm")]
+    crate::cvm::retirement::force_retire_node(&mut tx, actor, node_id).await?;
+
+    // Operational isolation only describes an active machine. Keeping this row after terminal
+    // retirement leaves a false live association in Console and future planning.
+    sqlx::query("DELETE FROM node_operational_isolations WHERE node_id=$1")
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await?;
+    let lifecycle_epoch = crate::lifecycle::abandon_tx(&mut tx, node_id).await?;
 
     let snapshot = materialize::load_current_snapshot_tx(&mut tx).await?;
     let applied = load_applied_states(&mut *tx).await?;
@@ -931,14 +1012,45 @@ pub async fn abandon_node(
         plan_snapshot_deployment(&snapshot, &applied).map_err(plan_error)?,
         DeploymentKind::Config,
     );
+    #[cfg(feature = "cvm")]
+    let plan = {
+        let mut plan = plan;
+        crate::cvm::releases::augment_plan_tx(&mut tx, &mut plan).await?;
+        plan
+    };
     let terminal = terminal_lifecycle_nodes(&mut *tx).await?;
-    let plan = without_terminal_lifecycle_targets(plan, &terminal);
+    let mut plan = without_terminal_lifecycle_targets(plan, &terminal);
+    let isolated = isolated_node_ids(&mut *tx).await?;
+    // Strong retirement only dispatches cleanup to live peers. An isolated peer keeps no active
+    // work-order debt here; service restoration will converge it from the already-advanced
+    // Console baseline and current model.
+    plan.targets
+        .retain(|target| !isolated.contains(&target.node_id));
+    for target in &mut plan.targets {
+        target
+            .prerequisites
+            .retain(|prerequisite| !isolated.contains(prerequisite));
+    }
+    plan.summary = brocade_deployment::plan::summarize_targets(&plan.targets);
     let deployment_id = if plan.summary.changed_targets > 0 {
+        let idempotency_base = format!("system:node-abandon:{node_id}:{lifecycle_epoch}");
+        let prior_attempts = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM deployments
+              WHERE idempotency_key=$1 OR idempotency_key LIKE $1 || ':retry:%'",
+        )
+        .bind(&idempotency_base)
+        .fetch_one(&mut *tx)
+        .await?;
+        let idempotency_key = if prior_attempts == 0 {
+            idempotency_base
+        } else {
+            format!("{idempotency_base}:retry:{prior_attempts}")
+        };
         Some(
             insert_lifecycle_deployment_tx(
                 &mut tx,
                 actor.operator_id(),
-                &format!("system:node-abandon:{node_id}:{lifecycle_epoch}"),
+                &idempotency_key,
                 &format!("replace active deployment after force-retiring node {node_id}"),
                 &plan,
             )
@@ -2270,12 +2382,71 @@ pub async fn confirm_deployment_wave(
     })
 }
 
+/// An isolated node may execute an explicitly approved, full-scope CVM repair without
+/// re-entering serving. Keep the ordinary wave/confirmation and receipt gates authoritative.
+async fn has_active_cvm_repair<'e, E>(executor: E, node: &str) -> Result<bool>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    #[cfg(feature = "cvm")]
+    {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM deployments d
+                JOIN deployment_targets t ON t.deployment_id=d.id
+                JOIN deployment_target_state s ON s.deployment_id=t.deployment_id AND s.node_id=t.node_id
+                WHERE t.node_id=$1 AND d.kind='config' AND d.active=TRUE
+                  AND s.cvm_revision_id IS NOT NULL
+                  AND t.status IN ('pending','dispatched','converging','failed-recovered','failed-dirty')
+            )",
+        ).bind(node).fetch_one(executor).await?)
+    }
+    #[cfg(not(feature = "cvm"))]
+    {
+        let _ = (executor, node);
+        Ok(false)
+    }
+}
+
+/// CVM repairs keep a debt barrier until the exact ordinary and resource outcomes agree.
+/// Pending resource receipts must never make the manual restore action eligible.
+pub(crate) async fn settle_cvm_repair_obligation_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deployment: i64,
+    node: &str,
+    status: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    #[cfg(feature = "cvm")]
+    {
+        let status = if status == "converging" {
+            "pending"
+        } else {
+            status
+        };
+        sqlx::query(
+            "UPDATE node_convergence_obligations o
+             SET status=$3, last_error=$4,
+                 settled_at=CASE WHEN $3='succeeded' THEN now() ELSE NULL END
+             WHERE o.source_deployment_id=$1 AND o.node_id=$2 AND o.kind='config'
+               AND o.status IN ('pending','failed-recovered','failed-dirty')
+               AND EXISTS(SELECT 1 FROM deployment_target_state s
+                          WHERE s.deployment_id=$1 AND s.node_id=$2 AND s.cvm_revision_id IS NOT NULL)",
+        ).bind(deployment).bind(node).bind(status).bind(error).execute(&mut **tx).await?;
+    }
+    #[cfg(not(feature = "cvm"))]
+    let _ = (tx, deployment, node, status, error);
+    Ok(())
+}
+
 pub async fn load_desired_for_node(
     pool: &PgPool,
     node_id: &str,
 ) -> Result<Option<NodeDesiredDeployment>> {
-    if let Some(row) = sqlx::query(
-        "SELECT obligation.source_deployment_id AS deployment_id,
+    let cvm_repair = has_active_cvm_repair(pool, node_id).await?;
+    if !cvm_repair {
+        if let Some(row) = sqlx::query(
+            "SELECT obligation.source_deployment_id AS deployment_id,
                 obligation.desired_structure,
                 obligation.desired_grants,
                 obligation.usage_generation_id,
@@ -2293,41 +2464,42 @@ pub async fn load_desired_for_node(
                    obligation.priority DESC,
                    obligation.generation DESC
           LIMIT 1",
-    )
-    .bind(node_id)
-    .fetch_optional(pool)
-    .await?
-    {
-        let deployment_id: i64 = row.try_get("deployment_id")?;
-        let mut desired = desired_deployment_from_structure(
-            pool,
-            deployment_id,
-            node_id.to_owned(),
-            0,
-            row.try_get("desired_structure")?,
-            serde_json::from_value(row.try_get("desired_grants")?)?,
         )
-        .await?;
-        desired.claim_generation = i64_to_u64(
-            "obligation claim_generation",
-            row.try_get("claim_generation")?,
-        )?;
-        desired.usage_generation_id = row.try_get("usage_generation_id")?;
-        return Ok(Some(desired));
-    }
-    if sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (
+        .bind(node_id)
+        .fetch_optional(pool)
+        .await?
+        {
+            let deployment_id: i64 = row.try_get("deployment_id")?;
+            let mut desired = desired_deployment_from_structure(
+                pool,
+                deployment_id,
+                node_id.to_owned(),
+                0,
+                row.try_get("desired_structure")?,
+                serde_json::from_value(row.try_get("desired_grants")?)?,
+            )
+            .await?;
+            desired.claim_generation = i64_to_u64(
+                "obligation claim_generation",
+                row.try_get("claim_generation")?,
+            )?;
+            desired.usage_generation_id = row.try_get("usage_generation_id")?;
+            return Ok(Some(desired));
+        }
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
              SELECT 1
                FROM node_operational_isolations isolation
                JOIN node_lifecycle_state lifecycle ON lifecycle.node_id = isolation.node_id
               WHERE isolation.node_id = $1 AND lifecycle.phase = 'active'
          )",
-    )
-    .bind(node_id)
-    .fetch_one(pool)
-    .await?
-    {
-        return load_resigned_environment_desired(pool, node_id).await;
+        )
+        .bind(node_id)
+        .fetch_one(pool)
+        .await?
+        {
+            return load_resigned_environment_desired(pool, node_id).await;
+        }
     }
     if let Some(desired) = load_resigned_environment_desired(pool, node_id).await? {
         return Ok(Some(desired));
@@ -2491,7 +2663,7 @@ pub async fn claim_desired_for_node_with_protocol(
     .bind(node_id)
     .fetch_one(&mut *tx)
     .await?;
-    if isolated {
+    if isolated && !has_active_cvm_repair(&mut *tx, node_id).await? {
         let obligation = sqlx::query(
             "SELECT obligation.kind,
                     obligation.status,
@@ -2742,11 +2914,6 @@ pub async fn claim_desired_for_node_with_protocol(
         grants.clone(),
     )
     .await?;
-    #[cfg(feature = "cvm")]
-    if !crate::cvm::releases::can_claim(&mut tx, deployment_id, &node_id, protocol).await? {
-        tx.commit().await?;
-        return Ok(None);
-    }
     let dispatched_grants = serde_json::to_value(&grants)?;
     if !supports_config_policy(&desired, protocol) {
         tx.commit().await?;
@@ -3249,6 +3416,14 @@ pub async fn report_target_result(
         )
         .await?;
     }
+    settle_cvm_repair_obligation_tx(
+        &mut tx,
+        report.deployment_id,
+        &report.node_id,
+        final_status,
+        target_error,
+    )
+    .await?;
     // In a grants deployment phantun, wireguard, and xray are all Unmanaged, and the agent
     // faithfully reports Unmanaged (observe_linux_* returns it unchanged). Overwriting the applied
     // state with that would have the control plane believe this machine's configuration is
@@ -3959,6 +4134,12 @@ pub async fn retry_target(
           WHERE obligation.source_deployment_id = $1
             AND obligation.node_id = $2
             AND obligation.status IN ('failed-recovered', 'failed-dirty')
+            AND NOT EXISTS (
+                SELECT 1 FROM deployments d JOIN deployment_target_state s
+                  ON s.deployment_id=d.id AND s.node_id=obligation.node_id
+                WHERE d.id=obligation.source_deployment_id AND d.active=TRUE
+                  AND s.cvm_revision_id IS NOT NULL
+            )
           FOR UPDATE OF obligation",
     )
     .bind(deployment_id)
@@ -4076,6 +4257,7 @@ pub async fn retry_target(
     .execute(&mut *tx)
     .await?;
 
+    settle_cvm_repair_obligation_tx(&mut tx, deployment_id, node_id, "pending", None).await?;
     sqlx::query(
         "UPDATE deployments
          SET status = 'running',
@@ -6830,7 +7012,15 @@ async fn insert_target(
         .await?;
     }
 
-    if target.status == PlannedTargetStatus::Deferred {
+    let isolated_cvm = target.status == PlannedTargetStatus::Pending
+        && target.actions.contains(&PlannedAction::SyncCvm)
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM node_operational_isolations WHERE node_id=$1)",
+        )
+        .bind(&target.node_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    if target.status == PlannedTargetStatus::Deferred || isolated_cvm {
         let kind: String = sqlx::query_scalar("SELECT kind FROM deployments WHERE id = $1")
             .bind(deployment_id)
             .fetch_one(&mut **tx)
@@ -6838,7 +7028,7 @@ async fn insert_target(
         let kind = DeploymentKind::parse(&kind).ok_or_else(|| {
             StoreError::InvalidData(format!("deployment {deployment_id} has invalid kind"))
         })?;
-        let obligation_target = if kind == DeploymentKind::Config {
+        let obligation_target = if kind == DeploymentKind::Config && !isolated_cvm {
             plan_snapshot_deployment(&snapshot, &[])
                 .map_err(plan_error)?
                 .targets
@@ -7004,6 +7194,17 @@ async fn insert_or_supersede_obligation_tx(
     .await?;
     if let Some(policy) = policy {
         desired_structure["xray_config_update_policy"] = policy;
+    }
+    let cvm: Option<Value> = sqlx::query_scalar(
+        "SELECT desired_structure->'cvm' FROM deployment_target_state
+         WHERE deployment_id=$1 AND node_id=$2",
+    )
+    .bind(deployment_id)
+    .bind(&target.node_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if let Some(cvm) = cvm {
+        desired_structure["cvm"] = cvm;
     }
     let desired_grants = serde_json::to_value(&target.desired.grants)?;
     let desired_fingerprint = sha256_hex(&serde_json::to_vec(&json!({
@@ -8181,6 +8382,33 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[cfg(feature = "cvm")]
+    #[test]
+    fn isolated_cvm_repair_preserves_full_scope_dependency_checks() {
+        let mut plan = dependency_plan(vec![
+            planned_target("host", PlannedTargetStatus::Pending, &["entry"]),
+            planned_target("entry", PlannedTargetStatus::Pending, &["host"]),
+        ]);
+        for target in &mut plan.targets {
+            target.actions.push(PlannedAction::SyncCvm);
+        }
+        super::mark_isolated_targets(
+            &mut plan,
+            &std::collections::BTreeSet::from(["host".into()]),
+        );
+        assert!(plan
+            .targets
+            .iter()
+            .all(|t| t.status == PlannedTargetStatus::Pending));
+        plan.targets.retain(|t| t.node_id == "host");
+        defer_listener_dependents(&mut plan, true);
+        assert_eq!(plan.targets[0].status, PlannedTargetStatus::Deferred);
+        assert!(plan
+            .warnings
+            .iter()
+            .any(|w| w.code == "listener.prerequisite-out-of-scope"));
     }
 
     #[test]

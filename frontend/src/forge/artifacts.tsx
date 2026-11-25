@@ -50,10 +50,10 @@ export function changedConfigurationNodes(here: ArtifactIndexEntry[], there: Art
 /** 通过比较 sha256 得出发生变化的产物 id——索引本身包含 sha256，无需拉取内容。 */
 function changedBetween(here: ArtifactIndexEntry[], there: ArtifactIndexEntry[]): Set<string> {
   const before = new Map(there.map(a => [entryId(a), a.sha256]));
+  const after = new Map(here.map(a => [entryId(a), a.sha256]));
   const changed = new Set<string>();
-  for (const a of here) {
-    const was = before.get(entryId(a));
-    if (was === undefined || was !== a.sha256) changed.add(entryId(a));
+  for (const key of new Set([...before.keys(), ...after.keys()])) {
+    if (before.get(key) !== after.get(key)) changed.add(key);
   }
   return changed;
 }

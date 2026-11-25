@@ -1,5 +1,4 @@
 //! CVM contracts shared by Console and Agent; backend execution stays node-local.
-use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -11,6 +10,8 @@ mod capabilities;
 mod chain_egress;
 pub use chain_egress::*;
 mod entry;
+mod entry_policy;
+pub use entry_policy::*;
 mod host;
 mod metrics;
 mod network_quota;
@@ -31,10 +32,9 @@ pub use nic::*;
 pub use observation::*;
 pub use spec::*;
 pub use state::*;
-pub use validation::{valid_digest, valid_id, valid_public_key};
+pub use validation::{valid_digest, valid_id};
 use validation::{valid_interface_address, valid_mac};
 
-pub const CVM_PROTOCOL_VERSION: u32 = 65;
 pub const MAX_INSTANCES_PER_MACHINE: usize = 256;
 pub const MAX_INTERFACES: usize = 16;
 pub const MAX_CATALOG_ITEMS: usize = 128;
@@ -54,30 +54,19 @@ mod tests {
         };
         let value = serde_json::to_value(image).unwrap();
         assert!(value.get("memory_bytes").is_none() && value.get("vcpus").is_none());
-        assert!(!valid_public_key("ssh-ed25519 abc\ncommand=bad"));
     }
     #[test]
-    fn duplicate_default_routes_and_missing_contact_are_rejected() {
+    fn configured_sources_only_create_the_contact_device() {
         let caps = Capabilities {
             max_interfaces: 4,
-            network_sources: vec![
-                NetworkSource {
-                    id: "public".into(),
-                    name: "Public".into(),
-                    kind: NetworkKind::Public,
-                    description: String::new(),
-                    max_attachments: Some(1),
-                    supports_ipv6: Some(false),
-                },
-                NetworkSource {
-                    id: "own".into(),
-                    name: "Own".into(),
-                    kind: NetworkKind::Internal,
-                    description: String::new(),
-                    max_attachments: None,
-                    supports_ipv6: Some(true),
-                },
-            ],
+            network_sources: vec![NetworkSource {
+                id: "public".into(),
+                name: "Public".into(),
+                kind: NetworkKind::Public,
+                description: String::new(),
+                max_attachments: Some(1),
+                supports_ipv6: Some(false),
+            }],
             ..Default::default()
         };
         let contact = InterfaceRequest {
@@ -93,8 +82,11 @@ mod tests {
             default_ipv6: false,
         };
         assert!(caps
-            .validate_interfaces(&[contact.clone(), business.clone()])
+            .validate_interfaces(std::slice::from_ref(&contact))
             .is_ok());
+        assert!(caps
+            .validate_interfaces(&[contact.clone(), business.clone()])
+            .is_err());
         assert!(caps
             .validate_interfaces(&[contact.clone(), contact.clone()])
             .is_err());
@@ -131,4 +123,27 @@ fn independent_resources_enforce_each_limit_without_catalogue_coupling() {
     let mut invalid = limits;
     invalid.memory_step_bytes = 0;
     assert!(invalid.validate_resources(&resources).is_err());
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct GuestCredential {
+    pub instance_id: String,
+    pub revision: u64,
+    pub password: String,
+}
+
+impl GuestCredential {
+    pub fn validate(&self) -> Result<(), String> {
+        if !valid_id(&self.instance_id)
+            || self.revision == 0
+            || self.password.len() != 32
+            || !self
+                .password
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err("invalid Guest credential".into());
+        }
+        Ok(())
+    }
 }

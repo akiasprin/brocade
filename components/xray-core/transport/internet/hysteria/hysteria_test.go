@@ -7,13 +7,95 @@ import (
 	"errors"
 	"net"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/apernet/quic-go"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
+	"github.com/xtls/xray-core/transport/internet"
 )
+
+type failingQUICListener struct {
+	err        error
+	closeCount atomic.Int32
+}
+
+func (l *failingQUICListener) Accept(context.Context) (*quic.Conn, error) {
+	return nil, l.err
+}
+
+func (*failingQUICListener) Addr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
+}
+
+func (l *failingQUICListener) Close() error {
+	l.closeCount.Add(1)
+	return nil
+}
+
+type closeTrackingPacketConn struct {
+	closeCount atomic.Int32
+}
+
+func (*closeTrackingPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, net.ErrClosed
+}
+
+func (*closeTrackingPacketConn) WriteTo([]byte, net.Addr) (int, error) {
+	return 0, net.ErrClosed
+}
+
+func (c *closeTrackingPacketConn) Close() error {
+	c.closeCount.Add(1)
+	return nil
+}
+
+func (*closeTrackingPacketConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
+}
+
+func (*closeTrackingPacketConn) SetDeadline(time.Time) error      { return nil }
+func (*closeTrackingPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (*closeTrackingPacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+type closeTrackingHandoffGate struct {
+	closed atomic.Bool
+}
+
+func (*closeTrackingHandoffGate) BeforeAccept(ctx context.Context) (context.Context, bool) {
+	return ctx, true
+}
+
+func (*closeTrackingHandoffGate) AfterAccept(bool)      {}
+func (*closeTrackingHandoffGate) StartConnection() bool { return true }
+func (*closeTrackingHandoffGate) FinishConnection()     {}
+func (g *closeTrackingHandoffGate) Close()              { g.closed.Store(true) }
+
+var _ internet.PacketHandoffGate = (*closeTrackingHandoffGate)(nil)
+
+func TestListenerClosesPacketSocketAfterAcceptLoopFailure(t *testing.T) {
+	failure := errors.New("terminal packet read failure")
+	listener := &failingQUICListener{err: failure}
+	packetConn := &closeTrackingPacketConn{}
+	handoff := &closeTrackingHandoffGate{}
+	l := &Listener{listener: listener, pktConn: packetConn, handoff: handoff}
+
+	l.keepAccepting()
+	if !handoff.closed.Load() {
+		t.Fatal("terminal accept failure left handoff listener advertised as open")
+	}
+	if listener.closeCount.Load() != 1 || packetConn.closeCount.Load() != 1 {
+		t.Fatalf("terminal accept failure did not close listener resources exactly once: listener=%d packet=%d", listener.closeCount.Load(), packetConn.closeCount.Load())
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if listener.closeCount.Load() != 1 || packetConn.closeCount.Load() != 1 {
+		t.Fatal("listener close was not idempotent")
+	}
+}
 
 func TestDatagram(t *testing.T) {
 	run := func() (addr net.Addr, recv chan int64, cancel func()) {

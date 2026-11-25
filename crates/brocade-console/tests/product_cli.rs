@@ -83,7 +83,7 @@ async fn offline_upgrade_rejects_empty_databases_and_checks_initialized_schema()
             .iter()
             .map(|(version, _)| *version)
             .collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5, 6, 7, 8]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
     pool.close().await;
 }
@@ -143,7 +143,7 @@ async fn offline_ip_maintenance_compat_is_explicit_read_only_then_migrates() {
         String::from_utf8_lossy(&opted.stderr)
     );
     let report: Value = serde_json::from_slice(&opted.stdout).unwrap();
-    assert_eq!(report["pending_versions"], json!([7, 8]));
+    assert_eq!(report["pending_versions"], json!([7, 8, 9]));
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('ip_maintenance_policies') IS NULL")
         .fetch_one(store.pool())
         .await

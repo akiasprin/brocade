@@ -6,13 +6,15 @@ import { useRevisionDiff } from './artifacts';
 export function useConfigurationStatus(revision: number | undefined, released: number | null | undefined) {
   const compare = revision != null && released !== undefined && revision !== released;
   const diff = useRevisionDiff(compare ? revision : undefined, compare ? released : undefined);
-  // Keep ordinary edits on the lightweight index path. For new machines, share the release
-  // page's live check rather than mistaking a missing historical file for an unapplied one.
-  const verifyNewNodes = compare && diff.configurationOnlyNewNodes;
+  // CVM changes have no artifact diff at all. Grant and subscription revisions also leave
+  // configuration files unchanged, but their artifact diff must stay on the lightweight path.
+  const verifyPlan =
+    compare &&
+    (diff.configurationOnlyNewNodes || (diff.known && diff.configurationNodes?.size === 0 && diff.changed.size === 0));
   const verification = useQuery({
     queryKey: ['deployment-verify', revision],
     queryFn: () => verifyDeployment({ revision_id: revision! }),
-    enabled: verifyNewNodes,
+    enabled: verifyPlan,
     staleTime: 5_000,
     refetchInterval: query => ((query.state.data?.summary.changed_targets ?? 0) > 0 ? 5_000 : false),
   });
@@ -21,7 +23,7 @@ export function useConfigurationStatus(revision: number | undefined, released: n
       ? undefined
       : revision === released
         ? false
-        : verifyNewNodes
+        : verifyPlan
           ? verification.error || !verification.data
             ? undefined
             : verification.data.summary.changed_targets > 0
@@ -31,7 +33,7 @@ export function useConfigurationStatus(revision: number | undefined, released: n
 
   return {
     pendingChanges,
-    pending: compare && (diff.pending || (verifyNewNodes && verification.isPending)),
-    error: compare ? (diff.error ?? (verifyNewNodes ? verification.error : null)) : null,
+    pending: compare && (diff.pending || (verifyPlan && verification.isPending)),
+    error: compare ? (diff.error ?? (verifyPlan ? verification.error : null)) : null,
   };
 }

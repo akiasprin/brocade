@@ -77,8 +77,17 @@ def udp(address, port):
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); server.bind((address, port))
     while True:
         data, peer = server.recvfrom(2048); server.sendto(data + f" {peer[0]}".encode(), peer)
+def echo(address):
+    def connection(client):
+        try:
+            while data := client.recv(2048): client.sendall(data)
+        finally: client.close()
+    server = socket.socket(); server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((address, 8030)); server.listen(16)
+    while True: threading.Thread(target=connection, args=(server.accept()[0],), daemon=True).start()
 for target in (lambda: tcp("192.168.0.7", 8022), lambda: udp("192.168.0.7", 8022),
-               lambda: tcp("192.168.0.9", 80), lambda: tcp("192.168.0.8", 8022)):
+               lambda: tcp("192.168.0.9", 80), lambda: tcp("192.168.0.8", 8022),
+               lambda: echo("192.168.0.8"), lambda: udp("192.168.0.8", 8030)):
     threading.Thread(target=target, daemon=True).start()
 print("ready", flush=True)
 threading.Event().wait()
@@ -108,6 +117,7 @@ def tunnel(slot, side, entry, target, key, peer, endpoint):
         'side': side,
         'entry_node': entry,
         'target_node': target,
+        'wireguard_transport': 'udp',
         'offer': {
             'listen_side': 'provider',
             'kind': 'wireguard',
@@ -134,7 +144,7 @@ def udp(port):
     s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind((address,port))
     while True:
         data,peer=s.recvfrom(2048);s.sendto(label.encode(),peer)
-for fn,port in [(tcp,22),(tcp,9090),(udp,9090)]: threading.Thread(target=fn,args=(port,),daemon=True).start()
+for fn,port in [(tcp,p) for p in (22,9090,9091,9095,9099,30104,30106,30107)]+[(udp,9090),(udp,22)]: threading.Thread(target=fn,args=(port,),daemon=True).start()
 print('ready',flush=True);threading.Event().wait()
 """
 
@@ -177,6 +187,7 @@ def primary_l3(edge, host, roots):
             'mode': {'kind': 'l3'},
             'target': '198.51.100.2',
             'tunnel': 'entry-tunnel-3',
+            'host_local': False,
         }
         edge['rules'].append(primary)
         assert converge('edge', edge, roots['edge'])['error'] is None
@@ -210,6 +221,68 @@ def primary_l3(edge, host, roots):
         edge['generation'] += 1
         assert converge('edge', edge, roots['edge'])['error'] is None
         assert tcp('client', '198.51.100.1', 22) == 'EDGE'
+        # Protocol policies preserve host SSH while mapping a separate public port to guest SSH.
+        all_ports = {'kind': 'forward', 'ports': {'kind': 'all'}, 'mappings': []}
+        mode = {
+            'kind': 'protocols',
+            'tcp': dict(
+                all_ports,
+                mappings=[
+                    {'listen': {'start': 30022, 'end': 30022}, 'target': {'start': 22, 'end': 22}},
+                    {'listen': {'start': 30100, 'end': 30109}, 'target': {'start': 9090, 'end': 9099}},
+                ],
+            ),
+            'udp': all_ports,
+            'icmp': True,
+            'other_ip': True,
+        }
+        reserved = {
+            'tcp': [{'start': 22, 'end': 22}, {'start': 30104, 'end': 30104}, {'start': 30106, 'end': 30107}],
+            'udp': [],
+        }
+        primary.update(mode=mode, reserved_ports=reserved, target='198.51.100.2')
+        edge['rules'].append(primary)
+        edge['generation'] += 1
+        native = next(d for d in host['deliveries'] if d['id'] == 'native')
+        native.update(mode=mode, reserved_ports=reserved)
+        host['generation'] += 1
+        assert converge('host', host, roots['host'])['error'] is None
+        assert converge('edge', edge, roots['edge'])['error'] is None
+        for port in (22, 30104, 30106, 30107):
+            assert tcp('client', '198.51.100.1', port) == 'EDGE', port
+        for port in (30022, 30100, 30101, 30105, 30109):
+            assert tcp('client', '198.51.100.1', port) == 'NATIVE', port
+        assert udp('client', '198.51.100.1', 22) == 'NATIVE'
+        control()
+        sh('ping', '-c', '1', '-W', '3', '198.51.100.1', ns='client')
+        # Reservations are scoped to an address: the same port of another entry still forwards.
+        sh('ip', 'address', 'add', '203.0.113.31/32', 'dev', 'lo', ns='edge')
+        another = dict(primary, id='another', address='203.0.113.31', reserved_ports={'tcp': [], 'udp': []})
+        edge['rules'].append(another)
+        edge['generation'] += 1
+        assert converge('edge', edge, roots['edge'])['error'] is None
+        assert tcp('client', '203.0.113.31', 22) == 'NATIVE'
+        primary['target'] = None
+        edge['generation'] += 1
+        assert converge('edge', edge, roots['edge'])['error'] is None
+        assert tcp('client', '198.51.100.1', 22) == 'EDGE'
+        assert tcp('client', '198.51.100.1', 30022, timeout=2) is None
+        assert tcp('client', '198.51.100.1', 9090, timeout=2) is None
+        control()
+        edge['rules'].remove(primary)
+        edge['rules'].remove(another)
+        edge['generation'] += 1
+        assert converge('edge', edge, roots['edge'])['error'] is None
+        assert tcp('client', '198.51.100.1', 22) == 'EDGE'
+        primary['target'] = '198.51.100.2'
+        edge['rules'].append(primary)
+        edge['generation'] += 1
+        assert converge('edge', edge, roots['edge'])['error'] is None
+        assert tcp('client', '198.51.100.1', 22) == 'EDGE'
+        assert tcp('client', '198.51.100.1', 30022) == 'NATIVE'
+        print(
+            'protocol policies: reserved SSH, TCP/UDP separation, address isolation, mapped range offsets, target fencing and withdrawal/recreation passed'
+        )
         print(
             'primary L3: native TCP/SSH-port, UDP, ICMP, shared underlay endpoint, host TCP/UDP/ICMP replies, repeated convergence, stopped-target fence and withdrawal passed'
         )
@@ -217,6 +290,114 @@ def primary_l3(edge, host, roots):
         for p in servers:
             p.kill()
             p.wait()
+
+
+def withdrawal_recovery(local, root):
+    """Replay separate Agent processes across a bounded, interrupted cleanup."""
+    desired = json.loads(json.dumps(local))
+
+    def rule(name, start, end):
+        return {
+            'id': name,
+            'address': '203.0.114.20',
+            'mode': {
+                'kind': 'l4_range',
+                'protocol': 'tcp_udp',
+                'listen_start': start,
+                'listen_end': end,
+                'target_start': 8030,
+                'target_end': 8030 + end - start,
+            },
+            'target': '192.168.0.8',
+            'tunnel': None,
+            'host_local': False,
+        }
+
+    withdrawn = rule('withdrawn-connections', 31000, 31064)
+    desired['rules'].extend([withdrawn, rule('healthy-connections', 31070, 31070)])
+
+    def settle():
+        for _ in range(4):
+            report = converge('host2', desired, root)
+            if report['error'] is None:
+                return
+            assert 'continues next round' in report['error'], report
+        raise AssertionError('bounded cleanup did not converge')
+
+    settle()
+    code = r"""
+import json,socket,sys
+port=int(sys.argv[1]); peers=[]
+for kind in [socket.SOCK_STREAM,socket.SOCK_DGRAM]:
+    s=socket.socket(socket.AF_INET,kind);s.settimeout(1);s.connect(('203.0.114.20',port));peers.append(s)
+print('ready',flush=True)
+for line in sys.stdin:
+    result=[]
+    for s in peers:
+        try:
+            s.send(b'probe');result.append(s.recv(200).startswith(b'probe'))
+        except OSError: result.append(False)
+    print(json.dumps(result),flush=True)
+"""
+    clients = []
+    try:
+        for port in (31000, 31070):
+            client = subprocess.Popen(
+                ['ip', 'netns', 'exec', 'client', 'python3', '-u', '-c', code, str(port)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            clients.append(client)
+            assert client.stdout.readline().strip() == 'ready'
+
+        def probe(client):
+            client.stdin.write('probe\n')
+            client.stdin.flush()
+            return json.loads(client.stdout.readline())
+
+        assert probe(clients[0]) == [True, True]
+        assert probe(clients[1]) == [True, True]
+        settle()
+        assert probe(clients[0]) == [True, True]
+        assert probe(clients[1]) == [True, True]
+        desired['rules'].remove(withdrawn)
+        desired['generation'] += 1
+        report = converge('host2', desired, root)
+        assert 'continues next round' in report['error'], report
+        sh('nft', 'list', 'table', 'ip', 'brocade_cvm_entry_withdraw', ns='host2')
+        assert probe(clients[0]) == [False, False]
+        assert probe(clients[1]) == [True, True]
+        # Each converge starts a new Agent process with the durable cursor.
+        settle()
+        settle()
+        assert probe(clients[0]) == [False, False]
+        assert probe(clients[1]) == [True, True]
+        remaining = sh(
+            'conntrack',
+            '-L',
+            '-f',
+            'ipv4',
+            '-d',
+            '203.0.114.20',
+            '--dst-nat',
+            '192.168.0.8',
+            '-p',
+            'udp',
+            '--dport',
+            '31000',
+            ns='host2',
+        )
+        assert not remaining.stdout.strip(), remaining.stdout
+        assert sh('nft', 'list', 'table', 'ip', 'brocade_cvm_entry_withdraw', ns='host2', check=False).returncode
+        print(
+            'withdrawal recovery: established TCP/UDP revoked, durable fence/cursor replayed, healthy TCP/UDP preserved'
+        )
+    finally:
+        for client in clients:
+            client.kill()
+            client.wait()
 
 
 def main():
@@ -292,26 +473,49 @@ def scenario():
     edge_key, edge_public = keypair()
     host_key, host_public = keypair()
     host2_key, host2_public = keypair()
-    l4 = {'kind': 'l4', 'protocol': 'tcp_udp', 'listen_port': 30022, 'target_port': 8022}
+    l4 = {
+        'kind': 'l4_range',
+        'protocol': 'tcp_udp',
+        'listen_start': 30022,
+        'listen_end': 30022,
+        'target_start': 8022,
+        'target_end': 8022,
+    }
     edge = {
         'node_id': 'edge',
         'generation': 1,
         'rules': [
-            {'id': 'ssh', 'address': '203.0.113.12', 'mode': l4, 'target': '192.168.0.7', 'tunnel': 'entry-tunnel-3'},
+            {
+                'id': 'ssh',
+                'address': '203.0.113.12',
+                'mode': l4,
+                'target': '192.168.0.7',
+                'tunnel': 'entry-tunnel-3',
+                'host_local': False,
+            },
             {
                 'id': 'web',
                 'address': '203.0.113.30',
                 'mode': {'kind': 'l3'},
                 'target': '192.168.0.9',
                 'tunnel': 'entry-tunnel-3',
+                'host_local': False,
             },
             # Same container address, other host: only the tunnel tells them apart.
             {
                 'id': 'other',
                 'address': '203.0.113.12',
-                'mode': {'kind': 'l4', 'protocol': 'tcp', 'listen_port': 30023, 'target_port': 8022},
+                'mode': {
+                    'kind': 'l4_range',
+                    'protocol': 'tcp',
+                    'listen_start': 30023,
+                    'listen_end': 30023,
+                    'target_start': 8022,
+                    'target_end': 8022,
+                },
                 'target': '192.168.0.7',
                 'tunnel': 'entry-tunnel-4',
+                'host_local': False,
             },
         ],
         'deliveries': [],
@@ -325,13 +529,21 @@ def scenario():
         'generation': 1,
         'rules': [],
         'deliveries': [
-            {'id': 'ssh', 'instance_id': 'cvm-web', 'mode': l4, 'target': '192.168.0.7', 'tunnel': 'entry-tunnel-3'},
+            {
+                'id': 'ssh',
+                'instance_id': 'cvm-web',
+                'mode': l4,
+                'target': '192.168.0.7',
+                'tunnel': 'entry-tunnel-3',
+                'host_local': False,
+            },
             {
                 'id': 'web',
                 'instance_id': 'cvm-web',
                 'mode': {'kind': 'l3'},
                 'target': '192.168.0.9',
                 'tunnel': 'entry-tunnel-3',
+                'host_local': False,
             },
         ],
         'tunnels': [tunnel(3, 'target', 'edge', 'host', host_key, edge_public, '198.51.100.1')],
@@ -344,9 +556,17 @@ def scenario():
             {
                 'id': 'other',
                 'instance_id': 'cvm-api',
-                'mode': {'kind': 'l4', 'protocol': 'tcp', 'listen_port': 30023, 'target_port': 8022},
+                'mode': {
+                    'kind': 'l4_range',
+                    'protocol': 'tcp',
+                    'listen_start': 30023,
+                    'listen_end': 30023,
+                    'target_start': 8022,
+                    'target_end': 8022,
+                },
                 'target': '192.168.0.7',
                 'tunnel': 'entry-tunnel-4',
+                'host_local': False,
             },
         ],
         'tunnels': [tunnel(4, 'target', 'edge', 'host2', host2_key, edge_public, '198.51.101.1')],
@@ -355,6 +575,8 @@ def scenario():
     for ns, desired in (('edge', edge), ('host', host), ('host2', host2)):
         report = converge(ns, desired, roots[ns])
         assert report['error'] is None, (ns, report)
+        assert all(t['error'] is None for t in report['tunnels']), (ns, report)
+        assert all(r['configured'] for r in report['rules']), (ns, report)
     # The host side dials; give WireGuard a moment to complete its handshake.
     deadline = time.monotonic() + 20
     reply = None
@@ -371,10 +593,16 @@ def scenario():
         reply = tcp('client', '203.0.113.12', 30023, timeout=2)
     assert reply == '192.168.0.1 192.168.0.7:8022', reply
     assert tcp('client', '203.0.113.12', 30024, timeout=2) is None
+    # Simulate interruption after atomic creation but before the alias update.
+    links = json.loads(sh('ip', '-d', '-j', 'link', 'show', ns='edge').stdout)
+    owned = next(link for link in links if link.get('ifalias') == 'brocade-entry:entry-tunnel-3')
+    sh('ip', 'link', 'set', 'dev', owned['ifname'], 'alias', '', ns='edge')
     # Reports prove connected tunnels and configured items.
     report = converge('edge', edge, roots['edge'])
     assert all(t['connected'] for t in report['tunnels']), report
     assert all(r['configured'] for r in report['rules']), report
+    links = json.loads(sh('ip', '-j', 'link', 'show', ns='edge').stdout)
+    assert any(link.get('ifalias') == 'brocade-entry:entry-tunnel-3' for link in links)
     # A rule without a target keeps the port fenced instead of reaching the machine.
     stopped = json.loads(json.dumps(edge))
     stopped['generation'] = 2
@@ -385,7 +613,14 @@ def scenario():
     moved = json.loads(json.dumps(edge))
     moved['generation'] = 3
     moved['rules'][0]['tunnel'] = 'entry-tunnel-4'
-    moved['rules'][0]['mode'] = {'kind': 'l4', 'protocol': 'tcp', 'listen_port': 30022, 'target_port': 8022}
+    moved['rules'][0]['mode'] = {
+        'kind': 'l4_range',
+        'protocol': 'tcp',
+        'listen_start': 30022,
+        'listen_end': 30022,
+        'target_start': 8022,
+        'target_end': 8022,
+    }
     moved['rules'][0]['target'] = '192.168.0.8'
     host2_moved = json.loads(json.dumps(host2))
     host2_moved['generation'] = 2
@@ -396,6 +631,7 @@ def scenario():
             'mode': moved['rules'][0]['mode'],
             'target': '192.168.0.8',
             'tunnel': 'entry-tunnel-4',
+            'host_local': False,
         }
     )
     assert converge('host2', host2_moved, roots['host2'])['error'] is None
@@ -408,18 +644,27 @@ def scenario():
         {
             'id': 'local',
             'address': '203.0.114.20',
-            'mode': {'kind': 'l4', 'protocol': 'tcp', 'listen_port': 30080, 'target_port': 8022},
+            'mode': {
+                'kind': 'l4_range',
+                'protocol': 'tcp',
+                'listen_start': 30080,
+                'listen_end': 30080,
+                'target_start': 8022,
+                'target_end': 8022,
+            },
             'target': '192.168.0.8',
             'tunnel': None,
+            'host_local': False,
         }
     ]
     assert converge('host2', local, roots['host2'])['error'] is None
     assert tcp('client', '203.0.114.20', 30080) == '192.168.0.1 192.168.0.8:8022'
     assert tcp('client', '203.0.113.12', 30022) == '192.168.0.1 192.168.0.8:8022'
+    withdrawal_recovery(local, roots['host2'])
     primary_l3(moved, host, roots)
     # Withdrawal removes the table contents, tunnel devices and policy rules.
     for ns in ('edge', 'host', 'host2'):
-        empty = {'node_id': ns, 'generation': 9, 'rules': [], 'deliveries': [], 'tunnels': []}
+        empty = {'node_id': ns, 'generation': 99, 'rules': [], 'deliveries': [], 'tunnels': []}
         assert converge(ns, empty, roots[ns])['error'] is None
         links = json.loads(sh('ip', '-j', 'link', 'show', ns=ns).stdout)
         assert not any(str(l.get('ifalias', '')).startswith('brocade-entry:') for l in links), ns

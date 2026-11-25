@@ -18,6 +18,9 @@ func validateLeases(records map[string]*record) error {
 			continue
 		}
 		for _, a := range r.NICs {
+			if a.Allocated == nil {
+				return errors.New("address reservation requires a Store allocation")
+			}
 			if a.Removed {
 				continue
 			}
@@ -29,11 +32,7 @@ func validateLeases(records map[string]*record) error {
 				if err != nil {
 					return err
 				}
-				domain := "local"
-				if a.Allocated != nil {
-					domain = a.Allocated.ResourceDomain
-				}
-				key := addressKey{domain, prefix.Addr()}
+				key := addressKey{a.Allocated.ResourceDomain, prefix.Addr()}
 				if previous := used[key]; previous != "" && previous != owner+":"+a.ID {
 					return errors.New("Cube attachment address reservations conflict")
 				}

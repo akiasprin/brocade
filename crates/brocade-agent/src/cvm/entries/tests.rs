@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn legacy_private_entry_checkpoint_can_be_read_before_current_state_is_persisted() {
+    let root = std::env::temp_dir().join(format!("entry-checkpoint-compat-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let legacy = br#"{"node_id":"hk","generation":25,"rules":[{"id":"e1","address":"203.0.113.12","mode":{"kind":"l3"},"target":null,"tunnel":null}],"deliveries":[],"tunnels":[]}"#;
+    atomic_write_private(&desired_path(&root), legacy).unwrap();
+    let previous = snapshot(&root).unwrap();
+    assert_eq!(previous.generation, 25);
+    assert!(!previous.rules[0].host_local);
+    assert_eq!(std::fs::read(desired_path(&root)).unwrap(), legacy);
+
+    let next = EntryDesired {
+        generation: 26,
+        rules: Vec::new(),
+        ..previous
+    };
+    persist(&root, &next).unwrap();
+    assert_eq!(snapshot(&root).unwrap(), next);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn wireguard_listener_inventory_classifies_real_tool_failure_without_echoing_secrets() {
     let failure = run_command(
         "sh",
@@ -42,10 +63,12 @@ fn tunnel(side: EntryTunnelSide, slot: u16) -> EntryTunnel {
     }
 }
 fn l4(protocol: EntryProtocol, listen_port: u16, target_port: u16) -> EntryMode {
-    EntryMode::L4 {
+    EntryMode::L4Range {
         protocol,
-        listen_port,
-        target_port,
+        listen_start: listen_port,
+        listen_end: listen_port,
+        target_start: target_port,
+        target_end: target_port,
     }
 }
 
@@ -96,6 +119,7 @@ fn entry_machine_marks_translates_and_fences_by_entry() {
         generation: 4,
         rules: vec![
             EntryRule {
+                reserved_ports: Default::default(),
                 host_local: false,
                 id: "ssh".into(),
                 address: "203.0.113.12".parse().unwrap(),
@@ -104,6 +128,7 @@ fn entry_machine_marks_translates_and_fences_by_entry() {
                 tunnel: Some(remote.id.clone()),
             },
             EntryRule {
+                reserved_ports: Default::default(),
                 host_local: false,
                 id: "web".into(),
                 address: "203.0.113.30".parse().unwrap(),
@@ -112,6 +137,7 @@ fn entry_machine_marks_translates_and_fences_by_entry() {
                 tunnel: None,
             },
             EntryRule {
+                reserved_ports: Default::default(),
                 host_local: false,
                 id: "stopped".into(),
                 address: "203.0.113.12".parse().unwrap(),
@@ -165,6 +191,7 @@ fn container_host_accepts_only_listed_deliveries_from_its_peer() {
         generation: 2,
         rules: vec![],
         deliveries: vec![EntryDelivery {
+            reserved_ports: Default::default(),
             host_local: false,
             id: "ssh".into(),
             instance_id: "cvm-web".into(),
@@ -214,6 +241,7 @@ fn generated_rules_load_in_a_real_kernel() {
         node_id: "hk".into(),
         generation: 1,
         rules: vec![EntryRule {
+            reserved_ports: Default::default(),
             host_local: false,
             id: "ssh".into(),
             address: "203.0.113.12".parse().unwrap(),
@@ -222,6 +250,7 @@ fn generated_rules_load_in_a_real_kernel() {
             tunnel: Some(entry.id.clone()),
         }],
         deliveries: vec![EntryDelivery {
+            reserved_ports: Default::default(),
             host_local: false,
             id: "web".into(),
             instance_id: "cvm-web".into(),
@@ -282,6 +311,7 @@ fn native_host_deliveries_use_input_and_never_require_a_cube_gateway() {
         generation: 1,
         rules: vec![],
         deliveries: vec![EntryDelivery {
+            reserved_ports: Default::default(),
             host_local: true,
             id: "host-ssh".into(),
             instance_id: "cvm-host".into(),
@@ -317,6 +347,7 @@ fn host_l3_forwards_all_application_ports_but_never_captures_transport_or_host_r
         node_id: "hk".into(),
         generation: 1,
         rules: vec![EntryRule {
+            reserved_ports: Default::default(),
             host_local: false,
             id: "whole".into(),
             address: "203.0.113.12".parse().unwrap(),
@@ -366,6 +397,7 @@ fn native_entry_reply_source_is_the_delivery_address_and_never_a_transit_address
         generation: 1,
         tunnels: vec![remote.clone()],
         deliveries: vec![EntryDelivery {
+            reserved_ports: Default::default(),
             host_local: true,
             id: "native".into(),
             instance_id: "baremetal".into(),
@@ -461,6 +493,7 @@ fn tcp_entry_carriers_exempt_their_transport_before_l3_forwarding() {
             node_id: "hk".into(),
             generation: 1,
             rules: vec![EntryRule {
+                reserved_ports: Default::default(),
                 host_local: true,
                 id: "whole".into(),
                 address: "203.0.113.12".parse().unwrap(),
@@ -483,4 +516,71 @@ fn tcp_entry_carriers_exempt_their_transport_before_l3_forwarding() {
         );
         assert!(!script.contains("incoming udp dport 40000 return"));
     }
+}
+
+#[test]
+fn port_ranges_map_each_endpoint_and_fence_every_port_until_delivery_is_ready() {
+    let remote = tunnel(EntryTunnelSide::Entry, 3);
+    let mode = EntryMode::L4Range {
+        protocol: EntryProtocol::TcpUdp,
+        listen_start: 30000,
+        listen_end: 30002,
+        target_start: 40000,
+        target_end: 40002,
+    };
+    let desired = EntryDesired {
+        node_id: "hk".into(),
+        generation: 1,
+        rules: vec![EntryRule {
+            reserved_ports: Default::default(),
+            host_local: false,
+            id: "range-entry".into(),
+            address: "203.0.113.12".parse().unwrap(),
+            mode: mode.clone(),
+            target: Some("192.168.0.7".parse().unwrap()),
+            tunnel: Some(remote.id.clone()),
+        }],
+        deliveries: vec![],
+        tunnels: vec![remote.clone()],
+    };
+    let script = plan::ruleset(
+        &desired,
+        &BTreeSet::from([remote.id.as_str()]),
+        &BTreeSet::new(),
+    )
+    .unwrap();
+    for protocol in ["tcp", "udp"] {
+        for offset in 0..3 {
+            assert!(script.contains(&format!(
+                "{protocol} dport {} ct direction original dnat ip to 192.168.0.7:{}",
+                30000 + offset,
+                40000 + offset
+            )));
+        }
+    }
+    let blocked = plan::ruleset(&desired, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+    assert!(!blocked.contains("dnat ip to"));
+    for port in 30000..=30002 {
+        assert!(blocked.contains(&format!(
+            "tcp dport {port} ct direction original ct state new drop"
+        )));
+    }
+    let target = EntryDesired {
+        node_id: "jp".into(),
+        generation: 1,
+        rules: vec![],
+        deliveries: vec![EntryDelivery {
+            reserved_ports: Default::default(),
+            host_local: false,
+            id: "range-entry".into(),
+            instance_id: "cvm-web".into(),
+            mode,
+            target: "192.168.0.7".parse().unwrap(),
+            tunnel: remote.id.clone(),
+        }],
+        tunnels: vec![tunnel(EntryTunnelSide::Target, 3)],
+    };
+    let script = plan::ruleset(&target, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+    assert!(script.contains("tcp dport 40000-40002 ct direction original accept"));
+    assert!(!script.contains("tcp dport 40003"));
 }

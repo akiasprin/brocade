@@ -1,11 +1,220 @@
 use super::*;
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_stopped_configuration_freezes_reviewed_products_and_rejects_stale_inputs() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    prepare(&db).await;
+    let item = db
+        .store
+        .create_cvm(&system_admin(), create_request("stopped-review-create-01"))
+        .await
+        .unwrap();
+    publish_cvm_intent(&db).await;
+    db.store
+        .cvm_record_report("n1", evidence(&item))
+        .await
+        .unwrap();
+    supersede_cvm_fixture(&db).await;
+    let item = db
+        .store
+        .command_cvm(
+            &system_admin(),
+            &item.desired.id,
+            CvmCommand {
+                request_id: "stopped-review-stop-01".into(),
+                expected_generation: item.desired.generation,
+                change: CvmChange::Stop,
+            },
+        )
+        .await
+        .unwrap();
+    let stopped_report = |item: &CvmInstance| {
+        let mut report = evidence(item);
+        report.runtime_id = None;
+        report.interfaces.clear();
+        report.network = None;
+        report.network_absent = true;
+        report.volume_retained = true;
+        report
+    };
+    publish_cvm_intent(&db).await;
+    db.store
+        .cvm_record_report("n1", stopped_report(&item))
+        .await
+        .unwrap();
+    supersede_cvm_fixture(&db).await;
+    let request = CvmCommand {
+        request_id: "stopped-review-configure-01".into(),
+        expected_generation: item.desired.generation,
+        change: CvmChange::Configure {
+            name: "reviewed stopped configuration".into(),
+            vcpus: 2,
+            memory_bytes: 256 * 1024 * 1024,
+        },
+    };
+    let preview = db
+        .store
+        .command_cvm_reviewed(
+            &system_admin(),
+            &item.desired.id,
+            request.clone(),
+            CvmMutationReview {
+                preview: true,
+                expected_input_sha256: None,
+            },
+        )
+        .await
+        .unwrap();
+    let compiled = preview
+        .artifacts
+        .unwrap()
+        .current
+        .expect("stopped configuration must compile");
+    assert_eq!(
+        db.store
+            .cvm_instance(&system_admin(), &item.desired.id)
+            .await
+            .unwrap()
+            .desired
+            .generation,
+        item.desired.generation
+    );
+    let mut caps = catalogue();
+    caps.allocatable_vcpus += 1;
+    db.store
+        .cvm_record_inventory(
+            "n1",
+            InventoryReport {
+                capabilities: caps,
+                terminal_sessions_used: None,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    let error = db
+        .store
+        .command_cvm_reviewed(
+            &system_admin(),
+            &item.desired.id,
+            request.clone(),
+            CvmMutationReview {
+                preview: false,
+                expected_input_sha256: Some(compiled.input_sha256),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("编译输入已变化"), "{error}");
+    let preview = db
+        .store
+        .command_cvm_reviewed(
+            &system_admin(),
+            &item.desired.id,
+            request.clone(),
+            CvmMutationReview {
+                preview: true,
+                expected_input_sha256: None,
+            },
+        )
+        .await
+        .unwrap();
+    let compiled = preview.artifacts.unwrap().current.unwrap();
+    let saved = db
+        .store
+        .command_cvm_reviewed(
+            &system_admin(),
+            &item.desired.id,
+            request,
+            CvmMutationReview {
+                preview: false,
+                expected_input_sha256: Some(compiled.input_sha256.clone()),
+            },
+        )
+        .await
+        .unwrap()
+        .instance;
+    assert_eq!(saved.desired.power, PowerState::Stopped);
+    assert_eq!(
+        db.store
+            .cvm_artifacts(&system_admin(), &item.desired.id, None)
+            .await
+            .unwrap()
+            .current,
+        Some(compiled)
+    );
+    publish_cvm_intent(&db).await;
+    db.store
+        .cvm_record_report("n1", stopped_report(&saved))
+        .await
+        .unwrap();
+    supersede_cvm_fixture(&db).await;
+    let mut routes = saved.desired.spec.routing.clone();
+    routes.dns = vec!["1.1.1.1".parse().unwrap()];
+    let preview = db
+        .store
+        .set_cvm_routes_reviewed(
+            &system_admin(),
+            &item.desired.id,
+            RoutesWrite {
+                request_id: "stopped-review-routes-01".into(),
+                expected_generation: saved.desired.generation,
+                expected_revision: routes.revision,
+                routes,
+            },
+            CvmMutationReview {
+                preview: true,
+                expected_input_sha256: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(preview.artifacts.unwrap().current.is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_artifacts_require_current_compiler_before_allocating() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    prepare(&db).await;
+    let mut caps = catalogue();
+    caps.artifact_compiler = None;
+    db.store
+        .cvm_record_inventory(
+            "n1",
+            InventoryReport {
+                capabilities: caps,
+                terminal_sessions_used: None,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    let error = db
+        .store
+        .create_cvm(&system_admin(), create_request("artifact-no-compiler-01"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("升级 Agent"), "{error}");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM cvm_instances")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn cvm_artifacts_freeze_atomically_verify_inputs_and_scope_history() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
-    prepare(&db).await;
+    prepare_without_manifest(&db).await;
     let input: CvmArtifactInput = serde_json::from_str(include_str!(
         "../../../brocade-cvm-compile/tests/golden/input.json"
     ))
@@ -19,6 +228,7 @@ async fn cvm_artifacts_freeze_atomically_verify_inputs_and_scope_history() {
             "n1",
             InventoryReport {
                 capabilities: caps.clone(),
+                terminal_sessions_used: None,
                 error: None,
             },
         )
@@ -32,10 +242,7 @@ async fn cvm_artifacts_freeze_atomically_verify_inputs_and_scope_history() {
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .create_cvm(
-        &actor_user("alice"),
-        create_request("artifact-before-upload-01")
-    )
+    .create_cvm(&system_admin(), create_request("artifact-before-upload-01"))
     .await
     .is_err());
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM cvm_instances")
@@ -65,7 +272,7 @@ async fn cvm_artifacts_freeze_atomically_verify_inputs_and_scope_history() {
         &db.store
     })
     .create_cvm(
-        &actor_user("alice"),
+        &system_admin(),
         create_request("artifact-create-request-01"),
     )
     .await
@@ -82,7 +289,7 @@ async fn cvm_artifacts_freeze_atomically_verify_inputs_and_scope_history() {
         publish_cvm_intent(&db).await;
         &db.store
     })
-    .cvm_desired_page("n1", Some(0))
+    .cvm_desired_page("n1", 0)
     .await
     .unwrap();
     assert_eq!(sent.instances[0].artifacts.as_ref(), Some(&bundle));
@@ -106,6 +313,7 @@ async fn cvm_artifacts_freeze_atomically_verify_inputs_and_scope_history() {
             "n1",
             InventoryReport {
                 capabilities: caps,
+                terminal_sessions_used: None,
                 error: None,
             },
         )
@@ -124,7 +332,6 @@ async fn cvm_artifacts_freeze_atomically_verify_inputs_and_scope_history() {
     report.artifacts = Some(CvmArtifactReceipt {
         compiler: bundle.compiler.clone(),
         input_sha256: "f".repeat(64),
-        mode: CvmArtifactMode::Shadow,
         mismatches: Vec::new(),
         files: Vec::new(),
     });
@@ -147,7 +354,7 @@ async fn cvm_artifacts_freeze_atomically_verify_inputs_and_scope_history() {
         &db.store
     })
     .command_cvm(
-        &actor_user("alice"),
+        &system_admin(),
         &item.desired.id,
         CvmCommand {
             request_id: "artifact-restart-request-01".into(),
@@ -169,7 +376,7 @@ async fn cvm_artifacts_freeze_atomically_verify_inputs_and_scope_history() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn cvm_artifacts_pagination_and_cleanup_preserve_legacy_and_retention() {
+async fn cvm_artifacts_pagination_and_cleanup_preserve_retention() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -189,6 +396,7 @@ async fn cvm_artifacts_pagination_and_cleanup_preserve_legacy_and_retention() {
             "n1",
             InventoryReport {
                 capabilities: caps.clone(),
+                terminal_sessions_used: None,
                 error: None,
             },
         )
@@ -198,13 +406,6 @@ async fn cvm_artifacts_pagination_and_cleanup_preserve_legacy_and_retention() {
         .cvm_record_image_manifest("n1", input.image_manifest)
         .await
         .unwrap();
-    let mut q = quota();
-    q.max_instances = 12;
-    q.max_vcpus = 32;
-    q.max_memory_bytes = 4 * 1024 * 1024 * 1024;
-    q.max_disk_bytes = 48 * 1024 * 1024 * 1024;
-    q.max_interfaces = 12;
-    db.store.set_cvm_quota(&system_admin(), q).await.unwrap();
     let mut created = Vec::new();
     for index in 0..9 {
         created.push(
@@ -213,7 +414,7 @@ async fn cvm_artifacts_pagination_and_cleanup_preserve_legacy_and_retention() {
                 &db.store
             })
             .create_cvm(
-                &actor_user("alice"),
+                &system_admin(),
                 create_request(&format!("artifact-page-create-{index:04}")),
             )
             .await
@@ -224,7 +425,7 @@ async fn cvm_artifacts_pagination_and_cleanup_preserve_legacy_and_retention() {
         publish_cvm_intent(&db).await;
         &db.store
     })
-    .cvm_desired_page("n1", Some(0))
+    .cvm_desired_page("n1", 0)
     .await
     .unwrap();
     assert_eq!(first.instances.len(), 8);
@@ -234,21 +435,20 @@ async fn cvm_artifacts_pagination_and_cleanup_preserve_legacy_and_retention() {
         publish_cvm_intent(&db).await;
         &db.store
     })
-    .cvm_desired_page("n1", Some(8))
+    .cvm_desired_page("n1", 8)
     .await
     .unwrap();
     assert_eq!(last.instances.len(), 1);
     assert_eq!(last.next_offset, None);
     assert!(first.instances.iter().all(|d| d.id != last.instances[0].id));
-    let legacy = ({
+    let default_page = ({
         publish_cvm_intent(&db).await;
         &db.store
     })
     .cvm_desired("n1")
     .await
     .unwrap();
-    assert_eq!(legacy.instances.len(), 9);
-    assert!(legacy.page_offset.is_none() && legacy.instances.iter().all(|d| d.artifacts.is_none()));
+    assert_eq!(default_page, first);
     let item = &created[0];
     let b = db
         .store
@@ -261,7 +461,6 @@ async fn cvm_artifacts_pagination_and_cleanup_preserve_legacy_and_retention() {
     r.artifacts = Some(CvmArtifactReceipt {
         compiler: b.compiler.clone(),
         input_sha256: b.input_sha256.clone(),
-        mode: CvmArtifactMode::Shadow,
         mismatches: Vec::new(),
         files: b
             .files
@@ -274,6 +473,14 @@ async fn cvm_artifacts_pagination_and_cleanup_preserve_legacy_and_retention() {
             })
             .collect(),
     });
+    let mut inconsistent = r.clone();
+    inconsistent.artifacts.as_mut().unwrap().mismatches = vec![CvmArtifactKind::Attachments];
+    publish_cvm_intent(&db).await;
+    assert!(db
+        .store
+        .cvm_record_report("n1", inconsistent)
+        .await
+        .is_err());
     ({
         publish_cvm_intent(&db).await;
         &db.store
@@ -302,6 +509,7 @@ async fn cvm_artifacts_pagination_and_cleanup_preserve_legacy_and_retention() {
             "n1",
             InventoryReport {
                 capabilities: caps,
+                terminal_sessions_used: None,
                 error: None,
             },
         )
@@ -312,7 +520,7 @@ async fn cvm_artifacts_pagination_and_cleanup_preserve_legacy_and_retention() {
         &db.store
     })
     .command_cvm(
-        &actor_user("alice"),
+        &system_admin(),
         &item.desired.id,
         CvmCommand {
             request_id: "artifact-cleanup-stop-01".into(),
@@ -353,6 +561,7 @@ async fn cvm_compile_preview_rolls_back_and_reviewed_save_commits_identical_byte
             "n1",
             InventoryReport {
                 capabilities: caps,
+                terminal_sessions_used: None,
                 error: None,
             },
         )
@@ -365,7 +574,10 @@ async fn cvm_compile_preview_rolls_back_and_reviewed_save_commits_identical_byte
     let actor = actor_user("alice");
     let item = db
         .store
-        .create_cvm(&actor, create_request("compile-preview-create-0001"))
+        .create_cvm(
+            &system_admin(),
+            create_request("compile-preview-create-0001"),
+        )
         .await
         .unwrap();
     publish_cvm_intent(&db).await;
@@ -398,7 +610,7 @@ async fn cvm_compile_preview_rolls_back_and_reviewed_save_commits_identical_byte
     let preview = db
         .store
         .set_cvm_routes_reviewed(
-            &actor,
+            &system_admin(),
             &item.desired.id,
             request.clone(),
             CvmMutationReview {
@@ -456,7 +668,7 @@ async fn cvm_compile_preview_rolls_back_and_reviewed_save_commits_identical_byte
     assert!(db
         .store
         .set_cvm_routes_reviewed(
-            &actor,
+            &system_admin(),
             &item.desired.id,
             request.clone(),
             CvmMutationReview {
@@ -477,7 +689,7 @@ async fn cvm_compile_preview_rolls_back_and_reviewed_save_commits_identical_byte
     let saved = db
         .store
         .set_cvm_routes_reviewed(
-            &actor,
+            &system_admin(),
             &item.desired.id,
             request,
             CvmMutationReview {
@@ -513,7 +725,7 @@ async fn cvm_compile_preview_rolls_back_and_reviewed_save_commits_identical_byte
     let noop = db
         .store
         .set_cvm_routes(
-            &actor,
+            &system_admin(),
             &item.desired.id,
             RoutesWrite {
                 request_id: "compile-preview-noop-0001".into(),

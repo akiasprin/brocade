@@ -166,31 +166,31 @@ pub(crate) async fn begin(tx: &mut Transaction<'_, Postgres>, scope: Scope<'_>) 
             let payload = encode(&node, revision, &config)?;
             sqlx::query("INSERT INTO cvm_serving_nodes(node_id,revision_id,payload,entry_generation) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING")
                 .bind(&node).bind(revision).bind(payload).bind(config.entry.generation as i64).execute(&mut **tx).await?;
+            // Pre-release installations may have specifications without a release
+            // journal. Record the adopted baseline so their quota remains held.
+            for instance in &config.instances {
+                sqlx::query("INSERT INTO cvm_revision_instances(instance_id,generation,revision_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING")
+                    .bind(&instance.id).bind(instance.generation as i64).bind(revision).execute(&mut **tx).await?;
+            }
         }
         before.insert(node, config);
     }
     Ok(before)
 }
 
-/// Atomically commits changed CVM intent with the same revision counter and model snapshot used
-/// by every other configuration writer. No new release/version domain is introduced.
-pub(crate) async fn commit(
+async fn changed_configurations(
     tx: &mut Transaction<'_, Postgres>,
-    actor: &AdminContext,
-    before: Before,
-) -> Result<()> {
-    let nodes: Vec<String> = before.keys().cloned().collect();
+    before: &Before,
+) -> Result<Vec<(String, NodeConfig)>> {
     let mut changed = Vec::new();
-    for node in nodes {
-        let current = live_tx(tx, &node).await?;
-        if before.get(&node).map(serde_json::to_value).transpose()?
-            != Some(serde_json::to_value(&current)?)
-        {
-            changed.push((node, current));
+    for (node, previous) in before {
+        let current = live_tx(tx, node).await?;
+        if serde_json::to_value(previous)? != serde_json::to_value(&current)? {
+            changed.push((node.clone(), current));
         }
     }
     if changed.is_empty() {
-        return Ok(());
+        return Ok(changed);
     }
     let nodes: Vec<String> = changed.iter().map(|(node, _)| node.clone()).collect();
     let busy:Option<i64>=sqlx::query_scalar("SELECT d.id FROM deployments d JOIN deployment_targets t ON t.deployment_id=d.id JOIN deployment_target_state s ON s.deployment_id=t.deployment_id AND s.node_id=t.node_id WHERE d.kind='config' AND d.active=TRUE AND s.cvm_revision_id IS NOT NULL AND t.node_id=ANY($1) AND t.status IN ('pending','dispatched','converging','failed-recovered','failed-dirty') ORDER BY d.id LIMIT 1").bind(&nodes).fetch_optional(&mut **tx).await?;
@@ -221,6 +221,26 @@ pub(crate) async fn commit(
         }
     }
 
+    Ok(changed)
+}
+
+/// Run the same release-scope compilation and work-order fences without taking a revision ID.
+pub(super) async fn preview(tx: &mut Transaction<'_, Postgres>, before: Before) -> Result<()> {
+    changed_configurations(tx, &before).await?;
+    Ok(())
+}
+
+/// Atomically commits changed CVM intent with the same revision counter and model snapshot used
+/// by every other configuration writer. No new release/version domain is introduced.
+pub(crate) async fn commit(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    before: Before,
+) -> Result<()> {
+    let changed = changed_configurations(tx, &before).await?;
+    if changed.is_empty() {
+        return Ok(());
+    }
     let previous = crate::console::lock_control_state(tx).await?;
     let revision =
         crate::console::insert_revision(tx, actor.operator_id(), "容器与关联网络配置").await?;
@@ -251,6 +271,21 @@ pub(crate) async fn commit(
     }
     crate::console::commit_revision(tx, revision, previous, true).await?;
     Ok(())
+}
+
+pub(super) async fn frozen_revision(
+    tx: &mut Transaction<'_, Postgres>,
+    node: &str,
+    revision: i64,
+) -> Result<NodeConfig> {
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload FROM cvm_revision_nodes WHERE node_id=$1 AND revision_id=$2",
+    )
+    .bind(node)
+    .bind(revision)
+    .fetch_one(&mut **tx)
+    .await?;
+    decode(node, revision, &payload)
 }
 
 pub(crate) async fn serving_tx(
@@ -315,30 +350,45 @@ pub(crate) async fn entry_desired_tx(
 
 /// The ordinary planner and CVM compiler remain separate; the release envelope is shared.
 pub(crate) async fn augment_plan(pool: &sqlx::PgPool, plan: &mut DeploymentPlan) -> Result<()> {
+    let mut connection = pool.acquire().await?;
+    augment_plan_connection(&mut connection, plan).await
+}
+
+pub(crate) async fn augment_plan_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    plan: &mut DeploymentPlan,
+) -> Result<()> {
+    augment_plan_connection(tx, plan).await
+}
+
+async fn augment_plan_connection(
+    connection: &mut sqlx::PgConnection,
+    plan: &mut DeploymentPlan,
+) -> Result<()> {
     let future: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_revision_nodes WHERE revision_id>$1)")
             .bind(plan.revision as i64)
-            .fetch_one(pool)
+            .fetch_one(&mut *connection)
             .await?;
     if future {
         return Err(StoreError::Unsupported(
             "容器变更请使用最新全局修订；历史执行代须通过新的补偿修订发布".into(),
         ));
     }
-    let stale:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_serving_nodes s WHERE s.revision_id>$1 AND EXISTS(SELECT 1 FROM cvm_revision_nodes r WHERE r.node_id=s.node_id))").bind(plan.revision as i64).fetch_one(pool).await?;
+    let stale:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_serving_nodes s WHERE s.revision_id>$1 AND EXISTS(SELECT 1 FROM cvm_revision_nodes r WHERE r.node_id=s.node_id))").bind(plan.revision as i64).fetch_one(&mut *connection).await?;
     if stale {
         return Err(StoreError::Unsupported(
             "历史容器配置不能以旧执行代重新下发；请创建新的补偿修订后发布".into(),
         ));
     }
     let changed: Vec<(String,i64)> = sqlx::query_as("SELECT DISTINCT ON (r.node_id) r.node_id,r.revision_id FROM cvm_revision_nodes r LEFT JOIN cvm_serving_nodes s ON s.node_id=r.node_id WHERE r.revision_id<=$1 ORDER BY r.node_id,r.revision_id DESC")
-        .bind(plan.revision as i64).fetch_all(pool).await?;
+        .bind(plan.revision as i64).fetch_all(&mut *connection).await?;
     let mut dependencies = Vec::new();
     for (node, revision) in changed {
         let serving: Option<(i64, String)> =
             sqlx::query_as("SELECT revision_id,payload FROM cvm_serving_nodes WHERE node_id=$1")
                 .bind(&node)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *connection)
                 .await?;
         if serving.as_ref().is_some_and(|(r, _)| *r == revision) {
             continue;
@@ -357,7 +407,7 @@ pub(crate) async fn augment_plan(pool: &sqlx::PgPool, plan: &mut DeploymentPlan)
         )
         .bind(&node)
         .bind(revision)
-        .fetch_one(pool)
+        .fetch_one(&mut *connection)
         .await?;
         let config = decode(&node, revision, &payload)?;
         for binding in &config.nic.bindings {
@@ -381,7 +431,7 @@ pub(crate) async fn augment_plan(pool: &sqlx::PgPool, plan: &mut DeploymentPlan)
                             || prior.reinstall_epoch != next.reinstall_epoch
                             || prior.spec.resources != next.spec.resources
                             || prior.spec.image != next.spec.image
-                            || prior.spec.ssh_public_key != next.spec.ssh_public_key
+                            || prior.spec.login_revision != next.spec.login_revision
                     })
             })
         });
@@ -398,7 +448,7 @@ pub(crate) async fn augment_plan(pool: &sqlx::PgPool, plan: &mut DeploymentPlan)
     let cleanup_pairs: Vec<(String, String)> = sqlx::query_as(
         "SELECT entry_node,target_node FROM cvm_entry_tunnels WHERE withdrawn AND NOT cleaned",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
     dependencies.extend(cleanup_pairs);
     let executing_nodes: std::collections::BTreeSet<_> = plan
@@ -478,6 +528,40 @@ pub(crate) async fn activate_target(
     let Some((revision, payload)) = row else {
         return Ok(());
     };
+    activate(tx, node, revision, payload, false).await
+}
+
+/// A terminal or operationally isolated machine cannot execute a forced-retirement release.
+/// Move only its Console serving baseline; surviving active peers still use ordinary deployment
+/// activation and receipts.
+pub(crate) async fn force_activate_latest(
+    tx: &mut Transaction<'_, Postgres>,
+    node: &str,
+) -> Result<()> {
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT revision_id,payload FROM cvm_revision_nodes
+          WHERE node_id=$1 ORDER BY revision_id DESC LIMIT 1",
+    )
+    .bind(node)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((revision, payload)) = row else {
+        return Ok(());
+    };
+    let terminal: bool = sqlx::query_scalar("SELECT retired_at IS NOT NULL FROM nodes WHERE id=$1")
+        .bind(node)
+        .fetch_one(&mut **tx)
+        .await?;
+    activate(tx, node, revision, payload, terminal).await
+}
+
+async fn activate(
+    tx: &mut Transaction<'_, Postgres>,
+    node: &str,
+    revision: i64,
+    payload: String,
+    terminal: bool,
+) -> Result<()> {
     let previous: Option<(i64, String)> = sqlx::query_as(
         "SELECT revision_id,payload FROM cvm_serving_nodes WHERE node_id=$1 FOR UPDATE",
     )
@@ -489,6 +573,18 @@ pub(crate) async fn activate_target(
     }
     let mut config =
         runtime::project_for_approval(tx, node, decode(node, revision, &payload)?).await?;
+    if terminal {
+        config.instances.clear();
+        config.chain_clients.clear();
+        config.nic.bindings.clear();
+        config.nic.fences.clear();
+        config.nic.budgets.clear();
+        config.entry.rules.clear();
+        config.entry.deliveries.clear();
+        config.entry.tunnels.clear();
+        config.entry_instances.clear();
+        config.host_products.clear();
+    }
     let old = previous.map(|(r, p)| decode(node, r, &p)).transpose()?;
     let old_generation = old.as_ref().map_or(0, |c| c.nic.generation);
     if config.nic.generation > 0
@@ -507,21 +603,6 @@ pub(crate) async fn activate_target(
     sqlx::query("INSERT INTO cvm_serving_nodes(node_id,revision_id,payload) VALUES($1,$2,$3) ON CONFLICT(node_id) DO UPDATE SET revision_id=excluded.revision_id,payload=excluded.payload,entry_sha256=NULL")
         .bind(node).bind(revision).bind(payload).execute(&mut **tx).await?;
     Ok(())
-}
-
-pub(crate) async fn can_claim(
-    tx: &mut Transaction<'_, Postgres>,
-    deployment: i64,
-    node: &str,
-    protocol: u32,
-) -> Result<bool> {
-    let cvm: bool=sqlx::query_scalar("SELECT cvm_revision_id IS NOT NULL FROM deployment_target_state WHERE deployment_id=$1 AND node_id=$2").bind(deployment).bind(node).fetch_one(&mut **tx).await?;
-    let chain:bool=sqlx::query_scalar("SELECT coalesce(jsonb_array_length(desired_structure#>'{cvm,chain_clients}'),0)>0 FROM deployment_target_state WHERE deployment_id=$1 AND node_id=$2")
-        .bind(deployment).bind(node).fetch_one(&mut **tx).await?;
-    Ok(
-        (!cvm || protocol >= brocade_deployment::cvm::CVM_PROTOCOL_VERSION)
-            && (!chain || protocol >= CHAIN_EGRESS_PROTOCOL_VERSION),
-    )
 }
 
 pub(crate) async fn artifact_metadata(
@@ -574,12 +655,12 @@ pub(crate) async fn artifact_metadata(
             let prior=old.as_ref().and_then(|b|b.file(file.kind).ok());
             if prior.is_some_and(|p|p.sha256==file.sha256) {None} else {Some(serde_json::json!({"kind":file.kind,"sha256":file.sha256,"before_sha256":prior.map(|p|&p.sha256),"before_absent":previous.is_none()}))}
         }).collect::<Vec<_>>()).unwrap_or_default();
-        let owner: (String, String) =
+        let owner: (String, Option<String>) =
             sqlx::query_as("SELECT tenant_id,user_id FROM cvm_instances WHERE id=$1")
                 .bind(&instance.id)
                 .fetch_one(&mut **tx)
                 .await?;
-        items.push(serde_json::json!({"id":instance.id,"tenant_id":owner.0,"user_id":owner.1,"name":instance.spec.name,"generation":instance.generation,"previous_generation":previous_generation,"operation_id":instance.operation_id,"power":instance.power,"impact":if previous.is_none(){"create"}else if previous.is_some_and(|p|p.power!=instance.power || p.restart_epoch!=instance.restart_epoch || p.reinstall_epoch!=instance.reinstall_epoch){"power"}else if previous.is_some_and(|p|p.spec.resources!=instance.spec.resources || p.spec.image!=instance.spec.image){"stopped"}else if previous.is_some_and(|p|p.spec.ssh_public_key!=instance.spec.ssh_public_key){"boot_identity"}else{"hot"},"files":files}));
+        items.push(serde_json::json!({"id":instance.id,"tenant_id":owner.0,"user_id":owner.1,"name":instance.spec.name,"generation":instance.generation,"previous_generation":previous_generation,"operation_id":instance.operation_id,"power":instance.power,"impact":if previous.is_none(){"create"}else if previous.is_some_and(|p|p.power!=instance.power || p.restart_epoch!=instance.restart_epoch || p.reinstall_epoch!=instance.reinstall_epoch){"power"}else if previous.is_some_and(|p|p.spec.resources!=instance.spec.resources || p.spec.image!=instance.spec.image){"stopped"}else if previous.is_some_and(|p|p.spec.login_revision!=instance.spec.login_revision){"boot_identity"}else{"hot"},"files":files}));
     }
     Ok(
         serde_json::json!({"revision_id":release_revision,"source_revision_id":revision,"instances":items,"host_products":host_products,"network_bindings":config.nic.bindings.len(),"entries":config.entry.rules.len()+config.entry.deliveries.len(),"chain_clients":config.chain_clients.iter().map(|c|serde_json::json!({"instance_id":c.instance_id,"chain_id":c.chain_id,"tenant_id":c.tenant_id,"user_id":c.user_id,"ingress_node":c.ingress_node,"sha256":c.sha256,"redacted":c.redacted})).collect::<Vec<_>>()}),
@@ -772,6 +853,15 @@ pub(crate) async fn settle(tx: &mut Transaction<'_, Postgres>, node: &str) -> Re
             continue;
         }
         sqlx::query("UPDATE deployment_targets SET status=$3,error=CASE WHEN $3='failed-dirty' THEN '容器或关联网络执行失败，请查看网络日志和产物回执' ELSE error END WHERE deployment_id=$1 AND node_id=$2").bind(deployment).bind(node).bind(result).execute(&mut **tx).await?;
+        crate::deployment::settle_cvm_repair_obligation_tx(
+            tx,
+            deployment,
+            node,
+            result,
+            (result == "failed-dirty")
+                .then_some("容器或关联网络执行失败，请查看网络日志和产物回执"),
+        )
+        .await?;
         record_evidence(tx, deployment, node, result).await?;
         crate::deployment::refresh_deployment_status_after_report(
             tx,

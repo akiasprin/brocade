@@ -1890,8 +1890,10 @@ describe('纳管自动初始化', () => {
       Response.json({
         hosts: [],
         instances: [],
-        quotas: [],
-        can_manage_quotas: false,
+        usage: [],
+        tenants: [],
+        owners: [],
+        can_use: false,
         can_write: false,
         redacted: false,
       }),

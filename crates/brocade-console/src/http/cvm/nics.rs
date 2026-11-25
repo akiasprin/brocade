@@ -12,7 +12,7 @@ pub(crate) async fn catalog(
 pub(crate) async fn create_publication(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<PublicationWrite>,
+    Configuration(request): Configuration<PublicationWrite>,
 ) -> ApiResult<Response> {
     let actor = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
     Ok(private((
@@ -29,7 +29,7 @@ pub(crate) async fn update_publication(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<PublicationWrite>,
+    Configuration(request): Configuration<PublicationWrite>,
 ) -> ApiResult<Response> {
     let actor = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
     Ok(private(Json(
@@ -67,6 +67,17 @@ pub(crate) async fn delete_publication(
             .await?,
     )))
 }
+pub(crate) async fn route_match(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Configuration(request): Configuration<brocade_store::cvm::CvmRouteMatchRequest>,
+) -> ApiResult<Response> {
+    let actor = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    Ok(private(Json(
+        state.store.match_cvm_route(&actor, &id, request).await?,
+    )))
+}
 pub(crate) async fn instance_network(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -97,7 +108,7 @@ pub(crate) async fn routes(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<RoutesWrite>,
+    Configuration(request): Configuration<RoutesWrite>,
 ) -> ApiResult<Response> {
     let actor = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     Ok(private((
@@ -111,6 +122,34 @@ pub(crate) async fn routes(
         ),
     )))
 }
+#[derive(Deserialize)]
+pub(crate) struct NetworkEditQuery {
+    #[serde(default)]
+    preview: bool,
+}
+
+pub(crate) async fn network_edit(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<NetworkEditQuery>,
+    headers: HeaderMap,
+    Configuration(request): Configuration<brocade_store::cvm::CvmNetworkEditRequest>,
+) -> ApiResult<Response> {
+    let actor = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    let mut review = mutation_review(&headers)?;
+    review.preview = query.preview;
+    let result = state
+        .store
+        .edit_cvm_network(&actor, &id, request, review)
+        .await?;
+    let status = if query.preview {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok(private((status, Json(result))))
+}
+
 pub(crate) async fn transport(
     State(state): State<AppState>,
     Path((id, nic)): Path<(String, String)>,
@@ -127,15 +166,6 @@ pub(crate) async fn transport(
                 .await?,
         ),
     )))
-}
-async fn participant(state: &AppState, headers: &HeaderMap) -> ApiResult<AuthenticatedNode> {
-    let node = agent_node(state, headers).await?;
-    if agent_protocol_version(headers).is_none_or(|v| v < NIC_PROTOCOL_VERSION) {
-        return Err(ApiError::Store(StoreError::Unsupported(
-            "远端网卡需要匹配的新 Agent 协议".into(),
-        )));
-    }
-    Ok(node)
 }
 pub(crate) async fn version(
     State(state): State<AppState>,
@@ -159,7 +189,7 @@ pub(crate) async fn inventory(
     headers: HeaderMap,
     Json(request): Json<NicNodeCapabilities>,
 ) -> ApiResult<Response> {
-    let node = participant(&state, &headers).await?;
+    let node = agent_node(&state, &headers).await?;
     state
         .store
         .cvm_record_nic_capabilities(&node.node_id, request)
@@ -170,7 +200,7 @@ pub(crate) async fn desired(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let node = participant(&state, &headers).await?;
+    let node = agent_node(&state, &headers).await?;
     Ok(private(Json(
         state.store.cvm_nic_desired(&node.node_id).await?,
     )))
@@ -180,7 +210,7 @@ pub(crate) async fn report(
     headers: HeaderMap,
     Json(request): Json<NicNodeReport>,
 ) -> ApiResult<Response> {
-    let node = participant(&state, &headers).await?;
+    let node = agent_node(&state, &headers).await?;
     Ok(private(Json(
         json!({"accepted":state.store.cvm_record_nic_report(&node.node_id,request).await?}),
     )))

@@ -5,7 +5,6 @@ use serde_json::{json, Value};
 
 const CONTRACT: &str = "cubevs-attachments-v2";
 const RESULT_KEY: &str = "cube.network.attachments.result";
-pub(crate) const RESTART_REQUIRED: &str = "native Cube shim restart required";
 
 impl Inner {
     pub(crate) fn network_rpc(
@@ -51,14 +50,16 @@ impl Inner {
     pub(crate) fn native_capabilities(&self) -> Result<Capabilities> {
         let catalogue = self.network_rpc("inventory", "", None)?;
         let max = crate::number(&catalogue, "max_interfaces");
-        let sources = catalogue["sources"]
-            .as_object()
-            .ok_or("Cube network sources unavailable")?;
-        if !(1..=3).contains(&max) || sources.len() > MAX_CATALOG_ITEMS {
+        if !(1..=3).contains(&max) {
             return Err("unsupported Cube network catalogue".into());
         }
+        let flag = |key: &str| {
+            catalogue[key]
+                .as_bool()
+                .ok_or_else(|| format!("Cube network capability missing: {key}"))
+        };
         let mut caps = self.cfg.configured_capabilities();
-        if catalogue["network_quota"] == true {
+        if flag("network_quota")? {
             let quota = self.network_rpc("quota_inventory", "", Some(json!({})))?;
             caps.network_quota = Some(
                 serde_json::from_value(quota["capacity"].clone())
@@ -69,33 +70,11 @@ impl Inner {
             caps.network_quota.is_some(),
             std::sync::atomic::Ordering::Release,
         );
-        caps.managed_networks = catalogue["managed_nics"] == true;
-        caps.primary_ip_delivery = catalogue["primary_ip_delivery"] == true;
-        caps.route_services = catalogue["route_services"] == true;
-        caps.chain_egress = catalogue["chain_egress"] == true;
+        caps.managed_networks = flag("managed_nics")?;
+        caps.primary_ip_delivery = flag("primary_ip_delivery")?;
+        caps.route_services = flag("route_services")?;
+        caps.chain_egress = flag("chain_egress")?;
         caps.max_interfaces = caps.max_interfaces.min(max as u16);
-        let labels = caps.network_sources.clone();
-        caps.network_sources
-            .retain(|s| s.kind == NetworkKind::Public);
-        let mut ids = sources.keys().collect::<Vec<_>>();
-        ids.sort();
-        for id in ids {
-            if !valid_id(id) {
-                return Err("invalid Cube network source identity".into());
-            }
-            let label = labels.iter().find(|s| &s.id == id);
-            caps.network_sources.push(NetworkSource {
-                id: id.clone(),
-                name: label.map_or_else(|| id.clone(), |s| s.name.clone()),
-                kind: NetworkKind::Internal,
-                description: label.map_or_else(
-                    || "机器管理员配置的自有网络".into(),
-                    |s| s.description.clone(),
-                ),
-                max_attachments: Some(1),
-                supports_ipv6: Some(!crate::text(&sources[id], "ipv6_pool").is_empty()),
-            });
-        }
         Ok(caps)
     }
 
@@ -114,8 +93,7 @@ impl Inner {
             .cfg
             .capabilities
             .network_sources
-            .iter()
-            .find(|s| s.kind == NetworkKind::Public)
+            .first()
             .ok_or("Cube primary source missing")?;
         let mut contact = None;
         let mut ids = std::collections::BTreeSet::new();
@@ -146,7 +124,7 @@ impl Inner {
         record: &Record,
         desired: &InstanceDesired,
     ) -> Result<Value> {
-        if let Some(value) = self.artifact_value(
+        self.artifact_value(
             desired,
             CvmArtifactKind::Attachments,
             &brocade_cvm_compile::LocalBindings {
@@ -157,18 +135,7 @@ impl Inner {
                 }),
                 ..Default::default()
             },
-        )? {
-            return Ok(value);
-        }
-        let value = json!({"contract":CONTRACT,"instance_id":record.instance,
-            "runtime_id":if record.runtime.is_empty(){&record.instance}else{&record.runtime},
-            "generation":desired.generation,"interfaces":desired.spec.interfaces,"routing":desired.spec.routing,"detach":desired.detached_interfaces,"release":false,"forget":false});
-        let mut value = value;
-        let bindings = brocade_cvm_compile::chain_bindings(&desired.id, &desired.spec.routing);
-        if !bindings.is_empty() {
-            value["chain_egress"] = json!(bindings);
-        }
-        Ok(value)
+        )
     }
 
     pub(crate) fn prepare_nics(
@@ -176,13 +143,22 @@ impl Inner {
         record: &mut Record,
         desired: &InstanceDesired,
     ) -> Result<()> {
-        let request = self.network_desired(record, desired)?;
+        let request = if desired.power == PowerState::Running {
+            self.network_desired(record, desired)?
+        } else {
+            // Stopped instances retain prospective leases without consuming a creation product.
+            self.cleanup_network_desired(record, desired)
+        };
         let evidence = self.network_rpc(
             "prepare",
             crate::text(&request, "runtime_id"),
             Some(request.clone()),
         )?;
-        record.native_shim_version = crate::text(&evidence, "shim_version").into();
+        let shim = crate::text(&evidence, "shim_version");
+        if !valid_id(shim) {
+            return Err("Cube preparation lacks a pinned shim version".into());
+        }
+        record.native_shim_version = shim.into();
         Ok(())
     }
 
@@ -193,17 +169,14 @@ impl Inner {
     ) -> Result<(Vec<InterfaceObservation>, NetworkObservation, Vec<String>)> {
         // Fence new chain-selected flows before relaxing the original NAT policy.
         // On removal the guard RPC still installs the remaining NIC selectors first.
-        if self.native_capabilities()?.chain_egress {
-            let request = self.network_desired(record, desired)?;
-            self.network_rpc(
-                "guard_routes",
-                crate::text(&request, "runtime_id"),
-                Some(request.clone()),
-            )?;
-        }
-        let primary_policy = self
-            .artifact_value(desired, CvmArtifactKind::Egress, &Default::default())?
-            .unwrap_or_else(|| crate::config::primary_network_policy(&desired.spec.routing));
+        let request = self.network_desired(record, desired)?;
+        self.network_rpc(
+            "guard_routes",
+            crate::text(&request, "runtime_id"),
+            Some(request.clone()),
+        )?;
+        let primary_policy =
+            self.artifact_value(desired, CvmArtifactKind::Egress, &Default::default())?;
         let policy = self.cube(
             "Update",
             json!({
@@ -236,8 +209,20 @@ impl Inner {
         Ok((interfaces, network, detached))
     }
 
+    fn cleanup_network_desired(&self, record: &Record, desired: &InstanceDesired) -> Value {
+        let mut request = json!({"contract":CONTRACT,"instance_id":record.instance,
+            "runtime_id":if record.runtime.is_empty(){&record.instance}else{&record.runtime},
+            "generation":desired.generation,"interfaces":desired.spec.interfaces,"routing":desired.spec.routing,
+            "detach":desired.detached_interfaces});
+        let bindings = brocade_cvm_compile::chain_bindings(&desired.id, &desired.spec.routing);
+        if !bindings.is_empty() {
+            request["chain_egress"] = json!(bindings);
+        }
+        request
+    }
+
     pub(crate) fn remove_nics(&self, record: &mut Record, desired: &InstanceDesired) -> Result<()> {
-        let mut request = self.network_desired(record, desired)?;
+        let mut request = self.cleanup_network_desired(record, desired);
         request["release"] = json!(true);
         request["forget"] = json!(desired.power == PowerState::Deleted);
         let evidence = self.network_rpc(
@@ -279,11 +264,6 @@ fn evidence(response: &Value) -> Result<Value> {
 
 fn network_result(action: &str, response: &Value) -> Result<Value> {
     if crate::successful(response).is_err() {
-        // Failure responses normally have no evidence. Only a validated upgrade
-        // receipt may request a restart; never parse an empty failure as evidence.
-        if evidence(response).is_ok_and(|result| result["restart_required"] == true) {
-            return Err(RESTART_REQUIRED.into());
-        }
         let reason = match crate::text(&response["ret"], "ret_msg") {
             "Cube network reconciliation is busy; retry the same desired version"
             | "Cube network reconciliation is busy"
@@ -344,26 +324,5 @@ mod tests {
             payload
         );
         assert!(network_result("reconcile", &response(200, br#"{"contract":"other"}"#)).is_err());
-    }
-
-    #[test]
-    fn restart_requires_a_matching_failure_receipt() {
-        let payload = json!({"contract":CONTRACT,"restart_required":true});
-        assert_eq!(
-            network_result(
-                "reconcile",
-                &response(130568, &serde_json::to_vec(&payload).unwrap())
-            )
-            .unwrap_err(),
-            RESTART_REQUIRED
-        );
-        assert_ne!(
-            network_result(
-                "reconcile",
-                &response(130568, br#"{"contract":"other","restart_required":true}"#)
-            )
-            .unwrap_err(),
-            RESTART_REQUIRED
-        );
     }
 }

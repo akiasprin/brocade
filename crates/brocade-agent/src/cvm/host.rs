@@ -65,6 +65,28 @@ struct Record {
     deleted: bool,
 }
 
+pub(super) fn chain_configured(root: &Path) -> Result<bool> {
+    if !root.try_exists().map_err(|_| "无法读取裸机恢复状态")? {
+        return Ok(false);
+    }
+    let mut configured = false;
+    for (index, item) in std::fs::read_dir(root)
+        .map_err(|_| "无法读取裸机恢复状态")?
+        .enumerate()
+    {
+        if index >= 8192 {
+            return Err("裸机恢复记录数量超出上限".into());
+        }
+        let path = item.map_err(|_| "无法读取裸机恢复记录")?.path();
+        if path.extension().is_some_and(|value| value == "json") {
+            let record: Record = serde_json::from_slice(&read(&path, 256 * 1024)?)
+                .map_err(|_| "裸机恢复记录损坏，不能替换 Agent")?;
+            configured |= !record.deleted && !record.desired.spec.routing.chain_ids().is_empty();
+        }
+    }
+    Ok(configured)
+}
+
 #[derive(Clone)]
 pub(super) struct Backend(Arc<Inner>);
 pub(super) struct Inner {
@@ -215,9 +237,6 @@ impl Backend {
         }
         Ok(())
     }
-    pub(super) fn inspect(config: &Path) -> Result<Capabilities> {
-        inventory(&load_config(config)?)
-    }
     pub(super) fn open(config: &Path, root: &Path) -> Result<Self> {
         if !config.is_absolute() || !root.is_absolute() {
             return Err("native config and state paths must be absolute".into());
@@ -303,8 +322,39 @@ impl Backend {
             }
         }
     }
-    pub(super) fn inventory(&self) -> Result<Capabilities> {
-        inventory(&self.0.config)
+    pub(super) fn system_inventory(&self) -> Result<HostSystemInventory> {
+        system_inventory_from_config(&self.0.config)
+    }
+    pub(super) fn augment_capabilities(&self, capabilities: &mut Capabilities) -> Result<()> {
+        network::capabilities(capabilities)?;
+        if !capabilities
+            .network_sources
+            .iter()
+            .any(|source| source.id == "host")
+        {
+            capabilities.network_sources.push(NetworkSource {
+                id: "host".into(),
+                name: "宿主管理网卡".into(),
+                kind: NetworkKind::Public,
+                description: "原有网络与管理联络".into(),
+                max_attachments: Some(1),
+                supports_ipv6: Some(true),
+            });
+        }
+        let terminal =
+            Path::new(cube_terminal::ROOT).join(format!("host-ready-{}.sock", boot_id()?));
+        let terminal_ready = std::os::unix::net::UnixStream::connect(&terminal).is_ok();
+        capabilities.guest_terminal |= terminal_ready;
+        capabilities.guest_terminal_persistent |= terminal_ready;
+        Ok(())
+    }
+    pub(super) fn owns(&self, instance: &str) -> Result<bool> {
+        Ok(self
+            .0
+            .records
+            .lock()
+            .map_err(|_| "native state unavailable")?
+            .contains_key(instance))
     }
     pub(super) fn submit(&self, desired: &InstanceDesired) -> Result<InstanceReport> {
         let expected = desired
@@ -321,7 +371,7 @@ impl Backend {
                         .map_err(|_| "invalid native specification")?,
                 )
             || desired.spec.image.is_some()
-            || !desired.spec.ssh_public_key.is_empty()
+            || desired.spec.login_revision != 0
             || desired.delete_data
             || desired.restart_epoch != 0
             || desired.reinstall_epoch != 0
@@ -363,10 +413,17 @@ impl Backend {
             identity: expected.clone(),
             boot_id: boot_id()?,
         });
-        if let Err(error) = result {
-            report.status = ApplyStatus::Failed;
-            report.error = Some(error.chars().take(120).collect());
-            return Ok(report);
+        match result {
+            Ok(network::Convergence::Applied) => {}
+            Ok(network::Convergence::WaitingForTransport) => {
+                report.status = ApplyStatus::Pending;
+                return Ok(report);
+            }
+            Err(error) => {
+                report.status = ApplyStatus::Failed;
+                report.error = Some(error.chars().take(120).collect());
+                return Ok(report);
+            }
         }
         if desired.power == PowerState::Deleted {
             self.0.runtime.block_on(brocade_cube::revoke_terminal(
@@ -388,7 +445,8 @@ impl Backend {
             report.interfaces = network::interfaces(&self.0.config, desired)?;
             report.access_address = network::delivery(&self.0.root, desired)?;
             report.network = Some(NetworkObservation {
-                chain_egress_configured: false,
+                chain_egress_configured: !desired.spec.routing.chain_ids().is_empty()
+                    && super::chain_egress::ready(&desired.id, &desired.spec.routing),
                 routing_revision: desired.spec.routing.revision,
                 contact_route_preserved: true,
                 business_fallback_blocked: true,
@@ -524,63 +582,48 @@ impl brocade_cube::TerminalTarget for Inner {
         Ok(())
     }
 }
-fn inventory(config: &Config) -> Result<Capabilities> {
-    let identity = identity()?;
-    let interface = primary(config, "host")?;
-    let ipv4_delivery = interface.addresses.iter().any(|a| {
-        a.split('/')
-            .next()
-            .is_some_and(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
-    });
-    let sample = metrics(&[interface])?;
-    // os-release is normally a symlink into /usr/lib on Linux. Private mutable
-    // state remains O_NOFOLLOW; this public OS identity follows its system alias.
+pub(super) fn system_inventory(path: &Path) -> Result<HostSystemInventory> {
+    let config = load_config(path)?;
+    system_inventory_from_config(&config)
+}
+
+fn system_inventory_from_config(config: &Config) -> Result<HostSystemInventory> {
+    primary(config, "host")?;
+    let sample = metrics(&[primary(config, "host")?])?;
+    let inventory = HostSystemInventory {
+        os: os_name()?,
+        primary_device: config.primary_device.clone(),
+        identity: Some(identity()?),
+        terminal_user: Some(config.terminal_user.clone()),
+        resources: Some(Resources {
+            vcpus: std::thread::available_parallelism()
+                .map_err(|_| "CPU capacity unavailable")?
+                .get()
+                .try_into()
+                .map_err(|_| "CPU capacity exceeds limit")?,
+            memory_bytes: sample.memory_total_bytes,
+            root_disk_bytes: sample.root_total_bytes,
+        }),
+        terminal_ready: std::os::unix::net::UnixStream::connect(
+            Path::new(cube_terminal::ROOT).join(format!("host-ready-{}.sock", boot_id()?)),
+        )
+        .is_ok(),
+    };
+    inventory.validate()?;
+    Ok(inventory)
+}
+
+fn os_name() -> Result<String> {
     let release_path =
         std::fs::canonicalize("/etc/os-release").map_err(|_| "OS identity is unavailable")?;
     let release =
         String::from_utf8(read(&release_path, 8192)?).map_err(|_| "invalid OS identity")?;
-    let os = release
+    Ok(release
         .lines()
-        .find_map(|l| l.strip_prefix("PRETTY_NAME="))
+        .find_map(|line| line.strip_prefix("PRETTY_NAME="))
         .unwrap_or("Linux")
         .trim_matches('"')
-        .to_owned();
-    let terminal = Path::new(cube_terminal::ROOT).join(format!("host-ready-{}.sock", boot_id()?));
-    let terminal_ready = std::os::unix::net::UnixStream::connect(&terminal).is_ok();
-    let mut caps = Capabilities {
-        artifact_compiler: None,
-        cube_storage_backend: None,
-        baremetal: Some(HostInventory {
-            identity,
-            os,
-            terminal_user: config.terminal_user.clone(),
-            primary_device: config.primary_device.clone(),
-        }),
-        backend: "baremetal-v1".into(),
-        max_interfaces: MAX_INTERFACES as u16,
-        allocatable_vcpus: std::thread::available_parallelism()
-            .map_err(|_| "CPU capacity unavailable")?
-            .get()
-            .try_into()
-            .map_err(|_| "CPU capacity exceeds limit")?,
-        allocatable_memory_bytes: sample.memory_total_bytes,
-        allocatable_disk_bytes: sample.root_total_bytes,
-        guest_terminal: terminal_ready,
-        guest_terminal_persistent: terminal_ready,
-        network_sources: vec![NetworkSource {
-            id: "host".into(),
-            name: "宿主管理网卡".into(),
-            kind: NetworkKind::Public,
-            description: "原有网络与管理联络".into(),
-            max_attachments: Some(1),
-            supports_ipv6: Some(true),
-        }],
-        ..Capabilities::default()
-    };
-    network::capabilities(&mut caps)?;
-    caps.primary_ip_delivery = ipv4_delivery;
-    caps.validate()?;
-    Ok(caps)
+        .to_owned())
 }
 
 fn now_millis() -> Result<u64> {
@@ -600,10 +643,10 @@ fn runtime_id(instance: &str, boot: &str) -> String {
 }
 
 pub(crate) fn tracking_addresses() -> Result<std::collections::BTreeSet<std::net::IpAddr>> {
-    if !super::backend::native()? {
+    let Some(path) = super::backend::host_config_path()? else {
         return Ok(std::collections::BTreeSet::new());
-    }
-    let config = load_config(&super::backend::config_path()?)?;
+    };
+    let config = load_config(&path)?;
     primary(&config, "host")?;
     let rows: Vec<serde_json::Value> =
         serde_json::from_str(&command("ip", &["-j", "address", "show"])?)

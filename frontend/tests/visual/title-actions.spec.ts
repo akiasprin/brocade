@@ -92,8 +92,8 @@ for (const engine of ['chromium', 'webkit'] as const)
             }
             if (scene.name === 'containers') {
               await expect(header.getByRole('button', { name: '容器 更多操作', exact: true })).toHaveCount(0);
-              await header.getByRole('tab', { name: '额度', exact: true }).click();
-              await expect(page.getByRole('region', { name: '用户额度清单' })).toBeVisible();
+              await header.getByRole('tab', { name: '网络', exact: true }).click();
+              await expect(page.getByRole('region', { name: '出口网络', exact: true })).toBeVisible();
             }
             if (scene.name === 'user') {
               await header.getByRole('button', { name: '更多操作', exact: true }).click();

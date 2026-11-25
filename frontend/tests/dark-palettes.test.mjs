@@ -238,7 +238,19 @@ test('dark theme colors keep tab, link and filled-control text at WCAG AA', () =
   }
 });
 
-test('primary buttons and the selected navigation item read the primary token set', () => {
+const blend = (fg, alpha, bg) => {
+  const f = channels(fg);
+  const b = channels(bg);
+  return `#${f
+    .map((c, i) =>
+      Math.round((c * alpha + b[i] * (1 - alpha)) * 255)
+        .toString(16)
+        .padStart(2, '0'),
+    )
+    .join('')}`;
+};
+
+test('primary buttons keep the primary token set while selected navigation uses the tinted capsule tokens', () => {
   assert.match(
     styles,
     /^\.btn\.primary \{[^}]*border-color: var\(--primary-line\);[^}]*background: var\(--primary\);[^}]*color: var\(--primary-on\);/m,
@@ -247,9 +259,30 @@ test('primary buttons and the selected navigation item read the primary token se
   assert.match(styles, /^\.btn\.primary:active:not\(:disabled\) \{\s*background: var\(--primary-active\);/m);
   assert.match(
     styles,
-    /^\.fg-nv\[aria-current='true'\] \{[^}]*background: var\(--primary\);[^}]*color: var\(--primary-on\);[^}]*box-shadow: inset 0 0 0 1px var\(--primary-line\);/m,
+    /^\.fg-nv\[aria-current='true'\] \{[^}]*background: var\(--nav-active-bg\);[^}]*color: var\(--nav-active-ink\);[^}]*box-shadow: inset 0 0 0 1px var\(--nav-active-line\);/m,
   );
-  assert.match(styles, /^\.fg-nv\[aria-current='true'\] \.mark \{\s*background: var\(--primary-on\);/m);
+  assert.match(styles, /^\.fg-nv\[aria-current='true'\] \.mark \{\s*background: var\(--nav-active-ink\);/m);
+  assert.match(
+    styles,
+    /^\.fg-nv-group\.is-open \{[^}]*background: var\(--nav-active-bg\);[^}]*box-shadow: inset 0 0 0 1px var\(--nav-active-line\);/m,
+  );
+  for (const key of PALETTES) {
+    const lt = light[key];
+    const dt = dark[key];
+    const lightPill = blend(lt.get('--action'), 0.1, lt.get('--surface'));
+    const lightHoverPill = blend(lt.get('--action'), 0.15, lt.get('--surface'));
+    const darkPill = blend(dt.get('--action'), 0.15, dt.get('--surface'));
+    const darkHoverPill = blend(dt.get('--action'), 0.22, dt.get('--surface'));
+    const darkSubPill = blend(dt.get('--action'), 0.2, darkPill);
+    assert.ok(contrast(lt.get('--action-hover'), lightPill) >= 4.5, `light ${key} active nav text`);
+    assert.ok(contrast(lt.get('--action-hover'), lightHoverPill) >= 4.5, `light ${key} active nav hover text`);
+    assert.ok(contrast(lt.get('--ink-2'), lightPill) >= 4.5, `light ${key} open group idle sub-tab`);
+    assert.ok(contrast(lt.get('--action-hover'), lt.get('--sheet')) >= 4.5, `light ${key} open group active sub-tab`);
+    assert.ok(contrast(dt.get('--action-hover'), darkPill) >= 4.5, `dark ${key} active nav text`);
+    assert.ok(contrast(dt.get('--action-hover'), darkHoverPill) >= 4.5, `dark ${key} active nav hover text`);
+    assert.ok(contrast(dt.get('--ink-2'), darkPill) >= 4.5, `dark ${key} open group idle sub-tab`);
+    assert.ok(contrast(dt.get('--action-hover'), darkSubPill) >= 4.5, `dark ${key} open group active sub-tab`);
+  }
 });
 
 test('dark primary buttons use deeper fills with readable labels', () => {
@@ -299,7 +332,7 @@ test('light interface edges stay independent of and softer than the background g
 });
 
 test('dark grid lines follow muted palette hues at a consistent low lightness', () => {
-  const previousLightLines = ['#dedce4', '#d9dde6', '#dcded6', '#e2dce0', '#dbdcda'];
+  const previousLightLines = ['#e5e3ee', '#e5e7ec', '#e3e7df', '#e9e1e5', '#e3e4e7'];
   assert.equal(new Set(PALETTES.map(key => dark[key].get('--grid-line'))).size, PALETTES.length);
   for (const [index, key] of PALETTES.entries()) {
     const color = oklch(dark[key].get('--grid-line'));

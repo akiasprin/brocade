@@ -323,17 +323,31 @@ pub(crate) async fn abandon_tx(tx: &mut Transaction<'_, Postgres>, node_id: &str
                 phase = 'abandoned', deployment_id = NULL,
                 completed_at = now(),
                 last_error = 'remote teardown was not confirmed', updated_at = now()
-          WHERE node_id = $1 AND phase = 'retiring'
+          WHERE node_id = $1 AND phase IN ('retiring','retired')
         RETURNING lifecycle_epoch",
     )
     .bind(node_id)
     .fetch_optional(&mut **tx)
-    .await?
-    .ok_or_else(|| {
-        StoreError::Unsupported(format!(
-            "node {node_id} can only be force-retired while it is retiring"
-        ))
-    })?;
+    .await?;
+    let lifecycle_epoch = match lifecycle_epoch {
+        Some(epoch) => epoch,
+        None => {
+            let current: Option<(i64, String)> = sqlx::query_as(
+                "SELECT lifecycle_epoch,phase FROM node_lifecycle_state WHERE node_id=$1",
+            )
+            .bind(node_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            match current {
+                Some((epoch, phase)) if phase == "abandoned" => epoch,
+                _ => {
+                    return Err(StoreError::Unsupported(format!(
+                        "node {node_id} must be retired before forced retirement can finish"
+                    )))
+                }
+            }
+        }
+    };
     sqlx::query(
         "UPDATE node_agent_state
             SET token_revoked_at = COALESCE(token_revoked_at, now())

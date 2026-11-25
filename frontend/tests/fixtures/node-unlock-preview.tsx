@@ -286,6 +286,18 @@ if (params.has('connection-evidence') && job) {
       ...(mixed ? [connection('premium', 4, 'exit-taiwan', 'www.youtube.com', false)] : []),
     ];
     youtube.connection_requests = { webpage: 1, premium: mixed ? 2 : 1, cdn: 1 };
+    for (const part of youtube.dns_parts ?? []) {
+      part.connection_evidence = Object.fromEntries(
+        youtube.connection_observations
+          .filter(record => record.part === part.part)
+          .map(record => [record.id, 'verified']),
+      );
+    }
+    if (params.has('connection-identity')) {
+      const part = youtube.dns_parts!.find(part => part.part === 'premium')!;
+      part.connection_evidence![youtube.connection_observations[1].id] = 'dns_incomplete';
+      part.connection_evidence![youtube.connection_observations.at(-1)!.id] = 'profile_mismatch';
+    }
   }
 }
 if (params.has('dns-unclassified') && v6) {

@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -62,6 +63,43 @@ class Lab:
 
     def python(self, role, code, data=None, timeout=180):
         return self.remote(role, 'sudo python3 -c ' + shlex.quote(code), data=data, timeout=timeout).stdout
+
+    def persist_routes(self, role, routes):
+        """Keep owned probe/entry reply routes across the lab's clock and DHCP changes."""
+        if role not in self.state['roles']:
+            raise ValueError('unknown owned lab role')
+        peers = {ipaddress.ip_address(value[key]) for value in self.state['roles'].values() for key in ('ipv4', 'ipv6')}
+        configured = dict(self.state.get('static_routes', {}).get(role, {}))
+        for destination, gateway in routes:
+            network, peer = ipaddress.ip_network(destination), ipaddress.ip_address(gateway)
+            if (
+                not network.prefixlen
+                or peer not in peers
+                or str(peer) in (self.state['roles'][role]['ipv4'], self.state['roles'][role]['ipv6'])
+                or network.version != peer.version
+            ):
+                raise ValueError('owned lab routes require an explicit prefix and same-family lab peer')
+            configured[str(network)] = str(peer)
+        entries = [{'to': destination, 'via': gateway} for destination, gateway in sorted(configured.items())]
+        configuration = {'network': {'version': 2, 'ethernets': {'lan': {'routes': entries}}}}
+        self.python(
+            role,
+            "import os,sys;from pathlib import Path;p=Path('/etc/netplan/90-brocade-acceptance-routes.yaml');"
+            'p.write_bytes(sys.stdin.buffer.read());os.chmod(p,0o600)',
+            json.dumps(configuration).encode(),
+        )
+        self.remote(role, 'sudo netplan generate && sudo networkctl reload && sudo networkctl reconfigure lab0')
+        for destination, gateway in configured.items():
+            family = '-4' if ipaddress.ip_network(destination).version == 4 else '-6'
+            values = json.loads(
+                self.remote(role, shlex.join(['ip', family, '-j', 'route', 'show', destination])).stdout
+            )
+            if not any(
+                r.get('gateway') == gateway and r.get('dev') == 'lab0' and r.get('protocol') == 'static' for r in values
+            ):
+                raise RuntimeError('owned lab route did not become a persistent static route')
+        self.state.setdefault('static_routes', {})[role] = configured
+        self.save()
 
     def upload(self, role, source, target, mode=0o700):
         code = (

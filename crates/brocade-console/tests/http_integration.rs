@@ -11463,6 +11463,21 @@ mod realtime_compression;
 mod agent_channel;
 
 #[cfg(feature = "cvm")]
+fn cvm_compiler_fixture(
+    caps: &mut brocade_deployment::cvm::Capabilities,
+) -> brocade_deployment::cvm::CvmImageManifest {
+    use brocade_deployment::cvm::*;
+    let input: CvmArtifactInput = serde_json::from_str(include_str!(
+        "../../brocade-cvm-compile/tests/golden/input.json"
+    ))
+    .unwrap();
+    caps.artifact_compiler = Some(CVM_ARTIFACT_COMPILER.into());
+    caps.cube_storage_backend = input.capabilities.cube_storage_backend;
+    caps.images = vec![input.spec.image.unwrap()];
+    input.image_manifest
+}
+
+#[cfg(feature = "cvm")]
 async fn publish_cvm_intent(db: &TestPg) {
     use brocade_deployment::plan::{
         AppliedArtifactState, AppliedGrantsState, DeploymentKind, DesiredArtifact, DesiredGrants,
@@ -11609,14 +11624,17 @@ async fn publish_cvm_intent(db: &TestPg) {
 #[cfg(feature = "cvm")]
 async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
     use brocade_deployment::cvm::{Capabilities, InventoryReport};
-    use brocade_store::cvm::CvmQuota;
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
     db.store.migrate().await.unwrap();
     insert_usage_model(db.pool()).await;
     let token = admin_token(&db).await;
-    let actor = AdminContext::system_admin("test-admin");
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    sqlx::query("INSERT INTO node_agent_state(node_id,agent_protocol_version) VALUES('n1',77) ON CONFLICT(node_id) DO UPDATE SET agent_protocol_version=77").execute(db.pool()).await.unwrap();
     let mut caps_value = serde_json::to_value(Capabilities::default()).unwrap();
     let fields = json!({
         "backend":"http-contract-test","create":true,"delete":true,"managed_networks":true,"max_interfaces":1,
@@ -11629,33 +11647,21 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
         .as_object_mut()
         .unwrap()
         .extend(fields.as_object().unwrap().clone());
-    let caps: Capabilities = serde_json::from_value(caps_value).unwrap();
+    let mut caps: Capabilities = serde_json::from_value(caps_value).unwrap();
+    let manifest = cvm_compiler_fixture(&mut caps);
     db.store
         .cvm_record_inventory(
             "n1",
             InventoryReport {
                 capabilities: caps,
+                terminal_sessions_used: None,
                 error: None,
             },
         )
         .await
         .unwrap();
     db.store
-        .set_cvm_quota(
-            &actor,
-            CvmQuota {
-                host_network_quotas: vec![],
-                tenant_id: "platform.acme".into(),
-                user_id: "alice".into(),
-                enabled: true,
-                allowed_nodes: vec!["n1".into()],
-                max_instances: 1,
-                max_vcpus: 1,
-                max_memory_bytes: 134217728,
-                max_disk_bytes: 3000000000,
-                max_interfaces: 1,
-            },
-        )
+        .cvm_record_image_manifest("n1", manifest)
         .await
         .unwrap();
     let app = merged_router(
@@ -11679,12 +11685,11 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["cache-control"], "no-store");
     let workspace = response_json(response).await;
-    assert_eq!(workspace["can_write"], true);
-    assert_eq!(workspace["can_manage_quotas"], false);
+    assert_eq!(workspace["can_write"], false);
+    assert_eq!(workspace["can_use"], true);
+    assert!(workspace.get("quotas").is_none());
     assert_eq!(workspace["owners"].as_array().unwrap().len(), 1);
-    let public_key =
-        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEiBcpQEzqzjADp8VXvOigHnqLh5L5xP76cwoCD8YMK5 fixture";
-    let create = json!({"request_id":"http-create-request-000001","tenant_id":"platform.acme","user_id":"alice","node_id":"n1","name":"my-cvm","image_id":"debian","resources":{"vcpus":1,"memory_bytes":134217728,"root_disk_bytes":3000000000u64},"ssh_public_key":public_key,"interfaces":[{"source_id":"public","purpose":"contact"}]});
+    let create = json!({"request_id":"http-create-request-000001","tenant_id":"platform.acme","user_id":"alice","node_id":"n1","name":"my-cvm","image_id":"debian","resources":{"vcpus":1,"memory_bytes":134217728,"root_disk_bytes":3000000000u64},"interfaces":[{"source_id":"public","purpose":"contact"}]});
     let response = app
         .clone()
         .oneshot(
@@ -11696,14 +11701,60 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
         )
         .await
         .unwrap();
-    let status = response.status();
-    let created = response_json(response).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let (status, created) = post_json(&app, &token, "/cvm", create.clone()).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{created}");
     assert_eq!(created["status"], "pending");
     assert!(created["report"].is_null());
+    assert!(created["desired"]["spec"].get("ssh_public_key").is_none());
+    assert_eq!(created["desired"]["spec"]["login_revision"], 1);
+    let match_path = format!(
+        "/cvm/{}/routes/match",
+        created["desired"]["id"].as_str().unwrap()
+    );
+    let route_match = json!({"destination":"2001:db8::1","protocol":"udp","port":53});
+    let pending_response = app
+        .clone()
+        .oneshot(
+            Request::post(&match_path)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(route_match.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending_response.status(), StatusCode::OK);
+    assert_eq!(pending_response.headers()["cache-control"], "no-store");
     assert_eq!(
-        created["desired"]["spec"]["ssh_public_key"], public_key,
-        "self response must retain usable identity"
+        response_json(pending_response).await,
+        json!({"kind":"default"})
+    );
+    for (scope_cookie, expected) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some(&cookie), StatusCode::FORBIDDEN),
+    ] {
+        let mut request = Request::post(&match_path).header("content-type", "application/json");
+        if let Some(cookie) = scope_cookie {
+            request = request.header("cookie", cookie);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(route_match.to_string())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    assert_eq!(
+        post_json(
+            &app,
+            &token,
+            &match_path,
+            json!({"destination":"192.0.2.1","protocol":"tcp","port":0})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
     );
     let entries_path = format!(
         "/cvm/{}/entries",
@@ -11725,11 +11776,11 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
     }
     let board = get_json(&app, &token, "/cvm/entries").await;
     assert_eq!(board.1["can_manage"], true);
-    // Users reach the entry writers; Store then checks the target container.
+    // An assigned user can read entries but cannot manage their configuration.
     let entry = json!({
         "request_id":"http-entry-request-0000001", "instance_id":created["desired"]["id"],
         "publication_id":"entrypub-missing", "address":"198.51.100.20",
-        "mode":{"kind":"l4","protocol":"tcp","listen_port":30022,"target_port":22}
+        "mode":{"kind":"l4_range","protocol":"tcp","listen_start":30022,"listen_end":30022,"target_start":22,"target_end":22}
     });
     let response = app
         .clone()
@@ -11742,7 +11793,7 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let release = json!({"request_id":"http-entry-release-0000001","expected_revision":1});
     for (method, path) in [
         ("DELETE", "/cvm/entries/entry-missing"),
@@ -11770,7 +11821,7 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
     }
     let publication = json!({"request_id":"http-entry-publication-0001","expected_revision":0,"spec":{
         "name":"Edge","provider_node":"n1","addresses":[{"address":"198.51.100.20","kind":"dedicated"}],
-        "transports":[],"grants":[],"max_entries":1}});
+        "transports":[],"wireguard_transport":"udp","grants":[],"max_entries":1}});
     let response = app
         .clone()
         .oneshot(
@@ -11823,19 +11874,28 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
         .await
         .unwrap();
     assert_eq!(quota_response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        put_json(&app, &token, "/cvm/quota", json!({})).await.0,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
     let node_token = db.store.issue_node_token("n1").await.unwrap();
-    let response = app
-        .clone()
-        .oneshot(
-            Request::get("/agent/v1/cvm/desired")
-                .header("authorization", format!("Bearer {}", node_token.token))
-                .header("x-brocade-protocol-version", "57")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    for version in [
+        None,
+        Some(0),
+        Some(brocade_deployment::protocol::AGENT_PROTOCOL_VERSION + 1),
+    ] {
+        let mut request = Request::get("/agent/v1/cvm/desired")
+            .header("authorization", format!("Bearer {}", node_token.token));
+        if let Some(version) = version {
+            request = request.header("x-brocade-protocol-version", version.to_string());
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
     let response = app
         .clone()
         .oneshot(
@@ -11843,7 +11903,7 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
                 .header("authorization", format!("Bearer {}", node_token.token))
                 .header(
                     "x-brocade-protocol-version",
-                    brocade_deployment::cvm::CVM_PROTOCOL_VERSION.to_string(),
+                    brocade_deployment::protocol::AGENT_PROTOCOL_VERSION.to_string(),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -11861,7 +11921,7 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
                 .header("authorization", format!("Bearer {}", node_token.token))
                 .header(
                     "x-brocade-protocol-version",
-                    brocade_deployment::cvm::CVM_PROTOCOL_VERSION.to_string(),
+                    brocade_deployment::protocol::AGENT_PROTOCOL_VERSION.to_string(),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -11871,38 +11931,74 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
     assert_eq!(response.status(), StatusCode::OK);
     let desired = response_json(response).await;
     assert_eq!(desired["instances"][0]["id"], created["desired"]["id"]);
-    // Entry desired state (with tunnel secrets) only reaches an Agent of the entry protocol.
-    for (version, status) in [
-        (
-            (brocade_deployment::cvm::ENTRY_PROTOCOL_VERSION - 1).to_string(),
-            StatusCode::CONFLICT,
-        ),
-        (
-            brocade_deployment::cvm::ENTRY_PROTOCOL_VERSION.to_string(),
-            StatusCode::OK,
-        ),
-    ] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::get("/agent/v1/cvm/entries/desired")
-                    .header("authorization", format!("Bearer {}", node_token.token))
-                    .header("x-brocade-protocol-version", version)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), status);
-    }
+    let current = &created["desired"];
+    let report = serde_json::from_value(json!({
+        "id":current["id"],"operation_id":current["operation_id"],"generation":current["generation"],"spec_sha256":current["spec_sha256"],
+        "status":"applied","power":"running","runtime_id":"owned-runtime","volume_id":"owned-volume","access_address":"192.0.2.1",
+        "interfaces":[{"id":current["spec"]["interfaces"][0]["id"],"device":"eth0","mac":"02:00:00:00:00:01","addresses":["192.0.2.1/24"],"attached":true}],
+        "restart_epoch":0,"reinstall_epoch":0,"detached_interfaces":[],"network_absent":false,"volume_retained":false,"volume_deleted":false,"error":null
+    })).unwrap();
+    assert!(db.store.cvm_record_report("n1", report).await.unwrap());
+    let credential_path = format!("/cvm/{}/credential", current["id"].as_str().unwrap());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(&credential_path)
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let credential = response_json(response).await;
+    let password = credential["password"].as_str().unwrap();
+    assert_eq!(password.len(), 32);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(&credential_path)
+                .header("cookie", &bob_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(!get_json(&app, &token, "/cvm")
+        .await
+        .1
+        .to_string()
+        .contains(password));
+    // Entry secrets remain node-authenticated, using the current contract without feature-version dispatch.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/agent/v1/cvm/entries/desired")
+                .header("authorization", format!("Bearer {}", node_token.token))
+                .header(
+                    "x-brocade-protocol-version",
+                    brocade_deployment::protocol::AGENT_PROTOCOL_VERSION.to_string(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     let path = format!("/cvm/{}", created["desired"]["id"].as_str().unwrap());
     let readonly=post_json(&app,&token,"/admin/operators",json!({"id":"cvm-reader","display_name":"Reader","role":"readonly","tenant_scope":"platform.acme","password":"cvm-test-password"})).await;
     assert_eq!(readonly.0, StatusCode::CREATED);
     let issued = post_json(&app, &token, "/admin/operators/cvm-reader/token", json!({})).await;
     let reader = issued.1["token"].as_str().unwrap();
+    assert_eq!(
+        get_json(&app, reader, &credential_path).await.0,
+        StatusCode::FORBIDDEN
+    );
     let detail = get_json(&app, reader, &path).await;
     assert_eq!(detail.0, StatusCode::OK);
-    assert_eq!(detail.1["desired"]["spec"]["ssh_public_key"], "");
+    assert!(detail.1["desired"]["spec"].get("ssh_public_key").is_none());
     assert_eq!(
         post_json(&app, reader, "/cvm/entries", entry.clone())
             .await
@@ -11931,17 +12027,16 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
     let (status, workspace) = get_json_without_credentials(&app, "/cvm").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(workspace["can_write"], false);
-    assert_eq!(workspace["can_manage_quotas"], false);
+    assert!(workspace.get("quotas").is_none());
     assert_eq!(workspace["redacted"], true);
     assert_eq!(workspace["instances"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        workspace["instances"][0]["desired"]["spec"]["ssh_public_key"],
-        ""
-    );
+    assert!(workspace["instances"][0]["desired"]["spec"]
+        .get("ssh_public_key")
+        .is_none());
     assert_eq!(workspace["hosts"][0]["can_manage_terminal"], false);
     let detail = get_json_without_credentials(&app, &path).await;
     assert_eq!(detail.0, StatusCode::OK);
-    assert_eq!(detail.1["desired"]["spec"]["ssh_public_key"], "");
+    assert!(detail.1["desired"]["spec"].get("ssh_public_key").is_none());
     for read in [
         entries_path.clone(),
         "/cvm/entries".to_owned(),
@@ -11954,9 +12049,9 @@ async fn cvm_http_preserves_self_scope_and_requires_versioned_agent_evidence() {
     }
     for (method, denied_path) in [
         ("POST", "/cvm".to_owned()),
-        ("PUT", "/cvm/quota".to_owned()),
         ("POST", "/cvm/entries".to_owned()),
         ("DELETE", "/cvm/entries/entry-missing".to_owned()),
+        ("GET", credential_path.clone()),
         ("POST", format!("{path}/operations")),
         ("POST", format!("{path}/terminal")),
         ("PUT", "/cvm/hosts/n1/terminal".to_owned()),

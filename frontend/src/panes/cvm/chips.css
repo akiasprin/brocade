@@ -1,0 +1,80 @@
+/* 网络标记：清单与详情概览共用。主文为等宽读数，前缀与后缀（协议、转发目标）降一档。
+   出口用正文字体，因为它写的是网络或线路名称而不是地址。 */
+.cvm-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  height: 20px;
+  padding: 0 6px;
+  box-sizing: border-box;
+  border: 1px solid var(--line-soft);
+  border-radius: 5px;
+  background: var(--sunk);
+  color: var(--ink-2);
+  font: 11px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.cvm-chip > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cvm-chip > i {
+  flex: none;
+  color: var(--ink-4);
+  font-size: 10px;
+  font-style: normal;
+}
+.cvm-chip.l3 {
+  border-color: color-mix(in srgb, var(--action) 36%, var(--line-soft));
+}
+.cvm-chip.l3 > i:first-child {
+  color: var(--action);
+}
+.cvm-chip:is(.via, .chain, .local) {
+  font-family: var(--sans);
+  font-size: 11.5px;
+}
+.cvm-chip:is(.via, .chain, .local) > i {
+  font-family: var(--mono);
+}
+.cvm-chip.via {
+  background: color-mix(in srgb, var(--ink) 3%, var(--card));
+}
+.cvm-chip.chain {
+  border-style: dashed;
+  background: color-mix(in srgb, var(--ink) 3%, var(--card));
+}
+.cvm-chip.local {
+  background: transparent;
+  color: var(--ink-3);
+}
+.cvm-chip[data-tone='warn'] {
+  border-color: color-mix(in srgb, var(--gold) 46%, var(--line-soft));
+  background: color-mix(in srgb, var(--gold) 6%, var(--sunk));
+}
+.cvm-chip[data-tone='bad'] {
+  border-color: color-mix(in srgb, var(--err) 46%, var(--line-soft));
+  color: var(--err);
+}
+.cvm-chip[data-tone='draft'] {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--gold) 52%, var(--line-soft));
+  background: color-mix(in srgb, var(--gold) 8%, var(--sunk));
+  color: var(--gold);
+}
+button.cvm-chip {
+  cursor: pointer;
+}
+button.cvm-chip:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--action) 44%, transparent);
+  outline-offset: 1px;
+}
+@media (hover: hover) {
+  button.cvm-chip:hover {
+    border-color: color-mix(in srgb, var(--action) 50%, var(--line));
+    color: var(--ink);
+  }
+}

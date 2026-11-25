@@ -9,14 +9,16 @@
 //!
 //! 入口属于容器：删除容器即释放；同一用户的容器之间可以改派，地址与端口不变。
 use super::{
-    valid_id, L4Protocol, NetworkDiagnostics, NetworkOwner, TransportKind, TransportListenSide,
-    TransportOffer, MAX_CATALOG_ITEMS,
+    valid_id, EntryPortSet, EntryReservedPorts, EntryTraffic, EntryTransportSelection, L4Protocol,
+    NetworkDiagnostics, NetworkOwner, TransportKind, TransportListenSide, TransportOffer,
+    MAX_CATALOG_ITEMS,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, net::Ipv4Addr};
 
-/// Agent 与 Console 都支持入口投递的协议版本。
-pub const ENTRY_PROTOCOL_VERSION: u32 = 67;
+pub const MAX_ENTRY_RANGE_PORTS: u32 = 4096;
+/// Bounds resource claims and the expanded deterministic NAT plan, across both protocols.
+pub const MAX_ENTRY_PORTS_PER_NODE: u64 = 16384;
 /// Agent 上报这个契约（[`super::NicNodeCapabilities::entries`]）且计算宿主的 Cube 上报
 /// `primary_ip_delivery` 时，才向该节点下发入口。
 pub const ENTRY_CONTRACT: &str = "cvm-entry-delivery-v1";
@@ -47,7 +49,7 @@ impl EntryWireguardTransport {
     }
 }
 impl super::NicNodeCapabilities {
-    /// Existing UDP entry Agents remain usable; new carriers require explicit evidence.
+    /// Select only a transport backed by the node's current installed capabilities.
     pub fn supports_entry_transport(
         &self,
         kind: TransportKind,
@@ -91,24 +93,100 @@ impl EntryProtocol {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EntryMode {
+    Protocols {
+        #[serde(flatten)]
+        traffic: EntryTraffic,
+    },
     /// 整 IP 的新入站流量做 L3 转发，包含全部协议与 ICMP；保留机器自身连接的回包与传输端口。
     L3,
-    /// 只转发所选协议的一个入口端口到容器端口。
-    L4 {
+    /// Equal-length intervals map in order; a single port has equal bounds.
+    L4Range {
         protocol: EntryProtocol,
-        listen_port: u16,
-        target_port: u16,
+        listen_start: u16,
+        listen_end: u16,
+        target_start: u16,
+        target_end: u16,
     },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryPorts {
+    pub protocol: EntryProtocol,
+    pub listen_start: u16,
+    pub listen_end: u16,
+    pub target_start: u16,
+    pub target_end: u16,
+}
+impl EntryPorts {
+    pub fn count(self) -> u32 {
+        u32::from(self.listen_end).saturating_sub(u32::from(self.listen_start)) + 1
+    }
+    pub fn cost(self) -> u64 {
+        u64::from(self.count()) * self.protocol.protocols().len() as u64
+    }
+    pub fn target_for(self, listen: u16) -> Option<u16> {
+        if !(self.listen_start..=self.listen_end).contains(&listen) {
+            return None;
+        }
+        self.target_start
+            .checked_add(listen.checked_sub(self.listen_start)?)
+            .filter(|port| *port <= self.target_end)
+    }
+}
 impl EntryMode {
+    pub fn ports(&self) -> Option<EntryPorts> {
+        match *self {
+            Self::L4Range {
+                protocol,
+                listen_start,
+                listen_end,
+                target_start,
+                target_end,
+            } => Some(EntryPorts {
+                protocol,
+                listen_start,
+                listen_end,
+                target_start,
+                target_end,
+            }),
+            _ => None,
+        }
+    }
     pub fn valid(&self) -> bool {
-        !matches!(
-            self,
-            Self::L4 { listen_port: 0, .. } | Self::L4 { target_port: 0, .. }
-        )
+        match self {
+            Self::Protocols { traffic } => traffic.validate().is_ok(),
+            Self::L3 => true,
+            _ => self.ports().is_some_and(|p| {
+                p.listen_start > 0
+                    && p.target_start > 0
+                    && p.listen_end >= p.listen_start
+                    && p.target_end >= p.target_start
+                    && u32::from(p.listen_end) - u32::from(p.listen_start)
+                        == u32::from(p.target_end) - u32::from(p.target_start)
+                    && p.count() <= MAX_ENTRY_RANGE_PORTS
+            }),
+        }
+    }
+    pub fn port_cost(&self) -> u64 {
+        match self {
+            Self::Protocols { traffic } => [L4Protocol::Tcp, L4Protocol::Udp]
+                .into_iter()
+                .map(|p| {
+                    traffic
+                        .segments(p, &EntryReservedPorts::default())
+                        .map(|s| {
+                            s.iter()
+                                .map(|s| if s.preserving() { 1 } else { s.listen.count() })
+                                .sum::<u64>()
+                        })
+                        .unwrap_or(u64::MAX / 2)
+                })
+                .sum(),
+            _ => self.ports().map_or(0, EntryPorts::cost),
+        }
     }
 }
 
@@ -118,11 +196,13 @@ impl EntryMode {
 pub enum EntryAddressKind {
     /// 机器自己的地址：按协议端口分给多个容器；宿主正在监听的端口不能分配。
     Shared { port_start: u16, port_end: u16 },
-    /// 整 IP 的入站流量转发给一个实例；地址仍由入口机器持有。
+    /// 由一个实例独占地址租约；转发匹配由 EntryMode 决定，地址仍由入口机器持有。
     Dedicated,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct EntryAddressOffer {
+    #[serde(default, skip_serializing_if = "EntryReservedPorts::is_empty")]
+    pub reserved_ports: EntryReservedPorts,
     /// 数据包到达这台机器时的目的地址；共享地址必须是机器网卡上的实际地址。
     pub address: Ipv4Addr,
     /// 云厂商一对一 NAT 时访问者使用的公网地址，只用于展示；为空时与 `address` 相同。
@@ -135,16 +215,82 @@ impl EntryAddressOffer {
     /// 这个地址能否承接一条入口；端口与宿主监听、其他入口的冲突由 Store 统一检查。
     pub fn permits(&self, mode: &EntryMode) -> bool {
         match (self.kind, mode) {
-            (EntryAddressKind::Dedicated, EntryMode::L3) => true,
+            (EntryAddressKind::Dedicated, EntryMode::L3 | EntryMode::Protocols { .. }) => {
+                mode.valid()
+            }
             (
                 EntryAddressKind::Shared {
                     port_start,
                     port_end,
                 },
-                EntryMode::L4 { listen_port, .. },
-            ) => (port_start..=port_end).contains(listen_port),
+                EntryMode::Protocols { traffic },
+            ) => {
+                !traffic.icmp
+                    && !traffic.other_ip
+                    && [L4Protocol::Tcp, L4Protocol::Udp].into_iter().all(|p| {
+                        matches!(
+                            traffic.transport(p),
+                            EntryTransportSelection::Disabled
+                                | EntryTransportSelection::Forward {
+                                    ports: EntryPortSet::All,
+                                    ..
+                                }
+                        ) || traffic.transport(p).segments().is_ok_and(|s| {
+                            s.iter()
+                                .all(|s| port_start <= s.listen.start && s.listen.end <= port_end)
+                        })
+                    })
+            }
+            (
+                EntryAddressKind::Shared {
+                    port_start,
+                    port_end,
+                },
+                mode,
+            ) => mode.ports().is_some_and(|ports| {
+                port_start <= ports.listen_start && ports.listen_end <= port_end
+            }),
             _ => false,
         }
+    }
+    pub fn resolve_mode(&self, mode: &EntryMode) -> Result<EntryMode, String> {
+        if !self.permits(mode) {
+            return Err("转发协议或端口超出入口地址授权范围".into());
+        }
+        let mut mode = mode.normalized()?;
+        if let (
+            EntryAddressKind::Shared {
+                port_start,
+                port_end,
+            },
+            EntryMode::Protocols { traffic },
+        ) = (self.kind, &mut mode)
+        {
+            for selection in [&mut traffic.tcp, &mut traffic.udp] {
+                if let EntryTransportSelection::Forward { ports, .. } = selection {
+                    if matches!(ports, EntryPortSet::All) {
+                        *ports = EntryPortSet::Ranges {
+                            ranges: vec![super::EntryPortRange {
+                                start: port_start,
+                                end: port_end,
+                            }],
+                        };
+                    }
+                }
+            }
+            traffic.validate()?;
+        }
+        let traffic = mode.traffic();
+        if !traffic.icmp
+            && !traffic.other_ip
+            && [L4Protocol::Tcp, L4Protocol::Udp].into_iter().all(|p| {
+                mode.protocol_segments(p, &self.reserved_ports)
+                    .is_ok_and(|s| s.is_empty())
+            })
+        {
+            return Err("扣除保留端口后没有可转发的流量".into());
+        }
+        Ok(mode)
     }
     pub fn visible_address(&self) -> Ipv4Addr {
         self.public_address.unwrap_or(self.address)
@@ -159,7 +305,8 @@ pub struct EntryPublicationSpec {
     pub addresses: Vec<EntryAddressOffer>,
     /// 计算宿主不是这台机器时，机器对通道使用的承载报价。
     pub transports: Vec<TransportOffer>,
-    #[serde(default, skip_serializing_if = "EntryWireguardTransport::is_udp")]
+    // Earlier persisted publications omitted the default UDP transport.
+    #[serde(default)]
     pub wireguard_transport: EntryWireguardTransport,
     pub grants: Vec<NetworkOwner>,
     /// 这份发布最多同时承接的入口数。
@@ -182,6 +329,7 @@ impl EntryPublicationSpec {
         }
         let mut addresses = BTreeSet::new();
         for offer in &self.addresses {
+            offer.reserved_ports.normalized()?;
             if !entry_address(offer.address)
                 || offer.public_address.is_some_and(|ip| !entry_address(ip))
                 || !addresses.insert(offer.address)
@@ -272,25 +420,28 @@ impl Entry {
     pub fn conflicts(&self, other: &Self) -> bool {
         self.provider_node == other.provider_node
             && self.address == other.address
-            && modes_conflict(self.mode, other.mode)
+            && modes_conflict(&self.mode, &other.mode)
     }
 }
-pub fn modes_conflict(a: EntryMode, b: EntryMode) -> bool {
-    match (a, b) {
-        (
-            EntryMode::L4 {
-                protocol: a,
-                listen_port: x,
-                ..
-            },
-            EntryMode::L4 {
-                protocol: b,
-                listen_port: y,
-                ..
-            },
-        ) => x == y && a.overlaps(b),
-        _ => true,
+pub fn modes_conflict(
+    a: impl std::borrow::Borrow<EntryMode>,
+    b: impl std::borrow::Borrow<EntryMode>,
+) -> bool {
+    let a = a.borrow().traffic();
+    let b = b.borrow().traffic();
+    if (a.icmp && b.icmp) || (a.other_ip && b.other_ip) {
+        return true;
     }
+    [L4Protocol::Tcp, L4Protocol::Udp].into_iter().any(|p| {
+        let Ok(a) = a.transport(p).segments() else {
+            return true;
+        };
+        let Ok(b) = b.transport(p).segments() else {
+            return true;
+        };
+        a.iter()
+            .any(|a| b.iter().any(|b| a.listen.overlaps(b.listen)))
+    })
 }
 
 /// 新增入口；`instance_id` 是目标容器。
@@ -339,7 +490,10 @@ pub fn tunnel_addresses(slot: u16) -> Option<(Ipv4Addr, Ipv4Addr)> {
 /// 已确认的地址（例如已关机），入口仍占用地址与端口并丢弃流量，不能落到宿主服务。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryRule {
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "EntryReservedPorts::is_empty")]
+    pub reserved_ports: EntryReservedPorts,
+    // Published products and Agent checkpoints omitted this field when false.
+    #[serde(default)]
     pub host_local: bool,
     pub id: String,
     pub address: Ipv4Addr,
@@ -350,7 +504,9 @@ pub struct EntryRule {
 /// 计算宿主上的一条投递：从机器对通道收到的包交给容器主网卡，回包沿通道返回。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryDelivery {
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "EntryReservedPorts::is_empty")]
+    pub reserved_ports: EntryReservedPorts,
+    #[serde(default)]
     pub host_local: bool,
     pub id: String,
     pub instance_id: String,
@@ -375,7 +531,7 @@ pub struct EntryTunnel {
     pub entry_node: String,
     pub target_node: String,
     pub offer: TransportOffer,
-    #[serde(default, skip_serializing_if = "EntryWireguardTransport::is_udp")]
+    #[serde(default)]
     pub wireguard_transport: EntryWireguardTransport,
     pub port: u16,
     /// 全局唯一的槽位，见 [`ENTRY_TUNNEL_SLOTS`]。
@@ -453,6 +609,42 @@ pub struct EntryDesired {
     pub tunnels: Vec<EntryTunnel>,
 }
 impl EntryDesired {
+    /// Port checks also apply to frozen products whose addresses are late bindings.
+    pub fn validate_ports(&self) -> Result<(), String> {
+        if self.rules.iter().any(|rule| !rule.mode.valid())
+            || self
+                .deliveries
+                .iter()
+                .any(|delivery| !delivery.mode.valid())
+        {
+            return Err("invalid CVM entry port mapping".into());
+        }
+        for (mode, reserved) in self
+            .rules
+            .iter()
+            .map(|r| (&r.mode, &r.reserved_ports))
+            .chain(self.deliveries.iter().map(|d| (&d.mode, &d.reserved_ports)))
+        {
+            reserved.normalized()?;
+            for protocol in [L4Protocol::Tcp, L4Protocol::Udp] {
+                mode.protocol_segments(protocol, reserved)?;
+            }
+        }
+        let port_cost: u64 = self
+            .rules
+            .iter()
+            .map(|rule| rule.mode.port_cost())
+            .chain(
+                self.deliveries
+                    .iter()
+                    .map(|delivery| delivery.mode.port_cost()),
+            )
+            .sum();
+        if port_cost > MAX_ENTRY_PORTS_PER_NODE {
+            return Err("CVM entry port capacity exceeded".into());
+        }
+        Ok(())
+    }
     pub fn validate(&self) -> Result<(), String> {
         if !valid_id(&self.node_id)
             || self.rules.len() > MAX_ENTRIES_PER_NODE
@@ -461,6 +653,7 @@ impl EntryDesired {
         {
             return Err("CVM entry desired state exceeds its limits".into());
         }
+        self.validate_ports()?;
         let mut tunnels = BTreeSet::new();
         let mut slots = BTreeSet::new();
         for tunnel in &self.tunnels {
@@ -508,10 +701,9 @@ impl EntryDesired {
             }
         }
         for (index, rule) in self.rules.iter().enumerate() {
-            if self.rules[index + 1..]
-                .iter()
-                .any(|other| rule.address == other.address && modes_conflict(rule.mode, other.mode))
-            {
+            if self.rules[index + 1..].iter().any(|other| {
+                rule.address == other.address && modes_conflict(&rule.mode, &other.mode)
+            }) {
                 return Err("conflicting CVM entry rules".into());
             }
         }
@@ -571,6 +763,72 @@ impl EntryNodeReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_entry_defaults_remain_readable_and_known_fields_stay_checked() {
+        let old = serde_json::json!({
+            "node_id":"hk", "generation":25,
+            "rules":[{"id":"e1", "address":"203.0.113.12", "mode":{"kind":"l3"},
+                "target":"192.168.100.2", "tunnel":"t1"}],
+            "deliveries":[{"id":"e1", "instance_id":"web", "mode":{"kind":"l3"},
+                "target":"192.168.100.2", "tunnel":"t1"}],
+            "tunnels":[{"id":"t1", "side":"entry", "entry_node":"hk", "target_node":"jp",
+                "offer":{"listen_side":"provider", "kind":"wireguard", "endpoint":"203.0.113.12",
+                    "port_start":40000, "port_end":40010, "mtu":1420},
+                "port":40000, "slot":1, "credential":"a".repeat(44), "peer_credential":"b".repeat(44)}]
+        });
+        let desired: EntryDesired = serde_json::from_value(old.clone()).unwrap();
+        assert!(!desired.rules[0].host_local && !desired.deliveries[0].host_local);
+        assert_eq!(
+            desired.tunnels[0].wireguard_transport,
+            EntryWireguardTransport::Udp
+        );
+        assert_eq!(desired.generation, 25);
+        let current = serde_json::to_value(&desired).unwrap();
+        assert_eq!(current["rules"][0]["host_local"], false);
+        assert_eq!(current["tunnels"][0]["wireguard_transport"], "udp");
+        assert_eq!(
+            serde_json::from_value::<EntryDesired>(current).unwrap(),
+            desired
+        );
+
+        let mut explicit = old.clone();
+        explicit["rules"][0]["host_local"] = true.into();
+        explicit["deliveries"][0]["host_local"] = true.into();
+        explicit["tunnels"][0]["wireguard_transport"] = "phantun".into();
+        let explicit: EntryDesired = serde_json::from_value(explicit).unwrap();
+        assert!(explicit.rules[0].host_local && explicit.deliveries[0].host_local);
+        assert_eq!(
+            explicit.tunnels[0].wireguard_transport,
+            EntryWireguardTransport::Phantun
+        );
+
+        for field in ["id", "address", "mode"] {
+            let mut invalid = old.clone();
+            invalid["rules"][0].as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<EntryDesired>(invalid).is_err());
+        }
+        for field in ["host_local", "wireguard_transport"] {
+            let mut invalid = old.clone();
+            let owner = if field == "host_local" {
+                "rules"
+            } else {
+                "tunnels"
+            };
+            invalid[owner][0][field] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<EntryDesired>(invalid).is_err());
+        }
+
+        let publication = serde_json::json!({"name":"old", "provider_node":"hk", "addresses":[],
+            "transports":[], "grants":[], "max_entries":1});
+        assert_eq!(
+            serde_json::from_value::<EntryPublicationSpec>(publication)
+                .unwrap()
+                .wireguard_transport,
+            EntryWireguardTransport::Udp
+        );
+    }
+
     fn entry(address: &str, mode: EntryMode) -> Entry {
         Entry {
             id: "e1".into(),
@@ -582,10 +840,12 @@ mod tests {
         }
     }
     fn l4(protocol: EntryProtocol, listen_port: u16) -> EntryMode {
-        EntryMode::L4 {
+        EntryMode::L4Range {
             protocol,
-            listen_port,
-            target_port: 443,
+            listen_start: listen_port,
+            listen_end: listen_port,
+            target_start: 443,
+            target_end: 443,
         }
     }
     #[test]
@@ -610,6 +870,7 @@ mod tests {
     #[test]
     fn shared_addresses_take_ports_and_dedicated_addresses_take_whole_ips() {
         let shared = EntryAddressOffer {
+            reserved_ports: Default::default(),
             address: "10.0.0.12".parse().unwrap(),
             public_address: Some("203.0.113.12".parse().unwrap()),
             kind: EntryAddressKind::Shared {
@@ -618,6 +879,7 @@ mod tests {
             },
         };
         let dedicated = EntryAddressOffer {
+            reserved_ports: Default::default(),
             address: "198.51.100.210".parse().unwrap(),
             public_address: None,
             kind: EntryAddressKind::Dedicated,
@@ -674,6 +936,7 @@ mod tests {
         assert!(tunnel.listens());
         assert_eq!(tunnel.peer_node(), "jp-iij");
         let rule = |id: &str, mode: EntryMode, tunnel: Option<&str>| EntryRule {
+            reserved_ports: Default::default(),
             host_local: false,
             id: id.into(),
             address: "203.0.113.12".parse().unwrap(),
@@ -704,6 +967,7 @@ mod tests {
         desired.rules.pop();
         // 计算宿主一端的通道不能承接入口规则，也不能出现在别的节点的期望状态里。
         desired.deliveries.push(EntryDelivery {
+            reserved_ports: Default::default(),
             host_local: false,
             id: "d".into(),
             instance_id: "web".into(),
@@ -717,8 +981,17 @@ mod tests {
         assert!(desired.validate().is_err());
     }
     #[test]
-    fn old_entry_capabilities_keep_udp_and_gate_new_carriers() {
-        let mut caps:super::super::NicNodeCapabilities=serde_json::from_value(serde_json::json!({"contract":67,"transports":["wireguard","xray"],"consume":true,"provide":true,"max_bindings":64,"addresses":[],"host_ports":[],"xray_certificate_pem":null,"error":null,"entries":true})).unwrap();
+    fn entry_transport_requires_explicit_current_capabilities() {
+        let mut caps = super::super::NicNodeCapabilities {
+            entry_protocol_rules: true,
+            ssh_ports: Vec::new(),
+            entries: true,
+            transports: vec![TransportKind::Wireguard, TransportKind::Xray],
+            ..Default::default()
+        };
+        let mut missing = serde_json::to_value(&caps).unwrap();
+        missing.as_object_mut().unwrap().remove("entry_xray");
+        assert!(serde_json::from_value::<super::super::NicNodeCapabilities>(missing).is_err());
         assert!(
             caps.supports_entry_transport(TransportKind::Wireguard, EntryWireguardTransport::Udp)
         );
@@ -732,5 +1005,64 @@ mod tests {
         assert!(caps.supports_entry_transport(TransportKind::Xray, EntryWireguardTransport::Udp));
         caps.entries = false;
         assert!(!caps.supports_entry_transport(TransportKind::Xray, EntryWireguardTransport::Udp));
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    fn range(start: u16, end: u16, target: u16) -> EntryMode {
+        EntryMode::L4Range {
+            protocol: EntryProtocol::TcpUdp,
+            listen_start: start,
+            listen_end: end,
+            target_start: target,
+            target_end: target.saturating_add(end.saturating_sub(start)),
+        }
+    }
+    #[test]
+    fn range_mapping_bounds_are_explicit_and_obsolete_single_port_shape_is_rejected() {
+        let old = r#"{"kind":"l4","protocol":"tcp","listen_port":30022,"target_port":22}"#;
+        assert!(serde_json::from_str::<EntryMode>(old).is_err());
+        let mode = range(30000, 30002, 65533);
+        assert!(mode.valid());
+        let ports = mode.ports().unwrap();
+        assert_eq!(ports.target_for(30000), Some(65533));
+        assert_eq!(ports.target_for(30002), Some(65535));
+        assert_eq!(ports.target_for(30003), None);
+        assert!(!range(30000, 30002, 65534).valid());
+        for mode in [range(0, 2, 1), range(3, 2, 1), range(1, 4097, 1)] {
+            assert!(!mode.valid());
+        }
+        assert!(range(1, 4096, 1).valid());
+    }
+    #[test]
+    fn range_conflicts_cover_middle_protocols_and_publication_edges() {
+        let mode = range(30000, 30003, 80);
+        for port in [30000, 30001, 30003] {
+            assert!(modes_conflict(
+                &mode,
+                EntryMode::L4Range {
+                    protocol: EntryProtocol::Udp,
+                    listen_start: port,
+                    listen_end: port,
+                    target_start: 53,
+                    target_end: 53
+                }
+            ));
+        }
+        assert!(!modes_conflict(&mode, range(30004, 30007, 80)));
+        let offer = EntryAddressOffer {
+            reserved_ports: Default::default(),
+            address: "198.51.100.20".parse().unwrap(),
+            public_address: None,
+            kind: EntryAddressKind::Shared {
+                port_start: 30000,
+                port_end: 30003,
+            },
+        };
+        assert!(offer.permits(&mode));
+        assert!(!offer.permits(&range(29999, 30002, 80)));
+        assert!(!offer.permits(&range(30001, 30004, 80)));
     }
 }

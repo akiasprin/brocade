@@ -67,7 +67,7 @@ fn file_changes_express_apply_cost() {
         vec![CvmArtifactKind::Egress, CvmArtifactKind::Attachments]
     );
     j = i.clone();
-    j.spec.ssh_public_key.push_str(" renamed@operator");
+    j.spec.login_revision += 1;
     assert_eq!(changed(&j), vec![CvmArtifactKind::GuestInit]);
     assert_eq!(CvmArtifactKind::GuestInit.apply(), "boot_identity");
     assert_eq!(CvmArtifactKind::Attachments.bindings(), &["/runtime_id"]);
@@ -85,7 +85,7 @@ fn exact_manifest_commitment_and_catalogue_are_required() {
     bad.capabilities.cube_storage_backend = None;
     assert!(compile(&bad).is_err());
     bad = i.clone();
-    bad.spec.ssh_public_key = "ssh-ed25519 bad".into();
+    bad.spec.login_revision = 0;
     assert!(compile(&bad).is_err());
 }
 #[test]
@@ -150,10 +150,6 @@ fn engine_template_does_not_override_host_bindings_or_supply_scripts() {
         .is_none());
     assert!(req.get("cube_network_config").is_none());
     assert!(req["labels"].get("brocade.cvm.spec_sha256").is_none());
-    let mut guest: Value =
-        serde_json::from_str(&b.file(CvmArtifactKind::GuestInit).unwrap().content).unwrap();
-    guest["user"] = json!("root");
-    assert!(guest_key(&guest).is_err());
 }
 #[test]
 fn an_existing_pinned_manifest_does_not_depend_on_the_current_catalogue_entry() {
@@ -165,7 +161,7 @@ fn an_existing_pinned_manifest_does_not_depend_on_the_current_catalogue_entry() 
 }
 
 fn business_nic() -> InterfaceSpec {
-    serde_json::from_value(json!({"id":"nic-egress","source_id":"pub-egress","purpose":"business","default_ipv4":false,"default_ipv6":false,"allocated":{"slot":1,"publication_id":"pub-egress","publication_revision":1,"provider_node":"provider","resource_domain":"lab","allocation_id":"allocation-egress","mac":"02:00:00:00:00:01","ipv4":"10.2.0.2","ipv6":null,"public_ipv4":"192.0.2.1","public_ipv6":null,"address_mode":"shared_nat","destinations":["0.0.0.0/0"],"transport":"wireguard","transport_generation":1,"mtu":1400,"blocked":false,"limits":{"max_attachments":1,"upload_bps":null,"download_bps":null,"monthly_bytes":null}}})).unwrap()
+    serde_json::from_value(json!({"id":"nic-egress","source_id":"pub-egress","purpose":"business","default_ipv4":false,"default_ipv6":false,"allocated":{"slot":1,"publication_id":"pub-egress","publication_revision":1,"provider_node":"provider","resource_domain":"lab","allocation_id":"allocation-egress","mac":"02:00:00:00:00:01","ipv4":"10.2.0.2","ipv6":null,"public_ipv4":"192.0.2.1","public_ipv6":null,"address_mode":"shared_nat","destinations":["0.0.0.0/0"],"transport":"wireguard","transport_generation":1,"mtu":1400,"blocked":false,"quota_exceeded":false,"limits":{"max_attachments":1,"upload_bps":null,"download_bps":null,"monthly_bytes":null}}})).unwrap()
 }
 
 #[test]
@@ -257,6 +253,10 @@ fn subscriber_client_has_no_host_nat_outbound_and_hides_credentials_in_review() 
     assert_eq!(v["inbounds"][0]["settings"]["MTU"], 1280);
     assert_eq!(v["outbounds"].as_array().unwrap().len(), 1);
     assert_eq!(
+        v["outbounds"][0]["streamSettings"]["sockopt"]["mark"],
+        CHAIN_CLIENT_SOCKET_MARK
+    );
+    assert_eq!(
         v["outbounds"][0]["settings"]["vnext"][0]["users"][0]["id"],
         target.uuid
     );
@@ -265,7 +265,10 @@ fn subscriber_client_has_no_host_nat_outbound_and_hides_credentials_in_review() 
     assert!(!a.content.contains("freedom"));
     let files = host_network::compile(
         &NicDesired::default(),
-        &EntryDesired::default(),
+        &EntryDesired {
+            node_id: "node-entry".into(),
+            ..Default::default()
+        },
         std::slice::from_ref(&a),
     )
     .unwrap();
@@ -277,4 +280,19 @@ fn subscriber_client_has_no_host_nat_outbound_and_hides_credentials_in_review() 
     assert!(guard.content.contains("oifname !="));
     assert!(guard.content.contains(" drop\n"));
     assert_eq!(guard.content, host_network::chain_guard(&a, false));
+}
+
+#[test]
+fn password_initialization_compiles_only_a_versioned_secret_reference() {
+    let mut input = input();
+    input.spec.login_revision = 7;
+    let bundle = compile(&input).unwrap();
+    let file = bundle.file(CvmArtifactKind::GuestInit).unwrap();
+    let value: Value = serde_json::from_str(&file.content).unwrap();
+    assert_eq!(value["contract"], "brocade-guest-init-v2");
+    assert_eq!(value["credential_revision"], 7);
+    assert!(value.get("password").is_none() && value.get("ssh_public_key").is_none());
+    assert_eq!(compile(&input).unwrap(), bundle);
+    input.spec.login_revision = 0;
+    assert!(compile(&input).is_err());
 }

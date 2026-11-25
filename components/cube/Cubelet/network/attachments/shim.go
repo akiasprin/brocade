@@ -14,12 +14,7 @@ import (
 	"time"
 )
 
-var ErrRuntimeUpgradeRequired = errors.New("running Cube shim requires a retained-root restart before NIC hotplug")
-
 func (s *server) verifyRunningShim(r *record) error {
-	if s.cfg.ShimSHA256 == "" {
-		return nil
-	}
 	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 	defer cancel()
 	path := filepath.Join(s.cfg.VMMRoot, r.Runtime, "chapi")
@@ -45,7 +40,7 @@ func (s *server) verifyRunningShim(r *record) error {
 		return err
 	}
 	if hex.EncodeToString(h.Sum(nil)) != s.cfg.ShimSHA256 {
-		return ErrRuntimeUpgradeRequired
+		return errors.New("running Cube shim does not match its pinned digest")
 	}
 	return nil
 }
@@ -54,13 +49,10 @@ func (s *server) verifyRunningShim(r *record) error {
 // image and its CPU/memory choices. Only the private administrator catalogue
 // selects its immutable version, never an attachment request.
 func (m *Manager) verifyShim() error {
-	if m.shimVersion == "" {
-		return nil
-	}
 	if !safeID.MatchString(m.shimVersion) || len(m.shimSHA256) != 64 {
 		return errors.New("invalid native Cube shim artifact identity")
 	}
-	path := filepath.Join("/data/cubelet/root/component_versions/cube-shim", m.shimVersion, "bin/containerd-shim-cube-rs")
+	path := filepath.Join(m.componentRoot, "cube-shim", m.shimVersion, "bin/containerd-shim-cube-rs")
 	data, err := checkedFile(path, 256*1024*1024, false)
 	if err != nil {
 		return err

@@ -116,10 +116,6 @@ func (s *service) networkAttachmentsUpdate(ctx context.Context, req *cb.UpdateCu
 		evidence, err = manager.Reconcile(ctx, desired)
 	}
 	if err != nil {
-		if errors.Is(err, attachments.ErrRuntimeUpgradeRequired) {
-			data, _ := json.Marshal(wire.Result{Contract: wire.Contract, RestartRequired: true})
-			rsp.ExtInfo[wire.ResultKey] = data
-		}
 		return fail(err)
 	}
 	data, err := json.Marshal(evidence)

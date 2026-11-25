@@ -15,7 +15,6 @@
       "memory_bytes": 134217728,
       "root_disk_bytes": 3221225472
     },
-    "ssh_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICoqKioqKioqKioqKioqKioqKioqKioqKioqKioqKioq",
     "interfaces": [
       {
         "id": "nic-contact",
@@ -30,6 +29,10 @@
       "routes": [],
       "priorities": [],
       "dns": []
+    },
+    "login_revision": 1,
+    "execution": {
+      "kind": "cube"
     }
   },
   "image_manifest": {
@@ -37,6 +40,10 @@
     "content": "{\"volumes\":[{\"name\":\"root\",\"volume_source\":{\"empty_dir\":{}}}],\"containers\":[{\"volume_mounts\":[{\"name\":\"root\",\"container_path\":\"/\"}]}]}"
   },
   "capabilities": {
+    "managed_networks": false,
+    "guest_terminal_persistent": false,
+    "route_services": false,
+    "chain_egress": false,
     "artifact_compiler": "cube-artifacts-v1",
     "cube_storage_backend": "plain",
     "create": true,

@@ -10,6 +10,14 @@
 
 `install_kvm.py` 创建自己独占的外层 KVM、存储与服务，再安装同源节点运行包并执行上述网卡及 smoke 验收。显式传入 OS 镜像、运行包与 SHA-256；`--storage-filesystem xfs|ext4` 分别验证 reflink／plain。`--installation-only` 仅验证发行版安装、同包重装、重启恢复和既有服务保留，不代表内层 Guest 或网卡验收。`--prepare-host-only` 保留本轮新宿主供独立验收，不能算作测试通过。
 
+幂等与中断恢复的定向验证也在一次性 KVM 内运行：
+
+- `python3 crates/brocade-agent/tests/entries_netns.py <Agent 测试程序>` 创建独立网络命名空间，覆盖真实 nftables、WireGuard、同机与跨机入口；保持 TCP／UDP 连接跨越重复收敛、撤销和分批清理恢复，核对未变更入口仍可用。
+- `BROCADE_RUN_CVM_KVM=1 python3 crates/brocade-agent/tests/selfupdate_replay.py <旧 Agent> <新 Agent>` 使用私有安装目录与 loopback 发布夹具，执行真实二进制替换、回执确认前强杀、重启重报与同目标重放。两个程序须为不同摘要的 CVM 变体，候选大小须满足更新器限制。
+- `unshare -n env BROCADE_RUN_CVM_KVM=1 <Agent 测试程序> --exact cvm::chain_egress::tests::interrupted_restore_releases_open_tuns_before_retry --ignored --nocapture` 验证多个持久 TUN 部分恢复失败时释放句柄，修复检查点后可重新附着。
+
+这些定向测试不替代 Console 发布链路或其他架构、PVM 模式的验收。
+
 PVM 使用 `--host-virtualization pvm`，在本轮外层 VM 中隐藏 VMX／SVM，验证配对内核安装、待重启状态、手动重启后的 PVM 模式与真实 Guest。普通 KVM 结果不代表 PVM 已通过。包内元数据、低 glibc 基线、存储边界与构建入口见 [Cube 运行栈](../../../docs/cube-runtime.md)。
 
 资源默认值变更必须另外指定 `--host-memory-mib 1024 --host-cpus 1`，验证真实小宿主安装与 Guest/双承载网络。默认 6 GiB 宿主继续用于完整兼容矩阵，不能代替 1 GiB 验收。BPF 表容量升级用同源 `CubeNet/cubevs` 测试二进制在一次性宿主的私有 bpffs 中验证复制、重复执行和容量不足时保留原 pin。
@@ -31,7 +39,6 @@ PVM 使用 `--host-virtualization pvm`，在本轮外层 VM 中隐藏 VMX／SVM�
 并显式选择 ignored 用例 `cube_artifact_real_guest_lifecycle`。它使用独立的私有执行记录和临时 SSH 身份，
 验证四份产物的确认、真实 SSH、DNS 覆盖与恢复、保盘停机／改配／开机、数据及 SSH 主机身份保持、篡改拒绝和物理清理。
 默认 Guest 内存为 512 MiB，可用 `BROCADE_CVM_ARTIFACT_KVM_MEMORY_MIB` 显式选择合法档位；
-`BROCADE_CVM_ARTIFACT_KVM_BASELINE=legacy` 仅运行原规格路径的创建／删除对照，不算产物验收通过。
 测试失败或清理不明时保留私有目录并打印位置，不自动重建或猜测磁盘归属。
 该用例不替代 Console/Store 的 HTTP 与 PostgreSQL 验证，也不验证运行栈发行安装或入口／隧道承载。
 
@@ -41,9 +48,13 @@ PVM 使用 `--host-virtualization pvm`，在本轮外层 VM 中隐藏 VMX／SVM�
 `release_kvm_acceptance.py` 共同使用本轮独占的三个外层 KVM（计算、网络提供者、独立客户端），
 安装固定构建入口生成的真实 Console、Agent 和 Cube 运行包，通过正式 API 发布配置并核对实际回执。
 OS 镜像和运行包须显式提供摘要；具体参数见各脚本。受限输出目录包含节点令牌、会话和测试密钥，不能提交或公开。
+故障注入期间会断开本轮代理的既有 Agent 通道并拒绝重新升级，使用生产 HTTP 回退路径截获真实回执；
+恢复后继续透传实际 WebSocket 通道。不能把只拦截 HTTP、却仍放行通道 RPC 的脚本当作故障验收通过。
+实验网卡的整 IP 回程与探测网段使用持久静态路由；跨月改时钟后仍核对客户端回程，避免 DHCP 更新清除临时路由。
 
 `release_chain_acceptance.py` 在该实验状态上逐阶段执行：`prepare` 校验并上传 `chain_probe.go`
-构建的独立端点，`configure` 发布真实线路、授权与普通 WireGuard 下一跳，`primary` 为仅有主网卡的
+构建的独立端点；执行 `chain_icmp` 时，另将同源 `attachment_probe.go` 产物作为 `prepare` 的第二个文件参数，
+供受限 Guest I/O 正向对照使用。`configure` 发布真实线路、授权与普通 WireGuard 下一跳，`primary` 为仅有主网卡的
 实例选择线路。`traffic`、`mixed_routes`、`source_guard`、`faults`、`quotas`、`grant_revocation`
 分别核对双栈 TCP／UDP、线路内部域名／IP／协议／端口分流、网卡和线路的共同优先级、绑定业务源地址的绕过尝试、
 进程和上游故障、真实用量／限速／额度及撤销授权。阻断验收同时检查独立目的地的新 SYN／UDP 计数，不能仅以客户端超时当作不回落的证明。
@@ -64,3 +75,20 @@ Cube 的无主 `Ready` TAP 复用池会保留；验收要求没有活动所有�
 
 `release_chain_ui.mjs` 在实际 KVM Console 上检查组合台提案、路由编译预览和输入清单，覆盖桌面及窄屏，
 不拦截 API 响应；`release_kvm_ui.mjs` 检查混合发布与原生产物。它们补充前端组件和截图比较，不能替代真实网络流量验收。
+
+`release_baremetal_chain_acceptance.py <私有实验目录> <阶段>` 复用上述独占 KVM、已发布的线路与独立目的端，
+将计算 VM 的现有操作系统作为真实裸机执行器接管。先完成并清理 Cube 实例，保留线路与网卡发布项，
+安装支持 `cvm-check --baremetal-chain-contract` 的同源发行 Agent，再运行 `adopt`。
+该阶段确认旧 Cube 实例与宿主网络状态完成清理，写入本轮服务专属的裸机配置，验证双栈 TCP／UDP、线路内部
+域名／IP／端口／协议分流、管理进程与入站回包保护，以及保存、重放、撤回和恢复发布。
+`verify` 重跑已接管实例的完整正向矩阵；`mixed` 挂载真实业务网卡，比较最长前缀、协议端口和同前缀优先级，
+随后发布卸载并恢复原线路。`faults` 注入客户端退出、入口失联、策略表丢失、授权撤销和 Agent 重启，
+同时核对独立目的端的新连接计数，验证不可用时不直连回退。`quotas` 使用真实用量核对已有用户限速和额度。
+
+`release_baremetal_chain_ui.mjs <私有实验目录>` 在真实 Console 的 1440／390／320 px 页面验证裸机线路可选，
+并实际执行手机端保存、撤回和恢复发布。上述阶段涉及写操作，须串行运行。
+最后运行裸机 `cleanup`，经正式释放宿主流程确认原操作系统、启动身份和标记数据保留，
+检查本轮线路设备、策略规则与防火墙清理，再移除本轮 backend drop-in，恢复原 Cube 执行器。
+恢复 Cube 执行器后可继续其发行回归；所有阶段完成后关闭本轮外层 KVM。不得用此脚本切换生产 Agent 后端。
+
+容器由管理员创建并授权，不再准备用户配额。真实 Guest 的 SSH 验收通过独立凭据接口取得自动密码，使用私有密码文件和 SSH askpass，不把密码写入命令参数、实例规格或验收日志；重装后重新取得生效版本。

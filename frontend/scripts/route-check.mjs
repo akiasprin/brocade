@@ -66,8 +66,21 @@ function reads(name, hash, expected) {
 console.log('— 往返 —');
 trip('CVM 首页', { nav: 'cvm' }, '#/cvm');
 trip('创建 CVM', { nav: 'cvm', drill: { p: 'new' } }, '#/cvm/new');
+trip('指定宿主创建 CVM', { nav: 'cvm', drill: { p: 'new', host: 'hk-01' } }, '#/cvm/new?host=hk-01');
+trip('复制 CVM', { nav: 'cvm', drill: { p: 'new', copy: 'cvm-one' } }, '#/cvm/new?copy=cvm-one');
+trip('纳管裸机', { nav: 'cvm', drill: { p: 'adopt' } }, '#/cvm/adopt');
+trip('CVM 宿主', { nav: 'cvm', drill: { p: 'hosts' } }, '#/cvm/hosts');
+trip('CVM 网络资源', { nav: 'cvm', drill: { p: 'networks' } }, '#/cvm/networks');
+trip('编辑出口网络', { nav: 'cvm', drill: { p: 'network', id: 'network-hk' } }, '#/cvm/network/network-hk');
+trip('创建出口网络', { nav: 'cvm', drill: { p: 'network-new' } }, '#/cvm/network-new');
+reads('旧的组合台地址回到容器清单', '#/cvm/board', { nav: 'cvm' });
 reads('旧的用户转发入口回到 CVM 首页', '#/cvm/connect', { nav: 'cvm' });
 trip('CVM 实例', { nav: 'cvm', drill: { p: 'instance', id: 'cvm-one' } }, '#/cvm/instance/cvm-one');
+trip(
+  'CVM 实例网络定位',
+  { nav: 'cvm', drill: { p: 'instance', id: 'cvm-one', tab: 'network' } },
+  '#/cvm/instance/cvm-one?tab=network',
+);
 
 trip('面的根', { nav: 'nodes' }, '#/nodes');
 trip('列表等于根', { nav: 'nodes', drill: { p: 'list' } }, '#/nodes', { nav: 'nodes' });

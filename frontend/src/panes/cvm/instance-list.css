@@ -1,0 +1,697 @@
+/* 容器清单：按宿主分组的表格。卡面同 .panel，分组行用 --band 色带，表头用面板标题色。 */
+.cvm-instance-list {
+  container: cvm-list / inline-size;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── 工具条：状态筛选、宿主 / 使用者下拉、搜索 ── */
+.cvm-list-toolbar {
+  --ctl-h: 28px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 0 10px;
+  box-sizing: border-box;
+}
+.cvm-list-filters,
+.cvm-list-batch-actions {
+  display: flex;
+  gap: 5px;
+}
+.cvm-list-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--btn);
+  color: var(--ink-2);
+  font: 12.5px var(--sans);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.cvm-list-filter small {
+  color: var(--ink-4);
+  font-size: 11px;
+}
+.cvm-list-filter[data-tone='err'] small {
+  color: var(--err);
+}
+.cvm-list-filter[data-tone='gold'] small {
+  color: var(--gold);
+}
+.cvm-list-filter-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+}
+.cvm-list-filter[data-tone='err'] .cvm-list-filter-dot {
+  background: var(--err);
+}
+.cvm-list-filter[data-tone='gold'] .cvm-list-filter-dot {
+  background: var(--gold);
+}
+.cvm-list-filter[aria-pressed='true'] {
+  border-color: color-mix(in srgb, var(--action) 38%, var(--line));
+  background: var(--action-wash);
+  color: var(--action);
+  font-weight: 600;
+}
+.cvm-list-filter[aria-pressed='true'] small {
+  color: inherit;
+}
+.cvm-list-filter:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--action) 44%, transparent);
+  outline-offset: 1px;
+}
+@media (hover: hover) {
+  .cvm-list-filter:not([aria-pressed='true']):hover {
+    background: var(--btn-h);
+  }
+}
+.cvm-list-sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 2px;
+  background: var(--line);
+}
+/* 下拉：标签与当前值放进同一个控件框，选择器本身无边框。 */
+.cvm-list-select {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  min-width: 0;
+  padding: 0 0 0 9px;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+  color: var(--ink-4);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.cvm-list-select > select {
+  field-sizing: content;
+  max-width: 150px;
+  height: 100%;
+  padding: 0 26px 0 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink-2);
+  font: 500 12px var(--sans);
+  cursor: pointer;
+}
+.cvm-list-select > select:focus-visible {
+  outline: none;
+}
+.cvm-list-select:focus-within {
+  border-color: color-mix(in srgb, var(--action) 55%, var(--line));
+}
+.cvm-list-search {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: min(100%, 250px);
+  min-width: 0;
+  margin-left: auto;
+  color: var(--ink-4);
+}
+.cvm-list-search > .ui-icon {
+  position: absolute;
+  left: 9px;
+  pointer-events: none;
+}
+.cvm-list-search > input.f {
+  width: 100%;
+  min-width: 0;
+  min-height: 28px;
+  padding: 0 28px 0 28px;
+  font: 12px var(--sans);
+}
+.cvm-list-search > kbd,
+.cvm-list-clear > kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  height: 16px;
+  padding: 0 3px;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--card);
+  color: var(--ink-3);
+  font: 10px var(--mono);
+}
+.cvm-list-search > kbd {
+  position: absolute;
+  right: 7px;
+  pointer-events: none;
+}
+.cvm-list-recovery {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+/* 批量条：勾选后替换工具条。 */
+.cvm-list-batch {
+  min-height: 44px;
+  margin-bottom: 10px;
+  padding: 6px 10px 6px 12px;
+  border: 1px solid color-mix(in srgb, var(--action) 34%, var(--line));
+  border-radius: var(--r-card);
+  background: color-mix(in srgb, var(--action) 7%, var(--card));
+}
+.cvm-list-batch > b {
+  font-size: 12.5px;
+}
+.cvm-list-batch .btn {
+  gap: 5px;
+}
+.cvm-list-host-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 10px;
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+  font-size: 12px;
+}
+.cvm-list-host-counts > li {
+  overflow-wrap: anywhere;
+}
+.cvm-list-batch > .cvm-list-clear {
+  gap: 6px;
+  margin-left: auto;
+}
+
+/* ── 表格 ── */
+.cvm-list-table-frame {
+  overflow: clip;
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  background: var(--card);
+  box-shadow: var(--sheet-shadow);
+}
+.cvm-list-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  text-align: left;
+}
+.cvm-list-table th,
+.cvm-list-table td {
+  padding: 7px 8px;
+  text-align: left;
+}
+.cvm-list-table thead th {
+  height: 32px;
+  padding-block: 0;
+  box-sizing: border-box;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--panel-heading-bg);
+  color: var(--panel-heading-ink);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.cvm-list-table :is(th, td):first-child {
+  padding-left: 14px;
+}
+.cvm-list-table :is(th, td):last-child {
+  padding-right: 10px;
+}
+.cvm-list-table .cvm-list-check {
+  width: 38px;
+  box-sizing: border-box;
+}
+.cvm-list-check input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--action);
+  vertical-align: middle;
+  cursor: pointer;
+}
+.cvm-list-col-0 {
+  width: 24%;
+}
+.cvm-list-col-1 {
+  width: 128px;
+}
+.cvm-list-col-2,
+.cvm-list-col-3 {
+  width: 84px;
+}
+.cvm-list-col-6 {
+  width: 112px;
+}
+.cvm-list-col-7 {
+  width: 150px;
+}
+
+/* 分组行：宿主名、运行时与状态，右侧是分配量。 */
+.cvm-list-host-row > th {
+  height: 40px;
+  padding: 0 10px 0 14px;
+  box-sizing: border-box;
+  border-top: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--band);
+}
+.cvm-list-table tbody:first-of-type .cvm-list-host-row > th {
+  border-top: 0;
+}
+.cvm-list-host {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 9px;
+  min-width: 0;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-weight: 400;
+}
+.cvm-list-host > b {
+  color: var(--panel-title-ink);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.cvm-list-host > .ui-icon {
+  color: var(--ink-3);
+}
+.cvm-list-host > .st {
+  margin: 0;
+}
+.cvm-list-host-capacity {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-left: auto;
+}
+.cvm-list-capacity,
+.cvm-list-usage {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+.cvm-list-capacity > span:first-child,
+.cvm-list-muted {
+  color: var(--ink-4);
+}
+.cvm-list-capacity .mono,
+.cvm-list-usage .mono {
+  font: 11.5px var(--mono);
+}
+.cvm-list-usage .mono {
+  min-width: 30px;
+  text-align: right;
+}
+.cvm-list-capacity .cvm-meter,
+.cvm-list-usage .cvm-meter {
+  width: 44px;
+  flex: 0 1 44px;
+}
+.cvm-list-create {
+  margin-left: 4px;
+}
+.cvm-list-host-capacity + .cvm-list-create {
+  margin-left: 4px;
+}
+.cvm-list-host > :not(.cvm-list-host-capacity) + .cvm-list-create {
+  margin-left: auto;
+}
+
+/* 容器行 */
+.cvm-list-row {
+  cursor: pointer;
+}
+.cvm-list-row + .cvm-list-row {
+  border-top: 1px solid var(--line-soft);
+}
+@media (hover: hover) {
+  .cvm-list-row:hover {
+    background: var(--hover);
+  }
+}
+.cvm-list-row:focus-within {
+  background: var(--hover);
+}
+.cvm-list-row[data-selected='true'] {
+  background: color-mix(in srgb, var(--action) 6%, var(--card));
+}
+.cvm-list-name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.cvm-list-name > .st {
+  flex: none;
+  margin: 0;
+}
+.cvm-list-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--ink-4);
+}
+.cvm-list-dot[data-tone='ok'] {
+  background: var(--ok);
+}
+.cvm-list-dot[data-tone='warn'] {
+  background: var(--gold);
+}
+.cvm-list-dot[data-tone='bad'] {
+  background: var(--err);
+}
+.cvm-list-link {
+  min-width: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.cvm-list-link:hover,
+.cvm-list-link:focus-visible {
+  color: var(--action);
+}
+.cvm-list-row[data-deleting='true'] .cvm-list-link {
+  color: var(--ink-3);
+  text-decoration: line-through;
+  text-decoration-color: var(--gold);
+}
+.cvm-list-meta,
+.cvm-list-error {
+  display: block;
+  margin: 2px 0 0 14px;
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-list-error {
+  color: var(--gold);
+}
+.cvm-list-error[data-tone='bad'] {
+  color: var(--err);
+}
+.cvm-list-spec {
+  color: var(--ink-2);
+  font: 11.5px var(--mono);
+  white-space: nowrap;
+}
+.cvm-list-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+.cvm-list-month {
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.cvm-list-month .mono {
+  font: 11.5px var(--mono);
+}
+.cvm-list-month > small {
+  display: block;
+  color: var(--gold);
+}
+
+/* 行操作：常用操作悬停出现，异常行的「重试 / 核查」与「⋯」常驻。 */
+.cvm-list-table .cvm-list-action-cell {
+  padding-inline: 2px 8px;
+}
+.cvm-list-actions,
+.cvm-list-quick {
+  --ctl-h: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 1px;
+}
+.cvm-list-actions {
+  position: relative;
+  min-height: 28px;
+}
+.cvm-list-actions .btn.icon {
+  width: 26px;
+  min-width: 26px;
+  padding: 0;
+}
+.cvm-list-attention-action.btn {
+  gap: 5px;
+  margin-right: 2px;
+  white-space: nowrap;
+}
+.cvm-list-actions .cvm-list-more {
+  width: 28px;
+  height: 26px;
+}
+.cvm-list-blocked {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 1;
+  white-space: nowrap;
+}
+.machine-action-menu .copy-button small.mono {
+  overflow: hidden;
+  font: 10.5px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-list-empty-host td {
+  height: 38px;
+  padding-left: 52px;
+  color: var(--ink-4);
+  font-size: 12px;
+}
+
+/* ── 列表操作确认 ── */
+.dialog-layer > .cvm-list-confirm {
+  width: min(460px, calc(100vw - 24px));
+  max-height: min(84dvh, 630px);
+  overflow-wrap: anywhere;
+}
+.dialog-layer.popover > .cvm-list-confirm {
+  width: min(310px, calc(100vw - 24px));
+  max-height: min(52dvh, 340px);
+  padding: 12px 14px;
+}
+.cvm-list-confirm .confirm-body > p {
+  margin-block: 0 8px;
+}
+.cvm-list-confirm .confirm-body > :last-child {
+  margin-bottom: 0;
+}
+.cvm-list-results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.cvm-list-results > li {
+  padding-block: 7px;
+  border-top: 1px solid var(--line-soft);
+}
+.cvm-list-results > li:last-child {
+  padding-bottom: 0;
+}
+.cvm-list-result-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+}
+.cvm-list-result-row small {
+  display: block;
+}
+.cvm-list-delete-impact {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 8px;
+  margin: 5px 0 8px;
+}
+.cvm-list-delete-impact dt {
+  color: var(--ink-3);
+}
+.cvm-list-delete-impact dd {
+  margin: 0;
+}
+.cvm-list-confirm .cvm-field > .f {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.cvm-list-results [data-result='saved'] {
+  color: var(--ok);
+}
+.cvm-list-results [data-result='failed'] {
+  color: var(--err);
+}
+.cvm-list-results [data-result='uncertain'] {
+  color: var(--gold);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .cvm-list-quick {
+    opacity: 0;
+    transition: opacity 0.12s;
+  }
+  .cvm-list-row:hover .cvm-list-quick,
+  .cvm-list-row:focus-within .cvm-list-quick,
+  .cvm-list-row[data-selected='true'] .cvm-list-quick {
+    opacity: 1;
+  }
+}
+
+/* ── 窄屏：卡片清单，筛选条横向滚动，宿主下拉与搜索同一行 ── */
+@container cvm-list (max-width: 820px) {
+  .cvm-list-toolbar {
+    gap: 6px;
+    padding-bottom: 8px;
+  }
+  .cvm-list-filters {
+    flex: 0 0 100%;
+    min-width: 0;
+    overflow-x: auto;
+    padding: 1px;
+    scrollbar-width: none;
+  }
+  .cvm-list-filters::-webkit-scrollbar {
+    display: none;
+  }
+  .cvm-list-filters > .cvm-list-filter {
+    flex: none;
+  }
+  .cvm-list-sep {
+    display: none;
+  }
+  .cvm-list-select > select {
+    max-width: 96px;
+  }
+  .cvm-list-search {
+    flex: 1 1 120px;
+    width: auto;
+  }
+  .cvm-list-search > kbd {
+    display: none;
+  }
+  .cvm-list-batch-actions {
+    flex-wrap: wrap;
+  }
+  .cvm-list-table-frame {
+    overflow: visible;
+    border: 0;
+    background: none;
+    box-shadow: none;
+  }
+  .cvm-list-table,
+  .cvm-list-table tbody,
+  .cvm-list-host-row,
+  .cvm-list-host-row > th,
+  .cvm-list-empty-host,
+  .cvm-list-empty-host > td {
+    display: block;
+  }
+  .cvm-list-table thead {
+    display: none;
+  }
+  .cvm-list-host-row > th {
+    height: auto;
+    padding: 6px 2px 6px;
+    border: 0;
+    background: none;
+  }
+  .cvm-list-host > .st,
+  .cvm-list-host-capacity,
+  .cvm-list-create {
+    display: none;
+  }
+  .cvm-list-row,
+  .cvm-list-row + .cvm-list-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'name actions'
+      'spec spec'
+      'in in'
+      'out out';
+    gap: 4px 6px;
+    align-items: start;
+    margin: 0 0 8px;
+    padding: 10px 10px 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-card);
+    background: var(--card);
+    box-shadow: var(--sheet-shadow);
+  }
+  .cvm-list-table .cvm-list-row td {
+    padding: 0;
+  }
+  .cvm-list-table .cvm-list-row .cvm-list-check {
+    display: none;
+  }
+  .cvm-list-identity {
+    grid-area: name;
+    align-self: center;
+    min-width: 0;
+  }
+  .cvm-list-spec {
+    grid-area: spec;
+    padding-left: 14px !important;
+  }
+  .cvm-list-network {
+    grid-area: in;
+    min-width: 0;
+    padding-left: 14px !important;
+  }
+  .cvm-list-network + .cvm-list-network {
+    grid-area: out;
+  }
+  .cvm-list-network:empty,
+  .cvm-list-no-entry,
+  .cvm-list-metric,
+  .cvm-list-traffic,
+  .cvm-list-quick {
+    display: none;
+  }
+  .cvm-list-action-cell {
+    grid-area: actions;
+  }
+  .cvm-list-actions .cvm-list-more {
+    width: 32px;
+    height: 30px;
+  }
+  .cvm-list-actions .cvm-list-attention-action {
+    min-height: 30px;
+  }
+  .cvm-list-empty-host td {
+    padding: 4px 2px 10px;
+  }
+}

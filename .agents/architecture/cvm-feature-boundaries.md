@@ -13,7 +13,7 @@
 
 ## 裸机执行后端
 
-`cvm` Agent 可显式选择 `BROCADE_CVM_BACKEND=baremetal`。Store 仍是用户、整机独占绑定、额度和网络分配的唯一权威；共享期望状态用 execution target 区分 Cube 与现有宿主 OS。原盘账本只属于 Cube，裸机纳管不创建虚假卷。裸机能力和回执按协议 71 门槛分发，保留旧 Cube JSON。
+`cvm` Agent 同时承载 Cube 与物理宿主执行器，不提供全局后端模式开关。Store 仍是用户、物理宿主绑定、额度和网络分配的唯一权威；共享期望状态用 execution target 区分 Cube 与现有宿主 OS，并由 Agent 逐实例分派。原盘账本只属于 Cube，物理宿主纳管不创建虚假卷；旧 `BROCADE_CVM_BACKEND=baremetal` 仅作为安装器转换前需要识别并拒绝静默自更新的历史状态。
 
 裸机终端由同一个 Agent 二进制的独立本地服务持有 PTY，用现有账号运行，无业务进程或文件系统隔离。Agent 负责原有宿主上的受管网卡、路由和入口，解除纳管只清理自己拥有的对象；重装、硬件电源和资源调整不在此执行域。启用与恢复边界见[裸机实例](../../docs/baremetal.md)。
 

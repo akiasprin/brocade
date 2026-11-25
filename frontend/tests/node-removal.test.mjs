@@ -20,5 +20,5 @@ test('永久移除调用批量 DELETE 接口并明确清理关联线路', () => 
   assert.match(api, /api<RemoveRetiredNodesResult>\('\/nodes', '', \{/);
   assert.match(api, /method: 'DELETE'/);
   assert.match(api, /JSON\.stringify\(\{ node_ids: nodeIds \}\)/);
-  assert.match(nodes, /所有包含这些机器的线路会一并删除/);
+  assert.match(nodes, /所有包含这些机器的线路、运行状态、发布目标和用量明细会一并清理/);
 });

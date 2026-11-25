@@ -1,7 +1,6 @@
 //! Node-wide network capacity and durable per-user, per-host assignments.
 use super::*;
 
-pub const NETWORK_QUOTA_PROTOCOL_VERSION: u32 = 66;
 pub const NETWORK_QUOTA_CONTRACT: &str = "cubevs-user-quota-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

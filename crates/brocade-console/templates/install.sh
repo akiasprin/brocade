@@ -35,6 +35,9 @@ AGENT_FLAVOR=${BROCADE_AGENT_FLAVOR:-}
 AGENT_FLAVOR_EXPLICIT=$AGENT_FLAVOR
 ENABLE_CVM=${BROCADE_ENABLE_CVM:-0}
 CVM_SUPPORTED=__BROCADE_CVM_SUPPORTED__
+REUSE_NODE_TOKEN=0
+HOST_SYSTEM_CONFIG=/etc/brocade/cvm-host.json
+HOST_SYSTEM_DROPIN=/etc/systemd/system/brocade-agent.service.d/30-brocade-host-system.conf
 CVM_MODE=${BROCADE_CVM_MODE:-}
 CVM_REBOOT_PENDING=0
 CVM_BUNDLE_URL=${BROCADE_CVM_BUNDLE_URL:-}
@@ -44,9 +47,9 @@ CVM_INSTALLER_URL=${BROCADE_CVM_INSTALLER_URL:-}
 CVM_INSTALLER_SHA256=__BROCADE_CVM_INSTALLER_SHA256__
 CVM_APPROVED_BUNDLES=__BROCADE_CVM_APPROVED_BUNDLES__
 if [ -n "${BROCADE_VPNGATE_STATS_WINDOW_SECS:-}" ]; then
-    VPNGATE_STATS_WINDOW_EXPLICIT=1
+  VPNGATE_STATS_WINDOW_EXPLICIT=1
 else
-    VPNGATE_STATS_WINDOW_EXPLICIT=
+  VPNGATE_STATS_WINDOW_EXPLICIT=
 fi
 VPNGATE_STATS_WINDOW_SECS=${BROCADE_VPNGATE_STATS_WINDOW_SECS:-900}
 INSTALL_DIR=${BROCADE_AGENT_INSTALL_DIR:-/usr/local/bin}
@@ -59,187 +62,191 @@ TMPFILES=
 # drop -s while keeping -f -S -L. The progress bar goes to stderr, as this script's other notices
 # do.
 if [ -t 1 ]; then
-    CURL_FLAGS='-fSL --progress-bar'
+  CURL_FLAGS='-fSL --progress-bar'
 else
-    CURL_FLAGS='-fsSL'
+  CURL_FLAGS='-fsSL'
 fi
 
 cleanup() {
-    [ -n "$TMPFILES" ] && rm -f $TMPFILES
-    return 0
+  [ -n "$TMPFILES" ] && rm -f $TMPFILES
+  return 0
 }
 trap cleanup EXIT INT TERM
 
 usage() {
-    echo "usage: sh brocade-install.sh --server URL [--enroll-token TOKEN | --node-token TOKEN]" >&2
-    echo "  首次纳管用 --enroll-token（一次性）" >&2
-    echo "  token 轮换 / 机器重装用 --node-token（控制面重签时会给出这条完整命令）" >&2
-    echo "  都不带 = 沿用机器上已有的 token，纯升级" >&2
-    echo "         [--apply linux|state-dir]" >&2
-    echo "         [--service-mode auto|systemd|openrc|foreground]" >&2
-    echo "         [--enable-openvpn]" >&2
-    echo "         [--enable-cvm] [--cvm-bundle-url URL --cvm-bundle-sha256 SHA256]" >&2
-    echo "         [--cvm-mode auto|kvm|pvm]" >&2
-    echo "         [--vpngate-stats-window-secs SECONDS]" >&2
-    echo "         [--agent-bin-url URL] [--agent-bin-sha256 SHA256]" >&2
-    echo "         [--xray-bin-url URL] [--xray-bin-sha256 SHA256] [--xray-version TAG]" >&2
-    echo "         [--phantun-server-url URL] [--phantun-server-sha256 SHA256]" >&2
-    echo "         [--phantun-client-url URL] [--phantun-client-sha256 SHA256]" >&2
-    echo >&2
-    echo "  --apply linux      默认。把产物真的落到系统上：配 wg0、拉起 xray" >&2
-    echo "  --apply state-dir  只把产物写进状态目录，不碰系统。lab 用，生产别用" >&2
-    echo "  --service-mode auto        默认。自动选择 systemd 或 OpenRC" >&2
-    echo "  --service-mode systemd     强制写 systemd unit" >&2
-    echo "  --service-mode openrc      强制写 OpenRC service" >&2
-    echo "  --service-mode foreground  不写服务，直接 exec agent。preview 容器用" >&2
-    echo "  --enable-openvpn            安装 OpenVPN/iptables，加载并持久化 TUN；默认不安装" >&2
-    echo "  --agent-flavor base|cvm     选择 Agent 变体；网络提供节点只需 cvm，不必安装计算栈" >&2
-    echo "  --enable-cvm                安装经过摘要校验的 CVM 节点运行栈；自动选择 KVM/PVM，PVM 换核后等待手动重启" >&2
-    echo "  --cvm-mode auto|kvm|pvm      显式选择 CVM 模式；省略时保留已有选择，首次默认 auto" >&2
-    echo "  --vpngate-stats-window-secs 本机 VPN Gate 性能统计窗口；默认 900，范围 60–86400 秒" >&2
+  echo "usage: sh brocade-install.sh --server URL [--enroll-token TOKEN | --node-token TOKEN]" >&2
+  echo "  首次纳管用 --enroll-token（一次性）" >&2
+  echo "  token 轮换 / 机器重装用 --node-token（控制面重签时会给出这条完整命令）" >&2
+  echo "  都不带 = 沿用机器上已有的 token，纯升级" >&2
+  echo "         [--apply linux|state-dir]" >&2
+  echo "         [--service-mode auto|systemd|openrc|foreground]" >&2
+  echo "         [--enable-openvpn]" >&2
+  echo "         [--enable-cvm] [--cvm-bundle-url URL --cvm-bundle-sha256 SHA256]" >&2
+  echo "         [--reuse-node-token]" >&2
+  echo "         [--cvm-mode auto|kvm|pvm]" >&2
+  echo "         [--vpngate-stats-window-secs SECONDS]" >&2
+  echo "         [--agent-bin-url URL] [--agent-bin-sha256 SHA256]" >&2
+  echo "         [--xray-bin-url URL] [--xray-bin-sha256 SHA256] [--xray-version TAG]" >&2
+  echo "         [--phantun-server-url URL] [--phantun-server-sha256 SHA256]" >&2
+  echo "         [--phantun-client-url URL] [--phantun-client-sha256 SHA256]" >&2
+  echo >&2
+  echo "  --apply linux      默认。把产物真的落到系统上：配 wg0、拉起 xray" >&2
+  echo "  --apply state-dir  只把产物写进状态目录，不碰系统。lab 用，生产别用" >&2
+  echo "  --service-mode auto        默认。自动选择 systemd 或 OpenRC" >&2
+  echo "  --service-mode systemd     强制写 systemd unit" >&2
+  echo "  --service-mode openrc      强制写 OpenRC service" >&2
+  echo "  --service-mode foreground  不写服务，直接 exec agent。preview 容器用" >&2
+  echo "  --enable-openvpn            安装 OpenVPN/iptables，加载并持久化 TUN；默认不安装" >&2
+  echo "  --agent-flavor base|cvm     选择 Agent 变体；网络提供节点只需 cvm，不必安装计算栈" >&2
+  echo "  --enable-cvm                安装 Cube 与宿主系统组合执行栈；自动选择 KVM/PVM，PVM 换核后等待手动重启" >&2
+  echo "  --cvm-mode auto|kvm|pvm      显式选择 CVM 模式；省略时保留已有选择，首次默认 auto" >&2
+  echo "  --vpngate-stats-window-secs 本机 VPN Gate 性能统计窗口；默认 900，范围 60–86400 秒" >&2
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
 install_pkg() {
-    if have apt-get; then
-        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$1" >/dev/null
-    elif have dnf; then
-        dnf install -y -q "$1" >/dev/null
-    elif have yum; then
-        yum install -y -q "$1" >/dev/null
-    elif have apk; then
-        apk add --no-cache "$1" >/dev/null
-    elif have pacman; then
-        pacman -Sy --noconfirm "$1" >/dev/null
-    elif have zypper; then
-        zypper --non-interactive install -y "$1" >/dev/null
-    elif have xbps-install; then
-        xbps-install -Sy "$1" >/dev/null
-    elif have emerge; then
-        emerge --quiet "$1" >/dev/null
-    else
-        return 1
-    fi
+  if have apt-get; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$1" >/dev/null
+  elif have dnf; then
+    dnf install -y -q "$1" >/dev/null
+  elif have yum; then
+    yum install -y -q "$1" >/dev/null
+  elif have apk; then
+    apk add --no-cache "$1" >/dev/null
+  elif have pacman; then
+    pacman -Sy --noconfirm "$1" >/dev/null
+  elif have zypper; then
+    zypper --non-interactive install -y "$1" >/dev/null
+  elif have xbps-install; then
+    xbps-install -Sy "$1" >/dev/null
+  elif have emerge; then
+    emerge --quiet "$1" >/dev/null
+  else
+    return 1
+  fi
 }
 
 # Optional system-layer protection. Application-layer limits do not require these tools.
 if ! have tc; then
-    if have apk; then
-        install_pkg iproute2-tc || echo "tc 未安装；系统层限速待补齐依赖，应用层不受影响。" >&2
-    elif have dnf || have yum; then
-        install_pkg iproute-tc || echo "tc 未安装；系统层限速待补齐依赖，应用层不受影响。" >&2
-    else
-        install_pkg iproute2 || echo "tc 未安装；系统层限速待补齐依赖，应用层不受影响。" >&2
-    fi
+  if have apk; then
+    install_pkg iproute2-tc || echo "tc 未安装；系统层限速待补齐依赖，应用层不受影响。" >&2
+  elif have dnf || have yum; then
+    install_pkg iproute-tc || echo "tc 未安装；系统层限速待补齐依赖，应用层不受影响。" >&2
+  else
+    install_pkg iproute2 || echo "tc 未安装；系统层限速待补齐依赖，应用层不受影响。" >&2
+  fi
 fi
 
 tun_device_usable() {
-    [ -c /dev/net/tun ] || return 1
-    # Merely seeing a device node is insufficient in a restricted container: the devices cgroup
-    # may still reject opening it. Opening and immediately closing the clone device creates no
-    # interface, but proves that OpenVPN will at least reach TUNSETIFF instead of failing at open(2).
-    (: <> /dev/net/tun) 2>/dev/null
+  [ -c /dev/net/tun ] || return 1
+  # Merely seeing a device node is insufficient in a restricted container: the devices cgroup
+  # may still reject opening it. Opening and immediately closing the clone device creates no
+  # interface, but proves that OpenVPN will at least reach TUNSETIFF instead of failing at open(2).
+  (: <>/dev/net/tun) 2>/dev/null
 }
 
 ensure_tun_runtime() {
-    if ! tun_device_usable; then
-        # A built-in TUN driver already exposes this sysfs entry. Otherwise load the module before
-        # creating the device node; doing it in the opposite order can leave a convincing but dead
-        # /dev/net/tun behind on kernels that do not provide the driver.
-        if [ ! -r /sys/class/misc/tun/dev ]; then
-            if ! have modprobe; then
-                echo "installing kmod for the VPN Gate TUN driver ..." >&2
-                install_pkg kmod || {
-                    echo "无法安装 modprobe；不能加载 VPN Gate 所需的 tun 内核模块" >&2
-                    return 1
-                }
-            fi
-            if ! modprobe tun; then
-                echo "当前内核无法加载 tun 模块；VPN Gate 的 OpenVPN 隧道无法创建" >&2
-                return 1
-            fi
-        fi
-
-        # devtmpfs normally creates this automatically. Minimal containers and a few VPS images
-        # expose the kernel misc device without populating /dev/net, so recover only from the
-        # kernel-advertised major/minor pair instead of hard-coding an unverified device node.
-        if [ ! -c /dev/net/tun ] && [ -r /sys/class/misc/tun/dev ]; then
-            tun_device_number=$(cat /sys/class/misc/tun/dev 2>/dev/null || true)
-            tun_major=${tun_device_number%%:*}
-            tun_minor=${tun_device_number#*:}
-            case "$tun_major:$tun_minor" in
-                *[!0-9:]*|:|*:)
-                    echo "内核返回了无效的 TUN 设备号：${tun_device_number:-空}" >&2
-                    return 1
-                    ;;
-            esac
-            if [ -e /dev/net/tun ]; then
-                echo "/dev/net/tun 已存在但不是字符设备；拒绝覆盖" >&2
-                return 1
-            fi
-            install -d -m 0755 /dev/net || return 1
-            mknod /dev/net/tun c "$tun_major" "$tun_minor" || return 1
-            chmod 0666 /dev/net/tun || return 1
-        fi
-    fi
-
-    if ! tun_device_usable; then
-        echo "/dev/net/tun 不可用；可能是容器未透传设备或宿主机禁止 TUN" >&2
+  if ! tun_device_usable; then
+    # A built-in TUN driver already exposes this sysfs entry. Otherwise load the module before
+    # creating the device node; doing it in the opposite order can leave a convincing but dead
+    # /dev/net/tun behind on kernels that do not provide the driver.
+    if [ ! -r /sys/class/misc/tun/dev ]; then
+      if ! have modprobe; then
+        echo "installing kmod for the VPN Gate TUN driver ..." >&2
+        install_pkg kmod || {
+          echo "无法安装 modprobe；不能加载 VPN Gate 所需的 tun 内核模块" >&2
+          return 1
+        }
+      fi
+      if ! modprobe tun; then
+        echo "当前内核无法加载 tun 模块；VPN Gate 的 OpenVPN 隧道无法创建" >&2
         return 1
+      fi
     fi
 
-    # Both systemd-modules-load and Alpine/OpenRC consume this directory. Keep it separate from
-    # brocade.conf: tune_conntrack owns that file and rewrites it on every installer run.
-    install -d -m 0755 /etc/modules-load.d || return 1
-    tun_module_stage=/etc/modules-load.d/.brocade-vpngate.$$
-    TMPFILES="$TMPFILES $tun_module_stage"
-    printf 'tun\n' > "$tun_module_stage" || return 1
-    chmod 0644 "$tun_module_stage" || return 1
-    mv -f "$tun_module_stage" /etc/modules-load.d/brocade-vpngate.conf || return 1
-    echo "VPN Gate TUN 已就绪，并会在开机时加载。" >&2
+    # devtmpfs normally creates this automatically. Minimal containers and a few VPS images
+    # expose the kernel misc device without populating /dev/net, so recover only from the
+    # kernel-advertised major/minor pair instead of hard-coding an unverified device node.
+    if [ ! -c /dev/net/tun ] && [ -r /sys/class/misc/tun/dev ]; then
+      tun_device_number=$(cat /sys/class/misc/tun/dev 2>/dev/null || true)
+      tun_major=${tun_device_number%%:*}
+      tun_minor=${tun_device_number#*:}
+      case "$tun_major:$tun_minor" in
+      *[!0-9:]* | : | *:)
+        echo "内核返回了无效的 TUN 设备号：${tun_device_number:-空}" >&2
+        return 1
+        ;;
+      esac
+      if [ -e /dev/net/tun ]; then
+        echo "/dev/net/tun 已存在但不是字符设备；拒绝覆盖" >&2
+        return 1
+      fi
+      install -d -m 0755 /dev/net || return 1
+      mknod /dev/net/tun c "$tun_major" "$tun_minor" || return 1
+      chmod 0666 /dev/net/tun || return 1
+    fi
+  fi
+
+  if ! tun_device_usable; then
+    echo "/dev/net/tun 不可用；可能是容器未透传设备或宿主机禁止 TUN" >&2
+    return 1
+  fi
+
+  # Both systemd-modules-load and Alpine/OpenRC consume this directory. Keep it separate from
+  # brocade.conf: tune_conntrack owns that file and rewrites it on every installer run.
+  install -d -m 0755 /etc/modules-load.d || return 1
+  tun_module_stage=/etc/modules-load.d/.brocade-vpngate.$$
+  TMPFILES="$TMPFILES $tun_module_stage"
+  printf 'tun\n' >"$tun_module_stage" || return 1
+  chmod 0644 "$tun_module_stage" || return 1
+  mv -f "$tun_module_stage" /etc/modules-load.d/brocade-vpngate.conf || return 1
+  echo "VPN Gate TUN 已就绪，并会在开机时加载。" >&2
 }
 
 # Download, verify, install. **A failure at any step must not touch $dest.**
 # Installing nothing is safer than replacing a working binary with a partial download.
 fetch_binary() {
-    url=$1
-    want_sha=$2
-    dest=$3
-    tmp=$(mktemp)
-    TMPFILES="$TMPFILES $tmp"
-    if ! curl $CURL_FLAGS "$url" -o "$tmp"; then
-        echo "下载失败：$url（$dest 保持原样）" >&2
-        return 1
+  url=$1
+  want_sha=$2
+  dest=$3
+  tmp=$(mktemp)
+  TMPFILES="$TMPFILES $tmp"
+  if ! curl $CURL_FLAGS "$url" -o "$tmp"; then
+    echo "下载失败：$url（$dest 保持原样）" >&2
+    return 1
+  fi
+  if [ ! -s "$tmp" ]; then
+    echo "下载到的是空文件：$url（$dest 保持原样）" >&2
+    return 1
+  fi
+  if [ -n "$want_sha" ]; then
+    if ! printf '%s  %s\n' "$want_sha" "$tmp" | sha256sum -c - >/dev/null 2>&1; then
+      echo "sha256 不匹配：$url（$dest 保持原样）" >&2
+      return 1
     fi
-    if [ ! -s "$tmp" ]; then
-        echo "下载到的是空文件：$url（$dest 保持原样）" >&2
-        return 1
-    fi
-    if [ -n "$want_sha" ]; then
-        if ! printf '%s  %s\n' "$want_sha" "$tmp" | sha256sum -c - >/dev/null 2>&1; then
-            echo "sha256 不匹配：$url（$dest 保持原样）" >&2
-            return 1
-        fi
-    fi
-    if [ "$dest" = "${AGENT_BIN:-}" ]; then
-        [ -n "$want_sha" ] || { echo "Agent 下载必须提供 SHA-256" >&2; return 1; }
-        chmod 0700 "$tmp"
-        verify_agent_candidate "$tmp" || return 1
-    fi
-    install_binary_atomic "$tmp" "$dest"
+  fi
+  if [ "$dest" = "${AGENT_BIN:-}" ]; then
+    [ -n "$want_sha" ] || {
+      echo "Agent 下载必须提供 SHA-256" >&2
+      return 1
+    }
+    chmod 0700 "$tmp"
+    verify_agent_candidate "$tmp" || return 1
+  fi
+  install_binary_atomic "$tmp" "$dest"
 }
 
 # Stage beside the destination and rename only after the complete file has its final mode. This
 # keeps a running binary intact across disk-full, permission, and interrupted-copy failures.
 install_binary_atomic() {
-    src=$1
-    dest=$2
-    stage=$(mktemp "$(dirname "$dest")/.brocade-install.XXXXXX") || return 1
-    TMPFILES="$TMPFILES $stage"
-    install -m 0755 "$src" "$stage" || return 1
-    mv -f "$stage" "$dest"
+  src=$1
+  dest=$2
+  stage=$(mktemp "$(dirname "$dest")/.brocade-install.XXXXXX") || return 1
+  TMPFILES="$TMPFILES $stage"
+  install -m 0755 "$src" "$stage" || return 1
+  mv -f "$stage" "$dest"
 }
 
 # Xray is a Brocade-owned build artifact. The normal source is this Console's embedded binary;
@@ -255,14 +262,14 @@ GEODATA_BASE=${BROCADE_GEODATA_BASE:-https://raw.githubusercontent.com/Loyalsold
 # digest identifies those bytes; another xray in PATH or a differently formatted version banner
 # must not reject them. An explicitly supplied URL remains the operator escape hatch.
 verify_xray_pin() {
-    [ -z "$XRAY_BIN_URL_EXPLICIT" ] || return 0
+  [ -z "$XRAY_BIN_URL_EXPLICIT" ] || return 0
 
-    actual_sha=$(sha256sum "$XRAY_BIN" 2>/dev/null | cut -d' ' -f1)
-    if [ -n "$XRAY_BIN_SHA256" ] && [ "$actual_sha" = "$XRAY_BIN_SHA256" ]; then
-        return 0
-    fi
-    echo "安装的 Xray（$XRAY_BIN）sha256 与 Console 分发的 Brocade Xray $XRAY_VERSION 不一致。" >&2
-    return 1
+  actual_sha=$(sha256sum "$XRAY_BIN" 2>/dev/null | cut -d' ' -f1)
+  if [ -n "$XRAY_BIN_SHA256" ] && [ "$actual_sha" = "$XRAY_BIN_SHA256" ]; then
+    return 0
+  fi
+  echo "安装的 Xray（$XRAY_BIN）sha256 与 Console 分发的 Brocade Xray $XRAY_VERSION 不一致。" >&2
+  return 1
 }
 
 # geoip.dat / geosite.dat must be present, **regardless of whether a rule table uses them**.
@@ -273,45 +280,45 @@ verify_xray_pin() {
 # That is, xray **does not start**. So they are a precondition for a machine working at all, not an
 # optional dependency of one class of rule.
 ensure_geodata() {
-    need=
-    [ -s "$XRAY_ASSET_DIR/geoip.dat" ] || need="$need geoip.dat"
-    [ -s "$XRAY_ASSET_DIR/geosite.dat" ] || need="$need geosite.dat"
-    [ -n "$need" ] || return 0
+  need=
+  [ -s "$XRAY_ASSET_DIR/geoip.dat" ] || need="$need geoip.dat"
+  [ -s "$XRAY_ASSET_DIR/geosite.dat" ] || need="$need geosite.dat"
+  [ -n "$need" ] || return 0
 
-    echo "缺规则库（$need），下载中 ..." >&2
-    mkdir -p "$XRAY_ASSET_DIR"
-    for f in $need; do
-        if curl -fsSL --max-time 120 "$GEODATA_BASE/$f" -o "$XRAY_ASSET_DIR/$f.tmp" \
-           && [ -s "$XRAY_ASSET_DIR/$f.tmp" ]; then
-            mv "$XRAY_ASSET_DIR/$f.tmp" "$XRAY_ASSET_DIR/$f"
-        else
-            rm -f "$XRAY_ASSET_DIR/$f.tmp"
-            echo "  下不到 $f——这台机器上带 geosite:/geoip: 的配置会让 xray 起不来" >&2
-            return 1
-        fi
-    done
-    return 0
+  echo "缺规则库（$need），下载中 ..." >&2
+  mkdir -p "$XRAY_ASSET_DIR"
+  for f in $need; do
+    if curl -fsSL --max-time 120 "$GEODATA_BASE/$f" -o "$XRAY_ASSET_DIR/$f.tmp" &&
+      [ -s "$XRAY_ASSET_DIR/$f.tmp" ]; then
+      mv "$XRAY_ASSET_DIR/$f.tmp" "$XRAY_ASSET_DIR/$f"
+    else
+      rm -f "$XRAY_ASSET_DIR/$f.tmp"
+      echo "  下不到 $f——这台机器上带 geosite:/geoip: 的配置会让 xray 起不来" >&2
+      return 1
+    fi
+  done
+  return 0
 }
 
 install_xray() {
-    if [ -z "$XRAY_BIN_URL" ]; then
-        if [ -z "$DIST_JSON" ]; then
-            echo "问不到 $SERVER/enroll/dist，拿不到 Brocade Xray；不会回退下载社区 Xray。" >&2
-            echo "请确认 --server 指向控制面的节点入口，或显式传 --xray-bin-url。" >&2
-        elif [ -z "$XRAY_ARCH" ]; then
-            echo "控制面只内嵌 x86_64 和 aarch64 的 Brocade Xray，本机是 $(uname -m)。" >&2
-            echo "请为这个架构构建 Brocade Xray，并用 --xray-bin-url 明确指定。" >&2
-        else
-            echo "控制面的分发清单缺少 $XRAY_ARCH 的 Brocade Xray；拒绝回退社区版本。" >&2
-        fi
-        return 1
+  if [ -z "$XRAY_BIN_URL" ]; then
+    if [ -z "$DIST_JSON" ]; then
+      echo "问不到 $SERVER/enroll/dist，拿不到 Brocade Xray；不会回退下载社区 Xray。" >&2
+      echo "请确认 --server 指向控制面的节点入口，或显式传 --xray-bin-url。" >&2
+    elif [ -z "$XRAY_ARCH" ]; then
+      echo "控制面只内嵌 x86_64 和 aarch64 的 Brocade Xray，本机是 $(uname -m)。" >&2
+      echo "请为这个架构构建 Brocade Xray，并用 --xray-bin-url 明确指定。" >&2
+    else
+      echo "控制面的分发清单缺少 $XRAY_ARCH 的 Brocade Xray；拒绝回退社区版本。" >&2
     fi
-    if [ -n "$XRAY_BIN_SHA256" ] && [ -s "$XRAY_BIN" ] \
-       && printf '%s  %s\n' "$XRAY_BIN_SHA256" "$XRAY_BIN" | sha256sum -c - >/dev/null 2>&1; then
-        return 0
-    fi
-    echo "downloading Brocade Xray ($XRAY_VERSION) ..." >&2
-    fetch_binary "$XRAY_BIN_URL" "$XRAY_BIN_SHA256" "$XRAY_BIN"
+    return 1
+  fi
+  if [ -n "$XRAY_BIN_SHA256" ] && [ -s "$XRAY_BIN" ] &&
+    printf '%s  %s\n' "$XRAY_BIN_SHA256" "$XRAY_BIN" | sha256sum -c - >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "downloading Brocade Xray ($XRAY_VERSION) ..." >&2
+  fetch_binary "$XRAY_BIN_URL" "$XRAY_BIN_SHA256" "$XRAY_BIN"
 }
 
 # phantun: WireGuard is UDP only, and this wears a TCP disguise for it when an upstream seals inbound
@@ -323,229 +330,268 @@ install_xray() {
 # plainly that phantun-server is not on PATH when starting the instance and health turns red — better
 # than stopping the whole installation here.
 install_phantun() {
-    # Distributed by the control plane (preferred): each binary has its own URL and sha
-    if [ -n "$PHANTUN_SERVER_URL" ] && [ -n "$PHANTUN_CLIENT_URL" ]; then
-        fetch_binary "$PHANTUN_SERVER_URL" "$PHANTUN_SERVER_SHA" "$PHANTUN_SERVER_BIN" || return 1
-        fetch_binary "$PHANTUN_CLIENT_URL" "$PHANTUN_CLIENT_SHA" "$PHANTUN_CLIENT_BIN" || return 1
-        return 0
-    fi
-    if [ -n "$PHANTUN_BIN_URL" ]; then
-        fetch_binary "$PHANTUN_BIN_URL" "$PHANTUN_BIN_SHA256" "$PHANTUN_SERVER_BIN" || return 1
-        return 0
-    fi
-    # Reading the output again: an empty file's --help also "succeeds"
-    if "$PHANTUN_SERVER_BIN" --help 2>/dev/null | grep -qi phantun \
-        && "$PHANTUN_CLIENT_BIN" --help 2>/dev/null | grep -qi phantun; then
-        return 0
-    fi
+  # Distributed by the control plane (preferred): each binary has its own URL and sha
+  if [ -n "$PHANTUN_SERVER_URL" ] && [ -n "$PHANTUN_CLIENT_URL" ]; then
+    fetch_binary "$PHANTUN_SERVER_URL" "$PHANTUN_SERVER_SHA" "$PHANTUN_SERVER_BIN" || return 1
+    fetch_binary "$PHANTUN_CLIENT_URL" "$PHANTUN_CLIENT_SHA" "$PHANTUN_CLIENT_BIN" || return 1
+    return 0
+  fi
+  if [ -n "$PHANTUN_BIN_URL" ]; then
+    fetch_binary "$PHANTUN_BIN_URL" "$PHANTUN_BIN_SHA256" "$PHANTUN_SERVER_BIN" || return 1
+    return 0
+  fi
+  # Reading the output again: an empty file's --help also "succeeds"
+  if "$PHANTUN_SERVER_BIN" --help 2>/dev/null | grep -qi phantun &&
+    "$PHANTUN_CLIENT_BIN" --help 2>/dev/null | grep -qi phantun; then
+    return 0
+  fi
 
-    case "$(uname -m)" in
-        x86_64|amd64) triple=x86_64-unknown-linux-musl ;;
-        aarch64|arm64) triple=aarch64-unknown-linux-musl ;;
-        armv7l|armv7) triple=armv7-unknown-linux-musleabihf ;;
-        i686|i386) triple=i686-unknown-linux-musl ;;
-        *)
-            echo "不认识的架构 $(uname -m)，需要伪 TCP 的话用 --phantun-server-url / --phantun-client-url 指定" >&2
-            return 1
-            ;;
-    esac
-    if [ "$PHANTUN_VERSION" = "latest" ]; then
-        base="https://github.com/dndx/phantun/releases/latest/download"
-    else
-        base="https://github.com/dndx/phantun/releases/download/$PHANTUN_VERSION"
-    fi
+  case "$(uname -m)" in
+  x86_64 | amd64) triple=x86_64-unknown-linux-musl ;;
+  aarch64 | arm64) triple=aarch64-unknown-linux-musl ;;
+  armv7l | armv7) triple=armv7-unknown-linux-musleabihf ;;
+  i686 | i386) triple=i686-unknown-linux-musl ;;
+  *)
+    echo "不认识的架构 $(uname -m)，需要伪 TCP 的话用 --phantun-server-url / --phantun-client-url 指定" >&2
+    return 1
+    ;;
+  esac
+  if [ "$PHANTUN_VERSION" = "latest" ]; then
+    base="https://github.com/dndx/phantun/releases/latest/download"
+  else
+    base="https://github.com/dndx/phantun/releases/download/$PHANTUN_VERSION"
+  fi
 
-    # The release page gives a zip holding the client and server binaries, not two bare files
-    echo "downloading phantun ($triple) ..." >&2
-    zip=$(mktemp)
-    TMPFILES="$TMPFILES $zip"
-    if ! curl $CURL_FLAGS "$base/phantun_$triple.zip" -o "$zip"; then
-        echo "下不到 phantun_$triple.zip，需要伪 TCP 的话用 --phantun-server-url / --phantun-client-url 指定" >&2
-        return 1
-    fi
-    if ! have unzip; then
-        install_pkg unzip || {
-            echo "需要 unzip 解开 phantun 发行包，且无法自动安装" >&2
-            return 1
-        }
-    fi
-    dir=$(mktemp -d)
-    if ! unzip -oq "$zip" -d "$dir"; then
-        echo "phantun 发行包解不开" >&2
-        rm -rf "$dir"
-        return 1
-    fi
-    # Inside the archive they are phantun_client / phantun_server (underscores) and land as the
-    # hyphenated names: the agent pkills by process name and the two must agree (stop_phantun in
-    # main.rs)
-    for prog in server client; do
-        src=$(find "$dir" -type f -name "phantun_$prog" | head -1)
-        if [ -z "$src" ]; then
-            echo "phantun 发行包里找不到 phantun_$prog" >&2
-            rm -rf "$dir"
-            return 1
-        fi
-        install_binary_atomic "$src" "$INSTALL_DIR/phantun-$prog" || { rm -rf "$dir"; return 1; }
-    done
+  # The release page gives a zip holding the client and server binaries, not two bare files
+  echo "downloading phantun ($triple) ..." >&2
+  zip=$(mktemp)
+  TMPFILES="$TMPFILES $zip"
+  if ! curl $CURL_FLAGS "$base/phantun_$triple.zip" -o "$zip"; then
+    echo "下不到 phantun_$triple.zip，需要伪 TCP 的话用 --phantun-server-url / --phantun-client-url 指定" >&2
+    return 1
+  fi
+  if ! have unzip; then
+    install_pkg unzip || {
+      echo "需要 unzip 解开 phantun 发行包，且无法自动安装" >&2
+      return 1
+    }
+  fi
+  dir=$(mktemp -d)
+  if ! unzip -oq "$zip" -d "$dir"; then
+    echo "phantun 发行包解不开" >&2
     rm -rf "$dir"
+    return 1
+  fi
+  # Inside the archive they are phantun_client / phantun_server (underscores) and land as the
+  # hyphenated names: the agent pkills by process name and the two must agree (stop_phantun in
+  # main.rs)
+  for prog in server client; do
+    src=$(find "$dir" -type f -name "phantun_$prog" | head -1)
+    if [ -z "$src" ]; then
+      echo "phantun 发行包里找不到 phantun_$prog" >&2
+      rm -rf "$dir"
+      return 1
+    fi
+    install_binary_atomic "$src" "$INSTALL_DIR/phantun-$prog" || {
+      rm -rf "$dir"
+      return 1
+    }
+  done
+  rm -rf "$dir"
 }
 
 while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --server)
-            SERVER=${2:-}
-            shift 2
-            ;;
-        --enroll-token)
-            ENROLL_TOKEN=${2:-}
-            shift 2
-            ;;
-        --node-token)
-            NODE_TOKEN_ARG=${2:-}
-            shift 2
-            ;;
-        --apply)
-            APPLY_MODE=${2:-}
-            APPLY_MODE_EXPLICIT=1
-            shift 2
-            ;;
-        --service-mode)
-            SERVICE_MODE=${2:-}
-            shift 2
-            ;;
-        --enable-openvpn)
-            ENABLE_VPNGATE=1
-            shift
-            ;;
-        --agent-flavor)
-            AGENT_FLAVOR=${2:-}
-            AGENT_FLAVOR_EXPLICIT=$AGENT_FLAVOR
-            case "$AGENT_FLAVOR" in base|cvm) ;; *) echo "Agent flavor 必须是 base 或 cvm" >&2; exit 1 ;; esac
-            shift 2
-            ;;
-        --enable-cvm)
-            ENABLE_CVM=1
-            shift
-            ;;
-        --cvm-mode)
-            CVM_MODE=${2:-}
-            case "$CVM_MODE" in auto|kvm|pvm) ;; *) echo "CVM mode 必须是 auto、kvm 或 pvm" >&2; exit 1 ;; esac
-            ENABLE_CVM=1
-            shift 2
-            ;;
-        --cvm-bundle-url)
-            CVM_BUNDLE_URL=${2:-}
-            shift 2
-            ;;
-        --cvm-bundle-sha256)
-            CVM_BUNDLE_SHA256=${2:-}
-            shift 2
-            ;;
-        --vpngate-stats-window-secs)
-            VPNGATE_STATS_WINDOW_SECS=${2:-}
-            VPNGATE_STATS_WINDOW_EXPLICIT=1
-            shift 2
-            ;;
-        --agent-bin-url)
-            AGENT_BIN_URL=${2:-}
-            shift 2
-            ;;
-        --agent-bin-sha256)
-            AGENT_BIN_SHA256=${2:-}
-            shift 2
-            ;;
-        --xray-bin-url)
-            XRAY_BIN_URL=${2:-}
-            XRAY_BIN_URL_EXPLICIT=1
-            shift 2
-            ;;
-        --xray-version)
-            XRAY_VERSION=${2:-}
-            XRAY_VERSION_EXPLICIT=1
-            shift 2
-            ;;
-        --xray-bin-sha256)
-            XRAY_BIN_SHA256=${2:-}
-            shift 2
-            ;;
-        --phantun-server-url)
-            PHANTUN_SERVER_URL=${2:-}
-            shift 2
-            ;;
-        --phantun-server-sha256)
-            PHANTUN_SERVER_SHA=${2:-}
-            shift 2
-            ;;
-        --phantun-client-url)
-            PHANTUN_CLIENT_URL=${2:-}
-            shift 2
-            ;;
-        --phantun-client-sha256)
-            PHANTUN_CLIENT_SHA=${2:-}
-            shift 2
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            usage
-            exit 2
-            ;;
+  case "$1" in
+  --server)
+    SERVER=${2:-}
+    shift 2
+    ;;
+  --enroll-token)
+    ENROLL_TOKEN=${2:-}
+    shift 2
+    ;;
+  --node-token)
+    NODE_TOKEN_ARG=${2:-}
+    shift 2
+    ;;
+  --apply)
+    APPLY_MODE=${2:-}
+    APPLY_MODE_EXPLICIT=1
+    shift 2
+    ;;
+  --service-mode)
+    SERVICE_MODE=${2:-}
+    shift 2
+    ;;
+  --enable-openvpn)
+    ENABLE_VPNGATE=1
+    shift
+    ;;
+  --agent-flavor)
+    AGENT_FLAVOR=${2:-}
+    AGENT_FLAVOR_EXPLICIT=$AGENT_FLAVOR
+    case "$AGENT_FLAVOR" in base | cvm) ;; *)
+      echo "Agent flavor 必须是 base 或 cvm" >&2
+      exit 1
+      ;;
     esac
+    shift 2
+    ;;
+  --enable-cvm)
+    ENABLE_CVM=1
+    shift
+    ;;
+  --reuse-node-token)
+    REUSE_NODE_TOKEN=1
+    shift
+    ;;
+  --cvm-mode)
+    CVM_MODE=${2:-}
+    case "$CVM_MODE" in auto | kvm | pvm) ;; *)
+      echo "CVM mode 必须是 auto、kvm 或 pvm" >&2
+      exit 1
+      ;;
+    esac
+    ENABLE_CVM=1
+    shift 2
+    ;;
+  --cvm-bundle-url)
+    CVM_BUNDLE_URL=${2:-}
+    shift 2
+    ;;
+  --cvm-bundle-sha256)
+    CVM_BUNDLE_SHA256=${2:-}
+    shift 2
+    ;;
+  --vpngate-stats-window-secs)
+    VPNGATE_STATS_WINDOW_SECS=${2:-}
+    VPNGATE_STATS_WINDOW_EXPLICIT=1
+    shift 2
+    ;;
+  --agent-bin-url)
+    AGENT_BIN_URL=${2:-}
+    shift 2
+    ;;
+  --agent-bin-sha256)
+    AGENT_BIN_SHA256=${2:-}
+    shift 2
+    ;;
+  --xray-bin-url)
+    XRAY_BIN_URL=${2:-}
+    XRAY_BIN_URL_EXPLICIT=1
+    shift 2
+    ;;
+  --xray-version)
+    XRAY_VERSION=${2:-}
+    XRAY_VERSION_EXPLICIT=1
+    shift 2
+    ;;
+  --xray-bin-sha256)
+    XRAY_BIN_SHA256=${2:-}
+    shift 2
+    ;;
+  --phantun-server-url)
+    PHANTUN_SERVER_URL=${2:-}
+    shift 2
+    ;;
+  --phantun-server-sha256)
+    PHANTUN_SERVER_SHA=${2:-}
+    shift 2
+    ;;
+  --phantun-client-url)
+    PHANTUN_CLIENT_URL=${2:-}
+    shift 2
+    ;;
+  --phantun-client-sha256)
+    PHANTUN_CLIENT_SHA=${2:-}
+    shift 2
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+  esac
 done
 
 if [ -z "$SERVER" ]; then
-    usage
-    exit 2
+  usage
+  exit 2
 fi
 # On an upgrade, omission means "keep what this machine was using", not "switch to linux". An
 # explicit environment value or --apply still wins; only a truly unspecified value is inherited.
 if [ -z "$APPLY_MODE_EXPLICIT" ] && [ -r "$CONFIG_DIR/env" ]; then
-    APPLY_MODE=$(sed -n 's/^BROCADE_AGENT_APPLY=//p' "$CONFIG_DIR/env" | tail -n 1)
+  APPLY_MODE=$(sed -n 's/^BROCADE_AGENT_APPLY=//p' "$CONFIG_DIR/env" | tail -n 1)
 fi
 if [ -z "$VPNGATE_STATS_WINDOW_EXPLICIT" ] && [ -r "$CONFIG_DIR/env" ]; then
-    inherited_vpngate_stats_window=$(sed -n 's/^BROCADE_VPNGATE_STATS_WINDOW_SECS=//p' "$CONFIG_DIR/env" | tail -n 1)
-    if [ -n "$inherited_vpngate_stats_window" ]; then
-        VPNGATE_STATS_WINDOW_SECS=$inherited_vpngate_stats_window
-    fi
+  inherited_vpngate_stats_window=$(sed -n 's/^BROCADE_VPNGATE_STATS_WINDOW_SECS=//p' "$CONFIG_DIR/env" | tail -n 1)
+  if [ -n "$inherited_vpngate_stats_window" ]; then
+    VPNGATE_STATS_WINDOW_SECS=$inherited_vpngate_stats_window
+  fi
 fi
 [ -n "$APPLY_MODE" ] || APPLY_MODE=linux
 # Product identity is required from the first release; experimental Agents are not adopted.
 installed_flavor=
 if [ -x "$INSTALL_DIR/brocade-agent" ]; then
-    installed_probe=$("$INSTALL_DIR/brocade-agent" self-test 2>/dev/null) || { echo "已有 Agent 自检失败，未替换" >&2; exit 1; }
-    installed_flavor=$(printf '%s\n' "$installed_probe" | sed -n 's/^brocade-agent-product:\(base\|cvm\):v1$/\1/p')
-    case "$installed_flavor" in base|cvm) ;; *) echo "已有 Agent 缺少首发产品身份，不接管实验状态" >&2; exit 1 ;; esac
+  installed_probe=$("$INSTALL_DIR/brocade-agent" self-test 2>/dev/null) || {
+    echo "已有 Agent 自检失败，未替换" >&2
+    exit 1
+  }
+  installed_flavor=$(printf '%s\n' "$installed_probe" | sed -n 's/^brocade-agent-product:\(base\|cvm\):v1$/\1/p')
+  case "$installed_flavor" in base | cvm) ;; *)
+    echo "已有 Agent 缺少首发产品身份，不接管实验状态" >&2
+    exit 1
+    ;;
+  esac
 fi
 if [ "$ENABLE_CVM" = "1" ]; then
-    [ "$AGENT_FLAVOR_EXPLICIT" != "base" ] || { echo "计算扩展需要 CVM Agent" >&2; exit 1; }
-    AGENT_FLAVOR=cvm
+  [ "$AGENT_FLAVOR_EXPLICIT" != "base" ] || {
+    echo "宿主系统与容器运行需要 CVM Agent" >&2
+    exit 1
+  }
+  AGENT_FLAVOR=cvm
 fi
 [ -n "$AGENT_FLAVOR" ] || AGENT_FLAVOR=${installed_flavor:-base}
-case "$AGENT_FLAVOR" in base|cvm) ;; *) echo "Agent flavor 必须是 base 或 cvm" >&2; exit 1 ;; esac
+case "$AGENT_FLAVOR" in base | cvm) ;; *)
+  echo "Agent flavor 必须是 base 或 cvm" >&2
+  exit 1
+  ;;
+esac
 if [ "$AGENT_FLAVOR" = "cvm" ] && [ "$CVM_SUPPORTED" != "1" ]; then
-    echo "当前 Console 为基础版；请先安装容器版扩展" >&2; exit 1
+  echo "当前 Console 为基础版；请先安装容器版扩展" >&2
+  exit 1
 fi
 if [ "$installed_flavor" = "cvm" ] && [ "$AGENT_FLAVOR" = "base" ]; then
-    if have systemctl && systemctl is-active --quiet brocade-agent.service; then
-        echo "请先排空容器资源并停止 brocade-agent.service，再切换为基础版" >&2; exit 1
-    fi
-    if have rc-service && rc-service brocade-agent status >/dev/null 2>&1; then
-        echo "请先排空容器资源并停止 brocade-agent，再切换为基础版" >&2; exit 1
-    fi
-    [ -s "$CONFIG_DIR/token" ] || { echo "请先使用原纳管身份确认 CVM 清理，不能离线降级" >&2; exit 1; }
-    "$INSTALL_DIR/brocade-agent" product-check --state-dir "$STATE_DIR" \
-        --server "$SERVER" --token-file "$CONFIG_DIR/token" || exit 1
+  if have systemctl && systemctl is-active --quiet brocade-agent.service; then
+    echo "请先排空容器资源并停止 brocade-agent.service，再切换为基础版" >&2
+    exit 1
+  fi
+  if have rc-service && rc-service brocade-agent status >/dev/null 2>&1; then
+    echo "请先排空容器资源并停止 brocade-agent，再切换为基础版" >&2
+    exit 1
+  fi
+  [ -s "$CONFIG_DIR/token" ] || {
+    echo "请先使用原纳管身份确认 CVM 清理，不能离线降级" >&2
+    exit 1
+  }
+  "$INSTALL_DIR/brocade-agent" product-check --state-dir "$STATE_DIR" \
+    --server "$SERVER" --token-file "$CONFIG_DIR/token" || exit 1
 fi
 
 verify_agent_candidate() {
-    candidate=$1
-    probe_out=$("$candidate" self-test 2>/dev/null) || { echo "候选 Agent 自检失败，旧文件保持原样" >&2; return 1; }
-    printf '%s\n' "$probe_out" | grep -Fxq "brocade-agent-product:$AGENT_FLAVOR:v1" || {
-        echo "候选 Agent 产品变体不匹配，旧文件保持原样" >&2; return 1;
-    }
-    printf '%s\n' "$probe_out" | grep -Fxq 'brocade-agent-self-test-v1'
+  candidate=$1
+  probe_out=$("$candidate" self-test 2>/dev/null) || {
+    echo "候选 Agent 自检失败，旧文件保持原样" >&2
+    return 1
+  }
+  printf '%s\n' "$probe_out" | grep -Fxq "brocade-agent-product:$AGENT_FLAVOR:v1" || {
+    echo "候选 Agent 产品变体不匹配，旧文件保持原样" >&2
+    return 1
+  }
+  printf '%s\n' "$probe_out" | grep -Fxq 'brocade-agent-self-test-v1'
 }
 
 # Re-running this script on an already enrolled machine is an upgrade: replace the binaries, fill in
@@ -554,89 +600,100 @@ verify_agent_candidate() {
 # Three credential routes, in order of precedence: a directly issued long-lived token, a one-time
 # enrollment, then whatever the machine already has. The middle one is a first enrollment, and the
 # first covers a re-signed token, a lost token, and a reinstalled machine.
-if [ -n "$NODE_TOKEN_ARG" ]; then
-    CRED_MODE=node-token
+if [ "$REUSE_NODE_TOKEN" = "1" ]; then
+  [ -s "$CONFIG_DIR/token" ] || {
+    echo "当前机器没有可沿用的纳管凭据" >&2
+    exit 1
+  }
+  previous_server=$(sed -n 's/^BROCADE_AGENT_SERVER=//p' "$CONFIG_DIR/env" | tail -n 1)
+  [ "${previous_server%/}" = "$SERVER" ] || {
+    echo "现有 Agent 连接的是另一台 Console，拒绝转移凭据" >&2
+    exit 1
+  }
+  CRED_MODE=reuse
+elif [ -n "$NODE_TOKEN_ARG" ]; then
+  CRED_MODE=node-token
 elif [ -n "$ENROLL_TOKEN" ]; then
-    CRED_MODE=enroll
+  CRED_MODE=enroll
 elif [ -s "$CONFIG_DIR/token" ]; then
-    CRED_MODE=reuse
+  CRED_MODE=reuse
 else
-    echo "这台还没纳管过：首次要 --enroll-token，或用 --node-token 直接下发控制面签好的 token" >&2
-    usage
-    exit 2
+  echo "这台还没纳管过：首次要 --enroll-token，或用 --node-token 直接下发控制面签好的 token" >&2
+  usage
+  exit 2
 fi
 case "$APPLY_MODE" in
-    linux|state-dir) ;;
-    *)
-        echo "unknown --apply value: $APPLY_MODE (expected linux or state-dir)" >&2
-        exit 2
-        ;;
+linux | state-dir) ;;
+*)
+  echo "unknown --apply value: $APPLY_MODE (expected linux or state-dir)" >&2
+  exit 2
+  ;;
 esac
 case "$SERVICE_MODE" in
-    auto|systemd|openrc|foreground) ;;
-    *)
-        echo "unknown --service-mode value: $SERVICE_MODE (expected auto, systemd, openrc, or foreground)" >&2
-        exit 2
-        ;;
+auto | systemd | openrc | foreground) ;;
+*)
+  echo "unknown --service-mode value: $SERVICE_MODE (expected auto, systemd, openrc, or foreground)" >&2
+  exit 2
+  ;;
 esac
 case "$ENABLE_VPNGATE" in
-    0|1) ;;
-    *)
-        echo "BROCADE_ENABLE_VPNGATE must be 0 or 1" >&2
-        exit 2
-        ;;
+0 | 1) ;;
+*)
+  echo "BROCADE_ENABLE_VPNGATE must be 0 or 1" >&2
+  exit 2
+  ;;
 esac
 case "$VPNGATE_STATS_WINDOW_SECS" in
-    ''|*[!0-9]*)
-        echo "BROCADE_VPNGATE_STATS_WINDOW_SECS must be an integer between 60 and 86400" >&2
-        exit 2
-        ;;
+'' | *[!0-9]*)
+  echo "BROCADE_VPNGATE_STATS_WINDOW_SECS must be an integer between 60 and 86400" >&2
+  exit 2
+  ;;
 esac
 if [ "$VPNGATE_STATS_WINDOW_SECS" -lt 60 ] || [ "$VPNGATE_STATS_WINDOW_SECS" -gt 86400 ]; then
-    echo "BROCADE_VPNGATE_STATS_WINDOW_SECS must be between 60 and 86400 seconds" >&2
-    exit 2
+  echo "BROCADE_VPNGATE_STATS_WINDOW_SECS must be between 60 and 86400 seconds" >&2
+  exit 2
 fi
 
 SERVER=$(printf '%s' "$SERVER" | sed 's:/*$::')
 if [ "$(id -u)" != "0" ]; then
-    echo "brocade install must run as root" >&2
-    exit 1
+  echo "brocade install must run as root" >&2
+  exit 1
 fi
 if ! have curl; then
-    echo "curl is required" >&2
-    exit 1
+  echo "curl is required" >&2
+  exit 1
 fi
 
 # Resolve the default before enrollment consumes a one-time token. Failing here leaves the token
 # usable and avoids the old state where all files were installed but no init could start them.
 if [ "$SERVICE_MODE" = "auto" ]; then
-    if have systemctl && [ -d /run/systemd/system ]; then
-        SERVICE_MODE=systemd
-    elif have rc-service && have rc-update && have supervise-daemon && [ -x /sbin/openrc-run ]; then
-        SERVICE_MODE=openrc
-    else
-        echo "找不到受支持的服务管理器：需要 systemd，或带 supervise-daemon 的 OpenRC。" >&2
-        echo "容器内如有外部 supervisor，可显式使用 --service-mode foreground。" >&2
-        exit 1
-    fi
+  if have systemctl && [ -d /run/systemd/system ]; then
+    SERVICE_MODE=systemd
+  elif have rc-service && have rc-update && have supervise-daemon && [ -x /sbin/openrc-run ]; then
+    SERVICE_MODE=openrc
+  else
+    echo "找不到受支持的服务管理器：需要 systemd，或带 supervise-daemon 的 OpenRC。" >&2
+    echo "容器内如有外部 supervisor，可显式使用 --service-mode foreground。" >&2
+    exit 1
+  fi
 fi
 if [ "$SERVICE_MODE" = "systemd" ]; then
-    if ! have systemctl || [ ! -d /run/systemd/system ]; then
-        echo "指定了 --service-mode systemd，但 systemd 没有在运行。" >&2
-        exit 1
-    fi
+  if ! have systemctl || [ ! -d /run/systemd/system ]; then
+    echo "指定了 --service-mode systemd，但 systemd 没有在运行。" >&2
+    exit 1
+  fi
 fi
 if [ "$SERVICE_MODE" = "openrc" ]; then
-    missing_openrc=
-    for command in rc-service rc-update supervise-daemon; do
-        have "$command" || missing_openrc="$missing_openrc $command"
-    done
-    [ -x /sbin/openrc-run ] || missing_openrc="$missing_openrc /sbin/openrc-run"
-    if [ -n "$missing_openrc" ]; then
-        echo "指定了 --service-mode openrc，但缺少:$missing_openrc" >&2
-        echo "Alpine 上请先安装/恢复 openrc 包。" >&2
-        exit 1
-    fi
+  missing_openrc=
+  for command in rc-service rc-update supervise-daemon; do
+    have "$command" || missing_openrc="$missing_openrc $command"
+  done
+  [ -x /sbin/openrc-run ] || missing_openrc="$missing_openrc /sbin/openrc-run"
+  if [ -n "$missing_openrc" ]; then
+    echo "指定了 --service-mode openrc，但缺少:$missing_openrc" >&2
+    echo "Alpine 上请先安装/恢复 openrc 包。" >&2
+    exit 1
+  fi
 fi
 
 # Fail before downloading binaries or consuming a one-time enrollment token. OpenVPN can be
@@ -644,50 +701,69 @@ fi
 # particularly common shape on Alpine's virt kernel. Explicit VPN Gate opt-in promises the complete
 # capability, so current and post-reboot TUN availability are both mandatory here.
 if [ "$APPLY_MODE" = "linux" ] && [ "$ENABLE_VPNGATE" = "1" ]; then
-    ensure_tun_runtime || exit 1
+  ensure_tun_runtime || exit 1
 fi
 if [ "$CVM_SUPPORTED" != "1" ] && { [ "$ENABLE_CVM" = "1" ] || [ -n "$CVM_MODE$CVM_BUNDLE_URL$CVM_BUNDLE_SHA256$CVM_INSTALLER_URL" ]; }; then
-    echo "当前 Console 为基础版；请先安装容器版扩展" >&2
-    exit 1
+  echo "当前 Console 为基础版；请先安装容器版扩展" >&2
+  exit 1
 fi
 # CVM network providers need host networking tools even without the compute runtime.
 if [ "$AGENT_FLAVOR" = "cvm" ]; then
-    [ "$APPLY_MODE" = "linux" ] || {
-        echo "CVM Agent 需要 --apply linux" >&2; exit 1;
-    }
-    for cvm_dependency in ip tc ss nft conntrack wg findmnt nsenter mount umount; do
-        if ! have "$cvm_dependency"; then
-            case "$cvm_dependency" in
-                ip|ss)
-                    if have dnf || have yum; then cvm_package=iproute; else cvm_package=iproute2; fi ;;
-                tc)
-                    if have apk; then cvm_package=iproute2-tc
-                    elif have dnf || have yum; then cvm_package=iproute-tc
-                    else cvm_package=iproute2; fi ;;
-                conntrack) cvm_package=conntrack ;;
-                wg) cvm_package=wireguard-tools ;;
-                nft) cvm_package=nftables ;;
-                findmnt|nsenter|mount|umount) cvm_package=util-linux ;;
-            esac
-            install_pkg "$cvm_package" || { echo "CVM 缺少 $cvm_dependency" >&2; exit 1; }
-            have "$cvm_dependency" || { echo "CVM 安装后仍缺少 $cvm_dependency" >&2; exit 1; }
-        fi
-    done
+  [ "$APPLY_MODE" = "linux" ] || {
+    echo "CVM Agent 需要 --apply linux" >&2
+    exit 1
+  }
+  for cvm_dependency in ip tc ss nft conntrack wg findmnt nsenter mount umount; do
+    if ! have "$cvm_dependency"; then
+      case "$cvm_dependency" in
+      ip | ss)
+        if have dnf || have yum; then cvm_package=iproute; else cvm_package=iproute2; fi
+        ;;
+      tc)
+        if have apk; then
+          cvm_package=iproute2-tc
+        elif have dnf || have yum; then
+          cvm_package=iproute-tc
+        else cvm_package=iproute2; fi
+        ;;
+      conntrack) cvm_package=conntrack ;;
+      wg) cvm_package=wireguard-tools ;;
+      nft) cvm_package=nftables ;;
+      findmnt | nsenter | mount | umount) cvm_package=util-linux ;;
+      esac
+      install_pkg "$cvm_package" || {
+        echo "CVM 缺少 $cvm_dependency" >&2
+        exit 1
+      }
+      have "$cvm_dependency" || {
+        echo "CVM 安装后仍缺少 $cvm_dependency" >&2
+        exit 1
+      }
+    fi
+  done
 fi
 if [ "$ENABLE_CVM" = "1" ]; then
-    [ "$APPLY_MODE" = "linux" ] && [ "$SERVICE_MODE" = "systemd" ] || {
-        echo "CVM 扩展需要 --apply linux 和 systemd" >&2; exit 1;
-    }
-    for cvm_dependency in python3 modprobe; do
-        if ! have "$cvm_dependency"; then
-            case "$cvm_dependency" in python3) cvm_package=python3 ;; modprobe) cvm_package=kmod ;; esac
-            install_pkg "$cvm_package" || { echo "CVM 缺少 $cvm_dependency" >&2; exit 1; }
-            have "$cvm_dependency" || { echo "CVM 安装后仍缺少 $cvm_dependency" >&2; exit 1; }
-        fi
-    done
-    python3 -c 'import sys; sys.exit(sys.version_info < (3,11))' || {
-        echo "CVM 安装器需要 Python 3.11 或更新版本" >&2; exit 1;
-    }
+  [ "$APPLY_MODE" = "linux" ] && [ "$SERVICE_MODE" = "systemd" ] || {
+    echo "CVM 扩展需要 --apply linux 和 systemd" >&2
+    exit 1
+  }
+  for cvm_dependency in python3 modprobe; do
+    if ! have "$cvm_dependency"; then
+      case "$cvm_dependency" in python3) cvm_package=python3 ;; modprobe) cvm_package=kmod ;; esac
+      install_pkg "$cvm_package" || {
+        echo "CVM 缺少 $cvm_dependency" >&2
+        exit 1
+      }
+      have "$cvm_dependency" || {
+        echo "CVM 安装后仍缺少 $cvm_dependency" >&2
+        exit 1
+      }
+    fi
+  done
+  python3 -c 'import sys; sys.exit(sys.version_info < (3,11))' || {
+    echo "CVM 安装器需要 Python 3.11 或更新版本" >&2
+    exit 1
+  }
 fi
 
 install -d -m 0755 "$INSTALL_DIR" "$CONFIG_DIR" "$STATE_DIR"
@@ -709,14 +785,14 @@ PHANTUN_CLIENT_BIN="$INSTALL_DIR/phantun-client"
 # `"xray_bin_url":null}`, is taken for a URL and fed to curl, and on a brand-new machine fails
 # install_xray and aborts the whole script.
 dist_field() {
-    printf '%s' "$DIST_JSON" | tr ',' '\n' \
-        | sed -n 's/.*"'"$1"'" *: *"\([^"]*\)".*/\1/p' | head -1
+  printf '%s' "$DIST_JSON" | tr ',' '\n' |
+    sed -n 's/.*"'"$1"'" *: *"\([^"]*\)".*/\1/p' | head -1
 }
 cvm_approved_field() {
-    printf '%s' "$CVM_APPROVED_BUNDLES" | python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1], ""))' "$1"
+  printf '%s' "$CVM_APPROVED_BUNDLES" | python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1], ""))' "$1"
 }
 cvm_download() {
-    python3 - "$@" <<'PY'
+  python3 - "$@" <<'PY'
 import datetime, os, signal, subprocess, sys, time
 label, command = sys.argv[1], sys.argv[2:]
 started = time.monotonic()
@@ -751,219 +827,330 @@ PY
 # having them, are both legitimate ways to install.
 DIST_JSON=
 if curl -fsSL "$SERVER/enroll/dist" -o /tmp/brocade-dist.$$ 2>/dev/null; then
-    DIST_JSON=$(cat /tmp/brocade-dist.$$)
-    TMPFILES="$TMPFILES /tmp/brocade-dist.$$"
+  DIST_JSON=$(cat /tmp/brocade-dist.$$)
+  TMPFILES="$TMPFILES /tmp/brocade-dist.$$"
 fi
 # The host architecture, used to select matching embedded artifacts from the manifest.
 case "$(uname -m)" in
-    x86_64|amd64) AGENT_ARCH=x86_64; XRAY_ARCH=x86_64 ;;
-    aarch64|arm64) AGENT_ARCH=aarch64; XRAY_ARCH=aarch64 ;;
-    # The control plane embeds only these two architectures. No approximation is guessed for
-    # others — what gets installed is an Exec format error, a symptom several layers from the real
-    # cause. It is left empty and reported plainly below.
-    *) AGENT_ARCH=; XRAY_ARCH= ;;
+x86_64 | amd64)
+  AGENT_ARCH=x86_64
+  XRAY_ARCH=x86_64
+  ;;
+aarch64 | arm64)
+  AGENT_ARCH=aarch64
+  XRAY_ARCH=aarch64
+  ;;
+# The control plane embeds only these two architectures. No approximation is guessed for
+# others — what gets installed is an Exec format error, a symptom several layers from the real
+# cause. It is left empty and reported plainly below.
+*)
+  AGENT_ARCH=
+  XRAY_ARCH=
+  ;;
 esac
 
 if [ -n "$DIST_JSON" ]; then
-    # What the operator configured explicitly wins (a CDN, or a fleet holding architectures the
-    # embedding does not cover); unconfigured, the control plane's own copy is selected by host
-    # architecture.
-    if [ -z "$AGENT_BIN_URL" ] && [ -n "$AGENT_ARCH" ]; then
-        AGENT_BIN_URL=$(dist_field "agent_bin_url_${AGENT_FLAVOR}_$AGENT_ARCH")
-        AGENT_BIN_SHA256=$(dist_field "agent_bin_sha256_${AGENT_FLAVOR}_$AGENT_ARCH")
+  # What the operator configured explicitly wins (a CDN, or a fleet holding architectures the
+  # embedding does not cover); unconfigured, the control plane's own copy is selected by host
+  # architecture.
+  if [ -z "$AGENT_BIN_URL" ] && [ -n "$AGENT_ARCH" ]; then
+    AGENT_BIN_URL=$(dist_field "agent_bin_url_${AGENT_FLAVOR}_$AGENT_ARCH")
+    AGENT_BIN_SHA256=$(dist_field "agent_bin_sha256_${AGENT_FLAVOR}_$AGENT_ARCH")
+  fi
+  if [ -z "$XRAY_VERSION_EXPLICIT" ]; then
+    XRAY_VERSION=$(dist_field xray_version)
+    [ -n "$XRAY_VERSION" ] || XRAY_VERSION=v26.10.31
+  fi
+  if [ -z "$XRAY_BIN_URL" ]; then
+    XRAY_BIN_URL=$(dist_field xray_bin_url)
+    if [ -n "$XRAY_BIN_URL" ]; then
+      XRAY_BIN_URL_EXPLICIT=1
+      XRAY_BIN_SHA256=$(dist_field xray_bin_sha256)
+    elif [ -n "$XRAY_ARCH" ]; then
+      XRAY_BIN_URL=$(dist_field "xray_bin_url_$XRAY_ARCH")
+      XRAY_BIN_SHA256=$(dist_field "xray_bin_sha256_$XRAY_ARCH")
     fi
-    if [ -z "$XRAY_VERSION_EXPLICIT" ]; then
-        XRAY_VERSION=$(dist_field xray_version)
-        [ -n "$XRAY_VERSION" ] || XRAY_VERSION=v26.10.31
-    fi
-    if [ -z "$XRAY_BIN_URL" ]; then
-        XRAY_BIN_URL=$(dist_field xray_bin_url)
-        if [ -n "$XRAY_BIN_URL" ]; then
-            XRAY_BIN_URL_EXPLICIT=1
-            XRAY_BIN_SHA256=$(dist_field xray_bin_sha256)
-        elif [ -n "$XRAY_ARCH" ]; then
-            XRAY_BIN_URL=$(dist_field "xray_bin_url_$XRAY_ARCH")
-            XRAY_BIN_SHA256=$(dist_field "xray_bin_sha256_$XRAY_ARCH")
-        fi
-    fi
-    [ -n "$PHANTUN_SERVER_URL" ]         || PHANTUN_SERVER_URL=$(dist_field phantun_server_url)
-    [ -n "$PHANTUN_SERVER_SHA" ]         || PHANTUN_SERVER_SHA=$(dist_field phantun_server_sha256)
-    [ -n "$PHANTUN_CLIENT_URL" ]         || PHANTUN_CLIENT_URL=$(dist_field phantun_client_url)
-    [ -n "$PHANTUN_CLIENT_SHA" ]         || PHANTUN_CLIENT_SHA=$(dist_field phantun_client_sha256)
+  fi
+  [ -n "$PHANTUN_SERVER_URL" ] || PHANTUN_SERVER_URL=$(dist_field phantun_server_url)
+  [ -n "$PHANTUN_SERVER_SHA" ] || PHANTUN_SERVER_SHA=$(dist_field phantun_server_sha256)
+  [ -n "$PHANTUN_CLIENT_URL" ] || PHANTUN_CLIENT_URL=$(dist_field phantun_client_url)
+  [ -n "$PHANTUN_CLIENT_SHA" ] || PHANTUN_CLIENT_SHA=$(dist_field phantun_client_sha256)
 fi
 
-
 if [ -n "$AGENT_BIN_URL" ]; then
-    fetch_binary "$AGENT_BIN_URL" "$AGENT_BIN_SHA256" "$AGENT_BIN" || exit 1
+  fetch_binary "$AGENT_BIN_URL" "$AGENT_BIN_SHA256" "$AGENT_BIN" || exit 1
 elif [ -x "$AGENT_BIN" ]; then
-    echo "没有 --agent-bin-url，也问不到控制面的分发清单：沿用机器上已有的 $AGENT_BIN" >&2
+  echo "没有 --agent-bin-url，也问不到控制面的分发清单：沿用机器上已有的 $AGENT_BIN" >&2
 elif have brocade-agent; then
-    install_binary_atomic "$(command -v brocade-agent)" "$AGENT_BIN"
+  install_binary_atomic "$(command -v brocade-agent)" "$AGENT_BIN"
 else
-    # Reaching here means all three routes failed: no URL was given, the machine has no agent, and
-    # the manifest did not fill the gap. There are two reasons the manifest could not, pointing at
-    # entirely different fixes, so they are reported separately:
-    #   DIST_JSON empty     — curl got nothing. Usually --server points at the admin port (8080 by
-    #                         default), while /enroll/dist exists only on the agent port (8081 by
-    #                         default) and 8080 answers 404.
-    #   DIST_JSON non-empty — the control plane answered without agent_bin_url configured (console
-    #                         has no BROCADE_AGENT_BIN_URL set).
-    if [ -z "$DIST_JSON" ]; then
-        echo "问不到 $SERVER/enroll/dist 的分发清单——--server 要对到控制面的 agent 端口（默认 8081）；" >&2
-        echo "admin 端口（默认 8080）上没有这个路径，直接 404。" >&2
-    elif [ -z "$AGENT_ARCH" ]; then
-        echo "控制面答了 $SERVER/enroll/dist，但它只内嵌 x86_64 和 aarch64 两个架构的 agent，" >&2
-        echo "而本机是 $(uname -m)。在这个架构上自己编一个再指过来：" >&2
-        echo "  cargo build --release --target <triple> -p brocade-agent" >&2
-        echo "  sh brocade-install.sh --server $SERVER --agent-bin-url <URL>" >&2
-    else
-        echo "控制面答了 $SERVER/enroll/dist，但清单里没有 $AGENT_ARCH 的 agent——" >&2
-        echo "这个控制面编的时候没带上这个架构（正常情况下 build.rs 会强制带上）。" >&2
-    fi
-    echo "brocade-agent binary not found; rerun with --agent-bin-url or set BROCADE_AGENT_BIN_URL" >&2
-    exit 1
+  # Reaching here means all three routes failed: no URL was given, the machine has no agent, and
+  # the manifest did not fill the gap. There are two reasons the manifest could not, pointing at
+  # entirely different fixes, so they are reported separately:
+  #   DIST_JSON empty     — curl got nothing. Usually --server points at the admin port (8080 by
+  #                         default), while /enroll/dist exists only on the agent port (8081 by
+  #                         default) and 8080 answers 404.
+  #   DIST_JSON non-empty — the control plane answered without agent_bin_url configured (console
+  #                         has no BROCADE_AGENT_BIN_URL set).
+  if [ -z "$DIST_JSON" ]; then
+    echo "问不到 $SERVER/enroll/dist 的分发清单——--server 要对到控制面的 agent 端口（默认 8081）；" >&2
+    echo "admin 端口（默认 8080）上没有这个路径，直接 404。" >&2
+  elif [ -z "$AGENT_ARCH" ]; then
+    echo "控制面答了 $SERVER/enroll/dist，但它只内嵌 x86_64 和 aarch64 两个架构的 agent，" >&2
+    echo "而本机是 $(uname -m)。在这个架构上自己编一个再指过来：" >&2
+    echo "  cargo build --release --target <triple> -p brocade-agent" >&2
+    echo "  sh brocade-install.sh --server $SERVER --agent-bin-url <URL>" >&2
+  else
+    echo "控制面答了 $SERVER/enroll/dist，但清单里没有 $AGENT_ARCH 的 agent——" >&2
+    echo "这个控制面编的时候没带上这个架构（正常情况下 build.rs 会强制带上）。" >&2
+  fi
+  echo "brocade-agent binary not found; rerun with --agent-bin-url or set BROCADE_AGENT_BIN_URL" >&2
+  exit 1
 fi
 
 verify_agent_candidate "$AGENT_BIN" || exit 1
 
 if [ "$ENABLE_CVM" = "1" ]; then
-    [ -n "$CVM_BUNDLE_URL" ] || CVM_BUNDLE_URL=$(cvm_approved_field "cvm_bundle_url_$AGENT_ARCH")
-    [ -n "$CVM_BUNDLE_SHA256" ] || CVM_BUNDLE_SHA256=$(cvm_approved_field "cvm_bundle_sha256_$AGENT_ARCH")
-    [ -n "$CVM_INSTALLER_URL" ] || CVM_INSTALLER_URL="$SERVER/enroll/cvm-stack.py"
-    for cvm_digest in "$CVM_BUNDLE_SHA256" "$CVM_INSTALLER_SHA256"; do
-        case "$cvm_digest" in
-            ''|*[!0-9a-f]*) echo "控制面尚未提供本机架构的已校验 CVM 运行栈或安装器" >&2; exit 1 ;;
-        esac
-        [ "${#cvm_digest}" = 64 ] || { echo "CVM SHA-256 长度不正确" >&2; exit 1; }
-    done
-    [ -n "$CVM_BUNDLE_URL" ] && [ -n "$CVM_INSTALLER_URL" ] || {
-        echo "CVM 分发地址缺失；请配置控制面的对应架构运行栈" >&2; exit 1;
-    }
-    for cvm_url in "$CVM_BUNDLE_URL" "$CVM_INSTALLER_URL"; do
-        case "$cvm_url" in http://*|https://*) ;; *) echo "CVM 分发地址必须使用 HTTP 或 HTTPS" >&2; exit 1 ;; esac
-    done
-    install -d -m 0755 /usr/local/lib/brocade
-    cvm_installer_file=$(mktemp)
-    TMPFILES="$TMPFILES $cvm_installer_file"
-    cvm_download installer curl $CURL_FLAGS --connect-timeout 10 --max-time 120 --max-filesize 1048576 \
-        --proto '=http,https' --proto-redir '=http,https' "$CVM_INSTALLER_URL" -o "$cvm_installer_file" || exit 1
-    printf '%s  %s\n' "$CVM_INSTALLER_SHA256" "$cvm_installer_file" | sha256sum -c - >/dev/null || exit 1
-    install_binary_atomic "$cvm_installer_file" /usr/local/lib/brocade/cvm-stack.py || exit 1
-    cvm_bundle_file=$(mktemp)
-    TMPFILES="$TMPFILES $cvm_bundle_file"
-    echo "downloading verified CVM node runtime ..." >&2
-    cvm_download runtime curl $CURL_FLAGS --connect-timeout 10 --max-time 1800 --max-filesize 4294967296 \
-        --proto '=http,https' --proto-redir '=http,https' "$CVM_BUNDLE_URL" -o "$cvm_bundle_file" || exit 1
-    # No one-time enrollment credential has been consumed at this point.
-    case "$CVM_MODE" in ''|auto|kvm|pvm) ;; *) echo "CVM mode 必须是 auto、kvm 或 pvm" >&2; exit 1 ;; esac
-    set -- install --bundle "$cvm_bundle_file" --sha256 "$CVM_BUNDLE_SHA256"
-    [ -z "$CVM_MODE" ] || set -- "$@" --mode "$CVM_MODE"
-    if BROCADE_CVM_AGENT_BIN="$AGENT_BIN" python3 /usr/local/lib/brocade/cvm-stack.py "$@"; then
-        :
-    else
-        cvm_exit=$?
-        if [ "$cvm_exit" != 75 ]; then exit "$cvm_exit"; fi
-        CVM_REBOOT_PENDING=1
+  install -d -m 0755 /etc/brocade
+  if [ ! -e "$HOST_SYSTEM_CONFIG" ] && [ ! -L "$HOST_SYSTEM_CONFIG" ]; then
+    host_system_candidate=$(mktemp /etc/brocade/.cvm-host.XXXXXX)
+    TMPFILES="$TMPFILES $host_system_candidate"
+    if ! getent passwd brocade-native >/dev/null; then
+      useradd --create-home --shell /bin/sh brocade-native || exit 1
     fi
+    [ "$(id -u brocade-native)" -ne 0 ] || {
+      echo "拒绝使用 root 作为默认宿主终端账号" >&2
+      exit 1
+    }
+    python3 - "$host_system_candidate" <<'PY'
+import ipaddress
+import json
+import os
+import subprocess
+import sys
+
+
+def query_ip(*args):
+    return json.loads(subprocess.check_output(["ip", "-j", *args], timeout=5))
+
+
+routes = query_ip("route", "show", "default") + query_ip("-6", "route", "show", "default")
+devices = {route.get("dev") for route in routes}
+if len(devices) != 1 or not next(iter(devices), None) or "lo" in devices:
+    sys.exit("无法确定唯一管理网卡，请先准备 /etc/brocade/cvm-host.json")
+device = devices.pop()
+protected = set()
+for link in query_ip("address", "show", "dev", device):
+    for address in link.get("addr_info", []):
+        if address.get("scope") == "global":
+            network = ipaddress.ip_network(
+                f"{address['local']}/{address['prefixlen']}", strict=False
+            )
+            if network.prefixlen:
+                protected.add(str(network))
+try:
+    with open("/etc/resolv.conf", encoding="utf-8") as resolver:
+        dns_sources = resolver.readlines()
+    if any("127.0.0.53" in line for line in dns_sources):
+        with open("/run/systemd/resolve/resolv.conf", encoding="utf-8") as resolver:
+            dns_sources += resolver.readlines()
+except OSError:
+    sys.exit("无法读取宿主管理 DNS，请先准备 /etc/brocade/cvm-host.json")
+addresses = [
+    parts[1] for line in dns_sources if len(parts := line.split()) > 1 and parts[0] == "nameserver"
+]
+addresses += os.environ.get("SSH_CONNECTION", "").split()[:1]
+for address in addresses:
+    ip = ipaddress.ip_address(address.split("%", 1)[0])
+    if not ip.is_loopback:
+        protected.add(f"{ip}/{ip.max_prefixlen}")
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    json.dump({
+        "terminal_user": "brocade-native",
+        "primary_device": device,
+        "protected_destinations": sorted(protected),
+    }, output)
+    output.write("\n")
+PY
+    "$AGENT_BIN" cvm-check --host-config "$host_system_candidate" >/dev/null
+    ln "$host_system_candidate" "$HOST_SYSTEM_CONFIG"
+  else
+    "$AGENT_BIN" cvm-check --host-config "$HOST_SYSTEM_CONFIG" >/dev/null
+  fi
+
+  # Remove the legacy exclusive-backend environment before the Cube installer can reload or
+  # restart the Agent. The same drop-in is refreshed below when the service unit is installed.
+  if [ "$SERVICE_MODE" = "systemd" ]; then
+    install -d -m 0755 /etc/systemd/system/brocade-agent.service.d
+    host_system_unit=$(mktemp /etc/systemd/system/brocade-agent.service.d/.host-system.XXXXXX)
+    TMPFILES="$TMPFILES $host_system_unit"
+    {
+      printf '[Service]\n'
+      printf 'Environment=BROCADE_CVM_HOST_CONFIG=%s\n' "$HOST_SYSTEM_CONFIG"
+      printf 'Environment=BROCADE_CVM_HOST_STATE_DIR=/var/lib/brocade/cvm-host\n'
+    } >"$host_system_unit"
+    mv -f "$host_system_unit" "$HOST_SYSTEM_DROPIN"
+  fi
 fi
 
+if [ "$ENABLE_CVM" = "1" ]; then
+  [ -n "$CVM_BUNDLE_URL" ] || CVM_BUNDLE_URL=$(cvm_approved_field "cvm_bundle_url_$AGENT_ARCH")
+  [ -n "$CVM_BUNDLE_SHA256" ] || CVM_BUNDLE_SHA256=$(cvm_approved_field "cvm_bundle_sha256_$AGENT_ARCH")
+  [ -n "$CVM_INSTALLER_URL" ] || CVM_INSTALLER_URL="$SERVER/enroll/cvm-stack.py"
+  for cvm_digest in "$CVM_BUNDLE_SHA256" "$CVM_INSTALLER_SHA256"; do
+    case "$cvm_digest" in
+    '' | *[!0-9a-f]*)
+      echo "控制面尚未提供本机架构的已校验 CVM 运行栈或安装器" >&2
+      exit 1
+      ;;
+    esac
+    [ "${#cvm_digest}" = 64 ] || {
+      echo "CVM SHA-256 长度不正确" >&2
+      exit 1
+    }
+  done
+  [ -n "$CVM_BUNDLE_URL" ] && [ -n "$CVM_INSTALLER_URL" ] || {
+    echo "CVM 分发地址缺失；请配置控制面的对应架构运行栈" >&2
+    exit 1
+  }
+  for cvm_url in "$CVM_BUNDLE_URL" "$CVM_INSTALLER_URL"; do
+    case "$cvm_url" in http://* | https://*) ;; *)
+      echo "CVM 分发地址必须使用 HTTP 或 HTTPS" >&2
+      exit 1
+      ;;
+    esac
+  done
+  install -d -m 0755 /usr/local/lib/brocade
+  cvm_installer_file=$(mktemp)
+  TMPFILES="$TMPFILES $cvm_installer_file"
+  cvm_download installer curl $CURL_FLAGS --connect-timeout 10 --max-time 120 --max-filesize 1048576 \
+    --proto '=http,https' --proto-redir '=http,https' "$CVM_INSTALLER_URL" -o "$cvm_installer_file" || exit 1
+  printf '%s  %s\n' "$CVM_INSTALLER_SHA256" "$cvm_installer_file" | sha256sum -c - >/dev/null || exit 1
+  install_binary_atomic "$cvm_installer_file" /usr/local/lib/brocade/cvm-stack.py || exit 1
+  cvm_bundle_file=$(mktemp)
+  TMPFILES="$TMPFILES $cvm_bundle_file"
+  echo "downloading verified CVM node runtime ..." >&2
+  cvm_download runtime curl $CURL_FLAGS --connect-timeout 10 --max-time 1800 --max-filesize 4294967296 \
+    --proto '=http,https' --proto-redir '=http,https' "$CVM_BUNDLE_URL" -o "$cvm_bundle_file" || exit 1
+  # No one-time enrollment credential has been consumed at this point.
+  case "$CVM_MODE" in '' | auto | kvm | pvm) ;; *)
+    echo "CVM mode 必须是 auto、kvm 或 pvm" >&2
+    exit 1
+    ;;
+  esac
+  set -- install --bundle "$cvm_bundle_file" --sha256 "$CVM_BUNDLE_SHA256"
+  [ -z "$CVM_MODE" ] || set -- "$@" --mode "$CVM_MODE"
+  if BROCADE_CVM_AGENT_BIN="$AGENT_BIN" python3 /usr/local/lib/brocade/cvm-stack.py "$@"; then
+    :
+  else
+    cvm_exit=$?
+    if [ "$cvm_exit" != 75 ]; then exit "$cvm_exit"; fi
+    CVM_REBOOT_PENDING=1
+  fi
+fi
 
 # linux mode really touches the system, so the data-plane dependencies are installed here in one go
 # rather than leaving anything to be prepared by hand first.
 if [ "$APPLY_MODE" = "linux" ]; then
-    if ! have wg || ! have wg-quick; then
-        echo "installing wireguard-tools ..." >&2
-        install_pkg wireguard-tools || true
-    fi
-    install_xray || exit 1
-    verify_xray_pin || exit 1
-    # Reaching here, xray is certainly present; the .dat files are confirmed once more — there are
-    # several installation paths and only this one is taken by all of them.
-    ensure_geodata || exit 1
-    # Failing to install it does not block the installation: only nodes given fake TCP need it, and
-    # the agent and health report it missing faithfully
-    install_phantun || echo "phantun 没装上；这台若要用伪 TCP 需手动补" >&2
-    # nftables serves two features that write no firewall rules themselves: phantun (DNAT inbound
-    # TCP to the TUN, masquerade what leaves it — the `nft -f -` in phantun.rs) and Hysteria 2 port
-    # hopping (fold a UDP range onto the one port that listens — porthop.rs). Without the command
-    # either one fails at convergence, on the machine, well after this script has reported success.
-    #
-    # Best-effort rather than fatal, for the same reason as phantun: most machines carry neither,
-    # and refusing to install over a missing packet filter would turn away the common case to serve
-    # the rare one. The package is named nftables on every manager install_pkg knows.
-    if ! have nft; then
-        echo "installing nftables ..." >&2
-        install_pkg nftables || true
-    fi
-    # OpenVPN is deliberately not part of a normal Agent installation. A machine opts into the
-    # capability explicitly; once installed, the Agent reports the exact version and the control
-    # plane may offer it VPN Gate work. Failure is fatal only for this explicit opt-in.
-    if [ "$ENABLE_VPNGATE" = "1" ]; then
-        if ! have openvpn; then
-            echo "installing openvpn for managed VPN Gate exits ..." >&2
-            install_pkg openvpn || {
-                echo "无法安装 openvpn；这台机器不会加入 VPN Gate 接入节点" >&2
-                exit 1
-            }
-        fi
-        if ! have iptables; then
-            echo "installing iptables for managed VPN Gate namespace NAT ..." >&2
-            install_pkg iptables || {
-                echo "无法安装 iptables；VPN Gate 隔离命名空间无法联网" >&2
-                exit 1
-            }
-        fi
-    fi
-
-    missing=
-    for c in wg wg-quick ip pgrep pkill; do
-        have "$c" || missing="$missing $c"
-    done
-    if ! have xray && [ ! -x "$XRAY_BIN" ]; then
-        missing="$missing xray"
-    fi
-    if [ -n "$missing" ]; then
-        echo "--apply linux 需要这些命令，自动安装后仍然缺失:$missing" >&2
-        echo "这台机器的包管理器不认识（或被禁用）。装好 wireguard-tools 后重跑，" >&2
-        echo "或用 --xray-bin-url 让控制面分发 xray。" >&2
+  if ! have wg || ! have wg-quick; then
+    echo "installing wireguard-tools ..." >&2
+    install_pkg wireguard-tools || true
+  fi
+  install_xray || exit 1
+  verify_xray_pin || exit 1
+  # Reaching here, xray is certainly present; the .dat files are confirmed once more — there are
+  # several installation paths and only this one is taken by all of them.
+  ensure_geodata || exit 1
+  # Failing to install it does not block the installation: only nodes given fake TCP need it, and
+  # the agent and health report it missing faithfully
+  install_phantun || echo "phantun 没装上；这台若要用伪 TCP 需手动补" >&2
+  # nftables serves two features that write no firewall rules themselves: phantun (DNAT inbound
+  # TCP to the TUN, masquerade what leaves it — the `nft -f -` in phantun.rs) and Hysteria 2 port
+  # hopping (fold a UDP range onto the one port that listens — porthop.rs). Without the command
+  # either one fails at convergence, on the machine, well after this script has reported success.
+  #
+  # Best-effort rather than fatal, for the same reason as phantun: most machines carry neither,
+  # and refusing to install over a missing packet filter would turn away the common case to serve
+  # the rare one. The package is named nftables on every manager install_pkg knows.
+  if ! have nft; then
+    echo "installing nftables ..." >&2
+    install_pkg nftables || true
+  fi
+  # OpenVPN is deliberately not part of a normal Agent installation. A machine opts into the
+  # capability explicitly; once installed, the Agent reports the exact version and the control
+  # plane may offer it VPN Gate work. Failure is fatal only for this explicit opt-in.
+  if [ "$ENABLE_VPNGATE" = "1" ]; then
+    if ! have openvpn; then
+      echo "installing openvpn for managed VPN Gate exits ..." >&2
+      install_pkg openvpn || {
+        echo "无法安装 openvpn；这台机器不会加入 VPN Gate 接入节点" >&2
         exit 1
+      }
     fi
-    # Warned about rather than counted as missing, for the reason above — it is needed only where the
-    # model gives this machine fake TCP. Said here all the same: the alternative to hearing it now is
-    # hearing it from a node that has already been enrolled and cannot bring its tunnel up.
-    have nft || echo "nft（nftables）没装上；这台若要用伪 TCP 或 Hysteria 2 端口跳转，规则配不上" >&2
-    if [ "$ENABLE_VPNGATE" = "1" ]; then
-        have openvpn || { echo "--enable-openvpn 需要 openvpn" >&2; exit 1; }
-        have iptables || { echo "--enable-openvpn 需要 iptables" >&2; exit 1; }
+    if ! have iptables; then
+      echo "installing iptables for managed VPN Gate namespace NAT ..." >&2
+      install_pkg iptables || {
+        echo "无法安装 iptables；VPN Gate 隔离命名空间无法联网" >&2
+        exit 1
+      }
     fi
+  fi
+
+  missing=
+  for c in wg wg-quick ip pgrep pkill; do
+    have "$c" || missing="$missing $c"
+  done
+  if ! have xray && [ ! -x "$XRAY_BIN" ]; then
+    missing="$missing xray"
+  fi
+  if [ -n "$missing" ]; then
+    echo "--apply linux 需要这些命令，自动安装后仍然缺失:$missing" >&2
+    echo "这台机器的包管理器不认识（或被禁用）。装好 wireguard-tools 后重跑，" >&2
+    echo "或用 --xray-bin-url 让控制面分发 xray。" >&2
+    exit 1
+  fi
+  # Warned about rather than counted as missing, for the reason above — it is needed only where the
+  # model gives this machine fake TCP. Said here all the same: the alternative to hearing it now is
+  # hearing it from a node that has already been enrolled and cannot bring its tunnel up.
+  have nft || echo "nft（nftables）没装上；这台若要用伪 TCP 或 Hysteria 2 端口跳转，规则配不上" >&2
+  if [ "$ENABLE_VPNGATE" = "1" ]; then
+    have openvpn || {
+      echo "--enable-openvpn 需要 openvpn" >&2
+      exit 1
+    }
+    have iptables || {
+      echo "--enable-openvpn 需要 iptables" >&2
+      exit 1
+    }
+  fi
 else
-    if [ -n "$XRAY_BIN_URL" ]; then
-        fetch_binary "$XRAY_BIN_URL" "$XRAY_BIN_SHA256" "$XRAY_BIN" || exit 1
-    fi
+  if [ -n "$XRAY_BIN_URL" ]; then
+    fetch_binary "$XRAY_BIN_URL" "$XRAY_BIN_SHA256" "$XRAY_BIN" || exit 1
+  fi
 fi
 
 umask 077
 if [ "$CRED_MODE" = "node-token" ]; then
-    printf '%s\n' "$NODE_TOKEN_ARG" > "$CONFIG_DIR/token"
-    NODE_ID="(已写入下发的 token)"
+  printf '%s\n' "$NODE_TOKEN_ARG" >"$CONFIG_DIR/token"
+  NODE_ID="(已写入下发的 token)"
 elif [ "$CRED_MODE" = "enroll" ]; then
-    auth_header=$(mktemp)
-    TMPFILES="$TMPFILES $auth_header"
-    chmod 0600 "$auth_header"
-    printf 'Authorization: Bearer %s\n' "$ENROLL_TOKEN" > "$auth_header"
-    response=$(curl -fsS -X POST -H "@$auth_header" "$SERVER/agent/v1/enroll")
-    NODE_TOKEN=$(printf '%s\n' "$response" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    NODE_ID=$(printf '%s\n' "$response" | sed -n 's/.*"node_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    if [ -z "$NODE_TOKEN" ] || [ -z "$NODE_ID" ]; then
-        echo "enrollment response did not contain node token" >&2
-        exit 1
-    fi
-    printf '%s\n' "$NODE_TOKEN" > "$CONFIG_DIR/token"
+  auth_header=$(mktemp)
+  TMPFILES="$TMPFILES $auth_header"
+  chmod 0600 "$auth_header"
+  printf 'Authorization: Bearer %s\n' "$ENROLL_TOKEN" >"$auth_header"
+  response=$(curl -fsS -X POST -H "@$auth_header" "$SERVER/agent/v1/enroll")
+  NODE_TOKEN=$(printf '%s\n' "$response" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  NODE_ID=$(printf '%s\n' "$response" | sed -n 's/.*"node_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  if [ -z "$NODE_TOKEN" ] || [ -z "$NODE_ID" ]; then
+    echo "enrollment response did not contain node token" >&2
+    exit 1
+  fi
+  printf '%s\n' "$NODE_TOKEN" >"$CONFIG_DIR/token"
 else
-    NODE_ID="(已纳管)"
-    echo "沿用 $CONFIG_DIR/token，跳过纳管" >&2
+  NODE_ID="(已纳管)"
+  echo "沿用 $CONFIG_DIR/token，跳过纳管" >&2
 fi
-cat > "$CONFIG_DIR/env" <<EOF
+cat >"$CONFIG_DIR/env" <<EOF
 BROCADE_AGENT_SERVER=$SERVER
 BROCADE_NODE_TOKEN_FILE=$CONFIG_DIR/token
 BROCADE_AGENT_STATE_DIR=$STATE_DIR
@@ -989,72 +1176,76 @@ chmod 0600 "$CONFIG_DIR/token" "$CONFIG_DIR/env"
 # 极少数精简镜像没把 tcp_bbr 编进去。这三种情况下**继续装**——机器照样能跑 brocade，
 # 只是慢一点；缺少这项可选优化不应阻止安装。
 tune_congestion() {
-    # set -e 在被 `|| true` 包住的函数里不生效（见文件顶部），所以下面每一步自己判返回值。
-    kernel=$(uname -r 2>/dev/null || echo 0.0)
-    major=${kernel%%.*}
-    rest=${kernel#*.}
-    minor=${rest%%.*}
-    case "$major$minor" in
-        *[!0-9]*|'') major=0; minor=0 ;;
-    esac
-    if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 9 ]; }; then
-        echo "内核 $kernel 早于 4.9，没有 BBR。这台改不了，只能换镜像重装。" >&2
-        return 0
-    fi
+  # set -e 在被 `|| true` 包住的函数里不生效（见文件顶部），所以下面每一步自己判返回值。
+  kernel=$(uname -r 2>/dev/null || echo 0.0)
+  major=${kernel%%.*}
+  rest=${kernel#*.}
+  minor=${rest%%.*}
+  case "$major$minor" in
+  *[!0-9]* | '')
+    major=0
+    minor=0
+    ;;
+  esac
+  if [ "$major" -lt 4 ] || { [ "$major" -eq 4 ] && [ "$minor" -lt 9 ]; }; then
+    echo "内核 $kernel 早于 4.9，没有 BBR。这台改不了，只能换镜像重装。" >&2
+    return 0
+  fi
 
-    # 内建时必然失败，无所谓——下一步的 available 列表才是判据。
-    modprobe tcp_bbr >/dev/null 2>&1 || true
+  # 内建时必然失败，无所谓——下一步的 available 列表才是判据。
+  modprobe tcp_bbr >/dev/null 2>&1 || true
 
-    available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo '')
-    case " $available " in
-        *" bbr "*) ;;
-        *)
-            echo "这个内核没有 bbr（可选的只有：${available:-读不到}）。跳过，不影响安装。" >&2
-            return 0
-            ;;
-    esac
+  available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo '')
+  case " $available " in
+  *" bbr "*) ;;
+  *)
+    echo "这个内核没有 bbr（可选的只有：${available:-读不到}）。跳过，不影响安装。" >&2
+    return 0
+    ;;
+  esac
 
-    # 写文件而不是只 sysctl -w：只 -w 的话重启就没了，而「装的时候设过、现在不是了」
-    # 正是控制台要报的那种漂移——设了但不持久，等于给自己埋一个假信号。
-    if ! cat > /etc/sysctl.d/99-brocade.conf <<'SYSCTL'
+  # 写文件而不是只 sysctl -w：只 -w 的话重启就没了，而「装的时候设过、现在不是了」
+  # 正是控制台要报的那种漂移——设了但不持久，等于给自己埋一个假信号。
+  if ! cat >/etc/sysctl.d/99-brocade.conf <<'SYSCTL'
 # Brocade: TCP transport defaults.
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 SYSCTL
-    then
-        echo "写不了 /etc/sysctl.d/99-brocade.conf，跳过 BBR。不影响安装。" >&2
-        return 0
-    fi
+  then
+    echo "写不了 /etc/sysctl.d/99-brocade.conf，跳过 BBR。不影响安装。" >&2
+    return 0
+  fi
 
-    sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-brocade.conf >/dev/null 2>&1 || true
+  sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-brocade.conf >/dev/null 2>&1 || true
 
-    # 回读核对。写进去 ≠ 生效：OpenVZ 上 sysctl 是只读的，写文件会成功而值纹丝不动。
-    now_cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo '')
-    if [ "$now_cc" != "bbr" ]; then
-        echo "设了 bbr 但当前仍是「${now_cc:-读不到}」——多半是 OpenVZ/LXC，sysctl 只读。" >&2
-        echo "不影响安装，这台机器会比别的慢一档，而且控制台上量不出它的带宽。" >&2
-        rm -f /etc/sysctl.d/99-brocade.conf
-        return 0
-    fi
+  # 回读核对。写进去 ≠ 生效：OpenVZ 上 sysctl 是只读的，写文件会成功而值纹丝不动。
+  now_cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo '')
+  if [ "$now_cc" != "bbr" ]; then
+    echo "设了 bbr 但当前仍是「${now_cc:-读不到}」——多半是 OpenVZ/LXC，sysctl 只读。" >&2
+    echo "不影响安装，这台机器会比别的慢一档，而且控制台上量不出它的带宽。" >&2
+    rm -f /etc/sysctl.d/99-brocade.conf
+    return 0
+  fi
 
-    # fq 单独判定，因为它可能一个成一个败：sysctl 的权限往往是逐 key 的。
-    #
-    # 4.13 起 BBR 不再硬性需要 fq（TCP 有内建 pacing），所以设不上不算失败。仍然设，是因为
-    # fq 把 pacing 卸到 qdisc 层，并发流一多就省 CPU——而 CPU 正是转发机上先于带宽耗尽的那个。
-    nic=$(awk '$2 == "00000000" { print $1; exit }' /proc/net/route 2>/dev/null || echo '')
-    if [ -n "$nic" ] && have tc; then
-        # 关键的一步，也是最容易漏的：改 default_qdisc 只对**之后新建**的队列生效，
-        # 已经 up 的网卡纹丝不动。只回读 default_qdisc 的话它显示 fq、而 eth0 上还是
-        # fq_codel——「设了但没生效」会被判成成功。所以这里直接换现网卡上的那个。
-        root_queue=$(tc qdisc show dev "$nic" 2>/dev/null | awk '/ root / { print $2 " " $3; exit }')
-        case "$root_queue" in
-            "fq 80"*|"fq 0:"|"fq_codel 80"*|"fq_codel 0:"|"pfifo_fast 0:"|"mq 0:"|"noqueue 0:")
-                tc qdisc replace dev "$nic" root fq >/dev/null 2>&1 || true ;;
-            *) echo "保留网卡现有 QoS/限速队列：$nic" >&2 ;;
-        esac
-    fi
+  # fq 单独判定，因为它可能一个成一个败：sysctl 的权限往往是逐 key 的。
+  #
+  # 4.13 起 BBR 不再硬性需要 fq（TCP 有内建 pacing），所以设不上不算失败。仍然设，是因为
+  # fq 把 pacing 卸到 qdisc 层，并发流一多就省 CPU——而 CPU 正是转发机上先于带宽耗尽的那个。
+  nic=$(awk '$2 == "00000000" { print $1; exit }' /proc/net/route 2>/dev/null || echo '')
+  if [ -n "$nic" ] && have tc; then
+    # 关键的一步，也是最容易漏的：改 default_qdisc 只对**之后新建**的队列生效，
+    # 已经 up 的网卡纹丝不动。只回读 default_qdisc 的话它显示 fq、而 eth0 上还是
+    # fq_codel——「设了但没生效」会被判成成功。所以这里直接换现网卡上的那个。
+    root_queue=$(tc qdisc show dev "$nic" 2>/dev/null | awk '/ root / { print $2 " " $3; exit }')
+    case "$root_queue" in
+    "fq 80"* | "fq 0:" | "fq_codel 80"* | "fq_codel 0:" | "pfifo_fast 0:" | "mq 0:" | "noqueue 0:")
+      tc qdisc replace dev "$nic" root fq >/dev/null 2>&1 || true
+      ;;
+    *) echo "保留网卡现有 QoS/限速队列：$nic" >&2 ;;
+    esac
+  fi
 
-    echo "已开启 BBR（拥塞控制 bbr + qdisc fq）。" >&2
+  echo "已开启 BBR（拥塞控制 bbr + qdisc fq）。" >&2
 }
 tune_congestion || true
 
@@ -1063,33 +1254,33 @@ tune_congestion || true
 # AnyTLS/VLESS socket settings to take effect. Keep it separate from BBR because a machine without
 # BBR can still support TFO, and failing either optimisation must not prevent installation.
 tune_tcp_fast_open() {
-    conf=/etc/sysctl.d/99-brocade.conf
-    if [ ! -e "$conf" ]; then
-        if ! printf '%s\n' '# Brocade: TCP transport defaults.' > "$conf"; then
-            echo "写不了 $conf，跳过 TCP Fast Open。不影响安装。" >&2
-            return 0
-        fi
+  conf=/etc/sysctl.d/99-brocade.conf
+  if [ ! -e "$conf" ]; then
+    if ! printf '%s\n' '# Brocade: TCP transport defaults.' >"$conf"; then
+      echo "写不了 $conf，跳过 TCP Fast Open。不影响安装。" >&2
+      return 0
     fi
-    if ! sed -i '/^[[:space:]]*net\.ipv4\.tcp_fastopen[[:space:]]*=/d' "$conf"; then
-        echo "更新不了 $conf，跳过 TCP Fast Open。不影响安装。" >&2
-        return 0
-    fi
-    if ! printf '%s\n' 'net.ipv4.tcp_fastopen = 3' >> "$conf"; then
-        echo "写不了 TCP Fast Open 配置，跳过。不影响安装。" >&2
-        return 0
-    fi
+  fi
+  if ! sed -i '/^[[:space:]]*net\.ipv4\.tcp_fastopen[[:space:]]*=/d' "$conf"; then
+    echo "更新不了 $conf，跳过 TCP Fast Open。不影响安装。" >&2
+    return 0
+  fi
+  if ! printf '%s\n' 'net.ipv4.tcp_fastopen = 3' >>"$conf"; then
+    echo "写不了 TCP Fast Open 配置，跳过。不影响安装。" >&2
+    return 0
+  fi
 
-    sysctl -qw net.ipv4.tcp_fastopen=3 >/dev/null 2>&1 || true
-    now_tfo=$(cat /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null || echo '')
-    case "$now_tfo" in
-        *[!0-9]*|'') now_tfo=0 ;;
-    esac
-    if [ $((now_tfo & 3)) -ne 3 ]; then
-        echo "设了 TCP Fast Open 但当前值仍是「$now_tfo」——多半是容器限制或内核不支持。跳过，不影响安装。" >&2
-        sed -i '/^[[:space:]]*net\.ipv4\.tcp_fastopen[[:space:]]*=/d' "$conf" 2>/dev/null || true
-        return 0
-    fi
-    echo "已开启 TCP Fast Open（客户端 + 服务端）。" >&2
+  sysctl -qw net.ipv4.tcp_fastopen=3 >/dev/null 2>&1 || true
+  now_tfo=$(cat /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null || echo '')
+  case "$now_tfo" in
+  *[!0-9]* | '') now_tfo=0 ;;
+  esac
+  if [ $((now_tfo & 3)) -ne 3 ]; then
+    echo "设了 TCP Fast Open 但当前值仍是「$now_tfo」——多半是容器限制或内核不支持。跳过，不影响安装。" >&2
+    sed -i '/^[[:space:]]*net\.ipv4\.tcp_fastopen[[:space:]]*=/d' "$conf" 2>/dev/null || true
+    return 0
+  fi
+  echo "已开启 TCP Fast Open（客户端 + 服务端）。" >&2
 }
 tune_tcp_fast_open || true
 
@@ -1101,38 +1292,38 @@ tune_tcp_fast_open || true
 # and workload. Keep the module file separate from brocade.conf because tune_conntrack rewrites
 # that file on every installation.
 enable_xray_ktls() {
-    if [ ! -d /sys/module/tls ]; then
-        if ! have modprobe; then
-            echo "installing kmod for optional Xray kTLS support ..." >&2
-            if ! install_pkg kmod; then
-                echo "无法安装 modprobe；AnyTLS 将继续使用 Go TLS，不影响安装。" >&2
-                return 0
-            fi
-        fi
-        if ! modprobe tls >/dev/null 2>&1; then
-            echo "当前内核无法加载 tls 模块；AnyTLS 将继续使用 Go TLS，不影响安装。" >&2
-            return 0
-        fi
+  if [ ! -d /sys/module/tls ]; then
+    if ! have modprobe; then
+      echo "installing kmod for optional Xray kTLS support ..." >&2
+      if ! install_pkg kmod; then
+        echo "无法安装 modprobe；AnyTLS 将继续使用 Go TLS，不影响安装。" >&2
+        return 0
+      fi
     fi
+    if ! modprobe tls >/dev/null 2>&1; then
+      echo "当前内核无法加载 tls 模块；AnyTLS 将继续使用 Go TLS，不影响安装。" >&2
+      return 0
+    fi
+  fi
 
-    if [ ! -d /sys/module/tls ]; then
-        echo "tls 模块加载后仍不可见；AnyTLS 将继续使用 Go TLS，不影响安装。" >&2
-        return 0
-    fi
+  if [ ! -d /sys/module/tls ]; then
+    echo "tls 模块加载后仍不可见；AnyTLS 将继续使用 Go TLS，不影响安装。" >&2
+    return 0
+  fi
 
-    if ! install -d -m 0755 /etc/modules-load.d; then
-        echo "写不了 /etc/modules-load.d；kTLS 当前可用，但重启后可能回退到 Go TLS。" >&2
-        return 0
-    fi
-    ktls_module_stage=/etc/modules-load.d/.brocade-xray-ktls.$$
-    TMPFILES="$TMPFILES $ktls_module_stage"
-    if ! printf 'tls\n' > "$ktls_module_stage" ||
-       ! chmod 0644 "$ktls_module_stage" ||
-       ! mv -f "$ktls_module_stage" /etc/modules-load.d/brocade-xray-ktls.conf; then
-        echo "持久化 tls 模块失败；kTLS 当前可用，但重启后可能回退到 Go TLS。" >&2
-        return 0
-    fi
-    echo "Xray kTLS 模块已就绪，并会在开机时加载（运行时仍按 auto 安全回退）。" >&2
+  if ! install -d -m 0755 /etc/modules-load.d; then
+    echo "写不了 /etc/modules-load.d；kTLS 当前可用，但重启后可能回退到 Go TLS。" >&2
+    return 0
+  fi
+  ktls_module_stage=/etc/modules-load.d/.brocade-xray-ktls.$$
+  TMPFILES="$TMPFILES $ktls_module_stage"
+  if ! printf 'tls\n' >"$ktls_module_stage" ||
+    ! chmod 0644 "$ktls_module_stage" ||
+    ! mv -f "$ktls_module_stage" /etc/modules-load.d/brocade-xray-ktls.conf; then
+    echo "持久化 tls 模块失败；kTLS 当前可用，但重启后可能回退到 Go TLS。" >&2
+    return 0
+  fi
+  echo "Xray kTLS 模块已就绪，并会在开机时加载（运行时仍按 auto 安全回退）。" >&2
 }
 enable_xray_ktls || true
 
@@ -1155,107 +1346,118 @@ enable_xray_ktls || true
 # 起来，值又回到内核默认。modules-load.d 让它在 systemd-sysctl 之前加载——两步缺一，重启
 # 一次这些值就没了，而且没有任何报错。
 tune_conntrack() {
-    # set -e 在被 `|| true` 包住的函数里不生效（见文件顶部），每一步自己判返回值。
-    modprobe nf_conntrack >/dev/null 2>&1 || true
-    current=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo '')
-    case "$current" in
-        ''|*[!0-9]*)
-            echo "读不到 nf_conntrack_max，这台没有连接跟踪（模块缺失或 sysctl 只读）。跳过，不影响安装。" >&2
-            return 0
-            ;;
-    esac
+  # set -e 在被 `|| true` 包住的函数里不生效（见文件顶部），每一步自己判返回值。
+  modprobe nf_conntrack >/dev/null 2>&1 || true
+  current=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo '')
+  case "$current" in
+  '' | *[!0-9]*)
+    echo "读不到 nf_conntrack_max，这台没有连接跟踪（模块缺失或 sysctl 只读）。跳过，不影响安装。" >&2
+    return 0
+    ;;
+  esac
 
-    # 取现值和 32768 的较大者，不是硬写一个数：内存大的机器内核已经给到 65536，往下压是倒
-    # 退。32768 条约 10MB，在 431MB 的机器上占 2.4%，是能接受的代价。
-    want=32768
-    if [ "$current" -gt "$want" ]; then
-        want=$current
-    fi
+  # 取现值和 32768 的较大者，不是硬写一个数：内存大的机器内核已经给到 65536，往下压是倒
+  # 退。32768 条约 10MB，在 431MB 的机器上占 2.4%，是能接受的代价。
+  want=32768
+  if [ "$current" -gt "$want" ]; then
+    want=$current
+  fi
 
-    # UDP 超时由 Agent 按 HY2 实际后端管理；保留旧值，不覆盖宿主机其他 UDP 服务。
-    conf=/etc/sysctl.d/99-brocade.conf
-    # 先删掉本函数以前写过的行再追加，否则重装一次就多一份。sysctl 是后者覆盖前者，重复不
-    # 会出错，但一个越读越长的文件会让人以为有人手工改过。
-    #
-    # grep 一行都没输出时返回 1，而「文件里只剩 conntrack 行」正是重装一台 BBR 设不上的机器
-    # 时的常态——照着返回值判成失败就会跳过清理，然后追加，每重装一次多一份。所以这里只看
-    # 临时文件在不在：空文件也是正确结果。
-    if [ -f "$conf" ]; then
-        grep -v \
-            -e '^[[:space:]]*net\.netfilter\.nf_conntrack_max[[:space:]]*=' \
-            -e '^# Brocade: conntrack for Hysteria 2 port hopping\.$' \
-            -e '^# 连接跟踪。hy2 端口跳转' \
-            -e '^# 机器上是三四千条。' \
-            "$conf" > "$conf.tmp" 2>/dev/null || true
-        if [ -f "$conf.tmp" ]; then
-            mv "$conf.tmp" "$conf" 2>/dev/null || rm -f "$conf.tmp"
-        fi
+  # UDP 超时由 Agent 按 HY2 实际后端管理；保留旧值，不覆盖宿主机其他 UDP 服务。
+  conf=/etc/sysctl.d/99-brocade.conf
+  # 先删掉本函数以前写过的行再追加，否则重装一次就多一份。sysctl 是后者覆盖前者，重复不
+  # 会出错，但一个越读越长的文件会让人以为有人手工改过。
+  #
+  # grep 一行都没输出时返回 1，而「文件里只剩 conntrack 行」正是重装一台 BBR 设不上的机器
+  # 时的常态——照着返回值判成失败就会跳过清理，然后追加，每重装一次多一份。所以这里只看
+  # 临时文件在不在：空文件也是正确结果。
+  if [ -f "$conf" ]; then
+    grep -v \
+      -e '^[[:space:]]*net\.netfilter\.nf_conntrack_max[[:space:]]*=' \
+      -e '^# Brocade: conntrack for Hysteria 2 port hopping\.$' \
+      -e '^# 连接跟踪。hy2 端口跳转' \
+      -e '^# 机器上是三四千条。' \
+      "$conf" >"$conf.tmp" 2>/dev/null || true
+    if [ -f "$conf.tmp" ]; then
+      mv "$conf.tmp" "$conf" 2>/dev/null || rm -f "$conf.tmp"
     fi
-    if ! cat >> "$conf" <<SYSCTL
+  fi
+  if ! cat >>"$conf" <<SYSCTL
 # Brocade: conntrack for Hysteria 2 port hopping.
 net.netfilter.nf_conntrack_max = $want
 SYSCTL
-    then
-        echo "写不了 $conf，跳过连接表调整。不影响安装。" >&2
-        return 0
-    fi
+  then
+    echo "写不了 $conf，跳过连接表调整。不影响安装。" >&2
+    return 0
+  fi
 
-    # 模块要在 systemd-sysctl 之前加载，见上面的说明。写不了就只是重启后失效，装机这一次
-    # 仍然生效，所以不算失败。
-    if [ -d /etc/modules-load.d ]; then
-        echo nf_conntrack > /etc/modules-load.d/brocade.conf 2>/dev/null \
-            || echo "写不了 /etc/modules-load.d/brocade.conf，重启后连接表设置会回到内核默认。" >&2
-    fi
+  # 模块要在 systemd-sysctl 之前加载，见上面的说明。写不了就只是重启后失效，装机这一次
+  # 仍然生效，所以不算失败。
+  if [ -d /etc/modules-load.d ]; then
+    echo nf_conntrack >/etc/modules-load.d/brocade.conf 2>/dev/null ||
+      echo "写不了 /etc/modules-load.d/brocade.conf，重启后连接表设置会回到内核默认。" >&2
+  fi
 
-    sysctl --system >/dev/null 2>&1 || sysctl -p "$conf" >/dev/null 2>&1 || true
+  sysctl --system >/dev/null 2>&1 || sysctl -p "$conf" >/dev/null 2>&1 || true
 
-    # 回读核对，跟 BBR 那边同一条理由：写进去 ≠ 生效，OpenVZ 上 sysctl 只读，写文件会成功
-    # 而值纹丝不动。这里不删文件——BBR 那边删是因为文件的存在本身被控制台当作「装机时设过
-    # bbr」的依据，连接表没有这层含义。
-    now_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo '')
-    if [ "$now_max" != "$want" ]; then
-        echo "设了 nf_conntrack_max=$want 但当前是「${now_max:-读不到}」——多半是 OpenVZ/LXC，sysctl 只读。" >&2
-        echo "不影响安装，但这台机器的连接表撑不住高并发，端口跳转会先出问题。" >&2
-        return 0
-    fi
-    echo "连接表已调整（nf_conntrack_max=$want，UDP 超时 30/60 秒）。" >&2
+  # 回读核对，跟 BBR 那边同一条理由：写进去 ≠ 生效，OpenVZ 上 sysctl 只读，写文件会成功
+  # 而值纹丝不动。这里不删文件——BBR 那边删是因为文件的存在本身被控制台当作「装机时设过
+  # bbr」的依据，连接表没有这层含义。
+  now_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo '')
+  if [ "$now_max" != "$want" ]; then
+    echo "设了 nf_conntrack_max=$want 但当前是「${now_max:-读不到}」——多半是 OpenVZ/LXC，sysctl 只读。" >&2
+    echo "不影响安装，但这台机器的连接表撑不住高并发，端口跳转会先出问题。" >&2
+    return 0
+  fi
+  echo "连接表已调整（nf_conntrack_max=$want，UDP 超时 30/60 秒）。" >&2
 }
 tune_conntrack || true
 
 if [ "$SERVICE_MODE" = "foreground" ]; then
-    echo "brocade-agent enrolled node $NODE_ID (apply=$APPLY_MODE, service=foreground)"
-    echo "foreground 模式不会写系统服务；当前进程会直接变成 brocade-agent run。" >&2
-    # 自更新换完二进制会退出，指望 supervisor 把新的拉起来。这里没有 supervisor，所以
-    # 那一步会把 agent 停在原地。preview 容器走的就是这条路，而 preview 的控制面不会
-    # 批准任何 agent 发布，够不到那一步。
-    echo "另外：这个模式下 agent 自更新换完就停了，没人拉它起来。" >&2
-    exec env \
-        BROCADE_AGENT_SERVER="$SERVER" \
-        BROCADE_NODE_TOKEN_FILE="$CONFIG_DIR/token" \
-        BROCADE_AGENT_STATE_DIR="$STATE_DIR" \
-        BROCADE_AGENT_APPLY="$APPLY_MODE" \
-        BROCADE_XRAY_BIN="$XRAY_BIN" \
-        BROCADE_VPNGATE_STATS_WINDOW_SECS="$VPNGATE_STATS_WINDOW_SECS" \
-        "$AGENT_BIN" run
+  echo "brocade-agent enrolled node $NODE_ID (apply=$APPLY_MODE, service=foreground)"
+  echo "foreground 模式不会写系统服务；当前进程会直接变成 brocade-agent run。" >&2
+  # 自更新换完二进制会退出，指望 supervisor 把新的拉起来。这里没有 supervisor，所以
+  # 那一步会把 agent 停在原地。preview 容器走的就是这条路，而 preview 的控制面不会
+  # 批准任何 agent 发布，够不到那一步。
+  echo "另外：这个模式下 agent 自更新换完就停了，没人拉它起来。" >&2
+  exec env \
+    BROCADE_AGENT_SERVER="$SERVER" \
+    BROCADE_NODE_TOKEN_FILE="$CONFIG_DIR/token" \
+    BROCADE_AGENT_STATE_DIR="$STATE_DIR" \
+    BROCADE_AGENT_APPLY="$APPLY_MODE" \
+    BROCADE_XRAY_BIN="$XRAY_BIN" \
+    BROCADE_VPNGATE_STATS_WINDOW_SECS="$VPNGATE_STATS_WINDOW_SECS" \
+    "$AGENT_BIN" run
 fi
 
 LOG_NAMESPACE_LINE=
 AGENT_LOG_FILE=
 if [ "$SERVICE_MODE" = "systemd" ]; then
-    # Give Brocade its own journal namespace so the bootstrap 20 MiB ceiling applies to this
-    # agent, not to unrelated host services. The first authenticated poll replaces it with the
-    # global/per-machine value from Settings. Namespaces landed in systemd 245; on an older host
-    # retaining the global journal is safer than shrinking every service's logs to our limit.
-    SYSTEMD_VERSION=$(systemctl --version 2>/dev/null | awk 'NR == 1 { print $2 }')
-    if [ -n "$SYSTEMD_VERSION" ] && [ "$SYSTEMD_VERSION" -ge 245 ] 2>/dev/null; then
-        LOG_NAMESPACE_LINE=enabled
-        install -d -m 0755 /etc/systemd/system/brocade-agent.service.d
-        cat > /etc/systemd/system/brocade-agent.service.d/20-log-namespace.conf <<'EOF'
+  if [ "$ENABLE_CVM" = "1" ]; then
+    install -d -m 0755 /etc/systemd/system/brocade-agent.service.d
+    host_system_unit=$(mktemp /etc/systemd/system/brocade-agent.service.d/.host-system.XXXXXX)
+    TMPFILES="$TMPFILES $host_system_unit"
+    {
+      printf '[Service]\n'
+      printf 'Environment=BROCADE_CVM_HOST_CONFIG=%s\n' "$HOST_SYSTEM_CONFIG"
+      printf 'Environment=BROCADE_CVM_HOST_STATE_DIR=/var/lib/brocade/cvm-host\n'
+    } >"$host_system_unit"
+    mv -f "$host_system_unit" "$HOST_SYSTEM_DROPIN"
+  fi
+  # Give Brocade its own journal namespace so the bootstrap 20 MiB ceiling applies to this
+  # agent, not to unrelated host services. The first authenticated poll replaces it with the
+  # global/per-machine value from Settings. Namespaces landed in systemd 245; on an older host
+  # retaining the global journal is safer than shrinking every service's logs to our limit.
+  SYSTEMD_VERSION=$(systemctl --version 2>/dev/null | awk 'NR == 1 { print $2 }')
+  if [ -n "$SYSTEMD_VERSION" ] && [ "$SYSTEMD_VERSION" -ge 245 ] 2>/dev/null; then
+    LOG_NAMESPACE_LINE=enabled
+    install -d -m 0755 /etc/systemd/system/brocade-agent.service.d
+    cat >/etc/systemd/system/brocade-agent.service.d/20-log-namespace.conf <<'EOF'
 [Service]
 LogNamespace=brocade-agent
 EOF
-        install -d -m 0755 /etc/systemd/journald@brocade-agent.conf.d
-        cat > /etc/systemd/journald@brocade-agent.conf.d/limits.conf <<'EOF'
+    install -d -m 0755 /etc/systemd/journald@brocade-agent.conf.d
+    cat >/etc/systemd/journald@brocade-agent.conf.d/limits.conf <<'EOF'
 [Journal]
 Storage=persistent
 SystemMaxUse=20M
@@ -1263,11 +1465,11 @@ RuntimeMaxUse=20M
 SystemMaxFileSize=5M
 RuntimeMaxFileSize=5M
 EOF
-    else
-        rm -f /etc/systemd/system/brocade-agent.service.d/20-log-namespace.conf
-        echo "systemd 低于 245，不能创建独立日志命名空间；Agent 暂沿用系统 journal 上限" >&2
-    fi
-    cat > /etc/systemd/system/brocade-agent.service <<EOF
+  else
+    rm -f /etc/systemd/system/brocade-agent.service.d/20-log-namespace.conf
+    echo "systemd 低于 245，不能创建独立日志命名空间；Agent 暂沿用系统 journal 上限" >&2
+  fi
+  cat >/etc/systemd/system/brocade-agent.service <<EOF
 [Unit]
 Description=Brocade agent
 Wants=network-online.target
@@ -1292,27 +1494,51 @@ KillMode=process
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    if [ -n "$LOG_NAMESPACE_LINE" ]; then
-        systemctl try-restart systemd-journald@brocade-agent.service >/dev/null 2>&1 || true
-    fi
-    systemctl enable brocade-agent.service
-    # A resident process does not pick up a replaced binary on its own and must restart.
-    systemctl restart brocade-agent.service
-else
-    # OpenRC's supervise-daemon supplies the same property self-update relies on as systemd's
-    # Restart=always: after the resident process atomically replaces itself and exits 0, start the
-    # new inode five seconds later. Do not set stopgroup: Xray and Phantun are deliberately nohup'd
-    # data-plane children and must survive an Agent restart, matching KillMode=process above.
-    OPENRC_RUNNER="$CONFIG_DIR/run-openrc"
-    AGENT_LOG_FILE="$STATE_DIR/logs/agent.log"
-    AGENT_LOG_POLICY="$STATE_DIR/log-agent-journal-max-mib"
+  if [ "$ENABLE_CVM" = "1" ]; then
+    cat >/etc/systemd/system/brocade-host-terminal.service <<EOF
+[Unit]
+Description=Brocade physical host terminal
+After=local-fs.target
+ConditionPathExists=$HOST_SYSTEM_CONFIG
 
-    # EnvironmentFile is a systemd feature. The runner imports only the six names this installer
-    # writes, using `export "$line"` rather than sourcing the file as shell code. Besides accepting
-    # spaces and punctuation in values, this prevents a crafted --server value from becoming root
-    # shell syntax when OpenRC starts the service.
-    cat > "$OPENRC_RUNNER" <<EOF
+[Service]
+Type=simple
+Environment=BROCADE_CVM_HOST_CONFIG=$HOST_SYSTEM_CONFIG
+Environment=BROCADE_CVM_HOST_STATE_DIR=/var/lib/brocade/cvm-host
+ExecStart=$AGENT_BIN cvm-host-terminal
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+  systemctl daemon-reload
+  if [ -n "$LOG_NAMESPACE_LINE" ]; then
+    systemctl try-restart systemd-journald@brocade-agent.service >/dev/null 2>&1 || true
+  fi
+  if [ "$ENABLE_CVM" = "1" ]; then
+    systemctl enable brocade-host-terminal.service
+    systemctl restart brocade-host-terminal.service
+  fi
+  systemctl enable brocade-agent.service
+  # A resident process does not pick up a replaced binary on its own and must restart.
+  systemctl restart brocade-agent.service
+else
+  # OpenRC's supervise-daemon supplies the same property self-update relies on as systemd's
+  # Restart=always: after the resident process atomically replaces itself and exits 0, start the
+  # new inode five seconds later. Do not set stopgroup: Xray and Phantun are deliberately nohup'd
+  # data-plane children and must survive an Agent restart, matching KillMode=process above.
+  OPENRC_RUNNER="$CONFIG_DIR/run-openrc"
+  AGENT_LOG_FILE="$STATE_DIR/logs/agent.log"
+  AGENT_LOG_POLICY="$STATE_DIR/log-agent-journal-max-mib"
+
+  # EnvironmentFile is a systemd feature. The runner imports only the six names this installer
+  # writes, using `export "$line"` rather than sourcing the file as shell code. Besides accepting
+  # spaces and punctuation in values, this prevents a crafted --server value from becoming root
+  # shell syntax when OpenRC starts the service.
+  cat >"$OPENRC_RUNNER" <<EOF
 #!/bin/sh
 exec 2>&1
 env_file="$CONFIG_DIR/env"
@@ -1325,12 +1551,12 @@ while IFS= read -r line || [ -n "\$line" ]; do
 done < "\$env_file"
 exec "$AGENT_BIN" run
 EOF
-    chmod 0700 "$OPENRC_RUNNER"
+  chmod 0700 "$OPENRC_RUNNER"
 
-    # One bounded sink receives the runner's merged stdout/stderr. It watches the same policy file
-    # populated from Settings as journald does on systemd, so Alpine does not gain an unbounded log
-    # merely because it has no journal namespace.
-    cat > /etc/init.d/brocade-agent <<EOF
+  # One bounded sink receives the runner's merged stdout/stderr. It watches the same policy file
+  # populated from Settings as journald does on systemd, so Alpine does not gain an unbounded log
+  # merely because it has no journal namespace.
+  cat >/etc/init.d/brocade-agent <<EOF
 #!/sbin/openrc-run
 
 name="Brocade agent"
@@ -1350,21 +1576,21 @@ depend() {
     after firewall
 }
 EOF
-    chmod 0755 /etc/init.d/brocade-agent
-    rc-update add brocade-agent default
-    # A resident process does not pick up a replaced binary on its own. `restart` also starts a
-    # stopped OpenRC service.
-    rc-service brocade-agent restart
-    echo "OpenRC 日志：$AGENT_LOG_FILE" >&2
+  chmod 0755 /etc/init.d/brocade-agent
+  rc-update add brocade-agent default
+  # A resident process does not pick up a replaced binary on its own. `restart` also starts a
+  # stopped OpenRC service.
+  rc-service brocade-agent restart
+  echo "OpenRC 日志：$AGENT_LOG_FILE" >&2
 fi
 
 echo "brocade-agent enrolled node $NODE_ID (apply=$APPLY_MODE, service=$SERVICE_MODE)"
 
 if [ "$APPLY_MODE" = "state-dir" ]; then
-    echo
-    echo "注意：state-dir 模式只把产物写进 $STATE_DIR，不会配 wg0、不会拉起 xray。" >&2
-    echo "控制台上看到的 present 只代表文件写好了。生产请用 --apply linux。" >&2
-    exit 0
+  echo
+  echo "注意：state-dir 模式只把产物写进 $STATE_DIR，不会配 wg0、不会拉起 xray。" >&2
+  echo "控制台上看到的 present 只代表文件写好了。生产请用 --apply linux。" >&2
+  exit 0
 fi
 
 # The self-check: wait for the first poll to come back, then look at real system state rather than
@@ -1378,31 +1604,31 @@ echo
 echo "自检（最多等 90 秒）..."
 i=0
 while [ "$i" -lt 90 ]; do
-    if "$AGENT_BIN" health --state-dir "$STATE_DIR" >/dev/null 2>&1; then
-        break
-    fi
-    i=$((i + 3))
-    sleep 3
-    echo "  等 agent 跑完第一轮（已等 ${i} 秒）..." >&2
+  if "$AGENT_BIN" health --state-dir "$STATE_DIR" >/dev/null 2>&1; then
+    break
+  fi
+  i=$((i + 3))
+  sleep 3
+  echo "  等 agent 跑完第一轮（已等 ${i} 秒）..." >&2
 done
 # The verdict is the report itself, printed once here — the loop above ran quietly.
 "$AGENT_BIN" health --state-dir "$STATE_DIR" || {
-    # Tail the recent log directly rather than merely saying to consult journalctl — whoever just
-    # installed the machine has only this terminal, and there is no reason to send them to
-    # another.
-    echo "自检没通过。最近的 agent 日志：" >&2
-    if [ "$SERVICE_MODE" = "openrc" ]; then
-        tail -n 50 "$AGENT_LOG_FILE" >&2 || true
-    elif have journalctl; then
-        if [ -n "$LOG_NAMESPACE_LINE" ]; then
-            journalctl --namespace=brocade-agent -u brocade-agent -n 50 --no-pager >&2 || true
-        else
-            journalctl -u brocade-agent -n 50 --no-pager >&2 || true
-        fi
+  # Tail the recent log directly rather than merely saying to consult journalctl — whoever just
+  # installed the machine has only this terminal, and there is no reason to send them to
+  # another.
+  echo "自检没通过。最近的 agent 日志：" >&2
+  if [ "$SERVICE_MODE" = "openrc" ]; then
+    tail -n 50 "$AGENT_LOG_FILE" >&2 || true
+  elif have journalctl; then
+    if [ -n "$LOG_NAMESPACE_LINE" ]; then
+      journalctl --namespace=brocade-agent -u brocade-agent -n 50 --no-pager >&2 || true
+    else
+      journalctl -u brocade-agent -n 50 --no-pager >&2 || true
     fi
-    exit 1
+  fi
+  exit 1
 }
 if [ "$CVM_REBOOT_PENDING" = 1 ]; then
-    echo "CVM 已准备好，等待手动重启宿主；重启后自动继续安装。Agent 已正常纳管，CVM 尚未就绪。" >&2
-    exit 75
+  echo "CVM 已准备好，等待手动重启宿主；重启后自动继续安装。Agent 已正常纳管，CVM 尚未就绪。" >&2
+  exit 75
 fi

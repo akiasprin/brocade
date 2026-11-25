@@ -11,6 +11,8 @@ mod chain_egress;
 pub use artifacts::{CvmArtifactHistory, CvmMutationResult, CvmMutationReview};
 pub use chain_egress::{CvmChainCatalog, CvmChainOption};
 mod baremetal;
+mod credentials;
+mod host_capacity;
 mod host_policy;
 mod instances;
 mod interfaces;
@@ -19,9 +21,14 @@ mod network_quota;
 pub(crate) mod nics;
 mod node_state;
 mod operations;
-mod quota;
 mod readings;
+mod recovery;
 pub(crate) mod releases;
+pub(crate) mod retirement;
+mod route_match;
+pub use route_match::{
+    CvmRouteBlockReason, CvmRouteMatch, CvmRouteMatchProtocol, CvmRouteMatchRequest,
+};
 mod terminal;
 mod types;
 
@@ -31,17 +38,16 @@ pub use host_policy::HostPolicyUpdate;
 use instances::*;
 use interfaces::*;
 pub use monitoring::{CvmMonitoring, MonitoringSample};
-pub use network_quota::{
-    CvmHostNetworkQuota, CvmHostNetworkQuotaChange, CvmNetworkQuotaPreview,
-    CvmNetworkQuotaPreviewRequest,
-};
+
+use host_capacity::*;
 pub use nics::{
     CvmEntryAddressUse, CvmEntryBoard, CvmEntryPortUse, CvmEntryPublicationView, CvmEntryState,
-    CvmEntryView, CvmNetworkLogDomain, CvmNetworkLogs, CvmNetworkNodeLogs, CvmNetworkProvider,
-    CvmNicBindingView, CvmNicCatalog, CvmNicState,
+    CvmEntryView, CvmNetworkEditRequest, CvmNetworkEditResult, CvmNetworkEntryAddition,
+    CvmNetworkEntryRelease, CvmNetworkLogDomain, CvmNetworkLogs, CvmNetworkMount,
+    CvmNetworkNodeLogs, CvmNetworkProvider, CvmNetworkRoutesWrite, CvmNicBindingView,
+    CvmNicCatalog, CvmNicState,
 };
 use operations::*;
-use quota::*;
 pub use readings::{CvmCardReading, CvmCardSample, CvmReadings};
 pub use terminal::TerminalPolicyUpdate;
 pub use types::*;

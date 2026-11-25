@@ -12286,6 +12286,15 @@ async fn forced_retirement_is_a_fenced_terminal_state_and_restore_uses_a_new_epo
     assert_eq!(repaired.lifecycle.lifecycle_epoch, 1);
     assert_ne!(repaired.deployment_id, Some(first_teardown));
 
+    // A normal teardown can finish its ordinary artifacts before CVM residue is noticed. The
+    // force action remains available from this already-retired state to repair that residue.
+    sqlx::query(
+        "UPDATE node_lifecycle_state SET phase='retired',completed_at=now() WHERE node_id='n1'",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
     let abandoned = db.store.abandon_node(&system_admin(), "n1").await.unwrap();
     assert_eq!(abandoned.lifecycle.lifecycle_epoch, 2);
     assert_eq!(

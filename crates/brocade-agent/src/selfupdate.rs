@@ -494,16 +494,42 @@ fn probe_flavor(
     flavor: brocade_deployment::product::ProductFlavor,
 ) -> Result<(), String> {
     #[cfg(feature = "cvm")]
-    let native = crate::cvm::native_selected()?;
-    #[cfg(not(feature = "cvm"))]
-    let native = false;
-    probe_flavor_for_backend(candidate, flavor, native)
+    if std::env::var("BROCADE_CVM_BACKEND").as_deref() == Ok("baremetal") {
+        return Err("旧裸机独占模式不能自更新；请使用安装器 --enable-cvm 转换为组合执行栈".into());
+    }
+    probe_flavor_for_backend(candidate, flavor)?;
+    #[cfg(feature = "cvm")]
+    if flavor == brocade_deployment::product::ProductFlavor::Cvm
+        && crate::cvm::native_chain_configured()?
+    {
+        probe_native_chain_contract(candidate)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "cvm", test))]
+fn probe_native_chain_contract(candidate: &Path) -> Result<(), String> {
+    let candidate = candidate
+        .to_str()
+        .ok_or("Agent candidate path is not UTF-8")?;
+    let output = capture_command_with_timeout(
+        candidate,
+        &["cvm-check", "--baremetal-chain-contract"],
+        Duration::from_secs(10),
+    )?;
+    if !output.status.success()
+        || String::from_utf8_lossy(&output.stdout).trim() != "brocade-host-chain-egress-v1"
+    {
+        return Err(
+            "裸机仍配置了线路出口，候选 Agent 缺少对应执行与恢复能力；请先移除线路并发布".into(),
+        );
+    }
+    Ok(())
 }
 
 fn probe_flavor_for_backend(
     candidate: &Path,
     flavor: brocade_deployment::product::ProductFlavor,
-    native: bool,
 ) -> Result<(), String> {
     let candidate = candidate
         .to_str()
@@ -521,18 +547,6 @@ fn probe_flavor_for_backend(
         || identity.as_ref().and_then(|value| value["arch"].as_str()) != Some(identity::self_arch())
     {
         return Err("候选 Agent 自检、产品变体或架构不匹配".into());
-    }
-    if native && flavor == brocade_deployment::product::ProductFlavor::Cvm {
-        let output = capture_command_with_timeout(
-            candidate,
-            &["cvm-check", "--baremetal-contract"],
-            Duration::from_secs(10),
-        )?;
-        if !output.status.success()
-            || String::from_utf8_lossy(&output.stdout).trim() != "brocade-host-native-v1"
-        {
-            return Err("裸机模式不能更新为缺少本机执行与恢复契约的 Agent".into());
-        }
     }
     Ok(())
 }
@@ -787,32 +801,24 @@ mod tests {
     }
 
     #[test]
-    fn native_candidate_contract_preserves_safe_base_transition() {
-        use brocade_deployment::product::ProductFlavor::{Base, Cvm};
-        let root =
-            std::env::temp_dir().join(format!("brocade-native-candidate-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
+    fn native_chain_candidate_requires_the_specific_recovery_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "brocade-native-chain-candidate-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
         let candidate = root.join("candidate");
-        for (flavor, contract, accepted) in [
-            (Base, None, true),
-            (Cvm, None, false),
-            (Cvm, Some("invalid"), false),
-            (Cvm, Some("brocade-host-native-v1"), true),
+        for (response, accepted) in [
+            ("brocade-host-native-v1", false),
+            ("brocade-host-chain-egress-v1", true),
         ] {
-            let identity = serde_json::json!({"flavor":flavor,"arch":identity::self_arch()});
-            let check = contract
-                .map(|value| format!("printf '%s\\n' '{value}'"))
-                .unwrap_or_else(|| "exit 9".into());
-            let script = format!("#!/bin/sh\ncase \"$1\" in\nself-test) printf '%s\\n' '{}' '{}' ;;\ncvm-check) {check} ;;\n*) exit 9 ;;\nesac\n",brocade_deployment::protocol::AGENT_SELF_TEST_RESPONSE,identity);
-            let staging = root.join("staging");
-            fs::write(&staging, script).unwrap();
-            fs::set_permissions(&staging, permissions(0o700)).unwrap();
-            fs::rename(&staging, &candidate).unwrap();
-            assert_eq!(
-                probe_flavor_for_backend(&candidate, flavor, true).is_ok(),
-                accepted,
-                "flavor={flavor} contract={contract:?}"
-            );
+            fs::write(
+                &candidate,
+                format!("#!/bin/sh\nprintf '%s\\n' '{response}'\n"),
+            )
+            .unwrap();
+            fs::set_permissions(&candidate, permissions(0o700)).unwrap();
+            assert_eq!(probe_native_chain_contract(&candidate).is_ok(), accepted);
         }
         fs::remove_dir_all(root).unwrap();
     }

@@ -113,6 +113,12 @@ function mount(allowMachineDetails = true) {
   );
 }
 
+/** jsdom 不排版；模拟纸面（决定手机排版）与矩阵滚动区（决定读数格 / 点阵）的宽度。 */
+const layoutWidth = (panel: number, board = panel) =>
+  vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockImplementation(function (this: HTMLElement) {
+    return this.classList.contains('flt-cockpit') ? panel : board;
+  });
+
 const readingOf = (ledger: HTMLElement, label: string) =>
   within(ledger).getByText(label, { selector: 'dt' }).parentElement?.querySelector('dd')?.textContent;
 
@@ -347,7 +353,6 @@ describe('fleet realtime traffic panel', () => {
 
       const expected = phase === 'complete' ? '当前没有用户流量' : '当前读数不完整';
       expect(view.container.querySelector('.flt-readout')?.textContent).toBe(expected);
-      expect(view.container.querySelector('.flt-list-empty')?.textContent).toBe(expected);
       if (phase !== 'complete') expect(view.queryAllByText('当前没有用户流量')).toHaveLength(0);
     },
   );
@@ -428,6 +433,7 @@ describe('fleet realtime traffic panel', () => {
   });
 
   it('lays the fleet out as a user × machine table whose cells say what was measured', async () => {
+    layoutWidth(1000);
     serve(snapshot());
     const view = mount();
 
@@ -447,8 +453,13 @@ describe('fleet realtime traffic panel', () => {
     const mark = (row: HTMLElement, node: string) => cell(row, node).querySelector('.flt-cell')?.classList;
     expect(said(alice, 'hk')).toBe('下行 24.0 Mbit/s · 上行 1.00 Mbit/s');
     expect(mark(alice, 'hk')?.contains('l3')).toBe(true);
-    // Three machines leave room to print the reading next to the swatch.
-    expect(cell(alice, 'hk').querySelector('.flt-cv')?.textContent).toBe('25.0 Mbit/s');
+    // Three 104px reading columns fit: the tinted cell prints the reading itself.
+    expect(table.closest('.flt-board')?.classList.contains('reading')).toBe(true);
+    expect(cell(alice, 'hk').querySelector('.flt-cell')?.textContent).toBe('25.0 Mbit/s');
+    // Idle cells stay wordless; machines without a reading say so instead of showing 0.
+    expect(cell(bob, 'jp').querySelector('.flt-cell')?.textContent).toBe('');
+    expect(cell(bob, 'jp').querySelector('.flt-cell')?.getAttribute('title')).toBe('已采集，当前没有流量');
+    expect(cell(alice, 'tw').querySelector('.flt-cell')?.textContent).toBe('无读数');
     expect(said(alice, 'jp')).toBe('未授权到这台机器');
     expect(mark(alice, 'jp')?.contains('na')).toBe(true);
     expect(said(alice, 'tw')).toBe('实时通道未连接');
@@ -483,15 +494,57 @@ describe('fleet realtime traffic panel', () => {
     expect(readout.textContent).toBe('bob → 香港 HKIX · 已采集，当前没有流量');
   });
 
-  it('turns into a per-user flow list on narrow screens', async () => {
+  it('falls back to the dot matrix when reading columns do not fit', async () => {
+    // 148 + 3 × 104 + 92 = 552px is wider than the board.
+    layoutWidth(1000, 551);
     serve(snapshot());
     const view = mount();
 
-    const list = await view.findByLabelText('按用户的当前速率');
-    expect(within(list).getAllByRole('listitem')).toHaveLength(1);
-    expect(within(list).getByRole('button', { name: /alice/ }).textContent).toContain('香港 HKIX 25.0 Mbit/s');
-    const rest = [...list.querySelectorAll('.flt-list-rest')].map(line => line.textContent);
-    expect(rest).toEqual(['空闲 1 位bob', '读数不完整 1 台台北 家宽（实时通道未连接）']);
+    const table = await view.findByRole('table');
+    expect(table.closest('.flt-board')?.classList.contains('reading')).toBe(false);
+    expect(table.querySelector('tr[data-user="platform/alice"] td[data-node="hk"] .flt-cell')?.textContent).toBe('');
+  });
+
+  it('keeps the matrix on narrow screens and writes each total under the name', async () => {
+    layoutWidth(390);
+    serve(snapshot());
+    const view = mount();
+
+    const table = await view.findByRole('table');
+    expect(table.closest('.flt-board')?.classList.contains('compact')).toBe(true);
+    expect(view.queryByLabelText('按用户的当前速率')).toBeNull();
+    const columns = within(table)
+      .getAllByRole('columnheader')
+      .map(header => header.textContent);
+    expect(columns).toEqual(['用户', '香港 HKIX', '东京 IIJ', '台北 家宽']);
+    const total = (user: string) => table.querySelector(`tr[data-user="platform/${user}"] .flt-utotal`)?.textContent;
+    expect(total('alice')).toBe('25.0 Mbit/s');
+    expect(total('bob')).toBe('0');
+    expect(table.querySelector('tfoot')).toBeTruthy();
+  });
+
+  it('drops the totals that would only repeat a single cell', async () => {
+    layoutWidth(1000);
+    const payload = snapshot();
+    payload.nodes = payload.nodes.slice(0, 1);
+    payload.expected = [{ node_id: 'hk', users: [{ tenant_id: 'platform', user_id: 'alice' }] }];
+    serve(payload);
+    const fetchFleet = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation((input, init) =>
+      String(input) === '/nodes/agent-state'
+        ? Promise.resolve(
+            Response.json({
+              nodes: [{ node_id: 'hk', name: '香港 HKIX', lifecycle_phase: 'active', public_ipv4_country: 'HK' }],
+            }),
+          )
+        : fetchFleet(input, init),
+    );
+    const view = mount();
+
+    const table = await view.findByRole('table');
+    await waitFor(() => expect(table.querySelectorAll('tbody tr')).toHaveLength(1));
+    expect(table.querySelector('.flt-sum')).toBeNull();
+    expect(table.querySelector('tfoot')).toBeNull();
   });
 
   it('groups initial user-rate loading as connecting and clears it when reports arrive', async () => {
@@ -503,18 +556,21 @@ describe('fleet realtime traffic panel', () => {
     serve(payload);
     const view = mount();
     await act(() => vi.advanceTimersByTimeAsync(0));
-    const list = view.getByLabelText('按用户的当前速率');
+    const ledger = view.getByLabelText('机队当前速率');
+    const table = view.getByRole('table');
+    const bobJapan = () => table.querySelector('tr[data-user="platform/bob"] td[data-node="jp"]')!;
     expect(view.getByRole('status').textContent).toBe('连接中');
-    expect(within(list).getByText('正在等待速率数据')).toBeTruthy();
-    expect(list.querySelector('.flt-list-rest')?.textContent).toBe('连接中：香港 HKIX、东京 IIJ、台北 家宽');
-    expect(within(list).queryByText(/读数不完整|尚未支持用户速率|空闲/)).toBeNull();
+    // No machine has a current reading yet: the sum is unknown, not zero.
+    expect(ledger.querySelector('.usage-hero-value')?.textContent).toBe('—');
+    expect(view.container.querySelector('.flt-readout')?.textContent).toBe('正在等待速率数据');
+    expect(bobJapan().querySelector('.flt-sr')?.textContent).toBe('正在建立速率基线');
     expect(view.queryByRole('alert')).toBeNull();
 
     Object.assign(payload, snapshot());
     await act(() => vi.advanceTimersByTimeAsync(5_000));
     expect(view.getByRole('status').textContent).toBe('实时 · 每秒更新');
-    expect(within(list).queryByText('连接中：')).toBeNull();
-    expect(within(list).getByText('空闲 1 位')).toBeTruthy();
+    expect(ledger.querySelector('.usage-hero-value')?.textContent).toBe('25.0 Mbit/s');
+    expect(bobJapan().querySelector('.flt-cell')?.classList.contains('idle')).toBe(true);
   });
 
   it.each(['/nodes/agent-state', '/users'])(
@@ -566,7 +622,7 @@ describe('fleet realtime traffic panel', () => {
     expect(view.queryByRole('status', { name: '读取实时用量' })).toBeNull();
   });
 
-  it('keeps a large connecting fleet concise instead of repeating one message for every machine', async () => {
+  it('shows a large connecting fleet as waiting cells instead of zero readings', async () => {
     const payload = snapshot();
     const extra = Array.from({ length: 22 }, (_, index) => ({
       node_id: `extra-${String(index).padStart(2, '0')}`,
@@ -583,12 +639,13 @@ describe('fleet realtime traffic panel', () => {
     serve(payload);
     const view = mount();
 
-    const list = await view.findByLabelText('按用户的当前速率');
-    const line = list.querySelector('.flt-list-rest')!;
-    expect(line.textContent).toMatch(/^连接中：.* 等 25 台$/);
-    expect(line.querySelector('span')?.title.split('、')).toHaveLength(25);
-    expect(line.textContent).not.toContain('extra-21');
-    expect(within(list).queryByText(/读数不完整|尚未支持用户速率/)).toBeNull();
+    const table = await view.findByRole('table');
+    expect(table.querySelectorAll('thead th[data-node]')).toHaveLength(25);
+    const alice = table.querySelector('tr[data-user="platform/alice"]')!;
+    expect(alice.querySelectorAll('.flt-cell.unknown')).toHaveLength(25);
+    expect(alice.querySelector('.flt-sum')?.textContent).toBe('—');
+    expect(view.container.querySelector('.flt-readout')?.textContent).toBe('正在等待速率数据');
+    expect(view.getByLabelText('机队当前速率').querySelector('.usage-hero-value')?.textContent).toBe('—');
   });
 
   it('shows public viewers the complete matrix without any detail action', async () => {

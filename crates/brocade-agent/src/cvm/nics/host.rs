@@ -875,6 +875,146 @@ fn nft_header(table: &str, chain: &str, attributes: &str) -> String {
 fn nft_rule(table: &str, chain: &str, rule: &str) -> String {
     format!("add rule inet {table} {chain} {rule}\n")
 }
+
+const FOREIGN_FORWARD_COMMENT_PREFIX: &str = "brocade-cvm-nic:";
+
+fn foreign_forward_inventory(family: &str, chain: &str) -> Result<Option<serde_json::Value>> {
+    let output = capture_command_with_timeout(
+        "nft",
+        &["-j", "-a", "list", "chain", family, "filter", chain],
+        Duration::from_secs(5),
+    )?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    serde_json::from_slice(&output.stdout)
+        .map(Some)
+        .map_err(|_| "invalid host forwarding inventory".into())
+}
+
+fn foreign_forward_jumps_to(value: &serde_json::Value, target: &str) -> bool {
+    value["nftables"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("rule"))
+        .filter_map(|rule| rule["expr"].as_array())
+        .flatten()
+        .any(|expression| {
+            ["jump", "goto"].into_iter().any(|verdict| {
+                expression[verdict]["target"]
+                    .as_str()
+                    .is_some_and(|candidate| candidate == target)
+            })
+        })
+}
+
+fn foreign_forward_handles(value: &serde_json::Value, marker: &str) -> Result<Vec<u64>> {
+    value["nftables"]
+        .as_array()
+        .ok_or("missing host forwarding inventory")?
+        .iter()
+        .filter_map(|item| item.get("rule"))
+        .filter(|rule| rule["comment"].as_str() == Some(marker))
+        .map(|rule| {
+            rule["handle"]
+                .as_u64()
+                .ok_or_else(|| "invalid owned host forwarding rule".into())
+        })
+        .collect()
+}
+
+/// An accept in Brocade's own base chain does not override a later foreign drop.
+/// Prefer Docker's documented user chain when it is actually reached; a stranded
+/// DOCKER-USER chain is not an extension point, so fall back to an exact, marked
+/// rule at the start of the host FORWARD chain. Namespace policy remains the
+/// authority for which business and transport flows may leave this owned veth.
+fn reconcile_foreign_forwarding(root: &Path, b: &NicBinding, enabled: bool) -> Result<()> {
+    let marker = format!(
+        "{FOREIGN_FORWARD_COMMENT_PREFIX}{}:{}",
+        b.interface_id,
+        suffix(b.side)
+    );
+    let link = layout(b).root_link;
+    let quoted_marker =
+        serde_json::to_string(&marker).map_err(|_| "invalid host forwarding marker")?;
+    let quoted_link = serde_json::to_string(&link).map_err(|_| "invalid host forwarding link")?;
+    for family in ["ip", "ip6"] {
+        let user = foreign_forward_inventory(family, "DOCKER-USER")?;
+        let forward = foreign_forward_inventory(family, "FORWARD")?;
+        let user_handles = user
+            .as_ref()
+            .map(|value| foreign_forward_handles(value, &marker))
+            .transpose()?
+            .unwrap_or_default();
+        let forward_handles = forward
+            .as_ref()
+            .map(|value| foreign_forward_handles(value, &marker))
+            .transpose()?
+            .unwrap_or_default();
+        let target = if enabled {
+            if user.is_some()
+                && forward
+                    .as_ref()
+                    .is_some_and(|value| foreign_forward_jumps_to(value, "DOCKER-USER"))
+            {
+                Some("DOCKER-USER")
+            } else if forward.is_some() {
+                Some("FORWARD")
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let converged = match target {
+            Some("DOCKER-USER") => user_handles.len() == 2 && forward_handles.is_empty(),
+            Some("FORWARD") => forward_handles.len() == 2 && user_handles.is_empty(),
+            Some(_) => unreachable!("host forwarding target is fixed"),
+            None => user_handles.is_empty() && forward_handles.is_empty(),
+        };
+        if converged {
+            continue;
+        }
+        let mut script = String::new();
+        for (chain, handles) in [
+            ("DOCKER-USER", &user_handles),
+            ("FORWARD", &forward_handles),
+        ] {
+            for handle in handles {
+                script.push_str(&format!(
+                    "delete rule {family} filter {chain} handle {handle}\n"
+                ));
+            }
+        }
+        if let Some(chain) = target {
+            script.push_str(&format!(
+                "insert rule {family} filter {chain} iifname {quoted_link} accept comment {quoted_marker}\n"
+            ));
+            script.push_str(&format!(
+                "insert rule {family} filter {chain} oifname {quoted_link} accept comment {quoted_marker}\n"
+            ));
+        }
+        if script.is_empty() {
+            continue;
+        }
+        let path = root.join("cvm-nics").join(format!(
+            "foreign-forward-{}-{}-{family}.nft",
+            digest(&b.interface_id),
+            suffix(b.side)
+        ));
+        atomic_write_private(&path, script.as_bytes())?;
+        let path = path
+            .to_str()
+            .ok_or("invalid host forwarding compatibility path")?;
+        run_command("nft", &["--check", "-f", path])
+            .map_err(|error| format!("cannot validate host forwarding compatibility: {error}"))?;
+        run_command("nft", &["-f", path]).map_err(|error| {
+            format!("cannot update owned host forwarding compatibility: {error}")
+        })?;
+    }
+    Ok(())
+}
 fn network_set(prefixes: &[IpPrefix], ipv4: bool) -> String {
     prefixes
         .iter()
@@ -920,7 +1060,16 @@ pub(super) fn configure(root: &Path, b: &NicBinding, desired: &NicDesired) -> Re
     let b = active.unwrap_or(b);
     let l = layout(b);
     let ns = &l.namespace;
-    let device = active.map(tunnel);
+    let device = match active {
+        Some(active)
+            if active.nic.transport == TransportKind::Xray
+                && !super::xray::is_prepared(active)? =>
+        {
+            None
+        }
+        Some(active) => Some(tunnel(active)),
+        None => None,
+    };
     let scope = table(b);
     let mut script = nft_header(
         &scope,
@@ -1222,46 +1371,21 @@ pub(super) fn route_rules(routing: &ContainerRoutes, interface: &str, v4: bool) 
         .iter()
         .filter(|route| route.destination.is_ipv4() == v4)
         .filter_map(|route| {
-            let priority = routing
-                .priorities
-                .iter()
-                .find(|p| p.target == route.target)
-                .and_then(|p| if v4 { p.ipv4 } else { p.ipv6 })?;
-            let width = route.service.map_or(u32::MAX, |s| {
-                u32::from(s.port_end) - u32::from(s.port_start)
-            });
-            Some((
-                std::cmp::Reverse(route.destination.length()),
-                route.service.is_none(),
-                priority,
-                width,
-                route,
-            ))
+            let priority = routing.exit_priority(&route.target, v4)?;
+            Some((route, priority))
         })
         .collect::<Vec<_>>();
-    ordered.sort_by(|a, b| {
+    ordered.sort_by_key(|&(route, priority)| {
         (
-            a.0,
-            a.1,
-            a.2,
-            a.3,
-            &a.4.destination,
-            a.4.service,
-            &a.4.target,
+            route.precedence(priority),
+            &route.destination,
+            route.service,
+            &route.target,
         )
-            .cmp(&(
-                b.0,
-                b.1,
-                b.2,
-                b.3,
-                &b.4.destination,
-                b.4.service,
-                &b.4.target,
-            ))
     });
     ordered
         .into_iter()
-        .map(|(_, _, _, _, route)| {
+        .map(|(route, _)| {
             let action = if route.target.interface_id() == Some(interface) {
                 "accept"
             } else {
@@ -1411,6 +1535,7 @@ fn configure_root(root: &Path, b: &NicBinding, peers: &[&NicBinding]) -> Result<
         nft_apply(root, None, &guard, &owner(b), &block)?;
     }
     nft_apply(root, None, &scope, &owner(b), &script)?;
+    reconcile_foreign_forwarding(root, b, !peers.is_empty())?;
     if changed {
         super::flows::business(b)?;
     }
@@ -1653,5 +1778,23 @@ mod namespace_tests {
             assert!(namespace_handle(&path).is_err());
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn foreign_forwarding_inventory_requires_a_real_user_chain_jump() {
+        let marker = "brocade-cvm-nic:nic-owned:c";
+        let inventory = serde_json::json!({"nftables":[
+            {"chain":{"family":"ip","table":"filter","name":"FORWARD"}},
+            {"rule":{"family":"ip","table":"filter","chain":"FORWARD","handle":7,
+                "expr":[{"counter":null},{"jump":{"target":"DOCKER-USER"}}]}},
+            {"rule":{"family":"ip","table":"filter","chain":"FORWARD","handle":8,
+                "comment":marker,"expr":[{"accept":null}]}}
+        ]});
+        assert!(foreign_forward_jumps_to(&inventory, "DOCKER-USER"));
+        assert!(!foreign_forward_jumps_to(&inventory, "OTHER"));
+        assert_eq!(foreign_forward_handles(&inventory, marker).unwrap(), [8]);
+        assert!(foreign_forward_handles(&inventory, "foreign")
+            .unwrap()
+            .is_empty());
     }
 }

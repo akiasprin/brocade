@@ -48,13 +48,24 @@ pub(super) fn round(options: &Options, cursor: &mut usize) -> Result<bool, Strin
     let mut inventory = InventoryReport {
         capabilities: Capabilities::default(),
         error: None,
+        terminal_sessions_used: None,
     };
     if options.apply_mode != ApplyMode::Linux {
         inventory.error = Some("CVM 执行需要 Linux 收敛模式".into());
     } else {
         match backend.as_ref() {
             Ok(service) => match service.inventory() {
-                Ok(capabilities) => inventory.capabilities = capabilities,
+                Ok(capabilities) => {
+                    #[cfg(target_os = "linux")]
+                    if capabilities.guest_terminal && capabilities.guest_terminal_persistent {
+                        inventory.terminal_sessions_used = cube_terminal::server::occupied_slots(
+                            std::path::Path::new(cube_terminal::ROOT),
+                        )
+                        .ok()
+                        .and_then(|used| u8::try_from(used).ok());
+                    }
+                    inventory.capabilities = capabilities;
+                }
                 Err(error) => inventory.error = Some(error),
             },
             Err(error) if configured => inventory.error = Some(error.clone()),
@@ -91,7 +102,7 @@ pub(super) fn round(options: &Options, cursor: &mut usize) -> Result<bool, Strin
             }
         }
     }
-    if super::maintenance()? {
+    if options.apply_mode == ApplyMode::Linux && super::maintenance()? {
         return Ok(false);
     }
     let quota_error = if inventory.error.is_none() && inventory.capabilities.network_quota.is_some()
@@ -115,23 +126,17 @@ pub(super) fn round(options: &Options, cursor: &mut usize) -> Result<bool, Strin
     }
     let desired: DesiredState =
         serde_json::from_str(&response.body).map_err(|_| "CVM desired response is invalid")?;
+    if desired.page_offset != *cursor || desired.instances.len() > 8 {
+        return Err("CVM desired page does not match its cursor or size limit".into());
+    }
     if options.apply_mode == ApplyMode::Linux {
         super::chain_egress::sync(options, &desired.chain_clients)?;
-    }
-    if desired.instances.len() > MAX_INSTANCES_PER_MACHINE {
-        return Err("CVM desired set exceeds the machine limit".into());
     }
     if desired.instances.is_empty() {
         *cursor = 0;
         return Ok(false);
     }
-    let local_cursor = if desired.page_offset.is_some() {
-        0
-    } else {
-        *cursor
-    };
-    for offset in 0..desired.instances.len().min(8) {
-        let item = &desired.instances[(local_cursor + offset) % desired.instances.len()];
+    for item in &desired.instances {
         if !valid_id(&item.id)
             || !valid_id(&item.operation_id)
             || item.generation == 0
@@ -142,6 +147,37 @@ pub(super) fn round(options: &Options, cursor: &mut usize) -> Result<bool, Strin
                 )
         {
             return Err("CVM desired specification identity is invalid".into());
+        }
+        if item.power == PowerState::Running && item.spec.login_revision > 0 {
+            let response = client.request(
+                "GET",
+                &format!(
+                    "/agent/v1/cvm/{}/credential?revision={}",
+                    item.id, item.spec.login_revision
+                ),
+                &options.token,
+                None,
+            )?;
+            if response.status != 200 {
+                return Err(format!(
+                    "CVM credential request failed: HTTP {}",
+                    response.status
+                ));
+            }
+            if response.body.len() > 4096 {
+                return Err("Guest credential response exceeds limit".into());
+            }
+            let credential: GuestCredential = serde_json::from_str(&response.body)
+                .map_err(|_| "Guest credential response invalid")?;
+            credential.validate()?;
+            if credential.instance_id != item.id || credential.revision != item.spec.login_revision
+            {
+                return Err("Guest credential identity mismatch".into());
+            }
+            backend
+                .as_ref()
+                .map_err(Clone::clone)?
+                .stage_credential(&credential)?;
         }
         // Readiness is an allocation gate. Cleanup still needs the owned executor
         // when a bridge or an unrelated capability observation is unavailable.
@@ -163,7 +199,7 @@ pub(super) fn round(options: &Options, cursor: &mut usize) -> Result<bool, Strin
                 ApplyStatus::Unknown,
                 chain_error
                     .as_deref()
-                    .unwrap_or("本机 Cube 执行器不可用；实例与预约保留"),
+                    .unwrap_or("本机执行栈不可用；实例与预约保留"),
             )
         } else {
             match backend
@@ -210,11 +246,7 @@ pub(super) fn round(options: &Options, cursor: &mut usize) -> Result<bool, Strin
         super::diagnostics::instance(&options.state_dir, item, &report);
         post(&client, options, "/agent/v1/cvm/report", &report)?;
     }
-    *cursor = if desired.page_offset.is_some() {
-        desired.next_offset.unwrap_or(0)
-    } else {
-        (*cursor + 8) % desired.instances.len()
-    };
+    *cursor = desired.next_offset.unwrap_or(0);
     Ok(true)
 }
 fn failed_report(desired: &InstanceDesired, status: ApplyStatus, error: &str) -> InstanceReport {

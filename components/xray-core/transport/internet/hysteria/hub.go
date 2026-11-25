@@ -197,9 +197,17 @@ type Listener struct {
 	quicParams  *internet.QuicParams
 	addConn     internet.ConnHandler
 
-	pktConn  net.PacketConn
-	tr       *quic.Transport
-	listener *quic.Listener
+	pktConn   net.PacketConn
+	tr        *quic.Transport
+	listener  quicListener
+	closeOnce sync.Once
+	closeErr  error
+}
+
+type quicListener interface {
+	Accept(context.Context) (*quic.Conn, error)
+	Addr() net.Addr
+	Close() error
 }
 
 func (l *Listener) handleClient(conn *quic.Conn) {
@@ -246,6 +254,10 @@ func (l *Listener) keepAccepting() {
 		if err != nil {
 			if err != quic.ErrServerClosed {
 				errors.LogErrorInner(context.Background(), err, "failed to serve hysteria")
+				// A terminal QUIC read error stops admission. Close the externally
+				// owned packet socket too, so the handoff status cannot keep
+				// advertising a UDP listener whose receive queue is no longer read.
+				_ = l.Close()
 			}
 			break
 		}
@@ -258,10 +270,23 @@ func (l *Listener) Addr() net.Addr {
 }
 
 func (l *Listener) Close() error {
-	if l.handoff != nil {
-		l.handoff.Close()
-	}
-	return errors.Combine(l.listener.Close(), l.tr.Close(), l.pktConn.Close())
+	l.closeOnce.Do(func() {
+		if l.handoff != nil {
+			l.handoff.Close()
+		}
+		var closeErrors []error
+		if l.listener != nil {
+			closeErrors = append(closeErrors, l.listener.Close())
+		}
+		if l.tr != nil {
+			closeErrors = append(closeErrors, l.tr.Close())
+		}
+		if l.pktConn != nil {
+			closeErrors = append(closeErrors, l.pktConn.Close())
+		}
+		l.closeErr = errors.Combine(closeErrors...)
+	})
+	return l.closeErr
 }
 
 func Listen(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {

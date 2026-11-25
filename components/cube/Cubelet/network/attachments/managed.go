@@ -61,9 +61,6 @@ func assignedPrefix(address string) string {
 	return netip.PrefixFrom(ip, ip.BitLen()).String()
 }
 func (s *server) sourceFor(a *attachment) bridgeSource {
-	if a.Allocated == nil {
-		return bridgeSource{}
-	}
 	source := bridgeSource{Bridge: "bn" + hash([]byte(a.ID))[:12]}
 	if a.IPv4 != "" {
 		source.IPv4Pool = a.IPv4

@@ -31,7 +31,12 @@ pub fn addresses(tunnel: &EntryTunnel) -> Option<(Ipv4Addr, Ipv4Addr)> {
 fn protocols(mode: &EntryMode) -> Vec<Option<&'static str>> {
     match mode {
         EntryMode::L3 => vec![None],
-        EntryMode::L4 { protocol, .. } => protocol
+        EntryMode::Protocols { traffic } => [L4Protocol::Tcp, L4Protocol::Udp]
+            .into_iter()
+            .filter(|p| !matches!(traffic.transport(*p), EntryTransportSelection::Disabled))
+            .map(|p| Some(if p == L4Protocol::Tcp { "tcp" } else { "udp" }))
+            .collect(),
+        EntryMode::L4Range { protocol, .. } => protocol
             .protocols()
             .into_iter()
             .map(|protocol| {
@@ -43,37 +48,169 @@ fn protocols(mode: &EntryMode) -> Vec<Option<&'static str>> {
             .collect(),
     }
 }
-/// Packet selectors of an entry on this machine, one per protocol, before translation.
-fn selectors(address: Ipv4Addr, mode: &EntryMode) -> Vec<(String, String)> {
+/// Packet selectors before translation, one per mapped port and protocol.
+fn legacy_selectors(address: Ipv4Addr, mode: &EntryMode) -> Vec<(String, String)> {
+    let Some(ports) = mode.ports() else {
+        return vec![(format!("ip daddr {address}"), String::new())];
+    };
     protocols(mode)
         .into_iter()
-        .map(|protocol| match (protocol, mode) {
-            (
-                Some(protocol),
-                EntryMode::L4 {
-                    listen_port,
-                    target_port,
-                    ..
-                },
-            ) => (
-                format!("ip daddr {address} {protocol} dport {listen_port}"),
-                format!(":{target_port}"),
-            ),
-            _ => (format!("ip daddr {address}"), String::new()),
+        .flatten()
+        .flat_map(|protocol| {
+            (ports.listen_start..=ports.listen_end).map(move |listen| {
+                let target = ports
+                    .target_for(listen)
+                    .expect("validated entry maps equal-length port intervals");
+                (
+                    format!("ip daddr {address} {protocol} dport {listen}"),
+                    format!(":{target}"),
+                )
+            })
         })
         .collect()
 }
-/// Delivered traffic at the container: its address and, for L4, its protocol port.
-fn delivered(target: Ipv4Addr, mode: &EntryMode) -> Vec<String> {
+/// Delivered traffic only reaches the exact target interval of this entry.
+fn legacy_delivered(target: Ipv4Addr, mode: &EntryMode) -> Vec<String> {
+    let Some(ports) = mode.ports() else {
+        return vec![format!("ip daddr {target}")];
+    };
+    let range = if ports.target_start == ports.target_end {
+        ports.target_start.to_string()
+    } else {
+        format!("{}-{}", ports.target_start, ports.target_end)
+    };
     protocols(mode)
         .into_iter()
-        .map(|protocol| match (protocol, mode) {
-            (Some(protocol), EntryMode::L4 { target_port, .. }) => {
-                format!("ip daddr {target} {protocol} dport {target_port}")
-            }
-            _ => format!("ip daddr {target}"),
-        })
+        .flatten()
+        .map(|protocol| format!("ip daddr {target} {protocol} dport {range}"))
         .collect()
+}
+
+fn port_text(range: EntryPortRange) -> String {
+    if range.start == range.end {
+        range.start.to_string()
+    } else {
+        format!("{}-{}", range.start, range.end)
+    }
+}
+fn port_set(ranges: &[EntryPortRange]) -> String {
+    if ranges.len() == 1 {
+        port_text(ranges[0])
+    } else {
+        format!(
+            "{{ {} }}",
+            ranges
+                .iter()
+                .copied()
+                .map(port_text)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+fn selectors(
+    address: Ipv4Addr,
+    mode: &EntryMode,
+    reserved: &EntryReservedPorts,
+) -> Result<Vec<(String, String)>> {
+    if !mode.requires_protocol_rules(reserved) {
+        return Ok(legacy_selectors(address, mode));
+    }
+    let traffic = mode.traffic();
+    let mut out = Vec::new();
+    for protocol in [L4Protocol::Tcp, L4Protocol::Udp] {
+        let name = if protocol == L4Protocol::Tcp {
+            "tcp"
+        } else {
+            "udp"
+        };
+        let segments = traffic.segments(protocol, reserved)?;
+        let preserving: Vec<_> = segments
+            .iter()
+            .filter(|s| s.preserving())
+            .map(|s| s.listen)
+            .collect();
+        if !preserving.is_empty() {
+            out.push((
+                format!("ip daddr {address} {name} dport {}", port_set(&preserving)),
+                String::new(),
+            ));
+        }
+        for segment in segments.into_iter().filter(|s| !s.preserving()) {
+            for listen in segment.listen.start..=segment.listen.end {
+                let target = segment.target.start + (listen - segment.listen.start);
+                out.push((
+                    format!("ip daddr {address} {name} dport {listen}"),
+                    format!(":{target}"),
+                ));
+            }
+        }
+    }
+    if traffic.icmp {
+        out.push((
+            format!("ip daddr {address} ip protocol icmp"),
+            String::new(),
+        ));
+    }
+    if traffic.other_ip {
+        out.push((
+            format!("ip daddr {address} ip protocol != {{ tcp, udp, icmp }}"),
+            String::new(),
+        ));
+    }
+    Ok(out)
+}
+/// Original packet matches, shared by forwarding and durable withdrawal fences.
+pub fn packet_selectors(
+    address: Ipv4Addr,
+    mode: &EntryMode,
+    reserved: &EntryReservedPorts,
+) -> Result<Vec<String>> {
+    Ok(selectors(address, mode, reserved)?
+        .into_iter()
+        .map(|(packet, _)| packet)
+        .collect())
+}
+
+fn delivered(
+    target: Ipv4Addr,
+    mode: &EntryMode,
+    reserved: &EntryReservedPorts,
+) -> Result<Vec<String>> {
+    if !mode.requires_protocol_rules(reserved) {
+        return Ok(legacy_delivered(target, mode));
+    }
+    let traffic = mode.traffic();
+    let mut out = Vec::new();
+    for protocol in [L4Protocol::Tcp, L4Protocol::Udp] {
+        let name = if protocol == L4Protocol::Tcp {
+            "tcp"
+        } else {
+            "udp"
+        };
+        let ranges = merge_entry_ranges(
+            &traffic
+                .segments(protocol, reserved)?
+                .iter()
+                .map(|s| s.target)
+                .collect::<Vec<_>>(),
+        )?;
+        if !ranges.is_empty() {
+            out.push(format!(
+                "ip daddr {target} {name} dport {}",
+                port_set(&ranges)
+            ));
+        }
+    }
+    if traffic.icmp {
+        out.push(format!("ip daddr {target} ip protocol icmp"));
+    }
+    if traffic.other_ip {
+        out.push(format!(
+            "ip daddr {target} ip protocol != {{ tcp, udp, icmp }}"
+        ));
+    }
+    Ok(out)
 }
 
 /// Container addresses an entry-side tunnel delivers to; its routing table holds
@@ -119,6 +256,8 @@ pub fn ruleset(
     ready: &BTreeSet<&str>,
     transport_ports: &BTreeSet<(L4Protocol, u16)>,
 ) -> Result<String> {
+    // Frozen addresses are late bindings; port intervals must already be executable.
+    desired.validate_ports()?;
     let mut out = format!(
         "add table ip {TABLE}\ndelete table ip {TABLE}\ntable ip {TABLE} {{\n\
          chain steer {{ type filter hook prerouting priority -150; policy accept; }}\n\
@@ -154,6 +293,26 @@ pub fn ruleset(
     let tunnel = |id: &str| desired.tunnels.iter().find(|t| t.id == id);
     let mut local = BTreeSet::new();
     for rule in &desired.rules {
+        for protocol in [L4Protocol::Tcp, L4Protocol::Udp] {
+            let ranges = merge_entry_ranges(rule.reserved_ports.for_protocol(protocol))?;
+            if !ranges.is_empty() {
+                let name = if protocol == L4Protocol::Tcp {
+                    "tcp"
+                } else {
+                    "udp"
+                };
+                for chain in ["steer", "incoming", "fence"] {
+                    push(
+                        chain,
+                        format!(
+                            "ip daddr {} {name} dport {} return",
+                            rule.address,
+                            port_set(&ranges)
+                        ),
+                    );
+                }
+            }
+        }
         let path = match (&rule.target, &rule.tunnel) {
             (Some(target), None) => Some((*target, None)),
             (Some(target), Some(id)) if ready.contains(id.as_str()) => Some((
@@ -162,7 +321,7 @@ pub fn ruleset(
             )),
             _ => None,
         };
-        for (packet, port) in selectors(rule.address, &rule.mode) {
+        for (packet, port) in selectors(rule.address, &rule.mode, &rule.reserved_ports)? {
             let Some((target, via)) = path else {
                 // Claimed but undeliverable: never fall through to a host service.
                 push(
@@ -240,7 +399,9 @@ pub fn ruleset(
             }
             EntryTunnelSide::Target => {
                 for delivery in desired.deliveries.iter().filter(|d| d.tunnel == tunnel.id) {
-                    for packet in delivered(delivery.target, &delivery.mode) {
+                    for packet in
+                        delivered(delivery.target, &delivery.mode, &delivery.reserved_ports)?
+                    {
                         if delivery.host_local {
                             push("input", format!("iifname \"{dev}\" ip saddr {peer} {packet} ct direction original accept"));
                             continue;
@@ -271,4 +432,64 @@ pub fn ruleset(
         push("input", format!("iifname \"{dev}\" drop"));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+    #[test]
+    fn full_protocol_policy_keeps_host_ssh_during_target_failure_without_port_expansion() {
+        let desired = EntryDesired {
+            node_id: "entry".into(),
+            generation: 1,
+            rules: vec![EntryRule {
+                reserved_ports: EntryReservedPorts {
+                    tcp: vec![EntryPortRange { start: 22, end: 22 }],
+                    udp: vec![],
+                },
+                host_local: false,
+                id: "e1".into(),
+                address: "203.0.113.8".parse().unwrap(),
+                mode: EntryMode::Protocols {
+                    traffic: EntryTraffic::all(),
+                },
+                target: None,
+                tunnel: None,
+            }],
+            ..Default::default()
+        };
+        let nft = ruleset(&desired, &BTreeSet::new(), &BTreeSet::new()).unwrap();
+        for chain in ["steer", "incoming", "fence"] {
+            assert!(nft.contains(&format!("{chain} ip daddr 203.0.113.8 tcp dport 22 return")));
+        }
+        assert!(nft.contains("tcp dport { 1-21, 23-65535 }"));
+        assert!(nft.contains("udp dport 1-65535"));
+        assert!(nft.lines().count() < 30);
+    }
+    #[test]
+    fn guest_mapping_is_applied_after_external_port_reservations() {
+        let mut traffic = EntryTraffic::all();
+        traffic.tcp = EntryTransportSelection::Forward {
+            ports: EntryPortSet::All,
+            mappings: vec![EntryPortMapping {
+                listen: EntryPortRange {
+                    start: 30022,
+                    end: 30022,
+                },
+                target: EntryPortRange { start: 22, end: 22 },
+            }],
+        };
+        let mode = EntryMode::Protocols { traffic };
+        let reserved = EntryReservedPorts {
+            tcp: vec![EntryPortRange { start: 22, end: 22 }],
+            udp: vec![],
+        };
+        let address = "203.0.113.8".parse().unwrap();
+        let selections = selectors(address, &mode, &reserved).unwrap();
+        assert!(selections.contains(&("ip daddr 203.0.113.8 tcp dport 30022".into(), ":22".into())));
+        assert!(delivered(address, &mode, &reserved)
+            .unwrap()
+            .iter()
+            .any(|s| s == "ip daddr 203.0.113.8 tcp dport { 1-30021, 30023-65535 }"));
+    }
 }

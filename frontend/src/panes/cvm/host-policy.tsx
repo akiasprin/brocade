@@ -1,8 +1,8 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import { setCvmHostPolicy, type CvmHost, type CvmWorkspace } from '../../api';
-import { ErrorBox } from '../../ui/bits';
-import { ActionMenu } from '../../ui/choice-menu';
+import { Confirm, ErrorBox } from '../../ui/bits';
+import { Icon } from '../../ui/icons';
 import { NetworkLogsDialog } from './network-logs';
 import { QUERY } from './queries';
 
@@ -37,40 +37,70 @@ function useHostPolicy() {
   });
 }
 
-/** 宿主卡的 ⋯ 菜单：查看宿主网络配置日志、移除宿主身份（保留机器的其他功能）。 */
-export function HostMenu({ host, workspace }: { host: CvmHost; workspace: CvmWorkspace }) {
-  const change = useHostPolicy();
-  const [logs, setLogs] = useState(false);
-  const items = [
-    ...(workspace.can_manage_network
-      ? [{ label: '网络配置日志', note: 'Agent、Xray 与 Phantun 记录', onSelect: () => setLogs(true) }]
-      : []),
-    ...(host.can_manage_host
-      ? [
-          {
-            label: change.isPending ? '移除中…' : '移除宿主',
-            note: '取消容器宿主身份，保留机器的代理、组网及其他功能',
-            danger: true,
-            disabled: change.isPending,
-            onSelect: () => change.mutate({ host, enabled: false }),
-          },
-        ]
-      : []),
-  ];
+export function HostNetworkLogs({ host }: { host: CvmHost }) {
+  const [open, setOpen] = useState(false);
   return (
     <>
-      {items.length > 0 && <ActionMenu label={`${host.name} 更多操作`} items={items} />}
-      {logs && (
+      <button
+        className="btn icon cvm-row-btn"
+        type="button"
+        aria-label={`${host.name} 网络配置日志`}
+        title="宿主网络配置日志"
+        onClick={() => setOpen(true)}
+      >
+        <Icon of="diag" size={15} />
+      </button>
+      {open && (
         <NetworkLogsDialog
           title="宿主网络配置日志"
           machines={[{ node_id: host.node_id, name: host.name, role: '计算' }]}
-          onClose={() => setLogs(false)}
+          onClose={() => setOpen(false)}
         />
       )}
+    </>
+  );
+}
+
+export function RemoveHost({ host, occupied }: { host: CvmHost; occupied: boolean }) {
+  const change = useHostPolicy();
+  const [confirm, setConfirm] = useState(false);
+  const reasonId = useId();
+  if (!host.can_manage_host) return null;
+  const reason = occupied ? '请先清理该宿主上的工作负载并等待资源清理完成。' : null;
+  return (
+    <>
+      <button
+        className="btn sm danger"
+        type="button"
+        aria-describedby={reason ? reasonId : undefined}
+        disabled={occupied || change.isPending}
+        onClick={() => setConfirm(true)}
+      >
+        {change.isPending ? '移除中…' : '移除宿主…'}
+      </button>
+      {reason && (
+        <p className="note" id={reasonId}>
+          {reason}
+        </p>
+      )}
       {change.error && (
-        <div className="cvm-host-foot-error">
+        <div role="alert">
           <ErrorBox error={change.error} />
         </div>
+      )}
+      {confirm && (
+        <Confirm
+          title="移除宿主"
+          body={<>{host.name} 将从宿主清单移除。机器的代理、组网及其他功能会保留。</>}
+          confirmLabel="确认移除"
+          confirmDisabled={occupied || change.isPending}
+          onCancel={() => setConfirm(false)}
+          onConfirm={() => {
+            if (occupied || change.isPending) return;
+            setConfirm(false);
+            change.mutate({ host, enabled: false });
+          }}
+        />
       )}
     </>
   );

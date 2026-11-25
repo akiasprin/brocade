@@ -5,7 +5,8 @@ use crate::cvm::releases::Scope;
 pub struct CvmAdopt {
     pub request_id: String,
     pub tenant_id: String,
-    pub user_id: String,
+    #[serde(default)]
+    pub user_id: Option<String>,
     pub node_id: String,
     pub name: String,
     /// Freeze the inventory selected by the operator; never silently adopt another OS.
@@ -21,7 +22,7 @@ impl PgStore {
         if !actor.is_system_admin() {
             return Err(StoreError::Forbidden("只有系统管理员可以纳管裸机".into()));
         }
-        require_owner(actor, &request.tenant_id, &request.user_id, true)?;
+        require_manager(actor, &request.tenant_id)?;
         request_id(&request.request_id)?;
         request.identity.validate().map_err(invalid)?;
         if request.name.trim().is_empty()
@@ -41,22 +42,15 @@ impl PgStore {
             tx.commit().await?;
             return Ok(instance);
         }
-        let active: bool = sqlx::query_scalar(
-            "SELECT status='active' FROM users WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
-        )
-        .bind(&request.tenant_id)
-        .bind(&request.user_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| StoreError::NotFound("user".into()))?;
-        if !active {
-            return Err(StoreError::Forbidden("用户已停用".into()));
-        }
+        check_assignee(&mut tx, &request.tenant_id, request.user_id.as_deref()).await?;
         let caps = host_locked(&mut tx, &request.node_id, false).await?;
-        let host = caps
-            .baremetal
+        let host_system = caps
+            .host_system
             .as_ref()
-            .ok_or_else(|| StoreError::Unsupported("该机器未启用裸机执行器".into()))?;
+            .ok_or_else(|| StoreError::Unsupported("该机器尚未上报宿主系统管理能力".into()))?;
+        let host = host_system.adoptable().ok_or_else(|| {
+            StoreError::Unsupported("请先升级 Agent 以启用动态宿主系统管理".into())
+        })?;
         let node_tenant: String = sqlx::query_scalar("SELECT tenant_id FROM nodes WHERE id=$1")
             .bind(&request.node_id)
             .fetch_one(&mut *tx)
@@ -69,25 +63,22 @@ impl PgStore {
                 "机器身份已变化，请刷新后重新核对".into(),
             ));
         }
-        // Every allocator uses the same resource lock. Include uncleared old ledgers,
-        // not just active rows, so changing backends never adopts a foreign root disk.
-        let occupied: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_instances i WHERE i.node_id=$1 AND (i.reserved OR EXISTS(SELECT 1 FROM cvm_volumes v WHERE v.instance_id=i.id AND v.state<>'released') OR EXISTS(SELECT 1 FROM cvm_interfaces n WHERE n.instance_id=i.id AND NOT n.detached_confirmed) OR EXISTS(SELECT 1 FROM cvm_entries e WHERE e.instance_id=i.id AND NOT e.cleaned))) OR EXISTS(SELECT 1 FROM cvm_nic_allocations WHERE consumer_node=$1 AND NOT released) OR EXISTS(SELECT 1 FROM cvm_nic_bindings WHERE consumer_node=$1 AND NOT cleaned) OR EXISTS(SELECT 1 FROM cvm_entry_tunnels WHERE target_node=$1 AND NOT cleaned) OR EXISTS(SELECT 1 FROM cvm_user_host_network_quotas WHERE node_id=$1 AND held_states>0)")
+        // Cube workloads may coexist. Only an existing physical-host binding and its unfinished
+        // cleanup fence a second adoption of the same operating system.
+        let occupied: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_instances i WHERE i.node_id=$1 AND i.desired#>>'{spec,execution,kind}'='baremetal' AND (i.reserved OR EXISTS(SELECT 1 FROM cvm_interfaces n WHERE n.instance_id=i.id AND NOT n.detached_confirmed) OR EXISTS(SELECT 1 FROM cvm_entries e WHERE e.instance_id=i.id AND NOT e.cleaned)))")
             .bind(&request.node_id).fetch_one(&mut *tx).await?;
         if occupied {
             return Err(StoreError::Conflict(
-                "该机器已被占用或仍有待清理资源".into(),
+                "该宿主系统已被纳管或仍有待清理资源".into(),
             ));
         }
-        let resources = Resources {
-            vcpus: caps.allocatable_vcpus,
-            memory_bytes: caps.allocatable_memory_bytes,
-            root_disk_bytes: caps.allocatable_disk_bytes,
-        };
+        let resources = host_system
+            .resources
+            .clone()
+            .ok_or_else(|| StoreError::Unsupported("请先升级 Agent 以核验宿主系统容量".into()))?;
         if resources.vcpus == 0 || resources.memory_bytes == 0 || resources.root_disk_bytes == 0 {
             return Err(invalid("裸机容量尚未核验"));
         }
-        let quota = quota_locked(&mut tx, &request.tenant_id, &request.user_id).await?;
-        admission(&mut tx, &quota, &request.node_id, Some(&resources), 1).await?;
         let spec = InstanceSpec {
             execution: ExecutionTarget::BareMetal {
                 identity: request.identity,
@@ -96,7 +87,8 @@ impl PgStore {
             name: request.name.trim().into(),
             image: None,
             resources,
-            ssh_public_key: String::new(),
+            login_revision: 0,
+            legacy_ssh_public_key: None,
             interfaces: vec![InterfaceSpec {
                 id: new_id("nic")?,
                 allocated: None,
@@ -110,7 +102,6 @@ impl PgStore {
         };
         let desired = InstanceDesired {
             artifacts: None,
-            artifact_mode: Default::default(),
             id: new_id("cvm")?,
             operation_id: new_id("op")?,
             generation: 1,

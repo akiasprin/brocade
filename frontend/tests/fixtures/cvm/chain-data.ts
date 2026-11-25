@@ -1,7 +1,9 @@
 import type { CvmChainCatalog, CvmWorkspace } from '../../../src/api';
 export function chainCatalog(workspace: CvmWorkspace, id: string | null): CvmChainCatalog {
   const instance = workspace.instances.find(i => i.desired.id === id);
-  const owner = instance ? { tenant_id: instance.tenant_id, user_id: instance.user_id, name: instance.user_id } : null;
+  const owner = instance?.user_id
+    ? { tenant_id: instance.tenant_id, user_id: instance.user_id, name: instance.user_id }
+    : null;
   return {
     owner,
     supported: !!instance && instance.desired.spec.execution?.kind !== 'baremetal',

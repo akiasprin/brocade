@@ -2,6 +2,7 @@
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ProvisionInstall } from '../../../src/panes/nodes';
+import { HostInstallDialog } from '../../../src/panes/cvm/host-install';
 import { SessionProvider } from '../../../src/session';
 import { theme } from '../../../src/forge/theme';
 import type { ProvisionNodeResult } from '../../../src/api';
@@ -11,6 +12,7 @@ import '../../../src/styles.css';
 
 const parameters = new URLSearchParams(location.search);
 const online = parameters.get('online') === '1';
+const configure = parameters.get('configure') === '1';
 if (theme.snapshot() !== (parameters.get('theme') === 'light' ? 'light' : 'dark')) theme.toggle();
 const now = new Date().toISOString();
 const node = {
@@ -25,6 +27,9 @@ client.setQueryData(['nodes'], { nodes: [node] });
 client.setQueryData(['revisions'], { current_revision: 7, revisions: [] });
 client.setQueryData(['certs'], { domain: null, groups: [], nodes: [], sealing_available: true });
 client.setQueryData(['cvm'], cvmWorkspace('detail'));
+client.setQueryData(['cvm-host-install-command'], {
+  install_command: 'sudo sh brocade-install.sh --server https://console.invalid --reuse-node-token',
+});
 const result: ProvisionNodeResult = {
   revision_id: 7,
   node: {
@@ -70,7 +75,11 @@ createRoot(document.getElementById('root')!).render(
     >
       <div className={`forge${innerWidth < 900 ? ' narrow' : ''}`}>
         <main className="fg-desk" style={{ padding: 12 }}>
-          <ProvisionInstall node={node.node_id} result={result} go={() => {}} />
+          {configure ? (
+            <HostInstallDialog node={node.node_id} name={node.name} onClose={() => {}} />
+          ) : (
+            <ProvisionInstall node={node.node_id} result={result} go={() => {}} />
+          )}
         </main>
       </div>
     </SessionProvider>

@@ -51,7 +51,7 @@ pub(super) async fn operation_replay(
             .fetch_one(&mut **tx)
             .await?;
         let instance = from_row(&instance)?;
-        require_owner(actor, &instance.tenant_id, &instance.user_id, true)?;
+        require_owner(actor, &instance.tenant_id, instance.user(), true)?;
         return Ok(Some(instance));
     }
     Ok(None)
@@ -74,7 +74,7 @@ pub(super) async fn save_version(
     .bind(&desired.spec_sha256)
     .execute(&mut **tx)
     .await?;
-    artifacts::freeze(tx, desired).await?;
+    artifacts::freeze(tx, desired, kind).await?;
     sqlx::query("INSERT INTO cvm_operations(id,instance_id,generation,kind,actor_id,request_id,request_sha256) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(&desired.operation_id).bind(&desired.id).bind(desired.generation as i64).bind(kind).bind(actor.operator_id()).bind(request).bind(digest).execute(&mut **tx).await?;
     sqlx::query("UPDATE cvm_instances SET generation=$2,desired=$3,name=$4,status='pending',updated_at=now() WHERE id=$1").bind(&desired.id).bind(desired.generation as i64).bind(serde_json::to_value(desired)?).bind(&desired.spec.name).execute(&mut **tx).await?;
     Ok(())
@@ -88,6 +88,7 @@ pub(super) async fn save_system_version(
     kind: &str,
     update_current: bool,
 ) -> Result<()> {
+    ensure_access_generation(tx, &desired.id, desired.generation).await?;
     desired.generation = desired
         .generation
         .checked_add(1)
@@ -105,7 +106,7 @@ pub(super) async fn save_system_version(
     .bind(&desired.spec_sha256)
     .execute(&mut **tx)
     .await?;
-    artifacts::freeze(tx, desired).await?;
+    artifacts::freeze(tx, desired, kind).await?;
     sqlx::query("INSERT INTO cvm_operations(id,instance_id,generation,kind,actor_id,request_id,request_sha256) VALUES($1,$2,$3,$4,'system-network',$5,$6)")
         .bind(&desired.operation_id).bind(&desired.id).bind(desired.generation as i64).bind(kind).bind(&request).bind(request_digest(desired)?).execute(&mut **tx).await?;
     if update_current {
@@ -121,14 +122,13 @@ impl PgStore {
         actor: &AdminContext,
         request: CvmCreate,
     ) -> Result<CvmInstance> {
-        require_owner(actor, &request.tenant_id, &request.user_id, true)?;
+        require_manager(actor, &request.tenant_id)?;
         request_id(&request.request_id)?;
         if request.name.trim().is_empty()
             || request.name.chars().count() > 80
             || request.name.chars().any(char::is_control)
-            || !valid_public_key(&request.ssh_public_key)
         {
-            return Err(invalid("实例名称或 SSH 公钥无效"));
+            return Err(invalid("实例名称无效"));
         }
         let digest = request_digest(&request)?;
         let mut tx = self.pool.begin().await?;
@@ -141,48 +141,14 @@ impl PgStore {
             tx.commit().await?;
             return Ok(instance);
         }
-        let active: bool = sqlx::query_scalar(
-            "SELECT status='active' FROM users WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
-        )
-        .bind(&request.tenant_id)
-        .bind(&request.user_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| StoreError::NotFound("user".into()))?;
-        if !active {
-            return Err(StoreError::Forbidden("用户已停用".into()));
-        }
-        let quota = quota_locked(&mut tx, &request.tenant_id, &request.user_id).await?;
+        check_assignee(&mut tx, &request.tenant_id, request.user_id.as_deref()).await?;
+        require_host_manager(&mut tx, actor, &request.node_id).await?;
         let caps = host_locked(&mut tx, &request.node_id, false).await?;
-        network_quota::admission(
-            &mut tx,
-            &request.tenant_id,
-            &request.user_id,
-            &request.node_id,
-            &caps,
-        )
-        .await?;
-        let native_occupied: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_instances i WHERE node_id=$1 AND desired#>>'{spec,execution,kind}'='baremetal' AND (reserved OR EXISTS(SELECT 1 FROM cvm_interfaces n WHERE n.instance_id=i.id AND NOT n.detached_confirmed) OR EXISTS(SELECT 1 FROM cvm_entries e WHERE e.instance_id=i.id AND NOT e.cleaned)))")
-            .bind(&request.node_id).fetch_one(&mut *tx).await?;
-        if native_occupied {
-            return Err(StoreError::Conflict(
-                "该机器已由裸机实例独占或尚未清理".into(),
-            ));
-        }
         if !caps.create || !caps.managed_networks {
             return Err(StoreError::Unsupported("机器尚未支持创建 CVM".into()));
         }
         caps.validate_interfaces(&request.interfaces)
             .map_err(invalid)?;
-        if request
-            .interfaces
-            .iter()
-            .any(|n| n.purpose != InterfacePurpose::Contact)
-        {
-            return Err(invalid(
-                "创建容器保留管理主网卡；业务网卡请从已发布网络能力挂载",
-            ));
-        }
         let image = caps
             .images
             .iter()
@@ -195,14 +161,6 @@ impl PgStore {
             .ok_or_else(|| StoreError::Unsupported("机器尚未开放 CPU、内存独立配置".into()))?
             .validate_resources(&resources)
             .map_err(invalid)?;
-        admission(
-            &mut tx,
-            &quota,
-            &request.node_id,
-            Some(&resources),
-            request.interfaces.len() as u64,
-        )
-        .await?;
         let count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM cvm_instances WHERE node_id=$1 AND reserved")
                 .bind(&request.node_id)
@@ -211,8 +169,7 @@ impl PgStore {
         if count >= MAX_INSTANCES_PER_MACHINE as i64 {
             return Err(invalid("机器实例数量已达上限"));
         }
-        // User quota accounts logical resources. Host inventory is an observed
-        // baseline, not a second admission ceiling: compute and disks may oversell.
+        // Host inventory is an observed baseline, not a logical allocation ceiling.
         let id = new_id("cvm")?;
         let operation_id = new_id("op")?;
         let spec = InstanceSpec {
@@ -221,7 +178,8 @@ impl PgStore {
             name: request.name.trim().into(),
             image: Some(image),
             resources,
-            ssh_public_key: request.ssh_public_key.trim().into(),
+            login_revision: 1,
+            legacy_ssh_public_key: None,
             interfaces: request
                 .interfaces
                 .into_iter()
@@ -236,7 +194,6 @@ impl PgStore {
         };
         let desired = InstanceDesired {
             artifacts: None,
-            artifact_mode: Default::default(),
             detached_interfaces: Vec::new(),
             id: id.clone(),
             operation_id,
@@ -258,6 +215,7 @@ impl PgStore {
         .bind(desired.spec.resources.root_disk_bytes as i64)
         .execute(&mut *tx)
         .await?;
+        credentials::generate(&mut tx, &id).await?;
         for nic in &desired.spec.interfaces {
             insert_interface(&mut tx, &id, nic).await?;
         }
@@ -304,7 +262,13 @@ impl PgStore {
             return Err(invalid("该操作不支持配置编译预览"));
         }
         let before = self.cvm_instance(actor, id).await?;
-        require_owner(actor, &before.tenant_id, &before.user_id, true)?;
+        require_owner(actor, &before.tenant_id, before.user(), true)?;
+        if !matches!(
+            request.change,
+            CvmChange::Start | CvmChange::Stop | CvmChange::Restart
+        ) {
+            require_manager(actor, &before.tenant_id)?;
+        }
 
         request_id(&request.request_id)?;
         let digest = request_digest(&(id, &request))?;
@@ -317,12 +281,14 @@ impl PgStore {
             tx.commit().await?;
             return Ok(CvmMutationResult::existing(instance));
         }
-        sqlx::query("SELECT id FROM users WHERE tenant_id=$1 AND id=$2 FOR UPDATE")
-            .bind(&before.tenant_id)
-            .bind(&before.user_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        let quota = quota_locked(&mut tx, &before.tenant_id, &before.user_id).await?;
+        if matches!(request.change, CvmChange::UndoPending { .. }) {
+            if review.preview || review.expected_input_sha256.is_some() {
+                return Err(invalid("撤回操作使用当前容器版本"));
+            }
+            return self
+                .undo_pending_cvm(tx, actor, id, request, digest, cvm_before)
+                .await;
+        }
         let recovery = matches!(
             request.change,
             CvmChange::Delete { .. } | CvmChange::ReleaseHost | CvmChange::Retry
@@ -333,14 +299,16 @@ impl PgStore {
             .fetch_one(&mut *tx)
             .await?;
         let instance = from_row(&row)?;
+        // Recheck under the mutation lock: a concurrent revocation may have changed ownership.
+        require_owner(actor, &instance.tenant_id, instance.user(), true)?;
         if instance.desired.generation != request.expected_generation {
             return Err(StoreError::Conflict(
                 "CVM 已发生变化，请重新读取后再操作".into(),
             ));
         }
         if matches!(request.change, CvmChange::Retry) {
-            sqlx::query("UPDATE cvm_instances SET status='pending',updated_at=now() WHERE id=$1 AND status IN ('failed','unknown','restart_required')").bind(id).execute(&mut *tx).await?;
-            sqlx::query("UPDATE cvm_operations SET status='pending',updated_at=now() WHERE id=$1 AND status IN ('failed','unknown','restart_required')").bind(&instance.desired.operation_id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE cvm_instances SET status='pending',updated_at=now() WHERE id=$1 AND status IN ('failed','unknown')").bind(id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE cvm_operations SET status='pending',updated_at=now() WHERE id=$1 AND status IN ('failed','unknown')").bind(&instance.desired.operation_id).execute(&mut *tx).await?;
             tx.commit().await?;
             return Ok(CvmMutationResult::existing(
                 self.cvm_instance(actor, id).await?,
@@ -368,6 +336,89 @@ impl PgStore {
         }
         let mut desired = instance.desired.clone();
         let kind = match request.change {
+            CvmChange::Assign { user_id } => {
+                if baremetal {
+                    return Err(StoreError::Unsupported("裸机使用者由纳管关系管理".into()));
+                }
+                if user_id == instance.user_id {
+                    return self.finish_cvm_review(tx, actor, id, review, true).await;
+                }
+                check_assignee(&mut tx, &instance.tenant_id, user_id.as_deref()).await?;
+                if instance.user_id.is_some() && user_id.is_some() {
+                    return Err(StoreError::Conflict(
+                        "请先收回原使用授权并完成关机和网络清理，再授权其他用户".into(),
+                    ));
+                }
+                if user_id.is_some()
+                    && (!desired.spec.routing.routes.is_empty()
+                        || desired
+                            .spec
+                            .interfaces
+                            .iter()
+                            .any(|n| n.allocated.is_some()))
+                {
+                    return Err(StoreError::Conflict(
+                        "请先完成旧网络清理，再授权使用者".into(),
+                    ));
+                }
+                if user_id.is_some() {
+                    let cleanup: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_nic_allocations WHERE instance_id=$1 AND NOT released) OR EXISTS(SELECT 1 FROM cvm_entries WHERE instance_id=$1 AND NOT cleaned)")
+                        .bind(id).fetch_one(&mut *tx).await?;
+                    let revoked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_instance_access_events WHERE instance_id=$1 AND user_id IS NULL)")
+                        .bind(id).fetch_one(&mut *tx).await?;
+                    if cleanup
+                        || (revoked
+                            && (desired.power != PowerState::Stopped
+                                || instance.status != ApplyStatus::Applied
+                                || !instance.report.as_ref().is_some_and(|report| {
+                                    report.power == Some(PowerState::Stopped)
+                                        && report.generation == desired.generation
+                                        && report.spec_sha256 == desired.spec_sha256
+                                })))
+                    {
+                        return Err(StoreError::Conflict(
+                            "请先发布收回授权，并等待关机和网络清理确认".into(),
+                        ));
+                    }
+                }
+                if user_id.is_none() {
+                    desired.power = PowerState::Stopped;
+                    desired.spec.routing = ContainerRoutes::default();
+                    nics::withdraw(&mut tx, id, None).await?;
+                    nics::entries::release_instance(&mut tx, id).await?;
+                    desired
+                        .spec
+                        .interfaces
+                        .retain(|n| n.connection.purpose == InterfacePurpose::Contact);
+                    sqlx::query("UPDATE cvm_interfaces SET desired_attached=false WHERE instance_id=$1 AND purpose='business'").bind(id).execute(&mut *tx).await?;
+                }
+                desired.spec.login_revision = credentials::generate(&mut tx, id).await?;
+                desired.spec.legacy_ssh_public_key = None;
+                sqlx::query("UPDATE cvm_instances SET user_id=$2 WHERE id=$1")
+                    .bind(id)
+                    .bind(&user_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE cvm_volumes SET user_id=$2 WHERE instance_id=$1")
+                    .bind(id)
+                    .bind(&user_id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("INSERT INTO cvm_instance_access_events(instance_id,tenant_id,previous_user_id,user_id,actor_id,generation) VALUES($1,$2,$3,$4,$5,$6)")
+                    .bind(id).bind(&instance.tenant_id).bind(&instance.user_id).bind(&user_id).bind(actor.operator_id()).bind((desired.generation+1) as i64).execute(&mut *tx).await?;
+                "assign"
+            }
+            CvmChange::ResetPassword => {
+                if !caps.stable_storage {
+                    return Err(StoreError::Unsupported(
+                        "当前宿主不支持安全更新登录密码".into(),
+                    ));
+                }
+                desired.spec.login_revision = credentials::generate(&mut tx, id).await?;
+                desired.spec.legacy_ssh_public_key = None;
+                "reset_password"
+            }
+
             CvmChange::Restart => {
                 if !caps.restart || !caps.stable_storage || desired.power != PowerState::Running {
                     return Err(StoreError::Unsupported("该实例当前不能重启".into()));
@@ -375,15 +426,9 @@ impl PgStore {
                 desired.restart_epoch += 1;
                 "restart"
             }
-            CvmChange::Reinstall {
-                image_id,
-                ssh_public_key,
-            } => {
+            CvmChange::Reinstall { image_id } => {
                 if !caps.reinstall || !caps.stable_storage {
                     return Err(StoreError::Unsupported("机器尚未开放重装".into()));
-                }
-                if !valid_public_key(&ssh_public_key) {
-                    return Err(invalid("SSH 公钥无效"));
                 }
                 desired.spec.image = Some(
                     caps.images
@@ -392,7 +437,8 @@ impl PgStore {
                         .ok_or_else(|| invalid("系统镜像不可用"))?
                         .clone(),
                 );
-                desired.spec.ssh_public_key = ssh_public_key.trim().into();
+                desired.spec.login_revision = credentials::generate(&mut tx, id).await?;
+                desired.spec.legacy_ssh_public_key = None;
                 desired.reinstall_epoch += 1;
                 desired.power = PowerState::Running;
                 "reinstall"
@@ -419,15 +465,6 @@ impl PgStore {
                     .validate_resources(&resources)
                     .map_err(invalid)?;
                 let old = &desired.spec.resources;
-                let user_usage = sqlx::query("SELECT coalesce(sum((desired#>>'{spec,resources,vcpus}')::bigint),0)::bigint AS cpu,coalesce(sum((desired#>>'{spec,resources,memory_bytes}')::bigint),0)::bigint AS memory FROM cvm_instances WHERE tenant_id=$1 AND user_id=$2 AND reserved AND id<>$3")
-                    .bind(&instance.tenant_id).bind(&instance.user_id).bind(id).fetch_one(&mut *tx).await?;
-                if user_usage.try_get::<i64, _>("cpu")? as u64 + u64::from(resources.vcpus)
-                    > quota.max_vcpus
-                    || user_usage.try_get::<i64, _>("memory")? as u64 + resources.memory_bytes
-                        > quota.max_memory_bytes
-                {
-                    return Err(invalid("修改后的 CPU 或内存超过可用额度"));
-                }
                 // Only an observed shutdown can release the old compute allocation.
                 if old != &resources
                     && instance.report.as_ref().and_then(|r| r.power) != Some(PowerState::Stopped)
@@ -439,14 +476,6 @@ impl PgStore {
                 "configure"
             }
             CvmChange::Start => {
-                network_quota::admission(
-                    &mut tx,
-                    &before.tenant_id,
-                    &before.user_id,
-                    &before.node_id,
-                    &caps,
-                )
-                .await?;
                 if !caps.start || !caps.stable_storage {
                     return Err(StoreError::Unsupported("该后端尚未通过原盘启动验证".into()));
                 }
@@ -494,44 +523,16 @@ impl PgStore {
                 if instance.status != ApplyStatus::Applied {
                     return Err(invalid("请先完成当前实例操作，再卸载网卡"));
                 }
-                if desired.power == PowerState::Running && !caps.hot_detach {
-                    return Err(StoreError::Unsupported(
-                        "这台机器需要停止实例后卸载网卡".into(),
-                    ));
-                }
-                if !desired.spec.interfaces.iter().any(|x| x.id == interface_id) {
-                    return Err(StoreError::NotFound("网卡挂载".into()));
-                }
-                if desired.spec.routing.references(&interface_id) {
-                    return Err(StoreError::Conflict(
-                        "请先修改引用该网卡的路由和优先级，再卸载网卡".into(),
-                    ));
-                }
-                if desired.spec.interfaces.iter().any(|n| {
-                    n.id == interface_id && n.connection.purpose == InterfacePurpose::Contact
-                }) {
-                    return Err(invalid("管理主网卡不能卸载"));
-                }
-                nics::withdraw(&mut tx, id, Some(&interface_id)).await?;
-                desired.spec.interfaces.retain(|x| x.id != interface_id);
-                caps.validate_interfaces(
-                    &desired
-                        .spec
-                        .interfaces
-                        .iter()
-                        .filter(|x| x.allocated.is_none())
-                        .map(|x| x.connection.clone())
-                        .collect::<Vec<_>>(),
-                )
-                .map_err(invalid)?;
-                sqlx::query("UPDATE cvm_interfaces SET desired_attached=false WHERE id=$1 AND instance_id=$2").bind(interface_id).bind(id).execute(&mut *tx).await?;
+                nics::detach_nic_tx(&mut tx, &mut desired, &caps, &interface_id).await?;
                 "detach"
             }
-            CvmChange::Retry => {
-                unreachable!("retry returned before changing the immutable specification")
+            CvmChange::Retry | CvmChange::UndoPending { .. } => {
+                unreachable!("recovery returned before changing the immutable specification")
             }
         };
-        if !matches!(kind, "delete" | "release_host") && instance.status != ApplyStatus::Applied {
+        if !matches!(kind, "delete" | "release_host" | "assign")
+            && instance.status != ApplyStatus::Applied
+        {
             return Err(invalid("请先核查或重试当前操作"));
         }
         if desired == instance.desired {

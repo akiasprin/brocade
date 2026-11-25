@@ -20,8 +20,15 @@ export function routeForViewer(location: Loc, who: Whoami): Loc {
   if (location.nav === 'password' && isPublic(who)) return fallback;
 
   const page = location.drill?.p;
-  if (location.nav === 'cvm' && page === 'new' && !['user', 'tenant-admin', 'system-admin'].includes(who.role))
-    return { nav: 'cvm' };
+  if (location.nav === 'cvm') {
+    if ((page === 'new' || page === 'hosts') && !['tenant-admin', 'system-admin'].includes(who.role))
+      return { nav: 'cvm' };
+    if (
+      (page === 'adopt' || page === 'networks' || page === 'network' || page === 'network-new') &&
+      !can(who.role, 'system')
+    )
+      return { nav: 'cvm' };
+  }
   if (location.nav === 'nodes') {
     if ((page === 'provision' || page === 'install') && !can(who.role, 'system')) return { nav: 'nodes' };
     if (page === 'chain' && !can(who.role, 'edit')) return { nav: 'nodes' };

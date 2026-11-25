@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn cvm_oversells_host_cpu_memory_disk_but_preserves_user_quota() {
+async fn cvm_logical_allocations_can_exceed_host_baseline_without_user_quotas() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
@@ -18,21 +18,15 @@ async fn cvm_oversells_host_cpu_memory_disk_but_preserves_user_quota() {
             "n1",
             InventoryReport {
                 capabilities: caps,
+                terminal_sessions_used: None,
                 error: None,
             },
         )
         .await
         .unwrap();
-    let mut q = quota();
-    q.max_instances = 4;
-    q.max_vcpus = 6;
-    q.max_memory_bytes = gib;
-    q.max_disk_bytes = 16 * gib;
-    db.store.set_cvm_quota(&system_admin(), q).await.unwrap();
-    let actor = actor_user("alice");
     let first = db
         .store
-        .create_cvm(&actor, create_request("oversell-first-0001"))
+        .create_cvm(&system_admin(), create_request("oversell-first-0001"))
         .await
         .unwrap();
     let mut request = create_request("oversell-second-0001");
@@ -41,7 +35,7 @@ async fn cvm_oversells_host_cpu_memory_disk_but_preserves_user_quota() {
         memory_bytes: 256 * mib,
         root_disk_bytes: 4 * gib,
     };
-    let mut second = db.store.create_cvm(&actor, request).await.unwrap();
+    let mut second = db.store.create_cvm(&system_admin(), request).await.unwrap();
     assert_ne!(first.desired.id, second.desired.id);
     publish_cvm_intent(&db).await;
     db.store
@@ -52,7 +46,7 @@ async fn cvm_oversells_host_cpu_memory_disk_but_preserves_user_quota() {
     second = db
         .store
         .command_cvm(
-            &actor,
+            &system_admin(),
             &second.desired.id,
             CvmCommand {
                 request_id: "oversell-stop-0001".into(),
@@ -83,25 +77,25 @@ async fn cvm_oversells_host_cpu_memory_disk_but_preserves_user_quota() {
     assert!(db
         .store
         .command_cvm(
-            &actor,
+            &system_admin(),
             &second.desired.id,
-            configure("oversell-user-cpu-denied", 6, 256 * mib)
+            configure("unsupported-cpu-denied", 9, 256 * mib)
         )
         .await
         .is_err());
     assert!(db
         .store
         .command_cvm(
-            &actor,
+            &system_admin(),
             &second.desired.id,
-            configure("oversell-user-memory-denied", 2, gib)
+            configure("unsupported-memory-denied", 2, 5 * gib)
         )
         .await
         .is_err());
     let resized = db
         .store
         .command_cvm(
-            &actor,
+            &system_admin(),
             &second.desired.id,
             configure("oversell-configure-0001", 4, 512 * mib),
         )
@@ -111,8 +105,12 @@ async fn cvm_oversells_host_cpu_memory_disk_but_preserves_user_quota() {
     assert_eq!(resized.desired.spec.resources.memory_bytes, 512 * mib);
     supersede_cvm_fixture(&db).await;
     let mut disk_request = create_request("oversell-user-disk-denied");
-    disk_request.resources.root_disk_bytes = 16 * gib;
-    assert!(db.store.create_cvm(&actor, disk_request).await.is_err());
+    disk_request.resources.root_disk_bytes = 33 * gib;
+    assert!(db
+        .store
+        .create_cvm(&system_admin(), disk_request)
+        .await
+        .is_err());
     let usage = db
         .store
         .cvm_workspace(&system_admin())

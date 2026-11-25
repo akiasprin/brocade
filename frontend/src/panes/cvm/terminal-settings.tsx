@@ -31,38 +31,37 @@ export function HostTerminalPolicy({ host }: { host: CvmHost }) {
       void client.invalidateQueries({ queryKey: QUERY });
     },
   });
+  const supported = supportsGuestTerminal(host.capabilities);
+  const status = !supported
+    ? '运行栈待升级'
+    : !host.terminal_enabled
+      ? '已关闭'
+      : !host.can_manage_terminal
+        ? '已开启'
+        : host.terminal_sessions
+          ? `会话 ${host.terminal_sessions.used} / ${host.terminal_sessions.limit}`
+          : '会话数未上报';
   return (
     <div className="cvm-host-terminal">
-      <div className="cvm-card-footer">
-        <span>
-          WebShell
-          <small>
-            {!supportsGuestTerminal(host.capabilities)
-              ? '运行栈待升级'
-              : host.terminal_enabled
-                ? '允许连接实例终端'
-                : '已关闭'}
-          </small>
-        </span>
-        {host.can_manage_terminal ? (
-          <label className="switch" title="关闭后，该宿主上的现有终端会话会结束">
-            <input
-              type="checkbox"
-              role="switch"
-              aria-label={`${host.name} WebShell`}
-              aria-checked={host.terminal_enabled}
-              checked={host.terminal_enabled}
-              disabled={change.isPending}
-              onChange={event => change.mutate(event.target.checked)}
-            />
-            <span className="switch-ui" aria-hidden="true">
-              <span />
-            </span>
-          </label>
-        ) : (
-          <span className="note">{host.terminal_enabled ? '已开启' : '已关闭'}</span>
-        )}
-      </div>
+      {host.can_manage_terminal && (
+        <label className="switch" title="关闭后，该宿主上的现有终端会话会结束">
+          <input
+            type="checkbox"
+            role="switch"
+            aria-label={`${host.name} WebShell`}
+            aria-checked={host.terminal_enabled}
+            checked={host.terminal_enabled}
+            disabled={change.isPending}
+            onChange={event => change.mutate(event.target.checked)}
+          />
+          <span className="switch-ui" aria-hidden="true">
+            <span />
+          </span>
+        </label>
+      )}
+      <small title={host.terminal_sessions ? 'Agent 最近上报的宿主 WebShell 会话占用' : undefined} className="mono">
+        {status}
+      </small>
       {change.error && <ErrorBox error={change.error} />}
       {change.isPending && (
         <p className="note" role="status">

@@ -1,6 +1,6 @@
 use super::*;
 use brocade_deployment::cvm::*;
-use brocade_store::cvm::{CvmCreate, CvmQuota};
+use brocade_store::cvm::CvmCreate;
 async fn agent(
     app: &Router,
     token: &str,
@@ -26,13 +26,19 @@ async fn agent(
 }
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn cvm_artifacts_http_negotiates_manifests_and_keeps_old_agents_on_specs() {
+async fn cvm_artifacts_http_negotiates_manifests_and_requires_password_capability() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
     db.store.migrate().await.unwrap();
     insert_usage_model(db.pool()).await;
     let admin = admin_token(&db).await;
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    sqlx::query("INSERT INTO node_agent_state(node_id,agent_protocol_version) VALUES('n1',77) ON CONFLICT(node_id) DO UPDATE SET agent_protocol_version=77")
+        .execute(db.pool()).await.unwrap();
     let actor = AdminContext::system_admin("artifact-http-test");
     let node = db.store.issue_node_token("n1").await.unwrap().token;
     let app = merged_router(
@@ -48,13 +54,14 @@ async fn cvm_artifacts_http_negotiates_manifests_and_keeps_old_agents_on_specs()
     caps.managed_networks = true;
     let report = InventoryReport {
         capabilities: caps,
+        terminal_sessions_used: None,
         error: None,
     };
     let response = agent(
         &app,
         &node,
         "/agent/v1/cvm/inventory",
-        75,
+        brocade_deployment::protocol::AGENT_PROTOCOL_VERSION,
         Some(serde_json::to_value(report).unwrap()),
     )
     .await;
@@ -67,38 +74,11 @@ async fn cvm_artifacts_http_negotiates_manifests_and_keeps_old_agents_on_specs()
         &app,
         &node,
         "/agent/v1/cvm/image-manifests",
-        74,
-        Some(serde_json::to_value(&input.image_manifest).unwrap()),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let response = agent(
-        &app,
-        &node,
-        "/agent/v1/cvm/image-manifests",
-        75,
+        brocade_deployment::protocol::AGENT_PROTOCOL_VERSION,
         Some(serde_json::to_value(&input.image_manifest).unwrap()),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    db.store
-        .set_cvm_quota(
-            &actor,
-            CvmQuota {
-                tenant_id: "platform.acme".into(),
-                user_id: "alice".into(),
-                enabled: true,
-                allowed_nodes: vec!["n1".into()],
-                max_instances: 1,
-                max_vcpus: 1,
-                max_memory_bytes: 134217728,
-                max_disk_bytes: 3 * 1024 * 1024 * 1024,
-                max_interfaces: 1,
-                host_network_quotas: vec![],
-            },
-        )
-        .await
-        .unwrap();
     let item = db
         .store
         .create_cvm(
@@ -106,12 +86,11 @@ async fn cvm_artifacts_http_negotiates_manifests_and_keeps_old_agents_on_specs()
             CvmCreate {
                 request_id: "artifact-http-create-00001".into(),
                 tenant_id: "platform.acme".into(),
-                user_id: "alice".into(),
+                user_id: Some("alice".into()),
                 node_id: "n1".into(),
                 name: "artifact-http".into(),
                 image_id: "debian".into(),
                 resources: input.spec.resources,
-                ssh_public_key: input.spec.ssh_public_key,
                 interfaces: input
                     .spec
                     .interfaces
@@ -131,17 +110,19 @@ async fn cvm_artifacts_http_negotiates_manifests_and_keeps_old_agents_on_specs()
         StatusCode::UNAUTHORIZED
     );
     publish_cvm_intent(&db).await;
-    let response = agent(&app, &node, "/agent/v1/cvm/desired?offset=0", 74, None).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let old = response_json(response).await;
-    assert!(old.get("page_offset").is_none());
-    assert_eq!(old["instances"][0]["id"], item.desired.id);
-    assert!(old["instances"][0].get("artifacts").is_none());
-    let response = agent(&app, &node, "/agent/v1/cvm/desired?offset=0", 75, None).await;
+    let response = agent(
+        &app,
+        &node,
+        "/agent/v1/cvm/desired",
+        brocade_deployment::protocol::AGENT_PROTOCOL_VERSION,
+        None,
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["cache-control"], "no-store");
     let current = response_json(response).await;
     assert_eq!(current["page_offset"], 0);
+    assert!(current["instances"][0].get("artifact_mode").is_none());
     assert_eq!(
         current["instances"][0]["artifacts"]["files"]
             .as_array()

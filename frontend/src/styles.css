@@ -96,6 +96,17 @@
   --primary-active: var(--action-active);
   --primary-on: var(--action-on);
   --primary-line: transparent;
+  /* 顶栏当前导航胶囊：相对主按钮的实心强锚点，导航选中态使用轻盈洗色与细边，
+     贴合 Safari 26 等通透浏览器顶栏；亮色块有同名声明，供局部换肤子树重新求值。 */
+  --nav-active-bg: color-mix(in srgb, var(--action) 15%, transparent);
+  --nav-active-hover: color-mix(in srgb, var(--action) 22%, transparent);
+  --nav-active-ink: var(--action-hover);
+  --nav-active-line: color-mix(in srgb, var(--action) 24%, transparent);
+  --nav-sub-bg: color-mix(in srgb, var(--action) 20%, transparent);
+  --nav-sub-idle: var(--ink-2);
+  --nav-sub-hover: color-mix(in srgb, var(--action) 12%, transparent);
+  --nav-sub-divider: color-mix(in srgb, var(--action) 24%, transparent);
+  --nav-sub-shadow: none;
   --glass: color-mix(in srgb, var(--surface) 84%, transparent);
   --glass-strong: color-mix(in srgb, var(--surface) 94%, transparent);
   /* 浮层材质：菜单、弹出层、浮动窗口与对话框共用。底色 64% 不透明，背后的内容模糊 20px、
@@ -2692,6 +2703,15 @@
   --primary-active: var(--action-active);
   --primary-on: var(--action-on);
   --primary-line: transparent;
+  --nav-active-bg: color-mix(in srgb, var(--action) 10%, transparent);
+  --nav-active-hover: color-mix(in srgb, var(--action) 15%, transparent);
+  --nav-active-ink: var(--action-hover);
+  --nav-active-line: color-mix(in srgb, var(--action) 16%, transparent);
+  --nav-sub-bg: var(--sheet);
+  --nav-sub-idle: var(--ink-2);
+  --nav-sub-hover: color-mix(in srgb, var(--action) 10%, transparent);
+  --nav-sub-divider: color-mix(in srgb, var(--action) 20%, transparent);
+  --nav-sub-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
   --glass: rgba(255, 255, 255, 0.88);
   --glass-strong: rgba(255, 255, 255, 0.96);
   --float: color-mix(in srgb, var(--surface) 64%, transparent);
@@ -2722,40 +2742,40 @@
 }
 
 /* ── 黛蓝 · 默认回退 ──
-   柔和蓝建立交互秩序，同色系的浅蓝承载连续数据。真实选择由 data-palette 覆盖；
+   晴瓷蓝建立交互秩序，同色系的清蓝承载连续数据。真实选择由 data-palette 覆盖；
    这里与默认色板保持一致，避免首屏执行 JavaScript 前短暂闪回旧配色。 */
 :root,
 [data-theme='dark'] {
-  --action: #91b8f2;
-  --action-hover: #b0cdf8;
-  --action-active: #79a4e5;
-  --action-wash: rgba(145, 184, 242, 0.15);
-  --action-on: #101319;
-  --data: #81a9d2;
-  --data-secondary: #758196;
-  --data-wash: rgba(129, 169, 210, 0.13);
-  --primary: #315f9f;
-  --primary-hover: #396db6;
-  --primary-active: #29528b;
+  --action: #72b6ff;
+  --action-hover: #96caff;
+  --action-active: #57a1f2;
+  --action-wash: rgba(114, 182, 255, 0.15);
+  --action-on: #111215;
+  --data: #69abe6;
+  --data-secondary: #8f89b5;
+  --data-wash: rgba(105, 171, 230, 0.13);
+  --primary: #1f69c7;
+  --primary-hover: #2874d4;
+  --primary-active: #1959ad;
   --primary-on: #ffffff;
   --primary-line: transparent;
-  --data-accent: #7698d6;
-  --data-quiet: #8d9196;
-  --data-muted: #676b71;
+  --data-accent: #67a5e8;
+  --data-quiet: #9ca2ad;
+  --data-muted: #767d8a;
 }
 :root[data-theme='light'],
 [data-theme='light'] {
-  --action: #2563b9;
-  --action-hover: #1d56a3;
-  --action-active: #174989;
-  --action-wash: rgba(37, 99, 185, 0.09);
+  --action: #0062d1;
+  --action-hover: #0052b3;
+  --action-active: #004396;
+  --action-wash: rgba(0, 98, 209, 0.09);
   --action-on: #ffffff;
-  --data: #316ca5;
-  --data-secondary: #6a5f90;
-  --data-wash: rgba(49, 108, 165, 0.09);
-  --data-accent: #3c61a7;
-  --data-quiet: #4f5968;
-  --data-muted: #576373;
+  --data: #1f6fb8;
+  --data-secondary: #75639c;
+  --data-wash: rgba(31, 111, 184, 0.09);
+  --data-accent: #2466b8;
+  --data-quiet: #5b6069;
+  --data-muted: #646973;
 }
 
 /* ── 五套配色（`forge/palette.ts` 写入 data-palette） ──
@@ -2765,51 +2785,58 @@
    亮色标题底色保持原值。标题使用独立语义令牌，避免跟随正文改色。
    每个暗色色板声明的令牌都必须在对应亮色色板重新声明，避免亮色继承暗色值。 */
 
-/* 堇紫：紫灰底调与柔和紫色操作，图表沿用既有分类盘。 */
+/* 堇紫（晴瓷紫）：纯白 / 低彩紫炭顶栏衔接 Safari 工具栏，鸢尾雪灰台面配清透晴紫操作。 */
 :root[data-palette='jinzi'] {
-  --action: #c1a7ee;
-  --action-hover: #d8c2fa;
-  --action-active: #a88ad9;
-  --action-wash: rgba(193, 167, 238, 0.15);
-  --action-on: #17151d;
+  --action: #c1a2f7;
+  --action-hover: #d7c0fc;
+  --action-active: #a884ea;
+  --action-wash: rgba(193, 162, 247, 0.15);
+  --action-on: #121115;
   --data: #9e98f1;
   --data-secondary: #827c93;
   --data-wash: rgba(158, 152, 241, 0.13);
-  --ground: #17151d;
-  --sheet: #201d27;
-  --surface: #1d1b24;
-  --block: #2c2834;
-  --band: #24202c;
-  --sunk: #1a1721;
-  --line: #242328;
+  --ground: #121115;
+  --sheet: #1f1e24;
+  --surface: #1c1b1f;
+  --block: #27262e;
+  --band: #212027;
+  --sunk: #16151a;
+  --line: #2d2b35;
   /* 暗色网格线取 OKLCH 明度 27.8%、彩度 0.02，色相随调色盘；明度随台面上移约 1.5 L*。 */
   --grid-line: #292631;
-  --line-soft: rgba(226, 228, 231, 0.035);
+  --line-soft: rgba(240, 236, 248, 0.05);
+  --hover: rgba(255, 255, 255, 0.055);
+  --hover-2: rgba(255, 255, 255, 0.1);
+  --btn: var(--band);
+  --btn-h: #292731;
+  --btn-a: #312f3b;
+  --sheet-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 4px 14px rgba(0, 0, 0, 0.24);
   --hue-1: #a09baf;
   --hue-2: #8e8bc1;
   --hue-3: #ba92b8;
   --hue-4: #768ba4;
-  --primary: #6f5197;
-  --primary-hover: #8060ab;
-  --primary-active: #614585;
+  --primary: #6d47b8;
+  --primary-hover: #7d55ca;
+  --primary-active: #5d3ba3;
   --primary-on: #ffffff;
   --primary-line: transparent;
-  --ink: #f1edf7;
-  --ink-2: #d2cbdc;
-  --ink-3: #b4a9c3;
-  --ink-4: #a397b2;
-  --panel-title-ink: #e2e4e7;
-  --panel-heading-bg: var(--band);
-  --panel-heading-ink: #8d9196;
+  --ink: #f4f2f7;
+  --ink-2: #ccc8d4;
+  --ink-3: #a29cad;
+  --ink-4: #958fa1;
+  --panel-title-ink: #f4f2f7;
+  /* 标题栏比卡面压深一档，与 dailan 同力度（正文与标题栏差约 4.9 L*）；沿用 --band 时只差约 3。 */
+  --panel-heading-bg: #1d1c23;
+  --panel-heading-ink: #a29cad;
   --data-accent: #9167da;
-  --data-quiet: #8d9196;
-  --data-muted: #676b71;
+  --data-quiet: #a29cad;
+  --data-muted: #7a7585;
 }
 :root[data-theme='light'][data-palette='jinzi'] {
-  --action: #7251ad;
-  --action-hover: #634398;
-  --action-active: #553783;
-  --action-wash: rgba(114, 81, 173, 0.09);
+  --action: #6d46c4;
+  --action-hover: #5b36b0;
+  --action-active: #4b2999;
+  --action-wash: rgba(109, 70, 196, 0.09);
   --action-on: #ffffff;
   --data: #645bae;
   --data-secondary: #66546f;
@@ -2824,15 +2851,21 @@
   --observe-8: #836b39;
   --observe-9: #955c61;
   --observe-10: #737079;
-  --ground: #eeedf3;
+  --ground: #f6f5f8;
   --sheet: #ffffff;
-  --surface: #f5f3f8;
-  --block: #faf9fc;
-  --band: #f4f2f7;
-  --sunk: #f0edf5;
-  --line: #e9e8ed;
-  --grid-line: #dedce4;
-  --line-soft: rgba(45, 35, 70, 0.04);
+  --surface: #ffffff;
+  --block: #fbfbfd;
+  --band: #f7f6fa;
+  --sunk: #f3f1f7;
+  --line: #eae8f0;
+  --grid-line: #e5e3ee;
+  --line-soft: rgba(28, 22, 42, 0.055);
+  --hover: rgba(28, 22, 42, 0.045);
+  --hover-2: rgba(28, 22, 42, 0.08);
+  --btn: var(--sheet);
+  --btn-h: #f7f6fa;
+  --btn-a: #eeecf4;
+  --sheet-shadow: 0 1px 2px rgba(0, 0, 0, 0.035), 0 4px 14px rgba(0, 0, 0, 0.045);
   --hue-1: #645e6b;
   --hue-2: #66547e;
   --hue-3: #844f75;
@@ -2843,71 +2876,79 @@
   --primary-active: var(--action-active);
   --primary-on: var(--action-on);
   --primary-line: transparent;
-  --ink: #292332;
-  --ink-2: #494052;
-  --ink-3: #685d74;
-  --ink-4: #71657d;
-  --panel-title-ink: #1c1e21;
+  --ink: #1e1c22;
+  --ink-2: #403b49;
+  --ink-3: #5e586b;
+  --ink-4: #676174;
+  --panel-title-ink: #1e1c22;
+  /* 标题栏压深一档，与 dailan 同力度（正文与标题栏差约 3.8 L*），保留本色板色相。 */
   --panel-heading-bg: #f1f0f4;
-  --panel-heading-ink: #5c6165;
+  --panel-heading-ink: #5e586b;
   --data-accent: #6a53b8;
-  --data-quiet: #5c6165;
-  --data-muted: #7e8286;
+  --data-quiet: #5e586b;
+  --data-muted: #676174;
 }
 
-/* 黛蓝：浅灰蓝台面与白色纸面，蓝色实底建立操作层次。 */
+/* 黛蓝（晴瓷蓝）：纯白 / 中性炭灰顶栏无缝衔接 Safari 工具栏，纯净雪灰台面配清透晴蓝操作。 */
 :root[data-palette='dailan'] {
-  --action: #91b8f2;
-  --action-hover: #b0cdf8;
-  --action-active: #79a4e5;
-  --action-wash: rgba(145, 184, 242, 0.15);
-  --action-on: #101319;
-  --data: #81a9d2;
-  --data-secondary: #758196;
-  --data-wash: rgba(129, 169, 210, 0.13);
-  --ground: #101319;
-  --sheet: #191d25;
-  --surface: #171b22;
-  --block: #222731;
-  --band: #1b2029;
-  --sunk: #141820;
-  --line: #212428;
-  --grid-line: #232833;
-  --line-soft: rgba(226, 228, 231, 0.035);
-  --hue-1: #8fa8c0;
-  --hue-2: #8894c0;
-  --hue-3: #7fa8b0;
-  --hue-4: #9890b0;
+  --action: #72b6ff;
+  --action-hover: #96caff;
+  --action-active: #57a1f2;
+  --action-wash: rgba(114, 182, 255, 0.15);
+  --action-on: #111215;
+  --data: #69abe6;
+  --data-secondary: #8f89b5;
+  --data-wash: rgba(105, 171, 230, 0.13);
+  --ground: #111215;
+  --sheet: #1e2024;
+  --surface: #1b1c1f;
+  --block: #26282e;
+  --band: #202227;
+  --sunk: #15161a;
+  --line: #2b2d34;
+  --grid-line: #252831;
+  --line-soft: rgba(235, 238, 245, 0.05);
+  --hover: rgba(255, 255, 255, 0.055);
+  --hover-2: rgba(255, 255, 255, 0.1);
+  --btn: var(--band);
+  --btn-h: #282b32;
+  --btn-a: #30343c;
+  --sheet-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 4px 14px rgba(0, 0, 0, 0.24);
+  --hue-1: #8fa4be;
+  --hue-2: #8a95bf;
+  --hue-3: #7ea8b2;
+  --hue-4: #9690b2;
   --code-n: #c99fc8;
-  --primary: #315f9f;
-  --primary-hover: #396db6;
-  --primary-active: #29528b;
+  --primary: #1f69c7;
+  --primary-hover: #2874d4;
+  --primary-active: #1959ad;
   --primary-on: #ffffff;
   --primary-line: transparent;
-  --ink: #edf0f5;
-  --ink-2: #c9d0db;
-  --ink-3: #a4afbf;
-  --ink-4: #939fb0;
-  --panel-title-ink: #e2e4e7;
-  --panel-heading-bg: var(--band);
-  --panel-heading-ink: #8d9196;
-  --data-accent: #7698d6;
-  --data-quiet: #8d9196;
-  --data-muted: #676b71;
+  --ink: #f3f4f6;
+  --ink-2: #c8cbd2;
+  --ink-3: #9ca2ad;
+  --ink-4: #8f96a3;
+  --panel-title-ink: #f3f4f6;
+  /* 标题栏比卡面压深一档（L* 11.2 对 16.1）：沿用 --band 时只差 2.9，标题栏与正文分不出层次。 */
+  --panel-heading-bg: #1c1e22;
+  --panel-heading-ink: #9ca2ad;
+  --data-accent: #67a5e8;
+  --data-quiet: #9ca2ad;
+  --data-muted: #767d8a;
 }
 :root[data-theme='light'][data-palette='dailan'] {
   /* 小字在标题带、名册与卡片上均需可读，不能把说明文字当作装饰灰。 */
-  --ink-3: #566475;
-  --ink-4: #616e7f;
-  --action: #2563b9;
-  --action-hover: #1d56a3;
-  --action-active: #174989;
-  --action-wash: rgba(37, 99, 185, 0.09);
+  --ink-3: #5b6069;
+  --ink-4: #646973;
+  --action: #0062d1;
+  --action-hover: #0052b3;
+  --action-active: #004396;
+  --action-wash: rgba(0, 98, 209, 0.09);
   --action-on: #ffffff;
-  --data: #316ca5;
-  --data-secondary: #6a5f90;
-  --data-wash: rgba(49, 108, 165, 0.09);
-  --observe-1: #316ca5;
+  --data: #1f6fb8;
+  --data-secondary: #75639c;
+  --data-wash: rgba(31, 111, 184, 0.09);
+  --observe-1: #1f6fb8;
   --observe-2: #995577;
   --observe-3: #017e84;
   --observe-4: #7362a3;
@@ -2917,19 +2958,25 @@
   --observe-8: #836b39;
   --observe-9: #955c61;
   --observe-10: #6d727b;
-  --ground: #edf0f5;
+  --ground: #f5f5f7;
   --sheet: #ffffff;
-  --surface: #f6f7f9;
-  --block: #f8f9fb;
-  --band: #f5f6f8;
-  --sunk: #f1f3f7;
-  --line: #dfe3eb;
-  --grid-line: #d9dde6;
-  --line-soft: rgba(20, 35, 70, 0.07);
-  --hue-1: #55697e;
-  --hue-2: #5a6188;
-  --hue-3: #4d757c;
-  --hue-4: #6c5f85;
+  --surface: #ffffff;
+  --block: #fbfbfc;
+  --band: #f6f7f9;
+  --sunk: #f2f3f6;
+  --line: #e9eaee;
+  --grid-line: #e5e7ec;
+  --line-soft: rgba(15, 23, 42, 0.055);
+  --hover: rgba(15, 23, 42, 0.045);
+  --hover-2: rgba(15, 23, 42, 0.08);
+  --btn: var(--sheet);
+  --btn-h: #f5f6f8;
+  --btn-a: #eceef2;
+  --sheet-shadow: 0 1px 2px rgba(0, 0, 0, 0.035), 0 4px 14px rgba(0, 0, 0, 0.045);
+  --hue-1: #54687d;
+  --hue-2: #5a6288;
+  --hue-3: #4b747d;
+  --hue-4: #6a5f85;
   --code-n: #7c4690;
   /* 亮色主按钮仍为操作色实底，取值与基础亮色块相同 */
   --primary: var(--action);
@@ -2937,61 +2984,70 @@
   --primary-active: var(--action-active);
   --primary-on: var(--action-on);
   --primary-line: transparent;
-  --ink: #1d2633;
-  --ink-2: #394656;
-  --panel-title-ink: #1c1e21;
-  --panel-heading-bg: #eef0f5;
-  --panel-heading-ink: #4f5968;
-  --data-accent: #3c61a7;
-  --data-quiet: #4f5968;
-  --data-muted: #576373;
+  --ink: #1d1d1f;
+  --ink-2: #3d3f45;
+  --panel-title-ink: #1d1d1f;
+  /* 标题栏压深一档（L* 94.8，配置面板正文 98.6、纸面 97.6）：与 --band 同值时三层挤在 1.5 以内，
+     标题栏和正文看不出层次。容器清单、宿主表的表头共用此值，一起加深。 */
+  --panel-heading-bg: #eff0f4;
+  --panel-heading-ink: #5b6069;
+  --data-accent: #2466b8;
+  --data-quiet: #5b6069;
+  --data-muted: #646973;
 }
 
-/* 松绿：保留松针黄绿取向，灰绿底调与状态绿保持区分。 */
+/* 松绿（晴瓷松绿）：纯白 / 松炭顶栏衔接 Safari 工具栏，保留松针黄绿取向与状态绿保持区分。 */
 :root[data-palette='songlv'] {
-  --action: #b5ce98;
-  --action-hover: #cde0b7;
-  --action-active: #9dbb7b;
-  --action-wash: rgba(181, 206, 152, 0.15);
-  --action-on: #131710;
+  --action: #aad082;
+  --action-hover: #c3e2a1;
+  --action-active: #91bb66;
+  --action-wash: rgba(170, 208, 130, 0.15);
+  --action-on: #111310;
   --data: #9dad6c;
   --data-secondary: #79856f;
   --data-wash: rgba(157, 173, 108, 0.13);
-  --ground: #131710;
-  --sheet: #1c2218;
-  --surface: #191f16;
-  --block: #252d20;
-  --band: #1e251a;
-  --sunk: #171c13;
-  --line: #22241f;
+  --ground: #111310;
+  --sheet: #1e211d;
+  --surface: #1b1d1a;
+  --block: #262a24;
+  --band: #20231f;
+  --sunk: #151714;
+  --line: #2b3029;
   --grid-line: #252a20;
-  --line-soft: rgba(226, 228, 231, 0.035);
+  --line-soft: rgba(238, 244, 236, 0.05);
+  --hover: rgba(255, 255, 255, 0.055);
+  --hover-2: rgba(255, 255, 255, 0.1);
+  --btn: var(--band);
+  --btn-h: #282c26;
+  --btn-a: #30352d;
+  --sheet-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 4px 14px rgba(0, 0, 0, 0.24);
   --hue-1: #98a894;
   --hue-2: #8898a8;
   --hue-3: #9c94a8;
   --hue-4: #94a49c;
   --code-n: #d0a0b8;
-  --primary: #496434;
-  --primary-hover: #55763d;
-  --primary-active: #3e552c;
+  --primary: #456b2a;
+  --primary-hover: #517c32;
+  --primary-active: #395a22;
   --primary-on: #ffffff;
   --primary-line: transparent;
-  --ink: #eff3ec;
-  --ink-2: #cdd7c5;
-  --ink-3: #adbda2;
-  --ink-4: #9bad8f;
-  --panel-title-ink: #e2e4e7;
-  --panel-heading-bg: var(--band);
-  --panel-heading-ink: #8d9196;
+  --ink: #f2f4f0;
+  --ink-2: #c9d0c5;
+  --ink-3: #9da698;
+  --ink-4: #90998b;
+  --panel-title-ink: #f2f4f0;
+  /* 标题栏比卡面压深一档，与 dailan 同力度（正文与标题栏差约 4.9 L*）；沿用 --band 时只差约 3。 */
+  --panel-heading-bg: #1d1f1c;
+  --panel-heading-ink: #9da698;
   --data-accent: #658f3e;
-  --data-quiet: #8d9196;
-  --data-muted: #676b71;
+  --data-quiet: #9da698;
+  --data-muted: #768071;
 }
 :root[data-theme='light'][data-palette='songlv'] {
-  --action: #4b712e;
-  --action-hover: #3f6224;
-  --action-active: #34531c;
-  --action-wash: rgba(75, 113, 46, 0.09);
+  --action: #467028;
+  --action-hover: #3a5f20;
+  --action-active: #2f4f19;
+  --action-wash: rgba(70, 112, 40, 0.09);
   --action-on: #ffffff;
   --data: #627031;
   --data-secondary: #6f5f7e;
@@ -3006,15 +3062,21 @@
   --observe-8: #8c598f;
   --observe-9: #836b39;
   --observe-10: #6f736b;
-  --ground: #edf0ea;
+  --ground: #f5f7f4;
   --sheet: #ffffff;
-  --surface: #f5f8f3;
-  --block: #fafbf9;
-  --band: #f1f5ed;
-  --sunk: #f0f3ed;
-  --line: #e8eae4;
-  --grid-line: #dcded6;
-  --line-soft: rgba(35, 45, 25, 0.04);
+  --surface: #ffffff;
+  --block: #fbfcfa;
+  --band: #f6f8f4;
+  --sunk: #f2f4ef;
+  --line: #e8ece5;
+  --grid-line: #e3e7df;
+  --line-soft: rgba(24, 34, 20, 0.055);
+  --hover: rgba(24, 34, 20, 0.045);
+  --hover-2: rgba(24, 34, 20, 0.08);
+  --btn: var(--sheet);
+  --btn-h: #f5f7f4;
+  --btn-a: #ebf0e8;
+  --sheet-shadow: 0 1px 2px rgba(0, 0, 0, 0.035), 0 4px 14px rgba(0, 0, 0, 0.045);
   --hue-1: #68765c;
   --hue-2: #5c6a78;
   --hue-3: #6f6280;
@@ -3026,63 +3088,71 @@
   --primary-active: var(--action-active);
   --primary-on: var(--action-on);
   --primary-line: transparent;
-  --ink: #252d22;
-  --ink-2: #434f3d;
-  --ink-3: #5b6a53;
-  --ink-4: #63705b;
-  --panel-title-ink: #1c1e21;
-  --panel-heading-bg: #f0f1ed;
-  --panel-heading-ink: #5c6165;
+  --ink: #1c201b;
+  --ink-2: #3b4239;
+  --ink-3: #576154;
+  --ink-4: #606a5d;
+  --panel-title-ink: #1c201b;
+  /* 标题栏压深一档，与 dailan 同力度（正文与标题栏差约 3.8 L*），保留本色板色相。 */
+  --panel-heading-bg: #eff1ed;
+  --panel-heading-ink: #576154;
   --data-accent: #4d7a38;
-  --data-quiet: #5c6165;
-  --data-muted: #7e8286;
+  --data-quiet: #576154;
+  --data-muted: #606a5d;
 }
 
-/* 藕粉：淡粉灰底调与蔷薇操作，代码数字继续与关键字区分。 */
+/* 藕粉（晴瓷蔷薇）：纯白 / 暗炭顶栏衔接 Safari 工具栏，浅樱雪灰台面配通透蔷薇操作。 */
 :root[data-palette='oufen'] {
-  --action: #e0a7c4;
-  --action-hover: #efc2d9;
-  --action-active: #ca8dad;
-  --action-wash: rgba(224, 167, 196, 0.15);
-  --action-on: #1a1317;
+  --action: #ea9bc5;
+  --action-hover: #f5b9d9;
+  --action-active: #d981b0;
+  --action-wash: rgba(234, 155, 197, 0.15);
+  --action-on: #131113;
   --data: #c98fba;
   --data-secondary: #917884;
   --data-wash: rgba(201, 143, 186, 0.13);
-  --ground: #1a1317;
-  --sheet: #241c21;
-  --surface: #21191e;
-  --block: #2e242a;
-  --band: #261e23;
-  --sunk: #1e161b;
-  --line: #272224;
+  --ground: #131113;
+  --sheet: #211e20;
+  --surface: #1e1b1d;
+  --block: #2b252a;
+  --band: #242023;
+  --sunk: #171416;
+  --line: #312a2f;
   --grid-line: #30242a;
-  --line-soft: rgba(226, 228, 231, 0.035);
+  --line-soft: rgba(246, 238, 242, 0.05);
+  --hover: rgba(255, 255, 255, 0.055);
+  --hover-2: rgba(255, 255, 255, 0.1);
+  --btn: var(--band);
+  --btn-h: #2d272c;
+  --btn-a: #362e34;
+  --sheet-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 4px 14px rgba(0, 0, 0, 0.24);
   --hue-1: #a8a0ac;
   --hue-2: #8894a8;
   --hue-3: #b08c9c;
   --hue-4: #8ca0a0;
   --code-n: #a8b8d8;
-  --primary: #8a4e6b;
-  --primary-hover: #9d5a7b;
-  --primary-active: #77425c;
+  --primary: #993e6c;
+  --primary-hover: #ad497b;
+  --primary-active: #84335c;
   --primary-on: #ffffff;
   --primary-line: transparent;
-  --ink: #f7edf2;
-  --ink-2: #dfcbd5;
-  --ink-3: #c3aab7;
-  --ink-4: #b59ba8;
-  --panel-title-ink: #e2e4e7;
-  --panel-heading-bg: var(--band);
-  --panel-heading-ink: #8d9196;
+  --ink: #f6f2f4;
+  --ink-2: #d4c9cf;
+  --ink-3: #aa9ca4;
+  --ink-4: #9d8f97;
+  --panel-title-ink: #f6f2f4;
+  /* 标题栏比卡面压深一档，与 dailan 同力度（正文与标题栏差约 4.9 L*）；沿用 --band 时只差约 3。 */
+  --panel-heading-bg: #1f1c1e;
+  --panel-heading-ink: #aa9ca4;
   --data-accent: #b5628f;
-  --data-quiet: #8d9196;
-  --data-muted: #676b71;
+  --data-quiet: #aa9ca4;
+  --data-muted: #82757d;
 }
 :root[data-theme='light'][data-palette='oufen'] {
-  --action: #a04a75;
-  --action-hover: #8d3e66;
-  --action-active: #783455;
-  --action-wash: rgba(160, 74, 117, 0.09);
+  --action: #a93f7a;
+  --action-hover: #923267;
+  --action-active: #7c2756;
+  --action-wash: rgba(169, 63, 122, 0.09);
   --action-on: #ffffff;
   --data: #89547c;
   --data-secondary: #4f7a80;
@@ -3097,15 +3167,21 @@
   --observe-8: #836b39;
   --observe-9: #955c61;
   --observe-10: #796e73;
-  --ground: #f3ecef;
+  --ground: #f8f5f6;
   --sheet: #ffffff;
-  --surface: #fbf5f7;
-  --block: #fcfafb;
-  --band: #f7f0f3;
-  --sunk: #f5edf1;
-  --line: #ece8eb;
-  --grid-line: #e2dce0;
-  --line-soft: rgba(55, 30, 45, 0.04);
+  --surface: #ffffff;
+  --block: #fdfbfc;
+  --band: #f9f6f7;
+  --sunk: #f5f0f2;
+  --line: #eee8eb;
+  --grid-line: #e9e1e5;
+  --line-soft: rgba(42, 22, 34, 0.055);
+  --hover: rgba(42, 22, 34, 0.045);
+  --hover-2: rgba(42, 22, 34, 0.08);
+  --btn: var(--sheet);
+  --btn-h: #f9f6f7;
+  --btn-a: #f2ebee;
+  --sheet-shadow: 0 1px 2px rgba(0, 0, 0, 0.035), 0 4px 14px rgba(0, 0, 0, 0.045);
   --hue-1: #6f6670;
   --hue-2: #5c6478;
   --hue-3: #845f6c;
@@ -3117,64 +3193,71 @@
   --primary-active: var(--action-active);
   --primary-on: var(--action-on);
   --primary-line: transparent;
-  --ink: #32252d;
-  --ink-2: #57424f;
-  --ink-3: #745d6a;
-  --ink-4: #765f6d;
-  --panel-title-ink: #1c1e21;
-  --panel-heading-bg: #f2eff1;
-  --panel-heading-ink: #5c6165;
+  --ink: #221c1f;
+  --ink-2: #463b41;
+  --ink-3: #64585f;
+  --ink-4: #6d6068;
+  --panel-title-ink: #221c1f;
+  /* 标题栏压深一档，与 dailan 同力度（正文与标题栏差约 3.8 L*），保留本色板色相。 */
+  --panel-heading-bg: #f3f0f1;
+  --panel-heading-ink: #64585f;
   --data-accent: #a04a72;
-  --data-quiet: #5c6165;
-  --data-muted: #7e8286;
+  --data-quiet: #64585f;
+  --data-muted: #6d6068;
 }
 
-/* 玄墨：银灰底调与中性操作，图表继续使用钢青分类盘。 */
+/* 玄墨（晴瓷素墨）：纯白 / 纯炭顶栏衔接 Safari 工具栏，素灰雪面配利落墨岩与钢青数据。 */
 :root[data-palette='xuanmo'] {
-  --action: #c1c8d2;
-  --action-hover: #d9dee6;
-  --action-active: #a8b1bd;
-  --action-wash: rgba(193, 200, 210, 0.15);
-  --action-on: #191a1d;
+  --action: #c8d0da;
+  --action-hover: #e2e7ee;
+  --action-active: #aeb8c4;
+  --action-wash: rgba(200, 208, 218, 0.15);
+  --action-on: #111213;
   --data: #8babb4;
   --data-secondary: #80807d;
   --data-wash: rgba(139, 171, 180, 0.13);
-  --ground: #191a1d;
-  --sheet: #222327;
-  --surface: #202125;
-  --block: #2c2d32;
-  --band: #24252a;
-  --sunk: #1c1d21;
-  --line: #1e2527;
+  --ground: #111213;
+  --sheet: #1f2023;
+  --surface: #1b1c1e;
+  --block: #27282c;
+  --band: #212226;
+  --sunk: #151618;
+  --line: #2e3035;
   /* 玄墨网格线同取钢青，彩度约 0.008，与中性阶同一浓度。 */
   --grid-line: #24292b;
-  --line-soft: rgba(205, 205, 202, 0.035);
-  --ink: #f0f1f5;
-  --ink-2: #d0d2da;
-  --ink-3: #b0b3c0;
-  --ink-4: #9ca2b1;
+  --line-soft: rgba(235, 238, 245, 0.05);
+  --hover: rgba(255, 255, 255, 0.055);
+  --hover-2: rgba(255, 255, 255, 0.1);
+  --btn: var(--band);
+  --btn-h: #292b30;
+  --btn-a: #31343a;
+  --sheet-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 4px 14px rgba(0, 0, 0, 0.24);
+  --ink: #f3f4f6;
+  --ink-2: #cbced4;
+  --ink-3: #9ea2ab;
+  --ink-4: #90959f;
   --hue-1: #969e9b;
   --hue-2: #899f99;
   --hue-3: #9b8fa0;
   --hue-4: #8c9693;
-  --primary: #4d596a;
-  --primary-hover: #5b687a;
-  --primary-active: #414c5b;
+  --primary: #445160;
+  --primary-hover: #526071;
+  --primary-active: #384350;
   --primary-on: #ffffff;
   --primary-line: transparent;
-  --panel-title-ink: #cdcdca;
-  /* 保留既有灰色标题字，底色略低于 band，维持至少 4.5:1 的文字对比度。 */
-  --panel-heading-bg: #1b1c20;
-  --panel-heading-ink: #858583;
+  --panel-title-ink: #f3f4f6;
+  /* 标题栏比卡面压深一档，与 dailan 同力度（正文与标题栏差约 4.9 L*）；沿用 --band 时只差约 3。 */
+  --panel-heading-bg: #1d1e22;
+  --panel-heading-ink: #9ea2ab;
   --data-accent: #d1d1cd;
-  --data-quiet: #858583;
-  --data-muted: #646462;
+  --data-quiet: #9ea2ab;
+  --data-muted: #767a83;
 }
 :root[data-theme='light'][data-palette='xuanmo'] {
-  --action: #52606e;
-  --action-hover: #43515e;
-  --action-active: #35424e;
-  --action-wash: rgba(82, 96, 110, 0.09);
+  --action: #3d4956;
+  --action-hover: #2c3641;
+  --action-active: #1f2730;
+  --action-wash: rgba(61, 73, 86, 0.09);
   --action-on: #ffffff;
   --data: #506f77;
   --data-secondary: #725b74;
@@ -3189,19 +3272,25 @@
   --observe-8: #7b6d51;
   --observe-9: #876466;
   --observe-10: #6d7276;
-  --ground: #e9eaec;
+  --ground: #f5f5f6;
   --sheet: #ffffff;
-  --surface: #f1f2f4;
-  --block: #fafafb;
-  --band: #f2f3f5;
-  --sunk: #eeeff2;
-  --line: #e8e8e6;
-  --grid-line: #dbdcda;
-  --line-soft: rgba(20, 20, 25, 0.04);
-  --ink: #202329;
-  --ink-2: #424751;
-  --ink-3: #606775;
-  --ink-4: #616a78;
+  --surface: #ffffff;
+  --block: #fbfbfc;
+  --band: #f6f6f7;
+  --sunk: #f1f2f3;
+  --line: #e8e9eb;
+  --grid-line: #e3e4e7;
+  --line-soft: rgba(20, 22, 28, 0.055);
+  --hover: rgba(20, 22, 28, 0.045);
+  --hover-2: rgba(20, 22, 28, 0.08);
+  --btn: var(--sheet);
+  --btn-h: #f4f5f6;
+  --btn-a: #ebecef;
+  --sheet-shadow: 0 1px 2px rgba(0, 0, 0, 0.035), 0 4px 14px rgba(0, 0, 0, 0.045);
+  --ink: #18191b;
+  --ink-2: #3b3e44;
+  --ink-3: #5b5f68;
+  --ink-4: #656a73;
   --hue-1: #626967;
   --hue-2: #5a726c;
   --hue-3: #706274;
@@ -3212,12 +3301,13 @@
   --primary-active: var(--action-active);
   --primary-on: var(--action-on);
   --primary-line: transparent;
-  --panel-title-ink: #1c1e21;
-  --panel-heading-bg: #f0f0ef;
-  --panel-heading-ink: #5c6165;
+  --panel-title-ink: #18191b;
+  /* 标题栏压深一档，与 dailan 同力度（正文与标题栏差约 3.8 L*），保留本色板色相。 */
+  --panel-heading-bg: #f0f0f1;
+  --panel-heading-ink: #5b5f68;
   --data-accent: #17191d;
-  --data-quiet: #5c6165;
-  --data-muted: #7e8286;
+  --data-quiet: #5b5f68;
+  --data-muted: #656a73;
 }
 
 /* 玄墨的操作色与正文同族，链接额外依靠下划线辨认。 */
@@ -3250,7 +3340,7 @@
   --observe-10: #817e88;
 }
 :root[data-palette='dailan']:not([data-theme='light']) {
-  --observe-1: #81a9d2;
+  --observe-1: #69abe6;
   --observe-2: #db91b4;
   --observe-3: #4fbec4;
   --observe-4: #af9ee4;
@@ -8215,7 +8305,7 @@ textarea.f::placeholder {
   padding: 0;
   background: var(--nd-paper-surface);
   border-color: color-mix(in srgb, var(--line) 50%, transparent);
-  border-radius: 12px;
+  border-radius: 20px;
 }
 .nd-sheet > .nd-paper > .nd-page-head {
   box-sizing: border-box;
@@ -8250,6 +8340,10 @@ textarea.f::placeholder {
   font-size: 15px;
   font-weight: 700;
   line-height: 1;
+  /* 行高 1 配合截断的 overflow:hidden 会裁掉 p、g、y 的下伸部（英文容器名、机器名）。
+     下方补出下伸部的高度再用负外边距收回，版面高度不变。 */
+  padding-bottom: 0.22em;
+  margin-bottom: -0.22em;
 }
 .nd-status-slot {
   display: inline-grid;
@@ -9592,6 +9686,18 @@ textarea.f::placeholder {
   line-height: 14px;
   letter-spacing: 0.11em;
   color: var(--panel-heading-ink);
+}
+/* 只给辅助技术读的文字（表头「操作」、排序播报）。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 /* Icon 的 span 若保留普通行内盒，SVG 会按文字基线预留 descender：即便外层方钮使用
    place-items:center，图形仍会向上偏 1.5–2px。共享原语在这里消除行盒，并让所有调用方
@@ -15121,7 +15227,7 @@ body.has-artpanel .topo-deck {
   height: 28px;
   padding: 0 12px;
   border: 0;
-  border-radius: var(--r-ctl);
+  border-radius: 8px;
   background: none;
   cursor: pointer;
   color: var(--ink-2);
@@ -15131,17 +15237,19 @@ body.has-artpanel .topo-deck {
   gap: 7px;
   white-space: nowrap;
 }
-.fg-nv:hover {
-  color: var(--ink);
-  background: var(--hover);
+@media (hover: hover) {
+  .fg-nv:not([aria-current='true']):hover {
+    color: var(--ink);
+    background: color-mix(in srgb, var(--ink) 5%, transparent);
+  }
 }
-/* 选中项与主按钮共用 --primary 一组：默认为操作色实底；暗色调色盘取洗色，此时 inset 细边
-   给出选中项的轮廓。选中项上的提示点随文字色，与底色保持对比。 */
+/* 选中项采用清透洗色胶囊与细边，不再和主操作按钮共用重实底，避免紧贴 Safari 液态工具栏显得沉重。
+   选中项上的提示点随文字色，与底色保持对比。 */
 .fg-nv[aria-current='true'] {
-  background: var(--primary);
-  color: var(--primary-on);
-  box-shadow: inset 0 0 0 1px var(--primary-line);
-  font-weight: 500;
+  background: var(--nav-active-bg);
+  color: var(--nav-active-ink);
+  box-shadow: inset 0 0 0 1px var(--nav-active-line);
+  font-weight: 600;
 }
 .fg-nv-context {
   position: relative;
@@ -15158,7 +15266,7 @@ body.has-artpanel .topo-deck {
 }
 @media (hover: hover) {
   .fg-nv.is-back:hover {
-    background: var(--primary-hover);
+    background: var(--nav-active-hover);
   }
 }
 .fg-nv .mark {
@@ -15169,11 +15277,10 @@ body.has-artpanel .topo-deck {
   flex: 0 0 auto;
 }
 .fg-nv[aria-current='true'] .mark {
-  background: var(--primary-on);
+  background: var(--nav-active-ink);
 }
 /* 容器版「编排」：线路与容器合成一个入口。不在组内时与其它入口一样只是一枚按钮；
-   进入后整组取选中实底，组名之后接「线路 容器」子页切换，当前子页再叠一层浅底。
-   子页颜色都由 --primary-on 混出，亮暗调色盘下与选中实底保持同一组对比。 */
+   进入后整组取当前导航洗色胶囊，组名之后接「线路 容器」子页切换，当前子页浮起成浅白/清蓝子胶囊。 */
 .fg-nv-group {
   display: inline-flex;
   flex: 0 0 auto;
@@ -15182,9 +15289,9 @@ body.has-artpanel .topo-deck {
 .fg-nv-group.is-open {
   height: 28px;
   padding-right: 3px;
-  border-radius: var(--r-ctl);
-  background: var(--primary);
-  box-shadow: inset 0 0 0 1px var(--primary-line);
+  border-radius: 8px;
+  background: var(--nav-active-bg);
+  box-shadow: inset 0 0 0 1px var(--nav-active-line);
 }
 .fg-nv-group.is-open > .fg-nv {
   padding-right: 9px;
@@ -15196,30 +15303,31 @@ body.has-artpanel .topo-deck {
   align-items: center;
   gap: 2px;
   padding-left: 4px;
-  border-left: 1px solid color-mix(in srgb, var(--primary-on) 28%, transparent);
+  border-left: 1px solid var(--nav-sub-divider);
 }
 .fg-nv-sub > button {
   height: 22px;
   padding: 0 8px;
   border: 0;
-  border-radius: 4px;
+  border-radius: 5px;
   background: none;
-  color: color-mix(in srgb, var(--primary-on) 74%, transparent);
+  color: var(--nav-sub-idle);
   font: inherit;
   font-size: 12.5px;
   white-space: nowrap;
   cursor: pointer;
 }
 .fg-nv-sub > button[aria-current='true'] {
-  background: color-mix(in srgb, var(--primary-on) 22%, transparent);
-  color: var(--primary-on);
+  background: var(--nav-sub-bg);
+  color: var(--nav-active-ink);
+  box-shadow: var(--nav-sub-shadow);
   font-weight: 600;
 }
 @media (hover: hover) {
   .fg-nv-group.is-open > .fg-nv:hover,
   .fg-nv-sub > button:not([aria-current='true']):hover {
-    background: color-mix(in srgb, var(--primary-on) 12%, transparent);
-    color: var(--primary-on);
+    background: var(--nav-sub-hover);
+    color: var(--nav-active-ink);
   }
 }
 
@@ -16340,6 +16448,10 @@ body.has-artpanel .topo-deck {
     background: color-mix(in srgb, var(--gold) 8%, var(--float-sheet));
   }
 }
+/* 页面经 DraftSlot 投放的待发布条：插槽不产生盒子，条本身直接作为台面的弹性子项。 */
+.fg-draft-slot {
+  display: contents;
+}
 .fg-draft-head {
   display: flex;
   align-items: center;
@@ -16451,7 +16563,7 @@ body.has-artpanel .topo-deck {
   padding: 18px 20px 22px;
   background: var(--sheet);
   border: 1px solid var(--line);
-  /* 普通页面沿用紧凑圆角；机器详情页的连续页头由 .nd-paper 覆盖为 12px。 */
+  /* 普通页面沿用紧凑圆角；机器详情页的连续页头由 .nd-paper 覆盖为 20px。 */
   border-radius: 9px;
   box-shadow: var(--sheet-shadow);
 }
@@ -17013,7 +17125,7 @@ body.fg-dragging * {
 
      使用 column-reverse：DOM 顺序为 标题 → 错误 → 清单，固定在底部时清单会超出屏幕。
      反转后标题贴屏幕底部，展开的清单向上延伸。 */
-  .forge.narrow .fg-draft {
+  .forge.narrow .fg-draft:not(.cvm-pending-changes, .cvm-resource-draft) {
     position: fixed;
     left: 0;
     right: 0;
@@ -17030,10 +17142,10 @@ body.fg-dragging * {
   }
   /* 台面滚动到底部时最后一行不应被草稿条遮挡。使用 `:has()` 而非无条件留白：
      草稿条只在存在未提交改动时渲染，否则该留白没有作用。 */
-  .forge.narrow:has(.fg-draft) .fg-desk {
+  .forge.narrow:has(.fg-draft:not(.cvm-pending-changes, .cvm-resource-draft)) .fg-desk {
     padding-bottom: calc(52px + var(--safe-bottom));
   }
-  .forge.narrow:has(.fg-draft) .fg-topo {
+  .forge.narrow:has(.fg-draft:not(.cvm-pending-changes, .cvm-resource-draft)) .fg-topo {
     margin-bottom: 52px;
   }
   .fg-draft-list {
@@ -18267,6 +18379,47 @@ body.fg-dragging * {
   border: 1px solid var(--line-soft);
   border-radius: var(--r-ctl);
   background: var(--sunk);
+}
+.pv-install-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+}
+.pv-install-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.pv-page .fgrid .v .pv-install-options select.f {
+  min-width: 0;
+  width: auto;
+}
+.pv-install-options label:has(select) {
+  white-space: nowrap;
+}
+.pv-host-config-options,
+.pv-host-config-options label {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+.pv-host-config-options {
+  margin-block: 12px;
+}
+.pv-host-config-options select {
+  width: 100%;
+  min-width: 0;
+}
+@media (max-width: 520px) {
+  .pv-install .fgrid .row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+  }
+  .pv-install-options label:has(select) {
+    flex-basis: 100%;
+  }
 }
 .pv-cmd-bar {
   display: flex;
@@ -24804,6 +24957,17 @@ body.observe-brushing .observe-chart-tip {
   color: var(--ink-2);
   font: 500 10.5px var(--mono);
   letter-spacing: -0.02em;
+}
+/* 图例收进标题栏最右：与 .load-network-cap > .load-network-legend 同一处理，去掉页脚边线与内边距。 */
+.history-chart-cap > .history-chart-legend {
+  flex-wrap: nowrap;
+  margin-left: auto;
+  padding: 0;
+  border-top: 0;
+  gap: 5px 12px;
+}
+.history-chart-cap > strong + .history-chart-legend {
+  margin-left: 12px;
 }
 .history-chart {
   width: 100%;
@@ -37453,12 +37617,32 @@ button.site-usage-row:focus-visible {
   white-space: nowrap;
 }
 
+/* 点阵固定 30px 列宽和 24px 方格，读数格（.reading）固定 104px 列宽，都不随纸面拉伸；放不下时整表
+ * 横向滚动，用户列吸附在左侧。变量挂在板上，表格与其下的读数行、图例、折叠行共用同一宽度。
+ * --flt-columns / --flt-gaps / --flt-user-w / --flt-sum-w 由组件按机器数、地区组数与排版写入。 */
 .flt-board {
+  --flt-user-w: 148px;
+  --flt-sum-w: 92px;
+  --flt-gap: 8px;
+  --flt-head-h: 136px;
+  --flt-col: 30px;
+  --flt-row: var(--flt-col);
+  --flt-cell: calc(var(--flt-col) - 6px);
+  --flt-table-w: calc(
+    var(--flt-user-w) + var(--flt-sum-w) + var(--flt-columns) * var(--flt-col) + var(--flt-gaps) * var(--flt-gap)
+  );
   display: flex;
   min-width: 0;
   flex-direction: column;
   gap: 12px;
   padding: 14px 20px 16px 18px;
+}
+/* 表格不铺满纸面时，读数行和图例跟着表格宽度收住，不被推到最右侧；太窄时仍留出一行读数的宽度。 */
+.flt-under {
+  display: flex;
+  max-width: max(var(--flt-table-w), 560px);
+  flex-direction: column;
+  gap: 12px;
 }
 /* 单元格里的读屏文字（.flt-sr）是绝对定位的。滚动容器自身不定位时，它们的包含块落在纸面上，
  * 不受横向滚动裁切：机器多到矩阵需要横向滚动时，最右几列的读屏文字会把整页撑宽。 */
@@ -37469,20 +37653,9 @@ button.site-usage-row:focus-visible {
   overscroll-behavior-inline: contain;
   scrollbar-width: thin;
 }
-/* 固定 30px 列宽和 24px 方格，窗口变化时保持 6px 格间距与斜排列名的阅读节奏；
- * 空间不足时整表横向滚动，用户列吸附在左侧。
- * --flt-columns / --flt-gaps 由组件按机器数与地区组数写入。 */
+/* 窗口变化时保持 6px 格间距与斜排列名的阅读节奏。 */
 .flt-grid {
-  --flt-user-w: 148px;
-  --flt-sum-w: 92px;
-  --flt-gap: 8px;
-  --flt-head-h: 136px;
-  --flt-col: 30px;
-  --flt-row: var(--flt-col);
-  --flt-cell: calc(var(--flt-col) - 6px);
-  width: calc(
-    var(--flt-user-w) + var(--flt-sum-w) + var(--flt-columns) * var(--flt-col) + var(--flt-gaps) * var(--flt-gap)
-  );
+  width: var(--flt-table-w);
   table-layout: fixed;
   border-collapse: separate;
   border-spacing: 0;
@@ -37587,8 +37760,7 @@ button.site-usage-row:focus-visible {
   }
 }
 .flt-mlabel:focus-visible,
-.flt-ubtn:focus-visible,
-.flt-flow:focus-visible {
+.flt-ubtn:focus-visible {
   outline: 2px solid var(--action);
   outline-offset: 1px;
 }
@@ -37746,17 +37918,18 @@ button.site-usage-row:focus-visible {
   font-weight: 500;
 }
 
-/* 机器不多：列宽放得下读数，色块缩成行内标记，列名横排。 */
-.flt-board.wide .flt-grid {
-  --flt-col: 168px;
-  --flt-row: 32px;
-  --flt-cell: 10px;
-  --flt-head-h: 30px;
+/* 读数格：整张表放得下时使用，列宽 104px、格高 34px。整格按档位染色（与点阵同一色相，调浅到能放下
+ * 文字），格内写读数；空闲只留最浅的一档、不写字；给不出读数的格子描边写短标签；未授权与授权未知
+ * 留白。列名横排，最多两行。 */
+.flt-board.reading {
+  --flt-col: 104px;
+  --flt-row: 40px;
+  --flt-head-h: 40px;
 }
-.flt-board.wide .flt-grid thead th:not(.flt-corner) {
-  padding-bottom: 7px;
+.flt-board.reading .flt-grid thead th:not(.flt-corner) {
+  padding: 0 8px 7px 3px;
 }
-.flt-board.wide .flt-mflag {
+.flt-board.reading .flt-mflag {
   position: static;
   display: inline-block;
   width: 12px;
@@ -37764,30 +37937,123 @@ button.site-usage-row:focus-visible {
   margin-right: 6px;
   vertical-align: -2px;
 }
-.flt-board.wide .flt-mlabel {
+.flt-board.reading .flt-mlabel {
   position: static;
   display: inline-flex;
   max-width: calc(100% - 20px);
   vertical-align: bottom;
+  line-height: 15px;
+  text-align: left;
+  white-space: normal;
   transform: none;
 }
-.flt-board.wide .flt-cbox {
+.flt-board.reading .flt-mlabel > span {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.flt-board.reading .flt-cbox {
   justify-content: flex-start;
-  gap: 7px;
-  padding-left: 2px;
+  padding: 0 3px;
 }
-.flt-board.wide .flt-cell {
-  border-radius: 3px;
+.flt-board.reading .flt-c.g .flt-cbox {
+  padding-left: 3px;
 }
-.flt-cv {
-  min-width: 0;
-  overflow: hidden;
+.flt-board.reading .flt-cell {
+  display: flex;
+  width: 100%;
+  height: calc(var(--flt-row) - 6px);
+  box-sizing: border-box;
+  align-items: center;
+  gap: 4px;
+  padding: 0 9px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--observe-1) var(--flt-tint, 0%), transparent);
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.flt-board.reading .flt-cell b,
+.flt-total b {
+  color: var(--ink);
+  font: 600 13.5px/1 var(--sans);
+  letter-spacing: -0.01em;
+}
+.flt-board.reading .flt-cell small,
+.flt-total small {
+  color: var(--ink-3);
+  font-size: 11px;
+}
+.flt-board.reading .flt-cell:is(.l3, .l4) small {
   color: var(--ink-2);
+}
+.flt-board.reading .flt-cell.idle,
+.flt-key.reading i.idle {
+  --flt-tint: 5%;
+}
+.flt-board.reading .flt-cell.l1,
+.flt-key.reading i.l1 {
+  --flt-tint: 13%;
+}
+.flt-board.reading .flt-cell.l2,
+.flt-key.reading i.l2 {
+  --flt-tint: 22%;
+}
+.flt-board.reading .flt-cell.l3,
+.flt-key.reading i.l3 {
+  --flt-tint: 34%;
+}
+.flt-board.reading .flt-cell.l4,
+.flt-key.reading i.l4 {
+  --flt-tint: 50%;
+}
+.flt-board.reading .flt-cell.unknown {
+  --flt-cell-ring: inset 0 0 0 1px color-mix(in srgb, var(--ink-4) 40%, transparent);
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.flt-key.reading i:is(.idle, .l1, .l2, .l3, .l4) {
+  width: 14px;
+  height: 10px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--observe-1) var(--flt-tint), transparent);
+}
+/* 读数格的合计行只写数，不染色：合计与单格不是同一量级，染色会把它读成又一行格子。 */
+.flt-total {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 0 9px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.flt-total.zero {
+  color: var(--ink-4);
+}
+/* 手机：行头收窄、合计写在名字下面，不画合计列（组件按 680px 容器断点写入 .compact）。行高放到
+ * 34px 容下名字与合计两行；色块仍是 24px。 */
+.flt-board.compact:not(.reading) {
+  --flt-row: 34px;
+}
+.flt-board.compact .flt-ubtn {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-content: center;
+  gap: 0 8px;
+}
+.flt-board.compact .flt-ubtn .user-avatar {
+  grid-row: span 2;
+}
+.flt-utotal {
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 10.5px;
+  line-height: 13px;
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.flt-cell:is(.idle, .unknown) + .flt-cv {
+.flt-utotal.zero {
   color: var(--ink-4);
 }
 
@@ -37850,101 +38116,6 @@ button.site-usage-row:focus-visible {
   background: var(--gold);
 }
 
-/* 窄屏：按用户的流向列表。只列近 30 秒有流量的用户，空闲的用户与读数不完整的机器各收成一段。 */
-.flt-list {
-  display: none;
-}
-.flt-flows {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-.flt-flows > li + li {
-  border-top: 1px solid var(--line-soft);
-}
-.flt-flow {
-  display: grid;
-  box-sizing: border-box;
-  width: 100%;
-  min-height: 56px;
-  grid-template-areas:
-    'avatar who total'
-    'avatar nodes nodes';
-  grid-template-columns: 28px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 2px 12px;
-  padding: 9px 16px;
-  border: 0;
-  background: none;
-  color: inherit;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-.flt-flow.static {
-  cursor: default;
-}
-.flt-flow > .user-avatar {
-  grid-area: avatar;
-}
-.flt-flow-who {
-  display: flex;
-  min-width: 0;
-  grid-area: who;
-  align-items: baseline;
-  gap: 8px;
-}
-.flt-flow-who b {
-  overflow: hidden;
-  color: var(--ink);
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.flt-flow-who small {
-  color: var(--ink-4);
-  font-size: 11px;
-}
-.flt-flow-total {
-  grid-area: total;
-  color: var(--ink);
-  font-weight: 500;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-.flt-flow-total.zero {
-  color: var(--ink-4);
-  font-weight: 400;
-}
-.flt-flow-nodes {
-  min-width: 0;
-  grid-area: nodes;
-  overflow: hidden;
-  color: var(--ink-3);
-  font-size: 11.5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.flt-list-empty {
-  margin: 0;
-  padding: 18px 16px;
-  color: var(--ink-3);
-}
-.flt-list-rest {
-  margin: 0;
-  padding: 10px 16px;
-  border-top: 1px solid var(--line-soft);
-  color: var(--ink-3);
-  font-size: 12px;
-  line-height: 1.6;
-  overflow-wrap: anywhere;
-}
-.flt-list-rest b {
-  margin-right: 8px;
-  color: var(--ink-2);
-  font-weight: 600;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .flt-cell {
     transition: none;
@@ -37952,7 +38123,7 @@ button.site-usage-row:focus-visible {
 }
 
 /* 宽屏保留左侧读数栏；机器多时在矩阵内部横向滚动，只有内容区域较窄时才移到上方。
- * 读数栏内部沿用用量卡在 900px / 620px 下的排布。 */
+ * 读数栏内部沿用用量卡在 900px / 620px 下的排布。手机宽度同样是矩阵，只收窄四周留白。 */
 @container (max-width: 900px) {
   .flt-cockpit {
     grid-template-columns: minmax(0, 1fr);
@@ -37960,13 +38131,7 @@ button.site-usage-row:focus-visible {
 }
 @container (max-width: 680px) {
   .flt-board {
-    display: none;
-  }
-  .flt-board.pending {
-    display: flex;
-  }
-  .flt-list {
-    display: block;
+    padding: 12px 12px 14px;
   }
 }
 

@@ -1,75 +1,108 @@
-import { waitForVisualAssets } from '../helpers/visual-ready';
 import { expect, test, type Page } from '@playwright/test';
-async function open(page: Page, width: number, theme: string, scene = 'chain-board') {
+import type { CvmRouteMatchRequest, CvmRouteMatchResult } from '../../../src/api';
+import { waitForVisualAssets } from '../helpers/visual-ready';
+
+async function open(page: Page, width: number, theme: string, available = true) {
   await page.clock.setFixedTime(new Date('2026-11-04T10:30:00Z'));
-  // Keep the complete proposal inside the viewport: Chromium's oversized element capture
-  // temporarily resizes to 1px, crossing the real phone breakpoint and remounting the board.
-  await page.setViewportSize({ width, height: scene === 'chain-board' && width > 820 ? 2000 : 1050 });
-  await page.goto(`/tests/fixtures/cvm/preview.html?scene=${scene}&theme=${theme}`);
-  await expect(page.locator('.cvm-page')).toBeVisible({ timeout: 15_000 });
+  await page.setViewportSize({ width, height: 1050 });
+  await page.goto(
+    `/tests/fixtures/cvm/preview.html?scene=chain-detail&theme=${theme}&chain=${available ? 'ready' : 'unavailable'}`,
+  );
+  await expect(page.locator('.cvm-page')).toBeVisible();
   await waitForVisualAssets(page);
 }
+
+const routeEditor = (page: Page) => page.getByRole('region', { name: '路由与命中测试' });
+
 for (const theme of ['light', 'dark']) {
-  test(`chain board B, owner proposal and unauthorized drag ${theme}`, async ({ page }) => {
-    await open(page, 1440, theme);
-    await page.locator('[data-pill="cvm-alice"]').click();
-    await expect(page.locator('[data-exit="chain:chain-us"]')).toHaveAttribute('title', 'alice 已获授权');
-    await expect(page.locator('[data-exit="chain:chain-us"]')).toContainText('洛杉矶');
-    await expect(page.locator('.cz-layout')).toHaveScreenshot(`chain-board-${theme}.png`);
-    await page.getByRole('button', { name: '＋ 出口' }).click();
-    await page.locator('[data-exit="chain:chain-us"]').click();
-    const proposal = page.getByRole('region', { name: '待确认的组合变更' });
-    await expect(proposal).toContainText('alice');
-    await expect(proposal).toContainText('不占业务网卡槽位');
-    await expect(proposal).toContainText('不回落到宿主 NAT');
-    await expect(page.locator('.cz-layout')).toHaveScreenshot(`chain-proposal-${theme}.png`);
-    await proposal.getByRole('button', { name: '预览产物差异', exact: true }).click();
-    await expect(proposal.locator('.cvm-artifact-content').first()).toBeVisible();
-    expect(
-      await proposal.evaluate(
-        n => n.getBoundingClientRect().right <= n.parentElement!.getBoundingClientRect().right + 1,
-      ),
-    ).toBe(true);
-    expect(await proposal.evaluate(n => n.scrollWidth <= n.clientWidth + 1)).toBe(true);
-    const notice = page.locator('.cvm-release-notice');
-    expect(await notice.locator('span').evaluate(n => n.getBoundingClientRect().width)).toBeGreaterThan(200);
-    await expect(page.locator('.cz-layout')).toHaveScreenshot(`chain-compiled-proposal-${theme}.png`);
-    await proposal.getByRole('button', { name: '取消' }).click();
-    const bob = page.locator('[data-pill="cvm-board-1"]');
-    await bob.click();
-    await expect(page.locator('[data-exit="chain:chain-jp"]')).toHaveAttribute('title', 'bob 未获授权');
-    const from = await bob.locator('[data-anchor="out:cvm-board-1"]').boundingBox();
-    const to = await page.locator('[data-exit="chain:chain-jp"]').boundingBox();
-    if (!from || !to) throw new Error('drag anchors missing');
-    await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
-    await page.mouse.down();
-    await page.mouse.move(to.x + to.width / 2, to.y + to.height / 2, { steps: 12 });
-    await expect(page.locator('[data-exit="chain:chain-jp"]')).toContainText('bob 未获授权');
-    await expect(page.locator('.cz-layout')).toHaveScreenshot(`chain-unauthorized-${theme}.png`);
-    await page.mouse.up();
-    expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
+  test(`inline routes explain host restrictions and enforce line authorization ${theme}`, async ({ page }) => {
+    await open(page, 390, theme, false);
+    await page.getByRole('tab', { name: '网络', exact: true }).click();
+    const editor = routeEditor(page);
+    await expect(editor.getByText('此宿主尚不支持线路出口，请管理员检查并更新宿主组件。')).toBeVisible();
+    await expect(editor.getByRole('option', { name: /洛杉矶.*宿主未就绪/ }).first()).toHaveJSProperty('disabled', true);
+    await expect(editor.getByRole('option', { name: /香港/ }).first()).toHaveJSProperty('disabled', false);
+
+    await open(page, 390, theme);
+    await page.evaluate(() => {
+      const prior = globalThis.fetch;
+      globalThis.fetch = async (input, init) => {
+        const response = await prior(input, init);
+        if (!String(input).startsWith('/cvm/chain-egress?')) return response;
+        const catalog = await response.json();
+        return Response.json({
+          ...catalog,
+          chains: catalog.chains.map((chain: { id: string }) => ({
+            ...chain,
+            authorized: chain.id !== 'chain-jp',
+          })),
+        });
+      };
+    });
+    await page.getByRole('tab', { name: '网络', exact: true }).click();
+    await expect(editor.getByRole('option', { name: /东京 IIJ.*未获授权/ }).first()).toHaveJSProperty('disabled', true);
+    await expect(editor.getByRole('option', { name: '洛杉矶 · 三跳线路' }).first()).toHaveJSProperty('disabled', false);
+    await expect(editor.getByText(/alice.*授权、额度与限速，仅支持 TCP／UDP/)).toBeVisible();
   });
+
   for (const width of [1440, 390, 320])
-    test(`chain detail and grouped routes ${width} ${theme}`, async ({ page }) => {
-      await open(page, width, theme, 'chain-detail');
+    test(`inline routes and authoritative match ${width} ${theme}`, async ({ page }) => {
+      await open(page, width, theme);
       await page.getByRole('tab', { name: '网络', exact: true }).click();
-      await expect(page.getByRole('list', { name: '经由线路 洛杉矶 · 三跳线路' })).toBeVisible();
-      await expect(page.locator('.cvm-flow')).toHaveScreenshot(`chain-detail-${width}-${theme}.png`);
-      await page.getByRole('button', { name: '路由表', exact: true }).click();
-      const dialog = page.getByRole('dialog', { name: '容器路由表' });
-      await expect(dialog.getByRole('group', { name: '出口优先级' })).toBeVisible();
-      const selects = dialog.getByRole('combobox', { name: '经由' });
-      await expect(selects.last().locator('optgroup')).toHaveCount(2);
-      await expect(dialog).toHaveScreenshot(`chain-routes-${width}-${theme}.png`);
-      await dialog.getByRole('button', { name: '预览产物差异', exact: true }).click();
-      await expect(dialog.locator('.cvm-artifact-content').first()).toBeVisible();
-      expect(await dialog.locator('.cvm-dialog-body').evaluate(n => n.scrollWidth <= n.clientWidth + 1)).toBe(true);
-      await expect(dialog).toHaveScreenshot(`chain-routes-preview-${width}-${theme}.png`);
+      await page.evaluate(() => {
+        const prior = globalThis.fetch;
+        globalThis.fetch = async (input, init) => {
+          if (!String(input).endsWith('/routes/match') || init?.method !== 'POST') return prior(input, init);
+          const body = JSON.parse(String(init.body)) as CvmRouteMatchRequest;
+          const routing = body.network_edit?.routes?.routes;
+          const index = routing?.routes.findIndex(
+            route => route.destination === '198.51.100.0/24' && route.chain_id === 'chain-us',
+          );
+          const priority = routing?.priorities.find(priority => priority.chain_id === 'chain-us')?.ipv4;
+          if (
+            body.destination !== '198.51.100.9' ||
+            body.protocol !== 'tcp' ||
+            body.port !== 443 ||
+            !routing ||
+            index === undefined ||
+            index < 0 ||
+            priority == null
+          )
+            return Response.json({ error: 'unexpected route probe' }, { status: 422 });
+          return Response.json({
+            kind: 'route',
+            route_index: index,
+            route: routing.routes[index],
+            priority,
+          } satisfies CvmRouteMatchResult);
+        };
+      });
+      const editor = routeEditor(page);
+      await expect(editor.getByRole('list', { name: '出口优先级' })).toBeVisible();
+      // 常驻的添加行同时列出网卡和线路两组出口。
+      await expect(editor.getByRole('combobox', { name: '经由' }).locator('optgroup')).toHaveCount(2);
+      const routes = editor.getByRole('table', { name: '目标路由' });
+      await routes
+        .getByRole('button', { name: /^编辑路由 / })
+        .first()
+        .click();
+      const editing = routes.locator('tr[data-editing]');
+      await editing.getByRole('combobox', { name: '经由' }).selectOption('chain:chain-us');
+      await editing.getByRole('textbox', { name: '目标 IP／网段' }).fill('198.51.100.0/24');
+      await editing.getByRole('button', { name: '应用修改', exact: true }).click();
+      await expect(editing).toHaveCount(0);
+      await editor.getByRole('textbox', { name: '测试目标' }).fill('198.51.100.9 tcp/443');
+      await editor.getByRole('button', { name: '测试命中' }).click();
+      const hit = routes.getByRole('row').filter({ has: page.getByText('命中', { exact: true }) });
+      await expect(hit).toHaveCount(1);
+      await expect(hit.getByRole('cell').first()).toHaveText('198.51.100.0/24');
+      await expect(editor.getByRole('form', { name: '路由命中测试' }).getByRole('status')).toContainText(
+        /命中 198.51.100.0\/24.*洛杉矶.*优先级 200/,
+      );
+      await expect(page.getByLabel('容器草稿与待发布变更').getByRole('button', { name: '保存网络变更' })).toBeEnabled();
+      expect(await editor.evaluate(n => n.scrollWidth <= n.clientWidth + 1)).toBe(true);
+      if ((width === 1440 && theme === 'light') || (width === 320 && theme === 'dark'))
+        await expect(editor).toHaveScreenshot(`inline-f7-match-${width}-${theme}.png`);
       expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
     });
-  test(`chain phone chips ${theme}`, async ({ page }) => {
-    await open(page, 390, theme);
-    await expect(page.locator('.cz-phone')).toContainText('洛杉矶 · 三跳线路');
-    await expect(page.locator('.cz-phone')).toHaveScreenshot(`chain-phone-${theme}.png`);
-  });
 }

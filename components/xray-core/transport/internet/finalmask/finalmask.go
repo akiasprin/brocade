@@ -519,19 +519,24 @@ func (c *headerManagerOOBConn) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, ad
 	buf = buf[:bufferSize]
 	defer bytespool.Free(buf)
 
-	n, oobn, flags, addr, err = c.raw.ReadMsgUDP(buf, oob)
-	if n == 0 || err != nil {
-		return n, oobn, flags, addr, err
+	for {
+		n, oobn, flags, addr, err = c.raw.ReadMsgUDP(buf, oob)
+		if n == 0 || err != nil {
+			return n, oobn, flags, addr, err
+		}
+		payload, decodeErr := c.decodePacket(buf[:n], addr)
+		if decodeErr != nil {
+			errors.LogDebug(context.Background(), addr, " mask read msg err ", decodeErr)
+			continue
+		}
+		if len(b) < len(payload) {
+			// A per-datagram size error must not close QUIC's receive loop while
+			// its underlying UDP socket remains open and accumulates packets.
+			errors.LogDebug(context.Background(), addr, " mask read msg err short buffer")
+			continue
+		}
+		return copy(b, payload), oobn, flags, addr, nil
 	}
-	payload, decodeErr := c.decodePacket(buf[:n], addr)
-	if decodeErr != nil {
-		errors.LogDebug(context.Background(), addr, " mask read msg err ", decodeErr)
-		return 0, oobn, flags, addr, nil
-	}
-	if len(b) < len(payload) {
-		return 0, oobn, flags, addr, io.ErrShortBuffer
-	}
-	return copy(b, payload), oobn, flags, addr, nil
 }
 
 func (c *headerManagerOOBConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error) {
@@ -619,10 +624,8 @@ func (c *headerManagerOOBConn) ReadBatch(messages []ipv4.Message, flags int) (in
 				continue
 			}
 			if len(payload) > messageBufferSize(messages[valid].Buffers) {
-				for _, buffer := range buffers {
-					bytespool.Free(buffer)
-				}
-				return valid, io.ErrShortBuffer
+				errors.LogDebug(context.Background(), temporary[i].Addr, " mask batch read err short buffer")
+				continue
 			}
 			messages[valid].N = copyMessageBuffers(messages[valid].Buffers, payload)
 			messages[valid].NN = copy(messages[valid].OOB, temporary[i].OOB[:temporary[i].NN])

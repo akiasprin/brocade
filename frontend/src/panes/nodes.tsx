@@ -111,8 +111,10 @@ import { can, isPublic, isVisitor, useSession } from '../session';
 import { Ago, Confirm, Empty, EmptyState, ErrorBox, Loading, SegmentedControl, SegSwitch } from '../ui/bits';
 import { FieldLoading, PanelLoading } from '../ui/loading';
 import { Icon, PanelTitle, type IconName } from '../ui/icons';
+import { RuntimeBand, RuntimeCells } from '../ui/runtime-band';
 import { bytes } from '../ui/format';
 import { CopyButton } from '../ui/copy-button';
+import { HostInstallDialog } from './cvm/host-install';
 import { nodeInitializationView } from '../node-initialization';
 import { firstProvisionError, provisionFormErrors } from '../provision-form';
 import { WizardCard, WizardField, WizardFooter, WizardPaper, WizardPaperHeader } from '../ui/wizard-paper';
@@ -446,47 +448,6 @@ const STATE_TITLE: Record<string, string> = {
   error: '异常',
 };
 
-/* ── 字段的两种排列方式。选用依据见 styles.css，此处只提供结构。 ── */
-
-/* ⑥ 规格网格：字段数量多、值较短、彼此平级 */
-
-/** 一个字段格。第三个元素是跨栏数——网格是 8 栏，长值（CPU 型号、发行版、内核）
-    占一栏放不下。跨栏数在窄容器下由 styles.css 按断点收窄，不在此处判断容器宽度。
-    使用字面量而非数字，是为了在调用处能直接看出这是跨栏而不是别的计数。 */
-type CellSpan = 'w2' | 'w3' | 'w5';
-type CellItem = [string, ReactNode] | [string, ReactNode, CellSpan];
-
-function Cells({ items }: { items: CellItem[] }) {
-  return (
-    <dl className="nd-rt-cells">
-      {items.map(([k, v, span]) => (
-        <div className={span ? `nd-rt-c ${span}` : 'nd-rt-c'} key={k}>
-          <dt>{k}</dt>
-          <dd>{v}</dd>
-        </div>
-      ))}
-    </dl>
-  );
-}
-
-/** 一条横带：一个数据来源。三条带的来源互不相同——AGENT 是 agent 轮询时写入的状态，
-    HOST 来自负载上报，CONFIG 是收敛观测的结果——因此每条带自带时效读数，
-    合并成一张卡后不能只在卡头写一个时间。 */
-function Band({ name, icon, meta, children }: { name: string; icon: IconName; meta: ReactNode; children: ReactNode }) {
-  return (
-    <section className="nd-rt-band">
-      <div className="nd-rt-bl">
-        <b>
-          <Icon of={icon} size={12} className="nd-rt-bl-ic" />
-          {name}
-        </b>
-        <i>{meta}</i>
-      </div>
-      {children}
-    </section>
-  );
-}
-
 /** 异常读数前的标记。判定结果此前只由 `.hot` 的金色表达，而 styles.css 中没有裸
     `.hot` 的规则（只有 .plate.hot 这类作用域版本），三处判定实际渲染为普通文字。
     颜色之外再给一个形状，异常项在一片读数里才可定位。 */
@@ -728,6 +689,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
         ['revisions'],
         ['compile'],
         ['deployments'],
+        ['cvm'],
         ['usage-node-series'],
         ['node-load-list'],
         ['node-nic-list'],
@@ -760,7 +722,7 @@ function NodeList({ go, sheeted = false }: { go: (d: Drill) => void; sheeted?: b
     const names = targets.map(id => nodeLabel(list.find(node => node.node_id === id)!));
     const confirmed = window.confirm(
       `确定永久移除 ${targets.length} 台退役机器吗？\n\n${names.join('、')}\n\n` +
-        '所有包含这些机器的线路会一并删除，机器的运行记录、发布目标和用量明细也会清理。此操作不能撤销。',
+        '所有包含这些机器的线路、运行状态、发布目标和用量明细会一并清理。已删除容器的不可变执行证据仅保留原机器 ID 文本，不再阻止机器记录删除。此操作不能撤销。',
     );
     if (!confirmed) return;
     setRemovalNotice(null);
@@ -4379,7 +4341,7 @@ function openvpnExtensionStatus(node: NodeAgentStateItem) {
 }
 
 function cubeExtensionLabel(backend: string | undefined) {
-  if (backend === 'baremetal-v1') return '裸机';
+  if (backend === 'baremetal-v1') return 'AGENT 需升级';
   if (!backend?.startsWith('cube-')) return 'CUBE';
   const mode = /^cube-(kvm|pvm)(?:-v\d+)?$/.exec(backend)?.[1] ?? backend.slice('cube-'.length);
   return mode ? `CUBE[${mode.toUpperCase()}]` : 'CUBE';
@@ -4892,9 +4854,9 @@ export function HostCard({ load, pending = false }: { load: NodeLoadView | undef
     );
   if (!host)
     return (
-      <Band name="HOST" icon="nodes" meta={meta}>
+      <RuntimeBand name="HOST" icon="nodes" meta={meta}>
         <p className="note nd-rt-empty">{pending ? <FieldLoading /> : '还没有主机信息上报。'}</p>
-      </Band>
+      </RuntimeBand>
     );
   const cpuSummary = [cpu, cores].filter(Boolean).join(' · ');
   const osSummary = [host.os_pretty, host.virt].filter(Boolean).join(' · ');
@@ -4902,8 +4864,8 @@ export function HostCard({ load, pending = false }: { load: NodeLoadView | undef
   const bufferSummary =
     host.rmem_max > 0 || host.wmem_max > 0 ? `${bytes(host.rmem_max)} / ${bytes(host.wmem_max)}` : '';
   return (
-    <Band name="HOST" icon="nodes" meta={meta}>
-      <Cells
+    <RuntimeBand name="HOST" icon="nodes" meta={meta}>
+      <RuntimeCells
         items={[
           [
             'CPU',
@@ -4985,7 +4947,7 @@ export function HostCard({ load, pending = false }: { load: NodeLoadView | undef
           ],
         ]}
       />
-    </Band>
+    </RuntimeBand>
   );
 }
 
@@ -5011,7 +4973,7 @@ function AgentCard({
   return (
     /* 「上次来拉」放在带名下方的时效位：它表示这条带的数据有多新，与 HOST 的上报时间、
        CONFIG 的观察时间同一性质，三者在同一列上才能横向比对。 */
-    <Band
+    <RuntimeBand
       name="AGENT"
       icon="agent"
       meta={
@@ -5020,7 +4982,7 @@ function AgentCard({
         </>
       }
     >
-      <Cells
+      <RuntimeCells
         items={[
           ['上次用量', <Ago at={node.last_usage_report_at} />],
           [
@@ -5110,7 +5072,7 @@ function AgentCard({
       {publicIpHistoryOpen && (
         <PublicIpHistoryDetails nodeId={node.node_id} history={publicIpHistory} lastSeen={publicIpLastSeen} />
       )}
-    </Band>
+    </RuntimeBand>
   );
 }
 
@@ -5130,8 +5092,7 @@ export function AppliedCard({
   const a = appliedOf(node);
   const openvpn = openvpnExtensionStatus(node);
   // CUBE 是可选扩展：只有确认过运行栈或仍有保留实例的机器，才有运行健康期望。
-  const hasCubeRuntime =
-    !!cubeHost?.capabilities.backend.startsWith('cube') || cubeHost?.capabilities.backend === 'baremetal-v1';
+  const hasCubeRuntime = !!cubeHost?.capabilities.backend.startsWith('cube');
   const cubeLabel = cubeExtensionLabel(cubeHost?.capabilities.backend);
   const cubeManaged = cubeExpected || hasCubeRuntime;
   const cubeReady = cubeStatus === 'ready' && hasCubeRuntime && !!cubeHost?.fresh && !cubeHost.error;
@@ -5165,6 +5126,13 @@ export function AppliedCard({
     <span className="nd-rt-chips">
       {openvpn}
       {CVM_ENABLED && <StateChip label={cubeLabel} state={cubeState} title={`${cubeLabel} 扩展 · ${cubeTitle}`} />}
+      {CVM_ENABLED && (cubeHost?.capabilities.host_system || cubeHost?.capabilities.host_system_error) && (
+        <StateChip
+          label="宿主系统"
+          state={!cubeHost.fresh ? 'unknown' : cubeHost.capabilities.host_system_error ? 'error' : 'present'}
+          title={cubeHost.capabilities.host_system_error ?? cubeHost.capabilities.host_system?.os}
+        />
+      )}
     </span>
   );
   const rev = a?.source_deployment_id != null ? revisionOf(a.source_deployment_id) : undefined;
@@ -5177,21 +5145,21 @@ export function AppliedCard({
   );
   if (!a)
     return (
-      <Band name="CONFIG" icon="artifacts" meta={meta}>
-        <Cells
+      <RuntimeBand name="CONFIG" icon="artifacts" meta={meta}>
+        <RuntimeCells
           items={[
             ['状态', <span className="note">还没收敛过。</span>, 'w3'],
             ['扩展应用', extensions],
           ]}
         />
-      </Band>
+      </RuntimeBand>
     );
   return (
-    <Band name="CONFIG" icon="artifacts" meta={meta}>
+    <RuntimeBand name="CONFIG" icon="artifacts" meta={meta}>
       {/* 逐项状态合成一条状态带，不再逐件占一格：五件产物此前各占一格，而每格里只有一个
           三字符的状态词，一格的其余宽度是空的。状态带上每片自带产物名，见 StateChip。
           需要列全：它也是发布前判定待发布的依据，unknown 一律判定为需要操作。 */}
-      <Cells
+      <RuntimeCells
         items={[
           [
             '来自',
@@ -5216,7 +5184,7 @@ export function AppliedCard({
       {/* 此处原有 xray 和 wg 的 sha256，已移除：这条带表示的是收敛来源和各产物状态，
           而 sha256 用于与产物面板逐字节核对，二者用途不同；两个 64 位值还会占满一行。
           需要查看指纹时使用产物面板，那里有完整值。 */}
-    </Band>
+    </RuntimeBand>
   );
 }
 
@@ -5254,9 +5222,10 @@ function RuntimeCard({
     staleTime: 15_000,
     refetchInterval: 30_000,
   });
-  const cubeHost = Array.isArray(cube.data?.hosts)
-    ? cube.data.hosts.find(host => host.node_id === node.node_id)
-    : undefined;
+  const cubeHost = [
+    ...(Array.isArray(cube.data?.hosts) ? cube.data.hosts : []),
+    ...(cube.data?.available_hosts ?? []),
+  ].find(host => host.node_id === node.node_id);
   return (
     <div className="panel nd-runtime" data-draft-panel={nodeDraftPanelKey(node.node_id, 'observed')}>
       <header>
@@ -5657,6 +5626,7 @@ export function NodeDetail({
   /* 签发的 node token 同样只显示一次 */
   const { receipt: issued, receive: receiveToken, dismiss: dismissToken } = useNodeTokenReceipt(id);
   const [confirmIsolationFor, setConfirmIsolationFor] = useState<string | null>(null);
+  const [configureHost, setConfigureHost] = useState(false);
   const [unlockActionTarget, setUnlockActionTarget] = useState<HTMLSpanElement | null>(null);
   const [confirmForceRetirement, setConfirmForceRetirement] = useState<ConfigHandoffForceCandidate | null>(null);
 
@@ -5734,6 +5704,9 @@ export function NodeDetail({
       qc.invalidateQueries({ queryKey: ['nodes'] });
       qc.invalidateQueries({ queryKey: ['deployments'] });
       qc.invalidateQueries({ queryKey: ['snapshot'] });
+      qc.invalidateQueries({ queryKey: ['revisions'] });
+      qc.invalidateQueries({ queryKey: ['compile'] });
+      qc.invalidateQueries({ queryKey: ['cvm'] });
     },
   });
   const serviceRestore = useMutation({
@@ -6167,6 +6140,14 @@ export function NodeDetail({
                           </span>
                         </button>
                       )}
+                      {CVM_ENABLED && system && n.lifecycle_phase === 'active' && (
+                        <button role="menuitem" onClick={() => setConfigureHost(true)}>
+                          <Icon of="config" size={14} className="action-menu-icon" />
+                          <span>
+                            配置机器能力<small>生成沿用现有凭据的安装命令</small>
+                          </span>
+                        </button>
+                      )}
                       <button
                         role="menuitem"
                         disabled={!system || issue.isPending || n.lifecycle_phase !== 'active'}
@@ -6227,35 +6208,31 @@ export function NodeDetail({
                           </small>
                         </span>
                       </button>
-                      {n.lifecycle_phase === 'retiring' && (
-                        <>
-                          {teardownNeedsRepair && (
-                            <button
-                              role="menuitem"
-                              disabled={!system || retire.isPending}
-                              onClick={() => retire.mutate('retired')}
-                            >
-                              <Icon of="deploy" size={14} className="action-menu-icon" />
-                              <span>
-                                重建停用发布
-                                <small>当前没有可继续执行的停用单；沿用本次退役代次重新规划</small>
-                              </span>
-                            </button>
-                          )}
-                          <button
-                            role="menuitem"
-                            className="dg"
-                            disabled={!system || abandon.isPending}
-                            onClick={() => abandon.mutate()}
-                          >
-                            <Icon of="warn" size={14} className="action-menu-icon" />
-                            <span>
-                              {abandon.isPending ? '处理中…' : '强制退役'}
-                              <small>仅用于机器永久失联；结果会保留为警告状态</small>
-                            </span>
-                          </button>
-                        </>
+                      {n.lifecycle_phase === 'retiring' && teardownNeedsRepair && (
+                        <button
+                          role="menuitem"
+                          disabled={!system || retire.isPending}
+                          onClick={() => retire.mutate('retired')}
+                        >
+                          <Icon of="deploy" size={14} className="action-menu-icon" />
+                          <span>
+                            重建停用发布
+                            <small>当前没有可继续执行的停用单；沿用本次退役代次重新规划</small>
+                          </span>
+                        </button>
                       )}
+                      <button
+                        role="menuitem"
+                        className="dg"
+                        disabled={!system || abandon.isPending}
+                        onClick={() => abandon.mutate()}
+                      >
+                        <Icon of="warn" size={14} className="action-menu-icon" />
+                        <span>
+                          {abandon.isPending ? '处理中…' : '强制退役'}
+                          <small>立即终止本机容器并清理未隔离关联机器；未确认资源不阻塞</small>
+                        </span>
+                      </button>
                       {n.lifecycle_deployment_id && (
                         <button role="menuitem" onClick={() => navigate('deploy')}>
                           <Icon of="deploy" size={14} className="action-menu-icon" />
@@ -6353,6 +6330,9 @@ export function NodeDetail({
             </button>
           </div>
         </div>
+      )}
+      {CVM_ENABLED && configureHost && (
+        <HostInstallDialog node={id} name={base.name || id} onClose={() => setConfigureHost(false)} />
       )}
 
       {(issue.error ||
@@ -7127,7 +7107,9 @@ export function ProvisionInstall({
   const { receipt: reissued, receive: receiveToken } = useNodeTokenReceipt(node);
   const [confirmIssue, setConfirmIssue] = useState(false);
   const [enableOpenvpn, setEnableOpenvpn] = useState(false);
+  const [enableCvmNetwork, setEnableCvmNetwork] = useState(false);
   const [enableCvm, setEnableCvm] = useState(false);
+  const [cvmMode, setCvmMode] = useState<'auto' | 'kvm' | 'pvm'>('auto');
   const issue = useMutation({
     mutationFn: () => issueNodeToken(node),
     onSuccess: r => {
@@ -7184,9 +7166,12 @@ export function ProvisionInstall({
   const installCommand =
     command && !enrollmentExpired && (!redeemed || (!!reissued && !nodeReflectsReissuedToken)) ? command : undefined;
   // 仅附加安装器参数，不修改 enrollment token 或登记配置；sudo 只保留 token 环境变量。
-  const commandToCopy = installCommand
-    ? installCommand + (enableOpenvpn ? ' --enable-openvpn' : '') + (CVM_ENABLED && enableCvm ? ' --enable-cvm' : '')
-    : '';
+  const installOptions = [
+    ...(enableOpenvpn ? ['--enable-openvpn'] : []),
+    ...(CVM_ENABLED && enableCvmNetwork ? ['--agent-flavor cvm'] : []),
+    ...(CVM_ENABLED && enableCvm ? ['--enable-cvm', ...(cvmMode === 'auto' ? [] : ['--cvm-mode ' + cvmMode])] : []),
+  ];
+  const commandToCopy = installCommand ? [installCommand, ...installOptions].join(' ') : '';
   useUnsavedChanges(installCommand !== undefined, `${nodeLabel} 的一次性安装命令`, `node-route:install:${node}`);
 
   // 证书与本屏的另外两步不同：它不经过下发流程，也不需要等待机器上线——控制面签发后入库，
@@ -7287,35 +7272,71 @@ export function ProvisionInstall({
               </span>
             </WizardField>
             {CVM_ENABLED && (
-              <WizardField label="CVM 扩展">
+              <WizardField label="机器能力">
                 {online ? (
                   <span className="st" title={cvmHost?.error ?? undefined}>
                     {cvm.isPending
                       ? '等待能力上报'
                       : cvm.error || !cvmHosts
                         ? '能力状态未知'
-                        : cvmHost?.fresh && cvmHost.capabilities.create
-                          ? '已启用'
-                          : cvmHost
-                            ? cvmHost.fresh
-                              ? '未开放创建'
-                              : '执行能力不可用'
-                            : '尚无能力报告'}
+                        : cvmHost?.fresh && cvmHost.capabilities.host_system && cvmHost.capabilities.create
+                          ? 'Cube · 宿主系统管理'
+                          : cvmHost?.fresh && cvmHost.capabilities.baremetal
+                            ? 'Agent 需升级'
+                            : cvmHost?.fresh && cvmHost.capabilities.create
+                              ? '容器运行'
+                              : cvmHost
+                                ? cvmHost.fresh
+                                  ? '未开放创建'
+                                  : '执行能力不可用'
+                                : '尚无能力报告'}
                   </span>
                 ) : (
-                  <SegSwitch
-                    checked={enableCvm}
+                  <fieldset
+                    className="pv-fields pv-install-options"
+                    aria-label="可选安装项"
                     disabled={!installCommand || issue.isPending}
-                    onChange={setEnableCvm}
-                    off="不安装"
-                    on="安装"
-                    ariaLabel="是否安装 CVM 扩展"
-                  />
+                  >
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={enableCvmNetwork || enableCvm}
+                        disabled={enableCvm}
+                        onChange={event => setEnableCvmNetwork(event.target.checked)}
+                      />{' '}
+                      网络提供
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={enableCvm}
+                        onChange={event => setEnableCvm(event.target.checked)}
+                      />{' '}
+                      Cube 与宿主系统管理
+                    </label>
+                    {enableCvm && (
+                      <label>
+                        虚拟化方式
+                        <select
+                          className="f"
+                          value={cvmMode}
+                          onChange={event => {
+                            const mode = event.target.value;
+                            if (mode === 'auto' || mode === 'kvm' || mode === 'pvm') setCvmMode(mode);
+                          }}
+                        >
+                          <option value="auto">自动</option>
+                          <option value="kvm">KVM</option>
+                          <option value="pvm">PVM</option>
+                        </select>
+                      </label>
+                    )}
+                  </fieldset>
                 )}
                 <span className="sub">
                   {online
                     ? '状态来自机器实际能力报告。'
-                    : '可选。安装 CVM 节点运行栈；需要 KVM、systemd 和持久 XFS，磁盘需提前准备。'}
+                    : '组合执行栈同时提供 Cube 容器与物理宿主管理，并可在 Console 动态纳管或解除；仅提供网络时无需安装 Cube。'}
                 </span>
               </WizardField>
             )}
@@ -7336,18 +7357,12 @@ export function ProvisionInstall({
                     </span>
                   ),
                 )}
-                {enableOpenvpn && (
-                  <>
+                {installOptions.map(option => (
+                  <span key={option}>
                     {' '}
-                    <span className="pv-flag">--enable-openvpn</span>
-                  </>
-                )}
-                {CVM_ENABLED && enableCvm && (
-                  <>
-                    {' '}
-                    <span className="pv-flag">--enable-cvm</span>
-                  </>
-                )}
+                    <span className="pv-flag">{option}</span>
+                  </span>
+                ))}
               </pre>
               <div className="pv-cmd-meta">
                 <span>

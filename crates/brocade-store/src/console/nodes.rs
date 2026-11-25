@@ -122,26 +122,6 @@ pub async fn remove_retired_nodes(
     }
     for row in &rows {
         let node_id: String = row.try_get("id")?;
-        if sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(
-                SELECT 1 FROM cvm_instances WHERE node_id=$1
-                UNION ALL SELECT 1 FROM cvm_nic_bindings WHERE provider_node=$1 OR consumer_node=$1
-                UNION ALL SELECT 1 FROM cvm_nic_allocations WHERE provider_node=$1 OR consumer_node=$1
-                UNION ALL SELECT 1 FROM cvm_nic_publications WHERE provider_node=$1
-                UNION ALL SELECT 1 FROM cvm_entries WHERE provider_node=$1
-                UNION ALL SELECT 1 FROM cvm_entry_tunnels WHERE entry_node=$1 OR target_node=$1
-                UNION ALL SELECT 1 FROM cvm_entry_publications WHERE provider_node=$1
-                UNION ALL SELECT 1 FROM cvm_user_host_network_quotas WHERE node_id=$1
-            )",
-        )
-        .bind(&node_id)
-        .fetch_one(&mut *tx)
-        .await?
-        {
-            return Err(StoreError::Conflict(
-                "机器仍被 CVM 执行历史引用，请保留退役记录用于审计".into(),
-            ));
-        }
         let retired: bool = row.try_get("retired")?;
         let phase: String = row.try_get("phase")?;
         if !retired || !matches!(phase.as_str(), "retired" | "abandoned") {
@@ -202,8 +182,9 @@ pub async fn remove_retired_nodes(
 
     remove_node_forwarding_tx(&mut tx, &node_ids).await?;
 
-    // Capability/capacity reports are disposable node snapshots, unlike the CVM resource
-    // history guarded above. Their RESTRICT references must leave in this same transaction.
+    // Capability/capacity reports are disposable node snapshots. Immutable CVM execution rows
+    // retain the original node ID as detached historical text, while these live RESTRICT
+    // references must leave in this same transaction.
     for statement in [
         "DELETE FROM cvm_nic_nodes WHERE node_id = ANY($1)",
         "DELETE FROM cvm_entry_nodes WHERE node_id = ANY($1)",

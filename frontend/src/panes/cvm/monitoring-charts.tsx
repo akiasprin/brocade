@@ -1,9 +1,8 @@
 import { type ReactNode } from 'react';
 import type { CvmMonitoring, CvmMonitoringSample } from '../../api';
 import { bytes } from '../../ui/format';
-import { Section } from './presentation';
-import { observeBpsReading, observeBpsUnit, observeBytesUnit, observeNumberUnit } from '../../ui/observe-chart';
-import { cvmEventLabel, cvmNetworkRate } from './monitoring-data';
+import { observeBpsUnit, observeBytesUnit, observeNumberUnit } from '../../ui/observe-chart';
+import { cpuPercent, cvmEventLabel, cvmNetworkRate, type CvmOverviewMetric } from './monitoring-data';
 import { HistoryChart } from '../telemetry';
 
 const pct = (n: number | null | undefined) => (n == null ? '—' : `${n.toFixed(1)}%`);
@@ -21,36 +20,19 @@ function Facts({ items }: { items: [string, ReactNode][] }) {
     </dl>
   );
 }
-function Card({
-  title,
-  reading,
-  children,
-  more,
-}: {
-  title: string;
-  reading: ReactNode;
-  children: ReactNode;
-  more: ReactNode;
-}) {
+/** 一张监控卡：上方是带图例的历史图，下方可展开该资源的诊断明细。卡面同机器详情的 .chart-card。 */
+function Card({ title, children, more }: { title: string; children: ReactNode; more: ReactNode }) {
   return (
-    <Section title={title} className="cvm-diagnostic-card" aside={<span className="cvm-chart-reading">{reading}</span>}>
-      {children}
+    <section className="chart-card cvm-diagnostic-card" aria-label={title}>
+      <div className="cvm-chart-flush">{children}</div>
       <details className="cvm-diagnostic-more">
         <summary>{title} 诊断</summary>
-        {more}
+        <div className="cvm-diagnostic-body">{more}</div>
       </details>
-    </Section>
+    </section>
   );
 }
-export default function CvmMonitoringCharts({
-  data,
-  nic,
-  latest,
-}: {
-  data: CvmMonitoring;
-  nic: string;
-  latest: CvmMonitoringSample;
-}) {
+function cvmChartContext(data: CvmMonitoring) {
   const points = data.samples;
   const samples = points.map(s => ({
     window_start_unix_secs: (s.has_gap ? s.observed_at_unix_millis : s.window_start_unix_millis) / 1000,
@@ -63,7 +45,73 @@ export default function CvmMonitoringCharts({
   const events = data.events
     .slice(0, 40)
     .map(e => ({ atUnixSecs: e.at_unix_millis / 1000, label: cvmEventLabel(e.kind) }));
-  const common = { samples, ...bounds, events };
+  return { samples, ...bounds, events };
+}
+
+export function CvmMetricHistory({
+  data,
+  metric,
+  wide = false,
+}: {
+  data: CvmMonitoring;
+  metric: CvmOverviewMetric;
+  wide?: boolean;
+}) {
+  const common = { ...cvmChartContext(data), wide, legendPlacement: 'cap' as const };
+  const series = (pick: (sample: CvmMonitoringSample) => number | null) =>
+    data.samples.map(sample => (sample.has_gap ? null : pick(sample)));
+  if (metric === 'cpu')
+    return (
+      <HistoryChart
+        {...common}
+        title="CPU 使用率"
+        max={100}
+        formatValue={pct}
+        lines={[
+          { name: '平均', values: series(sample => cpuPercent(sample.cpu_usage_basis_points)) },
+          { name: '采样峰值', values: series(sample => cpuPercent(sample.cpu_peak_basis_points)), dashed: true },
+        ]}
+      />
+    );
+  if (metric === 'network')
+    return (
+      <HistoryChart
+        {...common}
+        title="网卡流量"
+        valueUnit={observeBpsUnit}
+        lines={[
+          { name: '接收', values: series(sample => cvmNetworkRate(sample, 'rx_bps')) },
+          { name: '发送', values: series(sample => cvmNetworkRate(sample, 'tx_bps')) },
+        ]}
+      />
+    );
+  return (
+    <HistoryChart
+      {...common}
+      title={metric === 'memory' ? '内存用量' : '系统盘用量'}
+      valueUnit={observeBytesUnit}
+      lines={[
+        {
+          name: '已用',
+          values: series(sample => (metric === 'memory' ? sample.memory_used_bytes : sample.root_used_bytes)),
+        },
+      ]}
+    />
+  );
+}
+
+export default function CvmMonitoringCharts({
+  data,
+  nic,
+  latest,
+}: {
+  data: CvmMonitoring;
+  nic: string;
+  latest: CvmMonitoringSample;
+}) {
+  const points = data.samples;
+  const base = cvmChartContext(data);
+  const common = { ...base, legendPlacement: 'cap' as const };
   const diagnostics = latest.diagnostics;
   const cpu = diagnostics?.cpus.find(c => c.cpu === -1);
   const cpuSeries = (key: 'user' | 'system' | 'softirq' | 'iowait' | 'steal') =>
@@ -94,11 +142,6 @@ export default function CvmMonitoringCharts({
     <div className="cvm-diagnostic-grid">
       <Card
         title="CPU"
-        reading={
-          <>
-            平均 <b>{pct(latest.cpu_usage_basis_points == null ? null : latest.cpu_usage_basis_points / 100)}</b>
-          </>
-        }
         more={
           <>
             <Facts
@@ -111,7 +154,7 @@ export default function CvmMonitoringCharts({
               ]}
             />
             <HistoryChart
-              {...common}
+              {...base}
               title="CPU 时间分项"
               max={100}
               formatValue={n => pct(n)}
@@ -167,11 +210,6 @@ export default function CvmMonitoringCharts({
       </Card>
       <Card
         title="内存"
-        reading={
-          <>
-            已用 <b>{bytes(latest.memory_used_bytes)}</b> / {bytes(latest.memory_total_bytes)}
-          </>
-        }
         more={
           <>
             <Facts
@@ -192,7 +230,7 @@ export default function CvmMonitoringCharts({
             />
             {pressure('memory')}
             <HistoryChart
-              {...common}
+              {...base}
               title="Swap 使用"
               valueUnit={observeBytesUnit}
               lines={[{ name: 'Swap', values: points.map(s => s.diagnostics?.swap_used_bytes ?? null) }]}
@@ -212,11 +250,6 @@ export default function CvmMonitoringCharts({
       </Card>
       <Card
         title="系统盘"
-        reading={
-          <>
-            已用 <b>{bytes(latest.root_used_bytes)}</b> / {bytes(latest.root_total_bytes)}
-          </>
-        }
         more={
           <>
             <Facts
@@ -238,7 +271,7 @@ export default function CvmMonitoringCharts({
             {pressure('io')}
             {io && (
               <HistoryChart
-                {...common}
+                {...base}
                 title="磁盘等待时间"
                 valueUnit={axis => observeNumberUnit(axis, 'ms')}
                 lines={[
@@ -273,26 +306,6 @@ export default function CvmMonitoringCharts({
       </Card>
       <Card
         title="网络"
-        reading={
-          <>
-            <span>
-              接收{' '}
-              <b>
-                {cvmNetworkRate(latest, 'rx_bps', nic) === null
-                  ? '—'
-                  : observeBpsReading(cvmNetworkRate(latest, 'rx_bps', nic)!)}
-              </b>
-            </span>
-            <span>
-              发送{' '}
-              <b>
-                {cvmNetworkRate(latest, 'tx_bps', nic) === null
-                  ? '—'
-                  : observeBpsReading(cvmNetworkRate(latest, 'tx_bps', nic)!)}
-              </b>
-            </span>
-          </>
-        }
         more={
           <>
             {selectedNics.map(n => (

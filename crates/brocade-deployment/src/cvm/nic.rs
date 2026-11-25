@@ -1,5 +1,5 @@
 //! Reusable IP network services, their allocated container devices and independent routes.
-use super::{valid_id, NetworkDiagnostics, RouteTarget};
+use super::{valid_id, ExecutionTarget, NetworkDiagnostics, RouteTarget};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -7,9 +7,8 @@ use std::{
     str::FromStr,
 };
 
-/// 67：网卡只承担出口（去掉入站方向、入站来源与 `NicIngress`），入站改由访问入口承担；
-/// 绑定可携带出入对称的 IPv4 源地址。旧 Agent 不领取新语义。
-pub const NIC_PROTOCOL_VERSION: u32 = 67;
+/// Current node network execution contract.
+pub const NIC_CONTRACT_VERSION: u32 = 1;
 /// Agent 与 Cubelet 都具备时才下发带协议端口的出口规则（组合台 L4 出口）。
 pub const ROUTE_SERVICE_CONTRACT: &str = "cvm-route-service-v1";
 pub const MAX_NETWORK_ROUTES: usize = 256;
@@ -46,31 +45,31 @@ impl FromStr for IpPrefix {
             Some((address, length)) => (
                 address
                     .parse::<IpAddr>()
-                    .map_err(|_| "invalid IP address")?,
+                    .map_err(|_| "IP 地址格式不正确，请填写有效的 IPv4 或 IPv6 地址")?,
                 Some(
                     length
                         .parse::<u8>()
-                        .map_err(|_| "invalid IP prefix length")?,
+                        .map_err(|_| "网段前缀长度不正确，IPv4 须为 0–32，IPv6 须为 0–128")?,
                 ),
             ),
             None => (
                 value
                     .parse::<IpAddr>()
-                    .map_err(|_| "route must be an IP address or prefix")?,
+                    .map_err(|_| "目标须为 IP 地址或网段，例如 203.0.113.1 或 203.0.113.0/24")?,
                 None,
             ),
         };
         if matches!(address, IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some()) {
-            return Err("mapped IPv4 addresses are not supported".into());
+            return Err("不支持映射到 IPv6 的 IPv4 地址，请直接填写 IPv4 地址".into());
         }
         let bits = if address.is_ipv4() { 32 } else { 128 };
         let length = length.unwrap_or(bits);
         if length > bits {
-            return Err("invalid IP prefix length".into());
+            return Err("网段前缀长度不正确，IPv4 须为 0–32，IPv6 须为 0–128".into());
         }
         let network = Self { address, length };
         if network.number() & !network.mask() != 0 {
-            return Err("IP prefix must use its network address".into());
+            return Err("网段须填写网络地址，例如 10.0.0.0/24，不能填写 10.0.0.1/24".into());
         }
         Ok(network)
     }
@@ -202,10 +201,10 @@ impl NicPublicationSpec {
             || !valid_id(&self.provider_node)
             || !valid_id(&self.resource_domain)
         {
-            return Err("invalid network publication identity".into());
+            return Err("出口网络名称须为 1–80 字，提供机器和地址资源范围必须有效".into());
         }
         if self.ipv4_pool.is_none() && self.ipv6_pool.is_none() {
-            return Err("at least one address family is required".into());
+            return Err("请至少填写一个 IPv4 或 IPv6 地址池".into());
         }
         for (pool, v4) in [
             (&self.ipv4_pool, true),
@@ -219,10 +218,10 @@ impl NicPublicationSpec {
                     || pool.address().is_unspecified()
                     || pool.address().is_loopback()
                 {
-                    return Err("invalid network allocation pool".into());
+                    return Err("地址池的 IP 类型或地址无效，不能使用回环、组播或未指定地址".into());
                 }
                 if v4 && pool.length() < 16 || !v4 && pool.length() < 64 {
-                    return Err("network allocation pool is too large".into());
+                    return Err("地址池范围过大，IPv4 前缀长度至少为 16，IPv6 至少为 64".into());
                 }
             }
         }
@@ -230,16 +229,14 @@ impl NicPublicationSpec {
             if address.is_some_and(|ip| {
                 ip.is_ipv4() != v4 || ip.is_unspecified() || ip.is_multicast() || ip.is_loopback()
             }) {
-                return Err("invalid public egress address".into());
+                return Err("共享出口地址无效，请填写对应类型的可用 IPv4 或 IPv6 地址".into());
             }
         }
         if self.address_mode == NicAddressMode::DedicatedNat
             && ((self.ipv4_pool.is_some() != self.public_ipv4_pool.is_some())
                 || (self.ipv6_pool.is_some() != self.public_ipv6_pool.is_some()))
         {
-            return Err(
-                "each dedicated NAT address family requires its public allocation pool".into(),
-            );
+            return Err("一对一映射需要为每个已启用的地址类型填写对应的公网地址池".into());
         }
         for raw in [
             "198.18.0.0/15",
@@ -252,21 +249,21 @@ impl NicPublicationSpec {
                 .expect("fixed network isolation prefix is canonical");
             for pool in [&self.ipv4_pool, &self.ipv6_pool].into_iter().flatten() {
                 if reserved.contains_prefix(pool) || pool.contains_prefix(&reserved) {
-                    return Err(
-                        "allocation pool overlaps managed transit or link-local addresses".into(),
-                    );
+                    return Err("地址池与系统连接网段或链路本地地址重叠，请更换地址池".into());
                 }
             }
         }
         if self.destinations.is_empty() {
-            return Err("outbound networks must be explicitly declared".into());
+            return Err("请填写此出口允许访问的目标 IP／网段".into());
         }
         if self.destinations.len() > MAX_NETWORK_ROUTES
             || self.route_presets.len() > MAX_NETWORK_ROUTES
             || self.dns_suggestions.len() > 4
             || self.grants.len() > 256
         {
-            return Err("network publication exceeds its limits".into());
+            return Err(
+                "目标网段和初始路由最多各 256 条，DNS 建议最多 4 个，授权用户最多 256 个".into(),
+            );
         }
         if self.limits.max_attachments == 0
             || usize::from(self.limits.max_attachments) > MAX_NETWORK_BINDINGS
@@ -279,10 +276,10 @@ impl NicPublicationSpec {
             .flatten()
             .any(|n| n == 0)
         {
-            return Err("invalid network capacity or limits".into());
+            return Err("网卡数量、限速或流量额度无效；填写限额时须大于 0".into());
         }
         if self.transports.is_empty() || self.transports.len() > 2 {
-            return Err("a publication requires Xray or WireGuard transport".into());
+            return Err("请至少启用 Xray 或 WireGuard 中的一种连接方式".into());
         }
         let mut kinds = BTreeSet::new();
         for offer in &self.transports {
@@ -300,7 +297,7 @@ impl NicPublicationSpec {
                 || offer.mtu < 1280
                 || offer.mtu > 1500
             {
-                return Err("invalid transport offer".into());
+                return Err("连接配置无效，请核对端点 IP、端口范围和 MTU（1280–1500）".into());
             }
         }
         let mut owners = BTreeSet::new();
@@ -310,7 +307,7 @@ impl NicPublicationSpec {
                 || !valid_id(&owner.user_id)
                 || !owners.insert((&owner.tenant_id, &owner.user_id))
             {
-                return Err("invalid or duplicate network grant".into());
+                return Err("授权用户无效或重复，请核对用户并移除重复项".into());
             }
         }
         for route in &self.route_presets {
@@ -319,7 +316,9 @@ impl NicPublicationSpec {
                 .iter()
                 .any(|network| network.contains_prefix(route))
             {
-                return Err("initial route exceeds published network access".into());
+                return Err(
+                    "初始路由超出此出口允许访问的目标范围，请调整初始路由或目标网段".into(),
+                );
             }
         }
         Ok(())
@@ -406,7 +405,6 @@ pub struct AllocatedNic {
     pub transport_generation: u64,
     pub mtu: u16,
     pub blocked: bool,
-    #[serde(default)]
     pub quota_exceeded: bool,
     pub limits: NicLimits,
 }
@@ -462,6 +460,18 @@ pub struct ContainerRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<RouteService>,
 }
+impl ContainerRoute {
+    /// Precedence shared by flow matching and the Linux route rule emitters.
+    pub fn precedence(&self, priority: u16) -> impl Ord + use<> {
+        (
+            std::cmp::Reverse(self.destination.length()),
+            self.service.is_none(),
+            priority,
+            self.service
+                .map(|s| s.port_end.saturating_sub(s.port_start)),
+        )
+    }
+}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerRoutes {
     pub revision: u64,
@@ -496,21 +506,24 @@ impl ContainerRoutes {
             || self.priorities.len() > MAX_NETWORK_ROUTES
             || self.dns.len() > 4
         {
-            return Err("container routing configuration exceeds its limits".into());
+            return Err("路由和出口优先级最多各 256 条，DNS 服务器最多 4 个，请减少后重试".into());
         }
         let mut ids = BTreeSet::new();
         for priority in &self.priorities {
             if !valid_id(priority.target.id()) || !ids.insert(&priority.target) {
-                return Err("invalid or duplicate exit priority".into());
+                return Err("出口优先级的目标无效或重复，请为每个出口只保留一项优先级".into());
             }
             if let Some(id) = priority.target.interface_id() {
                 let nic = devices
                     .get(id)
-                    .ok_or("priority references an unmounted NIC")?;
+                    .ok_or("出口优先级引用了未挂载的网卡，请重新选择出口")?;
                 if priority.ipv4.is_some() && nic.ipv4.is_none()
                     || priority.ipv6.is_some() && nic.ipv6.is_none()
                 {
-                    return Err("invalid NIC priority address family".into());
+                    return Err(
+                        "出口优先级的地址类型不可用，请核对该网卡是否分配了 IPv4 或 IPv6 地址"
+                            .into(),
+                    );
                 }
             }
         }
@@ -518,20 +531,25 @@ impl ContainerRoutes {
         let mut services: Vec<(&IpPrefix, u16, RouteService, &RouteTarget)> = Vec::new();
         for route in &self.routes {
             if !valid_id(route.target.id()) {
-                return Err("invalid exit identifier".into());
+                return Err("出口引用无效，请重新选择网卡或线路".into());
             }
             if let Some(id) = route.target.interface_id() {
-                let nic = devices.get(id).ok_or("route references an unmounted NIC")?;
+                let nic = devices
+                    .get(id)
+                    .ok_or("路由引用了未挂载的网卡，请重新选择出口")?;
                 if !nic.supports(&route.destination) {
-                    return Err("route exceeds NIC network access or address family".into());
+                    return Err(
+                        "目标网段超出该出口允许访问的范围，或该网卡没有对应的 IPv4／IPv6 地址"
+                            .into(),
+                    );
                 }
             }
             let priority = self
                 .exit_priority(&route.target, route.destination.is_ipv4())
-                .ok_or("route requires an exit priority for its address family")?;
+                .ok_or("请先为所选出口填写目标地址类型对应的 IPv4 或 IPv6 优先级")?;
             if let Some(service) = route.service {
                 if !service.valid() {
-                    return Err("invalid route protocol or port range".into());
+                    return Err("路由协议或端口范围不正确，请填写 1–65535 的端口，且起始端口不能大于结束端口".into());
                 }
                 if services.iter().any(|(prefix, p, other, target)| {
                     *prefix == &route.destination
@@ -540,7 +558,7 @@ impl ContainerRoutes {
                         && *target != &route.target
                 }) {
                     return Err(
-                        "the same prefix, priority and ports cannot select different exits".into(),
+                        "相同目标网段和优先级下，重叠的协议端口不能指向不同出口，请调整优先级或端口范围".into(),
                     );
                 }
                 services.push((&route.destination, priority, service, &route.target));
@@ -548,7 +566,7 @@ impl ContainerRoutes {
                 selections.insert((&route.destination, priority), &route.target)
             {
                 if previous != &route.target {
-                    return Err("the same prefix and priority cannot select different exits".into());
+                    return Err("相同目标网段和优先级不能指向不同出口，请调整出口优先级".into());
                 }
             }
         }
@@ -557,37 +575,46 @@ impl ContainerRoutes {
             .iter()
             .any(|ip| ip.is_unspecified() || ip.is_multicast() || ip.is_loopback())
         {
-            return Err("invalid container DNS server".into());
+            return Err(
+                "容器 DNS 不能使用回环、组播或未指定地址，请填写容器可访问的 DNS 服务器 IP".into(),
+            );
         }
         Ok(())
     }
-    /// Health never participates in selection: an unavailable selected exit cannot cause fallback.
+    /// Match a new flow against the configured table, not runtime health or management exceptions.
+    /// Cube selects a whole-prefix chain even for other protocols (its classifier then drops
+    /// the packet); bare metal only selects a chain for TCP/UDP in the host OUTPUT policy.
+    pub fn select_route_flow(
+        &self,
+        address: IpAddr,
+        flow: Option<(L4Protocol, u16)>,
+        execution: &ExecutionTarget,
+    ) -> Option<(usize, &ContainerRoute, u16)> {
+        self.routes
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.destination.contains(address))
+            .filter(|(_, r)| match (r.service, flow) {
+                (None, None) => execution.is_cube() || r.target.chain_id().is_none(),
+                (None, Some(_)) => true,
+                (Some(s), Some((protocol, port))) => s.matches(protocol, port),
+                (Some(_), None) => false,
+            })
+            .filter_map(|(index, r)| {
+                self.exit_priority(&r.target, address.is_ipv4())
+                    .map(|p| (index, r, p))
+            })
+            // Equal-ranked overlapping rules can only select the same target. Use the
+            // canonical rule ordering for a deterministic row, including in unsaved edits.
+            .min_by_key(|(_, r, p)| (r.precedence(*p), *r))
+    }
     pub fn select_target_flow(
         &self,
         address: IpAddr,
         flow: Option<(L4Protocol, u16)>,
     ) -> Option<&RouteTarget> {
-        self.routes
-            .iter()
-            .filter(|r| r.destination.contains(address))
-            .filter(|r| match (r.service, flow) {
-                (None, _) => true,
-                (Some(s), Some((protocol, port))) => s.matches(protocol, port),
-                (Some(_), None) => false,
-            })
-            .filter_map(|r| {
-                self.exit_priority(&r.target, address.is_ipv4())
-                    .map(|p| (r, p))
-            })
-            .min_by_key(|(r, p)| {
-                (
-                    std::cmp::Reverse(r.destination.length()),
-                    r.service.is_none(),
-                    *p,
-                    r.service.map(|s| s.port_end - s.port_start),
-                )
-            })
-            .map(|(r, _)| &r.target)
+        self.select_route_flow(address, flow, &ExecutionTarget::Cube)
+            .map(|(_, r, _)| &r.target)
     }
     pub fn select(&self, address: IpAddr) -> Option<&str> {
         self.select_flow(address, None)
@@ -640,6 +667,10 @@ pub struct RoutesWrite {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NicNodeCapabilities {
+    #[serde(default)]
+    pub entry_protocol_rules: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_ports: Vec<u16>,
     pub contract: u32,
     pub transports: Vec<TransportKind>,
     pub consume: bool,
@@ -650,18 +681,13 @@ pub struct NicNodeCapabilities {
     pub xray_certificate_pem: Option<String>,
     pub error: Option<String>,
     /// Agent 能执行入口规则、宿主投递与机器对通道（[`super::ENTRY_CONTRACT`]）。
-    #[serde(default)]
     pub entries: bool,
     /// Agent 能在宿主侧按协议端口执行出口规则（[`ROUTE_SERVICE_CONTRACT`]）。
-    #[serde(default)]
     pub route_service: bool,
     /// L3 forwarding of a host address preserves host replies and transport sockets.
-    #[serde(default)]
     pub entry_host_l3: bool,
     /// Entry IP transport, independently gated from the existing egress NIC transport.
-    #[serde(default)]
     pub entry_xray: bool,
-    #[serde(default)]
     pub entry_phantun: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -714,13 +740,10 @@ pub struct NicHostPort {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NicDesired {
     pub node_id: String,
-    #[serde(default)]
     pub budgets: BTreeMap<String, NicTrafficBudget>,
     pub generation: u64,
     pub bindings: Vec<NicBinding>,
-    #[serde(default)]
     pub fences: Vec<NicResourceFence>,
-    #[serde(default)]
     pub management_networks: Vec<IpPrefix>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

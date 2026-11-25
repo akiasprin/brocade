@@ -30,7 +30,7 @@ impl PgStore {
         id: &str,
     ) -> Result<(String, Target)> {
         let instance = self.cvm_instance(actor, id).await?;
-        require_owner(actor, &instance.tenant_id, &instance.user_id, true)?;
+        require_owner(actor, &instance.tenant_id, instance.user(), true)?;
         let allowed: bool = sqlx::query_scalar(
             "SELECT coalesce((SELECT enabled FROM cvm_terminal_policies WHERE node_id=$1),false)",
         )
@@ -40,7 +40,22 @@ impl PgStore {
         if !allowed {
             return Err(StoreError::Forbidden("该机器的 WebShell 已关闭".into()));
         }
-        let desired = &instance.desired;
+        let mut tx = self.pool.begin().await?;
+        let approved = releases::serving_tx(&mut tx, &instance.node_id)
+            .await?
+            .and_then(|config| config.instances.into_iter().find(|item| item.id == id));
+        tx.commit().await?;
+        let unpublished = instance
+            .revision_id
+            .is_some_and(|revision| revision > instance.published_revision_id.unwrap_or(0));
+        let desired = if unpublished {
+            approved.as_ref().unwrap_or(&instance.desired)
+        } else {
+            &instance.desired
+        };
+        let mut authorization = self.pool.begin().await?;
+        ensure_access_generation(&mut authorization, id, desired.generation).await?;
+        authorization.commit().await?;
         let report = instance
             .report
             .as_ref()

@@ -3,6 +3,7 @@ package finalmask_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync/atomic"
@@ -246,6 +247,113 @@ func TestSalamanderQUICReadBatchDecodesEveryDatagram(t *testing.T) {
 		}
 		if messages[i].NN != 1 || messages[i].OOB[0] != byte(i+1) || messages[i].Flags != i+10 {
 			t.Fatalf("packet %d metadata changed: NN=%d OOB=%x flags=%d", i, messages[i].NN, messages[i].OOB[:messages[i].NN], messages[i].Flags)
+		}
+	}
+}
+
+func TestSalamanderQUICReadMsgUDPDropsOversizedDatagram(t *testing.T) {
+	clientRaw, serverRaw, client, server := wrapSalamanderOOBPair(t)
+	for i, payload := range [][]byte{bytes.Repeat([]byte{0x5a}, 2000), []byte("next-valid-packet")} {
+		if _, _, err := client.WriteMsgUDP(payload, nil, serverRaw.LocalAddr().(*net.UDPAddr)); err != nil {
+			t.Fatal(err)
+		}
+		wire := <-clientRaw.writes
+		serverRaw.reads <- recordedOOBPacket{payload: wire.payload, oob: []byte{byte(i)}, addr: clientRaw.LocalAddr().(*net.UDPAddr)}
+	}
+	buffer, oob := make([]byte, 1452), make([]byte, 16)
+	n, nn, _, addr, err := server.ReadMsgUDP(buffer, oob)
+	if err != nil || !bytes.Equal(buffer[:n], []byte("next-valid-packet")) {
+		t.Fatalf("listener did not continue after oversized datagram: n=%d err=%v", n, err)
+	}
+	if nn != 1 || oob[0] != 1 || addr.String() != clientRaw.LocalAddr().String() {
+		t.Fatal("next valid datagram metadata changed")
+	}
+}
+
+func TestSalamanderQUICReadBatchDropsOversizedDatagrams(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		oversized []bool
+		batchSize int
+	}{
+		{"before-valid", []bool{true, false}, 2},
+		{"after-valid", []bool{false, true}, 2},
+		{"between-valid", []bool{false, true, false}, 3},
+		{"whole-batch", []bool{true, true, false}, 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clientRaw, serverRaw, client, server := wrapSalamanderOOBPair(t)
+			var expected [][]byte
+			var expectedMetadata []byte
+			for i, oversized := range test.oversized {
+				payload := bytes.Repeat([]byte{byte(i + 1)}, 17)
+				if oversized {
+					payload = bytes.Repeat([]byte{0x5a}, 2000)
+				} else {
+					expected = append(expected, payload)
+					expectedMetadata = append(expectedMetadata, byte(i+1))
+				}
+				if _, _, err := client.WriteMsgUDP(payload, nil, serverRaw.LocalAddr().(*net.UDPAddr)); err != nil {
+					t.Fatal(err)
+				}
+				wire := <-clientRaw.writes
+				serverRaw.reads <- recordedOOBPacket{payload: wire.payload, oob: []byte{byte(i + 1)}, flags: i + 1, addr: clientRaw.LocalAddr().(*net.UDPAddr)}
+			}
+			messages := make([]ipv4.Message, test.batchSize)
+			for i := range messages {
+				messages[i].Buffers = [][]byte{make([]byte, 8), make([]byte, 24)}
+				messages[i].OOB = make([]byte, 16)
+			}
+			n, err := server.ReadBatch(messages, 0)
+			if err != nil || n != len(expected) {
+				t.Fatalf("valid datagrams must survive oversized packets in the batch: n=%d want=%d err=%v", n, len(expected), err)
+			}
+			for i := range expected {
+				packet := append(append([]byte{}, messages[i].Buffers[0]...), messages[i].Buffers[1]...)
+				if messages[i].N != len(expected[i]) || !bytes.Equal(packet[:messages[i].N], expected[i]) {
+					t.Fatalf("valid packet %d changed", i)
+				}
+				if messages[i].NN != 1 || messages[i].OOB[0] != expectedMetadata[i] || messages[i].Flags != int(expectedMetadata[i]) || messages[i].Addr.String() != clientRaw.LocalAddr().String() {
+					t.Fatalf("valid packet %d metadata changed after batch compaction", i)
+				}
+			}
+			wantReads := int64(1)
+			if test.name == "whole-batch" {
+				wantReads = 2
+			}
+			if serverRaw.batchReads.Load() != wantReads {
+				t.Fatalf("batch read count=%d want=%d", serverRaw.batchReads.Load(), wantReads)
+			}
+		})
+	}
+}
+
+func TestSalamanderQUICReadsPreserveSocketErrors(t *testing.T) {
+	for _, method := range []string{"ReadMsgUDP", "ReadBatch"} {
+		for _, test := range []struct {
+			name   string
+			packet []byte
+		}{
+			{"empty", nil},
+			{"after-malformed", []byte{1}},
+			{"after-oversized", bytes.Repeat([]byte{0x5a}, 2000)},
+		} {
+			t.Run(method+"/"+test.name, func(t *testing.T) {
+				_, serverRaw, _, server := wrapSalamanderOOBPair(t)
+				if test.packet != nil {
+					serverRaw.reads <- recordedOOBPacket{payload: test.packet, addr: serverRaw.LocalAddr().(*net.UDPAddr)}
+				}
+				close(serverRaw.reads)
+				var err error
+				if method == "ReadMsgUDP" {
+					_, _, _, _, err = server.ReadMsgUDP(make([]byte, 1452), nil)
+				} else {
+					_, err = server.ReadBatch([]ipv4.Message{{Buffers: [][]byte{make([]byte, 1452)}}}, 0)
+				}
+				if !errors.Is(err, io.EOF) {
+					t.Fatalf("%s lost the underlying error: %v", method, err)
+				}
+			})
 		}
 	}
 }

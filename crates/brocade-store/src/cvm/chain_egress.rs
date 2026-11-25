@@ -27,6 +27,27 @@ pub struct CvmChainOption {
     pub rtt_ms: Option<i32>,
 }
 
+fn unsupported_host_reason(caps: &Capabilities) -> &'static str {
+    if caps.host_system.is_some() || caps.baremetal.is_some() {
+        "此物理宿主的线路出口尚未就绪，请管理员更新 Agent 并检查主机网络能力。"
+    } else {
+        "此宿主尚不支持线路出口，请管理员检查并更新宿主组件。"
+    }
+}
+
+fn host_unavailable_reason(host: Option<&CvmHost>) -> Option<&'static str> {
+    let Some(host) = host else {
+        return Some("无法读取容器宿主状态，请管理员检查宿主接入与授权。");
+    };
+    if host.error.is_some() {
+        return Some("宿主容器服务异常，请管理员在「宿主」中查看并处理。");
+    }
+    if !host.fresh {
+        return Some("尚未收到宿主的最新状态，请等待恢复连接后重试。");
+    }
+    (!host.capabilities.chain_egress).then(|| unsupported_host_reason(&host.capabilities))
+}
+
 fn ipv6_supported(snapshot: &brocade_core::model::ModelSnapshot, chain: &str) -> bool {
     use brocade_core::model::Action;
     let mut found = false;
@@ -74,29 +95,30 @@ impl PgStore {
                     .ok_or_else(|| StoreError::NotFound("CVM".into()))
             })
             .transpose()?;
-        let owner = selected.map(|i| CvmOwner {
-            tenant_id: i.tenant_id.clone(),
-            user_id: i.user_id.clone(),
-            name: workspace
-                .owners
-                .iter()
-                .find(|o| o.tenant_id == i.tenant_id && o.user_id == i.user_id)
-                .map(|o| o.name.clone())
-                .unwrap_or_else(|| i.user_id.clone()),
+        let owner = selected.and_then(|i| {
+            i.user_id.as_ref().map(|user| CvmOwner {
+                tenant_id: i.tenant_id.clone(),
+                user_id: user.clone(),
+                name: workspace
+                    .owners
+                    .iter()
+                    .find(|o| o.tenant_id == i.tenant_id && &o.user_id == user)
+                    .map(|o| o.name.clone())
+                    .unwrap_or_else(|| user.clone()),
+            })
         });
-        let supported = selected.is_some_and(|i| {
-            workspace
-                .hosts
-                .iter()
-                .any(|h| h.node_id == i.node_id && h.fresh && h.capabilities.chain_egress)
-        });
-        let reason = (!supported).then(|| {
-            if selected.is_none() {
-                "请选择容器".into()
-            } else {
-                "宿主 Agent 或 Cube 运行栈尚未验证主网卡线路出口".into()
-            }
-        });
+        let reason = match selected {
+            None => Some("请选择容器"),
+            Some(instance) if instance.user_id.is_none() => Some("请先授权容器使用者，再选择线路"),
+            Some(instance) => host_unavailable_reason(
+                workspace
+                    .hosts
+                    .iter()
+                    .find(|host| host.node_id == instance.node_id),
+            ),
+        };
+        let supported = reason.is_none();
+        let reason = reason.map(str::to_owned);
         let snapshot = crate::materialize::load_snapshot(&self.pool, None).await?;
         let mut connection = self.pool.acquire().await?;
         let targets = if let Some(o) = &owner {
@@ -249,7 +271,7 @@ pub(super) async fn freeze_clients(
             owners.insert(key.clone(), targets);
         }
         for chain in instance.spec.routing.chain_ids() {
-            let client = if let Some(target) = owners[&key]
+            let mut client = if let Some(target) = owners[&key]
                 .iter()
                 .find(|t| t.chain_id == chain && t.chain_egress_reason.is_none())
             {
@@ -283,6 +305,7 @@ pub(super) async fn freeze_clients(
                     "容器使用者没有这条线路的有效接入授权".into(),
                 ));
             };
+            client.host_system = !instance.spec.execution.is_cube();
             if !marks.insert(client.binding.mark) {
                 return Err(StoreError::Conflict(
                     "线路出口执行标识发生冲突，请调整所选线路".into(),
@@ -303,15 +326,16 @@ pub(super) async fn validate_selection(
     if routing.chain_ids().is_empty() {
         return Ok(());
     }
-    let (node, tenant, user): (String, String, String) =
-        sqlx::query_as("SELECT node_id,tenant_id,user_id FROM cvm_instances WHERE id=$1")
-            .bind(id)
-            .fetch_one(&mut **tx)
-            .await?;
+    let (node, tenant, user): (String, String, String) = sqlx::query_as(
+        "SELECT node_id,tenant_id,coalesce(user_id,'') FROM cvm_instances WHERE id=$1",
+    )
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await?;
     let caps = host_locked(tx, &node, false).await?;
     if !caps.chain_egress {
         return Err(StoreError::Unsupported(
-            "宿主 Agent 或 Cube 运行栈尚不支持主网卡线路出口".into(),
+            unsupported_host_reason(&caps).into(),
         ));
     }
     let snapshot = crate::materialize::load_snapshot_tx(tx, None).await?;

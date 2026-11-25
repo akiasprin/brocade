@@ -3,7 +3,8 @@ use crate::{screen::Screen, *};
 use async_trait::async_trait;
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs::{File, OpenOptions},
+    fs::{File, Metadata, OpenOptions},
+    io::{self, BufRead, BufReader},
     os::{
         fd::AsRawFd,
         unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -47,6 +48,10 @@ pub trait Guest: Send + Sync + 'static {
 
 pub struct Admission(File);
 impl Admission {
+    fn slot_path(root: &Path, index: usize) -> PathBuf {
+        root.join(format!("slot-{index}"))
+    }
+
     fn acquire(root: &Path) -> Result<Self, String> {
         for index in 0..MAX_SESSIONS {
             let file = OpenOptions::new()
@@ -56,14 +61,10 @@ impl Admission {
                 .truncate(false)
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(root.join(format!("slot-{index}")))
+                .open(Self::slot_path(root, index))
                 .map_err(|e| e.to_string())?;
             let metadata = file.metadata().map_err(|e| e.to_string())?;
-            // SAFETY: geteuid has no preconditions.
-            if !metadata.is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.mode() & 0o077 != 0
-            {
+            if !metadata.is_file() || !is_private(&metadata) {
                 return Err("unsafe terminal slot".into());
             }
             // SAFETY: file owns a live descriptor. The lock lasts until this Slot is dropped.
@@ -84,6 +85,87 @@ impl Drop for Admission {
         unsafe {
             libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
         }
+    }
+}
+
+fn is_private(metadata: &Metadata) -> bool {
+    // SAFETY: geteuid has no preconditions.
+    metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0
+}
+
+/// Count node-wide admission slots held by living terminal processes.
+/// Reading the kernel's lock table leaves the slots available to concurrent opens.
+#[cfg(target_os = "linux")]
+pub fn occupied_slots(root: &Path) -> io::Result<usize> {
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() && is_private(&metadata) => {}
+        Ok(_) => return Err(io::Error::other("unsafe terminal directory")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    }
+    let mut slots = std::collections::BTreeSet::new();
+    for index in 0..MAX_SESSIONS {
+        let metadata = match std::fs::symlink_metadata(Admission::slot_path(root, index)) {
+            Ok(metadata) if metadata.is_file() && is_private(&metadata) => metadata,
+            Ok(_) => return Err(io::Error::other("unsafe terminal slot")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        // SAFETY: Linux's device-number accessors accept every dev_t value.
+        // Older libc versions declare them unsafe.
+        #[allow(unused_unsafe)]
+        let (major, minor) = unsafe { (libc::major(metadata.dev()), libc::minor(metadata.dev())) };
+        slots.insert(format!("{major:02x}:{minor:02x}:{}", metadata.ino()));
+    }
+    if slots.is_empty() {
+        return Ok(0);
+    }
+    let mut occupied = 0;
+    // This procfs table is scoped to the node's PID namespace, where Agent and
+    // CubeShim run. Waiting locks have an extra `->` column and do not count.
+    for line in BufReader::new(File::open("/proc/locks")?).lines() {
+        let line = line?;
+        let mut fields = line.split_ascii_whitespace().skip(1);
+        if fields.next() == Some("FLOCK")
+            && fields.next() == Some("ADVISORY")
+            && fields.next() == Some("WRITE")
+            && fields.nth(1).is_some_and(|identity| slots.remove(identity))
+        {
+            occupied += 1;
+            if slots.is_empty() {
+                break;
+            }
+        }
+    }
+    Ok(occupied)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn occupancy_tracks_locks_without_reserving_slots() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        assert_eq!(occupied_slots(&root).unwrap(), 0);
+        private_directory(&root).unwrap();
+        let first = Admission::acquire(&root).unwrap();
+        let second = Admission::acquire(&root).unwrap();
+        assert_eq!(occupied_slots(&root).unwrap(), 2);
+        drop(first);
+        assert_eq!(occupied_slots(&root).unwrap(), 1);
+        drop(second);
+        assert_eq!(occupied_slots(&root).unwrap(), 0);
+    }
+
+    #[test]
+    fn occupancy_rejects_linked_slot_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sessions");
+        private_directory(&root).unwrap();
+        std::os::unix::fs::symlink(&root, Admission::slot_path(&root, 0)).unwrap();
+        assert!(occupied_slots(&root).is_err());
     }
 }
 

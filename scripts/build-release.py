@@ -191,6 +191,8 @@ def frontend(root, state, env, timer):
 
 
 def agent_wrappers(state, zig):
+    # Cargo links native objects with rust-lld, without Zig's UBSan runtime.
+    # AWS-LC's entropy sources deliberately use -O0 even in release builds.
     directory = state.parent / 'brocade-agent-build'
     directory.mkdir(parents=True, exist_ok=True)
     paths = {}
@@ -209,7 +211,7 @@ while [ "$i" -lt "$n" ]; do
   case "$argument" in --target=*|-nostdlibinc) continue ;; esac
   set -- "$@" "$argument"
 done
-exec "{zig}" cc -target {target} "$@"
+exec "{zig}" cc -fno-sanitize=undefined -target {target} "$@"
 ''',
             ar: f'''#!/bin/sh
 set -eu

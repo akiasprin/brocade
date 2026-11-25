@@ -18,7 +18,9 @@ func TestAttachmentIdentityAndAddressesSurviveRestart(t *testing.T) {
 		t.Fatal(e)
 	}
 	before, _ := json.Marshal(r.NICs)
-	manager, e := New(Config{StateDir: s.root, VMMRoot: "/run/vc/vm", MaxInterfaces: 3}, nil)
+	cfg := managerConfig(t)
+	cfg.StateDir = s.root
+	manager, e := New(cfg, nil)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -35,7 +37,7 @@ func TestAttachmentIdentityAndAddressesSurviveRestart(t *testing.T) {
 	if e := s.persist(r); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := New(Config{StateDir: s.root, VMMRoot: "/run/vc/vm", MaxInterfaces: 3}, nil); e == nil {
+	if _, e := New(cfg, nil); e == nil {
 		t.Fatal("corrupt TAP binding was accepted")
 	}
 }

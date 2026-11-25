@@ -1,4 +1,4 @@
-import { useMemo, useState, type CSSProperties, type ReactNode } from 'react';
+import { useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from 'react';
 import { useQuery } from '@tanstack/react-query';
 
 import {
@@ -24,20 +24,55 @@ import { HEAT_STEPS, heatOf, type HeatKind } from '../ui/traffic-heat';
 /* 用量页的「机队实时流量」：每台机器每秒上报的用户速率拼成「用户 × 机器」矩阵。
  * 左侧读数栏与月度页签同一骨架；右侧热力矩阵按地区成组排开整个机队，一格只表达四种事实：
  * 有速率（按固定十进档上色）、已采集且为 0、授权了但这台机器给不出当前读数、未授权（空白）。
- * 机器不多时列宽足够，格子直接写读数；窄屏改为按用户的流向列表。 */
+ * 格子只有两种固定尺寸：读数格整张表放得下就用读数格（按档位染色的格内写读数），放不下用点阵；
+ * 都不为铺满空间而拉伸。手机宽度同样是矩阵，行头收窄、合计写在名字下面。 */
 
 const MIN_FRESH_MILLIS = 10_000;
-/** 不超过这么多台机器时列宽放得下读数，格子写出数值，列名横排。 */
-const WIDE_MACHINES = 6;
 /** 超过这么多位用户时只展开近期有流量的行，其余收起成一行说明。 */
 const CROWD_USERS = 24;
 /** 最后一次有流量之后仍算活跃的时长：突发流量之间的空档不让行在列表里进出。 */
 const ACTIVE_HOLD_MILLIS = 30_000;
-/** 窄屏流向列表每位用户列出的机器数。 */
-const FLOW_PREVIEW = 3;
-/** 窄屏空闲用户名单最多写出的名字数。 */
-const IDLE_NAMES = 12;
-const CONNECTING_NAMES = 4;
+/** 读数格列宽；与样式表 `.flt-board.reading` 的 `--flt-col` 一致。 */
+const READING_COLUMN = 104;
+/** 用户列与合计列宽；与样式表 `.flt-board` 的同名变量一致。 */
+const USER_COLUMN = 148;
+const COMPACT_USER_COLUMN = 108;
+const SUM_COLUMN = 92;
+/** 纸面内容不超过这个宽度时按手机排版；与样式表的 680px 容器断点一致。 */
+const COMPACT_PANEL = 680;
+
+export interface FleetMatrixLayout {
+  /** 格内写读数；否则画 24px 点阵。 */
+  reading: boolean;
+  userWidth: number;
+  /** 0 表示不画合计列：只有一台机器时它与那一格重复，手机上合计写在名字下面。 */
+  sumWidth: number;
+}
+
+/** 只看机器数和可用宽度，不看速率：读数每秒变化，格子大小不能跟着跳。宽度未知（尚未排版）时按点阵。 */
+export function fleetMatrixLayout(machines: number, available: number | null, compact: boolean): FleetMatrixLayout {
+  const userWidth = compact ? COMPACT_USER_COLUMN : USER_COLUMN;
+  const sumWidth = compact || machines <= 1 ? 0 : SUM_COLUMN;
+  const reading = available !== null && available > 0 && userWidth + machines * READING_COLUMN + sumWidth <= available;
+  return { reading, userWidth, sumWidth };
+}
+
+/** 元素内容宽度；在绘制前测量，首帧就按实际宽度排版。 */
+function useClientWidth<T extends HTMLElement>(): [RefObject<T | null>, number | null] {
+  const ref = useRef<T>(null);
+  const [width, setWidth] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    const measure = () => setWidth(element.clientWidth);
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  return [ref, width];
+}
 
 type CellState = 'rate' | 'idle' | 'pending' | 'unknown' | 'not-entitled';
 
@@ -372,6 +407,12 @@ function cellText(cell: FleetTrafficCell, node: FleetTrafficMatrixNode) {
   return `${pairText(cell.down, cell.up)}${cell.partial ? ` · ${PARTIAL_TEXT}` : ''}`;
 }
 
+/** 读数格里给不出读数时的短标签：它不是 0，不能只靠颜色区分。完整原因在悬停说明与读屏文字里。 */
+function unknownLabel(node: FleetTrafficMatrixNode) {
+  if (node.phase === 'pending') return '等待速率';
+  return reporting(node) ? '无法确认' : '无读数';
+}
+
 function topFlow(matrix: FleetTrafficMatrix) {
   let best: { user: FleetTrafficMatrixUser; node: FleetTrafficMatrixNode; cell: FleetTrafficCell } | null = null;
   for (const user of matrix.users) {
@@ -479,6 +520,8 @@ function FleetLedger({ matrix, status }: { matrix: FleetTrafficMatrix; status: R
   const totalOf = (value: { down: number; up: number }) => rateText(value.down + value.up);
   const nicPair = Math.max(matrix.nicRx, matrix.nicTx);
   const missing = matrix.nodes.filter(node => !reporting(node)).map(node => node.name);
+  // 没有任何机器给出当前读数时速率未知：写「—」，不能写成 0。
+  const waiting = matrix.currentNodes === 0;
 
   return (
     <section className="usage-ledger flt-ledger" aria-label="机队当前速率">
@@ -487,7 +530,13 @@ function FleetLedger({ matrix, status }: { matrix: FleetTrafficMatrix; status: R
           最近速率合计
         </span>
         <strong className="usage-hero-value">
-          {total > 0 ? hero.number : '0'} <small>{hero.unit}</small>
+          {waiting ? (
+            '—'
+          ) : (
+            <>
+              {total > 0 ? hero.number : '0'} <small>{hero.unit}</small>
+            </>
+          )}
         </strong>
         <span className="usage-period rut-hero-sub">
           <b>{matrix.activeUsers}</b> 位活跃 · <b>{matrix.entitlementsKnown ? matrix.users.length : '—'}</b> 位已授权
@@ -505,7 +554,7 @@ function FleetLedger({ matrix, status }: { matrix: FleetTrafficMatrix; status: R
               <i aria-hidden="true" />
               下行
             </dt>
-            <dd>{rateText(down, pair)}</dd>
+            <dd>{waiting ? '—' : rateText(down, pair)}</dd>
             <dd className="usage-share">{total > 0 ? shareOf(down, total) : ''}</dd>
           </div>
           <div className="up">
@@ -513,7 +562,7 @@ function FleetLedger({ matrix, status }: { matrix: FleetTrafficMatrix; status: R
               <i aria-hidden="true" />
               上行
             </dt>
-            <dd>{rateText(up, pair)}</dd>
+            <dd>{waiting ? '—' : rateText(up, pair)}</dd>
             <dd className="usage-share">{total > 0 ? shareOf(up, total) : ''}</dd>
           </div>
         </dl>
@@ -571,10 +620,18 @@ function FleetLedger({ matrix, status }: { matrix: FleetTrafficMatrix; status: R
 
 /* ── 热力矩阵 ── */
 
-function HeatKey({ matrix, rows }: { matrix: FleetTrafficMatrix; rows: readonly FleetTrafficMatrixUser[] }) {
+function HeatKey({
+  matrix,
+  rows,
+  reading,
+}: {
+  matrix: FleetTrafficMatrix;
+  rows: readonly FleetTrafficMatrixUser[];
+  reading: boolean;
+}) {
   const kinds = new Set(rows.flatMap(user => [...user.cells.values()].map(cellKind)));
   return (
-    <span className="flt-key" aria-hidden="true">
+    <span className={`flt-key${reading ? ' reading' : ''}`} aria-hidden="true">
       <span className="flt-key-item">
         <i className="idle" />
         空闲
@@ -602,6 +659,16 @@ function HeatKey({ matrix, rows }: { matrix: FleetTrafficMatrix; rows: readonly 
   );
 }
 
+/** 读数格里的速率：数值与单位分开排版，读屏另有完整的下行 / 上行文字。 */
+function ReadingValue({ value }: { value: number }) {
+  const reading = observeBpsReadingParts(value * 8);
+  return (
+    <>
+      <b>{reading.number}</b> <small>{reading.unit}</small>
+    </>
+  );
+}
+
 function FleetBoard({
   matrix,
   rows,
@@ -609,6 +676,7 @@ function FleetBoard({
   expanded,
   onExpand,
   allowDetails,
+  compact,
   onOpenNode,
 }: {
   matrix: FleetTrafficMatrix;
@@ -617,16 +685,23 @@ function FleetBoard({
   expanded: boolean;
   onExpand: (value: boolean) => void;
   allowDetails: boolean;
+  compact: boolean;
   onOpenNode: (node: FleetTrafficMatrixNode) => void;
 }) {
   const [focus, setFocus] = useState<BoardFocus | null>(null);
-  const wide = matrix.nodes.length <= WIDE_MACHINES;
-  // The first machine of each region carries the flag; every later region also opens with a gap.
+  const [scrollRef, available] = useClientWidth<HTMLDivElement>();
+  const layout = fleetMatrixLayout(matrix.nodes.length, available, compact);
+  const reading = layout.reading;
+  const showSum = layout.sumWidth > 0;
+  // 只有一行时，合计行与这一行重复。
+  const showTotals = rows.length !== 1;
+  // The first machine of each region carries the flag; in the dot matrix every later region also
+  // opens with a gap. Reading columns are wide enough that the flags alone mark the groups.
   const regionStarts = matrix.nodes
     .filter((node, index) => index === 0 || node.country !== matrix.nodes[index - 1].country)
     .map(node => node.id);
   const firstOfRegion = new Set(regionStarts);
-  const groupStart = new Set(regionStarts.slice(1));
+  const groupStart = new Set(reading ? [] : regionStarts.slice(1));
   const hotUser = focus && focus.kind !== 'node' ? focus.user : null;
   const hotNode = focus && focus.kind !== 'user' ? focus.node : null;
   const focusedUser = hotUser ? matrix.users.find(user => user.key === hotUser) : undefined;
@@ -644,9 +719,48 @@ function FleetBoard({
   const style = {
     '--flt-columns': matrix.nodes.length,
     '--flt-gaps': groupStart.size,
+    '--flt-user-w': `${layout.userWidth}px`,
+    '--flt-sum-w': `${layout.sumWidth}px`,
   } as CSSProperties;
   const columnClass = (node: FleetTrafficMatrixNode) =>
     `${groupStart.has(node.id) ? ' g' : ''}${hotNode === node.id ? ' hot' : ''}`;
+  const userSum = (user: FleetTrafficMatrixUser) =>
+    user.down + user.up > 0
+      ? rateText(user.down + user.up)
+      : !matrix.entitlementsKnown || (user.unknown === user.entitled && user.entitled > 0)
+        ? '—'
+        : '0';
+
+  /* 点阵只画色块。读数格整格按档位染色：有速率写读数，空闲不写字（悬停与读屏给出说明），
+   * 给不出读数时写短标签，未授权与授权未知留白。 */
+  const cellMark = (cell: FleetTrafficCell, node: FleetTrafficMatrixNode, focused: boolean) => {
+    const kind = cellKind(cell);
+    const className = `flt-cell ${kind}${cell.partial ? ' partial' : ''}${focused ? ' focus' : ''}`;
+    if (!reading) return <span className={className} />;
+    const content =
+      kind === 'unknown' ? (
+        unknownLabel(node)
+      ) : kind === 'na' || kind === 'pending' || kind === 'idle' ? null : (
+        <ReadingValue value={cell.down + cell.up} />
+      );
+    return (
+      <span className={className} title={kind === 'na' || kind === 'pending' ? undefined : cellText(cell, node)}>
+        {content}
+      </span>
+    );
+  };
+  const totalMark = (node: FleetTrafficMatrixNode) => {
+    const total = matrix.nodeTotals.get(node.id)!;
+    const kind: CellKind = reporting(node) ? heatOf(total.down + total.up) : 'unknown';
+    if (!reading) return <span className={`flt-cell ${kind}`} />;
+    if (kind === 'unknown') return <span className="flt-total zero">—</span>;
+    if (kind === 'idle') return <span className="flt-total zero">0</span>;
+    return (
+      <span className="flt-total">
+        <ReadingValue value={total.down + total.up} />
+      </span>
+    );
+  };
 
   const pick = (target: EventTarget | null) => {
     if (!(target instanceof Element)) return;
@@ -664,14 +778,14 @@ function FleetBoard({
 
   return (
     <section
-      className={`flt-board${wide ? ' wide' : ''}${matrix.entitlementsKnown ? '' : ' pending'}`}
+      className={`flt-board${reading ? ' reading' : ''}${compact ? ' compact' : ''}${matrix.entitlementsKnown ? '' : ' pending'}`}
+      style={style}
       aria-label="用户与机器的当前速率"
       aria-busy={matrix.entitlementsKnown ? undefined : true}
     >
-      <div className="flt-scroll">
+      <div className="flt-scroll" ref={scrollRef}>
         <table
           className="flt-grid"
-          style={style}
           onPointerOver={event => pick(event.target)}
           onPointerLeave={event => {
             if (event.pointerType !== 'touch') setFocus(null);
@@ -685,7 +799,7 @@ function FleetBoard({
             {matrix.nodes.map(node => (
               <col key={node.id} className={`flt-col-node${groupStart.has(node.id) ? ' g' : ''}`} />
             ))}
-            <col className="flt-col-sum" />
+            {showSum && <col className="flt-col-sum" />}
           </colgroup>
           <thead>
             <tr>
@@ -703,7 +817,7 @@ function FleetBoard({
                       litNodes.has(node.id) ? ' lit' : ''
                     }`}
                   >
-                    {firstOfRegion.has(node.id) && node.country && (
+                    {(reading || firstOfRegion.has(node.id)) && node.country && (
                       <span className="flt-mflag">
                         <RegionFlag code={node.country} square />
                       </span>
@@ -729,14 +843,23 @@ function FleetBoard({
                   </th>
                 );
               })}
-              <th className="flt-sum" scope="col">
-                合计
-              </th>
+              {showSum && (
+                <th className="flt-sum" scope="col">
+                  合计
+                </th>
+              )}
             </tr>
           </thead>
           <tbody>
             {rows.map(user => {
-              const total = user.down + user.up;
+              const sum = userSum(user);
+              const identity = (
+                <>
+                  <GeneratedUserAvatar id={user.userId} variant="mini" />
+                  <span className="flt-uname">{user.userId}</span>
+                  {compact && <small className={`flt-utotal${sum === '0' ? ' zero' : ''}`}>{sum}</small>}
+                </>
+              );
               return (
                 <tr
                   key={user.key}
@@ -753,19 +876,16 @@ function FleetBoard({
                         onBlur={() => release({ kind: 'user', user: user.key })}
                         onClick={() => navigate('users', { p: 'user', id: user.userId })}
                       >
-                        <GeneratedUserAvatar id={user.userId} variant="mini" />
-                        <span className="flt-uname">{user.userId}</span>
+                        {identity}
                       </button>
                     ) : (
                       <span className="flt-ubtn static" title={user.userId}>
-                        <GeneratedUserAvatar id={user.userId} variant="mini" />
-                        <span className="flt-uname">{user.userId}</span>
+                        {identity}
                       </span>
                     )}
                   </th>
                   {matrix.nodes.map(node => {
                     const cell = user.cells.get(node.id)!;
-                    const kind = cellKind(cell);
                     const focused = focus?.kind === 'cell' && hotUser === user.key && hotNode === node.id;
                     return (
                       <td key={node.id} data-node={node.id} className={`flt-c${columnClass(node)}`}>
@@ -779,216 +899,75 @@ function FleetBoard({
                             onBlur={() => release({ kind: 'cell', user: user.key, node: node.id })}
                             onClick={() => onOpenNode(node)}
                           >
-                            <i
-                              className={`flt-cell ${kind}${cell.partial ? ' partial' : ''}${focused ? ' focus' : ''}`}
-                            />
-                            {wide && kind !== 'na' && kind !== 'pending' && (
-                              <span className="flt-cv" aria-hidden="true">
-                                {kind === 'unknown' ? '—' : rateText(cell.down + cell.up)}
-                              </span>
-                            )}
+                            {cellMark(cell, node, focused)}
                           </button>
                         ) : (
-                          <span className="flt-cbox">
-                            <i
-                              className={`flt-cell ${kind}${cell.partial ? ' partial' : ''}${focused ? ' focus' : ''}`}
-                            />
-                            {wide && kind !== 'na' && kind !== 'pending' && (
-                              <span className="flt-cv" aria-hidden="true">
-                                {kind === 'unknown' ? '—' : rateText(cell.down + cell.up)}
-                              </span>
-                            )}
-                          </span>
+                          <span className="flt-cbox">{cellMark(cell, node, focused)}</span>
                         )}
                         <span className="flt-sr">{cellText(cell, node)}</span>
                       </td>
                     );
                   })}
-                  <td className={`flt-sum${total > 0 ? '' : ' zero'}`}>
-                    {total > 0
-                      ? rateText(total)
-                      : !matrix.entitlementsKnown || (user.unknown === user.entitled && user.entitled > 0)
-                        ? '—'
-                        : '0'}
-                  </td>
+                  {showSum && <td className={`flt-sum${sum === '0' || sum === '—' ? ' zero' : ''}`}>{sum}</td>}
                 </tr>
               );
             })}
           </tbody>
-          <tfoot>
-            <tr>
-              <th scope="row" className="flt-uhead flt-foot-label">
-                机器合计
-              </th>
-              {matrix.nodes.map(node => {
-                const total = matrix.nodeTotals.get(node.id)!;
-                const kind: CellKind = reporting(node) ? heatOf(total.down + total.up) : 'unknown';
-                return (
-                  <td key={node.id} data-node={node.id} className={`flt-c${columnClass(node)}`}>
-                    {allowDetails ? (
-                      <button
-                        type="button"
-                        className="flt-cbox flt-machine-open"
-                        aria-label={`${node.name} 机器合计：${
-                          reporting(node) ? pairText(total.down, total.up) : (machineIssue(node) ?? '没有当前读数')
-                        }，查看机器用量`}
-                        aria-haspopup="dialog"
-                        onFocus={() => setFocus({ kind: 'node', node: node.id })}
-                        onBlur={() => release({ kind: 'node', node: node.id })}
-                        onClick={() => onOpenNode(node)}
-                      >
-                        <i className={`flt-cell ${kind}`} />
-                        {wide && (
-                          <span className="flt-cv" aria-hidden="true">
-                            {kind === 'unknown' ? '—' : rateText(total.down + total.up)}
-                          </span>
-                        )}
-                      </button>
-                    ) : (
-                      <span className="flt-cbox">
-                        <i className={`flt-cell ${kind}`} />
-                        {wide && (
-                          <span className="flt-cv" aria-hidden="true">
-                            {kind === 'unknown' ? '—' : rateText(total.down + total.up)}
-                          </span>
-                        )}
-                      </span>
-                    )}
-                    <span className="flt-sr">
-                      {reporting(node) ? pairText(total.down, total.up) : (machineIssue(node) ?? '没有当前读数')}
-                    </span>
-                  </td>
-                );
-              })}
-              <td className="flt-sum">{rateText(matrix.userDown + matrix.userUp)}</td>
-            </tr>
-          </tfoot>
+          {showTotals && (
+            <tfoot>
+              <tr>
+                <th scope="row" className="flt-uhead flt-foot-label">
+                  机器合计
+                </th>
+                {matrix.nodes.map(node => {
+                  const total = matrix.nodeTotals.get(node.id)!;
+                  const said = reporting(node)
+                    ? pairText(total.down, total.up)
+                    : (machineIssue(node) ?? '没有当前读数');
+                  return (
+                    <td key={node.id} data-node={node.id} className={`flt-c${columnClass(node)}`}>
+                      {allowDetails ? (
+                        <button
+                          type="button"
+                          className="flt-cbox flt-machine-open"
+                          aria-label={`${node.name} 机器合计：${said}，查看机器用量`}
+                          aria-haspopup="dialog"
+                          onFocus={() => setFocus({ kind: 'node', node: node.id })}
+                          onBlur={() => release({ kind: 'node', node: node.id })}
+                          onClick={() => onOpenNode(node)}
+                        >
+                          {totalMark(node)}
+                        </button>
+                      ) : (
+                        <span className="flt-cbox">{totalMark(node)}</span>
+                      )}
+                      <span className="flt-sr">{said}</span>
+                    </td>
+                  );
+                })}
+                {showSum && <td className="flt-sum">{rateText(matrix.userDown + matrix.userUp)}</td>}
+              </tr>
+            </tfoot>
+          )}
         </table>
       </div>
-      {(hidden > 0 || expanded) && (
-        <div className="flt-fold">
-          {rows.length === 0 && <span>当前没有活跃用户</span>}
-          <button className="btn text sm" type="button" aria-expanded={expanded} onClick={() => onExpand(!expanded)}>
-            {expanded ? '只看活跃用户' : `其余 ${hidden} 位当前空闲 · 全部显示`}
-          </button>
-        </div>
-      )}
-      <footer className="flt-foot">
-        <p className="flt-readout">
-          <Readout matrix={matrix} focus={focus} />
-        </p>
-        <HeatKey matrix={matrix} rows={rows} />
-      </footer>
-    </section>
-  );
-}
-
-/* ── 窄屏：按用户的流向列表 ── */
-
-function FleetList({
-  matrix,
-  rows,
-  idle,
-  allowDetails,
-}: {
-  matrix: FleetTrafficMatrix;
-  rows: readonly FleetTrafficMatrixUser[];
-  idle: readonly FleetTrafficMatrixUser[];
-  allowDetails: boolean;
-}) {
-  const connecting = matrix.nodes.filter(node => node.phase === 'pending');
-  const issues = matrix.nodes.filter(node => node.phase !== 'pending' && machineIssue(node) !== null);
-  return (
-    <section className="flt-list" aria-label="按用户的当前速率">
-      {rows.length === 0 ? (
-        <p className="flt-list-empty">{emptyTrafficText(matrix)}</p>
-      ) : (
-        <ul className="flt-flows">
-          {rows.map(user => {
-            const total = user.down + user.up;
-            const flows = matrix.nodes
-              .map(node => ({ node, cell: user.cells.get(node.id)! }))
-              .filter(({ cell }) => cell.state === 'rate' && cell.down + cell.up > 0)
-              .sort((left, right) => right.cell.down + right.cell.up - (left.cell.down + left.cell.up));
-            return (
-              <li key={user.key}>
-                {allowDetails ? (
-                  <button
-                    type="button"
-                    className="flt-flow"
-                    title={user.userId}
-                    onClick={() => navigate('users', { p: 'user', id: user.userId })}
-                  >
-                    <GeneratedUserAvatar id={user.userId} variant="cell" />
-                    <span className="flt-flow-who">
-                      <b>{user.userId}</b>
-                    </span>
-                    <span className={`flt-flow-total${total > 0 ? '' : ' zero'}`}>
-                      {total > 0 ? rateText(total) : '空闲'}
-                    </span>
-                    <span className="flt-flow-nodes">
-                      {flows.length === 0
-                        ? '当前没有流量'
-                        : flows
-                            .slice(0, FLOW_PREVIEW)
-                            .map(({ node, cell }) => `${node.name} ${rateText(cell.down + cell.up)}`)
-                            .join(' · ') +
-                          (flows.length > FLOW_PREVIEW ? ` · 另 ${flows.length - FLOW_PREVIEW} 台` : '')}
-                    </span>
-                  </button>
-                ) : (
-                  <div className="flt-flow static" title={user.userId}>
-                    <GeneratedUserAvatar id={user.userId} variant="cell" />
-                    <span className="flt-flow-who">
-                      <b>{user.userId}</b>
-                    </span>
-                    <span className={`flt-flow-total${total > 0 ? '' : ' zero'}`}>
-                      {total > 0 ? rateText(total) : '空闲'}
-                    </span>
-                    <span className="flt-flow-nodes">
-                      {flows.length === 0
-                        ? '当前没有流量'
-                        : flows
-                            .slice(0, FLOW_PREVIEW)
-                            .map(({ node, cell }) => `${node.name} ${rateText(cell.down + cell.up)}`)
-                            .join(' · ') +
-                          (flows.length > FLOW_PREVIEW ? ` · 另 ${flows.length - FLOW_PREVIEW} 台` : '')}
-                    </span>
-                  </div>
-                )}
-              </li>
-            );
-          })}
-        </ul>
-      )}
-      {idle.length > 0 && (
-        <p className="flt-list-rest">
-          <b>空闲 {idle.length} 位</b>
-          {idle
-            .slice(0, IDLE_NAMES)
-            .map(user => user.userId)
-            .join('、')}
-          {idle.length > IDLE_NAMES ? ' 等' : ''}
-        </p>
-      )}
-      {connecting.length > 0 && (
-        <p className="flt-list-rest">
-          <b>连接中：</b>
-          <span title={connecting.map(node => node.name).join('、')}>
-            {connecting
-              .slice(0, CONNECTING_NAMES)
-              .map(node => node.name)
-              .join('、')}
-            {connecting.length > CONNECTING_NAMES ? ` 等 ${connecting.length} 台` : ''}
-          </span>
-        </p>
-      )}
-      {issues.length > 0 && (
-        <p className="flt-list-rest">
-          <b>读数不完整 {issues.length} 台</b>
-          {issues.map(node => `${node.name}（${machineIssue(node)}）`).join('、')}
-        </p>
-      )}
+      {/* 读数行、图例和折叠行与表格同宽：表格不铺满时，图例不被推到纸面最右侧。 */}
+      <div className="flt-under">
+        {(hidden > 0 || expanded) && (
+          <div className="flt-fold">
+            {rows.length === 0 && <span>当前没有活跃用户</span>}
+            <button className="btn text sm" type="button" aria-expanded={expanded} onClick={() => onExpand(!expanded)}>
+              {expanded ? '只看活跃用户' : `其余 ${hidden} 位当前空闲 · 全部显示`}
+            </button>
+          </div>
+        )}
+        <footer className="flt-foot">
+          <p className="flt-readout">
+            <Readout matrix={matrix} focus={focus} />
+          </p>
+          <HeatKey matrix={matrix} rows={rows} reading={reading} />
+        </footer>
+      </div>
     </section>
   );
 }
@@ -1024,38 +1003,30 @@ function FleetCockpit({
   onOpenNode: (node: FleetTrafficMatrixNode) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [cockpitRef, panelWidth] = useClientWidth<HTMLDivElement>();
   const seen = useLastActive(matrix, now);
   const recent = (user: FleetTrafficMatrixUser) =>
     user.down + user.up > 0 || now - (seen.get(user.key) ?? Number.NEGATIVE_INFINITY) <= ACTIVE_HOLD_MILLIS;
   const crowd = matrix.entitlementsKnown && matrix.users.length > CROWD_USERS;
   const boardRows = crowd && !expanded ? matrix.users.filter(recent) : matrix.users;
-  const listRows = matrix.users.filter(recent);
+  const compact = panelWidth !== null && panelWidth > 0 && panelWidth <= COMPACT_PANEL;
 
   return (
-    <div className="flt-cockpit">
+    <div className="flt-cockpit" ref={cockpitRef}>
       <FleetLedger matrix={matrix} status={status} />
       {matrix.entitlementsKnown && matrix.users.length === 0 ? (
         <p className="flt-empty">尚无用户授权到这些机器</p>
       ) : (
-        <>
-          <FleetBoard
-            matrix={matrix}
-            rows={boardRows}
-            hidden={matrix.users.length - boardRows.length}
-            expanded={expanded}
-            onExpand={setExpanded}
-            allowDetails={allowMachineDetails}
-            onOpenNode={onOpenNode}
-          />
-          {matrix.entitlementsKnown && (
-            <FleetList
-              matrix={matrix}
-              rows={listRows}
-              idle={matrix.users.filter(user => !recent(user) && user.unknown === 0)}
-              allowDetails={allowMachineDetails}
-            />
-          )}
-        </>
+        <FleetBoard
+          matrix={matrix}
+          rows={boardRows}
+          hidden={matrix.users.length - boardRows.length}
+          expanded={expanded}
+          onExpand={setExpanded}
+          allowDetails={allowMachineDetails}
+          compact={compact}
+          onOpenNode={onOpenNode}
+        />
       )}
     </div>
   );

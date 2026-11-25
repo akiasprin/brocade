@@ -1,0 +1,360 @@
+/* 容器网络页签：访问入口、网卡两张框架卡并排，路由整宽在下。卡片沿用 .panel.titled
+   （与机器配置页同一种带标题条的卡），这里只补行列表、就地编辑区与行内操作。 */
+.cvm-network-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.cvm-net-top {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  min-width: 0;
+}
+@container (min-width: 900px) {
+  .cvm-net-top {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+
+.cvm-nrows {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.cvm-nrow {
+  --ctl-h: 26px;
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 4px 10px;
+  min-height: 46px;
+  padding: 6px 10px 6px 12px;
+  box-sizing: border-box;
+  font-size: 12.5px;
+}
+.cvm-nrow + .cvm-nrow {
+  border-top: 1px solid var(--line-soft);
+}
+.cvm-nrow-lead,
+.cvm-nrow-dev {
+  justify-self: start;
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+  white-space: nowrap;
+}
+.cvm-nrow-lead {
+  min-width: 34px;
+  text-align: center;
+}
+.cvm-nrow-lead.l3 {
+  padding: 1px 5px;
+  border: 1px solid color-mix(in srgb, var(--action) 45%, transparent);
+  border-radius: 4px;
+  color: var(--action);
+}
+.cvm-nrow-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.cvm-nrow-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.cvm-nrow-title.mono {
+  font: 12.5px var(--mono);
+}
+.cvm-nrow-title > .st {
+  margin: 0 0 0 4px;
+}
+.cvm-nrow-main > small {
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-nrow-main > small.mono {
+  font: 11px/1.45 var(--mono);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.cvm-nrow-main > .cvm-meter {
+  width: min(100%, 180px);
+  margin-top: 2px;
+}
+.cvm-nrow-main > .cvm-notice {
+  margin: 4px 0 0;
+}
+.cvm-nrow-details summary {
+  color: var(--err);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.cvm-nrow > .st {
+  margin: 0;
+}
+.cvm-nrow-acts {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+}
+.cvm-nrow-acts .rule-machine-more {
+  width: 28px;
+  height: 26px;
+  font-size: 18px;
+}
+.cvm-nrow[data-removing] .cvm-nrow-title {
+  color: var(--ink-3);
+  text-decoration: line-through;
+  text-decoration-color: var(--gold);
+}
+.cvm-nrow[data-draft] {
+  background: color-mix(in srgb, var(--gold) 7%, var(--card));
+  box-shadow: inset 2px 0 0 var(--gold);
+}
+.cvm-nrow-empty,
+.cvm-nrow-hint {
+  display: flex;
+  min-height: 38px;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.cvm-nrow-hint {
+  justify-content: space-between;
+}
+.cvm-nrow + .cvm-nrow-hint {
+  border-top-style: dashed;
+}
+
+/* 就地编辑区：从行列表下方展开，金色左边线表示这是一项未保存的草稿。 */
+.cvm-composer {
+  --ctl-h: 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 11px 12px 12px;
+  border-top: 1px solid var(--line-soft);
+  background: var(--band);
+  box-shadow: inset 2px 0 0 var(--gold);
+}
+.cvm-composer > .note,
+.cvm-composer > .cvm-notice {
+  margin: 0;
+}
+.cvm-composer-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12.5px;
+}
+.cvm-composer-head > b {
+  color: var(--ink);
+  font-weight: 600;
+}
+.cvm-composer-head > .note {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-composer-head > .btn:last-child {
+  margin-left: auto;
+}
+.cvm-composer-fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.cvm-composer-label {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.cvm-composer-preview {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 6px 9px;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-ctl);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.cvm-composer-preview > .ui-icon {
+  color: var(--action);
+}
+.cvm-composer-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.cvm-composer-foot > .note {
+  flex: 1 1 200px;
+  margin: 0;
+  font-size: 11.5px;
+}
+.cvm-composer .cvm-field {
+  max-width: 420px;
+}
+
+/* 单选卡列表：入口地址与出口网络。 */
+.cvm-picks {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 232px;
+  overflow: auto;
+}
+.cvm-pick-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 42px;
+  padding: 5px 10px;
+  box-sizing: border-box;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-ctl);
+  background: var(--card);
+  cursor: pointer;
+}
+.cvm-pick-row[data-on] {
+  border-color: color-mix(in srgb, var(--action) 55%, var(--line));
+  background: color-mix(in srgb, var(--action) 7%, var(--card));
+}
+.cvm-pick-row:has(input:disabled) {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.cvm-pick-row > input {
+  flex: none;
+  margin: 0;
+  accent-color: var(--action);
+}
+.cvm-pick-main {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  font-size: 12.5px;
+}
+.cvm-pick-main b {
+  font-weight: 600;
+}
+.cvm-pick-main > small {
+  overflow: hidden;
+  color: var(--ink-4);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cvm-pick-tag {
+  flex: none;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--ink-3);
+  font: 10px var(--mono);
+}
+
+/* 入口流量编辑：TCP / UDP 各一行，范围与映射紧排。 */
+.cvm-entry-traffic-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cvm-entry-traffic-editor > .cvm-form-fieldset {
+  display: flow-root;
+  margin: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-ctl);
+  background: var(--card);
+}
+.cvm-entry-traffic-editor legend {
+  float: left;
+  width: 74px;
+  margin: 0;
+  padding: 5px 0 0;
+  font: 600 11.5px var(--mono);
+}
+.cvm-entry-traffic-editor legend input {
+  margin: 0 4px 0 0;
+  accent-color: var(--action);
+  vertical-align: -2px;
+}
+.cvm-entry-traffic-editor > .cvm-form-fieldset > .cvm-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr));
+  gap: 6px 10px;
+  margin-left: 84px;
+}
+.cvm-entry-traffic-editor > .cvm-form-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  padding: 0 10px;
+}
+.cvm-entry-traffic-editor .cvm-form-grid > label {
+  display: grid;
+  gap: 3px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.cvm-entry-traffic-editor > .cvm-form-grid > .cvm-check {
+  display: inline-flex;
+  color: var(--ink-2);
+}
+.cvm-entry-traffic-editor textarea.f {
+  min-height: 28px;
+  resize: vertical;
+}
+.cvm-entry-traffic-editor > .note {
+  margin: 0;
+  font-size: 11.5px;
+}
+@container (max-width: 560px) {
+  .cvm-nrow {
+    grid-template-columns: 44px minmax(0, 1fr) auto;
+  }
+  .cvm-nrow > .st {
+    grid-column: 2;
+    justify-self: start;
+  }
+  .cvm-nrow-acts {
+    grid-column: 3;
+    grid-row: 1 / span 2;
+  }
+}
+
+/* 副标题与名称同行时用中点隔开；窄页面单独成行，分隔点不挂在行首。 */
+.cvm-nrow-sub::before {
+  content: '·';
+  margin-right: 4px;
+}
+@container (max-width: 560px) {
+  .cvm-nrow-sub {
+    flex-basis: 100%;
+  }
+  .cvm-nrow-sub::before {
+    content: none;
+  }
+}

@@ -1,4 +1,5 @@
 """CVM maintenance boundary, exercised against an exclusively owned PostgreSQL container."""
+
 import importlib.util
 import os
 from pathlib import Path
@@ -17,9 +18,14 @@ SPEC.loader.exec_module(cleanup)
 
 class WhitelistTests(unittest.TestCase):
     def test_whitelist_covers_the_current_cvm_schema_and_nothing_else(self):
-        source = (ROOT / 'crates/brocade-store/migrations/0005_node_xray_enabled.sql').read_text()
-        names = set(re.findall(r'CREATE TABLE (cvm_\w+)', source))
-        self.assertEqual(len(names), 33)
+        # Historical names remain supported so an older experiment can also be reviewed.
+        migrations = ROOT / 'crates/brocade-store/migrations'
+        names = {
+            name
+            for path in migrations.glob('*.sql')
+            for name in re.findall(r'CREATE TABLE (cvm_\w+)', path.read_text())
+        }
+        self.assertGreaterEqual(len(names), 42)
         self.assertEqual(names, cleanup.TABLES)
         self.assertNotIn('users', cleanup.TABLES)
         self.assertNotIn('_sqlx_migrations', cleanup.TABLES)
@@ -30,12 +36,27 @@ class DatabaseTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.container = subprocess.check_output(
-            ['docker', 'run', '--rm', '-d', '--label', 'brocade.test=cvm-cleanup',
-             '-e', 'POSTGRES_PASSWORD=fixture-password', '-p', '127.0.0.1::5432',
-             'postgres:16-alpine'], text=True,
+            [
+                'docker',
+                'run',
+                '--rm',
+                '-d',
+                '--label',
+                'brocade.test=cvm-cleanup',
+                '-e',
+                'POSTGRES_PASSWORD=fixture-password',
+                '-p',
+                '127.0.0.1::5432',
+                'postgres:16-alpine',
+            ],
+            text=True,
         ).strip()
         try:
-            port = subprocess.check_output(['docker', 'port', cls.container, '5432/tcp'], text=True).strip().rsplit(':', 1)[1]
+            port = (
+                subprocess.check_output(['docker', 'port', cls.container, '5432/tcp'], text=True)
+                .strip()
+                .rsplit(':', 1)[1]
+            )
             cls.url = f'postgresql://postgres:fixture-password@127.0.0.1:{port}/postgres'
             deadline = time.monotonic() + 30
             while True:
@@ -82,14 +103,31 @@ CREATE TRIGGER immutable_cvm BEFORE DELETE ON cvm_instances
 FOR EACH ROW EXECUTE FUNCTION immutable_cvm();
 """)
         before = cleanup.inventory(self.url)
-        all_before = cleanup.query(self.url, 'SELECT jsonb_build_object(\'protected\',' + cleanup.fingerprint(before['preserved_tables']) + ');')
+        all_before = cleanup.query(
+            self.url, "SELECT jsonb_build_object('protected'," + cleanup.fingerprint(before['preserved_tables']) + ');'
+        )
         result = cleanup.apply(self.url, before)
         self.assertTrue(all(row[0] == 0 for row in result['cvm'].values()))
         after = cleanup.inventory(self.url)
         self.assertEqual(before['fingerprints']['preserved'], after['fingerprints']['preserved'])
         self.assertEqual(before['preserved_tables'], ['ordinary_usage', 'settings', 'users'])
-        all_after = cleanup.query(self.url, 'SELECT jsonb_build_object(\'protected\',' + cleanup.fingerprint(after['preserved_tables']) + ');')
+        all_after = cleanup.query(
+            self.url, "SELECT jsonb_build_object('protected'," + cleanup.fingerprint(after['preserved_tables']) + ');'
+        )
         self.assertEqual(all_before, all_after)
+
+    def test_access_and_password_records_are_cleared_with_the_owned_instance(self):
+        self.sql("""
+CREATE TABLE cvm_instance_access_events(instance_id text REFERENCES cvm_instances(id), actor_id text);
+CREATE TABLE cvm_guest_credentials(instance_id text REFERENCES cvm_instances(id), password_sealed text);
+INSERT INTO cvm_instance_access_events VALUES ('experiment','admin');
+INSERT INTO cvm_guest_credentials VALUES ('experiment','sealed-fixture');
+""")
+        before = cleanup.inventory(self.url)
+        result = cleanup.apply(self.url, before)
+        self.assertEqual(result['cvm']['cvm_instance_access_events'][0], 0)
+        self.assertEqual(result['cvm']['cvm_guest_credentials'][0], 0)
+        self.assertEqual(before['fingerprints']['preserved'], cleanup.inventory(self.url)['fingerprints']['preserved'])
 
     def test_changed_inventory_is_refused_without_deleting_anything(self):
         before = cleanup.inventory(self.url)
@@ -116,7 +154,9 @@ FOR EACH ROW EXECUTE FUNCTION immutable_cvm();
         self.assertEqual(before, cleanup.inventory(self.url))
 
     def test_non_cvm_foreign_reference_never_expands_cleanup_scope(self):
-        self.sql("CREATE TABLE retained_links(id text REFERENCES cvm_instances(id)); INSERT INTO retained_links VALUES ('experiment');")
+        self.sql(
+            "CREATE TABLE retained_links(id text REFERENCES cvm_instances(id)); INSERT INTO retained_links VALUES ('experiment');"
+        )
         before = cleanup.inventory(self.url)
         self.assertTrue(before['blockers']['external_references'])
         with self.assertRaises(cleanup.CleanupError):
@@ -124,7 +164,7 @@ FOR EACH ROW EXECUTE FUNCTION immutable_cvm();
         self.assertEqual(before, cleanup.inventory(self.url))
 
     def test_unreviewed_cvm_table_is_not_cleaned_by_prefix(self):
-        self.sql("CREATE TABLE cvm_unreviewed(id int); INSERT INTO cvm_unreviewed VALUES (1);")
+        self.sql('CREATE TABLE cvm_unreviewed(id int); INSERT INTO cvm_unreviewed VALUES (1);')
         with self.assertRaisesRegex(cleanup.CleanupError, 'unreviewed CVM tables'):
             cleanup.inventory(self.url)
 

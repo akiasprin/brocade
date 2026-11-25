@@ -1,17 +1,30 @@
 use super::*;
 
+pub(super) const TERMINAL_SESSIONS_USED: &str = "terminal_sessions_used";
+
 impl PgStore {
     pub async fn cvm_record_inventory(&self, node: &str, request: InventoryReport) -> Result<()> {
         request.capabilities.validate().map_err(invalid)?;
         if request.error.as_ref().is_some_and(|e| e.len() > 500) {
             return Err(invalid("CVM inventory error exceeds limit"));
         }
+        let mut inventory = serde_json::to_value(&request.capabilities)?;
+        // Keep observations out of typed capabilities, which are compiler inputs.
+        if let Some(used) = request.terminal_sessions_used {
+            if usize::from(used) > brocade_deployment::cvm::terminal::MAX_PER_NODE
+                || !request.capabilities.guest_terminal
+                || !request.capabilities.guest_terminal_persistent
+            {
+                return Err(invalid("invalid CVM terminal occupancy"));
+            }
+            inventory[TERMINAL_SESSIONS_USED] = used.into();
+        }
         // An observation outage must not erase the last verified cleanup policy.
         // Freshness/error still deny new allocations, while existing instances can
         // queue deletion using the previously advertised data-retention contract.
         let mut tx = self.pool.begin().await?;
         crate::resource_coordination::lock(&mut tx).await?;
-        sqlx::query("INSERT INTO cvm_hosts(node_id,capabilities,error) VALUES($1,$2,$3) ON CONFLICT(node_id) DO UPDATE SET capabilities=CASE WHEN excluded.error IS NULL THEN excluded.capabilities ELSE cvm_hosts.capabilities END,error=excluded.error,observed_at=now()").bind(node).bind(serde_json::to_value(&request.capabilities)?).bind(&request.error).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO cvm_hosts(node_id,capabilities,error) VALUES($1,$2,$3) ON CONFLICT(node_id) DO UPDATE SET capabilities=CASE WHEN excluded.error IS NULL THEN excluded.capabilities ELSE cvm_hosts.capabilities END,error=excluded.error,observed_at=now()").bind(node).bind(inventory).bind(&request.error).execute(&mut *tx).await?;
         if request.error.is_none() {
             if let Some(capacity) = &request.capabilities.network_quota {
                 network_quota::inventory_capacity(&mut tx, node, capacity).await?;
@@ -23,15 +36,12 @@ impl PgStore {
 }
 
 impl PgStore {
+    /// First compiled page; follow `next_offset` to consume the remaining instances.
     pub async fn cvm_desired(&self, node: &str) -> Result<DesiredState> {
-        self.cvm_desired_page(node, None).await
+        self.cvm_desired_page(node, 0).await
     }
-    pub async fn cvm_desired_page(
-        &self,
-        node: &str,
-        offset: Option<usize>,
-    ) -> Result<DesiredState> {
-        let start = offset.unwrap_or(0);
+    pub async fn cvm_desired_page(&self, node: &str, offset: usize) -> Result<DesiredState> {
+        let start = offset;
         if start > MAX_INSTANCES_PER_MACHINE {
             return Err(invalid("CVM page cursor exceeds limits"));
         }
@@ -53,23 +63,17 @@ impl PgStore {
         let total = rows.len();
         let mut instances = Vec::new();
         let mut bytes = 0usize;
-        for raw in rows.into_iter().skip(start).take(if offset.is_some() {
-            8
-        } else {
-            MAX_INSTANCES_PER_MACHINE
-        }) {
+        for raw in rows.into_iter().skip(start).take(8) {
             let mut desired: InstanceDesired = serde_json::from_value(raw)?;
-            if offset.is_some() {
-                desired.artifacts =
-                    artifacts::load(&mut tx, &desired.id, desired.generation).await?;
-            }
+            ensure_access_generation(&mut tx, &desired.id, desired.generation).await?;
+            desired.artifacts = artifacts::load(&mut tx, &desired.id, desired.generation).await?;
             let size = serde_json::to_vec(&desired)?.len();
             if size > 12 * 1024 * 1024 {
                 return Err(invalid(
                     "CVM single-instance artifact response exceeds limits",
                 ));
             }
-            if offset.is_some() && bytes + size > 12 * 1024 * 1024 {
+            if bytes + size > 12 * 1024 * 1024 {
                 break;
             }
             bytes += size;
@@ -81,11 +85,7 @@ impl PgStore {
             chain_clients,
             instances,
             page_offset: offset,
-            next_offset: if offset.is_some() && next < total {
-                Some(next)
-            } else {
-                None
-            },
+            next_offset: if next < total { Some(next) } else { None },
         })
     }
 }
@@ -138,9 +138,7 @@ impl PgStore {
                             .is_some_and(|sha| !valid_digest(sha))
                         || serde_json::to_vec(&f.bindings).map_or(true, |b| b.len() > 4096)
                 })
-                || (report.status == ApplyStatus::Applied
-                    && receipt.mode == CvmArtifactMode::Enforce
-                    && !receipt.mismatches.is_empty())
+                || (report.status == ApplyStatus::Applied && !receipt.mismatches.is_empty())
             {
                 return Err(invalid("CVM 产物回执与冻结内容不一致"));
             }

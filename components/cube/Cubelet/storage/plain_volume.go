@@ -109,13 +109,8 @@ func checkPlainInitialization(path, name string, size uint64) error {
 		return fmt.Errorf("invalid plain volume initialization receipt")
 	}
 	var r plainInitialization
-	if json.Unmarshal(data, &r) != nil || (r.Format != "brocade-plain-initialized-v1" && r.Format != "brocade-plain-initialized-v2") || r.Name != name || r.Size != size || r.Inode != stat.Ino {
+	if json.Unmarshal(data, &r) != nil || r.Format != "brocade-plain-initialized-v2" || r.Name != name || r.Size != size || r.Inode != stat.Ino {
 		return fmt.Errorf("plain volume initialization receipt does not match the original disk")
-	}
-	// A v1 receipt promised full physical allocation; retain that check for old
-	// disks. A v2 receipt proves formatting and identity, with sparse capacity.
-	if r.Format == "brocade-plain-initialized-v1" && uint64(stat.Blocks)*512 < size {
-		return fmt.Errorf("plain volume physical reservation is incomplete")
 	}
 	return nil
 }

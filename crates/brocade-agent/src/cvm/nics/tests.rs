@@ -212,7 +212,7 @@ fn udp(ns: &str, address: &str, port: u16) {
     command("ip", &["netns", "exec", ns, "python3", "-c", &script]);
 }
 
-fn scheduling_bindings(count: usize) -> Vec<NicBinding> {
+pub(super) fn scheduling_bindings(count: usize) -> Vec<NicBinding> {
     (0..count)
         .map(|index| {
             let card = (index % (NODE_BINDINGS * 2)) / 2;
@@ -587,6 +587,12 @@ fn real_ip_backend() {
     private_dir(&root.join("cvm-nics")).unwrap();
     ROOT.set(root.clone()).unwrap();
     command("ip", &["link", "set", "lo", "up"]);
+    crate::command::run_command_with_input(
+        "nft",
+        &["-f", "-"],
+        b"add table ip filter\nadd chain ip filter FORWARD { type filter hook forward priority 0; policy drop; }\nadd chain ip filter DOCKER-USER\nadd table ip6 filter\nadd chain ip6 filter FORWARD { type filter hook forward priority 0; policy drop; }\nadd chain ip6 filter DOCKER-USER\n",
+    )
+    .unwrap();
     command("ip", &["address", "add", "198.51.100.20/32", "dev", "lo"]);
     command(
         "ip",
@@ -1142,6 +1148,10 @@ fn real_ip_backend() {
     assert!(!Path::new("/run/netns")
         .join(host::namespace(&desired.bindings[1]))
         .exists());
+    for family in ["ip", "ip6"] {
+        let forwarding = command("nft", &["-a", "list", "chain", family, "filter", "FORWARD"]);
+        assert!(!forwarding.contains("brocade-cvm-nic:"));
+    }
     eprintln!("real {kind:?}: dual-stack TCP/UDP/ICMP, public source NAT, no NIC inbound, port-selected egress, symmetric entry source, revoke/recover and namespace cleanup passed");
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -1244,4 +1254,14 @@ fn consumer_forward_rules_follow_route_selection_order() {
             Some(wanted)
         );
     }
+}
+
+#[test]
+fn ssh_hints_only_use_observed_sshd_listeners() {
+    let raw = r#"LISTEN 0 128 0.0.0.0:2222 0.0.0.0:* users:(("sshd",pid=1,fd=3))
+LISTEN 0 128 [::]:2222 [::]:* users:(("sshd",pid=1,fd=4))
+LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("other-service",pid=2,fd=3))
+LISTEN 0 128 0.0.0.0:2200 0.0.0.0:* users:(("sshd",pid=3,fd=3))"#;
+    assert_eq!(ssh_listener_ports(raw), vec![2200, 2222]);
+    assert!(ssh_listener_ports("LISTEN 0 128 0.0.0.0:22 0.0.0.0:*").is_empty());
 }

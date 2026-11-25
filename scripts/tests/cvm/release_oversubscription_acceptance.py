@@ -26,22 +26,6 @@ print(json.dumps({'vcpus':value['config']['cpus']['boot_vcpus'],'memory_bytes':v
         return json.loads(self.lab.python('compute', code))
 
     def run(self):
-        self.call(
-            'PUT',
-            '/cvm/quota',
-            {
-                'tenant_id': 'platform',
-                'user_id': 'alice',
-                'enabled': True,
-                'allowed_nodes': list(self.state['nodes']),
-                'max_instances': 4,
-                'max_vcpus': 10,
-                'max_memory_bytes': 10 * GIB,
-                'max_disk_bytes': 28 * GIB,
-                'max_interfaces': 8,
-            },
-            expected=204,
-        )
         for name in ['over-a', 'over-b', 'over-c']:
             self.create(name, 'compute-a', {'vcpus': 3, 'memory_bytes': 3 * GIB, 'root_disk_bytes': 8 * GIB})
         self.complete(self.publish(), timeout=300)
@@ -88,8 +72,12 @@ print(json.dumps({'logical_disk_bytes':logical,'physical_file_bytes':physical,'f
                 'node_id': 'compute-a',
                 'name': 'disk-denied',
                 'image_id': spec['image']['id'],
-                'resources': {'vcpus': 1, 'memory_bytes': 128 * 1024**2, 'root_disk_bytes': 8 * GIB},
-                'ssh_public_key': spec['ssh_public_key'],
+                'resources': {
+                    'vcpus': 1,
+                    'memory_bytes': 128 * 1024**2,
+                    'root_disk_bytes': host['capabilities']['resource_limits']['max_root_disk_bytes']
+                    + host['capabilities']['resource_limits']['root_disk_step_bytes'],
+                },
                 'interfaces': [
                     {
                         'source_id': spec['interfaces'][0]['source_id'],
@@ -109,7 +97,7 @@ print(json.dumps({'logical_disk_bytes':logical,'physical_file_bytes':physical,'f
             'expected_generation': item['desired']['generation'],
             'action': 'configure',
             'name': 'over-a',
-            'vcpus': 5,
+            'vcpus': host['capabilities']['resource_limits']['max_vcpus'] + 1,
             'memory_bytes': 3 * GIB,
         }
         self.call('POST', '/cvm/' + item['desired']['id'] + '/operations', body, expected=400)
@@ -132,14 +120,15 @@ print(json.dumps({'logical_disk_bytes':logical,'physical_file_bytes':physical,'f
             'action': 'configure',
             'name': 'over-b',
             'vcpus': 3,
-            'memory_bytes': 4 * GIB,
+            'memory_bytes': host['capabilities']['resource_limits']['max_memory_bytes']
+            + host['capabilities']['resource_limits']['memory_step_bytes'],
         }
         self.call('POST', '/cvm/' + item['desired']['id'] + '/operations', body, expected=400)
         self.operation('over-b', 'start')
         self.complete(self.publish(), timeout=240)
         self.instance_ready('over-b')
         self.record(
-            'real stopped resize oversells CPU/RAM and preserves original sparse disk, data and SSH identity; user CPU, RAM and disk quotas still reject excess'
+            'real stopped resize oversells CPU/RAM and preserves original sparse disk, data and SSH identity; node execution ranges still reject unsupported CPU, RAM and disk specifications without user quotas'
         )
         for name in ['over-a', 'over-b', 'over-c']:
             self.operation(name, 'delete', delete_data=True)

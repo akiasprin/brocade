@@ -5,11 +5,8 @@ use std::{collections::BTreeMap, path::Path};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct Record {
-    #[serde(default)]
     pub(crate) sandbox_sha256: String,
-    #[serde(default)]
     pub(crate) sandbox_effective_sha256: String,
-    #[serde(default)]
     pub(crate) sandbox_bindings: serde_json::Value,
     pub(crate) instance: String,
     pub(crate) runtime: String,
@@ -30,6 +27,7 @@ pub(crate) struct Record {
     pub(crate) host_boot_id: String,
     pub(crate) attempted: bool,
     pub(crate) initialized: bool,
+    pub(crate) login_revision: u64,
     pub(crate) deleted: bool,
     pub(crate) detached_interfaces: Vec<String>,
     pub(crate) objects: Vec<RootObject>,
@@ -76,7 +74,8 @@ pub(crate) fn load(root: &Path) -> Result<BTreeMap<String, Record>> {
 }
 
 pub(crate) fn boot_digest(desired: &InstanceDesired) -> Result<String> {
-    let mut value = serde_json::json!({"image":desired.spec.image,"resources":desired.spec.resources,"ssh_public_key":desired.spec.ssh_public_key});
+    let mut value =
+        serde_json::json!({"image":desired.spec.image,"resources":desired.spec.resources});
     value.sort_all_objects();
     let json =
         serde_json::to_string(&value).map_err(|_| "Cube boot identity serialization failed")?;
@@ -95,7 +94,7 @@ mod tests {
             "spec_sha256":"a".repeat(64), "power":"running", "delete_data":false,
             "restart_epoch":0, "reinstall_epoch":0,
             "spec":{
-                "name":"before", "ssh_public_key":"public-key",
+                "name":"before", "login_revision":1,"execution":{"kind":"cube"},"routing":{"revision":0,"routes":[],"priorities":[],"dns":[]},
                 "image":{"id":"debian","name":"Debian","version":"13","architecture":"x86_64","sha256":"b".repeat(64),"boot_mode":"cube-oci"},
                 "resources":{"vcpus":1,"memory_bytes":134217728,"root_disk_bytes":3221225472u64},
                 "interfaces":[]

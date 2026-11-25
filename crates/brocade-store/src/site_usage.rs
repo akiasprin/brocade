@@ -208,6 +208,7 @@ fn hourly_parts(start: i64, end: i64, up: i64, down: i64) -> Vec<(i64, i64, i64)
 }
 
 /// Start, end and query time of a calendar period, all read from the database clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PeriodBounds {
     pub(crate) clock: i64,
     pub(crate) now: i64,
@@ -253,19 +254,28 @@ pub(crate) async fn period_bounds(pool: &PgPool, period: SiteUsagePeriod) -> Res
     })
 }
 
-/// Destination observations are persisted hourly; do not prorate an hour into minute estimates.
 pub(crate) async fn destination_bounds(
     pool: &PgPool,
     period: SiteUsagePeriod,
     range: Option<brocade_deployment::source_traffic::TrafficTimeRange>,
 ) -> Result<PeriodBounds> {
-    let mut bounds = range_bounds(pool, period, range).await?;
-    if range.is_some() {
-        bounds.start = bounds.start / 3600 * 3600;
-        bounds.end = (bounds.now + 3599) / 3600 * 3600;
-        bounds.now = bounds.end.min(bounds.clock);
+    let bounds = range_bounds(pool, period, range).await?;
+    Ok(destination_cover(bounds, range.is_some()))
+}
+
+/// Destination observations are persisted hourly; do not prorate an hour into minute estimates.
+/// A custom range therefore covers every hour it touches, up to the database clock.
+fn destination_cover(bounds: PeriodBounds, custom_range: bool) -> PeriodBounds {
+    if !custom_range {
+        return bounds;
     }
-    Ok(bounds)
+    let end = (bounds.now + 3599) / 3600 * 3600;
+    PeriodBounds {
+        clock: bounds.clock,
+        start: bounds.start / 3600 * 3600,
+        end,
+        now: end.min(bounds.clock),
+    }
 }
 
 fn site_name(id: &str) -> Result<String> {
@@ -513,7 +523,10 @@ pub(crate) async fn query_node_range(
         period
     };
     let nodes = classified_node(pool, actor, node_id).await?;
-    let bounds = destination_bounds(pool, period, range).await?;
+    // Port forwarding keeps 30-second ledger windows, so a custom range applies to it exactly,
+    // as in the machine inflow. Only the hourly destination categories widen to whole hours.
+    let forwarding_bounds = range_bounds(pool, period, range).await?;
+    let bounds = destination_cover(forwarding_bounds, range.is_some());
     let scope = actor.tenant_scope();
     let pattern = actor.tenant_scope_like_pattern();
     let mut tx = pool.begin().await?;
@@ -540,15 +553,17 @@ pub(crate) async fn query_node_range(
         AND ($4::text IS NULL OR tenant_id=$4 OR tenant_id LIKE $5 ESCAPE '\\')
         GROUP BY site_id, tenant_id, user_id
         UNION ALL SELECT 'forwarding', tenant_id, user_id, sum(uplink_bytes)::bigint, sum(downlink_bytes)::bigint
-        FROM {forwarding_table} WHERE node_id=$1 AND {forwarding_time}>=to_timestamp($2::bigint) AND {forwarding_time}<to_timestamp($3::bigint)
+        FROM {forwarding_table} WHERE node_id=$1 AND {forwarding_time}>=to_timestamp($6::bigint) AND {forwarding_time}<to_timestamp($7::bigint)
         AND ($4::text IS NULL OR tenant_id=$4 OR tenant_id LIKE $5 ESCAPE '\\')
         GROUP BY tenant_id, user_id HAVING sum(uplink_bytes)>0 OR sum(downlink_bytes)>0"))
         .bind(node_id).bind(bounds.start).bind(bounds.now)
-        .bind(scope).bind(pattern.as_deref()).fetch_all(&mut *tx).await?;
+        .bind(scope).bind(pattern.as_deref())
+        .bind(forwarding_bounds.start).bind(forwarding_bounds.now)
+        .fetch_all(&mut *tx).await?;
     let forwarding_points = forwarding_series_tx(
         &mut tx,
         ForwardingScope::Node { node_id, actor },
-        &bounds,
+        &forwarding_bounds,
         period,
     )
     .await?;
@@ -700,5 +715,41 @@ mod tests {
         );
         assert!(hourly_parts(100, 100, 1, 1).is_empty());
         assert!(hourly_parts(1, 40 * 86400, 1, 1).len() <= 31 * 24 + 1);
+    }
+
+    #[test]
+    fn destination_cover_widens_only_custom_ranges_to_elapsed_whole_hours() {
+        let exact = PeriodBounds {
+            clock: 7200 + 900,
+            start: 3600 + 3300,
+            now: 7200 + 600,
+            end: 7200 + 600,
+        };
+        // 01:55–02:10 touches two stored hours; the open hour ends at the clock.
+        assert_eq!(
+            destination_cover(exact, true),
+            PeriodBounds {
+                clock: 7200 + 900,
+                start: 3600,
+                now: 7200 + 900,
+                end: 3 * 3600,
+            }
+        );
+        let past = PeriodBounds {
+            clock: 10 * 3600,
+            start: 3600 + 300,
+            now: 3600 + 1200,
+            end: 3600 + 1200,
+        };
+        assert_eq!(
+            destination_cover(past, true),
+            PeriodBounds {
+                clock: 10 * 3600,
+                start: 3600,
+                now: 2 * 3600,
+                end: 2 * 3600,
+            }
+        );
+        assert_eq!(destination_cover(exact, false), exact);
     }
 }

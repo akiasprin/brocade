@@ -38,6 +38,7 @@ import { WinLayer } from '../ui/windows';
 import { wm, type CrumbSeg } from '../wm/store';
 import { draft } from '../draft';
 import { DraftBar } from './draft-bar';
+import { DraftSlotContext } from './draft-slot';
 import { ArtifactRail, blastRadius, useChangedArtifacts } from './artifacts';
 import { useConfigurationStatus } from './configuration-status';
 import { navigate, returnTo, startRouting } from './route';
@@ -157,6 +158,8 @@ export function ForgeShell({
   }, [nav]);
   const panel = useSyncExternalStore(artifactPanel.subscribe, artifactPanel.snapshot);
   const railPresence = usePresence(panel.open && artifacts, 300);
+  // 回调 ref 在提交阶段写入，插槽出现后页面的待发布条在首帧绘制前就移入顶栏下方。
+  const [draftSlot, setDraftSlot] = useState<HTMLDivElement | null>(null);
   // 草稿版本进入该层的查询键，同时统一失效所有页面的读取缓存。
   // 仅依靠查询键不够：各页面使用 `['snapshot']`，键中不含草稿版本，草稿变化后
   // 它们仍会命中缓存——表现为修改后草稿条已出现但表格内容未更新。
@@ -321,6 +324,7 @@ export function ForgeShell({
             onLogout={() => confirmDiscardChanges() && onLogout()}
           />
           <DraftBar current={current} />
+          <div className="fg-draft-slot" ref={setDraftSlot} />
 
           {nav === 'topo' ? (
             <div className="fg-topo" key="topo" role="main" aria-label={`${LABEL[nav]}内容`} tabIndex={-1}>
@@ -330,7 +334,9 @@ export function ForgeShell({
             </div>
           ) : (
             <div className="fg-view" key={nav} role="main" aria-label={`${LABEL[nav]}内容`} tabIndex={-1}>
-              <Work nav={nav} />
+              <DraftSlotContext.Provider value={draftSlot}>
+                <Work nav={nav} />
+              </DraftSlotContext.Provider>
             </div>
           )}
         </div>

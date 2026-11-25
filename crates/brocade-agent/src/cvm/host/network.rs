@@ -12,9 +12,7 @@ const TABLE: &str = "brocade_host_output";
 struct Owned {
     instance: String,
     nics: BTreeMap<String, AllocatedNic>,
-    #[serde(default)]
     retiring: Vec<(String, AllocatedNic)>,
-    #[serde(default)]
     protected: Vec<IpPrefix>,
 }
 fn ownership_path(root: &Path) -> PathBuf {
@@ -132,7 +130,68 @@ pub(super) fn capabilities(caps: &mut Capabilities) -> Result<()> {
     caps.route_services = true;
     caps.hot_attach = true;
     caps.hot_detach = true;
+    caps.chain_egress = match chain_capability() {
+        Ok(()) => true,
+        Err(error) => {
+            // An optional chain prerequisite must not disable existing native
+            // NICs, entry delivery, observations or route repair.
+            eprintln!("native chain capability unavailable: {error}");
+            false
+        }
+    };
     Ok(())
+}
+
+fn chain_capability() -> Result<()> {
+    // Check the same kernel expressions used by the selector without installing
+    // probe tables or changing the host's routing, firewall or sysctls.
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/net/tun")
+        .map_err(|_| "裸机线路出口需要可访问的 /dev/net/tun")?;
+    let service = management_service()?;
+    let mut probe = String::from("add table inet brocade_host_chain_probe\nadd chain inet brocade_host_chain_probe select { type route hook output priority -140; policy accept; }\nadd chain inet brocade_host_chain_probe guard { type filter hook postrouting priority -1; policy accept; }\nadd rule inet brocade_host_chain_probe select meta l4proto { tcp, udp } meta mark set 1 ct mark set meta mark return\nadd rule inet brocade_host_chain_probe guard meta mark 1 oifname != \"lo\" drop\n");
+    if let Some(service) = service.as_deref() {
+        probe.push_str(&format!(
+            "add rule inet brocade_host_chain_probe select {} return\n",
+            service_match(service)?
+        ));
+    }
+    crate::command::run_command_with_input("nft", &["--check", "-f", "-"], probe.as_bytes())?;
+    Ok(())
+}
+
+fn management_service() -> Result<Option<String>> {
+    let text = String::from_utf8(read(Path::new("/proc/self/cgroup"), 65536)?)
+        .map_err(|_| "invalid Agent service cgroup")?;
+    let Some(path) = text.lines().find_map(|line| line.strip_prefix("0::/")) else {
+        return Ok(None);
+    };
+    // Never exempt a whole slice, the root cgroup, or an interactive shell's
+    // session scope. Only the Agent's own service and its managed children bypass.
+    if !path.ends_with(".service") {
+        return Ok(None);
+    }
+    service_match(path)?;
+    Ok(Some(path.to_owned()))
+}
+
+fn service_match(path: &str) -> Result<String> {
+    let parts = path.split('/').collect::<Vec<_>>();
+    if path.len() > 4096
+        || parts.len() > 32
+        || !path.ends_with(".service")
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || *part == "." || *part == "..")
+        || path.bytes().any(|c| c.is_ascii_control())
+    {
+        return Err("invalid Agent service cgroup path".into());
+    }
+    let quoted =
+        serde_json::to_string(path).map_err(|_| "invalid Agent service cgroup encoding")?;
+    Ok(format!("socket cgroupv2 level {} {quoted}", parts.len()))
 }
 pub(super) fn interfaces(
     config: &Config,
@@ -218,7 +277,11 @@ fn table_owned() -> Result<bool> {
     }
     Ok(false)
 }
-fn rules(desired: &InstanceDesired, protected: &BTreeSet<IpPrefix>) -> Result<String> {
+fn rules(
+    desired: &InstanceDesired,
+    protected: &BTreeSet<IpPrefix>,
+    service: Option<&str>,
+) -> Result<String> {
     let devices = desired
         .spec
         .interfaces
@@ -226,7 +289,22 @@ fn rules(desired: &InstanceDesired, protected: &BTreeSet<IpPrefix>) -> Result<St
         .filter_map(|n| n.allocated.clone().map(|a| (n.id.clone(), a)))
         .collect::<BTreeMap<_, _>>();
     desired.spec.routing.validate(&devices)?;
+    let chains = brocade_cvm_compile::chain_bindings(&desired.id, &desired.spec.routing);
     let mut out = format!("add table inet {TABLE} {{ comment \"brocade-native-output-v1\"; }}\nadd chain inet {TABLE} return_marks {{ type filter hook prerouting priority -140; policy accept; }}\nadd chain inet {TABLE} select {{ type route hook output priority -140; policy accept; }}\nadd chain inet {TABLE} source {{ type nat hook postrouting priority 99; }}\nadd chain inet {TABLE} inbound {{ type filter hook input priority -125; policy accept; }}\n");
+    if !chains.is_empty() {
+        out.push_str(&format!("add chain inet {TABLE} chain_guard {{ type filter hook postrouting priority -1; policy accept; }}\n"));
+    }
+    for binding in &chains {
+        // Restore the reverse-path mark only on our TUN. Local replies still
+        // resolve via the local table; strict IPv4 rp_filter sees the correct TUN.
+        out.push_str(&format!("add rule inet {TABLE} return_marks iifname \"{}\" ct direction reply ct mark {} meta mark set ct mark\n",binding.device,binding.mark));
+        // This also fences an offline restore before the client has recreated
+        // its policy table. A failed lookup must not use the host main default.
+        out.push_str(&format!(
+            "add rule inet {TABLE} chain_guard meta mark {} oifname != \"{}\" counter drop\n",
+            binding.mark, binding.device
+        ));
+    }
     for id in devices.keys() {
         out.push_str(&format!("add rule inet {TABLE} return_marks iifname \"{}\" ct mark & {MASK:#x} == {MARK:#x} meta mark set ct mark\n", device(id)));
     }
@@ -234,6 +312,11 @@ fn rules(desired: &InstanceDesired, protected: &BTreeSet<IpPrefix>) -> Result<St
         out.push_str(&format!("add rule inet {TABLE} select {text}\n"));
     };
     push("oifname lo return".into());
+    if !chains.is_empty() {
+        if let Some(service) = service {
+            push(format!("{} return", service_match(service)?));
+        }
+    }
     for id in devices.keys() {
         push(format!("oifname \"{}\" ip6 hoplimit 255 icmpv6 type {{ nd-neighbor-solicit, nd-neighbor-advert }} return", device(id)));
     }
@@ -268,40 +351,58 @@ fn rules(desired: &InstanceDesired, protected: &BTreeSet<IpPrefix>) -> Result<St
         "ct mark & {MASK:#x} == {MARK:#x} meta mark set ct mark return"
     ));
     push("ct direction reply return".into());
-    let mut routes = desired.spec.routing.routes.iter().collect::<Vec<_>>();
-    routes.sort_by_key(|r| {
-        (
-            std::cmp::Reverse(r.destination.length()),
-            r.service.is_none(),
-            desired
-                .spec
-                .routing
-                .exit_priority(&r.target, r.destination.is_ipv4()),
-            r.service
-                .map_or(u32::MAX, |s| u32::from(s.port_end - s.port_start)),
-            r.target.clone(),
-        )
-    });
-    for r in routes {
-        let nic = devices
-            .get(
-                r.target
-                    .interface_id()
-                    .ok_or("bare-metal chain egress is unsupported")?,
-            )
-            .ok_or("native route references an unknown NIC")?;
-        let service = r.service.map_or(String::new(), |s| {
-            format!(
-                " meta l4proto {} th dport {}-{}",
-                if s.protocol == L4Protocol::Tcp {
-                    "tcp"
+    for binding in &chains {
+        push(format!(
+            "ct mark {} meta mark set ct mark return",
+            binding.mark
+        ));
+    }
+    let routing = &desired.spec.routing;
+    let mut routes = routing
+        .routes
+        .iter()
+        .filter_map(|route| {
+            let priority = routing.exit_priority(&route.target, route.destination.is_ipv4())?;
+            Some((route, priority))
+        })
+        .collect::<Vec<_>>();
+    // The table was validated above, so every route has a per-family priority.
+    routes.sort_by_key(|&(route, priority)| (route.precedence(priority), &route.target));
+    for (r, _) in routes {
+        let mark = match &r.target {
+            RouteTarget::Interface { interface_id } => {
+                MARK + u32::from(
+                    devices
+                        .get(interface_id)
+                        .ok_or("native route references an unknown NIC")?
+                        .slot,
+                )
+            }
+            RouteTarget::Chain { chain_id } => {
+                brocade_cvm_compile::chain_binding(&desired.id, chain_id).mark
+            }
+        };
+        let service = r.service.map_or_else(
+            || {
+                if r.target.chain_id().is_some() {
+                    " meta l4proto { tcp, udp }".into()
                 } else {
-                    "udp"
-                },
-                s.port_start,
-                s.port_end
-            )
-        });
+                    String::new()
+                }
+            },
+            |s| {
+                format!(
+                    " meta l4proto {} th dport {}-{}",
+                    if s.protocol == L4Protocol::Tcp {
+                        "tcp"
+                    } else {
+                        "udp"
+                    },
+                    s.port_start,
+                    s.port_end
+                )
+            },
+        );
         for (other_id, other) in &devices {
             if Some(other_id.as_str()) == r.target.interface_id() {
                 continue;
@@ -319,7 +420,6 @@ fn rules(desired: &InstanceDesired, protected: &BTreeSet<IpPrefix>) -> Result<St
                 ));
             }
         }
-        let mark = MARK + u32::from(nic.slot);
         push(format!(
             "{} daddr {}{service} meta mark set {mark:#x} ct mark set meta mark return",
             if r.destination.is_ipv4() { "ip" } else { "ip6" },
@@ -356,7 +456,16 @@ fn rules(desired: &InstanceDesired, protected: &BTreeSet<IpPrefix>) -> Result<St
 
     Ok(out)
 }
-pub(super) fn converge(config: &Config, root: &Path, desired: &InstanceDesired) -> Result<()> {
+pub(super) enum Convergence {
+    Applied,
+    WaitingForTransport,
+}
+
+pub(super) fn converge(
+    config: &Config,
+    root: &Path,
+    desired: &InstanceDesired,
+) -> Result<Convergence> {
     if desired.spec.interfaces.len() > MAX_INTERFACES
         || desired
             .spec
@@ -419,6 +528,29 @@ pub(super) fn converge(config: &Config, root: &Path, desired: &InstanceDesired) 
             }
         }
     }
+    let snapshot = super::super::nics::native_snapshot()?;
+    let Some(_activation) = super::super::nics::readiness::activation(desired, &snapshot)? else {
+        return Ok(Convergence::WaitingForTransport);
+    };
+    if desired.power != PowerState::Deleted {
+        if !desired.spec.routing.dns.is_empty() {
+            return Err(
+                "native DNS remains owned by the host; configure DNS in the operating system"
+                    .into(),
+            );
+        }
+        // Neither saved intent nor a bridge left by Preparing proves that the
+        // Active forwarding policy was installed. Wait before changing ownership,
+        // retiring the old NIC, or selecting any traffic into the new policy.
+        for id in requested.keys() {
+            let Some(parent) = link(&bridge(id))? else {
+                return Ok(Convergence::WaitingForTransport);
+            };
+            if parent["ifalias"] != format!("brocade-nic:{id}") {
+                return Err("native transport bridge ownership mismatch".into());
+            }
+        }
+    }
     let active = if desired.power == PowerState::Deleted {
         BTreeMap::new()
     } else {
@@ -446,7 +578,6 @@ pub(super) fn converge(config: &Config, root: &Path, desired: &InstanceDesired) 
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    let snapshot = super::super::nics::native_snapshot()?;
     protected.extend(snapshot.management_networks.iter().cloned());
     for binding in &snapshot.bindings {
         protected.insert(
@@ -521,7 +652,7 @@ pub(super) fn converge(config: &Config, root: &Path, desired: &InstanceDesired) 
         }
         std::fs::remove_file(ownership_path(root))
             .map_err(|_| "cannot finish native network release")?;
-        return Ok(());
+        return Ok(Convergence::Applied);
     }
     let mut tracking = super::super::nics::tracking_addresses()?;
     if let Ok(primary) = primary(config, "host") {
@@ -541,15 +672,6 @@ pub(super) fn converge(config: &Config, root: &Path, desired: &InstanceDesired) 
     for assigned in requested.values() {
         prepare_policy(assigned)?;
     }
-    plan.push_str(&rules(desired, &protected)?);
-    apply_rules(root, &plan)?;
-    for (_, nic) in &owned.retiring {
-        if !requested.values().any(|active| active.slot == nic.slot) {
-            clear_policy(nic)?;
-        }
-    }
-    owned.retiring.clear();
-    save_ownership(root, &owned)?;
     for nic in &desired.spec.interfaces {
         let Some(assigned) = &nic.allocated else {
             continue;
@@ -560,7 +682,11 @@ pub(super) fn converge(config: &Config, root: &Path, desired: &InstanceDesired) 
         let dev = device(&nic.id);
         let br = bridge(&nic.id);
         let owner = alias(&desired.id, &nic.id);
-        let parent = link(&br)?.ok_or("native transport bridge is not ready")?;
+        let Some(parent) = link(&br)? else {
+            // The bridge disappeared after preflight. Preserve existing selectors
+            // and do not activate the candidate while its transport is missing.
+            return Ok(Convergence::WaitingForTransport);
+        };
         if parent["ifalias"] != format!("brocade-nic:{}", nic.id) {
             return Err("native transport bridge ownership mismatch".into());
         }
@@ -636,12 +762,20 @@ pub(super) fn converge(config: &Config, root: &Path, desired: &InstanceDesired) 
             ])?;
         }
     }
-    if !desired.spec.routing.dns.is_empty() {
-        return Err(
-            "native DNS remains owned by the host; configure DNS in the operating system".into(),
-        );
+    plan.push_str(&rules(
+        desired,
+        &protected,
+        management_service()?.as_deref(),
+    )?);
+    apply_rules(root, &plan)?;
+    for (_, nic) in &owned.retiring {
+        if !requested.values().any(|active| active.slot == nic.slot) {
+            clear_policy(nic)?;
+        }
     }
-    Ok(())
+    owned.retiring.clear();
+    save_ownership(root, &owned)?;
+    Ok(Convergence::Applied)
 }
 
 fn apply_rules(root: &Path, plan: &str) -> Result<()> {

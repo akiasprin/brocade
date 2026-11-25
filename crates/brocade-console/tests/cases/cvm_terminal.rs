@@ -1,10 +1,19 @@
 use super::*;
 use brocade_deployment::{cvm::terminal as wire, cvm::*};
-use brocade_store::cvm::{CvmCreate, CvmQuota};
+use brocade_store::cvm::CvmCreate;
 
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 async fn socket(address: std::net::SocketAddr, path: &str, token: &str, terminal: bool) -> Socket {
+    socket_capability(address, path, token, terminal, false).await
+}
+async fn socket_capability(
+    address: std::net::SocketAddr,
+    path: &str,
+    token: &str,
+    terminal: bool,
+    rtc: bool,
+) -> Socket {
     let mut request = format!("ws://{address}{path}")
         .into_client_request()
         .unwrap();
@@ -14,11 +23,19 @@ async fn socket(address: std::net::SocketAddr, path: &str, token: &str, terminal
     if terminal {
         request.headers_mut().insert(
             "x-brocade-protocol-version",
-            CVM_PROTOCOL_VERSION.to_string().parse().unwrap(),
+            brocade_deployment::protocol::AGENT_PROTOCOL_VERSION
+                .to_string()
+                .parse()
+                .unwrap(),
         );
         request
             .headers_mut()
             .insert(wire::VERSION_HEADER, wire::VERSION.parse().unwrap());
+    }
+    if rtc {
+        request
+            .headers_mut()
+            .insert(wire::RTC_HEADER, wire::RTC_VERSION.parse().unwrap());
     }
     tokio_tungstenite::connect_async(request).await.unwrap().0
 }
@@ -75,6 +92,12 @@ async fn cvm_terminal_http_websocket_relay_revocation_and_lifecycle() {
     db.store.migrate().await.unwrap();
     insert_usage_model(db.pool()).await;
     let admin = admin_token(&db).await;
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    sqlx::query("INSERT INTO node_agent_state(node_id,agent_protocol_version) VALUES('n1',77) ON CONFLICT(node_id) DO UPDATE SET agent_protocol_version=77")
+        .execute(db.pool()).await.unwrap();
     let actor = AdminContext::system_admin("test-admin");
     let mut caps_value = serde_json::to_value(Capabilities::default()).unwrap();
     let fields = json!({"backend":"terminal-test","managed_networks":true,"guest_terminal":true,"guest_terminal_persistent":true,"create":true,"delete":true,"max_interfaces":1,
@@ -86,37 +109,49 @@ async fn cvm_terminal_http_websocket_relay_revocation_and_lifecycle() {
         .as_object_mut()
         .unwrap()
         .extend(fields.as_object().unwrap().clone());
-    let caps: Capabilities = serde_json::from_value(caps_value).unwrap();
+    let mut caps: Capabilities = serde_json::from_value(caps_value).unwrap();
+    let manifest = cvm_compiler_fixture(&mut caps);
     db.store
         .cvm_record_inventory(
             "n1",
             InventoryReport {
                 capabilities: caps,
+                terminal_sessions_used: None,
                 error: None,
             },
         )
         .await
         .unwrap();
     db.store
-        .set_cvm_quota(
+        .cvm_record_image_manifest("n1", manifest)
+        .await
+        .unwrap();
+    let instance = db
+        .store
+        .create_cvm(
             &actor,
-            CvmQuota {
-                host_network_quotas: vec![],
+            CvmCreate {
+                request_id: "terminal-http-create-00001".into(),
                 tenant_id: "platform.acme".into(),
-                user_id: "alice".into(),
-                enabled: true,
-                allowed_nodes: vec!["n1".into()],
-                max_instances: 1,
-                max_vcpus: 1,
-                max_memory_bytes: 134217728,
-                max_disk_bytes: 3000000000,
-                max_interfaces: 1,
+                user_id: Some("alice".into()),
+                node_id: "n1".into(),
+                name: "terminal".into(),
+                image_id: "debian".into(),
+                resources: brocade_deployment::cvm::Resources {
+                    vcpus: 1,
+                    memory_bytes: 134217728,
+                    root_disk_bytes: 3000000000,
+                },
+                interfaces: vec![InterfaceRequest {
+                    source_id: "public".into(),
+                    purpose: InterfacePurpose::Contact,
+                    default_ipv4: false,
+                    default_ipv6: false,
+                }],
             },
         )
         .await
         .unwrap();
-    let instance=db.store.create_cvm(&actor,CvmCreate{request_id:"terminal-http-create-00001".into(),tenant_id:"platform.acme".into(),user_id:"alice".into(),node_id:"n1".into(),name:"terminal".into(),image_id:"debian".into(),resources:brocade_deployment::cvm::Resources{vcpus:1,memory_bytes:134217728,root_disk_bytes:3000000000},
-        ssh_public_key:"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEiBcpQEzqzjADp8VXvOigHnqLh5L5xP76cwoCD8YMK5".into(),interfaces:vec![InterfaceRequest{source_id:"public".into(),purpose:InterfacePurpose::Contact,default_ipv4:false,default_ipv6:false}]}).await.unwrap();
     publish_cvm_intent(&db).await;
     let d = &instance.desired;
     let id = d.id.clone();
@@ -135,21 +170,24 @@ async fn cvm_terminal_http_websocket_relay_revocation_and_lifecycle() {
         async move { axum::serve(listener, app).await.unwrap() }
     });
     let node = db.store.issue_node_token("n1").await.unwrap().token;
-    for version in [None, Some(CVM_PROTOCOL_VERSION - 1)] {
+    for version in [None, Some("obsolete")] {
         let mut request = format!("ws://{address}/agent/v1/cvm/terminal/control")
             .into_client_request()
             .unwrap();
         request
             .headers_mut()
             .insert("authorization", format!("Bearer {node}").parse().unwrap());
-        request
-            .headers_mut()
-            .insert(wire::VERSION_HEADER, wire::VERSION.parse().unwrap());
+        request.headers_mut().insert(
+            "x-brocade-protocol-version",
+            brocade_deployment::protocol::AGENT_PROTOCOL_VERSION
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
         if let Some(version) = version {
-            request.headers_mut().insert(
-                "x-brocade-protocol-version",
-                version.to_string().parse().unwrap(),
-            );
+            request
+                .headers_mut()
+                .insert(wire::VERSION_HEADER, version.parse().unwrap());
         }
         assert!(matches!(
             tokio_tungstenite::connect_async(request).await,
@@ -223,6 +261,7 @@ async fn cvm_terminal_http_websocket_relay_revocation_and_lifecycle() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let created = (StatusCode::OK, response_json(response).await);
+    assert_eq!(created.1["webrtc"]["supported"], false);
     let session = created.1["session_id"].as_str().unwrap();
     let ticket = created.1["ticket"].as_str().unwrap();
     let browser_path = format!("/cvm/{id}/terminal/{session}/stream");
@@ -415,8 +454,23 @@ async fn cvm_terminal_http_websocket_relay_revocation_and_lifecycle() {
             );
         }
     }
+    // Rolling upgrade: the same v2 route independently negotiates RTC support.
+    control.close(None).await.unwrap();
+    let mut rtc_control =
+        socket_capability(address, "/agent/v1/cvm/terminal/control", &node, true, true).await;
+    let initial = tokio::time::timeout(Duration::from_secs(5), rtc_control.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    if let Message::Ping(p) = initial {
+        rtc_control.send(Message::Pong(p)).await.unwrap();
+    } else {
+        panic!("expected RTC control registration heartbeat");
+    }
     let created = post_json(&app, &admin, &path, json!({})).await;
     assert_eq!(created.0, StatusCode::OK);
+    assert_eq!(created.1["webrtc"]["supported"], true);
     let session = created.1["session_id"].as_str().unwrap();
     let mut browser = socket(
         address,
@@ -427,11 +481,72 @@ async fn cvm_terminal_http_websocket_relay_revocation_and_lifecycle() {
     .await;
     browser
         .send(Message::text(
-            json!({"ticket":created.1["ticket"]}).to_string(),
+            json!({"ticket":created.1["ticket"],"rtc_offer":"v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"}).to_string(),
         ))
         .await
         .unwrap();
-    let _ = next_message(&mut control).await;
+    let offer: wire::ConnectionOffer = serde_json::from_str(
+        next_message(&mut rtc_control)
+            .await
+            .into_text()
+            .unwrap()
+            .as_str(),
+    )
+    .unwrap();
+    assert_eq!(offer.session_id, session);
+    assert!(offer.rtc.is_some());
+    let mut rtc_agent = socket(
+        address,
+        &format!("/agent/v1/cvm/terminal/{session}/stream"),
+        &node,
+        true,
+    )
+    .await;
+    browser
+        .send(Message::text(r#"{"type":"control_probe","nonce":70}"#))
+        .await
+        .unwrap();
+    assert!(matches!(
+        serde_json::from_str::<wire::BrowserControl>(
+            next_message(&mut browser)
+                .await
+                .into_text()
+                .unwrap()
+                .as_str()
+        )
+        .unwrap(),
+        wire::BrowserControl::ControlGrant { nonce: 70 }
+    ));
+    rtc_agent
+        .send(Message::text(r#"{"type":"lease_probe","nonce":71}"#))
+        .await
+        .unwrap();
+    assert!(matches!(
+        serde_json::from_str::<wire::AgentControl>(
+            next_message(&mut rtc_agent)
+                .await
+                .into_text()
+                .unwrap()
+                .as_str()
+        )
+        .unwrap(),
+        wire::AgentControl::LeaseGrant { nonce: 71 }
+    ));
+    browser
+        .send(Message::text(r#"{"type":"control_probe","nonce":72}"#))
+        .await
+        .unwrap();
+    assert!(matches!(
+        serde_json::from_str::<wire::BrowserControl>(
+            next_message(&mut browser)
+                .await
+                .into_text()
+                .unwrap()
+                .as_str()
+        )
+        .unwrap(),
+        wire::BrowserControl::ControlGrant { nonce: 72 }
+    ));
     assert!(db
         .store
         .revoke_admin_token(&actor, "test-admin")
@@ -441,5 +556,23 @@ async fn cvm_terminal_http_websocket_relay_revocation_and_lifecycle() {
         next_message(&mut browser).await,
         Message::Close(_)
     ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rtc_agent.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Text(value))) => assert!(matches!(
+                    serde_json::from_str::<wire::AgentControl>(&value).unwrap(),
+                    wire::AgentControl::Revoke
+                )),
+                Some(Ok(Message::Ping(p))) => {
+                    let _ = rtc_agent.send(Message::Pong(p)).await;
+                }
+                Some(Ok(Message::Pong(_))) => {}
+                other => panic!("unexpected RTC data after revocation: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
     server.abort();
 }

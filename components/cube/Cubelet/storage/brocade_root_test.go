@@ -1,10 +1,10 @@
 package storage
 
 import (
-	"os"
-	"path/filepath"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -25,15 +25,26 @@ func TestBrocadeRootRetentionRequiresExplicitDataDeletion(t *testing.T) {
 }
 
 func TestBrocadeRootManifestSurvivesLossOfTemporaryDatabase(t *testing.T) {
-	l:=&local{config:&Config{DataPath:t.TempDir()}}
-	info:=&StorageInfo{SandboxID:"aos-owned",BrocadeProtectedRoot:true,Volumes:map[string]*BackendFileInfo{"root":{Name:"root",VolumeName:"sb-aos-owned-root",Kind:"volume",FilePath:"/persistent/original"}}}
-	if err:=l.persistBrocadeRoot(info);err!=nil{t.Fatal(err)}
+	l := &local{config: &Config{DataPath: t.TempDir()}}
+	info := &StorageInfo{SandboxID: "aos-owned", Backend: "xfs", BrocadeProtectedRoot: true, Volumes: map[string]*BackendFileInfo{"root": {Name: "root", VolumeName: "sb-aos-owned-root", Kind: "volume", FilePath: "/persistent/original"}}}
+	if err := l.persistBrocadeRoot(info); err != nil {
+		t.Fatal(err)
+	}
 	// A fresh storage process has no in-memory or tmpfs database to consult.
-	fresh:=&local{config:&Config{DataPath:l.config.DataPath}}
-	read,err:=fresh.readBrocadeRoot("aos-owned");if err!=nil || read.Volumes["root"].FilePath!="/persistent/original"{t.Fatalf("root binding lost: %v",err)}
-	path:=filepath.Join(l.brocadeRootDir(),"aos-owned.json")
-	if err:=os.Chmod(path,0666);err!=nil{t.Fatal(err)}
-	if _,err:=fresh.readBrocadeRoot("aos-owned");err==nil{t.Fatal("untrusted manifest accepted")}
-	info.Volumes["root"].VolumeName="sb-another-owner-root"
-	if err:=l.persistBrocadeRoot(info);err==nil{t.Fatal("another instance root was accepted")}
+	fresh := &local{config: &Config{DataPath: l.config.DataPath}}
+	read, err := fresh.readBrocadeRoot("aos-owned")
+	if err != nil || read.Volumes["root"].FilePath != "/persistent/original" {
+		t.Fatalf("root binding lost: %v", err)
+	}
+	path := filepath.Join(l.brocadeRootDir(), "aos-owned.json")
+	if err := os.Chmod(path, 0666); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fresh.readBrocadeRoot("aos-owned"); err == nil {
+		t.Fatal("untrusted manifest accepted")
+	}
+	info.Volumes["root"].VolumeName = "sb-another-owner-root"
+	if err := l.persistBrocadeRoot(info); err == nil {
+		t.Fatal("another instance root was accepted")
+	}
 }

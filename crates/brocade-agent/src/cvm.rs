@@ -11,24 +11,16 @@ mod reconcile;
 mod terminal;
 
 pub(crate) fn check(args: &[String]) -> Result<(), String> {
-    if args == ["--baremetal-contract"] {
-        println!("brocade-host-native-v1");
+    if args == ["--baremetal-chain-contract"] {
+        println!("brocade-host-chain-egress-v1");
         return Ok(());
     }
-
     if args == ["--network-contract"] {
         println!("cubevs-attachments-v2");
         return Ok(());
     }
     if args == ["--version"] {
-        println!(
-            "{}",
-            if backend::native()? {
-                "brocade-host-native-v1"
-            } else {
-                "brocade-cube-rust-v1"
-            }
-        );
+        println!("brocade-cube-rust-v1");
         return Ok(());
     }
     if args == ["--maintenance-contract"] {
@@ -38,30 +30,42 @@ pub(crate) fn check(args: &[String]) -> Result<(), String> {
     if let [empty, flag, path] = args {
         if empty == "--empty" && flag == "--config" {
             let state = backend::state_path()?;
-            if backend::native()? {
-                host::Backend::inspect_empty(std::path::Path::new(path), &state)?;
-            } else {
-                brocade_cube::Backend::inspect_empty(std::path::Path::new(path), &state)?;
-            }
+            brocade_cube::Backend::inspect_empty(std::path::Path::new(path), &state)?;
             println!("brocade-cvm-empty-v1");
             return Ok(());
         }
+        if empty == "--empty" && flag == "--host-config" {
+            host::Backend::inspect_empty(std::path::Path::new(path), &backend::host_state_path()?)?;
+            println!("brocade-cvm-host-empty-v1");
+            return Ok(());
+        }
     }
-    let config = match args {
-        [] => backend::config_path()?,
-        [flag, path] if flag == "--config" => std::path::PathBuf::from(path),
+    let (config, host) = match args {
+        [] => (backend::config_path()?, false),
+        [flag, path] if flag == "--config" => (std::path::PathBuf::from(path), false),
+        [flag, path] if flag == "--host-config" => (std::path::PathBuf::from(path), true),
         _ => {
             return Err(
-                "usage: brocade-agent cvm-check [--config /absolute/config.json | --version]"
-                    .into(),
+                "usage: brocade-agent cvm-check [--config /absolute/cube.json | --host-config /absolute/host.json | --version]".into(),
             )
         }
     };
+    if host {
+        let inventory = host::system_inventory(&config)?;
+        println!(
+            "{}",
+            serde_json::to_string(
+                &serde_json::json!({"executor":"brocade-host-system-v1","host_system":inventory})
+            )
+            .map_err(|_| "host system inventory serialization failed")?
+        );
+        return Ok(());
+    }
     let capabilities = backend::inspect(&config)?;
     println!(
         "{}",
         serde_json::to_string(
-            &serde_json::json!({"executor":if backend::native()? {"brocade-host-native-v1"} else {"brocade-cube-rust-v1"},"capabilities":capabilities})
+            &serde_json::json!({"executor":"brocade-cube-rust-v1","capabilities":capabilities})
         )
         .map_err(|_| "CVM capabilities serialization failed")?
     );
@@ -102,15 +106,21 @@ pub(crate) fn inspect_empty(
     config: &std::path::Path,
     state: &std::path::Path,
 ) -> Result<(), String> {
-    if backend::native()? {
-        host::Backend::inspect_empty(config, state)
-    } else {
-        brocade_cube::Backend::inspect_empty(config, state)
-    }
+    brocade_cube::Backend::inspect_empty(config, state)
 }
 
-pub(crate) fn native_selected() -> Result<bool, String> {
-    backend::native()
+pub(crate) fn inspect_host_empty(
+    config: &std::path::Path,
+    state: &std::path::Path,
+) -> Result<(), String> {
+    host::Backend::inspect_empty(config, state)
+}
+
+pub(crate) fn native_chain_configured() -> Result<bool, String> {
+    if backend::host_config_path()?.is_none() {
+        return Ok(false);
+    }
+    host::chain_configured(&backend::host_state_path()?)
 }
 
 #[cfg(test)]

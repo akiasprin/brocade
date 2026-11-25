@@ -22,7 +22,7 @@ impl<'de> Deserialize<'de> for RouteTarget {
             }
             (None, Some(chain_id)) if valid_id(&chain_id) => Ok(Self::Chain { chain_id }),
             _ => Err(serde::de::Error::custom(
-                "route must select exactly one valid interface or chain",
+                "每条路由须选择一张有效网卡或一条有效线路，不能同时选择两种出口",
             )),
         }
     }

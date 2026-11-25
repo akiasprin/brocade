@@ -40,8 +40,11 @@ for (const { width, machines, theme } of cases) {
       await page.evaluate(() => Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) > innerWidth),
     ).toBe(false);
     if (width <= 680) {
-      await expect(board).toBeHidden();
-      await expect(page.getByRole('region', { name: '按用户的当前速率' })).toBeVisible();
+      // Phones keep the matrix: a narrower user column with totals under the names, no separate list.
+      await expect(board).toBeVisible();
+      await expect(board).toHaveClass(/\bcompact\b/);
+      await expect(board.locator('thead .flt-sum')).toHaveCount(0);
+      await expect(page.getByRole('region', { name: '按用户的当前速率' })).toHaveCount(0);
       return;
     }
 
@@ -184,12 +187,23 @@ async function matrixDimensions(board: Locator) {
   });
 }
 
-test('few machine columns keep horizontal labels on a large paper', async ({ page }) => {
+test('few machines print readings in fixed-size cells on any paper', async ({ page }) => {
   await page.clock.setFixedTime(new Date('2026-10-28T08:00:00Z'));
   await page.setViewportSize({ width: 2300, height: 900 });
   await page.goto('/tests/fixtures/fleet-traffic-preview.html?scene=few&w=2300&nav=0&run=0');
   const board = page.getByRole('region', { name: '用户与机器的当前速率' });
   await expect(board.locator('thead th[data-node]')).toHaveCount(3);
+  // Reading cells stay 104px wide however much paper is left; the legend follows the table width.
+  await expect(board).toHaveClass(/\breading\b/);
+  expect(
+    await board
+      .locator('thead th[data-node]')
+      .first()
+      .evaluate(head => head.getBoundingClientRect().width),
+  ).toBe(104);
+  const table = await board.locator('.flt-grid').evaluate(element => element.getBoundingClientRect().toJSON());
+  const under = await board.locator('.flt-under').evaluate(element => element.getBoundingClientRect().toJSON());
+  expect(under.right).toBeLessThanOrEqual(Math.max(table.right, table.left + 560) + 1);
   for (const label of await board.locator('.flt-mlabel').all()) {
     expect(await label.evaluate(element => getComputedStyle(element).transform)).toBe('none');
   }

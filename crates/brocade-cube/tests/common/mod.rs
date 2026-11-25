@@ -44,6 +44,8 @@ pub struct State {
     pub storage_backend: Option<String>,
     pub boxes: Vec<Value>,
     pub creates: usize,
+    pub initial_internet_access: Option<bool>,
+    pub initial_deny_out: Vec<String>,
     pub root_deletes: usize,
     pub root_exists: bool,
     pub root_name: String,
@@ -58,6 +60,7 @@ pub struct State {
     pub network_delay: bool,
     pub network_active: bool,
     pub network_overlap: bool,
+    pub omit_prepared_shim: bool,
     pub network_actions: Vec<String>,
     pub vcpu_request: Vec<Value>,
 }
@@ -141,9 +144,14 @@ impl cb::cubebox_mgr_server::CubeboxMgr for Cube {
             let mut evidence = json!({"contract":"cubevs-attachments-v2","interfaces":[],"network":null,"detached_interfaces":[],"network_absent":false});
             match action.as_str() {
                 "inventory" => {
-                    evidence = json!({"contract":"cubevs-attachments-v2","max_interfaces":3,"sources":{},"managed_nics":true})
+                    evidence = json!({"contract":"cubevs-attachments-v2","max_interfaces":3,"managed_nics":true,"network_quota":false,"primary_ip_delivery":true,"route_services":true,"chain_egress":true})
                 }
-                "prepare" => evidence["shim_version"] = json!("test-shim"),
+                "prepare" => {
+                    if !self.state.lock().unwrap().omit_prepared_shim {
+                        evidence["shim_version"] = json!("test-shim");
+                    }
+                }
+                "guard_routes" => {}
                 "quota" => evidence["reports"] = json!([]),
                 "reconcile" => {
                     if payload["release"] == true {
@@ -154,7 +162,7 @@ impl cb::cubebox_mgr_server::CubeboxMgr for Cube {
                     } else {
                         let nics=payload["interfaces"].as_array().unwrap().iter().map(|nic|json!({"id":nic["id"],"device":"eth0","mac":"02:00:00:00:00:01","addresses":["192.0.2.10/32"],"attached":true})).collect::<Vec<_>>();
                         evidence["interfaces"] = json!(nics);
-                        evidence["network"] = json!({"contact_route_preserved":true,"business_fallback_blocked":true,"default_ipv4_interface":null,"default_ipv6_interface":null});
+                        evidence["network"] = json!({"chain_egress_configured":false,"routing_revision":payload["routing"]["revision"],"contact_route_preserved":true,"business_fallback_blocked":true,"default_ipv4_interface":null,"default_ipv6_interface":null});
                         let state = self.state.lock().unwrap();
                         evidence["actual_vcpus"] = json!(state.cpu);
                         evidence["actual_memory_bytes"] = json!(state.memory);
@@ -190,6 +198,15 @@ impl cb::cubebox_mgr_server::CubeboxMgr for Cube {
         let request = request.into_inner();
         let mut state = self.state.lock().unwrap();
         state.creates += 1;
+        state.initial_internet_access = request
+            .cube_network_config
+            .as_ref()
+            .and_then(|policy| policy.allow_internet_access);
+        state.initial_deny_out = request
+            .cube_network_config
+            .as_ref()
+            .map(|policy| policy.deny_out.clone())
+            .unwrap_or_default();
         state.cpu = request.containers[0]
             .resources
             .as_ref()
@@ -444,6 +461,20 @@ fn simulate_exec(exec: Arc<Exec>) {
             .as_array()
             .unwrap()
             .iter()
+            .any(|v| v.as_str().is_some_and(|s| s.contains("| chpasswd")))
+        {
+            let secret = read_line(&mut reader, &exec)?;
+            assert!(
+                secret.len() == 32,
+                "password input must be bounded and separate from process arguments"
+            );
+            assert!(!exec.process.to_string().contains(&secret));
+        }
+
+        if exec.process["args"]
+            .as_array()
+            .unwrap()
+            .iter()
             .any(|v| v.as_str().is_some_and(|s| s.contains("printf 'boot '")))
         {
             writer.write_all(METRICS.as_bytes())?;
@@ -612,7 +643,9 @@ impl Fixture {
                 memory_bytes: 128 * 1024 * 1024,
                 root_disk_bytes: 3 * 1024 * 1024 * 1024,
             },
-            ssh_public_key: public_key(),
+
+            login_revision: 1,
+            legacy_ssh_public_key: None,
             interfaces: vec![InterfaceSpec {
                 allocated: None,
                 id: "nic-test".into(),
@@ -624,9 +657,8 @@ impl Fixture {
                 },
             }],
         };
-        InstanceDesired {
+        let mut desired = InstanceDesired {
             artifacts: None,
-            artifact_mode: Default::default(),
             detached_interfaces: Vec::new(),
             id: "cvm-test".into(),
             operation_id: "op-1".into(),
@@ -637,7 +669,40 @@ impl Fixture {
             delete_data: false,
             restart_epoch: 0,
             reinstall_epoch: 0,
-        }
+        };
+        self.compile(&mut desired);
+        self.backend()
+            .stage_credential(&GuestCredential {
+                instance_id: desired.id.clone(),
+                revision: desired.spec.login_revision,
+                password: "A".repeat(32),
+            })
+            .unwrap();
+        desired
+    }
+    pub fn compile(&self, desired: &mut InstanceDesired) {
+        let capabilities = self.backend().inventory().unwrap();
+        let image_manifest = self
+            .backend()
+            .image_manifests()
+            .into_iter()
+            .find(|manifest| {
+                desired
+                    .spec
+                    .image
+                    .as_ref()
+                    .is_some_and(|image| image.sha256 == manifest.sha256)
+            })
+            .unwrap();
+        desired.artifacts = Some(
+            brocade_cvm_compile::compile(&CvmArtifactInput {
+                instance_id: desired.id.clone(),
+                spec: desired.spec.clone(),
+                image_manifest,
+                capabilities,
+            })
+            .unwrap(),
+        );
     }
     pub fn report(&self, generation: u64) -> Value {
         // The receipt file becomes visible before the executor publishes its record.
@@ -678,16 +743,6 @@ impl Drop for Fixture {
             inspector.join().unwrap();
         }
     }
-}
-
-pub fn public_key() -> String {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let mut key = vec![];
-    key.extend_from_slice(&11u32.to_be_bytes());
-    key.extend_from_slice(b"ssh-ed25519");
-    key.extend_from_slice(&32u32.to_be_bytes());
-    key.extend_from_slice(&[7; 32]);
-    format!("ssh-ed25519 {}", STANDARD.encode(key))
 }
 
 fn capabilities(digest: String) -> Value {

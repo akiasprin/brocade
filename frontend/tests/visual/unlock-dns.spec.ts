@@ -128,3 +128,19 @@ test('YouTube CN region restrictions use the same notice as MO', async ({ page }
   }
   await expect(page).toHaveScreenshot('youtube-cn-region-notice-1440-light.png');
 });
+
+test('connection evidence identifies missing DNS and a mismatched exit profile separately', async ({ page }) => {
+  await page.clock.setFixedTime(new Date('2026-10-26T08:00:00Z'));
+  await page.setViewportSize({ width: 390, height: 1100 });
+  await page.goto(
+    '/tests/fixtures/node-unlock-preview.html?scope=chain&scene=macau&connection-evidence=1&connection-mixed=1&connection-identity=1',
+  );
+  await page.getByRole('button', { name: '解锁', exact: true }).click();
+  const premium = page.getByRole('article', { name: 'YouTube Premium', exact: true });
+  await premium.getByRole('button', { name: 'YouTube Premium · 部分回退的解析路径' }).click();
+  const detail = page.getByRole('region', { name: 'YouTube Premium · 部分回退的解析路径' });
+  await expect(detail).toContainText('DNS 路径记录不完整');
+  await expect(detail).toContainText('报告出口 exit-taiwan');
+  await expect(detail).toContainText('出口配置或拨号地址族与本次检测不符');
+  await expect(detail).toHaveScreenshot('connection-identity-390.png');
+});

@@ -7,6 +7,7 @@ outside releases. A failed or interrupted activation restores the previous relea
 """
 
 import argparse
+import ctypes
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -582,14 +583,55 @@ def host_memory_budget():
 
 
 def render_configuration(release, previous=None, mode='kvm'):
+    """Publish only a complete configuration, including when regenerating this release."""
+    with tempfile.TemporaryDirectory(prefix='.generated-', dir=release) as temporary:
+        generated = Path(temporary) / 'configuration'
+        render_configuration_into(release, previous, mode, generated)
+        destination = release / 'generated'
+        if destination.exists():
+            if destination.is_symlink() or not destination.is_dir():
+                raise StackError('generated configuration is not an owned directory')
+            # Linux rename exchange keeps the old complete directory available until
+            # the new one is visible. A killed renderer never publishes its templates.
+            libc = ctypes.CDLL(None, use_errno=True)
+            if not hasattr(libc, 'renameat2'):
+                raise StackError('atomic CVM configuration replacement requires Linux renameat2')
+            exchange = libc.renameat2
+            exchange.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+            exchange.restype = ctypes.c_int
+            if exchange(-100, os.fsencode(generated), -100, os.fsencode(destination), 2) != 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
+        else:
+            os.rename(generated, destination)
+        sync_dir(release)
+
+
+def render_configuration_into(release, previous, mode, generated):
     """Keep immutable payloads separate from host-rendered public configuration."""
-    generated = release / 'generated'
+    published = release / 'generated'
     if previous:
         old = read_json(previous / 'generated/cube.json')
         old_native = read_json(previous / 'generated/network.json')
+        if 'bridge_sources' in old_native or old_native.get('state_dir') != '/data/cubelet/network-attachments-v2':
+            raise StackError('obsolete CVM network configuration is unsupported; clean up the old runtime first')
+        sources = old['capabilities']['network_sources']
+        if len(sources) != 1 or sources[0]['kind'] != 'public':
+            raise StackError('obsolete CVM local network sources are unsupported')
+        if old.get('virtualization_mode') not in ('kvm', 'pvm'):
+            raise StackError('retained CVM configuration requires an explicit virtualization mode')
         old_cubelet = (previous / 'generated/cubelet.toml').read_text()
+        if (
+            old.get('network_inspection_url') != INSPECTION_URL
+            or tomllib.loads(old_cubelet)['http']['address'] != INSPECTION_ADDRESS
+        ):
+            raise StackError('obsolete CVM inspection configuration is unsupported')
         old_dynamic = (previous / 'generated/dynamic.yaml').read_bytes()
-    generated.mkdir(exist_ok=True, mode=0o700)
+    retained = release / 'generated'
+    if retained.exists():
+        shutil.copytree(retained, generated, symlinks=True)
+    else:
+        generated.mkdir(mode=0o700)
     uplinks = json.loads(run(['ip', '-j', 'route', 'show', 'default']))
     uplink = next((route.get('dev') for route in uplinks if route.get('dev')), '')
     if not re.fullmatch(r'[A-Za-z0-9_.-]{1,15}', uplink):
@@ -620,7 +662,7 @@ def render_configuration(release, previous=None, mode='kvm'):
         atomic_json(generated / 'storage.json', {'backend': backend, 'filesystem_uuid': local_storage_uuid()})
     cfg['storage_backend'] = backend
     if previous:
-        # Administrator network sources and capacity are persistent host choices.
+        # Preserve current administrator settings; executable artifacts come from this release.
         for key, value in old_native.items():
             if key not in ('shim_version', 'shim_sha256'):
                 native[key] = value
@@ -654,7 +696,7 @@ def render_configuration(release, previous=None, mode='kvm'):
     caps['allocatable_memory_bytes'] = min(caps['allocatable_memory_bytes'], memory_budget)
     config_path = generated / 'cubelet.toml'
     source = apply_resource_defaults(config_path.read_text(), (release / 'config/cubelet.toml').read_text())
-    # Older managed bundles used Console's port; migrate both ends together.
+    # The private inspection listener is owned by this runtime configuration.
     source = set_toml_values(source, 'http', {'address': INSPECTION_ADDRESS})
     cfg['network_inspection_url'] = INSPECTION_URL
     atomic(config_path, source.encode())
@@ -666,20 +708,19 @@ def render_configuration(release, previous=None, mode='kvm'):
     # Recompute manifests after rendering paths; a system image remains independent of capacity.
     for image in caps['images']:
         path = Path(cfg['image_files'][image['id']])
-        if not path.is_relative_to(generated):
+        if not path.is_relative_to(published):
             raise StackError('packaged system manifest is outside the managed release configuration')
-        image['sha256'] = digest(path)
+        image['sha256'] = digest(generated / path.relative_to(published))
     if previous:
         by_id = {image['id']: image for image in caps['images']}
-        for image in old['capabilities']['images'] if old.get('virtualization_mode', 'kvm') == mode else []:
+        for image in old['capabilities']['images'] if old['virtualization_mode'] == mode else []:
             if image['id'] in by_id and image != by_id[image['id']]:
                 raise StackError('a published image identity was changed by the CVM bundle')
             by_id[image['id']] = image
             cfg['image_files'].setdefault(image['id'], old['image_files'][image['id']])
         caps['images'] = [by_id[key] for key in sorted(by_id)]
-    # The allocated NIC contract replaces the local bridge catalogue. Its device
-    # slots do not depend on how many administrator bridges happened to exist.
-    native.pop('bridge_sources', None)
+    if 'bridge_sources' in native:
+        raise StackError('CVM bundles must use Store-assigned NICs, without a local bridge catalogue')
     native['state_dir'] = '/data/cubelet/network-attachments-v2'
     caps['hot_attach'] = caps['hot_detach'] = True
     caps['max_interfaces'] = native['max_interfaces'] = 3
@@ -1156,7 +1197,10 @@ def main():
     resume.add_argument('--release', required=True)
     sub.add_parser('cancel-mode')
     sub.add_parser('status')
-    sub.add_parser('rollback')
+    rollback = sub.add_parser('rollback')
+    rollback.add_argument(
+        '--release', help='explicit retained release SHA-256; omitted retries retain the last rollback target'
+    )
     sub.add_parser('recover')
     start = sub.add_parser('start-cubelet')
     start.add_argument('--release', required=True)
@@ -1186,7 +1230,8 @@ def main():
             host.cancel()
     elif args.command == 'rollback':
         with install.locked():
-            previous = install.state().get('previous')
+            state = install.state()
+            previous = args.release or state.get('current' if state.get('action') == 'rollback' else 'previous')
             if not previous:
                 raise StackError('no previous CVM release is retained')
             manifest = verify_release(install.release(previous))

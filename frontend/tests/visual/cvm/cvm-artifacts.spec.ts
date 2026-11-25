@@ -1,4 +1,4 @@
-import { waitForVisualAssets } from '../helpers/visual-ready';
+import { fitViewportTo, waitForVisualAssets } from '../helpers/visual-ready';
 import { expect, test } from '@playwright/test';
 for (const width of [1440, 390, 320])
   for (const theme of ['light', 'dark']) {
@@ -7,9 +7,10 @@ for (const width of [1440, 390, 320])
       await page.setViewportSize({ width, height: 1000 });
       await page.goto(`/tests/fixtures/cvm/preview.html?scene=artifacts&theme=${theme}`);
       await page.getByRole('tab', { name: '产物', exact: true }).click();
-      await expect(page.getByText(/影子比对一致/)).toBeVisible();
+      await expect(page.getByRole('status').filter({ hasText: '产物校验通过，已按这一代产物执行' })).toBeVisible();
       await expect(page.locator('.cvm-monitoring')).toHaveCount(0);
       await waitForVisualAssets(page);
+      await fitViewportTo(page, page.locator('.cvm-artifacts'));
       await expect(page.locator('.cvm-artifacts')).toHaveScreenshot(`artifacts-${width}-${theme}.png`);
       await page.getByRole('button', { name: /网卡附件/ }).click();
       await expect(page.getByLabel('产物差异')).toContainText('nic-business');
@@ -24,8 +25,9 @@ for (const scene of ['artifacts-mismatch', 'artifacts-legacy'])
     await page.goto(`/tests/fixtures/cvm/preview.html?scene=${scene}&theme=light`);
     await page.getByRole('tab', { name: '产物', exact: true }).click();
     await expect(
-      page.getByText(scene === 'artifacts-mismatch' ? /影子比对不一致/ : /这一代没有编译产物/),
+      page.getByText(scene === 'artifacts-mismatch' ? /产物校验不一致/ : /这一代没有编译产物/),
     ).toBeVisible();
+    await fitViewportTo(page, page.locator('.cvm-detail'));
     await expect(page.locator('.cvm-detail')).toHaveScreenshot(`${scene}.png`);
   });
 
@@ -33,10 +35,11 @@ test('artifact pending restart does not show the previous operation evidence', a
   await page.setViewportSize({ width: 390, height: 1000 });
   await page.goto('/tests/fixtures/cvm/preview.html?scene=artifacts-pending&theme=light');
   await page.getByRole('tab', { name: '产物', exact: true }).click();
-  await expect(page.getByText('尚无这一代的产物比对回执')).toBeVisible();
+  await expect(page.getByText('尚无这一代的产物校验回执')).toBeVisible();
   await expect(page.getByText('尚无已确认的生效摘要')).toBeVisible();
   await expect(page.getByText('e'.repeat(64), { exact: true })).toHaveCount(0);
   await expect(page.getByText('执行绑定值')).toHaveCount(0);
   await waitForVisualAssets(page);
+  await fitViewportTo(page, page.locator('.cvm-artifacts'));
   await expect(page.locator('.cvm-artifacts')).toHaveScreenshot('artifacts-pending-390-light.png');
 });

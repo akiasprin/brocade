@@ -66,7 +66,7 @@ for (const width of [1440, 390]) {
       await expect(page).toHaveURL(/#\/nodes$/);
       await expect(page.locator('.nd-page-head')).toBeVisible();
     } else {
-      await expect(page.getByRole('tab', { name: '组合台', exact: true })).toBeVisible();
+      await expect(page.getByRole('tab', { name: '容器', exact: true })).toBeVisible();
       await expect(primary.getByRole('button', { name: '容器', exact: true })).toHaveAttribute('aria-current', 'true');
     }
   });

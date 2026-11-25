@@ -10,6 +10,7 @@ use std::{
 pub(crate) mod bindings;
 pub(crate) mod entries;
 pub(super) mod metering;
+mod network_edit;
 mod publications;
 mod versions;
 pub use bindings::*;
@@ -18,6 +19,10 @@ pub use entries::{
     CvmEntryView, CvmNetworkLogDomain, CvmNetworkLogs, CvmNetworkNodeLogs,
 };
 pub use metering::CvmNicUsage;
+pub use network_edit::{
+    CvmNetworkEditRequest, CvmNetworkEditResult, CvmNetworkEntryAddition, CvmNetworkEntryRelease,
+    CvmNetworkMount, CvmNetworkRoutesWrite,
+};
 pub use publications::*;
 
 use crate::resource_coordination::lock;
@@ -87,7 +92,7 @@ async fn capability(tx: &mut Transaction<'_, Postgres>, node: &str) -> Result<Ni
     let row=sqlx::query("SELECT s.capabilities,s.observed_at>now()-interval '150 seconds' AS fresh FROM cvm_nic_nodes s JOIN nodes n ON n.id=s.node_id WHERE s.node_id=$1 AND n.retired_at IS NULL").bind(node).fetch_optional(&mut **tx).await?.ok_or_else(||StoreError::Unsupported("机器尚未上报远端网卡能力".into()))?;
     let caps: NicNodeCapabilities = serde_json::from_value(row.try_get("capabilities")?)?;
     if !row.try_get::<bool, _>("fresh")?
-        || caps.contract != NIC_PROTOCOL_VERSION
+        || caps.contract != NIC_CONTRACT_VERSION
         || caps.error.is_some()
     {
         return Err(StoreError::Unsupported("机器网络能力已过期或不可用".into()));
@@ -129,7 +134,7 @@ async fn instance_locked_for_change(
         .await?
         .ok_or_else(|| StoreError::NotFound("CVM".into()))?;
     let instance = from_row(&row)?;
-    require_owner(actor, &instance.tenant_id, &instance.user_id, true)?;
+    require_manager(actor, &instance.tenant_id)?;
     if instance.desired.generation != generation {
         return Err(StoreError::Conflict("容器已变化，请刷新后操作".into()));
     }
@@ -295,256 +300,23 @@ impl PgStore {
             return Ok(CvmMutationResult::existing(instance));
         }
         let instance = instance_locked(&mut tx, actor, id, request.expected_generation).await?;
-        let p = publication(&mut tx, &request.publication_id).await?;
-        if p.retired || !p.admitting {
-            return Err(StoreError::Conflict("该网卡发布项已停止新增挂载".into()));
-        }
-        if !granted(actor, &instance.tenant_id, &instance.user_id, &p) {
-            return Err(StoreError::Forbidden("尚未获得该网卡的挂载授权".into()));
-        }
-        let quota = quota_locked(&mut tx, &instance.tenant_id, &instance.user_id).await?;
-        admission(&mut tx, &quota, &instance.node_id, None, 1).await?;
-        let host = host_locked(&mut tx, &instance.node_id, false).await?;
-        if instance.desired.spec.interfaces.len() >= usize::from(host.max_interfaces)
-            || instance.desired.spec.interfaces.len() >= MAX_INTERFACES
-        {
-            return Err(invalid("已达到宿主实际网卡容量"));
-        }
-        if instance.desired.power == PowerState::Running && !host.hot_attach {
-            return Err(StoreError::Unsupported("请先关机，再挂载网卡".into()));
-        }
-        let consumer = capability(&mut tx, &instance.node_id).await?;
-        let provider = capability(&mut tx, &p.spec.provider_node).await?;
-        if !consumer.consume
-            || !provider.provide
-            || !consumer.transports.contains(&request.transport)
-            || !provider.transports.contains(&request.transport)
-        {
-            return Err(StoreError::Unsupported("双方没有共同支持的所选承载".into()));
-        }
-        let offer = p
-            .spec
-            .transports
-            .iter()
-            .find(|t| t.kind == request.transport)
-            .ok_or_else(|| invalid("发布项不支持所选承载"))?
-            .clone();
-        let count:i64=sqlx::query_scalar("SELECT count(DISTINCT interface_id) FROM cvm_nic_allocations WHERE publication_id=$1 AND NOT released").bind(&p.id).fetch_one(&mut *tx).await?;
-        if count >= i64::from(p.spec.limits.max_attachments) {
-            return Err(invalid("发布项可用挂载容量已满"));
-        }
-        let provider_count:i64=sqlx::query_scalar("SELECT count(DISTINCT interface_id) FROM cvm_nic_allocations WHERE provider_node=$1 AND NOT released").bind(&p.spec.provider_node).fetch_one(&mut *tx).await?;
-        let consumer_count:i64=sqlx::query_scalar("SELECT count(DISTINCT interface_id) FROM cvm_nic_allocations WHERE consumer_node=$1 AND NOT released").bind(&instance.node_id).fetch_one(&mut *tx).await?;
-        if provider_count >= i64::from(provider.max_bindings)
-            || consumer_count >= i64::from(consumer.max_bindings)
-        {
-            return Err(invalid("执行机器承载容量不足"));
-        }
         let mut desired = instance.desired.clone();
-        let mut avoid: BTreeSet<IpAddr> = devices(&desired)
-            .values()
-            .flat_map(|n| [n.ipv4, n.ipv6])
-            .flatten()
-            .collect();
-        if let Some(report) = &instance.report {
-            for actual in &report.interfaces {
-                for raw in &actual.addresses {
-                    if let Ok(address) = raw.split('/').next().unwrap_or_default().parse::<IpAddr>()
-                    {
-                        avoid.insert(address);
-                    }
-                }
-            }
-        }
-        let public_avoid = public_exclusions(&mut tx, &p.spec.provider_node).await?;
-        if p.spec.address_mode == NicAddressMode::DedicatedRouted {
-            avoid.extend(public_avoid.iter().copied());
-        }
-        let private_scope = format!("private:{}", p.spec.resource_domain);
-        let public_scope = format!("public:{}", p.spec.provider_node);
-        let used_slots = allocated_values(&mut tx, "global", "slot").await?;
-        let slot = (0..8192u16)
-            .find(|s| !used_slots.contains(&s.to_string()))
-            .ok_or_else(|| invalid("网卡隔离上下文已达上限"))?;
-        let ipv4 = allocate_address(
+        mount_nic_tx(
             &mut tx,
-            p.spec.ipv4_pool.as_ref(),
-            &private_scope,
-            "ipv4",
-            &avoid,
-        )
-        .await?;
-        let ipv6 = allocate_address(
-            &mut tx,
-            p.spec.ipv6_pool.as_ref(),
-            &private_scope,
-            "ipv6",
-            &avoid,
-        )
-        .await?;
-        let public_ipv4 = match p.spec.address_mode {
-            NicAddressMode::SharedNat => p.spec.shared_ipv4,
-            NicAddressMode::DedicatedRouted => ipv4,
-            NicAddressMode::DedicatedNat => {
-                allocate_address(
-                    &mut tx,
-                    p.spec.public_ipv4_pool.as_ref(),
-                    &public_scope,
-                    "ipv4",
-                    &public_avoid,
-                )
-                .await?
-            }
-        };
-        let public_ipv6 = match p.spec.address_mode {
-            NicAddressMode::SharedNat => p.spec.shared_ipv6,
-            NicAddressMode::DedicatedRouted => ipv6,
-            NicAddressMode::DedicatedNat => {
-                allocate_address(
-                    &mut tx,
-                    p.spec.public_ipv6_pool.as_ref(),
-                    &public_scope,
-                    "ipv6",
-                    &public_avoid,
-                )
-                .await?
-            }
-        };
-        let nic_id = format!(
-            "nic-{}",
-            &sha256_hex(
-                format!(
-                    "cvm-mount:{}:{}:{}",
-                    actor.operator_id(),
-                    id,
-                    request.request_id
-                )
-                .as_bytes()
-            )[..32]
-        );
-        let allocation_id = format!(
-            "allocation-{}",
-            &sha256_hex(
-                format!(
-                    "cvm-allocation:{}:{}:{}",
-                    actor.operator_id(),
-                    id,
-                    request.request_id
-                )
-                .as_bytes()
-            )[..32]
-        );
-        let allocated = AllocatedNic {
-            slot,
-            publication_id: p.id.clone(),
-            publication_revision: p.revision,
-            provider_node: p.spec.provider_node.clone(),
-            resource_domain: p.spec.resource_domain.clone(),
-            allocation_id: allocation_id.clone(),
-            mac: mac(&nic_id),
-            ipv4,
-            ipv6,
-            public_ipv4,
-            public_ipv6,
-            address_mode: p.spec.address_mode,
-            destinations: p.spec.destinations.clone(),
-            transport: request.transport,
-            transport_generation: 1,
-            mtu: offer.mtu,
-            blocked: false,
-            quota_exceeded: false,
-            limits: p.spec.limits.clone(),
-        };
-        let nic = InterfaceSpec {
-            id: nic_id.clone(),
-            allocated: Some(allocated.clone()),
-            connection: InterfaceRequest {
-                source_id: p.id.clone(),
-                purpose: InterfacePurpose::Business,
-                default_ipv4: false,
-                default_ipv6: false,
+            actor,
+            &instance,
+            &mut desired,
+            NicMountEdit {
+                key: &request.request_id,
+                publication_id: &request.publication_id,
+                transport: request.transport,
+                use_dns_suggestions: request.use_dns_suggestions,
+                default_routes: true,
             },
-        };
-        insert_interface(&mut tx, id, &nic).await?;
-        sqlx::query("INSERT INTO cvm_nic_allocations(id,interface_id,instance_id,publication_id,provider_node,consumer_node,spec) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(&allocation_id).bind(&nic_id).bind(id).bind(&p.id).bind(&p.spec.provider_node).bind(&instance.node_id).bind(serde_json::to_value(&allocated)?).execute(&mut *tx).await?;
-        claim(
-            &mut tx,
-            &allocation_id,
-            None,
-            "global",
-            "slot",
-            &slot.to_string(),
+            false,
         )
         .await?;
-        for (address, kind) in [(ipv4, "ipv4"), (ipv6, "ipv6")] {
-            if let Some(address) = address {
-                claim(
-                    &mut tx,
-                    &allocation_id,
-                    None,
-                    &private_scope,
-                    kind,
-                    &address.to_string(),
-                )
-                .await?;
-            }
-        }
-        if p.spec.address_mode != NicAddressMode::SharedNat {
-            for (address, kind) in [(public_ipv4, "ipv4"), (public_ipv6, "ipv6")] {
-                if let Some(address) = address {
-                    claim(
-                        &mut tx,
-                        &allocation_id,
-                        None,
-                        &public_scope,
-                        kind,
-                        &address.to_string(),
-                    )
-                    .await?;
-                }
-            }
-        }
-        create_binding(
-            &mut tx,
-            id,
-            &nic_id,
-            &instance.node_id,
-            &allocated,
-            &offer,
-            &provider,
-        )
-        .await?;
-        desired.spec.interfaces.push(nic);
-        let priority = desired
-            .spec
-            .routing
-            .priorities
-            .iter()
-            .flat_map(|p| [p.ipv4, p.ipv6])
-            .flatten()
-            .max()
-            .unwrap_or(0)
-            .checked_add(10)
-            .ok_or_else(|| invalid("请先调整网卡优先级"))?;
-        desired.spec.routing.priorities.push(InterfacePriority {
-            target: RouteTarget::interface(nic_id.clone()),
-            ipv4: ipv4.map(|_| priority),
-            ipv6: ipv6.map(|_| priority),
-        });
-        for destination in &p.spec.route_presets {
-            desired.spec.routing.routes.push(ContainerRoute {
-                destination: destination.clone(),
-                target: RouteTarget::interface(nic_id.clone()),
-                service: None,
-            });
-        }
-        if request.use_dns_suggestions {
-            if !desired.spec.execution.is_cube() {
-                return Err(StoreError::Unsupported("裸机 DNS 由操作系统管理".into()));
-            }
-            desired.spec.routing.dns = p.spec.dns_suggestions.clone();
-        }
-        desired.spec.routing.revision += 1;
+        advance_routes(&mut desired.spec.routing)?;
         desired.spec.routing.normalize();
         desired
             .spec
@@ -595,46 +367,15 @@ impl PgStore {
             tx.commit().await?;
             return Ok(CvmMutationResult::existing(instance));
         }
-        let mut desired =
+        let instance =
             instance_locked_for_change(&mut tx, actor, id, request.expected_generation, true)
-                .await?
-                .desired;
-        if desired.spec.routing.revision != request.expected_revision {
-            return Err(StoreError::Conflict("路由表已变化，请刷新后操作".into()));
-        }
-        let mut routes = request.routes;
-        if !desired.spec.execution.is_cube() && !routes.dns.is_empty() {
-            return Err(StoreError::Unsupported("裸机 DNS 由操作系统管理".into()));
-        }
-        routes.revision = desired.spec.routing.revision;
-        routes.normalize();
-        if routes == desired.spec.routing {
+                .await?;
+        let mut desired = instance.desired;
+        check_route_revision(&desired, request.expected_revision)?;
+        if !set_routes_tx(&mut tx, &instance.node_id, &mut desired, request.routes).await? {
             return self.finish_cvm_review(tx, actor, id, review, true).await;
         }
-        routes.revision = request
-            .expected_revision
-            .checked_add(1)
-            .ok_or_else(|| invalid("路由版本已满"))?;
-        routes.normalize();
-        routes.validate(&devices(&desired)).map_err(invalid)?;
-        super::chain_egress::validate_selection(&mut tx, id, &routes).await?;
-        // Port rules need both the host Agent (host firewall) and Cubelet (Guest policy
-        // routing); an older executor would apply them as whole-prefix routes.
-        if routes.routes.iter().any(|route| route.service.is_some()) {
-            let instance =
-                sqlx::query_scalar::<_, String>("SELECT node_id FROM cvm_instances WHERE id=$1")
-                    .bind(id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            if !host_locked(&mut tx, &instance, false).await?.route_services
-                || !capability(&mut tx, &instance).await?.route_service
-            {
-                return Err(StoreError::Unsupported(
-                    "容器宿主的运行栈或 Agent 尚不支持按协议端口选择出口".into(),
-                ));
-            }
-        }
-        desired.spec.routing = routes;
+        advance_routes(&mut desired.spec.routing)?;
         persist_routes(&mut tx, actor, &desired).await?;
         save_network(
             &mut tx,
@@ -652,7 +393,364 @@ impl PgStore {
         self.finish_cvm_review(tx, actor, id, review, false).await
     }
 }
-async fn persist_routes(
+struct NicMountEdit<'a> {
+    key: &'a str,
+    publication_id: &'a str,
+    transport: TransportKind,
+    use_dns_suggestions: bool,
+    default_routes: bool,
+}
+
+/// Stage an allocation and its binding on a draft spec. The caller owns the routing revision,
+/// generation, compilation, and release for the complete edit.
+async fn mount_nic_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    instance: &CvmInstance,
+    desired: &mut InstanceDesired,
+    mount: NicMountEdit<'_>,
+    before_first_apply: bool,
+) -> Result<String> {
+    let id = &desired.id;
+    let p = publication(tx, mount.publication_id).await?;
+    if p.retired || !p.admitting {
+        return Err(StoreError::Conflict("该网卡发布项已停止新增挂载".into()));
+    }
+    if !granted(actor, &instance.tenant_id, instance.user(), &p) {
+        return Err(StoreError::Forbidden("尚未获得该网卡的挂载授权".into()));
+    }
+    let host = host_locked(tx, &instance.node_id, false).await?;
+    if desired.spec.interfaces.len() >= usize::from(host.max_interfaces)
+        || desired.spec.interfaces.len() >= MAX_INTERFACES
+    {
+        return Err(invalid("已达到宿主实际网卡容量"));
+    }
+    if before_first_apply && (!host.create || !host.managed_networks) {
+        return Err(StoreError::Unsupported("机器尚未支持创建 CVM".into()));
+    }
+    if desired.power == PowerState::Running && !host.hot_attach && !before_first_apply {
+        return Err(StoreError::Unsupported("请先关机，再挂载网卡".into()));
+    }
+    let consumer = capability(tx, &instance.node_id).await?;
+    let provider = capability(tx, &p.spec.provider_node).await?;
+    if !consumer.consume
+        || !provider.provide
+        || !consumer.transports.contains(&mount.transport)
+        || !provider.transports.contains(&mount.transport)
+    {
+        return Err(StoreError::Unsupported("双方没有共同支持的所选承载".into()));
+    }
+    let offer = p
+        .spec
+        .transports
+        .iter()
+        .find(|t| t.kind == mount.transport)
+        .ok_or_else(|| invalid("发布项不支持所选承载"))?
+        .clone();
+    let count:i64=sqlx::query_scalar("SELECT count(DISTINCT interface_id) FROM cvm_nic_allocations WHERE publication_id=$1 AND NOT released").bind(&p.id).fetch_one(&mut **tx).await?;
+    if count >= i64::from(p.spec.limits.max_attachments) {
+        return Err(invalid("发布项可用挂载容量已满"));
+    }
+    let provider_count:i64=sqlx::query_scalar("SELECT count(DISTINCT interface_id) FROM cvm_nic_allocations WHERE provider_node=$1 AND NOT released").bind(&p.spec.provider_node).fetch_one(&mut **tx).await?;
+    let consumer_count:i64=sqlx::query_scalar("SELECT count(DISTINCT interface_id) FROM cvm_nic_allocations WHERE consumer_node=$1 AND NOT released").bind(&instance.node_id).fetch_one(&mut **tx).await?;
+    if provider_count >= i64::from(provider.max_bindings)
+        || consumer_count >= i64::from(consumer.max_bindings)
+    {
+        return Err(invalid("执行机器承载容量不足"));
+    }
+    let mut avoid: BTreeSet<IpAddr> = devices(desired)
+        .values()
+        .flat_map(|n| [n.ipv4, n.ipv6])
+        .flatten()
+        .collect();
+    if let Some(report) = &instance.report {
+        for actual in &report.interfaces {
+            for raw in &actual.addresses {
+                if let Ok(address) = raw.split('/').next().unwrap_or_default().parse::<IpAddr>() {
+                    avoid.insert(address);
+                }
+            }
+        }
+    }
+    let public_avoid = public_exclusions(tx, &p.spec.provider_node).await?;
+    if p.spec.address_mode == NicAddressMode::DedicatedRouted {
+        avoid.extend(public_avoid.iter().copied());
+    }
+    let private_scope = format!("private:{}", p.spec.resource_domain);
+    let public_scope = format!("public:{}", p.spec.provider_node);
+    let used_slots = allocated_values(tx, "global", "slot").await?;
+    let slot = (0..8192u16)
+        .find(|s| !used_slots.contains(&s.to_string()))
+        .ok_or_else(|| invalid("网卡隔离上下文已达上限"))?;
+    let ipv4 = allocate_address(
+        tx,
+        p.spec.ipv4_pool.as_ref(),
+        &private_scope,
+        "ipv4",
+        &avoid,
+    )
+    .await?;
+    let ipv6 = allocate_address(
+        tx,
+        p.spec.ipv6_pool.as_ref(),
+        &private_scope,
+        "ipv6",
+        &avoid,
+    )
+    .await?;
+    let public_ipv4 = match p.spec.address_mode {
+        NicAddressMode::SharedNat => p.spec.shared_ipv4,
+        NicAddressMode::DedicatedRouted => ipv4,
+        NicAddressMode::DedicatedNat => {
+            allocate_address(
+                tx,
+                p.spec.public_ipv4_pool.as_ref(),
+                &public_scope,
+                "ipv4",
+                &public_avoid,
+            )
+            .await?
+        }
+    };
+    let public_ipv6 = match p.spec.address_mode {
+        NicAddressMode::SharedNat => p.spec.shared_ipv6,
+        NicAddressMode::DedicatedRouted => ipv6,
+        NicAddressMode::DedicatedNat => {
+            allocate_address(
+                tx,
+                p.spec.public_ipv6_pool.as_ref(),
+                &public_scope,
+                "ipv6",
+                &public_avoid,
+            )
+            .await?
+        }
+    };
+    let nic_id = format!(
+        "nic-{}",
+        &sha256_hex(format!("cvm-mount:{}:{}:{}", actor.operator_id(), id, mount.key).as_bytes())
+            [..32]
+    );
+    let allocation_id = format!(
+        "allocation-{}",
+        &sha256_hex(
+            format!(
+                "cvm-allocation:{}:{}:{}",
+                actor.operator_id(),
+                id,
+                mount.key
+            )
+            .as_bytes()
+        )[..32]
+    );
+    let allocated = AllocatedNic {
+        slot,
+        publication_id: p.id.clone(),
+        publication_revision: p.revision,
+        provider_node: p.spec.provider_node.clone(),
+        resource_domain: p.spec.resource_domain.clone(),
+        allocation_id: allocation_id.clone(),
+        mac: mac(&nic_id),
+        ipv4,
+        ipv6,
+        public_ipv4,
+        public_ipv6,
+        address_mode: p.spec.address_mode,
+        destinations: p.spec.destinations.clone(),
+        transport: mount.transport,
+        transport_generation: 1,
+        mtu: offer.mtu,
+        blocked: false,
+        quota_exceeded: false,
+        limits: p.spec.limits.clone(),
+    };
+    let nic = InterfaceSpec {
+        id: nic_id.clone(),
+        allocated: Some(allocated.clone()),
+        connection: InterfaceRequest {
+            source_id: p.id.clone(),
+            purpose: InterfacePurpose::Business,
+            default_ipv4: false,
+            default_ipv6: false,
+        },
+    };
+    insert_interface(tx, id, &nic).await?;
+    sqlx::query("INSERT INTO cvm_nic_allocations(id,interface_id,instance_id,publication_id,provider_node,consumer_node,spec) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(&allocation_id).bind(&nic_id).bind(id).bind(&p.id).bind(&p.spec.provider_node).bind(&instance.node_id).bind(serde_json::to_value(&allocated)?).execute(&mut **tx).await?;
+    claim(
+        tx,
+        &allocation_id,
+        None,
+        "global",
+        "slot",
+        &slot.to_string(),
+    )
+    .await?;
+    for (address, kind) in [(ipv4, "ipv4"), (ipv6, "ipv6")] {
+        if let Some(address) = address {
+            claim(
+                tx,
+                &allocation_id,
+                None,
+                &private_scope,
+                kind,
+                &address.to_string(),
+            )
+            .await?;
+        }
+    }
+    if p.spec.address_mode != NicAddressMode::SharedNat {
+        for (address, kind) in [(public_ipv4, "ipv4"), (public_ipv6, "ipv6")] {
+            if let Some(address) = address {
+                claim(
+                    tx,
+                    &allocation_id,
+                    None,
+                    &public_scope,
+                    kind,
+                    &address.to_string(),
+                )
+                .await?;
+            }
+        }
+    }
+    create_binding(
+        tx,
+        id,
+        &nic_id,
+        &instance.node_id,
+        &allocated,
+        &offer,
+        &provider,
+    )
+    .await?;
+    desired.spec.interfaces.push(nic);
+    if mount.default_routes {
+        let priority = desired
+            .spec
+            .routing
+            .priorities
+            .iter()
+            .flat_map(|p| [p.ipv4, p.ipv6])
+            .flatten()
+            .max()
+            .unwrap_or(0)
+            .checked_add(10)
+            .ok_or_else(|| invalid("请先调整网卡优先级"))?;
+        desired.spec.routing.priorities.push(InterfacePriority {
+            target: RouteTarget::interface(nic_id.clone()),
+            ipv4: ipv4.map(|_| priority),
+            ipv6: ipv6.map(|_| priority),
+        });
+        for destination in &p.spec.route_presets {
+            desired.spec.routing.routes.push(ContainerRoute {
+                destination: destination.clone(),
+                target: RouteTarget::interface(nic_id.clone()),
+                service: None,
+            });
+        }
+    }
+    if mount.use_dns_suggestions {
+        if !desired.spec.execution.is_cube() {
+            return Err(StoreError::Unsupported("裸机 DNS 由操作系统管理".into()));
+        }
+        desired.spec.routing.dns = p.spec.dns_suggestions.clone();
+    }
+    Ok(nic_id)
+}
+
+fn check_route_revision(desired: &InstanceDesired, expected_revision: u64) -> Result<()> {
+    if desired.spec.routing.revision != expected_revision {
+        return Err(StoreError::Conflict("路由表已变化，请刷新后操作".into()));
+    }
+    Ok(())
+}
+
+fn advance_routes(routes: &mut ContainerRoutes) -> Result<()> {
+    routes.revision = routes
+        .revision
+        .checked_add(1)
+        .filter(|revision| *revision <= i64::MAX as u64)
+        .ok_or_else(|| invalid("路由版本已满"))?;
+    Ok(())
+}
+
+async fn set_routes_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    node: &str,
+    desired: &mut InstanceDesired,
+    mut routes: ContainerRoutes,
+) -> Result<bool> {
+    if !desired.spec.execution.is_cube() && !routes.dns.is_empty() {
+        return Err(StoreError::Unsupported("裸机 DNS 由操作系统管理".into()));
+    }
+    routes.revision = desired.spec.routing.revision;
+    routes.normalize();
+    if routes == desired.spec.routing {
+        return Ok(false);
+    }
+    routes.validate(&devices(desired)).map_err(invalid)?;
+    super::chain_egress::validate_selection(tx, &desired.id, &routes).await?;
+    // Older executors would apply port rules as whole-prefix routes.
+    if routes.routes.iter().any(|route| route.service.is_some())
+        && (!host_locked(tx, node, false).await?.route_services
+            || !capability(tx, node).await?.route_service)
+    {
+        return Err(StoreError::Unsupported(
+            "容器宿主的运行栈或 Agent 尚不支持按协议端口选择出口".into(),
+        ));
+    }
+    desired.spec.routing = routes;
+    Ok(true)
+}
+
+pub(super) async fn detach_nic_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    desired: &mut InstanceDesired,
+    caps: &Capabilities,
+    interface_id: &str,
+) -> Result<()> {
+    if desired.power == PowerState::Running && !caps.hot_detach {
+        return Err(StoreError::Unsupported(
+            "这台机器需要停止实例后卸载网卡".into(),
+        ));
+    }
+    if !desired.spec.interfaces.iter().any(|x| x.id == interface_id) {
+        return Err(StoreError::NotFound("网卡挂载".into()));
+    }
+    if desired.spec.routing.references(interface_id) {
+        return Err(StoreError::Conflict(
+            "请先修改引用该网卡的路由和优先级，再卸载网卡".into(),
+        ));
+    }
+    if desired
+        .spec
+        .interfaces
+        .iter()
+        .any(|n| n.id == interface_id && n.connection.purpose == InterfacePurpose::Contact)
+    {
+        return Err(invalid("管理主网卡不能卸载"));
+    }
+    withdraw(tx, &desired.id, Some(interface_id)).await?;
+    desired.spec.interfaces.retain(|x| x.id != interface_id);
+    caps.validate_interfaces(
+        &desired
+            .spec
+            .interfaces
+            .iter()
+            .filter(|x| x.allocated.is_none())
+            .map(|x| x.connection.clone())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(invalid)?;
+    sqlx::query("UPDATE cvm_interfaces SET desired_attached=false WHERE id=$1 AND instance_id=$2")
+        .bind(interface_id)
+        .bind(&desired.id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+pub(super) async fn persist_routes(
     tx: &mut Transaction<'_, Postgres>,
     actor: &AdminContext,
     desired: &InstanceDesired,

@@ -178,6 +178,11 @@ jobs:
             -run '^TestBrocadeFrozen(DNSRetryCacheAndProtocol|DNSColdWarmDiagnosticsAndBudget|DNSCanceledLeaderAndStaleRefresh|SourceBansAndAttribution|SiteStatisticsDoNotDuplicateRelay|OtherDomainAndFailedTargetAttribution|SS2022OversizedKeys)$' \
             -count=1 -timeout=3m
 
+      - name: HY2 Salamander oversized datagram recovery
+        env:
+          BROCADE_XRAY_BIN: ${{ runner.temp }}/reality-xray
+        run: go test ./testing/scenarios -run '^TestBrocadeFrozenHY2SalamanderOversizedDatagrams$' -count=1 -timeout=1m
+
       - name: QUIC sniffing compatibility, fuzz seeds and races
         run: |
           go test -race ./common/protocol/quic -count=3 -timeout=2m

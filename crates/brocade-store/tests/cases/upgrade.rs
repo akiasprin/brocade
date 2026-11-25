@@ -47,7 +47,7 @@ async fn upgrade_v031_preflight_is_read_only_and_forward_migration_preserves_dat
         let check = db.store.check_database_upgrade().await.unwrap();
         assert!(check.compatible);
         assert_eq!(check.installed_versions, [1]);
-        assert_eq!(check.pending_versions, [2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(check.pending_versions, [2, 3, 4, 5, 6, 7, 8, 9]);
         let added: bool =
             sqlx::query_scalar("SELECT to_regclass('node_traffic_limit') IS NOT NULL")
                 .fetch_one(db.pool())
@@ -58,7 +58,7 @@ async fn upgrade_v031_preflight_is_read_only_and_forward_migration_preserves_dat
     db.store.migrate_database_schema().await.unwrap();
     let check = db.store.check_database_upgrade().await.unwrap();
     assert!(check.compatible && check.pending_versions.is_empty());
-    assert_eq!(check.installed_versions, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(check.installed_versions, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
     db.store.migrate_database_schema().await.unwrap();
     let preserved: (String, Vec<u8>) = sqlx::query_as(
         "SELECT site_name, checksum FROM control_state CROSS JOIN _sqlx_migrations WHERE version=1",
@@ -160,7 +160,7 @@ async fn rejected_upgrade_releases_its_session_lock_before_a_repaired_retry() {
             .await
             .unwrap()
             .installed_versions,
-        [1, 2, 3, 4, 5, 6, 7, 8]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
 }
 
@@ -231,7 +231,7 @@ async fn upgrade_v038_applies_0008_atomically_without_rewriting_published_receip
         .unwrap();
     let check = db.store.check_database_upgrade().await.unwrap();
     assert!(check.compatible);
-    assert_eq!(check.pending_versions, [8]);
+    assert_eq!(check.pending_versions, [8, 9]);
     sqlx::raw_sql("CREATE FUNCTION reject_artifact_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN
       IF to_regclass('public.cvm_spec_artifacts') IS NOT NULL THEN RAISE EXCEPTION 'injected late 0008 DDL failure'; END IF;
       END $$; CREATE EVENT TRIGGER reject_artifact_ddl ON ddl_command_end EXECUTE FUNCTION reject_artifact_ddl();")
@@ -252,7 +252,7 @@ async fn upgrade_v038_applies_0008_atomically_without_rewriting_published_receip
     db.store.migrate_database_schema().await.unwrap();
     let check = db.store.check_database_upgrade().await.unwrap();
     assert!(check.compatible && check.pending_versions.is_empty());
-    assert_eq!(check.installed_versions, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(check.installed_versions, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
     let after: serde_json::Value = sqlx::query_scalar(receipts)
         .fetch_one(db.pool())
         .await

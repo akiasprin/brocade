@@ -1,4 +1,8 @@
 use super::*;
+use brocade_store::cvm::{
+    CvmMutationReview, CvmNetworkEditRequest, CvmNetworkEntryAddition, CvmNetworkEntryRelease,
+    CvmNetworkMount, CvmNetworkRoutesWrite,
+};
 
 const SHARED: &str = "198.51.100.20";
 const WHOLE: &str = "198.51.100.30";
@@ -12,6 +16,7 @@ async fn entry_setup(db: &TestPg) {
             "n1",
             InventoryReport {
                 capabilities: caps,
+                terminal_sessions_used: None,
                 error: None,
             },
         )
@@ -22,7 +27,9 @@ async fn entry_setup(db: &TestPg) {
             .cvm_record_nic_capabilities(
                 node,
                 NicNodeCapabilities {
-                    contract: NIC_PROTOCOL_VERSION,
+                    entry_protocol_rules: true,
+                    ssh_ports: Vec::new(),
+                    contract: NIC_CONTRACT_VERSION,
                     transports: vec![TransportKind::Wireguard, TransportKind::Xray],
                     consume: node == "n1",
                     provide: true,
@@ -51,6 +58,7 @@ fn entry_spec() -> EntryPublicationSpec {
         provider_node: "n2".into(),
         addresses: vec![
             EntryAddressOffer {
+                reserved_ports: Default::default(),
                 address: SHARED.parse().unwrap(),
                 public_address: None,
                 kind: EntryAddressKind::Shared {
@@ -59,6 +67,7 @@ fn entry_spec() -> EntryPublicationSpec {
                 },
             },
             EntryAddressOffer {
+                reserved_ports: Default::default(),
                 address: WHOLE.parse().unwrap(),
                 public_address: Some("203.0.113.30".parse().unwrap()),
                 kind: EntryAddressKind::Dedicated,
@@ -98,10 +107,12 @@ async fn publish_entries(db: &TestPg) -> EntryPublication {
     .unwrap()
 }
 fn tcp(listen_port: u16, target_port: u16) -> EntryMode {
-    EntryMode::L4 {
+    EntryMode::L4Range {
         protocol: EntryProtocol::Tcp,
-        listen_port,
-        target_port,
+        listen_start: listen_port,
+        listen_end: listen_port,
+        target_start: target_port,
+        target_end: target_port,
     }
 }
 fn entry_request(key: &str, instance: &CvmInstance, address: &str, mode: EntryMode) -> EntryCreate {
@@ -123,7 +134,7 @@ async fn add(
         supersede_cvm_fixture(db).await;
         &db.store
     })
-    .create_cvm_entry(&actor_user("alice"), request)
+    .create_cvm_entry(&system_admin(), request)
     .await
 }
 /// Reports full convergence of a node's current entry desired state.
@@ -223,10 +234,12 @@ async fn cvm_entries_share_addresses_by_protocol_and_hold_claims_until_the_entry
             "entry-create-dns-0001",
             &api,
             SHARED,
-            EntryMode::L4 {
+            EntryMode::L4Range {
                 protocol: EntryProtocol::Udp,
-                listen_port: 30022,
-                target_port: 53,
+                listen_start: 30022,
+                listen_end: 30022,
+                target_start: 53,
+                target_end: 53,
             },
         ),
     )
@@ -235,10 +248,12 @@ async fn cvm_entries_share_addresses_by_protocol_and_hold_claims_until_the_entry
     for (key, mode) in [
         (
             "entry-create-both-0001",
-            EntryMode::L4 {
+            EntryMode::L4Range {
                 protocol: EntryProtocol::TcpUdp,
-                listen_port: 30022,
-                target_port: 22,
+                listen_start: 30022,
+                listen_end: 30022,
+                target_start: 22,
+                target_end: 22,
             },
         ),
         // A port the entry machine's own service listens on.
@@ -372,7 +387,7 @@ async fn cvm_entries_share_addresses_by_protocol_and_hold_claims_until_the_entry
         &db.store
     })
     .repoint_cvm_entry(
-        &actor_user("alice"),
+        &system_admin(),
         &ssh.id,
         EntryRepoint {
             request_id: "entry-repoint-ssh-0001".into(),
@@ -392,7 +407,7 @@ async fn cvm_entries_share_addresses_by_protocol_and_hold_claims_until_the_entry
         &db.store
     })
     .release_cvm_entry(
-        &actor_user("alice"),
+        &system_admin(),
         &dns.id,
         EntryRelease {
             request_id: "entry-release-dns-0001".into(),
@@ -402,16 +417,18 @@ async fn cvm_entries_share_addresses_by_protocol_and_hold_claims_until_the_entry
     .await
     .unwrap();
     assert_eq!(released.state, CvmEntryState::Releasing);
-    let again = EntryMode::L4 {
+    let again = EntryMode::L4Range {
         protocol: EntryProtocol::Udp,
-        listen_port: 30022,
-        target_port: 53,
+        listen_start: 30022,
+        listen_end: 30022,
+        target_start: 53,
+        target_end: 53,
     };
     assert!(matches!(
         add(
             &db,
             &p,
-            entry_request("entry-create-dns-0002", &web, SHARED, again)
+            entry_request("entry-create-dns-0002", &web, SHARED, again.clone())
         )
         .await,
         Err(StoreError::Conflict(_))
@@ -432,7 +449,7 @@ async fn cvm_entries_share_addresses_by_protocol_and_hold_claims_until_the_entry
         &db.store
     })
     .command_cvm(
-        &actor_user("alice"),
+        &system_admin(),
         &api.desired.id,
         CvmCommand {
             request_id: "entry-delete-api-0001".into(),
@@ -482,13 +499,74 @@ async fn cvm_entry_tunnels_follow_their_last_entry_and_wait_for_both_machines() 
         tunnels, 1,
         "entries between one machine pair share one tunnel"
     );
+    publish_cvm_intent(&db).await;
+    // Simulate the prior persisted encoding without touching immutable revision history.
+    // Both the provider and the compute host must be able to read it before withdrawal.
+    let frozen_before: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT revision_id,node_id,payload FROM cvm_revision_nodes ORDER BY revision_id,node_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    for node in ["n1", "n2"] {
+        let (revision, payload): (i64, String) =
+            sqlx::query_as("SELECT revision_id,payload FROM cvm_serving_nodes WHERE node_id=$1")
+                .bind(node)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let context = format!("cvm-revision:{node}:{revision}");
+        let json = brocade_store::secrets::open(&context, &payload).unwrap();
+        let mut saved: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for field in ["rules", "deliveries"] {
+            for item in saved["entry"][field].as_array_mut().unwrap() {
+                if item["host_local"] == false {
+                    item.as_object_mut().unwrap().remove("host_local");
+                }
+            }
+        }
+        for tunnel in saved["entry"]["tunnels"].as_array_mut().unwrap() {
+            if tunnel["wireguard_transport"] == "udp" {
+                tunnel
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("wireguard_transport");
+            }
+        }
+        let legacy = brocade_store::secrets::seal(&context, &saved.to_string()).unwrap();
+        sqlx::query("UPDATE cvm_serving_nodes SET payload=$2 WHERE node_id=$1")
+            .bind(node)
+            .bind(&legacy)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let desired = db.store.cvm_entry_desired(node).await.unwrap();
+        assert!(!desired.tunnels.is_empty());
+        let preserved: String =
+            sqlx::query_scalar("SELECT payload FROM cvm_serving_nodes WHERE node_id=$1")
+                .bind(node)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            preserved, legacy,
+            "reading must not rewrite the saved product"
+        );
+    }
+    let frozen_after: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT revision_id,node_id,payload FROM cvm_revision_nodes ORDER BY revision_id,node_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(frozen_before, frozen_after);
     for entry in [&first, &second] {
         ({
             supersede_cvm_fixture(&db).await;
             &db.store
         })
         .release_cvm_entry(
-            &actor_user("alice"),
+            &system_admin(),
             &entry.id,
             EntryRelease {
                 request_id: format!("tunnel-release-{}", &entry.id[6..22]),
@@ -744,7 +822,7 @@ async fn cvm_whole_ip_entry_becomes_the_egress_source_on_the_same_machine() {
         &db.store
     })
     .mount_cvm_nic(
-        &actor_user("alice"),
+        &system_admin(),
         &web.desired.id,
         mount_request(&web, &network, "symmetric-mount-0001"),
     )
@@ -778,7 +856,7 @@ async fn cvm_whole_ip_entry_becomes_the_egress_source_on_the_same_machine() {
         &db.store
     })
     .release_cvm_entry(
-        &actor_user("alice"),
+        &system_admin(),
         &whole.id,
         EntryRelease {
             request_id: "symmetric-release-0001".into(),
@@ -810,6 +888,7 @@ async fn cvm_host_ip_l3_is_gated_exclusive_and_coexists_with_shared_egress() {
             "n1",
             InventoryReport {
                 capabilities: native,
+                terminal_sessions_used: None,
                 error: None,
             },
         )
@@ -820,7 +899,7 @@ async fn cvm_host_ip_l3_is_gated_exclusive_and_coexists_with_shared_egress() {
         &db.store
     })
     .mount_cvm_nic(
-        &actor_user("alice"),
+        &system_admin(),
         &web.desired.id,
         mount_request(&web, &network, "host-l3-mount-0001"),
     )
@@ -828,6 +907,7 @@ async fn cvm_host_ip_l3_is_gated_exclusive_and_coexists_with_shared_egress() {
     .unwrap();
     let mut spec = entry_spec();
     spec.addresses = vec![EntryAddressOffer {
+        reserved_ports: Default::default(),
         address: SHARED.parse().unwrap(),
         public_address: None,
         kind: EntryAddressKind::Dedicated,
@@ -965,7 +1045,7 @@ async fn cvm_host_ip_l3_is_gated_exclusive_and_coexists_with_shared_egress() {
         &db.store
     })
     .release_cvm_entry(
-        &actor_user("alice"),
+        &system_admin(),
         &entry.id,
         EntryRelease {
             request_id: "host-l3-release-0001".into(),
@@ -1093,6 +1173,7 @@ async fn cvm_entry_xray_and_phantun_assignments_and_capability_gates() {
                         "n1",
                         InventoryReport {
                             capabilities: runtime,
+                            terminal_sessions_used: None,
                             error: None,
                         },
                     )
@@ -1157,10 +1238,12 @@ async fn cvm_entry_xray_and_phantun_assignments_and_capability_gates() {
                             &format!("entry-{suffix}-{key}"),
                             &instance,
                             SHARED,
-                            EntryMode::L4 {
+                            EntryMode::L4Range {
                                 protocol,
-                                listen_port: listen,
-                                target_port,
+                                listen_start: listen,
+                                listen_end: listen,
+                                target_start: target_port,
+                                target_end: target_port,
                             },
                         ),
                     )
@@ -1565,7 +1648,7 @@ async fn cvm_mixed_entry_release_requires_both_peers_and_retains_unapproved_clea
     // Withdraw intent keeps the previously published rule and address claims until approval.
     db.store
         .release_cvm_entry(
-            &actor_user("alice"),
+            &system_admin(),
             &entry.id,
             EntryRelease {
                 request_id: "release-entry-withdraw-01".into(),
@@ -1580,4 +1663,1131 @@ async fn cvm_mixed_entry_release_requires_both_peers_and_retains_unapproved_clea
         .await
         .iter()
         .any(|(_, _, released)| !*released));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_undo_unpublished_entry_creation_releases_ports_without_guest_mutation() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    entry_setup(&db).await;
+    let item = create(&db, "undo-entry-create-instance-01").await;
+    let p = publish_entries(&db).await;
+    let entry = add(
+        &db,
+        &p,
+        entry_request(
+            "undo-entry-create-request-01",
+            &item,
+            SHARED,
+            tcp(30081, 22),
+        ),
+    )
+    .await
+    .unwrap();
+    let pending = db
+        .store
+        .cvm_instance(&actor_user("alice"), &item.desired.id)
+        .await
+        .unwrap();
+    assert_eq!(pending.operation_kind.as_deref(), Some("entries"));
+    assert!(pending.revision_id > item.revision_id);
+    let restored = db
+        .store
+        .command_cvm(
+            &system_admin(),
+            &item.desired.id,
+            CvmCommand {
+                request_id: "undo-entry-create-restore-01".into(),
+                expected_generation: pending.desired.generation,
+                change: CvmChange::UndoPending {
+                    expected_revision: pending.revision_id.unwrap(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored.desired.power, PowerState::Running);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM cvm_nic_resources WHERE entry_id=$1 AND NOT released"
+        )
+        .bind(&entry.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    let replacement = add(
+        &db,
+        &p,
+        entry_request(
+            "undo-entry-reallocate-01",
+            &restored,
+            SHARED,
+            tcp(30081, 22),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_ne!(replacement.id, entry.id);
+    let next = db
+        .store
+        .cvm_instance(&actor_user("alice"), &item.desired.id)
+        .await
+        .unwrap();
+    assert_eq!(next.operation_kind.as_deref(), Some("entries"));
+    db.store
+        .command_cvm(
+            &system_admin(),
+            &item.desired.id,
+            CvmCommand {
+                request_id: "undo-entry-newer-restore-01".into(),
+                expected_generation: next.desired.generation,
+                change: CvmChange::UndoPending {
+                    expected_revision: next.revision_id.unwrap(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_undo_unpublished_entry_removal_restores_existing_tunnel_and_port() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    entry_setup(&db).await;
+    let item = create(&db, "undo-entry-remove-instance-01").await;
+    let p = publish_entries(&db).await;
+    let entry = add(
+        &db,
+        &p,
+        entry_request("undo-entry-remove-create-01", &item, SHARED, tcp(30081, 22)),
+    )
+    .await
+    .unwrap();
+    converge(&db, "n1").await;
+    converge(&db, "n2").await;
+    supersede_cvm_fixture(&db).await;
+    let entry = db
+        .store
+        .cvm_instance_entries(&actor_user("alice"), &item.desired.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.id == entry.id)
+        .unwrap();
+    db.store
+        .release_cvm_entry(
+            &system_admin(),
+            &entry.id,
+            EntryRelease {
+                request_id: "undo-entry-remove-request-01".into(),
+                expected_revision: entry.revision,
+            },
+        )
+        .await
+        .unwrap();
+    let pending = db
+        .store
+        .cvm_instance(&actor_user("alice"), &item.desired.id)
+        .await
+        .unwrap();
+    assert_eq!(pending.operation_kind.as_deref(), Some("entries"));
+    db.store
+        .command_cvm(
+            &system_admin(),
+            &item.desired.id,
+            CvmCommand {
+                request_id: "undo-entry-remove-restore-01".into(),
+                expected_generation: pending.desired.generation,
+                change: CvmChange::UndoPending {
+                    expected_revision: pending.revision_id.unwrap(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !sqlx::query_scalar::<_, bool>("SELECT released FROM cvm_entries WHERE id=$1")
+            .bind(&entry.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM cvm_entry_tunnels WHERE withdrawn AND NOT cleaned"
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    assert!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM cvm_nic_resources WHERE entry_id=$1 AND NOT released"
+        )
+        .bind(&entry.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+            > 0
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_undo_pending_creation_with_entries_is_atomic_and_revision_fenced() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    entry_setup(&db).await;
+    let p = publish_entries(&db).await;
+    let item = db
+        .store
+        .create_cvm(
+            &system_admin(),
+            create_request("undo-all-instance-create-01"),
+        )
+        .await
+        .unwrap();
+    let entry = add(
+        &db,
+        &p,
+        entry_request("undo-all-entry-create-01", &item, SHARED, tcp(30081, 22)),
+    )
+    .await
+    .unwrap();
+    let pending = db
+        .store
+        .cvm_instance(&actor_user("alice"), &item.desired.id)
+        .await
+        .unwrap();
+    assert_eq!(pending.desired.generation, item.desired.generation);
+    let stale = db
+        .store
+        .command_cvm(
+            &system_admin(),
+            &item.desired.id,
+            CvmCommand {
+                request_id: "undo-all-stale-request-01".into(),
+                expected_generation: pending.desired.generation,
+                change: CvmChange::UndoPending {
+                    expected_revision: item.revision_id.unwrap(),
+                },
+            },
+        )
+        .await;
+    assert!(matches!(stale, Err(StoreError::Conflict(_))));
+    let restored = db
+        .store
+        .command_cvm(
+            &system_admin(),
+            &item.desired.id,
+            CvmCommand {
+                request_id: "undo-all-restore-request-01".into(),
+                expected_generation: pending.desired.generation,
+                change: CvmChange::UndoPending {
+                    expected_revision: pending.revision_id.unwrap(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!restored.reserved);
+    assert!(db
+        .store
+        .cvm_desired("n1")
+        .await
+        .unwrap()
+        .instances
+        .is_empty());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM cvm_nic_resources WHERE entry_id=$1 AND NOT released"
+        )
+        .bind(&entry.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_entry_ranges_reserve_every_port_atomically_and_keep_claims_until_cleanup() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    entry_setup(&db).await;
+    let publication = publish_entries(&db).await;
+    let instance = create(&db, "entry-range-container-0001").await;
+    let mode = EntryMode::L4Range {
+        protocol: EntryProtocol::TcpUdp,
+        listen_start: 30040,
+        listen_end: 30043,
+        target_start: 40000,
+        target_end: 40003,
+    };
+    let request = entry_request("entry-range-create-0001", &instance, SHARED, mode);
+    let entry = add(&db, &publication, request.clone()).await.unwrap();
+    assert_eq!(add(&db, &publication, request).await.unwrap().id, entry.id);
+    assert_eq!(claims(&db, &entry.id).await.len(), 8);
+    // A collision in the middle rolls back all of the other candidate ports and the entry row.
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM cvm_entries")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        add(
+            &db,
+            &publication,
+            entry_request(
+                "entry-range-overlap-0001",
+                &instance,
+                SHARED,
+                tcp(30042, 22)
+            )
+        )
+        .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        add(
+            &db,
+            &publication,
+            entry_request(
+                "entry-range-host-port-01",
+                &instance,
+                SHARED,
+                EntryMode::L4Range {
+                    protocol: EntryProtocol::Tcp,
+                    listen_start: 30079,
+                    listen_end: 30082,
+                    target_start: 1000,
+                    target_end: 1003
+                }
+            )
+        )
+        .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM cvm_entries")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        before
+    );
+    let board = db
+        .store
+        .cvm_entry_board(&actor_user("alice"))
+        .await
+        .unwrap();
+    let held: Vec<_> = board
+        .publications
+        .iter()
+        .flat_map(|p| &p.usage)
+        .flat_map(|u| &u.ports)
+        .filter(|p| p.entry_id.as_deref() == Some(&entry.id))
+        .collect();
+    assert_eq!(held.len(), 2);
+    assert!(held
+        .iter()
+        .all(|p| p.port_start == 30040 && p.port_end == 30043));
+    let targets = db.store.cvm_observation_targets("n1").await.unwrap();
+    let probes = &targets
+        .iter()
+        .find(|t| t.id == instance.desired.id)
+        .unwrap()
+        .services;
+    assert!(probes.iter().any(|p| p.port == 40000));
+    assert!(probes.iter().any(|p| p.port == 40003));
+    supersede_cvm_fixture(&db).await;
+    db.store
+        .release_cvm_entry(
+            &system_admin(),
+            &entry.id,
+            EntryRelease {
+                request_id: "entry-range-release-0001".into(),
+                expected_revision: entry.revision,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(claims(&db, &entry.id).await.iter().all(|p| !p.2));
+    assert!(add(
+        &db,
+        &publication,
+        entry_request(
+            "entry-range-before-clean-01",
+            &instance,
+            SHARED,
+            tcp(30041, 22)
+        )
+    )
+    .await
+    .is_err());
+    converge(&db, "n2").await;
+    assert!(claims(&db, &entry.id).await.iter().all(|p| p.2));
+    add(
+        &db,
+        &publication,
+        entry_request(
+            "entry-range-after-clean-01",
+            &instance,
+            SHARED,
+            tcp(30041, 22),
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_entry_range_second_protocol_and_concurrent_overlap_roll_back_whole_allocations() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    entry_setup(&db).await;
+    let publication = publish_entries(&db).await;
+    let instance = create(&db, "entry-range-concurrent-01").await;
+    for node in ["n1", "n2"] {
+        sqlx::query("INSERT INTO node_agent_state(node_id,agent_protocol_version) VALUES($1,$2) ON CONFLICT(node_id) DO UPDATE SET agent_protocol_version=excluded.agent_protocol_version")
+            .bind(node).bind(i32::try_from(brocade_deployment::protocol::AGENT_PROTOCOL_VERSION).unwrap()).execute(db.pool()).await.unwrap();
+    }
+    add(
+        &db,
+        &publication,
+        entry_request(
+            "entry-range-existing-udp",
+            &instance,
+            SHARED,
+            EntryMode::L4Range {
+                protocol: EntryProtocol::Udp,
+                listen_start: 30052,
+                listen_end: 30052,
+                target_start: 53,
+                target_end: 53,
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        add(
+            &db,
+            &publication,
+            entry_request(
+                "entry-range-both-protocols",
+                &instance,
+                SHARED,
+                EntryMode::L4Range {
+                    protocol: EntryProtocol::TcpUdp,
+                    listen_start: 30050,
+                    listen_end: 30053,
+                    target_start: 40000,
+                    target_end: 40003
+                }
+            )
+        )
+        .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let tcp_claims:i64=sqlx::query_scalar("SELECT count(*) FROM cvm_nic_resources WHERE scope='port:n2' AND kind='tcp' AND NOT released AND value LIKE '198.51.100.20:3005%'").fetch_one(db.pool()).await.unwrap();
+    assert_eq!(tcp_claims, 0);
+    supersede_cvm_fixture(&db).await;
+    let request = |id: &str, start, end| {
+        let mut r = entry_request(
+            id,
+            &instance,
+            SHARED,
+            EntryMode::L4Range {
+                protocol: EntryProtocol::Tcp,
+                listen_start: start,
+                listen_end: end,
+                target_start: 40000,
+                target_end: 40003,
+            },
+        );
+        r.publication_id = publication.id.clone();
+        r
+    };
+    let actor = system_admin();
+    let first_request = request("entry-range-concurrent-a", 30060, 30063);
+    let second_request = request("entry-range-concurrent-b", 30062, 30065);
+    let (first, second) = tokio::join!(
+        db.store.create_cvm_entry(&actor, first_request),
+        db.store.create_cvm_entry(&actor, second_request)
+    );
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    let entry = first.or(second).unwrap();
+    assert_eq!(claims(&db, &entry.id).await.len(), 4);
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_network_edit_previews_fences_and_undoes_one_combined_unpublished_revision() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    entry_setup(&db).await;
+    let network = publish(&db).await;
+    let entries = publish_entries(&db).await;
+    let mut caps = catalogue();
+    caps.primary_ip_delivery = true;
+    caps.hot_attach = false;
+    db.store
+        .cvm_record_inventory(
+            "n1",
+            InventoryReport {
+                capabilities: caps,
+                terminal_sessions_used: None,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+    let actor = system_admin();
+    let instance = db
+        .store
+        .create_cvm(&actor, create_request("atomic-network-create-01"))
+        .await
+        .unwrap();
+    assert_eq!(instance.status, ApplyStatus::Pending);
+    let id = &instance.desired.id;
+    let draft = "draft-test-mount";
+    let request = CvmNetworkEditRequest {
+        request_id: "atomic-network-combined-01".into(),
+        expected_generation: instance.desired.generation,
+        mounts: vec![CvmNetworkMount {
+            draft_id: draft.into(),
+            publication_id: network.id,
+            transport: TransportKind::Wireguard,
+            use_dns_suggestions: false,
+        }],
+        detach_interface_ids: vec![],
+        entry_additions: vec![CvmNetworkEntryAddition {
+            publication_id: entries.id,
+            address: SHARED.parse().unwrap(),
+            mode: tcp(30051, 8080),
+        }],
+        entry_releases: vec![],
+        routes: Some(CvmNetworkRoutesWrite {
+            expected_revision: instance.desired.spec.routing.revision,
+            routes: ContainerRoutes {
+                revision: 0,
+                priorities: vec![InterfacePriority {
+                    target: RouteTarget::interface(draft),
+                    ipv4: Some(10),
+                    ipv6: None,
+                }],
+                routes: vec![ContainerRoute {
+                    destination: "192.0.2.0/24".parse().unwrap(),
+                    target: RouteTarget::interface(draft),
+                    service: None,
+                }],
+                dns: vec![],
+            },
+        }),
+    };
+    let before = network_edit_counts(&db, id).await;
+    let preview = db
+        .store
+        .edit_cvm_network(
+            &actor,
+            id,
+            request.clone(),
+            CvmMutationReview {
+                preview: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(network_edit_counts(&db, id).await, before);
+    assert!(matches!(
+        db.store
+            .edit_cvm_network(
+                &actor,
+                id,
+                request.clone(),
+                CvmMutationReview {
+                    expected_input_sha256: Some("0".repeat(64)),
+                    ..Default::default()
+                }
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(network_edit_counts(&db, id).await, before);
+
+    let saved = db
+        .store
+        .edit_cvm_network(
+            &actor,
+            id,
+            request.clone(),
+            CvmMutationReview {
+                expected_input_sha256: Some(preview.input_sha256),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.mounted_interfaces, preview.mounted_interfaces);
+    assert_eq!(
+        saved.instance.operation_kind.as_deref(),
+        Some("network_edit")
+    );
+    assert_eq!(
+        saved.instance.desired.generation,
+        instance.desired.generation + 1
+    );
+    let planned = &saved.instance.desired.spec.routing;
+    assert_eq!(planned.revision, instance.desired.spec.routing.revision + 1);
+    assert_eq!(
+        planned.routes[0].target.interface_id(),
+        Some(saved.mounted_interfaces[draft].as_str())
+    );
+    assert_eq!(planned.priorities[0].target, planned.routes[0].target);
+    assert_eq!(network_edit_counts(&db, id).await, (before.0 + 1, 1, 1));
+    let revision = saved.instance.revision_id.unwrap();
+    let nodes: Vec<String> = sqlx::query_scalar(
+        "SELECT node_id FROM cvm_revision_nodes WHERE revision_id=$1 ORDER BY node_id",
+    )
+    .bind(revision as i64)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(nodes, ["n1", "n2"]);
+    let review =
+        serde_json::to_value(db.store.cvm_pending_review(&actor, id).await.unwrap()).unwrap();
+    assert_eq!(review["revision"], revision);
+    assert_eq!(review["fields"], serde_json::json!(["create"]));
+    assert_eq!(review["entries_added"], 1);
+    assert_eq!(review["nics_added"], 1);
+    assert!(review["author"]
+        .as_str()
+        .is_some_and(|author| !author.is_empty()));
+    let reader = AdminContext::new("reader", AdminRole::Readonly, Some("platform.acme".into()));
+    assert!(matches!(
+        db.store.cvm_pending_review(&reader, id).await,
+        Err(StoreError::Forbidden(_))
+    ));
+
+    let replayed = db
+        .store
+        .edit_cvm_network(&actor, id, request, CvmMutationReview::default())
+        .await
+        .unwrap();
+    assert_eq!(replayed.input_sha256, saved.input_sha256);
+    assert_eq!(network_edit_counts(&db, id).await, (before.0 + 1, 1, 1));
+    let undone = db
+        .store
+        .command_cvm(
+            &actor,
+            id,
+            CvmCommand {
+                request_id: "atomic-network-undo-0001".into(),
+                expected_generation: saved.instance.desired.generation,
+                change: CvmChange::UndoPending {
+                    expected_revision: revision,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!undone.reserved);
+    assert_eq!(network_edit_counts(&db, id).await, (before.0 + 2, 0, 0));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_network_edit_entry_only_replays_and_fences_releases_by_container() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    entry_setup(&db).await;
+    let publication = publish_entries(&db).await;
+    let other = create(&db, "entry-network-edit-other").await;
+    let instance = create(&db, "entry-network-edit-owner").await;
+    let actor = system_admin();
+    let id = &instance.desired.id;
+    let mut request = CvmNetworkEditRequest {
+        request_id: "atomic-network-entry-0001".into(),
+        expected_generation: instance.desired.generation,
+        mounts: vec![],
+        detach_interface_ids: vec![],
+        entry_additions: vec![CvmNetworkEntryAddition {
+            publication_id: publication.id,
+            address: SHARED.parse().unwrap(),
+            mode: tcp(30052, 8080),
+        }],
+        entry_releases: vec![],
+        routes: None,
+    };
+    let before = network_edit_counts(&db, id).await;
+    let preview = db
+        .store
+        .edit_cvm_network(
+            &actor,
+            id,
+            request.clone(),
+            CvmMutationReview {
+                preview: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(network_edit_counts(&db, id).await, before);
+    let saved = db
+        .store
+        .edit_cvm_network(
+            &actor,
+            id,
+            request.clone(),
+            CvmMutationReview {
+                expected_input_sha256: Some(preview.input_sha256),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        saved.instance.desired.generation,
+        instance.desired.generation
+    );
+    assert_eq!(saved.instance.operation_kind.as_deref(), Some("entries"));
+    assert!(saved.instance.revision_id > instance.revision_id);
+    assert_eq!(network_edit_counts(&db, id).await, (before.0 + 1, 0, 1));
+    let replayed = db
+        .store
+        .edit_cvm_network(&actor, id, request.clone(), CvmMutationReview::default())
+        .await
+        .unwrap();
+    assert_eq!(replayed.instance.revision_id, saved.instance.revision_id);
+    request.entry_additions[0].mode = tcp(30053, 8080);
+    assert!(matches!(
+        db.store
+            .edit_cvm_network(&actor, id, request.clone(), CvmMutationReview::default())
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let entry = db
+        .store
+        .cvm_instance_entries(&actor, id)
+        .await
+        .unwrap()
+        .remove(0);
+    request.request_id = "atomic-network-entry-0002".into();
+    request.entry_additions.clear();
+    request.entry_releases = vec![CvmNetworkEntryRelease {
+        id: entry.id.clone(),
+        expected_revision: entry.revision,
+    }];
+    let bad = db
+        .store
+        .edit_cvm_network(
+            &actor,
+            &other.desired.id,
+            request.clone(),
+            CvmMutationReview::default(),
+        )
+        .await;
+    assert!(matches!(bad, Err(StoreError::NotFound(_))));
+    assert_eq!(network_edit_counts(&db, id).await, (before.0 + 1, 0, 1));
+    db.store
+        .edit_cvm_network(&actor, id, request, CvmMutationReview::default())
+        .await
+        .unwrap();
+    let still_held: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cvm_nic_resources WHERE entry_id=$1 AND NOT released",
+    )
+    .bind(entry.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(still_held, 1);
+    let released: bool =
+        sqlx::query_scalar("SELECT released FROM cvm_entries WHERE instance_id=$1")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(released);
+}
+
+async fn network_edit_counts(db: &TestPg, instance: &str) -> (i64, i64, i64) {
+    sqlx::query_as("SELECT (SELECT count(*) FROM revisions),(SELECT count(*) FROM cvm_nic_allocations WHERE instance_id=$1 AND NOT released),(SELECT count(*) FROM cvm_entries WHERE instance_id=$1 AND NOT cleaned)")
+        .bind(instance).fetch_one(db.pool()).await.unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_entry_protocol_policy_freezes_reservations_and_preserves_whole_address_claims() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    entry_setup(&db).await;
+    let mut spec = entry_spec();
+    spec.addresses[1].reserved_ports.tcp = vec![EntryPortRange { start: 22, end: 22 }];
+    supersede_cvm_fixture(&db).await;
+    let p = db
+        .store
+        .write_cvm_entry_publication(
+            &system_admin(),
+            None,
+            EntryPublicationWrite {
+                request_id: "protocol-publication-0001".into(),
+                expected_revision: 0,
+                spec,
+            },
+        )
+        .await
+        .unwrap();
+    let instance = create(&db, "protocol-container-0001").await;
+    let mut traffic = EntryTraffic::all();
+    traffic.tcp = EntryTransportSelection::Forward {
+        ports: EntryPortSet::All,
+        mappings: vec![EntryPortMapping {
+            listen: EntryPortRange {
+                start: 30022,
+                end: 30022,
+            },
+            target: EntryPortRange { start: 22, end: 22 },
+        }],
+    };
+    let entry = add(
+        &db,
+        &p,
+        entry_request(
+            "protocol-entry-0001",
+            &instance,
+            WHOLE,
+            EntryMode::Protocols { traffic },
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        claims(&db, &entry.id).await.len(),
+        1,
+        "an exclusive address is never expanded into per-port leases"
+    );
+    converge(&db, "n1").await;
+    converge(&db, "n2").await;
+    let old = db.store.cvm_entry_desired("n2").await.unwrap();
+    assert_eq!(
+        old.rules[0].reserved_ports.tcp,
+        vec![EntryPortRange { start: 22, end: 22 }]
+    );
+    let mut spec = p.spec.clone();
+    spec.addresses[1].reserved_ports.tcp.push(EntryPortRange {
+        start: 8080,
+        end: 8090,
+    });
+    supersede_cvm_fixture(&db).await;
+    db.store
+        .write_cvm_entry_publication(
+            &system_admin(),
+            Some(&p.id),
+            EntryPublicationWrite {
+                request_id: "protocol-publication-0002".into(),
+                expected_revision: p.revision,
+                spec,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        db.store.cvm_entry_desired("n2").await.unwrap(),
+        old,
+        "saving cannot mutate a frozen serving policy"
+    );
+    publish_cvm_intent(&db).await;
+    let next = db.store.cvm_entry_desired("n2").await.unwrap();
+    assert_eq!(next.rules[0].reserved_ports.tcp.len(), 2);
+    let delivery = db.store.cvm_entry_desired("n1").await.unwrap();
+    assert_eq!(
+        delivery.deliveries[0].reserved_ports,
+        next.rules[0].reserved_ports
+    );
+    assert_eq!(claims(&db, &entry.id).await.len(), 1);
+    let replacement = create(&db, "protocol-repoint-target-01").await;
+    sqlx::query("UPDATE cvm_nic_nodes SET capabilities=capabilities-'entry_protocol_rules' WHERE node_id='n1'").execute(db.pool()).await.unwrap();
+    supersede_cvm_fixture(&db).await;
+    assert!(matches!(
+        db.store
+            .repoint_cvm_entry(
+                &system_admin(),
+                &entry.id,
+                EntryRepoint {
+                    request_id: "protocol-repoint-old-agent-01".into(),
+                    expected_revision: entry.revision,
+                    instance_id: replacement.desired.id
+                }
+            )
+            .await,
+        Err(StoreError::Unsupported(_))
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_entry_protocol_policy_shared_reservations_and_capability_gate() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    entry_setup(&db).await;
+    let mut spec = entry_spec();
+    spec.addresses[0].reserved_ports.tcp = vec![EntryPortRange {
+        start: 30050,
+        end: 30051,
+    }];
+    spec.addresses[0].reserved_ports.tcp.push(EntryPortRange {
+        start: 30060,
+        end: 30060,
+    });
+    supersede_cvm_fixture(&db).await;
+    let p = db
+        .store
+        .write_cvm_entry_publication(
+            &system_admin(),
+            None,
+            EntryPublicationWrite {
+                request_id: "shared-protocol-publication-01".into(),
+                expected_revision: 0,
+                spec,
+            },
+        )
+        .await
+        .unwrap();
+    let instance = create(&db, "shared-protocol-container-01").await;
+    let traffic = EntryTraffic {
+        tcp: EntryTransportSelection::Forward {
+            ports: EntryPortSet::Ranges {
+                ranges: vec![EntryPortRange {
+                    start: 30048,
+                    end: 30053,
+                }],
+            },
+            mappings: vec![],
+        },
+        udp: EntryTransportSelection::Disabled,
+        icmp: false,
+        other_ip: false,
+    };
+    let request = entry_request(
+        "shared-protocol-entry-01",
+        &instance,
+        SHARED,
+        EntryMode::Protocols { traffic },
+    );
+    sqlx::query("UPDATE cvm_nic_nodes SET capabilities=capabilities-'entry_protocol_rules' WHERE node_id='n2'").execute(db.pool()).await.unwrap();
+    assert!(matches!(
+        add(&db, &p, request.clone()).await,
+        Err(StoreError::Unsupported(_))
+    ));
+    sqlx::query("UPDATE cvm_nic_nodes SET capabilities=jsonb_set(capabilities,'{entry_protocol_rules}','true') WHERE node_id='n2'").execute(db.pool()).await.unwrap();
+    let entry = add(&db, &p, request).await.unwrap();
+    let held = claims(&db, &entry.id).await;
+    assert_eq!(held.len(), 4);
+    assert!(held
+        .iter()
+        .all(|(_, value, _)| !value.ends_with(":30050") && !value.ends_with(":30051")));
+    converge(&db, "n1").await;
+    converge(&db, "n2").await;
+    let mut revised = p.spec.clone();
+    revised.addresses[0]
+        .reserved_ports
+        .tcp
+        .retain(|r| r.start != 30060);
+    supersede_cvm_fixture(&db).await;
+    let revised = db
+        .store
+        .write_cvm_entry_publication(
+            &system_admin(),
+            Some(&p.id),
+            EntryPublicationWrite {
+                request_id: "shared-reservation-remove-01".into(),
+                expected_revision: p.revision,
+                spec: revised,
+            },
+        )
+        .await
+        .unwrap();
+    let candidate = entry_request(
+        "shared-reuse-reservation-01",
+        &instance,
+        SHARED,
+        tcp(30060, 22),
+    );
+    assert!(matches!(
+        add(&db, &revised, candidate.clone()).await,
+        Err(StoreError::Conflict(_))
+    ));
+    publish_cvm_intent(&db).await;
+    // A failed receipt must not drop the previous reservation protection.
+    let desired = db.store.cvm_entry_desired("n2").await.unwrap();
+    db.store
+        .cvm_record_entry_report(
+            "n2",
+            EntryNodeReport {
+                generation: desired.generation,
+                rules: vec![],
+                deliveries: vec![],
+                tunnels: vec![],
+                diagnostics: None,
+                error: Some("fixture apply failure".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        add(&db, &revised, candidate.clone()).await,
+        Err(StoreError::Conflict(_))
+    ));
+    converge(&db, "n2").await;
+    add(&db, &revised, candidate).await.unwrap();
+    let mut spec = revised.spec.clone();
+    spec.addresses[0].reserved_ports.tcp.push(EntryPortRange {
+        start: 30052,
+        end: 30052,
+    });
+    supersede_cvm_fixture(&db).await;
+    assert!(matches!(
+        db.store
+            .write_cvm_entry_publication(
+                &system_admin(),
+                Some(&p.id),
+                EntryPublicationWrite {
+                    request_id: "shared-protocol-publication-02".into(),
+                    expected_revision: revised.revision,
+                    spec
+                }
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn isolated_cvm_entry_repair_keeps_both_peers_in_the_same_executable_wave() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    entry_setup(&db).await;
+    let instance = create(&db, "isolated-entry-instance-01").await;
+    let publication = publish_entries(&db).await;
+    db.store
+        .isolate_node(
+            &system_admin(),
+            "n1",
+            IsolateNodeRequest {
+                acknowledge_uncertain: true,
+            },
+        )
+        .await
+        .unwrap();
+    let entry = add(
+        &db,
+        &publication,
+        entry_request(
+            "isolated-entry-create-0001",
+            &instance,
+            SHARED,
+            tcp(30110, 8080),
+        ),
+    )
+    .await
+    .unwrap();
+    let revision: i64 =
+        sqlx::query_scalar("SELECT current_revision FROM control_state WHERE id=TRUE")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let order = db
+        .store
+        .create_deployment(
+            &system_admin(),
+            create_deployment_request(revision as u64, "isolated-entry-order-0001"),
+        )
+        .await
+        .unwrap();
+    let a = order
+        .plan
+        .targets
+        .iter()
+        .find(|t| t.node_id == "n1")
+        .unwrap();
+    let b = order
+        .plan
+        .targets
+        .iter()
+        .find(|t| t.node_id == "n2")
+        .unwrap();
+    assert_eq!(
+        a.status,
+        brocade_deployment::plan::PlannedTargetStatus::Pending
+    );
+    assert_eq!(a.status, b.status);
+    assert_eq!(a.wave, b.wave);
+    for node in ["n1", "n2"] {
+        let claim = db
+            .store
+            .claim_desired_for_node(node)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.deployment_id, order.deployment_id);
+        db.store
+            .report_target_result(applied_report(&claim))
+            .await
+            .unwrap();
+    }
+    converge(&db, "n1").await;
+    assert_ne!(
+        target_status(db.pool(), order.deployment_id, "n2").await,
+        "succeeded",
+        "one peer receipt cannot confirm the pair"
+    );
+    converge(&db, "n2").await;
+    acknowledge_network(&db, "n1").await;
+    acknowledge_network(&db, "n2").await;
+    assert_eq!(
+        target_status(db.pool(), order.deployment_id, "n1").await,
+        "succeeded"
+    );
+    assert_eq!(
+        target_status(db.pool(), order.deployment_id, "n2").await,
+        "succeeded"
+    );
+    assert!(db
+        .store
+        .cvm_entry_desired("n2")
+        .await
+        .unwrap()
+        .rules
+        .iter()
+        .any(|r| r.id == entry.id));
+    let isolated: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM node_operational_isolations WHERE node_id='n1')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(isolated);
+    let debt: i64 = sqlx::query_scalar("SELECT count(*) FROM node_convergence_obligations WHERE node_id='n1' AND status IN ('pending','dispatched','converging','failed-recovered','failed-dirty')").fetch_one(db.pool()).await.unwrap();
+    assert_eq!(debt, 0);
 }

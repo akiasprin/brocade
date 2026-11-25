@@ -215,7 +215,7 @@ async fn v037_rules_upgrade_preserves_receipts_and_connectors_and_retries_atomic
     let check = db.store.check_database_upgrade().await.unwrap();
     assert!(check.compatible);
     assert_eq!(check.installed_versions, [1, 2, 3, 4, 5, 6]);
-    assert_eq!(check.pending_versions, [7, 8]);
+    assert_eq!(check.pending_versions, [7, 8, 9]);
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('public.user_clash_rules') IS NULL")
         .fetch_one(db.pool())
         .await
@@ -252,7 +252,7 @@ async fn v037_rules_upgrade_preserves_receipts_and_connectors_and_retries_atomic
     assert_eq!(after, before);
     let check = db.store.check_database_upgrade().await.unwrap();
     assert!(check.compatible && check.pending_versions.is_empty());
-    assert_eq!(check.installed_versions, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(check.installed_versions, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
     sqlx::query("INSERT INTO user_clash_rules(tenant_id,user_id,version,rules) VALUES('platform.acme','alice',3,'{\"custom\":[]}')")
         .execute(db.pool()).await.unwrap();
     let rules_and_receipt = "SELECT jsonb_build_object('rules',(SELECT to_jsonb(r) FROM user_clash_rules r),'receipt',(SELECT to_jsonb(m) FROM _sqlx_migrations m WHERE version=7))";

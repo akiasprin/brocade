@@ -8,7 +8,7 @@ license.workspace = true
 
 [features]
 default = []
-cvm = ["dep:brocade-cube", "dep:brocade-cvm-compile", "brocade-deployment/cvm", "dep:cube-terminal", "dep:async-trait"]
+cvm = ["dep:brocade-cube", "dep:brocade-cvm-compile", "brocade-deployment/cvm", "dep:cube-terminal", "dep:async-trait", "dep:str0m"]
 
 [dependencies]
 cube-terminal = { path = "../../components/cube/CubeShim/terminal", optional = true, features = ["server"] }
@@ -50,6 +50,9 @@ base64 = "0.22.1"
 # Reuse the workspace's ring/rcgen stack for private CVM transport identities.
 ring = "0.17"
 rcgen = "0.14"
+# DataChannel with RustCrypto; exclude OpenSSL and example HTTP servers.
+# dimpl/rcgen still enables AWS-LC for certificate generation; verify both musl targets.
+str0m = { version = "=0.26.0", optional = true, default-features = false, features = ["rust-crypto"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

@@ -48,7 +48,7 @@ try {
     for (const kind of ['cube/sandbox.json', 'cube/egress.json', 'cube/attachments.json', 'guest/init.json']) {
       await page.locator('.cvm-artifact-file').filter({ hasText: kind }).click();
       await page.getByRole('button', { name: '全文', exact: true }).click();
-      await page.locator('.cvm-artifacts pre').first().waitFor();
+      await page.getByLabel('产物全文', { exact: true }).waitFor();
     }
     if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth))
       throw new Error(`native artifact horizontal overflow at ${width}`);

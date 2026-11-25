@@ -1,13 +1,10 @@
 use crate::{
     backend::{report, running, valid_runtime, Inner},
-    network::RESTART_REQUIRED,
     records::{boot_digest, Record},
     Result,
 };
 use brocade_deployment::cvm::*;
 use serde_json::json;
-
-use brocade_cvm_compile::INIT_SCRIPT;
 
 impl Inner {
     pub(crate) fn reconcile(
@@ -31,17 +28,17 @@ impl Inner {
         {
             return Err("运行中系统、容量或访问身份不可替换".into());
         }
-        if desired.power == PowerState::Running && !valid_public_key(&desired.spec.ssh_public_key) {
+        if desired.power == PowerState::Running && desired.spec.login_revision == 0 {
             return Ok(report(
                 desired,
                 ApplyStatus::Failed,
-                Some("SSH 公钥无效，尚未创建运行时"),
+                Some("缺少容器登录凭据版本，尚未创建运行时"),
             ));
         }
         if desired.power == PowerState::Stopped && !self.cfg.capabilities.stable_storage {
             return Ok(report(
                 desired,
-                ApplyStatus::RestartRequired,
+                ApplyStatus::Failed,
                 Some("稳定根盘停止与恢复尚未验证"),
             ));
         }
@@ -123,7 +120,7 @@ impl Inner {
             if record.attempted && record.transition != "boot" && record.transition != "fresh" {
                 return Err("原运行时不存在或创建结果不明，拒绝自动重建空盘".into());
             }
-            let mut request = match self.cfg.create_request(&self.images, desired) {
+            let mut request = match self.cfg.create_request(desired) {
                 Ok(req) => req,
                 Err(error) => return Ok(report(desired, ApplyStatus::Failed, Some(&error))),
             };
@@ -141,10 +138,8 @@ impl Inner {
             record.boot_sha256 = boot_digest(desired)?;
             record.contact_id = contact.id.clone();
             self.prepare_nics(record, desired)?;
-            if !record.native_shim_version.is_empty() {
-                request["annotations"]["cube.master.components.cube-shim.version"] =
-                    json!(record.native_shim_version);
-            }
+            request["annotations"]["cube.master.components.cube-shim.version"] =
+                json!(record.native_shim_version);
             crate::artifacts::record_sandbox(record, desired, &request)?;
             record.attempted = true;
             record.save(&self.root)?;
@@ -160,33 +155,55 @@ impl Inner {
         if !valid_runtime(&record.runtime) {
             return Err("运行时身份无效".into());
         }
-        if !record.initialized {
+        let sandbox = desired
+            .artifacts
+            .as_ref()
+            .ok_or("Cube artifacts missing")?
+            .file(CvmArtifactKind::Sandbox)?;
+        if record.sandbox_sha256 != sandbox.sha256
+            || !valid_digest(&record.sandbox_effective_sha256)
+        {
+            return Err("当前运行时缺少匹配的沙箱产物回执，拒绝接管".into());
+        }
+        if !record.initialized || record.login_revision != desired.spec.login_revision {
             let guest =
                 self.artifact_value(desired, CvmArtifactKind::GuestInit, &Default::default())?;
-            let ssh_key = match guest.as_ref() {
-                Some(value) => brocade_cvm_compile::guest_key(value)?,
-                None => &desired.spec.ssh_public_key,
-            };
-            self.guest_exec(
+            if guest["contract"] != "brocade-guest-init-v2"
+                || guest["user"] != "cube"
+                || guest["credential_revision"] != desired.spec.login_revision
+            {
+                return Err("unsupported Guest password initialization contract".into());
+            }
+            let path = self
+                .root
+                .join("credentials")
+                .join(format!("{}.json", desired.id));
+            let bytes = crate::files::checked_file(&path, 4096, true)?;
+            let credential: GuestCredential =
+                serde_json::from_slice(&bytes).map_err(|_| "Guest credential is invalid")?;
+            credential.validate()?;
+            if credential.instance_id != desired.id
+                || credential.revision != desired.spec.login_revision
+            {
+                return Err("Guest credential does not match approved specification".into());
+            }
+            self.guest_exec_input(
                 &record.runtime,
                 false,
-                &["/bin/sh", "-c", INIT_SCRIPT, "brocade-init", ssh_key],
+                &[
+                    "/bin/sh",
+                    "-c",
+                    brocade_cvm_compile::PASSWORD_INIT_SCRIPT,
+                    "brocade-password-init",
+                ],
+                format!("{}\n", credential.password).as_bytes(),
                 std::time::Duration::from_secs(20),
             )?;
             record.initialized = true;
+            record.login_revision = credential.revision;
             record.save(&self.root)?;
         }
-        let (interfaces, network, detached) = match self.ensure_nics(record, desired) {
-            Ok(result) => result,
-            Err(error) if error == RESTART_REQUIRED => {
-                return Ok(report(
-                    desired,
-                    ApplyStatus::RestartRequired,
-                    Some("运行中的 Cube 执行栈需要保盘重启，之后继续原网卡挂载任务"),
-                ))
-            }
-            Err(error) => return Err(error),
-        };
+        let (interfaces, network, detached) = self.ensure_nics(record, desired)?;
         let volume = self.volume(record, desired)?;
         if !record.volume.is_empty() && record.volume != volume {
             return Err("原系统盘身份发生变化，需要核查".into());

@@ -1,7 +1,13 @@
 import { Fragment, useRef, useState } from 'react';
 import { DialogClose, DialogLayer } from '../ui/dialog';
 import { Icon } from '../ui/icons';
-import { egressDnsEndpointText, egressDnsMembers, type DestMatch, type UnlockDnsRule } from '../api';
+import {
+  egressDnsEndpointText,
+  egressDnsMembers,
+  type DestMatch,
+  type UnlockConnectionEvidence,
+  type UnlockDnsRule,
+} from '../api';
 import type { Row } from './unlock-report';
 import { connectionFailureReason } from './unlock-dial';
 
@@ -37,6 +43,13 @@ export function DnsRuleMembers({ rule }: { rule: UnlockDnsRule }) {
   );
 }
 
+const CONNECTION_EVIDENCE: Record<Exclude<UnlockConnectionEvidence, 'verified'>, string> = {
+  dns_incomplete: 'DNS 路径记录不完整',
+  trace_incomplete: '连接追踪未完整关联',
+  exit_mismatch: '报告的出口未匹配本次线路',
+  profile_mismatch: '出口配置或拨号地址族与本次检测不符',
+};
+
 export function UnlockDnsDetails({ row }: { row: Row }) {
   const anchor = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
@@ -58,16 +71,9 @@ export function UnlockDnsDetails({ row }: { row: Row }) {
           : '回退待确认'
         : '回退';
   const label = `${row.name} · ${evidence.kind === 'fallback' ? '回退结果' : tag}的解析路径`;
-  const connections = [
-    ...new Map(
-      (row.source?.connection_observations ?? [])
-        .filter(connection => connection.part === evidence.part)
-        .map(connection => [
-          `${connection.domain}|${connection.exit}|${connection.family}|${connection.connected}|${connection.complete}`,
-          connection,
-        ]),
-    ).values(),
-  ];
+  const connections = (row.source?.connection_observations ?? []).filter(
+    connection => connection.part === evidence.part,
+  );
   return (
     <>
       <button
@@ -191,27 +197,39 @@ export function UnlockDnsDetails({ row }: { row: Row }) {
                   <dd>{evidence.exits.join('、')}</dd>
                 </div>
               )}
-              {connections.slice(0, 16).map((connection, index) => (
-                <div key={index}>
-                  <dt>实际连接{connections.length > 1 ? ` ${index + 1}` : ''}</dt>
-                  <dd>
-                    <code>{connection.domain}</code>
-                    <small>
-                      {evidence.exits.includes(connection.exit) ? connection.exit : '出口未验证'} ·{' '}
-                      {connection.connected
-                        ? `已连接 ${connection.family === 'v4' ? 'IPv4' : 'IPv6'}`
-                        : connection.error === 'dns_empty'
-                          ? '无解析地址，未建立连接'
-                          : (connectionFailureReason(connection) ?? '未建立连接')}
-                    </small>
-                  </dd>
-                </div>
-              ))}
+              {connections.slice(0, 16).map((connection, index) => {
+                const verification = evidence.connection_evidence?.[connection.id];
+                const trustedExit = verification === 'verified' || verification === 'dns_incomplete';
+                return (
+                  <div key={index}>
+                    <dt>实际连接{connections.length > 1 ? ` ${index + 1}` : ''}</dt>
+                    <dd>
+                      <code>{connection.domain}</code>
+                      <small>
+                        {trustedExit
+                          ? connection.exit
+                          : connection.exit
+                            ? `报告出口 ${connection.exit}`
+                            : '未收到出口身份'}{' '}
+                        ·{' '}
+                        {connection.connected
+                          ? `已连接 ${connection.family === 'v4' ? 'IPv4' : 'IPv6'}`
+                          : connection.error === 'dns_empty'
+                            ? '无解析地址，未建立连接'
+                            : (connectionFailureReason(connection) ?? '未建立连接')}
+                      </small>
+                      {verification !== 'verified' && (
+                        <small>{verification ? CONNECTION_EVIDENCE[verification] : '历史记录缺少逐连接校验'}</small>
+                      )}
+                    </dd>
+                  </div>
+                );
+              })}
               <div>
                 <dt>依据</dt>
                 <dd>
                   本次实际连接的 DNS 解析与拨号
-                  <small>已按连接编号关联，并核对出口身份、DNS 与出站配置及检测修订。</small>
+                  <small>按连接编号核对出口身份、出站配置与 DNS 记录。</small>
                 </dd>
               </div>
             </dl>

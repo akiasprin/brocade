@@ -275,7 +275,7 @@ impl PgStore {
             let id: String = row.try_get("id")?;
             // Probe the container's TCP entry services from its own host through the
             // primary NIC delivery address, the same path an entry delivers to.
-            let probes=sqlx::query("SELECT e.id,e.mode,i.report->>'access_address' AS target,(SELECT device->>'id' FROM jsonb_array_elements(i.desired#>'{spec,interfaces}') device WHERE device#>>'{connection,purpose}'='contact' LIMIT 1) AS interface_id FROM cvm_entries e JOIN cvm_instances i ON i.id=e.instance_id WHERE e.instance_id=$1 AND NOT e.released AND e.mode->>'kind'='l4' ORDER BY e.created_at,e.id LIMIT 64").bind(&id).fetch_all(&self.pool).await?;
+            let probes=sqlx::query("SELECT e.id,e.mode,e.address,p.spec AS publication_spec,i.report->>'access_address' AS target,(SELECT device->>'id' FROM jsonb_array_elements(i.desired#>'{spec,interfaces}') device WHERE device->>'purpose'='contact' LIMIT 1) AS interface_id FROM cvm_entries e JOIN cvm_instances i ON i.id=e.instance_id JOIN cvm_entry_publications p ON p.id=e.publication_id WHERE e.instance_id=$1 AND NOT e.released AND e.mode->>'kind' IN ('l4_range','protocols') ORDER BY e.created_at,e.id LIMIT 64").bind(&id).fetch_all(&self.pool).await?;
             let mut services = Vec::new();
             for probe in probes {
                 let (Some(target), Some(interface_id)) = (
@@ -284,31 +284,49 @@ impl PgStore {
                 ) else {
                     continue;
                 };
-                let EntryMode::L4 {
-                    protocol,
-                    target_port,
-                    ..
-                } = serde_json::from_value(probe.try_get("mode")?)?
-                else {
-                    continue;
-                };
-                if !protocol.covers(L4Protocol::Tcp)
-                    || services
+                let mode: EntryMode = serde_json::from_value(probe.try_get("mode")?)?;
+                let spec: EntryPublicationSpec =
+                    serde_json::from_value(probe.try_get("publication_spec")?)?;
+                let address: std::net::Ipv4Addr = probe
+                    .try_get::<String, _>("address")?
+                    .parse()
+                    .map_err(|_| invalid("invalid entry observation address"))?;
+                let offer = spec
+                    .offer(address)
+                    .ok_or_else(|| invalid("missing entry observation address offer"))?;
+                let ports = offer
+                    .resolve_mode(&mode)
+                    .map_err(invalid)?
+                    .sample_tcp_targets(&offer.reserved_ports)
+                    .map_err(invalid)?;
+                let single = ports.len() == 1;
+                let entry_id: String = probe.try_get("id")?;
+                for port in ports {
+                    if services
                         .iter()
-                        .any(|s: &ServiceProbeTarget| s.port == target_port)
-                {
-                    continue;
+                        .any(|service: &ServiceProbeTarget| service.port == port)
+                    {
+                        continue;
+                    }
+                    services.push(ServiceProbeTarget {
+                        id: if single {
+                            entry_id.clone()
+                        } else {
+                            format!("{entry_id}-{port}")
+                        },
+                        interface_id: interface_id.clone(),
+                        host: target.clone(),
+                        port,
+                    });
+                    if services.len() == 8 {
+                        break;
+                    }
                 }
-                services.push(ServiceProbeTarget {
-                    id: probe.try_get("id")?,
-                    interface_id,
-                    host: target,
-                    port: target_port,
-                });
                 if services.len() == 8 {
                     break;
                 }
             }
+
             out.push(ObservationTarget {
                 id,
                 generation: row.try_get::<i64, _>("generation")? as u64,

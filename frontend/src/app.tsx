@@ -26,6 +26,8 @@ import { initialNodeDetailFromHash, initialPaneFromHash, preloadPaneForHash } fr
 import { draft } from './draft';
 import { clearRetiredMachineOrder } from './retired-machine-order';
 
+const WebShellWindow = __BROCADE_CVM__ ? lazy(() => import('./panes/cvm/terminal-window')) : null;
+
 type ForgeShellModule = typeof import('./forge/shell');
 
 let forgeShellModule: Promise<ForgeShellModule> | undefined;
@@ -200,7 +202,11 @@ export function App() {
   return (
     <SessionProvider value={session}>
       <Suspense fallback={<div id="stage" />}>
-        <ForgeShell branding={branding} session={session} onLogout={onLogout} />
+        {WebShellWindow && new URLSearchParams(location.search).get('webshell') ? (
+          <WebShellWindow id={new URLSearchParams(location.search).get('webshell')!} />
+        ) : (
+          <ForgeShell branding={branding} session={session} onLogout={onLogout} />
+        )}
       </Suspense>
     </SessionProvider>
   );

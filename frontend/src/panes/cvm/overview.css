@@ -1,0 +1,298 @@
+/* 容器概览：机器详情观测页的同一套卡面（.chart-card / .load-network-cap / .panel.nd-runtime），
+   这里只补容器特有的块内排版。 */
+/* 两列窄砖（指标带未切到三列时）放不下「读数 后缀」整串：后缀统一落到第二行，
+   接收与发送两个读数之间允许折行，不再截掉发送速率或容量。 */
+@container (max-width: 639.98px) {
+  .cvm-overview .cvm-kpis .kpi-v {
+    line-height: 1.25;
+    white-space: normal;
+  }
+  .cvm-overview .cvm-kpis .kpi-v > .kpi-sub {
+    display: block;
+    margin: 2px 0 0;
+    white-space: nowrap;
+  }
+}
+.cvm-kpi-idle {
+  color: var(--ink-4);
+  font: 500 12.5px var(--sans);
+  letter-spacing: 0;
+}
+.cvm-overview-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  align-items: stretch;
+  min-width: 0;
+}
+@container (min-width: 900px) {
+  .cvm-overview-pair {
+    grid-template-columns: minmax(0, 1.06fr) minmax(0, 0.94fr);
+  }
+}
+.cvm-overview-card {
+  display: flex;
+  flex-direction: column;
+}
+.cvm-card-block {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.cvm-card-block + .cvm-card-block {
+  border-top: 1px solid var(--line);
+}
+.cvm-card-grow {
+  flex: 1 1 auto;
+}
+.cvm-card-body {
+  --ctl-h: 26px;
+  min-width: 0;
+  padding: 0 12px 12px;
+}
+/* 标题栏右端的跳转：与机器详情「IP 变更记录 0 条 ›」同一写法，文字链加 ›。 */
+.cvm-cap-link {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--action);
+  font: 12px var(--sans);
+  cursor: pointer;
+}
+.cvm-cap-link > span {
+  font-size: 14px;
+  line-height: 1;
+}
+.cvm-cap-link:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--action) 44%, transparent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+@media (hover: hover) {
+  .cvm-cap-link:hover {
+    text-decoration: underline;
+  }
+}
+.load-network-cap > .cvm-cap-link {
+  margin-left: auto;
+}
+.load-network-cap > span + .cvm-cap-link {
+  margin-left: auto;
+}
+
+/* 嵌在框架卡里的历史图不再自带卡面。 */
+.cvm-chart-flush > .history-chart-card {
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+.cvm-chart-flush > .history-chart-card .history-chart {
+  height: 168px;
+}
+/* 曲线分块加载期间占住图表高度，读取提示居中，不贴着卡边、加载完也不跳动。 */
+.cvm-chart-flush > .loading-mark {
+  display: flex;
+  justify-content: center;
+  min-height: 204px;
+}
+.cvm-chart-empty {
+  margin: 0;
+  padding: 12px;
+}
+
+/* SSH：一行命令，右端是经由的入口（多条时可切换）与复制。 */
+.cvm-ssh {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  min-height: 36px;
+  padding: 4px 4px 4px 11px;
+  box-sizing: border-box;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-ctl);
+  background: var(--sunk);
+}
+.cvm-ssh-command {
+  flex: 1 1 260px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font: 12.5px var(--mono);
+  overflow-wrap: anywhere;
+}
+.cvm-ssh-route {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-left: auto;
+}
+.cvm-ssh-route > .note {
+  margin: 0;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.cvm-ssh-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: var(--r-ctl);
+  color: var(--ink-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.cvm-ssh-switch > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.cvm-ssh-switch > select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+.cvm-ssh-switch:focus-within {
+  border-color: color-mix(in srgb, var(--action) 50%, var(--line));
+}
+@media (hover: hover) {
+  .cvm-ssh-switch:hover {
+    border-color: var(--line);
+    color: var(--ink);
+  }
+}
+.cvm-ssh-route > .btn {
+  min-height: 26px;
+}
+.cvm-ssh-empty {
+  margin: 0;
+  padding: 9px 11px;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-ctl);
+}
+.cvm-password-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink-3);
+  font-size: 12px;
+}
+.cvm-password-row > .ui-icon {
+  color: var(--ink-4);
+}
+.cvm-password-who {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.cvm-password-who b {
+  color: var(--ink);
+  font-weight: 500;
+}
+.cvm-password-value {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.cvm-password-value > input.f {
+  width: 210px;
+  min-height: 26px;
+}
+.cvm-password-row .btn {
+  gap: 5px;
+  min-height: 26px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+.cvm-quiet-btn.btn {
+  border-color: transparent;
+  background: transparent;
+  color: var(--ink-3);
+}
+@media (hover: hover) {
+  .cvm-quiet-btn.btn:hover:not(:disabled) {
+    color: var(--ink);
+  }
+}
+
+/* 网络概况：三行标记，标签列等宽对齐。 */
+.cvm-net-summary {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+.cvm-net-summary > div {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+.cvm-net-summary dt {
+  padding-top: 3px;
+  color: var(--ink-4);
+  font-size: 11.5px;
+}
+.cvm-net-summary dd {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+  margin: 0;
+}
+.cvm-net-summary .dim {
+  color: var(--ink-4);
+  font-size: 12px;
+  line-height: 20px;
+}
+.cvm-overview-events .cvm-monitoring-events li {
+  padding: 6px 0;
+}
+.cvm-overview-events .cvm-monitoring-events li:first-child {
+  padding-top: 0;
+}
+.cvm-overview-events > .note {
+  margin: 0;
+}
+
+/* 运行状态卡：机器详情同一张整宽卡，标题条右端放跳转。 */
+.cvm-runtime > header {
+  align-items: center;
+}
+.cvm-runtime > header .hint {
+  color: var(--ink-4);
+  font: 10.5px var(--mono);
+}
+.cvm-rt-owner {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+}
+.cvm-rt-owner > .btn {
+  min-height: 22px;
+  padding: 0 7px;
+  font: 11.5px var(--sans);
+}
+.nd-rt-c:has(.cvm-rt-owner) dd {
+  overflow: visible;
+}

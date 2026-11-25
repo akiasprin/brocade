@@ -10,7 +10,7 @@ pub(crate) async fn ensure_node_released(
         "SELECT EXISTS(SELECT 1 FROM cvm_instances WHERE (reserved OR status<>'applied') AND node_id=$1)
          OR EXISTS(SELECT 1 FROM cvm_interfaces f JOIN cvm_instances i ON i.id=f.instance_id WHERE NOT f.detached_confirmed AND i.node_id=$1)
          OR EXISTS(SELECT 1 FROM cvm_nic_allocations WHERE NOT released AND (provider_node=$1 OR consumer_node=$1))
-         OR EXISTS(SELECT 1 FROM cvm_user_host_network_quotas WHERE held_states > 0 AND node_id=$1)
+         OR EXISTS(SELECT 1 FROM cvm_network_quota_hosts WHERE coalesce((report->>'states')::bigint,0)>0 AND node_id=$1)
          OR EXISTS(SELECT 1 FROM cvm_volumes v JOIN cvm_instances i ON i.id=v.instance_id WHERE v.state<>'released' AND i.node_id=$1)
          OR EXISTS(SELECT 1 FROM cvm_nic_bindings WHERE NOT cleaned AND (provider_node=$1 OR consumer_node=$1))
          OR EXISTS(SELECT 1 FROM cvm_entries e JOIN cvm_instances i ON i.id=e.instance_id WHERE NOT e.cleaned AND (e.provider_node=$1 OR i.node_id=$1))
@@ -57,6 +57,7 @@ impl PgStore {
         crate::resource_coordination::lock(&mut tx).await?;
         let occupied: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM cvm_instances WHERE reserved OR status<>'applied')
+             OR EXISTS(SELECT 1 FROM cvm_network_quota_hosts WHERE coalesce((report->>'states')::bigint,0)>0)
              OR EXISTS(SELECT 1 FROM cvm_volumes WHERE state <> 'released')
              OR EXISTS(SELECT 1 FROM cvm_interfaces WHERE NOT detached_confirmed)
              OR EXISTS(SELECT 1 FROM cvm_nic_resources WHERE NOT released)
@@ -66,7 +67,6 @@ impl PgStore {
              OR EXISTS(SELECT 1 FROM cvm_entry_tunnels WHERE NOT cleaned)
              OR EXISTS(SELECT 1 FROM cvm_nic_publications WHERE NOT deleted)
              OR EXISTS(SELECT 1 FROM cvm_entry_publications WHERE NOT deleted)
-             OR EXISTS(SELECT 1 FROM cvm_user_host_network_quotas WHERE held_states > 0)
              OR EXISTS(SELECT 1 FROM binary_releases WHERE active AND component='agent' AND artifacts->>'agent_flavor'='cvm')",
         )
         .fetch_one(&mut *tx)

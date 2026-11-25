@@ -107,7 +107,7 @@ async fn node_removal_cleans_cvm_snapshots_and_preserves_other_nodes() {
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn node_removal_preserves_cvm_publication_history() {
+async fn node_removal_detaches_and_preserves_cvm_publication_history() {
     for table in ["cvm_nic_publications", "cvm_entry_publications"] {
         let Some(db) = TestPg::start_if_enabled().await else {
             return;
@@ -125,7 +125,7 @@ async fn node_removal_preserves_cvm_publication_history() {
         .await
         .unwrap();
 
-        let error = db
+        let removed = db
             .store
             .remove_retired_nodes(
                 &system_admin(),
@@ -134,9 +134,16 @@ async fn node_removal_preserves_cvm_publication_history() {
                 },
             )
             .await
-            .unwrap_err();
-        assert!(matches!(error, StoreError::Conflict(_)), "{table}: {error}");
-        assert_cvm_snapshots(&db, 1).await;
+            .unwrap();
+        assert_eq!(removed.removed_nodes, ["n1"]);
+        assert_cvm_snapshots(&db, 0).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nodes WHERE id='n1'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(&format!(
                 "SELECT count(*) FROM {table} WHERE id='history' AND deleted"
@@ -147,6 +154,150 @@ async fn node_removal_preserves_cvm_publication_history() {
             1
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn node_removal_detaches_and_preserves_cvm_instance_execution_history() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    insert_minimal_fixture(db.pool()).await;
+    retire_for_removal(&db, "n1").await;
+    sqlx::query(
+        "INSERT INTO cvm_instances (
+             id,tenant_id,user_id,node_id,name,generation,desired,status,reserved
+         ) VALUES (
+             'cvm-11111111-1111-4111-8111-111111111111','platform.acme','alice','n1',
+             'retired history',1,
+             '{\"id\":\"cvm-11111111-1111-4111-8111-111111111111\",\"power\":\"deleted\"}',
+             'unknown',FALSE
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cvm_spec_versions(instance_id,generation,spec,sha256)
+         VALUES ('cvm-11111111-1111-4111-8111-111111111111',1,'{}',repeat('a',64))",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cvm_operations(
+             id,instance_id,generation,kind,actor_id,request_id,request_sha256,status
+         ) VALUES (
+             'op-11111111-1111-4111-8111-111111111111',
+             'cvm-11111111-1111-4111-8111-111111111111',1,'force_node_retirement',
+             'test-system','remove-history',repeat('b',64),'unknown'
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let removed = db
+        .store
+        .remove_retired_nodes(
+            &system_admin(),
+            RemoveRetiredNodesRequest {
+                node_ids: vec!["n1".to_owned()],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(removed.removed_nodes, ["n1"]);
+    let history = sqlx::query(
+        "SELECT i.node_id,i.reserved,i.desired->>'power' AS power,o.kind
+           FROM cvm_instances i
+           JOIN cvm_operations o ON o.instance_id=i.id
+          WHERE i.id='cvm-11111111-1111-4111-8111-111111111111'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(history.get::<String, _>("node_id"), "n1");
+    assert!(!history.get::<bool, _>("reserved"));
+    assert_eq!(history.get::<String, _>("power"), "deleted");
+    assert_eq!(history.get::<String, _>("kind"), "force_node_retirement");
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn prerelease_0009_upgrade_resets_cvm_data_and_detaches_exact_node_foreign_keys() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    db.store.migrate().await.unwrap();
+    for statement in [
+        "ALTER TABLE cvm_instances ADD CONSTRAINT cvm_instances_node_id_fkey FOREIGN KEY(node_id) REFERENCES nodes(id) ON DELETE RESTRICT",
+        "ALTER TABLE cvm_nic_publications ADD CONSTRAINT cvm_nic_publications_provider_node_fkey FOREIGN KEY(provider_node) REFERENCES nodes(id) ON DELETE RESTRICT",
+        "ALTER TABLE cvm_nic_allocations ADD CONSTRAINT cvm_nic_allocations_provider_node_fkey FOREIGN KEY(provider_node) REFERENCES nodes(id) ON DELETE RESTRICT",
+        "ALTER TABLE cvm_nic_allocations ADD CONSTRAINT cvm_nic_allocations_consumer_node_fkey FOREIGN KEY(consumer_node) REFERENCES nodes(id) ON DELETE RESTRICT",
+        "ALTER TABLE cvm_nic_bindings ADD CONSTRAINT cvm_nic_bindings_provider_node_fkey FOREIGN KEY(provider_node) REFERENCES nodes(id) ON DELETE RESTRICT",
+        "ALTER TABLE cvm_nic_bindings ADD CONSTRAINT cvm_nic_bindings_consumer_node_fkey FOREIGN KEY(consumer_node) REFERENCES nodes(id) ON DELETE RESTRICT",
+        "ALTER TABLE cvm_entry_publications ADD CONSTRAINT cvm_entry_publications_provider_node_fkey FOREIGN KEY(provider_node) REFERENCES nodes(id) ON DELETE RESTRICT",
+        "ALTER TABLE cvm_entry_tunnels ADD CONSTRAINT cvm_entry_tunnels_entry_node_fkey FOREIGN KEY(entry_node) REFERENCES nodes(id) ON DELETE RESTRICT",
+        "ALTER TABLE cvm_entry_tunnels ADD CONSTRAINT cvm_entry_tunnels_target_node_fkey FOREIGN KEY(target_node) REFERENCES nodes(id) ON DELETE RESTRICT",
+        "ALTER TABLE cvm_entries ADD CONSTRAINT cvm_entries_provider_node_fkey FOREIGN KEY(provider_node) REFERENCES nodes(id) ON DELETE RESTRICT",
+    ] {
+        sqlx::query(statement).execute(db.pool()).await.unwrap();
+    }
+    insert_minimal_fixture(db.pool()).await;
+    sqlx::query(
+        "INSERT INTO cvm_instances(id,tenant_id,node_id,name,generation,desired)
+         VALUES('legacy-cvm','platform.acme','n1','Legacy CVM',1,'{}')",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE _sqlx_migrations
+            SET checksum=decode('3955d2e313a1e967cf6602843d774a45698fa5eb7cdc0ed8d5ebff081cbce1ce2ddbd1dcdc69b5d1099b206cd08ba1a4','hex')
+          WHERE version=9",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    assert!(!db.store.check_database_upgrade().await.unwrap().compatible);
+    let compatible = db.store.check_prerelease_0009_upgrade().await.unwrap();
+    assert!(compatible.compatible);
+    assert_eq!(compatible.pending_versions, [9]);
+    db.store.migrate_prerelease_0009_schema().await.unwrap();
+    assert!(db.store.check_database_upgrade().await.unwrap().compatible);
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint
+          WHERE conname=ANY($1) AND confrelid='nodes'::regclass",
+    )
+    .bind(vec![
+        "cvm_entries_provider_node_fkey",
+        "cvm_entry_publications_provider_node_fkey",
+        "cvm_entry_tunnels_entry_node_fkey",
+        "cvm_entry_tunnels_target_node_fkey",
+        "cvm_instances_node_id_fkey",
+        "cvm_nic_allocations_consumer_node_fkey",
+        "cvm_nic_allocations_provider_node_fkey",
+        "cvm_nic_bindings_consumer_node_fkey",
+        "cvm_nic_bindings_provider_node_fkey",
+        "cvm_nic_publications_provider_node_fkey",
+    ])
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(remaining, 0);
+    let rows: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+             (SELECT count(*) FROM cvm_instances),
+             (SELECT count(*) FROM nodes),
+             (SELECT count(*) FROM users)",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows, (0, 1, 1));
 }
 
 async fn forwarding_history(db: &TestPg, node: &str, tenant: &str, user: &str) -> i64 {

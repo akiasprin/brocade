@@ -202,7 +202,10 @@ for (const engine of ['chromium', 'webkit'] as const) {
         const errors = await preview(page, 390, theme);
         await noOverflow(page);
         const head = page.locator('.node-cardpage .nd-page-head');
-        const title = await head.locator('h1').boundingBox();
+        // The identity is the flex item centered against the tools. The nested h1 carries
+        // asymmetric descender padding so clipped names retain p/g/y; its content box is
+        // therefore not the header's alignment box.
+        const title = await head.locator('.nd-page-identity').boundingBox();
         const tools = await head.locator('.nd-tools').boundingBox();
         expect(Math.abs(title!.y + title!.height / 2 - tools!.y - tools!.height / 2)).toBeLessThanOrEqual(1);
         await expect(page).toHaveScreenshot(`comet-${engine}-390-${theme}.png`);

@@ -89,6 +89,8 @@ export function nicCatalog(manage = true, instance?: CvmInstance): CvmNicCatalog
               host_ports: [{ protocol: 'tcp', port: 22 }],
               error: null,
               entries: true,
+              entry_protocol_rules: true,
+              ssh_ports: [22],
               route_service: true,
               entry_host_l3: true,
               entry_xray: true,

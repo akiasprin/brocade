@@ -80,46 +80,62 @@ fn annotate_result(
         let mut conditional = 0;
         let mut paths = vec![];
         let mut exits = BTreeSet::new();
+        let mut connection_evidence = BTreeMap::new();
         for observation in &records {
             let record = &observation.connection;
-            if !result
-                .service
-                .probe_hosts()
-                .contains(&record.domain.as_str())
-            {
-                unknown = true;
-                continue;
-            }
-            let Some(profile) = profiles.get(&record.exit) else {
-                unknown = true;
-                continue;
+            let verification = (|| {
+                if !record.valid()
+                    || !record.complete
+                    || !result
+                        .service
+                        .probe_hosts()
+                        .contains(&record.domain.as_str())
+                {
+                    return Err(UnlockConnectionEvidence::TraceIncomplete);
+                }
+                let profile = profiles
+                    .get(&record.exit)
+                    .ok_or(UnlockConnectionEvidence::ExitMismatch)?;
+                let normal = brocade_core::model::probe_family_base(&record.outbound, family)
+                    .ok_or(UnlockConnectionEvidence::ProfileMismatch)?;
+                if record.profile != profile.fingerprint
+                    || profile.strategies.get(normal) != Some(&record.normal_strategy)
+                    || record.connected && record.family != Some(family)
+                {
+                    return Err(UnlockConnectionEvidence::ProfileMismatch);
+                }
+                Ok(profile.bindings.get(normal).copied())
+            })();
+            let binding = match verification {
+                Ok(binding) => binding,
+                Err(reason) => {
+                    connection_evidence.insert(record.id.clone(), reason);
+                    unknown = true;
+                    continue;
+                }
             };
-            let Some(normal) = brocade_core::model::probe_family_base(&record.outbound, family)
-            else {
-                unknown = true;
-                continue;
-            };
-            if !record.valid()
-                || !record.complete
-                || record.profile != profile.fingerprint
-                || profile.strategies.get(normal) != Some(&record.normal_strategy)
-                || record.connected && record.family != Some(family)
-                || record.lookups.len() != 1
+            exits.insert(record.exit.clone());
+            if record.lookups.len() != 1
                 || record
                     .lookups
                     .iter()
                     .any(|lookup| !lookup.complete || lookup.domain != record.domain)
             {
+                connection_evidence
+                    .insert(record.id.clone(), UnlockConnectionEvidence::DnsIncomplete);
                 unknown = true;
                 continue;
             }
-            exits.insert(record.exit.clone());
-            match measured_path(
-                snapshot,
-                record,
-                profile.bindings.get(normal).copied(),
-                family,
-            ) {
+            let path = measured_path(snapshot, record, binding, family);
+            connection_evidence.insert(
+                record.id.clone(),
+                if path.is_some() {
+                    UnlockConnectionEvidence::Verified
+                } else {
+                    UnlockConnectionEvidence::DnsIncomplete
+                },
+            );
+            match path {
                 None => unknown = true,
                 Some(None) => {}
                 Some(Some(path)) => {
@@ -150,6 +166,7 @@ fn annotate_result(
             kind,
             paths,
             exits: exits.into_iter().collect(),
+            connection_evidence,
         });
     }
     // This aggregate remains useful to non-split consumers, but is never used to
@@ -336,6 +353,30 @@ fn normal_family(
 mod tests {
     use super::*;
     use brocade_core::model::*;
+
+    #[test]
+    fn connection_identity_is_separate_from_missing_dns_evidence() {
+        let (snapshot, profiles, mut result) = fixture();
+        let mut second = result.connection_observations[0].clone();
+        second.connection.id = "b".repeat(32);
+        second.connection.profile = "f".repeat(64);
+        result.connection_observations[0].connection.lookups.clear();
+        let first_id = result.connection_observations[0].connection.id.clone();
+        result.connection_observations.push(second);
+        result.connection_requests.insert(UnlockPart::Service, 2);
+        annotate_result(&snapshot, &profiles, IpFamily::V4, &mut result);
+        let part = &result.dns_parts[0];
+        assert_eq!(part.kind, UnlockDnsKind::Unknown);
+        assert_eq!(
+            part.connection_evidence[&first_id],
+            UnlockConnectionEvidence::DnsIncomplete
+        );
+        assert_eq!(
+            part.connection_evidence[&"b".repeat(32)],
+            UnlockConnectionEvidence::ProfileMismatch
+        );
+        assert_eq!(part.exits.len(), 1);
+    }
 
     #[test]
     fn racing_group_records_the_adopted_member_of_a_later_policy() {

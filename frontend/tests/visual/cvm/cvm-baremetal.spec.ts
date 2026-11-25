@@ -13,19 +13,28 @@ for (const [width, theme] of [
     await page.setViewportSize({ width, height: 1100 });
     await page.goto(`/tests/fixtures/cvm/preview.html?scene=baremetal-hosts&theme=${theme}`);
     await page.getByRole('button', { name: '纳管裸机', exact: true }).click();
-    const picker = page.getByRole('dialog', { name: '选择裸机' });
-    await expect(picker.getByRole('combobox', { name: '选择裸机' })).toBeVisible();
+    await expect(page).toHaveURL(/#\/cvm\/adopt$/);
+    const form = page.getByRole('form', { name: '纳管裸机', exact: true });
+    const picker = form.getByRole('region', { name: '裸机与使用者', exact: true });
+    await expect(picker.getByRole('combobox', { name: '选择裸机', exact: true })).toHaveValue('hk-hkix');
+    const confirmation = form.getByRole('region', { name: '整机纳管确认', exact: true });
+    await expect(confirmation).toContainText('Debian GNU/Linux 13');
+    const submit = form.getByRole('button', { name: '确认纳管', exact: true });
+    await expect(submit).toBeDisabled();
+    await confirmation
+      .getByRole('checkbox', {
+        name: '确认此用户可管理本物理系统；宿主业务没有容器隔离，Cube 容器保持独立运行',
+        exact: true,
+      })
+      .check();
+    await expect(submit).toBeEnabled();
     await waitForVisualAssets(page);
-    await expect(page).toHaveScreenshot(`baremetal-picker-${width}-${theme}.png`, { fullPage: true });
-    await picker.getByRole('button', { name: '下一步' }).click();
-    const dialog = page.getByRole('dialog', { name: '纳管裸机' });
-    await expect(dialog.getByRole('button', { name: '确认纳管' })).toBeDisabled();
-    await dialog.getByRole('checkbox').check();
-    await expect(dialog.getByRole('button', { name: '确认纳管' })).toBeEnabled();
-    await waitForVisualAssets(page);
-    await expect(page).toHaveScreenshot(`baremetal-adopt-${width}-${theme}.png`, { fullPage: true });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
+    await expect(page).toHaveScreenshot(`baremetal-adopt-page-${width}-${theme}.png`, { fullPage: true });
     await page.goto(`/tests/fixtures/cvm/preview.html?scene=baremetal-detail&theme=${theme}`);
-    await expect(page.getByRole('button', { name: '解除纳管', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: '实例更多操作' }).click();
+    await expect(page.getByRole('menuitem', { name: /^解除纳管/ })).toBeVisible();
+    await page.keyboard.press('Escape');
     await expect(page.getByRole('button', { name: '删除', exact: true })).toHaveCount(0);
     await waitForVisualAssets(page);
     expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
@@ -39,15 +48,19 @@ for (const [width, theme] of [
     await page.setViewportSize({ width, height: 1100 });
     await page.goto(`/tests/fixtures/cvm/preview.html?scene=list&theme=${theme}`);
     await page.getByRole('button', { name: '纳管裸机', exact: true }).click();
-    const dialog = page.getByRole('dialog', { name: '选择裸机' });
-    await expect(dialog.getByText('尚无可纳管的裸机')).toBeVisible();
-    await expect(dialog.getByText(/当前宿主以容器模式运行/)).toBeVisible();
-    await expect(dialog.getByRole('button', { name: '下一步' })).toHaveCount(0);
+    await expect(page).toHaveURL(/#\/cvm\/adopt$/);
+    const form = page.getByRole('form', { name: '纳管裸机', exact: true });
+    await expect(form.getByText('尚无可纳管的裸机', { exact: true })).toBeVisible();
+    await expect(form.getByText(/安装或升级组合执行栈/)).toBeVisible();
+    await expect(form.getByRole('combobox', { name: '选择裸机', exact: true })).toHaveCount(0);
+    await expect(form.getByRole('button', { name: '确认纳管', exact: true })).toHaveCount(0);
     await waitForVisualAssets(page);
     expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
-    await expect(page).toHaveScreenshot(`baremetal-unavailable-${width}-${theme}.png`, { fullPage: true });
-    await dialog.getByRole('button', { name: '查看宿主' }).click();
+    await expect(page).toHaveScreenshot(`baremetal-adopt-unavailable-page-${width}-${theme}.png`, { fullPage: true });
+    await form.getByRole('button', { name: '查看宿主', exact: true }).click();
+    await expect(page).toHaveURL(/#\/cvm\/hosts$/);
     await expect(page.getByRole('tab', { name: '宿主', exact: true })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('table', { name: '宿主', exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: '纳管裸机', exact: true })).toBeVisible();
   });
 }

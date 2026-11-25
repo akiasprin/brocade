@@ -1,4 +1,4 @@
-//! Shadow comparison and the fixed native binding boundary.
+//! Verified compiled products and the fixed native binding boundary.
 use crate::{backend::Inner, records::Record, Result};
 use brocade_cvm_compile::{bind, canonical, compile, digest, verify, LocalBindings};
 use brocade_deployment::cvm::*;
@@ -14,44 +14,18 @@ impl Inner {
         if desired.power != PowerState::Running {
             return Ok(None);
         }
-        let Some(bundle) = &desired.artifacts else {
-            if desired.artifact_mode == CvmArtifactMode::Enforce {
-                return Err("enforced Cube artifacts missing".into());
-            }
-            return Ok(None);
-        };
+        let bundle = desired.artifacts.as_ref().ok_or("Cube artifacts missing")?;
         let verified = verify(bundle, desired).is_ok();
-        let image = desired.spec.image.as_ref().ok_or("Cube image missing")?;
         let local_facts = self.cfg.configured_capabilities();
-        let manifest = if desired.artifact_mode == CvmArtifactMode::Enforce {
-            Some(&bundle.input.image_manifest)
-        } else {
-            self.cfg
-                .manifests
-                .get(&image.id)
-                .filter(|manifest| manifest.sha256 == image.sha256)
-        };
-        let compiled = match manifest {
-            Some(local) => {
-                let mut facts = bundle.input.capabilities.clone();
-                facts.cube_storage_backend = local_facts.cube_storage_backend;
-                facts.stable_storage = local_facts.stable_storage;
-                if desired.artifact_mode == CvmArtifactMode::Shadow {
-                    facts.resource_limits = local_facts.resource_limits;
-                    facts.images = local_facts.images;
-                    if !facts.images.contains(image) {
-                        facts.images.clear();
-                    }
-                }
-                compile(&CvmArtifactInput {
-                    instance_id: desired.id.clone(),
-                    spec: desired.spec.clone(),
-                    image_manifest: local.clone(),
-                    capabilities: facts,
-                })
-            }
-            None => Err("local verified Cube manifest missing".into()),
-        };
+        let mut facts = bundle.input.capabilities.clone();
+        facts.cube_storage_backend = local_facts.cube_storage_backend;
+        facts.stable_storage = local_facts.stable_storage;
+        let compiled = compile(&CvmArtifactInput {
+            instance_id: desired.id.clone(),
+            spec: desired.spec.clone(),
+            image_manifest: bundle.input.image_manifest.clone(),
+            capabilities: facts,
+        });
         let kinds = [
             CvmArtifactKind::Sandbox,
             CvmArtifactKind::Egress,
@@ -80,7 +54,6 @@ impl Inner {
         Ok(Some(CvmArtifactReceipt {
             compiler: bundle.compiler.clone(),
             input_sha256: bundle.input_sha256.clone(),
-            mode: desired.artifact_mode,
             mismatches,
             files,
         }))
@@ -90,16 +63,9 @@ impl Inner {
         desired: &InstanceDesired,
         kind: CvmArtifactKind,
         local: &LocalBindings,
-    ) -> Result<Option<Value>> {
-        if desired.power != PowerState::Running || desired.artifact_mode != CvmArtifactMode::Enforce
-        {
-            return Ok(None);
-        }
-        let bundle = desired
-            .artifacts
-            .as_ref()
-            .ok_or("enforced Cube artifacts missing")?;
-        bind(bundle, kind, desired, local).map(Some)
+    ) -> Result<Value> {
+        let bundle = desired.artifacts.as_ref().ok_or("Cube artifacts missing")?;
+        bind(bundle, kind, desired, local)
     }
     /// Acknowledged execution only. Historical sandbox identity survives hot route changes.
     pub(crate) fn complete_artifact_receipt(
@@ -116,12 +82,8 @@ impl Inner {
                         continue;
                     }
                     if file.kind == CvmArtifactKind::Sandbox {
-                        if record.sandbox_sha256 == file.compiled_sha256
-                            && !record.sandbox_effective_sha256.is_empty()
-                        {
-                            file.effective_sha256 = Some(record.sandbox_effective_sha256.clone());
-                            file.bindings = record.sandbox_bindings.clone();
-                        }
+                        file.effective_sha256 = Some(record.sandbox_effective_sha256.clone());
+                        file.bindings = record.sandbox_bindings.clone();
                     } else if let Some(bundle) = &desired.artifacts {
                         let bindings = LocalBindings {
                             runtime_id: Some(record.runtime.clone()),
@@ -149,13 +111,10 @@ pub(crate) fn record_sandbox(
     record.sandbox_sha256.clear();
     record.sandbox_effective_sha256.clear();
     record.sandbox_bindings = json!({});
-    if let Some(bundle) = &desired.artifacts {
-        if desired.artifact_mode == CvmArtifactMode::Enforce {
-            record.sandbox_sha256 = bundle.file(CvmArtifactKind::Sandbox)?.sha256.clone();
-            record.sandbox_effective_sha256 =
-                brocade_core::hash::sha256_hex(canonical(request)?.as_bytes());
-            record.sandbox_bindings = json!({"expected_root":request["annotations"]["brocade.cvm.expected_root"],"shim_version":request["annotations"]["cube.master.components.cube-shim.version"],"spec_sha256":desired.spec_sha256,"egress_sha256":bundle.file(CvmArtifactKind::Egress)?.sha256});
-        }
-    }
+    let bundle = desired.artifacts.as_ref().ok_or("Cube artifacts missing")?;
+    record.sandbox_sha256 = bundle.file(CvmArtifactKind::Sandbox)?.sha256.clone();
+    record.sandbox_effective_sha256 =
+        brocade_core::hash::sha256_hex(canonical(request)?.as_bytes());
+    record.sandbox_bindings = json!({"expected_root":request["annotations"]["brocade.cvm.expected_root"],"shim_version":request["annotations"]["cube.master.components.cube-shim.version"],"spec_sha256":desired.spec_sha256,"egress_sha256":bundle.file(CvmArtifactKind::Egress)?.sha256});
     Ok(())
 }

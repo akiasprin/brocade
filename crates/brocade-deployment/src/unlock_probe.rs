@@ -350,6 +350,20 @@ pub struct UnlockDnsPartPath {
     pub kind: UnlockDnsKind,
     pub paths: Vec<UnlockDnsPath>,
     pub exits: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub connection_evidence: std::collections::BTreeMap<String, UnlockConnectionEvidence>,
+}
+
+/// Verified against the frozen probe path. DNS evidence is checked separately from
+/// the identity and outbound configuration of the exit that reported the dial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnlockConnectionEvidence {
+    Verified,
+    DnsIncomplete,
+    TraceIncomplete,
+    ExitMismatch,
+    ProfileMismatch,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnlockDnsTrace {

@@ -45,6 +45,7 @@ async fn removed_host_stays_removed_after_inventory_without_retiring_the_machine
             "n1",
             InventoryReport {
                 capabilities: catalogue(),
+                terminal_sessions_used: None,
                 error: None,
             },
         )
@@ -58,10 +59,7 @@ async fn removed_host_stays_removed_after_inventory_without_retiring_the_machine
     assert!(user_view.hosts.is_empty() && user_view.available_hosts.is_empty());
     assert!(matches!(
         db.store
-            .create_cvm(
-                &actor_user("alice"),
-                create_request("removed-host-create-001")
-            )
+            .create_cvm(&system_admin(), create_request("removed-host-create-001"))
             .await,
         Err(StoreError::Conflict(_))
     ));
@@ -100,10 +98,7 @@ async fn removed_host_stays_removed_after_inventory_without_retiring_the_machine
         2
     );
     db.store
-        .create_cvm(
-            &actor_user("alice"),
-            create_request("restored-host-create-01"),
-        )
+        .create_cvm(&system_admin(), create_request("restored-host-create-01"))
         .await
         .unwrap();
     let events: i64 =
@@ -116,6 +111,56 @@ async fn removed_host_stays_removed_after_inventory_without_retiring_the_machine
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn terminal_occupancy_is_exposed_only_for_fresh_managed_hosts() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    prepare(&db).await;
+    let mut capabilities = catalogue();
+    capabilities.guest_terminal = true;
+    capabilities.guest_terminal_persistent = true;
+    let mut report = InventoryReport {
+        capabilities,
+        terminal_sessions_used: Some(4),
+        error: None,
+    };
+    assert!(db
+        .store
+        .cvm_record_inventory("n1", report.clone())
+        .await
+        .is_err());
+    let owner = system_admin();
+    let reader = AdminContext::new("reader", AdminRole::Readonly, Some("platform.acme".into()));
+    for used in [0, 2] {
+        report.terminal_sessions_used = Some(used);
+        db.store
+            .cvm_record_inventory("n1", report.clone())
+            .await
+            .unwrap();
+        let view = db.store.cvm_workspace(&owner).await.unwrap();
+        let count = view.hosts[0].terminal_sessions.as_ref().unwrap();
+        assert_eq!((count.used, count.limit), (u64::from(used), 3));
+        let view = db.store.cvm_workspace(&reader).await.unwrap();
+        let raw = serde_json::to_value(&view.hosts[0]).unwrap();
+        assert!(raw.get("terminal_sessions").is_none());
+        assert!(raw["capabilities"].get("terminal_sessions_used").is_none());
+    }
+    sqlx::query("UPDATE cvm_hosts SET observed_at=now()-interval '151 seconds' WHERE node_id='n1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(db.store.cvm_workspace(&owner).await.unwrap().hosts[0]
+        .terminal_sessions
+        .is_none());
+    report.terminal_sessions_used = None;
+    db.store.cvm_record_inventory("n1", report).await.unwrap();
+    let view = db.store.cvm_workspace(&owner).await.unwrap();
+    assert!(view.hosts[0].fresh);
+    assert!(view.hosts[0].terminal_sessions.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn host_removal_waits_for_instances_and_retained_disks() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -123,10 +168,7 @@ async fn host_removal_waits_for_instances_and_retained_disks() {
     prepare(&db).await;
     let item = db
         .store
-        .create_cvm(
-            &actor_user("alice"),
-            create_request("occupied-host-create-01"),
-        )
+        .create_cvm(&system_admin(), create_request("occupied-host-create-01"))
         .await
         .unwrap();
     let owner = system_admin();

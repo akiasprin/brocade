@@ -1,5 +1,4 @@
-import type { CvmInstance, CvmQuota, CvmWorkspace } from '../../api';
-import { capacity, ownerKey } from './queries';
+import type { CvmInstance, CvmWorkspace } from '../../api';
 
 export const percent = (share: number | null) => (share === null ? '—' : `${Math.round(share * 100)}%`);
 export const shareOf = (used: number | undefined, total: number | undefined) =>
@@ -18,19 +17,6 @@ export function reservationUsage(instances: CvmInstance[]) {
     }),
     { instances: 0, vcpus: 0, memory: 0, disk: 0, interfaces: 0 },
   );
-}
-export function quotaRows(workspace: CvmWorkspace, quota: CvmQuota) {
-  const used = workspace.usage?.find(
-    item => ownerKey(item.tenant_id, item.user_id) === ownerKey(quota.tenant_id, quota.user_id),
-  );
-  if (!used) return [];
-  return [
-    { label: '实例', used: used.instances, total: quota.max_instances, format: String },
-    { label: 'vCPU', used: used.vcpus, total: quota.max_vcpus, format: String },
-    { label: '内存', used: used.memory_bytes, total: quota.max_memory_bytes, format: capacity },
-    { label: '系统盘', used: used.disk_bytes, total: quota.max_disk_bytes, format: capacity },
-    { label: '网卡', used: used.interfaces, total: quota.max_interfaces, format: String },
-  ];
 }
 export function CapacityMeter({
   used,

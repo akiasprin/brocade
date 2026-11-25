@@ -1,5 +1,7 @@
 //! Bounded process-local rendezvous. Tickets and terminal contents are never persisted.
-use brocade_deployment::cvm::terminal::{Offer, Target, MAX_ATTACHMENTS_PER_NODE, MAX_SESSIONS};
+use brocade_deployment::cvm::terminal::{
+    self as wire, ConnectionOffer, Offer, Target, MAX_ATTACHMENTS_PER_NODE, MAX_SESSIONS,
+};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -30,15 +32,20 @@ struct Session {
     terminal_id: Option<String>,
     new_session: bool,
     policy_revision: u64,
+    rtc: bool,
+    validated_at: Instant,
+    browser_seen_at: Option<Instant>,
 }
 struct Agent {
     id: String,
-    offers: mpsc::Sender<Offer>,
+    offers: mpsc::Sender<ConnectionOffer>,
+    rtc: bool,
 }
 #[derive(Default)]
 struct Inner {
     sessions: HashMap<String, Session>,
     agents: HashMap<String, Agent>,
+    stun_servers: Vec<String>,
 }
 #[derive(Clone, Default)]
 pub struct Service(Arc<Mutex<Inner>>);
@@ -88,13 +95,95 @@ impl Inner {
     }
 }
 impl Service {
+    pub fn uses_rtc(&self, id: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .get(id)
+            .is_some_and(|s| s.rtc)
+    }
+    pub fn configure_stun(&self, servers: Vec<String>) -> Result<(), &'static str> {
+        if servers.len() > 2 {
+            return Err("at most two controlled STUN servers may be configured");
+        }
+        for server in &servers {
+            wire::stun_endpoint(server)?;
+        }
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stun_servers = servers;
+        Ok(())
+    }
+    pub fn rtc_settings(&self, node: &str) -> wire::RtcSettings {
+        let inner = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        wire::RtcSettings {
+            supported: inner
+                .agents
+                .get(node)
+                .is_some_and(|a| a.rtc && !a.offers.is_closed()),
+            stun_servers: inner.stun_servers.clone(),
+        }
+    }
+    pub fn validated(&self, id: &str) {
+        if let Some(s) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .get_mut(id)
+        {
+            s.validated_at = Instant::now();
+        }
+    }
+    pub fn rtc_lease_allowed(&self, id: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .get(id)
+            .is_some_and(|s| {
+                s.rtc
+                    && s.ticket.is_none()
+                    && s.validated_at.elapsed() <= Duration::from_secs(wire::CONTROL_FRESH_SECONDS)
+                    && s.browser_seen_at.is_some_and(|seen| {
+                        seen.elapsed() <= Duration::from_secs(wire::CONTROL_FRESH_SECONDS)
+                    })
+            })
+    }
+    pub fn browser_seen(&self, id: &str) {
+        if let Some(s) = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sessions
+            .get_mut(id)
+        {
+            s.browser_seen_at = Some(Instant::now());
+        }
+    }
     pub fn expire(&self) {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .expire()
     }
-    pub fn register(&self, node: &str) -> Result<(String, mpsc::Receiver<Offer>), &'static str> {
+    #[cfg(test)]
+    pub fn register(
+        &self,
+        node: &str,
+    ) -> Result<(String, mpsc::Receiver<ConnectionOffer>), &'static str> {
+        self.register_with_rtc(node, false)
+    }
+    pub fn register_with_rtc(
+        &self,
+        node: &str,
+        rtc: bool,
+    ) -> Result<(String, mpsc::Receiver<ConnectionOffer>), &'static str> {
         let mut inner = self
             .0
             .lock()
@@ -119,6 +208,7 @@ impl Service {
             Agent {
                 id: id.clone(),
                 offers: tx,
+                rtc,
             },
         );
         Ok((id, rx))
@@ -191,10 +281,14 @@ impl Service {
                 terminal_id,
                 new_session,
                 policy_revision,
+                rtc: false,
+                validated_at: Instant::now(),
+                browser_seen_at: None,
             },
         );
         Ok((id, ticket))
     }
+    #[cfg(test)]
     pub fn browser(
         &self,
         id: &str,
@@ -203,11 +297,33 @@ impl Service {
         node: &str,
         target: &Target,
     ) -> Result<Link, &'static str> {
+        self.browser_with_rtc(id, ticket, operator, node, target, None)
+    }
+    pub fn browser_with_rtc(
+        &self,
+        id: &str,
+        ticket: &str,
+        operator: &str,
+        node: &str,
+        target: &Target,
+        sdp: Option<String>,
+    ) -> Result<Link, &'static str> {
         let mut inner = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.expire();
+        let rtc = if let Some(sdp) = sdp {
+            if !wire::valid_sdp(&sdp) || !inner.agents.get(node).is_some_and(|a| a.rtc) {
+                return Err("terminal WebRTC offer is unsupported or invalid");
+            }
+            Some(wire::RtcOffer {
+                sdp,
+                stun_servers: inner.stun_servers.clone(),
+            })
+        } else {
+            None
+        };
         let s = inner
             .sessions
             .get_mut(id)
@@ -223,6 +339,8 @@ impl Service {
             return Err("terminal ticket is invalid or already used");
         }
         s.ticket = None;
+        s.rtc = rtc.is_some();
+        s.validated_at = Instant::now();
         let link = s.browser.take().ok_or("terminal is already attached")?;
         let offer = Offer {
             session_id: id.into(),
@@ -237,7 +355,10 @@ impl Service {
             .get(node)
             .ok_or("terminal machine disconnected")?
             .offers
-            .try_send(offer)
+            .try_send(ConnectionOffer {
+                terminal: offer,
+                rtc,
+            })
             .map_err(|_| "terminal machine is busy")?;
         Ok(link)
     }
@@ -255,6 +376,21 @@ impl Service {
             return Err("terminal does not belong to this machine");
         }
         s.agent.take().ok_or("terminal agent already attached")
+    }
+    pub fn close_instance_sessions(&self, instance: &str) {
+        let mut inner = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ids: Vec<_> = inner
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.target.instance_id == instance)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            inner.remove(&id);
+        }
     }
     pub fn close_node_sessions(&self, node: &str) {
         let mut inner = self
@@ -344,6 +480,23 @@ mod tests {
         assert!(s.create("owner", "node", target()).is_ok());
     }
     #[test]
+    fn changing_instance_access_closes_only_that_instances_sessions() {
+        let service = Service::default();
+        let (_, _offers) = service.register("node").unwrap();
+        let (id, ticket) = service.create("owner", "node", target()).unwrap();
+        let browser = service
+            .browser(&id, &ticket, "owner", "node", &target())
+            .unwrap();
+        let mut other = target();
+        other.instance_id = "cvm-other".into();
+        let (other_id, other_ticket) = service.create("owner", "node", other.clone()).unwrap();
+        service.close_instance_sessions("cvm-one");
+        assert!(*browser.cancelled.borrow());
+        assert!(service
+            .browser(&other_id, &other_ticket, "owner", "node", &other)
+            .is_ok());
+    }
+    #[test]
     fn quotas_expiry_and_machine_replacement_cancel_sessions() {
         let s = Service::default();
         let (registration, _offers) = s.register("node").unwrap();
@@ -374,5 +527,71 @@ mod tests {
             s.create("same-owner", "b", target()).unwrap();
         }
         assert!(s.create("another-owner", "a", target()).is_err());
+    }
+    #[test]
+    fn rtc_offer_keeps_ticket_scope_and_only_uses_console_stun_configuration() {
+        let s = Service::default();
+        s.configure_stun(vec!["stun:controlled.example:3478".into()])
+            .unwrap();
+        let (_, mut offers) = s.register_with_rtc("node", true).unwrap();
+        assert!(s.rtc_settings("node").supported);
+        let (id, ticket) = s.create("owner", "node", target()).unwrap();
+        let sdp = "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n".to_owned();
+        assert!(!s.rtc_lease_allowed(&id));
+        assert!(s
+            .browser_with_rtc(&id, &ticket, "other", "node", &target(), Some(sdp.clone()))
+            .is_err());
+        let mut changed = target();
+        changed.reinstall_epoch = 1;
+        assert!(s
+            .browser_with_rtc(&id, &ticket, "owner", "node", &changed, Some(sdp.clone()))
+            .is_err());
+        let browser = s
+            .browser_with_rtc(&id, &ticket, "owner", "node", &target(), Some(sdp))
+            .unwrap();
+        let offer = offers.try_recv().unwrap();
+        assert_eq!(
+            offer.rtc.unwrap().stun_servers,
+            vec!["stun:controlled.example:3478"]
+        );
+        assert!(!s.rtc_lease_allowed(&id));
+        s.browser_seen(&id);
+        assert!(s.rtc_lease_allowed(&id));
+        s.0.lock()
+            .unwrap()
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .validated_at = Instant::now() - Duration::from_secs(3);
+        assert!(!s.rtc_lease_allowed(&id));
+        s.validated(&id);
+        assert!(s.rtc_lease_allowed(&id));
+        s.0.lock()
+            .unwrap()
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .browser_seen_at = Some(Instant::now() - Duration::from_secs(3));
+        assert!(!s.rtc_lease_allowed(&id));
+        s.close_instance_sessions("cvm-one");
+        assert!(*browser.cancelled.borrow());
+        assert!(!s.rtc_lease_allowed(&id));
+    }
+    #[test]
+    fn unsupported_or_invalid_rtc_does_not_consume_the_relay_ticket() {
+        let s = Service::default();
+        let (_, mut offers) = s.register("node").unwrap();
+        let (id, ticket) = s.create("owner", "node", target()).unwrap();
+        assert!(!s.rtc_settings("node").supported);
+        assert!(s
+            .browser_with_rtc(&id, &ticket, "owner", "node", &target(), Some("bad".into()))
+            .is_err());
+        s.browser(&id, &ticket, "owner", "node", &target()).unwrap();
+        assert!(offers.try_recv().unwrap().rtc.is_none());
+        assert!(!s.rtc_lease_allowed(&id));
+        assert!(s.configure_stun(vec!["turn:example.com".into()]).is_err());
+        assert!(s
+            .configure_stun(vec!["stun:example.com".into(); 3])
+            .is_err());
     }
 }

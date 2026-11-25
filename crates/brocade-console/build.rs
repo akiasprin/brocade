@@ -687,6 +687,8 @@ fn zig_wrapper(out_dir: &Path, target: &Target, zig: &Path) -> (PathBuf, PathBuf
     // whether the control plane builds. The cost is no arrays, so the filtering below rotates the
     // arguments — take the first each time, append the ones to keep at the end, and after n
     // rotations `$@` holds only what should be kept.
+    // Cargo's rust-lld does not link Zig's UBSan runtime. Native dependencies such
+    // as AWS-LC compile some entropy sources at -O0 even for release builds.
     let cc = write(
         format!("zig-cc-{}", target.arch),
         format!(
@@ -703,7 +705,7 @@ fn zig_wrapper(out_dir: &Path, target: &Target, zig: &Path) -> (PathBuf, PathBuf
              \x20   esac\n\
              \x20   set -- \"$@\" \"$a\"\n\
              done\n\
-             exec \"{zig}\" cc -target {} \"$@\"\n",
+             exec \"{zig}\" cc -fno-sanitize=undefined -target {} \"$@\"\n",
             target.zig_target
         ),
     );

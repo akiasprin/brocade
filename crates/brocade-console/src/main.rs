@@ -412,6 +412,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ConsoleServices::new(quota_wake, grants_wake, cert_wake, geoip, realtime.clone())
             .and_bootstrap_credential(bootstrap_credential)
             .and_shutdown(shutdown.clone());
+    #[cfg(feature = "cvm")]
+    let admin_services = admin_services.and_terminal_stun_servers(
+        match env::var("BROCADE_TERMINAL_STUN_SERVERS") {
+            Ok(value) => value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            Err(env::VarError::NotPresent) => Vec::new(),
+            Err(_) => return Err("BROCADE_TERMINAL_STUN_SERVERS must be UTF-8".into()),
+        },
+    )?;
 
     let outcome = match agent_listener {
         // Split: the console keeps the static fallback, the agent face is on its own.
@@ -480,7 +493,17 @@ async fn database_command() -> Result<bool, Box<dyn std::error::Error>> {
         Ok(value) if value == "1" => true,
         _ => return Err("BROCADE_PRERELEASE_0007_COMPAT 仅接受临时值 1".into()),
     };
-    let check = if ip_compat || node_notification_compat {
+    let cvm_0009_compat = match env::var("BROCADE_PRERELEASE_0009_COMPAT") {
+        Err(env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        _ => return Err("BROCADE_PRERELEASE_0009_COMPAT 仅接受临时值 1".into()),
+    };
+    if cvm_0009_compat && (ip_compat || node_notification_compat) {
+        return Err("0007 与 0009 预发布兼容模式不能同时启用".into());
+    }
+    let check = if cvm_0009_compat {
+        store.check_prerelease_0009_upgrade().await
+    } else if ip_compat || node_notification_compat {
         store.check_prerelease_0007_upgrade().await
     } else {
         store.check_database_upgrade().await
@@ -491,7 +514,9 @@ async fn database_command() -> Result<bool, Box<dyn std::error::Error>> {
         return Err("数据库不在支持的升级路径中，未执行迁移".into());
     }
     if migrate {
-        let result = if ip_compat || node_notification_compat {
+        let result = if cvm_0009_compat {
+            store.migrate_prerelease_0009_schema().await
+        } else if ip_compat || node_notification_compat {
             store.migrate_prerelease_0007_schema().await
         } else {
             store.migrate_database_schema().await
@@ -499,7 +524,13 @@ async fn database_command() -> Result<bool, Box<dyn std::error::Error>> {
         result.map_err(|_| "数据库迁移失败；保留备份和迁移历史，请检查后重试")?;
     }
     #[cfg(not(feature = "cvm"))]
-    store.ensure_cvm_released().await?;
+    if migrate || !check.pending_versions.contains(&9) {
+        // The unreleased pre-0009 CVM model is removed by migration 0009. Its tables do not have
+        // the current host report columns, so a read-only preflight only validates the known
+        // migration path. Migration commands reach this guard after the destructive reset; an
+        // already-current database is guarded immediately.
+        store.ensure_cvm_released().await?;
+    }
     Ok(true)
 }
 

@@ -113,7 +113,7 @@ async fn node_notifications_exact_deployed_0007_converts_without_losing_preferen
            'indexes',(SELECT jsonb_agg(jsonb_build_array(pg_get_indexdef(i.indexrelid),i.indisvalid,i.indisready) ORDER BY pg_get_indexdef(i.indexrelid)) FROM pg_index i WHERE i.indrelid='public.node_notification_preferences'::regclass))"
     ).fetch_one(db.pool()).await.unwrap();
     assert!(check.compatible, "{check:?}; schema={notification_schema}");
-    assert_eq!(check.pending_versions, [7, 8]);
+    assert_eq!(check.pending_versions, [7, 8, 9]);
     assert_eq!(
         serde_json::from_str::<Vec<serde_json::Value>>(&receipts(&db).await).unwrap(),
         before_receipts,
@@ -124,7 +124,7 @@ async fn node_notifications_exact_deployed_0007_converts_without_losing_preferen
     assert!(db.store.check_database_upgrade().await.unwrap().compatible);
     let after_receipts: Vec<serde_json::Value> =
         serde_json::from_str(&receipts(&db).await).unwrap();
-    assert_eq!(after_receipts.len(), 8);
+    assert_eq!(after_receipts.len(), 9);
     assert_eq!(&after_receipts[..6], &before_receipts[..6]);
     let mut expected_seventh = before_receipts[6].clone();
     expected_seventh["checksum"] = serde_json::Value::String(format!("\\x{OLD}"));
@@ -384,7 +384,7 @@ async fn check_notification_compat(tag: &str) {
     assert!(db.store.check_database_upgrade().await.unwrap().compatible);
     let check = db.store.check_prerelease_0007_upgrade().await.unwrap();
     assert!(check.compatible, "{check:?}");
-    assert_eq!(check.pending_versions, [8]);
+    assert_eq!(check.pending_versions, [8, 9]);
     assert_eq!(receipts(&db).await, before);
     sqlx::raw_sql("CREATE FUNCTION reject_notification_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN
             IF to_regclass('public.cvm_spec_artifacts') IS NOT NULL THEN RAISE EXCEPTION 'injected artifact DDL failure'; END IF;

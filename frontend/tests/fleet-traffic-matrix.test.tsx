@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { NodeAgentStateItem, UserListItem } from '../src/api';
 import type { FleetTrafficSnapshot } from '../src/fleet-traffic-source';
-import { buildFleetTrafficMatrix } from '../src/panes/fleet-traffic';
+import { buildFleetTrafficMatrix, fleetMatrixLayout } from '../src/panes/fleet-traffic';
 
 const NOW = 100_000;
 
@@ -293,5 +293,26 @@ describe('fleet traffic matrix', () => {
     ]);
     // A reported zero row is a measurement, not traffic.
     expect(matrix.activeUsers).toBe(1);
+  });
+});
+
+describe('fleetMatrixLayout', () => {
+  it('prints readings only when the whole fixed-width table fits, and never stretches it', () => {
+    // 148 user column + 6 × 104 reading columns + 92 total column = 864px.
+    expect(fleetMatrixLayout(6, 864, false)).toEqual({ reading: true, userWidth: 148, sumWidth: 92 });
+    expect(fleetMatrixLayout(6, 863, false).reading).toBe(false);
+    expect(fleetMatrixLayout(3, 2300, false).reading).toBe(true);
+    expect(fleetMatrixLayout(29, 2300, false).reading).toBe(false);
+  });
+
+  it('drops the total column for a single machine and moves totals under names on phones', () => {
+    expect(fleetMatrixLayout(1, 300, false)).toEqual({ reading: true, userWidth: 148, sumWidth: 0 });
+    expect(fleetMatrixLayout(3, 420, true)).toEqual({ reading: true, userWidth: 108, sumWidth: 0 });
+    expect(fleetMatrixLayout(3, 419, true).reading).toBe(false);
+  });
+
+  it('keeps the dot matrix until the width is known', () => {
+    expect(fleetMatrixLayout(2, null, false).reading).toBe(false);
+    expect(fleetMatrixLayout(2, 0, false).reading).toBe(false);
   });
 });

@@ -1,7 +1,6 @@
 //! A chain reference is public routing intent; subscriber credentials stay in node-only products.
 use super::*;
 
-pub const CHAIN_EGRESS_PROTOCOL_VERSION: u32 = 76;
 pub const CHAIN_EGRESS_CONTRACT: &str = "cvm-chain-egress-v1";
 /// Interface-local source identity for Linux's IPv4 reverse-path validation. It has no prefix
 /// route and is shared only by owned TUNs; it is never a Guest/business address allocation.
@@ -11,6 +10,9 @@ pub const CHAIN_TUN_MTU: u32 = 65535;
 /// The userspace writer fragments replies before they enter the physical primary link.
 pub const CHAIN_STACK_MTU: u32 = 1280;
 pub const CHAIN_TUN_IPV4: &str = "169.254.254.254";
+/// Transport sockets must not re-enter a native instance's own OUTPUT selector.
+/// Outside both the native NIC mark range and the per-chain routing mark range.
+pub const CHAIN_CLIENT_SOCKET_MARK: u32 = 0x00b9_0000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainEgressBinding {
@@ -25,6 +27,9 @@ pub struct ChainEgressBinding {
 pub struct ChainClientArtifact {
     #[serde(default)]
     pub blocked: bool,
+    /// Apply host OUTPUT protections only for the adopted physical operating system.
+    #[serde(default)]
+    pub host_system: bool,
     pub instance_id: String,
     pub chain_id: String,
     pub tenant_id: String,

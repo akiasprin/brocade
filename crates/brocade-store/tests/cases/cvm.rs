@@ -2,6 +2,8 @@ use super::*;
 use brocade_deployment::cvm::*;
 use brocade_store::cvm::*;
 
+#[path = "cvm_access.rs"]
+mod access_tests;
 #[path = "cvm_artifacts.rs"]
 mod artifact_tests;
 #[path = "cvm_baremetal.rs"]
@@ -22,9 +24,11 @@ mod remote_nic_tests;
 
 fn catalogue() -> Capabilities {
     Capabilities {
-        artifact_compiler: None,
-        cube_storage_backend: None,
+        artifact_compiler: Some(CVM_ARTIFACT_COMPILER.into()),
+        cube_storage_backend: Some("plain".into()),
         baremetal: None,
+        host_system: None,
+        host_system_error: None,
         managed_networks: true,
         network_quota: None,
         route_services: false,
@@ -64,27 +68,17 @@ fn catalogue() -> Capabilities {
             name: "Debian".into(),
             version: "13".into(),
             architecture: "x86_64".into(),
-            sha256: "a".repeat(64),
+            sha256: artifact_input().image_manifest.sha256,
             boot_mode: "cube-oci".into(),
         }],
-        network_sources: vec![
-            NetworkSource {
-                id: "public".into(),
-                name: "Public".into(),
-                kind: NetworkKind::Public,
-                description: "mapped".into(),
-                max_attachments: None,
-                supports_ipv6: None,
-            },
-            NetworkSource {
-                id: "internal".into(),
-                name: "Own network".into(),
-                kind: NetworkKind::Internal,
-                description: "Brocade internal transport".into(),
-                max_attachments: None,
-                supports_ipv6: None,
-            },
-        ],
+        network_sources: vec![NetworkSource {
+            id: "public".into(),
+            name: "Public".into(),
+            kind: NetworkKind::Public,
+            description: "mapped".into(),
+            max_attachments: None,
+            supports_ipv6: None,
+        }],
     }
 }
 
@@ -116,12 +110,11 @@ async fn cvm_lifecycle_epochs_and_shutdown_configuration_preserve_boundaries() {
         return;
     };
     prepare(&db).await;
-    let actor = actor_user("alice");
     let mut item = ({
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .create_cvm(&actor, create_request("lifecycle-create-0001"))
+    .create_cvm(&system_admin(), create_request("lifecycle-create-0001"))
     .await
     .unwrap();
     ({
@@ -140,7 +133,7 @@ async fn cvm_lifecycle_epochs_and_shutdown_configuration_preserve_boundaries() {
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .command_cvm(&actor, &item.desired.id, restart.clone())
+    .command_cvm(&system_admin(), &item.desired.id, restart.clone())
     .await
     .unwrap();
     assert_eq!(item.desired.restart_epoch, 1);
@@ -148,7 +141,7 @@ async fn cvm_lifecycle_epochs_and_shutdown_configuration_preserve_boundaries() {
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .command_cvm(&actor, &item.desired.id, restart)
+    .command_cvm(&system_admin(), &item.desired.id, restart)
     .await
     .unwrap();
     assert_eq!(replay.desired, item.desired);
@@ -182,7 +175,7 @@ async fn cvm_lifecycle_epochs_and_shutdown_configuration_preserve_boundaries() {
         &db.store
     })
     .command_cvm(
-        &actor,
+        &system_admin(),
         &item.desired.id,
         configure(item.desired.generation, 2)
     )
@@ -193,7 +186,7 @@ async fn cvm_lifecycle_epochs_and_shutdown_configuration_preserve_boundaries() {
         &db.store
     })
     .command_cvm(
-        &actor,
+        &system_admin(),
         &item.desired.id,
         CvmCommand {
             request_id: "lifecycle-stop-00001".into(),
@@ -221,9 +214,9 @@ async fn cvm_lifecycle_epochs_and_shutdown_configuration_preserve_boundaries() {
         &db.store
     })
     .command_cvm(
-        &actor,
+        &system_admin(),
         &item.desired.id,
-        configure(item.desired.generation, 3)
+        configure(item.desired.generation, 9)
     )
     .await
     .is_err());
@@ -232,7 +225,7 @@ async fn cvm_lifecycle_epochs_and_shutdown_configuration_preserve_boundaries() {
         &db.store
     })
     .command_cvm(
-        &actor,
+        &system_admin(),
         &item.desired.id,
         configure(item.desired.generation, 2),
     )
@@ -259,7 +252,6 @@ async fn cvm_lifecycle_epochs_and_shutdown_configuration_preserve_boundaries() {
         expected_generation: item.desired.generation,
         change: CvmChange::Reinstall {
             image_id: "debian13".into(),
-            ssh_public_key: item.desired.spec.ssh_public_key.clone(),
         },
     };
     assert!(matches!(
@@ -275,7 +267,7 @@ async fn cvm_lifecycle_epochs_and_shutdown_configuration_preserve_boundaries() {
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .command_cvm(&actor, &item.desired.id, reinstall)
+    .command_cvm(&system_admin(), &item.desired.id, reinstall)
     .await
     .unwrap();
     assert_eq!(reset.desired.reinstall_epoch, 1);
@@ -291,21 +283,6 @@ async fn cvm_lifecycle_epochs_and_shutdown_configuration_preserve_boundaries() {
     .await
     .is_err());
 }
-fn quota() -> CvmQuota {
-    CvmQuota {
-        host_network_quotas: vec![],
-        tenant_id: "platform.acme".into(),
-        user_id: "alice".into(),
-        enabled: true,
-        allowed_nodes: vec!["n1".into()],
-        max_instances: 1,
-        max_vcpus: 2,
-        max_memory_bytes: 256 * 1024 * 1024,
-        max_disk_bytes: 6 * 1024 * 1024 * 1024,
-        max_interfaces: 4,
-    }
-}
-
 fn contact() -> InterfaceRequest {
     InterfaceRequest {
         source_id: "public".into(),
@@ -319,12 +296,15 @@ fn create_request(key: &str) -> CvmCreate {
     CvmCreate {
         request_id: key.into(),
         tenant_id: "platform.acme".into(),
-        user_id: "alice".into(),
+        user_id: Some("alice".into()),
         node_id: "n1".into(),
         name: "my-cvm".into(),
         image_id: "debian13".into(),
-        resources: Resources { vcpus: 1, memory_bytes: 128 * 1024 * 1024, root_disk_bytes: 3 * 1024 * 1024 * 1024 },
-        ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEiBcpQEzqzjADp8VXvOigHnqLh5L5xP76cwoCD8YMK5 fixture".into(),
+        resources: Resources {
+            vcpus: 1,
+            memory_bytes: 128 * 1024 * 1024,
+            root_disk_bytes: 3 * 1024 * 1024 * 1024,
+        },
         interfaces: vec![contact()],
     }
 }
@@ -396,21 +376,39 @@ fn evidence(instance: &CvmInstance) -> InstanceReport {
         error: None,
     }
 }
+fn artifact_input() -> CvmArtifactInput {
+    serde_json::from_str(include_str!(
+        "../../../brocade-cvm-compile/tests/golden/input.json"
+    ))
+    .unwrap()
+}
+
 async fn prepare(db: &TestPg) {
+    prepare_without_manifest(db).await;
+    db.store
+        .cvm_record_image_manifest("n1", artifact_input().image_manifest)
+        .await
+        .unwrap();
+}
+
+async fn prepare_without_manifest(db: &TestPg) {
+    std::env::set_var(
+        brocade_store::secrets::SECRET_KEY_ENV,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
     db.store.migrate().await.unwrap();
     insert_minimal_fixture(db.pool()).await;
+    sqlx::query("INSERT INTO node_agent_state(node_id,agent_protocol_version) VALUES('n1',77) ON CONFLICT(node_id) DO UPDATE SET agent_protocol_version=77")
+        .execute(db.pool()).await.unwrap();
     db.store
         .cvm_record_inventory(
             "n1",
             InventoryReport {
                 capabilities: catalogue(),
+                terminal_sessions_used: None,
                 error: None,
             },
         )
-        .await
-        .unwrap();
-    db.store
-        .set_cvm_quota(&system_admin(), quota())
         .await
         .unwrap();
 }
@@ -427,14 +425,14 @@ async fn cvm_idempotency_capacity_and_owner_boundaries() {
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .create_cvm(&actor_user("alice"), request.clone())
+    .create_cvm(&system_admin(), request.clone())
     .await
     .unwrap();
     let replay = ({
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .create_cvm(&actor_user("alice"), request)
+    .create_cvm(&system_admin(), request)
     .await
     .unwrap();
     assert_eq!(a.desired.id, replay.desired.id);
@@ -490,30 +488,26 @@ async fn cvm_idempotency_capacity_and_owner_boundaries() {
 }
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
-async fn cvm_concurrent_requests_only_reserve_the_last_slot_once() {
+async fn cvm_concurrent_replays_share_one_instance_and_password() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
     };
     prepare(&db).await;
-    let actor = actor_user("alice");
+    supersede_cvm_fixture(&db).await;
+    let request = create_request("concurrent-replay-create-01");
+    let actor = system_admin();
     let (a, b) = tokio::join!(
-        ({
-            supersede_cvm_fixture(&db).await;
-            &db.store
-        })
-        .create_cvm(&actor, create_request("concurrent-request-000001")),
-        ({
-            supersede_cvm_fixture(&db).await;
-            &db.store
-        })
-        .create_cvm(&actor, create_request("concurrent-request-000002"))
+        db.store.create_cvm(&actor, request.clone()),
+        db.store.create_cvm(&actor, request)
     );
-    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
-    let volumes: i64 = sqlx::query_scalar("SELECT count(*) FROM cvm_volumes")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    assert_eq!(volumes, 1);
+    assert_eq!(a.unwrap().desired.id, b.unwrap().desired.id);
+    let count: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM cvm_instances),(SELECT count(*) FROM cvm_guest_credentials)",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, (1, 1));
 }
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
@@ -552,9 +546,6 @@ async fn cvm_requires_real_interface_and_version_evidence_and_retains_reservatio
     .cvm_record_report("n1", evidence(&item))
     .await
     .unwrap());
-    let mut q = quota();
-    q.enabled = false;
-    assert!(db.store.set_cvm_quota(&system_admin(), q).await.is_err());
     let before = db
         .store
         .cvm_instance(&system_admin(), &item.desired.id)
@@ -666,9 +657,6 @@ async fn cvm_delete_needs_cleanup_proof_and_keeps_retained_disk_charged() {
     .cvm_record_report("n1", report)
     .await
     .unwrap();
-    let mut q = quota();
-    q.max_disk_bytes = 0;
-    assert!(db.store.set_cvm_quota(&system_admin(), q).await.is_err());
     assert!(({
         publish_cvm_intent(&db).await;
         &db.store
@@ -687,18 +675,12 @@ async fn cvm_one_image_is_independent_of_cpu_memory_and_disk_resources() {
         return;
     };
     prepare(&db).await;
-    let mut q = quota();
-    q.max_instances = 2;
-    q.max_vcpus = 4;
-    q.max_memory_bytes = 1024 * 1024 * 1024;
-    q.max_disk_bytes = 20 * 1024 * 1024 * 1024;
-    db.store.set_cvm_quota(&system_admin(), q).await.unwrap();
     let small = ({
         supersede_cvm_fixture(&db).await;
         &db.store
     })
     .create_cvm(
-        &actor_user("alice"),
+        &system_admin(),
         create_request("independent-image-small-01"),
     )
     .await
@@ -713,7 +695,7 @@ async fn cvm_one_image_is_independent_of_cpu_memory_and_disk_resources() {
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .create_cvm(&actor_user("alice"), request)
+    .create_cvm(&system_admin(), request)
     .await
     .unwrap();
     assert_eq!(small.desired.spec.image, large.desired.spec.image);
@@ -751,15 +733,12 @@ async fn cvm_tenant_admin_sees_explicitly_granted_shared_pool_and_readonly_detai
         Some("platform.acme".into()),
     );
     let workspace = db.store.cvm_workspace(&admin).await.unwrap();
-    assert_eq!(workspace.hosts.len(), 1);
+    assert!(workspace.hosts.is_empty());
     let item = ({
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .create_cvm(
-        &actor_user("alice"),
-        create_request("shared-pool-create-00001"),
-    )
+    .create_cvm(&system_admin(), create_request("shared-pool-create-00001"))
     .await
     .unwrap();
     ({
@@ -769,13 +748,13 @@ async fn cvm_tenant_admin_sees_explicitly_granted_shared_pool_and_readonly_detai
     .cvm_record_report("n1", evidence(&item))
     .await
     .unwrap();
+    assert_eq!(db.store.cvm_workspace(&admin).await.unwrap().hosts.len(), 1);
     let reader = AdminContext::new("reader", AdminRole::Readonly, Some("platform.acme".into()));
     let detail = db
         .store
         .cvm_instance(&reader, &item.desired.id)
         .await
         .unwrap();
-    assert!(detail.desired.spec.ssh_public_key.is_empty());
     let report = detail.report.unwrap();
     assert!(
         report.runtime_id.is_none()
@@ -799,10 +778,7 @@ async fn cvm_guest_reads_are_scoped_redacted_and_cannot_write() {
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .create_cvm(
-        &actor_user("alice"),
-        create_request("guest-create-00000001"),
-    )
+    .create_cvm(&system_admin(), create_request("guest-create-00000001"))
     .await
     .unwrap();
     assert!(({
@@ -818,11 +794,10 @@ async fn cvm_guest_reads_are_scoped_redacted_and_cannot_write() {
         Some("platform".into()),
     );
     let workspace = db.store.cvm_workspace(&guest).await.unwrap();
-    assert!(!workspace.can_write && !workspace.can_manage_quotas && workspace.redacted);
+    assert!(!workspace.can_write && !workspace.can_use && workspace.redacted);
     assert_eq!(workspace.instances.len(), 1);
     assert_eq!(workspace.hosts.len(), 1);
     assert!(!workspace.hosts[0].can_manage_terminal);
-    assert_eq!(workspace.quotas.len(), 1);
     assert!(workspace
         .owners
         .iter()
@@ -834,7 +809,6 @@ async fn cvm_guest_reads_are_scoped_redacted_and_cannot_write() {
             .await
             .unwrap(),
     ] {
-        assert!(instance.desired.spec.ssh_public_key.is_empty());
         let report = instance.report.unwrap();
         assert!(
             report.runtime_id.is_none()
@@ -920,10 +894,6 @@ async fn cvm_guest_reads_are_scoped_redacted_and_cannot_write() {
         Err(StoreError::Forbidden(_))
     ));
     assert!(matches!(
-        db.store.set_cvm_quota(&guest, quota()).await,
-        Err(StoreError::Forbidden(_))
-    ));
-    assert!(matches!(
         db.store.cvm_terminal_target(&guest, &item.desired.id).await,
         Err(StoreError::Forbidden(_))
     ));
@@ -935,10 +905,7 @@ async fn cvm_guest_reads_are_scoped_redacted_and_cannot_write() {
     );
     let workspace = db.store.cvm_workspace(&outside).await.unwrap();
     assert!(
-        workspace.instances.is_empty()
-            && workspace.hosts.is_empty()
-            && workspace.quotas.is_empty()
-            && workspace.owners.is_empty()
+        workspace.instances.is_empty() && workspace.hosts.is_empty() && workspace.owners.is_empty()
     );
     assert!(matches!(
         db.store.cvm_instance(&outside, &item.desired.id).await,
@@ -984,6 +951,7 @@ async fn cvm_cleanup_survives_inventory_failure_and_expiry_without_new_allocatio
             "n1",
             InventoryReport {
                 capabilities: caps.clone(),
+                terminal_sessions_used: None,
                 error: None,
             },
         )
@@ -995,7 +963,7 @@ async fn cvm_cleanup_survives_inventory_failure_and_expiry_without_new_allocatio
             &db.store
         })
         .create_cvm(
-            &actor,
+            &system_admin(),
             create_request(&format!("cleanup-create-{index:08}")),
         )
         .await
@@ -1013,6 +981,7 @@ async fn cvm_cleanup_survives_inventory_failure_and_expiry_without_new_allocatio
                     "n1",
                     InventoryReport {
                         capabilities: Capabilities::default(),
+                        terminal_sessions_used: None,
                         error: Some("bridge unavailable".into()),
                     },
                 )
@@ -1034,7 +1003,7 @@ async fn cvm_cleanup_survives_inventory_failure_and_expiry_without_new_allocatio
             &db.store
         })
         .create_cvm(
-            &actor,
+            &system_admin(),
             create_request(&format!("cleanup-denied-{index:08}")),
         )
         .await
@@ -1046,7 +1015,7 @@ async fn cvm_cleanup_survives_inventory_failure_and_expiry_without_new_allocatio
                 &db.store
             })
             .command_cvm(
-                &actor,
+                &system_admin(),
                 &item.desired.id,
                 CvmCommand {
                     request_id: format!("cleanup-retain-{index:08}"),
@@ -1063,7 +1032,7 @@ async fn cvm_cleanup_survives_inventory_failure_and_expiry_without_new_allocatio
             &db.store
         })
         .command_cvm(
-            &actor,
+            &system_admin(),
             &item.desired.id,
             CvmCommand {
                 request_id: format!("cleanup-delete-{index:08}"),
@@ -1085,6 +1054,7 @@ async fn cvm_cleanup_survives_inventory_failure_and_expiry_without_new_allocatio
                 "n1",
                 InventoryReport {
                     capabilities: caps.clone(),
+                    terminal_sessions_used: None,
                     error: None,
                 },
             )
@@ -1115,10 +1085,7 @@ async fn cvm_terminal_requires_write_scope_and_current_running_incarnation() {
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .create_cvm(
-        &actor_user("alice"),
-        create_request("terminal-create-00001"),
-    )
+    .create_cvm(&system_admin(), create_request("terminal-create-00001"))
     .await
     .unwrap();
     let id = &instance.desired.id;
@@ -1232,10 +1199,7 @@ async fn cvm_independent_observations_survive_failed_inventory_and_preserve_inte
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .create_cvm(
-        &actor_user("alice"),
-        create_request("independent-monitor-001"),
-    )
+    .create_cvm(&system_admin(), create_request("independent-monitor-001"))
     .await
     .unwrap();
     let mut report = evidence(&item);
@@ -1253,6 +1217,7 @@ async fn cvm_independent_observations_survive_failed_inventory_and_preserve_inte
             "n1",
             InventoryReport {
                 capabilities: catalogue(),
+                terminal_sessions_used: None,
                 error: Some("gateway unavailable".into()),
             },
         )
@@ -1575,6 +1540,7 @@ async fn cvm_terminal_policy_is_admin_owned_versioned_and_not_overwritten_by_inv
             "n1",
             InventoryReport {
                 capabilities: catalogue(),
+                terminal_sessions_used: None,
                 error: None,
             },
         )
@@ -1629,7 +1595,7 @@ async fn cvm_quota_usage_keeps_storage_and_interfaces_until_cleanup() {
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .create_cvm(&actor_user("alice"), create_request("quota-ledger-00001"))
+    .create_cvm(&system_admin(), create_request("quota-ledger-00001"))
     .await
     .unwrap();
     // Compute and resource cleanup have separate durable ledgers. A released

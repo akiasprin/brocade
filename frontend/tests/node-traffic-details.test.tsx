@@ -19,7 +19,7 @@ import {
 import { NodeInflowUsageCard, NodeTrafficDialog, trafficSources, trafficUserKeys } from '../src/node-traffic';
 import { NodeSiteUsageCard } from '../src/user-site-usage';
 import { Icon } from '../src/ui/icons';
-import { trafficDateInput } from '../src/node-traffic-range';
+import { trafficDateInput, trafficRangeText } from '../src/node-traffic-range';
 import type { SiteUsageChartSeries } from '../src/site-usage-chart';
 
 vi.mock('../src/api', async original => ({
@@ -530,6 +530,33 @@ it('includes forwarding in outflow totals and its own chart layer and expands it
   expect(users.textContent).toContain('bob');
   expect(users.textContent).toContain('70 B');
   expect(users.textContent).toContain('其余 2 位用户 · 30 B');
+});
+
+it('states the whole-hour site cover of a custom range beside the total and keeps forwarding exact', async () => {
+  const range = { start_unix_secs: start + 3300, end_unix_secs: start + 4200 };
+  const data = outflow();
+  data.range_end_unix_secs = start + 7200;
+  data.rows.push({ site_id: 'forwarding', name: '端口转发', uplink_bytes: 30, downlink_bytes: 70 });
+  data.series.push({ site_id: 'forwarding', points: [[start, 30, 70]] });
+  vi.mocked(fetchNodeSiteUsage).mockResolvedValue(data);
+  const { container } = mount(<NodeSiteUsageCard nodeId="n1" period="day" range={range} />);
+  const note = await screen.findByText(/站点按整点汇总/);
+  expect(fetchNodeSiteUsage).toHaveBeenCalledWith('n1', 'day', range);
+  expect(note.textContent).toBe(
+    `站点按整点汇总，实际覆盖 ${trafficRangeText(start, start + 7200)}（UTC+8），比所选时段多 1 小时 45 分。端口转发按所选时段计入，与流入统计一致。`,
+  );
+  // The cover sits under the total it explains, not after the detail sections.
+  expect(note.previousElementSibling).toBe(container.querySelector('.site-usage-head'));
+  expect(screen.queryByText(/目标按小时汇总/)).toBeNull();
+});
+
+it('omits the extra duration and forwarding clause when a custom range is already whole hours', async () => {
+  const data = outflow();
+  data.range_end_unix_secs = start + 3600;
+  vi.mocked(fetchNodeSiteUsage).mockResolvedValue(data);
+  mount(<NodeSiteUsageCard nodeId="n1" period="day" range={{ start_unix_secs: start, end_unix_secs: start + 3600 }} />);
+  const note = await screen.findByText(/站点按整点汇总/);
+  expect(note.textContent).toBe(`站点按整点汇总，实际覆盖 ${trafficRangeText(start, start + 3600)}（UTC+8）。`);
 });
 
 it('shows forwarding without authenticated ingress or site collection and explains missing hourly detail', async () => {

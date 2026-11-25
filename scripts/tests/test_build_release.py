@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -499,6 +501,71 @@ time.sleep(30)
             self.assertEqual(record['status'], 'failed')
             self.assertFalse(record['build_complete'])
             self.assertEqual(record['artifacts'], {})
+
+
+@unittest.skipUnless(os.environ.get('BROCADE_RUN_ZIG_LINK_TESTS') == '1', 'requires Zig and both Rust musl targets')
+class ZigNativeLinkTests(unittest.TestCase):
+    def test_unoptimized_native_archive_links_with_rust_without_a_zig_runtime(self):
+        zig = shutil.which('zig')
+        self.assertIsNotNone(zig, 'install the pinned Zig compiler before running this test')
+        with tempfile.TemporaryDirectory(prefix='brocade-zig-link-') as directory:
+            root = Path(directory)
+            state = root / 'target/brocade-release'
+            state.mkdir(parents=True)
+            _, wrappers = BUILD.agent_wrappers(state, zig)
+            native = root / 'native.c'
+            native.write_text('int native_add(int a, int b) { return a + b; }\n')
+            rust = root / 'main.rs'
+            rust.write_text(
+                'extern "C" { fn native_add(a: i32, b: i32) -> i32; }\nfn main() { assert_eq!(unsafe { native_add(20, 22) }, 42); }\n'
+            )
+            for arch in ['x86_64', 'aarch64']:
+                with self.subTest(arch=arch):
+                    triple = f'{arch}-unknown-linux-musl'
+                    output = root / arch
+                    output.mkdir()
+                    # Like AWS-LC's entropy sources, this stays unoptimized in release.
+                    subprocess.run(
+                        [
+                            str(wrappers[arch][0]),
+                            f'--target={triple}',
+                            '-nostdlibinc',
+                            '-O0',
+                            '-c',
+                            str(native),
+                            '-o',
+                            str(output / 'native.o'),
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        [str(wrappers[arch][1]), 'crs', str(output / 'libnative.a'), str(output / 'native.o')],
+                        check=True,
+                        capture_output=True,
+                    )
+                    binary = output / 'fixture'
+                    subprocess.run(
+                        [
+                            'rustc',
+                            '--target',
+                            triple,
+                            '-C',
+                            'linker=rust-lld',
+                            str(rust),
+                            '-L',
+                            str(output),
+                            '-l',
+                            'static=native',
+                            '-o',
+                            str(binary),
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    self.assertEqual(binary.read_bytes()[:4], b'\x7fELF')
+                    if arch == 'x86_64':
+                        subprocess.run([str(binary)], check=True)
 
 
 if __name__ == '__main__':

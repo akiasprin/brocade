@@ -16,6 +16,21 @@ pub(crate) async fn check_user_listener(
         ForwardingProtocol::Udp => vec!["udp"],
         ForwardingProtocol::TcpUdp => vec!["tcp", "udp"],
     };
+    #[cfg(feature = "cvm")]
+    for kind in &kinds {
+        let protocol = if *kind == "tcp" {
+            brocade_deployment::cvm::L4Protocol::Tcp
+        } else {
+            brocade_deployment::cvm::L4Protocol::Udp
+        };
+        if crate::cvm::nics::entries::policy::protected(tx, node, None, protocol)
+            .await?
+            .iter()
+            .any(|r| r.start <= port && port <= r.end)
+        {
+            return Err(StoreError::Conflict("端口由入口机器保留".into()));
+        }
+    }
     let occupied:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_nic_resources WHERE scope=$1 AND NOT released AND kind=ANY($2::text[]) AND split_part(value,':',array_length(string_to_array(value,':'),1))=$3)")
         .bind(format!("port:{node}")).bind(&kinds).bind(port.to_string()).fetch_one(&mut **tx).await?;
     if occupied {

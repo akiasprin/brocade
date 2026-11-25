@@ -139,15 +139,43 @@ it.each([
   expect(fetch).not.toHaveBeenCalled();
 });
 
-it('ignores grant-only and subscription changes without a live verification', () => {
-  const fetch = vi.fn();
+it('does not mistake grant-only and subscription changes for configuration work', async () => {
+  const fetch = vi.fn(async () => verified(0));
   vi.stubGlobal('fetch', fetch);
   mount(
     [entry('old'), entry('old', 'a', 'grants')],
     [entry('old'), entry('old', 'b', 'grants'), { ...entry('user', 'c', 'uri'), target_kind: 'user' }],
   );
-  expect(screen.getByRole('status').textContent).toBe('consistent');
+  await waitFor(() => expect(screen.getByRole('status').textContent).toBe('consistent'));
   expect(fetch).not.toHaveBeenCalled();
+});
+
+it('does not verify when grant and subscription artifacts are removed', async () => {
+  const fetch = vi.fn(async () => verified(0));
+  vi.stubGlobal('fetch', fetch);
+  mount(
+    [entry('old'), entry('old', 'a', 'grants'), { ...entry('user', 'c', 'uri'), target_kind: 'user' }],
+    [entry('old')],
+  );
+  await waitFor(() => expect(screen.getByRole('status').textContent).toBe('consistent'));
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+it('advertises a pure container change even when ordinary configuration artifacts are identical', async () => {
+  const fetch = vi.fn(async () => verified(1));
+  vi.stubGlobal('fetch', fetch);
+  mount([entry('old')], [entry('old')]);
+  await waitFor(() => expect(screen.getByRole('status').textContent).toBe('pending'));
+  expect(fetch).toHaveBeenCalledWith('/deployments/verify', expect.objectContaining({ body: '{"revision_id":3}' }));
+});
+
+it('keeps pure container status unknown when live verification fails', async () => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => Response.json({ error: 'verification unavailable' }, { status: 503 })),
+  );
+  mount([entry('old')], [entry('old')]);
+  await waitFor(() => expect(screen.getByRole('status').textContent).toBe('error'));
 });
 
 it('reports a failed live check instead of claiming that initialization is pending or complete', async () => {

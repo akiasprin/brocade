@@ -3,11 +3,36 @@ use super::*;
 pub(super) mod entries;
 pub(super) mod nics;
 pub(super) mod terminal;
-use brocade_deployment::cvm::{
-    CvmArtifactMode, CvmImageManifest, InstanceReport, InventoryReport,
-    CHAIN_EGRESS_PROTOCOL_VERSION, CVM_ARTIFACT_PROTOCOL_VERSION, CVM_PROTOCOL_VERSION,
-};
-use brocade_store::cvm::{CvmCommand, CvmCreate, CvmQuota};
+use brocade_deployment::cvm::{CvmImageManifest, InstanceReport, InventoryReport};
+use brocade_store::cvm::{CvmCommand, CvmCreate};
+
+/// User configuration errors have the same JSON/Chinese feedback as Store validation.
+/// Preserve extractor status codes, including body-size and content-type failures.
+pub(super) struct Configuration<T>(pub T);
+impl<S, T> axum::extract::FromRequest<S> for Configuration<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned + Send,
+{
+    type Rejection = Response;
+
+    async fn from_request(
+        request: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        <Json<T> as axum::extract::FromRequest<S>>::from_request(request, state)
+            .await
+            .map(|Json(value)| Self(value))
+            .map_err(|error| {
+                let message = match error.status() {
+                    StatusCode::PAYLOAD_TOO_LARGE => "配置内容过大，请减少配置项后重试。",
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE => "请以 JSON 格式提交配置。",
+                    _ => "配置格式不正确，请检查 IP／网段、端口和数值字段后重试。",
+                };
+                private((error.status(), Json(json!({ "error": message }))).into_response())
+            })
+    }
+}
 
 fn private(response: impl IntoResponse) -> Response {
     let mut response = response.into_response();
@@ -44,7 +69,7 @@ pub(super) async fn compile_preview(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<CvmCompilePreview>,
+    Configuration(request): Configuration<CvmCompilePreview>,
 ) -> ApiResult<Response> {
     let actor = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     let review = brocade_store::cvm::CvmMutationReview {
@@ -95,6 +120,23 @@ pub(super) async fn host_policy(
     Ok(private(Json(state.store.cvm_workspace(&actor).await?)))
 }
 
+pub(super) async fn host_install_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let distribution = state.distribution().await?;
+    let server = &distribution.agent_public_url;
+    let digest = install_script_sha256(&distribution);
+    let command = format!(
+        "installer=$(mktemp) && curl -fsSL {} -o \"$installer\" && printf '%s  %s\\n' {} \"$installer\" | sha256sum -c - && sudo sh \"$installer\" --server {} --reuse-node-token",
+        shell_quote(&format!("{server}/enroll/install.sh")),
+        shell_quote(&digest),
+        shell_quote(server),
+    );
+    Ok(private(Json(json!({ "install_command": command }))))
+}
+
 pub(super) async fn instance(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -103,6 +145,17 @@ pub(super) async fn instance(
     let actor = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     Ok(private(Json(state.store.cvm_instance(&actor, &id).await?)))
 }
+pub(super) async fn pending_review(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let actor = require_admin_context(&state, &headers, AdminPermission::Edit).await?;
+    Ok(private(Json(
+        state.store.cvm_pending_review(&actor, &id).await?,
+    )))
+}
+
 pub(super) async fn readings(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -167,7 +220,7 @@ pub(super) async fn adopt(
 pub(super) async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<CvmCreate>,
+    Configuration(request): Configuration<CvmCreate>,
 ) -> ApiResult<Response> {
     let actor = require_admin_context(&state, &headers, AdminPermission::Read).await?;
     Ok(private((
@@ -179,58 +232,53 @@ pub(super) async fn command(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<CvmCommand>,
+    Configuration(request): Configuration<CvmCommand>,
 ) -> ApiResult<Response> {
     let actor = require_admin_context(&state, &headers, AdminPermission::Read).await?;
-    Ok(private((
-        StatusCode::ACCEPTED,
-        Json(
-            state
-                .store
-                .command_cvm_reviewed(&actor, &id, request, mutation_review(&headers)?)
-                .await?
-                .instance,
-        ),
+    let access_changed = matches!(request.change, brocade_store::cvm::CvmChange::Assign { .. });
+    let result = state
+        .store
+        .command_cvm_reviewed(&actor, &id, request, mutation_review(&headers)?)
+        .await?;
+    if access_changed {
+        state.terminals.close_instance_sessions(&id);
+    }
+    Ok(private((StatusCode::ACCEPTED, Json(result.instance))))
+}
+
+pub(super) async fn login_credential(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let actor = require_admin_context(&state, &headers, AdminPermission::Read).await?;
+    Ok(private(Json(
+        state.store.cvm_login_credential(&actor, &id).await?,
     )))
 }
-pub(super) async fn quota(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<CvmQuota>,
-) -> ApiResult<Response> {
-    let actor = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
-    state.store.set_cvm_quota(&actor, request).await?;
-    Ok(private(StatusCode::NO_CONTENT))
+#[derive(Deserialize)]
+pub(super) struct CredentialQuery {
+    revision: u64,
 }
-pub(super) async fn network_quota_preview(
+pub(super) async fn node_credential(
     State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CredentialQuery>,
     headers: HeaderMap,
-    Json(request): Json<brocade_store::cvm::CvmNetworkQuotaPreviewRequest>,
 ) -> ApiResult<Response> {
-    let actor = require_admin_context(&state, &headers, AdminPermission::SystemAdmin).await?;
+    let node = agent_node(&state, &headers).await?;
     Ok(private(Json(
         state
             .store
-            .cvm_network_quota_preview(&actor, request)
+            .cvm_node_credential(&node.node_id, &id, query.revision)
             .await?,
     )))
-}
-async fn quota_agent_node(state: &AppState, headers: &HeaderMap) -> ApiResult<AuthenticatedNode> {
-    let node = agent_node(state, headers).await?;
-    if agent_protocol_version(headers)
-        .is_none_or(|v| v < brocade_deployment::cvm::NETWORK_QUOTA_PROTOCOL_VERSION)
-    {
-        return Err(ApiError::Store(StoreError::Unsupported(
-            "宿主网络额度需要新版 Agent".into(),
-        )));
-    }
-    Ok(node)
 }
 pub(super) async fn network_quota_desired(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let node = quota_agent_node(&state, &headers).await?;
+    let node = agent_node(&state, &headers).await?;
     Ok(private(Json(
         state.store.cvm_network_quota_desired(&node.node_id).await?,
     )))
@@ -244,7 +292,7 @@ pub(super) async fn network_quota_report(
     headers: HeaderMap,
     Json(request): Json<NetworkQuotaUpload>,
 ) -> ApiResult<Response> {
-    let node = quota_agent_node(&state, &headers).await?;
+    let node = agent_node(&state, &headers).await?;
     Ok(private(Json(
         json!({"accepted":state.store.cvm_record_network_quotas(&node.node_id,request.reports).await?}),
     )))
@@ -252,10 +300,9 @@ pub(super) async fn network_quota_report(
 async fn agent_node(state: &AppState, headers: &HeaderMap) -> ApiResult<AuthenticatedNode> {
     let node = authenticate_agent(&state.store, headers).await?;
     require_active_agent(&node)?;
-    if agent_protocol_version(headers).is_none_or(|v| v < CVM_PROTOCOL_VERSION) {
-        return Err(ApiError::Store(StoreError::Unsupported(
-            "CVM requires an Agent with the current CVM contract".into(),
-        )));
+    if agent_protocol_version(headers) != Some(brocade_deployment::protocol::AGENT_PROTOCOL_VERSION)
+    {
+        return Err(StoreError::Unsupported("容器节点必须使用当前执行契约".into()).into());
     }
     Ok(node)
 }
@@ -265,14 +312,6 @@ pub(super) async fn inventory(
     Json(request): Json<InventoryReport>,
 ) -> ApiResult<Response> {
     let node = agent_node(&state, &headers).await?;
-    if request.capabilities.baremetal.is_some()
-        && agent_protocol_version(&headers)
-            .is_none_or(|v| v < brocade_deployment::cvm::BAREMETAL_PROTOCOL_VERSION)
-    {
-        return Err(ApiError::Store(StoreError::Unsupported(
-            "裸机需要新版 Agent".into(),
-        )));
-    }
     state
         .store
         .cvm_record_inventory(&node.node_id, request)
@@ -287,11 +326,6 @@ pub(super) async fn image_manifest(
     Json(manifest): Json<CvmImageManifest>,
 ) -> ApiResult<Response> {
     let node = agent_node(&state, &headers).await?;
-    if agent_protocol_version(&headers).is_none_or(|v| v < CVM_ARTIFACT_PROTOCOL_VERSION) {
-        return Err(ApiError::Store(StoreError::Unsupported(
-            "镜像清单需要新版 Agent".into(),
-        )));
-    }
     state
         .store
         .cvm_record_image_manifest(&node.node_id, manifest)
@@ -344,53 +378,10 @@ pub(super) async fn desired(
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let node = agent_node(&state, &headers).await?;
-    let current =
-        agent_protocol_version(&headers).is_some_and(|v| v >= CVM_ARTIFACT_PROTOCOL_VERSION);
-    let mut desired = state
+    let desired = state
         .store
-        .cvm_desired_page(
-            &node.node_id,
-            if current {
-                Some(query.offset.unwrap_or(0))
-            } else {
-                None
-            },
-        )
+        .cvm_desired_page(&node.node_id, query.offset.unwrap_or(0))
         .await?;
-    if !desired.chain_clients.is_empty()
-        && agent_protocol_version(&headers).is_none_or(|v| v < CHAIN_EGRESS_PROTOCOL_VERSION)
-    {
-        return Err(ApiError::Store(StoreError::Unsupported(
-            "线路出口需要协议 76 或更新的 Agent".into(),
-        )));
-    }
-    let mode = match std::env::var("BROCADE_CVM_ARTIFACT_MODE").as_deref() {
-        Ok("enforce") => CvmArtifactMode::Enforce,
-        Ok("shadow") | Err(std::env::VarError::NotPresent) => CvmArtifactMode::Shadow,
-        _ => {
-            return Err(ApiError::Store(StoreError::InvalidData(
-                "BROCADE_CVM_ARTIFACT_MODE must be shadow or enforce".into(),
-            )))
-        }
-    };
-    for instance in &mut desired.instances {
-        if agent_protocol_version(&headers).is_none_or(|v| v < CVM_ARTIFACT_PROTOCOL_VERSION) {
-            instance.artifacts = None;
-        } else if instance.artifacts.is_some() {
-            instance.artifact_mode = mode;
-        }
-    }
-    if desired
-        .instances
-        .iter()
-        .any(|d| !d.spec.execution.is_cube())
-        && agent_protocol_version(&headers)
-            .is_none_or(|v| v < brocade_deployment::cvm::BAREMETAL_PROTOCOL_VERSION)
-    {
-        return Err(ApiError::Store(StoreError::Unsupported(
-            "裸机期望状态需要新版 Agent".into(),
-        )));
-    }
     Ok(private(Json(desired)))
 }
 pub(super) async fn report(
@@ -399,17 +390,55 @@ pub(super) async fn report(
     Json(request): Json<InstanceReport>,
 ) -> ApiResult<Response> {
     let node = agent_node(&state, &headers).await?;
-    if request.host.is_some()
-        && agent_protocol_version(&headers)
-            .is_none_or(|v| v < brocade_deployment::cvm::BAREMETAL_PROTOCOL_VERSION)
-    {
-        return Err(ApiError::Store(StoreError::Unsupported(
-            "裸机回执需要新版 Agent".into(),
-        )));
-    }
     let accepted = state
         .store
         .cvm_record_report(&node.node_id, request)
         .await?;
     Ok(private(Json(json!({"accepted":accepted}))))
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+    use axum::extract::FromRequest;
+
+    #[tokio::test]
+    async fn malformed_routes_keep_status_and_return_chinese_json_without_echoing_input() {
+        for dns in [json!(["127.0.0.1"]), json!(["bad-dns"])] {
+            let request = Request::builder().header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"request_id":"configuration-test-01", "expected_generation":1,
+                    "expected_revision":1,"routes":{"revision":1,"dns":dns,"priorities":[],"routes":[
+                        {"destination":"10.0.0.1/24","interface_id":"nic-test"}
+                    ]}}).to_string())).unwrap();
+            let response =
+                match Configuration::<brocade_deployment::cvm::RoutesWrite>::from_request(
+                    request,
+                    &(),
+                )
+                .await
+                {
+                    Ok(_) => panic!("noncanonical prefix must be rejected"),
+                    Err(response) => response,
+                };
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                value["error"],
+                "配置格式不正确，请检查 IP／网段、端口和数值字段后重试。"
+            );
+            assert!(!String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("bad-dns"));
+        }
+        let request = Request::builder().body(Body::from("{}")).unwrap();
+        let response = match Configuration::<CvmCreate>::from_request(request, &()).await {
+            Ok(_) => panic!("JSON content type is required"),
+            Err(response) => response,
+        };
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
 }

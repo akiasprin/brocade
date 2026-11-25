@@ -2,10 +2,11 @@
 use super::*;
 
 /// Joined facts for an entry, read in the caller's snapshot.
-const FACTS_SELECT: &str = "SELECT e.id,e.publication_id,e.provider_node,e.instance_id,e.address,e.mode,e.revision,e.released,i.node_id AS host,i.tenant_id,i.user_id,i.reserved,i.report->>'power' AS power,i.report->>'access_address' AS target,i.desired#>>'{spec,execution,kind}' AS execution_kind,p.spec,(SELECT t.id FROM cvm_entry_tunnels t WHERE t.entry_node=e.provider_node AND t.target_node=i.node_id AND NOT t.withdrawn) AS tunnel FROM cvm_entries e JOIN cvm_instances i ON i.id=e.instance_id JOIN cvm_entry_publications p ON p.id=e.publication_id";
+const FACTS_SELECT: &str = "SELECT e.id,e.publication_id,e.provider_node,e.instance_id,e.address,e.mode,e.revision,e.released,i.node_id AS host,i.tenant_id,coalesce(i.user_id,'') AS user_id,i.reserved,i.report->>'power' AS power,i.report->>'access_address' AS target,i.desired#>>'{spec,execution,kind}' AS execution_kind,p.spec,(SELECT t.id FROM cvm_entry_tunnels t WHERE t.entry_node=e.provider_node AND t.target_node=i.node_id AND NOT t.withdrawn) AS tunnel FROM cvm_entries e JOIN cvm_instances i ON i.id=e.instance_id JOIN cvm_entry_publications p ON p.id=e.publication_id";
 
 struct Facts {
     entry: StoredEntry,
+    reserved_ports: EntryReservedPorts,
     host_local: bool,
     granted: bool,
     /// The container's host-side primary NIC address while it runs. Cube reports an
@@ -20,8 +21,14 @@ impl Facts {
     }
 }
 fn facts(row: &sqlx::postgres::PgRow) -> Result<Facts> {
-    let entry = stored(row)?;
+    let mut entry = stored(row)?;
     let spec: EntryPublicationSpec = serde_json::from_value(row.try_get("spec")?)?;
+    let reserved_ports = if let Some(offer) = spec.offer(entry.address) {
+        entry.mode = offer.resolve_mode(&entry.mode).map_err(invalid)?;
+        offer.reserved_ports.normalized().map_err(invalid)?
+    } else {
+        EntryReservedPorts::default()
+    };
     let granted = spec
         .grants
         .iter()
@@ -38,6 +45,7 @@ fn facts(row: &sqlx::postgres::PgRow) -> Result<Facts> {
         .offer(entry.address)
         .map_or(entry.address, EntryAddressOffer::visible_address);
     Ok(Facts {
+        reserved_ports,
         host_local: row
             .try_get::<Option<String>, _>("execution_kind")?
             .as_deref()
@@ -188,13 +196,28 @@ async fn render(
         .iter()
         .flat_map(|f| [f.entry.provider_node.clone(), f.entry.host.clone()])
         .collect();
+    let mut serving = BTreeMap::new();
+    for node in &nodes {
+        if let Some(config) = crate::cvm::releases::serving_tx(tx, node).await? {
+            serving.insert(node.clone(), config.entry);
+        }
+    }
     let receipts = receipts(tx, nodes.into_iter().collect()).await?;
     let mut out = Vec::with_capacity(all.len());
-    for f in all {
+    for mut f in all {
         let (state, mut error) = state(&f, &receipts);
         let readonly = actor.role() == AdminRole::Readonly;
         if readonly && error.is_some() {
             error = Some("网络执行失败，请管理员核查".into());
+        }
+        if state == CvmEntryState::Active {
+            if let Some(rule) = serving
+                .get(&f.entry.provider_node)
+                .and_then(|d| d.rules.iter().find(|r| r.id == f.entry.id))
+            {
+                f.entry.mode = rule.mode.clone();
+                f.reserved_ports = rule.reserved_ports.clone();
+            }
         }
         let remote = f.remote();
         let mask = |ip: Ipv4Addr| if readonly { Ipv4Addr::UNSPECIFIED } else { ip };
@@ -207,6 +230,7 @@ async fn render(
             provider_node: f.entry.provider_node,
             instance_id: f.entry.instance_id,
             mode: f.entry.mode,
+            reserved_ports: f.reserved_ports,
             remote,
             state,
             error,
@@ -286,6 +310,7 @@ impl PgStore {
         report.validate().map_err(invalid)?;
         let mut tx = self.pool.begin().await?;
         crate::cvm::releases::lock(&mut tx).await?;
+        let expected = crate::cvm::releases::entry_desired_tx(&mut tx, node).await?;
         if crate::cvm::releases::serving_tx(&mut tx, node)
             .await?
             .is_some()
@@ -315,9 +340,23 @@ impl PgStore {
         if report.generation < applied as u64 {
             return Ok(false);
         }
+        let mut value = serde_json::to_value(&report)?;
+        let previous: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT report->'protected_entry_ports' FROM cvm_entry_nodes WHERE node_id=$1",
+        )
+        .bind(node)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        let protected = if report.error.is_none() && report.generation == expected.generation {
+            serde_json::to_value(super::policy::serving(&mut tx, node).await?)?
+        } else {
+            previous.unwrap_or_else(|| serde_json::json!([]))
+        };
+        value["protected_entry_ports"] = protected;
         sqlx::query("UPDATE cvm_entry_nodes SET report=$2,reported_at=now(),applied_generation=CASE WHEN $3 THEN greatest(applied_generation,$4) ELSE applied_generation END WHERE node_id=$1")
             .bind(node)
-            .bind(serde_json::to_value(&report)?)
+            .bind(value)
             .bind(report.error.is_none())
             .bind(report.generation as i64)
             .execute(&mut *tx)
@@ -388,6 +427,7 @@ pub(crate) async fn desired_tx(
         // still owns the address and ports but drops the traffic.
         let deliverable = f.granted && (!f.remote() || tunnel.is_some());
         desired.rules.push(EntryRule {
+            reserved_ports: f.reserved_ports.clone(),
             host_local: f.host_local && !f.remote(),
             id: f.entry.id,
             address: f.entry.address,
@@ -405,6 +445,7 @@ pub(crate) async fn desired_tx(
             continue;
         };
         desired.deliveries.push(EntryDelivery {
+            reserved_ports: f.reserved_ports.clone(),
             host_local: f.host_local,
             id: f.entry.id,
             instance_id: f.entry.instance_id,

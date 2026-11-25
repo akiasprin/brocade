@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package attachments
 
-// Cubelet owns additional virtio NICs and preserves the original
-// contact NIC; configured bridges belong to the machine administrator.
+// Cubelet owns Store-assigned virtio NICs and preserves the original contact NIC.
 import (
 	"bytes"
 	"context"
@@ -259,11 +258,12 @@ func checkTap(r *record, a *attachment) error {
 	return nil
 }
 func (s *server) ensureTap(r *record, a *attachment) error {
+	if a.Allocated == nil {
+		return errors.New("NIC TAP requires a Store allocation")
+	}
 	source := s.sourceFor(a)
-	if a.Allocated != nil {
-		if err := checkAssignedBridge(source, a); err != nil {
-			return err
-		}
+	if err := checkAssignedBridge(source, a); err != nil {
+		return err
 	}
 	if _, e := os.Stat(filepath.Join("/sys/class/net", source.Bridge, "bridge")); e != nil {
 		return errors.New("administrator bridge is unavailable")
@@ -589,17 +589,14 @@ func validateSavedNICs(r *record) error {
 		}
 		seenSlots[a.Slot] = true
 		sum := hash([]byte(r.Instance + ":" + id))
-		expectedMAC := fmt.Sprintf("02:%s:%s:%s:%s:%s", sum[:2], sum[2:4], sum[4:6], sum[6:8], sum[8:10])
 		if a.Allocated == nil {
 			return errors.New("durable business NIC lacks a Store allocation")
 		}
-		{
-			assigned, err := allocatedNIC(object{"source_id": a.Source, "allocated": a.Allocated})
-			if err != nil || assignedPrefix(assigned.IPv4) != a.IPv4 || assignedPrefix(assigned.IPv6) != a.IPv6 {
-				return errors.New("durable Store allocation is corrupt")
-			}
-			expectedMAC = strings.ToLower(assigned.MAC)
+		assigned, err := allocatedNIC(object{"source_id": a.Source, "allocated": a.Allocated})
+		if err != nil || assignedPrefix(assigned.IPv4) != a.IPv4 || assignedPrefix(assigned.IPv6) != a.IPv6 {
+			return errors.New("durable Store allocation is corrupt")
 		}
+		expectedMAC := strings.ToLower(assigned.MAC)
 		if a.Tap != "ba"+sum[:12] || a.DeviceID != "cvm-"+sum[:12] || a.MAC != expectedMAC || len(a.SourceSHA256) != 64 {
 			return errors.New("durable NIC device binding is corrupt")
 		}

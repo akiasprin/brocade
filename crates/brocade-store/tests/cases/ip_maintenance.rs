@@ -877,7 +877,7 @@ async fn ip_maintenance_upgrade_from_0006_preserves_existing_receipts() {
     assert_eq!(before.len(), 6);
     let check = db.store.check_database_upgrade().await.unwrap();
     assert!(check.compatible);
-    assert_eq!(check.pending_versions, vec![7, 8]);
+    assert_eq!(check.pending_versions, vec![7, 8, 9]);
     // Both operational features share the same unreleased migration. A failure after the Clash
     // table was created must roll back that table and every maintenance table together.
     sqlx::query("CREATE TABLE ip_maintenance_state(conflict TEXT)")
@@ -973,7 +973,7 @@ async fn ip_maintenance_compat_exact_old_0007_is_read_only_atomic_and_idempotent
         assert!(!db.store.check_database_upgrade().await.unwrap().compatible);
         let check = db.store.check_ip_maintenance_upgrade().await.unwrap();
         assert!(check.compatible, "{:?}", check);
-        assert_eq!(check.pending_versions, vec![7, 8]);
+        assert_eq!(check.pending_versions, vec![7, 8, 9]);
         assert_eq!(
             before,
             compat_snapshot(&db).await,

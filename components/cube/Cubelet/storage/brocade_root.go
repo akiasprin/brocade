@@ -16,7 +16,6 @@ import (
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/pkg/utils"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage/cow"
-	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/tencentcloud/CubeSandbox/Cubelet/plugins/workflow"
 	"github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
@@ -37,7 +36,7 @@ func ProtectBrocadeRoot(ctx context.Context, sandboxID string) error {
 	if err != nil {
 		return err
 	}
-	if !cow.IsLocalBackend(info.Backend) {
+	if info.Backend != cow.BackendXFS && info.Backend != cow.BackendPlain {
 		return fmt.Errorf("Brocade protected roots require local persistent volumes")
 	}
 	if len(info.Volumes) != 1 {
@@ -72,9 +71,6 @@ func (l *local) reuseBrocadeRoot(ctx context.Context, opts *workflow.CreateConte
 			return true, fmt.Errorf("retained root unavailable: %w", err)
 		}
 		info, err = l.readBrocadeRoot(opts.SandboxID)
-		if os.IsNotExist(err) {
-			info, err = l.rebindBrocadeRoot(ctx, opts, expected)
-		}
 		if err != nil {
 			return true, err
 		}
@@ -87,6 +83,9 @@ func (l *local) reuseBrocadeRoot(ctx context.Context, opts *workflow.CreateConte
 	}
 	if !info.BrocadeProtectedRoot || len(info.Volumes) != 1 {
 		return true, fmt.Errorf("retained root is not protected")
+	}
+	if err := validateBrocadeRoot(info); err != nil {
+		return true, err
 	}
 	if storageBackendFromInfo(info) != createContextStorageBackend(opts) {
 		return true, fmt.Errorf("retained root storage backend mismatch")
@@ -123,6 +122,9 @@ func (l *local) brocadeRootDir() string { return filepath.Join(l.config.DataPath
 func validateBrocadeRoot(info *StorageInfo) error {
 	if info == nil || !brocadeID.MatchString(info.SandboxID) || !info.BrocadeProtectedRoot || len(info.Volumes) != 1 || len(info.HostDirBackendInfos) > 0 || len(info.PluginVolumeBackendInfos) > 0 {
 		return fmt.Errorf("invalid protected root manifest")
+	}
+	if info.Backend != cow.BackendXFS && info.Backend != cow.BackendPlain {
+		return fmt.Errorf("protected root requires an explicit local backend")
 	}
 	for name, v := range info.Volumes {
 		if v == nil || !brocadeID.MatchString(name) || v.Name != name || v.Kind != "volume" || v.VolumeName != "sb-"+info.SandboxID+"-"+name {
@@ -244,40 +246,6 @@ func (l *local) recoverBrocadeRoots(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-// Upgrade compatibility for an adapter that already froze the exact native
-// volume identity before persistent manifests existed. Resolve only that
-// existing object; this path never calls a volume-creation or format function.
-func (l *local) rebindBrocadeRoot(ctx context.Context, opts *workflow.CreateContext, expected string) (*StorageInfo, error) {
-	if len(opts.ReqInfo.Volumes) != 1 {
-		return nil, fmt.Errorf("legacy root mount is ambiguous")
-	}
-	v := opts.ReqInfo.Volumes[0]
-	empty := v.GetVolumeSource().GetEmptyDir()
-	if empty == nil || expected != "sb-"+opts.SandboxID+"-"+v.Name {
-		return nil, fmt.Errorf("legacy root ownership mismatch")
-	}
-	q, err := resource.ParseQuantity(empty.SizeLimit)
-	if err != nil || q.Sign() <= 0 {
-		return nil, fmt.Errorf("invalid retained capacity")
-	}
-	backend := createContextStorageBackend(opts)
-	store, err := l.storeForBackend(backend)
-	if err != nil {
-		return nil, err
-	}
-	size, err := store.GetSizeBytes(ctx, expected)
-	if err != nil || size != uint64(q.Value()) {
-		return nil, fmt.Errorf("original physical root is missing or changed")
-	}
-	path, err := store.ResolveDevPath(ctx, expected, "volume")
-	if err != nil {
-		return nil, err
-	}
-	volume := newCowVolume(expected, "volume", 0, path)
-	info := &StorageInfo{Namespace: "default", SandboxID: opts.SandboxID, Backend: backend, BrocadeProtectedRoot: true, Volumes: map[string]*BackendFileInfo{v.Name: newDefaultMediumBackendInfo(v.Name, path, q, normalizeRootfsSizes(q), volume)}}
-	return info, l.persistBrocadeRoot(info)
 }
 
 func (l *local) removeBrocadeRoot(info *StorageInfo) error {

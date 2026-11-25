@@ -9,6 +9,8 @@ use std::{
 };
 
 use yawc::{Frame, OpCode, Options as SocketOptions, WebSocket};
+mod rtc;
+mod shortcut;
 
 static POLICY_REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
 struct PolicyRefreshGuard;
@@ -22,6 +24,7 @@ pub(crate) fn spawn(options: Options) -> Result<(), String> {
     if options.apply_mode != crate::options::ApplyMode::Linux {
         return Ok(());
     }
+    let rtc_config = rtc::Config::from_env()?;
     thread::Builder::new()
         .name("cvm-terminal".into())
         .spawn(move || {
@@ -37,13 +40,19 @@ pub(crate) fn spawn(options: Options) -> Result<(), String> {
             };
             runtime.block_on(async {
                 let mut delay = 5;
+                let mut sessions = tokio::task::JoinSet::new();
                 loop {
+                    while sessions.try_join_next().is_some() {}
                     if super::backend::current().is_some() {
-                        if let Ok(socket) =
-                            connect(&options, "/agent/v1/cvm/terminal/control").await
+                        if let Ok(socket) = connect(
+                            &options,
+                            "/agent/v1/cvm/terminal/control",
+                            rtc_config.is_some(),
+                        )
+                        .await
                         {
                             delay = 5;
-                            control(&options, socket).await;
+                            control(&options, socket, rtc_config.as_ref(), &mut sessions).await;
                         }
                     }
                     tokio::time::sleep(Duration::from_secs(delay)).await;
@@ -55,7 +64,11 @@ pub(crate) fn spawn(options: Options) -> Result<(), String> {
     Ok(())
 }
 
-async fn connect(options: &Options, path: &str) -> Result<WebSocket<crate::http::Stream>, String> {
+async fn connect(
+    options: &Options,
+    path: &str,
+    rtc: bool,
+) -> Result<WebSocket<crate::http::Stream>, String> {
     let server = options.server.trim_end_matches('/');
     let address = if let Some(host) = server.strip_prefix("https://") {
         format!("wss://{host}{path}")
@@ -67,20 +80,23 @@ async fn connect(options: &Options, path: &str) -> Result<WebSocket<crate::http:
     let url = address
         .parse()
         .map_err(|_| "invalid terminal WebSocket URL")?;
-    let request = yawc::HttpRequest::builder()
+    let mut request = yawc::HttpRequest::builder()
         .header("authorization", format!("Bearer {}", options.token))
         .header(wire::VERSION_HEADER, wire::VERSION)
         .header(
             "x-brocade-protocol-version",
             AGENT_PROTOCOL_VERSION.to_string(),
         );
+    if rtc {
+        request = request.header(wire::RTC_HEADER, wire::RTC_VERSION);
+    }
     let deadline = Instant::now() + Duration::from_secs(10);
     let stream = HttpClient::new(&options.server)?
         .connect_stream(deadline)
         .await?;
     let settings = SocketOptions::default()
-        .with_max_payload_read(wire::MAX_DATA + 1)
-        .with_max_read_buffer(wire::MAX_DATA + 1)
+        .with_max_payload_read(wire::MAX_SIGNAL + 1)
+        .with_max_read_buffer(wire::MAX_SIGNAL + 1)
         .with_backpressure_boundary(64 * 1024);
     tokio::time::timeout_at(
         deadline.into(),
@@ -111,8 +127,12 @@ where
     .map_err(|_| "terminal control timed out")?
     .map_err(|_| "terminal control failed".into())
 }
-async fn control(options: &Options, mut socket: WebSocket<crate::http::Stream>) {
-    let mut sessions = tokio::task::JoinSet::new();
+async fn control(
+    options: &Options,
+    mut socket: WebSocket<crate::http::Stream>,
+    rtc_config: Option<&rtc::Config>,
+    sessions: &mut tokio::task::JoinSet<()>,
+) {
     let mut policy_refresh = tokio::task::JoinSet::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
     let mut seen = Instant::now();
@@ -135,18 +155,22 @@ async fn control(options: &Options, mut socket: WebSocket<crate::http::Stream>) 
                 match frame.opcode(){
                     OpCode::Ping=>if flush(&mut socket).await.is_err(){break},
                     OpCode::Pong=>{},
-                    OpCode::Text if frame.payload().len()<=wire::MAX_CONTROL=>{
-                        let Ok(offer)=serde_json::from_slice::<wire::Offer>(frame.payload()) else{break};
+                    OpCode::Text if frame.payload().len()<=wire::MAX_SIGNAL=>{
+                        let Ok(offer)=serde_json::from_slice::<wire::ConnectionOffer>(frame.payload()) else{break};
                         if !wire::valid_session(&offer.session_id)||sessions.len()>=wire::MAX_ATTACHMENTS_PER_NODE{break}
-                        let options=options.clone();sessions.spawn(async move{session(&options,offer).await});
+                        let options=options.clone();let config=rtc_config.cloned();
+                        sessions.spawn(async move {
+                            if let Some(rtc_offer)=offer.rtc {
+                                if let Some(config)=config {shortcut::session(&options,offer.terminal,rtc_offer,&config).await;}
+                            } else {session(&options,offer.terminal).await}
+                        });
                     },
                     _=>break,
                 }
             }
         }
     }
-    sessions.abort_all();
-    while sessions.join_next().await.is_some() {}
+    // Data tasks own their lifetime and lease; reconnecting control is not a new owner.
 }
 async fn refresh_policy(options: Options, guard: PolicyRefreshGuard) -> Result<(), String> {
     tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -186,7 +210,7 @@ async fn refresh_policy(options: Options, guard: PolicyRefreshGuard) -> Result<(
 
 async fn session(options: &Options, offer: wire::Offer) {
     let path = format!("/agent/v1/cvm/terminal/{}/stream", offer.session_id);
-    let Ok(mut socket) = connect(options, &path).await else {
+    let Ok(mut socket) = connect(options, &path, false).await else {
         return;
     };
     if bridge(&mut socket, &offer).await.is_err() {

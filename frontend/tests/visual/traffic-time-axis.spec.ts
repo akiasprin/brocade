@@ -150,5 +150,30 @@ test.describe('fixed calendar ranges in a UTC browser', () => {
       await expect(sites).toHaveScreenshot(`sites-custom-${width}-${theme}.png`);
       expect(errors).toEqual([]);
     });
+
+    test(`outflow states its whole-hour site cover under the total at ${width}px`, async ({ page }) => {
+      const errors: string[] = [];
+      page.on('pageerror', error => errors.push(error.message));
+      await page.clock.setFixedTime(new Date('2026-10-18T13:40:00Z'));
+      await page.setViewportSize({ width, height: 950 });
+      await page.goto(`/tests/fixtures/node-traffic-acceptance.html?scene=solo&run=0&theme=${theme}`);
+      await page.getByRole('button', { name: '香港测试机器', exact: true }).click();
+      await page.getByRole('button', { name: '自定义', exact: true }).click();
+      await page.getByLabel('开始时间（UTC+8）').fill('2026-10-18T17:55');
+      await page.getByLabel('结束时间（UTC+8）').fill('2026-10-18T18:10');
+      await page.getByRole('button', { name: '应用', exact: true }).click();
+      const plot = page
+        .getByRole('region', { name: '流出统计', exact: true })
+        .getByRole('region', { name: '流量随时间分布', exact: true });
+      // 17:55–18:10 touches the 17:00 and 18:00 site hours: 55 minutes before and 50 after.
+      await expect(plot.locator('.site-usage-head + .site-usage-note')).toHaveText(
+        /^站点按整点汇总，实际覆盖 10\/18 17:00:00 — 10\/18 19:00:00（UTC\+8），比所选时段多 1 小时 45 分。/,
+      );
+      await plot.scrollIntoViewIfNeeded();
+      await expect.poll(() => inspectSites(page)).not.toBeNull();
+      await waitForVisualAssets(page);
+      await expect(plot).toHaveScreenshot(`sites-cover-${width}-${theme}.png`);
+      expect(errors).toEqual([]);
+    });
   }
 });

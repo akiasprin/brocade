@@ -23,6 +23,9 @@ pub(crate) fn check_base_transition(args: &[String]) -> Result<(), String> {
 
 /// Check the current executor before replacing it with a base Agent.
 pub(crate) fn ensure_base_ready(state: &Path) -> Result<(), String> {
+    if std::env::var("BROCADE_CVM_BACKEND").as_deref() == Ok("baremetal") {
+        return Err("旧裸机独占模式不能直接降级；请先用安装器 --enable-cvm 转换执行栈".into());
+    }
     for name in ["cvm-nics-desired.json", "cvm-entries-desired.json"] {
         let Some(bytes) = crate::fsutil::read_bounded(&state.join(name), 16 * 1024 * 1024)? else {
             continue;
@@ -41,36 +44,35 @@ pub(crate) fn ensure_base_ready(state: &Path) -> Result<(), String> {
         }
     }
     // Base retains only neutral checkpoint inspection, never Cube execution.
-    let execution = std::env::var_os("BROCADE_CVM_STATE_DIR")
+    let cube_execution = std::env::var_os("BROCADE_CVM_STATE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            if std::env::var("BROCADE_CVM_BACKEND").as_deref() == Ok("baremetal") {
-                "/var/lib/brocade/cvm-host".into()
-            } else {
-                "/var/lib/brocade/cvm-cube".into()
-            }
-        });
-    if execution
-        .try_exists()
-        .map_err(|_| "无法检查 CVM 执行状态")?
-    {
-        for (count, entry) in std::fs::read_dir(&execution)
-            .map_err(|_| "无法读取 CVM 执行状态")?
-            .enumerate()
+        .unwrap_or_else(|| "/var/lib/brocade/cvm-cube".into());
+    let host_execution = std::env::var_os("BROCADE_CVM_HOST_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "/var/lib/brocade/cvm-host".into());
+    for execution in [&cube_execution, &host_execution] {
+        if execution
+            .try_exists()
+            .map_err(|_| "无法检查 CVM 执行状态")?
         {
-            if count >= 8192 {
-                return Err("CVM 执行记录超出检查上限".into());
-            }
-            let path = entry.map_err(|_| "无法读取 CVM 执行记录")?.path();
-            if path.extension().is_none_or(|suffix| suffix != "json") {
-                continue;
-            }
-            let bytes = crate::fsutil::read_bounded(&path, 256 * 1024)?
-                .ok_or("CVM 执行记录检查期间变化")?;
-            let record: serde_json::Value =
-                serde_json::from_slice(&bytes).map_err(|_| "CVM 执行记录无效")?;
-            if record.get("deleted").and_then(serde_json::Value::as_bool) != Some(true) {
-                return Err("CVM 实例尚未确认物理删除，不能启动基础版".into());
+            for (count, entry) in std::fs::read_dir(execution)
+                .map_err(|_| "无法读取 CVM 执行状态")?
+                .enumerate()
+            {
+                if count >= 8192 {
+                    return Err("CVM 执行记录超出检查上限".into());
+                }
+                let path = entry.map_err(|_| "无法读取 CVM 执行记录")?.path();
+                if path.extension().is_none_or(|suffix| suffix != "json") {
+                    continue;
+                }
+                let bytes = crate::fsutil::read_bounded(&path, 256 * 1024)?
+                    .ok_or("CVM 执行记录检查期间变化")?;
+                let record: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|_| "CVM 执行记录无效")?;
+                if record.get("deleted").and_then(serde_json::Value::as_bool) != Some(true) {
+                    return Err("CVM 实例尚未确认物理删除，不能启动基础版".into());
+                }
             }
         }
     }
@@ -83,13 +85,7 @@ pub(crate) fn ensure_base_ready(state: &Path) -> Result<(), String> {
         }
         let mut config = std::env::var_os("BROCADE_CVM_CONFIG")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                if std::env::var("BROCADE_CVM_BACKEND").as_deref() == Ok("baremetal") {
-                    "/etc/brocade/cvm-host.json".into()
-                } else {
-                    "/etc/brocade/cvm-cube.json".into()
-                }
-            });
+            .unwrap_or_else(|| "/etc/brocade/cvm-cube.json".into());
         if std::env::var_os("BROCADE_CVM_CONFIG").is_none()
             && !config.try_exists().map_err(|_| "无法检查 CVM 配置")?
         {
@@ -100,13 +96,7 @@ pub(crate) fn ensure_base_ready(state: &Path) -> Result<(), String> {
         }
         let execution = std::env::var_os("BROCADE_CVM_STATE_DIR")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                if std::env::var("BROCADE_CVM_BACKEND").as_deref() == Ok("baremetal") {
-                    "/var/lib/brocade/cvm-host".into()
-                } else {
-                    "/var/lib/brocade/cvm-cube".into()
-                }
-            });
+            .unwrap_or_else(|| "/var/lib/brocade/cvm-cube".into());
         if config.try_exists().map_err(|_| "无法检查 CVM 配置")? {
             crate::cvm::inspect_empty(&config, &execution)?;
         } else if std::env::var_os("BROCADE_CVM_CONFIG").is_some()
@@ -115,6 +105,24 @@ pub(crate) fn ensure_base_ready(state: &Path) -> Result<(), String> {
                 .map_err(|_| "无法检查 CVM 执行状态")?
         {
             return Err("CVM 配置缺失，无法证明执行栈已清空".into());
+        }
+        let host_config = std::env::var_os("BROCADE_CVM_HOST_CONFIG")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "/etc/brocade/cvm-host.json".into());
+        let host_execution = std::env::var_os("BROCADE_CVM_HOST_STATE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "/var/lib/brocade/cvm-host".into());
+        if host_config
+            .try_exists()
+            .map_err(|_| "无法检查宿主系统配置")?
+        {
+            crate::cvm::inspect_host_empty(&host_config, &host_execution)?;
+        } else if std::env::var_os("BROCADE_CVM_HOST_CONFIG").is_some()
+            || host_execution
+                .try_exists()
+                .map_err(|_| "无法检查宿主系统执行状态")?
+        {
+            return Err("宿主系统配置缺失，无法证明执行栈已清空".into());
         }
     }
     Ok(())

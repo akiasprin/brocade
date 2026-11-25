@@ -1,0 +1,72 @@
+/* 上一个／下一个容器：与右侧操作组同一种连体按钮，只放图标。 */
+.title-actions .cvm-detail-nav .title-action-item .btn {
+  width: var(--title-icon-w);
+  padding: 0;
+}
+.cvm-remove-body,
+.cvm-access-dialog .tunnel-dialog-body {
+  display: grid;
+  gap: 10px;
+  overflow-wrap: anywhere;
+}
+.cvm-remove-body > p,
+.cvm-access-dialog .tunnel-dialog-body > p {
+  margin: 0;
+}
+.cvm-impact-list {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-inline-start: 1.4em;
+}
+.cvm-access-consequences {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--sunk);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.cvm-tab-short-label {
+  display: none;
+}
+@container (max-width: 620px) {
+  .cvm-instance-head .cvm-detail-nav,
+  .cvm-instance-head .cvm-tab-full-label {
+    display: none;
+  }
+  .cvm-instance-head .nd-tabs-seg {
+    display: flex;
+    width: 100%;
+  }
+  .cvm-instance-head .nd-tabs-seg > button {
+    flex: 1;
+    min-width: 0;
+    gap: 3px;
+    padding-inline: 3px;
+  }
+  .cvm-instance-head .nd-tabs-seg svg {
+    flex: none;
+  }
+  .cvm-page .cvm-instance-head .nd-tab-badge,
+  .cvm-page .cvm-instance-head .nd-tab-badge.dim,
+  .cvm-tab-short-label {
+    display: inline-flex;
+  }
+}
+@container (max-width: 340px) {
+  .cvm-page > .nd-paper > .cvm-instance-head[data-tabbed='true']:has(> .nd-tools) {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(50px, auto) auto 40px;
+  }
+  .cvm-page > .nd-paper > .cvm-instance-head[data-tabbed='true'] > .nd-tools {
+    grid-area: 2 / 1;
+    justify-self: end;
+    padding-inline: 12px;
+  }
+  .cvm-page > .nd-paper > .cvm-instance-head[data-tabbed='true']:has(> .nd-tools) > .nd-tabs {
+    grid-row: 3;
+  }
+}

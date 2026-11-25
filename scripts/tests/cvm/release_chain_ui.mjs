@@ -39,7 +39,8 @@ try {
       const proposal = page.getByRole('region', { name: '待确认的组合变更' });
       await proposal.waitFor();
       if (!(await proposal.innerText()).includes('alice')) throw new Error('proposal has wrong authorization owner');
-      await proposal.getByRole('button', { name: '预览产物差异', exact: true }).click();
+      await proposal.getByRole('button', { name: '查看配置差异', exact: true }).click();
+      await proposal.getByText('查看生成文件', { exact: true }).click();
       await proposal.locator('.cvm-artifact-content').first().waitFor();
       if (
         !(await proposal.evaluate(
@@ -63,11 +64,12 @@ try {
       .getByRole('option', { name: /KVM split chain/ })
       .first()
       .waitFor({ state: 'attached' });
-    const save = dialog.getByRole('button', { name: '保存', exact: true });
-    if (!(await save.isDisabled())) throw new Error('unreviewed save enabled');
-    await dialog.getByRole('button', { name: '预览产物差异', exact: true }).click();
+    const save = dialog.getByRole('button', { name: '保存变更', exact: true });
+    if (await save.isDisabled()) throw new Error('save should check configuration automatically');
+    await dialog.getByRole('button', { name: '查看配置差异', exact: true }).click();
     await save.waitFor();
     await page.waitForFunction(() => !document.querySelector('.cvm-dialog footer button.btn.primary')?.disabled);
+    await dialog.getByText('查看生成文件', { exact: true }).click();
     await dialog.locator('.cvm-artifact-content').first().waitFor();
     if (!(await dialog.locator('.cvm-dialog-body').evaluate(n => n.scrollWidth <= n.clientWidth + 1)))
       throw new Error('compiled route dialog clips its children');

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import http.cookiejar
 import json
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -13,8 +14,14 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import guest_password
 
 from release_kvm_lab import Lab
+
+AGENT_PROTOCOL_VERSION = re.search(
+    r'pub const AGENT_PROTOCOL_VERSION: u32 = (\d+);',
+    (Path(__file__).resolve().parents[3] / 'crates/brocade-deployment/src/protocol.rs').read_text(),
+).group(1)
 
 
 class Acceptance:
@@ -47,7 +54,7 @@ class Acceptance:
         print('PASS: ' + name, flush=True)
 
     def call(self, method, path, body=None, expected=200, authorization=None, opener=None, extra_headers=None):
-        headers = {'Content-Type': 'application/json', 'x-brocade-protocol-version': '76'}
+        headers = {'Content-Type': 'application/json', 'x-brocade-protocol-version': AGENT_PROTOCOL_VERSION}
         headers.update(extra_headers or {})
         if authorization:
             headers['Authorization'] = 'Bearer ' + authorization
@@ -101,6 +108,12 @@ class Acceptance:
             json.dumps(current).encode(),
         )
         self.save()
+        # Close an already-upgraded channel before enabling HTTP fault injection.
+        # With no fault active, the production Agent channel remains available.
+        self.lab.remote(
+            'compute',
+            'if sudo systemctl is-active --quiet brocade-lab-gate; then sudo systemctl restart brocade-lab-gate; fi',
+        )
 
     def wait(self, description, function, predicate=lambda x: bool(x), timeout=180):
         start = time.monotonic()
@@ -159,14 +172,14 @@ class Acceptance:
             address = next(t['sandboxIP'] for t in taps if t['ownerSandboxID'] == item['desired']['id'])
         return item, role, address
 
-    def guest(self, name, command, timeout=60):
+    def guest(self, name, command, timeout=60, *, cached_revision=None):
         item, role, address = self.guest_endpoint(name)
-        words = [
-            'ssh',
-            '-i',
-            self.prefix + '/guest.key',
-            '-o',
-            'IdentitiesOnly=yes',
+        if cached_revision is None:
+            words = self.prepare_guest_password(item, role)
+        else:
+            guest_password.validate_cached(self.output, item, cached_revision)
+            words = guest_password.ssh(self.prefix, item['desired']['id'])
+        words += [
             '-o',
             'StrictHostKeyChecking=accept-new',
             '-o',
@@ -315,41 +328,20 @@ class Acceptance:
                 {'enabled': True, 'expected_revision': host['host_revision']},
                 expected=200,
             )
-        quota = {
-            'tenant_id': 'platform',
-            'user_id': 'alice',
-            'enabled': True,
-            'allowed_nodes': list(self.state['nodes']),
-            'max_instances': 4,
-            'max_vcpus': 4,
-            'max_memory_bytes': 2 * 1024**3,
-            'max_disk_bytes': 20 * 1024**3,
-            'max_interfaces': 8,
-        }
-        quota['host_network_quotas'] = []
-        for node in self.state['nodes']:
-            limits = {'max_states': 100000, 'new_per_second': 1000, 'burst': 2000}
-            preview = self.call(
-                'POST',
-                '/cvm/quota/network/preview',
-                {'tenant_id': 'platform', 'user_id': 'alice', 'node_id': node, 'limits': limits},
-            )
-            assert preview['fits']
-            quota['host_network_quotas'].append(
-                {
-                    'node_id': node,
-                    'expected_revision': preview['revision'],
-                    'budget_revision': preview['budget_revision'],
-                    'limits': limits,
-                }
-            )
-        self.call('PUT', '/cvm/quota', quota, expected=204)
-        guest_key = self.output / 'guest.key'
-        if not guest_key.exists():
-            subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(guest_key)], check=True)
-        for role in ('compute', 'provider'):
-            self.lab.upload(role, guest_key, self.prefix + '/guest.key', 0o600)
-        self.record('actual host inventory, image-manifest upload and user resource authorization complete')
+        self.record(
+            'actual host inventory and image manifests ready; instances are administrator-created without user quotas'
+        )
+
+    def prepare_guest_password(self, item, role):
+        guest_password.prepare(
+            self.call,
+            self.output,
+            item,
+            lambda source, name, executable: self.lab.upload(
+                role, source, self.prefix + '/' + name, 0o700 if executable else 0o600
+            ),
+        )
+        return guest_password.ssh(self.prefix, item['desired']['id'])
 
     def create(self, name, node, resources=None):
         host = next(h for h in self.call('GET', '/cvm')['hosts'] if h['node_id'] == node)
@@ -361,7 +353,6 @@ class Acceptance:
             'name': name,
             'image_id': host['capabilities']['images'][0]['id'],
             'resources': resources or {'vcpus': 1, 'memory_bytes': 256 * 1024**2, 'root_disk_bytes': 3 * 1024**3},
-            'ssh_public_key': (self.output / 'guest.key.pub').read_text().strip(),
             'interfaces': [
                 {
                     'source_id': host['capabilities']['network_sources'][0]['id'],
@@ -447,46 +438,29 @@ class Acceptance:
             'compute', 'sudo sha256sum /var/lib/bc-' + self.lab.state['task'][:6] + '/wireguard.conf'
         ).stdout.decode()
         assert before == after and self.revision() == revision
-        assert not self.desired('compute-b')['instances']
-        self.record(
-            'runtime recovery starts actual Guest without changing ordinary WG bytes or global R; wave two stays gated'
-        )
-        self.call('POST', f'/deployments/{deployment}/waves/2/confirm', {'actor': None}, expected=(200, 202))
+        self.record('runtime recovery starts actual Guest without changing ordinary WG bytes or global R')
         self.complete(deployment, timeout=240)
         self.instance_ready('beta')
         self.record(
-            'explicit second-wave approval starts its real Guest and all mixed targets complete', deployment=deployment
+            'non-disruptive creation advances automatically to wave two only after wave one completes',
+            deployment=deployment,
         )
         self.native_guests()
 
     def finish_initial(self):
         self.complete(self.state['barrier_deployment'], timeout=240)
         self.record(
-            'explicit second-wave approval starts its real Guest and all mixed targets complete',
+            'non-disruptive creation advances automatically to wave two only after wave one completes',
             deployment=self.state['barrier_deployment'],
         )
         self.native_guests()
 
     def integrity_failure(self):
-        self.lab.python(
-            'compute',
-            'from pathlib import Path;p=Path('
-            + repr(self.prefix + '/console.env')
-            + ');s=p.read_text();p.write_text(s if "BROCADE_CVM_ARTIFACT_MODE=enforce" in s else s+"BROCADE_CVM_ARTIFACT_MODE=enforce\\n")',
-        )
-        self.lab.remote('compute', 'sudo systemctl restart brocade-lab-console')
-
-        def healthy():
-            try:
-                return urllib.request.urlopen(self.origin + '/healthz', timeout=5).status == 200
-            except OSError:
-                return False
-
-        self.wait('Console enforce mode', healthy)
         self.operation('alpha', 'restart')
         self.operation('beta', 'restart')
         revision = self.revision()
         boot = self.guest('alpha', 'cat /proc/sys/kernel/random/boot_id')
+        credential_revision = self.instance('alpha')['desired']['spec']['login_revision']
         before = self.lab.remote(
             'compute', 'sudo sha256sum /var/lib/bc-' + self.lab.state['task'][:6] + '/wireguard.conf'
         ).stdout.decode()
@@ -499,7 +473,7 @@ class Acceptance:
         )
         assert next(t for t in detail['targets'] if t['node_id'] == 'compute-a')['status'] == 'failed-dirty'
         assert next(t for t in detail['targets'] if t['node_id'] == 'compute-b')['status'] == 'pending'
-        assert self.guest('alpha', 'cat /proc/sys/kernel/random/boot_id') == boot
+        assert self.guest('alpha', 'cat /proc/sys/kernel/random/boot_id', cached_revision=credential_revision) == boot
         self.record(
             'Agent rejects actual corrupted native bytes before execution; failure halts later wave without rebooting Guest',
             deployment=deployment,
@@ -529,7 +503,14 @@ class Acceptance:
         revision = detail['revision_id']
         assert detail['status'] == 'halted'
         boot = self.state['native']['alpha']['boot']
-        assert self.guest('alpha', 'cat /proc/sys/kernel/random/boot_id') == boot
+        assert (
+            self.guest(
+                'alpha',
+                'cat /proc/sys/kernel/random/boot_id',
+                cached_revision=self.instance('alpha')['desired']['spec']['login_revision'],
+            )
+            == boot
+        )
         assert self.instance('alpha')['report']['status'] == 'failed'
         self.record(
             'real corrupted artifact rejection halts global release and leaves physical Guest boot unchanged',
@@ -623,7 +604,7 @@ print(json.dumps(out[0]))
             assert self.guest(name, 'printf %s ' + shlex.quote(marker) + ' > ~/acceptance; cat ~/acceptance') == marker
             bundle = self.call('GET', '/cvm/' + item['desired']['id'] + '/artifacts')['current']
             receipt = item['report']['artifacts']
-            assert receipt['mode'] in ('shadow', 'enforce') and not receipt['mismatches']
+            assert 'mode' not in receipt and not receipt['mismatches']
             assert receipt['input_sha256'] == bundle['input_sha256']
             assert len(bundle['files']) == len(receipt['files']) == 4
             self.state.setdefault('native', {})[name] = {
@@ -632,19 +613,27 @@ print(json.dumps(out[0]))
                 'volume': item['report']['volume_id'],
             }
             self.record(
-                'native four-artifact ' + receipt['mode'] + ', actual KVM FD, SSH and disk write: ' + name,
+                'native four-artifact execution, actual KVM FD, SSH and disk write: ' + name,
                 boot=boot,
                 **proof,
             )
 
     def change(self, suffix, body, name='alpha', method='PUT'):
         item = self.instance(name)
+        revision = self.revision()
         result = self.call(
             method,
             '/cvm/' + item['desired']['id'] + suffix,
             {'request_id': uuid.uuid4().hex, 'expected_generation': item['desired']['generation'], **body},
             expected=202,
         )
+        verification = self.call('POST', '/deployments/verify', {'revision_id': self.revision()})
+        if verification['summary']['changed_targets'] == 0:
+            assert result['desired']['generation'] == item['desired']['generation']
+            assert self.revision() == revision
+            self.instance_ready(name)
+            self.record('actual unchanged configuration keeps its generation and revision without an empty publication')
+            return result
         deployment = self.publish()
         self.complete(deployment, timeout=240)
         self.instance_ready(name)
@@ -727,12 +716,7 @@ threading.Event().wait()
         for name in ('alpha', 'beta'):
             item = self.instance(name)
             role = self.state['nodes'][item['node_id']]['role']
-            words = [
-                'ssh',
-                '-i',
-                self.prefix + '/guest.key',
-                '-o',
-                'IdentitiesOnly=yes',
+            words = self.prepare_guest_password(item, role) + [
                 '-o',
                 'StrictHostKeyChecking=accept-new',
                 '-o',
@@ -800,7 +784,11 @@ threading.Event().wait()
             {'destination': '::/0', 'interface_id': first['id']},
         ]
         self.change('/routes', {'expected_revision': routing['revision'], 'routes': routing})
+        self.finish_networks()
+
+    def finish_networks(self):
         self.network_ready()
+        first = self.state['nic']
         for protocol in ('tcp4', 'udp4', 'tcp6', 'udp6'):
             assert self.echo(protocol, 'wireguard-' + protocol) == 'wireguard-' + protocol
         self.record('actual cross-host WG business NIC carries IPv4 and IPv6 TCP and UDP')
@@ -862,7 +850,6 @@ threading.Event().wait()
             'beta',
             'reinstall',
             image_id=original['desired']['spec']['image']['id'],
-            ssh_public_key=(self.output / 'guest.key.pub').read_text().strip(),
         )
         self.complete(self.publish(), timeout=240)
         self.finish_reinstall()
@@ -1058,8 +1045,7 @@ threading.Event().wait()
     def entries(self):
         provider = self.lab.state['roles']['provider']['ipv4']
         whole = '198.51.100.211'
-        self.lab.upload('client', self.output / 'guest.key', self.prefix + '/guest.key', 0o600)
-        self.lab.remote('client', 'sudo ip route add ' + whole + '/32 via ' + provider + ' dev lab0')
+        self.lab.persist_routes('client', [(whole + '/32', provider)])
         spec = {
             'name': 'actual entry publication',
             'provider_node': 'compute-b',
@@ -1079,6 +1065,7 @@ threading.Event().wait()
             ],
             'grants': [{'tenant_id': 'platform', 'user_id': 'alice'}],
             'max_entries': 3,
+            'wireguard_transport': 'udp',
         }
         publication = self.call(
             'POST',
@@ -1088,8 +1075,28 @@ threading.Event().wait()
         )
         entries = []
         for address, mode in [
-            (provider, {'kind': 'l4', 'protocol': 'tcp', 'listen_port': 55080, 'target_port': 22}),
-            (provider, {'kind': 'l4', 'protocol': 'udp', 'listen_port': 55081, 'target_port': 18081}),
+            (
+                provider,
+                {
+                    'kind': 'l4_range',
+                    'protocol': 'tcp',
+                    'listen_start': 55080,
+                    'listen_end': 55080,
+                    'target_start': 22,
+                    'target_end': 22,
+                },
+            ),
+            (
+                provider,
+                {
+                    'kind': 'l4_range',
+                    'protocol': 'udp',
+                    'listen_start': 55081,
+                    'listen_end': 55081,
+                    'target_start': 18081,
+                    'target_end': 18081,
+                },
+            ),
             (whole, {'kind': 'l3'}),
         ]:
             entries.append(
@@ -1162,12 +1169,8 @@ threading.Event().wait()
         )
         self.guest('alpha', 'nohup ~/probe udp-server 0.0.0.0:18081 >~/entry.log 2>&1 </dev/null &')
         for address, port in [(provider, 55080), (whole, 22)]:
-            words = [
-                'ssh',
-                '-i',
-                self.prefix + '/guest.key',
-                '-o',
-                'IdentitiesOnly=yes',
+            item = self.instance('alpha')
+            words = self.prepare_guest_password(item, 'client') + [
                 '-o',
                 'StrictHostKeyChecking=accept-new',
                 '-o',
@@ -1278,7 +1281,7 @@ threading.Event().wait()
             expected=202,
         )
         revision = self.revision()
-        serving = self.desired('compute-a')['instances'][0]
+        serving = next(i for i in self.desired('compute-a')['instances'] if i['id'] == self.state['instances']['alpha'])
         assert serving['spec']['interfaces'][1]['allocated']['limits']['monthly_bytes'] == 512 * 1024
         assert serving['spec']['interfaces'][1]['allocated']['quota_exceeded']
         assert (
@@ -1299,6 +1302,10 @@ threading.Event().wait()
             lambda: self.instance('alpha'),
             lambda i: i['desired']['spec']['interfaces'][1]['allocated']['quota_exceeded'],
         )
+        self.instance_ready('alpha')
+        self.finish_traffic_quotas()
+
+    def finish_traffic_quotas(self):
         self.operation('alpha', 'stop')
         revision = self.revision()
         before_pending = self.instance('alpha')['desired']['generation']
@@ -1339,7 +1346,7 @@ threading.Event().wait()
     def transport_failure(self):
         self.lab.remote(
             'provider',
-            'sudo nft add table inet bckvm_fault && sudo nft "add chain inet bckvm_fault input { type filter hook input priority -100; policy accept; }" && sudo nft add rule inet bckvm_fault input iifname lab0 tcp dport 43000-43100 drop',
+            'sudo nft add table inet bckvm_fault && sudo nft "add chain inet bckvm_fault prerouting { type filter hook prerouting priority -300; policy accept; }" && sudo nft add rule inet bckvm_fault prerouting iifname lab0 tcp dport 43000-43100 counter drop',
         )
         item = self.instance('alpha')
         self.call(
@@ -1349,12 +1356,20 @@ threading.Event().wait()
             expected=202,
         )
         deployment = self.publish()
-        self.wait(
+        terminal = self.wait(
             'real broken Xray transport triggers fallback and release failure',
             lambda: self.detail(deployment),
-            lambda d: d['status'] == 'halted',
+            lambda d: d['status'] in ('halted', 'succeeded'),
             timeout=240,
         )
+        assert terminal['status'] == 'halted', 'the injected fault must prevent the requested transport from succeeding'
+        rules = json.loads(self.lab.remote('provider', 'sudo nft -j list chain inet bckvm_fault prerouting').stdout)
+        dropped = sum(
+            expression.get('counter', {}).get('packets', 0)
+            for item in rules['nftables']
+            for expression in item.get('rule', {}).get('expr', [])
+        )
+        assert dropped > 0, 'the owned firewall must have observed and dropped actual Xray connection attempts'
         self.wait(
             'real WG fallback identity',
             lambda: self.instance('alpha'),
@@ -1365,6 +1380,7 @@ threading.Event().wait()
         self.record(
             'real Xray port fault restores prior WG data path while original requested release stays failed',
             deployment=deployment,
+            dropped_connection_packets=dropped,
         )
         self.burn(count=150)
         self.wait(
@@ -1474,10 +1490,10 @@ threading.Event().wait()
         )
         replay = r"""import hashlib,json,pathlib,urllib.request
 root=pathlib.Path(ROOT);data=(root/'gate/compute-a-nic-withdrawing.json').read_bytes();token=(root/'node.token').read_text().strip()
-request=urllib.request.Request('http://127.0.0.1:8080/agent/v1/cvm/nics/report',method='POST',data=data,headers={'Authorization':'Bearer '+token,'Content-Type':'application/json','x-brocade-protocol-version':'75'})
+request=urllib.request.Request('http://127.0.0.1:8080/agent/v1/cvm/nics/report',method='POST',data=data,headers={'Authorization':'Bearer '+token,'Content-Type':'application/json','x-brocade-protocol-version':CURRENT_PROTOCOL})
 with urllib.request.urlopen(request,timeout=30) as response:result=json.load(response)
 print(json.dumps({'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data),'response':result,'traffic_samples':[b['traffic'] for b in json.loads(data)['bindings'] if b.get('traffic')]}))
-""".replace('ROOT', repr(self.prefix))
+""".replace('ROOT', repr(self.prefix)).replace('CURRENT_PROTOCOL', repr(AGENT_PROTOCOL_VERSION))
         result = json.loads(self.lab.python('compute', replay))
         assert result['traffic_samples']
         self.private('actual-final-receipt-replay.json', result)

@@ -12,14 +12,21 @@ fn apply(backend: &Backend, desired: &InstanceDesired) -> InstanceReport {
     let until = Instant::now() + Duration::from_secs(240);
     loop {
         let report = backend.submit(desired).unwrap();
-        if report.status != ApplyStatus::Pending {
+        if !matches!(report.status, ApplyStatus::Pending | ApplyStatus::Unknown) {
             return report;
         }
         assert!(
             Instant::now() < until,
-            "actual Guest did not converge before deadline"
+            "actual Guest did not converge before deadline: {:?}",
+            report.error
         );
         backend.wait_idle(Duration::from_secs(240)).unwrap();
+        // A newly booted Guest can be visible before its network confirmation
+        // succeeds. Replay the same frozen intent, as the Agent does, until the
+        // outcome is proven; a definite failure still returns immediately.
+        if report.status == ApplyStatus::Unknown {
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 }
 fn wait_guest_ssh(address: &str) {
@@ -43,18 +50,23 @@ fn guest_ssh(root: &std::path::Path, address: &str, command: &str) -> String {
             "20",
             "ssh",
             "-o",
-            "BatchMode=yes",
+            "BatchMode=no",
             "-o",
-            "IdentitiesOnly=yes",
+            "PreferredAuthentications=password",
+            "-o",
+            "PubkeyAuthentication=no",
             "-o",
             "StrictHostKeyChecking=accept-new",
             "-o",
             "HostKeyAlgorithms=ssh-ed25519",
             "-o",
             "ConnectTimeout=5",
-            "-i",
         ])
-        .arg(root.join("guest-key"))
+        .env("SSH_ASKPASS", root.join("ssh-askpass"))
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", ":0")
+        .env("BROCADE_CVM_KVM_PASSWORD_FILE", root.join("guest-password"))
+        .stdin(std::process::Stdio::null())
         .arg("-o")
         .arg(format!(
             "UserKnownHostsFile={}",
@@ -99,16 +111,6 @@ fn cube_artifact_real_guest_lifecycle() {
         .into_iter()
         .find(|m| m.sha256 == image.sha256)
         .unwrap();
-    assert!(std::process::Command::new("timeout")
-        .args(["15", "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f"])
-        .arg(root.path().join("guest-key"))
-        .status()
-        .unwrap()
-        .success());
-    let public_key = std::fs::read_to_string(root.path().join("guest-key.pub"))
-        .unwrap()
-        .trim()
-        .to_owned();
     let limits = caps.resource_limits.as_ref().unwrap();
     let id = format!(
         "cvm-artifacts-{}",
@@ -134,7 +136,9 @@ fn cube_artifact_real_guest_lifecycle() {
             memory_bytes: memory,
             root_disk_bytes: limits.min_root_disk_bytes,
         },
-        ssh_public_key: public_key,
+
+        login_revision: 1,
+        legacy_ssh_public_key: None,
         interfaces: vec![InterfaceSpec {
             id: "nic-contact".into(),
             allocated: None,
@@ -154,31 +158,33 @@ fn cube_artifact_real_guest_lifecycle() {
         routing: ContainerRoutes::default(),
     };
     let mut desired:InstanceDesired=serde_json::from_value(json!({"id":id,"operation_id":"op-create","generation":1,"spec_sha256":brocade_core::hash::sha256_hex(&serde_json::to_vec(&spec).unwrap()),"spec":spec,"power":"running","delete_data":false,"restart_epoch":0,"reinstall_epoch":0})).unwrap();
-    if std::env::var("BROCADE_CVM_ARTIFACT_KVM_BASELINE").as_deref() == Ok("legacy") {
-        let created = apply(&backend, &desired);
-        if created.status != ApplyStatus::Applied {
-            let path = root.keep();
-            panic!(
-                "legacy path did not boot: {:?}; evidence retained at {}",
-                created.error,
-                path.display()
-            );
-        }
-        println!("PASS: original specification path creates an actual Guest at {memory_mib} MiB");
-        desired.generation += 1;
-        desired.operation_id = "op-baseline-delete".into();
-        desired.power = PowerState::Deleted;
-        desired.delete_data = true;
-        let removed = apply(&backend, &desired);
-        if removed.status != ApplyStatus::Applied {
-            let path = root.keep();
-            panic!(
-                "legacy cleanup not confirmed; evidence retained at {}",
-                path.display()
-            );
-        }
-        return;
-    }
+    use base64::Engine;
+    let mut entropy = [0; 24];
+    getrandom::fill(&mut entropy).unwrap();
+    let password = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(entropy);
+    std::fs::write(root.path().join("guest-password"), &password).unwrap();
+    std::fs::set_permissions(
+        root.path().join("guest-password"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("ssh-askpass"),
+        b"#!/bin/sh\nexec cat -- \"$BROCADE_CVM_KVM_PASSWORD_FILE\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        root.path().join("ssh-askpass"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    backend
+        .stage_credential(&GuestCredential {
+            instance_id: desired.id.clone(),
+            revision: desired.spec.login_revision,
+            password,
+        })
+        .unwrap();
     let freeze = |d: &mut InstanceDesired| {
         d.spec_sha256 = brocade_core::hash::sha256_hex(&serde_json::to_vec(&d.spec).unwrap());
         d.artifacts = Some(
@@ -190,7 +196,6 @@ fn cube_artifact_real_guest_lifecycle() {
             })
             .unwrap(),
         );
-        d.artifact_mode = CvmArtifactMode::Enforce;
     };
     freeze(&mut desired);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

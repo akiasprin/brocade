@@ -77,8 +77,17 @@ func TestPlainInitializationAndOriginalDiskBinding(t *testing.T) {
 	if err = os.WriteFile(receiptPath, legacyData, 0600); err != nil {
 		t.Fatal(err)
 	}
+	f, err := os.OpenFile(volume.FilePath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = unix.Fallocate(int(f.Fd()), 0, 0, 1<<20)
+	f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err = checkPlainInitialization(volume.FilePath, volume.VolumeName, 1<<20); err == nil {
-		t.Fatal("legacy physical promise was ignored")
+		t.Fatal("obsolete receipt was accepted even with full physical allocation")
 	}
 	if err = os.WriteFile(receiptPath, receipt, 0600); err != nil {
 		t.Fatal(err)
@@ -99,7 +108,7 @@ func TestPlainInitializationAndOriginalDiskBinding(t *testing.T) {
 	if err = os.Rename(volume.FilePath, original); err != nil {
 		t.Fatal(err)
 	}
-	f, err := os.OpenFile(volume.FilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	f, err = os.OpenFile(volume.FilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if err != nil {
 		t.Fatal(err)
 	}

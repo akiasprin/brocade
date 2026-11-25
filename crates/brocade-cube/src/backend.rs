@@ -34,7 +34,6 @@ impl Drop for Owner {
 
 pub(crate) struct Inner {
     pub(crate) cfg: Config,
-    pub(crate) images: BTreeMap<String, Value>,
     pub(crate) root: PathBuf,
     pub(crate) rpc: Rpc,
     pub(crate) runtime: tokio::runtime::Runtime,
@@ -109,7 +108,7 @@ impl Backend {
         records: BTreeMap<String, Record>,
         lock: Option<File>,
     ) -> Result<Self> {
-        let (cfg, images) = Config::load(config)?;
+        let cfg = Config::load(config)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -128,7 +127,6 @@ impl Backend {
         Ok(Self(Arc::new(Owner {
             inner: Arc::new(Inner {
                 cfg,
-                images,
                 root: state,
                 rpc,
                 runtime,
@@ -167,6 +165,17 @@ impl Backend {
         }
         capabilities.validate()?;
         Ok(capabilities)
+    }
+
+    /// Stage an authenticated secret separately from public desired state and receipts.
+    pub fn stage_credential(&self, credential: &GuestCredential) -> Result<()> {
+        credential.validate()?;
+        let directory = self.0.inner.root.join("credentials");
+        files::private_dir(&directory)?;
+        files::atomic_json(
+            &directory.join(format!("{}.json", credential.instance_id)),
+            credential,
+        )
     }
 
     pub fn submit(&self, desired: &InstanceDesired) -> Result<InstanceReport> {
@@ -367,9 +376,7 @@ impl Inner {
             };
             let result = match self.artifact_receipt(&desired) {
                 Ok(receipt) => {
-                    let mut result = if desired.artifact_mode == CvmArtifactMode::Enforce
-                        && receipt.as_ref().is_some_and(|r| !r.mismatches.is_empty())
-                    {
+                    let mut result = if receipt.as_ref().is_some_and(|r| !r.mismatches.is_empty()) {
                         report(&desired, ApplyStatus::Failed, Some("Cube artifacts differ from verified local executor inputs; no changes applied"))
                     } else {
                         self.reconcile(&mut record, &desired)

@@ -75,6 +75,12 @@ pub fn compile_chain_client(
             "sniffing":{"enabled":true,"destOverride":["http","tls","quic"],"routeOnly":false}
         }]);
         config["log"] = json!({"loglevel":"info","access":"none"});
+        for outbound in config["outbounds"]
+            .as_array_mut()
+            .ok_or("chain client outbounds missing")?
+        {
+            outbound["streamSettings"]["sockopt"]["mark"] = json!(CHAIN_CLIENT_SOCKET_MARK);
+        }
         config["routing"] = json!({"domainStrategy":"AsIs","rules":[{
             "type":"field","inboundTag":["chain-egress"],"network":"tcp,udp","outboundTag":"probe-out"
         }]});
@@ -91,6 +97,7 @@ pub fn compile_chain_client(
     let redacted = render(&safe)?;
     let mut artifact = ChainClientArtifact {
         blocked: false,
+        host_system: false,
         instance_id: instance.into(),
         chain_id: target.chain_id.clone(),
         tenant_id: tenant.into(),
@@ -211,8 +218,7 @@ pub fn primary_network_policy(routing: &ContainerRoutes) -> Value {
     }
     json!({"allow_internet_access":true,"allow_out":[],"deny_out":denied,"rules":[]})
 }
-/// Exact legacy renderer retained for shadow verification; local runtime facts bind later.
-pub fn sandbox_request(
+fn sandbox_request(
     instance: &str,
     spec: &InstanceSpec,
     normalized: &Value,
@@ -224,11 +230,6 @@ pub fn sandbox_request(
     request["namespace"] = json!("default");
     request["backend"] = json!(backend);
     request["exposed_ports"] = json!([]);
-    request["cube_network_config"] = if spec.routing.chain_ids().is_empty() {
-        primary_network_policy(&spec.routing)
-    } else {
-        json!({"allow_internet_access":false,"allow_out":[],"deny_out":["0.0.0.0/0"],"rules":[]})
-    };
     request["annotations"]["cube.master.desired.sandbox.id"] = json!(instance);
     request["labels"] = json!({"brocade.cvm.instance":instance});
     request["containers"][0]["resources"] = json!({"cpu":format!("{}m",u64::from(resources.vcpus)*1000),"mem":format!("{}Mi",resources.memory_bytes/(1024*1024))});
@@ -265,9 +266,9 @@ pub fn compile(input: &CvmArtifactInput) -> Result<CvmArtifactBundle> {
         .validate_resources(&input.spec.resources)?;
     if input.spec.interfaces.len() > MAX_INTERFACES
         || input.spec.interfaces.len() > usize::from(input.capabilities.max_interfaces)
-        || !valid_public_key(&input.spec.ssh_public_key)
+        || input.spec.login_revision == 0
     {
-        return Err("Cube interfaces or SSH public key invalid".into());
+        return Err("Cube interfaces or credential revision invalid".into());
     }
     let backend = input
         .capabilities
@@ -321,7 +322,8 @@ pub fn compile(input: &CvmArtifactInput) -> Result<CvmArtifactBundle> {
     }
     let normalized = normalize_image(&input.image_manifest)?;
     let mut sandbox = sandbox_request(&input.instance_id, &input.spec, &normalized, backend)?;
-    // The policy is an independently hot-applied product; omit it from boot identity.
+    // Egress is a separately hot-applied product. Binding installs its initial
+    // policy before creation without adding route changes to the boot identity.
     sandbox
         .as_object_mut()
         .ok_or("Cube request is not an object")?
@@ -349,7 +351,7 @@ pub fn compile(input: &CvmArtifactInput) -> Result<CvmArtifactBundle> {
     if !bindings.is_empty() {
         attachments["chain_egress"] = json!(bindings);
     }
-    let guest = json!({"contract":"brocade-guest-init-v1","user":"cube","ssh_public_key":input.spec.ssh_public_key,"regenerate_host_keys_once":true});
+    let guest = json!({"contract":"brocade-guest-init-v2","user":"cube","credential_revision":input.spec.login_revision,"regenerate_host_keys_once":true});
     let mut files = Vec::new();
     for (kind, value) in [
         (CvmArtifactKind::Sandbox, sandbox),
@@ -466,17 +468,26 @@ fn valid_local(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
-/// Fixed executor: declarations cannot supply shell text, users, paths or arbitrary commands.
-pub const INIT_SCRIPT: &str = r#"set -eu; id cube >/dev/null; install -d -m 0700 -o cube -g cube /home/cube/.ssh; printf '%s\n' "$1" > /home/cube/.ssh/authorized_keys; chown cube:cube /home/cube/.ssh/authorized_keys; chmod 0600 /home/cube/.ssh/authorized_keys; install -d -m 0700 /root/.ssh; if [ ! -e /root/.ssh/brocade-initialized ]; then rm -f /etc/ssh/ssh_host_*; ssh-keygen -A; touch /root/.ssh/brocade-initialized; if [ -s /run/sshd.pid ]; then kill -HUP "$(cat /run/sshd.pid)"; fi; fi"#;
-pub fn guest_key(value: &Value) -> Result<&str> {
-    if value["contract"] != "brocade-guest-init-v1"
-        || value["user"] != "cube"
-        || value["regenerate_host_keys_once"] != true
-    {
-        return Err("unsupported Guest init contract".into());
-    }
-    value["ssh_public_key"]
-        .as_str()
-        .filter(|key| valid_public_key(key))
-        .ok_or_else(|| "invalid Guest initialization key".into())
-}
+/// Credentials are supplied through a separate private channel, never compiled into this script.
+pub const PASSWORD_INIT_SCRIPT: &str = r#"set -eu
+id cube >/dev/null
+IFS= read -r password
+printf 'cube:%s\n' "$password" | chpasswd
+unset password
+rm -f /home/cube/.ssh/authorized_keys
+install -d -m 0700 /root/.ssh
+if [ ! -e /root/.ssh/brocade-initialized ]; then
+  rm -f /etc/ssh/ssh_host_*
+  ssh-keygen -A
+  touch /root/.ssh/brocade-initialized
+fi
+sed -i '/^# BROCADE PASSWORD BEGIN$/,/^# BROCADE PASSWORD END$/d' /etc/ssh/sshd_config
+umask 077
+config=$(mktemp /etc/ssh/.brocade-sshd.XXXXXX)
+trap 'rm -f "$config"' EXIT
+printf '# BROCADE PASSWORD BEGIN\nPasswordAuthentication yes\n# BROCADE PASSWORD END\n' > "$config"
+cat /etc/ssh/sshd_config >> "$config"
+/usr/sbin/sshd -t -f "$config"
+cat "$config" > /etc/ssh/sshd_config
+if [ -s /run/sshd.pid ]; then kill -HUP "$(cat /run/sshd.pid)"; fi
+"#;

@@ -33,6 +33,54 @@ pub(super) fn require_owner(
     Ok(())
 }
 
+pub(super) fn require_manager(actor: &AdminContext, tenant: &str) -> Result<()> {
+    if !matches!(
+        actor.role(),
+        AdminRole::SystemAdmin | AdminRole::TenantAdmin
+    ) || !(actor.is_global_scope() || actor.can_access_tenant(tenant))
+    {
+        return Err(StoreError::Forbidden(
+            "只有作用域内管理员可以管理容器".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) async fn require_host_manager(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &AdminContext,
+    node: &str,
+) -> Result<()> {
+    let tenant: String =
+        sqlx::query_scalar("SELECT tenant_id FROM nodes WHERE id=$1 AND retired_at IS NULL")
+            .bind(node)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| StoreError::NotFound("宿主".into()))?;
+    require_manager(actor, &tenant)
+}
+
+pub(super) async fn check_assignee(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: &str,
+    user: Option<&str>,
+) -> Result<()> {
+    if let Some(user) = user {
+        let active: bool = sqlx::query_scalar(
+            "SELECT status='active' FROM users WHERE tenant_id=$1 AND id=$2 FOR UPDATE",
+        )
+        .bind(tenant)
+        .bind(user)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| StoreError::NotFound("user".into()))?;
+        if !active {
+            return Err(StoreError::Forbidden("用户已停用".into()));
+        }
+    }
+    Ok(())
+}
+
 pub(super) const READ_SCOPE: &str = "($1::text IS NULL OR tenant_id=$1 OR ($3::text IS NULL AND tenant_id LIKE $2 ESCAPE E'\\\\')) AND ($3::text IS NULL OR user_id=$3)";
 
 pub(super) fn read_scope(
@@ -60,7 +108,7 @@ pub(super) fn redact(actor: &AdminContext, item: &mut CvmInstance) {
         return;
     }
     item.desired.artifacts = None;
-    item.desired.spec.ssh_public_key.clear();
+    item.desired.spec.legacy_ssh_public_key = None;
     for nic in &mut item.desired.spec.interfaces {
         if let Some(allocated) = &mut nic.allocated {
             allocated.mac.clear();
@@ -81,4 +129,20 @@ pub(super) fn redact(actor: &AdminContext, item: &mut CvmInstance) {
             nic.mac.clear();
         }
     }
+}
+
+/// Historical configuration cannot restore an earlier user's execution identity.
+pub(super) async fn ensure_access_generation(
+    tx: &mut Transaction<'_, Postgres>,
+    id: &str,
+    generation: u64,
+) -> Result<()> {
+    let stale: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM cvm_instance_access_events WHERE instance_id=$1 AND generation>$2)")
+        .bind(id).bind(generation as i64).fetch_one(&mut **tx).await?;
+    if stale {
+        return Err(StoreError::Conflict(
+            "容器使用授权已更新，请先发布当前授权变更；旧执行版本不可恢复访问身份".into(),
+        ));
+    }
+    Ok(())
 }

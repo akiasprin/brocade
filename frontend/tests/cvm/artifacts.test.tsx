@@ -14,13 +14,11 @@ afterEach(() => {
 function show(
   history = artifactHistory(),
   mismatch = false,
-  mode: 'shadow' | 'enforce' = 'shadow',
   prepare?: (instance: CvmInstance, history: CvmArtifactHistory) => void,
 ) {
   const instance = cvmWorkspace('detail', 'system-admin').instances[0];
   instance.desired.generation = history.generation;
   artifactReceipt(instance, mismatch);
-  instance.report!.artifacts!.mode = mode;
   prepare?.(instance, history);
   const calls: string[] = [];
   vi.stubGlobal(
@@ -41,7 +39,7 @@ function show(
 }
 it('fetches one authorized generation lazily and compares canonical artifact content', async () => {
   const { instance, calls } = show();
-  expect(await screen.findByText(/影子比对一致/)).toBeTruthy();
+  expect(await screen.findByText('产物校验通过，已按这一代产物执行')).toBeTruthy();
   expect(calls).toEqual([`/cvm/${instance.desired.id}/artifacts?generation=${instance.desired.generation}`]);
   fireEvent.click(screen.getByRole('button', { name: /网卡附件/ }));
   expect(screen.getByLabelText('产物差异').textContent).toContain('+');
@@ -50,10 +48,17 @@ it('fetches one authorized generation lazily and compares canonical artifact con
   expect(screen.getByLabelText('产物全文').textContent).toBe(artifactHistory().current!.files[2].content);
   expect(screen.getByText('尚无已确认的生效摘要')).toBeTruthy();
 });
-it('shows shadow mismatches without claiming an enforced application', async () => {
+it('shows validation failures without claiming execution', async () => {
   show(artifactHistory(), true);
-  expect(await screen.findByText(/影子比对不一致/)).toBeTruthy();
-  expect(screen.queryByText('Console 产物执行')).toBeNull();
+  expect(await screen.findByText(/产物校验不一致.*本轮已拒绝执行/)).toBeTruthy();
+  expect(screen.queryByText('产物校验通过，已按这一代产物执行')).toBeNull();
+});
+it('does not present a verified product as completed execution after a runtime failure', async () => {
+  show(artifactHistory(), false, instance => {
+    instance.report!.status = 'failed';
+  });
+  expect(await screen.findByText('产物校验通过，尚未确认执行完成')).toBeTruthy();
+  expect(screen.queryByText('产物校验通过，已按这一代产物执行')).toBeNull();
 });
 it('does not fabricate compiled history for a legacy generation', async () => {
   show({ generation: 1, current: null, previous: null });
@@ -61,16 +66,10 @@ it('does not fabricate compiled history for a legacy generation', async () => {
   expect(screen.queryByRole('button', { name: '复制产物' })).toBeNull();
 });
 
-it('enforced mismatch explains refusal instead of claiming a legacy fallback', async () => {
-  show(artifactHistory(), true, 'enforce');
-  expect(await screen.findByText(/产物校验不一致.*本轮已拒绝执行/)).toBeTruthy();
-  expect(screen.queryByText(/仍由原规格路径执行/)).toBeNull();
-});
-
 it.each(['stop', 'restart'] as const)(
   'does not reuse a preceding receipt for a pending %s with identical products',
   async action => {
-    show(artifactHistory(), false, 'enforce', (instance, history) => {
+    show(artifactHistory(), false, (instance, history) => {
       instance.report!.artifacts!.files[0].effective_sha256 = 'e'.repeat(64);
       instance.report!.artifacts!.files[0].bindings = { runtime_id: 'previous-runtime' };
       instance.desired.generation += 1;
@@ -80,8 +79,8 @@ it.each(['stop', 'restart'] as const)(
       instance.status = 'pending';
       history.generation = instance.desired.generation;
     });
-    expect(await screen.findByText('尚无这一代的产物比对回执')).toBeTruthy();
-    expect(screen.queryByText('Console 产物执行')).toBeNull();
+    expect(await screen.findByText('尚无这一代的产物校验回执')).toBeTruthy();
+    expect(screen.queryByText('产物校验通过，已按这一代产物执行')).toBeNull();
     expect(screen.queryByText('e'.repeat(64))).toBeNull();
     expect(screen.queryByText('执行绑定值')).toBeNull();
     expect(screen.getByText('尚无已确认的生效摘要')).toBeTruthy();
@@ -91,30 +90,30 @@ it.each(['stop', 'restart'] as const)(
 it.each(['generation', 'operation_id', 'input_sha256'] as const)(
   'requires matching %s even when the other receipt identities match',
   async field => {
-    show(artifactHistory(), true, 'enforce', instance => {
+    show(artifactHistory(), true, instance => {
       if (field === 'generation') instance.report!.generation -= 1;
       else if (field === 'operation_id') instance.report!.operation_id = 'another-operation';
       else instance.report!.artifacts!.input_sha256 = 'f'.repeat(64);
     });
-    expect(await screen.findByText('尚无这一代的产物比对回执')).toBeTruthy();
+    expect(await screen.findByText('尚无这一代的产物校验回执')).toBeTruthy();
     expect(screen.queryByText(/本轮已拒绝执行/)).toBeNull();
   },
 );
 
 it('shows the current operation receipt when it arrives after a stale report', async () => {
-  const { instance, refresh } = show(artifactHistory(), false, 'enforce', (instance, history) => {
+  const { instance, refresh } = show(artifactHistory(), false, (instance, history) => {
     instance.desired.generation += 1;
     instance.desired.operation_id = 'current-restart';
     instance.status = 'pending';
     history.generation = instance.desired.generation;
   });
-  expect(await screen.findByText('尚无这一代的产物比对回执')).toBeTruthy();
+  expect(await screen.findByText('尚无这一代的产物校验回执')).toBeTruthy();
   instance.report!.generation = instance.desired.generation;
   instance.report!.operation_id = instance.desired.operation_id;
   instance.report!.artifacts!.files[0].effective_sha256 = 'e'.repeat(64);
   instance.status = 'applied';
   refresh();
-  expect(await screen.findByText('Console 产物执行')).toBeTruthy();
+  expect(await screen.findByText('产物校验通过，已按这一代产物执行')).toBeTruthy();
   expect(screen.getByText('e'.repeat(64))).toBeTruthy();
   expect(screen.getByText('执行绑定值')).toBeTruthy();
 });

@@ -77,11 +77,11 @@ fn virtualization_switch_requires_exclusive_drained_state_and_no_runtime() {
     fixture.backend.take();
     brocade_cube::Backend::inspect_empty(&fixture.config, &fixture.records).unwrap();
     let record = fixture.records.join("owned.json");
-    std::fs::write(&record, br#"{"instance":"owned","runtime":"","volume":"","launch_sha256":"","boot_sha256":"","spec_sha256":"","contact_id":"","native_shim_version":"","actual_vcpus":0,"actual_memory_bytes":0,"generation":0,"restart_epoch":0,"reinstall_epoch":0,"reinstall_reset_epoch":0,"transition":"","host_boot_id":"","attempted":false,"initialized":false,"deleted":false,"detached_interfaces":[],"objects":[],"last_interfaces":[],"report":null}"#).unwrap();
+    std::fs::write(&record, br#"{"sandbox_sha256":"","sandbox_effective_sha256":"","sandbox_bindings":{},"login_revision":0,"instance":"owned","runtime":"","volume":"","launch_sha256":"","boot_sha256":"","spec_sha256":"","contact_id":"","native_shim_version":"","actual_vcpus":0,"actual_memory_bytes":0,"generation":0,"restart_epoch":0,"reinstall_epoch":0,"reinstall_reset_epoch":0,"transition":"","host_boot_id":"","attempted":false,"initialized":false,"deleted":false,"detached_interfaces":[],"objects":[],"last_interfaces":[],"report":null}"#).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert!(brocade_cube::Backend::inspect_empty(&fixture.config, &fixture.records).is_err());
-    std::fs::write(&record, br#"{"instance":"owned","runtime":"","volume":"","launch_sha256":"","boot_sha256":"","spec_sha256":"","contact_id":"","native_shim_version":"","actual_vcpus":0,"actual_memory_bytes":0,"generation":0,"restart_epoch":0,"reinstall_epoch":0,"reinstall_reset_epoch":0,"transition":"","host_boot_id":"","attempted":false,"initialized":false,"deleted":true,"detached_interfaces":[],"objects":[],"last_interfaces":[],"report":null}"#).unwrap();
+    std::fs::write(&record, br#"{"sandbox_sha256":"","sandbox_effective_sha256":"","sandbox_bindings":{},"login_revision":0,"instance":"owned","runtime":"","volume":"","launch_sha256":"","boot_sha256":"","spec_sha256":"","contact_id":"","native_shim_version":"","actual_vcpus":0,"actual_memory_bytes":0,"generation":0,"restart_epoch":0,"reinstall_epoch":0,"reinstall_reset_epoch":0,"transition":"","host_boot_id":"","attempted":false,"initialized":false,"deleted":true,"detached_interfaces":[],"objects":[],"last_interfaces":[],"report":null}"#).unwrap();
     brocade_cube::Backend::inspect_empty(&fixture.config, &fixture.records).unwrap();
     fixture
         .state
@@ -422,4 +422,52 @@ fn independent_observation_preserves_device_identity_and_cumulative_counters() {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn password_credentials_are_private_versioned_and_do_not_recreate_the_root_disk() {
+    let fixture = Fixture::new();
+    let mut desired = fixture.desired();
+
+    desired.spec.login_revision = 1;
+    desired.spec_sha256 =
+        brocade_core::hash::sha256_hex(&serde_json::to_vec(&desired.spec).unwrap());
+    let credential = GuestCredential {
+        instance_id: desired.id.clone(),
+        revision: 1,
+        password: "Abcde0123456789_Abcde0123456789_".into(),
+    };
+    fixture.compile(&mut desired);
+    fixture.backend().stage_credential(&credential).unwrap();
+    fixture.backend().submit(&desired).unwrap();
+    assert_eq!(fixture.report(1)["status"], "applied");
+    let creates = fixture.state.lock().unwrap().creates;
+    let calls = fixture.guest_calls.load(Ordering::Acquire);
+    fixture.backend().submit(&desired).unwrap();
+    fixture.report(1);
+    assert_eq!(fixture.guest_calls.load(Ordering::Acquire), calls);
+    desired.generation = 2;
+    desired.operation_id = "op-password-2".into();
+    desired.spec.login_revision = 2;
+    desired.spec_sha256 =
+        brocade_core::hash::sha256_hex(&serde_json::to_vec(&desired.spec).unwrap());
+    let next = GuestCredential {
+        instance_id: desired.id.clone(),
+        revision: 2,
+        password: "Zyxwv0987654321_Zyxwv0987654321_".into(),
+    };
+    fixture.compile(&mut desired);
+    fixture.backend().stage_credential(&next).unwrap();
+    fixture.backend().submit(&desired).unwrap();
+    assert_eq!(fixture.report(2)["status"], "applied");
+    assert_eq!(fixture.state.lock().unwrap().creates, creates);
+    assert!(fixture.guest_calls.load(Ordering::Acquire) > calls);
+    let record = std::fs::read_to_string(fixture.records.join("cvm-test.json")).unwrap();
+    assert!(!record.contains(&credential.password) && !record.contains(&next.password));
+    use std::os::unix::fs::PermissionsExt;
+    let secret = fixture.records.join("credentials/cvm-test.json");
+    assert_eq!(
+        std::fs::metadata(secret).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }

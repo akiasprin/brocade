@@ -65,7 +65,9 @@ test('draft notice blurs the backdrop and keeps an opaque fallback on desktop an
     /@supports \(backdrop-filter: blur\(1px\)\) or \(-webkit-backdrop-filter: blur\(1px\)\)\s*\{\s*\.fg-draft\s*\{\s*background: color-mix\(in srgb, var\(--gold\) 8%, var\(--float-sheet\)\);/,
   );
   assert.match(rule('.fg-draft-head .note'), /color: var\(--ink-2\);/);
-  const mobile = styles.match(/^[ \t]+\.forge\.narrow \.fg-draft \{([^}]+)\}/m)?.[1];
+  const mobile = styles.match(
+    /^[ \t]+\.forge\.narrow \.fg-draft:not\(\.cvm-pending-changes, \.cvm-resource-draft\) \{([^}]+)\}/m,
+  )?.[1];
   assert.ok(mobile, 'mobile draft rule exists');
   assert.match(mobile, /position: fixed;/);
   assert.doesNotMatch(mobile, /background:/, 'mobile inherits the same readable material');

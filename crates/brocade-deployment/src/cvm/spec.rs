@@ -76,7 +76,6 @@ impl ResourceLimits {
 #[serde(rename_all = "snake_case")]
 pub enum NetworkKind {
     Public,
-    Internal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,16 +117,98 @@ pub struct InterfaceSpec {
     pub connection: InterfaceRequest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "InstanceSpecFields")]
 pub struct InstanceSpec {
-    #[serde(default, skip_serializing_if = "ExecutionTarget::is_cube")]
     pub execution: ExecutionTarget,
-    #[serde(default)]
     pub routing: ContainerRoutes,
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<Image>,
     pub resources: Resources,
-    pub ssh_public_key: String,
+    /// Reference to a separately delivered secret; Cube requires a nonzero revision.
+    pub login_revision: u64,
+    /// Retained only when reading the published key-based format. Never create new key-based specs.
+    pub legacy_ssh_public_key: Option<String>,
     pub interfaces: Vec<InterfaceSpec>,
+}
+
+#[derive(Deserialize)]
+struct InstanceSpecFields {
+    execution: Option<ExecutionTarget>,
+    routing: Option<ContainerRoutes>,
+    name: String,
+    image: Option<Image>,
+    resources: Resources,
+    #[serde(default, deserialize_with = "present_login_revision")]
+    login_revision: Option<u64>,
+    ssh_public_key: Option<String>,
+    interfaces: Vec<InterfaceSpec>,
+}
+
+fn present_login_revision<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
+}
+
+impl TryFrom<InstanceSpecFields> for InstanceSpec {
+    type Error = String;
+
+    fn try_from(fields: InstanceSpecFields) -> Result<Self, Self::Error> {
+        let legacy = fields.login_revision.is_none() && fields.ssh_public_key.is_some();
+        let execution = fields
+            .execution
+            .or_else(|| legacy.then_some(ExecutionTarget::Cube))
+            .ok_or("missing field `execution`")?;
+        let routing = fields
+            .routing
+            .or_else(|| legacy.then(ContainerRoutes::default))
+            .ok_or("missing field `routing`")?;
+        let login_revision = fields
+            .login_revision
+            .or_else(|| legacy.then_some(0))
+            .ok_or("missing field `login_revision`")?;
+        Ok(Self {
+            execution,
+            routing,
+            name: fields.name,
+            image: fields.image,
+            resources: fields.resources,
+            login_revision,
+            legacy_ssh_public_key: if legacy { fields.ssh_public_key } else { None },
+            interfaces: fields.interfaces,
+        })
+    }
+}
+
+impl Serialize for InstanceSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let legacy_key = self
+            .legacy_ssh_public_key
+            .as_ref()
+            .filter(|_| self.login_revision == 0);
+        let execution = legacy_key.is_none() || !self.execution.is_cube();
+        let mut fields = serializer.serialize_struct(
+            "InstanceSpec",
+            5 + usize::from(execution) + usize::from(self.image.is_some()),
+        )?;
+        // Published specification hashes cover these exact field bytes and their order.
+        if execution {
+            fields.serialize_field("execution", &self.execution)?;
+        }
+        fields.serialize_field("routing", &self.routing)?;
+        fields.serialize_field("name", &self.name)?;
+        if let Some(image) = &self.image {
+            fields.serialize_field("image", image)?;
+        }
+        fields.serialize_field("resources", &self.resources)?;
+        if let Some(key) = legacy_key {
+            fields.serialize_field("ssh_public_key", key)?;
+        } else {
+            fields.serialize_field("login_revision", &self.login_revision)?;
+        }
+        fields.serialize_field("interfaces", &self.interfaces)?;
+        fields.end()
+    }
 }

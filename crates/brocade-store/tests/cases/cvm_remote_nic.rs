@@ -10,23 +10,15 @@ async fn setup(db: &TestPg) {
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
     );
     prepare(db).await;
-    let mut policy = quota();
-    policy.max_instances = 8;
-    policy.max_vcpus = 8;
-    policy.max_memory_bytes = 4 * 1024 * 1024 * 1024;
-    policy.max_disk_bytes = 32 * 1024 * 1024 * 1024;
-    policy.max_interfaces = 32;
-    db.store
-        .set_cvm_quota(&system_admin(), policy)
-        .await
-        .unwrap();
     sqlx::query("INSERT INTO nodes(id,tenant_id,name,public_ipv4,overlay_addr,wg_private_key,wg_public_key,wg_listen_port,api_port,overlay,egress_allowed,dns_kind) VALUES('n2','platform.acme','Network provider','198.51.100.20','10.66.0.2','fixture-private','fixture-public',51821,10086,true,true,'system')").execute(db.pool()).await.unwrap();
     for node in ["n1", "n2"] {
         db.store
             .cvm_record_nic_capabilities(
                 node,
                 NicNodeCapabilities {
-                    contract: NIC_PROTOCOL_VERSION,
+                    entry_protocol_rules: true,
+                    ssh_ports: Vec::new(),
+                    contract: NIC_CONTRACT_VERSION,
                     transports: vec![TransportKind::Wireguard, TransportKind::Xray],
                     consume: node == "n1",
                     provide: true,
@@ -116,7 +108,7 @@ async fn create(db: &TestPg, key: &str) -> CvmInstance {
         supersede_cvm_fixture(db).await;
         &db.store
     })
-    .create_cvm(&actor_user("alice"), request)
+    .create_cvm(&system_admin(), request)
     .await
     .unwrap();
     acknowledge_guest(db, &instance).await;
@@ -127,18 +119,87 @@ async fn create(db: &TestPg, key: &str) -> CvmInstance {
         .await
         .unwrap()
 }
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_route_match_selects_temporary_mounts_on_the_compiled_draft() {
+    use brocade_store::cvm::CvmRouteMatchRequest;
+
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    let publication = publish(&db).await;
+    let instance = create(&db, "match-temp-nic-create-0001").await;
+    supersede_cvm_fixture(&db).await;
+    let id = &instance.desired.id;
+    let revision = instance.desired.spec.routing.revision;
+    let mut draft = json!({
+        "request_id":"match-temp-nic-request-0001",
+        "expected_generation":instance.desired.generation,
+        "mounts":[{"draft_id":"draft-first","publication_id":publication.id,"transport":"wireguard"}],
+        "routes":{"expected_revision":revision,"routes":{
+            "revision":revision,"dns":[],"priorities":[{"interface_id":"draft-first","ipv4":9}],
+            "routes":[{"destination":"203.0.113.0/24","interface_id":"draft-first"},{"destination":"0.0.0.0/0","interface_id":"draft-first"}]
+        }}
+    });
+    let request = |draft| {
+        serde_json::from_value::<CvmRouteMatchRequest>(
+            json!({"destination":"203.0.113.9","protocol":"tcp","port":443,"network_edit":draft}),
+        )
+        .unwrap()
+    };
+    let result = db
+        .store
+        .match_cvm_route(&system_admin(), id, request(draft.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(result).unwrap(),
+        json!({"kind":"route","route_index":0,"priority":9,
+        "route":{"destination":"203.0.113.0/24","interface_id":"draft-first"}})
+    );
+    // An implicit mount preset can also win; the response still uses the draft NIC identity.
+    draft.as_object_mut().unwrap().remove("routes");
+    let result = db
+        .store
+        .match_cvm_route(&system_admin(), id, request(draft))
+        .await
+        .unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    assert_eq!(
+        result["route"],
+        json!({"destination":"0.0.0.0/0","interface_id":"draft-first"})
+    );
+    let after = db.store.cvm_instance(&system_admin(), id).await.unwrap();
+    assert_eq!(after.desired, instance.desired);
+    assert_eq!(after.revision_id, instance.revision_id);
+    let allocations: i64 = sqlx::query_scalar("SELECT count(*) FROM cvm_nic_allocations")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(allocations, 0);
+}
+
 async fn create_native(db: &TestPg, key: &str) -> CvmInstance {
     let mut capabilities = super::baremetal_tests::native_catalogue();
     capabilities.managed_networks = true;
     capabilities.configure_network = true;
     capabilities.hot_attach = true;
     capabilities.hot_detach = true;
-    let identity = capabilities.baremetal.as_ref().unwrap().identity.clone();
+    let identity = capabilities
+        .host_system
+        .as_ref()
+        .unwrap()
+        .identity
+        .as_ref()
+        .unwrap()
+        .clone();
     db.store
         .cvm_record_inventory(
             "n1",
             InventoryReport {
                 capabilities,
+                terminal_sessions_used: None,
                 error: None,
             },
         )
@@ -153,7 +214,7 @@ async fn create_native(db: &TestPg, key: &str) -> CvmInstance {
         CvmAdopt {
             request_id: key.into(),
             tenant_id: "platform.acme".into(),
-            user_id: "alice".into(),
+            user_id: Some("alice".into()),
             node_id: "n1".into(),
             name: "Running host".into(),
             identity,
@@ -355,7 +416,7 @@ async fn cvm_remote_nic_provider_names_follow_publications_and_owned_allocations
         &db.store
     })
     .mount_cvm_nic(
-        &actor_user("alice"),
+        &system_admin(),
         &instance.desired.id,
         mount_request(&instance, &p, "provider-name-mount-0001"),
     )
@@ -445,7 +506,7 @@ async fn cvm_remote_nic_reuse_concurrent_allocations_replay_and_scope() {
     let b = create(&db, "container-network-b-0001").await;
     let first = mount_request(&a, &p, "mount-network-a-0001");
     let second = mount_request(&b, &p, "mount-network-b-0001");
-    let actor = actor_user("alice");
+    let actor = system_admin();
     let (a, b) = tokio::join!(
         ({
             supersede_cvm_fixture(&db).await;
@@ -475,7 +536,7 @@ async fn cvm_remote_nic_reuse_concurrent_allocations_replay_and_scope() {
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .mount_cvm_nic(&actor, &a.desired.id, first)
+    .mount_cvm_nic(&system_admin(), &a.desired.id, first)
     .await
     .unwrap();
     assert_eq!(replay.desired.spec.interfaces, a.desired.spec.interfaces);
@@ -513,7 +574,7 @@ async fn cvm_remote_nic_dependencies_two_sided_cleanup_and_admission() {
         &db.store
     })
     .mount_cvm_nic(
-        &actor_user("alice"),
+        &system_admin(),
         &a.desired.id,
         mount_request(&a, &p, "mount-dependencies-0001"),
     )
@@ -527,7 +588,7 @@ async fn cvm_remote_nic_dependencies_two_sided_cleanup_and_admission() {
             &db.store
         })
         .command_cvm(
-            &actor_user("alice"),
+            &system_admin(),
             &a.desired.id,
             CvmCommand {
                 request_id: "dependent-detach-0001".into(),
@@ -566,7 +627,7 @@ async fn cvm_remote_nic_dependencies_two_sided_cleanup_and_admission() {
         &db.store
     })
     .mount_cvm_nic(
-        &actor_user("alice"),
+        &system_admin(),
         &a.desired.id,
         mount_request(&current, &p, "mount-stopped-00001")
     )
@@ -583,7 +644,7 @@ async fn cvm_remote_nic_dependencies_two_sided_cleanup_and_admission() {
         &db.store
     })
     .set_cvm_routes(
-        &actor_user("alice"),
+        &system_admin(),
         &a.desired.id,
         RoutesWrite {
             request_id: "remove-route-reference-0001".into(),
@@ -600,7 +661,7 @@ async fn cvm_remote_nic_dependencies_two_sided_cleanup_and_admission() {
         &db.store
     })
     .command_cvm(
-        &actor_user("alice"),
+        &system_admin(),
         &a.desired.id,
         CvmCommand {
             request_id: "detach-network-after-routes-0001".into(),
@@ -654,7 +715,7 @@ async fn cvm_remote_nic_switch_failure_preserves_identity_allocation_and_routes(
         &db.store
     })
     .mount_cvm_nic(
-        &actor_user("alice"),
+        &system_admin(),
         &a.desired.id,
         mount_request(&a, &p, "mount-switch-00001"),
     )
@@ -671,7 +732,7 @@ async fn cvm_remote_nic_switch_failure_preserves_identity_allocation_and_routes(
         &db.store
     })
     .change_cvm_nic_transport(
-        &actor_user("alice"),
+        &system_admin(),
         &a.desired.id,
         &nic.id,
         NicTransportChange {
@@ -764,7 +825,7 @@ async fn cvm_remote_nic_revocation_blocks_but_retirement_removes_references() {
         &db.store
     })
     .mount_cvm_nic(
-        &actor_user("alice"),
+        &system_admin(),
         &a.desired.id,
         mount_request(&a, &p, "mount-retirement-0001"),
     )
@@ -868,7 +929,7 @@ async fn cvm_remote_nic_monthly_usage_counts_consumer_once_and_blocks_without_lo
         &db.store
     })
     .mount_cvm_nic(
-        &actor_user("alice"),
+        &system_admin(),
         &a.desired.id,
         mount_request(&a, &p, "meter-mount-0001"),
     )
@@ -1026,7 +1087,7 @@ async fn cvm_remote_nic_version_reallocation_is_explicit_and_retains_old_resourc
             &db.store
         })
         .mount_cvm_nic(
-            &actor_user("alice"),
+            &system_admin(),
             &a.desired.id,
             mount_request(&a, &p, "version-mount-0001"),
         )
@@ -1081,7 +1142,7 @@ async fn cvm_remote_nic_version_reallocation_is_explicit_and_retains_old_resourc
                 supersede_cvm_fixture(&db).await;
                 &db.store
             })
-            .update_cvm_nic_version(&actor_user("alice"), &a.desired.id, &nic_id, denied)
+            .update_cvm_nic_version(&system_admin(), &a.desired.id, &nic_id, denied)
             .await,
             Err(StoreError::Conflict(_))
         ));
@@ -1092,7 +1153,7 @@ async fn cvm_remote_nic_version_reallocation_is_explicit_and_retains_old_resourc
                     &db.store
                 })
                 .update_cvm_nic_version(
-                    &actor_user("alice"),
+                    &system_admin(),
                     &a.desired.id,
                     &nic_id,
                     NicVersionChange {
@@ -1115,7 +1176,7 @@ async fn cvm_remote_nic_version_reallocation_is_explicit_and_retains_old_resourc
                 &db.store
             })
             .command_cvm(
-                &actor_user("alice"),
+                &system_admin(),
                 &a.desired.id,
                 CvmCommand {
                     request_id: "version-stop-0001".into(),
@@ -1132,7 +1193,7 @@ async fn cvm_remote_nic_version_reallocation_is_explicit_and_retains_old_resourc
             &db.store
         })
         .update_cvm_nic_version(
-            &actor_user("alice"),
+            &system_admin(),
             &a.desired.id,
             &nic_id,
             NicVersionChange {
@@ -1211,7 +1272,7 @@ async fn cvm_remote_nic_bulk_versions_are_atomic_within_one_container() {
         &db.store
     })
     .mount_cvm_nic(
-        &actor_user("alice"),
+        &system_admin(),
         &a.desired.id,
         mount_request(&a, &p, "bulk-mount-first-0001"),
     )
@@ -1227,7 +1288,7 @@ async fn cvm_remote_nic_bulk_versions_are_atomic_within_one_container() {
         &db.store
     })
     .mount_cvm_nic(
-        &actor_user("alice"),
+        &system_admin(),
         &a.desired.id,
         mount_request(&a, &p, "bulk-mount-second-0001"),
     )
@@ -1279,7 +1340,7 @@ async fn cvm_remote_nic_bulk_versions_are_atomic_within_one_container() {
         &db.store
     })
     .update_cvm_nic_versions(
-        &actor_user("alice"),
+        &system_admin(),
         &a.desired.id,
         NicVersionsChange {
             request_id: "bulk-invalid-0001".into(),
@@ -1305,7 +1366,7 @@ async fn cvm_remote_nic_bulk_versions_are_atomic_within_one_container() {
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .update_cvm_nic_versions(&actor_user("alice"), &a.desired.id, request.clone())
+    .update_cvm_nic_versions(&system_admin(), &a.desired.id, request.clone())
     .await
     .unwrap();
     assert_eq!(updated.desired.generation, a.desired.generation + 1);
@@ -1327,7 +1388,7 @@ async fn cvm_remote_nic_bulk_versions_are_atomic_within_one_container() {
         supersede_cvm_fixture(&db).await;
         &db.store
     })
-    .update_cvm_nic_versions(&actor_user("alice"), &a.desired.id, request)
+    .update_cvm_nic_versions(&system_admin(), &a.desired.id, request)
     .await
     .unwrap();
     assert_eq!(replay.desired.generation, updated.desired.generation);
@@ -1376,7 +1437,7 @@ async fn cvm_remote_nic_ports_conflict_with_static_services_in_both_write_direct
             &db.store
         })
         .mount_cvm_nic(
-            &actor_user("alice"),
+            &system_admin(),
             &a.desired.id,
             mount_request(&a, &unavailable, "port-conflict-mount-0001")
         )
@@ -1389,7 +1450,7 @@ async fn cvm_remote_nic_ports_conflict_with_static_services_in_both_write_direct
         &db.store
     })
     .mount_cvm_nic(
-        &actor_user("alice"),
+        &system_admin(),
         &a.desired.id,
         mount_request(&a, &p, "port-valid-mount-0001"),
     )
@@ -1434,7 +1495,7 @@ async fn cvm_mixed_release_groups_carrier_peers_and_fences_provider_and_consumer
     let mounted = db
         .store
         .mount_cvm_nic(
-            &actor_user("alice"),
+            &system_admin(),
             &instance.desired.id,
             NicMountRequest {
                 request_id: "release-carrier-mount-01".into(),
@@ -1495,6 +1556,229 @@ async fn cvm_mixed_release_groups_carrier_peers_and_fences_provider_and_consumer
 
 #[tokio::test]
 #[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn forced_node_retirement_deletes_hosted_cvm_and_only_waits_for_live_peer_cleanup() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    let instance = create(&db, "force-retire-create-0001").await;
+    let publication = publish(&db).await;
+    let mounted = db
+        .store
+        .mount_cvm_nic(
+            &system_admin(),
+            &instance.desired.id,
+            mount_request(&instance, &publication, "force-retire-mount-0001"),
+        )
+        .await
+        .unwrap();
+    acknowledge_guest(&db, &mounted).await;
+    for node in ["n1", "n2", "n1", "n2"] {
+        acknowledge_network(&db, node).await;
+    }
+
+    let retired = db.store.abandon_node(&system_admin(), "n1").await.unwrap();
+    assert_eq!(
+        retired.lifecycle.phase,
+        brocade_store::NodeLifecyclePhase::Abandoned
+    );
+    let stored = db
+        .store
+        .cvm_instance(&system_admin(), &mounted.desired.id)
+        .await
+        .unwrap();
+    assert!(!stored.reserved);
+    assert_eq!(stored.desired.power, PowerState::Deleted);
+    assert_eq!(stored.status, ApplyStatus::Unknown);
+    assert_eq!(
+        stored.operation_kind.as_deref(),
+        Some("force_node_retirement")
+    );
+    assert!(db
+        .store
+        .cvm_nic_desired("n1")
+        .await
+        .unwrap()
+        .bindings
+        .is_empty());
+
+    let deployment = retired
+        .deployment_id
+        .expect("the surviving provider receives cleanup work");
+    let detail = db
+        .store
+        .deployment_detail(&system_admin(), deployment, false)
+        .await
+        .unwrap();
+    assert!(detail.targets.iter().all(|target| target.node_id != "n1"));
+    let provider = detail
+        .targets
+        .iter()
+        .find(|target| target.node_id == "n2")
+        .expect("provider is the only live cleanup peer");
+    let frozen: (String, Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT b.phase,s.cvm_revision_id,
+                (SELECT max(revision_id) FROM cvm_revision_nodes WHERE node_id='n2'),
+                (SELECT revision_id FROM cvm_serving_nodes WHERE node_id='n2')
+           FROM cvm_nic_bindings b
+           JOIN deployment_target_state s ON s.deployment_id=$1 AND s.node_id='n2'
+          WHERE b.instance_id=$2 ORDER BY b.created_at DESC LIMIT 1",
+    )
+    .bind(deployment)
+    .bind(&mounted.desired.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(frozen.0, "withdrawing", "live binding must be withdrawing");
+    assert_eq!(
+        frozen.1, frozen.2,
+        "deployment must freeze the newest CVM revision: {frozen:?}"
+    );
+    assert_ne!(
+        frozen.2, frozen.3,
+        "provider must still owe the forced withdrawal: {frozen:?}"
+    );
+    if provider.disruptive && provider.wave > 1 {
+        db.store
+            .confirm_deployment_wave(&system_admin(), deployment, provider.wave, None)
+            .await
+            .unwrap();
+    }
+    let claimed = db
+        .store
+        .claim_desired_for_node("n2")
+        .await
+        .unwrap()
+        .expect("provider claims forced-retirement cleanup");
+    db.store
+        .report_target_result(applied_report(&claimed))
+        .await
+        .unwrap();
+    let desired = db.store.cvm_nic_desired("n2").await.unwrap();
+    assert_eq!(desired.bindings.len(), 1);
+    assert_eq!(desired.bindings[0].phase, BindingPhase::Withdrawing);
+    assert!(db
+        .store
+        .cvm_record_nic_report(
+            "n2",
+            NicNodeReport {
+                diagnostics: None,
+                generation: desired.generation,
+                bindings: desired
+                    .bindings
+                    .into_iter()
+                    .map(|binding| NicBindingReport {
+                        local_block: None,
+                        traffic: None,
+                        id: binding.id,
+                        side: binding.side,
+                        generation: binding.generation,
+                        phase: binding.phase,
+                        configured: true,
+                        reachable: Some(true),
+                        rx_bytes: 0,
+                        tx_bytes: 0,
+                        error: None,
+                    })
+                    .collect(),
+            },
+        )
+        .await
+        .unwrap());
+
+    let cleanup: (bool, bool, bool) = sqlx::query_as(
+        "SELECT b.cleaned,a.retired,a.released
+           FROM cvm_nic_bindings b
+           JOIN cvm_nic_allocations a ON a.id=b.allocation_id
+          WHERE b.instance_id=$1 ORDER BY b.created_at DESC LIMIT 1",
+    )
+    .bind(&mounted.desired.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(cleanup, (true, true, true));
+    let workspace = db.store.cvm_workspace(&system_admin()).await.unwrap();
+    assert!(workspace.pending_revision_id.is_none());
+    assert!(workspace.instances.iter().all(|item| !item.reserved));
+
+    let repeated = db.store.abandon_node(&system_admin(), "n1").await.unwrap();
+    assert_eq!(
+        repeated.lifecycle.lifecycle_epoch,
+        retired.lifecycle.lifecycle_epoch
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn forced_node_retirement_does_not_wait_for_an_isolated_cvm_peer() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    let instance = create(&db, "force-retire-isolated-create-01").await;
+    let publication = publish(&db).await;
+    let mounted = db
+        .store
+        .mount_cvm_nic(
+            &system_admin(),
+            &instance.desired.id,
+            mount_request(&instance, &publication, "force-retire-isolated-mount-01"),
+        )
+        .await
+        .unwrap();
+    acknowledge_guest(&db, &mounted).await;
+    for node in ["n1", "n2", "n1", "n2"] {
+        acknowledge_network(&db, node).await;
+    }
+    db.store
+        .isolate_node(
+            &system_admin(),
+            "n2",
+            IsolateNodeRequest {
+                acknowledge_uncertain: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    let retired = db.store.abandon_node(&system_admin(), "n1").await.unwrap();
+    if let Some(deployment) = retired.deployment_id {
+        let detail = db
+            .store
+            .deployment_detail(&system_admin(), deployment, false)
+            .await
+            .unwrap();
+        assert!(detail.targets.iter().all(|target| target.node_id != "n2"));
+    }
+    assert!(db
+        .store
+        .cvm_nic_desired("n2")
+        .await
+        .unwrap()
+        .bindings
+        .is_empty());
+    let cleanup: (bool, bool, bool) = sqlx::query_as(
+        "SELECT b.cleaned,a.retired,a.released
+           FROM cvm_nic_bindings b
+           JOIN cvm_nic_allocations a ON a.id=b.allocation_id
+          WHERE b.instance_id=$1 ORDER BY b.created_at DESC LIMIT 1",
+    )
+    .bind(&mounted.desired.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(cleanup, (true, true, false));
+    assert!(db
+        .store
+        .cvm_workspace(&system_admin())
+        .await
+        .unwrap()
+        .pending_revision_id
+        .is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
 async fn cvm_mixed_pending_instance_does_not_freeze_or_rewind_another_instances_runtime_quota() {
     let Some(db) = TestPg::start_if_enabled().await else {
         return;
@@ -1524,7 +1808,7 @@ async fn cvm_mixed_pending_instance_does_not_freeze_or_rewind_another_instances_
     let b = db
         .store
         .mount_cvm_nic(
-            &actor_user("alice"),
+            &system_admin(),
             &b.desired.id,
             mount_request(&b, &p, "runtime-quota-mount-01"),
         )
@@ -1536,10 +1820,7 @@ async fn cvm_mixed_pending_instance_does_not_freeze_or_rewind_another_instances_
     }
     let pending = db
         .store
-        .create_cvm(
-            &actor_user("alice"),
-            create_request("runtime-quota-pending-01"),
-        )
+        .create_cvm(&system_admin(), create_request("runtime-quota-pending-01"))
         .await
         .unwrap();
     let revision = pending.revision_id.unwrap();
@@ -1649,7 +1930,7 @@ async fn cvm_mixed_transport_fallback_does_not_complete_the_requested_release() 
     let item = db
         .store
         .mount_cvm_nic(
-            &actor_user("alice"),
+            &system_admin(),
             &item.desired.id,
             mount_request(&item, &p, "release-fallback-mount-01"),
         )
@@ -1663,7 +1944,7 @@ async fn cvm_mixed_transport_fallback_does_not_complete_the_requested_release() 
     let switch = db
         .store
         .change_cvm_nic_transport(
-            &actor_user("alice"),
+            &system_admin(),
             &item.desired.id,
             &nic,
             NicTransportChange {
@@ -1750,7 +2031,7 @@ async fn cvm_mixed_transport_fallback_does_not_complete_the_requested_release() 
     let stopped = db
         .store
         .command_cvm(
-            &actor_user("alice"),
+            &system_admin(),
             &item.desired.id,
             CvmCommand {
                 request_id: "fallback-compensating-stop-01".into(),
@@ -1786,6 +2067,7 @@ async fn cvm_published_mounted(db: &TestPg) -> CvmInstance {
             "n1",
             InventoryReport {
                 capabilities,
+                terminal_sessions_used: None,
                 error: None,
             },
         )
@@ -1814,7 +2096,7 @@ async fn cvm_published_mounted(db: &TestPg) -> CvmInstance {
     let b = db
         .store
         .mount_cvm_nic(
-            &actor_user("alice"),
+            &system_admin(),
             &b.desired.id,
             mount_request(&b, &p, "review-metering-mount-01"),
         )
@@ -1866,7 +2148,7 @@ async fn cvm_published_pending_delete_keeps_metering_serving_binding() {
     let b = cvm_published_mounted(&db).await;
     db.store
         .command_cvm(
-            &actor_user("alice"),
+            &system_admin(),
             &b.desired.id,
             CvmCommand {
                 request_id: "review-pending-delete-01".into(),
@@ -1894,7 +2176,7 @@ async fn cvm_published_pending_delete_keeps_metering_serving_binding() {
         total, 1100,
         "an unapproved deletion must not stop accounting for the active data plane"
     );
-    let serving = db.store.cvm_desired_page("n1", Some(0)).await.unwrap();
+    let serving = db.store.cvm_desired_page("n1", 0).await.unwrap();
     let running = &serving.instances[0];
     assert_eq!(running.power, PowerState::Running);
     assert!(
@@ -1939,7 +2221,7 @@ async fn cvm_published_pending_stop_does_not_freeze_monthly_quota_reset() {
     }
     db.store
         .command_cvm(
-            &actor_user("alice"),
+            &system_admin(),
             &b.desired.id,
             CvmCommand {
                 request_id: "review-pending-stop-01".into(),
@@ -1987,14 +2269,14 @@ async fn cvm_published_pending_stop_does_not_freeze_monthly_quota_reset() {
         latest.desired.generation > published_generation,
         "pending intent must stay ahead of the execution already sent to Agent"
     );
-    let page = db.store.cvm_desired_page("n1", Some(0)).await.unwrap();
+    let page = db.store.cvm_desired_page("n1", 0).await.unwrap();
     brocade_cvm_compile::verify(
         page.instances[0].artifacts.as_ref().unwrap(),
         &page.instances[0],
     )
     .unwrap();
     publish_cvm_intent(&db).await;
-    let approved = db.store.cvm_desired_page("n1", Some(0)).await.unwrap();
+    let approved = db.store.cvm_desired_page("n1", 0).await.unwrap();
     assert_eq!(approved.instances[0].power, PowerState::Stopped);
     assert_eq!(approved.instances[0].generation, latest.desired.generation);
     brocade_cvm_compile::verify(
@@ -2020,7 +2302,7 @@ async fn cvm_published_empty_network_receipt_unblocks_next_container_release() {
     let deleted = db
         .store
         .command_cvm(
-            &actor_user("alice"),
+            &system_admin(),
             &b.desired.id,
             CvmCommand {
                 request_id: "empty-network-delete-01".into(),
@@ -2071,7 +2353,7 @@ async fn cvm_published_empty_network_receipt_unblocks_next_container_release() {
     let instance = db
         .store
         .create_cvm(
-            &actor_user("alice"),
+            &system_admin(),
             create_request("empty-network-next-create-01"),
         )
         .await
@@ -2129,7 +2411,7 @@ async fn cvm_published_quota_uses_approved_limit_until_new_nic_version_is_publis
         .unwrap();
     db.store
         .update_cvm_nic_versions(
-            &actor_user("alice"),
+            &system_admin(),
             &b.desired.id,
             NicVersionsChange {
                 request_id: "quota-pending-limit-apply-01".into(),
@@ -2149,7 +2431,7 @@ async fn cvm_published_quota_uses_approved_limit_until_new_nic_version_is_publis
         .cvm_record_nic_report("n1", cvm_published_report(desired, true))
         .await
         .unwrap();
-    let serving = db.store.cvm_desired_page("n1", Some(0)).await.unwrap();
+    let serving = db.store.cvm_desired_page("n1", 0).await.unwrap();
     let approved = serving.instances[0].spec.interfaces[1]
         .allocated
         .as_ref()
@@ -2175,7 +2457,7 @@ async fn cvm_published_quota_uses_approved_limit_until_new_nic_version_is_publis
             .quota_exceeded
     );
     publish_cvm_intent(&db).await;
-    let desired = db.store.cvm_desired_page("n1", Some(0)).await.unwrap();
+    let desired = db.store.cvm_desired_page("n1", 0).await.unwrap();
     assert_eq!(desired.instances[0].generation, draft.desired.generation);
     assert!(
         !desired.instances[0].spec.interfaces[1]
@@ -2203,4 +2485,148 @@ async fn cvm_published_quota_uses_approved_limit_until_new_nic_version_is_publis
         .bindings
         .iter()
         .all(|b| b.nic.publication_revision == next.revision && !b.nic.quota_exceeded));
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_undo_routes_restores_both_host_rules_with_the_guest_routes() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    let mounted = cvm_published_mounted(&db).await;
+    let before = db
+        .store
+        .cvm_instance(&actor_user("alice"), &mounted.desired.id)
+        .await
+        .unwrap();
+    assert!(!before.desired.spec.routing.routes.is_empty());
+    let mut routes = before.desired.spec.routing.clone();
+    routes.routes.clear();
+    routes.priorities.clear();
+    let pending = db
+        .store
+        .set_cvm_routes(
+            &system_admin(),
+            &before.desired.id,
+            RoutesWrite {
+                request_id: "undo-host-routes-stage-01".into(),
+                expected_generation: before.desired.generation,
+                expected_revision: routes.revision,
+                routes,
+            },
+        )
+        .await
+        .unwrap();
+    let restored = db
+        .store
+        .command_cvm(
+            &system_admin(),
+            &pending.desired.id,
+            CvmCommand {
+                request_id: "undo-host-routes-restore-01".into(),
+                expected_generation: pending.desired.generation,
+                change: CvmChange::UndoPending {
+                    expected_revision: pending.revision_id.unwrap(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.desired.spec.routing.routes,
+        before.desired.spec.routing.routes
+    );
+    assert!(restored.desired.spec.routing.revision > pending.desired.spec.routing.revision);
+    publish_cvm_intent(&db).await;
+    for node in ["n1", "n2"] {
+        let network = db.store.cvm_nic_desired(node).await.unwrap();
+        let bindings: Vec<_> = network
+            .bindings
+            .iter()
+            .filter(|b| b.instance_id == restored.desired.id)
+            .collect();
+        assert_eq!(bindings.len(), 1, "{node} must retain its actual endpoint");
+        assert_eq!(
+            bindings[0].routing, restored.desired.spec.routing,
+            "{node} firewall must agree with restored Guest routes"
+        );
+        assert_eq!(
+            bindings[0].nic.allocation_id,
+            before.desired.spec.interfaces[1]
+                .allocated
+                .as_ref()
+                .unwrap()
+                .allocation_id
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires BROCADE_RUN_PG_TESTS=1 and PostgreSQL"]
+async fn cvm_undo_unpublished_mount_releases_only_new_allocation() {
+    let Some(db) = TestPg::start_if_enabled().await else {
+        return;
+    };
+    setup(&db).await;
+    let item = create(&db, "undo-nic-instance-01").await;
+    let network = publish(&db).await;
+    let mounted = db
+        .store
+        .mount_cvm_nic(
+            &system_admin(),
+            &item.desired.id,
+            mount_request(&item, &network, "undo-nic-mount-request-01"),
+        )
+        .await
+        .unwrap();
+    let nic = mounted
+        .desired
+        .spec
+        .interfaces
+        .iter()
+        .find_map(|nic| nic.allocated.as_ref())
+        .unwrap();
+    let allocation = nic.allocation_id.clone();
+    let restored = db
+        .store
+        .command_cvm(
+            &system_admin(),
+            &item.desired.id,
+            CvmCommand {
+                request_id: "undo-nic-command-request-01".into(),
+                expected_generation: mounted.desired.generation,
+                change: CvmChange::UndoPending {
+                    expected_revision: mounted.revision_id.unwrap(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.desired.spec.interfaces,
+        item.desired.spec.interfaces
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT released FROM cvm_nic_allocations WHERE id=$1")
+            .bind(&allocation)
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM cvm_nic_resources WHERE allocation_id=$1 AND NOT released"
+        )
+        .bind(&allocation)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.store.cvm_desired("n1").await.unwrap().instances[0]
+            .spec
+            .interfaces,
+        item.desired.spec.interfaces
+    );
 }

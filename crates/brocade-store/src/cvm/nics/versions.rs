@@ -108,8 +108,7 @@ async fn apply_version(
         .ok_or_else(|| StoreError::NotFound("受管网卡".into()))?
         .clone();
     let publication = publication(tx, &old.publication_id).await?;
-    if publication.retired || !granted(actor, &instance.tenant_id, &instance.user_id, &publication)
-    {
+    if publication.retired || !granted(actor, &instance.tenant_id, instance.user(), &publication) {
         return Err(StoreError::Forbidden("网卡挂载授权已撤销".into()));
     }
     let raw: serde_json::Value = sqlx::query_scalar(

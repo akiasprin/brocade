@@ -86,26 +86,33 @@ class ChainAcceptance(Acceptance):
             deployment=deployment,
         )
 
-    def prepare(self, binary):
+    def prepare(self, binary, attachment_probe=None):
         client = self.lab.state['roles']['client']
         ips = V4 + V6 + [client['ipv4'], client['ipv6']]
         digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+        if attachment_probe is not None:
+            guest_probe_digest = hashlib.sha256(attachment_probe.read_bytes()).hexdigest()
+            self.lab.upload('compute', attachment_probe, self.prefix + '/attachment-probe')
+            assert (
+                self.lab.remote('compute', 'sudo sha256sum ' + self.prefix + '/attachment-probe')
+                .stdout.decode()
+                .split()[0]
+                == guest_probe_digest
+            )
+            self.state['attachment_probe_sha256'] = guest_probe_digest
+            self.save()
         for role in self.lab.state['roles']:
-            current = self.lab.remote(role, 'sha256sum ' + self.prefix + '/chain-probe', check=False)
+            current = self.lab.remote(role, 'sudo sha256sum ' + self.prefix + '/chain-probe', check=False)
             if current.returncode or current.stdout.decode().split()[0] != digest:
                 if role == 'client':
                     self.lab.remote(role, 'sudo systemctl stop brocade-chain-probe', check=False)
                 self.lab.upload(role, binary, self.prefix + '/chain-probe')
         for role in ['compute', 'provider']:
-            code = """import json,subprocess
-v4,v6=%r,%r
-for family,destination,gateway in [('-4','11.254.0.0/24',v4),('-6','2001:4860:ff00::/64',v6)]:
- route=json.loads(subprocess.check_output(['ip',family,'-j','route','get',gateway]))[0]
- subprocess.run(['ip',family,'route','replace',destination,'via',gateway,'dev',route['dev']],check=True)
-from pathlib import Path
+            self.lab.persist_routes(role, [('11.254.0.0/24', client['ipv4']), ('2001:4860:ff00::/64', client['ipv6'])])
+            code = """from pathlib import Path
 p=Path('/etc/hosts');s=p.read_text();line='11.254.0.30 direct.solid.test blocked.solid.test default.solid.test\\n2001:4860:ff00::30 v6.direct.solid.test v6.blocked.solid.test v6.default.solid.test'
 if line not in s:p.write_text(s+'\\n'+line+'\\n')
-""" % (client['ipv4'], client['ipv6'])
+"""
             self.lab.python(role, code)
         self.lab.python(
             'client',
@@ -260,12 +267,7 @@ if line not in s:p.write_text(s+'\\n'+line+'\\n')
         if not item.get('report'):
             item = self.instance_ready('gamma')
         _, _, address = self.guest_endpoint('gamma')
-        words = [
-            'ssh',
-            '-i',
-            self.prefix + '/guest.key',
-            '-o',
-            'IdentitiesOnly=yes',
+        words = self.prepare_guest_password(item, 'compute') + [
             '-o',
             'StrictHostKeyChecking=accept-new',
             '-o',
@@ -486,12 +488,8 @@ if line not in s:p.write_text(s+'\\n'+line+'\\n')
             + self.prefix
             + '/chain-probe | sudo '
             + shlex.join(
-                [
-                    'ssh',
-                    '-i',
-                    self.prefix + '/guest.key',
-                    '-o',
-                    'IdentitiesOnly=yes',
+                self.prepare_guest_password(self.instance('alpha'), 'compute')
+                + [
                     '-o',
                     'StrictHostKeyChecking=accept-new',
                     '-o',
@@ -798,7 +796,7 @@ if line not in s:p.write_text(s+'\\n'+line+'\\n')
         return saved
 
     def preview_lifecycle(self):
-        # The owned fixture's four-vCPU user quota is real. Release the completed
+        # Release the completed fixture before preparing the next independent workload.
         # two-vCPU Beta lifecycle fixture before reserving another sandbox.
         beta = self.instance('beta')
         if beta['reserved']:
@@ -822,12 +820,7 @@ if line not in s:p.write_text(s+'\\n'+line+'\\n')
         allocated = [n for n in mounted['desired']['spec']['interfaces'] if n.get('allocated')]
         assert len(allocated) == 1
         item, role, address = self.guest_endpoint('delta')
-        words = [
-            'ssh',
-            '-i',
-            self.prefix + '/guest.key',
-            '-o',
-            'IdentitiesOnly=yes',
+        words = self.prepare_guest_password(item, role) + [
             '-o',
             'StrictHostKeyChecking=accept-new',
             '-o',
@@ -941,6 +934,8 @@ print(json.dumps({'state':value['state'],'vcpus':value['config']['cpus']['boot_v
         )
 
     def chain_icmp(self):
+        if self.lab.remote('compute', 'sudo test -x ' + self.prefix + '/attachment-probe', check=False).returncode:
+            raise RuntimeError('ICMP acceptance requires the same-source attachment probe as the second prepare input')
         runtime = (
             self.lab.python(
                 'compute',
@@ -1020,22 +1015,18 @@ print(json.dumps({'state':value['state'],'vcpus':value['config']['cpus']['boot_v
                 'selected chain does not claim ICMP echo support or fall back to host NAT; real dual-stack destinations observe zero Guest echo requests while direct controls work'
             )
         finally:
-            ping_group_range(original)
-            self.lab.remote('client', 'sudo nft delete table inet brocade_accept_chain_icmp')
+            try:
+                ping_group_range(original)
+            finally:
+                self.lab.remote('client', 'sudo nft delete table inet brocade_accept_chain_icmp')
 
     def entry_existing(self):
         provider = self.lab.state['roles']['provider']['ipv4']
         whole = '198.51.100.211'
-        self.lab.remote('client', 'sudo ip route replace ' + whole + '/32 via ' + provider + ' dev lab0')
-        self.lab.upload('client', self.output / 'guest.key', self.prefix + '/guest.key', 0o600)
+        self.lab.persist_routes('client', [(whole + '/32', provider)])
         payload = b'entry-full-duplex-' * 16384
         for address, port in [(provider, 55080), (whole, 22)]:
-            words = [
-                'ssh',
-                '-i',
-                self.prefix + '/guest.key',
-                '-o',
-                'IdentitiesOnly=yes',
+            words = self.prepare_guest_password(self.instance('alpha'), 'client') + [
                 '-o',
                 'StrictHostKeyChecking=accept-new',
                 '-o',
@@ -1182,6 +1173,19 @@ print(json.dumps({'state':value['state'],'vcpus':value['config']['cpus']['boot_v
         self.record('all owned NIC/entry/tunnel claims released; empty network snapshot acknowledged by real Agents')
 
     def unauthorized_selection(self):
+        # Referenced revoked chains stay visible so existing users can repair
+        # their configuration. This last phase requires a globally unused chain.
+        chain_id = self.state['chain']['id']
+        for name in self.state['instances']:
+            item = self.instance(name)
+            routing = item['desired']['spec']['routing']
+            if item['reserved'] and any(route.get('chain_id') == chain_id for route in routing['routes']):
+                self.reviewed_routes(
+                    name,
+                    [route for route in routing['routes'] if route.get('chain_id') != chain_id],
+                    [priority for priority in routing['priorities'] if priority.get('chain_id') != chain_id],
+                    'unauthorized-unused-chain-precondition-' + name,
+                )
         if 'epsilon' not in self.state['instances'] or not self.instance('epsilon')['reserved']:
             self.create('epsilon', 'compute-a')
             self.complete(self.publish(), timeout=240)
@@ -1237,7 +1241,7 @@ print(json.dumps({'state':value['state'],'vcpus':value['config']['cpus']['boot_v
 if __name__ == '__main__':
     a = ChainAcceptance(sys.argv[1])
     if sys.argv[2] == 'prepare':
-        a.prepare(Path(sys.argv[3]))
+        a.prepare(Path(sys.argv[3]), Path(sys.argv[4]) if len(sys.argv) > 4 else None)
     elif sys.argv[2] == 'configure':
         a.configure()
     elif sys.argv[2] == 'primary':

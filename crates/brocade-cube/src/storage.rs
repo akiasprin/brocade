@@ -58,30 +58,9 @@ impl Inner {
             }
             record.objects[0].role.clone()
         } else {
-            let pinned = desired
-                .artifacts
-                .as_ref()
-                .filter(|bundle| {
-                    desired.artifact_mode == brocade_deployment::cvm::CvmArtifactMode::Enforce
-                        && desired
-                            .spec
-                            .image
-                            .as_ref()
-                            .is_some_and(|image| image.sha256 == bundle.input.image_manifest.sha256)
-                })
-                .map(|bundle| brocade_cvm_compile::normalize_image(&bundle.input.image_manifest))
-                .transpose()?;
-            let base = pinned
-                .as_ref()
-                .or_else(|| {
-                    desired
-                        .spec
-                        .image
-                        .as_ref()
-                        .and_then(|image| self.images.get(&image.id))
-                })
-                .ok_or("Cube system image identity unavailable")?;
-            root_name(base)?.to_owned()
+            let bundle = desired.artifacts.as_ref().ok_or("Cube artifacts missing")?;
+            let image = brocade_cvm_compile::normalize_image(&bundle.input.image_manifest)?;
+            root_name(&image)?.to_owned()
         };
         if let Err(error) = captured {
             if error != OWNERSHIP_UNKNOWN

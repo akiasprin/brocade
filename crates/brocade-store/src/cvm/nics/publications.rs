@@ -310,10 +310,12 @@ impl PgStore {
         node: &str,
         caps: NicNodeCapabilities,
     ) -> Result<()> {
-        if caps.contract != NIC_PROTOCOL_VERSION
+        if caps.contract != NIC_CONTRACT_VERSION
             || caps.transports.len() > 2
             || caps.addresses.len() > 256
             || caps.host_ports.len() > 2048
+            || caps.ssh_ports.len() > 1024
+            || caps.ssh_ports.contains(&0)
             || caps.max_bindings as usize > MAX_NETWORK_BINDINGS
             || caps.error.as_ref().is_some_and(|e| e.len() > 500)
             || caps
@@ -336,7 +338,7 @@ async fn apply_grants(tx: &mut Transaction<'_, Postgres>, p: &NicPublication) ->
             .spec
             .grants
             .iter()
-            .any(|g| g.tenant_id == instance.tenant_id && g.user_id == instance.user_id);
+            .any(|g| g.tenant_id == instance.tenant_id && g.user_id == instance.user());
         let mut desired = instance.desired;
         let mut changed = false;
         for nic in &mut desired.spec.interfaces {
