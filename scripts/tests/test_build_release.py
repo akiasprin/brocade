@@ -55,20 +55,19 @@ class ReleaseBuildTests(unittest.TestCase):
             self.assertEqual(command[command.index('--go') + 1], '/tools/go')
             self.assertEqual(compiler.call_args.kwargs, {'component': 'cube'})
 
-    def test_cube_compiler_selection_uses_its_own_pin(self):
+    def test_cube_and_xray_compiler_pins_match(self):
+        root = PATH.parents[1]
+        cube_version = (root / 'components/cube/.go-version').read_text().strip()
+        xray_version = (root / 'components/xray-core/.go-version').read_text().strip()
+        self.assertEqual(cube_version, '1.27.4')
+        self.assertEqual(cube_version, xray_version)
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for component, version in [('cube', '1.27.3'), ('xray-core', '1.27.4')]:
-                pin = root / 'components' / component / '.go-version'
-                pin.parent.mkdir(parents=True)
-                pin.write_text(version + '\n')
-            compiler = root / 'go'
+            compiler = Path(directory) / 'go'
             compiler.touch()
             env = {'BROCADE_GO': str(compiler)}
-            with patch.object(BUILD, 'run', return_value='go version go1.27.3 linux/amd64'):
+            with patch.object(BUILD, 'run', return_value=f'go version go{cube_version} linux/amd64'):
                 self.assertEqual(BUILD.go_binary(root, env, BUILD.BuildTimer(), component='cube'), str(compiler))
-                with self.assertRaisesRegex(BUILD.BuildError, 'Go 1.27.4 is required'):
-                    BUILD.go_binary(root, env, BUILD.BuildTimer())
+                self.assertEqual(BUILD.go_binary(root, env, BUILD.BuildTimer()), str(compiler))
 
     def test_cube_runtime_requires_architecture_and_matching_sysroot(self):
         with (

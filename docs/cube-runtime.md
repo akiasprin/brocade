@@ -14,7 +14,7 @@ python3 scripts/build-release.py --cube-runtime-only \
   --cube-glibc 2.35
 ```
 
-运行栈构建使用 Go 1.27.3、Rust 1.96、Clang 21 和仓库 Zig 包装器，默认 GNU libc 基线为 2.35。统一入口按 `components/cube/.go-version` 选择 Cube 编译器，与 Xray 的版本钉住分别校验。sysroot 中必须包含对应目标架构的 `libcap-ng.so` 和 `libseccomp.so`，与选定基线匹配；BPF include 目录需包含 libbpf 开发头文件，仅传入 BPF 编译阶段，避免覆盖后续 Zig 的目标 libc 头文件。它们属于构建输入，摘要随产物记录。可通过 `BROCADE_GO` 指定固定 Go 编译器。`--cube-arch aarch64` 需要同架构 sysroot 与 Rust 目标，并另做该架构 KVM 验收。
+运行栈构建使用 Go 1.27.4、Rust 1.96、Clang 21 工具集和仓库 Zig 包装器，默认 GNU libc 基线为 2.35。统一入口按 `components/cube/.go-version` 选择 Cube 编译器，与 Xray 的版本钉住分别校验。Clang 目录需同时包含同版本的 `llvm-objcopy`：Cubecow 保留 Rust ThinLTO 生成的原生代码，再清除 Go 1.27.4 禁止出现在 CGO 链接输入中的嵌入式 LTO 元数据。sysroot 中必须包含对应目标架构的 `libcap-ng.so` 和 `libseccomp.so`，与选定基线匹配；BPF include 目录需包含 libbpf 开发头文件，仅传入 BPF 编译阶段，避免覆盖后续 Zig 的目标 libc 头文件。它们属于构建输入，摘要随产物记录。可通过 `BROCADE_GO` 指定固定 Go 编译器。`--cube-arch aarch64` 需要同架构 sysroot 与 Rust 目标，并另做该架构 KVM 验收。
 
 构建前检查外部库的架构及实际导入的 `GLIBC_*` 版本，构建后检查所有宿主 ELF，打包前再次核验；超过声明基线时拒绝产物。仅降低 `--cube-glibc` 或包内 `min_glibc` 不能修复高版本依赖。Debian 12 的官方 `libcap-ng0=0.8.3-1+b3` 和 `libseccomp2=2.5.4-1+deb12u1` 可作为 x86_64 sysroot 输入：从经过 APT 签名和包摘要校验的仓库下载 `.deb`，使用 `dpkg-deb -x` 提取，将实际共享库复制为上述两个链接输入名；保留原包、版本、来源和 SHA-256，不从开发宿主直接复制库。
 

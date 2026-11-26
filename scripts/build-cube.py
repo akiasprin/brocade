@@ -147,9 +147,10 @@ def main():
     root = Path(__file__).resolve().parents[1]
     if str(root).startswith(('/tmp/', '/var/tmp/')):
         parser.error('use a persistent checkout')
+    objcopy = args.clang.with_name('llvm-objcopy')
     libraries = args.sysroot_libs.resolve()
     dependencies = [libraries / 'libcap-ng.so', libraries / 'libseccomp.so']
-    for path in [*dependencies, args.clang, args.bpf_include / 'bpf/bpf_helpers.h']:
+    for path in [*dependencies, args.clang, objcopy, args.bpf_include / 'bpf/bpf_helpers.h']:
         if not path.is_file():
             parser.error(f'required build input is missing: {path}')
     try:
@@ -159,9 +160,10 @@ def main():
     go = shutil.which(args.go) if not Path(args.go).is_absolute() else args.go
     if not go:
         parser.error('Go compiler is missing')
+    go_version = (root / 'components/cube/.go-version').read_text().strip()
     version = subprocess.check_output([go, 'version'], text=True).strip()
-    if 'go1.27.3 ' not in version:
-        parser.error('this runtime recipe requires Go 1.27.3')
+    if f'go{go_version} ' not in version:
+        parser.error(f'this runtime recipe requires Go {go_version}')
     cache = root / 'target/cube'
     cache.mkdir(parents=True, exist_ok=True)
     with (cache / 'build.lock').open('w') as lock:
@@ -229,10 +231,29 @@ def main():
                 'cow',
                 logs,
             )
+            cow = cache / 'cow' / musl / 'release/libcubecow.a'
+            cgo_cow = cache / 'cow' / musl / 'release/libcubecow-cgo.a'
+            # Rust ThinLTO has already optimized the native objects. Its embedded bitcode and
+            # command metadata are not needed by the external Zig link, and Go 1.27.4 rejects
+            # archives carrying those sections as unsafe CGO linker inputs.
+            run(
+                [
+                    str(objcopy),
+                    '--remove-section=.llvmbc',
+                    '--remove-section=.llvmcmd',
+                    str(cow),
+                    str(cgo_cow),
+                ],
+                root,
+                env,
+                record,
+                'cow-cgo-archive',
+                logs,
+            )
             sdk = root / 'components/cube/Cubelet/third_party/cubecow'
             (sdk / 'include').mkdir(parents=True, exist_ok=True)
             (sdk / 'lib').mkdir(exist_ok=True)
-            shutil.copy2(cache / 'cow' / musl / 'release/libcubecow.a', sdk / 'lib/libcubecow.a')
+            shutil.copy2(cgo_cow, sdk / 'lib/libcubecow.a')
             shutil.copy2(root / 'components/cube/cubecow/include/cubecow.h', sdk / 'include/cubecow.h')
             env['CGO_ENABLED'], env['CGO_LDFLAGS'] = '1', '-lunwind'
             run(

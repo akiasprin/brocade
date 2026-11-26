@@ -21,18 +21,21 @@ class CubeBuildTests(unittest.TestCase):
             libraries = root / 'sysroot'
             include = root / 'include'
             clang = root / 'clang'
+            objcopy = root / 'llvm-objcopy'
             go = root / 'go'
             inputs = [
                 libraries / 'libcap-ng.so',
                 libraries / 'libseccomp.so',
                 include / 'bpf/bpf_helpers.h',
                 clang,
+                objcopy,
                 go,
                 root / 'components/cube/cubecow/include/cubecow.h',
             ]
             for path in inputs:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.touch()
+            (root / 'components/cube/.go-version').write_text('1.27.4\n')
             (root / 'components/cube/Cubelet/third_party').mkdir(parents=True)
             output = root / 'target/cube/artifacts/x86_64'
             generated = {
@@ -44,13 +47,17 @@ class CubeBuildTests(unittest.TestCase):
                 'inspector': output / 'lan-inspect',
             }
             environments = {}
+            commands = {}
 
             def run(command, cwd, env, record, name, logs):
                 environments[name] = env.copy()
+                commands[name] = command
                 if name in generated:
                     path = generated[name]
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(b'artifact')
+                if name == 'cow-cgo-archive':
+                    Path(command[-1]).write_bytes(b'native archive')
 
             argv = [
                 'build-cube.py',
@@ -72,13 +79,17 @@ class CubeBuildTests(unittest.TestCase):
                 patch.dict(os.environ, env, clear=True),
                 patch.object(BUILD, 'source_digest', return_value='source'),
                 patch.object(BUILD, 'validate_elf', return_value='2.34'),
-                patch.object(BUILD.subprocess, 'check_output', return_value='go version go1.27.3 linux/amd64'),
+                patch.object(BUILD.subprocess, 'check_output', return_value='go version go1.27.4 linux/amd64'),
                 patch.object(BUILD, 'run', side_effect=run),
             ):
                 BUILD.main()
             self.assertEqual(environments['bpf']['CPATH'], str(include))
-            self.assertEqual(set(environments), {'bpf', *generated})
-            for stage in generated:
+            self.assertEqual(set(environments), {'bpf', 'cow-cgo-archive', *generated})
+            self.assertEqual(
+                commands['cow-cgo-archive'][:3],
+                [str(objcopy), '--remove-section=.llvmbc', '--remove-section=.llvmcmd'],
+            )
+            for stage in {*generated, 'cow-cgo-archive'}:
                 self.assertNotIn('CPATH', environments[stage], stage)
 
 
